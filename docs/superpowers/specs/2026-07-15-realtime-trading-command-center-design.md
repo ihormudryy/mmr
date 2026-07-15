@@ -1,7 +1,7 @@
 # Realtime Trading Command Center
 
-**Date:** 2026-07-15  
-**Status:** Design approved; written specification pending user review  
+**Date:** 2026-07-15
+**Status:** Design approved; written specification pending user review
 **Baseline:** Repository audit at `7ad150f`; unrelated active worktree changes are outside this specification
 
 ## 1. Purpose

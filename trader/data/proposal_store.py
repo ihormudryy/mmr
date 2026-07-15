@@ -1,5 +1,6 @@
 from trader.data.duckdb_store import DuckDBConnection
 from trader.trading.proposal import ExecutionSpec, ProposalStatus, TradeProposal
+from enum import Enum
 from typing import List, Optional, Set
 
 import datetime as dt
@@ -37,6 +38,20 @@ _ALLOWED_TRANSITIONS = {
 
 class InvalidProposalTransition(ValueError):
     """Raised when update_status is called with an illegal state transition."""
+
+
+class ApprovalClaimResult(str, Enum):
+    CLAIMED = "CLAIMED"
+    EXPIRED = "EXPIRED"
+    NOT_PENDING = "NOT_PENDING"
+    NOT_FOUND = "NOT_FOUND"
+
+
+_EXPIRY_SQL = "json_extract_string(metadata, '$.expires_at')"
+_AWARE_EXPIRY_SQL = (
+    "regexp_matches(" + _EXPIRY_SQL + ", '(Z|[+-][0-9]{2}:[0-9]{2})$') "
+    "AND TRY_CAST(" + _EXPIRY_SQL + " AS TIMESTAMPTZ) IS NOT NULL"
+)
 
 
 class ProposalStore:
@@ -241,6 +256,70 @@ class ProposalStore:
 
         rows = self.db.execute_atomic(_cas)
         return bool(rows)
+
+    def claim_for_approval(self, id: int, now: dt.datetime) -> ApprovalClaimResult:
+        """Atomically transition PENDING -> APPROVED, expiring the row instead if
+        its `expires_at` metadata is elapsed, naive, or otherwise invalid.
+
+        Single-statement CAS: the UPDATE only matches a row still in PENDING, so
+        concurrent callers can't both claim the same proposal, and a proposal
+        whose expiry has already passed is expired atomically in the same
+        statement rather than being approved and expired out from under the
+        caller by a separate check. A missing `expires_at` is valid (legacy
+        manual proposals do not carry one) and claims succeed for those rows.
+        """
+        now = now.astimezone(dt.timezone.utc)
+
+        def _claim(conn):
+            rows = conn.execute(
+                f"""
+                UPDATE trade_proposals
+                   SET status = CASE
+                       WHEN {_EXPIRY_SQL} IS NULL THEN 'APPROVED'
+                       WHEN {_AWARE_EXPIRY_SQL}
+                            AND TRY_CAST({_EXPIRY_SQL} AS TIMESTAMPTZ) > ?
+                         THEN 'APPROVED'
+                       ELSE 'EXPIRED'
+                   END,
+                       updated_at = ?
+                 WHERE id = ? AND status = 'PENDING'
+             RETURNING status
+                """,
+                [now, now.replace(tzinfo=None), id],
+            ).fetchall()
+            if rows:
+                return ApprovalClaimResult.CLAIMED if rows[0][0] == "APPROVED" else ApprovalClaimResult.EXPIRED
+            row = conn.execute("SELECT status FROM trade_proposals WHERE id = ?", [id]).fetchone()
+            return ApprovalClaimResult.NOT_PENDING if row else ApprovalClaimResult.NOT_FOUND
+
+        return self.db.execute_atomic(_claim)
+
+    def expire_stale_pending(self, now: dt.datetime) -> list[int]:
+        """Expire every PENDING proposal whose `expires_at` metadata has elapsed
+        (or is naive/invalid). Unlimited sweep — intended for a startup/periodic
+        caller, not a per-request query, so it deliberately has no limit or
+        source filter: a stale proposal from any source is stale.
+        """
+        now = now.astimezone(dt.timezone.utc)
+
+        def _expire(conn):
+            return [
+                row[0]
+                for row in conn.execute(
+                    f"""
+                    UPDATE trade_proposals
+                       SET status = 'EXPIRED', updated_at = ?
+                     WHERE status = 'PENDING'
+                       AND {_EXPIRY_SQL} IS NOT NULL
+                       AND (NOT ({_AWARE_EXPIRY_SQL})
+                            OR TRY_CAST({_EXPIRY_SQL} AS TIMESTAMPTZ) <= ?)
+                 RETURNING id
+                    """,
+                    [now.replace(tzinfo=None), now],
+                ).fetchall()
+            ]
+
+        return self.db.execute_atomic(_expire)
 
     def get(self, id: int) -> Optional[TradeProposal]:
         rows = self.db.execute(

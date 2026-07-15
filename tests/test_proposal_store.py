@@ -324,3 +324,113 @@ class TestProposalStore:
         result = proposal_store.get(pid)
         assert result.group == ''
         assert '_group' not in result.metadata
+
+    def test_claim_for_approval_expires_elapsed_row(self, proposal_store):
+        from trader.data.proposal_store import ApprovalClaimResult
+
+        pid = proposal_store.add(_make_proposal(source="strategy:orb"))
+        proposal_store.update_metadata(pid, {"expires_at": "2026-07-15T10:00:00Z"})
+        result = proposal_store.claim_for_approval(
+            pid, dt.datetime(2026, 7, 15, 10, 0, 1, tzinfo=dt.timezone.utc)
+        )
+        assert result is ApprovalClaimResult.EXPIRED
+        assert proposal_store.get(pid).status == "EXPIRED"
+
+    def test_claim_for_approval_allows_missing_legacy_expiry(self, proposal_store):
+        from trader.data.proposal_store import ApprovalClaimResult
+
+        pid = proposal_store.add(_make_proposal(source="manual"))
+        result = proposal_store.claim_for_approval(
+            pid, dt.datetime(2026, 7, 15, 10, 0, tzinfo=dt.timezone.utc)
+        )
+        assert result is ApprovalClaimResult.CLAIMED
+        assert proposal_store.get(pid).status == "APPROVED"
+
+    def test_claim_for_approval_rejects_naive_expiry(self, proposal_store):
+        from trader.data.proposal_store import ApprovalClaimResult
+
+        pid = proposal_store.add(_make_proposal(source="strategy:orb"))
+        proposal_store.update_metadata(pid, {"expires_at": "2026-07-15T10:30:00"})
+        result = proposal_store.claim_for_approval(
+            pid, dt.datetime(2026, 7, 15, 10, 0, tzinfo=dt.timezone.utc)
+        )
+        assert result is ApprovalClaimResult.EXPIRED
+
+    def test_claim_for_approval_not_pending_returns_not_pending(self, proposal_store):
+        from trader.data.proposal_store import ApprovalClaimResult
+
+        pid = proposal_store.add(_make_proposal(source="strategy:orb"))
+        # Already claimed by someone else (PENDING -> APPROVED).
+        assert proposal_store.try_transition(pid, "PENDING", "APPROVED") is True
+        result = proposal_store.claim_for_approval(
+            pid, dt.datetime(2026, 7, 15, 10, 0, tzinfo=dt.timezone.utc)
+        )
+        assert result is ApprovalClaimResult.NOT_PENDING
+        # Status is left untouched — the second claimant does not re-mark it.
+        assert proposal_store.get(pid).status == "APPROVED"
+
+    def test_claim_for_approval_nonexistent_returns_not_found(self, proposal_store):
+        from trader.data.proposal_store import ApprovalClaimResult
+
+        result = proposal_store.claim_for_approval(
+            999, dt.datetime(2026, 7, 15, 10, 0, tzinfo=dt.timezone.utc)
+        )
+        assert result is ApprovalClaimResult.NOT_FOUND
+
+    def test_expire_stale_pending_expires_elapsed_aware(self, proposal_store):
+        pid = proposal_store.add(_make_proposal(source="strategy:orb"))
+        proposal_store.update_metadata(pid, {"expires_at": "2026-07-15T10:00:00Z"})
+        expired = proposal_store.expire_stale_pending(
+            dt.datetime(2026, 7, 15, 10, 0, 1, tzinfo=dt.timezone.utc)
+        )
+        assert expired == [pid]
+        assert proposal_store.get(pid).status == "EXPIRED"
+
+    def test_expire_stale_pending_skips_missing_legacy_expiry(self, proposal_store):
+        pid = proposal_store.add(_make_proposal(source="manual"))
+        expired = proposal_store.expire_stale_pending(
+            dt.datetime(2026, 7, 15, 10, 0, tzinfo=dt.timezone.utc)
+        )
+        assert pid not in expired
+        assert proposal_store.get(pid).status == "PENDING"
+
+    def test_expire_stale_pending_expires_naive_and_garbage(self, proposal_store):
+        naive = proposal_store.add(_make_proposal(symbol="AMD", source="strategy:orb"))
+        proposal_store.update_metadata(naive, {"expires_at": "2026-07-15T10:30:00"})
+        garbage = proposal_store.add(_make_proposal(symbol="AAPL", source="llm"))
+        proposal_store.update_metadata(garbage, {"expires_at": "not-a-timestamp"})
+
+        expired = proposal_store.expire_stale_pending(
+            dt.datetime(2026, 7, 15, 10, 0, tzinfo=dt.timezone.utc)
+        )
+        assert set(expired) == {naive, garbage}
+        assert proposal_store.get(naive).status == "EXPIRED"
+        assert proposal_store.get(garbage).status == "EXPIRED"
+
+    def test_expire_stale_pending_no_limit_no_source_filter(self, proposal_store):
+        now = dt.datetime(2026, 7, 15, 10, 0, tzinfo=dt.timezone.utc)
+
+        # Several stale PENDING rows with mixed sources (elapsed / naive / garbage).
+        stale = []
+        s1 = proposal_store.add(_make_proposal(symbol="S1", source="strategy:orb"))
+        proposal_store.update_metadata(s1, {"expires_at": "2026-07-15T09:00:00Z"})
+        stale.append(s1)
+        s2 = proposal_store.add(_make_proposal(symbol="S2", source="llm"))
+        proposal_store.update_metadata(s2, {"expires_at": "2026-07-15T09:30:00"})  # naive
+        stale.append(s2)
+        s3 = proposal_store.add(_make_proposal(symbol="S3", source="manual"))
+        proposal_store.update_metadata(s3, {"expires_at": "garbage"})  # invalid
+        stale.append(s3)
+
+        # One fresh-future row and one missing-expiry legacy row — must be untouched.
+        fresh = proposal_store.add(_make_proposal(symbol="FRESH", source="strategy:orb"))
+        proposal_store.update_metadata(fresh, {"expires_at": "2026-07-15T11:00:00Z"})
+        missing = proposal_store.add(_make_proposal(symbol="MISSING", source="manual"))
+
+        expired = proposal_store.expire_stale_pending(now)
+
+        assert set(expired) == set(stale)
+        for pid in stale:
+            assert proposal_store.get(pid).status == "EXPIRED"
+        assert proposal_store.get(fresh).status == "PENDING"
+        assert proposal_store.get(missing).status == "PENDING"

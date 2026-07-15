@@ -43,6 +43,25 @@ class StrategyState(IntEnum):
     ERROR = 5
 
 
+def is_dispatchable_strategy_state(state: Union[str, "StrategyState"]) -> bool:
+    """True if *state* is a runtime state that actually dispatches signals.
+
+    Accepts either a `StrategyState` member or a raw string (as surfaced by
+    the SDK's `strategies()` listing, which emits state *names* for
+    transport-independence). `INSTALLED` and `DISABLED` are not dispatchable —
+    only `RUNNING` and `WAITING_HISTORICAL_DATA` (which is en route to
+    `RUNNING` once history backfills) are.
+
+    Note: `StrategyState` is an `IntEnum`, so `.value` is the numeric member
+    (e.g. `3`), not its name — using `getattr(state, "value", state)` the way
+    a plain string `Enum` would allow compares an int against the name set
+    and always misses. We branch on `.name` for enum members and fall back to
+    `str(state)` for raw strings instead.
+    """
+    name = state.name if isinstance(state, StrategyState) else str(state)
+    return name.upper() in {"RUNNING", "WAITING_HISTORICAL_DATA"}
+
+
 @dataclass
 class StrategyContext:
     name: str

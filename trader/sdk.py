@@ -21,7 +21,7 @@ from trader.data.universe import Universe
 from trader.messaging.clientserver import consume, RPCClient, TopicPubSub, pack, unpack
 from trader.messaging.data_service_api import DataServiceApi
 from trader.messaging.trader_service_api import TraderServiceApi
-from trader.trading.strategy import StrategyConfig, StrategyState
+from trader.trading.strategy import StrategyConfig, StrategyState, is_dispatchable_strategy_state
 from typing import Any, Callable, Dict, List, Optional, Union
 
 import asyncio
@@ -122,6 +122,17 @@ def compute_resize_deltas(
         })
 
     return scale_factor, adjustments
+
+
+def proposal_display_status(storage_status: str) -> str:
+    """Map a `ProposalStore` storage-layer status to a user-facing label.
+
+    `EXECUTED` is a state-machine implementation detail (see
+    `proposal_store.py`'s transition table) — from the trader's point of
+    view what actually happened is that an order was submitted to the
+    broker, which is what the dashboard/CLI should say.
+    """
+    return "ORDER_SUBMITTED" if storage_status == "EXECUTED" else storage_status
 
 
 class MMR:
@@ -1015,12 +1026,17 @@ class MMR:
         import math
 
         portfolio_df = self.portfolio()
-        if portfolio_df is None or portfolio_df.empty:
-            return {'total_value': 0, 'daily_pnl': 0, 'position_count': 0,
-                    'exposure_pct': 0, 'movers': [], 'timestamp': str(dt.datetime.now())}
 
+        # Fetch account values before the empty-position check: a flat
+        # account still holds cash, and net_liquidation must reflect that
+        # instead of silently reporting 0 just because there are no positions.
         acct_vals = consume(self._rpc.rpc(return_type=dict).get_account_values())
         net_liq = float(acct_vals.get('NetLiquidation', {}).get('value', 0)) if acct_vals else 0.0
+
+        if portfolio_df is None or portfolio_df.empty:
+            return {'total_value': 0.0, 'net_liquidation': round(net_liq, 2),
+                    'daily_pnl': 0, 'position_count': 0,
+                    'exposure_pct': 0, 'movers': [], 'timestamp': str(dt.datetime.now())}
 
         total_value = 0.0
         daily_pnl = 0.0
@@ -1417,10 +1433,19 @@ class MMR:
                 'size': size,
                 'order': order,
                 'exit': exit_label,
-                'conf': f'{p.confidence:.0%}' if p.confidence else '-',
+                # Numeric confidence, not a formatted percent string — a
+                # percent string loses the value for downstream consumers
+                # (dashboard, LLM loop) that need to compare/sort/threshold it.
+                'confidence': float(p.confidence),
                 'created': created,
                 'source': p.source or 'manual',
                 'reasoning': p.reasoning or '',
+                # Raw storage-layer status (state machine value, e.g.
+                # 'EXECUTED') alongside a user-facing label — callers that
+                # need the authoritative state machine value still have it,
+                # while UI/LLM consumers get plain English.
+                'storage_status': p.status,
+                'display_status': proposal_display_status(p.status),
             }
             # Include status column only when showing mixed statuses (--all)
             if status is None:
@@ -2221,6 +2246,11 @@ class MMR:
                 row = {
                     'name': s.name,
                     'state': state_name,
+                    # Transport-independent dispatchable flag — callers
+                    # (dashboard, LLM loop) should derive "is this strategy
+                    # actually running" from this, not from re-deriving their
+                    # own state allowlist against the raw state string.
+                    'dispatchable': is_dispatchable_strategy_state(state_name),
                     'bar_size': str(s.bar_size),
                     'conids': s.conids or [],
                     'hist_days_prior': s.historical_days_prior,

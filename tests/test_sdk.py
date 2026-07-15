@@ -6,7 +6,7 @@ import sys
 import threading
 import time
 from dataclasses import dataclass
-from unittest.mock import MagicMock, patch, PropertyMock
+from unittest.mock import MagicMock, Mock, patch, PropertyMock
 
 import pandas as pd
 import pytest
@@ -17,6 +17,7 @@ if PROJECT_ROOT not in sys.path:
 
 from trader.sdk import MMR, Subscription
 from trader.common.reactivex import SuccessFail, SuccessFailEnum
+from trader.trading.proposal import ExecutionSpec, TradeProposal
 
 
 # ---------------------------------------------------------------------------
@@ -49,6 +50,26 @@ def _make_mmr_with_mock(mock_client) -> MMR:
     mmr._container = MagicMock()
     mmr._container.config_file = '/tmp/test_trader.yaml'
     return mmr
+
+
+def _proposal(symbol='AMD', quantity=10, confidence=0.0) -> TradeProposal:
+    """Build a (not-yet-stored) TradeProposal for domain-value tests."""
+    return TradeProposal(
+        symbol=symbol, action='BUY', quantity=float(quantity),
+        execution=ExecutionSpec(order_type='MARKET'),
+        reasoning='test reasoning',
+        confidence=confidence,
+    )
+
+
+@pytest.fixture
+def mmr(tmp_duckdb_path):
+    """MMR shell wired to a mock RPCClient and to `tmp_duckdb_path`, so it
+    shares the same underlying DuckDB file as the `proposal_store` fixture
+    (both fixtures resolve `tmp_duckdb_path` to the same instance per test)."""
+    m = _make_mmr_with_mock(_make_mock_rpc())
+    m._container.config.return_value = {'duckdb_path': tmp_duckdb_path}
+    return m
 
 
 # ---------------------------------------------------------------------------
@@ -1206,3 +1227,25 @@ class TestStrategiesListingEnrichment:
         row = df.iloc[0]
         assert row['class_name'] == 'OpeningRangeBreakout'
         assert row['description'] == 'ORB 45/1.3 on GOOGL'
+
+
+class TestTransportIndependentDomainValues:
+    """SDK boundary values must be truthful regardless of transport state:
+    a flat account still has cash, confidence is a number not a formatted
+    string, and a storage-layer status maps to a plain-English label."""
+
+    def test_flat_portfolio_keeps_account_net_liquidation(self, mmr):
+        mmr.portfolio = Mock(return_value=pd.DataFrame())
+        mmr._rpc.rpc().get_account_values.return_value = {
+            "NetLiquidation": {"value": "50000", "currency": "USD"}
+        }
+        assert mmr.portfolio_snapshot()["net_liquidation"] == 50000.0
+
+    def test_proposal_rows_keep_numeric_confidence_and_map_submission(self, mmr, proposal_store):
+        pid = proposal_store.add(_proposal(confidence=0.73))
+        proposal_store.update_status(pid, "APPROVED")
+        proposal_store.update_status(pid, "EXECUTED", order_ids=[17])
+        row = mmr.proposals().iloc[0]
+        assert row["confidence"] == 0.73
+        assert row["storage_status"] == "EXECUTED"
+        assert row["display_status"] == "ORDER_SUBMITTED"

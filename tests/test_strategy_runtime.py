@@ -21,7 +21,13 @@ from ib_async.contract import Contract
 from ib_async.ticker import Ticker
 from trader.data.market_data import NORMALIZED_COLUMNS, normalize_ticker
 from trader.objects import Action
-from trader.trading.strategy import Signal, Strategy, StrategyContext, StrategyState
+from trader.trading.strategy import (
+    Signal,
+    Strategy,
+    StrategyContext,
+    StrategyState,
+    is_dispatchable_strategy_state,
+)
 
 
 # ---------------------------------------------------------------------------
@@ -340,3 +346,42 @@ class TestNormalizeTickerEdgeCases:
         # OHLC should be last (100.5), not midpoint (100.0)
         assert df["close"].iloc[0] == pytest.approx(100.5)
         assert df["open"].iloc[0] == pytest.approx(100.5)
+
+
+class TestIsDispatchableStrategyState:
+    """`is_dispatchable_strategy_state` must accept both a `StrategyState`
+    enum member and a raw string. The enum path is the one that used to break:
+    `StrategyState` is an `IntEnum`, so `.value` is the number (e.g. 3), not
+    the name — comparing that against the name-set always missed. These pin
+    the enum-instance branch so it can't regress to that broken form.
+
+    Assertions use identity (`is True` / `is False`) so a truthy-but-non-bool
+    return would fail.
+    """
+
+    def test_enum_running_dispatchable(self):
+        assert is_dispatchable_strategy_state(StrategyState.RUNNING) is True
+
+    def test_enum_waiting_historical_data_dispatchable(self):
+        assert is_dispatchable_strategy_state(StrategyState.WAITING_HISTORICAL_DATA) is True
+
+    def test_enum_disabled_not_dispatchable(self):
+        assert is_dispatchable_strategy_state(StrategyState.DISABLED) is False
+
+    def test_enum_error_not_dispatchable(self):
+        assert is_dispatchable_strategy_state(StrategyState.ERROR) is False
+
+    def test_enum_not_installed_not_dispatchable(self):
+        assert is_dispatchable_strategy_state(StrategyState.NOT_INSTALLED) is False
+
+    def test_enum_installed_not_dispatchable(self):
+        assert is_dispatchable_strategy_state(StrategyState.INSTALLED) is False
+
+    def test_string_running_dispatchable(self):
+        assert is_dispatchable_strategy_state("RUNNING") is True
+
+    def test_string_running_case_insensitive(self):
+        assert is_dispatchable_strategy_state("running") is True
+
+    def test_string_disabled_not_dispatchable(self):
+        assert is_dispatchable_strategy_state("DISABLED") is False

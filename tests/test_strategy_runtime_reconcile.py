@@ -357,3 +357,27 @@ class TestReconcileResilience:
             f'event loop was blocked for {max_gap*1000:.0f}ms during '
             f'reconcile; sync RPC must run in a thread'
         )
+
+
+class TestConfigMtimeInitialization:
+    """reload_strategies (RPC → _reconcile) can fire before run() finishes
+    its initial historical fetch. _config_mtime used to be assigned only
+    late inside run(), so an early reload crashed with AttributeError —
+    the attribute must exist from construction."""
+
+    def test_init_sets_config_mtime(self, tmp_path):
+        rt = StrategyRuntime(
+            ib_server_address='127.0.0.1', ib_server_port=4002,
+            strategy_runtime_ib_client_id=99,
+            duckdb_path=str(tmp_path / 'x.duckdb'),
+            universe_library='u',
+            zmq_pubsub_server_address='tcp://127.0.0.1', zmq_pubsub_server_port=1,
+            zmq_rpc_server_address='tcp://127.0.0.1', zmq_rpc_server_port=2,
+            zmq_strategy_rpc_server_address='tcp://127.0.0.1',
+            zmq_strategy_rpc_server_port=3,
+            zmq_messagebus_server_address='tcp://127.0.0.1',
+            zmq_messagebus_server_port=4,
+            strategies_directory=str(tmp_path),
+            strategy_config_file=str(tmp_path / 'strategy_runtime.yaml'),
+        )
+        assert rt._config_mtime == 0.0

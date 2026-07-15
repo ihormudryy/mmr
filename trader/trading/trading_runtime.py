@@ -684,10 +684,19 @@ class Trader():
         finally:
             self._reconnecting = False
 
+    # The strategy_service proxies below make a BLOCKING zmq RPC. It must run
+    # in a thread (asyncio.to_thread), never on this event loop: several
+    # strategy_service handlers (reload → reconcile → resolve_symbol,
+    # update_strategy_params historically) call back INTO trader_service —
+    # with our loop blocked awaiting their reply, those callbacks can't be
+    # served and both sides burn their RPC timeout. Every `strategies reload`
+    # silently timed out this way before the fix.
+
     @log_method
     async def enable_strategy(self, name: str) -> SuccessFail[StrategyState]:
         try:
-            return self.zmq_strategy_client.rpc().enable_strategy(name)
+            return await asyncio.to_thread(
+                lambda: self.zmq_strategy_client.rpc().enable_strategy(name))
         except Exception as ex:
             logging.error('enable_strategy: {}'.format(ex))
             return SuccessFail.fail(exception=ex)
@@ -695,7 +704,8 @@ class Trader():
     @log_method
     async def update_strategy_params(self, name: str, params: dict) -> SuccessFail[dict]:
         try:
-            return self.zmq_strategy_client.rpc().update_strategy_params(name, params)
+            return await asyncio.to_thread(
+                lambda: self.zmq_strategy_client.rpc().update_strategy_params(name, params))
         except Exception as ex:
             logging.error('update_strategy_params: {}'.format(ex))
             return SuccessFail.fail(exception=ex)
@@ -703,7 +713,8 @@ class Trader():
     @log_method
     async def disable_strategy(self, name: str) -> SuccessFail[StrategyState]:
         try:
-            return self.zmq_strategy_client.rpc().disable_strategy(name)
+            return await asyncio.to_thread(
+                lambda: self.zmq_strategy_client.rpc().disable_strategy(name))
         except Exception as ex:
             logging.error('disable_strategy: {}'.format(ex))
             return SuccessFail.fail(exception=ex)
@@ -711,8 +722,8 @@ class Trader():
     @log_method
     async def get_strategies(self) -> SuccessFail[List[StrategyConfig]]:
         try:
-            rpc_call = self.zmq_strategy_client.rpc().get_strategies()
-            # rpc_call = SuccessFail.success(await (await self.zmq_strategy_client.awaitable_rpc()).get_strategies())
+            rpc_call = await asyncio.to_thread(
+                lambda: self.zmq_strategy_client.rpc().get_strategies())
             return SuccessFail.success(rpc_call)
         except Exception as ex:
             return SuccessFail.fail(exception=ex)
@@ -720,7 +731,8 @@ class Trader():
     @log_method
     async def reload_strategies(self) -> SuccessFail[List[StrategyConfig]]:
         try:
-            return self.zmq_strategy_client.rpc().reload_strategies()
+            return await asyncio.to_thread(
+                lambda: self.zmq_strategy_client.rpc().reload_strategies())
         except Exception as ex:
             logging.error('reload_strategies: {}'.format(ex))
             return SuccessFail.fail(exception=ex)

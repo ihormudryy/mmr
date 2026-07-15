@@ -36,7 +36,8 @@ from urllib.parse import quote
 
 import markdown as _markdown
 import pandas as pd
-from fastapi import FastAPI, Form, HTTPException, Request
+import yaml
+from fastapi import FastAPI, File, Form, HTTPException, Request, UploadFile
 from fastapi.responses import RedirectResponse
 from fastapi.templating import Jinja2Templates
 from starlette.concurrency import run_in_threadpool
@@ -240,6 +241,59 @@ def _humanize_class_name(class_name: str) -> str:
 _STRATEGIES_DIR = os.environ.get(
     'MMR_STRATEGIES_DIR', str(Path(__file__).parent.parent / 'strategies'))
 
+# The runtime's actual config (same file strategy_service reads/reconciles).
+_STRATEGY_CONFIG_PATH = Path('~/.config/mmr/strategy_runtime.yaml').expanduser()
+
+_WATCHLIST_NAME_RE = re.compile(r'^[a-z0-9_-]{1,40}$')
+
+
+def _get_accessor():
+    """UniverseAccessor over the local DuckDB — watchlists ARE universes."""
+    from trader.container import Container
+    from trader.data.universe import UniverseAccessor
+    cfg = Container.instance().config()
+    return UniverseAccessor(cfg['duckdb_path'], cfg['universe_library'])
+
+
+def fetch_watchlists() -> list[dict]:
+    accessor = _get_accessor()
+    rows = []
+    for name, count in sorted(accessor.list_universes_count().items()):
+        symbols = ''
+        try:
+            defs = accessor.get(name).security_definitions
+            symbols = ', '.join(d.symbol for d in defs[:40])
+            if count > 40:
+                symbols += f', +{count - 40} more'
+        except Exception as exc:  # pragma: no cover - defensive
+            logger.warning('watchlist %s read failed: %s', name, exc)
+        rows.append({'name': name, 'count': count, 'symbols': symbols})
+    return rows
+
+
+def _split_symbols(raw: str) -> list[str]:
+    return [s.strip().upper() for s in re.split(r'[,\s;]+', raw or '') if s.strip()]
+
+
+def _resolve_symbols(symbols: list[str], exchange: str = '', currency: str = '',
+                     sec_type: str = 'STK') -> tuple[list, list[str]]:
+    """Resolve each symbol via IB (precision over convenience — never guess).
+    Returns (resolved SecurityDefinitions, unresolved symbol names)."""
+    resolved, missing = [], []
+    for sym in symbols:
+        try:
+            defs = _call(lambda m: m.resolve(
+                sym, sec_type=sec_type, exchange=exchange, currency=currency),
+                retry=False)
+        except Exception as exc:
+            logger.warning('resolve %s failed: %s', sym, exc)
+            defs = None
+        if defs:
+            resolved.append(defs[0])
+        else:
+            missing.append(sym)
+    return resolved, missing
+
 
 def fetch_strategies() -> list[dict]:
     rows = _records(_call(lambda m: m.strategies()))
@@ -297,6 +351,7 @@ def dashboard(request: Request, flash: str = ''):
         'strategies': fetch_strategies,
         'proposals': fetch_proposals,
         'available': fetch_available_strategies,
+        'watchlists': fetch_watchlists,
     }
     for key, fn in fetchers.items():
         try:
@@ -322,6 +377,7 @@ def dashboard(request: Request, flash: str = ''):
         'positions': sections.get('positions') or [],
         'strategies': strategies,
         'available_strategies': available,
+        'watchlists': sections.get('watchlists') or [],
         'enabled_count': sum(1 for s in strategies if s.get('enabled')),
         'proposals': sections.get('proposals') or [],
         'errors': errors,
@@ -427,6 +483,267 @@ async def update_strategy_params(name: str, request: Request):
         logger.warning('params update %s failed: %s', name, exc)
         msg = f'{name} params error: {type(exc).__name__}: {exc}'
     return RedirectResponse(url=f'/?flash={quote(msg)}', status_code=303)
+
+
+def _flash(msg: str) -> RedirectResponse:
+    return RedirectResponse(url=f'/?flash={quote(msg)}', status_code=303)
+
+
+@app.post('/watchlists/create')
+def watchlist_create(request: Request, name: str = Form(''), csrf_token: str = Form('')):
+    _check_access(request)
+    _check_csrf(csrf_token)
+    wl = (name or '').strip().lower()
+    if not _WATCHLIST_NAME_RE.match(wl):
+        return _flash(f'invalid watchlist name {name!r} — use a-z, 0-9, -, _ (max 40)')
+    try:
+        accessor = _get_accessor()
+        if wl in accessor.list_universes_count():
+            return _flash(f'watchlist "{wl}" already exists')
+        universe = accessor.get(wl)          # creates-on-read semantics
+        accessor.update(universe)            # persist the (empty) universe
+        msg = f'watchlist "{wl}" created — add symbols or upload a CSV'
+    except Exception as exc:  # noqa: BLE001
+        logger.warning('watchlist create %s failed: %s', wl, exc)
+        msg = f'create failed: {type(exc).__name__}: {exc}'
+    return _flash(msg)
+
+
+@app.post('/watchlists/{name}/add')
+def watchlist_add(name: str, request: Request, symbols: str = Form(''),
+                  exchange: str = Form(''), currency: str = Form(''),
+                  csrf_token: str = Form('')):
+    _check_access(request)
+    _check_csrf(csrf_token)
+    syms = _split_symbols(symbols)
+    if not syms:
+        return _flash('no symbols given')
+    try:
+        resolved, missing = _resolve_symbols(syms, exchange=exchange, currency=currency)
+        accessor = _get_accessor()
+        for sd in resolved:
+            accessor.insert(name, sd)
+        parts = []
+        if resolved:
+            parts.append('added ' + ', '.join(f'{d.symbol} ({d.conId})' for d in resolved))
+        if missing:
+            parts.append('UNRESOLVED (not added): ' + ', '.join(missing)
+                         + ' — for non-US listings set exchange/currency')
+        msg = f'{name}: ' + ('; '.join(parts) or 'nothing to do')
+    except Exception as exc:  # noqa: BLE001
+        logger.warning('watchlist add %s failed: %s', name, exc)
+        msg = f'{name} add failed: {type(exc).__name__}: {exc}'
+    return _flash(msg)
+
+
+@app.post('/watchlists/{name}/upload')
+async def watchlist_upload(name: str, request: Request,
+                           file: UploadFile = File(...),
+                           csrf_token: str = Form('')):
+    """CSV upload. Simple shape: a `symbol` column (optional exchange/
+    currency/sectype columns) or one symbol per line — rows resolve via IB.
+    Full SecurityDefinition exports (conId column) import directly."""
+    _check_access(request)
+    _check_csrf(csrf_token)
+    raw = await file.read()
+    if len(raw) > 1_000_000:
+        return _flash('CSV too large (max 1 MB)')
+    try:
+        text = raw.decode('utf-8-sig')
+    except UnicodeDecodeError:
+        return _flash('file is not UTF-8 text — export as plain CSV')
+
+    def _import() -> str:
+        import csv as _csv
+        import io
+        lines = [ln for ln in text.splitlines() if ln.strip()]
+        if not lines:
+            return 'CSV is empty'
+        header = [h.strip().lower() for h in lines[0].split(',')]
+        accessor = _get_accessor()
+        if 'conid' in header:
+            count = accessor.update_from_csv_str(name, text)
+            return f'{name}: imported {count} security definitions'
+        if 'symbol' in header:
+            rows = list(_csv.DictReader(io.StringIO(text)))
+            rows = [{k.strip().lower(): (v or '').strip() for k, v in r.items()} for r in rows]
+        else:
+            # headerless: one symbol per line
+            rows = [{'symbol': ln.split(',')[0].strip()} for ln in lines]
+        added, missing = [], []
+        for r in rows:
+            sym = (r.get('symbol') or '').upper()
+            if not sym:
+                continue
+            resolved, unres = _resolve_symbols(
+                [sym], exchange=r.get('exchange', ''), currency=r.get('currency', ''),
+                sec_type=r.get('sectype', 'STK') or 'STK')
+            if resolved:
+                accessor.insert(name, resolved[0])
+                added.append(sym)
+            else:
+                missing.extend(unres)
+        msg = f'{name}: added {len(added)} symbol(s)'
+        if missing:
+            msg += f'; UNRESOLVED: {", ".join(missing[:15])}'
+        return msg
+
+    try:
+        msg = await run_in_threadpool(_import)
+    except Exception as exc:  # noqa: BLE001
+        logger.warning('watchlist upload %s failed: %s', name, exc)
+        msg = f'{name} upload failed: {type(exc).__name__}: {exc}'
+    return _flash(msg)
+
+
+@app.post('/watchlists/{name}/remove')
+def watchlist_remove(name: str, request: Request, symbol: str = Form(''),
+                     csrf_token: str = Form('')):
+    _check_access(request)
+    _check_csrf(csrf_token)
+    try:
+        accessor = _get_accessor()
+        universe = accessor.get(name)
+        match = universe.find_symbol(symbol.strip())
+        if not match:
+            return _flash(f'"{symbol}" not in {name}')
+        universe.security_definitions = [
+            d for d in universe.security_definitions if d.conId != match.conId]
+        accessor.update(universe)
+        msg = f'removed {match.symbol} from {name}'
+    except Exception as exc:  # noqa: BLE001
+        logger.warning('watchlist remove %s failed: %s', name, exc)
+        msg = f'{name} remove failed: {type(exc).__name__}: {exc}'
+    return _flash(msg)
+
+
+@app.post('/watchlists/{name}/delete')
+def watchlist_delete(name: str, request: Request, csrf_token: str = Form('')):
+    _check_access(request)
+    _check_csrf(csrf_token)
+    try:
+        _get_accessor().delete(name)
+        msg = f'watchlist "{name}" deleted'
+    except Exception as exc:  # noqa: BLE001
+        logger.warning('watchlist delete %s failed: %s', name, exc)
+        msg = f'{name} delete failed: {type(exc).__name__}: {exc}'
+    return _flash(msg)
+
+
+def _coerce_yaml_value(text: str):
+    t = (text or '').strip()
+    if t.lower() in ('true', 'false'):
+        return t.lower() == 'true'
+    try:
+        return int(t)
+    except ValueError:
+        pass
+    try:
+        return float(t)
+    except ValueError:
+        pass
+    return t
+
+
+@app.post('/strategies/deploy')
+async def deploy_strategy(request: Request):
+    """Deploy an on-disk strategy: validate against the scanner (keeps the
+    strategies-dir sandbox), resolve/attach the target instruments, append
+    the YAML entry atomically, then reload + enable via RPC."""
+    _check_access(request)
+    form = await request.form()
+    _check_csrf(str(form.get('csrf_token') or ''))
+
+    file_name = str(form.get('file') or '').strip()
+    class_name = str(form.get('class') or '').strip()
+    name = str(form.get('name') or '').strip().lower()
+    bar_size = str(form.get('bar_size') or '1 min').strip()
+    days = str(form.get('days') or '90').strip()
+    symbols = _split_symbols(str(form.get('symbols') or ''))
+    watchlist = str(form.get('watchlist') or '').strip()
+    auto_propose = bool(form.get('auto_propose'))
+    params = {k[len('param_'):]: _coerce_yaml_value(str(v))
+              for k, v in form.items()
+              if k.startswith('param_') and str(v).strip() != ''}
+
+    def _deploy() -> str:
+        # 1. The (file, class) pair must come from the scanner — a forged
+        # form must not be able to point the runtime at an arbitrary path.
+        known = {(r['file'], r['class']) for r in scan_strategies(_STRATEGIES_DIR)}
+        if (file_name, class_name) not in known:
+            return f'unknown strategy {class_name} in {file_name} — not deploying'
+        if not _WATCHLIST_NAME_RE.match(name or ''):
+            return f'invalid deployment name {name!r} — use a-z, 0-9, -, _ (max 40)'
+        if bool(symbols) == bool(watchlist):
+            return 'give either symbols or a watchlist (exactly one)'
+
+        # 2. Config: reject duplicate names before doing any work.
+        if _STRATEGY_CONFIG_PATH.exists():
+            config = yaml.safe_load(_STRATEGY_CONFIG_PATH.read_text()) or {}
+        else:
+            config = {}
+        entries = config.setdefault('strategies', [])
+        if any(e.get('name') == name for e in entries):
+            return f'strategy "{name}" already deployed — undeploy first or pick another name'
+
+        entry: dict = {
+            'name': name,
+            'description': f'Deployed from dashboard ({class_name} in {file_name})',
+            'module': f'strategies/{file_name}',
+            'class_name': class_name,
+            'bar_size': bar_size,
+            'historical_days_prior': int(days) if days.isdigit() else 90,
+        }
+        # 3. Target instruments. Symbols resolve via IB and register their
+        # security definitions locally (strategy load needs resolve_symbol
+        # to hit) in a per-deploy watchlist for provenance.
+        if symbols:
+            resolved, missing = _resolve_symbols(symbols)
+            if missing:
+                return ('deploy aborted — unresolved: ' + ', '.join(missing)
+                        + ' (nothing written)')
+            accessor = _get_accessor()
+            for sd in resolved:
+                accessor.insert(f'strat_{name}', sd)
+            entry['conids'] = [sd.conId for sd in resolved]
+        else:
+            entry['universe'] = watchlist
+        if auto_propose:
+            entry['auto_execute'] = 'propose'
+        if params:
+            entry['params'] = params
+
+        entries.append(entry)
+        tmp = str(_STRATEGY_CONFIG_PATH) + '.tmp'
+        with open(tmp, 'w') as f:
+            yaml.safe_dump(config, f, sort_keys=False)
+        os.replace(tmp, _STRATEGY_CONFIG_PATH)
+
+        # 4. Load it now (not in 30s) and enable it, per the one-click ask.
+        try:
+            reload_result = _call(lambda m: m.reload_strategies(), retry=False)
+            if hasattr(reload_result, 'is_success') and not reload_result.is_success():
+                return (f'"{name}" written to config but reload failed: '
+                        f'{_result_error(reload_result)} — it loads on the next '
+                        'reconcile; enable it from the Strategies tab')
+            enable_result = _call(lambda m: m.enable_strategy(name), retry=False)
+            if hasattr(enable_result, 'is_success') and not enable_result.is_success():
+                return (f'"{name}" deployed but enable failed: '
+                        f'{_result_error(enable_result)} — enable it from the '
+                        'Strategies tab')
+        except Exception as exc:
+            return (f'"{name}" written to config but service call failed '
+                    f'({type(exc).__name__}: {exc}) — it loads on the next '
+                    'reconcile; enable it from the Strategies tab')
+        target = ', '.join(symbols) if symbols else f'watchlist {watchlist}'
+        return f'deployed & enabled "{name}" ({class_name}) on {target}'
+
+    try:
+        msg = await run_in_threadpool(_deploy)
+    except Exception as exc:  # noqa: BLE001
+        logger.warning('deploy failed: %s', exc)
+        msg = f'deploy error: {type(exc).__name__}: {exc}'
+    return _flash(msg)
 
 
 def main():

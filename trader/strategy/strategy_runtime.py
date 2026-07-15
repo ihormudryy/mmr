@@ -133,6 +133,12 @@ class StrategyRuntime():
         # Last completed bar timestamp dispatched per (conId, strategy name), so
         # a strategy sees each bar once (not on every tick).
         self._last_dispatched_bar: Dict[tuple, pd.Timestamp] = {}
+        # Config-file change detection. Must exist from construction:
+        # reload_strategies (RPC → _reconcile) can fire while run() is still
+        # in its initial historical fetch, long before run() stamps the real
+        # mtime — 0.0 makes that early reload load the config instead of
+        # crashing on a missing attribute.
+        self._config_mtime: float = 0.0
         # Keep at most this many days of raw ticks per conid (bounds compute).
         self._tick_retention_days: int = 2
 

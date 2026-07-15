@@ -673,3 +673,50 @@ class TestReconnectTickerResubscription:
         t = self._trader()
         Trader._republish_ticker_subscriptions(t)
         assert t._published_calls == []
+
+
+# ---------------------------------------------------------------------------
+# Strategy-service proxies must not block the event loop
+# ---------------------------------------------------------------------------
+
+@pytest.mark.asyncio
+async def test_strategy_proxies_run_off_loop():
+    """The strategy_service proxies (reload/enable/disable/update_params)
+    make a BLOCKING zmq RPC. Running it on the trader event loop deadlocks:
+    strategy_service handlers call resolve_symbol back into trader_service,
+    which can't answer while its loop is blocked awaiting their reply —
+    every `strategies reload` silently timed out this way. The proxies must
+    offload the sync call to a thread."""
+    trader = _minimal_trader()
+
+    thread_ids = []
+
+    class _Rpc:
+        def _record(self, *a, **k):
+            thread_ids.append(threading.get_ident())
+            return 'ok'
+        reload_strategies = _record
+        enable_strategy = _record
+        disable_strategy = _record
+
+        def update_strategy_params(self, name, params):
+            thread_ids.append(threading.get_ident())
+            return 'ok'
+
+    class _Client:
+        def rpc(self, **kw):
+            return _Rpc()
+
+    trader.zmq_strategy_client = _Client()
+
+    await trader.reload_strategies()
+    await trader.enable_strategy('x')
+    await trader.disable_strategy('x')
+    await trader.update_strategy_params('x', {'A': 1})
+
+    assert len(thread_ids) == 4
+    assert all(tid != threading.get_ident() for tid in thread_ids), (
+        'strategy-service proxy ran its blocking zmq call on the event '
+        'loop thread — must offload via asyncio.to_thread (deadlock: '
+        'strategy_service calls back into trader_service during these RPCs)'
+    )

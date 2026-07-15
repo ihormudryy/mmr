@@ -235,3 +235,221 @@ class TestTabs:
         preserves — switching to Strategies must survive the 15s refresh."""
         html = client.get('/').text
         assert 'location.hash' in html
+
+
+# ---------------------------------------------------------------------------
+# Watchlists (universes UI) + deploy-from-disk
+# Spec: docs/superpowers/specs/2026-07-15-watchlists-and-ui-deploy-design.md
+# ---------------------------------------------------------------------------
+
+from types import SimpleNamespace
+
+
+def _sd(symbol='AAPL', conid=265598):
+    return SimpleNamespace(symbol=symbol, conId=conid, secType='STK',
+                           exchange='SMART', primaryExchange='NASDAQ',
+                           currency='USD')
+
+
+class StubAccessor:
+    def __init__(self):
+        self.universes = {'mylist': [_sd('AAPL'), _sd('MSFT', 272093)]}
+        self.calls = []
+
+    def list_universes_count(self):
+        return {n: len(d) for n, d in self.universes.items()}
+
+    def get(self, name):
+        defs = list(self.universes.get(name, []))
+        ns = SimpleNamespace(name=name, security_definitions=defs)
+        ns.find_symbol = lambda sym: next(
+            (d for d in defs if d.symbol.upper() == sym.upper()), None)
+        return ns
+
+    def insert(self, name, sd):
+        self.universes.setdefault(name, []).append(sd)
+        self.calls.append(('insert', name, sd.symbol))
+
+    def update(self, universe):
+        self.universes[universe.name] = list(universe.security_definitions)
+        self.calls.append(('update', universe.name))
+
+    def delete(self, name):
+        self.universes.pop(name, None)
+        self.calls.append(('delete', name))
+
+    def update_from_csv_str(self, name, csv_str):
+        self.calls.append(('csv', name))
+        return max(0, len(csv_str.strip().splitlines()) - 1)
+
+
+_RESOLVABLE = {'AAPL': 265598, 'MSFT': 272093, 'GLD': 51529211}
+
+
+@pytest.fixture
+def accessor(monkeypatch):
+    acc = StubAccessor()
+    monkeypatch.setattr(webapp, '_get_accessor', lambda: acc)
+    return acc
+
+
+@pytest.fixture
+def stub_resolving(stub, monkeypatch):
+    def resolve(symbol, sec_type='STK', exchange='', currency='', universe=''):
+        conid = _RESOLVABLE.get(str(symbol).upper())
+        return [_sd(str(symbol).upper(), conid)] if conid else []
+    stub.resolve = resolve
+    stub.reload_strategies = lambda: _Ok()
+    return stub
+
+
+@pytest.fixture
+def deploy_config(tmp_path, monkeypatch):
+    import yaml
+    cfg = tmp_path / 'strategy_runtime.yaml'
+    cfg.write_text(yaml.safe_dump(
+        {'strategies': [{'name': 'orb_googl', 'module': 'strategies/opening_range_breakout.py',
+                         'class_name': 'OpeningRangeBreakout'}]}))
+    monkeypatch.setattr(webapp, '_STRATEGY_CONFIG_PATH', cfg)
+    return cfg
+
+
+class TestWatchlistRoutes:
+    def test_create(self, client, accessor, stub_resolving):
+        r = client.post('/watchlists/create',
+                        data={'csrf_token': _csrf(), 'name': 'My-Watch_1'},
+                        follow_redirects=False)
+        assert r.status_code == 303
+        assert 'my-watch_1' in accessor.universes
+
+    def test_create_bad_name_rejected(self, client, accessor, stub_resolving):
+        client.post('/watchlists/create',
+                    data={'csrf_token': _csrf(), 'name': '../evil'},
+                    follow_redirects=False)
+        assert '../evil' not in accessor.universes
+
+    def test_add_symbols_resolves_and_inserts(self, client, accessor, stub_resolving):
+        r = client.post('/watchlists/mylist/add',
+                        data={'csrf_token': _csrf(), 'symbols': 'GLD, MSFT'},
+                        follow_redirects=False)
+        assert r.status_code == 303
+        assert ('insert', 'mylist', 'GLD') in accessor.calls
+
+    def test_add_unresolved_symbol_reported_not_inserted(self, client, accessor, stub_resolving):
+        r = client.post('/watchlists/mylist/add',
+                        data={'csrf_token': _csrf(), 'symbols': 'NOPE123'},
+                        follow_redirects=False)
+        assert 'NOPE123' in r.headers['location']
+        assert not any(c[0] == 'insert' for c in accessor.calls)
+
+    def test_upload_simple_csv_resolves_rows(self, client, accessor, stub_resolving):
+        csv_bytes = b'symbol\nAAPL\nGLD\n'
+        r = client.post('/watchlists/mylist/upload',
+                        data={'csrf_token': _csrf()},
+                        files={'file': ('w.csv', csv_bytes, 'text/csv')},
+                        follow_redirects=False)
+        assert r.status_code == 303
+        assert ('insert', 'mylist', 'AAPL') in accessor.calls
+        assert ('insert', 'mylist', 'GLD') in accessor.calls
+
+    def test_upload_secdef_csv_uses_bulk_import(self, client, accessor, stub_resolving):
+        csv_bytes = b'conId,symbol\n265598,AAPL\n'
+        client.post('/watchlists/mylist/upload',
+                    data={'csrf_token': _csrf()},
+                    files={'file': ('w.csv', csv_bytes, 'text/csv')},
+                    follow_redirects=False)
+        assert ('csv', 'mylist') in accessor.calls
+
+    def test_remove_symbol(self, client, accessor, stub_resolving):
+        client.post('/watchlists/mylist/remove',
+                    data={'csrf_token': _csrf(), 'symbol': 'AAPL'},
+                    follow_redirects=False)
+        assert all(d.symbol != 'AAPL' for d in accessor.universes['mylist'])
+
+    def test_delete_watchlist(self, client, accessor, stub_resolving):
+        client.post('/watchlists/mylist/delete',
+                    data={'csrf_token': _csrf()}, follow_redirects=False)
+        assert 'mylist' not in accessor.universes
+
+    def test_watchlists_tab_rendered(self, client, accessor, stub_resolving):
+        html = client.get('/').text
+        assert 'data-tab="watchlists"' in html
+        assert 'id="tab-watchlists"' in html
+        assert 'mylist' in html
+        assert 'AAPL' in html
+
+
+class TestDeployRoute:
+    def _deploy(self, client, **extra):
+        data = {'csrf_token': _csrf(), 'file': 'momentum.py', 'class': 'Momentum',
+                'name': 'mom_test', 'bar_size': '1 min', 'days': '90',
+                'symbols': 'AAPL'}
+        data.update(extra)
+        return client.post('/strategies/deploy', data=data, follow_redirects=False)
+
+    def test_deploy_writes_yaml_reloads_and_enables(
+            self, client, stub, accessor, stub_resolving, deploy_config):
+        import yaml
+        r = self._deploy(client)
+        assert r.status_code == 303
+        cfg = yaml.safe_load(deploy_config.read_text())
+        entry = next(e for e in cfg['strategies'] if e['name'] == 'mom_test')
+        assert entry['module'] == 'strategies/momentum.py'
+        assert entry['class_name'] == 'Momentum'
+        assert entry['conids'] == [265598]
+        assert ('enable', 'mom_test') in stub.calls
+        # resolved secdef registered so resolve_symbol(conId) works at load
+        assert ('insert', 'strat_mom_test', 'AAPL') in accessor.calls
+
+    def test_deploy_with_watchlist_target(self, client, stub, accessor,
+                                          stub_resolving, deploy_config):
+        import yaml
+        self._deploy(client, symbols='', watchlist='mylist')
+        cfg = yaml.safe_load(deploy_config.read_text())
+        entry = next(e for e in cfg['strategies'] if e['name'] == 'mom_test')
+        assert entry['universe'] == 'mylist'
+        assert 'conids' not in entry
+
+    def test_deploy_propose_mode(self, client, stub, accessor,
+                                 stub_resolving, deploy_config):
+        import yaml
+        self._deploy(client, auto_propose='on')
+        cfg = yaml.safe_load(deploy_config.read_text())
+        entry = next(e for e in cfg['strategies'] if e['name'] == 'mom_test')
+        assert entry['auto_execute'] == 'propose'
+
+    def test_deploy_params_recorded(self, client, stub, accessor,
+                                    stub_resolving, deploy_config):
+        import yaml
+        self._deploy(client, param_LOOKBACK='25')
+        cfg = yaml.safe_load(deploy_config.read_text())
+        entry = next(e for e in cfg['strategies'] if e['name'] == 'mom_test')
+        assert entry['params'] == {'LOOKBACK': 25}
+
+    def test_duplicate_name_rejected(self, client, stub, accessor,
+                                     stub_resolving, deploy_config):
+        import yaml
+        r = self._deploy(client, name='orb_googl')
+        assert 'already' in r.headers['location']
+        cfg = yaml.safe_load(deploy_config.read_text())
+        assert len([e for e in cfg['strategies'] if e['name'] == 'orb_googl']) == 1
+
+    def test_unknown_class_rejected(self, client, stub, accessor,
+                                    stub_resolving, deploy_config):
+        import yaml
+        self._deploy(client, **{'class': 'EvilClass', 'file': '../../etc/passwd'})
+        cfg = yaml.safe_load(deploy_config.read_text())
+        assert not any(e.get('name') == 'mom_test' for e in cfg['strategies'])
+
+    def test_unresolved_symbol_aborts_deploy(self, client, stub, accessor,
+                                             stub_resolving, deploy_config):
+        import yaml
+        r = self._deploy(client, symbols='AAPL NOPE123')
+        assert 'NOPE123' in r.headers['location']
+        cfg = yaml.safe_load(deploy_config.read_text())
+        assert not any(e.get('name') == 'mom_test' for e in cfg['strategies'])
+
+    def test_deploy_form_rendered_in_available_table(self, client, accessor, stub_resolving):
+        html = client.get('/').text
+        assert '/strategies/deploy' in html
+        assert 'name="watchlist"' in html

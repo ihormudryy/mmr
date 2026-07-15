@@ -9,7 +9,11 @@
 Replace the current periodically refreshed dashboard with a realtime, single-user
 trading command center. The trading services remain authoritative. The dashboard
 provides a coherent operational view and safe controls, including proposal
-approval and strategy controls in both paper and live modes.
+creation, proposal approval, and strategy controls in both paper and live modes.
+With proposal origination included, the dashboard covers the complete
+propose → review → approve → monitor loop — the one workflow it is built
+around — so routine trading operation does not require the CLI. Section 8.5
+records the disposition of every CLI capability.
 
 This is the first milestone. New charting and historical exploration remain a
 separate second milestone. Watchlist management and deploy-from-disk already
@@ -20,6 +24,8 @@ they remain compatibility requirements before that dashboard can be retired.
 
 - Show account, position, proposal, order, fill, strategy, risk, reconciliation,
   and dependency state with low latency.
+- Originate trade proposals from the dashboard through the same trading-filter,
+  position-sizing, and risk pipeline as the CLI `propose` command.
 - Recover coherently from browser, bridge, and source-service disconnections.
 - Make stale, degraded, submitted, partially filled, filled, and failed states
   unambiguous.
@@ -565,13 +571,25 @@ and daily P&L, exposure, protection state, and freshness.
 Selecting a position opens a drawer with related orders, fills, proposals, risk
 information, and reconciliation findings.
 
+The drawer's **Close position** action never places an order directly. It
+creates a pre-filled position-reducing proposal (opposite side, verified
+reducible quantity, market order by default) that enters the ordinary action
+queue and follows the position-reducing approval rules of Section 9.2.
+
 ### 8.3 Action queue
 
 The persistent right rail contains pending proposals and urgent warnings.
 Proposal cards show side, instrument, quantity and notional, rationale, source,
 typed numeric confidence, reference-price age, current price drift, risk result,
 and expiry. Approve and reject are available in paper and live modes subject to
-Section 9.
+Section 9. A proposal's drawer shows the complete position-sizing reasoning
+chain (the CLI's `proposals show`), not only a one-line preview.
+
+A **New proposal** action opens a drawer with the same expressiveness as the
+CLI `propose` command: instrument, side, order type, quantity or notional
+amount, bracket / stop-loss / trailing-stop exits, time in force, confidence,
+group tag, and reasoning. Leaving quantity and amount empty invokes the same
+automatic position sizing as the CLI. Creation follows Section 9.6.
 
 ### 8.4 Orders, executions, strategy, and risk
 
@@ -588,6 +606,10 @@ The normalized dashboard contract maps the legacy proposal status `EXECUTED` to
 `ORDER_SUBMITTED`; it never presents submission as a fill. Actual order and fill
 events determine execution progress.
 
+Each working order exposes **Cancel**, subject to the risk classification in
+Section 9.7. **Cancel all** requires one confirmation listing every affected
+order with its classification.
+
 Strategy rows derive enabled state from dispatchable runtime states, not merely
 from an installed configuration. They show latest activity, data freshness, and
 errors.
@@ -595,9 +617,40 @@ Their drawers provide enable/disable and schema-driven parameter controls. Risk
 and reconciliation failures are explicit alerts; an RPC or validation failure
 can never render as a green "no warnings" result.
 
+### 8.5 CLI capability coverage
+
+The command center is an operations console, not a replacement terminal. Every
+CLI capability has an explicit disposition and delivery tag so parity gaps are
+chosen rather than discovered:
+
+- `[M1-C]` — proposal creation (`propose`), review detail (`proposals show`),
+  approval and rejection (`approve`, `reject`); position close via a
+  pre-filled reducing proposal (`close`); working-order cancel (`cancel`,
+  `cancel-all`).
+- `[M1-R]` — account, portfolio, order, execution, risk, and session state
+  (`portfolio`, `account`, `status`, `orders`, `trades`, `portfolio-risk`,
+  `session`) as read panels.
+- `[COMPAT]` — watchlist CRUD and CSV import, strategy discovery and
+  deploy-from-disk, parameter editing, and reasoning views, retained per
+  Section 14.1.
+- `[M2]` — charts and history; position-group management (`group ...`);
+  proposal history browsing and filtering; `strategies undeploy`; read-only
+  data freshness (`data status`) surfaced beside strategy health.
+- **Deliberately excluded** — direct order entry (`buy`, `sell`),
+  `resize-positions`, and standalone protective-order placement. Every
+  dashboard-originated order passes through the proposal pipeline and the
+  Section 5.6 coordinator; order placement that bypasses them is materially
+  different and requires a separate future design.
+- **Remains CLI** — research and development workflows: scanners (`ideas`,
+  `scan`, `movers`), per-symbol research (`news`, `ratios`, `depth`,
+  `snapshot`), options and forex tooling, backtesting (`backtest`, `bt-sweep`,
+  `sweep`, `backtests`), universe bulk operations, and data download/refresh
+  management.
+
 ## 9. Live Commands and Safety
 
-Supported milestone-1 commands are proposal approve/reject, strategy
+Supported milestone-1 commands are proposal create/approve/reject, position
+close via a pre-filled reducing proposal, working-order cancel, strategy
 enable/disable, atomic strategy-parameter update, and account-scoped **Pause new
 trading** for the exact configured account.
 
@@ -622,8 +675,9 @@ preflight and reuses it for confirmation and every retry:
 2. Confirmation submits that nonce, the same command ID, and the same
    `expected_version`.
 
-Proposal rejection, **Pause new trading**, and strategy disable with verified
-zero exposure are immediate idempotent actions in both modes. Exposure-owning
+Proposal rejection, **Pause new trading**, entry-order cancel (Section 9.7), and
+strategy disable with verified zero exposure are immediate idempotent actions in
+both modes. Exposure-owning
 disable follows Section 9.3. Resuming new trading is risk-increasing and follows
 the live preflight ceremony for a live account.
 
@@ -820,6 +874,52 @@ service proves whether the original command committed. Receipt reconciliation
 is included in the initial immediate/5-second/30-second schedule and the
 15-minute critical-alert rule.
 
+### 9.6 Proposal creation and position close
+
+Creating a proposal stages intent; it places no order. It therefore uses
+Section 9.1's single authenticated POST in both modes — carrying a
+client-generated `command_id` so a double-submit, retry, or reconnect cannot
+create duplicate proposals — rather than the two-stage preflight. The
+`TradingCommandCoordinator` routes creation to the same typed `create_proposal`
+API that strategy signal bridging uses (Section 5.5), with the CLI path's
+trading-filter check, automatic position sizing (confidence, risk level, ATR
+volatility, liquidity) when no quantity or amount is supplied, and group
+registration. The source is recorded as `dashboard`.
+
+Dashboard-created proposals satisfy the guard-complete `PENDING` shape of
+Section 9.2 at creation: account, account mode, canonical `conId`, UTC expiry,
+reference price/timestamp/quote side/feed type, drift guard, and initial
+revision come from the trader's own quote and account state, never from
+browser-supplied values. If the trader lacks a sufficiently fresh quote for the
+instrument, creation is refused with an explicit error; a pending row is never
+inserted and enriched later. The Section 9.4 pause gate blocks
+exposure-increasing creation; verified position-reducing close proposals remain
+allowed while paused.
+
+The **Close position** action (Section 8.2) creates a reducing proposal through
+this same path, pre-filled from the broker-verified position. Its quantity may
+not exceed the verified reducible quantity, and that limit is re-checked at
+approval per Section 9.2.
+
+### 9.7 Working-order cancel
+
+Cancel is classified by its risk direction, not treated as uniformly safe.
+Cancelling a working exposure-increasing entry order is risk-reducing:
+immediate, idempotent, and available in both modes with a single authenticated
+POST. Cancelling a protective order (a stop, trailing stop, or take-profit leg
+attached to an open position) removes protection and is risk-increasing: it
+requires the Section 9.1 ceremony for the account mode, and the confirmation
+names the position left unprotected. Order-group membership (Section 8.4)
+determines the classification; an order whose classification cannot be
+established is treated as protective.
+
+Cancel commands flow through the coordinator's command ledger and are
+reconciled like other order commands (Section 9.5). Cancelling an order that
+reached a terminal state in the meantime is a no-op that reports the
+authoritative state. **Cancel all** expands to per-order commands under one
+correlation ID and one confirmation that lists every affected order with its
+classification.
+
 ## 10. Authentication, CSRF, and Audit
 
 In direct host mode the dashboard binds to loopback. In Compose it binds to
@@ -894,6 +994,10 @@ Command availability is dependency-aware:
 
 - Approval, strategy enable, and risk-increasing changes require the relevant
   services plus fresh market/account state.
+- Proposal creation requires the trader command coordinator, its durable store,
+  and a fresh quote for the target instrument.
+- Entry-order cancel requires the trader service and its broker path; it does
+  not require fresh market data.
 - **Pause new trading** remains available whenever the trader command
   coordinator and its durable store are reachable. Risk-reducing exits also
   require their broker path. Strategy disable additionally requires
@@ -951,6 +1055,11 @@ the dashboard is trusted for live monitoring or control.
   coalescing.
 - Journal cursor, fenced snapshot, replay cursor, and stream-change behavior.
 - Proposal expiry, price drift, freshness, risk, and compare-and-set validation.
+- Proposal creation: guard-complete `PENDING` shape, sizing parity with the CLI
+  path, duplicate-submit idempotency, trading-filter rejection, missing-quote
+  refusal, pause-gate enforcement, and close-proposal quantity limits.
+- Order-cancel risk classification (entry versus protective) and idempotency
+  against already-terminal orders.
 - Command-ledger idempotency, same-ID/different-payload conflict, saga crash
   points, one-time preflight expiry, pause semantics, session authentication,
   CSRF, and origin enforcement.
@@ -1063,7 +1172,7 @@ The delivery workstreams expose service-side effort before scheduling starts:
 | `[M1-F]` | `strategy_service` | Typed proposal creation, persistent strategy revisions/receipts, pause observation, committed-state acknowledgement, and anti-entropy snapshot. | Trader typed APIs. |
 | `[M1-F]` | SDK/CLI | Thin typed proposal/command/query adapters; removal of direct proposal-table writes and unrestricted production order calls. | Trader coordinator. |
 | `[M1-R]` | Dashboard | Authenticated snapshot, long-poll bridge, reducer, quote conflation, quote-free replay, async SSE, operations-first UI, degraded polling fallback, and browser tests. | Fenced source foundation. |
-| `[M1-C]` | `trader_service` | Dashboard and strategy integration; paper commands first, then live preflight, account pinning, drift/freshness gates, resume ceremony, event-confirmed outcomes, and full audit/reconciliation. | `[M1-F]`, `[M1-R]`, soak gates. |
+| `[M1-C]` | `trader_service` | Dashboard and strategy integration; proposal creation, position-close, and order-cancel commands; paper commands first, then live preflight, account pinning, drift/freshness gates, resume ceremony, event-confirmed outcomes, and full audit/reconciliation. | `[M1-F]`, `[M1-R]`, soak gates. |
 | `[COMPAT]` | Dashboard | Legacy reasoning views, parameter editor, watchlists/CSV, strategy discovery/deploy, side-by-side route, and migration of retained strategy mutations to the common authenticated coordinator. | Retained until Section 14.1 passes. |
 
 Rollout order is:
@@ -1077,9 +1186,10 @@ Rollout order is:
    5.4, command coordinator, journal, entity revisions, pause state, order/fill
    persistence, quote coverage, and fenced snapshot/long-poll APIs.
 3. Deploy `[M1-R]` read-only in paper mode with snapshot plus SSE.
-4. Enable `[M1-C]` authenticated proposal and strategy commands in paper mode;
-   disable overlapping legacy proposal and strategy-control routes so each
-   command type has one acting surface.
+4. Enable `[M1-C]` authenticated proposal creation, approval, position-close,
+   order-cancel, and strategy commands in paper mode; disable overlapping legacy
+   proposal and strategy-control routes so each command type has one acting
+   surface.
 5. Pass CI, process-kill tests, and the eight-hour paper soak with simulated
    dependency failures.
 6. Run both interfaces read-only for at least one complete live market session
@@ -1134,6 +1244,9 @@ existing controls.
 
 - A single local operator can monitor and control the system from Layout A
   without full-page refreshes.
+- The operator can complete the entire trading loop — create a proposal, review
+  its sizing and risk, approve it, and watch the order work and fill — without
+  the CLI.
 - Every event in Section 5.4 has a tested producer, durable transaction where
   required, fenced snapshot representation, and typed long-poll delivery; the
   read-only dashboard does not depend on snapshot poll-and-diff for normal

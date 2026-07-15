@@ -781,7 +781,25 @@ class StrategyRuntime():
         portfolio universe with ~10 conIds used to stall the loop for
         ~1s every 30s, which surfaced as an asyncio "slow callback"
         warning and stalled live ticker dispatch.
+
+        Runs the stale-proposal expiry sweep first, on every invocation —
+        this is what makes expiry time-driven (every ~30s reconcile tick)
+        rather than only firing when a strategy happens to emit a fresh
+        signal. This method is also the target of the ``reload_strategies``
+        RPC and can fire before ``run()``'s initial historical fetch
+        completes, so it doubles as the "startup reconciliation" path.
+
+        The sweep is a synchronous DuckDB UPDATE whose ``execute_atomic``
+        retries for up to ~45s under file-lock contention, so it is
+        offloaded to a thread (like ``_reconcile_sync``) — running it on the
+        loop would stall live ticker dispatch. It is also isolated in its
+        own try/except: a proposal-store failure must not skip the config
+        reload + re-subscription work that follows.
         """
+        try:
+            await asyncio.to_thread(self.signal_proposer.expire_stale)
+        except Exception as ex:
+            logging.warning('proposal expiry sweep failed (will retry next cycle): %s', ex)
         await asyncio.to_thread(self._reconcile_sync)
 
     def _reconcile_sync(self):
@@ -1082,12 +1100,19 @@ class StrategyRuntime():
         except OSError:
             self._config_mtime = 0.0
 
-        # Stay alive and periodically reconcile subscriptions
+        # Stay alive and periodically reconcile subscriptions. Reconcile
+        # ONCE immediately (reconcile-then-sleep, not sleep-then-reconcile)
+        # so the stale-proposal expiry sweep runs at startup rather than 30s
+        # in — proposals that expired while the service was down get swept on
+        # boot. This is idempotent: the inline subscribe block above already
+        # ran and _config_mtime was just stamped, so _reconcile_sync's
+        # subscribe/reload work is a no-op here; only the expiry sweep does
+        # real work on this first pass.
         logging.info('entering reconciliation loop (30s interval)')
         while True:
-            await asyncio.sleep(30)
             try:
                 await self._reconcile()
             except Exception as ex:
                 logging.error('reconciliation error: {}'.format(ex))
+            await asyncio.sleep(30)
 

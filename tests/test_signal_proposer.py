@@ -10,6 +10,7 @@ Spec: docs/superpowers/specs/2026-07-15-signal-propose-bridge-design.md
 
 import datetime as dt
 from pathlib import Path
+from unittest.mock import Mock
 
 import pandas as pd
 import pytest
@@ -271,6 +272,21 @@ class TestGatingAndTtl:
         )
         proposer.on_signal('orb_test', _signal(Action.BUY), _frame())
         assert proposal_store.get(manual_id).status == ProposalStatus.PENDING.value
+
+
+# ---------------------------------------------------------------------------
+# Periodic (reconciliation-driven) expiry sweep
+# ---------------------------------------------------------------------------
+
+class TestExpireStale:
+    def test_expire_stale_delegates_without_limit(self, proposer, proposal_store):
+        proposal_store.expire_stale_pending = Mock(return_value=[4])
+        now = dt.datetime(2026, 7, 16, 12, 0, tzinfo=dt.timezone.utc)
+        assert proposer.expire_stale(now) == [4]
+        # Delegates the whole sweep with only the effective `now` — no
+        # limit=/source= kwargs. Asserting the exact call catches a future
+        # regression that would silently scope or cap the sweep.
+        proposal_store.expire_stale_pending.assert_called_once_with(now)
 
 
 # ---------------------------------------------------------------------------

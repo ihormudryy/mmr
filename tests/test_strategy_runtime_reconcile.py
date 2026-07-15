@@ -11,6 +11,7 @@ minimally-wired StrategyRuntime and drive the pieces under test directly.
 import asyncio
 import os
 from pathlib import Path
+from unittest.mock import Mock
 
 import pytest
 import yaml
@@ -34,7 +35,20 @@ def _make_runtime(tmp_path, strategies_dir, config_file=None, paper_trading=True
     rt._config_mtime = 0.0
     rt.trader_client = None  # type: ignore
     rt.paper_trading = paper_trading
+    # _reconcile() sweeps proposal expiry unconditionally on every call — a
+    # bare stub (not exercised by these tests) keeps that a no-op.
+    rt.signal_proposer = Mock()
     return rt
+
+
+@pytest.fixture
+def runtime(tmp_path):
+    """Minimal StrategyRuntime (with its default Mock signal_proposer from
+    ``_make_runtime``), for exercising the reconciliation-loop wiring in
+    isolation (no real proposal store)."""
+    strategies = tmp_path / 'strategies'
+    strategies.mkdir()
+    return _make_runtime(tmp_path, strategies)
 
 
 def _write_strategy(strategies_dir: Path, name: str, body: str) -> Path:
@@ -357,6 +371,81 @@ class TestReconcileResilience:
             f'event loop was blocked for {max_gap*1000:.0f}ms during '
             f'reconcile; sync RPC must run in a thread'
         )
+
+    @pytest.mark.asyncio
+    async def test_expiry_sweep_does_not_block_event_loop(self, tmp_path):
+        """Regression guard: the proposal expiry sweep is a synchronous
+        DuckDB UPDATE whose execute_atomic retries for up to ~45s under
+        file-lock contention. If _reconcile() ran it on the loop thread
+        (instead of via asyncio.to_thread) it would stall live ticker
+        dispatch. Simulate a slow sweep and prove the loop stays responsive."""
+        import time
+        strategies = tmp_path / 'strategies'
+        strategies.mkdir()
+        config_file = tmp_path / 'strategy_runtime.yaml'
+        config_file.write_text('strategies: []\n')
+        rt = _make_runtime(tmp_path, strategies, config_file)
+        rt.strategy_implementations = []
+        rt._config_mtime = os.path.getmtime(str(config_file))
+
+        # A trader_client that never blocks — the only slow thing is the sweep.
+        class _StubClient:
+            def rpc(self, return_type=None):
+                raise ConnectionError('not connected — test stub')
+
+        rt.trader_client = _StubClient()  # type: ignore
+
+        # Simulate a slow proposal-store sweep (200ms blocking call). On the
+        # old on-loop code this would freeze the loop for the full duration.
+        def _slow_sweep():
+            time.sleep(0.2)
+            return []
+
+        rt.signal_proposer.expire_stale = _slow_sweep
+
+        tick_gaps = []
+
+        async def ticker():
+            prev = time.monotonic()
+            while True:
+                await asyncio.sleep(0.01)
+                now = time.monotonic()
+                tick_gaps.append(now - prev)
+                prev = now
+
+        ticker_task = asyncio.create_task(ticker())
+        try:
+            # Let the ticker spin up its loop before the sweep runs, then let
+            # it run once more after. Without the pre-sleep a synchronous
+            # on-loop sweep blocks BEFORE the first tick is recorded; without
+            # the post-sleep the ticker never gets a wakeup to record the
+            # freeze gap after _reconcile() returns. Both are needed for the
+            # guard to actually bite against the broken on-loop code
+            # (verified: on-loop -> ~210ms max gap; to_thread -> ~12ms).
+            await asyncio.sleep(0.05)
+            await rt._reconcile()
+            await asyncio.sleep(0.05)
+        finally:
+            ticker_task.cancel()
+            try:
+                await ticker_task
+            except asyncio.CancelledError:
+                pass
+
+        max_gap = max(tick_gaps) if tick_gaps else 0.0
+        assert max_gap < 0.1, (
+            f'event loop was blocked for {max_gap*1000:.0f}ms during the '
+            f'expiry sweep; it must run via asyncio.to_thread'
+        )
+
+
+def test_reconcile_sweeps_expired_proposals(runtime):
+    """Expiry must be time-driven, not just signal-driven — every
+    reconciliation tick (every 30s) sweeps stale PENDING proposals,
+    regardless of whether any strategy fired a signal this cycle."""
+    runtime.signal_proposer.expire_stale = Mock(return_value=[11, 12])
+    asyncio.run(runtime._reconcile())
+    runtime.signal_proposer.expire_stale.assert_called_once()
 
 
 class TestConfigMtimeInitialization:

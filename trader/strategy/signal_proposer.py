@@ -104,6 +104,21 @@ class SignalProposer:
             confidence=signal.probability,
         )
 
+    def expire_stale(self, now: dt.datetime | None = None) -> list[int]:
+        """Time-driven expiry sweep for the strategy_service reconciliation
+        loop (every ~30s) — expires stale PENDING proposals regardless of
+        whether a signal fired this cycle. Delegates to the shared,
+        unlimited, unfiltered ``ProposalStore.expire_stale_pending`` (Task 1)
+        rather than the signal-triggered ``_expire_stale`` above, which is
+        scoped to bridge (``strategy:``-sourced) proposals only and is kept
+        purely as harmless defense-in-depth until ``[M1-F3]`` moves
+        ownership to the trader service."""
+        effective_now = now or dt.datetime.now(dt.timezone.utc)
+        expired = self.proposal_store.expire_stale_pending(effective_now)
+        if expired:
+            logging.info("expired stale proposals: %s", expired)
+        return expired
+
     def check_exits(self, strategy_name: str, conid: int,
                     frame: pd.DataFrame) -> Optional[int]:
         """Propose closing an executed bridge entry whose time-based exit

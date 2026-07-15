@@ -1495,24 +1495,38 @@ class MMR:
         return self._proposal_store().try_transition(
             proposal_id, 'PENDING', 'REJECTED', rejection_reason=reason)
 
+    def _utcnow(self) -> dt.datetime:
+        """Seam for tests to inject a fixed clock. Must stay tz-aware UTC —
+        ``claim_for_approval`` calls ``now.astimezone(utc)``, and a naive
+        datetime would be silently reinterpreted as local time."""
+        return dt.datetime.now(dt.timezone.utc)
+
     def approve(self, proposal_id: int) -> SuccessFail:
         """Approve and execute a proposal. REQUIRES trader_service."""
-        from trader.trading.proposal import ProposalStatus
+        from trader.data.proposal_store import ApprovalClaimResult
 
         store = self._proposal_store()
-        proposal = store.get(proposal_id)
-        if not proposal:
-            return SuccessFail.fail(error=f'Proposal #{proposal_id} not found')
-        if proposal.status != 'PENDING':
-            return SuccessFail.fail(error=f'Proposal #{proposal_id} is {proposal.status}, not PENDING')
 
-        # Atomically claim the proposal. This is a compare-and-swap on the DB row
-        # (UPDATE ... WHERE status='PENDING'), so if a second process — the LLM
-        # loop and a human, or two `approve --all` shells — races us, exactly one
-        # wins and the loser aborts here instead of placing a duplicate live order.
-        if not store.try_transition(proposal_id, 'PENDING', 'APPROVED'):
-            return SuccessFail.fail(
-                error=f'Proposal #{proposal_id} was already claimed by another approver')
+        # Atomically claim the proposal via a single guarded UPDATE that
+        # transitions PENDING -> APPROVED, or PENDING -> EXPIRED if the
+        # proposal's expires_at has already elapsed. This is a compare-and-swap
+        # on the DB row, so if a second process — the LLM loop and a human, or
+        # two `approve --all` shells — races us, exactly one wins and the loser
+        # aborts here instead of placing a duplicate live order. It also closes
+        # the gap where an expired-but-still-PENDING proposal was never checked
+        # at all, so a live order could be placed against a stale signal.
+        claim = store.claim_for_approval(proposal_id, self._utcnow())
+        if claim is ApprovalClaimResult.NOT_FOUND:
+            return SuccessFail.fail(error=f'Proposal #{proposal_id} not found')
+        if claim is ApprovalClaimResult.EXPIRED:
+            return SuccessFail.fail(error=f'Proposal #{proposal_id} expired before approval')
+        if claim is ApprovalClaimResult.NOT_PENDING:
+            current = store.get(proposal_id)
+            state = current.status if current else 'missing'
+            return SuccessFail.fail(error=f'Proposal #{proposal_id} is {state}, not PENDING')
+        proposal = store.get(proposal_id)
+        if proposal is None:
+            return SuccessFail.fail(error=f'Proposal #{proposal_id} disappeared after claim')
 
         try:
             contract = self._resolve_contract(

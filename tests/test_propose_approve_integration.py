@@ -138,6 +138,33 @@ def _create_proposal(store: ProposalStore, symbol='AMD', quantity=10) -> int:
     ))
 
 
+def _proposal(symbol='AMD', quantity=10, expires_at=None) -> TradeProposal:
+    """Build a (not-yet-stored) TradeProposal, optionally carrying an
+    `expires_at` metadata timestamp (ISO string) for expiry-path regressions."""
+    metadata = {'expires_at': expires_at} if expires_at else {}
+    return TradeProposal(
+        symbol=symbol, action='BUY', quantity=float(quantity),
+        execution=ExecutionSpec(order_type='MARKET'),
+        reasoning='integration test',
+        metadata=metadata,
+    )
+
+
+@pytest.fixture
+def rpc():
+    """Stub RPC client defaulting to a successful order placement."""
+    return _StubRPCClient(
+        place_expressive_order_result=SuccessFail.success(obj=[_StubTrade(orderId=777)])
+    )
+
+
+@pytest.fixture
+def mmr(tmp_duckdb_path, rpc):
+    """MMR shell wired to the same tmp_duckdb_path as the `proposal_store`
+    fixture, so both see the same underlying DuckDB-backed proposal row."""
+    return _make_mmr(tmp_duckdb_path, rpc)
+
+
 class TestProposeApproveFlow:
     def test_happy_path_execute(self, tmp_duckdb_path):
         """Propose → Approve → EXECUTED with recorded order IDs."""
@@ -238,6 +265,21 @@ class TestProposeApproveFlow:
         result = mmr.approve(99999)
         assert result.success_fail == SuccessFailEnum.FAIL
         assert 'not found' in (result.error or '').lower()
+
+
+class TestApprovalExpiryTruth:
+    """Approval must route through the atomic expiry-aware claim: an expired
+    proposal is transitioned PENDING -> EXPIRED and never reaches the order
+    RPC, instead of being silently approved and executed against a stale
+    signal."""
+
+    def test_expired_proposal_never_calls_order_rpc(self, mmr, rpc, proposal_store):
+        pid = proposal_store.add(_proposal(expires_at="2026-07-15T10:00:00Z"))
+        mmr._utcnow = lambda: _dt.datetime(2026, 7, 15, 10, 1, tzinfo=_dt.timezone.utc)
+        result = mmr.approve(pid)
+        assert not result.is_success()
+        assert proposal_store.get(pid).status == "EXPIRED"
+        assert not [call for call in rpc.calls if call["method"] == "place_expressive_order"]
 
 
 class TestEventStoreAuditTrail:

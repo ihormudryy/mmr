@@ -693,6 +693,14 @@ class Trader():
             return SuccessFail.fail(exception=ex)
 
     @log_method
+    async def update_strategy_params(self, name: str, params: dict) -> SuccessFail[dict]:
+        try:
+            return self.zmq_strategy_client.rpc().update_strategy_params(name, params)
+        except Exception as ex:
+            logging.error('update_strategy_params: {}'.format(ex))
+            return SuccessFail.fail(exception=ex)
+
+    @log_method
     async def disable_strategy(self, name: str) -> SuccessFail[StrategyState]:
         try:
             return self.zmq_strategy_client.rpc().disable_strategy(name)

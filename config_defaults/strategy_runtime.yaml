@@ -4,6 +4,14 @@
 # container at /home/trader/.config/mmr/). Use this file to update defaults
 # that ship with the repo for fresh installs only.
 env: TRADER_CHECK=False
+# Per-strategy optional key `auto_execute`:
+#   (absent/false) — signals are recorded + published only (default)
+#   propose        — each signal creates a PENDING trade proposal (auto-sized,
+#                    30-min TTL) for human approval in the web dashboard or via
+#                    `mmr approve N`. Paper mode only. SELL closes the held long
+#                    (long-only, matching the backtester); time-based exits
+#                    (max_hold_bars / close_by_time) propose closes too.
+#   true           — NOT implemented; the strategy is refused at load time.
 strategies:
   - name: global
     description: strategy wide configuration

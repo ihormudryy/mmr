@@ -226,6 +226,10 @@ class TraderServiceApi(RPCHandler):
         return await self.trader.disable_strategy(name)
 
     @rpcmethod
+    async def update_strategy_params(self, name: str, params: dict) -> SuccessFail[dict]:
+        return await self.trader.update_strategy_params(name, params)
+
+    @rpcmethod
     async def reload_strategies(self) -> SuccessFail[list[StrategyConfig]]:
         return await self.trader.reload_strategies()
 

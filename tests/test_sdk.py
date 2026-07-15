@@ -1158,3 +1158,51 @@ class TestPortfolioSnapshotPropagatesFailures:
 
         with pytest.raises(TimeoutError):
             mmr.portfolio_snapshot()
+
+
+class TestProposalsListingSource:
+    """The dashboard needs to distinguish strategy-bridge proposals from
+    manual/LLM ones — the listing must carry the proposal source."""
+
+    def test_proposals_rows_include_source(self):
+        from trader.trading.proposal import TradeProposal
+        mmr = _make_mmr_with_mock(_make_mock_rpc())
+        p = TradeProposal(symbol='AMD', action='BUY', amount=5000.0,
+                          source='strategy:orb_test')
+        p.id = 1
+        p.status = 'PENDING'
+        _stub_proposal_store(mmr, pending=[p])
+
+        df = mmr.proposals()
+
+        assert 'source' in df.columns
+        assert df.iloc[0]['source'] == 'strategy:orb_test'
+
+
+class TestStrategiesListingEnrichment:
+    """The dashboard derives human-readable names from class_name and shows
+    the YAML description on hover — both must survive the SDK listing."""
+
+    def test_rows_include_class_name_and_description(self):
+        mock_client = _make_mock_rpc()
+        strat = MagicMock()
+        strat.name = 'orb_googl'
+        strat.state = 'RUNNING'
+        strat.bar_size = '1 min'
+        strat.conids = [208813719]
+        strat.historical_days_prior = 90
+        strat.auto_execute = 'propose'
+        strat.class_name = 'OpeningRangeBreakout'
+        strat.description = 'ORB 45/1.3 on GOOGL'
+        strat.params = {'RANGE_MINUTES': 45}
+        result = MagicMock()
+        result.is_success.return_value = True
+        result.obj = [strat]
+        mock_client.rpc.return_value.get_strategies.return_value = result
+
+        mmr = _make_mmr_with_mock(mock_client)
+        df = mmr.strategies()
+
+        row = df.iloc[0]
+        assert row['class_name'] == 'OpeningRangeBreakout'
+        assert row['description'] == 'ORB 45/1.3 on GOOGL'

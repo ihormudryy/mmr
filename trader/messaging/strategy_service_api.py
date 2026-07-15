@@ -37,6 +37,15 @@ class StrategyServiceApi(RPCHandler):
             return SuccessFail.fail(exception=ex)
 
     @rpcmethod
+    def update_strategy_params(self, name: str, params: Dict) -> SuccessFail[Dict]:
+        """Persist new params to the YAML config and hot-swap the live
+        strategy so they apply immediately (see StrategyRuntime)."""
+        try:
+            return SuccessFail.success(self.strategy.update_strategy_params(name, params))
+        except Exception as ex:
+            return SuccessFail.fail(exception=ex)
+
+    @rpcmethod
     def disable_strategy(self, name: str) -> SuccessFail[StrategyState]:
         try:
             # find the strategy

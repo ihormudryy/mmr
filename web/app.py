@@ -1,7 +1,9 @@
-"""MMR read-only web dashboard.
+"""MMR web dashboard.
 
-Renders per-currency cash, positions + P&L, strategy state, and trade
-proposals. Everything is read-only except proposal approve / reject.
+Renders per-currency cash, positions + P&L, strategy state (deployed and
+on-disk), and trade proposals. Mutations: proposal approve / reject,
+strategy enable / disable, and live strategy-param editing (persisted +
+hot-swapped via update_strategy_params RPC). Everything else is read-only.
 
 Runs *inside* the mmr container: it needs the proposals DuckDB (in the
 ``mmr_db_data`` named volume) plus the trader_service ZMQ RPC. Launched by
@@ -37,6 +39,9 @@ import pandas as pd
 from fastapi import FastAPI, Form, HTTPException, Request
 from fastapi.responses import RedirectResponse
 from fastapi.templating import Jinja2Templates
+from starlette.concurrency import run_in_threadpool
+
+from trader.strategy.inspect import scan_strategies
 
 logger = logging.getLogger('web')
 
@@ -190,6 +195,14 @@ def _records(df) -> list[dict]:
     return out
 
 
+def _result_error(result) -> str:
+    """Human-readable failure reason from a SuccessFail — `error` when set,
+    else the carried exception (a timeout arrives as exception, error=None)."""
+    return str(getattr(result, 'error', None)
+               or getattr(result, 'exception', None)
+               or 'unknown error')
+
+
 def fetch_cash() -> Optional[dict]:
     return _call(lambda m: m.account_cash())
 
@@ -214,6 +227,20 @@ def fetch_positions() -> list[dict]:
     return _records(_call(lambda m: m.portfolio()))
 
 
+def _humanize_class_name(class_name: str) -> str:
+    """CamelCase → spaced words: 'OpeningRangeBreakout' → 'Opening Range
+    Breakout', 'VbtMacdBB' → 'Vbt Macd BB'."""
+    if not class_name:
+        return ''
+    return re.sub(r'(?<=[a-z0-9])(?=[A-Z])|(?<=[A-Z])(?=[A-Z][a-z])', ' ', class_name)
+
+
+# Strategies live next to this package in the repo checkout; override for
+# non-standard layouts with MMR_STRATEGIES_DIR.
+_STRATEGIES_DIR = os.environ.get(
+    'MMR_STRATEGIES_DIR', str(Path(__file__).parent.parent / 'strategies'))
+
+
 def fetch_strategies() -> list[dict]:
     rows = _records(_call(lambda m: m.strategies()))
     for r in rows:
@@ -221,6 +248,18 @@ def fetch_strategies() -> list[dict]:
         r['enabled'] = state in _ENABLED_STATES
         if isinstance(r.get('conids'), (list, tuple)):
             r['conids'] = ', '.join(str(c) for c in r['conids'])
+        r['display_name'] = _humanize_class_name(str(r.get('class_name') or '')) or r.get('name')
+        if not isinstance(r.get('params'), dict):
+            r['params'] = {}
+    return rows
+
+
+def fetch_available_strategies() -> list[dict]:
+    """Every Strategy subclass implemented under strategies/ (static AST
+    facts — file, class, dispatch mode, tunables, docstring)."""
+    rows = scan_strategies(_STRATEGIES_DIR)
+    for r in rows:
+        r['display_name'] = _humanize_class_name(r.get('class') or '') or r.get('file')
     return rows
 
 
@@ -257,6 +296,7 @@ def dashboard(request: Request, flash: str = ''):
         'positions': fetch_positions,
         'strategies': fetch_strategies,
         'proposals': fetch_proposals,
+        'available': fetch_available_strategies,
     }
     for key, fn in fetchers.items():
         try:
@@ -267,6 +307,12 @@ def dashboard(request: Request, flash: str = ''):
             errors[key] = f'{type(exc).__name__}: {exc}'
 
     strategies = sections.get('strategies') or []
+    # Mark scanned classes that are already deployed so the "available"
+    # table distinguishes on-disk-only strategies from live ones.
+    deployed_classes = {s.get('class_name') for s in strategies if s.get('class_name')}
+    available = sections.get('available') or []
+    for a in available:
+        a['deployed'] = a.get('class') in deployed_classes
     return _TEMPLATES.TemplateResponse(request, 'dashboard.html', {
         'cash': sections.get('cash'),
         'snapshot': sections.get('snapshot'),
@@ -275,6 +321,7 @@ def dashboard(request: Request, flash: str = ''):
         'risk_limits': sections.get('risk_limits'),
         'positions': sections.get('positions') or [],
         'strategies': strategies,
+        'available_strategies': available,
         'enabled_count': sum(1 for s in strategies if s.get('enabled')),
         'proposals': sections.get('proposals') or [],
         'errors': errors,
@@ -311,6 +358,74 @@ def reject(pid: int, request: Request, reason: str = Form(''), csrf_token: str =
     except Exception as exc:  # noqa: BLE001
         logger.warning('reject #%s failed: %s', pid, exc)
         msg = f'#{pid} reject error: {type(exc).__name__}: {exc}'
+    return RedirectResponse(url=f'/?flash={quote(msg)}', status_code=303)
+
+
+@app.post('/strategies/{name}/enable')
+def enable_strategy(name: str, request: Request, csrf_token: str = Form('')):
+    _check_access(request)
+    _check_csrf(csrf_token)
+    try:
+        result = _call(lambda m: m.enable_strategy(name), retry=False)
+        if hasattr(result, 'is_success') and not result.is_success():
+            msg = f'{name} enable failed: {_result_error(result)}'
+        else:
+            msg = f'{name} enabled'
+    except Exception as exc:  # noqa: BLE001
+        logger.warning('enable %s failed: %s', name, exc)
+        msg = f'{name} enable error: {type(exc).__name__}: {exc}'
+    return RedirectResponse(url=f'/?flash={quote(msg)}', status_code=303)
+
+
+@app.post('/strategies/{name}/disable')
+def disable_strategy(name: str, request: Request, csrf_token: str = Form('')):
+    _check_access(request)
+    _check_csrf(csrf_token)
+    try:
+        result = _call(lambda m: m.disable_strategy(name), retry=False)
+        if hasattr(result, 'is_success') and not result.is_success():
+            msg = f'{name} disable failed: {_result_error(result)}'
+        else:
+            msg = f'{name} disabled'
+    except Exception as exc:  # noqa: BLE001
+        logger.warning('disable %s failed: %s', name, exc)
+        msg = f'{name} disable error: {type(exc).__name__}: {exc}'
+    return RedirectResponse(url=f'/?flash={quote(msg)}', status_code=303)
+
+
+@app.post('/strategies/{name}/params')
+async def update_strategy_params(name: str, request: Request):
+    """Persist edited params — the strategy is hot-swapped live server-side.
+
+    Async so we can read the dynamic form fields (param_<KEY> inputs plus an
+    optional new_key/new_value pair); the SDK call runs in the threadpool
+    because it internally uses asyncio.run().
+    """
+    _check_access(request)
+    form = await request.form()
+    _check_csrf(str(form.get('csrf_token') or ''))
+
+    params: dict[str, str] = {}
+    for key, value in form.items():
+        if key.startswith('param_'):
+            params[key[len('param_'):]] = str(value)
+    new_key = str(form.get('new_key') or '').strip()
+    if new_key:
+        params[new_key] = str(form.get('new_value') or '')
+
+    if not params:
+        return RedirectResponse(url=f'/?flash={quote("no params submitted")}', status_code=303)
+
+    try:
+        result = await run_in_threadpool(
+            lambda: _call(lambda m: m.update_strategy_params(name, params), retry=False))
+        if hasattr(result, 'is_success') and not result.is_success():
+            msg = f'{name} params update failed: {_result_error(result)}'
+        else:
+            msg = f'{name} params updated (live — persisted to config)'
+    except Exception as exc:  # noqa: BLE001
+        logger.warning('params update %s failed: %s', name, exc)
+        msg = f'{name} params error: {type(exc).__name__}: {exc}'
     return RedirectResponse(url=f'/?flash={quote(msg)}', status_code=303)
 
 

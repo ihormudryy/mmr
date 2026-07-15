@@ -20,6 +20,8 @@ from trader.messaging.clientserver import (
 )
 from trader.objects import Action, BarSize, WhatToShow
 from trader.data.event_store import EventStore, EventType, TradingEvent
+from trader.data.proposal_store import ProposalStore
+from trader.strategy.signal_proposer import SignalProposer
 from trader.trading.strategy import Signal, Strategy, StrategyConfig, StrategyContext, StrategyState
 from typing import cast, Dict, List, Optional
 
@@ -174,6 +176,13 @@ class StrategyRuntime():
                 zmq_server_port=self.zmq_rpc_server_port,
                 error_table=error_table
             )
+            # Signal → PENDING proposal bridge for auto_execute: 'propose'
+            # strategies (paper mode only; see signal_proposer.py).
+            self.signal_proposer = SignalProposer(
+                proposal_store=ProposalStore(self.duckdb_path),
+                trader_client=self.trader_client,
+                paper_trading=self.paper_trading,
+            )
             self.last_connect_time = dt.datetime.now()
 
             self.zmq_strategy_rpc_server = RPCServer[bus.StrategyServiceApi](
@@ -262,6 +271,113 @@ class StrategyRuntime():
             if strategy.name == name:
                 return strategy
         return None
+
+    @staticmethod
+    def _coerce_param_value(value):
+        """Form values arrive as strings — coerce to bool/int/float where the
+        text is unambiguous, otherwise keep the string. Non-strings pass
+        through untouched (RPC callers may send native types)."""
+        if not isinstance(value, str):
+            return value
+        text = value.strip()
+        low = text.lower()
+        if low == 'true':
+            return True
+        if low == 'false':
+            return False
+        try:
+            return int(text)
+        except ValueError:
+            pass
+        try:
+            return float(text)
+        except ValueError:
+            pass
+        return text
+
+    def update_strategy_params(self, name: str, params: Dict) -> Dict:
+        """Persist new params for ``name`` into the YAML config and hot-swap
+        the live instance so they take effect immediately — no service
+        restart. An empty-string value deletes that key.
+
+        Raises ``ValueError`` for an unknown strategy (nothing written) and
+        ``RuntimeError`` if the reload after a successful write fails (the
+        config IS persisted at that point; a restart converges).
+        """
+        with open(self.strategy_config_file) as f:
+            cfg = yaml.safe_load(f) or {}
+        entries = cfg.get('strategies') or []
+        entry = next((e for e in entries if e.get('name') == name), None)
+        if entry is None:
+            raise ValueError(
+                f'strategy {name!r} not found in {self.strategy_config_file}')
+
+        merged = dict(entry.get('params') or {})
+        for key, raw in params.items():
+            if not key:
+                continue
+            if isinstance(raw, str) and raw.strip() == '':
+                merged.pop(key, None)
+                continue
+            merged[key] = self._coerce_param_value(raw)
+        if merged:
+            entry['params'] = merged
+        else:
+            entry.pop('params', None)
+
+        # Atomic write: reconcile reading a half-written YAML retries safely,
+        # but a crash mid-write must never leave a torn config behind.
+        tmp_path = self.strategy_config_file + '.tmp'
+        with open(tmp_path, 'w') as f:
+            yaml.safe_dump(cfg, f, sort_keys=False)
+        os.replace(tmp_path, self.strategy_config_file)
+
+        # Hot-swap: unload the live instance, re-load from the updated entry.
+        # Primed history survives (keyed by (conId, bar_size)) and
+        # load_strategy restores the persisted enabled/disabled state (D2).
+        old = self.get_strategy(name)
+        if old is not None:
+            self.strategy_implementations.remove(old)
+            for lst in self.strategies.values():
+                if old in lst:
+                    lst.remove(old)
+            self._last_dispatched_bar = {
+                k: v for k, v in self._last_dispatched_bar.items() if k[1] != name}
+            sys.modules.pop(f'_mmr_strategy_{name}', None)
+
+        self.load_strategy(
+            name=name,
+            bar_size_str=entry.get('bar_size', '1 min'),
+            conids=entry.get('conids'),
+            universe=entry.get('universe'),
+            historical_days_prior=entry.get('historical_days_prior', 0),
+            module=entry.get('module', ''),
+            class_name=entry.get('class_name', ''),
+            description=entry.get('description', ''),
+            paper_only=entry.get('paper_only', False),
+            auto_execute=entry.get('auto_execute', False),
+            params=merged,
+        )
+        new = self.get_strategy(name)
+        if new is None:
+            raise RuntimeError(
+                f'strategy {name!r} failed to reload after params update — the '
+                'config is persisted; restart strategy_service to converge')
+
+        # Re-attach the new instance to the conid dispatch lists its
+        # predecessor occupied. Deliberately NO RPC here: this method runs
+        # while trader_service's event loop is blocked awaiting our reply, so
+        # calling resolve_symbol back into it deadlocks until timeout. The
+        # conIds are already subscribed/published (the old instance put them
+        # there); a conId with no existing list is genuinely new and is
+        # published properly by the reconcile loop within 30s.
+        for conId in (new.conids or []):
+            bucket = self.strategies.get(conId)
+            if bucket is not None and new not in bucket:
+                bucket.append(new)
+
+        logging.info('strategy %s params updated to %s (hot-swapped)', name, merged)
+        return {'name': name, 'params': merged}
 
     def __get_enabled_strategies(self, conid: int) -> List[Strategy]:
         if conid in self.strategies:
@@ -396,34 +512,76 @@ class StrategyRuntime():
                     pass
                 continue
 
+            # Time-based exits (max_hold_bars / close_by_time) are checked on
+            # every new completed bar, signal or not — a VwapReclaim-style
+            # position must flatten at 15:45 even if no fresh signal fires.
+            self._maybe_check_exits(strategy, conId, frame)
+
             if not signal:
                 continue
             try:
-                if signal.action == Action.BUY:
-                    logging.info('BUY signal from %s', strategy.name)
-                elif signal.action == Action.SELL:
-                    logging.info('SELL signal from %s', strategy.name)
-
-                # Persist signal to event store
-                event = TradingEvent(
-                    event_type=EventType.SIGNAL,
-                    timestamp=dt.datetime.now(),
-                    strategy_name=signal.source_name,
-                    conid=conId,
-                    action=str(signal.action),
-                    signal_probability=signal.probability,
-                    signal_risk=signal.risk,
-                )
-                self.event_store.append(event)
-
-                # Publish signal via MessageBus for cross-strategy use and subscribers
-                self.zmq_messagebus_client.write('signal', signal)
+                self._dispatch_signal(strategy, signal, conId=conId, frame=frame)
             except Exception:
                 # A failure persisting/publishing one signal must not kill the
                 # feed or the other strategies either.
                 logging.exception(
                     'failed to record/publish signal from %s for conId %s',
                     getattr(strategy, 'name', '?'), conId)
+
+    def _dispatch_signal(self, strategy: Strategy, signal, conId: int,
+                         frame: pd.DataFrame) -> None:
+        """Record, publish, and (in propose mode) bridge one signal."""
+        if signal.action == Action.BUY:
+            logging.info('BUY signal from %s', strategy.name)
+        elif signal.action == Action.SELL:
+            logging.info('SELL signal from %s', strategy.name)
+
+        # Stamp the instrument on the signal — downstream consumers (event
+        # store, MessageBus subscribers, proposal bridge) need to know WHICH
+        # contract fired, and strategies don't set it themselves.
+        if not signal.conid:
+            signal.conid = conId
+
+        # Persist signal to event store
+        event = TradingEvent(
+            event_type=EventType.SIGNAL,
+            timestamp=dt.datetime.now(),
+            strategy_name=signal.source_name,
+            conid=conId,
+            action=str(signal.action),
+            signal_probability=signal.probability,
+            signal_risk=signal.risk,
+        )
+        self.event_store.append(event)
+
+        # Publish signal via MessageBus for cross-strategy use and subscribers
+        self.zmq_messagebus_client.write('signal', signal)
+
+        # auto_execute: propose — signal becomes a PENDING proposal awaiting
+        # human approval (dashboard / `mmr approve`). Guarded separately so a
+        # bridge failure never blocks the record/publish path above.
+        proposer = getattr(self, 'signal_proposer', None)
+        if proposer is not None and strategy.auto_execute == 'propose':
+            try:
+                proposer.on_signal(strategy.name, signal, frame)
+            except Exception:
+                logging.exception(
+                    'signal→proposal bridge failed for %s conId %s',
+                    getattr(strategy, 'name', '?'), conId)
+
+    def _maybe_check_exits(self, strategy: Strategy, conId: int,
+                           frame: pd.DataFrame) -> None:
+        """Bridge hook: propose time-based exit closes for propose-mode
+        strategies. Self-guarded — never propagates into the tick feed."""
+        proposer = getattr(self, 'signal_proposer', None)
+        if proposer is None or strategy.auto_execute != 'propose':
+            return
+        try:
+            proposer.check_exits(strategy.name, conId, frame)
+        except Exception:
+            logging.exception(
+                'exit check failed for %s conId %s',
+                getattr(strategy, 'name', '?'), conId)
 
     def on_ticker_error(self, ex: Exception):
         logging.error('StrategyRuntime ticker stream error: %s', ex, exc_info=True)
@@ -458,7 +616,7 @@ class StrategyRuntime():
         class_name: str,
         description: str,
         paper_only: bool = False,
-        auto_execute: bool = False,
+        auto_execute: 'bool | str' = False,
         params: Optional[Dict] = None,
     ) -> None:
 
@@ -469,6 +627,18 @@ class StrategyRuntime():
 
         if not name or not class_name or not module or not bar_size_str:
             raise ValueError('invalid config. need name, bar_size, class_name and module specified')
+
+        # auto_execute is a safety-relevant knob: accepting a value we don't
+        # implement (and silently doing nothing) violates fail-loudly. Only
+        # 'propose' (signal → PENDING proposal, human approves) is supported.
+        if auto_execute not in (False, None, '', 'propose'):
+            logging.error(
+                'refusing to load strategy %s: auto_execute=%r is not supported. '
+                "Full auto-execution is not implemented — use auto_execute: 'propose' "
+                '(signal creates a PENDING proposal for dashboard approval) or remove '
+                'the flag.', name, auto_execute,
+            )
+            return
 
         # paper_only gate: refuse to load strategies marked paper_only when the
         # trader_service is bound to a live account. Routing is service-level

@@ -1419,6 +1419,7 @@ class MMR:
                 'exit': exit_label,
                 'conf': f'{p.confidence:.0%}' if p.confidence else '-',
                 'created': created,
+                'source': p.source or 'manual',
                 'reasoning': p.reasoning or '',
             }
             # Include status column only when showing mixed statuses (--all)
@@ -2194,13 +2195,24 @@ class MMR:
         if result.is_success() and result.obj:
             rows = []
             for s in result.obj:
+                # Emit the state NAME ("RUNNING"), never the number: since
+                # Python 3.11 str(IntEnum) is the numeric value ("3"), which
+                # broke every name-based consumer (web dashboard enabled
+                # count, CLI state column).
+                state = s.state
+                try:
+                    state_name = StrategyState(int(state)).name
+                except (ValueError, TypeError):
+                    state_name = str(state)
                 row = {
                     'name': s.name,
-                    'state': str(s.state),
+                    'state': state_name,
                     'bar_size': str(s.bar_size),
                     'conids': s.conids or [],
                     'hist_days_prior': s.historical_days_prior,
                     'auto_execute': getattr(s, 'auto_execute', False),
+                    'class_name': getattr(s, 'class_name', '') or '',
+                    'description': getattr(s, 'description', '') or '',
                 }
                 params = getattr(s, 'params', None)
                 if params:
@@ -2216,6 +2228,11 @@ class MMR:
     def disable_strategy(self, name: str) -> SuccessFail:
         """Disable a strategy by name."""
         return consume(self._rpc.rpc().disable_strategy(name))
+
+    def update_strategy_params(self, name: str, params: dict) -> SuccessFail:
+        """Update a strategy's params — persisted to YAML and hot-swapped
+        live (no service restart needed). Empty-string value deletes a key."""
+        return consume(self._rpc.rpc().update_strategy_params(name, params))
 
     def reload_strategies(self) -> SuccessFail:
         """Reload strategies from YAML config and re-subscribe to instruments."""

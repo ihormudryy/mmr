@@ -3527,11 +3527,15 @@ def _handle_strategies_list(mmr: MMR):
 
     for _, row in df.iterrows():
         state_raw = str(row.get('state', '?'))
-        # state comes back as enum-like: '1' / 'StrategyEnabled.ENABLED' etc.
-        if state_raw in ('1', 'StrategyEnabled.ENABLED'):
-            state_disp = '[green]ON[/green]'
-        elif state_raw in ('0', 'StrategyEnabled.DISABLED'):
-            state_disp = '[red]off[/red]'
+        # state is a StrategyState name from the SDK ("RUNNING", "ERROR", ...)
+        if state_raw == 'RUNNING':
+            state_disp = '[green]RUNNING[/green]'
+        elif state_raw == 'ERROR':
+            state_disp = '[red]ERROR[/red]'
+        elif state_raw == 'DISABLED':
+            state_disp = '[dim]DISABLED[/dim]'
+        elif state_raw in ('INSTALLED', 'WAITING_HISTORICAL_DATA'):
+            state_disp = f'[yellow]{state_raw}[/yellow]'
         else:
             state_disp = state_raw
 
@@ -3552,7 +3556,14 @@ def _handle_strategies_list(mmr: MMR):
         else:
             params_disp = '[dim]-[/dim]'
 
-        auto_disp = '[bold red]AUTO[/bold red]' if row.get('auto_execute') else '[dim]-[/dim]'
+        auto_val = row.get('auto_execute')
+        if auto_val == 'propose':
+            # Semi-auto: signals become PENDING proposals, human approves.
+            auto_disp = '[yellow]propose[/yellow]'
+        elif auto_val:
+            auto_disp = '[bold red]AUTO[/bold red]'
+        else:
+            auto_disp = '[dim]-[/dim]'
 
         table.add_row(
             str(row.get('name', '?')),
@@ -3585,8 +3596,7 @@ def _handle_strategies_inspect(args: argparse.Namespace):
     of reading every file, it gets one JSON payload with everything it
     needs to construct the grid.
     """
-    import ast
-    import pandas as pd
+    from trader.strategy.inspect import scan_strategies
 
     # 1. Resolve strategies directory or a single file target.
     from trader.container import Container
@@ -3597,7 +3607,6 @@ def _handle_strategies_inspect(args: argparse.Namespace):
     except Exception:
         default_dir = 'strategies'
 
-    targets: List[Path] = []
     if args.strategy:
         p = Path(args.strategy).expanduser()
         if not p.is_absolute():
@@ -3611,7 +3620,8 @@ def _handle_strategies_inspect(args: argparse.Namespace):
         if not p.exists():
             print_status(f'File not found: {args.strategy}', success=False)
             return
-        targets = [p]
+        scan_dir = p.parent
+        rows = [r for r in scan_strategies(scan_dir) if r['file'] == p.name]
     else:
         strategies_dir = Path(args.directory or default_dir).expanduser()
         if not strategies_dir.is_absolute():
@@ -3628,119 +3638,14 @@ def _handle_strategies_inspect(args: argparse.Namespace):
                 success=False,
             )
             return
-        targets = sorted(
-            p for p in strategies_dir.glob('*.py') if not p.name.startswith('_')
-        )
+        scan_dir = strategies_dir
+        rows = scan_strategies(scan_dir)
 
-    def _literal(node) -> Any:
-        """Return a literal value for an AST node or the sentinel
-        ``_NON_LITERAL`` — we skip tunables whose defaults are expressions
-        (they're typically computed at class scope, not user-tunable)."""
-        try:
-            return ast.literal_eval(node)
-        except (ValueError, SyntaxError, TypeError):
-            return _NON_LITERAL
-
-    _NON_LITERAL = object()
-
-    rows: List[Dict[str, Any]] = []
-    for py in targets:
-        try:
-            tree = ast.parse(py.read_text())
-        except SyntaxError as ex:
-            rows.append({
-                'file': py.name,
-                'class': '',
-                'mode': 'parse_error',
-                'tunables': {},
-                'docstring': f'syntax error: {ex.msg}',
-            })
-            continue
-
-        for cls in [n for n in tree.body if isinstance(n, ast.ClassDef)]:
-            # Must extend Strategy (direct or indirect — we match by name,
-            # same heuristic as _handle_strategies_available).
-            extends_strategy = any(
-                (isinstance(b, ast.Name) and b.id == 'Strategy')
-                or (isinstance(b, ast.Attribute) and b.attr == 'Strategy')
-                for b in cls.bases
-            )
-            if not extends_strategy:
-                continue
-
-            tunables: Dict[str, Any] = {}
-            methods: set = set()
-            for item in cls.body:
-                if isinstance(item, ast.Assign):
-                    for target in item.targets:
-                        if isinstance(target, ast.Name) and target.id.isupper():
-                            val = _literal(item.value)
-                            if val is _NON_LITERAL:
-                                continue
-                            tunables[target.id] = val
-                elif isinstance(item, ast.AnnAssign):
-                    # e.g. ``EMA_PERIOD: int = 20``
-                    if (isinstance(item.target, ast.Name)
-                            and item.target.id.isupper()
-                            and item.value is not None):
-                        val = _literal(item.value)
-                        if val is not _NON_LITERAL:
-                            tunables[item.target.id] = val
-                elif isinstance(item, (ast.FunctionDef, ast.AsyncFunctionDef)):
-                    methods.add(item.name)
-                    # Older strategies keep tunables in ``self.params`` and
-                    # read them via ``self.params.get('key', default)``.
-                    # Scan the method body for those calls so the LLM gets
-                    # the knob list without reading the source.
-                    for node in ast.walk(item):
-                        if not isinstance(node, ast.Call):
-                            continue
-                        func = node.func
-                        # Match self.params.get('key', default)
-                        if (isinstance(func, ast.Attribute)
-                                and func.attr == 'get'
-                                and isinstance(func.value, ast.Attribute)
-                                and func.value.attr == 'params'
-                                and isinstance(func.value.value, ast.Name)
-                                and func.value.value.id == 'self'
-                                and node.args):
-                            key_node = node.args[0]
-                            if isinstance(key_node, ast.Constant) and isinstance(key_node.value, str):
-                                key = key_node.value
-                                default = (
-                                    _literal(node.args[1])
-                                    if len(node.args) > 1 else None
-                                )
-                                if default is _NON_LITERAL:
-                                    default = None
-                                # Preserve first-seen default if the key
-                                # appears in multiple methods.
-                                tunables.setdefault(key, default)
-
-            has_precompute = 'precompute' in methods
-            has_on_bar = 'on_bar' in methods
-            has_on_prices = 'on_prices' in methods
-            if has_precompute and has_on_bar:
-                mode = 'precompute'
-            elif has_precompute:
-                # precompute without on_bar — strategy likely falls back to
-                # the default on_bar that calls on_prices. Rare, but valid.
-                mode = 'precompute+on_prices'
-            elif has_on_prices:
-                mode = 'on_prices'
-            else:
-                mode = 'inherited'
-
-            docstring = ast.get_docstring(cls) or ''
-            first_line = docstring.split('\n', 1)[0].strip()
-
-            rows.append({
-                'file': str(py.relative_to(py.parents[1]) if len(py.parents) > 1 else py.name),
-                'class': cls.name,
-                'mode': mode,
-                'tunables': tunables,
-                'docstring': first_line,
-            })
+    # Preserve the historical CLI row shape: `file` includes the parent dir
+    # ('strategies/foo.py'); docstring_full stays dashboard-only.
+    for r in rows:
+        r['file'] = f"{scan_dir.name}/{r['file']}"
+        r.pop('docstring_full', None)
 
     if _json_mode:
         print(json.dumps({'data': rows, 'title': 'Strategy Inspect'}, default=str))

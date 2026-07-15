@@ -5,7 +5,7 @@ from logging import Logger
 from trader.data.data_access import TickStorage
 from trader.data.universe import UniverseAccessor
 from trader.objects import Action, BarSize
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Union
 
 import datetime as dt
 import pandas as pd
@@ -58,7 +58,9 @@ class StrategyContext:
     class_name: Optional[str] = None
     runs_when_crontab: Optional[str] = None
     description: Optional[str] = None
-    auto_execute: bool = False
+    # False = off; 'propose' = signal → PENDING proposal (human approves).
+    # Other truthy values are rejected at load time (full auto not implemented).
+    auto_execute: Union[bool, str] = False
     params: Dict[str, Any] = field(default_factory=dict)
 
 
@@ -104,6 +106,10 @@ class Strategy(ABC):
     @property
     def universe(self) -> Optional[str]:
         return self._context.universe if self._context else None
+
+    @property
+    def auto_execute(self) -> Union[bool, str]:
+        return self._context.auto_execute if self._context else False
 
     @property
     def module(self) -> Optional[str]:
@@ -258,7 +264,7 @@ class StrategyConfig():
         runs_when_crontab: Optional[str] = None,
         description: Optional[str] = None,
         paper_only: bool = False,
-        auto_execute: bool = False,
+        auto_execute: Union[bool, str] = False,
         params: Optional[Dict[str, Any]] = None,
     ):
         self.name = name

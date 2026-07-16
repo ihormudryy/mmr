@@ -55,6 +55,26 @@ fails, compaction retains the data instead of deleting it -- see the Task 6
 brief). So "no checkpoint row yet" means "compaction has never trimmed
 anything, ever" -- not "trimmed silently".
 
+Re-check-after-read (binding, [M1-F1] whole-branch review follow-up):
+the up-front expiry check above and ``read_after()`` below are two
+INDEPENDENT lock-free MVCC reads with a window between them --
+``read_domain_events`` deliberately takes no lock across that window (the
+module's "empty heartbeat" section explains why the hot path must stay
+lock-free). ``compact()`` takes ``_write_lock`` + ``fenced_read_lock`` and
+commits its DELETE + checkpoint write atomically; if that commit lands IN
+this window, it can advance ``oldest_retained_cursor`` past ``after_cursor``
+and physically delete events in ``(after_cursor, new_floor]`` between the
+check and the query. Without a second check, ``read_after()`` would return
+only the survivors that happen to still exist -- indistinguishable from a
+normal (if partial) result -- and the caller would advance its own cursor
+past the deleted events having been told nothing was wrong: permanent,
+silent event loss. ``read_domain_events`` therefore re-reads the checkpoint
+via a second ``_raise_if_expired(after_cursor)`` call strictly AFTER
+``read_after()`` returns, so the caller either gets a fully consistent
+window or ``CursorExpired`` to re-baseline from -- never a silent gap. The
+extra check is one more indexed ``SELECT`` on ``domain_snapshot_checkpoints``
+(no lock), so the hot path stays lock-free exactly as designed.
+
 Deliberately NOT falling back to ``MIN(source_cursor)`` over the live
 journal when no checkpoint exists (unlike a literal reading of RA-5's "or
 MIN(source_cursor)" phrasing might suggest): cursor values are
@@ -156,9 +176,13 @@ class DomainFeedService:
 
         ``limit`` is clamped to 1..1000 and ``wait_ms`` to 0..10000 BEFORE
         either is used for anything. Raises ``CursorExpired`` if
-        ``after_cursor`` is behind the journal's retained window (checked
-        up front, before any waiting -- an already-invalid cursor should
-        fail immediately, not after burning the full wait budget).
+        ``after_cursor`` is behind the journal's retained window -- checked
+        up front, before any waiting (an already-invalid cursor should fail
+        immediately, not after burning the full wait budget), AND re-checked
+        after ``read_after()`` returns (see the module docstring's
+        "Re-check-after-read" section) -- a compaction that commits in the
+        lock-free window between those two reads must never be allowed to
+        silently hand back a partial survivor set.
         """
         limit = _clamp(limit, MIN_LIMIT, MAX_LIMIT)
         wait_ms = _clamp(wait_ms, MIN_WAIT_MS, MAX_WAIT_MS)
@@ -169,6 +193,16 @@ class DomainFeedService:
         cursor_at_wake = self._journal.wait_for_cursor_after(after_cursor, deadline)
 
         events = tuple(self._journal.read_after(after_cursor, limit))
+
+        # Re-check-after-read -- see module docstring's "Re-check-after-read"
+        # section. A compaction that committed strictly between the
+        # up-front check above and this point would have advanced
+        # `oldest_retained_cursor` past `after_cursor` and deleted rows
+        # `read_after` might otherwise have returned; re-raising here turns
+        # that into a detectable `CursorExpired` instead of a silently
+        # partial result.
+        self._raise_if_expired(after_cursor)
+
         if events:
             newest_cursor = events[-1].source_cursor
         else:

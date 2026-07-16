@@ -33,7 +33,7 @@ from concurrent.futures import ThreadPoolExecutor
 
 import pytest
 
-from trader.data.domain_journal import DomainJournal
+from trader.data.domain_journal import RETENTION_FLOOR, DomainJournal
 from trader.data.duckdb_store import DuckDBConnection
 from trader.data.schema_migrations import SchemaMigrator
 from trader.domain.events import DomainMutation
@@ -298,6 +298,97 @@ def test_no_checkpoint_means_never_expired_regardless_of_after_cursor(feed_servi
     # run) -- there is no retention floor, so nothing can be "expired".
     result = feed_service.read_domain_events(0, 100, 0)  # must not raise
     assert result.events == ()
+
+
+# --------------------------------------------------------------------- #
+# Regression ([M1-F1] whole-branch review, Fix 1): a compaction that
+# commits IN the lock-free window between the up-front expiry check and
+# the `read_after()` query must never silently hand back a partial
+# survivor set -- it must be detected and turned into `CursorExpired`.
+# --------------------------------------------------------------------- #
+
+def _insert_raw_event(journal: DomainJournal, *, event_id: str, entity_id: str, received_timestamp: dt.datetime) -> int:
+    """Insert a `domain_event_journal` row with a FULLY CONTROLLED
+    `received_timestamp`, bypassing `mutate()` (which always stamps the
+    real wall clock) -- mirrors `test_domain_retention.py`'s helper of the
+    same name. Needed here to engineer an event old enough for a REAL
+    `compact()` call to delete it (`writer.account()`'s timestamp is always
+    "now", so it can never land outside the 30-day floor). Returns the
+    assigned `source_cursor`.
+    """
+    conn = journal.connect()
+    conn.execute("BEGIN TRANSACTION")
+    row = conn.execute(
+        "INSERT INTO domain_event_journal "
+        "(event_id, entity_revision, event_type, entity_type, entity_id, "
+        " operation, account_id, source, source_timestamp, received_timestamp, "
+        " correlation_id, payload) VALUES "
+        "(?, 1, 'account.updated', 'account', ?, 'upsert', NULL, 'test', ?, ?, NULL, '{}') "
+        "RETURNING source_cursor",
+        [event_id, entity_id, received_timestamp, received_timestamp],
+    ).fetchone()
+    conn.execute("COMMIT")
+    return row[0]
+
+
+def test_compaction_racing_between_expiry_check_and_read_raises_cursor_expired_not_silent_partial_survivors(
+    feed_service, journal, monkeypatch
+):
+    """`_raise_if_expired` (up front) and `read_after` (the actual query)
+    are two independent lock-free MVCC reads with a window between them.
+    If a `compact()` commits IN that window it can advance
+    `oldest_retained_cursor` past `after_cursor` and physically delete
+    events the caller has never seen -- without a re-check, `read_after`
+    would return only whatever survivors happen to still be there, which
+    is indistinguishable from a normal (if partial) result: the caller
+    would advance its cursor past the deleted events having received
+    `CursorExpired` from neither the up-front check (which ran BEFORE
+    compaction) nor anything afterward (there was no second check) --
+    permanent, undetectable silent event loss.
+
+    Engineers the race directly rather than depending on winning a real
+    thread-timing race: an old event (outside the 30-day retention floor)
+    and a fresh one both commit before any checkpoint exists, so the
+    up-front `_raise_if_expired(0)` sees no checkpoint row and does not
+    raise (matches the "no checkpoint -- never expired" contract). Then
+    `journal.read_after` is monkeypatched to run a REAL `compact()` (which
+    deletes the old event and writes a checkpoint recording
+    `oldest_retained_cursor` at the fresh event's cursor) as a side effect
+    immediately before running the real query -- faithfully reproducing
+    "a compaction commits in the window between the check and the read".
+
+    Against the pre-fix code (single up-front check only) this test FAILS
+    with "DID NOT RAISE `CursorExpired`" -- the call instead returns
+    `events=(e-fresh,)`, silently omitting `e-old` which `after_cursor=0`
+    never saw. The fix (re-checking `_raise_if_expired` after `read_after`
+    returns) makes it PASS.
+    """
+    old_cursor = _insert_raw_event(
+        journal, event_id="e-old", entity_id="DU-old",
+        received_timestamp=UTC_NOW - RETENTION_FLOOR - dt.timedelta(days=15),
+    )
+    fresh_cursor = _insert_raw_event(
+        journal, event_id="e-fresh", entity_id="DU-fresh",
+        received_timestamp=UTC_NOW - dt.timedelta(days=1),
+    )
+    assert old_cursor < fresh_cursor
+
+    original_read_after = journal.read_after
+
+    def racing_read_after(after_cursor, limit):
+        # The race: a compaction commits HERE -- after the up-front expiry
+        # check (already run by the caller, and it passed since no
+        # checkpoint existed yet) but BEFORE the actual query below runs.
+        journal.compact(now=UTC_NOW, active_cursors={})
+        return original_read_after(after_cursor, limit)
+
+    monkeypatch.setattr(journal, "read_after", racing_read_after)
+
+    with pytest.raises(CursorExpired) as excinfo:
+        feed_service.read_domain_events(0, 100, 0)
+
+    assert excinfo.value.after_cursor == 0
+    assert excinfo.value.oldest_retained_cursor == fresh_cursor
 
 
 # --------------------------------------------------------------------- #

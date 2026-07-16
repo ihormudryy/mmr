@@ -98,13 +98,17 @@ def snapshot_service(journal):
 # --------------------------------------------------------------------- #
 
 def test_snapshot_cursor_covers_exact_returned_revisions(snapshot_service, writer):
-    writer.proposal(quantity=10, event_id="p1")
+    first = writer.proposal(quantity=10, event_id="p1")
     snapshot = snapshot_service.snapshot_with_cursor(
         on_read_started=lambda: writer.proposal(quantity=20, event_id="p2")
     )
     proposal = snapshot.entities["proposal"][0]
     assert proposal["quantity"] == 10
-    assert snapshot.source_cursor == 1
+    # Relative/observed, not an absolute journal-derived value (RA-4:
+    # cursors are monotonic but SPARSE -- source_cursor burns values on
+    # rollback) -- mirrors the convention in test_domain_retention.py /
+    # test_domain_journal.py.
+    assert snapshot.source_cursor == first.source_cursor
     assert snapshot.broker_generation == 0  # gate dormant in F1; F2 activates it
 
 

@@ -160,6 +160,28 @@ def test_up_bootstraps_a_portable_hmac_key(fake_docker: FakeDocker):
     assert "up -d" in result.log
 
 
+def test_up_is_idempotent_when_default_configs_already_exist(fake_docker: FakeDocker):
+    first = fake_docker.run("-u")
+    second = fake_docker.run("-u")
+
+    assert first.returncode == 0, first.stdout
+    assert second.returncode == 0, second.stdout
+    assert second.log.count("up -d") == 2
+
+
+def test_up_provisions_hmac_key_for_existing_legacy_trader_config(fake_docker: FakeDocker):
+    config_dir = fake_docker.home / ".config/mmr"
+    config_dir.mkdir(parents=True)
+    (config_dir / "trader.yaml").write_text("ib_server_address: 127.0.0.1\n")
+
+    result = fake_docker.run("-u")
+
+    assert result.returncode == 0, result.stdout
+    assert "service_hmac_key_file: ~/.config/mmr/service_hmac.key" in result.config.read_text()
+    assert result.key.exists()
+    assert "up -d" in result.log
+
+
 def test_backup_uses_scheduler_when_running(fake_docker: FakeDocker):
     result = fake_docker.run("-B", env={"MMR_FAKE_SCHEDULER": "1"})
 

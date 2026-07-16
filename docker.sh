@@ -346,7 +346,7 @@ _api_key_status_d() {
                 | sed -E "s/^[[:space:]]*${yaml_key}[[:space:]]*:[[:space:]]*//" \
                 | sed -E 's/^"//;  s/"$//'                                          \
                 | sed -E "s/^'//;  s/'$//"                                          \
-                | sed -E 's/[[:space:]]+$//'
+                | sed -E 's/[[:space:]]+$//' || true
         )
     fi
     if [ -n "$env_val" ]; then
@@ -495,7 +495,7 @@ _read_service_hmac_key_file() {
         | head -n1 \
         | sed -E 's/^[[:space:]]*service_hmac_key_file[[:space:]]*:[[:space:]]*//' \
         | sed -E "s/^['\"]//; s/['\"][[:space:]]*$//" \
-        | sed -E 's/[[:space:]]+$//'
+        | sed -E 's/[[:space:]]+$//' || true
 }
 
 _write_portable_service_hmac_key_file() {
@@ -520,7 +520,7 @@ ensure_split_config() {
     mkdir -p "$config_dir"
     for default_config in "$BUILDDIR"/config_defaults/*.yaml; do
         [[ -e "$default_config" ]] || continue
-        cp -n "$default_config" "$config_dir/"
+        [[ -e "$config_dir/$(basename "$default_config")" ]] || cp "$default_config" "$config_dir/"
     done
 
     if [[ ! -f "$trader_config" ]]; then

@@ -86,7 +86,7 @@ class DomainEvent:
     source: str
     source_timestamp: datetime
     correlation_id: str | None
-    payload: dict[str, Any]
+    payload: dict[str, Any] | None  # None for delete tombstones (journal stores NULL, read reconstructs None)
 
 @dataclass(frozen=True)
 class SnapshotWithCursor:
@@ -125,6 +125,24 @@ Additional frozen conventions:
   per command.
 - Quote-coverage owner kinds: `"position"`, `"order"`, `"proposal"`, `"strategy"`
   (`QuoteSubscriptionManager.set_owner_refs(owner_kind, contracts, delayed=False)`).
+- Journal DB topology: the `domain_event_journal`, `domain_snapshot_checkpoints`,
+  and ALL materialized-state tables (F1's + F2's broker tables) live in a dedicated
+  `trader_service`-owned DuckDB file (`journal_duckdb_path`, separate from
+  `mmr.duckdb`, mirroring the existing `history_duckdb_path` split), accessed in-process
+  through ONE shared `duckdb.connect()` instance; writers and the long-poll reader use
+  `.cursor()` off that instance and the reader does NOT go through `execute_atomic`/the
+  per-db lock. No other process opens this file. This is why `snapshot_with_cursor`
+  can read the journal cursor and every materialized adapter in one fenced transaction.
+- Quote snapshot ownership: `get_quotes_snapshot() -> {"quotes": {instrument_id: quote_row}}`
+  is produced by `[M1-F2]` (it owns the quote plane; quotes are absent from the journal),
+  registered on the `query` socket. `[M1-F1]` does NOT register it. `[M1-R]` may use a
+  fake for it during foundation-era development.
+- Snapshot readiness gate: `snapshot_with_cursor` returns `broker_generation` and
+  raises/returns `SNAPSHOT_NOT_READY` only once a complete broker generation exists.
+  `[M1-F1]` defines `SnapshotWithCursor`/`SnapshotNotReady` and returns
+  `broker_generation=0` with the gate DORMANT; `[M1-F2]` promotes generations and
+  ACTIVATES the gate. `[M1-R]` develops against fakes and meets the active gate at the
+  release-gate integration run.
 
 ## Release gates
 

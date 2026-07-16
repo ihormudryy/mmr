@@ -6,6 +6,8 @@
 
 **Architecture:** Add an explicit DuckDB unit of work, immutable domain-event contracts, and per-entity materialized adapters. A mutation writes its complete materialized row and journal entry in one transaction; a dedicated reader connection serves fenced snapshots and cursor long-polls without blocking the IB or command loops.
 
+> **Pre-flight resolution (connection topology — binding).** The journal, snapshot checkpoints, and ALL materialized-state tables live in a dedicated `trader_service`-owned DuckDB file `journal_duckdb_path` (separate from `mmr.duckdb`, mirroring the existing `history_duckdb_path` split). This is mandatory: a persistent reader connection on the shared `mmr.duckdb` file holds its cross-process lock and makes every CLI `connect()` fail (verified against DuckDB 1.4.4). In-process, hold ONE shared `duckdb.connect()` instance; writers and the long-poll reader take `.cursor()` off it (same-process MVCC + concurrent cursors). The long-poll reader must NOT route through `execute_atomic`/the per-db lock (that would freeze all DB access during `wait()`). `DuckDBConnection.transaction()` (Task 1) is still built on `execute_atomic` for the ordinary trader-DB path; the journal's atomic append uses the shared-instance cursor with an explicit `BEGIN/COMMIT`. No other process opens `journal_duckdb_path`.
+
 **Tech Stack:** CPython 3.12.13, DuckDB, dataclasses, JSON, threading conditions, typed JSON RPC, pytest.
 
 ## Global Constraints
@@ -180,7 +182,9 @@ git commit -m "feat(m1-f): define domain events and canonical keys"
 - Produces: `DomainJournal.mutate(conn, mutation, write_materialized) -> DomainEvent`.
 - The `write_materialized` callback signature is `write_materialized(conn, entity_revision: int) -> None`; it runs inside the same transaction as the journal insert.
 - Migration version allocation: this plan owns versions 1-9; `[M1-F2]` owns 10-19; `[M1-F3]` owns 20-29.
-- Produces tables `schema_migrations`, `domain_event_journal`, and `domain_snapshot_checkpoints`.
+- Produces tables `schema_migrations`, `domain_event_journal`, and `domain_snapshot_checkpoints`. All in the dedicated `journal_duckdb_path` file (see Architecture pre-flight resolution); its `schema_migrations` ledger starts clean at version 1.
+
+> **Pre-flight resolution (revision source — binding, RA-6).** `mutate()` reads the current `entity_revision` from the durable **materialized row**, never `MAX(entity_revision)` from the journal (compaction trims the journal → stale/NULL MAX → `UNIQUE(entity_type, entity_id, entity_revision)` collision). Therefore this task ALSO defines the materialized-state table(s) it reads revisions from (each row carries `entity_revision`); Task 4 adds only the `MaterializedAdapter` protocol + snapshot registration over those tables. Idempotency is a `SELECT`-by-`event_id` inside the write transaction (present → compare canonical fields → return existing or raise `EventIdentityConflict` without inserting; absent → insert); a `UNIQUE(entity_type, entity_id, entity_revision)` violation is a hard fail-loud error, never retried. `source_cursor` is monotonic-but-sparse (`nextval()` burns values on rollback) — tests assert ordering/relative deltas, never absolute integers.
 
 - [ ] **Step 1: Write migration and crash-point tests**
 
@@ -256,15 +260,18 @@ git commit -m "feat(m1-f): persist atomic materialized events"
 - Produces: `MaterializedAdapter` protocol with `entity_type`, `select_active(conn)`, and `checkpoint(conn)`.
 - Produces: `DomainSnapshotService.snapshot_with_cursor() -> SnapshotWithCursor`.
 
+> **Pre-flight resolution (broker-generation deferral — binding, BLOCKER-2).** `[M1-F1]` does NOT promote broker generations (that is `[M1-F2]`), so the readiness gate is DORMANT here: `snapshot_with_cursor` returns `broker_generation=0` and has NO active `SnapshotNotReady` raise-path in F1. Define the `SnapshotNotReady` class and the `SNAPSHOT_NOT_READY` wire-code mapping now (for F2 to activate) and read `broker_generation` from `domain_snapshot_checkpoints` (defaulting to 0 when absent), but do not gate on it. The fence test uses a NON-broker entity (`proposal`, which needs no generation) so the task is self-consistent and standalone-testable; the original `position`-based test would require a broker generation that only F2 produces.
+
 - [ ] **Step 1: Write an interleaving fence test**
 
 ```python
 def test_snapshot_cursor_covers_exact_returned_revisions(snapshot_service, writer):
-    writer.position(quantity=10, event_id="p1")
-    snapshot = snapshot_service.snapshot_with_cursor(on_read_started=lambda: writer.position(quantity=20, event_id="p2"))
-    position = snapshot.entities["position"][0]
-    assert position["quantity"] == 10
+    writer.proposal(quantity=10, event_id="p1")
+    snapshot = snapshot_service.snapshot_with_cursor(on_read_started=lambda: writer.proposal(quantity=20, event_id="p2"))
+    proposal = snapshot.entities["proposal"][0]
+    assert proposal["quantity"] == 10
     assert snapshot.source_cursor == 1
+    assert snapshot.broker_generation == 0  # gate dormant in F1; F2 activates it
 ```
 
 - [ ] **Step 2: Run and verify failure**
@@ -275,7 +282,7 @@ Expected: FAIL because no fenced snapshot service exists.
 
 - [ ] **Step 3: Implement one-read-transaction fencing**
 
-Open a dedicated read connection, `BEGIN TRANSACTION`, read the newest complete broker generation, read every registered materialized adapter, then read `MAX(source_cursor)` before `COMMIT`. Return JSON-native named fields only. If no complete broker generation exists, raise `SnapshotNotReady` instead of returning a partial view.
+Open a read cursor off the shared journal-DB instance (see Architecture pre-flight resolution — NOT a fresh file connection, NOT `execute_atomic`), `BEGIN TRANSACTION`, read `broker_generation` from `domain_snapshot_checkpoints` (0 when absent — the gate is dormant in F1 per the Task 4 pre-flight resolution; do NOT raise `SnapshotNotReady`), read every registered materialized adapter, then read `MAX(source_cursor)` before `COMMIT`. Every row dict in `entities` MUST retain `entity_id` and `entity_revision` (M1-R installs the read model by these). Return JSON-native named fields only.
 
 - [ ] **Step 4: Run tests and commit**
 

@@ -398,7 +398,7 @@ if [ "$DOCKER_MODE" = true ]; then
     echo ""
     echo "Next steps:"
     echo "  ./start_mmr.sh --docker -g   # clean rebuild + restart + exec in"
-    echo "  ./docker.sh -e               # shell into the MMR container"
+    echo "  ./docker.sh -e               # shell into the trader service"
     echo "  ./docker.sh -l               # tail logs from all containers"
     echo "  ./docker.sh -d               # stop and remove all containers"
     echo ""
@@ -668,7 +668,9 @@ ensure_service_hmac_key() {
         info "  (production never auto-generates this — see docker-entrypoint.sh)"
     fi
 
-    sed -i.bak "s|^service_hmac_key_file:.*|service_hmac_key_file: ${key_path}|" "$yaml_file"
+    # This portable spelling resolves to the host key for local processes and
+    # to the same bind-mounted key under /home/trader in split Compose.
+    sed -i.bak "s|^service_hmac_key_file:.*|service_hmac_key_file: ~/.config/mmr/service_hmac.key|" "$yaml_file"
     rm -f "${yaml_file}.bak"
 }
 

@@ -72,6 +72,25 @@ class ScriptedFeed:
         self.closed = True
 
 
+class BlockingFeed:
+    """Long-poll fake that always blocks for `delay` seconds regardless of
+    wait_ms -- simulates a poll genuinely in flight when stop() is called."""
+
+    def __init__(self, delay: float = 0.3):
+        self.delay = delay
+        self.calls = 0
+        self.closed = False
+
+    def call(self, method, body, response_model):
+        assert method == "read_domain_events"
+        self.calls += 1
+        time.sleep(self.delay)
+        return ReadDomainEventsResult(events=(), newest_cursor=body["after_cursor"])
+
+    def close(self):
+        self.closed = True
+
+
 class RecordingFanout:
     def __init__(self):
         self.published: list[dict] = []
@@ -165,6 +184,11 @@ class TestFailureHandling:
         try:
             assert wait_until(lambda: state.has_baseline)
             assert bridge.health()["reconnects"] >= 1
+            # The failure happened inside _resync_baseline (a snapshot-query
+            # error) -- it must be attributed to the 'snapshot' source, not
+            # hardcoded to 'journal'. reconnects is never reset by a later
+            # success, so this is safe to check even after recovery.
+            assert bridge.health()["sources"]["snapshot"]["reconnects"] >= 1
         finally:
             feed.items.put(ConnectionError("stop"))
             bridge.stop()
@@ -202,9 +226,163 @@ class TestFailureHandling:
 
     def test_stop_joins_thread_and_closes_nothing_it_does_not_own(self, loop_thread):
         feed = ScriptedFeed()
-        bridge, _, _ = _bridge(loop_thread, FakeQueryClient([_snapshot(10)]), feed)
+        query = FakeQueryClient([_snapshot(10)])
+        bridge, _, _ = _bridge(loop_thread, query, feed)
         bridge.start()
         assert wait_until(lambda: bridge.lifecycle is BridgeLifecycle.LIVE)
         feed.items.put(ConnectionError("stop"))
         bridge.stop()
         assert not bridge.is_alive()
+        assert not feed.closed
+        assert not query.closed
+
+
+class TestTailApplyIntegrity:
+    """FIX #1: the loop-side apply must be confirmed before the bridge
+    advances its read cursor, and two in-flight batches must never alias."""
+
+    def test_apply_error_does_not_skip_events_and_forces_resync(self, loop_thread):
+        class ExplodingState(DashboardState):
+            def __init__(self):
+                super().__init__()
+                self.raise_on_cursor = None
+
+            def apply(self, event):
+                if event.source_cursor == self.raise_on_cursor:
+                    raise RuntimeError("apply boom")
+                return super().apply(event)
+
+        feed = ScriptedFeed()
+        state = ExplodingState()
+        bridge, _, fanout = _bridge(
+            loop_thread, FakeQueryClient([_snapshot(10)]), feed, state=state)
+        bridge.start()
+        try:
+            assert wait_until(lambda: bridge.lifecycle is BridgeLifecycle.LIVE)
+            state.raise_on_cursor = 12
+            feed.items.put([_event(11, revision=4), _event(12, revision=5)])
+            # The loop-side apply blows up on cursor 12 -- the bridge must
+            # not silently treat the batch as consumed (a read-model gap),
+            # must record the failure, and must force a resync rather than
+            # quietly staying LIVE.
+            assert wait_until(
+                lambda: bridge.health()["sources"]["journal"]["last_error"] is not None)
+            assert "apply boom" in bridge.health()["sources"]["journal"]["last_error"]
+            assert wait_until(lambda: fanout.resyncs >= 2)
+            # Recovery must resume tailing from the re-installed baseline
+            # cursor (10), not from 12 -- proof the failed batch was never
+            # marked consumed.
+            assert wait_until(
+                lambda: len(feed.calls) >= 2 and feed.calls[1]["after_cursor"] == 10)
+        finally:
+            state.raise_on_cursor = None
+            feed.items.put(ConnectionError("stop"))
+            bridge.stop()
+
+    def test_apply_callback_binds_its_own_batch_no_aliasing(self, loop_thread):
+        feed = ScriptedFeed()
+        bridge, _, fanout = _bridge(
+            loop_thread, FakeQueryClient([_snapshot(10)]), feed)
+        # Distinct entity_ids so batch2's higher revisions can't shadow
+        # batch1's as merely-stale under DashboardState's per-entity
+        # revision check -- any cross-talk here must come from aliasing.
+        batch1 = (_event(11, revision=4, entity_id="DU123:111"),)
+        batch2 = (
+            _event(12, revision=5, entity_id="DU123:222"),
+            _event(13, revision=6, entity_id="DU123:222"),
+        )
+        applied1, applied2 = threading.Event(), threading.Event()
+        errors1: list = []
+        errors2: list = []
+        cb1 = bridge._make_apply_callback(batch1, applied1, errors1)
+        cb2 = bridge._make_apply_callback(batch2, applied2, errors2)
+
+        # Invoke out of creation order. If the callbacks aliased a shared
+        # events/applied cell (the pre-fix bug), cb1 would end up operating
+        # on batch2's events and/or signalling applied2 instead of applied1.
+        cb2()
+        cb1()
+
+        assert applied1.is_set() and applied2.is_set()
+        assert errors1 == [] and errors2 == []
+        published_cursors = [e["source_cursor"] for e in fanout.published]
+        assert published_cursors == [12, 13, 11]
+
+    def test_two_sequential_batches_do_not_cross_contaminate(self, loop_thread):
+        feed = ScriptedFeed()
+        bridge, state, fanout = _bridge(
+            loop_thread, FakeQueryClient([_snapshot(10)]), feed)
+        bridge.start()
+        try:
+            assert wait_until(lambda: bridge.lifecycle is BridgeLifecycle.LIVE)
+            feed.items.put([_event(11, revision=4)])
+            assert wait_until(lambda: len(fanout.published) == 1)
+            assert wait_until(lambda: bridge.health()["cursor"] == 11)
+            feed.items.put([_event(12, revision=5), _event(13, revision=6)])
+            assert wait_until(lambda: len(fanout.published) == 3)
+            assert wait_until(lambda: bridge.health()["cursor"] == 13)
+            assert [e["source_cursor"] for e in fanout.published] == [11, 12, 13]
+            assert state.positions["DU123:265598"]["quantity"] == 13
+        finally:
+            feed.items.put(ConnectionError("stop"))
+            bridge.stop()
+
+
+class TestColdOutageDisconnect:
+    """FIX #3: DISCONNECTED must be reachable even if the backend has never
+    once succeeded (last_success stays None forever)."""
+
+    def test_disconnected_after_cold_outage_never_had_a_success(self, loop_thread):
+        clock = {"t": 0.0}
+
+        def fake_monotonic():
+            return clock["t"]
+
+        class AlwaysFailQuery:
+            def __init__(self):
+                self.closed = False
+
+            def call(self, method, body, response_model):
+                raise ConnectionError("backend unreachable")
+
+            def close(self):
+                self.closed = True
+
+        feed = ScriptedFeed()
+        bridge, _, _ = _bridge(
+            loop_thread, AlwaysFailQuery(), feed,
+            monotonic=fake_monotonic, disconnected_after=5.0)
+        bridge.start()
+        try:
+            assert wait_until(
+                lambda: bridge.health()["sources"]["snapshot"]["reconnects"] >= 1)
+            assert bridge.lifecycle is BridgeLifecycle.DEGRADED
+            clock["t"] += 10.0
+            assert wait_until(lambda: bridge.lifecycle is BridgeLifecycle.DISCONNECTED)
+        finally:
+            bridge.stop()
+
+
+class TestStopReliability:
+    """FIX #2: stop() must reliably join an in-flight long-poll, and every
+    loop.call_soon_threadsafe must be guarded against a closed/None loop."""
+
+    def test_stop_joins_thread_through_an_in_flight_long_poll(self, loop_thread):
+        feed = BlockingFeed(delay=0.3)
+        bridge, _, _ = _bridge(
+            loop_thread, FakeQueryClient([_snapshot(10)]), feed, wait_ms=300)
+        bridge.start()
+        assert wait_until(lambda: bridge.lifecycle is BridgeLifecycle.LIVE)
+        assert wait_until(lambda: feed.calls >= 1)
+        # A poll is in flight (blocked inside feed.call) right now; the
+        # caller's timeout is deliberately shorter than the poll itself.
+        bridge.stop(timeout=0.05)
+        assert not bridge.is_alive()
+
+    def test_schedule_guards_closed_loop(self):
+        closed_loop = asyncio.new_event_loop()
+        closed_loop.close()
+        bridge, _, _ = _bridge(
+            closed_loop, FakeQueryClient([_snapshot(10)]), ScriptedFeed())
+        with pytest.raises(RuntimeError):
+            bridge._schedule(lambda: None)

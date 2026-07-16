@@ -40,6 +40,10 @@ class _SourceHealth:
     last_success: Optional[float] = None
     last_error: Optional[str] = None
     reconnects: int = 0
+    # Set on the first failure since the last success; cleared on any
+    # success. Lets a cold/never-connected outage (last_success still None)
+    # still age into DISCONNECTED instead of hanging in DEGRADED forever.
+    first_failure_at: Optional[float] = None
 
 
 class DashboardEventBridge:
@@ -77,24 +81,48 @@ class DashboardEventBridge:
     def stop(self, timeout: float = 5.0) -> None:
         self._stop.set()
         if self._thread is not None:
-            self._thread.join(timeout=timeout)
+            # A long-poll can legitimately block inside the feed client for
+            # up to wait_ms before it next checks _stop. Join at least that
+            # long (plus a margin), regardless of the caller's timeout, so
+            # stop() never returns with the thread still alive -- a lingering
+            # thread could later fire a callback onto a loop the caller has
+            # since torn down.
+            min_join = self._wait_ms / 1000.0 + 1.0
+            self._thread.join(timeout=max(timeout, min_join))
 
     def is_alive(self) -> bool:
         return bool(self._thread and self._thread.is_alive())
 
+    def _schedule(self, callback) -> None:
+        """Cross onto the ASGI loop, guarded against a closed/None loop.
+
+        A callback scheduled by a lingering bridge thread (e.g. after stop()
+        gives up on an unusually slow join) must never raise past this call
+        uncontrolled -- it should surface as a normal, catchable failure.
+        """
+        loop = self._loop
+        if loop is None or loop.is_closed():
+            raise RuntimeError("bridge: cannot schedule onto a closed event loop")
+        try:
+            loop.call_soon_threadsafe(callback)
+        except RuntimeError as exc:
+            raise RuntimeError(f"bridge: event loop rejected callback: {exc}") from exc
+
     def _run(self) -> None:
         backoff = self._backoff_min
         while not self._stop.is_set():
+            phase = "snapshot"
             try:
                 self.lifecycle = BridgeLifecycle.SYNCHRONIZING
                 self._resync_baseline()
                 backoff = self._backoff_min
                 self.lifecycle = BridgeLifecycle.LIVE
+                phase = "journal"
                 self._tail()
             except Exception as exc:  # noqa: BLE001 — every failure degrades, retries
                 if self._stop.is_set():
                     break
-                self._record_error("journal", exc)
+                self._record_error(phase, exc)
                 self._reconnects += 1
                 delay = min(backoff, self._backoff_max) * (0.5 + self._rng())
                 logger.warning("bridge degraded (%s); retrying in %.2fs",
@@ -117,7 +145,7 @@ class DashboardEventBridge:
             self._state.apply_quotes(dict(quotes.get("quotes") or {}))
             installed.set()
 
-        self._loop.call_soon_threadsafe(_install)
+        self._schedule(_install)
         if not installed.wait(timeout=10):
             raise TimeoutError("reducer loop did not install baseline within 10s")
         self._cursor = baseline.source_cursor
@@ -134,19 +162,44 @@ class DashboardEventBridge:
             self._record_success("journal")
             if not result.events:
                 continue  # ten-second empty heartbeat
-            self._cursor = result.events[-1].source_cursor
             events = tuple(result.events)
             applied = threading.Event()
+            error_holder: list[BaseException] = []
+            self._schedule(self._make_apply_callback(events, applied, error_holder))
+            applied_ok = applied.wait(timeout=10)  # natural backpressure: one batch in flight
+            if not applied_ok:
+                raise TimeoutError("reducer loop did not apply tail batch within 10s")
+            if error_holder:
+                raise error_holder[0]
+            # Only advance past a batch confirmed applied on the loop --
+            # otherwise the next read_domain_events(after_cursor=...) would
+            # silently skip these events forever (a read-model gap while the
+            # bridge still reports LIVE).
+            self._cursor = events[-1].source_cursor
 
-            def _apply() -> None:
+    def _make_apply_callback(self, events, applied, error_holder):
+        """Build the loop-side apply callback, binding this iteration's batch
+        by parameter rather than by closure-over-loop-variable.
+
+        ``_tail`` reassigns its local ``events``/``applied`` every iteration
+        of its while loop; a nested closure that merely references those
+        names would resolve them by cell at call time, not at definition
+        time. If a wait ever timed out while a callback was still queued on
+        the loop, a later closure would alias whichever iteration happened to
+        be current when it finally ran and corrupt the wrong batch. Passing
+        them as arguments here gives each callback its own bound values.
+        """
+        def _apply() -> None:
+            try:
                 for event in events:
                     envelope = self._state.apply(event)
                     if envelope is not None:  # stale revisions ignored idempotently
                         self._fanout.publish(envelope)
+            except Exception as exc:  # noqa: BLE001 — captured; re-raised on the bridge thread
+                error_holder.append(exc)
+            finally:
                 applied.set()
-
-            self._loop.call_soon_threadsafe(_apply)
-            applied.wait(timeout=10)  # natural backpressure: one batch in flight
+        return _apply
 
     # -- health -------------------------------------------------------------------
     def _record_success(self, source: str) -> None:
@@ -154,14 +207,24 @@ class DashboardEventBridge:
         health.state = "ok"
         health.last_success = self._monotonic()
         health.last_error = None
+        health.first_failure_at = None
 
     def _record_error(self, source: str, exc: BaseException) -> None:
         health = self._sources[source]
         health.state = "error"
         health.last_error = _safe_error(exc)
         health.reconnects += 1
-        if (health.last_success is not None
-                and self._monotonic() - health.last_success > self._disconnected_after):
+        now = self._monotonic()
+        if health.last_success is not None:
+            outage_seconds = now - health.last_success
+        else:
+            # Never had a success (cold/never-connected outage): age from
+            # the first observed failure instead of hanging in DEGRADED
+            # forever because there's no "last success" to measure from.
+            if health.first_failure_at is None:
+                health.first_failure_at = now
+            outage_seconds = now - health.first_failure_at
+        if outage_seconds > self._disconnected_after:
             self.lifecycle = BridgeLifecycle.DISCONNECTED
         else:
             self.lifecycle = BridgeLifecycle.DEGRADED

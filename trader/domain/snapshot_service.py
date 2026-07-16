@@ -42,6 +42,19 @@ wait -- see ``test_domain_snapshot.py``'s fence test, which proves the
 injected writer's commit lands durably (a real, completed, independent
 transaction) yet still isn't visible inside the reader's still-open one.
 
+This method DOES take ``journal.fenced_read_lock`` (Task 6) for the full
+span of its transaction -- that lock is a SEPARATE primitive from
+``_write_lock`` and exists solely to serialize this held-open,
+multi-statement read transaction against ``DomainJournal.compact()``'s
+own DELETE + ``CHECKPOINT`` (verified empirically that interleaving those
+is unreliable against DuckDB 1.4.4 -- see ``domain_journal.py``'s module
+docstring). Taking ``fenced_read_lock`` here is safe precisely because it
+is never the SAME lock ``mutate()`` takes: a caller-supplied
+``on_read_started`` hook that synchronously calls back into ``mutate()``
+on this same thread (this task's own fence test) only ever contends for
+``_write_lock``, never ``fenced_read_lock``, so no self-deadlock is
+possible.
+
 Broker-generation gate (binding, BLOCKER-2 -- DORMANT in [M1-F1])
 --------------------------------------------------------------------------
 ``[M1-F1]`` does not promote broker generations (``[M1-F2]`` does). So
@@ -58,7 +71,7 @@ from __future__ import annotations
 
 from typing import Any, Callable, Optional
 
-from trader.data.domain_journal import DomainJournal
+from trader.data.domain_journal import DomainJournal, read_latest_broker_generation
 from trader.data.materialized_state import MaterializedAdapter
 from trader.domain.events import SnapshotWithCursor
 
@@ -126,37 +139,39 @@ class DomainSnapshotService:
         it is never blocked or serialized behind this read -- yet its new
         revision does not appear in the entities/cursor returned below.
         """
-        conn = self._journal.connect()
-        conn.execute("BEGIN TRANSACTION")
-        try:
-            # First read of the transaction -- pins the snapshot every
-            # subsequent read below observes (verified empirically against
-            # DuckDB 1.4.4; see the module docstring's "Fencing mechanism"
-            # section). Do not reorder this behind on_read_started.
-            broker_generation = self._read_broker_generation(conn)
-
-            if on_read_started is not None:
-                on_read_started()
-
-            entities: dict[str, list[dict[str, Any]]] = {}
-            for adapter in self._adapters:
-                entities[adapter.entity_type] = adapter.select_active(conn)
-
-            cursor_row = conn.execute(
-                "SELECT MAX(source_cursor) FROM domain_event_journal"
-            ).fetchone()
-            source_cursor = cursor_row[0] if cursor_row and cursor_row[0] is not None else 0
-
-            conn.execute("COMMIT")
-        except BaseException:
+        with self._journal.fenced_read_lock:
+            conn = self._journal.connect()
+            conn.execute("BEGIN TRANSACTION")
             try:
-                conn.execute("ROLLBACK")
+                # First read of the transaction -- pins the snapshot every
+                # subsequent read below observes (verified empirically
+                # against DuckDB 1.4.4; see the module docstring's "Fencing
+                # mechanism" section). Do not reorder this behind
+                # on_read_started.
+                broker_generation = self._read_broker_generation(conn)
+
+                if on_read_started is not None:
+                    on_read_started()
+
+                entities: dict[str, list[dict[str, Any]]] = {}
+                for adapter in self._adapters:
+                    entities[adapter.entity_type] = adapter.select_active(conn)
+
+                cursor_row = conn.execute(
+                    "SELECT MAX(source_cursor) FROM domain_event_journal"
+                ).fetchone()
+                source_cursor = cursor_row[0] if cursor_row and cursor_row[0] is not None else 0
+
+                conn.execute("COMMIT")
             except BaseException:
-                # A rollback failure (e.g. a failed BEGIN left no open
-                # transaction) must never mask the real exception raised
-                # below.
-                pass
-            raise
+                try:
+                    conn.execute("ROLLBACK")
+                except BaseException:
+                    # A rollback failure (e.g. a failed BEGIN left no open
+                    # transaction) must never mask the real exception raised
+                    # below.
+                    pass
+                raise
 
         return SnapshotWithCursor(
             source_cursor=source_cursor,
@@ -168,9 +183,8 @@ class DomainSnapshotService:
         # Dormant gate (BLOCKER-2): read straight off the checkpoints
         # table, 0 when it's empty -- true for the whole of [M1-F1], since
         # only Task 6/[M1-F2] ever write a row here. Never raises
-        # SnapshotNotReady -- see the module docstring.
-        row = conn.execute(
-            "SELECT broker_generation FROM domain_snapshot_checkpoints "
-            "ORDER BY checkpoint_id DESC LIMIT 1"
-        ).fetchone()
-        return row[0] if row is not None else 0
+        # SnapshotNotReady -- see the module docstring. Shared with
+        # DomainJournal.compact() (Task 6) via read_latest_broker_generation
+        # so a retention sweep's own checkpoint write always carries this
+        # same value forward instead of duplicating the query.
+        return read_latest_broker_generation(conn)

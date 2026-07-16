@@ -74,13 +74,66 @@ seeds the counter from the durable journal inside ``migrate()`` so a
 process restart (or any fresh ``DomainJournal`` wrapping a pre-existing
 file) doesn't make the first long-poll read block needlessly for history
 that predates this in-process instance.
+
+Retention, checkpoints, and the ``fenced_read_lock`` (Task 6)
+----------------------------------------------------------------
+``compact(now, active_cursors)`` bounds journal growth: it deletes rows
+strictly older than a 30-day floor (``RETENTION_FLOOR``) UNLESS a still-live
+``active_cursors`` entry needs them, records the outcome as a
+``CompactionResult``, and appends a row to ``domain_snapshot_checkpoints``
+(read back via ``latest_checkpoint()``) recording exactly
+``oldest_retained_cursor`` -- the same column ``DomainFeedService``'s
+``CursorExpired`` check (Task 5) reads. A client whose cursor has fallen
+below that floor is FORCE-EXPIRED: compaction does not extend retention for
+it (a dead/stuck client must never pin the journal open forever), so its
+next ``read_domain_events`` call raises ``CursorExpired`` and it must
+re-establish a baseline via ``snapshot_with_cursor()``. The written
+checkpoint's ``broker_generation`` is READ from, and carried forward from,
+whatever the previous checkpoint already recorded
+(``read_latest_broker_generation``) -- compaction is a retention concern,
+not a broker-generation concern (that gate is dormant in F1, see
+``snapshot_service.py``), and must never reset an already-promoted
+generation back to 0 just because a retention sweep ran.
+
+``CHECKPOINT`` concurrency (binding, verified empirically against DuckDB
+1.4.4): issuing ``CHECKPOINT`` while a SIBLING cursor of this same shared
+connection instance holds a still-open, multi-statement read transaction is
+unreliable -- observed outcomes ranged from an immediate
+``TransactionException`` to the connection spinning at 100%+ CPU with no
+progress, depending on prior transaction history on the connection. The
+ONLY place in this process that holds a read transaction open across more
+than one statement is ``DomainSnapshotService.snapshot_with_cursor``'s
+fenced read (Task 4) -- ``read_after``/``wait_for_cursor_after`` (the
+long-poll feed's read side) never do, so they are not a candidate for this
+hazard and stay lock-free/hot. ``fenced_read_lock`` is the dedicated mutex
+(distinct from ``_write_lock``, which only guards ``mutate()``'s critical
+section and must never be taken by ``snapshot_with_cursor`` -- an existing,
+tested Task 4 invariant, since a caller-supplied ``on_read_started`` hook
+may synchronously call back into ``mutate()`` on the SAME thread) that
+``compact()`` and ``snapshot_with_cursor`` both take for the full span of
+their respective transactions, so the two can never interleave. ``compact()``
+additionally takes ``_write_lock`` too (mirroring ``mutate()``'s own
+defensive convention), and issues ``CHECKPOINT`` only strictly AFTER its own
+DELETE transaction has durably committed and still WHILE holding both locks
+-- so nothing else can open a transaction between "rows deleted" and "WAL
+checkpointed". Both locks are released only after ``CHECKPOINT`` returns.
+This makes ``compact()`` a genuinely OFF-hot-path operation: it never runs
+as part of ``mutate()``'s own critical section, only as a distinct,
+occasional maintenance call.
+
+On any failure inside ``compact()``'s transaction, the whole thing rolls
+back -- no rows are deleted and no checkpoint row is written, so a failed
+compaction run is invisible from the outside (the previous checkpoint, if
+any, remains "latest"). This is the "retain data on failure" contract:
+correctness over completing a maintenance sweep on schedule.
 """
 from __future__ import annotations
 
 import json
 import threading
 import time
-from datetime import datetime, timezone
+from dataclasses import dataclass
+from datetime import datetime, timedelta, timezone
 from typing import Any, Callable, Optional, Sequence
 from uuid import uuid4
 
@@ -91,6 +144,11 @@ from trader.data.schema_migrations import SchemaMigrator
 from trader.domain.events import DomainEvent, DomainMutation
 
 WriteMaterialized = Callable[[duckdb.DuckDBPyConnection, int], None]
+
+# [M1-F1] Task 6: the journal retention floor. An event survives
+# compaction if it is within this many days of `now` OR is at/after a
+# still-live active cursor (see `DomainJournal.compact`'s docstring).
+RETENTION_FLOOR = timedelta(days=30)
 
 
 class EventIdentityConflict(Exception):
@@ -192,6 +250,56 @@ def _as_utc(value: datetime) -> datetime:
     return value.astimezone(timezone.utc)
 
 
+def read_latest_broker_generation(conn: duckdb.DuckDBPyConnection) -> int:
+    """Read the most recent ``broker_generation`` recorded in
+    ``domain_snapshot_checkpoints`` (0 when the table is empty, which it
+    always is before the first compaction/checkpoint ever runs).
+
+    Shared by ``DomainSnapshotService._read_broker_generation`` (Task 4's
+    dormant BLOCKER-2 gate) and ``DomainJournal.compact`` (Task 6), so a
+    retention-driven checkpoint NEVER resets an already-promoted broker
+    generation back to 0 -- compaction only needs to CARRY the current
+    value forward, never invent or clear it. Must be called with an open
+    connection/cursor; does not open its own transaction (a bare
+    autocommitting ``SELECT``).
+    """
+    row = conn.execute(
+        "SELECT broker_generation FROM domain_snapshot_checkpoints "
+        "ORDER BY checkpoint_id DESC LIMIT 1"
+    ).fetchone()
+    return row[0] if row is not None else 0
+
+
+@dataclass(frozen=True)
+class CompactionResult:
+    """Outcome of one ``DomainJournal.compact()`` run.
+
+    ``oldest_retained_cursor``: the lowest ``source_cursor`` still present
+    in the journal after this run -- every event at/after it survived.
+    ``newest_cursor``: the highest ``source_cursor`` present at the moment
+    this compaction ran (never affected by the deletion -- the newest row
+    is always retained relative to itself).
+    ``deleted_count``: rows actually removed by this run. 0 is a common,
+    valid outcome (nothing yet falls outside the retention floor).
+    ``completed_at``: wall-clock time this compaction finished; also the
+    ``created_at`` stamped on the checkpoint row it wrote.
+    """
+    oldest_retained_cursor: int
+    newest_cursor: int
+    deleted_count: int
+    completed_at: datetime
+
+
+@dataclass(frozen=True)
+class CheckpointRecord:
+    """One durable row read back from ``domain_snapshot_checkpoints``."""
+    checkpoint_id: int
+    created_at: datetime
+    newest_cursor: int
+    oldest_retained_cursor: int
+    broker_generation: int
+
+
 def _canonical_payload(payload: Optional[dict]) -> Optional[str]:
     # Canonical JSON (sorted keys) so payload equality is compared by
     # content, not by incidental key order or re-parsed float formatting
@@ -229,6 +337,15 @@ class DomainJournal:
         # released -- see `_signal_commit`.
         self._commit_condition = threading.Condition()
         self._latest_committed_cursor: int = 0
+        # Task 6: dedicated mutex serializing `compact()` against
+        # `DomainSnapshotService.snapshot_with_cursor`'s fenced, held-open
+        # read transaction -- the only other place in this process that
+        # spans multiple statements inside one transaction. Deliberately
+        # NOT `_write_lock` (see module docstring's "CHECKPOINT
+        # concurrency" section for why `snapshot_with_cursor` must never
+        # take that one). Public (no leading underscore): shared across
+        # module boundaries with `DomainSnapshotService`.
+        self.fenced_read_lock = threading.Lock()
 
     # ------------------------------------------------------------------ #
     # Connection access
@@ -421,6 +538,137 @@ class DomainJournal:
                     break
                 self._commit_condition.wait(timeout=remaining)
             return self._latest_committed_cursor
+
+    # ------------------------------------------------------------------ #
+    # Task 6: retention, compaction, and checkpoints
+    # ------------------------------------------------------------------ #
+
+    def compact(self, now: datetime, active_cursors: dict[str, int]) -> CompactionResult:
+        """Bounded retention sweep over ``domain_event_journal``.
+
+        Retention rule (binding, plan Global Constraint: "Journal retention
+        is 30 days plus the newest complete checkpoint; active cursors
+        prevent required compaction"): an event survives if EITHER (a) it
+        is within ``RETENTION_FLOOR`` of ``now`` (``received_timestamp >=
+        now - RETENTION_FLOOR``), OR (b) it is at/after a LIVE entry in
+        ``active_cursors`` (client name -> cursor). A cursor that has
+        already fallen BEHIND the time floor is FORCE-EXPIRED: it is
+        excluded from (b) entirely, so a dead/stuck client can never pin
+        the journal open forever -- its next
+        ``DomainFeedService.read_domain_events`` call will observe
+        ``after_cursor < oldest_retained_cursor`` and raise
+        ``CursorExpired``, telling it to re-establish a baseline via
+        ``snapshot_with_cursor()``.
+
+        See the module docstring's "CHECKPOINT concurrency" section for
+        why this method holds BOTH ``_write_lock`` and ``fenced_read_lock``
+        across its own transaction AND the trailing ``CHECKPOINT`` call.
+
+        Raises ``ValueError`` if ``now`` is not timezone-aware (mirrors
+        ``DomainMutation.source_timestamp``'s own guard). On any other
+        failure, the whole transaction rolls back -- nothing is deleted
+        and no checkpoint row is written (see module docstring's final
+        paragraph).
+        """
+        if now.tzinfo is None:
+            raise ValueError("now must be timezone-aware UTC")
+
+        with self._write_lock:
+            with self.fenced_read_lock:
+                conn = self.connect()
+                conn.execute("BEGIN TRANSACTION")
+                try:
+                    newest_row = conn.execute(
+                        "SELECT COALESCE(MAX(source_cursor), 0) FROM domain_event_journal"
+                    ).fetchone()
+                    newest_cursor = newest_row[0] if newest_row is not None else 0
+
+                    cutoff = now - RETENTION_FLOOR
+                    floor_row = conn.execute(
+                        "SELECT MIN(source_cursor) FROM domain_event_journal "
+                        "WHERE received_timestamp >= ?",
+                        [cutoff],
+                    ).fetchone()
+                    if floor_row is not None and floor_row[0] is not None:
+                        time_floor_cursor = floor_row[0]
+                    else:
+                        # Nothing in the journal is within the floor (either
+                        # the journal is empty, or every row predates the
+                        # cutoff) -- represent "keep nothing on time grounds
+                        # alone" as one past the newest known cursor, so the
+                        # min() below can only be pulled DOWN by a live
+                        # active cursor, never up.
+                        time_floor_cursor = newest_cursor + 1
+
+                    # Force-expire: a cursor strictly behind the time floor
+                    # never extends retention (see docstring above).
+                    live_active_cursors = [
+                        cursor for cursor in active_cursors.values()
+                        if cursor >= time_floor_cursor
+                    ]
+                    oldest_retained_cursor = min([time_floor_cursor, *live_active_cursors])
+
+                    # Carry the current broker generation forward -- this
+                    # compaction is a retention concern, not a
+                    # broker-generation concern (see module docstring).
+                    broker_generation = read_latest_broker_generation(conn)
+                    completed_at = _utcnow()
+
+                    deleted_rows = conn.execute(
+                        "DELETE FROM domain_event_journal WHERE source_cursor < ? "
+                        "RETURNING source_cursor",
+                        [oldest_retained_cursor],
+                    ).fetchall()
+                    deleted_count = len(deleted_rows)
+
+                    conn.execute(
+                        "INSERT INTO domain_snapshot_checkpoints "
+                        "(created_at, newest_cursor, oldest_retained_cursor, broker_generation) "
+                        "VALUES (?, ?, ?, ?)",
+                        [completed_at, newest_cursor, oldest_retained_cursor, broker_generation],
+                    )
+                    conn.execute("COMMIT")
+                    # Strictly after the retention transaction has durably
+                    # committed, and still under both locks -- no other
+                    # transaction can be interleaved between "rows deleted"
+                    # and "WAL checkpointed" (module docstring).
+                    conn.execute("CHECKPOINT")
+                except BaseException:
+                    try:
+                        conn.execute("ROLLBACK")
+                    except BaseException:
+                        # RA-11-style guard: never let a rollback failure
+                        # mask the real exception re-raised below.
+                        pass
+                    raise
+
+        return CompactionResult(
+            oldest_retained_cursor=oldest_retained_cursor,
+            newest_cursor=newest_cursor,
+            deleted_count=deleted_count,
+            completed_at=completed_at,
+        )
+
+    def latest_checkpoint(self) -> Optional[CheckpointRecord]:
+        """Return the newest ``domain_snapshot_checkpoints`` row, or
+        ``None`` if ``compact()`` has never run. Operational-visibility /
+        test-support API (Task 6).
+        """
+        conn = self.connect()
+        row = conn.execute(
+            "SELECT checkpoint_id, created_at, newest_cursor, oldest_retained_cursor, "
+            "broker_generation FROM domain_snapshot_checkpoints "
+            "ORDER BY checkpoint_id DESC LIMIT 1"
+        ).fetchone()
+        if row is None:
+            return None
+        return CheckpointRecord(
+            checkpoint_id=row[0],
+            created_at=_as_utc(row[1]),
+            newest_cursor=row[2],
+            oldest_retained_cursor=row[3],
+            broker_generation=row[4],
+        )
 
     # ------------------------------------------------------------------ #
     # Test-support / read APIs

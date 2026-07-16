@@ -169,6 +169,64 @@ def test_illegal_transition_raises(ledger, journal, now):
         ledger.transition_in_tx(conn, "does-not-exist", "RECEIVED", "RESOLVED")
 
 
+# ---------------------------------------------------------------------------
+# Unexpected (non-CommandValidationError) handler failures must not wedge
+# the command at RECEIVED forever.
+# ---------------------------------------------------------------------------
+
+def test_unexpected_handler_exception_reraises_and_wedges_to_outcome_unknown(coordinator, ledger):
+    def handler(cmd):
+        raise RuntimeError("boom: handler's own mutate() blew up")
+
+    coordinator.register_action("noop", handler, requires_preflight=False)
+    request = _request(action="noop")
+
+    # (a) execute() re-raises the original exception -- the surface fails
+    # loud, it is not swallowed into some receipt.
+    with pytest.raises(RuntimeError, match="boom"):
+        coordinator.execute(request)
+
+    # (b) the ledger row is left in OUTCOME_UNKNOWN with error_code
+    # INTERNAL_ERROR, not stuck at RECEIVED.
+    row = ledger.get("cmd-1")
+    assert row is not None
+    assert row.state == "OUTCOME_UNKNOWN"
+    assert row.error_code == "INTERNAL_ERROR"
+
+    # (c) a subsequent replay of the SAME command_id (exact-retry lookup by
+    # command_id + matching request_hash) returns the ledger's actual
+    # OUTCOME_UNKNOWN state -- NOT a re-run of the handler and NOT a
+    # falsely "still pending" RECEIVED.
+    replay = coordinator.execute(request)
+    assert replay.state == "OUTCOME_UNKNOWN"
+    assert replay.error_code == "INTERNAL_ERROR"
+
+
+def test_unexpected_handler_exception_does_not_affect_the_validation_error_path(coordinator):
+    """The existing CommandValidationError -> REJECTED path must be
+    unchanged by the new broad `except Exception` clause."""
+    def handler(cmd):
+        raise CommandValidationError("RISK_REJECTED", "concentration too high")
+
+    coordinator.register_action("noop", handler, requires_preflight=False)
+    receipt = coordinator.execute(_request(action="noop"))
+    assert receipt.state == "REJECTED"
+    assert receipt.error_code == "RISK_REJECTED"
+
+
+def test_outcome_unknown_from_unexpected_error_survives_purge_expired(ledger, now):
+    """Mirrors test_retention_purges_terminal_but_never_unknown: an
+    OUTCOME_UNKNOWN row produced by the wedged-RECEIVED fix must never be
+    purged, no matter how old it is -- it stays visible until a human/
+    automated reconciler actually resolves it (see purge_expired's own
+    docstring)."""
+    ledger.insert_for_test(
+        "wedged-old", state="OUTCOME_UNKNOWN", updated_at=now - dt.timedelta(days=400),
+    )
+    assert ledger.purge_expired(now) == 0
+    assert ledger.get("wedged-old") is not None
+
+
 def test_colon_bearing_command_id_is_rejected():
     with pytest.raises(ValueError, match="colon|:"):
         _request(command_id="bad:id")
@@ -314,3 +372,52 @@ def test_create_and_reject_proposal_over_the_registry(production_registry):
     from trader.messaging.production_api import GetCommandRequest
     command_state = get_command_reg.handler(GetCommandRequest(command_id="cmd-create-1"))
     assert command_state["state"] == "RESOLVED"
+
+
+# ---------------------------------------------------------------------------
+# A colon-bearing command_id must be rejected as a clean client-input
+# validation error, not surface as an opaque INTERNAL_ERROR deep inside the
+# handler (CommandRequest.__post_init__ is defense-in-depth, not the only
+# check).
+# ---------------------------------------------------------------------------
+
+def test_create_proposal_request_rejects_colon_bearing_command_id():
+    from trader.messaging.production_api import CreateProposalRequest
+    with pytest.raises(ValidationError, match="colon|:"):
+        CreateProposalRequest(command_id="bad:id", conid=265598, action="BUY", quantity=10)
+
+
+def test_reject_proposal_request_rejects_colon_bearing_command_id():
+    with pytest.raises(ValidationError, match="colon|:"):
+        RejectProposalRequest(command_id="bad:id", proposal_id=7, reason="x")
+
+
+def test_create_proposal_colon_command_id_fails_at_coercion_not_the_handler(production_registry):
+    """Mirrors test_create_and_reject_proposal_over_the_registry's wiring,
+    but drives the request through the SAME request-coercion helper
+    (`_coerce_request_body`) that `TypedRpcServer._handle_request` calls
+    before ever invoking the registered handler. A malformed wire
+    `command_id` must fail HERE, as a `pydantic.ValidationError` (which the
+    server maps to `RpcProblem(code="VALIDATION_ERROR", ...)`) -- not deep
+    inside the handler via `CommandRequest.__post_init__`'s bare
+    `ValueError`, which the server's broad, unrelated-exception catch-all
+    would otherwise scrub to an opaque `INTERNAL_ERROR` ("internal error")."""
+    from trader.messaging.typed_rpc import _coerce_request_body
+
+    create_reg = production_registry.resolve("command", "create_proposal")
+    with pytest.raises(ValidationError):
+        _coerce_request_body(
+            {"command_id": "bad:id", "conid": 265598, "action": "BUY", "quantity": 10},
+            create_reg.request_model,
+        )
+
+
+def test_reject_proposal_colon_command_id_fails_at_coercion_not_the_handler(production_registry):
+    from trader.messaging.typed_rpc import _coerce_request_body
+
+    reject_reg = production_registry.resolve("command", "reject_proposal")
+    with pytest.raises(ValidationError):
+        _coerce_request_body(
+            {"command_id": "bad:id", "proposal_id": 7, "reason": "x"},
+            reject_reg.request_model,
+        )

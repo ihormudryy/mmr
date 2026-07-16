@@ -46,7 +46,21 @@ Command-ledger ordering (binding, spec-derived; order matters)
 4. The registered action handler runs. Raising ``CommandValidationError``
    transitions the command to ``REJECTED`` with the exception's code;
    returning normally transitions it to ``RESOLVED`` carrying the handler's
-   return value as ``outcome``.
+   return value as ``outcome``. Any OTHER exception (a bug, a DuckDB
+   ``IOException`` from the handler's own ``mutate()`` call, etc.) is not
+   swallowed: the command is transitioned ``RECEIVED`` -> ``OUTCOME_UNKNOWN``
+   with ``error_code="INTERNAL_ERROR"`` (the same "ambiguous, reconcile
+   later" state Task 5/6/7's multi-step sagas land on for a lost
+   acknowledgement), and the original exception is then re-raised so the RPC
+   layer still surfaces the failure loudly. Without this, the RECEIVED row
+   would be left behind forever: a client retry with the same ``command_id``
+   hits the exact-retry replay path (step 1) and gets back a
+   ``state="RECEIVED", retryable=True`` receipt WITHOUT the handler ever
+   running again -- a false promise, since replay never re-invokes a
+   handler once a ledger row exists. ``CommandLedger.transition_in_tx`` is a
+   plain compare-and-swap on the row's CURRENT state (``WHERE command_id = ?
+   AND state = ?``); there is no separate legal-from/to-state adjacency
+   table to consult or update here.
 
 ``command_id`` is colon-free by construction (``CommandRequest.__post_init__``
 raises ``ValueError`` otherwise) because ``encode_order_ref`` builds
@@ -638,6 +652,26 @@ class TradingCommandCoordinator:
         except CommandValidationError as exc:
             row = self._transition(request, "RECEIVED", "REJECTED", error_code=exc.code)
             return _row_to_receipt(row)
+        except Exception:
+            # Fail loud at the surface (the original exception is
+            # re-raised below) but leave a defined, reconcilable ledger
+            # state behind instead of a silently wedged RECEIVED -- a
+            # handler can fail AFTER already committing a side effect of
+            # its own (e.g. a proposal insert inside its own mutate()
+            # call), so this outcome can be characterized as neither a
+            # clean REJECTED nor a clean RESOLVED. OUTCOME_UNKNOWN is
+            # exactly the "ambiguous, reconcile later" state for this.
+            try:
+                self._transition(
+                    request, "RECEIVED", "OUTCOME_UNKNOWN", error_code="INTERNAL_ERROR",
+                )
+            except Exception:
+                # The ledger write itself failed too (e.g. the DB is
+                # genuinely down). Do not let that mask the original
+                # exception -- the caller must still see what actually
+                # went wrong, not a secondary bookkeeping failure.
+                pass
+            raise
 
         row = self._transition(request, "RECEIVED", "RESOLVED", outcome=outcome)
         return _row_to_receipt(row)

@@ -68,7 +68,13 @@ there is no ``skip_risk_gate`` anywhere on this surface, and risk-limit
 administration (``set_risk_limits``) is still not registered on ``command``
 by this or any other addition. Account id is derived from the trusted
 ``trader.ib_account`` server-side value, never from the caller's request
-body.
+body. ``CreateProposalRequest``/``RejectProposalRequest`` also reject a
+colon-bearing ``command_id`` at the field-validator level (see
+``_reject_colon_in_command_id``) so a malformed wire value fails with a
+clean ``VALIDATION_ERROR`` at request-coercion time instead of a bare
+``ValueError`` raised deep inside the handler by
+``CommandRequest.__post_init__`` -- which ``TypedRpcServer``'s catch-all
+would otherwise scrub to an opaque ``INTERNAL_ERROR``.
 """
 
 from __future__ import annotations
@@ -76,7 +82,7 @@ from __future__ import annotations
 from dataclasses import asdict
 from typing import Any, Dict, Optional
 
-from pydantic import BaseModel, ConfigDict
+from pydantic import BaseModel, ConfigDict, field_validator
 
 from trader.data.proposal_repository import ProposalRepository
 from trader.domain.commands import CommandReceipt
@@ -165,6 +171,32 @@ def _snapshot_with_cursor_handler(snapshot_service: DomainSnapshotService):
 # at all, on either role.
 # ---------------------------------------------------------------------------
 
+def _reject_colon_in_command_id(value: str) -> str:
+    """Shared ``command_id`` field-validator body for the two mutating
+    request models below.
+
+    Mirrors ``CommandRequest.__post_init__`` (``command_coordinator.py``):
+    ``encode_order_ref`` reserves ``':'`` for the ``mmr:`` orderRef prefix,
+    so a colon inside ``command_id`` would corrupt that encoding. That
+    ``__post_init__`` check only fires once ``CommandRequest`` is
+    constructed -- deep inside the RPC handler -- so a malformed wire
+    ``command_id`` previously surfaced as a bare ``ValueError`` that
+    ``TypedRpcServer``'s unhandled-exception catch-all scrubs to an opaque
+    ``INTERNAL_ERROR`` ("internal error"), giving the caller no clue their
+    own input was malformed. Validating here, at request-coercion time,
+    turns that into a clean ``VALIDATION_ERROR`` instead. This is
+    defense-in-depth ALONGSIDE (not a replacement for) the
+    ``CommandRequest.__post_init__`` check, which still guards every other
+    ``CommandRequest`` construction path.
+    """
+    if ":" in value:
+        raise ValueError(
+            f"command_id must not contain ':' (encode_order_ref reserves it "
+            f"for the mmr: orderRef prefix): {value!r}"
+        )
+    return value
+
+
 class CreateProposalRequest(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
@@ -180,6 +212,11 @@ class CreateProposalRequest(BaseModel):
     max_price_drift_bps: Optional[float] = None
     preflight_nonce: Optional[str] = None
 
+    @field_validator("command_id")
+    @classmethod
+    def _command_id_has_no_colon(cls, value: str) -> str:
+        return _reject_colon_in_command_id(value)
+
 
 class RejectProposalRequest(BaseModel):
     model_config = ConfigDict(extra="forbid")
@@ -187,6 +224,11 @@ class RejectProposalRequest(BaseModel):
     command_id: str
     proposal_id: int
     reason: str
+
+    @field_validator("command_id")
+    @classmethod
+    def _command_id_has_no_colon(cls, value: str) -> str:
+        return _reject_colon_in_command_id(value)
 
 
 class GetCommandRequest(BaseModel):

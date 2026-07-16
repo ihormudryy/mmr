@@ -30,6 +30,94 @@ def _minimal_trader() -> Trader:
     return t
 
 
+def test_trader_accepts_a_dedicated_journal_database_path():
+    trader = Trader(
+        ib_server_address='127.0.0.1',
+        ib_server_port=7497,
+        trading_runtime_ib_client_id=5,
+        ib_account='DU12345',
+        duckdb_path='/tmp/mmr.duckdb',
+        journal_duckdb_path='/tmp/mmr_journal.duckdb',
+        universe_library='Universes',
+        zmq_pubsub_server_address='tcp://127.0.0.1',
+        zmq_pubsub_server_port=42002,
+        zmq_rpc_server_address='tcp://127.0.0.1',
+        zmq_rpc_server_port=42001,
+        zmq_strategy_rpc_server_address='tcp://127.0.0.1',
+        zmq_strategy_rpc_server_port=42005,
+        zmq_messagebus_server_address='tcp://127.0.0.1',
+        zmq_messagebus_server_port=42006,
+    )
+
+    assert trader.journal_duckdb_path == '/tmp/mmr_journal.duckdb'
+
+
+def test_trader_derives_a_separate_journal_path_for_older_configurations():
+    trader = Trader(
+        ib_server_address='127.0.0.1',
+        ib_server_port=7497,
+        trading_runtime_ib_client_id=5,
+        ib_account='DU12345',
+        duckdb_path='/tmp/mmr.duckdb',
+        universe_library='Universes',
+        zmq_pubsub_server_address='tcp://127.0.0.1',
+        zmq_pubsub_server_port=42002,
+        zmq_rpc_server_address='tcp://127.0.0.1',
+        zmq_rpc_server_port=42001,
+        zmq_strategy_rpc_server_address='tcp://127.0.0.1',
+        zmq_strategy_rpc_server_port=42005,
+        zmq_messagebus_server_address='tcp://127.0.0.1',
+        zmq_messagebus_server_port=42006,
+    )
+
+    assert trader.journal_duckdb_path == '/tmp/mmr.duckdb.journal'
+
+
+@pytest.mark.asyncio
+async def test_reconciliation_journals_a_startup_run_without_changing_report(monkeypatch):
+    trader = _minimal_trader()
+    trader.duckdb_path = '/tmp/reconcile-state.duckdb'
+    trader.domain_journal = object()
+    trader.journal_db = object()
+    trader.client = MagicMock()
+    trader.client.get_open_orders = MagicMock(return_value=[])
+    trader.client.get_executions = MagicMock(return_value=[])
+    trader.get_positions = MagicMock(return_value=[])
+
+    async def no_orders():
+        return []
+
+    trader.client.get_open_orders = no_orders
+    trader.client.get_executions = no_orders
+
+    class Report:
+        findings = []
+        checked_proposals = checked_positions = ib_open_orders = ib_executions = 0
+
+        def to_dict(self):
+            return {"discrepancies": [], "resolutions": [], "ok": True}
+
+    monkeypatch.setattr("trader.trading.reconciliation.reconcile", lambda *args: Report())
+    monkeypatch.setattr("trader.data.proposal_store.ProposalStore.query", lambda *args, **kwargs: [])
+
+    published = []
+
+    class Producer:
+        def __init__(self, **_kwargs):
+            pass
+
+        def publish_run(self, **kwargs):
+            published.append(kwargs)
+
+    monkeypatch.setattr("trader.trading.risk_producer.ReconciliationProducer", Producer)
+
+    assert await trader.reconcile_with_broker(trigger="startup") == {
+        "discrepancies": [], "resolutions": [], "ok": True
+    }
+    assert published[0]["trigger"] == "startup"
+    assert published[0]["discrepancies"] == []
+
+
 # ---------------------------------------------------------------------------
 # PnL subscription lock — race-free "first-claim-wins"
 # ---------------------------------------------------------------------------

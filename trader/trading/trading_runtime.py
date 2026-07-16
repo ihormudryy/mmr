@@ -17,9 +17,16 @@ from trader.common.logging_helper import get_callstack, log_method, setup_loggin
 from trader.common.reactivex import AnonymousObserver, SuccessFail
 
 from trader.data.data_access import PortfolioSummary, SecurityDefinition, TickStorage
+from trader.data.broker_state import BrokerStateStore, broker_materialized_adapters
+from trader.data.domain_journal import DomainJournal
 from trader.data.event_store import EventStore, EventType, TradingEvent
 from trader.data.market_data import SecurityDataStream
+from trader.data.schema_migrations import SchemaMigrator
 from trader.data.universe import Universe, UniverseAccessor
+from trader.domain.feed_service import DomainFeedService
+from trader.domain.snapshot_service import DomainSnapshotService
+from trader.data.duckdb_store import DuckDBConnection
+from trader.trading.broker_ingest import BrokerIngest
 from trader.trading.risk_gate import RiskGate, RiskLimits
 from trader.listeners.ibreactive import IBAIORx, IBAIORxError
 from trader.messaging.clientserver import MessageBusServer, MultithreadedTopicPubSub, RPCClient, RPCServer
@@ -75,6 +82,7 @@ class Trader():
                  zmq_messagebus_server_address: str,
                  zmq_messagebus_server_port: int,
                  history_duckdb_path: str = '',
+                 journal_duckdb_path: str = '',
                  paper_trading: bool = False,
                  simulation: bool = False,
                  require_proposal_approval: bool = False,
@@ -90,6 +98,10 @@ class Trader():
         self.ib_account = ib_account
         self.duckdb_path = duckdb_path
         self.history_duckdb_path = history_duckdb_path or duckdb_path
+        # Existing installations may predate ``journal_duckdb_path``. Keep
+        # them functional while never falling back to the shared operational
+        # database, which would reintroduce cross-process DuckDB lockouts.
+        self.journal_duckdb_path = journal_duckdb_path or f"{duckdb_path}.journal"
         self.universe_library = universe_library
         self.simulation: bool = simulation
         self.paper_trading = paper_trading
@@ -302,6 +314,34 @@ class Trader():
             self.clear_portfolio_universe()
             self.contract_subscriptions = {}
             self.market_data_subscriptions = {}
+
+            # [M1-F2] The journal file is owned exclusively by this process.
+            # Build its durable broker view before IB can emit a connected
+            # callback; callback registration and the initial completeness
+            # barrier happen later in setup_subscriptions()/connected_event().
+            journal_db = DuckDBConnection.get_instance(self.journal_duckdb_path)
+            self.journal_db = journal_db
+            journal_migrator = SchemaMigrator(journal_db)
+            self.domain_journal = DomainJournal(journal_db)
+            self.domain_journal.migrate(journal_migrator)
+            self.broker_state_store = BrokerStateStore(journal_db)
+            self.broker_state_store.migrate(journal_migrator)
+            from trader.trading.risk_producer import ReconciliationProducer
+            ReconciliationProducer(journal_db, self.domain_journal).migrate(journal_migrator)
+            self.broker_ingest = BrokerIngest(
+                db=journal_db,
+                journal=self.domain_journal,
+                store=self.broker_state_store,
+                account_id=self.ib_account,
+                account_mode='paper' if self.paper_trading else 'live',
+            )
+            self.snapshot_service = DomainSnapshotService(self.domain_journal)
+            self.snapshot_service.register_broker_generation_reader(
+                self.broker_state_store.latest_promoted_generation_in_tx
+            )
+            for adapter in broker_materialized_adapters(self.broker_state_store):
+                self.snapshot_service.register_adapter(adapter)
+            self.feed_service = DomainFeedService(self.domain_journal)
             self.client.ib.connectedEvent += self.connected_event
             self.client.ib.disconnectedEvent += self.disconnected_event
             # G0 Task 6: MMR_FAKE_BROKER=1 lets this process boot, report
@@ -368,7 +408,12 @@ class Trader():
             hmac_key = load_service_hmac_key(self.service_hmac_key_file)
             self.typed_authenticator = HmacServiceAuthenticator(hmac_key)
 
-            production_registry = build_production_registry(self, self.typed_authenticator)
+            production_registry = build_production_registry(
+                self,
+                self.typed_authenticator,
+                snapshot_service=self.snapshot_service,
+                feed_service=self.feed_service,
+            )
             self.typed_query_server = TypedRpcServer(
                 'query', production_registry, self.typed_authenticator,
                 address=self.typed_bind_address,
@@ -432,6 +477,7 @@ class Trader():
             # exists before the first connected_event runs); wire its event store
             # now that it's available.
             self.order_tracker.set_event_store(self.event_store)
+            self.broker_ingest.start()
 
             # load trading filters (allowlist/denylist)
             from trader.trading.trading_filter import TradingFilter
@@ -476,6 +522,8 @@ class Trader():
 
     @log_method
     async def shutdown(self):
+        if getattr(self, 'broker_ingest', None) is not None:
+            self.broker_ingest.stop()
         self.client.ib.connectedEvent -= self.connected_event
         self.client.ib.disconnectedEvent -= self.disconnected_event
         self.client.ib.disconnect()
@@ -571,6 +619,23 @@ class Trader():
                 pass
             _ev.connect(self.order_tracker.on_trade, keep_ref=True)
             logging.info('order-lifecycle tracker attached to orderStatusEvent')
+
+        if getattr(self, 'broker_ingest', None) is not None:
+            for event, handler in (
+                (self.client.ib.accountValueEvent, self.broker_ingest.on_account_value),
+                (self.client.ib.positionEvent, self.broker_ingest.on_position),
+                (self.client.ib.updatePortfolioEvent, self.broker_ingest.on_portfolio_item),
+                (self.client.ib.openOrderEvent, self.broker_ingest.on_open_order),
+                (self.client.ib.orderStatusEvent, self.broker_ingest.on_order_status),
+                (self.client.ib.execDetailsEvent, self.broker_ingest.on_exec_details),
+                (self.client.ib.commissionReportEvent, self.broker_ingest.on_commission_report),
+            ):
+                try:
+                    event.disconnect(handler)
+                except Exception:
+                    pass
+                event.connect(handler, keep_ref=True)
+            logging.info('broker ingest producers attached to IB callbacks')
 
         positions_observer = Observer(
             on_next=self.__update_positions,
@@ -751,6 +816,11 @@ class Trader():
             # No-op on the first connect (nothing published yet).
             self._republish_ticker_subscriptions()
 
+            if getattr(self, 'broker_ingest', None) is not None:
+                asyncio.get_running_loop().create_task(
+                    self.broker_ingest.run_broker_sync(self.client)
+                )
+
             # One-shot startup broker-truth reconciliation: after a restart,
             # cross-check proposals + positions against live IB and log any
             # divergence (report-only). Delayed so IB open-orders/positions have
@@ -761,7 +831,7 @@ class Trader():
                 async def _delayed_reconcile():
                     try:
                         await asyncio.sleep(8)
-                        await self.reconcile_with_broker()
+                        await self.reconcile_with_broker(trigger='startup')
                     except Exception as ex:
                         logging.warning('startup reconciliation failed: %s', ex)
 
@@ -797,6 +867,14 @@ class Trader():
 
     @log_method
     async def disconnected_event(self):
+        if getattr(self, 'broker_ingest', None) is not None:
+            try:
+                await asyncio.to_thread(
+                    self.broker_ingest.abandon_generation, 'ib disconnected'
+                )
+            except Exception as ex:
+                logging.warning('abandoning broker sync generation failed: %s', ex)
+
         # Guard against multiple concurrent reconnection attempts
         if hasattr(self, '_reconnecting') and self._reconnecting:
             logging.debug('reconnection already in progress, skipping')
@@ -1780,15 +1858,19 @@ class Trader():
             logging.warning('ib.positions() failed, using cache: %s', ex)
         return self.portfolio.get_positions()
 
-    async def reconcile_with_broker(self) -> dict:
+    async def reconcile_with_broker(self, trigger: str = 'operator') -> dict:
         """Cross-check recent proposals + positions against live IB truth.
 
         REPORT-ONLY: fetches IB open orders, executions and positions, compares
         them to the proposal store and current positions, and returns a
         divergence report. Places/cancels nothing and mutates no proposal status.
         """
+        import uuid
+
         from trader.trading.reconciliation import reconcile
         from trader.data.proposal_store import ProposalStore
+
+        started_at = dt.datetime.now(dt.timezone.utc)
 
         def _action(o):
             return str(getattr(o, 'action', '') or '')
@@ -1857,7 +1939,28 @@ class Trader():
                          '%d open orders, %d executions checked)',
                          report.checked_proposals, report.checked_positions,
                          report.ib_open_orders, report.ib_executions)
-        return report.to_dict()
+        result = report.to_dict()
+        # Reconciliation remains report-only: failure to record its audit
+        # event must never alter the existing report or broker interaction.
+        if getattr(self, 'domain_journal', None) is not None:
+            try:
+                from trader.trading.risk_producer import ReconciliationProducer
+
+                journal_db = getattr(self, 'journal_db', None)
+                if journal_db is None:
+                    journal_db = self.domain_journal.db
+                ReconciliationProducer(db=journal_db, journal=self.domain_journal).publish_run(
+                    run_id=f"recon-{uuid.uuid4().hex}",
+                    trigger=trigger,
+                    source_cursor=None,
+                    discrepancies=result.get('discrepancies', []),
+                    resolutions=result.get('resolutions', []),
+                    started_at=started_at,
+                    completed_at=dt.datetime.now(dt.timezone.utc),
+                )
+            except Exception as ex:
+                logging.warning('journaling reconciliation run failed: %s', ex)
+        return result
 
     def diagnose_portfolio_feed(self) -> dict:
         """Dump raw IB portfolio/positions from every managed account.

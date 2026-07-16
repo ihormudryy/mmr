@@ -104,6 +104,30 @@ def test_same_event_id_is_idempotent(domain_store):
     assert len(domain_store.journal.read_after(0, 100)) == 1
 
 
+def test_mutate_batch_commits_multiple_materialized_rows_and_events_together(domain_store):
+    second = replace(POSITION_MUTATION, entity_id="DU123:272093", payload={"quantity": 5})
+
+    def write_for(mutation):
+        return lambda conn, revision: conn.execute(
+            "INSERT INTO test_position_writes VALUES (?, ?)",
+            [mutation.entity_id, revision],
+        )
+
+    events = domain_store.journal.mutate_batch(
+        domain_store.journal.connect(),
+        [
+            (POSITION_MUTATION, write_for(POSITION_MUTATION), "batch-1"),
+            (second, write_for(second), "batch-2"),
+        ],
+    )
+
+    assert [event.event_id for event in events] == ["batch-1", "batch-2"]
+    assert domain_store.journal.read_after(0, 10)[-1].source_cursor == events[-1].source_cursor
+    assert domain_store.journal.db.execute(
+        "SELECT entity_id FROM test_position_writes ORDER BY entity_id", fetch="all"
+    ) == [("DU123:265598",), ("DU123:272093",)]
+
+
 # --------------------------------------------------------------------- #
 # Additional coverage
 # --------------------------------------------------------------------- #

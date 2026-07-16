@@ -428,36 +428,78 @@ class DomainJournal:
         propagates out of the whole method without ever reaching the signal
         call, so a rolled-back transaction never notifies a waiting reader.
         """
-        eid = event_id if event_id is not None else str(uuid4())
-        committed_event: Optional[DomainEvent] = None
+        return self.mutate_batch(conn, [(mutation, write_materialized, event_id)])[0]
+
+    def mutate_batch(
+        self,
+        conn: duckdb.DuckDBPyConnection,
+        mutations: Sequence[tuple[DomainMutation, WriteMaterialized, Optional[str]]],
+    ) -> tuple[DomainEvent, ...]:
+        """Commit a non-empty ordered set of domain mutations atomically.
+
+        The broker snapshot-completeness barrier uses this when it promotes a
+        staged generation: every materialized row, journal event, tombstone,
+        and the generation cursor must become visible together. Like
+        ``mutate``, this method owns ``BEGIN``/``COMMIT``; callbacks must not
+        open an outer transaction or call ``mutate`` recursively.
+        """
+        if not mutations:
+            return ()
+        return self.mutate_batch_work(
+            conn,
+            lambda _conn, append: tuple(
+                append(mutation, write_materialized, event_id)
+                for mutation, write_materialized, event_id in mutations
+            ),
+        )
+
+    def mutate_batch_work(
+        self,
+        conn: duckdb.DuckDBPyConnection,
+        work: Callable[[duckdb.DuckDBPyConnection, Callable[[DomainMutation, WriteMaterialized, Optional[str]], DomainEvent]], Any],
+    ) -> Any:
+        """Run ``work`` and its ordered mutation appends in one transaction.
+
+        The callback receives an ``append`` function rather than a list so a
+        producer can read materialized state written by an earlier append in
+        the same batch.  This is needed when a broker generation contains an
+        order followed by its fill, or a fill followed by its commission.
+        ``work`` may also update producer-owned metadata (such as the
+        promoted-generation cursor) on the same connection before commit.
+        """
+        committed_events: tuple[DomainEvent, ...] = ()
         with self._write_lock:
             conn.execute("BEGIN TRANSACTION")
             try:
-                existing = self._select_journal_row(conn, eid)
-                if existing is not None:
-                    if not self._matches(existing, mutation):
-                        raise EventIdentityConflict(eid)
-                    conn.execute("COMMIT")
-                    committed_event = self._row_to_event(existing)
-                else:
-                    current_revision = self._read_current_revision(
+                events: list[DomainEvent] = []
+                def append(
+                    mutation: DomainMutation,
+                    write_materialized: WriteMaterialized,
+                    event_id: Optional[str] = None,
+                ) -> DomainEvent:
+                    eid = event_id if event_id is not None else str(uuid4())
+                    existing = self._select_journal_row(conn, eid)
+                    if existing is not None:
+                        if not self._matches(existing, mutation):
+                            raise EventIdentityConflict(eid)
+                        event = self._row_to_event(existing)
+                    else:
+                        current_revision = self._read_current_revision(
                         conn, mutation.entity_type, mutation.entity_id
-                    )
-                    next_revision = current_revision + 1
+                        )
+                        next_revision = current_revision + 1
+                        write_materialized(conn, next_revision)
+                        received_ts = _utcnow()
+                        self._upsert_materialized(conn, mutation, next_revision, received_ts)
+                        event = self._insert_journal_row(
+                            conn, eid, mutation, next_revision, received_ts
+                        )
+                    events.append(event)
+                    return event
 
-                    # Caller's own materialized write. Runs INSIDE this
-                    # transaction -- if it raises, everything below (and
-                    # this callback's own writes) rolls back together
-                    # (atomicity, binding item 4).
-                    write_materialized(conn, next_revision)
-
-                    received_ts = _utcnow()
-                    self._upsert_materialized(conn, mutation, next_revision, received_ts)
-                    committed_event = self._insert_journal_row(
-                        conn, eid, mutation, next_revision, received_ts
-                    )
-
-                    conn.execute("COMMIT")
+                result = work(conn, append)
+                conn.execute("COMMIT")
+                committed_events = tuple(events)
             except BaseException:
                 try:
                     conn.execute("ROLLBACK")
@@ -470,8 +512,9 @@ class DomainJournal:
         # `_write_lock` is released above (the `with` block has exited).
         # ONLY NOW -- after both the durable COMMIT and the lock release --
         # do we bump the in-memory cursor and wake long-poll readers.
-        self._signal_commit(committed_event.source_cursor)
-        return committed_event
+        if committed_events:
+            self._signal_commit(max(event.source_cursor for event in committed_events))
+        return result
 
     # ------------------------------------------------------------------ #
     # Task 5: commit signalling for the long-poll feed

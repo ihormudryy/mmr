@@ -7,6 +7,8 @@ transaction self-managed by ``DomainJournal.mutate``.
 from __future__ import annotations
 
 import datetime as dt
+import dataclasses
+import json
 import queue
 import threading
 import uuid
@@ -29,6 +31,74 @@ from trader.trading.order_correlation import (
     decode_order_ref,
     normalize_open_order,
 )
+
+
+BROKER_SYNC_SOURCES = ("account", "positions", "open_orders", "completed_orders", "executions")
+
+
+class GenerationIncomplete(RuntimeError):
+    """A broker snapshot cannot promote until every required source ends."""
+
+
+class NoActiveGeneration(RuntimeError):
+    """A completion marker was received without an active broker snapshot."""
+
+
+@dataclass
+class _Generation:
+    generation_id: int
+    required: tuple[str, ...]
+    complete: set[str] = dataclasses.field(default_factory=set)
+
+
+def _encode_observation(record: Any) -> str:
+    def default(value: Any) -> Any:
+        if isinstance(value, dt.datetime):
+            return {"__datetime__": value.isoformat()}
+        raise TypeError(f"cannot encode {type(value)!r}")
+    return json.dumps(dataclasses.asdict(record), default=default, sort_keys=True)
+
+
+def _canonical_key(record: Any) -> str:
+    if isinstance(record, AccountValueObservation):
+        return f"account:{record.account_id}:{record.tag}:{record.currency}"
+    if isinstance(record, PositionObservation):
+        return f"position:{record.account_id}:{record.conid}"
+    if isinstance(record, OrderObservation):
+        return f"order:{record.account_id}:{record.perm_id or record.client_order_id}"
+    if isinstance(record, FillObservation):
+        return f"fill:{record.account_id}:{record.exec_id}"
+    if isinstance(record, CommissionObservation):
+        return f"commission:{record.fill.account_id}:{record.fill.exec_id}"
+    raise TypeError(f"unsupported broker observation {type(record)!r}")
+
+
+def _decode_observation(kind: str, record_json: Any) -> Any:
+    payload = json.loads(record_json) if isinstance(record_json, str) else record_json
+
+    def revive(value: Any) -> Any:
+        if isinstance(value, dict):
+            if set(value) == {"__datetime__"}:
+                return dt.datetime.fromisoformat(value["__datetime__"])
+            return {key: revive(item) for key, item in value.items()}
+        if isinstance(value, list):
+            return [revive(item) for item in value]
+        return value
+
+    revived = revive(payload)
+    record_types = {
+        "AccountValueObservation": AccountValueObservation,
+        "PositionObservation": PositionObservation,
+        "OrderObservation": OrderObservation,
+        "FillObservation": FillObservation,
+    }
+    if kind == "CommissionObservation":
+        revived["fill"] = FillObservation(**revived["fill"])
+        return CommissionObservation(**revived)
+    try:
+        return record_types[kind](**revived)
+    except KeyError as exc:
+        raise ValueError(f"unknown staged broker observation kind {kind!r}") from exc
 
 
 _UNSET_DOUBLE = 1.7976931348623157e308
@@ -253,7 +323,7 @@ class BrokerIngest:
             AccountValueObservation | PositionObservation | OrderObservation | FillObservation | CommissionObservation
         ] = queue.Queue()
         self._ingest_seq = 0
-        self._generation: Optional[int] = None
+        self._generation: Optional[_Generation] = None
         self._apply_lock = threading.Lock()
         self._stop = threading.Event()
         self._writer: Optional[threading.Thread] = None
@@ -307,6 +377,123 @@ class BrokerIngest:
             self._writer.join(timeout=5)
             self._writer = None
 
+    def begin_generation(self, required: tuple[str, ...] = BROKER_SYNC_SOURCES) -> int:
+        """Start staging one broker snapshot generation.
+
+        Live broker rows remain untouched until a later, complete generation
+        is promoted.  Reject overlapping generations: there is only one IB
+        snapshot stream per ingest instance and mixing their callbacks would
+        make absence tombstones unsafe.
+        """
+        with self._apply_lock:
+            if self._generation is not None:
+                raise RuntimeError("broker snapshot generation already active")
+            if not required or len(set(required)) != len(required):
+                raise ValueError("required broker sources must be unique and non-empty")
+            generation_id = self.db.transaction(
+                lambda conn: self.store.open_generation_in_tx(conn, required, self.clock())
+            )
+            self._generation = _Generation(generation_id=generation_id, required=required)
+            return generation_id
+
+    @property
+    def is_ready(self) -> bool:
+        """Whether a coherent broker generation has been promoted."""
+        with self._apply_lock:
+            if self._generation is not None:
+                return False
+        return self.db.transaction(self.store.latest_promoted_generation_in_tx) is not None
+
+    def mark_source_complete(self, source: str) -> None:
+        with self._apply_lock:
+            generation = self._require_generation()
+            if source not in generation.required:
+                raise ValueError(f"source {source!r} is not required by this broker generation")
+            self.db.transaction(
+                lambda conn: self.store.mark_source_complete_in_tx(
+                    conn, generation.generation_id, source
+                )
+            )
+            generation.complete.add(source)
+
+    def promote_generation(self) -> int:
+        """Apply a complete staged generation in one journal transaction."""
+        with self._apply_lock:
+            generation = self._require_generation()
+            missing = sorted(set(generation.required) - generation.complete)
+            if missing:
+                raise GenerationIncomplete(
+                    f"broker generation {generation.generation_id} is incomplete; missing: {', '.join(missing)}"
+                )
+            cursor = self.journal.mutate_batch_work(
+                self.journal.connect(),
+                lambda conn, append: self._promote_in_journal_transaction(conn, generation, append),
+            )
+            self._generation = None
+            return cursor
+
+    def abandon_generation(self, reason: str) -> None:
+        with self._apply_lock:
+            generation = self._generation
+            if generation is None:
+                return
+            self.db.transaction(
+                lambda conn: (
+                    self.store.mark_generation_abandoned_in_tx(
+                        conn, generation.generation_id, reason, self.clock()
+                    ),
+                    self.store.purge_staging_in_tx(conn, generation.generation_id),
+                )
+            )
+            self._generation = None
+
+    def _require_generation(self) -> _Generation:
+        if self._generation is None:
+            raise NoActiveGeneration("no broker snapshot generation is active")
+        return self._generation
+
+    async def run_broker_sync(self, client: Any, timeout_seconds: float = 45.0) -> bool:
+        """Stage and promote one complete IB broker snapshot.
+
+        Registered callbacks continue to feed the same staging queue while
+        these requests run.  Ingest sequence therefore preserves the broker's
+        observed ordering when a live delta interleaves the initial snapshot.
+        """
+        import asyncio
+
+        self.begin_generation()
+        try:
+            async with asyncio.timeout(timeout_seconds):
+                await client.ib.reqAccountUpdatesAsync(self.account_id)
+                self.mark_source_complete("account")
+                for position in await client.ib.reqPositionsAsync():
+                    self.on_position(position)
+                self.mark_source_complete("positions")
+                for trade in await client.ib.reqAllOpenOrdersAsync():
+                    self.on_open_order(trade)
+                self.mark_source_complete("open_orders")
+                for trade in await client.ib.reqCompletedOrdersAsync(apiOnly=True):
+                    self.on_open_order(trade)
+                self.mark_source_complete("completed_orders")
+                for fill in await client.ib.reqExecutionsAsync():
+                    self.on_exec_details(None, fill)
+                self.mark_source_complete("executions")
+            await asyncio.to_thread(self._promote_after_drain)
+            return True
+        except (asyncio.TimeoutError, ConnectionError, OSError) as exc:
+            await asyncio.to_thread(self._abandon_if_active, f"broker sync failed: {exc}")
+            return False
+
+    def _promote_after_drain(self) -> None:
+        self.drain_once()
+        self.promote_generation()
+
+    def _abandon_if_active(self, reason: str) -> None:
+        with self._apply_lock:
+            active = self._generation is not None
+        if active:
+            self.abandon_generation(reason)
+
     def _drain_loop(self) -> None:
         while not self._stop.is_set():
             try:
@@ -351,25 +538,35 @@ class BrokerIngest:
                 if self._generation is not None:
                     self._stage(self._ingest_seq, record)
                 else:
-                    self._apply_record(self.journal.connect(), record)
+                    conn = self.journal.connect()
+                    self._apply_record(
+                        conn,
+                        record,
+                        lambda mutation, write: self.journal.mutate(conn, mutation, write),
+                    )
 
     def _apply_record(
-        self, conn: Any, record: AccountValueObservation | PositionObservation | OrderObservation | FillObservation | CommissionObservation
+        self,
+        conn: Any,
+        record: AccountValueObservation | PositionObservation | OrderObservation | FillObservation | CommissionObservation,
+        emit: Callable[[DomainMutation, Callable[[Any, int], None]], Any],
     ) -> None:
         if isinstance(record, AccountValueObservation):
-            self._apply_account_value(conn, record)
+            self._apply_account_value(conn, record, emit)
         elif isinstance(record, PositionObservation):
-            self._apply_position(conn, record)
+            self._apply_position(conn, record, emit)
         elif isinstance(record, OrderObservation):
-            self._apply_order(conn, record)
+            self._apply_order(conn, record, emit)
         elif isinstance(record, FillObservation):
-            self._apply_fill(conn, record)
+            self._apply_fill(conn, record, emit)
         elif isinstance(record, CommissionObservation):
-            self._apply_commission(conn, record)
+            self._apply_commission(conn, record, emit)
         else:
             raise TypeError(f"unknown ingest record: {type(record)!r}")
 
-    def _apply_account_value(self, conn: Any, obs: AccountValueObservation) -> None:
+    def _apply_account_value(
+        self, conn: Any, obs: AccountValueObservation, emit: Callable[[DomainMutation, Callable[[Any, int], None]], Any]
+    ) -> None:
         current = self.store.get_account_in_tx(conn, obs.account_id)
         merged = merge_account_value(current, obs, self.account_mode)
         if current is not None and merged.same_fields(current):
@@ -389,9 +586,11 @@ class BrokerIngest:
         def write(write_conn: Any, revision: int) -> None:
             self.store.upsert_account_in_tx(write_conn, replace(merged, revision=revision))
 
-        self.journal.mutate(conn, mutation, write)
+        emit(mutation, write)
 
-    def _apply_order(self, conn: Any, obs: OrderObservation) -> tuple[str, Any | None]:
+    def _apply_order(
+        self, conn: Any, obs: OrderObservation, emit: Callable[[DomainMutation, Callable[[Any, int], None]], Any]
+    ) -> tuple[str, Any | None]:
         entity_id = self.correlator.resolve_in_tx(conn, obs)
         current = self.store.get_order_in_tx(conn, entity_id)
         group_id = decode_order_ref(obs.order_ref)
@@ -434,7 +633,7 @@ class BrokerIngest:
         )
         if current is not None and not current.deleted and merged.same_fields(current):
             self.correlator.bind_aliases_in_tx(conn, entity_id, obs)
-            self._resolve_unbound_fills_in_tx(conn, obs, entity_id)
+            self._resolve_unbound_fills_in_tx(conn, obs, entity_id, emit)
             return entity_id, None
         mutation = DomainMutation(
             event_type="order.updated",
@@ -452,12 +651,16 @@ class BrokerIngest:
             self.correlator.bind_aliases_in_tx(write_conn, entity_id, obs)
             self.store.upsert_order_in_tx(write_conn, replace(merged, revision=revision))
 
-        event = self.journal.mutate(conn, mutation, write)
-        self._resolve_unbound_fills_in_tx(conn, obs, entity_id)
+        event = emit(mutation, write)
+        self._resolve_unbound_fills_in_tx(conn, obs, entity_id, emit)
         return entity_id, event
 
     def _resolve_unbound_fills_in_tx(
-        self, conn: Any, obs: OrderObservation, entity_id: str
+        self,
+        conn: Any,
+        obs: OrderObservation,
+        entity_id: str,
+        emit: Callable[[DomainMutation, Callable[[Any, int], None]], Any],
     ) -> None:
         for fill in self.store.unbound_fills_in_tx(conn, obs.account_id):
             matches = (
@@ -486,7 +689,7 @@ class BrokerIngest:
             def write(write_conn: Any, revision: int, row: BrokerFillRow = bound) -> None:
                 self.store.upsert_fill_in_tx(write_conn, replace(row, revision=revision))
 
-            self.journal.mutate(conn, mutation, write)
+            emit(mutation, write)
 
     def _fill_row(self, conn: Any, obs: FillObservation) -> BrokerFillRow:
         return BrokerFillRow(
@@ -525,7 +728,9 @@ class BrokerIngest:
             )
         return None
 
-    def _apply_fill(self, conn: Any, obs: FillObservation) -> Any | None:
+    def _apply_fill(
+        self, conn: Any, obs: FillObservation, emit: Callable[[DomainMutation, Callable[[Any, int], None]], Any]
+    ) -> Any | None:
         if self.store.get_fill_in_tx(conn, obs.account_id, obs.exec_id) is not None:
             return None
         row = self._fill_row(conn, obs)
@@ -544,10 +749,12 @@ class BrokerIngest:
         def write(write_conn: Any, revision: int) -> None:
             self.store.upsert_fill_in_tx(write_conn, replace(row, revision=revision))
 
-        return self.journal.mutate(conn, mutation, write)
+        return emit(mutation, write)
 
-    def _apply_commission(self, conn: Any, obs: CommissionObservation) -> Any | None:
-        self._apply_fill(conn, obs.fill)
+    def _apply_commission(
+        self, conn: Any, obs: CommissionObservation, emit: Callable[[DomainMutation, Callable[[Any, int], None]], Any]
+    ) -> Any | None:
+        self._apply_fill(conn, obs.fill, emit)
         current = self.store.get_fill_in_tx(conn, obs.fill.account_id, obs.fill.exec_id)
         if current is None:
             raise RuntimeError("fill was not persisted before commission update")
@@ -575,9 +782,11 @@ class BrokerIngest:
         def write(write_conn: Any, revision: int) -> None:
             self.store.upsert_fill_in_tx(write_conn, replace(revised, revision=revision))
 
-        return self.journal.mutate(conn, mutation, write)
+        return emit(mutation, write)
 
-    def _apply_position(self, conn: Any, obs: PositionObservation) -> None:
+    def _apply_position(
+        self, conn: Any, obs: PositionObservation, emit: Callable[[DomainMutation, Callable[[Any, int], None]], Any]
+    ) -> None:
         current = self.store.get_position_in_tx(conn, obs.account_id, obs.conid)
         entity_id = position_entity_id(obs.account_id, obs.conid)
         if obs.quantity == 0.0:
@@ -600,7 +809,7 @@ class BrokerIngest:
                     write_conn, obs.account_id, obs.conid, revision, obs.source_timestamp
                 )
 
-            self.journal.mutate(conn, mutation, write_tombstone)
+            emit(mutation, write_tombstone)
             return
 
         merged = merge_position(current, obs)
@@ -621,9 +830,108 @@ class BrokerIngest:
         def write(write_conn: Any, revision: int) -> None:
             self.store.upsert_position_in_tx(write_conn, replace(merged, revision=revision))
 
-        self.journal.mutate(conn, mutation, write)
+        emit(mutation, write)
+
+    def _tombstone_order(
+        self,
+        conn: Any,
+        row: BrokerOrderRow,
+        now: dt.datetime,
+        emit: Callable[[DomainMutation, Callable[[Any, int], None]], Any],
+    ) -> None:
+        mutation = DomainMutation(
+            event_type="order.updated",
+            entity_type="order",
+            entity_id=row.order_entity_id,
+            operation="delete",
+            account_id=row.account_id,
+            source="trader_service",
+            source_timestamp=now,
+            correlation_id=None,
+            payload=None,
+        )
+
+        def write(write_conn: Any, revision: int) -> None:
+            self.store.tombstone_order_in_tx(
+                write_conn, row.order_entity_id, revision, now
+            )
+
+        emit(mutation, write)
+
+    def _promote_in_journal_transaction(
+        self,
+        conn: Any,
+        generation: _Generation,
+        append: Callable[[DomainMutation, Callable[[Any, int], None], Optional[str]], Any],
+    ) -> int:
+        """Replay staging and the enumerable-set absence checks atomically."""
+        observed_positions: set[tuple[str, int]] = set()
+        observed_orders: set[str] = set()
+        for staged in self.store.staged_rows_in_tx(conn, generation.generation_id):
+            record = _decode_observation(staged.record_kind, staged.record_json)
+            if isinstance(record, PositionObservation):
+                observed_positions.add((record.account_id, record.conid))
+                self._apply_position(conn, record, append)
+            elif isinstance(record, OrderObservation):
+                entity_id, _event = self._apply_order(conn, record, append)
+                observed_orders.add(entity_id)
+            else:
+                self._apply_record(conn, record, append)
+
+        # Positions and currently working orders are enumerable broker sets.
+        # Absence is therefore a delete only after every snapshot source has
+        # completed and only for rows belonging to this ingest account.
+        now = self.clock()
+        for row in self.store.select_active_positions_in_tx(conn):
+            if row.account_id == self.account_id and (row.account_id, row.conid) not in observed_positions:
+                self._apply_position(
+                    conn,
+                    PositionObservation(
+                        account_id=row.account_id,
+                        conid=row.conid,
+                        symbol=row.symbol,
+                        sec_type=row.sec_type,
+                        exchange=row.exchange,
+                        currency=row.currency,
+                        quantity=0.0,
+                        average_cost=None,
+                        market_price=None,
+                        market_value=None,
+                        unrealized_pnl=None,
+                        realized_pnl=None,
+                        daily_pnl=None,
+                        source_timestamp=now,
+                    ),
+                    append,
+                )
+        for row in self.store.select_working_orders_in_tx(conn):
+            if row.account_id == self.account_id and row.order_entity_id not in observed_orders:
+                self._tombstone_order(conn, row, now, append)
+
+        cursor_row = conn.execute(
+            "SELECT COALESCE(MAX(source_cursor), 0) FROM domain_event_journal"
+        ).fetchone()
+        cursor = int(cursor_row[0]) if cursor_row is not None else 0
+        self.store.mark_generation_promoted_in_tx(
+            conn, generation.generation_id, cursor, now
+        )
+        self.store.purge_staging_in_tx(conn, generation.generation_id)
+        return cursor
 
     def _stage(
         self, ingest_seq: int, record: AccountValueObservation | PositionObservation | OrderObservation | FillObservation | CommissionObservation
     ) -> None:
-        raise NotImplementedError("broker-sync staging lands in Task 5")
+        generation = self._require_generation()
+        canonical_key = _canonical_key(record)
+        self.db.transaction(
+            lambda conn: self.store.stage_in_tx(
+                conn,
+                generation.generation_id,
+                ingest_seq,
+                "snapshot",
+                canonical_key.split(":", 1)[0],
+                canonical_key,
+                _encode_observation(record),
+                type(record).__name__,
+            )
+        )

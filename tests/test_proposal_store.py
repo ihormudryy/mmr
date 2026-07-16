@@ -407,20 +407,6 @@ class TestProposalStore:
         assert proposal_store.get(naive).status == "EXPIRED"
         assert proposal_store.get(garbage).status == "EXPIRED"
 
-    def test_writes_succeed_before_any_cutover_migration(self, proposal_store):
-        """A ProposalStore whose file has never seen the [M1-F3]
-        `apply_proposal_authority_migration` cutover (the ordinary case for
-        every one of these tests) must never raise `ProposalStoreFrozen` —
-        `_cutover_applied()` treats a missing `schema_migrations` ledger as
-        "not frozen", not as an error.
-        """
-        pid = proposal_store.add(_make_proposal())
-        proposal_store.update_metadata(pid, {"k": "v"})
-        proposal_store.update_status(pid, 'APPROVED')
-        proposal_store.try_transition(pid, 'APPROVED', 'EXECUTED', order_ids=[1])
-        assert proposal_store.get(pid).status == 'EXECUTED'
-        assert proposal_store.delete(pid) is True
-
     def test_expire_stale_pending_no_limit_no_source_filter(self, proposal_store):
         now = dt.datetime(2026, 7, 15, 10, 0, tzinfo=dt.timezone.utc)
 

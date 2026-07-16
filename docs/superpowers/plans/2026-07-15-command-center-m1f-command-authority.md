@@ -20,6 +20,7 @@
 > **Pre-flight resolutions 2 (binding, from the M1-F3 understand-phase — these OVERRIDE any conflicting task-body code sample).**
 > - **B1 (samples are illustrative, this rule governs):** wherever a task's code sample below shows `self._db.transaction(lambda conn: … journal.mutate(conn, …) …)`, that pattern is KNOWN-INCORRECT (double-`BEGIN`) and is superseded by the pre-flight resolution above — call `mutate()` directly on `journal.connect()`, one per transition, no `DuckDBConnection.transaction` wrapper. Do not copy the wrapper from the samples.
 > - **B2 (Task 1 is a CROSS-FILE relocation, not in-place):** the four authority tables live in the journal file, so Task 1's migration must MOVE existing rows across files, not migrate `trade_proposals` in place in `mmr.duckdb`. Implement it as: create the tables in the journal DB (migration v20 on the journal `SchemaMigrator`), then `ATTACH '<mmr.duckdb>' AS legacy; INSERT INTO trade_proposals SELECT … FROM legacy.trade_proposals; DETACH legacy;` (migrated rows: `live_approval_eligible=false`, `revision=1`, guard/account/mode/reference columns NOT backfilled). Retarget all Task 1 fixtures/tests to the journal `DuckDBConnection`. The `[S0]` `mmr.duckdb` `trade_proposals` is frozen (no further writes) after cutover — add `test_legacy_writers_are_frozen_after_cutover`.
+> - **B2 update — fresh bootstrap (binding, 2026-07-16):** Production starts with an empty deployment; there is no legacy proposal schema or data to migrate. This supersedes B2 and every conflicting Task 1 sample below. Version 20 creates `trade_proposals` and its ID sequence directly in the journal DB through `apply_proposal_authority_migration(migrator)`. Do **not** `ATTACH` `mmr.duckdb`, import rows, write a cross-file freeze marker, or modify `ProposalStore` for compatibility. Task 2 is responsible for wiring the journal repository as the sole writer; do not reintroduce a compatibility path while implementing later tasks.
 > - **B3 (`state_revision` rides in payload, never `entity_revision`):** `mutate()` computes the journal `entity_revision` itself (`current+1`) and `DomainMutation` has no `entity_revision` field; the strategy-service `state_revision` counter is independent. Carry `state_revision` in the event `payload` and assert on the payload (Tasks 7/9) — never claim the frozen contract lets a caller supply `entity_revision`.
 > - **Colon-free command IDs (I3):** `encode_order_ref` builds `mmr:og-{command_id}`, so `command_id` MUST be colon-free — use `sdk-<uuid>` / `strategy-<uuid>`, and cancel child IDs `{root}__ord-<order_entity_id-sanitized>`. Add a `decode(encode("og-sdk-<uuid>"))` round-trip test.
 > - **Import correction:** import `BrokerOrderRow` and the broker store from `trader.data.broker_state` (landed location), NOT the plan's stated `trader/trading/broker_state.py`.
@@ -46,9 +47,9 @@
 
 **Interfaces:**
 - Consumes: `SchemaMigrator.apply(version: int, name: str, statements: Sequence[str])` from `[M1-F1]`.
-- Produces: `apply_proposal_authority_migration(migrator: SchemaMigrator) -> None` (trader-DB migration version 20, name `m1f3_proposal_command_authority` — `[M1-F3]` owns versions 20–29).
+- Produces: `apply_proposal_authority_migration(migrator: SchemaMigrator) -> None` (journal-DB migration version 20, name `m1f3_proposal_command_authority` — `[M1-F3]` owns versions 20–29).
 - Produces: `ProposalRecord` frozen dataclass mirroring the migrated column list, and module constant `PROPOSAL_COLUMNS` (the explicit stable column list).
-- Produces: `ProposalStoreFrozen(RuntimeError)` — every legacy `ProposalStore` write raises it once the cutover is applied to that database file; reads remain allowed for the read-only window.
+- Does not produce a legacy-store freeze or compatibility API; fresh deployment support is journal-only.
 
 - [ ] **Step 1: Write failing migration tests**
 

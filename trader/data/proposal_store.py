@@ -1,11 +1,9 @@
 from trader.data.duckdb_store import DuckDBConnection
-from trader.data.proposal_repository import PROPOSAL_AUTHORITY_MIGRATION_VERSION
 from trader.trading.proposal import ExecutionSpec, ProposalStatus, TradeProposal
 from enum import Enum
 from typing import List, Optional, Set
 
 import datetime as dt
-import duckdb
 import json
 
 
@@ -40,26 +38,6 @@ _ALLOWED_TRANSITIONS = {
 
 class InvalidProposalTransition(ValueError):
     """Raised when update_status is called with an illegal state transition."""
-
-
-class ProposalStoreFrozen(RuntimeError):
-    """Legacy `trade_proposals` writes are disabled after the [M1-F3]
-    cutover (`apply_proposal_authority_migration`) has been applied to
-    this database file. Reads remain available during the read-only
-    window — only mutating entry points raise this."""
-
-
-# Explicit, stable column list for the legacy (mmr.duckdb) `trade_proposals`
-# table, pinned by name rather than relying on `SELECT *`'s physical column
-# order. `_rows_to_proposals` decodes rows positionally against THIS list,
-# so any future column added to the physical table (there should be none —
-# the [M1-F3] cutover relocates new columns into the journal file instead,
-# see proposal_repository.py) can never shift these positions.
-_LEGACY_COLUMNS = (
-    "id, symbol, action, quantity, amount, execution, reasoning, confidence, "
-    "thesis, source, metadata, status, created_at, updated_at, order_ids, "
-    "rejection_reason, sec_type"
-)
 
 
 class ApprovalClaimResult(str, Enum):
@@ -114,13 +92,6 @@ class ProposalStore:
     def __init__(self, duckdb_path: str):
         self.duckdb_path = duckdb_path
         self.db = DuckDBConnection.get_instance(duckdb_path)
-        # Only ever transitions False -> True (the cutover is one-way), so
-        # it is safe to cache `True` forever but NOT `False` — a store
-        # constructed before the [M1-F3] migration runs must still detect
-        # the freeze on its next write after the migration lands, even
-        # though it already answered `False` earlier in its lifetime. See
-        # `_cutover_applied`.
-        self._frozen = False
         self._ensure_table()
 
     def _ensure_table(self):
@@ -129,39 +100,8 @@ class ProposalStore:
             conn.execute(self._CREATE_SEQUENCE)
         self.db.execute_atomic(_init)
 
-    def _cutover_applied(self) -> bool:
-        """Has the [M1-F3] `apply_proposal_authority_migration` cutover
-        been applied to THIS database file? Reads the zero-DDL freeze
-        marker that migration records in this file's own
-        `schema_migrations` ledger (see `proposal_repository.py`'s
-        `_freeze_legacy_writers`). Absent ledger table (no migration has
-        ever touched this file) is not an error — it just means "not
-        frozen yet".
-        """
-        if self._frozen:
-            return True
-        try:
-            row = self.db.execute(
-                "SELECT 1 FROM schema_migrations WHERE version = ?",
-                [PROPOSAL_AUTHORITY_MIGRATION_VERSION],
-                fetch='one',
-            )
-        except duckdb.CatalogException:
-            row = None
-        self._frozen = bool(row)
-        return self._frozen
-
-    def _assert_writable(self) -> None:
-        if self._cutover_applied():
-            raise ProposalStoreFrozen(
-                'trade_proposals is owned by trader_service after the [M1-F3] '
-                'cutover — use the typed create_proposal/reject_proposal/'
-                'approve_proposal APIs'
-            )
-
     def add(self, proposal: TradeProposal) -> int:
         """Add a proposal and return its assigned id."""
-        self._assert_writable()
         now = dt.datetime.now()
         execution_json = json.dumps(proposal.execution.to_dict())
         # Persist exchange/currency hints in metadata (avoids DB schema migration)
@@ -201,7 +141,6 @@ class ProposalStore:
 
     def update_metadata(self, proposal_id: int, extra: dict) -> None:
         """Merge extra keys into an existing proposal's metadata. Atomic under the row lock."""
-        self._assert_writable()
         now = dt.datetime.now()
 
         def _merge(conn):
@@ -233,7 +172,6 @@ class ProposalStore:
         that genuinely want to re-mark a terminal proposal must explicitly delete
         and recreate it.
         """
-        self._assert_writable()
         if status not in _ALLOWED_TRANSITIONS and status not in _TERMINAL:
             raise InvalidProposalTransition(
                 f'unknown proposal status: {status!r}'
@@ -290,7 +228,6 @@ class ProposalStore:
         (already claimed, terminal, or missing). Use this — not get()+update_status
         — whenever the transition guards a side effect like placing a live order.
         """
-        self._assert_writable()
         if to_status not in _ALLOWED_TRANSITIONS and to_status not in _TERMINAL:
             raise InvalidProposalTransition(f'unknown proposal status: {to_status!r}')
         allowed = _ALLOWED_TRANSITIONS.get(from_status, set())
@@ -331,7 +268,6 @@ class ProposalStore:
         caller by a separate check. A missing `expires_at` is valid (legacy
         manual proposals do not carry one) and claims succeed for those rows.
         """
-        self._assert_writable()
         now = now.astimezone(dt.timezone.utc)
 
         def _claim(conn):
@@ -364,7 +300,6 @@ class ProposalStore:
         caller, not a per-request query, so it deliberately has no limit or
         source filter: a stale proposal from any source is stale.
         """
-        self._assert_writable()
         now = now.astimezone(dt.timezone.utc)
 
         def _expire(conn):
@@ -388,7 +323,7 @@ class ProposalStore:
 
     def get(self, id: int) -> Optional[TradeProposal]:
         rows = self.db.execute(
-            f"SELECT {_LEGACY_COLUMNS} FROM trade_proposals WHERE id = ?", [id], fetch='all',
+            "SELECT * FROM trade_proposals WHERE id = ?", [id], fetch='all',
         )
         proposals = self._rows_to_proposals(rows or [])
         return proposals[0] if proposals else None
@@ -396,14 +331,14 @@ class ProposalStore:
     def query(self, status: Optional[str] = None, limit: int = 50) -> List[TradeProposal]:
         if status:
             rows = self.db.execute(
-                f"SELECT {_LEGACY_COLUMNS} FROM trade_proposals "
+                "SELECT * FROM trade_proposals "
                 "WHERE status = ? ORDER BY created_at DESC LIMIT ?",
                 [status, limit],
                 fetch='all',
             )
         else:
             rows = self.db.execute(
-                f"SELECT {_LEGACY_COLUMNS} FROM trade_proposals ORDER BY created_at DESC LIMIT ?",
+                "SELECT * FROM trade_proposals ORDER BY created_at DESC LIMIT ?",
                 [limit],
                 fetch='all',
             )
@@ -411,8 +346,6 @@ class ProposalStore:
 
     def delete(self, id: int) -> bool:
         """Delete a proposal by id. Returns True if a row was deleted."""
-        self._assert_writable()
-
         def _delete(conn):
             conn.execute("DELETE FROM trade_proposals WHERE id = ?", [id])
             result = conn.execute(

@@ -421,3 +421,154 @@ def test_reject_proposal_colon_command_id_fails_at_coercion_not_the_handler(prod
             {"command_id": "bad:id", "proposal_id": 7, "reason": "x"},
             reject_reg.request_model,
         )
+
+
+# ---------------------------------------------------------------------------
+# Concurrent duplicate-command_id claim race: the handler must run AT MOST
+# ONCE per command_id. The lock-free claim_or_replay read can go stale
+# between the lookup and mutate()'s locked idempotency check; the loser must
+# detect it (skipped write_materialized / EventIdentityConflict) and return
+# the winner's recorded receipt WITHOUT dispatching the handler again.
+# ---------------------------------------------------------------------------
+
+from trader.trading.command_coordinator import LedgerClaim  # noqa: E402
+
+
+class TestConcurrentClaimRace:
+    def test_stale_new_claim_with_identical_mutation_never_redispatches(self, coordinator, ledger):
+        # Winner completes normally first.
+        calls: list[str] = []
+        coordinator.register_action(
+            "count_calls", lambda cmd: calls.append(cmd.command_id) or {"ok": True},
+            requires_preflight=False)
+        request = _request(command_id="race-1", action="count_calls")
+        first = coordinator.execute(request)
+        assert first.state == "RESOLVED" and calls == ["race-1"]
+
+        # Simulate the loser's exact interleaving: its lock-free claim read
+        # happened BEFORE the winner committed (returned "new"), but by the
+        # time its mutate() runs the winner's RECEIVED event exists. The
+        # frozen fixture clock makes the loser's mutation byte-identical, so
+        # mutate() silently replays and skips _write_received.
+        real = ledger.claim_or_replay_in_tx
+        lied = {"done": False}
+
+        def stale_read(conn, req):
+            if not lied["done"] and req.command_id == "race-1":
+                lied["done"] = True
+                return LedgerClaim("new", None)
+            return real(conn, req)
+
+        coordinator._ledger = SimpleNamespace(
+            claim_or_replay_in_tx=stale_read,
+            insert_received_in_tx=ledger.insert_received_in_tx,
+            transition_in_tx=ledger.transition_in_tx,
+            get=ledger.get,
+        )
+        second = coordinator.execute(request)
+        assert calls == ["race-1"], "loser must NOT re-dispatch the handler"
+        assert second.state == "RESOLVED"  # the winner's recorded receipt
+
+    def test_stale_new_claim_with_differing_timestamp_never_redispatches(self, journal, ledger):
+        # Same race, but the loser runs on a coordinator with a DIFFERENT
+        # frozen clock, so its RECEIVED mutation has a different
+        # source_timestamp -> mutate() raises EventIdentityConflict instead
+        # of silently replaying. The loser must map that to the winner's
+        # recorded receipt, not AUDIT_UNAVAILABLE, and never dispatch.
+        calls: list[str] = []
+        winner = TradingCommandCoordinator(
+            journal=journal, ledger=ledger, audit=FakeCommandAudit(),
+            nonces=FakeNonceGate(), now=lambda: NOW)
+        winner.register_action(
+            "count_calls", lambda cmd: calls.append(cmd.command_id) or {"ok": True},
+            requires_preflight=False)
+        request = _request(command_id="race-2", action="count_calls")
+        assert winner.execute(request).state == "RESOLVED" and calls == ["race-2"]
+
+        later = NOW + dt.timedelta(seconds=1)
+        loser = TradingCommandCoordinator(
+            journal=journal, ledger=ledger, audit=FakeCommandAudit(),
+            nonces=FakeNonceGate(), now=lambda: later)
+        loser.register_action(
+            "count_calls", lambda cmd: calls.append(cmd.command_id) or {"ok": True},
+            requires_preflight=False)
+        real = ledger.claim_or_replay_in_tx
+        lied = {"done": False}
+
+        def stale_read(conn, req):
+            if not lied["done"] and req.command_id == "race-2":
+                lied["done"] = True
+                return LedgerClaim("new", None)
+            return real(conn, req)
+
+        loser._ledger = SimpleNamespace(
+            claim_or_replay_in_tx=stale_read,
+            insert_received_in_tx=ledger.insert_received_in_tx,
+            transition_in_tx=ledger.transition_in_tx,
+            get=ledger.get,
+        )
+        receipt = loser.execute(request)
+        assert calls == ["race-2"], "loser must NOT re-dispatch the handler"
+        assert receipt.state == "RESOLVED"
+        assert receipt.error_code != "AUDIT_UNAVAILABLE"
+
+    def test_two_threads_same_command_id_dispatch_exactly_once(self, coordinator, ledger, journal):
+        import threading
+
+        # Force the true interleaving with real threads: both threads
+        # complete the lock-free claim read (both see "new") before either
+        # enters mutate(). The barrier gates only the first two claim calls;
+        # the loser's post-race re-claim passes straight through.
+        barrier = threading.Barrier(2)
+        gate_lock = threading.Lock()
+        gated_calls = {"n": 0}
+        real = ledger.claim_or_replay_in_tx
+
+        def gated_read(conn, req):
+            claim = real(conn, req)
+            with gate_lock:
+                gated_calls["n"] += 1
+                should_gate = gated_calls["n"] <= 2
+            if should_gate:
+                barrier.wait(timeout=5)
+            return claim
+
+        coordinator._ledger = SimpleNamespace(
+            claim_or_replay_in_tx=gated_read,
+            insert_received_in_tx=ledger.insert_received_in_tx,
+            transition_in_tx=ledger.transition_in_tx,
+            get=ledger.get,
+        )
+        calls: list[str] = []
+        calls_lock = threading.Lock()
+
+        def handler(cmd):
+            with calls_lock:
+                calls.append(cmd.command_id)
+            return {"ok": True}
+
+        coordinator.register_action("count_calls", handler, requires_preflight=False)
+        request = _request(command_id="race-3", action="count_calls")
+        results: list = [None, None]
+
+        def run(i):
+            try:
+                results[i] = coordinator.execute(request)
+            except Exception as exc:  # surface, don't swallow
+                results[i] = exc
+
+        threads = [threading.Thread(target=run, args=(i,)) for i in range(2)]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join(timeout=10)
+        assert all(not t.is_alive() for t in threads)
+        assert not any(isinstance(r, Exception) for r in results), results
+        assert calls == ["race-3"], f"handler must run exactly once, ran {len(calls)}x"
+        # Both callers hold a coherent receipt for the same command; the
+        # loser may have observed the winner mid-flight (RECEIVED) or
+        # finished (RESOLVED) -- never a second dispatch.
+        assert {r.command_id for r in results} == {"race-3"}
+        assert all(r.state in ("RECEIVED", "RESOLVED") for r in results)
+        row = ledger.get("race-3")
+        assert row is not None and row.state == "RESOLVED"

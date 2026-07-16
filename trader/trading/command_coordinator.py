@@ -77,7 +77,7 @@ from typing import Any, Callable, Literal, Optional, Protocol
 
 import duckdb
 
-from trader.data.domain_journal import DomainJournal
+from trader.data.domain_journal import DomainJournal, EventIdentityConflict
 from trader.data.proposal_repository import (
     ApprovalClaim,
     ApprovalClaimOutcome,
@@ -834,6 +834,14 @@ class TradingCommandCoordinator:
             return CommandReceipt(
                 request.command_id, request.command_id, "REJECTED", None, exc.code, True
             )
+        except EventIdentityConflict:
+            # Lost a concurrent claim race with a DIFFERING source_timestamp:
+            # another caller journaled RECEIVED for this command_id between
+            # our lock-free lookup above and mutate()'s locked idempotency
+            # check, and the timestamp mismatch made the replay guard raise
+            # instead of silently matching. Our transaction rolled back --
+            # the WINNER owns the dispatch. Return its recorded receipt.
+            return self._losing_claim_receipt(request)
         except Exception:
             # Fail closed: the ledger/audit write itself did not persist.
             # Nothing committed (the whole mutate() transaction rolled
@@ -844,9 +852,24 @@ class TradingCommandCoordinator:
                 "AUDIT_UNAVAILABLE", True,
             )
 
+        if not inserted:
+            # Lost the same race with an IDENTICAL mutation (equal
+            # source_timestamps): mutate()'s locked ``_select_journal_row``
+            # check found the winner's committed ``command:<id>:received``
+            # event, treated our stable event_id as an idempotent replay,
+            # and SKIPPED ``_write_received`` entirely. We inserted nothing
+            # -- the winner owns the dispatch, and running the handler here
+            # anyway would execute the action twice for one command_id
+            # (double proposal mutation; after Task 5, a double ORDER
+            # submission). Return the winner's recorded receipt instead.
+            return self._losing_claim_receipt(request)
+
         # Step 4: the handler runs strictly AFTER RECEIVED has committed, so
         # `ledger.get(command_id)` is already visible to it (insert precedes
-        # validation).
+        # validation). Reaching here also means THIS caller inserted the
+        # RECEIVED row (``inserted`` is non-empty) -- exclusive dispatch
+        # ownership is what makes the handler run at most once per
+        # command_id even under concurrent duplicate submission.
         try:
             outcome = registration.handler(request)
         except CommandValidationError as exc:
@@ -898,6 +921,28 @@ class TradingCommandCoordinator:
     def get_command(self, command_id: str) -> Optional[CommandReceipt]:
         row = self._ledger.get(command_id)
         return _row_to_receipt(row) if row is not None else None
+
+    def _losing_claim_receipt(self, request: CommandRequest) -> CommandReceipt:
+        """Receipt for the LOSER of a concurrent duplicate-command_id race.
+
+        Called only after mutate() proved another caller already journaled
+        RECEIVED for this command_id (either by silently replaying our stable
+        event_id or by raising ``EventIdentityConflict``). The winner's
+        transaction committed the ledger row atomically with that event, so
+        re-running the claim must find it: ``replay`` for an identical
+        request (return the recorded receipt -- possibly still non-terminal
+        ``RECEIVED`` if the winner is mid-dispatch), ``conflict`` for a
+        same-id-different-hash duplicate.
+        """
+        claim = self._ledger.claim_or_replay_in_tx(self._journal.connect(), request)
+        if claim.kind == "new" or claim.receipt is None:
+            # The journal event exists without its ledger row -- impossible
+            # unless journal/ledger atomicity was violated. Fail loud.
+            raise RuntimeError(
+                f"command {request.command_id!r}: journal RECEIVED event exists "
+                "without a command_ledger row -- journal/ledger atomicity violated"
+            )
+        return claim.receipt
 
     def _fallback_outcome_unknown(self, request: CommandRequest) -> None:
         """Guarded CAS from the command's CURRENT state to OUTCOME_UNKNOWN.

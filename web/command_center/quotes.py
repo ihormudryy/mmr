@@ -33,7 +33,12 @@ def _default_decode(payload: bytes):
     same env var independently before delegating, rather than trusting a
     single gate deep in a shared module.
     """
-    if os.environ.get("MMR_DILL_STRICT") != "1":
+    # Parse the flag exactly as trader.messaging.clientserver.DILL_STRICT_MODE
+    # does ('1'/'true'/'yes', case-insensitive) so a value the rest of the
+    # system accepts can't silently disable the quote plane here. Evaluated at
+    # call time (not import) so it stays monkeypatchable and reflects the live
+    # service environment.
+    if os.environ.get("MMR_DILL_STRICT", "").lower() not in ("1", "true", "yes"):
         raise RuntimeError(
             "command center requires MMR_DILL_STRICT=1 — the dashboard never "
             "executes dill payloads (set it in the dashboard service environment)")
@@ -127,6 +132,10 @@ class QuotePlane:
         to schedule a callback onto a loop that has since been torn down.
         """
         loop = self._loop
+        if loop is None:
+            logger.warning(
+                "quote plane: no event loop, dropping a batch of %d quotes", len(batch))
+            return False
         is_closed = getattr(loop, "is_closed", None)
         if callable(is_closed) and is_closed():
             logger.warning(
@@ -142,6 +151,11 @@ class QuotePlane:
 
     # -- thread ---------------------------------------------------------------
     def start(self) -> None:
+        # A stop()ed plane must be restartable: without clearing the event a
+        # second start() would spawn a thread whose very first loop check
+        # sees _stop already set and exits silently -- a plane that looks
+        # started but delivers nothing.
+        self._stop.clear()
         self._thread = threading.Thread(
             target=self._run, name="cc-quote-plane", daemon=True)
         self._thread.start()

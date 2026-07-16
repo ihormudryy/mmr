@@ -485,3 +485,96 @@ class TestQuoteSocketRoundTrip:
             plane.stop()
             pub.close(0)
             ctx.term()
+
+
+class TestQuoteSecuritySeam:
+    """The default decoder is the dill gate — it must refuse without opt-in
+    and must parse MMR_DILL_STRICT exactly as clientserver.DILL_STRICT_MODE
+    does ('1'/'true'/'yes', case-insensitive), so a value the rest of the
+    system honors can't silently kill the quote plane here."""
+
+    def test_default_decode_refuses_without_opt_in(self, monkeypatch):
+        from web.command_center.quotes import _default_decode
+        monkeypatch.delenv("MMR_DILL_STRICT", raising=False)
+        with pytest.raises(RuntimeError, match="MMR_DILL_STRICT"):
+            _default_decode(b"\x81\xa5conId\xcd\x01\x02")
+        monkeypatch.setenv("MMR_DILL_STRICT", "0")
+        with pytest.raises(RuntimeError, match="MMR_DILL_STRICT"):
+            _default_decode(b"\x81\xa5conId\xcd\x01\x02")
+
+    @pytest.mark.parametrize("value", ["1", "true", "yes", "TRUE", "Yes"])
+    def test_default_decode_accepts_every_strict_spelling(self, monkeypatch, value):
+        from web.command_center.quotes import _default_decode
+        monkeypatch.setenv("MMR_DILL_STRICT", value)
+        decoded = _default_decode(msgpack.packb({"conId": 265598, "last": 1.0}))
+        assert decoded == {"conId": 265598, "last": 1.0}
+
+
+class TestQuoteLoopGuard:
+    def _plane(self, loop):
+        return QuotePlane("tcp://127.0.0.1", 1, loop, lambda batch: None,
+                          decode=msgpack.unpackb)
+
+    def test_closed_loop_drops_batch_without_raising(self):
+        class ClosedLoop:
+            def is_closed(self):
+                return True
+
+            def call_soon_threadsafe(self, fn, *args):  # pragma: no cover
+                raise AssertionError("must not be called on a closed loop")
+
+        plane = self._plane(ClosedLoop())
+        plane.ingest({"conId": 265598, "last": 1.0})
+        assert plane.flush_due(now=1e9) is False
+
+    def test_loop_raising_runtimeerror_drops_batch_without_raising(self):
+        class RejectingLoop:
+            def call_soon_threadsafe(self, fn, *args):
+                raise RuntimeError("Event loop is closed")
+
+        plane = self._plane(RejectingLoop())
+        plane.ingest({"conId": 265598, "last": 1.0})
+        assert plane.flush_due(now=1e9) is False
+
+    def test_none_loop_drops_batch_without_raising(self):
+        plane = self._plane(None)
+        plane.ingest({"conId": 265598, "last": 1.0})
+        assert plane.flush_due(now=1e9) is False
+
+
+class TestQuotePlaneLifecycle:
+    def test_stop_terminates_thread_and_plane_is_restartable(self):
+        loop = _CollectingLoop()
+        plane = QuotePlane("tcp://127.0.0.1", 1, loop, lambda b: None,
+                           decode=msgpack.unpackb)
+        plane.start()
+        assert plane._thread is not None and plane._thread.is_alive()
+        plane.stop()
+        assert not plane._thread.is_alive(), "stop() must join the thread"
+        # Restart: without _stop.clear() the new thread exits immediately
+        # and the plane silently delivers nothing while appearing started.
+        plane.start()
+        try:
+            assert wait_until(lambda: plane._thread.is_alive(), timeout=2.0)
+            assert not plane._stop.is_set()
+        finally:
+            plane.stop()
+            assert not plane._thread.is_alive()
+
+
+class TestQuoteMultiInstrument:
+    def test_different_instruments_coexist_in_one_batch(self):
+        batches: list[dict] = []
+        loop = _CollectingLoop()
+        plane = QuotePlane("tcp://127.0.0.1", 1, loop, batches.append,
+                           decode=msgpack.unpackb)
+        plane.ingest({"conId": 265598, "last": 210.0})
+        plane.ingest({"conId": 4815747, "last": 172.0})
+        plane.ingest({"conId": 265598, "last": 211.0})  # conflates 265598 only
+        assert plane.flush_due(now=1e9) is True
+        assert batches == [{
+            "265598": {"instrument_id": "265598", "bid": None, "ask": None,
+                        "last": 211.0, "market_timestamp": None, "feed_type": None},
+            "4815747": {"instrument_id": "4815747", "bid": None, "ask": None,
+                         "last": 172.0, "market_timestamp": None, "feed_type": None},
+        }]

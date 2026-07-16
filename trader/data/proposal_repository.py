@@ -424,6 +424,83 @@ class ProposalRepository:
             return ApprovalClaimOutcome(ApprovalClaim.NOT_PENDING, current)
         return ApprovalClaimOutcome(ApprovalClaim.REVISION_MISMATCH, current)
 
+    def link_order_group_in_tx(
+        self, conn: Any, proposal_id: int, order_group_id: str
+    ) -> None:
+        """Bind ``order_group_id`` to an ``APPROVED`` proposal WITHOUT bumping
+        ``revision``.
+
+        [M1-F3] Task 5: this runs inside the approval saga's claim transaction
+        so the proposal→group binding is durable *before* the irreversible
+        dispatch (it is what lets the Task-9 reconciler correlate broker rows
+        back to a proposal on the ``OUTCOME_UNKNOWN`` path). It deliberately
+        does not touch ``revision`` and gets no journal event of its own --
+        the caller folds ``order_group_id`` into the claim's single
+        ``proposal.updated`` event (built from the linked record), keeping the
+        one-append-per-revision-bump lockstep intact.
+        """
+        conn.execute(
+            "UPDATE trade_proposals SET order_group_id = ? "
+            "WHERE id = ? AND status = 'APPROVED'",
+            [order_group_id, proposal_id],
+        )
+
+    def mark_order_submitted_in_tx(
+        self,
+        conn: Any,
+        proposal_id: int,
+        order_ids: list[int],
+        expected_revision: int,
+        now: datetime,
+    ) -> Optional[ProposalRecord]:
+        """Flip ``APPROVED`` → ``EXECUTED`` recording the placed ``order_ids``.
+
+        The single "submit-link" write of the approval saga: ``status`` becomes
+        ``EXECUTED`` (the storage-layer name for a submitted/working order --
+        [S0] maps it for display), ``order_ids`` is set, and ``revision`` is
+        bumped exactly once. Guarded on ``status = 'APPROVED' AND revision = ?``
+        so a concurrent change (or a double-submit) returns ``None`` rather than
+        clobbering. ``order_group_id`` is intentionally left untouched (it was
+        linked in the claim tx).
+        """
+        row = conn.execute(
+            """
+            UPDATE trade_proposals
+               SET status = 'EXECUTED', order_ids = ?, updated_at = ?,
+                   revision = revision + 1
+             WHERE id = ? AND status = 'APPROVED' AND revision = ?
+         RETURNING """ + ", ".join(PROPOSAL_COLUMNS),
+            [json.dumps(list(order_ids)), _stored_timestamp(now), proposal_id, expected_revision],
+        ).fetchone()
+        return ProposalRecord.from_row(row) if row else None
+
+    def mark_failed_in_tx(
+        self,
+        conn: Any,
+        proposal_id: int,
+        reason: str,
+        expected_revision: int,
+        now: datetime,
+    ) -> Optional[ProposalRecord]:
+        """Flip ``APPROVED`` → ``FAILED`` after a clean broker rejection.
+
+        Used ONLY on the approval saga's ``BrokerRejectedError`` path -- a
+        clean ``SuccessFail.fail`` before any live order left the door. An
+        ambiguous dispatch (timeout/disconnect) must NOT call this: the
+        proposal stays ``APPROVED`` for the Task-9 reconciler. Guarded on
+        ``status = 'APPROVED' AND revision = ?``; bumps ``revision`` once.
+        """
+        row = conn.execute(
+            """
+            UPDATE trade_proposals
+               SET status = 'FAILED', rejection_reason = ?, updated_at = ?,
+                   revision = revision + 1
+             WHERE id = ? AND status = 'APPROVED' AND revision = ?
+         RETURNING """ + ", ".join(PROPOSAL_COLUMNS),
+            [reason, _stored_timestamp(now), proposal_id, expected_revision],
+        ).fetchone()
+        return ProposalRecord.from_row(row) if row else None
+
     def mutation_for(
         self, record: ProposalRecord, correlation_id: Optional[str]
     ) -> DomainMutation:

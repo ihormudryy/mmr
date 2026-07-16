@@ -1400,6 +1400,7 @@ class Trader():
                     parentId=parent_id,
                     transmit=False,
                     account=self.ib_account,
+                    orderRef=algo_name,
                     tif=spec.tif,
                     outsideRth=spec.outside_rth,
                 )
@@ -1423,6 +1424,7 @@ class Trader():
                     parentId=parent_id,
                     transmit=True,
                     account=self.ib_account,
+                    orderRef=algo_name,
                     tif=spec.tif,
                     outsideRth=spec.outside_rth,
                 )
@@ -1466,6 +1468,7 @@ class Trader():
                     parentId=parent_id,
                     transmit=True,
                     account=self.ib_account,
+                    orderRef=algo_name,
                     tif=spec.tif,
                     outsideRth=spec.outside_rth,
                 )
@@ -1525,6 +1528,7 @@ class Trader():
                     parentId=parent_id,
                     transmit=True,
                     account=self.ib_account,
+                    orderRef=algo_name,
                     tif=spec.tif,
                     outsideRth=spec.outside_rth,
                 )
@@ -2086,3 +2090,89 @@ class Trader():
 
     def run(self, *args):
         self.client.run(*args)
+
+
+class TradingRuntimeOrderDispatch:
+    """[M1-F3] Task 5: ``OrderDispatchPort`` over the trader's async
+    ``place_expressive_order``.
+
+    The approval saga runs on the coordinator/RPC thread; this adapter bridges
+    that synchronous call onto the trader's own event loop
+    (``run_coroutine_threadsafe`` against ``_main_loop``, the same loop the PnL
+    off-loop routing uses) and maps the resulting ``SuccessFail`` onto the
+    port contract:
+
+    - ``is_success()`` → ``SubmittedOrders`` (this deliberately INCLUDES the
+      "placed but ack slow" case: ``place_expressive_order`` returns SUCCESS on
+      its 8s decisive-wait timeout because the order IS working, which is a
+      genuine ``SUBMITTED``, not an ambiguous dispatch);
+    - a clean ``sf.error`` (invalid spec, denylist, leverage/risk reject,
+      "Failed to place entry order", bracket-aborted-and-rolled-back, "Order
+      rejected by IB") → ``BrokerRejectedError`` (no live order left behind →
+      proposal ``FAILED``);
+    - ``sf.exception`` or a cross-thread ``TimeoutError``/disconnect → propagate
+      a generic ``Exception`` (the saga treats it as ``OUTCOME_UNKNOWN`` and
+      NEVER auto-retries a possibly-live real-money dispatch).
+
+    The correlatable ``order_ref`` (``encode_order_ref(order_group_id)`` →
+    ``"mmr:og-<cmd>"``) is stamped on EVERY bracket leg by
+    ``place_expressive_order`` so the Task-9 reconciler can bind all
+    ``broker_orders`` rows back to the group.
+    """
+
+    def __init__(self, trader: 'Trader', *, dispatch_timeout: float = 30.0):
+        self._trader = trader
+        self._dispatch_timeout = dispatch_timeout
+
+    def submit(self, proposal, order_ref: str, order_group_id: str):
+        from trader.trading.command_coordinator import BrokerRejectedError, SubmittedOrders
+
+        loop = getattr(self._trader, '_main_loop', None)
+        if loop is None:
+            raise RuntimeError('trader event loop unavailable for order dispatch')
+        contract = Contract(
+            conId=int(proposal.conid),
+            symbol=proposal.symbol,
+            secType=proposal.sec_type or 'STK',
+            exchange='SMART',
+            currency='USD',
+        )
+        execution_spec = dict(proposal.execution or {})
+        quantity = float(proposal.quantity or 0.0)
+
+        future = asyncio.run_coroutine_threadsafe(
+            self._trader.place_expressive_order(
+                contract, proposal.action, quantity, execution_spec, algo_name=order_ref,
+            ),
+            loop,
+        )
+        # .result() may raise TimeoutError (cross-thread wait) or a disconnect
+        # exception — both propagate as generic Exception → OUTCOME_UNKNOWN.
+        sf = future.result(timeout=self._dispatch_timeout)
+
+        if sf.is_success():
+            trades = sf.obj or []
+            order_ids = [
+                int(t.order.orderId) for t in trades
+                if getattr(t, 'order', None) is not None
+            ]
+            return SubmittedOrders(
+                order_group_id=order_group_id, order_ref=order_ref, order_ids=order_ids,
+            )
+        if sf.error is not None:
+            raise BrokerRejectedError(str(sf.error))
+        if sf.exception is not None:
+            raise sf.exception
+        raise BrokerRejectedError('order dispatch failed with no error detail')
+
+    def cancel(self, order_entity_id: str, order_ref: str):
+        # Thin: full cancel/repair lands with the Task-9 outcome reconciler.
+        raise NotImplementedError('order cancel is implemented by the Task-9 reconciler')
+
+    def find_by_order_ref(self, account_id: str, order_ref: str) -> list:
+        # Thin: the Task-9 reconciler correlates broker_orders by order_group_id.
+        return []
+
+    def enumeration_complete(self) -> bool:
+        ingest = getattr(self._trader, 'broker_ingest', None)
+        return bool(ingest is not None and ingest.is_ready())

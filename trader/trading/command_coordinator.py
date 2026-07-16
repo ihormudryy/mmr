@@ -71,18 +71,39 @@ from __future__ import annotations
 
 import datetime as dt
 import json
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from enum import Enum
 from typing import Any, Callable, Literal, Optional, Protocol
 
 import duckdb
 
 from trader.data.domain_journal import DomainJournal
+from trader.data.proposal_repository import (
+    ApprovalClaim,
+    ApprovalClaimOutcome,
+    ProposalRecord,
+    ProposalRepository,
+)
 from trader.data.schema_migrations import SchemaMigrator
 from trader.domain.commands import CommandReceipt
 from trader.domain.events import DomainMutation
 from trader.domain.identity import command_entity_id
 from trader.messaging.typed_rpc import canonical_json
+from trader.trading.order_correlation import encode_order_ref
+from trader.trading.proposal_command_service import (
+    ExecutableQuote,
+    PositionAuthority,
+    QuoteAuthority,
+    _ConcurrentProposalChange,
+)
+from trader.trading.trading_control import PauseStateUnavailable, TradingPausedError
+
+# [M1-F3] Task 5: the maximum source-clock skew (in seconds) the approval
+# saga tolerates on a live executable quote before treating the quote as
+# arriving "from the future" and rejecting it with ``SOURCE_CLOCK_SKEW``.
+# Distinct from ``typed_rpc.DEFAULT_CLOCK_SKEW_SECONDS`` (an RPC-transport
+# concern): this one is about market-data timestamp sanity, not request auth.
+MAX_SOURCE_CLOCK_SKEW_SECONDS = 30.0
 
 # [M1-F3] owns trader-DB (journal file) migration versions 20-29; Task 1
 # used 20 for trade_proposals. This task owns 21. Task 4 owns 22
@@ -174,6 +195,165 @@ class RiskDirection(str, Enum):
 
     INCREASING = "INCREASING"
     REDUCING = "REDUCING"
+
+
+# ---------------------------------------------------------------------------
+# [M1-F3] Task 5: pure approval guards + order-dispatch ports.
+# ---------------------------------------------------------------------------
+
+@dataclass(frozen=True)
+class CommandProblem:
+    """A structured validation failure carried out of the pure guards.
+
+    ``retryable`` means "transient -- mint a fresh command and retry"; the
+    approval saga builds the terminal receipt from this explicitly rather
+    than letting ``_row_to_receipt`` derive retryability from terminality.
+    """
+
+    code: str
+    retryable: bool
+    detail: Optional[str] = None
+
+
+def classify_risk_direction(
+    action: str, held_quantity: float, order_quantity: float
+) -> RiskDirection:
+    """Whether an order reduces or increases market exposure.
+
+    A SELL no larger than a long holding, or a BUY no larger than a short
+    holding, REDUCES risk (a close/cover) and is exempt from the pause gate.
+    Everything else INCREASES exposure. Broker-verified quantities only --
+    never caller-supplied.
+    """
+    if action == "SELL" and held_quantity > 0 and order_quantity <= held_quantity:
+        return RiskDirection.REDUCING
+    if action == "BUY" and held_quantity < 0 and order_quantity <= -held_quantity:
+        return RiskDirection.REDUCING           # covering a short reduces risk
+    return RiskDirection.INCREASING
+
+
+def check_exposure_increasing_guards(
+    record: ProposalRecord,
+    quote: Optional[ExecutableQuote],
+    now: dt.datetime,
+    account_mode: str,
+    outside_session_limit_enabled: bool = False,
+) -> Optional[CommandProblem]:
+    """Pure pre-dispatch guards for an exposure-INCREASING approval.
+
+    Returns the first violated guard as a ``CommandProblem``, or ``None`` when
+    the row may be dispatched. Live mode additionally demands a fresh,
+    live-feed, session-compatible executable-side quote; paper mode only
+    enforces the recorded price-drift band.
+    """
+    expected_side = "ask" if record.action == "BUY" else "bid"
+    if quote is None or quote.side != expected_side or not quote.price or quote.price <= 0:
+        return CommandProblem("EXECUTABLE_QUOTE_MISSING", retryable=True)
+    if account_mode == "live":
+        if quote.feed_type != "live":
+            return CommandProblem("FEED_NOT_LIVE", retryable=True)
+        if quote.session_state != "continuous":
+            order_type = (record.execution or {}).get("order_type", "MARKET")
+            if order_type == "MARKET" or not outside_session_limit_enabled:
+                return CommandProblem("SESSION_INCOMPATIBLE", retryable=True)
+        age = (now - quote.market_timestamp).total_seconds()
+        if age > 5.0:
+            return CommandProblem("QUOTE_STALE", retryable=True)
+        if age < -MAX_SOURCE_CLOCK_SKEW_SECONDS:
+            return CommandProblem("SOURCE_CLOCK_SKEW", retryable=True)
+    drift_bps = abs(quote.price - record.reference_price) / record.reference_price * 10_000.0
+    if drift_bps > record.max_price_drift_bps:
+        return CommandProblem(
+            "PRICE_DRIFT_EXCEEDED", retryable=False,
+            detail=f"{drift_bps:.1f} bps > {record.max_price_drift_bps:.1f} bps guard",
+        )
+    return None
+
+
+@dataclass(frozen=True)
+class SubmittedOrders:
+    """Result of a successful ``OrderDispatchPort.submit``."""
+
+    order_group_id: str
+    order_ref: str            # == encode_order_ref(order_group_id) == "mmr:og-<cmd>"
+    order_ids: list[int]      # IB orderId per placed leg (entry first)
+
+
+@dataclass(frozen=True)
+class CancelAck:
+    order_entity_id: str
+    cancelled: bool
+
+
+class BrokerRejectedError(Exception):
+    """A clean ``SuccessFail.fail`` with NO live order left behind.
+
+    Distinct from an ambiguous dispatch (timeout/disconnect): a broker
+    rejection is a definite negative outcome, so the proposal is marked
+    ``FAILED`` and the command ``REJECTED`` -- never ``OUTCOME_UNKNOWN``.
+    """
+
+    def __init__(self, reason: str):
+        self.reason = reason
+        super().__init__(reason)
+
+
+class OrderDispatchPort(Protocol):
+    """The real-order boundary. Implemented by ``trading_runtime``."""
+
+    def submit(
+        self, proposal: ProposalRecord, order_ref: str, order_group_id: str
+    ) -> SubmittedOrders: ...
+
+    def cancel(self, order_entity_id: str, order_ref: str) -> CancelAck: ...
+
+    def find_by_order_ref(self, account_id: str, order_ref: str) -> list: ...
+
+    def enumeration_complete(self) -> bool: ...
+
+
+class ReconcilerPort(Protocol):
+    """Schedules an ambiguous (``OUTCOME_UNKNOWN``) command for reconciliation.
+
+    The real ``OutcomeReconciler`` is Task 9; Task 5 only defines the port.
+    """
+
+    def schedule(self, command_id: str, now: dt.datetime) -> None: ...
+
+
+class BrokerHealthPort(Protocol):
+    """Whether the broker is enumerated and ready to accept a dispatch.
+
+    In production this maps to ``broker_ingest.is_ready`` (the promoted
+    broker-generation fence).
+    """
+
+    def is_ready(self) -> bool: ...
+
+
+class ApprovalClaimFailed(Exception):
+    """The atomic ``claim_for_approval_in_tx`` did not return ``CLAIMED``.
+
+    Raised INSIDE the claim transaction (rolling it back) for every
+    non-``CLAIMED``/non-``EXPIRED`` outcome. ``EXPIRED`` is handled separately
+    -- its flip must COMMIT -- so it never travels via this exception.
+    """
+
+    def __init__(self, outcome: ApprovalClaimOutcome):
+        self.outcome = outcome
+        super().__init__(str(outcome.result))
+
+    def code(self) -> str:
+        return _CLAIM_ERROR_CODES.get(self.outcome.result, "PROPOSAL_NOT_FOUND")
+
+
+_CLAIM_ERROR_CODES: dict[ApprovalClaim, str] = {
+    ApprovalClaim.EXPIRED: "PROPOSAL_EXPIRED",
+    ApprovalClaim.REVISION_MISMATCH: "REVISION_MISMATCH",
+    ApprovalClaim.NOT_PENDING: "NOT_PENDING",
+    ApprovalClaim.NOT_FOUND: "PROPOSAL_NOT_FOUND",
+    ApprovalClaim.WRONG_ACCOUNT: "WRONG_ACCOUNT",
+}
 
 
 class CommandValidationError(Exception):
@@ -543,6 +723,7 @@ ActionHandler = Callable[[CommandRequest], dict[str, Any]]
 class _ActionRegistration:
     handler: ActionHandler
     requires_preflight: bool
+    saga: bool = False
 
 
 class TradingCommandCoordinator:
@@ -575,8 +756,22 @@ class TradingCommandCoordinator:
 
     def register_action(
         self, action: str, handler: ActionHandler, *, requires_preflight: bool,
+        saga: bool = False,
     ) -> None:
-        self._actions[action] = _ActionRegistration(handler, requires_preflight)
+        """Register a per-action handler.
+
+        ``saga=True`` marks a handler that owns its OWN multi-step ledger
+        transitions (the approval/cancel/strategy-forward sagas): it drives
+        the command from ``RECEIVED`` to a terminal-or-ambiguous state itself
+        and returns its own ``CommandReceipt``. ``execute()`` therefore skips
+        the single-step ``RECEIVED -> RESOLVED`` fallback for a saga action
+        and returns the handler's receipt verbatim; its broad-exception
+        fallback transitions from the command's CURRENT ledger state (not an
+        assumed ``RECEIVED``) to ``OUTCOME_UNKNOWN``. Single-step actions
+        (``saga=False``, the default) keep their existing
+        ``RECEIVED -> RESOLVED/REJECTED`` behaviour unchanged.
+        """
+        self._actions[action] = _ActionRegistration(handler, requires_preflight, saga)
 
     def execute(self, request: CommandRequest) -> CommandReceipt:
         if request.action not in self._actions:
@@ -655,6 +850,12 @@ class TradingCommandCoordinator:
         try:
             outcome = registration.handler(request)
         except CommandValidationError as exc:
+            if registration.saga:
+                # A saga handler is contracted to build its own receipts and
+                # never raise this; if it does (a bug), fail closed from the
+                # command's CURRENT state rather than assuming RECEIVED.
+                self._fallback_outcome_unknown(request)
+                raise
             row = self._transition(request, "RECEIVED", "REJECTED", error_code=exc.code)
             return _row_to_receipt(row)
         except Exception:
@@ -666,17 +867,30 @@ class TradingCommandCoordinator:
             # call), so this outcome can be characterized as neither a
             # clean REJECTED nor a clean RESOLVED. OUTCOME_UNKNOWN is
             # exactly the "ambiguous, reconcile later" state for this.
-            try:
-                self._transition(
-                    request, "RECEIVED", "OUTCOME_UNKNOWN", error_code="INTERNAL_ERROR",
-                )
-            except Exception:
-                # The ledger write itself failed too (e.g. the DB is
-                # genuinely down). Do not let that mask the original
-                # exception -- the caller must still see what actually
-                # went wrong, not a secondary bookkeeping failure.
-                pass
+            if registration.saga:
+                # A saga may have already advanced past RECEIVED
+                # (VALIDATED/SUBMITTING) before failing -- transition from
+                # wherever it actually is, guarded, never from an assumed
+                # RECEIVED (which would CAS-miss and wedge the command).
+                self._fallback_outcome_unknown(request)
+            else:
+                try:
+                    self._transition(
+                        request, "RECEIVED", "OUTCOME_UNKNOWN", error_code="INTERNAL_ERROR",
+                    )
+                except Exception:
+                    # The ledger write itself failed too (e.g. the DB is
+                    # genuinely down). Do not let that mask the original
+                    # exception -- the caller must still see what actually
+                    # went wrong, not a secondary bookkeeping failure.
+                    pass
             raise
+
+        if registration.saga:
+            # The saga drove its own transitions to a terminal-or-ambiguous
+            # state and returns its own receipt; do NOT force RESOLVED.
+            assert isinstance(outcome, CommandReceipt)
+            return outcome
 
         row = self._transition(request, "RECEIVED", "RESOLVED", outcome=outcome)
         return _row_to_receipt(row)
@@ -684,6 +898,25 @@ class TradingCommandCoordinator:
     def get_command(self, command_id: str) -> Optional[CommandReceipt]:
         row = self._ledger.get(command_id)
         return _row_to_receipt(row) if row is not None else None
+
+    def _fallback_outcome_unknown(self, request: CommandRequest) -> None:
+        """Guarded CAS from the command's CURRENT state to OUTCOME_UNKNOWN.
+
+        Used when a saga handler raises unexpectedly: it may have already
+        advanced the command past RECEIVED, so transitioning from an assumed
+        RECEIVED would CAS-miss and wedge the row. A terminal/already-unknown
+        state is left untouched, and any secondary ledger-write failure is
+        swallowed so it never masks the original exception being re-raised.
+        """
+        try:
+            current = self._ledger.get(request.command_id)
+            if current is None or current.state in _TERMINAL_STATES or current.state == "OUTCOME_UNKNOWN":
+                return
+            self._transition(
+                request, current.state, "OUTCOME_UNKNOWN", error_code="INTERNAL_ERROR",
+            )
+        except Exception:
+            pass
 
     def _transition(
         self,
@@ -705,27 +938,9 @@ class TradingCommandCoordinator:
                 )
             )
 
-        mutation = DomainMutation(
-            event_type="command.updated",
-            entity_type="command",
-            entity_id=command_entity_id(request.command_id),
-            operation="upsert",
-            account_id=request.account_id,
-            source="trader_service",
-            source_timestamp=now,
-            correlation_id=request.command_id,
-            payload={
-                "state": to_state,
-                "action": request.action,
-                "target_type": request.target_type,
-                "target_id": request.target_id,
-                "outcome": outcome,
-                "error_code": error_code,
-            },
-        )
         self._journal.mutate(
             self._journal.connect(),
-            mutation,
+            _command_updated_mutation(request, to_state, now, outcome=outcome, error_code=error_code),
             _write_transition,
             event_id=f"command:{request.command_id}:{to_state.lower()}",
         )
@@ -736,3 +951,390 @@ class TradingCommandCoordinator:
         if value.tzinfo is None:
             raise ValueError("command timestamps must be timezone-aware")
         return value.astimezone(dt.timezone.utc)
+
+
+# ---------------------------------------------------------------------------
+# [M1-F3] Task 5: shared command-event helpers + the approval saga.
+# ---------------------------------------------------------------------------
+
+def _command_updated_mutation(
+    request: CommandRequest,
+    to_state: str,
+    now: dt.datetime,
+    *,
+    outcome: Optional[dict[str, Any]] = None,
+    error_code: Optional[str] = None,
+) -> DomainMutation:
+    """Build the ``command.updated`` mutation for one ledger transition.
+
+    Shared by the coordinator's single-step ``_transition`` and the approval
+    saga's own transitions/appends so every ``command.updated`` event for a
+    given command has an identical shape and stays on one revision stream.
+    """
+    return DomainMutation(
+        event_type="command.updated",
+        entity_type="command",
+        entity_id=command_entity_id(request.command_id),
+        operation="upsert",
+        account_id=request.account_id,
+        source="trader_service",
+        source_timestamp=now,
+        correlation_id=request.command_id,
+        payload={
+            "state": to_state,
+            "action": request.action,
+            "target_type": request.target_type,
+            "target_id": request.target_id,
+            "outcome": outcome,
+            "error_code": error_code,
+        },
+    )
+
+
+def _noop_write(conn: duckdb.DuckDBPyConnection, revision: int) -> None:
+    """A no-op ``write_materialized`` for a journal append whose durable row
+    was already written directly on the transaction's ``conn`` (the
+    command-ledger row transitioned by ``transition_in_tx``). The append
+    exists only to record the ``command.updated`` event, advance the command
+    entity revision, and drive the long-poll commit signal."""
+    return None
+
+
+def _assert_proposal_revision(expected: int) -> Callable[[duckdb.DuckDBPyConnection, int], None]:
+    """A ``write_materialized`` callback asserting the journal's computed
+    ``next_revision`` equals the revision the repository write already
+    produced -- keeping ``trade_proposals.revision`` and the journal
+    ``entity_revision`` in lockstep (exactly one append per revision bump).
+    It does NOT re-write ``trade_proposals`` (the claim/link/submit already
+    wrote the row directly on ``conn``); it only guards the invariant."""
+    def _write(conn: duckdb.DuckDBPyConnection, revision: int) -> None:
+        if revision != expected:
+            raise _ConcurrentProposalChange(
+                f"journal revision {revision} diverged from proposal revision {expected}"
+            )
+    return _write
+
+
+class ApprovalCommandService:
+    """The approval saga -- the ONE command that dispatches real orders.
+
+    Registered on the coordinator via ``register_action("approve_proposal",
+    svc.approve, requires_preflight=True, saga=True)``. When ``execute()``
+    invokes ``approve``, the command ledger is already at ``RECEIVED``;
+    ``approve`` drives it the rest of the way and returns its own
+    ``CommandReceipt``:
+
+        RECEIVED -> REJECTED                              (a pre-dispatch guard failed)
+        RECEIVED -> VALIDATED -> SUBMITTING -> SUBMITTED  (happy path)
+        ...      -> SUBMITTING -> REJECTED                (clean broker rejection)
+        ...      -> SUBMITTING -> OUTCOME_UNKNOWN         (ambiguous dispatch)
+
+    The claim (``VALIDATED -> SUBMITTING``) is one ``mutate_batch_work``
+    transaction that -- for an INCREASING order -- re-checks the pause gate in
+    the SAME tx (spec §9.4/I1), atomically flips the proposal
+    ``PENDING -> APPROVED``, links the order group (no revision bump), and
+    journals both a ``proposal.updated`` and a ``command.updated`` event. Only
+    THEN is the bracket dispatched. A clean rejection marks the proposal
+    ``FAILED``; an ambiguous dispatch (timeout/disconnect) leaves it
+    ``APPROVED`` for the Task-9 reconciler and NEVER auto-retries.
+    """
+
+    def __init__(
+        self,
+        *,
+        journal: DomainJournal,
+        ledger: CommandLedger,
+        repo: ProposalRepository,
+        controls: Any,
+        orders: OrderDispatchPort,
+        positions: PositionAuthority,
+        quotes: QuoteAuthority,
+        risk_gate: Any,
+        risk_producer: Any,
+        reconciler: ReconcilerPort,
+        broker: BrokerHealthPort,
+        account_id: str,
+        account_mode: str,
+        now: Callable[[], dt.datetime] = _utcnow,
+        outside_session_limit_enabled: bool = False,
+    ):
+        self._journal = journal
+        self._ledger = ledger
+        self._repo = repo
+        self._controls = controls
+        self._orders = orders
+        self._positions = positions
+        self._quotes = quotes
+        self._risk_gate = risk_gate
+        self._risk_producer = risk_producer
+        self._reconciler = reconciler
+        self._broker = broker
+        self._account_id = account_id
+        self._account_mode = account_mode
+        self._now = now
+        self._outside_session_limit_enabled = outside_session_limit_enabled
+
+    # -- public saga entry point (the registered action handler) ----------
+
+    def approve(self, cmd: CommandRequest) -> CommandReceipt:
+        proposal_id = int(cmd.body["proposal_id"])
+        record = self._repo.get(proposal_id)
+
+        problem, direction, decision = self._validate(record, cmd)
+
+        # Write-once risk decision, recorded regardless of approve/reject, in
+        # its OWN transaction, BEFORE the claim tx. Never re-published on a
+        # legitimate retry (the ledger exact-retry replay path returns before
+        # this handler -- and thus this call -- ever runs again).
+        self._risk_producer.publish_decision(
+            cmd.command_id, decision, correlation_id=cmd.command_id
+        )
+
+        if problem is not None:
+            self._transition_command(cmd, "RECEIVED", "REJECTED", error_code=problem.code)
+            return self._receipt(cmd.command_id, "REJECTED", problem.code, problem.retryable)
+
+        self._transition_command(cmd, "RECEIVED", "VALIDATED")
+
+        order_group_id = f"og-{cmd.command_id}"
+        claimed: list[ProposalRecord] = []
+
+        def work(conn, append):
+            # §9.4/I1: re-check the pause gate in the SAME tx (INCREASING only)
+            # so a pause that committed first is guaranteed to be observed and
+            # serializes against final dispatch.
+            if direction is RiskDirection.INCREASING:
+                self._controls.require_unpaused_in_tx(conn, record.account_id)
+            outcome = self._repo.claim_for_approval_in_tx(
+                conn, record.id, cmd.expected_version, self._account_id, self._now_utc()
+            )
+            if outcome.result is ApprovalClaim.CLAIMED:
+                self._repo.link_order_group_in_tx(conn, record.id, order_group_id)
+                linked = replace(outcome.record, order_group_id=order_group_id)
+                append(
+                    self._repo.mutation_for(linked, cmd.command_id),
+                    _assert_proposal_revision(linked.revision),
+                    f"proposal:{record.id}:{linked.revision}",
+                )
+                self._ledger.transition_in_tx(conn, cmd.command_id, "VALIDATED", "SUBMITTING")
+                append(
+                    _command_updated_mutation(cmd, "SUBMITTING", self._now_utc()),
+                    _noop_write,
+                    f"command:{cmd.command_id}:submitting",
+                )
+                claimed.append(linked)
+            elif outcome.result is ApprovalClaim.EXPIRED:
+                # The claim UPDATE flipped PENDING -> EXPIRED (revision + 1);
+                # that flip MUST commit (the row is genuinely expired now), so
+                # journal it rather than rolling back the way the other
+                # non-CLAIMED outcomes (which wrote nothing) do.
+                append(
+                    self._repo.mutation_for(outcome.record, cmd.command_id),
+                    _assert_proposal_revision(outcome.record.revision),
+                    f"proposal:{record.id}:{outcome.record.revision}",
+                )
+            else:
+                raise ApprovalClaimFailed(outcome)      # rollback; nothing was written
+
+        try:
+            self._journal.mutate_batch_work(self._journal.connect(), work)
+        except (TradingPausedError, PauseStateUnavailable):
+            self._transition_command(cmd, "VALIDATED", "REJECTED", error_code="TRADING_PAUSED")
+            return self._receipt(cmd.command_id, "REJECTED", "TRADING_PAUSED", True)
+        except ApprovalClaimFailed as ex:
+            code = ex.code()
+            self._transition_command(cmd, "VALIDATED", "REJECTED", error_code=code)
+            return self._receipt(cmd.command_id, "REJECTED", code, False)
+
+        if not claimed:
+            # EXPIRED: the flip committed above; the command ends REJECTED.
+            self._transition_command(cmd, "VALIDATED", "REJECTED", error_code="PROPOSAL_EXPIRED")
+            return self._receipt(cmd.command_id, "REJECTED", "PROPOSAL_EXPIRED", False)
+
+        claimed_record = claimed[0]
+
+        # --- Irreversible boundary: dispatch the bracket to the broker. ---
+        try:
+            submitted = self._orders.submit(
+                proposal=self._repo.get(record.id),
+                order_ref=encode_order_ref(order_group_id),
+                order_group_id=order_group_id,
+            )
+        except BrokerRejectedError as ex:
+            self._fail_after_broker_rejection(cmd, record.id, claimed_record.revision, str(ex))
+            return self._receipt(cmd.command_id, "REJECTED", "BROKER_REJECTED", False)
+        except Exception:
+            # Timeout / disconnect / lost ack. NEVER auto-retry an ambiguous
+            # real-money dispatch (retryable=False): the proposal stays
+            # APPROVED and the Task-9 reconciler resolves the true outcome.
+            self._transition_command(
+                cmd, "SUBMITTING", "OUTCOME_UNKNOWN", error_code="DISPATCH_AMBIGUOUS"
+            )
+            self._reconciler.schedule(cmd.command_id, self._now_utc())
+            return self._receipt(cmd.command_id, "OUTCOME_UNKNOWN", "DISPATCH_AMBIGUOUS", False)
+
+        # --- Finish: proposal APPROVED->EXECUTED, command SUBMITTING->SUBMITTED. ---
+        outcome_payload = {"order_ids": submitted.order_ids, "order_group_id": order_group_id}
+
+        def finish(conn, append):
+            row = self._repo.mark_order_submitted_in_tx(
+                conn, record.id, submitted.order_ids, claimed_record.revision, self._now_utc()
+            )
+            if row is None:
+                raise _ConcurrentProposalChange("proposal changed before submit-link")
+            append(
+                self._repo.mutation_for(row, cmd.command_id),
+                _assert_proposal_revision(row.revision),
+                f"proposal:{record.id}:{row.revision}",
+            )
+            self._ledger.transition_in_tx(
+                conn, cmd.command_id, "SUBMITTING", "SUBMITTED", outcome=outcome_payload
+            )
+            append(
+                _command_updated_mutation(cmd, "SUBMITTED", self._now_utc(), outcome=outcome_payload),
+                _noop_write,
+                f"command:{cmd.command_id}:submitted",
+            )
+
+        self._journal.mutate_batch_work(self._journal.connect(), finish)
+        return self._receipt(cmd.command_id, "SUBMITTED", None, False, outcome=outcome_payload)
+
+    # -- validation (pure guards + broker-verified collaborators) ---------
+
+    def _validate(
+        self, record: Optional[ProposalRecord], cmd: CommandRequest
+    ) -> tuple[Optional[CommandProblem], Optional[RiskDirection], dict[str, Any]]:
+        def reject(code: str, retryable: bool):
+            return (
+                CommandProblem(code, retryable),
+                None,
+                {"decision": "reject", "code": code, "proposal_id": int(cmd.body["proposal_id"])},
+            )
+
+        if record is None:
+            return reject("PROPOSAL_NOT_FOUND", False)
+        if record.account_id != self._account_id:
+            return reject("WRONG_ACCOUNT", False)
+        if self._account_mode == "live" and not record.live_approval_eligible:
+            return reject("LIVE_INELIGIBLE", False)
+        if record.status != "PENDING":
+            return reject("NOT_PENDING", False)
+        if cmd.expected_version is not None and record.revision != cmd.expected_version:
+            return reject("REVISION_MISMATCH", False)
+        inflight = [
+            r for r in self._ledger.unresolved_for_target("proposal", str(record.id))
+            if r.command_id != cmd.command_id
+        ]
+        if inflight:
+            return reject("COMMAND_IN_FLIGHT", True)
+        if not self._broker.is_ready():
+            return reject("BROKER_UNAVAILABLE", True)
+        if not self._evaluate_risk(record).approved:
+            return reject("RISK_REJECTED", False)
+
+        held = float(self._positions.reducible_quantity(self._account_id, record.conid))
+        qty = float(record.quantity or 0.0)
+        direction = classify_risk_direction(record.action, held, qty)
+        # Explicit reducible cap (correction #3): a SELL that overshoots the
+        # held long is an exposure-increasing short in disguise -- reject it
+        # BEFORE the exposure guards. classify_risk_direction alone can't
+        # produce this code.
+        if record.action == "SELL" and held > 0 and qty > held:
+            problem, _, decision = reject("REDUCIBLE_QUANTITY_EXCEEDED", False)
+            return problem, direction, decision
+        if direction is RiskDirection.REDUCING:
+            # Pause-exempt close/cover; a stale feed is tolerated (no guards).
+            return None, direction, {
+                "decision": "approve", "direction": "REDUCING", "proposal_id": record.id,
+            }
+        side = "ask" if record.action == "BUY" else "bid"
+        quote = self._quotes.executable_quote(record.conid, side=side)
+        problem = check_exposure_increasing_guards(
+            record, quote, self._now_utc(), self._account_mode, self._outside_session_limit_enabled,
+        )
+        if problem is not None:
+            return problem, direction, {
+                "decision": "reject", "code": problem.code, "proposal_id": record.id,
+            }
+        return None, direction, {
+            "decision": "approve", "direction": "INCREASING", "proposal_id": record.id,
+        }
+
+    def _evaluate_risk(self, record: ProposalRecord):
+        from trader.objects import Action
+        from trader.trading.strategy import Signal
+
+        signal = Signal(
+            source_name=f"approval:{record.source}",
+            action=Action.BUY if record.action == "BUY" else Action.SELL,
+            probability=1.0,
+            risk=0.0,
+            conid=int(record.conid or 0),
+        )
+        return self._risk_gate.evaluate(signal=signal)
+
+    # -- finalizers -------------------------------------------------------
+
+    def _fail_after_broker_rejection(
+        self, cmd: CommandRequest, proposal_id: int, expected_revision: int, reason: str
+    ) -> None:
+        def work(conn, append):
+            row = self._repo.mark_failed_in_tx(
+                conn, proposal_id, reason, expected_revision, self._now_utc()
+            )
+            if row is None:
+                raise _ConcurrentProposalChange("proposal changed before fail-mark")
+            append(
+                self._repo.mutation_for(row, cmd.command_id),
+                _assert_proposal_revision(row.revision),
+                f"proposal:{proposal_id}:{row.revision}",
+            )
+            self._ledger.transition_in_tx(
+                conn, cmd.command_id, "SUBMITTING", "REJECTED", error_code="BROKER_REJECTED"
+            )
+            append(
+                _command_updated_mutation(cmd, "REJECTED", self._now_utc(), error_code="BROKER_REJECTED"),
+                _noop_write,
+                f"command:{cmd.command_id}:rejected",
+            )
+
+        self._journal.mutate_batch_work(self._journal.connect(), work)
+
+    # -- command-ledger single-step transition ---------------------------
+
+    def _transition_command(
+        self,
+        cmd: CommandRequest,
+        from_state: str,
+        to_state: str,
+        *,
+        outcome: Optional[dict[str, Any]] = None,
+        error_code: Optional[str] = None,
+    ) -> None:
+        now = self._now_utc()
+
+        def _write(conn: duckdb.DuckDBPyConnection, _revision: int) -> None:
+            self._ledger.transition_in_tx(
+                conn, cmd.command_id, from_state, to_state,
+                outcome=outcome, error_code=error_code, now=now,
+            )
+
+        self._journal.mutate(
+            self._journal.connect(),
+            _command_updated_mutation(cmd, to_state, now, outcome=outcome, error_code=error_code),
+            _write,
+            event_id=f"command:{cmd.command_id}:{to_state.lower()}",
+        )
+
+    @staticmethod
+    def _receipt(
+        command_id: str, state: str, error_code: Optional[str], retryable: bool,
+        *, outcome: Optional[dict[str, Any]] = None,
+    ) -> CommandReceipt:
+        return CommandReceipt(
+            command_id=command_id, correlation_id=command_id, state=state,
+            outcome=outcome, error_code=error_code, retryable=retryable,
+        )
+
+    def _now_utc(self) -> dt.datetime:
+        return _as_utc(self._now())

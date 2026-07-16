@@ -91,7 +91,12 @@ from trader.domain.feed_service import CURSOR_EXPIRED, CursorExpired, DomainFeed
 from trader.domain.snapshot_service import SNAPSHOT_NOT_READY, DomainSnapshotService, SnapshotNotReady
 from trader.messaging.trader_service_api import TraderServiceApi
 from trader.messaging.typed_rpc import HmacServiceAuthenticator, TypedRpcRegistry, _DispatchProblem
-from trader.trading.command_coordinator import CommandRequest, CommandValidationError, TradingCommandCoordinator
+from trader.trading.command_coordinator import (
+    ApprovalCommandService,
+    CommandRequest,
+    CommandValidationError,
+    TradingCommandCoordinator,
+)
 from trader.trading.proposal_command_service import (
     ProposalCommandService,
     ProposalCreateRequest,
@@ -257,6 +262,28 @@ class SetTradingPauseRequest(BaseModel):
         return _reject_colon_in_command_id(value)
 
 
+class ApproveProposalRequest(BaseModel):
+    """[M1-F3] Task 5. Approving a proposal is the ONE command that dispatches
+    a real order, so it ALWAYS requires a preflight nonce (``requires_preflight
+    =True`` when registered). ``expected_version`` is the exact proposal
+    ``revision`` the caller reviewed -- a stale approval is rejected
+    (``REVISION_MISMATCH``) rather than acting on a proposal that changed.
+    The account is the coordinator's own configured account, never
+    request-supplied (there is no ``account_id`` field)."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    command_id: str
+    proposal_id: int
+    expected_version: int
+    preflight_nonce: Optional[str] = None
+
+    @field_validator("command_id")
+    @classmethod
+    def _command_id_has_no_colon(cls, value: str) -> str:
+        return _reject_colon_in_command_id(value)
+
+
 class GetTradingControlRequest(BaseModel):
     """No fields: this always reads the coordinator's own configured
     account, exactly like the command above never accepts one."""
@@ -355,6 +382,26 @@ def _reject_proposal_rpc_handler(coordinator: TradingCommandCoordinator, account
     return _handler
 
 
+def _approve_proposal_rpc_handler(coordinator: TradingCommandCoordinator, account_id: Optional[str]):
+    """[M1-F3] Task 5. Builds the ``approve_proposal`` command envelope and
+    drives it through the coordinator (which dispatches to the registered
+    ``ApprovalCommandService.approve`` saga). ``target_id`` is the proposal id
+    so ``unresolved_for_target`` can enforce the one-live-command-per-proposal
+    rule (``COMMAND_IN_FLIGHT``); ``expected_version`` rides the envelope so
+    the atomic claim can reject a stale approval race-safely."""
+    def _handler(parsed: ApproveProposalRequest) -> Dict[str, Any]:
+        request = CommandRequest(
+            command_id=parsed.command_id, action="approve_proposal", account_id=account_id,
+            target_type="proposal", target_id=str(parsed.proposal_id),
+            expected_version=parsed.expected_version,
+            body={"proposal_id": parsed.proposal_id}, source="dashboard",
+            preflight_nonce=parsed.preflight_nonce,
+        )
+        receipt = coordinator.execute(request)
+        return _receipt_to_dict(receipt)
+    return _handler
+
+
 def _set_trading_pause_action(controls: TradingControlStore, account_id: Optional[str]):
     """The coordinator-registered inner action for ``set_trading_pause``.
 
@@ -444,6 +491,7 @@ def register_command_authority(
     *,
     account_id: Optional[str] = None,
     controls: Optional[TradingControlStore] = None,
+    approval_service: Optional[ApprovalCommandService] = None,
 ) -> None:
     """Wire the command-authority surface onto ``registry``.
 
@@ -471,6 +519,13 @@ def register_command_authority(
     ``PreflightNonceGate`` accepts the documented ``paper:<command_id>``
     self-nonce. Omitted (the default) leaves ``command``/``query`` exactly
     as before this task.
+
+    [M1-F3] Task 5: when ``approval_service`` (an ``ApprovalCommandService``)
+    is also supplied, ALSO registers ``approve_proposal`` on ``command`` --
+    the ONE command that dispatches a real order. It is a SAGA action
+    (``saga=True``: the service drives its own SUBMITTING/SUBMITTED/
+    OUTCOME_UNKNOWN transitions) and ALWAYS requires a preflight nonce. Omitted
+    (the default) leaves the approval surface unregistered.
     """
     coordinator.register_action(
         "create_proposal", _create_proposal_action(proposal_service), requires_preflight=False,
@@ -506,6 +561,15 @@ def register_command_authority(
             _get_trading_control_handler(controls, account_id),
         )
 
+    if approval_service is not None:
+        coordinator.register_action(
+            "approve_proposal", approval_service.approve, requires_preflight=True, saga=True,
+        )
+        registry.register(
+            "command", "approve_proposal", ApproveProposalRequest, dict,
+            _approve_proposal_rpc_handler(coordinator, account_id),
+        )
+
 
 def build_production_registry(
     trader,
@@ -517,6 +581,7 @@ def build_production_registry(
     proposal_service: Optional[ProposalCommandService] = None,
     proposal_repository: Optional[ProposalRepository] = None,
     trading_control: Optional[TradingControlStore] = None,
+    approval_service: Optional[ApprovalCommandService] = None,
 ) -> TypedRpcRegistry:
     """Build the typed-RPC registry a production ``trader_service`` serves.
 
@@ -576,6 +641,7 @@ def build_production_registry(
             registry, command_coordinator, proposal_service, proposal_repository,
             account_id=getattr(trader, 'ib_account', None),
             controls=trading_control,
+            approval_service=approval_service,
         )
 
     if snapshot_service is not None:

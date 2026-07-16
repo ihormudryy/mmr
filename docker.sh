@@ -9,6 +9,87 @@ BUILDDIR=$(cd $(dirname "$0"); pwd)
 # layout works out of the box; override with NEWS_DIR=/path/to/news.
 NEWS_DIR="${NEWS_DIR:-$HOME/dev/news}"
 
+echo_usage() {
+    echo "usage: docker.sh -- helper script to manage split MMR services + IB Gateway"
+    echo
+    echo "  -b (build the shared MMR image)"
+    echo "  -u (up: start all split services and IB Gateway)"
+    echo "  -i (ib-only: start only IB Gateway for local development)"
+    echo "  -d (down: stop and remove all containers)"
+    echo "  -c (clean: remove all images and containers)"
+    echo "  -f (force clean: images + containers + build cache + host data)"
+    echo "  -s (retired: source is baked into read-only images; use -b -u)"
+    echo "  -a (retired: source is baked into read-only images; use -b -u)"
+    echo "  -g (go: build, start all containers, and exec into trader)"
+    echo "  -l (logs: tail logs from all containers)"
+    echo "  -r (restart-ib: restart the IB Gateway container)"
+    echo "  -e [service] (exec: shell into trader by default; valid services:"
+    echo "      trader, data, strategy, dashboard, scheduler, ib-gateway)"
+    echo "  -n (news: bring up the news scraper stack at \$NEWS_DIR)"
+    echo "  -B [name] (backup DuckDB files to ~/.local/share/mmr/backups/)"
+    echo
+}
+
+b=n c=n f=n u=n d=n s=n a=n g=n l=n e=n i=n r=n n=n B=n
+BACKUP_NAME=""
+EXEC_SERVICE="trader"
+
+# Parse and validate before probing Docker or Podman. An invalid requested
+# service should not touch a container runtime at all.
+while [[ $# -gt 0 ]]; do
+  case $1 in
+    -b|--build) b=y; shift ;;
+    -u|--up) u=y; shift ;;
+    -d|--down) d=y; shift ;;
+    -c|--clean) c=y; shift ;;
+    -f|--force) f=y; shift ;;
+    -g|--go) g=y; shift ;;
+    -s|--sync) s=y; shift ;;
+    -a|--sync_all) a=y; shift ;;
+    -l|--logs) l=y; shift ;;
+    -e|--exec)
+      e=y
+      shift
+      if [[ $# -gt 0 && ! "$1" =~ ^- ]]; then
+          EXEC_SERVICE="$1"
+          shift
+      fi
+      ;;
+    -i|--ib-only) i=y; shift ;;
+    -r|--restart-ib) r=y; shift ;;
+    -n|--news) n=y; shift ;;
+    -B|--backup)
+      B=y
+      shift
+      if [[ $# -gt 0 && ! "$1" =~ ^- ]]; then
+        BACKUP_NAME="$1"
+        shift
+      fi
+      ;;
+    -*|--*)
+      echo "Unknown option $1"
+      echo_usage
+      exit 1
+      ;;
+    *) shift ;;
+  esac
+done
+
+if [[ $b == "n" && $c == "n" && $f == "n" && $u == "n" && $d == "n" && $s == "n" && $a == "n" && $g == "n" && $l == "n" && $e == "n" && $i == "n" && $r == "n" && $n == "n" && $B == "n" ]]; then
+    echo_usage
+    exit 0
+fi
+
+if [[ $e == "y" ]]; then
+    case "$EXEC_SERVICE" in
+        trader|data|strategy|dashboard|scheduler|ib-gateway) ;;
+        *)
+            echo "Unknown exec service: $EXEC_SERVICE"
+            exit 1
+            ;;
+    esac
+fi
+
 # Detect container runtime.
 # 1. Use whichever is already running.
 # 2. If neither is running, try to start whichever is installed.
@@ -324,118 +405,6 @@ print_vnc_url() {
     fi
 }
 
-echo_usage() {
-    echo "usage: docker.sh -- helper script to manage MMR + IB Gateway containers"
-    echo
-    echo "  Uses docker-compose with IB Gateway sidecar container."
-    echo "  Supports both docker and podman (auto-detected)."
-    echo
-    echo "  -b (build MMR image)"
-    echo "  -u (up: start all containers — IB Gateway + MMR)"
-    echo "  -i (ib-only: start only IB Gateway for local development)"
-    echo "  -d (down: stop and remove all containers)"
-    echo "  -c (clean: remove all images and containers)"
-    echo "  -f (force clean: images + containers + build cache + HOST DATA"
-    echo "      — prompts for confirmation before wiping sweeps/backtests/history;"
-    echo "      set MMR_FORCE_CLEAN_KEEP_DATA=1 to skip the data wipe)"
-    echo "  -s (sync code to running MMR container)"
-    echo "  -a (sync all files to running MMR container)"
-    echo "  -g (go: build, then start all containers and exec in)"
-    echo "  -l (logs: tail logs from all containers)"
-    echo "  -r (restart-ib: restart the IB Gateway container)"
-    echo "  -e (exec: shell into running MMR container)"
-    echo "  -n (news: bring up the news scraper stack at \$NEWS_DIR"
-    echo "      — default ~/dev/news; idempotent. Used by the news skill.)"
-    echo "  -B [name] (backup DuckDB files from the named volume to"
-    echo "      ~/.local/share/mmr/backups/<name>/ — defaults to a timestamp"
-    echo "      if no name given. Briefly stops the MMR container so the"
-    echo "      copy is consistent, then restarts.)"
-    echo ""
-}
-
-b=n c=n f=n u=n d=n s=n a=n g=n l=n e=n i=n r=n n=n B=n
-BACKUP_NAME=""
-
-while [[ $# -gt 0 ]]; do
-  case $1 in
-    -b|--build)
-      b=y
-      shift
-      ;;
-    -u|--up)
-      u=y
-      shift
-      ;;
-    -d|--down)
-      d=y
-      shift
-      ;;
-    -c|--clean)
-      c=y
-      shift
-      ;;
-    -f|--force)
-      f=y
-      shift
-      ;;
-    -g|--go)
-      g=y
-      shift
-      ;;
-    -s|--sync)
-      s=y
-      shift
-      ;;
-    -a|--sync_all)
-      a=y
-      shift
-      ;;
-    -l|--logs)
-      l=y
-      shift
-      ;;
-    -e|--exec)
-      e=y
-      shift
-      ;;
-    -i|--ib-only)
-      i=y
-      shift
-      ;;
-    -r|--restart-ib)
-      r=y
-      shift
-      ;;
-    -n|--news)
-      n=y
-      shift
-      ;;
-    -B|--backup)
-      B=y
-      shift
-      # Optional positional arg: backup name (must not look like a flag).
-      if [[ $# -gt 0 && ! "$1" =~ ^- ]]; then
-        BACKUP_NAME="$1"
-        shift
-      fi
-      ;;
-    -*|--*)
-      echo "Unknown option $1"
-      echo_usage
-      exit 1
-      ;;
-    *)
-      shift
-      ;;
-  esac
-done
-
-# show usage if no action flags were set
-if [[ $b == "n" && $c == "n" && $f == "n" && $u == "n" && $d == "n" && $s == "n" && $a == "n" && $g == "n" && $l == "n" && $e == "n" && $i == "n" && $r == "n" && $n == "n" && $B == "n" ]]; then
-    echo_usage
-    exit 0
-fi
-
 # Prompt for IB credentials and write .env file
 setup_credentials() {
     echo ""
@@ -521,19 +490,77 @@ check_env() {
     fi
 }
 
+_read_service_hmac_key_file() {
+    grep -E '^[[:space:]]*service_hmac_key_file[[:space:]]*:' "$1" 2>/dev/null \
+        | head -n1 \
+        | sed -E 's/^[[:space:]]*service_hmac_key_file[[:space:]]*:[[:space:]]*//' \
+        | sed -E "s/^['\"]//; s/['\"][[:space:]]*$//" \
+        | sed -E 's/[[:space:]]+$//'
+}
+
+_write_portable_service_hmac_key_file() {
+    local yaml_file="$1"
+    local portable_path='~/.config/mmr/service_hmac.key'
+    if grep -q -E '^[[:space:]]*service_hmac_key_file[[:space:]]*:' "$yaml_file"; then
+        sed -i.bak "s|^[[:space:]]*service_hmac_key_file:.*|service_hmac_key_file: ${portable_path}|" "$yaml_file"
+        rm -f "${yaml_file}.bak"
+    else
+        printf '\nservice_hmac_key_file: %s\n' "$portable_path" >> "$yaml_file"
+    fi
+}
+
+ensure_split_config() {
+    local config_dir="$HOME/.config/mmr"
+    local trader_config="$config_dir/trader.yaml"
+    local default_config
+    local configured_key
+    local portable_path='~/.config/mmr/service_hmac.key'
+    local host_key="$config_dir/service_hmac.key"
+
+    mkdir -p "$config_dir"
+    for default_config in "$BUILDDIR"/config_defaults/*.yaml; do
+        [[ -e "$default_config" ]] || continue
+        cp -n "$default_config" "$config_dir/"
+    done
+
+    if [[ ! -f "$trader_config" ]]; then
+        echo "Error: missing trader configuration at $trader_config"
+        exit 1
+    fi
+
+    configured_key="$(_read_service_hmac_key_file "$trader_config")"
+    if [[ "$configured_key" == "$HOME/.config/mmr/service_hmac.key" ]]; then
+        # This is the old host-only spelling produced by start_mmr.sh. It
+        # names the same mounted file, so normalization is safe and makes it
+        # resolve correctly inside /home/trader as well.
+        _write_portable_service_hmac_key_file "$trader_config"
+        configured_key="$portable_path"
+    fi
+
+    if [[ -z "$configured_key" || "$configured_key" == "$portable_path" ]]; then
+        if [[ ! -f "$host_key" ]]; then
+            ( umask 177 && head -c 48 /dev/urandom > "$host_key" )
+            chmod 600 "$host_key"
+            echo "Provisioned local service HMAC key at $host_key"
+        fi
+        _write_portable_service_hmac_key_file "$trader_config"
+    fi
+}
+
 build() {
     echo "Building MMR image..."
     echo ""
-    $COMPOSE -f "$BUILDDIR/docker-compose.yml" build mmr
+    $COMPOSE -f "$BUILDDIR/docker-compose.yml" build
 }
 
 up() {
+    ensure_split_config
     check_env
     print_api_keys
     echo "Pulling latest IB Gateway image..."
     $COMPOSE -f "$BUILDDIR/docker-compose.yml" pull ib-gateway
     echo ""
-    echo "Starting IB Gateway + MMR containers..."
+    echo "Starting IB Gateway + split MMR services..."
     echo ""
     # Ensure bind-mount directories exist on host
     mkdir -p "$HOME/.local/share/mmr/data" "$HOME/.local/share/mmr/logs" "$HOME/.local/share/mmr/tws_settings"
@@ -543,28 +570,22 @@ up() {
         $RUNTIME rm -f "$cid" 2>/dev/null || true
     done
     $RUNTIME network rm mmr_default 2>/dev/null || true
-    # Belt-and-suspenders: also sweep any mmr-mmr / mmr_mmr containers that
-    # somehow aren't attached to mmr_default (e.g. left over from a previous
-    # run on a different network name). Without this, `./docker.sh -g`
-    # can't recover from the stuck-dependent state described in
-    # `_remove_mmr_dependents`.
-    _remove_mmr_dependents
+    # Remove only stale legacy monolith containers before the split topology
+    # starts. This avoids a leftover legacy dependent blocking ib-gateway.
+    _remove_legacy_monolith
     # Disaster-recovery: if the DB volume is empty (lost / reset / fresh machine),
     # seed it from the newest host backup BEFORE the services start. No-op when the
     # volume already has data.
     seed_db_if_empty
     $COMPOSE -f "$BUILDDIR/docker-compose.yml" up -d
     echo ""
-    echo "Containers started. Use './docker.sh -e' to exec in, or './docker.sh -l' for logs."
+    echo "Containers started. Use './docker.sh -e [service]' to exec in, or './docker.sh -l' for logs."
     print_vnc_url
 }
 
-# Force-recreate fails when other compose services (e.g. mmr_mmr_1 from a
-# previous `./docker.sh -u`) still exist with `depends_on: ib-gateway` —
-# podman/docker refuse to remove ib-gateway while a dependent is around,
-# leaving the old ib-gateway stopped and nothing listening on 7497/7496.
-# Sweep dependents before recreating.
-_remove_mmr_dependents() {
+# A stale legacy monolith can retain a depends_on edge to ib-gateway. Remove
+# only those legacy containers before recreating the gateway.
+_remove_legacy_monolith() {
     for cid in $($RUNTIME ps -aq --filter "name=mmr[-_]mmr" 2>/dev/null); do
         $RUNTIME rm -f "$cid" 2>/dev/null || true
     done
@@ -578,7 +599,7 @@ ib_only() {
     echo ""
     echo "Starting IB Gateway only (for local development)..."
     echo ""
-    _remove_mmr_dependents
+    _remove_legacy_monolith
     # Force recreate so .env changes are always picked up
     $COMPOSE -f "$BUILDDIR/docker-compose.yml" up -d --force-recreate ib-gateway
     echo ""
@@ -613,7 +634,7 @@ restart_ib() {
     # Same dependent-container guard as ib_only(): podman/docker won't
     # recreate ib-gateway while a container with `depends_on: ib-gateway`
     # exists, even if it's stopped.
-    _remove_mmr_dependents
+    _remove_legacy_monolith
     $COMPOSE -f "$BUILDDIR/docker-compose.yml" up -d --force-recreate ib-gateway
     echo ""
     echo "IB Gateway restarted."
@@ -670,16 +691,16 @@ backup() {
     # Snapshot the DuckDB files to the host-visible backups/ dir.
     local name="$BACKUP_NAME"
 
-    # Preferred path: if mmr-mmr-1 is running, take a CLEAN in-DB snapshot via the
-    # container — no downtime. DuckDB `COPY FROM DATABASE` (in `mmr data backup`)
-    # produces a consistent, compacted copy even while the services write, so we
-    # no longer need to stop the daemon like the old plain-cp path did.
-    if [[ -n "$($RUNTIME ps -q -f name=mmr-mmr-1 2>/dev/null)" ]]; then
-        echo "Clean in-DB snapshot via running container (no downtime)..."
+    # Preferred path: scheduler owns both mounts and runs a clean in-DB backup
+    # without stopping the split services.
+    if [[ -n "$($COMPOSE -f "$BUILDDIR/docker-compose.yml" ps -q scheduler 2>/dev/null)" ]]; then
+        echo "Clean in-DB snapshot via running scheduler service (no downtime)..."
         if [[ -n "$name" ]]; then
-            $RUNTIME exec mmr-mmr-1 mmr data backup --name "$name"
+            $COMPOSE -f "$BUILDDIR/docker-compose.yml" exec -T scheduler \
+                python3 -m trader.mmr_cli data backup --name "$name"
         else
-            $RUNTIME exec mmr-mmr-1 mmr data backup --keep 30
+            $COMPOSE -f "$BUILDDIR/docker-compose.yml" exec -T scheduler \
+                python3 -m trader.mmr_cli data backup --keep 30
         fi
         echo "Backup complete → $HOME/.local/share/mmr/backups/"
         return
@@ -692,9 +713,9 @@ backup() {
     fi
     local dest_host="$HOME/.local/share/mmr/backups/$name"
     mkdir -p "$dest_host"
-    echo "Container not running — plain-copy snapshot to $dest_host/"
+    echo "Scheduler is not running — plain-copy snapshot to $dest_host/"
     $RUNTIME run --rm \
-        -v mmr_mmr_db_data:/src:ro \
+        -v mmr_db_data:/src:ro \
         -v "$dest_host":/dst \
         alpine sh -c 'cp -v /src/*.duckdb /dst/ 2>&1; ls -lh /dst/'
     echo "Backup complete: $dest_host/"
@@ -705,7 +726,7 @@ backup() {
 # whatever the image happened to seed — the "stale seed" trap. Never overwrites a
 # volume that already has data; no-ops when there's no latest backup.
 seed_db_if_empty() {
-    local vol="mmr_mmr_db_data"
+    local vol="mmr_db_data"
     local latest_link="$HOME/.local/share/mmr/backups/latest"
     local latest
     latest=$(cd -P "$latest_link" 2>/dev/null && pwd) || return 0
@@ -779,61 +800,28 @@ logs() {
 }
 
 exec_in() {
-    CONTID="$($RUNTIME ps -aqf name=mmr-mmr)"
-    if [[ -z "$CONTID" ]]; then
-        CONTID="$($RUNTIME ps -aqf name=mmr_mmr || true)"
+    local user="trader"
+    local workdir="/home/trader/mmr"
+    if [[ "$EXEC_SERVICE" == "ib-gateway" ]]; then
+        user="ibgateway"
+        workdir="/home/ibgateway"
     fi
-    if [[ -z "$CONTID" ]]; then
-        echo "Can't find running MMR container"
-        exit 1
-    fi
-    echo "Exec'ing into MMR container ($CONTID)..."
-    # `exec` replaces the docker.sh process with the runtime exec, so when
-    # the user types `exit` inside the container shell, the (now-replaced)
-    # script process simply ends — no chance for a stale stdin byte from
-    # the `-it` TTY teardown to be re-parsed by bash as a command. This
-    # was the root cause of the post-exit `ader: command not found`
-    # error on line 688: any byte the TTY layer dropped (e.g. losing the
-    # `tr` of `trader@...$` from the container's last prompt) was being
-    # fed back into bash's script parser, which dutifully tried to run
-    # "ader" as a command on whatever line happened to be next in the
-    # dispatch. Replacing the process eliminates the entire window.
-    exec $RUNTIME exec -it -u trader -w /home/trader/mmr "$CONTID" bash -l
+    echo "Exec'ing into MMR $EXEC_SERVICE service..."
+    exec $COMPOSE -f "$BUILDDIR/docker-compose.yml" exec -it -u "$user" -w "$workdir" "$EXEC_SERVICE" bash -l
 }
 
 sync() {
-    echo "Syncing code directory to MMR container..."
-    echo ""
-    CONTID="$($RUNTIME ps -aqf name=mmr-mmr)"
-    if [[ -z "$CONTID" ]]; then
-      # try alternate name patterns
-      CONTID="$($RUNTIME ps -aqf name=mmr_mmr || true)"
-    fi
-    if [[ -z "$CONTID" ]]; then
-      echo "Can't find running MMR container"
-      exit 1
-    fi
-    echo "container id: $CONTID"
+    echo "Sync is unavailable: split services run baked, read-only images."
+    echo "Rebuild and recreate them with: ./docker.sh -b -u"
+    exit 1
 
-    RSYNC_RSH="$RUNTIME exec -i"
-    rsync -e "$RSYNC_RSH" -av --delete $BUILDDIR/ $CONTID:/home/trader/mmr/ --exclude='.git' --filter="dir-merge,- .gitignore"
 }
 
 sync_all() {
-    echo "Syncing entire mmr directory to MMR container..."
-    echo ""
-    CONTID="$($RUNTIME ps -aqf name=mmr-mmr)"
-    if [[ -z "$CONTID" ]]; then
-      CONTID="$($RUNTIME ps -aqf name=mmr_mmr || true)"
-    fi
-    if [[ -z "$CONTID" ]]; then
-      echo "Can't find running MMR container"
-      exit 1
-    fi
-    echo "container id: $CONTID"
+    echo "Sync is unavailable: split services run baked, read-only images."
+    echo "Rebuild and recreate them with: ./docker.sh -b -u"
+    exit 1
 
-    RSYNC_RSH="$RUNTIME exec -i"
-    rsync -e "$RSYNC_RSH" -av --delete $BUILDDIR/ $CONTID:/home/trader/mmr/ --exclude='.git'
 }
 
 echo "action: build=$b clean=$c force=$f up=$u down=$d sync=$s sync_all=$a go=$g logs=$l exec=$e ib-only=$i restart-ib=$r news=$n backup=$B${BACKUP_NAME:+($BACKUP_NAME)} | runtime: $RUNTIME"

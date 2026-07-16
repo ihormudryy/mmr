@@ -41,26 +41,26 @@ cd mmr
 ./docker.sh -g
 ```
 
-`./docker.sh -g` handles everything: builds the Docker image, prompts for your IB username/password/account, writes credentials to `.env` (gitignored), starts the IB Gateway sidecar + MMR container, and drops you into an SSH session. From there, run `./start_mmr.sh` to launch all services.
+`./docker.sh -g` handles everything: builds the shared Docker image, prompts for your IB username/password/account, writes credentials to `.env` (gitignored), starts IB Gateway and the split MMR services, then opens a shell in the `trader` service. Compose starts each service directly; do not run the legacy monolithic `start_mmr.sh` launcher inside that shell.
 
-```bash
-# Once inside the container:
-./start_mmr.sh              # Paper trading (default)
-./start_mmr.sh --live        # Live trading
-./start_mmr.sh --cli         # CLI only (services already running)
-```
+Use `./docker.sh -e dashboard`, `./docker.sh -e strategy`, or another named
+service when you need a shell outside the default trader service.
 
 ### Other Docker Commands
 
 ```bash
 ./docker.sh -u    # Start containers
 ./docker.sh -d    # Stop containers
-./docker.sh -s    # Sync code to running container
-./docker.sh -e    # SSH into container
+./docker.sh -b    # Build the shared image
+./docker.sh -e    # Shell into trader (default)
+./docker.sh -e dashboard  # Shell into another split service
 ./docker.sh -l    # Tail logs
 ./docker.sh -c    # Clean images/volumes
 ./docker.sh -i    # IB Gateway only (for local dev)
 ```
+
+Split services run immutable, read-only images. `-s` and `-a` are retired;
+rebuild and recreate with `./docker.sh -b -u` after code changes.
 
 ### Local Install (No Docker)
 

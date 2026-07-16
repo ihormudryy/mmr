@@ -100,3 +100,64 @@ class TestMMRConfig:
         cfg.write_text("trading_mode: paper\nib_paper_port: 7497\nib_live_port: 7496\n")
         config = MMRConfig.from_yaml(str(cfg))
         assert config.ib.server_port == 5555
+
+    # ── Typed RPC config (G0 Task 3) ─────────────────────────────────────
+
+    def test_typed_rpc_defaults(self, test_config_file):
+        config = MMRConfig.from_yaml(test_config_file)
+        assert config.typed_rpc.query_port == 42101
+        assert config.typed_rpc.command_port == 42102
+        assert config.typed_rpc.feed_port == 42103
+        assert config.typed_rpc.service_hmac_key_file == ''
+        assert config.unsafe_legacy_rpc is False
+
+    def test_typed_rpc_yaml_overrides(self, tmp_path):
+        cfg = tmp_path / "cfg.yaml"
+        cfg.write_text(
+            "typed_query_port: 51101\n"
+            "typed_command_port: 51102\n"
+            "typed_feed_port: 51103\n"
+            "service_hmac_key_file: /run/secrets/service_hmac.key\n"
+        )
+        config = MMRConfig.from_yaml(str(cfg))
+        assert config.typed_rpc.query_port == 51101
+        assert config.typed_rpc.command_port == 51102
+        assert config.typed_rpc.feed_port == 51103
+        assert config.typed_rpc.service_hmac_key_file == '/run/secrets/service_hmac.key'
+
+    def test_typed_rpc_ports_in_flat_dict(self, test_config_file):
+        config = MMRConfig.from_yaml(test_config_file)
+        flat = config.to_flat_dict()
+        assert flat['typed_query_port'] == 42101
+        assert flat['typed_command_port'] == 42102
+        assert flat['typed_feed_port'] == 42103
+        assert flat['unsafe_legacy_rpc'] is False
+
+    # ── unsafe_legacy_rpc top-level bool env-var coercion ────────────────
+    #
+    # Regression guard: `unsafe_legacy_rpc` is the first TOP-LEVEL (not
+    # nested) bool in _FLAT_KEY_MAP. The env-var branch for top-level fields
+    # used to do `type(current_val)(value)`, and since bool is a subclass of
+    # int, `bool("false")` is True (any non-empty string is truthy) -- so
+    # UNSAFE_LEGACY_RPC=false would have silently ENABLED the unsafe legacy
+    # RPC path. Assert both directions parse correctly via the env var.
+
+    def test_unsafe_legacy_rpc_env_var_false_string_is_false(self, tmp_path, monkeypatch):
+        monkeypatch.setenv('UNSAFE_LEGACY_RPC', 'false')
+        cfg = tmp_path / "cfg.yaml"
+        cfg.write_text("unsafe_legacy_rpc: true\n")  # YAML says true; env var must win as False
+        config = MMRConfig.from_yaml(str(cfg))
+        assert config.unsafe_legacy_rpc is False
+
+    def test_unsafe_legacy_rpc_env_var_true_string_is_true(self, tmp_path, monkeypatch):
+        monkeypatch.setenv('UNSAFE_LEGACY_RPC', 'true')
+        cfg = tmp_path / "cfg.yaml"
+        cfg.write_text("unsafe_legacy_rpc: false\n")
+        config = MMRConfig.from_yaml(str(cfg))
+        assert config.unsafe_legacy_rpc is True
+
+    def test_unsafe_legacy_rpc_yaml_bool_parses_directly(self, tmp_path):
+        cfg = tmp_path / "cfg.yaml"
+        cfg.write_text("unsafe_legacy_rpc: true\n")
+        config = MMRConfig.from_yaml(str(cfg))
+        assert config.unsafe_legacy_rpc is True

@@ -62,6 +62,26 @@ zmq_messagebus_server_port: 42006
 zmq_data_rpc_server_address: tcp://127.0.0.1
 zmq_data_rpc_server_port: 42003
 
+# Typed, authenticated query/command/feed transport (G0 runtime & RPC
+# security). Ports are frozen by the command-center plan index. These
+# sockets bind on the private Compose network only -- a later Compose task
+# enforces that they are never host-published (except query/command on
+# host 127.0.0.1, per the plan's loopback-only allowance; feed never is).
+# service_hmac_key_file must point at a real file (mode 0600, non-empty,
+# >= 32 bytes) before production startup -- see
+# trader/messaging/typed_rpc.py:load_service_hmac_key. Left empty here
+# deliberately: there is no safe default secret to ship.
+typed_query_port: 42101
+typed_command_port: 42102
+typed_feed_port: 42103
+service_hmac_key_file: ''
+
+# Hard gate: the legacy dill/msgpack RPC path (raw Python objects, no
+# per-method allowlist) may only run when simulation=True AND this is also
+# explicitly true -- production always uses the typed query/command/feed
+# transport above. Refused at startup otherwise (G0 Task 4).
+unsafe_legacy_rpc: false
+
 # Massive.com (formerly Polygon.io)
 massive_api_key: ''
 massive_feed: stocks

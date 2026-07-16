@@ -71,6 +71,23 @@ class StrategyRuntimeConfig:
 
 
 @dataclass
+class TypedRpcConfig:
+    """Authenticated query/command/feed transport (G0 Task 3).
+
+    Ports are frozen by the command-center plan index -- see
+    ``trader/messaging/typed_rpc.py`` for the transport itself and
+    ``load_service_hmac_key`` for why ``service_hmac_key_file`` has no
+    usable default: production startup must fail loudly rather than fall
+    back to an unset/empty key.
+    """
+    address: str = 'tcp://127.0.0.1'
+    query_port: int = 42101
+    command_port: int = 42102
+    feed_port: int = 42103
+    service_hmac_key_file: str = ''
+
+
+@dataclass
 class MMRConfig:
     ib: IBConfig = field(default_factory=IBConfig)
     storage: StorageConfig = field(default_factory=StorageConfig)
@@ -79,12 +96,17 @@ class MMRConfig:
     strategy: StrategyRuntimeConfig = field(default_factory=StrategyRuntimeConfig)
     massive: MassiveConfig = field(default_factory=MassiveConfig)
     twelvedata: TwelveDataConfig = field(default_factory=TwelveDataConfig)
+    typed_rpc: TypedRpcConfig = field(default_factory=TypedRpcConfig)
     root_directory: str = '.'
     config_file: str = '~/.config/mmr/trader.yaml'
     logfile: str = '~/.local/share/mmr/logs/trader.log'
     trading_mode: str = 'live'
     paper_trading: bool = False
     simulation: bool = False
+    # Hard gate (G0 Task 4 enforces it): the legacy dill/msgpack RPC path
+    # that returns raw Python objects may only run when simulation=True AND
+    # this is explicitly set -- never in a production/live posture.
+    unsafe_legacy_rpc: bool = False
 
     # Mapping from flat YAML keys to nested config fields
     _FLAT_KEY_MAP: Dict[str, tuple] = field(default=None, init=False, repr=False)
@@ -127,11 +149,17 @@ class MMRConfig:
             'massive_delayed': ('massive', 'delayed'),
             # TwelveData
             'twelvedata_api_key': ('twelvedata', 'api_key'),
+            # Typed RPC (G0 authenticated query/command/feed transport)
+            'typed_query_port': ('typed_rpc', 'query_port'),
+            'typed_command_port': ('typed_rpc', 'command_port'),
+            'typed_feed_port': ('typed_rpc', 'feed_port'),
+            'service_hmac_key_file': ('typed_rpc', 'service_hmac_key_file'),
             # Top-level
             'root_directory': ('root_directory',),
             'config_file': ('config_file',),
             'logfile': ('logfile',),
             'trading_mode': ('trading_mode',),
+            'unsafe_legacy_rpc': ('unsafe_legacy_rpc',),
         }
 
     @staticmethod
@@ -155,7 +183,19 @@ class MMRConfig:
                 # Top-level field
                 attr = nested_path[0]
                 current_val = getattr(config, attr)
-                setattr(config, attr, type(current_val)(value) if current_val is not None else value)
+                # bool must be checked before the generic type(current_val)(value)
+                # cast for the same reason as the nested branch below: bool is a
+                # subclass of int, and `bool("false")` is True (any non-empty
+                # string is truthy), so a naive cast would make
+                # UNSAFE_LEGACY_RPC=false ENABLE the unsafe legacy RPC path --
+                # the opposite of what the env var says. Parse the string
+                # explicitly instead of relying on Python truthiness.
+                if isinstance(current_val, bool):
+                    setattr(config, attr, str(value).strip().lower() in ('1', 'true', 'yes', 'on'))
+                elif current_val is not None:
+                    setattr(config, attr, type(current_val)(value))
+                else:
+                    setattr(config, attr, value)
             elif len(nested_path) == 2:
                 # Nested field
                 section = getattr(config, nested_path[0])

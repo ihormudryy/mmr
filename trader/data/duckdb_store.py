@@ -67,6 +67,53 @@ class DuckDBConnection:
 
         return self.execute_atomic(_run)
 
+    def transaction(self, fn):
+        """Run ``fn`` as a single explicit unit of work: one BEGIN
+        TRANSACTION, one COMMIT on success, one ROLLBACK + re-raise on any
+        exception. ``fn`` receives the live DuckDBPyConnection and may issue
+        multiple statements against it — they all commit together or none
+        do.
+
+        Returns whatever ``fn`` returns. This is load-bearing: callers do
+        e.g. ``generation_id = db.transaction(_open)`` — returning ``None``
+        here would silently corrupt every caller that assigns the result.
+
+        Binding convention for helper methods that run inside a transaction
+        (by convention named ``_foo_in_tx`` / passed as ``fn`` here): they
+        must accept the supplied ``conn`` and call ``conn.execute(...)``
+        directly. They must NEVER call ``self.db.execute`` or
+        ``self.db.transaction`` from inside ``fn`` — ``self._lock`` is a
+        plain non-reentrant ``threading.Lock``, so calling back into it from
+        inside the lock already held by ``execute_atomic`` below deadlocks
+        the thread. They must also NOT issue their own BEGIN/COMMIT/ROLLBACK
+        — DuckDB rejects a nested BEGIN, and an errant COMMIT/ROLLBACK
+        inside ``fn`` leaves no active transaction for this wrapper to
+        finish, which surfaces as a DuckDB TransactionException (guarded
+        against below, but still a bug in the caller).
+
+        Built on ``execute_atomic`` so it shares the same per-db lock and
+        IOException retry/backoff as every other write path.
+        """
+        def _transaction(conn):
+            conn.execute("BEGIN TRANSACTION")
+            try:
+                result = fn(conn)
+                conn.execute("COMMIT")
+                return result
+            except BaseException:
+                # RA-11: guard the ROLLBACK itself. If it raises too (e.g.
+                # a failed BEGIN left no open transaction, or fn already
+                # closed the transaction itself in violation of the
+                # convention above), swallow ROLLBACK's own error so it
+                # can never mask the real exception being re-raised below.
+                try:
+                    conn.execute("ROLLBACK")
+                except BaseException:
+                    pass
+                raise
+
+        return self.execute_atomic(_transaction)
+
     def execute_atomic(self, fn):
         """Execute a function with an exclusive connection.
 

@@ -4,7 +4,7 @@ import pandas as pd
 import numpy as np
 
 from unittest.mock import MagicMock, patch
-from trader.data.duckdb_store import DuckDBDataStore, DuckDBObjectStore
+from trader.data.duckdb_store import DuckDBConnection, DuckDBDataStore, DuckDBObjectStore
 from trader.sdk import MMR
 
 
@@ -341,3 +341,98 @@ class TestConcurrentAccess:
         assert errors == []
         # Only 8 rows regardless of how many times we wrote
         assert len(store.read('AAPL')) == 8
+
+
+class TestDuckDBConnectionTransaction:
+    """DuckDBConnection.transaction(fn) — explicit unit-of-work wrapper.
+
+    This is the frozen contract consumed by [M1-F2] (~25 call sites doing
+    `generation_id = db.transaction(_open)`) and [M1-F3]
+    (`claim = db.transaction(_claim)`): exactly one BEGIN, exactly one
+    COMMIT on success, exactly one ROLLBACK + re-raise on any exception,
+    and the callable's return value passed straight through.
+    """
+
+    def test_transaction_rolls_back_every_statement(self, tmp_duckdb_path):
+        db = DuckDBConnection.get_instance(tmp_duckdb_path)
+        db.execute("CREATE TABLE tx_test(id INTEGER PRIMARY KEY)")
+
+        def write_then_fail(conn):
+            conn.execute("INSERT INTO tx_test VALUES (1)")
+            raise RuntimeError("crash point")
+
+        with pytest.raises(RuntimeError, match="crash point"):
+            db.transaction(write_then_fail)
+        assert db.execute("SELECT * FROM tx_test", fetch="all") == []
+
+    def test_transaction_commits_all_statements(self, tmp_duckdb_path):
+        """Happy path: multiple statements in one fn are all durably
+        committed together (one BEGIN, one COMMIT)."""
+        db = DuckDBConnection.get_instance(tmp_duckdb_path)
+        db.execute("CREATE TABLE tx_test(id INTEGER PRIMARY KEY, label VARCHAR)")
+
+        def write_two_rows(conn):
+            conn.execute("INSERT INTO tx_test VALUES (1, 'a')")
+            conn.execute("INSERT INTO tx_test VALUES (2, 'b')")
+
+        db.transaction(write_two_rows)
+        rows = db.execute("SELECT * FROM tx_test ORDER BY id", fetch="all")
+        assert rows == [(1, 'a'), (2, 'b')]
+
+    def test_transaction_returns_fn_result(self, tmp_duckdb_path):
+        """[M1-F2]/[M1-F3] assign the result of db.transaction(fn) — e.g.
+        `generation_id = db.transaction(_open)`. Returning None here would
+        silently break ~25 downstream call sites."""
+        db = DuckDBConnection.get_instance(tmp_duckdb_path)
+        db.execute("CREATE TABLE tx_test(id INTEGER PRIMARY KEY)")
+
+        def insert_and_return_id(conn):
+            conn.execute("INSERT INTO tx_test VALUES (42)")
+            return 42
+
+        result = db.transaction(insert_and_return_id)
+        assert result == 42
+
+    def test_transaction_rollback_failure_does_not_mask_original_exception(
+        self, tmp_duckdb_path,
+    ):
+        """RA-11: if the ROLLBACK itself raises (e.g. because no transaction
+        is active by the time the except-block runs), that secondary error
+        must be swallowed — the caller must still see the ORIGINAL exception
+        from fn, not DuckDB's "no transaction is active" TransactionException.
+
+        We simulate "no active transaction at ROLLBACK time" by having fn
+        issue its own COMMIT before raising. Real code must never do this
+        (see the module docstring on the `_in_tx` convention) — this is
+        purely to exercise the wrapper's defensive guard around ROLLBACK,
+        proving a failed ROLLBACK can never mask the real error."""
+        db = DuckDBConnection.get_instance(tmp_duckdb_path)
+        db.execute("CREATE TABLE tx_test(id INTEGER PRIMARY KEY)")
+
+        def boom(conn):
+            conn.execute("INSERT INTO tx_test VALUES (1)")
+            conn.execute("COMMIT")  # leaves no active transaction to roll back
+            raise ValueError("original failure")
+
+        with pytest.raises(ValueError, match="original failure"):
+            db.transaction(boom)
+
+    def test_transaction_uses_execute_atomic_lock(self, tmp_duckdb_path):
+        """transaction() must go through execute_atomic (the per-db lock +
+        IOException retry path) rather than opening its own connection —
+        otherwise it loses the multi-writer serialization the rest of the
+        store relies on."""
+        db = DuckDBConnection.get_instance(tmp_duckdb_path)
+        db.execute("CREATE TABLE tx_test(id INTEGER PRIMARY KEY)")
+
+        calls = []
+        original = db.execute_atomic
+
+        def spy(fn):
+            calls.append(fn)
+            return original(fn)
+
+        with patch.object(db, "execute_atomic", side_effect=spy):
+            db.transaction(lambda conn: conn.execute("INSERT INTO tx_test VALUES (1)"))
+
+        assert len(calls) == 1

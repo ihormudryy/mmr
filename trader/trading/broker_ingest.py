@@ -15,12 +15,13 @@ from typing import Any, Callable, Optional
 
 from trader.data.broker_state import (
     BrokerAccountRow,
+    BrokerFillRow,
     BrokerOrderRow,
     BrokerPositionRow,
     BrokerStateStore,
 )
 from trader.domain.events import DomainMutation
-from trader.domain.identity import position_entity_id
+from trader.domain.identity import fill_entity_id, position_entity_id
 from trader.trading.order_correlation import (
     OrderCorrelator,
     OrderObservation,
@@ -76,6 +77,28 @@ class PositionObservation:
     source_timestamp: dt.datetime
 
 
+@dataclass(frozen=True)
+class FillObservation:
+    account_id: str
+    exec_id: str
+    perm_id: int
+    client_order_id: int
+    conid: int
+    side: str
+    quantity: float
+    price: float
+    fill_time: dt.datetime
+    source_timestamp: dt.datetime
+
+
+@dataclass(frozen=True)
+class CommissionObservation:
+    fill: FillObservation
+    commission: float
+    currency: str
+    realized_pnl: Optional[float]
+
+
 def normalize_account_value(av: Any, now: dt.datetime) -> AccountValueObservation:
     return AccountValueObservation(
         account_id=av.account,
@@ -123,6 +146,33 @@ def normalize_portfolio_item(item: Any, now: dt.datetime) -> PositionObservation
         realized_pnl=float(item.realizedPNL) if item.realizedPNL is not None else None,
         daily_pnl=None,
         source_timestamp=now,
+    )
+
+
+def normalize_execution(fill_obj: Any, now: dt.datetime) -> FillObservation:
+    execution, contract = fill_obj.execution, fill_obj.contract
+    reported_time = getattr(execution, "time", None)
+    fill_time = reported_time if getattr(reported_time, "tzinfo", None) else now
+    return FillObservation(
+        account_id=execution.acctNumber,
+        exec_id=execution.execId,
+        perm_id=int(execution.permId or 0),
+        client_order_id=int(execution.orderId or 0),
+        conid=int(contract.conId),
+        side="BUY" if execution.side == "BOT" else "SELL",
+        quantity=float(execution.shares),
+        price=float(execution.price),
+        fill_time=fill_time,
+        source_timestamp=now,
+    )
+
+
+def normalize_commission(fill_obj: Any, report: Any, now: dt.datetime) -> CommissionObservation:
+    return CommissionObservation(
+        fill=normalize_execution(fill_obj, now),
+        commission=float(report.commission),
+        currency=report.currency or "",
+        realized_pnl=_none_if_unset(getattr(report, "realizedPNL", None)),
     )
 
 
@@ -199,7 +249,9 @@ class BrokerIngest:
         self.account_mode = account_mode
         self.session_epoch = session_epoch or uuid.uuid4().hex
         self.clock = clock or (lambda: dt.datetime.now(dt.timezone.utc))
-        self._queue: queue.Queue[AccountValueObservation | PositionObservation | OrderObservation] = queue.Queue()
+        self._queue: queue.Queue[
+            AccountValueObservation | PositionObservation | OrderObservation | FillObservation | CommissionObservation
+        ] = queue.Queue()
         self._ingest_seq = 0
         self._generation: Optional[int] = None
         self._apply_lock = threading.Lock()
@@ -230,6 +282,16 @@ class BrokerIngest:
     def on_order_status(self, trade: Any) -> None:
         observation = normalize_open_order(trade, self.clock())
         if observation.account_id == self.account_id:
+            self._queue.put(observation)
+
+    def on_exec_details(self, _trade: Any, fill: Any) -> None:
+        observation = normalize_execution(fill, self.clock())
+        if observation.account_id == self.account_id:
+            self._queue.put(observation)
+
+    def on_commission_report(self, _trade: Any, fill: Any, report: Any) -> None:
+        observation = normalize_commission(fill, report, self.clock())
+        if observation.fill.account_id == self.account_id:
             self._queue.put(observation)
 
     def start(self) -> None:
@@ -266,7 +328,9 @@ class BrokerIngest:
                 logging.getLogger(__name__).exception("broker ingest batch failed")
 
     def drain_once(self) -> int:
-        batch: list[AccountValueObservation | PositionObservation | OrderObservation] = []
+        batch: list[
+            AccountValueObservation | PositionObservation | OrderObservation | FillObservation | CommissionObservation
+        ] = []
         while True:
             try:
                 batch.append(self._queue.get_nowait())
@@ -277,7 +341,9 @@ class BrokerIngest:
         return len(batch)
 
     def _apply_batch(
-        self, batch: list[AccountValueObservation | PositionObservation | OrderObservation]
+        self, batch: list[
+            AccountValueObservation | PositionObservation | OrderObservation | FillObservation | CommissionObservation
+        ]
     ) -> None:
         with self._apply_lock:
             for record in batch:
@@ -288,7 +354,7 @@ class BrokerIngest:
                     self._apply_record(self.journal.connect(), record)
 
     def _apply_record(
-        self, conn: Any, record: AccountValueObservation | PositionObservation | OrderObservation
+        self, conn: Any, record: AccountValueObservation | PositionObservation | OrderObservation | FillObservation | CommissionObservation
     ) -> None:
         if isinstance(record, AccountValueObservation):
             self._apply_account_value(conn, record)
@@ -296,6 +362,10 @@ class BrokerIngest:
             self._apply_position(conn, record)
         elif isinstance(record, OrderObservation):
             self._apply_order(conn, record)
+        elif isinstance(record, FillObservation):
+            self._apply_fill(conn, record)
+        elif isinstance(record, CommissionObservation):
+            self._apply_commission(conn, record)
         else:
             raise TypeError(f"unknown ingest record: {type(record)!r}")
 
@@ -364,6 +434,7 @@ class BrokerIngest:
         )
         if current is not None and not current.deleted and merged.same_fields(current):
             self.correlator.bind_aliases_in_tx(conn, entity_id, obs)
+            self._resolve_unbound_fills_in_tx(conn, obs, entity_id)
             return entity_id, None
         mutation = DomainMutation(
             event_type="order.updated",
@@ -388,7 +459,123 @@ class BrokerIngest:
     def _resolve_unbound_fills_in_tx(
         self, conn: Any, obs: OrderObservation, entity_id: str
     ) -> None:
+        for fill in self.store.unbound_fills_in_tx(conn, obs.account_id):
+            matches = (
+                (obs.perm_id and fill.perm_id == obs.perm_id)
+                or (
+                    obs.client_order_id
+                    and fill.client_order_id == obs.client_order_id
+                    and fill.session_epoch == self.session_epoch
+                )
+            )
+            if not matches:
+                continue
+            bound = replace(fill, order_entity_id=entity_id, source_timestamp=obs.source_timestamp)
+            mutation = DomainMutation(
+                event_type="fill.updated",
+                entity_type="fill",
+                entity_id=fill_entity_id(fill.account_id, fill.exec_id),
+                operation="upsert",
+                account_id=fill.account_id,
+                source="trader_service",
+                source_timestamp=obs.source_timestamp,
+                correlation_id=None,
+                payload=bound.to_payload(),
+            )
+
+            def write(write_conn: Any, revision: int, row: BrokerFillRow = bound) -> None:
+                self.store.upsert_fill_in_tx(write_conn, replace(row, revision=revision))
+
+            self.journal.mutate(conn, mutation, write)
+
+    def _fill_row(self, conn: Any, obs: FillObservation) -> BrokerFillRow:
+        return BrokerFillRow(
+            account_id=obs.account_id,
+            exec_id=obs.exec_id,
+            order_entity_id=self._resolve_fill_order_in_tx(conn, obs),
+            perm_id=obs.perm_id or None,
+            client_order_id=obs.client_order_id or None,
+            session_epoch=self.session_epoch,
+            conid=obs.conid,
+            side=obs.side,
+            quantity=obs.quantity,
+            price=obs.price,
+            commission=None,
+            commission_currency=None,
+            realized_pnl=None,
+            fill_time=obs.fill_time,
+            revision=0,
+            source_timestamp=obs.source_timestamp,
+        )
+
+    def _resolve_fill_order_in_tx(self, conn: Any, obs: FillObservation) -> Optional[str]:
+        if obs.perm_id:
+            entity = self.store.find_order_by_alias_in_tx(
+                conn, "perm_id", str(obs.perm_id), obs.account_id, ""
+            )
+            if entity:
+                return entity
+        if obs.client_order_id:
+            return self.store.find_order_by_alias_in_tx(
+                conn,
+                "client_order_id",
+                str(obs.client_order_id),
+                obs.account_id,
+                self.session_epoch,
+            )
         return None
+
+    def _apply_fill(self, conn: Any, obs: FillObservation) -> Any | None:
+        if self.store.get_fill_in_tx(conn, obs.account_id, obs.exec_id) is not None:
+            return None
+        row = self._fill_row(conn, obs)
+        mutation = DomainMutation(
+            event_type="fill.received",
+            entity_type="fill",
+            entity_id=fill_entity_id(obs.account_id, obs.exec_id),
+            operation="upsert",
+            account_id=obs.account_id,
+            source="trader_service",
+            source_timestamp=obs.source_timestamp,
+            correlation_id=None,
+            payload=row.to_payload(),
+        )
+
+        def write(write_conn: Any, revision: int) -> None:
+            self.store.upsert_fill_in_tx(write_conn, replace(row, revision=revision))
+
+        return self.journal.mutate(conn, mutation, write)
+
+    def _apply_commission(self, conn: Any, obs: CommissionObservation) -> Any | None:
+        self._apply_fill(conn, obs.fill)
+        current = self.store.get_fill_in_tx(conn, obs.fill.account_id, obs.fill.exec_id)
+        if current is None:
+            raise RuntimeError("fill was not persisted before commission update")
+        revised = replace(
+            current,
+            commission=obs.commission,
+            commission_currency=obs.currency,
+            realized_pnl=obs.realized_pnl,
+            source_timestamp=obs.fill.source_timestamp,
+        )
+        if revised.same_fields(current):
+            return None
+        mutation = DomainMutation(
+            event_type="fill.updated",
+            entity_type="fill",
+            entity_id=fill_entity_id(obs.fill.account_id, obs.fill.exec_id),
+            operation="upsert",
+            account_id=obs.fill.account_id,
+            source="trader_service",
+            source_timestamp=obs.fill.source_timestamp,
+            correlation_id=None,
+            payload=revised.to_payload(),
+        )
+
+        def write(write_conn: Any, revision: int) -> None:
+            self.store.upsert_fill_in_tx(write_conn, replace(revised, revision=revision))
+
+        return self.journal.mutate(conn, mutation, write)
 
     def _apply_position(self, conn: Any, obs: PositionObservation) -> None:
         current = self.store.get_position_in_tx(conn, obs.account_id, obs.conid)
@@ -437,6 +624,6 @@ class BrokerIngest:
         self.journal.mutate(conn, mutation, write)
 
     def _stage(
-        self, ingest_seq: int, record: AccountValueObservation | PositionObservation | OrderObservation
+        self, ingest_seq: int, record: AccountValueObservation | PositionObservation | OrderObservation | FillObservation | CommissionObservation
     ) -> None:
         raise NotImplementedError("broker-sync staging lands in Task 5")

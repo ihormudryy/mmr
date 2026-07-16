@@ -109,25 +109,38 @@ class TestMMRConfig:
         assert config.typed_rpc.command_port == 42102
         assert config.typed_rpc.feed_port == 42103
         assert config.typed_rpc.service_hmac_key_file == ''
+        # Safe loopback default -- Compose's `trader` overrides to 0.0.0.0.
+        assert config.typed_rpc.address == 'tcp://127.0.0.1'
         assert config.unsafe_legacy_rpc is False
 
     def test_typed_rpc_yaml_overrides(self, tmp_path):
         cfg = tmp_path / "cfg.yaml"
         cfg.write_text(
+            "typed_bind_address: tcp://0.0.0.0\n"
             "typed_query_port: 51101\n"
             "typed_command_port: 51102\n"
             "typed_feed_port: 51103\n"
             "service_hmac_key_file: /run/secrets/service_hmac.key\n"
         )
         config = MMRConfig.from_yaml(str(cfg))
+        assert config.typed_rpc.address == 'tcp://0.0.0.0'
         assert config.typed_rpc.query_port == 51101
         assert config.typed_rpc.command_port == 51102
         assert config.typed_rpc.feed_port == 51103
         assert config.typed_rpc.service_hmac_key_file == '/run/secrets/service_hmac.key'
 
+    def test_typed_bind_address_env_override(self, test_config_file, monkeypatch):
+        # G0 Task 5: the Compose `trader` service sets TYPED_BIND_ADDRESS so
+        # the typed ROUTER sockets bind all interfaces (0.0.0.0), making the
+        # loopback host-publish and cross-container reach work. Env must win.
+        monkeypatch.setenv('TYPED_BIND_ADDRESS', 'tcp://0.0.0.0')
+        config = MMRConfig.from_yaml(test_config_file)
+        assert config.typed_rpc.address == 'tcp://0.0.0.0'
+
     def test_typed_rpc_ports_in_flat_dict(self, test_config_file):
         config = MMRConfig.from_yaml(test_config_file)
         flat = config.to_flat_dict()
+        assert flat['typed_bind_address'] == 'tcp://127.0.0.1'
         assert flat['typed_query_port'] == 42101
         assert flat['typed_command_port'] == 42102
         assert flat['typed_feed_port'] == 42103

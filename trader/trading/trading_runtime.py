@@ -77,6 +77,7 @@ class Trader():
                  paper_trading: bool = False,
                  simulation: bool = False,
                  require_proposal_approval: bool = False,
+                 typed_bind_address: str = 'tcp://127.0.0.1',
                  typed_query_port: int = 42101,
                  typed_command_port: int = 42102,
                  typed_feed_port: int = 42103,
@@ -102,6 +103,14 @@ class Trader():
         # production's ONLY RPC boundary (see connect()). The legacy
         # dill/msgpack RPCServer is gated behind `unsafe_legacy_rpc` AND
         # `simulation` both being True (validate_rpc_mode enforces this).
+        # The interface the typed ROUTER sockets bind to. Default loopback
+        # (safe for local/non-Compose); the Compose `trader` service sets
+        # TYPED_BIND_ADDRESS=tcp://0.0.0.0 so the published ports and
+        # cross-container peers actually reach a listening socket. Without
+        # threading this through, the servers inherited TypedRpcServer's own
+        # tcp://127.0.0.1 default and the published 42101/42102 refused all
+        # connections (G0 Task 5 fix).
+        self.typed_bind_address = typed_bind_address
         self.typed_query_port = typed_query_port
         self.typed_command_port = typed_command_port
         self.typed_feed_port = typed_feed_port
@@ -307,6 +316,7 @@ class Trader():
             production_registry = build_production_registry(self, self.typed_authenticator)
             self.typed_query_server = TypedRpcServer(
                 'query', production_registry, self.typed_authenticator,
+                address=self.typed_bind_address,
                 port=self.typed_query_port,
             )
             # Command and feed registries are intentionally empty for now --
@@ -317,10 +327,12 @@ class Trader():
             # forward and doesn't change shape later.
             self.typed_command_server = TypedRpcServer(
                 'command', TypedRpcRegistry(), self.typed_authenticator,
+                address=self.typed_bind_address,
                 port=self.typed_command_port,
             )
             self.typed_feed_server = TypedRpcServer(
                 'feed', TypedRpcRegistry(), self.typed_authenticator,
+                address=self.typed_bind_address,
                 port=self.typed_feed_port,
             )
 

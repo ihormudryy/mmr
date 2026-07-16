@@ -9,46 +9,16 @@ env: TRADER_CHECK=False
 health_check_eval:
   - "exec('from trader.tools.trader_check import health_check') or health_check('~/.config/mmr/trader.yaml')"
 jobs:
-    - name: data_service
-      description: historical data download service
-      command: python3
-      arguments: -m trader.data_service
-      start: "* * * * *"
-      start_on_pycron_start: True
-      restart_if_found: False
-      restart_if_finished: False
-      delay: 5
-    - name: trader_service
-      description: service that abstracts over and interfaces with Interactive Brokers
-      command: python3
-      arguments: -m trader.trader_service
-      start: "* * * * *"
-      start_on_pycron_start: True
-      restart_if_found: True
-      restart_if_finished: True
-      delay: 10
-    - name: strategy_service
-      description: service that loads, hosts and executes trading strategies and algorithms
-      command: python3
-      arguments: -m trader.strategy_service
-      start: "* * * * *"
-      start_on_pycron_start: True
-      restart_if_found: True
-      restart_if_finished: True
-      depends_on:
-        - trader_service
-      delay: 15
-    - name: web_dashboard
-      description: read-only web dashboard (currencies, positions, strategies, proposals) on port 7424
-      command: python3
-      arguments: -m web.app
-      start: "* * * * *"
-      start_on_pycron_start: True
-      restart_if_found: True
-      restart_if_finished: True
-      depends_on:
-        - trader_service
-      delay: 20
+    # NOTE (G0 Task 5): data_service / trader_service / strategy_service /
+    # web_dashboard used to be declared here as pseudo-cron "jobs" started
+    # via start_on_pycron_start, even though nothing in the Docker image
+    # actually invoked pycron.pycron (start_mmr.sh launched these as plain
+    # child processes; the pycron.yaml declarations were dead config). Each
+    # of those four long-lived processes is now its own supervised Compose
+    # service (data/trader/strategy/dashboard in docker-compose.yml) with
+    # its own restart policy -- pycron itself is ALSO now a real Compose
+    # service ("scheduler") that owns ONLY the one-shot cron jobs below.
+    # See tests/test_compose_topology.py for the enforced invariant.
     # ---- declarative data refreshes (driven by data_refresh.yaml) ----
     # One-shot subprocesses on a schedule. Each cron entry calls
     # `mmr data refresh JOB [JOB ...]` with the job names declared in

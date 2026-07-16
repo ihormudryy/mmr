@@ -6,6 +6,36 @@
 # CLI mode:    verifies services are running, then launches mmr_cli
 #
 
+# ─── Modern Bash Guard ───────────────────────────────────────────────────────
+# The fail-fast child supervision below uses `wait -n <pids...>` (a specific
+# PID list, not just bare `wait -n`), which needs Bash >= 5.1. Docker's image
+# ships Bash 5.2, but stock macOS /bin/bash is 3.2 (Apple froze it pre-GPLv3)
+# even though a modern bash is almost always installed via Homebrew. Re-exec
+# under a newer bash if one is available rather than silently degrading —
+# this script already goes out of its way elsewhere (check_tcp_port) to
+# paper over exactly this kind of macOS/Linux/BSD divergence.
+if [ -z "${MMR_BASH_REEXEC:-}" ]; then
+    _need_reexec=false
+    if [ -z "${BASH_VERSINFO:-}" ] || [ "${BASH_VERSINFO[0]}" -lt 5 ] \
+        || { [ "${BASH_VERSINFO[0]}" -eq 5 ] && [ "${BASH_VERSINFO[1]}" -lt 1 ]; }; then
+        _need_reexec=true
+    fi
+    if [ "$_need_reexec" = true ]; then
+        for _candidate in /opt/homebrew/bin/bash /usr/local/bin/bash; do
+            if [ -x "$_candidate" ]; then
+                MMR_BASH_REEXEC=1 exec "$_candidate" "$0" "$@"
+            fi
+        done
+        echo "Warning: bash ${BASH_VERSINFO[0]:-?}.${BASH_VERSINFO[1]:-?} detected;" \
+             "fail-fast child supervision needs >= 5.1 and no newer bash was" \
+             "found (checked /opt/homebrew/bin/bash, /usr/local/bin/bash)." >&2
+        echo "  Install one: brew install bash" >&2
+        echo "  Falling back to portable (polling) child supervision." >&2
+        MMR_PORTABLE_WAIT=1
+    fi
+    unset _need_reexec _candidate
+fi
+
 set -e
 
 MMR_DIR="$(cd "$(dirname "$0")"; pwd)"
@@ -22,6 +52,7 @@ NEWS_DIR="${NEWS_DIR:-$HOME/dev/news}"
 DATA_PID=""
 TRADER_PID=""
 STRATEGY_PID=""
+WEB_PID=""
 
 # ─── Colors ──────────────────────────────────────────────────────────────────
 # Enable colors on a TTY, or when FORCE_COLOR=1; disable when NO_COLOR is set.
@@ -587,6 +618,62 @@ fi
 sed -i.bak "s/^trading_mode:.*/trading_mode: ${TRADING_MODE}/" "$TRADER_CONFIG"
 rm -f "${TRADER_CONFIG}.bak"
 
+# ─── HMAC Key Provisioning (local/offline convenience ONLY) ─────────────────
+#
+# G0 Task 4 made trader_service hard-refuse to start without a valid
+# service_hmac_key_file (mode 0600, >= 32 bytes) -- correct for production,
+# but config_defaults/trader.yaml ships `service_hmac_key_file: ''` (there's
+# no safe default secret to check in), so a bare `./start_mmr.sh --paper` on
+# a fresh checkout could no longer boot at all. This is scoped to local/dev
+# convenience by CONSTRUCTION, not by a flag that production could
+# accidentally inherit: the production container path never runs this
+# function at all — each Compose service's `command:` invokes
+# `python -m trader.<x>_service` directly (see docker-compose.yml),
+# bypassing this script entirely. Only start_mmr.sh's own hybrid/host and
+# --docker-wrapper convenience paths call this. docker-entrypoint.sh (the
+# actual production entrypoint) does NOT auto-generate a key — a missing/
+# invalid key there still hard-fails exactly as Task 4 intended.
+#
+# Deliberately minimal: only acts when the key is unset or the file is
+# missing (per the brief). It does not validate/repair an existing key's
+# mode or length — a key that exists but is otherwise malformed still fails
+# loudly via trader_service's own load_service_hmac_key() check, which is
+# the correct behavior (silently regenerating a key someone deliberately
+# placed there would be surprising).
+ensure_service_hmac_key() {
+    local yaml_file="$1"
+    local current_key
+    current_key=$(
+        grep -E '^[[:space:]]*service_hmac_key_file[[:space:]]*:' "$yaml_file" 2>/dev/null \
+            | head -n1 \
+            | sed -E 's/^[[:space:]]*service_hmac_key_file[[:space:]]*:[[:space:]]*//' \
+            | sed -E "s/^['\"]//; s/['\"][[:space:]]*\$//" \
+            | sed -E 's/[[:space:]]+$//'
+    )
+    # Expand a leading ~ so the existence check below is accurate.
+    local expanded_key="${current_key/#\~/$HOME}"
+
+    if [ -n "$current_key" ] && [ -f "$expanded_key" ]; then
+        return 0   # already provisioned — leave it alone
+    fi
+
+    local key_dir
+    key_dir="$(dirname "$yaml_file")"
+    mkdir -p "$key_dir"
+    local key_path="$key_dir/service_hmac.key"
+    if [ ! -f "$key_path" ]; then
+        ( umask 177 && head -c 48 /dev/urandom > "$key_path" )
+        chmod 600 "$key_path"
+        warn "auto-provisioned service_hmac_key_file for local/paper use: $key_path"
+        info "  (production never auto-generates this — see docker-entrypoint.sh)"
+    fi
+
+    sed -i.bak "s|^service_hmac_key_file:.*|service_hmac_key_file: ${key_path}|" "$yaml_file"
+    rm -f "${yaml_file}.bak"
+}
+
+ensure_service_hmac_key "$TRADER_CONFIG"
+
 # ─── Helper Functions ────────────────────────────────────────────────────────
 
 # Portable TCP-port probe with a ~1s budget.
@@ -612,38 +699,47 @@ check_tcp_port() {
 
 # ─── Signal Handling ─────────────────────────────────────────────────────────
 
-cleanup() {
-    echo ""
-    step "Shutting down services..."
-    # Send SIGINT first (services handle it gracefully)
-    for pid in $STRATEGY_PID $TRADER_PID $DATA_PID; do
+# Stop the given PIDs: SIGINT (graceful), wait up to 10s, then SIGKILL any
+# survivors, then reap them so they don't linger as zombies. Shared by both
+# the SIGINT/SIGTERM handler below and the fail-fast child-death path
+# further down — same shutdown sequence either way, just a different reason
+# for triggering it.
+stop_pids() {
+    local pid
+    for pid in "$@"; do
         if [ -n "$pid" ] && kill -0 "$pid" 2>/dev/null; then
             kill -INT "$pid" 2>/dev/null || true
         fi
     done
-    # Give them up to 10 seconds to exit gracefully
-    WAIT=0
-    while [ $WAIT -lt 10 ]; do
-        ALL_DONE=true
-        for pid in $STRATEGY_PID $TRADER_PID $DATA_PID; do
+    local elapsed=0
+    while [ $elapsed -lt 10 ]; do
+        local all_done=true
+        for pid in "$@"; do
             if [ -n "$pid" ] && kill -0 "$pid" 2>/dev/null; then
-                ALL_DONE=false
+                all_done=false
             fi
         done
-        if [ "$ALL_DONE" = true ]; then
+        if [ "$all_done" = true ]; then
             break
         fi
         sleep 1
-        WAIT=$((WAIT + 1))
+        elapsed=$((elapsed + 1))
     done
-    # Force kill anything still alive
-    for pid in $STRATEGY_PID $TRADER_PID $DATA_PID; do
+    for pid in "$@"; do
         if [ -n "$pid" ] && kill -0 "$pid" 2>/dev/null; then
             warn "force killing PID $pid"
             kill -9 "$pid" 2>/dev/null || true
         fi
     done
-    wait 2>/dev/null || true
+    for pid in "$@"; do
+        [ -n "$pid" ] && wait "$pid" 2>/dev/null || true
+    done
+}
+
+cleanup() {
+    echo ""
+    step "Shutting down services..."
+    stop_pids "$STRATEGY_PID" "$TRADER_PID" "$DATA_PID" "$WEB_PID"
     ok "all services stopped"
     exit 0
 }
@@ -991,30 +1087,95 @@ info "Run './start_mmr.sh --cli' in another terminal for the CLI"
 info "IB Gateway VNC: vnc://localhost:5901"
 echo ""
 
-# ─── Wait for Children ───────────────────────────────────────────────────────
+# ─── Wait for Children (fail-fast) ───────────────────────────────────────────
+#
+# Any mandatory child dying now terminates start_mmr.sh non-zero, immediately,
+# after cleanly stopping its siblings — replacing the old behavior of
+# logging a warning and continuing to poll, only exiting once ALL FOUR had
+# already died on their own (so a supervisor watching this script's exit
+# code had no fast signal that e.g. trader_service alone had crashed). A
+# clean SIGINT/SIGTERM shutdown is unaffected and still exits 0 via the
+# `cleanup()` trap above (trapped signals interrupt a blocking `wait`, and
+# `cleanup()`'s own `exit 0` runs before control ever returns to the code
+# below).
+PID_LIST="$DATA_PID:data_service $TRADER_PID:trader_service $STRATEGY_PID:strategy_service $WEB_PID:web_dashboard"
 
-# Monitor child processes — report if any die unexpectedly
-while true; do
-    for pid_info in "$DATA_PID:data_service" "$TRADER_PID:trader_service" "$STRATEGY_PID:strategy_service" "$WEB_PID:web_dashboard"; do
+if [ "${MMR_PORTABLE_WAIT:-0}" != "1" ]; then
+    # Fast path: bash >= 5.1 (guaranteed by the re-exec guard at the top of
+    # this script, unless no modern bash exists anywhere on this host).
+    # `wait -n <pids...>` blocks until the FIRST of the listed jobs exits
+    # and returns its exit status directly -- no polling needed.
+    #
+    # Filter out empty entries: on a partial launch (e.g. web_dashboard
+    # never started, so WEB_PID=""), an empty element in the array makes
+    # `wait -n` see an invalid pid argument and return 127 IMMEDIATELY --
+    # a false "a child died" before anything actually has. Only pass the
+    # PIDs that were really assigned.
+    ALL_PIDS=()
+    for _p in "$DATA_PID" "$TRADER_PID" "$STRATEGY_PID" "$WEB_PID"; do
+        [ -n "$_p" ] && ALL_PIDS+=("$_p")
+    done
+    if wait -n "${ALL_PIDS[@]}" 2>/dev/null; then
+        FIRST_EXIT=0
+    else
+        FIRST_EXIT=$?
+    fi
+
+    DEAD_PID=""
+    DEAD_NAME=""
+    for pid_info in $PID_LIST; do
         pid="${pid_info%%:*}"
         name="${pid_info##*:}"
         if [ -n "$pid" ] && ! kill -0 "$pid" 2>/dev/null; then
-            wait "$pid" 2>/dev/null || true
-            EXIT_CODE=$?
-            echo ""
-            fail "$name (PID $pid) exited with code $EXIT_CODE"
-            # Clear the PID so we don't report it again
-            case "$name" in
-                data_service)     DATA_PID="" ;;
-                trader_service)   TRADER_PID="" ;;
-                strategy_service) STRATEGY_PID="" ;;
-            esac
-            # If all services are dead, exit
-            if [ -z "$DATA_PID" ] && [ -z "$TRADER_PID" ] && [ -z "$STRATEGY_PID" ]; then
-                fail "all services have exited"
-                exit 1
-            fi
+            DEAD_PID="$pid"
+            DEAD_NAME="$name"
+            break
         fi
     done
-    sleep 2
+else
+    # Portable fallback (no bash >= 5.1 available on this host at all): same
+    # fail-fast contract, implemented with a plain `kill -0` poll instead of
+    # an event-driven wait, so it still works under e.g. macOS's stock
+    # /bin/bash 3.2.
+    DEAD_PID=""
+    DEAD_NAME=""
+    FIRST_EXIT=1
+    while [ -z "$DEAD_PID" ]; do
+        for pid_info in $PID_LIST; do
+            pid="${pid_info%%:*}"
+            name="${pid_info##*:}"
+            if [ -n "$pid" ] && ! kill -0 "$pid" 2>/dev/null; then
+                DEAD_PID="$pid"
+                DEAD_NAME="$name"
+                if wait "$pid" 2>/dev/null; then
+                    FIRST_EXIT=0
+                else
+                    FIRST_EXIT=$?
+                fi
+                break
+            fi
+        done
+        [ -z "$DEAD_PID" ] && sleep 2
+    done
+fi
+
+echo ""
+fail "$DEAD_NAME (PID $DEAD_PID) exited with code $FIRST_EXIT"
+step "Stopping remaining services..."
+
+REMAINING=""
+for pid_info in $PID_LIST; do
+    pid="${pid_info%%:*}"
+    if [ -n "$pid" ] && [ "$pid" != "$DEAD_PID" ] && kill -0 "$pid" 2>/dev/null; then
+        REMAINING="$REMAINING $pid"
+    fi
 done
+
+if [ -n "$REMAINING" ]; then
+    # shellcheck disable=SC2086 -- intentional word-splitting of a
+    # space-separated PID list built above.
+    stop_pids $REMAINING
+fi
+
+ok "remaining services stopped"
+exit "$FIRST_EXIT"

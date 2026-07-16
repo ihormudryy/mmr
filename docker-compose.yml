@@ -1,13 +1,109 @@
 name: mmr
 
+# G0 Task 5: one supervisor per long-lived process.
+#
+# Previously a single `mmr` container ran data_service/trader_service/
+# strategy_service/web_dashboard as plain child processes of start_mmr.sh
+# (PID 1), with pycron's job list for those same four processes never
+# actually invoked by anything (dead config -- start_mmr.sh never execs
+# pycron.pycron). Restarting or debugging one process meant restarting (or
+# exec-ing into) all of them, and a single OOM/crash could take the whole
+# stack down together.
+#
+# Now each long-lived process is its OWN Compose service, all built from the
+# SAME image (one `build:` block, reused via the `mmr-build` anchor) with a
+# per-service `command:`. `scheduler` is the one place pycron now actually
+# runs, and it owns ONLY the one-shot cron jobs (data refresh, backup) --
+# see config_defaults/pycron.yaml.
+#
+# Hardening applied uniformly: non-root `user: trader`, `read_only: true`
+# root filesystem (writable paths are explicit volumes/tmpfs only -- see the
+# per-service comments below), a healthcheck, explicit memory/CPU limits,
+# and the private `mmr-internal` network. Nothing here is published to the
+# host except: dashboard's HTTP port, and the typed query (42101) + command
+# (42102) ports on `trader` -- all three on host 127.0.0.1 only. The typed
+# feed port (42103) and every legacy ZMQ port (42001/42002/42003/42005/42006)
+# stay on the private network and are never host-published, per the G0 plan's
+# global constraints.
+#
+# Cross-container addressing: several services connect OUT to a sibling
+# rather than just binding their own socket (confirmed by reading the
+# construction sites, not assumed): strategy_service subscribes to trader's
+# ticker PubSub and MessageBus, and opens an RPC client to trader's legacy
+# RPC port for resolve_symbol()/the signal->proposal bridge
+# (trader/strategy/strategy_runtime.py); trader_service opens an RPC client
+# to strategy_service's own RPC port (trader/trading/trading_runtime.py).
+# Each service's ZMQ_*_SERVER_ADDRESS below is therefore set to `tcp://0.0.0.0`
+# when that var configures THAT service's own bind, and to the peer
+# container's Compose DNS name (`tcp://trader` / `tcp://strategy`) when it
+# configures an outbound connection -- the same env var name serves both
+# roles depending on which process reads it, and each container gets its own
+# independent value.
+#
+# KNOWN GAP (pre-existing, not introduced or fixable here -- see the G0
+# Task 5 report): trader_service's legacy RPCServer (port 42001) is only
+# constructed in offline simulation with `unsafe_legacy_rpc: true` (G0
+# Task 4). In a real production posture neither flag is set, so
+# strategy_service's `trader_client` (resolve_symbol calls, the
+# auto_execute:propose signal bridge) will get ConnectionError/timeout
+# against a live trader_service until [M1-F3] adds typed command/query
+# equivalents. This is an extension of Task 4's own flagged concern #1, not
+# a regression from this task.
+
+x-mmr-build: &mmr-build
+  context: .
+  dockerfile: Dockerfile
+
+x-mmr-common-env: &mmr-common-env
+  TRADER_CONFIG: /home/trader/.config/mmr/trader.yaml
+  TZ: ${TIME_ZONE:-America/New_York}
+  TRADING_MODE: ${TRADING_MODE:-paper}
+  IB_SERVER_ADDRESS: ib-gateway
+  IB_ACCOUNT: ${IB_ACCOUNT:-}
+  # ~/dev/news scraper service runs on the HOST (separate stack); only
+  # consumed by the `mmr` CLI (news/ideas --news), not by any of these
+  # long-lived services, but kept available for anyone `docker compose exec`
+  # -ing in to run CLI commands.
+  NEWS_SERVICE_URL: ${NEWS_SERVICE_URL:-http://host.docker.internal:8089}
+  MASSIVE_API_KEY: ${MASSIVE_API_KEY:-}
+  TWELVEDATA_API_KEY: ${TWELVEDATA_API_KEY:-}
+  # Skip writing .pyc under the read-only, editable-installed source tree
+  # (harmless if it happens -- CPython swallows bytecode-cache write
+  # failures -- but this avoids relying on that silently-swallowed path).
+  PYTHONDONTWRITEBYTECODE: "1"
+
+x-mmr-hardening: &mmr-hardening
+  # One shared image tag across all five services: `docker compose build`
+  # builds it exactly once (identical build context/Dockerfile + identical
+  # tag), and every service's own `command:` (below) selects which process
+  # that same image runs -- this is the literal "one built image" the brief
+  # asks for, not just five images that happen to be built the same way.
+  image: mmr:latest
+  restart: unless-stopped
+  user: trader
+  read_only: true
+  # /home/trader/.tmp and /home/trader/.cache are where TMPDIR and numba's/
+  # pip's caches point (see Dockerfile ENV TMPDIR=$HOME/.tmp) -- tmpfs all
+  # three so nothing under the read-only root needs a write and silently
+  # (or loudly) fails.
+  tmpfs:
+    - /tmp
+    - /home/trader/.tmp
+    - /home/trader/.cache
+  networks:
+    - mmr-internal
+
 services:
   ib-gateway:
     image: ghcr.io/gnzsnz/ib-gateway:latest
-    # unless-stopped so IB Gateway comes back after a host reboot / Docker restart
-    # (the mmr container depends on it). OOM kills still surface on the last-exit
-    # state (RestartCount / OOMKilled=true); availability wins for an always-on
-    # trading stack. (Was `on-failure` to keep the OOM signal visible.)
+    # unless-stopped so IB Gateway comes back after a host reboot / Docker
+    # restart (the mmr services depend on it). OOM kills still surface on
+    # the last-exit state (RestartCount / OOMKilled=true); availability
+    # wins for an always-on trading stack. (Was `on-failure` to keep the
+    # OOM signal visible.)
     restart: unless-stopped
+    networks:
+      - mmr-internal
     # IB Gateway itself (Java + XVfb + VNC) sits around 600–800 MB steady
     # state. Capping at 1.5G gives headroom for the JVM to GC without
     # letting it run away and starve the rest of the VM.
@@ -45,80 +141,233 @@ services:
       # VNC for viewing IB Gateway GUI
       - "127.0.0.1:5901:5900"
 
-  mmr:
-    build:
-      context: .
-      dockerfile: Dockerfile
-    # unless-stopped so the live trading stack survives a host reboot / Docker
-    # Desktop restart / sleep — critical for an always-on trading system that
-    # must be up for market opens, nightly backups, and armed strategies.
-    # Trade-off vs the old `on-failure`: an OOM kill now auto-restarts (visible as
-    # a rising RestartCount / State.OOMKilled=true on the last exit) rather than
-    # staying stopped. At ~3% steady-state memory that risk is remote, and
-    # availability wins for this workload. (History: on-failure was chosen so OOM
-    # kills surfaced as State.OOMKilled=true after the 2026-04-20 fix.)
-    restart: unless-stopped
-    # trader_service + strategy_service + data_service + pycron together
-    # run around 1.6–2.2 GB RSS with a full universe loaded. 4 GB leaves
-    # clear headroom and still protects the Podman/Docker VM from being
-    # starved by a single runaway.
-    mem_limit: 24g
-    memswap_limit: 24g
+  # ── data: historical data downloader (trader/data_service.py) ──────────
+  # Writes OHLCV bars to history_duckdb_path -- needs the DB volume despite
+  # the brief naming `trader` as the primary owner (confirmed by reading
+  # DataService.__init__ / its TickStorage/DuckDBDataStore construction).
+  data:
+    <<: *mmr-hardening
+    build: *mmr-build
+    command: ["python", "-m", "trader.data_service"]
     depends_on:
       - ib-gateway
+    mem_limit: 2g
+    cpus: 1.0
     environment:
-      TRADER_CONFIG: /home/trader/.config/mmr/trader.yaml
-      TZ: ${TIME_ZONE:-America/New_York}
-      # IB connection — entrypoint sets IB_SERVER_PORT from TRADING_MODE
-      TRADING_MODE: ${TRADING_MODE:-paper}
-      IB_SERVER_ADDRESS: ib-gateway
-      IB_ACCOUNT: ${IB_ACCOUNT:-}
-      # ~/dev/news scraper service runs on the HOST (separate stack);
-      # host.docker.internal lets the container reach the host loopback.
-      # Override with NEWS_SERVICE_URL=http://... for a remote instance.
-      NEWS_SERVICE_URL: ${NEWS_SERVICE_URL:-http://host.docker.internal:8089}
-      # Bind ZMQ to 0.0.0.0 so host can reach services via port mapping
+      <<: *mmr-common-env
+      ZMQ_DATA_RPC_SERVER_ADDRESS: tcp://0.0.0.0
+    volumes:
+      - ${HOME}/.config/mmr:/home/trader/.config/mmr
+      - mmr_db_data:/home/trader/.local/share/mmr/data
+      - ${HOME}/.local/share/mmr/logs:/home/trader/.local/share/mmr/logs
+    healthcheck:
+      test: ["CMD", "python3", "-c", "import socket; socket.create_connection(('127.0.0.1', 42003), timeout=3).close()"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 20s
+
+  # ── trader: IB trading runtime (trader/trader_service.py) ───────────────
+  # Owns duckdb_path (events/proposals/groups/universes) -- the database
+  # volume the brief calls out explicitly. Also the ONLY service that
+  # publishes anything besides dashboard: the typed query/command ports,
+  # loopback-only. The typed feed port (42103) is bound but never published.
+  trader:
+    <<: *mmr-hardening
+    build: *mmr-build
+    command: ["python", "-m", "trader.trader_service"]
+    depends_on:
+      - ib-gateway
+    mem_limit: 4g
+    cpus: 2.0
+    environment:
+      <<: *mmr-common-env
+      # This service's own socket binds -- 0.0.0.0 so sibling containers on
+      # mmr-internal can reach them by the "trader" DNS name.
       ZMQ_RPC_SERVER_ADDRESS: tcp://0.0.0.0
       ZMQ_PUBSUB_SERVER_ADDRESS: tcp://0.0.0.0
-      ZMQ_STRATEGY_RPC_SERVER_ADDRESS: tcp://0.0.0.0
       ZMQ_MESSAGEBUS_SERVER_ADDRESS: tcp://0.0.0.0
-      ZMQ_DATA_RPC_SERVER_ADDRESS: tcp://0.0.0.0
-      # Data-feed API keys. Forwarded from the host shell (or from
-      # ~/.config/mmr/secrets.env, sourced by docker.sh / start_mmr.sh
-      # before compose runs). Compose only crosses the host→container
-      # boundary for vars it explicitly references — without these
-      # lines the keys are silently invisible inside the container even
-      # when they are exported on the host. trader/config.py falls back
-      # to os.getenv('MASSIVE_API_KEY' / 'TWELVEDATA_API_KEY') when the
-      # corresponding trader.yaml entry is empty, so the env path is
-      # the canonical one.
-      MASSIVE_API_KEY: ${MASSIVE_API_KEY:-}
-      TWELVEDATA_API_KEY: ${TWELVEDATA_API_KEY:-}
+      # The typed query/command/feed ROUTER sockets bind here. Must be
+      # 0.0.0.0, NOT the loopback default -- otherwise they'd bind the
+      # container's loopback only, and Docker's `127.0.0.1:42101:42101`
+      # host-forward (which lands on the container's eth0) plus any
+      # cross-container `trader:4210x` connection would both be refused.
+      # Threaded into TypedRpcServer(address=...) via
+      # trading_runtime.py's typed_bind_address (G0 Task 5 fix). Feed
+      # (42103) binds 0.0.0.0 too but is never host-published (see ports).
+      TYPED_BIND_ADDRESS: tcp://0.0.0.0
+      # Outbound: trader opens an RPCClient to strategy_service's own RPC
+      # server (trading_runtime.py's self.zmq_strategy_client) -- must
+      # target the strategy container by name, not 0.0.0.0.
+      ZMQ_STRATEGY_RPC_SERVER_ADDRESS: tcp://strategy
     ports:
-      # pycron web
-      - "127.0.0.1:8081:8081"
-      # MMR dashboard (web/app.py)
-      - "127.0.0.1:7424:7424"
-      # ZMQ RPC/PubSub — allows host CLI to talk to services
-      - "127.0.0.1:42001:42001"   # trader_service RPC
-      - "127.0.0.1:42002:42002"   # ticker PubSub
-      - "127.0.0.1:42003:42003"   # data_service RPC
-      - "127.0.0.1:42005:42005"   # strategy_service RPC
-      - "127.0.0.1:42006:42006"   # strategy MessageBus
+      - "127.0.0.1:42101:42101"   # typed query
+      - "127.0.0.1:42102:42102"   # typed command
+      # typed feed (42103) intentionally NOT published -- private network only
     volumes:
-      # Bind mount for logs/, tws_settings/ — host-visible for tailing/backup
-      - ${HOME}/.local/share/mmr:/home/trader/.local/share/mmr
-      # Named volume for the DuckDB files (overlays the data/ subdir).
-      # Reason: macOS Docker Desktop uses VirtioFS for bind mounts, which has
-      # quirky fsync/mmap semantics for write-heavy single-file DBs. Native
-      # ext4 in the Docker VM is faster and more reliable. Backups: use
-      # `./docker.sh -B [name]` which copies them out to ~/.local/share/mmr/backups/
-      - mmr_db_data:/home/trader/.local/share/mmr/data
-      # Strategy/runtime config lives on the host — single source of truth so
-      # `mmr strategies deploy` (from the host) affects the running service and
-      # the strategy_service's 30s mtime-reload picks up edits without a rebuild.
       - ${HOME}/.config/mmr:/home/trader/.config/mmr
+      - mmr_db_data:/home/trader/.local/share/mmr/data
+      - ${HOME}/.local/share/mmr/logs:/home/trader/.local/share/mmr/logs
+    healthcheck:
+      # Connect via the container's OWN routable hostname (eth0), not
+      # 127.0.0.1: because TYPED_BIND_ADDRESS is 0.0.0.0 the socket accepts
+      # on every interface, so a hostname-resolved connect proves the
+      # published/cross-container surface actually works -- a 127.0.0.1
+      # probe would report healthy even under the loopback-only bind bug
+      # this task fixed (it can't distinguish 0.0.0.0 from 127.0.0.1 binds).
+      test: ["CMD", "python3", "-c", "import socket; socket.create_connection((socket.gethostname(), 42101), timeout=3).close()"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 30s
+
+  # ── strategy: strategy runtime (trader/strategy_service.py) ─────────────
+  # "the strategy-config volume" from the brief is ~/.config/mmr (single
+  # source of truth for strategy_runtime.yaml -- the CLI's `strategies
+  # deploy` and the dashboard's deploy-from-disk route both write there, and
+  # this service's 30s reconciliation loop re-reads it). It ALSO opens
+  # EventStore/ProposalStore/UniverseAccessor/TickStorage directly against
+  # duckdb_path/history_duckdb_path (confirmed in strategy_runtime.py), so
+  # it needs the DB volume too, not just config.
+  strategy:
+    <<: *mmr-hardening
+    build: *mmr-build
+    command: ["python", "-m", "trader.strategy_service"]
+    depends_on:
+      - ib-gateway
+      - trader
+    mem_limit: 2g
+    cpus: 1.0
+    environment:
+      <<: *mmr-common-env
+      # This service's own RPC server bind.
+      ZMQ_STRATEGY_RPC_SERVER_ADDRESS: tcp://0.0.0.0
+      # Outbound: subscribes to trader's ticker PubSub and MessageBus, and
+      # opens an RPC client to trader's legacy RPC port (resolve_symbol /
+      # the signal->proposal bridge -- see the top-of-file KNOWN GAP note).
+      ZMQ_PUBSUB_SERVER_ADDRESS: tcp://trader
+      ZMQ_MESSAGEBUS_SERVER_ADDRESS: tcp://trader
+      ZMQ_RPC_SERVER_ADDRESS: tcp://trader
+    volumes:
+      - ${HOME}/.config/mmr:/home/trader/.config/mmr
+      - mmr_db_data:/home/trader/.local/share/mmr/data
+      - ${HOME}/.local/share/mmr/logs:/home/trader/.local/share/mmr/logs
+    healthcheck:
+      test: ["CMD", "python3", "-c", "import socket; socket.create_connection(('127.0.0.1', 42005), timeout=3).close()"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 30s
+
+  # ── dashboard: read-only web UI (web/app.py) ─────────────────────────────
+  # Deliberately NO database volume -- must reach trading data only via RPC
+  # to trader_service, never the DB file directly (see the KNOWN GAP note
+  # below and in the Task 5 report: two existing dashboard features --
+  # the Proposals list and the Watchlists tab -- currently open duckdb_path
+  # directly via the SDK/UniverseAccessor and WILL show error banners under
+  # this constraint until a follow-up adds RPC-backed equivalents; every
+  # other section degrades independently per the dashboard's existing
+  # per-section try/except design, so this is a bounded, visible failure,
+  # not a silent one).
+  #
+  # RPC ADDRESSING + PRODUCTION LIMITATION (G0 Task 5 fix + known sequencing
+  # gap): the dashboard's SDK opens a LEGACY dill/msgpack RPCClient to
+  # trader_service (sdk.py). ZMQ_RPC_SERVER_ADDRESS below points it at the
+  # `trader` container over the private network (the SDK now honours this env
+  # var -- previously it read only the shared trader.yaml's loopback and so
+  # targeted its own empty loopback). BUT that legacy RPC server is bound by
+  # trader_service ONLY in offline simulation with unsafe_legacy_rpc=true (G0
+  # Task 4). Against a PRODUCTION-mode trader (the default `command:` above,
+  # no --simulation) the legacy server is never bound, and the SDK is not yet
+  # on the typed transport, so the dashboard is KNOWINGLY NON-FUNCTIONAL until
+  # [M1-F3] migrates the SDK to the authenticated typed query/command sockets.
+  # This is by-design release sequencing (finish G0 before trusting the
+  # command surface), NOT a defect to fix here. In offline-sim / the Task 6
+  # fullstack profile (MMR_FAKE_BROKER) the addressing above makes it work.
+  #
+  # Gets ~/.config/mmr read-write (needed to boot with the real trader.yaml,
+  # and its "deploy strategy from disk" route writes strategy_runtime.yaml)
+  # and a dedicated logs mount -- NOT the broader ~/.local/share/mmr tree,
+  # so a stray write to the (otherwise DB-volume-backed) data/ subdirectory
+  # can't silently create a divergent, empty duckdb file; read_only:true
+  # plus no volume there means any such attempt fails loudly instead.
+  dashboard:
+    <<: *mmr-hardening
+    build: *mmr-build
+    command: ["python", "-m", "web.app"]
+    depends_on:
+      - trader
+    mem_limit: 1g
+    cpus: 0.5
+    environment:
+      <<: *mmr-common-env
+      WEB_PORT: "7424"
+      # Outbound RPC/PubSub to the trader container (see the addressing note
+      # above). No 0.0.0.0 binds here -- the dashboard is a pure client.
+      ZMQ_RPC_SERVER_ADDRESS: tcp://trader
+      ZMQ_PUBSUB_SERVER_ADDRESS: tcp://trader
+    ports:
+      - "127.0.0.1:7424:7424"
+    volumes:
+      - ${HOME}/.config/mmr:/home/trader/.config/mmr
+      - ${HOME}/.local/share/mmr/logs:/home/trader/.local/share/mmr/logs
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://127.0.0.1:7424/healthz"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 15s
+
+  # ── scheduler: pycron, one-shot cron jobs only ───────────────────────────
+  # No long-lived trading process here anymore -- just data-refresh/backup
+  # cron entries (config_defaults/pycron.yaml). Needs the DB volume
+  # read-write (data-refresh jobs write history bars; the backup job reads
+  # both duckdb files) plus the host-mounted backups/ dir (db_backup's
+  # destination, separate from the volume-backed data/) and ~/.config/mmr
+  # (pycron.yaml itself, data_refresh.yaml, trader.yaml).
+  scheduler:
+    <<: *mmr-hardening
+    build: *mmr-build
+    # `pycron` is a plain top-level script directory, not part of the
+    # installed `mmr` distribution (pyproject.toml's packages.find only
+    # includes trader*/web*) -- it has no __init__.py and was historically
+    # invoked as `python3 pycron/pycron.py` from the repo root, never as
+    # `python -m pycron.pycron`. That exact module form (required by this
+    # task's brief) only resolves via Python's implicit namespace-package
+    # lookup, which needs the repo root on sys.path -- `-m` prepends the
+    # CWD, so working_dir must be the repo root (confirmed empirically:
+    # `python -m pycron.pycron --help` fails with ModuleNotFoundError from
+    # the image's default WORKDIR /home/trader, succeeds from
+    # /home/trader/mmr).
+    working_dir: /home/trader/mmr
+    command: ["python", "-m", "pycron.pycron", "--config", "/home/trader/.config/mmr/pycron.yaml"]
+    depends_on:
+      - ib-gateway
+    mem_limit: 2g
+    cpus: 1.0
+    environment:
+      <<: *mmr-common-env
+    volumes:
+      - ${HOME}/.config/mmr:/home/trader/.config/mmr
+      - mmr_db_data:/home/trader/.local/share/mmr/data
+      - ${HOME}/.local/share/mmr/backups:/home/trader/.local/share/mmr/backups
+      - ${HOME}/.local/share/mmr/logs:/home/trader/.local/share/mmr/logs
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://127.0.0.1:8081/"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 15s
+
+networks:
+  mmr-internal:
+    # A private, user-defined bridge network -- NOT Compose's `internal:
+    # true` flag, which would cut off ALL outbound internet access for
+    # every container on it (breaking data_service's Massive/TwelveData
+    # downloads, the scheduler's data-refresh jobs, and IB Gateway's own
+    # upstream connection). "Private" here means "not published to the
+    # host except the three explicit loopback port mappings above" -- the
+    # actual host-exposure control is each service's own `ports:` list.
 
 volumes:
   mmr_db_data:
-

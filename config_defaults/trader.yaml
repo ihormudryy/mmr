@@ -71,6 +71,13 @@ zmq_data_rpc_server_port: 42003
 # >= 32 bytes) before production startup -- see
 # trader/messaging/typed_rpc.py:load_service_hmac_key. Left empty here
 # deliberately: there is no safe default secret to ship.
+# typed_bind_address: the interface the query/command/feed ROUTER sockets
+# BIND to (distinct from host-publishing, which is a Compose concern).
+# Loopback by default -- safe for local/non-Docker. The Compose `trader`
+# service overrides this to tcp://0.0.0.0 (via TYPED_BIND_ADDRESS) so the
+# loopback host-publish of 42101/42102 and cross-container peers on the
+# private network can actually reach the sockets.
+typed_bind_address: tcp://127.0.0.1
 typed_query_port: 42101
 typed_command_port: 42102
 typed_feed_port: 42103

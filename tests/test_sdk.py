@@ -224,6 +224,64 @@ class TestSubscription:
         assert not sub.is_active()
 
 
+class TestSdkAddressEnvOverride:
+    """G0 Task 5: the SDK must honour the ZMQ_*_SERVER_ADDRESS env vars, not
+    just the raw trader.yaml. The split-Compose dashboard container reaches
+    trader_service via ZMQ_RPC_SERVER_ADDRESS=tcp://trader over the private
+    network -- the shared trader.yaml still says loopback. Before this fix the
+    SDK read cfg[...] directly and the env override was silently ignored, so a
+    dashboard container dialed its own empty loopback and every RPC failed."""
+
+    _YAML_CFG = {
+        'zmq_rpc_server_address': 'tcp://127.0.0.1',
+        'zmq_rpc_server_port': 42001,
+        'zmq_pubsub_server_address': 'tcp://127.0.0.1',
+        'zmq_pubsub_server_port': 42002,
+        'zmq_data_rpc_server_address': 'tcp://127.0.0.1',
+        'zmq_data_rpc_server_port': 42003,
+    }
+
+    def _make(self):
+        fake_container = MagicMock()
+        fake_container.config.return_value = dict(self._YAML_CFG)
+        with patch('trader.container.Container.instance', return_value=fake_container):
+            return MMR()
+
+    def test_rpc_address_env_var_wins_over_yaml(self, monkeypatch):
+        monkeypatch.setenv('ZMQ_RPC_SERVER_ADDRESS', 'tcp://trader')
+        monkeypatch.setenv('ZMQ_PUBSUB_SERVER_ADDRESS', 'tcp://trader')
+        monkeypatch.setenv('ZMQ_DATA_RPC_SERVER_ADDRESS', 'tcp://data')
+        mmr = self._make()
+        assert mmr._rpc_address == 'tcp://trader'
+        assert mmr._pubsub_address == 'tcp://trader'
+        assert mmr._data_rpc_address == 'tcp://data'
+        # Ports (no env override wired) still come from yaml.
+        assert mmr._rpc_port == 42001
+
+    def test_addresses_fall_back_to_yaml_without_env(self, monkeypatch):
+        for var in ('ZMQ_RPC_SERVER_ADDRESS', 'ZMQ_PUBSUB_SERVER_ADDRESS', 'ZMQ_DATA_RPC_SERVER_ADDRESS'):
+            monkeypatch.delenv(var, raising=False)
+        mmr = self._make()
+        assert mmr._rpc_address == 'tcp://127.0.0.1'
+        assert mmr._pubsub_address == 'tcp://127.0.0.1'
+        assert mmr._data_rpc_address == 'tcp://127.0.0.1'
+
+    def test_empty_env_var_does_not_clobber_yaml(self, monkeypatch):
+        # An explicitly-empty env var (a common docker-compose default idiom)
+        # must be treated as unset, not blank out a valid config value.
+        monkeypatch.setenv('ZMQ_RPC_SERVER_ADDRESS', '')
+        mmr = self._make()
+        assert mmr._rpc_address == 'tcp://127.0.0.1'
+
+    def test_ctor_arg_wins_over_env(self, monkeypatch):
+        monkeypatch.setenv('ZMQ_RPC_SERVER_ADDRESS', 'tcp://trader')
+        fake_container = MagicMock()
+        fake_container.config.return_value = dict(self._YAML_CFG)
+        with patch('trader.container.Container.instance', return_value=fake_container):
+            mmr = MMR(rpc_address='tcp://explicit')
+        assert mmr._rpc_address == 'tcp://explicit'
+
+
 class TestMMRConnect:
     def test_context_manager(self):
         mock_client = _make_mock_rpc()

@@ -150,6 +150,14 @@ class MMRConfig:
             # TwelveData
             'twelvedata_api_key': ('twelvedata', 'api_key'),
             # Typed RPC (G0 authenticated query/command/feed transport)
+            # typed_bind_address is the interface the query/command/feed
+            # ROUTER sockets BIND to (not publish -- publishing is a Compose
+            # concern). Default tcp://127.0.0.1 is a safe local default; the
+            # Compose `trader` service overrides it to tcp://0.0.0.0 so the
+            # loopback host-publish (127.0.0.1:42101/42102) AND cross-container
+            # `trader:4210x` reach a listening socket. Without this in the
+            # flat-key map, TypedRpcConfig.address was inert (G0 Task 5 fix).
+            'typed_bind_address': ('typed_rpc', 'address'),
             'typed_query_port': ('typed_rpc', 'query_port'),
             'typed_command_port': ('typed_rpc', 'command_port'),
             'typed_feed_port': ('typed_rpc', 'feed_port'),

@@ -28,6 +28,7 @@ import asyncio
 import dataclasses
 import datetime as dt
 import logging
+import os
 import pandas as pd
 import threading
 import zmq
@@ -168,11 +169,22 @@ class MMR:
         self._container = Container(config_file) if config_file else Container.instance()
         cfg = self._container.config()
 
-        self._rpc_address = rpc_address or cfg['zmq_rpc_server_address']
+        # Address resolution precedence: explicit ctor arg > env var > raw
+        # YAML config. The env-var layer matters for the split-Compose
+        # topology (G0 Task 5): the dashboard container reaches trader_service
+        # over the private network via ZMQ_RPC_SERVER_ADDRESS=tcp://trader,
+        # NOT the loopback baked into the shared trader.yaml. Every OTHER
+        # service already honours these env vars (they go through
+        # Container.resolve, which consults env first) -- the SDK was the lone
+        # exception because it read cfg[...] (the raw YAML dict) directly, so
+        # the env override was silently ignored and a dashboard container
+        # targeted its own empty loopback. os.getenv('') is treated as unset
+        # (an explicitly-empty env var must not blank a valid config value).
+        self._rpc_address = rpc_address or (os.getenv('ZMQ_RPC_SERVER_ADDRESS') or None) or cfg['zmq_rpc_server_address']
         self._rpc_port = rpc_port or cfg['zmq_rpc_server_port']
-        self._pubsub_address = pubsub_address or cfg['zmq_pubsub_server_address']
+        self._pubsub_address = pubsub_address or (os.getenv('ZMQ_PUBSUB_SERVER_ADDRESS') or None) or cfg['zmq_pubsub_server_address']
         self._pubsub_port = pubsub_port or cfg['zmq_pubsub_server_port']
-        self._data_rpc_address = cfg.get('zmq_data_rpc_server_address', 'tcp://127.0.0.1')
+        self._data_rpc_address = (os.getenv('ZMQ_DATA_RPC_SERVER_ADDRESS') or None) or cfg.get('zmq_data_rpc_server_address', 'tcp://127.0.0.1')
         self._data_rpc_port = cfg.get('zmq_data_rpc_server_port', 42003)
         self._timeout = timeout
 

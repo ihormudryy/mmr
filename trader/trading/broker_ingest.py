@@ -13,9 +13,21 @@ import uuid
 from dataclasses import dataclass, replace
 from typing import Any, Callable, Optional
 
-from trader.data.broker_state import BrokerAccountRow, BrokerPositionRow, BrokerStateStore
+from trader.data.broker_state import (
+    BrokerAccountRow,
+    BrokerOrderRow,
+    BrokerPositionRow,
+    BrokerStateStore,
+)
 from trader.domain.events import DomainMutation
 from trader.domain.identity import position_entity_id
+from trader.trading.order_correlation import (
+    OrderCorrelator,
+    OrderObservation,
+    classify_leg,
+    decode_order_ref,
+    normalize_open_order,
+)
 
 
 _UNSET_DOUBLE = 1.7976931348623157e308
@@ -187,12 +199,13 @@ class BrokerIngest:
         self.account_mode = account_mode
         self.session_epoch = session_epoch or uuid.uuid4().hex
         self.clock = clock or (lambda: dt.datetime.now(dt.timezone.utc))
-        self._queue: queue.Queue[AccountValueObservation | PositionObservation] = queue.Queue()
+        self._queue: queue.Queue[AccountValueObservation | PositionObservation | OrderObservation] = queue.Queue()
         self._ingest_seq = 0
         self._generation: Optional[int] = None
         self._apply_lock = threading.Lock()
         self._stop = threading.Event()
         self._writer: Optional[threading.Thread] = None
+        self.correlator = OrderCorrelator(store, self.session_epoch)
 
     def on_account_value(self, account_value: Any) -> None:
         observation = normalize_account_value(account_value, self.clock())
@@ -206,6 +219,16 @@ class BrokerIngest:
 
     def on_portfolio_item(self, item: Any) -> None:
         observation = normalize_portfolio_item(item, self.clock())
+        if observation.account_id == self.account_id:
+            self._queue.put(observation)
+
+    def on_open_order(self, trade: Any) -> None:
+        observation = normalize_open_order(trade, self.clock())
+        if observation.account_id == self.account_id:
+            self._queue.put(observation)
+
+    def on_order_status(self, trade: Any) -> None:
+        observation = normalize_open_order(trade, self.clock())
         if observation.account_id == self.account_id:
             self._queue.put(observation)
 
@@ -243,7 +266,7 @@ class BrokerIngest:
                 logging.getLogger(__name__).exception("broker ingest batch failed")
 
     def drain_once(self) -> int:
-        batch: list[AccountValueObservation | PositionObservation] = []
+        batch: list[AccountValueObservation | PositionObservation | OrderObservation] = []
         while True:
             try:
                 batch.append(self._queue.get_nowait())
@@ -253,7 +276,9 @@ class BrokerIngest:
             self._apply_batch(batch)
         return len(batch)
 
-    def _apply_batch(self, batch: list[AccountValueObservation | PositionObservation]) -> None:
+    def _apply_batch(
+        self, batch: list[AccountValueObservation | PositionObservation | OrderObservation]
+    ) -> None:
         with self._apply_lock:
             for record in batch:
                 self._ingest_seq += 1
@@ -262,11 +287,15 @@ class BrokerIngest:
                 else:
                     self._apply_record(self.journal.connect(), record)
 
-    def _apply_record(self, conn: Any, record: AccountValueObservation | PositionObservation) -> None:
+    def _apply_record(
+        self, conn: Any, record: AccountValueObservation | PositionObservation | OrderObservation
+    ) -> None:
         if isinstance(record, AccountValueObservation):
             self._apply_account_value(conn, record)
         elif isinstance(record, PositionObservation):
             self._apply_position(conn, record)
+        elif isinstance(record, OrderObservation):
+            self._apply_order(conn, record)
         else:
             raise TypeError(f"unknown ingest record: {type(record)!r}")
 
@@ -291,6 +320,75 @@ class BrokerIngest:
             self.store.upsert_account_in_tx(write_conn, replace(merged, revision=revision))
 
         self.journal.mutate(conn, mutation, write)
+
+    def _apply_order(self, conn: Any, obs: OrderObservation) -> tuple[str, Any | None]:
+        entity_id = self.correlator.resolve_in_tx(conn, obs)
+        current = self.store.get_order_in_tx(conn, entity_id)
+        group_id = decode_order_ref(obs.order_ref)
+        merged = BrokerOrderRow(
+            order_entity_id=entity_id,
+            account_id=obs.account_id,
+            conid=obs.conid,
+            symbol=obs.symbol,
+            order_group_id=group_id or (current.order_group_id if current else None),
+            leg=(
+                current.leg
+                if current and current.leg
+                else (
+                    classify_leg(obs.order_type, obs.parent_id, obs.client_order_id)
+                    if group_id
+                    else None
+                )
+            ),
+            is_external=(group_id is None) if current is None else current.is_external,
+            action=obs.action,
+            order_type=obs.order_type,
+            total_quantity=obs.total_quantity,
+            filled_quantity=obs.filled_quantity,
+            avg_fill_price=(
+                obs.avg_fill_price
+                if obs.avg_fill_price is not None
+                else (current.avg_fill_price if current else None)
+            ),
+            limit_price=(
+                obs.limit_price if obs.limit_price is not None else (current.limit_price if current else None)
+            ),
+            stop_price=(
+                obs.stop_price if obs.stop_price is not None else (current.stop_price if current else None)
+            ),
+            tif=obs.tif or (current.tif if current else None),
+            status=obs.status,
+            deleted=False,
+            revision=current.revision if current else 0,
+            source_timestamp=obs.source_timestamp,
+        )
+        if current is not None and not current.deleted and merged.same_fields(current):
+            self.correlator.bind_aliases_in_tx(conn, entity_id, obs)
+            return entity_id, None
+        mutation = DomainMutation(
+            event_type="order.updated",
+            entity_type="order",
+            entity_id=entity_id,
+            operation="upsert",
+            account_id=obs.account_id,
+            source="trader_service",
+            source_timestamp=obs.source_timestamp,
+            correlation_id=None,
+            payload=merged.to_payload(),
+        )
+
+        def write(write_conn: Any, revision: int) -> None:
+            self.correlator.bind_aliases_in_tx(write_conn, entity_id, obs)
+            self.store.upsert_order_in_tx(write_conn, replace(merged, revision=revision))
+
+        event = self.journal.mutate(conn, mutation, write)
+        self._resolve_unbound_fills_in_tx(conn, obs, entity_id)
+        return entity_id, event
+
+    def _resolve_unbound_fills_in_tx(
+        self, conn: Any, obs: OrderObservation, entity_id: str
+    ) -> None:
+        return None
 
     def _apply_position(self, conn: Any, obs: PositionObservation) -> None:
         current = self.store.get_position_in_tx(conn, obs.account_id, obs.conid)
@@ -338,5 +436,7 @@ class BrokerIngest:
 
         self.journal.mutate(conn, mutation, write)
 
-    def _stage(self, ingest_seq: int, record: AccountValueObservation | PositionObservation) -> None:
+    def _stage(
+        self, ingest_seq: int, record: AccountValueObservation | PositionObservation | OrderObservation
+    ) -> None:
         raise NotImplementedError("broker-sync staging lands in Task 5")

@@ -66,3 +66,20 @@ def risk_projection_entity_id(account_id: str) -> str:
 def risk_decision_entity_id(command_id: str) -> str:
     """Per-command risk decision namespace (write-once): ``decision:<command_id>``."""
     return f"decision:{command_id}"
+
+
+def order_group_leg_entity_id(order_group_id: str, leg: str) -> str:
+    """An MMR order leg is keyed ``order_group_id:leg``."""
+    return f"{order_group_id}:{leg}"
+
+
+def external_order_entity_id() -> str:
+    """Mint a persisted local id for an order not created by MMR."""
+    import uuid
+
+    return f"ext:{uuid.uuid4()}"
+
+
+def fill_entity_id(account_id: str, exec_id: str) -> str:
+    """A broker execution is keyed ``account:execId``."""
+    return f"{account_id}:{exec_id}"

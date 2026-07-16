@@ -175,6 +175,19 @@ def test_snapshot_not_ready_is_defined_but_never_raised_in_f1(snapshot_service, 
     assert snapshot.broker_generation == 0
 
 
+def test_registered_broker_generation_reader_gates_until_promotion(snapshot_service):
+    snapshot_service.register_broker_generation_reader(lambda _conn: None)
+
+    with pytest.raises(SnapshotNotReady, match="no complete broker-sync generation"):
+        snapshot_service.snapshot_with_cursor()
+
+
+def test_registered_broker_generation_reader_is_returned_in_snapshot(snapshot_service):
+    snapshot_service.register_broker_generation_reader(lambda _conn: 17)
+
+    assert snapshot_service.snapshot_with_cursor().broker_generation == 17
+
+
 def test_materialized_adapter_protocol_matches_generic_entity_adapter():
     adapter = GenericEntityAdapter("proposal")
     assert isinstance(adapter, MaterializedAdapter)

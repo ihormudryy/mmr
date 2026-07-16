@@ -42,18 +42,10 @@ are simply omitted from the registry when absent, so every existing call
 site (``Trader.connect()``, and ``_FakeTrader``-based tests like
 ``test_production_rpc_security.py``) keeps working unchanged.
 
-This is deliberately opt-in rather than unconditional: ``DomainJournal`` (and
-the ``DomainSnapshotService``/``DomainFeedService`` built on it) has no live
-instance wired into ``Trader`` yet -- Tasks 3/4 landed those classes as
-standalone modules with their own dedicated test fixtures, but nothing in
-``trading_runtime.py`` constructs a ``DomainJournal`` against
-``journal_duckdb_path`` or attaches it to ``Trader`` today. Threading that
-construction through ``Trader.connect()`` and updating its
-``build_production_registry(...)`` call site is out of this task's scope
-(only this module, ``feed_service.py``, and its own test file) and is left
-for a follow-up wiring task -- until that lands, these two methods are
-registrable and independently tested (see ``tests/test_domain_feed.py``),
-but not yet reachable on a live ``trader_service``'s sockets.
+The optional arguments keep isolated registry tests and non-trader callers
+lightweight. ``Trader.connect()`` now constructs the journal against its
+dedicated ``journal_duckdb_path`` and supplies both services, so these read
+methods are reachable on the live typed sockets.
 
 Both handlers translate their domain-layer exceptions into wire-level
 ``RpcProblem`` codes via ``typed_rpc._DispatchProblem`` (the same mechanism

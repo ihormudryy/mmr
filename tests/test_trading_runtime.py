@@ -30,6 +30,49 @@ def _minimal_trader() -> Trader:
     return t
 
 
+def test_trader_accepts_a_dedicated_journal_database_path():
+    trader = Trader(
+        ib_server_address='127.0.0.1',
+        ib_server_port=7497,
+        trading_runtime_ib_client_id=5,
+        ib_account='DU12345',
+        duckdb_path='/tmp/mmr.duckdb',
+        journal_duckdb_path='/tmp/mmr_journal.duckdb',
+        universe_library='Universes',
+        zmq_pubsub_server_address='tcp://127.0.0.1',
+        zmq_pubsub_server_port=42002,
+        zmq_rpc_server_address='tcp://127.0.0.1',
+        zmq_rpc_server_port=42001,
+        zmq_strategy_rpc_server_address='tcp://127.0.0.1',
+        zmq_strategy_rpc_server_port=42005,
+        zmq_messagebus_server_address='tcp://127.0.0.1',
+        zmq_messagebus_server_port=42006,
+    )
+
+    assert trader.journal_duckdb_path == '/tmp/mmr_journal.duckdb'
+
+
+def test_trader_derives_a_separate_journal_path_for_older_configurations():
+    trader = Trader(
+        ib_server_address='127.0.0.1',
+        ib_server_port=7497,
+        trading_runtime_ib_client_id=5,
+        ib_account='DU12345',
+        duckdb_path='/tmp/mmr.duckdb',
+        universe_library='Universes',
+        zmq_pubsub_server_address='tcp://127.0.0.1',
+        zmq_pubsub_server_port=42002,
+        zmq_rpc_server_address='tcp://127.0.0.1',
+        zmq_rpc_server_port=42001,
+        zmq_strategy_rpc_server_address='tcp://127.0.0.1',
+        zmq_strategy_rpc_server_port=42005,
+        zmq_messagebus_server_address='tcp://127.0.0.1',
+        zmq_messagebus_server_port=42006,
+    )
+
+    assert trader.journal_duckdb_path == '/tmp/mmr.duckdb.journal'
+
+
 # ---------------------------------------------------------------------------
 # PnL subscription lock — race-free "first-claim-wins"
 # ---------------------------------------------------------------------------

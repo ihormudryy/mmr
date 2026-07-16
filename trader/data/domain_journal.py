@@ -445,30 +445,59 @@ class DomainJournal:
         """
         if not mutations:
             return ()
-        committed_events: tuple[DomainEvent, ...]
+        return self.mutate_batch_work(
+            conn,
+            lambda _conn, append: tuple(
+                append(mutation, write_materialized, event_id)
+                for mutation, write_materialized, event_id in mutations
+            ),
+        )
+
+    def mutate_batch_work(
+        self,
+        conn: duckdb.DuckDBPyConnection,
+        work: Callable[[duckdb.DuckDBPyConnection, Callable[[DomainMutation, WriteMaterialized, Optional[str]], DomainEvent]], Any],
+    ) -> Any:
+        """Run ``work`` and its ordered mutation appends in one transaction.
+
+        The callback receives an ``append`` function rather than a list so a
+        producer can read materialized state written by an earlier append in
+        the same batch.  This is needed when a broker generation contains an
+        order followed by its fill, or a fill followed by its commission.
+        ``work`` may also update producer-owned metadata (such as the
+        promoted-generation cursor) on the same connection before commit.
+        """
+        committed_events: tuple[DomainEvent, ...] = ()
         with self._write_lock:
             conn.execute("BEGIN TRANSACTION")
             try:
                 events: list[DomainEvent] = []
-                for mutation, write_materialized, event_id in mutations:
+                def append(
+                    mutation: DomainMutation,
+                    write_materialized: WriteMaterialized,
+                    event_id: Optional[str] = None,
+                ) -> DomainEvent:
                     eid = event_id if event_id is not None else str(uuid4())
                     existing = self._select_journal_row(conn, eid)
                     if existing is not None:
                         if not self._matches(existing, mutation):
                             raise EventIdentityConflict(eid)
-                        events.append(self._row_to_event(existing))
-                        continue
-
-                    current_revision = self._read_current_revision(
+                        event = self._row_to_event(existing)
+                    else:
+                        current_revision = self._read_current_revision(
                         conn, mutation.entity_type, mutation.entity_id
-                    )
-                    next_revision = current_revision + 1
-                    write_materialized(conn, next_revision)
-                    received_ts = _utcnow()
-                    self._upsert_materialized(conn, mutation, next_revision, received_ts)
-                    events.append(self._insert_journal_row(
-                        conn, eid, mutation, next_revision, received_ts
-                    ))
+                        )
+                        next_revision = current_revision + 1
+                        write_materialized(conn, next_revision)
+                        received_ts = _utcnow()
+                        self._upsert_materialized(conn, mutation, next_revision, received_ts)
+                        event = self._insert_journal_row(
+                            conn, eid, mutation, next_revision, received_ts
+                        )
+                    events.append(event)
+                    return event
+
+                result = work(conn, append)
                 conn.execute("COMMIT")
                 committed_events = tuple(events)
             except BaseException:
@@ -483,8 +512,9 @@ class DomainJournal:
         # `_write_lock` is released above (the `with` block has exited).
         # ONLY NOW -- after both the durable COMMIT and the lock release --
         # do we bump the in-memory cursor and wake long-poll readers.
-        self._signal_commit(max(event.source_cursor for event in committed_events))
-        return committed_events
+        if committed_events:
+            self._signal_commit(max(event.source_cursor for event in committed_events))
+        return result
 
     # ------------------------------------------------------------------ #
     # Task 5: commit signalling for the long-poll feed

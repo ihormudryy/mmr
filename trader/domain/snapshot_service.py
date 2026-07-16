@@ -55,17 +55,13 @@ on this same thread (this task's own fence test) only ever contends for
 ``_write_lock``, never ``fenced_read_lock``, so no self-deadlock is
 possible.
 
-Broker-generation gate (binding, BLOCKER-2 -- DORMANT in [M1-F1])
+Broker-generation gate (activated by [M1-F2])
 --------------------------------------------------------------------------
-``[M1-F1]`` does not promote broker generations (``[M1-F2]`` does). So
-``broker_generation`` here is read straight from
-``domain_snapshot_checkpoints`` (0 when that table is empty, which it always
-is in F1 -- only Task 6/``[M1-F2]`` ever write a row to it) and this method
-NEVER gates on it. ``SnapshotNotReady`` and the ``SNAPSHOT_NOT_READY`` wire
-code below are defined now for ``[M1-F2]`` to activate once it wires
-``register_broker_generation_reader(BrokerStateStore.latest_promoted_generation_in_tx)``
-and finds no promoted generation. Until then, this class has no attribute,
-method, or code path that can raise ``SnapshotNotReady``.
+Without a registered broker-generation reader, snapshots retain the M1-F1
+compatibility behavior and report the checkpoint generation (normally 0).
+The trader runtime registers
+``BrokerStateStore.latest_promoted_generation_in_tx``; from then on no
+snapshot is served until a complete broker generation has promoted.
 """
 from __future__ import annotations
 
@@ -88,11 +84,8 @@ SNAPSHOT_NOT_READY = "SNAPSHOT_NOT_READY"
 class SnapshotNotReady(RuntimeError):
     """No complete broker-sync generation exists yet.
 
-    DEFINED now for ``[M1-F2]`` to activate; DORMANT in ``[M1-F1]`` --
-    nothing in this module raises it today (see the module docstring's
-    "Broker-generation gate" section). ``[M1-F2]`` will raise it from
-    inside the same read transaction ``snapshot_with_cursor`` opens, once
-    its registered broker-generation reader reports no promoted generation.
+    Raised inside the fenced snapshot transaction when an activated
+    broker-generation reader reports no promoted generation.
     """
 
 
@@ -107,6 +100,7 @@ class DomainSnapshotService:
     def __init__(self, journal: DomainJournal):
         self._journal = journal
         self._adapters: list[MaterializedAdapter] = []
+        self._broker_generation_reader: Optional[Callable[[Any], Optional[int]]] = None
 
     def register_adapter(self, adapter: MaterializedAdapter) -> None:
         """Register one entity type's ``MaterializedAdapter``.
@@ -119,6 +113,12 @@ class DomainSnapshotService:
         registers each entity type exactly once at startup.
         """
         self._adapters.append(adapter)
+
+    def register_broker_generation_reader(
+        self, reader: Callable[[Any], Optional[int]]
+    ) -> None:
+        """Activate the broker completeness gate with an authoritative reader."""
+        self._broker_generation_reader = reader
 
     def snapshot_with_cursor(
         self,
@@ -180,6 +180,11 @@ class DomainSnapshotService:
         )
 
     def _read_broker_generation(self, conn: Any) -> int:
+        if self._broker_generation_reader is not None:
+            generation = self._broker_generation_reader(conn)
+            if generation is None:
+                raise SnapshotNotReady("no complete broker-sync generation")
+            return generation
         # Dormant gate (BLOCKER-2): read straight off the checkpoints
         # table, 0 when it's empty -- true for the whole of [M1-F1], since
         # only Task 6/[M1-F2] ever write a row here. Never raises

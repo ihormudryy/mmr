@@ -78,6 +78,9 @@ test = [
 streaming = [
     "websocket-client>=1.8",
 ]
+browser-test = [
+    "playwright==1.55.0",
+]
 
 [project.scripts]
 trader-service = "trader.trader_service:main"

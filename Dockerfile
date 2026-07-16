@@ -1,4 +1,4 @@
-FROM python:3.12-slim-bookworm
+FROM python:3.12.13-slim-bookworm
 WORKDIR /home/trader/mmr
 ENV container=docker
 ENV PATH="/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
@@ -10,7 +10,7 @@ RUN useradd -m -d /home/trader -s /bin/bash -G sudo trader \
     && mkdir -p /tmp
 
 # System packages (no TWS/VNC/X11 — IB Gateway runs in a separate container).
-# Python 3.12 is provided by the python:3.12-slim-bookworm base image.
+# Python 3.12.13 is provided by the python:3.12.13-slim-bookworm base image.
 RUN apt-get update && apt-get install -y --no-install-recommends \
     dialog apt-utils ca-certificates \
     git wget vim dpkg build-essential \

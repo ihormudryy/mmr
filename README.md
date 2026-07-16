@@ -518,7 +518,7 @@ mmr/
 ├── CLAUDE.md                      # Claude Code context (architecture, commands, workflows)
 ├── tests/                         # 1000+ tests (pytest, no IB required)
 ├── docker-compose.yml             # IB Gateway + MMR containers
-├── Dockerfile                     # Debian bookworm + Python venv
+├── Dockerfile                     # Debian bookworm, Python 3.12.13 (pinned)
 ├── docker.sh                      # Docker/Podman build helper
 ├── start_mmr.sh                   # Service startup (tmux + health checks)
 └── pyproject.toml                 # Package config + 58 dependencies
@@ -526,14 +526,17 @@ mmr/
 
 ## Testing
 
-All tests are unit tests using temporary DuckDB databases — no IB connection required. The suite runs in ~47s with zero failures:
+The interpreter is pinned to exactly **Python 3.12.13** via `.python-version` — matching the Docker/production runtime (`python:3.12.13-slim-bookworm`) so nothing drifts between local dev and prod. Set up and run the suite with [uv](https://docs.astral.sh/uv/):
 
 ```bash
-pytest tests/ --timeout=30 -q --ignore=tests/test_ibrx_async.py
+uv sync --python 3.12.13 --frozen --extra test
+uv run --frozen --extra test pytest tests/ --timeout=30 -q --ignore=tests/test_ibrx_async.py
 # → 880 passed
 ```
 
-`test_ibrx_async.py` is excluded because it spins up long-lived asyncio tasks that flake in the full suite; it still runs cleanly on its own.
+All tests are unit tests using temporary DuckDB databases — no IB connection required.
+
+`test_ibrx_async.py` is excluded because it spins up long-lived asyncio tasks that flake in the full suite; it still runs cleanly on its own. CI (`.github/workflows/ci.yml`) runs the main suite and `test_ibrx_async.py` as a separate required job, both on the same pinned 3.12.13 interpreter.
 
 Coverage highlights:
 

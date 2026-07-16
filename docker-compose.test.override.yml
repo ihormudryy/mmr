@@ -1,0 +1,34 @@
+# G0 Task 6 -- TEST-PROFILE-ONLY override. Injects the fake broker into the
+# `trader` service so the fullstack process-supervision gate can boot trader
+# without a real IB Gateway login.
+#
+# CRITICAL: this file is NEVER auto-loaded. Docker Compose only auto-merges
+# `docker-compose.override.yml` (that exact name); this custom-named file is
+# applied ONLY when explicitly passed with `-f`:
+#
+#   docker compose -f docker-compose.yml -f docker-compose.test.override.yml \
+#     --profile test up --build --abort-on-container-exit fullstack-tests
+#
+# So a production `docker compose up` (base file only) leaves `trader`'s
+# environment WITHOUT MMR_FAKE_BROKER at all -- the fake broker is
+# unreachable in production by construction. Keeping this out of the base
+# docker-compose.yml (rather than gating with a shared env var) is the fix
+# for the review CRITICAL: MMR_FAKE_BROKER must not exist on the production
+# `trader` service, not merely be empty/falsey there.
+#
+# Two things get injected here, both required to satisfy the FAIL-LOUD guard
+# in trading_runtime.py's _fake_broker_enabled():
+#   1. MMR_FAKE_BROKER=1  -- opt in to the stub broker.
+#   2. --simulation True on trader's command -- the guard permits the stub
+#      ONLY in offline simulation + paper trading + a paper (D-prefixed)
+#      account. TRADING_MODE=paper (base env) + a DU... IB_ACCOUNT satisfy
+#      the other two; `--simulation True` sets Trader(simulation=True).
+#      NOTE: trader_service.py's --simulation is a VALUE option (not an
+#      is_flag), so it needs an explicit `True` argument -- bare
+#      `--simulation` errors with "requires an argument" (verified). Not
+#      changing that pre-existing CLI here; just feeding it correctly.
+services:
+  trader:
+    command: ["python", "-m", "trader.trader_service", "--simulation", "True"]
+    environment:
+      MMR_FAKE_BROKER: "1"

@@ -53,6 +53,12 @@ name: mmr
 x-mmr-build: &mmr-build
   context: .
   dockerfile: Dockerfile
+  # Pinned explicitly (G0 Task 6) now that the Dockerfile has a second,
+  # test-only stage (`test`, layered FROM this one) -- without an explicit
+  # target, Docker defaults to the LAST stage in the file, which would
+  # silently ship pytest/docker-py in every one of these five production
+  # services. Only `fullstack-tests` (below) overrides this to `test`.
+  target: runtime
 
 x-mmr-common-env: &mmr-common-env
   TRADER_CONFIG: /home/trader/.config/mmr/trader.yaml
@@ -71,6 +77,15 @@ x-mmr-common-env: &mmr-common-env
   # (harmless if it happens -- CPython swallows bytecode-cache write
   # failures -- but this avoids relying on that silently-swallowed path).
   PYTHONDONTWRITEBYTECODE: "1"
+  # NOTE (G0 Task 6): MMR_FAKE_BROKER is DELIBERATELY NOT here. The stub
+  # broker is a test-only mechanism that must NEVER be reachable by the
+  # production `trader` service -- putting it on this shared anchor once
+  # leaked it into `trader`'s production environment (a live `docker compose
+  # up` with the var exported would have fabricated a broker on a live
+  # account). It is injected into `trader` ONLY for the test profile, via
+  # docker-compose.test.override.yml (an explicitly-passed `-f` override,
+  # never auto-loaded), together with the `--simulation` flag the
+  # fail-loud guard in trading_runtime.py's _fake_broker_enabled() requires.
 
 x-mmr-hardening: &mmr-hardening
   # One shared image tag across all five services: `docker compose build`
@@ -358,6 +373,67 @@ services:
       timeout: 5s
       retries: 3
       start_period: 15s
+
+  # ── fullstack-tests: process-supervision gate (G0 Task 6, test profile) ──
+  # NOT part of the production topology -- profiles:["test"] means a plain
+  # `docker compose up` never creates this service. It is brought up with:
+  #   docker compose -f docker-compose.yml -f docker-compose.test.override.yml \
+  #     --profile test up --build --abort-on-container-exit fullstack-tests
+  # Brings up the full five-service + ib-gateway graph (via depends_on) and
+  # runs tests/fullstack/test_process_supervision.py against the REAL
+  # containers over docker.sock, proving Task 5's one-supervisor-per-process
+  # claim empirically (kill one, siblings' container IDs/restart counts are
+  # unaffected; the killed one's OWN healthcheck degrades then recovers once
+  # Compose restarts it).
+  #
+  # The `MMR_FAKE_BROKER: "1"` below is read ONLY by this test-runner
+  # container's own code path (the test's skip-guard) -- it is NOT what makes
+  # `trader` fake its broker. The `trader` service must NOT carry
+  # MMR_FAKE_BROKER in this base file (that once leaked the stub into
+  # production `trader`); the flag AND the `--simulation` command the
+  # fail-loud guard in trading_runtime.py requires are injected into `trader`
+  # ONLY via docker-compose.test.override.yml (explicitly passed with `-f`,
+  # never auto-loaded). `data`/`strategy`/`scheduler` never touch IB at boot
+  # regardless (confirmed by reading their startup paths).
+  #
+  # `build.target: test` selects the Dockerfile's test-only stage (pytest +
+  # docker-py layered on top of the same `runtime` image the other five
+  # services use) -- see the Dockerfile and the `x-mmr-build` anchor above.
+  # The read-only Docker socket mount lets the supervision test stop/kill
+  # and inspect sibling containers; it exists ONLY in this test-profile
+  # service, never in production.
+  fullstack-tests:
+    profiles: ["test"]
+    build:
+      <<: *mmr-build
+      target: test
+    # Deliberately root, NOT `user: trader` -- confirmed empirically: the
+    # bind-mounted host docker.sock is a root-owned, group-0-permissioned
+    # socket (mode 0660) on every Docker install checked (Docker Desktop's
+    # Linux VM here; native Linux hosts commonly use a *different*, host-
+    # specific `docker` group GID instead of 0). Chasing that GID portably
+    # from a static `group_add:` isn't possible across hosts/CI runners, and
+    # this container never runs in production (`profiles: ["test"]`) or
+    # touches trading logic -- its entire job is privileged Docker
+    # introspection (stop/kill/inspect siblings), so root here is the
+    # correct, portable, narrowly-scoped exception to this file's otherwise
+    # uniform non-root hardening.
+    user: root
+    # `tests/fullstack` is a relative path -- resolves against CWD, and the
+    # image's default WORKDIR (post-ENTRYPOINT) is /home/trader, one level
+    # above the repo checkout. Same gotcha Task 5 hit for `scheduler`'s
+    # `python -m pycron.pycron` (see that service's comment above) --
+    # confirmed empirically here too (pytest reports "file or directory
+    # not found: tests/fullstack" without this).
+    working_dir: /home/trader/mmr
+    command: ["python", "-m", "pytest", "tests/fullstack", "-q", "--timeout=300"]
+    environment:
+      TRADING_MODE: paper
+      MMR_FAKE_BROKER: "1"
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock:ro
+    networks: [mmr-internal]
+    depends_on: [data, trader, strategy, dashboard, scheduler]
 
 networks:
   mmr-internal:

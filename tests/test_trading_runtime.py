@@ -501,6 +501,77 @@ class TestAssertAccountPinned:
             t._assert_account_pinned(['DU12345'])
 
 
+class TestFakeBrokerGuard:
+    """G0 Task 6 fix (review CRITICAL): the MMR_FAKE_BROKER stub broker
+    must be IMPOSSIBLE to activate in any posture that could reach a
+    real/live account. _fake_broker_enabled() is the fail-loud gate.
+
+    RED context: before this fix, connect() activated the fake broker on a
+    bare `os.environ.get('MMR_FAKE_BROKER') == '1'` with no posture check,
+    and the only downstream gate -- _assert_account_pinned -- PASSES for a
+    live account when paper_trading is False (see
+    TestAssertAccountPinned.test_valid_live_account_in_managed_returns_it,
+    which asserts a live 'U...' account is accepted). So a live process
+    with the flag set would have fabricated a healthy live broker that
+    silently drops every order. These tests lock that hole shut.
+    """
+
+    def _trader(self, *, simulation, paper_trading, ib_account):
+        t = object.__new__(Trader)
+        t.simulation = simulation
+        t.paper_trading = paper_trading
+        t.ib_account = ib_account
+        return t
+
+    def test_disabled_when_env_unset(self, monkeypatch):
+        monkeypatch.delenv('MMR_FAKE_BROKER', raising=False)
+        t = self._trader(simulation=True, paper_trading=True, ib_account='DU12345')
+        assert t._fake_broker_enabled() is False
+
+    def test_disabled_when_env_not_exactly_one(self, monkeypatch):
+        # Only the exact string '1' opts in; anything else is "off", and in a
+        # paper+sim+D posture "off" must be a clean False (real connect), not
+        # a raise.
+        monkeypatch.setenv('MMR_FAKE_BROKER', '0')
+        t = self._trader(simulation=True, paper_trading=True, ib_account='DU12345')
+        assert t._fake_broker_enabled() is False
+
+    def test_enabled_only_in_paper_sim_with_paper_account(self, monkeypatch):
+        monkeypatch.setenv('MMR_FAKE_BROKER', '1')
+        t = self._trader(simulation=True, paper_trading=True, ib_account='DU12345')
+        assert t._fake_broker_enabled() is True
+
+    @pytest.mark.parametrize('simulation,paper_trading,ib_account,why', [
+        (True, False, 'DU12345', 'not paper_trading (live posture)'),
+        (False, True, 'DU12345', 'not simulation'),
+        (True, True, 'U26774889', 'live (non-D) account'),
+        (False, False, 'U26774889', 'fully live'),
+        (True, True, '', 'blank account (does not start with D)'),
+    ])
+    def test_refused_loudly_outside_paper_sim(self, monkeypatch, simulation,
+                                              paper_trading, ib_account, why):
+        """MMR_FAKE_BROKER=1 in ANY non-(sim+paper+D) posture must RAISE --
+        never return False (which would silently fall back to the real
+        broker and mask the misconfiguration) and never activate the stub.
+        The raise is what guarantees connect() reaches NEITHER connect_fake
+        nor the real connect() (its `if self._fake_broker_enabled()` never
+        resolves to a branch)."""
+        monkeypatch.setenv('MMR_FAKE_BROKER', '1')
+        t = self._trader(simulation=simulation, paper_trading=paper_trading,
+                          ib_account=ib_account)
+        with pytest.raises(AccountNotPinnedError, match='MMR_FAKE_BROKER refused'):
+            t._fake_broker_enabled()
+
+    def test_refusal_names_the_offending_posture(self, monkeypatch):
+        monkeypatch.setenv('MMR_FAKE_BROKER', '1')
+        t = self._trader(simulation=True, paper_trading=False, ib_account='U26774889')
+        with pytest.raises(AccountNotPinnedError) as exc:
+            t._fake_broker_enabled()
+        msg = str(exc.value)
+        assert 'paper_trading=False' in msg
+        assert "ib_account='U26774889'" in msg
+
+
 class TestGetAccountCashByCurrency:
     def _api(self, values, account='U26774889', managed=None):
         return _api_with_account_values(account, values, managed=managed or [account])

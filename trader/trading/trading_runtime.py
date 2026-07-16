@@ -33,6 +33,7 @@ from typing import cast, Dict, List, NamedTuple, Optional, Tuple, Union
 import asyncio
 import backoff
 import datetime as dt
+import os
 import reactivex as rx
 import reactivex.operators as ops
 import threading
@@ -249,6 +250,43 @@ class Trader():
             )
         return self.ib_account
 
+    def _fake_broker_enabled(self) -> bool:
+        """Whether ``MMR_FAKE_BROKER=1`` activates the stub broker (G0 Task 6).
+
+        FAIL-LOUD safety gate. The fake broker (``IBAIORx.connect_fake``)
+        silently accepts and DROPS every order / stop / take-profit while
+        reporting ``ib_connected: True`` -- so it must be impossible to
+        activate against anything that could reach a real/live account. The
+        catastrophic scenario this guards is a live ``docker compose up``
+        with ``MMR_FAKE_BROKER=1`` left exported in the shell fabricating a
+        healthy broker on a LIVE account and swallowing real trades.
+
+        Returns ``False`` when the flag is unset (normal path -> real
+        ``connect()``). When the flag IS set, permits the fake broker ONLY in
+        the most restrictive non-live posture -- offline ``simulation`` AND
+        ``paper_trading`` AND a paper (``D``-prefixed, e.g. ``DU...``)
+        account -- and otherwise RAISES ``AccountNotPinnedError`` (a fatal
+        safety refusal that ``connect()`` re-raises un-retried/un-wrapped).
+
+        It deliberately RAISES rather than returning ``False`` in a
+        live/misconfigured posture: silently falling back to the real broker
+        would mask the misconfiguration, and proceeding with the stub would
+        fabricate a healthy live broker that eats trades. A flag set on a
+        live process is a bug that must hard-fail, loudly, either way.
+        """
+        if os.environ.get('MMR_FAKE_BROKER') != '1':
+            return False
+        if not (self.simulation and self.paper_trading
+                and str(self.ib_account).startswith('D')):
+            raise AccountNotPinnedError(
+                'MMR_FAKE_BROKER refused: the fake broker is permitted ONLY in '
+                'offline simulation + paper trading with a paper (D-prefixed) '
+                'account. Got simulation={}, paper_trading={}, ib_account={!r}. '
+                'Refusing to fabricate a broker in a potentially live posture '
+                '(it would silently drop every order).'.format(
+                    self.simulation, self.paper_trading, self.ib_account))
+        return True
+
     @backoff.on_exception(backoff.expo, (ConnectionRefusedError, TimeoutError), max_tries=10, max_time=120)
     def connect(self):
         logging.debug('trading_runtime.connect() connecting to services: %s:%s' % (self.ib_server_address, self.ib_server_port))
@@ -266,7 +304,24 @@ class Trader():
             self.market_data_subscriptions = {}
             self.client.ib.connectedEvent += self.connected_event
             self.client.ib.disconnectedEvent += self.disconnected_event
-            self.client.connect()
+            # G0 Task 6: MMR_FAKE_BROKER=1 lets this process boot, report
+            # healthy, and stay up WITHOUT a real IB Gateway connection --
+            # the fullstack process-supervision gate's only use for this.
+            # _fake_broker_enabled() is a FAIL-LOUD safety gate: it raises
+            # (never silently falls back to either broker) if the flag is
+            # set in any posture that could touch a real/live account, so
+            # the else-branch's real connect() is reached only when the flag
+            # is genuinely unset. See _fake_broker_enabled for the rules.
+            if self._fake_broker_enabled():
+                logging.warning(
+                    'MMR_FAKE_BROKER=1: skipping real IB Gateway connection -- '
+                    'trading_runtime is running against a stub broker (offline '
+                    'simulation + paper account only). This must NEVER be set '
+                    'outside the fullstack test-profile runner.'
+                )
+                self.client.connect_fake(self.ib_account)
+            else:
+                self.client.connect()
 
             # Track IB upstream connectivity via error codes
             self.client.error_subject.subscribe(AnonymousObserver(

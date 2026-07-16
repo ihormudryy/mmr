@@ -24,6 +24,7 @@ Design notes:
 """
 from __future__ import annotations
 
+import contextlib
 import html as _html
 import logging
 import os
@@ -42,6 +43,7 @@ from fastapi.responses import RedirectResponse
 from fastapi.templating import Jinja2Templates
 from starlette.concurrency import run_in_threadpool
 
+from trader.operations.health import build_health_payload
 from trader.strategy.inspect import scan_strategies
 
 logger = logging.getLogger('web')
@@ -104,7 +106,23 @@ def _preview(text: Any, n: int = 90) -> str:
     s = ' '.join(str(text or '').split())
     return (s[: n - 1] + '…') if len(s) > n else s
 
-app = FastAPI(title='MMR Dashboard')
+# `/readyz`'s readiness flag (G0 Task 6) -- flips false once the app starts a
+# graceful shutdown (SIGTERM), so an external LB/orchestrator polling
+# `/readyz` stops routing new requests to a draining process while
+# in-flight ones finish. A standard readiness-probe pattern, not a
+# dependency check. Wired via `lifespan` (not the deprecated `on_event`)
+# so the flip happens exactly once, deterministically, on shutdown.
+_READY = True
+
+
+@contextlib.asynccontextmanager
+async def _lifespan(_app: FastAPI):
+    yield
+    global _READY
+    _READY = False
+
+
+app = FastAPI(title='MMR Dashboard', lifespan=_lifespan)
 _TEMPLATES = Jinja2Templates(directory=str(Path(__file__).parent / 'templates'))
 
 # CSRF: a per-process token embedded as a hidden field in every approve/reject
@@ -329,11 +347,50 @@ def fetch_proposals() -> list[dict]:
 
 
 # ---------------------------------------------------------------------------
-# Routes
+# Health (G0 Task 6)
 # ---------------------------------------------------------------------------
+# `/healthz` and `/readyz` are UNAUTHENTICATED liveness/readiness probes (no
+# `_check_access` gate) -- Compose's healthcheck and any external load
+# balancer must be able to hit them without a token. Both are deliberately
+# bare booleans: neither may leak dependency/internal detail to an
+# unauthenticated caller (which service is down, why, what its address is,
+# etc.) -- that detail only appears behind `/api/health`'s auth gate below.
+#
+# `_READY` (defined above, next to `app`'s construction) flips false once
+# the app starts a graceful shutdown -- see the `_lifespan` docstring.
 @app.get('/healthz')
 def healthz():
     return {'ok': True}
+
+
+@app.get('/readyz')
+def readyz():
+    return {'ready': _READY}
+
+
+@app.get('/api/health')
+def api_health(request: Request):
+    """Authenticated: process state + each scheduled job's last
+    success/failure, for operators/dashboards that need real detail (unlike
+    `/healthz`/`/readyz` above). Every dependency fetch degrades to a
+    reachable=False entry rather than raising -- a health probe must never
+    500 because a sibling service is down; that IS the interesting case to
+    report, not a reason to fail the request. Redaction is applied inside
+    `build_health_payload` regardless of what these fetchers return.
+    """
+    _check_access(request)
+    try:
+        status = fetch_status()
+        trader_dep: dict = {'reachable': status is not None, 'status': status}
+    except Exception as exc:  # noqa: BLE001 - degrade, never 500 a health probe
+        logger.warning('api_health: trader status fetch failed: %s', exc)
+        trader_dep = {'reachable': False, 'error': type(exc).__name__}
+    return build_health_payload(dependencies={'trader': trader_dep})
+
+
+# ---------------------------------------------------------------------------
+# Routes
+# ---------------------------------------------------------------------------
 
 
 @app.get('/')

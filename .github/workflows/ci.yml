@@ -27,3 +27,78 @@ jobs:
       - run: uv sync --python 3.12.13 --frozen --extra test
       - run: uv run --frozen python -c 'import platform; assert platform.python_version() == "3.12.13"'
       - run: uv run --frozen pytest tests/test_ibrx_async.py --timeout=30 -q
+
+  fullstack-gate:
+    # G0 Task 6 capstone: brings up the real five-service + ib-gateway
+    # Compose topology and runs tests/fullstack/test_process_supervision.py
+    # against the actual containers over docker.sock -- proving G0 Task 5's
+    # one-supervisor-per-process claim empirically (kill one process,
+    # siblings are untouched; the killed one's own healthcheck degrades then
+    # recovers). The fake broker (so `trader` boots without a real IB
+    # Gateway) is injected into `trader` ONLY via docker-compose.test.
+    # override.yml, explicitly passed with `-f` below -- the production base
+    # file never carries MMR_FAKE_BROKER on `trader`.
+    name: Full-stack process-supervision gate (test profile, fake broker)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Provision ~/.config/mmr for a fresh runner (config + HMAC key)
+        # Compose bind-mounts ${HOME}/.config/mmr into every service's
+        # /home/trader/.config/mmr, SHADOWING the Dockerfile's baked-in
+        # config_defaults/*.yaml copy with whatever's on the HOST -- on a
+        # fresh runner that's an empty, Docker-auto-created directory,
+        # leaving every container with no trader.yaml at all. Confirmed
+        # empirically (see the G0 Task 6 report): without this, `trader`
+        # fails to boot with "service_hmac_key_file is not configured".
+        # This mirrors what start_mmr.sh's ensure_service_hmac_key() +
+        # container.ensure_config_dir() do for a real host deployment --
+        # neither runs here, since Compose execs each service directly via
+        # docker-entrypoint.sh and never falls through to start_mmr.sh.
+        # chown to UID/GID 1000 (the Dockerfile's pinned `trader` user) so
+        # the 0600 key file is actually readable inside the container
+        # regardless of the runner's own user's UID (load_service_hmac_key
+        # requires exactly mode 0600 -- loosening it to be world-readable
+        # instead would defeat the point of the check).
+        run: |
+          mkdir -p "$HOME/.config/mmr"
+          cp config_defaults/*.yaml "$HOME/.config/mmr/"
+          openssl rand 48 > "$HOME/.config/mmr/service_hmac.key"
+          chmod 600 "$HOME/.config/mmr/service_hmac.key"
+          sed -i "s#^service_hmac_key_file: ''#service_hmac_key_file: /home/trader/.config/mmr/service_hmac.key#" \
+            "$HOME/.config/mmr/trader.yaml"
+          grep service_hmac_key_file "$HOME/.config/mmr/trader.yaml"
+          sudo chown -R 1000:1000 "$HOME/.config/mmr"
+      - name: Write a throwaway .env for the ib-gateway sidecar
+        # ib-gateway is a transitive `depends_on` of data/trader/scheduler
+        # regardless -- but `trader_service` never actually dials it under
+        # the fake broker (see trading_runtime.py's connect() /
+        # ibreactive.py's connect_fake), so ib-gateway is only ever required
+        # to START, not log in or reach a healthy state. `env_file: .env`
+        # still needs the file to exist, and IB_ACCOUNT must be a paper
+        # (D-prefixed) account: it satisfies BOTH Trader._assert_account_
+        # pinned AND the fake-broker fail-loud guard's D-account requirement.
+        # TRADING_MODE=paper makes the trader `--simulation` run paper+sim.
+        # MMR_FAKE_BROKER is NOT set here -- it is injected into `trader`
+        # only via docker-compose.test.override.yml (below). None of this is
+        # a real credential.
+        run: |
+          cat > .env <<'EOF'
+          TWS_USERID=ci_fake_user
+          TWS_PASSWORD=ci_fake_password
+          TRADING_MODE=paper
+          IB_ACCOUNT=DU_CI_FAKE_BROKER
+          EOF
+      - name: Run the full-stack process-supervision gate
+        run: >-
+          docker compose -f docker-compose.yml -f docker-compose.test.override.yml
+          --profile test up --build --abort-on-container-exit fullstack-tests
+      - name: Show service logs on failure
+        if: failure()
+        run: >-
+          docker compose -f docker-compose.yml -f docker-compose.test.override.yml
+          --profile test logs
+      - name: Tear down
+        if: always()
+        run: >-
+          docker compose -f docker-compose.yml -f docker-compose.test.override.yml
+          --profile test down --volumes --remove-orphans

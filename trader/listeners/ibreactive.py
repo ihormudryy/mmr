@@ -236,6 +236,48 @@ class IBAIORx():
                 ))
         self.error_subject.on_next(IBAIORxError(reqId, errorCode, errorString, contract))
 
+    def connect_fake(self, account: str = '') -> 'IBAIORx':
+        """G0 Task 6 test-only stub: boot without a real IB Gateway socket.
+
+        Used ONLY by ``Trader.connect()`` when ``MMR_FAKE_BROKER=1`` (see
+        ``trading_runtime.py``), so the fullstack process-supervision gate
+        can bring ``trader_service`` up, have it report healthy, and keep
+        it running WITHOUT dialing a real ``ib_async`` connection or
+        requiring a live IB Gateway login. It does not simulate order
+        placement, market data, positions, or any other trading behavior —
+        the moment real IB interaction is attempted (a snapshot, an order,
+        a history pull) it will simply do nothing/return empty, exactly as
+        a freshly-constructed, never-connected ``IB()`` instance does today.
+
+        Fakes exactly the two facts ``Trader.connect()`` reads immediately
+        afterward, and nothing else:
+
+        - ``self.ib.isConnected()`` -> True (status()/health reporting;
+          overridden as an instance attribute, shadowing ``IB.isConnected``
+          — a plain, easily-greppable monkeypatch, not new subclassing).
+        - ``self.ib.managedAccounts()`` -> ``[account]`` (satisfies
+          ``Trader._assert_account_pinned``'s safety check) — achieved by
+          setting the underlying ``wrapper.accounts`` list rather than
+          overriding the method, so any other code path that reads
+          ``managedAccounts()`` sees the same consistent state.
+
+        Deliberately NOT faked: the internal ``ib.client.isConnected()``
+        used by ``IB.disconnect()``/``shutdown()`` stays at its real,
+        never-connected value (``False``), so tearing down a fake-broker
+        Trader safely short-circuits exactly like tearing down a real one
+        that never got past ``connect()`` — no socket work is attempted
+        either way.
+        """
+        self._shutdown = False
+        self.ib.wrapper.accounts = [account] if account else []
+        self.ib.isConnected = lambda: True  # type: ignore[method-assign]
+        self.history_worker = IBHistoryWorker(
+            self.ib_server_address,
+            self.ib_server_port,
+            self.ib_client_id + 1,
+        )
+        return self
+
     @backoff.on_exception(backoff.expo, Exception, max_tries=5, max_time=60)
     def connect(self) -> 'IBAIORx':
         def __handle_client_id_error(msg):

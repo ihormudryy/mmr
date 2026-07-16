@@ -206,6 +206,26 @@ class JobScheduler():
                                                                           job.command,
                                                                           result,
                                                                           stderr.decode().strip()))
+
+        # G0 Task 6: one JSON-lines receipt per completed one-shot job,
+        # under the scheduler's shared state volume (~/.local/share/mmr/logs)
+        # -- the dashboard's authenticated /api/health reads these to report
+        # "each scheduled job's last success/failure". A receipt-write
+        # failure must never take down the job itself (mirrors the
+        # sweep-digest failure-isolation precedent elsewhere in this
+        # project) -- it's just deferred-imported and best-effort here.
+        try:
+            from trader.operations.health import record_receipt
+            record_receipt(
+                job=job.name,
+                started_at=job.last_started or dt.datetime.now(),
+                completed_at=dt.datetime.now(),
+                success=(job.return_code == 0),
+                error=None if job.return_code == 0 else 'exit code {}'.format(job.return_code),
+            )
+        except Exception as exc:
+            log.warning('failed to record receipt for job {}: {}'.format(job.name, exc))
+
         return result
 
     # todo make this better

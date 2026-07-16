@@ -1,4 +1,4 @@
-FROM python:3.12.13-slim-bookworm
+FROM python:3.12.13-slim-bookworm AS runtime
 WORKDIR /home/trader/mmr
 ENV container=docker
 ENV PATH="/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
@@ -107,3 +107,16 @@ RUN chmod +x /home/trader/mmr/scripts/docker-entrypoint.sh
 USER trader
 WORKDIR /home/trader
 ENTRYPOINT ["/home/trader/mmr/scripts/docker-entrypoint.sh"]
+
+# ---------------------------------------------------------------------------
+# `test` stage (G0 Task 6) -- ONLY used by docker-compose.yml's `test`-profile
+# `fullstack-tests` runner (`build.target: test`). The five real, always-on
+# services build the plain `runtime` stage above (docker-compose.yml's
+# `x-mmr-build` anchor pins `target: runtime`), so production images never
+# carry pytest/docker-py. `requirements.txt` intentionally does NOT list
+# these -- they'd otherwise ship in every real deployment for no reason.
+FROM runtime AS test
+USER root
+RUN --mount=type=cache,target=/home/trader/.cache/pip \
+    pip3 install "pytest>=8.0" "pytest-timeout>=2.3" "docker>=7.0"
+USER trader

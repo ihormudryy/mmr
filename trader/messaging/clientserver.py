@@ -772,7 +772,21 @@ class MessageBusServer:
         self.wait_handle = threading.Event()
 
         self.sentinel_flag = False
-        self.read_thread = threading.Thread(target=self.__combined_loop, args=(self.wait_handle,))
+        # daemon=True (G0 Task 6 finding): neither Trader.shutdown() nor any
+        # other caller invokes stop() on a live MessageBusServer today, and
+        # this thread has no graceful-flush requirement beyond what already
+        # happens on each message -- but a NON-daemon thread blocks the
+        # entire Python process from exiting even after the main thread/
+        # event loop finishes. Confirmed empirically via the fullstack
+        # process-supervision gate: sending trader_service a real SIGTERM
+        # (the same signal Compose/Docker send on a normal stop/restart)
+        # let graceful_shutdown() complete and the event loop stop, but the
+        # process then hung indefinitely -- this thread (and the pubsub
+        # publisher thread below) was still alive and non-daemon. Making it
+        # daemon doesn't change any in-process behavior; it only lets the
+        # interpreter actually exit once everything else is done.
+        self.read_thread = threading.Thread(
+            target=self.__combined_loop, args=(self.wait_handle,), daemon=True)
         self.read_thread.start()
 
         self.wait_handle.wait()
@@ -1039,7 +1053,11 @@ class MultithreadedTopicPubSub(Generic[T], TopicPubSub[T]):
         logging.debug('starting _publisher_loop')
         self.wait_handle = threading.Event()
 
-        th = threading.Thread(target=self._publisher_loop, args=(self.wait_handle,))
+        # daemon=True -- see the identical comment on MessageBusServer.start()
+        # above (same G0 Task 6 finding: a non-daemon worker thread that's
+        # never explicitly stopped hangs the whole process past a clean
+        # SIGTERM shutdown).
+        th = threading.Thread(target=self._publisher_loop, args=(self.wait_handle,), daemon=True)
         th.start()
         self.wait_handle.wait()
         logging.debug('started _publisher_loop')

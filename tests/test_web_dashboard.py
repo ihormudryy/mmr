@@ -13,6 +13,7 @@ import pytest
 from fastapi.testclient import TestClient
 
 import web.app as webapp
+from trader.common.reactivex import SuccessFail
 
 
 class _Ok:
@@ -32,6 +33,8 @@ class StubSDK:
         self.calls = []
         self.toggle_result = _Ok()
         self.params_result = _Ok()
+        self.approve_result = SuccessFail.success()
+        self.risk_error = None
 
     # --- read fetchers (minimal shapes; sections degrade gracefully) ---
     def account_cash(self):
@@ -44,6 +47,8 @@ class StubSDK:
         return None
 
     def risk_report(self):
+        if self.risk_error is not None:
+            raise self.risk_error
         return None
 
     def get_risk_limits(self):
@@ -69,6 +74,10 @@ class StubSDK:
         ])
 
     # --- mutations ---
+    def approve(self, pid):
+        self.calls.append(('approve', pid))
+        return self.approve_result
+
     def enable_strategy(self, name):
         self.calls.append(('enable', name))
         return self.toggle_result
@@ -95,7 +104,16 @@ _SCANNED = [
 @pytest.fixture
 def stub(monkeypatch):
     sdk = StubSDK()
+    # Patch at the _get_mmr seam, not the _mmr global: _call() reconnects on a
+    # dropped connection via _reset_mmr() + _get_mmr(), and if _get_mmr fell
+    # through to its real body it would construct a live MMR().connect() (real
+    # ZMQ socket, 30s RPC timeout) the moment a test simulates a ConnectionError.
+    # Returning the same stub from _get_mmr — and no-op'ing _reset_mmr — keeps a
+    # simulated failure fully contained to the stub across _call's retry-once,
+    # so no test can ever reach a real SDK.
     monkeypatch.setattr(webapp, '_mmr', sdk)
+    monkeypatch.setattr(webapp, '_get_mmr', lambda: sdk)
+    monkeypatch.setattr(webapp, '_reset_mmr', lambda: None)
     monkeypatch.setattr(webapp, 'scan_strategies', lambda *a, **k: list(_SCANNED))
     return sdk
 
@@ -107,6 +125,31 @@ def client(stub):
 
 def _csrf():
     return webapp._CSRF_TOKEN
+
+
+# ---------------------------------------------------------------------------
+# [S0] Legacy dashboard failure rendering — a failed approval must never
+# flash as "submitted", and a failed risk-report fetch must never render as
+# a green "no active warnings" pass row (that infers OK from a missing
+# report, which is exactly the false-safety bug this task closes).
+# Spec: docs/superpowers/plans/2026-07-15-command-center-s0-safety.md (Task 5)
+# ---------------------------------------------------------------------------
+def test_failed_approval_never_flashes_submitted(client, stub):
+    stub.approve_result = SuccessFail.fail(error="broker rejected")
+    response = client.post(
+        "/proposals/7/approve",
+        data={"csrf_token": _csrf()},
+        follow_redirects=False,
+    )
+    assert "broker%20rejected" in response.headers["location"]
+    assert "submitted" not in response.headers["location"]
+
+
+def test_risk_fetch_failure_is_unavailable_not_green(client, stub):
+    stub.risk_error = ConnectionError("risk RPC down")
+    html = client.get("/").text
+    assert "Risk unavailable" in html
+    assert "No active risk warnings" not in html
 
 
 class TestStrategyToggleRoutes:

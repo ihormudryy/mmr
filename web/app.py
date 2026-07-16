@@ -368,11 +368,26 @@ def dashboard(request: Request, flash: str = ''):
     available = sections.get('available') or []
     for a in available:
         a['deployed'] = a.get('class') in deployed_classes
+
+    # Explicit risk tri-state — never infer "ok" from a missing/failed
+    # report. "unavailable" takes priority even if a stale/None risk value
+    # happens to carry no warnings; "ok" only applies when the fetch itself
+    # succeeded.
+    risk_obj = sections.get('risk')
+    risk_warnings = (risk_obj.get('warnings') or []) if isinstance(risk_obj, dict) else []
+    if 'risk' in errors:
+        risk_state = 'unavailable'
+    elif risk_warnings:
+        risk_state = 'warning'
+    else:
+        risk_state = 'ok'
+
     return _TEMPLATES.TemplateResponse(request, 'dashboard.html', {
         'cash': sections.get('cash'),
         'snapshot': sections.get('snapshot'),
         'status': sections.get('status'),
         'risk': sections.get('risk'),
+        'risk_state': risk_state,
         'risk_limits': sections.get('risk_limits'),
         'positions': sections.get('positions') or [],
         'strategies': strategies,
@@ -393,11 +408,10 @@ def approve(pid: int, request: Request, csrf_token: str = Form('')):
     _check_csrf(csrf_token)
     try:
         result = _call(lambda m: m.approve(pid), retry=False)
-        ok = getattr(result, 'success', None)
-        if ok is False:
-            msg = f'#{pid} approve failed: {getattr(result, "error", "unknown error")}'
+        if not hasattr(result, 'is_success') or not result.is_success():
+            msg = f'#{pid} approve failed: {_result_error(result)}'
         else:
-            msg = f'#{pid} approved & submitted'
+            msg = f'#{pid} approved & order submitted'
     except Exception as exc:  # noqa: BLE001
         logger.warning('approve #%s failed: %s', pid, exc)
         msg = f'#{pid} approve error: {type(exc).__name__}: {exc}'

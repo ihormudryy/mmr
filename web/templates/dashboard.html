@@ -169,7 +169,7 @@
 <main>
   {% set warns = (risk.warnings if risk else []) or [] %}
   {% set crit = warns | selectattr('level', 'equalto', 'critical') | list %}
-{% set pending_count = proposals | selectattr('status', 'defined') | selectattr('status', 'equalto', 'PENDING') | list | length %}
+{% set pending_count = proposals | selectattr('storage_status', 'defined') | selectattr('storage_status', 'equalto', 'PENDING') | list | length %}
 <nav class="tabs">
   <button type="button" class="tab active" data-tab="overview">Overview
     {% if pending_count %}<span class="chip PENDING">{{ pending_count }}</span>{% endif %}</button>
@@ -178,7 +178,8 @@
   <button type="button" class="tab" data-tab="watchlists">Watchlists
     <span class="chip">{{ watchlists|length }}</span></button>
   <button type="button" class="tab" data-tab="risk">Risk
-    {% if warns %}<span class="chip {{ 'err' if crit else 'warnchip' }}">{{ warns|length }}</span>{% endif %}</button>
+    {% if risk_state == 'unavailable' %}<span class="chip err">!</span>
+    {% elif warns %}<span class="chip {{ 'err' if crit else 'warnchip' }}">{{ warns|length }}</span>{% endif %}</button>
 </nav>
 
 <main>
@@ -252,8 +253,8 @@
           <td class="sym">{{ p.symbol }}</td>
           <td><span class="chip {{ 'buy' if (p.action or '')|upper == 'BUY' else 'sell' }}">{{ p.action }}</span></td>
           <td>{{ p.size or '—' }}</td>
-          <td>{{ num(p.conf, 2) if p.conf is not none else '—' }}</td>
-          <td><span class="chip {{ p.status }}">{{ p.status }}</span></td>
+          <td>{{ num(p.confidence, 2) if p.confidence is not none else '—' }}</td>
+          <td><span class="chip {{ p.storage_status }}" data-storage-status="{{ p.storage_status }}">{{ p.display_status }}</span></td>
           <td class="reasoning">
             {% if p.has_reasoning %}
               <a class="reason-link" href="#" onclick="return openReason('r{{ p.id }}')">{{ p.reasoning_preview }}</a>
@@ -269,7 +270,7 @@
             {% else %}<span class="dim">—</span>{% endif %}
           </td>
           <td>
-            {% if (p.status or '')|upper == 'PENDING' %}
+            {% if (p.storage_status or '')|upper == 'PENDING' %}
               <form class="inline" method="post" action="/proposals/{{ p.id }}/approve"
                     onsubmit="return confirm('LIVE ORDER: approve proposal #{{ p.id }} ({{ p.action }} {{ p.symbol }} {{ p.size }})? This places a real order.');">
                 <input type="hidden" name="csrf_token" value="{{ csrf_token }}" />
@@ -503,9 +504,12 @@
   <section class="full">
     <h2>Risk
       {{ info('Portfolio risk analysis computed from live positions: exposure, leverage, concentration, and rule-based warnings.') }}
-      {% if risk %}<span class="chip {{ 'err' if crit else ('warnchip' if warns else 'on') }}">{{ warns|length }} warning{{ '' if warns|length == 1 else 's' }}</span>{% endif %}
+      {% if risk_state == 'unavailable' %}<span class="chip err">unavailable</span>
+      {% elif risk_state == 'warning' %}<span class="chip {{ 'err' if crit else 'warnchip' }}">{{ warns|length }} warning{{ '' if warns|length == 1 else 's' }}</span>
+      {% else %}<span class="chip on">ok</span>{% endif %}
     </h2>
-    {% if errors.risk and errors.status %}<p class="banner err">trader_service: {{ errors.risk }}</p>
+    {% if risk_state == 'unavailable' %}
+      <p class="banner err">Risk unavailable — trader_service: {{ errors.risk }}</p>
     {% else %}
       <div class="subhead">Exposure &amp; leverage</div>
       <div class="metric-grid">
@@ -530,7 +534,7 @@
       </div>
       {% endif %}
 
-      {% if warns %}
+      {% if risk_state == 'warning' %}
       <div class="subhead">Warnings</div>
       <div class="warnings">
         {% for w in warns %}

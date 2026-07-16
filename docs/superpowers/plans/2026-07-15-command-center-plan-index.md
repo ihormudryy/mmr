@@ -125,14 +125,26 @@ Additional frozen conventions:
   per command.
 - Quote-coverage owner kinds: `"position"`, `"order"`, `"proposal"`, `"strategy"`
   (`QuoteSubscriptionManager.set_owner_refs(owner_kind, contracts, delayed=False)`).
-- Journal DB topology: the `domain_event_journal`, `domain_snapshot_checkpoints`,
-  and ALL materialized-state tables (F1's + F2's broker tables) live in a dedicated
-  `trader_service`-owned DuckDB file (`journal_duckdb_path`, separate from
-  `mmr.duckdb`, mirroring the existing `history_duckdb_path` split), accessed in-process
-  through ONE shared `duckdb.connect()` instance; writers and the long-poll reader use
-  `.cursor()` off that instance and the reader does NOT go through `execute_atomic`/the
-  per-db lock. No other process opens this file. This is why `snapshot_with_cursor`
-  can read the journal cursor and every materialized adapter in one fenced transaction.
+- Journal DB topology: the `domain_event_journal`, `domain_snapshot_checkpoints`, and
+  EVERY domain-journaled materialized-state table — F1's, F2's broker tables
+  (positions/orders/fills), and F3's command-authority tables (`trade_proposals`,
+  `command_ledger`, `command_audit`, `trading_control_state`) — live in a dedicated
+  `trader_service`-owned DuckDB file (`journal_duckdb_path`, separate from `mmr.duckdb`,
+  mirroring the existing `history_duckdb_path` split), accessed in-process through ONE
+  shared `duckdb.connect()` instance; writers and the long-poll reader use `.cursor()`
+  off that instance and the reader does NOT go through `execute_atomic`/the per-db lock.
+  No other process opens this file (the CLI/dashboard read these entities via typed RPC,
+  never direct DuckDB — consistent with `[G0]`'s RPC-only path). Co-locating the
+  materialized row and its journal event in one file is why a mutation commits atomically
+  and `snapshot_with_cursor` reads the cursor + every adapter in one fenced transaction.
+- `DomainJournal.mutate(conn, mutation, write_materialized)` SELF-MANAGES its
+  `BEGIN/COMMIT` on a `journal.connect()` connection and MUST NOT be wrapped in
+  `DuckDBConnection.transaction` (nested `BEGIN` → DuckDB rejects it). The materialized
+  write goes inside the `write_materialized` callback. `DuckDBConnection.transaction`
+  is for `mmr.duckdb` work that does not journal. Producers emit one `mutate()` per
+  logical mutation (each self-commits); batch/generation atomicity relies on `event_id`
+  idempotent replay, and generation-promote bookkeeping is its own single journal-connection
+  transaction.
 - Quote snapshot ownership: `get_quotes_snapshot() -> {"quotes": {instrument_id: quote_row}}`
   is produced by `[M1-F2]` (it owns the quote plane; quotes are absent from the journal),
   registered on the `query` socket. `[M1-F1]` does NOT register it. `[M1-R]` may use a

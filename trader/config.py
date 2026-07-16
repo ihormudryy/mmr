@@ -30,6 +30,13 @@ class IBConfig:
 class StorageConfig:
     duckdb_path: str = '~/.local/share/mmr/data/mmr.duckdb'
     history_duckdb_path: str = '~/.local/share/mmr/data/mmr_history.duckdb'
+    # Dedicated file for the domain event journal, snapshot checkpoints, and
+    # materialized-state tables ([M1-F1] Task 3). Kept separate from
+    # mmr.duckdb: a persistent connection on the shared file would hold its
+    # cross-process lock and make every CLI `connect()` fail (verified
+    # against DuckDB 1.4.4). Owned exclusively by trader_service -- no other
+    # process should open this file. See trader/data/domain_journal.py.
+    journal_duckdb_path: str = '~/.local/share/mmr/data/mmr_journal.duckdb'
     universe_library: str = 'Universes'
 
 
@@ -126,6 +133,7 @@ class MMRConfig:
             # Storage
             'duckdb_path': ('storage', 'duckdb_path'),
             'history_duckdb_path': ('storage', 'history_duckdb_path'),
+            'journal_duckdb_path': ('storage', 'journal_duckdb_path'),
             'universe_library': ('storage', 'universe_library'),
             # ZMQ
             'zmq_rpc_server_address': ('zmq', 'rpc_server_address'),
@@ -251,7 +259,7 @@ class MMRConfig:
 
         # Resolve duckdb paths: expand ~ first, then resolve relative paths against project root
         from trader.container import mmr_root
-        for attr in ('duckdb_path', 'history_duckdb_path'):
+        for attr in ('duckdb_path', 'history_duckdb_path', 'journal_duckdb_path'):
             val = getattr(config.storage, attr)
             if val:
                 val = os.path.expanduser(val)

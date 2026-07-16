@@ -17,6 +17,36 @@ import signal
 logging = setup_logging(module_name='trader_service')
 
 
+def _resolve_seed_accounts(
+    live_account: str | None,
+    paper_account: str | None,
+    active_account: str | None,
+    paper_trading: bool,
+) -> list[tuple[str, str]]:
+    """Resolve the (account_id, mode) set to seed into the pause gate.
+
+    Seeds the configured per-mode accounts (``ib_live_account`` /
+    ``ib_paper_account``) when present AND unconditionally unions the
+    resolved account this process actually trades under
+    (``trader.ib_account`` with its mode from ``trader.paper_trading``).
+    An ``IB_ACCOUNT`` env override can leave ``config.ib.account`` diverging
+    from the per-mode YAML fields; without this union the ACTIVE account
+    could be left unseeded, and once the gate is wired every
+    exposure-increasing proposal for it would be refused with a misleading
+    ``TRADING_PAUSED`` (``PauseStateUnavailable``) even though nobody paused
+    it. The active account's runtime mode wins on an id collision (dict
+    overwrite keeps first-insertion order, so [live, paper] ordering holds).
+    """
+    seed: dict[str, str] = {}
+    if live_account:
+        seed[live_account] = 'live'
+    if paper_account:
+        seed[paper_account] = 'paper'
+    if active_account:
+        seed[active_account] = 'paper' if paper_trading else 'live'
+    return list(seed.items())
+
+
 def _seed_trading_control(trader: Trader, container: Container) -> TradingControlStore:
     """[M1-F3] Task 4: seed the durable per-account pause gate BEFORE this
     service is considered ready (i.e. before ``trader.run()`` starts the
@@ -28,10 +58,11 @@ def _seed_trading_control(trader: Trader, container: Container) -> TradingContro
     Seeds BOTH the configured live and paper accounts (``ib_live_account``/
     ``ib_paper_account``) when present -- a single journal file governs
     pause state for both, even though this process only ever ACTS as one
-    of them. Falls back to seeding just the currently-active resolved
-    account (``trader.ib_account`` / ``trader.paper_trading``) when neither
-    per-mode config value is set (e.g. an ``IB_ACCOUNT`` env-var override
-    that bypasses the per-mode config fields entirely), so the account this
+    of them -- and ALWAYS unions the currently-active resolved account
+    (``trader.ib_account`` / ``trader.paper_trading``). An ``IB_ACCOUNT``
+    env-var override can leave ``config.ib.account`` diverging from the
+    per-mode config fields, so unconditionally including the active account
+    (see ``_resolve_seed_accounts``) is what guarantees the account this
     process actually trades under is never left ungoverned.
 
     Runs inside ONE transaction (``seed_in_tx`` never opens its own --
@@ -43,13 +74,10 @@ def _seed_trading_control(trader: Trader, container: Container) -> TradingContro
     store = TradingControlStore(trader.domain_journal)
 
     ib_config = container.typed_config().ib
-    accounts = [
-        (account_id, mode)
-        for account_id, mode in ((ib_config.live_account, 'live'), (ib_config.paper_account, 'paper'))
-        if account_id
-    ]
-    if not accounts and trader.ib_account:
-        accounts = [(trader.ib_account, 'paper' if trader.paper_trading else 'live')]
+    accounts = _resolve_seed_accounts(
+        ib_config.live_account, ib_config.paper_account,
+        trader.ib_account, trader.paper_trading,
+    )
 
     if accounts:
         now = dt.datetime.now(dt.timezone.utc)

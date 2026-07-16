@@ -302,3 +302,46 @@ def test_set_trading_pause_registered_and_runs_through_the_coordinator(authority
     receipt = a.coordinator.execute(request)
     assert receipt.state == "RESOLVED"
     assert a.controls.get(ACCOUNT_ID).new_exposure_paused is True
+
+
+# --- _resolve_seed_accounts: the active account is NEVER left ungoverned ---
+from trader.trader_service import _resolve_seed_accounts  # noqa: E402
+
+
+def test_active_account_always_seeded_even_when_it_diverges_from_per_mode_config():
+    # IB_ACCOUNT override: active paper account differs from the configured
+    # per-mode paper field. The active account MUST still be seeded, else the
+    # gate blocks every exposure-increasing proposal with a bogus TRADING_PAUSED.
+    accounts = _resolve_seed_accounts(
+        live_account="U1234567", paper_account="DU999999",
+        active_account="DU111111", paper_trading=True,
+    )
+    assert ("DU111111", "paper") in accounts
+    assert ("U1234567", "live") in accounts
+    assert ("DU999999", "paper") in accounts
+
+
+def test_active_account_seeded_when_no_per_mode_config():
+    accounts = _resolve_seed_accounts(
+        live_account="", paper_account="", active_account="DU111111", paper_trading=True,
+    )
+    assert accounts == [("DU111111", "paper")]
+
+
+def test_active_account_dedupes_against_per_mode_and_preserves_order():
+    # active id collides with the configured paper account; no duplicate, and
+    # the [live, paper] ordering is preserved (dict overwrite keeps position).
+    accounts = _resolve_seed_accounts(
+        live_account="U1234567", paper_account="DU111111",
+        active_account="DU111111", paper_trading=True,
+    )
+    assert accounts == [("U1234567", "live"), ("DU111111", "paper")]
+
+
+def test_active_account_runtime_mode_wins_on_id_collision():
+    # If the active id equals the configured live id but the process runs
+    # paper, the active runtime mode wins (paper -> unpaused seed default).
+    accounts = _resolve_seed_accounts(
+        live_account="DU111111", paper_account="", active_account="DU111111", paper_trading=True,
+    )
+    assert accounts == [("DU111111", "paper")]

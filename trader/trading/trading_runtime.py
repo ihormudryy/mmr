@@ -38,7 +38,6 @@ import reactivex.operators as ops
 import threading
 import time
 import trader.messaging.strategy_service_api as strategy_bus
-import trader.messaging.trader_service_api as bus
 
 
 logging = setup_logging(module_name='trading_runtime')
@@ -77,7 +76,12 @@ class Trader():
                  history_duckdb_path: str = '',
                  paper_trading: bool = False,
                  simulation: bool = False,
-                 require_proposal_approval: bool = False):
+                 require_proposal_approval: bool = False,
+                 typed_query_port: int = 42101,
+                 typed_command_port: int = 42102,
+                 typed_feed_port: int = 42103,
+                 service_hmac_key_file: str = '',
+                 unsafe_legacy_rpc: bool = False):
         self.ib_server_address = ib_server_address
         self.ib_server_port = ib_server_port
         self.trading_runtime_ib_client_id = trading_runtime_ib_client_id
@@ -94,6 +98,15 @@ class Trader():
         # helper use after a proposal is reviewed. Defensive gate against
         # LLM loops drifting off-plan and firing direct orders.
         self.require_proposal_approval: bool = require_proposal_approval
+        # Typed authenticated query/command/feed transport (G0 Tasks 2-3) --
+        # production's ONLY RPC boundary (see connect()). The legacy
+        # dill/msgpack RPCServer is gated behind `unsafe_legacy_rpc` AND
+        # `simulation` both being True (validate_rpc_mode enforces this).
+        self.typed_query_port = typed_query_port
+        self.typed_command_port = typed_command_port
+        self.typed_feed_port = typed_feed_port
+        self.service_hmac_key_file = service_hmac_key_file
+        self.unsafe_legacy_rpc: bool = unsafe_legacy_rpc
         self.zmq_pubsub_server_address = zmq_pubsub_server_address
         self.zmq_pubsub_server_port = zmq_pubsub_server_port
         self.zmq_rpc_server_address = zmq_rpc_server_address
@@ -137,7 +150,17 @@ class Trader():
         self.executioner: TradeExecutioner
         # a list of all the universes of stocks we have registered
         self.market_data = 3
-        self.zmq_rpc_server: RPCServer[bus.TraderServiceApi]
+        # Legacy dill/object-returning RPC server -- ONLY constructed in
+        # connect() when simulation=True AND unsafe_legacy_rpc=True (see
+        # validate_rpc_mode). Absent (never set) in every other posture,
+        # including all of production.
+        self.zmq_rpc_server: Optional[RPCServer] = None
+        # Typed authenticated query/command/feed servers -- ALWAYS started in
+        # connect(); this is production's sole RPC boundary.
+        self.typed_query_server: 'TypedRpcServer'
+        self.typed_command_server: 'TypedRpcServer'
+        self.typed_feed_server: 'TypedRpcServer'
+        self.typed_authenticator: 'HmacServiceAuthenticator'
         self.zmq_pubsub_server: MultithreadedTopicPubSub
         self.zmq_pubsub_contracts: Dict[int, Observable[IBAIORxError]] = {}
         self.zmq_pubsub_contract_filters: Dict[int, bool] = {}
@@ -254,11 +277,66 @@ class Trader():
             logging.info('trading mode verified: %s, account: %s', 'paper' if self.paper_trading else 'live', active_account)
 
             self.last_connect_time = dt.datetime.now()
-            self.zmq_rpc_server = RPCServer[bus.TraderServiceApi](
-                instance=bus.TraderServiceApi(self),
-                zmq_rpc_server_address=self.zmq_rpc_server_address,
-                zmq_rpc_server_port=self.zmq_rpc_server_port
+
+            # --- Production RPC boundary (G0 Task 4) -----------------------
+            # Fail-closed guard: the dill-capable legacy RPC path (raw
+            # objects, no schema validation) may run ONLY in offline
+            # simulation with the explicit unsafe flag. This raises
+            # ValueError before anything below binds a single socket if
+            # some other code path ever tried to combine unsafe_legacy_rpc
+            # with a live/production posture.
+            from trader.messaging.production_api import build_production_registry, validate_rpc_mode
+            from trader.messaging.typed_rpc import (
+                HmacServiceAuthenticator,
+                TypedRpcRegistry,
+                TypedRpcServer,
+                load_service_hmac_key,
             )
+
+            validate_rpc_mode(self.simulation, self.unsafe_legacy_rpc)
+
+            # Typed query/command/feed servers ALWAYS start -- this is the
+            # only RPC surface production exposes. The service HMAC key is
+            # loaded (and hardness-checked -- absent/wrong-mode/empty/<32B
+            # all fail loudly) unconditionally, offline simulation included:
+            # there is no "test mode" bypass for the typed transport's
+            # authentication.
+            hmac_key = load_service_hmac_key(self.service_hmac_key_file)
+            self.typed_authenticator = HmacServiceAuthenticator(hmac_key)
+
+            production_registry = build_production_registry(self, self.typed_authenticator)
+            self.typed_query_server = TypedRpcServer(
+                'query', production_registry, self.typed_authenticator,
+                port=self.typed_query_port,
+            )
+            # Command and feed registries are intentionally empty for now --
+            # [M1-F3] registers coordinator-authorized command methods and
+            # feed subscriptions on top of these same servers. Standing the
+            # sockets up now (rather than deferring until [M1-F3]) means the
+            # production port/authentication surface is fixed from this task
+            # forward and doesn't change shape later.
+            self.typed_command_server = TypedRpcServer(
+                'command', TypedRpcRegistry(), self.typed_authenticator,
+                port=self.typed_command_port,
+            )
+            self.typed_feed_server = TypedRpcServer(
+                'feed', TypedRpcRegistry(), self.typed_authenticator,
+                port=self.typed_feed_port,
+            )
+
+            # Legacy dill/object-returning RPC (clientserver.py) -- offline
+            # simulation ONLY, and only with the explicit unsafe flag.
+            # Production never constructs LegacyOfflineTraderServiceApi or
+            # binds this socket at all.
+            if self.simulation and self.unsafe_legacy_rpc:
+                from trader.messaging.legacy_offline_api import LegacyOfflineTraderServiceApi
+                self.zmq_rpc_server = RPCServer[LegacyOfflineTraderServiceApi](
+                    instance=LegacyOfflineTraderServiceApi(self),
+                    zmq_rpc_server_address=self.zmq_rpc_server_address,
+                    zmq_rpc_server_port=self.zmq_rpc_server_port
+                )
+            # ----------------------------------------------------------------
+
             self.zmq_pubsub_server = MultithreadedTopicPubSub(
                 zmq_pubsub_server_address=self.zmq_pubsub_server_address,
                 zmq_pubsub_server_port=self.zmq_pubsub_server_port
@@ -297,7 +375,11 @@ class Trader():
             self.executioner.connect(self)
 
             self.run(self.zmq_strategy_client.connect())
-            self.run(self.zmq_rpc_server.serve())
+            self.run(self.typed_query_server.serve())
+            self.run(self.typed_command_server.serve())
+            self.run(self.typed_feed_server.serve())
+            if self.zmq_rpc_server is not None:
+                self.run(self.zmq_rpc_server.serve())
 
         except KeyboardInterrupt:
             logging.info('connect() interrupted, shutting down')
@@ -312,6 +394,17 @@ class Trader():
             # Fatal safety refusal — must never be retried or wrapped.
             raise
         except Exception as ex:
+            # NOTE: ValueError from validate_rpc_mode() (unsafe_legacy_rpc
+            # requested outside offline simulation) and
+            # trader.messaging.typed_rpc.ServiceHmacKeyError from
+            # load_service_hmac_key (HMAC key file absent, not mode 0600,
+            # empty, or <32 bytes) both fall through to here rather than
+            # getting a dedicated except clause: either way connect() still
+            # fails loudly (raised as TraderConnectionException, never
+            # silently swallowed, never started with a missing/weak key or
+            # an illegal legacy-RPC mode combination) and, unlike
+            # ConnectionRefusedError/TimeoutError, neither should be retried
+            # by the @backoff decorator.
             raise trader_exception(self, TraderConnectionException, message='trading_runtime connect() exception', inner=ex)
 
     @log_method

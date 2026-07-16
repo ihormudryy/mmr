@@ -3,6 +3,14 @@
 When the flag is on, direct buy/sell RPC calls must be rejected unless
 the caller explicitly marked this as a liquidation (``skip_risk_gate=True``).
 The approve() path uses place_expressive_order, which is not gated here.
+
+``place_order_simple`` (and the gate logic tested here) lives on
+``LegacyOfflineTraderServiceApi`` as of G0 Task 4 — it moved off the base
+``TraderServiceApi`` along with the rest of the direct-order/risk-mutation
+RPC surface, since that surface is now offline-simulation-only (see
+``trader.messaging.production_api.validate_rpc_mode`` and
+``trader.messaging.legacy_offline_api``). The gate behaviour itself is
+unchanged; only the class it's defined on moved.
 """
 
 import asyncio
@@ -10,7 +18,7 @@ import asyncio
 import pytest
 
 from trader.common.reactivex import SuccessFail
-from trader.messaging.trader_service_api import TraderServiceApi
+from trader.messaging.legacy_offline_api import LegacyOfflineTraderServiceApi as TraderServiceApi
 
 
 class _FakeContract:

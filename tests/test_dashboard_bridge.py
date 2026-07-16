@@ -386,3 +386,102 @@ class TestStopReliability:
             closed_loop, FakeQueryClient([_snapshot(10)]), ScriptedFeed())
         with pytest.raises(RuntimeError):
             bridge._schedule(lambda: None)
+
+
+import msgpack
+import zmq
+
+from web.command_center.quotes import QuotePlane, clamp_hz, normalize_ticker
+
+
+class _CollectingLoop:
+    """Minimal loop stand-in: records deliveries synchronously."""
+
+    def __init__(self):
+        self.batches: list[dict] = []
+
+    def call_soon_threadsafe(self, fn, *args):
+        fn(*args)
+
+
+class TestQuoteNormalization:
+    def test_dict_ticker_normalizes(self):
+        quote = normalize_ticker({
+            "conId": 265598, "bid": 199.4, "ask": 199.6, "last": 199.5,
+            "time": "2026-07-15T14:30:00+00:00", "feed": "live"})
+        assert quote == {
+            "instrument_id": "265598", "bid": 199.4, "ask": 199.6, "last": 199.5,
+            "market_timestamp": "2026-07-15T14:30:00+00:00", "feed_type": "live"}
+
+    def test_unknown_shape_returns_none(self):
+        assert normalize_ticker({"nothing": "useful"}) is None
+        assert normalize_ticker(b"garbage") is None
+
+    def test_hz_clamped_to_two_to_five(self):
+        assert clamp_hz(0.5) == 2.0
+        assert clamp_hz(4.0) == 4.0
+        assert clamp_hz(60.0) == 5.0
+
+
+class TestQuoteConflation:
+    def _plane(self, hz=4.0):
+        loop = _CollectingLoop()
+        plane = QuotePlane("tcp://127.0.0.1", 0, loop,
+                           lambda batch: loop.batches.append(batch), hz=hz,
+                           decode=msgpack.unpackb)
+        return plane, loop
+
+    def test_conflation_keeps_latest_value_only(self):
+        plane, loop = self._plane()
+        for last in (100.0, 101.0, 102.5):
+            plane.ingest({"conId": 265598, "bid": last - 0.1, "ask": last + 0.1,
+                          "last": last})
+        assert plane.flush_due(now=10.0)
+        assert len(loop.batches) == 1
+        assert loop.batches[0]["265598"]["last"] == 102.5
+
+    def test_flush_respects_rate(self):
+        plane, loop = self._plane(hz=4.0)  # interval 0.25s
+        plane.ingest({"conId": 1, "last": 1.0})
+        assert plane.flush_due(now=10.0)
+        plane.ingest({"conId": 1, "last": 2.0})
+        assert not plane.flush_due(now=10.1)   # too soon
+        assert plane.flush_due(now=10.26)
+        assert [b["1"]["last"] for b in loop.batches] == [1.0, 2.0]
+
+    def test_malformed_payloads_dropped_and_counted(self):
+        plane, loop = self._plane()
+        plane.ingest({"useless": True})
+        plane.ingest(12345)
+        assert plane.dropped == 2
+        assert not plane.flush_due(now=10.0)
+        assert loop.batches == []
+
+
+class TestQuoteSocketRoundTrip:
+    def test_subscriber_thread_receives_published_quote(self):
+        ctx = zmq.Context()
+        pub = ctx.socket(zmq.PUB)
+        port = pub.bind_to_random_port("tcp://127.0.0.1")
+        loop = _CollectingLoop()
+        received = threading.Event()
+
+        def deliver(batch):
+            loop.batches.append(batch)
+            received.set()
+
+        plane = QuotePlane("tcp://127.0.0.1", port, loop, deliver,
+                           hz=5.0, decode=msgpack.unpackb)
+        plane.start()
+        try:
+            deadline = time.monotonic() + 3
+            payload = msgpack.packb({"conId": 4815747, "last": 172.4})
+            while not received.is_set() and time.monotonic() < deadline:
+                pub.send_multipart([b"", payload])  # re-send until SUB connects
+                time.sleep(0.05)
+            assert received.is_set()
+            assert loop.batches[-1]["4815747"]["last"] == 172.4
+        finally:
+            plane.stop()
+            pub.close(0)
+            ctx.term()

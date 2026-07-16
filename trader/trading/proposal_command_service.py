@@ -9,6 +9,7 @@ from typing import Any, Callable, Optional, Protocol
 
 from trader.data.domain_journal import DomainJournal
 from trader.data.proposal_repository import ProposalDraft, ProposalRecord, ProposalRepository
+from trader.trading.trading_control import PauseStateUnavailable, TradingPausedError
 
 
 @dataclass(frozen=True)
@@ -27,6 +28,18 @@ class QuoteAuthority(Protocol):
 
 class UniverseAuthority(Protocol):
     def resolve_conid(self, conid: int) -> Any | None: ...
+
+
+class PositionAuthority(Protocol):
+    """Broker-verified reducible quantity for one (account, conid).
+
+    Used ONLY to decide whether a SELL is a position-reducing close (exempt
+    from the pause gate) or an exposure-increasing short (not exempt) --
+    never caller-supplied. [M1-F3] Task 5's approval saga reuses the same
+    protocol shape for its own risk-direction classification.
+    """
+
+    def reducible_quantity(self, account_id: str, conid: int) -> float: ...
 
 
 @dataclass(frozen=True)
@@ -79,6 +92,7 @@ class ProposalCommandService:
         ttl: dt.timedelta = dt.timedelta(minutes=5),
         controls: Any | None = None,
         sizer: Any | None = None,
+        positions: Optional[PositionAuthority] = None,
     ):
         self._repository = repository
         self._journal = journal
@@ -91,6 +105,7 @@ class ProposalCommandService:
         self._ttl = ttl
         self._controls = controls
         self._sizer = sizer
+        self._positions = positions
 
     def create_proposal(
         self, request: ProposalCreateRequest, *, source: str, correlation_id: str
@@ -113,8 +128,13 @@ class ProposalCommandService:
         if not instrument_check.approved:
             raise ProposalCreationRefused("TRADING_FILTER_REJECTED", instrument_check.reason)
 
-        if self._controls is not None and request.action == "BUY":
-            self._controls.require_unpaused(self._account_id)
+        if self._controls is not None and not self._is_reducing_close(request):
+            try:
+                self._controls.require_unpaused(self._account_id)
+            except TradingPausedError as exc:
+                raise ProposalCreationRefused("TRADING_PAUSED", str(exc)) from exc
+            except PauseStateUnavailable as exc:
+                raise ProposalCreationRefused("TRADING_PAUSED", str(exc)) from exc
 
         side = "ask" if request.action == "BUY" else "bid"
         quote = self._quotes.executable_quote(request.conid, side=side)
@@ -264,6 +284,20 @@ class ProposalCommandService:
                 self.expire_stale(self._as_utc(self._now()))
             except Exception:
                 logging.exception("proposal expiry sweep failed; retrying on the next tick")
+
+    def _is_reducing_close(self, request: ProposalCreateRequest) -> bool:
+        """True only for a SELL whose quantity is VERIFIED (broker-reported
+        held/reducible quantity, never caller-supplied) to be <= what's
+        actually held. An amount-based or auto-sized SELL (quantity not
+        known yet -- sizing happens after this check) or one with no wired
+        ``PositionAuthority`` is NOT exempt: fail closed, treat as
+        exposure-increasing."""
+        if request.action != "SELL":
+            return False
+        if request.quantity is None or self._positions is None:
+            return False
+        held = self._positions.reducible_quantity(self._account_id, request.conid)
+        return request.quantity <= held
 
     def _size(self, request: ProposalCreateRequest, price: float) -> tuple[Optional[float], float]:
         if request.quantity is not None:

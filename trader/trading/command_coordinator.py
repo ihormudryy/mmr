@@ -85,7 +85,12 @@ from trader.domain.identity import command_entity_id
 from trader.messaging.typed_rpc import canonical_json
 
 # [M1-F3] owns trader-DB (journal file) migration versions 20-29; Task 1
-# used 20 for trade_proposals. This task owns 21.
+# used 20 for trade_proposals. This task owns 21. Task 4 owns 22
+# (``trading_control_state`` -- see ``trader/trading/trading_control.py``),
+# whose ``set_trading_pause`` action is registered on THIS coordinator via
+# ``register_action`` from ``trader/messaging/production_api.py`` --
+# exactly the same ``requires_preflight``/``execute()`` machinery every
+# other action already uses, no coordinator-side code changes needed.
 COMMAND_LEDGER_MIGRATION_VERSION = 21
 COMMAND_LEDGER_MIGRATION_NAME = "m1f3_command_ledger_audit"
 

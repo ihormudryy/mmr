@@ -2,16 +2,61 @@ from asyncio import AbstractEventLoop
 from trader.common.helpers import get_network_ip
 from trader.common.logging_helper import LogLevels, set_all_log_level, setup_logging
 from trader.container import Container, default_config_path
+from trader.data.schema_migrations import SchemaMigrator
+from trader.trading.trading_control import TradingControlStore, apply_trading_control_migration
 from trader.trading.trading_runtime import Trader
 
 import asyncio
 import click
+import datetime as dt
 import logging as log
 import os
 import signal
 
 
 logging = setup_logging(module_name='trader_service')
+
+
+def _seed_trading_control(trader: Trader, container: Container) -> TradingControlStore:
+    """[M1-F3] Task 4: seed the durable per-account pause gate BEFORE this
+    service is considered ready (i.e. before ``trader.run()`` starts the
+    main loop). ``trader.connect()`` has already migrated/opened the
+    journal file (``trader.journal_db`` / ``trader.domain_journal``) by the
+    time this runs, so this only adds migration 22 and seeds whichever
+    accounts are configured.
+
+    Seeds BOTH the configured live and paper accounts (``ib_live_account``/
+    ``ib_paper_account``) when present -- a single journal file governs
+    pause state for both, even though this process only ever ACTS as one
+    of them. Falls back to seeding just the currently-active resolved
+    account (``trader.ib_account`` / ``trader.paper_trading``) when neither
+    per-mode config value is set (e.g. an ``IB_ACCOUNT`` env-var override
+    that bypasses the per-mode config fields entirely), so the account this
+    process actually trades under is never left ungoverned.
+
+    Runs inside ONE transaction (``seed_in_tx`` never opens its own --
+    see ``trading_control.py``'s module docstring) via
+    ``trader.journal_db.transaction(...)``.
+    """
+    migrator = SchemaMigrator(trader.journal_db)
+    apply_trading_control_migration(migrator)
+    store = TradingControlStore(trader.domain_journal)
+
+    ib_config = container.typed_config().ib
+    accounts = [
+        (account_id, mode)
+        for account_id, mode in ((ib_config.live_account, 'live'), (ib_config.paper_account, 'paper'))
+        if account_id
+    ]
+    if not accounts and trader.ib_account:
+        accounts = [(trader.ib_account, 'paper' if trader.paper_trading else 'live')]
+
+    if accounts:
+        now = dt.datetime.now(dt.timezone.utc)
+        trader.journal_db.transaction(lambda conn: store.seed_in_tx(conn, accounts, now))
+
+    trader.trading_control_store = store
+    return store
 
 
 @click.command()
@@ -78,6 +123,13 @@ def main(simulation: bool,
         loop.add_signal_handler(signal.SIGTERM, handle_sigint)
 
         trader.connect()
+
+        # [M1-F3] Task 4: the durable per-account pause gate must be seeded
+        # before this service is considered ready -- an exposure-increasing
+        # command that races startup must find a governed (not missing)
+        # row, never a silent bypass. Uses the SAME journal file connect()
+        # just migrated/opened.
+        _seed_trading_control(trader, container)
 
         ip_address = get_network_ip()
         logging.debug('starting trading_runtime at network address: {}'.format(ip_address))

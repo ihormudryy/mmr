@@ -79,6 +79,7 @@ would otherwise scrub to an opaque ``INTERNAL_ERROR``.
 
 from __future__ import annotations
 
+import datetime as dt
 from dataclasses import asdict
 from typing import Any, Dict, Optional
 
@@ -95,6 +96,11 @@ from trader.trading.proposal_command_service import (
     ProposalCommandService,
     ProposalCreateRequest,
     ProposalCreationRefused,
+)
+from trader.trading.trading_control import (
+    PauseRevisionConflict,
+    PauseStateUnavailable,
+    TradingControlStore,
 )
 
 
@@ -231,6 +237,33 @@ class RejectProposalRequest(BaseModel):
         return _reject_colon_in_command_id(value)
 
 
+class SetTradingPauseRequest(BaseModel):
+    """[M1-F3] Task 4. The account is ALWAYS the coordinator's own
+    configured account (``account_id`` passed to
+    ``register_command_authority``), never request-supplied -- there is no
+    ``account_id`` field here."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    command_id: str
+    paused: bool
+    expected_version: Optional[int] = None
+    reason: str
+    preflight_nonce: Optional[str] = None
+
+    @field_validator("command_id")
+    @classmethod
+    def _command_id_has_no_colon(cls, value: str) -> str:
+        return _reject_colon_in_command_id(value)
+
+
+class GetTradingControlRequest(BaseModel):
+    """No fields: this always reads the coordinator's own configured
+    account, exactly like the command above never accepts one."""
+
+    model_config = ConfigDict(extra="forbid")
+
+
 class GetCommandRequest(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
@@ -322,6 +355,62 @@ def _reject_proposal_rpc_handler(coordinator: TradingCommandCoordinator, account
     return _handler
 
 
+def _set_trading_pause_action(controls: TradingControlStore, account_id: Optional[str]):
+    """The coordinator-registered inner action for ``set_trading_pause``.
+
+    Runs strictly AFTER the command has been claimed (mirrors
+    ``_create_proposal_action``). ``controls.set`` owns its own row+event
+    transaction (see ``TradingControlStore.set``); its two fail-closed
+    exceptions are translated into ``CommandValidationError`` so the
+    coordinator transitions the command to ``REJECTED`` with a stable code
+    instead of leaking a raw domain exception (and, for any OTHER
+    exception, wedging into ``OUTCOME_UNKNOWN`` per ``execute()``'s
+    contract -- appropriate here too, since a DB failure mid-``set`` is
+    exactly the "ambiguous, reconcile later" case).
+    """
+    def _action(command: CommandRequest) -> Dict[str, Any]:
+        body = command.body
+        try:
+            state = controls.set(
+                account_id,
+                bool(body["paused"]),
+                body.get("expected_version"),
+                command.command_id,
+                body["reason"],
+                dt.datetime.now(dt.timezone.utc),
+            )
+        except PauseRevisionConflict as exc:
+            raise CommandValidationError("PAUSE_REVISION_CONFLICT", str(exc)) from exc
+        except PauseStateUnavailable as exc:
+            raise CommandValidationError("PAUSE_STATE_UNAVAILABLE", str(exc)) from exc
+        return state.to_payload()
+    return _action
+
+
+def _set_trading_pause_rpc_handler(coordinator: TradingCommandCoordinator, account_id: Optional[str]):
+    def _handler(parsed: SetTradingPauseRequest) -> Dict[str, Any]:
+        payload = parsed.model_dump(exclude={"command_id", "preflight_nonce"})
+        request = CommandRequest(
+            command_id=parsed.command_id, action="set_trading_pause", account_id=account_id,
+            target_type="trading_control", target_id=account_id or "",
+            expected_version=parsed.expected_version, body=payload, source="dashboard",
+            preflight_nonce=parsed.preflight_nonce,
+        )
+        receipt = coordinator.execute(request)
+        return _receipt_to_dict(receipt)
+    return _handler
+
+
+def _get_trading_control_handler(controls: TradingControlStore, account_id: Optional[str]):
+    def _handler(_parsed: GetTradingControlRequest) -> Dict[str, Any]:
+        try:
+            state = controls.get(account_id)
+        except PauseStateUnavailable as exc:
+            raise _DispatchProblem("TRADING_CONTROL_UNAVAILABLE", str(exc)) from exc
+        return state.to_payload()
+    return _handler
+
+
 def _get_command_handler(coordinator: TradingCommandCoordinator):
     def _handler(parsed: GetCommandRequest) -> Dict[str, Any]:
         receipt = coordinator.get_command(parsed.command_id)
@@ -354,6 +443,7 @@ def register_command_authority(
     repository: ProposalRepository,
     *,
     account_id: Optional[str] = None,
+    controls: Optional[TradingControlStore] = None,
 ) -> None:
     """Wire the command-authority surface onto ``registry``.
 
@@ -368,6 +458,19 @@ def register_command_authority(
     authenticated trader_service's own configuration) — it is never read
     from the request body, so a client cannot act on an account it doesn't
     own.
+
+    [M1-F3] Task 4: when ``controls`` (a ``TradingControlStore``) is also
+    supplied, ALSO registers ``set_trading_pause`` on ``command`` and
+    ``get_trading_control`` on ``query``. Both a pause and a resume go
+    through the SAME registered action, differentiated only by the
+    ``paused`` field -- and BOTH require a preflight nonce (unlike
+    create/reject above): a pause is risk-reducing but still a real,
+    auditable control action, and treating pause/resume as one action with
+    one preflight rule is simpler and no less safe than special-casing
+    resume alone. ``[M1-C]`` supplies the live nonce ceremony; the paper
+    ``PreflightNonceGate`` accepts the documented ``paper:<command_id>``
+    self-nonce. Omitted (the default) leaves ``command``/``query`` exactly
+    as before this task.
     """
     coordinator.register_action(
         "create_proposal", _create_proposal_action(proposal_service), requires_preflight=False,
@@ -390,6 +493,19 @@ def register_command_authority(
         "query", "list_proposals", ListProposalsRequest, dict, _list_proposals_handler(repository),
     )
 
+    if controls is not None:
+        coordinator.register_action(
+            "set_trading_pause", _set_trading_pause_action(controls, account_id), requires_preflight=True,
+        )
+        registry.register(
+            "command", "set_trading_pause", SetTradingPauseRequest, dict,
+            _set_trading_pause_rpc_handler(coordinator, account_id),
+        )
+        registry.register(
+            "query", "get_trading_control", GetTradingControlRequest, dict,
+            _get_trading_control_handler(controls, account_id),
+        )
+
 
 def build_production_registry(
     trader,
@@ -400,6 +516,7 @@ def build_production_registry(
     command_coordinator: Optional[TradingCommandCoordinator] = None,
     proposal_service: Optional[ProposalCommandService] = None,
     proposal_repository: Optional[ProposalRepository] = None,
+    trading_control: Optional[TradingControlStore] = None,
 ) -> TypedRpcRegistry:
     """Build the typed-RPC registry a production ``trader_service`` serves.
 
@@ -426,6 +543,13 @@ def build_production_registry(
     the ``command`` role empty, exactly as before this task. There is still
     no typed `set_risk_limits` anywhere on this registry, on either role —
     mutating risk limits stays behind the offline-simulation legacy path.
+
+    [M1-F3] Task 4 addition: ``trading_control`` (a ``TradingControlStore``)
+    is an additional OPTIONAL keyword, only consulted when the base three
+    command-authority services are ALSO present — see
+    ``register_command_authority``'s own docstring for what it adds
+    (``set_trading_pause`` / ``get_trading_control``). Omitted, the default,
+    changes nothing.
     """
     if not isinstance(authenticator, HmacServiceAuthenticator):
         raise TypeError(
@@ -451,6 +575,7 @@ def build_production_registry(
         register_command_authority(
             registry, command_coordinator, proposal_service, proposal_repository,
             account_id=getattr(trader, 'ib_account', None),
+            controls=trading_control,
         )
 
     if snapshot_service is not None:

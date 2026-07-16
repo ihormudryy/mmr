@@ -73,6 +73,51 @@ def test_trader_derives_a_separate_journal_path_for_older_configurations():
     assert trader.journal_duckdb_path == '/tmp/mmr.duckdb.journal'
 
 
+@pytest.mark.asyncio
+async def test_reconciliation_journals_a_startup_run_without_changing_report(monkeypatch):
+    trader = _minimal_trader()
+    trader.duckdb_path = '/tmp/reconcile-state.duckdb'
+    trader.domain_journal = object()
+    trader.journal_db = object()
+    trader.client = MagicMock()
+    trader.client.get_open_orders = MagicMock(return_value=[])
+    trader.client.get_executions = MagicMock(return_value=[])
+    trader.get_positions = MagicMock(return_value=[])
+
+    async def no_orders():
+        return []
+
+    trader.client.get_open_orders = no_orders
+    trader.client.get_executions = no_orders
+
+    class Report:
+        findings = []
+        checked_proposals = checked_positions = ib_open_orders = ib_executions = 0
+
+        def to_dict(self):
+            return {"discrepancies": [], "resolutions": [], "ok": True}
+
+    monkeypatch.setattr("trader.trading.reconciliation.reconcile", lambda *args: Report())
+    monkeypatch.setattr("trader.data.proposal_store.ProposalStore.query", lambda *args, **kwargs: [])
+
+    published = []
+
+    class Producer:
+        def __init__(self, **_kwargs):
+            pass
+
+        def publish_run(self, **kwargs):
+            published.append(kwargs)
+
+    monkeypatch.setattr("trader.trading.risk_producer.ReconciliationProducer", Producer)
+
+    assert await trader.reconcile_with_broker(trigger="startup") == {
+        "discrepancies": [], "resolutions": [], "ok": True
+    }
+    assert published[0]["trigger"] == "startup"
+    assert published[0]["discrepancies"] == []
+
+
 # ---------------------------------------------------------------------------
 # PnL subscription lock — race-free "first-claim-wins"
 # ---------------------------------------------------------------------------

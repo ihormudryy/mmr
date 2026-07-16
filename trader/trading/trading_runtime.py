@@ -320,11 +320,14 @@ class Trader():
             # callback; callback registration and the initial completeness
             # barrier happen later in setup_subscriptions()/connected_event().
             journal_db = DuckDBConnection.get_instance(self.journal_duckdb_path)
+            self.journal_db = journal_db
             journal_migrator = SchemaMigrator(journal_db)
             self.domain_journal = DomainJournal(journal_db)
             self.domain_journal.migrate(journal_migrator)
             self.broker_state_store = BrokerStateStore(journal_db)
             self.broker_state_store.migrate(journal_migrator)
+            from trader.trading.risk_producer import ReconciliationProducer
+            ReconciliationProducer(journal_db, self.domain_journal).migrate(journal_migrator)
             self.broker_ingest = BrokerIngest(
                 db=journal_db,
                 journal=self.domain_journal,
@@ -828,7 +831,7 @@ class Trader():
                 async def _delayed_reconcile():
                     try:
                         await asyncio.sleep(8)
-                        await self.reconcile_with_broker()
+                        await self.reconcile_with_broker(trigger='startup')
                     except Exception as ex:
                         logging.warning('startup reconciliation failed: %s', ex)
 
@@ -1855,15 +1858,19 @@ class Trader():
             logging.warning('ib.positions() failed, using cache: %s', ex)
         return self.portfolio.get_positions()
 
-    async def reconcile_with_broker(self) -> dict:
+    async def reconcile_with_broker(self, trigger: str = 'operator') -> dict:
         """Cross-check recent proposals + positions against live IB truth.
 
         REPORT-ONLY: fetches IB open orders, executions and positions, compares
         them to the proposal store and current positions, and returns a
         divergence report. Places/cancels nothing and mutates no proposal status.
         """
+        import uuid
+
         from trader.trading.reconciliation import reconcile
         from trader.data.proposal_store import ProposalStore
+
+        started_at = dt.datetime.now(dt.timezone.utc)
 
         def _action(o):
             return str(getattr(o, 'action', '') or '')
@@ -1932,7 +1939,28 @@ class Trader():
                          '%d open orders, %d executions checked)',
                          report.checked_proposals, report.checked_positions,
                          report.ib_open_orders, report.ib_executions)
-        return report.to_dict()
+        result = report.to_dict()
+        # Reconciliation remains report-only: failure to record its audit
+        # event must never alter the existing report or broker interaction.
+        if getattr(self, 'domain_journal', None) is not None:
+            try:
+                from trader.trading.risk_producer import ReconciliationProducer
+
+                journal_db = getattr(self, 'journal_db', None)
+                if journal_db is None:
+                    journal_db = self.domain_journal.db
+                ReconciliationProducer(db=journal_db, journal=self.domain_journal).publish_run(
+                    run_id=f"recon-{uuid.uuid4().hex}",
+                    trigger=trigger,
+                    source_cursor=None,
+                    discrepancies=result.get('discrepancies', []),
+                    resolutions=result.get('resolutions', []),
+                    started_at=started_at,
+                    completed_at=dt.datetime.now(dt.timezone.utc),
+                )
+            except Exception as ex:
+                logging.warning('journaling reconciliation run failed: %s', ex)
+        return result
 
     def diagnose_portfolio_feed(self) -> dict:
         """Dump raw IB portfolio/positions from every managed account.

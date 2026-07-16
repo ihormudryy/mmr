@@ -57,11 +57,29 @@ transaction: present → compare canonical fields → return the existing
 ``EventIdentityConflict`` (without inserting) when any field differs;
 absent → insert. A ``UNIQUE(entity_type, entity_id, entity_revision)``
 violation is a hard fail-loud error and is never retried.
+
+Commit signalling for the long-poll feed (Task 5, added by this task)
+------------------------------------------------------------------------
+``DomainJournal`` owns one ``threading.Condition`` (``_commit_condition``)
+guarding an in-memory ``_latest_committed_cursor`` counter. ``mutate()``
+bumps that counter and calls ``notify_all()`` via ``_signal_commit`` --
+strictly AFTER its transaction has durably ``COMMIT``ed AND after
+``_write_lock`` has been released (never before commit: a pre-commit signal
+would be a false/lost wakeup for a transaction that might still roll back
+or hasn't actually finished). ``wait_for_cursor_after`` is the reader side:
+it re-checks its predicate in a ``while`` loop UNDER the condition's lock on
+every wakeup (guarding spurious wakeups) using a monotonic-clock deadline,
+and performs no DB I/O while holding that lock. ``_sync_latest_committed_cursor``
+seeds the counter from the durable journal inside ``migrate()`` so a
+process restart (or any fresh ``DomainJournal`` wrapping a pre-existing
+file) doesn't make the first long-poll read block needlessly for history
+that predates this in-process instance.
 """
 from __future__ import annotations
 
 import json
 import threading
+import time
 from datetime import datetime, timezone
 from typing import Any, Callable, Optional, Sequence
 from uuid import uuid4
@@ -204,6 +222,13 @@ class DomainJournal:
         # cheap insurance against two Python threads independently racing
         # DuckDB's single-active-write-transaction model.
         self._write_lock = threading.Lock()
+        # Task 5's long-poll commit signal (see module docstring "Commit
+        # signalling for the long-poll feed"). `_latest_committed_cursor`
+        # is bumped, and `_commit_condition` notified, only after a
+        # transaction has durably committed AND `_write_lock` has been
+        # released -- see `_signal_commit`.
+        self._commit_condition = threading.Condition()
+        self._latest_committed_cursor: int = 0
 
     # ------------------------------------------------------------------ #
     # Connection access
@@ -239,6 +264,9 @@ class DomainJournal:
         migrator.apply(1, "domain_event_journal", _JOURNAL_DDL)
         migrator.apply(2, "domain_snapshot_checkpoints", _CHECKPOINTS_DDL)
         migrator.apply(3, "domain_materialized_entities", _MATERIALIZED_DDL)
+        # Task 5: seed the in-memory commit-signal counter from whatever is
+        # already durably in the journal -- see module docstring.
+        self._sync_latest_committed_cursor()
 
     # ------------------------------------------------------------------ #
     # Atomic append
@@ -266,8 +294,17 @@ class DomainJournal:
         idempotent-retry semantics requested). Producers that need
         idempotent retries (the common case -- e.g. replaying an IB
         callback after a crash) pass a stable, source-derived id.
+
+        Task 5: on success, ``_signal_commit`` fires strictly AFTER this
+        method's ``with self._write_lock:`` block has exited (i.e. after
+        both the durable ``COMMIT`` and the write-lock release) -- see that
+        method's docstring and the module docstring's "Commit signalling"
+        section. On any exception the ``raise`` inside the ``except`` below
+        propagates out of the whole method without ever reaching the signal
+        call, so a rolled-back transaction never notifies a waiting reader.
         """
         eid = event_id if event_id is not None else str(uuid4())
+        committed_event: Optional[DomainEvent] = None
         with self._write_lock:
             conn.execute("BEGIN TRANSACTION")
             try:
@@ -276,25 +313,26 @@ class DomainJournal:
                     if not self._matches(existing, mutation):
                         raise EventIdentityConflict(eid)
                     conn.execute("COMMIT")
-                    return self._row_to_event(existing)
+                    committed_event = self._row_to_event(existing)
+                else:
+                    current_revision = self._read_current_revision(
+                        conn, mutation.entity_type, mutation.entity_id
+                    )
+                    next_revision = current_revision + 1
 
-                current_revision = self._read_current_revision(
-                    conn, mutation.entity_type, mutation.entity_id
-                )
-                next_revision = current_revision + 1
+                    # Caller's own materialized write. Runs INSIDE this
+                    # transaction -- if it raises, everything below (and
+                    # this callback's own writes) rolls back together
+                    # (atomicity, binding item 4).
+                    write_materialized(conn, next_revision)
 
-                # Caller's own materialized write. Runs INSIDE this
-                # transaction -- if it raises, everything below (and this
-                # callback's own writes) rolls back together (atomicity,
-                # binding item 4).
-                write_materialized(conn, next_revision)
+                    received_ts = _utcnow()
+                    self._upsert_materialized(conn, mutation, next_revision, received_ts)
+                    committed_event = self._insert_journal_row(
+                        conn, eid, mutation, next_revision, received_ts
+                    )
 
-                received_ts = _utcnow()
-                self._upsert_materialized(conn, mutation, next_revision, received_ts)
-                event = self._insert_journal_row(conn, eid, mutation, next_revision, received_ts)
-
-                conn.execute("COMMIT")
-                return event
+                    conn.execute("COMMIT")
             except BaseException:
                 try:
                     conn.execute("ROLLBACK")
@@ -304,6 +342,85 @@ class DomainJournal:
                     # real exception being re-raised below.
                     pass
                 raise
+        # `_write_lock` is released above (the `with` block has exited).
+        # ONLY NOW -- after both the durable COMMIT and the lock release --
+        # do we bump the in-memory cursor and wake long-poll readers.
+        self._signal_commit(committed_event.source_cursor)
+        return committed_event
+
+    # ------------------------------------------------------------------ #
+    # Task 5: commit signalling for the long-poll feed
+    # ------------------------------------------------------------------ #
+
+    def _signal_commit(self, source_cursor: int) -> None:
+        """Bump ``_latest_committed_cursor`` and wake every long-poll reader.
+
+        Called ONLY from ``mutate()``, ONLY after its transaction has
+        durably ``COMMIT``ed and ONLY after ``_write_lock`` has already been
+        released (see the call site) -- a pre-commit or pre-release signal
+        would be a false/lost wakeup (a reader could act on a transaction
+        that then rolls back, or race a writer that hasn't actually
+        finished yet).
+
+        Uses ``notify_all()`` (never ``notify()``): several readers can be
+        waiting on different, unrelated ``after_cursor`` values at once, and
+        exactly one commit must be able to satisfy any subset of them.
+        Every waiter re-checks its OWN predicate under the lock in
+        ``wait_for_cursor_after``'s ``while`` loop, so a waiter whose
+        predicate isn't satisfied by this particular commit just loops back
+        into ``wait()`` -- ``notify_all`` is safe to call unconditionally
+        regardless of how many readers are (or aren't) actually waiting.
+        """
+        with self._commit_condition:
+            if source_cursor > self._latest_committed_cursor:
+                self._latest_committed_cursor = source_cursor
+            self._commit_condition.notify_all()
+
+    def _sync_latest_committed_cursor(self) -> None:
+        """Seed ``_latest_committed_cursor`` from the durable journal.
+
+        Called from ``migrate()`` (idempotent -- safe every time). Without
+        this, a fresh ``DomainJournal`` wrapping a file that already has
+        committed history (e.g. after a process restart) would start its
+        counter at 0, making the very first ``wait_for_cursor_after(0, ...)``
+        call block for the full requested timeout even though matching rows
+        already durably exist -- ``read_after()`` would still find them
+        eventually, but only after needlessly burning the whole wait budget.
+        Only ever advances the counter, never regresses it.
+        """
+        conn = self.connect()
+        row = conn.execute(
+            "SELECT COALESCE(MAX(source_cursor), 0) FROM domain_event_journal"
+        ).fetchone()
+        newest = row[0] if row is not None else 0
+        with self._commit_condition:
+            if newest > self._latest_committed_cursor:
+                self._latest_committed_cursor = newest
+
+    def wait_for_cursor_after(self, after_cursor: int, deadline: float) -> int:
+        """Block until a commit has produced ``source_cursor > after_cursor``,
+        or ``deadline`` (a ``time.monotonic()`` timestamp) passes -- whichever
+        comes first. Returns the latest known committed cursor at the moment
+        of return (this may still be ``<= after_cursor`` if the deadline was
+        reached with no qualifying commit).
+
+        [M1-F1] Task 5's long-poll reader. The ``while`` loop re-checks the
+        predicate UNDER the condition's lock on every wakeup -- guarding
+        against spurious wakeups, since a condition variable's ``wait()`` may
+        return with no corresponding ``notify()`` at all -- and recomputes
+        its remaining budget from ``time.monotonic()`` on every iteration
+        (immune to wall-clock adjustments, and correct no matter how many
+        spurious/irrelevant wakeups occur first). Performs NO database I/O
+        while holding the lock: callers run their own ``read_after()`` query
+        themselves, strictly after this method returns.
+        """
+        with self._commit_condition:
+            while self._latest_committed_cursor <= after_cursor:
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    break
+                self._commit_condition.wait(timeout=remaining)
+            return self._latest_committed_cursor
 
     # ------------------------------------------------------------------ #
     # Test-support / read APIs

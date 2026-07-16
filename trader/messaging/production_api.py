@@ -29,14 +29,50 @@ This module is the other half of the split:
   (``place_order_simple``, ``place_expressive_order``,
   ``place_standalone_order``, ``set_risk_limits``, ``cancel_all``) are
   reachable through this registry, on either role.
+
+[M1-F1] Task 5 addition -- event-foundation read methods
+-----------------------------------------------------------
+``build_production_registry`` also accepts two OPTIONAL keyword-only
+services: ``snapshot_service`` (a ``DomainSnapshotService``) and
+``feed_service`` (a ``DomainFeedService``). When supplied, they register
+``snapshot_with_cursor`` on role ``query`` and ``read_domain_events`` on
+role ``feed`` respectively -- never on ``command`` (reserved for
+``[M1-F3]``, same as everything else here). Both default to ``None`` and
+are simply omitted from the registry when absent, so every existing call
+site (``Trader.connect()``, and ``_FakeTrader``-based tests like
+``test_production_rpc_security.py``) keeps working unchanged.
+
+This is deliberately opt-in rather than unconditional: ``DomainJournal`` (and
+the ``DomainSnapshotService``/``DomainFeedService`` built on it) has no live
+instance wired into ``Trader`` yet -- Tasks 3/4 landed those classes as
+standalone modules with their own dedicated test fixtures, but nothing in
+``trading_runtime.py`` constructs a ``DomainJournal`` against
+``journal_duckdb_path`` or attaches it to ``Trader`` today. Threading that
+construction through ``Trader.connect()`` and updating its
+``build_production_registry(...)`` call site is out of this task's scope
+(only this module, ``feed_service.py``, and its own test file) and is left
+for a follow-up wiring task -- until that lands, these two methods are
+registrable and independently tested (see ``tests/test_domain_feed.py``),
+but not yet reachable on a live ``trader_service``'s sockets.
+
+Both handlers translate their domain-layer exceptions into wire-level
+``RpcProblem`` codes via ``typed_rpc._DispatchProblem`` (the same mechanism
+``snapshot_service.py``'s own docstring documents): ``SnapshotNotReady`` ->
+``SNAPSHOT_NOT_READY`` (dormant in F1 per BLOCKER-2 -- never actually raised
+yet, but the mapping is wired now) and ``CursorExpired`` -> ``CURSOR_EXPIRED``
+(RA-5). Without this, both would fall through to the generic scrubbed
+``INTERNAL_ERROR`` catch-all in ``TypedRpcServer._handle_request``, and a
+caller could never distinguish "must re-snapshot" from "the server broke".
 """
 
 from __future__ import annotations
 
-from typing import Any, Dict
+from typing import Any, Dict, Optional
 
+from trader.domain.feed_service import CURSOR_EXPIRED, CursorExpired, DomainFeedService, domain_event_to_wire
+from trader.domain.snapshot_service import SNAPSHOT_NOT_READY, DomainSnapshotService, SnapshotNotReady
 from trader.messaging.trader_service_api import TraderServiceApi
-from trader.messaging.typed_rpc import HmacServiceAuthenticator, TypedRpcRegistry
+from trader.messaging.typed_rpc import HmacServiceAuthenticator, TypedRpcRegistry, _DispatchProblem
 
 
 def validate_rpc_mode(simulation: bool, unsafe_legacy_rpc: bool) -> None:
@@ -71,7 +107,44 @@ def _no_arg_handler(fn):
     return _handler
 
 
-def build_production_registry(trader, authenticator: HmacServiceAuthenticator) -> TypedRpcRegistry:
+def _read_domain_events_handler(feed_service: DomainFeedService):
+    def _handler(body: Dict[str, Any]) -> Dict[str, Any]:
+        try:
+            result = feed_service.read_domain_events(
+                after_cursor=body['after_cursor'],
+                limit=body['limit'],
+                wait_ms=body['wait_ms'],
+            )
+        except CursorExpired as exc:
+            raise _DispatchProblem(CURSOR_EXPIRED, str(exc)) from exc
+        return {
+            'events': [domain_event_to_wire(event) for event in result.events],
+            'newest_cursor': result.newest_cursor,
+        }
+    return _handler
+
+
+def _snapshot_with_cursor_handler(snapshot_service: DomainSnapshotService):
+    def _handler(_body: Dict[str, Any]) -> Dict[str, Any]:
+        try:
+            snapshot = snapshot_service.snapshot_with_cursor()
+        except SnapshotNotReady as exc:
+            raise _DispatchProblem(SNAPSHOT_NOT_READY, str(exc)) from exc
+        return {
+            'source_cursor': snapshot.source_cursor,
+            'broker_generation': snapshot.broker_generation,
+            'entities': snapshot.entities,
+        }
+    return _handler
+
+
+def build_production_registry(
+    trader,
+    authenticator: HmacServiceAuthenticator,
+    *,
+    snapshot_service: Optional[DomainSnapshotService] = None,
+    feed_service: Optional[DomainFeedService] = None,
+) -> TypedRpcRegistry:
     """Build the typed-RPC registry a production ``trader_service`` serves.
 
     ``authenticator`` isn't consulted by the handlers below (the typed
@@ -83,8 +156,10 @@ def build_production_registry(trader, authenticator: HmacServiceAuthenticator) -
     ``[M1-F3]``, which will need the authenticator when it adds
     coordinator-authorized command methods.
 
-    Registers ONLY ``query``-role health/read methods for now — no
-    ``command``-role methods at all.
+    Registers ``query``-role health/read methods, plus (opt-in, see module
+    docstring's "[M1-F1] Task 5 addition") ``snapshot_with_cursor`` on
+    ``query`` and ``read_domain_events`` on ``feed`` when their service
+    objects are supplied. No ``command``-role methods at all.
     """
     if not isinstance(authenticator, HmacServiceAuthenticator):
         raise TypeError(
@@ -105,5 +180,14 @@ def build_production_registry(trader, authenticator: HmacServiceAuthenticator) -
     # mutating limits stays behind the offline-simulation legacy path until
     # [M1-F3] adds an authorized command equivalent.
     registry.register('query', 'get_risk_limits', dict, dict, _no_arg_handler(api.get_risk_limits))
+
+    if snapshot_service is not None:
+        registry.register(
+            'query', 'snapshot_with_cursor', dict, dict, _snapshot_with_cursor_handler(snapshot_service)
+        )
+    if feed_service is not None:
+        registry.register(
+            'feed', 'read_domain_events', dict, dict, _read_domain_events_handler(feed_service)
+        )
 
     return registry

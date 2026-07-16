@@ -80,22 +80,56 @@ def journal(tmp_duckdb_path):
     return j
 
 
+@pytest.fixture
+def make_journal(tmp_path):
+    """Factory for INDEPENDENT journals on distinct files -- used by the
+    subsumption test, which must run two isolated compactions (one with a
+    live active cursor, one with ``{}``) over identical starting state and
+    compare their outcomes.
+    """
+    from uuid import uuid4
+
+    def _make():
+        path = str(tmp_path / f"journal_{uuid4().hex[:8]}.duckdb")
+        db = DuckDBConnection.get_instance(path)
+        migrator = SchemaMigrator(db)
+        j = DomainJournal(db)
+        j.migrate(migrator)
+        return j
+
+    return _make
+
+
 # --------------------------------------------------------------------- #
 # Brief's verbatim retention test, adapted to a REAL observed cursor
-# instead of a hardcoded absolute value (RA-4 -- see module docstring)
+# instead of a hardcoded absolute value (RA-4 -- see module docstring).
+#
+# NOTE (T6 adversarial-panel fix): the brief's original assertion
+# `oldest_retained_cursor <= dashboard_cursor` is trivially true for ANY
+# retention point and proved nothing about the active cursor. Retention is
+# EXACTLY the time floor (the min within-floor row), and `active_cursors`
+# is subsumed by it (see `compact()`'s docstring and
+# `test_live_within_floor_active_cursor_is_subsumed_by_the_time_floor`).
+# This test now honestly verifies what it can: a checkpoint is written and
+# retention equals the time floor.
 # --------------------------------------------------------------------- #
 
-def test_compaction_preserves_active_cursor_and_latest_checkpoint(journal):
-    dashboard_cursor = _insert_raw_event(
+def test_compaction_writes_a_checkpoint_and_retention_equals_the_time_floor(journal):
+    # A single within-floor row -- so the time floor IS this row's cursor.
+    within_floor_cursor = _insert_raw_event(
         journal, event_id="e-dashboard", entity_id="p-dashboard",
         received_timestamp=NOW - dt.timedelta(days=5),
     )
 
-    result = journal.compact(now=NOW, active_cursors={"dashboard": dashboard_cursor})
+    result = journal.compact(now=NOW, active_cursors={"dashboard": within_floor_cursor})
 
     assert isinstance(result, CompactionResult)
-    assert result.oldest_retained_cursor <= dashboard_cursor
+    # Retention is the time floor exactly (the only within-floor row) --
+    # NOT because the active cursor "preserved" anything.
+    assert result.oldest_retained_cursor == within_floor_cursor
+    assert result.deleted_count == 0
     assert journal.latest_checkpoint() is not None
+    assert journal.latest_checkpoint().oldest_retained_cursor == within_floor_cursor
 
 
 # --------------------------------------------------------------------- #
@@ -156,18 +190,59 @@ def test_event_older_than_floor_with_no_active_cursor_is_deleted(journal):
     assert [e.event_id for e in journal.read_after(0, 100)] == ["e-fresh"]
 
 
-def test_never_deletes_an_event_at_or_after_a_live_active_cursor(journal):
-    c1 = _insert_raw_event(journal, event_id="e1", entity_id="p1", received_timestamp=NOW - dt.timedelta(days=40))
+def test_below_floor_active_cursor_does_not_extend_retention(journal):
+    # A below-floor active cursor is FORCE-EXPIRED: it must NOT extend
+    # retention to protect the stale rows at/after it (the old, vacuous
+    # framing was "never deletes an event at/after a live active cursor" --
+    # false: c2 IS at/after the passed cursor and IS deleted, precisely
+    # because that cursor is force-expired).
+    _insert_raw_event(journal, event_id="e1", entity_id="p1", received_timestamp=NOW - dt.timedelta(days=40))
     c2 = _insert_raw_event(journal, event_id="e2", entity_id="p2", received_timestamp=NOW - dt.timedelta(days=35))
     c3 = _insert_raw_event(journal, event_id="e3", entity_id="p3", received_timestamp=NOW - dt.timedelta(days=1))
 
-    # c2 (35 days old) is itself past the floor -- force-expired -- so it
-    # must NOT protect anything; only c3 (within the floor) survives.
+    # c2 (35 days old) is itself past the floor -- force-expired -- so
+    # passing it as an active cursor protects nothing; both e1 AND e2
+    # (the row AT the passed cursor) are deleted, only c3 (within floor)
+    # survives.
     result = journal.compact(now=NOW, active_cursors={"dashboard": c2})
 
     remaining_ids = [e.event_id for e in journal.read_after(0, 100)]
     assert remaining_ids == ["e3"]
     assert result.oldest_retained_cursor == c3
+    assert result.deleted_count == 2  # e1 AND e2 -- the below-floor cursor did not save e2
+
+
+def test_live_within_floor_active_cursor_is_subsumed_by_the_time_floor(make_journal):
+    # The ONE genuinely distinguishing test for `active_cursors`: a LIVE
+    # (within-floor) active cursor produces the EXACT SAME retention as
+    # `{}`, BECAUSE the time floor already protects everything at/after it.
+    # This honestly encodes the subsumption invariant -- it does NOT
+    # pretend the parameter is load-bearing. Two independent journals with
+    # identical starting state are compacted (one with the live cursor, one
+    # with `{}`) and their outcomes compared.
+    def seed(j):
+        _insert_raw_event(j, event_id="e-old", entity_id="p-old", received_timestamp=NOW - dt.timedelta(days=45))
+        live = _insert_raw_event(j, event_id="e-live", entity_id="p-live", received_timestamp=NOW - dt.timedelta(days=3))
+        return live
+
+    j_with = make_journal()
+    live_cursor = seed(j_with)
+    result_with = j_with.compact(now=NOW, active_cursors={"dashboard": live_cursor})
+
+    j_without = make_journal()
+    live_cursor_2 = seed(j_without)
+    result_without = j_without.compact(now=NOW, active_cursors={})
+
+    # Identical starting state ⇒ identical cursor assignment (both journals
+    # are fresh sequences) ⇒ the live cursor and `{}` yield the SAME
+    # retention point and deletion count.
+    assert live_cursor == live_cursor_2
+    assert result_with.oldest_retained_cursor == result_without.oldest_retained_cursor
+    assert result_with.deleted_count == result_without.deleted_count
+    # ...and that shared retention point IS the time floor (the live row),
+    # which is what actually protected it -- not the parameter.
+    assert result_with.oldest_retained_cursor == live_cursor
+    assert [e.event_id for e in j_with.read_after(0, 100)] == ["e-live"]
 
 
 def test_compact_on_empty_journal_writes_a_checkpoint_and_deletes_nothing(journal):
@@ -175,7 +250,44 @@ def test_compact_on_empty_journal_writes_a_checkpoint_and_deletes_nothing(journa
 
     assert result.deleted_count == 0
     assert result.newest_cursor == 0
+    # Defect-2 fix: an empty journal must retain-from 0, NOT 1. The prior
+    # `newest_cursor + 1` clamp set this to 1 and spuriously expired a
+    # cold-start reader.
+    assert result.oldest_retained_cursor == 0
     assert journal.latest_checkpoint() is not None
+    assert journal.latest_checkpoint().oldest_retained_cursor == 0
+
+    # And a cold-start reader (snapshot over the empty journal yields
+    # source_cursor 0) tailing from 0 must NOT get a spurious CursorExpired.
+    feed = DomainFeedService(journal)
+    heartbeat = feed.read_domain_events(0, 100, 0)  # must not raise
+    assert heartbeat.events == ()
+
+
+def test_compact_all_stale_journal_retains_newest_row_and_does_not_expire_a_caught_up_reader(journal):
+    # Defect-2 fix (all-stale symmetric case): every row is older than the
+    # 30-day floor and no live active cursor exists. The prior
+    # `newest_cursor + 1` clamp deleted the NEWEST row too and expired a
+    # reader caught up to it. The newest row must survive and a reader at
+    # `newest_cursor` must not be expired.
+    _insert_raw_event(journal, event_id="e-old1", entity_id="p1", received_timestamp=NOW - dt.timedelta(days=60))
+    newest_cursor = _insert_raw_event(
+        journal, event_id="e-old2", entity_id="p2", received_timestamp=NOW - dt.timedelta(days=45)
+    )
+
+    result = journal.compact(now=NOW, active_cursors={})
+
+    assert result.newest_cursor == newest_cursor
+    assert result.oldest_retained_cursor == newest_cursor
+    # The newest (still-stale) row survives; only strictly-older rows go.
+    assert [e.event_id for e in journal.read_after(0, 100)] == ["e-old2"]
+    assert result.deleted_count == 1
+
+    # A reader caught up to `newest_cursor` tails from there without a
+    # spurious CursorExpired.
+    feed = DomainFeedService(journal)
+    heartbeat = feed.read_domain_events(newest_cursor, 100, 0)  # must not raise
+    assert heartbeat.events == ()
 
 
 def test_latest_checkpoint_is_none_before_any_compaction(journal):

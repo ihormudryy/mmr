@@ -78,16 +78,20 @@ that predates this in-process instance.
 Retention, checkpoints, and the ``fenced_read_lock`` (Task 6)
 ----------------------------------------------------------------
 ``compact(now, active_cursors)`` bounds journal growth: it deletes rows
-strictly older than a 30-day floor (``RETENTION_FLOOR``) UNLESS a still-live
-``active_cursors`` entry needs them, records the outcome as a
-``CompactionResult``, and appends a row to ``domain_snapshot_checkpoints``
-(read back via ``latest_checkpoint()``) recording exactly
-``oldest_retained_cursor`` -- the same column ``DomainFeedService``'s
-``CursorExpired`` check (Task 5) reads. A client whose cursor has fallen
-below that floor is FORCE-EXPIRED: compaction does not extend retention for
-it (a dead/stuck client must never pin the journal open forever), so its
-next ``read_domain_events`` call raises ``CursorExpired`` and it must
-re-establish a baseline via ``snapshot_with_cursor()``. The written
+strictly older than a 30-day floor (``RETENTION_FLOOR``), records the
+outcome as a ``CompactionResult``, and appends a row to
+``domain_snapshot_checkpoints`` (read back via ``latest_checkpoint()``)
+recording exactly ``oldest_retained_cursor`` -- the same column
+``DomainFeedService``'s ``CursorExpired`` check (Task 5) reads. A client
+whose cursor has fallen below that floor is FORCE-EXPIRED: compaction does
+not extend retention for it (a dead/stuck client must never pin the journal
+open forever), so its next ``read_domain_events`` call raises
+``CursorExpired`` and it must re-establish a baseline via
+``snapshot_with_cursor()``. ``active_cursors`` is part of the frozen
+signature but is SUBSUMED by the time floor by design and never changes the
+retention point (a within-floor cursor is already at/after the floor; a
+below-floor cursor is force-expired, not honored) -- see ``compact()``'s
+own docstring/body for the full argument. The written
 checkpoint's ``broker_generation`` is READ from, and carried forward from,
 whatever the previous checkpoint already recorded
 (``read_latest_broker_generation``) -- compaction is a retention concern,
@@ -276,9 +280,13 @@ class CompactionResult:
 
     ``oldest_retained_cursor``: the lowest ``source_cursor`` still present
     in the journal after this run -- every event at/after it survived.
+    Always ``<= newest_cursor`` (see below), so a reader caught up to
+    ``newest_cursor`` is never expired by this compaction.
     ``newest_cursor``: the highest ``source_cursor`` present at the moment
-    this compaction ran (never affected by the deletion -- the newest row
-    is always retained relative to itself).
+    this compaction ran. The newest row is always retained
+    (``oldest_retained_cursor <= newest_cursor`` by construction: an
+    all-stale/empty journal clamps the floor to ``newest_cursor`` rather
+    than past it), so the deletion never removes the newest row.
     ``deleted_count``: rows actually removed by this run. 0 is a common,
     valid outcome (nothing yet falls outside the retention floor).
     ``completed_at``: wall-clock time this compaction finished; also the
@@ -592,21 +600,39 @@ class DomainJournal:
                     if floor_row is not None and floor_row[0] is not None:
                         time_floor_cursor = floor_row[0]
                     else:
-                        # Nothing in the journal is within the floor (either
-                        # the journal is empty, or every row predates the
-                        # cutoff) -- represent "keep nothing on time grounds
-                        # alone" as one past the newest known cursor, so the
-                        # min() below can only be pulled DOWN by a live
-                        # active cursor, never up.
-                        time_floor_cursor = newest_cursor + 1
+                        # Nothing in the journal is within the 30-day floor
+                        # (the journal is empty, or EVERY row predates the
+                        # cutoff). Clamp retention to ``newest_cursor`` --
+                        # deliberately NOT ``newest_cursor + 1`` -- so the
+                        # newest row is always retained and a reader caught
+                        # up to ``newest_cursor`` is NEVER spuriously expired
+                        # (``_raise_if_expired`` uses a strict ``<``). On an
+                        # empty journal ``newest_cursor`` is 0, so
+                        # ``oldest_retained_cursor`` is 0 and a cold-start
+                        # reader at cursor 0 is likewise never expired. (The
+                        # earlier ``newest_cursor + 1`` form was a latent bug:
+                        # it deleted the newest all-stale row and expired a
+                        # caught-up/cold-start reader with CursorExpired.)
+                        time_floor_cursor = newest_cursor
 
-                    # Force-expire: a cursor strictly behind the time floor
-                    # never extends retention (see docstring above).
-                    live_active_cursors = [
-                        cursor for cursor in active_cursors.values()
-                        if cursor >= time_floor_cursor
-                    ]
-                    oldest_retained_cursor = min([time_floor_cursor, *live_active_cursors])
+                    # ``active_cursors`` is part of the FROZEN
+                    # ``compact(now, active_cursors)`` contract, but it is
+                    # SUBSUMED by the time floor by design and provably never
+                    # changes ``oldest_retained_cursor`` or ``deleted_count``:
+                    #   - a WITHIN-floor active cursor is, by construction,
+                    #     already ``>= time_floor_cursor`` (the time floor is
+                    #     the MIN cursor within the floor), so honoring it
+                    #     could never LOWER the retention point;
+                    #   - a BELOW-floor active cursor is deliberately
+                    #     FORCE-EXPIRED and must NOT extend retention -- a
+                    #     dead/stuck client can never pin the journal open
+                    #     forever; it hits ``CursorExpired`` on its next read
+                    #     and re-baselines via ``snapshot_with_cursor()``.
+                    # So retention is EXACTLY the time floor in every case.
+                    # The parameter is retained for the frozen signature and
+                    # for callers/telemetry that log which cursors were live,
+                    # not because it is load-bearing here.
+                    oldest_retained_cursor = time_floor_cursor
 
                     # Carry the current broker generation forward -- this
                     # compaction is a retention concern, not a

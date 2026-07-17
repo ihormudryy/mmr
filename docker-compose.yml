@@ -247,6 +247,12 @@ services:
   strategy:
     <<: *mmr-hardening
     build: *mmr-build
+    # strategies_directory in trader.yaml is the relative path `strategies`,
+    # resolved against CWD. The image's default WORKDIR is /home/trader, so
+    # without this the service looks for /home/trader/strategies (missing) and
+    # every strategy fails to load. The source tree (and strategies/) lives at
+    # /home/trader/mmr -- same repo-root CWD the scheduler already pins.
+    working_dir: /home/trader/mmr
     command: ["python", "-m", "trader.strategy_service"]
     depends_on:
       - ib-gateway
@@ -317,6 +323,27 @@ services:
     environment:
       <<: *mmr-common-env
       WEB_PORT: "7424"
+      # The dashboard is a pure read client -- it must NEVER execute a dill
+      # payload, so command-center startup asserts strict mode. Without this
+      # the command center degrades to inert at boot (ops probes stay up, but
+      # /session 500s and no live data flows). Scoped to the dashboard only --
+      # the trader/strategy services legitimately use dill for object_store
+      # blobs + EXT_OBJECT, so this must NOT go on the shared env anchor.
+      MMR_DILL_STRICT: "1"
+      # Session auth: login token + >=32-byte HMAC session secret, sourced from
+      # .env (gitignored). The command center raises CredentialConfigError ->
+      # POST /session 500 without both. Read-only dashboard: commands stay
+      # disabled (DASHBOARD_COMMANDS_ENABLED unset -> false).
+      DASHBOARD_TOKEN: ${DASHBOARD_TOKEN:-}
+      DASHBOARD_SESSION_SECRET: ${DASHBOARD_SESSION_SECRET:-}
+      # Shared service HMAC key for the typed-RPC seam to the trader (the read
+      # bridge + command gateway authenticate with it). Same 0600 key the trader
+      # loads via trader.yaml's service_hmac_key_file; it's already on the
+      # ~/.config/mmr mount below. Without it the command center degrades at boot
+      # with ServiceHmacKeyError. (The read path additionally needs the trader's
+      # from-wire snapshot/event decoders -- integration-gate CRITICAL-1 -- before
+      # live data flows; this env only clears the credential prerequisite.)
+      MMR_SERVICE_HMAC_KEY_FILE: /home/trader/.config/mmr/service_hmac.key
       # Outbound RPC/PubSub to the trader container (see the addressing note
       # above). No 0.0.0.0 binds here -- the dashboard is a pure client.
       ZMQ_RPC_SERVER_ADDRESS: tcp://trader

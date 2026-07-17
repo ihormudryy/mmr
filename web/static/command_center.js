@@ -1271,6 +1271,17 @@ function ccOpenStrategyParamsDrawer(strategy) {
 }
 
 if (CFG.commandsEnabled) {
+  // [M1-C] fix wave I-1: `/cc` is served with a strict CSP (`script-src
+  // 'self'`, no `'unsafe-inline'` -- web/command_center/session.py's
+  // `_STRICT_CSP`), so these two command-initiation buttons can no longer be
+  // wired via inline `onclick=` (a real browser silently drops the handler,
+  // leaving the button dead) -- bind them here instead, same
+  // addEventListener convention as every other control in this block.
+  document.getElementById('cc-cancel-all-open')
+      ?.addEventListener('click', () => ccCancelAll());
+  document.getElementById('cc-open-proposal')
+      ?.addEventListener('click', () => ccOpenProposalDrawer());
+
   // Proposal drawer: Approve / Reject (Task 4).
   document.getElementById('drawer-content').addEventListener('click', (e) => {
     const approveBtn = e.target.closest('[data-cc-approve]');
@@ -1295,8 +1306,8 @@ if (CFG.commandsEnabled) {
   });
 
   // Working orders: per-leg Cancel (Task 5). "Cancel all" is the static
-  // #cc-cancel-all-open button (command_center.html), wired inline via
-  // onclick="ccCancelAll()" -- same convention as #cc-open-proposal above.
+  // #cc-cancel-all-open button (command_center.html), bound via
+  // addEventListener above (I-1 fix) -- same convention as #cc-open-proposal.
   document.getElementById('order-groups').addEventListener('click', (e) => {
     const btn = e.target.closest('[data-cc-cancel-order]');
     if (!btn) return;

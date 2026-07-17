@@ -456,9 +456,17 @@ def create_proposal(body: CreateProposalBody, request: Request,
 
 
 @router.post("/api/commands/positions/{account}/{conid}/close", status_code=202)
-def close_position(account: str, conid: int, body: ClosePositionBody,
-                   request: Request,
-                   session: str = Depends(require_command_auth)):
+def close_position(
+    account: str,
+    request: Request,
+    body: ClosePositionBody,
+    # [M1-C] fix wave M-1: unlike `CreateProposalBody.conid = Field(gt=0)`,
+    # this path param had no positive-integer bound at all -- a non-positive
+    # conid is now a 422 at this web layer too, consistent with
+    # proposal-create, instead of reaching the gateway/coordinator.
+    conid: int = Path(gt=0),
+    session: str = Depends(require_command_auth),
+):
     # `account` is accepted for URL/audit clarity (it identifies which
     # account's position row the browser is closing) but is NOT part of the
     # frozen `create_proposal` wire contract -- the coordinator's account is

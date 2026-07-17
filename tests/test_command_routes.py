@@ -178,6 +178,21 @@ def test_close_position_builds_reducing_payload(gateway):
     assert "account" not in body  # not part of the frozen wire contract
 
 
+@pytest.mark.parametrize("bad_conid", [0, -1, -265598])
+def test_close_position_rejects_non_positive_conid(gateway, bad_conid):
+    """M-1: the `close_position` route's `conid` path param had no
+    positive-integer bound, unlike `CreateProposalBody.conid = Field(gt=0)`
+    -- a non-positive conid must be a 422 at this web layer (consistent
+    with proposal-create) and must never reach the gateway."""
+    client = make_client(gateway)
+    r = client.post(f"/api/commands/positions/DU123/{bad_conid}/close",
+                    json={"command_id": CMD_ID, "action": "SELL",
+                          "quantity": 40.0, "reasoning": "trim"},
+                    headers=HEADERS)
+    assert r.status_code == 422
+    assert gateway.calls == []
+
+
 def test_commands_disabled_returns_403_before_gateway(gateway):
     client = make_client(gateway, flags=CommandFlags(False, False, None, None))
     r = client.post("/api/commands/proposals", json=_proposal_body(), headers=HEADERS)

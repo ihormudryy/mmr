@@ -105,8 +105,8 @@
     </aside>
     <div class="lower">
       <section id="orders-panel"><h2>Working orders
-        {% if commands_enabled %}<button id="cc-cancel-all-open" type="button"
-                onclick="ccCancelAll()">Cancel all</button>{% endif %}</h2>
+        {% if commands_enabled %}<button id="cc-cancel-all-open"
+                type="button">Cancel all</button>{% endif %}</h2>
         <div id="order-groups"></div></section>
       <section id="fills-panel"><h2>Recent executions</h2>
         <table><thead><tr><th>Time</th><th>Instrument</th><th>Side</th>
@@ -152,7 +152,7 @@
        frozen create_proposal wire contract only knows conIds and this
        dashboard has no resolve-by-symbol endpoint wired in yet, so asking
        for the exact conId is "precision over convenience", not a shortcut. -->
-  <button id="cc-open-proposal" type="button" onclick="ccOpenProposalDrawer()">
+  <button id="cc-open-proposal" type="button">
     New proposal
   </button>
   <aside id="cc-proposal-drawer" class="cc-drawer" hidden>

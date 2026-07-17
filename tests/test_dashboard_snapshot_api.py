@@ -1,6 +1,7 @@
 import asyncio
 import datetime as dt
 import json
+import re
 import socket
 import threading
 import time
@@ -369,3 +370,35 @@ class TestCommandCenterPage:
             assert 'data-commands-enabled="true"' in html
             for cc_marker in _CC_AFFORDANCE_MARKERS:
                 assert cc_marker in html
+
+    @pytest.mark.asyncio
+    async def test_command_affordances_have_no_inline_event_handlers(self, client, cc, app):
+        """[M1-C] fix wave I-1: `/cc` is served with a strict CSP
+        (`script-src 'self'`, no `'unsafe-inline'` -- see
+        `web/command_center/session.py`'s `_STRICT_CSP`), so ANY inline
+        `on*="..."` attribute is silently blocked by a real browser -- the
+        element renders but the handler never fires. `ccCancelAll()` (the
+        "Cancel all" button) and `ccOpenProposalDrawer()` (the "New
+        proposal" button) were previously wired via inline `onclick=`, with
+        no `addEventListener` fallback anywhere in command_center.js, so
+        both buttons were dead on a real page load. This regression guard
+        greps the ENTIRE rendered command-enabled page for any ` on\\w+=`
+        attribute -- not just the two named handlers -- so any future
+        CSP-incompatible handler (onsubmit, oninput, onchange, ...) trips
+        this test too."""
+        app.state.command_flags = CommandFlags(True, False, None, None)
+        _seed(cc)
+        async with client as c:
+            await _login(c)
+            html = (await c.get("/cc")).text
+            assert 'data-commands-enabled="true"' in html
+            assert re.search(r" on\w+=", html) is None, (
+                "found an inline event-handler attribute in /cc's HTML -- "
+                "this is silently blocked by the page's strict CSP "
+                "(script-src 'self', no 'unsafe-inline'); bind it via "
+                "addEventListener in command_center.js instead")
+            # The two previously-dead command-initiation buttons must still
+            # be present and addressable by id (used by command_center.js
+            # to bind their click handlers post-fix).
+            assert 'id="cc-cancel-all-open"' in html
+            assert 'id="cc-open-proposal"' in html

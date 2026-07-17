@@ -94,6 +94,25 @@ class ControlRevisionConflict(Exception):
         )
 
 
+class StartupConfigRecoveryError(Exception):
+    """[M1-F3] Task 7. Startup recovery could not restore ``prior_config``
+    into the live YAML for one or more crashed staged-config revisions.
+
+    Raised (fail-loud) instead of swallowing the failure and reporting the
+    revisions as cleanly recovered: a genuinely failed restore must abort
+    startup rather than let the service come up on a config whose real state
+    is unknown while the DB claims it was rolled back (a falsified audit
+    trail)."""
+
+    def __init__(self, failures: list[tuple[int, str]]):
+        self.failures = failures
+        detail = '; '.join(f'revision {rid}: {err}' for rid, err in failures)
+        super().__init__(
+            f'startup config recovery failed to restore prior_config for '
+            f'{len(failures)} revision(s): {detail}'
+        )
+
+
 # ---------------------------------------------------------------------------
 # [M1-F3] Task 7 -- typed request models + handlers for the strategy-service
 # command/query sockets (42104/42105). Registered onto their own
@@ -616,9 +635,25 @@ class StrategyRuntime():
                 self._swap_runtime(strategy_name, proposed_entry)  # validate + instantiate replacement
                 os.replace(self._staged_path(), self.strategy_config_file)
             except Exception as ex:
-                self._restore_runtime(strategy_name, prior_entry)
+                restore_error = self._restore_runtime(strategy_name, prior_entry)
                 self._unstage_yaml()
                 self._revisions.mark_rolled_back(revision_id, str(ex))
+                if self.get_strategy(strategy_name) is None:
+                    # Double failure: the swap failed AND the restore ALSO
+                    # failed, so the strategy is now UNLOADED with nothing
+                    # replacing it. Fail loudly with a DISTINCT terminal state
+                    # instead of a plain ROLLED_BACK that would imply the prior
+                    # configuration was cleanly restored.
+                    logging.error(
+                        'strategy %r left UNLOADED after a failed params swap AND '
+                        'a failed restore (command %s) -- restart/manual '
+                        'intervention required', strategy_name, command_id,
+                    )
+                    return self._record(
+                        command_id, strategy_name, action, 'ROLLBACK_FAILED', current,
+                        error=f'swap failed: {ex}; restore failed: {restore_error}; '
+                              f'strategy left unloaded',
+                    )
                 return self._record(command_id, strategy_name, action, 'ROLLED_BACK', current, error=str(ex))
             self._revisions.mark_committed(revision_id)
         elif action == 'enable_strategy':
@@ -736,19 +771,23 @@ class StrategyRuntime():
             if bucket is not None and new not in bucket:
                 bucket.append(new)
 
-    def _restore_runtime(self, strategy_name: str, prior_entry: Dict) -> None:
+    def _restore_runtime(self, strategy_name: str, prior_entry: Dict) -> Optional[str]:
         """Best-effort restoration of the PRIOR configuration after a failed
         swap. Never re-raises -- the caller is already inside a rollback
-        path building a ROLLED_BACK receipt; a secondary failure here is
-        logged loudly rather than masking the original error."""
+        path building a receipt; a secondary failure here is logged loudly
+        rather than masking the original error. Returns ``None`` on success,
+        or the restore-error text so the caller can surface a distinct
+        ROLLBACK_FAILED receipt when the strategy is left unloaded."""
         try:
             self._swap_runtime(strategy_name, prior_entry)
-        except Exception:
+            return None
+        except Exception as ex:
             logging.error(
                 'failed to restore prior configuration for %s after a rejected '
                 'params update -- the strategy may be left unloaded until the '
                 'next service restart', strategy_name, exc_info=True,
             )
+            return str(ex)
 
     def _state_payload(self, strategy_name: str, control_revision: int) -> Dict:
         strategy = self.get_strategy(strategy_name)
@@ -781,23 +820,44 @@ class StrategyRuntime():
         ``PREPARED`` by a crash between staging and commit is restored to
         its ``prior_config`` in the live YAML and marked ``ROLLED_BACK``.
         MUST run before the service reports ready / the first
-        ``config_loader`` call (see ``run()``)."""
+        ``config_loader`` call (see ``run()``).
+
+        Restore-then-flip: a revision is flipped to ``ROLLED_BACK`` ONLY after
+        its live YAML has been successfully restored. A failed restore leaves
+        the revision ``PREPARED`` (retried on the next startup) and raises
+        ``StartupConfigRecoveryError`` so THIS startup refuses to come up on a
+        config whose real state is unknown -- never eagerly rolling back
+        (which would lose the retry and falsify the audit trail)."""
         if self._revisions is None:
             return []
-        recovered = self._revisions.recover_on_startup()
-        for revision_id in recovered:
+        recovered: list[int] = []
+        failures: list[tuple[int, str]] = []
+        for revision_id in self._revisions.prepared_config_revision_ids():
             row = self._revisions.get_config_revision(revision_id)
             if row is None:
                 continue
             try:
                 self._stage_yaml(row['prior_config'])
                 os.replace(self._staged_path(), self.strategy_config_file)
-            except Exception:
+            except Exception as ex:
+                # Fail loud, not silently inconsistent: leave this revision
+                # PREPARED (do NOT flip it) so the next startup retries the
+                # restore, best-effort clean up the stale .tmp, record the
+                # failure, and re-raise below so the service refuses to come
+                # up on a live YAML still holding un-committed proposed values.
+                self._unstage_yaml()
                 logging.error(
                     'failed to restore prior_config for strategy %s (revision %s) '
-                    'during startup recovery -- config may be left inconsistent',
+                    'during startup recovery -- left PREPARED for retry',
                     row['strategy_name'], revision_id, exc_info=True,
                 )
+                failures.append((revision_id, str(ex)))
+                continue
+            # Live YAML restored -> only NOW is it safe to record the rollback.
+            self._revisions.mark_rolled_back(revision_id)
+            recovered.append(revision_id)
+        if failures:
+            raise StartupConfigRecoveryError(failures)
         return recovered
 
     def __get_enabled_strategies(self, conid: int) -> List[Strategy]:

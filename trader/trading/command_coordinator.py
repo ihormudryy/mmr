@@ -89,7 +89,7 @@ from trader.data.schema_migrations import SchemaMigrator
 from trader.domain.commands import CommandReceipt
 from trader.domain.events import DomainMutation
 from trader.domain.identity import command_entity_id
-from trader.messaging.typed_rpc import canonical_json
+from trader.messaging.typed_rpc import TypedRpcRemoteError, canonical_json
 from trader.strategy.strategy_revisions import StrategyCommandReceipt
 from trader.trading.order_correlation import encode_order_ref
 from trader.trading.proposal_command_service import (
@@ -2064,10 +2064,27 @@ class StrategyControlCommandService:
 
         try:
             strategy_receipt = self._port.forward(cmd)
+        except TypedRpcRemoteError as exc:
+            # A DETERMINISTIC strategy-side rejection carrying a declared
+            # ``.code`` (e.g. a stale-CAS CONTROL_REVISION_CONFLICT raised by
+            # apply_control_command BEFORE any strategy-side mutation/receipt)
+            # is a clean REJECT, NOT an ambiguous dispatch -- strategy_service's
+            # true state is definitively "unchanged". Mirrors how the approval
+            # saga routes BrokerRejectedError->REJECTED and cancel routes
+            # CommandValidationError->REJECTED. retryable=True: the operator
+            # re-issues with a fresh control_revision. No reconciler is
+            # scheduled -- there is nothing ambiguous to reconcile.
+            self._transition_command(
+                cmd, "SUBMITTING", "REJECTED", error_code=exc.code,
+            )
+            return self._receipt(cmd.command_id, "REJECTED", exc.code, True)
         except Exception:
-            # Timeout / disconnect / lost ack. NEVER auto-retry an ambiguous
-            # dispatch (retryable=False): Task 9's reconciler resolves the
-            # true outcome via StrategyControlPort.get_receipt(command_id).
+            # Timeout / disconnect / lost ack (no declared code). NEVER
+            # auto-retry an ambiguous dispatch (retryable=False): Task 9's
+            # reconciler resolves the true outcome via
+            # StrategyControlPort.get_receipt(command_id). Ambiguity is
+            # reserved STRICTLY for this case, where strategy_service's true
+            # state genuinely cannot be inferred.
             self._transition_command(
                 cmd, "SUBMITTING", "OUTCOME_UNKNOWN", error_code="DISPATCH_AMBIGUOUS",
             )

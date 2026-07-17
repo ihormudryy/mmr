@@ -20,6 +20,7 @@ Covers, per the task brief:
 from __future__ import annotations
 
 import datetime as dt
+import os
 import types
 from pathlib import Path
 
@@ -44,6 +45,7 @@ from trader.strategy.strategy_revisions import (
 )
 from trader.strategy.strategy_runtime import (
     ControlRevisionConflict,
+    StartupConfigRecoveryError,
     StrategyRuntime,
     register_strategy_control_authority,
 )
@@ -216,6 +218,29 @@ def test_failed_swap_restores_prior_config_and_marks_rolled_back(runtime, config
     assert runtime._revisions.control_revision("smi_crossover") == current   # no revision minted
 
 
+def test_double_failure_swap_and_restore_reports_rollback_failed(runtime, config_path):
+    """[Fix 3] If the staged swap fails AND ``_restore_runtime`` ALSO fails,
+    the strategy is left UNLOADED with nothing replacing it. That must be a
+    DISTINCT terminal receipt (ROLLBACK_FAILED) carrying the restore error --
+    NOT a plain ROLLED_BACK that falsely implies the prior state was
+    restored."""
+    runtime.fail_next_reload()                            # the staged swap fails -> strategy unloaded
+
+    def _failing_restore(strategy_name, prior_entry):     # the restore ALSO fails
+        return "synthetic restore failure"                # never reloads -> strategy stays None
+    runtime._restore_runtime = _failing_restore
+
+    current = runtime._revisions.control_revision("smi_crossover")
+    receipt = runtime.apply_control_command(
+        "cmd-double", "smi_crossover", "update_strategy_params",
+        expected_control_revision=current, params={"EMA_PERIOD": 15})
+
+    assert receipt.state == "ROLLBACK_FAILED"
+    assert receipt.error and "restore" in receipt.error.lower()
+    assert runtime.get_strategy("smi_crossover") is None  # genuinely unloaded
+    assert runtime._revisions.control_revision("smi_crossover") == current  # no revision minted
+
+
 def test_restart_recovers_prepared_to_last_committed(revisions, config_path):
     rid = revisions.prepare_config_revision(
         "smi_crossover", expected_control_revision=3,
@@ -224,6 +249,62 @@ def test_restart_recovers_prepared_to_last_committed(revisions, config_path):
     recovered = revisions.recover_on_startup()
     assert recovered == [rid]
     assert revisions.config_revision_state(rid) == "ROLLED_BACK"
+
+
+def test_startup_recovery_rewrites_live_yaml_back_to_prior_config(runtime, config_path):
+    """[Fix 1a] A staged config revision left PREPARED by a crash AFTER
+    ``os.replace`` (the live YAML already holds the PROPOSED params) must be
+    REWRITTEN back to ``prior_config`` on startup recovery -- not merely
+    flipped to ROLLED_BACK in the DB while the live YAML keeps the proposed
+    values. The JSON columns come back from DuckDB as ``str``; without a
+    ``json.loads`` on read, ``_stage_yaml`` gets a str and blows up, the
+    swallow path leaves the YAML at proposed, yet the DB reports 'recovered'."""
+    cfg = yaml.safe_load(config_path.read_text())
+    prior_entry = dict(cfg["strategies"][0])
+    proposed_entry = dict(prior_entry)
+    proposed_entry["params"] = dict(prior_entry.get("params") or {}, EMA_PERIOD=15)
+
+    # Post-os.replace crash state: the live YAML already holds PROPOSED.
+    crashed = dict(cfg, strategies=[proposed_entry])
+    config_path.write_text(yaml.safe_dump(crashed, sort_keys=False))
+    assert yaml.safe_load(config_path.read_text())["strategies"][0]["params"]["EMA_PERIOD"] == 15
+
+    rid = runtime._revisions.prepare_config_revision(
+        "smi_crossover",
+        expected_control_revision=runtime._revisions.control_revision("smi_crossover"),
+        prior=prior_entry, proposed=proposed_entry, command_id="cmd-crash")
+
+    recovered = runtime.recover_startup_config()
+
+    assert recovered == [rid]
+    assert runtime._revisions.config_revision_state(rid) == "ROLLED_BACK"
+    live_params = yaml.safe_load(config_path.read_text())["strategies"][0].get("params") or {}
+    assert "EMA_PERIOD" not in live_params      # live YAML rewritten back to prior_config
+
+
+def test_startup_recovery_fails_loud_and_retains_prepared_when_restore_raises(runtime, config_path):
+    """[Fix 1] A genuinely failed restore must NOT be downgraded to a log
+    line while the revision is reported as recovered. It must fail loud
+    (raise) AND leave the revision PREPARED -- flipping it to ROLLED_BACK
+    before a confirmed restore would both falsify the audit trail and lose
+    the retry, so the NEXT startup would find nothing to recover and silently
+    come up on the un-restored (proposed) config."""
+    rid = runtime._revisions.prepare_config_revision(
+        "smi_crossover",
+        expected_control_revision=runtime._revisions.control_revision("smi_crossover"),
+        prior={"name": "smi_crossover", "params": {"EMA_PERIOD": 20}},
+        proposed={"name": "smi_crossover", "params": {"EMA_PERIOD": 15}},
+        command_id="cmd-crash")
+
+    def _boom(entry):
+        raise RuntimeError("disk full")
+    runtime._stage_yaml = _boom     # the YAML restore genuinely fails
+
+    with pytest.raises(StartupConfigRecoveryError):
+        runtime.recover_startup_config()
+
+    # Left PREPARED for retry on the next startup -- NOT prematurely flipped.
+    assert runtime._revisions.config_revision_state(rid) == "PREPARED"
 
 
 # ---------------------------------------------------------------------------
@@ -372,6 +453,30 @@ class TestForwardingSagaEdgeCases:
         assert receipt.error_code == "DISPATCH_AMBIGUOUS"
         assert "cmd-2" in forwarding.reconciler.scheduled
         # No strategy.updated is journaled on an ambiguous outcome.
+        kinds = [e.event_type for e in forwarding.journal.read_after(0, 100)]
+        assert "strategy.updated" not in kinds
+
+    def test_forward_deterministic_conflict_rejects_not_ambiguous(self, forwarding):
+        """[Fix 2] A DETERMINISTIC strategy-side rejection surfaced as a
+        declared-code ``TypedRpcRemoteError`` (e.g. a stale-CAS
+        CONTROL_REVISION_CONFLICT raised BEFORE any strategy-side mutation) is
+        a clean REJECT, not an ambiguous dispatch: REJECTED with that code,
+        retryable=True (operator re-issues with a fresh control_revision), and
+        the reconciler is NOT scheduled (ambiguity is reserved for
+        Timeout/Connection errors that leave the true state unknowable)."""
+        from trader.messaging.typed_rpc import TypedRpcRemoteError
+
+        forwarding.port.raise_on_forward(
+            TypedRpcRemoteError("CONTROL_REVISION_CONFLICT", "stale control_revision"))
+        receipt = forwarding.coordinator.execute(_strategy_request(
+            "cmd-conflict", "update_strategy_params", expected_version=0,
+            params={"EMA_PERIOD": 15}))
+
+        assert receipt.state == "REJECTED"
+        assert receipt.error_code == "CONTROL_REVISION_CONFLICT"
+        assert receipt.retryable is True
+        assert forwarding.reconciler.scheduled == []      # NOT reconciled
+        # No strategy.updated on a rejected dispatch.
         kinds = [e.event_type for e in forwarding.journal.read_after(0, 100)]
         assert "strategy.updated" not in kinds
 
@@ -571,6 +676,22 @@ class TestStoreMisc:
         assert rows[0].strategy_name == "smi_crossover"
         revisions.mark_acknowledged(rows[0].ack_id)
         assert revisions.unacknowledged_outbox(10) == []
+
+    def test_unacknowledged_outbox_payload_is_a_dict_not_str(self, revisions, db):
+        """[Fix 1b] The ``payload`` JSON column comes back from DuckDB as a
+        ``str``; the ack-drain feeds it straight into
+        ``RecordStateAcknowledgedRequest.payload: Dict[str, Any]``, so it MUST
+        be re-parsed to a dict on read or the whole ack backstop is broken."""
+        payload = {"strategy_name": "smi_crossover", "state": "RUNNING", "control_revision": 1}
+
+        def _bump(conn):
+            revisions.bump_state_revision_in_tx(conn, "smi_crossover", payload)
+        db.transaction(_bump)
+
+        rows = revisions.unacknowledged_outbox(10)
+        assert len(rows) == 1
+        assert isinstance(rows[0].payload, dict)
+        assert rows[0].payload == payload
 
     def test_apply_control_command_rejects_unknown_action(self, runtime):
         current = runtime._revisions.control_revision("smi_crossover")

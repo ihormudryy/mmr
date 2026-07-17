@@ -40,6 +40,7 @@ never by forcing the value.
 from __future__ import annotations
 
 import datetime as dt
+import json
 import logging as _stdlib_logging
 from dataclasses import dataclass
 from typing import Any, Callable, Literal, Optional
@@ -74,7 +75,7 @@ _STRATEGY_REVISIONS_STATEMENTS = (
         command_id VARCHAR PRIMARY KEY,
         strategy_name VARCHAR NOT NULL,
         action VARCHAR NOT NULL,
-        state VARCHAR NOT NULL CHECK (state IN ('COMMITTED', 'ROLLED_BACK')),
+        state VARCHAR NOT NULL CHECK (state IN ('COMMITTED', 'ROLLED_BACK', 'ROLLBACK_FAILED')),
         control_revision BIGINT NOT NULL,
         state_revision BIGINT NOT NULL,
         error VARCHAR,
@@ -121,6 +122,17 @@ def _utcnow() -> dt.datetime:
     return dt.datetime.now(dt.timezone.utc)
 
 
+def _parse_json_column(value: Any) -> Any:
+    """DuckDB returns a ``JSON`` column as raw JSON TEXT (``str``), not a
+    parsed dict/list. Every read-back of a ``JSON`` column MUST route through
+    here so callers get the ``dict``/``list`` they annotated for -- defensive
+    (leaves an already-parsed value untouched, so it is safe whether or not a
+    future driver/version starts auto-parsing)."""
+    if isinstance(value, (str, bytes, bytearray)):
+        return json.loads(value)
+    return value
+
+
 @dataclass(frozen=True)
 class StrategyCommandReceipt:
     """[M1-F3] Task 7 -- FROZEN field order (per the task brief).
@@ -132,7 +144,11 @@ class StrategyCommandReceipt:
     command_id: str
     strategy_name: str
     action: str
-    state: Literal["COMMITTED", "ROLLED_BACK"]
+    # ``ROLLBACK_FAILED`` is the distinct terminal state for a double failure:
+    # the staged swap failed AND the prior-config restore ALSO failed, leaving
+    # the strategy UNLOADED (never a clean ``ROLLED_BACK``, which implies the
+    # prior state was restored).
+    state: Literal["COMMITTED", "ROLLED_BACK", "ROLLBACK_FAILED"]
     control_revision: int
     state_revision: int
     error: Optional[str] = None
@@ -240,7 +256,7 @@ class StrategyRevisionStore:
             "INSERT INTO strategy_ack_outbox "
             "(strategy_name, state_revision, control_revision, payload, "
             " acknowledged, created_at) VALUES (?, ?, ?, ?, false, ?)",
-            [strategy_name, new_state, control, payload, now],
+            [strategy_name, new_state, control, json.dumps(payload), now],
         )
         return new_state
 
@@ -263,7 +279,7 @@ class StrategyRevisionStore:
         command_id: str,
         strategy_name: str,
         action: str,
-        state: Literal["COMMITTED", "ROLLED_BACK"],
+        state: Literal["COMMITTED", "ROLLED_BACK", "ROLLBACK_FAILED"],
         control_revision: int,
         state_revision: int,
         error: Optional[str] = None,
@@ -297,7 +313,8 @@ class StrategyRevisionStore:
                 "(strategy_name, expected_control_revision, prior_config, "
                 " proposed_config, state, command_id, created_at) "
                 "VALUES (?, ?, ?, ?, 'PREPARED', ?, ?) RETURNING revision_id",
-                [strategy_name, expected_control_revision, prior, proposed,
+                [strategy_name, expected_control_revision,
+                 json.dumps(prior), json.dumps(proposed),
                  command_id, self._now()],
             ).fetchone()
             return row[0]
@@ -366,11 +383,29 @@ class StrategyRevisionStore:
             "revision_id": revision_id_,
             "strategy_name": strategy_name,
             "expected_control_revision": expected_control_revision,
-            "prior_config": prior_config,
-            "proposed_config": proposed_config,
+            # DuckDB hands JSON columns back as str -- re-parse so callers
+            # (startup recovery -> ``_stage_yaml``) get a dict, not a str.
+            "prior_config": _parse_json_column(prior_config),
+            "proposed_config": _parse_json_column(proposed_config),
             "state": state,
             "command_id": command_id,
         }
+
+    def prepared_config_revision_ids(self) -> list[int]:
+        """Every staged-config revision still in ``PREPARED`` (ascending),
+        read WITHOUT mutating state. Startup recovery restores each one's
+        ``prior_config`` into the live YAML and flips it to ``ROLLED_BACK``
+        (via ``mark_rolled_back``) only AFTER a confirmed restore -- a failed
+        restore is left ``PREPARED`` so the next startup retries it, instead
+        of being eagerly rolled back (which would lose the retry and falsify
+        the audit trail). Contrast ``recover_on_startup``, which flips
+        eagerly."""
+        rows = self.db.execute(
+            "SELECT revision_id FROM strategy_config_revisions "
+            "WHERE state = 'PREPARED' ORDER BY revision_id",
+            fetch="all",
+        )
+        return [row[0] for row in rows]
 
     def recover_on_startup(self) -> list[int]:
         """Roll back every ``PREPARED`` staged-config row to ``ROLLED_BACK``.
@@ -414,7 +449,9 @@ class StrategyRevisionStore:
             result.append(OutboxRow(
                 ack_id=ack_id, strategy_name=strategy_name,
                 state_revision=state_revision, control_revision=control_revision,
-                payload=payload, created_at=created_at,
+                # JSON column -> str from DuckDB; re-parse to the dict the
+                # ack-drain feeds into RecordStateAcknowledgedRequest.payload.
+                payload=_parse_json_column(payload), created_at=created_at,
             ))
         return result
 

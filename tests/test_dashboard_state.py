@@ -353,3 +353,85 @@ class TestBaseline:
         )
         with pytest.raises(ValueError, match="entity_id"):
             state.install_baseline(bad, stream_id="stream-c")
+
+
+class TestReadModelCounts:
+    """COMPAT Task 4 soak-metric exporters: `ring_depth()` /
+    `terminal_row_count()` back the `/api/cc-health` `replay_ring_events` /
+    `terminal_rows` keys the soak runner samples for the previously-unmetered
+    `max_replay_ring_events` / `max_terminal_rows` thresholds. Both are pure
+    reads -- they must not mutate state."""
+
+    def test_ring_depth_reflects_current_ring_size(self, state):
+        assert state.ring_depth() == 0
+        for i in range(5):
+            state.apply(
+                _event(event_id=f"evt-{i}", source_cursor=i + 1, entity_revision=i + 1)
+            )
+        assert state.ring_depth() == 5
+
+    def test_ring_depth_matches_replay_after_full_history_length(self, state):
+        for i in range(7):
+            state.apply(
+                _event(event_id=f"evt-{i}", source_cursor=i + 1, entity_revision=i + 1)
+            )
+        assert state.ring_depth() == len(state.replay_after("stream-a", 0))
+
+    def test_ring_depth_is_pure_and_repeatable(self, state):
+        state.apply(_event())
+        first = state.ring_depth()
+        second = state.ring_depth()
+        assert first == second == 1
+
+    def test_terminal_row_count_sums_all_three_terminal_stores(self, state):
+        assert state.terminal_row_count() == 0
+        state.apply(
+            _event(
+                entity_type="proposal",
+                entity_id="p1",
+                event_type="proposal.updated",
+                payload={"status": "REJECTED", "symbol": "AMD"},
+            )
+        )
+        state.apply(
+            _event(
+                entity_type="order",
+                entity_id="o1",
+                event_type="order.updated",
+                payload={"status": "FILLED"},
+            )
+        )
+        state.apply(
+            _event(
+                entity_type="fill",
+                entity_id="f1",
+                event_type="fill.received",
+                payload={"exec_id": "exec-1"},
+            )
+        )
+        assert state.terminal_row_count() == 3
+        view = state.snapshot_view()
+        assert state.terminal_row_count() == (
+            len(view["proposals"]["terminal"])
+            + len(view["orders"]["terminal"])
+            + len(view["fills"])
+        )
+
+    def test_terminal_row_count_excludes_active_rows(self, state):
+        state.apply(
+            _event(
+                entity_type="proposal",
+                entity_id="p1",
+                event_type="proposal.updated",
+                payload={"status": "PENDING", "symbol": "AMD"},
+            )
+        )
+        state.apply(
+            _event(
+                entity_type="order",
+                entity_id="o1",
+                event_type="order.updated",
+                payload={"status": "SUBMITTED"},
+            )
+        )
+        assert state.terminal_row_count() == 0

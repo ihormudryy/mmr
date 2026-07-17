@@ -101,6 +101,13 @@ class SseFanout:
     def client_count(self) -> int:
         return len(self._clients)
 
+    def max_fifo_depth(self) -> int:
+        """Deepest client replay FIFO right now (bound is `FIFO_LIMIT`). A
+        pure read, no side effects -- exposed on `/api/cc-health` as
+        `client_fifo_depth_max` so the soak runner can sample it for the
+        previously fail-closed `max_client_fifo_depth` COMPAT threshold."""
+        return max((len(c.fifo) for c in self._clients), default=0)
+
     def publish(self, envelope: dict) -> None:
         """Fan a journaled domain-event envelope out to every live client.
 

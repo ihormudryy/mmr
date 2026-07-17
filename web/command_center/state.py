@@ -75,6 +75,9 @@ class _TerminalStore:
     def __contains__(self, entity_id: str) -> bool:
         return entity_id in self._rows
 
+    def __len__(self) -> int:
+        return len(self._rows)
+
 
 class DashboardState:
     def __init__(self, *, clock=time.time, monotonic=time.monotonic):
@@ -283,6 +286,23 @@ class DashboardState:
             "trading_control": list(self.trading_control.values()),
             "commands": list(self.commands.values()),
         }
+
+    def ring_depth(self) -> int:
+        """Current replay-ring size (bounded by `REPLAY_RING_MAX_EVENTS` /
+        `REPLAY_RING_MAX_AGE_SECONDS`, see `_prune_ring`). A pure read, no
+        side effects -- exposed on `/api/cc-health` as `replay_ring_events`
+        so the soak runner can sample it over time for the previously
+        fail-closed `max_replay_ring_events` COMPAT threshold."""
+        return len(self._ring)
+
+    def terminal_row_count(self) -> int:
+        """Total retained terminal rows across all three `_TerminalStore`s
+        (`proposals_terminal` + `orders_terminal` + `fills`, each capped at
+        `TERMINAL_CAP`). A pure read, no side effects -- exposed on
+        `/api/cc-health` as `terminal_rows` so the soak runner can sample it
+        for the previously fail-closed `max_terminal_rows` COMPAT
+        threshold."""
+        return len(self.proposals_terminal) + len(self.orders_terminal) + len(self.fills)
 
     def _prune_ring(self, now: float) -> None:
         while len(self._ring) > REPLAY_RING_MAX_EVENTS:

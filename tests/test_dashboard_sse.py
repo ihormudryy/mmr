@@ -91,6 +91,36 @@ class TestFifoBounds:
         assert replay == [] and fresh.resync is False
 
 
+class TestFifoDepth:
+    """COMPAT Task 4 soak-metric exporters: `max_fifo_depth()` backs the
+    `/api/cc-health` `client_fifo_depth_max` key the soak runner samples for
+    the previously-unmetered `max_client_fifo_depth` threshold."""
+
+    def test_max_fifo_depth_is_zero_with_no_clients(self, fanout):
+        assert fanout.max_fifo_depth() == 0
+
+    def test_max_fifo_depth_is_zero_for_a_freshly_registered_client(self, fanout):
+        fanout.register(None)
+        assert fanout.max_fifo_depth() == 0
+
+    def test_max_fifo_depth_tracks_the_deepest_client(self, state, fanout):
+        slow_client, _, _ = fanout.register(None)
+        fast_client, _, _ = fanout.register(None)
+        for i in range(1, 4):
+            _apply_and_publish(state, fanout, _event(i, i))
+        # Drain the fast client so only the slow one still carries backlog.
+        fast_client.fifo.clear()
+        assert len(slow_client.fifo) == 3
+        assert fanout.max_fifo_depth() == 3
+
+    def test_max_fifo_depth_reflects_overflow_clear(self, state, fanout):
+        client, _, _ = fanout.register(None)
+        for i in range(1, FIFO_LIMIT + 2):
+            _apply_and_publish(state, fanout, _event(i, i))
+        assert client.resync is True
+        assert fanout.max_fifo_depth() == 0
+
+
 class TestResyncBroadcast:
     def test_broadcast_resync_flags_every_client(self, state, fanout):
         a, _, _ = fanout.register(None)

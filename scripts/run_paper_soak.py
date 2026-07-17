@@ -33,15 +33,18 @@ NOTE -- source-vs-brief drift (see the report accompanying this task):
 `--commands-per-hour`, or `--metrics-out`), and its `--report` JSON is a
 nested `{config, domain_events_received, latency_ms, rss_bytes,
 cpu_avg_cores, violations}` shape, not the flat spec-13.3 counter set. Only
-`p95_critical_ms` (from `latency_ms.p95`) is derived from it here --
-`unhandled_errors`, `unresolved_commands`, `max_replay_ring_events`,
-`max_client_fifo_depth`, and `max_terminal_rows` have no live exporter
-anywhere in this codebase revision (the ring/FIFO/terminal-retention
-bookkeeping in `web/command_center/state.py` and `sse.py` is private
-in-process state with no HTTP surface), so they are intentionally left
-absent from the harness dict `evaluate_soak` sees. Its existing
-fail-closed contract (`harness.get(name) is None` -> check fails) reports
-that honestly as "not observed" rather than fabricating a passing zero.
+`p95_critical_ms` (from `latency_ms.p95`) is derived from the harness. The
+ring/FIFO/terminal-retention metrics -- `max_replay_ring_events`,
+`max_client_fifo_depth`, `max_terminal_rows` -- ARE now live: the read model
+exposes the current counts on the authenticated `/api/cc-health` endpoint
+(`replay_ring_events`/`client_fifo_depth_max`/`terminal_rows`), and this
+runner samples that endpoint each interval and folds the running maxima into
+the dict `evaluate_soak` sees (see `cc_health_metrics`/`fold_read_model_sample`
+below). Only `unhandled_errors` and `unresolved_commands` still have no live
+exporter (those are trader-side/command-ledger state with no web surface --
+a Worker-B/F3 follow-up); for those two the existing fail-closed contract
+(`harness.get(name) is None` -> check fails) reports honestly as "not
+observed" rather than fabricating a passing zero.
 Likewise, the real authenticated `GET /api/health` payload
 (`web/app.py::api_health` / `trader/operations/health.py::
 build_health_payload`) is `{process, dependencies: {trader: {reachable,
@@ -209,6 +212,67 @@ def harness_metrics(raw: dict) -> dict:
     return {'p95_critical_ms': latency.get('p95')}
 
 
+# --- COMPAT exporters: replay-ring / FIFO / terminal-rows soak metrics -------
+#
+# Unlike `unhandled_errors`/`unresolved_commands` (still no live exporter --
+# trader-side command-ledger / error-log surface, a Worker-B/F3 follow-up),
+# three of the six `evaluate_soak` thresholds ARE now backed by a live
+# exporter: `web/command_center/state.py`'s `ring_depth()`/
+# `terminal_row_count()` and `sse.py`'s `max_fifo_depth()`, surfaced on the
+# authenticated `/api/cc-health` endpoint as `replay_ring_events`/
+# `terminal_rows`/`client_fifo_depth_max`. This section samples that
+# endpoint each minute alongside the container stats and keeps a running max
+# of each, mirroring `harness_metrics` above for the soak-harness report.
+
+def cc_health_metrics(raw: dict) -> dict:
+    """Translate one `/api/cc-health` response into the flat `max_*` keys
+    `evaluate_soak` understands. Missing keys default to 0 rather than
+    raising -- a single malformed/incomplete sample must not crash an
+    otherwise-healthy multi-hour run.
+    """
+    return {
+        'max_replay_ring_events': int(raw.get('replay_ring_events') or 0),
+        'max_client_fifo_depth': int(raw.get('client_fifo_depth_max') or 0),
+        'max_terminal_rows': int(raw.get('terminal_rows') or 0),
+    }
+
+
+def fold_read_model_sample(maxima: dict, raw: dict) -> dict:
+    """Merge one `/api/cc-health` sample into the running max-so-far for
+    the three read-model soak metrics. Pure -- returns a new dict rather
+    than mutating ``maxima``, so callers can chain samples across the soak
+    window without aliasing bugs.
+    """
+    sample = cc_health_metrics(raw)
+    return {key: max(maxima.get(key, 0), sample[key]) for key in sample}
+
+
+def _cc_health(base_url: str, cookie: str) -> dict:
+    req = urllib.request.Request(base_url + '/api/cc-health',
+                                 headers={'Cookie': cookie})
+    with urllib.request.urlopen(req, timeout=10) as resp:
+        return json.load(resp)
+
+
+def sample_read_model(base_url: str, token: str, cookie: str,
+                      maxima: dict) -> tuple[str, dict]:
+    """Fetch `/api/cc-health` and fold it into the running maxima. Returns
+    ``(cookie, maxima)`` -- a dashboard restart mid-soak invalidates the
+    prior session cookie (see `run_scenario`'s own re-login for the same
+    reason), so a failed fetch here triggers one re-login attempt before
+    giving up for this tick; a transient miss is one skipped data point,
+    never a soak-ending exception.
+    """
+    try:
+        return cookie, fold_read_model_sample(maxima, _cc_health(base_url, cookie))
+    except Exception:  # noqa: BLE001 -- best-effort sample, see docstring
+        try:
+            cookie = login(base_url, token)
+            return cookie, fold_read_model_sample(maxima, _cc_health(base_url, cookie))
+        except Exception:  # noqa: BLE001
+            return cookie, maxima
+
+
 # --- failure injection -------------------------------------------------------
 
 @dataclass(frozen=True)
@@ -350,7 +414,7 @@ def main() -> int:
     token = Path(args.token_file).read_text().strip()
     minutes = int(args.hours * 60)
     report_path = Path('/tmp/soak_harness_report.json')
-    harness = spawn_harness(args.hours * 60.0, report_path)
+    harness_proc = spawn_harness(args.hours * 60.0, report_path)
 
     samples: list[Sample] = []
     outcomes: dict[str, str] = {}
@@ -359,20 +423,34 @@ def main() -> int:
                key=lambda s: s.offset_minutes)
     parity_cmd = args.parity_cmd.split() if args.parity_cmd else None
 
+    # COMPAT exporters: sample `/api/cc-health` alongside the container
+    # stats and keep a running max of the three now-live read-model
+    # metrics (replay-ring depth, deepest client FIFO, terminal-row count).
+    read_model_cookie = login(args.base_url, token)
+    read_model_maxima: dict = {}
+
     for minute in range(minutes):
         samples.append(sample_container('dashboard', minute))
+        read_model_cookie, read_model_maxima = sample_read_model(
+            args.base_url, token, read_model_cookie, read_model_maxima)
         while pending and pending[0].offset_minutes <= minute:
             scenario = pending.pop(0)
             outcomes[scenario.name] = run_scenario(
                 scenario, args.base_url, token, parity_cmd)
-        if harness.poll() is not None:
+        if harness_proc.poll() is not None:
             break
         time.sleep(60)
 
-    harness.wait(timeout=600)
+    harness_proc.wait(timeout=600)
     raw_metrics = json.loads(report_path.read_text()) if report_path.exists() else {}
-    report = evaluate_soak(samples, harness_metrics(raw_metrics), outcomes,
-                           SoakThresholds())
+    metrics = harness_metrics(raw_metrics)
+    metrics.update(read_model_maxima)
+    # `unhandled_errors` / `unresolved_commands` still have no live exporter
+    # (trader-side command-ledger / error-log surface -- a Worker-B/F3
+    # follow-up) -- left absent so `evaluate_soak`'s existing fail-closed
+    # default (`harness.get(name) is None` -> check fails) reports them
+    # honestly as "not observed" rather than fabricating a passing zero.
+    report = evaluate_soak(samples, metrics, outcomes, SoakThresholds())
 
     stamp = dt.datetime.now(dt.timezone.utc).strftime('%Y%m%dT%H%M%SZ')
     out = Path(args.out) if args.out else \

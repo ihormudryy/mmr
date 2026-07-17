@@ -265,14 +265,43 @@ class TestHealthEndpoints:
             body = (await c.get("/api/cc-health")).json()
             assert set(body) >= {"lifecycle", "reconnects", "cursor", "stream_id",
                                  "sequence", "last_event_at", "transport_lag_ms",
-                                 "sse_clients", "sources", "quote_plane"}
+                                 "sse_clients", "sources", "quote_plane",
+                                 "replay_ring_events", "terminal_rows",
+                                 "client_fifo_depth_max"}
             journal = body["sources"]["journal"]
             assert set(journal) == {"state", "last_success_age_seconds",
                                     "last_error", "reconnects"}
             assert set(body["quote_plane"]) == {"instruments", "feed_types", "dropped"}
+            # COMPAT Task 4 soak-metric exporters: read-model counts backing
+            # the previously-unmetered replay-ring/FIFO/terminal-rows soak
+            # thresholds must be present and integer.
+            for key in ("replay_ring_events", "terminal_rows", "client_fifo_depth_max"):
+                assert isinstance(body[key], int)
             encoded = json.dumps(body).lower()
             assert TOKEN.lower() not in encoded
             assert SECRET.lower() not in encoded
+
+    @pytest.mark.asyncio
+    async def test_cc_health_read_model_counts_reflect_seeded_state(self, client, cc):
+        """COMPAT Task 4: `replay_ring_events`/`terminal_rows` must track
+        the live read model (not a stubbed/hardcoded value) so the soak
+        runner's sampled maxima mean something."""
+        _seed(cc)
+        cc.bridge = _NullBridge()
+        envelope = cc.state.apply(DomainEvent(
+            event_id="evt-terminal", source_cursor=3, entity_revision=2,
+            event_type="order.updated", entity_type="order",
+            entity_id="ord-term-1", operation="upsert", account_id="DU123",
+            source="trader_service",
+            source_timestamp=dt.datetime.now(UTC),
+            correlation_id=None, payload={"status": "FILLED"}))
+        cc.fanout.publish(envelope)
+        async with client as c:
+            await _login(c)
+            body = (await c.get("/api/cc-health")).json()
+            assert body["replay_ring_events"] == cc.state.ring_depth() >= 1
+            assert body["terminal_rows"] == cc.state.terminal_row_count() >= 1
+            assert body["client_fifo_depth_max"] == cc.fanout.max_fifo_depth()
 
     @pytest.mark.asyncio
     async def test_transport_lag_recorded_after_event(self, client, cc):

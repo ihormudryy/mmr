@@ -57,6 +57,16 @@ def create_health_router(cc) -> APIRouter:
                 "feed_types": feed_types,
                 "dropped": getattr(cc.quote_plane, "dropped", None),
             },
+            # COMPAT Task 4 soak-metric exporters: instantaneous read-model
+            # counts. `scripts/run_paper_soak.py` samples these over the
+            # soak window and keeps the MAX of each, feeding them into
+            # `evaluate_soak` as `max_replay_ring_events` /
+            # `max_client_fifo_depth` / `max_terminal_rows` -- three of the
+            # six soak thresholds that previously had no live exporter and
+            # always reported `observed=None`.
+            "replay_ring_events": cc.state.ring_depth(),
+            "terminal_rows": cc.state.terminal_row_count(),
+            "client_fifo_depth_max": cc.fanout.max_fifo_depth(),
         }
 
     return router

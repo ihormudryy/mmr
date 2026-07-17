@@ -27,6 +27,7 @@ full rationale):
 """
 from __future__ import annotations
 
+import asyncio
 import datetime as dt
 import time
 from concurrent.futures import ThreadPoolExecutor
@@ -446,7 +447,9 @@ class TestProductionRegistryWiring:
         writer.account(net_liquidation=10_000, event_id="a1")
         registry = build_production_registry(object(), authenticator, feed_service=feed_service)
         registration = registry.resolve("feed", "read_domain_events")
-        body = registration.handler({"after_cursor": 0, "limit": 100, "wait_ms": 0})
+        # Handler is async (the blocking long-poll runs off the shared event
+        # loop via asyncio.to_thread -- see _read_domain_events_handler).
+        body = asyncio.run(registration.handler({"after_cursor": 0, "limit": 100, "wait_ms": 0}))
         assert body["events"][0]["event_id"] == "a1"
         assert isinstance(body["events"][0]["source_timestamp"], str)  # JSON-safe, not a datetime
         assert body["newest_cursor"] == body["events"][0]["source_cursor"]
@@ -458,7 +461,7 @@ class TestProductionRegistryWiring:
         registry = build_production_registry(object(), authenticator, feed_service=feed_service_past_retention)
         registration = registry.resolve("feed", "read_domain_events")
         with pytest.raises(_DispatchProblem) as excinfo:
-            registration.handler({"after_cursor": 7, "limit": 100, "wait_ms": 0})
+            asyncio.run(registration.handler({"after_cursor": 7, "limit": 100, "wait_ms": 0}))
         assert excinfo.value.code == CURSOR_EXPIRED
 
     def test_snapshot_with_cursor_handler_returns_wire_safe_body(self, authenticator, snapshot_service, writer):

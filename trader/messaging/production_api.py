@@ -79,6 +79,7 @@ would otherwise scrub to an opaque ``INTERNAL_ERROR``.
 
 from __future__ import annotations
 
+import asyncio
 import dataclasses
 import datetime as dt
 from dataclasses import asdict
@@ -152,13 +153,26 @@ def _no_arg_handler(fn):
 
 
 def _read_domain_events_handler(feed_service: DomainFeedService):
-    def _handler(body: Dict[str, Any]) -> Dict[str, Any]:
-        try:
-            result = feed_service.read_domain_events(
+    # ASYNC + off-loop: read_domain_events long-polls via a *synchronous*
+    # threading.Condition wait (up to wait_ms, 10s in production). All three
+    # typed servers share trader_service's single asyncio event loop -- the
+    # SAME loop ib_async runs IB socket/market-data processing on. Running the
+    # blocking wait inline would freeze that loop for the full wait_ms every
+    # poll (the dashboard re-polls immediately, so effectively continuously),
+    # starving IB tick/heartbeat handling -> stale/empty quotes and spurious
+    # 1100 disconnects. asyncio flags this as "Executing <Task ...> took 10s".
+    # Delegating the blocking read to a worker thread lets `_handle_request`
+    # await it and yield the loop; DomainFeedService.read_domain_events is
+    # thread-safe (Condition wakeups + DuckDB via the per-db-locked wrapper).
+    async def _handler(body: Dict[str, Any]) -> Dict[str, Any]:
+        def _blocking_read():
+            return feed_service.read_domain_events(
                 after_cursor=body['after_cursor'],
                 limit=body['limit'],
                 wait_ms=body['wait_ms'],
             )
+        try:
+            result = await asyncio.to_thread(_blocking_read)
         except CursorExpired as exc:
             raise _DispatchProblem(CURSOR_EXPIRED, str(exc)) from exc
         return {

@@ -260,7 +260,17 @@ def merge_account_value(
         "maintenance_margin": current.maintenance_margin if current else None,
     }
     column = _ACCOUNT_TAG_COLUMNS.get(obs.tag)
-    if column and obs.currency in ("", "BASE", "USD", "AUD"):
+    # These five tags are account-level, base-currency figures: IB reports
+    # each once, denominated in the account's base currency (EUR, USD, AUD,
+    # CAD, ...), never per-holding-currency. The old hardcoded
+    # ("", "BASE", "USD", "AUD") allowlist silently dropped every base
+    # currency outside that set (e.g. a EUR paper account), so the typed
+    # summary columns stayed NULL while the raw values sat in `balances` --
+    # the dashboard account panel then rendered empty. Mirror the vetted
+    # trader_service_api.get_account_values reader: accept any currency
+    # except the "BASE" consolidated pseudo-row (which would clobber the real
+    # base-currency value last-wins).
+    if column and obs.currency != "BASE":
         try:
             fields[column] = float(obs.value)
         except ValueError:

@@ -897,7 +897,8 @@ def create_app(cc: CommandCenter | None = None) -> FastAPI:
     `DASHBOARD_SESSION_SECRET` to be configured. `ensure_session_manager()`
     stays the one hard failure point, at lifespan startup or first request.
     """
-    center = cc or CommandCenter(CommandCenterConfig.from_env())
+    center = cc or CommandCenter(CommandCenterConfig.from_env(),
+                                 commands_enabled=_COMMAND_FLAGS.commands_enabled)
 
     @contextlib.asynccontextmanager
     async def _app_lifespan(fastapi_app: FastAPI):
@@ -933,10 +934,22 @@ def create_app(cc: CommandCenter | None = None) -> FastAPI:
     # HMAC-key/typed-socket requirement) is only constructed when commands
     # are enabled, so a paper-only or read-only deployment never pays that
     # startup cost or needs that credential configured at all.
+    #
+    # [M1-C] Task 3 fix (I-1): the gateway is NOT built here. Building it
+    # eagerly at `create_app()` time (outside any try/except) meant a
+    # bad/missing service HMAC key raised straight out of `create_app()` --
+    # taking the whole ASGI boot, and its always-on `/healthz`/`/readyz`
+    # probes, down with it. It is now built inside
+    # `CommandCenter._start_or_degrade` (see `web/command_center/__init__.py`),
+    # the SAME degrade-tolerant try/except that already brings up the bridge
+    # + quote plane: a build failure there degrades the center to inert
+    # (`center.command_gateway` stays `None`) instead of aborting startup.
+    # Routes read it per-request via `request.app.state.command_center.
+    # command_gateway`, and return 503 `COMMAND_GATEWAY_UNAVAILABLE` (not the
+    # 403 `COMMANDS_DISABLED` used for the feature simply being off) when
+    # commands are enabled but the gateway never came up -- see
+    # `routes_commands.py`'s `_gateway()`.
     install_command_routes(application)
-    if _COMMAND_FLAGS.commands_enabled:
-        from web.command_center.gateway import build_command_gateway
-        application.state.command_gateway = build_command_gateway(os.environ)
     application.mount('/static', StaticFiles(
         directory=str(Path(__file__).parent / 'static')), name='static')
 

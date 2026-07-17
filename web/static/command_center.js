@@ -435,8 +435,12 @@ function ccNewCommandId() {
   return crypto.randomUUID();
 }
 
-async function ccCsrfToken() {
-  if (CC.csrfToken) return CC.csrfToken;
+async function ccCsrfToken(force = false) {
+  // `force` bypasses the cache -- used after a `CSRF_REJECTED` 403 (see
+  // ccPost below), since the process-local `_CSRF_SECRET` that derives this
+  // token rotates on every web restart, so a token cached from before a
+  // restart 403s until refreshed.
+  if (CC.csrfToken && !force) return CC.csrfToken;
   const res = await fetch('/api/commands/csrf-token', { credentials: 'same-origin' });
   if (!res.ok) throw new Error('could not fetch a CSRF token for this session');
   const data = await res.json();
@@ -454,16 +458,30 @@ function ccToast(kind, text) {
 
 async function ccPost(url, body, { okStatus = 202 } = {}) {
   const timeoutMs = window.CC_COMMAND_TIMEOUT_MS || 8000;
-  let res;
-  try {
+  const attempt = async () => {
     const csrf = await ccCsrfToken();
-    res = await fetch(url, {
+    return fetch(url, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json', 'X-CSRF-Token': csrf },
       credentials: 'same-origin',
       body: JSON.stringify(body),
       signal: AbortSignal.timeout(timeoutMs),
     });
+  };
+  let res;
+  try {
+    res = await attempt();
+    if (res.status === 403) {
+      const peek = await res.clone().json().catch(() => ({}));
+      if (peek.code === 'CSRF_REJECTED') {
+        // Refetch the token (bypassing the cache) and retry ONCE, reusing
+        // the SAME `body` -- and therefore the SAME `body.command_id` (see
+        // ccNewCommandId) -- so the coordinator's idempotent replay dedupes
+        // this as one logical command rather than creating two proposals.
+        await ccCsrfToken(true);
+        res = await attempt();
+      }
+    }
   } catch (err) {
     return {
       ok: false, outcomeUnknown: true,
@@ -585,11 +603,11 @@ function ccOpenProposalDrawer() {
   document.getElementById('cc-proposal-drawer').hidden = false;
 }
 
-function ccProposalBody(form) {
+function ccProposalBody(form, commandId) {
   const f = new FormData(form);
   const num = (k) => (f.get(k) ? Number(f.get(k)) : null);
   return {
-    command_id: ccNewCommandId(),
+    command_id: commandId,
     conid: Number(f.get('conid')),
     action: f.get('action'),
     quantity: num('quantity'),       // both empty -> server auto-sizing
@@ -604,7 +622,11 @@ function ccProposalBody(form) {
 document.getElementById('cc-proposal-form').addEventListener('submit',
     async (evt) => {
       evt.preventDefault();
-      const body = ccProposalBody(evt.target);
+      // Minted ONCE here, at command initiation -- reused for the CSRF
+      // retry inside ccPost (M-3) and any future resubmit of this same
+      // logical command; never re-minted (see ccNewCommandId).
+      const commandId = ccNewCommandId();
+      const body = ccProposalBody(evt.target, commandId);
       document.getElementById('cc-proposal-drawer').hidden = true;
       await ccSubmitCommand('create_proposal',
           `New proposal ${body.action} conId ${body.conid}`,
@@ -633,8 +655,11 @@ document.getElementById('cc-close-form').addEventListener('submit',
     async (evt) => {
       evt.preventDefault();
       const d = document.getElementById('cc-close-drawer');
+      // Minted ONCE at initiation -- see the proposal-form handler above
+      // for the same reuse contract (CSRF retry + any future resubmit).
+      const commandId = ccNewCommandId();
       const body = {
-        command_id: ccNewCommandId(),
+        command_id: commandId,
         action: d.dataset.action,
         quantity: Number(d.querySelector('input[name=quantity]').value),
         reasoning: d.querySelector('textarea[name=reasoning]').value,

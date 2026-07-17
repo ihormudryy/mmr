@@ -107,6 +107,23 @@ def _default_feed_client(config: CommandCenterConfig):
     return client
 
 
+def _default_command_gateway(env=os.environ):
+    """Production wiring for the command gateway.
+
+    Mirrors ``_default_query_client``/``_default_feed_client`` above: a lazy
+    import (so `web.command_center.gateway` -- and the `trader.messaging.
+    typed_rpc` service-HMAC-key loading it does at call time -- is only ever
+    touched from inside `CommandCenter._start_or_degrade`'s try/except, never
+    at module import or `create_app()` time). [M1-C] Task 3 fix (I-1): a
+    missing/invalid `MMR_SERVICE_HMAC_KEY_FILE` raises here, which
+    `_start_or_degrade` catches like any other startup failure -- it
+    DEGRADES the command center to inert rather than crashing `create_app()`
+    and taking the always-on `/healthz`/`/readyz` ops probes down with it.
+    """
+    from web.command_center.gateway import build_command_gateway
+    return build_command_gateway(env)
+
+
 class CommandCenter:
     def __init__(self, config: CommandCenterConfig, *,
                  credentials_loader: Callable[[], DashboardCredentials]
@@ -115,6 +132,7 @@ class CommandCenter:
                  feed_client_factory=None,
                  bridge_factory=None,
                  quote_plane_factory=None,
+                 commands_enabled: bool = False,
                  command_gateway_factory=None):
         self.config = config
         self._credentials_loader = credentials_loader
@@ -127,9 +145,21 @@ class CommandCenter:
             lambda loop, deliver: QuotePlane(
                 config.pubsub_address, config.pubsub_port, loop, deliver,
                 hz=config.quote_hz))
-        # Reserved seam for [M1-C]: DashboardCommandGateway lives here.
-        self._command_gateway_factory = command_gateway_factory
-        self.command_gateway = None
+        # [M1-C] Task 3 fix (I-1): the command gateway is built lazily, in
+        # `_start_or_degrade`, inside the SAME degrade-tolerant try/except
+        # that brings up the bridge + quote plane below -- never eagerly at
+        # `create_app()` time (that used to raise past this constructor
+        # entirely on a bad/missing service HMAC key, taking the whole ASGI
+        # boot -- and its always-on `/healthz`/`/readyz` probes -- down with
+        # it). `commands_enabled` mirrors `CommandFlags.commands_enabled`
+        # (web/app.py, [M1-C] Task 3): a disabled deployment never attempts
+        # the build at all (that's normal "off", not a failure); when
+        # enabled, a factory failure degrades the WHOLE center to inert --
+        # same as any other `_start_or_degrade` failure -- not just the
+        # gateway.
+        self._commands_enabled = commands_enabled
+        self._command_gateway_factory = command_gateway_factory or _default_command_gateway
+        self.command_gateway = None  # built by _start_or_degrade, see above
         self.state = DashboardState()
         self.fanout = SseFanout(self.state)
         self.session_manager: Optional[SessionManager] = None
@@ -156,10 +186,13 @@ class CommandCenter:
         """Bring up the command center, but NEVER abort ASGI startup.
 
         A misconfiguration (``MMR_DILL_STRICT`` unset, dashboard credentials
-        missing) or a bridge/quote-plane start failure DEGRADES the command
-        center to inert -- logged loudly -- and still yields, so the app (and
-        its always-on ``/healthz`` / ``/readyz`` ops probes) boots regardless.
-        Degrading here does NOT weaken security:
+        missing) or a bridge/quote-plane/command-gateway start failure
+        DEGRADES the command center to inert -- logged loudly -- and still
+        yields, so the app (and its always-on ``/healthz`` / ``/readyz`` ops
+        probes) boots regardless. This is where the command gateway (when
+        ``commands_enabled``) is built too -- see the constructor's docstring
+        for why that must NOT happen eagerly in ``create_app()`` instead
+        ([M1-C] Task 3 fix I-1). Degrading here does NOT weaken security:
 
         * dashboard routes still fail loud *per request* -- ``require_session``
           -> ``ensure_session_manager()`` raises ``CredentialConfigError`` on a
@@ -183,8 +216,9 @@ class CommandCenter:
                 self._teardown()
 
     def _start_or_degrade(self) -> bool:
-        """Start the bridge + quote plane. Returns True on a full start, or
-        False after catching+logging a startup failure (degraded/inert)."""
+        """Start the bridge + quote plane (+ command gateway, if enabled).
+        Returns True on a full start, or False after catching+logging a
+        startup failure (degraded/inert)."""
         try:
             _assert_single_worker()
             _assert_dill_strict()
@@ -199,8 +233,14 @@ class CommandCenter:
             self.quote_plane = self._quote_plane_factory(
                 loop, self.fanout.publish_quotes)
             self.quote_plane.start()
-            if self._command_gateway_factory is not None:  # [M1-C] wires this
-                self.command_gateway = self._command_gateway_factory(self)
+            if self._commands_enabled:
+                # [M1-C] Task 3 fix (I-1): built HERE (same try as bridge/
+                # quote-plane), not eagerly in `create_app()` -- a bad/missing
+                # service HMAC key (or any other gateway-factory failure) is
+                # caught by the `except` below and DEGRADES the whole center
+                # to inert, exactly like a dill-strict or credentials failure
+                # would; it never aborts ASGI startup.
+                self.command_gateway = self._command_gateway_factory()
             return True
         except Exception:  # noqa: BLE001 - degrade to inert, never abort the app
             logger.exception(

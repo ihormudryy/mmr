@@ -15,6 +15,7 @@ thesis, group, max_price_drift_bps, preflight_nonce}`` shape (conId, not
 symbol). This test file exercises the routes against those REAL shapes.
 """
 from dataclasses import replace
+from types import SimpleNamespace
 
 import pytest
 from fastapi import FastAPI
@@ -69,7 +70,11 @@ def gateway():
 def make_client(gateway, flags=CommandFlags(True, False, None, None)):
     app = FastAPI()
     app.state.command_flags = flags
-    app.state.command_gateway = gateway
+    # [M1-C] Task 3 fix (I-1/M-6): the gateway now lives on
+    # `command_center.command_gateway`, not a bare `app.state.command_gateway`
+    # -- a plain namespace stands in for the real `CommandCenter` here since
+    # these tests only ever read that one attribute off it.
+    app.state.command_center = SimpleNamespace(command_gateway=gateway)
     install_command_routes(app)
     app.dependency_overrides[require_session] = lambda: SESSION
     return TestClient(app)
@@ -200,8 +205,8 @@ def test_get_command_returns_receipt_for_reconciliation(gateway):
 
 
 def test_get_command_disabled_gateway_returns_stable_error(gateway):
-    """No `app.state.command_gateway` at all (commands disabled at startup,
-    so `web/app.py` never constructs one) must not surface a raw
+    """No `app.state.command_center` at all (commands disabled at startup,
+    so `web/app.py` never builds a gateway) must not surface a raw
     AttributeError -- it degrades to the same stable COMMANDS_DISABLED
     envelope the mutation routes use."""
     app = FastAPI()
@@ -212,3 +217,195 @@ def test_get_command_disabled_gateway_returns_stable_error(gateway):
     r = client.get(f"/api/commands/{CMD_ID}", headers=HEADERS)
     assert r.status_code == 403
     assert r.json()["code"] == "COMMANDS_DISABLED"
+
+
+# ---------------------------------------------------------------------------
+# [M1-C] Task 3 fix wave -- I-1 (eager gateway build regression), M-6
+# (degraded gateway -> 503, not 403), M-4 (creds-missing -> 401, not 500),
+# M-7 (colon-in-command_id rejected at the web layer).
+# ---------------------------------------------------------------------------
+
+def test_degraded_gateway_returns_503_not_403_for_create_proposal(gateway):
+    """M-6: commands ARE enabled but the gateway never came up (e.g. the
+    command center degraded to inert at startup -- I-1) -- this must be a
+    distinct, retryable 503, not the 403 COMMANDS_DISABLED the feature-off
+    path returns."""
+    app = FastAPI()
+    app.state.command_flags = CommandFlags(True, False, None, None)
+    app.state.command_center = SimpleNamespace(command_gateway=None)
+    install_command_routes(app)
+    app.dependency_overrides[require_session] = lambda: SESSION
+    client = TestClient(app)
+    r = client.post("/api/commands/proposals", json=_proposal_body(), headers=HEADERS)
+    assert r.status_code == 503
+    assert r.json()["code"] == "COMMAND_GATEWAY_UNAVAILABLE"
+    assert r.json()["retryable"] is True
+
+
+def test_degraded_gateway_returns_503_for_get_command(gateway):
+    app = FastAPI()
+    app.state.command_flags = CommandFlags(True, False, None, None)
+    app.state.command_center = SimpleNamespace(command_gateway=None)
+    install_command_routes(app)
+    app.dependency_overrides[require_session] = lambda: SESSION
+    client = TestClient(app)
+    r = client.get(f"/api/commands/{CMD_ID}", headers=HEADERS)
+    assert r.status_code == 503
+    assert r.json()["code"] == "COMMAND_GATEWAY_UNAVAILABLE"
+
+
+def test_missing_credentials_on_require_session_is_401_not_500():
+    """M-4: `require_session` must catch `CredentialConfigError` (raised by
+    `CommandCenter.ensure_session_manager` on missing dashboard credentials,
+    via the `require_session` property) and surface the stable 401
+    SESSION_REQUIRED, not an unhandled 500."""
+    from web.command_center.session import CredentialConfigError
+
+    class _BrokenCenter:
+        @property
+        def require_session(self):
+            raise CredentialConfigError("dashboard login token missing")
+
+    app = FastAPI()
+    app.state.command_flags = CommandFlags(True, False, None, None)
+    app.state.command_center = _BrokenCenter()
+    install_command_routes(app)
+    client = TestClient(app)
+    r = client.get(f"/api/commands/{CMD_ID}", headers=HEADERS)
+    assert r.status_code == 401
+    assert r.json()["code"] == "SESSION_REQUIRED"
+
+
+@pytest.mark.parametrize("bad_id", [
+    "0f9b2c1a-5b7e-4c1d-9e2f-3a4b5c6d:8f1",   # colon, still exactly 36 chars
+    "not-a-uuid-shaped-value-at-all-36789",    # 36 chars, wrong shape
+])
+def test_create_proposal_rejects_malformed_command_id(gateway, bad_id):
+    """M-7: a `:`-bearing (or otherwise malformed) command_id must be
+    rejected at THIS web layer, not one hop later at the coordinator."""
+    assert len(bad_id) == 36
+    client = make_client(gateway)
+    r = client.post("/api/commands/proposals",
+                    json=_proposal_body(command_id=bad_id), headers=HEADERS)
+    assert r.status_code == 422
+    assert gateway.calls == []
+
+
+def test_close_position_rejects_malformed_command_id(gateway):
+    client = make_client(gateway)
+    bad_id = "0f9b2c1a-5b7e-4c1d-9e2f-3a4b5c6d:8f1"
+    r = client.post("/api/commands/positions/DU123/265598/close",
+                    json={"command_id": bad_id, "action": "SELL",
+                          "quantity": 40.0, "reasoning": "trim"},
+                    headers=HEADERS)
+    assert r.status_code == 422
+    assert gateway.calls == []
+
+
+def test_get_command_rejects_colon_in_path_param(gateway):
+    """M-7 applies to the path-param `command_id` too -- previously
+    unvalidated entirely (not even length-checked)."""
+    client = make_client(gateway)
+    bad_id = "0f9b2c1a-5b7e-4c1d-9e2f-3a4b5c6d:8f1"
+    r = client.get(f"/api/commands/{bad_id}", headers=HEADERS)
+    assert r.status_code == 422
+    assert gateway.calls == []
+
+
+class TestGatewayLifespanWiring:
+    """I-1: the command gateway must be built inside
+    `CommandCenter._start_or_degrade` (the SAME degrade-tolerant try/except
+    that already builds the bridge + quote plane), never eagerly at
+    `create_app()` time -- a bad/missing service HMAC key must degrade the
+    center to inert, not crash the whole web process (re-breaking the M1-R
+    Task-5 ops-probe contract)."""
+
+    @staticmethod
+    def _center(monkeypatch, *, commands_enabled, command_gateway_factory):
+        from cc_fakes import NullBridge, NullQuotePlane
+
+        from web.command_center import CommandCenter, CommandCenterConfig
+        from web.command_center.session import DashboardCredentials
+
+        monkeypatch.setenv("MMR_DILL_STRICT", "1")
+        monkeypatch.delenv("WEB_CONCURRENCY", raising=False)
+        monkeypatch.delenv("UVICORN_WORKERS", raising=False)
+        return CommandCenter(
+            CommandCenterConfig(),
+            credentials_loader=lambda: DashboardCredentials(
+                token="t", session_secret=b"s" * 32, legacy_alias_used=False),
+            query_client_factory=lambda: None,
+            feed_client_factory=lambda: None,
+            bridge_factory=lambda *a, **k: NullBridge(),
+            quote_plane_factory=lambda *a, **k: NullQuotePlane(),
+            commands_enabled=commands_enabled,
+            command_gateway_factory=command_gateway_factory,
+        )
+
+    @pytest.mark.asyncio
+    async def test_gateway_build_failure_degrades_whole_center_not_abort(self, monkeypatch):
+        def _boom():
+            raise RuntimeError("missing/invalid service HMAC key")
+
+        # `_start_or_degrade` calls `asyncio.get_running_loop()` (to hand the
+        # loop to the bridge/quote-plane factories) -- exercised here from
+        # inside a running loop, same as its one real caller, the async
+        # `lifespan` context manager.
+        center = self._center(monkeypatch, commands_enabled=True,
+                              command_gateway_factory=_boom)
+        started = center._start_or_degrade()
+        assert started is False
+        assert center.command_gateway is None
+        # Same try/except as bridge + quote plane -- a gateway failure
+        # degrades the WHOLE center, not just the gateway.
+        assert center.bridge is None
+        assert center.quote_plane is None
+
+    @pytest.mark.asyncio
+    async def test_gateway_build_success_is_stored_on_center(self, monkeypatch):
+        fake_gateway = object()
+        center = self._center(monkeypatch, commands_enabled=True,
+                              command_gateway_factory=lambda: fake_gateway)
+        started = center._start_or_degrade()
+        assert started is True
+        assert center.command_gateway is fake_gateway
+
+    @pytest.mark.asyncio
+    async def test_gateway_factory_never_invoked_when_commands_disabled(self, monkeypatch):
+        calls = []
+
+        def factory():
+            calls.append(1)
+            return object()
+
+        center = self._center(monkeypatch, commands_enabled=False,
+                              command_gateway_factory=factory)
+        started = center._start_or_degrade()
+        assert started is True
+        assert center.command_gateway is None
+        assert calls == []
+
+
+def test_create_app_survives_commands_enabled_with_missing_hmac_key(monkeypatch):
+    """I-1 regression test. `build_command_gateway()` used to run EAGERLY in
+    `create_app()` (outside any try/except), so DASHBOARD_COMMANDS_ENABLED=
+    true + a missing/bad service HMAC key raised straight out of
+    `create_app()` -- taking the whole web process, including the
+    unauthenticated `/healthz`/`/readyz`/`/api/health` probes, down with it.
+
+    RED before the fix: `webapp.create_app()` itself raises
+    `ServiceHmacKeyError`. GREEN after: gateway construction lives inside the
+    degrade-tolerant `CommandCenter._start_or_degrade`, so a bad/missing key
+    only degrades the command center -- the app still boots and the probes
+    still serve.
+    """
+    import web.app as webapp
+
+    monkeypatch.setattr(webapp, "_COMMAND_FLAGS",
+                        CommandFlags(True, False, None, None))
+    monkeypatch.delenv("MMR_SERVICE_HMAC_KEY_FILE", raising=False)
+
+    app = webapp.create_app()  # must not raise merely from a missing HMAC key
+    with TestClient(app) as client:  # lifespan startup must not raise either
+        assert client.get("/healthz").status_code == 200
+        assert client.get("/readyz").status_code == 200

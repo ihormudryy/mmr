@@ -52,13 +52,14 @@ from typing import Any, Literal
 
 from urllib.parse import urlsplit
 
-from fastapi import APIRouter, Depends, FastAPI, HTTPException, Request
+from fastapi import APIRouter, Depends, FastAPI, HTTPException, Path, Request
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 from trader.domain.commands import CommandReceipt
 from web.command_center.flags import CommandFlags
 from web.command_center.gateway import DashboardCommandGateway, GatewayError
+from web.command_center.session import CredentialConfigError
 
 router = APIRouter()
 
@@ -82,6 +83,10 @@ _HTTP_STATUS = {
     "PREFLIGHT_REQUIRED": 428, "PREFLIGHT_EXPIRED": 410,
     "PREFLIGHT_CONSUMED": 410, "PREFLIGHT_MISMATCH": 409,
     "DEPENDENCY_UNAVAILABLE": 503, "COMMAND_CHANNEL_DOWN": 503,
+    # [M1-C] Task 3 fix (M-6): commands enabled but the gateway never came up
+    # (degraded startup, see `_gateway()` below) -- transient/retryable, NOT
+    # the 403 `COMMANDS_DISABLED` used when the feature is simply off.
+    "COMMAND_GATEWAY_UNAVAILABLE": 503,
     "OUTCOME_UNKNOWN": 504,
 }
 
@@ -150,6 +155,13 @@ def require_session(request: Request) -> str:
         return center.require_session(request)
     except HTTPException as exc:
         raise CommandApiError(401, "SESSION_REQUIRED", "session required") from exc
+    except CredentialConfigError as exc:
+        # [M1-C] Task 3 fix (M-4): a missing-credentials dashboard config
+        # (`ensure_session_manager` -> `load_dashboard_credentials`) must
+        # still surface the stable 401 `SESSION_REQUIRED` a caller can branch
+        # on, not an unhandled 500 -- the credential problem is real, but a
+        # request without a session was never going to succeed anyway.
+        raise CommandApiError(401, "SESSION_REQUIRED", "session required") from exc
 
 
 # Process-local: ties the derived CSRF token to a secret this process alone
@@ -178,6 +190,14 @@ def require_command_auth(
     supplied = request.headers.get("X-CSRF-Token", "")
     if not secrets.compare_digest(supplied, session_csrf_token(session)):
         raise CommandApiError(403, "CSRF_REJECTED", "session CSRF token mismatch")
+    # [M1-C] Task 3 (I-2): this gate checks `commands_enabled` ONLY, not
+    # `live_commands_enabled` -- deliberately. Both routes behind this
+    # dependency (`create_proposal`, `close_position`) only ever create a
+    # NON-EXECUTING PENDING proposal; nothing here places or transmits an
+    # order. The live-command gate (`DASHBOARD_LIVE_COMMANDS_ENABLED` /
+    # the `LIVE_COMMANDS_DISABLED` code already reserved in `_HTTP_STATUS`
+    # above) belongs on the EXECUTING command -- the approve route -- which
+    # is [M1-C] Task 4, not this one. Do not add a live-commands check here.
     flags: CommandFlags = request.app.state.command_flags
     if not flags.commands_enabled:
         raise CommandApiError(403, "COMMANDS_DISABLED",
@@ -187,16 +207,33 @@ def require_command_auth(
 
 
 def _gateway(request: Request) -> DashboardCommandGateway:
-    gateway = getattr(request.app.state, "command_gateway", None)
-    if gateway is None:
-        # Flags may be enabled with the gateway still unbuilt (e.g. the
-        # command center degraded to inert at startup -- see
-        # `CommandCenter._start_or_degrade`) -- surface the same stable
-        # 403 rather than an unhandled AttributeError.
+    """Resolve the live gateway, distinguishing "feature is off" (403) from
+    "feature is on but the gateway isn't up" (503).
+
+    [M1-C] Task 3 fix (I-1/M-6): the gateway is now built lazily by
+    `CommandCenter._start_or_degrade` (never eagerly in `create_app()`), so
+    it lives on `request.app.state.command_center.command_gateway` --
+    reached the same way `require_session` above already reaches
+    `command_center` -- not on a separate `app.state.command_gateway`
+    attribute set once at boot.
+    """
+    center = getattr(request.app.state, "command_center", None)
+    gateway = getattr(center, "command_gateway", None) if center is not None else None
+    if gateway is not None:
+        return gateway
+    flags: CommandFlags = request.app.state.command_flags
+    if not flags.commands_enabled:
         raise CommandApiError(403, "COMMANDS_DISABLED",
                               "dashboard commands are disabled "
                               "(DASHBOARD_COMMANDS_ENABLED=false)")
-    return gateway
+    # Commands ARE enabled but the gateway never came up -- the command
+    # center degraded to inert at startup (bad/missing service HMAC key,
+    # unreachable command socket, ...; see `_start_or_degrade`). That is a
+    # TRANSIENT condition, not "the feature is off", so it is 503/retryable
+    # rather than the 403 `COMMANDS_DISABLED` above.
+    raise CommandApiError(503, "COMMAND_GATEWAY_UNAVAILABLE",
+                          "the command gateway is temporarily unavailable; "
+                          "retry shortly", retryable=True)
 
 
 def _receipt_json(receipt: CommandReceipt) -> JSONResponse:
@@ -207,7 +244,22 @@ def _receipt_json(receipt: CommandReceipt) -> JSONResponse:
     })
 
 
-_COMMAND_ID = Field(min_length=36, max_length=36)
+# [M1-C] Task 3 fix (M-7): `command_id` was previously length-checked only,
+# so a 36-char value smuggling a `:` (e.g. a hyphen swapped for a colon)
+# passed this web layer and was only rejected one hop later, at the
+# coordinator (`trader.trading.command_coordinator`'s
+# `CommandRequest.__post_init__`, mirrored web-adjacent by
+# `trader.messaging.production_api._reject_colon_in_command_id`): a colon
+# inside `command_id` corrupts `encode_order_ref`'s `mmr:<command_id>`
+# orderRef encoding, which reserves `:` as its own separator. The pattern
+# below enforces the full UUID shape (8-4-4-4-12 hex groups) up front, which
+# also excludes `:` by construction -- failing fast, at THIS boundary,
+# instead of a plausible-looking 202 that the coordinator rejects later.
+_COMMAND_ID_PATTERN = (
+    r"^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-"
+    r"[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$"
+)
+_COMMAND_ID = Field(min_length=36, max_length=36, pattern=_COMMAND_ID_PATTERN)
 
 
 class CreateProposalBody(BaseModel):
@@ -295,8 +347,15 @@ def close_position(account: str, conid: int, body: ClosePositionBody,
 
 
 @router.get("/api/commands/{command_id}")
-def get_command(command_id: str, request: Request,
-                session: str = Depends(require_session)):
+def get_command(
+    request: Request,
+    # [M1-C] Task 3 fix (M-7): the path param gets the SAME UUID-shape/
+    # colon-free enforcement as the body-carried `command_id` fields above --
+    # this one was previously unvalidated (not even length-checked).
+    command_id: str = Path(min_length=36, max_length=36,
+                           pattern=_COMMAND_ID_PATTERN),
+    session: str = Depends(require_session),
+):
     # Read-only reconciliation lookup for the outcome-unknown banner.
     receipt = _gateway(request).get_command(command_id)
     return {"command_id": receipt.command_id,

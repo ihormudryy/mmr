@@ -54,7 +54,11 @@ from web.command_center import (
 )
 from web.command_center.flags import CommandFlags, load_command_flags
 from web.command_center.health import create_health_router
-from web.command_center.routes_commands import install_command_routes
+from web.command_center.routes_commands import (
+    _check_origin,
+    install_command_routes,
+    require_session,
+)
 from web.command_center.routes_read import create_read_router
 from web.command_center.session import (
     SESSION_COOKIE,
@@ -333,6 +337,15 @@ def make_test_client(*, commands_enabled: bool):
         live_account_id=None, live_max_order_notional=None)
     client = TestClient(application)
     client.post("/session", data={"token": token})
+    # [COMPAT] Task 1: the watchlist routes now also require a matching
+    # Origin header (`_check_origin`, reused from routes_commands.py) -- set
+    # a same-origin default here so every existing caller of this helper
+    # (tests/test_command_security_gate.py's watchlist/deploy-out-of-scope
+    # check in particular) keeps getting the pre-existing 303/409 behavior
+    # for those routes without needing to know about the new requirement.
+    # Callers that explicitly pass their own `headers=` (e.g. HEADERS with
+    # its own "Origin": "http://testserver") are unaffected -- same value.
+    client.headers.update({"Origin": "http://testserver"})
     return client
 
 
@@ -767,9 +780,45 @@ def _register_legacy_routes(application: FastAPI) -> None:
         return RedirectResponse(url=f'/?flash={quote(msg)}', status_code=303)
 
 
+    # -------------------------------------------------------------------
+    # [COMPAT] Task 1 -- watchlist CRUD + CSV upload under the command-center
+    # session (spec 2026-07-15-realtime-trading-command-center-design.md
+    # Sections 10/14.1). Watchlists ARE NOT a trading mutation (see
+    # LEGACY_TRADING_MUTATION_PATHS above) -- they keep working regardless of
+    # DASHBOARD_COMMANDS_ENABLED -- but they used to share the SAME weak gate
+    # as everything else pre-[M1-R]: `_check_access`, a no-op in the
+    # canonical DASHBOARD_TOKEN config (it only does something when the
+    # deprecated MMR_WEB_TOKEN alias is set), plus `_check_csrf` against a
+    # single process-wide secret with no origin check at all.
+    #
+    # These five routes now require `Depends(require_session)` -- the exact
+    # same dependency `web/command_center/routes_commands.py`'s command
+    # routes already enforce (reached the same way, via
+    # `request.app.state.command_center.require_session`) -- and the same
+    # `_check_origin` strict same-origin check, imported verbatim rather
+    # than reimplemented. A request without a valid session cookie now hard
+    # 401s (or is redirected by `SessionSecurityMiddleware` before even
+    # reaching here, since that middleware already gates every non-exempt
+    # path); a request whose Origin doesn't match Host now hard 403s -- a
+    # protection no legacy route had before.
+    #
+    # CSRF verification is deliberately LEFT on the existing `_check_csrf`/
+    # `_CSRF_TOKEN` pair rather than switched to `session_csrf_token` (the
+    # per-session-derived token `require_command_auth` uses): `dashboard.html`
+    # renders ONE shared `{{ csrf_token }}` Jinja slot, read by both these
+    # watchlist forms AND the not-yet-migrated trading-mutation/deploy forms
+    # (approve/reject/enable/disable/params/deploy — out of this task's
+    # scope, and the template itself is out of scope to edit). Re-deriving
+    # the rendered value from the session would silently break those other
+    # forms' real submissions the moment `dashboard()` re-renders — a bigger
+    # regression than the narrower theoretical gain of a per-session CSRF
+    # secret in a single-operator dashboard. See the Task 1 report for the
+    # full drift note.
+    # -------------------------------------------------------------------
     @application.post('/watchlists/create')
-    def watchlist_create(request: Request, name: str = Form(''), csrf_token: str = Form('')):
-        _check_access(request)
+    def watchlist_create(request: Request, name: str = Form(''), csrf_token: str = Form(''),
+                         session: str = Depends(require_session)):
+        _check_origin(request)
         _check_csrf(csrf_token)
         wl = (name or '').strip().lower()
         if not _WATCHLIST_NAME_RE.match(wl):
@@ -790,8 +839,9 @@ def _register_legacy_routes(application: FastAPI) -> None:
     @application.post('/watchlists/{name}/add')
     def watchlist_add(name: str, request: Request, symbols: str = Form(''),
                       exchange: str = Form(''), currency: str = Form(''),
-                      csrf_token: str = Form('')):
-        _check_access(request)
+                      csrf_token: str = Form(''),
+                      session: str = Depends(require_session)):
+        _check_origin(request)
         _check_csrf(csrf_token)
         syms = _split_symbols(symbols)
         if not syms:
@@ -817,11 +867,12 @@ def _register_legacy_routes(application: FastAPI) -> None:
     @application.post('/watchlists/{name}/upload')
     async def watchlist_upload(name: str, request: Request,
                                file: UploadFile = File(...),
-                               csrf_token: str = Form('')):
+                               csrf_token: str = Form(''),
+                               session: str = Depends(require_session)):
         """CSV upload. Simple shape: a `symbol` column (optional exchange/
         currency/sectype columns) or one symbol per line — rows resolve via IB.
         Full SecurityDefinition exports (conId column) import directly."""
-        _check_access(request)
+        _check_origin(request)
         _check_csrf(csrf_token)
         raw = await file.read()
         if len(raw) > 1_000_000:
@@ -876,8 +927,9 @@ def _register_legacy_routes(application: FastAPI) -> None:
 
     @application.post('/watchlists/{name}/remove')
     def watchlist_remove(name: str, request: Request, symbol: str = Form(''),
-                         csrf_token: str = Form('')):
-        _check_access(request)
+                         csrf_token: str = Form(''),
+                         session: str = Depends(require_session)):
+        _check_origin(request)
         _check_csrf(csrf_token)
         try:
             accessor = _get_accessor()
@@ -896,8 +948,9 @@ def _register_legacy_routes(application: FastAPI) -> None:
 
 
     @application.post('/watchlists/{name}/delete')
-    def watchlist_delete(name: str, request: Request, csrf_token: str = Form('')):
-        _check_access(request)
+    def watchlist_delete(name: str, request: Request, csrf_token: str = Form(''),
+                         session: str = Depends(require_session)):
+        _check_origin(request)
         _check_csrf(csrf_token)
         try:
             _get_accessor().delete(name)

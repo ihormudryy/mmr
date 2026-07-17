@@ -148,6 +148,15 @@ def client(stub, stub_cc):
     app = create_app(stub_cc)
     test_client = TestClient(app)
     test_client.post("/session", data={"token": TEST_TOKEN})
+    # [COMPAT] Task 1: the watchlist CRUD/upload routes now also require a
+    # matching Origin header (`_check_origin`, reused verbatim from
+    # web/command_center/routes_commands.py) -- a real browser's own-page
+    # form POST always carries one, but httpx's TestClient (unlike a
+    # browser) never adds it automatically. Set once, dashboard-wide, on
+    # this client: harmless for every other route exercised below (none of
+    # them check Origin), and lets the watchlist tests keep posting plain
+    # form bodies unchanged.
+    test_client.headers.update({"Origin": "http://testserver"})
     return test_client
 
 

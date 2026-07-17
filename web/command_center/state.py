@@ -71,6 +71,7 @@ class DashboardState:
         self.sequence: int = 0
         self.has_baseline: bool = False
         self.last_event_at: Optional[str] = None
+        self.last_transport_lag_ms: Optional[float] = None
         self.quotes: dict[str, dict] = {}
         self._revisions: dict[tuple[str, str], int] = {}
         self._ring: deque[tuple[int, float, dict]] = deque()
@@ -138,6 +139,12 @@ class DashboardState:
 
     def _envelope(self, event: DomainEvent) -> dict:
         self.sequence += 1
+        received = self._clock()
+        # Source-timestamp -> reducer-applied lag for the newest event, used
+        # by the command-center health surface (spec §12). Clamped at 0 so a
+        # skewed/slightly-ahead source clock never reports a negative lag.
+        self.last_transport_lag_ms = max(
+            0.0, received * 1000.0 - event.source_timestamp.timestamp() * 1000.0)
         return {
             "schema_version": SCHEMA_VERSION,
             "stream_id": self.stream_id,
@@ -152,7 +159,7 @@ class DashboardState:
             "account_id": event.account_id,
             "source": event.source,
             "source_timestamp": event.source_timestamp.isoformat(),
-            "received_timestamp": _utc_iso(self._clock()),
+            "received_timestamp": _utc_iso(received),
             "correlation_id": event.correlation_id,
             "payload": event.payload,
         }

@@ -51,6 +51,7 @@ from web.command_center import (
     CommandCenterConfig,
     GRACEFUL_SHUTDOWN_SECONDS,
 )
+from web.command_center.health import create_health_router
 from web.command_center.routes_read import create_read_router
 from web.command_center.session import (
     CredentialConfigError,
@@ -905,6 +906,10 @@ def create_app(cc: CommandCenter | None = None) -> FastAPI:
         center.ensure_session_manager, center.limiter,
         cookie_secure=center.config.cookie_secure))
     application.include_router(create_read_router(center, _TEMPLATES))
+    # NEW route only: `/api/cc-health`. Never touches the G0 `/healthz` /
+    # `/readyz` / `/api/health` routes registered by `_register_legacy_routes`
+    # below -- see the M1-R Task 7 addendum for why those must stay as-is.
+    application.include_router(create_health_router(center))
     _register_legacy_routes(application)
     return application
 

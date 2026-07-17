@@ -202,6 +202,71 @@ class TestEventsEndpoint:
         assert cc.fanout.client_count() == 0
 
 
+class TestHealthEndpoints:
+    """`/api/cc-health` — session-gated, NEW route (M1-R Task 7 addendum).
+
+    The G0 `/healthz` / `/readyz` / `/api/health` routes in `web/app.py` stay
+    exactly as they are (LB-drain readiness + their own `MMR_WEB_TOKEN` gate)
+    and are pinned, unedited, by `tests/test_service_health.py`. This class
+    covers the rich command-center dependency detail on the new path only.
+    """
+
+    @pytest.mark.asyncio
+    async def test_cc_health_requires_session(self, client, cc):
+        _seed(cc)
+        async with client as c:
+            assert (await c.get("/api/cc-health")).status_code == 401
+
+    @pytest.mark.asyncio
+    async def test_cc_health_ready_field_flips_with_baseline(self, client, cc):
+        async with client as c:
+            await _login(c)
+            before = (await c.get("/api/cc-health")).json()
+            assert before["ready"] is False
+            _seed(cc)
+            after = (await c.get("/api/cc-health")).json()
+            assert after["ready"] is True
+
+    @pytest.mark.asyncio
+    async def test_cc_health_detail_and_redaction(self, client, cc):
+        _seed(cc)
+        # The `client` fixture runs uvicorn with `lifespan="off"` (see its
+        # docstring), so `CommandCenter._start_or_degrade` -- and therefore
+        # the `bridge_factory` that would normally install `cc.bridge` --
+        # never runs. Assign the fake bridge directly, the same way `_seed`
+        # bypasses the bridge's own `_resync_baseline` to drive `cc.state`.
+        cc.bridge = _NullBridge()
+        async with client as c:
+            await _login(c)
+            body = (await c.get("/api/cc-health")).json()
+            assert set(body) >= {"lifecycle", "reconnects", "cursor", "stream_id",
+                                 "sequence", "last_event_at", "transport_lag_ms",
+                                 "sse_clients", "sources", "quote_plane"}
+            journal = body["sources"]["journal"]
+            assert set(journal) == {"state", "last_success_age_seconds",
+                                    "last_error", "reconnects"}
+            assert set(body["quote_plane"]) == {"instruments", "feed_types", "dropped"}
+            encoded = json.dumps(body).lower()
+            assert TOKEN.lower() not in encoded
+            assert SECRET.lower() not in encoded
+
+    @pytest.mark.asyncio
+    async def test_transport_lag_recorded_after_event(self, client, cc):
+        _seed(cc)
+        envelope = cc.state.apply(DomainEvent(
+            event_id="evt-lag", source_cursor=2, entity_revision=3,
+            event_type="position.updated", entity_type="position",
+            entity_id="DU123:1", operation="upsert", account_id="DU123",
+            source="trader_service",
+            source_timestamp=dt.datetime.now(UTC) - dt.timedelta(milliseconds=120),
+            correlation_id=None, payload={"quantity": 1}))
+        cc.fanout.publish(envelope)
+        async with client as c:
+            await _login(c)
+            lag = (await c.get("/api/cc-health")).json()["transport_lag_ms"]
+            assert lag is not None and lag >= 100.0
+
+
 class TestCommandCenterPage:
     @pytest.mark.asyncio
     async def test_page_requires_session(self, client, cc):

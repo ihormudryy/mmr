@@ -224,6 +224,41 @@
     <button id="cc-cancel-all-abort" type="button">Keep orders</button>
   </aside>
 
+  <!-- [M1-C] Task 6 -- strategy parameter editor: typed fields, CAS on
+       control_revision. The <form> below is intentionally left empty here:
+       there is no strategy params/tunables schema in the reduced store yet
+       (the real "strategy" entity payload -- StrategyControlCommandService.
+       acknowledge_state -- carries {strategy_name, action, strategy_state,
+       control_revision, state_revision, error}, nothing about tunables), so
+       field generation is deferred to the same later UI-wiring pass that
+       populates cc-close-drawer/cc-confirm-drawer above and calls
+       ccUpdateStrategyParams(strategy, params) with whatever it collects.
+       Server (F3's versioned params schema) is still the real validation
+       authority regardless of what this form offers. -->
+  <aside id="cc-strategy-params-dialog" class="cc-drawer" hidden>
+    <h2>Edit <span id="cc-params-strategy-name"></span> parameters</h2>
+    <p class="cc-hint">Server validates every value against the strategy's
+       versioned schema; unspecified risk effects are treated as
+       risk-increasing.</p>
+    <form id="cc-strategy-params-form"></form>
+    <button id="cc-params-apply" type="button"
+            data-cc-command="update_strategy_params">Apply</button>
+    <button id="cc-params-cancel" type="button">Cancel</button>
+  </aside>
+
+  <!-- [M1-C] Task 6 -- pause new trading control (spec 9.4): pause is an
+       immediate absolute set (risk-reducing, no revision); resume is a
+       compare-and-set against the trading_control entity's current
+       `revision` (risk-increasing -- ccSetPause runs the live ceremony on a
+       live account). Populated/toggled by a later UI-wiring pass reading
+       store.view.trading_control (no CC.entity() accessor exists -- see
+       command_center.js's Task 5/6 drift notes above). -->
+  <div id="cc-pause-control" class="cc-pause">
+    <button id="cc-pause-toggle" type="button"
+            data-cc-command="set_trading_pause">Pause new trading</button>
+    <span id="cc-pause-state" class="cc-pause-state"></span>
+  </div>
+
   <script src="/static/command_center.js" defer></script>
 </body>
 </html>

@@ -87,6 +87,34 @@ anticipated when it was written:
    ``order_entity_id`` opaquely and never inspects the leg itself -- the
    classification ceremony is client-side UX only, per the module docstring
    above).
+
+5. [M1-C] Task 6: strategy control (enable/disable/params) and pause/resume.
+   The plan's literal route bodies forwarded ``expected_version`` +
+   ``preflight_nonce`` + ``session_fingerprint`` on all four commands,
+   mirroring ``approve_proposal``'s shape. The real [M1-F3] request models
+   (``trader.messaging.production_api``) do not:
+   ``EnableStrategyRequest``/``DisableStrategyRequest``/
+   ``UpdateStrategyParamsRequest`` are ``extra="forbid"`` with fields
+   ``{command_id, strategy_name, expected_control_revision[, params]}`` --
+   the CAS field is named ``expected_control_revision``, not
+   ``expected_version``, and there is NO ``preflight_nonce`` field at all
+   (the coordinator registers this trio ``requires_preflight=False,
+   saga=True`` -- they don't use the preflight-nonce mechanism).
+   ``SetTradingPauseRequest`` IS ``extra="forbid"`` with fields
+   ``{command_id, paused, expected_version, reason, preflight_nonce}`` -- no
+   ``account_id`` (the coordinator pins its own configured account, same
+   as approve/cancel) and no ``session_fingerprint``. Per this task's
+   explicit instruction not to repeat the ``session_fingerprint`` drift
+   already known on approve/cancel, none of these four forwarded bodies
+   carries it. ``preflight_nonce`` is still accepted on the WEB-FACING
+   ``StrategyControlBody``/``StrategyParamsBody`` for enable/params (risk-
+   increasing per spec 9.3 -- re-enabling or reparameterizing lets new
+   signals fire) purely as this layer's own live-ceremony gate signal
+   (``_reject_live_targeted_without_flag``, reused from drift item 4 above);
+   it is simply never forwarded past this layer since the real models
+   would 422 on it. Disable and pause=true are risk-REDUCING and immediate
+   in both modes (mirrors ``reject_proposal``/an entry-leg cancel): no
+   live-gate applies even if a nonce happens to be supplied.
 """
 from __future__ import annotations
 
@@ -551,6 +579,120 @@ def cancel_order(order_entity_id: str, body: CancelOrderBody, request: Request,
         "order_entity_id": order_entity_id,
         "preflight_nonce": body.preflight_nonce,
         "session_fingerprint": session_fingerprint(session),
+    })
+    return _receipt_json(receipt)
+
+
+class StrategyControlBody(BaseModel):
+    """Web-facing shape for enable/disable. Forwarded to F3 as
+    ``expected_control_revision`` (see drift item 5) -- ``expected_version``
+    here is just this layer's own field name, kept consistent with
+    ``SetPauseBody``/``ApproveProposalBody`` below. ``preflight_nonce`` is
+    accepted for the enable route's live-gate signal only (see
+    ``enable_strategy``); ``disable_strategy`` ignores it entirely (risk-
+    reducing, always immediate)."""
+
+    model_config = ConfigDict(extra="forbid")
+    command_id: str = _COMMAND_ID
+    expected_version: int = Field(ge=0)   # the strategy's control_revision (CAS)
+    preflight_nonce: str | None = None    # live enable ceremony only
+
+
+class StrategyParamsBody(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    command_id: str = _COMMAND_ID
+    expected_version: int = Field(ge=0)
+    params: dict[str, Any] = Field(min_length=1)  # a non-empty JSON object, never a list
+    preflight_nonce: str | None = None
+
+
+class SetPauseBody(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    command_id: str = _COMMAND_ID
+    paused: bool
+    expected_version: int | None = None   # required for resume, ignored for pause
+    reason: str = Field(min_length=1, max_length=200)
+    preflight_nonce: str | None = None
+
+    @model_validator(mode="after")
+    def _resume_requires_revision(self) -> "SetPauseBody":
+        # Setting paused=false increases risk (spec 9.4): it is a compare-and-set
+        # against the exact current revision. Pausing is idempotent even from a
+        # stale view, so it carries no revision.
+        if self.paused is False and self.expected_version is None:
+            raise ValueError("resume requires the exact current revision")
+        return self
+
+
+@router.post("/api/commands/strategies/{strategy_name}/enable")
+def enable_strategy(strategy_name: str, body: StrategyControlBody, request: Request,
+                    session: str = Depends(require_command_auth)):
+    # Risk-increasing (spec 9.3): re-enabling lets the strategy dispatch new
+    # signals again -- same live-gate as approve/cancel. The nonce is never
+    # forwarded below: EnableStrategyRequest declares no such field.
+    _reject_live_targeted_without_flag(request, body.preflight_nonce)
+    receipt = _gateway(request).execute("enable_strategy", {
+        "command_id": body.command_id,
+        "strategy_name": strategy_name,
+        "expected_control_revision": body.expected_version,
+    })
+    return _receipt_json(receipt)
+
+
+@router.post("/api/commands/strategies/{strategy_name}/disable")
+def disable_strategy(strategy_name: str, body: StrategyControlBody, request: Request,
+                     session: str = Depends(require_command_auth)):
+    # Risk-reducing (spec 9.3): stops the strategy from dispatching new
+    # signals -- immediate in both modes, no live-gate (mirrors
+    # reject_proposal). Any client-supplied preflight_nonce is dropped, never
+    # gated on. Exposure-ownership validation (whether disabling orphans an
+    # open exit) is the coordinator's, not this web layer's.
+    receipt = _gateway(request).execute("disable_strategy", {
+        "command_id": body.command_id,
+        "strategy_name": strategy_name,
+        "expected_control_revision": body.expected_version,
+    })
+    return _receipt_json(receipt)
+
+
+@router.post("/api/commands/strategies/{strategy_name}/params")
+def update_strategy_params(strategy_name: str, body: StrategyParamsBody,
+                           request: Request,
+                           session: str = Depends(require_command_auth)):
+    # Risk-increasing by default (any parameter whose risk effect is
+    # unspecified is treated as increasing -- the same fail-safe posture as
+    # classify_cancel's INCREASING default): live parameter changes take the
+    # same live-gate as enable above. The coordinator still re-validates
+    # every value against the strategy's versioned schema, allowed types,
+    # and finite ranges (spec Section 9.3) -- this route only guarantees the
+    # shape is a non-empty JSON object.
+    _reject_live_targeted_without_flag(request, body.preflight_nonce)
+    receipt = _gateway(request).execute("update_strategy_params", {
+        "command_id": body.command_id,
+        "strategy_name": strategy_name,
+        "expected_control_revision": body.expected_version,
+        "params": body.params,
+    })
+    return _receipt_json(receipt)
+
+
+@router.post("/api/commands/pause")
+def set_trading_pause(body: SetPauseBody, request: Request,
+                      session: str = Depends(require_command_auth)):
+    # The account is the coordinator's own configured account, never
+    # request-supplied (SetTradingPauseRequest has no account_id field).
+    # paused=true is risk-reducing -> immediate, no gate (mirrors disable).
+    # paused=false (resume) is risk-increasing -> same live-gate as
+    # enable/params above; the model_validator on SetPauseBody already
+    # enforced an exact expected_version is present.
+    if body.paused is False:
+        _reject_live_targeted_without_flag(request, body.preflight_nonce)
+    receipt = _gateway(request).execute("set_trading_pause", {
+        "command_id": body.command_id,
+        "paused": body.paused,
+        "expected_version": body.expected_version,
+        "reason": body.reason,
+        "preflight_nonce": body.preflight_nonce,
     })
     return _receipt_json(receipt)
 

@@ -677,3 +677,257 @@ def test_cancel_routes_require_csrf_and_origin(gateway):
         assert r.status_code == 403
         assert r.json()["code"] == "CSRF_REJECTED"
     assert gateway.calls == []
+
+
+# ---------------------------------------------------------------------------
+# [M1-C] Task 6 -- strategy control (enable/disable/params) and pause/resume.
+#
+# Source-vs-brief drift: the plan's literal route bodies forwarded
+# `expected_version` + `preflight_nonce` + `session_fingerprint` on EVERY one
+# of these four commands, mirroring approve_proposal's shape. The real
+# [M1-F3] request models (`trader/messaging/production_api.py`) do not:
+#
+# - `EnableStrategyRequest` / `DisableStrategyRequest` /
+#   `UpdateStrategyParamsRequest` are `extra="forbid"` with fields
+#   `{command_id, strategy_name, expected_control_revision[, params]}` --
+#   NOT `expected_version`, and NO `preflight_nonce` field at all (registered
+#   `requires_preflight=False, saga=True` at the coordinator; the strategy
+#   control trio doesn't use the coordinator's preflight-nonce mechanism).
+# - `SetTradingPauseRequest` IS `extra="forbid"` with fields `{command_id,
+#   paused, expected_version, reason, preflight_nonce}` -- `expected_version`
+#   matches the plan here, but there is no `account_id` field (the
+#   coordinator pins its own configured account) and no `session_fingerprint`
+#   field either.
+#
+# Forwarding `session_fingerprint`/a mismatched CAS field name to any of
+# these four would 422 downstream against the real models -- so unlike
+# approve_proposal/cancel_order (an ALREADY-LANDED drift this task was told
+# not to repeat), these bodies below carry ONLY the fields each real model
+# declares. `preflight_nonce` is still accepted on the WEB-FACING body for
+# enable/params (risk-increasing, per spec 9.3: re-enabling or reparameterizing
+# lets new signals fire) as this layer's own live-ceremony gate signal
+# (mirrors `_reject_live_targeted_without_flag` for approve/cancel) -- it is
+# just never forwarded past this layer. Disable and pause=true are
+# risk-REDUCING and immediate in both modes (mirrors reject_proposal/an
+# entry-leg cancel): no live-gate is applied even if a nonce is supplied.
+# ---------------------------------------------------------------------------
+
+def test_strategy_enable_forwards_control_revision(gateway):
+    client = make_client(gateway)
+    r = client.post("/api/commands/strategies/smi_crossover/enable",
+                    json={"command_id": CMD_ID, "expected_version": 4},
+                    headers=HEADERS)
+    assert r.status_code == 202
+    method, body = gateway.calls[0]
+    assert method == "enable_strategy"
+    # Matches EnableStrategyRequest field-for-field: expected_control_revision,
+    # not expected_version; no preflight_nonce/session_fingerprint (the real
+    # model declares neither and is extra="forbid").
+    assert body == {"command_id": CMD_ID, "strategy_name": "smi_crossover",
+                    "expected_control_revision": 4}
+
+
+def test_strategy_params_forwards_typed_params(gateway):
+    client = make_client(gateway)
+    r = client.post("/api/commands/strategies/smi_crossover/params",
+                    json={"command_id": CMD_ID, "expected_version": 4,
+                          "params": {"EMA_PERIOD": 15}},
+                    headers=HEADERS)
+    assert r.status_code == 202
+    method, body = gateway.calls[0]
+    assert method == "update_strategy_params"
+    assert body == {"command_id": CMD_ID, "strategy_name": "smi_crossover",
+                    "expected_control_revision": 4,
+                    "params": {"EMA_PERIOD": 15}}
+
+
+def test_strategy_params_rejects_non_object_params(gateway):
+    client = make_client(gateway)
+    r = client.post("/api/commands/strategies/smi_crossover/params",
+                    json={"command_id": CMD_ID, "expected_version": 4,
+                          "params": [1, 2, 3]},
+                    headers=HEADERS)
+    assert r.status_code == 422           # params must be a JSON object
+    assert gateway.calls == []
+
+
+def test_strategy_params_rejects_empty_params(gateway):
+    client = make_client(gateway)
+    r = client.post("/api/commands/strategies/smi_crossover/params",
+                    json={"command_id": CMD_ID, "expected_version": 4,
+                          "params": {}},
+                    headers=HEADERS)
+    assert r.status_code == 422
+    assert gateway.calls == []
+
+
+def test_strategy_disable_is_immediate_even_with_a_nonce(gateway):
+    """Disable is risk-reducing (spec 9.3) -- immediate in both modes, no
+    live-gate. A client-supplied preflight_nonce is silently dropped (never
+    forwarded -- DisableStrategyRequest declares no such field) rather than
+    gated on, unlike enable/params below."""
+    client = make_client(gateway)  # paper-only (default) flags
+    r = client.post("/api/commands/strategies/smi_crossover/disable",
+                    json={"command_id": CMD_ID, "expected_version": 4,
+                          "preflight_nonce": "n-7"},
+                    headers=HEADERS)
+    assert r.status_code == 202
+    method, body = gateway.calls[0]
+    assert method == "disable_strategy"
+    assert body == {"command_id": CMD_ID, "strategy_name": "smi_crossover",
+                    "expected_control_revision": 4}
+
+
+def test_live_targeted_strategy_enable_without_live_commands_enabled_is_403(gateway):
+    client = make_client(gateway)  # paper-only flags
+    r = client.post("/api/commands/strategies/smi_crossover/enable",
+                    json={"command_id": CMD_ID, "expected_version": 4,
+                          "preflight_nonce": "n-7"},
+                    headers=HEADERS)
+    assert r.status_code == 403
+    assert r.json()["code"] == "LIVE_COMMANDS_DISABLED"
+    assert gateway.calls == []
+
+
+def test_live_strategy_enable_forwards_without_the_nonce_field(gateway):
+    client = make_client(gateway, flags=LIVE_FLAGS)
+    r = client.post("/api/commands/strategies/smi_crossover/enable",
+                    json={"command_id": CMD_ID, "expected_version": 4,
+                          "preflight_nonce": "n-7"},
+                    headers=HEADERS)
+    assert r.status_code == 202
+    body = gateway.calls[0][1]
+    assert "preflight_nonce" not in body
+    assert body["expected_control_revision"] == 4
+
+
+def test_live_targeted_strategy_params_without_live_commands_enabled_is_403(gateway):
+    client = make_client(gateway)  # paper-only flags
+    r = client.post("/api/commands/strategies/smi_crossover/params",
+                    json={"command_id": CMD_ID, "expected_version": 4,
+                          "params": {"EMA_PERIOD": 15}, "preflight_nonce": "n-7"},
+                    headers=HEADERS)
+    assert r.status_code == 403
+    assert r.json()["code"] == "LIVE_COMMANDS_DISABLED"
+    assert gateway.calls == []
+
+
+def test_pause_sets_absolute_boolean_without_account(gateway):
+    client = make_client(gateway)
+    r = client.post("/api/commands/pause",
+                    json={"command_id": CMD_ID, "paused": True,
+                          "reason": "operator hold"},
+                    headers=HEADERS)
+    assert r.status_code == 202
+    method, body = gateway.calls[0]
+    assert method == "set_trading_pause"
+    assert body == {"command_id": CMD_ID, "paused": True,
+                    "expected_version": None, "reason": "operator hold",
+                    "preflight_nonce": None}
+    assert "account_id" not in body      # coordinator pins its configured account
+    assert "session_fingerprint" not in body
+
+
+def test_pause_true_is_immediate_without_live_gate(gateway):
+    """paused=true never requires the live ceremony even with a nonce
+    present -- risk-reducing, mirrors disable_strategy."""
+    client = make_client(gateway)  # paper-only flags
+    r = client.post("/api/commands/pause",
+                    json={"command_id": CMD_ID, "paused": True,
+                          "reason": "operator hold", "preflight_nonce": "n-9"},
+                    headers=HEADERS)
+    assert r.status_code == 202
+    assert gateway.calls[0][1]["preflight_nonce"] == "n-9"
+
+
+def test_resume_forwards_exact_revision(gateway):
+    client = make_client(gateway, flags=LIVE_FLAGS)
+    r = client.post("/api/commands/pause",
+                    json={"command_id": CMD_ID, "paused": False,
+                          "expected_version": 12, "reason": "resume",
+                          "preflight_nonce": "n-1"},
+                    headers=HEADERS)
+    assert r.status_code == 202
+    method, body = gateway.calls[0]
+    assert method == "set_trading_pause"
+    assert body["expected_version"] == 12
+    assert body["preflight_nonce"] == "n-1"
+    assert "session_fingerprint" not in body
+
+
+def test_resume_without_revision_is_rejected(gateway):
+    client = make_client(gateway)
+    r = client.post("/api/commands/pause",
+                    json={"command_id": CMD_ID, "paused": False,
+                          "reason": "resume"},
+                    headers=HEADERS)
+    assert r.status_code == 422           # resume is CAS: an exact revision is mandatory
+    assert gateway.calls == []
+
+
+def test_live_targeted_resume_without_live_commands_enabled_is_403(gateway):
+    client = make_client(gateway)  # paper-only flags
+    r = client.post("/api/commands/pause",
+                    json={"command_id": CMD_ID, "paused": False,
+                          "expected_version": 12, "reason": "resume",
+                          "preflight_nonce": "n-1"},
+                    headers=HEADERS)
+    assert r.status_code == 403
+    assert r.json()["code"] == "LIVE_COMMANDS_DISABLED"
+    assert gateway.calls == []
+
+
+def test_strategy_and_pause_routes_reject_malformed_command_id(gateway):
+    bad_id = "0f9b2c1a-5b7e-4c1d-9e2f-3a4b5c6d:8f1"
+    client = make_client(gateway)
+    for url, body in [
+        ("/api/commands/strategies/smi_crossover/enable",
+         {"command_id": bad_id, "expected_version": 4}),
+        ("/api/commands/strategies/smi_crossover/disable",
+         {"command_id": bad_id, "expected_version": 4}),
+        ("/api/commands/strategies/smi_crossover/params",
+         {"command_id": bad_id, "expected_version": 4, "params": {"EMA_PERIOD": 15}}),
+        ("/api/commands/pause",
+         {"command_id": bad_id, "paused": True, "reason": "hold"}),
+    ]:
+        r = client.post(url, json=body, headers=HEADERS)
+        assert r.status_code == 422
+    assert gateway.calls == []
+
+
+def test_strategy_and_pause_routes_require_csrf_and_origin(gateway):
+    bad_headers = dict(HEADERS)
+    bad_headers.pop("X-CSRF-Token")
+    for url, body in [
+        ("/api/commands/strategies/smi_crossover/enable",
+         {"command_id": CMD_ID, "expected_version": 4}),
+        ("/api/commands/strategies/smi_crossover/disable",
+         {"command_id": CMD_ID, "expected_version": 4}),
+        ("/api/commands/strategies/smi_crossover/params",
+         {"command_id": CMD_ID, "expected_version": 4, "params": {"EMA_PERIOD": 15}}),
+        ("/api/commands/pause",
+         {"command_id": CMD_ID, "paused": True, "reason": "hold"}),
+    ]:
+        client = make_client(gateway, flags=LIVE_FLAGS)
+        r = client.post(url, json=body, headers=bad_headers)
+        assert r.status_code == 403
+        assert r.json()["code"] == "CSRF_REJECTED"
+    assert gateway.calls == []
+
+
+def test_strategy_and_pause_routes_disabled_returns_403_before_gateway(gateway):
+    client = make_client(gateway, flags=CommandFlags(False, False, None, None))
+    for url, body in [
+        ("/api/commands/strategies/smi_crossover/enable",
+         {"command_id": CMD_ID, "expected_version": 4}),
+        ("/api/commands/strategies/smi_crossover/disable",
+         {"command_id": CMD_ID, "expected_version": 4}),
+        ("/api/commands/strategies/smi_crossover/params",
+         {"command_id": CMD_ID, "expected_version": 4, "params": {"EMA_PERIOD": 15}}),
+        ("/api/commands/pause",
+         {"command_id": CMD_ID, "paused": True, "reason": "hold"}),
+    ]:
+        r = client.post(url, json=body, headers=HEADERS)
+        assert r.status_code == 403
+        assert r.json()["code"] == "COMMANDS_DISABLED"
+    assert gateway.calls == []

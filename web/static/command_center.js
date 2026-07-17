@@ -979,5 +979,146 @@ document.getElementById('cc-cancel-all-confirm').addEventListener('click',
 document.getElementById('cc-cancel-all-abort').addEventListener('click',
     () => { document.getElementById('cc-cancel-all-dialog').hidden = true; });
 
+/* ===================== [M1-C] Task 6: strategy control + pause/resume =====
+ * Spec 9.3 (strategy enable/disable/params) / 9.4 (pause new trading).
+ * Strategy enable and resume (unpause) let new risk on -- they mirror
+ * approve_proposal/T4's live-gate + two-stage ceremony. Strategy disable and
+ * pause are risk-reducing and immediate in both modes, same as
+ * reject_proposal / an entry-leg cancel above -- no ceremony, no live-gate,
+ * even if a nonce happens to be passed through.
+ *
+ * Source-vs-brief drift: the plan assumed a `strategy.account_mode` field, a
+ * `strategy.owns_exposure` field, and a `CC.entity('trading_control',
+ * accountId)` accessor. None exist. The real "strategy" entity payload
+ * (`StrategyControlCommandService.acknowledge_state`,
+ * trader/trading/command_coordinator.py) is `{strategy_name, action,
+ * strategy_state, control_revision, state_revision, error}` plus the
+ * generic `entity_id`/`entity_revision` every row gets -- no `account_mode`,
+ * no `owns_exposure`, no `account_id` at all. Since a CommandFlags-
+ * configured dashboard already binds to exactly one account/mode (see
+ * ccApproveProposal's docstring above), a strategy's live/paper-ness is read
+ * off the single dashboard account (`store.view.accounts[0].mode`, the same
+ * value renderStatusBar's LIVE/PAPER badge already uses) rather than a
+ * per-strategy field that doesn't exist. The `trading_control` entity IS
+ * real (trader/trading/trading_control.py) and does carry
+ * `new_exposure_paused`/`revision`, but its account/mode is likewise
+ * resolved by matching its `account_id` against `store.view.accounts`,
+ * mirroring `ccOrderAccountMode` above -- there is no `CC.entities`/
+ * `CC.entity` helper (same gap Task 5's section above already documents).
+ *
+ * F3 wire-contract drift: `EnableStrategyRequest`/`DisableStrategyRequest`/
+ * `UpdateStrategyParamsRequest` (trader/messaging/production_api.py) have no
+ * `preflight_nonce` field at all (`requires_preflight=False, saga=True` at
+ * the coordinator) -- routes_commands.py accepts `preflight_nonce` on the
+ * enable/params bodies purely as ITS OWN live-gate signal and never forwards
+ * it past that layer. That's invisible at this JS boundary: the shape this
+ * file posts to those routes is unchanged from the brief.
+ *
+ * Wiring note: same deferred-wiring boundary `ccOpenCloseDrawer`/
+ * `ccApproveProposal`/`ccCancelOrder` above already document -- these
+ * functions are exposed per this task's interface (a strategy row's
+ * "Enable"/"Disable"/"Edit params" controls and a pause/resume toggle
+ * trigger them) but are not themselves wired into `renderStrategies()` or a
+ * pause control here; that is a later UI-wiring pass, not a restructure of
+ * the M1-R client store or renderer. */
+
+function ccDashboardAccountMode() {
+  const v = store.view;
+  return v && v.accounts && v.accounts[0] ? v.accounts[0].mode : null;
+}
+
+function ccAccountModeFor(accountId) {
+  const v = store.view;
+  if (!v || !v.accounts) return null;
+  const acct = v.accounts.find((a) =>
+      a.account_id === accountId || a.entity_id === accountId) || v.accounts[0];
+  return acct ? acct.mode : null;
+}
+
+function ccStrategyName(strategy) {
+  return strategy.name || strategy.strategy_name || strategy.entity_id;
+}
+
+async function ccEnableStrategy(strategy) {
+  const name = ccStrategyName(strategy);
+  const url = `/api/commands/strategies/${encodeURIComponent(name)}/enable`;
+  const label = `Enable ${name}`;
+  const revision = strategy.control_revision;
+  if (!ccIsLive(ccDashboardAccountMode())) {
+    await ccSubmitCommand('enable_strategy', label, url,
+        {command_id: ccNewCommandId(), expected_version: revision,
+         preflight_nonce: null});
+    return;
+  }
+  await ccRunLiveCeremony('enable_strategy', label, 'enable_strategy',
+      {strategy_name: name}, revision,
+      (commandId, nonce) => ccSubmitCommand('enable_strategy', label, url,
+          {command_id: commandId, expected_version: revision, preflight_nonce: nonce}));
+}
+
+async function ccDisableStrategy(strategy) {
+  // Risk-reducing (spec 9.3): immediate single POST in both modes, no
+  // ceremony -- mirrors ccRejectProposal / an entry-leg ccCancelOrder above.
+  // Exposure-ownership validation (whether disabling orphans an open exit)
+  // is the coordinator's, never decided here.
+  const name = ccStrategyName(strategy);
+  const url = `/api/commands/strategies/${encodeURIComponent(name)}/disable`;
+  const label = `Disable ${name}`;
+  await ccSubmitCommand('disable_strategy', label, url,
+      {command_id: ccNewCommandId(), expected_version: strategy.control_revision,
+       preflight_nonce: null});
+}
+
+async function ccUpdateStrategyParams(strategy, params) {
+  const name = ccStrategyName(strategy);
+  const url = `/api/commands/strategies/${encodeURIComponent(name)}/params`;
+  const label = `Update ${name} params`;
+  const revision = strategy.control_revision;
+  // Any parameter whose risk effect is unspecified is treated as
+  // risk-increasing (the same fail-safe default ccClassifyOrder uses
+  // above): live parameter changes take the ceremony, paper takes the
+  // single CAS POST.
+  if (!ccIsLive(ccDashboardAccountMode())) {
+    await ccSubmitCommand('update_strategy_params', label, url,
+        {command_id: ccNewCommandId(), expected_version: revision, params,
+         preflight_nonce: null});
+    return;
+  }
+  await ccRunLiveCeremony('update_strategy_params', label, 'update_strategy_params',
+      {strategy_name: name, params}, revision,
+      (commandId, nonce) => ccSubmitCommand('update_strategy_params', label, url,
+          {command_id: commandId, expected_version: revision, params,
+           preflight_nonce: nonce}));
+}
+
+/* ---- Pause new trading (spec 9.4) ----
+ * paused=true is risk-reducing: immediate single POST, no revision, both
+ * modes. paused=false (resume) is risk-increasing: paper sends the exact
+ * current revision in one POST; live runs the signed ceremony. */
+
+async function ccSetPause(accountId, paused, revision) {
+  const label = paused ? `Pause new trading (${accountId})`
+                       : `Resume new trading (${accountId})`;
+  const url = '/api/commands/pause';
+  const reason = paused ? 'operator pause' : 'operator resume';
+  if (paused) {
+    await ccSubmitCommand('set_trading_pause', label, url,
+        {command_id: ccNewCommandId(), paused: true, expected_version: null,
+         reason, preflight_nonce: null});
+    return;
+  }
+  if (!ccIsLive(ccAccountModeFor(accountId))) {
+    await ccSubmitCommand('set_trading_pause', label, url,
+        {command_id: ccNewCommandId(), paused: false, expected_version: revision,
+         reason, preflight_nonce: null});
+    return;
+  }
+  await ccRunLiveCeremony('set_trading_pause', label, 'set_trading_pause',
+      {paused: false}, revision,
+      (commandId, nonce) => ccSubmitCommand('set_trading_pause', label, url,
+          {command_id: commandId, paused: false, expected_version: revision,
+           reason, preflight_nonce: nonce}));
+}
+
 /* ---------------- boot ----------------------------------------------------- */
 resync();

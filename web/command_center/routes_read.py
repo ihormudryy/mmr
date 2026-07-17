@@ -83,9 +83,21 @@ def create_read_router(cc, templates) -> APIRouter:
     @router.get("/cc", response_class=HTMLResponse)
     async def command_center_page(request: Request,
                                   _session: str = Depends(_require_session)):
+        # [M1-C] UI-wiring pass: `commands_enabled` gates every command
+        # affordance (action buttons + the drawers/dialogs they open) in the
+        # template below. Read straight off `app.state.command_flags` -- the
+        # same `CommandFlags` instance `routes_commands.py`'s gateway routes
+        # and `web/app.py`'s legacy-mutation guard already treat as the one
+        # authority for this flag (set once at app-build time, see
+        # `web/app.py`'s `create_app`) -- rather than re-deriving it from
+        # `cc` (the `CommandCenter` doesn't itself own this flag; it only
+        # takes a `commands_enabled` constructor kwarg used to decide whether
+        # to build the command gateway at all).
+        commands_enabled = request.app.state.command_flags.commands_enabled
         return templates.TemplateResponse(request, "command_center.html", {
             "degraded_after_ms": int(os.environ.get("CC_DEGRADED_AFTER_MS", "15000")),
             "poll_interval_ms": int(os.environ.get("CC_POLL_INTERVAL_MS", "5000")),
+            "commands_enabled": commands_enabled,
         })
 
     return router

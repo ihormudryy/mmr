@@ -10,6 +10,12 @@ const CFG = {
   degradedAfterMs: parseInt(document.body.dataset.degradedAfterMs, 10) || 15000,
   pollIntervalMs: parseInt(document.body.dataset.pollIntervalMs, 10) || 5000,
   staleAfterS: 30,
+  // [M1-C] UI-wiring pass: mirrors data-commands-enabled (command_center.html
+  // body tag, set from routes_read.py's /cc handler off app.state.command_
+  // flags.commands_enabled). Every [M1-C] action affordance below checks
+  // this before rendering -- false (the default, read-only deployment)
+  // means the M1-R render functions behave exactly as before.
+  commandsEnabled: document.body.dataset.commandsEnabled === 'true',
 };
 
 const DOMAIN_EVENT_TYPES = [
@@ -240,6 +246,8 @@ function renderPositions() {
       <td class="num ${pnl >= 0 ? 'pos' : 'neg'}">${money(pnl)}</td>
       <td class="num">${money(p.daily_pnl)}</td>
       <td><span class="age">${fmtAge(quoteAge)}</span></td>
+      ${CFG.commandsEnabled ? `<td><button type="button"
+        data-cc-close-position="${esc(p.entity_id)}">Close</button></td>` : ''}
     </tr>`;
   }).join('');
 }
@@ -266,6 +274,9 @@ function renderProposals() {
 
 function renderOrders() {
   const v = store.view; if (!v) return;
+  // Cancellable == currently active (not yet terminal) -- mirrors the same
+  // active/terminal split state.py's _place() already enforces server-side.
+  const activeIds = new Set(v.orders.active.map(o => o.entity_id));
   const orders = [...v.orders.active, ...v.orders.terminal];
   const groups = new Map();
   for (const o of orders) {
@@ -285,7 +296,11 @@ function renderOrders() {
           ${esc(l.action || '')} ${fmt.format(l.quantity ?? 0)}
           @ ${esc(l.order_type || '')}</span>
           <span>${esc(l.status || '')} · filled ${fmt.format(l.filled_quantity || 0)}
-          ${l.avg_fill_price ? '@ ' + money(l.avg_fill_price) : ''}</span></div>`
+          ${l.avg_fill_price ? '@ ' + money(l.avg_fill_price) : ''}
+          ${CFG.commandsEnabled && activeIds.has(l.entity_id)
+            ? ` <button type="button"
+                data-cc-cancel-order="${esc(l.entity_id)}">Cancel</button>` : ''}
+          </span></div>`
         ).join('')}
       </div>`;
     }).join('') || '<div class="order-group group-head dim">No orders.</div>';
@@ -303,14 +318,61 @@ function renderFills() {
 function renderStrategies() {
   const v = store.view; if (!v) return;
   document.getElementById('strategies-body').innerHTML = v.strategies.map(s => {
-    const state = String(s.runtime_state || s.state || '').toUpperCase();
+    // `strategy_state` is the REAL field on the strategy row (the only
+    // producer is StrategyControlCommandService.acknowledge_state,
+    // trader/trading/command_coordinator.py -- see this file's Task 5/6
+    // drift notes below); `runtime_state`/`state` are kept as fallbacks for
+    // any other future producer rather than dropped outright.
+    const state = String(s.strategy_state || s.runtime_state || s.state || '')
+        .toUpperCase();
     const enabled = DISPATCHABLE_STRATEGY.has(state);
-    return `<tr><td>${esc(s.name || s.entity_id)}</td><td>${esc(state)}</td>
+    const name = esc(ccStrategyName(s));
+    const actions = CFG.commandsEnabled ? `<td>
+        ${enabled
+          ? `<button type="button" data-cc-strategy-action="disable"
+               data-cc-strategy="${name}">Disable</button>`
+          : `<button type="button" data-cc-strategy-action="enable"
+               data-cc-strategy="${name}">Enable</button>`}
+        <button type="button" data-cc-strategy-action="params"
+          data-cc-strategy="${name}">Edit params</button>
+      </td>` : '';
+    return `<tr><td>${name}</td><td>${esc(state)}</td>
       <td>${enabled ? '● enabled' : '○ not dispatchable'}</td>
       <td><span class="age">${fmtAge(ageOf(s.last_activity_at))}</span></td>
       <td class="${s.last_error ? 'neg' : 'dim'}">${
-        s.last_error ? '⚠ ' + esc(s.last_error) : '—'}</td></tr>`;
+        s.last_error ? '⚠ ' + esc(s.last_error) : '—'}</td>${actions}</tr>`;
   }).join('');
+  renderPauseControl();
+}
+
+/* ---- [M1-C] UI-wiring pass: account-level pause/resume control ----------
+ * Placed here (rather than a standalone entry in renderAll()) per the
+ * wiring task's own placement ("renderStrategies(...): ... and the
+ * pause/resume control"), even though trading_control is account-scoped,
+ * not per-strategy. */
+function renderPauseControl() {
+  if (!CFG.commandsEnabled) return;
+  const toggle = document.getElementById('cc-pause-toggle');
+  const stateEl = document.getElementById('cc-pause-state');
+  if (!toggle || !stateEl) return;
+  const v = store.view; if (!v) return;
+  const account = (v.accounts || [])[0] || {};
+  const accountId = account.entity_id || account.account_id;
+  const control = (v.trading_control || []).find(tc =>
+      tc.account_id === accountId || tc.entity_id === accountId);
+  if (!control) {
+    stateEl.textContent = 'unknown (no trading_control data)';
+    toggle.textContent = 'Pause new trading';
+    toggle.disabled = true;
+    toggle.onclick = null;
+    return;
+  }
+  toggle.disabled = false;
+  const paused = !!control.new_exposure_paused;
+  const revision = control.revision;
+  stateEl.textContent = paused ? '⏸ paused' : '● active';
+  toggle.textContent = paused ? 'Resume new trading' : 'Pause new trading';
+  toggle.onclick = () => ccSetPause(accountId, !paused, revision);
 }
 
 function renderRisk() {
@@ -378,14 +440,30 @@ document.getElementById('proposal-cards').addEventListener('keydown', e => {
   }
 });
 
+function ccFindProposalRow(id) {
+  const v = store.view; if (!v) return null;
+  return v.proposals.active.find(x => String(x.entity_id) === String(id))
+    || v.proposals.terminal.find(x => String(x.entity_id) === String(id))
+    || null;
+}
+
 function showProposalDrawer(id, invoker) {
-  const p = store.view.proposals.active.find(x => String(x.entity_id) === String(id))
-    || store.view.proposals.terminal.find(x => String(x.entity_id) === String(id));
+  const p = ccFindProposalRow(id);
   if (!p) return;
   // Full sizing-reasoning chain, not a one-line preview (spec §8.3).
   const sizing = p.sizing_result || {};
   const reasoning = Array.isArray(sizing.reasoning) ? sizing.reasoning
     : (sizing.reasoning ? [sizing.reasoning] : []);
+  // [M1-C] UI-wiring pass: Approve/Reject only for a PENDING proposal --
+  // ccApproveProposal/ccRejectProposal read `.id`/`.account_mode` straight
+  // off the real proposal row (ProposalRecord.to_payload() already carries
+  // both -- trader/data/proposal_repository.py -- so the store row can be
+  // passed through unchanged, no adapter needed).
+  const actions = (CFG.commandsEnabled && String(p.status || '').toUpperCase() === 'PENDING')
+    ? `<div class="cc-actions">
+        <button type="button" data-cc-approve="${esc(p.entity_id)}">Approve</button>
+        <button type="button" data-cc-reject="${esc(p.entity_id)}">Reject</button>
+      </div>` : '';
   openDrawer(`<h3>Proposal #${esc(p.entity_id)} — ${esc(p.action || '')}
       ${esc(p.symbol || '')}</h3>
     <p>status <strong>${esc(p.status)}</strong> · source ${esc(p.source || '—')}
@@ -395,7 +473,8 @@ function showProposalDrawer(id, invoker) {
       ? '<ol>' + reasoning.map(step => `<li>${esc(step)}</li>`).join('') + '</ol>'
       : '<p class="dim">No sizing reasoning recorded.</p>'}
     <h4>Rationale</h4>
-    <p>${esc(p.reasoning || '—')}</p>`, invoker);
+    <p>${esc(p.reasoning || '—')}</p>
+    ${actions}`, invoker);
 }
 
 /* ---------------- freshness ticker ---------------------------------------- */
@@ -619,6 +698,13 @@ function ccProposalBody(form, commandId) {
   };
 }
 
+// [M1-C] UI-wiring pass: `cc-proposal-form` (and every other cc-* static
+// element below) only exists in the DOM when commands_enabled is true (see
+// command_center.html's `{% if commands_enabled %}` wrapper) -- guard the
+// listener registration itself so a commands-disabled load never throws on
+// a null getElementById(...) and aborts the rest of this script (which
+// would also skip the resync() boot call at the very end of the file).
+if (CFG.commandsEnabled) {
 document.getElementById('cc-proposal-form').addEventListener('submit',
     async (evt) => {
       evt.preventDefault();
@@ -632,6 +718,7 @@ document.getElementById('cc-proposal-form').addEventListener('submit',
           `New proposal ${body.action} conId ${body.conid}`,
           '/api/commands/proposals', body);
     });
+}
 
 /* ---- Close position drawer (pre-filled reducing proposal) ---- */
 
@@ -651,6 +738,7 @@ function ccOpenCloseDrawer(position) {
   d.hidden = false;
 }
 
+if (CFG.commandsEnabled) {
 document.getElementById('cc-close-form').addEventListener('submit',
     async (evt) => {
       evt.preventDefault();
@@ -670,6 +758,7 @@ document.getElementById('cc-close-form').addEventListener('submit',
           `/api/commands/positions/${d.dataset.account}/${d.dataset.conid}/close`,
           body);
     });
+}
 
 /* ===================== [M1-C] Task 4: approve / reject / preflight ======
  * Live two-stage ceremony (spec 9.1): one command_id minted BEFORE
@@ -953,6 +1042,7 @@ function ccCancelAll() {
   ccOpenCancelAllDialog();
 }
 
+if (CFG.commandsEnabled) {
 document.getElementById('cc-cancel-all-confirm').addEventListener('click',
     async () => {
       const d = document.getElementById('cc-cancel-all-dialog');
@@ -978,6 +1068,7 @@ document.getElementById('cc-cancel-all-confirm').addEventListener('click',
     });
 document.getElementById('cc-cancel-all-abort').addEventListener('click',
     () => { document.getElementById('cc-cancel-all-dialog').hidden = true; });
+}
 
 /* ===================== [M1-C] Task 6: strategy control + pause/resume =====
  * Spec 9.3 (strategy enable/disable/params) / 9.4 (pause new trading).
@@ -1118,6 +1209,132 @@ async function ccSetPause(accountId, paused, revision) {
       (commandId, nonce) => ccSubmitCommand('set_trading_pause', label, url,
           {command_id: commandId, paused: false, expected_version: revision,
            reason, preflight_nonce: nonce}));
+}
+
+/* ===================== [M1-C] UI-wiring pass ==============================
+ * The consolidating pass Tasks 3-6 each deferred (their comments above still
+ * say "a later task wires that control ... "): binds the already-built cc*
+ * action functions into the M1-R render/drawer functions as additive
+ * affordances, gated on CFG.commandsEnabled. Nothing here restructures
+ * applyEvent()/the store shape -- every lookup below reads the exact same
+ * store.view collections renderPositions()/renderOrders()/renderStrategies()/
+ * showProposalDrawer() already read.
+ *
+ * Reuses the event-delegation pattern the M1-R `#proposal-cards` listener
+ * (above) established: one listener per stable container, matched by a
+ * `data-cc-*` attribute on the actual (plain <button>) target -- real
+ * <button> elements are natively keyboard-operable, so no extra keydown
+ * shim is needed the way the div/role=button proposal cards required. */
+
+function ccFindPositionRow(entityId) {
+  const v = store.view;
+  if (!v || !v.positions) return null;
+  return v.positions.find((p) => String(p.entity_id) === String(entityId)) || null;
+}
+
+function ccPositionForClose(position) {
+  // ccOpenCloseDrawer (Task 3, above) reads `.conid` directly with no
+  // fallback; the real BrokerPositionRow payload always carries `conid`
+  // (trader/data/broker_state.py), but a synthetic/seed row keyed only by
+  // `entity_id` ("ACCOUNT:CONID") would not -- derive it the same way
+  // renderPositions() already does rather than teaching ccOpenCloseDrawer
+  // a new fallback.
+  if (position.conid !== undefined && position.conid !== null) return position;
+  const conid = Number(String(position.entity_id || '').split(':').pop());
+  return Object.assign({}, position, {conid});
+}
+
+function ccFindOrderRow(entityId) {
+  const v = store.view;
+  if (!v || !v.orders) return null;
+  return v.orders.active.find((o) => String(o.entity_id) === String(entityId))
+      || v.orders.terminal.find((o) => String(o.entity_id) === String(entityId))
+      || null;
+}
+
+function ccFindStrategy(name) {
+  const v = store.view;
+  if (!v || !v.strategies) return null;
+  return v.strategies.find((s) => String(ccStrategyName(s)) === String(name)) || null;
+}
+
+/* ---- Strategy params drawer open (Apply/Cancel wiring is below, guarded
+ * with the rest of the cc-* static elements) ---- */
+function ccOpenStrategyParamsDrawer(strategy) {
+  const d = document.getElementById('cc-strategy-params-dialog');
+  if (!d) return;
+  const name = ccStrategyName(strategy);
+  document.getElementById('cc-params-strategy-name').textContent = name;
+  d.dataset.strategyName = name;
+  d.dataset.controlRevision = strategy.control_revision ?? '';
+  d.hidden = false;
+}
+
+if (CFG.commandsEnabled) {
+  // Proposal drawer: Approve / Reject (Task 4).
+  document.getElementById('drawer-content').addEventListener('click', (e) => {
+    const approveBtn = e.target.closest('[data-cc-approve]');
+    if (approveBtn) {
+      const p = ccFindProposalRow(approveBtn.dataset.ccApprove);
+      if (p) ccApproveProposal(p);
+      return;
+    }
+    const rejectBtn = e.target.closest('[data-cc-reject]');
+    if (rejectBtn) {
+      const p = ccFindProposalRow(rejectBtn.dataset.ccReject);
+      if (p) ccRejectProposal(p);
+    }
+  });
+
+  // Positions: Close (Task 3).
+  document.getElementById('positions-body').addEventListener('click', (e) => {
+    const btn = e.target.closest('[data-cc-close-position]');
+    if (!btn) return;
+    const position = ccFindPositionRow(btn.dataset.ccClosePosition);
+    if (position) ccOpenCloseDrawer(ccPositionForClose(position));
+  });
+
+  // Working orders: per-leg Cancel (Task 5). "Cancel all" is the static
+  // #cc-cancel-all-open button (command_center.html), wired inline via
+  // onclick="ccCancelAll()" -- same convention as #cc-open-proposal above.
+  document.getElementById('order-groups').addEventListener('click', (e) => {
+    const btn = e.target.closest('[data-cc-cancel-order]');
+    if (!btn) return;
+    const order = ccFindOrderRow(btn.dataset.ccCancelOrder);
+    if (order) ccCancelOrder(order);
+  });
+
+  // Strategies: Enable / Disable / Edit params (Task 6).
+  document.getElementById('strategies-body').addEventListener('click', (e) => {
+    const btn = e.target.closest('[data-cc-strategy-action]');
+    if (!btn) return;
+    const strategy = ccFindStrategy(btn.dataset.ccStrategy);
+    if (!strategy) return;
+    const action = btn.dataset.ccStrategyAction;
+    if (action === 'enable') ccEnableStrategy(strategy);
+    else if (action === 'disable') ccDisableStrategy(strategy);
+    else if (action === 'params') ccOpenStrategyParamsDrawer(strategy);
+  });
+
+  // Strategy params dialog: Apply / Cancel. The form is intentionally empty
+  // (no tunables schema yet -- see command_center.html's comment on
+  // #cc-strategy-params-dialog); Apply collects whatever it holds today
+  // (nothing) and still exercises the real ccUpdateStrategyParams(strategy,
+  // params) call so the CAS/live-ceremony path works once fields exist.
+  document.getElementById('cc-params-apply').addEventListener('click', () => {
+    const d = document.getElementById('cc-strategy-params-dialog');
+    const strategy = ccFindStrategy(d.dataset.strategyName) || {
+      strategy_name: d.dataset.strategyName,
+      control_revision: d.dataset.controlRevision ? Number(d.dataset.controlRevision) : null,
+    };
+    const form = document.getElementById('cc-strategy-params-form');
+    const params = Object.fromEntries(new FormData(form).entries());
+    d.hidden = true;
+    ccUpdateStrategyParams(strategy, params);
+  });
+  document.getElementById('cc-params-cancel').addEventListener('click', () => {
+    document.getElementById('cc-strategy-params-dialog').hidden = true;
+  });
 }
 
 /* ---------------- boot ----------------------------------------------------- */

@@ -73,7 +73,8 @@
   </style>
 </head>
 <body data-degraded-after-ms="{{ degraded_after_ms }}"
-      data-poll-interval-ms="{{ poll_interval_ms }}">
+      data-poll-interval-ms="{{ poll_interval_ms }}"
+      data-commands-enabled="{{ 'true' if commands_enabled else 'false' }}">
   <div id="degraded-banner" role="alert" hidden>
     ⚠ Realtime stream degraded — polling snapshots every 5 s. Data may be stale.
   </div>
@@ -93,6 +94,7 @@
           <th>Instrument</th><th>Qty</th><th>Avg</th><th>Last</th><th>Ccy</th>
           <th>Mkt value</th><th>Base value</th><th>Unrl P&amp;L</th>
           <th>Day P&amp;L</th><th>Fresh</th>
+          {% if commands_enabled %}<th data-cc-col="position-actions">Actions</th>{% endif %}
         </tr></thead>
         <tbody id="positions-body"></tbody>
       </table>
@@ -102,7 +104,9 @@
       <div id="proposal-cards"></div>
     </aside>
     <div class="lower">
-      <section id="orders-panel"><h2>Working orders</h2>
+      <section id="orders-panel"><h2>Working orders
+        {% if commands_enabled %}<button id="cc-cancel-all-open" type="button"
+                onclick="ccCancelAll()">Cancel all</button>{% endif %}</h2>
         <div id="order-groups"></div></section>
       <section id="fills-panel"><h2>Recent executions</h2>
         <table><thead><tr><th>Time</th><th>Instrument</th><th>Side</th>
@@ -110,7 +114,9 @@
           <tbody id="fills-body"></tbody></table></section>
       <section id="strategies-panel"><h2>Strategies</h2>
         <table><thead><tr><th>Strategy</th><th>State</th><th>Enabled</th>
-          <th>Last activity</th><th>Error</th></tr></thead>
+          <th>Last activity</th><th>Error</th>
+          {% if commands_enabled %}<th data-cc-col="strategy-actions">Actions</th>{% endif %}
+          </tr></thead>
           <tbody id="strategies-body"></tbody></table></section>
       <section id="risk-panel"><h2>Risk &amp; reconciliation</h2>
         <div id="risk-body" data-state="unavailable">Risk unavailable — waiting
@@ -124,6 +130,15 @@
     </div>
   </div>
 
+  <!-- [M1-C] UI-wiring pass: this whole block (toasts/pending-command chips/
+       every drawer+dialog) is gated on `commands_enabled` (see
+       routes_read.py's `/cc` handler) so a commands-disabled deployment
+       renders exactly the read-only [M1-R] page -- no orphaned drawer HTML,
+       and command_center.js's own listener registrations for the elements
+       below are gated the same way (see its own "[M1-C] UI-wiring pass"
+       section) so it never does a null `getElementById(...).addEventListener`
+       against a container this conditional block omitted. -->
+  {% if commands_enabled %}
   <!-- [M1-C] command containers. 202 == received only -- these never render
        success from the POST response itself; a "Pending confirmation" chip
        stays up until a correlated command.updated row (via [M1-R]'s existing
@@ -164,8 +179,9 @@
 
   <!-- [M1-C] Close position drawer -- pre-filled reducing proposal (market
        only; see routes_commands.py's ClosePositionBody). Invoked as
-       ccOpenCloseDrawer(position) from a position row's "Close" action once
-       a later task wires that control into the [M1-R] positions table. -->
+       ccOpenCloseDrawer(position) from a position row's "Close" action --
+       wired into renderPositions() by command_center.js's UI-wiring pass
+       (event delegation on #positions-body, gated on CFG.commandsEnabled). -->
   <aside id="cc-close-drawer" class="cc-drawer" hidden>
     <h2>Close position</h2>
     <p><span data-field="instrument"></span> — reducing
@@ -184,9 +200,9 @@
        confirms exactly what will transmit before the signed nonce +
        command_id ride the approve POST. Opened by ccOpenConfirmDrawer()
        (command_center.js) once ccRequestPreflight() returns a ticket;
-       populated by an "Approve" control a later task wires into the
-       proposal cards (same deferred-wiring boundary cc-close-drawer above
-       already documents). -->
+       populated by an "Approve" control wired into showProposalDrawer()'s
+       PENDING-proposal actions (command_center.js's UI-wiring pass, event
+       delegation on #drawer-content). -->
   <aside id="cc-confirm-drawer" class="cc-drawer cc-drawer-live" hidden>
     <h2>Confirm live command</h2>
     <dl>
@@ -211,9 +227,8 @@
        per-order commands under one correlation id (spec 9.7: "cancel-all
        expands under ONE correlation id and ONE confirmation"). Populated by
        ccOpenCancelAllDialog()/ccCancelAll() (command_center.js); opened from
-       a "Cancel all" control a later task wires into the working-orders
-       panel (same deferred-wiring boundary cc-close-drawer above already
-       documents). -->
+       the "Cancel all" button in the working-orders panel header above
+       (routes_read.py/this template, gated on commands_enabled). -->
   <aside id="cc-cancel-all-dialog" class="cc-drawer" hidden>
     <h2>Cancel all working orders</h2>
     <p>The following orders will be cancelled under one correlation id.
@@ -230,11 +245,13 @@
        (the real "strategy" entity payload -- StrategyControlCommandService.
        acknowledge_state -- carries {strategy_name, action, strategy_state,
        control_revision, state_revision, error}, nothing about tunables), so
-       field generation is deferred to the same later UI-wiring pass that
-       populates cc-close-drawer/cc-confirm-drawer above and calls
-       ccUpdateStrategyParams(strategy, params) with whatever it collects.
-       Server (F3's versioned params schema) is still the real validation
-       authority regardless of what this form offers. -->
+       typed field generation stays a follow-up. The open/apply wiring is
+       done: a strategy row's "Edit params" action opens this dialog
+       (ccOpenStrategyParamsDrawer, command_center.js's UI-wiring pass) and
+       "Apply" collects whatever this empty form yields (nothing, today) and
+       calls ccUpdateStrategyParams(strategy, params). Server (F3's versioned
+       params schema) is still the real validation authority regardless of
+       what this form offers. -->
   <aside id="cc-strategy-params-dialog" class="cc-drawer" hidden>
     <h2>Edit <span id="cc-params-strategy-name"></span> parameters</h2>
     <p class="cc-hint">Server validates every value against the strategy's
@@ -250,14 +267,17 @@
        immediate absolute set (risk-reducing, no revision); resume is a
        compare-and-set against the trading_control entity's current
        `revision` (risk-increasing -- ccSetPause runs the live ceremony on a
-       live account). Populated/toggled by a later UI-wiring pass reading
-       store.view.trading_control (no CC.entity() accessor exists -- see
-       command_center.js's Task 5/6 drift notes above). -->
+       live account). Populated/toggled by renderPauseControl()
+       (command_center.js's UI-wiring pass), called from renderStrategies(),
+       reading store.view.trading_control matched by account_id (no
+       CC.entity() accessor exists -- see command_center.js's Task 5/6 drift
+       notes above). -->
   <div id="cc-pause-control" class="cc-pause">
     <button id="cc-pause-toggle" type="button"
             data-cc-command="set_trading_pause">Pause new trading</button>
     <span id="cc-pause-state" class="cc-pause-state"></span>
   </div>
+  {% endif %}
 
   <script src="/static/command_center.js" defer></script>
 </body>

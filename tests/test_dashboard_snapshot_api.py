@@ -13,11 +13,34 @@ from sse_starlette.sse import AppStatus
 from cc_fakes import NullBridge as _NullBridge, NullQuotePlane as _NullQuotePlane
 from trader.domain.events import DomainEvent, SnapshotWithCursor
 from web.command_center import CommandCenter, CommandCenterConfig
+from web.command_center.flags import CommandFlags
 from web.command_center.session import DashboardCredentials
 
 UTC = dt.timezone.utc
 SECRET = "s" * 64
 TOKEN = "test-token"
+
+# [M1-C] UI-wiring pass: static, server-templated markers that only appear
+# in command_center.html when `commands_enabled` is true (see
+# routes_read.py's `/cc` handler and the template's `{% if commands_enabled
+# %}` guards) -- the gated Actions table columns (positions/strategies), the
+# "Cancel all" trigger, and the command drawer/dialog containers the
+# client-side per-row buttons (Approve/Reject/Close/Cancel/Enable/Disable/
+# Edit params -- rendered by command_center.js, not this server template)
+# open. Shared by the enabled/disabled page-render tests below so the two
+# assertions can never drift apart.
+_CC_AFFORDANCE_MARKERS = (
+    'data-cc-col="position-actions"',
+    'data-cc-col="strategy-actions"',
+    'id="cc-cancel-all-open"',
+    'id="cc-open-proposal"',
+    'id="cc-proposal-drawer"',
+    'id="cc-close-drawer"',
+    'id="cc-confirm-drawer"',
+    'id="cc-cancel-all-dialog"',
+    'id="cc-strategy-params-dialog"',
+    'id="cc-pause-control"',
+)
 
 
 @pytest.fixture
@@ -291,6 +314,14 @@ class TestCommandCenterPage:
             assert '/static/command_center.js' in html
             assert 'data-degraded-after-ms="15000"' in html
             assert 'data-poll-interval-ms="5000"' in html
+            # [M1-C] UI-wiring pass: commands are OFF by default (no
+            # DASHBOARD_COMMANDS_ENABLED in this test process's environment,
+            # see web/app.py's module-level `_COMMAND_FLAGS`) -- the page
+            # must render exactly as the pre-existing read-only [M1-R]
+            # dashboard, with none of the command action affordances present.
+            assert 'data-commands-enabled="false"' in html
+            for cc_marker in _CC_AFFORDANCE_MARKERS:
+                assert cc_marker not in html
 
     @pytest.mark.asyncio
     async def test_risk_panel_defaults_to_unavailable_not_green(self, client, cc):
@@ -300,3 +331,41 @@ class TestCommandCenterPage:
             html = (await c.get("/cc")).text
             assert 'data-state="unavailable"' in html
             assert 'Risk unavailable' in html
+
+    @pytest.mark.asyncio
+    async def test_page_renders_command_affordances_when_enabled(self, client, cc, app):
+        """[M1-C] UI-wiring pass: with commands_enabled=True, the `/cc` page
+        must render the command-affordance containers (the per-row Approve/
+        Reject/Close/Cancel/Enable/Disable buttons are rendered client-side
+        by command_center.js from the live snapshot -- see that file's new
+        "[M1-C] UI-wiring pass" section -- so this server-rendered-HTML test
+        can only observe the static markers: the gated Actions columns, the
+        "Cancel all" trigger, and the drawer/dialog containers those client
+        buttons open). A PENDING proposal / an active order / a strategy are
+        seeded in the backing store regardless, so this exercises the same
+        `/cc` code path a real commands-enabled deployment would serve.
+        """
+        app.state.command_flags = CommandFlags(True, False, None, None)
+        cc.state.install_baseline(
+            SnapshotWithCursor(source_cursor=0, broker_generation=1, entities={
+                "position": [{"entity_id": "DU123:1", "entity_revision": 1,
+                              "quantity": 10, "currency": "USD", "conid": 1}],
+                "account": [{"entity_id": "DU123", "entity_revision": 1,
+                             "net_liquidation": 50_000.0, "mode": "paper"}],
+                "proposal": [{"entity_id": "1", "entity_revision": 1, "id": 1,
+                              "status": "PENDING", "account_mode": "paper",
+                              "symbol": "AAPL", "action": "BUY"}],
+                "order": [{"entity_id": "ord-1", "entity_revision": 1,
+                           "order_entity_id": "ord-1", "account_id": "DU123",
+                           "conid": 1, "status": "SUBMITTED", "leg": "entry"}],
+                "strategy": [{"entity_id": "my_strategy", "entity_revision": 1,
+                              "strategy_name": "my_strategy",
+                              "strategy_state": "RUNNING", "control_revision": 1}],
+            }),
+            stream_id="stream-t")
+        async with client as c:
+            await _login(c)
+            html = (await c.get("/cc")).text
+            assert 'data-commands-enabled="true"' in html
+            for cc_marker in _CC_AFFORDANCE_MARKERS:
+                assert cc_marker in html

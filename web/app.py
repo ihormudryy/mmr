@@ -54,6 +54,7 @@ from web.command_center import (
 )
 from web.command_center.flags import CommandFlags, load_command_flags
 from web.command_center.health import create_health_router
+from web.command_center.routes_commands import install_command_routes
 from web.command_center.routes_read import create_read_router
 from web.command_center.session import (
     SESSION_COOKIE,
@@ -926,6 +927,16 @@ def create_app(cc: CommandCenter | None = None) -> FastAPI:
     # every app instance (including test-built ones via `create_app(stub_cc)`)
     # gets the same fail-closed flags on `app.state`, not a per-instance reload.
     application.state.command_flags = _COMMAND_FLAGS
+    # [M1-C] Task 3 -- the router is installed UNCONDITIONALLY so a disabled
+    # deployment still answers `/api/commands/*` with a stable 403
+    # `COMMANDS_DISABLED` instead of a bare 404; the gateway itself (and its
+    # HMAC-key/typed-socket requirement) is only constructed when commands
+    # are enabled, so a paper-only or read-only deployment never pays that
+    # startup cost or needs that credential configured at all.
+    install_command_routes(application)
+    if _COMMAND_FLAGS.commands_enabled:
+        from web.command_center.gateway import build_command_gateway
+        application.state.command_gateway = build_command_gateway(os.environ)
     application.mount('/static', StaticFiles(
         directory=str(Path(__file__).parent / 'static')), name='static')
 

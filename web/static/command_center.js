@@ -401,5 +401,250 @@ function showProposalDrawer(id, invoker) {
 /* ---------------- freshness ticker ---------------------------------------- */
 setInterval(() => { renderStatusBar(); renderPositions(); }, 1000);
 
+/* ===================== [M1-C] command surfaces ===================== */
+/* 202 == received only. Success renders ONLY once a matching command_id
+ * shows up in store.view.commands with a terminal state -- the exact same
+ * command.updated SSE reducer path applyEvent() (above) already wires via
+ * collectionFor(v, 'command') -> v.commands, since "command" is already one
+ * of DOMAIN_EVENT_TYPES. A POST that never gets an ack renders "Outcome
+ * unknown — reconciling" instead of ever inferring success from the HTTP
+ * response.
+ *
+ * Source-vs-brief note: this section assumes no CC.* namespace and no
+ * CC.onEvent hook -- neither exists anywhere above (the M1-R client store
+ * is bare globals: `store`, `resync`, `renderAll`, ...) -- so command
+ * resolution is read off the already-reduced `store.view.commands` via a
+ * small poll (ccCheckPendingCommands) instead of re-subscribing to SSE or
+ * restructuring applyEvent()/renderAll(). Likewise there is no
+ * `<meta name="cc-csrf-token">` anywhere in the page (session.py's cookie
+ * is HttpOnly and [M1-R] never minted a CSRF token to begin with) --
+ * ccCsrfToken() fetches-and-caches it from the
+ * `GET /api/commands/csrf-token` route this task adds instead. */
+
+const CC = {
+  commands: {
+    pending: new Map(),   // command_id -> {label}
+    unknown: new Map(),   // command_id -> {label}
+    availability: {},     // command kind -> {enabled, reason} (later task)
+  },
+  csrfToken: null,
+};
+
+function ccNewCommandId() {
+  // Created BEFORE submission; reused across confirmation and every retry.
+  return crypto.randomUUID();
+}
+
+async function ccCsrfToken() {
+  if (CC.csrfToken) return CC.csrfToken;
+  const res = await fetch('/api/commands/csrf-token', { credentials: 'same-origin' });
+  if (!res.ok) throw new Error('could not fetch a CSRF token for this session');
+  const data = await res.json();
+  CC.csrfToken = data.csrf_token;
+  return CC.csrfToken;
+}
+
+function ccToast(kind, text) {
+  const el = document.createElement('div');
+  el.className = `cc-toast cc-toast-${kind}`;
+  el.textContent = text;
+  document.getElementById('cc-toasts').appendChild(el);
+  setTimeout(() => el.remove(), 8000);
+}
+
+async function ccPost(url, body, { okStatus = 202 } = {}) {
+  const timeoutMs = window.CC_COMMAND_TIMEOUT_MS || 8000;
+  let res;
+  try {
+    const csrf = await ccCsrfToken();
+    res = await fetch(url, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', 'X-CSRF-Token': csrf },
+      credentials: 'same-origin',
+      body: JSON.stringify(body),
+      signal: AbortSignal.timeout(timeoutMs),
+    });
+  } catch (err) {
+    return {
+      ok: false, outcomeUnknown: true,
+      error: {
+        code: 'OUTCOME_UNKNOWN', message: 'no acknowledgement — reconciling',
+        retryable: false, correlation_id: body.command_id,
+      },
+    };
+  }
+  const data = await res.json().catch(() => ({}));
+  if (res.status === okStatus) return { ok: true, data };
+  const unknown = res.status === 504 || data.code === 'OUTCOME_UNKNOWN';
+  return { ok: false, outcomeUnknown: unknown, error: data };
+}
+
+function ccRenderPending() {
+  const box = document.getElementById('cc-pending-commands');
+  box.replaceChildren(...[...CC.commands.pending.entries()].map(([id, p]) => {
+    const chip = document.createElement('div');
+    chip.className = 'cc-pending';
+    chip.dataset.commandId = id;
+    chip.textContent = `${p.label} — Pending confirmation`;
+    return chip;
+  }));
+}
+
+function ccShowOutcomeUnknown(commandId, label) {
+  const banner = document.getElementById('cc-outcome-unknown');
+  CC.commands.unknown.set(commandId, { label });
+  banner.hidden = false;
+  banner.textContent =
+      `Outcome unknown — reconciling: ${
+        [...CC.commands.unknown.values()].map((u) => u.label).join(', ')}`;
+}
+
+function ccClearOutcomeUnknown(commandId) {
+  CC.commands.unknown.delete(commandId);
+  if (CC.commands.unknown.size === 0) {
+    document.getElementById('cc-outcome-unknown').hidden = true;
+  }
+}
+
+async function ccReconcileCommand(commandId, label) {
+  // Authoritative refresh: poll the ledger until a terminal state, or until
+  // ccCheckPendingCommands() clears it first from a command.updated event
+  // that already arrived over SSE.
+  for (let i = 0; i < 12 && CC.commands.unknown.has(commandId); i += 1) {
+    await new Promise((r) => setTimeout(r, window.CC_RECONCILE_MS || 5000));
+    try {
+      const res = await fetch(`/api/commands/${commandId}`,
+                              { credentials: 'same-origin' });
+      if (!res.ok) continue;
+      const receipt = await res.json();
+      if (['SUBMITTED', 'REJECTED', 'RESOLVED'].includes(receipt.state)) {
+        ccResolveCommand(commandId, receipt.state, receipt.error_code, label);
+        return;
+      }
+    } catch (err) { /* keep reconciling */ }
+  }
+}
+
+function ccResolveCommand(commandId, state, errorCode, label) {
+  const pending = CC.commands.pending.get(commandId);
+  const name = label || (pending && pending.label) || commandId;
+  CC.commands.pending.delete(commandId);
+  ccClearOutcomeUnknown(commandId);
+  ccRenderPending();
+  if (state === 'REJECTED') {
+    ccToast('error', `${name}: rejected (${errorCode || 'no code'})`);
+  } else {
+    ccToast('ok', `${name}: ${state.toLowerCase()}`);
+  }
+}
+
+function ccCheckPendingCommands() {
+  const v = typeof store !== 'undefined' ? store.view : null;
+  if (!v || !Array.isArray(v.commands)) return;
+  const ids = new Set([...CC.commands.pending.keys(), ...CC.commands.unknown.keys()]);
+  ids.forEach((id) => {
+    const row = v.commands.find((c) => c.entity_id === id);
+    if (!row) return;
+    const state = String(row.state || '').toUpperCase();
+    if (['SUBMITTED', 'REJECTED', 'RESOLVED'].includes(state)) {
+      ccResolveCommand(id, state, row.error_code, null);
+    }
+  });
+}
+setInterval(ccCheckPendingCommands, 400);
+
+function ccRequireAvailable(kind) {
+  const a = CC.commands.availability[kind];
+  if (a && !a.enabled) {
+    ccToast('error',
+            `Command unavailable — ${a.reason}. Commands are never queued.`);
+    return false;
+  }
+  return true;
+}
+
+async function ccSubmitCommand(kind, label, url, body) {
+  if (!ccRequireAvailable(kind)) return;
+  CC.commands.pending.set(body.command_id, { label });
+  ccRenderPending();
+  const result = await ccPost(url, body);
+  if (result.ok) return;  // stays "Pending confirmation" until command.updated
+  CC.commands.pending.delete(body.command_id);
+  ccRenderPending();
+  if (result.outcomeUnknown) {
+    ccShowOutcomeUnknown(body.command_id, label);
+    ccReconcileCommand(body.command_id, label);
+    return;
+  }
+  ccToast('error', `${label}: ${result.error.message} (${result.error.code})`);
+}
+
+/* ---- New proposal drawer ---- */
+
+function ccOpenProposalDrawer() {
+  document.getElementById('cc-proposal-drawer').hidden = false;
+}
+
+function ccProposalBody(form) {
+  const f = new FormData(form);
+  const num = (k) => (f.get(k) ? Number(f.get(k)) : null);
+  return {
+    command_id: ccNewCommandId(),
+    conid: Number(f.get('conid')),
+    action: f.get('action'),
+    quantity: num('quantity'),       // both empty -> server auto-sizing
+    amount: num('amount'),
+    confidence: f.get('confidence') ? Number(f.get('confidence')) : 0.0,
+    group: String(f.get('group') || '').trim(),
+    thesis: String(f.get('thesis') || '').trim(),
+    reasoning: String(f.get('reasoning') || ''),
+  };
+}
+
+document.getElementById('cc-proposal-form').addEventListener('submit',
+    async (evt) => {
+      evt.preventDefault();
+      const body = ccProposalBody(evt.target);
+      document.getElementById('cc-proposal-drawer').hidden = true;
+      await ccSubmitCommand('create_proposal',
+          `New proposal ${body.action} conId ${body.conid}`,
+          '/api/commands/proposals', body);
+    });
+
+/* ---- Close position drawer (pre-filled reducing proposal) ---- */
+
+function ccOpenCloseDrawer(position) {
+  const d = document.getElementById('cc-close-drawer');
+  d.querySelector('[data-field=instrument]').textContent =
+      `${position.symbol || position.conid} (${position.conid})`;
+  const action = position.quantity > 0 ? 'SELL' : 'BUY';  // opposite, reducing
+  d.querySelector('[data-field=side]').textContent = action;
+  const qty = d.querySelector('input[name=quantity]');
+  qty.value = Math.abs(position.quantity);
+  qty.max = Math.abs(position.quantity);  // never exceed reducible quantity
+  d.dataset.account = position.account_id
+      || String(position.entity_id || '').split(':')[0] || '';
+  d.dataset.action = action;
+  d.dataset.conid = position.conid;
+  d.hidden = false;
+}
+
+document.getElementById('cc-close-form').addEventListener('submit',
+    async (evt) => {
+      evt.preventDefault();
+      const d = document.getElementById('cc-close-drawer');
+      const body = {
+        command_id: ccNewCommandId(),
+        action: d.dataset.action,
+        quantity: Number(d.querySelector('input[name=quantity]').value),
+        reasoning: d.querySelector('textarea[name=reasoning]').value,
+      };
+      d.hidden = true;
+      await ccSubmitCommand('create_proposal',
+          `Close position conId ${d.dataset.conid}`,
+          `/api/commands/positions/${d.dataset.account}/${d.dataset.conid}/close`,
+          body);
+    });
+
 /* ---------------- boot ----------------------------------------------------- */
 resync();

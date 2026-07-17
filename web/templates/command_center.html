@@ -123,6 +123,62 @@
       <div id="drawer-content"></div>
     </div>
   </div>
+
+  <!-- [M1-C] command containers. 202 == received only -- these never render
+       success from the POST response itself; a "Pending confirmation" chip
+       stays up until a correlated command.updated row (via [M1-R]'s existing
+       store.view.commands reducer) or the reconciliation GET resolves it. -->
+  <div id="cc-toasts" aria-live="polite"></div>
+  <div id="cc-pending-commands" aria-live="polite"></div>
+  <div id="cc-outcome-unknown" class="cc-banner cc-banner-warn" hidden></div>
+
+  <!-- [M1-C] New proposal drawer -- MARKET-only, auto-sized when quantity
+       and amount are both left blank. Asks for a conId (not a symbol): the
+       frozen create_proposal wire contract only knows conIds and this
+       dashboard has no resolve-by-symbol endpoint wired in yet, so asking
+       for the exact conId is "precision over convenience", not a shortcut. -->
+  <button id="cc-open-proposal" type="button" onclick="ccOpenProposalDrawer()">
+    New proposal
+  </button>
+  <aside id="cc-proposal-drawer" class="cc-drawer" hidden>
+    <h2>New proposal</h2>
+    <form id="cc-proposal-form">
+      <label>Instrument conId
+        <input name="conid" type="number" step="1" min="1" required></label>
+      <label>Side
+        <select name="action"><option>BUY</option><option>SELL</option></select>
+      </label>
+      <fieldset>
+        <legend>Size — leave both empty for automatic position sizing</legend>
+        <label>Quantity <input name="quantity" type="number" step="any" min="0"></label>
+        <label>Notional amount <input name="amount" type="number" step="0.01" min="0"></label>
+      </fieldset>
+      <label>Confidence (0–1)
+        <input name="confidence" type="number" step="0.05" min="0" max="1"></label>
+      <label>Group tag <input name="group" maxlength="40"></label>
+      <label>Thesis <input name="thesis" maxlength="4000"></label>
+      <label>Reasoning <textarea name="reasoning" rows="4"></textarea></label>
+      <button type="submit" data-cc-command="create_proposal">Create proposal</button>
+    </form>
+  </aside>
+
+  <!-- [M1-C] Close position drawer -- pre-filled reducing proposal (market
+       only; see routes_commands.py's ClosePositionBody). Invoked as
+       ccOpenCloseDrawer(position) from a position row's "Close" action once
+       a later task wires that control into the [M1-R] positions table. -->
+  <aside id="cc-close-drawer" class="cc-drawer" hidden>
+    <h2>Close position</h2>
+    <p><span data-field="instrument"></span> — reducing
+       <strong data-field="side"></strong> (market by default)</p>
+    <form id="cc-close-form">
+      <label>Quantity (max = reducible quantity)
+        <input name="quantity" type="number" step="any" min="0.000001" required></label>
+      <label>Reasoning <textarea name="reasoning" rows="2"></textarea></label>
+      <button type="submit" data-cc-command="create_proposal">
+        Create close proposal</button>
+    </form>
+  </aside>
+
   <script src="/static/command_center.js" defer></script>
 </body>
 </html>

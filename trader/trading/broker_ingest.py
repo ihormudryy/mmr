@@ -9,6 +9,7 @@ from __future__ import annotations
 import datetime as dt
 import dataclasses
 import json
+import logging
 import queue
 import threading
 import uuid
@@ -476,7 +477,19 @@ class BrokerIngest:
                 # documents this same "reqAccountUpdates deadlocks post-connect"
                 # trap. Read the already-cached values instead, mirroring the
                 # reqPositionsAsync/reqAllOpenOrdersAsync pattern below.
-                for account_value in client.ib.accountValues(self.account_id):
+                account_values = client.ib.accountValues(self.account_id)
+                if not account_values:
+                    # Fail loudly (project principle): an empty cache means the
+                    # connect-time reqAccountUpdatesAsync likely timed out on a
+                    # busy gateway. We still promote (positions/orders are
+                    # complete), but the fenced snapshot will carry no balances
+                    # until the next sync -- surface it rather than silently
+                    # shipping a "ready" snapshot with missing account rows.
+                    logging.getLogger(__name__).warning(
+                        "broker sync: no cached account values for %s; promoting "
+                        "with empty balances (reqAccountUpdatesAsync at connect "
+                        "likely timed out)", self.account_id)
+                for account_value in account_values:
                     self.on_account_value(account_value)
                 self.mark_source_complete("account")
                 for position in await client.ib.reqPositionsAsync():

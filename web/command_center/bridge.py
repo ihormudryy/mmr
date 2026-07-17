@@ -155,6 +155,8 @@ class DashboardEventBridge:
         except TypedRpcRemoteError as exc:
             if exc.code != "METHOD_NOT_ALLOWED":
                 raise
+            logger.info("get_quotes_snapshot unavailable (%s); skipping quote "
+                        "pre-seed -- live quotes come from the QuotePlane", exc.code)
             quotes = {}
         stream_id = uuid.uuid4().hex  # every resync rotates the stream
         installed = threading.Event()

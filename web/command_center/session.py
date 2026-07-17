@@ -24,7 +24,14 @@ logger = logging.getLogger("web.command_center.session")
 SESSION_COOKIE = "mmr_dashboard_session"
 SESSION_LIFETIME_SECONDS = 12 * 3600
 
-_EXEMPT_PATHS = frozenset({"/healthz", "/readyz", "/session", "/logout", "/cc/login"})
+# `/api/health` is exempt from the *session cookie* gate on purpose: it runs
+# its OWN token gate (`web.app._check_access` / `MMR_WEB_TOKEN`) -- 200/degraded
+# when unconfigured, 401 only when that token is set. Letting the session
+# middleware also demand a cookie for it would clobber that gate (a blanket 401
+# whenever no session manager exists) and break the always-on ops-detail probe.
+# Only `/api/health` is exempted here -- every other `/api/*` route stays gated.
+_EXEMPT_PATHS = frozenset(
+    {"/healthz", "/readyz", "/api/health", "/session", "/logout", "/cc/login"})
 _STRICT_CSP = (
     "default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; "
     "img-src 'self' data:; connect-src 'self'; frame-ancestors 'none'; "

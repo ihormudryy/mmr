@@ -52,7 +52,11 @@ from web.command_center import (
     GRACEFUL_SHUTDOWN_SECONDS,
 )
 from web.command_center.routes_read import create_read_router
-from web.command_center.session import SessionSecurityMiddleware, create_session_router
+from web.command_center.session import (
+    CredentialConfigError,
+    SessionSecurityMiddleware,
+    create_session_router,
+)
 
 logger = logging.getLogger('web')
 
@@ -849,11 +853,20 @@ def create_app(cc: CommandCenter | None = None) -> FastAPI:
     async def _app_lifespan(fastapi_app: FastAPI):
         # Compose the command center's lifespan (bridge/quote-plane startup
         # and teardown) with the pre-existing `_lifespan` (the `_READY`
-        # readiness flip, G0 Task 6). Nesting `_lifespan` INSIDE
-        # `center.lifespan` means its post-yield code (`_READY = False`)
-        # runs on the way OUT before `center.lifespan`'s own `finally`
-        # (bridge.stop()/quote_plane.stop()) -- `/readyz` goes false as soon
-        # as shutdown begins, not only once that teardown finishes.
+        # readiness flip, G0 Task 6).
+        #
+        # `center.lifespan` DEGRADES to inert on a startup failure rather than
+        # aborting (see its docstring), so the inner `_lifespan` -- and the
+        # always-on `/healthz`/`/readyz` ops probes -- ALWAYS run regardless of
+        # dashboard configuration: the app boots even with no dill-strict / no
+        # credentials, and a misconfigured dashboard fails loud per request
+        # instead of taking the whole process (and its probes) down at startup.
+        #
+        # Nesting `_lifespan` INSIDE `center.lifespan` keeps the teardown order:
+        # its post-yield code (`_READY = False`) runs on the way OUT before
+        # `center.lifespan`'s own `finally` (bridge.stop()/quote_plane.stop()),
+        # so `/readyz` goes false as soon as shutdown begins, not only once that
+        # teardown finishes.
         async with center.lifespan(fastapi_app):
             async with _lifespan(fastapi_app):
                 yield
@@ -862,9 +875,28 @@ def create_app(cc: CommandCenter | None = None) -> FastAPI:
     application.state.command_center = center
     application.mount('/static', StaticFiles(
         directory=str(Path(__file__).parent / 'static')), name='static')
+
+    def _middleware_manager():
+        """None-TOLERANT session-manager provider for the middleware.
+
+        Attempts lazy construction (so a valid cookie presented before the
+        lifespan/first request ever built the manager still authenticates,
+        removing the ordering coupling), but a *misconfigured* dashboard
+        (missing credentials -> `CredentialConfigError`) degrades to "no
+        manager". The middleware turns "no manager" into a redirect to
+        `/cc/login` (or 401 for `/api/*`) -- a gated request must never 500
+        from the middleware just because the manager can't be built. The hard,
+        fail-loud failure stays per-request in `require_session` ->
+        `ensure_session_manager` for the routes that truly need a manager.
+        """
+        try:
+            return center.ensure_session_manager()
+        except CredentialConfigError:
+            return None
+
     application.add_middleware(
         SessionSecurityMiddleware,
-        manager_provider=lambda: center.session_manager)
+        manager_provider=_middleware_manager)
     # `center.ensure_session_manager` (a bound method, callable) is passed
     # rather than a manager instance: create_session_router wraps any
     # callable as its lazy manager_provider, so building this router never

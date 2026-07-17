@@ -153,31 +153,86 @@ class CommandCenter:
 
     @asynccontextmanager
     async def lifespan(self, app):
-        _assert_single_worker()
-        _assert_dill_strict()
-        self.ensure_session_manager()
-        loop = asyncio.get_running_loop()
-        self._query_client = self._query_client_factory()
-        self._feed_client = self._feed_client_factory()
-        self.bridge = self._bridge_factory(
-            self._query_client, self._feed_client, self.state, self.fanout, loop)
-        if hasattr(self.bridge, "start"):
-            self.bridge.start()
-        self.quote_plane = self._quote_plane_factory(loop, self.fanout.publish_quotes)
-        self.quote_plane.start()
-        if self._command_gateway_factory is not None:  # [M1-C] wires this
-            self.command_gateway = self._command_gateway_factory(self)
+        """Bring up the command center, but NEVER abort ASGI startup.
+
+        A misconfiguration (``MMR_DILL_STRICT`` unset, dashboard credentials
+        missing) or a bridge/quote-plane start failure DEGRADES the command
+        center to inert -- logged loudly -- and still yields, so the app (and
+        its always-on ``/healthz`` / ``/readyz`` ops probes) boots regardless.
+        Degrading here does NOT weaken security:
+
+        * dashboard routes still fail loud *per request* -- ``require_session``
+          -> ``ensure_session_manager()`` raises ``CredentialConfigError`` on a
+          dashboard request without credentials (unchanged, request-scoped);
+        * dill-strict is still enforced at the quote-decode seam
+          (``quotes._default_decode`` raises unless ``MMR_DILL_STRICT`` is set),
+          so relaxing the *startup* assertion to degrade-not-abort opens no dill
+          execution hole -- the quote plane simply is not started in this path.
+        """
+        started = self._start_or_degrade()
         try:
             yield
         finally:
-            # Uvicorn has already drained or cancelled SSE responses within its
-            # 5-second graceful-shutdown bound; generators unregister in finally.
-            remaining = self.fanout.client_count()
-            if remaining:
-                logger.warning("lifespan teardown with %d SSE clients still "
-                               "registered", remaining)
-            self.quote_plane.stop()
-            self.bridge.stop()
-            for client in (self._query_client, self._feed_client):
-                if client is not None and hasattr(client, "close"):
+            if started:
+                # Uvicorn has already drained or cancelled SSE responses within
+                # its graceful-shutdown bound; generators unregister in finally.
+                remaining = self.fanout.client_count()
+                if remaining:
+                    logger.warning("lifespan teardown with %d SSE clients still "
+                                   "registered", remaining)
+                self._teardown()
+
+    def _start_or_degrade(self) -> bool:
+        """Start the bridge + quote plane. Returns True on a full start, or
+        False after catching+logging a startup failure (degraded/inert)."""
+        try:
+            _assert_single_worker()
+            _assert_dill_strict()
+            self.ensure_session_manager()
+            loop = asyncio.get_running_loop()
+            self._query_client = self._query_client_factory()
+            self._feed_client = self._feed_client_factory()
+            self.bridge = self._bridge_factory(
+                self._query_client, self._feed_client, self.state, self.fanout, loop)
+            if hasattr(self.bridge, "start"):
+                self.bridge.start()
+            self.quote_plane = self._quote_plane_factory(
+                loop, self.fanout.publish_quotes)
+            self.quote_plane.start()
+            if self._command_gateway_factory is not None:  # [M1-C] wires this
+                self.command_gateway = self._command_gateway_factory(self)
+            return True
+        except Exception:  # noqa: BLE001 - degrade to inert, never abort the app
+            logger.exception(
+                "command center failed to start -- dashboard DEGRADED to inert "
+                "(ops probes /healthz and /readyz still serve; dashboard routes "
+                "fail loud per request)")
+            # Partial-startup cleanup: if the bridge started but the quote plane
+            # (or gateway) then failed, stop the bridge so its thread never
+            # leaks. _teardown() is idempotent over the None-guarded handles.
+            self._teardown()
+            return False
+
+    def _teardown(self) -> None:
+        """Stop whatever came up, guarded so it is safe on a partial start."""
+        if self.quote_plane is not None:
+            try:
+                self.quote_plane.stop()
+            except Exception:  # noqa: BLE001
+                logger.exception("quote plane stop failed during teardown")
+            self.quote_plane = None
+        if self.bridge is not None:
+            try:
+                self.bridge.stop()
+            except Exception:  # noqa: BLE001
+                logger.exception("bridge stop failed during teardown")
+            self.bridge = None
+        self.command_gateway = None
+        for attr in ("_query_client", "_feed_client"):
+            client = getattr(self, attr)
+            if client is not None and hasattr(client, "close"):
+                try:
                     client.close()
+                except Exception:  # noqa: BLE001
+                    logger.exception("%s close failed during teardown", attr)
+            setattr(self, attr, None)

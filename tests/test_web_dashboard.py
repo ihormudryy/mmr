@@ -13,7 +13,11 @@ import pytest
 from fastapi.testclient import TestClient
 
 import web.app as webapp
+from cc_fakes import NullBridge, NullQuotePlane
 from trader.common.reactivex import SuccessFail
+
+TEST_TOKEN = "test-dashboard-token"
+TEST_SECRET = "s" * 64
 
 
 class _Ok:
@@ -119,8 +123,32 @@ def stub(monkeypatch):
 
 
 @pytest.fixture
-def client(stub):
-    return TestClient(webapp.app)
+def stub_cc():
+    """A CommandCenter wired with the same null bridge/quote-plane fakes
+    used by tests/test_dashboard_snapshot_api.py, and a fixed test token --
+    just enough to build create_app(...) and authenticate through
+    /session, since these tests exercise the legacy SDK-backed dashboard
+    routes (now behind the same session gate), not the read-model API."""
+    from web.command_center import CommandCenter, CommandCenterConfig
+    from web.command_center.session import DashboardCredentials
+    return CommandCenter(
+        CommandCenterConfig(),
+        credentials_loader=lambda: DashboardCredentials(
+            token=TEST_TOKEN, session_secret=TEST_SECRET.encode(), legacy_alias_used=False),
+        query_client_factory=lambda: None,
+        feed_client_factory=lambda: None,
+        bridge_factory=lambda *a, **k: NullBridge(),
+        quote_plane_factory=lambda loop, deliver: NullQuotePlane(),
+    )
+
+
+@pytest.fixture
+def client(stub, stub_cc):
+    from web.app import create_app
+    app = create_app(stub_cc)
+    test_client = TestClient(app)
+    test_client.post("/session", data={"token": TEST_TOKEN})
+    return test_client
 
 
 def _csrf():

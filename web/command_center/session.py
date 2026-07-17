@@ -186,11 +186,26 @@ input{background:#0e1116;color:#d7dce3}button{background:#1f6feb;color:#fff;bord
 
 
 def create_session_router(
-    manager: SessionManager,
+    manager: SessionManager | Callable[[], SessionManager],
     limiter: FailedAttemptLimiter,
     *,
     cookie_secure: bool = False,
 ) -> APIRouter:
+    """Build the login/logout router.
+
+    ``manager`` may be a plain ``SessionManager`` instance (the original
+    Task 1 shape -- still exactly how ``tests/test_dashboard_session.py``
+    constructs this router) OR a zero-arg callable that lazily resolves one
+    (e.g. ``CommandCenter.ensure_session_manager``, which constructs-and-
+    caches the manager from configured credentials on first call). Routes
+    resolve the provider inside each request handler, never at router-build
+    time, so building this router never itself needs credentials to be
+    configured -- ``ensure_session_manager`` stays the one hard failure
+    point, whenever a request (or lifespan startup) first asks for it.
+    """
+    manager_provider: Callable[[], SessionManager] = (
+        manager if callable(manager) else (lambda: manager)
+    )
     router = APIRouter()
 
     @router.get("/cc/login", response_class=HTMLResponse)
@@ -201,7 +216,7 @@ def create_session_router(
     def login(request: Request, token: str = Form("")):
         if not limiter.allow():
             raise HTTPException(status_code=429, detail="too many failed attempts")
-        cookie = manager.exchange(token)
+        cookie = manager_provider().exchange(token)
         if cookie is None:
             limiter.record_failure()
             raise HTTPException(status_code=401, detail="invalid token")

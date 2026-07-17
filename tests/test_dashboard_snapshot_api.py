@@ -200,3 +200,38 @@ class TestEventsEndpoint:
                         break
             await asyncio.sleep(0.05)  # let the finally block run
         assert cc.fanout.client_count() == 0
+
+
+class TestCommandCenterPage:
+    @pytest.mark.asyncio
+    async def test_page_requires_session(self, client, cc):
+        _seed(cc)
+        async with client as c:
+            response = await c.get("/cc")
+            assert response.status_code == 303
+            assert response.headers["location"] == "/cc/login"
+
+    @pytest.mark.asyncio
+    async def test_page_renders_layout_a_regions(self, client, cc):
+        _seed(cc)
+        async with client as c:
+            await _login(c)
+            html = (await c.get("/cc")).text
+            for element_id in ("status-bar", "mode-badge", "account-id",
+                               "dependency-chips", "last-event-time",
+                               "account-cards", "positions-panel", "action-rail",
+                               "orders-panel", "fills-panel", "strategies-panel",
+                               "risk-panel", "degraded-banner", "drawer"):
+                assert f'id="{element_id}"' in html
+            assert '/static/command_center.js' in html
+            assert 'data-degraded-after-ms="15000"' in html
+            assert 'data-poll-interval-ms="5000"' in html
+
+    @pytest.mark.asyncio
+    async def test_risk_panel_defaults_to_unavailable_not_green(self, client, cc):
+        _seed(cc)
+        async with client as c:
+            await _login(c)
+            html = (await c.get("/cc")).text
+            assert 'data-state="unavailable"' in html
+            assert 'Risk unavailable' in html

@@ -1,0 +1,128 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>MMR Command Center</title>
+  <style>
+    :root { --bg:#0e1116; --panel:#171b22; --border:#262c36; --fg:#d7dce3;
+      --dim:#7d8794; --pos:#3fb950; --neg:#f85149; --accent:#58a6ff;
+      --warn:#d29922; --chip:#21262d; }
+    * { box-sizing: border-box; }
+    body { margin:0; background:var(--bg); color:var(--fg);
+      font:14px/1.45 -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif; }
+    #degraded-banner { padding:10px 24px; background:rgba(210,153,34,.15);
+      color:var(--warn); border-bottom:1px solid var(--border); font-weight:600; }
+    #status-bar { display:flex; gap:16px; align-items:center; flex-wrap:wrap;
+      padding:12px 24px; background:var(--panel); border-bottom:1px solid var(--border); }
+    .badge { padding:2px 10px; border-radius:999px; font-weight:700; font-size:12px;
+      background:var(--chip); }
+    .badge.live { background:rgba(248,81,73,.2); color:var(--neg); }
+    .badge.paper { background:rgba(88,166,255,.2); color:var(--accent); }
+    #dependency-chips { display:flex; gap:8px; flex-wrap:wrap; }
+    .chip { padding:2px 8px; border-radius:999px; font-size:11px; font-weight:600;
+      background:var(--chip); color:var(--dim); }
+    .chip[data-state="ok"] { background:rgba(63,185,80,.15); color:var(--pos); }
+    .chip[data-state="error"], .chip[data-state="unknown"] {
+      background:rgba(248,81,73,.15); color:var(--neg); }
+    #last-event-time { margin-left:auto; color:var(--dim); font-size:12px; }
+    #account-cards { display:grid; grid-template-columns:repeat(auto-fit, minmax(170px,1fr));
+      gap:14px; padding:16px 24px; }
+    .card { background:var(--panel); border:1px solid var(--border); border-radius:10px;
+      padding:12px 16px; }
+    .card .k { color:var(--dim); font-size:11px; text-transform:uppercase; letter-spacing:.5px; }
+    .card .v { font-size:20px; font-weight:700; font-variant-numeric:tabular-nums; }
+    main.grid { display:grid; gap:18px; padding:0 24px 24px;
+      grid-template-columns:minmax(0, 3fr) minmax(280px, 1fr); }
+    section, aside { background:var(--panel); border:1px solid var(--border);
+      border-radius:10px; overflow:hidden; }
+    section > h2, aside > h2 { margin:0; padding:11px 16px; font-size:12px;
+      text-transform:uppercase; letter-spacing:.6px; color:var(--dim);
+      border-bottom:1px solid var(--border); }
+    #positions-panel { grid-column:1; grid-row:1 / span 2; }
+    #action-rail { grid-column:2; grid-row:1 / span 2; }
+    .lower { grid-column:1 / -1; display:grid; gap:18px;
+      grid-template-columns:repeat(auto-fit, minmax(320px, 1fr)); }
+    table { width:100%; border-collapse:collapse; }
+    th, td { padding:7px 14px; text-align:right; white-space:nowrap; font-size:13px; }
+    th:first-child, td:first-child { text-align:left; }
+    thead th { color:var(--dim); font-weight:500; font-size:11px;
+      border-bottom:1px solid var(--border); }
+    tbody tr { border-top:1px solid var(--border); }
+    .pos { color:var(--pos); } .neg { color:var(--neg); } .dim { color:var(--dim); }
+    .num { font-variant-numeric:tabular-nums; }
+    .age { font-size:11px; color:var(--dim); }
+    tr.stale .age::before, .stale-marker::before { content:"⚠ "; color:var(--warn); }
+    .proposal-card { border-bottom:1px solid var(--border); padding:12px 16px; }
+    .proposal-card:focus { outline:2px solid var(--accent); outline-offset:-2px; }
+    #risk-body { padding:14px 16px; }
+    #risk-body[data-state="unavailable"] { color:var(--warn); }
+    #risk-body[data-state="warning"] { color:var(--neg); }
+    .order-group { border-bottom:1px solid var(--border); }
+    .order-group .group-head { padding:8px 16px; font-weight:600; }
+    .order-group .leg { padding:4px 16px 4px 32px; font-size:12px; color:var(--dim);
+      display:flex; justify-content:space-between; }
+    #drawer { position:fixed; inset:0; background:rgba(0,0,0,.6); z-index:50;
+      display:flex; align-items:flex-start; justify-content:center; padding:6vh 16px; }
+    #drawer[hidden] { display:none; }
+    #drawer-box { background:var(--panel); border:1px solid var(--border);
+      border-radius:10px; width:min(720px,100%); max-height:82vh; overflow:auto; }
+    #drawer-close { float:right; margin:8px; background:transparent; border:none;
+      color:var(--dim); font-size:18px; cursor:pointer; }
+    #drawer-content { padding:8px 20px 20px; }
+  </style>
+</head>
+<body data-degraded-after-ms="{{ degraded_after_ms }}"
+      data-poll-interval-ms="{{ poll_interval_ms }}">
+  <div id="degraded-banner" role="alert" hidden>
+    ⚠ Realtime stream degraded — polling snapshots every 5 s. Data may be stale.
+  </div>
+  <header id="status-bar">
+    <span id="mode-badge" class="badge">…</span>
+    <span id="account-id" class="num">—</span>
+    <span id="dependency-chips" aria-label="Dependency health"></span>
+    <span id="last-event-time" title="Latest authoritative event time">
+      last event: <span class="v">—</span></span>
+  </header>
+  <div id="account-cards" aria-label="Account summary"></div>
+  <main class="grid">
+    <section id="positions-panel" aria-label="Positions">
+      <h2>Positions</h2>
+      <table>
+        <thead><tr>
+          <th>Instrument</th><th>Qty</th><th>Avg</th><th>Last</th><th>Ccy</th>
+          <th>Mkt value</th><th>Base value</th><th>Unrl P&amp;L</th>
+          <th>Day P&amp;L</th><th>Fresh</th>
+        </tr></thead>
+        <tbody id="positions-body"></tbody>
+      </table>
+    </section>
+    <aside id="action-rail" aria-label="Pending proposals">
+      <h2>Action queue <span class="dim">(read-only)</span></h2>
+      <div id="proposal-cards"></div>
+    </aside>
+    <div class="lower">
+      <section id="orders-panel"><h2>Working orders</h2>
+        <div id="order-groups"></div></section>
+      <section id="fills-panel"><h2>Recent executions</h2>
+        <table><thead><tr><th>Time</th><th>Instrument</th><th>Side</th>
+          <th>Qty</th><th>Price</th><th>Commission</th></tr></thead>
+          <tbody id="fills-body"></tbody></table></section>
+      <section id="strategies-panel"><h2>Strategies</h2>
+        <table><thead><tr><th>Strategy</th><th>State</th><th>Enabled</th>
+          <th>Last activity</th><th>Error</th></tr></thead>
+          <tbody id="strategies-body"></tbody></table></section>
+      <section id="risk-panel"><h2>Risk &amp; reconciliation</h2>
+        <div id="risk-body" data-state="unavailable">Risk unavailable — waiting
+          for an authoritative risk projection.</div></section>
+    </div>
+  </main>
+  <div id="drawer" role="dialog" aria-modal="true" aria-label="Detail" hidden>
+    <div id="drawer-box">
+      <button id="drawer-close" aria-label="Close detail">×</button>
+      <div id="drawer-content"></div>
+    </div>
+  </div>
+  <script src="/static/command_center.js" defer></script>
+</body>
+</html>

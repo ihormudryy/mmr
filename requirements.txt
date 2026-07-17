@@ -56,3 +56,4 @@ uniplot>=0.21
 vectorbt>=0.28
 massive>=2.2.0
 twelvedata[pandas]>=1.3
+sse-starlette==2.1.3

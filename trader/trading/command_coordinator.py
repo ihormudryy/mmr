@@ -1531,22 +1531,35 @@ class CancelCommandService:
     ``retryable=False``, and call ``self._reconciler.schedule(...)`` -- never
     a raw exception or a generic ``INTERNAL_ERROR`` with nothing scheduled.
 
-    ``cancel_orders`` is NOT a saga: it validates the list, mints one
-    colon-free, deterministic child ``command_id`` per order
-    (``f"{root}-{index}"`` -- Task 6 addendum §4: the base brief's
-    ``f"{root}:{order_entity_id}"`` scheme is a colon-in-command_id
-    invariant violation caught by ``CommandRequest.__post_init__``/
-    ``encode_order_ref``), carries the ``order_entity_id`` in the child's
-    ``target_id``/``body`` (never in the command_id), and executes each
-    child through the SAME coordinator (``coordinator.execute(child)``) so
-    every child gets its own ledger row, audit record, and the full
-    ``cancel_order`` saga treatment. Every child's ``parent_command_id`` is
-    the root's ``command_id``, so its ``command.updated`` journal events all
-    carry the root as ``correlation_id`` (addendum §4: "child correlation_id
-    = the root command_id"). Returning a plain dict outcome lets the
-    coordinator's existing single-step ``RECEIVED -> RESOLVED`` fallback
-    finish the root command with ``{"child_command_ids": [...],
-    "classifications": {...}}``.
+    ``cancel_orders`` is NOT a saga: it dedupes the list (first-seen order),
+    classifies every target, and mints one colon-free, deterministic child
+    ``command_id`` per order (``f"{root}-{index}"`` over the DEDUPED sequence
+    -- Task 6 addendum §4: the base brief's ``f"{root}:{order_entity_id}"``
+    scheme is a colon-in-command_id invariant violation caught by
+    ``CommandRequest.__post_init__``/``encode_order_ref``), carries the
+    ``order_entity_id`` in the child's ``target_id``/``body`` (never in the
+    command_id), and executes each child through the SAME coordinator
+    (``coordinator.execute(child)``) so every child gets its own ledger row,
+    audit record, and the full ``cancel_order`` saga treatment. Every child's
+    ``parent_command_id`` is the root's ``command_id``, so its
+    ``command.updated`` journal events all carry the root as ``correlation_id``
+    (addendum §4: "child correlation_id = the root command_id").
+
+    The preflight ceremony authorizes the BATCH once (§9.7: "cancel-all
+    expands under ONE correlation id and ONE confirmation"; §9.1 binds the
+    nonce to a single command). If ANY deduped target classifies INCREASING,
+    the root consumes ``cmd.preflight_nonce`` EXACTLY once, transactionally,
+    BEFORE fanning out -- a failed consume rejects the WHOLE batch
+    (``PREFLIGHT_REQUIRED``, nothing fanned out) rather than dispatching a
+    partial set. The per-child ``cancel_order`` sees ``parent_command_id`` set
+    and skips its own (single-use) consume. Each child's receipt is captured
+    into the root outcome so per-leg truth is never masked; the outcome is
+    ``{"child_command_ids": [...], "children": {order_entity_id: {"command_id",
+    "state", "error_code", "classification"}}, "partial_failure": <bool>}``,
+    where ``partial_failure`` is true if any child ended non-SUBMITTED (or its
+    ``execute`` raised, which is isolated per child so a later order still
+    dispatches). Returning a plain dict lets the coordinator's existing
+    single-step ``RECEIVED -> RESOLVED`` fallback finish the root command.
     """
 
     def __init__(
@@ -1593,10 +1606,14 @@ class CancelCommandService:
         # Write-once risk decision for this cancel's classification, mirroring
         # ApprovalCommandService.approve's publish_decision call: a bare method
         # call, not itself journaled, recorded before the claiming transaction.
+        # The risk_id (first positional) stays the per-command command_id so a
+        # fan-out sibling never collides on it; the correlation is
+        # ``cmd.correlation_id`` so a CHILD's decision correlates to the ROOT
+        # cancel_orders command, not to the child's own id (Fix 5).
         self._risk_producer.publish_decision(
             cmd.command_id,
             {"decision": "cancel", "direction": direction.value, "order_entity_id": order_entity_id},
-            correlation_id=cmd.command_id,
+            correlation_id=cmd.correlation_id,
         )
 
         self._transition_command(cmd, "RECEIVED", "VALIDATED")
@@ -1606,8 +1623,13 @@ class CancelCommandService:
             # addendum): only an INCREASING (protective-leg or unclassifiable)
             # cancel needs the nonce, consumed inside this SAME transaction as
             # the VALIDATED -> SUBMITTING transition so a failed ceremony
-            # never leaves SUBMITTING committed.
-            if direction is RiskDirection.INCREASING:
+            # never leaves SUBMITTING committed. A fan-out CHILD
+            # (``parent_command_id`` set) is exempt: the root
+            # ``cancel_orders`` already performed the ONE ceremony for the
+            # whole batch (Fix 1), and the nonce is single-use -- so only a
+            # STANDALONE cancel (``parent_command_id is None``, which every
+            # wire-level ``cancel_order`` is) consumes its own nonce here.
+            if direction is RiskDirection.INCREASING and cmd.parent_command_id is None:
                 if not self._nonces.consume_in_tx(conn, cmd.preflight_nonce, cmd):
                     raise CommandValidationError(
                         "PREFLIGHT_REQUIRED",
@@ -1685,10 +1707,47 @@ class CancelCommandService:
                 "ORDER_ENTITY_IDS_REQUIRED", "order_entity_ids must be a non-empty list",
             )
 
+        # Fix 4: dedupe (preserving first-seen order) BEFORE classification and
+        # fan-out -- a repeated id must never mint two child commands or two
+        # broker cancel dispatches for the same order. The child index keys off
+        # this deduped sequence.
+        order_entity_ids = list(dict.fromkeys(order_entity_ids))
+
+        # Classify every (deduped) target up front. A batch needs the preflight
+        # ceremony iff ANY target classifies INCREASING (protective / missing /
+        # unclassifiable -- see ``classify_cancel``).
+        classifications: dict[str, str] = {
+            order_entity_id: classify_cancel(self._orders_view.get_order(order_entity_id)).value
+            for order_entity_id in order_entity_ids
+        }
+        batch_needs_ceremony = any(
+            value == RiskDirection.INCREASING.value for value in classifications.values()
+        )
+
+        # Fix 1: the ceremony authorizes the WHOLE batch ONCE. Consume the
+        # root's single-use nonce EXACTLY once, in its OWN journal transaction
+        # (the same ``mutate_batch_work`` mechanism ``cancel_order`` uses for
+        # its per-command consume), so a failed ceremony rolls the consume back
+        # and NOTHING is fanned out. On failure REJECT the whole batch: the
+        # raised ``CommandValidationError`` drives the root (a non-saga command)
+        # to REJECTED/PREFLIGHT_REQUIRED via ``execute()``'s handler-raise path.
+        # The per-child ``cancel_order`` then SKIPS its own consume (it sees
+        # ``parent_command_id`` set), so the one nonce covers every child.
+        if batch_needs_ceremony:
+            def _consume_root_nonce(conn: duckdb.DuckDBPyConnection, _append) -> None:
+                if not self._nonces.consume_in_tx(conn, cmd.preflight_nonce, cmd):
+                    raise CommandValidationError(
+                        "PREFLIGHT_REQUIRED",
+                        "missing, expired, or already-consumed preflight nonce",
+                    )
+            self._journal.mutate_batch_work(self._journal.connect(), _consume_root_nonce)
+
         child_ids: list[str] = []
-        classifications: dict[str, str] = {}
+        children: dict[str, dict[str, Any]] = {}
+        partial_failure = False
         for index, order_entity_id in enumerate(order_entity_ids):
             child_id = f"{cmd.command_id}-{index}"
+            child_ids.append(child_id)
             child = CommandRequest(
                 command_id=child_id,
                 action="cancel_order",
@@ -1701,13 +1760,38 @@ class CancelCommandService:
                 preflight_nonce=cmd.preflight_nonce,
                 parent_command_id=cmd.command_id,
             )
-            self._coordinator.execute(child)
-            child_ids.append(child_id)
-            classifications[order_entity_id] = classify_cancel(
-                self._orders_view.get_order(order_entity_id)
-            ).value
+            classification = classifications[order_entity_id]
+            # Fix 3: isolate each child. An exception out of one child's
+            # ``execute`` must NOT abort the batch (dropping every not-yet-reached
+            # order with no record) -- record it as FAILED and continue.
+            try:
+                receipt = self._coordinator.execute(child)
+            except Exception:  # deliberately broad: per-child fault isolation
+                children[order_entity_id] = {
+                    "command_id": child_id,
+                    "state": "FAILED",
+                    "error_code": "CHILD_EXECUTE_FAILED",
+                    "classification": classification,
+                }
+                partial_failure = True
+                continue
+            # Fix 2: capture each child's real receipt so the root outcome
+            # reflects per-child truth (no masked partial failure). A child that
+            # ends anything other than SUBMITTED flips ``partial_failure``.
+            children[order_entity_id] = {
+                "command_id": child_id,
+                "state": receipt.state,
+                "error_code": receipt.error_code,
+                "classification": classification,
+            }
+            if receipt.state != "SUBMITTED":
+                partial_failure = True
 
-        return {"child_command_ids": child_ids, "classifications": classifications}
+        return {
+            "child_command_ids": child_ids,
+            "children": children,
+            "partial_failure": partial_failure,
+        }
 
     # -- command-ledger single-step transition (mirrors ApprovalCommandService) --
 

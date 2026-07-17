@@ -133,10 +133,13 @@ class FakeReconciler:
 
 class FakeRiskProducer:
     def __init__(self):
-        self.decisions: list[tuple[str, dict]] = []
+        # (risk_id, payload, correlation_id) -- correlation_id is captured so a
+        # fan-out child's decision can be checked to carry the ROOT correlation
+        # while retaining its own per-child risk_id (Fix 5).
+        self.decisions: list[tuple[str, dict, "str | None"]] = []
 
     def publish_decision(self, command_id, payload, correlation_id=None):
-        self.decisions.append((command_id, payload))
+        self.decisions.append((command_id, payload, correlation_id))
 
 
 class FakeNonceGate:
@@ -232,6 +235,13 @@ def test_entry_cancel_is_risk_reducing_and_immediate(cancel):
     assert receipt.state == "SUBMITTED"
     assert cancel.dispatch.cancelled == [("ord-1", "c1")]      # dispatch correlation carries the command_id
     assert classify_cancel(cancel.orders_view.get_order("ord-1")) is RiskDirection.REDUCING
+    # Fix 6 (test-honesty): the docstring promises the risk decision is
+    # published exactly once on a saga-path cancel -- pin it so deleting the
+    # call can no longer keep the suite green.
+    assert len(cancel.risk_producer.decisions) == 1
+    risk_id, payload, _correlation = cancel.risk_producer.decisions[0]
+    assert risk_id == "c1"
+    assert payload["decision"] == "cancel"
 
 
 def test_protective_leg_cancel_is_risk_increasing_and_names_the_position(cancel_live):
@@ -239,6 +249,7 @@ def test_protective_leg_cancel_is_risk_increasing_and_names_the_position(cancel_
     without_nonce = cancel_live.execute(
         "cancel_order", {"order_entity_id": "ord-2"}, command_id="c1", nonce=None)
     assert without_nonce.error_code == "PREFLIGHT_REQUIRED"     # §9.1 ceremony for a risk-increasing cancel
+    assert without_nonce.retryable is True                      # Fix 6: mint a fresh nonce + retry
     with_nonce = cancel_live.execute(
         "cancel_order", {"order_entity_id": "ord-2"}, command_id="c1b", nonce="n-1")
     assert with_nonce.state == "SUBMITTED"
@@ -290,6 +301,7 @@ def test_missing_order_is_rejected_never_blind_cancelled(cancel):
     receipt = cancel.execute("cancel_order", {"order_entity_id": "does-not-exist"}, command_id="c1")
     assert receipt.state == "REJECTED"
     assert receipt.error_code == "ORDER_NOT_FOUND"
+    assert receipt.retryable is True                            # Fix 6: ORDER_NOT_FOUND is retryable
     assert cancel.dispatch.cancelled == []
 
 
@@ -338,3 +350,151 @@ def test_outcome_unknown_cancel_replay_is_not_retryable(cancel):
     fetched = cancel.coordinator.get_command("c1")
     assert fetched.state == "OUTCOME_UNKNOWN"
     assert fetched.retryable is False
+
+
+# ---------------------------------------------------------------------------
+# Fix 1 — batch ceremony: the nonce is consumed ONCE at the root, not per child.
+# ---------------------------------------------------------------------------
+
+def test_cancel_all_protective_legs_dispatch_under_one_ceremony(cancel):
+    # Two protective (risk-INCREASING) legs in one batch, sharing ONE nonce.
+    # §9.7: a cancel-all expands under ONE correlation id and ONE confirmation
+    # -- so BOTH children must dispatch on the single ceremony. Before the fix
+    # the root forwarded the same single-use nonce to each child, so the 2nd
+    # protective child re-consumed an already-spent nonce and was rejected
+    # PREFLIGHT_REQUIRED (only the FIRST dispatched).
+    cancel.orders_view.add(_order("ord-p1", leg="stop", status="Submitted"))
+    cancel.orders_view.add(_order("ord-p2", leg="take_profit", status="Submitted"))
+    receipt = cancel.execute(
+        "cancel_orders", {"order_entity_ids": ["ord-p1", "ord-p2"]},
+        command_id="root-prot", nonce="n-batch")
+    assert receipt.state == "RESOLVED"
+    children = [cancel.ledger.get(c) for c in receipt.outcome["child_command_ids"]]
+    assert {c.state for c in children} == {"SUBMITTED"}
+    assert sorted(oid for oid, _ref in cancel.dispatch.cancelled) == ["ord-p1", "ord-p2"]
+
+
+def test_cancel_all_protective_legs_missing_nonce_rejects_whole_batch(cancel):
+    # A batch that needs the ceremony but carries no nonce rejects the WHOLE
+    # batch at the root (before any fan-out) -- no child command is minted and
+    # no broker cancel is dispatched.
+    cancel.orders_view.add(_order("ord-p3", leg="stop", status="Submitted"))
+    cancel.orders_view.add(_order("ord-p4", leg="stop", status="Submitted"))
+    receipt = cancel.execute(
+        "cancel_orders", {"order_entity_ids": ["ord-p3", "ord-p4"]},
+        command_id="root-nonce", nonce=None)
+    assert receipt.state == "REJECTED"
+    assert receipt.error_code == "PREFLIGHT_REQUIRED"
+    assert cancel.dispatch.cancelled == []
+    assert cancel.ledger.get("root-nonce-0") is None    # no child was ever minted
+    assert cancel.ledger.get("root-nonce-1") is None
+
+
+def test_cancel_all_all_reducing_needs_no_ceremony(cancel):
+    # An all-REDUCING batch needs no ceremony: it dispatches with no nonce and
+    # never touches the nonce gate.
+    cancel.orders_view.add(_order("ord-r1", leg="entry", status="Submitted"))
+    cancel.orders_view.add(_order("ord-r2", leg="entry", status="Submitted"))
+    receipt = cancel.execute(
+        "cancel_orders", {"order_entity_ids": ["ord-r1", "ord-r2"]},
+        command_id="root-red", nonce=None)
+    assert receipt.state == "RESOLVED"
+    children = [cancel.ledger.get(c) for c in receipt.outcome["child_command_ids"]]
+    assert {c.state for c in children} == {"SUBMITTED"}
+    assert len(cancel.dispatch.cancelled) == 2
+
+
+# ---------------------------------------------------------------------------
+# Fix 2 — the root outcome reflects per-child truth (no masked partial failure).
+# ---------------------------------------------------------------------------
+
+def test_cancel_orders_outcome_reflects_partial_failure(cancel):
+    # One child dispatches cleanly; the other hits an ambiguous dispatch
+    # (TimeoutError) -> OUTCOME_UNKNOWN. The root outcome must carry each
+    # child's real state and flag partial_failure -- before the fix the root
+    # resolved identically whether children succeeded or not.
+    cancel.orders_view.add(_order("ord-m1", leg="entry", status="Submitted"))
+    cancel.orders_view.add(_order("ord-m2", leg="entry", status="Submitted"))
+    cancel.dispatch.raise_on_cancel(TimeoutError("ack lost"))   # first cancel raises once
+    receipt = cancel.execute(
+        "cancel_orders", {"order_entity_ids": ["ord-m1", "ord-m2"]}, command_id="root-mix")
+    assert receipt.state == "RESOLVED"
+    assert receipt.outcome["partial_failure"] is True
+    children = receipt.outcome["children"]
+    assert children["ord-m1"]["state"] == "OUTCOME_UNKNOWN"
+    assert children["ord-m1"]["error_code"] == "DISPATCH_AMBIGUOUS"
+    assert children["ord-m1"]["classification"] == "REDUCING"
+    assert children["ord-m2"]["state"] == "SUBMITTED"
+
+
+def test_cancel_orders_all_success_is_not_partial_failure(cancel):
+    cancel.orders_view.add(_order("ord-s1", leg="entry", status="Submitted"))
+    cancel.orders_view.add(_order("ord-s2", leg="entry", status="Submitted"))
+    receipt = cancel.execute(
+        "cancel_orders", {"order_entity_ids": ["ord-s1", "ord-s2"]}, command_id="root-ok")
+    assert receipt.outcome["partial_failure"] is False
+    assert {c["state"] for c in receipt.outcome["children"].values()} == {"SUBMITTED"}
+
+
+# ---------------------------------------------------------------------------
+# Fix 3 — per-child fault isolation: one child's exception doesn't abort the batch.
+# ---------------------------------------------------------------------------
+
+def test_cancel_orders_child_execute_exception_is_isolated(cancel):
+    # The MIDDLE child's execute raises. Before the fix that aborted the whole
+    # loop, dropping the later order with no record. Now the failure is
+    # isolated: the later child still dispatches and the failed child is marked.
+    for oid in ["ord-a", "ord-b", "ord-c"]:
+        cancel.orders_view.add(_order(oid, leg="entry", status="Submitted"))
+    real_execute = cancel.coordinator.execute
+
+    def flaky_execute(request):
+        if request.command_id == "root-iso-1":      # the middle child (ord-b)
+            raise RuntimeError("child blew up")
+        return real_execute(request)
+
+    cancel.coordinator.execute = flaky_execute
+    try:
+        receipt = cancel.execute(
+            "cancel_orders", {"order_entity_ids": ["ord-a", "ord-b", "ord-c"]},
+            command_id="root-iso")
+    finally:
+        cancel.coordinator.execute = real_execute
+
+    assert receipt.state == "RESOLVED"
+    children = receipt.outcome["children"]
+    assert children["ord-a"]["state"] == "SUBMITTED"
+    assert children["ord-b"]["state"] == "FAILED"
+    assert children["ord-c"]["state"] == "SUBMITTED"      # later child still reached
+    assert receipt.outcome["partial_failure"] is True
+    assert ("ord-c", "root-iso-2") in cancel.dispatch.cancelled
+
+
+# ---------------------------------------------------------------------------
+# Fix 4 — dedupe repeated order_entity_ids.
+# ---------------------------------------------------------------------------
+
+def test_cancel_orders_dedupes_repeated_order_ids(cancel):
+    cancel.orders_view.add(_order("ord-1", leg="entry", status="Submitted"))
+    cancel.orders_view.add(_order("ord-2", leg="entry", status="Submitted"))
+    receipt = cancel.execute(
+        "cancel_orders", {"order_entity_ids": ["ord-1", "ord-1", "ord-2"]},
+        command_id="root-dup")
+    assert len(receipt.outcome["child_command_ids"]) == 2
+    assert len(cancel.dispatch.cancelled) == 2
+    assert sorted(oid for oid, _ref in cancel.dispatch.cancelled) == ["ord-1", "ord-2"]
+
+
+# ---------------------------------------------------------------------------
+# Fix 5 — a fan-out child's risk decision carries the ROOT correlation id
+# while retaining its own per-child risk_id.
+# ---------------------------------------------------------------------------
+
+def test_fanout_child_decision_carries_root_correlation(cancel):
+    cancel.orders_view.add(_order("ord-x", leg="entry", status="Submitted"))
+    cancel.execute("cancel_orders", {"order_entity_ids": ["ord-x"]}, command_id="root-corr")
+    assert len(cancel.risk_producer.decisions) == 1
+    risk_id, payload, correlation_id = cancel.risk_producer.decisions[0]
+    assert risk_id == "root-corr-0"          # per-child risk_id (its own command_id) is retained
+    assert correlation_id == "root-corr"     # decision correlates to the root, not the child
+    assert payload["decision"] == "cancel"

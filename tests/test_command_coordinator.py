@@ -30,10 +30,15 @@ from trader.trading.command_coordinator import (
     apply_command_ledger_migration,
     canonical_request_hash,
 )
+from trader.data.broker_state import BrokerOrderRow
 from trader.data.proposal_repository import ProposalDraft
 from trader.strategy.strategy_revisions import StrategyCommandReceipt
 from trader.trading.order_correlation import encode_order_ref
-from trader.trading.proposal_command_service import ExecutableQuote, ProposalCommandService
+from trader.trading.proposal_command_service import (
+    ExecutableQuote,
+    ProposalCommandService,
+    ProposalCreateRequest,
+)
 from trader.trading.trading_control import TradingControlStore, apply_trading_control_migration
 
 UTC = dt.timezone.utc
@@ -607,6 +612,7 @@ class FakeReconcilerOrders:
         self._by_ref: dict[str, list] = {}
         self.enumeration_ok = False
         self.submissions: list = []
+        self.find_calls: list[str] = []
 
     def add_broker_order(self, *, order_ref, status, order_ids):
         self._by_ref.setdefault(order_ref, []).append(
@@ -614,6 +620,7 @@ class FakeReconcilerOrders:
         )
 
     def find_by_order_ref(self, account_id, order_ref):
+        self.find_calls.append(order_ref)
         return list(self._by_ref.get(order_ref, []))
 
     def enumeration_complete(self):
@@ -649,6 +656,66 @@ class FakeAlerts:
 
     def raise_alert(self, command_id, detail):
         self.raised.append(command_id)
+
+
+class FakeOrdersView:
+    """Test double for ``OrderStateView`` -- the conn-free ``get_order`` seam
+    onto [M1-F2]'s materialized broker-order store the cancel reconciliation
+    reads for the TARGET order's authoritative status (MEDIUM-2)."""
+
+    def __init__(self):
+        self._orders: dict[str, BrokerOrderRow] = {}
+
+    def add(self, order: BrokerOrderRow) -> None:
+        self._orders[order.order_entity_id] = order
+
+    def get_order(self, order_entity_id: str):
+        return self._orders.get(order_entity_id)
+
+
+def _broker_order(order_entity_id: str, *, status: str, deleted: bool = False) -> BrokerOrderRow:
+    return BrokerOrderRow(
+        order_entity_id=order_entity_id, account_id="DU111111", conid=265598, symbol="AAPL",
+        order_group_id=None, leg="entry", is_external=False, action="SELL", order_type="MKT",
+        total_quantity=10.0, filled_quantity=0.0, avg_fill_price=None, limit_price=None,
+        stop_price=None, tif="DAY", status=status, deleted=deleted, revision=1,
+        source_timestamp=NOW,
+    )
+
+
+def _recon_proposal_service(recon):
+    """A REAL ``ProposalCommandService`` bound to the reconciliation fixture's
+    journal/repo (no pause gate) -- used to drive genuine create/reject
+    mutations that then wedge (HIGH-1)."""
+    quotes = SimpleNamespace(executable_quote=lambda conid, side: ExecutableQuote(
+        conid=conid, side=side, price=210.0 if side == "ask" else 209.5,
+        market_timestamp=NOW, feed_type="live", session_state="continuous"))
+    universe = SimpleNamespace(resolve_conid=lambda conid: SimpleNamespace(
+        conId=conid, symbol="AAPL", primaryExchange="NASDAQ", secType="STK",
+    ) if conid == 265598 else None)
+    risk_gate = SimpleNamespace(
+        check_instrument=lambda **_kw: SimpleNamespace(approved=True, reason=""),
+        evaluate=lambda **_kw: SimpleNamespace(approved=True, reason=""))
+    return ProposalCommandService(
+        repository=recon.repo, journal=recon.journal, risk_gate=risk_gate, quotes=quotes,
+        universe=universe, account_id="DU111111", account_mode="paper", now=lambda: NOW,
+        controls=None, positions=SimpleNamespace(reducible_quantity=lambda a, c: 0.0),
+    )
+
+
+def _recon_coordinator(recon):
+    return TradingCommandCoordinator(
+        journal=recon.journal, ledger=recon.ledger, audit=CommandAudit(recon.journal),
+        nonces=FakeNonceGate(), now=lambda: NOW,
+    )
+
+
+def _recon_view_reconciler(recon, view):
+    return OutcomeReconciler(
+        journal=recon.journal, ledger=recon.ledger, orders=recon.orders,
+        strategy=recon.strategy, alerts=recon.alerts, repo=recon.repo,
+        orders_view=view, now=recon.now,
+    )
 
 
 @pytest.fixture
@@ -694,32 +761,33 @@ def recon(tmp_path):
         )
 
     def mark_unknown(command_id, *, target_type, target_id=None, order_group_id=None,
-                     proposal_id=None):
+                     proposal_id=None, action=None):
         if proposal_id is not None:
             _seed_approved(proposal_id, order_group_id or f"og-{command_id}")
         if target_type == "proposal":
             resolved_target = target_id if target_id is not None else str(proposal_id)
             outcome = None
-            action = "approve_proposal"
+            default_action = "approve_proposal"
         elif target_type == "strategy":
             resolved_target = target_id or ""
             outcome = None
-            action = "enable_strategy"
+            default_action = "enable_strategy"
         else:  # "order" (cancel) -- carries no proposal in production; the plan's
                 # order test wires one explicitly via the ledger outcome.
             resolved_target = target_id or order_group_id or ""
             outcome = {"proposal_id": proposal_id} if proposal_id is not None else None
-            action = "cancel_order"
+            default_action = "cancel_order"
         ledger_.insert_for_test(
             command_id, state="OUTCOME_UNKNOWN", updated_at=NOW, account_id="DU111111",
-            action=action, target_type=target_type, target_id=resolved_target, outcome=outcome,
+            action=action or default_action, target_type=target_type,
+            target_id=resolved_target, outcome=outcome,
         )
         reconciler.schedule(command_id, NOW)
 
     return SimpleNamespace(
         db=db_, journal=journal_, repo=repo, ledger=ledger_, orders=orders,
         strategy=strategy, alerts=alerts, reconciler=reconciler,
-        now=lambda: NOW, cursor=0, mark_unknown=mark_unknown,
+        now=lambda: NOW, cursor=0, mark_unknown=mark_unknown, seed_approved=_seed_approved,
     )
 
 
@@ -746,17 +814,49 @@ def test_proposal_approve_resolves_by_encoded_order_ref(recon):
     assert "command.updated" in kinds and "proposal.updated" in kinds
 
 
-def test_order_command_resolves_by_encoded_order_ref(recon):
-    recon.mark_unknown("cmd-1", target_type="order", order_group_id="og-cmd-1", proposal_id=7)
-    recon.orders.add_broker_order(
-        order_ref=encode_order_ref("og-cmd-1"), status="Submitted", order_ids=[17])
+# ---------------------------------------------------------------------------
+# MEDIUM-2: a ``cancel_order`` creates NO og-* group, so the og lookup is
+# always empty and must NEVER be used to resolve a cancel. Resolution reads
+# the TARGET order's authoritative status via the injected ``OrderStateView``;
+# with no view wired (dormant) or a still-active order it stays unknown.
+# ---------------------------------------------------------------------------
+
+def test_cancel_wedge_without_order_view_stays_unknown(recon):
+    # RED before: the old target_type-only branch ran a cancel through the
+    # og-{command_id} order path and rubber-stamped RESOLVED on a complete
+    # enumeration. A cancel dispatches no og group, so that is fail-UNSAFE.
+    recon.mark_unknown("cmd-1", target_type="order", target_id="ord-1")
+    recon.orders.enumeration_ok = True                  # must NOT rubber-stamp a cancel
     result = recon.reconciler.reconcile_once("cmd-1", recon.now())
+    assert result.resolved is False
+    assert recon.ledger.get("cmd-1").state == "OUTCOME_UNKNOWN"
+    assert encode_order_ref("og-cmd-1") not in recon.orders.find_calls  # order path untouched
+
+
+def test_cancel_wedge_resolves_only_when_target_order_is_terminal(recon):
+    view = FakeOrdersView()
+    reconciler = _recon_view_reconciler(recon, view)
+    recon.mark_unknown("cmd-1", target_type="order", target_id="ord-1")
+    # Target order still Submitted -> the cancel didn't take -> stay unknown.
+    view.add(_broker_order("ord-1", status="Submitted"))
+    assert reconciler.reconcile_once("cmd-1", recon.now()).resolved is False
+    assert recon.ledger.get("cmd-1").state == "OUTCOME_UNKNOWN"
+    # Target order Cancelled -> RESOLVED, recording the authoritative status.
+    view.add(_broker_order("ord-1", status="Cancelled"))
+    result = reconciler.reconcile_once("cmd-1", recon.now())
     assert result.resolved is True
     row = recon.ledger.get("cmd-1")
-    assert row.state == "RESOLVED" and row.outcome["order_ids"] == [17]
-    assert recon.repo.get(7).status == "EXECUTED"       # submission evidence recorded
-    kinds = [e.event_type for e in recon.journal.read_after(recon.cursor, 100)]
-    assert "command.updated" in kinds and "proposal.updated" in kinds
+    assert row.state == "RESOLVED"
+    assert row.outcome["authoritative_status"] == "Cancelled"
+    assert recon.orders.submissions == []               # never re-dispatched
+
+
+def test_cancel_wedge_with_missing_target_order_stays_unknown(recon):
+    view = FakeOrdersView()                              # order not present in the view
+    reconciler = _recon_view_reconciler(recon, view)
+    recon.mark_unknown("cmd-1", target_type="order", target_id="ord-gone")
+    assert reconciler.reconcile_once("cmd-1", recon.now()).resolved is False
+    assert recon.ledger.get("cmd-1").state == "OUTCOME_UNKNOWN"
 
 
 def test_definitive_absence_requires_a_complete_enumeration(recon):
@@ -831,6 +931,191 @@ def test_rescan_ignores_terminal_rows(recon):
     recon.ledger.insert_for_test("rej", state="REJECTED", updated_at=recon.now())
     recon.mark_unknown("cmd-1", target_type="proposal", order_group_id="og-cmd-1", proposal_id=7)
     assert set(recon.reconciler.rescan_on_startup()) == {"cmd-1"}
+
+
+# ---------------------------------------------------------------------------
+# HIGH-1: approve/create/reject all stamp target_type="proposal" but resolve by
+# entirely different authority. Only ``approve_proposal`` may use the
+# og-{command_id} order lookup. A wedged create/reject must resolve by the
+# ACTUAL proposal-mutation outcome -- never via the order path (which falsely
+# marks a create never-submitted and can mark a concurrently-APPROVED proposal
+# FAILED).
+# ---------------------------------------------------------------------------
+
+def test_create_wedge_resolves_by_proposal_creation_not_order_path(recon):
+    svc = _recon_proposal_service(recon)
+    coord = _recon_coordinator(recon)
+
+    def create_then_wedge(cmd):
+        # REAL create: commits the proposal + journals proposal.updated
+        # correlated to the command, THEN blows up (ambiguous-but-committed).
+        svc.create_proposal(
+            ProposalCreateRequest(conid=cmd.body["conid"], action=cmd.body["action"],
+                                  quantity=cmd.body.get("quantity")),
+            source=cmd.source, correlation_id=cmd.command_id)
+        raise RuntimeError("boom after create committed")
+
+    coord.register_action("create_proposal", create_then_wedge, requires_preflight=False)
+    create_cmd = CommandRequest(
+        command_id="cc-1", action="create_proposal", account_id="DU111111",
+        target_type="proposal", target_id="", expected_version=None,
+        body={"conid": 265598, "action": "BUY", "quantity": 10}, source="dashboard")
+    with pytest.raises(RuntimeError):
+        coord.execute(create_cmd)
+    assert recon.ledger.get("cc-1").state == "OUTCOME_UNKNOWN"
+
+    recon.orders.enumeration_ok = True                  # a complete enum must NOT falsely resolve
+    result = recon.reconciler.reconcile_once("cc-1", recon.now())
+    assert result.resolved is True
+    row = recon.ledger.get("cc-1")
+    assert row.outcome.get("created") is True
+    assert row.outcome != {"submitted": False}          # NOT the never-submitted order path
+    assert recon.orders.find_calls == []                # order path never consulted for a create
+
+
+def test_create_wedge_without_committed_proposal_stays_unknown(recon):
+    coord = _recon_coordinator(recon)
+
+    def wedge_before_create(cmd):
+        raise RuntimeError("boom before any proposal write")
+
+    coord.register_action("create_proposal", wedge_before_create, requires_preflight=False)
+    create_cmd = CommandRequest(
+        command_id="cc-2", action="create_proposal", account_id="DU111111",
+        target_type="proposal", target_id="", expected_version=None,
+        body={"conid": 265598, "action": "BUY", "quantity": 10}, source="dashboard")
+    with pytest.raises(RuntimeError):
+        coord.execute(create_cmd)
+
+    recon.orders.enumeration_ok = True
+    result = recon.reconciler.reconcile_once("cc-2", recon.now())
+    assert result.resolved is False                     # not positively confirmed -> stay unknown
+    assert recon.ledger.get("cc-2").state == "OUTCOME_UNKNOWN"
+    assert recon.orders.find_calls == []
+
+
+def test_reject_wedge_resolves_when_proposal_is_rejected(recon):
+    svc = _recon_proposal_service(recon)
+    coord = _recon_coordinator(recon)
+    created = svc.create_proposal(
+        ProposalCreateRequest(conid=265598, action="BUY", quantity=10),
+        source="dashboard", correlation_id="seed-create")
+    pid = created.id
+
+    def reject_then_wedge(cmd):
+        svc.reject_proposal(int(cmd.body["proposal_id"]), cmd.body["reason"], cmd.command_id)
+        raise RuntimeError("boom after reject committed")
+
+    coord.register_action("reject_proposal", reject_then_wedge, requires_preflight=False)
+    reject_cmd = CommandRequest(
+        command_id="rj-2", action="reject_proposal", account_id="DU111111",
+        target_type="proposal", target_id=str(pid), expected_version=None,
+        body={"proposal_id": pid, "reason": "changed thesis"}, source="dashboard")
+    with pytest.raises(RuntimeError):
+        coord.execute(reject_cmd)
+    assert recon.ledger.get("rj-2").state == "OUTCOME_UNKNOWN"
+    assert recon.repo.get(pid).status == "REJECTED"
+
+    recon.orders.enumeration_ok = True
+    result = recon.reconciler.reconcile_once("rj-2", recon.now())
+    assert result.resolved is True
+    assert recon.ledger.get("rj-2").outcome["status"] == "REJECTED"
+    assert recon.orders.find_calls == []                # order path never consulted for a reject
+
+
+def test_reject_wedge_never_marks_a_separately_approved_proposal_failed(recon):
+    # Proposal 7 is APPROVED (a live order path owns it). A reject command that
+    # wedged to OUTCOME_UNKNOWN must NEVER be run through the order path (which
+    # would mark the APPROVED proposal FAILED via _resolve_never_submitted).
+    recon.mark_unknown("rej-1", target_type="proposal", target_id="7",
+                       proposal_id=7, action="reject_proposal")
+    recon.orders.enumeration_ok = True
+    result = recon.reconciler.reconcile_once("rej-1", recon.now())
+    assert result.resolved is False                     # proposal is APPROVED, not REJECTED
+    assert recon.ledger.get("rej-1").state == "OUTCOME_UNKNOWN"
+    assert recon.repo.get(7).status == "APPROVED"       # NEVER blind-marked FAILED
+
+
+# ---------------------------------------------------------------------------
+# MEDIUM-3: set_trading_pause and the cancel_orders root must reach a defined
+# resolution rather than falling through to an eternal critical alert.
+# ---------------------------------------------------------------------------
+
+def _seed_controls(recon):
+    apply_trading_control_migration(SchemaMigrator(recon.db))
+    controls = TradingControlStore(recon.journal)
+    recon.db.transaction(lambda conn: controls.seed_in_tx(conn, [("DU111111", "paper")], NOW))
+    return controls
+
+
+def test_pause_wedge_resolves_when_control_row_reflects_the_command(recon):
+    controls = _seed_controls(recon)
+    controls.set("DU111111", True, None, "pz-1", "risk event", NOW)  # committed under pz-1
+    recon.ledger.insert_for_test(
+        "pz-1", state="OUTCOME_UNKNOWN", updated_at=NOW, account_id="DU111111",
+        action="set_trading_pause", target_type="trading_control", target_id="DU111111")
+    result = recon.reconciler.reconcile_once("pz-1", recon.now())
+    assert result.resolved is True
+    row = recon.ledger.get("pz-1")
+    assert row.state == "RESOLVED"
+    assert row.outcome["new_exposure_paused"] is True
+
+
+def test_pause_wedge_stays_unknown_when_control_row_is_from_another_command(recon):
+    controls = _seed_controls(recon)
+    controls.set("DU111111", True, None, "other-cmd", "x", NOW)      # a DIFFERENT command set it
+    recon.ledger.insert_for_test(
+        "pz-2", state="OUTCOME_UNKNOWN", updated_at=NOW, account_id="DU111111",
+        action="set_trading_pause", target_type="trading_control", target_id="DU111111")
+    result = recon.reconciler.reconcile_once("pz-2", recon.now())
+    assert result.resolved is False                     # not confirmed committed by THIS command
+    assert recon.ledger.get("pz-2").state == "OUTCOME_UNKNOWN"
+
+
+def test_cancel_orders_root_wedge_reaches_a_defined_terminal(recon):
+    # The root fan-out dispatches nothing itself; children are independently
+    # reconciled. A wedged root must resolve, not alert forever.
+    recon.ledger.insert_for_test(
+        "co-1", state="OUTCOME_UNKNOWN", updated_at=NOW, account_id="DU111111",
+        action="cancel_orders", target_type="order_group", target_id="")
+    recon.reconciler.schedule("co-1", NOW)
+    result = recon.reconciler.reconcile_once("co-1", recon.now())
+    assert result.resolved is True
+    assert recon.ledger.get("co-1").state == "RESOLVED"
+    # And it never escalates to a perpetual critical alert.
+    assert recon.reconciler.run_due(recon.now() + dt.timedelta(seconds=901)) == []
+    assert recon.alerts.raised == []
+
+
+# ---------------------------------------------------------------------------
+# MEDIUM-4: a hard crash between the approve saga's VALIDATED commit and the
+# claim tx orphans a VALIDATED row that reconcilable() never requeues -- it
+# would block the proposal forever via unresolved_for_target/COMMAND_IN_FLIGHT.
+# A VALIDATED-but-unclaimed command dispatched no order, so startup recovery can
+# safely terminalize it (fail-safe) and unblock the proposal.
+# ---------------------------------------------------------------------------
+
+def test_rescan_terminalizes_orphaned_validated_rows(recon):
+    recon.ledger.insert_for_test(
+        "val-1", state="VALIDATED", updated_at=recon.now() - dt.timedelta(minutes=2),
+        account_id="DU111111", action="approve_proposal", target_type="proposal", target_id="7")
+    assert recon.ledger.unresolved_for_target("proposal", "7")      # blocks the proposal
+    recon.reconciler.rescan_on_startup()
+    row = recon.ledger.get("val-1")
+    assert row.state == "REJECTED"                                  # terminalized
+    assert row.error_code == "CRASH_ORPHANED"
+    assert recon.ledger.unresolved_for_target("proposal", "7") == []  # proposal unblocked
+
+
+def test_rescan_leaves_received_rows_untouched(recon):
+    # RECEIVED (pre-VALIDATED) for a non-saga action may carry a committed side
+    # effect (a created proposal / committed pause), so it is NOT blindly
+    # terminalized -- only the provably pre-dispatch VALIDATED state is.
+    recon.ledger.insert_for_test(
+        "rcv-1", state="RECEIVED", updated_at=recon.now(), account_id="DU111111",
+        action="set_trading_pause", target_type="trading_control", target_id="DU111111")
+    recon.reconciler.rescan_on_startup()
+    assert recon.ledger.get("rcv-1").state == "RECEIVED"
 
 
 # ---------------------------------------------------------------------------

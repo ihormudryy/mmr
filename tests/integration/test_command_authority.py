@@ -17,12 +17,14 @@ from types import SimpleNamespace
 
 import pytest
 
+from trader.data.broker_state import BrokerOrderRow, BrokerStateStore
 from trader.data.domain_journal import DomainJournal
 from trader.data.duckdb_store import DuckDBConnection
 from trader.data.proposal_repository import ProposalRepository, apply_proposal_authority_migration
 from trader.data.schema_migrations import SchemaMigrator
 from trader.messaging.production_api import register_command_authority
 from trader.messaging.typed_rpc import TypedRpcRegistry
+from trader.trader_service import build_order_state_view
 from trader.trading.command_coordinator import (
     ApprovalCommandService,
     CommandAudit,
@@ -282,6 +284,51 @@ def test_crash_between_claim_and_dispatch_reconciles_after_restart(stack):
     assert restarted.repo.get(pid).status == "EXECUTED"  # exactly one order, no resubmission
     assert restarted.orders.submissions == []            # reconciler never re-dispatched
     assert restarted.ledger.get("c-9").state == "RESOLVED"
+
+
+def _broker_order(order_entity_id, *, status, deleted=False):
+    return BrokerOrderRow(
+        order_entity_id=order_entity_id, account_id=ACCOUNT, conid=CONID, symbol="AAPL",
+        order_group_id=None, leg="entry", is_external=False, action="SELL", order_type="MKT",
+        total_quantity=10.0, filled_quantity=0.0, avg_fill_price=None, limit_price=None,
+        stop_price=None, tif="DAY", status=status, deleted=deleted, revision=1,
+        source_timestamp=NOW)
+
+
+def test_cancel_wedge_reconciles_against_the_real_broker_order_store(stack):
+    # [M1-F3] MEDIUM-2 end to end: the production OrderStateView adapter
+    # (trader_service.build_order_state_view over a REAL [M1-F2] BrokerStateStore)
+    # resolves an ambiguous cancel_order by the TARGET order's authoritative
+    # materialized status -- NOT the always-empty og-{command_id} lookup.
+    store = BrokerStateStore(stack.db)
+    store.migrate(SchemaMigrator(stack.db))
+    trader_like = SimpleNamespace(broker_state_store=store, domain_journal=stack.journal)
+    view = build_order_state_view(trader_like)
+    assert view is not None
+
+    reconciler = OutcomeReconciler(
+        journal=stack.journal, ledger=stack.ledger, orders=stack.orders,
+        strategy=stack.strategy, alerts=stack.alerts, repo=stack.repo,
+        orders_view=view, now=stack._now)
+
+    stack.ledger.insert_for_test(
+        "cx-1", state="OUTCOME_UNKNOWN", updated_at=NOW, account_id=ACCOUNT,
+        action="cancel_order", target_type="order", target_id="ord-1")
+
+    # Still Submitted at the broker -> the cancel didn't take -> stays unknown.
+    stack.db.transaction(lambda conn: store.upsert_order_in_tx(
+        conn, _broker_order("ord-1", status="Submitted")))
+    assert reconciler.reconcile_once("cx-1", stack.now()).resolved is False
+    assert stack.ledger.get("cx-1").state == "OUTCOME_UNKNOWN"
+
+    # Cancelled at the broker -> RESOLVED with the authoritative status.
+    stack.db.transaction(lambda conn: store.upsert_order_in_tx(
+        conn, _broker_order("ord-1", status="Cancelled")))
+    result = reconciler.reconcile_once("cx-1", stack.now())
+    assert result.resolved is True
+    row = stack.ledger.get("cx-1")
+    assert row.state == "RESOLVED"
+    assert row.outcome["authoritative_status"] == "Cancelled"
 
 
 def test_crash_with_no_broker_order_and_complete_enumeration_fails_cleanly(stack):

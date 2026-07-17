@@ -62,6 +62,40 @@ class _LoggingCriticalAlerts:
         )
 
 
+class _BrokerStoreOrderView:
+    """[M1-F3] Task 9 MEDIUM-2 production ``OrderStateView``.
+
+    Wraps [M1-F2]'s ``BrokerStateStore.get_order_in_tx`` behind the conn-free
+    ``get_order`` seam the ``OutcomeReconciler``'s cancel reconciliation reads,
+    so an ambiguous ``cancel_order`` resolves against the TARGET order's
+    authoritative materialized status instead of the always-empty ``og-*``
+    order-ref lookup (a ``cancel_order`` creates no order group). Mirrors the
+    same conn-free seam the cancel saga itself consumes.
+    """
+
+    def __init__(self, store, connect):
+        self._store = store
+        self._connect = connect
+
+    def get_order(self, order_entity_id):
+        return self._store.get_order_in_tx(self._connect(), order_entity_id)
+
+
+def build_order_state_view(trader: Trader):
+    """Build the production ``OrderStateView`` for the command reconciler, or
+    ``None`` when [M1-F2]'s materialized broker-order store is not attached
+    (dormant). The integration step that constructs the ``OutcomeReconciler``
+    passes this as its ``orders_view`` so a ``cancel_order`` wedge reconciles
+    against the ``broker_orders`` store's authoritative status. Returning
+    ``None`` keeps the cancel branch fail-safe (it stays OUTCOME_UNKNOWN rather
+    than rubber-stamping RESOLVED) when the store is unavailable."""
+    store = getattr(trader, 'broker_state_store', None)
+    journal = getattr(trader, 'domain_journal', None)
+    if store is None or journal is None:
+        return None
+    return _BrokerStoreOrderView(store, journal.connect)
+
+
 async def _command_reconciliation_loop(
     reconciler,
     ledger,
@@ -117,6 +151,15 @@ def _maybe_start_command_reconciliation(trader: Trader, loop: AbstractEventLoop)
     if reconciler is None or ledger is None:
         return
     try:
+        # [M1-F3] MEDIUM-2: ensure the reconciler can read the TARGET order's
+        # authoritative status for a cancel_order wedge. If the integration
+        # step that constructed the reconciler left it without an OrderStateView,
+        # attach the production one now (still fail-safe: None leaves the cancel
+        # branch unresolved rather than rubber-stamping).
+        if getattr(reconciler, '_orders_view', None) is None:
+            view = build_order_state_view(trader)
+            if view is not None:
+                reconciler._orders_view = view
         requeued = reconciler.rescan_on_startup()
         if requeued:
             logging.info(

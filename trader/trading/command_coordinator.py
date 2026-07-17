@@ -691,6 +691,30 @@ class CommandLedger:
         ).fetchall()
         return [_row_to_ledger_row(row) for row in rows]
 
+    def pre_dispatch_orphans(self) -> list[LedgerRow]:
+        """Every ``VALIDATED`` row a coordinator restart must recover
+        ([M1-F3] Task 9 MEDIUM-4 crash recovery).
+
+        A hard crash between an approve/cancel/strategy saga's
+        ``RECEIVED -> VALIDATED`` commit and its claim/dispatch transaction
+        orphans a ``VALIDATED`` row that ``reconcilable()`` never requeues
+        (it only covers ``SUBMITTING``/``OUTCOME_UNKNOWN``). Such a row would
+        block its target forever via ``unresolved_for_target`` ->
+        ``COMMAND_IN_FLIGHT``. Every saga transitions ``VALIDATED ->
+        SUBMITTING`` ATOMICALLY with its first durable side effect (the
+        proposal claim, the in-tx nonce consume, or the SUBMITTING commit that
+        precedes any dispatch), so a row still at ``VALIDATED`` provably
+        dispatched no order and claimed no proposal -- making it safe to
+        terminalize on startup. ``RECEIVED`` is deliberately EXCLUDED: a
+        non-saga handler (create/reject/pause) may commit its side effect while
+        the ledger row is still ``RECEIVED`` (the ``RECEIVED -> RESOLVED``
+        fallback runs after the handler), so blindly terminalizing it would
+        falsely fail a mutation that actually committed."""
+        rows = self._journal.connect().execute(
+            f"{self._SELECT} WHERE state = 'VALIDATED' ORDER BY created_at",
+        ).fetchall()
+        return [_row_to_ledger_row(row) for row in rows]
+
     def purge_expired(self, now: dt.datetime) -> int:
         """Delete terminal (``RESOLVED``/``REJECTED``) rows older than the
         30-day retention floor. ``OUTCOME_UNKNOWN`` (and every other
@@ -2297,6 +2321,23 @@ class OutcomeReconciler:
     - ``repo``: ``ProposalRepository`` -- marks a proposal EXECUTED/FAILED as
       submission evidence, in the SAME journaled transaction as the command
       transition. Optional (a cancel target carries no proposal).
+    - ``orders_view``: ``OrderStateView`` -- [M1-F3] MEDIUM-2: the authoritative
+      read seam onto [M1-F2]'s materialized ``broker_orders`` store, used to
+      resolve a ``cancel_order`` wedge by the TARGET order's real status. A
+      ``cancel_order`` creates NO ``og-*`` group, so the order-ref lookup the
+      approve path uses is always empty for it and must NEVER resolve a cancel.
+      Optional: when unwired (dormant) the cancel branch stays OUTCOME_UNKNOWN
+      rather than rubber-stamping RESOLVED (fail-safe).
+
+    Command-type awareness ([M1-F3] Task 9 HIGH-1, verbatim): ``reconcile_once``
+    discriminates by the command's ACTION, not by ``target_type`` alone --
+    ``approve_proposal``, ``create_proposal`` and ``reject_proposal`` all stamp
+    ``target_type="proposal"`` yet resolve by entirely different authority (the
+    order-ref lookup, the created-proposal journal event, and the proposal's
+    REJECTED status respectively). FAIL-SAFE throughout: an outcome that cannot
+    be POSITIVELY confirmed leaves the command OUTCOME_UNKNOWN (-> the 15-minute
+    critical alert); the reconciler never guesses, never blind-mutates a
+    proposal, and never blind-cancels/resubmits.
     """
 
     def __init__(
@@ -2308,6 +2349,7 @@ class OutcomeReconciler:
         strategy: StrategyControlPort,
         alerts: CriticalAlertPort,
         repo: Optional[ProposalRepository] = None,
+        orders_view: Optional[OrderStateView] = None,
         now: Callable[[], dt.datetime] = _utcnow,
     ):
         self._journal = journal
@@ -2316,6 +2358,7 @@ class OutcomeReconciler:
         self._strategy = strategy
         self._alerts = alerts
         self._repo = repo
+        self._orders_view = orders_view
         self._now = now
         self._plans: dict[str, _ReconcilePlan] = {}
 
@@ -2365,11 +2408,24 @@ class OutcomeReconciler:
     def rescan_on_startup(self) -> list[str]:
         """Requeue every in-flight ledger row (coordinator crash recovery,
         spec §9.5). Covers the crash-between-claim-and-ack window a live
-        ``schedule`` call could never have reached."""
+        ``schedule`` call could never have reached.
+
+        [M1-F3] MEDIUM-4: ALSO recovers orphaned pre-dispatch ``VALIDATED``
+        rows -- a hard crash between a saga's ``RECEIVED -> VALIDATED`` commit
+        and its claim/dispatch tx leaves a row that ``reconcilable()`` never
+        requeues and that would otherwise block its target forever
+        (``COMMAND_IN_FLIGHT``). A ``VALIDATED``-but-unclaimed command
+        dispatched no order and claimed no proposal, so it is safe to
+        terminalize it (``REJECTED``/``CRASH_ORPHANED``) up front, unblocking
+        the target. Each terminalization is isolated so one racing/failed row
+        never aborts the whole rescan."""
         requeued: list[str] = []
         for row in self._ledger.reconcilable():
             self.schedule(row.command_id, self._now_utc())
             requeued.append(row.command_id)
+        for row in self._ledger.pre_dispatch_orphans():
+            if self._terminalize_pre_dispatch_orphan(row):
+                requeued.append(row.command_id)
         return requeued
 
     # -- one reconciliation attempt ----------------------------------------
@@ -2382,25 +2438,15 @@ class OutcomeReconciler:
             self._plans.pop(command_id, None)
             return ReconcileResult(command_id, resolved=True, critical=False)
 
-        # RJ2 addendum §1: the REAL approve saga stamps target_type="proposal"
-        # (the primary real-order-dispatch case); cancel stamps "order". BOTH
-        # resolve via the og-{command_id} order-ref lookup -- an approve that
-        # is found marks its proposal EXECUTED; a proven-absent one marks it
-        # FAILED. A cancel carries no proposal, so nothing is marked.
-        if row.target_type in ("proposal", "order"):
-            order_ref = encode_order_ref(f"og-{command_id}")
-            found = self._orders.find_by_order_ref(row.account_id, order_ref)
-            if found:
-                self._resolve_order(row, found, now)
-                return ReconcileResult(command_id, True, False)
-            if self._orders.enumeration_complete():
-                self._resolve_never_submitted(row, now)
-                return ReconcileResult(command_id, True, False)
-        elif row.target_type == "strategy":
-            receipt = self._strategy.get_receipt(command_id)  # root command_id lookup
-            if receipt is not None and receipt.state in ("COMMITTED", "ROLLED_BACK"):
-                self._resolve_strategy(row, receipt, now)
-                return ReconcileResult(command_id, True, False)
+        # HIGH-1 / MEDIUM-2/3: discriminate by the command's ACTION, never by
+        # target_type alone. approve/create/reject all stamp
+        # target_type="proposal" but resolve by entirely different authority;
+        # a cancel reads the target order, a pause the control row, a
+        # strategy-control its forwarded receipt. FAIL-SAFE: a command whose
+        # outcome cannot be POSITIVELY determined is left unresolved (never
+        # rubber-stamped), and the block below escalates it after 15 minutes.
+        if self._try_resolve(row, now):
+            return ReconcileResult(command_id, True, False)
 
         # Unresolved: escalate to a critical alert once past the boundary, but
         # NEVER convert to failure by time alone.
@@ -2417,7 +2463,229 @@ class OutcomeReconciler:
             )
         return ReconcileResult(command_id, False, plan.alerted)
 
+    # -- action-aware positive determination (HIGH-1 / MEDIUM-2/3) ---------
+
+    def _try_resolve(self, row: LedgerRow, now: dt.datetime) -> bool:
+        """Positively determine a command's true outcome from the authority
+        appropriate to its ACTION and RESOLVE it, or return ``False`` to leave
+        it OUTCOME_UNKNOWN. FAIL-SAFE: an outcome that cannot be POSITIVELY
+        confirmed is never guessed -- the command stays unknown (and, past the
+        boundary, becomes a critical operator alert)."""
+        action = row.action
+        if action == "approve_proposal":
+            return self._reconcile_approve(row, now)
+        if action == "create_proposal":
+            return self._reconcile_create(row, now)
+        if action == "reject_proposal":
+            return self._reconcile_reject(row, now)
+        if action == "cancel_order":
+            return self._reconcile_cancel(row, now)
+        if action == "cancel_orders":
+            return self._reconcile_cancel_orders(row, now)
+        if action == "set_trading_pause":
+            return self._reconcile_pause(row, now)
+        if action in ("enable_strategy", "disable_strategy", "update_strategy_params"):
+            return self._reconcile_strategy(row, now)
+        # Unmapped action: cannot positively determine an outcome -> stay
+        # OUTCOME_UNKNOWN (fail-safe), never rubber-stamp RESOLVED.
+        return False
+
+    def _reconcile_approve(self, row: LedgerRow, now: dt.datetime) -> bool:
+        """The approve saga is the ONE command that dispatches a real order,
+        stamping ``order_ref = mmr:og-{command_id}``. Resolve via that lookup:
+        a found order marks the proposal EXECUTED; only a fenced, COMPLETE
+        broker enumeration proving absence records a clean never-submitted
+        failure. This is the pre-existing (correct) approve reconciliation."""
+        order_ref = encode_order_ref(f"og-{row.command_id}")
+        found = self._orders.find_by_order_ref(row.account_id, order_ref)
+        if found:
+            self._resolve_order(row, found, now)
+            return True
+        if self._orders.enumeration_complete():
+            self._resolve_never_submitted(row, now)
+            return True
+        return False
+
+    def _reconcile_create(self, row: LedgerRow, now: dt.datetime) -> bool:
+        """A wedged ``create_proposal`` never dispatched an order, so the
+        order path is irrelevant. Resolve ONLY when the proposal was positively
+        confirmed created (its ``proposal.*`` journal event correlated to this
+        command exists); otherwise stay unknown -- NEVER mark anything
+        FAILED."""
+        proposal_id = self._created_proposal_id(row.command_id)
+        if proposal_id is None:
+            return False
+        self._resolve_command_only(
+            row, {"proposal_id": proposal_id, "created": True}, now
+        )
+        return True
+
+    def _reconcile_reject(self, row: LedgerRow, now: dt.datetime) -> bool:
+        """A wedged ``reject_proposal`` never dispatched an order. Resolve ONLY
+        when the target proposal is positively confirmed REJECTED; otherwise
+        stay unknown. Crucially NEVER run this through the order path (which
+        would ``_resolve_never_submitted`` -> mark a concurrently-APPROVED
+        proposal FAILED)."""
+        if self._repo is None or not row.target_id:
+            return False
+        try:
+            proposal_id = int(row.target_id)
+        except (TypeError, ValueError):
+            return False
+        record = self._repo.get(proposal_id)
+        if record is not None and record.status == "REJECTED":
+            self._resolve_command_only(
+                row, {"proposal_id": proposal_id, "status": "REJECTED"}, now
+            )
+            return True
+        return False
+
+    def _reconcile_cancel(self, row: LedgerRow, now: dt.datetime) -> bool:
+        """MEDIUM-2: a ``cancel_order`` creates NO ``og-*`` group, so the
+        order-ref lookup is always empty and must NEVER resolve it. Read the
+        TARGET order's authoritative status from the injected
+        ``OrderStateView``: RESOLVED only when the order is TERMINAL
+        (Cancelled/ApiCancelled/Filled/Inactive/deleted); if still active (the
+        cancel didn't take), the order is unreadable, or no view is wired
+        (dormant), stay OUTCOME_UNKNOWN -- never rubber-stamp."""
+        if self._orders_view is None:
+            return False
+        order = self._orders_view.get_order(row.target_id)
+        if order is None:
+            return False
+        if _is_terminal_order(order):
+            self._resolve_command_only(
+                row,
+                {"order_entity_id": row.target_id, "authoritative_status": order.status},
+                now,
+            )
+            return True
+        return False
+
+    def _reconcile_cancel_orders(self, row: LedgerRow, now: dt.datetime) -> bool:
+        """MEDIUM-3: the ``cancel_orders`` ROOT is a non-saga fan-out that
+        dispatches NOTHING itself -- each child ``cancel_order`` is an
+        independently-reconciled ledger row carrying its own authoritative
+        outcome. A wedged root therefore has no ambiguous real-money action of
+        its own; resolve it to a defined terminal so it never becomes an
+        eternal critical alert (fail-safe: no order state is hidden)."""
+        self._resolve_command_only(row, {"reconciled": "cancel_orders_root"}, now)
+        return True
+
+    def _reconcile_pause(self, row: LedgerRow, now: dt.datetime) -> bool:
+        """MEDIUM-3: ``set_trading_pause`` is a single-step mutation whose
+        control row records ``updated_by_command_id``. Resolve ONLY when the
+        control row was last written by THIS command (positive proof the
+        intended state committed); otherwise stay unknown."""
+        state = self._pause_state_for(row.target_id)
+        if state is None:
+            return False
+        paused, updated_by = state
+        if updated_by == row.command_id:
+            self._resolve_command_only(
+                row, {"account_id": row.target_id, "new_exposure_paused": paused}, now
+            )
+            return True
+        return False
+
+    def _reconcile_strategy(self, row: LedgerRow, now: dt.datetime) -> bool:
+        """Strategy-control forwarding: resolve via strategy_service's own
+        committed receipt (``get_receipt`` by the root command_id). A missing
+        or non-terminal receipt stays unknown -- the mutation is never
+        re-forwarded."""
+        receipt = self._strategy.get_receipt(row.command_id)
+        if receipt is not None and receipt.state in ("COMMITTED", "ROLLED_BACK"):
+            self._resolve_strategy(row, receipt, now)
+            return True
+        return False
+
+    def _created_proposal_id(self, command_id: str) -> Optional[int]:
+        """The id of the proposal a wedged ``create_proposal`` actually
+        committed, or ``None``. A committed create journals a ``proposal.*``
+        event correlated to the creating command_id (see
+        ``ProposalCommandService.create_proposal``); its ABSENCE means the
+        create never durably committed, so the command stays OUTCOME_UNKNOWN --
+        fail-safe, NEVER marked FAILED."""
+        try:
+            found = self._journal.connect().execute(
+                "SELECT entity_id FROM domain_event_journal "
+                "WHERE entity_type = 'proposal' AND correlation_id = ? "
+                "ORDER BY source_cursor LIMIT 1",
+                [command_id],
+            ).fetchone()
+        except Exception:
+            return None
+        if found is None:
+            return None
+        try:
+            return int(found[0])
+        except (TypeError, ValueError):
+            return None
+
+    def _pause_state_for(self, account_id: str) -> Optional[tuple[bool, Optional[str]]]:
+        """``(new_exposure_paused, updated_by_command_id)`` for the account's
+        ``trading_control_state`` row, or ``None`` when the row/table is
+        unavailable. Read directly off the journal DB (the same file the
+        control store writes to); any read failure -> ``None`` -> stay unknown
+        (fail-safe)."""
+        try:
+            row = self._journal.connect().execute(
+                "SELECT new_exposure_paused, updated_by_command_id "
+                "FROM trading_control_state WHERE account_id = ?",
+                [account_id],
+            ).fetchone()
+        except Exception:
+            return None
+        if row is None:
+            return None
+        return bool(row[0]), row[1]
+
+    def _terminalize_pre_dispatch_orphan(self, row: LedgerRow) -> bool:
+        """Terminalize a crash-orphaned ``VALIDATED`` row to
+        ``REJECTED``/``CRASH_ORPHANED`` (MEDIUM-4). Returns ``True`` on a
+        committed terminalization. Guarded per-row: a lost CAS (raced away from
+        VALIDATED) or any write failure is swallowed so one bad row never
+        aborts the whole startup rescan."""
+        now = self._now_utc()
+
+        def work(conn: duckdb.DuckDBPyConnection, append) -> None:
+            self._ledger.transition_in_tx(
+                conn, row.command_id, "VALIDATED", "REJECTED",
+                error_code="CRASH_ORPHANED", now=now,
+            )
+            append(
+                self._command_mutation(row, "REJECTED", now, error_code="CRASH_ORPHANED"),
+                _noop_write, f"command:{row.command_id}:rejected",
+            )
+
+        try:
+            self._journal.mutate_batch_work(self._journal.connect(), work)
+        except Exception:
+            return False
+        self._plans.pop(row.command_id, None)
+        return True
+
     # -- resolution transitions --------------------------------------------
+
+    def _resolve_command_only(
+        self, row: LedgerRow, outcome: dict[str, Any], now: dt.datetime
+    ) -> None:
+        """Transition the command ledger row to RESOLVED (with ``outcome``) and
+        journal its ``command.updated`` event -- WITHOUT touching any proposal
+        or order. Used by the create/reject/cancel/pause/cancel_orders
+        reconciliations, whose authority is the mutation/order/control state
+        itself, not a proposal to be marked."""
+        def work(conn: duckdb.DuckDBPyConnection, append) -> None:
+            self._ledger.transition_in_tx(
+                conn, row.command_id, row.state, "RESOLVED", outcome=outcome, now=now,
+            )
+            append(
+                self._command_mutation(row, "RESOLVED", now, outcome=outcome),
+                _noop_write, f"command:{row.command_id}:resolved",
+            )
+
+        self._journal.mutate_batch_work(self._journal.connect(), work)
+        self._plans.pop(row.command_id, None)
 
     def _resolve_order(self, row: LedgerRow, found: list, now: dt.datetime) -> None:
         """OUTCOME_UNKNOWN/SUBMITTING -> RESOLVED with the found broker aliases;

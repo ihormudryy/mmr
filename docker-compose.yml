@@ -348,6 +348,18 @@ services:
       # above). No 0.0.0.0 binds here -- the dashboard is a pure client.
       ZMQ_RPC_SERVER_ADDRESS: tcp://trader
       ZMQ_PUBSUB_SERVER_ADDRESS: tcp://trader
+      # Command-center typed-RPC seam to the trader. CommandCenterConfig
+      # defaults these to 127.0.0.1 (fine on a single host), but in the
+      # split-container model the trader is a SEPARATE service. Without them
+      # the read bridge's query/feed clients dial the dashboard's OWN
+      # localhost, the snapshot_with_cursor request never gets a reply, and the
+      # bridge hangs in SYNCHRONIZING forever -> /api/snapshot 503. The trader
+      # binds all of these on 0.0.0.0: 42101 query, 42103 feed, 42102 command;
+      # pub/sub (quote plane) is MMR_PUBSUB_ADDRESS + MMR_PUBSUB_PORT (42002).
+      MMR_TYPED_QUERY_ENDPOINT: tcp://trader:42101
+      MMR_TYPED_FEED_ENDPOINT: tcp://trader:42103
+      MMR_TYPED_COMMAND_ENDPOINT: tcp://trader:42102
+      MMR_PUBSUB_ADDRESS: tcp://trader
     ports:
       - "127.0.0.1:7424:7424"
     volumes:

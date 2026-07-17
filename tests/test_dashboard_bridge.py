@@ -7,6 +7,8 @@ import time
 import pytest
 
 from trader.domain.events import DomainEvent, ReadDomainEventsResult, SnapshotWithCursor
+from trader.domain.feed_service import domain_event_to_wire
+from trader.messaging.typed_rpc import TypedRpcRemoteError
 from web.command_center.bridge import BridgeLifecycle, DashboardEventBridge
 from web.command_center.state import DashboardState
 
@@ -41,7 +43,12 @@ class FakeQueryClient:
             item = self.snapshots.pop(0) if len(self.snapshots) > 1 else self.snapshots[0]
             if isinstance(item, Exception):
                 raise item
-            return item
+            # Real server returns a wire dict (response_model=dict); the bridge
+            # reconstructs via snapshot_with_cursor_from_wire. Serialize here so
+            # this test exercises the actual wire contract, not a bypass.
+            return {"source_cursor": item.source_cursor,
+                    "broker_generation": item.broker_generation,
+                    "entities": item.entities}
         if method == "get_quotes_snapshot":
             return {"quotes": {"265598": {"instrument_id": "265598", "last": 100.0}}}
         raise AssertionError(f"unexpected query method {method}")
@@ -66,7 +73,8 @@ class ScriptedFeed:
             raise item
         events = tuple(e for e in item if e.source_cursor > body["after_cursor"])
         newest = max([e.source_cursor for e in events], default=body["after_cursor"])
-        return ReadDomainEventsResult(events=events, newest_cursor=newest)
+        return {"events": [domain_event_to_wire(e) for e in events],
+                "newest_cursor": newest}
 
     def close(self):
         self.closed = True
@@ -85,7 +93,7 @@ class BlockingFeed:
         assert method == "read_domain_events"
         self.calls += 1
         time.sleep(self.delay)
-        return ReadDomainEventsResult(events=(), newest_cursor=body["after_cursor"])
+        return {"events": [], "newest_cursor": body["after_cursor"]}
 
     def close(self):
         self.closed = True
@@ -141,6 +149,42 @@ class TestBaselineAndTail:
             assert wait_until(lambda: state.has_baseline)
             assert wait_until(lambda: bridge.lifecycle is BridgeLifecycle.LIVE)
             assert wait_until(lambda: feed.calls and feed.calls[0]["after_cursor"] == 10)
+        finally:
+            feed.items.put(ConnectionError("stop"))
+            bridge.stop()
+
+    def test_missing_get_quotes_snapshot_does_not_block_baseline(self, loop_thread):
+        # get_quotes_snapshot is an optional quote pre-seed. A trader query
+        # surface that doesn't register it (METHOD_NOT_ALLOWED) must NOT block
+        # the fenced baseline -- readiness is gated on snapshot_with_cursor, and
+        # live quotes stream via the QuotePlane. Only METHOD_NOT_ALLOWED is
+        # tolerated; other remote errors still degrade (covered elsewhere).
+        class QuotelessQuery:
+            def __init__(self):
+                self.closed = False
+
+            def call(self, method, body, response_model):
+                if method == "snapshot_with_cursor":
+                    s = _snapshot(10)
+                    return {"source_cursor": s.source_cursor,
+                            "broker_generation": s.broker_generation,
+                            "entities": s.entities}
+                if method == "get_quotes_snapshot":
+                    raise TypedRpcRemoteError(
+                        "METHOD_NOT_ALLOWED",
+                        "method 'get_quotes_snapshot' is not registered on the 'query' socket")
+                raise AssertionError(f"unexpected query method {method}")
+
+            def close(self):
+                self.closed = True
+
+        feed = ScriptedFeed()
+        bridge, state, _ = _bridge(loop_thread, QuotelessQuery(), feed)
+        bridge.start()
+        try:
+            assert wait_until(lambda: state.has_baseline)
+            assert wait_until(lambda: bridge.lifecycle is BridgeLifecycle.LIVE)
+            assert state.quotes == {}  # no pre-seed installed, baseline still live
         finally:
             feed.items.put(ConnectionError("stop"))
             bridge.stop()

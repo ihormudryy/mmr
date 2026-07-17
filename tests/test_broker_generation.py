@@ -118,8 +118,12 @@ def test_abandon_without_an_active_generation_is_idempotent(env):
 @pytest.mark.asyncio
 async def test_run_broker_sync_marks_all_sources_and_promotes(env):
     class FakeIB:
-        async def reqAccountUpdatesAsync(self, _account_id):
-            return None
+        def accountValues(self, _account_id):
+            # ib.accountValues() is a SYNC snapshot of the already-downloaded
+            # account subscription (connectAsync fires reqAccountUpdatesAsync).
+            # run_broker_sync reads this instead of re-subscribing (which hangs).
+            return [SimpleNamespace(account="DU123", tag="NetLiquidation",
+                                    currency="USD", value="100000")]
 
         async def reqPositionsAsync(self):
             return [_position()]
@@ -137,3 +141,5 @@ async def test_run_broker_sync_marks_all_sources_and_promotes(env):
     assert await env.ingest.run_broker_sync(SimpleNamespace(ib=FakeIB())) is True
     assert env.ingest.is_ready is True
     assert env.db.execute("SELECT COUNT(*) FROM broker_positions", fetch="one") == (1,)
+    # The account source now stages from the cached accountValues() snapshot.
+    assert env.db.execute("SELECT COUNT(*) FROM broker_account_state", fetch="one") == (1,)

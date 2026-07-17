@@ -464,7 +464,20 @@ class BrokerIngest:
         self.begin_generation()
         try:
             async with asyncio.timeout(timeout_seconds):
-                await client.ib.reqAccountUpdatesAsync(self.account_id)
+                # ib_async's connectAsync(account=...) already issues
+                # reqAccountUpdatesAsync (with its own timeout) during connect,
+                # so the account-updates subscription is active and its values
+                # are already cached by the time this runs. Re-issuing
+                # reqAccountUpdatesAsync here re-subscribes an already-subscribed
+                # connection: IB sends no fresh accountDownloadEnd, so the await
+                # hangs until the outer timeout, the sync abandons, and NO broker
+                # generation ever promotes -> the command-center snapshot stays
+                # SNAPSHOT_NOT_READY forever (dashboard 503). ibreactive.connect*
+                # documents this same "reqAccountUpdates deadlocks post-connect"
+                # trap. Read the already-cached values instead, mirroring the
+                # reqPositionsAsync/reqAllOpenOrdersAsync pattern below.
+                for account_value in client.ib.accountValues(self.account_id):
+                    self.on_account_value(account_value)
                 self.mark_source_complete("account")
                 for position in await client.ib.reqPositionsAsync():
                     self.on_position(position)

@@ -121,3 +121,67 @@ class ReadDomainEventsResult:
     """
     events: tuple[DomainEvent, ...]
     newest_cursor: int
+
+
+# ---------------------------------------------------------------------------
+# Wire reconstruction (from_wire). These are the INVERSE of the server-side
+# serializers the typed-RPC handlers use, and exist because the typed transport
+# returns raw JSON dicts (``response_model=dict``): the client cannot
+# ``model_validate`` a frozen dataclass. The dashboard bridge calls the typed
+# query/feed methods with ``response_model=dict`` and reconstructs the frozen
+# contracts here.
+#
+# CONTRACT: keep these in lock-step with their forward serializers ---
+# ``trader.domain.feed_service.domain_event_to_wire`` (events) and
+# ``trader.messaging.production_api._snapshot_with_cursor_handler`` /
+# ``_read_domain_events_handler`` (snapshot + feed result). The DomainEvent
+# field set is contract-frozen (see the class docstring), so the only field
+# needing conversion is ``source_timestamp`` (ISO-8601 string -> tz-aware
+# datetime); every other field is JSON-native and round-trips as-is.
+
+
+def domain_event_from_wire(wire: dict[str, Any]) -> DomainEvent:
+    """Reconstruct a frozen ``DomainEvent`` from its typed-RPC wire dict.
+
+    Inverse of ``trader.domain.feed_service.domain_event_to_wire``.
+    """
+    return DomainEvent(
+        event_id=wire["event_id"],
+        source_cursor=wire["source_cursor"],
+        entity_revision=wire["entity_revision"],
+        event_type=wire["event_type"],
+        entity_type=wire["entity_type"],
+        entity_id=wire["entity_id"],
+        operation=wire["operation"],
+        account_id=wire["account_id"],
+        source=wire["source"],
+        source_timestamp=datetime.fromisoformat(wire["source_timestamp"]),
+        correlation_id=wire["correlation_id"],
+        payload=wire["payload"],
+    )
+
+
+def snapshot_with_cursor_from_wire(wire: dict[str, Any]) -> SnapshotWithCursor:
+    """Reconstruct a frozen ``SnapshotWithCursor`` from its wire dict.
+
+    Inverse of ``production_api._snapshot_with_cursor_handler``'s
+    ``{source_cursor, broker_generation, entities}`` payload.
+    """
+    return SnapshotWithCursor(
+        source_cursor=wire["source_cursor"],
+        broker_generation=wire["broker_generation"],
+        entities=wire["entities"],
+    )
+
+
+def read_domain_events_result_from_wire(wire: dict[str, Any]) -> ReadDomainEventsResult:
+    """Reconstruct a frozen ``ReadDomainEventsResult`` from its wire dict.
+
+    Inverse of ``production_api._read_domain_events_handler``'s
+    ``{events: [<wire event>...], newest_cursor}`` payload. ``events`` becomes
+    a tuple, per the M1-R immutability contract.
+    """
+    return ReadDomainEventsResult(
+        events=tuple(domain_event_from_wire(e) for e in wire["events"]),
+        newest_cursor=wire["newest_cursor"],
+    )

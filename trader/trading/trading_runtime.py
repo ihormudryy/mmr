@@ -419,19 +419,26 @@ class Trader():
                 address=self.typed_bind_address,
                 port=self.typed_query_port,
             )
-            # Command and feed registries are intentionally empty for now --
-            # [M1-F3] registers coordinator-authorized command methods and
-            # feed subscriptions on top of these same servers. Standing the
-            # sockets up now (rather than deferring until [M1-F3]) means the
-            # production port/authentication surface is fixed from this task
-            # forward and doesn't change shape later.
+            # All three servers share the ONE production_registry: it keys
+            # handlers by (socket_role, method), and each server resolves only
+            # its own role's methods (see TypedRpcRegistry.resolve), so the feed
+            # server exposes exactly the feed-role methods (read_domain_events)
+            # and nothing from the query/command roles -- no cross-role leak.
+            # The feed server MUST use production_registry: build_production_
+            # registry registers read_domain_events on role 'feed' there, and
+            # the M1-R dashboard bridge long-polls it; an empty registry made
+            # every read_domain_events call fail METHOD_NOT_ALLOWED, so the
+            # bridge could never tail past the fenced baseline (dashboard stuck
+            # resyncing). The command server stays empty until the command
+            # authority + live-command preflight are wired (integration gate);
+            # commands are disabled by default and the gateway isn't built then.
             self.typed_command_server = TypedRpcServer(
                 'command', TypedRpcRegistry(), self.typed_authenticator,
                 address=self.typed_bind_address,
                 port=self.typed_command_port,
             )
             self.typed_feed_server = TypedRpcServer(
-                'feed', TypedRpcRegistry(), self.typed_authenticator,
+                'feed', production_registry, self.typed_authenticator,
                 address=self.typed_bind_address,
                 port=self.typed_feed_port,
             )

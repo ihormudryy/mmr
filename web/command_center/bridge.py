@@ -16,7 +16,13 @@ from dataclasses import dataclass
 from enum import Enum
 from typing import Optional
 
-from trader.domain.events import ReadDomainEventsResult, SnapshotWithCursor
+from trader.domain.events import (
+    ReadDomainEventsResult,
+    SnapshotWithCursor,
+    read_domain_events_result_from_wire,
+    snapshot_with_cursor_from_wire,
+)
+from trader.messaging.typed_rpc import TypedRpcRemoteError
 
 logger = logging.getLogger("web.command_center.bridge")
 
@@ -132,9 +138,24 @@ class DashboardEventBridge:
 
     # -- fenced baseline --------------------------------------------------------
     def _resync_baseline(self) -> None:
-        baseline: SnapshotWithCursor = self._query.call(
-            "snapshot_with_cursor", {}, SnapshotWithCursor)
-        quotes = self._query.call("get_quotes_snapshot", {}, dict)
+        # The typed transport returns raw wire dicts (response_model=dict);
+        # the frozen dataclasses have no model_validate, so we reconstruct
+        # them here via the from_wire inverses (see trader.domain.events).
+        baseline: SnapshotWithCursor = snapshot_with_cursor_from_wire(
+            self._query.call("snapshot_with_cursor", {}, dict))
+        # Optional quote pre-seed. The authoritative live quote source is the
+        # QuotePlane (pubsub), which streams independently; get_quotes_snapshot
+        # is only an initial baseline. If the trader query surface doesn't
+        # implement it, seed empty rather than failing the whole resync --
+        # readiness is gated on the entity snapshot above, not on quotes. Only
+        # "method not registered" is tolerated; any other remote/transport
+        # error still degrades + retries.
+        try:
+            quotes = self._query.call("get_quotes_snapshot", {}, dict)
+        except TypedRpcRemoteError as exc:
+            if exc.code != "METHOD_NOT_ALLOWED":
+                raise
+            quotes = {}
         stream_id = uuid.uuid4().hex  # every resync rotates the stream
         installed = threading.Event()
 
@@ -154,11 +175,12 @@ class DashboardEventBridge:
     # -- long-poll tail ---------------------------------------------------------
     def _tail(self) -> None:
         while not self._stop.is_set():
-            result: ReadDomainEventsResult = self._feed.call(
-                "read_domain_events",
-                {"after_cursor": self._cursor, "limit": self._poll_limit,
-                 "wait_ms": self._wait_ms},
-                ReadDomainEventsResult)
+            result: ReadDomainEventsResult = read_domain_events_result_from_wire(
+                self._feed.call(
+                    "read_domain_events",
+                    {"after_cursor": self._cursor, "limit": self._poll_limit,
+                     "wait_ms": self._wait_ms},
+                    dict))
             self._record_success("journal")
             if not result.events:
                 continue  # ten-second empty heartbeat

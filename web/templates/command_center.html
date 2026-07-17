@@ -205,6 +205,25 @@
     <button id="cc-confirm-cancel" type="button">Cancel</button>
   </aside>
 
+  <!-- [M1-C] Task 5 -- cancel-all confirmation: every working order with its
+       classification (ENTRY = risk-reducing, PROTECTIVE = risk-increasing,
+       fail-safe default per classify_cancel), fanned out server-side to
+       per-order commands under one correlation id (spec 9.7: "cancel-all
+       expands under ONE correlation id and ONE confirmation"). Populated by
+       ccOpenCancelAllDialog()/ccCancelAll() (command_center.js); opened from
+       a "Cancel all" control a later task wires into the working-orders
+       panel (same deferred-wiring boundary cc-close-drawer above already
+       documents). -->
+  <aside id="cc-cancel-all-dialog" class="cc-drawer" hidden>
+    <h2>Cancel all working orders</h2>
+    <p>The following orders will be cancelled under one correlation id.
+       Protective legs leave their position unprotected:</p>
+    <ul id="cc-cancel-all-list"></ul>
+    <button id="cc-cancel-all-confirm" type="button"
+            data-cc-command="cancel_orders">Cancel all listed orders</button>
+    <button id="cc-cancel-all-abort" type="button">Keep orders</button>
+  </aside>
+
   <script src="/static/command_center.js" defer></script>
 </body>
 </html>

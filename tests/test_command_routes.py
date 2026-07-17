@@ -571,3 +571,109 @@ def test_approve_reject_preflight_require_csrf_and_origin(gateway):
         assert r.status_code == 403
         assert r.json()["code"] == "CSRF_REJECTED"
     assert gateway.calls == []
+
+
+# ---------------------------------------------------------------------------
+# [M1-C] Task 5 -- order cancel and cancel-all with the classification
+# ceremony (spec 9.7). The SERVER (F3 Task 6's `classify_cancel` +
+# `CancelCommandService`) is the real authority for whether a cancel is
+# risk-reducing (entry) or risk-increasing (protective/unclassifiable) -- this
+# web layer forwards through the gateway and never re-derives that itself.
+# ---------------------------------------------------------------------------
+
+def test_cancel_single_order_forwards_entity_id(gateway):
+    client = make_client(gateway)
+    r = client.post("/api/commands/orders/grp-9:entry/cancel",
+                    json={"command_id": CMD_ID}, headers=HEADERS)
+    assert r.status_code == 202
+    method, body = gateway.calls[0]
+    assert method == "cancel_order"
+    assert body == {"command_id": CMD_ID, "order_entity_id": "grp-9:entry",
+                    "preflight_nonce": None,
+                    "session_fingerprint": body["session_fingerprint"]}
+
+
+def test_protective_cancel_forwards_nonce(gateway):
+    client = make_client(gateway, flags=LIVE_FLAGS)
+    r = client.post("/api/commands/orders/grp-9:stop/cancel",
+                    json={"command_id": CMD_ID, "preflight_nonce": "n-1"},
+                    headers=HEADERS)
+    assert r.status_code == 202
+    assert gateway.calls[0][1]["preflight_nonce"] == "n-1"
+
+
+def test_cancel_all_sends_every_order_under_one_command(gateway):
+    client = make_client(gateway)
+    r = client.post("/api/commands/orders/cancel-all",
+                    json={"command_id": CMD_ID,
+                          "order_entity_ids": ["grp-9:entry", "grp-9:stop"]},
+                    headers=HEADERS)
+    assert r.status_code == 202
+    method, body = gateway.calls[0]
+    assert method == "cancel_orders"
+    assert body["order_entity_ids"] == ["grp-9:entry", "grp-9:stop"]
+    # one correlation id: the coordinator expands per-order commands under it
+    assert body["command_id"] == CMD_ID
+
+
+def test_cancel_all_requires_at_least_one_order(gateway):
+    client = make_client(gateway)
+    r = client.post("/api/commands/orders/cancel-all",
+                    json={"command_id": CMD_ID, "order_entity_ids": []},
+                    headers=HEADERS)
+    assert r.status_code == 422
+    assert gateway.calls == []
+
+
+def test_terminal_order_cancel_reports_authoritative_state(gateway):
+    gateway.error = GatewayError("COMMAND_REJECTED",
+                                 "order grp-9:entry already FILLED; no-op",
+                                 retryable=False, correlation_id=CMD_ID)
+    client = make_client(gateway)
+    r = client.post("/api/commands/orders/grp-9:entry/cancel",
+                    json={"command_id": CMD_ID}, headers=HEADERS)
+    assert r.status_code == 409
+    assert "already FILLED" in r.json()["message"]
+
+
+def test_live_targeted_cancel_without_live_commands_enabled_is_403(gateway):
+    """Mirrors `test_live_targeted_approve_without_live_commands_enabled_is_403`
+    above: a `preflight_nonce` on the wire only ever exists once the browser
+    has completed the live ceremony, so its presence is this layer's signal
+    that the cancel targets the live account -- refused before the gateway
+    is ever reached when this dashboard isn't configured for live commands."""
+    client = make_client(gateway)  # paper-only (default) flags
+    r = client.post("/api/commands/orders/grp-9:stop/cancel",
+                    json={"command_id": CMD_ID, "preflight_nonce": "n-1"},
+                    headers=HEADERS)
+    assert r.status_code == 403
+    assert r.json()["code"] == "LIVE_COMMANDS_DISABLED"
+    assert gateway.calls == []
+
+
+def test_cancel_routes_reject_malformed_command_id(gateway):
+    bad_id = "0f9b2c1a-5b7e-4c1d-9e2f-3a4b5c6d:8f1"
+    client = make_client(gateway)
+    r = client.post("/api/commands/orders/grp-9:entry/cancel",
+                    json={"command_id": bad_id}, headers=HEADERS)
+    assert r.status_code == 422
+    r = client.post("/api/commands/orders/cancel-all",
+                    json={"command_id": bad_id, "order_entity_ids": ["grp-9:entry"]},
+                    headers=HEADERS)
+    assert r.status_code == 422
+    assert gateway.calls == []
+
+
+def test_cancel_routes_require_csrf_and_origin(gateway):
+    bad_headers = dict(HEADERS)
+    bad_headers.pop("X-CSRF-Token")
+    for url, body in [
+        ("/api/commands/orders/grp-9:entry/cancel", {"command_id": CMD_ID}),
+        ("/api/commands/orders/cancel-all",
+         {"command_id": CMD_ID, "order_entity_ids": ["grp-9:entry"]}),
+    ]:
+        client = make_client(gateway, flags=LIVE_FLAGS)
+        r = client.post(url, json=body, headers=bad_headers)
+        assert r.status_code == 403
+        assert r.json()["code"] == "CSRF_REJECTED"
+    assert gateway.calls == []

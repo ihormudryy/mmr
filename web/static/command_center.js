@@ -803,5 +803,181 @@ async function ccRejectProposal(proposal) {
       });
 }
 
+/* ===================== [M1-C] Task 5: order cancel + cancel-all ==========
+ * Working-order cancel (spec 9.7). An entry-leg cancel just removes PENDING
+ * exposure -- risk-REDUCING, immediate single POST in both modes, same as
+ * reject_proposal above. A protective-leg cancel strips protection from an
+ * already-open position -- risk-INCREASING -- so it runs a confirmation
+ * ceremony that names the position left unprotected: a plain confirm()
+ * dialog on paper, the signed two-stage live ceremony (ccRunLiveCeremony,
+ * already built for approve_proposal) on live. The SERVER is still the real
+ * authority: `classify_cancel` (trader/trading/command_coordinator.py)
+ * re-derives this from durable order-group state and enforces the nonce
+ * requirement itself -- this classification only drives which UX ceremony
+ * the browser runs, it is never trusted for the actual gate.
+ *
+ * Source-vs-brief drift: the plan assumed `CC.entities('order')` /
+ * `CC.entity('position', id)` accessors and an `order.leg_role` field with
+ * values `entry|parent|take_profit|stop|trailing_stop|null`. Neither the
+ * `CC.entities`/`CC.entity` helpers nor a `leg_role` field exist anywhere in
+ * the landed [M1-R] client store or the real [M1-F2]/[M1-F3] order payload
+ * (`trader/data/broker_state.py`'s `BrokerOrderRow.to_payload()`) -- the
+ * real field is `leg`, produced ONLY by `order_correlation.classify_leg`
+ * with values `"entry" | "stop" | "take_profit" | f"child-{id}" | null`
+ * (mirrored server-side by `classify_cancel`, the real authority this
+ * ceremony defers to). This section reads the real store shape instead --
+ * `store.view.orders.active`/`.terminal`, `store.view.positions`,
+ * `store.view.accounts` -- the exact same shape `renderOrders`/
+ * `renderPositions`/`showProposalDrawer` above already read, rather than
+ * inventing the accessors the brief assumed. Orders also carry no
+ * `account_mode` of their own (unlike proposals): live/paper is resolved
+ * from the account entity matching the order's `account_id`, the same way
+ * `renderStatusBar` derives the status bar's LIVE/PAPER badge.
+ *
+ * Wiring note: same deferred-wiring boundary `ccOpenCloseDrawer`/
+ * `ccApproveProposal` above already document -- these functions are exposed
+ * per this task's interface (a working-order row's "Cancel" control and a
+ * "Cancel all" button trigger them) but are not themselves wired into
+ * `renderOrders()` here; that is a later UI-wiring pass, not a restructure
+ * of the M1-R client store. */
+
+const CC_ENTRY_LEGS = new Set(['entry']);
+
+function ccClassifyOrder(order) {
+  // Fail-safe: an unclassifiable leg (null, external, or any non-entry
+  // value such as a protective stop/take-profit/child leg) is PROTECTIVE,
+  // never entry -- mirrors classify_cancel's "any non-entry leg, including
+  // a missing one, is INCREASING" rule exactly.
+  const leg = String(order.leg || '').toLowerCase();
+  return CC_ENTRY_LEGS.has(leg) ? 'entry' : 'protective';
+}
+
+function ccOrderAccountMode(order) {
+  const v = store.view;
+  if (!v || !v.accounts) return null;
+  const acct = v.accounts.find((a) =>
+      a.account_id === order.account_id || a.entity_id === order.account_id)
+      || v.accounts[0];
+  return acct ? acct.mode : null;
+}
+
+function ccFindPosition(order) {
+  const v = store.view;
+  if (!v || !v.positions) return null;
+  const id = `${order.account_id}:${order.conid}`;
+  return v.positions.find((p) => p.entity_id === id) || null;
+}
+
+function ccOrderEntityId(order) {
+  return order.order_entity_id || order.entity_id;
+}
+
+function ccUnprotectedPositionLabel(order) {
+  const position = ccFindPosition(order);
+  const symbol = order.symbol || (position && position.symbol) || order.conid;
+  const qty = position ? position.quantity : '?';
+  return `${symbol} (${order.account_id}, qty ${qty})`;
+}
+
+async function ccCancelOrder(order) {
+  const orderEntityId = ccOrderEntityId(order);
+  const url = `/api/commands/orders/${encodeURIComponent(orderEntityId)}/cancel`;
+  const label = `Cancel order ${orderEntityId}`;
+
+  if (ccClassifyOrder(order) === 'entry') {
+    // Risk-reducing: immediate, idempotent, both modes -- no ceremony.
+    await ccSubmitCommand('cancel_order', label, url,
+        {command_id: ccNewCommandId(), preflight_nonce: null});
+    return;
+  }
+
+  const positionLabel = ccUnprotectedPositionLabel(order);
+  if (!ccIsLive(ccOrderAccountMode(order))) {
+    // Paper ceremony: one authenticated POST, but an explicit confirm
+    // dialog that names the position left unprotected.
+    const ok = window.confirm(
+        `Cancel PROTECTIVE order ${orderEntityId}?\n` +
+        `This leaves ${positionLabel} unprotected.`);
+    if (!ok) return;
+    await ccSubmitCommand('cancel_order', label, url,
+        {command_id: ccNewCommandId(), preflight_nonce: null});
+    return;
+  }
+
+  // Live: signed two-stage preflight; the drawer's authoritative summary/
+  // warnings name the unprotected position (the coordinator includes it
+  // server-side in summary.warnings).
+  await ccRunLiveCeremony('cancel_order', label, 'cancel_order',
+      {order_entity_id: orderEntityId}, null,
+      (commandId, nonce) => ccSubmitCommand('cancel_order', label, url,
+          {command_id: commandId, preflight_nonce: nonce}));
+}
+
+/* ---- Cancel all: one confirmation listing every working order with its
+ * classification, fanned out server-side to per-order commands under one
+ * correlation id. Mirrors `CancelCommandService.cancel_orders`' outcome
+ * shape `{child_command_ids, children: {order_entity_id: {command_id,
+ * state, error_code, classification}}, partial_failure}` -- the per-child
+ * truth resolves later from `command.updated` events, same as every other
+ * command in this file; this dialog only drives the ONE up-front
+ * confirmation spec 9.7 requires for the whole batch. */
+
+function ccOpenCancelAllDialog() {
+  const v = store.view;
+  const orders = v && v.orders ? v.orders.active : [];
+  if (!orders || orders.length === 0) {
+    ccToast('warn', 'No working orders to cancel');
+    return;
+  }
+  const d = document.getElementById('cc-cancel-all-dialog');
+  const list = d.querySelector('#cc-cancel-all-list');
+  list.replaceChildren(...orders.map((o) => {
+    const li = document.createElement('li');
+    const cls = ccClassifyOrder(o);
+    li.textContent = `${ccOrderEntityId(o)} — ${o.symbol || o.conid || ''} ` +
+        `${o.action || ''} ${o.total_quantity ?? ''} [${cls.toUpperCase()}]` +
+        (cls === 'protective'
+            ? ` — leaves ${ccUnprotectedPositionLabel(o)} unprotected` : '');
+    return li;
+  }));
+  const orderIds = orders.map(ccOrderEntityId);
+  d.dataset.orderIds = JSON.stringify(orderIds);
+  d.dataset.hasProtective =
+      String(orders.some((o) => ccClassifyOrder(o) === 'protective'));
+  d.dataset.hasLive =
+      String(orders.some((o) => ccIsLive(ccOrderAccountMode(o))));
+  d.hidden = false;
+}
+
+function ccCancelAll() {
+  ccOpenCancelAllDialog();
+}
+
+document.getElementById('cc-cancel-all-confirm').addEventListener('click',
+    async () => {
+      const d = document.getElementById('cc-cancel-all-dialog');
+      d.hidden = true;
+      const orderIds = JSON.parse(d.dataset.orderIds || '[]');
+      if (orderIds.length === 0) return;
+      const riskIncreasing = d.dataset.hasProtective === 'true' &&
+                             d.dataset.hasLive === 'true';
+      const submit = (commandId, nonce) => ccSubmitCommand('cancel_orders',
+          `Cancel all (${orderIds.length} orders)`,
+          '/api/commands/orders/cancel-all', {
+            command_id: commandId,
+            order_entity_ids: orderIds,
+            preflight_nonce: nonce,
+          });
+      if (riskIncreasing) {
+        await ccRunLiveCeremony('cancel_orders',
+            `Cancel all (${orderIds.length} orders)`, 'cancel_orders',
+            {order_entity_ids: orderIds}, null, submit);
+      } else {
+        await submit(ccNewCommandId(), null);
+      }
+    });
+document.getElementById('cc-cancel-all-abort').addEventListener('click',
+    () => { document.getElementById('cc-cancel-all-dialog').hidden = true; });
+
 /* ---------------- boot ----------------------------------------------------- */
 resync();

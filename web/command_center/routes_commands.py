@@ -64,6 +64,29 @@ anticipated when it was written:
    ever produces -- see ``command_center.js``'s ``ccIsLive``) is refused
    with 403 ``LIVE_COMMANDS_DISABLED`` unless ``flags.live_commands_enabled``
    is set, before the gateway is ever called.
+
+4. [M1-C] Task 5: the plan's cancel routes matched the brief almost exactly
+   (``CancelOrderBody``/``CancelAllBody`` mirror the frozen [M1-F3]
+   ``CancelOrderRequest``/``CancelOrdersRequest`` field-for-field:
+   ``command_id``, ``order_entity_id(s)``, ``preflight_nonce``). The one
+   addition versus the brief's literal Step 3 code: the same live-command
+   gate drift item 3 added to ``approve_proposal`` is reused here (factored
+   into ``_reject_live_targeted_without_flag``) rather than re-derived --
+   a cancel whose classification the coordinator resolves to protective
+   (``classify_cancel``'s fail-safe INCREASING default) needs the identical
+   live ceremony an INCREASING approval does, so a live-targeted cancel
+   (signalled the same way: a non-``None`` ``preflight_nonce``) must be
+   refused with the same 403 ``LIVE_COMMANDS_DISABLED`` before the gateway
+   is reached, not left to degrade into whatever error the coordinator
+   raises for a nonce it was never going to accept anyway. Note also that
+   the real order-classification field the coordinator's
+   ``order_correlation.classify_leg`` produces is ``leg`` (values
+   ``"entry" | "stop" | "take_profit" | f"child-{id}" | None``), not the
+   brief's hypothetical ``leg_role``; that only matters to
+   ``command_center.js``'s ``ccClassifyOrder`` (this router forwards
+   ``order_entity_id`` opaquely and never inspects the leg itself -- the
+   classification ceremony is client-side UX only, per the module docstring
+   above).
 """
 from __future__ import annotations
 
@@ -353,6 +376,33 @@ class PreflightBody(BaseModel):
     expected_version: int | None = Field(default=None, ge=1)
 
 
+class CancelOrderBody(BaseModel):
+    """Mirrors ``trader.messaging.production_api.CancelOrderRequest``.
+    Whether a nonce is required is NOT static here (unlike
+    ``ApproveProposalBody``): the coordinator's ``CancelCommandService.
+    cancel_order`` saga derives it from the order's classification
+    (``classify_cancel``) once the order row is loaded server-side -- this
+    body only carries the nonce through if the browser's client-side
+    ceremony (``ccClassifyOrder`` in ``command_center.js``) already ran one."""
+
+    model_config = ConfigDict(extra="forbid")
+    command_id: str = _COMMAND_ID
+    preflight_nonce: str | None = None  # protective cancel on live accounts
+
+
+class CancelAllBody(BaseModel):
+    """Mirrors ``trader.messaging.production_api.CancelOrdersRequest``. The
+    coordinator's (non-saga) ``cancel_orders`` fans this out into one
+    colon-free child ``cancel_order`` command per entry, all correlated
+    under this one ``command_id`` (spec 9.7: "cancel-all expands under ONE
+    correlation id and ONE confirmation")."""
+
+    model_config = ConfigDict(extra="forbid")
+    command_id: str = _COMMAND_ID
+    order_entity_ids: list[str] = Field(min_length=1, max_length=200)
+    preflight_nonce: str | None = None
+
+
 @router.get("/api/commands/csrf-token")
 def csrf_token(request: Request, session: str = Depends(require_session)):
     """Lets the browser learn its session-bound CSRF token.
@@ -438,6 +488,69 @@ def reject_proposal(pid: int, body: RejectProposalBody, request: Request,
         "command_id": body.command_id,
         "proposal_id": pid,
         "reason": body.reason,
+    })
+    return _receipt_json(receipt)
+
+
+def _reject_live_targeted_without_flag(request: Request, preflight_nonce: str | None) -> None:
+    """Shared with ``approve_proposal``'s guard above: a non-``None``
+    ``preflight_nonce`` only ever exists once the browser has completed the
+    live two-stage ceremony (``ccIsLive``/``ccRunLiveCeremony`` in
+    ``command_center.js``), so its presence on the wire IS this layer's
+    signal that the command targets the live account. A live-targeted
+    cancel must never reach the gateway while this deployment isn't
+    configured for live commands (spec 9.7's ceremony reuses T4's live gate,
+    not a separate one)."""
+    flags: CommandFlags = request.app.state.command_flags
+    if preflight_nonce is not None and not flags.live_commands_enabled:
+        raise CommandApiError(403, "LIVE_COMMANDS_DISABLED",
+                              "live commands are disabled "
+                              "(DASHBOARD_LIVE_COMMANDS_ENABLED=false)")
+
+
+@router.post("/api/commands/orders/cancel-all")
+def cancel_all_orders(body: CancelAllBody, request: Request,
+                      session: str = Depends(require_command_auth)):
+    # Registered before the parameterized `/{order_entity_id}/cancel` path
+    # below so a literal "cancel-all" is never captured as an
+    # order_entity_id -- moot given the different path-segment counts, but
+    # kept in this order for readability (see the module's own precedent of
+    # documenting intent even where FastAPI's routing wouldn't ambiguously
+    # match otherwise).
+    #
+    # The coordinator's (non-saga) `cancel_orders` expands to one colon-free
+    # child `cancel_order` command per entry, all under THIS command_id as
+    # the single correlation id (spec 9.7); the outcome shape it returns is
+    # `{child_command_ids, children: {order_entity_id: {command_id, state,
+    # error_code, classification}}, partial_failure}` -- this route still
+    # only ever returns the root 202 receipt (received-only; the browser
+    # resolves the per-child outcome from correlated `command.updated`
+    # events, same as every other command in this module).
+    _reject_live_targeted_without_flag(request, body.preflight_nonce)
+    receipt = _gateway(request).execute("cancel_orders", {
+        "command_id": body.command_id,
+        "order_entity_ids": body.order_entity_ids,
+        "preflight_nonce": body.preflight_nonce,
+        "session_fingerprint": session_fingerprint(session),
+    })
+    return _receipt_json(receipt)
+
+
+@router.post("/api/commands/orders/{order_entity_id}/cancel")
+def cancel_order(order_entity_id: str, body: CancelOrderBody, request: Request,
+                 session: str = Depends(require_command_auth)):
+    # Classification-aware ceremony happens client-side for UX
+    # (`ccClassifyOrder` in command_center.js treats an unclassifiable leg as
+    # PROTECTIVE, fail-safe); the coordinator re-derives the classification
+    # from durable order-group state (`classify_cancel`) and enforces the
+    # nonce requirement itself (spec 9.7) -- this layer never re-validates,
+    # it only forwards and drives the live-gate check shared with approve.
+    _reject_live_targeted_without_flag(request, body.preflight_nonce)
+    receipt = _gateway(request).execute("cancel_order", {
+        "command_id": body.command_id,
+        "order_entity_id": order_entity_id,
+        "preflight_nonce": body.preflight_nonce,
+        "session_fingerprint": session_fingerprint(session),
     })
     return _receipt_json(receipt)
 

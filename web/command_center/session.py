@@ -9,6 +9,7 @@ import hashlib
 import hmac
 import logging
 import os
+import secrets
 import threading
 import time
 from collections import OrderedDict, deque
@@ -214,6 +215,36 @@ def build_require_session(manager: SessionManager) -> Callable[[Request], str]:
         return cookie
 
     return require_session
+
+
+# [M1-C] Task 4: process-local, generated once at import time -- the SAME
+# pattern `web/command_center/routes_commands.py`'s `_CSRF_SECRET` already
+# established for deriving a session-bound value without changing this
+# module's session-identity shape. A `DashboardSession` dataclass with its
+# own `session_id`/`epoch` fields (what an earlier plan for this function
+# assumed) never landed here (see `build_require_session` above): the
+# session identity every route actually threads through is the raw signed
+# cookie `str` this module already returns. Keying on THAT string still
+# gives a value that is stable for one browser session (repeat calls with
+# the same cookie derive the same fingerprint) and distinct across sessions
+# (a different login -- different `issued_at`/signature -- derives a
+# different fingerprint), without ever being reversible back to the cookie.
+_FINGERPRINT_SECRET = secrets.token_bytes(32)
+
+
+def session_fingerprint(session: str) -> str:
+    """Opaque per-session value the trader binds preflight nonces to
+    (spec 9.1 session binding).
+
+    Derived, not the raw cookie: leaking this value cannot replay the
+    session, and the trader (a separate process, on the other side of the
+    command gateway) never learns the browser's session credential. The
+    trader only ever needs this value to match itself across the
+    preflight -> confirm -> approve ceremony for one browser session, never
+    to independently recompute it from a shared secret.
+    """
+    return hmac.new(_FINGERPRINT_SECRET, f"preflight:{session}".encode(),
+                    hashlib.sha256).hexdigest()
 
 
 _LOGIN_PAGE = """<!DOCTYPE html>

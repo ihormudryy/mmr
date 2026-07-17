@@ -6,9 +6,10 @@ received only; the browser resolves outcomes from correlated
 ``command.updated`` events -- this module never renders success from the
 HTTP response itself.
 
-Source-vs-brief drift (see ``.superpowers/sdd/m1c-task-3-report.md`` for the
-full account) -- two real interfaces this router forwards to landed
-DIFFERENTLY from what the plan anticipated when it was written:
+Source-vs-brief drift (see ``.superpowers/sdd/m1c-task-3-report.md`` and
+``.superpowers/sdd/m1c-task-4-report.md`` for the full accounts) -- real
+interfaces this router forwards to landed DIFFERENTLY from what the plan
+anticipated when it was written:
 
 1. ``web/command_center/session.py`` ([M1-R], out of this task's scope --
    the coordination brief for this task forbids touching it) exports
@@ -42,6 +43,27 @@ DIFFERENTLY from what the plan anticipated when it was written:
    ``action``/``quantity`` for the position it's looking at; the
    coordinator verifies the broker-reported reducible quantity server-side
    (``ProposalCommandService._is_reducing_close``).
+
+3. [M1-C] Task 4: the plan for ``session_fingerprint`` assumed a
+   ``DashboardSession`` dataclass with ``.session_id``/``.epoch`` fields and
+   a module-level ``_session_secret()`` accessor for the loaded
+   ``DASHBOARD_SESSION_SECRET`` -- neither exists (see drift item 1 above;
+   the session identity is still the raw signed cookie ``str``). Landed as
+   ``session_fingerprint(session: str) -> str`` in ``session.py``, keyed by
+   a process-local secret generated once at import time -- the exact same
+   pattern already established for ``session_csrf_token`` in THIS module.
+   It is stable for one browser session (repeat calls with the same cookie
+   derive the same value, which is what lets the trader bind a nonce across
+   the preflight -> confirm -> approve ceremony) and irreversible back to
+   the cookie, without needing ``DASHBOARD_SESSION_SECRET`` itself. Also,
+   the brief's literal ``approve_proposal`` route body had no live-command
+   gate at all; ``approve`` EXECUTES a real order (unlike
+   ``create_proposal``/``close_position``, gated by ``commands_enabled``
+   only per drift item 1's ``require_command_auth``), so this router adds
+   one: a non-``None`` ``preflight_nonce`` (which only the live ceremony
+   ever produces -- see ``command_center.js``'s ``ccIsLive``) is refused
+   with 403 ``LIVE_COMMANDS_DISABLED`` unless ``flags.live_commands_enabled``
+   is set, before the gateway is ever called.
 """
 from __future__ import annotations
 
@@ -59,7 +81,7 @@ from pydantic import BaseModel, ConfigDict, Field, model_validator
 from trader.domain.commands import CommandReceipt
 from web.command_center.flags import CommandFlags
 from web.command_center.gateway import DashboardCommandGateway, GatewayError
-from web.command_center.session import CredentialConfigError
+from web.command_center.session import CredentialConfigError, session_fingerprint
 
 router = APIRouter()
 
@@ -301,6 +323,36 @@ class ClosePositionBody(BaseModel):
     reasoning: str = Field(default="", max_length=8000)
 
 
+# [M1-C] Task 4: the [M1-F3] actions `preflight_command` may be asked to
+# price/summarize before an EXECUTING command transmits (spec 9.1). This is
+# a closed set -- an unknown action is a 422 at this web layer, not a
+# pass-through to the coordinator.
+_PREFLIGHT_ACTIONS = ("approve_proposal", "set_trading_pause",
+                      "enable_strategy", "disable_strategy",
+                      "update_strategy_params", "cancel_order", "cancel_orders")
+
+
+class ApproveProposalBody(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    command_id: str = _COMMAND_ID
+    expected_version: int = Field(ge=1)   # proposal entity_revision (spec 6.1)
+    preflight_nonce: str | None = None    # required for live; trader enforces
+
+
+class RejectProposalBody(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    command_id: str = _COMMAND_ID
+    reason: str = Field(default="", max_length=2000)
+
+
+class PreflightBody(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    command_id: str = _COMMAND_ID
+    action: Literal[_PREFLIGHT_ACTIONS]
+    params: dict[str, Any]
+    expected_version: int | None = Field(default=None, ge=1)
+
+
 @router.get("/api/commands/csrf-token")
 def csrf_token(request: Request, session: str = Depends(require_session)):
     """Lets the browser learn its session-bound CSRF token.
@@ -344,6 +396,69 @@ def close_position(account: str, conid: int, body: ClosePositionBody,
         "reasoning": body.reasoning,
     })
     return _receipt_json(receipt)
+
+
+@router.post("/api/commands/proposals/{pid}/approve")
+def approve_proposal(pid: int, body: ApproveProposalBody, request: Request,
+                     session: str = Depends(require_command_auth)):
+    # [M1-C] Task 4 (I-2, deferred from the T3 review): unlike
+    # create_proposal/close_position -- which only ever create a
+    # NON-EXECUTING PENDING proposal and are gated by `commands_enabled`
+    # alone via `require_command_auth` -- approve EXECUTES a real order.
+    # A `preflight_nonce` on the wire only ever exists once the browser has
+    # completed the live two-stage ceremony (`ccIsLive(proposal.account_mode)`
+    # in command_center.js decides whether to run it), so its presence here
+    # IS this layer's signal that the approval targets the live account
+    # (a CommandFlags-configured dashboard binds to exactly one account/mode
+    # -- see flags.py -- never a per-proposal mix). A live-targeted approval
+    # must never reach the gateway while this deployment isn't configured
+    # for live commands.
+    flags: CommandFlags = request.app.state.command_flags
+    if body.preflight_nonce is not None and not flags.live_commands_enabled:
+        raise CommandApiError(403, "LIVE_COMMANDS_DISABLED",
+                              "live commands are disabled "
+                              "(DASHBOARD_LIVE_COMMANDS_ENABLED=false)")
+    receipt = _gateway(request).execute("approve_proposal", {
+        "command_id": body.command_id,
+        "proposal_id": pid,
+        "expected_version": body.expected_version,
+        "preflight_nonce": body.preflight_nonce,
+        "session_fingerprint": session_fingerprint(session),
+    })
+    return _receipt_json(receipt)
+
+
+@router.post("/api/commands/proposals/{pid}/reject")
+def reject_proposal(pid: int, body: RejectProposalBody, request: Request,
+                    session: str = Depends(require_command_auth)):
+    # Risk-reducing: idempotent PENDING->REJECTED CAS server-side; a stale
+    # view must never block it, so no expected_version (spec 6.1). Not an
+    # executing command -- no live gate, same as create_proposal/close.
+    receipt = _gateway(request).execute("reject_proposal", {
+        "command_id": body.command_id,
+        "proposal_id": pid,
+        "reason": body.reason,
+    })
+    return _receipt_json(receipt)
+
+
+@router.post("/api/preflight")
+def preflight(body: PreflightBody, request: Request,
+             session: str = Depends(require_command_auth)):
+    flags: CommandFlags = request.app.state.command_flags
+    if not flags.live_commands_enabled:
+        raise CommandApiError(403, "LIVE_COMMANDS_DISABLED",
+                              "live commands are disabled "
+                              "(DASHBOARD_LIVE_COMMANDS_ENABLED=false)")
+    ticket = _gateway(request).preflight({
+        "command_id": body.command_id,
+        "action": body.action,
+        "params": body.params,
+        "expected_version": body.expected_version,
+        "session_fingerprint": session_fingerprint(session),
+    })
+    return {"command_id": ticket.command_id, "nonce": ticket.nonce,
+            "expires_at": ticket.expires_at, "summary": ticket.summary}
 
 
 @router.get("/api/commands/{command_id}")

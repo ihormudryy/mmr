@@ -179,6 +179,32 @@
     </form>
   </aside>
 
+  <!-- [M1-C] Task 4 -- live confirmation drawer. Repeats the AUTHORITATIVE
+       preflight summary (not whatever the browser assumed) so a human
+       confirms exactly what will transmit before the signed nonce +
+       command_id ride the approve POST. Opened by ccOpenConfirmDrawer()
+       (command_center.js) once ccRequestPreflight() returns a ticket;
+       populated by an "Approve" control a later task wires into the
+       proposal cards (same deferred-wiring boundary cc-close-drawer above
+       already documents). -->
+  <aside id="cc-confirm-drawer" class="cc-drawer cc-drawer-live" hidden>
+    <h2>Confirm live command</h2>
+    <dl>
+      <dt>Side</dt><dd data-field=side></dd>
+      <dt>Instrument</dt><dd data-field=instrument></dd>
+      <dt>Quantity</dt><dd data-field=quantity></dd>
+      <dt>Notional</dt><dd data-field=notional></dd>
+      <dt>Order type</dt><dd data-field=order_type></dd>
+      <dt>Latest price</dt><dd data-field=latest_price></dd>
+      <dt>Drift (bps)</dt><dd data-field=drift_bps></dd>
+      <dt>Account</dt><dd data-field=account></dd>
+    </dl>
+    <ul data-field=warnings class="cc-warnings"></ul>
+    <p>Nonce expires in <span id="cc-confirm-countdown"></span></p>
+    <button id="cc-confirm-button" type="button">Confirm</button>
+    <button id="cc-confirm-cancel" type="button">Cancel</button>
+  </aside>
+
   <script src="/static/command_center.js" defer></script>
 </body>
 </html>

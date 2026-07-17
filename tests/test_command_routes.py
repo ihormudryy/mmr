@@ -31,6 +31,7 @@ CMD_ID = "0f9b2c1a-5b7e-4c1d-9e2f-3a4b5c6d7e8f"
 SESSION = "epoch-abc.1752000000.deadbeefsig"
 HEADERS = {"X-CSRF-Token": "test-csrf", "Origin": "http://testserver",
            "Host": "testserver"}
+LIVE_FLAGS = CommandFlags(True, True, "U1234567", 25000.0)
 
 
 class FakeGateway:
@@ -409,3 +410,164 @@ def test_create_app_survives_commands_enabled_with_missing_hmac_key(monkeypatch)
     with TestClient(app) as client:  # lifespan startup must not raise either
         assert client.get("/healthz").status_code == 200
         assert client.get("/readyz").status_code == 200
+
+
+# ---------------------------------------------------------------------------
+# [M1-C] Task 4 -- approve, reject, preflight, and the live confirmation
+# ceremony.
+#
+# Source-vs-brief drift: `session.py` ([M1-R], out of scope for this task)
+# has no `DashboardSession` dataclass -- the session identity threaded
+# through every route in this module (including these new ones) is the raw
+# signed cookie `str` `require_session`/`require_command_auth` already
+# return (see the module docstring's drift item 1). `session_fingerprint`
+# is therefore `session_fingerprint(session: str) -> str`, added to
+# `session.py` as a plain module-level function keyed by a process-local
+# secret (the exact same pattern Task 3 already established for
+# `session_csrf_token` in this file) rather than the brief's hypothetical
+# `_session_secret()` accessor for a `DashboardSession.session_id`/`.epoch`
+# pair that doesn't exist in the landed session module.
+# ---------------------------------------------------------------------------
+
+def test_paper_approve_is_single_post_with_expected_version(gateway):
+    client = make_client(gateway)
+    r = client.post("/api/commands/proposals/7/approve",
+                    json={"command_id": CMD_ID, "expected_version": 3},
+                    headers=HEADERS)
+    assert r.status_code == 202
+    method, body = gateway.calls[0]
+    assert method == "approve_proposal"
+    assert body == {"command_id": CMD_ID, "proposal_id": 7,
+                    "expected_version": 3, "preflight_nonce": None,
+                    "session_fingerprint": body["session_fingerprint"]}
+    assert body["session_fingerprint"]  # opaque, non-empty
+
+
+def test_live_approve_forwards_nonce_with_same_command_id(gateway):
+    client = make_client(gateway, flags=LIVE_FLAGS)
+    r = client.post("/api/commands/proposals/7/approve",
+                    json={"command_id": CMD_ID, "expected_version": 3,
+                          "preflight_nonce": "n-1"},
+                    headers=HEADERS)
+    assert r.status_code == 202
+    assert gateway.calls[0][1]["preflight_nonce"] == "n-1"
+    assert gateway.calls[0][1]["command_id"] == CMD_ID
+
+
+def test_reject_is_immediate_without_expected_version(gateway):
+    client = make_client(gateway)
+    r = client.post("/api/commands/proposals/7/reject",
+                    json={"command_id": CMD_ID, "reason": "changed thesis"},
+                    headers=HEADERS)
+    assert r.status_code == 202
+    method, body = gateway.calls[0]
+    assert method == "reject_proposal"
+    assert body == {"command_id": CMD_ID, "proposal_id": 7,
+                    "reason": "changed thesis"}
+
+
+def test_preflight_requires_live_commands_enabled(gateway):
+    client = make_client(gateway)  # paper-only flags
+    r = client.post("/api/preflight",
+                    json={"command_id": CMD_ID, "action": "approve_proposal",
+                          "params": {"proposal_id": 7}, "expected_version": 3},
+                    headers=HEADERS)
+    assert r.status_code == 403
+    assert r.json()["code"] == "LIVE_COMMANDS_DISABLED"
+    assert gateway.calls == []
+
+
+def test_preflight_returns_ticket_bound_to_session(gateway):
+    gateway.ticket = PreflightTicket(
+        CMD_ID, "n-9", "2026-07-15T13:42:47Z",
+        {"side": "BUY", "instrument": "AAPL", "quantity": 10,
+         "notional": 2350.0, "order_type": "MARKET", "latest_price": 235.0,
+         "drift_bps": 12.0, "warnings": ["quote is 4s old"],
+         "account_id": "U1234567", "account_mode": "live"})
+    client = make_client(gateway, flags=LIVE_FLAGS)
+    r = client.post("/api/preflight",
+                    json={"command_id": CMD_ID, "action": "approve_proposal",
+                          "params": {"proposal_id": 7}, "expected_version": 3},
+                    headers=HEADERS)
+    assert r.status_code == 200
+    assert r.json()["nonce"] == "n-9"
+    assert r.json()["summary"]["drift_bps"] == 12.0
+    sent = gateway.calls[0][1]
+    assert sent["session_fingerprint"]
+    assert sent["action"] == "approve_proposal"
+
+
+def test_expired_preflight_maps_to_410(gateway):
+    gateway.error = GatewayError("PREFLIGHT_EXPIRED", "nonce expired after 30s",
+                                 retryable=True, correlation_id=CMD_ID)
+    client = make_client(gateway, flags=LIVE_FLAGS)
+    r = client.post("/api/commands/proposals/7/approve",
+                    json={"command_id": CMD_ID, "expected_version": 3,
+                          "preflight_nonce": "n-old"},
+                    headers=HEADERS)
+    assert r.status_code == 410
+    assert r.json()["retryable"] is True
+
+
+def test_session_fingerprint_is_stable_and_session_bound(gateway):
+    """Direct unit coverage of the derived value itself: same session ->
+    same fingerprint (so the trader can bind a nonce across the preflight ->
+    approve ceremony), different sessions -> different fingerprints, and the
+    fingerprint never IS the raw session string it was derived from."""
+    from web.command_center.session import session_fingerprint
+
+    fp1 = session_fingerprint(SESSION)
+    fp2 = session_fingerprint(SESSION)
+    assert fp1 == fp2
+    assert fp1 != SESSION
+    assert fp1 != session_fingerprint("epoch-abc.1752000001.otherSig")
+
+
+def test_live_targeted_approve_without_live_commands_enabled_is_403(gateway):
+    """[M1-C] Task 4 (I-2, deferred from the T3 review): approve EXECUTES a
+    real order, unlike create_proposal/close_position (gated on
+    `commands_enabled` only). A `preflight_nonce` on the wire only ever
+    appears once the browser has completed the live ceremony
+    (`ccIsLive(proposal.account_mode)` decides whether to run it in
+    command_center.js) -- so its presence here is the signal that this
+    approval targets the live account. A live-targeted approval must be
+    refused with the same 403 LIVE_COMMANDS_DISABLED code `/api/preflight`
+    already uses when this dashboard isn't configured for live commands,
+    and must never reach the gateway."""
+    client = make_client(gateway)  # paper-only (default) flags
+    r = client.post("/api/commands/proposals/7/approve",
+                    json={"command_id": CMD_ID, "expected_version": 3,
+                          "preflight_nonce": "n-1"},
+                    headers=HEADERS)
+    assert r.status_code == 403
+    assert r.json()["code"] == "LIVE_COMMANDS_DISABLED"
+    assert gateway.calls == []
+
+
+def test_preflight_action_rejects_unknown_action(gateway):
+    client = make_client(gateway, flags=LIVE_FLAGS)
+    r = client.post("/api/preflight",
+                    json={"command_id": CMD_ID, "action": "delete_everything",
+                          "params": {}, "expected_version": None},
+                    headers=HEADERS)
+    assert r.status_code == 422
+    assert gateway.calls == []
+
+
+def test_approve_reject_preflight_require_csrf_and_origin(gateway):
+    bad_headers = dict(HEADERS)
+    bad_headers.pop("X-CSRF-Token")
+    for method, url, body in [
+        ("post", "/api/commands/proposals/7/approve",
+         {"command_id": CMD_ID, "expected_version": 3}),
+        ("post", "/api/commands/proposals/7/reject",
+         {"command_id": CMD_ID, "reason": ""}),
+        ("post", "/api/preflight",
+         {"command_id": CMD_ID, "action": "approve_proposal",
+          "params": {"proposal_id": 7}, "expected_version": 3}),
+    ]:
+        client = make_client(gateway, flags=LIVE_FLAGS)
+        r = getattr(client, method)(url, json=body, headers=bad_headers)
+        assert r.status_code == 403
+        assert r.json()["code"] == "CSRF_REJECTED"
+    assert gateway.calls == []

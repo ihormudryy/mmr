@@ -671,5 +671,137 @@ document.getElementById('cc-close-form').addEventListener('submit',
           body);
     });
 
+/* ===================== [M1-C] Task 4: approve / reject / preflight ======
+ * Live two-stage ceremony (spec 9.1): one command_id minted BEFORE
+ * preflight, reused across the confirmation drawer and any retry -- the
+ * gateway/coordinator dedupes on it. `/api/preflight` is a same-origin GET
+ * of a summary, never treated as an approval itself; the drawer below
+ * repeats that authoritative summary so the human confirms what will
+ * actually transmit, not what the browser assumed. The approve POST itself
+ * is still 202-received-only, exactly like every other command in this
+ * file -- the outcome resolves from `command.updated` via
+ * ccCheckPendingCommands, never from this response.
+ *
+ * Wiring note: these functions are exposed per this task's interface (a
+ * proposal-row "Approve"/"Reject" control triggering them) but are not
+ * themselves wired into `renderProposals()`/`showProposalDrawer()` here --
+ * same deferred-wiring boundary `ccOpenCloseDrawer` already documents above
+ * ("invoked ... once a later task wires that control into the positions
+ * table"): the M1-R proposal-card rendering is out of this task's scope to
+ * restructure. */
+
+function ccIsLive(accountMode) {
+  return String(accountMode || '').toLowerCase() === 'live';
+}
+
+async function ccRequestPreflight(commandId, action, params, expectedVersion) {
+  const result = await ccPost('/api/preflight', {
+    command_id: commandId, action, params,
+    expected_version: expectedVersion,
+  }, {okStatus: 200});
+  if (!result.ok) {
+    ccToast('error',
+            `Preflight failed: ${result.error.message} (${result.error.code})`);
+    return null;
+  }
+  return result.data;  // {command_id, nonce, expires_at, summary}
+}
+
+function ccOpenConfirmDrawer(ticket, onConfirm, onExpired) {
+  const d = document.getElementById('cc-confirm-drawer');
+  const s = ticket.summary;
+  const set = (name, value) => {
+    d.querySelector(`[data-field=${name}]`).textContent =
+        value === null || value === undefined ? '—' : String(value);
+  };
+  set('side', s.side);
+  set('instrument', s.instrument);
+  set('quantity', s.quantity);
+  set('notional', s.notional);
+  set('order_type', s.order_type);
+  set('latest_price', s.latest_price);
+  set('drift_bps', s.drift_bps);
+  set('account', `${s.account_id} (${String(s.account_mode).toUpperCase()})`);
+  const warnings = d.querySelector('[data-field=warnings]');
+  warnings.replaceChildren(...(s.warnings || []).map((w) => {
+    const li = document.createElement('li');
+    li.textContent = w;
+    return li;
+  }));
+
+  const confirmBtn = d.querySelector('#cc-confirm-button');
+  const countdown = d.querySelector('#cc-confirm-countdown');
+  confirmBtn.disabled = false;
+  const expiresAt = Date.parse(ticket.expires_at);
+  const timer = setInterval(() => {
+    const left = Math.max(0, Math.round((expiresAt - Date.now()) / 1000));
+    countdown.textContent = `${left}s`;
+    if (left <= 0) {
+      clearInterval(timer);
+      confirmBtn.disabled = true;
+      countdown.textContent = 'Preflight expired — re-run to confirm';
+      if (onExpired) onExpired();
+    }
+  }, 250);
+
+  confirmBtn.onclick = () => {
+    clearInterval(timer);
+    d.hidden = true;
+    onConfirm(ticket.nonce);
+  };
+  d.querySelector('#cc-confirm-cancel').onclick = () => {
+    clearInterval(timer);
+    d.hidden = true;
+  };
+  d.hidden = false;
+}
+
+async function ccRunLiveCeremony(kind, label, action, params,
+                                 expectedVersion, submit) {
+  if (!ccRequireAvailable(kind)) return;
+  const commandId = ccNewCommandId();  // reused across retries
+  const run = async () => {
+    const ticket = await ccRequestPreflight(commandId, action, params,
+                                            expectedVersion);
+    if (!ticket) return;
+    ccOpenConfirmDrawer(ticket,
+        (nonce) => submit(commandId, nonce),
+        () => ccToast('warn', `${label}: preflight expired — reopen to retry`));
+  };
+  await run();
+}
+
+/* ---- Proposal approve / reject actions (spec 9.2) ---- */
+
+async function ccApproveProposal(proposal) {
+  const expectedVersion = proposal.entity_revision;
+  const url = `/api/commands/proposals/${proposal.id}/approve`;
+  if (!ccIsLive(proposal.account_mode)) {
+    await ccSubmitCommand('approve_proposal', `Approve #${proposal.id}`, url, {
+      command_id: ccNewCommandId(),
+      expected_version: expectedVersion,
+      preflight_nonce: null,
+    });
+    return;
+  }
+  await ccRunLiveCeremony('approve_proposal', `Approve #${proposal.id}`,
+      'approve_proposal', {proposal_id: proposal.id}, expectedVersion,
+      (commandId, nonce) => ccSubmitCommand('approve_proposal',
+          `Approve #${proposal.id}`, url, {
+            command_id: commandId,
+            expected_version: expectedVersion,
+            preflight_nonce: nonce,
+          }));
+}
+
+async function ccRejectProposal(proposal) {
+  // Immediate, idempotent, risk-reducing in both modes.
+  await ccSubmitCommand('reject_proposal', `Reject #${proposal.id}`,
+      `/api/commands/proposals/${proposal.id}/reject`, {
+        command_id: ccNewCommandId(),
+        reason: '',
+      });
+}
+
 /* ---------------- boot ----------------------------------------------------- */
 resync();

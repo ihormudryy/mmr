@@ -70,6 +70,7 @@ raises ``ValueError`` otherwise) because ``encode_order_ref`` builds
 from __future__ import annotations
 
 import datetime as dt
+import itertools
 import json
 from dataclasses import dataclass, field, replace
 from enum import Enum
@@ -126,6 +127,20 @@ COMMAND_STATES = (
 _TERMINAL_STATES = frozenset({"RESOLVED", "REJECTED"})
 
 RETENTION = dt.timedelta(days=30)
+
+# [M1-F3] Task 9 (spec §9.5, verbatim): the reconciliation attempt schedule for
+# an ``OUTCOME_UNKNOWN`` command -- fire immediately, then every 5 s for the
+# first minute, then every 30 s for the next 14 minutes. The cumulative sum is
+# exactly the 15-minute critical-alert boundary; after the table is exhausted a
+# command is NEVER converted to failure by time alone -- it stays registered at
+# the periodic 30-second session-reconciliation cadence and keeps blocking
+# same-target commands (``COMMAND_IN_FLIGHT``) until it is actually resolved.
+RECONCILE_DELAYS: tuple[float, ...] = (0.0,) + (5.0,) * 12 + (30.0,) * 28
+CRITICAL_AFTER_SECONDS = 900.0
+
+# Cumulative offset (seconds from ``started``) of each scheduled attempt:
+# _RECONCILE_OFFSETS[i] == sum(RECONCILE_DELAYS[: i + 1]).
+_RECONCILE_OFFSETS: tuple[float, ...] = tuple(itertools.accumulate(RECONCILE_DELAYS))
 
 # The sequence is created BEFORE the table that consumes it (binding).
 _COMMAND_LEDGER_STATEMENTS = (
@@ -317,10 +332,35 @@ class OrderDispatchPort(Protocol):
 class ReconcilerPort(Protocol):
     """Schedules an ambiguous (``OUTCOME_UNKNOWN``) command for reconciliation.
 
-    The real ``OutcomeReconciler`` is Task 9; Task 5 only defines the port.
+    Implemented by Task 9's ``OutcomeReconciler``. The sagas (approval/cancel/
+    strategy) call ``schedule`` on their inline ``OUTCOME_UNKNOWN`` branch;
+    ``TradingCommandCoordinator`` calls it on the generic saga-exception
+    fallback so EVERY wedge is registered for reconciliation (RJ2 addendum §2).
     """
 
     def schedule(self, command_id: str, now: dt.datetime) -> None: ...
+
+
+@dataclass(frozen=True)
+class ReconcileResult:
+    """One reconciliation attempt's outcome (Task 9).
+
+    ``resolved`` is True once the command reaches a terminal ``RESOLVED`` (or is
+    already terminal/gone). ``critical`` is True once an unresolved command has
+    passed the 15-minute boundary and a ``CriticalAlertPort`` alert has fired --
+    an unresolved command is NEVER converted to failure by time alone.
+    """
+
+    command_id: str
+    resolved: bool
+    critical: bool
+
+
+class CriticalAlertPort(Protocol):
+    """Escalation seam for a command still unresolved after
+    ``CRITICAL_AFTER_SECONDS`` (consumed by ``[M1-R]`` health rendering)."""
+
+    def raise_alert(self, command_id: str, detail: str) -> None: ...
 
 
 class BrokerHealthPort(Protocol):
@@ -636,6 +676,21 @@ class CommandLedger:
         ).fetchall()
         return [_row_to_ledger_row(row) for row in rows]
 
+    def reconcilable(self) -> list[LedgerRow]:
+        """Every in-flight command a coordinator restart must requeue for
+        reconciliation (Task 9 ``rescan_on_startup``, spec §9.5).
+
+        A row is reconcilable iff it has committed a dispatch-or-ambiguity
+        transition -- ``SUBMITTING`` (claimed, dispatch may or may not have
+        reached the broker: the classic crash-between-claim-and-ack window) or
+        ``OUTCOME_UNKNOWN`` (a persisted ambiguous outcome). ``RECEIVED``/
+        ``VALIDATED`` never dispatched, and the terminal states are done."""
+        rows = self._journal.connect().execute(
+            f"{self._SELECT} WHERE state IN ('SUBMITTING', 'OUTCOME_UNKNOWN') "
+            "ORDER BY created_at",
+        ).fetchall()
+        return [_row_to_ledger_row(row) for row in rows]
+
     def purge_expired(self, now: dt.datetime) -> int:
         """Delete terminal (``RESOLVED``/``REJECTED``) rows older than the
         30-day retention floor. ``OUTCOME_UNKNOWN`` (and every other
@@ -675,6 +730,7 @@ class CommandLedger:
         target_id: str = "1",
         expected_version: Optional[int] = None,
         source: str = "test",
+        outcome: Optional[dict[str, Any]] = None,
     ) -> LedgerRow:
         conn = self._journal.connect()
         row = conn.execute(
@@ -683,11 +739,11 @@ class CommandLedger:
                 command_id, request_hash, account_id, action, target_type,
                 target_id, expected_version, state, outcome, error_code,
                 source, created_at, updated_at
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, NULL, NULL, ?, ?, ?)
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, ?, ?, ?)
             RETURNING """ + ", ".join(_LEDGER_COLUMNS),
             [
                 command_id, request_hash, account_id, action, target_type,
-                target_id, expected_version, state, source,
+                target_id, expected_version, state, outcome, source,
                 _as_utc(created_at) if created_at is not None else _as_utc(updated_at),
                 _as_utc(updated_at),
             ],
@@ -773,12 +829,21 @@ class TradingCommandCoordinator:
         audit: Any,
         nonces: PreflightNonceGate,
         now: Callable[[], dt.datetime] = _utcnow,
+        reconciler: Optional[ReconcilerPort] = None,
     ):
         self._journal = journal
         self._ledger = ledger
         self._audit = audit
         self._nonces = nonces
         self._now = now
+        # [M1-F3] Task 9 (RJ2 addendum §2): optional reconciliation hook. When
+        # set, EVERY command the coordinator parks at OUTCOME_UNKNOWN via its
+        # own fallback (a non-saga handler bug, or a saga that raised before
+        # reaching its own inline DISPATCH_AMBIGUOUS schedule) is scheduled for
+        # reconciliation here -- so a wedge is revisited in-process, not only
+        # after a restart's rescan_on_startup. Default None/no-op keeps every
+        # existing coordinator test (built without a reconciler) unchanged.
+        self._reconciler = reconciler
         self._actions: dict[str, _ActionRegistration] = {}
 
     def register_action(
@@ -924,16 +989,22 @@ class TradingCommandCoordinator:
                 # RECEIVED (which would CAS-miss and wedge the command).
                 self._fallback_outcome_unknown(request)
             else:
+                parked = False
                 try:
                     self._transition(
                         request, "RECEIVED", "OUTCOME_UNKNOWN", error_code="INTERNAL_ERROR",
                     )
+                    parked = True
                 except Exception:
                     # The ledger write itself failed too (e.g. the DB is
                     # genuinely down). Do not let that mask the original
                     # exception -- the caller must still see what actually
                     # went wrong, not a secondary bookkeeping failure.
                     pass
+                if parked:
+                    # RJ2 §2: schedule the wedge so it is reconciled in-process,
+                    # not only after a restart.
+                    self._schedule_reconcile(request.command_id)
             raise
 
         if registration.saga:
@@ -980,6 +1051,7 @@ class TradingCommandCoordinator:
         state is left untouched, and any secondary ledger-write failure is
         swallowed so it never masks the original exception being re-raised.
         """
+        parked = False
         try:
             current = self._ledger.get(request.command_id)
             if current is None or current.state in _TERMINAL_STATES or current.state == "OUTCOME_UNKNOWN":
@@ -987,6 +1059,28 @@ class TradingCommandCoordinator:
             self._transition(
                 request, current.state, "OUTCOME_UNKNOWN", error_code="INTERNAL_ERROR",
             )
+            parked = True
+        except Exception:
+            pass
+        if parked:
+            # RJ2 §2: a fallback-parked wedge must be scheduled for
+            # reconciliation just like the sagas' own inline OUTCOME_UNKNOWN
+            # branch does -- otherwise it would rely on a restart's
+            # rescan_on_startup to ever be revisited.
+            self._schedule_reconcile(request.command_id)
+
+    def _schedule_reconcile(self, command_id: str) -> None:
+        """Register ``command_id`` for reconciliation via the optional hook.
+
+        No-op (and swallow any hook error) when no reconciler is wired or the
+        hook itself raises: scheduling is a best-effort convenience on top of
+        the durable ledger row, which ``rescan_on_startup`` will always
+        requeue regardless -- a hook failure must never mask the original
+        exception being re-raised by the caller."""
+        if self._reconciler is None:
+            return
+        try:
+            self._reconciler.schedule(command_id, self._as_utc(self._now()))
         except Exception:
             pass
 
@@ -2157,6 +2251,336 @@ class StrategyControlCommandService:
         return CommandReceipt(
             command_id=command_id, correlation_id=command_id, state=state,
             outcome=outcome, error_code=error_code, retryable=retryable,
+        )
+
+    def _now_utc(self) -> dt.datetime:
+        return _as_utc(self._now())
+
+
+# ---------------------------------------------------------------------------
+# [M1-F3] Task 9: OUTCOME_UNKNOWN reconciliation.
+#
+# The reconciler is the ONLY component that resolves an ambiguous real-money
+# dispatch. It NEVER re-submits or re-cancels anything: it reads the
+# authoritative broker view ([M1-F2]'s materialized ``broker_orders`` via
+# ``OrderDispatchPort.find_by_order_ref`` / ``enumeration_complete``) and
+# strategy_service's committed receipt (``StrategyControlPort.get_receipt``),
+# and either RESOLVES the command (recording submission evidence on the
+# proposal) or -- only with a fenced, COMPLETE broker enumeration proving the
+# order never reached the broker -- records a clean never-submitted failure.
+# A command it cannot resolve is NEVER converted to failure by time alone;
+# past the 15-minute boundary it raises a single critical operator alert and
+# stays OUTCOME_UNKNOWN, continuing to block same-target commands.
+# ---------------------------------------------------------------------------
+
+
+@dataclass
+class _ReconcilePlan:
+    """In-memory schedule state for one command under reconciliation."""
+
+    command_id: str
+    started: dt.datetime
+    next_due: dt.datetime
+    attempt: int = 0
+    alerted: bool = False
+
+
+class OutcomeReconciler:
+    """Resolves ``SUBMITTING``/``OUTCOME_UNKNOWN`` commands against authority.
+
+    Ports (all fakeable; production wiring is the coordinated integration
+    step, not T9-core):
+    - ``orders``: ``OrderDispatchPort`` -- ``find_by_order_ref`` /
+      ``enumeration_complete`` only (submit/cancel are NEVER called).
+    - ``strategy``: ``StrategyControlPort`` -- ``get_receipt`` only.
+    - ``alerts``: ``CriticalAlertPort`` -- raised once past 15 minutes.
+    - ``repo``: ``ProposalRepository`` -- marks a proposal EXECUTED/FAILED as
+      submission evidence, in the SAME journaled transaction as the command
+      transition. Optional (a cancel target carries no proposal).
+    """
+
+    def __init__(
+        self,
+        *,
+        journal: DomainJournal,
+        ledger: CommandLedger,
+        orders: OrderDispatchPort,
+        strategy: StrategyControlPort,
+        alerts: CriticalAlertPort,
+        repo: Optional[ProposalRepository] = None,
+        now: Callable[[], dt.datetime] = _utcnow,
+    ):
+        self._journal = journal
+        self._ledger = ledger
+        self._orders = orders
+        self._strategy = strategy
+        self._alerts = alerts
+        self._repo = repo
+        self._now = now
+        self._plans: dict[str, _ReconcilePlan] = {}
+
+    # -- scheduling --------------------------------------------------------
+
+    def schedule(self, command_id: str, now: dt.datetime) -> None:
+        """Register (idempotently) a command for reconciliation.
+
+        The first attempt is due immediately (``RECONCILE_DELAYS[0] == 0``). A
+        re-schedule of an already-tracked command is a no-op -- it must not
+        reset the clock and thereby postpone the 15-minute critical boundary.
+        """
+        if command_id in self._plans:
+            return
+        started = _as_utc(now)
+        self._plans[command_id] = _ReconcilePlan(
+            command_id=command_id, started=started, next_due=started,
+        )
+
+    def run_due(self, now: dt.datetime) -> list[ReconcileResult]:
+        """Reconcile every command whose next attempt is due at ``now``.
+
+        Walks ``RECONCILE_DELAYS`` cumulatively (attempts at 0 s, 5-60 s, then
+        90-900 s). After the table is exhausted the plan stays registered at
+        the periodic 30-second session-reconciliation cadence -- a command is
+        never dropped or failed by time alone.
+        """
+        now = _as_utc(now)
+        results: list[ReconcileResult] = []
+        for command_id in list(self._plans.keys()):
+            plan = self._plans.get(command_id)
+            if plan is None or plan.next_due > now:
+                continue
+            results.append(self.reconcile_once(command_id, now))
+            plan = self._plans.get(command_id)
+            if plan is None:
+                continue  # resolved (or gone) -- reconcile_once dropped it
+            plan.attempt += 1
+            if plan.attempt < len(RECONCILE_DELAYS):
+                plan.next_due = plan.started + dt.timedelta(
+                    seconds=_RECONCILE_OFFSETS[plan.attempt]
+                )
+            else:
+                plan.next_due = now + dt.timedelta(seconds=30.0)
+        return results
+
+    def rescan_on_startup(self) -> list[str]:
+        """Requeue every in-flight ledger row (coordinator crash recovery,
+        spec §9.5). Covers the crash-between-claim-and-ack window a live
+        ``schedule`` call could never have reached."""
+        requeued: list[str] = []
+        for row in self._ledger.reconcilable():
+            self.schedule(row.command_id, self._now_utc())
+            requeued.append(row.command_id)
+        return requeued
+
+    # -- one reconciliation attempt ----------------------------------------
+
+    def reconcile_once(self, command_id: str, now: dt.datetime) -> ReconcileResult:
+        now = _as_utc(now)
+        row = self._ledger.get(command_id)
+        if row is None or row.state not in ("SUBMITTING", "OUTCOME_UNKNOWN"):
+            # Already terminal (or gone) -- drop it and report resolved.
+            self._plans.pop(command_id, None)
+            return ReconcileResult(command_id, resolved=True, critical=False)
+
+        # RJ2 addendum §1: the REAL approve saga stamps target_type="proposal"
+        # (the primary real-order-dispatch case); cancel stamps "order". BOTH
+        # resolve via the og-{command_id} order-ref lookup -- an approve that
+        # is found marks its proposal EXECUTED; a proven-absent one marks it
+        # FAILED. A cancel carries no proposal, so nothing is marked.
+        if row.target_type in ("proposal", "order"):
+            order_ref = encode_order_ref(f"og-{command_id}")
+            found = self._orders.find_by_order_ref(row.account_id, order_ref)
+            if found:
+                self._resolve_order(row, found, now)
+                return ReconcileResult(command_id, True, False)
+            if self._orders.enumeration_complete():
+                self._resolve_never_submitted(row, now)
+                return ReconcileResult(command_id, True, False)
+        elif row.target_type == "strategy":
+            receipt = self._strategy.get_receipt(command_id)  # root command_id lookup
+            if receipt is not None and receipt.state in ("COMMITTED", "ROLLED_BACK"):
+                self._resolve_strategy(row, receipt, now)
+                return ReconcileResult(command_id, True, False)
+
+        # Unresolved: escalate to a critical alert once past the boundary, but
+        # NEVER convert to failure by time alone.
+        plan = self._plans.get(command_id)
+        if plan is None:
+            plan = _ReconcilePlan(command_id=command_id, started=now, next_due=now)
+            self._plans[command_id] = plan
+        if (now - plan.started).total_seconds() >= CRITICAL_AFTER_SECONDS and not plan.alerted:
+            plan.alerted = True
+            self._alerts.raise_alert(
+                command_id,
+                f"{row.action} unresolved after 15 minutes -- "
+                f"operator reconciliation required",
+            )
+        return ReconcileResult(command_id, False, plan.alerted)
+
+    # -- resolution transitions --------------------------------------------
+
+    def _resolve_order(self, row: LedgerRow, found: list, now: dt.datetime) -> None:
+        """OUTCOME_UNKNOWN/SUBMITTING -> RESOLVED with the found broker aliases;
+        marks the associated proposal EXECUTED (submission evidence) in the same
+        journaled transaction."""
+        order_ids = self._collect_order_ids(found)
+        outcome = {"order_ids": order_ids, "order_group_id": f"og-{row.command_id}"}
+        proposal_id = self._associated_proposal_id(row)
+
+        def work(conn: duckdb.DuckDBPyConnection, append) -> None:
+            self._mark_proposal(
+                conn, append, row, proposal_id, "EXECUTED", order_ids=order_ids, now=now,
+            )
+            self._ledger.transition_in_tx(
+                conn, row.command_id, row.state, "RESOLVED", outcome=outcome, now=now,
+            )
+            append(
+                self._command_mutation(row, "RESOLVED", now, outcome=outcome),
+                _noop_write, f"command:{row.command_id}:resolved",
+            )
+
+        self._journal.mutate_batch_work(self._journal.connect(), work)
+        self._plans.pop(row.command_id, None)
+
+    def _resolve_never_submitted(self, row: LedgerRow, now: dt.datetime) -> None:
+        """Requires a fenced, COMPLETE broker enumeration ([M1-F2]) proving the
+        order never reached the broker before recording ``{"submitted": False}``
+        and failing the proposal cleanly -- NEVER a blind resubmission."""
+        outcome = {"submitted": False}
+        proposal_id = self._associated_proposal_id(row)
+
+        def work(conn: duckdb.DuckDBPyConnection, append) -> None:
+            self._mark_proposal(conn, append, row, proposal_id, "FAILED", now=now)
+            self._ledger.transition_in_tx(
+                conn, row.command_id, row.state, "RESOLVED", outcome=outcome, now=now,
+            )
+            append(
+                self._command_mutation(row, "RESOLVED", now, outcome=outcome),
+                _noop_write, f"command:{row.command_id}:resolved",
+            )
+
+        self._journal.mutate_batch_work(self._journal.connect(), work)
+        self._plans.pop(row.command_id, None)
+
+    def _resolve_strategy(self, row: LedgerRow, receipt, now: dt.datetime) -> None:
+        """Journals the acknowledged ``strategy.updated`` (Task 7 contract) and
+        the command outcome together. A reconcile-scoped ``event_id`` keeps this
+        idempotent against ``acknowledge_state``'s own state-revision events."""
+        payload = {
+            "strategy_name": receipt.strategy_name,
+            "action": receipt.action,
+            "strategy_state": receipt.state,
+            "control_revision": receipt.control_revision,
+            "state_revision": receipt.state_revision,
+            "error": receipt.error,
+        }
+        outcome = dict(payload)
+
+        def work(conn: duckdb.DuckDBPyConnection, append) -> None:
+            append(
+                DomainMutation(
+                    event_type="strategy.updated",
+                    entity_type="strategy",
+                    entity_id=receipt.strategy_name,
+                    operation="upsert",
+                    account_id=row.account_id,
+                    source="trader_service",
+                    source_timestamp=now,
+                    correlation_id=row.command_id,
+                    payload=payload,
+                ),
+                _noop_write,
+                f"strategy:{receipt.strategy_name}:reconcile:{row.command_id}",
+            )
+            self._ledger.transition_in_tx(
+                conn, row.command_id, row.state, "RESOLVED", outcome=outcome, now=now,
+            )
+            append(
+                self._command_mutation(row, "RESOLVED", now, outcome=outcome),
+                _noop_write, f"command:{row.command_id}:resolved",
+            )
+
+        self._journal.mutate_batch_work(self._journal.connect(), work)
+        self._plans.pop(row.command_id, None)
+
+    # -- helpers -----------------------------------------------------------
+
+    def _mark_proposal(
+        self, conn, append, row: LedgerRow, proposal_id: Optional[int],
+        target_status: str, *, order_ids: Optional[list[int]] = None, now: dt.datetime,
+    ) -> None:
+        """Flip the associated proposal to EXECUTED/FAILED (submission evidence)
+        inside the caller's transaction, appending its ``proposal.updated``
+        event. A no-op when there is no associated proposal (e.g. a cancel), or
+        when it is no longer APPROVED (already resolved by another path)."""
+        if proposal_id is None or self._repo is None:
+            return
+        record = self._repo.get(proposal_id)
+        if record is None or record.status != "APPROVED":
+            return
+        if target_status == "EXECUTED":
+            prow = self._repo.mark_order_submitted_in_tx(
+                conn, proposal_id, order_ids or [], record.revision, now,
+            )
+        else:
+            prow = self._repo.mark_failed_in_tx(
+                conn, proposal_id, "reconciled: order never submitted", record.revision, now,
+            )
+        if prow is not None:
+            append(
+                self._repo.mutation_for(prow, row.command_id),
+                _assert_proposal_revision(prow.revision),
+                f"proposal:{proposal_id}:{prow.revision}",
+            )
+
+    @staticmethod
+    def _associated_proposal_id(row: LedgerRow) -> Optional[int]:
+        """The proposal a command's reconciliation should mark, or None.
+
+        The approve saga's target_type is "proposal" with the proposal id in
+        ``target_id`` (production-faithful). A recorded ``outcome.proposal_id``
+        (the plan's order-target test path) takes precedence. A cancel
+        (target_type="order", a broker-order entity id) has neither -> None."""
+        if row.outcome and row.outcome.get("proposal_id") is not None:
+            return int(row.outcome["proposal_id"])
+        if row.target_type == "proposal" and row.target_id:
+            try:
+                return int(row.target_id)
+            except (TypeError, ValueError):
+                return None
+        return None
+
+    @staticmethod
+    def _collect_order_ids(found: list) -> list[int]:
+        ids: list[int] = []
+        for item in found:
+            item_ids = getattr(item, "order_ids", None)
+            if item_ids:
+                ids.extend(item_ids)
+        return ids
+
+    @staticmethod
+    def _command_mutation(
+        row: LedgerRow, to_state: str, now: dt.datetime, *,
+        outcome: Optional[dict[str, Any]] = None, error_code: Optional[str] = None,
+    ) -> DomainMutation:
+        return DomainMutation(
+            event_type="command.updated",
+            entity_type="command",
+            entity_id=command_entity_id(row.command_id),
+            operation="upsert",
+            account_id=row.account_id,
+            source="trader_service",
+            source_timestamp=now,
+            correlation_id=row.command_id,
+            payload={
+                "state": to_state,
+                "action": row.action,
+                "target_type": row.target_type,
+                "target_id": row.target_id,
+                "outcome": outcome,
+                "error_code": error_code,
+            },
         )
 
     def _now_utc(self) -> dt.datetime:

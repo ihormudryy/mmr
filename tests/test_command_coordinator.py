@@ -14,15 +14,27 @@ from trader.data.schema_migrations import SchemaMigrator
 from trader.messaging.production_api import RejectProposalRequest, build_production_registry
 from trader.messaging.typed_rpc import HmacServiceAuthenticator
 from trader.trading.command_coordinator import (
+    ApprovalCommandService,
+    BrokerRejectedError,
+    CommandAudit,
     CommandLedger,
     CommandRequest,
     CommandValidationError,
+    CRITICAL_AFTER_SECONDS,
     IllegalCommandTransition,
+    OutcomeReconciler,
+    RECONCILE_DELAYS,
+    ReconcileResult,
+    SubmittedOrders,
     TradingCommandCoordinator,
     apply_command_ledger_migration,
     canonical_request_hash,
 )
+from trader.data.proposal_repository import ProposalDraft
+from trader.strategy.strategy_revisions import StrategyCommandReceipt
+from trader.trading.order_correlation import encode_order_ref
 from trader.trading.proposal_command_service import ExecutableQuote, ProposalCommandService
+from trader.trading.trading_control import TradingControlStore, apply_trading_control_migration
 
 UTC = dt.timezone.utc
 NOW = dt.datetime(2026, 7, 16, 14, 0, tzinfo=UTC)
@@ -572,3 +584,456 @@ class TestConcurrentClaimRace:
         assert all(r.state in ("RECEIVED", "RESOLVED") for r in results)
         row = ledger.get("race-3")
         assert row is not None and row.state == "RESOLVED"
+
+
+# ---------------------------------------------------------------------------
+# [M1-F3] Task 9 -- OUTCOME_UNKNOWN reconciliation schedule + resolution.
+#
+# The reconciler is driven directly (reconcile_once / run_due / rescan) against
+# a REAL journal/repo/ledger with FAKE broker/strategy/alert ports -- the same
+# fake-port shape the approval/cancel sagas use.
+# ---------------------------------------------------------------------------
+
+
+class FakeReconcilerOrders:
+    """Test double for ``OrderDispatchPort`` on the reconciliation read path.
+
+    Records nothing on submit/cancel (the reconciler must NEVER dispatch);
+    only the read seams (``find_by_order_ref`` / ``enumeration_complete``)
+    return meaningful data.
+    """
+
+    def __init__(self):
+        self._by_ref: dict[str, list] = {}
+        self.enumeration_ok = False
+        self.submissions: list = []
+
+    def add_broker_order(self, *, order_ref, status, order_ids):
+        self._by_ref.setdefault(order_ref, []).append(
+            SimpleNamespace(order_ref=order_ref, status=status, order_ids=list(order_ids))
+        )
+
+    def find_by_order_ref(self, account_id, order_ref):
+        return list(self._by_ref.get(order_ref, []))
+
+    def enumeration_complete(self):
+        return self.enumeration_ok
+
+    def submit(self, *a, **k):  # pragma: no cover - reconciler never dispatches
+        raise AssertionError("reconciler must never re-submit an order")
+
+    def cancel(self, *a, **k):  # pragma: no cover - reconciler never dispatches
+        raise AssertionError("reconciler must never re-cancel an order")
+
+
+class FakeStrategyPort:
+    """Test double for ``StrategyControlPort``: read-only receipt lookup; a
+    ``forward`` call would be a bug (the reconciler only reconciles, never
+    re-forwards a mutation)."""
+
+    def __init__(self):
+        self.receipts: dict[str, StrategyCommandReceipt] = {}
+        self.forward_calls: list = []
+
+    def forward(self, request):  # pragma: no cover - reconciler never forwards
+        self.forward_calls.append(request)
+        raise AssertionError("reconciler must never re-forward a strategy mutation")
+
+    def get_receipt(self, command_id):
+        return self.receipts.get(command_id)
+
+
+class FakeAlerts:
+    def __init__(self):
+        self.raised: list[str] = []
+
+    def raise_alert(self, command_id, detail):
+        self.raised.append(command_id)
+
+
+@pytest.fixture
+def recon(tmp_path):
+    db_ = DuckDBConnection.get_instance(str(tmp_path / "recon.duckdb"))
+    migrator = SchemaMigrator(db_)
+    journal_ = DomainJournal(db_)
+    journal_.migrate(migrator)
+    apply_proposal_authority_migration(migrator)
+    apply_command_ledger_migration(migrator)
+    repo = ProposalRepository(journal_)
+    ledger_ = CommandLedger(journal_)
+    orders = FakeReconcilerOrders()
+    strategy = FakeStrategyPort()
+    alerts = FakeAlerts()
+    now_fn = lambda: NOW  # noqa: E731
+    reconciler = OutcomeReconciler(
+        journal=journal_, ledger=ledger_, orders=orders, strategy=strategy,
+        alerts=alerts, repo=repo, now=now_fn,
+    )
+
+    def _seed_approved(pid, order_group_id):
+        draft = ProposalDraft(
+            id=pid, symbol="AAPL", action="BUY", quantity=10.0, amount=2100.0,
+            execution={"order_type": "MARKET"}, reasoning="", confidence=0.7, thesis="",
+            source="dashboard", metadata={}, sec_type="STK", account_id="DU111111",
+            account_mode="paper", conid=265598, reference_price=210.0, reference_timestamp=NOW,
+            reference_quote_side="ask", reference_feed_type="live", max_price_drift_bps=50.0,
+            expires_at=NOW + dt.timedelta(minutes=5), live_approval_eligible=True, created_at=NOW,
+        )
+        predicted = ProposalCommandService._record_from_draft(draft, revision=1)
+
+        def _write(conn, revision):
+            repo.insert_pending_in_tx(conn, draft, revision)
+            conn.execute(
+                "UPDATE trade_proposals SET status='APPROVED', order_group_id=? WHERE id=?",
+                [order_group_id, pid],
+            )
+
+        journal_.mutate(
+            journal_.connect(), repo.mutation_for(predicted, "seed"), _write,
+            event_id=f"proposal:{pid}:1",
+        )
+
+    def mark_unknown(command_id, *, target_type, target_id=None, order_group_id=None,
+                     proposal_id=None):
+        if proposal_id is not None:
+            _seed_approved(proposal_id, order_group_id or f"og-{command_id}")
+        if target_type == "proposal":
+            resolved_target = target_id if target_id is not None else str(proposal_id)
+            outcome = None
+            action = "approve_proposal"
+        elif target_type == "strategy":
+            resolved_target = target_id or ""
+            outcome = None
+            action = "enable_strategy"
+        else:  # "order" (cancel) -- carries no proposal in production; the plan's
+                # order test wires one explicitly via the ledger outcome.
+            resolved_target = target_id or order_group_id or ""
+            outcome = {"proposal_id": proposal_id} if proposal_id is not None else None
+            action = "cancel_order"
+        ledger_.insert_for_test(
+            command_id, state="OUTCOME_UNKNOWN", updated_at=NOW, account_id="DU111111",
+            action=action, target_type=target_type, target_id=resolved_target, outcome=outcome,
+        )
+        reconciler.schedule(command_id, NOW)
+
+    return SimpleNamespace(
+        db=db_, journal=journal_, repo=repo, ledger=ledger_, orders=orders,
+        strategy=strategy, alerts=alerts, reconciler=reconciler,
+        now=lambda: NOW, cursor=0, mark_unknown=mark_unknown,
+    )
+
+
+def test_schedule_is_immediate_then_5s_then_30s_for_15_minutes():
+    assert RECONCILE_DELAYS[0] == 0.0
+    assert RECONCILE_DELAYS[1:13] == (5.0,) * 12        # every 5 s for the first minute
+    assert RECONCILE_DELAYS[13:] == (30.0,) * 28        # every 30 s for the next 14 minutes
+    assert sum(RECONCILE_DELAYS) == 900.0               # critical alert boundary
+    assert CRITICAL_AFTER_SECONDS == 900.0
+
+
+def test_proposal_approve_resolves_by_encoded_order_ref(recon):
+    # RJ2: the REAL approve saga stamps target_type="proposal"; an ambiguous
+    # approve must resolve via the og-{command_id} order lookup.
+    recon.mark_unknown("cmd-1", target_type="proposal", order_group_id="og-cmd-1", proposal_id=7)
+    recon.orders.add_broker_order(
+        order_ref=encode_order_ref("og-cmd-1"), status="Submitted", order_ids=[17])
+    result = recon.reconciler.reconcile_once("cmd-1", recon.now())
+    assert result.resolved is True
+    row = recon.ledger.get("cmd-1")
+    assert row.state == "RESOLVED" and row.outcome["order_ids"] == [17]
+    assert recon.repo.get(7).status == "EXECUTED"       # submission evidence recorded
+    kinds = [e.event_type for e in recon.journal.read_after(recon.cursor, 100)]
+    assert "command.updated" in kinds and "proposal.updated" in kinds
+
+
+def test_order_command_resolves_by_encoded_order_ref(recon):
+    recon.mark_unknown("cmd-1", target_type="order", order_group_id="og-cmd-1", proposal_id=7)
+    recon.orders.add_broker_order(
+        order_ref=encode_order_ref("og-cmd-1"), status="Submitted", order_ids=[17])
+    result = recon.reconciler.reconcile_once("cmd-1", recon.now())
+    assert result.resolved is True
+    row = recon.ledger.get("cmd-1")
+    assert row.state == "RESOLVED" and row.outcome["order_ids"] == [17]
+    assert recon.repo.get(7).status == "EXECUTED"       # submission evidence recorded
+    kinds = [e.event_type for e in recon.journal.read_after(recon.cursor, 100)]
+    assert "command.updated" in kinds and "proposal.updated" in kinds
+
+
+def test_definitive_absence_requires_a_complete_enumeration(recon):
+    recon.mark_unknown("cmd-1", target_type="proposal", order_group_id="og-cmd-1", proposal_id=7)
+    recon.orders.enumeration_ok = False                 # no fenced generation yet
+    assert recon.reconciler.reconcile_once("cmd-1", recon.now()).resolved is False
+    assert recon.ledger.get("cmd-1").state == "OUTCOME_UNKNOWN"
+    recon.orders.enumeration_ok = True                  # fenced view proves absence
+    result = recon.reconciler.reconcile_once("cmd-1", recon.now())
+    assert result.resolved is True
+    assert recon.ledger.get("cmd-1").outcome == {"submitted": False}
+    assert recon.repo.get(7).status == "FAILED"         # proven never-submitted: clean failure
+    assert recon.orders.submissions == []               # never blindly resubmitted
+
+
+def test_strategy_receipts_reconcile_by_root_command_id(recon):
+    recon.mark_unknown("cmd-9", target_type="strategy", target_id="smi_crossover")
+    recon.strategy.receipts["cmd-9"] = StrategyCommandReceipt(
+        "cmd-9", "smi_crossover", "enable_strategy", "COMMITTED",
+        control_revision=5, state_revision=12, error=None)
+    assert recon.reconciler.reconcile_once("cmd-9", recon.now()).resolved is True
+    assert recon.ledger.get("cmd-9").outcome["control_revision"] == 5
+    # A missing receipt stays unknown and the mutation is never repeated.
+    recon.mark_unknown("cmd-10", target_type="strategy", target_id="smi_crossover")
+    assert recon.reconciler.reconcile_once("cmd-10", recon.now()).resolved is False
+    assert recon.strategy.forward_calls == []
+
+
+def test_unresolved_after_15_minutes_is_critical_never_failed(recon):
+    recon.mark_unknown("cmd-1", target_type="proposal", order_group_id="og-cmd-1", proposal_id=7)
+    late = recon.now() + dt.timedelta(seconds=901)
+    results = recon.reconciler.run_due(late)
+    assert results[0].critical is True
+    assert recon.alerts.raised == ["cmd-1"]
+    assert recon.ledger.get("cmd-1").state == "OUTCOME_UNKNOWN"   # never timeout-to-failure
+
+
+def test_run_due_only_fires_attempts_that_are_actually_due(recon):
+    recon.mark_unknown("cmd-1", target_type="proposal", order_group_id="og-cmd-1", proposal_id=7)
+    # First attempt fires immediately (delay 0); it stays unknown (no order,
+    # incomplete enumeration) and is rescheduled 5 s out.
+    first = recon.reconciler.run_due(recon.now())
+    assert [r.command_id for r in first] == ["cmd-1"]
+    assert first[0].resolved is False
+    # 1 s later nothing is due yet.
+    assert recon.reconciler.run_due(recon.now() + dt.timedelta(seconds=1)) == []
+    # By +5 s the second attempt is due again.
+    again = recon.reconciler.run_due(recon.now() + dt.timedelta(seconds=5))
+    assert [r.command_id for r in again] == ["cmd-1"]
+
+
+def test_resolved_command_is_dropped_from_the_schedule(recon):
+    recon.mark_unknown("cmd-1", target_type="proposal", order_group_id="og-cmd-1", proposal_id=7)
+    recon.orders.add_broker_order(
+        order_ref=encode_order_ref("og-cmd-1"), status="Submitted", order_ids=[21])
+    assert recon.reconciler.reconcile_once("cmd-1", recon.now()).resolved is True
+    # Once resolved, run_due no longer revisits it.
+    assert recon.reconciler.run_due(recon.now() + dt.timedelta(seconds=901)) == []
+    assert recon.alerts.raised == []
+
+
+def test_startup_rescan_requeues_inflight_commands(recon):
+    recon.mark_unknown("cmd-1", target_type="proposal", order_group_id="og-cmd-1", proposal_id=7)
+    recon.ledger.insert_for_test("cmd-2", state="SUBMITTING",
+                                 updated_at=recon.now() - dt.timedelta(minutes=2))
+    requeued = recon.reconciler.rescan_on_startup()
+    assert set(requeued) == {"cmd-1", "cmd-2"}          # crash between claim and ack is covered
+
+
+def test_rescan_ignores_terminal_rows(recon):
+    recon.ledger.insert_for_test("done", state="RESOLVED", updated_at=recon.now())
+    recon.ledger.insert_for_test("rej", state="REJECTED", updated_at=recon.now())
+    recon.mark_unknown("cmd-1", target_type="proposal", order_group_id="og-cmd-1", proposal_id=7)
+    assert set(recon.reconciler.rescan_on_startup()) == {"cmd-1"}
+
+
+# ---------------------------------------------------------------------------
+# RJ2 (addendum #2): the coordinator schedules reconciliation for EVERY
+# OUTCOME_UNKNOWN wedge -- including the generic saga-exception fallback path
+# that previously scheduled nothing and relied on a restart to be revisited.
+# The hook is optional/default-None so existing coordinator tests are
+# unaffected (proven by the whole existing suite above, which builds the
+# coordinator without a reconciler).
+# ---------------------------------------------------------------------------
+
+
+class _RecordingReconciler:
+    def __init__(self):
+        self.scheduled: list[str] = []
+
+    def schedule(self, command_id, now):
+        self.scheduled.append(command_id)
+
+
+def test_coordinator_schedules_reconcile_when_a_non_saga_handler_wedges(journal, ledger):
+    hook = _RecordingReconciler()
+    coord = TradingCommandCoordinator(
+        journal=journal, ledger=ledger, audit=FakeCommandAudit(),
+        nonces=FakeNonceGate(), now=lambda: NOW, reconciler=hook,
+    )
+
+    def handler(cmd):
+        raise RuntimeError("boom: handler's own mutate() blew up")
+
+    coord.register_action("noop", handler, requires_preflight=False)
+    with pytest.raises(RuntimeError, match="boom"):
+        coord.execute(_request(action="noop"))
+    assert ledger.get("cmd-1").state == "OUTCOME_UNKNOWN"
+    assert hook.scheduled == ["cmd-1"]                  # the wedge was scheduled, not left orphaned
+
+
+def test_coordinator_fallback_schedules_reconcile_for_a_saga_wedge(journal, ledger):
+    hook = _RecordingReconciler()
+    coord = TradingCommandCoordinator(
+        journal=journal, ledger=ledger, audit=FakeCommandAudit(),
+        nonces=FakeNonceGate(), now=lambda: NOW, reconciler=hook,
+    )
+
+    def saga_handler(cmd):
+        # A saga that advances past RECEIVED then blows up before reaching its
+        # own DISPATCH_AMBIGUOUS branch -- the generic fallback must schedule.
+        coord._transition(cmd, "RECEIVED", "VALIDATED")
+        raise RuntimeError("saga blew up pre-dispatch")
+
+    coord.register_action("saga_noop", saga_handler, requires_preflight=False, saga=True)
+    with pytest.raises(RuntimeError, match="saga blew up"):
+        coord.execute(_request(action="saga_noop"))
+    assert ledger.get("cmd-1").state == "OUTCOME_UNKNOWN"
+    assert hook.scheduled == ["cmd-1"]
+
+
+def test_coordinator_without_reconciler_still_wedges_cleanly(journal, ledger):
+    # Default None hook: no scheduling, no crash -- byte-identical to the
+    # pre-Task-9 behaviour exercised by the rest of this suite.
+    coord = TradingCommandCoordinator(
+        journal=journal, ledger=ledger, audit=FakeCommandAudit(),
+        nonces=FakeNonceGate(), now=lambda: NOW,
+    )
+    coord.register_action(
+        "noop", lambda cmd: (_ for _ in ()).throw(RuntimeError("boom")), requires_preflight=False)
+    with pytest.raises(RuntimeError):
+        coord.execute(_request(action="noop"))
+    assert ledger.get("cmd-1").state == "OUTCOME_UNKNOWN"
+
+
+# ---------------------------------------------------------------------------
+# An OUTCOME_UNKNOWN command blocks any OTHER command for the same target
+# (the COMMAND_IN_FLIGHT guard, §9.5), driven through the REAL coordinator +
+# approval saga.
+# ---------------------------------------------------------------------------
+
+
+class _GateOrders:
+    def __init__(self):
+        self._raise = None
+        self._next = 5001
+        self.submissions: list = []
+
+    def raise_on_submit(self, exc):
+        self._raise = exc
+
+    def submit(self, proposal, order_ref, order_group_id):
+        if self._raise is not None:
+            raise self._raise
+        s = SubmittedOrders(order_group_id=order_group_id, order_ref=order_ref,
+                            order_ids=[self._next])
+        self._next += 1
+        self.submissions.append(s)
+        return s
+
+    def cancel(self, *a, **k):  # pragma: no cover
+        raise NotImplementedError
+
+    def find_by_order_ref(self, account_id, order_ref):
+        return []
+
+    def enumeration_complete(self):
+        return True
+
+
+@pytest.fixture
+def gate(tmp_path):
+    db_ = DuckDBConnection.get_instance(str(tmp_path / "gate.duckdb"))
+    migrator = SchemaMigrator(db_)
+    journal_ = DomainJournal(db_)
+    journal_.migrate(migrator)
+    apply_proposal_authority_migration(migrator)
+    apply_command_ledger_migration(migrator)
+    apply_trading_control_migration(migrator)
+    repo = ProposalRepository(journal_)
+    ledger_ = CommandLedger(journal_)
+    controls = TradingControlStore(journal_)
+    db_.transaction(lambda conn: controls.seed_in_tx(conn, [("DU111111", "paper")], NOW))
+    now_fn = lambda: NOW  # noqa: E731
+
+    orders = _GateOrders()
+    quotes = SimpleNamespace(executable_quote=lambda conid, side: ExecutableQuote(
+        conid=conid, side=side, price=210.0 if side == "ask" else 209.5,
+        market_timestamp=NOW, feed_type="live", session_state="continuous"))
+    positions = SimpleNamespace(reducible_quantity=lambda account_id, conid: 0.0)
+    broker = SimpleNamespace(is_ready=lambda: True)
+    risk_gate = SimpleNamespace(evaluate=lambda **_kw: SimpleNamespace(approved=True, reason=""))
+    risk_producer = SimpleNamespace(publish_decision=lambda *a, **k: None)
+    fake_reconciler = _RecordingReconciler()
+
+    coordinator = TradingCommandCoordinator(
+        journal=journal_, ledger=ledger_, audit=CommandAudit(journal_),
+        nonces=FakeNonceGate(), now=now_fn, reconciler=fake_reconciler,
+    )
+    approval = ApprovalCommandService(
+        journal=journal_, ledger=ledger_, repo=repo, controls=controls, orders=orders,
+        positions=positions, quotes=quotes, risk_gate=risk_gate, risk_producer=risk_producer,
+        reconciler=fake_reconciler, broker=broker, account_id="DU111111",
+        account_mode="paper", now=now_fn,
+    )
+    coordinator.register_action(
+        "approve_proposal", approval.approve, requires_preflight=True, saga=True)
+
+    def _reject_action(cmd):
+        pid = int(cmd.body["proposal_id"])
+        inflight = [
+            r for r in ledger_.unresolved_for_target("proposal", str(pid))
+            if r.command_id != cmd.command_id
+        ]
+        if inflight:
+            raise CommandValidationError(
+                "COMMAND_IN_FLIGHT", "another command is in flight for this proposal")
+        return {"rejected": True}
+
+    coordinator.register_action("reject_proposal", _reject_action, requires_preflight=False)
+
+    def pending(*, conid=265598, action="BUY"):
+        pid = repo.reserve_id()
+        draft = ProposalDraft(
+            id=pid, symbol="AAPL", action=action, quantity=10.0, amount=2100.0,
+            execution={"order_type": "MARKET"}, reasoning="", confidence=0.7, thesis="",
+            source="dashboard", metadata={}, sec_type="STK", account_id="DU111111",
+            account_mode="paper", conid=conid, reference_price=210.0, reference_timestamp=NOW,
+            reference_quote_side="ask" if action == "BUY" else "bid",
+            reference_feed_type="live", max_price_drift_bps=50.0,
+            expires_at=NOW + dt.timedelta(minutes=5), live_approval_eligible=True, created_at=NOW,
+        )
+        predicted = ProposalCommandService._record_from_draft(draft, revision=1)
+        written: list = []
+        journal_.mutate(
+            journal_.connect(), repo.mutation_for(predicted, "seed"),
+            lambda conn, revision: written.append(repo.insert_pending_in_tx(conn, draft, revision)),
+            event_id=f"proposal:{pid}:1",
+        )
+        return written[0]
+
+    def execute_approve(record, command_id):
+        request = CommandRequest(
+            command_id=command_id, action="approve_proposal", account_id="DU111111",
+            target_type="proposal", target_id=str(record.id), expected_version=record.revision,
+            body={"proposal_id": record.id}, source="dashboard",
+            preflight_nonce=f"nonce-{command_id}")
+        return coordinator.execute(request)
+
+    def execute_reject(record, command_id):
+        request = CommandRequest(
+            command_id=command_id, action="reject_proposal", account_id="DU111111",
+            target_type="proposal", target_id=str(record.id), expected_version=None,
+            body={"proposal_id": record.id, "reason": "x"}, source="dashboard")
+        return coordinator.execute(request)
+
+    return SimpleNamespace(
+        journal=journal_, repo=repo, ledger=ledger_, controls=controls,
+        coordinator=coordinator, approval=approval, orders=orders,
+        pending=pending, execute_approve=execute_approve, execute_reject=execute_reject,
+    )
+
+
+def test_unknown_command_blocks_other_commands_for_the_same_proposal(gate):
+    record = gate.pending(conid=265598, action="BUY")
+    gate.orders.raise_on_submit(TimeoutError("ack lost"))
+    unknown = gate.execute_approve(record, command_id="cmd-1")
+    assert unknown.state == "OUTCOME_UNKNOWN"
+    blocked = gate.execute_reject(record, command_id="cmd-2")
+    assert blocked.error_code == "COMMAND_IN_FLIGHT"              # §9.5

@@ -47,6 +47,88 @@ def _resolve_seed_accounts(
     return list(seed.items())
 
 
+class _LoggingCriticalAlerts:
+    """[M1-F3] Task 9 ``CriticalAlertPort``: an ``OUTCOME_UNKNOWN`` command
+    still unresolved after 15 minutes is surfaced to the log for the operator.
+
+    The durable, authoritative signal is the ``OUTCOME_UNKNOWN`` ledger row
+    itself (which ``[M1-R]`` health rendering reads directly); this handler is
+    the operational breadcrumb so it also shows up in the service log.
+    """
+
+    def raise_alert(self, command_id: str, detail: str) -> None:
+        logging.error(
+            'command %s requires operator reconciliation: %s', command_id, detail
+        )
+
+
+async def _command_reconciliation_loop(
+    reconciler,
+    ledger,
+    *,
+    now,
+    reconcile_interval: float = 5.0,
+    retention_interval: float = 86_400.0,
+):
+    """[M1-F3] Task 9: drive ``OUTCOME_UNKNOWN`` reconciliation on a fixed
+    5-second cadence and purge terminal (``RESOLVED``/``REJECTED``) ledger +
+    audit rows once a day.
+
+    The loop NEVER dies on a transient failure: each tick's error is logged
+    and the loop continues, because an ambiguous real-money command must keep
+    being reconciled until it actually resolves. ``purge_expired`` never
+    touches ``OUTCOME_UNKNOWN`` (see its own docstring), so retention can never
+    drop an unreconciled command.
+    """
+    last_retention = now()
+    while True:
+        try:
+            reconciler.run_due(now())
+        except Exception as ex:
+            logging.error('command reconciliation tick failed: {}'.format(ex))
+        try:
+            if (now() - last_retention).total_seconds() >= retention_interval:
+                purged = ledger.purge_expired(now())
+                last_retention = now()
+                if purged:
+                    logging.info('purged {} terminal command-ledger rows'.format(purged))
+        except Exception as ex:
+            logging.error('command-ledger retention failed: {}'.format(ex))
+        await asyncio.sleep(reconcile_interval)
+
+
+def _maybe_start_command_reconciliation(trader: Trader, loop: AbstractEventLoop) -> None:
+    """[M1-F3] Task 9: run ``rescan_on_startup()`` BEFORE readiness (coordinator
+    crash recovery, spec §9.5) and start the reconciliation + daily-retention
+    loop.
+
+    Additive + DORMANT by design (addendum §3): T9-core deliberately leaves the
+    live command DISPATCH unwired (no ``register_command_authority`` on the live
+    socket, no live command registry bound in ``Trader.connect()``), so no
+    ``command_reconciler`` is attached to the trader yet and this is a no-op --
+    startup behaviour is byte-for-byte unchanged. The coordinated integration
+    step that binds the live command authority also sets
+    ``trader.command_reconciler`` / ``trader.command_ledger`` and thereby
+    activates this loop. Any failure here is logged and swallowed so it can
+    never take down service startup.
+    """
+    reconciler = getattr(trader, 'command_reconciler', None)
+    ledger = getattr(trader, 'command_ledger', None)
+    if reconciler is None or ledger is None:
+        return
+    try:
+        requeued = reconciler.rescan_on_startup()
+        if requeued:
+            logging.info(
+                'requeued {} in-flight command(s) for reconciliation'.format(len(requeued))
+            )
+        loop.create_task(_command_reconciliation_loop(
+            reconciler, ledger, now=lambda: dt.datetime.now(dt.timezone.utc),
+        ))
+    except Exception as ex:
+        logging.error('failed to start command reconciliation: {}'.format(ex))
+
+
 def _seed_trading_control(trader: Trader, container: Container) -> TradingControlStore:
     """[M1-F3] Task 4: seed the durable per-account pause gate BEFORE this
     service is considered ready (i.e. before ``trader.run()`` starts the
@@ -158,6 +240,12 @@ def main(simulation: bool,
         # row, never a silent bypass. Uses the SAME journal file connect()
         # just migrated/opened.
         _seed_trading_control(trader, container)
+
+        # [M1-F3] Task 9: run coordinator crash-recovery rescan before readiness
+        # and start the OUTCOME_UNKNOWN reconciliation + daily retention loop.
+        # Dormant until the live command authority is wired (see the function's
+        # docstring) -- a no-op here today, never a startup regression.
+        _maybe_start_command_reconciliation(trader, loop)
 
         ip_address = get_network_ip()
         logging.debug('starting trading_runtime at network address: {}'.format(ip_address))

@@ -38,8 +38,8 @@ from urllib.parse import quote
 import markdown as _markdown
 import pandas as pd
 import yaml
-from fastapi import FastAPI, File, Form, HTTPException, Request, UploadFile
-from fastapi.responses import RedirectResponse
+from fastapi import Depends, FastAPI, File, Form, HTTPException, Request, UploadFile
+from fastapi.responses import JSONResponse, RedirectResponse
 from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
 from starlette.concurrency import run_in_threadpool
@@ -59,6 +59,7 @@ from web.command_center.routes_read import create_read_router
 from web.command_center.session import (
     SESSION_COOKIE,
     CredentialConfigError,
+    DashboardCredentials,
     SessionSecurityMiddleware,
     create_session_router,
 )
@@ -211,6 +212,129 @@ def _has_valid_dashboard_session(request: Request) -> bool:
 def _check_csrf(token: str) -> None:
     if not secrets.compare_digest(token or '', _CSRF_TOKEN):
         raise HTTPException(status_code=403, detail='CSRF token mismatch')
+
+
+# ---------------------------------------------------------------------------
+# [M1-C] Task 7 -- single-authority lockout.
+#
+# The command-center routes (web/command_center/routes_commands.py) are the
+# ONLY mutation authority once DASHBOARD_COMMANDS_ENABLED is true. Before
+# this task, a handful of legacy routes here (approve/reject proposals,
+# enable/disable a strategy, edit its params) placed the exact same
+# trades/RPC calls through a second, unguarded path -- no session/CSRF-bound
+# auth beyond this module's own single shared token, no CAS/expected-version
+# check, no command_id audit trail. That's a real second writer, and it's
+# the F3 finding this closes: legacy strategy mutations bypassing the new
+# command machinery. Watchlist CRUD and /strategies/deploy are deliberately
+# OUT of this frozenset -- they aren't trading mutations and their eventual
+# migration is tracked separately under [COMPAT].
+# ---------------------------------------------------------------------------
+LEGACY_TRADING_MUTATION_PATHS = frozenset({
+    "/proposals/{pid}/approve",
+    "/proposals/{pid}/reject",
+    "/strategies/{name}/enable",
+    "/strategies/{name}/disable",
+    "/strategies/{name}/params",
+})
+
+
+class LegacyMutationDisabledError(HTTPException):
+    """Raised by `require_legacy_mutations_enabled`. A plain
+    `HTTPException(detail={...})` would serialize as FastAPI's default
+    `{"detail": {...}}` wrapper; this subclass gets its OWN exception
+    handler (registered in `create_app` below) so the response body is the
+    stable `{code, message, retryable, correlation_id}` envelope directly --
+    the same shape `web/command_center/routes_commands.py`'s
+    `CommandApiError` already produces for the command routes, so a caller
+    (or the dashboard JS) can branch on `body["code"]` in both places the
+    same way.
+    """
+
+    def __init__(self) -> None:
+        super().__init__(status_code=409, detail={
+            "code": "MOVED_TO_COMMAND_CENTER",
+            "message": "this action moved to /command-center; the legacy "
+                       "dashboard is read-only for trading mutations while "
+                       "dashboard commands are enabled",
+            "retryable": False,
+            "correlation_id": None,
+        })
+
+
+def _legacy_mutation_disabled_handler(request: Request,
+                                      exc: LegacyMutationDisabledError) -> JSONResponse:
+    return JSONResponse(status_code=exc.status_code, content=exc.detail)
+
+
+def require_legacy_mutations_enabled(request: Request) -> None:
+    """FastAPI dependency attached to each path in
+    `LEGACY_TRADING_MUTATION_PATHS`. When the command center owns mutations,
+    these legacy POSTs must fail closed -- BEFORE this module's own
+    `_check_access`/`_check_csrf` even run (this is a route-level
+    `dependencies=[...]` entry, resolved ahead of the endpoint body) -- so a
+    stale/forged legacy-form submission can never race the guarded command
+    saga. Reads (the dashboard page itself, `/api/health`, watchlist routes,
+    `/strategies/deploy`) are untouched.
+    """
+    if request.app.state.command_flags.commands_enabled:
+        raise LegacyMutationDisabledError()
+
+
+def make_test_client(*, commands_enabled: bool):
+    """Test-only helper (used by `tests/test_command_security_gate.py`):
+    builds a real `create_app()` instance with `command_flags.commands_
+    enabled` forced to the given value, independent of whatever
+    DASHBOARD_COMMANDS_ENABLED this process actually loaded into the
+    module-level `_COMMAND_FLAGS` at import time.
+
+    The legacy mutation routes below sit behind `SessionSecurityMiddleware`
+    regardless of the command-center flag (session auth is unconditional
+    dashboard-wide), so a throwaway `CommandCenter` -- wired with inert
+    bridge/quote-plane stand-ins, mirroring `tests/test_web_dashboard.py`'s
+    `stub_cc` fixture -- supplies just enough to authenticate a client
+    through `/session` without a real typed-RPC bridge thread or ticker
+    PubSub connection. Imports `TestClient` lazily: `httpx` (fastapi.
+    testclient's dependency) is a test-only extra, never a hard runtime
+    dependency of this production module.
+    """
+    from fastapi.testclient import TestClient
+
+    class _NullBridge:
+        def health(self) -> dict:
+            return {}
+
+        def stop(self, timeout: float = 5.0) -> None:
+            pass
+
+    class _NullQuotePlane:
+        def start(self) -> None:
+            pass
+
+        def stop(self, timeout: float = 5.0) -> None:
+            pass
+
+    token = secrets.token_urlsafe(16)
+    center = CommandCenter(
+        CommandCenterConfig(),
+        credentials_loader=lambda: DashboardCredentials(
+            token=token, session_secret=b't' * 32, legacy_alias_used=False),
+        query_client_factory=lambda: None,
+        feed_client_factory=lambda: None,
+        bridge_factory=lambda *a, **k: _NullBridge(),
+        quote_plane_factory=lambda *a, **k: _NullQuotePlane(),
+        commands_enabled=commands_enabled,
+    )
+    application = create_app(center)
+    # create_app() always stamps the process-wide _COMMAND_FLAGS onto
+    # app.state -- overridden here so this helper can force either value
+    # regardless of the real environment's DASHBOARD_COMMANDS_ENABLED.
+    application.state.command_flags = CommandFlags(
+        commands_enabled=commands_enabled, live_commands_enabled=False,
+        live_account_id=None, live_max_order_notional=None)
+    client = TestClient(application)
+    client.post("/session", data={"token": token})
+    return client
+
 
 # States that count as "live / enabled" (mirrors strategy_runtime semantics).
 _ENABLED_STATES = {'RUNNING', 'WAITING_HISTORICAL_DATA', 'INSTALLED'}
@@ -540,7 +664,8 @@ def _register_legacy_routes(application: FastAPI) -> None:
         })
 
 
-    @application.post('/proposals/{pid}/approve')
+    @application.post('/proposals/{pid}/approve',
+                      dependencies=[Depends(require_legacy_mutations_enabled)])
     def approve(pid: int, request: Request, csrf_token: str = Form('')):
         """Approve a proposal — this PLACES A LIVE ORDER via trader_service."""
         _check_access(request)
@@ -557,7 +682,8 @@ def _register_legacy_routes(application: FastAPI) -> None:
         return RedirectResponse(url=f'/?flash={quote(msg)}', status_code=303)
 
 
-    @application.post('/proposals/{pid}/reject')
+    @application.post('/proposals/{pid}/reject',
+                      dependencies=[Depends(require_legacy_mutations_enabled)])
     def reject(pid: int, request: Request, reason: str = Form(''), csrf_token: str = Form('')):
         _check_access(request)
         _check_csrf(csrf_token)
@@ -570,7 +696,8 @@ def _register_legacy_routes(application: FastAPI) -> None:
         return RedirectResponse(url=f'/?flash={quote(msg)}', status_code=303)
 
 
-    @application.post('/strategies/{name}/enable')
+    @application.post('/strategies/{name}/enable',
+                      dependencies=[Depends(require_legacy_mutations_enabled)])
     def enable_strategy(name: str, request: Request, csrf_token: str = Form('')):
         _check_access(request)
         _check_csrf(csrf_token)
@@ -586,7 +713,8 @@ def _register_legacy_routes(application: FastAPI) -> None:
         return RedirectResponse(url=f'/?flash={quote(msg)}', status_code=303)
 
 
-    @application.post('/strategies/{name}/disable')
+    @application.post('/strategies/{name}/disable',
+                      dependencies=[Depends(require_legacy_mutations_enabled)])
     def disable_strategy(name: str, request: Request, csrf_token: str = Form('')):
         _check_access(request)
         _check_csrf(csrf_token)
@@ -602,7 +730,8 @@ def _register_legacy_routes(application: FastAPI) -> None:
         return RedirectResponse(url=f'/?flash={quote(msg)}', status_code=303)
 
 
-    @application.post('/strategies/{name}/params')
+    @application.post('/strategies/{name}/params',
+                      dependencies=[Depends(require_legacy_mutations_enabled)])
     async def update_strategy_params(name: str, request: Request):
         """Persist edited params — the strategy is hot-swapped live server-side.
 
@@ -950,6 +1079,14 @@ def create_app(cc: CommandCenter | None = None) -> FastAPI:
     # commands are enabled but the gateway never came up -- see
     # `routes_commands.py`'s `_gateway()`.
     install_command_routes(application)
+    # [M1-C] Task 7: serializes LegacyMutationDisabledError as the stable
+    # {code, message, retryable, correlation_id} envelope instead of
+    # FastAPI's default {"detail": {...}} wrapper -- registered for the
+    # subclass only, so every other HTTPException in this module (the
+    # single shared-token/CSRF checks, watchlist validation, etc.) keeps
+    # FastAPI's ordinary {"detail": ...} handling untouched.
+    application.add_exception_handler(LegacyMutationDisabledError,
+                                      _legacy_mutation_disabled_handler)
     application.mount('/static', StaticFiles(
         directory=str(Path(__file__).parent / 'static')), name='static')
 

@@ -68,16 +68,31 @@ def gateway():
     return FakeGateway()
 
 
-def make_client(gateway, flags=CommandFlags(True, False, None, None)):
+def make_client(gateway, flags=CommandFlags(True, False, None, None), session=SESSION):
+    """``session`` defaults to the fixed authenticated ``SESSION`` string
+    (unchanged behaviour for every pre-existing caller). [M1-C] Task 7's
+    security-gate matrix (``tests/test_command_security_gate.py``) also
+    needs an UNAUTHENTICATED client to prove every command route enforces
+    session auth: ``session=None`` skips the ``require_session`` override
+    entirely and leaves ``app.state.command_center`` unset (``None``), the
+    same "no session manager wired" shape ``require_session`` in
+    ``routes_commands.py`` already handles explicitly -- it fails closed
+    with 401 ``SESSION_REQUIRED`` rather than raising an unhandled
+    ``AttributeError`` off the bare ``SimpleNamespace`` stand-in below.
+    """
     app = FastAPI()
     app.state.command_flags = flags
-    # [M1-C] Task 3 fix (I-1/M-6): the gateway now lives on
-    # `command_center.command_gateway`, not a bare `app.state.command_gateway`
-    # -- a plain namespace stands in for the real `CommandCenter` here since
-    # these tests only ever read that one attribute off it.
-    app.state.command_center = SimpleNamespace(command_gateway=gateway)
+    if session is None:
+        app.state.command_center = None
+    else:
+        # [M1-C] Task 3 fix (I-1/M-6): the gateway now lives on
+        # `command_center.command_gateway`, not a bare `app.state.command_gateway`
+        # -- a plain namespace stands in for the real `CommandCenter` here since
+        # these tests only ever read that one attribute off it.
+        app.state.command_center = SimpleNamespace(command_gateway=gateway)
     install_command_routes(app)
-    app.dependency_overrides[require_session] = lambda: SESSION
+    if session is not None:
+        app.dependency_overrides[require_session] = lambda: session
     return TestClient(app)
 
 

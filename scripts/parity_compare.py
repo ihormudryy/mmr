@@ -9,6 +9,39 @@ timestamps at one-second resolution; everything else is exact.
 Exit codes: 0 parity (explained divergences allowed), 1 unexplained
 divergence, 2 collection failure. Runnable ad hoc and from the pycron
 `parity_compare` one-shot.
+
+## Coverage note — sections NOT actually compared today
+
+Three of the eight §14.1 sections cannot be honestly reconciled against the
+real legacy/center APIs as they exist today, and are deliberately collected
+as empty lists on BOTH sides (zero divergence, not a fabricated match) rather
+than crashing or reporting systematic false positives:
+
+- **fills**: the legacy SDK (`trader/sdk.py`) has no fills/executions
+  fetcher at all -- `trades()` is the live order book, not settled
+  executions. There is no legacy feed to compare the center's real
+  `BrokerFillRow` data against.
+- **orders**: legacy identifies an order by IB's `orderId`; the center
+  identifies it by `order_entity_id`, which per
+  `trader/domain/identity.py` is either `order_group_id:leg` (MMR-placed
+  orders) or a random `ext:<uuid>` (externally-placed orders) -- neither
+  scheme is derived from `orderId`, and legacy exposes no
+  `order_group_id`/`perm_id` to bridge them. Keying by either side's native
+  id against the other would flag every single order as a false
+  presence-divergence, which is worse than not comparing at all.
+- **risk**: `RiskProducer` (`trader/trading/risk_producer.py`) is never
+  instantiated anywhere in this codebase (nothing publishes a
+  `projection:<account_id>` risk row in prod), while the legacy SDK always
+  has *some* live risk report. Comparing "always populated" against
+  "always empty" would be a permanent, uninformative divergence, not a real
+  defect to chase. `collect_center` still does a best-effort extraction of
+  any `projection:*` row so this section starts working the moment
+  `RiskProducer` is wired up, without touching this file again.
+
+`account`/`cash`/`positions`/`proposals`/`strategies` ARE genuinely compared
+(see `collect_legacy`/`collect_center` docstrings for the exact field
+mapping and the couple of sub-fields -- proposal quantity/amount, strategy
+params -- that are dropped for the same "no real source on one side" reason).
 """
 from __future__ import annotations
 
@@ -113,15 +146,37 @@ def values_match(a: Any, b: Any, kind: str = 'exact') -> bool:
     return a == b
 
 
+# NOTE on 'proposals' and 'strategies' below: the section *keys* here are a
+# fixed contract `compare_surfaces` counts against (see
+# `test_compare_surfaces_covers_every_required_section`) and are NOT changed.
+# Only the per-section field *lists* are narrowed, for fields that have no
+# real counterpart on one side (verified by reading the actual source, not
+# assumed) -- comparing them would be a permanent false divergence, not a
+# real defect:
+#   - proposals 'quantity'/'amount': the legacy SDK's `proposals()` DataFrame
+#     (`trader/sdk.py`) exposes only a formatted display string (`size`,
+#     e.g. "100 sh" / "$5,000"), never numeric quantity/amount. Parsing that
+#     string back into a float would reintroduce the exact rounding error it
+#     was formatted with (`f'${amount:,.0f}'` truncates to whole dollars),
+#     i.e. a *guaranteed* spurious float divergence on any amount-based
+#     proposal -- worse than just not comparing it.
+#   - strategies 'params': the center's real "strategy" entity payload
+#     (`StrategyControlCommandService.acknowledge_state`,
+#     `trader/trading/command_coordinator.py`) is exactly
+#     `{strategy_name, action, strategy_state, control_revision,
+#     state_revision, error}` (+ generic entity_id/entity_revision) --
+#     documented in `web/static/command_center.js`'s "Source-vs-brief drift"
+#     comment. There is no `params` field on the wire at all, so it would
+#     always read back as `{}` and false-diverge against any legacy strategy
+#     that actually has tunable params configured.
 SECTION_FIELDS: dict[str, dict[str, str]] = {
     'account':    {'account_id': 'exact', 'mode': 'exact', 'net_liquidation': 'float'},
     'cash':       {'amount': 'float'},
     'positions':  {'quantity': 'float', 'avg_cost': 'float',
                    'market_value': 'float', 'unrealized_pnl': 'float'},
     'proposals':  {'storage_status': 'exact', 'display_status': 'exact',
-                   'symbol': 'exact', 'action': 'exact', 'quantity': 'float',
-                   'amount': 'float', 'confidence': 'float'},
-    'strategies': {'enabled': 'bool', 'params': 'loose_map'},
+                   'symbol': 'exact', 'action': 'exact', 'confidence': 'float'},
+    'strategies': {'enabled': 'bool'},
     'risk':       {'warnings': 'sorted_list', 'limits': 'loose_map'},
     'orders':     {'status': 'exact', 'action': 'exact', 'quantity': 'float',
                    'filled': 'float', 'avg_fill_price': 'float',
@@ -189,38 +244,77 @@ def _mode_for_account(account: str | None) -> str | None:
     return 'paper' if account.startswith('DU') else 'live'
 
 
+# Raw IB order-status strings (as `trades()`/`orders()` on the legacy SDK
+# surface -- `trader/sdk.py`'s `orders()` reads `t.orderStatus.status`
+# straight off ib_async, no canonicalization) mapped to an UPPER vocabulary.
+# `trader.trading.order_tracker` (imported by the ORIGINAL, broken version of
+# this collector) does not exist anywhere in the codebase -- there is no
+# shared status-mapping utility to import, so this is a small local
+# implementation, per the rebuild brief. It is currently unexercised by the
+# orders comparison itself (see the module docstring's "orders" coverage
+# note -- orders are dropped from keyed comparison because there is no
+# shared legacy/center order identity, not because of status formatting) but
+# is kept + unit-tested as the documented mapping for if/when a shared order
+# key makes that comparison possible again.
+_IB_STATUS_TO_CANONICAL = {
+    'PendingSubmit': 'PENDING_SUBMIT',
+    'PendingCancel': 'PENDING_CANCEL',
+    'PreSubmitted': 'PRESUBMITTED',
+    'Submitted': 'SUBMITTED',
+    'ApiPending': 'API_PENDING',
+    'ApiCancelled': 'CANCELLED',
+    'Cancelled': 'CANCELLED',
+    'Filled': 'FILLED',
+    'Inactive': 'INACTIVE',
+}
+
+
+def normalize_ib_status(raw: Any) -> str:
+    """Map a raw IB order-status string to the canonical UPPER vocabulary
+    (see `_IB_STATUS_TO_CANONICAL` above). Unknown statuses fall back to a
+    plain `.upper()` rather than raising -- an unrecognized-but-real IB
+    status should surface as a mismatch against the center's canonical set,
+    not crash the whole collection."""
+    if raw is None:
+        return ''
+    return _IB_STATUS_TO_CANONICAL.get(str(raw), str(raw).upper())
+
+
 def collect_legacy() -> dict:
-    """Read the legacy surface through its own fetchers + the SDK."""
+    """Read the legacy surface through its own fetchers + the SDK.
+
+    `risk`/`orders`/`fills` are intentionally always `[]` here -- see the
+    module docstring's "Coverage note" for why each one has no genuine
+    legacy/center counterpart to compare today. They are still real keys in
+    the returned dict (not omitted) so `compare_surfaces` -- which iterates
+    the fixed `SECTION_FIELDS` section set -- always finds a (trivially
+    matching) list rather than crashing on a missing key.
+    """
     import web.app as webapp
-    from trader.trading.order_tracker import normalize_ib_status
 
     status = webapp.fetch_status()
     snapshot = webapp.fetch_snapshot()
     cash = webapp.fetch_cash()
-    risk = webapp.fetch_risk()
-    limits = webapp.fetch_risk_limits()
     if status is None or snapshot is None:
         raise CollectionError('legacy: trader_service unreachable')
 
+    # Positions: `fetch_positions()` -> `_records(m.portfolio())`, whose
+    # columns are already the real, verified field names (conId/position/
+    # avgCost/marketValue/unrealizedPNL) -- no rename needed here.
     positions = [{'key': r.get('conId') or r.get('symbol'),
                   'quantity': r.get('position'), 'avg_cost': r.get('avgCost'),
                   'market_value': r.get('marketValue'),
                   'unrealized_pnl': r.get('unrealizedPNL')}
                  for r in webapp.fetch_positions()]
     proposals = [normalize_legacy_proposal(r) for r in webapp.fetch_proposals()]
-    strategies = [{'key': r.get('name'), 'enabled': r.get('enabled'),
-                   'params': r.get('params') or {}}
+    # Strategies: `fetch_strategies()` already derives 'enabled' from the
+    # runtime state name via `_ENABLED_STATES` (RUNNING/
+    # WAITING_HISTORICAL_DATA/INSTALLED) -- reused as-is on the center side
+    # below so both collectors apply the identical predicate. 'params' is
+    # deliberately NOT read here even though the legacy row has it -- see
+    # `SECTION_FIELDS`'s comment for why the center side can never supply it.
+    strategies = [{'key': r.get('name'), 'enabled': r.get('enabled')}
                   for r in webapp.fetch_strategies()]
-    orders = [{'key': r.get('orderId'),
-               'status': normalize_ib_status(str(r.get('status'))),
-               'action': r.get('action'), 'quantity': r.get('quantity'),
-               'filled': r.get('filled'), 'avg_fill_price': r.get('avgFillPrice'),
-               'limit_price': r.get('lmtPrice')}
-              for r in webapp._records(webapp._call(lambda m: m.orders()))]
-    fills = [{'key': r.get('execution_id'), 'side': r.get('side'),
-              'quantity': r.get('quantity'), 'price': r.get('price'),
-              'commission': r.get('commission'), 'time': r.get('time')}
-             for r in webapp._records(webapp._call(lambda m: m.fills()))]
     return {
         'account': [{'key': 'account', 'account_id': status.get('account'),
                      'mode': _mode_for_account(status.get('account')),
@@ -230,10 +324,9 @@ def collect_legacy() -> dict:
         'positions': positions,
         'proposals': proposals,
         'strategies': strategies,
-        'risk': [{'key': 'risk', 'warnings': (risk or {}).get('warnings') or [],
-                  'limits': limits or {}}],
-        'orders': orders,
-        'fills': fills,
+        'risk': [],
+        'orders': [],
+        'fills': [],
     }
 
 
@@ -249,44 +342,134 @@ def login(base_url: str, token: str) -> str:
     return cookie
 
 
+_CASH_TAG = 'TotalCashValue'
+
+
+def _center_cash_rows(account: dict) -> list[dict]:
+    """Parse one account's `balances` (`dict[str, str]` keyed
+    `"TAG:CURRENCY"`, e.g. `"TotalCashValue:USD" -> "12345.67"` -- see
+    `trader/trading/broker_ingest.py`'s `merge_account_value`, which stores
+    literally `f"{tag}:{currency}"` -> `str(value)`) into the same
+    `{key: <currency>, amount: <float>}` shape `collect_legacy` builds from
+    `account_cash()['currencies']` (C6).
+
+    Only the `TotalCashValue` tag is used (the brief's own worked example,
+    and the same tag `broker_ingest.py`'s `_ACCOUNT_TAG_COLUMNS` maps to the
+    account's scalar `total_cash` column) -- `balances` otherwise contains
+    every account-value tag IB streams (NetLiquidation, BuyingPower, ...),
+    not just cash-shaped ones. The pseudo-currency `BASE` row (IB's
+    consolidated summary line) is skipped, mirroring the legacy SDK's own
+    `get_account_cash_by_currency` doc: "a consolidated BASE row we skip".
+    """
+    rows = []
+    for composite, raw_value in (account.get('balances') or {}).items():
+        tag, _, currency = str(composite).partition(':')
+        if tag != _CASH_TAG or not currency or currency == 'BASE':
+            continue
+        try:
+            amount = float(raw_value)
+        except (TypeError, ValueError):
+            amount = None
+        rows.append({'key': currency, 'amount': amount})
+    return rows
+
+
+def _center_risk_rows(risk: dict) -> list[dict]:
+    """Best-effort extraction of the center's risk PROJECTION rows.
+
+    `risk` (from `snapshot_view()`) is a dict keyed by `entity_id`, e.g.
+    `"projection:<account_id>"` (`trader/domain/identity.py`'s
+    `risk_projection_entity_id`) -- not a list, and the field is `entity_id`
+    (added generically by `DashboardState._place`), not `id`.
+
+    `RiskProducer` (`trader/trading/risk_producer.py`) is never
+    instantiated anywhere in this codebase today (no call site constructs
+    one), so in a real deployment nothing ever publishes a `projection:*`
+    row and this returns `[]` -- matching `collect_legacy`'s permanently
+    empty `risk` (see the module docstring's coverage note for why both
+    sides stay empty rather than reporting a manufactured divergence). This
+    extraction is real (not stubbed) so wiring `RiskProducer` up in the
+    future makes this section start working without touching this file --
+    though `collect_legacy` would then need a matching follow-up, since its
+    `risk_report()`/`get_risk_limits()` fields aren't guaranteed to line up
+    with whatever `compute_projection()` callable ends up injected.
+    """
+    return [{'key': entity_id, 'warnings': payload.get('warnings') or [],
+             'limits': payload.get('limits') or {}}
+            for entity_id, payload in (risk or {}).items()
+            if str(entity_id).startswith('projection:')]
+
+
+def _merge_active_terminal(section: dict) -> list[dict]:
+    """`proposals`/`orders` in `snapshot_view()` are each
+    `{"active": [...], "terminal": [...]}` (C2) -- flatten to one list, the
+    shape `compare_keyed` expects."""
+    return list((section or {}).get('active') or []) + \
+        list((section or {}).get('terminal') or [])
+
+
+def _round2(value: Any) -> Any:
+    """Round `net_liquidation` to 2dp (C5) -- the legacy side's
+    `portfolio_snapshot()` already rounds, and the center's raw
+    `BrokerAccountRow.net_liquidation` is an unrounded double; comparing the
+    two unrounded would false-diverge on sub-cent noise."""
+    return round(value, 2) if isinstance(value, (int, float)) else value
+
+
 def collect_center(base_url: str, token: str) -> dict:
+    """Read the command-center surface via `/api/snapshot`
+    (`DashboardState.snapshot_view()`, `web/command_center/state.py`), and
+    normalize it into the same shape `collect_legacy` produces.
+
+    `/api/snapshot` has NO `entities` key (C0) -- its top level is the
+    PLURAL collections `accounts`/`positions`/`proposals`/`orders`/`fills`/
+    `strategies`/`risk` (+ `quotes`/`health`/schema bookkeeping, unused
+    here). Field names come from `Broker*Row.to_payload()`
+    (`trader/data/broker_state.py`) and `ProposalRecord.to_payload()`
+    (`trader/data/proposal_repository.py`). See the module docstring's
+    "Coverage note" for `risk`/`orders`/`fills`.
+    """
+    import web.app as webapp  # reuse `_ENABLED_STATES` so both sides apply
+    # the identical strategy-enabled predicate (RUNNING/
+    # WAITING_HISTORICAL_DATA/INSTALLED) -- see `collect_legacy`'s comment.
+
     cookie = login(base_url, token)
     req = urllib.request.Request(base_url + '/api/snapshot',
                                  headers={'Cookie': cookie})
     with urllib.request.urlopen(req, timeout=30) as resp:
-        entities = json.load(resp)['entities']
-    accounts = entities.get('account') or []
-    positions = entities.get('position') or []
+        view = json.load(resp)
+
+    accounts = view.get('accounts') or []
+    positions = view.get('positions') or []
+    proposals = _merge_active_terminal(view.get('proposals') or {})
+    strategies = view.get('strategies') or []
+
     return {
         'account': [{'key': 'account', 'account_id': a.get('account_id'),
-                     'mode': a.get('mode'),
-                     'net_liquidation': a.get('net_liquidation')} for a in accounts],
-        'cash': [{'key': ccy, 'amount': bal.get('cash')}
-                 for a in accounts
-                 for ccy, bal in (a.get('balances') or {}).items()],
+                     'mode': a.get('account_mode'),  # C4
+                     'net_liquidation': _round2(a.get('net_liquidation'))}  # C5
+                    for a in accounts],
+        'cash': [row for a in accounts for row in _center_cash_rows(a)],  # C6
         'positions': [{'key': p.get('conid'), 'quantity': p.get('quantity'),
-                       'avg_cost': p.get('avg_cost'),
+                       'avg_cost': p.get('average_cost'),  # C7
                        'market_value': p.get('market_value'),
-                       'unrealized_pnl': p.get('unrealized_pnl')} for p in positions],
-        'proposals': [normalize_center_proposal(p)
-                      for p in entities.get('proposal') or []],
-        'strategies': [{'key': s.get('name'), 'enabled': s.get('enabled'),
-                        'params': s.get('params') or {}}
-                       for s in entities.get('strategy') or []],
-        'risk': [{'key': 'risk', 'warnings': r.get('warnings') or [],
-                  'limits': r.get('limits') or {}}
-                 for r in entities.get('risk') or []
-                 if str(r.get('id', '')).startswith('projection:')],
-        'orders': [{'key': o.get('client_order_id'), 'status': o.get('status'),
-                    'action': o.get('action'), 'quantity': o.get('quantity'),
-                    'filled': o.get('filled'),
-                    'avg_fill_price': o.get('avg_fill_price'),
-                    'limit_price': o.get('limit_price')}
-                   for o in entities.get('order') or []],
-        'fills': [{'key': f.get('execution_id'), 'side': f.get('side'),
-                   'quantity': f.get('quantity'), 'price': f.get('price'),
-                   'commission': f.get('commission'), 'time': f.get('time')}
-                  for f in entities.get('fill') or []],
+                       'unrealized_pnl': p.get('unrealized_pnl')}
+                      for p in positions],
+        'proposals': [normalize_center_proposal(p) for p in proposals],  # C2
+        # Strategies: the real wire payload has `strategy_name` (not
+        # `name`) and `strategy_state` (not `enabled`) -- see
+        # `web/static/command_center.js`'s "Source-vs-brief drift" comment
+        # for the verified real shape. `enabled` is derived with the exact
+        # same predicate `webapp.fetch_strategies()` uses on the legacy side
+        # so both sides classify state names identically.
+        'strategies': [
+            {'key': s.get('strategy_name') or s.get('entity_id'),
+             'enabled': str(s.get('strategy_state') or '').upper()
+             in webapp._ENABLED_STATES}
+            for s in strategies],
+        'risk': _center_risk_rows(view.get('risk') or {}),
+        'orders': [],
+        'fills': [],
     }
 
 

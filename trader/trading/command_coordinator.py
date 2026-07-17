@@ -90,6 +90,7 @@ from trader.domain.commands import CommandReceipt
 from trader.domain.events import DomainMutation
 from trader.domain.identity import command_entity_id
 from trader.messaging.typed_rpc import canonical_json
+from trader.strategy.strategy_revisions import StrategyCommandReceipt
 from trader.trading.order_correlation import encode_order_ref
 from trader.trading.proposal_command_service import (
     ExecutableQuote,
@@ -1794,6 +1795,318 @@ class CancelCommandService:
         }
 
     # -- command-ledger single-step transition (mirrors ApprovalCommandService) --
+
+    def _transition_command(
+        self,
+        cmd: CommandRequest,
+        from_state: str,
+        to_state: str,
+        *,
+        outcome: Optional[dict[str, Any]] = None,
+        error_code: Optional[str] = None,
+    ) -> None:
+        now = self._now_utc()
+
+        def _write(conn: duckdb.DuckDBPyConnection, _revision: int) -> None:
+            self._ledger.transition_in_tx(
+                conn, cmd.command_id, from_state, to_state,
+                outcome=outcome, error_code=error_code, now=now,
+            )
+
+        self._journal.mutate(
+            self._journal.connect(),
+            _command_updated_mutation(cmd, to_state, now, outcome=outcome, error_code=error_code),
+            _write,
+            event_id=f"command:{cmd.command_id}:{to_state.lower()}",
+        )
+
+    @staticmethod
+    def _receipt(
+        command_id: str, state: str, error_code: Optional[str], retryable: bool,
+        *, outcome: Optional[dict[str, Any]] = None,
+    ) -> CommandReceipt:
+        return CommandReceipt(
+            command_id=command_id, correlation_id=command_id, state=state,
+            outcome=outcome, error_code=error_code, retryable=retryable,
+        )
+
+    def _now_utc(self) -> dt.datetime:
+        return _as_utc(self._now())
+
+
+# ---------------------------------------------------------------------------
+# [M1-F3] Task 7: strategy-control forwarding -- enable_strategy /
+# disable_strategy / update_strategy_params.
+#
+# STRICTLY one-way (trader -> strategy_service): ``StrategyControlPort.forward``
+# is the only call the trader ever makes toward strategy_service on this path,
+# and the reply from that ONE call already carries strategy_service's own
+# committed-or-rolled-back outcome. There is deliberately no callback FROM
+# strategy_service back into the trader anywhere on this path (see CLAUDE.md
+# memory: dashboard-strategy-controls -- a real deadlock already hit once when
+# a strategy_service RPC handler tried to call back into trader_service while
+# still handling an inbound request).
+# ---------------------------------------------------------------------------
+
+class StrategySnapshotPort(Protocol):
+    """Read seam onto the trader's own view of which strategies exist --
+    consulted BEFORE a strategy-control command is ever forwarded."""
+
+    def exists(self, strategy_name: str) -> bool: ...
+
+
+class StrategyExposureOwnershipPort(Protocol):
+    """Whether disabling ``strategy_name`` leaves every position it manages
+    with a resolved alternate owner for exits (spec §9.3: never silently
+    orphan a protective order).
+
+    [M1-F2]'s full ownership-tracking machinery
+    (``QuoteSubscriptionManager.set_owner_refs`` and friends) is not yet
+    available -- see the m1f3 briefing's F2 hard-block. This port is
+    OPTIONAL on ``StrategyControlCommandService``; when not supplied the
+    guard is skipped entirely (STUB/DEFER, mirroring Task 2/7's documented
+    allowance for the same ``set_owner_refs`` wiring). When supplied, a
+    disable that would leave an unresolved owner is rejected outright
+    rather than silently proceeding.
+    """
+
+    def remaining_owner_resolved(self, strategy_name: str) -> bool: ...
+
+
+class StrategyControlPort(Protocol):
+    """The one-way trader -> strategy_service forwarding boundary.
+
+    ``forward`` sends a validated strategy-control ``CommandRequest`` to
+    strategy_service and returns ITS ``StrategyCommandReceipt`` once
+    strategy_service's own local transaction has committed (or rolled back)
+    -- ``StrategyRuntime.apply_control_command`` on the receiving end is
+    fully self-contained and never calls back into the trader while handling
+    it. ``get_receipt`` is a pure read, used by reconciliation (Task 9) to
+    recover the true outcome of a command whose ``forward()`` call timed out
+    (this coordinator degrades that case to ``OUTCOME_UNKNOWN``, never a
+    silent/false ``RESOLVED``).
+    """
+
+    def forward(self, request: CommandRequest) -> StrategyCommandReceipt: ...
+
+    def get_receipt(self, command_id: str) -> Optional[StrategyCommandReceipt]: ...
+
+
+class _StrategyRevisionDrift(Exception):
+    """The journal's freshly computed ``entity_revision`` for a ``strategy``
+    entity diverged from the ``state_revision`` strategy_service reported for
+    this command. Would only fire if some OTHER writer journaled a
+    ``strategy.updated`` event for this entity outside
+    ``StrategyControlCommandService.acknowledge_state`` -- a producer bug,
+    never expected in normal operation (mirrors ``_ConcurrentProposalChange``'s
+    role for ``_assert_proposal_revision``)."""
+
+
+def _assert_state_revision(expected: int) -> Callable[[duckdb.DuckDBPyConnection, int], None]:
+    """A ``write_materialized`` callback asserting the journal's freshly
+    computed ``entity_revision`` for entity_type ``"strategy"`` equals the
+    ``state_revision`` strategy_service reported for this command.
+
+    Per the m1f3 briefing's B3 correction: this does NOT (cannot) force
+    ``entity_revision = state_revision`` -- ``DomainMutation`` has no such
+    field and ``DomainJournal.mutate`` always computes the next revision
+    itself. Equality holds only because both counters start fresh at 0 and
+    advance in lockstep, one bump per acknowledged strategy-control command;
+    this assertion is the guard that would catch it drifting, not the
+    mechanism that makes it hold.
+    """
+    def _write(conn: duckdb.DuckDBPyConnection, revision: int) -> None:
+        if revision != expected:
+            raise _StrategyRevisionDrift(
+                f"journal revision {revision} diverged from strategy "
+                f"state_revision {expected}"
+            )
+    return _write
+
+
+class StrategyControlCommandService:
+    """[M1-F3] Task 7 -- the forwarding saga for ``enable_strategy``,
+    ``disable_strategy``, and ``update_strategy_params``.
+
+    Registered on the coordinator via ``register_action("enable_strategy",
+    svc.enable_strategy, requires_preflight=False, saga=True)`` (and the
+    disable/update_strategy_params siblings). Drives its own ledger
+    transitions:
+
+        RECEIVED -> REJECTED                              (unknown strategy, or
+                                                             an exposure-owning
+                                                             disable with no
+                                                             resolved owner)
+        RECEIVED -> VALIDATED -> SUBMITTING -> RESOLVED    (happy path -- BOTH
+                                                             a strategy-side
+                                                             COMMITTED and a
+                                                             ROLLED_BACK resolve
+                                                             here; a rejected
+                                                             params update is a
+                                                             clean, definite
+                                                             outcome, not an
+                                                             ambiguous one)
+        ...      -> SUBMITTING -> OUTCOME_UNKNOWN          (forward() itself
+                                                             timed out/raised --
+                                                             Task 9's reconciler
+                                                             resolves the truth
+                                                             via
+                                                             StrategyControlPort
+                                                             .get_receipt)
+
+    The trader journals a ``strategy.updated`` domain event ONLY after
+    ``forward()`` returns -- i.e. only once strategy_service has actually
+    acknowledged the command (never speculatively before dispatch, never on
+    a bare timeout).
+    """
+
+    def __init__(
+        self,
+        *,
+        journal: DomainJournal,
+        ledger: CommandLedger,
+        port: StrategyControlPort,
+        snapshot: StrategySnapshotPort,
+        reconciler: ReconcilerPort,
+        ownership: Optional[StrategyExposureOwnershipPort] = None,
+        now: Callable[[], dt.datetime] = _utcnow,
+    ):
+        self._journal = journal
+        self._ledger = ledger
+        self._port = port
+        self._snapshot = snapshot
+        self._reconciler = reconciler
+        self._ownership = ownership
+        self._now = now
+
+    # -- public saga entry points (the registered action handlers) --------
+
+    def enable_strategy(self, cmd: CommandRequest) -> CommandReceipt:
+        return self._forward(cmd)
+
+    def disable_strategy(self, cmd: CommandRequest) -> CommandReceipt:
+        return self._forward(cmd)
+
+    def update_strategy_params(self, cmd: CommandRequest) -> CommandReceipt:
+        return self._forward(cmd)
+
+    # -- shared acknowledgement (also called directly by the trader's typed
+    #    record_state_acknowledged command -- see production_api.py) --------
+
+    def acknowledge_state(
+        self,
+        strategy_name: str,
+        state_revision: int,
+        control_revision: int,
+        payload: dict[str, Any],
+        *,
+        correlation_id: str,
+        account_id: Optional[str] = None,
+    ) -> int:
+        """Journal ``strategy.updated`` for this ``state_revision`` and
+        return the journaled ``entity_revision``.
+
+        Idempotent by construction: ``event_id`` is deterministic
+        (``f"strategy:{name}:state:{state_revision}"``), so a duplicate
+        acknowledgement for a revision already journaled with an IDENTICAL
+        payload is a no-op replay inside ``DomainJournal.mutate`` itself. A
+        duplicate whose payload matches but whose ``source_timestamp``
+        differs (the ordinary case for a genuinely later retry) raises
+        ``EventIdentityConflict`` from ``mutate()`` -- caught here and
+        treated as "already durably acknowledged", returning the entity's
+        current revision rather than propagating a spurious failure for
+        what is, from the caller's perspective, still success.
+        """
+        mutation = DomainMutation(
+            event_type="strategy.updated",
+            entity_type="strategy",
+            entity_id=strategy_name,
+            operation="upsert",
+            account_id=account_id,
+            source="trader_service",
+            source_timestamp=self._now_utc(),
+            correlation_id=correlation_id,
+            payload=payload,
+        )
+        try:
+            event = self._journal.mutate(
+                self._journal.connect(),
+                mutation,
+                _assert_state_revision(state_revision),
+                event_id=f"strategy:{strategy_name}:state:{state_revision}",
+            )
+            return event.entity_revision
+        except EventIdentityConflict:
+            entity = self._journal.get_entity("strategy", strategy_name)
+            if entity is not None:
+                return entity["entity_revision"]
+            raise
+
+    # -- internals ----------------------------------------------------------
+
+    def _forward(self, cmd: CommandRequest) -> CommandReceipt:
+        strategy_name = cmd.body.get("strategy_name")
+        if not strategy_name or not self._snapshot.exists(strategy_name):
+            self._transition_command(cmd, "RECEIVED", "REJECTED", error_code="STRATEGY_NOT_FOUND")
+            return self._receipt(cmd.command_id, "REJECTED", "STRATEGY_NOT_FOUND", False)
+
+        if cmd.action == "disable_strategy" and self._ownership is not None:
+            if not self._ownership.remaining_owner_resolved(strategy_name):
+                self._transition_command(
+                    cmd, "RECEIVED", "REJECTED", error_code="EXPOSURE_OWNERSHIP_UNRESOLVED",
+                )
+                return self._receipt(
+                    cmd.command_id, "REJECTED", "EXPOSURE_OWNERSHIP_UNRESOLVED", True,
+                )
+
+        self._transition_command(cmd, "RECEIVED", "VALIDATED")
+        self._transition_command(cmd, "VALIDATED", "SUBMITTING")
+
+        try:
+            strategy_receipt = self._port.forward(cmd)
+        except Exception:
+            # Timeout / disconnect / lost ack. NEVER auto-retry an ambiguous
+            # dispatch (retryable=False): Task 9's reconciler resolves the
+            # true outcome via StrategyControlPort.get_receipt(command_id).
+            self._transition_command(
+                cmd, "SUBMITTING", "OUTCOME_UNKNOWN", error_code="DISPATCH_AMBIGUOUS",
+            )
+            self._reconciler.schedule(cmd.command_id, self._now_utc())
+            return self._receipt(cmd.command_id, "OUTCOME_UNKNOWN", "DISPATCH_AMBIGUOUS", False)
+
+        payload = {
+            "strategy_name": strategy_receipt.strategy_name,
+            "action": strategy_receipt.action,
+            "strategy_state": strategy_receipt.state,
+            "control_revision": strategy_receipt.control_revision,
+            "state_revision": strategy_receipt.state_revision,
+            "error": strategy_receipt.error,
+        }
+        # Only a strategy-side COMMITTED actually bumped state_revision --
+        # journal strategy.updated (asserting entity_revision == state_revision)
+        # ONLY in that case. A ROLLED_BACK outcome minted no new revision on
+        # the strategy side (nothing about the strategy's observable state
+        # changed), so there is no new strategy.updated event to journal for
+        # it -- the command_ledger's own command.updated transition below
+        # (carrying this same outcome payload, including the error) is
+        # already the complete audit trail for a failed attempt.
+        entity_revision = None
+        if strategy_receipt.state == "COMMITTED":
+            entity_revision = self.acknowledge_state(
+                strategy_receipt.strategy_name,
+                strategy_receipt.state_revision,
+                strategy_receipt.control_revision,
+                payload,
+                correlation_id=cmd.correlation_id,
+                account_id=cmd.account_id,
+            )
+        outcome = dict(payload, entity_revision=entity_revision)
+        # Both a strategy-side COMMITTED and a ROLLED_BACK resolve the
+        # COMMAND here -- a rejected params update (e.g. the replacement
+        # strategy failed to instantiate) is a clean, definite outcome, not
+        # an ambiguous one; the caller sees it via outcome["error"].
+        self._transition_command(cmd, "SUBMITTING", "RESOLVED", outcome=outcome)
+        return self._receipt(cmd.command_id, "RESOLVED", None, False, outcome=outcome)
 
     def _transition_command(
         self,

@@ -87,6 +87,14 @@ typed_command_port: 42102
 typed_feed_port: 42103
 service_hmac_key_file: ''
 
+# [M1-F3] Task 7: strategy_service's own typed query/command sockets --
+# the receiving end of the coordinator's one-way strategy-control forwarding
+# (enable_strategy/disable_strategy/update_strategy_params). Bind address and
+# HMAC key are shared with the trader's own typed sockets above (same
+# service_hmac_key_file, same typed_bind_address) -- only the ports differ.
+strategy_typed_command_port: 42104
+strategy_typed_query_port: 42105
+
 # Hard gate: the legacy dill/msgpack RPC path (raw Python objects, no
 # per-method allowlist) may only run when simulation=True AND this is also
 # explicitly true -- production always uses the typed query/command/feed

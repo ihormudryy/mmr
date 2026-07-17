@@ -1,10 +1,12 @@
 from ib_async import Contract
 from ib_async.ib import IB
 from ib_async.ticker import Ticker
+from pydantic import BaseModel, ConfigDict
 from reactivex.observer import AutoDetachObserver
 from trader.common.exceptions import TraderConnectionException, TraderException
 from trader.common.helpers import dateify
 from trader.common.logging_helper import get_callstack, log_method, setup_logging
+from trader.data.duckdb_store import DuckDBConnection
 from trader.data.market_data import normalize_ticker
 from trader.data.store import DateRange
 
@@ -18,12 +20,21 @@ from trader.messaging.clientserver import (
     RPCServer,
     TopicPubSub
 )
+from trader.messaging.typed_rpc import (
+    HmacServiceAuthenticator,
+    TypedRpcClient,
+    TypedRpcRegistry,
+    TypedRpcServer,
+    _DispatchProblem,
+    load_service_hmac_key,
+)
 from trader.objects import Action, BarSize, WhatToShow
 from trader.data.event_store import EventStore, EventType, TradingEvent
 from trader.data.proposal_store import ProposalStore
 from trader.strategy.signal_proposer import SignalProposer
+from trader.strategy.strategy_revisions import StrategyCommandReceipt, StrategyRevisionStore
 from trader.trading.strategy import Signal, Strategy, StrategyConfig, StrategyContext, StrategyState
-from typing import cast, Dict, List, Optional
+from typing import Any, cast, Dict, List, Optional
 
 import asyncio
 import backoff
@@ -69,6 +80,114 @@ def _whattoshow_for_contract(contract: Contract) -> WhatToShow:
     return WhatToShow.TRADES
 
 
+class ControlRevisionConflict(Exception):
+    """[M1-F3] Task 7. The caller's ``expected_control_revision`` did not
+    match the strategy's CURRENT ``control_revision`` -- a stale forwarded
+    command, rejected rather than acted on."""
+
+    def __init__(self, strategy_name: str, current_control_revision: int):
+        self.strategy_name = strategy_name
+        self.current_control_revision = current_control_revision
+        super().__init__(
+            f'control revision conflict for strategy {strategy_name!r}: '
+            f'current control_revision is {current_control_revision}'
+        )
+
+
+# ---------------------------------------------------------------------------
+# [M1-F3] Task 7 -- typed request models + handlers for the strategy-service
+# command/query sockets (42104/42105). Registered onto their own
+# TypedRpcRegistry instances by _register_strategy_control_authority, wired
+# up from StrategyRuntime.connect()/run().
+# ---------------------------------------------------------------------------
+
+class _EnableStrategyRequest(BaseModel):
+    model_config = ConfigDict(extra='forbid')
+    command_id: str
+    strategy_name: str
+    expected_control_revision: int
+
+
+class _DisableStrategyRequest(BaseModel):
+    model_config = ConfigDict(extra='forbid')
+    command_id: str
+    strategy_name: str
+    expected_control_revision: int
+
+
+class _UpdateStrategyParamsRequest(BaseModel):
+    model_config = ConfigDict(extra='forbid')
+    command_id: str
+    strategy_name: str
+    expected_control_revision: int
+    params: Dict[str, Any] = {}
+
+
+class _GetStrategyReceiptRequest(BaseModel):
+    model_config = ConfigDict(extra='forbid')
+    command_id: str
+
+
+def _strategy_receipt_to_dict(receipt: StrategyCommandReceipt) -> Dict[str, Any]:
+    import dataclasses
+    return dataclasses.asdict(receipt)
+
+
+def _control_command_handler(runtime: 'StrategyRuntime', action: str):
+    def _handler(parsed) -> Dict[str, Any]:
+        params = parsed.params if action == 'update_strategy_params' else None
+        try:
+            receipt = runtime.apply_control_command(
+                parsed.command_id, parsed.strategy_name, action,
+                parsed.expected_control_revision, params,
+            )
+        except ControlRevisionConflict as exc:
+            raise _DispatchProblem('CONTROL_REVISION_CONFLICT', str(exc)) from exc
+        return _strategy_receipt_to_dict(receipt)
+    return _handler
+
+
+def _get_strategy_receipt_handler(runtime: 'StrategyRuntime'):
+    def _handler(parsed: _GetStrategyReceiptRequest) -> Dict[str, Any]:
+        receipt = runtime._revisions.get_receipt(parsed.command_id)
+        if receipt is None:
+            raise _DispatchProblem('COMMAND_NOT_FOUND', f'no receipt for command {parsed.command_id!r}')
+        return _strategy_receipt_to_dict(receipt)
+    return _handler
+
+
+def register_strategy_control_authority(
+    command_registry: TypedRpcRegistry, query_registry: TypedRpcRegistry, runtime: 'StrategyRuntime',
+) -> None:
+    """Wire the strategy-control typed surface onto the strategy-service's
+    own command/query registries: ``enable_strategy``, ``disable_strategy``,
+    and ``update_strategy_params`` (the SAME three frozen names the trader's
+    coordinator forwards) on ``command``; ``get_strategy_receipt`` on
+    ``query``. Every handler here is fully self-contained -- it applies
+    locally via ``runtime.apply_control_command`` (which itself commits the
+    receipt + revision bump + outbox row in ONE transaction) and returns --
+    NEVER calls back into the trader while handling the request (see
+    CLAUDE.md memory: dashboard-strategy-controls, the deadlock this exact
+    pattern already caused once).
+    """
+    command_registry.register(
+        'command', 'enable_strategy', _EnableStrategyRequest, dict,
+        _control_command_handler(runtime, 'enable_strategy'),
+    )
+    command_registry.register(
+        'command', 'disable_strategy', _DisableStrategyRequest, dict,
+        _control_command_handler(runtime, 'disable_strategy'),
+    )
+    command_registry.register(
+        'command', 'update_strategy_params', _UpdateStrategyParamsRequest, dict,
+        _control_command_handler(runtime, 'update_strategy_params'),
+    )
+    query_registry.register(
+        'query', 'get_strategy_receipt', _GetStrategyReceiptRequest, dict,
+        _get_strategy_receipt_handler(runtime),
+    )
+
+
 class StrategyRuntime():
     def __init__(
         self,
@@ -89,7 +208,12 @@ class StrategyRuntime():
         strategy_config_file: str,
         history_duckdb_path: str = '',
         paper_trading: bool = False,
-        simulation: bool = False
+        simulation: bool = False,
+        typed_bind_address: str = 'tcp://127.0.0.1',
+        strategy_typed_command_port: int = 42104,
+        strategy_typed_query_port: int = 42105,
+        typed_command_port: int = 42102,
+        service_hmac_key_file: str = '',
     ):
         self.ib_server_address = ib_server_address
         self.ib_server_port = ib_server_port
@@ -107,6 +231,22 @@ class StrategyRuntime():
         self.zmq_strategy_rpc_server_port = zmq_strategy_rpc_server_port
         self.zmq_messagebus_server_address = zmq_messagebus_server_address
         self.zmq_messagebus_server_port = zmq_messagebus_server_port
+
+        # [M1-F3] Task 7: typed, HMAC-authenticated command/query sockets --
+        # reuses the SAME typed_bind_address/service_hmac_key_file config
+        # keys the trader's own typed sockets use (shared HMAC secret is
+        # what lets the two sides authenticate each other); only the ports
+        # are new.
+        self.typed_bind_address = typed_bind_address
+        self.strategy_typed_command_port = strategy_typed_command_port
+        self.strategy_typed_query_port = strategy_typed_query_port
+        # The TRADER's own typed command port (same config key/value
+        # trader_service uses for its own typed_command_port) -- this is
+        # where _drain_ack_outbox's backstop record_state_acknowledged calls
+        # go, NOT this service's own strategy_typed_command_port above.
+        self.typed_command_port = typed_command_port
+        self.service_hmac_key_file = service_hmac_key_file
+        self._revisions: Optional[StrategyRevisionStore] = None
 
         self.strategies_directory = strategies_directory
         self.strategy_config_file = strategy_config_file
@@ -200,6 +340,44 @@ class StrategyRuntime():
             self.zmq_messagebus_client = MessageBusClient(
                 zmq_address=self.zmq_messagebus_server_address,
                 zmq_port=self.zmq_messagebus_server_port,
+            )
+
+            # [M1-F3] Task 7: strategy revisions/receipts/outbox -- the SAME
+            # DuckDB file this runtime already uses for strategy_state
+            # (self.duckdb_path), not the trader's dedicated journal file.
+            self._revisions = StrategyRevisionStore(DuckDBConnection.get_instance(self.duckdb_path))
+            self._revisions.migrate()
+
+            # Typed, HMAC-authenticated command/query sockets (42104/42105 by
+            # default) -- the strategy-service side of the coordinator's
+            # one-way forwarding boundary. Every handler registered here is
+            # fully self-contained (apply locally via
+            # apply_control_command, which itself commits the receipt +
+            # revision bump + outbox row in ONE transaction) and NEVER calls
+            # back into the trader while handling a request.
+            hmac_key = load_service_hmac_key(self.service_hmac_key_file)
+            self._typed_authenticator = HmacServiceAuthenticator(hmac_key)
+            self._typed_command_registry = TypedRpcRegistry()
+            self._typed_query_registry = TypedRpcRegistry()
+            register_strategy_control_authority(
+                self._typed_command_registry, self._typed_query_registry, self,
+            )
+            self.typed_command_server = TypedRpcServer(
+                'command', self._typed_command_registry, self._typed_authenticator,
+                address=self.typed_bind_address, port=self.strategy_typed_command_port,
+            )
+            self.typed_query_server = TypedRpcServer(
+                'query', self._typed_query_registry, self._typed_authenticator,
+                address=self.typed_bind_address, port=self.strategy_typed_query_port,
+            )
+            # Outbound-only client toward the TRADER's own typed command
+            # socket -- used exclusively by _drain_ack_outbox's backstop
+            # record_state_acknowledged calls (never inside a handler
+            # responding to an inbound forwarded command; see that method's
+            # docstring).
+            self._trader_command_client = TypedRpcClient(
+                'command', self._typed_authenticator,
+                address=self.typed_bind_address, port=self.typed_command_port,
             )
 
         except Exception as ex:
@@ -384,6 +562,243 @@ class StrategyRuntime():
 
         logging.info('strategy %s params updated to %s (hot-swapped)', name, merged)
         return {'name': name, 'params': merged}
+
+    # ------------------------------------------------------------------ #
+    # [M1-F3] Task 7 -- coordinator-forwarded strategy control.
+    #
+    # apply_control_command is the ONE entry point every forwarded
+    # enable_strategy/disable_strategy/update_strategy_params command runs
+    # through: idempotent-by-command_id, CAS-guarded on control_revision,
+    # and -- for update_strategy_params -- a crash-safe staged YAML swap
+    # (stage -> validate+instantiate the replacement -> rename onto the
+    # live path; any failure anywhere in that sequence restores the PRIOR
+    # config and rolls back, never leaving a half-applied strategy).
+    # ------------------------------------------------------------------ #
+
+    _CONTROL_ACTIONS = frozenset({'enable_strategy', 'disable_strategy', 'update_strategy_params'})
+
+    def apply_control_command(
+        self,
+        command_id: str,
+        strategy_name: str,
+        action: str,
+        expected_control_revision: int,
+        params: Optional[Dict] = None,
+    ) -> StrategyCommandReceipt:
+        """Self-contained application of one coordinator-forwarded
+        strategy-control command. NEVER calls back into the trader (see
+        CLAUDE.md memory: dashboard-strategy-controls).
+
+        Idempotent: a retry of a ``command_id`` already recorded in the
+        receipt ledger returns the SAME receipt without re-running the
+        mutation (§9.1). Otherwise CAS-guards on ``control_revision`` --
+        raises ``ControlRevisionConflict`` on a stale caller-supplied
+        ``expected_control_revision``.
+        """
+        if action not in self._CONTROL_ACTIONS:
+            raise ValueError(f'unknown strategy control action: {action!r}')
+
+        existing = self._revisions.get_receipt(command_id)
+        if existing is not None:
+            return existing
+
+        current = self._revisions.control_revision(strategy_name)
+        if expected_control_revision != current:
+            raise ControlRevisionConflict(strategy_name, current)
+
+        if action == 'update_strategy_params':
+            prior_entry, proposed_entry = self._config_entries(strategy_name, params or {})
+            revision_id = self._revisions.prepare_config_revision(
+                strategy_name, current, prior_entry, proposed_entry, command_id,
+            )
+            try:
+                self._stage_yaml(proposed_entry)          # write .tmp -- not yet renamed
+                self._swap_runtime(strategy_name, proposed_entry)  # validate + instantiate replacement
+                os.replace(self._staged_path(), self.strategy_config_file)
+            except Exception as ex:
+                self._restore_runtime(strategy_name, prior_entry)
+                self._unstage_yaml()
+                self._revisions.mark_rolled_back(revision_id, str(ex))
+                return self._record(command_id, strategy_name, action, 'ROLLED_BACK', current, error=str(ex))
+            self._revisions.mark_committed(revision_id)
+        elif action == 'enable_strategy':
+            if self.get_strategy(strategy_name) is None:
+                raise ValueError(f'strategy {strategy_name!r} not found')
+            self.enable_strategy(strategy_name)
+        elif action == 'disable_strategy':
+            if self.get_strategy(strategy_name) is None:
+                raise ValueError(f'strategy {strategy_name!r} not found')
+            self.disable_strategy(strategy_name)
+
+        def _commit(conn):
+            control = self._revisions.bump_control_revision_in_tx(conn, strategy_name)
+            state = self._revisions.bump_state_revision_in_tx(
+                conn, strategy_name, self._state_payload(strategy_name, control),
+            )
+            return self._revisions.record_receipt_in_tx(
+                conn, command_id, strategy_name, action, 'COMMITTED', control, state,
+            )
+
+        return self._revisions.db.transaction(_commit)
+
+    def _config_entries(self, strategy_name: str, params: Dict) -> tuple[Dict, Dict]:
+        """Return ``(prior_entry, proposed_entry)`` -- the strategy's CURRENT
+        YAML block and a COPY with ``params`` merged in, mirroring
+        ``update_strategy_params``'s own merge semantics (empty-string value
+        deletes that key)."""
+        with open(self.strategy_config_file) as f:
+            cfg = yaml.safe_load(f) or {}
+        entries = cfg.get('strategies') or []
+        entry = next((e for e in entries if e.get('name') == strategy_name), None)
+        if entry is None:
+            raise ValueError(f'strategy {strategy_name!r} not found in {self.strategy_config_file}')
+
+        prior_entry = dict(entry)
+        merged = dict(entry.get('params') or {})
+        for key, raw in (params or {}).items():
+            if not key:
+                continue
+            if isinstance(raw, str) and raw.strip() == '':
+                merged.pop(key, None)
+                continue
+            merged[key] = self._coerce_param_value(raw)
+
+        proposed_entry = dict(entry)
+        if merged:
+            proposed_entry['params'] = merged
+        else:
+            proposed_entry.pop('params', None)
+        return prior_entry, proposed_entry
+
+    def _staged_path(self) -> str:
+        return self.strategy_config_file + '.tmp'
+
+    def _stage_yaml(self, proposed_entry: Dict) -> None:
+        """Write the FULL config, with ``proposed_entry`` swapped in for its
+        strategy, to the staged ``.tmp`` path -- NOT yet renamed onto the
+        live config file."""
+        with open(self.strategy_config_file) as f:
+            cfg = yaml.safe_load(f) or {}
+        entries = cfg.get('strategies') or []
+        name = proposed_entry.get('name')
+        cfg['strategies'] = [proposed_entry if e.get('name') == name else e for e in entries]
+        with open(self._staged_path(), 'w') as f:
+            yaml.safe_dump(cfg, f, sort_keys=False)
+
+    def _unstage_yaml(self) -> None:
+        try:
+            os.remove(self._staged_path())
+        except OSError:
+            pass
+
+    def _swap_runtime(self, strategy_name: str, config_entry: Dict) -> None:
+        """Validate + instantiate the replacement strategy instance from
+        ``config_entry`` -- reuses ``update_strategy_params``'s own hot-swap
+        body. Raises ``RuntimeError`` if the replacement fails to load
+        (``load_strategy`` swallows load failures internally and simply
+        never appends the new instance -- this is what turns that silent
+        failure into a loud one the caller can catch and roll back)."""
+        merged = config_entry.get('params') or {}
+        old = self.get_strategy(strategy_name)
+        if old is not None:
+            self.strategy_implementations.remove(old)
+            for lst in self.strategies.values():
+                if old in lst:
+                    lst.remove(old)
+            self._last_dispatched_bar = {
+                k: v for k, v in self._last_dispatched_bar.items() if k[1] != strategy_name}
+            sys.modules.pop(f'_mmr_strategy_{strategy_name}', None)
+
+        self.load_strategy(
+            name=strategy_name,
+            bar_size_str=config_entry.get('bar_size', '1 min'),
+            conids=config_entry.get('conids'),
+            universe=config_entry.get('universe'),
+            historical_days_prior=config_entry.get('historical_days_prior', 0),
+            module=config_entry.get('module', ''),
+            class_name=config_entry.get('class_name', ''),
+            description=config_entry.get('description', ''),
+            paper_only=config_entry.get('paper_only', False),
+            auto_execute=config_entry.get('auto_execute', False),
+            params=merged,
+        )
+        new = self.get_strategy(strategy_name)
+        if new is None:
+            raise RuntimeError(
+                f'strategy {strategy_name!r} failed to reload with the proposed '
+                f'configuration -- rolling back')
+
+        # Deliberately NO RPC here -- see update_strategy_params's identical
+        # rationale: this runs while the coordinator's forward() call is
+        # in flight, so calling back into the trader would deadlock.
+        for conId in (new.conids or []):
+            bucket = self.strategies.get(conId)
+            if bucket is not None and new not in bucket:
+                bucket.append(new)
+
+    def _restore_runtime(self, strategy_name: str, prior_entry: Dict) -> None:
+        """Best-effort restoration of the PRIOR configuration after a failed
+        swap. Never re-raises -- the caller is already inside a rollback
+        path building a ROLLED_BACK receipt; a secondary failure here is
+        logged loudly rather than masking the original error."""
+        try:
+            self._swap_runtime(strategy_name, prior_entry)
+        except Exception:
+            logging.error(
+                'failed to restore prior configuration for %s after a rejected '
+                'params update -- the strategy may be left unloaded until the '
+                'next service restart', strategy_name, exc_info=True,
+            )
+
+    def _state_payload(self, strategy_name: str, control_revision: int) -> Dict:
+        strategy = self.get_strategy(strategy_name)
+        state_name = strategy.state.name if strategy is not None else 'UNKNOWN'
+        return {
+            'strategy_name': strategy_name,
+            'state': state_name,
+            'control_revision': control_revision,
+        }
+
+    def _record(
+        self, command_id: str, strategy_name: str, action: str, state: str,
+        control_revision: int, error: Optional[str] = None,
+    ) -> StrategyCommandReceipt:
+        """Record a receipt OUTSIDE the shared commit transaction -- the
+        ROLLED_BACK path, where no revision is minted (``control_revision``
+        is whatever the caller already had; ``state_revision`` is read as
+        the CURRENT value, unchanged since nothing bumped it)."""
+        current_state = self._revisions.state_revision(strategy_name)
+
+        def _tx(conn):
+            return self._revisions.record_receipt_in_tx(
+                conn, command_id, strategy_name, action, state,
+                control_revision, current_state, error=error,
+            )
+        return self._revisions.db.transaction(_tx)
+
+    def recover_startup_config(self) -> list[int]:
+        """[M1-F3] Task 7 startup recovery: every staged config revision left
+        ``PREPARED`` by a crash between staging and commit is restored to
+        its ``prior_config`` in the live YAML and marked ``ROLLED_BACK``.
+        MUST run before the service reports ready / the first
+        ``config_loader`` call (see ``run()``)."""
+        if self._revisions is None:
+            return []
+        recovered = self._revisions.recover_on_startup()
+        for revision_id in recovered:
+            row = self._revisions.get_config_revision(revision_id)
+            if row is None:
+                continue
+            try:
+                self._stage_yaml(row['prior_config'])
+                os.replace(self._staged_path(), self.strategy_config_file)
+            except Exception:
+                logging.error(
+                    'failed to restore prior_config for strategy %s (revision %s) '
+                    'during startup recovery -- config may be left inconsistent',
+                    row['strategy_name'], revision_id, exc_info=True,
+                )
+        return recovered
 
     def __get_enabled_strategies(self, conid: int) -> List[Strategy]:
         if conid in self.strategies:
@@ -843,6 +1258,45 @@ class StrategyRuntime():
         except (TimeoutError, ConnectionError) as ex:
             logging.debug('reconciliation RPC failed (trader_service may be restarting): %s', ex)
 
+        # 3. [M1-F3] Task 7: drain any acknowledgement-outbox rows the trader
+        # might have missed (its record_state_acknowledged reply was lost, or
+        # this process restarted before draining). Isolated: a drain failure
+        # must not skip config reload/re-subscription above, and every row is
+        # retried independently so one bad row doesn't block the rest.
+        try:
+            self._drain_ack_outbox()
+        except Exception as ex:
+            logging.warning('ack-outbox drain failed (will retry next cycle): %s', ex)
+
+    def _drain_ack_outbox(self, limit: int = 50) -> None:
+        """Push unacknowledged ``strategy_ack_outbox`` rows to the trader's
+        typed ``record_state_acknowledged`` command. This is a BACKSTOP --
+        the common case already acknowledges synchronously as part of the
+        forwarded command's own reply (see
+        ``command_coordinator.StrategyControlCommandService._forward``); this
+        loop only matters when that reply was lost in transit. Per-row
+        isolated: one row's failure must not block the rest, and an
+        unacknowledged row is simply retried on the next 30s tick."""
+        client = getattr(self, '_trader_command_client', None)
+        if self._revisions is None or client is None:
+            return
+        for row in self._revisions.unacknowledged_outbox(limit):
+            body = {
+                'strategy_name': row.strategy_name,
+                'state_revision': row.state_revision,
+                'control_revision': row.control_revision,
+                'payload': row.payload,
+            }
+            try:
+                client.call('record_state_acknowledged', body, dict)
+            except Exception as ex:
+                logging.debug(
+                    'record_state_acknowledged failed for %s state_revision %s '
+                    '(will retry next cycle): %s', row.strategy_name, row.state_revision, ex,
+                )
+                continue
+            self._revisions.mark_acknowledged(row.ack_id)
+
     async def _reconnect_historical_client(self):
         """Disconnect and reconnect the IB historical data client."""
         logging.info('reconnecting historical data IB client')
@@ -1015,6 +1469,9 @@ class StrategyRuntime():
         # actually get a chance to run.
         await self.zmq_messagebus_client.connect()
         await self.zmq_strategy_rpc_server.serve()
+        await self.typed_command_server.serve()
+        await self.typed_query_server.serve()
+        self._trader_command_client.connect()
 
         await self.trader_client.connect()
 
@@ -1031,6 +1488,11 @@ class StrategyRuntime():
             on_completed=self.on_ticker_completed
         )
         self.subscription = observable.subscribe(self.observer)
+
+        # [M1-F3] Task 7: recover any staged config swap left PREPARED by a
+        # crash between staging and commit -- MUST run before the first
+        # config_loader() call below reads the (possibly still-staged) YAML.
+        self.recover_startup_config()
 
         logging.debug('loading {} config file'.format(self.strategy_config_file))
         self.config_loader(self.strategy_config_file)

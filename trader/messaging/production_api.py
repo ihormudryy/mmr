@@ -79,6 +79,7 @@ would otherwise scrub to an opaque ``INTERNAL_ERROR``.
 
 from __future__ import annotations
 
+import dataclasses
 import datetime as dt
 from dataclasses import asdict
 from typing import Any, Dict, Optional
@@ -90,12 +91,20 @@ from trader.domain.commands import CommandReceipt
 from trader.domain.feed_service import CURSOR_EXPIRED, CursorExpired, DomainFeedService, domain_event_to_wire
 from trader.domain.snapshot_service import SNAPSHOT_NOT_READY, DomainSnapshotService, SnapshotNotReady
 from trader.messaging.trader_service_api import TraderServiceApi
-from trader.messaging.typed_rpc import HmacServiceAuthenticator, TypedRpcRegistry, _DispatchProblem
+from trader.messaging.typed_rpc import (
+    HmacServiceAuthenticator,
+    TypedRpcClient,
+    TypedRpcRegistry,
+    TypedRpcRemoteError,
+    _DispatchProblem,
+)
+from trader.strategy.strategy_revisions import StrategyCommandReceipt
 from trader.trading.command_coordinator import (
     ApprovalCommandService,
     CancelCommandService,
     CommandRequest,
     CommandValidationError,
+    StrategyControlCommandService,
     TradingCommandCoordinator,
 )
 from trader.trading.proposal_command_service import (
@@ -325,6 +334,69 @@ class CancelOrdersRequest(BaseModel):
         return _reject_colon_in_command_id(value)
 
 
+class EnableStrategyRequest(BaseModel):
+    """[M1-F3] Task 7. Forwarded through ``StrategyControlCommandService`` to
+    strategy_service via ``StrategyControlPort.forward``. ``expected_control_revision``
+    is the CAS guard strategy_service checks before applying the mutation --
+    a stale value is rejected (``ControlRevisionConflict``) rather than acting
+    on a strategy whose control state changed since the caller last read it."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    command_id: str
+    strategy_name: str
+    expected_control_revision: int
+
+    @field_validator("command_id")
+    @classmethod
+    def _command_id_has_no_colon(cls, value: str) -> str:
+        return _reject_colon_in_command_id(value)
+
+
+class DisableStrategyRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    command_id: str
+    strategy_name: str
+    expected_control_revision: int
+
+    @field_validator("command_id")
+    @classmethod
+    def _command_id_has_no_colon(cls, value: str) -> str:
+        return _reject_colon_in_command_id(value)
+
+
+class UpdateStrategyParamsRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    command_id: str
+    strategy_name: str
+    expected_control_revision: int
+    params: Dict[str, Any] = {}
+
+    @field_validator("command_id")
+    @classmethod
+    def _command_id_has_no_colon(cls, value: str) -> str:
+        return _reject_colon_in_command_id(value)
+
+
+class RecordStateAcknowledgedRequest(BaseModel):
+    """[M1-F3] Task 7. NOT routed through ``TradingCommandCoordinator`` --
+    this is an internal strategy_service -> trader acknowledgement (backstop
+    path for a state_revision bump whose original forwarded command's reply
+    was lost), not a user-initiated mutation, so it carries no ``command_id``/
+    ledger entry of its own. Idempotent: acknowledging the same
+    ``state_revision`` twice is a safe no-op (see
+    ``StrategyControlCommandService.acknowledge_state``)."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    strategy_name: str
+    state_revision: int
+    control_revision: int
+    payload: Dict[str, Any] = {}
+
+
 class GetTradingControlRequest(BaseModel):
     """No fields: this always reads the coordinator's own configured
     account, exactly like the command above never accepts one."""
@@ -476,6 +548,44 @@ def _cancel_orders_rpc_handler(coordinator: TradingCommandCoordinator, account_i
     return _handler
 
 
+def _strategy_receipt_to_dict(receipt: StrategyCommandReceipt) -> Dict[str, Any]:
+    return dataclasses.asdict(receipt)
+
+
+def _strategy_control_rpc_handler(
+    coordinator: TradingCommandCoordinator, account_id: Optional[str], action: str,
+):
+    """[M1-F3] Task 7. Shared handler body for ``enable_strategy``/
+    ``disable_strategy``/``update_strategy_params`` -- builds the
+    ``CommandRequest`` envelope (``expected_version`` carries
+    ``expected_control_revision``, ``target_type="strategy"``) and drives it
+    through the coordinator, which dispatches to
+    ``StrategyControlCommandService``'s forwarding saga."""
+    def _handler(parsed) -> Dict[str, Any]:
+        body: Dict[str, Any] = {"strategy_name": parsed.strategy_name}
+        if action == "update_strategy_params":
+            body["params"] = parsed.params
+        request = CommandRequest(
+            command_id=parsed.command_id, action=action, account_id=account_id,
+            target_type="strategy", target_id=parsed.strategy_name,
+            expected_version=parsed.expected_control_revision,
+            body=body, source="dashboard",
+        )
+        receipt = coordinator.execute(request)
+        return _receipt_to_dict(receipt)
+    return _handler
+
+
+def _record_state_acknowledged_handler(strategy_control_service: StrategyControlCommandService):
+    def _handler(parsed: RecordStateAcknowledgedRequest) -> Dict[str, Any]:
+        entity_revision = strategy_control_service.acknowledge_state(
+            parsed.strategy_name, parsed.state_revision, parsed.control_revision,
+            parsed.payload, correlation_id=f"strategy:{parsed.strategy_name}:ack",
+        )
+        return {"entity_revision": entity_revision}
+    return _handler
+
+
 def _set_trading_pause_action(controls: TradingControlStore, account_id: Optional[str]):
     """The coordinator-registered inner action for ``set_trading_pause``.
 
@@ -567,6 +677,7 @@ def register_command_authority(
     controls: Optional[TradingControlStore] = None,
     approval_service: Optional[ApprovalCommandService] = None,
     cancel_service: Optional[CancelCommandService] = None,
+    strategy_control_service: Optional[StrategyControlCommandService] = None,
 ) -> None:
     """Wire the command-authority surface onto ``registry``.
 
@@ -609,6 +720,18 @@ def register_command_authority(
     ``cancel_orders`` (non-saga -- fans out into per-order ``cancel_order``
     children) onto ``command``. Omitted (the default) leaves the cancel
     surface unregistered.
+
+    [M1-F3] Task 7: when ``strategy_control_service`` (a
+    ``StrategyControlCommandService``) is also supplied, ALSO registers
+    ``enable_strategy``, ``disable_strategy``, and ``update_strategy_params``
+    (each a SAGA action -- the service forwards to strategy_service and
+    drives its own RESOLVED/OUTCOME_UNKNOWN transitions; none requires a
+    preflight nonce, mirroring create/reject_proposal's "no market impact at
+    this step" rationale) plus ``record_state_acknowledged`` (registered
+    directly on ``registry``, NOT through the coordinator -- it is an
+    internal strategy_service -> trader acknowledgement, not a
+    user-initiated command, so it carries no ledger/audit row of its own).
+    Omitted (the default) leaves the strategy-control surface unregistered.
     """
     coordinator.register_action(
         "create_proposal", _create_proposal_action(proposal_service), requires_preflight=False,
@@ -669,6 +792,87 @@ def register_command_authority(
             _cancel_orders_rpc_handler(coordinator, account_id),
         )
 
+    if strategy_control_service is not None:
+        coordinator.register_action(
+            "enable_strategy", strategy_control_service.enable_strategy,
+            requires_preflight=False, saga=True,
+        )
+        coordinator.register_action(
+            "disable_strategy", strategy_control_service.disable_strategy,
+            requires_preflight=False, saga=True,
+        )
+        coordinator.register_action(
+            "update_strategy_params", strategy_control_service.update_strategy_params,
+            requires_preflight=False, saga=True,
+        )
+        registry.register(
+            "command", "enable_strategy", EnableStrategyRequest, dict,
+            _strategy_control_rpc_handler(coordinator, account_id, "enable_strategy"),
+        )
+        registry.register(
+            "command", "disable_strategy", DisableStrategyRequest, dict,
+            _strategy_control_rpc_handler(coordinator, account_id, "disable_strategy"),
+        )
+        registry.register(
+            "command", "update_strategy_params", UpdateStrategyParamsRequest, dict,
+            _strategy_control_rpc_handler(coordinator, account_id, "update_strategy_params"),
+        )
+        registry.register(
+            "command", "record_state_acknowledged", RecordStateAcknowledgedRequest, dict,
+            _record_state_acknowledged_handler(strategy_control_service),
+        )
+
+
+def _dict_to_strategy_receipt(data: Dict[str, Any]) -> StrategyCommandReceipt:
+    return StrategyCommandReceipt(
+        command_id=data["command_id"], strategy_name=data["strategy_name"],
+        action=data["action"], state=data["state"],
+        control_revision=data["control_revision"], state_revision=data["state_revision"],
+        error=data.get("error"),
+    )
+
+
+class TypedStrategyControlPort:
+    """[M1-F3] Task 7. Concrete ``StrategyControlPort`` backed by a pair of
+    ``TypedRpcClient``s (``command``/``query`` roles) against
+    strategy_service's typed sockets (``strategy_typed_command_port`` /
+    ``strategy_typed_query_port`` -- 42104/42105 by default).
+
+    Production wiring of an instance of this class into ``Trader.connect()``
+    (constructing the two ``TypedRpcClient``s and passing this as
+    ``strategy_control_service``'s ``port``) is deferred -- ``trading_runtime.py``/
+    ``trader_service.py`` are outside this task's file scope (mirroring how
+    Tasks 3-6's own coordinator/approval/cancel services are similarly not
+    yet threaded into a live ``Trader.connect()`` call). This class is ready
+    for that follow-on wiring.
+    """
+
+    def __init__(self, command_client: TypedRpcClient, query_client: TypedRpcClient):
+        self._command_client = command_client
+        self._query_client = query_client
+
+    def forward(self, request: CommandRequest) -> StrategyCommandReceipt:
+        body: Dict[str, Any] = {
+            "command_id": request.command_id,
+            "strategy_name": request.body["strategy_name"],
+            "expected_control_revision": request.expected_version,
+        }
+        if request.action == "update_strategy_params":
+            body["params"] = request.body.get("params") or {}
+        response = self._command_client.call(request.action, body, dict)
+        return _dict_to_strategy_receipt(response)
+
+    def get_receipt(self, command_id: str) -> Optional[StrategyCommandReceipt]:
+        try:
+            response = self._query_client.call(
+                "get_strategy_receipt", {"command_id": command_id}, dict,
+            )
+        except TypedRpcRemoteError as exc:
+            if exc.code == "COMMAND_NOT_FOUND":
+                return None
+            raise
+        return _dict_to_strategy_receipt(response)
+
 
 def build_production_registry(
     trader,
@@ -682,6 +886,7 @@ def build_production_registry(
     trading_control: Optional[TradingControlStore] = None,
     approval_service: Optional[ApprovalCommandService] = None,
     cancel_service: Optional[CancelCommandService] = None,
+    strategy_control_service: Optional[StrategyControlCommandService] = None,
 ) -> TypedRpcRegistry:
     """Build the typed-RPC registry a production ``trader_service`` serves.
 
@@ -722,6 +927,14 @@ def build_production_registry(
     ``register_command_authority``'s own docstring for what it adds
     (``cancel_order`` / ``cancel_orders``). Omitted, the default, changes
     nothing.
+
+    [M1-F3] Task 7 addition: ``strategy_control_service`` (a
+    ``StrategyControlCommandService``) is likewise an additional OPTIONAL
+    keyword, only consulted when the base three command-authority services
+    are ALSO present — see ``register_command_authority``'s own docstring
+    for what it adds (``enable_strategy`` / ``disable_strategy`` /
+    ``update_strategy_params`` / ``record_state_acknowledged``). Omitted,
+    the default, changes nothing.
     """
     if not isinstance(authenticator, HmacServiceAuthenticator):
         raise TypeError(
@@ -750,6 +963,7 @@ def build_production_registry(
             controls=trading_control,
             approval_service=approval_service,
             cancel_service=cancel_service,
+            strategy_control_service=strategy_control_service,
         )
 
     if snapshot_service is not None:

@@ -59,6 +59,12 @@ def main(simulation: bool,
         strategy_runtime = container.resolve(StrategyRuntime)
 
         strategy_runtime.connect()
+        # [M1-F3] Task 7: recover any staged strategy-config swap left
+        # PREPARED by a crash between staging and commit BEFORE this service
+        # reports ready. Idempotent (a clean startup finds nothing to
+        # recover) and safe to call again on every restart triggered by
+        # on_runtime_done below, since run() also calls it defensively.
+        strategy_runtime.recover_startup_config()
 
         restart_count = 0
 

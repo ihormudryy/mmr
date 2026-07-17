@@ -93,6 +93,7 @@ from trader.messaging.trader_service_api import TraderServiceApi
 from trader.messaging.typed_rpc import HmacServiceAuthenticator, TypedRpcRegistry, _DispatchProblem
 from trader.trading.command_coordinator import (
     ApprovalCommandService,
+    CancelCommandService,
     CommandRequest,
     CommandValidationError,
     TradingCommandCoordinator,
@@ -284,6 +285,46 @@ class ApproveProposalRequest(BaseModel):
         return _reject_colon_in_command_id(value)
 
 
+class CancelOrderRequest(BaseModel):
+    """[M1-F3] Task 6. Cancels one working order by its [M1-F2] entity id.
+
+    Whether this needs a preflight nonce is NOT static here (unlike
+    ``ApproveProposalRequest``): it is derived inside the coordinator's
+    ``cancel_order`` saga from the order's classification (an entry-leg
+    cancel is risk-REDUCING and never needs one; a protective-leg or
+    unclassifiable-leg cancel is risk-INCREASING and does). The account is
+    the coordinator's own configured account, never request-supplied.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    command_id: str
+    order_entity_id: str
+    preflight_nonce: Optional[str] = None
+
+    @field_validator("command_id")
+    @classmethod
+    def _command_id_has_no_colon(cls, value: str) -> str:
+        return _reject_colon_in_command_id(value)
+
+
+class CancelOrdersRequest(BaseModel):
+    """[M1-F3] Task 6. Cancels a batch of working orders under one root
+    command; the coordinator fans this out into one colon-free child
+    ``cancel_order`` command per entry (see ``CancelCommandService.cancel_orders``)."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    command_id: str
+    order_entity_ids: list[str]
+    preflight_nonce: Optional[str] = None
+
+    @field_validator("command_id")
+    @classmethod
+    def _command_id_has_no_colon(cls, value: str) -> str:
+        return _reject_colon_in_command_id(value)
+
+
 class GetTradingControlRequest(BaseModel):
     """No fields: this always reads the coordinator's own configured
     account, exactly like the command above never accepts one."""
@@ -402,6 +443,39 @@ def _approve_proposal_rpc_handler(coordinator: TradingCommandCoordinator, accoun
     return _handler
 
 
+def _cancel_order_rpc_handler(coordinator: TradingCommandCoordinator, account_id: Optional[str]):
+    """[M1-F3] Task 6. Builds the ``cancel_order`` command envelope and drives
+    it through the coordinator (which dispatches to the registered
+    ``CancelCommandService.cancel_order`` saga). ``target_id`` is the order's
+    [M1-F2] entity id."""
+    def _handler(parsed: CancelOrderRequest) -> Dict[str, Any]:
+        request = CommandRequest(
+            command_id=parsed.command_id, action="cancel_order", account_id=account_id,
+            target_type="order", target_id=parsed.order_entity_id, expected_version=None,
+            body={"order_entity_id": parsed.order_entity_id}, source="dashboard",
+            preflight_nonce=parsed.preflight_nonce,
+        )
+        receipt = coordinator.execute(request)
+        return _receipt_to_dict(receipt)
+    return _handler
+
+
+def _cancel_orders_rpc_handler(coordinator: TradingCommandCoordinator, account_id: Optional[str]):
+    """[M1-F3] Task 6. Builds the root ``cancel_orders`` command envelope;
+    ``CancelCommandService.cancel_orders`` (a non-saga action) fans it out
+    into per-order children through the SAME coordinator."""
+    def _handler(parsed: CancelOrdersRequest) -> Dict[str, Any]:
+        request = CommandRequest(
+            command_id=parsed.command_id, action="cancel_orders", account_id=account_id,
+            target_type="order_group", target_id="", expected_version=None,
+            body={"order_entity_ids": parsed.order_entity_ids}, source="dashboard",
+            preflight_nonce=parsed.preflight_nonce,
+        )
+        receipt = coordinator.execute(request)
+        return _receipt_to_dict(receipt)
+    return _handler
+
+
 def _set_trading_pause_action(controls: TradingControlStore, account_id: Optional[str]):
     """The coordinator-registered inner action for ``set_trading_pause``.
 
@@ -492,6 +566,7 @@ def register_command_authority(
     account_id: Optional[str] = None,
     controls: Optional[TradingControlStore] = None,
     approval_service: Optional[ApprovalCommandService] = None,
+    cancel_service: Optional[CancelCommandService] = None,
 ) -> None:
     """Wire the command-authority surface onto ``registry``.
 
@@ -526,6 +601,14 @@ def register_command_authority(
     (``saga=True``: the service drives its own SUBMITTING/SUBMITTED/
     OUTCOME_UNKNOWN transitions) and ALWAYS requires a preflight nonce. Omitted
     (the default) leaves the approval surface unregistered.
+
+    [M1-F3] Task 6: when ``cancel_service`` (a ``CancelCommandService``) is
+    also supplied, ALSO registers ``cancel_order`` (saga -- the coordinator's
+    own static preflight gate is bypassed; the service derives the ceremony
+    requirement itself from the order's risk classification) and
+    ``cancel_orders`` (non-saga -- fans out into per-order ``cancel_order``
+    children) onto ``command``. Omitted (the default) leaves the cancel
+    surface unregistered.
     """
     coordinator.register_action(
         "create_proposal", _create_proposal_action(proposal_service), requires_preflight=False,
@@ -570,6 +653,22 @@ def register_command_authority(
             _approve_proposal_rpc_handler(coordinator, account_id),
         )
 
+    if cancel_service is not None:
+        coordinator.register_action(
+            "cancel_order", cancel_service.cancel_order, requires_preflight=False, saga=True,
+        )
+        coordinator.register_action(
+            "cancel_orders", cancel_service.cancel_orders, requires_preflight=False,
+        )
+        registry.register(
+            "command", "cancel_order", CancelOrderRequest, dict,
+            _cancel_order_rpc_handler(coordinator, account_id),
+        )
+        registry.register(
+            "command", "cancel_orders", CancelOrdersRequest, dict,
+            _cancel_orders_rpc_handler(coordinator, account_id),
+        )
+
 
 def build_production_registry(
     trader,
@@ -582,6 +681,7 @@ def build_production_registry(
     proposal_repository: Optional[ProposalRepository] = None,
     trading_control: Optional[TradingControlStore] = None,
     approval_service: Optional[ApprovalCommandService] = None,
+    cancel_service: Optional[CancelCommandService] = None,
 ) -> TypedRpcRegistry:
     """Build the typed-RPC registry a production ``trader_service`` serves.
 
@@ -615,6 +715,13 @@ def build_production_registry(
     ``register_command_authority``'s own docstring for what it adds
     (``set_trading_pause`` / ``get_trading_control``). Omitted, the default,
     changes nothing.
+
+    [M1-F3] Task 6 addition: ``cancel_service`` (a ``CancelCommandService``)
+    is likewise an additional OPTIONAL keyword, only consulted when the base
+    three command-authority services are ALSO present — see
+    ``register_command_authority``'s own docstring for what it adds
+    (``cancel_order`` / ``cancel_orders``). Omitted, the default, changes
+    nothing.
     """
     if not isinstance(authenticator, HmacServiceAuthenticator):
         raise TypeError(
@@ -642,6 +749,7 @@ def build_production_registry(
             account_id=getattr(trader, 'ib_account', None),
             controls=trading_control,
             approval_service=approval_service,
+            cancel_service=cancel_service,
         )
 
     if snapshot_service is not None:

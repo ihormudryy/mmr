@@ -77,6 +77,7 @@ from typing import Any, Callable, Literal, Optional, Protocol
 
 import duckdb
 
+from trader.data.broker_state import BrokerOrderRow
 from trader.data.domain_journal import DomainJournal, EventIdentityConflict
 from trader.data.proposal_repository import (
     ApprovalClaim,
@@ -388,6 +389,16 @@ class CommandRequest:
     ``mmr:og-{command_id}``, so a colon inside ``command_id`` would corrupt
     that encoding. There is deliberately no ``skip_risk_gate`` field, here or
     anywhere else on the command surface.
+
+    ``parent_command_id`` [F3 Task 6]: set only on the per-order CHILD
+    commands ``CancelCommandService.cancel_orders`` fans a root
+    ``cancel_orders`` command out into (``f"{root}-{index}"`` -- colon-free,
+    per Task 6 addendum §4). It is deliberately NOT folded into
+    ``command_id`` itself (each child still needs its own unique ledger
+    row/primary key); ``correlation_id`` below is the derived value every
+    ``command.updated`` journal event and audit record actually uses, so a
+    child's own events correlate back to the root that dispatched it rather
+    than to the child's own (otherwise-unrelated) command_id.
     """
 
     command_id: str
@@ -399,6 +410,7 @@ class CommandRequest:
     body: dict[str, Any]
     source: str
     preflight_nonce: Optional[str] = None
+    parent_command_id: Optional[str] = None
 
     def __post_init__(self) -> None:
         if ":" in self.command_id:
@@ -406,6 +418,16 @@ class CommandRequest:
                 f"command_id must not contain ':' (encode_order_ref reserves it "
                 f"for the mmr: orderRef prefix): {self.command_id!r}"
             )
+
+    @property
+    def correlation_id(self) -> str:
+        """The correlation carried on this request's journal/audit events.
+
+        Defaults to the command's own ``command_id`` (self-correlated, the
+        behaviour every existing action already had) unless
+        ``parent_command_id`` is set.
+        """
+        return self.parent_command_id or self.command_id
 
 
 def canonical_request_hash(request: CommandRequest) -> str:
@@ -806,7 +828,7 @@ class TradingCommandCoordinator:
                         "missing, expired, or already-consumed preflight nonce",
                     )
             row = self._ledger.insert_received_in_tx(conn, request, request_hash, received_at)
-            self._audit.record_in_tx(conn, request, correlation_id=request.command_id, now=received_at)
+            self._audit.record_in_tx(conn, request, correlation_id=request.correlation_id, now=received_at)
             inserted.append(row)
 
         received_mutation = DomainMutation(
@@ -817,7 +839,7 @@ class TradingCommandCoordinator:
             account_id=request.account_id,
             source="trader_service",
             source_timestamp=received_at,
-            correlation_id=request.command_id,
+            correlation_id=request.correlation_id,
             payload={
                 "state": "RECEIVED",
                 "action": request.action,
@@ -1028,7 +1050,7 @@ def _command_updated_mutation(
         account_id=request.account_id,
         source="trader_service",
         source_timestamp=now,
-        correlation_id=request.command_id,
+        correlation_id=request.correlation_id,
         payload={
             "state": to_state,
             "action": request.action,
@@ -1380,6 +1402,314 @@ class ApprovalCommandService:
         self._journal.mutate_batch_work(self._journal.connect(), work)
 
     # -- command-ledger single-step transition ---------------------------
+
+    def _transition_command(
+        self,
+        cmd: CommandRequest,
+        from_state: str,
+        to_state: str,
+        *,
+        outcome: Optional[dict[str, Any]] = None,
+        error_code: Optional[str] = None,
+    ) -> None:
+        now = self._now_utc()
+
+        def _write(conn: duckdb.DuckDBPyConnection, _revision: int) -> None:
+            self._ledger.transition_in_tx(
+                conn, cmd.command_id, from_state, to_state,
+                outcome=outcome, error_code=error_code, now=now,
+            )
+
+        self._journal.mutate(
+            self._journal.connect(),
+            _command_updated_mutation(cmd, to_state, now, outcome=outcome, error_code=error_code),
+            _write,
+            event_id=f"command:{cmd.command_id}:{to_state.lower()}",
+        )
+
+    @staticmethod
+    def _receipt(
+        command_id: str, state: str, error_code: Optional[str], retryable: bool,
+        *, outcome: Optional[dict[str, Any]] = None,
+    ) -> CommandReceipt:
+        return CommandReceipt(
+            command_id=command_id, correlation_id=command_id, state=state,
+            outcome=outcome, error_code=error_code, retryable=retryable,
+        )
+
+    def _now_utc(self) -> dt.datetime:
+        return _as_utc(self._now())
+
+
+# ---------------------------------------------------------------------------
+# [M1-F3] Task 6: working-order cancel authority.
+#
+# Consumes [M1-F2]'s REAL materialized broker-order store
+# (``trader/data/broker_state.py``) -- ``OrderStateView`` wraps
+# ``BrokerStateStore.get_order_in_tx`` behind a conn-free read seam and
+# returns the real ``BrokerOrderRow``, never a parallel dataclass (Task 6
+# addendum §1).
+# ---------------------------------------------------------------------------
+
+class OrderStateView(Protocol):
+    """Read seam onto [M1-F2]'s materialized ``broker_orders`` store.
+
+    ``get_order`` is deliberately conn-free -- unlike
+    ``BrokerStateStore.get_order_in_tx``, which requires an open connection
+    -- so a production adapter can wrap that method later (T8/T9 wiring)
+    while tests supply a trivial fake backed by real ``BrokerOrderRow``
+    instances.
+    """
+
+    def get_order(self, order_entity_id: str) -> Optional[BrokerOrderRow]: ...
+
+
+# Mirrors ``book.py:42`` (``BookSubject._ACTIVE_STATUSES``) -- kept
+# textually identical. That frozenset is the single source of truth for
+# "still working" IB order statuses; anything else (Filled, Cancelled,
+# ApiCancelled, Inactive) is terminal. There is no ``is_terminal`` field on
+# ``BrokerOrderRow`` (Task 6 addendum §3): terminality is derived here from
+# ``status``/``deleted`` rather than importing book.py's private class
+# attribute.
+_ACTIVE_ORDER_STATUSES = frozenset({
+    "PendingSubmit", "ApiPending", "PreSubmitted", "Submitted", "PendingCancel",
+})
+
+
+def _is_terminal_order(order: BrokerOrderRow) -> bool:
+    return order.deleted or order.status not in _ACTIVE_ORDER_STATUSES
+
+
+def classify_cancel(order: Optional[BrokerOrderRow]) -> RiskDirection:
+    """Whether cancelling ``order`` reduces or increases market exposure.
+
+    [Task 6 addendum §2]: ``order_correlation.classify_leg`` is the ONLY
+    producer of ``leg``; its values are ``"entry"`` (no parent), ``"stop"``,
+    ``"take_profit"``, ``f"child-{client_order_id}"``, or ``None``
+    (external / no group). Cancelling an entry removes PENDING exposure
+    (REDUCING). Cancelling a protective leg strips protection from an
+    already-open position (INCREASING). A ``None`` row, a ``None`` leg, or
+    any non-entry leg is treated as protective -- fail safe toward requiring
+    the ceremony, never toward a silent unprotected cancel.
+    """
+    if order is not None and order.leg == "entry":
+        return RiskDirection.REDUCING
+    return RiskDirection.INCREASING
+
+
+class CancelCommandService:
+    """The cancel saga -- working-order cancel authority.
+
+    Registered on the coordinator via
+    ``register_action("cancel_order", svc.cancel_order,
+    requires_preflight=False, saga=True)`` and ``register_action(
+    "cancel_orders", svc.cancel_orders, requires_preflight=False)``.
+
+    Unlike ``ApprovalCommandService``, the preflight-nonce requirement here
+    is NOT static: it is derived from ``classify_cancel``'s risk direction,
+    which can only be evaluated once the target order's row is loaded. The
+    coordinator's own top-level nonce gate is therefore deliberately
+    bypassed (``requires_preflight=False``) for both actions and
+    re-implemented inside ``cancel_order`` itself, consuming the nonce
+    guarded inside the SAME claiming transaction as the VALIDATED ->
+    SUBMITTING transition -- mirroring ``ApprovalCommandService.approve``'s
+    in-tx pause re-check for an INCREASING approval.
+
+    ``cancel_order`` drives its own ledger transitions (mirrors the
+    CURRENT, post-fix ``ApprovalCommandService.approve`` -- commit
+    86ef4cc -- for its dispatch + post-dispatch handling):
+
+        RECEIVED -> REJECTED                             (missing order: ORDER_NOT_FOUND)
+        RECEIVED -> RESOLVED                              (terminal order: no-op)
+        RECEIVED -> VALIDATED -> REJECTED                 (ceremony required, nonce missing/invalid)
+        RECEIVED -> VALIDATED -> SUBMITTING -> SUBMITTED  (happy path)
+        ...      -> SUBMITTING -> OUTCOME_UNKNOWN         (ambiguous dispatch / post-dispatch tx failure)
+
+    An ambiguous dispatch (broker cancel timeout/disconnect) or a failure of
+    the post-dispatch finish tx (the cancel is already live at the broker)
+    both degrade to ``OUTCOME_UNKNOWN``/``DISPATCH_AMBIGUOUS``,
+    ``retryable=False``, and call ``self._reconciler.schedule(...)`` -- never
+    a raw exception or a generic ``INTERNAL_ERROR`` with nothing scheduled.
+
+    ``cancel_orders`` is NOT a saga: it validates the list, mints one
+    colon-free, deterministic child ``command_id`` per order
+    (``f"{root}-{index}"`` -- Task 6 addendum §4: the base brief's
+    ``f"{root}:{order_entity_id}"`` scheme is a colon-in-command_id
+    invariant violation caught by ``CommandRequest.__post_init__``/
+    ``encode_order_ref``), carries the ``order_entity_id`` in the child's
+    ``target_id``/``body`` (never in the command_id), and executes each
+    child through the SAME coordinator (``coordinator.execute(child)``) so
+    every child gets its own ledger row, audit record, and the full
+    ``cancel_order`` saga treatment. Every child's ``parent_command_id`` is
+    the root's ``command_id``, so its ``command.updated`` journal events all
+    carry the root as ``correlation_id`` (addendum §4: "child correlation_id
+    = the root command_id"). Returning a plain dict outcome lets the
+    coordinator's existing single-step ``RECEIVED -> RESOLVED`` fallback
+    finish the root command with ``{"child_command_ids": [...],
+    "classifications": {...}}``.
+    """
+
+    def __init__(
+        self,
+        *,
+        journal: DomainJournal,
+        ledger: CommandLedger,
+        orders_view: OrderStateView,
+        dispatch: OrderDispatchPort,
+        nonces: PreflightNonceGate,
+        risk_producer: Any,
+        reconciler: ReconcilerPort,
+        coordinator: TradingCommandCoordinator,
+        now: Callable[[], dt.datetime] = _utcnow,
+    ):
+        self._journal = journal
+        self._ledger = ledger
+        self._orders_view = orders_view
+        self._dispatch = dispatch
+        self._nonces = nonces
+        self._risk_producer = risk_producer
+        self._reconciler = reconciler
+        self._coordinator = coordinator
+        self._now = now
+
+    # -- public saga entry point: single-order cancel ----------------------
+
+    def cancel_order(self, cmd: CommandRequest) -> CommandReceipt:
+        order_entity_id = cmd.body["order_entity_id"]
+        order = self._orders_view.get_order(order_entity_id)
+
+        if order is None:
+            # Never blind-cancel: a missing row is unclassifiable, so this
+            # is a definite rejection, not an ambiguous outcome.
+            self._transition_command(cmd, "RECEIVED", "REJECTED", error_code="ORDER_NOT_FOUND")
+            return self._receipt(cmd.command_id, "REJECTED", "ORDER_NOT_FOUND", True)
+
+        if _is_terminal_order(order):
+            outcome = {"noop": True, "authoritative_status": order.status}
+            self._transition_command(cmd, "RECEIVED", "RESOLVED", outcome=outcome)
+            return self._receipt(cmd.command_id, "RESOLVED", None, False, outcome=outcome)
+
+        direction = classify_cancel(order)
+        # Write-once risk decision for this cancel's classification, mirroring
+        # ApprovalCommandService.approve's publish_decision call: a bare method
+        # call, not itself journaled, recorded before the claiming transaction.
+        self._risk_producer.publish_decision(
+            cmd.command_id,
+            {"decision": "cancel", "direction": direction.value, "order_entity_id": order_entity_id},
+            correlation_id=cmd.command_id,
+        )
+
+        self._transition_command(cmd, "RECEIVED", "VALIDATED")
+
+        def work(conn: duckdb.DuckDBPyConnection, append) -> None:
+            # The preflight ceremony is derived from classification (Task 6
+            # addendum): only an INCREASING (protective-leg or unclassifiable)
+            # cancel needs the nonce, consumed inside this SAME transaction as
+            # the VALIDATED -> SUBMITTING transition so a failed ceremony
+            # never leaves SUBMITTING committed.
+            if direction is RiskDirection.INCREASING:
+                if not self._nonces.consume_in_tx(conn, cmd.preflight_nonce, cmd):
+                    raise CommandValidationError(
+                        "PREFLIGHT_REQUIRED",
+                        "missing, expired, or already-consumed preflight nonce",
+                    )
+            self._ledger.transition_in_tx(conn, cmd.command_id, "VALIDATED", "SUBMITTING")
+            append(
+                _command_updated_mutation(cmd, "SUBMITTING", self._now_utc()),
+                _noop_write,
+                f"command:{cmd.command_id}:submitting",
+            )
+
+        try:
+            self._journal.mutate_batch_work(self._journal.connect(), work)
+        except CommandValidationError as exc:
+            self._transition_command(cmd, "VALIDATED", "REJECTED", error_code=exc.code)
+            return self._receipt(cmd.command_id, "REJECTED", exc.code, True)
+
+        # --- Irreversible boundary: dispatch the cancel to the broker. ---
+        try:
+            self._dispatch.cancel(order_entity_id, order_ref=cmd.command_id)
+        except Exception:
+            # Timeout / disconnect / lost ack. NEVER auto-retry an ambiguous
+            # real-money dispatch (retryable=False): the Task-9 reconciler
+            # resolves the true outcome by re-reading the order's
+            # authoritative status from [M1-F2]'s broker_orders store.
+            self._transition_command(
+                cmd, "SUBMITTING", "OUTCOME_UNKNOWN", error_code="DISPATCH_AMBIGUOUS",
+            )
+            self._reconciler.schedule(cmd.command_id, self._now_utc())
+            return self._receipt(cmd.command_id, "OUTCOME_UNKNOWN", "DISPATCH_AMBIGUOUS", False)
+
+        # --- Finish: command SUBMITTING -> SUBMITTED. ---
+        outcome: dict[str, Any] = {"order_entity_id": order_entity_id}
+        if direction is RiskDirection.INCREASING:
+            # Names the position the cancel leaves unprotected so the
+            # confirmation surface can call it out explicitly.
+            outcome["unprotected_conid"] = order.conid
+
+        def finish(conn: duckdb.DuckDBPyConnection, append) -> None:
+            self._ledger.transition_in_tx(
+                conn, cmd.command_id, "SUBMITTING", "SUBMITTED", outcome=outcome,
+            )
+            append(
+                _command_updated_mutation(cmd, "SUBMITTED", self._now_utc(), outcome=outcome),
+                _noop_write,
+                f"command:{cmd.command_id}:submitted",
+            )
+
+        try:
+            self._journal.mutate_batch_work(self._journal.connect(), finish)
+        except Exception:
+            # The cancel is already LIVE at the broker (dispatch returned), so
+            # a failure of the post-dispatch finish tx must NOT discard that
+            # fact or drop the command into a generic INTERNAL_ERROR with no
+            # reconciliation -- mirrors approve's guarded ``finish`` (fix2,
+            # FINISH-TX-AFTER-DISPATCH).
+            self._transition_command(
+                cmd, "SUBMITTING", "OUTCOME_UNKNOWN",
+                error_code="DISPATCH_AMBIGUOUS", outcome=outcome,
+            )
+            self._reconciler.schedule(cmd.command_id, self._now_utc())
+            return self._receipt(
+                cmd.command_id, "OUTCOME_UNKNOWN", "DISPATCH_AMBIGUOUS", False, outcome=outcome,
+            )
+
+        return self._receipt(cmd.command_id, "SUBMITTED", None, False, outcome=outcome)
+
+    # -- public non-saga entry point: bulk cancel expansion -----------------
+
+    def cancel_orders(self, cmd: CommandRequest) -> dict[str, Any]:
+        order_entity_ids = cmd.body.get("order_entity_ids")
+        if not order_entity_ids:
+            raise CommandValidationError(
+                "ORDER_ENTITY_IDS_REQUIRED", "order_entity_ids must be a non-empty list",
+            )
+
+        child_ids: list[str] = []
+        classifications: dict[str, str] = {}
+        for index, order_entity_id in enumerate(order_entity_ids):
+            child_id = f"{cmd.command_id}-{index}"
+            child = CommandRequest(
+                command_id=child_id,
+                action="cancel_order",
+                account_id=cmd.account_id,
+                target_type="order",
+                target_id=order_entity_id,
+                expected_version=None,
+                body={"order_entity_id": order_entity_id},
+                source=cmd.source,
+                preflight_nonce=cmd.preflight_nonce,
+                parent_command_id=cmd.command_id,
+            )
+            self._coordinator.execute(child)
+            child_ids.append(child_id)
+            classifications[order_entity_id] = classify_cancel(
+                self._orders_view.get_order(order_entity_id)
+            ).value
+
+        return {"child_command_ids": child_ids, "classifications": classifications}
+
+    # -- command-ledger single-step transition (mirrors ApprovalCommandService) --
 
     def _transition_command(
         self,

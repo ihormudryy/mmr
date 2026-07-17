@@ -1,99 +1,89 @@
 """Tests for the signal → PENDING proposal bridge (``auto_execute: propose``).
 
-Covers the SignalProposer unit behaviour (proposal creation, dedup, TTL
-expiry, long-only SELL semantics, time-based exit proposals) and the
-StrategyRuntime integration points (conid stamping via _dispatch_signal,
-load-time rejection of unsupported auto_execute values).
+[M1-F3] Task 8: ``SignalProposer`` is a thin typed adapter over the
+command-authority coordinator now -- it holds no ``ProposalStore`` handle
+and creates proposals ONLY through the typed ``create_proposal`` command,
+reached via a fake ``TypedRpcClient`` double (``FakeTypedClient``, serving
+both the ``command`` and ``query`` roles). Sizing, dedup, expiry, and
+quote/risk checks all moved server-side (``ProposalCommandService``); these
+tests cover what's left here: gating (paper-only, pause-aware), signal→body
+translation, and the StrategyRuntime dispatch integration points (conid
+stamping via ``_dispatch_signal``, load-time rejection of unsupported
+``auto_execute`` values) which are unaffected by the adapter rewrite.
 
 Spec: docs/superpowers/specs/2026-07-15-signal-propose-bridge-design.md
 """
 
 import datetime as dt
+from dataclasses import dataclass
 from pathlib import Path
-from unittest.mock import Mock
 
 import pandas as pd
 import pytest
-from ib_async import Contract, PortfolioItem
 
-from trader.data.data_access import SecurityDefinition
-from trader.data.proposal_store import ProposalStore
+from trader.domain.commands import CommandReceipt
 from trader.objects import Action
 from trader.strategy.signal_proposer import SignalProposer
 from trader.strategy.strategy_runtime import StrategyRuntime
-from trader.trading.position_sizing import PositionSizingConfig
-from trader.trading.proposal import ProposalStatus
 from trader.trading.strategy import Signal
 
 
 # ---------------------------------------------------------------------------
-# Helpers / fakes
+# Fake typed RPC client (mirrors tests/test_sdk.py's FakeTypedClient --
+# duplicated here since each test file in this task's edit scope is
+# self-contained; no shared conftest fixture was added).
 # ---------------------------------------------------------------------------
 
-ACCOUNT_VALUES = {
-    'NetLiquidation': {'value': 100_000.0, 'currency': 'USD'},
-    'AvailableFunds': {'value': 80_000.0, 'currency': 'USD'},
-    'GrossPositionValue': {'value': 20_000.0, 'currency': 'USD'},
-}
+@dataclass
+class _RecordedTypedCall:
+    method: str
+    body: dict
 
 
-def _make_secdef(conid=4391, symbol='AMD', exchange='SMART',
-                 primary='NASDAQ', currency='USD') -> SecurityDefinition:
-    return SecurityDefinition(
-        symbol=symbol, exchange=exchange, conId=conid,
-        secType='STK', primaryExchange=primary,
-        currency=currency, tradingClass=symbol,
-        includeExpired=False, secIdType='', secId='',
-        description='', minTick=0.01, orderTypes='',
-        validExchanges='', priceMagnifier=1, longName='',
-        category='', subcategory='', tradingHours='',
-        timeZoneId='', liquidHours='', stockType='',
-        minSize=1.0, sizeIncrement=1.0, suggestedSizeIncrement=1.0,
-        bondType='', couponType='', callable=False, putable=False,
-        coupon=0.0, convertable=False, maturity='', issueDate='',
-        nextOptionDate='', nextOptionPartial=False, nextOptionType='',
-        marketRuleIds='',
-    )
+class FakeTypedClient:
+    """Serves BOTH the ``query`` and ``command`` roles from one instance --
+    ``SignalProposer(command_client=typed, query_client=typed, ...)`` wires
+    the SAME fake into both constructor params, exactly like the real
+    trader_service exposes both roles on the same host (different ports)."""
+
+    def __init__(self):
+        self._query_queue: dict = {}
+        self._command_queue: dict = {}
+        self.queries: list[_RecordedTypedCall] = []
+        self.commands: list[_RecordedTypedCall] = []
+        self.store_writes: list = []
+
+    def queue_query(self, method, response):
+        self._query_queue.setdefault(method, []).append(('ok', response))
+
+    def queue_command(self, method, receipt):
+        self._command_queue.setdefault(method, []).append(('ok', receipt))
+
+    def fail_next_query(self, method, exc):
+        self._query_queue.setdefault(method, []).append(('err', exc))
+
+    def fail_next_command(self, method, exc):
+        self._command_queue.setdefault(method, []).append(('err', exc))
+
+    def call(self, method, body, response_model=None, timeout=None):
+        if self._command_queue.get(method):
+            kind, payload = self._command_queue[method].pop(0)
+            self.commands.append(_RecordedTypedCall(method=method, body=dict(body)))
+            if kind == 'err':
+                raise payload
+            return payload
+        if self._query_queue.get(method):
+            kind, payload = self._query_queue[method].pop(0)
+            self.queries.append(_RecordedTypedCall(method=method, body=dict(body)))
+            if kind == 'err':
+                raise payload
+            return payload
+        raise AssertionError(f'FakeTypedClient.call({method!r}, ...) with no queued response')
 
 
-def _make_portfolio_item(conid=4391, symbol='AMD', position=100.0):
-    c = Contract(conId=conid, symbol=symbol, secType='STK', currency='USD')
-    return PortfolioItem(
-        account='DU123', contract=c, position=position,
-        marketPrice=150.0, marketValue=position * 150.0,
-        averageCost=140.0, unrealizedPNL=0.0, realizedPNL=0.0,
-    )
-
-
-class _FakeRpc:
-    def __init__(self, owner):
-        self._o = owner
-
-    def get_account_values(self):
-        if self._o.fail_account:
-            raise ConnectionError('trader_service unreachable')
-        return self._o.account_values
-
-    def get_portfolio(self):
-        if self._o.fail_portfolio:
-            raise ConnectionError('trader_service unreachable')
-        return self._o.portfolio_items
-
-    def resolve_symbol(self, conid):
-        return self._o.secdefs.get(conid, [])
-
-
-class FakeTraderClient:
-    def __init__(self, secdefs=None, portfolio=None, account_values=None):
-        self.secdefs = secdefs or {}
-        self.portfolio_items = portfolio or []
-        self.account_values = account_values if account_values is not None else dict(ACCOUNT_VALUES)
-        self.fail_account = False
-        self.fail_portfolio = False
-
-    def rpc(self, **kwargs):
-        return _FakeRpc(self)
-
+# ---------------------------------------------------------------------------
+# Helpers / fixtures
+# ---------------------------------------------------------------------------
 
 def _frame(n=30, start='2026-07-15 09:31', freq='1min', last_time=None):
     """OHLCV frame of n 1-min bars. If last_time is given, the index is laid
@@ -116,251 +106,153 @@ def _signal(action=Action.BUY, conid=4391, probability=0.6, **kwargs):
 
 
 @pytest.fixture
-def trader_client():
-    return FakeTraderClient(secdefs={4391: [_make_secdef()]})
+def typed():
+    return FakeTypedClient()
 
 
 @pytest.fixture
-def proposer(proposal_store, trader_client):
+def proposer(typed):
     return SignalProposer(
-        proposal_store=proposal_store,
-        trader_client=trader_client,
+        command_client=typed,
+        query_client=typed,
         paper_trading=True,
-        sizing_config=PositionSizingConfig(),
+        account_id='DU111111',
         proposal_ttl_minutes=30,
     )
 
 
 # ---------------------------------------------------------------------------
-# BUY path
+# on_signal: BUY path (gated by the pause check) + SELL path (exempt, §9.4)
 # ---------------------------------------------------------------------------
 
-class TestBuyPath:
-    def test_buy_signal_creates_pending_proposal(self, proposer, proposal_store):
-        pid = proposer.on_signal('orb_test', _signal(Action.BUY), _frame())
-        assert pid is not None
-        p = proposal_store.get(pid)
-        assert p is not None
-        assert p.status == ProposalStatus.PENDING.value
-        assert p.symbol == 'AMD'
-        assert p.action == 'BUY'
-        assert p.source == 'strategy:orb_test'
-        assert p.amount is not None and p.amount > 0
-        assert p.confidence == 0.6
+class TestOnSignalCreatesViaTypedApi:
+    def test_signal_proposer_creates_via_typed_api(self, proposer, typed):
+        typed.queue_query('get_trading_control', {'new_exposure_paused': False, 'revision': 1})
+        typed.queue_command('create_proposal', CommandReceipt(
+            's1', 's1', 'RESOLVED', {'proposal_id': 41, 'revision': 1}, None, False))
+        pid = proposer.on_signal('orb', _signal(conid=265598, action=Action.BUY,
+                                                probability=0.8), _frame())
+        assert pid == 41
+        body = typed.commands[0].body
+        assert body['conid'] == 265598 and body['source'] == 'strategy:orb'
+        assert body['command_id'].startswith('strategy-')
+        assert body['action'] == 'BUY'
+        assert body['confidence'] == 0.8
 
-    def test_proposal_metadata_records_strategy_conid_and_expiry(self, proposer, proposal_store):
-        pid = proposer.on_signal('orb_test', _signal(Action.BUY), _frame())
-        p = proposal_store.get(pid)
-        assert p.metadata['strategy'] == 'orb_test'
-        assert p.metadata['conid'] == 4391
-        assert 'expires_at' in p.metadata
+    def test_sell_signal_is_exempt_from_the_pause_gate(self, proposer, typed):
+        """§9.4: SELL (position-reducing) never checks get_trading_control at
+        all -- only a BUY (new exposure) does."""
+        typed.queue_command('create_proposal', CommandReceipt(
+            's2', 's2', 'RESOLVED', {'proposal_id': 7, 'revision': 1}, None, False))
+        pid = proposer.on_signal('orb', _signal(action=Action.SELL), _frame())
+        assert pid == 7
+        assert typed.queries == []
 
-    def test_buy_records_exit_conditions_in_metadata(self, proposer, proposal_store):
-        sig = _signal(Action.BUY, max_hold_bars=180, close_by_time=dt.time(15, 45))
-        pid = proposer.on_signal('orb_test', sig, _frame())
-        p = proposal_store.get(pid)
-        assert p.metadata['max_hold_bars'] == 180
-        assert p.metadata['close_by_time'] == '15:45:00'
+    def test_server_refusal_returns_none(self, proposer, typed):
+        typed.queue_query('get_trading_control', {'new_exposure_paused': False, 'revision': 1})
+        typed.queue_command('create_proposal', CommandReceipt(
+            's3', 's3', 'REJECTED', None, 'DUPLICATE_PENDING', False))
+        assert proposer.on_signal('orb', _signal(action=Action.BUY), _frame()) is None
 
-    def test_buy_dedup_while_pending(self, proposer, proposal_store):
-        pid1 = proposer.on_signal('orb_test', _signal(Action.BUY), _frame())
-        pid2 = proposer.on_signal('orb_test', _signal(Action.BUY), _frame())
-        assert pid1 is not None
-        assert pid2 is None
-        assert len(proposal_store.query(status='PENDING')) == 1
+    def test_create_proposal_rpc_failure_returns_none(self, proposer, typed):
+        typed.queue_query('get_trading_control', {'new_exposure_paused': False, 'revision': 1})
+        typed.fail_next_command('create_proposal', ConnectionError('trader down'))
+        assert proposer.on_signal('orb', _signal(action=Action.BUY), _frame()) is None
 
-    def test_sizing_blocked_creates_no_proposal(self, proposal_store, trader_client):
+    def test_unstamped_conid_creates_no_proposal_without_any_rpc(self, proposer, typed):
+        pid = proposer.on_signal('orb', _signal(conid=0), _frame())
+        assert pid is None
+        assert typed.commands == [] and typed.queries == []
+
+    def test_unknown_action_returns_none(self, proposer, typed):
+        sig = _signal()
+        sig.action = None
+        assert proposer.on_signal('orb', sig, _frame()) is None
+        assert typed.commands == [] and typed.queries == []
+
+
+def test_signal_proposer_suppresses_entries_when_paused_stale_or_unavailable(proposer, typed):
+    typed.queue_query('get_trading_control', {'new_exposure_paused': True, 'revision': 2})
+    assert proposer.on_signal('orb', _signal(action=Action.BUY), _frame()) is None
+    typed.fail_next_query('get_trading_control', ConnectionError('trader down'))
+    assert proposer.on_signal('orb', _signal(action=Action.BUY), _frame()) is None  # fail closed
+    # Verified exit proposals remain allowed while paused (§9.4).
+    typed.queue_query('get_trading_control', {'new_exposure_paused': True, 'revision': 2})
+    typed.queue_command('create_proposal', CommandReceipt(
+        's2', 's2', 'RESOLVED', {'proposal_id': 42, 'revision': 1}, None, False))
+    assert proposer.on_signal('orb', _signal(action=Action.SELL), _frame()) == 42
+
+
+# ---------------------------------------------------------------------------
+# Gating: paper-only
+# ---------------------------------------------------------------------------
+
+class TestGating:
+    def test_live_mode_is_noop(self, typed):
         proposer = SignalProposer(
-            proposal_store=proposal_store,
-            trader_client=trader_client,
-            paper_trading=True,
-            sizing_config=PositionSizingConfig(max_positions=0),
-            proposal_ttl_minutes=30,
+            command_client=typed, query_client=typed,
+            paper_trading=False, account_id='DU111111',
         )
-        pid = proposer.on_signal('orb_test', _signal(Action.BUY), _frame())
+        pid = proposer.on_signal('orb', _signal(Action.BUY), _frame())
         assert pid is None
-        assert proposal_store.query(status='PENDING') == []
-
-    def test_account_state_unavailable_skips_buy(self, proposer, trader_client, proposal_store):
-        trader_client.fail_account = True
-        pid = proposer.on_signal('orb_test', _signal(Action.BUY), _frame())
-        assert pid is None
-        assert proposal_store.query(status='PENDING') == []
-
-    def test_unresolvable_conid_creates_no_proposal(self, proposer, proposal_store):
-        pid = proposer.on_signal('orb_test', _signal(Action.BUY, conid=999), _frame())
-        assert pid is None
-        assert proposal_store.query(status='PENDING') == []
-
-    def test_unstamped_conid_creates_no_proposal(self, proposer, proposal_store):
-        pid = proposer.on_signal('orb_test', _signal(Action.BUY, conid=0), _frame())
-        assert pid is None
+        assert typed.commands == [] and typed.queries == []
 
 
 # ---------------------------------------------------------------------------
-# SELL path (long-only close, matching backtester semantics)
+# expire_stale: now trader-owned; this bridge is an inert no-op
 # ---------------------------------------------------------------------------
 
-class TestSellPath:
-    def test_sell_when_flat_creates_no_proposal(self, proposer, proposal_store):
-        pid = proposer.on_signal('orb_test', _signal(Action.SELL), _frame())
-        assert pid is None
-        assert proposal_store.query(status='PENDING') == []
-
-    def test_sell_when_long_proposes_full_close(self, proposer, trader_client, proposal_store):
-        trader_client.portfolio_items = [_make_portfolio_item(position=100.0)]
-        pid = proposer.on_signal('orb_test', _signal(Action.SELL), _frame())
-        assert pid is not None
-        p = proposal_store.get(pid)
-        assert p.action == 'SELL'
-        assert p.quantity == 100.0
-        assert p.amount is None
-
-    def test_sell_when_short_creates_no_proposal(self, proposer, trader_client, proposal_store):
-        trader_client.portfolio_items = [_make_portfolio_item(position=-50.0)]
-        pid = proposer.on_signal('orb_test', _signal(Action.SELL), _frame())
-        assert pid is None
-
-    def test_sell_portfolio_unavailable_creates_no_proposal(self, proposer, trader_client):
-        trader_client.portfolio_items = [_make_portfolio_item(position=100.0)]
-        trader_client.fail_portfolio = True
-        pid = proposer.on_signal('orb_test', _signal(Action.SELL), _frame())
-        assert pid is None
+class TestExpireStaleIsNowServerOwned:
+    def test_expire_stale_is_an_inert_noop(self, proposer, typed):
+        """[M1-F3] Task 2 moved expiry ownership to the trader service
+        (``ProposalCommandService.run_expiry_loop``, which trader_service
+        already runs on its own timer against the journal DB it owns). This
+        bridge has no ``ProposalStore`` handle to sweep with anymore --
+        ``expire_stale`` is a documented no-op, kept only so
+        ``strategy_runtime._reconcile()``'s existing call site doesn't
+        require touching."""
+        assert proposer.expire_stale() == []
+        assert typed.commands == [] and typed.queries == []
 
 
 # ---------------------------------------------------------------------------
-# Gating and TTL
+# check_exits: reads executed bridge entries via list_proposals
 # ---------------------------------------------------------------------------
 
-class TestGatingAndTtl:
-    def test_live_mode_is_noop(self, proposal_store, trader_client):
+class TestCheckExits:
+    def test_reads_executed_entries_via_list_proposals(self, proposer, typed):
+        typed.queue_query('list_proposals', {'proposals': [
+            {'id': 5, 'conid': 4391, 'action': 'BUY', 'source': 'strategy:orb'},
+        ]})
+        # _exit_reason is a documented no-op today (see its docstring: the
+        # typed wire has nowhere to persist/echo max_hold_bars/close_by_time
+        # back through list_proposals) -- this pins the current, honest
+        # behaviour: the entry is found and considered, but no exit fires.
+        assert proposer.check_exits('orb', 4391, _frame()) is None
+        assert typed.commands == []
+
+    def test_empty_frame_short_circuits_without_a_query(self, proposer, typed):
+        assert proposer.check_exits('orb', 4391, pd.DataFrame()) is None
+        assert typed.queries == []
+
+    def test_list_proposals_failure_is_swallowed(self, proposer, typed):
+        typed.fail_next_query('list_proposals', ConnectionError('down'))
+        assert proposer.check_exits('orb', 4391, _frame()) is None
+
+    def test_live_mode_short_circuits_without_a_query(self, typed):
         proposer = SignalProposer(
-            proposal_store=proposal_store,
-            trader_client=trader_client,
-            paper_trading=False,
-            sizing_config=PositionSizingConfig(),
+            command_client=typed, query_client=typed,
+            paper_trading=False, account_id='DU111111',
         )
-        pid = proposer.on_signal('orb_test', _signal(Action.BUY), _frame())
-        assert pid is None
-        assert proposal_store.query(status='PENDING') == []
-
-    def test_stale_pending_proposal_expires_and_new_signal_proposes(
-            self, proposal_store, trader_client):
-        proposer = SignalProposer(
-            proposal_store=proposal_store,
-            trader_client=trader_client,
-            paper_trading=True,
-            sizing_config=PositionSizingConfig(),
-            proposal_ttl_minutes=0,   # everything is stale immediately
-        )
-        pid1 = proposer.on_signal('orb_test', _signal(Action.BUY), _frame())
-        pid2 = proposer.on_signal('orb_test', _signal(Action.BUY), _frame())
-        assert pid1 is not None and pid2 is not None and pid2 != pid1
-        assert proposal_store.get(pid1).status == ProposalStatus.EXPIRED.value
-        assert proposal_store.get(pid2).status == ProposalStatus.PENDING.value
-
-    def test_ttl_does_not_expire_foreign_proposals(self, proposal_store, trader_client):
-        from trader.trading.proposal import TradeProposal
-        manual_id = proposal_store.add(TradeProposal(symbol='AAPL', action='BUY',
-                                                     amount=1000.0, source='manual'))
-        proposer = SignalProposer(
-            proposal_store=proposal_store,
-            trader_client=trader_client,
-            paper_trading=True,
-            sizing_config=PositionSizingConfig(),
-            proposal_ttl_minutes=0,
-        )
-        proposer.on_signal('orb_test', _signal(Action.BUY), _frame())
-        assert proposal_store.get(manual_id).status == ProposalStatus.PENDING.value
-
-
-# ---------------------------------------------------------------------------
-# Periodic (reconciliation-driven) expiry sweep
-# ---------------------------------------------------------------------------
-
-class TestExpireStale:
-    def test_expire_stale_delegates_without_limit(self, proposer, proposal_store):
-        proposal_store.expire_stale_pending = Mock(return_value=[4])
-        now = dt.datetime(2026, 7, 16, 12, 0, tzinfo=dt.timezone.utc)
-        assert proposer.expire_stale(now) == [4]
-        # Delegates the whole sweep with only the effective `now` — no
-        # limit=/source= kwargs. Asserting the exact call catches a future
-        # regression that would silently scope or cap the sweep.
-        proposal_store.expire_stale_pending.assert_called_once_with(now)
-
-
-# ---------------------------------------------------------------------------
-# Time-based exits (close_by_time / max_hold_bars)
-# ---------------------------------------------------------------------------
-
-def _executed_entry(proposal_store, proposer, trader_client, **signal_kwargs):
-    """Create a bridge BUY proposal and walk it to EXECUTED, returning its id."""
-    sig = _signal(Action.BUY, **signal_kwargs)
-    pid = proposer.on_signal('orb_test', sig, _frame())
-    assert pid is not None
-    proposal_store.update_status(pid, ProposalStatus.APPROVED.value)
-    proposal_store.update_status(pid, ProposalStatus.EXECUTED.value)
-    # The position now exists
-    trader_client.portfolio_items = [_make_portfolio_item(position=100.0)]
-    return pid
-
-
-class TestTimeBasedExits:
-    def test_close_by_time_proposes_close_once(self, proposer, proposal_store, trader_client):
-        entry_id = _executed_entry(proposal_store, proposer, trader_client,
-                                   close_by_time=dt.time(15, 45))
-        late_frame = _frame(last_time='2026-07-15 15:45')
-        exit_id = proposer.check_exits('orb_test', 4391, late_frame)
-        assert exit_id is not None
-        p = proposal_store.get(exit_id)
-        assert p.action == 'SELL'
-        assert p.quantity == 100.0
-        assert p.metadata['exit_reason'] == 'close_by_time'
-        # Entry proposal flagged; second check does not re-propose
-        assert proposal_store.get(entry_id).metadata.get('exit_proposed') is True
-        assert proposer.check_exits('orb_test', 4391, late_frame) is None
-
-    def test_close_by_time_not_yet_reached_no_proposal(
-            self, proposer, proposal_store, trader_client):
-        _executed_entry(proposal_store, proposer, trader_client,
-                        close_by_time=dt.time(15, 45))
-        early_frame = _frame(last_time='2026-07-15 12:00')
-        assert proposer.check_exits('orb_test', 4391, early_frame) is None
-
-    def test_max_hold_bars_proposes_close(self, proposer, proposal_store, trader_client):
-        _executed_entry(proposal_store, proposer, trader_client, max_hold_bars=30)
-        # 40 bars strictly after the entry's execution timestamp
-        future_start = dt.datetime.now() + dt.timedelta(minutes=1)
-        held_frame = _frame(n=40, start=future_start)
-        exit_id = proposer.check_exits('orb_test', 4391, held_frame)
-        assert exit_id is not None
-        assert proposal_store.get(exit_id).metadata['exit_reason'] == 'max_hold_bars'
-
-    def test_max_hold_bars_not_reached_no_proposal(
-            self, proposer, proposal_store, trader_client):
-        _executed_entry(proposal_store, proposer, trader_client, max_hold_bars=30)
-        future_start = dt.datetime.now() + dt.timedelta(minutes=1)
-        short_frame = _frame(n=10, start=future_start)
-        assert proposer.check_exits('orb_test', 4391, short_frame) is None
-
-    def test_exit_when_already_flat_flags_without_proposal(
-            self, proposer, proposal_store, trader_client):
-        entry_id = _executed_entry(proposal_store, proposer, trader_client,
-                                   close_by_time=dt.time(15, 45))
-        trader_client.portfolio_items = []   # closed manually in the meantime
-        late_frame = _frame(last_time='2026-07-15 15:45')
-        assert proposer.check_exits('orb_test', 4391, late_frame) is None
-        assert proposal_store.get(entry_id).metadata.get('exit_proposed') is True
-
-    def test_entry_without_exit_conditions_never_exit_checked(
-            self, proposer, proposal_store, trader_client):
-        _executed_entry(proposal_store, proposer, trader_client)
-        late_frame = _frame(last_time='2026-07-15 15:45')
-        assert proposer.check_exits('orb_test', 4391, late_frame) is None
+        assert proposer.check_exits('orb', 4391, _frame()) is None
+        assert typed.queries == []
 
 
 # ---------------------------------------------------------------------------
 # StrategyRuntime integration: conid stamping + load-time validation
+# (unaffected by the SignalProposer rewrite -- on_signal/check_exits keep
+# the same public (strategy_name, signal, frame) / (strategy_name, conid,
+# frame) shapes, so the runtime's dispatch plumbing doesn't change).
 # ---------------------------------------------------------------------------
 
 class _RecordingEventStore:

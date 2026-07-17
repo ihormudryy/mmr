@@ -30,7 +30,6 @@ from trader.messaging.typed_rpc import (
 )
 from trader.objects import Action, BarSize, WhatToShow
 from trader.data.event_store import EventStore, EventType, TradingEvent
-from trader.data.proposal_store import ProposalStore
 from trader.strategy.signal_proposer import SignalProposer
 from trader.strategy.strategy_revisions import StrategyCommandReceipt, StrategyRevisionStore
 from trader.trading.strategy import Signal, Strategy, StrategyConfig, StrategyContext, StrategyState
@@ -232,7 +231,9 @@ class StrategyRuntime():
         strategy_typed_command_port: int = 42104,
         strategy_typed_query_port: int = 42105,
         typed_command_port: int = 42102,
+        typed_query_port: int = 42101,
         service_hmac_key_file: str = '',
+        ib_account: str = '',
     ):
         self.ib_server_address = ib_server_address
         self.ib_server_port = ib_server_port
@@ -259,12 +260,22 @@ class StrategyRuntime():
         self.typed_bind_address = typed_bind_address
         self.strategy_typed_command_port = strategy_typed_command_port
         self.strategy_typed_query_port = strategy_typed_query_port
-        # The TRADER's own typed command port (same config key/value
-        # trader_service uses for its own typed_command_port) -- this is
-        # where _drain_ack_outbox's backstop record_state_acknowledged calls
-        # go, NOT this service's own strategy_typed_command_port above.
+        # The TRADER's own typed command/query ports (same config
+        # keys/values trader_service uses for its own typed_command_port/
+        # typed_query_port) -- this is where _drain_ack_outbox's backstop
+        # record_state_acknowledged calls AND SignalProposer's
+        # create_proposal/get_trading_control/list_proposals calls go, NOT
+        # this service's own strategy_typed_command_port/
+        # strategy_typed_query_port above.
         self.typed_command_port = typed_command_port
+        self.typed_query_port = typed_query_port
         self.service_hmac_key_file = service_hmac_key_file
+        # [M1-F3] Task 8: the account SignalProposer reads the pause gate
+        # for (get_trading_control has no account_id in its request body --
+        # the SERVER derives it from ITS OWN configured account -- but the
+        # bridge still stamps its own copy on the outbound query body for
+        # symmetry/logging; harmless either way since the server ignores it).
+        self.ib_account = ib_account
         self._revisions: Optional[StrategyRevisionStore] = None
 
         self.strategies_directory = strategies_directory
@@ -341,13 +352,6 @@ class StrategyRuntime():
                 zmq_server_port=self.zmq_rpc_server_port,
                 error_table=error_table
             )
-            # Signal → PENDING proposal bridge for auto_execute: 'propose'
-            # strategies (paper mode only; see signal_proposer.py).
-            self.signal_proposer = SignalProposer(
-                proposal_store=ProposalStore(self.duckdb_path),
-                trader_client=self.trader_client,
-                paper_trading=self.paper_trading,
-            )
             self.last_connect_time = dt.datetime.now()
 
             self.zmq_strategy_rpc_server = RPCServer[bus.StrategyServiceApi](
@@ -393,10 +397,33 @@ class StrategyRuntime():
             # socket -- used exclusively by _drain_ack_outbox's backstop
             # record_state_acknowledged calls (never inside a handler
             # responding to an inbound forwarded command; see that method's
-            # docstring).
+            # docstring), AND [M1-F3] Task 8's signal→proposal bridge
+            # (SignalProposer's create_proposal calls, below).
             self._trader_command_client = TypedRpcClient(
                 'command', self._typed_authenticator,
                 address=self.typed_bind_address, port=self.typed_command_port,
+            )
+            # Outbound-only client toward the TRADER's own typed QUERY
+            # socket -- used by SignalProposer to read the pause gate
+            # (get_trading_control) and executed bridge entries
+            # (list_proposals). Same host/HMAC secret as the command client
+            # above; only the port differs.
+            self._trader_query_client = TypedRpcClient(
+                'query', self._typed_authenticator,
+                address=self.typed_bind_address, port=self.typed_query_port,
+            )
+
+            # [M1-F3] Task 8: signal → PENDING proposal bridge for
+            # auto_execute: 'propose' strategies (paper mode only; see
+            # signal_proposer.py). Thin typed adapter -- holds no
+            # ProposalStore handle, routes every mutation through the
+            # trader's command-authority coordinator via the typed clients
+            # just constructed above.
+            self.signal_proposer = SignalProposer(
+                command_client=self._trader_command_client,
+                query_client=self._trader_query_client,
+                paper_trading=self.paper_trading,
+                account_id=self.ib_account,
             )
 
         except Exception as ex:
@@ -1532,6 +1559,7 @@ class StrategyRuntime():
         await self.typed_command_server.serve()
         await self.typed_query_server.serve()
         self._trader_command_client.connect()
+        self._trader_query_client.connect()
 
         await self.trader_client.connect()
 

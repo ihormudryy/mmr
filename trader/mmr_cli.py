@@ -1235,10 +1235,14 @@ def build_parser() -> argparse.ArgumentParser:
     approve_p = sub.add_parser('approve', help='Approve and execute a trade proposal',
                                 epilog='Examples:\n'
                                        '  approve 3                    # Execute proposal #3\n'
+                                       '  approve 3 --expected-version 2   # CAS-guard against a stale review\n'
                                        '  approve --all                # Execute all pending proposals',
                                 formatter_class=fmt)
     approve_p.add_argument('proposal_id', type=int, nargs='?', default=None, help='Proposal ID to approve')
     approve_p.add_argument('--all', action='store_true', default=False, help='Approve all pending proposals')
+    approve_p.add_argument('--expected-version', type=int, default=None, dest='expected_version',
+                            help='Exact proposal revision being approved (CAS guard against a stale review); '
+                                 'defaults to the proposal\'s current revision when omitted')
 
     # reject
     reject_p = sub.add_parser('reject', help='Reject a trade proposal',
@@ -2397,7 +2401,14 @@ def _handle_propose(mmr: MMR, args: argparse.Namespace):
             if not _json_mode:
                 console.print(f'[yellow]--enrich-news skipped ({type(ex).__name__}: {ex}) — is the news service running? `cd ~/dev/news && ./docker.sh -g`. Proposal will be saved without news enrichment.[/yellow]')
 
-    proposal_id, leverage_info, snapshot_info = mmr.propose(
+    # [M1-F3] Task 8: propose() now routes through the command-authority
+    # coordinator's typed `create_proposal` and returns a SuccessFail whose
+    # `.obj` is the created proposal's payload -- sizing/quote/leverage
+    # enrichment that used to be computed client-side here (snapshot bid/
+    # ask/last, leverage-vs-net-liq estimate, sizing reasoning) is not yet
+    # carried by that payload, so those fields are surfaced as None below
+    # until a follow-up task extends the wire contract to return them.
+    proposal_result = mmr.propose(
         symbol=args.symbol,
         action=args.action,
         quantity=args.quantity,
@@ -2412,26 +2423,29 @@ def _handle_propose(mmr: MMR, args: argparse.Namespace):
         currency=args.currency,
         group=getattr(args, 'group', ''),
     )
+    if not proposal_result.is_success():
+        print_status(f'Proposal creation failed: {proposal_result.error}', success=False)
+        return
+
+    outcome = proposal_result.obj or {}
+    proposal_id = outcome.get('proposal_id')
 
     if _json_mode:
-        # Fetch the stored proposal to get sizing_result from metadata
-        detail = mmr.proposal_detail(proposal_id)
-        sizing = (detail.get('metadata') or {}).get('sizing_result') if detail else None
         result = {
             'proposal_id': proposal_id,
             'symbol': args.symbol,
             'action': args.action,
-            'amount': detail.get('amount') if detail else args.amount,
-            'quantity': detail.get('quantity') if detail else args.quantity,
-            'currency': (detail.get('currency') if detail else None) or getattr(args, 'currency', None),
+            'amount': outcome.get('amount', args.amount),
+            'quantity': outcome.get('quantity', args.quantity),
+            'currency': getattr(args, 'currency', None),
             'confidence': args.confidence,
             'group': getattr(args, 'group', ''),
             'order_type': order_type,
             'exit_type': exit_type,
-            'status': 'PENDING',
-            'sizing_result': sizing,
-            'snapshot': snapshot_info,
-            'leverage': leverage_info,
+            'status': outcome.get('status', 'PENDING'),
+            'sizing_result': None,
+            'snapshot': None,
+            'leverage': None,
         }
         print(json.dumps({"data": result, "title": f"Proposal #{proposal_id}"}, default=str))
         return
@@ -2449,33 +2463,6 @@ def _handle_propose(mmr: MMR, args: argparse.Namespace):
         summary += f' [{exit_type}]'
 
     print_status(f'Proposal #{proposal_id} created (PENDING): {summary}')
-
-    if snapshot_info:
-        bid = snapshot_info.get('bid')
-        ask = snapshot_info.get('ask')
-        last = snapshot_info.get('last')
-        parts = []
-        if bid is not None and bid == bid:
-            parts.append(f'bid {bid:g}')
-        if ask is not None and ask == ask:
-            parts.append(f'ask {ask:g}')
-        if last is not None and last == last:
-            parts.append(f'last {last:g}')
-        if parts:
-            console.print(f'[dim]  Snapshot: {" / ".join(parts)}[/dim]')
-
-    if leverage_info:
-        current = leverage_info.get('current_leverage', 0)
-        estimated = leverage_info.get('estimated_leverage', 0)
-        buying_power = leverage_info.get('buying_power', 0)
-        if leverage_info.get('uses_margin'):
-            console.print(
-                f'[yellow]  MARGIN WARNING: Estimated leverage {estimated:.2f}x '
-                f'(current: {current:.2f}x)[/yellow]'
-            )
-        else:
-            console.print(f'[dim]  Leverage: {estimated:.2f}x (current: {current:.2f}x)[/dim]')
-        console.print(f'[dim]  Buying power: ${buying_power:,.2f}[/dim]')
 
 
 def _handle_proposals(mmr: MMR, args: argparse.Namespace):
@@ -2593,6 +2580,7 @@ def _handle_proposals(mmr: MMR, args: argparse.Namespace):
 
 
 def _handle_approve(mmr: MMR, args: argparse.Namespace):
+    expected_version = getattr(args, 'expected_version', None)
     if args.all:
         pending = mmr._proposal_store().query(status='PENDING')
         if not pending:
@@ -2607,11 +2595,11 @@ def _handle_approve(mmr: MMR, args: argparse.Namespace):
         print_status('Specify a proposal ID or use --all', success=False)
         return
 
-    _approve_one(mmr, args.proposal_id)
+    _approve_one(mmr, args.proposal_id, expected_version=expected_version)
 
 
-def _approve_one(mmr: MMR, proposal_id: int):
-    result = mmr.approve(proposal_id)
+def _approve_one(mmr: MMR, proposal_id: int, expected_version=None):
+    result = mmr.approve(proposal_id, expected_version=expected_version)
     if result.is_success():
         order_ids = result.obj if result.obj else []
         print_status(f'Proposal #{proposal_id} approved and executed. Order IDs: {order_ids}')

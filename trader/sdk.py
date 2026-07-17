@@ -188,6 +188,21 @@ class MMR:
         self._data_rpc_port = cfg.get('zmq_data_rpc_server_port', 42003)
         self._timeout = timeout
 
+        # [M1-F3] Task 8: typed, HMAC-authenticated query/command sockets --
+        # the ONLY path `propose`/`proposals`/`reject`/`approve` use to reach
+        # trader_service's command-authority coordinator (registered via
+        # `register_command_authority` in `trader/messaging/production_api.py`).
+        # Same host as the legacy RPC (`_rpc_address`); only the ports differ
+        # (`typed_query_port`/`typed_command_port` in trader.yaml). Lazily
+        # connected on first use (see `_ensure_typed_clients`) so a plain
+        # `mmr portfolio` doesn't require a configured service_hmac_key_file.
+        self._typed_address = (os.getenv('TYPED_RPC_SERVER_ADDRESS') or None) or cfg.get('typed_bind_address', 'tcp://127.0.0.1')
+        self._typed_query_port = cfg.get('typed_query_port', 42101)
+        self._typed_command_port = cfg.get('typed_command_port', 42102)
+        self._service_hmac_key_file = cfg.get('service_hmac_key_file', '')
+        self._typed_query_client: Optional['TypedRpcClient'] = None
+        self._typed_command_client: Optional['TypedRpcClient'] = None
+
         self._client: Optional[RPCClient[TraderServiceApi]] = None
         self._data_client: Optional[RPCClient[DataServiceApi]] = None
         self._massive_rest_client = None
@@ -230,6 +245,39 @@ class MMR:
             raise ConnectionError("Not connected to data_service.")
         return self._data_client
 
+    def _ensure_typed_clients(self) -> None:
+        """Lazily build+connect the typed query/command clients toward
+        trader_service's command-authority coordinator. Called only by
+        `_typed_query`/`_typed_command` (i.e. only when a proposal command
+        is actually attempted) so unrelated commands never require a
+        configured `service_hmac_key_file`."""
+        if self._typed_query_client is not None and self._typed_command_client is not None:
+            return
+        from trader.messaging.typed_rpc import HmacServiceAuthenticator, TypedRpcClient, load_service_hmac_key
+        authenticator = HmacServiceAuthenticator(load_service_hmac_key(self._service_hmac_key_file))
+        query_client = TypedRpcClient(
+            'query', authenticator, address=self._typed_address,
+            port=self._typed_query_port, timeout=self._timeout,
+        )
+        query_client.connect()
+        command_client = TypedRpcClient(
+            'command', authenticator, address=self._typed_address,
+            port=self._typed_command_port, timeout=self._timeout,
+        )
+        command_client.connect()
+        self._typed_query_client = query_client
+        self._typed_command_client = command_client
+
+    @property
+    def _typed_query(self) -> 'TypedRpcClient':
+        self._ensure_typed_clients()
+        return self._typed_query_client
+
+    @property
+    def _typed_command(self) -> 'TypedRpcClient':
+        self._ensure_typed_clients()
+        return self._typed_command_client
+
     def close(self) -> None:
         """Disconnect and clean up resources."""
         for sub in self._subscriptions:
@@ -241,6 +289,12 @@ class MMR:
         if self._data_client:
             self._data_client.close()
             self._data_client = None
+        if self._typed_query_client:
+            self._typed_query_client.close()
+            self._typed_query_client = None
+        if self._typed_command_client:
+            self._typed_command_client.close()
+            self._typed_command_client = None
 
     def __enter__(self) -> 'MMR':
         return self.connect()
@@ -1215,257 +1269,147 @@ class MMR:
         exchange: str = '',
         currency: str = '',
         group: str = '',
-    ) -> tuple[int, Optional[dict], Optional[dict]]:
-        """Create a trade proposal. Returns (proposal_id, leverage_info, snapshot_info). No trader_service needed."""
-        from trader.trading.proposal import ExecutionSpec, TradeProposal
+    ) -> SuccessFail:
+        """Create a trade proposal via the command-authority coordinator's
+        ``create_proposal`` command. REQUIRES trader_service (typed command
+        socket) -- filter/sizing/quote/group-registration checks and the
+        proposal write itself all now happen server-side
+        (``ProposalCommandService.create_proposal``); this adapter only
+        resolves *symbol* to a conId and translates the keyword surface into
+        the wire body. Returns a ``SuccessFail`` whose ``.obj`` is the
+        created proposal's payload (normalized to always carry a
+        ``proposal_id`` key) on success.
+
+        Note: the typed ``create_proposal`` wire contract
+        (``CreateProposalRequest``) does not yet carry an execution spec, a
+        caller-supplied ``source`` label, or free-form ``metadata`` -- those
+        fields are accepted here for signature compatibility but a non-default
+        *execution* is refused loudly (rather than silently downgraded to a
+        plain market order) and *source*/*metadata* are currently inert.
+        """
+        import uuid
+        from trader.domain.commands import CommandReceipt
+        from trader.trading.proposal import ExecutionSpec
+
         spec = execution if isinstance(execution, ExecutionSpec) else ExecutionSpec()
         validation_errors = spec.validate()
         if validation_errors:
-            raise ValueError(f'Invalid execution spec: {"; ".join(validation_errors)}')
+            return SuccessFail.fail(error=f'Invalid execution spec: {"; ".join(validation_errors)}')
+        if spec != ExecutionSpec():
+            return SuccessFail.fail(error=(
+                'propose(): the command-authority create_proposal endpoint only '
+                'supports a plain MARKET entry with no exit strategy right now -- '
+                'bracket/stop-loss/trailing-stop/limit execution specs are not yet '
+                'carried by CreateProposalRequest. Use the default ExecutionSpec() '
+                'for now, or place the order directly via `mmr buy`/`mmr sell`.'
+            ))
 
-        # Auto-size when neither quantity nor amount is provided
-        if metadata is None:
-            metadata = {}
-        _cached_snap = None  # reused below to avoid duplicate snapshot RPC
-        if quantity is None and amount is None:
-            try:
-                from trader.trading.position_sizing import (
-                    LiquidityInfo, PositionSizingConfig, PositionSizer,
-                    VolatilityInfo, compute_atr,
-                )
-                config = PositionSizingConfig.load()
-                state = self._get_portfolio_state()
-                sizer = PositionSizer(config)
-
-                # Build liquidity info from snapshot (gracefully degrades)
-                liq = None
-                vol_info = None
-                try:
-                    _cached_snap = self.snapshot(symbol, exchange=exchange, currency=currency)
-                    snap = _cached_snap
-                    if snap:
-                        import math
-                        _bid = snap.get('bid', 0) or 0
-                        _ask = snap.get('ask', 0) or 0
-                        _last = snap.get('last', 0) or 0
-                        _bid_sz = snap.get('bidSize', 0) or 0
-                        _ask_sz = snap.get('askSize', 0) or 0
-                        # NaN guard
-                        if isinstance(_bid, float) and math.isnan(_bid): _bid = 0
-                        if isinstance(_ask, float) and math.isnan(_ask): _ask = 0
-                        if isinstance(_last, float) and math.isnan(_last): _last = 0
-                        if isinstance(_bid_sz, float) and math.isnan(_bid_sz): _bid_sz = 0
-                        if isinstance(_ask_sz, float) and math.isnan(_ask_sz): _ask_sz = 0
-                        liq = LiquidityInfo(
-                            bid=_bid, ask=_ask, last=_last,
-                            bid_size=_bid_sz, ask_size=_ask_sz,
-                        )
-                        # Try to get ADV + ATR from local historical data
-                        try:
-                            import datetime as _dt
-                            from trader.data.duckdb_store import DuckDBDataStore
-                            cfg = self._container.config()
-                            # OHLCV lives in the history DB and is keyed by
-                            # conId-string, not ticker. Reading the trading DB by
-                            # ticker returned nothing, so ADV/ATR were always
-                            # unset and the volatility + liquidity adjustments were
-                            # silently inert.
-                            hist_path = cfg.get('history_duckdb_path', '') or cfg.get('duckdb_path', '')
-                            _conid = (_cached_snap or {}).get('conId') if _cached_snap else None
-                            read_key = str(_conid) if _conid else symbol
-                            if hist_path:
-                                ds = DuckDBDataStore(hist_path)
-                                start = _dt.datetime.now() - _dt.timedelta(days=60)
-                                hist = ds.read(read_key, start=start, bar_size='1 day')
-                                if hist is not None and not hist.empty:
-                                    # Use last 20 bars for ADV
-                                    recent = hist.tail(20)
-                                    if 'volume' in recent.columns:
-                                        liq.avg_daily_volume = float(recent['volume'].mean())
-                                    # Compute ATR for volatility-aware sizing
-                                    if all(c in hist.columns for c in ('high', 'low', 'close')):
-                                        atr_val = compute_atr(
-                                            hist['high'].tolist(),
-                                            hist['low'].tolist(),
-                                            hist['close'].tolist(),
-                                        )
-                                        if atr_val is not None:
-                                            last_price = _last or _bid or _ask or float(hist['close'].iloc[-1])
-                                            vol_info = VolatilityInfo(atr=atr_val, price=last_price)
-                        except Exception:
-                            pass
-                except Exception:
-                    pass
-
-                result = sizer.compute(
-                    confidence=confidence, portfolio_state=state,
-                    liquidity=liq, volatility=vol_info,
-                )
-                if result.amount_usd > 0:
-                    amount = result.amount_usd
-                    metadata['auto_sized'] = True
-                    metadata['sizing_result'] = {
-                        'amount': result.amount_usd,
-                        'reasoning': result.reasoning,
-                        'capped_by': result.capped_by,
-                        'warnings': result.warnings,
-                    }
-                else:
-                    # The sizer blocked/zeroed the trade (e.g. at the position
-                    # cap or daily-loss limit). Surface WHY rather than emitting
-                    # a mysteriously unsized proposal with the reason discarded.
-                    metadata['sizing_blocked'] = True
-                    metadata['sizing_result'] = {
-                        'amount': result.amount_usd,
-                        'reasoning': result.reasoning,
-                        'capped_by': result.capped_by,
-                        'warnings': result.warnings,
-                    }
-            except Exception:
-                pass  # Fall through — proposal will have no size, same as before
-
-        proposal = TradeProposal(
-            symbol=symbol,
-            action=action,
-            quantity=quantity,
-            amount=amount,
-            execution=spec,
-            reasoning=reasoning,
-            confidence=confidence,
-            thesis=thesis,
-            source=source,
-            metadata=metadata or {},
-            sec_type=sec_type,
-            exchange=exchange,
-            currency=currency,
-            group=group,
-        )
-        proposal_id = self._proposal_store().add(proposal)
-
-        # Register group membership if specified
-        if group:
-            try:
-                gs = self._group_store()
-                if gs.get_group(group) is None:
-                    # The group doesn't exist, so tagging it silently disables
-                    # the budget tracking the user asked for. Surface it on the
-                    # proposal instead of no-op'ing.
-                    msg = (f"group {group!r} does not exist — budget tracking NOT "
-                           f"applied; create it with `mmr group create {group}`")
-                    logging.warning('propose: %s', msg)
-                    try:
-                        self._proposal_store().update_metadata(
-                            proposal_id, {'group_warning': msg})
-                    except Exception:
-                        pass
-                else:
-                    # Uppercase to match how the portfolio-risk group-budget
-                    # analyzer keys symbols — otherwise 'amd' vs 'AMD' silently
-                    # excludes the position from its group's budget tracking.
-                    gs.add_member(group, symbol.upper())
-            except Exception as ex:
-                logging.warning('propose: group membership registration failed '
-                                'for %s/%s: %s', group, symbol, ex)
-
-        # Attempt to capture snapshot + leverage estimate (requires trader_service, gracefully degrades)
-        # Reuse snapshot from sizing if available to avoid a duplicate RPC call.
-        leverage_info = None
-        snapshot_info = None
         try:
-            # Capture bid/ask/last at proposal time — reuse cached snapshot from sizing
-            snap = _cached_snap
-            if snap is None:
-                snap = self.snapshot(symbol, exchange=exchange, currency=currency)
-            if snap:
-                snapshot_info = {
-                    'bid': snap.get('bid'),
-                    'ask': snap.get('ask'),
-                    'last': snap.get('last'),
-                    'time': str(snap.get('time', '')),
-                }
-                self._proposal_store().update_metadata(proposal_id, {'snapshot': snapshot_info})
+            contract = self._resolve_contract(symbol, sec_type=sec_type, exchange=exchange, currency=currency)
+        except Exception as ex:
+            return SuccessFail.fail(error=f'Could not resolve symbol {symbol}: {ex}', exception=ex)
 
-            acct_vals = consume(self._rpc.rpc(return_type=dict).get_account_values())
-            if acct_vals:
-                net_liq = float(acct_vals.get('NetLiquidation', {}).get('value', 0))
-                gross_pos = float(acct_vals.get('GrossPositionValue', {}).get('value', 0))
-                buying_power = float(acct_vals.get('BuyingPower', {}).get('value', 0))
+        body = {
+            'command_id': f'sdk-{uuid.uuid4()}',
+            'conid': contract.conId,
+            'action': action,
+            'quantity': quantity,
+            'amount': amount,
+            'reasoning': reasoning,
+            'confidence': confidence,
+            'thesis': thesis,
+            'group': group,
+        }
+        try:
+            receipt = self._typed_command.call('create_proposal', body, CommandReceipt)
+        except (TimeoutError, ConnectionError) as ex:
+            return SuccessFail.fail(
+                error=f'create_proposal for {symbol} did not complete: {ex}', exception=ex)
+        if receipt.error_code or receipt.state not in ('RESOLVED', 'SUBMITTED'):
+            return SuccessFail.fail(error=(
+                f'proposal for {symbol} rejected: {receipt.error_code or receipt.state}'))
 
-                # Estimate order value using snapshot price if no limit
-                snap_price = snap.get('last') or snap.get('ask') or 0 if snap else 0
-                price = spec.limit_price or snap_price
-                order_value = quantity * price if quantity and price else amount or 0
-
-                if net_liq > 0:
-                    current_leverage = gross_pos / net_liq
-                    estimated_leverage = (gross_pos + order_value) / net_liq
-                    leverage_info = {
-                        'current_leverage': round(current_leverage, 2),
-                        'estimated_leverage': round(estimated_leverage, 2),
-                        'net_liquidation': net_liq,
-                        'buying_power': buying_power,
-                        'uses_margin': estimated_leverage > 1.0,
-                    }
-                    self._proposal_store().update_metadata(proposal_id, {'leverage_estimate': leverage_info})
-        except Exception:
-            pass  # No trader_service connection, skip enrichment
-
-        return proposal_id, leverage_info, snapshot_info
+        outcome = dict(receipt.outcome or {})
+        # Normalize so callers can always read `proposal_id` regardless of
+        # whether the server's payload key is `id` (the real
+        # ProposalRecord.to_payload() shape) or `proposal_id`.
+        outcome.setdefault('proposal_id', outcome.get('id'))
+        return SuccessFail.success(obj=outcome)
 
     def proposals(self, status: Optional[str] = None, limit: int = 50) -> pd.DataFrame:
-        """List proposals. No trader_service needed."""
-        props = self._proposal_store().query(status=status, limit=limit)
+        """List proposals via the command-authority coordinator's
+        ``list_proposals`` query. REQUIRES trader_service (typed query
+        socket)."""
+        response = self._typed_query.call(
+            'list_proposals', {'status': status, 'limit': limit}, dict)
+        props = response.get('proposals') or []
         if not props:
             return pd.DataFrame()
 
         rows = []
         for p in props:
+            quantity = p.get('quantity')
+            amount = p.get('amount')
             # Build concise size column: "100 sh" or "$5,000"
-            if p.quantity is not None and p.quantity == p.quantity:  # not NaN
-                size = f'{p.quantity:g} sh'
-            elif p.amount is not None and p.amount == p.amount:
-                size = f'${p.amount:,.0f}'
+            if quantity is not None and quantity == quantity:  # not NaN
+                size = f'{quantity:g} sh'
+            elif amount is not None and amount == amount:
+                size = f'${amount:,.0f}'
             else:
                 size = '-'
 
+            execution = p.get('execution') or {}
+            order_type = execution.get('order_type', 'MARKET')
+            limit_price = execution.get('limit_price')
             # Build concise order description: "MKT" or "LMT @165"
-            order = 'MKT' if p.execution.order_type == 'MARKET' else f'LMT @{p.execution.limit_price:g}'
+            order = 'MKT' if order_type == 'MARKET' or limit_price is None else f'LMT @{limit_price:g}'
 
             # Compact exit type
+            exit_type = execution.get('exit_type', 'NONE')
             exit_abbrev = {'NONE': '-', 'BRACKET': 'BKT', 'TRAILING_STOP': 'TSL', 'STOP_LOSS': 'SL'}
-            exit_label = exit_abbrev.get(p.execution.exit_type, p.execution.exit_type[:3])
+            exit_label = exit_abbrev.get(exit_type, (exit_type or '-')[:3])
 
             # Compact timestamp — full detail in `proposals show N`
-            created = p.created_at.strftime('%m/%d %H:%M') if p.created_at else ''
+            created = ''
+            created_at = p.get('created_at')
+            if created_at:
+                try:
+                    created = dt.datetime.fromisoformat(str(created_at)).strftime('%m/%d %H:%M')
+                except ValueError:
+                    created = str(created_at)
 
+            status_value = p.get('status')
             row = {
-                'id': p.id,
-                'symbol': p.symbol,
-                'action': p.action,
+                'id': p.get('id'),
+                'symbol': p.get('symbol'),
+                'action': p.get('action'),
                 'size': size,
                 'order': order,
                 'exit': exit_label,
                 # Numeric confidence, not a formatted percent string — a
                 # percent string loses the value for downstream consumers
                 # (dashboard, LLM loop) that need to compare/sort/threshold it.
-                'confidence': float(p.confidence),
+                'confidence': float(p.get('confidence') or 0.0),
                 'created': created,
-                'source': p.source or 'manual',
-                'reasoning': p.reasoning or '',
+                'source': p.get('source') or 'manual',
+                'reasoning': p.get('reasoning') or '',
                 # Raw storage-layer status (state machine value, e.g.
                 # 'EXECUTED') alongside a user-facing label — callers that
                 # need the authoritative state machine value still have it,
                 # while UI/LLM consumers get plain English.
-                'storage_status': p.status,
-                'display_status': proposal_display_status(p.status),
+                'storage_status': status_value,
+                'display_status': proposal_display_status(status_value),
+                # [M1-F3] Task 8: the command-authority row carries these
+                # natively -- surfaced so a caller can check the exact
+                # revision to approve against and how fresh the reference
+                # quote/expiry are, without a separate `proposals show` call.
+                'revision': p.get('revision'),
+                'expires_at': p.get('expires_at'),
+                'reference_price': p.get('reference_price'),
             }
             # Include status column only when showing mixed statuses (--all)
             if status is None:
-                row['status'] = p.status
-            # Include leverage warning if available
-            leverage = p.metadata.get('leverage_estimate')
-            if leverage and leverage.get('uses_margin'):
-                row['margin'] = f"{leverage['estimated_leverage']:.1f}x"
+                row['status'] = status_value
             rows.append(row)
         return pd.DataFrame(rows)
 
@@ -1523,146 +1467,81 @@ class MMR:
         return detail
 
     def reject(self, proposal_id: int, reason: str = '') -> bool:
-        """Reject a proposal. No trader_service needed."""
-        p = self._proposal_store().get(proposal_id)
-        if not p:
-            return False
-        # Atomic CAS so a concurrent approve/reject race resolves cleanly instead
-        # of raising on a same-status no-op.
-        return self._proposal_store().try_transition(
-            proposal_id, 'PENDING', 'REJECTED', rejection_reason=reason)
-
-    def _utcnow(self) -> dt.datetime:
-        """Seam for tests to inject a fixed clock. Must stay tz-aware UTC —
-        ``claim_for_approval`` calls ``now.astimezone(utc)``, and a naive
-        datetime would be silently reinterpreted as local time."""
-        return dt.datetime.now(dt.timezone.utc)
-
-    def approve(self, proposal_id: int) -> SuccessFail:
-        """Approve and execute a proposal. REQUIRES trader_service."""
-        from trader.data.proposal_store import ApprovalClaimResult
-
-        store = self._proposal_store()
-
-        # Atomically claim the proposal via a single guarded UPDATE that
-        # transitions PENDING -> APPROVED, or PENDING -> EXPIRED if the
-        # proposal's expires_at has already elapsed. This is a compare-and-swap
-        # on the DB row, so if a second process — the LLM loop and a human, or
-        # two `approve --all` shells — races us, exactly one wins and the loser
-        # aborts here instead of placing a duplicate live order. It also closes
-        # the gap where an expired-but-still-PENDING proposal was never checked
-        # at all, so a live order could be placed against a stale signal.
-        claim = store.claim_for_approval(proposal_id, self._utcnow())
-        if claim is ApprovalClaimResult.NOT_FOUND:
-            return SuccessFail.fail(error=f'Proposal #{proposal_id} not found')
-        if claim is ApprovalClaimResult.EXPIRED:
-            return SuccessFail.fail(error=f'Proposal #{proposal_id} expired before approval')
-        if claim is ApprovalClaimResult.NOT_PENDING:
-            current = store.get(proposal_id)
-            state = current.status if current else 'missing'
-            return SuccessFail.fail(error=f'Proposal #{proposal_id} is {state}, not PENDING')
-        proposal = store.get(proposal_id)
-        if proposal is None:
-            return SuccessFail.fail(error=f'Proposal #{proposal_id} disappeared after claim')
+        """Reject a proposal via the command-authority coordinator's
+        ``reject_proposal`` command. REQUIRES trader_service (typed command
+        socket) -- the state-machine transition now happens server-side."""
+        import uuid
+        from trader.domain.commands import CommandReceipt
 
         try:
-            contract = self._resolve_contract(
-                proposal.symbol, sec_type=proposal.sec_type,
-                exchange=proposal.exchange, currency=proposal.currency,
+            receipt = self._typed_command.call(
+                'reject_proposal',
+                {'command_id': f'sdk-{uuid.uuid4()}', 'proposal_id': proposal_id, 'reason': reason},
+                CommandReceipt,
             )
+        except (TimeoutError, ConnectionError):
+            return False
+        return receipt.state == 'RESOLVED'
 
-            # Determine quantity
-            qty = proposal.quantity
-            if qty is None and proposal.amount is not None:
-                import math
-                ticker = consume(
-                    self._rpc.rpc(return_type=Ticker).get_snapshot(contract, False)
-                )
-                snap = {
-                    'last': getattr(ticker, 'last', float('nan')),
-                    'ask': getattr(ticker, 'ask', float('nan')),
-                    'bid': getattr(ticker, 'bid', float('nan')),
-                }
-                # Pick the first valid (non-NaN, positive) price
-                price = None
-                for key in ('last', 'ask', 'bid'):
-                    val = snap.get(key)
-                    if val and isinstance(val, (int, float)) and not math.isnan(val) and val > 0:
-                        price = val
-                        break
-                if not price:
-                    store.update_status(proposal_id, 'FAILED')
-                    return SuccessFail.fail(error='Could not determine price for quantity calculation')
-                # Convert the instrument price to the account BASE currency before
-                # dividing, so `amount` (a base-currency notional target) yields
-                # the correct quantity for a foreign instrument. Without this, a
-                # base amount was divided by a foreign price directly — e.g. an
-                # AUD-priced ASX name sized as if the price were in the base
-                # currency, over/under-sizing by the FX factor. Degrades to no
-                # conversion (rate 1.0) when FX is unavailable or same-currency.
-                _cur = getattr(contract, 'currency', '') or proposal.currency or ''
-                _price_base = self._to_base(price, _cur, self._fx_rates())
-                qty = round(proposal.amount / (_price_base if _price_base > 0 else price))
-                if qty < 1:
-                    qty = 1
+    def approve(self, proposal_id: int, expected_version: Optional[int] = None) -> SuccessFail:
+        """Approve and execute a proposal via the command-authority
+        coordinator's guarded ``approve_proposal`` saga. REQUIRES
+        trader_service (typed query + command sockets) -- claim,
+        expiry/drift/risk checks, quote lookup, sizing, and order dispatch
+        all now happen server-side (``ApprovalCommandService.approve``);
+        this adapter only fetches the current revision (when the caller
+        doesn't supply one) and translates the receipt.
 
-            if qty is None or qty <= 0:
-                store.update_status(proposal_id, 'FAILED')
-                return SuccessFail.fail(error='No valid quantity or amount specified')
+        *expected_version* pins the exact proposal revision being approved
+        (a CAS guard against approving a proposal that changed since the
+        caller last reviewed it). When omitted, the SDK fetches the
+        proposal's current revision via ``get_proposal`` first.
+        """
+        import uuid
+        from trader.domain.commands import CommandReceipt
+        from trader.messaging.typed_rpc import TypedRpcRemoteError
 
-            # The order-placement RPC is the one call where a client-side
-            # timeout is genuinely ambiguous: the request may already be
-            # executing on trader_service. We must NOT mark such a proposal
-            # FAILED (terminal, immutable) — that would tell the operator the
-            # trade never happened while a live order fills. Only a *clean*
-            # failure (explicit reject, or a send that never left the client)
-            # is safe to record as FAILED.
+        if expected_version is None:
             try:
-                result = consume(
-                    self._rpc.rpc(return_type=SuccessFail[list[Trade]]).place_expressive_order(
-                        contract=contract,
-                        action=proposal.action,
-                        quantity=float(qty),
-                        execution_spec=proposal.execution.to_dict(),
-                        algo_name='proposal',
-                    )
-                )
-            except TimeoutError as ex:
-                # Ambiguous: order may be live. Leave the proposal APPROVED so a
-                # reconciliation pass / the operator can resolve it against the
-                # broker, and surface the uncertainty loudly.
+                view = self._typed_query.call(
+                    'get_proposal', {'proposal_id': proposal_id}, dict)
+            except TypedRpcRemoteError as ex:
+                # e.g. PROPOSAL_NOT_FOUND — a clean, expected refusal, not a
+                # transport failure.
                 return SuccessFail.fail(
-                    error=(
-                        f'Proposal #{proposal_id}: order submission timed out — status UNKNOWN. '
-                        f'The order may be live on the broker. Left APPROVED (not FAILED); '
-                        f'reconcile with `mmr orders` / `mmr portfolio` before re-approving. ({ex})'
-                    ),
-                    exception=ex,
-                )
-            except ConnectionError as ex:
-                # The request could not be sent at all (no route to
-                # trader_service). No order was placed — safe to fail cleanly.
-                store.try_transition(proposal_id, 'APPROVED', 'FAILED')
-                return SuccessFail.fail(error=str(ex), exception=ex)
+                    error=f'Proposal #{proposal_id}: {ex.code}: {ex.message}', exception=ex)
+            except (TimeoutError, ConnectionError) as ex:
+                return SuccessFail.fail(
+                    error=f'could not fetch proposal #{proposal_id} to approve: {ex}',
+                    exception=ex)
+            expected_version = view.get('revision')
 
-            if result.is_success():
-                order_ids = []
-                if result.obj:
-                    for t in result.obj:
-                        oid = getattr(t, 'orderId', None) or getattr(getattr(t, 'order', None), 'orderId', None)
-                        if oid:
-                            order_ids.append(oid)
-                store.try_transition(proposal_id, 'APPROVED', 'EXECUTED', order_ids=order_ids)
-                return SuccessFail.success(obj=order_ids)
-            else:
-                store.try_transition(proposal_id, 'APPROVED', 'FAILED')
-                return SuccessFail.fail(error=result.error, exception=result.exception)
+        try:
+            receipt = self._typed_command.call(
+                'approve_proposal',
+                {'command_id': f'sdk-{uuid.uuid4()}', 'proposal_id': proposal_id,
+                 'expected_version': expected_version},
+                CommandReceipt,
+            )
+        except (TimeoutError, ConnectionError) as ex:
+            return SuccessFail.fail(
+                error=f'approve_proposal for #{proposal_id} did not complete: {ex}. '
+                      f'Check `mmr proposals` / `mmr orders` before retrying.',
+                exception=ex)
 
-        except Exception as ex:
-            # Pre-order failures (contract resolution, price snapshot, quantity):
-            # no order was placed, so FAILED is the correct terminal state.
-            store.try_transition(proposal_id, 'APPROVED', 'FAILED')
-            return SuccessFail.fail(error=str(ex))
+        if receipt.state == 'SUBMITTED':
+            return SuccessFail.success(obj=(receipt.outcome or {}).get('order_ids', []))
+        if receipt.state == 'OUTCOME_UNKNOWN':
+            # Loud ambiguity, never a silent failure: the order MAY be live
+            # at the broker even though this call can't confirm it (see
+            # ApprovalCommandService's OUTCOME_UNKNOWN contract).
+            return SuccessFail.fail(error=(
+                f'Proposal #{proposal_id}: outcome unknown — trader_service is '
+                f'reconciling by orderRef (command {receipt.command_id}). '
+                f'Do NOT re-approve; watch `mmr proposals` for the resolution.'))
+        return SuccessFail.fail(
+            error=f'Proposal #{proposal_id} approve rejected: '
+                  f'{receipt.error_code or receipt.state}')
 
     # ------------------------------------------------------------------
     # Protective orders for existing positions

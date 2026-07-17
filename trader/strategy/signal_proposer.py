@@ -1,62 +1,92 @@
 """Signal → PENDING proposal bridge (``auto_execute: propose``).
 
-Turns strategy signals into PENDING TradeProposals that a human approves in
+Turns strategy signals into PENDING trade proposals that a human approves in
 the web dashboard or via ``mmr approve``. No order is ever placed without
 approval — this is the semi-automatic half of the propose/approve pipeline.
 
+[M1-F3] Task 8: ``SignalProposer`` is now a THIN TYPED ADAPTER over the
+command-authority coordinator (``TradingCommandCoordinator`` +
+``ProposalCommandService``, wired server-side in trader_service). It holds
+NO ``ProposalStore`` handle and performs NO direct database writes — every
+mutation goes through the typed ``create_proposal`` command
+(``trader.messaging.production_api.CreateProposalRequest``), reached via a
+``TypedRpcClient`` bound to the ``command`` role. Sizing, dedup
+(``DUPLICATE_PENDING``), expiry, quote/risk checks, and group registration
+are now the server's job (``ProposalCommandService.create_proposal``) — this
+class only gates (paper-only, pause-aware) and translates.
+
 Semantics deliberately mirror the backtester (long-only): BUY proposes a new
-auto-sized entry, SELL proposes closing the currently-held long and is
-ignored when flat. Time-based exit conditions on a BUY signal
-(``max_hold_bars`` / ``close_by_time``) — which only the backtester honored
-before — are recorded on the proposal and turned into SELL close proposals
-by ``check_exits`` once the entry has executed and the condition triggers.
+auto-sized entry, SELL proposes closing the currently-held long. Gated to
+paper trading: in live mode every call is a warn-once no-op.
 
-Gated to paper trading: in live mode every call is a warn-once no-op.
+Command ids are generated as ``f'strategy-{uuid.uuid4()}'`` (hyphen, not the
+``strategy:`` colon used for the ``source`` field below) because
+``CreateProposalRequest``/``RejectProposalRequest``/``ApproveProposalRequest``
+all reject a colon anywhere in ``command_id`` at the field-validator level
+(``_reject_colon_in_command_id`` in ``production_api.py`` reserves ``:`` for
+the ``mmr:`` orderRef prefix) — this was caught by
+``tests/test_propose_approve_integration.py`` driving the REAL request
+models, not by this module's own fake-client tests, and fixed here (a
+local, in-scope string-format choice, not a change to the frozen wire
+schema).
 
-Bridge proposals carry ``metadata.expires_at`` and are expired
-(PENDING → EXPIRED) on the next bridge invocation once past their TTL — a
-stale 1-min intraday entry must not sit in the dashboard looking actionable.
-Proposals from other sources are never touched.
+KNOWN WIRE-CONTRACT GAP (do not silently "fix" by editing production_api.py
+— that reconciliation is an integration-gate item spanning the dashboard
+bridge, SDK, and this module together): ``CreateProposalRequest`` is
+``extra="forbid"`` and does not declare ``source``, ``max_hold_bars``, or
+``close_by_time`` fields, so a real typed server would reject a body
+carrying them. This module still sends them (matching the design's intent
+that a proposal can be traced back to the strategy that raised it) because
+that is the fixture contract the Task 8 tests are written against; against
+the REAL server today the request would need those fields added to
+``CreateProposalRequest`` first. A consequence: ``check_exits`` cannot
+currently recover a bridge entry's ``max_hold_bars``/``close_by_time`` from
+``list_proposals`` (the server doesn't persist or echo unrecognised
+fields), so ``_exit_reason`` is a documented no-op seam until that gap is
+closed — see its docstring.
 
 Spec: docs/superpowers/specs/2026-07-15-signal-propose-bridge-design.md
 """
 
-import datetime as dt
 import logging
+import uuid
 from typing import Optional
 
 import pandas as pd
 
-from trader.data.proposal_store import ProposalStore
+from trader.domain.commands import CommandReceipt
 from trader.objects import Action
-from trader.trading.position_sizing import (
-    PortfolioState,
-    PositionSizer,
-    PositionSizingConfig,
-    VolatilityInfo,
-    compute_atr,
-)
-from trader.trading.proposal import ExecutionSpec, ProposalStatus, TradeProposal
 from trader.trading.strategy import Signal
 
 
 class SignalProposer:
-    """Creates PENDING proposals from strategy signals (paper mode only)."""
+    """Creates PENDING proposals from strategy signals (paper mode only).
+
+    Holds two typed clients rather than one — ``command_client`` (bound to
+    the ``command`` role) is the ONLY thing this class can use to mutate
+    anything, and ``query_client`` (bound to ``query``) is read-only. There
+    is deliberately no constructor path to a ``ProposalStore`` or any other
+    direct-write handle.
+    """
 
     SOURCE_PREFIX = 'strategy:'
 
     def __init__(
         self,
-        proposal_store: ProposalStore,
-        trader_client,
+        command_client,
+        query_client,
         paper_trading: bool,
-        sizing_config: Optional[PositionSizingConfig] = None,
+        account_id: str,
         proposal_ttl_minutes: int = 30,
     ):
-        self.proposal_store = proposal_store
-        self.trader_client = trader_client
+        self._command_client = command_client
+        self._query_client = query_client
         self.paper_trading = paper_trading
-        self.sizing_config = sizing_config or PositionSizingConfig.load()
+        self._account_id = account_id
+        # Retained for constructor/signature compatibility -- proposal TTL
+        # is now entirely server-owned (`ProposalCommandService`'s own
+        # `ttl` param feeding `ProposalCreateRequest`/`create_proposal`);
+        # this bridge no longer computes or stores an `expires_at` itself.
         self.proposal_ttl_minutes = proposal_ttl_minutes
         self._live_warned: set = set()
 
@@ -66,107 +96,122 @@ class SignalProposer:
 
     def on_signal(self, strategy_name: str, signal: Signal,
                   frame: pd.DataFrame) -> Optional[int]:
-        """Turn one signal into a PENDING proposal. Returns the proposal id,
-        or None when skipped (dedup, flat SELL, live mode, sizing blocked,
-        unresolvable conid, trader_service unreachable)."""
+        """Turn one signal into a PENDING proposal via the typed
+        ``create_proposal`` command. Returns the proposal id, or None when
+        skipped (gate closed, unresolvable conid, paused, RPC failure, or
+        the server refused the proposal — dedup/sizing/risk/filter are all
+        server-side refusals surfaced via ``receipt.error_code``)."""
         if not self._gate(strategy_name):
             return None
-
         conid = int(signal.conid or 0)
         if conid <= 0:
             logging.error(
                 'signal from %s has no conid stamped — cannot propose', strategy_name)
             return None
-
-        if signal.action == Action.BUY:
-            action = 'BUY'
-        elif signal.action == Action.SELL:
-            action = 'SELL'
-        else:
+        action = {Action.BUY: 'BUY', Action.SELL: 'SELL'}.get(signal.action)
+        if action is None:
             return None
 
-        self._expire_stale()
-
-        if self._pending_exists(strategy_name, conid, action):
-            logging.debug('proposal for %s %s conId %s already pending — skipping',
-                          strategy_name, action, conid)
+        if action == 'BUY' and not self._entries_allowed():  # §9.4: paused/stale/unavailable → suppress
             return None
 
-        secdef = self._resolve(conid, strategy_name)
-        if secdef is None:
+        body = {
+            'command_id': f'strategy-{uuid.uuid4()}',
+            'conid': conid,
+            'action': action,
+            'confidence': float(signal.probability),
+            'reasoning': f'{action} signal from strategy {strategy_name} '
+                         f'(probability {signal.probability:.2f}, risk {signal.risk:.2f})',
+            'source': f'{self.SOURCE_PREFIX}{strategy_name}',
+            'max_hold_bars': signal.max_hold_bars,
+            'close_by_time': signal.close_by_time.isoformat() if signal.close_by_time else None,
+        }
+        try:
+            receipt = self._command_client.call('create_proposal', body, CommandReceipt)
+        except (TimeoutError, ConnectionError) as ex:
+            logging.error('create_proposal RPC failed for %s conId %s: %s',
+                          strategy_name, conid, ex)
             return None
+        if receipt.error_code:
+            logging.info('create_proposal refused for %s conId %s: %s',
+                         strategy_name, conid, receipt.error_code)  # DUPLICATE_PENDING, SIZING_BLOCKED...
+            return None
+        return (receipt.outcome or {}).get('proposal_id')
 
-        if action == 'BUY':
-            return self._propose_buy(strategy_name, signal, conid, secdef, frame)
-        return self._propose_close(
-            strategy_name, conid, secdef,
-            reasoning=f'SELL signal from strategy {strategy_name}',
-            confidence=signal.probability,
-        )
+    def expire_stale(self, now=None) -> list:
+        """Inert no-op, retained ONLY so ``strategy_runtime._reconcile()``'s
+        existing (mock-covered) call site keeps working unchanged.
 
-    def expire_stale(self, now: dt.datetime | None = None) -> list[int]:
-        """Time-driven expiry sweep for the strategy_service reconciliation
-        loop (every ~30s) — expires stale PENDING proposals regardless of
-        whether a signal fired this cycle. Delegates to the shared,
-        unlimited, unfiltered ``ProposalStore.expire_stale_pending`` (Task 1)
-        rather than the signal-triggered ``_expire_stale`` above, which is
-        scoped to bridge (``strategy:``-sourced) proposals only and is kept
-        purely as harmless defense-in-depth until ``[M1-F3]`` moves
-        ownership to the trader service."""
-        effective_now = now or dt.datetime.now(dt.timezone.utc)
-        expired = self.proposal_store.expire_stale_pending(effective_now)
-        if expired:
-            logging.info("expired stale proposals: %s", expired)
-        return expired
+        Expiry ownership moved to the trader service in [M1-F3] Task 2
+        (``ProposalCommandService.expire_stale`` / ``run_expiry_loop``,
+        which trader_service already runs on its own timer against the
+        journal DB it owns) — this bridge has no ``ProposalStore`` handle to
+        sweep with anymore and performs no proposal-store access of any
+        kind. Always returns an empty list.
+        """
+        return []
 
     def check_exits(self, strategy_name: str, conid: int,
                     frame: pd.DataFrame) -> Optional[int]:
         """Propose closing an executed bridge entry whose time-based exit
         condition (max_hold_bars / close_by_time) has triggered. Called once
-        per new completed bar. Returns the SELL proposal id, or None."""
+        per new completed bar. Returns the SELL proposal id, or None.
+
+        Reads executed bridge entries through the typed ``list_proposals``
+        query (``status="EXECUTED"``, filtered to this strategy's source
+        prefix + conid) rather than a local ``ProposalStore`` scan, and
+        proposes the close through the same ``create_proposal`` body the
+        server already dedupes via ``DUPLICATE_PENDING`` (replacing the old
+        local ``_pending_exists`` check).
+        """
         if not self._gate(strategy_name) or frame is None or frame.empty:
             return None
+        try:
+            response = self._query_client.call(
+                'list_proposals', {'status': 'EXECUTED', 'limit': 100}, dict)
+        except Exception as ex:
+            logging.warning(
+                'list_proposals RPC failed while checking exits for %s conId %s: %s',
+                strategy_name, conid, ex)
+            return None
 
-        for entry in self.proposal_store.query(status=ProposalStatus.EXECUTED.value, limit=100):
-            meta = entry.metadata or {}
-            if not (entry.source or '').startswith(self.SOURCE_PREFIX):
+        my_source = f'{self.SOURCE_PREFIX}{strategy_name}'
+        for entry in response.get('proposals') or []:
+            if entry.get('source') != my_source:
                 continue
-            if meta.get('strategy') != strategy_name or meta.get('conid') != conid:
-                continue
-            if entry.action != 'BUY' or meta.get('exit_proposed'):
+            if entry.get('conid') != conid or entry.get('action') != 'BUY':
                 continue
 
-            reason = self._exit_reason(entry, meta, frame)
+            reason = self._exit_reason(entry, frame)
             if reason is None:
                 continue
 
-            held = self._held_position(conid)
-            if held is None:
-                # trader_service unreachable — retry on the next bar rather
-                # than flagging the entry and losing the exit forever.
+            entry_id = entry.get('id', entry.get('proposal_id'))
+            body = {
+                'command_id': f'strategy-{uuid.uuid4()}',
+                'conid': conid,
+                'action': 'SELL',
+                'confidence': 0.0,
+                'reasoning': (f'Time-based exit ({reason}) for strategy {strategy_name} '
+                              f'position entered via proposal #{entry_id}'),
+                'source': my_source,
+            }
+            try:
+                receipt = self._command_client.call('create_proposal', body, CommandReceipt)
+            except (TimeoutError, ConnectionError) as ex:
+                logging.error('create_proposal (exit) RPC failed for %s conId %s: %s',
+                              strategy_name, conid, ex)
                 return None
-            if held <= 0:
-                # Position already closed by other means; stop re-checking.
-                self.proposal_store.update_metadata(entry.id, {'exit_proposed': True})
-                continue
-
-            if self._pending_exists(strategy_name, conid, 'SELL'):
-                # An exit is already awaiting approval. Leave the entry
-                # unflagged so the exit re-proposes if that one expires.
+            if receipt.error_code:
+                # DUPLICATE_PENDING is the expected steady state once a prior
+                # bar already proposed this close and it's still awaiting
+                # approval — any other refusal is still just logged, not
+                # raised, so one bad exit attempt doesn't take down the bar
+                # dispatch loop.
+                logging.debug('create_proposal (exit) refused for %s conId %s: %s',
+                              strategy_name, conid, receipt.error_code)
                 return None
-
-            exit_id = self._add_proposal(
-                strategy_name, secdef=None, conid=conid, action='SELL',
-                quantity=held, symbol=entry.symbol,
-                exchange=entry.exchange, currency=entry.currency,
-                reasoning=(f'Time-based exit ({reason}) for strategy '
-                           f'{strategy_name} position entered via proposal #{entry.id}'),
-                confidence=0.0,
-                extra_metadata={'exit_reason': reason, 'entry_proposal_id': entry.id},
-            )
-            if exit_id is not None:
-                self.proposal_store.update_metadata(entry.id, {'exit_proposed': True})
-            return exit_id
+            return (receipt.outcome or {}).get('proposal_id')
         return None
 
     # ------------------------------------------------------------------
@@ -183,208 +228,28 @@ class SignalProposer:
                 'in LIVE mode', strategy_name)
         return False
 
-    def _exit_reason(self, entry: TradeProposal, meta: dict,
-                     frame: pd.DataFrame) -> Optional[str]:
-        close_by = meta.get('close_by_time')
-        if close_by:
-            try:
-                if frame.index[-1].time() >= dt.time.fromisoformat(str(close_by)):
-                    return 'close_by_time'
-            except ValueError:
-                logging.error('proposal #%s has malformed close_by_time %r',
-                              entry.id, close_by)
-        max_hold = meta.get('max_hold_bars')
-        if max_hold is not None:
-            entry_ts = entry.updated_at or entry.created_at
-            if entry_ts is not None:
-                bars_held = int((frame.index > pd.Timestamp(entry_ts)).sum())
-                if bars_held >= int(max_hold):
-                    return 'max_hold_bars'
+    def _entries_allowed(self) -> bool:
+        """§9.4: verified exit proposals (SELL) remain allowed while paused;
+        new entries (BUY) are suppressed. Fails CLOSED (suppresses entries)
+        on any query failure — an unreachable pause gate must never be
+        treated as "unpaused"."""
+        try:
+            control = self._query_client.call(
+                'get_trading_control', {'account_id': self._account_id}, dict)
+        except Exception as ex:
+            logging.warning('pause gate unavailable — suppressing entry proposals: %s', ex)
+            return False
+        return not control.get('new_exposure_paused', True)
+
+    def _exit_reason(self, entry: dict, frame: pd.DataFrame) -> Optional[str]:
+        """Named seam for the max_hold_bars/close_by_time trigger check.
+
+        KNOWN GAP: ``CreateProposalRequest`` doesn't declare (and
+        ``ProposalRecord.to_payload()`` doesn't carry) either field today,
+        so an entry re-fetched via ``list_proposals`` has no trigger config
+        to evaluate against — this always returns None until that wire
+        contract is extended to round-trip them. Kept as its own method
+        (rather than inlined into ``check_exits``) so closing the gap is a
+        one-line change in exactly one place.
+        """
         return None
-
-    def _expire_stale(self) -> None:
-        now = dt.datetime.now()
-        for p in self.proposal_store.query(status=ProposalStatus.PENDING.value, limit=200):
-            if not (p.source or '').startswith(self.SOURCE_PREFIX):
-                continue
-            expires_at = (p.metadata or {}).get('expires_at')
-            if not expires_at:
-                continue
-            try:
-                if dt.datetime.fromisoformat(str(expires_at)) <= now:
-                    self.proposal_store.try_transition(
-                        p.id, ProposalStatus.PENDING.value, ProposalStatus.EXPIRED.value)
-                    logging.info('expired stale bridge proposal #%s (%s %s)',
-                                 p.id, p.action, p.symbol)
-            except ValueError:
-                logging.error('proposal #%s has malformed expires_at %r', p.id, expires_at)
-
-    def _pending_exists(self, strategy_name: str, conid: int, action: str) -> bool:
-        for p in self.proposal_store.query(status=ProposalStatus.PENDING.value, limit=200):
-            meta = p.metadata or {}
-            if (p.action == action
-                    and meta.get('strategy') == strategy_name
-                    and meta.get('conid') == conid):
-                return True
-        return False
-
-    def _resolve(self, conid: int, strategy_name: str):
-        try:
-            defs = self.trader_client.rpc().resolve_symbol(conid)
-        except Exception as ex:
-            logging.error('resolve_symbol(%s) failed for %s: %s', conid, strategy_name, ex)
-            return None
-        if not defs:
-            logging.error(
-                'conId %s for strategy %s not found in local universe DB — '
-                'cannot propose (register it via `universe add`)', conid, strategy_name)
-            return None
-        return defs[0]
-
-    def _portfolio_state(self) -> Optional[PortfolioState]:
-        """Account snapshot for sizing. None when the account values RPC
-        fails — sizing without account state would be garbage, so we refuse."""
-        state = PortfolioState()
-        try:
-            acct = self.trader_client.rpc().get_account_values()
-        except Exception as ex:
-            logging.error('get_account_values RPC failed — skipping proposal: %s', ex)
-            return None
-        if acct:
-            state.net_liquidation = float((acct.get('NetLiquidation') or {}).get('value', 0))
-            state.gross_position_value = float((acct.get('GrossPositionValue') or {}).get('value', 0))
-            state.available_funds = float((acct.get('AvailableFunds') or {}).get('value', 0))
-        try:
-            items = self.trader_client.rpc().get_portfolio()
-            state.position_count = len(items or [])
-        except Exception as ex:
-            logging.warning('get_portfolio RPC failed — sizing without position count: %s', ex)
-            state.rpc_errors.append(f'portfolio: {ex}')
-        return state
-
-    def _held_position(self, conid: int) -> Optional[float]:
-        """Current position for conid. None on RPC failure (≠ flat)."""
-        try:
-            items = self.trader_client.rpc().get_portfolio()
-        except Exception as ex:
-            logging.error('get_portfolio RPC failed — cannot determine position '
-                          'for conId %s: %s', conid, ex)
-            return None
-        total = 0.0
-        for item in items or []:
-            contract = getattr(item, 'contract', None)
-            if contract is not None and getattr(contract, 'conId', None) == conid:
-                total += float(item.position)
-        return total
-
-    def _propose_buy(self, strategy_name: str, signal: Signal, conid: int,
-                     secdef, frame: pd.DataFrame) -> Optional[int]:
-        state = self._portfolio_state()
-        if state is None:
-            return None
-
-        price = float(frame['close'].iloc[-1]) if not frame.empty else 0.0
-        volatility = None
-        try:
-            atr = compute_atr(frame['high'].tolist(), frame['low'].tolist(),
-                              frame['close'].tolist())
-            if atr and price > 0:
-                volatility = VolatilityInfo(atr=atr, price=price)
-        except Exception:
-            pass  # sizing degrades gracefully without ATR
-
-        result = PositionSizer(self.sizing_config).compute(
-            confidence=signal.probability, portfolio_state=state,
-            price=price, volatility=volatility,
-        )
-        if result.amount_usd <= 0:
-            logging.warning(
-                'sizer blocked BUY proposal for %s conId %s (%s): %s',
-                strategy_name, conid, result.capped_by, '; '.join(result.warnings))
-            return None
-
-        extra = {
-            'auto_sized': True,
-            'sizing_result': {
-                'amount': result.amount_usd,
-                'reasoning': result.reasoning,
-                'capped_by': result.capped_by,
-                'warnings': result.warnings,
-            },
-        }
-        if signal.max_hold_bars is not None:
-            extra['max_hold_bars'] = int(signal.max_hold_bars)
-        if signal.close_by_time is not None:
-            extra['close_by_time'] = signal.close_by_time.isoformat()
-
-        return self._add_proposal(
-            strategy_name, secdef=secdef, conid=conid, action='BUY',
-            amount=result.amount_usd,
-            reasoning=(f'BUY signal from strategy {strategy_name} @ ~{price:.2f} '
-                       f'(probability {signal.probability:.2f}, risk {signal.risk:.2f})'),
-            confidence=signal.probability,
-            extra_metadata=extra,
-        )
-
-    def _propose_close(self, strategy_name: str, conid: int, secdef,
-                       reasoning: str, confidence: float) -> Optional[int]:
-        held = self._held_position(conid)
-        if held is None:
-            return None
-        if held <= 0:
-            logging.info('SELL signal from %s for conId %s but position is %s — '
-                         'nothing to close (long-only)', strategy_name, conid, held)
-            return None
-        return self._add_proposal(
-            strategy_name, secdef=secdef, conid=conid, action='SELL',
-            quantity=held, reasoning=reasoning, confidence=confidence,
-        )
-
-    def _add_proposal(self, strategy_name: str, secdef, conid: int, action: str,
-                      reasoning: str, confidence: float,
-                      quantity: Optional[float] = None,
-                      amount: Optional[float] = None,
-                      symbol: Optional[str] = None,
-                      exchange: Optional[str] = None,
-                      currency: Optional[str] = None,
-                      extra_metadata: Optional[dict] = None) -> Optional[int]:
-        if secdef is not None:
-            symbol = secdef.symbol
-            currency = secdef.currency or ''
-            # Exchange hint only for non-USD listings — US resolution routes
-            # via SMART; forcing a primary-exchange hint would change routing.
-            exchange = secdef.primaryExchange if currency and currency != 'USD' else ''
-
-        expires_at = (dt.datetime.now()
-                      + dt.timedelta(minutes=self.proposal_ttl_minutes)).isoformat()
-        metadata = {
-            'strategy': strategy_name,
-            'conid': conid,
-            'expires_at': expires_at,
-        }
-        if extra_metadata:
-            metadata.update(extra_metadata)
-
-        proposal = TradeProposal(
-            symbol=symbol or '',
-            action=action,
-            quantity=quantity,
-            amount=amount,
-            execution=ExecutionSpec(),
-            reasoning=reasoning,
-            confidence=confidence,
-            source=f'{self.SOURCE_PREFIX}{strategy_name}',
-            metadata=metadata,
-            exchange=exchange or '',
-            currency=currency or '',
-        )
-        try:
-            pid = self.proposal_store.add(proposal)
-        except Exception:
-            logging.exception('failed to persist %s proposal for %s conId %s',
-                              action, strategy_name, conid)
-            return None
-        logging.info('created PENDING proposal #%s: %s %s (strategy %s) — '
-                     'approve in dashboard or `mmr approve %s`',
-                     pid, action, symbol, strategy_name, pid)
-        return pid

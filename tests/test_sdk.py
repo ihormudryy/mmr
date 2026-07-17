@@ -17,6 +17,7 @@ if PROJECT_ROOT not in sys.path:
 
 from trader.sdk import MMR, Subscription
 from trader.common.reactivex import SuccessFail, SuccessFailEnum
+from trader.domain.commands import CommandReceipt
 from trader.trading.proposal import ExecutionSpec, TradeProposal
 
 
@@ -49,6 +50,12 @@ def _make_mmr_with_mock(mock_client) -> MMR:
     mmr._contract_map = {}
     mmr._container = MagicMock()
     mmr._container.config_file = '/tmp/test_trader.yaml'
+    # [M1-F3] Task 8: no typed query/command client wired by default -- only
+    # propose/proposals/reject/approve touch these (via `_typed_query`/
+    # `_typed_command`), and tests exercising those explicitly assign a
+    # `FakeTypedClient` (see the `typed`/`mmr` fixtures below).
+    mmr._typed_query_client = None
+    mmr._typed_command_client = None
     return mmr
 
 
@@ -62,13 +69,77 @@ def _proposal(symbol='AMD', quantity=10, confidence=0.0) -> TradeProposal:
     )
 
 
+@dataclass
+class _RecordedTypedCall:
+    method: str
+    body: dict
+
+
+class FakeTypedClient:
+    """Fake typed RPC client double serving BOTH the ``query`` and
+    ``command`` roles from one instance (mirrors how the ``mmr`` fixture
+    wires the SAME fake into both ``_typed_query_client`` and
+    ``_typed_command_client``). Queue a response per method with
+    ``queue_query``/``queue_command`` (FIFO per method); every ``.call()``
+    is recorded so tests can assert on method/body. ``store_writes`` is a
+    standing invariant list -- it stays empty for the lifetime of the fake
+    because nothing in this test double (or the SDK/SignalProposer code
+    under test) ever performs a direct ``ProposalStore`` write."""
+
+    def __init__(self):
+        self._query_queue: dict = {}
+        self._command_queue: dict = {}
+        self.queries: list[_RecordedTypedCall] = []
+        self.commands: list[_RecordedTypedCall] = []
+        self.store_writes: list = []
+
+    def queue_query(self, method, response):
+        self._query_queue.setdefault(method, []).append(('ok', response))
+
+    def queue_command(self, method, receipt):
+        self._command_queue.setdefault(method, []).append(('ok', receipt))
+
+    def fail_next_query(self, method, exc):
+        self._query_queue.setdefault(method, []).append(('err', exc))
+
+    def fail_next_command(self, method, exc):
+        self._command_queue.setdefault(method, []).append(('err', exc))
+
+    def call(self, method, body, response_model=None, timeout=None):
+        # Command queue is checked first: a method registered as a command
+        # (create_proposal/reject_proposal/approve_proposal) is never also a
+        # query in these tests, so ordering only matters for methods queued
+        # on neither (falls through to the AssertionError below).
+        if self._command_queue.get(method):
+            kind, payload = self._command_queue[method].pop(0)
+            self.commands.append(_RecordedTypedCall(method=method, body=dict(body)))
+            if kind == 'err':
+                raise payload
+            return payload
+        if self._query_queue.get(method):
+            kind, payload = self._query_queue[method].pop(0)
+            self.queries.append(_RecordedTypedCall(method=method, body=dict(body)))
+            if kind == 'err':
+                raise payload
+            return payload
+        raise AssertionError(f'FakeTypedClient.call({method!r}, ...) with no queued response')
+
+
 @pytest.fixture
-def mmr(tmp_duckdb_path):
-    """MMR shell wired to a mock RPCClient and to `tmp_duckdb_path`, so it
-    shares the same underlying DuckDB file as the `proposal_store` fixture
-    (both fixtures resolve `tmp_duckdb_path` to the same instance per test)."""
+def typed():
+    """A fresh `FakeTypedClient` per test."""
+    return FakeTypedClient()
+
+
+@pytest.fixture
+def mmr(tmp_duckdb_path, typed):
+    """MMR shell wired to a mock RPCClient, to `tmp_duckdb_path` (so it
+    shares the same underlying DuckDB file as the `proposal_store` fixture),
+    and to `typed` for both the query and command typed-RPC roles."""
     m = _make_mmr_with_mock(_make_mock_rpc())
     m._container.config.return_value = {'duckdb_path': tmp_duckdb_path}
+    m._typed_query_client = typed
+    m._typed_command_client = typed
     return m
 
 
@@ -1241,16 +1312,18 @@ class TestPortfolioSnapshotPropagatesFailures:
 
 class TestProposalsListingSource:
     """The dashboard needs to distinguish strategy-bridge proposals from
-    manual/LLM ones — the listing must carry the proposal source."""
+    manual/LLM ones — the listing must carry the proposal source.
 
-    def test_proposals_rows_include_source(self):
-        from trader.trading.proposal import TradeProposal
-        mmr = _make_mmr_with_mock(_make_mock_rpc())
-        p = TradeProposal(symbol='AMD', action='BUY', amount=5000.0,
-                          source='strategy:orb_test')
-        p.id = 1
-        p.status = 'PENDING'
-        _stub_proposal_store(mmr, pending=[p])
+    [M1-F3] Task 8: `proposals()` now reads through the typed
+    `list_proposals` query rather than a local `ProposalStore` scan."""
+
+    def test_proposals_rows_include_source(self, mmr, typed):
+        typed.queue_query('list_proposals', {'proposals': [{
+            'id': 1, 'symbol': 'AMD', 'action': 'BUY', 'amount': 5000.0,
+            'quantity': None, 'confidence': 0.0, 'reasoning': '',
+            'source': 'strategy:orb_test', 'status': 'PENDING',
+            'execution': {}, 'created_at': None,
+        }]})
 
         df = mmr.proposals()
 
@@ -1299,11 +1372,91 @@ class TestTransportIndependentDomainValues:
         }
         assert mmr.portfolio_snapshot()["net_liquidation"] == 50000.0
 
-    def test_proposal_rows_keep_numeric_confidence_and_map_submission(self, mmr, proposal_store):
-        pid = proposal_store.add(_proposal(confidence=0.73))
-        proposal_store.update_status(pid, "APPROVED")
-        proposal_store.update_status(pid, "EXECUTED", order_ids=[17])
+    def test_proposal_rows_keep_numeric_confidence_and_map_submission(self, mmr, typed):
+        typed.queue_query('list_proposals', {'proposals': [{
+            'id': 1, 'symbol': 'AMD', 'action': 'BUY', 'amount': None,
+            'quantity': 10.0, 'confidence': 0.73, 'reasoning': 'test reasoning',
+            'source': 'manual', 'status': 'EXECUTED', 'execution': {},
+            'created_at': None, 'revision': 2, 'expires_at': None,
+            'reference_price': None,
+        }]})
         row = mmr.proposals().iloc[0]
         assert row["confidence"] == 0.73
         assert row["storage_status"] == "EXECUTED"
         assert row["display_status"] == "ORDER_SUBMITTED"
+
+
+class TestTypedProposalAdapters:
+    """[M1-F3] Task 8: `propose`/`proposals`/`reject`/`approve` are thin
+    typed adapters over the command-authority coordinator's
+    `create_proposal`/`list_proposals`/`reject_proposal`/`approve_proposal`/
+    `get_proposal` typed RPC methods. No direct `ProposalStore` write
+    anywhere in `trader/sdk.py` (see the banned-token test at the bottom of
+    this class)."""
+
+    def test_sdk_approve_is_a_typed_command_with_no_store_write(self, mmr, typed):
+        typed.queue_query('get_proposal', {'proposal_id': 7, 'revision': 3, 'status': 'PENDING'})
+        typed.queue_command('approve_proposal', CommandReceipt(
+            command_id='sdk-x', correlation_id='sdk-x', state='SUBMITTED',
+            outcome={'order_ids': [17], 'order_group_id': 'og-sdk-x'},
+            error_code=None, retryable=False))
+        result = mmr.approve(7)
+        assert result.is_success() and result.obj == [17]
+        call = typed.commands[0]
+        assert call.method == 'approve_proposal'
+        assert call.body['proposal_id'] == 7 and call.body['expected_version'] == 3
+        assert call.body['command_id'].startswith('sdk-')
+        assert typed.store_writes == []                       # no ProposalStore mutation anywhere
+
+    def test_sdk_surfaces_outcome_unknown_without_marking_failed(self, mmr, typed):
+        typed.queue_query('get_proposal', {'proposal_id': 7, 'revision': 3, 'status': 'PENDING'})
+        typed.queue_command('approve_proposal', CommandReceipt(
+            command_id='sdk-x', correlation_id='sdk-x', state='OUTCOME_UNKNOWN',
+            outcome=None, error_code='DISPATCH_AMBIGUOUS', retryable=False))
+        result = mmr.approve(7)
+        assert not result.is_success()
+        assert 'reconcil' in result.error.lower()             # loud ambiguity, never silent failure
+        assert 'do not re-approve' in result.error.lower()
+
+    def test_sdk_approve_honors_explicit_expected_version_no_fetch(self, mmr, typed):
+        """When the caller already knows the revision (e.g. re-driving from
+        `proposals()`'s own `revision` column), approve() must not issue a
+        get_proposal fetch first."""
+        typed.queue_command('approve_proposal', CommandReceipt(
+            'sdk-y', 'sdk-y', 'SUBMITTED', {'order_ids': [1]}, None, False))
+        result = mmr.approve(9, expected_version=5)
+        assert result.is_success()
+        assert typed.queries == []
+        assert typed.commands[0].body['expected_version'] == 5
+
+    def test_sdk_propose_and_reject_are_typed_calls(self, mmr, typed):
+        mmr._rpc.rpc().resolve_symbol.return_value = [
+            FakeSecurityDefinition(symbol='AAPL', conId=265598)]
+        typed.queue_command('create_proposal', CommandReceipt(
+            'c1', 'c1', 'RESOLVED', {'proposal_id': 41, 'revision': 1}, None, False))
+        created = mmr.propose(symbol='AAPL', action='BUY', confidence=0.7, group='tech')
+        assert created.is_success() and created.obj['proposal_id'] == 41
+        typed.queue_command('reject_proposal', CommandReceipt(
+            'c2', 'c2', 'RESOLVED', {'proposal_id': 41, 'status': 'REJECTED'}, None, False))
+        assert mmr.reject(41, 'changed thesis') is True
+        assert [c.method for c in typed.commands] == ['create_proposal', 'reject_proposal']
+
+    def test_propose_refuses_non_default_execution_spec_loudly(self, mmr, typed):
+        """A bracket/stop/limit execution spec must be refused loudly, not
+        silently downgraded to a plain market order (CreateProposalRequest
+        doesn't carry an execution spec yet)."""
+        mmr._rpc.rpc().resolve_symbol.return_value = [
+            FakeSecurityDefinition(symbol='AAPL', conId=265598)]
+        spec = ExecutionSpec(exit_type='STOP_LOSS', stop_loss_price=140.0)
+        result = mmr.propose(symbol='AAPL', action='BUY', quantity=10, execution=spec)
+        assert not result.is_success()
+        assert typed.commands == []
+
+    def test_non_trader_processes_hold_no_proposal_write_capability(self):
+        from pathlib import Path
+        banned = ("proposal_store.add(", ".try_transition(", ".update_status(",
+                  "claim_for_approval(", "expire_stale_pending(")
+        for relpath in ("trader/sdk.py", "trader/strategy/signal_proposer.py", "web/app.py"):
+            source = (Path(PROJECT_ROOT) / relpath).read_text()
+            for token in banned:
+                assert token not in source, f"{relpath} still writes proposals via {token}"

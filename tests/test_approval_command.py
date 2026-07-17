@@ -11,6 +11,7 @@ import datetime as dt
 from types import SimpleNamespace
 
 import pytest
+from pydantic import ValidationError
 
 from trader.data.domain_journal import DomainJournal
 from trader.data.duckdb_store import DuckDBConnection
@@ -20,8 +21,14 @@ from trader.data.proposal_repository import (
     apply_proposal_authority_migration,
 )
 from trader.data.schema_migrations import SchemaMigrator
+from trader.messaging.production_api import (
+    ApproveProposalRequest,
+    register_command_authority,
+)
+from trader.messaging.typed_rpc import TypedRpcRegistry
 from trader.trading.command_coordinator import (
     ApprovalCommandService,
+    BrokerRejectedError,
     CommandAudit,
     CommandLedger,
     CommandRequest,
@@ -269,6 +276,11 @@ def test_happy_path_claims_dispatches_and_binds_order_ref(approval):
     assert stored.status == "EXECUTED"                    # storage keeps legacy name ([S0] display maps it)
     assert stored.order_group_id == "og-cmd-1"
     assert stored.revision == record.revision + 2         # claim + submit-link
+    # [Finding 2] the write-once risk decision is recorded, exactly once, with
+    # the INCREASING-approve payload, BEFORE the claim tx.
+    assert approval.risk_producer.decisions == [
+        ("cmd-1", {"decision": "approve", "direction": "INCREASING", "proposal_id": record.id})
+    ]
 
 
 def test_expired_row_flips_to_expired_inside_the_claiming_transaction(approval):
@@ -294,6 +306,11 @@ def test_drift_beyond_recorded_guard_rejects(approval):
     approval.quotes.set(265598, ask=212.0)                # ~95 bps drift
     receipt = approval.execute_approve(record, command_id="cmd-1")
     assert receipt.error_code == "PRICE_DRIFT_EXCEEDED"
+    # [Finding 2] the risk decision is recorded EVEN on the reject path — the
+    # publish_decision call precedes the reject branch — exactly once.
+    assert approval.risk_producer.decisions == [
+        ("cmd-1", {"decision": "reject", "code": "PRICE_DRIFT_EXCEEDED", "proposal_id": record.id})
+    ]
 
 
 def test_live_mode_requires_fresh_live_executable_side_quote(approval_live):
@@ -337,3 +354,210 @@ def test_dispatch_timeout_becomes_outcome_unknown_never_failed(approval):
     assert receipt.state == "OUTCOME_UNKNOWN"
     assert approval.repo.get(record.id).status == "APPROVED"    # ambiguous: not FAILED
     assert approval.reconciler.scheduled == ["cmd-1"]
+    # [Finding 3] the durable proposal->group link the Task-9 reconciler needs
+    # is written in the claim tx BEFORE dispatch, so it survives the ambiguity.
+    stored = approval.repo.get(record.id)
+    assert stored.order_group_id == "og-cmd-1"
+    assert receipt.error_code == "DISPATCH_AMBIGUOUS"
+    assert receipt.retryable is False                           # NEVER auto-retry ambiguous real money
+    assert approval.ledger.get("cmd-1").state == "OUTCOME_UNKNOWN"
+
+
+# ---------------------------------------------------------------------------
+# [Finding 1] broker-rejection leg: the only proposal-FAILED path.
+# ---------------------------------------------------------------------------
+
+def test_broker_rejection_marks_proposal_failed(approval):
+    record = approval.pending(conid=265598, action="BUY")
+    approval.orders.raise_on_submit(BrokerRejectedError("Order rejected by IB"))
+    receipt = approval.execute_approve(record, command_id="cmd-1")
+
+    # A definite negative outcome: proposal FAILED, command REJECTED, no retry.
+    assert receipt.state == "REJECTED"
+    assert receipt.error_code == "BROKER_REJECTED"
+    assert receipt.retryable is False
+
+    stored = approval.repo.get(record.id)
+    assert stored.status == "FAILED"
+    assert stored.rejection_reason == "Order rejected by IB"    # non-None reason recorded
+    assert stored.revision == record.revision + 2               # claim + fail-mark
+
+    # A DEFINITE negative outcome must never be scheduled for reconciliation.
+    assert approval.reconciler.scheduled == []
+
+
+# ---------------------------------------------------------------------------
+# [Finding 4] one saga-level test per error-code row.
+# ---------------------------------------------------------------------------
+
+def test_risk_rejected_stays_pending_and_never_dispatches(approval):
+    approval.risk_gate.approved = False
+    record = approval.pending(conid=265598, action="BUY")
+    receipt = approval.execute_approve(record, command_id="cmd-1")
+    assert receipt.error_code == "RISK_REJECTED"
+    assert approval.repo.get(record.id).status == "PENDING"     # not FAILED / not EXECUTED
+    assert approval.orders.submissions == []
+
+
+def _foreign_pending(approval, *, foreign_account_id, conid=265598, action="BUY",
+                     quantity=10.0, reference_price=210.0):
+    """Insert a PENDING proposal owned by a DIFFERENT account than the service.
+
+    Mirrors the fixture's ``pending()`` closure (which hardcodes the service's
+    own ``account_id``) but with a caller-supplied foreign ``account_id`` so the
+    WRONG_ACCOUNT guard can be exercised.
+    """
+    repo = approval.repo
+    journal = approval.journal
+    pid = repo.reserve_id()
+    draft = ProposalDraft(
+        id=pid, symbol="AAPL", action=action, quantity=quantity,
+        amount=quantity * reference_price, execution={"order_type": "MARKET"},
+        reasoning="", confidence=0.7, thesis="", source="dashboard", metadata={},
+        sec_type="STK", account_id=foreign_account_id, account_mode="paper", conid=conid,
+        reference_price=reference_price, reference_timestamp=NOW,
+        reference_quote_side="ask" if action == "BUY" else "bid",
+        reference_feed_type="live", max_price_drift_bps=50.0,
+        expires_at=NOW + dt.timedelta(minutes=5), live_approval_eligible=True, created_at=NOW,
+    )
+    predicted = ProposalCommandService._record_from_draft(draft, revision=1)
+    written: list = []
+    journal.mutate(
+        journal.connect(),
+        repo.mutation_for(predicted, "seed"),
+        lambda conn, revision: written.append(repo.insert_pending_in_tx(conn, draft, revision)),
+        event_id=f"proposal:{pid}:1",
+    )
+    return written[0]
+
+
+def test_foreign_account_proposal_is_rejected_wrong_account(approval):
+    # Service account is DU111111; this proposal belongs to a different account.
+    record = _foreign_pending(approval, foreign_account_id="DFOREIGN9")
+    receipt = approval.execute_approve(record, command_id="cmd-1")
+    assert receipt.error_code == "WRONG_ACCOUNT"
+    assert approval.orders.submissions == []
+
+
+def test_command_in_flight_when_a_prior_command_wedged_non_terminal(approval):
+    record = approval.pending(conid=265598, action="BUY")
+
+    # Wedge the FIRST command pre-claim: make publish_decision raise once so the
+    # coordinator's broad-except leaves it at OUTCOME_UNKNOWN (non-terminal) with
+    # the proposal still PENDING (never claimed).
+    raised: list = []
+
+    def flaky(command_id, payload, correlation_id=None):
+        if not raised:
+            raised.append(True)
+            raise RuntimeError("audit sink down")
+        approval.risk_producer.decisions.append((command_id, payload))
+
+    approval.risk_producer.publish_decision = flaky
+    with pytest.raises(RuntimeError):
+        approval.execute_approve(record, command_id="cmd-1")
+    assert approval.ledger.get("cmd-1").state == "OUTCOME_UNKNOWN"
+    assert approval.repo.get(record.id).status == "PENDING"
+
+    # A NEW command for the SAME proposal sees the in-flight (unresolved) one.
+    receipt = approval.execute_approve(record, command_id="cmd-2")
+    assert receipt.error_code == "COMMAND_IN_FLIGHT"
+    assert receipt.retryable is True
+    assert approval.orders.submissions == []
+
+
+def test_source_clock_skew_rejects_future_dated_live_quote(approval_live):
+    record = approval_live.pending(conid=265598, action="BUY")
+    # Future timestamp beyond MAX_SOURCE_CLOCK_SKEW_SECONDS (30s): age = -31.
+    approval_live.quotes.set(265598, ask=210.0, feed_type="live", age_seconds=-31)
+    receipt = approval_live.execute_approve(record, command_id="cmd-1")
+    assert receipt.error_code == "SOURCE_CLOCK_SKEW"
+    assert approval_live.orders.submissions == []
+
+
+def test_executable_quote_missing_rejects_retryably(approval):
+    # A conid FakeQuotes never `.set(...)`: no ask quote exists for it.
+    record = approval.pending(conid=424242, action="BUY")
+    receipt = approval.execute_approve(record, command_id="cmd-1")
+    assert receipt.error_code == "EXECUTABLE_QUOTE_MISSING"
+    assert receipt.retryable is True
+    assert approval.orders.submissions == []
+
+
+def test_trading_paused_blocks_increasing_but_exempts_reducing(approval):
+    # Pause the service's own account (paper seeds unpaused at revision 1).
+    approval.controls.set("DU111111", True, None, "pause-1", "manual halt", NOW)
+
+    # INCREASING BUY is blocked by the in-tx pause re-check; proposal untouched.
+    buy = approval.pending(conid=265598, action="BUY")
+    receipt = approval.execute_approve(buy, command_id="cmd-buy")
+    assert receipt.error_code == "TRADING_PAUSED"
+    assert receipt.retryable is True
+    assert approval.repo.get(buy.id).status == "PENDING"        # not claimed
+    assert approval.orders.submissions == []
+
+    # REDUCING SELL of a verified held quantity is pause-EXEMPT and dispatches.
+    approval.positions.set_held(265598, 100.0)
+    sell = approval.pending(conid=265598, action="SELL", quantity=100.0)
+    reducing = approval.execute_approve(sell, command_id="cmd-sell")
+    assert reducing.state == "SUBMITTED"
+    assert approval.orders.submissions[-1].order_group_id == "og-cmd-sell"
+
+
+# ---------------------------------------------------------------------------
+# [Finding 5] the production approve_proposal RPC surface.
+# ---------------------------------------------------------------------------
+
+def _minimal_proposal_service(approval):
+    """A real ``ProposalCommandService`` for the ``register_command_authority``
+    signature. Its create/reject actions are never driven in this test — only
+    the ``approve_proposal`` saga is — so the unused collaborators are simple
+    fakes; the object itself is real."""
+    return ProposalCommandService(
+        repository=approval.repo, journal=approval.journal, risk_gate=approval.risk_gate,
+        quotes=approval.quotes, universe=SimpleNamespace(resolve_conid=lambda conid: None),
+        account_id="DU111111", account_mode="paper", now=approval.now,
+        controls=approval.controls, positions=approval.positions,
+    )
+
+
+def test_approve_proposal_rpc_surface_registers_and_drives_a_real_approve(approval):
+    registry = TypedRpcRegistry()
+    register_command_authority(
+        registry, approval.coordinator, _minimal_proposal_service(approval), approval.repo,
+        account_id="DU111111", controls=approval.controls, approval_service=approval.service,
+    )
+
+    # (register branch) approve_proposal is wired on the command role.
+    assert registry.contains("command", "approve_proposal")
+
+    # Drive ONE approve through the REAL typed handler with the REAL request.
+    record = approval.pending(conid=265598, action="BUY")
+    registration = registry.resolve("command", "approve_proposal")
+    parsed = ApproveProposalRequest(
+        command_id="cmd-rpc", proposal_id=record.id, expected_version=record.revision,
+        preflight_nonce="nonce-cmd-rpc",
+    )
+    result = registration.handler(parsed)
+    assert result["state"] == "SUBMITTED"
+    assert result["command_id"] == "cmd-rpc"
+    assert approval.repo.get(record.id).status == "EXECUTED"
+
+
+def test_approve_proposal_request_model_rejects_extra_field():
+    # extra='forbid'
+    with pytest.raises(ValidationError):
+        ApproveProposalRequest(
+            command_id="cmd-1", proposal_id=1, expected_version=1, bogus="x",
+        )
+
+
+def test_approve_proposal_request_model_rejects_colon_command_id():
+    # command_id colon reservation (encode_order_ref mmr: prefix).
+    with pytest.raises(ValidationError):
+        ApproveProposalRequest(command_id="bad:id", proposal_id=1, expected_version=1)
+
+
+def test_approve_proposal_request_model_requires_expected_version():
+    with pytest.raises(ValidationError):
+        ApproveProposalRequest(command_id="cmd-1", proposal_id=1)

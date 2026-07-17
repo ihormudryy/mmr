@@ -52,6 +52,7 @@ from web.command_center import (
     GRACEFUL_SHUTDOWN_SECONDS,
     _assert_single_worker,
 )
+from web.command_center.flags import CommandFlags, load_command_flags
 from web.command_center.health import create_health_router
 from web.command_center.routes_read import create_read_router
 from web.command_center.session import (
@@ -62,6 +63,20 @@ from web.command_center.session import (
 )
 
 logger = logging.getLogger('web')
+
+# [M1-C] Command feature flags (spec Section 10): both DASHBOARD_COMMANDS_
+# ENABLED and DASHBOARD_LIVE_COMMANDS_ENABLED default false. Loaded HERE, at
+# module import time (not lazily inside create_app/a request), so that an
+# inconsistent configuration (e.g. live enabled without an exact account id
+# or a positive finite notional cap) raises CommandFlagsError and kills the
+# process before it ever binds a socket -- fail-closed, no permissive
+# fallback. `python3 -m web.app` imports this module to build the
+# module-level `app` below, so a bad config aborts that import outright;
+# `create_app()` also stamps the already-validated flags onto
+# `app.state.command_flags` for every app instance (including test-built
+# ones via `create_app(stub_cc)`), since only THIS module-level load is
+# guaranteed to run once, at import.
+_COMMAND_FLAGS: CommandFlags = load_command_flags(os.environ)
 
 # Proposal reasoning is UNTRUSTED: it originates from an LLM (prompt-injectable)
 # and from scraped news headlines (attacker-controlled). It is rendered into the
@@ -907,6 +922,10 @@ def create_app(cc: CommandCenter | None = None) -> FastAPI:
 
     application = FastAPI(title='MMR Dashboard', lifespan=_app_lifespan)
     application.state.command_center = center
+    # [M1-C] Already-validated at module import (see `_COMMAND_FLAGS` above) --
+    # every app instance (including test-built ones via `create_app(stub_cc)`)
+    # gets the same fail-closed flags on `app.state`, not a per-instance reload.
+    application.state.command_flags = _COMMAND_FLAGS
     application.mount('/static', StaticFiles(
         directory=str(Path(__file__).parent / 'static')), name='static')
 

@@ -127,6 +127,7 @@ class FakeOrders:
 
     def __init__(self):
         self.submissions: list[SubmittedOrders] = []
+        self.proposals: list = []              # the ``proposal`` arg each submit received
         self._raise = None
         self._next_id = 1001
 
@@ -134,6 +135,7 @@ class FakeOrders:
         self._raise = exc
 
     def submit(self, proposal, order_ref, order_group_id):
+        self.proposals.append(proposal)
         if self._raise is not None:
             raise self._raise
         submitted = SubmittedOrders(
@@ -561,3 +563,88 @@ def test_approve_proposal_request_model_rejects_colon_command_id():
 def test_approve_proposal_request_model_requires_expected_version():
     with pytest.raises(ValidationError):
         ApproveProposalRequest(command_id="cmd-1", proposal_id=1)
+
+
+# ---------------------------------------------------------------------------
+# Re-verified correctness fixes on the dispatch saga (fix2 set).
+# ---------------------------------------------------------------------------
+
+def test_finish_tx_failure_after_dispatch_degrades_to_ambiguous(approval):
+    # Fix 1 (FINISH-TX-AFTER-DISPATCH): the bracket is LIVE at the broker
+    # (submit returned) but the post-dispatch finish tx fails. The known
+    # order_ids must be preserved and the reconciler scheduled -- NOT lost to a
+    # generic INTERNAL_ERROR with an empty schedule.
+    record = approval.pending(conid=265598, action="BUY")
+    # mark_order_submitted_in_tx returns None -> the saga's
+    # _ConcurrentProposalChange inside the finish tx.
+    approval.repo.mark_order_submitted_in_tx = lambda *a, **k: None
+
+    receipt = approval.execute_approve(record, command_id="cmd-1")
+
+    assert receipt.state == "OUTCOME_UNKNOWN"
+    assert receipt.error_code == "DISPATCH_AMBIGUOUS"
+    assert receipt.retryable is False                       # never auto-retry ambiguous real money
+    assert receipt.outcome is not None
+    assert receipt.outcome["order_ids"] == approval.orders.submissions[0].order_ids
+    # the live order was dispatched -> the Task-9 reconciler must resolve it
+    assert approval.reconciler.scheduled == ["cmd-1"]
+    # the claim committed, so the proposal stays APPROVED (NOT FAILED)
+    assert approval.repo.get(record.id).status == "APPROVED"
+    assert approval.ledger.get("cmd-1").state == "OUTCOME_UNKNOWN"
+
+
+def test_outcome_unknown_replay_is_not_retryable(approval):
+    # Fix 2 (RJ3): OUTCOME_UNKNOWN is not in _TERMINAL_STATES, so a get_command
+    # / same-command replay must NOT report retryable=True -- it would
+    # contradict the saga's explicit retryable=False on the ambiguity.
+    record = approval.pending(conid=265598, action="BUY")
+    approval.orders.raise_on_submit(TimeoutError("ib ack timeout"))
+    first = approval.execute_approve(record, command_id="cmd-1")
+    assert first.state == "OUTCOME_UNKNOWN"
+    assert first.retryable is False
+
+    fetched = approval.coordinator.get_command("cmd-1")
+    assert fetched.state == "OUTCOME_UNKNOWN"
+    assert fetched.retryable is False
+
+    # idempotent same-command_id replay must match the original (not retryable)
+    replay = approval.execute_approve(record, command_id="cmd-1")
+    assert replay.state == "OUTCOME_UNKNOWN"
+    assert replay.retryable is False
+
+
+def test_dispatch_uses_the_claimed_record_not_a_reread(approval):
+    # Fix 3 (SA5): dispatch must pass the in-hand claimed_record, not a
+    # redundant re-read inside the ambiguity window.
+    record = approval.pending(conid=265598, action="BUY")
+
+    calls = {"n": 0}
+    real_get = approval.repo.get
+
+    def counting_get(pid):
+        calls["n"] += 1
+        return real_get(pid)
+
+    approval.repo.get = counting_get
+    receipt = approval.execute_approve(record, command_id="cmd-1")
+    reads_during_saga = calls["n"]          # capture BEFORE assertion-time reads
+    approval.repo.get = real_get            # restore so assertions don't inflate
+
+    assert receipt.state == "SUBMITTED"
+    # the dispatched proposal is the claimed_record carrying the order_group_id
+    dispatched = approval.orders.proposals[0]
+    assert dispatched.order_group_id == "og-cmd-1"
+    # and no redundant post-claim re-read happened inside the ambiguity window
+    assert reads_during_saga == 1
+
+
+def test_validation_order_matches_spec(approval):
+    # Fix 4 (SA6): design-spec 9.2 pins "exists -> PENDING -> expected_version"
+    # ahead of account/mode. A PENDING foreign-account proposal approved with a
+    # WRONG expected_version must report REVISION_MISMATCH (version before
+    # account), not WRONG_ACCOUNT.
+    record = _foreign_pending(approval, foreign_account_id="DFOREIGN9")
+    receipt = approval.execute_approve(record, command_id="cmd-1",
+                                       expected_version=record.revision + 5)
+    assert receipt.error_code == "REVISION_MISMATCH"
+    assert approval.orders.submissions == []

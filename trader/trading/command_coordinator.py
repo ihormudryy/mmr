@@ -510,7 +510,11 @@ def _row_to_receipt(row: LedgerRow) -> CommandReceipt:
         state=row.state,
         outcome=row.outcome,
         error_code=row.error_code,
-        retryable=row.state not in _TERMINAL_STATES,
+        # OUTCOME_UNKNOWN is non-terminal but must NEVER report retryable -- an
+        # ambiguous real-money dispatch is never auto-retried (the saga builds
+        # its own receipt with retryable=False; a later replay / get_command
+        # read must match rather than derive True from non-terminality).
+        retryable=row.state not in _TERMINAL_STATES and row.state != "OUTCOME_UNKNOWN",
     )
 
 
@@ -1201,7 +1205,13 @@ class ApprovalCommandService:
         # --- Irreversible boundary: dispatch the bracket to the broker. ---
         try:
             submitted = self._orders.submit(
-                proposal=self._repo.get(record.id),
+                # Dispatch the in-hand claimed_record (the linked record already
+                # carrying order_group_id), NOT a redundant re-read: a re-read
+                # here would be strictly before any order is sent, yet a failure
+                # of it would be misclassified as an ambiguous dispatch that
+                # never happened -- and it adds a needless round-trip + race
+                # inside the irreversible-dispatch window.
+                proposal=claimed_record,
                 order_ref=encode_order_ref(order_group_id),
                 order_group_id=order_group_id,
             )
@@ -1241,7 +1251,27 @@ class ApprovalCommandService:
                 f"command:{cmd.command_id}:submitted",
             )
 
-        self._journal.mutate_batch_work(self._journal.connect(), finish)
+        try:
+            self._journal.mutate_batch_work(self._journal.connect(), finish)
+        except Exception:
+            # The orders are already LIVE at the broker (submit returned), so a
+            # failure of the post-dispatch finish tx (a _ConcurrentProposalChange
+            # from mark_order_submitted_in_tx returning None, or a DuckDB
+            # IOException) must NOT discard the in-hand order_ids or drop the
+            # command into a generic INTERNAL_ERROR with no reconciliation.
+            # Mirror the dispatch-timeout path, persisting the known outcome so
+            # the Task-9 reconciler can resolve the live order. The proposal
+            # stays APPROVED (the claim committed); never auto-retry ambiguous
+            # real money (retryable=False).
+            self._transition_command(
+                cmd, "SUBMITTING", "OUTCOME_UNKNOWN",
+                error_code="DISPATCH_AMBIGUOUS", outcome=outcome_payload,
+            )
+            self._reconciler.schedule(cmd.command_id, self._now_utc())
+            return self._receipt(
+                cmd.command_id, "OUTCOME_UNKNOWN", "DISPATCH_AMBIGUOUS", False,
+                outcome=outcome_payload,
+            )
         return self._receipt(cmd.command_id, "SUBMITTED", None, False, outcome=outcome_payload)
 
     # -- validation (pure guards + broker-verified collaborators) ---------
@@ -1256,16 +1286,20 @@ class ApprovalCommandService:
                 {"decision": "reject", "code": code, "proposal_id": int(cmd.body["proposal_id"])},
             )
 
+        # Guard order pins §9.2: "The proposal exists, is PENDING, and matches
+        # expected_version" is the primary identity check, evaluated BEFORE the
+        # account/mode guards (WRONG_ACCOUNT is otherwise re-verified in the
+        # claim-tx compare-and-set). These are independent early returns.
         if record is None:
             return reject("PROPOSAL_NOT_FOUND", False)
-        if record.account_id != self._account_id:
-            return reject("WRONG_ACCOUNT", False)
-        if self._account_mode == "live" and not record.live_approval_eligible:
-            return reject("LIVE_INELIGIBLE", False)
         if record.status != "PENDING":
             return reject("NOT_PENDING", False)
         if cmd.expected_version is not None and record.revision != cmd.expected_version:
             return reject("REVISION_MISMATCH", False)
+        if record.account_id != self._account_id:
+            return reject("WRONG_ACCOUNT", False)
+        if self._account_mode == "live" and not record.live_approval_eligible:
+            return reject("LIVE_INELIGIBLE", False)
         inflight = [
             r for r in self._ledger.unresolved_for_target("proposal", str(record.id))
             if r.command_id != cmd.command_id

@@ -100,6 +100,35 @@ class TestSessionExchange:
             assert client.post("/session", data={"token": "nope"}).status_code == 401
         assert client.post("/session", data={"token": "nope"}).status_code == 429
 
+    def test_rate_limit_is_per_client_not_global(self):
+        """MINOR-1: one shared counter used to cap failures across every
+        caller -- a single bad-token spammer would lock every operator out
+        of /session for up to 60s. Two distinct clients (different
+        request.client host) must be rate-limited independently."""
+        limiter = FailedAttemptLimiter()
+        app = _app(SessionManager(_creds()), limiter)
+        attacker = TestClient(app, client=("10.0.0.1", 12345))
+        victim = TestClient(app, client=("10.0.0.2", 12345))
+        for _ in range(5):
+            assert attacker.post("/session", data={"token": "nope"}).status_code == 401
+        # Attacker is now locked out...
+        assert attacker.post("/session", data={"token": "nope"}).status_code == 429
+        # ...but the victim, a different client, is unaffected.
+        assert victim.post("/session", data={"token": "nope"}).status_code == 401
+        assert victim.post("/session", data={"token": TOKEN}).status_code in (200, 303)
+
+    def test_successful_login_resets_failure_count_for_that_client(self):
+        limiter = FailedAttemptLimiter()
+        client = TestClient(_app(SessionManager(_creds()), limiter), client=("10.0.0.3", 1))
+        for _ in range(4):
+            assert client.post("/session", data={"token": "nope"}).status_code == 401
+        assert client.post("/session", data={"token": TOKEN}).status_code in (200, 303)
+        # The successful login cleared this client's failure history, so it
+        # takes another 5 failures (not just 1 more) to trip the limiter.
+        for _ in range(5):
+            assert client.post("/session", data={"token": "nope"}).status_code == 401
+        assert client.post("/session", data={"token": "nope"}).status_code == 429
+
     def test_query_token_never_authenticates(self):
         client = TestClient(_app(SessionManager(_creds())))
         assert client.get(f"/api/snapshot?token={TOKEN}").status_code == 401
@@ -145,3 +174,43 @@ class TestEnforcementAndHeaders:
         client.post("/session", data={"token": TOKEN})
         client.post("/logout")
         assert client.get("/api/snapshot").status_code == 401
+
+
+class TestFailedAttemptLimiterUnit:
+    """Direct unit coverage of the limiter itself (MINOR-1), independent of
+    the FastAPI wiring exercised above."""
+
+    def test_keys_are_independent(self):
+        fake_now = [0.0]
+        limiter = FailedAttemptLimiter(max_attempts=3, clock=lambda: fake_now[0])
+        for _ in range(3):
+            limiter.record_failure("a")
+        assert limiter.allow("a") is False
+        assert limiter.allow("b") is True
+
+    def test_reset_clears_only_that_key(self):
+        fake_now = [0.0]
+        limiter = FailedAttemptLimiter(max_attempts=3, clock=lambda: fake_now[0])
+        for _ in range(3):
+            limiter.record_failure("a")
+            limiter.record_failure("b")
+        limiter.reset("a")
+        assert limiter.allow("a") is True
+        assert limiter.allow("b") is False
+
+    def test_default_key_preserves_single_bucket_behaviour(self):
+        """Callers that never pass a key (e.g. legacy direct use) still get
+        a single shared bucket, matching the pre-fix behaviour."""
+        fake_now = [0.0]
+        limiter = FailedAttemptLimiter(max_attempts=2, clock=lambda: fake_now[0])
+        limiter.record_failure()
+        limiter.record_failure()
+        assert limiter.allow() is False
+
+    def test_client_map_itself_is_bounded(self):
+        fake_now = [0.0]
+        limiter = FailedAttemptLimiter(max_attempts=5, clock=lambda: fake_now[0])
+        limiter.MAX_TRACKED_CLIENTS = 50
+        for i in range(200):
+            limiter.record_failure(f"client-{i}")
+        assert len(limiter._failures) <= 50

@@ -46,21 +46,34 @@ class _TerminalStore:
         self._ttl = ttl
         self._rows: OrderedDict[str, tuple[float, dict]] = OrderedDict()
 
-    def put(self, entity_id: str, row: dict, now: float) -> None:
+    def put(self, entity_id: str, row: dict, now: float) -> Optional[str]:
+        """Insert/replace a row. Returns the entity_id cap-evicted to make
+        room, if any -- the caller (DashboardState) uses this to also drop
+        the evicted entity's revision-guard entry once it's confirmed gone
+        from every collection (see `_forget_revision_if_untracked`)."""
         self._rows.pop(entity_id, None)
         self._rows[entity_id] = (now, row)
+        evicted = None
         while len(self._rows) > self._cap:
-            self._rows.popitem(last=False)
+            evicted, _ = self._rows.popitem(last=False)
+        return evicted
 
     def remove(self, entity_id: str) -> None:
         self._rows.pop(entity_id, None)
 
-    def cleanup(self, now: float) -> None:
-        for key in [key for key, (then, _) in self._rows.items() if now - then > self._ttl]:
+    def cleanup(self, now: float) -> list[str]:
+        """TTL-evict aged rows. Returns the evicted entity_ids so the caller
+        can also prune their revision-guard entries."""
+        expired = [key for key, (then, _) in self._rows.items() if now - then > self._ttl]
+        for key in expired:
             del self._rows[key]
+        return expired
 
     def values(self) -> list[dict]:
         return [row for _, row in self._rows.values()]
+
+    def __contains__(self, entity_id: str) -> bool:
+        return entity_id in self._rows
 
 
 class DashboardState:
@@ -172,16 +185,22 @@ class DashboardState:
                 self.proposals_terminal.remove(entity_id)
             else:
                 self.proposals_active.pop(entity_id, None)
-                self.proposals_terminal.put(entity_id, row, now)
+                evicted = self.proposals_terminal.put(entity_id, row, now)
+                if evicted is not None:
+                    self._forget_revision_if_untracked("proposal", evicted)
         elif entity_type == "order":
             if status in TERMINAL_ORDER_STATUSES:
                 self.orders_active.pop(entity_id, None)
-                self.orders_terminal.put(entity_id, row, now)
+                evicted = self.orders_terminal.put(entity_id, row, now)
+                if evicted is not None:
+                    self._forget_revision_if_untracked("order", evicted)
             else:
                 self.orders_active[entity_id] = row
                 self.orders_terminal.remove(entity_id)
         elif entity_type == "fill":
-            self.fills.put(entity_id, row, now)
+            evicted = self.fills.put(entity_id, row, now)
+            if evicted is not None:
+                self._forget_revision_if_untracked("fill", evicted)
         elif entity_type == "account":
             self.accounts[entity_id] = row
         elif entity_type == "position":
@@ -218,7 +237,16 @@ class DashboardState:
             self.orders_terminal.remove(entity_id)
         elif entity_type == "fill":
             self.fills.remove(entity_id)
-        self.quotes.pop(entity_id, None)
+        # NOTE: quotes are keyed by conId ("265598"), not by entity_id
+        # ("DU123:265598" for positions, order/proposal/fill ids for those
+        # types) -- there is no entity_id that ever matches a quotes key, so
+        # popping by entity_id here would always be a no-op. Quotes are
+        # instrument-lifecycle (bounded by the number of distinct instruments
+        # ever conflated, latest-value-only -- see quotes.py), not
+        # position-lifecycle, and are deliberately left alone here: a closed
+        # position's conId may still be held by another account, and quotes
+        # don't grow unbounded the way per-entity revisions/terminal rows do.
+        self._forget_revision_if_untracked(entity_type, entity_id)
 
     def replay_after(self, stream_id: str, sequence: int) -> Optional[list[dict]]:
         if stream_id != self.stream_id:
@@ -267,6 +295,51 @@ class DashboardState:
         if now - self._last_cleanup < CLEANUP_INTERVAL_SECONDS:
             return
         self._last_cleanup = now
-        for store in (self.proposals_terminal, self.orders_terminal, self.fills):
-            store.cleanup(now)
+        for entity_type, store in (
+            ("proposal", self.proposals_terminal),
+            ("order", self.orders_terminal),
+            ("fill", self.fills),
+        ):
+            for evicted_id in store.cleanup(now):
+                self._forget_revision_if_untracked(entity_type, evicted_id)
         self._prune_ring(now)
+
+    def _is_entity_tracked(self, entity_type: str, entity_id: str) -> bool:
+        """Whether (entity_type, entity_id) still lives in ANY collection
+        for its type -- active or terminal. Mirrors `_place`'s dispatch."""
+        if entity_type == "proposal":
+            return entity_id in self.proposals_active or entity_id in self.proposals_terminal
+        elif entity_type == "order":
+            return entity_id in self.orders_active or entity_id in self.orders_terminal
+        elif entity_type == "fill":
+            return entity_id in self.fills
+        elif entity_type == "account":
+            return entity_id in self.accounts
+        elif entity_type == "position":
+            return entity_id in self.positions
+        elif entity_type == "strategy":
+            return entity_id in self.strategies
+        elif entity_type == "risk":
+            return entity_id in self.risk
+        elif entity_type == "reconciliation":
+            return entity_id in self.reconciliation
+        elif entity_type == "trading_control":
+            return entity_id in self.trading_control
+        elif entity_type == "command":
+            return entity_id in self.commands
+        return False
+
+    def _forget_revision_if_untracked(self, entity_type: str, entity_id: str) -> None:
+        """Bounds `_revisions` (IMPORTANT-1): once an entity is evicted from
+        its terminal store (TTL/cap) or tombstoned (`_remove`), drop its
+        revision-guard entry too -- otherwise `_revisions` keeps one
+        permanent entry per distinct id ever seen (unbounded over a
+        long-LIVE process; only `install_baseline` used to clear it).
+
+        Only forgets when the entity is confirmed gone from every collection
+        for its type -- an entity still tracked (active OR terminal) keeps
+        its revision-regression guard so a stale/duplicate update for it is
+        still correctly rejected.
+        """
+        if not self._is_entity_tracked(entity_type, entity_id):
+            self._revisions.pop((entity_type, entity_id), None)

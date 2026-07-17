@@ -50,10 +50,12 @@ from web.command_center import (
     CommandCenter,
     CommandCenterConfig,
     GRACEFUL_SHUTDOWN_SECONDS,
+    _assert_single_worker,
 )
 from web.command_center.health import create_health_router
 from web.command_center.routes_read import create_read_router
 from web.command_center.session import (
+    SESSION_COOKIE,
     CredentialConfigError,
     SessionSecurityMiddleware,
     create_session_router,
@@ -155,8 +157,39 @@ def _check_access(request: Request) -> None:
     if not _ACCESS_TOKEN:
         return
     supplied = request.headers.get('X-MMR-Token') or request.query_params.get('token') or ''
-    if not secrets.compare_digest(supplied, _ACCESS_TOKEN):
-        raise HTTPException(status_code=401, detail='unauthorized')
+    if secrets.compare_digest(supplied, _ACCESS_TOKEN):
+        return
+    if _has_valid_dashboard_session(request):
+        return
+    raise HTTPException(status_code=401, detail='unauthorized')
+
+
+def _has_valid_dashboard_session(request: Request) -> bool:
+    """A valid command-center session cookie also satisfies this legacy
+    token gate.
+
+    ``_ACCESS_TOKEN`` is only non-empty when the deprecated ``MMR_WEB_TOKEN``
+    alias is set (canonical ``DASHBOARD_TOKEN`` config leaves it empty and
+    this check is a no-op above). In that deprecated-alias case the SAME env
+    var also seeds the command-center's ``SessionManager`` token, so a
+    cookie-authenticated browser never re-sends the raw token on every
+    request -- without this, `_check_access` would demand it on top of the
+    already-verified session cookie and permanently 401 the legacy page for
+    a normal cookie login. Any failure here (no command center wired, no
+    manager configured yet, malformed/expired cookie) degrades to False --
+    the caller still falls through to the 401 below, never to an open gate.
+    """
+    center = getattr(getattr(request.app, 'state', None), 'command_center', None)
+    if center is None:
+        return False
+    cookie = request.cookies.get(SESSION_COOKIE, '')
+    if not cookie:
+        return False
+    try:
+        manager = center.ensure_session_manager()
+    except Exception:
+        return False
+    return manager.verify(cookie)
 
 
 def _check_csrf(token: str) -> None:
@@ -919,6 +952,15 @@ app = create_app()
 
 def main():
     import uvicorn
+    # Hard, unconditional fail-loud guard: this process pins workers=1 below,
+    # but an operator setting WEB_CONCURRENCY/UVICORN_WORKERS (e.g. copying a
+    # gunicorn-style multi-worker convention) would otherwise silently launch
+    # with a single worker anyway while believing more were requested. There
+    # is no ops probe to protect pre-startup here (unlike the in-lifespan
+    # `CommandCenter._start_or_degrade`, which intentionally DEGRADES rather
+    # than aborts so /healthz and /readyz keep serving) -- so this one aborts
+    # the process outright, before uvicorn.run ever binds a socket.
+    _assert_single_worker()
     port = int(os.environ.get('WEB_PORT', '7424'))
     logging.basicConfig(
         level=logging.INFO,

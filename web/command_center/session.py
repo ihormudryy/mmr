@@ -9,8 +9,9 @@ import hashlib
 import hmac
 import logging
 import os
+import threading
 import time
-from collections import deque
+from collections import OrderedDict, deque
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Callable, Mapping, Optional
@@ -100,7 +101,22 @@ def load_dashboard_credentials(env: Mapping[str, str] = os.environ) -> Dashboard
 
 
 class FailedAttemptLimiter:
-    """Five failed login attempts per rolling minute (spec §10)."""
+    """Five failed login attempts per rolling minute, tracked per client
+    (spec §10).
+
+    Keyed by an opaque per-caller identifier (``create_session_router`` uses
+    the request's client host) so one attacker hammering ``/session`` with a
+    bad token only locks out *that* client, not every operator sharing the
+    dashboard. The default (unkeyed) bucket is kept for callers that don't
+    pass a key, preserving the original single-bucket behaviour.
+
+    The per-key map itself is bounded (``MAX_TRACKED_CLIENTS``, LRU-evicted)
+    so an attacker rotating source addresses can't grow it without bound.
+    Individual deque ops are already atomic under the GIL; the coarse lock
+    only guards the shared ``_failures`` map (insert/evict) added here.
+    """
+
+    MAX_TRACKED_CLIENTS = 10_000
 
     def __init__(
         self,
@@ -111,16 +127,40 @@ class FailedAttemptLimiter:
         self._max = max_attempts
         self._window = window_seconds
         self._clock = clock
-        self._failures: deque[float] = deque()
+        self._lock = threading.Lock()
+        self._failures: "OrderedDict[str, deque[float]]" = OrderedDict()
 
-    def allow(self) -> bool:
+    def _bucket(self, key: str, now: float) -> deque:
+        """Fetch (creating if needed) and prune the bucket for `key`.
+        Caller must hold `self._lock`."""
+        bucket = self._failures.get(key)
+        if bucket is None:
+            bucket = deque()
+            self._failures[key] = bucket
+        else:
+            self._failures.move_to_end(key)
+        while bucket and now - bucket[0] > self._window:
+            bucket.popleft()
+        return bucket
+
+    def allow(self, key: str = "") -> bool:
         now = self._clock()
-        while self._failures and now - self._failures[0] > self._window:
-            self._failures.popleft()
-        return len(self._failures) < self._max
+        with self._lock:
+            bucket = self._bucket(key, now)
+            return len(bucket) < self._max
 
-    def record_failure(self) -> None:
-        self._failures.append(self._clock())
+    def record_failure(self, key: str = "") -> None:
+        now = self._clock()
+        with self._lock:
+            bucket = self._bucket(key, now)
+            bucket.append(now)
+            while len(self._failures) > self.MAX_TRACKED_CLIENTS:
+                self._failures.popitem(last=False)
+
+    def reset(self, key: str = "") -> None:
+        """Clear a client's failure history (called on successful login)."""
+        with self._lock:
+            self._failures.pop(key, None)
 
 
 class SessionManager:
@@ -221,12 +261,14 @@ def create_session_router(
 
     @router.post("/session")
     def login(request: Request, token: str = Form("")):
-        if not limiter.allow():
+        client_key = request.client.host if request.client else "unknown"
+        if not limiter.allow(client_key):
             raise HTTPException(status_code=429, detail="too many failed attempts")
         cookie = manager_provider().exchange(token)
         if cookie is None:
-            limiter.record_failure()
+            limiter.record_failure(client_key)
             raise HTTPException(status_code=401, detail="invalid token")
+        limiter.reset(client_key)
         wants_html = "text/html" in (request.headers.get("accept") or "")
         response = (
             RedirectResponse("/cc", status_code=303)

@@ -196,6 +196,100 @@ class TestLifecycleCollections:
         state._test_clock["mono"] += TERMINAL_TTL_SECONDS + 61
         state.maybe_cleanup()
         assert state.snapshot_view()["fills"] == []
+        # TTL eviction (not just cap eviction) also prunes the revision guard.
+        assert ("fill", "DU123:exec-1") not in state._revisions
+
+    def test_position_removal_leaves_quotes_untouched(self, state):
+        """MINOR-4: quotes are keyed by conId ("265598"), positions by
+        "ACCOUNT:conId" -- the two never share a key. A position tombstone
+        must not (accidentally or via a dead pop-by-entity_id) disturb the
+        quote for that instrument, since another account could still hold
+        the same conId."""
+        state.apply_quotes({"265598": {"instrument_id": "265598", "last": 199.5}})
+        state.apply(_event(entity_id="DU123:265598"))
+        assert state.snapshot_view()["quotes"]["265598"]["last"] == 199.5
+        state.apply(
+            _event(
+                event_id="evt-del",
+                source_cursor=2,
+                entity_revision=2,
+                entity_id="DU123:265598",
+                operation="delete",
+                payload=None,
+            )
+        )
+        assert state.snapshot_view()["positions"] == []
+        assert state.snapshot_view()["quotes"]["265598"]["last"] == 199.5
+
+
+class TestRevisionBounding:
+    """IMPORTANT-1: `_revisions` gets a permanent entry per (entity_type,
+    entity_id) ever applied unless something prunes it. Drive hundreds of
+    DISTINCT terminal fill/order ids through the normal cap-eviction path
+    (no intervening install_baseline, which is the one place that used to
+    clear `_revisions`) and confirm the map stays bounded."""
+
+    def test_revisions_stay_bounded_under_terminal_churn(self, state):
+        total = TERMINAL_CAP + 300
+        for i in range(total):
+            state.apply(
+                _event(
+                    event_id=f"evt-fill-{i}",
+                    source_cursor=2 * i + 1,
+                    entity_type="fill",
+                    entity_id=f"fill-{i}",
+                    event_type="fill.received",
+                    payload={"exec_id": f"exec-{i}", "status": "FILLED"},
+                )
+            )
+            state.apply(
+                _event(
+                    event_id=f"evt-order-{i}",
+                    source_cursor=2 * i + 2,
+                    entity_type="order",
+                    entity_id=f"order-{i}",
+                    event_type="order.updated",
+                    payload={"status": "FILLED"},
+                )
+            )
+
+        fill_revisions = sum(1 for etype, _eid in state._revisions if etype == "fill")
+        order_revisions = sum(1 for etype, _eid in state._revisions if etype == "order")
+        assert fill_revisions <= TERMINAL_CAP
+        assert order_revisions <= TERMINAL_CAP
+        # The map must not grow with the total distinct-id count ever seen.
+        assert len(state._revisions) < 2 * total
+
+        # A still-present (recent, not-yet-evicted) entity keeps its
+        # revision-regression guard -- a stale/duplicate update is still
+        # idempotently rejected.
+        last_fill = f"fill-{total - 1}"
+        stale_fill = state.apply(
+            _event(
+                event_id="evt-stale-fill",
+                source_cursor=10**7,
+                entity_type="fill",
+                entity_id=last_fill,
+                entity_revision=1,
+                event_type="fill.received",
+                payload={"exec_id": "exec-stale", "status": "FILLED"},
+            )
+        )
+        assert stale_fill is None
+
+        last_order = f"order-{total - 1}"
+        stale_order = state.apply(
+            _event(
+                event_id="evt-stale-order",
+                source_cursor=10**7 + 1,
+                entity_type="order",
+                entity_id=last_order,
+                entity_revision=1,
+                event_type="order.updated",
+                payload={"status": "FILLED"},
+            )
+        )
+        assert stale_order is None
 
 
 class TestReplayRing:

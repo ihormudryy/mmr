@@ -524,3 +524,79 @@ class TestDeployRoute:
         html = client.get('/').text
         assert '/strategies/deploy' in html
         assert 'name="watchlist"' in html
+
+
+class TestLegacyAccessTokenDoubleGate:
+    """MINOR-3: the deprecated MMR_WEB_TOKEN alias sets both `_ACCESS_TOKEN`
+    (this module's standalone token gate, checked by `_check_access`) and
+    the command center's SessionManager token (since DASHBOARD_TOKEN is
+    unset in that config). A cookie-authenticated browser never re-sends
+    the raw token on ordinary page loads, so `_check_access` used to 401
+    every legacy-page request in that configuration even with a fully
+    valid session cookie -- a double gate. `_check_access` must also accept
+    a valid dashboard session cookie."""
+
+    @pytest.fixture
+    def alias_client(self, stub, monkeypatch):
+        from web.command_center import CommandCenter, CommandCenterConfig
+        from web.command_center.session import DashboardCredentials
+        from cc_fakes import NullBridge, NullQuotePlane
+        # Simulate the deprecated-alias path: MMR_WEB_TOKEN populates
+        # _ACCESS_TOKEN directly (normally read from os.environ at import
+        # time) while ALSO being the token load_dashboard_credentials would
+        # hand to the SessionManager.
+        monkeypatch.setattr(webapp, '_ACCESS_TOKEN', TEST_TOKEN)
+        cc = CommandCenter(
+            CommandCenterConfig(),
+            credentials_loader=lambda: DashboardCredentials(
+                token=TEST_TOKEN, session_secret=TEST_SECRET.encode(),
+                legacy_alias_used=True),
+            query_client_factory=lambda: None,
+            feed_client_factory=lambda: None,
+            bridge_factory=lambda *a, **k: NullBridge(),
+            quote_plane_factory=lambda loop, deliver: NullQuotePlane(),
+        )
+        return TestClient(webapp.create_app(cc))
+
+    def test_cookie_session_satisfies_legacy_token_gate(self, alias_client):
+        alias_client.post("/session", data={"token": TEST_TOKEN})
+        assert alias_client.get("/").status_code == 200
+
+    def test_no_session_still_blocked(self, alias_client):
+        response = alias_client.get("/", follow_redirects=False)
+        assert response.status_code in (303, 401)
+
+    def test_canonical_config_unaffected(self, client):
+        """The ordinary `client` fixture never sets `_ACCESS_TOKEN` (mirrors
+        canonical DASHBOARD_TOKEN config, MMR_WEB_TOKEN unset) -- must keep
+        working exactly as before."""
+        assert client.get("/").status_code == 200
+
+
+class TestEntrypointWorkerGuard:
+    """MINOR-2: an external multi-worker launch (WEB_CONCURRENCY /
+    UVICORN_WORKERS set) must hard-fail at the `main()` CLI entrypoint,
+    before uvicorn.run ever binds a socket -- distinct from the in-lifespan
+    `CommandCenter._start_or_degrade` guard, which intentionally degrades
+    rather than aborts so the ops probes keep serving."""
+
+    def test_main_aborts_before_uvicorn_run_on_multi_worker_env(self, monkeypatch):
+        import uvicorn
+
+        def _must_not_run(*_a, **_k):
+            raise AssertionError("uvicorn.run must not be reached")
+
+        monkeypatch.setattr(uvicorn, "run", _must_not_run)
+        monkeypatch.setenv("WEB_CONCURRENCY", "4")
+        with pytest.raises(RuntimeError, match="one worker"):
+            webapp.main()
+
+    def test_main_runs_uvicorn_when_unset(self, monkeypatch):
+        import uvicorn
+        calls = []
+        monkeypatch.setattr(uvicorn, "run", lambda *a, **k: calls.append((a, k)))
+        monkeypatch.delenv("WEB_CONCURRENCY", raising=False)
+        monkeypatch.delenv("UVICORN_WORKERS", raising=False)
+        webapp.main()
+        assert len(calls) == 1
+        assert calls[0][1]["workers"] == 1

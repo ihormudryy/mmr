@@ -24,7 +24,8 @@ interface.
 | Owner | Branch / worktree | Scope and writable files | Depends on | Status |
 |---|---|---|---|---|
 | Codex | `codex/p1-liquidation-command` / `.worktrees/p1-liquidation-command` | P1 Task 7: broker-verified liquidation root and authenticated command surface | Foundation `a11e546` | INTEGRATED — `fe4155e`; root remains `OUTCOME_UNKNOWN` until broker-confirmed flat evidence |
-| Claude | `feat/p1-task8-harness` / `.claude/worktrees/p1-task8-harness` | P1 Task 8: `config_defaults/trader.yaml`, `scripts/command_plane_drill.py`, `docs/superpowers/rollout/trading-income-operations-runbook.md`, `tests/integration/test_command_plane_activation.py` | Foundation `a11e546`; Task 7 liquidation contract before final drill integration | HANDOFF READY — `575a799` |
+| Claude | `feat/p1-task8-harness` / `.claude/worktrees/p1-task8-harness` | P1 Task 8 (complete) | Foundation `a11e546` | MERGED — Task 8 done; 9-drill battery incl. 2 restored live-mode DispatchGuard drills (`77341f4`) |
+| Claude | `feat/p2-research-evidence` / `.claude/worktrees/p2-research-evidence` | P2 Task 1: `pyproject.toml`, `uv.lock`, `trader/config.py`, `trader/container.py`, `config_defaults/trader.yaml`, `scripts/db_backup.sh`, `tests/test_research_config.py`; then research-DB-only modules under `trader/research/` | Current main `77341f4`; P2 is parallel-safe per program index (writes only the research DB) | CLAIMED |
 | Codex worker: backend dashboard safety | `codex/dashboard-backend-safety` | `web/command_center/quotes.py`, `state.py`, `bridge.py`, `sse.py`, focused backend tests | Foundation `d2a9cc2`; must publish server quote receive timestamps for the browser lane | CLAIMED |
 | Codex worker: browser dashboard resilience | `codex/dashboard-browser-resilience` | `web/static/command_center.js`, browser/JS-focused tests | Backend quote receive timestamp contract | INTEGRATED — `ff0d453`; Node stateful tests pass |
 

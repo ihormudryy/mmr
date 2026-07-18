@@ -1,6 +1,7 @@
 """Deterministic, public-only research evidence bundles."""
 from __future__ import annotations
 
+import datetime as dt
 import hashlib
 import json
 import os
@@ -8,11 +9,16 @@ import shutil
 import tempfile
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Mapping
+from typing import Any, Mapping, Sequence
 
-from trader.research.attestation import AttestationRepository, EligibilityAttestation
-from trader.research.canonical import canonical_json_bytes
-from trader.research.eligibility import EligibilityDecision, EligibilityDecisionRepository
+from trader.research import signing
+from trader.research.artifact import ExperimentFamily, artifact_id as strategy_artifact_id, trial_id
+from trader.research.attestation import (
+    AttestationRepository, EligibilityAttestation, attestation_payload_bytes,
+    payload_digest,
+)
+from trader.research.canonical import canonical_json_bytes, sha256_digest
+from trader.research.eligibility import EligibilityDecision, EligibilityDecisionRepository, RuleResult
 from trader.research.experiment_registry import ExperimentRegistry
 from trader.research.review import OperatorReview, OperatorReviewRepository
 
@@ -60,7 +66,7 @@ class ResearchBundle:
         evidence = self._load_public_evidence(artifact_id)
         return self._write_staged(path, self._canonical_files(evidence))
 
-    def verify(self, path: Path) -> VerifiedResearchBundle:
+    def verify(self, path: Path, *, trusted_public_keys: Sequence[Any] = ()) -> VerifiedResearchBundle:
         """Accept only a complete, checksum-valid public export directory."""
         if not path.is_dir() or path.is_symlink():
             raise BundleError("bundle root must be a real directory")
@@ -86,7 +92,7 @@ class ResearchBundle:
         if path.stat().st_mode & 0o222 or any(
                 (path / name).stat().st_mode & 0o222 for name in _FILE_NAMES):
             raise BundleError("bundle is not read-only")
-        _validate_payload_bindings(path, manifest)
+        _validate_payload_bindings(path, manifest, trusted_public_keys)
         digest = manifest["manifest_digest"]
         return VerifiedResearchBundle(
             manifest_digest=digest, artifact_id=manifest["artifact_id"],
@@ -193,6 +199,8 @@ class ResearchBundle:
                  for name in ("artifact", "family", "trials", "folds", "decision", "review", "attestation")}
         checksums = {name: _sha256(data) for name, data in sorted(files.items())}
         attestation = evidence["attestation"]
+        trials_digest = _bundle_digest("trials", evidence["trials"])
+        folds_digest = _bundle_digest("folds", evidence["folds"])
         manifest = {
             "format_version": FORMAT_VERSION,
             "artifact_id": evidence["artifact"]["artifact_id"],
@@ -202,6 +210,8 @@ class ResearchBundle:
             "config_digest": attestation["config_digest"],
             "dataset_manifest_digest": attestation["dataset_manifest_digest"],
             "ruleset_digest": attestation["ruleset_digest"],
+            "trials_digest": trials_digest,
+            "folds_digest": folds_digest,
             "files": checksums,
         }
         manifest["manifest_digest"] = _sha256(canonical_json_bytes(manifest))
@@ -261,8 +271,8 @@ def _chmod_read_only(root: Path) -> None:
 
 def _validate_manifest(manifest: Any) -> None:
     required = {"format_version", "artifact_id", "attestation", "source_digest",
-                "config_digest", "dataset_manifest_digest", "ruleset_digest", "files",
-                "manifest_digest"}
+                "config_digest", "dataset_manifest_digest", "ruleset_digest", "trials_digest",
+                "folds_digest", "files", "manifest_digest"}
     if not isinstance(manifest, dict) or manifest.get("format_version") != FORMAT_VERSION:
         raise BundleError("unsupported bundle format")
     if set(manifest) != required or not isinstance(manifest["artifact_id"], str):
@@ -271,7 +281,7 @@ def _validate_manifest(manifest: Any) -> None:
     if not isinstance(attestation, dict) or set(attestation) != {"payload_digest", "public_key_id"}:
         raise BundleError("invalid manifest attestation")
     digests = ("source_digest", "config_digest", "dataset_manifest_digest",
-               "ruleset_digest", "manifest_digest")
+               "ruleset_digest", "trials_digest", "folds_digest", "manifest_digest")
     if not all(isinstance(manifest[key], str) and manifest[key] for key in digests):
         raise BundleError("invalid manifest digest")
     if not all(isinstance(attestation[key], str) and attestation[key]
@@ -291,7 +301,8 @@ def _validate_manifest(manifest: Any) -> None:
         raise BundleError("manifest checksum mismatch")
 
 
-def _validate_payload_bindings(root: Path, manifest: Mapping[str, Any]) -> None:
+def _validate_payload_bindings(root: Path, manifest: Mapping[str, Any],
+                               trusted_public_keys: Sequence[Any]) -> None:
     payloads = {}
     for name in _FILE_NAMES:
         if name == "manifest.json":
@@ -317,8 +328,23 @@ def _validate_payload_bindings(root: Path, manifest: Mapping[str, Any]) -> None:
     try:
         if artifact["artifact_id"] != manifest["artifact_id"]:
             raise BundleError("artifact binding disagrees with manifest")
+        reconstructed_family = ExperimentFamily(
+            strategy_path=family["strategy_path"], class_name=family["class_name"],
+            repository_commit=family["repository_commit"],
+            source_tree_digest=family["source_tree_digest"],
+            dependency_lock_digest=family["dependency_lock_digest"],
+            container_digest=family["container_digest"],
+            dataset_manifest_digest=family["dataset_manifest_digest"],
+            search_space=family["search_space"], cost_model=family["cost_model"],
+            validation_protocol=family["validation_protocol"], provenance=family["provenance"])
+        if reconstructed_family.family_id != family["family_id"]:
+            raise BundleError("family digest binding disagrees")
         if artifact["family_id"] != family["family_id"]:
             raise BundleError("artifact family binding disagrees")
+        if strategy_artifact_id(artifact["family_id"], artifact["selected_trial_id"],
+                                artifact["selected_parameters"], artifact["provenance"]) != \
+                artifact["artifact_id"]:
+            raise BundleError("artifact digest binding disagrees")
         if not any(isinstance(trial, dict) and
                    trial.get("trial_id") == artifact["selected_trial_id"]
                    for trial in trials):
@@ -326,8 +352,14 @@ def _validate_payload_bindings(root: Path, manifest: Mapping[str, Any]) -> None:
         if any(not isinstance(trial, dict) or trial.get("family_id") != family["family_id"]
                for trial in trials):
             raise BundleError("trial family binding disagrees")
+        if any(trial_id(family["family_id"], trial["trial_key"], trial["parameters"])
+               != trial["trial_id"] for trial in trials):
+            raise BundleError("trial digest binding disagrees")
         if any(not isinstance(fold, dict) for fold in folds):
             raise BundleError("invalid validation-fold payload")
+        if (_bundle_digest("trials", trials) != manifest["trials_digest"] or
+                _bundle_digest("folds", folds) != manifest["folds_digest"]):
+            raise BundleError("trial or validation-fold digest binding disagrees")
         if review["artifact_id"] != artifact["artifact_id"] or \
                 review["eligibility_decision_digest"] != decision["decision_digest"]:
             raise BundleError("review binding disagrees")
@@ -347,6 +379,47 @@ def _validate_payload_bindings(root: Path, manifest: Mapping[str, Any]) -> None:
                 manifest["attestation"]["payload_digest"] != attestation["payload_digest"] or
                 manifest["attestation"]["public_key_id"] != attestation["public_key_id"]):
             raise BundleError("manifest attestation binding disagrees")
+        decision_object = EligibilityDecision(
+            state=decision["state"], ruleset_name=decision["ruleset_name"],
+            ruleset_version=decision["ruleset_version"], ruleset_digest=decision["ruleset_digest"],
+            passed=decision["passed"], results=tuple(
+                RuleResult(code=result["code"], passed=result["passed"],
+                           observed=result["observed"], threshold=result["threshold"],
+                           evidence_ref=result["evidence_ref"], detail=result["detail"])
+                for result in decision["results"]))
+        if decision_object.digest != decision["decision_digest"]:
+            raise BundleError("decision digest binding disagrees")
+        if decision["passed"] != all(result["passed"] for result in decision["results"]):
+            raise BundleError("decision pass-state binding disagrees")
+        review_object = OperatorReview(
+            artifact_id=review["artifact_id"],
+            eligibility_decision_digest=review["eligibility_decision_digest"],
+            reviewer=review["reviewer"], reviewed_at=_parse_datetime(review["reviewed_at"]),
+            economic_rationale=review["economic_rationale"],
+            edge_survives_costs=review["edge_survives_costs"],
+            known_failure_regimes=review["known_failure_regimes"],
+            data_and_survivorship_limits=review["data_and_survivorship_limits"],
+            parameter_sensitivity=review["parameter_sensitivity"],
+            operational_dependencies=review["operational_dependencies"],
+            capacity_and_decay=review["capacity_and_decay"],
+            episode_dominance=review["episode_dominance"],
+            holdout_opened_once_confirmed=review["holdout_opened_once_confirmed"])
+        if review_object.digest != review["review_digest"]:
+            raise BundleError("review digest binding disagrees")
+        attestation_fields = {key: value for key, value in attestation.items()
+                              if key != "payload_digest"}
+        attestation_object = EligibilityAttestation(
+            **{**attestation_fields, "created_at": _parse_datetime(attestation["created_at"]),
+               "expires_at": _parse_datetime(attestation["expires_at"]),
+               "operator_approved_at": _parse_datetime(attestation["operator_approved_at"]),
+               "promoted_at": (_parse_datetime(attestation["promoted_at"])
+                               if attestation["promoted_at"] is not None else None)})
+        if attestation_object.payload_digest != attestation["payload_digest"]:
+            raise BundleError("attestation payload digest binding disagrees")
+        _verify_attestation_signature(attestation_object, trusted_public_keys)
+        if (f"bundle_trials:{manifest['trials_digest']}" not in attestation_object.evidence_refs or
+                f"bundle_folds:{manifest['folds_digest']}" not in attestation_object.evidence_refs):
+            raise BundleError("attestation trial or validation-fold binding disagrees")
     except (KeyError, TypeError) as exc:
         raise BundleError("incomplete payload binding") from exc
 
@@ -356,6 +429,35 @@ def _mapping_payload(payloads: Mapping[str, Any], name: str) -> Mapping[str, Any
     if not isinstance(payload, dict):
         raise BundleError(f"invalid payload: {name}.json")
     return payload
+
+
+def _bundle_digest(kind: str, value: Any) -> str:
+    return sha256_digest(f"research_bundle_{kind}", value)
+
+
+def _parse_datetime(value: Any) -> dt.datetime:
+    if not isinstance(value, str):
+        raise BundleError("invalid timestamp payload")
+    parsed = dt.datetime.fromisoformat(value)
+    if parsed.tzinfo is None or parsed.utcoffset() is None:
+        raise BundleError("timestamp payload must be timezone-aware")
+    return parsed
+
+
+def _verify_attestation_signature(attestation: EligibilityAttestation,
+                                  trusted_public_keys: Sequence[Any]) -> None:
+    try:
+        trusted = {signing.public_key_id(key): key for key in trusted_public_keys}
+    except Exception as exc:
+        raise BundleError("invalid trusted public-key mapping") from exc
+    public_key = trusted.get(attestation.public_key_id)
+    if public_key is None:
+        raise BundleError("attestation public key is not trusted")
+    try:
+        signing.verify_bytes(public_key, attestation_payload_bytes(attestation),
+                             attestation.signature)
+    except signing.BadSignature as exc:
+        raise BundleError("attestation signature does not verify") from exc
 
 
 def _artifact_public(artifact: Any, holdout: Mapping[str, Any]) -> dict[str, Any]:

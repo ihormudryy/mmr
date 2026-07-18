@@ -12,7 +12,7 @@ from trader.data.duckdb_store import DuckDBConnection
 from trader.data.schema_migrations import SchemaMigrator
 from trader.research.artifact import ExperimentFamily, TRIAL_FAILED, TRIAL_SUCCEEDED
 from trader.research.attestation import AttestationRepository, build_attestation
-from trader.research.canonical import canonical_json_bytes
+from trader.research.canonical import canonical_json_bytes, sha256_digest
 from trader.research.eligibility import (
     EligibilityDecisionRepository,
     EligibilityEvidence,
@@ -55,7 +55,8 @@ def _evidence() -> EligibilityEvidence:
 
 
 def build_populated_db(tmp_path, *, attestation_source_digest="source-1",
-                       attestation_config_digest="config-1", validation_folds=None):
+                       attestation_config_digest="config-1", validation_folds=None,
+                       return_signer=False):
     db = DuckDBConnection.get_instance(str(tmp_path / "research.duckdb"))
     apply_research_migrations(SchemaMigrator(db))
     registry = ExperimentRegistry(db)
@@ -93,6 +94,14 @@ def build_populated_db(tmp_path, *, attestation_source_digest="source-1",
         episode_dominance="no dominance", holdout_opened_once_confirmed=True)
     OperatorReviewRepository(db).record(review)
     signer = AttestationSigner.generate()
+    trials = registry.list_trials(family.family_id, include_archived=True)
+    trial_payload = [{"trial_id": t.trial_id, "family_id": t.family_id, "trial_key": t.trial_key,
+                      "parameters": dict(t.parameters), "status": t.status,
+                      "started_at": t.started_at, "finished_at": t.finished_at,
+                      "metrics": dict(t.metrics), "traceback_digest": t.traceback_digest,
+                      "safe_summary": t.safe_summary, "archived": t.archived} for t in trials]
+    trial_digest = sha256_digest("research_bundle_trials", trial_payload)
+    folds_digest = sha256_digest("research_bundle_folds", list(validation_folds))
     unsigned = build_attestation(
         decision=decision, review=review, public_key_id=signer.public_key_id,
         artifact_digest=artifact_id, source_digest=attestation_source_digest,
@@ -102,8 +111,12 @@ def build_populated_db(tmp_path, *, attestation_source_digest="source-1",
         evidence_boundary="2020/2025", cost_assumptions={"slippage_bps": 2.0},
         capacity_assumptions={"capacity_usd": 1_000_000}, max_gross_allocation=0.05,
         permitted_instruments=("SPY",), created_at=T0, expires_at=T0 + dt.timedelta(days=90),
-        operator_approved_at=T0)
+        operator_approved_at=T0,
+        evidence_refs=tuple(decision.evidence_refs) +
+        (f"bundle_trials:{trial_digest}", f"bundle_folds:{folds_digest}"))
     AttestationRepository(db).record(signer.sign(unsigned))
+    if return_signer:
+        return db, artifact_id, signer
     return db, artifact_id
 
 
@@ -205,3 +218,74 @@ def test_verify_rejects_forged_self_consistent_payload(populated_db, tmp_path):
 
     with pytest.raises(BundleError, match="binding"):
         bundle.verify(root)
+
+
+def _rewrite_payload_and_manifest(root: Path, name: str, mutate) -> None:
+    payload_path = root / name
+    payload_path.chmod(0o644)
+    payload = read_canonical_json(payload_path)
+    mutate(payload)
+    payload_bytes = canonical_json_bytes(payload)
+    payload_path.write_bytes(payload_bytes)
+    manifest_path = root / "manifest.json"
+    manifest_path.chmod(0o644)
+    manifest = read_canonical_json(manifest_path)
+    manifest["files"][name] = hashlib.sha256(payload_bytes).hexdigest()
+    manifest_body = dict(manifest)
+    manifest_body.pop("manifest_digest")
+    manifest["manifest_digest"] = hashlib.sha256(canonical_json_bytes(manifest_body)).hexdigest()
+    manifest_path.write_bytes(canonical_json_bytes(manifest))
+    payload_path.chmod(0o444)
+    manifest_path.chmod(0o444)
+
+
+@pytest.mark.parametrize(("name", "mutate"), [
+    ("review.json", lambda payload: payload.__setitem__("economic_rationale", "forged narrative")),
+    ("decision.json", lambda payload: payload["results"][0].__setitem__("observed", 999)),
+    ("attestation.json", lambda payload: payload.__setitem__("max_gross_allocation", 0.99)),
+    ("trials.json", lambda payload: payload[0]["metrics"].__setitem__("sharpe", 99.0)),
+    ("folds.json", lambda payload: payload[0].__setitem__("test", "forged")),
+])
+def test_verify_rejects_self_consistent_semantic_payload_tampering(tmp_path, name, mutate):
+    from trader.research.bundle import BundleError, ResearchBundle
+
+    db, artifact_id, signer = build_populated_db(tmp_path, return_signer=True)
+    root = tmp_path / "bundle"
+    bundle = ResearchBundle(db)
+    bundle.export(artifact_id, root)
+    _rewrite_payload_and_manifest(root, name, mutate)
+
+    with pytest.raises(BundleError):
+        bundle.verify(root, trusted_public_keys=[signer.public_key])
+
+
+def test_verify_requires_a_trusted_valid_attestation_signature(tmp_path):
+    from trader.research.bundle import BundleError, ResearchBundle
+
+    db, artifact_id, signer = build_populated_db(tmp_path, return_signer=True)
+    root = tmp_path / "bundle"
+    bundle = ResearchBundle(db)
+    bundle.export(artifact_id, root)
+    assert bundle.verify(root, trusted_public_keys=[signer.public_key]).artifact_id == artifact_id
+
+    def forge_authority(payload):
+        payload["max_gross_allocation"] = 0.99
+        unsigned = dict(payload)
+        unsigned.pop("signature")
+        unsigned.pop("payload_digest")
+        payload["payload_digest"] = sha256_digest("eligibility_attestation", unsigned)
+
+    _rewrite_payload_and_manifest(root, "attestation.json", forge_authority)
+    manifest_path = root / "manifest.json"
+    manifest_path.chmod(0o644)
+    manifest = read_canonical_json(manifest_path)
+    attestation = read_canonical_json(root / "attestation.json")
+    manifest["attestation"]["payload_digest"] = attestation["payload_digest"]
+    manifest_body = dict(manifest)
+    manifest_body.pop("manifest_digest")
+    manifest["manifest_digest"] = hashlib.sha256(canonical_json_bytes(manifest_body)).hexdigest()
+    manifest_path.write_bytes(canonical_json_bytes(manifest))
+    manifest_path.chmod(0o444)
+
+    with pytest.raises(BundleError, match="signature"):
+        bundle.verify(root, trusted_public_keys=[signer.public_key])

@@ -546,7 +546,10 @@ def fetch_proposals() -> list[dict]:
 
 
 def _flash(msg: str) -> RedirectResponse:
-    return RedirectResponse(url=f'/?flash={quote(msg)}', status_code=303)
+    # Legacy POST routes redirect back to the legacy page (now /legacy, since
+    # `/` redirects to the command center) so the post/redirect/get loop stays
+    # on the page the form was submitted from.
+    return RedirectResponse(url=f'/legacy?flash={quote(msg)}', status_code=303)
 
 
 def _coerce_yaml_value(text: str):
@@ -613,6 +616,20 @@ def _register_legacy_routes(application: FastAPI) -> None:
 
 
     @application.get('/')
+    def home() -> RedirectResponse:
+        # The command center (/cc) is the live dashboard. Root redirects there
+        # so the default entry point never touches the legacy server-rendered
+        # dashboard below (/legacy), whose 10 sequential blocking SDK fetchers
+        # hang for minutes against a split-container trader that serves only the
+        # typed sockets (42101/2/3), not the legacy full RPC (42001) — the
+        # "stuck loading the page" symptom. Unauthenticated requests are already
+        # bounced to /cc/login by SessionSecurityMiddleware before reaching here.
+        # 307 (temporary, method-preserving) keeps this fully reversible — no
+        # permanent browser caching of the redirect.
+        return RedirectResponse('/cc', status_code=307)
+
+
+    @application.get('/legacy')
     def dashboard(request: Request, flash: str = ''):
         _check_access(request)
         sections: dict[str, Any] = {}

@@ -198,3 +198,6 @@ def test_enabled_stack_attaches_recovery_components_to_trader(tmp_path):
 
     assert trader.command_ledger is stack.ledger
     assert trader.command_reconciler is stack.reconciler
+    assert trader.automation_circuit_breaker is stack.circuit_breaker
+    assert trader.semantic_readiness is stack.semantic_readiness
+    assert stack.circuit_breaker.store.get().state == "CLEAR"

@@ -187,7 +187,11 @@ class TestProductionRegistryHasRealQueries:
         proving build_production_registry wired live trader-backed methods
         rather than stubs."""
         status_reg = production_registry.resolve("query", "get_status")
-        assert status_reg.handler({}) == {"ib_connected": True, "ib_upstream_connected": True}
+        status = status_reg.handler({})
+        assert status["ib_connected"] is True
+        assert status["ib_upstream_connected"] is True
+        assert status["liveness"] == {"alive": True}
+        assert status["semantic_readiness"]["ready"] is False
 
         values_reg = production_registry.resolve("query", "get_account_values")
         values = values_reg.handler({})
@@ -281,7 +285,10 @@ class TestProductionRegistryOverRealTransport:
 
         try:
             result = query_client.call("get_status", {}, dict)
-            assert result == {"ib_connected": True, "ib_upstream_connected": True}
+            assert result["ib_connected"] is True
+            assert result["ib_upstream_connected"] is True
+            assert result["liveness"] == {"alive": True}
+            assert result["semantic_readiness"]["ready"] is False
 
             # No command-role methods are registered in production yet --
             # not even something as innocuous-sounding as get_status leaks

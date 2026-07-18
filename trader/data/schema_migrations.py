@@ -13,6 +13,9 @@ silently skipped (already-applied) when it never actually ran, or to
 double-apply DDL that assumes it is fresh. Callers must stay inside their
 assigned range.
 
+P1 command-plane safety continues the F3-owned range: migration 24 is the
+durable automation breaker and incident ledger.
+
 ``SchemaMigrator`` is deliberately storage-agnostic about *which* file it
 targets — it operates on whatever ``DuckDBConnection`` it is constructed
 with. For M1-F1 that is the dedicated ``journal_duckdb_path`` file (see

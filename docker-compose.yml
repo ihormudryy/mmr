@@ -224,6 +224,10 @@ services:
       - mmr_db_data:/home/trader/.local/share/mmr/data
       - ${HOME}/.local/share/mmr/logs:/home/trader/.local/share/mmr/logs
     healthcheck:
+      # LIVENESS ONLY. Semantic trading readiness is exposed by typed
+      # get_status and gates automation; it must not restart-loop a healthy,
+      # diagnosable trader merely because the market is closed or the breaker
+      # is tripped.
       # Connect via the container's OWN routable hostname (eth0), not
       # 127.0.0.1: because TYPED_BIND_ADDRESS is 0.0.0.0 the socket accepts
       # on every interface, so a hostname-resolved connect proves the

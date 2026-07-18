@@ -11,6 +11,7 @@ from trader.messaging.clientserver import RPCHandler, rpcmethod
 from trader.objects import TickList, TradeLogSimple
 from trader.trading.strategy import StrategyConfig, StrategyState
 from typing import List, Tuple, Union
+import datetime as dt
 
 import time
 import trader.trading.trading_runtime as runtime
@@ -154,7 +155,24 @@ class TraderServiceApi(RPCHandler):
 
     @rpcmethod
     def get_status(self) -> dict:
-        return self.trader.status()
+        status = dict(self.trader.status())
+        # Liveness answers only "can this service answer?" and must stay
+        # independent from whether automation is safe to run. Docker uses a
+        # socket-level liveness probe so a semantically blocked trader remains
+        # alive and diagnosable.
+        status["liveness"] = {"alive": True}
+        readiness = getattr(self.trader, "semantic_readiness", None)
+        if readiness is None:
+            status["semantic_readiness"] = {
+                "ready": False,
+                "failed": ["command_stack_active"],
+                "checks": {"command_stack_active": False},
+            }
+        else:
+            status["semantic_readiness"] = readiness.evaluate(
+                dt.datetime.now(dt.timezone.utc)
+            ).to_payload()
+        return status
 
     @rpcmethod
     async def scanner_data(

@@ -11,6 +11,10 @@ from trader.data.proposal_repository import (
     apply_proposal_authority_migration,
 )
 from trader.data.schema_migrations import SchemaMigrator
+from trader.data.circuit_breaker_store import (
+    CircuitBreakerStore,
+    apply_circuit_breaker_migration,
+)
 from trader.data.universe import Universe
 from trader.trading.command_coordinator import (
     ApprovalCommandService,
@@ -36,6 +40,12 @@ from trader.trading.preflight_nonce import (
 from trader.trading.proposal_command_service import ProposalCommandService
 from trader.trading.risk_producer import RiskProducer
 from trader.trading.dispatch_guard import DispatchGuard
+from trader.trading.circuit_breaker import CircuitBreaker
+from trader.trading.semantic_readiness import (
+    SemanticReadiness,
+    xnys_session_key,
+    xnys_session_open,
+)
 from trader.trading.trading_control import (
     TradingControlStore,
     apply_trading_control_migration,
@@ -93,6 +103,8 @@ class CommandStack:
     account_mode: str
     resume_ready: Callable[[], bool]
     reconciliation_complete: Callable[[str], bool]
+    circuit_breaker: CircuitBreaker
+    semantic_readiness: SemanticReadiness
 
 
 _REQUIRED_TRADER_PORTS = (
@@ -167,6 +179,7 @@ def build_command_stack(
     apply_command_ledger_migration(migrator)
     apply_trading_control_migration(migrator)
     apply_preflight_nonce_migration(migrator)
+    apply_circuit_breaker_migration(migrator)
 
     repository = ProposalRepository(journal)
     ledger = CommandLedger(journal)
@@ -197,6 +210,32 @@ def build_command_stack(
         except Exception:
             return False
         return True
+
+    breaker_store = CircuitBreakerStore(journal, trader.ib_account)
+    breaker_store.seed(now())
+
+    def journal_writable() -> bool:
+        def probe(conn):
+            conn.execute(
+                "UPDATE automation_circuit_breaker SET revision=revision WHERE account_id=?",
+                [trader.ib_account],
+            )
+            return True
+        return bool(trader.journal_db.transaction(probe))
+
+    def control_readable() -> bool:
+        try:
+            controls.get(trader.ib_account)
+        except Exception:
+            return False
+        return True
+
+    def quotes_ready() -> bool:
+        instruments = tuple(getattr(trader, "automated_instruments", ()) or ())
+        if not instruments:
+            return True
+        probe = getattr(trader, "automation_quotes_ready", None)
+        return bool(probe(instruments)) if callable(probe) else False
     margin = TraderBrokerAuthority(
         trader, run_coro=run_coro, resolve_contract=resolve_contract,
     )
@@ -252,6 +291,39 @@ def build_command_stack(
         return not ledger.unresolved_for_account(
             trader.ib_account, exclude_command_id=command_id,
         )
+
+    def reconciliation_safe() -> bool:
+        return not ledger.unresolved_for_account(trader.ib_account)
+
+    semantic_readiness = SemanticReadiness(
+        ib_connected=lambda: bool(trader.is_ib_connected()),
+        account_pinned=lambda: bool(trader.ib_account),
+        broker_current=resume_ready,
+        journal_writable=journal_writable,
+        reconciliation_safe=reconciliation_safe,
+        control_readable=control_readable,
+        breaker_clear=lambda: breaker_store.get().state == "CLEAR",
+        session_open=xnys_session_open,
+        command_stack_active=lambda: getattr(trader, "command_stack", None) is not None,
+        quotes_ready=quotes_ready,
+    )
+
+    def reset_ready() -> bool:
+        # Breaker state itself is deliberately excluded: reset is the action
+        # that changes it. Reconciliation is checked by CircuitBreaker as a
+        # separate, explicit precondition.
+        return all((
+            bool(trader.is_ib_connected()), bool(trader.ib_account), resume_ready(),
+            journal_writable(), control_readable(), xnys_session_open(now()), quotes_ready(),
+        ))
+
+    circuit_breaker = CircuitBreaker(
+        breaker_store,
+        now=now,
+        reset_ready=reset_ready,
+        reconciliation_complete=reconciliation_safe,
+        session_key=xnys_session_key,
+    )
     proposal_service = ProposalCommandService(
         repository=repository,
         journal=journal,
@@ -305,9 +377,13 @@ def build_command_stack(
         account_mode=account_mode,
         resume_ready=resume_ready,
         reconciliation_complete=reconciliation_complete,
+        circuit_breaker=circuit_breaker,
+        semantic_readiness=semantic_readiness,
     )
     trader.command_ledger = ledger
     trader.command_reconciler = reconciler
     trader.command_stack = stack
     trader.trading_control_store = controls
+    trader.automation_circuit_breaker = circuit_breaker
+    trader.semantic_readiness = semantic_readiness
     return stack

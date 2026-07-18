@@ -59,7 +59,6 @@ if str(_PROJECT_ROOT) not in sys.path:
 from trader.data.domain_journal import DomainJournal
 from trader.data.duckdb_store import DuckDBConnection
 from trader.data.proposal_repository import (
-    ProposalDraft,
     ProposalRepository,
     apply_proposal_authority_migration,
 )
@@ -76,8 +75,6 @@ from trader.trading.command_coordinator import (
     TradingCommandCoordinator,
     apply_command_ledger_migration,
 )
-from trader.trading.command_policy import CommandAuthorityPolicy
-from trader.trading.dispatch_guard import DispatchGuard
 from trader.trading.order_correlation import encode_order_ref
 from trader.trading.proposal_command_service import ExecutableQuote, ProposalCommandService
 from trader.trading.trading_control import (
@@ -406,228 +403,6 @@ def scn_restart_unresolved(db_path: str) -> dict:
     return {"rescanned": rescan, "resubmissions": len(restarted.orders.submissions)}
 
 
-ACCOUNT_LIVE = "U1234567"
-
-
-class LiveApproval:
-    """A LIVE-mode approval path with a ``DispatchGuard`` wired in, plus a
-    directly inserted live-eligible pending proposal. This is the shape needed to
-    drive the guard's live-only enforcement (feed/freshness, notional, leverage)
-    end to end through the coordinator saga -- the harness itself runs paper, so
-    the live path is built explicitly here. Mirrors
-    ``tests/test_approval_command.py::_build_approval`` for ``account_mode='live'``
-    and the command-stack DispatchGuard wiring."""
-
-    def __init__(self, db_path: str, *, stale_quote: bool = False,
-                 max_notional: Optional[float] = None) -> None:
-        db = DuckDBConnection.get_instance(db_path)
-        migrator = SchemaMigrator(db)
-        journal = DomainJournal(db)
-        journal.migrate(migrator)
-        apply_proposal_authority_migration(migrator)
-        apply_command_ledger_migration(migrator)
-        apply_trading_control_migration(migrator)
-
-        self.journal = journal
-        self.repo = ProposalRepository(journal)
-        self.ledger = CommandLedger(journal)
-        self.controls = TradingControlStore(journal)
-        db.transaction(lambda conn: self.controls.seed_in_tx(conn, [(ACCOUNT_LIVE, "live")], NOW))
-
-        ts = NOW - dt.timedelta(seconds=30) if stale_quote else NOW
-        self.quotes = SimpleNamespace(executable_quote=lambda conid, side: ExecutableQuote(
-            conid=conid, side=side, price=210.0 if side == "ask" else 209.5,
-            market_timestamp=ts, feed_type="live", session_state="continuous"))
-        self.broker = SimpleNamespace(capture=lambda account_id: SimpleNamespace(
-            account_id=account_id, account_mode="live", generation_id=1, source_cursor=1,
-            open_order_count=0, daily_pnl=0.0, net_liquidation=1_000_000.0, working_orders=(),
-            reducible_quantity=lambda conid: 0.0, position_value=lambda conid: 0.0))
-        self.margin = SimpleNamespace(what_if_margin=lambda conid, side, quantity: {
-            "initMarginAfter": 5000.0, "equityWithLoanAfter": 1_000_000.0})
-        self.risk_gate = SimpleNamespace(
-            evaluate=lambda **_kw: SimpleNamespace(approved=True, reason=""),
-            check_leverage=lambda *a, **k: SimpleNamespace(approved=True, reason=""))
-        self.risk_producer = SimpleNamespace(publish_decision=lambda *a, **k: None)
-        self.orders = FakeOrders()
-        self.reconciler = OutcomeReconciler(
-            journal=journal, ledger=self.ledger, orders=self.orders,
-            strategy=FakeStrategyPort(), alerts=FakeAlerts(), repo=self.repo, now=lambda: NOW)
-
-        policy = CommandAuthorityPolicy(
-            enabled=True, live_enabled=True, live_account_id=ACCOUNT_LIVE,
-            max_order_notional=max_notional, max_drift_bps=50.0)
-        self.guard = DispatchGuard(
-            broker=self.broker, quotes=self.quotes, margin=self.margin,
-            controls=self.controls, risk_gate=self.risk_gate, policy=policy,
-            account_id=ACCOUNT_LIVE, account_mode="live")
-        self.service = ApprovalCommandService(
-            journal=journal, ledger=self.ledger, repo=self.repo, controls=self.controls,
-            orders=self.orders, quotes=self.quotes, risk_gate=self.risk_gate,
-            risk_producer=self.risk_producer, reconciler=self.reconciler, broker=self.broker,
-            account_id=ACCOUNT_LIVE, account_mode="live", now=lambda: NOW,
-            dispatch_guard=self.guard)
-        self.coordinator = TradingCommandCoordinator(
-            journal=journal, ledger=self.ledger, audit=CommandAudit(journal),
-            nonces=FakeNonceGate(), now=lambda: NOW, reconciler=self.reconciler)
-        self.coordinator.register_action(
-            "approve_proposal", self.service.approve, requires_preflight=True, saga=True)
-
-    def insert_pending(self, *, conid=CONID, action="BUY", quantity=10.0,
-                       reference_price=210.0):
-        pid = self.repo.reserve_id()
-        draft = ProposalDraft(
-            id=pid, symbol="AAPL", action=action, quantity=quantity,
-            amount=quantity * reference_price, execution={"order_type": "MARKET"},
-            reasoning="", confidence=0.7, thesis="", source="dashboard", metadata={},
-            sec_type="STK", account_id=ACCOUNT_LIVE, account_mode="live", conid=conid,
-            reference_price=reference_price, reference_timestamp=NOW,
-            reference_quote_side="ask" if action == "BUY" else "bid",
-            reference_feed_type="live", max_price_drift_bps=50.0,
-            expires_at=NOW + dt.timedelta(minutes=5), live_approval_eligible=True,
-            created_at=NOW)
-        predicted = ProposalCommandService._record_from_draft(draft, revision=1)
-        written: list = []
-        self.journal.mutate(
-            self.journal.connect(),
-            self.repo.mutation_for(predicted, "seed"),
-            lambda conn, revision: written.append(
-                self.repo.insert_pending_in_tx(conn, draft, revision)),
-            event_id=f"proposal:{pid}:1")
-        return written[0]
-
-    def approve(self, record, command_id="c-live"):
-        return self.coordinator.execute(CommandRequest(
-            command_id=command_id, action="approve_proposal", account_id=ACCOUNT_LIVE,
-            target_type="proposal", target_id=str(record.id), expected_version=record.revision,
-            body={"proposal_id": record.id}, source="dashboard",
-            preflight_nonce=f"nonce-{command_id}"))
-
-
-def scn_stale_quote_blocks_dispatch(db_path: str) -> dict:
-    """LIVE approval with a stale executable quote: the approval path refuses to
-    turn a stale quote into a live order (QUOTE_STALE); nothing dispatches."""
-    live = LiveApproval(db_path, stale_quote=True)
-    record = live.insert_pending()
-    receipt = live.approve(record)
-    if receipt.state != "REJECTED":
-        raise AssertionError(f"stale-quote approve state {receipt.state} != REJECTED")
-    if receipt.error_code != "QUOTE_STALE":
-        raise AssertionError(f"stale-quote error_code {receipt.error_code} != QUOTE_STALE")
-    if live.orders.submissions:
-        raise AssertionError("an order was dispatched on a stale quote")
-    if live.repo.get(record.id).status == "EXECUTED":
-        raise AssertionError("proposal executed on a stale quote")
-    return {"error_code": receipt.error_code, "orders_submitted": len(live.orders.submissions)}
-
-
-def scn_notional_cap_blocks_dispatch(db_path: str) -> dict:
-    """LIVE approval whose notional exceeds the policy ceiling: the DispatchGuard
-    (a check check_exposure does NOT perform) rejects ORDER_NOTIONAL_LIMIT before
-    any dispatch. Exercises the Task-4 guard specifically, end to end."""
-    # 10 * 210 = 2100 notional against a 1000 ceiling.
-    live = LiveApproval(db_path, max_notional=1000.0)
-    record = live.insert_pending()
-    receipt = live.approve(record)
-    if receipt.state != "REJECTED":
-        raise AssertionError(f"over-notional approve state {receipt.state} != REJECTED")
-    if receipt.error_code != "ORDER_NOTIONAL_LIMIT":
-        raise AssertionError(
-            f"over-notional error_code {receipt.error_code} != ORDER_NOTIONAL_LIMIT")
-    if live.orders.submissions:
-        raise AssertionError("an order was dispatched over the notional ceiling")
-    return {"error_code": receipt.error_code, "orders_submitted": len(live.orders.submissions)}
-
-
-def scn_circuit_breaker_trips_and_persists(db_path: str) -> dict:
-    """An immediate breaker signal trips automation, the trip survives a restart
-    over the same journal (durable), and a reset fails closed until BOTH semantic
-    readiness and reconciliation hold."""
-    from trader.data.circuit_breaker_store import (
-        CircuitBreakerStore, apply_circuit_breaker_migration)
-    from trader.trading.circuit_breaker import (
-        BreakerResetRefused, BreakerSignal, CircuitBreaker)
-
-    db = DuckDBConnection.get_instance(db_path)
-    migrator = SchemaMigrator(db)
-    journal = DomainJournal(db)
-    journal.migrate(migrator)
-    apply_circuit_breaker_migration(migrator)
-    store = CircuitBreakerStore(journal, ACCOUNT)
-    store.seed(NOW)
-
-    flags = {"reset_ready": False, "recon": False}
-    breaker = CircuitBreaker(
-        store, now=lambda: NOW,
-        reset_ready=lambda: flags["reset_ready"],
-        reconciliation_complete=lambda: flags["recon"],
-        session_key=lambda t: t.date().isoformat())
-
-    # 1. Immediate trip on a protective-order failure.
-    tripped = breaker.record(BreakerSignal(
-        kind="PROTECTIVE_ORDER_FAILURE", occurred_at=NOW, detail="SL leg rejected"))
-    if tripped.state != "TRIPPED":
-        raise AssertionError(f"breaker state {tripped.state} != TRIPPED on immediate signal")
-
-    # 2. Durable: a fresh store over the SAME journal still reads TRIPPED.
-    reread = CircuitBreakerStore(DomainJournal(db), ACCOUNT).get()
-    if reread.state != "TRIPPED":
-        raise AssertionError("breaker trip did not persist across restart")
-
-    # 3. Reset fails closed until readiness AND reconciliation both hold.
-    try:
-        breaker.reset("op-1", "manual clear", "operator")
-        raise AssertionError("reset succeeded despite readiness/reconciliation unmet")
-    except BreakerResetRefused:
-        pass
-    flags["reset_ready"] = True
-    flags["recon"] = True
-    cleared = breaker.reset("op-2", "manual clear after checks", "operator")
-    if cleared.state != "CLEAR":
-        raise AssertionError(f"breaker state {cleared.state} != CLEAR after a valid reset")
-    return {"tripped_reason": tripped.reason_code, "persisted": True,
-            "reset_state": cleared.state}
-
-
-def scn_semantic_readiness_gates_activation(db_path: str) -> dict:
-    """Automation is gated by semantic readiness: all checks green -> ready; a
-    single failing check gates it; a check that RAISES is treated as not-ready
-    (fail closed)."""
-    from trader.trading.semantic_readiness import SemanticReadiness
-
-    flags = {k: True for k in (
-        "ib", "acct", "broker", "journal", "recon", "control", "breaker", "stack", "quotes")}
-
-    def make():
-        return SemanticReadiness(
-            ib_connected=lambda: flags["ib"], account_pinned=lambda: flags["acct"],
-            broker_current=lambda: flags["broker"], journal_writable=lambda: flags["journal"],
-            reconciliation_safe=lambda: flags["recon"], control_readable=lambda: flags["control"],
-            breaker_clear=lambda: flags["breaker"], session_open=lambda now: True,
-            command_stack_active=lambda: flags["stack"], quotes_ready=lambda: flags["quotes"])
-
-    ready = make().evaluate(NOW)
-    if not ready.ready:
-        raise AssertionError(f"not ready with all checks green: {ready.to_payload()['failed']}")
-
-    flags["breaker"] = False
-    gated = make().evaluate(NOW)
-    if gated.ready or "breaker_clear" not in gated.to_payload()["failed"]:
-        raise AssertionError("a failing check did not gate activation / was not reported")
-    flags["breaker"] = True
-
-    def boom():
-        raise RuntimeError("ib probe blew up")
-    raising = SemanticReadiness(
-        ib_connected=boom, account_pinned=lambda: True, broker_current=lambda: True,
-        journal_writable=lambda: True, reconciliation_safe=lambda: True,
-        control_readable=lambda: True, breaker_clear=lambda: True,
-        session_open=lambda now: True, command_stack_active=lambda: True,
-        quotes_ready=lambda: True)
-    if raising.evaluate(NOW).ready:
-        raise AssertionError("readiness reported ready despite a raising check")
-    return {"all_green_ready": True, "gated_on": "breaker_clear", "fail_closed_on_raise": True}
-
-
 # Scenario registry maps name -> (callable | None). None means the feature is
 # not landed yet (reported as pending, never as covered).
 def _liquidation_available() -> bool:
@@ -652,8 +427,6 @@ def build_scenarios() -> dict[str, Optional[Callable[[str], dict]]]:
         "duplicate_create_idempotent": scn_duplicate_create_idempotent,
         "ambiguous_submit_reconciles": scn_ambiguous_submit_reconciles,
         "restart_unresolved": scn_restart_unresolved,
-        "stale_quote_blocks_dispatch": scn_stale_quote_blocks_dispatch,
-        "notional_cap_blocks_dispatch": scn_notional_cap_blocks_dispatch,
         # Pending until their features land AND their scenarios are written.
         # Reported as pending (never silently "covered"). The feature-detection
         # helpers gate the flip from None -> scenario fn when the modules exist:
@@ -662,15 +435,17 @@ def build_scenarios() -> dict[str, Optional[Callable[[str], dict]]]:
         "liquidation_flat_only_from_broker_truth":
             scn_liquidation if _liquidation_available() and scn_liquidation else None,
         "circuit_breaker_trips_and_persists":
-            scn_circuit_breaker_trips_and_persists if _breaker_available() else None,
+            scn_circuit_breaker if _breaker_available() and scn_circuit_breaker else None,
         "semantic_readiness_gates_activation":
-            scn_semantic_readiness_gates_activation if _breaker_available() else None,
+            scn_semantic_readiness if _breaker_available() and scn_semantic_readiness else None,
     }
 
 
-# Task 7 (liquidation) scenario body lands with that feature; until then the name
-# is declared (above) so the report lists it as pending, not missing.
+# Task 6/7 scenario bodies are added here as those features land; until then the
+# names are declared (above) so the report lists them as pending, not missing.
 scn_liquidation: Optional[Callable[[str], dict]] = None
+scn_circuit_breaker: Optional[Callable[[str], dict]] = None
+scn_semantic_readiness: Optional[Callable[[str], dict]] = None
 
 
 # ---------------------------------------------------------------------------
@@ -732,7 +507,7 @@ def run_drills(selected: Optional[list[str]] = None) -> DrillReport:
             report.pending.append(name)
             report.scenario_results.append(
                 {"name": name, "status": "pending",
-                 "detail": "feature not landed yet (Task 7 liquidation)"})
+                 "detail": "feature not landed yet (Task 6/7)"})
             continue
         ran_any = True
         with tempfile.TemporaryDirectory() as tmp:

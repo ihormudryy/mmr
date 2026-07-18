@@ -93,20 +93,18 @@ docker compose config --quiet                                     # compose vali
 | `duplicate_create_idempotent` | exact replay returns the recorded receipt; one proposal |
 | `ambiguous_submit_reconciles` | a lost ack → OUTCOME_UNKNOWN (never false SUBMITTED); reconciler resolves from broker truth with no re-send |
 | `restart_unresolved` | crash between claim and ack → rescan_on_startup + reconcile after restart; exactly one order, no resubmission |
-| `stale_quote_blocks_dispatch` | live approval refuses a stale executable quote (QUOTE_STALE); nothing dispatches |
-| `notional_cap_blocks_dispatch` | the DispatchGuard rejects an over-ceiling notional (ORDER_NOTIONAL_LIMIT) before any dispatch |
-| `circuit_breaker_trips_and_persists` | an immediate signal trips automation, the trip survives restart (durable), reset fails closed until readiness + reconciliation hold |
-| `semantic_readiness_gates_activation` | all checks green → ready; a single failing (or raising) check gates activation, fail-closed |
 
 ## What is NOT yet gated (pending)
 
-Surfaces as `pending` in the drill report until its feature lands:
+These surface as `pending` in the drill report until their features land:
 
 - `liquidation_flat_only_from_broker_truth` — **Task 7** (broker-verified
   liquidation saga). FLAT must require a fresh promoted broker snapshot with zero
   positions and no working orders — never an RPC ack.
+- `circuit_breaker_trips_and_persists` — **Task 6** (durable automation breaker).
+- `semantic_readiness_gates_activation` — **Task 6** (semantic readiness).
 
-Automation stays prohibited until this lands, its drill goes green, and the
+Automation stays prohibited until these land, their drills go green, and the
 manual IB-paper soak is signed off.
 
 ## Rollback / kill switch

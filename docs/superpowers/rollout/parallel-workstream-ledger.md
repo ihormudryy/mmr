@@ -1,0 +1,54 @@
+# Parallel Workstream Ledger
+
+This tracked file is the handoff channel for concurrent work on the trading
+income roadmap. It prevents branch assumptions from becoming an undocumented
+interface.
+
+## Protocol
+
+1. A worker claims a lane here before editing production code.
+2. A lane lists its branch, base commit, exact writable files, dependencies,
+   and verification command.
+3. Workers may not edit another active lane's writable files. Read-only
+   inspection is allowed.
+4. Every handoff is a small commit plus this ledger update. The handoff records
+   the commit ID, tests run, and any interface contract consumed or produced.
+5. Only the integration owner cherry-picks into
+   `feat/command-center-foundation`, after checking the dependency commit and
+   rerunning the lane's focused tests.
+6. If a dependency changes, mark the dependent lane `REBASE_REQUIRED`; do not
+   silently adapt its behavior while resolving a merge conflict.
+
+## Active lanes
+
+| Owner | Branch / worktree | Scope and writable files | Depends on | Status |
+|---|---|---|---|---|
+| Codex | `codex/trading-income-p1-inline` / `.worktrees/trading-income-p1-inline` | P1 Task 7: `trader/trading/liquidation_service.py`, `trader/trading/command_stack.py`, `trader/trader_service.py`, `trader/trading/command_coordinator.py`, `tests/test_liquidation_service.py`, `tests/integration/test_command_authority.py` | Foundation `a11e546` | CLAIMED |
+| Claude | `feat/p1-task8-harness` / `.claude/worktrees/p1-task8-harness` | P1 Task 8: `config_defaults/trader.yaml`, `scripts/command_plane_drill.py`, `docs/superpowers/rollout/trading-income-operations-runbook.md`, `tests/integration/test_command_plane_activation.py` | Foundation `a11e546`; Task 7 liquidation contract before final drill integration | HANDOFF READY — `575a799` |
+
+## Contracts and merge order
+
+### Task 7 liquidation contract (Codex → Claude)
+
+Task 7 will expose a broker-evidence-only terminal state: a liquidation is
+`FLAT` only after a fresh promoted broker snapshot contains no positions and no
+working orders. Claude's drills must assert that property and must never infer
+flatness from an order acknowledgement.
+
+The exact public receipt/state fields will be recorded here with the Task 7
+commit. Until then, Task 8 may build fixtures, report serialization, and the
+runbook, but its liquidation scenario remains `REBASE_REQUIRED`.
+
+### Current handoff
+
+Claude's `575a799 test(command-plane): add production activation and recovery
+gates` changes only the Task 8 files listed above. It is safe to review in
+parallel, but must be rebased or cherry-picked only after Task 7's contract is
+available. Integration owner: Codex.
+
+## Completed foundation commits
+
+| Commit | Meaning |
+|---|---|
+| `41a8b7f` | Split safe pause from guarded resume; bound preflight issuance and submission to the same command/session. |
+| `a11e546` | Durable automation circuit breaker and semantic readiness. |

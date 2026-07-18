@@ -93,6 +93,8 @@ docker compose config --quiet                                     # compose vali
 | `duplicate_create_idempotent` | exact replay returns the recorded receipt; one proposal |
 | `ambiguous_submit_reconciles` | a lost ack → OUTCOME_UNKNOWN (never false SUBMITTED); reconciler resolves from broker truth with no re-send |
 | `restart_unresolved` | crash between claim and ack → rescan_on_startup + reconcile after restart; exactly one order, no resubmission |
+| `stale_quote_blocks_dispatch` | live approval refuses a stale executable quote (QUOTE_STALE); nothing dispatches |
+| `notional_cap_blocks_dispatch` | the DispatchGuard rejects an over-ceiling notional (ORDER_NOTIONAL_LIMIT) before any dispatch |
 
 | `liquidation_flat_only_from_broker_truth` | FLAT needs a fresh broker snapshot with zero positions and working orders; never an RPC ack |
 | `circuit_breaker_trips_and_persists` | a critical liquidation failure trips and persists the breaker |

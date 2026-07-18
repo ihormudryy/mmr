@@ -64,7 +64,17 @@ function removeById(list, id) {
 
 function applyEvent(env) {
   if (env.stream_id !== store.streamId) { resync(); return; }
-  store.sequence = env.sequence;
+  const sequence = env.sequence;
+  // EventSource can redeliver the last event while reconnecting.  Ignore
+  // those duplicates, but never skip forward: a non-contiguous sequence
+  // means at least one state transition was missed and only a fenced
+  // snapshot can restore a coherent view.
+  if (Number.isSafeInteger(sequence) && sequence <= store.sequence) return;
+  if (!Number.isSafeInteger(sequence) || sequence !== store.sequence + 1) {
+    resync();
+    return;
+  }
+  store.sequence = sequence;
   const v = store.view;
   if (!v) return;
   const row = env.operation === 'upsert'
@@ -220,11 +230,14 @@ function setBanner(visible) {
 }
 
 function currentSseState() {
-  // Before the first successful connect, report a clean transport so only
-  // bridge health can raise the banner (avoids an initial-load flicker).
+  // A normal first connection attempt gets a clean grace state to avoid a
+  // startup flicker.  Snapshot polling is different: it means the client has
+  // no coherent live baseline yet, so it must remain visibly degraded even
+  // before EventSource has connected successfully for the first time.
   if (!everConnected) {
     return { open: true, disconnectedForMs: null,
-             degradedAfterMs: CFG.degradedAfterMs, polling: false };
+             degradedAfterMs: CFG.degradedAfterMs,
+             polling: store.connection.mode === 'polling' };
   }
   return {
     open: !!es && es.readyState === EventSource.OPEN,

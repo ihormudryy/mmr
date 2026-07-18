@@ -356,6 +356,7 @@ def build_command_stack(
         broker_snapshot, _LiquidationDispatch(dispatch),
         breaker=_LiquidationBreaker(circuit_breaker, now), now=now,
         store=LiquidationRunStore(trader.journal_db),
+        journal=journal, ledger=ledger,
     )
     proposal_service = ProposalCommandService(
         repository=repository,

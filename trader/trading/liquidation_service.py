@@ -13,6 +13,9 @@ from dataclasses import dataclass
 from typing import Any, Callable, Optional, Protocol
 
 from trader.data.schema_migrations import SchemaMigrator
+from trader.domain.commands import CommandReceipt
+from trader.domain.events import DomainMutation
+from trader.domain.identity import command_entity_id
 
 
 _NON_FLAT = {"REQUESTED", "CANCELLING_ENTRIES", "REDUCING", "VERIFYING", "OUTCOME_UNKNOWN", "FAILED_SAFE"}
@@ -86,6 +89,7 @@ class LiquidationService:
         *,
         breaker: Optional[LiquidationBreakerPort] = None,
         now: Callable[[], dt.datetime], store: Optional[LiquidationRunStore] = None,
+        journal=None, ledger=None, deadline_seconds: float = 300.0,
     ):
         self._broker = broker
         self._dispatch = dispatch
@@ -93,6 +97,26 @@ class LiquidationService:
         self._now = now
         self._store = store
         self._runs: dict[str, LiquidationReceipt] = {r.cause_command_id: r for r in (store.load_unresolved() if store else ())}
+        self._journal, self._ledger, self._deadline_seconds = journal, ledger, deadline_seconds
+
+    def liquidate(self, cmd) -> CommandReceipt:
+        """Coordinator saga entry: acknowledgement is explicitly non-terminal."""
+        if self._journal is None or self._ledger is None:
+            raise RuntimeError("liquidation command authority is not configured")
+        receipt = self.start(cmd.account_id, cmd.command_id, self._now() + dt.timedelta(seconds=self._deadline_seconds))
+        outcome = {"liquidation_state": receipt.state, "detail": receipt.detail,
+                   "generation_id": receipt.generation_id}
+        now = self._now()
+        def write(conn, _revision):
+            self._ledger.transition_in_tx(conn, cmd.command_id, "RECEIVED", "OUTCOME_UNKNOWN",
+                                          outcome=outcome, error_code="LIQUIDATION_PENDING", now=now)
+        self._journal.mutate(self._journal.connect(), DomainMutation(
+            event_type="command.updated", entity_type="command", entity_id=command_entity_id(cmd.command_id),
+            operation="upsert", account_id=cmd.account_id, source="trader_service", source_timestamp=now,
+            correlation_id=cmd.command_id, payload={"state": "OUTCOME_UNKNOWN", **outcome}),
+            write, event_id=f"command:{cmd.command_id}:liquidation-pending")
+        return CommandReceipt(cmd.command_id, cmd.command_id, "OUTCOME_UNKNOWN", outcome,
+                              "LIQUIDATION_PENDING", False)
 
     @staticmethod
     def child_command_id(cause_command_id: str, phase: str, key: str) -> str:

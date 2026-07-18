@@ -355,6 +355,20 @@ class PauseTradingRequest(BaseModel):
         return value.strip()
 
 
+class LiquidateAccountRequest(BaseModel):
+    """Authenticated emergency flatten request; the account is server-pinned."""
+    model_config = ConfigDict(extra="forbid")
+    command_id: str
+    reason: str = Field(min_length=1, max_length=200)
+    preflight_nonce: Optional[str] = None
+    session_fingerprint: Optional[str] = None
+
+    @field_validator("command_id")
+    @classmethod
+    def _command_id_has_no_colon(cls, value: str) -> str:
+        return _reject_colon_in_command_id(value)
+
+
 class ResumeTradingRequest(BaseModel):
     """Risk-increasing resume; mode is pinned by trader_service."""
     model_config = ConfigDict(extra="forbid")
@@ -394,7 +408,7 @@ class PreflightCommandRequest(BaseModel):
     @field_validator("action")
     @classmethod
     def _known_action(cls, value: str) -> str:
-        allowed = {"approve_proposal", "resume_trading", "cancel_order", "cancel_orders"}
+        allowed = {"approve_proposal", "resume_trading", "cancel_order", "cancel_orders", "liquidate_account"}
         if value not in allowed:
             raise ValueError(f"action must be one of {sorted(allowed)}")
         return value
@@ -801,6 +815,18 @@ def _pause_trading_rpc_handler(coordinator: TradingCommandCoordinator, account_i
     return _handler
 
 
+def _liquidate_account_rpc_handler(coordinator: TradingCommandCoordinator, account_id: Optional[str]):
+    def _handler(parsed: LiquidateAccountRequest) -> Dict[str, Any]:
+        request = CommandRequest(
+            command_id=parsed.command_id, action="liquidate_account", account_id=account_id,
+            target_type="account", target_id=account_id or "", expected_version=None,
+            body={"reason": parsed.reason}, source="dashboard",
+            preflight_nonce=parsed.preflight_nonce, session_fingerprint=parsed.session_fingerprint,
+        )
+        return _receipt_to_dict(coordinator.execute(request))
+    return _handler
+
+
 def _resume_trading_rpc_handler(coordinator: TradingCommandCoordinator, account_id: Optional[str]):
     def _handler(parsed: ResumeTradingRequest) -> Dict[str, Any]:
         request = CommandRequest(
@@ -1030,6 +1056,7 @@ def register_command_authority(
     reconciliation_complete=None,
     approval_service: Optional[ApprovalCommandService] = None,
     cancel_service: Optional[CancelCommandService] = None,
+    liquidation_service=None,
     strategy_control_service: Optional[StrategyControlCommandService] = None,
 ) -> None:
     """Wire the command-authority surface onto ``registry``.
@@ -1147,6 +1174,16 @@ def register_command_authority(
         registry.register(
             "query", "get_trading_control", GetTradingControlRequest, dict,
             _get_trading_control_handler(controls, account_id),
+        )
+
+    if liquidation_service is not None:
+        coordinator.register_action(
+            "liquidate_account", liquidation_service.liquidate,
+            requires_preflight=account_mode == "live", saga=True,
+        )
+        registry.register(
+            "command", "liquidate_account", LiquidateAccountRequest, dict,
+            _liquidate_account_rpc_handler(coordinator, account_id),
         )
 
     if approval_service is not None:
@@ -1376,6 +1413,7 @@ def build_production_registry(
             reconciliation_complete=command_stack.reconciliation_complete,
             approval_service=command_stack.approval_service,
             cancel_service=command_stack.cancel_service,
+            liquidation_service=command_stack.liquidation_service,
         )
         register_strategy_state_ingest(registry, command_stack.journal)
     elif command_coordinator is not None and proposal_service is not None and proposal_repository is not None:

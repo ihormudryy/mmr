@@ -119,14 +119,12 @@ class TestPolicyValidation:
 
 
 class TestCapabilityMatrix:
-    def test_alert_adapter_is_the_last_stub(self):
-        # After step 2c (cancel/state) + step 5 (nonce gate), the critical-alert
-        # adapter is the only port still unbuilt -> ONLY approve_proposal (which
-        # requires it) is withheld; every other command is available.
-        ready = ALL_PORTS - KNOWN_STUB_PORTS
-        avail = set(available_commands(ready))
-        assert "approve_proposal" not in avail
-        assert set(COMMAND_PORT_REQUIREMENTS) - {"approve_proposal"} <= avail
+    def test_no_stub_ports_remain(self):
+        # Every port now has a real adapter -> with all ports ready, every
+        # command (incl. approve_proposal) is available. Runtime availability is
+        # still gated by what the trader actually constructs at startup.
+        assert KNOWN_STUB_PORTS == frozenset()
+        assert set(available_commands(ALL_PORTS)) == set(COMMAND_PORT_REQUIREMENTS)
 
     def test_full_port_set_yields_every_command(self):
         assert set(available_commands(ALL_PORTS)) == set(COMMAND_PORT_REQUIREMENTS)

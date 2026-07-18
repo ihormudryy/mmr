@@ -194,15 +194,14 @@ COMMAND_PORT_REQUIREMENTS: dict[str, frozenset[str]] = {
 
 ALL_PORTS: frozenset[str] = frozenset().union(*COMMAND_PORT_REQUIREMENTS.values())
 
-# Ports whose production adapters don't exist yet (design C4). order_cancel /
-# order_state landed in step 2c (TradingRuntimeOrderDispatch); the preflight
-# nonce gate landed in step 5 (trader.trading.preflight_nonce.PreflightNonceGate).
-# The critical-alert adapter is the last one unbuilt. Callers should NOT pass a
-# stub port as ready until its real adapter lands + is tested; documented here so
-# the gate is explicit. (Adapter EXISTENCE is separate from being wired at
-# startup -- available_commands() is driven by the ports the trader actually
-# constructs, not this constant.)
-KNOWN_STUB_PORTS: frozenset[str] = frozenset({PORT_ALERTS})
+# Every command-authority port now has a production adapter: order dispatch
+# (submit, step 2b/M1-F3), cancel + order-state (step 2c), quotes / positions /
+# broker (step 2b, command_ports.py), strategy control (existing), the preflight
+# nonce gate (step 5), and the critical-alert adapter (command_alerts.py). None
+# is a stub. Adapter EXISTENCE is separate from being CONSTRUCTED at startup --
+# available_commands() is driven by the ports the trader actually builds in the
+# wiring phase, not this set.
+KNOWN_STUB_PORTS: frozenset[str] = frozenset()
 
 
 def available_commands(ready_ports: Iterable[str]) -> tuple[str, ...]:

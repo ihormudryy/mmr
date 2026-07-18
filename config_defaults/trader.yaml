@@ -48,6 +48,11 @@ strategy_runtime_ib_client_id: 7
 duckdb_path: ~/.local/share/mmr/data/mmr.duckdb
 history_duckdb_path: ~/.local/share/mmr/data/mmr_history.duckdb
 journal_duckdb_path: ~/.local/share/mmr/data/mmr_journal.duckdb
+# research_duckdb_path: offline research evidence store (P2). Owned by the
+# offline research CLI/process ONLY -- trader_service and strategy_service never
+# open it. Must resolve to a distinct file from the paths above (startup fails
+# closed otherwise). Override per-shell with RESEARCH_DUCKDB_PATH.
+research_duckdb_path: ~/.local/share/mmr/data/mmr_research.duckdb
 universe_library: 'Universes'
 
 # Pycron process manager

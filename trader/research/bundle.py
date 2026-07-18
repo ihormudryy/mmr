@@ -12,7 +12,9 @@ from pathlib import Path
 from typing import Any, Mapping, Sequence
 
 from trader.research import signing
-from trader.research.artifact import ExperimentFamily, artifact_id as strategy_artifact_id, trial_id
+from trader.research.artifact import (
+    TRIAL_SUCCEEDED, ExperimentFamily, artifact_id as strategy_artifact_id, trial_id,
+)
 from trader.research.attestation import (
     AttestationRepository, EligibilityAttestation, attestation_payload_bytes,
     payload_digest,
@@ -66,7 +68,7 @@ class ResearchBundle:
         evidence = self._load_public_evidence(artifact_id)
         return self._write_staged(path, self._canonical_files(evidence))
 
-    def verify(self, path: Path, *, trusted_public_keys: Sequence[Any] = ()) -> VerifiedResearchBundle:
+    def verify(self, path: Path, *, trusted_public_keys: Mapping[str, Any] = {}) -> VerifiedResearchBundle:
         """Accept only a complete, checksum-valid public export directory."""
         if not path.is_dir() or path.is_symlink():
             raise BundleError("bundle root must be a real directory")
@@ -140,6 +142,11 @@ class ResearchBundle:
         folds = self._registry.get_validation_folds(family.family_id)
         if not folds:
             raise BundleError("artifact family has no validation folds")
+        trials_digest = _bundle_digest("trials", [_trial_public(t) for t in trials])
+        folds_digest = _bundle_digest("folds", folds)
+        if (f"bundle_trials:{trials_digest}" not in attestation.evidence_refs or
+                f"bundle_folds:{folds_digest}" not in attestation.evidence_refs):
+            raise BundleError("attestation trial or validation-fold binding disagrees")
 
         return {
             "artifact": _artifact_public(artifact, self._holdout_for(artifact_id)),
@@ -302,7 +309,7 @@ def _validate_manifest(manifest: Any) -> None:
 
 
 def _validate_payload_bindings(root: Path, manifest: Mapping[str, Any],
-                               trusted_public_keys: Sequence[Any]) -> None:
+                               trusted_public_keys: Mapping[str, Any]) -> None:
     payloads = {}
     for name in _FILE_NAMES:
         if name == "manifest.json":
@@ -345,10 +352,14 @@ def _validate_payload_bindings(root: Path, manifest: Mapping[str, Any],
                                 artifact["selected_parameters"], artifact["provenance"]) != \
                 artifact["artifact_id"]:
             raise BundleError("artifact digest binding disagrees")
-        if not any(isinstance(trial, dict) and
-                   trial.get("trial_id") == artifact["selected_trial_id"]
-                   for trial in trials):
+        selected_trials = [trial for trial in trials if isinstance(trial, dict) and
+                           trial.get("trial_id") == artifact["selected_trial_id"]]
+        if len(selected_trials) != 1:
             raise BundleError("selected trial binding disagrees")
+        selected_trial = selected_trials[0]
+        if (selected_trial.get("status") != TRIAL_SUCCEEDED or
+                selected_trial.get("parameters") != artifact["selected_parameters"]):
+            raise BundleError("selected trial state or parameters binding disagrees")
         if any(not isinstance(trial, dict) or trial.get("family_id") != family["family_id"]
                for trial in trials):
             raise BundleError("trial family binding disagrees")
@@ -445,14 +456,19 @@ def _parse_datetime(value: Any) -> dt.datetime:
 
 
 def _verify_attestation_signature(attestation: EligibilityAttestation,
-                                  trusted_public_keys: Sequence[Any]) -> None:
-    try:
-        trusted = {signing.public_key_id(key): key for key in trusted_public_keys}
-    except Exception as exc:
-        raise BundleError("invalid trusted public-key mapping") from exc
-    public_key = trusted.get(attestation.public_key_id)
+                                  trusted_public_keys: Mapping[str, Any]) -> None:
+    if not isinstance(trusted_public_keys, Mapping):
+        raise BundleError("trusted public keys must be an explicit mapping")
+    public_key = trusted_public_keys.get(attestation.public_key_id)
     if public_key is None:
         raise BundleError("attestation public key is not trusted")
+    try:
+        if signing.public_key_id(public_key) != attestation.public_key_id:
+            raise BundleError("trusted public-key mapping disagrees with key identity")
+    except BundleError:
+        raise
+    except Exception as exc:
+        raise BundleError("invalid trusted public-key mapping") from exc
     try:
         signing.verify_bytes(public_key, attestation_payload_bytes(attestation),
                              attestation.signature)

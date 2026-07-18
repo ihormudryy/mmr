@@ -56,7 +56,7 @@ def _evidence() -> EligibilityEvidence:
 
 def build_populated_db(tmp_path, *, attestation_source_digest="source-1",
                        attestation_config_digest="config-1", validation_folds=None,
-                       return_signer=False):
+                       include_bundle_evidence_refs=True, return_signer=False):
     db = DuckDBConnection.get_instance(str(tmp_path / "research.duckdb"))
     apply_research_migrations(SchemaMigrator(db))
     registry = ExperimentRegistry(db)
@@ -112,8 +112,9 @@ def build_populated_db(tmp_path, *, attestation_source_digest="source-1",
         capacity_assumptions={"capacity_usd": 1_000_000}, max_gross_allocation=0.05,
         permitted_instruments=("SPY",), created_at=T0, expires_at=T0 + dt.timedelta(days=90),
         operator_approved_at=T0,
-        evidence_refs=tuple(decision.evidence_refs) +
-        (f"bundle_trials:{trial_digest}", f"bundle_folds:{folds_digest}"))
+        evidence_refs=(tuple(decision.evidence_refs) +
+                       ((f"bundle_trials:{trial_digest}", f"bundle_folds:{folds_digest}")
+                        if include_bundle_evidence_refs else ())) )
     AttestationRepository(db).record(signer.sign(unsigned))
     if return_signer:
         return db, artifact_id, signer
@@ -175,6 +176,15 @@ def test_export_rejects_missing_validation_folds(tmp_path):
     db, artifact_id = build_populated_db(tmp_path, validation_folds=())
 
     with pytest.raises(BundleError, match="validation folds"):
+        ResearchBundle(db).export(artifact_id, tmp_path / "bundle")
+
+
+def test_export_rejects_attestation_missing_trial_and_fold_bindings(tmp_path):
+    from trader.research.bundle import BundleError, ResearchBundle
+
+    db, artifact_id = build_populated_db(tmp_path, include_bundle_evidence_refs=False)
+
+    with pytest.raises(BundleError, match="trial or validation-fold binding"):
         ResearchBundle(db).export(artifact_id, tmp_path / "bundle")
 
 
@@ -256,7 +266,7 @@ def test_verify_rejects_self_consistent_semantic_payload_tampering(tmp_path, nam
     _rewrite_payload_and_manifest(root, name, mutate)
 
     with pytest.raises(BundleError):
-        bundle.verify(root, trusted_public_keys=[signer.public_key])
+        bundle.verify(root, trusted_public_keys={signer.public_key_id: signer.public_key})
 
 
 def test_verify_requires_a_trusted_valid_attestation_signature(tmp_path):
@@ -266,7 +276,7 @@ def test_verify_requires_a_trusted_valid_attestation_signature(tmp_path):
     root = tmp_path / "bundle"
     bundle = ResearchBundle(db)
     bundle.export(artifact_id, root)
-    assert bundle.verify(root, trusted_public_keys=[signer.public_key]).artifact_id == artifact_id
+    assert bundle.verify(root, trusted_public_keys={signer.public_key_id: signer.public_key}).artifact_id == artifact_id
 
     def forge_authority(payload):
         payload["max_gross_allocation"] = 0.99
@@ -288,4 +298,36 @@ def test_verify_requires_a_trusted_valid_attestation_signature(tmp_path):
     manifest_path.chmod(0o444)
 
     with pytest.raises(BundleError, match="signature"):
+        bundle.verify(root, trusted_public_keys={signer.public_key_id: signer.public_key})
+
+
+def test_verify_requires_explicit_key_id_mapping(tmp_path):
+    from trader.research.bundle import BundleError, ResearchBundle
+
+    db, artifact_id, signer = build_populated_db(tmp_path, return_signer=True)
+    root = tmp_path / "bundle"
+    bundle = ResearchBundle(db)
+    bundle.export(artifact_id, root)
+
+    assert bundle.verify(root, trusted_public_keys={signer.public_key_id: signer.public_key})
+    with pytest.raises(BundleError, match="mapping"):
         bundle.verify(root, trusted_public_keys=[signer.public_key])
+
+
+def test_verify_rejects_selected_trial_with_wrong_state_or_parameters(tmp_path):
+    from trader.research.bundle import BundleError, ResearchBundle
+
+    db, artifact_id, signer = build_populated_db(tmp_path, return_signer=True)
+    root = tmp_path / "bundle"
+    bundle = ResearchBundle(db)
+    bundle.export(artifact_id, root)
+    selected_trial_id = read_canonical_json(root / "artifact.json")["selected_trial_id"]
+    _rewrite_payload_and_manifest(
+        root, "trials.json",
+        lambda payload: next(trial for trial in payload
+                             if trial["trial_id"] == selected_trial_id).update(
+                                 status="FAILED", parameters={"minutes": 15}),
+    )
+
+    with pytest.raises(BundleError, match="binding"):
+        bundle.verify(root, trusted_public_keys={signer.public_key_id: signer.public_key})

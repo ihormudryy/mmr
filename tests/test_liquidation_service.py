@@ -67,6 +67,22 @@ class _Breaker:
     def trip_liquidation(self, cause, detail): self.calls.append((cause, detail))
 
 
+class _LedgerRow:
+    def __init__(self, state): self.state = state
+
+
+class _Ledger:
+    def __init__(self): self.row = _LedgerRow("OUTCOME_UNKNOWN"); self.transitions = []
+    def get(self, command_id): return self.row
+    def transition_in_tx(self, _conn, command_id, before, after, **kwargs):
+        self.transitions.append((command_id, before, after, kwargs)); self.row.state = after
+
+
+class _Journal:
+    def connect(self): return object()
+    def mutate(self, conn, mutation, write, event_id): write(conn, 1)
+
+
 def _service(snapshots, *, now=NOW):
     dispatch, breaker = _Dispatch(), _Breaker()
     return LiquidationService(_Broker(snapshots), dispatch, breaker=breaker, now=lambda: now), dispatch, breaker
@@ -99,6 +115,16 @@ def test_flat_requires_newer_generation_after_actions():
     ])
     assert service.start(ACCOUNT, "root-1", NOW + dt.timedelta(minutes=1)).state == "VERIFYING"
     assert service.rescan().state == "FLAT"
+
+
+def test_broker_flat_proof_resolves_pending_command_root():
+    broker, dispatch, breaker = _Broker([_snapshot(1, [_position()]), _snapshot(2, [])]), _Dispatch(), _Breaker()
+    ledger = _Ledger()
+    service = LiquidationService(broker, dispatch, breaker=breaker, now=lambda: NOW,
+                                 journal=_Journal(), ledger=ledger)
+    service.start(ACCOUNT, "root-1", NOW + dt.timedelta(minutes=1))
+    assert service.rescan().state == "FLAT"
+    assert ledger.transitions[0][:3] == ("root-1", "OUTCOME_UNKNOWN", "RESOLVED")
 
 
 def test_disconnect_is_outcome_unknown_and_keeps_breaker_tripped():

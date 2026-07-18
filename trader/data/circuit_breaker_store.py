@@ -171,10 +171,15 @@ class CircuitBreakerStore:
         ).fetchone()[0]
 
     def disconnect_started(self, conn) -> Optional[dt.datetime]:
-        reconnected = conn.execute(
-            "SELECT max(occurred_at) FROM automation_incidents WHERE account_id=? "
-            "AND signal_kind='BROKER_RECONNECTED'", [self.account_id],
-        ).fetchone()[0]
+        # DuckDB 1.4 can raise an internal error for MAX() over this filtered
+        # empty relation while a journal write is in progress. Ordered LIMIT is
+        # equivalent here and correctly returns no row for first disconnect.
+        row = conn.execute(
+            "SELECT occurred_at FROM automation_incidents WHERE account_id=? "
+            "AND signal_kind='BROKER_RECONNECTED' ORDER BY occurred_at DESC LIMIT 1",
+            [self.account_id],
+        ).fetchone()
+        reconnected = row[0] if row else None
         row = conn.execute(
             "SELECT min(occurred_at) FROM automation_incidents WHERE account_id=? "
             "AND signal_kind='BROKER_DISCONNECTED' AND (? IS NULL OR occurred_at>?)",

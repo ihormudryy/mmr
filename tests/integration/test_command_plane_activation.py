@@ -59,11 +59,11 @@ def test_drill_battery_passes_with_release_digests():
     assert report.config_digest.startswith("sha256:")
 
 
-def test_pending_scenarios_are_exactly_the_unlanded_features():
+def test_all_p1_safety_scenarios_are_enforced():
     # Coverage gaps (liquidation = Task 7, breaker/readiness = Task 6) must be
     # reported as pending so the gate never reads as "all covered" prematurely.
     report = drill.run_drills()
-    assert set(report.pending) == PENDING
+    assert not report.pending
 
 
 def test_unknown_scenario_name_fails_the_gate():

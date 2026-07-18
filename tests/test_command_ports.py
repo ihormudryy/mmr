@@ -9,13 +9,16 @@ or IB. The concrete production wiring supplies a real
 """
 from __future__ import annotations
 
+import datetime as dt
 from types import SimpleNamespace
 
 import pytest
 
+from trader.trading.proposal_command_service import ExecutableQuote
 from trader.trading.command_ports import (
     TraderBrokerAuthority,
     TraderPositionAuthority,
+    TraderQuoteAuthority,
     scoped_net_liquidation,
 )
 
@@ -23,6 +26,13 @@ ACCT = "DU123"
 OTHER = "DUother"
 CONID = 265598
 MARGIN = {"initMarginAfter": 5000.0, "equityWithLoanAfter": 100000.0}
+NOW = dt.datetime(2026, 7, 18, 14, 30, tzinfo=dt.timezone.utc)
+
+
+def _ticker(bid=209.5, ask=210.0, last=209.8, time=NOW, market_data_type=1, halted=0):
+    return SimpleNamespace(
+        bid=bid, ask=ask, last=last, time=time,
+        marketDataType=market_data_type, halted=halted)
 
 
 def _av(tag, value, currency="USD", account=ACCT):
@@ -41,16 +51,18 @@ def _item(conid, market_value, account=ACCT):
 
 def _fake_trader(*, positions=(), items=(), account_values=(), pnl=(),
                  open_orders=2, ready=True, ib_account=ACCT,
-                 managed=(ACCT,), margin=MARGIN):
+                 managed=(ACCT,), margin=MARGIN, snapshot=None):
     return SimpleNamespace(
         ib_account=ib_account,
         portfolio=SimpleNamespace(
             get_positions=lambda: list(positions),
             get_portfolio_items=lambda: list(items)),
         book=SimpleNamespace(get_open_order_count=lambda: open_orders),
-        client=SimpleNamespace(ib=SimpleNamespace(
-            accountValues=lambda: list(account_values),
-            managedAccounts=lambda: list(managed))),
+        client=SimpleNamespace(
+            ib=SimpleNamespace(
+                accountValues=lambda: list(account_values),
+                managedAccounts=lambda: list(managed)),
+            get_snapshot=lambda contract, delayed=False: snapshot),
         get_pnl=lambda: list(pnl),
         broker_ingest=SimpleNamespace(is_ready=lambda: ready),
         check_order_margin=lambda contract, order: margin,
@@ -129,3 +141,86 @@ class TestBrokerAuthority:
         trader = _fake_trader()
         trader.check_order_margin = _boom
         assert self._auth(trader).what_if_margin(CONID, "BUY", 10.0) is None
+
+
+class TestQuoteAuthority:
+    def _auth(self, trader, *, resolve=None):
+        return TraderQuoteAuthority(
+            trader, run_coro=lambda x: x,
+            resolve_contract=resolve or (lambda conid: SimpleNamespace(conId=conid)))
+
+    def test_buy_uses_ask_sell_uses_bid(self):
+        trader = _fake_trader(snapshot=_ticker(bid=209.5, ask=210.0))
+        assert self._auth(trader).executable_quote(CONID, side="BUY").price == 210.0
+        assert self._auth(trader).executable_quote(CONID, side="SELL").price == 209.5
+
+    def test_carries_real_market_timestamp_and_feed_type(self):
+        ts = NOW - dt.timedelta(seconds=8)
+        trader = _fake_trader(snapshot=_ticker(time=ts, market_data_type=3))  # 3 = delayed
+        q = self._auth(trader).executable_quote(CONID, side="BUY")
+        assert isinstance(q, ExecutableQuote)
+        assert q.market_timestamp == ts   # NOT re-stamped to "now"
+        assert q.feed_type == "delayed"
+        assert q.session_state == "continuous"
+
+    def test_halted_ticker_reports_halted_session(self):
+        trader = _fake_trader(snapshot=_ticker(halted=1))
+        assert self._auth(trader).executable_quote(CONID, side="BUY").session_state == "halted"
+
+    def test_none_when_contract_unresolved(self):
+        auth = self._auth(_fake_trader(snapshot=_ticker()), resolve=lambda conid: None)
+        assert auth.executable_quote(CONID, side="BUY") is None
+
+    def test_none_when_price_missing_or_nonpositive(self):
+        nan = float("nan")
+        for tk in (_ticker(ask=nan), _ticker(ask=None), _ticker(ask=0.0), _ticker(ask=-1.0)):
+            assert self._auth(_fake_trader(snapshot=tk)).executable_quote(CONID, side="BUY") is None
+
+    def test_none_when_no_market_timestamp(self):
+        # A quote with no real market time can't be aged -> not tradable.
+        trader = _fake_trader(snapshot=_ticker(time=None))
+        assert self._auth(trader).executable_quote(CONID, side="BUY") is None
+
+    def test_none_on_snapshot_failure(self):
+        def _boom(contract, delayed=False):
+            raise RuntimeError("reqMktData failed")
+        trader = _fake_trader()
+        trader.client.get_snapshot = _boom
+        assert self._auth(trader).executable_quote(CONID, side="BUY") is None
+
+
+class TestAdaptersSatisfyCapture:
+    """End-to-end: the three real adapters conform to the port protocols
+    capture_approval_context expects, and assemble a full single-generation
+    snapshot from live trader state."""
+
+    def test_capture_assembles_full_context_from_the_adapters(self):
+        from trader.trading.approval_context import capture_approval_context
+
+        trader = _fake_trader(
+            positions=[_pos(CONID, 100.0)],
+            items=[_item(CONID, 21000.0)],
+            account_values=[_av("NetLiquidation", "40002.78")],
+            pnl=[SimpleNamespace(dailyPnL=-120.0)],
+            open_orders=1,
+            snapshot=_ticker(bid=209.5, ask=210.0, time=NOW),
+            margin=MARGIN)
+        run = (lambda x: x)
+        resolve = lambda conid: SimpleNamespace(conId=conid)
+
+        ctx = capture_approval_context(
+            account_id=ACCT, conid=CONID, side="BUY", quantity=10.0,
+            quotes=TraderQuoteAuthority(trader, run_coro=run, resolve_contract=resolve),
+            positions=TraderPositionAuthority(trader),
+            broker=TraderBrokerAuthority(trader, run_coro=run, resolve_contract=resolve),
+            now=NOW)
+
+        assert ctx.quote.price == 210.0 and ctx.quote.market_timestamp == NOW
+        assert ctx.net_liquidation == pytest.approx(40002.78)
+        assert ctx.daily_pnl == pytest.approx(-120.0)
+        assert ctx.open_order_count == 1
+        assert ctx.position_value == 21000.0
+        assert ctx.reducible_quantity == 100.0
+        assert ctx.what_if_margin == MARGIN
+        assert ctx.notional(10) == 2100.0
+        assert ctx.is_quote_fresh(NOW, max_age_seconds=30) is True

@@ -16,10 +16,11 @@ are plain snapshot reads and safe from that thread. The one async read
 by the injected ``run_coro`` (production: ``run_coroutine_threadsafe(coro,
 loop).result(timeout)``) so it never touches ib_async off-loop.
 
-The ``QuoteAuthority`` adapter (executable quote) is intentionally NOT here yet:
-its market-timestamp/freshness semantics need to be derived from the real quote
-source, not guessed — getting it wrong reintroduces the "stale quote looks
-fresh" hazard just fixed on the read path.
+The ``QuoteAuthority`` adapter carries the IB ``Ticker``'s REAL market timestamp
+(``ticker.time``), never a re-stamp to "now" — so a snapshot taken while the
+market is closed reports the old close time and is correctly detected as stale
+downstream, rather than reintroducing the "stale quote looks fresh" hazard just
+fixed on the read path.
 """
 from __future__ import annotations
 
@@ -28,7 +29,12 @@ from typing import Any, Callable, Iterable, Optional
 
 from ib_async import Order
 
+from trader.trading.proposal_command_service import ExecutableQuote
+
 logger = logging.getLogger(__name__)
+
+# IB marketDataType -> feed label (reqMarketDataType / Ticker.marketDataType).
+_MARKET_DATA_TYPE = {1: "live", 2: "frozen", 3: "delayed", 4: "delayed-frozen"}
 
 
 def scoped_net_liquidation(
@@ -123,4 +129,72 @@ class TraderBrokerAuthority:
             return self._run_coro(self._trader.check_order_margin(contract, probe))
         except Exception as exc:  # noqa: BLE001 — best-effort; leverage gated by consumer
             logger.warning("what_if_margin unavailable for conid %s: %s", conid, exc)
+            return None
+
+
+def _feed_type(ticker) -> str:
+    return _MARKET_DATA_TYPE.get(getattr(ticker, "marketDataType", None), "unknown")
+
+
+def _session_state(ticker) -> str:
+    halted = getattr(ticker, "halted", 0) or 0
+    return "halted" if halted > 0 else "continuous"
+
+
+def _usable_price(value) -> Optional[float]:
+    """A tradable price, or None. Rejects None, NaN, and non-positive values —
+    an empty/absent bid or ask must not become an executable quote."""
+    if value is None:
+        return None
+    try:
+        price = float(value)
+    except (TypeError, ValueError):
+        return None
+    if price != price or price <= 0:  # NaN or non-positive
+        return None
+    return price
+
+
+class TraderQuoteAuthority:
+    """``QuoteAuthority`` backed by a fresh IB snapshot (reqMktData ``Ticker``).
+
+    Executable price = the BUY ask / SELL bid (the price you'd cross the spread
+    at). The quote carries the Ticker's REAL ``time`` so staleness is honest.
+    Returns None -- and the capture then fails closed -- when the contract can't
+    be resolved, the side has no usable price, the quote has no market
+    timestamp, or the snapshot fails."""
+
+    def __init__(self, trader, *, run_coro: Callable[[Any], Any],
+                 resolve_contract: Callable[[int], Optional[Any]],
+                 delayed: bool = False):
+        self._trader = trader
+        self._run_coro = run_coro
+        self._resolve_contract = resolve_contract
+        self._delayed = delayed
+
+    def executable_quote(self, conid: int, *, side: str) -> Optional[ExecutableQuote]:
+        try:
+            contract = self._resolve_contract(conid)
+            if contract is None:
+                return None
+            ticker = self._run_coro(
+                self._trader.client.get_snapshot(contract, self._delayed))
+            if ticker is None:
+                return None
+            raw = (getattr(ticker, "ask", None) if side.upper() == "BUY"
+                   else getattr(ticker, "bid", None))
+            price = _usable_price(raw)
+            if price is None:
+                return None
+            market_timestamp = getattr(ticker, "time", None)
+            if market_timestamp is None:
+                return None  # no real market time -> can't age it -> not tradable
+            return ExecutableQuote(
+                conid=conid, side=side, price=price,
+                market_timestamp=market_timestamp,
+                feed_type=_feed_type(ticker),
+                session_state=_session_state(ticker),
+            )
+        except Exception as exc:  # noqa: BLE001 — no usable quote -> capture fails closed
+            logger.warning("executable_quote unavailable for conid %s: %s", conid, exc)
             return None

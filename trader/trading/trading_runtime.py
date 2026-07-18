@@ -429,11 +429,20 @@ class Trader():
             # the M1-R dashboard bridge long-polls it; an empty registry made
             # every read_domain_events call fail METHOD_NOT_ALLOWED, so the
             # bridge could never tail past the fenced baseline (dashboard stuck
-            # resyncing). The command server stays empty until the command
-            # authority + live-command preflight are wired (integration gate);
-            # commands are disabled by default and the gateway isn't built then.
+            # resyncing). The command server exposes ONLY
+            # record_state_acknowledged (strategy_service's internal state
+            # announcement/ack backstop -- no market impact, no ledger row;
+            # without it strategy entities never reach the journal and the
+            # command center's Strategies panel stays empty forever). Every
+            # user-facing command (enable_strategy, approve_proposal, ...)
+            # stays unregistered until the command authority + live-command
+            # preflight are wired (integration gate); commands are disabled
+            # by default and the gateway isn't built then.
+            from trader.messaging.production_api import register_strategy_state_ingest
+            command_registry = TypedRpcRegistry()
+            register_strategy_state_ingest(command_registry, self.domain_journal)
             self.typed_command_server = TypedRpcServer(
-                'command', TypedRpcRegistry(), self.typed_authenticator,
+                'command', command_registry, self.typed_authenticator,
                 address=self.typed_bind_address,
                 port=self.typed_command_port,
             )

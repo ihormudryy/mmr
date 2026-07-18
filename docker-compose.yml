@@ -269,6 +269,12 @@ services:
       ZMQ_PUBSUB_SERVER_ADDRESS: tcp://trader
       ZMQ_MESSAGEBUS_SERVER_ADDRESS: tcp://trader
       ZMQ_RPC_SERVER_ADDRESS: tcp://trader
+      # Outbound: the trader's typed command/query sockets (42102/42101) --
+      # carries record_state_acknowledged state announcements (what populates
+      # the command center's Strategies panel) and the SignalProposer bridge.
+      # Without this the runtime falls back to TYPED_BIND_ADDRESS
+      # (tcp://0.0.0.0 here -- its OWN bind), i.e. the wrong host.
+      TRADER_TYPED_ADDRESS: tcp://trader
     volumes:
       - ${HOME}/.config/mmr:/home/trader/.config/mmr
       - mmr_db_data:/home/trader/.local/share/mmr/data

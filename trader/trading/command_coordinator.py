@@ -2042,6 +2042,62 @@ def _assert_state_revision(expected: int) -> Callable[[duckdb.DuckDBPyConnection
     return _write
 
 
+def acknowledge_strategy_state(
+    journal: DomainJournal,
+    strategy_name: str,
+    state_revision: int,
+    control_revision: int,
+    payload: dict[str, Any],
+    *,
+    correlation_id: str,
+    account_id: Optional[str] = None,
+    now: Optional[dt.datetime] = None,
+) -> int:
+    """Journal ``strategy.updated`` for this ``state_revision`` and return the
+    journaled ``entity_revision``.
+
+    Extracted from ``StrategyControlCommandService.acknowledge_state`` so the
+    production trader can accept strategy_service's state announcements
+    (``record_state_acknowledged``) on its typed command socket WITHOUT
+    constructing the full strategy-control forwarding saga — the ack only
+    needs the journal (see ``production_api.register_strategy_state_ingest``).
+
+    Idempotent by construction: ``event_id`` is deterministic
+    (``f"strategy:{name}:state:{state_revision}"``), so a duplicate
+    acknowledgement for a revision already journaled with an IDENTICAL
+    payload is a no-op replay inside ``DomainJournal.mutate`` itself. A
+    duplicate whose payload matches but whose ``source_timestamp`` differs
+    (the ordinary case for a genuinely later retry) raises
+    ``EventIdentityConflict`` from ``mutate()`` — caught here and treated as
+    "already durably acknowledged", returning the entity's current revision
+    rather than propagating a spurious failure for what is, from the
+    caller's perspective, still success."""
+    mutation = DomainMutation(
+        event_type="strategy.updated",
+        entity_type="strategy",
+        entity_id=strategy_name,
+        operation="upsert",
+        account_id=account_id,
+        source="trader_service",
+        source_timestamp=now if now is not None else _utcnow(),
+        correlation_id=correlation_id,
+        payload=payload,
+    )
+    try:
+        event = journal.mutate(
+            journal.connect(),
+            mutation,
+            _assert_state_revision(state_revision),
+            event_id=f"strategy:{strategy_name}:state:{state_revision}",
+        )
+        return event.entity_revision
+    except EventIdentityConflict:
+        entity = journal.get_entity("strategy", strategy_name)
+        if entity is not None:
+            return entity["entity_revision"]
+        raise
+
+
 class StrategyControlCommandService:
     """[M1-F3] Task 7 -- the forwarding saga for ``enable_strategy``,
     ``disable_strategy``, and ``update_strategy_params``.
@@ -2135,30 +2191,11 @@ class StrategyControlCommandService:
         current revision rather than propagating a spurious failure for
         what is, from the caller's perspective, still success.
         """
-        mutation = DomainMutation(
-            event_type="strategy.updated",
-            entity_type="strategy",
-            entity_id=strategy_name,
-            operation="upsert",
-            account_id=account_id,
-            source="trader_service",
-            source_timestamp=self._now_utc(),
-            correlation_id=correlation_id,
-            payload=payload,
+        return acknowledge_strategy_state(
+            self._journal, strategy_name, state_revision, control_revision,
+            payload, correlation_id=correlation_id, account_id=account_id,
+            now=self._now_utc(),
         )
-        try:
-            event = self._journal.mutate(
-                self._journal.connect(),
-                mutation,
-                _assert_state_revision(state_revision),
-                event_id=f"strategy:{strategy_name}:state:{state_revision}",
-            )
-            return event.entity_revision
-        except EventIdentityConflict:
-            entity = self._journal.get_entity("strategy", strategy_name)
-            if entity is not None:
-                return entity["entity_revision"]
-            raise
 
     # -- internals ----------------------------------------------------------
 

@@ -584,9 +584,15 @@ class RPCClient(Generic[T]):
         #   an order to a down trader_service fails loudly rather than firing later.
         socket.setsockopt(zmq.LINGER, 0)
         socket.setsockopt(zmq.IMMEDIATE, 1)
-        if self.timeout:
-            socket.setsockopt(zmq.RCVTIMEO, self.timeout * 1000)
-            socket.setsockopt(zmq.SNDTIMEO, self.timeout * 1000)
+        # SNDTIMEO must NEVER stay at ZMQ's infinite default: with IMMEDIATE=1
+        # a send toward a peer that never binds (e.g. the production trader's
+        # legacy 42001 socket, which only offline-sim binds) would otherwise
+        # block the calling thread forever — this wedged strategy_service at
+        # startup for its whole container lifetime. Fall back to the same 10s
+        # the receive poll loop uses (_SyncMethodCall: `self._timeout or 10`).
+        effective_timeout = self.timeout if self.timeout else 10
+        socket.setsockopt(zmq.RCVTIMEO, effective_timeout * 1000)
+        socket.setsockopt(zmq.SNDTIMEO, effective_timeout * 1000)
 
     async def connect(self, loop=None):
         logging.debug('trying RPCClient.connect()')

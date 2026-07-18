@@ -232,6 +232,7 @@ class StrategyRuntime():
         strategy_typed_query_port: int = 42105,
         typed_command_port: int = 42102,
         typed_query_port: int = 42101,
+        trader_typed_address: str = '',
         service_hmac_key_file: str = '',
         ib_account: str = '',
     ):
@@ -269,6 +270,13 @@ class StrategyRuntime():
         # strategy_typed_query_port above.
         self.typed_command_port = typed_command_port
         self.typed_query_port = typed_query_port
+        # Where the TRADER's typed sockets live. In a single-host deployment
+        # this coincides with typed_bind_address (tcp://127.0.0.1), which is
+        # why it defaults to it — but in the split-container deployment
+        # typed_bind_address is THIS service's own bind (tcp://0.0.0.0) and
+        # connecting outbound to it silently targets the wrong host, so the
+        # compose file sets TRADER_TYPED_ADDRESS=tcp://trader explicitly.
+        self.trader_typed_address = trader_typed_address or typed_bind_address
         self.service_hmac_key_file = service_hmac_key_file
         # [M1-F3] Task 8: the account SignalProposer reads the pause gate
         # for (get_trading_control has no account_id in its request body --
@@ -277,6 +285,11 @@ class StrategyRuntime():
         # symmetry/logging; harmless either way since the server ignores it).
         self.ib_account = ib_account
         self._revisions: Optional[StrategyRevisionStore] = None
+        # Last state-name announced per strategy (via the ack outbox). Resets
+        # on restart, so every strategy is re-announced once per process —
+        # harmless: the journal upsert is keyed by (name, state_revision) and
+        # a repeat announce is just a new revision of the same entity.
+        self._announced_states: Dict[str, str] = {}
 
         self.strategies_directory = strategies_directory
         self.strategy_config_file = strategy_config_file
@@ -401,7 +414,7 @@ class StrategyRuntime():
             # (SignalProposer's create_proposal calls, below).
             self._trader_command_client = TypedRpcClient(
                 'command', self._typed_authenticator,
-                address=self.typed_bind_address, port=self.typed_command_port,
+                address=self.trader_typed_address, port=self.typed_command_port,
             )
             # Outbound-only client toward the TRADER's own typed QUERY
             # socket -- used by SignalProposer to read the pause gate
@@ -410,7 +423,7 @@ class StrategyRuntime():
             # above; only the port differs.
             self._trader_query_client = TypedRpcClient(
                 'query', self._typed_authenticator,
-                address=self.typed_bind_address, port=self.typed_query_port,
+                address=self.trader_typed_address, port=self.typed_query_port,
             )
 
             # [M1-F3] Task 8: signal → PENDING proposal bridge for
@@ -1345,15 +1358,77 @@ class StrategyRuntime():
         except (TimeoutError, ConnectionError) as ex:
             logging.debug('reconciliation RPC failed (trader_service may be restarting): %s', ex)
 
-        # 3. [M1-F3] Task 7: drain any acknowledgement-outbox rows the trader
-        # might have missed (its record_state_acknowledged reply was lost, or
-        # this process restarted before draining). Isolated: a drain failure
-        # must not skip config reload/re-subscription above, and every row is
+        # 3. [M1-F3] Task 7: announce any strategy whose observable state
+        # changed since the last announce (also seeds strategies the startup
+        # announce missed, e.g. ones loaded by this very reconcile), then
+        # drain any acknowledgement-outbox rows the trader might have missed
+        # (its record_state_acknowledged reply was lost, or this process
+        # restarted before draining). Isolated: a failure here must not skip
+        # config reload/re-subscription above, and every drained row is
         # retried independently so one bad row doesn't block the rest.
+        try:
+            self._announce_strategy_states()
+        except Exception as ex:
+            logging.warning('strategy state announce failed (will retry next cycle): %s', ex)
         try:
             self._drain_ack_outbox()
         except Exception as ex:
             logging.warning('ack-outbox drain failed (will retry next cycle): %s', ex)
+
+    def _announce_strategy_states(self) -> None:
+        """Seed/refresh every loaded strategy's observable state into the
+        acknowledgement outbox (drained to the trader's
+        ``record_state_acknowledged`` by ``_drain_ack_outbox``).
+
+        Without this, strategy entities reach the trader's domain journal —
+        and therefore the command center's Strategies panel — ONLY via
+        control-command acks, and a control command for a never-journaled
+        strategy is rejected ``STRATEGY_NOT_FOUND``: a fresh deployment
+        showed zero strategies forever. One announce per (strategy,
+        state-name) transition; the in-memory dedup resets on restart, which
+        just re-announces the current state once (idempotent upsert)."""
+        if self._revisions is None:
+            return
+        for strategy in list(self.strategy_implementations):
+            state_name = strategy.state.name if hasattr(strategy.state, 'name') else str(strategy.state)
+            if self._announced_states.get(strategy.name) == state_name:
+                continue
+            control = self._revisions.control_revision(strategy.name)
+            payload = self._state_payload(strategy.name, control)
+
+            def _tx(conn, name=strategy.name, payload=payload):
+                return self._revisions.bump_state_revision_in_tx(conn, name, payload)
+
+            self._revisions.db.transaction(_tx)
+            self._announced_states[strategy.name] = state_name
+            logging.debug('announced strategy %r state %s to ack outbox', strategy.name, state_name)
+
+    def _subscribe_all_strategies(self) -> None:
+        """Startup instrument subscription, one strategy at a time, each
+        isolated: the legacy trader RPC these subscriptions ride on is not
+        bound at all in the split-container production posture (compose
+        KNOWN GAP), and one dead RPC must not abort startup for every other
+        strategy — the reconcile loop retries subscriptions anyway."""
+        for strategy in self.strategy_implementations:
+            try:
+                if strategy.conids:
+                    for conId in strategy.conids:
+                        security_definitions = self.trader_client.rpc().resolve_symbol(conId)
+                        if security_definitions:
+                            self.subscribe(strategy, SecurityDefinition.to_contract(security_definitions[0]))
+                        else:
+                            logging.error('could not find security definition for conId {} for strategy {}. Disabling strategy.'
+                                          .format(conId, strategy))
+                            strategy.on_error(
+                                Exception('could not find security definition for conId {} for strategy {}. Disabling strategy.'
+                                          .format(conId, strategy))
+                            )
+                if strategy.universe:
+                    self.subscribe_universe(strategy, strategy.universe)
+            except (TimeoutError, ConnectionError) as ex:
+                logging.warning(
+                    'startup instrument subscription failed for %r (trader legacy '
+                    'RPC unavailable; reconcile will retry): %s', strategy.name, ex)
 
     def _drain_ack_outbox(self, limit: int = 50) -> None:
         """Push unacknowledged ``strategy_ack_outbox`` rows to the trader's
@@ -1589,22 +1664,16 @@ class StrategyRuntime():
 
         # todo: i'm not sure the runtime should automagically subscribe here.
         # it's probably up to the strategy how they want to secure data
-        for strategy in self.strategy_implementations:
-            if strategy.conids:
-                for conId in strategy.conids:
-                    security_definitions = self.trader_client.rpc().resolve_symbol(conId)
-                    if security_definitions:
-                        self.subscribe(strategy, SecurityDefinition.to_contract(security_definitions[0]))
-                    else:
-                        logging.error('could not find security definition for conId {} for strategy {}. Disabling strategy.'
-                                      .format(conId, strategy))
-                        strategy.on_error(
-                            Exception('could not find security definition for conId {} for strategy {}. Disabling strategy.'
-                                      .format(conId, strategy))
-                        )
+        self._subscribe_all_strategies()
 
-            if strategy.universe:
-                self.subscribe_universe(strategy, strategy.universe)
+        # Announce the freshly loaded strategies to the trader's journal right
+        # away (don't wait for the first 30s reconcile tick) so the command
+        # center's Strategies panel populates as soon as the service is up.
+        try:
+            self._announce_strategy_states()
+            self._drain_ack_outbox()
+        except Exception as ex:
+            logging.warning('startup strategy state announce failed (reconcile will retry): %s', ex)
 
         logging.debug('starting connection to IB for historical data')
 

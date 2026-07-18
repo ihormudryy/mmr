@@ -107,6 +107,7 @@ from trader.trading.command_coordinator import (
     CommandValidationError,
     StrategyControlCommandService,
     TradingCommandCoordinator,
+    acknowledge_strategy_state,
 )
 from trader.trading.proposal_command_service import (
     ProposalCommandService,
@@ -588,6 +589,37 @@ def _strategy_control_rpc_handler(
         receipt = coordinator.execute(request)
         return _receipt_to_dict(receipt)
     return _handler
+
+
+def register_strategy_state_ingest(registry: "TypedRpcRegistry", journal) -> None:
+    """Register ONLY ``record_state_acknowledged`` on the command role.
+
+    This is the minimal command-socket surface the split-container production
+    trader needs so strategy_service's state announcements/ack backstop can
+    reach the domain journal (and therefore the command center's Strategies
+    panel). It is deliberately NOT the command-authority wiring: the ack is
+    an internal strategy_service -> trader notification with no market
+    impact, no ledger row, and no preflight ceremony (see
+    ``RecordStateAcknowledgedRequest``'s docstring), so exposing it does not
+    open any user-facing command. ``enable_strategy`` / ``approve_proposal``
+    / every other real command stays unregistered until the
+    command-authority integration gate wires the coordinator."""
+    from trader.data.domain_journal import DomainJournal
+    if not isinstance(journal, DomainJournal):
+        raise TypeError(f"journal must be a DomainJournal, got {type(journal)!r}")
+
+    def _handler(parsed: RecordStateAcknowledgedRequest) -> Dict[str, Any]:
+        entity_revision = acknowledge_strategy_state(
+            journal, parsed.strategy_name, parsed.state_revision,
+            parsed.control_revision, parsed.payload,
+            correlation_id=f"strategy:{parsed.strategy_name}:ack",
+        )
+        return {"entity_revision": entity_revision}
+
+    registry.register(
+        "command", "record_state_acknowledged", RecordStateAcknowledgedRequest, dict,
+        _handler,
+    )
 
 
 def _record_state_acknowledged_handler(strategy_control_service: StrategyControlCommandService):

@@ -699,3 +699,43 @@ class TestStoreMisc:
             runtime.apply_control_command(
                 "cmd-x", "smi_crossover", "reticulate_splines",
                 expected_control_revision=current, params=None)
+
+
+class TestStrategyStateIngestRegistration:
+    """[split-container fix] The production trader's typed COMMAND server used
+    to bind an EMPTY registry, so strategy_service's record_state_acknowledged
+    backstop got METHOD_NOT_ALLOWED and strategy rows never reached the domain
+    journal (Strategies panel permanently empty). register_strategy_state_ingest
+    wires ONLY that internal ack — the user-facing command surface stays gated
+    behind the command-authority integration."""
+
+    def _registry(self, journal):
+        from trader.messaging.production_api import register_strategy_state_ingest
+        from trader.messaging.typed_rpc import TypedRpcRegistry
+        registry = TypedRpcRegistry()
+        register_strategy_state_ingest(registry, journal)
+        return registry
+
+    def test_registers_only_record_state_acknowledged_on_command_role(self, tmp_path):
+        _, journal = _build_journal(tmp_path)
+        registry = self._registry(journal)
+        assert registry.contains("command", "record_state_acknowledged")
+        assert not registry.contains("query", "record_state_acknowledged")
+        for user_command in ("enable_strategy", "disable_strategy",
+                             "update_strategy_params", "create_proposal",
+                             "approve_proposal", "cancel_order"):
+            assert not registry.contains("command", user_command), user_command
+
+    def test_handler_journals_strategy_entity(self, tmp_path):
+        _, journal = _build_journal(tmp_path)
+        registry = self._registry(journal)
+        registration = registry.resolve("command", "record_state_acknowledged")
+        payload = {"strategy_name": "alpha", "state": "INSTALLED", "control_revision": 0}
+        parsed = registration.request_model(
+            strategy_name="alpha", state_revision=1, control_revision=0, payload=payload)
+        response = registration.handler(parsed)
+        assert response == {"entity_revision": 1}
+        entity = journal.get_entity("strategy", "alpha")
+        assert entity is not None
+        # idempotent replay of the same state_revision
+        assert registration.handler(parsed) == {"entity_revision": 1}

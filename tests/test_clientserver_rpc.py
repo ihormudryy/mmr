@@ -243,3 +243,46 @@ def test_rpc_round_trip_preserves_error_types():
         if loop:
             loop.call_soon_threadsafe(loop.stop)
         t.join(timeout=3.0)
+
+
+class TestSendNeverBlocksForever:
+    """Regression: an RPCClient constructed WITHOUT an explicit timeout left
+    SNDTIMEO/RCVTIMEO at ZMQ's infinite default. Combined with IMMEDIATE=1,
+    a send toward a peer that never binds (the split-container production
+    trader never binds the legacy 42001 socket) blocked *forever* — this is
+    what wedged strategy_service at startup for its whole container lifetime.
+    A default send timeout must make the call fail loudly instead."""
+
+    def test_unroutable_send_raises_connection_error_with_default_timeout(self):
+        import threading
+
+        port = _free_port()  # nothing ever binds this port
+        client = RPCClient[_Service](
+            zmq_server_address='tcp://127.0.0.1',
+            zmq_server_port=port,
+            # deliberately NO timeout kwarg — the unsafe default is the bug
+        )
+        asyncio.new_event_loop().run_until_complete(client.connect())
+
+        result: dict = {}
+
+        def _call():
+            try:
+                client.rpc().add(1, 2)
+                result['outcome'] = 'returned'
+            except (ConnectionError, TimeoutError) as ex:
+                result['outcome'] = 'raised'
+                result['error'] = ex
+            except Exception as ex:  # pragma: no cover - diagnostic
+                result['outcome'] = 'other'
+                result['error'] = ex
+
+        t = threading.Thread(target=_call, daemon=True)
+        t.start()
+        t.join(timeout=25.0)
+        try:
+            assert not t.is_alive(), (
+                'RPC send to an unbound port blocked past 25s — SNDTIMEO default missing')
+            assert result.get('outcome') == 'raised', result
+        finally:
+            client.close()

@@ -30,7 +30,16 @@ const DISPATCHABLE_STRATEGY = new Set(['RUNNING', 'WAITING_HISTORICAL_DATA']);
 
 const store = {
   view: null, streamId: null, sequence: 0,
-  quotes: {}, quoteReceivedAt: {},
+  // Quotes carry their own server_received_timestamp; freshness is computed
+  // from that (corrected onto the client clock via serverClockOffsetMs learned
+  // from the snapshot's generated_at), NOT from client arrival time -- that's
+  // what let stale quotes look fresh after a snapshot/reconnect.
+  quotes: {}, serverClockOffsetMs: 0,
+  // Authoritative bridge health, refreshed by an independent /api/cc-health
+  // poll (see refreshHealth) so the degraded banner reflects whether the
+  // server actually has live trader data -- not merely that the SSE socket to
+  // the dashboard process is open.
+  health: null,
   connection: { mode: 'connecting', degradedSince: null },
 };
 
@@ -87,77 +96,122 @@ function applyEvent(env) {
 }
 
 function applyQuotes(batch) {
-  const now = Date.now();
-  for (const [id, quote] of Object.entries(batch)) {
-    store.quotes[id] = quote;
-    store.quoteReceivedAt[id] = now;
-  }
+  // Merge latest-value; each quote already carries its own
+  // server_received_timestamp (no client arrival stamping).
+  Object.assign(store.quotes, batch);
   renderPositions();
 }
 
 function applySnapshot(view) {
+  // Reject a late/overlapping snapshot that would roll state backward (a slow
+  // older fetch resolving after a newer one). Returns whether it was applied.
+  if (!ccSnapshotSupersedes(store.streamId, store.sequence, view)) return false;
   store.view = view;
   store.streamId = view.stream_id;
   store.sequence = view.sequence;
   store.quotes = view.quotes || {};
-  const now = Date.now();
-  Object.keys(store.quotes).forEach(id => { store.quoteReceivedAt[id] = now; });
+  // Calibrate the client<->server clock offset from this snapshot's
+  // server-stamped generated_at so quote ages are skew-corrected.
+  store.serverClockOffsetMs = ccServerClockOffsetMs(view.generated_at, Date.now());
+  if (view.health) store.health = view.health;
   renderAll();
+  return true;
 }
 
 /* ---------------- connection management ---------------------------------- */
-let es = null, pollTimer = null, disconnectedAt = null;
+let es = null, pollTimer = null, disconnectedAt = null, everConnected = false;
+let snapshotGen = 0, snapshotInFlight = false;
+const SNAPSHOT_TIMEOUT_MS = 8000;
 
 async function fetchSnapshot() {
-  const response = await fetch('/api/snapshot', { credentials: 'same-origin' });
-  if (response.status === 401) { window.location.href = '/cc/login'; return null; }
-  if (!response.ok) return null;
-  return response.json();
+  // Bounded fetch: a hung snapshot must never wedge recovery forever.
+  const ctrl = new AbortController();
+  const timer = setTimeout(() => ctrl.abort(), SNAPSHOT_TIMEOUT_MS);
+  try {
+    const response = await fetch('/api/snapshot',
+      { credentials: 'same-origin', signal: ctrl.signal });
+    if (response.status === 401) { window.location.href = '/cc/login'; return null; }
+    if (!response.ok) return null;      // 503 not-ready etc.: stay degraded, retry
+    return await response.json();
+  } catch (err) {
+    return null;                        // timeout / abort / network -> no snapshot
+  } finally {
+    clearTimeout(timer);
+  }
 }
 
-async function resync() {
+// Single in-flight snapshot fetch guarded by a generation token: only the most
+// recently initiated fetch may apply, so a slow older response can never roll
+// state back over a newer one (applySnapshot also rejects a stale sequence).
+async function fetchAndApplySnapshot() {
+  if (snapshotInFlight) return false;
+  snapshotInFlight = true;
+  const gen = ++snapshotGen;
+  try {
+    const view = await fetchSnapshot();
+    if (gen !== snapshotGen || !view) return false;
+    return applySnapshot(view);
+  } finally {
+    snapshotInFlight = false;
+  }
+}
+
+// Enter the degraded/recovering state and drive ONE recovery loop: fetch a
+// coherent snapshot, then reconnect SSE. Idempotent -- a second call while
+// already recovering is a no-op (guarded on connection.mode), so a
+// resync_required event, a stream mismatch, and the transport watchdog can all
+// funnel here without spawning overlapping loops. Shows the banner immediately
+// because the readyState watchdog can't fire while es is null mid-fetch.
+function resync() {
+  if (store.connection.mode === 'polling') return;
+  store.connection.mode = 'polling';
+  updateBanner();
   if (es) { es.close(); es = null; }
-  const view = await fetchSnapshot();
-  if (view) { applySnapshot(view); connectSse(); }
-  else setTimeout(resync, CFG.pollIntervalMs);
+  recoverTick();
+}
+
+async function recoverTick() {
+  if (store.connection.mode !== 'polling') return;
+  if (await fetchAndApplySnapshot()) {
+    stopPolling();                      // return to SSE only after a coherent snapshot
+    connectSse();
+    return;
+  }
+  if (store.connection.mode === 'polling') {
+    pollTimer = setTimeout(recoverTick, CFG.pollIntervalMs);
+  }
 }
 
 function connectSse() {
   if (es) es.close();
+  // A fresh connection attempt gets a fresh grace window: clear the
+  // "disconnected since" clock so the 1s watchdog can't fire mid-handshake and
+  // abort this reconnect (onerror re-arms it if THIS attempt fails).
+  disconnectedAt = null;
   const after = store.streamId ? `?after=${store.streamId}:${store.sequence}` : '';
   es = new EventSource('/api/events' + after);
-  es.onopen = () => { disconnectedAt = null; stopPolling(); setBanner(false); };
-  es.onerror = () => { if (disconnectedAt === null) disconnectedAt = Date.now(); };
+  es.onopen = () => {
+    everConnected = true; disconnectedAt = null; stopPolling(); updateBanner();
+  };
+  es.onerror = () => {
+    if (disconnectedAt === null) disconnectedAt = Date.now();
+    updateBanner();
+  };
   DOMAIN_EVENT_TYPES.forEach(t =>
     es.addEventListener(t, e => applyEvent(JSON.parse(e.data))));
   es.addEventListener('quote.updated',
     e => applyQuotes(JSON.parse(e.data).quotes));
   es.addEventListener('quotes.snapshot', e => {
+    // Replace (not merge): the reconnect baseline is authoritative; freshness
+    // still comes from each quote's server_received_timestamp.
     store.quotes = JSON.parse(e.data).quotes || {};
-    const now = Date.now();
-    Object.keys(store.quotes).forEach(id => { store.quoteReceivedAt[id] = now; });
     renderPositions();
   });
   es.addEventListener('resync_required', () => resync());
 }
 
-function startPolling() {
-  if (pollTimer) return;
-  setBanner(true);
-  store.connection.mode = 'polling';
-  pollTimer = setInterval(async () => {
-    const view = await fetchSnapshot();
-    if (view) {
-      applySnapshot(view);
-      // Return to SSE only after this coherent snapshot (spec §11).
-      stopPolling();
-      connectSse();
-    }
-  }, CFG.pollIntervalMs);
-}
-
 function stopPolling() {
-  if (pollTimer) { clearInterval(pollTimer); pollTimer = null; }
+  if (pollTimer) { clearTimeout(pollTimer); pollTimer = null; }
   store.connection.mode = 'sse';
 }
 
@@ -165,13 +219,58 @@ function setBanner(visible) {
   document.getElementById('degraded-banner').hidden = !visible;
 }
 
+function currentSseState() {
+  // Before the first successful connect, report a clean transport so only
+  // bridge health can raise the banner (avoids an initial-load flicker).
+  if (!everConnected) {
+    return { open: true, disconnectedForMs: null,
+             degradedAfterMs: CFG.degradedAfterMs, polling: false };
+  }
+  return {
+    open: !!es && es.readyState === EventSource.OPEN,
+    disconnectedForMs: disconnectedAt === null ? null : Date.now() - disconnectedAt,
+    degradedAfterMs: CFG.degradedAfterMs,
+    polling: store.connection.mode === 'polling',
+  };
+}
+
+function updateBanner() {
+  const lifecycle = store.health && store.health.lifecycle;
+  setBanner(ccIsDegraded(lifecycle, currentSseState()));
+}
+
+async function refreshHealth() {
+  // Authoritative source-freshness poll, independent of the SSE socket: an open
+  // EventSource to the dashboard process says nothing about whether that
+  // process still has live trader data. Drives the banner + dependency chips.
+  try {
+    const res = await fetch('/api/cc-health', { credentials: 'same-origin' });
+    if (res.status === 401) { window.location.href = '/cc/login'; return; }
+    if (!res.ok) return;
+    const h = await res.json();
+    store.health = { lifecycle: h.lifecycle, sources: h.sources,
+                     reconnects: h.reconnects, cursor: h.cursor };
+    renderStatusBar();
+    updateBanner();
+  } catch (err) { /* transient; the next tick retries */ }
+}
+
+// Transport watchdog: an SSE that errored and stayed non-open past the grace
+// window falls back to snapshot polling via resync(). Also re-evaluates the
+// banner every tick so crossing the grace window (or a health change) is
+// reflected even with no other event.
 setInterval(() => {
   if (es && es.readyState !== EventSource.OPEN && disconnectedAt !== null
-      && Date.now() - disconnectedAt >= CFG.degradedAfterMs && !pollTimer) {
-    es.close(); es = null;
-    startPolling();
+      && Date.now() - disconnectedAt >= CFG.degradedAfterMs
+      && store.connection.mode !== 'polling') {
+    resync();
   }
+  updateBanner();
 }, 1000);
+
+// Independent health poll (issue #6): keep source freshness current even while
+// SSE is open.
+setInterval(refreshHealth, CFG.pollIntervalMs);
 
 /* ---------------- rendering ---------------------------------------------- */
 const fmt = new Intl.NumberFormat('en-US', { maximumFractionDigits: 2 });
@@ -193,14 +292,17 @@ function renderStatusBar() {
   document.getElementById('account-id').textContent =
     account.entity_id || account.account_id || '—';
   const chips = document.getElementById('dependency-chips');
-  const sources = (v.health && v.health.sources) || {};
+  // Prefer the independently-polled store.health (issue #6) so the chips + the
+  // bridge lifecycle stay current during live SSE, not frozen at snapshot time.
+  const health = store.health || v.health || {};
+  const sources = health.sources || {};
   chips.innerHTML = Object.entries(sources).map(([name, s]) =>
     `<span class="chip" data-state="${esc(s.state)}">${esc(name)}: ${esc(s.state)}` +
     (s.last_success_age_seconds !== null && s.last_success_age_seconds !== undefined
       ? ` (${fmtAge(s.last_success_age_seconds)})` : '') + '</span>').join('');
   chips.innerHTML += `<span class="chip" data-state="${
-    v.health && v.health.lifecycle === 'live' ? 'ok' : 'error'}">bridge: ${
-    esc(v.health ? v.health.lifecycle : 'unknown')}</span>`;
+    health.lifecycle === 'live' ? 'ok' : 'error'}">bridge: ${
+    esc(health.lifecycle || 'unknown')}</span>`;
   document.querySelector('#last-event-time .v').textContent =
     v.last_event_at ? `${v.last_event_at} (${fmtAge(ageOf(v.last_event_at))} ago)` : '—';
 }
@@ -230,8 +332,11 @@ function renderPositions() {
     const conid = String(p.conid ?? (p.entity_id || '').split(':').pop());
     const quote = store.quotes[conid];
     const last = quote ? quote.last : null;
-    const quoteAge = store.quoteReceivedAt[conid]
-      ? (Date.now() - store.quoteReceivedAt[conid]) / 1000 : null;
+    // Age from the quote's own server_received_timestamp (skew-corrected via
+    // the snapshot clock offset), never from client arrival time -- so a stale
+    // quote reads stale immediately after a snapshot/reconnect. null == unknown
+    // -> stale, never silently "fresh".
+    const quoteAge = ccQuoteAgeSeconds(quote, store.serverClockOffsetMs, Date.now());
     const stale = quoteAge === null || quoteAge > CFG.staleAfterS;
     const pnl = p.unrealized_pnl;
     return `<tr class="${stale ? 'stale' : ''}" data-entity="${esc(p.entity_id)}">
@@ -604,11 +709,17 @@ function ccClearOutcomeUnknown(commandId) {
 }
 
 async function ccReconcileCommand(commandId, label) {
-  // Authoritative refresh: poll the ledger until a terminal state, or until
-  // ccCheckPendingCommands() clears it first from a command.updated event
-  // that already arrived over SSE.
-  for (let i = 0; i < 12 && CC.commands.unknown.has(commandId); i += 1) {
+  // Authoritative ledger reconcile for an accepted command whose terminal
+  // state hasn't arrived over SSE. Drives BOTH the outcome-unknown path AND a
+  // normal 202 (issue #9): a 202 that the feed never confirms -- because SSE
+  // or the bridge is degraded -- would otherwise stay "Pending confirmation"
+  // forever. Re-checks after each wait so a command.updated event (applied by
+  // ccCheckPendingCommands) short-circuits this without a needless ledger poll.
+  for (let i = 0; i < 12; i += 1) {
     await new Promise((r) => setTimeout(r, window.CC_RECONCILE_MS || 5000));
+    if (!(CC.commands.pending.has(commandId) || CC.commands.unknown.has(commandId))) {
+      return;  // resolved over SSE while we waited
+    }
     try {
       const res = await fetch(`/api/commands/${commandId}`,
                               { credentials: 'same-origin' });
@@ -665,7 +776,15 @@ async function ccSubmitCommand(kind, label, url, body) {
   CC.commands.pending.set(body.command_id, { label });
   ccRenderPending();
   const result = await ccPost(url, body);
-  if (result.ok) return;  // stays "Pending confirmation" until command.updated
+  if (result.ok) {
+    // 202 accepted: normally an SSE command.updated resolves the pending chip
+    // within ~1s. But if SSE/the feed is degraded that event may never arrive,
+    // so ALSO reconcile against the ledger after a grace interval (silent -- no
+    // outcome-unknown banner). ccReconcileCommand re-checks after each wait, so
+    // the SSE path still wins when it's healthy and no ledger poll is wasted.
+    ccReconcileCommand(body.command_id, label);
+    return;
+  }
   CC.commands.pending.delete(body.command_id);
   ccRenderPending();
   if (result.outcomeUnknown) {

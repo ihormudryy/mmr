@@ -121,6 +121,15 @@ class DashboardState:
         self._ring.clear()
         self._revisions.clear()
         self._reset_collections()
+        # A fenced re-baseline REPLACES the quote map rather than merging into
+        # it: the stream identity rotated, so any quote the QuotePlane hasn't
+        # refreshed is stale-derived state that must not survive and be
+        # re-stamped "fresh" under the new stream. Quotes refill from the live
+        # plane and the optional pre-seed apply_quotes() that follows this call.
+        # (This differs from a position tombstone in _remove(), which leaves
+        # quotes alone — see the note there — because a single close doesn't
+        # invalidate the whole stream.)
+        self.quotes = {}
         now = self._monotonic()
         for entity_type, rows in snapshot.entities.items():
             for row in rows:

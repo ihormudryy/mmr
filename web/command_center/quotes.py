@@ -6,6 +6,7 @@ ephemeral: they never touch the journal, the replay ring, or client FIFOs.
 """
 from __future__ import annotations
 
+import datetime as dt
 import logging
 import os
 import threading
@@ -17,6 +18,10 @@ import zmq
 logger = logging.getLogger("web.command_center.quotes")
 
 DEFAULT_QUOTE_HZ = 4.0
+
+
+def _utc_iso(epoch_seconds: float) -> str:
+    return dt.datetime.fromtimestamp(epoch_seconds, tz=dt.timezone.utc).isoformat()
 
 
 def clamp_hz(hz: float) -> float:
@@ -96,13 +101,15 @@ class QuotePlane:
     def __init__(self, address: str, port: int, loop,
                  deliver: Callable[[dict], None], *,
                  hz: float = DEFAULT_QUOTE_HZ, topic: str = "",
-                 decode: Optional[Callable[[bytes], object]] = None):
+                 decode: Optional[Callable[[bytes], object]] = None,
+                 clock: Callable[[], float] = time.time):
         self._endpoint = f"{address}:{port}"
         self._loop = loop
         self._deliver = deliver
         self._interval = 1.0 / clamp_hz(hz)
         self._topic = topic
         self._decode = decode or _default_decode
+        self._clock = clock
         self._pending: dict[str, dict] = {}
         self._last_flush = 0.0
         self._stop = threading.Event()
@@ -115,6 +122,11 @@ class QuotePlane:
         if quote is None:
             self.dropped += 1
             return
+        # Stamp the dashboard's own receive time (wall clock, ISO-8601 UTC) so
+        # the client ages a quote from a real timestamp rather than from when a
+        # snapshot happened to arrive. Set here, not in the pure normalize_ticker,
+        # so the normalizer's shape stays unchanged.
+        quote["server_received_timestamp"] = _utc_iso(self._clock())
         self._pending[quote["instrument_id"]] = quote  # conflate: latest wins
 
     def flush_due(self, now: float) -> bool:

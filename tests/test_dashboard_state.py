@@ -221,6 +221,20 @@ class TestLifecycleCollections:
         assert state.snapshot_view()["positions"] == []
         assert state.snapshot_view()["quotes"]["265598"]["last"] == 199.5
 
+    def test_install_baseline_replaces_stale_quotes(self, state):
+        """A fenced re-baseline discards the old derived quote map. Unlike a
+        position tombstone (above), a resync rotates the whole stream: a quote
+        the QuotePlane hasn't refreshed must NOT survive and be re-stamped
+        "fresh" under the new stream. Quotes refill from the live plane (and
+        the optional pre-seed apply_quotes that follows install_baseline)."""
+        state.apply_quotes({"265598": {"instrument_id": "265598", "last": 199.5}})
+        assert state.snapshot_view()["quotes"] != {}
+        state.install_baseline(
+            SnapshotWithCursor(source_cursor=1, broker_generation=1, entities={}),
+            stream_id="stream-b",
+        )
+        assert state.snapshot_view()["quotes"] == {}
+
 
 class TestRevisionBounding:
     """IMPORTANT-1: `_revisions` gets a permanent entry per (entity_type,

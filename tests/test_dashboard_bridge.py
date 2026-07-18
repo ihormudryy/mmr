@@ -466,6 +466,24 @@ class TestQuoteNormalization:
         assert clamp_hz(4.0) == 4.0
         assert clamp_hz(60.0) == 5.0
 
+    def test_ingest_stamps_server_received_timestamp(self):
+        """Each ingested quote carries the dashboard's own receive time, so the
+        client computes freshness from a real server timestamp rather than
+        snapshot-arrival time (which made stale quotes look fresh). Stamped in
+        ingest, not normalize_ticker, so the pure normalizer stays unchanged."""
+        plane = QuotePlane(
+            "tcp://ignored", 1, loop=None, deliver=lambda batch: None,
+            clock=lambda: 1_752_580_800.0,
+        )
+        plane.ingest({"conId": 265598, "last": 199.5})
+        quote = plane._pending["265598"]
+        assert "server_received_timestamp" in quote
+        parsed = dt.datetime.fromisoformat(quote["server_received_timestamp"])
+        assert parsed.timestamp() == 1_752_580_800.0
+        # normalize_ticker itself must NOT gain the field (shape-pure).
+        assert "server_received_timestamp" not in normalize_ticker(
+            {"conId": 265598, "last": 199.5})
+
 
 class TestQuoteConflation:
     def _plane(self, hz=4.0):
@@ -610,15 +628,19 @@ class TestQuoteMultiInstrument:
     def test_different_instruments_coexist_in_one_batch(self):
         batches: list[dict] = []
         loop = _CollectingLoop()
+        ts = 1_752_580_800.0
         plane = QuotePlane("tcp://127.0.0.1", 1, loop, batches.append,
-                           decode=msgpack.unpackb)
+                           decode=msgpack.unpackb, clock=lambda: ts)
         plane.ingest({"conId": 265598, "last": 210.0})
         plane.ingest({"conId": 4815747, "last": 172.0})
         plane.ingest({"conId": 265598, "last": 211.0})  # conflates 265598 only
         assert plane.flush_due(now=1e9) is True
+        received = dt.datetime.fromtimestamp(ts, tz=dt.timezone.utc).isoformat()
         assert batches == [{
             "265598": {"instrument_id": "265598", "bid": None, "ask": None,
-                        "last": 211.0, "market_timestamp": None, "feed_type": None},
+                        "last": 211.0, "market_timestamp": None, "feed_type": None,
+                        "server_received_timestamp": received},
             "4815747": {"instrument_id": "4815747", "bid": None, "ask": None,
-                         "last": 172.0, "market_timestamp": None, "feed_type": None},
+                         "last": 172.0, "market_timestamp": None, "feed_type": None,
+                         "server_received_timestamp": received},
         }]

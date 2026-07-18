@@ -172,6 +172,39 @@ def _maybe_start_command_reconciliation(trader: Trader, loop: AbstractEventLoop)
         logging.error('failed to start command reconciliation: {}'.format(ex))
 
 
+async def _liquidation_recovery_loop(service, *, interval: float = 5.0) -> None:
+    """Keep unresolved verified-liquidation roots moving after restart.
+
+    Every transition still requires a newly promoted broker snapshot; a loop
+    tick can never manufacture a flat result.  Errors are contained so an IB
+    outage preserves the durable run for the next tick rather than killing the
+    trader process.
+    """
+    while True:
+        try:
+            receipt = service.rescan()
+            if receipt is not None and receipt.state != 'FLAT':
+                logging.warning('liquidation %s remains %s: %s', receipt.cause_command_id,
+                                receipt.state, receipt.detail)
+        except Exception as ex:
+            logging.error('liquidation recovery tick failed: {}'.format(ex))
+        await asyncio.sleep(interval)
+
+
+def _maybe_start_liquidation_recovery(trader: Trader, loop: AbstractEventLoop) -> None:
+    """Rescan durable liquidation roots before normal service operation."""
+    service = getattr(trader, 'liquidation_service', None)
+    if service is None:
+        return
+    try:
+        first = service.rescan()
+        if first is not None and first.state != 'FLAT':
+            logging.warning('resumed liquidation %s in state %s', first.cause_command_id, first.state)
+        loop.create_task(_liquidation_recovery_loop(service))
+    except Exception as ex:
+        logging.error('failed to start liquidation recovery: {}'.format(ex))
+
+
 def _seed_trading_control(trader: Trader, container: Container) -> TradingControlStore:
     """[M1-F3] Task 4: seed the durable per-account pause gate BEFORE this
     service is considered ready (i.e. before ``trader.run()`` starts the
@@ -289,6 +322,7 @@ def main(simulation: bool,
         # Dormant until the live command authority is wired (see the function's
         # docstring) -- a no-op here today, never a startup regression.
         _maybe_start_command_reconciliation(trader, loop)
+        _maybe_start_liquidation_recovery(trader, loop)
 
         ip_address = get_network_ip()
         logging.debug('starting trading_runtime at network address: {}'.format(ip_address))

@@ -139,6 +139,25 @@ def test_alias_binding_is_idempotent_and_scoped(env):
     assert by_cid_s2 == "ext:other"
 
 
+def test_find_perm_id_for_order_reverse_lookup(env):
+    # The cancel adapter resolves order_entity_id -> stable perm_id through this
+    # reverse lookup. It must return the perm_id alias (as int), never the
+    # session-scoped client_order_id, and None when no perm_id has been observed.
+    def _tx(conn):
+        env.store.bind_alias_in_tx(
+            conn, "perm_id", "987654321", "DU123", "", "og-cmd1:entry", UTC_NOW)
+        env.store.bind_alias_in_tx(
+            conn, "client_order_id", "3", "DU123", "s1", "og-cmd1:entry", UTC_NOW)
+        return (
+            env.store.find_perm_id_for_order_in_tx(conn, "og-cmd1:entry"),
+            env.store.find_perm_id_for_order_in_tx(conn, "og-cmd1:stop"),
+        )
+
+    found, missing = env.db.transaction(_tx)
+    assert found == 987654321 and isinstance(found, int)
+    assert missing is None
+
+
 def test_tombstoned_position_is_excluded_from_active(env):
     def _tx(conn):
         env.store.upsert_position_in_tx(conn, _position(revision=1))

@@ -2182,19 +2182,38 @@ class TradingRuntimeOrderDispatch:
         raise BrokerRejectedError('order dispatch failed with no error detail')
 
     def cancel(self, order_entity_id: str, order_ref: str):
-        # Re-validate against the LIVE session by the STABLE perm_id (encoded in
-        # order_entity_id), NEVER the persisted session orderId -- that can go
-        # stale or be reused across a reconnect and resolve to the wrong order.
-        # Only ever cancels an order that is open right now; no live perm_id
-        # match -> cancelled=False (fail safe, never a wrong cancel). Pure
-        # correlation is in command_ports.resolve_cancel_target (tested there).
+        # Resolve the STABLE perm_id for this order entity from the persisted
+        # broker_order_aliases table (the entity id is order_group_id:leg /
+        # ext:<uuid> -- perm_id is an alias, never the key), then match the
+        # CURRENT session's open trades by perm_id (never a session-scoped
+        # orderId, which can go stale / be reused across a reconnect).
+        #
+        # A cancel we cannot resolve to a LIVE order RAISES rather than
+        # returning: the coordinator treats a non-raising return as SUBMITTED,
+        # so a silent "cancelled=False" would falsely report success. Raising
+        # sends the command to OUTCOME_UNKNOWN, and the Task-9 reconciler
+        # resolves the true state from broker_orders (already terminal -> no-op
+        # success; still working -> retry). NEVER report SUBMITTED for an order
+        # we did not cancel. Pure matcher: command_ports.resolve_cancel_target.
         from trader.trading.command_coordinator import CancelAck
-        from trader.trading.command_ports import resolve_cancel_target
-        order = resolve_cancel_target(order_entity_id, self._open_trades())
+        from trader.trading.command_ports import CancelUnresolved, resolve_cancel_target
+        perm_id = self._perm_id_for_order(order_entity_id)
+        order = resolve_cancel_target(perm_id, self._open_trades())
         if order is None:
-            return CancelAck(order_entity_id=order_entity_id, cancelled=False)
+            raise CancelUnresolved(
+                f"no live order to cancel for {order_entity_id!r} "
+                f"(perm_id={perm_id}); deferring to reconciliation")
         self._trader.client.ib.cancelOrder(order)
         return CancelAck(order_entity_id=order_entity_id, cancelled=True)
+
+    def _perm_id_for_order(self, order_entity_id: str):
+        # Conn-free reverse alias lookup (order_entity_id -> perm_id). Fail-safe:
+        # no store -> None -> cancel raises CancelUnresolved (reconciler resolves).
+        store = getattr(self._trader, 'broker_state_store', None)
+        journal = getattr(self._trader, 'domain_journal', None)
+        if store is None or journal is None:
+            return None
+        return store.find_perm_id_for_order_in_tx(journal.connect(), order_entity_id)
 
     def find_by_order_ref(self, account_id: str, order_ref: str) -> list:
         # Read-only correlation: broker_orders rows for this command's order

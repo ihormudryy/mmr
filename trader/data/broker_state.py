@@ -447,6 +447,22 @@ class BrokerStateStore:
         ).fetchone()
         return None if row is None else row[0]
 
+    def find_perm_id_for_order_in_tx(
+        self, conn: Any, order_entity_id: str
+    ) -> Optional[int]:
+        """Reverse alias lookup: the STABLE IB ``perm_id`` bound to this order
+        entity, or None if none has been observed yet. perm_id aliases are
+        session-independent (bound with ``session_epoch=''``), so a working
+        order has at most one. Used by the cancel adapter to re-validate against
+        the LIVE session by perm_id rather than trusting a session-scoped
+        ``orderId`` (which can go stale / be reused across a reconnect)."""
+        row = conn.execute(
+            "SELECT alias_value FROM broker_order_aliases "
+            "WHERE order_entity_id = ? AND alias_type = 'perm_id' LIMIT 1",
+            [order_entity_id],
+        ).fetchone()
+        return None if row is None else int(row[0])
+
     def upsert_fill_in_tx(self, conn: Any, row: BrokerFillRow) -> None:
         self._upsert(conn, "broker_fills", {"account_id": row.account_id, "exec_id": row.exec_id}, {
             "account_id": row.account_id, "exec_id": row.exec_id,

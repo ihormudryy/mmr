@@ -239,41 +239,40 @@ def _order_row(entity_id, account=ACCT, group="og-cmd1"):
 
 class TestCancelCorrelation:
     def test_matches_live_order_by_stable_perm_id(self):
-        entity = f"order:{ACCT}:987654321"
+        # perm_id is resolved from the alias table by the caller and passed in;
+        # the matcher finds the currently-open order with that permId.
         trades = [_trade(111), _trade(987654321, order_id=3), _trade(222)]
-        target = resolve_cancel_target(entity, trades)
-        assert target is trades[1].order
+        assert resolve_cancel_target(987654321, trades) is trades[1].order
 
     def test_none_when_no_live_perm_id_matches(self):
         # A stale/terminal order: its perm_id isn't in the current open trades.
-        assert resolve_cancel_target(f"order:{ACCT}:987654321", [_trade(111)]) is None
+        assert resolve_cancel_target(987654321, [_trade(111)]) is None
+
+    def test_none_when_perm_id_unknown(self):
+        # No perm_id alias resolved (e.g. order not yet observed) -> no target.
+        assert resolve_cancel_target(None, [_trade(111)]) is None
 
     def test_never_matches_by_session_order_id(self):
-        # The encoded id is a perm_id (large); it must NOT be matched against a
-        # live order's session orderId even if numerically equal.
-        entity = f"order:{ACCT}:3"
-        trades = [_trade(987654321, order_id=3)]  # orderId 3, perm_id differs
-        assert resolve_cancel_target(entity, trades) is None
-
-    def test_none_for_unparseable_entity(self):
-        assert resolve_cancel_target("not-an-order-id", [_trade(111)]) is None
-        assert resolve_cancel_target(f"order:{ACCT}:abc", [_trade(111)]) is None
+        # perm_id must match a live order's permId, NEVER its session orderId --
+        # a numeric collision with an orderId must not resolve a target.
+        trades = [_trade(987654321, order_id=3)]  # orderId 3, perm_id 987654321
+        assert resolve_cancel_target(3, trades) is None
 
     def test_ignores_trades_without_an_order(self):
         trades = [SimpleNamespace(order=None), _trade(500)]
-        assert resolve_cancel_target(f"order:{ACCT}:500", trades) is trades[1].order
+        assert resolve_cancel_target(500, trades) is trades[1].order
 
     def test_group_correlation_filters_account_and_group(self):
         rows = [
-            _order_row("order:DU123:1", account=ACCT, group="og-cmd1"),
-            _order_row("order:DU123:2", account=ACCT, group="og-cmd1"),
-            _order_row("order:DU123:3", account=ACCT, group="og-other"),
-            _order_row("order:DUother:4", account=OTHER, group="og-cmd1"),
+            _order_row("og-cmd1:entry", account=ACCT, group="og-cmd1"),
+            _order_row("og-cmd1:stop", account=ACCT, group="og-cmd1"),
+            _order_row("og-other:entry", account=ACCT, group="og-other"),
+            _order_row("og-cmd1:entry", account=OTHER, group="og-cmd1"),
         ]
         matched = orders_matching_group(rows, ACCT, "og-cmd1")
-        assert {r.order_entity_id for r in matched} == {"order:DU123:1", "order:DU123:2"}
+        assert {r.order_entity_id for r in matched} == {"og-cmd1:entry", "og-cmd1:stop"}
 
     def test_group_correlation_empty_group_is_no_match(self):
-        rows = [_order_row("order:DU123:1")]
+        rows = [_order_row("og-cmd1:entry")]
         assert orders_matching_group(rows, ACCT, None) == []
         assert orders_matching_group(rows, ACCT, "") == []

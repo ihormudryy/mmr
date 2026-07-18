@@ -203,32 +203,28 @@ class TraderQuoteAuthority:
 # --- Order cancel / reconciliation correlation (design C4, sequence step 2c) ---
 # These are the SAFETY-CRITICAL pure helpers behind OrderDispatchPort.cancel and
 # find_by_order_ref. Kept pure (no IB, no store) so the correlation is fully
-# testable in isolation; trading_runtime supplies the live open-trades list and
-# the store rows.
-
-def _perm_id_from_entity(order_entity_id: str) -> Optional[int]:
-    """The IB perm_id encoded in an order entity id
-    (``order:{account}:{perm_id or client_order_id}``). Matching a LIVE order by
-    this STABLE perm_id -- never the persisted session ``orderId`` -- is what
-    makes cancellation reconnect-safe: perm_id is permanent while ``orderId`` is
-    session-scoped and can go stale / be reused after a reconnect. If the id was
-    actually encoded from a client_order_id (the rare pre-perm_id window), no
-    live perm_id will match and cancel fails safe rather than hitting the wrong
-    order."""
-    try:
-        return int(str(order_entity_id).rsplit(":", 1)[-1])
-    except (ValueError, AttributeError):
-        return None
+# testable in isolation; trading_runtime supplies the live open-trades list, the
+# store rows, and the perm_id resolved from the persisted alias table.
 
 
-def resolve_cancel_target(order_entity_id: str, open_trades: Iterable[Any]):
-    """The LIVE order to cancel for a persisted broker entity, matched by the
-    STABLE perm_id against the CURRENT session's open trades. Returns None (so
-    the caller reports ``cancelled=False`` and NEVER cancels a wrong order) when
-    there is no live perm_id match -- a stale/reused session id, a
-    terminal/absent order, or an unparseable entity id all fail safe. Only ever
-    returns an order that is live right now, so cancel cannot hit a phantom."""
-    perm_id = _perm_id_from_entity(order_entity_id)
+class CancelUnresolved(RuntimeError):
+    """A cancel could not be resolved to a LIVE order.
+
+    Raised by the dispatch adapter so the coordinator records
+    ``OUTCOME_UNKNOWN`` (never a false ``SUBMITTED``) and the Task-9 reconciler
+    resolves the true state from the authoritative ``broker_orders`` store --
+    the order may already be terminal (a no-op cancel) or still working and
+    needing a retry. NEVER report a cancel as done when nothing was cancelled.
+    """
+
+
+def resolve_cancel_target(perm_id: Optional[int], open_trades: Iterable[Any]):
+    """The LIVE order matched by the STABLE ``perm_id`` (resolved from the
+    persisted ``broker_order_aliases`` table by the caller -- NEVER parsed from
+    the entity id, which is ``order_group_id:leg`` / ``ext:<uuid>``, and never a
+    session-scoped ``orderId``). Returns None when ``perm_id`` is unknown or no
+    currently-open order matches; the caller treats None as an unresolved cancel
+    (raise), so cancel can neither hit a phantom nor silently no-op as success."""
     if perm_id is None:
         return None
     for trade in open_trades:

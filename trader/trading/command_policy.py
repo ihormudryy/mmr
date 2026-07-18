@@ -194,11 +194,12 @@ COMMAND_PORT_REQUIREMENTS: dict[str, frozenset[str]] = {
 
 ALL_PORTS: frozenset[str] = frozenset().union(*COMMAND_PORT_REQUIREMENTS.values())
 
-# Ports whose production adapters are still stubs today (design C4;
-# TradingRuntimeOrderDispatch.cancel raises NotImplementedError and
-# find_by_order_ref returns []). Callers should NOT pass these as ready until
-# the real adapters land + are tested; documented here so the gate is explicit.
-KNOWN_STUB_PORTS: frozenset[str] = frozenset({PORT_ORDER_CANCEL, PORT_ORDER_STATE})
+# Ports whose production adapters don't exist yet (design C4). order_cancel /
+# order_state landed in step 2c (TradingRuntimeOrderDispatch.cancel /
+# find_by_order_ref); what remains unbuilt is the critical-alert adapter and the
+# preflight nonce gate (step 5). Callers should NOT pass these as ready until
+# their real adapters land + are tested; documented here so the gate is explicit.
+KNOWN_STUB_PORTS: frozenset[str] = frozenset({PORT_ALERTS, PORT_NONCES})
 
 
 def available_commands(ready_ports: Iterable[str]) -> tuple[str, ...]:

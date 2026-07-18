@@ -119,16 +119,17 @@ class TestPolicyValidation:
 
 
 class TestCapabilityMatrix:
-    def test_stub_ports_exclude_cancel_and_approve(self):
-        # Everything constructed EXCEPT the two stub adapters (order cancel +
-        # order-state lookup) -> cancel + approval reconciliation are withheld,
-        # but create/reject/pause/strategy/preflight are available.
+    def test_stub_ports_gate_the_nonce_and_alert_commands(self):
+        # Post-2c the order cancel/state adapters are real; only the alert
+        # adapter + the preflight nonce gate remain unbuilt. So nonce-requiring
+        # commands (preflight/resume/param-update) and approve (needs alerts +
+        # nonces) stay withheld, while cancel -- now built -- is available.
         ready = ALL_PORTS - KNOWN_STUB_PORTS
         avail = set(available_commands(ready))
-        assert "approve_proposal" not in avail
-        assert "cancel_order" not in avail and "cancel_all" not in avail
-        assert {"create_proposal", "reject_proposal", "pause_new_trading",
-                "resume_new_trading", "enable_strategy", "preflight_command"} <= avail
+        assert {"approve_proposal", "preflight_command", "resume_new_trading",
+                "update_strategy_params"}.isdisjoint(avail)
+        assert {"create_proposal", "reject_proposal", "cancel_order", "cancel_all",
+                "pause_new_trading", "enable_strategy", "disable_strategy"} <= avail
 
     def test_full_port_set_yields_every_command(self):
         assert set(available_commands(ALL_PORTS)) == set(COMMAND_PORT_REQUIREMENTS)

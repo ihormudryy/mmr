@@ -2182,12 +2182,44 @@ class TradingRuntimeOrderDispatch:
         raise BrokerRejectedError('order dispatch failed with no error detail')
 
     def cancel(self, order_entity_id: str, order_ref: str):
-        # Thin: full cancel/repair lands with the Task-9 outcome reconciler.
-        raise NotImplementedError('order cancel is implemented by the Task-9 reconciler')
+        # Re-validate against the LIVE session by the STABLE perm_id (encoded in
+        # order_entity_id), NEVER the persisted session orderId -- that can go
+        # stale or be reused across a reconnect and resolve to the wrong order.
+        # Only ever cancels an order that is open right now; no live perm_id
+        # match -> cancelled=False (fail safe, never a wrong cancel). Pure
+        # correlation is in command_ports.resolve_cancel_target (tested there).
+        from trader.trading.command_coordinator import CancelAck
+        from trader.trading.command_ports import resolve_cancel_target
+        order = resolve_cancel_target(order_entity_id, self._open_trades())
+        if order is None:
+            return CancelAck(order_entity_id=order_entity_id, cancelled=False)
+        self._trader.client.ib.cancelOrder(order)
+        return CancelAck(order_entity_id=order_entity_id, cancelled=True)
 
     def find_by_order_ref(self, account_id: str, order_ref: str) -> list:
-        # Thin: the Task-9 reconciler correlates broker_orders by order_group_id.
-        return []
+        # Read-only correlation: broker_orders rows for this command's order
+        # group (og-{command_id}, stable across reconnects). A non-empty result
+        # proves the order was submitted -> the reconciler marks it EXECUTED.
+        from trader.trading.command_ports import orders_matching_group
+        from trader.trading.order_correlation import decode_order_ref
+        group = decode_order_ref(order_ref)
+        if group is None:
+            return []
+        return orders_matching_group(self._active_order_rows(), account_id, group)
+
+    def _open_trades(self) -> list:
+        ib = getattr(getattr(self._trader, 'client', None), 'ib', None)
+        return list(ib.openTrades()) if ib is not None else []
+
+    def _active_order_rows(self) -> list:
+        # Conn-free read over [M1-F2]'s materialized broker_orders store -- mirror
+        # of trader_service._BrokerStoreOrderView. Fail-safe: no store -> [] (the
+        # reconciler then treats absence as unknown, never a false EXECUTED).
+        store = getattr(self._trader, 'broker_state_store', None)
+        journal = getattr(self._trader, 'domain_journal', None)
+        if store is None or journal is None:
+            return []
+        return store.select_active_orders_in_tx(journal.connect())
 
     def enumeration_complete(self) -> bool:
         ingest = getattr(self._trader, 'broker_ingest', None)

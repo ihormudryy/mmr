@@ -198,3 +198,55 @@ class TraderQuoteAuthority:
         except Exception as exc:  # noqa: BLE001 — no usable quote -> capture fails closed
             logger.warning("executable_quote unavailable for conid %s: %s", conid, exc)
             return None
+
+
+# --- Order cancel / reconciliation correlation (design C4, sequence step 2c) ---
+# These are the SAFETY-CRITICAL pure helpers behind OrderDispatchPort.cancel and
+# find_by_order_ref. Kept pure (no IB, no store) so the correlation is fully
+# testable in isolation; trading_runtime supplies the live open-trades list and
+# the store rows.
+
+def _perm_id_from_entity(order_entity_id: str) -> Optional[int]:
+    """The IB perm_id encoded in an order entity id
+    (``order:{account}:{perm_id or client_order_id}``). Matching a LIVE order by
+    this STABLE perm_id -- never the persisted session ``orderId`` -- is what
+    makes cancellation reconnect-safe: perm_id is permanent while ``orderId`` is
+    session-scoped and can go stale / be reused after a reconnect. If the id was
+    actually encoded from a client_order_id (the rare pre-perm_id window), no
+    live perm_id will match and cancel fails safe rather than hitting the wrong
+    order."""
+    try:
+        return int(str(order_entity_id).rsplit(":", 1)[-1])
+    except (ValueError, AttributeError):
+        return None
+
+
+def resolve_cancel_target(order_entity_id: str, open_trades: Iterable[Any]):
+    """The LIVE order to cancel for a persisted broker entity, matched by the
+    STABLE perm_id against the CURRENT session's open trades. Returns None (so
+    the caller reports ``cancelled=False`` and NEVER cancels a wrong order) when
+    there is no live perm_id match -- a stale/reused session id, a
+    terminal/absent order, or an unparseable entity id all fail safe. Only ever
+    returns an order that is live right now, so cancel cannot hit a phantom."""
+    perm_id = _perm_id_from_entity(order_entity_id)
+    if perm_id is None:
+        return None
+    for trade in open_trades:
+        order = getattr(trade, "order", None)
+        if order is not None and getattr(order, "permId", None) == perm_id:
+            return order
+    return None
+
+
+def orders_matching_group(rows: Iterable[Any], account_id: str,
+                          order_group_id: Optional[str]) -> list:
+    """Broker rows for (account, order_group_id) -- the read-only correlation
+    behind ``find_by_order_ref`` (a non-empty result tells the reconciler the
+    order was submitted -> EXECUTED). ``order_group_id`` (``og-{command_id}``)
+    is stable across reconnects, so this is safe. Empty/None group -> no match
+    (never a false positive)."""
+    if not order_group_id:
+        return []
+    return [r for r in rows
+            if getattr(r, "account_id", None) == account_id
+            and getattr(r, "order_group_id", None) == order_group_id]

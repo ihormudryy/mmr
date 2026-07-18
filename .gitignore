@@ -15,6 +15,7 @@ scratch/
 .env
 .claude/
 .venv/
+.worktrees/
 
 # Runtime directories
 /data/

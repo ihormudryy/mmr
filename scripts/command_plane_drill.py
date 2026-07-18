@@ -538,6 +538,96 @@ def scn_notional_cap_blocks_dispatch(db_path: str) -> dict:
     return {"error_code": receipt.error_code, "orders_submitted": len(live.orders.submissions)}
 
 
+def scn_circuit_breaker_trips_and_persists(db_path: str) -> dict:
+    """An immediate breaker signal trips automation, the trip survives a restart
+    over the same journal (durable), and a reset fails closed until BOTH semantic
+    readiness and reconciliation hold."""
+    from trader.data.circuit_breaker_store import (
+        CircuitBreakerStore, apply_circuit_breaker_migration)
+    from trader.trading.circuit_breaker import (
+        BreakerResetRefused, BreakerSignal, CircuitBreaker)
+
+    db = DuckDBConnection.get_instance(db_path)
+    migrator = SchemaMigrator(db)
+    journal = DomainJournal(db)
+    journal.migrate(migrator)
+    apply_circuit_breaker_migration(migrator)
+    store = CircuitBreakerStore(journal, ACCOUNT)
+    store.seed(NOW)
+
+    flags = {"reset_ready": False, "recon": False}
+    breaker = CircuitBreaker(
+        store, now=lambda: NOW,
+        reset_ready=lambda: flags["reset_ready"],
+        reconciliation_complete=lambda: flags["recon"],
+        session_key=lambda t: t.date().isoformat())
+
+    # 1. Immediate trip on a protective-order failure.
+    tripped = breaker.record(BreakerSignal(
+        kind="PROTECTIVE_ORDER_FAILURE", occurred_at=NOW, detail="SL leg rejected"))
+    if tripped.state != "TRIPPED":
+        raise AssertionError(f"breaker state {tripped.state} != TRIPPED on immediate signal")
+
+    # 2. Durable: a fresh store over the SAME journal still reads TRIPPED.
+    reread = CircuitBreakerStore(DomainJournal(db), ACCOUNT).get()
+    if reread.state != "TRIPPED":
+        raise AssertionError("breaker trip did not persist across restart")
+
+    # 3. Reset fails closed until readiness AND reconciliation both hold.
+    try:
+        breaker.reset("op-1", "manual clear", "operator")
+        raise AssertionError("reset succeeded despite readiness/reconciliation unmet")
+    except BreakerResetRefused:
+        pass
+    flags["reset_ready"] = True
+    flags["recon"] = True
+    cleared = breaker.reset("op-2", "manual clear after checks", "operator")
+    if cleared.state != "CLEAR":
+        raise AssertionError(f"breaker state {cleared.state} != CLEAR after a valid reset")
+    return {"tripped_reason": tripped.reason_code, "persisted": True,
+            "reset_state": cleared.state}
+
+
+def scn_semantic_readiness_gates_activation(db_path: str) -> dict:
+    """Automation is gated by semantic readiness: all checks green -> ready; a
+    single failing check gates it; a check that RAISES is treated as not-ready
+    (fail closed)."""
+    from trader.trading.semantic_readiness import SemanticReadiness
+
+    flags = {k: True for k in (
+        "ib", "acct", "broker", "journal", "recon", "control", "breaker", "stack", "quotes")}
+
+    def make():
+        return SemanticReadiness(
+            ib_connected=lambda: flags["ib"], account_pinned=lambda: flags["acct"],
+            broker_current=lambda: flags["broker"], journal_writable=lambda: flags["journal"],
+            reconciliation_safe=lambda: flags["recon"], control_readable=lambda: flags["control"],
+            breaker_clear=lambda: flags["breaker"], session_open=lambda now: True,
+            command_stack_active=lambda: flags["stack"], quotes_ready=lambda: flags["quotes"])
+
+    ready = make().evaluate(NOW)
+    if not ready.ready:
+        raise AssertionError(f"not ready with all checks green: {ready.to_payload()['failed']}")
+
+    flags["breaker"] = False
+    gated = make().evaluate(NOW)
+    if gated.ready or "breaker_clear" not in gated.to_payload()["failed"]:
+        raise AssertionError("a failing check did not gate activation / was not reported")
+    flags["breaker"] = True
+
+    def boom():
+        raise RuntimeError("ib probe blew up")
+    raising = SemanticReadiness(
+        ib_connected=boom, account_pinned=lambda: True, broker_current=lambda: True,
+        journal_writable=lambda: True, reconciliation_safe=lambda: True,
+        control_readable=lambda: True, breaker_clear=lambda: True,
+        session_open=lambda now: True, command_stack_active=lambda: True,
+        quotes_ready=lambda: True)
+    if raising.evaluate(NOW).ready:
+        raise AssertionError("readiness reported ready despite a raising check")
+    return {"all_green_ready": True, "gated_on": "breaker_clear", "fail_closed_on_raise": True}
+
+
 # Scenario registry maps name -> (callable | None). None means the feature is
 # not landed yet (reported as pending, never as covered).
 def _liquidation_available() -> bool:
@@ -572,17 +662,15 @@ def build_scenarios() -> dict[str, Optional[Callable[[str], dict]]]:
         "liquidation_flat_only_from_broker_truth":
             scn_liquidation if _liquidation_available() and scn_liquidation else None,
         "circuit_breaker_trips_and_persists":
-            scn_circuit_breaker if _breaker_available() and scn_circuit_breaker else None,
+            scn_circuit_breaker_trips_and_persists if _breaker_available() else None,
         "semantic_readiness_gates_activation":
-            scn_semantic_readiness if _breaker_available() and scn_semantic_readiness else None,
+            scn_semantic_readiness_gates_activation if _breaker_available() else None,
     }
 
 
-# Task 6/7 scenario bodies are added here as those features land; until then the
-# names are declared (above) so the report lists them as pending, not missing.
+# Task 7 (liquidation) scenario body lands with that feature; until then the name
+# is declared (above) so the report lists it as pending, not missing.
 scn_liquidation: Optional[Callable[[str], dict]] = None
-scn_circuit_breaker: Optional[Callable[[str], dict]] = None
-scn_semantic_readiness: Optional[Callable[[str], dict]] = None
 
 
 # ---------------------------------------------------------------------------
@@ -644,7 +732,7 @@ def run_drills(selected: Optional[list[str]] = None) -> DrillReport:
             report.pending.append(name)
             report.scenario_results.append(
                 {"name": name, "status": "pending",
-                 "detail": "feature not landed yet (Task 6/7)"})
+                 "detail": "feature not landed yet (Task 7 liquidation)"})
             continue
         ran_any = True
         with tempfile.TemporaryDirectory() as tmp:

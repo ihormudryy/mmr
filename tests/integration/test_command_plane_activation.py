@@ -42,11 +42,12 @@ RUNNABLE = {
     "restart_unresolved",
     "stale_quote_blocks_dispatch",
     "notional_cap_blocks_dispatch",
-}
-PENDING = {
-    "liquidation_flat_only_from_broker_truth",
     "circuit_breaker_trips_and_persists",
     "semantic_readiness_gates_activation",
+}
+# Only liquidation remains pending (Task 7 broker-verified liquidation saga).
+PENDING = {
+    "liquidation_flat_only_from_broker_truth",
 }
 
 

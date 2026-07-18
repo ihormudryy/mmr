@@ -88,13 +88,13 @@
 
 **Research migrations 3-6:** `experiment_families`, `experiment_trials`, `validation_folds`, `trial_metrics`, `strategy_artifacts`, `holdout_access_log`.
 
-- [ ] Test family creation with commit, source-tree digest, dependency-lock digest, container digest, manifest digest, declared search space, cost model, and validation protocol.
-- [ ] Test that `start_trial` inserts before execution and `finish_trial` records `SUCCEEDED`, `FAILED`, `INVALID`, or `TIMED_OUT` with traceback digest/safe summary.
-- [ ] Test that no trial may be deleted and archived trials remain in `selection_trial_count`.
-- [ ] Test a holdout token can be opened once per artifact version; any second open rejects and a failed holdout sets artifact state `RETIRED`.
-- [ ] Implement `ExperimentRegistry` transactionally. Add an adapter that imports existing `BacktestStore` results as `LEGACY_UNQUALIFIED`; they cannot earn eligibility.
-- [ ] Add CLI commands `mmr research family create`, `trial run`, `family show`, and `artifact show --json` with parameterized queries only.
-- [ ] Run focused tests plus `tests/test_backtest_store.py`; commit `feat(research): record complete experiment families`.
+- [x] Test family creation with commit, source-tree digest, dependency-lock digest, container digest, manifest digest, declared search space, cost model, and validation protocol.
+- [x] Test that `start_trial` inserts before execution and `finish_trial` records `SUCCEEDED`, `FAILED`, `INVALID`, or `TIMED_OUT` with traceback digest/safe summary.
+- [x] Test that no trial may be deleted and archived trials remain in `selection_trial_count`.
+- [x] Test a holdout token can be opened once per artifact version; any second open rejects and a failed holdout sets artifact state `RETIRED`.
+- [x] Implement `ExperimentRegistry` transactionally. Add an adapter that imports existing `BacktestStore` results as `LEGACY_UNQUALIFIED`; they cannot earn eligibility.
+- [x] Add CLI commands `mmr research family create`, `trial run`, `family show`, and `artifact show --json` with parameterized queries only.
+- [x] Run focused tests plus `tests/test_backtest_store.py`; commit `feat(research): record complete experiment families`.
 
 ### Task 5: Implement walk-forward, cost, robustness, and selection-bias analysis
 

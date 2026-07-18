@@ -146,12 +146,12 @@
 
 **Research migrations 7-8:** append-only `operator_reviews`, `eligibility_attestations`, and `attestation_revocations`.
 
-- [ ] Test the mandatory review fields: rationale, cost survival, failure regimes, data limitations, sensitivity, dependencies, capacity/decay, episode dominance, holdout-once confirmation.
-- [ ] Test sign/verify, tampering of every authority field, wrong key, expiry, revoked attestation, changed artifact/allowlist/ruleset/mode/allocation, deterministic signature payload, and public-key rotation identifier.
-- [ ] Test key permissions and hygiene: signer accepts a path/PKCS8 input only, refuses group/world-readable files, never prints key bytes, and generated bundles contain only public key IDs.
-- [ ] Implement offline `AttestationSigner` and production-safe `AttestationVerifier`. Store signature as base64url; digest the unsigned canonical payload.
-- [ ] Add `mmr research review submit`, `attest paper --key-file`, and `attest verify --public-key-file`. Require interactive confirmation unless `--review-id` and `--yes` are both present in a non-production offline context.
-- [ ] Run focused tests and commit `feat(research): sign versioned eligibility attestations`.
+- [x] Test the mandatory review fields: rationale, cost survival, failure regimes, data limitations, sensitivity, dependencies, capacity/decay, episode dominance, holdout-once confirmation.
+- [x] Test sign/verify, tampering of every authority field, wrong key, expiry, revoked attestation, changed artifact/allowlist/ruleset/mode/allocation, deterministic signature payload, and public-key rotation identifier.
+- [x] Test key permissions and hygiene: signer accepts a path/PKCS8 input only, refuses group/world-readable files, never prints key bytes, and generated bundles contain only public key IDs.
+- [x] Implement offline `AttestationSigner` and production-safe `AttestationVerifier`. Store signature as base64url; digest the unsigned canonical payload.
+- [x] Add `mmr research review submit`, `attest paper --key-file`, and `attest verify --public-key-file`. Require interactive confirmation unless `--review-id` and `--yes` are both present in a non-production offline context.
+- [x] Run focused tests and commit `feat(research): sign versioned eligibility attestations`.
 
 ### Task 8: Export a read-only artifact bundle and prove reproduction
 

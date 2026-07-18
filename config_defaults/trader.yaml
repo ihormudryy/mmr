@@ -109,6 +109,13 @@ unsafe_legacy_rpc: false
 # without a matching account or a notional ceiling refuses to start). Disabled
 # by default: the trader stays read-only + strategy-state-ack until the
 # command-plane integration gate is complete.
+#
+# ACTIVATION (paper only): before setting enabled: true, pass BOTH halves of the
+# release gate -- the synthetic drills (scripts/command_plane_drill.py, exit 0)
+# AND a recorded IB-paper session soak (scripts/run_paper_soak.py during market
+# hours). Full runbook + prerequisites:
+#   docs/superpowers/rollout/trading-income-operations-runbook.md
+# Enable per-deployment in ~/.config/mmr/trader.yaml or env -- never here.
 command_authority:
   enabled: false          # master switch: build/register the authority at all
   live_enabled: false     # allow risk-increasing commands on a LIVE account

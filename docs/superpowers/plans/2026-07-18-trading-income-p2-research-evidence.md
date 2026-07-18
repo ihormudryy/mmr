@@ -68,12 +68,12 @@
 
 **Interfaces:** `PointInTimeMembership(conid, effective_from, effective_to, symbol, delisted_at, source)`; `DatasetQualifier.qualify(request) -> DatasetQualification`.
 
-- [ ] Test membership as-of boundaries, ticker changes, delisted names, overlapping intervals, missing provenance, and frozen membership digest.
-- [ ] Test XNYS regular-session completeness, early closes, DST, duplicates, gaps, timestamps outside session, corrupt/non-finite OHLCV, split discontinuities, and verified corrections.
-- [ ] Keep genuine gaps/crashes/halts; only a correction with original value, replacement, source, reason, and reviewer may alter data.
-- [ ] Add a read adapter from existing `UniverseAccessor`; do not mutate legacy current-universe behavior.
-- [ ] Implement deterministic reports and fail the dataset rather than silently dropping a failed instrument/bar.
-- [ ] Run focused tests and commit `feat(research): qualify point-in-time market datasets`.
+- [x] Test membership as-of boundaries, ticker changes, delisted names, overlapping intervals, missing provenance, and frozen membership digest.
+- [x] Test XNYS regular-session completeness, early closes, DST, duplicates, gaps, timestamps outside session, corrupt/non-finite OHLCV, split discontinuities, and verified corrections.
+- [x] Keep genuine gaps/crashes/halts; only a correction with original value, replacement, source, reason, and reviewer may alter data.
+- [x] Add a read adapter from existing `UniverseAccessor`; do not mutate legacy current-universe behavior.
+- [x] Implement deterministic reports and fail the dataset rather than silently dropping a failed instrument/bar.
+- [x] Run focused tests and commit `feat(research): qualify point-in-time market datasets`.
 
 ### Task 4: Build the complete experiment registry
 

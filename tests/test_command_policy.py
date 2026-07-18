@@ -119,17 +119,14 @@ class TestPolicyValidation:
 
 
 class TestCapabilityMatrix:
-    def test_stub_ports_gate_the_nonce_and_alert_commands(self):
-        # Post-2c the order cancel/state adapters are real; only the alert
-        # adapter + the preflight nonce gate remain unbuilt. So nonce-requiring
-        # commands (preflight/resume/param-update) and approve (needs alerts +
-        # nonces) stay withheld, while cancel -- now built -- is available.
+    def test_alert_adapter_is_the_last_stub(self):
+        # After step 2c (cancel/state) + step 5 (nonce gate), the critical-alert
+        # adapter is the only port still unbuilt -> ONLY approve_proposal (which
+        # requires it) is withheld; every other command is available.
         ready = ALL_PORTS - KNOWN_STUB_PORTS
         avail = set(available_commands(ready))
-        assert {"approve_proposal", "preflight_command", "resume_new_trading",
-                "update_strategy_params"}.isdisjoint(avail)
-        assert {"create_proposal", "reject_proposal", "cancel_order", "cancel_all",
-                "pause_new_trading", "enable_strategy", "disable_strategy"} <= avail
+        assert "approve_proposal" not in avail
+        assert set(COMMAND_PORT_REQUIREMENTS) - {"approve_proposal"} <= avail
 
     def test_full_port_set_yields_every_command(self):
         assert set(available_commands(ALL_PORTS)) == set(COMMAND_PORT_REQUIREMENTS)

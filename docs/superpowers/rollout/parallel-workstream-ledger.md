@@ -23,10 +23,10 @@ interface.
 
 | Owner | Branch / worktree | Scope and writable files | Depends on | Status |
 |---|---|---|---|---|
-| Codex | `codex/trading-income-p1-inline` / `.worktrees/trading-income-p1-inline` | P1 Task 7: `trader/trading/liquidation_service.py`, `trader/trading/command_stack.py`, `trader/trader_service.py`, `trader/trading/command_coordinator.py`, `tests/test_liquidation_service.py`, `tests/integration/test_command_authority.py` | Foundation `a11e546` | CLAIMED |
+| Codex | `codex/p1-liquidation-saga` / `.worktrees/p1-liquidation-saga` | P1 Task 7: `trader/trading/liquidation_service.py`, `trader/trading/command_stack.py`, `trader/trader_service.py`, `trader/trading/command_coordinator.py`, `tests/test_liquidation_service.py`, `tests/integration/test_command_authority.py` | Foundation `a11e546` | IN PROGRESS — core `22a3785`; durable restart recovery and command-surface tests remain |
 | Claude | `feat/p1-task8-harness` / `.claude/worktrees/p1-task8-harness` | P1 Task 8: `config_defaults/trader.yaml`, `scripts/command_plane_drill.py`, `docs/superpowers/rollout/trading-income-operations-runbook.md`, `tests/integration/test_command_plane_activation.py` | Foundation `a11e546`; Task 7 liquidation contract before final drill integration | HANDOFF READY — `575a799` |
 | Codex worker: backend dashboard safety | `codex/dashboard-backend-safety` | `web/command_center/quotes.py`, `state.py`, `bridge.py`, `sse.py`, focused backend tests | Foundation `d2a9cc2`; must publish server quote receive timestamps for the browser lane | CLAIMED |
-| Codex worker: browser dashboard resilience | `codex/dashboard-browser-resilience` | `web/static/command_center.js`, browser/JS-focused tests | Foundation `d2a9cc2`; consumes the backend lane's quote timestamp contract | CLAIMED — wait to integrate after backend contract is reviewed |
+| Codex worker: browser dashboard resilience | `codex/dashboard-browser-resilience` | `web/static/command_center.js`, browser/JS-focused tests | Backend quote receive timestamp contract | INTEGRATED — `ff0d453`; Node stateful tests pass |
 
 ## Contracts and merge order
 
@@ -54,3 +54,5 @@ available. Integration owner: Codex.
 |---|---|
 | `41a8b7f` | Split safe pause from guarded resume; bound preflight issuance and submission to the same command/session. |
 | `a11e546` | Durable automation circuit breaker and semantic readiness. |
+| `22a3785` | Broker-evidence-only liquidation saga core wired to the existing dispatcher; focused tests pass. |
+| `ff0d453` | Dashboard SSE sequence-gap recovery, degraded polling state, and timestamp-based quote freshness. |

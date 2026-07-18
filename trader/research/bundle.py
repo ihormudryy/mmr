@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import hashlib
+import json
 import os
 import shutil
 import tempfile
@@ -60,18 +61,32 @@ class ResearchBundle:
         return self._write_staged(path, self._canonical_files(evidence))
 
     def verify(self, path: Path) -> VerifiedResearchBundle:
-        """Task 1's format reader; strict checksum/path validation follows in Task 2."""
+        """Accept only a complete, checksum-valid public export directory."""
+        if not path.is_dir() or path.is_symlink():
+            raise BundleError("bundle root must be a real directory")
         manifest_path = path / "manifest.json"
+        if manifest_path.is_symlink() or not manifest_path.is_file():
+            raise BundleError("bundle manifest is unsafe")
         try:
-            import json
-            manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+            raw_manifest = manifest_path.read_bytes()
+            manifest = json.loads(raw_manifest)
         except (OSError, ValueError) as exc:
             raise BundleError("invalid bundle manifest") from exc
-        if manifest.get("format_version") != FORMAT_VERSION:
-            raise BundleError("unsupported bundle format")
-        digest = manifest.get("manifest_digest")
-        if not isinstance(digest, str):
-            raise BundleError("invalid bundle manifest digest")
+        if canonical_json_bytes(manifest) != raw_manifest:
+            raise BundleError("manifest is not canonical JSON")
+        _validate_manifest(manifest)
+        if {child.name for child in path.iterdir()} != set(_FILE_NAMES):
+            raise BundleError("bundle has unexpected or missing files")
+        for name, checksum in manifest["files"].items():
+            child = path / name
+            if child.is_symlink() or not child.is_file():
+                raise BundleError(f"bundle file is unsafe: {name}")
+            if _sha256(child.read_bytes()) != checksum:
+                raise BundleError(f"checksum mismatch for {name}")
+        if path.stat().st_mode & 0o222 or any(
+                (path / name).stat().st_mode & 0o222 for name in _FILE_NAMES):
+            raise BundleError("bundle is not read-only")
+        digest = manifest["manifest_digest"]
         return VerifiedResearchBundle(
             manifest_digest=digest, artifact_id=manifest["artifact_id"],
             dataset_manifest_digest=manifest["dataset_manifest_digest"],
@@ -111,14 +126,19 @@ class ResearchBundle:
                 attestation.eligibility_decision_digest != decision_digest or
                 attestation.review_digest != review_digest):
             raise BundleError("attestation binding disagrees with evidence chain")
-        if attestation.dataset_manifest_digest != family.dataset_manifest_digest:
-            raise BundleError("attestation dataset binding disagrees with family")
+        if (attestation.source_digest != family.source_tree_digest or
+                attestation.config_digest != family.dependency_lock_digest or
+                attestation.dataset_manifest_digest != family.dataset_manifest_digest):
+            raise BundleError("attestation source, config, or dataset binding disagrees with family")
+        folds = self._registry.get_validation_folds(family.family_id)
+        if not folds:
+            raise BundleError("artifact family has no validation folds")
 
         return {
             "artifact": _artifact_public(artifact, self._holdout_for(artifact_id)),
             "family": _family_public(family),
             "trials": [_trial_public(t) for t in trials],
-            "folds": self._registry.get_validation_folds(family.family_id),
+            "folds": folds,
             "decision": _decision_public(decision),
             "review": _review_public(review),
             "attestation": _attestation_public(attestation),
@@ -236,6 +256,38 @@ def _chmod_read_only(root: Path) -> None:
     for child in root.iterdir():
         child.chmod(0o444)
     root.chmod(0o555)
+
+
+def _validate_manifest(manifest: Any) -> None:
+    required = {"format_version", "artifact_id", "attestation", "source_digest",
+                "config_digest", "dataset_manifest_digest", "ruleset_digest", "files",
+                "manifest_digest"}
+    if not isinstance(manifest, dict) or manifest.get("format_version") != FORMAT_VERSION:
+        raise BundleError("unsupported bundle format")
+    if set(manifest) != required or not isinstance(manifest["artifact_id"], str):
+        raise BundleError("invalid bundle manifest")
+    attestation = manifest["attestation"]
+    if not isinstance(attestation, dict) or set(attestation) != {"payload_digest", "public_key_id"}:
+        raise BundleError("invalid manifest attestation")
+    digests = ("source_digest", "config_digest", "dataset_manifest_digest",
+               "ruleset_digest", "manifest_digest")
+    if not all(isinstance(manifest[key], str) and manifest[key] for key in digests):
+        raise BundleError("invalid manifest digest")
+    if not all(isinstance(attestation[key], str) and attestation[key]
+               for key in ("payload_digest", "public_key_id")):
+        raise BundleError("invalid manifest attestation")
+    files = manifest["files"]
+    expected = set(_FILE_NAMES) - {"manifest.json"}
+    if not isinstance(files, dict) or set(files) != expected or list(files) != sorted(files):
+        raise BundleError("invalid manifest file table")
+    if not all(isinstance(value, str) and len(value) == 64 and
+               all(char in "0123456789abcdef" for char in value)
+               for value in files.values()):
+        raise BundleError("invalid manifest checksum table")
+    digest_body = dict(manifest)
+    digest = digest_body.pop("manifest_digest")
+    if _sha256(canonical_json_bytes(digest_body)) != digest:
+        raise BundleError("manifest checksum mismatch")
 
 
 def _artifact_public(artifact: Any, holdout: Mapping[str, Any]) -> dict[str, Any]:

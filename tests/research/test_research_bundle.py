@@ -52,8 +52,8 @@ def _evidence() -> EligibilityEvidence:
         regime_transitions_stable=True)
 
 
-@pytest.fixture
-def populated_db(tmp_path):
+def build_populated_db(tmp_path, *, attestation_source_digest="source-1",
+                       attestation_config_digest="config-1", validation_folds=None):
     db = DuckDBConnection.get_instance(str(tmp_path / "research.duckdb"))
     apply_research_migrations(SchemaMigrator(db))
     registry = ExperimentRegistry(db)
@@ -64,8 +64,10 @@ def populated_db(tmp_path):
         dataset_manifest_digest="dataset-1", search_space={"minutes": [15, 30]},
         cost_model={"slippage_bps": 2.0},
         validation_protocol={"holdout": "2025-01-01/2025-12-31"})
-    registry.create_family(family, created_at=T0, validation_folds=(
-        {"kind": "walk_forward", "test": "2024"}, {"kind": "holdout", "test": "2025"}))
+    if validation_folds is None:
+        validation_folds = (
+            {"kind": "walk_forward", "test": "2024"}, {"kind": "holdout", "test": "2025"})
+    registry.create_family(family, created_at=T0, validation_folds=validation_folds)
     selected = registry.start_trial(family.family_id, trial_key="selected",
                                       parameters={"minutes": 30}, started_at=T0)
     registry.finish_trial(selected, status=TRIAL_SUCCEEDED, finished_at=T0,
@@ -91,7 +93,8 @@ def populated_db(tmp_path):
     signer = AttestationSigner.generate()
     unsigned = build_attestation(
         decision=decision, review=review, public_key_id=signer.public_key_id,
-        artifact_digest=artifact_id, source_digest="source-1", config_digest="config-1",
+        artifact_digest=artifact_id, source_digest=attestation_source_digest,
+        config_digest=attestation_config_digest,
         dataset_manifest_digest="dataset-1", allowlist_digest="allowlist-1",
         training_boundary="2020/2023", validation_boundary="2024", holdout_boundary="2025",
         evidence_boundary="2020/2025", cost_assumptions={"slippage_bps": 2.0},
@@ -100,6 +103,11 @@ def populated_db(tmp_path):
         operator_approved_at=T0)
     AttestationRepository(db).record(signer.sign(unsigned))
     return db, artifact_id
+
+
+@pytest.fixture
+def populated_db(tmp_path):
+    return build_populated_db(tmp_path)
 
 
 def test_export_is_byte_identical_and_read_only(populated_db, tmp_path):
@@ -131,3 +139,39 @@ def test_export_binds_failed_trial_holdout_cost_stress_and_attestation(populated
     assert attestation["cost_assumptions"]["slippage_bps"] == 2.0
     assert manifest["attestation"]["public_key_id"].startswith("ed25519-")
     assert "private" not in canonical_text(tmp_path / "bundle")
+
+
+@pytest.mark.parametrize(("field", "value"), [
+    ("attestation_source_digest", "other-source"),
+    ("attestation_config_digest", "other-config"),
+])
+def test_export_rejects_attestation_family_digest_mismatch(tmp_path, field, value):
+    from trader.research.bundle import BundleError, ResearchBundle
+
+    db, artifact_id = build_populated_db(tmp_path, **{field: value})
+
+    with pytest.raises(BundleError, match="attestation .* binding"):
+        ResearchBundle(db).export(artifact_id, tmp_path / "bundle")
+
+
+def test_export_rejects_missing_validation_folds(tmp_path):
+    from trader.research.bundle import BundleError, ResearchBundle
+
+    db, artifact_id = build_populated_db(tmp_path, validation_folds=())
+
+    with pytest.raises(BundleError, match="validation folds"):
+        ResearchBundle(db).export(artifact_id, tmp_path / "bundle")
+
+
+def test_verify_rejects_tampered_or_extra_file(populated_db, tmp_path):
+    from trader.research.bundle import BundleError, ResearchBundle
+
+    db, artifact_id = populated_db
+    root = tmp_path / "bundle"
+    bundle = ResearchBundle(db)
+    bundle.export(artifact_id, root)
+    (root / "artifact.json").chmod(0o644)
+    (root / "artifact.json").write_text("{}", encoding="utf-8")
+
+    with pytest.raises(BundleError, match="checksum"):
+        bundle.verify(root)

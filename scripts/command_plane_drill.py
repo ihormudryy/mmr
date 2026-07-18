@@ -76,6 +76,7 @@ from trader.trading.command_coordinator import (
     apply_command_ledger_migration,
 )
 from trader.trading.order_correlation import encode_order_ref
+from trader.trading.liquidation_service import LiquidationService
 from trader.trading.proposal_command_service import ExecutableQuote, ProposalCommandService
 from trader.trading.trading_control import (
     TradingControlStore,
@@ -443,7 +444,26 @@ def build_scenarios() -> dict[str, Optional[Callable[[str], dict]]]:
 
 # Task 6/7 scenario bodies are added here as those features land; until then the
 # names are declared (above) so the report lists them as pending, not missing.
-scn_liquidation: Optional[Callable[[str], dict]] = None
+def scn_liquidation(_db_path: str) -> dict:
+    pos = SimpleNamespace(quantity=10.0, conid=CONID)
+    snapshots = [
+        SimpleNamespace(account_id=ACCOUNT, generation_id=1, positions=(pos,), working_orders=()),
+        SimpleNamespace(account_id=ACCOUNT, generation_id=2, positions=(), working_orders=()),
+    ]
+    broker = SimpleNamespace(capture=lambda _account: snapshots.pop(0) if len(snapshots) > 1 else snapshots[0])
+    calls = []
+    dispatch = SimpleNamespace(cancel=lambda *args: calls.append(("cancel", args)),
+                               reduce=lambda *args: calls.append(("reduce", args)))
+    service = LiquidationService(broker, dispatch, now=lambda: NOW)
+    first = service.start(ACCOUNT, "drill-liquidation", NOW + dt.timedelta(minutes=1))
+    if first.state == "FLAT" or not calls:
+        raise AssertionError("order acknowledgement was treated as broker-flat proof")
+    terminal = service.rescan()
+    if terminal is None or terminal.state != "FLAT":
+        raise AssertionError("fresh zero-position broker generation did not resolve liquidation")
+    return {"initial": first.state, "terminal": terminal.state, "reductions": len(calls)}
+
+
 scn_circuit_breaker: Optional[Callable[[str], dict]] = None
 scn_semantic_readiness: Optional[Callable[[str], dict]] = None
 

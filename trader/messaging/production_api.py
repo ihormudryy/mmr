@@ -83,7 +83,7 @@ import asyncio
 import dataclasses
 import datetime as dt
 from dataclasses import asdict
-from typing import Any, Dict, Optional
+from typing import TYPE_CHECKING, Any, Dict, Optional
 
 from ib_async import Contract
 from pydantic import BaseModel, ConfigDict, field_validator
@@ -121,6 +121,9 @@ from trader.trading.proposal_command_service import (
     ProposalCreateRequest,
     ProposalCreationRefused,
 )
+
+if TYPE_CHECKING:
+    from trader.trading.command_stack import CommandStack
 from trader.trading.trading_control import (
     PauseRevisionConflict,
     PauseStateUnavailable,
@@ -998,6 +1001,7 @@ def build_production_registry(
     approval_service: Optional[ApprovalCommandService] = None,
     cancel_service: Optional[CancelCommandService] = None,
     strategy_control_service: Optional[StrategyControlCommandService] = None,
+    command_stack: Optional["CommandStack"] = None,
 ) -> TypedRpcRegistry:
     """Build the typed-RPC registry a production ``trader_service`` serves.
 
@@ -1085,7 +1089,19 @@ def build_production_registry(
         PublishInstrumentResponse, _publish_instrument_handler(api),
     )
 
-    if command_coordinator is not None and proposal_service is not None and proposal_repository is not None:
+    if command_stack is not None:
+        register_command_authority(
+            registry,
+            command_stack.coordinator,
+            command_stack.proposal_service,
+            command_stack.repository,
+            account_id=getattr(trader, 'ib_account', None),
+            controls=command_stack.controls,
+            approval_service=command_stack.approval_service,
+            cancel_service=command_stack.cancel_service,
+        )
+        register_strategy_state_ingest(registry, command_stack.journal)
+    elif command_coordinator is not None and proposal_service is not None and proposal_repository is not None:
         register_command_authority(
             registry, command_coordinator, proposal_service, proposal_repository,
             account_id=getattr(trader, 'ib_account', None),

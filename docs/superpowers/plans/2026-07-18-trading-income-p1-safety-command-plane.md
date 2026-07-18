@@ -28,14 +28,15 @@
 - Create: `tests/test_command_stack.py`
 - Modify: `tests/test_production_rpc_security.py`
 
-**Interfaces:** `build_command_stack(trader, policy, now) -> CommandStack`; frozen `CommandStack` holds coordinator, ledger, reconciler, services, trading control, and one `TypedRpcRegistry`.
+**Interfaces:** `build_command_stack(trader, policy, now) -> CommandStack`; frozen `CommandStack` holds coordinator, ledger, reconciler, services, and trading control. `build_production_registry(..., command_stack=stack)` remains the transport composition point and returns the one `TypedRpcRegistry`; keeping the authenticated transport outside the domain stack avoids coupling `command_stack.py` to socket construction.
 
 - [ ] Write a failing test that constructs a fully enabled fake trader and asserts `build_command_stack` refuses any missing required adapter with `CommandStackConfigurationError(code="MISSING_<PORT>")`.
-- [ ] Write a failing integration-style test asserting the same registry resolves `snapshot_with_cursor`, `read_domain_events`, `record_state_acknowledged`, `approve_proposal`, `cancel_order`, `pause_trading`, and `resume_trading` on their correct socket roles.
+- [ ] Write a failing integration-style test asserting the same registry resolves `snapshot_with_cursor`, `read_domain_events`, `record_state_acknowledged`, `approve_proposal`, `cancel_order`, and the currently landed `set_trading_pause` on their correct socket roles. Task 5 replaces `set_trading_pause` with separately classified `pause_trading` and `resume_trading`; Task 1 must not implement that later behavior early.
 - [ ] Run `uv run --frozen --extra test pytest tests/test_command_stack.py tests/test_production_rpc_security.py -q`; confirm failure because composition and split pause/resume do not exist.
 - [ ] Implement `CommandStack` and `build_command_stack` by composing the landed repositories/services. Do not recreate proposal, ledger, preflight, approval, cancel, risk, or strategy-control logic.
 - [ ] Change `build_production_registry` to accept `command_stack: CommandStack | None` and register strategy ingest on that same registry. Remove the separately constructed command-only registry from `Trader.connect()`.
 - [ ] When policy is disabled, preserve read/feed/state-ingest capabilities and omit market-impact commands. When enabled, build the stack or abort startup; never silently downgrade.
+- [ ] Until Task 4 lands maximum-notional and immediate dispatch revalidation, reject any enabled live command stack at startup with `LIVE_GUARDS_INCOMPLETE`. Task 4 removes this temporary gate only after its live policy tests pass; paper activation is the only Task 1 runtime posture.
 - [ ] Attach `command_ledger` and `command_reconciler` to `Trader` before `_maybe_start_command_reconciliation` runs.
 - [ ] Run the focused tests and commit: `feat(command-plane): activate one production command registry`.
 

@@ -91,7 +91,8 @@ class Trader():
                  typed_command_port: int = 42102,
                  typed_feed_port: int = 42103,
                  service_hmac_key_file: str = '',
-                 unsafe_legacy_rpc: bool = False):
+                 unsafe_legacy_rpc: bool = False,
+                 command_authority: Optional[dict] = None):
         self.ib_server_address = ib_server_address
         self.ib_server_port = ib_server_port
         self.trading_runtime_ib_client_id = trading_runtime_ib_client_id
@@ -129,6 +130,7 @@ class Trader():
         self.typed_feed_port = typed_feed_port
         self.service_hmac_key_file = service_hmac_key_file
         self.unsafe_legacy_rpc: bool = unsafe_legacy_rpc
+        self.command_authority = dict(command_authority or {})
         self.zmq_pubsub_server_address = zmq_pubsub_server_address
         self.zmq_pubsub_server_port = zmq_pubsub_server_port
         self.zmq_rpc_server_address = zmq_rpc_server_address
@@ -382,6 +384,16 @@ class Trader():
 
             self.last_connect_time = dt.datetime.now()
 
+            # The production command composition root consumes the real risk
+            # gate, so initialize it before building the typed registry. The
+            # servers still start only after every adapter and executioner are
+            # constructed below.
+            self.event_store = EventStore(self.duckdb_path)
+            self.risk_gate = RiskGate(RiskLimits(), self.event_store)
+            self.order_tracker.set_event_store(self.event_store)
+            from trader.trading.trading_filter import TradingFilter
+            self.risk_gate.trading_filter = TradingFilter.load()
+
             # --- Production RPC boundary (G0 Task 4) -----------------------
             # Fail-closed guard: the dill-capable legacy RPC path (raw
             # objects, no schema validation) may run ONLY in offline
@@ -389,13 +401,18 @@ class Trader():
             # ValueError before anything below binds a single socket if
             # some other code path ever tried to combine unsafe_legacy_rpc
             # with a live/production posture.
-            from trader.messaging.production_api import build_production_registry, validate_rpc_mode
+            from trader.messaging.production_api import (
+                build_production_registry,
+                register_strategy_state_ingest,
+                validate_rpc_mode,
+            )
             from trader.messaging.typed_rpc import (
                 HmacServiceAuthenticator,
-                TypedRpcRegistry,
                 TypedRpcServer,
                 load_service_hmac_key,
             )
+            from trader.trading.command_policy import load_and_validate_command_policy
+            from trader.trading.command_stack import build_command_stack
 
             validate_rpc_mode(self.simulation, self.unsafe_legacy_rpc)
 
@@ -408,12 +425,25 @@ class Trader():
             hmac_key = load_service_hmac_key(self.service_hmac_key_file)
             self.typed_authenticator = HmacServiceAuthenticator(hmac_key)
 
+            self.command_authority_policy = load_and_validate_command_policy(
+                self.command_authority,
+                trader_account_id=self.ib_account,
+                paper_trading=self.paper_trading,
+            )
+            command_stack = build_command_stack(
+                self,
+                self.command_authority_policy,
+                now=lambda: dt.datetime.now(dt.timezone.utc),
+            )
             production_registry = build_production_registry(
                 self,
                 self.typed_authenticator,
                 snapshot_service=self.snapshot_service,
                 feed_service=self.feed_service,
+                command_stack=command_stack,
             )
+            if command_stack is None:
+                register_strategy_state_ingest(production_registry, self.domain_journal)
             self.typed_query_server = TypedRpcServer(
                 'query', production_registry, self.typed_authenticator,
                 address=self.typed_bind_address,
@@ -429,20 +459,12 @@ class Trader():
             # the M1-R dashboard bridge long-polls it; an empty registry made
             # every read_domain_events call fail METHOD_NOT_ALLOWED, so the
             # bridge could never tail past the fenced baseline (dashboard stuck
-            # resyncing). The command server exposes ONLY
-            # record_state_acknowledged (strategy_service's internal state
-            # announcement/ack backstop -- no market impact, no ledger row;
-            # without it strategy entities never reach the journal and the
-            # command center's Strategies panel stays empty forever). Every
-            # user-facing command (enable_strategy, approve_proposal, ...)
-            # stays unregistered until the command authority + live-command
-            # preflight are wired (integration gate); commands are disabled
-            # by default and the gateway isn't built then.
-            from trader.messaging.production_api import register_strategy_state_ingest
-            command_registry = TypedRpcRegistry()
-            register_strategy_state_ingest(command_registry, self.domain_journal)
+            # resyncing). The command server uses this SAME registry. With
+            # authority disabled it exposes only record_state_acknowledged;
+            # with authority enabled the fail-closed command stack registers
+            # the production-ready command surface as well.
             self.typed_command_server = TypedRpcServer(
-                'command', command_registry, self.typed_authenticator,
+                'command', production_registry, self.typed_authenticator,
                 address=self.typed_bind_address,
                 port=self.typed_command_port,
             )
@@ -485,19 +507,7 @@ class Trader():
                 timeout=6,
             )
 
-            # initialize event store and risk gate
-            self.event_store = EventStore(self.duckdb_path)
-            self.risk_gate = RiskGate(RiskLimits(), self.event_store)
-
-            # The order-lifecycle tracker itself is built in __init__ (so it
-            # exists before the first connected_event runs); wire its event store
-            # now that it's available.
-            self.order_tracker.set_event_store(self.event_store)
             self.broker_ingest.start()
-
-            # load trading filters (allowlist/denylist)
-            from trader.trading.trading_filter import TradingFilter
-            self.risk_gate.trading_filter = TradingFilter.load()
 
             # fire up the executioner
             self.executioner = TradeExecutioner()

@@ -77,6 +77,9 @@ from trader.trading.command_coordinator import (
 )
 from trader.trading.order_correlation import encode_order_ref
 from trader.trading.liquidation_service import LiquidationService
+from trader.data.circuit_breaker_store import CircuitBreakerStore, apply_circuit_breaker_migration
+from trader.trading.circuit_breaker import BreakerSignal, CircuitBreaker
+from trader.trading.semantic_readiness import SemanticReadiness
 from trader.trading.proposal_command_service import ExecutableQuote, ProposalCommandService
 from trader.trading.trading_control import (
     TradingControlStore,
@@ -464,8 +467,29 @@ def scn_liquidation(_db_path: str) -> dict:
     return {"initial": first.state, "terminal": terminal.state, "reductions": len(calls)}
 
 
-scn_circuit_breaker: Optional[Callable[[str], dict]] = None
-scn_semantic_readiness: Optional[Callable[[str], dict]] = None
+def scn_circuit_breaker(db_path: str) -> dict:
+    db = DuckDBConnection.get_instance(db_path + ".breaker")
+    migrator = SchemaMigrator(db); journal = DomainJournal(db); journal.migrate(migrator)
+    apply_circuit_breaker_migration(migrator)
+    store = CircuitBreakerStore(journal, ACCOUNT); store.seed(NOW)
+    breaker = CircuitBreaker(store, now=lambda: NOW, reset_ready=lambda: True,
+                             reconciliation_complete=lambda: True, session_key=lambda value: value.date().isoformat())
+    breaker.record(BreakerSignal("LIQUIDATION_FAILED", NOW, key="drill"))
+    if CircuitBreakerStore(journal, ACCOUNT).get().state != "TRIPPED":
+        raise AssertionError("critical liquidation signal did not persistently trip breaker")
+    return {"state": "TRIPPED"}
+
+
+def scn_semantic_readiness(_db_path: str) -> dict:
+    checks = dict(ib_connected=True, account_pinned=True, broker_current=True,
+                  journal_writable=True, reconciliation_safe=True, control_readable=True,
+                  breaker_clear=False, command_stack_active=True, quotes_ready=True)
+    readiness = SemanticReadiness(**{name: (lambda value=value: value) for name, value in checks.items()},
+                                  session_open=lambda _now: True)
+    report = readiness.evaluate(NOW)
+    if report.ready or "breaker_clear" not in report.to_payload()["failed"]:
+        raise AssertionError("semantic readiness allowed a tripped breaker")
+    return {"failed": report.to_payload()["failed"]}
 
 
 # ---------------------------------------------------------------------------

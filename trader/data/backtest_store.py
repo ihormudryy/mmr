@@ -19,6 +19,7 @@ from typing import Any, Dict, List, Optional
 import datetime as dt
 import hashlib
 import json
+import math
 import os
 
 from trader.data.duckdb_store import DuckDBConnection
@@ -110,6 +111,48 @@ def compute_strategy_hash(strategy_path: str) -> str:
             return hashlib.sha256(f.read()).hexdigest()
     except (OSError, FileNotFoundError):
         return ''
+
+
+# --- Research-registry legacy-import adapters ---------------------------- #
+# Pure mappings from a historical ``BacktestRecord`` into the terms the offline
+# research ``ExperimentRegistry`` records. Legacy runs predate the qualified
+# dataset/holdout evidence chain, so they are imported as ``LEGACY_UNQUALIFIED``
+# families (recorded for the selection denominator, unable to earn eligibility).
+# These live next to ``BacktestRecord`` because they define how *that* shape maps
+# into research terms; the registry orchestrates the transactional writes.
+
+def legacy_import_group_key(record: 'BacktestRecord') -> tuple:
+    """Runs of the same strategy file + class belong to one legacy family."""
+    return (record.strategy_path, record.class_name)
+
+
+def legacy_cost_model(record: 'BacktestRecord') -> dict:
+    """The execution assumptions a legacy run was scored under."""
+    return {
+        'fill_policy': record.fill_policy,
+        'slippage_bps': record.slippage_bps,
+        'commission_per_share': record.commission_per_share,
+        'initial_capital': record.initial_capital,
+    }
+
+
+def legacy_result_metrics(record: 'BacktestRecord') -> dict:
+    """A legacy run's summary metrics, dropping any non-finite value (a NaN/Inf
+    would fail the canonical-digest encoding and must never enter the chain)."""
+    candidate = {
+        'total_return': record.total_return,
+        'sharpe_ratio': record.sharpe_ratio,
+        'sortino_ratio': record.sortino_ratio,
+        'calmar_ratio': record.calmar_ratio,
+        'max_drawdown': record.max_drawdown,
+        'win_rate': record.win_rate,
+        'profit_factor': record.profit_factor,
+        'expectancy_bps': record.expectancy_bps,
+        'total_trades': record.total_trades,
+        'final_equity': record.final_equity,
+    }
+    return {k: v for k, v in candidate.items()
+            if not (isinstance(v, float) and not math.isfinite(v))}
 
 
 class BacktestStore:

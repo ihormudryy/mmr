@@ -815,3 +815,48 @@ class Backtester:
         # storage, so we stash on the result object.
         result.applied_params = applied_params
         return result
+
+
+def _iso(ts: Any) -> Any:
+    """Deterministic ISO-8601 rendering of a timestamp for the trace digest."""
+    if isinstance(ts, dt.datetime):
+        return ts.isoformat()
+    if ts is None:
+        return None
+    return str(ts)
+
+
+def trace_signature(result: BacktestResult) -> str:
+    """Canonical SHA-256 over the ordered signal + trade trace of a backtest.
+
+    Pure, ADDITIVE adapter (it reads a ``BacktestResult`` and computes nothing
+    of its own). Two runs with identical inputs -- same bars, strategy, config --
+    produce the same ordered ``(timestamp, conid, action, quantity, price)``
+    tuples and therefore the SAME signature: this is the "deterministic replay
+    produces identical signals and orders" check (design §8.3). Any differing
+    signal or trade changes the digest.
+
+    Uses ``hashlib`` + a compact sorted-key JSON encoding directly (no operational
+    imports), so the simulation package stays free of a research dependency.
+    """
+    import hashlib
+    import json
+
+    payload = {
+        "signals": [
+            [_iso(getattr(s, "timestamp", None)), int(getattr(s, "conid", 0)),
+             str(getattr(s, "action", "")),
+             float(getattr(s, "signal_probability", 0.0)),
+             float(getattr(s, "signal_risk", 0.0))]
+            for s in result.signals
+        ],
+        "trades": [
+            [_iso(getattr(t, "timestamp", None)), int(getattr(t, "conid", 0)),
+             str(getattr(t, "action", "")), float(getattr(t, "quantity", 0.0)),
+             float(getattr(t, "price", 0.0)), float(getattr(t, "commission", 0.0))]
+            for t in result.trades
+        ],
+    }
+    encoded = json.dumps(payload, sort_keys=True, separators=(",", ":"),
+                         ensure_ascii=False).encode("utf-8")
+    return hashlib.sha256(b"backtest_trace\n" + encoded).hexdigest()

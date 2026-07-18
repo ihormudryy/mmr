@@ -37,6 +37,11 @@ class StorageConfig:
     # against DuckDB 1.4.4). Owned exclusively by trader_service -- no other
     # process should open this file. See trader/data/domain_journal.py.
     journal_duckdb_path: str = '~/.local/share/mmr/data/mmr_journal.duckdb'
+    # Offline research evidence store (P2). NEVER opened by trader_service or
+    # strategy_service -- the research CLI/process owns it exclusively, and it
+    # is a distinct file so research writes can never contend with the trader's
+    # authoritative operational / journal / history cross-process locks.
+    research_duckdb_path: str = '~/.local/share/mmr/data/mmr_research.duckdb'
     universe_library: str = 'Universes'
 
 
@@ -134,6 +139,7 @@ class MMRConfig:
             'duckdb_path': ('storage', 'duckdb_path'),
             'history_duckdb_path': ('storage', 'history_duckdb_path'),
             'journal_duckdb_path': ('storage', 'journal_duckdb_path'),
+            'research_duckdb_path': ('storage', 'research_duckdb_path'),
             'universe_library': ('storage', 'universe_library'),
             # ZMQ
             'zmq_rpc_server_address': ('zmq', 'rpc_server_address'),
@@ -259,13 +265,26 @@ class MMRConfig:
 
         # Resolve duckdb paths: expand ~ first, then resolve relative paths against project root
         from trader.container import mmr_root
-        for attr in ('duckdb_path', 'history_duckdb_path', 'journal_duckdb_path'):
+        for attr in ('duckdb_path', 'history_duckdb_path', 'journal_duckdb_path',
+                     'research_duckdb_path'):
             val = getattr(config.storage, attr)
             if val:
                 val = os.path.expanduser(val)
                 if not os.path.isabs(val):
                     val = str(mmr_root() / val)
                 setattr(config.storage, attr, val)
+
+        # The research DB is a SEPARATE offline store; sharing a file with an
+        # operational / journal / history DB would let research writes contend
+        # with the trader's authoritative cross-process locks. Fail closed.
+        research = config.storage.research_duckdb_path
+        for attr in ('duckdb_path', 'history_duckdb_path', 'journal_duckdb_path'):
+            if research and research == getattr(config.storage, attr):
+                raise ValueError(
+                    f"storage.research_duckdb_path must differ from storage.{attr} "
+                    f"(both resolve to {research!r}); the research database must "
+                    f"never share a file with the trader's operational, journal, "
+                    f"or history stores")
 
         return config
 

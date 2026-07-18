@@ -50,12 +50,12 @@
 
 **Research migrations 1-2:** `dataset_manifests`, `dataset_files`, `dataset_quality_findings`, `dataset_corrections`; primary key is SHA-256 manifest digest and sealed rows are append-only.
 
-- [ ] Write golden canonicalization tests for UTC timestamps, decimals, tuple ordering, mapping-key sorting, Unicode, and rejection of NaN/Infinity/naive datetimes.
-- [ ] Write manifest tests covering vendor/retrieval, calendar/package version, timestamp convention, adjustments, boundaries, checksums, quality summary, spread source, and correction lineage.
-- [ ] Test seal idempotency and digest conflict; UPDATE/DELETE APIs must not exist for sealed records.
-- [ ] Implement `canonical_json_bytes(value)`, `sha256_digest(prefix, value)`, frozen `DatasetManifest`, `QualityFinding`, and `DatasetManifestRepository.seal/get`.
-- [ ] A required finding with `passed=False` makes `research_eligible=False`; no caller flag may override it.
-- [ ] Run `uv run --frozen --extra test pytest tests/research/test_dataset_manifest.py -q` and commit `feat(research): add immutable dataset manifests`.
+- [x] Write golden canonicalization tests for UTC timestamps, decimals, tuple ordering, mapping-key sorting, Unicode, and rejection of NaN/Infinity/naive datetimes.
+- [x] Write manifest tests covering vendor/retrieval, calendar/package version, timestamp convention, adjustments, boundaries, checksums, quality summary, spread source, and correction lineage.
+- [x] Test seal idempotency and digest conflict; UPDATE/DELETE APIs must not exist for sealed records.
+- [x] Implement `canonical_json_bytes(value)`, `sha256_digest(prefix, value)`, frozen `DatasetManifest`, `QualityFinding`, and `DatasetManifestRepository.seal/get`.
+- [x] A required finding with `passed=False` makes `research_eligible=False`; no caller flag may override it.
+- [x] Run `uv run --frozen --extra test pytest tests/research/test_dataset_manifest.py -q` and commit `feat(research): add immutable dataset manifests`.
 
 ### Task 3: Freeze point-in-time universes and qualify bars
 
@@ -68,12 +68,12 @@
 
 **Interfaces:** `PointInTimeMembership(conid, effective_from, effective_to, symbol, delisted_at, source)`; `DatasetQualifier.qualify(request) -> DatasetQualification`.
 
-- [ ] Test membership as-of boundaries, ticker changes, delisted names, overlapping intervals, missing provenance, and frozen membership digest.
-- [ ] Test XNYS regular-session completeness, early closes, DST, duplicates, gaps, timestamps outside session, corrupt/non-finite OHLCV, split discontinuities, and verified corrections.
-- [ ] Keep genuine gaps/crashes/halts; only a correction with original value, replacement, source, reason, and reviewer may alter data.
-- [ ] Add a read adapter from existing `UniverseAccessor`; do not mutate legacy current-universe behavior.
-- [ ] Implement deterministic reports and fail the dataset rather than silently dropping a failed instrument/bar.
-- [ ] Run focused tests and commit `feat(research): qualify point-in-time market datasets`.
+- [x] Test membership as-of boundaries, ticker changes, delisted names, overlapping intervals, missing provenance, and frozen membership digest.
+- [x] Test XNYS regular-session completeness, early closes, DST, duplicates, gaps, timestamps outside session, corrupt/non-finite OHLCV, split discontinuities, and verified corrections.
+- [x] Keep genuine gaps/crashes/halts; only a correction with original value, replacement, source, reason, and reviewer may alter data.
+- [x] Add a read adapter from existing `UniverseAccessor`; do not mutate legacy current-universe behavior.
+- [x] Implement deterministic reports and fail the dataset rather than silently dropping a failed instrument/bar.
+- [x] Run focused tests and commit `feat(research): qualify point-in-time market datasets`.
 
 ### Task 4: Build the complete experiment registry
 
@@ -88,13 +88,13 @@
 
 **Research migrations 3-6:** `experiment_families`, `experiment_trials`, `validation_folds`, `trial_metrics`, `strategy_artifacts`, `holdout_access_log`.
 
-- [ ] Test family creation with commit, source-tree digest, dependency-lock digest, container digest, manifest digest, declared search space, cost model, and validation protocol.
-- [ ] Test that `start_trial` inserts before execution and `finish_trial` records `SUCCEEDED`, `FAILED`, `INVALID`, or `TIMED_OUT` with traceback digest/safe summary.
-- [ ] Test that no trial may be deleted and archived trials remain in `selection_trial_count`.
-- [ ] Test a holdout token can be opened once per artifact version; any second open rejects and a failed holdout sets artifact state `RETIRED`.
-- [ ] Implement `ExperimentRegistry` transactionally. Add an adapter that imports existing `BacktestStore` results as `LEGACY_UNQUALIFIED`; they cannot earn eligibility.
-- [ ] Add CLI commands `mmr research family create`, `trial run`, `family show`, and `artifact show --json` with parameterized queries only.
-- [ ] Run focused tests plus `tests/test_backtest_store.py`; commit `feat(research): record complete experiment families`.
+- [x] Test family creation with commit, source-tree digest, dependency-lock digest, container digest, manifest digest, declared search space, cost model, and validation protocol.
+- [x] Test that `start_trial` inserts before execution and `finish_trial` records `SUCCEEDED`, `FAILED`, `INVALID`, or `TIMED_OUT` with traceback digest/safe summary.
+- [x] Test that no trial may be deleted and archived trials remain in `selection_trial_count`.
+- [x] Test a holdout token can be opened once per artifact version; any second open rejects and a failed holdout sets artifact state `RETIRED`.
+- [x] Implement `ExperimentRegistry` transactionally. Add an adapter that imports existing `BacktestStore` results as `LEGACY_UNQUALIFIED`; they cannot earn eligibility.
+- [x] Add CLI commands `mmr research family create`, `trial run`, `family show`, and `artifact show --json` with parameterized queries only.
+- [x] Run focused tests plus `tests/test_backtest_store.py`; commit `feat(research): record complete experiment families`.
 
 ### Task 5: Implement walk-forward, cost, robustness, and selection-bias analysis
 
@@ -108,13 +108,13 @@
 
 **Interfaces:** `ValidationPlan(training, folds, embargo, holdout)`; `ValidationResult` includes baseline/1.5x/2x costs, bootstrap interval, deflated/selection-adjusted Sharpe, fold/regime/month/instrument results, benchmark, capacity, and deterministic replay.
 
-- [ ] Test chronological non-overlap and embargo with property-generated date ranges; reject random shuffles and fold leakage.
-- [ ] Add deterministic fixtures for commissions/spread/slippage at 1x, 1.5x, 2x and prove higher costs cannot improve net P&L.
-- [ ] Test parameter neighborhoods, all-trial selection denominator, bootstrap lower bound, deflated Sharpe inputs, profit factor, concentration, and remove-outlier diagnostics.
-- [ ] Add exposure/volatility-matched SPY benchmark metrics: drawdown, return, downside deviation, recovery, time in market.
-- [ ] Freeze regime definitions before trial results and require adequate sample counts; insufficient buckets are explicit, not assumed positive.
-- [ ] Add a pure adapter around the existing backtester so identical inputs produce identical signal/order traces; do not fork execution math.
-- [ ] Run focused tests and commit `feat(research): add leakage-safe validation protocol`.
+- [x] Test chronological non-overlap and embargo with property-generated date ranges; reject random shuffles and fold leakage.
+- [x] Add deterministic fixtures for commissions/spread/slippage at 1x, 1.5x, 2x and prove higher costs cannot improve net P&L.
+- [x] Test parameter neighborhoods, all-trial selection denominator, bootstrap lower bound, deflated Sharpe inputs, profit factor, concentration, and remove-outlier diagnostics.
+- [x] Add exposure/volatility-matched SPY benchmark metrics: drawdown, return, downside deviation, recovery, time in market.
+- [x] Freeze regime definitions before trial results and require adequate sample counts; insufficient buckets are explicit, not assumed positive.
+- [x] Add a pure adapter around the existing backtester so identical inputs produce identical signal/order traces; do not fork execution math.
+- [x] Run focused tests and commit `feat(research): add leakage-safe validation protocol`.
 
 ### Task 6: Encode the quantitative eligibility ruleset
 
@@ -125,12 +125,12 @@
 
 **Interfaces:** `EligibilityDecision(state, ruleset_digest, passed, failures, evidence_refs)`; every rule returns stable code, observed value, threshold, and evidence reference.
 
-- [ ] Add one test per approved gate: 200 round trips; eight instruments; expectancy at 1x/1.5x/2x; 95% selection-adjusted confidence; Sharpe lower bound; profit factor 1.20; 60% positive folds; 35% month/40% instrument concentration; scaled 3% drawdown; neighborhood robustness; liquidity/capacity; deterministic replay.
-- [ ] Add benchmark/regime tests: benchmark-relative drawdown, accompanying exposure metrics, 70% eligible regimes, per-regime loss tolerance, transition stability.
-- [ ] Add boundary and missing-evidence tests. All missing or non-finite critical observations fail closed.
-- [ ] Implement immutable versioned ruleset `paper-v1`; compute digest from exact rule configuration and code/source identity.
-- [ ] Persist the complete decision, including every passing and failing rule. No qualitative review may change a quantitative failure.
-- [ ] Run focused tests and commit `feat(research): enforce paper eligibility ruleset v1`.
+- [x] Add one test per approved gate: 200 round trips; eight instruments; expectancy at 1x/1.5x/2x; 95% selection-adjusted confidence; Sharpe lower bound; profit factor 1.20; 60% positive folds; 35% month/40% instrument concentration; scaled 3% drawdown; neighborhood robustness; liquidity/capacity; deterministic replay.
+- [x] Add benchmark/regime tests: benchmark-relative drawdown, accompanying exposure metrics, 70% eligible regimes, per-regime loss tolerance, transition stability.
+- [x] Add boundary and missing-evidence tests. All missing or non-finite critical observations fail closed.
+- [x] Implement immutable versioned ruleset `paper-v1`; compute digest from exact rule configuration and code/source identity.
+- [x] Persist the complete decision, including every passing and failing rule. No qualitative review may change a quantitative failure.
+- [x] Run focused tests and commit `feat(research): enforce paper eligibility ruleset v1`.
 
 ### Task 7: Add qualitative review and Ed25519 attestations
 
@@ -146,12 +146,12 @@
 
 **Research migrations 7-8:** append-only `operator_reviews`, `eligibility_attestations`, and `attestation_revocations`.
 
-- [ ] Test the mandatory review fields: rationale, cost survival, failure regimes, data limitations, sensitivity, dependencies, capacity/decay, episode dominance, holdout-once confirmation.
-- [ ] Test sign/verify, tampering of every authority field, wrong key, expiry, revoked attestation, changed artifact/allowlist/ruleset/mode/allocation, deterministic signature payload, and public-key rotation identifier.
-- [ ] Test key permissions and hygiene: signer accepts a path/PKCS8 input only, refuses group/world-readable files, never prints key bytes, and generated bundles contain only public key IDs.
-- [ ] Implement offline `AttestationSigner` and production-safe `AttestationVerifier`. Store signature as base64url; digest the unsigned canonical payload.
-- [ ] Add `mmr research review submit`, `attest paper --key-file`, and `attest verify --public-key-file`. Require interactive confirmation unless `--review-id` and `--yes` are both present in a non-production offline context.
-- [ ] Run focused tests and commit `feat(research): sign versioned eligibility attestations`.
+- [x] Test the mandatory review fields: rationale, cost survival, failure regimes, data limitations, sensitivity, dependencies, capacity/decay, episode dominance, holdout-once confirmation.
+- [x] Test sign/verify, tampering of every authority field, wrong key, expiry, revoked attestation, changed artifact/allowlist/ruleset/mode/allocation, deterministic signature payload, and public-key rotation identifier.
+- [x] Test key permissions and hygiene: signer accepts a path/PKCS8 input only, refuses group/world-readable files, never prints key bytes, and generated bundles contain only public key IDs.
+- [x] Implement offline `AttestationSigner` and production-safe `AttestationVerifier`. Store signature as base64url; digest the unsigned canonical payload.
+- [x] Add `mmr research review submit`, `attest paper --key-file`, and `attest verify --public-key-file`. Require interactive confirmation unless `--review-id` and `--yes` are both present in a non-production offline context.
+- [x] Run focused tests and commit `feat(research): sign versioned eligibility attestations`.
 
 ### Task 8: Export a read-only artifact bundle and prove reproduction
 

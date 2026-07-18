@@ -101,6 +101,21 @@ strategy_typed_query_port: 42105
 # transport above. Refused at startup otherwise (G0 Task 4).
 unsafe_legacy_rpc: false
 
+# Command-authority policy (trader-owned; design C2 in
+# docs/superpowers/specs/2026-07-18-command-plane-activation-design.md). The
+# dashboard's DASHBOARD_COMMANDS_ENABLED flag is only a UI kill switch --
+# risk-increasing commands (approve / create / cancel / strategy-control) are
+# gated by THIS policy, validated fail-closed at startup (a live authority
+# without a matching account or a notional ceiling refuses to start). Disabled
+# by default: the trader stays read-only + strategy-state-ack until the
+# command-plane integration gate is complete.
+command_authority:
+  enabled: false          # master switch: build/register the authority at all
+  live_enabled: false     # allow risk-increasing commands on a LIVE account
+  live_account_id: ''      # must equal the trader's IB account when live_enabled
+  max_order_notional:      # hard per-order notional ceiling (required when live_enabled)
+  max_drift_bps: 50        # server-side price-drift ceiling (bps)
+
 # Massive.com (formerly Polygon.io)
 massive_api_key: ''
 massive_feed: stocks

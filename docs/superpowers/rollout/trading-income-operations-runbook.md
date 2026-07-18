@@ -61,8 +61,8 @@ python3 scripts/command_plane_drill.py --scenarios happy_path,restart_unresolved
 
 Exit code is non-zero if any runnable scenario fails, so it is a CI/pre-activation
 gate. The JSON report carries `commit_digest` + `config_digest` — staple it to the
-release record. Scenarios whose feature has not landed are reported `pending`
-(never silently skipped), so the report never reads "all covered" prematurely.
+release record. A release is blocked if any required scenario fails or is
+reported `pending`; scenarios are never silently skipped.
 
 The pytest wrapper (also part of the gate):
 
@@ -94,18 +94,12 @@ docker compose config --quiet                                     # compose vali
 | `ambiguous_submit_reconciles` | a lost ack → OUTCOME_UNKNOWN (never false SUBMITTED); reconciler resolves from broker truth with no re-send |
 | `restart_unresolved` | crash between claim and ack → rescan_on_startup + reconcile after restart; exactly one order, no resubmission |
 
-## What is NOT yet gated (pending)
+| `liquidation_flat_only_from_broker_truth` | FLAT needs a fresh broker snapshot with zero positions and working orders; never an RPC ack |
+| `circuit_breaker_trips_and_persists` | a critical liquidation failure trips and persists the breaker |
+| `semantic_readiness_gates_activation` | a tripped breaker makes automation semantically unready |
 
-These surface as `pending` in the drill report until their features land:
-
-- `liquidation_flat_only_from_broker_truth` — **Task 7** (broker-verified
-  liquidation saga). FLAT must require a fresh promoted broker snapshot with zero
-  positions and no working orders — never an RPC ack.
-- `circuit_breaker_trips_and_persists` — **Task 6** (durable automation breaker).
-- `semantic_readiness_gates_activation` — **Task 6** (semantic readiness).
-
-Automation stays prohibited until these land, their drills go green, and the
-manual IB-paper soak is signed off.
+Automation stays prohibited until all drills are green and the manual IB-paper
+soak is signed off.
 
 ## Rollback / kill switch
 

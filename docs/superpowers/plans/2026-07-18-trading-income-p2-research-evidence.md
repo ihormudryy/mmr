@@ -108,13 +108,13 @@
 
 **Interfaces:** `ValidationPlan(training, folds, embargo, holdout)`; `ValidationResult` includes baseline/1.5x/2x costs, bootstrap interval, deflated/selection-adjusted Sharpe, fold/regime/month/instrument results, benchmark, capacity, and deterministic replay.
 
-- [ ] Test chronological non-overlap and embargo with property-generated date ranges; reject random shuffles and fold leakage.
-- [ ] Add deterministic fixtures for commissions/spread/slippage at 1x, 1.5x, 2x and prove higher costs cannot improve net P&L.
-- [ ] Test parameter neighborhoods, all-trial selection denominator, bootstrap lower bound, deflated Sharpe inputs, profit factor, concentration, and remove-outlier diagnostics.
-- [ ] Add exposure/volatility-matched SPY benchmark metrics: drawdown, return, downside deviation, recovery, time in market.
-- [ ] Freeze regime definitions before trial results and require adequate sample counts; insufficient buckets are explicit, not assumed positive.
-- [ ] Add a pure adapter around the existing backtester so identical inputs produce identical signal/order traces; do not fork execution math.
-- [ ] Run focused tests and commit `feat(research): add leakage-safe validation protocol`.
+- [x] Test chronological non-overlap and embargo with property-generated date ranges; reject random shuffles and fold leakage.
+- [x] Add deterministic fixtures for commissions/spread/slippage at 1x, 1.5x, 2x and prove higher costs cannot improve net P&L.
+- [x] Test parameter neighborhoods, all-trial selection denominator, bootstrap lower bound, deflated Sharpe inputs, profit factor, concentration, and remove-outlier diagnostics.
+- [x] Add exposure/volatility-matched SPY benchmark metrics: drawdown, return, downside deviation, recovery, time in market.
+- [x] Freeze regime definitions before trial results and require adequate sample counts; insufficient buckets are explicit, not assumed positive.
+- [x] Add a pure adapter around the existing backtester so identical inputs produce identical signal/order traces; do not fork execution math.
+- [x] Run focused tests and commit `feat(research): add leakage-safe validation protocol`.
 
 ### Task 6: Encode the quantitative eligibility ruleset
 

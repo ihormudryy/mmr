@@ -125,12 +125,12 @@
 
 **Interfaces:** `EligibilityDecision(state, ruleset_digest, passed, failures, evidence_refs)`; every rule returns stable code, observed value, threshold, and evidence reference.
 
-- [ ] Add one test per approved gate: 200 round trips; eight instruments; expectancy at 1x/1.5x/2x; 95% selection-adjusted confidence; Sharpe lower bound; profit factor 1.20; 60% positive folds; 35% month/40% instrument concentration; scaled 3% drawdown; neighborhood robustness; liquidity/capacity; deterministic replay.
-- [ ] Add benchmark/regime tests: benchmark-relative drawdown, accompanying exposure metrics, 70% eligible regimes, per-regime loss tolerance, transition stability.
-- [ ] Add boundary and missing-evidence tests. All missing or non-finite critical observations fail closed.
-- [ ] Implement immutable versioned ruleset `paper-v1`; compute digest from exact rule configuration and code/source identity.
-- [ ] Persist the complete decision, including every passing and failing rule. No qualitative review may change a quantitative failure.
-- [ ] Run focused tests and commit `feat(research): enforce paper eligibility ruleset v1`.
+- [x] Add one test per approved gate: 200 round trips; eight instruments; expectancy at 1x/1.5x/2x; 95% selection-adjusted confidence; Sharpe lower bound; profit factor 1.20; 60% positive folds; 35% month/40% instrument concentration; scaled 3% drawdown; neighborhood robustness; liquidity/capacity; deterministic replay.
+- [x] Add benchmark/regime tests: benchmark-relative drawdown, accompanying exposure metrics, 70% eligible regimes, per-regime loss tolerance, transition stability.
+- [x] Add boundary and missing-evidence tests. All missing or non-finite critical observations fail closed.
+- [x] Implement immutable versioned ruleset `paper-v1`; compute digest from exact rule configuration and code/source identity.
+- [x] Persist the complete decision, including every passing and failing rule. No qualitative review may change a quantitative failure.
+- [x] Run focused tests and commit `feat(research): enforce paper eligibility ruleset v1`.
 
 ### Task 7: Add qualitative review and Ed25519 attestations
 

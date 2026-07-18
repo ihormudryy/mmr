@@ -90,6 +90,9 @@ class CommandStack:
     proposal_service: ProposalCommandService
     approval_service: ApprovalCommandService
     cancel_service: CancelCommandService
+    account_mode: str
+    resume_ready: Callable[[], bool]
+    reconciliation_complete: Callable[[str], bool]
 
 
 _REQUIRED_TRADER_PORTS = (
@@ -186,6 +189,14 @@ def build_command_stack(
         account_mode=account_mode,
         ready=lambda: _broker_ready(trader),
     )
+
+    def resume_ready() -> bool:
+        """Require current, fenced broker evidence immediately before resume."""
+        try:
+            broker_snapshot.capture(trader.ib_account)
+        except Exception:
+            return False
+        return True
     margin = TraderBrokerAuthority(
         trader, run_coro=run_coro, resolve_contract=resolve_contract,
     )
@@ -236,6 +247,11 @@ def build_command_stack(
         now=now,
         reconciler=reconciler,
     )
+
+    def reconciliation_complete(command_id: str) -> bool:
+        return not ledger.unresolved_for_account(
+            trader.ib_account, exclude_command_id=command_id,
+        )
     proposal_service = ProposalCommandService(
         repository=repository,
         journal=journal,
@@ -286,6 +302,9 @@ def build_command_stack(
         proposal_service=proposal_service,
         approval_service=approval_service,
         cancel_service=cancel_service,
+        account_mode=account_mode,
+        resume_ready=resume_ready,
+        reconciliation_complete=reconciliation_complete,
     )
     trader.command_ledger = ledger
     trader.command_reconciler = reconciler

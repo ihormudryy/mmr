@@ -190,7 +190,9 @@ class _Stack:
         self.registry = TypedRpcRegistry()
         register_command_authority(
             self.registry, self.coordinator, self.proposal_service, self.repo,
-            account_id=ACCOUNT, controls=self.controls, approval_service=self.approval_service)
+            account_id=ACCOUNT, account_mode="paper", controls=self.controls,
+            resume_ready=lambda: True, reconciliation_complete=lambda command_id: True,
+            approval_service=self.approval_service)
 
     def now(self):
         return NOW

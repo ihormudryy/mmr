@@ -100,10 +100,10 @@ anticipated when it was written:
    ``expected_version``, and there is NO ``preflight_nonce`` field at all
    (the coordinator registers this trio ``requires_preflight=False,
    saga=True`` -- they don't use the preflight-nonce mechanism).
-   ``SetTradingPauseRequest`` IS ``extra="forbid"`` with fields
-   ``{command_id, paused, expected_version, reason, preflight_nonce}`` -- no
-   ``account_id`` (the coordinator pins its own configured account, same
-   as approve/cancel) and no ``session_fingerprint``. Per this task's
+   Trading control is deliberately split: ``PauseTradingRequest`` accepts
+   only ``{command_id, reason}``, while ``ResumeTradingRequest`` accepts
+   ``{command_id, expected_control_revision, reason, preflight_nonce}``.
+   Neither accepts account or mode; trader_service pins both. Per this task's
    explicit instruction not to repeat the ``session_fingerprint`` drift
    already known on approve/cancel, none of these four forwarded bodies
    carries it. ``preflight_nonce`` is still accepted on the WEB-FACING
@@ -112,7 +112,7 @@ anticipated when it was written:
    signals fire) purely as this layer's own live-ceremony gate signal
    (``_reject_live_targeted_without_flag``, reused from drift item 4 above);
    it is simply never forwarded past this layer since the real models
-   would 422 on it. Disable and pause=true are risk-REDUCING and immediate
+   would 422 on it. Disable and pause are risk-REDUCING and immediate
    in both modes (mirrors ``reject_proposal``/an entry-leg cancel): no
    live-gate applies even if a nonce happens to be supplied.
 """
@@ -378,9 +378,9 @@ class ClosePositionBody(BaseModel):
 # price/summarize before an EXECUTING command transmits (spec 9.1). This is
 # a closed set -- an unknown action is a 422 at this web layer, not a
 # pass-through to the coordinator.
-_PREFLIGHT_ACTIONS = ("approve_proposal", "set_trading_pause",
-                      "enable_strategy", "disable_strategy",
-                      "update_strategy_params", "cancel_order", "cancel_orders")
+_PREFLIGHT_ACTIONS = (
+    "approve_proposal", "resume_trading", "cancel_order", "cancel_orders",
+)
 
 
 class ApproveProposalBody(BaseModel):
@@ -614,22 +614,18 @@ class StrategyParamsBody(BaseModel):
     preflight_nonce: str | None = None
 
 
-class SetPauseBody(BaseModel):
+class PauseTradingBody(BaseModel):
     model_config = ConfigDict(extra="forbid")
     command_id: str = _COMMAND_ID
-    paused: bool
-    expected_version: int | None = None   # required for resume, ignored for pause
+    reason: str = Field(min_length=1, max_length=200)
+
+
+class ResumeTradingBody(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    command_id: str = _COMMAND_ID
+    expected_control_revision: int = Field(ge=1)
     reason: str = Field(min_length=1, max_length=200)
     preflight_nonce: str | None = None
-
-    @model_validator(mode="after")
-    def _resume_requires_revision(self) -> "SetPauseBody":
-        # Setting paused=false increases risk (spec 9.4): it is a compare-and-set
-        # against the exact current revision. Pausing is idempotent even from a
-        # stale view, so it carries no revision.
-        if self.paused is False and self.expected_version is None:
-            raise ValueError("resume requires the exact current revision")
-        return self
 
 
 @router.post("/api/commands/strategies/{strategy_name}/enable")
@@ -685,22 +681,25 @@ def update_strategy_params(strategy_name: str, body: StrategyParamsBody,
 
 
 @router.post("/api/commands/pause")
-def set_trading_pause(body: SetPauseBody, request: Request,
-                      session: str = Depends(require_command_auth)):
-    # The account is the coordinator's own configured account, never
-    # request-supplied (SetTradingPauseRequest has no account_id field).
-    # paused=true is risk-reducing -> immediate, no gate (mirrors disable).
-    # paused=false (resume) is risk-increasing -> same live-gate as
-    # enable/params above; the model_validator on SetPauseBody already
-    # enforced an exact expected_version is present.
-    if body.paused is False:
-        _reject_live_targeted_without_flag(request, body.preflight_nonce)
-    receipt = _gateway(request).execute("set_trading_pause", {
+def pause_trading(body: PauseTradingBody, request: Request,
+                  session: str = Depends(require_command_auth)):
+    receipt = _gateway(request).execute("pause_trading", {
         "command_id": body.command_id,
-        "paused": body.paused,
-        "expected_version": body.expected_version,
+        "reason": body.reason,
+    })
+    return _receipt_json(receipt)
+
+
+@router.post("/api/commands/resume")
+def resume_trading(body: ResumeTradingBody, request: Request,
+                   session: str = Depends(require_command_auth)):
+    _reject_live_targeted_without_flag(request, body.preflight_nonce)
+    receipt = _gateway(request).execute("resume_trading", {
+        "command_id": body.command_id,
+        "expected_control_revision": body.expected_control_revision,
         "reason": body.reason,
         "preflight_nonce": body.preflight_nonce,
+        "session_fingerprint": session_fingerprint(session),
     })
     return _receipt_json(receipt)
 

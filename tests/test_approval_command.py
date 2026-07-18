@@ -609,7 +609,9 @@ def test_approve_proposal_rpc_surface_registers_and_drives_a_real_approve(approv
     registry = TypedRpcRegistry()
     register_command_authority(
         registry, approval.coordinator, _minimal_proposal_service(approval), approval.repo,
-        account_id="DU111111", controls=approval.controls, approval_service=approval.service,
+        account_id="DU111111", account_mode="paper", controls=approval.controls,
+        resume_ready=lambda: True, reconciliation_complete=lambda command_id: True,
+        approval_service=approval.service,
     )
 
     # (register branch) approve_proposal is wired on the command role.

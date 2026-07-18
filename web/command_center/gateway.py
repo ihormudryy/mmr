@@ -166,9 +166,9 @@ class DashboardCommandGateway:
         response ``{command_id, nonce, expires_at, summary}`` where
         ``summary`` carries ``side, instrument, quantity, notional,
         order_type, latest_price, drift_bps, warnings, account_id,
-        account_mode``. The real typed method doesn't exist upstream yet;
-        this is exercised against ``FakeTypedClient`` in
-        ``tests/test_command_gateway.py`` until [M1-F3] lands it.
+        account_mode``. trader_service reconstructs the exact future
+        ``CommandRequest`` and binds the nonce to its canonical hash and this
+        browser session before returning the ticket.
         """
         raw = self._call("preflight_command", body)
         return PreflightTicket(

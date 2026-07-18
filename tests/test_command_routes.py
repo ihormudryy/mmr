@@ -845,51 +845,45 @@ def test_live_targeted_strategy_params_without_live_commands_enabled_is_403(gate
 def test_pause_sets_absolute_boolean_without_account(gateway):
     client = make_client(gateway)
     r = client.post("/api/commands/pause",
-                    json={"command_id": CMD_ID, "paused": True,
-                          "reason": "operator hold"},
+                    json={"command_id": CMD_ID, "reason": "operator hold"},
                     headers=HEADERS)
     assert r.status_code == 202
     method, body = gateway.calls[0]
-    assert method == "set_trading_pause"
-    assert body == {"command_id": CMD_ID, "paused": True,
-                    "expected_version": None, "reason": "operator hold",
-                    "preflight_nonce": None}
+    assert method == "pause_trading"
+    assert body == {"command_id": CMD_ID, "reason": "operator hold"}
     assert "account_id" not in body      # coordinator pins its configured account
     assert "session_fingerprint" not in body
 
 
-def test_pause_true_is_immediate_without_live_gate(gateway):
-    """paused=true never requires the live ceremony even with a nonce
-    present -- risk-reducing, mirrors disable_strategy."""
+def test_pause_rejects_preflight_field_instead_of_forwarding_it(gateway):
     client = make_client(gateway)  # paper-only flags
     r = client.post("/api/commands/pause",
-                    json={"command_id": CMD_ID, "paused": True,
-                          "reason": "operator hold", "preflight_nonce": "n-9"},
+                    json={"command_id": CMD_ID, "reason": "operator hold",
+                          "preflight_nonce": "n-9"},
                     headers=HEADERS)
-    assert r.status_code == 202
-    assert gateway.calls[0][1]["preflight_nonce"] == "n-9"
+    assert r.status_code == 422
+    assert gateway.calls == []
 
 
 def test_resume_forwards_exact_revision(gateway):
     client = make_client(gateway, flags=LIVE_FLAGS)
-    r = client.post("/api/commands/pause",
-                    json={"command_id": CMD_ID, "paused": False,
-                          "expected_version": 12, "reason": "resume",
+    r = client.post("/api/commands/resume",
+                    json={"command_id": CMD_ID,
+                          "expected_control_revision": 12, "reason": "resume",
                           "preflight_nonce": "n-1"},
                     headers=HEADERS)
     assert r.status_code == 202
     method, body = gateway.calls[0]
-    assert method == "set_trading_pause"
-    assert body["expected_version"] == 12
+    assert method == "resume_trading"
+    assert body["expected_control_revision"] == 12
     assert body["preflight_nonce"] == "n-1"
-    assert "session_fingerprint" not in body
+    assert body["session_fingerprint"]
 
 
 def test_resume_without_revision_is_rejected(gateway):
     client = make_client(gateway)
-    r = client.post("/api/commands/pause",
-                    json={"command_id": CMD_ID, "paused": False,
-                          "reason": "resume"},
+    r = client.post("/api/commands/resume",
+                    json={"command_id": CMD_ID, "reason": "resume"},
                     headers=HEADERS)
     assert r.status_code == 422           # resume is CAS: an exact revision is mandatory
     assert gateway.calls == []
@@ -897,9 +891,9 @@ def test_resume_without_revision_is_rejected(gateway):
 
 def test_live_targeted_resume_without_live_commands_enabled_is_403(gateway):
     client = make_client(gateway)  # paper-only flags
-    r = client.post("/api/commands/pause",
-                    json={"command_id": CMD_ID, "paused": False,
-                          "expected_version": 12, "reason": "resume",
+    r = client.post("/api/commands/resume",
+                    json={"command_id": CMD_ID,
+                          "expected_control_revision": 12, "reason": "resume",
                           "preflight_nonce": "n-1"},
                     headers=HEADERS)
     assert r.status_code == 403
@@ -918,7 +912,9 @@ def test_strategy_and_pause_routes_reject_malformed_command_id(gateway):
         ("/api/commands/strategies/smi_crossover/params",
          {"command_id": bad_id, "expected_version": 4, "params": {"EMA_PERIOD": 15}}),
         ("/api/commands/pause",
-         {"command_id": bad_id, "paused": True, "reason": "hold"}),
+         {"command_id": bad_id, "reason": "hold"}),
+        ("/api/commands/resume",
+         {"command_id": bad_id, "expected_control_revision": 1, "reason": "resume"}),
     ]:
         r = client.post(url, json=body, headers=HEADERS)
         assert r.status_code == 422
@@ -936,7 +932,9 @@ def test_strategy_and_pause_routes_require_csrf_and_origin(gateway):
         ("/api/commands/strategies/smi_crossover/params",
          {"command_id": CMD_ID, "expected_version": 4, "params": {"EMA_PERIOD": 15}}),
         ("/api/commands/pause",
-         {"command_id": CMD_ID, "paused": True, "reason": "hold"}),
+         {"command_id": CMD_ID, "reason": "hold"}),
+        ("/api/commands/resume",
+         {"command_id": CMD_ID, "expected_control_revision": 1, "reason": "resume"}),
     ]:
         client = make_client(gateway, flags=LIVE_FLAGS)
         r = client.post(url, json=body, headers=bad_headers)
@@ -955,7 +953,9 @@ def test_strategy_and_pause_routes_disabled_returns_403_before_gateway(gateway):
         ("/api/commands/strategies/smi_crossover/params",
          {"command_id": CMD_ID, "expected_version": 4, "params": {"EMA_PERIOD": 15}}),
         ("/api/commands/pause",
-         {"command_id": CMD_ID, "paused": True, "reason": "hold"}),
+         {"command_id": CMD_ID, "reason": "hold"}),
+        ("/api/commands/resume",
+         {"command_id": CMD_ID, "expected_control_revision": 1, "reason": "resume"}),
     ]:
         r = client.post(url, json=body, headers=HEADERS)
         assert r.status_code == 403

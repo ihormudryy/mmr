@@ -56,6 +56,11 @@ revision-bookkeeping helpers (``_read_current_revision``,
 only way to co-locate "maybe write a row, maybe not" with "exactly one
 event when a row really changed" inside a transaction ``mutate()`` doesn't
 own.
+
+Transport authority is intentionally asymmetric: production exposes
+``pause_trading(command_id, reason)`` without preflight and
+``resume_trading(command_id, expected_control_revision, reason,
+preflight_nonce)``. Account and live/paper mode are never caller-supplied.
 """
 from __future__ import annotations
 
@@ -306,7 +311,7 @@ class TradingControlStore:
     ) -> TradingControlState:
         """Own the transaction boundary around ``set_pause_in_tx``.
 
-        Used by the ``set_trading_pause`` command action (production) and
+        Used by the split ``pause_trading`` / ``resume_trading`` actions and
         directly by tests exercising the "public" (non-``_in_tx``) surface.
         Mirrors ``CommandLedger.purge_expired``'s manual
         BEGIN/COMMIT/ROLLBACK idiom rather than ``DomainJournal.mutate`` --

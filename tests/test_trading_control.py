@@ -180,7 +180,9 @@ def authority_with_controls(tmp_path):
     )
     registry = TypedRpcRegistry()
     register_command_authority(
-        registry, coordinator, service, repository, account_id=ACCOUNT_ID, controls=controls,
+        registry, coordinator, service, repository, account_id=ACCOUNT_ID,
+        account_mode="paper", controls=controls, resume_ready=lambda: True,
+        reconciliation_complete=lambda command_id: True,
     )
 
     return SimpleNamespace(
@@ -285,19 +287,20 @@ def test_unverified_sell_is_treated_as_exposure_increasing(authority_with_contro
 
 
 # ---------------------------------------------------------------------------
-# Production RPC wiring (set_trading_pause command, get_trading_control query)
+# Production RPC wiring (split pause/resume commands, get_trading_control query)
 # ---------------------------------------------------------------------------
 
-def test_set_trading_pause_registered_and_runs_through_the_coordinator(authority_with_controls):
+def test_pause_trading_registered_and_runs_through_the_coordinator(authority_with_controls):
     a = authority_with_controls
-    assert a.registry.contains("command", "set_trading_pause")
+    assert a.registry.contains("command", "pause_trading")
+    assert a.registry.contains("command", "resume_trading")
+    assert not a.registry.contains("command", "set_trading_pause")
     assert a.registry.contains("query", "get_trading_control")
 
     request = CommandRequest(
-        command_id="cmd-pause-1", action="set_trading_pause", account_id=ACCOUNT_ID,
+        command_id="cmd-pause-1", action="pause_trading", account_id=ACCOUNT_ID,
         target_type="trading_control", target_id=ACCOUNT_ID, expected_version=None,
-        body={"paused": True, "expected_version": None, "reason": "manual halt"},
-        source="dashboard", preflight_nonce="test-nonce-1",
+        body={"reason": "manual halt"}, source="dashboard",
     )
     receipt = a.coordinator.execute(request)
     assert receipt.state == "RESOLVED"

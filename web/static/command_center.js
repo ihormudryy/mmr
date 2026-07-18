@@ -1309,24 +1309,23 @@ async function ccUpdateStrategyParams(strategy, params) {
 async function ccSetPause(accountId, paused, revision) {
   const label = paused ? `Pause new trading (${accountId})`
                        : `Resume new trading (${accountId})`;
-  const url = '/api/commands/pause';
   const reason = paused ? 'operator pause' : 'operator resume';
   if (paused) {
-    await ccSubmitCommand('set_trading_pause', label, url,
-        {command_id: ccNewCommandId(), paused: true, expected_version: null,
-         reason, preflight_nonce: null});
+    await ccSubmitCommand('pause_trading', label, '/api/commands/pause',
+        {command_id: ccNewCommandId(), reason});
     return;
   }
   if (!ccIsLive(ccAccountModeFor(accountId))) {
-    await ccSubmitCommand('set_trading_pause', label, url,
-        {command_id: ccNewCommandId(), paused: false, expected_version: revision,
+    await ccSubmitCommand('resume_trading', label, '/api/commands/resume',
+        {command_id: ccNewCommandId(), expected_control_revision: revision,
          reason, preflight_nonce: null});
     return;
   }
-  await ccRunLiveCeremony('set_trading_pause', label, 'set_trading_pause',
-      {paused: false}, revision,
-      (commandId, nonce) => ccSubmitCommand('set_trading_pause', label, url,
-          {command_id: commandId, paused: false, expected_version: revision,
+  await ccRunLiveCeremony('resume_trading', label, 'resume_trading',
+      {reason}, revision,
+      (commandId, nonce) => ccSubmitCommand('resume_trading', label,
+          '/api/commands/resume',
+          {command_id: commandId, expected_control_revision: revision,
            reason, preflight_nonce: nonce}));
 }
 

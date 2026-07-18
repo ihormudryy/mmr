@@ -180,9 +180,11 @@ def test_one_registry_contains_reads_feed_ingest_and_landed_commands(tmp_path):
         ("query", "snapshot_with_cursor"),
         ("feed", "read_domain_events"),
         ("command", "record_state_acknowledged"),
+        ("command", "preflight_command"),
         ("command", "approve_proposal"),
         ("command", "cancel_order"),
-        ("command", "set_trading_pause"),
+        ("command", "pause_trading"),
+        ("command", "resume_trading"),
     }
     for role, method in expected:
         assert registry.contains(role, method), (role, method)

@@ -1037,7 +1037,7 @@ def test_reject_wedge_never_marks_a_separately_approved_proposal_failed(recon):
 
 
 # ---------------------------------------------------------------------------
-# MEDIUM-3: set_trading_pause and the cancel_orders root must reach a defined
+# MEDIUM-3: pause_trading and the cancel_orders root must reach a defined
 # resolution rather than falling through to an eternal critical alert.
 # ---------------------------------------------------------------------------
 
@@ -1053,7 +1053,7 @@ def test_pause_wedge_resolves_when_control_row_reflects_the_command(recon):
     controls.set("DU111111", True, None, "pz-1", "risk event", NOW)  # committed under pz-1
     recon.ledger.insert_for_test(
         "pz-1", state="OUTCOME_UNKNOWN", updated_at=NOW, account_id="DU111111",
-        action="set_trading_pause", target_type="trading_control", target_id="DU111111")
+        action="pause_trading", target_type="trading_control", target_id="DU111111")
     result = recon.reconciler.reconcile_once("pz-1", recon.now())
     assert result.resolved is True
     row = recon.ledger.get("pz-1")
@@ -1066,7 +1066,7 @@ def test_pause_wedge_stays_unknown_when_control_row_is_from_another_command(reco
     controls.set("DU111111", True, None, "other-cmd", "x", NOW)      # a DIFFERENT command set it
     recon.ledger.insert_for_test(
         "pz-2", state="OUTCOME_UNKNOWN", updated_at=NOW, account_id="DU111111",
-        action="set_trading_pause", target_type="trading_control", target_id="DU111111")
+        action="pause_trading", target_type="trading_control", target_id="DU111111")
     result = recon.reconciler.reconcile_once("pz-2", recon.now())
     assert result.resolved is False                     # not confirmed committed by THIS command
     assert recon.ledger.get("pz-2").state == "OUTCOME_UNKNOWN"
@@ -1113,7 +1113,7 @@ def test_rescan_leaves_received_rows_untouched(recon):
     # terminalized -- only the provably pre-dispatch VALIDATED state is.
     recon.ledger.insert_for_test(
         "rcv-1", state="RECEIVED", updated_at=recon.now(), account_id="DU111111",
-        action="set_trading_pause", target_type="trading_control", target_id="DU111111")
+        action="pause_trading", target_type="trading_control", target_id="DU111111")
     recon.reconciler.rescan_on_startup()
     assert recon.ledger.get("rcv-1").state == "RECEIVED"
 

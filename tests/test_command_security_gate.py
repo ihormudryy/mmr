@@ -86,7 +86,9 @@ COMMAND_ROUTES = [
     ("POST", "/api/commands/strategies/smi/params",
      {"command_id": CMD_ID, "expected_version": 4, "params": {"EMA_PERIOD": 15}}),
     ("POST", "/api/commands/pause",
-     {"command_id": CMD_ID, "paused": True, "reason": "hold"}),
+     {"command_id": CMD_ID, "reason": "hold"}),
+    ("POST", "/api/commands/resume",
+     {"command_id": CMD_ID, "expected_control_revision": 1, "reason": "resume"}),
 ]
 
 

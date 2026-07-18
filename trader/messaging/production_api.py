@@ -86,7 +86,7 @@ from dataclasses import asdict
 from typing import TYPE_CHECKING, Any, Dict, Optional
 
 from ib_async import Contract
-from pydantic import BaseModel, ConfigDict, field_validator
+from pydantic import BaseModel, ConfigDict, Field, field_validator
 
 from trader.data.proposal_repository import ProposalRepository
 from trader.domain.commands import CommandReceipt
@@ -115,6 +115,7 @@ from trader.trading.command_coordinator import (
     StrategyControlCommandService,
     TradingCommandCoordinator,
     acknowledge_strategy_state,
+    canonical_request_hash,
 )
 from trader.trading.proposal_command_service import (
     ProposalCommandService,
@@ -335,30 +336,74 @@ class RejectProposalRequest(BaseModel):
         return _reject_colon_in_command_id(value)
 
 
-class SetTradingPauseRequest(BaseModel):
-    """[M1-F3] Task 4. The account is ALWAYS the coordinator's own
-    configured account (``account_id`` passed to
-    ``register_command_authority``), never request-supplied -- there is no
-    ``account_id`` field here."""
-
+class PauseTradingRequest(BaseModel):
+    """Risk-reducing absolute pause; account and mode are trader-owned."""
     model_config = ConfigDict(extra="forbid")
-
     command_id: str
-    paused: bool
-    expected_version: Optional[int] = None
-    reason: str
-    preflight_nonce: Optional[str] = None
+    reason: str = Field(min_length=1, max_length=200)
 
     @field_validator("command_id")
     @classmethod
     def _command_id_has_no_colon(cls, value: str) -> str:
         return _reject_colon_in_command_id(value)
 
+    @field_validator("reason")
+    @classmethod
+    def _reason_is_not_blank(cls, value: str) -> str:
+        if not value.strip():
+            raise ValueError("reason must not be blank")
+        return value.strip()
+
+
+class ResumeTradingRequest(BaseModel):
+    """Risk-increasing resume; mode is pinned by trader_service."""
+    model_config = ConfigDict(extra="forbid")
+    command_id: str
+    expected_control_revision: int = Field(ge=1)
+    reason: str = Field(min_length=1, max_length=200)
+    preflight_nonce: Optional[str] = None
+    session_fingerprint: Optional[str] = None
+
+    @field_validator("command_id")
+    @classmethod
+    def _command_id_has_no_colon(cls, value: str) -> str:
+        return _reject_colon_in_command_id(value)
+
+    @field_validator("reason")
+    @classmethod
+    def _reason_is_not_blank(cls, value: str) -> str:
+        if not value.strip():
+            raise ValueError("reason must not be blank")
+        return value.strip()
+
+
+class PreflightCommandRequest(BaseModel):
+    """Authenticated confirmation request used to mint a bound nonce."""
+    model_config = ConfigDict(extra="forbid")
+    command_id: str
+    action: str
+    params: dict[str, Any]
+    expected_version: Optional[int] = Field(default=None, ge=1)
+    session_fingerprint: str = Field(min_length=16, max_length=256)
+
+    @field_validator("command_id")
+    @classmethod
+    def _command_id_has_no_colon(cls, value: str) -> str:
+        return _reject_colon_in_command_id(value)
+
+    @field_validator("action")
+    @classmethod
+    def _known_action(cls, value: str) -> str:
+        allowed = {"approve_proposal", "resume_trading", "cancel_order", "cancel_orders"}
+        if value not in allowed:
+            raise ValueError(f"action must be one of {sorted(allowed)}")
+        return value
+
 
 class ApproveProposalRequest(BaseModel):
     """[M1-F3] Task 5. Approving a proposal is the ONE command that dispatches
-    a real order, so it ALWAYS requires a preflight nonce (``requires_preflight
-    =True`` when registered). ``expected_version`` is the exact proposal
+    a real order. Live mode requires a preflight nonce; paper mode uses the
+    authenticated single POST. ``expected_version`` is the exact proposal
     ``revision`` the caller reviewed -- a stale approval is rejected
     (``REVISION_MISMATCH``) rather than acting on a proposal that changed.
     The account is the coordinator's own configured account, never
@@ -370,6 +415,7 @@ class ApproveProposalRequest(BaseModel):
     proposal_id: int
     expected_version: int
     preflight_nonce: Optional[str] = None
+    session_fingerprint: Optional[str] = None
 
     @field_validator("command_id")
     @classmethod
@@ -393,6 +439,7 @@ class CancelOrderRequest(BaseModel):
     command_id: str
     order_entity_id: str
     preflight_nonce: Optional[str] = None
+    session_fingerprint: Optional[str] = None
 
     @field_validator("command_id")
     @classmethod
@@ -410,6 +457,7 @@ class CancelOrdersRequest(BaseModel):
     command_id: str
     order_entity_ids: list[str]
     preflight_nonce: Optional[str] = None
+    session_fingerprint: Optional[str] = None
 
     @field_validator("command_id")
     @classmethod
@@ -592,6 +640,7 @@ def _approve_proposal_rpc_handler(coordinator: TradingCommandCoordinator, accoun
             expected_version=parsed.expected_version,
             body={"proposal_id": parsed.proposal_id}, source="dashboard",
             preflight_nonce=parsed.preflight_nonce,
+            session_fingerprint=parsed.session_fingerprint,
         )
         receipt = coordinator.execute(request)
         return _receipt_to_dict(receipt)
@@ -609,6 +658,7 @@ def _cancel_order_rpc_handler(coordinator: TradingCommandCoordinator, account_id
             target_type="order", target_id=parsed.order_entity_id, expected_version=None,
             body={"order_entity_id": parsed.order_entity_id}, source="dashboard",
             preflight_nonce=parsed.preflight_nonce,
+            session_fingerprint=parsed.session_fingerprint,
         )
         receipt = coordinator.execute(request)
         return _receipt_to_dict(receipt)
@@ -625,6 +675,7 @@ def _cancel_orders_rpc_handler(coordinator: TradingCommandCoordinator, account_i
             target_type="order_group", target_id="", expected_version=None,
             body={"order_entity_ids": parsed.order_entity_ids}, source="dashboard",
             preflight_nonce=parsed.preflight_nonce,
+            session_fingerprint=parsed.session_fingerprint,
         )
         receipt = coordinator.execute(request)
         return _receipt_to_dict(receipt)
@@ -700,26 +751,32 @@ def _record_state_acknowledged_handler(strategy_control_service: StrategyControl
     return _handler
 
 
-def _set_trading_pause_action(controls: TradingControlStore, account_id: Optional[str]):
-    """The coordinator-registered inner action for ``set_trading_pause``.
-
-    Runs strictly AFTER the command has been claimed (mirrors
-    ``_create_proposal_action``). ``controls.set`` owns its own row+event
-    transaction (see ``TradingControlStore.set``); its two fail-closed
-    exceptions are translated into ``CommandValidationError`` so the
-    coordinator transitions the command to ``REJECTED`` with a stable code
-    instead of leaking a raw domain exception (and, for any OTHER
-    exception, wedging into ``OUTCOME_UNKNOWN`` per ``execute()``'s
-    contract -- appropriate here too, since a DB failure mid-``set`` is
-    exactly the "ambiguous, reconcile later" case).
-    """
+def _control_action(
+    controls: TradingControlStore,
+    account_id: Optional[str],
+    *,
+    paused: bool,
+    resume_ready=None,
+    reconciliation_complete=None,
+):
+    """Build one trader-owned absolute control mutation."""
     def _action(command: CommandRequest) -> Dict[str, Any]:
         body = command.body
+        if not paused:
+            if resume_ready is None or not resume_ready():
+                raise CommandValidationError(
+                    "TRADER_NOT_READY", "trader/broker readiness is not current",
+                )
+            if reconciliation_complete is None or not reconciliation_complete(command.command_id):
+                raise CommandValidationError(
+                    "RECONCILIATION_INCOMPLETE",
+                    "unresolved command reconciliation blocks resume",
+                )
         try:
             state = controls.set(
                 account_id,
-                bool(body["paused"]),
-                body.get("expected_version"),
+                paused,
+                body.get("expected_control_revision") if not paused else None,
                 command.command_id,
                 body["reason"],
                 dt.datetime.now(dt.timezone.utc),
@@ -732,14 +789,30 @@ def _set_trading_pause_action(controls: TradingControlStore, account_id: Optiona
     return _action
 
 
-def _set_trading_pause_rpc_handler(coordinator: TradingCommandCoordinator, account_id: Optional[str]):
-    def _handler(parsed: SetTradingPauseRequest) -> Dict[str, Any]:
-        payload = parsed.model_dump(exclude={"command_id", "preflight_nonce"})
+def _pause_trading_rpc_handler(coordinator: TradingCommandCoordinator, account_id: Optional[str]):
+    def _handler(parsed: PauseTradingRequest) -> Dict[str, Any]:
         request = CommandRequest(
-            command_id=parsed.command_id, action="set_trading_pause", account_id=account_id,
+            command_id=parsed.command_id, action="pause_trading", account_id=account_id,
             target_type="trading_control", target_id=account_id or "",
-            expected_version=parsed.expected_version, body=payload, source="dashboard",
-            preflight_nonce=parsed.preflight_nonce,
+            expected_version=None, body={"reason": parsed.reason}, source="dashboard",
+        )
+        receipt = coordinator.execute(request)
+        return _receipt_to_dict(receipt)
+    return _handler
+
+
+def _resume_trading_rpc_handler(coordinator: TradingCommandCoordinator, account_id: Optional[str]):
+    def _handler(parsed: ResumeTradingRequest) -> Dict[str, Any]:
+        request = CommandRequest(
+            command_id=parsed.command_id, action="resume_trading", account_id=account_id,
+            target_type="trading_control", target_id=account_id or "",
+            expected_version=parsed.expected_control_revision,
+            body={
+                "expected_control_revision": parsed.expected_control_revision,
+                "reason": parsed.reason,
+            },
+            source="dashboard", preflight_nonce=parsed.preflight_nonce,
+            session_fingerprint=parsed.session_fingerprint,
         )
         receipt = coordinator.execute(request)
         return _receipt_to_dict(receipt)
@@ -753,6 +826,168 @@ def _get_trading_control_handler(controls: TradingControlStore, account_id: Opti
         except PauseStateUnavailable as exc:
             raise _DispatchProblem("TRADING_CONTROL_UNAVAILABLE", str(exc)) from exc
         return state.to_payload()
+    return _handler
+
+
+def _preflight_command_handler(
+    nonces,
+    repository: ProposalRepository,
+    controls: TradingControlStore,
+    account_id: Optional[str],
+    account_mode: str,
+):
+    """Mint a nonce bound to the exact command envelope later submitted."""
+    def reject(message: str):
+        raise _DispatchProblem("PREFLIGHT_INVALID", message)
+
+    def exact_params(params: dict[str, Any], required: set[str]) -> None:
+        if set(params) != required:
+            reject(f"params must contain exactly {sorted(required)}")
+
+    def _handler(parsed: PreflightCommandRequest) -> Dict[str, Any]:
+        params = parsed.params
+        expected = parsed.expected_version
+        summary: dict[str, Any] = {
+            "side": None,
+            "instrument": None,
+            "quantity": None,
+            "notional": None,
+            "order_type": None,
+            "latest_price": None,
+            "drift_bps": None,
+            "warnings": [],
+            "account_id": account_id,
+            "account_mode": account_mode,
+        }
+
+        if parsed.action == "approve_proposal":
+            exact_params(params, {"proposal_id"})
+            if expected is None:
+                reject("approve_proposal requires expected_version")
+            try:
+                proposal_id = int(params["proposal_id"])
+            except (TypeError, ValueError):
+                reject("proposal_id must be an integer")
+            proposal = repository.get(proposal_id)
+            if proposal is None:
+                reject("proposal not found")
+            if proposal.account_id != account_id or proposal.account_mode != account_mode:
+                reject("proposal account or mode does not match pinned trader")
+            if proposal.revision != expected:
+                reject("proposal revision changed; refresh before confirming")
+            request = CommandRequest(
+                command_id=parsed.command_id,
+                action=parsed.action,
+                account_id=account_id,
+                target_type="proposal",
+                target_id=str(proposal_id),
+                expected_version=expected,
+                body={"proposal_id": proposal_id},
+                source="dashboard",
+                session_fingerprint=parsed.session_fingerprint,
+            )
+            price = proposal.reference_price
+            notional = proposal.amount
+            if notional is None and proposal.quantity is not None and price is not None:
+                notional = abs(proposal.quantity * price)
+            summary.update({
+                "side": proposal.action,
+                "instrument": proposal.symbol or proposal.conid,
+                "quantity": proposal.quantity,
+                "notional": notional,
+                "order_type": (proposal.execution or {}).get("order_type", "MARKET"),
+                "latest_price": price,
+                "drift_bps": 0.0,
+                "warnings": ["Market and broker evidence are revalidated immediately before dispatch."],
+            })
+        elif parsed.action == "resume_trading":
+            exact_params(params, {"reason"})
+            if expected is None:
+                reject("resume_trading requires expected_version")
+            reason = str(params["reason"]).strip()
+            if not reason:
+                reject("resume reason must not be blank")
+            state = controls.get(account_id)
+            if state.revision != expected:
+                reject("trading-control revision changed; refresh before confirming")
+            request = CommandRequest(
+                command_id=parsed.command_id,
+                action=parsed.action,
+                account_id=account_id,
+                target_type="trading_control",
+                target_id=account_id or "",
+                expected_version=expected,
+                body={"expected_control_revision": expected, "reason": reason},
+                source="dashboard",
+                session_fingerprint=parsed.session_fingerprint,
+            )
+            summary.update({
+                "side": "RESUME",
+                "instrument": "new trading",
+                "order_type": "CONTROL",
+                "warnings": [
+                    "Resume permits new exposure; readiness and reconciliation are checked again on submit."
+                ],
+            })
+        elif parsed.action == "cancel_order":
+            exact_params(params, {"order_entity_id"})
+            order_entity_id = str(params["order_entity_id"]).strip()
+            if not order_entity_id:
+                reject("order_entity_id must not be blank")
+            request = CommandRequest(
+                command_id=parsed.command_id,
+                action=parsed.action,
+                account_id=account_id,
+                target_type="order",
+                target_id=order_entity_id,
+                expected_version=None,
+                body={"order_entity_id": order_entity_id},
+                source="dashboard",
+                session_fingerprint=parsed.session_fingerprint,
+            )
+            summary.update({
+                "side": "CANCEL",
+                "instrument": order_entity_id,
+                "order_type": "ORDER CONTROL",
+                "warnings": ["Protective-order risk is classified again by trader_service."],
+            })
+        else:
+            exact_params(params, {"order_entity_ids"})
+            ids = params["order_entity_ids"]
+            if not isinstance(ids, list) or not ids or not all(isinstance(i, str) and i for i in ids):
+                reject("order_entity_ids must be a non-empty list of strings")
+            request = CommandRequest(
+                command_id=parsed.command_id,
+                action=parsed.action,
+                account_id=account_id,
+                target_type="order_group",
+                target_id="",
+                expected_version=None,
+                body={"order_entity_ids": ids},
+                source="dashboard",
+                session_fingerprint=parsed.session_fingerprint,
+            )
+            summary.update({
+                "side": "CANCEL ALL",
+                "instrument": f"{len(ids)} working orders",
+                "order_type": "ORDER CONTROL",
+                "warnings": ["Every target is classified again by trader_service."],
+            })
+
+        nonce, expires_at = nonces.issue_with_expiry(
+            command_id=parsed.command_id,
+            account_id=account_id,
+            account_mode=account_mode,
+            session_fingerprint=parsed.session_fingerprint,
+            request_hash=canonical_request_hash(request),
+        )
+        return {
+            "command_id": parsed.command_id,
+            "nonce": nonce,
+            "expires_at": expires_at.isoformat(),
+            "summary": summary,
+        }
+
     return _handler
 
 
@@ -788,7 +1023,11 @@ def register_command_authority(
     repository: ProposalRepository,
     *,
     account_id: Optional[str] = None,
+    account_mode: Optional[str] = None,
     controls: Optional[TradingControlStore] = None,
+    preflight_nonces=None,
+    resume_ready=None,
+    reconciliation_complete=None,
     approval_service: Optional[ApprovalCommandService] = None,
     cancel_service: Optional[CancelCommandService] = None,
     strategy_control_service: Optional[StrategyControlCommandService] = None,
@@ -805,20 +1044,17 @@ def register_command_authority(
     ``account_id`` is supplied by the caller (derived server-side from the
     authenticated trader_service's own configuration) — it is never read
     from the request body, so a client cannot act on an account it doesn't
-    own.
+    own. When ``preflight_nonces`` is supplied, ``preflight_command`` is
+    registered on the command role and mints a nonce bound to the exact
+    trader-owned command envelope and browser-session fingerprint.
 
     [M1-F3] Task 4: when ``controls`` (a ``TradingControlStore``) is also
-    supplied, ALSO registers ``set_trading_pause`` on ``command`` and
-    ``get_trading_control`` on ``query``. Both a pause and a resume go
-    through the SAME registered action, differentiated only by the
-    ``paused`` field -- and BOTH require a preflight nonce (unlike
-    create/reject above): a pause is risk-reducing but still a real,
-    auditable control action, and treating pause/resume as one action with
-    one preflight rule is simpler and no less safe than special-casing
-    resume alone. ``[M1-C]`` supplies the live nonce ceremony; the paper
-    ``PreflightNonceGate`` accepts the documented ``paper:<command_id>``
-    self-nonce. Omitted (the default) leaves ``command``/``query`` exactly
-    as before this task.
+    supplied, ALSO registers explicit ``pause_trading`` and
+    ``resume_trading`` commands plus ``get_trading_control``. Pause is
+    risk-reducing and never requires preflight. Resume is risk-increasing:
+    its preflight rule is derived from the pinned trader account mode and
+    it additionally requires current readiness and complete reconciliation.
+    No request field can override the account or mode.
 
     [M1-F3] Task 5: when ``approval_service`` (an ``ApprovalCommandService``)
     is also supplied, ALSO registers ``approve_proposal`` on ``command`` --
@@ -847,6 +1083,13 @@ def register_command_authority(
     user-initiated command, so it carries no ledger/audit row of its own).
     Omitted (the default) leaves the strategy-control surface unregistered.
     """
+    if any(service is not None for service in (controls, preflight_nonces, approval_service,
+                                                cancel_service)):
+        if account_mode not in ("paper", "live"):
+            raise ValueError(
+                "account_mode must be pinned to 'paper' or 'live' for market-impact controls"
+            )
+
     coordinator.register_action(
         "create_proposal", _create_proposal_action(proposal_service), requires_preflight=False,
     )
@@ -868,13 +1111,38 @@ def register_command_authority(
         "query", "list_proposals", ListProposalsRequest, dict, _list_proposals_handler(repository),
     )
 
+    if preflight_nonces is not None:
+        if controls is None or account_mode not in ("paper", "live"):
+            raise ValueError("preflight requires pinned controls and account_mode")
+        registry.register(
+            "command", "preflight_command", PreflightCommandRequest, dict,
+            _preflight_command_handler(
+                preflight_nonces, repository, controls, account_id, account_mode,
+            ),
+        )
+
     if controls is not None:
         coordinator.register_action(
-            "set_trading_pause", _set_trading_pause_action(controls, account_id), requires_preflight=True,
+            "pause_trading",
+            _control_action(controls, account_id, paused=True),
+            requires_preflight=False,
+        )
+        coordinator.register_action(
+            "resume_trading",
+            _control_action(
+                controls, account_id, paused=False,
+                resume_ready=resume_ready,
+                reconciliation_complete=reconciliation_complete,
+            ),
+            requires_preflight=account_mode == "live",
         )
         registry.register(
-            "command", "set_trading_pause", SetTradingPauseRequest, dict,
-            _set_trading_pause_rpc_handler(coordinator, account_id),
+            "command", "pause_trading", PauseTradingRequest, dict,
+            _pause_trading_rpc_handler(coordinator, account_id),
+        )
+        registry.register(
+            "command", "resume_trading", ResumeTradingRequest, dict,
+            _resume_trading_rpc_handler(coordinator, account_id),
         )
         registry.register(
             "query", "get_trading_control", GetTradingControlRequest, dict,
@@ -883,7 +1151,8 @@ def register_command_authority(
 
     if approval_service is not None:
         coordinator.register_action(
-            "approve_proposal", approval_service.approve, requires_preflight=True, saga=True,
+            "approve_proposal", approval_service.approve,
+            requires_preflight=account_mode == "live", saga=True,
         )
         registry.register(
             "command", "approve_proposal", ApproveProposalRequest, dict,
@@ -1033,7 +1302,8 @@ def build_production_registry(
     is an additional OPTIONAL keyword, only consulted when the base three
     command-authority services are ALSO present — see
     ``register_command_authority``'s own docstring for what it adds
-    (``set_trading_pause`` / ``get_trading_control``). Omitted, the default,
+    (``pause_trading`` / ``resume_trading`` / ``get_trading_control``).
+    Omitted, the default,
     changes nothing.
 
     [M1-F3] Task 6 addition: ``cancel_service`` (a ``CancelCommandService``)
@@ -1099,7 +1369,11 @@ def build_production_registry(
             command_stack.proposal_service,
             command_stack.repository,
             account_id=getattr(trader, 'ib_account', None),
+            account_mode=command_stack.account_mode,
             controls=command_stack.controls,
+            preflight_nonces=command_stack.nonces,
+            resume_ready=command_stack.resume_ready,
+            reconciliation_complete=command_stack.reconciliation_complete,
             approval_service=command_stack.approval_service,
             cancel_service=command_stack.cancel_service,
         )
@@ -1108,7 +1382,15 @@ def build_production_registry(
         register_command_authority(
             registry, command_coordinator, proposal_service, proposal_repository,
             account_id=getattr(trader, 'ib_account', None),
+            account_mode=("paper" if getattr(trader, "paper_trading", False) else "live"),
             controls=trading_control,
+            preflight_nonces=None,
+            resume_ready=(lambda: bool(getattr(trader, "is_ib_connected", lambda: False)())),
+            reconciliation_complete=(
+                lambda command_id: command_coordinator.reconciliation_complete_for_account(
+                    getattr(trader, 'ib_account', None), exclude_command_id=command_id,
+                )
+            ),
             approval_service=approval_service,
             cancel_service=cancel_service,
             strategy_control_service=strategy_control_service,

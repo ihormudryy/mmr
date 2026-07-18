@@ -87,6 +87,20 @@ class PreflightNonceGate:
     def issue(self, *, command_id: str, account_id: Optional[str],
               account_mode: str, session_fingerprint: str,
               request_hash: str) -> str:
+        nonce, _expires = self.issue_with_expiry(
+            command_id=command_id,
+            account_id=account_id,
+            account_mode=account_mode,
+            session_fingerprint=session_fingerprint,
+            request_hash=request_hash,
+        )
+        return nonce
+
+    def issue_with_expiry(
+        self, *, command_id: str, account_id: Optional[str],
+        account_mode: str, session_fingerprint: str, request_hash: str,
+    ) -> tuple[str, dt.datetime]:
+        """Issue a nonce and return the authoritative expiry for UI display."""
         nonce = uuid.uuid4().hex
         issued = self._now()
         expires = issued + dt.timedelta(seconds=self._ttl)
@@ -97,7 +111,7 @@ class PreflightNonceGate:
             [nonce, command_id, account_id, account_mode, session_fingerprint,
              request_hash, issued, expires, False],
         ))
-        return nonce
+        return nonce, expires
 
     def consume_in_tx(self, conn: Any, nonce: Optional[str],
                       request: CommandRequest) -> bool:

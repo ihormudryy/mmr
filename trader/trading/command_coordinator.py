@@ -113,7 +113,7 @@ MAX_SOURCE_CLOCK_SKEW_SECONDS = 30.0
 # [M1-F3] owns trader-DB (journal file) migration versions 20-29; Task 1
 # used 20 for trade_proposals. This task owns 21. Task 4 owns 22
 # (``trading_control_state`` -- see ``trader/trading/trading_control.py``),
-# whose ``set_trading_pause`` action is registered on THIS coordinator via
+# whose pause/resume actions are registered on THIS coordinator via
 # ``register_action`` from ``trader/messaging/production_api.py`` --
 # exactly the same ``requires_preflight``/``execute()`` machinery every
 # other action already uses, no coordinator-side code changes needed.
@@ -681,6 +681,25 @@ class CommandLedger:
         ).fetchall()
         return [_row_to_ledger_row(row) for row in rows]
 
+    def unresolved_for_account(
+        self, account_id: str, *, exclude_command_id: Optional[str] = None,
+    ) -> list[LedgerRow]:
+        """All non-terminal commands for an account, optionally excluding self.
+
+        Resume uses this as its reconciliation fence: a new ``resume_trading``
+        row is already RECEIVED when its handler runs, so that one row must be
+        excluded while every other unresolved mutation remains blocking.
+        """
+        sql = f"{self._SELECT} WHERE account_id = ? " \
+              "AND state NOT IN ('RESOLVED', 'REJECTED')"
+        params: list[Any] = [account_id]
+        if exclude_command_id is not None:
+            sql += " AND command_id <> ?"
+            params.append(exclude_command_id)
+        sql += " ORDER BY created_at"
+        rows = self._journal.connect().execute(sql, params).fetchall()
+        return [_row_to_ledger_row(row) for row in rows]
+
     def reconcilable(self) -> list[LedgerRow]:
         """Every in-flight command a coordinator restart must requeue for
         reconciliation (Task 9 ``rescan_on_startup``, spec §9.5).
@@ -893,6 +912,14 @@ class TradingCommandCoordinator:
         ``RECEIVED -> RESOLVED/REJECTED`` behaviour unchanged.
         """
         self._actions[action] = _ActionRegistration(handler, requires_preflight, saga)
+
+    def reconciliation_complete_for_account(
+        self, account_id: str, *, exclude_command_id: Optional[str] = None,
+    ) -> bool:
+        """Whether no other command for the pinned account needs resolution."""
+        return not self._ledger.unresolved_for_account(
+            account_id, exclude_command_id=exclude_command_id,
+        )
 
     def execute(self, request: CommandRequest) -> CommandReceipt:
         if request.action not in self._actions:
@@ -2606,7 +2633,7 @@ class OutcomeReconciler:
             return self._reconcile_cancel(row, now)
         if action == "cancel_orders":
             return self._reconcile_cancel_orders(row, now)
-        if action == "set_trading_pause":
+        if action in ("pause_trading", "resume_trading"):
             return self._reconcile_pause(row, now)
         if action in ("enable_strategy", "disable_strategy", "update_strategy_params"):
             return self._reconcile_strategy(row, now)
@@ -2697,7 +2724,7 @@ class OutcomeReconciler:
         return True
 
     def _reconcile_pause(self, row: LedgerRow, now: dt.datetime) -> bool:
-        """MEDIUM-3: ``set_trading_pause`` is a single-step mutation whose
+        """Pause/resume is a single-step mutation whose
         control row records ``updated_by_command_id``. Resolve ONLY when the
         control row was last written by THIS command (positive proof the
         intended state committed); otherwise stay unknown."""

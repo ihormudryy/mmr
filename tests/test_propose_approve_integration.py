@@ -302,7 +302,9 @@ def _build_stack(tmp_path):
     registry = TypedRpcRegistry()
     register_command_authority(
         registry, coordinator, proposal_service, repo,
-        account_id=ACCOUNT_ID, controls=controls, approval_service=approval_service,
+        account_id=ACCOUNT_ID, account_mode="paper", controls=controls,
+        resume_ready=lambda: True, reconciliation_complete=lambda command_id: True,
+        approval_service=approval_service,
     )
 
     return SimpleNamespace(

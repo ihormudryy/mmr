@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import datetime as dt
+import hashlib
 import json
 from pathlib import Path
 
@@ -11,6 +12,7 @@ from trader.data.duckdb_store import DuckDBConnection
 from trader.data.schema_migrations import SchemaMigrator
 from trader.research.artifact import ExperimentFamily, TRIAL_FAILED, TRIAL_SUCCEEDED
 from trader.research.attestation import AttestationRepository, build_attestation
+from trader.research.canonical import canonical_json_bytes
 from trader.research.eligibility import (
     EligibilityDecisionRepository,
     EligibilityEvidence,
@@ -174,4 +176,32 @@ def test_verify_rejects_tampered_or_extra_file(populated_db, tmp_path):
     (root / "artifact.json").write_text("{}", encoding="utf-8")
 
     with pytest.raises(BundleError, match="checksum"):
+        bundle.verify(root)
+
+
+def test_verify_rejects_forged_self_consistent_payload(populated_db, tmp_path):
+    from trader.research.bundle import BundleError, ResearchBundle
+
+    db, artifact_id = populated_db
+    root = tmp_path / "bundle"
+    bundle = ResearchBundle(db)
+    bundle.export(artifact_id, root)
+    artifact_path = root / "artifact.json"
+    artifact_path.chmod(0o644)
+    artifact = read_canonical_json(artifact_path)
+    artifact["family_id"] = "forged-family"
+    artifact_bytes = canonical_json_bytes(artifact)
+    artifact_path.write_bytes(artifact_bytes)
+    manifest_path = root / "manifest.json"
+    manifest_path.chmod(0o644)
+    manifest = read_canonical_json(manifest_path)
+    manifest["files"]["artifact.json"] = hashlib.sha256(artifact_bytes).hexdigest()
+    manifest_body = dict(manifest)
+    manifest_body.pop("manifest_digest")
+    manifest["manifest_digest"] = hashlib.sha256(canonical_json_bytes(manifest_body)).hexdigest()
+    manifest_path.write_bytes(canonical_json_bytes(manifest))
+    artifact_path.chmod(0o444)
+    manifest_path.chmod(0o444)
+
+    with pytest.raises(BundleError, match="binding"):
         bundle.verify(root)

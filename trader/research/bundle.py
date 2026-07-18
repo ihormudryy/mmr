@@ -86,6 +86,7 @@ class ResearchBundle:
         if path.stat().st_mode & 0o222 or any(
                 (path / name).stat().st_mode & 0o222 for name in _FILE_NAMES):
             raise BundleError("bundle is not read-only")
+        _validate_payload_bindings(path, manifest)
         digest = manifest["manifest_digest"]
         return VerifiedResearchBundle(
             manifest_digest=digest, artifact_id=manifest["artifact_id"],
@@ -288,6 +289,73 @@ def _validate_manifest(manifest: Any) -> None:
     digest = digest_body.pop("manifest_digest")
     if _sha256(canonical_json_bytes(digest_body)) != digest:
         raise BundleError("manifest checksum mismatch")
+
+
+def _validate_payload_bindings(root: Path, manifest: Mapping[str, Any]) -> None:
+    payloads = {}
+    for name in _FILE_NAMES:
+        if name == "manifest.json":
+            continue
+        raw = (root / name).read_bytes()
+        try:
+            payload = json.loads(raw)
+        except (UnicodeDecodeError, ValueError) as exc:
+            raise BundleError(f"malformed payload: {name}") from exc
+        if canonical_json_bytes(payload) != raw:
+            raise BundleError(f"noncanonical payload: {name}")
+        payloads[name.removesuffix(".json")] = payload
+
+    artifact = _mapping_payload(payloads, "artifact")
+    family = _mapping_payload(payloads, "family")
+    decision = _mapping_payload(payloads, "decision")
+    review = _mapping_payload(payloads, "review")
+    attestation = _mapping_payload(payloads, "attestation")
+    trials = payloads["trials"]
+    folds = payloads["folds"]
+    if not isinstance(trials, list) or not isinstance(folds, list) or not folds:
+        raise BundleError("invalid trial or validation-fold payload")
+    try:
+        if artifact["artifact_id"] != manifest["artifact_id"]:
+            raise BundleError("artifact binding disagrees with manifest")
+        if artifact["family_id"] != family["family_id"]:
+            raise BundleError("artifact family binding disagrees")
+        if not any(isinstance(trial, dict) and
+                   trial.get("trial_id") == artifact["selected_trial_id"]
+                   for trial in trials):
+            raise BundleError("selected trial binding disagrees")
+        if any(not isinstance(trial, dict) or trial.get("family_id") != family["family_id"]
+               for trial in trials):
+            raise BundleError("trial family binding disagrees")
+        if any(not isinstance(fold, dict) for fold in folds):
+            raise BundleError("invalid validation-fold payload")
+        if review["artifact_id"] != artifact["artifact_id"] or \
+                review["eligibility_decision_digest"] != decision["decision_digest"]:
+            raise BundleError("review binding disagrees")
+        if (attestation["artifact_digest"] != artifact["artifact_id"] or
+                attestation["eligibility_decision_digest"] != decision["decision_digest"] or
+                attestation["review_digest"] != review["review_digest"] or
+                attestation["ruleset_digest"] != decision["ruleset_digest"]):
+            raise BundleError("attestation evidence binding disagrees")
+        if (attestation["source_digest"] != family["source_tree_digest"] or
+                attestation["config_digest"] != family["dependency_lock_digest"] or
+                attestation["dataset_manifest_digest"] != family["dataset_manifest_digest"]):
+            raise BundleError("attestation family binding disagrees")
+        if (manifest["source_digest"] != attestation["source_digest"] or
+                manifest["config_digest"] != attestation["config_digest"] or
+                manifest["dataset_manifest_digest"] != attestation["dataset_manifest_digest"] or
+                manifest["ruleset_digest"] != attestation["ruleset_digest"] or
+                manifest["attestation"]["payload_digest"] != attestation["payload_digest"] or
+                manifest["attestation"]["public_key_id"] != attestation["public_key_id"]):
+            raise BundleError("manifest attestation binding disagrees")
+    except (KeyError, TypeError) as exc:
+        raise BundleError("incomplete payload binding") from exc
+
+
+def _mapping_payload(payloads: Mapping[str, Any], name: str) -> Mapping[str, Any]:
+    payload = payloads[name]
+    if not isinstance(payload, dict):
+        raise BundleError(f"invalid payload: {name}.json")
+    return payload
 
 
 def _artifact_public(artifact: Any, holdout: Mapping[str, Any]) -> dict[str, Any]:

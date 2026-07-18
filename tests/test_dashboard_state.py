@@ -305,6 +305,31 @@ class TestRevisionBounding:
         )
         assert stale_order is None
 
+    def test_quote_command_risk_and_reconciliation_retention_prunes_revisions(self, state):
+        total = TERMINAL_CAP + 25
+        for i in range(total):
+            state.apply_quotes({str(i): {"instrument_id": str(i), "last": float(i)}})
+            for offset, entity_type in enumerate(("command", "risk", "reconciliation")):
+                state.apply(
+                    _event(
+                        event_id=f"evt-{entity_type}-{i}",
+                        source_cursor=10_000 + i * 3 + offset,
+                        entity_type=entity_type,
+                        entity_id=f"{entity_type}-{i}",
+                        entity_revision=1,
+                        event_type=f"{entity_type}.updated",
+                        payload={"status": "RESOLVED"},
+                    )
+                )
+
+        assert len(state.quotes) <= TERMINAL_CAP
+        assert len(state.commands) <= TERMINAL_CAP
+        assert len(state.risk) <= TERMINAL_CAP
+        assert len(state.reconciliation) <= TERMINAL_CAP
+        for entity_type in ("command", "risk", "reconciliation"):
+            assert sum(1 for kind, _ in state._revisions if kind == entity_type) <= TERMINAL_CAP
+
+
 
 class TestReplayRing:
     def test_replay_after_returns_events_strictly_after_sequence(self, state):

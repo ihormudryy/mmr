@@ -461,6 +461,11 @@ class TestQuoteNormalization:
         assert normalize_ticker({"nothing": "useful"}) is None
         assert normalize_ticker(b"garbage") is None
 
+    @pytest.mark.parametrize(
+        "value", (float("nan"), float("inf"), float("-inf"), "inf", "-inf"))
+    def test_non_finite_quote_values_are_rejected(self, value):
+        assert normalize_ticker({"conId": 265598, "last": value}) is None
+
     def test_hz_clamped_to_two_to_five(self):
         assert clamp_hz(0.5) == 2.0
         assert clamp_hz(4.0) == 4.0

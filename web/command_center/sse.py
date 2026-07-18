@@ -25,6 +25,7 @@ logger = logging.getLogger("web.command_center.sse")
 # into a forced resync instead of allowed to grow the queue unbounded (which
 # would eventually OOM a client that never reads, e.g. a backgrounded tab).
 FIFO_LIMIT = 1000
+QUOTE_MAP_LIMIT = 500
 
 
 class SseClient:
@@ -119,6 +120,13 @@ class SseFanout:
         blocks or slows delivery to any other client: the loop below is a
         plain iteration with no per-client I/O or backpressure.
         """
+        if self._state.consume_retention_eviction():
+            # An eviction is an implicit delete from the snapshot, but the
+            # journal has only the triggering upsert. Send the established
+            # resync control frame rather than leave an uninterrupted browser
+            # retaining a row the bounded read model has discarded.
+            self.broadcast_resync()
+            return
         for client in list(self._clients):
             if client.resync:
                 continue
@@ -141,10 +149,23 @@ class SseFanout:
         a flood of quote updates can never itself trigger a forced resync.
         """
         self._state.apply_quotes(batch)
+        if self._state.consume_retention_eviction():
+            # quote.updated is merge-only in the browser. A bounded quote-map
+            # eviction therefore needs the snapshot path, which replaces the
+            # browser's quote map rather than retaining the stale key.
+            self.broadcast_resync()
+            return
         for client in self._clients:
             if client.resync:
                 continue
-            client.quote_map.update(batch)  # latest-value, no FIFO capacity
+            for instrument_id, quote in batch.items():
+                # Reinsert updates at the tail so cap eviction drops the least
+                # recently updated quote, not an actively changing one.
+                client.quote_map.pop(instrument_id, None)
+                client.quote_map[instrument_id] = quote
+            while len(client.quote_map) > QUOTE_MAP_LIMIT:
+                oldest = next(iter(client.quote_map))
+                client.quote_map.pop(oldest)
             client.wake.set()
 
     def broadcast_resync(self) -> None:

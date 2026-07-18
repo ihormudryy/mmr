@@ -38,8 +38,8 @@ def _utc_iso(epoch_seconds: float) -> str:
     return dt.datetime.fromtimestamp(epoch_seconds, tz=dt.timezone.utc).isoformat()
 
 
-class _TerminalStore:
-    """Insertion-ordered terminal records: cap 500, TTL 24 h."""
+class _BoundedStore:
+    """Insertion-ordered records with a fixed cap and TTL."""
 
     def __init__(self, cap: int = TERMINAL_CAP, ttl: float = TERMINAL_TTL_SECONDS):
         self._cap = cap
@@ -60,6 +60,9 @@ class _TerminalStore:
 
     def remove(self, entity_id: str) -> None:
         self._rows.pop(entity_id, None)
+
+    def clear(self) -> None:
+        self._rows.clear()
 
     def cleanup(self, now: float) -> list[str]:
         """TTL-evict aged rows. Returns the evicted entity_ids so the caller
@@ -89,6 +92,8 @@ class DashboardState:
         self.last_event_at: Optional[str] = None
         self.last_transport_lag_ms: Optional[float] = None
         self.quotes: dict[str, dict] = {}
+        self._quote_rows = _BoundedStore()
+        self._retention_evicted = False
         self._revisions: dict[tuple[str, str], int] = {}
         self._ring: deque[tuple[int, float, dict]] = deque()
         self._last_cleanup: float = monotonic()
@@ -100,13 +105,13 @@ class DashboardState:
         self.proposals_active: dict[str, dict] = {}
         self.orders_active: dict[str, dict] = {}
         self.strategies: dict[str, dict] = {}
-        self.risk: dict[str, dict] = {}
-        self.reconciliation: dict[str, dict] = {}
+        self.risk = _BoundedStore()
+        self.reconciliation = _BoundedStore()
         self.trading_control: dict[str, dict] = {}
-        self.commands: dict[str, dict] = {}
-        self.proposals_terminal = _TerminalStore()
-        self.orders_terminal = _TerminalStore()
-        self.fills = _TerminalStore()
+        self.commands = _BoundedStore()
+        self.proposals_terminal = _BoundedStore()
+        self.orders_terminal = _BoundedStore()
+        self.fills = _BoundedStore()
 
     def install_baseline(self, snapshot: SnapshotWithCursor, stream_id: str) -> None:
         for entity_type, rows in snapshot.entities.items():
@@ -120,6 +125,7 @@ class DashboardState:
         self.sequence = 0
         self._ring.clear()
         self._revisions.clear()
+        self._retention_evicted = False
         self._reset_collections()
         # A fenced re-baseline REPLACES the quote map rather than merging into
         # it: the stream identity rotated, so any quote the QuotePlane hasn't
@@ -130,6 +136,7 @@ class DashboardState:
         # quotes alone — see the note there — because a single close doesn't
         # invalidate the whole stream.)
         self.quotes = {}
+        self._quote_rows.clear()
         now = self._monotonic()
         for entity_type, rows in snapshot.entities.items():
             for row in rows:
@@ -160,7 +167,26 @@ class DashboardState:
 
     def apply_quotes(self, batch: dict[str, dict]) -> None:
         """Latest-value only. Quotes never enter the ring or advance sequence."""
-        self.quotes.update(batch)
+        now = self._monotonic()
+        for instrument_id, quote in batch.items():
+            evicted = self._quote_rows.put(instrument_id, quote, now)
+            self.quotes[instrument_id] = quote
+            if evicted is not None:
+                self.quotes.pop(evicted, None)
+                self._retention_evicted = True
+        self.maybe_cleanup(now)
+
+    def consume_retention_eviction(self) -> bool:
+        """Return and clear whether a bounded row was evicted.
+
+        The SSE fan-out uses this to force a snapshot resync for live
+        consumers: eviction changes a snapshot by removing a row, while the
+        domain stream only carries the incoming upsert and cannot otherwise
+        express that implicit removal.
+        """
+        evicted = self._retention_evicted
+        self._retention_evicted = False
+        return evicted
 
     def _envelope(self, event: DomainEvent) -> dict:
         self.sequence += 1
@@ -199,12 +225,14 @@ class DashboardState:
                 self.proposals_active.pop(entity_id, None)
                 evicted = self.proposals_terminal.put(entity_id, row, now)
                 if evicted is not None:
+                    self._retention_evicted = True
                     self._forget_revision_if_untracked("proposal", evicted)
         elif entity_type == "order":
             if status in TERMINAL_ORDER_STATUSES:
                 self.orders_active.pop(entity_id, None)
                 evicted = self.orders_terminal.put(entity_id, row, now)
                 if evicted is not None:
+                    self._retention_evicted = True
                     self._forget_revision_if_untracked("order", evicted)
             else:
                 self.orders_active[entity_id] = row
@@ -212,6 +240,7 @@ class DashboardState:
         elif entity_type == "fill":
             evicted = self.fills.put(entity_id, row, now)
             if evicted is not None:
+                self._retention_evicted = True
                 self._forget_revision_if_untracked("fill", evicted)
         elif entity_type == "account":
             self.accounts[entity_id] = row
@@ -220,29 +249,44 @@ class DashboardState:
         elif entity_type == "strategy":
             self.strategies[entity_id] = row
         elif entity_type == "risk":
-            self.risk[entity_id] = row
+            evicted = self.risk.put(entity_id, row, now)
+            if evicted is not None:
+                self._retention_evicted = True
+                self._forget_revision_if_untracked("risk", evicted)
         elif entity_type == "reconciliation":
-            self.reconciliation[entity_id] = row
+            evicted = self.reconciliation.put(entity_id, row, now)
+            if evicted is not None:
+                self._retention_evicted = True
+                self._forget_revision_if_untracked("reconciliation", evicted)
         elif entity_type == "trading_control":
             self.trading_control[entity_id] = row
         elif entity_type == "command":
-            self.commands[entity_id] = row
+            evicted = self.commands.put(entity_id, row, now)
+            if evicted is not None:
+                self._retention_evicted = True
+                self._forget_revision_if_untracked("command", evicted)
         else:
             logger.warning("unknown entity_type %r ignored", entity_type)
 
     def _remove(self, entity_type: str, entity_id: str) -> None:
-        for collection in (
-            self.accounts,
-            self.positions,
-            self.proposals_active,
-            self.orders_active,
-            self.strategies,
-            self.risk,
-            self.reconciliation,
-            self.trading_control,
-            self.commands,
-        ):
-            collection.pop(entity_id, None)
+        if entity_type == "account":
+            self.accounts.pop(entity_id, None)
+        elif entity_type == "position":
+            self.positions.pop(entity_id, None)
+        elif entity_type == "proposal":
+            self.proposals_active.pop(entity_id, None)
+        elif entity_type == "order":
+            self.orders_active.pop(entity_id, None)
+        elif entity_type == "strategy":
+            self.strategies.pop(entity_id, None)
+        elif entity_type == "risk":
+            self.risk.remove(entity_id)
+        elif entity_type == "reconciliation":
+            self.reconciliation.remove(entity_id)
+        elif entity_type == "trading_control":
+            self.trading_control.pop(entity_id, None)
+        elif entity_type == "command":
+            self.commands.remove(entity_id)
         if entity_type == "proposal":
             self.proposals_terminal.remove(entity_id)
         elif entity_type == "order":
@@ -263,7 +307,9 @@ class DashboardState:
     def replay_after(self, stream_id: str, sequence: int) -> Optional[list[dict]]:
         if stream_id != self.stream_id:
             return None
-        if sequence >= self.sequence:
+        if sequence < 0 or sequence > self.sequence:
+            return None
+        if sequence == self.sequence:
             return []
         if not self._ring or self._ring[0][0] > sequence + 1:
             return None
@@ -290,7 +336,7 @@ class DashboardState:
             },
             "fills": self.fills.values(),
             "strategies": list(self.strategies.values()),
-            "risk": dict(self.risk),
+            "risk": {row["entity_id"]: row for row in self.risk.values()},
             "reconciliation": list(self.reconciliation.values()),
             "trading_control": list(self.trading_control.values()),
             "commands": list(self.commands.values()),
@@ -305,7 +351,7 @@ class DashboardState:
         return len(self._ring)
 
     def terminal_row_count(self) -> int:
-        """Total retained terminal rows across all three `_TerminalStore`s
+        """Total retained terminal rows across all three `_BoundedStore`s
         (`proposals_terminal` + `orders_terminal` + `fills`, each capped at
         `TERMINAL_CAP`). A pure read, no side effects -- exposed on
         `/api/cc-health` as `terminal_rows` so the soak runner can sample it
@@ -324,12 +370,19 @@ class DashboardState:
         if now - self._last_cleanup < CLEANUP_INTERVAL_SECONDS:
             return
         self._last_cleanup = now
+        for instrument_id in self._quote_rows.cleanup(now):
+            self.quotes.pop(instrument_id, None)
+            self._retention_evicted = True
         for entity_type, store in (
             ("proposal", self.proposals_terminal),
             ("order", self.orders_terminal),
             ("fill", self.fills),
+            ("risk", self.risk),
+            ("reconciliation", self.reconciliation),
+            ("command", self.commands),
         ):
             for evicted_id in store.cleanup(now):
+                self._retention_evicted = True
                 self._forget_revision_if_untracked(entity_type, evicted_id)
         self._prune_ring(now)
 

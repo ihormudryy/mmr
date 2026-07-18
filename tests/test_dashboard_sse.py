@@ -5,20 +5,22 @@ import json
 import pytest
 
 from trader.domain.events import DomainEvent, SnapshotWithCursor
-from web.command_center.sse import FIFO_LIMIT, SseFanout
-from web.command_center.state import DashboardState
+from web.command_center.sse import FIFO_LIMIT, QUOTE_MAP_LIMIT, SseFanout
+from web.command_center.state import TERMINAL_CAP, DashboardState
 
 UTC = dt.timezone.utc
 
 
-def _event(cursor: int, revision: int) -> DomainEvent:
-    return DomainEvent(
+def _event(cursor: int, revision: int, **overrides) -> DomainEvent:
+    fields = dict(
         event_id=f"evt-{cursor}", source_cursor=cursor, entity_revision=revision,
         event_type="position.updated", entity_type="position",
         entity_id="DU123:265598", operation="upsert", account_id="DU123",
         source="trader_service",
         source_timestamp=dt.datetime(2026, 7, 15, 12, 0, tzinfo=UTC),
         correlation_id=None, payload={"quantity": cursor})
+    fields.update(overrides)
+    return DomainEvent(**fields)
 
 
 @pytest.fixture
@@ -63,6 +65,12 @@ class TestHandshake:
         _, replay, _ = fanout.register("stream-OLD:1")
         assert replay is None
 
+    @pytest.mark.parametrize("cursor", (2, -1))
+    def test_future_or_negative_cursor_requires_resync(self, state, fanout, cursor):
+        _apply_and_publish(state, fanout, _event(1, 1))
+        _, replay, _ = fanout.register(f"stream-a:{cursor}")
+        assert replay is None
+
 
 class TestFifoBounds:
     def test_fifo_overflow_clears_client_and_marks_resync(self, state, fanout):
@@ -72,13 +80,31 @@ class TestFifoBounds:
         assert client.resync is True
         assert len(client.fifo) == 0
 
-    def test_quotes_never_consume_fifo_capacity(self, state, fanout):
+    def test_quote_retention_eviction_forces_resync(self, state, fanout):
         client, _, _ = fanout.register(None)
-        for i in range(5000):
+        for i in range(QUOTE_MAP_LIMIT + 1):
             fanout.publish_quotes({str(i): {"instrument_id": str(i), "last": 1.0}})
-        assert client.resync is False
+        assert client.resync is True
         assert len(client.fifo) == 0
-        assert len(client.quote_map) == 5000
+        assert client.quote_map == {}
+
+    @pytest.mark.parametrize("entity_type", ("command", "risk", "reconciliation"))
+    def test_entity_retention_eviction_forces_resync(self, state, fanout, entity_type):
+        client, _, _ = fanout.register(None)
+        for i in range(TERMINAL_CAP + 1):
+            _apply_and_publish(
+                state,
+                fanout,
+                _event(
+                    cursor=i + 1,
+                    revision=1,
+                    entity_type=entity_type,
+                    entity_id=f"{entity_type}-{i}",
+                    event_type=f"{entity_type}.updated",
+                ),
+        )
+        assert client.resync is True
+        assert len(client.fifo) == 0
 
     def test_slow_client_never_blocks_others(self, state, fanout):
         slow, _, _ = fanout.register(None)

@@ -163,9 +163,13 @@ class DashboardEventBridge:
 
         def _install() -> None:
             # Existing clients must resnapshot: their sequence space is gone.
-            self._fanout.broadcast_resync()
             self._state.install_baseline(baseline, stream_id)
             self._state.apply_quotes(dict(quotes.get("quotes") or {}))
+            # A large baseline can itself hit retention caps. It is followed
+            # by an unconditional resync below, so consume that marker here
+            # instead of carrying it into the next incremental publish.
+            self._state.consume_retention_eviction()
+            self._fanout.broadcast_resync()
             installed.set()
 
         self._schedule(_install)

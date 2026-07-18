@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import datetime as dt
 import logging
+import math
 import os
 import threading
 import time
@@ -85,7 +86,9 @@ def _num(value) -> Optional[float]:
     if value is None:
         return None
     number = float(value)
-    return number if number == number else None  # NaN -> None
+    if not math.isfinite(number):
+        raise ValueError("quote values must be finite")
+    return number
 
 
 class QuotePlane:

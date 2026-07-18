@@ -1,7 +1,7 @@
 # Trading Income Foundation Design
 
 **Date:** 2026-07-18  
-**Status:** approved design, awaiting written-spec review  
+**Status:** approved
 **Scope:** first deterministic, fully automated strategy for liquid US equities
 and ETFs, long-only intraday, flat by the end of every session
 

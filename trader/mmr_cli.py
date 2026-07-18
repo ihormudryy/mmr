@@ -1568,6 +1568,59 @@ def build_parser() -> argparse.ArgumentParser:
     bts_sub.add_parser('help', aliases=['metrics'],
                         help='Explain every metric in the backtest report')
 
+    # research — offline experiment registry (P2). Records the WHOLE search
+    # (every trial in the selection denominator) and write-once holdouts in a
+    # SEPARATE research DuckDB. No trader/strategy service is ever involved.
+    research_p = sub.add_parser('research', help='Offline experiment registry (no service needed)',
+                                epilog='Examples:\n'
+                                       '  research family create -s strategies/orb.py --class OpeningRangeBreakout \\\n'
+                                       '      --dataset-digest <sha> --search-space \'{"RANGE_MINUTES":[15,30,45]}\'\n'
+                                       '  research family show <family_id>\n'
+                                       '  research trial run <family_id> --conids 756733 --days 365 \\\n'
+                                       '      --bar-size "1 day" --params \'{"RANGE_MINUTES":30}\'\n'
+                                       '  research artifact show <artifact_id> --json\n'
+                                       '  research import-legacy            # import BacktestStore history as LEGACY_UNQUALIFIED',
+                                formatter_class=fmt)
+    research_sub = research_p.add_subparsers(dest='research_action')
+
+    rf_p = research_sub.add_parser('family', help='Create or inspect an experiment family')
+    rf_sub = rf_p.add_subparsers(dest='family_action')
+    rf_create = rf_sub.add_parser('create', help='Create (seal the identity of) an experiment family')
+    rf_create.add_argument('-s', '--strategy', required=True, help='Strategy file path')
+    rf_create.add_argument('--class', dest='class_name', required=True, help='Strategy class name')
+    rf_create.add_argument('--commit', default='', help='Repository commit (default: current git HEAD)')
+    rf_create.add_argument('--dataset-digest', required=True,
+                           help='Sealed dataset-manifest digest this family researches against')
+    rf_create.add_argument('--dependency-digest', default='',
+                           help='Dependency-lock digest (default: sha256 of uv.lock/requirements)')
+    rf_create.add_argument('--container-digest', default='local:none',
+                           help='Container image digest (default: local:none)')
+    rf_create.add_argument('--search-space', default='{}',
+                           help='Declared parameter search space (JSON object)')
+    rf_create.add_argument('--cost-model', default='{}', help='Cost model assumptions (JSON object)')
+    rf_create.add_argument('--validation', default='{}',
+                           help='Validation protocol boundaries (JSON object)')
+    rf_show = rf_sub.add_parser('show', help='Show a family, its trials, and sealed artifacts')
+    rf_show.add_argument('family_id', help='Family id (content digest)')
+
+    rt_p = research_sub.add_parser('trial', help='Run a trial in an experiment family')
+    rt_sub = rt_p.add_subparsers(dest='trial_action')
+    rt_run = rt_sub.add_parser('run', help='Start a trial, run the backtest, record its outcome')
+    rt_run.add_argument('family_id', help='Family id to run a trial in')
+    rt_run.add_argument('--conids', type=int, nargs='+', required=True, help='ConIds to backtest')
+    rt_run.add_argument('--days', type=int, default=365, help='Lookback window in days')
+    rt_run.add_argument('--bar-size', default='1 day', help='Bar size (e.g. "1 day")')
+    rt_run.add_argument('--params', default='{}', help='Trial parameters (JSON object)')
+    rt_run.add_argument('--key', default='', help='Trial key (default: short hash of params)')
+
+    ra_p = research_sub.add_parser('artifact', help='Inspect or seal a strategy artifact')
+    ra_sub = ra_p.add_subparsers(dest='artifact_action')
+    ra_show = ra_sub.add_parser('show', help='Show a sealed artifact and its holdout status')
+    ra_show.add_argument('artifact_id', help='Artifact id (content digest)')
+
+    research_sub.add_parser('import-legacy',
+                            help='Import BacktestStore history as LEGACY_UNQUALIFIED families')
+
     # data
     data_p = sub.add_parser('data', help='Local data exploration (no service needed)',
                             epilog='Examples:\n'
@@ -2238,6 +2291,9 @@ def dispatch(mmr: MMR, args: argparse.Namespace) -> bool:
 
         elif cmd == 'data':
             _handle_data(args)
+
+        elif cmd == 'research':
+            _handle_research(args)
 
         else:
             console.print(f'[yellow]Unknown command: {cmd}[/yellow]')
@@ -4851,6 +4907,270 @@ def _handle_backtests(args: argparse.Namespace):
         return
 
     print_status(f'Unknown backtests action: {action}', success=False)
+
+
+# ------------------------------------------------------------------
+# research — offline experiment registry (P2 Task 4)
+# ------------------------------------------------------------------
+
+def _research_now():
+    import datetime as _dt
+    return _dt.datetime.now(_dt.timezone.utc)
+
+
+def _research_duckdb_path() -> str:
+    """Resolve the offline research DB path. Env override wins (used for tests
+    and ops); otherwise config, then the documented default. NEVER shares a file
+    with an operational/journal/history DB."""
+    import os
+    from pathlib import Path
+    path = os.environ.get('MMR_RESEARCH_DUCKDB')
+    if not path:
+        try:
+            from trader.container import Container
+            cfg = Container.instance().config()
+            path = cfg.get('research_duckdb_path')
+        except Exception:
+            path = None
+        path = path or '~/.local/share/mmr/data/mmr_research.duckdb'
+    p = Path(path).expanduser()
+    p.parent.mkdir(parents=True, exist_ok=True)
+    return str(p)
+
+
+def _research_registry():
+    from trader.data.duckdb_store import DuckDBConnection
+    from trader.data.schema_migrations import SchemaMigrator
+    from trader.research.experiment_registry import ExperimentRegistry
+    from trader.research.schema import apply_research_migrations
+    db = DuckDBConnection.get_instance(_research_duckdb_path())
+    apply_research_migrations(SchemaMigrator(db))
+    return ExperimentRegistry(db)
+
+
+def _git_head() -> str:
+    import subprocess
+    try:
+        return subprocess.check_output(
+            ['git', 'rev-parse', 'HEAD'], stderr=subprocess.DEVNULL, text=True).strip()
+    except Exception:
+        return ''
+
+
+def _dependency_lock_digest() -> str:
+    import hashlib
+    from pathlib import Path
+    for name in ('uv.lock', 'requirements.txt', 'pyproject.toml'):
+        p = Path(name)
+        if p.exists():
+            return 'sha256:' + hashlib.sha256(p.read_bytes()).hexdigest()
+    return ''
+
+
+def _handle_research(args: argparse.Namespace):
+    """Offline experiment-registry commands (no trader/strategy service)."""
+    action = getattr(args, 'research_action', None)
+    if action == 'family':
+        _handle_research_family(args)
+    elif action == 'trial':
+        _handle_research_trial(args)
+    elif action == 'artifact':
+        _handle_research_artifact(args)
+    elif action == 'import-legacy':
+        _handle_research_import_legacy(args)
+    else:
+        print_status('Usage: research {family|trial|artifact|import-legacy} ...', success=False)
+
+
+def _handle_research_family(args: argparse.Namespace):
+    import json as _json
+    from pathlib import Path
+    from trader.data.backtest_store import compute_strategy_hash
+    from trader.research.artifact import ExperimentFamily
+
+    reg = _research_registry()
+    fa = getattr(args, 'family_action', None)
+
+    if fa == 'create':
+        try:
+            search_space = _json.loads(args.search_space)
+            cost_model = _json.loads(args.cost_model)
+            validation = _json.loads(args.validation)
+        except _json.JSONDecodeError as e:
+            print_status(f'Invalid JSON argument: {e}', success=False)
+            return
+        source_digest = compute_strategy_hash(str(Path(args.strategy).expanduser())) or 'unknown'
+        try:
+            family = ExperimentFamily(
+                strategy_path=args.strategy,
+                class_name=args.class_name,
+                repository_commit=(args.commit or _git_head() or 'unknown'),
+                source_tree_digest=source_digest,
+                dependency_lock_digest=(args.dependency_digest or _dependency_lock_digest() or 'unknown'),
+                container_digest=args.container_digest,
+                dataset_manifest_digest=args.dataset_digest,
+                search_space=search_space,
+                cost_model=cost_model,
+                validation_protocol=validation,
+            )
+        except ValueError as e:
+            print_status(f'Invalid family: {e}', success=False)
+            return
+        fid = reg.create_family(family, created_at=_research_now())
+        print_json_result({
+            'family_id': fid,
+            'strategy_path': family.strategy_path,
+            'class_name': family.class_name,
+            'provenance': family.provenance,
+            'dataset_manifest_digest': family.dataset_manifest_digest,
+        }, title='Experiment family created')
+
+    elif fa == 'show':
+        family = reg.get_family(args.family_id)
+        if family is None:
+            print_status(f'Family not found: {args.family_id}', success=False)
+            return
+        trials = reg.list_trials(args.family_id, include_archived=True)
+        print_json_result({
+            'family_id': family.family_id,
+            'strategy_path': family.strategy_path,
+            'class_name': family.class_name,
+            'provenance': family.provenance,
+            'repository_commit': family.repository_commit,
+            'dataset_manifest_digest': family.dataset_manifest_digest,
+            'search_space': family.search_space,
+            'cost_model': family.cost_model,
+            'validation_protocol': family.validation_protocol,
+            'selection_trial_count': reg.selection_trial_count(args.family_id),
+            'trials': [{
+                'trial_id': t.trial_id, 'trial_key': t.trial_key, 'status': t.status,
+                'archived': t.archived, 'parameters': t.parameters, 'metrics': t.metrics,
+                'safe_summary': t.safe_summary,
+            } for t in trials],
+        }, title=f'Family {family.class_name}')
+    else:
+        print_status('Usage: research family {create|show}', success=False)
+
+
+def _handle_research_trial(args: argparse.Namespace):
+    import hashlib
+    import json as _json
+    import math as _math
+    import subprocess
+    import sys
+    import traceback as _tb
+    from trader.research.artifact import (
+        PROVENANCE_RESEARCH, TRIAL_FAILED, TRIAL_INVALID, TRIAL_SUCCEEDED)
+    from trader.research.experiment_registry import TrialAlreadyExists
+
+    if getattr(args, 'trial_action', None) != 'run':
+        print_status('Usage: research trial run <family_id> --conids ... --params ...', success=False)
+        return
+
+    reg = _research_registry()
+    family = reg.get_family(args.family_id)
+    if family is None:
+        print_status(f'Family not found: {args.family_id}', success=False)
+        return
+    if family.provenance != PROVENANCE_RESEARCH:
+        print_status('Cannot run trials on a LEGACY_UNQUALIFIED family', success=False)
+        return
+    try:
+        params = _json.loads(args.params)
+    except _json.JSONDecodeError as e:
+        print_status(f'Invalid --params JSON: {e}', success=False)
+        return
+
+    key = args.key or ('t-' + hashlib.sha256(
+        _json.dumps(params, sort_keys=True).encode()).hexdigest()[:12])
+    try:
+        tid = reg.start_trial(args.family_id, trial_key=key, parameters=params,
+                              started_at=_research_now())
+    except TrialAlreadyExists:
+        print_status(f'Trial key already used in this family: {key}', success=False)
+        return
+
+    # Run the backtest through the proven CLI subprocess path (same as sweeps),
+    # then record the real outcome — SUCCEEDED with metrics, FAILED with a
+    # traceback digest, or INVALID if the output can't be parsed.
+    cmd = [sys.executable, '-m', 'trader.mmr_cli', '--json', 'backtest',
+           '-s', family.strategy_path, '--class', family.class_name,
+           '--conids', *[str(c) for c in args.conids],
+           '--days', str(args.days), '--bar-size', args.bar_size, '--summary-only']
+    if params:
+        cmd.extend(['--params', _json.dumps(params)])
+    proc = subprocess.run(cmd, capture_output=True, text=True)
+
+    if proc.returncode != 0:
+        err = (proc.stderr or proc.stdout or 'backtest failed')[-4000:]
+        summary_line = next((ln for ln in reversed(err.strip().splitlines()) if ln.strip()),
+                            'backtest failed')[:200]
+        reg.finish_trial(tid, status=TRIAL_FAILED, finished_at=_research_now(),
+                         traceback=err, safe_summary=summary_line)
+        print_json_result({'trial_id': tid, 'status': TRIAL_FAILED, 'error_tail': err[-500:]},
+                          title='Trial FAILED')
+        return
+    try:
+        summary = _json.loads(proc.stdout.strip()).get('data', {}).get('summary', {})
+    except Exception as e:  # noqa: BLE001
+        reg.finish_trial(tid, status=TRIAL_INVALID, finished_at=_research_now(),
+                         traceback=_tb.format_exc(), safe_summary=f'unparseable output: {e}'[:200])
+        print_json_result({'trial_id': tid, 'status': TRIAL_INVALID}, title='Trial INVALID')
+        return
+
+    metrics = {
+        k: summary[k] for k in ('total_return', 'sharpe_ratio', 'sortino_ratio', 'calmar_ratio',
+                                'max_drawdown', 'profit_factor', 'expectancy_bps', 'win_rate',
+                                'total_trades')
+        if isinstance(summary.get(k), (int, float)) and _math.isfinite(summary[k])}
+    reg.finish_trial(tid, status=TRIAL_SUCCEEDED, finished_at=_research_now(), metrics=metrics)
+    print_json_result({'trial_id': tid, 'status': TRIAL_SUCCEEDED, 'metrics': metrics},
+                      title='Trial SUCCEEDED')
+
+
+def _handle_research_artifact(args: argparse.Namespace):
+    if getattr(args, 'artifact_action', None) != 'show':
+        print_status('Usage: research artifact show <artifact_id>', success=False)
+        return
+    reg = _research_registry()
+    art = reg.get_artifact(args.artifact_id)
+    if art is None:
+        print_status(f'Artifact not found: {args.artifact_id}', success=False)
+        return
+    print_json_result({
+        'artifact_id': art.artifact_id,
+        'family_id': art.family_id,
+        'selected_trial_id': art.selected_trial_id,
+        'selected_parameters': art.selected_parameters,
+        'provenance': art.provenance,
+        'state': art.state,
+        'holdout_opened': art.holdout_opened,
+        'holdout_passed': art.holdout_passed,
+    }, title='Strategy artifact')
+
+
+def _handle_research_import_legacy(args: argparse.Namespace):
+    from trader.container import Container
+    from trader.data.backtest_store import BacktestStore
+
+    reg = _research_registry()
+    try:
+        duckdb_path = Container.instance().config().get('duckdb_path', '')
+    except Exception:
+        duckdb_path = ''
+    if not duckdb_path:
+        print_status('duckdb_path not configured', success=False)
+        return
+    records = BacktestStore(duckdb_path).list(limit=None, include_archived=True)
+    if not records:
+        print_status('No backtest runs to import', success=False)
+        return
+    fids = reg.import_legacy_backtests(records, imported_at=_research_now())
+    print_json_result({
+        'families_imported': len(fids),
+        'runs_imported': len(records),
+        'family_ids': fids,
+    }, title='Imported legacy backtests as LEGACY_UNQUALIFIED')
 
 
 # --- backtests list: per-metric quality classification -----------------
@@ -10418,7 +10738,7 @@ def repl(mmr: MMR):
 # Entry point
 # ------------------------------------------------------------------
 
-_LOCAL_ONLY_COMMANDS = {'backtest', 'bt', 'data', 'propose', 'proposals', 'reject', 'market-hours', 'mh', 'session', 'group'}
+_LOCAL_ONLY_COMMANDS = {'backtest', 'bt', 'data', 'propose', 'proposals', 'reject', 'market-hours', 'mh', 'session', 'group', 'research'}
 _LOCAL_ONLY_STRAT_ACTIONS = {'create', 'deploy', 'undeploy', 'signals', 'backtest'}
 
 

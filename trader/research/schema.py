@@ -82,13 +82,19 @@ _QUALITY_STATEMENTS = (
 
 
 def apply_research_migrations(migrator: SchemaMigrator) -> None:
-    """Research DB migrations 1-2 (idempotent)."""
+    """Set up the WHOLE offline research DB (idempotent): dataset manifests
+    (migrations 1-2) plus the experiment registry (migrations 3-6). The research
+    DB is a single file, so one call bootstraps every research table. The
+    experiment migrations are imported lazily to keep this module free of a
+    hard dependency on the registry at import time."""
     migrator.apply(version=RESEARCH_MIGRATION_DATASET_MANIFESTS,
                    name="research_dataset_manifests",
                    statements=list(_MANIFEST_STATEMENTS))
     migrator.apply(version=RESEARCH_MIGRATION_DATASET_QUALITY,
                    name="research_dataset_quality",
                    statements=list(_QUALITY_STATEMENTS))
+    from trader.research.experiment_registry import apply_experiment_migrations
+    apply_experiment_migrations(migrator)
 
 
 class DigestConflict(Exception):

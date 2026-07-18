@@ -40,6 +40,8 @@ RUNNABLE = {
     "duplicate_create_idempotent",
     "ambiguous_submit_reconciles",
     "restart_unresolved",
+    "stale_quote_blocks_dispatch",
+    "notional_cap_blocks_dispatch",
 }
 PENDING = {
     "liquidation_flat_only_from_broker_truth",

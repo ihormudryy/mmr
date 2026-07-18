@@ -26,12 +26,13 @@ NOW = dt.datetime(2026, 7, 18, 14, 30, tzinfo=UTC)
 
 
 def _request(*, command_id="cmd-1", action="approve_proposal", account_id="DU123",
-             target_id="42", body=None):
+             target_id="42", body=None, session_fingerprint="sess-abc"):
     return CommandRequest(
         command_id=command_id, action=action, account_id=account_id,
         target_type="proposal", target_id=target_id, expected_version=None,
         body=(body if body is not None else {"amount": 5000}),
-        source="dashboard", preflight_nonce=None)
+        source="dashboard", preflight_nonce=None,
+        session_fingerprint=session_fingerprint)
 
 
 @pytest.fixture
@@ -110,6 +111,22 @@ def test_wrong_account_is_rejected(gate):
     g, journal = gate
     nonce = _issue(g, _request(account_id="DU123"))
     assert _consume(g, journal, nonce, _request(account_id="DUother")) is False
+
+
+def test_wrong_session_fingerprint_is_rejected(gate):
+    g, journal = gate
+    nonce = _issue(g, _request())  # issued to session "sess-abc"
+    # A command from a DIFFERENT session must not spend this nonce.
+    assert _consume(g, journal, nonce, _request(session_fingerprint="sess-evil")) is False
+    # ... and the issuing session still can.
+    assert _consume(g, journal, nonce, _request()) is True
+
+
+def test_missing_session_fingerprint_is_rejected(gate):
+    g, journal = gate
+    nonce = _issue(g, _request())
+    # No fingerprint on the command -> can't prove same-session -> fail closed.
+    assert _consume(g, journal, nonce, _request(session_fingerprint=None)) is False
 
 
 def test_issue_records_binding_fields(gate):

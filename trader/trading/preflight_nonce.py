@@ -67,13 +67,14 @@ class PreflightNonceGate:
     ``issue`` binds the nonce to ``command_id`` + account + account mode +
     session fingerprint + the canonical request hash (design C5) and returns it.
     ``consume_in_tx`` re-verifies everything the ``CommandRequest`` carries
-    (command_id, account, and the canonical hash of action/target/expected-
-    version/body), plus not-expired and not-already-consumed, then spends the
-    nonce -- ALL on the caller's ``conn``, so the spend commits together with the
-    command claim: a nonce can never be double-spent, replayed, or made to
-    authorize a mutated request. ``account_mode`` / ``session_fingerprint`` are
-    recorded for audit; the coordinator can only enforce what the
-    ``CommandRequest`` itself carries.
+    (command_id, account, the canonical hash of action/target/expected-version/
+    body, and the issuing ``session_fingerprint``), plus not-expired and
+    not-already-consumed, then spends the nonce -- ALL on the caller's ``conn``,
+    so the spend commits together with the command claim: a nonce can never be
+    double-spent, replayed, made to authorize a mutated request, or replayed
+    from a different session. ``account_mode`` is recorded for audit but not
+    re-compared at consume: it is subsumed by the account_id binding (paper vs
+    live accounts have distinct ids) and is fixed per single-mode trader.
     """
 
     def __init__(self, journal: DomainJournal, *,
@@ -103,22 +104,33 @@ class PreflightNonceGate:
         if not nonce:
             return False
         row = conn.execute(
-            "SELECT command_id, account_id, request_hash, expires_at, consumed "
-            "FROM preflight_nonces WHERE nonce = ?", [nonce]).fetchone()
+            "SELECT command_id, account_id, request_hash, session_fingerprint, "
+            "expires_at, consumed FROM preflight_nonces WHERE nonce = ?",
+            [nonce]).fetchone()
         if row is None:
             return False
-        command_id, account_id, request_hash, expires_at, consumed = row
+        command_id, account_id, request_hash, session_fingerprint, expires_at, consumed = row
         if consumed:
             return False
         if self._now() > _as_utc(expires_at):
             return False
-        # Bindings the CommandRequest carries -- a mismatch means this nonce was
-        # issued for a different / mutated command and must not authorize it.
+        # Bindings a mismatch on means this nonce was issued for a different /
+        # mutated command, or from a different session, and must not authorize
+        # this request.
         if command_id != request.command_id:
             return False
         if account_id != request.account_id:
             return False
         if request_hash != canonical_request_hash(request):
+            return False
+        # Session binding: the command must be submitted under the SAME session
+        # the nonce was issued to (fail closed if the request carries no
+        # fingerprint). NOTE: account_mode is recorded at issue for audit but is
+        # deliberately NOT re-compared here -- it is subsumed by the account_id
+        # binding above (a paper vs a live account has a distinct account_id) and
+        # is fixed for a single-mode trader process, so a separate comparison
+        # could never fail.
+        if session_fingerprint != (request.session_fingerprint or ""):
             return False
         conn.execute(
             "UPDATE preflight_nonces SET consumed = TRUE WHERE nonce = ?", [nonce])

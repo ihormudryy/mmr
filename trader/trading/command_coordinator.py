@@ -452,6 +452,13 @@ class CommandRequest:
     source: str
     preflight_nonce: Optional[str] = None
     parent_command_id: Optional[str] = None
+    # Browser/session fingerprint the command was submitted under. Provenance,
+    # NOT command identity: excluded from ``canonical_request_hash`` (like
+    # ``source``/``preflight_nonce``) so a legitimate retry from the same
+    # session isn't seen as a different command. The preflight nonce gate binds
+    # a nonce to the issuing session's fingerprint and re-checks it here at
+    # consume, so a nonce can't be replayed from a different session.
+    session_fingerprint: Optional[str] = None
 
     def __post_init__(self) -> None:
         if ":" in self.command_id:

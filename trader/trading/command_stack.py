@@ -41,6 +41,9 @@ from trader.trading.proposal_command_service import ProposalCommandService
 from trader.trading.risk_producer import RiskProducer
 from trader.trading.dispatch_guard import DispatchGuard
 from trader.trading.circuit_breaker import CircuitBreaker
+from trader.trading.circuit_breaker import BreakerSignal
+from trader.trading.liquidation_service import LiquidationService
+from trader.trading.order_correlation import encode_order_ref
 from trader.trading.semantic_readiness import (
     SemanticReadiness,
     xnys_session_key,
@@ -88,6 +91,29 @@ class _UniverseAuthority:
         return rows[0] if rows else None
 
 
+class _LiquidationDispatch:
+    """Adapter which keeps emergency flattening on the existing IB boundary."""
+    def __init__(self, dispatch):
+        self._dispatch = dispatch
+
+    def cancel(self, order, command_id: str) -> None:
+        self._dispatch.cancel(order.order_entity_id, encode_order_ref(command_id))
+
+    def reduce(self, position, side: str, quantity: float, command_id: str) -> None:
+        self._dispatch.reduce_position(position, side, quantity, encode_order_ref(command_id))
+
+
+class _LiquidationBreaker:
+    def __init__(self, breaker: CircuitBreaker, now):
+        self._breaker = breaker
+        self._now = now
+
+    def trip_liquidation(self, cause_command_id: str, detail: str) -> None:
+        self._breaker.record(BreakerSignal(
+            "LIQUIDATION_FAILED", self._now(), detail=detail, key=cause_command_id,
+        ))
+
+
 @dataclass(frozen=True)
 class CommandStack:
     journal: Any
@@ -105,6 +131,7 @@ class CommandStack:
     reconciliation_complete: Callable[[str], bool]
     circuit_breaker: CircuitBreaker
     semantic_readiness: SemanticReadiness
+    liquidation_service: LiquidationService
 
 
 _REQUIRED_TRADER_PORTS = (
@@ -324,6 +351,10 @@ def build_command_stack(
         reconciliation_complete=reconciliation_safe,
         session_key=xnys_session_key,
     )
+    liquidation_service = LiquidationService(
+        broker_snapshot, _LiquidationDispatch(dispatch),
+        breaker=_LiquidationBreaker(circuit_breaker, now), now=now,
+    )
     proposal_service = ProposalCommandService(
         repository=repository,
         journal=journal,
@@ -379,6 +410,7 @@ def build_command_stack(
         reconciliation_complete=reconciliation_complete,
         circuit_breaker=circuit_breaker,
         semantic_readiness=semantic_readiness,
+        liquidation_service=liquidation_service,
     )
     trader.command_ledger = ledger
     trader.command_reconciler = reconciler
@@ -386,4 +418,5 @@ def build_command_stack(
     trader.trading_control_store = controls
     trader.automation_circuit_breaker = circuit_breaker
     trader.semantic_readiness = semantic_readiness
+    trader.liquidation_service = liquidation_service
     return stack

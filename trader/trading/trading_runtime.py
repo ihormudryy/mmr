@@ -2237,6 +2237,40 @@ class TradingRuntimeOrderDispatch:
         self._trader.client.ib.cancelOrder(order)
         return CancelAck(order_entity_id=order_entity_id, cancelled=True)
 
+    def reduce_position(self, position, side: str, quantity: float, order_ref: str):
+        """Submit an emergency reduce-only market order.
+
+        This intentionally bypasses proposal semantics, but not the trader's
+        one real-order boundary.  The caller supplies a broker position and
+        this method re-derives side/quantity, rejecting any request which
+        could increase or flip exposure.
+        """
+        broker_quantity = float(position.quantity)
+        expected_side = 'SELL' if broker_quantity > 0 else 'BUY'
+        if broker_quantity == 0 or side != expected_side or float(quantity) != abs(broker_quantity):
+            raise ValueError('liquidation order must exactly reduce the broker position')
+        loop = getattr(self._trader, '_main_loop', None)
+        if loop is None:
+            raise RuntimeError('trader event loop unavailable for liquidation')
+        contract = Contract(
+            conId=int(position.conid), symbol=position.symbol,
+            secType=position.sec_type or 'STK', exchange=position.exchange or 'SMART',
+            currency=position.currency or 'USD',
+        )
+        future = asyncio.run_coroutine_threadsafe(
+            self._trader.place_expressive_order(
+                contract, side, abs(broker_quantity),
+                {'order_type': 'MARKET', 'exit_type': 'NONE', 'tif': 'DAY', 'outside_rth': False},
+                algo_name=order_ref,
+            ), loop,
+        )
+        result = future.result(timeout=self._dispatch_timeout)
+        if result.is_success():
+            return result.obj or []
+        if result.exception is not None:
+            raise result.exception
+        raise RuntimeError(str(result.error or 'liquidation dispatch failed'))
+
     def _perm_id_for_order(self, order_entity_id: str):
         # Conn-free reverse alias lookup (order_entity_id -> perm_id). Fail-safe:
         # no store -> None -> cancel raises CancelUnresolved (reconciler resolves).

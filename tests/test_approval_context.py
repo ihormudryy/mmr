@@ -24,6 +24,7 @@ UTC = dt.timezone.utc
 NOW = dt.datetime(2026, 7, 18, 14, 30, tzinfo=UTC)
 CONID = 265598
 ACCT = "DU123"
+MARGIN = {"initMarginAfter": 5000.0, "equityWithLoanAfter": 100000.0}
 
 
 def _quote(price=210.0, ts=NOW, side="BUY"):
@@ -54,7 +55,7 @@ class _Positions:
 
 class _Broker:
     def __init__(self, *, ready=True, net_liq=100000.0, daily_pnl=-250.0,
-                 open_orders=2, position_value=5000.0, margin=1200.0,
+                 open_orders=2, position_value=5000.0, margin=MARGIN,
                  raise_on=None):
         self._ready = ready
         self._net_liq = net_liq
@@ -127,7 +128,7 @@ class TestCapture:
         assert ctx.quote.price == 205.0
         assert ctx.net_liquidation == 100000.0 and ctx.daily_pnl == -250.0
         assert ctx.open_order_count == 2 and ctx.position_value == 5000.0
-        assert ctx.reducible_quantity == 3.0 and ctx.what_if_margin == 1200.0
+        assert ctx.reducible_quantity == 3.0 and ctx.what_if_margin == MARGIN
         assert ctx.captured_at == NOW
         # exactly one read per port (single generation)
         assert quotes.calls == 1 and positions.calls == 1

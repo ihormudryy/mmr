@@ -47,7 +47,7 @@ class BrokerAuthority(Protocol):
     def daily_pnl(self) -> float: ...
     def open_order_count(self) -> int: ...
     def position_value(self, conid: int) -> float: ...
-    def what_if_margin(self, conid: int, side: str, quantity: float) -> Optional[float]: ...
+    def what_if_margin(self, conid: int, side: str, quantity: float) -> Optional[dict]: ...
 
 
 class ApprovalContextError(RuntimeError):
@@ -78,7 +78,9 @@ class ApprovalContext:
     position_value: float
     reducible_quantity: float
     captured_at: dt.datetime
-    what_if_margin: Optional[float] = None
+    # The whatIfOrder margin-impact dict (shape of RiskGate.check_leverage's
+    # input), or None when the broker's what-if is unavailable.
+    what_if_margin: Optional[dict] = None
 
     def notional(self, quantity: float) -> float:
         """Order notional (magnitude): ``|quantity| * quote price``."""
@@ -161,5 +163,5 @@ def capture_approval_context(
         position_value=float(position_value),
         reducible_quantity=float(reducible),
         captured_at=now,
-        what_if_margin=(None if what_if_margin is None else float(what_if_margin)),
+        what_if_margin=(None if what_if_margin is None else dict(what_if_margin)),
     )

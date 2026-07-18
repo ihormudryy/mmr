@@ -50,12 +50,12 @@
 
 **Research migrations 1-2:** `dataset_manifests`, `dataset_files`, `dataset_quality_findings`, `dataset_corrections`; primary key is SHA-256 manifest digest and sealed rows are append-only.
 
-- [ ] Write golden canonicalization tests for UTC timestamps, decimals, tuple ordering, mapping-key sorting, Unicode, and rejection of NaN/Infinity/naive datetimes.
-- [ ] Write manifest tests covering vendor/retrieval, calendar/package version, timestamp convention, adjustments, boundaries, checksums, quality summary, spread source, and correction lineage.
-- [ ] Test seal idempotency and digest conflict; UPDATE/DELETE APIs must not exist for sealed records.
-- [ ] Implement `canonical_json_bytes(value)`, `sha256_digest(prefix, value)`, frozen `DatasetManifest`, `QualityFinding`, and `DatasetManifestRepository.seal/get`.
-- [ ] A required finding with `passed=False` makes `research_eligible=False`; no caller flag may override it.
-- [ ] Run `uv run --frozen --extra test pytest tests/research/test_dataset_manifest.py -q` and commit `feat(research): add immutable dataset manifests`.
+- [x] Write golden canonicalization tests for UTC timestamps, decimals, tuple ordering, mapping-key sorting, Unicode, and rejection of NaN/Infinity/naive datetimes.
+- [x] Write manifest tests covering vendor/retrieval, calendar/package version, timestamp convention, adjustments, boundaries, checksums, quality summary, spread source, and correction lineage.
+- [x] Test seal idempotency and digest conflict; UPDATE/DELETE APIs must not exist for sealed records.
+- [x] Implement `canonical_json_bytes(value)`, `sha256_digest(prefix, value)`, frozen `DatasetManifest`, `QualityFinding`, and `DatasetManifestRepository.seal/get`.
+- [x] A required finding with `passed=False` makes `research_eligible=False`; no caller flag may override it.
+- [x] Run `uv run --frozen --extra test pytest tests/research/test_dataset_manifest.py -q` and commit `feat(research): add immutable dataset manifests`.
 
 ### Task 3: Freeze point-in-time universes and qualify bars
 

@@ -93,6 +93,8 @@ from trader.domain.identity import command_entity_id
 from trader.messaging.typed_rpc import TypedRpcRemoteError, canonical_json
 from trader.strategy.strategy_revisions import StrategyCommandReceipt
 from trader.trading.order_correlation import encode_order_ref
+from trader.trading.approval_context import ApprovalContext, ExecutableMarketEvidence
+from trader.trading.dispatch_guard import DispatchGuardError
 from trader.trading.proposal_command_service import (
     ExecutableQuote,
     PositionAuthority,
@@ -1249,6 +1251,7 @@ class ApprovalCommandService:
         account_mode: str,
         now: Callable[[], dt.datetime] = _utcnow,
         outside_session_limit_enabled: bool = False,
+        dispatch_guard: Any = None,
     ):
         self._journal = journal
         self._ledger = ledger
@@ -1264,6 +1267,7 @@ class ApprovalCommandService:
         self._account_mode = account_mode
         self._now = now
         self._outside_session_limit_enabled = outside_session_limit_enabled
+        self._dispatch_guard = dispatch_guard
 
     # -- public saga entry point (the registered action handler) ----------
 
@@ -1271,7 +1275,17 @@ class ApprovalCommandService:
         proposal_id = int(cmd.body["proposal_id"])
         record = self._repo.get(proposal_id)
 
-        problem, direction, decision = self._validate(record, cmd)
+        problem, direction, decision, approved_context = self._validate(record, cmd)
+        if approved_context is not None:
+            decision = {
+                **decision,
+                "generation_id": approved_context.broker.generation_id,
+                "source_cursor": approved_context.broker.source_cursor,
+                "quote_timestamp": (
+                    approved_context.market.quote.market_timestamp.isoformat()
+                    if approved_context.market is not None else None
+                ),
+            }
 
         # Write-once risk decision, recorded regardless of approve/reject, in
         # its OWN transaction, BEFORE the claim tx. Never re-published on a
@@ -1343,6 +1357,41 @@ class ApprovalCommandService:
             return self._receipt(cmd.command_id, "REJECTED", "PROPOSAL_EXPIRED", False)
 
         claimed_record = claimed[0]
+
+        if self._dispatch_guard is not None and approved_context is not None:
+            try:
+                permit = self._dispatch_guard.revalidate(
+                    approved_context, cmd, self._now_utc()
+                )
+            except DispatchGuardError as ex:
+                self._risk_producer.publish_decision(
+                    f"{cmd.command_id}/dispatch",
+                    {"decision": "reject", "code": ex.code, "proposal_id": record.id},
+                    correlation_id=cmd.command_id,
+                )
+                self._fail_after_broker_rejection(
+                    cmd, record.id, claimed_record.revision,
+                    f"pre-dispatch validation: {ex.code}", error_code=ex.code,
+                )
+                return self._receipt(cmd.command_id, "REJECTED", ex.code, ex.retryable)
+            self._risk_producer.publish_decision(
+                f"{cmd.command_id}/dispatch",
+                {
+                    "decision": "approve", "proposal_id": record.id,
+                    "generation_id": permit.generation_id,
+                    "source_cursor": permit.source_cursor,
+                    "quote_timestamp": (
+                        permit.quote_timestamp.isoformat()
+                        if permit.quote_timestamp is not None else None
+                    ),
+                    "what_if_timestamp": (
+                        permit.what_if_timestamp.isoformat()
+                        if permit.what_if_timestamp is not None else None
+                    ),
+                    "warnings": list(permit.warnings),
+                },
+                correlation_id=cmd.command_id,
+            )
 
         # --- Irreversible boundary: dispatch the bracket to the broker. ---
         try:
@@ -1420,12 +1469,13 @@ class ApprovalCommandService:
 
     def _validate(
         self, record: Optional[ProposalRecord], cmd: CommandRequest
-    ) -> tuple[Optional[CommandProblem], Optional[RiskDirection], dict[str, Any]]:
+    ) -> tuple[Optional[CommandProblem], Optional[RiskDirection], dict[str, Any], Optional[ApprovalContext]]:
         def reject(code: str, retryable: bool):
             return (
                 CommandProblem(code, retryable),
                 None,
                 {"decision": "reject", "code": code, "proposal_id": int(cmd.body["proposal_id"])},
+                None,
             )
 
         # Guard order pins §9.2: "The proposal exists, is PENDING, and matches
@@ -1459,7 +1509,7 @@ class ApprovalCommandService:
             return reject(exc.code, retryable)
         except Exception:
             return reject("BROKER_UNAVAILABLE", True)
-        if not self._evaluate_risk(record).approved:
+        if not self._evaluate_risk(record, broker_snapshot).approved:
             return reject("RISK_REJECTED", False)
 
         held = float(broker_snapshot.reducible_quantity(record.conid))
@@ -1470,13 +1520,20 @@ class ApprovalCommandService:
         # BEFORE the exposure guards. classify_risk_direction alone can't
         # produce this code.
         if record.action == "SELL" and held > 0 and qty > held:
-            problem, _, decision = reject("REDUCIBLE_QUANTITY_EXCEEDED", False)
-            return problem, direction, decision
+            problem, _, decision, _ = reject("REDUCIBLE_QUANTITY_EXCEEDED", False)
+            return problem, direction, decision, None
         if direction is RiskDirection.REDUCING:
             # Pause-exempt close/cover; a stale feed is tolerated (no guards).
+            context = ApprovalContext(
+                conid=record.conid, side=record.action, quantity=qty,
+                reference_price=record.reference_price,
+                max_drift_bps=record.max_price_drift_bps,
+                risk_direction=direction, broker=broker_snapshot,
+                market=None, what_if=None,
+            )
             return None, direction, {
                 "decision": "approve", "direction": "REDUCING", "proposal_id": record.id,
-            }
+            }, context
         side = "ask" if record.action == "BUY" else "bid"
         quote = self._quotes.executable_quote(record.conid, side=side)
         problem = check_exposure_increasing_guards(
@@ -1485,12 +1542,25 @@ class ApprovalCommandService:
         if problem is not None:
             return problem, direction, {
                 "decision": "reject", "code": problem.code, "proposal_id": record.id,
-            }
+            }, None
+        context = ApprovalContext(
+            conid=record.conid, side=record.action, quantity=qty,
+            reference_price=record.reference_price,
+            max_drift_bps=record.max_price_drift_bps,
+            risk_direction=direction, broker=broker_snapshot,
+            market=ExecutableMarketEvidence(quote=quote, received_at=self._now_utc()),
+            what_if=None,
+        )
+        if self._dispatch_guard is not None:
+            try:
+                self._dispatch_guard.revalidate(context, cmd, self._now_utc())
+            except DispatchGuardError as ex:
+                return reject(ex.code, ex.retryable)
         return None, direction, {
             "decision": "approve", "direction": "INCREASING", "proposal_id": record.id,
-        }
+        }, context
 
-    def _evaluate_risk(self, record: ProposalRecord):
+    def _evaluate_risk(self, record: ProposalRecord, broker_snapshot):
         from trader.objects import Action
         from trader.trading.strategy import Signal
 
@@ -1501,12 +1571,19 @@ class ApprovalCommandService:
             risk=0.0,
             conid=int(record.conid or 0),
         )
-        return self._risk_gate.evaluate(signal=signal)
+        return self._risk_gate.evaluate(
+            signal=signal,
+            open_order_count=broker_snapshot.open_order_count,
+            daily_pnl=broker_snapshot.daily_pnl,
+            portfolio_value=broker_snapshot.net_liquidation,
+            position_value=broker_snapshot.position_value(record.conid),
+        )
 
     # -- finalizers -------------------------------------------------------
 
     def _fail_after_broker_rejection(
-        self, cmd: CommandRequest, proposal_id: int, expected_revision: int, reason: str
+        self, cmd: CommandRequest, proposal_id: int, expected_revision: int, reason: str,
+        error_code: str = "BROKER_REJECTED",
     ) -> None:
         def work(conn, append):
             row = self._repo.mark_failed_in_tx(
@@ -1520,10 +1597,10 @@ class ApprovalCommandService:
                 f"proposal:{proposal_id}:{row.revision}",
             )
             self._ledger.transition_in_tx(
-                conn, cmd.command_id, "SUBMITTING", "REJECTED", error_code="BROKER_REJECTED"
+                conn, cmd.command_id, "SUBMITTING", "REJECTED", error_code=error_code
             )
             append(
-                _command_updated_mutation(cmd, "REJECTED", self._now_utc(), error_code="BROKER_REJECTED"),
+                _command_updated_mutation(cmd, "REJECTED", self._now_utc(), error_code=error_code),
                 _noop_write,
                 f"command:{cmd.command_id}:rejected",
             )

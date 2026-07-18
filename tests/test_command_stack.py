@@ -141,11 +141,8 @@ def test_disabled_stack_is_dormant_even_when_ports_are_absent():
     ) is None
 
 
-def test_live_authority_refuses_startup_until_dispatch_guards_land(tmp_path):
-    from trader.trading.command_stack import (
-        CommandStackConfigurationError,
-        build_command_stack,
-    )
+def test_live_authority_builds_with_dispatch_guard_and_hard_notional(tmp_path):
+    from trader.trading.command_stack import build_command_stack
 
     trader = _trader(tmp_path)
     trader.ib_account = "U111111"
@@ -157,10 +154,11 @@ def test_live_authority_refuses_startup_until_dispatch_guards_land(tmp_path):
         max_order_notional=25_000.0,
     )
 
-    with pytest.raises(CommandStackConfigurationError) as exc:
-        build_command_stack(trader, policy, now=lambda: NOW)
+    stack = build_command_stack(trader, policy, now=lambda: NOW)
 
-    assert exc.value.code == "LIVE_GUARDS_INCOMPLETE"
+    assert stack is not None
+    assert stack.approval_service._dispatch_guard is not None
+    assert stack.approval_service._dispatch_guard._policy.max_order_notional == 25_000.0
 
 
 def test_one_registry_contains_reads_feed_ingest_and_landed_commands(tmp_path):

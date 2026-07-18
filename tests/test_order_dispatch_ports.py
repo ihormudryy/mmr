@@ -14,7 +14,8 @@ from types import SimpleNamespace
 
 import pytest
 
-from trader.trading.command_coordinator import CancelAck
+from trader.trading.command_coordinator import BrokerRejectedError, CancelAck
+from trader.trading.command_policy import CommandAuthorityPolicy
 from trader.trading.command_ports import CancelUnresolved
 from trader.trading.order_correlation import encode_order_ref
 from trader.trading.trading_runtime import TradingRuntimeOrderDispatch
@@ -114,3 +115,31 @@ def test_find_by_order_ref_returns_only_the_matching_group_rows():
 def test_find_by_order_ref_is_empty_when_store_dormant():
     dispatch, _ = _dispatch(store=False)
     assert dispatch.find_by_order_ref(ACCT, encode_order_ref("og-cmd1")) == []
+
+
+@pytest.mark.parametrize(
+    ("account", "mode", "quantity", "reference", "message"),
+    [
+        ("DU999", "live", 1.0, 100.0, "account"),
+        (ACCT, "paper", 1.0, 100.0, "mode"),
+        (ACCT, "live", 300.0, 100.0, "notional"),
+        (ACCT, "live", 1.0, float("nan"), "notional"),
+    ],
+)
+def test_submit_rechecks_account_mode_and_notional_at_final_adapter(
+    account, mode, quantity, reference, message,
+):
+    dispatch, trader = _dispatch()
+    trader.ib_account = ACCT
+    trader.paper_trading = False
+    dispatch._policy = CommandAuthorityPolicy(
+        enabled=True, live_enabled=True, live_account_id=ACCT,
+        max_order_notional=25_000.0,
+    )
+    proposal = SimpleNamespace(
+        account_id=account, account_mode=mode, quantity=quantity,
+        reference_price=reference,
+    )
+
+    with pytest.raises(BrokerRejectedError, match=message):
+        dispatch.submit(proposal, "mmr:og-cmd", "og-cmd")

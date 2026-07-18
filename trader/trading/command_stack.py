@@ -24,6 +24,7 @@ from trader.trading.command_coordinator import (
 from trader.trading.command_alerts import LoggingCriticalAlertPort
 from trader.trading.command_policy import CommandAuthorityPolicy
 from trader.trading.command_ports import (
+    TraderBrokerAuthority,
     TraderBrokerRiskSnapshotAuthority,
     TraderPositionAuthority,
     TraderQuoteAuthority,
@@ -34,6 +35,7 @@ from trader.trading.preflight_nonce import (
 )
 from trader.trading.proposal_command_service import ProposalCommandService
 from trader.trading.risk_producer import RiskProducer
+from trader.trading.dispatch_guard import DispatchGuard
 from trader.trading.trading_control import (
     TradingControlStore,
     apply_trading_control_migration,
@@ -154,12 +156,6 @@ def build_command_stack(
     """
     if not policy.enabled:
         return None
-    if not getattr(trader, "paper_trading", False):
-        raise CommandStackConfigurationError(
-            "LIVE_GUARDS_INCOMPLETE",
-            "live command authority remains disabled until P1 Task 4 adds "
-            "trader-owned notional and immediate dispatch revalidation",
-        )
     _require_trader_ports(trader)
 
     journal = trader.domain_journal
@@ -190,6 +186,14 @@ def build_command_stack(
         account_mode=account_mode,
         ready=lambda: _broker_ready(trader),
     )
+    margin = TraderBrokerAuthority(
+        trader, run_coro=run_coro, resolve_contract=resolve_contract,
+    )
+    dispatch_guard = DispatchGuard(
+        broker=broker_snapshot, quotes=quotes, margin=margin,
+        controls=controls, risk_gate=trader.risk_gate, policy=policy,
+        account_id=trader.ib_account, account_mode=account_mode,
+    )
 
     def compute_risk_projection():
         snapshot = broker_snapshot.capture(trader.ib_account)
@@ -210,7 +214,7 @@ def build_command_stack(
 
     from trader.trading.trading_runtime import TradingRuntimeOrderDispatch
 
-    dispatch = TradingRuntimeOrderDispatch(trader)
+    dispatch = TradingRuntimeOrderDispatch(trader, policy=policy)
     orders_view = _BrokerStoreOrderView(trader.broker_state_store, journal)
     alerts = LoggingCriticalAlertPort(now=now)
     strategy = _UnavailableStrategyControl()
@@ -258,6 +262,7 @@ def build_command_stack(
         account_id=trader.ib_account,
         account_mode=account_mode,
         now=now,
+        dispatch_guard=dispatch_guard,
     )
     cancel_service = CancelCommandService(
         journal=journal,

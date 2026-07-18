@@ -54,14 +54,22 @@ class ApprovalContext:
 
     conid: int
     side: str
+    quantity: float
+    reference_price: float
+    max_drift_bps: float
+    risk_direction: object
     broker: BrokerRiskSnapshot
-    market: ExecutableMarketEvidence
+    market: Optional[ExecutableMarketEvidence]
     what_if: Optional[WhatIfEvidence]
 
     def notional(self, quantity: float) -> float:
+        if self.market is None:
+            raise ApprovalContextError("NO_QUOTE", "approval has no market evidence")
         return abs(float(quantity) * self.market.quote.price)
 
     def quote_age_seconds(self, now: dt.datetime) -> float:
+        if self.market is None:
+            raise ApprovalContextError("NO_QUOTE", "approval has no market evidence")
         return self.market.age_seconds(now)
 
     def is_quote_fresh(self, now: dt.datetime, max_age_seconds: float) -> bool:
@@ -75,6 +83,8 @@ class ApprovalContext:
 
     @property
     def quote(self) -> ExecutableQuote:
+        if self.market is None:
+            raise ApprovalContextError("NO_QUOTE", "approval has no market evidence")
         return self.market.quote
 
     @property
@@ -99,6 +109,8 @@ class ApprovalContext:
 
     @property
     def captured_at(self) -> dt.datetime:
+        if self.market is None:
+            return self.broker.promoted_at
         return self.market.received_at
 
     @property
@@ -127,6 +139,9 @@ def capture_approval_context(
     broker: BrokerRiskSnapshotAuthority,
     margin: WhatIfMarginAuthority,
     now: dt.datetime,
+    reference_price: Optional[float] = None,
+    max_drift_bps: float = 50.0,
+    risk_direction: object = "INCREASING",
 ) -> ApprovalContext:
     """Capture broker state once, then independently timestamp market evidence."""
     broker_snapshot = _required(
@@ -154,6 +169,10 @@ def capture_approval_context(
     return ApprovalContext(
         conid=conid,
         side=side,
+        quantity=float(quantity),
+        reference_price=float(quote.price if reference_price is None else reference_price),
+        max_drift_bps=float(max_drift_bps),
+        risk_direction=risk_direction,
         broker=broker_snapshot,
         market=ExecutableMarketEvidence(quote=quote, received_at=now),
         what_if=(

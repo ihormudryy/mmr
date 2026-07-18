@@ -1243,7 +1243,11 @@ def gate(tmp_path):
         market_timestamp=NOW, feed_type="live", session_state="continuous"))
     positions = SimpleNamespace(reducible_quantity=lambda account_id, conid: 0.0)
     broker = SimpleNamespace(capture=lambda account_id: SimpleNamespace(
-        reducible_quantity=lambda conid: 0.0))
+        account_id=account_id, account_mode="paper", generation_id=1,
+        source_cursor=1, open_order_count=0, daily_pnl=0.0,
+        net_liquidation=100_000.0, working_orders=(),
+        reducible_quantity=lambda conid: 0.0,
+        position_value=lambda conid: 0.0))
     risk_gate = SimpleNamespace(evaluate=lambda **_kw: SimpleNamespace(approved=True, reason=""))
     risk_producer = SimpleNamespace(publish_decision=lambda *a, **k: None)
     fake_reconciler = _RecordingReconciler()

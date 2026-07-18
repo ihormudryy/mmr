@@ -37,6 +37,7 @@ from trader.trading.command_coordinator import (
     TradingCommandCoordinator,
     apply_command_ledger_migration,
 )
+from trader.trading.dispatch_guard import DispatchGuardError, DispatchPermit
 from trader.trading.order_correlation import encode_order_ref
 from trader.trading.proposal_command_service import ExecutableQuote, ProposalCommandService
 from trader.trading.trading_control import (
@@ -109,7 +110,12 @@ class FakeBroker:
             account_mode=self.account_mode,
             generation_id=1,
             source_cursor=1,
+            open_order_count=0,
+            daily_pnl=0.0,
+            net_liquidation=100_000.0,
+            working_orders=(),
             reducible_quantity=lambda conid: self.positions._held.get(conid, 0.0),
+            position_value=lambda conid: abs(self.positions._held.get(conid, 0.0)) * 210.0,
         )
 
 
@@ -297,7 +303,11 @@ def test_happy_path_claims_dispatches_and_binds_order_ref(approval):
     # [Finding 2] the write-once risk decision is recorded, exactly once, with
     # the INCREASING-approve payload, BEFORE the claim tx.
     assert approval.risk_producer.decisions == [
-        ("cmd-1", {"decision": "approve", "direction": "INCREASING", "proposal_id": record.id})
+        ("cmd-1", {
+            "decision": "approve", "direction": "INCREASING",
+            "proposal_id": record.id, "generation_id": 1,
+            "source_cursor": 1, "quote_timestamp": NOW.isoformat(),
+        })
     ]
     assert approval.broker.calls == 1
     assert approval.positions.calls == 0  # approval uses the fenced snapshot, not live state
@@ -381,6 +391,60 @@ def test_dispatch_timeout_becomes_outcome_unknown_never_failed(approval):
     assert receipt.error_code == "DISPATCH_AMBIGUOUS"
     assert receipt.retryable is False                           # NEVER auto-retry ambiguous real money
     assert approval.ledger.get("cmd-1").state == "OUTCOME_UNKNOWN"
+
+
+def test_pre_dispatch_revalidation_failure_never_reaches_order_dispatch(approval):
+    class Guard:
+        def __init__(self):
+            self.calls = 0
+
+        def revalidate(self, approved, request, now):
+            self.calls += 1
+            if self.calls == 2:
+                raise DispatchGuardError(
+                    "BROKER_STATE_CHANGED", "position changed before dispatch",
+                    retryable=True,
+                )
+            return DispatchPermit(1, 1, NOW, NOW)
+
+    guard = Guard()
+    approval.service._dispatch_guard = guard
+    record = approval.pending(conid=265598, action="BUY")
+
+    receipt = approval.execute_approve(record, command_id="cmd-guard")
+
+    assert guard.calls == 2
+    assert receipt.state == "REJECTED"
+    assert receipt.error_code == "BROKER_STATE_CHANGED"
+    assert approval.orders.submissions == []
+    assert approval.repo.get(record.id).status == "FAILED"
+    assert approval.risk_producer.decisions[-1] == (
+        "cmd-guard/dispatch",
+        {"decision": "reject", "code": "BROKER_STATE_CHANGED", "proposal_id": record.id},
+    )
+
+
+def test_dispatch_approval_records_refreshed_fence_and_market_evidence(approval):
+    class Guard:
+        def revalidate(self, approved, request, now):
+            return DispatchPermit(3, 27, NOW, NOW)
+
+    approval.service._dispatch_guard = Guard()
+    record = approval.pending(conid=265598, action="BUY")
+
+    receipt = approval.execute_approve(record, command_id="cmd-permit")
+
+    assert receipt.state == "SUBMITTED"
+    assert approval.risk_producer.decisions[-1] == (
+        "cmd-permit/dispatch",
+        {
+            "decision": "approve", "proposal_id": record.id,
+            "generation_id": 3, "source_cursor": 27,
+            "quote_timestamp": NOW.isoformat(),
+            "what_if_timestamp": NOW.isoformat(),
+            "warnings": [],
+        },
+    )
 
 
 # ---------------------------------------------------------------------------

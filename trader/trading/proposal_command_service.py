@@ -20,6 +20,8 @@ class ExecutableQuote:
     market_timestamp: dt.datetime
     feed_type: str
     session_state: str
+    bid: Optional[float] = None
+    ask: Optional[float] = None
 
 
 class QuoteAuthority(Protocol):

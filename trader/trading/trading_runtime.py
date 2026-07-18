@@ -2147,12 +2147,32 @@ class TradingRuntimeOrderDispatch:
     ``broker_orders`` rows back to the group.
     """
 
-    def __init__(self, trader: 'Trader', *, dispatch_timeout: float = 30.0):
+    def __init__(self, trader: 'Trader', *, dispatch_timeout: float = 30.0, policy=None):
         self._trader = trader
         self._dispatch_timeout = dispatch_timeout
+        self._policy = policy
 
     def submit(self, proposal, order_ref: str, order_group_id: str):
         from trader.trading.command_coordinator import BrokerRejectedError, SubmittedOrders
+
+        if self._policy is not None:
+            import math
+            account = getattr(proposal, 'account_id', None)
+            mode = getattr(proposal, 'account_mode', None)
+            if account != getattr(self._trader, 'ib_account', None):
+                raise BrokerRejectedError('proposal account does not match trader account')
+            expected_mode = 'paper' if getattr(self._trader, 'paper_trading', False) else 'live'
+            if mode != expected_mode:
+                raise BrokerRejectedError('proposal account mode does not match trader mode')
+            try:
+                notional = abs(float(proposal.quantity) * float(proposal.reference_price))
+            except (TypeError, ValueError) as exc:
+                raise BrokerRejectedError('order notional is invalid') from exc
+            ceiling = self._policy.max_order_notional
+            if not math.isfinite(notional) or (
+                ceiling is not None and notional > float(ceiling)
+            ):
+                raise BrokerRejectedError('order notional exceeds trader policy')
 
         loop = getattr(self._trader, '_main_loop', None)
         if loop is None:

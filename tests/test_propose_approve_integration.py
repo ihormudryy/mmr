@@ -151,7 +151,11 @@ class FakeBroker:
         if not self.ready:
             raise RuntimeError("broker unavailable")
         return SimpleNamespace(
-            reducible_quantity=lambda conid: self.positions._held.get(conid, 0.0)
+            account_id=ACCOUNT_ID, account_mode=ACCOUNT_MODE,
+            generation_id=1, source_cursor=1, open_order_count=0,
+            daily_pnl=0.0, net_liquidation=100_000.0, working_orders=(),
+            reducible_quantity=lambda conid: self.positions._held.get(conid, 0.0),
+            position_value=lambda conid: abs(self.positions._held.get(conid, 0.0)) * 100.0,
         )
 
 

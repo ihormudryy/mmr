@@ -248,6 +248,8 @@ class TraderQuoteAuthority:
                 market_timestamp=market_timestamp,
                 feed_type=_feed_type(ticker),
                 session_state=_session_state(ticker),
+                bid=_usable_price(getattr(ticker, "bid", None)),
+                ask=_usable_price(getattr(ticker, "ask", None)),
             )
         except Exception as exc:  # noqa: BLE001 — no usable quote -> capture fails closed
             logger.warning("executable_quote unavailable for conid %s: %s", conid, exc)

@@ -42,7 +42,7 @@ from trader.trading.risk_producer import RiskProducer
 from trader.trading.dispatch_guard import DispatchGuard
 from trader.trading.circuit_breaker import CircuitBreaker
 from trader.trading.circuit_breaker import BreakerSignal
-from trader.trading.liquidation_service import LiquidationService
+from trader.trading.liquidation_service import LiquidationService, LiquidationRunStore, apply_liquidation_migration
 from trader.trading.order_correlation import encode_order_ref
 from trader.trading.semantic_readiness import (
     SemanticReadiness,
@@ -207,6 +207,7 @@ def build_command_stack(
     apply_trading_control_migration(migrator)
     apply_preflight_nonce_migration(migrator)
     apply_circuit_breaker_migration(migrator)
+    apply_liquidation_migration(migrator)
 
     repository = ProposalRepository(journal)
     ledger = CommandLedger(journal)
@@ -354,6 +355,7 @@ def build_command_stack(
     liquidation_service = LiquidationService(
         broker_snapshot, _LiquidationDispatch(dispatch),
         breaker=_LiquidationBreaker(circuit_breaker, now), now=now,
+        store=LiquidationRunStore(trader.journal_db),
     )
     proposal_service = ProposalCommandService(
         repository=repository,

@@ -12,8 +12,21 @@ import datetime as dt
 from dataclasses import dataclass
 from typing import Any, Callable, Optional, Protocol
 
+from trader.data.schema_migrations import SchemaMigrator
+
 
 _NON_FLAT = {"REQUESTED", "CANCELLING_ENTRIES", "REDUCING", "VERIFYING", "OUTCOME_UNKNOWN", "FAILED_SAFE"}
+LIQUIDATION_MIGRATION_VERSION = 25
+
+
+def apply_liquidation_migration(migrator: SchemaMigrator) -> None:
+    migrator.apply(LIQUIDATION_MIGRATION_VERSION, "p1_liquidation_runs", (
+        """CREATE TABLE IF NOT EXISTS liquidation_runs (
+            cause_command_id VARCHAR PRIMARY KEY, account_id VARCHAR NOT NULL,
+            state VARCHAR NOT NULL, deadline TIMESTAMPTZ NOT NULL,
+            generation_id BIGINT, detail VARCHAR NOT NULL, updated_at TIMESTAMPTZ NOT NULL
+        )""",
+    ))
 
 
 class BrokerSnapshotPort(Protocol):
@@ -44,6 +57,19 @@ class LiquidationReceipt:
     detail: str = ""
 
 
+class LiquidationRunStore:
+    """Small durable resume cursor; broker state remains the authority."""
+    def __init__(self, db): self._db = db
+    def load_unresolved(self):
+        rows = self._db.execute("SELECT account_id,cause_command_id,state,deadline,generation_id,detail FROM liquidation_runs WHERE state <> 'FLAT'", fetch="all")
+        return [LiquidationReceipt(*row) for row in rows]
+    def save(self, receipt, now):
+        def write(conn):
+            conn.execute("DELETE FROM liquidation_runs WHERE cause_command_id=?", [receipt.cause_command_id])
+            conn.execute("INSERT INTO liquidation_runs VALUES (?, ?, ?, ?, ?, ?, ?)", [receipt.cause_command_id, receipt.account_id, receipt.state, receipt.deadline, receipt.generation_id, receipt.detail, now])
+        self._db.transaction(write)
+
+
 class LiquidationService:
     """Conservative single-process saga; persistent orchestration is added by its owner.
 
@@ -59,13 +85,14 @@ class LiquidationService:
         dispatch: LiquidationDispatchPort,
         *,
         breaker: Optional[LiquidationBreakerPort] = None,
-        now: Callable[[], dt.datetime],
+        now: Callable[[], dt.datetime], store: Optional[LiquidationRunStore] = None,
     ):
         self._broker = broker
         self._dispatch = dispatch
         self._breaker = breaker
         self._now = now
-        self._runs: dict[str, LiquidationReceipt] = {}
+        self._store = store
+        self._runs: dict[str, LiquidationReceipt] = {r.cause_command_id: r for r in (store.load_unresolved() if store else ())}
 
     @staticmethod
     def child_command_id(cause_command_id: str, phase: str, key: str) -> str:
@@ -97,6 +124,8 @@ class LiquidationService:
             receipt.generation_id if generation_id is None else generation_id, detail,
         )
         self._runs[receipt.cause_command_id] = updated
+        if self._store is not None:
+            self._store.save(updated, self._now())
         if state != "FLAT" and self._breaker is not None:
             self._breaker.trip_liquidation(receipt.cause_command_id, detail or state)
         return updated

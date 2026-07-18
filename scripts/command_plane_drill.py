@@ -59,6 +59,7 @@ if str(_PROJECT_ROOT) not in sys.path:
 from trader.data.domain_journal import DomainJournal
 from trader.data.duckdb_store import DuckDBConnection
 from trader.data.proposal_repository import (
+    ProposalDraft,
     ProposalRepository,
     apply_proposal_authority_migration,
 )
@@ -77,6 +78,8 @@ from trader.trading.command_coordinator import (
 )
 from trader.trading.order_correlation import encode_order_ref
 from trader.trading.liquidation_service import LiquidationService
+from trader.trading.command_policy import CommandAuthorityPolicy
+from trader.trading.dispatch_guard import DispatchGuard
 from trader.data.circuit_breaker_store import CircuitBreakerStore, apply_circuit_breaker_migration
 from trader.trading.circuit_breaker import BreakerSignal, CircuitBreaker
 from trader.trading.semantic_readiness import SemanticReadiness
@@ -407,6 +410,138 @@ def scn_restart_unresolved(db_path: str) -> dict:
     return {"rescanned": rescan, "resubmissions": len(restarted.orders.submissions)}
 
 
+ACCOUNT_LIVE = "U1234567"
+
+
+class LiveApproval:
+    """A LIVE-mode approval path with a ``DispatchGuard`` wired in, plus a
+    directly inserted live-eligible pending proposal. This is the shape needed to
+    drive the guard's live-only enforcement (feed/freshness, notional, leverage)
+    end to end through the coordinator saga -- the harness itself runs paper, so
+    the live path is built explicitly here. Mirrors
+    ``tests/test_approval_command.py::_build_approval`` for ``account_mode='live'``
+    and the command-stack DispatchGuard wiring."""
+
+    def __init__(self, db_path: str, *, stale_quote: bool = False,
+                 max_notional: Optional[float] = None) -> None:
+        db = DuckDBConnection.get_instance(db_path)
+        migrator = SchemaMigrator(db)
+        journal = DomainJournal(db)
+        journal.migrate(migrator)
+        apply_proposal_authority_migration(migrator)
+        apply_command_ledger_migration(migrator)
+        apply_trading_control_migration(migrator)
+
+        self.journal = journal
+        self.repo = ProposalRepository(journal)
+        self.ledger = CommandLedger(journal)
+        self.controls = TradingControlStore(journal)
+        db.transaction(lambda conn: self.controls.seed_in_tx(conn, [(ACCOUNT_LIVE, "live")], NOW))
+
+        ts = NOW - dt.timedelta(seconds=30) if stale_quote else NOW
+        self.quotes = SimpleNamespace(executable_quote=lambda conid, side: ExecutableQuote(
+            conid=conid, side=side, price=210.0 if side == "ask" else 209.5,
+            market_timestamp=ts, feed_type="live", session_state="continuous"))
+        self.broker = SimpleNamespace(capture=lambda account_id: SimpleNamespace(
+            account_id=account_id, account_mode="live", generation_id=1, source_cursor=1,
+            open_order_count=0, daily_pnl=0.0, net_liquidation=1_000_000.0, working_orders=(),
+            reducible_quantity=lambda conid: 0.0, position_value=lambda conid: 0.0))
+        self.margin = SimpleNamespace(what_if_margin=lambda conid, side, quantity: {
+            "initMarginAfter": 5000.0, "equityWithLoanAfter": 1_000_000.0})
+        self.risk_gate = SimpleNamespace(
+            evaluate=lambda **_kw: SimpleNamespace(approved=True, reason=""),
+            check_leverage=lambda *a, **k: SimpleNamespace(approved=True, reason=""))
+        self.risk_producer = SimpleNamespace(publish_decision=lambda *a, **k: None)
+        self.orders = FakeOrders()
+        self.reconciler = OutcomeReconciler(
+            journal=journal, ledger=self.ledger, orders=self.orders,
+            strategy=FakeStrategyPort(), alerts=FakeAlerts(), repo=self.repo, now=lambda: NOW)
+
+        policy = CommandAuthorityPolicy(
+            enabled=True, live_enabled=True, live_account_id=ACCOUNT_LIVE,
+            max_order_notional=max_notional, max_drift_bps=50.0)
+        self.guard = DispatchGuard(
+            broker=self.broker, quotes=self.quotes, margin=self.margin,
+            controls=self.controls, risk_gate=self.risk_gate, policy=policy,
+            account_id=ACCOUNT_LIVE, account_mode="live")
+        self.service = ApprovalCommandService(
+            journal=journal, ledger=self.ledger, repo=self.repo, controls=self.controls,
+            orders=self.orders, quotes=self.quotes, risk_gate=self.risk_gate,
+            risk_producer=self.risk_producer, reconciler=self.reconciler, broker=self.broker,
+            account_id=ACCOUNT_LIVE, account_mode="live", now=lambda: NOW,
+            dispatch_guard=self.guard)
+        self.coordinator = TradingCommandCoordinator(
+            journal=journal, ledger=self.ledger, audit=CommandAudit(journal),
+            nonces=FakeNonceGate(), now=lambda: NOW, reconciler=self.reconciler)
+        self.coordinator.register_action(
+            "approve_proposal", self.service.approve, requires_preflight=True, saga=True)
+
+    def insert_pending(self, *, conid=CONID, action="BUY", quantity=10.0,
+                       reference_price=210.0):
+        pid = self.repo.reserve_id()
+        draft = ProposalDraft(
+            id=pid, symbol="AAPL", action=action, quantity=quantity,
+            amount=quantity * reference_price, execution={"order_type": "MARKET"},
+            reasoning="", confidence=0.7, thesis="", source="dashboard", metadata={},
+            sec_type="STK", account_id=ACCOUNT_LIVE, account_mode="live", conid=conid,
+            reference_price=reference_price, reference_timestamp=NOW,
+            reference_quote_side="ask" if action == "BUY" else "bid",
+            reference_feed_type="live", max_price_drift_bps=50.0,
+            expires_at=NOW + dt.timedelta(minutes=5), live_approval_eligible=True,
+            created_at=NOW)
+        predicted = ProposalCommandService._record_from_draft(draft, revision=1)
+        written: list = []
+        self.journal.mutate(
+            self.journal.connect(),
+            self.repo.mutation_for(predicted, "seed"),
+            lambda conn, revision: written.append(
+                self.repo.insert_pending_in_tx(conn, draft, revision)),
+            event_id=f"proposal:{pid}:1")
+        return written[0]
+
+    def approve(self, record, command_id="c-live"):
+        return self.coordinator.execute(CommandRequest(
+            command_id=command_id, action="approve_proposal", account_id=ACCOUNT_LIVE,
+            target_type="proposal", target_id=str(record.id), expected_version=record.revision,
+            body={"proposal_id": record.id}, source="dashboard",
+            preflight_nonce=f"nonce-{command_id}"))
+
+
+def scn_stale_quote_blocks_dispatch(db_path: str) -> dict:
+    """LIVE approval with a stale executable quote: the approval path refuses to
+    turn a stale quote into a live order (QUOTE_STALE); nothing dispatches."""
+    live = LiveApproval(db_path, stale_quote=True)
+    record = live.insert_pending()
+    receipt = live.approve(record)
+    if receipt.state != "REJECTED":
+        raise AssertionError(f"stale-quote approve state {receipt.state} != REJECTED")
+    if receipt.error_code != "QUOTE_STALE":
+        raise AssertionError(f"stale-quote error_code {receipt.error_code} != QUOTE_STALE")
+    if live.orders.submissions:
+        raise AssertionError("an order was dispatched on a stale quote")
+    if live.repo.get(record.id).status == "EXECUTED":
+        raise AssertionError("proposal executed on a stale quote")
+    return {"error_code": receipt.error_code, "orders_submitted": len(live.orders.submissions)}
+
+
+def scn_notional_cap_blocks_dispatch(db_path: str) -> dict:
+    """LIVE approval whose notional exceeds the policy ceiling: the DispatchGuard
+    (a check check_exposure does NOT perform) rejects ORDER_NOTIONAL_LIMIT before
+    any dispatch. Exercises the Task-4 guard specifically, end to end."""
+    # 10 * 210 = 2100 notional against a 1000 ceiling.
+    live = LiveApproval(db_path, max_notional=1000.0)
+    record = live.insert_pending()
+    receipt = live.approve(record)
+    if receipt.state != "REJECTED":
+        raise AssertionError(f"over-notional approve state {receipt.state} != REJECTED")
+    if receipt.error_code != "ORDER_NOTIONAL_LIMIT":
+        raise AssertionError(
+            f"over-notional error_code {receipt.error_code} != ORDER_NOTIONAL_LIMIT")
+    if live.orders.submissions:
+        raise AssertionError("an order was dispatched over the notional ceiling")
+    return {"error_code": receipt.error_code, "orders_submitted": len(live.orders.submissions)}
+
+
 # Scenario registry maps name -> (callable | None). None means the feature is
 # not landed yet (reported as pending, never as covered).
 def _liquidation_available() -> bool:
@@ -431,6 +566,8 @@ def build_scenarios() -> dict[str, Optional[Callable[[str], dict]]]:
         "duplicate_create_idempotent": scn_duplicate_create_idempotent,
         "ambiguous_submit_reconciles": scn_ambiguous_submit_reconciles,
         "restart_unresolved": scn_restart_unresolved,
+        "stale_quote_blocks_dispatch": scn_stale_quote_blocks_dispatch,
+        "notional_cap_blocks_dispatch": scn_notional_cap_blocks_dispatch,
         # Pending until their features land AND their scenarios are written.
         # Reported as pending (never silently "covered"). The feature-detection
         # helpers gate the flip from None -> scenario fn when the modules exist:

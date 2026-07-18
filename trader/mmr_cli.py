@@ -1621,6 +1621,72 @@ def build_parser() -> argparse.ArgumentParser:
     research_sub.add_parser('import-legacy',
                             help='Import BacktestStore history as LEGACY_UNQUALIFIED families')
 
+    # research review — the §8.5 mandatory qualitative review
+    rr_p = research_sub.add_parser('review', help='Record a mandatory §8.5 qualitative review')
+    rr_sub = rr_p.add_subparsers(dest='review_action')
+    rr_submit = rr_sub.add_parser('submit', help='Submit an operator review for an artifact')
+    rr_submit.add_argument('--artifact-id', required=True, help='Artifact id under review')
+    rr_submit.add_argument('--decision-id', required=True,
+                           help='Eligibility decision digest this review accompanies')
+    rr_submit.add_argument('--reviewer', required=True, help='Reviewer identity')
+    rr_submit.add_argument('--economic-rationale', required=True,
+                           help='Economic rationale + plausible source of edge')
+    rr_submit.add_argument('--edge-survives-costs', required=True,
+                           help='Why the edge should survive costs')
+    rr_submit.add_argument('--known-failure-regimes', required=True, help='Known failure regimes')
+    rr_submit.add_argument('--data-limits', required=True,
+                           help='Data + survivorship limitations')
+    rr_submit.add_argument('--parameter-sensitivity', required=True, help='Parameter sensitivity')
+    rr_submit.add_argument('--operational-dependencies', required=True,
+                           help='Operational dependencies')
+    rr_submit.add_argument('--capacity-and-decay', required=True, help='Expected capacity + decay')
+    rr_submit.add_argument('--episode-dominance', required=True,
+                           help='Assessment of implausible episode dominance')
+    rr_submit.add_argument('--holdout-opened-once', action='store_true',
+                           help='Confirm the holdout was opened exactly once (REQUIRED to be valid)')
+
+    # research attest — sign / verify Ed25519 eligibility attestations
+    rat_p = research_sub.add_parser('attest', help='Sign / verify eligibility attestations')
+    rat_sub = rat_p.add_subparsers(dest='attest_action')
+
+    rat_paper = rat_sub.add_parser('paper',
+                                   help='Sign a PAPER attestation from a passing decision + review')
+    rat_paper.add_argument('--decision-id', required=True, help='Eligibility decision digest')
+    rat_paper.add_argument('--review-id', help='Operator review digest (required for --yes)')
+    rat_paper.add_argument('--key-file', required=True,
+                           help='Path to the offline Ed25519 private key (PKCS8 PEM, 0o600)')
+    rat_paper.add_argument('--artifact-digest', required=True)
+    rat_paper.add_argument('--source-digest', required=True)
+    rat_paper.add_argument('--config-digest', required=True)
+    rat_paper.add_argument('--dataset-digest', required=True)
+    rat_paper.add_argument('--allowlist-digest', required=True)
+    rat_paper.add_argument('--training-boundary', required=True)
+    rat_paper.add_argument('--validation-boundary', required=True)
+    rat_paper.add_argument('--holdout-boundary', required=True)
+    rat_paper.add_argument('--evidence-boundary', required=True)
+    rat_paper.add_argument('--cost-assumptions', default='{}', help='JSON object')
+    rat_paper.add_argument('--capacity-assumptions', default='{}', help='JSON object')
+    rat_paper.add_argument('--max-gross-allocation', type=float, required=True,
+                           help='Maximum gross allocation fraction (e.g. 0.06)')
+    rat_paper.add_argument('--instruments', nargs='+', required=True,
+                           help='Permitted instrument symbols')
+    rat_paper.add_argument('--ttl-days', type=int, default=90, help='Expiry in days (default 90)')
+    rat_paper.add_argument('--yes', action='store_true',
+                           help='Skip interactive confirmation (requires --review-id)')
+
+    rat_verify = rat_sub.add_parser('verify',
+                                    help='Verify a stored attestation against expected bindings')
+    rat_verify.add_argument('--digest', required=True, help='Attestation payload digest')
+    rat_verify.add_argument('--public-key-file', required=True,
+                            help='Path to the Ed25519 public verification key (PEM)')
+    rat_verify.add_argument('--artifact-digest', required=True)
+    rat_verify.add_argument('--allowlist-digest', required=True)
+    rat_verify.add_argument('--ruleset-digest', required=True)
+    rat_verify.add_argument('--account-mode', required=True, help='Expected account mode (e.g. paper)')
+    rat_verify.add_argument('--max-gross-allocation', type=float, required=True)
+    rat_verify.add_argument('--instruments', nargs='+', required=True)
+    rat_verify.add_argument('--now', default='', help='Override "now" (ISO-8601 UTC); default: current time')
+
     # data
     data_p = sub.add_parser('data', help='Local data exploration (no service needed)',
                             epilog='Examples:\n'
@@ -4978,8 +5044,24 @@ def _handle_research(args: argparse.Namespace):
         _handle_research_artifact(args)
     elif action == 'import-legacy':
         _handle_research_import_legacy(args)
+    elif action == 'review':
+        _handle_research_review(args)
+    elif action == 'attest':
+        _handle_research_attest(args)
     else:
-        print_status('Usage: research {family|trial|artifact|import-legacy} ...', success=False)
+        print_status(
+            'Usage: research {family|trial|artifact|import-legacy|review|attest} ...',
+            success=False)
+
+
+def _research_db():
+    """The raw offline research DuckDBConnection with all migrations applied."""
+    from trader.data.duckdb_store import DuckDBConnection
+    from trader.data.schema_migrations import SchemaMigrator
+    from trader.research.schema import apply_research_migrations
+    db = DuckDBConnection.get_instance(_research_duckdb_path())
+    apply_research_migrations(SchemaMigrator(db))
+    return db
 
 
 def _handle_research_family(args: argparse.Namespace):
@@ -5171,6 +5253,212 @@ def _handle_research_import_legacy(args: argparse.Namespace):
         'runs_imported': len(records),
         'family_ids': fids,
     }, title='Imported legacy backtests as LEGACY_UNQUALIFIED')
+
+
+def _handle_research_review(args: argparse.Namespace):
+    """Record a §8.5 mandatory qualitative review (no service needed)."""
+    from trader.research.review import OperatorReview, OperatorReviewRepository
+
+    if getattr(args, 'review_action', None) != 'submit':
+        print_status('Usage: research review submit --artifact-id ... --decision-id ... ...',
+                     success=False)
+        return
+    if not args.holdout_opened_once:
+        print_status('Refusing to record: --holdout-opened-once must be set (the review '
+                     'must confirm the holdout was opened exactly once).', success=False)
+        return
+    try:
+        review = OperatorReview(
+            artifact_id=args.artifact_id,
+            eligibility_decision_digest=args.decision_id,
+            reviewer=args.reviewer,
+            reviewed_at=_research_now(),
+            economic_rationale=args.economic_rationale,
+            edge_survives_costs=args.edge_survives_costs,
+            known_failure_regimes=args.known_failure_regimes,
+            data_and_survivorship_limits=args.data_limits,
+            parameter_sensitivity=args.parameter_sensitivity,
+            operational_dependencies=args.operational_dependencies,
+            capacity_and_decay=args.capacity_and_decay,
+            episode_dominance=args.episode_dominance,
+            holdout_opened_once_confirmed=True)
+    except ValueError as e:
+        print_status(f'Invalid review: {e}', success=False)
+        return
+    digest = OperatorReviewRepository(_research_db()).record(review)
+    print_json_result({
+        'review_digest': digest,
+        'artifact_id': review.artifact_id,
+        'eligibility_decision_digest': review.eligibility_decision_digest,
+        'reviewer': review.reviewer,
+    }, title='Operator review recorded')
+
+
+def _handle_research_attest(args: argparse.Namespace):
+    """Sign or verify an Ed25519 eligibility attestation (offline, no service)."""
+    action = getattr(args, 'attest_action', None)
+    if action == 'paper':
+        _handle_research_attest_paper(args)
+    elif action == 'verify':
+        _handle_research_attest_verify(args)
+    else:
+        print_status('Usage: research attest {paper|verify} ...', success=False)
+
+
+def _attestation_public_view(att) -> dict:
+    """Public-only projection of an attestation for display — NEVER key bytes."""
+    return {
+        'payload_digest': att.payload_digest,
+        'artifact_digest': att.artifact_digest,
+        'source_digest': att.source_digest,
+        'config_digest': att.config_digest,
+        'dataset_manifest_digest': att.dataset_manifest_digest,
+        'allowlist_digest': att.allowlist_digest,
+        'ruleset_name': att.ruleset_name,
+        'ruleset_version': att.ruleset_version,
+        'ruleset_digest': att.ruleset_digest,
+        'eligibility_state': att.eligibility_state,
+        'permitted_account_mode': att.permitted_account_mode,
+        'max_gross_allocation': att.max_gross_allocation,
+        'permitted_instruments': list(att.permitted_instruments),
+        'created_at': att.created_at,
+        'expires_at': att.expires_at,
+        'operator_approved_at': att.operator_approved_at,
+        'reason_codes': list(att.reason_codes),
+        'evidence_refs': list(att.evidence_refs),
+        'eligibility_decision_digest': att.eligibility_decision_digest,
+        'review_digest': att.review_digest,
+        'public_key_id': att.public_key_id,
+        'signature': att.signature,
+    }
+
+
+def _handle_research_attest_paper(args: argparse.Namespace):
+    import datetime as _dt
+    import json as _json
+    from trader.research.attestation import AttestationRepository, build_attestation
+    from trader.research.eligibility import EligibilityDecisionRepository
+    from trader.research.review import OperatorReviewRepository
+    from trader.research.signing import (
+        AttestationSigner, InsecureKeyFile, InvalidKeyType, MalformedKey)
+
+    db = _research_db()
+    decision = EligibilityDecisionRepository(db).get(args.decision_id)
+    if decision is None:
+        print_status(f'Eligibility decision not found: {args.decision_id}', success=False)
+        return
+    if not args.review_id:
+        print_status('Refusing to sign: --review-id is required (bind the qualitative review).',
+                     success=False)
+        return
+    review = OperatorReviewRepository(db).get(args.review_id)
+    if review is None:
+        print_status(f'Operator review not found: {args.review_id}', success=False)
+        return
+
+    # Require interactive confirmation UNLESS both --review-id and --yes are present.
+    if not args.yes:
+        confirm = input(
+            f'Sign a {decision.state} attestation for artifact {args.artifact_digest} '
+            f'with key {args.key_file}? [y/N] ')
+        if confirm.strip().lower() != 'y':
+            print_status('Aborted (no confirmation).', success=False)
+            return
+
+    try:
+        cost_assumptions = _json.loads(args.cost_assumptions)
+        capacity_assumptions = _json.loads(args.capacity_assumptions)
+    except _json.JSONDecodeError as e:
+        print_status(f'Invalid JSON assumptions: {e}', success=False)
+        return
+
+    try:
+        signer = AttestationSigner.from_key_file(args.key_file)
+    except InsecureKeyFile as e:
+        print_status(f'Insecure key file: {e}', success=False)
+        return
+    except (InvalidKeyType, MalformedKey) as e:
+        print_status(f'Invalid signing key: {e}', success=False)
+        return
+
+    created_at = _research_now()
+    expires_at = created_at + _dt.timedelta(days=args.ttl_days)
+    fields = build_attestation(
+        decision=decision, review=review, public_key_id=signer.public_key_id,
+        artifact_digest=args.artifact_digest, source_digest=args.source_digest,
+        config_digest=args.config_digest, dataset_manifest_digest=args.dataset_digest,
+        allowlist_digest=args.allowlist_digest, training_boundary=args.training_boundary,
+        validation_boundary=args.validation_boundary, holdout_boundary=args.holdout_boundary,
+        evidence_boundary=args.evidence_boundary, cost_assumptions=cost_assumptions,
+        capacity_assumptions=capacity_assumptions, max_gross_allocation=args.max_gross_allocation,
+        permitted_instruments=tuple(args.instruments), created_at=created_at,
+        expires_at=expires_at, operator_approved_at=created_at)
+    attestation = signer.sign(fields)
+    AttestationRepository(db).record(attestation)
+    print_json_result(_attestation_public_view(attestation),
+                      title=f'{attestation.eligibility_state} attestation signed')
+
+
+def _handle_research_attest_verify(args: argparse.Namespace):
+    import datetime as _dt
+    from trader.research.attestation import (
+        AttestationError, AttestationRepository, AttestationVerifier, ExpectedBindings)
+    from trader.research.signing import (
+        InvalidKeyType, MalformedKey, load_verify_key)
+
+    db = _research_db()
+    repo = AttestationRepository(db)
+    attestation = repo.get(args.digest)
+    if attestation is None:
+        print_status(f'Attestation not found: {args.digest}', success=False)
+        return
+    try:
+        public_key = load_verify_key(args.public_key_file)
+    except (InvalidKeyType, MalformedKey) as e:
+        print_status(f'Invalid public key: {e}', success=False)
+        return
+
+    if args.now:
+        try:
+            now = _dt.datetime.fromisoformat(args.now)
+            if now.tzinfo is None:
+                now = now.replace(tzinfo=_dt.timezone.utc)
+        except ValueError as e:
+            print_status(f'Invalid --now: {e}', success=False)
+            return
+    else:
+        now = _research_now()
+
+    expected = ExpectedBindings(
+        artifact_digest=args.artifact_digest, allowlist_digest=args.allowlist_digest,
+        ruleset_digest=args.ruleset_digest, account_mode=args.account_mode,
+        max_gross_allocation=args.max_gross_allocation,
+        permitted_instruments=tuple(args.instruments))
+    verifier = AttestationVerifier([public_key])
+    try:
+        verified = verifier.verify(attestation, expected, now=now,
+                                   revoked_digests=repo.revoked_digests())
+    except AttestationError as e:
+        print_json_result({
+            'result': 'FAIL',
+            'error': type(e).__name__,
+            'detail': str(e),
+            'payload_digest': args.digest,
+        }, title='Attestation verification FAILED')
+        return
+    print_json_result({
+        'result': 'PASS',
+        'eligibility_state': verified.eligibility_state,
+        'permitted_account_mode': verified.permitted_account_mode,
+        'max_gross_allocation': verified.max_gross_allocation,
+        'permitted_instruments': list(verified.permitted_instruments),
+        'artifact_digest': verified.artifact_digest,
+        'allowlist_digest': verified.allowlist_digest,
+        'ruleset_digest': verified.ruleset_digest,
+        'expires_at': verified.expires_at,
+        'public_key_id': verified.public_key_id,
+        'payload_digest': verified.payload_digest,
+    }, title='Attestation verified')
 
 
 # --- backtests list: per-metric quality classification -----------------

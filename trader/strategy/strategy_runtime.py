@@ -16,7 +16,6 @@ from trader.listeners.ib_history_worker import IBHistoryWorker, IBConnectivityEr
 from trader.messaging.clientserver import (
     MessageBusClient,
     MultithreadedTopicPubSub,
-    RPCClient,
     RPCServer,
     TopicPubSub
 )
@@ -32,6 +31,7 @@ from trader.objects import Action, BarSize, WhatToShow
 from trader.data.event_store import EventStore, EventType, TradingEvent
 from trader.strategy.signal_proposer import SignalProposer
 from trader.strategy.strategy_revisions import StrategyCommandReceipt, StrategyRevisionStore
+from trader.strategy.trader_gateway import StrategyTraderGateway
 from trader.trading.strategy import Signal, Strategy, StrategyConfig, StrategyContext, StrategyState
 from typing import Any, cast, Dict, List, Optional
 
@@ -354,17 +354,10 @@ class StrategyRuntime():
         method used to spin up a throwaway loop and orphan the server task —
         the socket was bound, no task ever ran, requests silently piled up.
         """
-        # avoids circular import
-        from trader.messaging.trader_service_api import TraderServiceApi
         try:
             self.storage = TickStorage(self.history_duckdb_path)
             self.universe_accessor = UniverseAccessor(self.duckdb_path, self.universe_library)
             self.event_store = EventStore(self.duckdb_path)
-            self.trader_client = RPCClient[TraderServiceApi](
-                zmq_server_address=self.zmq_rpc_server_address,
-                zmq_server_port=self.zmq_rpc_server_port,
-                error_table=error_table
-            )
             self.last_connect_time = dt.datetime.now()
 
             self.zmq_strategy_rpc_server = RPCServer[bus.StrategyServiceApi](
@@ -425,6 +418,13 @@ class StrategyRuntime():
                 'query', self._typed_authenticator,
                 address=self.trader_typed_address, port=self.typed_query_port,
             )
+            # Instrument resolution + market-data publication over that same
+            # typed QUERY socket. Replaces the legacy full RPC (port 42001,
+            # never bound in the split-container posture) the runtime used to
+            # ride for resolve_symbol/publish_contract -- the source of the
+            # "resolve_symbol ... no route to server" startup warnings.
+            self._trader_gateway = StrategyTraderGateway(
+                query_client=self._trader_query_client)
 
             # [M1-F3] Task 8: signal → PENDING proposal bridge for
             # auto_execute: 'propose' strategies (paper mode only; see
@@ -1115,7 +1115,7 @@ class StrategyRuntime():
         if contract.conId not in self.strategies:
             self.strategies[contract.conId] = []
             self.strategies[contract.conId].append(strategy)
-            self.trader_client.rpc().publish_contract(contract=contract, delayed=False)
+            self._trader_gateway.publish_instrument(contract.conId, delayed=False)
         elif contract.conId in self.strategies and strategy not in self.strategies[contract.conId]:
             self.strategies[contract.conId].append(strategy)
 
@@ -1349,9 +1349,9 @@ class StrategyRuntime():
             for strategy in self.strategy_implementations:
                 if strategy.conids:
                     for conId in strategy.conids:
-                        security_definitions = self.trader_client.rpc().resolve_symbol(conId)
-                        if security_definitions:
-                            self.subscribe(strategy, SecurityDefinition.to_contract(security_definitions[0]))
+                        instrument = self._trader_gateway.resolve_instrument(conId)
+                        if instrument:
+                            self.subscribe(strategy, instrument.to_contract())
 
                 if strategy.universe:
                     self.subscribe_universe(strategy, strategy.universe)
@@ -1405,17 +1405,17 @@ class StrategyRuntime():
 
     def _subscribe_all_strategies(self) -> None:
         """Startup instrument subscription, one strategy at a time, each
-        isolated: the legacy trader RPC these subscriptions ride on is not
-        bound at all in the split-container production posture (compose
-        KNOWN GAP), and one dead RPC must not abort startup for every other
-        strategy — the reconcile loop retries subscriptions anyway."""
+        isolated: the trader's typed query socket these subscriptions ride on
+        may be briefly unreachable (trader still starting, container restart),
+        and one failed call must not abort startup for every other strategy —
+        the reconcile loop retries subscriptions anyway."""
         for strategy in self.strategy_implementations:
             try:
                 if strategy.conids:
                     for conId in strategy.conids:
-                        security_definitions = self.trader_client.rpc().resolve_symbol(conId)
-                        if security_definitions:
-                            self.subscribe(strategy, SecurityDefinition.to_contract(security_definitions[0]))
+                        instrument = self._trader_gateway.resolve_instrument(conId)
+                        if instrument:
+                            self.subscribe(strategy, instrument.to_contract())
                         else:
                             logging.error('could not find security definition for conId {} for strategy {}. Disabling strategy.'
                                           .format(conId, strategy))
@@ -1427,8 +1427,8 @@ class StrategyRuntime():
                     self.subscribe_universe(strategy, strategy.universe)
             except (TimeoutError, ConnectionError) as ex:
                 logging.warning(
-                    'startup instrument subscription failed for %r (trader legacy '
-                    'RPC unavailable; reconcile will retry): %s', strategy.name, ex)
+                    'startup instrument subscription failed for %r (trader typed '
+                    'query unreachable; reconcile will retry): %s', strategy.name, ex)
 
     def _drain_ack_outbox(self, limit: int = 50) -> None:
         """Push unacknowledged ``strategy_ack_outbox`` rows to the trader's
@@ -1591,11 +1591,11 @@ class StrategyRuntime():
 
             if strategy.conids:
                 for conId in strategy.conids:
-                    security_definitions = self.trader_client.rpc().resolve_symbol(conId)
-                    if security_definitions:
+                    instrument = self._trader_gateway.resolve_instrument(conId)
+                    if instrument:
                         try:
                             await self._fetch_history_with_resume(
-                                security=security_definitions[0],
+                                security=instrument,
                                 bar_size=strategy.bar_size,
                                 historical_days=historical_days,
                                 strategy_name=strategy.name,
@@ -1635,8 +1635,6 @@ class StrategyRuntime():
         await self.typed_query_server.serve()
         self._trader_command_client.connect()
         self._trader_query_client.connect()
-
-        await self.trader_client.connect()
 
         self.zmq_subscriber = TopicPubSub[Ticker](
             self.zmq_pubsub_server_address,

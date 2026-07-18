@@ -140,16 +140,12 @@ class TestStartupSubscriptionIsolation:
         rt = _make_runtime(tmp_path)
         attempted = []
 
-        class _Rpc:
-            def resolve_symbol(self, conId):
+        class _Gateway:
+            def resolve_instrument(self, conId):
                 attempted.append(conId)
                 raise ConnectionError('no route to server')
 
-        class _Client:
-            def rpc(self):
-                return _Rpc()
-
-        rt.trader_client = _Client()
+        rt._trader_gateway = _Gateway()
         rt.strategy_implementations = [
             _StubStrategy('alpha', conids=[111]),
             _StubStrategy('beta', conids=[222]),

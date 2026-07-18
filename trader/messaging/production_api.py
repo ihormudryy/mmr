@@ -85,12 +85,19 @@ import datetime as dt
 from dataclasses import asdict
 from typing import Any, Dict, Optional
 
+from ib_async import Contract
 from pydantic import BaseModel, ConfigDict, field_validator
 
 from trader.data.proposal_repository import ProposalRepository
 from trader.domain.commands import CommandReceipt
 from trader.domain.feed_service import CURSOR_EXPIRED, CursorExpired, DomainFeedService, domain_event_to_wire
 from trader.domain.snapshot_service import SNAPSHOT_NOT_READY, DomainSnapshotService, SnapshotNotReady
+from trader.messaging.strategy_trader_contracts import (
+    PublishInstrumentRequest,
+    PublishInstrumentResponse,
+    ResolveInstrumentRequest,
+    ResolveInstrumentResponse,
+)
 from trader.messaging.trader_service_api import TraderServiceApi
 from trader.messaging.typed_rpc import (
     HmacServiceAuthenticator,
@@ -150,6 +157,64 @@ def _no_arg_handler(fn):
     """
     def _handler(_body: Dict[str, Any]) -> Dict[str, Any]:
         return fn()
+    return _handler
+
+
+def _instrument_to_wire(definition: Any) -> Dict[str, Any]:
+    """Project a resolved ``SecurityDefinition`` down to the JSON-safe fields
+    the strategy runtime needs: the six that build an IB ``Contract`` plus the
+    IANA timezone the historical fetch reads. Coerced to plain ``int``/``str``
+    so a DuckDB-backed numeric conId still validates under the response
+    model's strict mode."""
+    return {
+        "instrument_id": int(definition.conId),
+        "symbol": str(definition.symbol),
+        "exchange": str(definition.exchange),
+        "primary_exchange": str(definition.primaryExchange),
+        "currency": str(definition.currency),
+        "security_type": str(definition.secType),
+        "time_zone_id": str(definition.timeZoneId),
+    }
+
+
+def _resolve_instrument_handler(api: TraderServiceApi):
+    """Resolve a conId against the trader's OWN universe DB (local lookup, no
+    IB fallback — identical semantics to the legacy ``resolve_symbol``) and
+    return the JSON-safe projection. An empty list means "not in the universe";
+    the strategy treats that as a disabled instrument, exactly as before.
+
+    Async because ``resolve_symbol`` offloads its blocking DuckDB read to a
+    thread — the handler must not run that inline on the shared trader loop."""
+    async def _handler(parsed: ResolveInstrumentRequest) -> Dict[str, Any]:
+        definitions = await api.resolve_symbol(parsed.instrument_id)
+        return {"instruments": [_instrument_to_wire(d) for d in definitions]}
+    return _handler
+
+
+def _publish_instrument_handler(api: TraderServiceApi):
+    """Start streaming an instrument's ticks to the pubsub. The trader resolves
+    the conId ITSELF and never trusts a client-supplied contract — a
+    partially-specified contract can resolve to the wrong listing (the
+    ``4391 -> TSEJ`` class of bug), so the strategy passes only the conId. The
+    ``publish_contract`` call runs inline on the trader loop where ib_async
+    lives, matching the legacy RPC's behaviour."""
+    async def _handler(parsed: PublishInstrumentRequest) -> Dict[str, Any]:
+        definitions = await api.resolve_symbol(parsed.instrument_id)
+        if not definitions:
+            raise _DispatchProblem(
+                "INSTRUMENT_NOT_FOUND",
+                f"no instrument {parsed.instrument_id!r} in the trader universe",
+            )
+        d = definitions[0]
+        # The same six fields SecurityDefinition.to_contract builds, kept
+        # explicit so the subscription contract is decoupled from the full
+        # SecurityDefinition type (and testable with a lightweight fake).
+        contract = Contract(
+            conId=d.conId, symbol=d.symbol, secType=d.secType, exchange=d.exchange,
+            primaryExchange=d.primaryExchange, currency=d.currency,
+        )
+        api.publish_contract(contract=contract, delayed=parsed.delayed)
+        return {"published": True}
     return _handler
 
 
@@ -1001,6 +1066,24 @@ def build_production_registry(
     # mutating limits stays behind the offline-simulation legacy path until
     # [M1-F3] adds an authorized command equivalent.
     registry.register('query', 'get_risk_limits', dict, dict, _no_arg_handler(api.get_risk_limits))
+    # Strategy runtime instrument path: resolve a conId to a contract, and
+    # start tick publication for it. These replace the legacy dill-RPC
+    # resolve_symbol/publish_contract the split-container trader no longer
+    # binds (port 42001), which is why strategy startup used to log
+    # "resolve_symbol ... no route to server" and no strategy got live ticks.
+    # Registered on the QUERY role deliberately: both must ALWAYS be available
+    # (core strategy operation, not a gated user command), neither has ledger
+    # or market impact, and the trader resolves the conId itself — so a
+    # strategy can only ever subscribe to instruments already in the trader's
+    # universe.
+    registry.register(
+        'query', 'resolve_instrument', ResolveInstrumentRequest,
+        ResolveInstrumentResponse, _resolve_instrument_handler(api),
+    )
+    registry.register(
+        'query', 'publish_instrument', PublishInstrumentRequest,
+        PublishInstrumentResponse, _publish_instrument_handler(api),
+    )
 
     if command_coordinator is not None and proposal_service is not None and proposal_repository is not None:
         register_command_authority(

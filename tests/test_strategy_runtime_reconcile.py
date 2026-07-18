@@ -33,7 +33,7 @@ def _make_runtime(tmp_path, strategies_dir, config_file=None, paper_trading=True
     rt.storage = None  # type: ignore
     rt.universe_accessor = None  # type: ignore
     rt._config_mtime = 0.0
-    rt.trader_client = None  # type: ignore
+    rt._trader_gateway = None  # type: ignore
     rt.paper_trading = paper_trading
     # _reconcile() sweeps proposal expiry unconditionally on every call — a
     # bare stub (not exercised by these tests) keeps that a no-op.
@@ -243,12 +243,12 @@ class TestReconcileResilience:
         rt = _make_runtime(tmp_path, strategies, config_file)
         rt._config_mtime = 0.0
 
-        # Stub trader_client to avoid the RPC call in step 2.
-        class _StubClient:
-            def rpc(self):
+        # Stub the trader gateway to avoid the RPC call in step 2.
+        class _StubGateway:
+            def resolve_instrument(self, conId):
                 raise ConnectionError('not connected — test stub')
 
-        rt.trader_client = _StubClient()  # type: ignore
+        rt._trader_gateway = _StubGateway()  # type: ignore
 
         await rt._reconcile()
         # After a failed reload, _config_mtime must still be the sentinel 0.0
@@ -271,11 +271,11 @@ class TestReconcileResilience:
 
         rt.strategy_implementations = [_Strategy()]  # type: ignore
 
-        class _StubClient:
-            def rpc(self, return_type=None):
+        class _StubGateway:
+            def resolve_instrument(self, conId):
                 raise ConnectionError('trader_service restarting')
 
-        rt.trader_client = _StubClient()  # type: ignore
+        rt._trader_gateway = _StubGateway()  # type: ignore
         rt._config_mtime = os.path.getmtime(str(config_file))
         # Should not raise
         await rt._reconcile()
@@ -298,11 +298,11 @@ class TestReconcileResilience:
 
         rt.strategy_implementations = [_Strategy()]  # type: ignore
 
-        class _StubClient:
-            def rpc(self, return_type=None):
+        class _StubGateway:
+            def resolve_instrument(self, conId):
                 raise KeyError('programmer bug — dict lookup')
 
-        rt.trader_client = _StubClient()  # type: ignore
+        rt._trader_gateway = _StubGateway()  # type: ignore
         rt._config_mtime = os.path.getmtime(str(config_file))
         with pytest.raises(KeyError):
             await rt._reconcile()
@@ -329,16 +329,14 @@ class TestReconcileResilience:
 
         rt.strategy_implementations = [_Strategy()]  # type: ignore
 
-        # Simulate a slow trader_service — each RPC call sleeps 200ms.
+        # Simulate a slow trader_service — each resolve call sleeps 200ms.
         # On the old code this would block the event loop for 600ms+.
-        class _SlowClient:
-            def rpc(self, return_type=None):
-                return self
-            def resolve_symbol(self, conId):
+        class _SlowGateway:
+            def resolve_instrument(self, conId):
                 time.sleep(0.2)
-                return []
+                return None
 
-        rt.trader_client = _SlowClient()  # type: ignore
+        rt._trader_gateway = _SlowGateway()  # type: ignore
         rt._config_mtime = os.path.getmtime(str(config_file))
 
         # Run reconcile concurrently with a ticker task that ticks every 10ms.
@@ -388,12 +386,12 @@ class TestReconcileResilience:
         rt.strategy_implementations = []
         rt._config_mtime = os.path.getmtime(str(config_file))
 
-        # A trader_client that never blocks — the only slow thing is the sweep.
-        class _StubClient:
-            def rpc(self, return_type=None):
+        # A trader gateway that never blocks — the only slow thing is the sweep.
+        class _StubGateway:
+            def resolve_instrument(self, conId):
                 raise ConnectionError('not connected — test stub')
 
-        rt.trader_client = _StubClient()  # type: ignore
+        rt._trader_gateway = _StubGateway()  # type: ignore
 
         # Simulate a slow proposal-store sweep (200ms blocking call). On the
         # old on-loop code this would freeze the loop for the full duration.

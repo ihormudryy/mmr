@@ -150,9 +150,30 @@ class LiquidationService:
         self._runs[receipt.cause_command_id] = updated
         if self._store is not None:
             self._store.save(updated, self._now())
+        if state == "FLAT":
+            self._resolve_root_command(updated)
         if state != "FLAT" and self._breaker is not None:
             self._breaker.trip_liquidation(receipt.cause_command_id, detail or state)
         return updated
+
+    def _resolve_root_command(self, receipt: LiquidationReceipt) -> None:
+        """Resolve only a coordinator-owned root after broker proof of flatness."""
+        if self._journal is None or self._ledger is None:
+            return
+        row = self._ledger.get(receipt.cause_command_id)
+        if row is None or row.state != "OUTCOME_UNKNOWN":
+            return
+        now = self._now()
+        outcome = {"liquidation_state": "FLAT", "generation_id": receipt.generation_id,
+                   "detail": receipt.detail}
+        def write(conn, _revision):
+            self._ledger.transition_in_tx(conn, receipt.cause_command_id, "OUTCOME_UNKNOWN", "RESOLVED",
+                                          outcome=outcome, error_code=None, now=now)
+        self._journal.mutate(self._journal.connect(), DomainMutation(
+            event_type="command.updated", entity_type="command", entity_id=command_entity_id(receipt.cause_command_id),
+            operation="upsert", account_id=receipt.account_id, source="trader_service", source_timestamp=now,
+            correlation_id=receipt.cause_command_id, payload={"state": "RESOLVED", **outcome}),
+            write, event_id=f"command:{receipt.cause_command_id}:liquidation-flat")
 
     def _advance(self, receipt: LiquidationReceipt) -> LiquidationReceipt:
         if receipt.state in {"FLAT", "FAILED_SAFE"}:

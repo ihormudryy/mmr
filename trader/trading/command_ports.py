@@ -25,10 +25,12 @@ fixed on the read path.
 from __future__ import annotations
 
 import logging
+import threading
 from typing import Any, Callable, Iterable, Optional
 
 from ib_async import Order
 
+from trader.data.broker_state import BrokerRiskSnapshotError
 from trader.trading.proposal_command_service import ExecutableQuote
 
 logger = logging.getLogger(__name__)
@@ -130,6 +132,58 @@ class TraderBrokerAuthority:
         except Exception as exc:  # noqa: BLE001 — best-effort; leverage gated by consumer
             logger.warning("what_if_margin unavailable for conid %s: %s", conid, exc)
             return None
+
+
+class TraderBrokerRiskSnapshotAuthority:
+    """Transactionally fenced materialized broker-state authority.
+
+    Account and mode are pinned when the adapter is composed. A monotonic
+    generation/cursor check also prevents a restored or replaced journal from
+    silently moving risk decisions backwards during the process lifetime.
+    """
+
+    def __init__(
+        self, *, db, store, account_id: str, account_mode: str,
+        ready: Callable[[], bool] = lambda: True,
+    ):
+        self._db = db
+        self._store = store
+        self._account_id = account_id
+        self._account_mode = account_mode
+        self._ready = ready
+        self._last_fence: Optional[tuple[int, int]] = None
+        self._lock = threading.Lock()
+
+    def capture(self, account_id: str):
+        if not self._ready():
+            raise BrokerRiskSnapshotError(
+                "BROKER_UNAVAILABLE", "broker transport or enumeration is not ready"
+            )
+        if account_id != self._account_id:
+            raise BrokerRiskSnapshotError(
+                "ACCOUNT_MISMATCH",
+                f"requested account {account_id!r} does not match pinned trader account",
+            )
+        snapshot = self._db.transaction(
+            lambda conn: self._store.capture_risk_snapshot_in_tx(conn, account_id)
+        )
+        if snapshot.account_mode != self._account_mode:
+            raise BrokerRiskSnapshotError(
+                "ACCOUNT_MODE_MISMATCH",
+                f"broker mode {snapshot.account_mode!r} does not match "
+                f"configured mode {self._account_mode!r}",
+            )
+        fence = (snapshot.generation_id, snapshot.source_cursor)
+        with self._lock:
+            if self._last_fence is not None and (
+                fence[0] < self._last_fence[0] or fence[1] < self._last_fence[1]
+            ):
+                raise BrokerRiskSnapshotError(
+                    "GENERATION_REGRESSION",
+                    f"broker fence regressed from {self._last_fence} to {fence}",
+                )
+            self._last_fence = fence
+        return snapshot
 
 
 def _feed_type(ticker) -> str:

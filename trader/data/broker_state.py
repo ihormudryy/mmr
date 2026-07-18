@@ -10,6 +10,7 @@ from __future__ import annotations
 import dataclasses
 import datetime as dt
 import json
+import math
 from dataclasses import dataclass, replace
 from types import SimpleNamespace
 from typing import Any, Callable, Optional
@@ -244,6 +245,50 @@ class BrokerOrderRow:
         payload["entity_id"] = self.order_entity_id
         payload["entity_revision"] = self.revision
         return payload
+
+
+class BrokerRiskSnapshotError(RuntimeError):
+    """A fenced broker snapshot cannot be trusted for a risk decision."""
+
+    def __init__(self, code: str, message: str):
+        self.code = code
+        self.message = message
+        super().__init__(f"{code}: {message}")
+
+
+@dataclass(frozen=True)
+class BrokerRiskSnapshot:
+    """Immutable account/position/order evidence from one DuckDB snapshot.
+
+    ``generation_id`` identifies the most recent complete broker enumeration.
+    ``source_cursor`` is the latest journal cursor visible in the same read
+    transaction, so it also fences broker deltas committed after promotion.
+    Quotes and what-if responses deliberately do not belong to this object.
+    """
+
+    generation_id: int
+    source_cursor: int
+    promoted_at: dt.datetime
+    account_id: str
+    account_mode: str
+    net_liquidation: float
+    daily_pnl: float
+    positions: tuple[BrokerPositionRow, ...]
+    working_orders: tuple[BrokerOrderRow, ...]
+
+    def reducible_quantity(self, conid: int) -> float:
+        return sum(row.quantity for row in self.positions if row.conid == conid)
+
+    def position_value(self, conid: int) -> float:
+        return sum(
+            abs(float(row.market_value or 0.0))
+            for row in self.positions
+            if row.conid == conid
+        )
+
+    @property
+    def open_order_count(self) -> int:
+        return len(self.working_orders)
 
 
 @dataclass(frozen=True)
@@ -575,6 +620,142 @@ class BrokerStateStore:
             "SELECT MAX(generation_id) FROM broker_sync_generations WHERE status = 'promoted'"
         ).fetchone()
         return None if row is None or row[0] is None else row[0]
+
+    def capture_risk_snapshot_in_tx(
+        self, conn: Any, account_id: str
+    ) -> BrokerRiskSnapshot:
+        """Read all broker risk inputs under one caller-owned transaction.
+
+        A promoted generation is a completeness barrier, not a claim that
+        independently timestamped market data shares its clock. Materialized
+        broker deltas newer than that promotion are included and fenced by the
+        journal ``source_cursor`` visible in this same DuckDB snapshot.
+        """
+        promoted = conn.execute(
+            "SELECT generation_id, promoted_cursor, completed_at "
+            "FROM broker_sync_generations WHERE status = 'promoted' "
+            "ORDER BY generation_id DESC LIMIT 1"
+        ).fetchone()
+        if promoted is None:
+            raise BrokerRiskSnapshotError(
+                "NO_PROMOTED_GENERATION", "no complete broker generation is available"
+            )
+        generation_id, promoted_cursor, promoted_at = promoted
+        if promoted_cursor is None or int(promoted_cursor) < 0 or promoted_at is None:
+            raise BrokerRiskSnapshotError(
+                "INVALID_GENERATION_CURSOR", "promoted generation has invalid provenance"
+            )
+
+        staging = conn.execute(
+            "SELECT generation_id FROM broker_sync_generations "
+            "WHERE status = 'staging' AND generation_id > ? "
+            "ORDER BY generation_id DESC LIMIT 1",
+            [generation_id],
+        ).fetchone()
+        if staging is not None:
+            raise BrokerRiskSnapshotError(
+                "GENERATION_STAGING",
+                f"newer broker generation {staging[0]} is still staging",
+            )
+
+        accounts = self.select_accounts_in_tx(conn)
+        account = next((row for row in accounts if row.account_id == account_id), None)
+        if account is None:
+            if accounts:
+                raise BrokerRiskSnapshotError(
+                    "ACCOUNT_MISMATCH", f"broker state does not contain account {account_id!r}"
+                )
+            raise BrokerRiskSnapshotError(
+                "ACCOUNT_STATE_UNAVAILABLE", "promoted generation contains no account state"
+            )
+        try:
+            net_liquidation = float(account.net_liquidation)
+        except (TypeError, ValueError) as exc:
+            raise BrokerRiskSnapshotError(
+                "INVALID_NET_LIQUIDATION", "net liquidation is unavailable"
+            ) from exc
+        if not math.isfinite(net_liquidation) or net_liquidation <= 0:
+            raise BrokerRiskSnapshotError(
+                "INVALID_NET_LIQUIDATION", "net liquidation must be finite and positive"
+            )
+
+        positions = tuple(
+            row for row in self.select_active_positions_in_tx(conn)
+            if row.account_id == account_id
+        )
+        for row in positions:
+            if not math.isfinite(float(row.quantity)):
+                raise BrokerRiskSnapshotError(
+                    "INVALID_POSITION", f"position {row.conid} has non-finite quantity"
+                )
+            if row.quantity and (
+                row.market_value is None or not math.isfinite(float(row.market_value))
+            ):
+                raise BrokerRiskSnapshotError(
+                    "INVALID_POSITION", f"position {row.conid} has no finite market value"
+                )
+
+        daily_values = [
+            value for key, value in account.balances.items()
+            if key.split(":", 1)[0] == "DailyPnL"
+        ]
+        if daily_values:
+            if len(daily_values) != 1:
+                raise BrokerRiskSnapshotError(
+                    "INVALID_DAILY_PNL", "daily P&L is ambiguous across currencies"
+                )
+            try:
+                daily_pnl = float(daily_values[0])
+            except (TypeError, ValueError) as exc:
+                raise BrokerRiskSnapshotError(
+                    "INVALID_DAILY_PNL", "daily P&L is not numeric"
+                ) from exc
+        elif positions:
+            if any(row.daily_pnl is None for row in positions):
+                raise BrokerRiskSnapshotError(
+                    "DAILY_PNL_UNAVAILABLE", "daily P&L is missing for an active position"
+                )
+            daily_pnl = sum(float(row.daily_pnl) for row in positions)
+        else:
+            daily_pnl = 0.0
+        if not math.isfinite(daily_pnl):
+            raise BrokerRiskSnapshotError(
+                "INVALID_DAILY_PNL", "daily P&L must be finite"
+            )
+
+        working_orders = tuple(
+            row for row in self.select_working_orders_in_tx(conn)
+            if row.account_id == account_id
+        )
+        for row in working_orders:
+            values = (row.total_quantity, row.filled_quantity)
+            if any(not math.isfinite(float(value)) for value in values):
+                raise BrokerRiskSnapshotError(
+                    "INVALID_WORKING_ORDER",
+                    f"working order {row.order_entity_id!r} has non-finite quantity",
+                )
+
+        cursor_row = conn.execute(
+            "SELECT COALESCE(MAX(source_cursor), 0) FROM domain_event_journal"
+        ).fetchone()
+        source_cursor = int(cursor_row[0]) if cursor_row is not None else 0
+        if source_cursor < int(promoted_cursor):
+            raise BrokerRiskSnapshotError(
+                "INVALID_GENERATION_CURSOR",
+                "promoted cursor is ahead of the visible event journal",
+            )
+
+        return BrokerRiskSnapshot(
+            generation_id=int(generation_id),
+            source_cursor=source_cursor,
+            promoted_at=promoted_at,
+            account_id=account.account_id,
+            account_mode=account.account_mode,
+            net_liquidation=net_liquidation,
+            daily_pnl=daily_pnl,
+            positions=positions,
+            working_orders=working_orders,
+        )
 
 
 @dataclass(frozen=True)

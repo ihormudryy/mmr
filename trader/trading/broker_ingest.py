@@ -65,6 +65,8 @@ def _canonical_key(record: Any) -> str:
         return f"account:{record.account_id}:{record.tag}:{record.currency}"
     if isinstance(record, PositionObservation):
         return f"position:{record.account_id}:{record.conid}"
+    if isinstance(record, PnLObservation):
+        return f"position:{record.account_id}:{record.conid}"
     if isinstance(record, OrderObservation):
         return f"order:{record.account_id}:{record.perm_id or record.client_order_id}"
     if isinstance(record, FillObservation):
@@ -90,6 +92,7 @@ def _decode_observation(kind: str, record_json: Any) -> Any:
     record_types = {
         "AccountValueObservation": AccountValueObservation,
         "PositionObservation": PositionObservation,
+        "PnLObservation": PnLObservation,
         "OrderObservation": OrderObservation,
         "FillObservation": FillObservation,
     }
@@ -145,6 +148,16 @@ class PositionObservation:
     unrealized_pnl: Optional[float]
     realized_pnl: Optional[float]
     daily_pnl: Optional[float]
+    source_timestamp: dt.datetime
+
+
+@dataclass(frozen=True)
+class PnLObservation:
+    account_id: str
+    conid: int
+    daily_pnl: Optional[float]
+    unrealized_pnl: Optional[float]
+    realized_pnl: Optional[float]
     source_timestamp: dt.datetime
 
 
@@ -216,6 +229,23 @@ def normalize_portfolio_item(item: Any, now: dt.datetime) -> PositionObservation
         unrealized_pnl=float(item.unrealizedPNL) if item.unrealizedPNL is not None else None,
         realized_pnl=float(item.realizedPNL) if item.realizedPNL is not None else None,
         daily_pnl=None,
+        source_timestamp=now,
+    )
+
+
+def normalize_pnl(pnl: Any, now: dt.datetime) -> PnLObservation:
+    def value(raw: Any) -> Optional[float]:
+        if raw is None:
+            return None
+        numeric = float(raw)
+        return None if numeric >= _UNSET_DOUBLE else numeric
+
+    return PnLObservation(
+        account_id=pnl.account,
+        conid=int(pnl.conId),
+        daily_pnl=value(getattr(pnl, "dailyPnL", None)),
+        unrealized_pnl=value(getattr(pnl, "unrealizedPnL", None)),
+        realized_pnl=value(getattr(pnl, "realizedPnL", None)),
         source_timestamp=now,
     )
 
@@ -331,7 +361,7 @@ class BrokerIngest:
         self.session_epoch = session_epoch or uuid.uuid4().hex
         self.clock = clock or (lambda: dt.datetime.now(dt.timezone.utc))
         self._queue: queue.Queue[
-            AccountValueObservation | PositionObservation | OrderObservation | FillObservation | CommissionObservation
+            AccountValueObservation | PositionObservation | PnLObservation | OrderObservation | FillObservation | CommissionObservation
         ] = queue.Queue()
         self._ingest_seq = 0
         self._generation: Optional[_Generation] = None
@@ -352,6 +382,11 @@ class BrokerIngest:
 
     def on_portfolio_item(self, item: Any) -> None:
         observation = normalize_portfolio_item(item, self.clock())
+        if observation.account_id == self.account_id:
+            self._queue.put(observation)
+
+    def on_pnl_single(self, pnl: Any) -> None:
+        observation = normalize_pnl(pnl, self.clock())
         if observation.account_id == self.account_id:
             self._queue.put(observation)
 
@@ -552,7 +587,7 @@ class BrokerIngest:
 
     def drain_once(self) -> int:
         batch: list[
-            AccountValueObservation | PositionObservation | OrderObservation | FillObservation | CommissionObservation
+            AccountValueObservation | PositionObservation | PnLObservation | OrderObservation | FillObservation | CommissionObservation
         ] = []
         while True:
             try:
@@ -565,7 +600,7 @@ class BrokerIngest:
 
     def _apply_batch(
         self, batch: list[
-            AccountValueObservation | PositionObservation | OrderObservation | FillObservation | CommissionObservation
+            AccountValueObservation | PositionObservation | PnLObservation | OrderObservation | FillObservation | CommissionObservation
         ]
     ) -> None:
         with self._apply_lock:
@@ -584,13 +619,15 @@ class BrokerIngest:
     def _apply_record(
         self,
         conn: Any,
-        record: AccountValueObservation | PositionObservation | OrderObservation | FillObservation | CommissionObservation,
+        record: AccountValueObservation | PositionObservation | PnLObservation | OrderObservation | FillObservation | CommissionObservation,
         emit: Callable[[DomainMutation, Callable[[Any, int], None]], Any],
     ) -> None:
         if isinstance(record, AccountValueObservation):
             self._apply_account_value(conn, record, emit)
         elif isinstance(record, PositionObservation):
             self._apply_position(conn, record, emit)
+        elif isinstance(record, PnLObservation):
+            self._apply_pnl(conn, record, emit)
         elif isinstance(record, OrderObservation):
             self._apply_order(conn, record, emit)
         elif isinstance(record, FillObservation):
@@ -868,6 +905,50 @@ class BrokerIngest:
 
         emit(mutation, write)
 
+    def _apply_pnl(
+        self,
+        conn: Any,
+        obs: PnLObservation,
+        emit: Callable[[DomainMutation, Callable[[Any, int], None]], Any],
+    ) -> None:
+        current = self.store.get_position_in_tx(conn, obs.account_id, obs.conid)
+        if current is None or current.deleted:
+            return
+        revised = replace(
+            current,
+            daily_pnl=(obs.daily_pnl if obs.daily_pnl is not None else current.daily_pnl),
+            unrealized_pnl=(
+                obs.unrealized_pnl
+                if obs.unrealized_pnl is not None
+                else current.unrealized_pnl
+            ),
+            realized_pnl=(
+                obs.realized_pnl if obs.realized_pnl is not None else current.realized_pnl
+            ),
+            source_timestamp=obs.source_timestamp,
+        )
+        if revised.same_fields(current):
+            return
+        entity_id = position_entity_id(obs.account_id, obs.conid)
+        mutation = DomainMutation(
+            event_type="position.updated",
+            entity_type="position",
+            entity_id=entity_id,
+            operation="upsert",
+            account_id=obs.account_id,
+            source="trader_service",
+            source_timestamp=obs.source_timestamp,
+            correlation_id=None,
+            payload=revised.to_payload(),
+        )
+
+        def write(write_conn: Any, revision: int) -> None:
+            self.store.upsert_position_in_tx(
+                write_conn, replace(revised, revision=revision)
+            )
+
+        emit(mutation, write)
+
     def _tombstone_order(
         self,
         conn: Any,
@@ -955,7 +1036,7 @@ class BrokerIngest:
         return cursor
 
     def _stage(
-        self, ingest_seq: int, record: AccountValueObservation | PositionObservation | OrderObservation | FillObservation | CommissionObservation
+        self, ingest_seq: int, record: AccountValueObservation | PositionObservation | PnLObservation | OrderObservation | FillObservation | CommissionObservation
     ) -> None:
         generation = self._require_generation()
         canonical_key = _canonical_key(record)

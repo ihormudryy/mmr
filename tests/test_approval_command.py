@@ -13,6 +13,7 @@ from types import SimpleNamespace
 import pytest
 from pydantic import ValidationError
 
+from trader.data.broker_state import BrokerRiskSnapshotError
 from trader.data.domain_journal import DomainJournal
 from trader.data.duckdb_store import DuckDBConnection
 from trader.data.proposal_repository import (
@@ -81,20 +82,35 @@ class FakeQuotes:
 class FakePositions:
     def __init__(self):
         self._held: dict[int, float] = {}
+        self.calls = 0
 
     def set_held(self, conid, quantity):
         self._held[conid] = quantity
 
     def reducible_quantity(self, account_id, conid):
+        self.calls += 1
         return self._held.get(conid, 0.0)
 
 
 class FakeBroker:
-    def __init__(self):
+    def __init__(self, positions, account_id, account_mode):
         self.ready = True
+        self.positions = positions
+        self.account_id = account_id
+        self.account_mode = account_mode
+        self.calls = 0
 
-    def is_ready(self):
-        return self.ready
+    def capture(self, account_id):
+        self.calls += 1
+        if not self.ready:
+            raise BrokerRiskSnapshotError("BROKER_UNAVAILABLE", "not ready")
+        return SimpleNamespace(
+            account_id=self.account_id,
+            account_mode=self.account_mode,
+            generation_id=1,
+            source_cursor=1,
+            reducible_quantity=lambda conid: self.positions._held.get(conid, 0.0),
+        )
 
 
 class FakeReconciler:
@@ -189,7 +205,7 @@ def _build_approval(tmp_path, *, account_mode, account_id):
 
     quotes = FakeQuotes(now)
     positions = FakePositions()
-    broker = FakeBroker()
+    broker = FakeBroker(positions, account_id, account_mode)
     reconciler = FakeReconciler()
     orders = FakeOrders()
     risk_gate = FakeRiskGate()
@@ -201,7 +217,7 @@ def _build_approval(tmp_path, *, account_mode, account_id):
     )
     service = ApprovalCommandService(
         journal=journal, ledger=ledger, repo=repo, controls=controls, orders=orders,
-        positions=positions, quotes=quotes, risk_gate=risk_gate,
+        quotes=quotes, risk_gate=risk_gate,
         risk_producer=risk_producer, reconciler=reconciler, broker=broker,
         account_id=account_id, account_mode=account_mode, now=now,
     )
@@ -283,6 +299,8 @@ def test_happy_path_claims_dispatches_and_binds_order_ref(approval):
     assert approval.risk_producer.decisions == [
         ("cmd-1", {"decision": "approve", "direction": "INCREASING", "proposal_id": record.id})
     ]
+    assert approval.broker.calls == 1
+    assert approval.positions.calls == 0  # approval uses the fenced snapshot, not live state
 
 
 def test_expired_row_flips_to_expired_inside_the_claiming_transaction(approval):

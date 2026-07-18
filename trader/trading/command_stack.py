@@ -24,7 +24,7 @@ from trader.trading.command_coordinator import (
 from trader.trading.command_alerts import LoggingCriticalAlertPort
 from trader.trading.command_policy import CommandAuthorityPolicy
 from trader.trading.command_ports import (
-    TraderBrokerAuthority,
+    TraderBrokerRiskSnapshotAuthority,
     TraderPositionAuthority,
     TraderQuoteAuthority,
 )
@@ -135,6 +135,13 @@ def _resolve_contract(trader: Any, conid: int):
     return None if security is None else Universe.to_contract(security)
 
 
+def _broker_ready(trader: Any) -> bool:
+    if not trader.is_ib_connected():
+        return False
+    readiness = trader.broker_ingest.is_ready
+    return bool(readiness() if callable(readiness) else readiness)
+
+
 def build_command_stack(
     trader: Any,
     policy: CommandAuthorityPolicy,
@@ -176,19 +183,27 @@ def build_command_stack(
     quotes = TraderQuoteAuthority(
         trader, run_coro=run_coro, resolve_contract=resolve_contract, delayed=False,
     )
-    broker = TraderBrokerAuthority(
-        trader, run_coro=run_coro, resolve_contract=resolve_contract,
+    broker_snapshot = TraderBrokerRiskSnapshotAuthority(
+        db=trader.journal_db,
+        store=trader.broker_state_store,
+        account_id=trader.ib_account,
+        account_mode=account_mode,
+        ready=lambda: _broker_ready(trader),
     )
+
+    def compute_risk_projection():
+        snapshot = broker_snapshot.capture(trader.ib_account)
+        return {
+            "net_liquidation": snapshot.net_liquidation,
+            "daily_pnl": snapshot.daily_pnl,
+            "open_order_count": snapshot.open_order_count,
+        }
 
     risk_producer = RiskProducer(
         trader.journal_db,
         journal,
         trader.ib_account,
-        compute_projection=lambda: {
-            "net_liquidation": broker.net_liquidation(),
-            "daily_pnl": broker.daily_pnl(),
-            "open_order_count": broker.open_order_count(),
-        },
+        compute_projection=compute_risk_projection,
         clock=now,
     )
     risk_producer.migrate(migrator)
@@ -235,12 +250,11 @@ def build_command_stack(
         repo=repository,
         controls=controls,
         orders=dispatch,
-        positions=positions,
         quotes=quotes,
         risk_gate=trader.risk_gate,
         risk_producer=risk_producer,
         reconciler=reconciler,
-        broker=broker,
+        broker=broker_snapshot,
         account_id=trader.ib_account,
         account_mode=account_mode,
         now=now,

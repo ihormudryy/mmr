@@ -1242,7 +1242,8 @@ def gate(tmp_path):
         conid=conid, side=side, price=210.0 if side == "ask" else 209.5,
         market_timestamp=NOW, feed_type="live", session_state="continuous"))
     positions = SimpleNamespace(reducible_quantity=lambda account_id, conid: 0.0)
-    broker = SimpleNamespace(is_ready=lambda: True)
+    broker = SimpleNamespace(capture=lambda account_id: SimpleNamespace(
+        reducible_quantity=lambda conid: 0.0))
     risk_gate = SimpleNamespace(evaluate=lambda **_kw: SimpleNamespace(approved=True, reason=""))
     risk_producer = SimpleNamespace(publish_decision=lambda *a, **k: None)
     fake_reconciler = _RecordingReconciler()
@@ -1253,7 +1254,7 @@ def gate(tmp_path):
     )
     approval = ApprovalCommandService(
         journal=journal_, ledger=ledger_, repo=repo, controls=controls, orders=orders,
-        positions=positions, quotes=quotes, risk_gate=risk_gate, risk_producer=risk_producer,
+        quotes=quotes, risk_gate=risk_gate, risk_producer=risk_producer,
         reconciler=fake_reconciler, broker=broker, account_id="DU111111",
         account_mode="paper", now=now_fn,
     )

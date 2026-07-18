@@ -79,6 +79,13 @@ def fake_portfolio_item(conid=265598, qty=10.0):
     )
 
 
+def fake_pnl(conid=265598, daily=-75.0):
+    return SimpleNamespace(
+        account="DU123", conId=conid, dailyPnL=daily,
+        unrealizedPnL=45.0, realizedPnL=-5.0,
+    )
+
+
 def test_callbacks_only_enqueue_until_drained(env):
     env.ingest.on_position(fake_position())
     assert _events(env.db) == []
@@ -117,6 +124,22 @@ def test_bare_position_does_not_erase_market_fields(env):
     env.ingest.on_position(fake_position(qty=10.0))
     env.ingest.drain_once()
     assert len(_events(env.db)) == 1
+
+
+def test_pnl_callback_materializes_daily_pnl_for_fenced_risk(env):
+    env.ingest.on_portfolio_item(fake_portfolio_item(qty=10.0))
+    env.ingest.drain_once()
+
+    env.ingest.on_pnl_single(fake_pnl(daily=-75.0))
+    env.ingest.drain_once()
+
+    row = env.db.transaction(
+        lambda conn: env.store.get_position_in_tx(conn, "DU123", 265598)
+    )
+    assert row.daily_pnl == -75.0
+    assert row.unrealized_pnl == 45.0
+    assert row.realized_pnl == -5.0
+    assert _events(env.db)[-1]["payload"]["daily_pnl"] == -75.0
 
 
 def test_zero_quantity_emits_tombstone_and_allows_resurrection(env):

@@ -143,11 +143,16 @@ class FakeRiskGate:
 
 
 class FakeBroker:
-    def __init__(self):
+    def __init__(self, positions):
         self.ready = True
+        self.positions = positions
 
-    def is_ready(self):
-        return self.ready
+    def capture(self, account_id):
+        if not self.ready:
+            raise RuntimeError("broker unavailable")
+        return SimpleNamespace(
+            reducible_quantity=lambda conid: self.positions._held.get(conid, 0.0)
+        )
 
 
 class FakeReconciler:
@@ -269,7 +274,7 @@ def _build_stack(tmp_path):
     universe.add(AMD_CONID, 'AMD')
     positions = FakePositions()
     risk_gate = FakeRiskGate()
-    broker = FakeBroker()
+    broker = FakeBroker(positions)
     reconciler = FakeReconciler()
     orders = FakeOrders()
     risk_producer = FakeRiskProducer()
@@ -285,7 +290,7 @@ def _build_stack(tmp_path):
     )
     approval_service = ApprovalCommandService(
         journal=journal, ledger=ledger, repo=repo, controls=controls, orders=orders,
-        positions=positions, quotes=quotes, risk_gate=risk_gate,
+        quotes=quotes, risk_gate=risk_gate,
         risk_producer=risk_producer, reconciler=reconciler, broker=broker,
         account_id=ACCOUNT_ID, account_mode=ACCOUNT_MODE, now=clock,
     )

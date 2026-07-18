@@ -15,6 +15,7 @@ from types import SimpleNamespace
 import pytest
 
 from trader.trading.proposal_command_service import ExecutableQuote
+from trader.data.broker_state import BrokerPositionRow, BrokerRiskSnapshot
 from trader.trading.command_ports import (
     TraderBrokerAuthority,
     TraderPositionAuthority,
@@ -192,9 +193,7 @@ class TestQuoteAuthority:
 
 
 class TestAdaptersSatisfyCapture:
-    """End-to-end: the three real adapters conform to the port protocols
-    capture_approval_context expects, and assemble a full single-generation
-    snapshot from live trader state."""
+    """Broker state stays fenced while quote and what-if keep their clocks."""
 
     def test_capture_assembles_full_context_from_the_adapters(self):
         from trader.trading.approval_context import capture_approval_context
@@ -209,18 +208,36 @@ class TestAdaptersSatisfyCapture:
             margin=MARGIN)
         run = (lambda x: x)
         resolve = lambda conid: SimpleNamespace(conId=conid)
+        position = BrokerPositionRow(
+            account_id=ACCT, conid=CONID, symbol="AAPL", sec_type="STK",
+            exchange="NASDAQ", currency="USD", quantity=100.0,
+            average_cost=200.0, market_price=210.0, market_value=21000.0,
+            unrealized_pnl=1000.0, realized_pnl=0.0, daily_pnl=-120.0,
+            deleted=False, revision=1, source_timestamp=NOW,
+        )
+        snapshot = BrokerRiskSnapshot(
+            generation_id=3, source_cursor=17, promoted_at=NOW,
+            account_id=ACCT, account_mode="paper", net_liquidation=40002.78,
+            daily_pnl=-120.0, positions=(position,), working_orders=(),
+        )
+        snapshot_authority = SimpleNamespace(capture=lambda account_id: snapshot)
+        margin_authority = TraderBrokerAuthority(
+            trader, run_coro=run, resolve_contract=resolve,
+        )
 
         ctx = capture_approval_context(
             account_id=ACCT, conid=CONID, side="BUY", quantity=10.0,
             quotes=TraderQuoteAuthority(trader, run_coro=run, resolve_contract=resolve),
-            positions=TraderPositionAuthority(trader),
-            broker=TraderBrokerAuthority(trader, run_coro=run, resolve_contract=resolve),
+            broker=snapshot_authority,
+            margin=margin_authority,
             now=NOW)
 
         assert ctx.quote.price == 210.0 and ctx.quote.market_timestamp == NOW
         assert ctx.net_liquidation == pytest.approx(40002.78)
         assert ctx.daily_pnl == pytest.approx(-120.0)
-        assert ctx.open_order_count == 1
+        # Open orders come from the fenced snapshot, never the live book's
+        # independently changing count (the fake live book says 1 here).
+        assert ctx.open_order_count == 0
         assert ctx.position_value == 21000.0
         assert ctx.reducible_quantity == 100.0
         assert ctx.what_if_margin == MARGIN

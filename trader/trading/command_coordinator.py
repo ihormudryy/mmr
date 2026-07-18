@@ -78,7 +78,7 @@ from typing import Any, Callable, Literal, Optional, Protocol
 
 import duckdb
 
-from trader.data.broker_state import BrokerOrderRow
+from trader.data.broker_state import BrokerOrderRow, BrokerRiskSnapshotError
 from trader.data.domain_journal import DomainJournal, EventIdentityConflict
 from trader.data.proposal_repository import (
     ApprovalClaim,
@@ -363,14 +363,10 @@ class CriticalAlertPort(Protocol):
     def raise_alert(self, command_id: str, detail: str) -> None: ...
 
 
-class BrokerHealthPort(Protocol):
-    """Whether the broker is enumerated and ready to accept a dispatch.
+class BrokerRiskSnapshotPort(Protocol):
+    """Captures the trader-owned, generation-fenced broker risk state."""
 
-    In production this maps to ``broker_ingest.is_ready`` (the promoted
-    broker-generation fence).
-    """
-
-    def is_ready(self) -> bool: ...
+    def capture(self, account_id: str) -> Any: ...
 
 
 class ApprovalClaimFailed(Exception):
@@ -1244,12 +1240,11 @@ class ApprovalCommandService:
         repo: ProposalRepository,
         controls: Any,
         orders: OrderDispatchPort,
-        positions: PositionAuthority,
         quotes: QuoteAuthority,
         risk_gate: Any,
         risk_producer: Any,
         reconciler: ReconcilerPort,
-        broker: BrokerHealthPort,
+        broker: BrokerRiskSnapshotPort,
         account_id: str,
         account_mode: str,
         now: Callable[[], dt.datetime] = _utcnow,
@@ -1260,7 +1255,6 @@ class ApprovalCommandService:
         self._repo = repo
         self._controls = controls
         self._orders = orders
-        self._positions = positions
         self._quotes = quotes
         self._risk_gate = risk_gate
         self._risk_producer = risk_producer
@@ -1454,12 +1448,21 @@ class ApprovalCommandService:
         ]
         if inflight:
             return reject("COMMAND_IN_FLIGHT", True)
-        if not self._broker.is_ready():
+        try:
+            broker_snapshot = self._broker.capture(self._account_id)
+        except BrokerRiskSnapshotError as exc:
+            retryable = exc.code not in {
+                "ACCOUNT_MISMATCH", "ACCOUNT_MODE_MISMATCH",
+                "INVALID_NET_LIQUIDATION", "INVALID_DAILY_PNL",
+                "INVALID_POSITION", "INVALID_WORKING_ORDER",
+            }
+            return reject(exc.code, retryable)
+        except Exception:
             return reject("BROKER_UNAVAILABLE", True)
         if not self._evaluate_risk(record).approved:
             return reject("RISK_REJECTED", False)
 
-        held = float(self._positions.reducible_quantity(self._account_id, record.conid))
+        held = float(broker_snapshot.reducible_quantity(record.conid))
         qty = float(record.quantity or 0.0)
         direction = classify_risk_direction(record.action, held, qty)
         # Explicit reducible cap (correction #3): a SELL that overshoots the

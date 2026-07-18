@@ -651,6 +651,7 @@ class Trader():
                 (self.client.ib.accountValueEvent, self.broker_ingest.on_account_value),
                 (self.client.ib.positionEvent, self.broker_ingest.on_position),
                 (self.client.ib.updatePortfolioEvent, self.broker_ingest.on_portfolio_item),
+                (self.client.ib.pnlSingleEvent, self.broker_ingest.on_pnl_single),
                 (self.client.ib.openOrderEvent, self.broker_ingest.on_open_order),
                 (self.client.ib.orderStatusEvent, self.broker_ingest.on_order_status),
                 (self.client.ib.execDetailsEvent, self.broker_ingest.on_exec_details),

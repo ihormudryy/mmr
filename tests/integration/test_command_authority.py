@@ -159,7 +159,8 @@ class _Stack:
             conid=conid, side=side, price=210.0 if side == "ask" else 209.5,
             market_timestamp=NOW, feed_type="live", session_state="continuous"))
         self.positions = SimpleNamespace(reducible_quantity=lambda account_id, conid: 0.0)
-        self.broker = SimpleNamespace(is_ready=lambda: True)
+        self.broker = SimpleNamespace(capture=lambda account_id: SimpleNamespace(
+            reducible_quantity=lambda conid: 0.0))
         self.risk_gate = SimpleNamespace(
             check_instrument=lambda **_kw: SimpleNamespace(approved=True, reason=""),
             evaluate=lambda **_kw: SimpleNamespace(approved=True, reason=""))
@@ -176,7 +177,7 @@ class _Stack:
             positions=self.positions)
         self.approval_service = ApprovalCommandService(
             journal=journal, ledger=self.ledger, repo=self.repo, controls=self.controls,
-            orders=self.orders, positions=self.positions, quotes=self.quotes,
+            orders=self.orders, quotes=self.quotes,
             risk_gate=self.risk_gate, risk_producer=self.risk_producer, reconciler=self.reconciler,
             broker=self.broker, account_id=ACCOUNT, account_mode="paper", now=self._now)
 

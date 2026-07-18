@@ -1056,7 +1056,10 @@ def build_production_registry(
             f'authenticator must be an HmacServiceAuthenticator, got {type(authenticator).__name__}'
         )
 
-    registry = TypedRpcRegistry()
+    # Every production handler may touch DuckDB, IB state, or another service.
+    # Keep that work off the ROUTER event loop by default; isolated registries
+    # elsewhere retain TypedRpcRegistry's inline default.
+    registry = TypedRpcRegistry(default_execution="thread")
     api = TraderServiceApi(trader)
 
     # Health: service connectivity (IB, storage, upstream) — the same dict

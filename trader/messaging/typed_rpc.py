@@ -103,7 +103,7 @@ import threading
 import time
 import uuid
 from dataclasses import dataclass
-from typing import Any, Callable, Dict, FrozenSet, Optional
+from typing import Any, Callable, Dict, FrozenSet, Literal, Optional
 
 import zmq
 import zmq.asyncio
@@ -649,6 +649,7 @@ class TypedRpcRegistration:
     request_model: Any
     response_model: Any
     handler: Callable[[Any], Any]
+    execution: Literal["inline", "thread"]
 
 
 class TypedRpcRegistry:
@@ -660,7 +661,10 @@ class TypedRpcRegistry:
     happens to match something registered elsewhere.
     """
 
-    def __init__(self) -> None:
+    def __init__(self, *, default_execution: Literal["inline", "thread"] = "inline") -> None:
+        if default_execution not in ("inline", "thread"):
+            raise ValueError("default_execution must be 'inline' or 'thread'")
+        self.default_execution = default_execution
         self._by_role_method: Dict[tuple, TypedRpcRegistration] = {}
         self._method_role: Dict[str, str] = {}
 
@@ -671,12 +675,17 @@ class TypedRpcRegistry:
         request_model: Any,
         response_model: Any,
         handler: Callable[[Any], Any],
+        *,
+        execution: Optional[Literal["inline", "thread"]] = None,
     ) -> None:
         if socket_role not in VALID_SOCKET_ROLES:
             raise ValueError(
                 f"socket_role must be one of {sorted(VALID_SOCKET_ROLES)}, got {socket_role!r}"
             )
         _validate_method_name(method)
+        selected_execution = self.default_execution if execution is None else execution
+        if selected_execution not in ("inline", "thread"):
+            raise ValueError("execution must be 'inline' or 'thread'")
 
         existing_role = self._method_role.get(method)
         if existing_role is not None and existing_role != socket_role:
@@ -694,6 +703,7 @@ class TypedRpcRegistry:
             request_model=request_model,
             response_model=response_model,
             handler=handler,
+            execution=selected_execution,
         )
 
     def resolve(self, socket_role: str, method: str) -> Optional[TypedRpcRegistration]:
@@ -790,6 +800,7 @@ class TypedRpcServer:
         authenticator: HmacServiceAuthenticator,
         address: str = "tcp://127.0.0.1",
         port: int = 0,
+        max_in_flight: Optional[int] = None,
     ):
         if socket_role not in VALID_SOCKET_ROLES:
             raise ValueError(
@@ -799,6 +810,16 @@ class TypedRpcServer:
         self.registry = registry
         self.authenticator = authenticator
         self.address = f"{address}:{port}"
+        configured_max = (
+            os.getenv("TYPED_RPC_MAX_IN_FLIGHT", "32")
+            if max_in_flight is None else max_in_flight
+        )
+        try:
+            self.max_in_flight = int(configured_max)
+        except (TypeError, ValueError) as exc:
+            raise ValueError("max_in_flight must be a positive integer") from exc
+        if self.max_in_flight <= 0:
+            raise ValueError("max_in_flight must be a positive integer")
         self.ctx: Optional[zmq.asyncio.Context] = zmq.asyncio.Context()
         self.socket: Optional[zmq.asyncio.Socket] = None
         self._serve_task: Optional[asyncio.Task] = None
@@ -807,6 +828,8 @@ class TypedRpcServer:
         # that's about to be terminated (which is what triggers asyncio's
         # "Task was destroyed but it is pending!" noise).
         self._handler_tasks: "set[asyncio.Task]" = set()
+        self._active_handlers = 0
+        self._closing = False
 
     async def serve(self) -> None:
         self.socket = self.ctx.socket(zmq.ROUTER)
@@ -857,6 +880,8 @@ class TypedRpcServer:
                 logging.exception(f"TypedRpcServer[{self.socket_role}] unexpected error: {e}")
 
     async def _handle_request(self, client_id: bytes, raw: bytes) -> None:
+        if self._closing:
+            return
         try:
             request = decode_request(raw)
         except AuthenticationError as exc:
@@ -896,15 +921,25 @@ class TypedRpcServer:
             except (ValidationError, TypeError) as exc:
                 raise _DispatchProblem("VALIDATION_ERROR", f"invalid request body: {exc}") from exc
 
-            result = registration.handler(parsed_body)
-            if inspect.isawaitable(result):
-                result = await result
-
-            try:
-                body = _coerce_response_value(result, registration.response_model)
-            except (ValidationError, TypeError) as exc:
+            if self._active_handlers >= self.max_in_flight:
                 raise _DispatchProblem(
-                    "VALIDATION_ERROR", f"handler returned an invalid response: {exc}") from exc
+                    "SERVER_BUSY", "server command capacity is temporarily exhausted")
+            self._active_handlers += 1
+            try:
+                if registration.execution == "thread":
+                    result = await asyncio.to_thread(registration.handler, parsed_body)
+                else:
+                    result = registration.handler(parsed_body)
+                if inspect.isawaitable(result):
+                    result = await result
+
+                try:
+                    body = _coerce_response_value(result, registration.response_model)
+                except (ValidationError, TypeError) as exc:
+                    raise _DispatchProblem(
+                        "VALIDATION_ERROR", f"handler returned an invalid response: {exc}") from exc
+            finally:
+                self._active_handlers -= 1
 
             ok = True
         except ReplayError as exc:
@@ -924,7 +959,8 @@ class TypedRpcServer:
                 f"TypedRpcServer[{self.socket_role}] unhandled error dispatching {request.method!r}")
             problem = RpcProblem(code="INTERNAL_ERROR", message="internal error")
 
-        await self._reply(client_id, request_id, ok, body if ok else None, problem)
+        if not self._closing:
+            await self._reply(client_id, request_id, ok, body if ok else None, problem)
 
     async def _reply(
         self,
@@ -934,6 +970,13 @@ class TypedRpcServer:
         body: Optional[Dict[str, Any]],
         problem: Optional[RpcProblem],
     ) -> None:
+        # Shutdown is an authorization boundary for output as well as input:
+        # a thread handler may finish after its awaiting task was cancelled,
+        # and decode/auth failures can race with resource teardown.  Never
+        # write once close has begun, regardless of which response path won
+        # that race.
+        if self._closing:
+            return
         response = TypedRpcResponse(request_id=request_id, ok=ok, body=body, problem=problem)
         signed = self.authenticator.sign_response(response)
         try:
@@ -953,12 +996,45 @@ class TypedRpcServer:
         with LINGER=0 before ``ctx.term()``, term has no open sockets to wait
         on and returns immediately -- no teardown hang.
         """
+        self._closing = True
         if self._serve_task is not None:
             self._serve_task.cancel()
             self._serve_task = None
         for task in list(self._handler_tasks):
             task.cancel()
         self._handler_tasks.clear()
+        self._close_resources()
+
+    async def aclose(self, *, drain_timeout: float = 5.0) -> None:
+        """Stop accepting, drain handlers for at most ``drain_timeout``, close.
+
+        Thread work cannot be force-stopped safely. After the bound expires its
+        awaiting task is cancelled and the socket is closed, so a late handler
+        completion can neither emit a response nor keep shutdown blocked.
+        """
+        self._closing = True
+        timeout = max(0.0, drain_timeout)
+        loop = asyncio.get_running_loop()
+        deadline = loop.time() + timeout
+        serve_task = self._serve_task
+        self._serve_task = None
+        if serve_task is not None:
+            serve_task.cancel()
+            await asyncio.wait({serve_task}, timeout=max(0.0, deadline - loop.time()))
+        pending = {task for task in self._handler_tasks if not task.done()}
+        if pending:
+            _done, pending = await asyncio.wait(
+                pending,
+                timeout=max(0.0, deadline - loop.time()),
+            )
+            for task in pending:
+                task.cancel()
+            if pending:
+                await asyncio.gather(*pending, return_exceptions=True)
+        self._handler_tasks.clear()
+        self._close_resources()
+
+    def _close_resources(self) -> None:
         if self.socket is not None:
             try:
                 self.socket.close(linger=0)

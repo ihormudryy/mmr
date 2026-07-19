@@ -83,6 +83,15 @@ class StrategyRuntimeConfig:
 
 
 @dataclass
+class AutomationConfig:
+    enabled: bool = False
+    live_enabled: bool = False
+    artifact_bundle_path: str = ''
+    public_key_ring_path: str = ''
+    expected_artifact_id: str = ''
+
+
+@dataclass
 class TypedRpcConfig:
     """Authenticated query/command/feed transport (G0 Task 3).
 
@@ -109,6 +118,7 @@ class MMRConfig:
     massive: MassiveConfig = field(default_factory=MassiveConfig)
     twelvedata: TwelveDataConfig = field(default_factory=TwelveDataConfig)
     typed_rpc: TypedRpcConfig = field(default_factory=TypedRpcConfig)
+    automation: AutomationConfig = field(default_factory=AutomationConfig)
     root_directory: str = '.'
     config_file: str = '~/.config/mmr/trader.yaml'
     logfile: str = '~/.local/share/mmr/logs/trader.log'
@@ -176,6 +186,12 @@ class MMRConfig:
             'typed_command_port': ('typed_rpc', 'command_port'),
             'typed_feed_port': ('typed_rpc', 'feed_port'),
             'service_hmac_key_file': ('typed_rpc', 'service_hmac_key_file'),
+            # Automation
+            'automation_enabled': ('automation', 'enabled'),
+            'automation_live_enabled': ('automation', 'live_enabled'),
+            'automation_artifact_bundle_path': ('automation', 'artifact_bundle_path'),
+            'automation_public_key_ring_path': ('automation', 'public_key_ring_path'),
+            'automation_expected_artifact_id': ('automation', 'expected_artifact_id'),
             # Top-level
             'root_directory': ('root_directory',),
             'config_file': ('config_file',),

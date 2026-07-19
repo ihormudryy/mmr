@@ -235,6 +235,12 @@ class StrategyRuntime():
         trader_typed_address: str = '',
         service_hmac_key_file: str = '',
         ib_account: str = '',
+        # [P3 Task 2] Artifact verification gate
+        automation_enabled: bool = False,
+        automation_live_enabled: bool = False,
+        automation_artifact_bundle_path: str = '',
+        automation_public_key_ring_path: str = '',
+        automation_expected_artifact_id: str = '',
     ):
         self.ib_server_address = ib_server_address
         self.ib_server_port = ib_server_port
@@ -284,6 +290,15 @@ class StrategyRuntime():
         # bridge still stamps its own copy on the outbound query body for
         # symmetry/logging; harmless either way since the server ignores it).
         self.ib_account = ib_account
+        # [P3 Task 2] Automation / artifact-verification gate
+        self.automation_enabled: bool = automation_enabled
+        self.automation_live_enabled: bool = automation_live_enabled
+        self.automation_artifact_bundle_path: str = automation_artifact_bundle_path
+        self.automation_public_key_ring_path: str = automation_public_key_ring_path
+        self.automation_expected_artifact_id: str = automation_expected_artifact_id
+        # Lazily initialised in _get_artifact_verifier() the first time automation
+        # config is complete; None means "not yet built".
+        self._artifact_verifier: Optional[Any] = None
         self._revisions: Optional[StrategyRevisionStore] = None
         # Last state-name announced per strategy (via the ack outbox). Resets
         # on restart, so every strategy is re-announced once per process —
@@ -900,6 +915,102 @@ class StrategyRuntime():
             raise StartupConfigRecoveryError(failures)
         return recovered
 
+    # ------------------------------------------------------------------ #
+    # [P3 Task 2] Artifact verification helpers
+    # ------------------------------------------------------------------ #
+
+    def _get_artifact_verifier(self):
+        """Lazily build and cache an ``ArtifactVerifier`` from the configured
+        public key ring directory.  Returns ``None`` when automation is not
+        enabled or no key ring is configured (so non-automated strategies pass
+        through unaffected).
+
+        The key ring directory must contain one or more ``*.pem`` files, each
+        holding a single Ed25519 SubjectPublicKeyInfo PEM public key.
+        """
+        if self._artifact_verifier is not None:
+            return self._artifact_verifier
+        if not self.automation_enabled:
+            return None
+        if not self.automation_public_key_ring_path:
+            return None
+        try:
+            from trader.automation.artifact_verifier import ArtifactVerifier
+            from trader.research import signing
+            import glob as _glob
+            key_ring_path = os.path.abspath(os.path.expanduser(
+                self.automation_public_key_ring_path))
+            pem_files = sorted(_glob.glob(os.path.join(key_ring_path, '*.pem')))
+            if not pem_files:
+                logging.error(
+                    'automation key ring %s contains no *.pem files',
+                    key_ring_path,
+                )
+                return None
+            trusted_keys = []
+            for pem_path in pem_files:
+                try:
+                    trusted_keys.append(signing.load_verify_key(pem_path))
+                except Exception as kexc:
+                    logging.error(
+                        'failed to load public key %s: %s', pem_path, kexc)
+            if not trusted_keys:
+                return None
+            self._artifact_verifier = ArtifactVerifier(trusted_keys)
+            return self._artifact_verifier
+        except Exception as exc:
+            logging.error(
+                'failed to initialise artifact verifier from key ring %s: %s',
+                self.automation_public_key_ring_path, exc,
+            )
+            return None
+
+    def _verify_artifact_at_load(self, strategy_name: str,
+                                 artifact_bundle_path_str: str) -> None:
+        """Run the full artifact verification chain at strategy load time.
+
+        Raises on any failure (fail-closed).  Logs the verification result
+        (safe reason codes + public key ID only) at INFO level.
+
+        The expected_artifact_id is taken from ``automation_expected_artifact_id``
+        in config; the expected mode is ``"live"`` when ``automation_live_enabled``
+        is True, otherwise ``"paper"``.
+        """
+        from trader.automation.artifact_verifier import ArtifactVerifier, ArtifactVerifierError
+        verifier = self._get_artifact_verifier()
+        if verifier is None:
+            # Automation not enabled or key ring not configured.  A strategy
+            # that supplies artifact_bundle_path but has no verifier configured
+            # is rejected as a safety measure (fail-closed).
+            raise ArtifactVerifierError(
+                f'strategy {strategy_name!r} specifies artifact_bundle_path but '
+                'automation is not enabled or public_key_ring_path is not configured'
+            )
+        bundle_path = os.path.abspath(os.path.expanduser(artifact_bundle_path_str))
+        expected_mode = 'live' if self.automation_live_enabled else 'paper'
+        expected_artifact_id = self.automation_expected_artifact_id
+        if not expected_artifact_id:
+            raise ArtifactVerifierError(
+                f'strategy {strategy_name!r} specifies artifact_bundle_path but '
+                'automation_expected_artifact_id is not configured'
+            )
+        from pathlib import Path as _Path
+        import datetime as _dt
+        verified = verifier.verify(
+            _Path(bundle_path),
+            expected_mode=expected_mode,
+            expected_artifact_id=expected_artifact_id,
+            now=_dt.datetime.now(_dt.timezone.utc),
+        )
+        logging.info(
+            'strategy %s artifact verified: id=%s key=%s mode=%s codes=%s',
+            strategy_name,
+            verified.artifact_id,
+            verified.public_key_id,
+            expected_mode,
+            verified.verification_reason_codes,
+        )
+
     def __get_enabled_strategies(self, conid: int) -> List[Strategy]:
         if conid in self.strategies:
             return [strategy for strategy in self.strategies[conid]
@@ -1173,6 +1284,22 @@ class StrategyRuntime():
             return
 
         strategies_dir = os.path.abspath(os.path.expanduser(self.strategies_directory))
+
+        # [P3 Task 2] Artifact verification gate — checked BEFORE the class module
+        # is loaded from disk.  Only active when automation is enabled and the
+        # strategy config carries an ``artifact_bundle_path`` key (so existing
+        # non-automated strategies are unaffected).  Fail closed: any verification
+        # failure is logged at ERROR and the strategy is refused.
+        artifact_bundle_path_str = (params or {}).get('artifact_bundle_path', '')
+        if artifact_bundle_path_str:
+            try:
+                self._verify_artifact_at_load(name, artifact_bundle_path_str)
+            except Exception as exc:
+                logging.error(
+                    'refusing to load strategy %s: artifact verification failed: %s',
+                    name, exc,
+                )
+                return
 
         def load_class_from_file(filename, classname):
             # Reject absolute paths and path traversal. Strategy modules must

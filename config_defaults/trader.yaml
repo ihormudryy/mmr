@@ -128,6 +128,15 @@ command_authority:
   max_order_notional:      # hard per-order notional ceiling (required when live_enabled)
   max_drift_bps: 50        # server-side price-drift ceiling (bps)
 
+# Deterministic automation configuration (P3).
+# When enabled, only a single signed artifact bundle runs under strict control.
+automation:
+  enabled: false
+  live_enabled: false
+  artifact_bundle_path: ''
+  public_key_ring_path: ''
+  expected_artifact_id: ''
+
 # Massive.com (formerly Polygon.io)
 massive_api_key: ''
 massive_feed: stocks

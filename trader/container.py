@@ -112,6 +112,11 @@ class Container():
         self.configuration['massive_feed'] = self.mmr_config.massive.feed
         self.configuration['massive_delayed'] = self.mmr_config.massive.delayed
         self.configuration['twelvedata_api_key'] = self.mmr_config.twelvedata.api_key
+        self.configuration['automation_enabled'] = self.mmr_config.automation.enabled
+        self.configuration['automation_live_enabled'] = self.mmr_config.automation.live_enabled
+        self.configuration['automation_artifact_bundle_path'] = self.mmr_config.automation.artifact_bundle_path
+        self.configuration['automation_public_key_ring_path'] = self.mmr_config.automation.public_key_ring_path
+        self.configuration['automation_expected_artifact_id'] = self.mmr_config.automation.expected_artifact_id
 
     @classmethod
     def create(cls, config_file: str = '') -> 'Container':

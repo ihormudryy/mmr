@@ -26,12 +26,12 @@
 
 **Interfaces:** Produces the frozen `ExecutionIntent` contract from the program index plus `derive_intent_id(fields) -> str` and `derive_command_id(intent_id) -> str`.
 
-- [ ] Add strict schema tests for all frozen index fields, timezone-aware timestamps, positive conid, BUY/SELL only, risk fraction bounds, stop distance, account mode, and completed-bar ordering.
-- [ ] Add golden ID tests and Hypothesis tests proving identical stable inputs create identical IDs; any authority-relevant change changes both intent and command ID.
-- [ ] Reject caller-supplied IDs that do not equal recomputation. IDs are colon-free and round-trip through existing `encode_order_ref`.
-- [ ] Implement frozen policies (`EntryPolicy`, `StopPolicy`, `TargetPolicy`, `TimeExitPolicy`) with no free-form executable strings.
-- [ ] Use P2 canonical bytes and SHA-256 prefixes `intent-`/`auto-`; do not use Python `hash()` or random UUIDs.
-- [ ] Run focused tests and commit `feat(automation): define deterministic execution intents`.
+- [x] Add strict schema tests for all frozen index fields, timezone-aware timestamps, positive conid, BUY/SELL only, risk fraction bounds, stop distance, account mode, and completed-bar ordering.
+- [x] Add golden ID tests and Hypothesis tests proving identical stable inputs create identical IDs; any authority-relevant change changes both intent and command ID.
+- [x] Reject caller-supplied IDs that do not equal recomputation. IDs are colon-free and round-trip through existing `encode_order_ref`.
+- [x] Implement frozen policies (`EntryPolicy`, `StopPolicy`, `TargetPolicy`, `TimeExitPolicy`) with no free-form executable strings.
+- [x] Use P2 canonical bytes and SHA-256 prefixes `intent-`/`auto-`; do not use Python `hash()` or random UUIDs.
+- [x] Run focused tests and commit `feat(automation): define deterministic execution intents`.
 
 ### Task 2: Verify artifacts at both load and command boundaries
 
@@ -44,12 +44,12 @@
 
 **Interfaces:** `ArtifactVerifier.verify(bundle_path, expected_mode, now) -> VerifiedArtifact`; result contains immutable allowlist, parameters, digests, allocation, expiry, and public-key ID.
 
-- [ ] Test checksum/signature/expiry/revocation/mode/allowlist/ruleset/artifact mismatch and changed files after load.
-- [ ] Test `CANDIDATE`, `SUSPENDED`, and `RETIRED` cannot run; `PAPER_ELIGIBLE` cannot run live; `CANARY_ELIGIBLE` is required live.
-- [ ] Add config paths for read-only artifact bundle, public verification key ring, and expected artifact ID; refuse writable bundle mounts in live mode.
-- [ ] Verify once at strategy load and again from immutable bundle evidence at trader command validation. Never trust a strategy-service “verified” boolean.
-- [ ] Persist safe verification reason codes, not artifact source contents or keys.
-- [ ] Run focused tests and commit `feat(automation): verify signed strategy authority`.
+- [x] Test checksum/signature/expiry/revocation/mode/allowlist/ruleset/artifact mismatch and changed files after load.
+- [x] Test `CANDIDATE`, `SUSPENDED`, and `RETIRED` cannot run; `PAPER_ELIGIBLE` cannot run live; `CANARY_ELIGIBLE` is required live.
+- [x] Add config paths for read-only artifact bundle, public verification key ring, and expected artifact ID; refuse writable bundle mounts in live mode.
+- [x] Verify once at strategy load and again from immutable bundle evidence at trader command validation. Never trust a strategy-service “verified” boolean.
+- [x] Persist safe verification reason codes, not artifact source contents or keys.
+- [x] Run focused tests and commit `feat(automation): verify signed strategy authority`.
 
 ### Task 3: Register automated intent as a coordinator action
 

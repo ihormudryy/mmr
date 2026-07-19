@@ -74,7 +74,7 @@ def build_populated_db(tmp_path, *, attestation_source_digest="source-1",
     selected = registry.start_trial(family.family_id, trial_key="selected",
                                       parameters={"minutes": 30}, started_at=T0)
     registry.finish_trial(selected, status=TRIAL_SUCCEEDED, finished_at=T0,
-                          metrics={"sharpe": 2.0})
+                          metrics={"sharpe": 2.0, "trace_signature": "a" * 64})
     failed = registry.start_trial(family.family_id, trial_key="failed",
                                     parameters={"minutes": 15}, started_at=T0)
     registry.finish_trial(failed, status=TRIAL_FAILED, finished_at=T0,

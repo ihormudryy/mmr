@@ -420,6 +420,17 @@ Every run is persisted with its strategy source hash, params, conids, date range
 
 Nightly sweeps drop a markdown digest to `~/.local/share/mmr/reports/sweep_<id>_<name>_<ts>.md` with strong-candidate leaderboards, risk flags (negative skew + fat tails), and pointers back into the CLI. Cron-compatible — `0 2 * * * mmr sweep run ~/mmr-sweeps/nightly.yaml` runs at 2am and you wake up to a verdict.
 
+## Reproducing Research Artifacts
+
+When a new strategy is published, it is distributed as a read-only artifact bundle. To verify the bundle and replay its execution, use:
+
+```bash
+mmr research attest verify --public-key-file <path_to_public_key> --bundle <path_to_bundle>
+python scripts/reproduce_experiment.py --bundle <path_to_bundle>
+```
+
+**Note on Data Limitations:** Data vendors may introduce restatements, stock splits, or corrections over time. Because of this, a software-pass experiment will remain `CANDIDATE` until a real qualified dataset and family earn a signed paper attestation.
+
 ## Writing a Strategy
 
 Subclass `Strategy` and implement `on_prices()`:

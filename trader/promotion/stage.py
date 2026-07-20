@@ -24,7 +24,7 @@ from typing import Any, Callable, Optional
 from trader.data.schema_migrations import SchemaMigrator
 from trader.domain.events import DomainMutation
 from trader.domain.identity import strategy_entity_id
-from trader.promotion.evidence_store import EvidenceWindow
+from trader.promotion.evidence_store import EvidenceStore, EvidenceWindow
 
 STAGE_MIGRATION_42 = 42
 STAGE_MIGRATION_VERSIONS = (STAGE_MIGRATION_42,)
@@ -64,25 +64,39 @@ _ALLOWED_EDGES: dict[Optional[str], frozenset[str]] = {
 }
 
 # Stages that certify evidence as "good enough to move forward" and
-# therefore MANDATE a strategy-matched, freshly-projected, clean evidence
-# window (not stale, no breaker trip, no cost breach, no drawdown breach
-# since the last correction). Tasks 2/3/6 own the concrete simultaneous
-# floors (day/session/round-trip/instrument counts); this machine only
-# refuses to rubber-stamp a passed/authorized/canary-passed stage without
-# real, current evidence -- omission is a rejection, never trusted. Software
-# completion alone (a bare reason/actor with no evidence_window) can never
+# therefore MANDATE a store-backed, freshly-projected, clean evidence window
+# (not stale, no breaker trip, no cost breach, no drawdown breach since the
+# last correction). Tasks 2/3/6 own the concrete simultaneous floors (day/
+# session/round-trip/instrument counts); this machine only refuses to
+# rubber-stamp a passed/authorized/canary-passed stage without real, current,
+# STORE-PROJECTED evidence -- omission is a rejection, never trusted, and a
+# caller-constructed ``EvidenceWindow`` is never accepted as sufficient proof
+# on its own (that would let a forged clean window rubber-stamp the gate --
+# see ``EvidenceStore``/``_require_clean_evidence`` below). Software
+# completion alone (a bare reason/actor with no evidence_store) can never
 # mark a paper or live gate passed.
 _REQUIRES_CLEAN_EVIDENCE = frozenset({PAPER_PASSED, CANARY_AUTHORIZED, CANARY_PASSED})
 
-# How long after an EvidenceWindow's own `as_of` it may still be presented to
-# authorize a transition. This is a BINDING/provenance check -- distinct from
-# `EvidenceWindow.stale` (30-day evidence-inactivity, relative to the
-# window's own `as_of`) -- that guards against a cached or replayed window
-# from an earlier review cycle being reused to rubber-stamp a *later*
-# transition. Callers are expected to call `EvidenceStore.project()`
-# immediately before `transition()`, so this tolerance only needs to absorb
-# ordinary call latency, not multi-day gaps.
-EVIDENCE_WINDOW_FRESHNESS = dt.timedelta(hours=1)
+_WINDOW_COMPARISON_FIELDS = (
+    "strategy_id", "window_reset_at", "first_event_at", "last_event_at",
+    "calendar_days", "session_ids", "round_trip_ids", "instrument_ids",
+    "corrections", "breaker_trips", "cost_breaches", "drawdown_breaches",
+    "stale", "event_count",
+)
+
+
+def _window_matches_projection(window: EvidenceWindow, projected: EvidenceWindow) -> bool:
+    """True iff a caller-supplied ``EvidenceWindow``'s substantive content is
+    identical to the store's own fresh projection (every field except
+    ``as_of``, which legitimately differs by call time). Used only as a
+    defense-in-depth integrity check when a caller *chooses* to also pass
+    ``evidence_window=`` alongside the mandatory ``evidence_store=`` -- the
+    projection, never the caller's copy, is what actually gets evaluated for
+    cleanliness."""
+    return all(
+        getattr(window, field) == getattr(projected, field)
+        for field in _WINDOW_COMPARISON_FIELDS
+    )
 
 
 def _as_utc(value: dt.datetime) -> dt.datetime:
@@ -107,11 +121,13 @@ class IllegalStageTransition(Exception):
 
 class EvidenceNotCleanError(Exception):
     """Raised when a transition into a clean-evidence-required stage
-    (PAPER_PASSED/CANARY_AUTHORIZED/CANARY_PASSED) cannot be trusted: the
-    ``evidence_window`` is missing entirely, bound to a different
-    ``strategy_id``, not freshly projected relative to this transition, or
-    its content is stale/carries breaker/cost/drawdown evidence. Any one of
-    these fails the whole transition closed -- omission is never trusted."""
+    (PAPER_PASSED/CANARY_AUTHORIZED/CANARY_PASSED) cannot be trusted:
+    ``evidence_store`` is missing entirely (a bare ``evidence_window=`` is
+    never sufficient on its own -- that is the exact forged-window bypass
+    this error exists to close), a caller-supplied ``evidence_window``
+    disagrees with the store's own fresh projection, or the store-projected
+    window is stale/carries breaker/cost/drawdown evidence. Any one of these
+    fails the whole transition closed -- omission is never trusted."""
 
     def __init__(self, strategy_id: str, to_stage: str, reasons: tuple[str, ...]):
         self.strategy_id = strategy_id
@@ -272,12 +288,16 @@ class PromotionStageMachine:
     ``transition`` is the sole write path. It (1) validates the requested
     edge against the frozen ``_ALLOWED_EDGES`` map, (2) for a target stage
     that requires clean evidence (PAPER_PASSED/CANARY_AUTHORIZED/
-    CANARY_PASSED), MANDATES a strategy-matched, freshly-projected
-    ``evidence_window`` and refuses to advance if it is missing, mismatched,
-    stale (either not freshly projected or 30-day-inactive), or carries
-    breaker/cost/drawdown evidence, (3) for canary authorization/activation,
-    records and then verifies authority reference + expiry exactly, and
-    (4) persists the new ``StageRecord`` and its domain event atomically.
+    CANARY_PASSED), MANDATES a caller-supplied ``evidence_store`` and
+    recomputes ``evidence_store.project(strategy_id, as_of=now)`` itself --
+    a caller-constructed ``EvidenceWindow`` is never trusted as sufficient
+    proof by itself, closing the "forged clean window" bypass -- refusing to
+    advance if the store is missing, an optionally-supplied ``evidence_window``
+    disagrees with the store's own projection, or the projection is stale or
+    carries breaker/cost/drawdown evidence, (3) for canary authorization/
+    activation, records and then verifies authority reference + expiry
+    exactly, and (4) persists the new ``StageRecord`` and its domain event
+    atomically.
     """
 
     def __init__(self, journal: Any, db: Any, now: Optional[Callable[[], dt.datetime]] = None):
@@ -302,6 +322,7 @@ class PromotionStageMachine:
         reason: str,
         actor: str,
         now: Optional[dt.datetime] = None,
+        evidence_store: Optional[EvidenceStore] = None,
         evidence_window: Optional[EvidenceWindow] = None,
         authority_ref: Optional[str] = None,
         authority_expiry: Optional[dt.datetime] = None,
@@ -323,7 +344,9 @@ class PromotionStageMachine:
             raise IllegalStageTransition(strategy_id, from_stage, to_stage)
 
         if to_stage in _REQUIRES_CLEAN_EVIDENCE:
-            self._require_clean_evidence(strategy_id, to_stage, evidence_window, resolved_now)
+            self._require_clean_evidence(
+                strategy_id, to_stage, evidence_store, evidence_window, resolved_now,
+            )
 
         next_authority_ref = current.authority_ref if current is not None else None
         next_authority_expiry = current.authority_expiry if current is not None else None
@@ -365,26 +388,34 @@ class PromotionStageMachine:
     def _require_clean_evidence(
         strategy_id: str,
         to_stage: str,
+        evidence_store: Optional[EvidenceStore],
         evidence_window: Optional[EvidenceWindow],
         now: dt.datetime,
     ) -> None:
         reasons: list[str] = []
-        if evidence_window is None:
-            # Do not trust omission: no window at all is the exact bypass
-            # this check exists to close (a caller "trust me, floors met").
-            reasons.append("missing_evidence_window")
+        if evidence_store is None:
+            # A caller-constructed EvidenceWindow is NEVER sufficient proof
+            # by itself, no matter how clean it claims to be -- without a
+            # store to project from there is nothing to bind that claim to.
+            # This is the exact forged-window bypass this check exists to
+            # close: omission (or a bare evidence_window with no store) is
+            # always a rejection, never trusted.
+            reasons.append("missing_evidence_store")
         else:
-            if evidence_window.strategy_id != strategy_id:
-                reasons.append("strategy_mismatch")
-            if abs(now - evidence_window.as_of) > EVIDENCE_WINDOW_FRESHNESS:
-                reasons.append("window_not_fresh")
-            if evidence_window.stale:
+            projected = evidence_store.project(strategy_id, as_of=now)
+            if evidence_window is not None and not _window_matches_projection(evidence_window, projected):
+                # A caller-supplied window that disagrees with the store's
+                # own projection is untrustworthy regardless of its own
+                # content -- the projection below, not the caller's copy,
+                # is what actually gets evaluated for cleanliness.
+                reasons.append("evidence_window_mismatch")
+            if projected.stale:
                 reasons.append("stale_evidence")
-            if evidence_window.breaker_trips:
+            if projected.breaker_trips:
                 reasons.append("breaker_trip")
-            if evidence_window.cost_breaches:
+            if projected.cost_breaches:
                 reasons.append("cost_breach")
-            if evidence_window.drawdown_breaches:
+            if projected.drawdown_breaches:
                 reasons.append("drawdown_breach")
         if reasons:
             raise EvidenceNotCleanError(strategy_id, to_stage, tuple(reasons))

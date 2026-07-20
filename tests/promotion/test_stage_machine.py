@@ -11,12 +11,14 @@ Contract:
 * Activation onto CANARY_ACTIVE requires authority that exactly matches
   what was recorded at CANARY_AUTHORIZED and is not expired as of "now".
 * Transitions into a "requires clean evidence" stage
-  (PAPER_PASSED/CANARY_AUTHORIZED/CANARY_PASSED) MANDATE a strategy-matched,
-  freshly-projected ``EvidenceWindow`` -- omitting it, supplying one for the
-  wrong strategy, supplying a stale (not just-projected) one, or supplying
-  one that carries breaker/cost/drawdown evidence or 30-day inactivity all
-  fail closed. Software completion alone can never mark a paper or live
-  gate passed.
+  (PAPER_PASSED/CANARY_AUTHORIZED/CANARY_PASSED) MANDATE a caller-supplied
+  ``evidence_store`` -- the machine recomputes
+  ``evidence_store.project(strategy_id, as_of=now)`` itself and evaluates
+  THAT for cleanliness. A caller-constructed ``EvidenceWindow`` (however
+  clean it claims to be) is NEVER accepted as sufficient proof by itself --
+  omitting the store, or supplying an ``evidence_window`` that disagrees
+  with the store's own projection, all fail closed. Software completion
+  alone can never mark a paper or live gate passed.
 * Migration 42: strategy_promotion_state (current stage per strategy).
 * Mutation and its domain event commit atomically (via DomainJournal).
 """
@@ -45,17 +47,34 @@ def _db(tmp_path: Path, name: str = "stage.duckdb"):
 
 
 def _machine(tmp_path: Path, **overrides):
+    from trader.promotion.evidence_store import EvidenceStore, apply_evidence_migrations
     from trader.promotion.stage import PromotionStageMachine, apply_stage_migration
 
     db, migrator, journal = _db(tmp_path)
     apply_stage_migration(migrator)
-    machine = PromotionStageMachine(
-        journal=journal, db=db, now=overrides.pop("now", lambda: NOW), **overrides,
-    )
-    return machine, journal, db, migrator
+    apply_evidence_migrations(migrator)
+    now_fn = overrides.pop("now", lambda: NOW)
+    machine = PromotionStageMachine(journal=journal, db=db, now=now_fn, **overrides)
+    evidence = EvidenceStore(journal=journal, db=db, now=now_fn)
+    return machine, evidence, journal, db, migrator
+
+
+def _seed_clean_evidence(evidence, strategy_id=STRATEGY, ts=NOW, suffix=""):
+    """Append one session event so a fresh projection is non-empty and not
+    stale, and contains no safety incidents -- i.e. genuinely clean."""
+    from trader.promotion.evidence_store import EvidenceEvent
+
+    evidence.append(EvidenceEvent(
+        source_event_id=f"{strategy_id}-sess-{suffix or ts.isoformat()}",
+        strategy_id=strategy_id, event_kind="session",
+        payload={"session_id": f"s{suffix or '1'}"}, source_timestamp=ts,
+    ))
 
 
 def _clean_window(strategy_id=STRATEGY, as_of=NOW):
+    """A free-standing, forgeable ``EvidenceWindow`` -- NOT backed by any
+    store. Used only to prove such an object can never authorize a gate on
+    its own."""
     from trader.promotion.evidence_store import EvidenceWindow
 
     return EvidenceWindow(
@@ -65,11 +84,6 @@ def _clean_window(strategy_id=STRATEGY, as_of=NOW):
         corrections=(), breaker_trips=(), cost_breaches=(), drawdown_breaches=(),
         stale=False, event_count=2,
     )
-
-
-def _dirty_window(**kwargs):
-    from dataclasses import replace
-    return replace(_clean_window(), **kwargs)
 
 
 # ---------------------------------------------------------------------------
@@ -135,11 +149,12 @@ def test_strategy_bootstraps_into_paper_collecting(tmp_path):
 def test_paper_collecting_to_paper_passed_with_clean_evidence(tmp_path):
     from trader.promotion.stage import PAPER_COLLECTING, PAPER_PASSED
 
-    machine, *_ = _machine(tmp_path)
+    machine, evidence, *_ = _machine(tmp_path)
+    _seed_clean_evidence(evidence)
     machine.transition(STRATEGY, PAPER_COLLECTING, reason="bootstrap", actor="system")
     record = machine.transition(
         STRATEGY, PAPER_PASSED, reason="all paper floors met", actor="paper_gate",
-        evidence_window=_clean_window(),
+        evidence_store=evidence,
     )
     assert record.stage == PAPER_PASSED
     assert record.prior_stage == PAPER_COLLECTING
@@ -179,11 +194,12 @@ def test_forbids_direct_paper_collecting_to_canary_active(tmp_path):
 def test_forbids_direct_paper_passed_to_canary_active(tmp_path):
     from trader.promotion.stage import CANARY_ACTIVE, IllegalStageTransition, PAPER_COLLECTING, PAPER_PASSED
 
-    machine, *_ = _machine(tmp_path)
+    machine, evidence, *_ = _machine(tmp_path)
+    _seed_clean_evidence(evidence)
     machine.transition(STRATEGY, PAPER_COLLECTING, reason="bootstrap", actor="system")
     machine.transition(
         STRATEGY, PAPER_PASSED, reason="floors met", actor="paper_gate",
-        evidence_window=_clean_window(),
+        evidence_store=evidence,
     )
     with pytest.raises(IllegalStageTransition):
         machine.transition(
@@ -195,8 +211,8 @@ def test_forbids_direct_paper_passed_to_canary_active(tmp_path):
 def test_forbids_canary_suspended_directly_back_to_canary_active(tmp_path):
     from trader.promotion.stage import CANARY_ACTIVE, IllegalStageTransition
 
-    machine, *_ = _machine(tmp_path)
-    _authorize_and_activate(machine)
+    machine, evidence, *_ = _machine(tmp_path)
+    _authorize_and_activate(machine, evidence)
     machine.transition(STRATEGY, "CANARY_SUSPENDED", reason="breaker trip", actor="canary_risk")
     with pytest.raises(IllegalStageTransition):
         machine.transition(
@@ -241,12 +257,10 @@ def test_elapsed_time_alone_never_changes_stage(tmp_path):
 def test_projecting_evidence_never_mutates_stage_state(tmp_path):
     """EvidenceStore.project() and PromotionStageMachine are decoupled --
     accumulating evidence alone must never advance the stage."""
-    from trader.promotion.evidence_store import EvidenceEvent, EvidenceStore, apply_evidence_migrations
+    from trader.promotion.evidence_store import EvidenceEvent
     from trader.promotion.stage import PAPER_COLLECTING
 
-    machine, journal, db, migrator = _machine(tmp_path)
-    apply_evidence_migrations(migrator)
-    evidence = EvidenceStore(journal=journal, db=db, now=lambda: NOW)
+    machine, evidence, *_ = _machine(tmp_path)
 
     machine.transition(STRATEGY, PAPER_COLLECTING, reason="bootstrap", actor="system")
     for i in range(60):
@@ -263,28 +277,29 @@ def test_projecting_evidence_never_mutates_stage_state(tmp_path):
 # Authority: required, must match, must not be expired
 # ---------------------------------------------------------------------------
 
-def _authorize(machine, *, authority_ref="auth-1", expiry=None):
+def _authorize(machine, evidence, *, authority_ref="auth-1", expiry=None):
     from trader.promotion.stage import CANARY_AUTHORIZED, PAPER_COLLECTING, PAPER_PASSED
 
+    _seed_clean_evidence(evidence)
     machine.transition(STRATEGY, PAPER_COLLECTING, reason="bootstrap", actor="system")
     machine.transition(
         STRATEGY, PAPER_PASSED, reason="floors met", actor="paper_gate",
-        evidence_window=_clean_window(),
+        evidence_store=evidence,
     )
     return machine.transition(
         STRATEGY, CANARY_AUTHORIZED, reason="promotion controller prepared canary",
         actor="promotion_controller",
         authority_ref=authority_ref,
         authority_expiry=expiry or (NOW + dt.timedelta(days=7)),
-        evidence_window=_clean_window(),
+        evidence_store=evidence,
     )
 
 
-def _authorize_and_activate(machine, *, authority_ref="auth-1", expiry=None):
+def _authorize_and_activate(machine, evidence, *, authority_ref="auth-1", expiry=None):
     from trader.promotion.stage import CANARY_ACTIVE
 
     expiry = expiry or (NOW + dt.timedelta(days=7))
-    _authorize(machine, authority_ref=authority_ref, expiry=expiry)
+    _authorize(machine, evidence, authority_ref=authority_ref, expiry=expiry)
     return machine.transition(
         STRATEGY, CANARY_ACTIVE, reason="operator activated canary", actor="operator:alice",
         authority_ref=authority_ref, authority_expiry=expiry,
@@ -294,24 +309,25 @@ def _authorize_and_activate(machine, *, authority_ref="auth-1", expiry=None):
 def test_canary_authorized_requires_authority_ref_and_expiry(tmp_path):
     from trader.promotion.stage import AuthorityRequiredError, CANARY_AUTHORIZED, PAPER_COLLECTING, PAPER_PASSED
 
-    machine, *_ = _machine(tmp_path)
+    machine, evidence, *_ = _machine(tmp_path)
+    _seed_clean_evidence(evidence)
     machine.transition(STRATEGY, PAPER_COLLECTING, reason="bootstrap", actor="system")
     machine.transition(
         STRATEGY, PAPER_PASSED, reason="floors met", actor="paper_gate",
-        evidence_window=_clean_window(),
+        evidence_store=evidence,
     )
     with pytest.raises(AuthorityRequiredError):
         machine.transition(
             STRATEGY, CANARY_AUTHORIZED, reason="missing authority", actor="promotion_controller",
-            evidence_window=_clean_window(),
+            evidence_store=evidence,
         )
 
 
 def test_activation_succeeds_with_matching_unexpired_authority(tmp_path):
     from trader.promotion.stage import CANARY_ACTIVE
 
-    machine, *_ = _machine(tmp_path)
-    record = _authorize_and_activate(machine)
+    machine, evidence, *_ = _machine(tmp_path)
+    record = _authorize_and_activate(machine, evidence)
     assert record.stage == CANARY_ACTIVE
     assert record.authority_ref == "auth-1"
 
@@ -319,8 +335,8 @@ def test_activation_succeeds_with_matching_unexpired_authority(tmp_path):
 def test_activation_forbidden_without_authority_supplied(tmp_path):
     from trader.promotion.stage import AuthorityRequiredError, CANARY_ACTIVE
 
-    machine, *_ = _machine(tmp_path)
-    _authorize(machine)
+    machine, evidence, *_ = _machine(tmp_path)
+    _authorize(machine, evidence)
     with pytest.raises(AuthorityRequiredError):
         machine.transition(STRATEGY, CANARY_ACTIVE, reason="activate", actor="operator:alice")
 
@@ -328,8 +344,8 @@ def test_activation_forbidden_without_authority_supplied(tmp_path):
 def test_activation_forbidden_on_changed_authority(tmp_path):
     from trader.promotion.stage import AuthorityMismatchError, CANARY_ACTIVE
 
-    machine, *_ = _machine(tmp_path)
-    _authorize(machine, authority_ref="auth-1")
+    machine, evidence, *_ = _machine(tmp_path)
+    _authorize(machine, evidence, authority_ref="auth-1")
     with pytest.raises(AuthorityMismatchError):
         machine.transition(
             STRATEGY, CANARY_ACTIVE, reason="activate", actor="operator:alice",
@@ -340,9 +356,9 @@ def test_activation_forbidden_on_changed_authority(tmp_path):
 def test_activation_forbidden_on_changed_expiry(tmp_path):
     from trader.promotion.stage import AuthorityMismatchError, CANARY_ACTIVE
 
-    machine, *_ = _machine(tmp_path)
+    machine, evidence, *_ = _machine(tmp_path)
     original_expiry = NOW + dt.timedelta(days=7)
-    _authorize(machine, authority_ref="auth-1", expiry=original_expiry)
+    _authorize(machine, evidence, authority_ref="auth-1", expiry=original_expiry)
     with pytest.raises(AuthorityMismatchError):
         machine.transition(
             STRATEGY, CANARY_ACTIVE, reason="activate", actor="operator:alice",
@@ -353,9 +369,9 @@ def test_activation_forbidden_on_changed_expiry(tmp_path):
 def test_activation_forbidden_on_expired_authority(tmp_path):
     from trader.promotion.stage import AuthorityExpiredError, CANARY_ACTIVE
 
-    machine, *_ = _machine(tmp_path)
+    machine, evidence, *_ = _machine(tmp_path)
     expiry = NOW + dt.timedelta(hours=1)
-    _authorize(machine, authority_ref="auth-1", expiry=expiry)
+    _authorize(machine, evidence, authority_ref="auth-1", expiry=expiry)
 
     later = expiry + dt.timedelta(minutes=1)
     with pytest.raises(AuthorityExpiredError):
@@ -371,8 +387,8 @@ def test_canary_suspended_requires_fresh_authorization_not_bare_reset(tmp_path):
     breaker reset alone can never reactivate."""
     from trader.promotion.stage import CANARY_ACTIVE, CANARY_AUTHORIZED, CANARY_SUSPENDED
 
-    machine, *_ = _machine(tmp_path)
-    _authorize_and_activate(machine, authority_ref="auth-1")
+    machine, evidence, *_ = _machine(tmp_path)
+    _authorize_and_activate(machine, evidence, authority_ref="auth-1")
     machine.transition(STRATEGY, CANARY_SUSPENDED, reason="drawdown breach", actor="canary_risk")
     assert machine.current_stage(STRATEGY) == CANARY_SUSPENDED
 
@@ -380,7 +396,7 @@ def test_canary_suspended_requires_fresh_authorization_not_bare_reset(tmp_path):
         STRATEGY, CANARY_AUTHORIZED, reason="fresh promotion review completed",
         actor="promotion_controller",
         authority_ref="auth-2", authority_expiry=NOW + dt.timedelta(days=7),
-        evidence_window=_clean_window(),
+        evidence_store=evidence,
     )
     assert reauthorized.stage == CANARY_AUTHORIZED
     reactivated = machine.transition(
@@ -399,11 +415,11 @@ def test_canary_suspended_requires_fresh_authorization_not_bare_reset(tmp_path):
 def test_canary_active_to_canary_passed(tmp_path):
     from trader.promotion.stage import CANARY_PASSED
 
-    machine, *_ = _machine(tmp_path)
-    _authorize_and_activate(machine)
+    machine, evidence, *_ = _machine(tmp_path)
+    _authorize_and_activate(machine, evidence)
     record = machine.transition(
         STRATEGY, CANARY_PASSED, reason="live floors met, zero incidents", actor="live_metrics",
-        evidence_window=_clean_window(),
+        evidence_store=evidence,
     )
     assert record.stage == CANARY_PASSED
 
@@ -415,65 +431,90 @@ def test_canary_active_to_canary_passed(tmp_path):
 def test_stale_evidence_blocks_paper_passed(tmp_path):
     from trader.promotion.stage import EvidenceNotCleanError, PAPER_COLLECTING, PAPER_PASSED
 
-    machine, *_ = _machine(tmp_path)
+    machine, evidence, *_ = _machine(tmp_path)
+    # Only ancient evidence (>30 days before `now`) -- the fresh projection
+    # will be stale even though it's computed live from the real store.
+    _seed_clean_evidence(evidence, ts=NOW - dt.timedelta(days=40))
     machine.transition(STRATEGY, PAPER_COLLECTING, reason="bootstrap", actor="system")
     with pytest.raises(EvidenceNotCleanError) as exc_info:
         machine.transition(
             STRATEGY, PAPER_PASSED, reason="floors met but evidence is old", actor="paper_gate",
-            evidence_window=_dirty_window(stale=True),
+            evidence_store=evidence,
         )
     assert "stale_evidence" in exc_info.value.reasons
 
 
 def test_breaker_trip_blocks_paper_passed(tmp_path):
+    from trader.promotion.evidence_store import EvidenceEvent
     from trader.promotion.stage import EvidenceNotCleanError, PAPER_COLLECTING, PAPER_PASSED
 
-    machine, *_ = _machine(tmp_path)
+    machine, evidence, *_ = _machine(tmp_path)
+    _seed_clean_evidence(evidence)
+    evidence.append(EvidenceEvent(
+        source_event_id="breaker-1", strategy_id=STRATEGY, event_kind="breaker_trip",
+        payload={"incident_id": "inc-1"}, source_timestamp=NOW,
+    ))
     machine.transition(STRATEGY, PAPER_COLLECTING, reason="bootstrap", actor="system")
     with pytest.raises(EvidenceNotCleanError) as exc_info:
         machine.transition(
             STRATEGY, PAPER_PASSED, reason="floors met but breaker tripped", actor="paper_gate",
-            evidence_window=_dirty_window(breaker_trips=({"incident_id": "inc-1"},)),
+            evidence_store=evidence,
         )
     assert "breaker_trip" in exc_info.value.reasons
 
 
 def test_cost_breach_blocks_canary_authorized(tmp_path):
+    from trader.promotion.evidence_store import EvidenceEvent
     from trader.promotion.stage import CANARY_AUTHORIZED, EvidenceNotCleanError, PAPER_COLLECTING, PAPER_PASSED
 
-    machine, *_ = _machine(tmp_path)
+    machine, evidence, *_ = _machine(tmp_path)
+    _seed_clean_evidence(evidence)
     machine.transition(STRATEGY, PAPER_COLLECTING, reason="bootstrap", actor="system")
     machine.transition(
         STRATEGY, PAPER_PASSED, reason="floors met", actor="paper_gate",
-        evidence_window=_clean_window(),
+        evidence_store=evidence,
     )
+    evidence.append(EvidenceEvent(
+        source_event_id="cost-1", strategy_id=STRATEGY, event_kind="cost_breach",
+        payload={"metric": "stressed_cost_bps"}, source_timestamp=NOW,
+    ))
     with pytest.raises(EvidenceNotCleanError) as exc_info:
         machine.transition(
             STRATEGY, CANARY_AUTHORIZED, reason="prepare canary despite cost breach",
             actor="promotion_controller",
             authority_ref="auth-1", authority_expiry=NOW + dt.timedelta(days=7),
-            evidence_window=_dirty_window(cost_breaches=({"metric": "stressed_cost_bps"},)),
+            evidence_store=evidence,
         )
     assert "cost_breach" in exc_info.value.reasons
 
 
 def test_drawdown_breach_blocks_canary_passed(tmp_path):
+    from trader.promotion.evidence_store import EvidenceEvent
     from trader.promotion.stage import CANARY_PASSED, EvidenceNotCleanError
 
-    machine, *_ = _machine(tmp_path)
-    _authorize_and_activate(machine)
+    machine, evidence, *_ = _machine(tmp_path)
+    _authorize_and_activate(machine, evidence)
+    evidence.append(EvidenceEvent(
+        source_event_id="dd-1", strategy_id=STRATEGY, event_kind="drawdown_breach",
+        payload={"drawdown_pct": 5.0}, source_timestamp=NOW,
+    ))
     with pytest.raises(EvidenceNotCleanError) as exc_info:
         machine.transition(
             STRATEGY, CANARY_PASSED, reason="try to pass despite drawdown", actor="live_metrics",
-            evidence_window=_dirty_window(drawdown_breaches=({"drawdown_pct": 5.0},)),
+            evidence_store=evidence,
         )
     assert "drawdown_breach" in exc_info.value.reasons
 
 
-def test_missing_evidence_window_blocks_paper_passed(tmp_path):
+# ---------------------------------------------------------------------------
+# CRITICAL: a caller-constructed EvidenceWindow is never sufficient proof by
+# itself -- an EvidenceStore is mandatory and the machine projects from it.
+# ---------------------------------------------------------------------------
+
+def test_evidence_store_is_mandatory_bare_call_blocks_paper_passed(tmp_path):
     """CRITICAL fail-closed contract: software completion alone (a bare
-    reason/actor with no evidence) can never mark PAPER_PASSED. Omission is
-    treated as a rejection, never trusted."""
+    reason/actor with no evidence at all) can never mark PAPER_PASSED.
+    Omission is treated as a rejection, never trusted."""
     from trader.promotion.stage import EvidenceNotCleanError, PAPER_COLLECTING, PAPER_PASSED
 
     machine, *_ = _machine(tmp_path)
@@ -482,87 +523,104 @@ def test_missing_evidence_window_blocks_paper_passed(tmp_path):
         machine.transition(
             STRATEGY, PAPER_PASSED, reason="caller says floors met, trust me", actor="paper_gate",
         )
-    assert "missing_evidence_window" in exc_info.value.reasons
+    assert "missing_evidence_store" in exc_info.value.reasons
     assert machine.current_stage(STRATEGY) == PAPER_COLLECTING
 
 
-def test_missing_evidence_window_blocks_canary_authorized(tmp_path):
-    from trader.promotion.stage import CANARY_AUTHORIZED, EvidenceNotCleanError, PAPER_COLLECTING, PAPER_PASSED
-
-    machine, *_ = _machine(tmp_path)
-    machine.transition(STRATEGY, PAPER_COLLECTING, reason="bootstrap", actor="system")
-    machine.transition(
-        STRATEGY, PAPER_PASSED, reason="floors met", actor="paper_gate",
-        evidence_window=_clean_window(),
-    )
-    with pytest.raises(EvidenceNotCleanError) as exc_info:
-        machine.transition(
-            STRATEGY, CANARY_AUTHORIZED, reason="prepare canary, trust me", actor="promotion_controller",
-            authority_ref="auth-1", authority_expiry=NOW + dt.timedelta(days=7),
-        )
-    assert "missing_evidence_window" in exc_info.value.reasons
-
-
-def test_missing_evidence_window_blocks_canary_passed(tmp_path):
-    from trader.promotion.stage import CANARY_PASSED, EvidenceNotCleanError
-
-    machine, *_ = _machine(tmp_path)
-    _authorize_and_activate(machine)
-    with pytest.raises(EvidenceNotCleanError) as exc_info:
-        machine.transition(
-            STRATEGY, CANARY_PASSED, reason="live floors met, trust me", actor="live_metrics",
-        )
-    assert "missing_evidence_window" in exc_info.value.reasons
-
-
-def test_evidence_window_for_wrong_strategy_blocks_paper_passed(tmp_path):
-    """A window that's clean but bound to a DIFFERENT strategy_id must never
-    be honored -- that would let one strategy's real evidence rubber-stamp
-    another strategy's gate."""
+def test_forged_evidence_window_without_a_store_is_rejected(tmp_path):
+    """CRITICAL: the exact bypass this fix closes. Constructing a
+    free-standing, perfectly clean ``EvidenceWindow`` and handing it to
+    ``transition()`` -- with NO backing ``evidence_store`` -- must NOT be
+    enough to mark PAPER_PASSED. A forged clean window is worthless without
+    a store to verify it against."""
     from trader.promotion.stage import EvidenceNotCleanError, PAPER_COLLECTING, PAPER_PASSED
 
     machine, *_ = _machine(tmp_path)
     machine.transition(STRATEGY, PAPER_COLLECTING, reason="bootstrap", actor="system")
+    forged = _clean_window()
+    assert forged.is_clean  # the forged window claims to be spotless
+
+    with pytest.raises(EvidenceNotCleanError) as exc_info:
+        machine.transition(
+            STRATEGY, PAPER_PASSED, reason="forged clean window, no store", actor="attacker",
+            evidence_window=forged,
+        )
+    assert "missing_evidence_store" in exc_info.value.reasons
+    assert machine.current_stage(STRATEGY) == PAPER_COLLECTING
+
+
+def test_forged_evidence_window_without_matching_store_projection_is_rejected(tmp_path):
+    """CRITICAL: even when a real ``evidence_store`` IS supplied, a
+    caller-supplied ``evidence_window`` that does NOT match what the store
+    actually projects (e.g. it claims clean evidence the store has never
+    recorded) must be rejected -- the store's own projection is what is
+    evaluated, and a forged window is treated as untrustworthy on sight."""
+    from trader.promotion.stage import EvidenceNotCleanError, PAPER_COLLECTING, PAPER_PASSED
+
+    machine, evidence, *_ = _machine(tmp_path)
+    # The real store has NO evidence at all for this strategy.
+    machine.transition(STRATEGY, PAPER_COLLECTING, reason="bootstrap", actor="system")
+    forged = _clean_window()
+
+    with pytest.raises(EvidenceNotCleanError) as exc_info:
+        machine.transition(
+            STRATEGY, PAPER_PASSED, reason="forged window, real store disagrees", actor="attacker",
+            evidence_store=evidence, evidence_window=forged,
+        )
+    assert "evidence_window_mismatch" in exc_info.value.reasons
+    # And the real (empty) projection is independently unclean too.
+    assert "stale_evidence" in exc_info.value.reasons
+    assert machine.current_stage(STRATEGY) == PAPER_COLLECTING
+
+
+def test_evidence_window_for_wrong_strategy_is_rejected_as_mismatch(tmp_path):
+    """A window that's internally clean but bound to a DIFFERENT strategy_id
+    must never be honored -- even with a real store present, it disagrees
+    with the store's own (this-strategy) projection and is rejected."""
+    from trader.promotion.stage import EvidenceNotCleanError, PAPER_COLLECTING, PAPER_PASSED
+
+    machine, evidence, *_ = _machine(tmp_path)
+    _seed_clean_evidence(evidence)
+    machine.transition(STRATEGY, PAPER_COLLECTING, reason="bootstrap", actor="system")
+    wrong_strategy_window = _clean_window(strategy_id="some_other_strategy")
+
     with pytest.raises(EvidenceNotCleanError) as exc_info:
         machine.transition(
             STRATEGY, PAPER_PASSED, reason="floors met (wrong strategy's evidence)", actor="paper_gate",
-            evidence_window=_clean_window(strategy_id="some_other_strategy"),
+            evidence_store=evidence, evidence_window=wrong_strategy_window,
         )
-    assert "strategy_mismatch" in exc_info.value.reasons
-
-
-def test_stale_projected_window_blocks_paper_passed_even_if_content_is_clean(tmp_path):
-    """A window that is internally "clean" (no breaker/cost/drawdown, not
-    30-day-inactivity-stale relative to ITS OWN as_of) but was projected long
-    before this transition call is not "freshly projected" and must be
-    rejected -- a cached/replayed window from an earlier review cycle cannot
-    authorize today's gate."""
-    from trader.promotion.stage import EvidenceNotCleanError, PAPER_COLLECTING, PAPER_PASSED
-
-    old_as_of = NOW - dt.timedelta(days=10)
-    machine, *_ = _machine(tmp_path)
-    machine.transition(STRATEGY, PAPER_COLLECTING, reason="bootstrap", actor="system")
-    stale_projection = _clean_window(as_of=old_as_of)
-    assert stale_projection.stale is False  # clean relative to its own as_of
-
-    with pytest.raises(EvidenceNotCleanError) as exc_info:
-        machine.transition(
-            STRATEGY, PAPER_PASSED, reason="floors met (stale projection)", actor="paper_gate",
-            evidence_window=stale_projection,
-        )
-    assert "window_not_fresh" in exc_info.value.reasons
+    assert "evidence_window_mismatch" in exc_info.value.reasons
 
 
 def test_freshly_projected_clean_window_at_transition_time_passes(tmp_path):
-    """The positive case: a window projected at (or within tolerance of) the
-    transition's own `now` is accepted."""
+    """The positive case: a real, store-backed, clean projection is
+    accepted -- with or without also passing the matching window object."""
     from trader.promotion.stage import PAPER_COLLECTING, PAPER_PASSED
 
-    machine, *_ = _machine(tmp_path)
+    machine, evidence, *_ = _machine(tmp_path)
+    _seed_clean_evidence(evidence)
     machine.transition(STRATEGY, PAPER_COLLECTING, reason="bootstrap", actor="system")
     record = machine.transition(
         STRATEGY, PAPER_PASSED, reason="floors met", actor="paper_gate",
-        evidence_window=_clean_window(as_of=NOW),
+        evidence_store=evidence,
+    )
+    assert record.stage == PAPER_PASSED
+
+
+def test_matching_evidence_window_alongside_store_passes(tmp_path):
+    """Supplying an ``evidence_window=`` that DOES match the store's own
+    projection (e.g. the caller already called ``project()`` and wants to
+    pass the result through for its own bookkeeping) is accepted -- the
+    optional integrity check is satisfied, not merely bypassed."""
+    from trader.promotion.stage import PAPER_COLLECTING, PAPER_PASSED
+
+    machine, evidence, *_ = _machine(tmp_path)
+    _seed_clean_evidence(evidence)
+    machine.transition(STRATEGY, PAPER_COLLECTING, reason="bootstrap", actor="system")
+    real_window = evidence.project(STRATEGY, as_of=NOW)
+    record = machine.transition(
+        STRATEGY, PAPER_PASSED, reason="floors met", actor="paper_gate",
+        evidence_store=evidence, evidence_window=real_window,
     )
     assert record.stage == PAPER_PASSED
 
@@ -574,7 +632,7 @@ def test_freshly_projected_clean_window_at_transition_time_passes(tmp_path):
 def test_transition_commits_domain_event_atomically(tmp_path):
     from trader.promotion.stage import PAPER_COLLECTING
 
-    machine, journal, db, _ = _machine(tmp_path)
+    machine, evidence, journal, db, _ = _machine(tmp_path)
     machine.transition(STRATEGY, PAPER_COLLECTING, reason="bootstrap", actor="system")
 
     kinds = {
@@ -596,7 +654,7 @@ def test_transition_commits_domain_event_atomically(tmp_path):
 def test_restart_recovers_current_stage_from_durable_state(tmp_path):
     from trader.promotion.stage import PAPER_COLLECTING, PromotionStageMachine
 
-    machine, journal, db, migrator = _machine(tmp_path)
+    machine, evidence, journal, db, migrator = _machine(tmp_path)
     machine.transition(STRATEGY, PAPER_COLLECTING, reason="bootstrap", actor="system")
 
     # Fresh machine instance (process restart), same db/journal.

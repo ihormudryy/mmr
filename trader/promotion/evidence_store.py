@@ -46,6 +46,15 @@ EVENT_KIND_BREAKER_TRIP = "breaker_trip"
 EVENT_KIND_COST_BREACH = "cost_breach"
 EVENT_KIND_DRAWDOWN_BREACH = "drawdown_breach"
 
+# P4 Task 2 (paper gate) additions -- same append-only/idempotent contract as
+# the Task 1 kinds above, surfaced explicitly on the window (never silently
+# averaged away) so ``PaperGate.evaluate`` can block on each independently.
+EVENT_KIND_DIVERGENCE = "divergence"
+EVENT_KIND_DUPLICATE = "duplicate"
+EVENT_KIND_UNRESOLVED_ALERT = "unresolved_alert"
+EVENT_KIND_MISSED_FLAT = "missed_flat"
+EVENT_KIND_REPLAY_MISMATCH = "replay_mismatch"
+
 CORRECTION_SCOPES = frozenset({"code", "config", "allowlist", "risk", "data"})
 
 # Every event_kind recognized by the pure projection above. An unrecognized
@@ -61,6 +70,11 @@ EVENT_KINDS = frozenset({
     EVENT_KIND_BREAKER_TRIP,
     EVENT_KIND_COST_BREACH,
     EVENT_KIND_DRAWDOWN_BREACH,
+    EVENT_KIND_DIVERGENCE,
+    EVENT_KIND_DUPLICATE,
+    EVENT_KIND_UNRESOLVED_ALERT,
+    EVENT_KIND_MISSED_FLAT,
+    EVENT_KIND_REPLAY_MISMATCH,
 })
 
 # 30-day evidence inactivity floor (plan Global Constraint / Task 1 checklist).
@@ -168,6 +182,21 @@ class EvidenceWindow:
     always lists the FULL, never-reset correction history for audit.
     ``stale`` is true when there is no in-window evidence within
     ``STALE_AFTER`` (30 days) of ``as_of``.
+
+    P4 Task 2 additions (all default to ``()`` so existing callers that
+    construct an ``EvidenceWindow`` positionally/by-keyword without them keep
+    working): ``divergences``/``duplicates``/``missed_flats``/
+    ``replay_mismatches`` are explicit, in-window incident lists mirroring
+    ``breaker_trips`` above; ``unresolved_alerts`` is the latest-state (by
+    ``alert_id``, defaulting to the raw evidence key when absent) of every
+    in-window ``unresolved_alert`` event whose payload does not carry
+    ``resolved: true`` -- a later event for the same ``alert_id`` marking it
+    resolved removes it, exactly like the append-only ``fills_by_exec``
+    pattern in ``trader.automation.attribution``. ``round_trip_records`` is a
+    pure passthrough of in-window round-trip payloads (never truncated to
+    just an id, unlike ``round_trip_ids`` above) so a caller such as
+    ``PaperGate`` can compute expectancy/concentration purely from the
+    window, with no separate raw-event query.
     """
     strategy_id: str
     as_of: dt.datetime
@@ -184,6 +213,12 @@ class EvidenceWindow:
     drawdown_breaches: tuple[dict[str, Any], ...]
     stale: bool
     event_count: int
+    divergences: tuple[dict[str, Any], ...] = ()
+    duplicates: tuple[dict[str, Any], ...] = ()
+    unresolved_alerts: tuple[dict[str, Any], ...] = ()
+    missed_flats: tuple[dict[str, Any], ...] = ()
+    replay_mismatches: tuple[dict[str, Any], ...] = ()
+    round_trip_records: tuple[dict[str, Any], ...] = ()
 
     @property
     def calendar_day_count(self) -> int:
@@ -233,6 +268,12 @@ class EvidenceWindow:
             "drawdown_breaches": list(self.drawdown_breaches),
             "stale": self.stale,
             "event_count": self.event_count,
+            "divergences": list(self.divergences),
+            "duplicates": list(self.duplicates),
+            "unresolved_alerts": list(self.unresolved_alerts),
+            "missed_flats": list(self.missed_flats),
+            "replay_mismatches": list(self.replay_mismatches),
+            "round_trip_records": list(self.round_trip_records),
         }
 
     @classmethod
@@ -254,6 +295,12 @@ class EvidenceWindow:
             drawdown_breaches=tuple(data.get("drawdown_breaches") or ()),
             stale=bool(data["stale"]),
             event_count=int(data["event_count"]),
+            divergences=tuple(data.get("divergences") or ()),
+            duplicates=tuple(data.get("duplicates") or ()),
+            unresolved_alerts=tuple(data.get("unresolved_alerts") or ()),
+            missed_flats=tuple(data.get("missed_flats") or ()),
+            replay_mismatches=tuple(data.get("replay_mismatches") or ()),
+            round_trip_records=tuple(data.get("round_trip_records") or ()),
         )
 
 
@@ -265,6 +312,27 @@ def _latest_correction_ts(ordered_events: Sequence[Mapping[str, Any]]) -> Option
             if latest is None or ts > latest:
                 latest = ts
     return latest
+
+
+def _latest_unresolved_alerts(in_window: Sequence[Mapping[str, Any]]) -> list[dict[str, Any]]:
+    """Latest-state-wins resolution of ``unresolved_alert`` events, grouped by
+    ``payload["alert_id"]`` (falling back to the raw ``evidence_key`` when an
+    alert_id is not supplied, so each such event is its own group). Mirrors
+    the append-only ``fills_by_exec`` idiom in
+    ``trader.automation.attribution.rebuild_attribution_from_evidence``: a
+    later event for the same alert_id (e.g. an operator resolution) replaces
+    the earlier one rather than accumulating duplicates. Only alerts whose
+    LATEST payload does not carry ``resolved: true`` are returned -- those
+    are the ones still blocking a gate.
+    """
+    latest_by_key: dict[str, dict[str, Any]] = {}
+    for event in in_window:
+        if event["event_kind"] != EVENT_KIND_UNRESOLVED_ALERT:
+            continue
+        payload = dict(event["payload"])
+        key = str(payload.get("alert_id") or event.get("evidence_key") or "")
+        latest_by_key[key] = payload
+    return [payload for payload in latest_by_key.values() if payload.get("resolved") is not True]
 
 
 def project_evidence_window(
@@ -336,6 +404,22 @@ def project_evidence_window(
     drawdown_breaches = tuple(
         dict(event["payload"]) for event in in_window if event["event_kind"] == EVENT_KIND_DRAWDOWN_BREACH
     )
+    divergences = tuple(
+        dict(event["payload"]) for event in in_window if event["event_kind"] == EVENT_KIND_DIVERGENCE
+    )
+    duplicates = tuple(
+        dict(event["payload"]) for event in in_window if event["event_kind"] == EVENT_KIND_DUPLICATE
+    )
+    missed_flats = tuple(
+        dict(event["payload"]) for event in in_window if event["event_kind"] == EVENT_KIND_MISSED_FLAT
+    )
+    replay_mismatches = tuple(
+        dict(event["payload"]) for event in in_window if event["event_kind"] == EVENT_KIND_REPLAY_MISMATCH
+    )
+    unresolved_alerts = tuple(_latest_unresolved_alerts(in_window))
+    round_trip_records = tuple(
+        dict(event["payload"]) for event in in_window if event["event_kind"] == EVENT_KIND_ROUND_TRIP
+    )
 
     first_event_at = _as_utc(ordered[0]["source_timestamp"]) if ordered else None
     last_event_at = _as_utc(ordered[-1]["source_timestamp"]) if ordered else None
@@ -358,6 +442,12 @@ def project_evidence_window(
         drawdown_breaches=drawdown_breaches,
         stale=stale,
         event_count=len(ordered),
+        divergences=divergences,
+        duplicates=duplicates,
+        unresolved_alerts=unresolved_alerts,
+        missed_flats=missed_flats,
+        replay_mismatches=replay_mismatches,
+        round_trip_records=round_trip_records,
     )
 
 

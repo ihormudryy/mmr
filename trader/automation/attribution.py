@@ -513,3 +513,13 @@ class AttributionLedger:
             resolved=tuple(resolved),
             unresolved=tuple(unresolved),
         )
+
+    def canary_attribution_view(self) -> "CanaryAttributionView":
+        """Canary-scoped P&L summary for ``CanaryRiskController`` (P4 Task 6)."""
+        from trader.promotion.canary_risk import build_canary_attribution_view
+
+        report = self.promotion_attribution()
+        return build_canary_attribution_view(
+            report.resolved,
+            unresolved_trade_ids=[t.trade_id for t in report.unresolved],
+        )

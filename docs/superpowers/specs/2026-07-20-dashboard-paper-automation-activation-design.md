@@ -1,7 +1,7 @@
 # Dashboard Paper Automation Activation Design
 
 **Date:** 2026-07-20  
-**Status:** draft (awaiting user review)  
+**Status:** approved (phased: Phase 1 restart-required first; Phase 2 hot-arm later)  
 **Depends on:** hybrid paper-auto / live-propose (`2026-07-20-hybrid-paper-auto-live-propose-design.md`), command-plane activation, P3 deterministic automation, command-center command gateway.  
 **Related ops:** `scripts/bootstrap_paper_automation.py`, `docs/superpowers/rollout/trading-income-operations-runbook.md` (hybrid section).
 

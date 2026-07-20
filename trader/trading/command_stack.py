@@ -135,6 +135,7 @@ class CommandStack:
     session_risk: Any = None  # SessionRiskController when automation stack is active
     protective_order_saga: Any = None  # ProtectiveOrderSaga (P3 Task 5)
     session_controller: Any = None  # SessionController (P3 Task 6)
+    attribution_ledger: Any = None  # AttributionLedger (P3 Task 7)
     dispatch_guard: Any = None
 
 
@@ -451,6 +452,21 @@ def build_command_stack(
         account_id=trader.ib_account,
         now=now,
     )
+    # P3 Task 7 — authoritative attribution ledger; broker_ingest appends evidence.
+    from trader.automation.attribution import AttributionLedger
+    from trader.data.attribution_store import apply_attribution_migrations
+
+    apply_attribution_migrations(migrator)
+    attribution_ledger = AttributionLedger(
+        journal=journal,
+        db=trader.journal_db,
+        account_id=trader.ib_account,
+        now=now,
+    )
+    ingest = getattr(trader, "broker_ingest", None)
+    if ingest is not None:
+        ingest.attribution_ledger = attribution_ledger
+        ingest.protective_order_saga = protective_order_saga
     stack = CommandStack(
         journal=journal,
         repository=repository,
@@ -471,6 +487,7 @@ def build_command_stack(
         session_risk=session_risk,
         protective_order_saga=protective_order_saga,
         session_controller=session_controller,
+        attribution_ledger=attribution_ledger,
         dispatch_guard=dispatch_guard,
     )
     trader.command_ledger = ledger
@@ -483,4 +500,5 @@ def build_command_stack(
     trader.session_risk = session_risk
     trader.protective_order_saga = protective_order_saga
     trader.session_controller = session_controller
+    trader.attribution_ledger = attribution_ledger
     return stack

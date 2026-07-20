@@ -145,12 +145,12 @@
 
 **Journal migrations 32-34:** append-only `automation_decisions`, `trade_attribution`, `execution_cost_attribution`, and `operator_action_refs`; deterministic unique keys prevent duplicate broker-event accounting.
 
-- [ ] Test joins across artifact/dataset/signal/intent/context/policy/command/order/fill/commission/position and rejection/breaker/operator actions.
-- [ ] Test out-of-order fills/commissions, corrections, partial fills, duplicate exec IDs, multiple exits, MFE/MAE sampling, gross/net P&L, spread/slippage/latency, and crash between event and derived aggregation.
-- [ ] Store raw append-only evidence and rebuild derived trade rows deterministically; never overwrite raw broker evidence.
-- [ ] Ensure promotion queries exclude unresolved trades and report them explicitly rather than assuming zero P&L/cost.
-- [ ] Emit domain events for dashboard observability without making dashboard state authoritative.
-- [ ] Run focused tests and commit `feat(automation): record end-to-end trade attribution`.
+- [x] Test joins across artifact/dataset/signal/intent/context/policy/command/order/fill/commission/position and rejection/breaker/operator actions.
+- [x] Test out-of-order fills/commissions, corrections, partial fills, duplicate exec IDs, multiple exits, MFE/MAE sampling, gross/net P&L, spread/slippage/latency, and crash between event and derived aggregation.
+- [x] Store raw append-only evidence and rebuild derived trade rows deterministically; never overwrite raw broker evidence.
+- [x] Ensure promotion queries exclude unresolved trades and report them explicitly rather than assuming zero P&L/cost.
+- [x] Emit domain events for dashboard observability without making dashboard state authoritative.
+- [x] Run focused tests and commit `feat(automation): record end-to-end trade attribution`.
 
 ### Task 8: Seal and replay a complete trading day
 

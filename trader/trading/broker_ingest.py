@@ -352,6 +352,8 @@ class BrokerIngest:
         account_mode: str,
         session_epoch: Optional[str] = None,
         clock: Optional[Callable[[], dt.datetime]] = None,
+        attribution_ledger: Any = None,
+        protective_order_saga: Any = None,
     ):
         self.db = db
         self.journal = journal
@@ -360,6 +362,8 @@ class BrokerIngest:
         self.account_mode = account_mode
         self.session_epoch = session_epoch or uuid.uuid4().hex
         self.clock = clock or (lambda: dt.datetime.now(dt.timezone.utc))
+        self.attribution_ledger = attribution_ledger
+        self.protective_order_saga = protective_order_saga
         self._queue: queue.Queue[
             AccountValueObservation | PositionObservation | PnLObservation | OrderObservation | FillObservation | CommissionObservation
         ] = queue.Queue()
@@ -726,6 +730,8 @@ class BrokerIngest:
 
         event = emit(mutation, write)
         self._resolve_unbound_fills_in_tx(conn, obs, entity_id, emit)
+        self._notify_attribution_order(merged)
+        self._notify_protective_saga(merged, obs)
         return entity_id, event
 
     def _resolve_unbound_fills_in_tx(
@@ -822,7 +828,9 @@ class BrokerIngest:
         def write(write_conn: Any, revision: int) -> None:
             self.store.upsert_fill_in_tx(write_conn, replace(row, revision=revision))
 
-        return emit(mutation, write)
+        event = emit(mutation, write)
+        self._notify_attribution_fill(row)
+        return event
 
     def _apply_commission(
         self, conn: Any, obs: CommissionObservation, emit: Callable[[DomainMutation, Callable[[Any, int], None]], Any]
@@ -839,6 +847,7 @@ class BrokerIngest:
             source_timestamp=obs.fill.source_timestamp,
         )
         if revised.same_fields(current):
+            self._notify_attribution_commission(obs)
             return None
         mutation = DomainMutation(
             event_type="fill.updated",
@@ -855,7 +864,9 @@ class BrokerIngest:
         def write(write_conn: Any, revision: int) -> None:
             self.store.upsert_fill_in_tx(write_conn, replace(revised, revision=revision))
 
-        return emit(mutation, write)
+        event = emit(mutation, write)
+        self._notify_attribution_commission(obs)
+        return event
 
     def _apply_position(
         self, conn: Any, obs: PositionObservation, emit: Callable[[DomainMutation, Callable[[Any, int], None]], Any]
@@ -904,6 +915,7 @@ class BrokerIngest:
             self.store.upsert_position_in_tx(write_conn, replace(merged, revision=revision))
 
         emit(mutation, write)
+        self._notify_attribution_position(merged)
 
     def _apply_pnl(
         self,
@@ -1034,6 +1046,186 @@ class BrokerIngest:
         )
         self.store.purge_staging_in_tx(conn, generation.generation_id)
         return cursor
+
+    # -- P3 Task 7: attribution + protective saga hooks --------------------
+
+    def _resolve_trade_id_for_group(self, order_group_id: Optional[str]) -> Optional[str]:
+        if not order_group_id or self.attribution_ledger is None:
+            return None
+        row = self.db.execute(
+            "SELECT trade_id FROM automation_decisions "
+            "WHERE event_kind IN ('command', 'order') "
+            "AND payload LIKE ? "
+            "ORDER BY recorded_at ASC LIMIT 1",
+            [f'%\"order_group_id\": \"{order_group_id}\"%'],
+            fetch="one",
+        )
+        return row[0] if row else None
+
+    def _resolve_trade_id_for_fill(self, fill: BrokerFillRow) -> str:
+        if fill.order_entity_id:
+            try:
+                order = self.db.transaction(
+                    lambda conn: self.store.get_order_in_tx(conn, fill.order_entity_id)
+                )
+            except Exception:
+                order = None
+            if order is not None and order.order_group_id:
+                trade_id = self._resolve_trade_id_for_group(order.order_group_id)
+                if trade_id:
+                    return trade_id
+                return f"og:{order.order_group_id}"
+        return f"unbound:{fill.account_id}:{fill.exec_id}"
+
+    def _append_attribution(
+        self,
+        *,
+        evidence_key: str,
+        trade_id: str,
+        event_kind: str,
+        payload: dict[str, Any],
+        source_timestamp: dt.datetime,
+    ) -> None:
+        if self.attribution_ledger is None:
+            return
+        from trader.automation.attribution import AttributionEvidenceEvent
+
+        try:
+            self.attribution_ledger.append(AttributionEvidenceEvent(
+                evidence_key=evidence_key,
+                trade_id=trade_id,
+                event_kind=event_kind,
+                payload=payload,
+                source_timestamp=source_timestamp,
+            ))
+        except Exception:
+            logging.exception(
+                "attribution append failed for %s (%s)", evidence_key, event_kind
+            )
+
+    def _notify_attribution_order(self, order: BrokerOrderRow) -> None:
+        if not order.order_group_id:
+            return
+        trade_id = (
+            self._resolve_trade_id_for_group(order.order_group_id)
+            or f"og:{order.order_group_id}"
+        )
+        self._append_attribution(
+            evidence_key=(
+                f"order:{order.order_entity_id}:{order.status}:{order.filled_quantity}"
+            ),
+            trade_id=trade_id,
+            event_kind="order",
+            payload={
+                "order_entity_id": order.order_entity_id,
+                "order_group_id": order.order_group_id,
+                "leg": order.leg,
+                "status": order.status,
+                "filled_quantity": order.filled_quantity,
+                "total_quantity": order.total_quantity,
+            },
+            source_timestamp=order.source_timestamp,
+        )
+
+    def _notify_attribution_fill(self, fill: BrokerFillRow) -> None:
+        trade_id = self._resolve_trade_id_for_fill(fill)
+        leg = None
+        if fill.order_entity_id:
+            try:
+                order = self.db.transaction(
+                    lambda conn: self.store.get_order_in_tx(conn, fill.order_entity_id)
+                )
+            except Exception:
+                order = None
+            if order is not None:
+                leg = order.leg
+        self._append_attribution(
+            evidence_key=f"fill:{fill.account_id}:{fill.exec_id}",
+            trade_id=trade_id,
+            event_kind="fill",
+            payload={
+                "exec_id": fill.exec_id,
+                "leg": leg or "entry",
+                "side": fill.side,
+                "quantity": fill.quantity,
+                "price": fill.price,
+                "order_entity_id": fill.order_entity_id,
+                "conid": fill.conid,
+            },
+            source_timestamp=fill.source_timestamp,
+        )
+
+    def _notify_attribution_commission(self, obs: CommissionObservation) -> None:
+        try:
+            stored = self.db.transaction(
+                lambda conn: self.store.get_fill_in_tx(
+                    conn, obs.fill.account_id, obs.fill.exec_id
+                )
+            )
+        except Exception:
+            stored = None
+        if stored is not None:
+            trade_id = self._resolve_trade_id_for_fill(stored)
+        else:
+            trade_id = f"unbound:{obs.fill.account_id}:{obs.fill.exec_id}"
+        self._append_attribution(
+            evidence_key=f"commission:{obs.fill.account_id}:{obs.fill.exec_id}",
+            trade_id=trade_id,
+            event_kind="commission",
+            payload={
+                "exec_id": obs.fill.exec_id,
+                "commission": obs.commission,
+                "currency": obs.currency,
+                "realized_pnl": obs.realized_pnl,
+            },
+            source_timestamp=obs.fill.source_timestamp,
+        )
+
+    def _notify_attribution_position(self, position: BrokerPositionRow) -> None:
+        self._append_attribution(
+            evidence_key=(
+                f"position:{position.account_id}:{position.conid}:"
+                f"{position.quantity}:{position.source_timestamp.isoformat()}"
+            ),
+            trade_id=f"position:{position.account_id}:{position.conid}",
+            event_kind="position",
+            payload={
+                "conid": position.conid,
+                "quantity": position.quantity,
+                "average_cost": position.average_cost,
+                "symbol": position.symbol,
+            },
+            source_timestamp=position.source_timestamp,
+        )
+
+    def _notify_protective_saga(self, order: BrokerOrderRow, obs: OrderObservation) -> None:
+        if self.protective_order_saga is None or not order.order_group_id:
+            return
+        from trader.automation.protective_order_saga import BrokerOrderEvent
+
+        leg = order.leg or classify_leg(obs.order_type, obs.parent_id, obs.client_order_id)
+        event = BrokerOrderEvent(
+            order_group_id=order.order_group_id,
+            leg=leg or "entry",
+            status=obs.status,
+            filled_quantity=float(obs.filled_quantity),
+            total_quantity=float(obs.total_quantity),
+            order_id=int(obs.client_order_id or obs.perm_id or 0),
+            event_id=(
+                f"order:{order.order_entity_id}:{obs.status}:"
+                f"{obs.filled_quantity}:{obs.source_timestamp.isoformat()}"
+            ),
+            source_timestamp=obs.source_timestamp,
+        )
+        try:
+            self.protective_order_saga.on_broker_event(event)
+        except KeyError:
+            # No saga registered for this order group — external / manual order.
+            pass
+        except Exception:
+            logging.exception(
+                "protective saga on_broker_event failed for %s", order.order_group_id
+            )
 
     def _stage(
         self, ingest_seq: int, record: AccountValueObservation | PositionObservation | PnLObservation | OrderObservation | FillObservation | CommissionObservation

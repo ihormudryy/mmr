@@ -605,8 +605,11 @@ function renderPaperAutomation() {
   restartBanner.hidden = !showRestart;
   partialBanner.hidden = !showPartial;
 
+  const paperOk = ccPaperAutomationAllowed();
   let message = 'Waiting for paper automation status…';
-  if (pa == null) {
+  if (!paperOk) {
+    message = 'Paper automation is only available on paper accounts';
+  } else if (pa == null) {
     message = 'Paper automation status unavailable';
   } else if (pa.last_error) {
     message = pa.last_error;
@@ -651,12 +654,18 @@ function renderPaperAutomation() {
     }
   }
 
+  const controls = document.getElementById('paper-auto-controls');
+  if (controls) {
+    controls.hidden = !paperOk;
+  }
+
   const activateBtn = document.getElementById('paper-auto-activate');
   if (activateBtn) {
-    activateBtn.disabled = !caReady;
-    activateBtn.title = caReady
-      ? ''
-      : 'Command authority must be enabled before Activate';
+    activateBtn.disabled = !paperOk || !caReady;
+    activateBtn.title = !paperOk
+      ? 'Paper automation is only available on paper accounts'
+      : (caReady ? ''
+        : 'Command authority must be enabled before Activate');
   }
   const deactivateBtn = document.getElementById('paper-auto-deactivate');
   if (deactivateBtn) {
@@ -664,7 +673,10 @@ function renderPaperAutomation() {
         || lifecycle === 'armed'
         || lifecycle === 'armed_unpersisted'
         || lifecycle === 'degraded';
-    deactivateBtn.disabled = !enabledLifecycle;
+    deactivateBtn.disabled = !paperOk || !enabledLifecycle;
+    deactivateBtn.title = !paperOk
+      ? 'Paper automation is only available on paper accounts'
+      : '';
   }
 }
 
@@ -1094,6 +1106,10 @@ function ccIsLive(accountMode) {
   return String(accountMode || '').toLowerCase() === 'live';
 }
 
+function ccIsPaper(accountMode) {
+  return String(accountMode || '').toLowerCase() === 'paper';
+}
+
 async function ccRequestPreflight(commandId, action, params, expectedVersion) {
   const result = await ccPost('/api/preflight', {
     command_id: commandId, action, params,
@@ -1429,6 +1445,16 @@ function ccDashboardAccountMode() {
   return v && v.accounts && v.accounts[0] ? ccAccountModeValue(v.accounts[0]) : null;
 }
 
+function ccPaperAutomationAllowed() {
+  const dashboardMode = ccDashboardAccountMode();
+  if (!ccIsPaper(dashboardMode)) return false;
+  const pa = store.view && store.view.paper_automation;
+  if (pa && pa.account_mode != null && String(pa.account_mode).trim() !== '') {
+    return ccIsPaper(pa.account_mode);
+  }
+  return true;
+}
+
 function ccAccountModeFor(accountId) {
   const v = store.view;
   if (!v || !v.accounts) return null;
@@ -1755,6 +1781,10 @@ if (CFG.commandsEnabled) {
  * Phase 1 returns restart_required — operator restarts trader + strategy. */
 
 async function ccActivatePaperAutomation() {
+  if (!ccPaperAutomationAllowed()) {
+    ccToast('error', 'Paper automation is only available on paper accounts');
+    return;
+  }
   const strategy = (document.getElementById('paper-auto-strategy').value || '')
       .trim();
   const reason = (document.getElementById('paper-auto-reason').value || '')
@@ -1795,6 +1825,10 @@ async function ccActivatePaperAutomation() {
 }
 
 async function ccDeactivatePaperAutomation() {
+  if (!ccPaperAutomationAllowed()) {
+    ccToast('error', 'Paper automation is only available on paper accounts');
+    return;
+  }
   const reason = (document.getElementById('paper-auto-reason').value || '')
       .trim();
   if (!reason) {

@@ -54,6 +54,7 @@
 
   function normalizeDashTab(raw) {
     if (!raw || raw === 'trading') return 'trading';
+    if (raw === 'scaling') return 'scaling';
     if (raw === 'manage' || raw === 'setup' || raw === 'setup-strategies') return 'deploy';
     if (raw === 'setup-watchlists') return 'watchlists';
     if (ADMIN_TABS[raw]) return raw;

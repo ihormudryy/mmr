@@ -523,9 +523,55 @@ function renderRisk() {
         esc(r.discrepancy_count ?? 0)} discrepancies</div>`).join('');
 }
 
+function _pctCeiling(value) {
+  if (value == null || !Number.isFinite(Number(value))) return '—';
+  return (Number(value) * 100).toFixed(2) + '%';
+}
+
+function renderScaling() {
+  const panel = document.getElementById('scaling-panel');
+  if (!panel) return;
+  const v = store.view;
+  const scaling = (v && v.scaling) || {
+    status: 'unknown', lifecycle: 'unknown',
+    message: 'Snapshot not ready', authorities: [],
+  };
+  const lifecycle = scaling.lifecycle || scaling.status || 'unknown';
+  const badge = document.getElementById('scaling-lifecycle');
+  badge.dataset.lifecycle = lifecycle;
+  badge.textContent = lifecycle;
+  document.getElementById('scaling-message').textContent =
+    scaling.message || 'No allocation message';
+  document.getElementById('scaling-stage').textContent = scaling.stage || '—';
+  document.getElementById('scaling-ceiling').textContent =
+    _pctCeiling(scaling.max_gross_allocation);
+  document.getElementById('scaling-event').textContent = scaling.event || '—';
+  document.getElementById('scaling-expires').textContent =
+    scaling.expires_at ? esc(String(scaling.expires_at)) : '—';
+
+  const body = document.getElementById('scaling-authorities-body');
+  const rows = scaling.authorities || [];
+  if (!rows.length) {
+    body.innerHTML = '<tr><td colspan="6" class="dim">No allocation authority rows yet</td></tr>';
+    return;
+  }
+  body.innerHTML = rows.slice().sort((a, b) =>
+      (b.entity_revision || 0) - (a.entity_revision || 0)).map(row => {
+    const sid = esc(row.entity_id || row.strategy_id || '—');
+    return `<tr>
+      <td>${sid}</td>
+      <td>${esc(row.stage || '—')}</td>
+      <td class="num">${_pctCeiling(row.max_gross_allocation)}</td>
+      <td>${esc(row.event || '—')}</td>
+      <td>${esc(row.expires_at || '—')}</td>
+      <td class="num">${esc(row.entity_revision ?? '—')}</td>
+    </tr>`;
+  }).join('');
+}
+
 function renderAll() {
   renderStatusBar(); renderAccountCards(); renderPositions(); renderProposals();
-  renderOrders(); renderFills(); renderStrategies(); renderRisk();
+  renderOrders(); renderFills(); renderStrategies(); renderRisk(); renderScaling();
 }
 
 /* ---------------- drawer (keyboard + focus managed) ----------------------- */

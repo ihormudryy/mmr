@@ -350,32 +350,71 @@ class DashboardState:
 
     def _scaling_view(self) -> dict:
         """Authoritative allocation/scaling read model — never infer green from absence."""
-        authorities = list(self.allocation_authorities.values())
+        authorities = [
+            self._redact_allocation_authority(row)
+            for row in self.allocation_authorities.values()
+        ]
         if not authorities:
             return {
                 "status": "unknown",
+                "lifecycle": "unknown",
                 "message": "No allocation authority events received yet",
+                "stage": None,
+                "max_gross_allocation": None,
+                "expires_at": None,
+                "event": None,
                 "authorities": [],
             }
-        active = [
-            row for row in authorities
-            if str(row.get("event", "")).upper() in {"ISSUED", "ACTIVATED", "OVERRIDE"}
-        ]
-        if not active:
-            return {
-                "status": "inactive",
-                "message": "Allocation authorities present but none currently active",
-                "authorities": authorities,
-            }
-        latest = max(active, key=lambda r: int(r.get("entity_revision", 0)))
+        ranked = sorted(authorities, key=lambda r: int(r.get("entity_revision", 0)))
+        latest = ranked[-1]
+        event = str(latest.get("event", "")).upper()
+        gross = latest.get("max_gross_allocation")
+        try:
+            gross_f = float(gross) if gross is not None else None
+        except (TypeError, ValueError):
+            gross_f = None
+
+        if event in {"REVOKED", "SUPERSEDED", "DEACTIVATED"}:
+            lifecycle = "suspended" if event == "DEACTIVATED" else "inactive"
+            status = "inactive"
+            message = f"Latest allocation authority event is {event}"
+        elif event == "OVERRIDE" and (gross_f is None or gross_f <= 0):
+            lifecycle = "suspended"
+            status = "suspended"
+            message = "Allocation suspended by restrictive override"
+        elif event == "ISSUED":
+            lifecycle = "authorized"
+            status = "authorized"
+            message = "Allocation authority signed but not yet activated"
+        elif event in {"ACTIVATED", "OVERRIDE"}:
+            lifecycle = "active"
+            status = "active"
+            message = "Allocation authority is active"
+        else:
+            lifecycle = "unknown"
+            status = "unknown"
+            message = f"Unrecognized allocation event {event or 'missing'}"
+
         return {
-            "status": "active",
+            "status": status,
+            "lifecycle": lifecycle,
+            "message": message,
             "stage": latest.get("stage"),
-            "max_gross_allocation": latest.get("max_gross_allocation"),
+            "max_gross_allocation": gross_f,
             "expires_at": latest.get("expires_at"),
-            "event": latest.get("event"),
+            "event": event or None,
+            "strategy_id": latest.get("entity_id") or latest.get("strategy_id"),
             "authorities": authorities,
         }
+
+    @staticmethod
+    def _redact_allocation_authority(row: dict) -> dict:
+        """Drop signature / key material from ordinary dashboard responses."""
+        blocked = {
+            "signature", "public_key", "private_key", "attestation", "payload",
+            "payload_bytes", "unsigned_payload",
+        }
+        return {k: v for k, v in row.items() if k not in blocked and not str(k).endswith("_pem")}
 
     def ring_depth(self) -> int:
         """Current replay-ring size (bounded by `REPLAY_RING_MAX_EVENTS` /

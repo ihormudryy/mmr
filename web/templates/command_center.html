@@ -134,6 +134,22 @@
       border-color:var(--accent); color:var(--accent); font-weight:600; }
     .dash-admin-pane .param-hint { color:var(--dim); font-size:11px; }
     .dash-admin-pane td.sym { font-weight:600; }
+    #dash-scaling .scaling-status {
+      display:inline-block; padding:2px 8px; border-radius:4px;
+      border:1px solid var(--border); font-size:12px; font-weight:600;
+    }
+    #dash-scaling .scaling-status[data-lifecycle="active"] { color:var(--pos, #3fb950); border-color:currentColor; }
+    #dash-scaling .scaling-status[data-lifecycle="authorized"] { color:var(--accent); border-color:currentColor; }
+    #dash-scaling .scaling-status[data-lifecycle="suspended"] { color:var(--neg, #f85149); border-color:currentColor; }
+    #dash-scaling .scaling-status[data-lifecycle="inactive"],
+    #dash-scaling .scaling-status[data-lifecycle="unknown"] { color:var(--dim); }
+    #dash-scaling .scaling-cards { display:grid; gap:12px;
+      grid-template-columns:repeat(auto-fit, minmax(160px, 1fr)); margin:12px 0; }
+    #dash-scaling .scaling-card { background:var(--panel); border:1px solid var(--border);
+      border-radius:8px; padding:12px; }
+    #dash-scaling .scaling-card .label { color:var(--dim); font-size:11px; text-transform:uppercase; }
+    #dash-scaling .scaling-card .value { font-size:18px; font-weight:600; margin-top:4px; }
+    #dash-scaling .scaling-note { color:var(--dim); font-size:12.5px; margin:8px 0 16px; }
   </style>
 </head>
 <body data-degraded-after-ms="{{ degraded_after_ms }}"
@@ -153,6 +169,7 @@
   {% if flash %}<div class="flash{% if flash_err %} err{% endif %}">{{ flash }}</div>{% endif %}
   <nav class="dash-tabs" aria-label="Dashboard sections">
     <button type="button" class="dash-tab active" data-dash-tab="trading">Trading</button>
+    <button type="button" class="dash-tab" data-dash-tab="scaling">Scaling</button>
     <button type="button" class="dash-tab" data-dash-tab="deploy">Deploy
       <span class="chip on">{{ deployed_count|default(0) }}</span></button>
     <button type="button" class="dash-tab" data-dash-tab="watchlists">Watchlists
@@ -197,6 +214,40 @@
           for an authoritative risk projection.</div></section>
     </div>
   </main>
+  </div>
+  <div id="dash-scaling" class="dash-pane" aria-label="Scaling and allocation">
+    <main class="grid" style="grid-template-columns:1fr">
+      <section id="scaling-panel">
+        <h2>Allocation &amp; scaling
+          <span id="scaling-lifecycle" class="scaling-status" data-lifecycle="unknown">unknown</span>
+        </h2>
+        <p id="scaling-message" class="scaling-note">Waiting for authoritative allocation events…</p>
+        <p class="scaling-note">Read-only. Activation uses offline
+          <code>mmr research allocation sign</code> then
+          <code>mmr activate-allocation</code> — this UI never calculates or
+          overrides ceilings.</p>
+        <div class="scaling-cards" aria-label="Current allocation summary">
+          <div class="scaling-card"><div class="label">Stage</div>
+            <div id="scaling-stage" class="value">—</div></div>
+          <div class="scaling-card"><div class="label">Signed ceiling</div>
+            <div id="scaling-ceiling" class="value">—</div></div>
+          <div class="scaling-card"><div class="label">Event</div>
+            <div id="scaling-event" class="value">—</div></div>
+          <div class="scaling-card"><div class="label">Expires</div>
+            <div id="scaling-expires" class="value">—</div></div>
+        </div>
+        <h3>Authority history</h3>
+        <table>
+          <thead><tr>
+            <th>Strategy</th><th>Stage</th><th>Ceiling</th><th>Event</th>
+            <th>Expires</th><th>Revision</th>
+          </tr></thead>
+          <tbody id="scaling-authorities-body">
+            <tr><td colspan="6" class="dim">No allocation authority rows yet</td></tr>
+          </tbody>
+        </table>
+      </section>
+    </main>
   </div>
   <div id="dash-deploy" class="dash-pane dash-admin-pane">
     {% include "_deploy_tab.html" %}

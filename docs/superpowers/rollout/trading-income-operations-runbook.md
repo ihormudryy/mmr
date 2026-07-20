@@ -190,6 +190,15 @@ docker compose config --quiet                                     # compose vali
 Automation stays prohibited until all drills are green and the manual IB-paper
 soak is signed off.
 
+## P4 paper / canary soak (operational)
+
+Software cannot pass these gates. Use the sanitized templates and fill only digests:
+
+- Paper: [`trading-income-paper-log.md`](trading-income-paper-log.md) — ≥30 calendar days, 20 sessions, 50 RT, 5 instruments
+- Canary: [`trading-income-canary-log.md`](trading-income-canary-log.md) — ≥30 live sessions, 75 RT, 5 instruments, zero capital-safety incidents
+
+Daily: run `scripts/session_open_check.py` / `scripts/session_close_check.py`, seal replay, and never edit counters manually after a failed gate.
+
 ## P5 scaling rollback
 
 - **Immediate scale-down:** run `scripts/scaling_fault_drill.py --json` offline to

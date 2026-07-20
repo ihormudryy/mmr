@@ -85,13 +85,13 @@
 
 **Interfaces:** `SessionRiskController.evaluate(intent, artifact, approval_context, session_state, allocation) -> AutomatedRiskDecision`.
 
-- [ ] Add rule tests: permitted strategy/conid, long-only, at most 3 positions, 5% position, 6% initial gross, 0.20% equity risk, 0.50% daily loss, 3% drawdown, stop validity, and most-restrictive-wins.
-- [ ] Add liquidity tests: price >=5, 20-day median dollar volume >=50m, spread <=15bps, quantity <=0.25% ADV, permitted live feed, halt/requalification, depth/slicing policy.
-- [ ] Add XNYS tests across DST, holidays, early closes, opening stabilization, 15:30/15:35/15:45/15:55 relative offsets, and calendar package version recording.
-- [ ] Add monotonic property tests: lowering allocation/equity/ADV/depth or raising risk/spread/order size cannot convert rejection to approval unless the changed dimension is irrelevant.
-- [ ] Use only trader-owned policy/config and signed artifact ceilings. Ignore/reject request fields that would weaken hard limits.
-- [ ] Feed P1 breaker signals for repeated quote failures, account mismatch, loss, and halt.
-- [ ] Run focused tests and commit `feat(automation): enforce session and liquidity risk`.
+- [x] Add rule tests: permitted strategy/conid, long-only, at most 3 positions, 5% position, 6% initial gross, 0.20% equity risk, 0.50% daily loss, 3% drawdown, stop validity, and most-restrictive-wins.
+- [x] Add liquidity tests: price >=5, 20-day median dollar volume >=50m, spread <=15bps, quantity <=0.25% ADV, permitted live feed, halt/requalification, depth/slicing policy.
+- [x] Add XNYS tests across DST, holidays, early closes, opening stabilization, 15:30/15:35/15:45/15:55 relative offsets, and calendar package version recording.
+- [x] Add monotonic property tests: lowering allocation/equity/ADV/depth or raising risk/spread/order size cannot convert rejection to approval unless the changed dimension is irrelevant.
+- [x] Use only trader-owned policy/config and signed artifact ceilings. Ignore/reject request fields that would weaken hard limits.
+- [x] Feed P1 breaker signals for repeated quote failures, account mismatch, loss, and halt.
+- [x] Run focused tests and commit `feat(automation): enforce session and liquidity risk`.
 
 ### Task 5: Build the protective entry saga
 

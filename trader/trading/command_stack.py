@@ -132,6 +132,7 @@ class CommandStack:
     circuit_breaker: CircuitBreaker
     semantic_readiness: SemanticReadiness
     liquidation_service: LiquidationService
+    session_risk: Any = None  # SessionRiskController when automation stack is active
 
 
 _REQUIRED_TRADER_PORTS = (
@@ -397,6 +398,15 @@ def build_command_stack(
         coordinator=coordinator,
         now=now,
     )
+    # P3 Task 4 — trader-owned session/liquidity risk (evaluate-only; saga uses it in Task 5).
+    from trader.automation.calendar_policy import XNYSCalendarPolicy
+    from trader.automation.session_risk import SessionRiskController
+
+    session_risk = SessionRiskController(
+        calendar=XNYSCalendarPolicy(),
+        breaker=circuit_breaker,
+        now=now,
+    )
     stack = CommandStack(
         journal=journal,
         repository=repository,
@@ -414,6 +424,7 @@ def build_command_stack(
         circuit_breaker=circuit_breaker,
         semantic_readiness=semantic_readiness,
         liquidation_service=liquidation_service,
+        session_risk=session_risk,
     )
     trader.command_ledger = ledger
     trader.command_reconciler = reconciler
@@ -422,4 +433,5 @@ def build_command_stack(
     trader.automation_circuit_breaker = circuit_breaker
     trader.semantic_readiness = semantic_readiness
     trader.liquidation_service = liquidation_service
+    trader.session_risk = session_risk
     return stack

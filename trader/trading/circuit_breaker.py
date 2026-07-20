@@ -25,6 +25,10 @@ _IMMEDIATE = {
     "PROTECTIVE_ORDER_FAILURE",
     "RECONCILIATION_DIVERGENCE",
     "LIQUIDATION_FAILED",
+    # P3 session-risk immediate pauses (foundation design §6.2 / §6.5)
+    "ACCOUNT_MISMATCH",
+    "INSTRUMENT_HALT",
+    "DRAWDOWN_BREACH",
 }
 _ROLLING = {
     "QUOTE_FAILURE": (3, dt.timedelta(minutes=5)),

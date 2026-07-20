@@ -168,6 +168,76 @@ def _no_arg_handler(fn):
     return _handler
 
 
+def _finite_or_none(value: Any) -> Optional[float]:
+    """JSON-safe float: NaN/Inf → None (typed RPC uses ``allow_nan=False``)."""
+    try:
+        number = float(value)
+    except (TypeError, ValueError):
+        return None
+    if number != number or number in (float('inf'), float('-inf')):
+        return None
+    return number
+
+
+def _portfolio_summary_to_wire(summary: Any) -> Dict[str, Any]:
+    """Project a ``PortfolioSummary`` (or duck-typed equivalent) to JSON-safe fields."""
+    if isinstance(summary, (list, tuple)) and not hasattr(summary, 'account'):
+        contract, position, mkt_price, mkt_value, avg_cost, unrealized, realized, account, daily = summary
+    else:
+        contract = summary.contract
+        position = summary.position
+        mkt_price = summary.marketPrice
+        mkt_value = summary.marketValue
+        avg_cost = summary.averageCost
+        unrealized = summary.unrealizedPNL
+        realized = summary.realizedPNL
+        account = summary.account
+        daily = summary.dailyPNL
+    if isinstance(contract, dict):
+        con_id = int(contract.get('conId') or 0)
+        symbol = str(contract.get('localSymbol') or contract.get('symbol') or '')
+        sec_type = str(contract.get('secType') or 'STK')
+        currency = str(contract.get('currency') or '')
+        exchange = str(contract.get('exchange') or '')
+        primary = str(contract.get('primaryExchange') or '')
+    else:
+        con_id = int(getattr(contract, 'conId', 0) or 0)
+        symbol = str(getattr(contract, 'localSymbol', None) or getattr(contract, 'symbol', '') or '')
+        sec_type = str(getattr(contract, 'secType', 'STK') or 'STK')
+        currency = str(getattr(contract, 'currency', '') or '')
+        exchange = str(getattr(contract, 'exchange', '') or '')
+        primary = str(getattr(contract, 'primaryExchange', '') or '')
+    return {
+        'account': str(account or ''),
+        'instrument_id': con_id,
+        'symbol': symbol,
+        'security_type': sec_type,
+        'currency': currency,
+        'exchange': exchange,
+        'primary_exchange': primary,
+        'position': float(position or 0.0),
+        'market_price': _finite_or_none(mkt_price) or 0.0,
+        'market_value': _finite_or_none(mkt_value) or 0.0,
+        'average_cost': _finite_or_none(avg_cost) or 0.0,
+        'unrealized_pnl': _finite_or_none(unrealized),
+        'realized_pnl': _finite_or_none(realized),
+        'daily_pnl': _finite_or_none(daily),
+    }
+
+
+def _portfolio_summary_handler(api: TraderServiceApi):
+    """Typed replacement for legacy ``get_portfolio_summary`` (port 42001).
+
+    Uses the trader's sync body directly so the typed server's default
+    ``execution='thread'`` path does not nest another event loop.
+    """
+    def _handler(_body: Dict[str, Any]) -> Dict[str, Any]:
+        sync = getattr(api.trader, '_get_portfolio_summary_sync', None)
+        summaries = sync() if sync is not None else []
+        return {'positions': [_portfolio_summary_to_wire(s) for s in summaries]}
+    return _handler
+
+
 def _instrument_to_wire(definition: Any) -> Dict[str, Any]:
     """Project a resolved ``SecurityDefinition`` down to the JSON-safe fields
     the strategy runtime needs: the six that build an IB ``Contract`` plus the
@@ -2029,6 +2099,11 @@ def build_production_registry(
     # Read: account balances (cash, net liquidation, buying power, etc.),
     # scoped to the configured account — see TraderServiceApi.get_account_values.
     registry.register('query', 'get_account_values', dict, dict, _no_arg_handler(api.get_account_values))
+    # Read: portfolio rows with P&L — typed replacement for legacy dill
+    # ``get_portfolio_summary`` (port 42001 is unbound in split containers).
+    registry.register(
+        'query', 'get_portfolio_summary', dict, dict, _portfolio_summary_handler(api),
+    )
     # Read: current risk-gate limits. Note this is the READ half only —
     # there is deliberately no typed `set_risk_limits` query or command here;
     # mutating limits stays behind the offline-simulation legacy path until
@@ -2053,6 +2128,8 @@ def build_production_registry(
         PublishInstrumentResponse, _publish_instrument_handler(api),
     )
     register_manage_surface(registry, api)
+    from trader.messaging.cli_surface import register_cli_surface
+    register_cli_surface(registry, api)
 
     if command_stack is not None:
         register_command_authority(

@@ -215,6 +215,11 @@ services:
       # as the typed server. Absolute path avoids '~' expansion surprises
       # when trader.yaml still has the portable spelling.
       MMR_SERVICE_HMAC_KEY_FILE: /home/trader/.config/mmr/service_hmac.key
+      # Strategy typed sockets live on the strategy container — needed when
+      # `mmr strategies` runs inside trader (list/enable/disable/reload).
+      STRATEGY_TYPED_ADDRESS: tcp://strategy
+      MMR_TYPED_STRATEGY_QUERY_ENDPOINT: tcp://strategy:42105
+      MMR_TYPED_STRATEGY_COMMAND_ENDPOINT: tcp://strategy:42104
       # Outbound: trader opens an RPCClient to strategy_service's own RPC
       # server (trading_runtime.py's self.zmq_strategy_client) -- must
       # target the strategy container by name, not 0.0.0.0.
@@ -293,6 +298,9 @@ services:
       # Without this the runtime falls back to TYPED_BIND_ADDRESS
       # (tcp://0.0.0.0 here -- its OWN bind), i.e. the wrong host.
       TRADER_TYPED_ADDRESS: tcp://trader
+      # Same HMAC key the dashboard / trader CLI use when calling strategy
+      # typed sockets (list/enable/disable/reload).
+      MMR_SERVICE_HMAC_KEY_FILE: /home/trader/.config/mmr/service_hmac.key
     volumes:
       - ${HOME}/.config/mmr:/home/trader/.config/mmr
       - mmr_db_data:/home/trader/.local/share/mmr/data

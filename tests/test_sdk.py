@@ -50,12 +50,18 @@ def _make_mmr_with_mock(mock_client) -> MMR:
     mmr._contract_map = {}
     mmr._container = MagicMock()
     mmr._container.config_file = '/tmp/test_trader.yaml'
-    # [M1-F3] Task 8: no typed query/command client wired by default -- only
-    # propose/proposals/reject/approve touch these (via `_typed_query`/
-    # `_typed_command`), and tests exercising those explicitly assign a
-    # `FakeTypedClient` (see the `typed`/`mmr` fixtures below).
+    # Typed clients are wired by tests that need them (FakeTypedClient).
     mmr._typed_query_client = None
     mmr._typed_command_client = None
+    mmr._strategy_typed_query_client = None
+    mmr._strategy_typed_command_client = None
+    mmr._typed_address = 'tcp://127.0.0.1'
+    mmr._typed_query_port = 42101
+    mmr._typed_command_port = 42102
+    mmr._strategy_typed_address = 'tcp://127.0.0.1'
+    mmr._strategy_typed_query_port = 42105
+    mmr._strategy_typed_command_port = 42104
+    mmr._service_hmac_key_file = None
     return mmr
 
 
@@ -393,7 +399,7 @@ class TestMMRConnect:
 
 class TestPortfolio:
     def test_portfolio_returns_dataframe(self):
-        mock_client = _make_mock_rpc()
+        typed = FakeTypedClient()
         contract = FakeContract(conId=4391, symbol='AMD', localSymbol='AMD')
         summary = FakePortfolioSummary(
             contract=contract,
@@ -406,9 +412,11 @@ class TestPortfolio:
             account='DU123',
             dailyPNL=50.0,
         )
-        mock_client.rpc.return_value.get_portfolio_summary.return_value = [summary]
-
-        mmr = _make_mmr_with_mock(mock_client)
+        from trader.messaging.production_api import _portfolio_summary_to_wire
+        typed.queue_query('get_portfolio_summary', {
+            'positions': [_portfolio_summary_to_wire(summary)],
+        })
+        mmr = _mmr_with_typed(typed)
         df = mmr.portfolio()
 
         assert isinstance(df, pd.DataFrame)
@@ -419,7 +427,7 @@ class TestPortfolio:
         assert df.iloc[0]['unrealizedPNL'] == 1000.0
 
     def test_portfolio_updates_position_map(self):
-        mock_client = _make_mock_rpc()
+        typed = FakeTypedClient()
         contracts = [
             FakeContract(conId=4391, symbol='AMD', localSymbol='AMD'),
             FakeContract(conId=265598, symbol='AAPL', localSymbol='AAPL'),
@@ -428,21 +436,21 @@ class TestPortfolio:
             FakePortfolioSummary(contracts[0], 100, 150.0, 15000.0, 140.0, 1000.0, 0.0, 'DU123', 50.0),
             FakePortfolioSummary(contracts[1], 50, 180.0, 9000.0, 170.0, 500.0, 0.0, 'DU123', -10.0),
         ]
-        mock_client.rpc.return_value.get_portfolio_summary.return_value = summaries
-
-        mmr = _make_mmr_with_mock(mock_client)
+        from trader.messaging.production_api import _portfolio_summary_to_wire
+        typed.queue_query('get_portfolio_summary', {
+            'positions': [_portfolio_summary_to_wire(s) for s in summaries],
+        })
+        mmr = _mmr_with_typed(typed)
         mmr.portfolio()
 
         assert len(mmr._position_map) == 2
-        # The map should contain the symbols (sorted by dailyPNL desc)
         assert 'AMD' in mmr._position_map.values()
         assert 'AAPL' in mmr._position_map.values()
 
     def test_portfolio_empty(self):
-        mock_client = _make_mock_rpc()
-        mock_client.rpc.return_value.get_portfolio_summary.return_value = []
-
-        mmr = _make_mmr_with_mock(mock_client)
+        typed = FakeTypedClient()
+        typed.queue_query('get_portfolio_summary', {'positions': []})
+        mmr = _mmr_with_typed(typed)
         df = mmr.portfolio()
 
         assert isinstance(df, pd.DataFrame)
@@ -451,12 +459,21 @@ class TestPortfolio:
 
 class TestPositions:
     def test_positions_returns_dataframe(self):
-        mock_client = _make_mock_rpc()
-        contract = FakeContract(conId=4391, symbol='AMD', localSymbol='AMD')
-        position = FakePosition(account='DU123', contract=contract, position=100, avgCost=140.0)
-        mock_client.rpc.return_value.get_positions.return_value = [position]
-
-        mmr = _make_mmr_with_mock(mock_client)
+        typed = FakeTypedClient()
+        typed.queue_query('get_positions', {
+            'positions': [{
+                'account': 'DU123',
+                'instrument_id': 4391,
+                'symbol': 'AMD',
+                'security_type': 'STK',
+                'exchange': 'SMART',
+                'primary_exchange': 'NASDAQ',
+                'currency': 'USD',
+                'position': 100.0,
+                'average_cost': 140.0,
+            }],
+        })
+        mmr = _mmr_with_typed(typed)
         df = mmr.positions()
 
         assert isinstance(df, pd.DataFrame)
@@ -467,14 +484,25 @@ class TestPositions:
 
 class TestOrders:
     def test_orders_returns_dataframe(self):
-        mock_client = _make_mock_rpc()
-        contract = FakeContract(conId=4391, symbol='AMD')
-        order = FakeOrder(orderId=42, action='BUY', orderType='LMT', lmtPrice=145.0, totalQuantity=50)
-        status = FakeOrderStatus(status='Submitted', filled=0, remaining=50)
-        trade = FakeTrade(contract=contract, order=order, orderStatus=status)
-        mock_client.rpc.return_value.get_trades.return_value = {42: [trade]}
-
-        mmr = _make_mmr_with_mock(mock_client)
+        typed = FakeTypedClient()
+        typed.queue_query('get_open_orders', {
+            'orders': [{
+                'order_id': 42,
+                'instrument_id': 4391,
+                'symbol': 'AMD',
+                'action': 'BUY',
+                'order_type': 'LMT',
+                'quantity': 50.0,
+                'limit_price': 145.0,
+                'aux_price': None,
+                'status': 'Submitted',
+                'filled': 0.0,
+                'remaining': 50.0,
+                'avg_fill_price': None,
+                'tif': 'DAY',
+            }],
+        })
+        mmr = _mmr_with_typed(typed)
         df = mmr.orders()
 
         assert isinstance(df, pd.DataFrame)
@@ -485,82 +513,69 @@ class TestOrders:
         assert df.iloc[0]['status'] == 'Submitted'
         assert df.iloc[0]['lmtPrice'] == 145.0
         assert df.iloc[0]['quantity'] == 50
-        # Market data columns should be present
         assert 'bid' in df.columns
         assert 'ask' in df.columns
         assert 'last' in df.columns
 
     def test_orders_empty(self):
-        mock_client = _make_mock_rpc()
-        mock_client.rpc.return_value.get_trades.return_value = {}
-
-        mmr = _make_mmr_with_mock(mock_client)
+        typed = FakeTypedClient()
+        typed.queue_query('get_open_orders', {'orders': []})
+        mmr = _mmr_with_typed(typed)
         df = mmr.orders()
-
         assert isinstance(df, pd.DataFrame)
         assert df.empty
 
-
     def test_orders_filters_cancelled(self):
-        """After cancel-all, cancelled orders should not appear."""
-        mock_client = _make_mock_rpc()
-        contract = FakeContract(conId=4391, symbol='AMD')
-
-        active_order = FakeOrder(orderId=10, action='BUY', orderType='LMT',
-                                  lmtPrice=145.0, totalQuantity=50)
-        active_trade = FakeTrade(contract=contract, order=active_order,
-                                  orderStatus=FakeOrderStatus(status='Submitted', remaining=50))
-
-        cancelled_order = FakeOrder(orderId=11, action='BUY', orderType='LMT',
-                                     lmtPrice=140.0, totalQuantity=100)
-        cancelled_trade = FakeTrade(contract=contract, order=cancelled_order,
-                                     orderStatus=FakeOrderStatus(status='Cancelled'))
-
-        filled_order = FakeOrder(orderId=12, action='SELL', orderType='MKT',
-                                  totalQuantity=25)
-        filled_trade = FakeTrade(contract=contract, order=filled_order,
-                                  orderStatus=FakeOrderStatus(status='Filled', filled=25))
-
-        mock_client.rpc.return_value.get_trades.return_value = {
-            10: [active_trade],
-            11: [cancelled_trade],
-            12: [filled_trade],
-        }
-
-        mmr = _make_mmr_with_mock(mock_client)
+        """Server-side get_open_orders already drops terminal statuses."""
+        typed = FakeTypedClient()
+        typed.queue_query('get_open_orders', {
+            'orders': [{
+                'order_id': 10,
+                'instrument_id': 4391,
+                'symbol': 'AMD',
+                'action': 'BUY',
+                'order_type': 'LMT',
+                'quantity': 50.0,
+                'limit_price': 145.0,
+                'status': 'Submitted',
+                'filled': 0.0,
+                'remaining': 50.0,
+                'tif': 'DAY',
+            }],
+        })
+        mmr = _mmr_with_typed(typed)
         df = mmr.orders()
-
         assert len(df) == 1
         assert df.iloc[0]['orderId'] == 10
         assert df.iloc[0]['status'] == 'Submitted'
 
     def test_orders_all_cancelled_returns_empty(self):
-        """If every order is cancelled, orders() returns empty DataFrame."""
-        mock_client = _make_mock_rpc()
-        contract = FakeContract(conId=4391, symbol='AMD')
-        order = FakeOrder(orderId=20, action='BUY', orderType='MKT', totalQuantity=10)
-        trade = FakeTrade(contract=contract, order=order,
-                          orderStatus=FakeOrderStatus(status='Cancelled'))
-
-        mock_client.rpc.return_value.get_trades.return_value = {20: [trade]}
-
-        mmr = _make_mmr_with_mock(mock_client)
+        """If every order is cancelled, get_open_orders returns empty."""
+        typed = FakeTypedClient()
+        typed.queue_query('get_open_orders', {'orders': []})
+        mmr = _mmr_with_typed(typed)
         df = mmr.orders()
-
         assert isinstance(df, pd.DataFrame)
         assert df.empty
 
 
 class TestTrades:
     def test_trades_returns_dataframe(self):
-        mock_client = _make_mock_rpc()
-        contract = FakeContract(conId=4391, symbol='AMD')
-        order = FakeOrder(orderId=1, action='BUY')
-        status = FakeOrderStatus(status='Submitted', filled=0)
-        trade = FakeTrade(contract=contract, order=order, orderStatus=status)
-        mock_client.rpc.return_value.get_trades.return_value = {1: [trade]}
-
-        mmr = _make_mmr_with_mock(mock_client)
+        typed = FakeTypedClient()
+        typed.queue_query('get_trades', {
+            'trades': [{
+                'instrument_id': 4391,
+                'symbol': 'AMD',
+                'order_id': 1,
+                'action': 'BUY',
+                'status': 'Submitted',
+                'filled': 0.0,
+                'order_type': 'LMT',
+                'limit_price': 100.0,
+                'quantity': 10.0,
+            }],
+        })
+        mmr = _mmr_with_typed(typed)
         df = mmr.trades()
 
         assert isinstance(df, pd.DataFrame)
@@ -608,6 +623,16 @@ class TestTrading:
         result = mmr.sell('AMD', market=True, quantity=10)
 
         assert result.is_success()
+
+    def test_buy_without_legacy_explains_topology(self):
+        typed = FakeTypedClient()
+        typed.queue_query('discover_instrument', {
+            'instruments': [_wire_instrument(FakeSecurityDefinition())],
+        })
+        mmr = _mmr_with_typed(typed)
+        mmr._client = None  # no legacy RPC
+        with pytest.raises(ConnectionError, match='offline-simulation legacy RPC'):
+            mmr.buy('AMD', market=True, quantity=10)
 
 
 class TestCancel:
@@ -710,16 +735,29 @@ class TestToMarket:
 
 class TestSnapshot:
     def test_snapshot_returns_dict(self):
-        mock_client = _make_mock_rpc()
         typed = FakeTypedClient()
         typed.queue_query('discover_instrument', {
             'instruments': [_wire_instrument(FakeSecurityDefinition())],
         })
-
-        ticker = FakeTicker()
-        mock_client.rpc.return_value.get_snapshot.return_value = ticker
-
-        mmr = _mmr_with_typed(typed, mock_client)
+        typed.queue_query('get_snapshot', {
+            'snapshot': {
+                'instrument_id': 4391,
+                'symbol': 'AMD',
+                'bid': 150.0,
+                'ask': 150.5,
+                'last': 150.25,
+                'bid_size': 100,
+                'ask_size': 200,
+                'last_size': 10,
+                'open': 149.0,
+                'high': 151.0,
+                'low': 148.0,
+                'close': 150.0,
+                'halted': 0,
+                'time': None,
+            },
+        })
+        mmr = _mmr_with_typed(typed)
         result = mmr.snapshot('AMD')
 
         assert isinstance(result, dict)
@@ -1054,22 +1092,22 @@ class TestResolveContractExchangeCurrency:
 
 class TestStrategies:
     def test_strategies_returns_dataframe(self):
-        mock_client = _make_mock_rpc()
-
-        class FakeStrategyConfig:
-            def __init__(self):
-                self.name = 'smi_crossover'
-                self.state = 'RUNNING'
-                self.paper_only = False
-                self.bar_size = '1 min'
-                self.conids = [4391]
-                self.historical_days_prior = 5
-
-        mock_client.rpc.return_value.get_strategies.return_value = SuccessFail.success(
-            obj=[FakeStrategyConfig()]
-        )
-
-        mmr = _make_mmr_with_mock(mock_client)
+        typed = FakeTypedClient()
+        typed.queue_query('list_strategies', {
+            'strategies': [{
+                'name': 'smi_crossover',
+                'state': 'RUNNING',
+                'bar_size': '1 min',
+                'conids': [4391],
+                'historical_days_prior': 5,
+                'auto_execute': False,
+                'class_name': 'SMICrossOver',
+                'description': '',
+            }],
+        })
+        mmr = _make_mmr_with_mock(_make_mock_rpc())
+        mmr._strategy_typed_query_client = typed
+        mmr._strategy_typed_command_client = typed
         df = mmr.strategies()
 
         assert isinstance(df, pd.DataFrame)
@@ -1077,10 +1115,11 @@ class TestStrategies:
         assert df.iloc[0]['name'] == 'smi_crossover'
 
     def test_strategies_empty_on_failure(self):
-        mock_client = _make_mock_rpc()
-        mock_client.rpc.return_value.get_strategies.return_value = SuccessFail.fail()
-
-        mmr = _make_mmr_with_mock(mock_client)
+        typed = FakeTypedClient()
+        typed.queue_query('list_strategies', {'strategies': []})
+        mmr = _make_mmr_with_mock(_make_mock_rpc())
+        mmr._strategy_typed_query_client = typed
+        mmr._strategy_typed_command_client = typed
         df = mmr.strategies()
 
         assert isinstance(df, pd.DataFrame)
@@ -1089,21 +1128,22 @@ class TestStrategies:
 
 class TestClosePosition:
     def test_close_position_no_positions(self):
-        mock_client = _make_mock_rpc()
-        mock_client.rpc.return_value.get_portfolio_summary.return_value = []
-
-        mmr = _make_mmr_with_mock(mock_client)
+        typed = FakeTypedClient()
+        typed.queue_query('get_portfolio_summary', {'positions': []})
+        mmr = _mmr_with_typed(typed)
         result = mmr.close_position('AMD')
 
         assert not result.is_success()
 
     def test_close_position_symbol_not_found(self):
-        mock_client = _make_mock_rpc()
+        typed = FakeTypedClient()
         contract = FakeContract(conId=4391, symbol='AMD', localSymbol='AMD')
         summary = FakePortfolioSummary(contract, 100, 150.0, 15000.0, 140.0, 1000.0, 0.0, 'DU123', 50.0)
-        mock_client.rpc.return_value.get_portfolio_summary.return_value = [summary]
-
-        mmr = _make_mmr_with_mock(mock_client)
+        from trader.messaging.production_api import _portfolio_summary_to_wire
+        typed.queue_query('get_portfolio_summary', {
+            'positions': [_portfolio_summary_to_wire(summary)],
+        })
+        mmr = _mmr_with_typed(typed)
         result = mmr.close_position('ZZZZZ')
 
         assert not result.is_success()
@@ -1152,10 +1192,9 @@ class TestProtectiveOrder:
 
 class TestAccount:
     def test_account_returns_string(self):
-        mock_client = _make_mock_rpc()
-        mock_client.rpc.return_value.get_ib_account.return_value = 'DU123456'
-
-        mmr = _make_mmr_with_mock(mock_client)
+        typed = FakeTypedClient()
+        typed.queue_query('get_ib_account', {'account_id': 'DU123456'})
+        mmr = _mmr_with_typed(typed)
         result = mmr.account()
 
         assert result == 'DU123456'
@@ -1207,12 +1246,10 @@ class TestGetPortfolioStateErrorSurfacing:
     (via session_summary) surfaced as warnings."""
 
     def test_account_values_failure_recorded(self):
-        mock_client = _make_mock_rpc()
-        mock_client.rpc.return_value.get_account_values.side_effect = TimeoutError('deadline')
-        # portfolio() must still succeed so we isolate the account_values path
-        mock_client.rpc.return_value.get_portfolio_summary.return_value = []
-
-        mmr = _make_mmr_with_mock(mock_client)
+        typed = FakeTypedClient()
+        typed.fail_next_query('get_account_values', TimeoutError('deadline'))
+        typed.queue_query('get_portfolio_summary', {'positions': []})
+        mmr = _mmr_with_typed(typed)
         _stub_proposal_store(mmr)
 
         state = mmr._get_portfolio_state()
@@ -1223,35 +1260,29 @@ class TestGetPortfolioStateErrorSurfacing:
         )
 
     def test_portfolio_failure_recorded(self):
-        mock_client = _make_mock_rpc()
-        mock_client.rpc.return_value.get_account_values.return_value = {
+        typed = FakeTypedClient()
+        typed.queue_query('get_account_values', {
             'NetLiquidation': {'value': 97248.18},
             'GrossPositionValue': {'value': 22382.0},
             'AvailableFunds': {'value': 50000.0},
-        }
-        mock_client.rpc.return_value.get_portfolio_summary.side_effect = ConnectionError('lost')
-
-        mmr = _make_mmr_with_mock(mock_client)
+        })
+        typed.fail_next_query('get_portfolio_summary', ConnectionError('lost'))
+        mmr = _mmr_with_typed(typed)
         _stub_proposal_store(mmr)
 
         state = mmr._get_portfolio_state()
 
-        # account_values succeeded so net_liq is correct
         assert state.net_liquidation == 97248.18
-        # position_count stays at 0 but the failure is *flagged*
         assert state.position_count == 0
         assert any('portfolio' in e and 'ConnectionError' in e for e in state.rpc_errors), (
             f'expected portfolio error in rpc_errors, got {state.rpc_errors!r}'
         )
 
     def test_both_failures_recorded_simultaneously(self):
-        # This is the exact scenario observed in the LLMVM trajectory:
-        # portfolio_risk worked, then session_status returned all zeros.
-        mock_client = _make_mock_rpc()
-        mock_client.rpc.return_value.get_account_values.side_effect = TimeoutError('a')
-        mock_client.rpc.return_value.get_portfolio_summary.side_effect = TimeoutError('b')
-
-        mmr = _make_mmr_with_mock(mock_client)
+        typed = FakeTypedClient()
+        typed.fail_next_query('get_account_values', TimeoutError('a'))
+        typed.fail_next_query('get_portfolio_summary', TimeoutError('b'))
+        mmr = _mmr_with_typed(typed)
         _stub_proposal_store(mmr)
 
         state = mmr._get_portfolio_state()
@@ -1262,15 +1293,14 @@ class TestGetPortfolioStateErrorSurfacing:
         assert any('portfolio' in e for e in state.rpc_errors)
 
     def test_clean_success_leaves_rpc_errors_empty(self):
-        mock_client = _make_mock_rpc()
-        mock_client.rpc.return_value.get_account_values.return_value = {
+        typed = FakeTypedClient()
+        typed.queue_query('get_account_values', {
             'NetLiquidation': {'value': 50000.0},
             'GrossPositionValue': {'value': 0.0},
             'AvailableFunds': {'value': 50000.0},
-        }
-        mock_client.rpc.return_value.get_portfolio_summary.return_value = []
-
-        mmr = _make_mmr_with_mock(mock_client)
+        })
+        typed.queue_query('get_portfolio_summary', {'positions': []})
+        mmr = _mmr_with_typed(typed)
         _stub_proposal_store(mmr)
 
         state = mmr._get_portfolio_state()
@@ -1281,13 +1311,10 @@ class TestGetPortfolioStateErrorSurfacing:
 
 class TestSessionStatusSurfacesErrors:
     def test_session_status_flags_rpc_failure(self):
-        # session_status should loudly signal when its data is incomplete —
-        # otherwise an LLM can't tell "account empty" from "RPC failed".
-        mock_client = _make_mock_rpc()
-        mock_client.rpc.return_value.get_account_values.side_effect = TimeoutError('x')
-        mock_client.rpc.return_value.get_portfolio_summary.return_value = []
-
-        mmr = _make_mmr_with_mock(mock_client)
+        typed = FakeTypedClient()
+        typed.fail_next_query('get_account_values', TimeoutError('x'))
+        typed.queue_query('get_portfolio_summary', {'positions': []})
+        mmr = _mmr_with_typed(typed)
         _stub_proposal_store(mmr)
 
         summary = mmr.session_status()
@@ -1305,12 +1332,10 @@ class TestRiskReportPropagatesFailures:
     HHI and group-budget number it produces. Better to raise."""
 
     def test_account_values_failure_propagates(self):
-        mock_client = _make_mock_rpc()
-        mock_client.rpc.return_value.get_portfolio_summary.return_value = []
-        mock_client.rpc.return_value.get_account_values.side_effect = TimeoutError('boom')
-
-        mmr = _make_mmr_with_mock(mock_client)
-        # avoid PortfolioRiskAnalyzer needing a real duckdb path
+        typed = FakeTypedClient()
+        typed.queue_query('get_portfolio_summary', {'positions': []})
+        typed.fail_next_query('get_account_values', TimeoutError('boom'))
+        mmr = _mmr_with_typed(typed)
         mmr._container.config.return_value = {'duckdb_path': ''}
 
         with pytest.raises(TimeoutError):
@@ -1319,18 +1344,19 @@ class TestRiskReportPropagatesFailures:
 
 class TestPortfolioSnapshotPropagatesFailures:
     def test_account_values_failure_propagates(self):
-        mock_client = _make_mock_rpc()
-        # Must return a non-empty portfolio so we get past the early-return
+        typed = FakeTypedClient()
         contract = FakeContract(conId=4391, symbol='AMD', localSymbol='AMD')
         summary = FakePortfolioSummary(
             contract=contract, position=100, marketPrice=150.0, marketValue=15000.0,
             averageCost=140.0, unrealizedPNL=1000.0, realizedPNL=0.0,
             account='DU123', dailyPNL=50.0,
         )
-        mock_client.rpc.return_value.get_portfolio_summary.return_value = [summary]
-        mock_client.rpc.return_value.get_account_values.side_effect = TimeoutError('boom')
-
-        mmr = _make_mmr_with_mock(mock_client)
+        from trader.messaging.production_api import _portfolio_summary_to_wire
+        typed.queue_query('get_portfolio_summary', {
+            'positions': [_portfolio_summary_to_wire(summary)],
+        })
+        typed.fail_next_query('get_account_values', TimeoutError('boom'))
+        mmr = _mmr_with_typed(typed)
 
         with pytest.raises(TimeoutError):
             mmr.portfolio_snapshot()
@@ -1362,23 +1388,23 @@ class TestStrategiesListingEnrichment:
     the YAML description on hover — both must survive the SDK listing."""
 
     def test_rows_include_class_name_and_description(self):
-        mock_client = _make_mock_rpc()
-        strat = MagicMock()
-        strat.name = 'orb_googl'
-        strat.state = 'RUNNING'
-        strat.bar_size = '1 min'
-        strat.conids = [208813719]
-        strat.historical_days_prior = 90
-        strat.auto_execute = 'propose'
-        strat.class_name = 'OpeningRangeBreakout'
-        strat.description = 'ORB 45/1.3 on GOOGL'
-        strat.params = {'RANGE_MINUTES': 45}
-        result = MagicMock()
-        result.is_success.return_value = True
-        result.obj = [strat]
-        mock_client.rpc.return_value.get_strategies.return_value = result
-
-        mmr = _make_mmr_with_mock(mock_client)
+        typed = FakeTypedClient()
+        typed.queue_query('list_strategies', {
+            'strategies': [{
+                'name': 'orb_googl',
+                'state': 'RUNNING',
+                'bar_size': '1 min',
+                'conids': [208813719],
+                'historical_days_prior': 90,
+                'auto_execute': 'propose',
+                'class_name': 'OpeningRangeBreakout',
+                'description': 'ORB 45/1.3 on GOOGL',
+                'params': {'RANGE_MINUTES': 45},
+            }],
+        })
+        mmr = _make_mmr_with_mock(_make_mock_rpc())
+        mmr._strategy_typed_query_client = typed
+        mmr._strategy_typed_command_client = typed
         df = mmr.strategies()
 
         row = df.iloc[0]
@@ -1391,11 +1417,11 @@ class TestTransportIndependentDomainValues:
     a flat account still has cash, confidence is a number not a formatted
     string, and a storage-layer status maps to a plain-English label."""
 
-    def test_flat_portfolio_keeps_account_net_liquidation(self, mmr):
+    def test_flat_portfolio_keeps_account_net_liquidation(self, mmr, typed):
         mmr.portfolio = Mock(return_value=pd.DataFrame())
-        mmr._rpc.rpc().get_account_values.return_value = {
+        typed.queue_query('get_account_values', {
             "NetLiquidation": {"value": "50000", "currency": "USD"}
-        }
+        })
         assert mmr.portfolio_snapshot()["net_liquidation"] == 50000.0
 
     def test_proposal_rows_keep_numeric_confidence_and_map_submission(self, mmr, typed):

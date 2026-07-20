@@ -4393,9 +4393,7 @@ def _handle_strategy_deploy(args: argparse.Namespace):
                     new_defs = []
                     for cid in unregistered:
                         try:
-                            resolved = rpc_mmr._rpc.rpc().resolve_contract(
-                                Contract(conId=int(cid))
-                            )
+                            resolved = rpc_mmr.resolve(int(cid))
                             if resolved:
                                 new_defs.append(resolved[0])
                         except Exception as ex:
@@ -8569,7 +8567,7 @@ def _handle_data_download(args: argparse.Namespace):
         )
         candidate.connect()
         # Soft probe — if trader_service isn't up, skip silently
-        candidate._rpc.rpc().get_status()  # type: ignore[attr-defined]
+        candidate._typed_query.call('get_status', {}, dict)
         rpc_mmr = candidate
     except Exception:
         # connect() may have opened a socket before the probe failed — close the
@@ -10421,7 +10419,7 @@ def _handle_diagnose(mmr: MMR, args: argparse.Namespace):
         )
         return
     try:
-        result = mmr._rpc.rpc(return_type=dict).diagnose_portfolio_feed()
+        result = mmr._typed_query.call('diagnose_portfolio_feed', {}, dict)
     except Exception as ex:
         print_status(f'diagnose failed: {ex}', success=False)
         return
@@ -10485,8 +10483,14 @@ def _handle_scan(mmr: MMR, args: argparse.Namespace):
     # guessing at the scanner subscription matrix.
     if getattr(args, 'list_locations', False):
         try:
-            locs = mmr._rpc.rpc(return_type=list[dict]).scanner_locations()
+            locs = mmr._legacy_or_raise('scan --list-locations').rpc(
+                return_type=list[dict]
+            ).scanner_locations()
         except Exception as ex:
+            try:
+                mmr._map_legacy_route_error('scan --list-locations', ex)
+            except ConnectionError as mapped:
+                ex = mapped
             print_status(f'Failed to fetch scanner locations: {ex}', success=False)
             return
         if _json_mode:
@@ -11385,8 +11389,7 @@ def _handle_watch(mmr: MMR, args: argparse.Namespace | None = None):
                 # Fetch account summary for footer
                 account_summary = None
                 try:
-                    from trader.messaging.clientserver import consume
-                    acct_vals = consume(mmr._rpc.rpc(return_type=dict).get_account_values())
+                    acct_vals = mmr._account_values()
                     if acct_vals:
                         account_summary = {}
                         for key, display in (('TotalCashValue', 'cash'), ('AvailableFunds', 'available'), ('NetLiquidation', 'net_liq')):
@@ -11473,16 +11476,38 @@ def _build_completer(parser: argparse.ArgumentParser):
     return MMRCompleter()
 
 
+def _repl_history():
+    """prompt_toolkit history for the interactive REPL.
+
+    Prefer ``~/.local/share/mmr/logs/.mmr_repl_history`` — that directory is
+    bind-mounted writable in the split-container topology (root FS is
+    ``read_only: true``, so the old ``~/.local/share/mmr/.mmr_repl_history``
+    path raises ``EROFS``). Fall back through ``$TMPDIR`` then in-memory so
+    a read-only host never crashes the REPL on Enter.
+    """
+    import os
+    from prompt_toolkit.history import FileHistory, InMemoryHistory
+
+    candidates = [
+        Path('~/.local/share/mmr/logs').expanduser() / '.mmr_repl_history',
+        Path(os.environ.get('TMPDIR') or '/tmp') / '.mmr_repl_history',
+    ]
+    for history_file in candidates:
+        try:
+            history_file.parent.mkdir(parents=True, exist_ok=True)
+            with open(history_file, 'a'):
+                pass
+            return FileHistory(str(history_file))
+        except OSError:
+            continue
+    return InMemoryHistory()
+
+
 def repl(mmr: MMR):
     """Interactive REPL with prompt_toolkit."""
     from prompt_toolkit import PromptSession
     from prompt_toolkit.auto_suggest import AutoSuggestFromHistory
-    from prompt_toolkit.history import FileHistory
     from prompt_toolkit.key_binding import KeyBindings
-
-    history_dir = Path('~/.local/share/mmr').expanduser()
-    history_dir.mkdir(parents=True, exist_ok=True)
-    history_file = history_dir / '.mmr_repl_history'
 
     parser = build_parser()
 
@@ -11517,7 +11542,7 @@ def repl(mmr: MMR):
         return [(style, f'[{tag}]'), ('', ' mmr> ')]
 
     session = PromptSession(
-        history=FileHistory(str(history_file)),
+        history=_repl_history(),
         auto_suggest=AutoSuggestFromHistory(),
         completer=_build_completer(parser),
         vi_mode=vi_mode[0],
@@ -11579,12 +11604,25 @@ def repl(mmr: MMR):
 # Entry point
 # ------------------------------------------------------------------
 
-# resolve uses typed RPC (42101), not legacy dill 42001 — skip legacy connect.
+# These commands use typed RPC (42101/42102 / strategy 42104/42105) or are fully
+# local — skip legacy dill connect on port 42001 (unbound in split containers).
 _LOCAL_ONLY_COMMANDS = {
     'backtest', 'bt', 'data', 'propose', 'proposals', 'reject', 'resolve',
+    'portfolio', 'p', 'portfolio-snapshot', 'psnap', 'portfolio-diff', 'pdiff',
+    'portfolio-risk', 'prisk',
+    'positions', 'orders', 'trades', 'account', 'status', 's',
+    'snapshot', 'snap', 'snapshot-batch', 'depth',
+    'risk-limits', 'rl', 'reconcile', 'diagnose', 'approve', 'listen',
+    'ideas', 'scan-ideas',
     'market-hours', 'mh', 'session', 'group', 'research',
 }
-_LOCAL_ONLY_STRAT_ACTIONS = {'create', 'deploy', 'undeploy', 'signals', 'backtest'}
+# strategies list/enable/disable/reload hit strategy typed ports; create/deploy
+# etc. are YAML-local. Legacy connect is never needed for strategies/*.
+_LOCAL_ONLY_STRAT_ACTIONS = {
+    'create', 'deploy', 'undeploy', 'signals', 'backtest',
+    'enable', 'disable', 'reload', 'inspect', 'available', 'avail', 'list-files',
+    None,  # default list action
+}
 
 
 def main():

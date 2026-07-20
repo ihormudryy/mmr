@@ -93,6 +93,9 @@ class Trader():
                  service_hmac_key_file: str = '',
                  unsafe_legacy_rpc: bool = False,
                  command_authority: Optional[dict] = None,
+                 strategy_typed_command_port: int = 42104,
+                 strategy_typed_query_port: int = 42105,
+                 strategy_typed_address: str = '',
                  automation_enabled: bool = False,
                  automation_live_enabled: bool = False,
                  automation_artifact_bundle_path: str = '',
@@ -112,6 +115,9 @@ class Trader():
         self.universe_library = universe_library
         self.simulation: bool = simulation
         self.paper_trading = paper_trading
+        self.strategy_typed_command_port = int(strategy_typed_command_port)
+        self.strategy_typed_query_port = int(strategy_typed_query_port)
+        self.strategy_typed_address = strategy_typed_address or ''
         self.automation_enabled = bool(automation_enabled)
         self.automation_live_enabled = bool(automation_live_enabled)
         self.automation_artifact_bundle_path = automation_artifact_bundle_path or ''
@@ -457,6 +463,10 @@ class Trader():
                 feed_service=self.feed_service,
                 command_stack=command_stack,
             )
+            if command_stack is not None:
+                hot_arm = getattr(command_stack, "paper_hot_arm", None)
+                if hot_arm is not None and hasattr(hot_arm, "attach_registry"):
+                    hot_arm.attach_registry(production_registry)
             if command_stack is None:
                 register_strategy_state_ingest(production_registry, self.domain_journal)
             self.typed_query_server = TypedRpcServer(

@@ -116,12 +116,12 @@ scheduled) the paper soak.
 
 ### 5. Arm paper automation (one strategy)
 
-#### Preferred — dashboard (Phase 1)
+#### Preferred — dashboard (Phase 2 hot-arm)
 
 1. Open the web dashboard / command center **Scaling** tab
 2. **Paper automation** → select the strategy
 3. **Activate paper automation** (preflight / confirm)
-4. Expect `restart_required` → restart **trader** + **strategy**
+4. Expect `lifecycle=armed` (no restart). If you see `armed_unpersisted`, click Activate again to finish YAML persist. `restart_required` only appears for incomplete configs or until services have loaded YAML-enabled automation after a cold start.
 5. Confirm lifecycle shows **armed** (not `armed_unpersisted` / `failed`)
 
 See also [`DASHBOARD_USER_GUIDE.md`](DASHBOARD_USER_GUIDE.md).
@@ -188,7 +188,7 @@ python3 scripts/automation_paper_drill.py
 
 | Action | Effect |
 |--------|--------|
-| Dashboard **Deactivate paper automation** + restart | Stops durable auto arm |
+| Dashboard **Deactivate paper automation** | Tears down in-memory arm immediately; clears durable enable |
 | `automation.enabled: false` + restart strategy | Stops intent emission |
 | `pause_trading` | Risk-reducing pause |
 | `DASHBOARD_COMMANDS_ENABLED=false` | Hides UI commands only |

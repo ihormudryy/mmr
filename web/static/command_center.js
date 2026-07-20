@@ -617,10 +617,14 @@ function renderPaperAutomation() {
     message = 'Activation partially succeeded — click Activate again to complete.';
   } else if (showRestart) {
     message = 'Config written. Restart trader and strategy services to arm.';
+  } else if (lifecycle === 'failed') {
+    message = 'Last activate/deactivate failed — see last_error; automation is off';
+  } else if (lifecycle === 'preparing') {
+    message = 'Paper automation activation in progress…';
   } else if (lifecycle === 'disabled') {
     message = 'Paper automation is disabled';
   } else if (lifecycle === 'armed') {
-    message = 'Paper automation is armed';
+    message = 'Paper automation is armed (hot-arm active)';
   } else if (lifecycle === 'degraded') {
     message = 'Paper automation is degraded — check materials and YAML';
   }
@@ -1804,8 +1808,9 @@ async function ccActivatePaperAutomation() {
   }
   if (!window.confirm(
       `Activate paper automation for ${strategy}?\n\n`
-      + 'Config will be written; trader and strategy services must restart '
-      + 'to arm.\n\nReason: ' + reason)) {
+      + 'Will arm trader + strategy in-process (no restart when hot-arm '
+      + 'succeeds). Private keys stay on the host filesystem.\n\n'
+      + 'Reason: ' + reason)) {
     return;
   }
 
@@ -1837,7 +1842,7 @@ async function ccDeactivatePaperAutomation() {
   }
   if (!window.confirm(
       `Deactivate paper automation?\n\n`
-      + 'YAML enablement will be cleared; restart services to match.\n\n'
+      + 'Clears in-memory arm immediately and writes automation.enabled=false.\n\n'
       + `Reason: ${reason}`)) {
     return;
   }

@@ -1147,7 +1147,7 @@
         </table>
       </section>
       <section id="paper-auto-panel" aria-label="Paper automation">
-        <h2>Paper automation {{ info('Paper mode only. Writes keys, fixture artifact, and YAML for one strategy; restart trader and strategy services to arm. Needs command authority. Private keys never enter this browser.') }}
+        <h2>Paper automation {{ info('Paper mode only. Writes keys, fixture artifact, and YAML for one strategy, then hot-arms execute_automated_intent + IntentEmitter without restart when Activate succeeds. Needs command authority. Private keys never enter this browser.') }}
           <span id="paper-auto-lifecycle" class="scaling-status"
                 data-lifecycle="unknown">unknown</span>
         </h2>
@@ -1157,7 +1157,7 @@
            role="status">Activation partially succeeded — click Activate again to complete.</p>
         <p id="paper-auto-message" class="scaling-note">Waiting for paper automation status…</p>
         <p class="scaling-note">Writes keys, fixture artifact, and YAML for one paper
-          strategy. Services must restart before automation arms. Requires command
+          strategy, then hot-arms trader + strategy in-process. Requires command
           authority. Private keys never enter this browser.</p>
         <div class="scaling-cards" aria-label="Paper automation summary">
           <div class="scaling-card"><div class="label">Strategy</div>

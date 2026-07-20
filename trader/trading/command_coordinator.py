@@ -913,6 +913,13 @@ class TradingCommandCoordinator:
         """
         self._actions[action] = _ActionRegistration(handler, requires_preflight, saga)
 
+    def unregister_action(self, action: str) -> bool:
+        """Remove a previously registered action handler (hot-arm teardown)."""
+        if action not in self._actions:
+            return False
+        del self._actions[action]
+        return True
+
     def reconciliation_complete_for_account(
         self, account_id: str, *, exclude_command_id: Optional[str] = None,
     ) -> bool:

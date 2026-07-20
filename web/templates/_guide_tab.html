@@ -176,7 +176,7 @@
           <td>Reason → Suspend (immediate, risk-reducing)</td>
         </tr>
         <tr>
-          <td><strong>Paper automation</strong> {{ info('Paper only. Writes keys/artifact/YAML for one strategy; restart trader and strategy to arm. Needs command authority.') }}</td>
+          <td><strong>Paper automation</strong> {{ info('Paper only. Writes keys/artifact/YAML and hot-arms trader + strategy IntentEmitter without restart when Activate succeeds. Needs command authority.') }}</td>
           <td>Select strategy + reason → Activate paper automation (preflight) → restart services. Deactivate clears enablement.</td>
         </tr>
       </tbody>

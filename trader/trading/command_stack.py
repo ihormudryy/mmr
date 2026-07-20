@@ -303,7 +303,8 @@ class CommandStack:
     # canary public-key ring is configured (dormant by default; see build_command_stack)
     allocation_service: Any = None  # AllocationActivationService (P5 Task 3)
     automated_intent_service: Any = None  # AutomatedIntentCommandService (paper automation)
-    paper_automation_service: Any = None  # Restart-required paper activation authority
+    paper_automation_service: Any = None  # Paper activation authority (Phase 1+2)
+    paper_hot_arm: Any = None  # ProductionPaperHotArmPorts when paper mode
 
 
 _REQUIRED_TRADER_PORTS = (
@@ -858,6 +859,7 @@ def build_command_stack(
         ),
     )
     from trader.automation.paper_activation import PaperAutomationActivationService
+    from trader.automation.paper_hot_arm import ProductionPaperHotArmPorts
 
     trader_yaml_path = Path(
         os.environ.get("TRADER_CONFIG", "~/.config/mmr/trader.yaml")
@@ -866,6 +868,7 @@ def build_command_stack(
         getattr(trader, "strategy_config_file", None)
         or "~/.config/mmr/strategy_runtime.yaml"
     ).expanduser()
+
     paper_automation_service = PaperAutomationActivationService(
         trader_yaml_path=trader_yaml_path,
         strategy_yaml_path=strategy_yaml_path,
@@ -874,6 +877,7 @@ def build_command_stack(
         account_mode=account_mode,
         command_authority_enabled=policy.enabled,
         now=now,
+        hot_arm=None,
     )
 
     stack = CommandStack(
@@ -906,6 +910,52 @@ def build_command_stack(
         automated_intent_service=automated_intent_service,
         paper_automation_service=paper_automation_service,
     )
+
+    def _build_intent_for_hot_arm(trader_obj: Any):
+        return _build_automated_intent_service(
+            trader_obj,
+            ledger=ledger,
+            audit=CommandAudit(journal),
+            journal=journal,
+            controls=controls,
+            dispatch=dispatch,
+            protective_order_saga=protective_order_saga,
+            account_id=trader.ib_account,
+            account_mode=account_mode,
+            now=now,
+            schedule_reconcile=lambda command_id: reconciler.schedule(
+                command_id, now(),
+            ),
+        )
+
+    if account_mode == "paper":
+        hot_arm = ProductionPaperHotArmPorts(
+            trader=trader,
+            stack=stack,
+            account_id=trader.ib_account,
+            account_mode=account_mode,
+            now=now,
+            build_intent_service=_build_intent_for_hot_arm,
+        )
+        paper_automation_service._hot_arm = hot_arm
+        object.__setattr__(stack, "paper_hot_arm", hot_arm)
+
+    if automated_intent_service is not None:
+        paper_automation_service.mark_runtime_armed(
+            strategy_name=str(
+                getattr(trader, "automation_strategy_name", "") or ""
+            ),
+            artifact_id=str(
+                getattr(trader, "automation_expected_artifact_id", "") or ""
+            ),
+            artifact_bundle_path=str(
+                getattr(trader, "automation_artifact_bundle_path", "") or ""
+            ),
+            public_key_ring_path=str(
+                getattr(trader, "automation_public_key_ring_path", "") or ""
+            ),
+        )
+
     trader.command_ledger = ledger
     trader.command_reconciler = reconciler
     trader.command_stack = stack

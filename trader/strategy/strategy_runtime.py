@@ -232,6 +232,56 @@ def _disable_strategy_by_name_handler(runtime: 'StrategyRuntime'):
     return _handler
 
 
+class PaperAutomationArmError(Exception):
+    """Coded refusal to hot-arm paper automation on strategy_service."""
+
+    def __init__(self, code: str, message: str) -> None:
+        super().__init__(message)
+        self.code = code
+
+
+class ArmPaperAutomationRequest(BaseModel):
+    model_config = ConfigDict(extra='forbid')
+    strategy_name: str
+    artifact_bundle_path: str
+    public_key_ring_path: str
+    expected_artifact_id: str
+
+
+class DisarmPaperAutomationRequest(BaseModel):
+    model_config = ConfigDict(extra='forbid')
+
+
+class GetPaperAutomationArmRequest(BaseModel):
+    model_config = ConfigDict(extra='forbid')
+
+
+def _arm_paper_automation_handler(runtime: 'StrategyRuntime'):
+    def _handler(parsed: ArmPaperAutomationRequest) -> Dict[str, Any]:
+        try:
+            return runtime.arm_paper_automation(
+                strategy_name=parsed.strategy_name,
+                artifact_bundle_path=parsed.artifact_bundle_path,
+                public_key_ring_path=parsed.public_key_ring_path,
+                expected_artifact_id=parsed.expected_artifact_id,
+            )
+        except PaperAutomationArmError as exc:
+            raise _DispatchProblem(exc.code, str(exc)) from exc
+    return _handler
+
+
+def _disarm_paper_automation_handler(runtime: 'StrategyRuntime'):
+    def _handler(_parsed: DisarmPaperAutomationRequest) -> Dict[str, Any]:
+        return runtime.disarm_paper_automation()
+    return _handler
+
+
+def _get_paper_automation_arm_handler(runtime: 'StrategyRuntime'):
+    def _handler(_parsed: GetPaperAutomationArmRequest) -> Dict[str, Any]:
+        return runtime.get_paper_automation_arm()
+    return _handler
+
+
 def register_strategy_control_authority(
     command_registry: TypedRpcRegistry, query_registry: TypedRpcRegistry, runtime: 'StrategyRuntime',
 ) -> None:
@@ -277,6 +327,18 @@ def register_strategy_control_authority(
     command_registry.register(
         'command', 'disable_strategy_by_name', DisableStrategyByNameRequest, dict,
         _disable_strategy_by_name_handler(runtime), execution='thread',
+    )
+    command_registry.register(
+        'command', 'arm_paper_automation', ArmPaperAutomationRequest, dict,
+        _arm_paper_automation_handler(runtime), execution='thread',
+    )
+    command_registry.register(
+        'command', 'disarm_paper_automation', DisarmPaperAutomationRequest, dict,
+        _disarm_paper_automation_handler(runtime), execution='thread',
+    )
+    query_registry.register(
+        'query', 'get_paper_automation_arm', GetPaperAutomationArmRequest, dict,
+        _get_paper_automation_arm_handler(runtime),
     )
 
 
@@ -1404,6 +1466,108 @@ class StrategyRuntime():
             self._verified_artifact.artifact_id,
             account_mode,
         )
+
+    def get_paper_automation_arm(self) -> Dict[str, Any]:
+        """Read model for hot-arm verify (trader asks strategy after commit)."""
+        armed = (
+            bool(self.automation_enabled)
+            and self.intent_emitter is not None
+            and bool(self.automation_strategy_name)
+        )
+        return {
+            'armed': armed,
+            'strategy_name': self.automation_strategy_name or None,
+            'artifact_id': self.automation_expected_artifact_id or None,
+        }
+
+    def disarm_paper_automation(self) -> Dict[str, Any]:
+        """Clear in-memory IntentEmitter + automation binding (hot-arm teardown)."""
+        self.intent_emitter = None
+        self._verified_artifact = None
+        self._verified_artifact_strategy = None
+        self._artifact_verifier = None
+        self.automation_enabled = False
+        self.automation_strategy_name = ''
+        self.automation_expected_artifact_id = ''
+        self.automation_artifact_bundle_path = ''
+        self.automation_public_key_ring_path = ''
+        logging.info('paper automation disarmed in strategy runtime')
+        return {'ok': True, 'armed': False}
+
+    def arm_paper_automation(
+        self,
+        *,
+        strategy_name: str,
+        artifact_bundle_path: str,
+        public_key_ring_path: str,
+        expected_artifact_id: str,
+    ) -> Dict[str, Any]:
+        """Hot-arm IntentEmitter for one strategy without process restart."""
+        if self.automation_live_enabled:
+            raise PaperAutomationArmError(
+                'LIVE_AUTOMATION_REFUSED',
+                'live automation cannot be hot-armed',
+            )
+        if not self.paper_trading:
+            raise PaperAutomationArmError(
+                'NOT_PAPER',
+                'paper automation hot-arm requires paper_trading=true',
+            )
+        if getattr(self, '_trader_command_client', None) is None:
+            raise PaperAutomationArmError(
+                'TRADER_CLIENT_MISSING',
+                'trader typed command client is not connected; cannot arm IntentEmitter',
+            )
+        name = (strategy_name or '').strip()
+        if not name:
+            raise PaperAutomationArmError(
+                'STRATEGY_NOT_FOUND',
+                'strategy_name is required to arm paper automation',
+            )
+        bundle = (artifact_bundle_path or '').strip()
+        key_ring = (public_key_ring_path or '').strip()
+        artifact_id = (expected_artifact_id or '').strip()
+        if not bundle or not key_ring or not artifact_id:
+            raise PaperAutomationArmError(
+                'AUTOMATION_CONFIG_INCOMPLETE',
+                'artifact_bundle_path, public_key_ring_path, and expected_artifact_id are required',
+            )
+
+        # Clear any prior arm, then bind the new materials.
+        self.intent_emitter = None
+        self._verified_artifact = None
+        self._verified_artifact_strategy = None
+        self._artifact_verifier = None
+
+        self.automation_enabled = True
+        self.automation_live_enabled = False
+        self.automation_artifact_bundle_path = bundle
+        self.automation_public_key_ring_path = key_ring
+        self.automation_expected_artifact_id = artifact_id
+        self.automation_strategy_name = name
+
+        try:
+            self._verify_artifact_at_load(name, bundle)
+        except Exception as exc:
+            self.disarm_paper_automation()
+            raise PaperAutomationArmError(
+                'ARM_FAILED',
+                f'artifact verify failed for {name!r}: {exc}',
+            ) from exc
+
+        if self.intent_emitter is None:
+            self.disarm_paper_automation()
+            raise PaperAutomationArmError(
+                'ARM_FAILED',
+                f'IntentEmitter was not built for strategy {name!r}',
+            )
+
+        return {
+            'ok': True,
+            'armed': True,
+            'strategy_name': name,
+            'artifact_id': artifact_id,
+        }
 
     def _maybe_check_exits(self, strategy: Strategy, conId: int,
                            frame: pd.DataFrame) -> None:

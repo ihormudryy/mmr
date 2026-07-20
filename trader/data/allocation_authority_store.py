@@ -12,16 +12,24 @@ from trader.domain.events import DomainMutation
 from trader.domain.identity import strategy_entity_id
 from trader.promotion.allocation_attestation import (
     AllocationAttestation,
+    STAGE_CANARY,
+    STAGE_MAX_CEILING,
+    STAGE_SCALE_1,
+    STAGE_SCALE_2,
+    STAGE_STEADY,
     VerifiedAllocationAuthority,
     allocation_attestation_to_wire,
     allocation_payload_digest,
+    validate_signed_ceiling,
 )
 
 ALLOCATION_AUTHORITY_MIGRATION_50 = 50
 ALLOCATION_AUTHORITY_MIGRATION_51 = 51
+ALLOCATION_AUTHORITY_MIGRATION_52 = 52
 ALLOCATION_AUTHORITY_MIGRATION_VERSIONS = (
     ALLOCATION_AUTHORITY_MIGRATION_50,
     ALLOCATION_AUTHORITY_MIGRATION_51,
+    ALLOCATION_AUTHORITY_MIGRATION_52,
 )
 ALLOCATION_AUTHORITY_MIGRATION_50_NAME = "p5_allocation_authorities"
 ALLOCATION_AUTHORITY_MIGRATION_51_NAME = "p5_allocation_authority_events"
@@ -31,6 +39,7 @@ EVENT_ACTIVATED = "ACTIVATED"
 EVENT_DEACTIVATED = "DEACTIVATED"
 EVENT_REVOKED = "REVOKED"
 EVENT_SUPERSEDED = "SUPERSEDED"
+EVENT_OVERRIDE = "OVERRIDE"
 
 AUTHORITY_EVENTS = frozenset({
     EVENT_ISSUED,
@@ -38,7 +47,58 @@ AUTHORITY_EVENTS = frozenset({
     EVENT_DEACTIVATED,
     EVENT_REVOKED,
     EVENT_SUPERSEDED,
+    EVENT_OVERRIDE,
 })
+
+_ACTIVE_AUTHORITY_EVENTS = frozenset({
+    EVENT_ISSUED,
+    EVENT_ACTIVATED,
+    EVENT_OVERRIDE,
+})
+
+_STAGE_ORDER = (STAGE_CANARY, STAGE_SCALE_1, STAGE_SCALE_2, STAGE_STEADY)
+
+
+class AllocationOverrideRejected(ValueError):
+    """Raised when ``apply_override`` would increase stage or gross allocation."""
+
+
+def _stage_rank(stage: str) -> int:
+    try:
+        return _STAGE_ORDER.index(stage)
+    except ValueError as exc:
+        raise ValueError(f"unknown allocation stage {stage!r}") from exc
+
+
+def _validate_override_reduction(
+    current: "AllocationAuthorityRecord",
+    *,
+    new_stage: str,
+    new_max_gross: float,
+) -> None:
+    if new_max_gross > 0:
+        validate_signed_ceiling(new_stage, new_max_gross)
+    elif new_stage not in STAGE_MAX_CEILING:
+        raise ValueError(f"unknown allocation stage {new_stage!r}")
+    if _stage_rank(new_stage) > _stage_rank(current.stage):
+        raise AllocationOverrideRejected(
+            f"override stage {new_stage!r} is above current stage {current.stage!r}"
+        )
+    if new_max_gross > current.max_gross_allocation:
+        raise AllocationOverrideRejected(
+            f"override max_gross {new_max_gross} exceeds current {current.max_gross_allocation}"
+        )
+    if (
+        _stage_rank(new_stage) == _stage_rank(current.stage)
+        and new_max_gross >= current.max_gross_allocation
+    ):
+        raise AllocationOverrideRejected(
+            "override must strictly reduce stage and/or max_gross allocation"
+        )
+
+
+def _authority_event_literals() -> str:
+    return ", ".join(f"'{event}'" for event in sorted(AUTHORITY_EVENTS))
 
 
 def _as_utc(value: dt.datetime) -> dt.datetime:
@@ -47,17 +107,19 @@ def _as_utc(value: dt.datetime) -> dt.datetime:
     return value.astimezone(dt.timezone.utc)
 
 
-def apply_allocation_authority_migrations(migrator: SchemaMigrator) -> bool:
-    """Apply journal migrations 50-51. Returns True if any newly applied."""
-    event_literals = ", ".join(f"'{event}'" for event in sorted(AUTHORITY_EVENTS))
-    applied = False
-    applied |= migrator.apply(
-        ALLOCATION_AUTHORITY_MIGRATION_50,
-        ALLOCATION_AUTHORITY_MIGRATION_50_NAME,
-        (
-            "CREATE SEQUENCE IF NOT EXISTS allocation_authorities_seq START 1",
-            """CREATE TABLE IF NOT EXISTS allocation_authorities (
-                entry_id BIGINT PRIMARY KEY DEFAULT nextval('allocation_authorities_seq'),
+def _allocation_authorities_ddl(
+    *,
+    table_name: str,
+    event_literals: str,
+    with_entry_default: bool = True,
+) -> str:
+    entry_id_col = (
+        "entry_id BIGINT PRIMARY KEY DEFAULT nextval('allocation_authorities_seq')"
+        if with_entry_default
+        else "entry_id BIGINT PRIMARY KEY"
+    )
+    return f"""CREATE TABLE {table_name} (
+                {entry_id_col},
                 authority_digest VARCHAR NOT NULL,
                 strategy_id VARCHAR NOT NULL,
                 account_id VARCHAR NOT NULL,
@@ -73,11 +135,49 @@ def apply_allocation_authority_migrations(migrator: SchemaMigrator) -> bool:
                 reason VARCHAR NOT NULL,
                 issued_at TIMESTAMPTZ NOT NULL,
                 expires_at TIMESTAMPTZ NOT NULL,
-                event VARCHAR NOT NULL CHECK (event IN ({events})),
+                event VARCHAR NOT NULL CHECK (event IN ({event_literals})),
                 superseded_by_digest VARCHAR,
                 command_id VARCHAR,
                 recorded_at TIMESTAMPTZ NOT NULL
-            )""".format(events=event_literals),
+            )"""
+
+
+def _allocation_authority_events_ddl(
+    *,
+    table_name: str,
+    event_literals: str,
+    with_event_default: bool = True,
+) -> str:
+    event_id_col = (
+        "event_id BIGINT PRIMARY KEY DEFAULT nextval('allocation_authority_events_seq')"
+        if with_event_default
+        else "event_id BIGINT PRIMARY KEY"
+    )
+    return f"""CREATE TABLE {table_name} (
+                {event_id_col},
+                authority_digest VARCHAR NOT NULL,
+                account_id VARCHAR NOT NULL,
+                artifact_digest VARCHAR NOT NULL,
+                event VARCHAR NOT NULL CHECK (event IN ({event_literals})),
+                superseded_by_digest VARCHAR,
+                command_id VARCHAR,
+                recorded_at TIMESTAMPTZ NOT NULL
+            )"""
+
+
+def apply_allocation_authority_migrations(migrator: SchemaMigrator) -> bool:
+    """Apply journal migrations 50-52. Returns True if any newly applied."""
+    event_literals = _authority_event_literals()
+    applied = False
+    applied |= migrator.apply(
+        ALLOCATION_AUTHORITY_MIGRATION_50,
+        ALLOCATION_AUTHORITY_MIGRATION_50_NAME,
+        (
+            "CREATE SEQUENCE IF NOT EXISTS allocation_authorities_seq START 1",
+            _allocation_authorities_ddl(
+                table_name="allocation_authorities",
+                event_literals=event_literals,
+            ),
             """CREATE INDEX IF NOT EXISTS idx_allocation_authorities_digest
                 ON allocation_authorities(authority_digest)""",
             """CREATE INDEX IF NOT EXISTS idx_allocation_authorities_account_artifact
@@ -89,23 +189,78 @@ def apply_allocation_authority_migrations(migrator: SchemaMigrator) -> bool:
         ALLOCATION_AUTHORITY_MIGRATION_51_NAME,
         (
             "CREATE SEQUENCE IF NOT EXISTS allocation_authority_events_seq START 1",
-            """CREATE TABLE IF NOT EXISTS allocation_authority_events (
-                event_id BIGINT PRIMARY KEY DEFAULT nextval('allocation_authority_events_seq'),
-                authority_digest VARCHAR NOT NULL,
-                account_id VARCHAR NOT NULL,
-                artifact_digest VARCHAR NOT NULL,
-                event VARCHAR NOT NULL CHECK (event IN ({events})),
-                superseded_by_digest VARCHAR,
-                command_id VARCHAR,
-                recorded_at TIMESTAMPTZ NOT NULL
-            )""".format(events=event_literals),
+            _allocation_authority_events_ddl(
+                table_name="allocation_authority_events",
+                event_literals=event_literals,
+            ),
             """CREATE INDEX IF NOT EXISTS idx_allocation_authority_events_digest
                 ON allocation_authority_events(authority_digest)""",
             """CREATE INDEX IF NOT EXISTS idx_allocation_authority_events_account_artifact
                 ON allocation_authority_events(account_id, artifact_digest)""",
         ),
     )
+    if ALLOCATION_AUTHORITY_MIGRATION_52 not in migrator.applied_versions():
+        max_entry = migrator.db.execute(
+            "SELECT COALESCE(MAX(entry_id), 0) FROM allocation_authorities",
+            fetch="one",
+        )[0]
+        max_event = migrator.db.execute(
+            "SELECT COALESCE(MAX(event_id), 0) FROM allocation_authority_events",
+            fetch="one",
+        )[0]
+        applied |= migrator.apply(
+            ALLOCATION_AUTHORITY_MIGRATION_52,
+            "p5_allocation_authority_override_event",
+            _migration_52_override_event_statements(
+                event_literals,
+                next_entry_id=int(max_entry) + 1,
+                next_event_id=int(max_event) + 1,
+            ),
+        )
     return applied
+
+
+def _migration_52_override_event_statements(
+    event_literals: str,
+    *,
+    next_entry_id: int,
+    next_event_id: int,
+) -> tuple[str, ...]:
+    """Recreate authority tables so CHECK constraints include ``OVERRIDE``."""
+    return (
+        _allocation_authorities_ddl(
+            table_name="allocation_authorities_v52",
+            event_literals=event_literals,
+            with_entry_default=False,
+        ),
+        "INSERT INTO allocation_authorities_v52 SELECT * FROM allocation_authorities",
+        "DROP TABLE allocation_authorities",
+        "ALTER TABLE allocation_authorities_v52 RENAME TO allocation_authorities",
+        "DROP SEQUENCE IF EXISTS allocation_authorities_seq",
+        f"CREATE SEQUENCE allocation_authorities_seq START {next_entry_id}",
+        "ALTER TABLE allocation_authorities "
+        "ALTER COLUMN entry_id SET DEFAULT nextval('allocation_authorities_seq')",
+        """CREATE INDEX IF NOT EXISTS idx_allocation_authorities_digest
+            ON allocation_authorities(authority_digest)""",
+        """CREATE INDEX IF NOT EXISTS idx_allocation_authorities_account_artifact
+            ON allocation_authorities(account_id, artifact_digest)""",
+        _allocation_authority_events_ddl(
+            table_name="allocation_authority_events_v52",
+            event_literals=event_literals,
+            with_event_default=False,
+        ),
+        "INSERT INTO allocation_authority_events_v52 SELECT * FROM allocation_authority_events",
+        "DROP TABLE allocation_authority_events",
+        "ALTER TABLE allocation_authority_events_v52 RENAME TO allocation_authority_events",
+        "DROP SEQUENCE IF EXISTS allocation_authority_events_seq",
+        f"CREATE SEQUENCE allocation_authority_events_seq START {next_event_id}",
+        "ALTER TABLE allocation_authority_events "
+        "ALTER COLUMN event_id SET DEFAULT nextval('allocation_authority_events_seq')",
+        """CREATE INDEX IF NOT EXISTS idx_allocation_authority_events_digest
+            ON allocation_authority_events(authority_digest)""",
+        """CREATE INDEX IF NOT EXISTS idx_allocation_authority_events_account_artifact
+            ON allocation_authority_events(account_id, artifact_digest)""",
+    )
 
 
 @dataclass(frozen=True)
@@ -466,6 +621,49 @@ class AllocationAuthorityStore:
             now=now or self._now(),
         )
 
+    def apply_override(
+        self,
+        account_id: str,
+        artifact_digest: str,
+        *,
+        new_stage: str,
+        new_max_gross: float,
+        reason: str,
+        now: Optional[dt.datetime] = None,
+    ) -> AllocationAuthorityRecord:
+        """Append a restrictive override for the active account/artifact authority.
+
+        Overrides may only reduce stage and/or ``max_gross_allocation`` — any
+        attempt to increase either dimension raises ``AllocationOverrideRejected``.
+        """
+        if not reason.strip():
+            raise ValueError("reason is required")
+        base = self.active_for(account_id, artifact_digest, now=now)
+        if base is None:
+            raise ValueError(
+                f"no active authority for account {account_id!r} artifact {artifact_digest!r}"
+            )
+        _validate_override_reduction(base, new_stage=new_stage, new_max_gross=new_max_gross)
+        return self._append(
+            authority_digest=base.authority_digest,
+            strategy_id=base.strategy_id,
+            account_id=base.account_id,
+            account_mode=base.account_mode,
+            stage=new_stage,
+            artifact_digest=base.artifact_digest,
+            allowlist_digest=base.allowlist_digest,
+            ruleset_digest=base.ruleset_digest,
+            max_gross_allocation=float(new_max_gross),
+            evidence_digest=base.evidence_digest,
+            public_key_id=base.public_key_id,
+            operator=base.operator,
+            reason=reason.strip(),
+            issued_at=base.issued_at,
+            expires_at=base.expires_at,
+            event=EVENT_OVERRIDE,
+            now=now or self._now(),
+        )
+
     def latest(self, authority_digest: str) -> Optional[AllocationAuthorityRecord]:
         row = self.db.execute(
             f"SELECT {_SELECT_COLUMNS} FROM allocation_authorities "
@@ -531,7 +729,9 @@ class AllocationAuthorityStore:
                 continue
             if _as_utc(latest.expires_at) <= resolved_now:
                 continue
-            if latest.event not in (EVENT_ISSUED, EVENT_ACTIVATED):
+            if latest.event not in _ACTIVE_AUTHORITY_EVENTS:
+                continue
+            if latest.max_gross_allocation <= 0:
                 continue
             return latest
         return None

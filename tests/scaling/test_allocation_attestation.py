@@ -303,7 +303,7 @@ def test_signature_tamper_rejects():
 def test_migrations_50_51_idempotent(tmp_path):
     db, migrator, _ = _db(tmp_path, "mig.duckdb")
     assert apply_allocation_authority_migrations(migrator) is True
-    assert ALLOCATION_AUTHORITY_MIGRATION_VERSIONS == (50, 51)
+    assert ALLOCATION_AUTHORITY_MIGRATION_VERSIONS == (50, 51, 52)
     assert apply_allocation_authority_migrations(migrator) is False
 
     auth_cols = {row[1] for row in db.execute("PRAGMA table_info('allocation_authorities')", fetch="all")}

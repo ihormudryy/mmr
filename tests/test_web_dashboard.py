@@ -479,11 +479,17 @@ class TestWatchlistRoutes:
         assert 'mylist' not in accessor.universes
 
     def test_watchlists_tab_rendered(self, client, accessor, stub_resolving):
-        html = client.get('/legacy').text
+        html = client.get('/manage').text
         assert 'data-tab="watchlists"' in html
         assert 'id="tab-watchlists"' in html
-        assert 'mylist' in html
-        assert 'AAPL' in html
+
+    def test_flash_redirects_to_manage(self, client, accessor, stub_resolving):
+        r = client.post('/watchlists/create',
+                        data={'csrf_token': _csrf(), 'name': 'flash_test'},
+                        follow_redirects=False)
+        assert r.status_code == 303
+        assert r.headers['location'].startswith('/manage?flash=')
+        assert 'flash_test' in accessor.universes
 
 
 class TestDeployRoute:
@@ -557,9 +563,37 @@ class TestDeployRoute:
         assert not any(e.get('name') == 'mom_test' for e in cfg['strategies'])
 
     def test_deploy_form_rendered_in_available_table(self, client, accessor, stub_resolving):
-        html = client.get('/legacy').text
+        html = client.get('/manage').text
         assert '/strategies/deploy' in html
         assert 'name="watchlist"' in html
+        assert 'Command Center' in html
+        assert '/strategies/' not in html or '/strategies/deploy' in html
+        # Manage page is read-only for deployed strategies — no enable/disable forms
+        assert '/strategies/orb_googl/enable' not in html
+
+
+class TestManagePage:
+    def test_manage_renders_without_heavy_fetchers(self, client, stub, monkeypatch):
+        """ /manage must not fan out legacy overview fetchers (cash, risk, …). """
+        def _boom():
+            raise AssertionError('legacy fetcher must not run on /manage')
+
+        for name in ('fetch_cash', 'fetch_snapshot', 'fetch_status', 'fetch_risk',
+                     'fetch_risk_limits', 'fetch_positions', 'fetch_proposals'):
+            monkeypatch.setattr(webapp, name, _boom)
+        html = client.get('/manage').text
+        assert 'Available strategies' in html
+        assert 'Watchlists' in html
+        assert 'Command Center' in html
+
+    def test_manage_marks_deployed_classes(self, client):
+        html = client.get('/manage').text
+        assert 'deployed' in html.lower()
+
+    def test_manage_default_tab_is_strategies(self, client):
+        html = client.get('/manage').text
+        assert 'id="tab-strategies"' in html
+        assert "'strategies'" in html
 
 
 class TestLegacyAccessTokenDoubleGate:

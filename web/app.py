@@ -546,10 +546,43 @@ def fetch_proposals() -> list[dict]:
 
 
 def _flash(msg: str) -> RedirectResponse:
-    # Legacy POST routes redirect back to the legacy page (now /legacy, since
-    # `/` redirects to the command center) so the post/redirect/get loop stays
-    # on the page the form was submitted from.
-    return RedirectResponse(url=f'/legacy?flash={quote(msg)}', status_code=303)
+    # Deploy + watchlist POST routes redirect to /manage so the post/redirect/get
+    # loop stays on the page the form was submitted from.
+    return RedirectResponse(url=f'/manage?flash={quote(msg)}', status_code=303)
+
+
+def _manage_page_context(flash: str = '') -> tuple[dict[str, Any], dict[str, str]]:
+    """Fetch only the sections /manage needs — no trader RPC on the hot path."""
+    sections: dict[str, Any] = {}
+    errors: dict[str, str] = {}
+    fetchers: dict[str, Callable[[], Any]] = {
+        'strategies': fetch_strategies,
+        'available': fetch_available_strategies,
+        'watchlists': fetch_watchlists,
+    }
+    for key, fn in fetchers.items():
+        try:
+            sections[key] = fn()
+        except Exception as exc:  # noqa: BLE001 - surface, don't crash the page
+            logger.warning('manage section %s failed: %s', key, exc)
+            sections[key] = None
+            errors[key] = f'{type(exc).__name__}: {exc}'
+
+    strategies = sections.get('strategies') or []
+    deployed_classes = {s.get('class_name') for s in strategies if s.get('class_name')}
+    available = sections.get('available') or []
+    for a in available:
+        a['deployed'] = a.get('class') in deployed_classes
+
+    return ({
+        'strategies': strategies,
+        'available_strategies': available,
+        'watchlists': sections.get('watchlists') or [],
+        'deployed_count': len(strategies),
+        'flash': flash,
+        'csrf_token': _CSRF_TOKEN,
+        'errors': errors,
+    }, errors)
 
 
 def _coerce_yaml_value(text: str):
@@ -627,6 +660,14 @@ def _register_legacy_routes(application: FastAPI) -> None:
         # 307 (temporary, method-preserving) keeps this fully reversible — no
         # permanent browser caching of the redirect.
         return RedirectResponse('/cc', status_code=307)
+
+
+    @application.get('/manage')
+    def manage_page(request: Request, flash: str = ''):
+        """Deploy-from-disk + watchlist CRUD — extracted from the legacy dashboard."""
+        _check_access(request)
+        ctx, _ = _manage_page_context(flash=flash)
+        return _TEMPLATES.TemplateResponse(request, 'manage.html', ctx)
 
 
     @application.get('/legacy')
@@ -979,11 +1020,11 @@ def _register_legacy_routes(application: FastAPI) -> None:
 
 
     @application.post('/strategies/deploy')
-    async def deploy_strategy(request: Request):
+    async def deploy_strategy(request: Request, session: str = Depends(require_session)):
         """Deploy an on-disk strategy: validate against the scanner (keeps the
         strategies-dir sandbox), resolve/attach the target instruments, append
         the YAML entry atomically, then reload + enable via RPC."""
-        _check_access(request)
+        _check_origin(request)
         form = await request.form()
         _check_csrf(str(form.get('csrf_token') or ''))
 
@@ -1058,16 +1099,16 @@ def _register_legacy_routes(application: FastAPI) -> None:
                 if hasattr(reload_result, 'is_success') and not reload_result.is_success():
                     return (f'"{name}" written to config but reload failed: '
                             f'{_result_error(reload_result)} — it loads on the next '
-                            'reconcile; enable it from the Strategies tab')
+                            'reconcile; enable it from the Command Center')
                 enable_result = _call(lambda m: m.enable_strategy(name), retry=False)
                 if hasattr(enable_result, 'is_success') and not enable_result.is_success():
                     return (f'"{name}" deployed but enable failed: '
                             f'{_result_error(enable_result)} — enable it from the '
-                            'Strategies tab')
+                            'Command Center')
             except Exception as exc:
                 return (f'"{name}" written to config but service call failed '
                         f'({type(exc).__name__}: {exc}) — it loads on the next '
-                        'reconcile; enable it from the Strategies tab')
+                        'reconcile; enable it from the Command Center')
             target = ', '.join(symbols) if symbols else f'watchlist {watchlist}'
             return f'deployed & enabled "{name}" ({class_name}) on {target}'
 

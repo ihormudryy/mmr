@@ -64,12 +64,25 @@ _ALLOWED_EDGES: dict[Optional[str], frozenset[str]] = {
 }
 
 # Stages that certify evidence as "good enough to move forward" and
-# therefore require a clean evidence window (not stale, no breaker trip, no
-# cost breach, no drawdown breach since the last correction) whenever a
-# window is supplied. Tasks 2/3/6 own the concrete simultaneous floors; this
-# machine only refuses to rubber-stamp a passed/authorized/canary-passed
-# stage over evidence it can see is dirty.
+# therefore MANDATE a strategy-matched, freshly-projected, clean evidence
+# window (not stale, no breaker trip, no cost breach, no drawdown breach
+# since the last correction). Tasks 2/3/6 own the concrete simultaneous
+# floors (day/session/round-trip/instrument counts); this machine only
+# refuses to rubber-stamp a passed/authorized/canary-passed stage without
+# real, current evidence -- omission is a rejection, never trusted. Software
+# completion alone (a bare reason/actor with no evidence_window) can never
+# mark a paper or live gate passed.
 _REQUIRES_CLEAN_EVIDENCE = frozenset({PAPER_PASSED, CANARY_AUTHORIZED, CANARY_PASSED})
+
+# How long after an EvidenceWindow's own `as_of` it may still be presented to
+# authorize a transition. This is a BINDING/provenance check -- distinct from
+# `EvidenceWindow.stale` (30-day evidence-inactivity, relative to the
+# window's own `as_of`) -- that guards against a cached or replayed window
+# from an earlier review cycle being reused to rubber-stamp a *later*
+# transition. Callers are expected to call `EvidenceStore.project()`
+# immediately before `transition()`, so this tolerance only needs to absorb
+# ordinary call latency, not multi-day gaps.
+EVIDENCE_WINDOW_FRESHNESS = dt.timedelta(hours=1)
 
 
 def _as_utc(value: dt.datetime) -> dt.datetime:
@@ -93,9 +106,12 @@ class IllegalStageTransition(Exception):
 
 
 class EvidenceNotCleanError(Exception):
-    """Raised when a caller supplies an evidence window and it is stale or
-    carries breaker/cost/drawdown evidence for a stage that requires clean
-    evidence to advance into."""
+    """Raised when a transition into a clean-evidence-required stage
+    (PAPER_PASSED/CANARY_AUTHORIZED/CANARY_PASSED) cannot be trusted: the
+    ``evidence_window`` is missing entirely, bound to a different
+    ``strategy_id``, not freshly projected relative to this transition, or
+    its content is stale/carries breaker/cost/drawdown evidence. Any one of
+    these fails the whole transition closed -- omission is never trusted."""
 
     def __init__(self, strategy_id: str, to_stage: str, reasons: tuple[str, ...]):
         self.strategy_id = strategy_id
@@ -254,12 +270,14 @@ class PromotionStageMachine:
     """Durable, explicit-only promotion stage transitions.
 
     ``transition`` is the sole write path. It (1) validates the requested
-    edge against the frozen ``_ALLOWED_EDGES`` map, (2) when an
-    ``evidence_window`` is supplied and the target stage requires clean
-    evidence, refuses to advance over staleness/breaker/cost/drawdown
-    evidence, (3) for canary authorization/activation, records and then
-    verifies authority reference + expiry exactly, and (4) persists the new
-    ``StageRecord`` and its domain event atomically.
+    edge against the frozen ``_ALLOWED_EDGES`` map, (2) for a target stage
+    that requires clean evidence (PAPER_PASSED/CANARY_AUTHORIZED/
+    CANARY_PASSED), MANDATES a strategy-matched, freshly-projected
+    ``evidence_window`` and refuses to advance if it is missing, mismatched,
+    stale (either not freshly projected or 30-day-inactive), or carries
+    breaker/cost/drawdown evidence, (3) for canary authorization/activation,
+    records and then verifies authority reference + expiry exactly, and
+    (4) persists the new ``StageRecord`` and its domain event atomically.
     """
 
     def __init__(self, journal: Any, db: Any, now: Optional[Callable[[], dt.datetime]] = None):
@@ -304,8 +322,8 @@ class PromotionStageMachine:
         if to_stage not in allowed:
             raise IllegalStageTransition(strategy_id, from_stage, to_stage)
 
-        if to_stage in _REQUIRES_CLEAN_EVIDENCE and evidence_window is not None:
-            self._require_clean_evidence(strategy_id, to_stage, evidence_window)
+        if to_stage in _REQUIRES_CLEAN_EVIDENCE:
+            self._require_clean_evidence(strategy_id, to_stage, evidence_window, resolved_now)
 
         next_authority_ref = current.authority_ref if current is not None else None
         next_authority_expiry = current.authority_expiry if current is not None else None
@@ -345,17 +363,29 @@ class PromotionStageMachine:
 
     @staticmethod
     def _require_clean_evidence(
-        strategy_id: str, to_stage: str, evidence_window: EvidenceWindow,
+        strategy_id: str,
+        to_stage: str,
+        evidence_window: Optional[EvidenceWindow],
+        now: dt.datetime,
     ) -> None:
         reasons: list[str] = []
-        if evidence_window.stale:
-            reasons.append("stale_evidence")
-        if evidence_window.breaker_trips:
-            reasons.append("breaker_trip")
-        if evidence_window.cost_breaches:
-            reasons.append("cost_breach")
-        if evidence_window.drawdown_breaches:
-            reasons.append("drawdown_breach")
+        if evidence_window is None:
+            # Do not trust omission: no window at all is the exact bypass
+            # this check exists to close (a caller "trust me, floors met").
+            reasons.append("missing_evidence_window")
+        else:
+            if evidence_window.strategy_id != strategy_id:
+                reasons.append("strategy_mismatch")
+            if abs(now - evidence_window.as_of) > EVIDENCE_WINDOW_FRESHNESS:
+                reasons.append("window_not_fresh")
+            if evidence_window.stale:
+                reasons.append("stale_evidence")
+            if evidence_window.breaker_trips:
+                reasons.append("breaker_trip")
+            if evidence_window.cost_breaches:
+                reasons.append("cost_breach")
+            if evidence_window.drawdown_breaches:
+                reasons.append("drawdown_breach")
         if reasons:
             raise EvidenceNotCleanError(strategy_id, to_stage, tuple(reasons))
 

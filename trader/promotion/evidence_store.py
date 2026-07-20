@@ -48,6 +48,21 @@ EVENT_KIND_DRAWDOWN_BREACH = "drawdown_breach"
 
 CORRECTION_SCOPES = frozenset({"code", "config", "allowlist", "risk", "data"})
 
+# Every event_kind recognized by the pure projection above. An unrecognized
+# kind (e.g. a typo like "braker_trip") must never be accepted and silently
+# dropped from projection -- that would make safety evidence vanish without
+# any error. Validated eagerly in ``EvidenceEvent.__post_init__`` so it can
+# never even be constructed, let alone appended.
+EVENT_KINDS = frozenset({
+    EVENT_KIND_SESSION,
+    EVENT_KIND_ROUND_TRIP,
+    EVENT_KIND_INSTRUMENT,
+    EVENT_KIND_CORRECTION,
+    EVENT_KIND_BREAKER_TRIP,
+    EVENT_KIND_COST_BREACH,
+    EVENT_KIND_DRAWDOWN_BREACH,
+})
+
 # 30-day evidence inactivity floor (plan Global Constraint / Task 1 checklist).
 STALE_AFTER = dt.timedelta(days=30)
 
@@ -126,6 +141,10 @@ class EvidenceEvent:
             raise ValueError("strategy_id is required")
         if not self.event_kind:
             raise ValueError("event_kind is required")
+        if self.event_kind not in EVENT_KINDS:
+            raise ValueError(
+                f"event_kind must be one of {sorted(EVENT_KINDS)}, got {self.event_kind!r}"
+            )
         if self.source_timestamp.tzinfo is None:
             raise ValueError("source_timestamp must be timezone-aware")
         if self.event_kind == EVENT_KIND_CORRECTION:

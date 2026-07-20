@@ -376,6 +376,44 @@ def test_correction_event_requires_known_scope(tmp_path):
         )
 
 
+def test_append_rejects_unknown_event_kind(tmp_path):
+    """IMPORTANT fail-closed contract: a typo'd/unsupported event_kind must
+    never be silently accepted then dropped from projection -- that would
+    make safety evidence (e.g. a mistyped "braker_trip") vanish without any
+    error. Reject at construction, which precedes every append() call."""
+    from trader.promotion.evidence_store import EvidenceEvent
+
+    with pytest.raises(ValueError):
+        EvidenceEvent(
+            source_event_id="typo-1",
+            strategy_id=STRATEGY,
+            event_kind="braker_trip",
+            payload={"incident_id": "inc-1"},
+            source_timestamp=NOW,
+        )
+
+
+def test_append_rejects_unknown_event_kind_end_to_end(tmp_path):
+    """End-to-end: an unsupported kind can never make it into the raw table
+    or the derived projection via the real append() path."""
+    from trader.promotion.evidence_store import EvidenceEvent
+
+    store, *_ = _store(tmp_path)
+    with pytest.raises(ValueError):
+        store.append(EvidenceEvent(
+            source_event_id="typo-2",
+            strategy_id=STRATEGY,
+            event_kind="cost_breech",  # typo of cost_breach
+            payload={"metric": "stressed_cost_bps"},
+            source_timestamp=NOW,
+        ))
+
+    rows = store.db.execute("SELECT COUNT(*) FROM promotion_evidence_events", fetch="one")
+    assert rows == (0,)
+    window = store.project(STRATEGY, as_of=NOW)
+    assert window.event_count == 0
+
+
 def test_naive_timestamp_is_rejected(tmp_path):
     from trader.promotion.evidence_store import EvidenceEvent
 

@@ -11,8 +11,12 @@ Contract:
 * Activation onto CANARY_ACTIVE requires authority that exactly matches
   what was recorded at CANARY_AUTHORIZED and is not expired as of "now".
 * Transitions into a "requires clean evidence" stage
-  (PAPER_PASSED/CANARY_AUTHORIZED/CANARY_PASSED) refuse a supplied evidence
-  window that is stale or carries breaker/cost/drawdown evidence.
+  (PAPER_PASSED/CANARY_AUTHORIZED/CANARY_PASSED) MANDATE a strategy-matched,
+  freshly-projected ``EvidenceWindow`` -- omitting it, supplying one for the
+  wrong strategy, supplying a stale (not just-projected) one, or supplying
+  one that carries breaker/cost/drawdown evidence or 30-day inactivity all
+  fail closed. Software completion alone can never mark a paper or live
+  gate passed.
 * Migration 42: strategy_promotion_state (current stage per strategy).
 * Mutation and its domain event commit atomically (via DomainJournal).
 """
@@ -272,6 +276,7 @@ def _authorize(machine, *, authority_ref="auth-1", expiry=None):
         actor="promotion_controller",
         authority_ref=authority_ref,
         authority_expiry=expiry or (NOW + dt.timedelta(days=7)),
+        evidence_window=_clean_window(),
     )
 
 
@@ -298,6 +303,7 @@ def test_canary_authorized_requires_authority_ref_and_expiry(tmp_path):
     with pytest.raises(AuthorityRequiredError):
         machine.transition(
             STRATEGY, CANARY_AUTHORIZED, reason="missing authority", actor="promotion_controller",
+            evidence_window=_clean_window(),
         )
 
 
@@ -374,6 +380,7 @@ def test_canary_suspended_requires_fresh_authorization_not_bare_reset(tmp_path):
         STRATEGY, CANARY_AUTHORIZED, reason="fresh promotion review completed",
         actor="promotion_controller",
         authority_ref="auth-2", authority_expiry=NOW + dt.timedelta(days=7),
+        evidence_window=_clean_window(),
     )
     assert reauthorized.stage == CANARY_AUTHORIZED
     reactivated = machine.transition(
@@ -463,15 +470,99 @@ def test_drawdown_breach_blocks_canary_passed(tmp_path):
     assert "drawdown_breach" in exc_info.value.reasons
 
 
-def test_clean_evidence_gate_is_only_checked_when_window_supplied(tmp_path):
-    """Task 1 does not itself enforce the paper-gate floors (Task 2's job);
-    when no evidence_window is supplied, the machine trusts the caller."""
+def test_missing_evidence_window_blocks_paper_passed(tmp_path):
+    """CRITICAL fail-closed contract: software completion alone (a bare
+    reason/actor with no evidence) can never mark PAPER_PASSED. Omission is
+    treated as a rejection, never trusted."""
+    from trader.promotion.stage import EvidenceNotCleanError, PAPER_COLLECTING, PAPER_PASSED
+
+    machine, *_ = _machine(tmp_path)
+    machine.transition(STRATEGY, PAPER_COLLECTING, reason="bootstrap", actor="system")
+    with pytest.raises(EvidenceNotCleanError) as exc_info:
+        machine.transition(
+            STRATEGY, PAPER_PASSED, reason="caller says floors met, trust me", actor="paper_gate",
+        )
+    assert "missing_evidence_window" in exc_info.value.reasons
+    assert machine.current_stage(STRATEGY) == PAPER_COLLECTING
+
+
+def test_missing_evidence_window_blocks_canary_authorized(tmp_path):
+    from trader.promotion.stage import CANARY_AUTHORIZED, EvidenceNotCleanError, PAPER_COLLECTING, PAPER_PASSED
+
+    machine, *_ = _machine(tmp_path)
+    machine.transition(STRATEGY, PAPER_COLLECTING, reason="bootstrap", actor="system")
+    machine.transition(
+        STRATEGY, PAPER_PASSED, reason="floors met", actor="paper_gate",
+        evidence_window=_clean_window(),
+    )
+    with pytest.raises(EvidenceNotCleanError) as exc_info:
+        machine.transition(
+            STRATEGY, CANARY_AUTHORIZED, reason="prepare canary, trust me", actor="promotion_controller",
+            authority_ref="auth-1", authority_expiry=NOW + dt.timedelta(days=7),
+        )
+    assert "missing_evidence_window" in exc_info.value.reasons
+
+
+def test_missing_evidence_window_blocks_canary_passed(tmp_path):
+    from trader.promotion.stage import CANARY_PASSED, EvidenceNotCleanError
+
+    machine, *_ = _machine(tmp_path)
+    _authorize_and_activate(machine)
+    with pytest.raises(EvidenceNotCleanError) as exc_info:
+        machine.transition(
+            STRATEGY, CANARY_PASSED, reason="live floors met, trust me", actor="live_metrics",
+        )
+    assert "missing_evidence_window" in exc_info.value.reasons
+
+
+def test_evidence_window_for_wrong_strategy_blocks_paper_passed(tmp_path):
+    """A window that's clean but bound to a DIFFERENT strategy_id must never
+    be honored -- that would let one strategy's real evidence rubber-stamp
+    another strategy's gate."""
+    from trader.promotion.stage import EvidenceNotCleanError, PAPER_COLLECTING, PAPER_PASSED
+
+    machine, *_ = _machine(tmp_path)
+    machine.transition(STRATEGY, PAPER_COLLECTING, reason="bootstrap", actor="system")
+    with pytest.raises(EvidenceNotCleanError) as exc_info:
+        machine.transition(
+            STRATEGY, PAPER_PASSED, reason="floors met (wrong strategy's evidence)", actor="paper_gate",
+            evidence_window=_clean_window(strategy_id="some_other_strategy"),
+        )
+    assert "strategy_mismatch" in exc_info.value.reasons
+
+
+def test_stale_projected_window_blocks_paper_passed_even_if_content_is_clean(tmp_path):
+    """A window that is internally "clean" (no breaker/cost/drawdown, not
+    30-day-inactivity-stale relative to ITS OWN as_of) but was projected long
+    before this transition call is not "freshly projected" and must be
+    rejected -- a cached/replayed window from an earlier review cycle cannot
+    authorize today's gate."""
+    from trader.promotion.stage import EvidenceNotCleanError, PAPER_COLLECTING, PAPER_PASSED
+
+    old_as_of = NOW - dt.timedelta(days=10)
+    machine, *_ = _machine(tmp_path)
+    machine.transition(STRATEGY, PAPER_COLLECTING, reason="bootstrap", actor="system")
+    stale_projection = _clean_window(as_of=old_as_of)
+    assert stale_projection.stale is False  # clean relative to its own as_of
+
+    with pytest.raises(EvidenceNotCleanError) as exc_info:
+        machine.transition(
+            STRATEGY, PAPER_PASSED, reason="floors met (stale projection)", actor="paper_gate",
+            evidence_window=stale_projection,
+        )
+    assert "window_not_fresh" in exc_info.value.reasons
+
+
+def test_freshly_projected_clean_window_at_transition_time_passes(tmp_path):
+    """The positive case: a window projected at (or within tolerance of) the
+    transition's own `now` is accepted."""
     from trader.promotion.stage import PAPER_COLLECTING, PAPER_PASSED
 
     machine, *_ = _machine(tmp_path)
     machine.transition(STRATEGY, PAPER_COLLECTING, reason="bootstrap", actor="system")
     record = machine.transition(
-        STRATEGY, PAPER_PASSED, reason="caller already validated floors", actor="paper_gate",
+        STRATEGY, PAPER_PASSED, reason="floors met", actor="paper_gate",
+        evidence_window=_clean_window(as_of=NOW),
     )
     assert record.stage == PAPER_PASSED
 

@@ -168,16 +168,16 @@
       <thead><tr><th>Action</th><th>How</th></tr></thead>
       <tbody>
         <tr>
-          <td><strong>Activate</strong> {{ info('Private keys never enter the browser. Prepare and sign offline with the CLI, then paste the signed JSON here.') }}</td>
-          <td>Offline prepare → sign → paste/upload JSON + reason → Activate</td>
+          <td><strong>Activate allocation</strong> {{ info('Live capital path. Private keys never enter the browser.') }}</td>
+          <td>Offline prepare → sign → paste/upload JSON + reason → Activate. Skip on paper — use Paper automation instead.</td>
         </tr>
         <tr>
           <td><strong>Suspend</strong></td>
-          <td>Reason → Suspend (immediate, risk-reducing)</td>
+          <td>Reason → Suspend (immediate, risk-reducing). Enabled only when an authority is active/authorized.</td>
         </tr>
         <tr>
-          <td><strong>Paper automation</strong> {{ info('Paper only. Writes keys/artifact/YAML and hot-arms trader + strategy IntentEmitter without restart when Activate succeeds. Needs command authority.') }}</td>
-          <td>Select strategy + reason → Activate paper automation (preflight) → restart services. Deactivate clears enablement.</td>
+          <td><strong>Paper automation</strong> {{ info('Paper only. Needs command_authority.enabled=true. Hot-arms without restart when Activate succeeds.') }}</td>
+          <td>Enable <code>command_authority</code> in <code>~/.config/mmr/trader.yaml</code> → restart trader → Scaling checklist green → select strategy + reason → Activate. Deactivate only when armed.</td>
         </tr>
       </tbody>
     </table>

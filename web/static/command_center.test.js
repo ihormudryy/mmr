@@ -46,7 +46,10 @@ function makeContext() {
     } },
     getElementById: getElement,
     querySelector: () => element(),
-    querySelectorAll: () => [],
+    querySelectorAll: (sel) => {
+      if (sel === '[data-proposal-filter]') return [];
+      return [];
+    },
     addEventListener() {},
     createElement: () => element(),
   };

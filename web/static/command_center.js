@@ -581,16 +581,20 @@ function renderScaling() {
   const suspendBtn = document.getElementById('scaling-suspend');
   if (suspendBtn) {
     const gross = Number(scaling.max_gross_allocation);
-    suspendBtn.disabled = !(
+    const canSuspend = (
       (lifecycle === 'active' || lifecycle === 'authorized')
       && Number.isFinite(gross) && gross > 0
     );
+    suspendBtn.disabled = !canSuspend;
+    suspendBtn.title = canSuspend
+      ? ''
+      : 'Suspend needs an active/authorized allocation with a positive ceiling';
   }
 
   const body = document.getElementById('scaling-authorities-body');
   const rows = scaling.authorities || [];
   if (!rows.length) {
-    body.innerHTML = '<tr><td colspan="6" class="dim">No allocation authority rows yet</td></tr>';
+    body.innerHTML = '<tr><td colspan="6" class="dim">No allocation authority rows yet — paste a signed attestation above for live capital, or use Paper automation below for paper.</td></tr>';
     return;
   }
   body.innerHTML = rows.slice().sort((a, b) =>
@@ -605,6 +609,12 @@ function renderScaling() {
       <td class="num">${esc(row.entity_revision ?? '—')}</td>
     </tr>`;
   }).join('');
+}
+
+function _checklistItem(state, label, detail) {
+  const mark = state === 'ok' ? '✓' : (state === 'wait' ? '…' : '✗');
+  return `<li data-state="${esc(state)}"><span class="mark" aria-hidden="true">${mark}</span>`
+    + `<span><strong>${esc(label)}</strong> — ${detail}</span></li>`;
 }
 
 function renderPaperAutomation() {
@@ -624,12 +634,20 @@ function renderPaperAutomation() {
   restartBanner.hidden = !showRestart;
   partialBanner.hidden = !showPartial;
 
+  const dashboardMode = ccDashboardAccountMode();
   const paperOk = ccPaperAutomationAllowed();
+  const statusKnown = pa != null;
+  const caReady = !!(pa && pa.command_authority_ready === true);
+
   let message = 'Waiting for paper automation status…';
-  if (!paperOk) {
+  if (dashboardMode == null) {
+    message = 'Waiting for account mode from the live snapshot…';
+  } else if (!paperOk) {
     message = 'Paper automation is only available on paper accounts';
-  } else if (pa == null) {
-    message = 'Paper automation status unavailable';
+  } else if (!statusKnown) {
+    message = 'Paper automation status unavailable — usually means '
+      + 'command_authority.enabled is false (or trader query is down). '
+      + 'Set it in ~/.config/mmr/trader.yaml and restart trader.';
   } else if (pa.last_error) {
     message = pa.last_error;
   } else if (showPartial) {
@@ -641,7 +659,9 @@ function renderPaperAutomation() {
   } else if (lifecycle === 'preparing') {
     message = 'Paper automation activation in progress…';
   } else if (lifecycle === 'disabled') {
-    message = 'Paper automation is disabled';
+    message = caReady
+      ? 'Paper automation is disabled — select a strategy, enter a reason, then Activate.'
+      : 'Paper automation is disabled — enable command_authority first (see checklist).';
   } else if (lifecycle === 'armed') {
     message = 'Paper automation is armed (hot-arm active)';
   } else if (lifecycle === 'degraded') {
@@ -652,10 +672,11 @@ function renderPaperAutomation() {
   document.getElementById('paper-auto-strategy-value').textContent =
     (pa && pa.strategy_name) || '—';
   document.getElementById('paper-auto-account-mode').textContent =
-    (pa && pa.account_mode) ? String(pa.account_mode).toUpperCase() : '—';
-  const caReady = pa && pa.command_authority_ready === true;
+    (pa && pa.account_mode)
+      ? String(pa.account_mode).toUpperCase()
+      : (dashboardMode ? String(dashboardMode).toUpperCase() : '—');
   document.getElementById('paper-auto-ca-ready').textContent =
-    pa == null ? '—' : (caReady ? 'ready' : 'not ready');
+    !statusKnown ? 'unknown' : (caReady ? 'ready' : 'not ready');
   document.getElementById('paper-auto-last-activated').textContent =
     (pa && pa.last_activated_at) ? String(pa.last_activated_at) : '—';
 
@@ -677,18 +698,83 @@ function renderPaperAutomation() {
     }
   }
 
-  const controls = document.getElementById('paper-auto-controls');
-  if (controls) {
-    controls.hidden = !paperOk;
+  const strategySelected = !!(select && select.value);
+  const reasonEl = document.getElementById('paper-auto-reason');
+  const reasonFilled = !!(reasonEl && (reasonEl.value || '').trim());
+
+  const checklist = document.getElementById('paper-auto-checklist');
+  if (checklist) {
+    const items = [];
+    if (dashboardMode == null) {
+      items.push(_checklistItem('wait', 'Paper account',
+        'Waiting for broker account mode in the snapshot.'));
+    } else if (paperOk) {
+      items.push(_checklistItem('ok', 'Paper account',
+        `Mode is ${esc(String(dashboardMode).toUpperCase())}.`));
+    } else {
+      items.push(_checklistItem('blocked', 'Paper account',
+        `Mode is ${esc(String(dashboardMode).toUpperCase())} — Activate is paper-only.`));
+    }
+    if (!statusKnown) {
+      items.push(_checklistItem('blocked', 'Trader status',
+        'No <code>get_paper_automation_status</code> response. Enable '
+        + '<code>command_authority.enabled: true</code> in '
+        + '<code>~/.config/mmr/trader.yaml</code> (keep '
+        + '<code>live_enabled: false</code>), then restart trader.'));
+    } else {
+      items.push(_checklistItem('ok', 'Trader status',
+        `Lifecycle <code>${esc(lifecycle)}</code>.`));
+    }
+    if (!statusKnown) {
+      items.push(_checklistItem('blocked', 'Command authority',
+        'Unknown until trader serves status — usually still disabled.'));
+    } else if (caReady) {
+      items.push(_checklistItem('ok', 'Command authority',
+        'Ready — approve / automation dispatch is wired.'));
+    } else {
+      items.push(_checklistItem('blocked', 'Command authority',
+        'Not ready. Set <code>command_authority.enabled: true</code> and '
+        + '<code>live_enabled: false</code>, restart trader. See '
+        + '<code>docs/PAPER_AUTOMATION_SETUP.md</code>.'));
+    }
+    if (strategySelected) {
+      items.push(_checklistItem('ok', 'Strategy selected',
+        `Using <code>${esc(select.value)}</code>.`));
+    } else {
+      items.push(_checklistItem('wait', 'Strategy selected',
+        'Pick the one strategy to arm (must not use propose while automated).'));
+    }
+    if (reasonFilled) {
+      items.push(_checklistItem('ok', 'Reason', 'Operator reason entered.'));
+    } else {
+      items.push(_checklistItem('wait', 'Reason',
+        'Enter a short reason before Activate / Deactivate.'));
+    }
+    checklist.innerHTML = items.join('');
   }
 
+  // Keep controls visible so operators can always see why buttons are locked.
+  const controls = document.getElementById('paper-auto-controls');
+  if (controls) controls.hidden = false;
+
+  const canActivate = paperOk && statusKnown && caReady
+      && strategySelected && reasonFilled;
   const activateBtn = document.getElementById('paper-auto-activate');
   if (activateBtn) {
-    activateBtn.disabled = !paperOk || !caReady;
-    activateBtn.title = !paperOk
-      ? 'Paper automation is only available on paper accounts'
-      : (caReady ? ''
-        : 'Command authority must be enabled before Activate');
+    activateBtn.disabled = !canActivate;
+    if (!paperOk) {
+      activateBtn.title = 'Paper automation is only available on paper accounts';
+    } else if (!statusKnown) {
+      activateBtn.title = 'Enable command_authority.enabled in trader.yaml and restart trader';
+    } else if (!caReady) {
+      activateBtn.title = 'Command authority must be enabled before Activate';
+    } else if (!strategySelected) {
+      activateBtn.title = 'Select a strategy first';
+    } else if (!reasonFilled) {
+      activateBtn.title = 'Enter a reason first';
+    } else {
+      activateBtn.title = '';
+    }
   }
   const deactivateBtn = document.getElementById('paper-auto-deactivate');
   if (deactivateBtn) {
@@ -696,10 +782,19 @@ function renderPaperAutomation() {
         || lifecycle === 'armed'
         || lifecycle === 'armed_unpersisted'
         || lifecycle === 'degraded';
-    deactivateBtn.disabled = !paperOk || !enabledLifecycle;
-    deactivateBtn.title = !paperOk
-      ? 'Paper automation is only available on paper accounts'
-      : '';
+    const canDeactivate = paperOk && statusKnown && enabledLifecycle && reasonFilled;
+    deactivateBtn.disabled = !canDeactivate;
+    if (!paperOk) {
+      deactivateBtn.title = 'Paper automation is only available on paper accounts';
+    } else if (!statusKnown) {
+      deactivateBtn.title = 'Status unavailable — nothing to deactivate safely';
+    } else if (!enabledLifecycle) {
+      deactivateBtn.title = `Nothing armed to deactivate (lifecycle=${lifecycle})`;
+    } else if (!reasonFilled) {
+      deactivateBtn.title = 'Enter a reason first';
+    } else {
+      deactivateBtn.title = '';
+    }
   }
 }
 
@@ -1976,6 +2071,14 @@ if (CFG.commandsEnabled) {
     deactivateBtn.addEventListener('click', () => {
       ccDeactivatePaperAutomation();
     });
+  }
+  const strategySelect = document.getElementById('paper-auto-strategy');
+  const reasonInput = document.getElementById('paper-auto-reason');
+  if (strategySelect) {
+    strategySelect.addEventListener('change', () => renderPaperAutomation());
+  }
+  if (reasonInput) {
+    reasonInput.addEventListener('input', () => renderPaperAutomation());
   }
 }
 

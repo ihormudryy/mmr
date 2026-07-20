@@ -696,6 +696,48 @@
       padding: 0 var(--space-4) var(--space-3);
       line-height: 1.5;
     }
+    #dash-scaling .scaling-checklist {
+      list-style: none;
+      margin: 0 var(--space-4) var(--space-3);
+      padding: 0;
+      max-width: 720px;
+      display: grid;
+      gap: 6px;
+    }
+    #dash-scaling .scaling-checklist li {
+      display: flex;
+      gap: 8px;
+      align-items: flex-start;
+      font-size: 12.5px;
+      line-height: 1.45;
+      padding: 8px 10px;
+      border-radius: var(--radius);
+      border: 1px solid var(--border);
+      background: rgba(255,255,255,.02);
+    }
+    #dash-scaling .scaling-checklist li[data-state="ok"] {
+      border-color: color-mix(in srgb, var(--pos, #3fb950) 45%, transparent);
+    }
+    #dash-scaling .scaling-checklist li[data-state="blocked"] {
+      border-color: color-mix(in srgb, var(--neg, #f85149) 45%, transparent);
+    }
+    #dash-scaling .scaling-checklist li[data-state="wait"] {
+      border-color: color-mix(in srgb, #d29922 45%, transparent);
+    }
+    #dash-scaling .scaling-checklist .mark {
+      flex: 0 0 auto;
+      font-weight: 700;
+      min-width: 1.1rem;
+    }
+    #dash-scaling .scaling-checklist li[data-state="ok"] .mark { color: var(--pos, #3fb950); }
+    #dash-scaling .scaling-checklist li[data-state="blocked"] .mark { color: var(--neg, #f85149); }
+    #dash-scaling .scaling-checklist li[data-state="wait"] .mark { color: #d29922; }
+    #dash-scaling .scaling-checklist code {
+      font-size: .92em;
+      padding: .05em .3em;
+      border-radius: 3px;
+      background: rgba(255,255,255,.06);
+    }
     #dash-scaling .scaling-controls {
       margin: var(--space-3) var(--space-4) var(--space-4);
       padding: var(--space-3);
@@ -1251,10 +1293,12 @@
           <span id="scaling-lifecycle" class="scaling-status" data-lifecycle="unknown">unknown</span>
         </h2>
         <p id="scaling-message" class="scaling-note">Waiting for authoritative allocation events…</p>
-        <p class="scaling-note">Prepare and sign offline with
-          <code>mmr research allocation prepare/sign</code>, then paste the
-          signed attestation JSON below to activate. Private keys never enter
-          this browser. Suspend is risk-reducing and immediate.</p>
+        <p class="scaling-note"><strong>Live capital path.</strong> Prepare and
+          sign offline with <code>mmr research allocation prepare/sign</code>,
+          then paste the signed attestation JSON below. Private keys never
+          enter this browser. Suspend is risk-reducing and immediate.
+          <strong>Paper unattended trading</strong> uses
+          <em>Paper automation</em> below — not this attestation form.</p>
         <div class="scaling-cards" aria-label="Current allocation summary">
           <div class="scaling-card"><div class="label">Stage</div>
             <div id="scaling-stage" class="value">—</div></div>
@@ -1310,9 +1354,10 @@
         <p id="paper-auto-banner-partial" class="paper-auto-banner" hidden
            role="status">Activation partially succeeded — click Activate again to complete.</p>
         <p id="paper-auto-message" class="scaling-note">Waiting for paper automation status…</p>
-        <p class="scaling-note">Writes keys, fixture artifact, and YAML for one paper
-          strategy, then hot-arms trader + strategy in-process. Requires command
-          authority. Private keys never enter this browser.</p>
+        <p class="scaling-note">Paper only. One strategy: writes keys/artifact/YAML
+          on the host, then hot-arms trader + strategy in-process. Private keys
+          never enter this browser. Activate stays disabled until the checklist
+          below is green.</p>
         <div class="scaling-cards" aria-label="Paper automation summary">
           <div class="scaling-card"><div class="label">Strategy</div>
             <div id="paper-auto-strategy-value" class="value">—</div></div>
@@ -1323,6 +1368,8 @@
           <div class="scaling-card"><div class="label">Last activated</div>
             <div id="paper-auto-last-activated" class="value">—</div></div>
         </div>
+        <ul id="paper-auto-checklist" class="scaling-checklist"
+            aria-label="Paper automation readiness"></ul>
         {% if commands_enabled %}
         <div class="scaling-controls" id="paper-auto-controls"
              aria-label="Paper automation operator controls">
@@ -1338,9 +1385,13 @@
           </label>
           <div class="btn-row">
             <button type="button" id="paper-auto-activate" class="btn primary"
-                    data-cc-command="activate_paper_automation">Activate paper automation</button>
+                    data-cc-command="activate_paper_automation"
+                    disabled
+                    title="Waiting for readiness checklist">Activate paper automation</button>
             <button type="button" id="paper-auto-deactivate" class="btn reject"
-                    data-cc-command="deactivate_paper_automation">Deactivate</button>
+                    data-cc-command="deactivate_paper_automation"
+                    disabled
+                    title="Nothing armed to deactivate yet">Deactivate</button>
           </div>
         </div>
         {% endif %}

@@ -15,51 +15,58 @@ MMR (Make Me Rich) is a Python-based algorithmic trading platform for Interactiv
 
 **Fail loudly, not silently**: When an IB API call fails (scanner error 162, market data not subscribed, contract not found), surface the error to the caller. Don't swallow exceptions and return empty results — the user needs to know *why* something failed so they can fix it (subscribe to market data, use a different location code, etc.).
 
-**Massive first, IB fallback**: For US markets, Massive.com (Polygon.io) is the primary data source — it's fast (~4s for a full scan), has server-side indicators, and doesn't require trader_service. For international markets (ASX, TSE, SEHK, etc.), fall back to IB's APIs (scanner, snapshots, reqHistoricalData). Don't use Yahoo Finance.
+**Massive first, IB fallback**: For US markets, Massive.com (Polygon.io) is the primary data source for ideas/movers when the plan includes snapshots (Starter+). TwelveData is the default for cheap US history/quotes (`default_data_source: twelvedata`). International markets (ASX, TSE, SEHK, etc.) use IB. Don't use Yahoo Finance. Bare `ideas` / `movers` always default to Massive (they do **not** inherit `default_data_source`); if Massive snapshots aren't entitled (Stocks Basic), the scanner falls back to TwelveData quotes on a small liquid US set (or `--tickers` / `--universe`).
 
 **No sentiment analysis on IB path**: IB's news API doesn't provide sentiment scoring. On the Massive path, sentiment comes from Polygon's insights. On the IB path, we only show the headline — no fake or estimated sentiment.
 
 ## Architecture
 
+Production Docker runs **split services** (not one monolithic process). The CLI and dashboard talk to trader/strategy over **typed HMAC RPC**; legacy dill RPC on 42001 is unbound unless offline simulation explicitly enables it.
+
 ```
 trader.trader_service ──► Trader (trading_runtime.py)
                            ├── IBAIORx (ibreactive.py) ──► IB Gateway (ib_async)
                            ├── TradeExecutioner, BookSubject, Portfolio
-                           ├── ZMQ RPC Server (port 42001)
-                           ├── ZMQ PubSub Publisher (port 42002)
-                           └── ZMQ MessageBus (port 42006)
+                           ├── Typed RPC query/command (42101 / 42102)  ← production CLI/dashboard
+                           ├── Typed feed (42103, internal)
+                           ├── ZMQ PubSub Publisher (42002)
+                           ├── ZMQ MessageBus (42006)
+                           └── Legacy dill RPC (42001) — offline simulation only
 
 trader.strategy_service ──► StrategyRuntime (strategy_runtime.py)
                               ├── Loads strategies from strategy_runtime.yaml
-                              ├── Reconciliation loop (30s) — picks up new strategies + portfolio changes
-                              ├── ZMQ RPC Client → trader_service
+                              ├── Reconciliation loop (30s)
+                              ├── Typed trader gateway (resolve/publish via 42101)
+                              ├── Typed strategy control (42104 command / 42105 query)
                               ├── ZMQ PubSub Subscriber ← tickers
-                              └── ZMQ RPC Server (port 42005)
+                              └── Legacy strategy RPC (42005) — optional/compat
 
 trader.data_service ──► DataService (data_service.py)
-                          ├── Concurrent history downloads (asyncio + to_thread)
-                          ├── MassiveHistoryWorker, IBHistoryWorker
-                          └── ZMQ RPC Server (port 42003)
+                          ├── Concurrent history downloads
+                          ├── MassiveHistoryWorker, TwelveDataHistoryWorker, IBHistoryWorker
+                          └── ZMQ RPC Server (42003)
 
-trader.mmr_cli ──► ZMQ RPC Client → trader_service / strategy_service
-pycron/pycron.py ──► Process manager for all services
+web/app.py (dashboard) ──► typed query/command + strategy typed ports
+trader.mmr_cli / sdk.py ──► typed RPC (reads + propose/approve); legacy only for offline direct orders
+scheduler (pycron) ──► cron jobs only (data refresh, backups) — not the process supervisor for split services
 ```
 
 ### Key Patterns
 
 **Dependency injection**: `Container.resolve(Type)` introspects `__init__` parameter names, matches them against env vars (uppercased) then config YAML values, and constructs the instance. Constructor param names must match config keys. Missing required params raise `ContainerResolutionError` naming the param (not a cryptic `TypeError`). Env vars are coerced to the annotated type (`int`/`float`/`bool`); malformed values raise with the offending var + value. Singleton init and the type-instance cache are thread-safe, and circular dependencies during `resolve()` are detected and raised as `ContainerResolutionError`. YAML config is loaded with `yaml.safe_load` — `!!python/object` tags are refused.
 
-**Messaging (pyzmq)**: All inter-process communication uses ZeroMQ (not HTTP). This was chosen over HTTP/REST for lower latency (important for trading), native support for pub/sub patterns, and no web framework dependency. Three socket patterns in `trader/messaging/clientserver.py`, each serving a distinct communication need:
+**Messaging (pyzmq)**: Inter-process communication uses ZeroMQ (not HTTP) for latency and pub/sub. Two layers:
 
-- **RPC** (ports 42001, 42003, 42005): DEALER/ROUTER sockets with msgpack serialization. Synchronous request/reply — a client calls a method name with arguments and blocks for the result. Used by the CLI to call `trader_service` methods (place trades, query portfolio, etc.) and by `strategy_service` to submit orders to `trader_service`. Methods are marked with the `@rpcmethod` decorator on the service API classes (`trader_service_api.py`, `strategy_service_api.py`). The `RPCClient[T]` generic uses `__getattr__` chaining so calls look like `client.rpc().place_order(...)` — the method name is serialized as a string and dispatched on the server side. Server-side exceptions are reconstructed on the client: stdlib types (`ValueError`, `ConnectionError`, `TimeoutError`, etc.) are preserved; custom types can be registered via `RPCClient(error_table=...)`; unknown types surface as `RPCError` carrying the original `exc_type` and `exc_args` so callers can still inspect them. Timeouts include the method name in the message.
+**Typed HMAC RPC (production)** — JSON-safe request/reply on ROUTER sockets with HMAC service authentication (`trader/messaging/typed_rpc.py`). Trader query **42101**, command **42102**, feed **42103**; strategy command **42104**, query **42105**. The CLI/SDK and dashboard use this path for portfolio, resolve, propose/approve, strategies list/enable/disable/reload, snapshots, etc. Direct `buy`/`sell`/`cancel`/`set_risk_limits` are **not** registered on the production command surface (BYPASS methods) — use `propose` → `approve` or the dashboard command center; offline simulation can bind legacy dill RPC with `unsafe_legacy_rpc: true` + `--simulation True`.
 
-- **PubSub** (port 42002): ZMQ PUB/SUB sockets for one-way broadcast of live ticker data. `trader_service` publishes; `strategy_service`, CLI, and TUI subscribe. Uses ZMQ's native topic filtering at the socket level — the publisher doesn't track subscribers and subscribers filter by topic prefix. This is the most efficient pattern for "blast market data to everyone" since there's no per-client routing overhead. Implemented as `MultithreadedTopicPubSub` which runs the PUB socket on a dedicated thread with an async queue for thread-safe writes from the main event loop.
+**Legacy dill RPC** (`trader/messaging/clientserver.py`) — DEALER/ROUTER + msgpack (including dill ExtType). Ports **42001** (trader), **42003** (data), **42005** (strategy). Unbound for trader in split-container production. Still used by data_service and some IB-only tools (scanner, options resolve) when available.
 
-- **MessageBus** (port 42006): DEALER/ROUTER sockets with explicit subscription tracking and topic-based routing. Unlike PubSub, the server knows who is subscribed to which topics and routes messages only to matching clients. Used for strategy signals — a strategy publishes a signal to a topic, and only clients subscribed to that topic receive it. This enables targeted communication between specific services rather than broadcast. The server maintains a `clients: Dict[(client_id, topic), bool]` registry and forwards messages accordingly.
+Additional patterns:
 
-The reason PubSub and MessageBus are separate (despite overlap) is efficiency: ZMQ's native PUB/SUB does topic filtering in the kernel/socket layer with zero server-side bookkeeping, which is ideal for high-frequency ticker data. The MessageBus trades that efficiency for per-client routing control, which strategy signals need but tickers don't.
+- **PubSub** (port 42002): ZMQ PUB/SUB for live ticker broadcast. `MultithreadedTopicPubSub` runs PUB on a dedicated thread.
+- **MessageBus** (port 42006): DEALER/ROUTER with per-client topic routing for strategy signals.
 
-**Serialization**: All ZMQ messages use msgpack with custom ExtType handlers for datetime, date, time, timedelta, pandas DataFrames (via PyArrow IPC), and a dill fallback for arbitrary Python objects. Defined in `clientserver.py` (`ext_pack`/`ext_unpack`). Because `dill.loads` can execute arbitrary code, the fallback is policy-gated: set `MMR_DILL_STRICT=1` in the environment to refuse all `EXT_OBJECT` payloads, or call `set_dill_whitelist([Type1, Type2, ...])` to allow only specific classes.
+**Serialization**: Legacy ZMQ messages use msgpack with ExtType handlers for datetime/date/time/timedelta, pandas DataFrames (PyArrow IPC), and a dill fallback for arbitrary objects. Because `dill.loads` can execute code, set `MMR_DILL_STRICT=1` to refuse `EXT_OBJECT`, or `set_dill_whitelist([...])`. Typed RPC uses JSON-safe pydantic models — no dill on the production surface.
 
 **Storage (DuckDB)**: `trader/data/duckdb_store.py` wraps every query in a short-lived connection held under a per-database lock (`execute_atomic` opens, runs, closes atomically; `execute(query, params, fetch='all'|'one'|'df'|'none')` is the common-case wrapper). This lets multiple services share the same database file without leaking connections or tearing rows across concurrent writers. Two tables: `tick_data` (time-series OHLCV) and `object_store` (dill-serialized blobs). The OHLCV `write()` upsert filters its DELETE by `bar_size` as well as `symbol + date range` — without that filter a wide 1-min write (potentially expanded by `write_resolve_overlap` merging in years of pre-existing rows) would clobber every daily bar for the same conid in that range. The DuckDB live file lives in a named volume (`mmr_db_data`) rather than a host bind mount — on macOS Docker Desktop, VirtioFS has quirky mmap/fsync semantics for write-heavy single-file DBs. Use `./docker.sh -B [name]` to snapshot DB files out to the host bind-mount backup dir.
 
@@ -101,7 +108,7 @@ The reason PubSub and MessageBus are separate (despite overlap) is efficiency: Z
 
 **PnL subscription race**: `__subscribe_pnl` registers `(account, conId)` under `_pnl_subscriptions_lock` using first-claim-wins semantics. If the actual `subscribe_single_pnl` call fails, the registry entry is backed out so a retry can re-attempt. Portfolio updates fired from IB-eventkit threads are routed onto the main loop via `run_coroutine_threadsafe` (the main loop is captured in `connected_event`), so disk I/O during a universe update doesn't block the IB callback thread.
 
-**Idea scanner**: Raises `IdeaScannerError` (not an empty DataFrame) when the IB scanner returns no results or when every supplied ticker fails to resolve. This follows the "fail loudly" principle so callers can distinguish "API failure" from "zero matches". Batch operations (`get_snapshots_batch`, historical bar fetches) run via `asyncio.gather` / `ThreadPoolExecutor(max_workers=8)`, not sequential `for` loops — a 50-symbol ASX scan goes from ~200s sequential to ~15-20s parallel. The remaining cost is IB's own historical-data pacing (~6 concurrent requests, ~2s spacing), which is why the cron-driven `data refresh` exists — it keeps the local DuckDB warm so scans never hit IB historical on the hot path.
+**Idea scanner**: Raises `IdeaScannerError` (not an empty DataFrame) on IB discovery failure or when every ticker fails to resolve. Massive movers/snapshots require Stocks Starter+; TwelveData `/market_movers` requires Pro+. Entitlement errors fall back to TwelveData quote scans (liquid US set or `--tickers`/`--universe`) with a yellow CLI notice. Batch IB ops use `asyncio.gather` / `ThreadPoolExecutor` — keep DuckDB warm via `data refresh` so IB historical isn't on the hot path.
 
 **Data refresh loop** (`trader/mmr_cli.py:_handle_data_refresh` + `config_defaults/data_refresh.yaml`): Declarative jobs `{universe, source?, bar_size, days, force?}` keep universes' OHLCV current in the local DuckDB. Pycron owns the schedule (`data_refresh_us` and `data_refresh_asx` cron entries in `pycron.yaml`); the YAML owns *what* to fetch. Source auto-detects from the universe's dominant exchange when omitted (US → twelvedata; else IB). Incremental by default — only missing date ranges are fetched — so a daily cron run costs ~seconds for fresh windows. `mmr data status` shows per-(job, bar_size) coverage and stale-days, color-coded; `mmr data refresh JOB [JOB ...]` runs jobs ad-hoc. Failures in one job are isolated (per-job result, batch keeps going) and don't take down the cron entry.
 
@@ -231,43 +238,53 @@ mmr/
 
 ## Docker Setup
 
-Two-container model via docker-compose:
-- **ib-gateway**: `ghcr.io/gnzsnz/ib-gateway:latest` — runs IB Gateway. Configured via `.env` file. `scripts/ib-gateway-run.sh` is bind-mounted in to patch the upstream's broken `inst_jre.cfg` (it records a build-time `/tmp/setup/<pid>.dir/jre` path that doesn't exist at runtime, so install4j can't find Java on first launch).
-- **mmr**: Built from `python:3.12-slim-bookworm` base. Connects to ib-gateway via Docker DNS. Access via `docker exec`. The entrypoint auto-launches services via `start_mmr.sh` — interactive exec-ins (`docker exec -it bash`) do NOT re-launch (the `.bash_profile` only sets env), so they won't collide on ZMQ ports / IB client id. Container resource limits: 24 GB mem / 24 GB swap (sized for in-place DuckDB CHECKPOINT compaction on bloated DBs).
+Split-compose topology (`docker-compose.yml`) — each process is its own container (`read_only: true`, baked image):
 
-IB Gateway ports: 4003 (live), 4004 (paper), mapped to host as 4001/4002.
+- **ib-gateway**: `ghcr.io/gnzsnz/ib-gateway:latest` — IB Gateway. Credentials in `.env`. `scripts/ib-gateway-run.sh` patches upstream `inst_jre.cfg`.
+- **trader**: `python -m trader.trader_service` — typed ports 42101/42102 published to host loopback; owns DuckDB volume.
+- **strategy**: `python -m trader.strategy_service` — typed control 42104/42105; dials trader typed + PubSub.
+- **data**: `python -m trader.data_service` — history downloads (42003).
+- **dashboard**: FastAPI web UI + command center (host port published).
+- **scheduler**: pycron for one-shot cron only (data refresh, backups) — not a multi-service supervisor.
+
+Do **not** run the legacy monolithic `start_mmr.sh` inside split containers (it collides on ports/client ids). Local non-Docker still uses `./start_mmr.sh`. Code changes require `./docker.sh -b -u` (sync `-s` is retired — images are immutable).
+
+IB Gateway API ports map to host `7496` (live) / `7497` (paper); VNC at `5901`.
 
 Storage layout (host paths):
-- `~/.local/share/mmr/logs/` — bind mount; tail-able from the host
-- `~/.local/share/mmr/tws_settings/` — bind mount; IB session state
-- `~/.local/share/mmr/backups/` — bind mount; `docker.sh -B` writes here
-- DuckDB files (`mmr.duckdb`, `mmr_history.duckdb`) live in the **`mmr_db_data` named volume** (not bind-mounted) — native ext4 is faster + safer than VirtioFS for write-heavy single-file DBs. Snapshot to host with `./docker.sh -B [name]`.
+- `~/.local/share/mmr/logs/` — bind mount
+- `~/.local/share/mmr/tws_settings/` — IB session state
+- `~/.local/share/mmr/backups/` — `docker.sh -B` / `mmr data backup`
+- `~/.local/share/mmr/artifacts/` — signed paper-automation bundles (ro in trader/strategy)
+- DuckDB (`mmr.duckdb`, `mmr_history.duckdb`) in named volume **`mmr_db_data`**
 
 ## Build & Run
 
 ```bash
 # Docker (first-time prompts for IB credentials, writes .env)
-./docker.sh -g              # Build + start + exec in
-./docker.sh -b              # Build image only
+./docker.sh -g              # Build + start + shell into trader
+./docker.sh -b              # Build shared image
 ./docker.sh -u              # Start containers
 ./docker.sh -d              # Stop containers
-./docker.sh -s              # Sync code to running container
-./docker.sh -e              # Exec into container
+./docker.sh -e              # Shell into trader (default)
+./docker.sh -e dashboard    # Shell into another split service
 ./docker.sh -l              # Tail logs
-./docker.sh -c              # Clean all images/volumes
-./docker.sh -B              # Backup DuckDB files (auto-timestamped subdir)
+./docker.sh -c              # Clean images/volumes
+./docker.sh -B              # Backup DuckDB (auto-timestamped)
 ./docker.sh -B before_run   # Backup with a custom name
+# After code changes: ./docker.sh -b -u  (images are read-only; -s sync is retired)
 
-# Inside container (or non-Docker)
-./start_mmr.sh              # Start tmux session with all services
-./start_mmr.sh --paper      # Paper trading mode
-./start_mmr.sh --no-tmux    # Run pycron directly
+# Local non-Docker
+./start_mmr.sh --setup      # Wizard: IB + API keys
+./start_mmr.sh              # tmux + services
+./start_mmr.sh --paper
+./start_mmr.sh --no-tmux
 
-# Individual services
+# Individual services (local)
 python3 -m trader.trader_service
 python3 -m trader.strategy_service
-python3 -m trader.data_service   # Persistent data download RPC server
-python3 -m trader.mmr_cli    # Interactive REPL
+python3 -m trader.data_service
+python3 -m trader.mmr_cli
 ```
 
 ## Package Installation
@@ -292,11 +309,9 @@ resolve AMD                  # Resolve symbol to conId/universe
 resolve EURUSD --sectype CASH # Resolve forex pair via IB (IDEALPRO)
 portfolio                    # Current portfolio
 orders                       # Open orders
-buy AMD --market --amount 100.0
-buy EUR --sectype CASH --market --quantity 20000  # Forex buy
-sell AMD --market --quantity 10
-sell EUR --sectype CASH --market --quantity 20000  # Forex sell
-cancel 123                   # Cancel order by ID
+buy AMD --market --amount 100.0            # offline-simulation legacy only in split Docker
+sell AMD --market --quantity 10            # prefer: propose → approve
+cancel 123
 cancel-all                   # Cancel all orders
 close 1                      # Close position by row number
 strategies                   # List strategies
@@ -437,22 +452,33 @@ forex convert EUR USD 1000                   # Currency conversion (Massive only
 
 ## Ideas Scanner Architecture
 
-The ideas scanner has two backends that share scoring/filtering logic:
+Three backends share scoring/filtering:
 
 ```
-ideas momentum                                  → IdeaScanner (Massive.com, US only, ~4s)
-ideas momentum --location STK.AU.ASX --tickers   → IBIdeaScanner (IB API, international, ~30-90s)
+ideas momentum                                  → IdeaScanner (Massive, US, ~4s) — needs Stocks Starter+
+ideas --source twelvedata --tickers …           → TwelveDataIdeaScanner (quotes + local indicators)
+ideas momentum --location STK.AU.ASX --tickers  → IBIdeaScanner (IB, international, ~30-90s)
 ```
+
+Bare `ideas` defaults to Massive. On Massive `NOT_AUTHORIZED` (Stocks Basic) or TwelveData movers 403 (non-Pro), the SDK falls back to TwelveData quotes on a small liquid US set (or your `--tickers`/`--universe`) and prints a yellow notice.
 
 ### IdeaScanner (Massive path — default)
 
 ```
-Massive movers API  →  snapshots  →  filter  →  Massive indicator API (parallel)  →  score  →  rank
+Massive movers / snapshot_all  →  filter  →  Massive indicator API (parallel)  →  score  →  rank
 ```
 
-- Fast (~4s for full scan) — server-side indicators, batch snapshots
-- US markets only (Polygon.io coverage)
-- Fundamentals from `list_financials_ratios`, news from `list_ticker_news` with sentiment
+- Fast (~4s) when entitled — server-side indicators, batch snapshots
+- US only; fundamentals + news with sentiment when plan allows
+
+### TwelveDataIdeaScanner (`--source twelvedata`)
+
+```
+movers (Pro+) or batch /quote  →  filter  →  time_series + local RSI/EMA/SMA  →  score  →  rank
+```
+
+- Quotes work on Basic/Starter; `/market_movers` needs Pro+
+- No news endpoint — `--news` is a no-op on this path
 
 ### IBIdeaScanner (IB path — `--location`)
 
@@ -468,7 +494,7 @@ IB scanner / resolve_contract  →  get_snapshot (sequential)  →  reqHistorica
 - Fundamentals from `reqFundamentalData` (ReportSnapshot XML), news from `reqHistoricalNews` (no sentiment)
 - IB news headlines include metadata prefixes like `{A:800015:L:en}...` which are stripped before display
 
-### Shared module-level functions (used by both scanners)
+### Shared module-level functions (used by Massive, TwelveData, and IB scanners)
 
 - `PRESETS` dict, `ScanFilter`/`ScanPreset` dataclasses
 - Scoring functions: `_score_momentum`, `_score_gap_up`, `_score_gap_down`, `_score_mean_reversion`, `_score_breakout`, `_score_volatile`
@@ -485,15 +511,15 @@ When explicit tickers are provided with `--location`, the `min_change_pct`/`max_
 
 ## Contract Resolution
 
-`resolve_symbol()` in `trading_runtime.py` is a **local DB lookup only** — it checks the DuckDB universe database and returns empty on miss (with a `logging.warning` naming the symbol/conId). There is deliberately no fuzzy matching or implicit IB fallback: a conId that isn't locally registered is stale or wrong, and coercing an int conId to a string (e.g. `4391`) would match a Japanese ticker on TSEJ instead of AMD. If you need IB discovery with an exchange hint, use `resolve_contract(Contract(...))` explicitly — this is how `IBIdeaScanner` resolves international tickers (e.g. `STK.AU.ASX` → `exchange=ASX`), ensuring resolution to the local listing rather than a US ADR. Forex pairs (`sec_type='CASH'`) are constructed on IDEALPRO by the caller.
+CLI/SDK `resolve()` uses typed `discover_instrument` / `resolve_instrument` (42101) — not legacy dill. Server-side, `resolve_symbol()` in `trading_runtime.py` remains a **local DB lookup** (no fuzzy matching). Integer conIds must never be coerced to ticker strings (`4391` ≠ TSEJ `"4391"`). IB discovery with exchange hints goes through `resolve_contract` / typed discover. Forex (`sec_type='CASH'`) uses IDEALPRO.
 
 ## Configuration
 
 User configs live in `~/.config/mmr/`. On first run, bundled defaults from `config_defaults/` are copied there automatically (`container.ensure_config_dir()`). The `TRADER_CONFIG` env var overrides the config file path.
 
 **`~/.config/mmr/trader.yaml`**: IB connection (address, port, client IDs, account), DuckDB path, ZMQ port assignments. Env vars override config values (uppercased param name). Two CLI-only knobs the Container doesn't otherwise know about:
-- `default_data_source` (default `twelvedata`) — sets the default for every `--source` arg on CLI commands where the value is in that command's choice set (history download, snapshot, watch, financials, fx, movers, ideas). News/propose are unaffected (they don't accept those values). Override per-shell with `MMR_DEFAULT_DATA_SOURCE`.
-- `equity_decimation` (default `daily`) — sets how aggressively backtest persist downsamples `equity_curve_json` before storing. `daily` resamples to last-value-per-day (~17 KB/run vs ~9.9 MB for raw 1-min); `none` keeps everything; an integer N uniform-samples to N points. The blob feeds PSR + Sharpe-CI (both n≥30 minima), so daily decimation is statistically lossless. Override per-shell with `MMR_EQUITY_DECIMATION`.
+- `default_data_source` (default `twelvedata`) — default `--source` for history download, snapshot, watch, financials, fx where that choice is valid. **`ideas` and `movers` always default to `massive`** (Massive-first; TD movers is Pro+-gated). Override the global default per-shell with `MMR_DEFAULT_DATA_SOURCE`.
+- `equity_decimation` (default `daily`) — how aggressively backtest persist downsamples `equity_curve_json`. `daily` ≈ 17 KB/run vs ~9.9 MB raw 1-min; statistically lossless for PSR/Sharpe-CI. Override with `MMR_EQUITY_DECIMATION`.
 
 **`~/.config/mmr/pycron.yaml`**: Service definitions with cron scheduling, auto-restart, dependency ordering. Also hosts `data_refresh_us` / `data_refresh_asx` cron entries that drive the data-refresh loop (see below).
 
@@ -509,15 +535,20 @@ User configs live in `~/.config/mmr/`. On first run, bundled defaults from `conf
 
 Logs are written to `~/.local/share/mmr/logs/` with per-session timestamps (e.g. `trader_service_2026-02-19_18-38-06.log`). The directory is created automatically. Console output uses Rich for colored log levels and timestamps. Configured in `~/.config/mmr/logging.yaml`.
 
-## Key ZMQ Ports
+## Key ZMQ / typed ports
 
-| Port  | Protocol | Service |
-|-------|----------|---------|
-| 42001 | RPC      | trader_service |
-| 42002 | PubSub   | ticker broadcast |
-| 42003 | RPC      | data_service |
-| 42005 | RPC      | strategy_service |
+| Port  | Protocol | Service / role |
+|-------|----------|----------------|
+| 42101 | Typed query (HMAC) | trader — production CLI/dashboard reads |
+| 42102 | Typed command (HMAC) | trader — propose/approve, cancels via command center |
+| 42103 | Typed feed (HMAC) | trader — internal (not host-published) |
+| 42104 | Typed command (HMAC) | strategy — enable/disable/reload |
+| 42105 | Typed query (HMAC) | strategy — list_strategies |
+| 42002 | PubSub | ticker broadcast |
+| 42003 | Legacy RPC | data_service |
+| 42005 | Legacy RPC | strategy (compat) |
 | 42006 | MessageBus | strategy signals |
+| 42001 | Legacy dill RPC | trader — **unbound in split production**; offline simulation only |
 
 ## Dependencies
 
@@ -731,35 +762,28 @@ mmr reject 42 --reason "Group over budget"  # Reject with reason
 
 ### Command Service Requirements
 
-**No service needed** (fully local):
+**No service needed** (fully local / REST keys only):
 - `data summary`, `data query`, `data download`, `data refresh`, `data status`
 - `backtest` / `bt`, `bt-sweep`, `sweep run/list/show`
 - `backtests list/show/compare/confidence/archive/unarchive/delete`
-- `strategies create`, `strategies deploy`, `strategies undeploy`, `strategies inspect`
-- `strategies signals`, `strategies backtest`
-- `universe list`, `universe show`, `universe create`, `universe delete`, `universe remove`, `universe import`
-- `propose`, `proposals`, `reject`
-- `group list`, `group create`, `group delete`, `group show`, `group add`, `group remove`, `group set`
-- `session`
+- `strategies create`, `strategies deploy`, `strategies undeploy`, `strategies inspect`, `strategies signals`, `strategies backtest`
+- `universe list/show/create/delete/remove/import`
+- `propose`, `proposals`, `reject`, `group *`, `session`
+- `ideas` / `movers` (Massive or TwelveData API keys; no trader_service)
+- `financials`, `options`, `news` (Massive key)
 
-**Requires trader_service**:
-- `portfolio`, `positions`, `orders`, `trades`, `account`, `status`
-- `buy`, `sell`, `cancel`, `cancel-all`, `close`
-- `resize-positions` (reads portfolio + orders, places market orders + protective orders)
-- `resolve`, `snapshot`, `depth`
-- `approve`
-- `portfolio-risk` / `prisk` (reads live portfolio for risk analysis)
-- `portfolio-snapshot` / `psnap` (compact portfolio JSON)
-- `portfolio-diff` / `pdiff` (delta since last snapshot)
-- `strategies enable`, `strategies disable`, `strategies reload`
-- `listen`, `watch`
-- `ideas --location` (IB path for international markets)
-- `scan` (IB scanner)
+**Requires trader typed RPC (42101/42102)** — production path; no legacy 42001:
+- `portfolio`, `positions`, `orders`, `trades`, `account`, `status`, `resolve`, `snapshot` (IB), `depth`
+- `approve`, `portfolio-risk` / `psnap` / `pdiff`, `reconcile`, `diagnose`
+- `listen` (publish_instrument + PubSub)
 
-**Requires massive_api_key only** (no service):
-- `data download`
-- `financials`, `options`, `news`, `movers`
-- `ideas` (without `--location` — default Massive path)
+**Requires strategy typed RPC (42104/42105)**:
+- `strategies` list, `strategies enable|disable|reload`
+
+**Requires offline-simulation legacy RPC (42001)** — clear error in split production:
+- Direct `buy` / `sell` / `cancel` / `cancel-all` / `close` / `to-market` / `resize-positions` execute
+- IB `scan`, `ideas --location`, options contract resolve via dill
+- Prefer `propose` → `approve` or the dashboard command center instead
 
 ### ConId Lookup
 

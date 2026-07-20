@@ -43,6 +43,15 @@ from typing import Any, Callable, Optional, Sequence
 from trader.data.schema_migrations import SchemaMigrator
 from trader.domain.events import DomainMutation
 from trader.domain.identity import strategy_entity_id
+from trader.promotion.allocation_attestation import (
+    AllocationAttestation,
+    AllocationAttestationVerifier,
+    AllocationAuthorityError,
+    ExpectedAllocationBindings,
+    VerifiedAllocationAuthority,
+    build_allocation_payload,
+    allocation_attestation_from_wire,
+)
 from trader.promotion.canary_attestation import (
     CanaryAttestation,
     CanaryAuthorityError,
@@ -54,6 +63,7 @@ from trader.promotion.canary_attestation import (
 )
 from trader.promotion.evidence_store import EvidenceStore
 from trader.promotion.paper_gate import PaperGate
+from trader.promotion.scaling_gate import ScalingGate
 from trader.promotion.stage import (
     CANARY_ACTIVE,
     CANARY_AUTHORIZED,
@@ -490,6 +500,59 @@ class PromotionController:
             public_key_id=public_key_id,
         )
 
+    def prepare_allocation(
+        self,
+        strategy_id: str,
+        *,
+        target_stage: str,
+        current_allocation_stage: Optional[str],
+        account_id: str,
+        account_mode: str,
+        artifact_digest: str,
+        allowlist_digest: str,
+        ruleset_digest: str,
+        max_gross_allocation: float,
+        public_key_id: str,
+        expires_at: dt.datetime,
+        operator: str,
+        reason: str,
+        authority_started_at: Optional[dt.datetime] = None,
+        capacity_review_passed: bool = False,
+        now: Optional[dt.datetime] = None,
+    ) -> dict:
+        resolved_now = _as_utc(now) if now is not None else _as_utc(self._now())
+        promotion_stage = self._stage_machine.current_stage(strategy_id)
+        window = self._evidence_store.rebuild_window(strategy_id, as_of=resolved_now)
+        scaling = ScalingGate().evaluate(
+            promotion_stage=promotion_stage,
+            current_allocation_stage=current_allocation_stage,
+            window=window,
+            target_stage=target_stage,
+            authority_started_at=authority_started_at,
+            capacity_review_passed=capacity_review_passed,
+        )
+        if not scaling.passed:
+            raise PromotionPreparationError(
+                f"strategy {strategy_id!r} does not clear ScalingGate for {target_stage!r}: "
+                f"blockers={scaling.blockers!r}"
+            )
+        return build_allocation_payload(
+            strategy_id=strategy_id,
+            account_id=account_id,
+            account_mode=account_mode,
+            stage=target_stage,
+            artifact_digest=artifact_digest,
+            allowlist_digest=allowlist_digest,
+            ruleset_digest=ruleset_digest,
+            max_gross_allocation=max_gross_allocation,
+            evidence_digest=scaling.evidence_digest,
+            issued_at=resolved_now,
+            expires_at=expires_at,
+            operator=operator,
+            reason=reason,
+            public_key_id=public_key_id,
+        )
+
 
 def _window_digest(window) -> str:
     from trader.research.canonical import sha256_digest
@@ -697,6 +760,102 @@ class CanaryActivationService:
 
         return {
             "strategy_id": strategy_id, "stage": record.stage, "authority_digest": authority_digest,
+        }
+
+
+_ALLOCATION_ERROR_CODES = {
+    "AllocationUnknownKey": "UNTRUSTED_KEY",
+    "AllocationBadSignature": "BAD_SIGNATURE",
+    "AllocationExpired": "AUTHORITY_EXPIRED",
+    "AllocationRevoked": "AUTHORITY_REVOKED",
+    "AllocationBindingMismatch": "BINDING_MISMATCH",
+    "AllocationPolicyViolation": "POLICY_VIOLATION",
+}
+
+
+def _allocation_error_code(exc: AllocationAuthorityError) -> str:
+    return _ALLOCATION_ERROR_CODES.get(type(exc).__name__, "AUTHORITY_INVALID")
+
+
+class AllocationActivationService:
+    """Authenticated ``activate_allocation`` — verifies signed allocation authority."""
+
+    def __init__(
+        self,
+        *,
+        authority_store: Any,
+        verifier: AllocationAttestationVerifier,
+        expected_bindings: Callable[[], ExpectedAllocationBindings],
+        semantic_readiness_ready: Callable[[], bool],
+        broker_flat_reconciled: Callable[[], bool],
+        breaker_clear: Callable[[], bool],
+        now: Optional[Callable[[], dt.datetime]] = None,
+    ):
+        self._authority_store = authority_store
+        self._verifier = verifier
+        self._expected_bindings = expected_bindings
+        self._semantic_readiness_ready = semantic_readiness_ready
+        self._broker_flat_reconciled = broker_flat_reconciled
+        self._breaker_clear = breaker_clear
+        self._now = now or (lambda: dt.datetime.now(dt.timezone.utc))
+
+    def activate(self, cmd) -> dict[str, Any]:
+        body = cmd.body
+        reason = str(body.get("reason", "")).strip()
+        if not reason:
+            raise _validation_error("REASON_REQUIRED", "activation requires an explicit reason")
+        if cmd.source != REQUIRED_ACTIVATION_SOURCE:
+            raise _validation_error(
+                "AUTOMATIC_ACTIVATION_FORBIDDEN",
+                f"allocation activation must be an explicit operator action, got source={cmd.source!r}",
+            )
+        wire = body.get("attestation")
+        if not isinstance(wire, dict):
+            raise _validation_error("ATTESTATION_REQUIRED", "activation requires a signed attestation")
+        try:
+            attestation = allocation_attestation_from_wire(wire)
+        except (KeyError, ValueError, TypeError) as exc:
+            raise _validation_error("ATTESTATION_MALFORMED", str(exc)) from exc
+
+        now = _as_utc(self._now())
+        if not self._semantic_readiness_ready():
+            raise _validation_error("READINESS_NOT_MET", "semantic readiness checks are not all green")
+        if not self._broker_flat_reconciled():
+            raise _validation_error("BROKER_NOT_FLAT", "broker account is not flat and reconciled")
+        if not self._breaker_clear():
+            raise _validation_error("BREAKER_NOT_CLEAR", "circuit breaker is not clear")
+
+        try:
+            expected = self._expected_bindings()
+        except Exception as exc:  # noqa: BLE001
+            raise _validation_error("ARTIFACT_VERIFICATION_FAILED", str(exc)) from exc
+
+        try:
+            verified = self._verifier.verify(attestation, expected=expected, now=now)
+        except AllocationAuthorityError as exc:
+            raise _validation_error(_allocation_error_code(exc), str(exc)) from exc
+
+        digest = verified.payload_digest
+        if self._authority_store.is_revoked(digest):
+            raise _validation_error("AUTHORITY_REVOKED", f"allocation authority {digest} is revoked")
+
+        prior = self._authority_store.active_for(expected.account_id, expected.artifact_digest, now=now)
+        if prior is not None and prior.authority_digest != digest:
+            self._authority_store.record_superseded(
+                prior.authority_digest,
+                superseded_by_digest=digest,
+                reason=reason,
+                now=now,
+            )
+
+        self._authority_store.record_issued(
+            attestation, verified, operator=attestation.operator, reason=reason, now=now,
+        )
+        self._authority_store.record_activated(digest, command_id=cmd.command_id, now=now)
+        return {
+            "strategy_id": verified.strategy_id,
+            "stage": verified.stage,
+            "authority_digest": digest,
         }
 
 

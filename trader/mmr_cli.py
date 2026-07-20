@@ -1770,6 +1770,40 @@ def build_parser() -> argparse.ArgumentParser:
     rc_verify.add_argument('--ruleset-digest', required=True)
     rc_verify.add_argument('--now', default='', help='Override "now" (ISO-8601 UTC); default: current time')
 
+    ra_p = research_sub.add_parser(
+        'allocation', help='Prepare / sign / verify a signed allocation authority (P5 scaling)',
+        formatter_class=fmt,
+    )
+    ra_sub = ra_p.add_subparsers(dest='allocation_action')
+    ra_prepare = ra_sub.add_parser('prepare', help='Unsigned allocation payload from ScalingGate evidence')
+    ra_prepare.add_argument('--strategy-id', required=True)
+    ra_prepare.add_argument('--target-stage', required=True, choices=['SCALE_1', 'SCALE_2', 'STEADY'])
+    ra_prepare.add_argument('--current-allocation-stage', default='')
+    ra_prepare.add_argument('--account-id', required=True)
+    ra_prepare.add_argument('--account-mode', required=True, choices=['paper', 'live'])
+    ra_prepare.add_argument('--artifact-digest', required=True)
+    ra_prepare.add_argument('--allowlist-digest', required=True)
+    ra_prepare.add_argument('--ruleset-digest', required=True)
+    ra_prepare.add_argument('--max-gross-allocation', type=float, required=True)
+    ra_prepare.add_argument('--public-key-id', required=True)
+    ra_prepare.add_argument('--ttl-days', type=int, default=30)
+    ra_prepare.add_argument('--operator', required=True)
+    ra_prepare.add_argument('--reason', required=True)
+    ra_prepare.add_argument('--authority-started-at', default='')
+    ra_prepare.add_argument('--capacity-review-passed', action='store_true')
+    ra_sign = ra_sub.add_parser('sign', help='Sign an unsigned allocation payload (offline)')
+    ra_sign.add_argument('--payload-file', required=True)
+    ra_sign.add_argument('--key-file', required=True)
+    ra_verify = ra_sub.add_parser('verify', help='Verify a signed allocation attestation')
+    ra_verify.add_argument('--attestation-file', required=True)
+    ra_verify.add_argument('--public-key-file', required=True)
+    ra_verify.add_argument('--strategy-id', required=True)
+    ra_verify.add_argument('--account-id', required=True)
+    ra_verify.add_argument('--account-mode', required=True)
+    ra_verify.add_argument('--artifact-digest', required=True)
+    ra_verify.add_argument('--allowlist-digest', required=True)
+    ra_verify.add_argument('--ruleset-digest', required=True)
+
     # data
     data_p = sub.add_parser('data', help='Local data exploration (no service needed)',
                             epilog='Examples:\n'
@@ -5170,9 +5204,11 @@ def _handle_research(args: argparse.Namespace):
         _handle_research_attest(args)
     elif action == 'canary':
         _handle_research_canary(args)
+    elif action == 'allocation':
+        _handle_research_allocation(args)
     else:
         print_status(
-            'Usage: research {family|trial|artifact|import-legacy|review|attest|canary} ...',
+            'Usage: research {family|trial|artifact|import-legacy|review|attest|canary|allocation} ...',
             success=False)
 
 
@@ -5785,6 +5821,136 @@ def _handle_research_canary_verify(args: argparse.Namespace):
         'public_key_id': verified.public_key_id,
         'payload_digest': verified.payload_digest,
     }, title='Canary authority verified')
+
+
+def _allocation_payload_public_view(fields: dict) -> dict:
+    view = dict(fields)
+    for key in ('issued_at', 'expires_at'):
+        value = view.get(key)
+        if hasattr(value, 'isoformat'):
+            view[key] = value.isoformat()
+    return view
+
+
+def _handle_research_allocation(args: argparse.Namespace):
+    action = getattr(args, 'allocation_action', None)
+    if action == 'prepare':
+        _handle_research_allocation_prepare(args)
+    elif action == 'sign':
+        _handle_research_allocation_sign(args)
+    elif action == 'verify':
+        _handle_research_allocation_verify(args)
+    else:
+        print_status('Usage: research allocation {prepare|sign|verify} ...', success=False)
+
+
+def _handle_research_allocation_prepare(args: argparse.Namespace):
+    import datetime as _dt
+    from trader.promotion.controller import PromotionPreparationError
+
+    controller = _promotion_controller_for_cli()
+    now = _dt.datetime.now(_dt.timezone.utc)
+    authority_started_at = None
+    if args.authority_started_at:
+        authority_started_at = _parse_iso_datetime(args.authority_started_at)
+    try:
+        payload = controller.prepare_allocation(
+            args.strategy_id,
+            target_stage=args.target_stage,
+            current_allocation_stage=args.current_allocation_stage or None,
+            account_id=args.account_id,
+            account_mode=args.account_mode,
+            artifact_digest=args.artifact_digest,
+            allowlist_digest=args.allowlist_digest,
+            ruleset_digest=args.ruleset_digest,
+            max_gross_allocation=args.max_gross_allocation,
+            public_key_id=args.public_key_id,
+            expires_at=now + _dt.timedelta(days=args.ttl_days),
+            operator=args.operator,
+            reason=args.reason,
+            authority_started_at=authority_started_at,
+            capacity_review_passed=bool(args.capacity_review_passed),
+        )
+    except PromotionPreparationError as exc:
+        print_status(str(exc), success=False)
+        return
+    print_json_result(_allocation_payload_public_view(payload), title='Unsigned allocation payload prepared')
+
+
+def _handle_research_allocation_sign(args: argparse.Namespace):
+    import json as _json
+    from trader.promotion.allocation_attestation import allocation_attestation_to_wire, sign_allocation_payload
+    from trader.research.signing import InsecureKeyFile, InvalidKeyType, MalformedKey, load_signing_key
+
+    try:
+        with open(args.payload_file, 'r') as f:
+            unsigned = _json.load(f)
+    except (OSError, _json.JSONDecodeError) as exc:
+        print_status(f'Failed to read payload file: {exc}', success=False)
+        return
+    try:
+        signer = load_signing_key(args.key_file)
+    except (InsecureKeyFile, InvalidKeyType, MalformedKey) as exc:
+        print_status(f'Invalid signing key: {exc}', success=False)
+        return
+    try:
+        attestation = sign_allocation_payload(signer, unsigned)
+    except (KeyError, ValueError) as exc:
+        print_status(f'Failed to sign allocation payload: {exc}', success=False)
+        return
+    print_json_result(allocation_attestation_to_wire(attestation), title='Allocation authority signed')
+
+
+def _handle_research_allocation_verify(args: argparse.Namespace):
+    import datetime as _dt
+    import json as _json
+    from trader.promotion.allocation_attestation import (
+        AllocationAttestationVerifier,
+        AllocationAuthorityError,
+        ExpectedAllocationBindings,
+        allocation_attestation_from_wire,
+    )
+    from trader.research.signing import InvalidKeyType, MalformedKey, load_verify_key
+
+    try:
+        with open(args.attestation_file, 'r') as f:
+            wire = _json.load(f)
+    except (OSError, _json.JSONDecodeError) as exc:
+        print_status(f'Failed to read attestation file: {exc}', success=False)
+        return
+    try:
+        attestation = allocation_attestation_from_wire(wire)
+    except (KeyError, ValueError, TypeError) as exc:
+        print_status(f'Malformed attestation: {exc}', success=False)
+        return
+    try:
+        public_key = load_verify_key(args.public_key_file)
+    except (InvalidKeyType, MalformedKey) as exc:
+        print_status(f'Invalid public key: {exc}', success=False)
+        return
+    expected = ExpectedAllocationBindings(
+        account_id=args.account_id,
+        account_mode=args.account_mode,
+        artifact_digest=args.artifact_digest,
+        allowlist_digest=args.allowlist_digest,
+        ruleset_digest=args.ruleset_digest,
+        strategy_id=args.strategy_id,
+    )
+    verifier = AllocationAttestationVerifier({attestation.public_key_id: public_key})
+    now = _dt.datetime.now(_dt.timezone.utc)
+    try:
+        verified = verifier.verify(attestation, expected=expected, now=now)
+    except AllocationAuthorityError as exc:
+        print_json_result({'result': 'FAIL', 'error': type(exc).__name__, 'detail': str(exc)},
+                          title='Allocation authority verification FAILED')
+        return
+    print_json_result({
+        'result': 'PASS',
+        'strategy_id': verified.strategy_id,
+        'stage': verified.stage,
+        'max_gross_allocation': verified.max_gross_allocation,
+        'payload_digest': verified.payload_digest,
+    }, title='Allocation authority verified')
 
 
 def _parse_iso_datetime(value: str):

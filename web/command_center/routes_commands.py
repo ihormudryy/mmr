@@ -231,30 +231,46 @@ def _same_origin_netloc(origin_netloc: str, host_header: str) -> bool:
     return True
 
 
+def _request_host(request: Request) -> str:
+    forwarded = request.headers.get("x-forwarded-host", "")
+    if forwarded:
+        return forwarded.split(",", 1)[0].strip()
+    return request.headers.get("host", "")
+
+
+def _header_matches_host(header_value: str, host: str) -> bool:
+    parsed = urlsplit(header_value)
+    return (parsed.scheme in ("http", "https")
+            and _same_origin_netloc(parsed.netloc, host))
+
+
 def _check_origin(request: Request) -> None:
-    host = request.headers.get("host", "")
+    """Same-origin gate for JSON command API routes (``/api/commands/*``).
+
+    HTML form POST routes under ``web/app.py`` intentionally skip this check
+    and rely on session cookie + CSRF instead — browser Origin/Host pairs are
+    too flaky behind port maps and loopback aliases for deploy/watchlists.
+    """
+    host = _request_host(request)
     if not host:
         raise CommandApiError(403, "ORIGIN_REJECTED",
                               "mutations require a same-origin browser request")
 
+    sec_fetch_site = (request.headers.get("sec-fetch-site") or "").lower()
+    if sec_fetch_site == "same-origin":
+        return
+
     origin = request.headers.get("origin")
-    if origin:
-        parsed = urlsplit(origin)
-        if (parsed.scheme in ("http", "https")
-                and _same_origin_netloc(parsed.netloc, host)):
+    if origin and origin.lower() != "null":
+        if _header_matches_host(origin, host):
             return
-        raise CommandApiError(403, "ORIGIN_REJECTED",
-                              "cross-origin mutation rejected")
 
     referer = request.headers.get("referer")
-    if referer:
-        parsed_ref = urlsplit(referer)
-        if (parsed_ref.scheme in ("http", "https")
-                and _same_origin_netloc(parsed_ref.netloc, host)):
-            return
+    if referer and _header_matches_host(referer, host):
+        return
 
     raise CommandApiError(403, "ORIGIN_REJECTED",
-                          "mutations require a same-origin browser request")
+                          "cross-origin mutation rejected")
 
 
 def require_session(request: Request) -> str:

@@ -92,6 +92,20 @@
     });
   });
 
+  document.querySelectorAll('.param-form[action="/strategies/deploy"]').forEach(function (form) {
+    form.addEventListener('submit', function (ev) {
+      var symEl = form.querySelector('[name="symbols"]');
+      var wlEl = form.querySelector('[name="watchlist"]');
+      var sym = symEl && symEl.value ? symEl.value.trim() : '';
+      var wl = wlEl && wlEl.value ? wlEl.value.trim() : '';
+      if (!sym && !wl) {
+        ev.preventDefault();
+        window.alert('Enter at least one symbol (e.g. AAPL, MSFT) or choose a watchlist.');
+        if (symEl) symEl.focus();
+      }
+    });
+  });
+
   function parseHash() {
     var raw = (location.hash || '#trading').replace('#', '');
     activateDashTab(raw);

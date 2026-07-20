@@ -1,6 +1,7 @@
 {% macro info(text) %}<span class="info" tabindex="0">i<span class="tip">{{ text }}</span></span>{% endmacro %}
 
 <div class="dash-admin-body">
+  {% if flash %}<p class="banner{% if flash_err %} err{% endif %}">{{ flash }}</p>{% endif %}
   {% if errors.page %}<p class="banner err">{{ errors.page }}</p>{% endif %}
 
   <section class="full">
@@ -8,7 +9,8 @@
       {{ info('Currently loaded by strategy_service. Enable, disable, and live param edits live in the Trading tab — not here.') }}
       <span class="chip on">{{ deployed_count }} loaded</span>
     </h2>
-    <p class="note">Enable / disable / params → <strong>Trading</strong> tab · Undeploy → <code>mmr strategies undeploy NAME</code></p>
+    <p class="note">Enter <strong>symbols</strong> (e.g. AAPL, MSFT) or pick a <strong>watchlist</strong> to deploy.
+      Enable / disable / params → <strong>Trading</strong> tab · Undeploy → <code>mmr strategies undeploy NAME</code></p>
     {% if errors.strategies %}<p class="banner err">{{ errors.strategies }}</p>{% endif %}
     {% if strategies %}
     <table>

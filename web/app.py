@@ -57,7 +57,6 @@ from web.command_center import (
 from web.command_center.flags import CommandFlags, load_command_flags
 from web.command_center.health import create_health_router
 from web.command_center.routes_commands import (
-    _check_origin,
     install_command_routes,
     require_session,
 )
@@ -617,7 +616,21 @@ def _flash(msg: str) -> RedirectResponse:
     # Deploy + watchlist POST routes redirect back to the unified dashboard's
     # Setup tab so the post/redirect/get loop stays on the page the form was
     # submitted from.
-    return RedirectResponse(url=f'/cc?flash={quote(msg)}#deploy', status_code=303)
+    err = _flash_is_error(msg)
+    q = quote(msg)
+    suffix = '&flash_err=1' if err else ''
+    return RedirectResponse(url=f'/cc?flash={q}{suffix}#deploy', status_code=303)
+
+
+def _flash_is_error(msg: str) -> bool:
+    """Classify operator-facing failure strings for error-styled banners."""
+    lower = (msg or '').lower()
+    needles = (
+        'failed', 'aborted', 'invalid', 'unknown strategy', 'nothing was written',
+        'needs symbols', 'unresolved', 'already deployed', 'not deploying',
+        'deploy error', 'could not create',
+    )
+    return any(n in lower for n in needles)
 
 
 def _empty_manage_context(flash: str = '', *, error: str = '') -> dict[str, Any]:
@@ -648,6 +661,7 @@ def _manage_page_local_bootstrap(flash: str = '') -> dict[str, Any]:
         'watchlists': [],
         'deployed_count': len(strategies),
         'flash': flash,
+        'flash_err': _flash_is_error(flash),
         'csrf_token': _CSRF_TOKEN,
         'errors': errors,
     }
@@ -738,6 +752,7 @@ def _manage_page_context(flash: str = '') -> tuple[dict[str, Any], dict[str, str
         'watchlists': sections.get('watchlists') or [],
         'deployed_count': len(strategies),
         'flash': flash,
+        'flash_err': _flash_is_error(flash),
         'csrf_token': _CSRF_TOKEN,
         'errors': errors,
     }, errors)
@@ -954,12 +969,10 @@ def _register_legacy_routes(application: FastAPI) -> None:
     # same dependency `web/command_center/routes_commands.py`'s command
     # routes already enforce (reached the same way, via
     # `request.app.state.command_center.require_session`) -- and the same
-    # `_check_origin` strict same-origin check, imported verbatim rather
-    # than reimplemented. A request without a valid session cookie now hard
-    # 401s (or is redirected by `SessionSecurityMiddleware` before even
-    # reaching here, since that middleware already gates every non-exempt
-    # path); a request whose Origin doesn't match Host now hard 403s -- a
-    # protection no legacy route had before.
+    # Session cookie (``Depends(require_session)``) plus ``_check_csrf`` on
+    # the shared Jinja token. Origin is NOT checked here — HTML form POST
+    # Origin/Host pairs break behind loopback aliases and port maps; the
+    # JSON command API keeps the strict ``_check_origin`` gate instead.
     #
     # CSRF verification is deliberately LEFT on the existing `_check_csrf`/
     # `_CSRF_TOKEN` pair rather than switched to `session_csrf_token` (the
@@ -977,7 +990,6 @@ def _register_legacy_routes(application: FastAPI) -> None:
     @application.post('/watchlists/create')
     def watchlist_create(request: Request, name: str = Form(''), csrf_token: str = Form(''),
                          session: str = Depends(require_session)):
-        _check_origin(request)
         _check_csrf(csrf_token)
         wl = (name or '').strip().lower()
         if not _WATCHLIST_NAME_RE.match(wl):
@@ -999,7 +1011,6 @@ def _register_legacy_routes(application: FastAPI) -> None:
                       exchange: str = Form(''), currency: str = Form(''),
                       csrf_token: str = Form(''),
                       session: str = Depends(require_session)):
-        _check_origin(request)
         _check_csrf(csrf_token)
         syms = _split_symbols(symbols)
         if not syms:
@@ -1035,7 +1046,6 @@ def _register_legacy_routes(application: FastAPI) -> None:
         """CSV upload. Simple shape: a `symbol` column (optional exchange/
         currency/sectype columns) or one symbol per line — rows resolve via IB.
         Full SecurityDefinition exports (conId column) import directly."""
-        _check_origin(request)
         _check_csrf(csrf_token)
         raw = await file.read()
         if len(raw) > 1_000_000:
@@ -1096,7 +1106,6 @@ def _register_legacy_routes(application: FastAPI) -> None:
     def watchlist_remove(name: str, request: Request, symbol: str = Form(''),
                          csrf_token: str = Form(''),
                          session: str = Depends(require_session)):
-        _check_origin(request)
         _check_csrf(csrf_token)
         try:
             get_manage_client().trader_command('remove_universe_symbol', {
@@ -1115,7 +1124,6 @@ def _register_legacy_routes(application: FastAPI) -> None:
     @application.post('/watchlists/{name}/delete')
     def watchlist_delete(name: str, request: Request, csrf_token: str = Form(''),
                          session: str = Depends(require_session)):
-        _check_origin(request)
         _check_csrf(csrf_token)
         try:
             get_manage_client().trader_command('delete_universe', {'name': name})
@@ -1131,7 +1139,6 @@ def _register_legacy_routes(application: FastAPI) -> None:
         """Deploy an on-disk strategy: validate against the scanner (keeps the
         strategies-dir sandbox), resolve/attach the target instruments, append
         the YAML entry atomically, then reload + enable via RPC."""
-        _check_origin(request)
         form = await request.form()
         _check_csrf(str(form.get('csrf_token') or ''))
 
@@ -1148,6 +1155,9 @@ def _register_legacy_routes(application: FastAPI) -> None:
                   if k.startswith('param_') and str(v).strip() != ''}
 
         def _deploy() -> str:
+            target_watchlist = watchlist
+            if symbols and target_watchlist:
+                target_watchlist = ''  # symbols win when both are filled in
             # 1. The (file, class) pair must come from the scanner — a forged
             # form must not be able to point the runtime at an arbitrary path.
             known = {(r['file'], r['class']) for r in scan_strategies(_STRATEGIES_DIR)}
@@ -1155,8 +1165,9 @@ def _register_legacy_routes(application: FastAPI) -> None:
                 return f'unknown strategy {class_name} in {file_name} — not deploying'
             if not _WATCHLIST_NAME_RE.match(name or ''):
                 return f'invalid deployment name {name!r} — use a-z, 0-9, -, _ (max 40)'
-            if bool(symbols) == bool(watchlist):
-                return 'give either symbols or a watchlist (exactly one)'
+            if not symbols and not target_watchlist:
+                return ('deploy needs symbols (e.g. AAPL, MSFT) or a watchlist target '
+                        '— nothing was written')
 
             # 2. Config: reject duplicate names before doing any work.
             if _STRATEGY_CONFIG_PATH.exists():
@@ -1201,7 +1212,7 @@ def _register_legacy_routes(application: FastAPI) -> None:
                 entry['universe'] = univ
                 entry['conids'] = [int(sd['instrument_id']) for sd in resolved]
             else:
-                entry['universe'] = watchlist
+                entry['universe'] = target_watchlist
             if auto_propose:
                 entry['auto_execute'] = 'propose'
             if params:
@@ -1232,7 +1243,7 @@ def _register_legacy_routes(application: FastAPI) -> None:
                 return (f'"{name}" written to config but service call failed '
                         f'({type(exc).__name__}: {exc}) — it loads on the next '
                         'reconcile; enable it from the Command Center')
-            target = ', '.join(symbols) if symbols else f'watchlist {watchlist}'
+            target = ', '.join(symbols) if symbols else f'watchlist {target_watchlist}'
             return f'deployed & enabled "{name}" ({class_name}) on {target}'
 
         try:

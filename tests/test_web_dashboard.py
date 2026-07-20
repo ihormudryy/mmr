@@ -716,6 +716,16 @@ class TestDeployRoute:
         cfg = yaml.safe_load(deploy_config.read_text())
         assert not any(e.get('name') == 'mom_test' for e in cfg['strategies'])
 
+    def test_deploy_without_targets_shows_error_flash(self, client, stub, accessor,
+                                                      stub_resolving, deploy_config):
+        import yaml
+        r = self._deploy(client, symbols='', watchlist='')
+        loc = r.headers['location']
+        assert 'needs%20symbols' in loc or 'needs symbols' in loc
+        assert 'flash_err=1' in loc
+        cfg = yaml.safe_load(deploy_config.read_text())
+        assert not any(e.get('name') == 'mom_test' for e in cfg['strategies'])
+
     def test_deploy_form_rendered_in_available_table(self, client, accessor, stub_resolving):
         html = client.get('/cc').text
         assert '/strategies/deploy' in html

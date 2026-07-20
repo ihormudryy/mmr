@@ -86,6 +86,7 @@ def create_read_router(cc, templates, manage_context_provider=None,
     @router.get("/cc", response_class=HTMLResponse)
     async def command_center_page(request: Request,
                                   flash: str = '',
+                                  flash_err: int = 0,
                                   _session: str = Depends(_require_session)):
         # [M1-C] UI-wiring pass: `commands_enabled` gates every command
         # affordance (action buttons + the drawers/dialogs they open) in the
@@ -103,6 +104,7 @@ def create_read_router(cc, templates, manage_context_provider=None,
             "poll_interval_ms": int(os.environ.get("CC_POLL_INTERVAL_MS", "5000")),
             "commands_enabled": commands_enabled,
             "flash": flash,
+            "flash_err": bool(flash_err),
         }
         if manage_context_provider is not None:
             # Seed the Deploy/Watchlists tabs from local disk + YAML immediately

@@ -316,6 +316,7 @@ class StrategyRuntime():
         automation_public_key_ring_path: str = '',
         automation_expected_artifact_id: str = '',
         automation_strategy_name: str = '',
+        live_authority_enabled: bool = False,
     ):
         self.ib_server_address = ib_server_address
         self.ib_server_port = ib_server_port
@@ -325,6 +326,7 @@ class StrategyRuntime():
         self.universe_library = universe_library
         self.simulation: bool = simulation
         self.paper_trading = paper_trading
+        self.live_authority_enabled = bool(live_authority_enabled)
         self.zmq_pubsub_server_address = zmq_pubsub_server_address
         self.zmq_pubsub_server_port = zmq_pubsub_server_port
         self.zmq_rpc_server_address = zmq_rpc_server_address
@@ -521,17 +523,16 @@ class StrategyRuntime():
             self._trader_gateway = StrategyTraderGateway(
                 query_client=self._trader_query_client)
 
-            # [M1-F3] Task 8: signal → PENDING proposal bridge for
-            # auto_execute: 'propose' strategies (paper mode only; see
-            # signal_proposer.py). Thin typed adapter -- holds no
-            # ProposalStore handle, routes every mutation through the
-            # trader's command-authority coordinator via the typed clients
-            # just constructed above.
+        # [M1-F3] Task 8: signal → PENDING proposal bridge for
+            # auto_execute: 'propose' strategies. Live requires
+            # live_authority_enabled (command_authority.live_enabled).
+            # Thin typed adapter -- holds no ProposalStore handle.
             self.signal_proposer = SignalProposer(
                 command_client=self._trader_command_client,
                 query_client=self._trader_query_client,
                 paper_trading=self.paper_trading,
                 account_id=self.ib_account,
+                live_authority_enabled=bool(self.live_authority_enabled),
             )
             # [P3 Task 9] Intent emitter is built once a verified artifact for
             # the configured one-strategy name is available (see
@@ -1317,23 +1318,17 @@ class StrategyRuntime():
         # Publish signal via MessageBus for cross-strategy use and subscribers
         self.zmq_messagebus_client.write('signal', signal)
 
-        # auto_execute: propose — signal becomes a PENDING proposal awaiting
-        # human approval (dashboard / `mmr approve`). Guarded separately so a
-        # bridge failure never blocks the record/publish path above.
-        proposer = getattr(self, 'signal_proposer', None)
-        if proposer is not None and strategy.auto_execute == 'propose':
-            try:
-                proposer.on_signal(strategy.name, signal, frame)
-            except Exception:
-                logging.exception(
-                    'signal→proposal bridge failed for %s conId %s',
-                    getattr(strategy, 'name', '?'), conId)
-
-        # [P3 Task 9] Deterministic automation: emit typed ExecutionIntent after
-        # a completed bar. Never constructs IB orders / legacy RPC / journal
-        # writes — IntentEmitter is a thin typed adapter only.
+        # R1 exclusivity: IntentEmitter XOR SignalProposer for the same signal.
+        # When automation is armed for THIS strategy, emit intents only.
         emitter = getattr(self, 'intent_emitter', None)
-        if emitter is not None:
+        auto_name = getattr(self, 'automation_strategy_name', '') or ''
+        emitter_for_this = (
+            emitter is not None
+            and bool(auto_name)
+            and strategy.name == auto_name
+        )
+
+        if emitter_for_this:
             try:
                 last_bar = frame.index[-1]
                 if hasattr(last_bar, 'to_pydatetime'):
@@ -1354,6 +1349,19 @@ class StrategyRuntime():
             except Exception:
                 logging.exception(
                     'intent emitter failed for %s conId %s',
+                    getattr(strategy, 'name', '?'), conId)
+            return
+
+        # auto_execute: propose — signal becomes a PENDING proposal awaiting
+        # human approval (dashboard / `mmr approve`). Guarded separately so a
+        # bridge failure never blocks the record/publish path above.
+        proposer = getattr(self, 'signal_proposer', None)
+        if proposer is not None and strategy.auto_execute == 'propose':
+            try:
+                proposer.on_signal(strategy.name, signal, frame)
+            except Exception:
+                logging.exception(
+                    'signal→proposal bridge failed for %s conId %s',
                     getattr(strategy, 'name', '?'), conId)
 
     def _maybe_build_intent_emitter(self) -> None:

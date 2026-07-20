@@ -16,8 +16,9 @@ are now the server's job (``ProposalCommandService.create_proposal``) — this
 class only gates (paper-only, pause-aware) and translates.
 
 Semantics deliberately mirror the backtester (long-only): BUY proposes a new
-auto-sized entry, SELL proposes closing the currently-held long. Gated to
-paper trading: in live mode every call is a warn-once no-op.
+auto-sized entry, SELL proposes closing the currently-held long. Paper mode
+always allows the bridge; live mode requires ``live_authority_enabled``
+(command_authority live policy). Without that flag live is a warn-once no-op.
 
 Command ids are generated as ``f'strategy-{uuid.uuid4()}'`` (hyphen, not the
 ``strategy:`` colon used for the ``source`` field below) because
@@ -60,7 +61,11 @@ from trader.trading.strategy import Signal
 
 
 class SignalProposer:
-    """Creates PENDING proposals from strategy signals (paper mode only).
+    """Creates PENDING proposals from strategy signals.
+
+    Paper mode always allows the bridge. Live mode allows it only when
+    ``live_authority_enabled`` is true (command_authority live policy armed).
+    Otherwise live is a warn-once no-op.
 
     Holds two typed clients rather than one — ``command_client`` (bound to
     the ``command`` role) is the ONLY thing this class can use to mutate
@@ -78,11 +83,13 @@ class SignalProposer:
         paper_trading: bool,
         account_id: str,
         proposal_ttl_minutes: int = 30,
+        live_authority_enabled: bool = False,
     ):
         self._command_client = command_client
         self._query_client = query_client
         self.paper_trading = paper_trading
         self._account_id = account_id
+        self.live_authority_enabled = bool(live_authority_enabled)
         # Retained for constructor/signature compatibility -- proposal TTL
         # is now entirely server-owned (`ProposalCommandService`'s own
         # `ttl` param feeding `ProposalCreateRequest`/`create_proposal`);
@@ -221,11 +228,15 @@ class SignalProposer:
     def _gate(self, strategy_name: str) -> bool:
         if self.paper_trading:
             return True
+        if self.live_authority_enabled:
+            return True
         if strategy_name not in self._live_warned:
             self._live_warned.add(strategy_name)
             logging.warning(
-                'auto_execute: propose is paper-only — ignoring signals from %s '
-                'in LIVE mode', strategy_name)
+                'auto_execute: propose ignored for %s in LIVE mode — '
+                'enable command_authority.live_enabled (pinned account) '
+                'for human-approve proposals, or run paper',
+                strategy_name)
         return False
 
     def _entries_allowed(self) -> bool:

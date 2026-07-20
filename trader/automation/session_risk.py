@@ -18,13 +18,18 @@ from trader.automation.liquidity_policy import (
     LiquidityPolicy,
 )
 from trader.automation.models import ExecutionIntent
+from trader.promotion.allocation_policy import (
+    AllocationPolicy,
+    AuthoritySource,
+    STEADY_MAX_GROSS_FRACTION,
+)
 from trader.trading.approval_context import ApprovalContext
 from trader.trading.circuit_breaker import BreakerSignal
 
 # Hard trader-owned ceilings — never loosened by request/artifact fields.
 MAX_POSITIONS = 3
 MAX_POSITION_FRACTION = 0.05
-MAX_GROSS_FRACTION = 0.06
+MAX_GROSS_FRACTION = STEADY_MAX_GROSS_FRACTION
 MAX_TRADE_RISK_FRACTION = 0.002  # 0.20%
 MAX_DAILY_LOSS_FRACTION = 0.005  # 0.50%
 MAX_DRAWDOWN_FRACTION = 0.03  # 3%
@@ -32,9 +37,10 @@ MAX_DRAWDOWN_FRACTION = 0.03  # 3%
 
 @dataclass(frozen=True)
 class AllocationCeiling:
-    """Signed live allocation authority — may only tighten the hard 6% ceiling."""
+    """Signed gross allocation authority input (may only tighten the steady cap)."""
 
     max_gross_fraction: float
+    authority_digest: Optional[str] = None
 
     def __post_init__(self):
         value = float(self.max_gross_fraction)
@@ -60,10 +66,27 @@ class AutomatedRiskDecision:
     calendar_version: Optional[str] = None
     schedule: Optional[SessionSchedule] = None
     effective_gross_ceiling: Optional[float] = None
+    authority_digest: Optional[str] = None
+    allocation_limit_candidates: Tuple[tuple[str, float], ...] = ()
 
 
 class BreakerPort(Protocol):
     def record(self, signal: BreakerSignal) -> Any: ...
+
+
+@dataclass(frozen=True)
+class _SyntheticAllocationAuthority:
+    account_id: str
+    account_mode: str
+    artifact_digest: str
+    max_gross_allocation: float
+    authority_digest: Optional[str] = None
+    stage: str = "CANARY"
+    expires_at: dt.datetime = dt.datetime(2099, 1, 1, tzinfo=dt.timezone.utc)
+
+    @property
+    def payload_digest(self) -> Optional[str]:
+        return self.authority_digest
 
 
 def _finite(value: float) -> bool:
@@ -121,11 +144,13 @@ class SessionRiskController:
         calendar: Optional[XNYSCalendarPolicy] = None,
         liquidity_policy: Optional[LiquidityPolicy] = None,
         breaker: Optional[BreakerPort] = None,
+        allocation_policy: Optional[AllocationPolicy] = None,
         now: Optional[Callable[[], dt.datetime]] = None,
     ):
         self._calendar = calendar or XNYSCalendarPolicy()
         self._liquidity = liquidity_policy or LiquidityPolicy()
         self._breaker = breaker
+        self._allocation_policy = allocation_policy or AllocationPolicy(now=now)
         self._now = now or (lambda: dt.datetime.now(dt.timezone.utc))
 
     def evaluate(
@@ -135,6 +160,7 @@ class SessionRiskController:
         approval_context: ApprovalContext,
         session_state: AutomationSessionState,
         allocation: AllocationCeiling,
+        authority: AuthoritySource = None,
     ) -> AutomatedRiskDecision:
         now = self._now()
         reasons: list[str] = []
@@ -219,8 +245,9 @@ class SessionRiskController:
         if approval_context.market is not None:
             entry_price = float(approval_context.market.quote.price)
 
-        # --- Stop validity (long entries) ----------------------------------
         stop = float(intent.stop_policy.stop_price)
+
+        # --- Stop validity (long entries) ----------------------------------
         if is_entry and entry_price is not None:
             if not (_finite(stop) and stop > 0 and stop < entry_price):
                 reasons.append("STOP_INVALID")
@@ -234,41 +261,45 @@ class SessionRiskController:
             if intent.conid not in open_conids and len(open_conids) >= MAX_POSITIONS:
                 reasons.append("MAX_POSITIONS")
 
-        # --- Most-restrictive gross ceiling --------------------------------
-        effective_gross = min(
-            MAX_GROSS_FRACTION,
-            float(artifact.max_gross_allocation),
-            float(allocation.max_gross_fraction),
+        # --- Gross exposure via signed allocation policy (P5 Task 2) ---------
+
+        resolved_authority = authority
+        if resolved_authority is None:
+            resolved_authority = _SyntheticAllocationAuthority(
+                account_id=broker.account_id,
+                account_mode=broker.account_mode,
+                artifact_digest=artifact.artifact_id,
+                max_gross_allocation=float(allocation.max_gross_fraction),
+                authority_digest=allocation.authority_digest,
+            )
+
+        alloc_decision = self._allocation_policy.evaluate(
+            intent,
+            broker,
+            resolved_authority,
+            artifact=artifact,
+            entry_price=entry_price,
+            quote_prices={intent.conid: entry_price} if entry_price is not None else None,
         )
-        if effective_gross <= 0 or not math.isfinite(effective_gross):
-            reasons.append("GROSS_CEILING_INVALID")
-            effective_gross = 0.0
+        reasons.extend(alloc_decision.reason_codes)
+        effective_gross = alloc_decision.effective_gross_ceiling
+        authority_digest = alloc_decision.authority_digest
+        limit_candidates = tuple(
+            (c.name, c.max_gross_fraction) for c in alloc_decision.limit_candidates
+        )
 
         if is_entry and entry_price is not None and equity > 0 and qty > 0:
-            existing_gross = sum(
-                abs(float(row.market_value or 0.0))
-                for row in broker.positions
-                if not row.deleted
-            )
-            # Position % uses post-trade value for this conid
             existing_position_value = abs(float(broker.position_value(intent.conid)))
             order_notional = float(qty) * entry_price
             post_position_value = existing_position_value + order_notional
             if post_position_value / equity > MAX_POSITION_FRACTION:
                 reasons.append("POSITION_PCT")
 
-            post_gross = existing_gross + order_notional
-            # When adding to an existing position, existing_gross already includes it;
-            # order_notional is incremental — correct. When new, also correct.
-            if post_gross / equity > effective_gross + 1e-15:
-                reasons.append("GROSS_EXPOSURE")
-
             # Trade risk from broker-native stop distance (hard 0.20%; intent
             # risk_fraction may only tighten, never loosen).
             stop_distance = entry_price - stop if stop < entry_price else float("nan")
             if math.isfinite(stop_distance) and stop_distance > 0:
                 trade_risk = (stop_distance * float(qty)) / equity
-                # Intent risk_fraction may only tighten the hard 0.20% cap.
                 intent_cap = float(intent.risk_fraction)
                 effective_risk_cap = MAX_TRADE_RISK_FRACTION
                 if 0 < intent_cap < MAX_TRADE_RISK_FRACTION:
@@ -324,4 +355,6 @@ class SessionRiskController:
             calendar_version=calendar_version,
             schedule=schedule,
             effective_gross_ceiling=effective_gross,
+            authority_digest=authority_digest,
+            allocation_limit_candidates=limit_candidates,
         )

@@ -321,6 +321,13 @@ def build_command_stack(
     from trader.data.allocation_authority_store import apply_allocation_authority_migrations
 
     apply_allocation_authority_migrations(migrator)
+    from trader.data.allocation_authority_store import AllocationAuthorityStore
+    from trader.promotion.allocation_policy import AllocationPolicy
+
+    allocation_authority_store = AllocationAuthorityStore(
+        journal=journal, db=trader.journal_db, now=now,
+    )
+    allocation_policy = AllocationPolicy(now=now)
     from trader.automation.protective_order_saga import (
         ProtectiveBracketDispatch,
         ProtectiveOrderSaga,
@@ -390,6 +397,10 @@ def build_command_stack(
         broker=broker_snapshot, quotes=quotes, margin=margin,
         controls=controls, risk_gate=trader.risk_gate, policy=policy,
         account_id=trader.ib_account, account_mode=account_mode,
+        allocation_policy=allocation_policy,
+        allocation_authority_lookup=lambda account_id, artifact_digest: (
+            allocation_authority_store.active_for(account_id, artifact_digest)
+        ),
     )
 
     def compute_risk_projection():
@@ -523,6 +534,7 @@ def build_command_stack(
     session_risk = SessionRiskController(
         calendar=XNYSCalendarPolicy(),
         breaker=circuit_breaker,
+        allocation_policy=allocation_policy,
         now=now,
     )
     # P3 Task 5 — protective entry saga over existing expressive-order path.

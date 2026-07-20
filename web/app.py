@@ -490,22 +490,66 @@ def _get_accessor():
 
 
 def fetch_watchlists() -> list[dict]:
-    """List watchlist names + counts only.
+    """List watchlists with symbol previews for the Watchlists tab.
 
-    Deliberately avoids N per-universe ``get_universe`` calls on the /cc page
-    load path -- that fan-out blocked the single uvicorn worker for tens of
-    seconds and kept the browser tab spinning while /api/snapshot queued behind
-    it. Symbol previews belong in a future lazy-load endpoint; manage rows
-    still expose add/remove/upload actions without them.
+    Loads each universe's symbols on page render (``get_universe``) so the
+    Preview column and unfold checkbox list are populated without a second
+    round-trip. Fan-out is parallelized; per-universe failures degrade to an
+    empty symbol list rather than blanking the whole tab.
     """
+    from concurrent.futures import ThreadPoolExecutor, as_completed
+
     client = get_manage_client()
     listed = client.trader_query('list_universes')
-    rows = []
-    for entry in listed.get('universes') or []:
-        rows.append({
-            'name': entry['name'],
+    entries = list(listed.get('universes') or [])
+    if not entries:
+        return []
+
+    def _one(entry: dict) -> dict:
+        name = str(entry.get('name') or '')
+        count = int(entry.get('count') or 0)
+        symbols: list[str] = []
+        truncated = False
+        try:
+            resp = client.trader_query('get_universe', {
+                'name': name,
+                'symbol_limit': 200,
+            })
+            symbols = [
+                str(s).strip().upper()
+                for s in (resp.get('symbols') or [])
+                if str(s).strip()
+            ]
+            count = int(resp.get('count') or count)
+            truncated = count > len(symbols)
+        except Exception as exc:  # noqa: BLE001
+            logger.warning('watchlist preview %s failed: %s', name, exc)
+        preview = ', '.join(symbols) if symbols else '—'
+        return {
+            'name': name,
+            'count': count,
+            'symbols': preview,
+            'symbol_list': symbols,
+            'truncated': truncated,
+        }
+
+    rows: list[dict] = []
+    workers = min(8, max(1, len(entries)))
+    with ThreadPoolExecutor(max_workers=workers) as pool:
+        futs = {pool.submit(_one, e): e for e in entries}
+        by_name = {}
+        for fut in as_completed(futs):
+            row = fut.result()
+            by_name[row['name']] = row
+    # Stable order matching list_universes sort.
+    for entry in entries:
+        name = str(entry.get('name') or '')
+        rows.append(by_name.get(name) or {
+            'name': name,
             'count': int(entry.get('count') or 0),
-            'symbols': '',
+            'symbols': '—',
+            'symbol_list': [],
+            'truncated': False,
         })
     return rows
 
@@ -661,14 +705,14 @@ def fetch_proposals() -> list[dict]:
     return rows
 
 
-def _flash(msg: str) -> RedirectResponse:
-    # Deploy + watchlist POST routes redirect back to the unified dashboard's
-    # Setup tab so the post/redirect/get loop stays on the page the form was
-    # submitted from.
+def _flash(msg: str, *, tab: str = 'deploy') -> RedirectResponse:
+    # Deploy + watchlist POST routes redirect back to the matching /cc tab so
+    # the post/redirect/get loop stays on the page the form was submitted from.
     err = _flash_is_error(msg)
     q = quote(msg)
     suffix = '&flash_err=1' if err else ''
-    return RedirectResponse(url=f'/cc?flash={q}{suffix}#deploy', status_code=303)
+    hash_tab = tab if tab in ('deploy', 'watchlists', 'trading', 'scaling', 'guide') else 'deploy'
+    return RedirectResponse(url=f'/cc?flash={q}{suffix}#{hash_tab}', status_code=303)
 
 
 def _flash_is_error(msg: str) -> bool:
@@ -677,7 +721,7 @@ def _flash_is_error(msg: str) -> bool:
     needles = (
         'failed', 'aborted', 'invalid', 'unknown strategy', 'nothing was written',
         'needs symbols', 'unresolved', 'already deployed', 'not deploying',
-        'deploy error', 'could not create',
+        'deploy error', 'could not create', 'no symbols', 'not found',
     )
     return any(n in lower for n in needles)
 
@@ -990,13 +1034,48 @@ def _register_legacy_routes(application: FastAPI) -> None:
     # secret in a single-operator dashboard. See the Task 1 report for the
     # full drift note.
     # -------------------------------------------------------------------
+    @application.get('/watchlists/{name}/members')
+    def watchlist_members(name: str, session: str = Depends(require_session)):
+        """Lazy member list for the Watchlists tab unfold (avoids N get_universe
+        calls on every /cc page load — see ``fetch_watchlists``)."""
+        from fastapi.responses import JSONResponse
+        wl = (name or '').strip()
+        if not _WATCHLIST_NAME_RE.match(wl):
+            return JSONResponse({'error': 'invalid watchlist name'}, status_code=400)
+        try:
+            resp = get_manage_client().trader_query('get_universe', {
+                'name': wl,
+                'symbol_limit': 200,
+            })
+            symbols = [
+                str(s).strip().upper()
+                for s in (resp.get('symbols') or [])
+                if str(s).strip()
+            ]
+            count = int(resp.get('count') or len(symbols))
+            return JSONResponse({
+                'name': resp.get('name') or wl,
+                'count': count,
+                'symbols': symbols,
+                'truncated': count > len(symbols),
+            })
+        except TypedRpcRemoteError as exc:
+            code = 404 if exc.code == 'NOT_FOUND' else 502
+            return JSONResponse({'error': f'{exc.code}: {exc}'}, status_code=code)
+        except Exception as exc:  # noqa: BLE001
+            logger.warning('watchlist members %s failed: %s', wl, exc)
+            return JSONResponse(
+                {'error': f'{type(exc).__name__}: {exc}'}, status_code=502)
+
     @application.post('/watchlists/create')
     def watchlist_create(request: Request, name: str = Form(''), csrf_token: str = Form(''),
                          session: str = Depends(require_session)):
         _check_csrf(csrf_token)
         wl = (name or '').strip().lower()
         if not _WATCHLIST_NAME_RE.match(wl):
-            return _flash(f'invalid watchlist name {name!r} — use a-z, 0-9, -, _ (max 40)')
+            return _flash(
+                f'invalid watchlist name {name!r} — use a-z, 0-9, -, _ (max 40)',
+                tab='watchlists')
         try:
             get_manage_client().trader_command('create_universe', {'name': wl})
             msg = f'watchlist "{wl}" created — add symbols or upload a CSV'
@@ -1006,7 +1085,7 @@ def _register_legacy_routes(application: FastAPI) -> None:
         except Exception as exc:  # noqa: BLE001
             logger.warning('watchlist create %s failed: %s', wl, exc)
             msg = f'create failed: {type(exc).__name__}: {exc}'
-        return _flash(msg)
+        return _flash(msg, tab='watchlists')
 
 
     @application.post('/watchlists/{name}/add')
@@ -1017,7 +1096,7 @@ def _register_legacy_routes(application: FastAPI) -> None:
         _check_csrf(csrf_token)
         syms = _split_symbols(symbols)
         if not syms:
-            return _flash('no symbols given')
+            return _flash('no symbols given', tab='watchlists')
         try:
             result = get_manage_client().trader_command('add_universe_symbols', {
                 'name': name,
@@ -1038,7 +1117,7 @@ def _register_legacy_routes(application: FastAPI) -> None:
         except Exception as exc:  # noqa: BLE001
             logger.warning('watchlist add %s failed: %s', name, exc)
             msg = f'{name} add failed: {type(exc).__name__}: {exc}'
-        return _flash(msg)
+        return _flash(msg, tab='watchlists')
 
 
     @application.post('/watchlists/{name}/upload')
@@ -1052,11 +1131,12 @@ def _register_legacy_routes(application: FastAPI) -> None:
         _check_csrf(csrf_token)
         raw = await file.read()
         if len(raw) > 1_000_000:
-            return _flash('CSV too large (max 1 MB)')
+            return _flash('CSV too large (max 1 MB)', tab='watchlists')
         try:
             text = raw.decode('utf-8-sig')
         except UnicodeDecodeError:
-            return _flash('file is not UTF-8 text — export as plain CSV')
+            return _flash('file is not UTF-8 text — export as plain CSV',
+                          tab='watchlists')
 
         def _import() -> str:
             import csv as _csv
@@ -1102,26 +1182,50 @@ def _register_legacy_routes(application: FastAPI) -> None:
         except Exception as exc:  # noqa: BLE001
             logger.warning('watchlist upload %s failed: %s', name, exc)
             msg = f'{name} upload failed: {type(exc).__name__}: {exc}'
-        return _flash(msg)
+        return _flash(msg, tab='watchlists')
 
 
     @application.post('/watchlists/{name}/remove')
-    def watchlist_remove(name: str, request: Request, symbol: str = Form(''),
-                         csrf_token: str = Form(''),
-                         session: str = Depends(require_session)):
-        _check_csrf(csrf_token)
-        try:
-            get_manage_client().trader_command('remove_universe_symbol', {
-                'name': name,
-                'symbol': symbol.strip(),
-            })
-            msg = f'removed {symbol.strip().upper()} from {name}'
-        except TypedRpcRemoteError as exc:
-            msg = f'"{symbol}" not in {name}' if exc.code == 'NOT_FOUND' else f'{name} remove failed: {exc}'
-        except Exception as exc:  # noqa: BLE001
-            logger.warning('watchlist remove %s failed: %s', name, exc)
-            msg = f'{name} remove failed: {type(exc).__name__}: {exc}'
-        return _flash(msg)
+    async def watchlist_remove(name: str, request: Request,
+                               session: str = Depends(require_session)):
+        """Remove one or more symbols (checkbox multi-select or legacy single)."""
+        form = await request.form()
+        _check_csrf(str(form.get('csrf_token') or ''))
+        selected = [
+            str(s).strip().upper()
+            for s in form.getlist('symbols')
+            if str(s).strip()
+        ]
+        legacy = str(form.get('symbol') or '').strip().upper()
+        if legacy and legacy not in selected:
+            selected.append(legacy)
+        if not selected:
+            return _flash('no symbols selected to remove', tab='watchlists')
+        client = get_manage_client()
+        removed, missing = [], []
+        for sym in selected:
+            try:
+                client.trader_command('remove_universe_symbol', {
+                    'name': name,
+                    'symbol': sym,
+                })
+                removed.append(sym)
+            except TypedRpcRemoteError as exc:
+                if exc.code == 'NOT_FOUND':
+                    missing.append(sym)
+                else:
+                    return _flash(f'{name} remove failed: {exc}', tab='watchlists')
+            except Exception as exc:  # noqa: BLE001
+                logger.warning('watchlist remove %s/%s failed: %s', name, sym, exc)
+                return _flash(
+                    f'{name} remove failed: {type(exc).__name__}: {exc}',
+                    tab='watchlists')
+        parts = []
+        if removed:
+            parts.append('removed ' + ', '.join(removed))
+        if missing:
+            parts.append('not found: ' + ', '.join(missing))
+        return _flash(f'{name}: ' + '; '.join(parts), tab='watchlists')
 
 
     @application.post('/watchlists/{name}/delete')
@@ -1134,7 +1238,7 @@ def _register_legacy_routes(application: FastAPI) -> None:
         except Exception as exc:  # noqa: BLE001
             logger.warning('watchlist delete %s failed: %s', name, exc)
             msg = f'{name} delete failed: {type(exc).__name__}: {exc}'
-        return _flash(msg)
+        return _flash(msg, tab='watchlists')
 
 
     @application.post('/strategies/{name}/enable-live')

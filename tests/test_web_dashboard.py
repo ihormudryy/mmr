@@ -616,6 +616,36 @@ class TestWatchlistRoutes:
                     follow_redirects=False)
         assert all(d.symbol != 'AAPL' for d in accessor.universes['mylist'])
 
+    def test_remove_multiple_symbols_via_checkboxes(self, client, accessor, stub_resolving):
+        from urllib.parse import urlencode
+        body = urlencode([
+            ('csrf_token', _csrf()),
+            ('symbols', 'AAPL'),
+            ('symbols', 'MSFT'),
+        ])
+        r = client.post(
+            '/watchlists/mylist/remove',
+            content=body,
+            headers={'Content-Type': 'application/x-www-form-urlencoded'},
+            follow_redirects=False,
+        )
+        assert r.status_code == 303
+        assert '#watchlists' in r.headers['location']
+        assert accessor.universes['mylist'] == []
+
+    def test_members_endpoint_lazy_loads_symbols(self, client, accessor, stub_resolving):
+        r = client.get('/watchlists/mylist/members')
+        assert r.status_code == 200
+        body = r.json()
+        assert body['name'] == 'mylist'
+        assert body['count'] == 2
+        assert body['symbols'] == ['AAPL', 'MSFT']
+        assert body['truncated'] is False
+
+    def test_members_rejects_bad_name(self, client, accessor, stub_resolving):
+        r = client.get('/watchlists/Not_Valid!/members')
+        assert r.status_code == 400
+
     def test_delete_watchlist(self, client, accessor, stub_resolving):
         client.post('/watchlists/mylist/delete',
                     data={'csrf_token': _csrf()}, follow_redirects=False)
@@ -625,9 +655,13 @@ class TestWatchlistRoutes:
         html = client.get('/cc').text
         assert 'data-dash-tab="watchlists"' in html
         assert 'id="dash-watchlists"' in html
+        assert 'wl-name-toggle' in html
+        assert 'wl-member-list' in html
+        assert '▸ manage' not in html
+        assert 'AAPL' in html and 'MSFT' in html  # preview + checkbox list on load
 
-    def test_fetch_watchlists_does_not_fan_out_get_universe(self, manage_client, monkeypatch):
-        """Page load must not N+1 query every universe (blocks the single worker)."""
+    def test_fetch_watchlists_includes_symbol_previews(self, manage_client, monkeypatch):
+        """Page load populates Preview via get_universe (parallel per list)."""
         calls = []
         orig = manage_client.trader_query
 
@@ -636,17 +670,19 @@ class TestWatchlistRoutes:
             return orig(method, body)
 
         monkeypatch.setattr(manage_client, 'trader_query', _track)
-        webapp.fetch_watchlists()
-        assert calls == ['list_universes']
-        assert 'get_universe' not in calls
+        rows = webapp.fetch_watchlists()
+        assert 'list_universes' in calls
+        assert calls.count('get_universe') >= 1
+        assert rows[0]['symbol_list'] == ['AAPL', 'MSFT']
+        assert 'AAPL' in rows[0]['symbols']
 
-    def test_flash_redirects_to_cc_setup(self, client, accessor, stub_resolving):
+    def test_flash_redirects_to_cc_watchlists(self, client, accessor, stub_resolving):
         r = client.post('/watchlists/create',
                         data={'csrf_token': _csrf(), 'name': 'flash_test'},
                         follow_redirects=False)
         assert r.status_code == 303
         assert r.headers['location'].startswith('/cc?flash=')
-        assert '#deploy' in r.headers['location']
+        assert '#watchlists' in r.headers['location']
         assert 'flash_test' in accessor.universes
 
 

@@ -19,23 +19,47 @@
     {% if watchlists %}
     <table>
       <thead><tr>
-        <th>Name {{ info('Universe name stored in DuckDB. Use this exact name when deploying a strategy to a watchlist.') }}</th>
+        <th>Name {{ info('Click the name to unfold members, checkbox remove, add, and CSV tools. Universe name stored in DuckDB — use this exact name when deploying.') }}</th>
         <th>Symbols {{ info('Members of this watchlist, resolved to exact IB contract IDs when added.') }}</th>
         <th>Count {{ info('Number of resolved instruments currently in the watchlist.') }}</th>
-        <th>Actions {{ info('Manage unfolds: add symbols (set exchange/currency for non-US), upload CSV, remove a symbol, or delete the watchlist.') }}</th>
       </tr></thead>
       <tbody>
       {% for w in watchlists %}
-        <tr>
-          <td class="sym">{{ w.name }}</td>
-          <td class="dim wrap-wide">{{ w.symbols or '—' }}</td>
+        <tr class="wl-row" data-wl-name="{{ w.name }}">
+          <td class="sym">
+            <button type="button" class="wl-name-toggle setup-unfold"
+                    data-label="{{ w.name }}"
+                    data-target="wl-{{ loop.index }}"
+                    aria-expanded="false"
+                    title="Show members">▸ {{ w.name }}</button>
+          </td>
+          <td class="dim wrap-wide">{{ w.symbols or '—' }}{% if w.truncated %} …{% endif %}</td>
           <td>{{ w.count }}</td>
-          <td><button class="unfold setup-unfold" type="button" data-label="manage"
-                     data-target="wl-{{ loop.index }}">▸ manage</button></td>
         </tr>
-        <tr id="wl-{{ loop.index }}" class="param-row" style="display:none">
-          <td colspan="4">
+        <tr id="wl-{{ loop.index }}" class="param-row" style="display:none"
+            data-wl-panel="{{ w.name }}">
+          <td colspan="3">
             <div class="param-stack">
+              <form class="param-form wl-remove-form" method="post"
+                    action="/watchlists/{{ w.name }}/remove">
+                <input type="hidden" name="csrf_token" value="{{ csrf_token }}" />
+                <div class="wl-members-head">
+                  <strong>Members</strong>
+                  <span class="param-hint">{{ w.count }} symbol{% if w.count != 1 %}s{% endif %}{% if w.truncated %} (showing first {{ w.symbol_list|length }}){% endif %}</span>
+                  <button type="button" class="wl-select-all" data-wl="{{ w.name }}">Select all</button>
+                  <button type="button" class="wl-select-none" data-wl="{{ w.name }}">Clear</button>
+                  <button type="submit" class="reject">Remove selected</button>
+                </div>
+                <div class="wl-member-list" data-wl-members="{{ w.name }}" aria-live="polite">
+                  {% if w.symbol_list %}
+                    {% for sym in w.symbol_list %}
+                    <label><input type="checkbox" name="symbols" value="{{ sym }}" /> {{ sym }}</label>
+                    {% endfor %}
+                  {% else %}
+                    <span class="dim">No symbols yet — add some below.</span>
+                  {% endif %}
+                </div>
+              </form>
               <form class="param-form" method="post" action="/watchlists/{{ w.name }}/add">
                 <input type="hidden" name="csrf_token" value="{{ csrf_token }}" />
                 <label>add symbols <input class="w-symbols" name="symbols" placeholder="AAPL, MSFT, SPY" /></label>
@@ -48,11 +72,6 @@
                 <label>CSV upload <input type="file" name="file" accept=".csv,text/csv" /></label>
                 <button type="submit" class="primary">Upload</button>
                 <span class="param-hint">symbol column (+optional exchange,currency) or one symbol per line</span>
-              </form>
-              <form class="param-form" method="post" action="/watchlists/{{ w.name }}/remove">
-                <input type="hidden" name="csrf_token" value="{{ csrf_token }}" />
-                <label>remove symbol <input class="w-sm" name="symbol" placeholder="AAPL" /></label>
-                <button type="submit">Remove</button>
               </form>
               <form class="param-form setup-delete-form" method="post"
                     action="/watchlists/{{ w.name }}/delete"
@@ -70,4 +89,4 @@
   </section>
 
 </div>
-<p class="setup-foot">Watchlist CRUD · auto-refreshes every 30s while this tab is open (paused while a manage form is open)</p>
+<p class="setup-foot">Watchlist CRUD · click a name to manage members · auto-refreshes every 30s while this tab is open (paused while a panel is open)</p>

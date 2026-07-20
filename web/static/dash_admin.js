@@ -1,6 +1,7 @@
 /* Deploy + Watchlists tab wiring for /cc (CSP-safe — no inline script).
- * Tab clicks, hash routing, deploy-row unfold, watchlist delete confirm,
- * tooltip positioning, and the 30s admin-pane auto-refresh. */
+ * Tab clicks, hash routing, deploy/watchlist-row unfold, watchlist checkbox
+ * multi-remove, delete confirm, tooltip positioning, and the 30s admin-pane
+ * auto-refresh. */
 'use strict';
 
 (function () {
@@ -15,6 +16,9 @@
     if (btn) {
       var label = btn.dataset.label || 'params';
       btn.textContent = (open ? '▸' : '▾') + ' ' + label;
+      if (btn.classList.contains('wl-name-toggle')) {
+        btn.setAttribute('aria-expanded', open ? 'false' : 'true');
+      }
     }
   };
 
@@ -94,6 +98,38 @@
     form.addEventListener('submit', function (ev) {
       var msg = form.dataset.confirm || 'Delete this watchlist?';
       if (!window.confirm(msg)) ev.preventDefault();
+    });
+  });
+
+  document.querySelectorAll('.wl-select-all').forEach(function (btn) {
+    btn.addEventListener('click', function () {
+      var name = btn.getAttribute('data-wl');
+      var box = document.querySelector('[data-wl-members="' + name + '"]');
+      if (!box) return;
+      box.querySelectorAll('input[type="checkbox"]').forEach(function (c) {
+        c.checked = true;
+      });
+    });
+  });
+
+  document.querySelectorAll('.wl-select-none').forEach(function (btn) {
+    btn.addEventListener('click', function () {
+      var name = btn.getAttribute('data-wl');
+      var box = document.querySelector('[data-wl-members="' + name + '"]');
+      if (!box) return;
+      box.querySelectorAll('input[type="checkbox"]').forEach(function (c) {
+        c.checked = false;
+      });
+    });
+  });
+
+  document.querySelectorAll('.wl-remove-form').forEach(function (form) {
+    form.addEventListener('submit', function (ev) {
+      var checked = form.querySelectorAll('input[name="symbols"]:checked');
+      if (!checked.length) {
+        ev.preventDefault();
+        window.alert('Select at least one symbol to remove.');
+      }
     });
   });
 

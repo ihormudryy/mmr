@@ -313,6 +313,11 @@ def build_command_stack(
     apply_stage_migration(migrator)
     apply_evidence_migrations(migrator)
     apply_live_activation_authority_migration(migrator)
+    from trader.promotion.canary_risk import apply_canary_risk_migration
+    from trader.operations.session_checklist import apply_session_checklist_migration
+
+    apply_canary_risk_migration(migrator)
+    apply_session_checklist_migration(migrator)
     from trader.automation.protective_order_saga import (
         ProtectiveBracketDispatch,
         ProtectiveOrderSaga,

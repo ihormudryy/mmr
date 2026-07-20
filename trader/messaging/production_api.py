@@ -1310,6 +1310,7 @@ def _suspend_allocation_rpc_handler(coordinator: TradingCommandCoordinator, acco
 def _paper_automation_action(paper_automation_service, *, activate: bool):
     """Translate coded activation refusals into command receipts."""
     from trader.automation.paper_activation import PaperAutomationActivationError
+    from trader.automation.paper_materials import PaperMaterialsError
 
     def _action(command: CommandRequest) -> Dict[str, Any]:
         try:
@@ -1321,6 +1322,8 @@ def _paper_automation_action(paper_automation_service, *, activate: bool):
             return paper_automation_service.deactivate(reason=command.body["reason"])
         except PaperAutomationActivationError as exc:
             raise CommandValidationError(exc.code, str(exc)) from exc
+        except (PaperMaterialsError, FileExistsError) as exc:
+            raise CommandValidationError("PAPER_MATERIALS_ERROR", str(exc)) from exc
 
     return _action
 

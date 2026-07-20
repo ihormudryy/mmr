@@ -177,8 +177,11 @@ class TestSnapshotApi:
                 assert (method, body, response_model) == (
                     "get_paper_automation_status", {}, dict)
                 assert timeout is not None
-                return {"enabled": True, "strategy_name": "orb",
-                        "restart_required": True}
+                return {
+                    "lifecycle": "restart_required",
+                    "strategy_name": "orb",
+                    "restart_required": True,
+                }
 
         _seed(cc)
         cc._query_client = QueryClient()
@@ -186,7 +189,9 @@ class TestSnapshotApi:
             await _login(c)
             body = (await c.get("/api/snapshot")).json()
         assert body["paper_automation"] == {
-            "enabled": True, "strategy_name": "orb", "restart_required": True,
+            "lifecycle": "restart_required",
+            "strategy_name": "orb",
+            "restart_required": True,
         }
 
     @pytest.mark.asyncio

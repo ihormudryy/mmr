@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import datetime as dt
+import json
 import os
 import shutil
 import stat
@@ -114,6 +115,36 @@ def ensure_signing_keypair(
     signer = AttestationSigner.from_key_file(str(private_key_path))
     _write_public_key(signer, public_key_path, force=force)
     return signer, False
+
+
+def _try_reuse_existing_fixture_bundle(
+    export_dir: Path,
+    *,
+    signer: AttestationSigner,
+    expected_artifact_id: str,
+) -> bool:
+    """Return True when *export_dir* already holds a valid fixture bundle."""
+    attestation_path = export_dir / "attestation.json"
+    manifest_path = export_dir / "manifest.json"
+    if not attestation_path.is_file() or not manifest_path.is_file():
+        return False
+    try:
+        attestation = json.loads(attestation_path.read_text(encoding="utf-8"))
+        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return False
+    if attestation.get("public_key_id") != signer.public_key_id:
+        return False
+    if attestation.get("eligibility_state") != "PAPER_ELIGIBLE":
+        return False
+    if manifest.get("artifact_id") != expected_artifact_id:
+        return False
+    manifest_attestation = manifest.get("attestation")
+    if not isinstance(manifest_attestation, dict):
+        return False
+    if manifest_attestation.get("public_key_id") != signer.public_key_id:
+        return False
+    return True
 
 
 def export_fixture_paper_eligible_bundle(
@@ -229,8 +260,15 @@ def export_fixture_paper_eligible_bundle(
         artifacts_root.mkdir(parents=True, exist_ok=True)
         export_dir = artifacts_root / artifact_id
         if export_dir.exists():
-            raise FileExistsError(
-                f"artifact already exists at {export_dir}; remove it or choose a fresh key run"
+            if _try_reuse_existing_fixture_bundle(
+                export_dir,
+                signer=signer,
+                expected_artifact_id=artifact_id,
+            ):
+                return artifact_id
+            raise PaperMaterialsError(
+                f"artifact directory {export_dir} exists but is not a valid "
+                f"PAPER_ELIGIBLE bundle for public_key_id={signer.public_key_id}"
             )
         try:
             ResearchBundle(db).export(artifact_id, export_dir)

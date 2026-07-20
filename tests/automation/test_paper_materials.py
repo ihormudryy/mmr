@@ -104,6 +104,58 @@ def test_ensure_signing_keypair_force_regenerates_mismatched_pair(tmp_path: Path
     assert public_path.read_bytes() == signer2.public_key_pem()
 
 
+def test_export_fixture_bundle_reuses_existing_valid_bundle(tmp_path: Path) -> None:
+    private_path = tmp_path / "keys" / "private" / "signing.pem"
+    public_path = tmp_path / "keys" / "verify" / "paper-automation.pem"
+    signer, _ = ensure_signing_keypair(
+        private_key_path=private_path,
+        public_key_path=public_path,
+    )
+    artifacts_root = tmp_path / "artifacts"
+
+    first_id = export_fixture_paper_eligible_bundle(
+        signer=signer,
+        artifacts_root=artifacts_root,
+    )
+    second_id = export_fixture_paper_eligible_bundle(
+        signer=signer,
+        artifacts_root=artifacts_root,
+    )
+
+    assert first_id == second_id
+    assert len(list(artifacts_root.iterdir())) == 1
+
+
+def test_export_fixture_bundle_rejects_invalid_existing_dir(tmp_path: Path) -> None:
+    import os
+
+    private_path = tmp_path / "keys" / "private" / "signing.pem"
+    public_path = tmp_path / "keys" / "verify" / "paper-automation.pem"
+    signer, _ = ensure_signing_keypair(
+        private_key_path=private_path,
+        public_key_path=public_path,
+    )
+    artifacts_root = tmp_path / "artifacts"
+    artifact_id = export_fixture_paper_eligible_bundle(
+        signer=signer,
+        artifacts_root=artifacts_root,
+    )
+    export_dir = artifacts_root / artifact_id
+    os.chmod(export_dir, 0o755)
+    attestation_path = export_dir / "attestation.json"
+    os.chmod(attestation_path, 0o644)
+    attestation_path.write_text(
+        json.dumps({"public_key_id": "wrong", "eligibility_state": "PAPER_ELIGIBLE"}),
+        encoding="utf-8",
+    )
+
+    with pytest.raises(PaperMaterialsError, match="not a valid PAPER_ELIGIBLE bundle"):
+        export_fixture_paper_eligible_bundle(
+            signer=signer,
+            artifacts_root=artifacts_root,
+        )
+
+
 def test_export_fixture_bundle_cleans_up_orphan_dir_on_export_failure(
     tmp_path: Path,
 ) -> None:

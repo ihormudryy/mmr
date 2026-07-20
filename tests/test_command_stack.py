@@ -255,6 +255,33 @@ def test_paper_automation_action_maps_activation_error_code():
     assert exc.value.code == "NOT_PAPER"
 
 
+def test_paper_automation_action_maps_materials_error_code():
+    from trader.automation.paper_materials import PaperMaterialsError
+    from trader.messaging.production_api import _paper_automation_action
+    from trader.trading.command_coordinator import CommandRequest, CommandValidationError
+
+    class FailingService:
+        def activate(self, **_kwargs):
+            raise PaperMaterialsError("public key permissions too open")
+
+    action = _paper_automation_action(FailingService(), activate=True)
+    request = CommandRequest(
+        command_id="activate-paper-2",
+        action="activate_paper_automation",
+        account_id="DU111111",
+        target_type="paper_automation",
+        target_id="orb_gld",
+        expected_version=None,
+        body={"strategy_name": "orb_gld", "reason": "operator approved"},
+        source="operator",
+    )
+
+    with pytest.raises(CommandValidationError) as exc:
+        action(request)
+
+    assert exc.value.code == "PAPER_MATERIALS_ERROR"
+
+
 def test_enabled_stack_attaches_recovery_components_to_trader(tmp_path):
     from trader.trading.command_stack import build_command_stack
 

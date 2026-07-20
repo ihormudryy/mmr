@@ -274,6 +274,19 @@ def test_activate_reuses_existing_signing_keys(tmp_path: Path) -> None:
     assert second["reused_existing_keys"] is True
 
 
+def test_activate_deactivate_activate_reuses_materials(tmp_path: Path) -> None:
+    service = _service(tmp_path)
+
+    first = service.activate(strategy_name="orb_gld", reason="first activation")
+    service.deactivate(reason="operator paused")
+    second = service.activate(strategy_name="orb_gld", reason="second activation")
+
+    assert first["artifact_id"] == second["artifact_id"]
+    assert first["artifact_bundle_path"] == second["artifact_bundle_path"]
+    assert second["reused_existing_keys"] is True
+    assert len(list((tmp_path / "share" / "artifacts").iterdir())) == 1
+
+
 def test_deactivate_clears_enabled_and_requires_restart(tmp_path: Path) -> None:
     service = _service(
         tmp_path,

@@ -202,6 +202,75 @@ def _build_canary_service(
     )
 
 
+def _build_allocation_service(
+    trader: Any,
+    authority_store: Any,
+    *,
+    account_id: str,
+    account_mode: str,
+    semantic_readiness: SemanticReadiness,
+    broker_flat_reconciled: Callable[[], bool],
+    breaker_clear: Callable[[], bool],
+    now: Callable[[], dt.datetime],
+) -> Optional[Any]:
+    """Build ``AllocationActivationService`` when scaling keys + artifact are configured."""
+    key_ring_path = (
+        getattr(trader, "allocation_public_key_ring_path", None)
+        or getattr(trader, "canary_public_key_ring_path", None)
+    )
+    bundle_path_str = (
+        getattr(trader, "allocation_artifact_bundle_path", None)
+        or getattr(trader, "canary_artifact_bundle_path", None)
+    )
+    expected_artifact_id = (
+        getattr(trader, "allocation_expected_artifact_id", None)
+        or getattr(trader, "canary_expected_artifact_id", None)
+    )
+    if not key_ring_path or not bundle_path_str or not expected_artifact_id:
+        return None
+
+    public_keys = _load_canary_public_keys(key_ring_path)
+    if not public_keys:
+        return None
+
+    import os as _os
+    from pathlib import Path as _Path
+
+    from trader.automation.artifact_verifier import ArtifactVerifier
+    from trader.promotion.allocation_attestation import AllocationAttestationVerifier, ExpectedAllocationBindings
+    from trader.promotion.controller import AllocationActivationService
+
+    keys_by_id = {}
+    for key in public_keys:
+        from trader.research.signing import public_key_id
+        keys_by_id[public_key_id(key)] = key
+
+    allocation_verifier = AllocationAttestationVerifier(trusted_public_keys=keys_by_id)
+    artifact_verifier = ArtifactVerifier(trusted_public_keys=public_keys)
+    bundle_path = _Path(_os.path.abspath(_os.path.expanduser(bundle_path_str)))
+
+    def expected_bindings():
+        verified = artifact_verifier.verify(bundle_path, account_mode, expected_artifact_id, now())
+        return ExpectedAllocationBindings(
+            account_id=account_id,
+            account_mode=account_mode,
+            artifact_digest=verified.artifact_id,
+            allowlist_digest=verified.allowlist_digest,
+            ruleset_digest=verified.ruleset_digest,
+            strategy_id=getattr(trader, "allocation_strategy_id", "") or "default",
+        )
+
+    return AllocationActivationService(
+        authority_store=authority_store,
+        verifier=allocation_verifier,
+        expected_bindings=expected_bindings,
+        semantic_readiness_ready=lambda: semantic_readiness.evaluate(now()).ready,
+        broker_flat_reconciled=broker_flat_reconciled,
+        breaker_clear=breaker_clear,
+        now=now,
+    )
+
+
 @dataclass(frozen=True)
 class CommandStack:
     journal: Any
@@ -230,6 +299,7 @@ class CommandStack:
     canary_authority_store: Any = None  # LiveActivationAuthorityStore (P4 Task 5)
     canary_service: Any = None  # CanaryActivationService (P4 Task 5) -- None until a
     # canary public-key ring is configured (dormant by default; see build_command_stack)
+    allocation_service: Any = None  # AllocationActivationService (P5 Task 3)
 
 
 _REQUIRED_TRADER_PORTS = (
@@ -627,6 +697,12 @@ def build_command_stack(
         semantic_readiness=semantic_readiness, broker_flat_reconciled=broker_flat_reconciled,
         breaker_clear=lambda: breaker_store.get().state == "CLEAR", now=now,
     )
+    allocation_service = _build_allocation_service(
+        trader, allocation_authority_store,
+        account_id=trader.ib_account, account_mode=account_mode,
+        semantic_readiness=semantic_readiness, broker_flat_reconciled=broker_flat_reconciled,
+        breaker_clear=lambda: breaker_store.get().state == "CLEAR", now=now,
+    )
 
     stack = CommandStack(
         journal=journal,
@@ -654,6 +730,7 @@ def build_command_stack(
         promotion_evidence_store=promotion_evidence_store,
         canary_authority_store=canary_authority_store,
         canary_service=canary_service,
+        allocation_service=allocation_service,
     )
     trader.command_ledger = ledger
     trader.command_reconciler = reconciler

@@ -1280,6 +1280,17 @@ def build_parser() -> argparse.ArgumentParser:
     deactivate_canary_p.add_argument('strategy_id', help='Strategy id whose canary authority to suspend')
     deactivate_canary_p.add_argument('--reason', required=True)
 
+    activate_allocation_p = sub.add_parser(
+        'activate-allocation', help='Activate a signed allocation authority',
+        epilog='Examples:\n'
+               '  activate-allocation --attestation-file allocation.json \\\n'
+               '      --reason "Scale 1 after clean canary"',
+        formatter_class=fmt,
+    )
+    activate_allocation_p.add_argument('--attestation-file', required=True,
+                                       help='JSON file with signed attestation from `research allocation sign`')
+    activate_allocation_p.add_argument('--reason', required=True)
+
     # group (position groups)
     group_p = sub.add_parser('group', help='Manage position groups',
                               epilog='Examples:\n'
@@ -1931,7 +1942,7 @@ def dispatch(mmr: MMR, args: argparse.Namespace) -> bool:
         'buy', 'sell', 'cancel', 'cancel-all', 'close', 'protect',
         'snapshot', 'snap', 'snapshot-batch', 'depth', 'resolve',
         'listen', 'watch', 'scan',
-        'approve', 'activate-canary', 'deactivate-canary',
+        'approve', 'activate-canary', 'deactivate-canary', 'activate-allocation',
         'resize-positions',
         'portfolio-risk', 'prisk',
         'portfolio-snapshot', 'psnap',
@@ -2442,6 +2453,9 @@ def dispatch(mmr: MMR, args: argparse.Namespace) -> bool:
         elif cmd == 'activate-canary':
             _handle_activate_canary(mmr, args)
 
+        elif cmd == 'activate-allocation':
+            _handle_activate_allocation(mmr, args)
+
         elif cmd == 'deactivate-canary':
             _handle_deactivate_canary(mmr, args)
 
@@ -2901,6 +2915,25 @@ def _handle_activate_canary(mmr: MMR, args: argparse.Namespace):
     else:
         error = str(result.error or result.exception or 'Unknown error')
         print_status(f'Canary activation failed: {error}', success=False)
+
+
+def _handle_activate_allocation(mmr: MMR, args: argparse.Namespace):
+    """[P5 Task 3] Send an already-signed allocation attestation for activation."""
+    import json as _json
+
+    try:
+        with open(args.attestation_file, 'r') as f:
+            attestation = _json.load(f)
+    except (OSError, _json.JSONDecodeError) as exc:
+        print_status(f'Failed to read attestation file: {exc}', success=False)
+        return
+
+    result = mmr.activate_allocation(attestation, args.reason)
+    if result.is_success():
+        print_json_result(result.obj or {}, title='Allocation authority activated')
+    else:
+        error = str(result.error or result.exception or 'Unknown error')
+        print_status(f'Allocation activation failed: {error}', success=False)
 
 
 def _handle_deactivate_canary(mmr: MMR, args: argparse.Namespace):

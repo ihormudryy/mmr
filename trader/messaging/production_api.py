@@ -533,7 +533,7 @@ class PreflightCommandRequest(BaseModel):
     def _known_action(cls, value: str) -> str:
         allowed = {
             "approve_proposal", "resume_trading", "cancel_order", "cancel_orders",
-            "liquidate_account", "activate_live_canary",
+            "liquidate_account", "activate_live_canary", "activate_allocation",
         }
         if value not in allowed:
             raise ValueError(f"action must be one of {sorted(allowed)}")
@@ -773,6 +773,32 @@ class DeactivateLiveCanaryRequest(BaseModel):
     command_id: str
     strategy_id: str
     reason: str = Field(min_length=1, max_length=200)
+
+    @field_validator("command_id")
+    @classmethod
+    def _command_id_has_no_colon(cls, value: str) -> str:
+        return _reject_colon_in_command_id(value)
+
+    @field_validator("reason")
+    @classmethod
+    def _reason_is_not_blank(cls, value: str) -> str:
+        if not value.strip():
+            raise ValueError("reason must not be blank")
+        return value.strip()
+
+
+class ActivateAllocationRequest(BaseModel):
+    """[P5 Task 3] Activates a signed allocation authority for the trader's
+    pinned account. ``attestation`` is the wire form from offline
+    ``research allocation sign``. Risk-increasing — requires preflight nonce."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    command_id: str
+    attestation: Dict[str, Any]
+    reason: str = Field(min_length=1, max_length=200)
+    preflight_nonce: Optional[str] = None
+    session_fingerprint: Optional[str] = None
 
     @field_validator("command_id")
     @classmethod
@@ -1114,6 +1140,20 @@ def _deactivate_live_canary_rpc_handler(coordinator: TradingCommandCoordinator, 
     return _handler
 
 
+def _activate_allocation_rpc_handler(coordinator: TradingCommandCoordinator, account_id: Optional[str]):
+    def _handler(parsed: ActivateAllocationRequest) -> Dict[str, Any]:
+        strategy_id = str(parsed.attestation.get("strategy_id", ""))
+        request = CommandRequest(
+            command_id=parsed.command_id, action="activate_allocation", account_id=account_id,
+            target_type="allocation_authority", target_id=strategy_id, expected_version=None,
+            body={"attestation": parsed.attestation, "reason": parsed.reason},
+            source="operator",
+            preflight_nonce=parsed.preflight_nonce, session_fingerprint=parsed.session_fingerprint,
+        )
+        return _receipt_to_dict(coordinator.execute(request))
+    return _handler
+
+
 def _liquidate_account_rpc_handler(coordinator: TradingCommandCoordinator, account_id: Optional[str]):
     def _handler(parsed: LiquidateAccountRequest) -> Dict[str, Any]:
         request = CommandRequest(
@@ -1283,6 +1323,35 @@ def _preflight_command_handler(
                     "expiry, revocation, exact bindings) again on submit.",
                 ],
             })
+        elif parsed.action == "activate_allocation":
+            exact_params(params, {"attestation", "reason"})
+            attestation = params["attestation"]
+            if not isinstance(attestation, dict):
+                reject("attestation must be an object")
+            reason = str(params["reason"]).strip()
+            if not reason:
+                reject("activation reason must not be blank")
+            strategy_id = str(attestation.get("strategy_id", ""))
+            request = CommandRequest(
+                command_id=parsed.command_id,
+                action=parsed.action,
+                account_id=account_id,
+                target_type="allocation_authority",
+                target_id=strategy_id,
+                expected_version=None,
+                body={"attestation": attestation, "reason": reason},
+                source="operator",
+                session_fingerprint=parsed.session_fingerprint,
+            )
+            summary.update({
+                "side": "ACTIVATE_ALLOCATION",
+                "instrument": strategy_id,
+                "order_type": "ALLOCATION_AUTHORITY",
+                "warnings": [
+                    "Allocation authority is re-verified in full (signature, policy, "
+                    "expiry, revocation, exact bindings) again on submit.",
+                ],
+            })
         elif parsed.action == "cancel_order":
             exact_params(params, {"order_entity_id"})
             order_entity_id = str(params["order_entity_id"]).strip()
@@ -1388,6 +1457,7 @@ def register_command_authority(
     strategy_control_service: Optional[StrategyControlCommandService] = None,
     automated_intent_service=None,
     canary_service=None,
+    allocation_service=None,
 ) -> None:
     """Wire the command-authority surface onto ``registry``.
 
@@ -1599,6 +1669,15 @@ def register_command_authority(
             _deactivate_live_canary_rpc_handler(coordinator, account_id),
         )
 
+    if allocation_service is not None:
+        coordinator.register_action(
+            "activate_allocation", allocation_service.activate, requires_preflight=True,
+        )
+        registry.register(
+            "command", "activate_allocation", ActivateAllocationRequest, dict,
+            _activate_allocation_rpc_handler(coordinator, account_id),
+        )
+
     if automated_intent_service is not None:
         # P3 Task 3: strategy-service principal only. No dashboard HTTP route.
         coordinator.register_action(
@@ -1784,6 +1863,7 @@ def build_production_registry(
             cancel_service=command_stack.cancel_service,
             liquidation_service=command_stack.liquidation_service,
             canary_service=command_stack.canary_service,
+            allocation_service=command_stack.allocation_service,
         )
         register_strategy_state_ingest(registry, command_stack.journal)
     elif command_coordinator is not None and proposal_service is not None and proposal_repository is not None:

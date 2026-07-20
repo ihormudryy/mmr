@@ -1607,6 +1607,52 @@ class MMR:
             return SuccessFail.success(obj=receipt.outcome)
         return SuccessFail.fail(error=f'canary activation rejected: {receipt.error_code or receipt.state}')
 
+    def activate_allocation(self, attestation: Dict[str, Any], reason: str) -> SuccessFail:
+        """Activate a signed allocation authority via ``activate_allocation``.
+        REQUIRES trader_service. Risk-increasing — drives preflight nonce ceremony."""
+        import uuid
+        from trader.domain.commands import CommandReceipt
+        from trader.messaging.typed_rpc import TypedRpcRemoteError
+
+        command_id = f'sdk-{uuid.uuid4()}'
+        session_fingerprint = uuid.uuid4().hex
+
+        try:
+            preflight = self._typed_command.call(
+                'preflight_command',
+                {
+                    'command_id': command_id, 'action': 'activate_allocation',
+                    'params': {'attestation': attestation, 'reason': reason},
+                    'session_fingerprint': session_fingerprint,
+                },
+                dict,
+            )
+        except TypedRpcRemoteError as ex:
+            return SuccessFail.fail(error=f'allocation activation preflight refused: {ex.code}: {ex.message}',
+                                    exception=ex)
+        except (TimeoutError, ConnectionError) as ex:
+            return SuccessFail.fail(error=f'allocation activation preflight did not complete: {ex}', exception=ex)
+
+        try:
+            receipt = self._typed_command.call(
+                'activate_allocation',
+                {
+                    'command_id': command_id, 'attestation': attestation, 'reason': reason,
+                    'preflight_nonce': preflight['nonce'], 'session_fingerprint': session_fingerprint,
+                },
+                CommandReceipt,
+            )
+        except TypedRpcRemoteError as ex:
+            return SuccessFail.fail(error=f'allocation activation rejected: {ex.code}: {ex.message}', exception=ex)
+        except (TimeoutError, ConnectionError) as ex:
+            return SuccessFail.fail(
+                error=f'activate_allocation did not complete: {ex}. Check status before retrying.',
+                exception=ex)
+
+        if receipt.state == 'RESOLVED':
+            return SuccessFail.success(obj=receipt.outcome)
+        return SuccessFail.fail(error=f'allocation activation rejected: {receipt.error_code or receipt.state}')
+
     def deactivate_live_canary(self, strategy_id: str, reason: str) -> SuccessFail:
         """Suspend an ACTIVE canary authority via ``deactivate_live_canary``.
         REQUIRES trader_service. Risk-reducing: no preflight nonce needed,

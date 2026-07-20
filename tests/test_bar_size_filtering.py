@@ -364,7 +364,9 @@ class TestNewStrategies:
         assert result is not None
         assert len(result.equity_curve) > 0
 
+    @pytest.mark.timeout(120)
     def test_vbt_macd_bb_strategy(self, tmp_duckdb_path):
+        """First-run vectorbt/numba JIT can take >30s on a cold CI runner."""
         dates = self._write_test_data(tmp_duckdb_path)
         storage = TickStorage(tmp_duckdb_path)
         config = BacktestConfig(

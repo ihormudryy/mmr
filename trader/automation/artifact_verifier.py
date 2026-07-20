@@ -11,6 +11,12 @@
 7. Expected-binding match (artifact id, allowlist, ruleset, mode, allocation, instruments).
 8. Read-only mount enforcement in live mode (writable mounts are rejected).
 
+P5 signed allocation authorities (``trader.promotion.allocation_attestation``) are a
+separate verification path from P2 eligibility and P4 canary activation — they govern
+the runtime gross-exposure ceiling ladder and are checked by ``AllocationPolicy`` (Task 2),
+not by this verifier. The artifact ``max_gross_allocation`` here remains the research
+bundle ceiling; the signed allocation authority may only ratify a lower runtime ceiling.
+
 Only a ``VerifiedArtifact`` returned by this function may be passed downstream.
 Callers must NOT cache raw attestation dicts or pass strategy-service "verified"
 booleans — every load and every command re-runs the full chain.

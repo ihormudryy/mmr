@@ -318,6 +318,9 @@ def build_command_stack(
 
     apply_canary_risk_migration(migrator)
     apply_session_checklist_migration(migrator)
+    from trader.data.allocation_authority_store import apply_allocation_authority_migrations
+
+    apply_allocation_authority_migrations(migrator)
     from trader.automation.protective_order_saga import (
         ProtectiveBracketDispatch,
         ProtectiveOrderSaga,

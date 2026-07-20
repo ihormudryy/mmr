@@ -149,11 +149,14 @@ massive_delayed: false
 twelvedata_api_key: ''
 
 # CLI default for --source on commands that take it (history download,
-# snapshot, watch, financials, fx, movers, ideas). Per-command --source
-# arguments still win. Override per-shell with MMR_DEFAULT_DATA_SOURCE.
+# snapshot, watch, financials, fx). Per-command --source still wins.
+# Override per-shell with MMR_DEFAULT_DATA_SOURCE.
 # Recognised values: massive, twelvedata, ib (only used where the choice
 # set for that command includes it; otherwise the command's own default
 # applies).
+# NOTE: `ideas` and `movers` always default to massive — TwelveData's
+# /market_movers endpoint requires Pro+, so inheriting twelvedata here
+# would 403 on Basic/Starter keys that still work for quotes/history.
 default_data_source: twelvedata
 
 # Equity-curve decimation at backtest-persist time. The full per-bar

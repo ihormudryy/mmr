@@ -1086,9 +1086,12 @@ def build_parser() -> argparse.ArgumentParser:
                            help='Enrich with company name, ratios, and news (card view; Massive only)')
     movers_p.add_argument('--num', '-n', type=int, default=20,
                            help='Number of results (default: 20)')
+    # Massive-first: TD /market_movers requires Pro+ and is not covered by
+    # default_data_source (which is often twelvedata for cheap history/quotes).
     movers_p.add_argument('--source', choices=['massive', 'twelvedata'],
-                          default=_src_default(['massive', 'twelvedata'], 'massive'),
-                           help='Data source (default: massive)')
+                          default='massive',
+                           help='Data source (default: massive). '
+                                'twelvedata needs a Pro+ plan for market movers.')
 
     # scan
     scan_p = sub.add_parser('scan', help='IB market scanner',
@@ -1170,9 +1173,13 @@ def build_parser() -> argparse.ArgumentParser:
                           help='How many top-ranked symbols to enrich with article bodies (default: 3)')
     ideas_p.add_argument('--location', '-l', default=None,
                           help='IB market location (e.g. STK.AU.ASX, STK.CA, STK.HK.SEHK)')
+    # Massive-first for US ideas (design principle). Do NOT inherit
+    # default_data_source=twelvedata — TD market movers is Pro+-only and would
+    # 403 on Basic/Starter keys that still work for quotes/history.
     ideas_p.add_argument('--source', choices=['massive', 'twelvedata'],
-                         default=_src_default(['massive', 'twelvedata'], 'massive'),
+                         default='massive',
                           help='Data source for US equities (default: massive). '
+                               'twelvedata needs a Pro+ plan for movers discovery. '
                                'Ignored when --location is set (IB path).')
 
     # propose
@@ -10614,6 +10621,10 @@ def _handle_ideas(mmr: MMR, args: argparse.Namespace):
         location=args.location,
         data_source=data_source,
     )
+
+    notice = getattr(df, 'attrs', {}).get('ideas_notice') if df is not None else None
+    if notice and not _json_mode:
+        console.print(f'[yellow]{notice}[/yellow]')
 
     location_label = f' [{args.location}]' if args.location else ''
     source_label = ' — TwelveData' if data_source == 'twelvedata' and not args.location else ''

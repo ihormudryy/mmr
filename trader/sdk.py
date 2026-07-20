@@ -4161,20 +4161,61 @@ class MMR:
                 names=names,
             )
 
-        # Massive path (default): US markets
-        from trader.tools.idea_scanner import IdeaScanner
-        scanner = IdeaScanner(self._massive_client)
-        return scanner.scan(
-            preset=preset,
-            source=source,
-            tickers=tickers,
-            universe_symbols=universe_symbols,
-            top_n=top_n,
-            custom_filters=custom_filters or None,
-            fundamentals=fundamentals,
-            news=news,
-            names=names,
+        # Massive path (default): US markets. Stocks Basic has no snapshots —
+        # fall back to TwelveData quotes on entitlement errors so bare `ideas`
+        # still works when the user has a TD key (common for history).
+        from trader.tools.idea_scanner import (
+            IdeaScanner,
+            IdeaScannerError,
+            LIQUID_US_FALLBACK_TICKERS,
+            TwelveDataIdeaScanner,
+            entitlement_fallback_notice,
+            is_data_entitlement_error,
         )
+        try:
+            scanner = IdeaScanner(self._massive_client)
+            return scanner.scan(
+                preset=preset,
+                source=source,
+                tickers=tickers,
+                universe_symbols=universe_symbols,
+                top_n=top_n,
+                custom_filters=custom_filters or None,
+                fundamentals=fundamentals,
+                news=news,
+                names=names,
+            )
+        except Exception as ex:
+            if not is_data_entitlement_error(ex):
+                raise
+            notice = entitlement_fallback_notice('massive', str(ex))
+            logging.warning(notice)
+            fb_source = source
+            fb_tickers = tickers
+            fb_universe = universe_symbols
+            if source == 'movers' or (not tickers and not universe_symbols):
+                fb_source = 'tickers'
+                fb_tickers = list(LIQUID_US_FALLBACK_TICKERS)
+                fb_universe = None
+            try:
+                td = TwelveDataIdeaScanner(self._twelvedata_client)
+                df = td.scan(
+                    preset=preset,
+                    source=fb_source,
+                    tickers=fb_tickers,
+                    universe_symbols=fb_universe,
+                    top_n=top_n,
+                    custom_filters=custom_filters or None,
+                    fundamentals=fundamentals,
+                    news=False,  # TD has no news
+                    names=names,
+                )
+            except Exception as td_ex:
+                raise IdeaScannerError(
+                    f'{notice} TwelveData fallback also failed: {td_ex}'
+                ) from td_ex
+            df.attrs['ideas_notice'] = notice
+            return df
 
     def scan(
         self,

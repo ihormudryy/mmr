@@ -190,6 +190,9 @@ COMMAND_PORT_REQUIREMENTS: dict[str, frozenset[str]] = {
     "enable_strategy": frozenset({PORT_STRATEGY}),
     "disable_strategy": frozenset({PORT_STRATEGY}),
     "update_strategy_params": frozenset({PORT_STRATEGY, PORT_NONCES}),
+    "execute_automated_intent": frozenset({
+        PORT_ORDER_SUBMIT, PORT_ORDER_STATE, PORT_QUOTES, PORT_POSITIONS,
+        PORT_BROKER, PORT_RISK_GATE, PORT_ALERTS, PORT_CONTROLS}),
 }
 
 ALL_PORTS: frozenset[str] = frozenset().union(*COMMAND_PORT_REQUIREMENTS.values())

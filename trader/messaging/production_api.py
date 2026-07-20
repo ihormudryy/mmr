@@ -83,7 +83,8 @@ import asyncio
 import dataclasses
 import datetime as dt
 from dataclasses import asdict
-from typing import TYPE_CHECKING, Any, Dict, Optional
+from decimal import Decimal
+from typing import TYPE_CHECKING, Any, Dict, Literal, Optional
 
 from ib_async import Contract
 from pydantic import BaseModel, ConfigDict, Field, field_validator
@@ -437,6 +438,69 @@ class ApproveProposalRequest(BaseModel):
         return _reject_colon_in_command_id(value)
 
 
+class _EntryPolicyWire(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    order_type: Literal["LIMIT", "MARKETABLE_LIMIT"]
+    limit_offset_bps: Decimal
+    tif: Literal["DAY"]
+
+
+class _StopPolicyWire(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    stop_price: Decimal
+    order_type: Literal["STP", "STP_LMT"]
+
+
+class _TargetPolicyWire(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    target_price: Decimal
+    order_type: Literal["LMT"]
+
+
+class _TimeExitPolicyWire(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    max_hold_bars: Optional[int] = None
+    close_by: dt.datetime
+
+
+class ExecuteAutomatedIntentRequest(BaseModel):
+    """[P3 Task 3] Strategy-service-only automated intent command.
+
+    Carries the full frozen ``ExecutionIntent`` fields plus the artifact
+    bundle digest. ``account_id`` is deliberately absent -- the trader pins
+    its own account. Only the strategy-service principal may invoke this
+    action; dashboard/browser/CLI must not register an HTTP route for it.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    command_id: str
+    artifact_id: str
+    session_id: str
+    bar_id: str
+    signal_id: str
+    intent_id: str
+    account_mode: Literal["paper", "live"]
+    conid: int
+    side: Literal["BUY", "SELL"]
+    requested_quantity: Optional[Decimal] = None
+    risk_fraction: Decimal
+    entry_policy: _EntryPolicyWire
+    stop_policy: _StopPolicyWire
+    target_policy: Optional[_TargetPolicyWire] = None
+    time_exit_policy: _TimeExitPolicyWire
+    artifact_digest: str
+    eligibility_attestation_digest: str
+    signal_timestamp: dt.datetime
+    completed_bar_timestamp: dt.datetime
+    artifact_bundle_digest: str
+
+    @field_validator("command_id")
+    @classmethod
+    def _command_id_has_no_colon(cls, value: str) -> str:
+        return _reject_colon_in_command_id(value)
+
+
 class CancelOrderRequest(BaseModel):
     """[M1-F3] Task 6. Cancels one working order by its [M1-F2] entity id.
 
@@ -658,6 +722,30 @@ def _approve_proposal_rpc_handler(coordinator: TradingCommandCoordinator, accoun
         )
         receipt = coordinator.execute(request)
         return _receipt_to_dict(receipt)
+    return _handler
+
+
+def _execute_automated_intent_rpc_handler(
+    coordinator: TradingCommandCoordinator, account_id: Optional[str],
+):
+    """[P3 Task 3] Strategy-service principal only — never ``source=dashboard``."""
+
+    def _handler(parsed: ExecuteAutomatedIntentRequest) -> Dict[str, Any]:
+        # JSON mode keeps ledger/audit persistence free of datetime objects.
+        body = parsed.model_dump(mode="json")
+        request = CommandRequest(
+            command_id=parsed.command_id,
+            action="execute_automated_intent",
+            account_id=account_id,
+            target_type="intent",
+            target_id=parsed.intent_id,
+            expected_version=None,
+            body=body,
+            source="strategy_service",
+        )
+        receipt = coordinator.execute(request)
+        return _receipt_to_dict(receipt)
+
     return _handler
 
 
@@ -1058,6 +1146,7 @@ def register_command_authority(
     cancel_service: Optional[CancelCommandService] = None,
     liquidation_service=None,
     strategy_control_service: Optional[StrategyControlCommandService] = None,
+    automated_intent_service=None,
 ) -> None:
     """Wire the command-authority surface onto ``registry``.
 
@@ -1240,6 +1329,17 @@ def register_command_authority(
         registry.register(
             "command", "record_state_acknowledged", RecordStateAcknowledgedRequest, dict,
             _record_state_acknowledged_handler(strategy_control_service),
+        )
+
+    if automated_intent_service is not None:
+        # P3 Task 3: strategy-service principal only. No dashboard HTTP route.
+        coordinator.register_action(
+            "execute_automated_intent", automated_intent_service.execute,
+            requires_preflight=False, saga=True,
+        )
+        registry.register(
+            "command", "execute_automated_intent", ExecuteAutomatedIntentRequest, dict,
+            _execute_automated_intent_rpc_handler(coordinator, account_id),
         )
 
 

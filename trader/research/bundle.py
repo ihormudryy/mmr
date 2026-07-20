@@ -96,10 +96,12 @@ class ResearchBundle:
             raise BundleError("bundle is not read-only")
         _validate_payload_bindings(path, manifest, trusted_public_keys)
         digest = manifest["manifest_digest"]
+        trace_digests = _parse_trace_digests(manifest.get("trace_digests"))
         return VerifiedResearchBundle(
             manifest_digest=digest, artifact_id=manifest["artifact_id"],
             dataset_manifest_digest=manifest["dataset_manifest_digest"],
-            attestation=dict(manifest["attestation"]))
+            attestation=dict(manifest["attestation"]),
+            trace_digests=trace_digests)
 
     def _load_public_evidence(self, artifact_id: str) -> dict[str, Any]:
         artifact = self._registry.get_artifact(artifact_id)
@@ -148,6 +150,7 @@ class ResearchBundle:
                 f"bundle_folds:{folds_digest}" not in attestation.evidence_refs):
             raise BundleError("attestation trial or validation-fold binding disagrees")
 
+        trace_digests = self._trace_digests_for(artifact.selected_trial_id)
         return {
             "artifact": _artifact_public(artifact, self._holdout_for(artifact_id)),
             "family": _family_public(family),
@@ -156,6 +159,7 @@ class ResearchBundle:
             "decision": _decision_public(decision),
             "review": _review_public(review),
             "attestation": _attestation_public(attestation),
+            "trace_digests": trace_digests,
         }
 
     def _decision_digest_for(self, artifact_id: str) -> str:
@@ -191,6 +195,16 @@ class ResearchBundle:
             raise BundleError("review must have exactly one signed attestation")
         return rows[0][0]
 
+    def _trace_digests_for(self, selected_trial_id: str) -> tuple[str, ...]:
+        trial = self._registry.get_trial(selected_trial_id)
+        if trial is None:
+            raise BundleError("selected trial is missing from registry")
+        trace = trial.metrics.get("trace_signature")
+        if not isinstance(trace, str) or len(trace) != 64 or not all(
+                char in "0123456789abcdef" for char in trace):
+            raise BundleError("selected trial is missing a valid trace_signature metric")
+        return (trace,)
+
     def _holdout_for(self, artifact_id: str) -> dict[str, Any]:
         def query(conn):
             return conn.execute(
@@ -208,6 +222,7 @@ class ResearchBundle:
         attestation = evidence["attestation"]
         trials_digest = _bundle_digest("trials", evidence["trials"])
         folds_digest = _bundle_digest("folds", evidence["folds"])
+        trace_digests = _parse_trace_digests(evidence["trace_digests"])
         manifest = {
             "format_version": FORMAT_VERSION,
             "artifact_id": evidence["artifact"]["artifact_id"],
@@ -219,6 +234,7 @@ class ResearchBundle:
             "ruleset_digest": attestation["ruleset_digest"],
             "trials_digest": trials_digest,
             "folds_digest": folds_digest,
+            "trace_digests": list(trace_digests),
             "files": checksums,
         }
         manifest["manifest_digest"] = _sha256(canonical_json_bytes(manifest))
@@ -276,10 +292,22 @@ def _chmod_read_only(root: Path) -> None:
     root.chmod(0o555)
 
 
+def _parse_trace_digests(value: Any) -> tuple[str, ...]:
+    if not isinstance(value, Sequence) or isinstance(value, (str, bytes)) or not value:
+        raise BundleError("invalid trace digest list")
+    digests: list[str] = []
+    for item in value:
+        if not isinstance(item, str) or len(item) != 64 or not all(
+                char in "0123456789abcdef" for char in item):
+            raise BundleError("invalid trace digest entry")
+        digests.append(item)
+    return tuple(digests)
+
+
 def _validate_manifest(manifest: Any) -> None:
     required = {"format_version", "artifact_id", "attestation", "source_digest",
                 "config_digest", "dataset_manifest_digest", "ruleset_digest", "trials_digest",
-                "folds_digest", "files", "manifest_digest"}
+                "folds_digest", "trace_digests", "files", "manifest_digest"}
     if not isinstance(manifest, dict) or manifest.get("format_version") != FORMAT_VERSION:
         raise BundleError("unsupported bundle format")
     if set(manifest) != required or not isinstance(manifest["artifact_id"], str):
@@ -302,6 +330,7 @@ def _validate_manifest(manifest: Any) -> None:
                all(char in "0123456789abcdef" for char in value)
                for value in files.values()):
         raise BundleError("invalid manifest checksum table")
+    _parse_trace_digests(manifest["trace_digests"])
     digest_body = dict(manifest)
     digest = digest_body.pop("manifest_digest")
     if _sha256(canonical_json_bytes(digest_body)) != digest:
@@ -371,6 +400,10 @@ def _validate_payload_bindings(root: Path, manifest: Mapping[str, Any],
         if (_bundle_digest("trials", trials) != manifest["trials_digest"] or
                 _bundle_digest("folds", folds) != manifest["folds_digest"]):
             raise BundleError("trial or validation-fold digest binding disagrees")
+        trace_digests = _parse_trace_digests(manifest["trace_digests"])
+        trace_metric = selected_trial.get("metrics", {}).get("trace_signature")
+        if trace_metric != trace_digests[0] or len(trace_digests) != 1:
+            raise BundleError("selected trial trace binding disagrees")
         if review["artifact_id"] != artifact["artifact_id"] or \
                 review["eligibility_decision_digest"] != decision["decision_digest"]:
             raise BundleError("review binding disagrees")

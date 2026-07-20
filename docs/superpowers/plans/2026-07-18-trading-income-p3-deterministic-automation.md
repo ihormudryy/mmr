@@ -65,12 +65,12 @@
 
 **Action:** `execute_automated_intent`; only the authenticated strategy-service principal may call it. Browser/CLI principals are forbidden.
 
-- [ ] Test principal allowlisting, canonical request hash replay, changed payload conflict, command claimed/audited before validation, and colon-free order-group correlation.
-- [ ] Test duplicate delivery during in-flight, after reject, after submit, after `OUTCOME_UNKNOWN`, and after resolution never dispatches twice.
-- [ ] Add a typed request model carrying the full intent and artifact bundle digest; account ID is derived from the trader, never request body.
-- [ ] Register the action on the existing coordinator. Do not create another ledger/coordinator or call `TradingRuntimeOrderDispatch` directly from a route/runtime.
-- [ ] Record artifact, session, signal, intent, attestation, policy, and evidence IDs in command audit before dispatch.
-- [ ] Run focused tests and commit `feat(automation): route intents through command authority`.
+- [x] Test principal allowlisting, canonical request hash replay, changed payload conflict, command claimed/audited before validation, and colon-free order-group correlation.
+- [x] Test duplicate delivery during in-flight, after reject, after submit, after `OUTCOME_UNKNOWN`, and after resolution never dispatches twice.
+- [x] Add a typed request model carrying the full intent and artifact bundle digest; account ID is derived from the trader, never request body.
+- [x] Register the action on the existing coordinator. Do not create another ledger/coordinator or call `TradingRuntimeOrderDispatch` directly from a route/runtime.
+- [x] Record artifact, session, signal, intent, attestation, policy, and evidence IDs in command audit before dispatch.
+- [x] Run focused tests and commit `feat(automation): route intents through command authority`.
 
 ### Task 4: Implement trader-owned session, liquidity, and risk policy
 

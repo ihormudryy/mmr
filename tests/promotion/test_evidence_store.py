@@ -244,6 +244,93 @@ def test_multiple_corrections_use_the_most_recent_boundary(tmp_path):
 
 
 # ---------------------------------------------------------------------------
+# Elapsed calendar-day span vs. distinct session-date count
+# ---------------------------------------------------------------------------
+
+def test_elapsed_calendar_days_is_span_not_distinct_date_count(tmp_path):
+    """A normal ~30-calendar-day paper soak with only ~20 trading sessions
+    (weekends/holidays skipped) has FEWER distinct session dates than its
+    elapsed span -- ``elapsed_calendar_days`` must reflect the span."""
+    store, *_ = _store(tmp_path)
+    base = dt.datetime(2026, 5, 1, 15, 0, tzinfo=UTC)
+    offsets = (0, 1, 2, 3, 4, 6, 7, 8, 9, 10, 12, 13, 14, 15, 16, 18, 19, 20, 21, 29)
+    for i, offset in enumerate(offsets):
+        store.append(_event(
+            "session", source_event_id=f"sess-{i}", ts=base + dt.timedelta(days=offset),
+            session_id=f"s{i}",
+        ))
+
+    window = store.project(STRATEGY, as_of=base + dt.timedelta(days=29))
+    assert window.calendar_day_count == 20  # 20 distinct dates
+    assert window.elapsed_calendar_days == 30  # but a 30-day elapsed span
+
+
+def test_elapsed_calendar_days_matches_count_for_consecutive_days(tmp_path):
+    """For consecutive daily sessions, span and distinct-date count agree --
+    confirms the fix doesn't change behavior for the simple case."""
+    store, *_ = _store(tmp_path)
+    day1 = dt.datetime(2026, 6, 1, 15, 0, tzinfo=UTC)
+    day2 = dt.datetime(2026, 6, 2, 15, 0, tzinfo=UTC)
+    store.append(_event("session", source_event_id="sess-1", ts=day1, session_id="s1"))
+    store.append(_event("session", source_event_id="sess-2", ts=day2, session_id="s2"))
+
+    window = store.project(STRATEGY, as_of=day2)
+    assert window.calendar_day_count == 2
+    assert window.elapsed_calendar_days == 2
+
+
+def test_elapsed_calendar_days_is_zero_for_empty_window(tmp_path):
+    store, *_ = _store(tmp_path)
+    window = store.project("never_seen_strategy", as_of=NOW)
+    assert window.elapsed_calendar_days == 0
+
+
+# ---------------------------------------------------------------------------
+# rebuild_window: read-only rebuild (no persistence, no domain event)
+# ---------------------------------------------------------------------------
+
+def test_rebuild_window_matches_project_content_without_persisting(tmp_path):
+    store, journal, db, _ = _store(tmp_path)
+    store.append(_event("session", source_event_id="sess-1", ts=NOW, session_id="s1"))
+    store.append(_event("round_trip", source_event_id="rt-1", ts=NOW, round_trip_id="cmd-1", conid=1))
+
+    rebuilt = store.rebuild_window(STRATEGY, as_of=NOW)
+    assert rebuilt.session_count == 1
+    assert rebuilt.round_trip_count == 1
+
+    # Never wrote to promotion_evidence_windows...
+    assert store.load_window(STRATEGY) is None
+    row_count = db.execute(
+        "SELECT COUNT(*) FROM promotion_evidence_windows", fetch="one",
+    )
+    assert row_count == (0,)
+
+    # ...and never emitted a domain event either.
+    kinds = {
+        row[0]
+        for row in db.execute(
+            "SELECT event_type FROM domain_event_journal "
+            "WHERE entity_type = 'promotion_evidence_window'",
+            fetch="all",
+        )
+    }
+    assert "promotion.evidence_window_rebuilt" not in kinds
+
+    # Content matches what project() would have produced (and persisted).
+    projected = store.project(STRATEGY, as_of=NOW)
+    assert rebuilt.to_payload() == projected.to_payload()
+
+
+def test_rebuild_window_is_pure_and_repeatable(tmp_path):
+    store, *_ = _store(tmp_path)
+    store.append(_event("session", source_event_id="sess-1", ts=NOW, session_id="s1"))
+
+    a = store.rebuild_window(STRATEGY, as_of=NOW)
+    b = store.rebuild_window(STRATEGY, as_of=NOW)
+    assert a.to_payload() == b.to_payload()
+
+
+# ---------------------------------------------------------------------------
 # 30-day evidence inactivity
 # ---------------------------------------------------------------------------
 

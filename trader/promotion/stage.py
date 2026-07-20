@@ -66,15 +66,24 @@ _ALLOWED_EDGES: dict[Optional[str], frozenset[str]] = {
 # Stages that certify evidence as "good enough to move forward" and
 # therefore MANDATE a store-backed, freshly-projected, clean evidence window
 # (not stale, no breaker trip, no cost breach, no drawdown breach since the
-# last correction). Tasks 2/3/6 own the concrete simultaneous floors (day/
-# session/round-trip/instrument counts); this machine only refuses to
-# rubber-stamp a passed/authorized/canary-passed stage without real, current,
+# last correction). Tasks 3/6 own the concrete CANARY_AUTHORIZED/
+# CANARY_PASSED floors; this machine only refuses to rubber-stamp a
+# passed/authorized/canary-passed stage without real, current,
 # STORE-PROJECTED evidence -- omission is a rejection, never trusted, and a
 # caller-constructed ``EvidenceWindow`` is never accepted as sufficient proof
 # on its own (that would let a forged clean window rubber-stamp the gate --
 # see ``EvidenceStore``/``_require_clean_evidence`` below). Software
 # completion alone (a bare reason/actor with no evidence_store) can never
 # mark a paper or live gate passed.
+#
+# PAPER_PASSED additionally requires ``PaperGate.evaluate(projected).passed``
+# -- Task 2's exact simultaneous floors (30 elapsed calendar days, 20
+# sessions, 50 round trips, 5 instruments) and safety/economic/
+# diversification blockers -- evaluated against the SAME store-projected
+# window used for the generic staleness/breaker/cost/drawdown checks below.
+# A window that is merely "clean" by Task 1's generic definition (not stale,
+# no breaker/cost/drawdown incident) is NOT sufficient on its own to reach
+# PAPER_PASSED; it must also clear PaperGate. See ``_require_clean_evidence``.
 _REQUIRES_CLEAN_EVIDENCE = frozenset({PAPER_PASSED, CANARY_AUTHORIZED, CANARY_PASSED})
 
 _WINDOW_COMPARISON_FIELDS = (
@@ -294,7 +303,10 @@ class PromotionStageMachine:
     proof by itself, closing the "forged clean window" bypass -- refusing to
     advance if the store is missing, an optionally-supplied ``evidence_window``
     disagrees with the store's own projection, or the projection is stale or
-    carries breaker/cost/drawdown evidence, (3) for canary authorization/
+    carries breaker/cost/drawdown evidence -- and, specifically for
+    PAPER_PASSED, ALSO refusing unless that same projection clears
+    ``PaperGate.evaluate(...).passed`` (Task 2's simultaneous floors and
+    safety/economic/diversification blockers) -- (3) for canary authorization/
     activation, records and then verifies authority reference + expiry
     exactly, and (4) persists the new ``StageRecord`` and its domain event
     atomically.
@@ -417,8 +429,27 @@ class PromotionStageMachine:
                 reasons.append("cost_breach")
             if projected.drawdown_breaches:
                 reasons.append("drawdown_breach")
+            if to_stage == PAPER_PASSED:
+                # CRITICAL: Task 1's generic cleanliness checks above are
+                # necessary but not sufficient for PAPER_PASSED -- the same
+                # store-projected window must also clear PaperGate's exact
+                # simultaneous floors and safety/economic/diversification
+                # blockers. Deferred import: trader.promotion.paper_gate
+                # imports the PAPER_* stage constants from this module, so a
+                # module-level import here would be circular.
+                from trader.promotion.paper_gate import PaperGate
+
+                decision = PaperGate().evaluate(projected)
+                if not decision.passed:
+                    reasons.extend(
+                        f"floor_{floor.name}" for floor in decision.floors if not floor.met
+                    )
+                    reasons.extend(decision.blockers)
         if reasons:
-            raise EvidenceNotCleanError(strategy_id, to_stage, tuple(reasons))
+            # De-duplicate while preserving order: the generic checks above
+            # and PaperGate's blockers legitimately overlap on some names
+            # (e.g. "stale_evidence", "breaker_trip", "drawdown_breach").
+            raise EvidenceNotCleanError(strategy_id, to_stage, tuple(dict.fromkeys(reasons)))
 
     @staticmethod
     def _record_authority(

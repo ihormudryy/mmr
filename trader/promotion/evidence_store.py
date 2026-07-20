@@ -225,6 +225,24 @@ class EvidenceWindow:
         return len(self.calendar_days)
 
     @property
+    def elapsed_calendar_days(self) -> int:
+        """Elapsed calendar-day SPAN (inclusive) between the earliest and
+        latest in-window session date -- ``(last - first).days + 1`` -- not
+        a count of distinct session dates. A normal ~30-calendar-day paper
+        soak with only ~20 trading sessions (weekends/holidays skipped) must
+        be able to meet a 30-calendar-day floor; a raw distinct-date COUNT
+        (``calendar_day_count``) never could without a session on every
+        single day, which real trading calendars never have. Zero when
+        there are no in-window sessions at all (an empty window never
+        satisfies any elapsed-days floor).
+        """
+        if not self.calendar_days:
+            return 0
+        first = dt.date.fromisoformat(self.calendar_days[0])
+        last = dt.date.fromisoformat(self.calendar_days[-1])
+        return (last - first).days + 1
+
+    @property
     def session_count(self) -> int:
         return len(self.session_ids)
 
@@ -598,6 +616,21 @@ class EvidenceStore:
             event_id=f"promo-window:{strategy_id}:{uuid.uuid4().hex}",
         )
         return window
+
+    def rebuild_window(self, strategy_id: str, as_of: Optional[dt.datetime] = None) -> EvidenceWindow:
+        """Pure, READ-ONLY rebuild of the derived window: lists raw evidence
+        and projects it exactly like ``project`` does, but never writes to
+        ``promotion_evidence_windows`` and never emits a domain event.
+
+        Use this from reporting/CLI/inspection code paths that must never
+        mutate the store merely because someone looked at it -- ``project``
+        remains the durable, persisted path for callers (e.g.
+        ``PromotionStageMachine``) that actually want the rebuilt window
+        recorded as the current derived snapshot.
+        """
+        resolved_as_of = _as_utc(as_of) if as_of is not None else _as_utc(self._now())
+        events = self.list_events(strategy_id)
+        return project_evidence_window(strategy_id, events, resolved_as_of)
 
     def load_window(self, strategy_id: str) -> Optional[EvidenceWindow]:
         row = self.db.execute(

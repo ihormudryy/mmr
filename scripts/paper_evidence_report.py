@@ -11,9 +11,13 @@ process or platform (``trader.research.canonical.canonical_json_bytes`` --
 the same primitive the research evidence chain signs over).
 
 The report never edits evidence and never mutates promotion stage -- it is
-read-only reporting. ``build_report`` is the pure function tests exercise
-directly; ``main`` is a thin CLI wrapper that loads a window from a real
-DuckDB file.
+read-only reporting. It loads via ``EvidenceStore.rebuild_window`` (a pure
+list-and-project rebuild) rather than ``EvidenceStore.project`` specifically
+because ``project`` persists the derived window and emits a domain event as
+a side effect -- exactly the kind of write a tool billed as "read-only
+reporting" must never perform just because someone ran a report.
+``build_report`` is the pure function tests exercise directly; ``main`` is a
+thin CLI wrapper that loads a window from a real DuckDB file.
 
 Usage:
     python3 scripts/paper_evidence_report.py --db ~/.local/share/mmr/mmr.duckdb \\
@@ -84,7 +88,10 @@ def _load_window(db_path: str, strategy_id: str, as_of: Optional[dt.datetime]) -
     journal.migrate(migrator)
     apply_evidence_migrations(migrator)
     store = EvidenceStore(journal=journal, db=db)
-    return store.project(strategy_id, as_of=as_of)
+    # Read-only rebuild -- NOT store.project(), which persists the derived
+    # window and emits a domain event. A report must never write as a side
+    # effect of being generated.
+    return store.rebuild_window(strategy_id, as_of=as_of)
 
 
 def _parse_as_of(value: Optional[str]) -> Optional[dt.datetime]:

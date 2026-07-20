@@ -16,6 +16,11 @@ Two independent requirements gate a pass:
    trips, and five distinct instruments, ALL met simultaneously. Meeting
    four of the four floors generously is not "close enough" if the fifth
    isn't met -- see ``test_floors_must_be_met_simultaneously_not_independently``.
+   The calendar-days floor is the ELAPSED SPAN from the earliest to the
+   latest in-window session date (``EvidenceWindow.elapsed_calendar_days``),
+   not a count of distinct session dates -- a normal ~30-calendar-day paper
+   soak with ~20 trading sessions (weekends/holidays skipped) must be able
+   to meet it.
 2. **Blockers** -- divergence, duplicate, unresolved ambiguity/alert, missed
    flat, replay mismatch, a stressed-cost breach, negative expectancy, and
    instrument concentration EACH independently block a pass, regardless of
@@ -52,11 +57,12 @@ __all__ = [
     "BLOCK_DIVERGENCE", "BLOCK_DUPLICATE", "BLOCK_UNRESOLVED_ALERT", "BLOCK_MISSED_FLAT",
     "BLOCK_REPLAY_MISMATCH", "BLOCK_STRESSED_COST_BREACH", "BLOCK_NEGATIVE_EXPECTANCY",
     "BLOCK_CONCENTRATION", "BLOCK_BREAKER_TRIP", "BLOCK_DRAWDOWN_BREACH", "BLOCK_STALE_EVIDENCE",
+    "BLOCK_MISSING_ECONOMIC_EVIDENCE", "BLOCK_MISSING_INSTRUMENT_EVIDENCE",
     "MAX_INSTRUMENT_CONCENTRATION",
     "PAPER_COLLECTING", "PAPER_FAILED", "PAPER_PASSED",
     "FloorStatus", "PromotionDecision", "PaperGate",
     "SAFETY_CORRECTION_SCOPES", "is_safety_correction", "clean_session_streak", "correction_impact",
-    "ShadowTrace", "ShadowComparisonResult", "ShadowRunner",
+    "ShadowTrace", "ShadowComparisonResult", "ShadowRunner", "ShadowEscapeError",
 ]
 
 # Exact simultaneous floors (plan Task 2 / brief): 30 calendar days, 20
@@ -83,6 +89,14 @@ BLOCK_CONCENTRATION = "concentration"
 BLOCK_BREAKER_TRIP = "breaker_trip"
 BLOCK_DRAWDOWN_BREACH = "drawdown_breach"
 BLOCK_STALE_EVIDENCE = "stale_evidence"
+# Fail-closed evidence-availability blockers: round trips exist (the floor
+# can even be met) but NONE of them carry a parseable pnl_after_cost /
+# instrument id at all. Precision-over-convenience: an economic/
+# diversification claim with no underlying data to back it is worse than no
+# claim -- it must never be silently treated as "None, therefore skip the
+# check" and let the gate pass. See ``_expectancy_and_concentration``.
+BLOCK_MISSING_ECONOMIC_EVIDENCE = "missing_economic_evidence"
+BLOCK_MISSING_INSTRUMENT_EVIDENCE = "missing_instrument_evidence"
 
 # No single instrument may account for more than this fraction of in-window
 # round trips -- otherwise the "five instruments" floor is technically met
@@ -174,13 +188,27 @@ def _expectancy_and_concentration(
     average, never treated as zero -- see
     ``trader.automation.attribution``'s "never assume zero P&L" precedent).
     ``max_instrument_concentration`` is the largest fraction of records
-    attributed to a single instrument. Either metric is ``None`` (and never
-    blocks) when there is nothing to compute it from.
+    attributed to a single instrument. Either metric is ``None`` when there
+    are no round-trip records at all to compute it from (still floor-gated
+    separately by ``round_trip_count``/``instrument_count`` -- no records at
+    all never blocks HERE, it fails the floor instead).
+
+    Fail-closed exception to "exclude, don't zero": if round-trip records
+    DO exist but NOT ONE of them carries a parseable ``pnl_after_cost`` (or,
+    separately, an ``instrument_id``/``conid``), that is not "nothing to
+    compute from" -- it is 50 round trips' worth of evidence that was
+    promised and never delivered. Silently returning ``None`` and skipping
+    the check would let that inconsistency pass; instead each case adds its
+    own explicit blocker (``BLOCK_MISSING_ECONOMIC_EVIDENCE``/
+    ``BLOCK_MISSING_INSTRUMENT_EVIDENCE``) so the gate fails closed instead
+    of inventing a passed claim from missing data.
     """
     pnls = [d for r in records if (d := _decimal(r.get("pnl_after_cost"))) is not None]
     net_expectancy: Optional[float] = None
     blockers: list[str] = []
-    if pnls:
+    if records and not pnls:
+        blockers.append(BLOCK_MISSING_ECONOMIC_EVIDENCE)
+    elif pnls:
         net_expectancy = float(sum(pnls, Decimal("0")) / Decimal(len(pnls)))
         if net_expectancy <= 0:
             blockers.append(BLOCK_NEGATIVE_EXPECTANCY)
@@ -192,7 +220,9 @@ def _expectancy_and_concentration(
         if key is None:
             continue
         counts[key] = counts.get(key, 0) + 1
-    if counts:
+    if records and not counts:
+        blockers.append(BLOCK_MISSING_INSTRUMENT_EVIDENCE)
+    elif counts:
         total = sum(counts.values())
         max_concentration_observed = max(counts.values()) / total
         if max_concentration_observed > max_concentration:
@@ -214,8 +244,8 @@ class PaperGate:
 
     def evaluate(self, window: EvidenceWindow) -> PromotionDecision:
         floors = (
-            FloorStatus("calendar_days", FLOOR_CALENDAR_DAYS, window.calendar_day_count,
-                       window.calendar_day_count >= FLOOR_CALENDAR_DAYS),
+            FloorStatus("calendar_days", FLOOR_CALENDAR_DAYS, window.elapsed_calendar_days,
+                       window.elapsed_calendar_days >= FLOOR_CALENDAR_DAYS),
             FloorStatus("sessions", FLOOR_SESSIONS, window.session_count,
                        window.session_count >= FLOOR_SESSIONS),
             FloorStatus("round_trips", FLOOR_ROUND_TRIPS, window.round_trip_count,
@@ -452,6 +482,40 @@ def _diff_registrations(shadow_would_register: Sequence[str],
     }]
 
 
+class ShadowEscapeError(Exception):
+    """Raised by ``run_shadow`` when the ``compute`` callable's returned
+    trace shows evidence of a registration that did NOT go through the
+    injected interceptor -- i.e. ``trace.registered_intents`` came back
+    non-empty even though ``run_shadow`` only ever hands ``compute`` the
+    in-memory interceptor, never a real executor.
+
+    ``registered_intents`` is documented (``ShadowTrace``) as "only ever
+    non-empty for a paper trace" -- the ONLY way ``compute`` can produce a
+    non-empty value under shadow is by holding a reference to some real
+    execution path (e.g. a strategy pipeline that imports/retains a live
+    ``command_client``/``execute_automated_intent`` instead of calling
+    through the parameter it was handed) and recording success there
+    itself, bypassing the interceptor entirely. ``run_shadow`` cannot
+    prevent that escape (it has no visibility into what ``compute`` does
+    internally), but it MUST NOT mask it either -- silently coercing
+    ``registered_intents`` back to ``()`` (the previous behavior) would
+    hide exactly the failure mode this exists to catch. Fail loudly, not
+    silently: any integration wiring a real automation pipeline (e.g.
+    ``trader.strategy.intent_emitter.IntentEmitter``) into ``compute`` MUST
+    route ALL execution exclusively through the injected callback
+    parameter -- never hold a separate reference to a live command client.
+    """
+
+    def __init__(self, escaped_intent_ids: tuple[str, ...]):
+        self.escaped_intent_ids = escaped_intent_ids
+        super().__init__(
+            "shadow run escaped the interceptor boundary: compute() reported "
+            f"registered_intents={escaped_intent_ids!r} while running under "
+            "run_shadow(), which never hands compute a real executor -- some "
+            "code path bypassed the injected callback and registered for real"
+        )
+
+
 class ShadowRunner:
     """Runs one ``compute`` pipeline in shadow mode and/or paper mode over
     the same sealed input, and can compare the two traces.
@@ -472,6 +536,17 @@ class ShadowRunner:
     completes (it never raises just because the strategy wanted to trade).
     In paper mode the callback is a tracking wrapper around whatever real
     ``execute_automated_intent`` the caller supplies.
+
+    This guarantee holds for any ``compute`` that routes ALL execution
+    through the parameter it is handed -- it does NOT (and structurally
+    cannot) prevent a ``compute`` implementation that separately retains a
+    live executor reference and calls it directly, bypassing the injected
+    interceptor altogether. As defense in depth for that escape,
+    ``run_shadow`` raises ``ShadowEscapeError`` if the ``compute`` callable
+    ever returns a trace whose ``registered_intents`` is non-empty --
+    that field is documented to be populated ONLY by the real tracking
+    wrapper ``run_paper`` installs, so seeing it non-empty under shadow is
+    itself proof that something real fired outside the interceptor.
     """
 
     def __init__(self, compute: Callable[[Any, Callable[..., Any]], ShadowTrace]):
@@ -488,6 +563,8 @@ class ShadowRunner:
             return {"shadow_intercepted": True, "intent_id": intent_id}
 
         trace = self._compute(sealed_input, _intercepting_execute)
+        if trace.registered_intents:
+            raise ShadowEscapeError(tuple(trace.registered_intents))
         return replace(
             trace, mode="shadow", registered_intents=(),
             intercepted_registrations=tuple(intercepted),

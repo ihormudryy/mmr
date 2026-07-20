@@ -22,6 +22,7 @@ Contract:
 from __future__ import annotations
 
 import datetime as dt
+from dataclasses import replace
 
 import pytest
 
@@ -160,6 +161,120 @@ def test_stale_window_blocks_pass_even_with_floors_met():
     decision = PaperGate().evaluate(_window(stale=True))
     assert decision.passed is False
     assert "stale_evidence" in decision.blockers
+
+
+def test_calendar_days_floor_is_elapsed_span_not_distinct_session_date_count():
+    """CRITICAL: a normal ~30-calendar-day paper soak with only ~20 trading
+    sessions (weekends/holidays skipped) must be able to meet the 30-day
+    floor -- the floor is the elapsed SPAN between the earliest and latest
+    in-window session date, not a COUNT of distinct session dates."""
+    from trader.promotion.paper_gate import PaperGate
+
+    # 20 session dates spanning exactly 30 elapsed calendar days (gaps for
+    # weekends), i.e. only 20 distinct dates -- NOT 30 distinct dates.
+    offsets = (0, 1, 2, 3, 4, 6, 7, 8, 9, 10, 12, 13, 14, 15, 16, 18, 19, 20, 21, 29)
+    start = dt.date(2026, 5, 1)
+    calendar_dates = tuple((start + dt.timedelta(days=o)).isoformat() for o in offsets)
+
+    window = replace(_window(), calendar_days=calendar_dates)
+    assert len(window.calendar_days) == 20  # distinct dates: only 20
+    assert window.elapsed_calendar_days == 30  # elapsed span: 30
+
+    decision = PaperGate().evaluate(window)
+    day_floor = next(f for f in decision.floors if f.name == "calendar_days")
+    assert day_floor.observed == 30
+    assert day_floor.met is True
+    assert decision.passed is True
+
+
+def test_calendar_days_floor_still_fails_when_elapsed_span_is_short():
+    from trader.promotion.paper_gate import PaperGate
+
+    # 20 sessions crammed into only 25 elapsed calendar days.
+    calendar_dates = tuple(
+        (dt.date(2026, 5, 1) + dt.timedelta(days=i)).isoformat() for i in range(20)
+    )
+    window = replace(_window(), calendar_days=calendar_dates)
+    assert window.elapsed_calendar_days == 20
+
+    decision = PaperGate().evaluate(window)
+    day_floor = next(f for f in decision.floors if f.name == "calendar_days")
+    assert day_floor.met is False
+    assert decision.passed is False
+
+
+# ---------------------------------------------------------------------------
+# CRITICAL: fail closed on missing economic/diversification evidence -- a
+# round trip that lacks pnl_after_cost/instrument_id must never be silently
+# treated as "nothing to compute, so skip the check".
+# ---------------------------------------------------------------------------
+
+def test_missing_pnl_after_cost_on_all_round_trips_blocks():
+    from trader.promotion.paper_gate import BLOCK_MISSING_ECONOMIC_EVIDENCE, PaperGate
+
+    instruments = _instruments(5)
+    records = tuple(
+        {"round_trip_id": f"rt-{i}", "instrument_id": instruments[i % 5]}
+        for i in range(50)
+    )
+    window = _window(round_trip_records=records)
+    decision = PaperGate().evaluate(window)
+    assert decision.passed is False
+    assert BLOCK_MISSING_ECONOMIC_EVIDENCE in decision.blockers
+    assert decision.metrics["net_expectancy"] is None
+
+
+def test_unparseable_pnl_after_cost_on_all_round_trips_blocks():
+    from trader.promotion.paper_gate import BLOCK_MISSING_ECONOMIC_EVIDENCE, PaperGate
+
+    instruments = _instruments(5)
+    records = tuple(
+        {"round_trip_id": f"rt-{i}", "instrument_id": instruments[i % 5], "pnl_after_cost": "n/a"}
+        for i in range(50)
+    )
+    window = _window(round_trip_records=records)
+    decision = PaperGate().evaluate(window)
+    assert decision.passed is False
+    assert BLOCK_MISSING_ECONOMIC_EVIDENCE in decision.blockers
+
+
+def test_missing_instrument_ids_on_all_round_trips_blocks():
+    from trader.promotion.paper_gate import BLOCK_MISSING_INSTRUMENT_EVIDENCE, PaperGate
+
+    records = tuple({"round_trip_id": f"rt-{i}", "pnl_after_cost": 10.0} for i in range(50))
+    window = _window(round_trip_records=records)
+    decision = PaperGate().evaluate(window)
+    assert decision.passed is False
+    assert BLOCK_MISSING_INSTRUMENT_EVIDENCE in decision.blockers
+    assert decision.metrics["max_instrument_concentration"] is None
+
+
+def test_50_round_trips_without_economic_or_diversification_evidence_never_passes():
+    """The exact CRITICAL scenario from the review: 50 round trips exist
+    (the floor is met) but NONE carry usable economic/diversification
+    evidence -- must never return passed=True."""
+    from trader.promotion.paper_gate import PaperGate
+
+    records = tuple({"round_trip_id": f"rt-{i}"} for i in range(50))
+    window = _window(round_trip_records=records)
+    decision = PaperGate().evaluate(window)
+    assert decision.passed is False
+
+
+def test_partial_missing_pnl_still_excluded_not_zeroed_when_some_records_have_it():
+    """Not every round trip missing pnl_after_cost blocks -- only a TOTAL
+    absence does. Partial coverage still uses the documented "exclude, don't
+    zero" averaging (existing behavior, unaffected by the fail-closed fix)."""
+    from trader.promotion.paper_gate import BLOCK_MISSING_ECONOMIC_EVIDENCE, PaperGate
+
+    instruments = _instruments(5)
+    records = _round_trip_records(49, instruments=instruments, pnl=10.0) + (
+        {"round_trip_id": "rt-49", "instrument_id": instruments[0]},
+    )
+    window = _window(round_trip_records=records)
+    decision = PaperGate().evaluate(window)
+    assert BLOCK_MISSING_ECONOMIC_EVIDENCE not in decision.blockers
+    assert decision.metrics["net_expectancy"] == 10.0
 
 
 # ---------------------------------------------------------------------------
@@ -533,6 +648,31 @@ def test_compare_reports_divergence_when_intents_or_decisions_disagree():
     result = runner.compare({"session": "s1"}, lambda **kw: {"ok": True})
     assert result.matched is False
     assert len(result.divergences) >= 1
+
+
+def test_shadow_run_raises_if_compute_reports_a_real_registration():
+    """IMPORTANT (defense in depth): ``registered_intents`` is documented to
+    be populated ONLY by ``run_paper``'s real tracking wrapper -- if
+    ``compute`` returns a trace with a non-empty ``registered_intents``
+    while running under ``run_shadow`` (i.e. it never went through the
+    interceptor at all, e.g. because the pipeline held a separate reference
+    to a real executor), that is proof of an escape. ``run_shadow`` must
+    raise loudly instead of silently coercing it back to ``()``."""
+    from trader.promotion.paper_gate import ShadowEscapeError, ShadowRunner, ShadowTrace
+
+    def compute(sealed_input, execute_automated_intent):
+        # Never calls the injected interceptor at all -- simulates a
+        # pipeline that registered via some other, real code path and
+        # reports the result on the trace directly.
+        return ShadowTrace(
+            mode="unset", intents=({"intent_id": "i1"},), decisions=({"approved": True},),
+            registered_intents=("i1",), intercepted_registrations=(),
+        )
+
+    runner = ShadowRunner(compute)
+    with pytest.raises(ShadowEscapeError) as exc_info:
+        runner.run_shadow({"session": "s1"})
+    assert exc_info.value.escaped_intent_ids == ("i1",)
 
 
 def test_compare_reports_divergence_when_shadow_would_register_but_paper_does_not():

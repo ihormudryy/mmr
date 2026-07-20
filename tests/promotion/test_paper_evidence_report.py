@@ -127,3 +127,19 @@ def test_cli_main_writes_deterministic_report_from_real_store(tmp_path):
     assert payload["strategy_id"] == STRATEGY
     assert payload["decision"]["passed"] is False  # floors nowhere near met
     assert payload["window"]["session_ids"] == ["2026-05-01"]
+
+    # IMPORTANT: a report is read-only reporting -- generating one must
+    # never persist a derived window or emit a domain event as a side
+    # effect (previously it called EvidenceStore.project(), which does).
+    assert store.load_window(STRATEGY) is None
+    row_count = db.execute("SELECT COUNT(*) FROM promotion_evidence_windows", fetch="one")
+    assert row_count == (0,)
+    kinds = {
+        row[0]
+        for row in db.execute(
+            "SELECT event_type FROM domain_event_journal "
+            "WHERE entity_type = 'promotion_evidence_window'",
+            fetch="all",
+        )
+    }
+    assert "promotion.evidence_window_rebuilt" not in kinds

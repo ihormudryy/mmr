@@ -59,9 +59,53 @@ def _machine(tmp_path: Path, **overrides):
     return machine, evidence, journal, db, migrator
 
 
+# 20 session dates spanning exactly 30 ELAPSED calendar days (gaps for
+# weekends/holidays) -- proves the calendar-days floor is span-based, not a
+# count of distinct session dates (P4 Task 2 review fix).
+_PAPER_GATE_SESSION_OFFSETS = (0, 1, 2, 3, 4, 6, 7, 8, 9, 10, 12, 13, 14, 15, 16, 18, 19, 20, 21, 29)
+
+
 def _seed_clean_evidence(evidence, strategy_id=STRATEGY, ts=NOW, suffix=""):
-    """Append one session event so a fresh projection is non-empty and not
-    stale, and contains no safety incidents -- i.e. genuinely clean."""
+    """Append enough session + round-trip evidence for a fresh projection to
+    satisfy PaperGate's simultaneous floors (30 elapsed calendar days, 20
+    sessions, 50 round trips, 5 instruments), be economically/
+    diversification-evidenced (every round trip carries pnl_after_cost +
+    instrument_id), and be genuinely clean (no safety incidents, not stale
+    as of ``ts``) -- since ``PromotionStageMachine`` now requires
+    ``PaperGate.evaluate(...).passed`` for PAPER_PASSED, "clean" alone
+    (Task 1's stale/breaker/cost/drawdown-only definition) is no longer
+    sufficient evidence for the many tests below that expect PAPER_PASSED
+    to succeed.
+    """
+    from trader.promotion.evidence_store import EvidenceEvent
+
+    tag = suffix or "1"
+    start = ts - dt.timedelta(days=29)
+    for i, offset in enumerate(_PAPER_GATE_SESSION_OFFSETS):
+        evidence.append(EvidenceEvent(
+            source_event_id=f"{strategy_id}-sess-{tag}-{i}",
+            strategy_id=strategy_id, event_kind="session",
+            payload={"session_id": f"s{tag}{i:02d}"},
+            source_timestamp=start + dt.timedelta(days=offset),
+        ))
+    for i in range(50):
+        evidence.append(EvidenceEvent(
+            source_event_id=f"{strategy_id}-rt-{tag}-{i}",
+            strategy_id=strategy_id, event_kind="round_trip",
+            payload={
+                "round_trip_id": f"rt-{tag}-{i}",
+                "instrument_id": str(1000 + (i % 5)),
+                "pnl_after_cost": 10.0,
+            },
+            source_timestamp=ts,
+        ))
+
+
+def _seed_single_session_only(evidence, strategy_id=STRATEGY, ts=NOW, suffix=""):
+    """The OLD ``_seed_clean_evidence`` behavior: exactly one session event.
+    ``is_clean`` (not stale, no breaker/cost/drawdown) but far short of
+    every PaperGate floor -- used to prove Task 1's generic cleanliness
+    alone is no longer sufficient for PAPER_PASSED."""
     from trader.promotion.evidence_store import EvidenceEvent
 
     evidence.append(EvidenceEvent(
@@ -605,6 +649,99 @@ def test_freshly_projected_clean_window_at_transition_time_passes(tmp_path):
         evidence_store=evidence,
     )
     assert record.stage == PAPER_PASSED
+
+
+# ---------------------------------------------------------------------------
+# CRITICAL: PAPER_PASSED requires PaperGate.evaluate(...).passed, not just
+# Task 1's generic is_clean -- a store-backed window that fails floors or
+# blockers must never become PAPER_PASSED.
+# ---------------------------------------------------------------------------
+
+def test_paper_gate_floors_not_met_blocks_paper_passed_even_though_is_clean(tmp_path):
+    """A window can be ``is_clean`` (not stale, no breaker/cost/drawdown)
+    while still nowhere near PaperGate's floors (1 session, 0 round trips,
+    0 instruments). Task 1's generic cleanliness alone must NOT be enough
+    to reach PAPER_PASSED anymore -- PaperGate must also pass."""
+    from trader.promotion.stage import EvidenceNotCleanError, PAPER_COLLECTING, PAPER_PASSED
+
+    machine, evidence, *_ = _machine(tmp_path)
+    _seed_single_session_only(evidence)
+    machine.transition(STRATEGY, PAPER_COLLECTING, reason="bootstrap", actor="system")
+
+    real_window = evidence.project(STRATEGY, as_of=NOW)
+    assert real_window.is_clean is True  # Task 1 alone would have allowed this
+
+    with pytest.raises(EvidenceNotCleanError) as exc_info:
+        machine.transition(
+            STRATEGY, PAPER_PASSED, reason="claims floors met but they aren't",
+            actor="paper_gate", evidence_store=evidence,
+        )
+    assert any(reason.startswith("floor_") for reason in exc_info.value.reasons)
+    assert machine.current_stage(STRATEGY) == PAPER_COLLECTING
+
+
+def test_paper_gate_blocker_blocks_paper_passed_even_with_floors_met(tmp_path):
+    """Floors fully met (via ``_seed_clean_evidence``) but a Task 2 blocker
+    (a missed flat) is present on the same store-backed projection --
+    PAPER_PASSED must still be refused."""
+    from trader.promotion.evidence_store import EvidenceEvent
+    from trader.promotion.stage import EvidenceNotCleanError, PAPER_COLLECTING, PAPER_PASSED
+
+    machine, evidence, *_ = _machine(tmp_path)
+    _seed_clean_evidence(evidence)
+    evidence.append(EvidenceEvent(
+        source_event_id="missed-flat-1", strategy_id=STRATEGY, event_kind="missed_flat",
+        payload={"session_id": "s100"}, source_timestamp=NOW,
+    ))
+    machine.transition(STRATEGY, PAPER_COLLECTING, reason="bootstrap", actor="system")
+
+    real_window = evidence.project(STRATEGY, as_of=NOW)
+    from trader.promotion.paper_gate import PaperGate
+    decision = PaperGate().evaluate(real_window)
+    assert decision.floors_met is True  # floors alone are satisfied
+
+    with pytest.raises(EvidenceNotCleanError) as exc_info:
+        machine.transition(
+            STRATEGY, PAPER_PASSED, reason="floors met but missed a flat", actor="paper_gate",
+            evidence_store=evidence,
+        )
+    assert "missed_flat" in exc_info.value.reasons
+    assert machine.current_stage(STRATEGY) == PAPER_COLLECTING
+
+
+def test_paper_gate_missing_economic_evidence_blocks_paper_passed(tmp_path):
+    """50 round trips (floor met) but none carry a parseable
+    ``pnl_after_cost`` -- must never let PAPER_PASSED through."""
+    from trader.promotion.evidence_store import EvidenceEvent
+    from trader.promotion.stage import EvidenceNotCleanError, PAPER_COLLECTING, PAPER_PASSED
+
+    machine, evidence, *_ = _machine(tmp_path)
+    tag = "econ"
+    start = NOW - dt.timedelta(days=29)
+    for i, offset in enumerate(_PAPER_GATE_SESSION_OFFSETS):
+        evidence.append(EvidenceEvent(
+            source_event_id=f"{STRATEGY}-sess-{tag}-{i}", strategy_id=STRATEGY,
+            event_kind="session", payload={"session_id": f"s{tag}{i:02d}"},
+            source_timestamp=start + dt.timedelta(days=offset),
+        ))
+    for i in range(50):
+        evidence.append(EvidenceEvent(
+            source_event_id=f"{STRATEGY}-rt-{tag}-{i}", strategy_id=STRATEGY,
+            event_kind="round_trip",
+            # instrument_id present (diversification floor met) but no
+            # pnl_after_cost at all -- economic evidence missing entirely.
+            payload={"round_trip_id": f"rt-{tag}-{i}", "instrument_id": str(1000 + (i % 5))},
+            source_timestamp=NOW,
+        ))
+    machine.transition(STRATEGY, PAPER_COLLECTING, reason="bootstrap", actor="system")
+
+    with pytest.raises(EvidenceNotCleanError) as exc_info:
+        machine.transition(
+            STRATEGY, PAPER_PASSED, reason="50 round trips, no economic evidence",
+            actor="paper_gate", evidence_store=evidence,
+        )
+    assert "missing_economic_evidence" in exc_info.value.reasons
+    assert machine.current_stage(STRATEGY) == PAPER_COLLECTING
 
 
 def test_matching_evidence_window_alongside_store_passes(tmp_path):

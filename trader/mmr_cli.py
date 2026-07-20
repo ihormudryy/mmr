@@ -1255,6 +1255,31 @@ def build_parser() -> argparse.ArgumentParser:
     reject_p.add_argument('--all', action='store_true', default=False, help='Reject all pending proposals')
     reject_p.add_argument('--reason', default='', help='Rejection reason')
 
+    # activate-canary / deactivate-canary [P4 Task 5] — the ONLINE half of
+    # the signed live-canary flow. The attestation itself is produced fully
+    # OFFLINE by `research canary prepare` + `research canary sign`; this
+    # command only ever transmits the already-signed wire attestation
+    # (public material + signature), never a private key.
+    activate_canary_p = sub.add_parser(
+        'activate-canary', help='Activate a signed live-canary authority',
+        epilog='Examples:\n'
+               '  activate-canary --attestation-file attestation.json \\\n'
+               '      --reason "canary after 30d clean paper"',
+        formatter_class=fmt,
+    )
+    activate_canary_p.add_argument('--attestation-file', required=True,
+                                   help='JSON file with the signed attestation from `research canary sign`')
+    activate_canary_p.add_argument('--reason', required=True)
+
+    deactivate_canary_p = sub.add_parser(
+        'deactivate-canary', help='Deactivate (suspend) an ACTIVE live-canary authority',
+        epilog='Examples:\n'
+               '  deactivate-canary orb_756733 --reason "unexpected drawdown"',
+        formatter_class=fmt,
+    )
+    deactivate_canary_p.add_argument('strategy_id', help='Strategy id whose canary authority to suspend')
+    deactivate_canary_p.add_argument('--reason', required=True)
+
     # group (position groups)
     group_p = sub.add_parser('group', help='Manage position groups',
                               epilog='Examples:\n'
@@ -1687,6 +1712,64 @@ def build_parser() -> argparse.ArgumentParser:
     rat_verify.add_argument('--instruments', nargs='+', required=True)
     rat_verify.add_argument('--now', default='', help='Override "now" (ISO-8601 UTC); default: current time')
 
+    # research canary — P4 Task 5: offline prepare/sign/verify of a signed
+    # live-canary activation authority. NONE of these three subcommands ever
+    # transmit private key material anywhere -- `prepare` reads the trader's
+    # own local journal DB (read-only) and emits an UNSIGNED payload; `sign`
+    # loads the private key ONLY from a local file and never leaves this
+    # process; `verify` takes only a PUBLIC key file. The separate
+    # `activate-canary`/`deactivate-canary` commands (below) send only the
+    # already-signed wire attestation over RPC.
+    rc_p = research_sub.add_parser(
+        'canary', help='Prepare / sign / verify a live-canary activation authority',
+        epilog='Examples:\n'
+               '  research canary prepare --strategy-id orb_756733 --account-id U1234567 \\\n'
+               '      --artifact-digest sha256:... --allowlist-digest sha256:... \\\n'
+               '      --ruleset-digest sha256:... --max-gross-allocation 0.05 \\\n'
+               '      --instrument AAPL --public-key-id key-2026 --ttl-days 7 \\\n'
+               '      --operator alice --reason "canary after 30d clean paper" > payload.json\n'
+               '  research canary sign --payload-file payload.json --key-file ~/.keys/canary.pem \\\n'
+               '      > attestation.json\n'
+               '  research canary verify --attestation-file attestation.json \\\n'
+               '      --public-key-file ~/.keys/canary_pub.pem --account-id U1234567 \\\n'
+               '      --artifact-digest sha256:... --allowlist-digest sha256:... --ruleset-digest sha256:...',
+        formatter_class=fmt,
+    )
+    rc_sub = rc_p.add_subparsers(dest='canary_action')
+
+    rc_prepare = rc_sub.add_parser(
+        'prepare', help='Produce an UNSIGNED canary payload from the strategy\'s current PAPER_PASSED window')
+    rc_prepare.add_argument('--strategy-id', required=True)
+    rc_prepare.add_argument('--account-id', required=True, help='Exact live account this authority is scoped to')
+    rc_prepare.add_argument('--artifact-digest', required=True)
+    rc_prepare.add_argument('--allowlist-digest', required=True)
+    rc_prepare.add_argument('--ruleset-digest', required=True)
+    rc_prepare.add_argument('--max-gross-allocation', type=float, required=True,
+                            help='Must be in (0, 0.06]')
+    rc_prepare.add_argument('--instrument', required=True, help='Exactly one instrument symbol')
+    rc_prepare.add_argument('--public-key-id', required=True,
+                            help='Key id of the OFFLINE signing key that will sign this payload')
+    rc_prepare.add_argument('--ttl-days', type=int, default=7, help='Expiry in days (default 7)')
+    rc_prepare.add_argument('--operator', required=True)
+    rc_prepare.add_argument('--reason', required=True)
+
+    rc_sign = rc_sub.add_parser('sign', help='Sign an unsigned canary payload (fully offline)')
+    rc_sign.add_argument('--payload-file', required=True,
+                         help='JSON file with the unsigned payload from `research canary prepare`')
+    rc_sign.add_argument('--key-file', required=True,
+                         help='Path to the offline Ed25519 private key (PKCS8 PEM, 0o600)')
+
+    rc_verify = rc_sub.add_parser('verify', help='Verify a signed canary attestation against expected bindings')
+    rc_verify.add_argument('--attestation-file', required=True,
+                           help='JSON file with the signed attestation from `research canary sign`')
+    rc_verify.add_argument('--public-key-file', required=True,
+                           help='Path to the Ed25519 PUBLIC verification key (PEM)')
+    rc_verify.add_argument('--account-id', required=True)
+    rc_verify.add_argument('--artifact-digest', required=True)
+    rc_verify.add_argument('--allowlist-digest', required=True)
+    rc_verify.add_argument('--ruleset-digest', required=True)
+    rc_verify.add_argument('--now', default='', help='Override "now" (ISO-8601 UTC); default: current time')
+
     # data
     data_p = sub.add_parser('data', help='Local data exploration (no service needed)',
                             epilog='Examples:\n'
@@ -1814,7 +1897,7 @@ def dispatch(mmr: MMR, args: argparse.Namespace) -> bool:
         'buy', 'sell', 'cancel', 'cancel-all', 'close', 'protect',
         'snapshot', 'snap', 'snapshot-batch', 'depth', 'resolve',
         'listen', 'watch', 'scan',
-        'approve',
+        'approve', 'activate-canary', 'deactivate-canary',
         'resize-positions',
         'portfolio-risk', 'prisk',
         'portfolio-snapshot', 'psnap',
@@ -2322,6 +2405,12 @@ def dispatch(mmr: MMR, args: argparse.Namespace) -> bool:
         elif cmd == 'reject':
             _handle_reject(mmr, args)
 
+        elif cmd == 'activate-canary':
+            _handle_activate_canary(mmr, args)
+
+        elif cmd == 'deactivate-canary':
+            _handle_deactivate_canary(mmr, args)
+
         elif cmd == 'group':
             _handle_group(mmr, args)
 
@@ -2756,6 +2845,37 @@ def _handle_reject(mmr: MMR, args: argparse.Namespace):
         print_status(f'Proposal #{args.proposal_id} rejected')
     else:
         print_status(f'Reject failed: proposal #{args.proposal_id} not found or not PENDING', success=False)
+
+
+def _handle_activate_canary(mmr: MMR, args: argparse.Namespace):
+    """[P4 Task 5] Send an already-signed canary attestation for activation.
+
+    Never touches private key material: ``--attestation-file`` is the
+    PUBLIC wire form produced offline by `research canary sign`."""
+    import json as _json
+
+    try:
+        with open(args.attestation_file, 'r') as f:
+            attestation = _json.load(f)
+    except (OSError, _json.JSONDecodeError) as exc:
+        print_status(f'Failed to read attestation file: {exc}', success=False)
+        return
+
+    result = mmr.activate_live_canary(attestation, args.reason)
+    if result.is_success():
+        print_json_result(result.obj or {}, title='Live canary activated')
+    else:
+        error = str(result.error or result.exception or 'Unknown error')
+        print_status(f'Canary activation failed: {error}', success=False)
+
+
+def _handle_deactivate_canary(mmr: MMR, args: argparse.Namespace):
+    result = mmr.deactivate_live_canary(args.strategy_id, args.reason)
+    if result.is_success():
+        print_json_result(result.obj or {}, title='Live canary deactivated')
+    else:
+        error = str(result.error or result.exception or 'Unknown error')
+        print_status(f'Canary deactivation failed: {error}', success=False)
 
 
 def _handle_group(mmr: MMR, args: argparse.Namespace):
@@ -5048,9 +5168,11 @@ def _handle_research(args: argparse.Namespace):
         _handle_research_review(args)
     elif action == 'attest':
         _handle_research_attest(args)
+    elif action == 'canary':
+        _handle_research_canary(args)
     else:
         print_status(
-            'Usage: research {family|trial|artifact|import-legacy|review|attest} ...',
+            'Usage: research {family|trial|artifact|import-legacy|review|attest|canary} ...',
             success=False)
 
 
@@ -5459,6 +5581,218 @@ def _handle_research_attest_verify(args: argparse.Namespace):
         'public_key_id': verified.public_key_id,
         'payload_digest': verified.payload_digest,
     }, title='Attestation verified')
+
+
+# --- research canary — P4 Task 5: offline prepare/sign/verify --------------
+
+def _journal_duckdb_path() -> str:
+    """Resolve the trader's operational journal DB path -- same file the
+    running trader_service reads/writes via ``command_stack.py``. Env
+    override wins; otherwise config, then the documented default.
+
+    ``research canary prepare`` opens this file to read the strategy's
+    CURRENT stage + evidence window -- deliberately the trader's own durable
+    truth, never a value the operator supplies by hand, so a stale/forged
+    "trust me it's clean" window can't be smuggled into the payload.
+    """
+    import os
+    from pathlib import Path
+    path = os.environ.get('MMR_JOURNAL_DUCKDB')
+    if not path:
+        try:
+            from trader.container import Container
+            cfg = Container.instance().config()
+            path = cfg.get('journal_duckdb_path')
+        except Exception:
+            path = None
+        path = path or '~/.local/share/mmr/data/mmr_journal.duckdb'
+    p = Path(path).expanduser()
+    p.parent.mkdir(parents=True, exist_ok=True)
+    return str(p)
+
+
+def _promotion_controller_for_cli():
+    """Build a read-mostly ``PromotionController`` against the trader's own
+    journal DB. ``prepare_canary`` itself never writes (it uses
+    ``EvidenceStore.rebuild_window``, not the persisting ``project``) --
+    opening this alongside a live trader_service is safe for that reason,
+    though a concurrent WRITE from this process is never attempted here.
+    """
+    from trader.data.domain_journal import DomainJournal
+    from trader.data.duckdb_store import DuckDBConnection
+    from trader.data.schema_migrations import SchemaMigrator
+    from trader.promotion.controller import PromotionController
+    from trader.promotion.evidence_store import EvidenceStore, apply_evidence_migrations
+    from trader.promotion.stage import PromotionStageMachine, apply_stage_migration
+
+    db = DuckDBConnection.get_instance(_journal_duckdb_path())
+    migrator = SchemaMigrator(db)
+    journal = DomainJournal(db)
+    journal.migrate(migrator)
+    apply_stage_migration(migrator)
+    apply_evidence_migrations(migrator)
+    stage_machine = PromotionStageMachine(journal=journal, db=db)
+    evidence_store = EvidenceStore(journal=journal, db=db)
+    return PromotionController(evidence_store=evidence_store, stage_machine=stage_machine)
+
+
+def _handle_research_canary(args: argparse.Namespace):
+    """Offline prepare/sign/verify of a signed live-canary authority -- no
+    service needed. NEVER transmits private key material (see subcommand
+    docstrings)."""
+    action = getattr(args, 'canary_action', None)
+    if action == 'prepare':
+        _handle_research_canary_prepare(args)
+    elif action == 'sign':
+        _handle_research_canary_sign(args)
+    elif action == 'verify':
+        _handle_research_canary_verify(args)
+    else:
+        print_status('Usage: research canary {prepare|sign|verify} ...', success=False)
+
+
+def _canary_payload_public_view(fields: dict) -> dict:
+    """JSON-safe projection of an unsigned/signed canary payload dict."""
+    view = dict(fields)
+    for key in ('issued_at', 'expires_at'):
+        value = view.get(key)
+        if hasattr(value, 'isoformat'):
+            view[key] = value.isoformat()
+    if 'permitted_instruments' in view:
+        view['permitted_instruments'] = list(view['permitted_instruments'])
+    return view
+
+
+def _handle_research_canary_prepare(args: argparse.Namespace):
+    import datetime as _dt
+
+    from trader.promotion.controller import PromotionPreparationError
+
+    controller = _promotion_controller_for_cli()
+    now = _dt.datetime.now(_dt.timezone.utc)
+    expires_at = now + _dt.timedelta(days=args.ttl_days)
+    try:
+        payload = controller.prepare_canary(
+            args.strategy_id, account_id=args.account_id, artifact_digest=args.artifact_digest,
+            allowlist_digest=args.allowlist_digest, ruleset_digest=args.ruleset_digest,
+            max_gross_allocation=args.max_gross_allocation, permitted_instruments=(args.instrument,),
+            public_key_id=args.public_key_id, expires_at=expires_at, operator=args.operator,
+            reason=args.reason, now=now,
+        )
+    except PromotionPreparationError as exc:
+        print_status(f'Canary preparation refused: {exc}', success=False)
+        return
+    except Exception as exc:  # noqa: BLE001 - CanaryValidationError et al are dynamic
+        print_status(f'Canary preparation refused: {exc}', success=False)
+        return
+    print_json_result(_canary_payload_public_view(payload), title='Unsigned canary payload prepared')
+
+
+def _handle_research_canary_sign(args: argparse.Namespace):
+    import json as _json
+
+    from trader.promotion.canary_attestation import canary_attestation_to_wire, sign_canary_payload
+    from trader.research.signing import AttestationSigner, InsecureKeyFile, InvalidKeyType, MalformedKey
+
+    try:
+        with open(args.payload_file, 'r') as f:
+            unsigned = _json.load(f)
+    except (OSError, _json.JSONDecodeError) as exc:
+        print_status(f'Failed to read payload file: {exc}', success=False)
+        return
+    unsigned['issued_at'] = _parse_iso_datetime(unsigned['issued_at'])
+    unsigned['expires_at'] = _parse_iso_datetime(unsigned['expires_at'])
+    unsigned['permitted_instruments'] = tuple(unsigned.get('permitted_instruments', ()))
+
+    try:
+        # Loads the private key from a LOCAL file only, for the lifetime of
+        # this offline process; never serialized, logged, or sent anywhere.
+        signer = AttestationSigner.from_key_file(args.key_file)
+    except InsecureKeyFile as exc:
+        print_status(f'Insecure key file: {exc}', success=False)
+        return
+    except (InvalidKeyType, MalformedKey) as exc:
+        print_status(f'Invalid signing key: {exc}', success=False)
+        return
+
+    try:
+        attestation = sign_canary_payload(signer, unsigned)
+    except (KeyError, ValueError) as exc:
+        print_status(f'Failed to sign canary payload: {exc}', success=False)
+        return
+    print_json_result(canary_attestation_to_wire(attestation), title='Canary authority signed')
+
+
+def _handle_research_canary_verify(args: argparse.Namespace):
+    import datetime as _dt
+    import json as _json
+
+    from trader.promotion.canary_attestation import (
+        CanaryAuthorityError, CanaryAuthorityVerifier, ExpectedCanaryBindings,
+        canary_attestation_from_wire,
+    )
+    from trader.research.signing import InvalidKeyType, MalformedKey, load_verify_key
+
+    try:
+        with open(args.attestation_file, 'r') as f:
+            wire = _json.load(f)
+    except (OSError, _json.JSONDecodeError) as exc:
+        print_status(f'Failed to read attestation file: {exc}', success=False)
+        return
+    try:
+        attestation = canary_attestation_from_wire(wire)
+    except (KeyError, ValueError, TypeError) as exc:
+        print_status(f'Malformed attestation: {exc}', success=False)
+        return
+
+    try:
+        public_key = load_verify_key(args.public_key_file)
+    except (InvalidKeyType, MalformedKey) as exc:
+        print_status(f'Invalid public key: {exc}', success=False)
+        return
+
+    if args.now:
+        try:
+            now = _parse_iso_datetime(args.now)
+        except ValueError as exc:
+            print_status(f'Invalid --now: {exc}', success=False)
+            return
+    else:
+        now = _dt.datetime.now(_dt.timezone.utc)
+
+    expected = ExpectedCanaryBindings(
+        account_id=args.account_id, artifact_digest=args.artifact_digest,
+        allowlist_digest=args.allowlist_digest, ruleset_digest=args.ruleset_digest,
+    )
+    verifier = CanaryAuthorityVerifier([public_key])
+    try:
+        verified = verifier.verify(attestation, expected, now=now)
+    except CanaryAuthorityError as exc:
+        print_json_result({
+            'result': 'FAIL', 'error': type(exc).__name__, 'detail': str(exc),
+        }, title='Canary authority verification FAILED')
+        return
+    print_json_result({
+        'result': 'PASS',
+        'strategy_id': verified.strategy_id,
+        'account_id': verified.account_id,
+        'max_gross_allocation': verified.max_gross_allocation,
+        'permitted_instruments': list(verified.permitted_instruments),
+        'artifact_digest': verified.artifact_digest,
+        'allowlist_digest': verified.allowlist_digest,
+        'ruleset_digest': verified.ruleset_digest,
+        'expires_at': verified.expires_at.isoformat(),
+        'public_key_id': verified.public_key_id,
+        'payload_digest': verified.payload_digest,
+    }, title='Canary authority verified')
+
+
+def _parse_iso_datetime(value: str):
+    import datetime as _dt
+    parsed = _dt.datetime.fromisoformat(value)
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=_dt.timezone.utc)
+    return parsed
 
 
 # --- backtests list: per-metric quality classification -----------------

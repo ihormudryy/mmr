@@ -1544,6 +1544,93 @@ class MMR:
                   f'{receipt.error_code or receipt.state}')
 
     # ------------------------------------------------------------------
+    # [P4 Task 5] Signed live-canary activation
+    # ------------------------------------------------------------------
+
+    def activate_live_canary(self, attestation: Dict[str, Any], reason: str) -> SuccessFail:
+        """Activate a signed canary authority via the command-authority
+        coordinator's ``activate_live_canary`` command. REQUIRES
+        trader_service (typed query + command sockets).
+
+        ``attestation`` is the JSON wire form of an offline-signed
+        ``CanaryAttestation`` (produced entirely by ``mmr research canary
+        sign`` -- see ``canary_attestation_to_wire``); it carries a
+        signature and public key ID, NEVER a private key, so nothing this
+        method sends over the wire can ever leak signing material.
+
+        ``activate_live_canary`` is always risk-increasing (a canary
+        authority is definitionally live-only), so unlike ``approve``, this
+        method itself drives the two-step preflight-nonce ceremony
+        (``preflight_command`` mint, then the confirming command) rather
+        than skipping it — there is no paper-mode carve-out to lean on.
+        """
+        import uuid
+        from trader.domain.commands import CommandReceipt
+        from trader.messaging.typed_rpc import TypedRpcRemoteError
+
+        command_id = f'sdk-{uuid.uuid4()}'
+        session_fingerprint = uuid.uuid4().hex
+
+        try:
+            preflight = self._typed_command.call(
+                'preflight_command',
+                {
+                    'command_id': command_id, 'action': 'activate_live_canary',
+                    'params': {'attestation': attestation, 'reason': reason},
+                    'session_fingerprint': session_fingerprint,
+                },
+                dict,
+            )
+        except TypedRpcRemoteError as ex:
+            return SuccessFail.fail(error=f'canary activation preflight refused: {ex.code}: {ex.message}',
+                                    exception=ex)
+        except (TimeoutError, ConnectionError) as ex:
+            return SuccessFail.fail(error=f'canary activation preflight did not complete: {ex}', exception=ex)
+
+        try:
+            receipt = self._typed_command.call(
+                'activate_live_canary',
+                {
+                    'command_id': command_id, 'attestation': attestation, 'reason': reason,
+                    'preflight_nonce': preflight['nonce'], 'session_fingerprint': session_fingerprint,
+                },
+                CommandReceipt,
+            )
+        except TypedRpcRemoteError as ex:
+            return SuccessFail.fail(error=f'canary activation rejected: {ex.code}: {ex.message}', exception=ex)
+        except (TimeoutError, ConnectionError) as ex:
+            return SuccessFail.fail(
+                error=f'activate_live_canary did not complete: {ex}. Check `mmr proposals`/status before retrying.',
+                exception=ex)
+
+        if receipt.state == 'RESOLVED':
+            return SuccessFail.success(obj=receipt.outcome)
+        return SuccessFail.fail(error=f'canary activation rejected: {receipt.error_code or receipt.state}')
+
+    def deactivate_live_canary(self, strategy_id: str, reason: str) -> SuccessFail:
+        """Suspend an ACTIVE canary authority via ``deactivate_live_canary``.
+        REQUIRES trader_service. Risk-reducing: no preflight nonce needed,
+        mirroring ``reject``."""
+        import uuid
+        from trader.domain.commands import CommandReceipt
+        from trader.messaging.typed_rpc import TypedRpcRemoteError
+
+        try:
+            receipt = self._typed_command.call(
+                'deactivate_live_canary',
+                {'command_id': f'sdk-{uuid.uuid4()}', 'strategy_id': strategy_id, 'reason': reason},
+                CommandReceipt,
+            )
+        except TypedRpcRemoteError as ex:
+            return SuccessFail.fail(error=f'canary deactivation rejected: {ex.code}: {ex.message}', exception=ex)
+        except (TimeoutError, ConnectionError) as ex:
+            return SuccessFail.fail(error=f'deactivate_live_canary did not complete: {ex}', exception=ex)
+
+        if receipt.state == 'RESOLVED':
+            return SuccessFail.success(obj=receipt.outcome)
+        return SuccessFail.fail(error=f'canary deactivation rejected: {receipt.error_code or receipt.state}')
+
+    # ------------------------------------------------------------------
     # Protective orders for existing positions
     # ------------------------------------------------------------------
 

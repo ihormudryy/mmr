@@ -114,6 +114,94 @@ class _LiquidationBreaker:
         ))
 
 
+def _load_canary_public_keys(key_ring_path: str) -> list:
+    """Load every ``*.pem`` Ed25519 public key from ``key_ring_path``.
+
+    Mirrors ``StrategyRuntime._get_artifact_verifier``'s exact key-ring
+    loading convention (P3 Task 2) for consistency across services. Returns
+    an empty list (never raises) on any I/O/parse problem so a misconfigured
+    ring degrades to "canary activation stays dormant" rather than crashing
+    trader_service startup.
+    """
+    import glob as _glob
+    import logging
+    import os as _os
+
+    from trader.research import signing
+
+    keys: list = []
+    try:
+        abs_path = _os.path.abspath(_os.path.expanduser(key_ring_path))
+        pem_files = sorted(_glob.glob(_os.path.join(abs_path, "*.pem")))
+        for pem_path in pem_files:
+            try:
+                keys.append(signing.load_verify_key(pem_path))
+            except Exception as exc:
+                logging.error("failed to load canary public key %s: %s", pem_path, exc)
+    except Exception as exc:
+        logging.error("failed to enumerate canary key ring %s: %s", key_ring_path, exc)
+    return keys
+
+
+def _build_canary_service(
+    trader: Any,
+    stage_machine: Any,
+    evidence_store: Any,
+    authority_store: Any,
+    *,
+    account_id: str,
+    account_mode: str,
+    semantic_readiness: SemanticReadiness,
+    broker_flat_reconciled: Callable[[], bool],
+    breaker_clear: Callable[[], bool],
+    now: Callable[[], dt.datetime],
+) -> Optional[Any]:
+    """Build ``CanaryActivationService`` iff a canary signing-key ring AND an
+    artifact bundle to re-verify against are BOTH configured on ``trader``.
+
+    Absent either (the default -- no such attributes exist on ``Trader``
+    until ops config adds them), returns ``None`` and the two commands are
+    never registered (dormant), never partially wired.
+    """
+    key_ring_path = getattr(trader, "canary_public_key_ring_path", None)
+    bundle_path_str = getattr(trader, "canary_artifact_bundle_path", None)
+    expected_artifact_id = getattr(trader, "canary_expected_artifact_id", None)
+    if not key_ring_path or not bundle_path_str or not expected_artifact_id:
+        return None
+
+    public_keys = _load_canary_public_keys(key_ring_path)
+    if not public_keys:
+        return None
+
+    import os as _os
+    from pathlib import Path as _Path
+
+    from trader.automation.artifact_verifier import ArtifactVerifier
+    from trader.promotion.canary_attestation import CanaryAuthorityVerifier, ExpectedCanaryBindings
+    from trader.promotion.controller import CanaryActivationService
+
+    canary_verifier = CanaryAuthorityVerifier(trusted_public_keys=public_keys)
+    artifact_verifier = ArtifactVerifier(trusted_public_keys=public_keys)
+    bundle_path = _Path(_os.path.abspath(_os.path.expanduser(bundle_path_str)))
+
+    def expected_bindings():
+        # Re-run the FULL artifact chain (bundle integrity, signature,
+        # state/mode gate, expiry, revocation, read-only mount in live
+        # mode) fresh on every activation attempt -- never a cached copy.
+        verified = artifact_verifier.verify(bundle_path, "live", expected_artifact_id, now())
+        return ExpectedCanaryBindings(
+            account_id=account_id, artifact_digest=verified.artifact_id,
+            allowlist_digest=verified.allowlist_digest, ruleset_digest=verified.ruleset_digest,
+        )
+
+    return CanaryActivationService(
+        stage_machine=stage_machine, evidence_store=evidence_store, authority_store=authority_store,
+        verifier=canary_verifier, expected_bindings=expected_bindings,
+        semantic_readiness_ready=lambda: semantic_readiness.evaluate(now()).ready,
+        broker_flat_reconciled=broker_flat_reconciled, breaker_clear=breaker_clear, now=now,
+    )
+
+
 @dataclass(frozen=True)
 class CommandStack:
     journal: Any
@@ -137,6 +225,11 @@ class CommandStack:
     session_controller: Any = None  # SessionController (P3 Task 6)
     attribution_ledger: Any = None  # AttributionLedger (P3 Task 7)
     dispatch_guard: Any = None
+    promotion_stage_machine: Any = None  # PromotionStageMachine (P4 Task 1)
+    promotion_evidence_store: Any = None  # EvidenceStore (P4 Task 1)
+    canary_authority_store: Any = None  # LiveActivationAuthorityStore (P4 Task 5)
+    canary_service: Any = None  # CanaryActivationService (P4 Task 5) -- None until a
+    # canary public-key ring is configured (dormant by default; see build_command_stack)
 
 
 _REQUIRED_TRADER_PORTS = (
@@ -213,6 +306,13 @@ def build_command_stack(
     apply_preflight_nonce_migration(migrator)
     apply_circuit_breaker_migration(migrator)
     apply_liquidation_migration(migrator)
+    from trader.promotion.evidence_store import apply_evidence_migrations
+    from trader.promotion.stage import apply_stage_migration
+    from trader.promotion.controller import apply_live_activation_authority_migration
+
+    apply_stage_migration(migrator)
+    apply_evidence_migrations(migrator)
+    apply_live_activation_authority_migration(migrator)
     from trader.automation.protective_order_saga import (
         ProtectiveBracketDispatch,
         ProtectiveOrderSaga,
@@ -467,6 +567,47 @@ def build_command_stack(
     if ingest is not None:
         ingest.attribution_ledger = attribution_ledger
         ingest.protective_order_saga = protective_order_saga
+
+    # P4 Task 5 — promotion stage machine + evidence store + the
+    # append-only canary-authority ledger are always constructed (cheap,
+    # no external dependency) so `mmr strategies inspect`-style reporting
+    # and PromotionController.prepare_canary (which runs entirely offline,
+    # never through this stack) have a durable stage to read once a
+    # strategy starts accumulating paper evidence. The authenticated
+    # `activate_live_canary`/`deactivate_live_canary` COMMANDS, however,
+    # stay dormant (never registered -- see production_api.py's
+    # `canary_service is not None` guard) until a canary signing-key ring
+    # is actually configured: `trader.canary_public_key_ring_path`,
+    # `trader.canary_artifact_bundle_path`, and
+    # `trader.canary_expected_artifact_id` are ops config this task
+    # deliberately does not invent defaults for -- an unconfigured trader
+    # must never expose a live-canary activation surface.
+    from trader.promotion.controller import CanaryActivationService, LiveActivationAuthorityStore
+    from trader.promotion.evidence_store import EvidenceStore
+    from trader.promotion.stage import PromotionStageMachine
+
+    promotion_stage_machine = PromotionStageMachine(journal=journal, db=trader.journal_db, now=now)
+    promotion_evidence_store = EvidenceStore(journal=journal, db=trader.journal_db, now=now)
+    canary_authority_store = LiveActivationAuthorityStore(journal=journal, db=trader.journal_db, now=now)
+
+    def broker_flat_reconciled() -> bool:
+        # "Flat" (zero open positions, zero working orders) AND "reconciled"
+        # (no unresolved commands the ledger is still waiting on) -- both
+        # halves of the brief's "flat/reconciled broker state" gate.
+        snapshot = broker_snapshot.capture(trader.ib_account)
+        return (
+            len(snapshot.positions) == 0
+            and snapshot.open_order_count == 0
+            and reconciliation_safe()
+        )
+
+    canary_service = _build_canary_service(
+        trader, promotion_stage_machine, promotion_evidence_store, canary_authority_store,
+        account_id=trader.ib_account, account_mode=account_mode,
+        semantic_readiness=semantic_readiness, broker_flat_reconciled=broker_flat_reconciled,
+        breaker_clear=lambda: breaker_store.get().state == "CLEAR", now=now,
+    )
+
     stack = CommandStack(
         journal=journal,
         repository=repository,
@@ -489,6 +630,10 @@ def build_command_stack(
         session_controller=session_controller,
         attribution_ledger=attribution_ledger,
         dispatch_guard=dispatch_guard,
+        promotion_stage_machine=promotion_stage_machine,
+        promotion_evidence_store=promotion_evidence_store,
+        canary_authority_store=canary_authority_store,
+        canary_service=canary_service,
     )
     trader.command_ledger = ledger
     trader.command_reconciler = reconciler

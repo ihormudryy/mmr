@@ -558,7 +558,8 @@
       color: var(--dim);
     }
     #dash-scaling .scaling-controls textarea,
-    #dash-scaling .scaling-controls input[type="text"] {
+    #dash-scaling .scaling-controls input[type="text"],
+    #dash-scaling .scaling-controls select {
       font: inherit;
       font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
       font-size: 12px;
@@ -574,6 +575,36 @@
       flex-wrap: wrap;
       gap: var(--space-2);
       margin-top: var(--space-1);
+    }
+    #dash-scaling .paper-auto-banner {
+      margin: 0 var(--space-4) var(--space-3);
+      padding: 10px var(--space-3);
+      border-radius: var(--radius);
+      border: 1px solid rgba(210, 153, 34, .35);
+      background: rgba(210, 153, 34, .12);
+      color: var(--warn);
+      font-size: 13px;
+      font-weight: 600;
+      line-height: 1.4;
+    }
+    #dash-scaling .scaling-status[data-lifecycle="restart_required"],
+    #dash-scaling .scaling-status[data-lifecycle="armed_unpersisted"] {
+      color: var(--warn); border-color: currentColor;
+    }
+    #dash-scaling .scaling-status[data-lifecycle="armed"] {
+      color: var(--pos); border-color: currentColor;
+    }
+    #dash-scaling .scaling-status[data-lifecycle="degraded"],
+    #dash-scaling .scaling-status[data-lifecycle="failed"] {
+      color: var(--neg); border-color: currentColor;
+    }
+    #dash-scaling .scaling-status[data-lifecycle="disabled"] {
+      color: var(--dim);
+    }
+    #paper-auto-panel {
+      margin-top: var(--space-5);
+      border-top: 1px solid var(--border);
+      padding-top: var(--space-4);
     }
 
     /* —— Guide tab —— */
@@ -1100,6 +1131,51 @@
             <tr><td colspan="6" class="dim">No allocation authority rows yet</td></tr>
           </tbody>
         </table>
+      </section>
+      <section id="paper-auto-panel" aria-label="Paper automation">
+        <h2>Paper automation
+          <span id="paper-auto-lifecycle" class="scaling-status"
+                data-lifecycle="unknown">unknown</span>
+        </h2>
+        <p id="paper-auto-banner-restart" class="paper-auto-banner" hidden
+           role="status">Config written. Restart trader and strategy services to arm.</p>
+        <p id="paper-auto-banner-partial" class="paper-auto-banner" hidden
+           role="status">Activation partially succeeded — click Activate again to complete.</p>
+        <p id="paper-auto-message" class="scaling-note">Waiting for paper automation status…</p>
+        <p class="scaling-note">Writes keys, fixture artifact, and YAML for one paper
+          strategy. Services must restart before automation arms. Requires command
+          authority. Private keys never enter this browser.</p>
+        <div class="scaling-cards" aria-label="Paper automation summary">
+          <div class="scaling-card"><div class="label">Strategy</div>
+            <div id="paper-auto-strategy-value" class="value">—</div></div>
+          <div class="scaling-card"><div class="label">Account mode</div>
+            <div id="paper-auto-account-mode" class="value">—</div></div>
+          <div class="scaling-card"><div class="label">Command authority</div>
+            <div id="paper-auto-ca-ready" class="value">—</div></div>
+          <div class="scaling-card"><div class="label">Last activated</div>
+            <div id="paper-auto-last-activated" class="value">—</div></div>
+        </div>
+        {% if commands_enabled %}
+        <div class="scaling-controls" id="paper-auto-controls"
+             aria-label="Paper automation operator controls">
+          <h3>Operator controls</h3>
+          <label>Strategy
+            <select id="paper-auto-strategy">
+              <option value="">Select a strategy…</option>
+            </select>
+          </label>
+          <label>Reason
+            <input type="text" id="paper-auto-reason" maxlength="200"
+                   placeholder="Arm paper automation after clean soak" required>
+          </label>
+          <div class="btn-row">
+            <button type="button" id="paper-auto-activate" class="btn primary"
+                    data-cc-command="activate_paper_automation">Activate paper automation</button>
+            <button type="button" id="paper-auto-deactivate" class="btn reject"
+                    data-cc-command="deactivate_paper_automation">Deactivate</button>
+          </div>
+        </div>
+        {% endif %}
       </section>
     </main>
   </div>

@@ -588,9 +588,90 @@ function renderScaling() {
   }).join('');
 }
 
+function renderPaperAutomation() {
+  const panel = document.getElementById('paper-auto-panel');
+  if (!panel) return;
+  const v = store.view;
+  const pa = (v && v.paper_automation) || null;
+  const lifecycle = (pa && pa.lifecycle) || 'unknown';
+  const badge = document.getElementById('paper-auto-lifecycle');
+  badge.dataset.lifecycle = lifecycle;
+  badge.textContent = lifecycle;
+
+  const restartBanner = document.getElementById('paper-auto-banner-restart');
+  const partialBanner = document.getElementById('paper-auto-banner-partial');
+  const showRestart = !!(pa && (pa.restart_required || lifecycle === 'restart_required'));
+  const showPartial = !!(pa && (pa.armed_unpersisted || lifecycle === 'armed_unpersisted'));
+  restartBanner.hidden = !showRestart;
+  partialBanner.hidden = !showPartial;
+
+  let message = 'Waiting for paper automation status…';
+  if (pa == null) {
+    message = 'Paper automation status unavailable';
+  } else if (pa.last_error) {
+    message = pa.last_error;
+  } else if (showPartial) {
+    message = 'Activation partially succeeded — click Activate again to complete.';
+  } else if (showRestart) {
+    message = 'Config written. Restart trader and strategy services to arm.';
+  } else if (lifecycle === 'disabled') {
+    message = 'Paper automation is disabled';
+  } else if (lifecycle === 'armed') {
+    message = 'Paper automation is armed';
+  } else if (lifecycle === 'degraded') {
+    message = 'Paper automation is degraded — check materials and YAML';
+  }
+  document.getElementById('paper-auto-message').textContent = message;
+
+  document.getElementById('paper-auto-strategy-value').textContent =
+    (pa && pa.strategy_name) || '—';
+  document.getElementById('paper-auto-account-mode').textContent =
+    (pa && pa.account_mode) ? String(pa.account_mode).toUpperCase() : '—';
+  const caReady = pa && pa.command_authority_ready === true;
+  document.getElementById('paper-auto-ca-ready').textContent =
+    pa == null ? '—' : (caReady ? 'ready' : 'not ready');
+  document.getElementById('paper-auto-last-activated').textContent =
+    (pa && pa.last_activated_at) ? String(pa.last_activated_at) : '—';
+
+  const select = document.getElementById('paper-auto-strategy');
+  if (select) {
+    const previous = select.value;
+    const strategies = (v && v.strategies) || [];
+    const names = strategies.map(ccStrategyName).filter(Boolean);
+    const bound = (pa && pa.strategy_name) || '';
+    const options = ['<option value="">Select a strategy…</option>']
+        .concat(names.map(name =>
+          `<option value="${esc(name)}">${esc(name)}</option>`));
+    select.innerHTML = options.join('');
+    const prefer = previous || bound;
+    if (prefer && names.includes(prefer)) {
+      select.value = prefer;
+    } else if (bound && names.includes(bound)) {
+      select.value = bound;
+    }
+  }
+
+  const activateBtn = document.getElementById('paper-auto-activate');
+  if (activateBtn) {
+    activateBtn.disabled = !caReady;
+    activateBtn.title = caReady
+      ? ''
+      : 'Command authority must be enabled before Activate';
+  }
+  const deactivateBtn = document.getElementById('paper-auto-deactivate');
+  if (deactivateBtn) {
+    const enabledLifecycle = lifecycle === 'restart_required'
+        || lifecycle === 'armed'
+        || lifecycle === 'armed_unpersisted'
+        || lifecycle === 'degraded';
+    deactivateBtn.disabled = !enabledLifecycle;
+  }
+}
+
 function renderAll() {
   renderStatusBar(); renderAccountCards(); renderPositions(); renderProposals();
   renderOrders(); renderFills(); renderStrategies(); renderRisk(); renderScaling();
+  renderPaperAutomation();
 }
 
 /* ---------------- drawer (keyboard + focus managed) ----------------------- */
@@ -1664,6 +1745,85 @@ if (CFG.commandsEnabled) {
       } catch (err) {
         ccToast('error', `Failed to read file: ${err.message || err}`);
       }
+    });
+  }
+}
+
+/* ===================== Paper automation activate / deactivate (Scaling) ====
+ * Activate always runs the preflight confirm ceremony (coordinator
+ * requires_preflight=True). Deactivate is risk-reducing and a single POST.
+ * Phase 1 returns restart_required — operator restarts trader + strategy. */
+
+async function ccActivatePaperAutomation() {
+  const strategy = (document.getElementById('paper-auto-strategy').value || '')
+      .trim();
+  const reason = (document.getElementById('paper-auto-reason').value || '')
+      .trim();
+  if (!strategy) {
+    ccToast('error', 'Select a strategy first');
+    return;
+  }
+  if (!reason) {
+    ccToast('error', 'Reason is required');
+    return;
+  }
+  const pa = (store.view && store.view.paper_automation) || null;
+  if (pa && pa.command_authority_ready !== true) {
+    ccToast('error', 'Command authority must be enabled before Activate');
+    return;
+  }
+  if (!window.confirm(
+      `Activate paper automation for ${strategy}?\n\n`
+      + 'Config will be written; trader and strategy services must restart '
+      + 'to arm.\n\nReason: ' + reason)) {
+    return;
+  }
+
+  const url = '/api/commands/paper-automation/activate';
+  const label = 'Activate paper automation';
+  const params = {strategy_name: strategy, reason};
+  await ccRunLiveCeremony(
+      'activate_paper_automation', label, 'activate_paper_automation',
+      params, null,
+      (commandId, nonce) => ccSubmitCommand(
+          'activate_paper_automation', label, url, {
+            command_id: commandId,
+            strategy_name: strategy,
+            reason,
+            preflight_nonce: nonce,
+          }));
+}
+
+async function ccDeactivatePaperAutomation() {
+  const reason = (document.getElementById('paper-auto-reason').value || '')
+      .trim();
+  if (!reason) {
+    ccToast('error', 'Reason is required to deactivate paper automation');
+    return;
+  }
+  if (!window.confirm(
+      `Deactivate paper automation?\n\n`
+      + 'YAML enablement will be cleared; restart services to match.\n\n'
+      + `Reason: ${reason}`)) {
+    return;
+  }
+  await ccSubmitCommand(
+      'deactivate_paper_automation', 'Deactivate paper automation',
+      '/api/commands/paper-automation/deactivate', {
+        command_id: ccNewCommandId(),
+        reason,
+      });
+}
+
+if (CFG.commandsEnabled) {
+  const activateBtn = document.getElementById('paper-auto-activate');
+  const deactivateBtn = document.getElementById('paper-auto-deactivate');
+  if (activateBtn) {
+    activateBtn.addEventListener('click', () => { ccActivatePaperAutomation(); });
+  }
+  if (deactivateBtn) {
+    deactivateBtn.addEventListener('click', () => {
+      ccDeactivatePaperAutomation();
     });
   }
 }

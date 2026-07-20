@@ -88,6 +88,12 @@ Generates Ed25519 keys under `~/.config/mmr/keys/` (private `0o600`, public
 verify ring separate from private) and exports one fixture `PAPER_ELIGIBLE`
 bundle under `~/.local/share/mmr/artifacts/`. Prints the YAML snippets to paste.
 
+**Dashboard path (preferred when command authority is up):** Scaling tab →
+**Paper automation** → select strategy → **Activate paper automation**
+(preflight ceremony). Phase 1 returns `restart_required` — restart trader and
+strategy services to arm. **Deactivate** clears durable enablement (also needs
+a restart to match). Equivalent offline CLI:
+
 ```bash
 python3 scripts/bootstrap_paper_automation.py --strategy-name YOUR_STRATEGY
 # overwrite keys only when intentional:

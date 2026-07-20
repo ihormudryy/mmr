@@ -15,7 +15,9 @@ assigned range.
 
 P1 command-plane safety continues the F3-owned range: migration 24 is the
 durable automation breaker and incident ledger. P3 deterministic automation
-owns **30-39** (protective order sagas begin at migration 30).
+owns **30-39** (protective order sagas begin at migration 30). P4 paper/live
+canary promotion owns **40-49** (durable evidence windows and the promotion
+stage machine begin at migration 40).
 
 ``SchemaMigrator`` is deliberately storage-agnostic about *which* file it
 targets — it operates on whatever ``DuckDBConnection`` it is constructed

@@ -211,7 +211,7 @@ def test_failed_approval_never_flashes_submitted(client, stub):
 
 def test_risk_fetch_failure_is_unavailable_not_green(client, stub):
     stub.risk_error = ConnectionError("risk RPC down")
-    html = client.get("/legacy").text
+    html = client.get("/cc").text
     assert "Risk unavailable" in html
     assert "No active risk warnings" not in html
 
@@ -272,76 +272,66 @@ class TestParamsRoute:
 
 class TestDashboardRendering:
     def test_human_readable_names_and_description(self, client):
-        html = client.get('/legacy').text
+        html = client.get('/cc').text
         assert 'Opening Range Breakout' in html   # humanized class name
         assert 'orb_googl' in html                # config name still visible
         assert 'sweep run 309' in html            # description present (hover)
 
-    def test_toggle_buttons_match_state(self, client):
-        html = client.get('/legacy').text
-        assert '/strategies/orb_googl/disable' in html   # RUNNING → Disable
-        assert '/strategies/vwap_cat/enable' in html     # DISABLED → Enable
+    def test_setup_tab_has_deploy_not_legacy_toggle_forms(self, client):
+        html = client.get('/cc').text
+        assert '/strategies/deploy' in html
+        # Live enable/disable lives in the Trading tab (JS), not setup forms
+        assert '/strategies/orb_googl/enable' not in html
 
-    def test_unfold_param_editor_rendered(self, client):
-        html = client.get('/legacy').text
-        assert '/strategies/orb_googl/params' in html
-        assert 'param_RANGE_MINUTES' in html
-        assert 'new_key' in html
+    def test_unfold_deploy_editor_rendered(self, client):
+        html = client.get('/cc').text
+        assert 'toggleSetupParams' in html
+        assert 'name="watchlist"' in html
 
     def test_available_strategies_listed(self, client):
-        html = client.get('/legacy').text
+        html = client.get('/cc').text
         assert 'Momentum' in html
         assert 'momentum.py' in html
-        # deployed class is marked as such, not repeated as available-only
         assert 'deployed' in html.lower()
 
     def test_tooltips_present(self, client):
-        html = client.get('/legacy').text
-        assert html.count('class="info"') >= 8    # ⓘ across sections/metrics
+        html = client.get('/cc').text
+        assert html.count('class="info"') >= 4
         assert 'class="tip"' in html
 
     def test_bar_and_conids_columns_have_tooltips(self, client):
-        html = client.get('/legacy').text
-        assert 'completed bar of this size' in html      # Bar column tip
-        assert 'IB contract IDs' in html                 # ConIds column tip
+        html = client.get('/cc').text
+        assert 'completed bar of this size' not in html  # legacy-only tip
+        assert 'IB contract IDs' in html
 
     def test_tooltips_use_viewport_positioning(self, client):
         """Tips must escape section overflow:hidden — fixed positioning with
-        viewport clamping, computed on hover by positionTip()."""
-        html = client.get('/legacy').text
-        assert 'function positionTip' in html
+        viewport clamping, computed on hover by positionSetupTip()."""
+        html = client.get('/cc').text
+        assert 'function positionSetupTip' in html
         assert 'position: fixed' in html
 
 
 class TestTabs:
-    def test_three_tabs_with_overview_default(self, client):
-        html = client.get('/legacy').text
-        for name in ('overview', 'strategies', 'risk'):
-            assert f'data-tab="{name}"' in html
-            assert f'id="tab-{name}"' in html
-        # overview is the default-active pane
-        assert 'id="tab-overview" class="tabpane active"' in html
+    def test_dashboard_tabs_trading_and_setup(self, client):
+        html = client.get('/cc').text
+        assert 'data-dash-tab="trading"' in html
+        assert 'data-dash-tab="setup"' in html
+        assert 'id="dash-trading"' in html
+        assert 'id="dash-setup"' in html
 
-    def test_sections_live_in_the_right_panes(self, client):
-        html = client.get('/legacy').text
-        overview = html.index('id="tab-overview"')
-        strategies = html.index('id="tab-strategies"')
-        risk = html.index('id="tab-risk"')
-        # Overview holds cash, positions, proposals (cash folded into first tab)
-        assert overview < html.index('Cash by currency') < strategies
-        assert overview < html.index('Positions &amp; P&amp;L') < strategies
-        assert overview < html.index('>Proposals') < strategies
-        # Strategies pane holds deployed + available tables
-        assert strategies < html.index('/strategies/orb_googl/disable') < risk
-        assert strategies < html.index('Available strategies') < risk
-        # Risk pane holds the risk metrics
-        assert html.index('Gross exposure') > risk
+    def test_setup_subtabs(self, client):
+        html = client.get('/cc').text
+        for name in ('strategies', 'watchlists'):
+            assert f'data-setup-tab="{name}"' in html
+            assert f'id="setup-tab-{name}"' in html
 
     def test_tab_state_survives_auto_refresh(self, client):
         """Tab selection is kept in location.hash, which location.reload()
-        preserves — switching to Strategies must survive the 15s refresh."""
-        html = client.get('/legacy').text
+        preserves — switching to Setup must survive the 30s refresh."""
+        html = client.get('/cc').text
         assert 'location.hash' in html
+        assert 'parseHash' in html
 
 
 # ---------------------------------------------------------------------------
@@ -579,16 +569,17 @@ class TestWatchlistRoutes:
         assert 'mylist' not in accessor.universes
 
     def test_watchlists_tab_rendered(self, client, accessor, stub_resolving):
-        html = client.get('/manage').text
-        assert 'data-tab="watchlists"' in html
-        assert 'id="tab-watchlists"' in html
+        html = client.get('/cc').text
+        assert 'data-setup-tab="watchlists"' in html
+        assert 'id="setup-tab-watchlists"' in html
 
-    def test_flash_redirects_to_manage(self, client, accessor, stub_resolving):
+    def test_flash_redirects_to_cc_setup(self, client, accessor, stub_resolving):
         r = client.post('/watchlists/create',
                         data={'csrf_token': _csrf(), 'name': 'flash_test'},
                         follow_redirects=False)
         assert r.status_code == 303
-        assert r.headers['location'].startswith('/manage?flash=')
+        assert r.headers['location'].startswith('/cc?flash=')
+        assert '#setup-strategies' in r.headers['location']
         assert 'flash_test' in accessor.universes
 
 
@@ -662,37 +653,41 @@ class TestDeployRoute:
         assert not any(e.get('name') == 'mom_test' for e in cfg['strategies'])
 
     def test_deploy_form_rendered_in_available_table(self, client, accessor, stub_resolving):
-        html = client.get('/manage').text
+        html = client.get('/cc').text
         assert '/strategies/deploy' in html
         assert 'name="watchlist"' in html
-        assert 'Command Center' in html
+        assert 'Deploy &amp; watchlists' in html
         assert '/strategies/' not in html or '/strategies/deploy' in html
-        # Manage page is read-only for deployed strategies — no enable/disable forms
         assert '/strategies/orb_googl/enable' not in html
 
 
 class TestManagePage:
-    def test_manage_renders_without_heavy_fetchers(self, client, stub, manage_client, monkeypatch):
-        """ /manage must not fan out legacy overview fetchers (cash, risk, …). """
+    def test_manage_redirects_to_cc_setup(self, client):
+        r = client.get('/manage', follow_redirects=False)
+        assert r.status_code == 307
+        assert r.headers['location'] == '/cc#setup-strategies'
+
+    def test_cc_setup_renders_without_heavy_fetchers(self, client, stub, manage_client, monkeypatch):
+        """Setup tab must not fan out legacy overview fetchers (cash, risk, …)."""
         def _boom():
-            raise AssertionError('legacy fetcher must not run on /manage')
+            raise AssertionError('legacy fetcher must not run on /cc setup tab')
 
         for name in ('fetch_cash', 'fetch_snapshot', 'fetch_status', 'fetch_risk',
                      'fetch_risk_limits', 'fetch_positions', 'fetch_proposals'):
             monkeypatch.setattr(webapp, name, _boom)
-        html = client.get('/manage').text
+        html = client.get('/cc').text
         assert 'Available strategies' in html
         assert 'Watchlists' in html
-        assert 'Command Center' in html
+        assert 'Deploy &amp; watchlists' in html
 
-    def test_manage_marks_deployed_classes(self, client):
-        html = client.get('/manage').text
+    def test_cc_setup_marks_deployed_classes(self, client):
+        html = client.get('/cc').text
         assert 'deployed' in html.lower()
 
-    def test_manage_default_tab_is_strategies(self, client):
-        html = client.get('/manage').text
-        assert 'id="tab-strategies"' in html
-        assert "'strategies'" in html
+    def test_cc_setup_default_subtab_is_strategies(self, client):
+        html = client.get('/cc').text
+        assert 'id="setup-tab-strategies"' in html
+        assert "'strategies'" in html or 'setup-strategies' in html
 
 
 class TestLegacyAccessTokenDoubleGate:
@@ -729,17 +724,17 @@ class TestLegacyAccessTokenDoubleGate:
 
     def test_cookie_session_satisfies_legacy_token_gate(self, alias_client):
         alias_client.post("/session", data={"token": TEST_TOKEN})
-        assert alias_client.get("/legacy").status_code == 200
+        assert alias_client.get("/cc").status_code == 200
 
     def test_no_session_still_blocked(self, alias_client):
-        response = alias_client.get("/legacy", follow_redirects=False)
+        response = alias_client.get("/cc", follow_redirects=False)
         assert response.status_code in (303, 401)
 
     def test_canonical_config_unaffected(self, client):
         """The ordinary `client` fixture never sets `_ACCESS_TOKEN` (mirrors
         canonical DASHBOARD_TOKEN config, MMR_WEB_TOKEN unset) -- must keep
         working exactly as before."""
-        assert client.get("/legacy").status_code == 200
+        assert client.get("/cc").status_code == 200
 
 
 class TestEntrypointWorkerGuard:

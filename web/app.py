@@ -556,9 +556,10 @@ def fetch_proposals() -> list[dict]:
 
 
 def _flash(msg: str) -> RedirectResponse:
-    # Deploy + watchlist POST routes redirect to /manage so the post/redirect/get
-    # loop stays on the page the form was submitted from.
-    return RedirectResponse(url=f'/manage?flash={quote(msg)}', status_code=303)
+    # Deploy + watchlist POST routes redirect back to the unified dashboard's
+    # Setup tab so the post/redirect/get loop stays on the page the form was
+    # submitted from.
+    return RedirectResponse(url=f'/cc?flash={quote(msg)}#setup-strategies', status_code=303)
 
 
 def _manage_page_context(flash: str = '') -> tuple[dict[str, Any], dict[str, str]]:
@@ -674,75 +675,18 @@ def _register_legacy_routes(application: FastAPI) -> None:
 
     @application.get('/manage')
     def manage_page(request: Request, flash: str = ''):
-        """Deploy-from-disk + watchlist CRUD — extracted from the legacy dashboard."""
+        """Deprecated alias — unified dashboard lives at /cc."""
         _check_access(request)
-        ctx, _ = _manage_page_context(flash=flash)
-        return _TEMPLATES.TemplateResponse(request, 'manage.html', ctx)
+        url = f'/cc?flash={quote(flash)}#setup-strategies' if flash else '/cc#setup-strategies'
+        return RedirectResponse(url=url, status_code=307)
 
 
     @application.get('/legacy')
     def dashboard(request: Request, flash: str = ''):
+        """Deprecated alias — unified dashboard lives at /cc."""
         _check_access(request)
-        sections: dict[str, Any] = {}
-        errors: dict[str, str] = {}
-        fetchers: dict[str, Callable[[], Any]] = {
-            'cash': fetch_cash,
-            'snapshot': fetch_snapshot,
-            'status': fetch_status,
-            'risk': fetch_risk,
-            'risk_limits': fetch_risk_limits,
-            'positions': fetch_positions,
-            'strategies': fetch_strategies,
-            'proposals': fetch_proposals,
-            'available': fetch_available_strategies,
-            'watchlists': fetch_watchlists,
-        }
-        for key, fn in fetchers.items():
-            try:
-                sections[key] = fn()
-            except Exception as exc:  # noqa: BLE001 - surface, don't crash the page
-                logger.warning('dashboard section %s failed: %s', key, exc)
-                sections[key] = None
-                errors[key] = f'{type(exc).__name__}: {exc}'
-
-        strategies = sections.get('strategies') or []
-        # Mark scanned classes that are already deployed so the "available"
-        # table distinguishes on-disk-only strategies from live ones.
-        deployed_classes = {s.get('class_name') for s in strategies if s.get('class_name')}
-        available = sections.get('available') or []
-        for a in available:
-            a['deployed'] = a.get('class') in deployed_classes
-
-        # Explicit risk tri-state — never infer "ok" from a missing/failed
-        # report. "unavailable" takes priority even if a stale/None risk value
-        # happens to carry no warnings; "ok" only applies when the fetch itself
-        # succeeded.
-        risk_obj = sections.get('risk')
-        risk_warnings = (risk_obj.get('warnings') or []) if isinstance(risk_obj, dict) else []
-        if 'risk' in errors:
-            risk_state = 'unavailable'
-        elif risk_warnings:
-            risk_state = 'warning'
-        else:
-            risk_state = 'ok'
-
-        return _TEMPLATES.TemplateResponse(request, 'dashboard.html', {
-            'cash': sections.get('cash'),
-            'snapshot': sections.get('snapshot'),
-            'status': sections.get('status'),
-            'risk': sections.get('risk'),
-            'risk_state': risk_state,
-            'risk_limits': sections.get('risk_limits'),
-            'positions': sections.get('positions') or [],
-            'strategies': strategies,
-            'available_strategies': available,
-            'watchlists': sections.get('watchlists') or [],
-            'enabled_count': sum(1 for s in strategies if s.get('enabled')),
-            'proposals': sections.get('proposals') or [],
-            'errors': errors,
-            'flash': flash,
-            'csrf_token': _CSRF_TOKEN,
-        })
+        url = f'/cc?flash={quote(flash)}#trading' if flash else '/cc#trading'
+        return RedirectResponse(url=url, status_code=307)
 
 
     @application.post('/proposals/{pid}/approve',
@@ -1246,7 +1190,10 @@ def create_app(cc: CommandCenter | None = None) -> FastAPI:
     application.include_router(create_session_router(
         center.ensure_session_manager, center.limiter,
         cookie_secure=center.config.cookie_secure))
-    application.include_router(create_read_router(center, _TEMPLATES))
+    application.include_router(create_read_router(
+        center, _TEMPLATES,
+        manage_context_provider=lambda flash='': _manage_page_context(flash=flash)[0],
+    ))
     # NEW route only: `/api/cc-health`. Never touches the G0 `/healthz` /
     # `/readyz` / `/api/health` routes registered by `_register_legacy_routes`
     # below -- see the M1-R Task 7 addendum for why those must stay as-is.

@@ -3,7 +3,7 @@
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>MMR Command Center</title>
+  <title>MMR Dashboard</title>
   <style>
     :root { --bg:#0e1116; --panel:#171b22; --border:#262c36; --fg:#d7dce3;
       --dim:#7d8794; --pos:#3fb950; --neg:#f85149; --accent:#58a6ff;
@@ -73,6 +73,75 @@
     #drawer-close { float:right; margin:8px; background:transparent; border:none;
       color:var(--dim); font-size:18px; cursor:pointer; }
     #drawer-content { padding:8px 20px 20px; }
+    .flash { padding:10px 24px; background:rgba(88,166,255,.1); color:var(--accent);
+      border-bottom:1px solid var(--border); }
+    .dash-tabs { display:flex; gap:6px; padding:10px 24px 0; background:var(--panel);
+      border-bottom:1px solid var(--border); }
+    .dash-tab { background:transparent; border:1px solid transparent; border-bottom:none;
+      color:var(--dim); padding:8px 16px; border-radius:8px 8px 0 0; cursor:pointer;
+      font:inherit; font-size:13px; }
+    .dash-tab:hover { color:var(--fg); }
+    .dash-tab.active { background:var(--bg); color:var(--fg); border-color:var(--border);
+      margin-bottom:-1px; padding-bottom:9px; font-weight:600; }
+    .dash-pane { display:none; }
+    .dash-pane.active { display:block; }
+    #dash-setup { padding:0 0 24px; }
+    #dash-setup .setup-tabs { display:flex; gap:6px; padding:10px 24px 0;
+      background:var(--panel); border-bottom:1px solid var(--border); }
+    #dash-setup .setup-tab { background:transparent; border:1px solid transparent;
+      border-bottom:none; color:var(--dim); padding:8px 16px; border-radius:8px 8px 0 0;
+      cursor:pointer; font:inherit; font-size:13px; display:flex; align-items:center; gap:8px; }
+    #dash-setup .setup-tab:hover { color:var(--fg); }
+    #dash-setup .setup-tab.active { background:var(--bg); color:var(--fg);
+      border-color:var(--border); margin-bottom:-1px; padding-bottom:9px; font-weight:600; }
+    #dash-setup .setup-pane { display:none; padding:20px 24px; gap:22px;
+      grid-template-columns:repeat(auto-fit, minmax(440px, 1fr)); }
+    #dash-setup .setup-pane.active { display:grid; }
+    #dash-setup section { background:var(--panel); border:1px solid var(--border);
+      border-radius:10px; overflow:hidden; }
+    #dash-setup section.full { grid-column:1 / -1; }
+    #dash-setup section > h2 { margin:0; padding:12px 16px; font-size:13px;
+      text-transform:uppercase; letter-spacing:.6px; color:var(--dim);
+      border-bottom:1px solid var(--border); display:flex;
+      justify-content:space-between; align-items:center; }
+    #dash-setup .chip.on { background:rgba(63,185,80,.15); color:var(--pos); }
+    #dash-setup .chip.off { background:rgba(125,135,148,.15); color:var(--dim); }
+    #dash-setup .chip.err { background:rgba(248,81,73,.15); color:var(--neg); }
+    #dash-setup .banner { padding:10px 16px; margin:0; font-size:13px; }
+    #dash-setup .banner.err { color:var(--neg); background:rgba(248,81,73,.08); }
+    #dash-setup .note { padding:10px 16px; color:var(--dim); font-size:12.5px;
+      border-bottom:1px solid var(--border); }
+    #dash-setup button { font:inherit; border:1px solid var(--border); border-radius:6px;
+      cursor:pointer; padding:4px 10px; background:var(--chip); color:var(--fg); }
+    #dash-setup button.reject { color:var(--neg); }
+    #dash-setup .setup-foot { padding:8px 24px; color:var(--dim); font-size:11px; }
+    #dash-setup .empty { padding:16px; color:var(--dim); }
+    #dash-setup .info { position:relative; display:inline-block; margin-left:6px;
+      color:var(--dim); cursor:help; font-size:10px; font-weight:600; font-style:normal;
+      border:1px solid var(--border); border-radius:50%; width:15px; height:15px;
+      line-height:13px; text-align:center; vertical-align:middle; }
+    #dash-setup .info:hover, #dash-setup .info:focus { color:var(--accent);
+      border-color:var(--accent); outline:none; }
+    #dash-setup .tip { display:none; position: fixed; z-index:60; width:max-content;
+      max-width:300px; white-space:normal; background:#1c222b; border:1px solid var(--border);
+      border-radius:8px; padding:8px 11px; color:var(--fg); font-size:12px;
+      font-weight:400; text-align:left; letter-spacing:normal; text-transform:none;
+      line-height:1.5; box-shadow:0 8px 24px rgba(0,0,0,.5); }
+    #dash-setup .hover-tip { cursor:help; }
+    #dash-setup .strat-config-name { color:var(--dim); font-size:11px; font-weight:400; }
+    #dash-setup button.unfold { padding:2px 8px; font-size:12px; }
+    #dash-setup tr.param-row > td { background:var(--bg); padding:10px 16px; text-align:left; }
+    #dash-setup .param-form { display:flex; flex-wrap:wrap; gap:10px; align-items:center; }
+    #dash-setup .param-form label { display:flex; gap:6px; align-items:center;
+      color:var(--dim); font-size:12px; }
+    #dash-setup .param-form input, #dash-setup .param-form select {
+      background:var(--panel); border:1px solid var(--border); color:var(--fg);
+      border-radius:6px; padding:4px 7px; font:inherit; font-size:12.5px; }
+    #dash-setup .param-form input { width:110px; }
+    #dash-setup .param-form button { background:rgba(88,166,255,.15);
+      border-color:var(--accent); color:var(--accent); font-weight:600; }
+    #dash-setup .param-hint { color:var(--dim); font-size:11px; }
+    #dash-setup td.sym { font-weight:600; }
   </style>
 </head>
 <body data-degraded-after-ms="{{ degraded_after_ms }}"
@@ -85,10 +154,15 @@
     <span id="mode-badge" class="badge">…</span>
     <span id="account-id" class="num">—</span>
     <span id="dependency-chips" aria-label="Dependency health"></span>
-    <span id="nav-links"><a href="/manage">Manage strategies &amp; watchlists</a></span>
     <span id="last-event-time" title="Latest authoritative event time">
       last event: <span class="v">—</span></span>
   </header>
+  {% if flash %}<div class="flash">{{ flash }}</div>{% endif %}
+  <nav class="dash-tabs" aria-label="Dashboard sections">
+    <button type="button" class="dash-tab active" data-dash-tab="trading">Trading</button>
+    <button type="button" class="dash-tab" data-dash-tab="setup">Deploy &amp; watchlists</button>
+  </nav>
+  <div id="dash-trading" class="dash-pane active">
   <div id="account-cards" aria-label="Account summary"></div>
   <main class="grid">
     <section id="positions-panel" aria-label="Positions">
@@ -127,6 +201,10 @@
           for an authoritative risk projection.</div></section>
     </div>
   </main>
+  </div>
+  <div id="dash-setup" class="dash-pane">
+    {% include "_manage_tab.html" %}
+  </div>
   <div id="drawer" role="dialog" aria-modal="true" aria-label="Detail" hidden>
     <div id="drawer-box">
       <button id="drawer-close" aria-label="Close detail">×</button>
@@ -285,5 +363,119 @@
 
   <script src="/static/cc_util.js" defer></script>
   <script src="/static/command_center.js" defer></script>
+  <script>
+    (function () {
+      var _setupOpenEditors = 0;
+      window.toggleSetupParams = function (id, btn) {
+        var el = document.getElementById(id);
+        if (!el) return;
+        var open = el.style.display !== 'none';
+        el.style.display = open ? 'none' : 'table-row';
+        _setupOpenEditors = Math.max(0, _setupOpenEditors + (open ? -1 : 1));
+        if (btn) {
+          var label = btn.dataset.label || 'params';
+          btn.textContent = (open ? '▸' : '▾') + ' ' + label;
+        }
+      };
+
+      function positionSetupTip(anchor, tip) {
+        tip.style.display = 'block';
+        var r = anchor.getBoundingClientRect();
+        var margin = 8, gap = 7;
+        var tw = tip.offsetWidth, th = tip.offsetHeight;
+        var left = r.left + r.width / 2 - tw / 2;
+        left = Math.max(margin, Math.min(left, window.innerWidth - tw - margin));
+        var top = r.bottom + gap;
+        if (top + th > window.innerHeight - margin) top = r.top - th - gap;
+        tip.style.left = left + 'px';
+        tip.style.top = Math.max(top, margin) + 'px';
+      }
+      function hideSetupTips() {
+        document.querySelectorAll('#dash-setup .tip').forEach(function (t) {
+          t.style.display = 'none';
+        });
+      }
+      document.querySelectorAll('#dash-setup .info, #dash-setup .hover-tip').forEach(function (el) {
+        var tip = el.querySelector('.tip');
+        if (!tip) return;
+        var show = function () { positionSetupTip(el, tip); };
+        var hide = function () { tip.style.display = 'none'; };
+        el.addEventListener('mouseenter', show);
+        el.addEventListener('mouseleave', hide);
+        el.addEventListener('focus', show);
+        el.addEventListener('blur', hide);
+      });
+      window.addEventListener('scroll', hideSetupTips, true);
+
+      function activateSetupTab(name) {
+        if (!document.getElementById('setup-tab-' + name)) name = 'strategies';
+        document.querySelectorAll('#dash-setup .setup-tab').forEach(function (b) {
+          b.classList.toggle('active', b.dataset.setupTab === name);
+        });
+        document.querySelectorAll('#dash-setup .setup-pane').forEach(function (p) {
+          p.classList.toggle('active', p.id === 'setup-tab-' + name);
+        });
+        hideSetupTips();
+        return name;
+      }
+
+      function activateDashTab(name, setupSub) {
+        if (!document.getElementById('dash-' + name)) name = 'trading';
+        document.querySelectorAll('.dash-tab').forEach(function (b) {
+          b.classList.toggle('active', b.dataset.dashTab === name);
+        });
+        document.querySelectorAll('.dash-pane').forEach(function (p) {
+          p.classList.toggle('active', p.id === 'dash-' + name);
+        });
+        var hash = name;
+        if (name === 'setup') {
+          hash = 'setup-' + activateSetupTab(setupSub || 'strategies');
+        }
+        history.replaceState(null, '', '#' + hash);
+      }
+
+      document.querySelectorAll('.dash-tab').forEach(function (b) {
+        b.addEventListener('click', function () {
+          activateDashTab(b.dataset.dashTab, b.dataset.dashTab === 'setup' ? 'strategies' : null);
+        });
+      });
+      document.querySelectorAll('#dash-setup .setup-tab').forEach(function (b) {
+        b.addEventListener('click', function () {
+          activateDashTab('setup', b.dataset.setupTab);
+        });
+      });
+
+      document.querySelectorAll('#dash-setup .setup-unfold').forEach(function (btn) {
+        btn.addEventListener('click', function () {
+          toggleSetupParams(btn.dataset.target, btn);
+        });
+      });
+      document.querySelectorAll('#dash-setup .setup-delete-form').forEach(function (form) {
+        form.addEventListener('submit', function (ev) {
+          var msg = form.dataset.confirm || 'Delete this watchlist?';
+          if (!window.confirm(msg)) ev.preventDefault();
+        });
+      });
+
+      function parseHash() {
+        var raw = (location.hash || '#trading').replace('#', '');
+        if (raw === 'manage') raw = 'setup-strategies';
+        if (raw.indexOf('setup') === 0) {
+          var sub = raw === 'setup' ? 'strategies' : raw.replace('setup-', '');
+          activateDashTab('setup', sub);
+        } else {
+          activateDashTab('trading');
+        }
+      }
+      parseHash();
+      window.addEventListener('hashchange', parseHash);
+
+      setInterval(function () {
+        var setup = document.getElementById('dash-setup');
+        if (!setup || !setup.classList.contains('active')) return;
+        if (_setupOpenEditors === 0) location.reload();
+      }, 30000);
+    })();
+  </script>
 </body>
 </html>

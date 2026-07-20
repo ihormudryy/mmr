@@ -709,6 +709,21 @@ class TypedRpcRegistry:
             execution=selected_execution,
         )
 
+    def unregister(self, socket_role: str, method: str) -> bool:
+        """Remove a ``(role, method)`` registration if present.
+
+        Returns ``True`` when a registration was removed. Used by paper
+        automation hot-arm to tear down ``execute_automated_intent`` without
+        restarting the process. Idempotent for missing entries.
+        """
+        key = (socket_role, method)
+        if key not in self._by_role_method:
+            return False
+        del self._by_role_method[key]
+        if self._method_role.get(method) == socket_role:
+            del self._method_role[method]
+        return True
+
     def resolve(self, socket_role: str, method: str) -> Optional[TypedRpcRegistration]:
         """Look up the registration for an exact ``(role, method)`` pair.
 

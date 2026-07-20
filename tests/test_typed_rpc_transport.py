@@ -283,6 +283,16 @@ class TestTypedRpcRegistry:
         assert registry.contains("command", "get_status") is False
         assert registry.contains("query", "missing") is False
 
+    def test_unregister_removes_method_and_allows_reregister(self):
+        registry = TypedRpcRegistry()
+        registry.register("command", "execute_automated_intent", EmptyBody, dict, _handle_get_status)
+        assert registry.unregister("command", "execute_automated_intent") is True
+        assert registry.contains("command", "execute_automated_intent") is False
+        assert registry.resolve("command", "execute_automated_intent") is None
+        assert registry.unregister("command", "execute_automated_intent") is False
+        registry.register("command", "execute_automated_intent", EmptyBody, dict, _handle_get_status)
+        assert registry.contains("command", "execute_automated_intent") is True
+
 
 # ---------------------------------------------------------------------------
 # Successful round trips on each role

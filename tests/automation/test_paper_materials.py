@@ -4,10 +4,12 @@ from __future__ import annotations
 import json
 import stat
 from pathlib import Path
+from unittest.mock import patch
 
 import pytest
 
 from trader.automation.paper_materials import (
+    PaperMaterialsError,
     default_key_paths,
     ensure_signing_keypair,
     export_fixture_paper_eligible_bundle,
@@ -63,3 +65,69 @@ def test_default_key_paths(tmp_path: Path) -> None:
     assert private_path == tmp_path / "keys" / "private" / "signing.pem"
     assert verify_dir == tmp_path / "keys" / "verify"
     assert public_path == tmp_path / "keys" / "verify" / "paper-automation.pem"
+
+
+def test_ensure_signing_keypair_rejects_mismatched_public_key(tmp_path: Path) -> None:
+    private_path = tmp_path / "keys" / "private" / "signing.pem"
+    public_path = tmp_path / "keys" / "verify" / "paper-automation.pem"
+
+    ensure_signing_keypair(
+        private_key_path=private_path,
+        public_key_path=public_path,
+    )
+    public_path.write_bytes(b"-----BEGIN PUBLIC KEY-----\nwrong\n-----END PUBLIC KEY-----\n")
+
+    with pytest.raises(PaperMaterialsError, match="does not match private key"):
+        ensure_signing_keypair(
+            private_key_path=private_path,
+            public_key_path=public_path,
+        )
+
+
+def test_ensure_signing_keypair_force_regenerates_mismatched_pair(tmp_path: Path) -> None:
+    private_path = tmp_path / "keys" / "private" / "signing.pem"
+    public_path = tmp_path / "keys" / "verify" / "paper-automation.pem"
+
+    signer1, _ = ensure_signing_keypair(
+        private_key_path=private_path,
+        public_key_path=public_path,
+    )
+    public_path.write_bytes(b"-----BEGIN PUBLIC KEY-----\nwrong\n-----END PUBLIC KEY-----\n")
+
+    signer2, reused = ensure_signing_keypair(
+        private_key_path=private_path,
+        public_key_path=public_path,
+        force=True,
+    )
+    assert reused is False
+    assert signer2.public_key_id != signer1.public_key_id
+    assert public_path.read_bytes() == signer2.public_key_pem()
+
+
+def test_export_fixture_bundle_cleans_up_orphan_dir_on_export_failure(
+    tmp_path: Path,
+) -> None:
+    private_path = tmp_path / "keys" / "private" / "signing.pem"
+    public_path = tmp_path / "keys" / "verify" / "paper-automation.pem"
+    signer, _ = ensure_signing_keypair(
+        private_key_path=private_path,
+        public_key_path=public_path,
+    )
+    artifacts_root = tmp_path / "artifacts"
+
+    def _export_fail_after_mkdir(_self, artifact_id: str, path: Path) -> None:
+        path.mkdir(parents=True)
+        raise RuntimeError("simulated export failure")
+
+    with patch(
+        "trader.automation.paper_materials.ResearchBundle.export",
+        _export_fail_after_mkdir,
+    ):
+        with pytest.raises(RuntimeError, match="simulated export failure"):
+            export_fixture_paper_eligible_bundle(
+                signer=signer,
+                artifacts_root=artifacts_root,
+            )
+
+    orphan_dirs = list(artifacts_root.iterdir()) if artifacts_root.exists() else []
+    assert orphan_dirs == []

@@ -32,6 +32,10 @@ UTC = dt.timezone.utc
 T0 = dt.datetime(2026, 7, 18, 12, 0, tzinfo=UTC)
 
 
+class PaperMaterialsError(Exception):
+    """Raised when paper automation key/bundle material setup fails."""
+
+
 def default_key_paths(config_dir: Path) -> tuple[Path, Path, Path]:
     """Return ``(private_pem, verify_dir, public_pem)`` under *config_dir*."""
     verify_dir = config_dir / "keys" / "verify"
@@ -57,7 +61,7 @@ def _evidence() -> EligibilityEvidence:
 
 def _write_private_key(path: Path, *, force: bool) -> None:
     if path.exists() and not force:
-        raise SystemExit(
+        raise FileExistsError(
             f"refusing to overwrite existing private key {path}; pass --force"
         )
     path.parent.mkdir(parents=True, exist_ok=True)
@@ -70,12 +74,12 @@ def _write_private_key(path: Path, *, force: bool) -> None:
     os.chmod(path, 0o600)
     mode = stat.S_IMODE(path.stat().st_mode)
     if mode & 0o077:
-        raise SystemExit(f"private key permissions too open: {oct(mode)}")
+        raise PaperMaterialsError(f"private key permissions too open: {oct(mode)}")
 
 
 def _write_public_key(signer: AttestationSigner, path: Path, *, force: bool) -> None:
     if path.exists() and not force:
-        raise SystemExit(
+        raise FileExistsError(
             f"refusing to overwrite existing public key {path}; pass --force"
         )
     path.parent.mkdir(parents=True, exist_ok=True)
@@ -95,7 +99,16 @@ def ensure_signing_keypair(
         and public_key_path.exists()
         and not force
     ):
-        return AttestationSigner.from_key_file(str(private_key_path)), True
+        signer = AttestationSigner.from_key_file(str(private_key_path))
+        stored_public = public_key_path.read_bytes()
+        expected_public = signer.public_key_pem()
+        if stored_public != expected_public:
+            raise PaperMaterialsError(
+                f"public key at {public_key_path} does not match private key "
+                f"at {private_key_path} (public_key_id={signer.public_key_id}); "
+                "pass force=True to regenerate"
+            )
+        return signer, True
 
     _write_private_key(private_key_path, force=force)
     signer = AttestationSigner.from_key_file(str(private_key_path))
@@ -216,7 +229,7 @@ def export_fixture_paper_eligible_bundle(
         artifacts_root.mkdir(parents=True, exist_ok=True)
         export_dir = artifacts_root / artifact_id
         if export_dir.exists():
-            raise SystemExit(
+            raise FileExistsError(
                 f"artifact already exists at {export_dir}; remove it or choose a fresh key run"
             )
         try:

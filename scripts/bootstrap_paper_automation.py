@@ -27,6 +27,7 @@ if str(_PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(_PROJECT_ROOT))
 
 from trader.automation.paper_materials import (
+    PaperMaterialsError,
     default_key_paths,
     ensure_signing_keypair,
     export_fixture_paper_eligible_bundle,
@@ -111,16 +112,21 @@ def main() -> int:
     private_key, key_ring, public_key = default_key_paths(args.config_dir)
     artifacts_root = args.share_dir / "artifacts"
 
-    signer, _reused = ensure_signing_keypair(
-        private_key_path=private_key,
-        public_key_path=public_key,
-        force=args.force,
-    )
+    try:
+        signer, _reused = ensure_signing_keypair(
+            private_key_path=private_key,
+            public_key_path=public_key,
+            force=args.force,
+        )
 
-    artifact_id = export_fixture_paper_eligible_bundle(
-        signer=signer,
-        artifacts_root=artifacts_root,
-    )
+        artifact_id = export_fixture_paper_eligible_bundle(
+            signer=signer,
+            artifacts_root=artifacts_root,
+        )
+    except (PaperMaterialsError, FileExistsError) as exc:
+        print(exc, file=sys.stderr)
+        return 1
+
     bundle_path = artifacts_root / artifact_id
 
     _print_snippets(

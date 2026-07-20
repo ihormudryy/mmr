@@ -162,12 +162,12 @@
 
 **Interfaces:** Produces `ReplayBundle.seal(session_id) -> BundleDigest` and `TradingDayReplay.run(bundle) -> ReplayResult`; consumes immutable P2/P3 evidence.
 
-- [ ] Define bundle entries for artifact/attestation, bars, quote evidence, broker snapshots, policies, intents, decisions, commands, broker events, attribution, breaker/reconciliation/operator actions, and XNYS resolved schedule/version.
-- [ ] Test atomic seal (`tmp` + fsync + rename), checksums, path traversal, missing evidence, unresolved commands, corruption, and repeatable bundle digest.
-- [ ] Implement pure replay that recomputes signals, intent IDs, sizing, and policy decisions, while replaying recorded broker events rather than simulating broker behavior.
-- [ ] Compare exact decision traces and produce a structured divergence report; any divergence blocks evidence credit and trips/suspends via P4.
-- [ ] Run one golden accepted day and adversarial rejected/partial-fill/restart days.
-- [ ] Commit `feat(automation): add sealed forensic day replay`.
+- [x] Define bundle entries for artifact/attestation, bars, quote evidence, broker snapshots, policies, intents, decisions, commands, broker events, attribution, breaker/reconciliation/operator actions, and XNYS resolved schedule/version.
+- [x] Test atomic seal (`tmp` + fsync + rename), checksums, path traversal, missing evidence, unresolved commands, corruption, and repeatable bundle digest.
+- [x] Implement pure replay that recomputes signals, intent IDs, sizing, and policy decisions, while replaying recorded broker events rather than simulating broker behavior.
+- [x] Compare exact decision traces and produce a structured divergence report; any divergence blocks evidence credit and trips/suspends via P4.
+- [x] Run one golden accepted day and adversarial rejected/partial-fill/restart days.
+- [x] Commit `feat(automation): add sealed forensic day replay`.
 
 ### Task 9: Wire one strategy and pass the full paper vertical slice
 

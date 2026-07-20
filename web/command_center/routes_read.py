@@ -13,7 +13,7 @@ from sse_starlette.sse import EventSourceResponse
 logger = logging.getLogger("web.command_center.routes")
 
 SSE_PING_SECONDS = 10
-MANAGE_PAGE_TIMEOUT_S = float(os.environ.get('MMR_MANAGE_PAGE_TIMEOUT_S', '5'))
+MANAGE_PAGE_TIMEOUT_S = float(os.environ.get('MMR_MANAGE_PAGE_TIMEOUT_S', '12'))
 
 
 def create_read_router(cc, templates, manage_context_provider=None,

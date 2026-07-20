@@ -113,7 +113,7 @@ def get_manage_client() -> ManageRpcClient:
     global _CLIENT
     with _CLIENT_LOCK:
         if _CLIENT is None:
-            timeout_s = float(os.environ.get('MMR_MANAGE_RPC_TIMEOUT_S', '3'))
+            timeout_s = float(os.environ.get('MMR_MANAGE_RPC_TIMEOUT_S', '10'))
             _CLIENT = ManageRpcClient(timeout_s=timeout_s)
         return _CLIENT
 

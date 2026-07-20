@@ -700,22 +700,12 @@ class AllocationAuthorityStore:
         candidates = {row[0] for row in rows or ()}
         return frozenset(d for d in candidates if self.is_revoked(d))
 
-    def active_for(
+    def _active_from_rows(
         self,
-        account_id: str,
-        artifact_digest: str,
+        rows: Sequence[Any],
         *,
-        now: Optional[dt.datetime] = None,
+        resolved_now: dt.datetime,
     ) -> Optional[AllocationAuthorityRecord]:
-        """Return the currently active authority for an account/artifact pair."""
-        resolved_now = _as_utc(now or self._now())
-        rows = self.db.execute(
-            f"SELECT {_SELECT_COLUMNS} FROM allocation_authorities "
-            f"WHERE account_id = ? AND artifact_digest = ? "
-            f"ORDER BY entry_id DESC",
-            [account_id, artifact_digest],
-            fetch="all",
-        )
         seen: set[str] = set()
         for row in rows or ():
             record = _row_to_record(row)
@@ -735,6 +725,75 @@ class AllocationAuthorityStore:
                 continue
             return latest
         return None
+
+    def active_for(
+        self,
+        account_id: str,
+        artifact_digest: str,
+        *,
+        now: Optional[dt.datetime] = None,
+    ) -> Optional[AllocationAuthorityRecord]:
+        """Return the currently active authority for an account/artifact pair."""
+        resolved_now = _as_utc(now or self._now())
+        rows = self.db.execute(
+            f"SELECT {_SELECT_COLUMNS} FROM allocation_authorities "
+            f"WHERE account_id = ? AND artifact_digest = ? "
+            f"ORDER BY entry_id DESC",
+            [account_id, artifact_digest],
+            fetch="all",
+        )
+        return self._active_from_rows(rows, resolved_now=resolved_now)
+
+    def active_for_account(
+        self,
+        account_id: str,
+        *,
+        now: Optional[dt.datetime] = None,
+    ) -> Optional[AllocationAuthorityRecord]:
+        """Return the newest active authority for an account (any artifact)."""
+        resolved_now = _as_utc(now or self._now())
+        rows = self.db.execute(
+            f"SELECT {_SELECT_COLUMNS} FROM allocation_authorities "
+            f"WHERE account_id = ? ORDER BY entry_id DESC",
+            [account_id],
+            fetch="all",
+        )
+        return self._active_from_rows(rows, resolved_now=resolved_now)
+
+    def active_strategy_count(
+        self,
+        account_id: str,
+        *,
+        now: Optional[dt.datetime] = None,
+    ) -> int:
+        """Count distinct strategies with an active allocation authority."""
+        resolved_now = _as_utc(now or self._now())
+        rows = self.db.execute(
+            f"SELECT {_SELECT_COLUMNS} FROM allocation_authorities "
+            f"WHERE account_id = ? ORDER BY entry_id DESC",
+            [account_id],
+            fetch="all",
+        )
+        seen_digests: set[str] = set()
+        strategies: set[str] = set()
+        for row in rows or ():
+            record = _row_to_record(row)
+            if record.authority_digest in seen_digests:
+                continue
+            seen_digests.add(record.authority_digest)
+            latest = self.latest(record.authority_digest)
+            if latest is None:
+                continue
+            if latest.event in (EVENT_REVOKED, EVENT_SUPERSEDED, EVENT_DEACTIVATED):
+                continue
+            if _as_utc(latest.expires_at) <= resolved_now:
+                continue
+            if latest.event not in _ACTIVE_AUTHORITY_EVENTS:
+                continue
+            if latest.max_gross_allocation <= 0:
+                continue
+            strategies.add(latest.strategy_id)
+        return len(strategies)
 
     def authority_digest_for(
         self,

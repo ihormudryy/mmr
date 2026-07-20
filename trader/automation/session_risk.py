@@ -23,6 +23,13 @@ from trader.promotion.allocation_policy import (
     AuthoritySource,
     STEADY_MAX_GROSS_FRACTION,
 )
+from trader.promotion.portfolio_risk_budget import (
+    BLOCK_COMBINED_GROSS,
+    BLOCK_DAILY_LOSS,
+    BLOCK_MISSING_PORTFOLIO_AUTHORITY,
+    BLOCK_POSITION_COUNT,
+    PortfolioRiskBudget,
+)
 from trader.trading.approval_context import ApprovalContext
 from trader.trading.circuit_breaker import BreakerSignal
 
@@ -33,6 +40,13 @@ MAX_GROSS_FRACTION = STEADY_MAX_GROSS_FRACTION
 MAX_TRADE_RISK_FRACTION = 0.002  # 0.20%
 MAX_DAILY_LOSS_FRACTION = 0.005  # 0.50%
 MAX_DRAWDOWN_FRACTION = 0.03  # 3%
+
+_PORTFOLIO_REASON_MAP = {
+    BLOCK_COMBINED_GROSS: "PORTFOLIO_GROSS",
+    BLOCK_DAILY_LOSS: "PORTFOLIO_DAILY_LOSS",
+    BLOCK_POSITION_COUNT: "MAX_POSITIONS",
+    BLOCK_MISSING_PORTFOLIO_AUTHORITY: "PORTFOLIO_AUTHORITY_ABSENT",
+}
 
 
 @dataclass(frozen=True)
@@ -145,12 +159,18 @@ class SessionRiskController:
         liquidity_policy: Optional[LiquidityPolicy] = None,
         breaker: Optional[BreakerPort] = None,
         allocation_policy: Optional[AllocationPolicy] = None,
+        portfolio_risk_budget: Optional[PortfolioRiskBudget] = None,
+        portfolio_authority_present: Optional[Callable[[str], bool]] = None,
+        strategy_count: Optional[Callable[[], int]] = None,
         now: Optional[Callable[[], dt.datetime]] = None,
     ):
         self._calendar = calendar or XNYSCalendarPolicy()
         self._liquidity = liquidity_policy or LiquidityPolicy()
         self._breaker = breaker
         self._allocation_policy = allocation_policy or AllocationPolicy(now=now)
+        self._portfolio_risk_budget = portfolio_risk_budget or PortfolioRiskBudget()
+        self._portfolio_authority_present = portfolio_authority_present
+        self._strategy_count = strategy_count
         self._now = now or (lambda: dt.datetime.now(dt.timezone.utc))
 
     def evaluate(
@@ -287,6 +307,55 @@ class SessionRiskController:
         limit_candidates = tuple(
             (c.name, c.max_gross_fraction) for c in alloc_decision.limit_candidates
         )
+
+        # --- Portfolio combined risk (P5 Task 7) — multi-strategy only ------
+        strategy_count = 1
+        if self._strategy_count is not None:
+            try:
+                strategy_count = max(1, int(self._strategy_count()))
+            except Exception:
+                strategy_count = 1
+        if is_entry and strategy_count > 1:
+            equity_safe = _finite(equity) and equity > 0
+            proposed_gross = 0.0
+            if equity_safe and entry_price is not None and qty > 0:
+                proposed_gross = (float(qty) * entry_price) / equity
+            daily_loss_pct = 0.0
+            if equity_safe:
+                daily_loss_pct = max(0.0, -float(broker.daily_pnl)) / equity
+            gross_exposure = 0.0
+            if equity_safe:
+                gross_exposure = sum(
+                    abs(float(getattr(row, "market_value", 0.0) or 0.0))
+                    for row in broker.positions
+                    if getattr(row, "quantity", None) and float(row.quantity) != 0
+                    and not getattr(row, "deleted", False)
+                ) / equity
+            portfolio_authority = (
+                self._portfolio_authority_present(broker.account_id)
+                if self._portfolio_authority_present is not None
+                else False
+            )
+            portfolio = self._portfolio_risk_budget.evaluate(
+                intents=[{
+                    "proposed_gross": proposed_gross,
+                    "projected_daily_loss": 0.0,
+                }],
+                broker_snapshot={
+                    "positions": [
+                        row for row in broker.positions
+                        if getattr(row, "quantity", None) and float(row.quantity) != 0
+                        and not getattr(row, "deleted", False)
+                    ],
+                    "gross_exposure": gross_exposure,
+                    "daily_loss_pct": daily_loss_pct,
+                },
+                authorities=[resolved_authority],
+                portfolio_authority_present=bool(portfolio_authority),
+                strategy_count=strategy_count,
+            )
+            for blocker in portfolio.blockers:
+                reasons.append(_PORTFOLIO_REASON_MAP.get(blocker, blocker.upper()))
 
         if is_entry and entry_price is not None and equity > 0 and qty > 0:
             existing_position_value = abs(float(broker.position_value(intent.conid)))

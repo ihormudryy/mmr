@@ -392,9 +392,18 @@ def build_command_stack(
 
     apply_allocation_authority_migrations(migrator)
     from trader.data.allocation_authority_store import AllocationAuthorityStore
+    from trader.data.portfolio_risk_authority_store import (
+        PortfolioRiskAuthorityStore,
+        apply_portfolio_risk_authority_migrations,
+    )
     from trader.promotion.allocation_policy import AllocationPolicy
+    from trader.promotion.degradation_reaction import react_to_breaker_trip
 
+    apply_portfolio_risk_authority_migrations(migrator)
     allocation_authority_store = AllocationAuthorityStore(
+        journal=journal, db=trader.journal_db, now=now,
+    )
+    portfolio_risk_authority_store = PortfolioRiskAuthorityStore(
         journal=journal, db=trader.journal_db, now=now,
     )
     allocation_policy = AllocationPolicy(now=now)
@@ -551,6 +560,12 @@ def build_command_stack(
         reset_ready=reset_ready,
         reconciliation_complete=reconciliation_safe,
         session_key=xnys_session_key,
+        on_trip=lambda state: react_to_breaker_trip(
+            allocation_authority_store,
+            account_id=trader.ib_account,
+            breaker_state=state,
+            now=now(),
+        ),
     )
     liquidation_service = LiquidationService(
         broker_snapshot, _LiquidationDispatch(dispatch),
@@ -605,6 +620,12 @@ def build_command_stack(
         calendar=XNYSCalendarPolicy(),
         breaker=circuit_breaker,
         allocation_policy=allocation_policy,
+        portfolio_authority_present=lambda account_id: (
+            portfolio_risk_authority_store.active_for(account_id) is not None
+        ),
+        strategy_count=lambda: allocation_authority_store.active_strategy_count(
+            trader.ib_account,
+        ),
         now=now,
     )
     # P3 Task 5 — protective entry saga over existing expressive-order path.

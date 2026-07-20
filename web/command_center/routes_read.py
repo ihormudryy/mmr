@@ -5,6 +5,7 @@ import asyncio
 import json
 import logging
 import os
+from concurrent.futures import ThreadPoolExecutor
 
 from fastapi import APIRouter, Depends, Request
 from fastapi.responses import HTMLResponse, JSONResponse
@@ -16,6 +17,15 @@ SSE_PING_SECONDS = 10
 MANAGE_PAGE_TIMEOUT_S = float(os.environ.get('MMR_MANAGE_PAGE_TIMEOUT_S', '12'))
 PAPER_AUTOMATION_QUERY_TIMEOUT_S = float(
     os.environ.get("MMR_PAPER_AUTOMATION_QUERY_TIMEOUT_S", "1"))
+
+# Dedicated pool so a timed-out manage fetch can be abandoned without tying an
+# asyncio Task / default-executor Future to the request portal. ``asyncio.wait_for
+# (asyncio.to_thread(...))`` cancels the awaitable but the worker thread keeps
+# running; Starlette's TestClient portal then ``thread.join()``s forever waiting
+# for that Task — wedging the whole pytest process when manage RPC has no peer
+# (CI) or a slow one. Polling a concurrent.futures.Future avoids that coupling.
+_MANAGE_PAGE_EXECUTOR = ThreadPoolExecutor(
+    max_workers=2, thread_name_prefix='cc-manage-page')
 
 
 def create_read_router(cc, templates, manage_context_provider=None,
@@ -126,12 +136,20 @@ def create_read_router(cc, templates, manage_context_provider=None,
             # so a slow RPC overlay never leaves both sections blank.
             if empty_manage_context is not None:
                 ctx.update(empty_manage_context(flash))
+            # Poll a dedicated-pool Future instead of wait_for(to_thread(...)):
+            # cancelling to_thread leaves the worker alive and wedged TestClient
+            # portals (see module docstring on _MANAGE_PAGE_EXECUTOR).
+            fut = _MANAGE_PAGE_EXECUTOR.submit(manage_context_provider, flash)
+            loop = asyncio.get_running_loop()
+            deadline = loop.time() + MANAGE_PAGE_TIMEOUT_S
             try:
-                ctx.update(await asyncio.wait_for(
-                    asyncio.to_thread(manage_context_provider, flash),
-                    timeout=MANAGE_PAGE_TIMEOUT_S,
-                ))
-            except asyncio.TimeoutError:
+                while not fut.done():
+                    remaining = deadline - loop.time()
+                    if remaining <= 0:
+                        raise TimeoutError
+                    await asyncio.sleep(min(0.05, remaining))
+                ctx.update(fut.result())
+            except TimeoutError:
                 logger.warning('manage context exceeded %.0fs on /cc', MANAGE_PAGE_TIMEOUT_S)
                 page_errors = dict(ctx.get('errors') or {})
                 page_errors['page'] = (

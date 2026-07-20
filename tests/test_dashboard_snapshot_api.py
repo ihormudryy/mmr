@@ -60,8 +60,29 @@ def cc(monkeypatch):
 
 
 @pytest.fixture
-def app(cc):
+def app(cc, monkeypatch):
     from web.app import create_app
+
+    class _EmptyManage:
+        def trader_query(self, method, body=None):
+            if method == 'list_universes':
+                return {'universes': []}
+            return {}
+
+        def strategy_query(self, method, body=None):
+            if method == 'list_strategies':
+                return {'strategies': []}
+            return {}
+
+        def trader_command(self, method, body=None):
+            return {}
+
+        def strategy_command(self, method, body=None):
+            return {}
+
+    # /cc overlays Deploy/Watchlists via manage RPC; without a stub a missing
+    # peer (or a slow one) burns MANAGE_PAGE_TIMEOUT_S per page render.
+    monkeypatch.setattr('web.app.get_manage_client', lambda: _EmptyManage())
     return create_app(cc)
 
 

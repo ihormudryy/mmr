@@ -382,11 +382,25 @@ function renderPositions() {
   }).join('');
 }
 
+const PROPOSAL_FILTER = { mode: 'pending' };  // pending | all | terminal
+
+function proposalFilterRows() {
+  const v = store.view; if (!v) return [];
+  const active = v.proposals.active || [];
+  const terminal = v.proposals.terminal || [];
+  if (PROPOSAL_FILTER.mode === 'terminal') return terminal;
+  if (PROPOSAL_FILTER.mode === 'all') return [...active, ...terminal];
+  return active;
+}
+
 function renderProposals() {
   const v = store.view; if (!v) return;
   const rail = document.getElementById('proposal-cards');
-  const cards = v.proposals.active.map(p => {
+  if (!rail) return;
+  const rows = proposalFilterRows();
+  const cards = rows.map(p => {
     const age = ageOf(p.created_at);
+    const status = String(p.status || '').toUpperCase();
     return `<div class="proposal-card" tabindex="0" role="button"
         data-proposal="${esc(p.entity_id)}"
         aria-label="Proposal ${esc(p.entity_id)} details">
@@ -394,12 +408,17 @@ function renderProposals() {
         ${esc(p.symbol || '')}</strong>
       <div class="dim">qty ${esc(p.quantity ?? 'auto')} · notional
         ${money(p.amount, p.currency)} · conf ${esc(p.confidence ?? '—')}</div>
-      <div class="dim">status ${esc(p.status)} · expires ${esc(p.expires_at || '—')}
+      <div class="dim">status ${esc(status)} · source ${esc(p.source || '—')}
         · <span class="age">${fmtAge(age)} old</span></div>
     </div>`;
   });
+  const emptyMsg = PROPOSAL_FILTER.mode === 'pending'
+    ? 'No pending proposals.'
+    : (PROPOSAL_FILTER.mode === 'terminal'
+      ? 'No terminal proposals in the live feed yet.'
+      : 'No proposals.');
   rail.innerHTML = cards.join('')
-    || '<div class="proposal-card dim">No pending proposals.</div>';
+    || `<div class="proposal-card dim">${emptyMsg}</div>`;
 }
 
 function renderOrders() {
@@ -726,6 +745,15 @@ document.getElementById('proposal-cards').addEventListener('keydown', e => {
     showProposalDrawer(card.dataset.proposal, card);
   }
 });
+document.querySelectorAll('[data-proposal-filter]').forEach(btn => {
+  btn.addEventListener('click', () => {
+    PROPOSAL_FILTER.mode = btn.getAttribute('data-proposal-filter') || 'pending';
+    document.querySelectorAll('[data-proposal-filter]').forEach(b => {
+      b.classList.toggle('active', b === btn);
+    });
+    renderProposals();
+  });
+});
 
 function ccFindProposalRow(id) {
   const v = store.view; if (!v) return null;
@@ -735,33 +763,52 @@ function ccFindProposalRow(id) {
 }
 
 function showProposalDrawer(id, invoker) {
-  const p = ccFindProposalRow(id);
-  if (!p) return;
-  // Full sizing-reasoning chain, not a one-line preview (spec §8.3).
-  const sizing = p.sizing_result || {};
-  const reasoning = Array.isArray(sizing.reasoning) ? sizing.reasoning
-    : (sizing.reasoning ? [sizing.reasoning] : []);
-  // [M1-C] UI-wiring pass: Approve/Reject only for a PENDING proposal --
-  // ccApproveProposal/ccRejectProposal read `.id`/`.account_mode` straight
-  // off the real proposal row (ProposalRecord.to_payload() already carries
-  // both -- trader/data/proposal_repository.py -- so the store row can be
-  // passed through unchanged, no adapter needed).
-  const actions = (CFG.commandsEnabled && String(p.status || '').toUpperCase() === 'PENDING')
-    ? `<div class="cc-actions">
-        <button type="button" data-cc-approve="${esc(p.entity_id)}" class="primary">Approve</button>
-        <button type="button" data-cc-reject="${esc(p.entity_id)}" class="reject">Reject</button>
-      </div>` : '';
-  openDrawer(`<h3>Proposal #${esc(p.entity_id)} — ${esc(p.action || '')}
-      ${esc(p.symbol || '')}</h3>
-    <p>status <strong>${esc(p.status)}</strong> · source ${esc(p.source || '—')}
-      · confidence ${esc(p.confidence ?? '—')} · expires ${esc(p.expires_at || '—')}</p>
-    <h4>Position sizing reasoning</h4>
-    ${reasoning.length
-      ? '<ol>' + reasoning.map(step => `<li>${esc(step)}</li>`).join('') + '</ol>'
-      : '<p class="dim">No sizing reasoning recorded.</p>'}
-    <h4>Rationale</h4>
-    <p>${esc(p.reasoning || '—')}</p>
-    ${actions}`, invoker);
+  const local = ccFindProposalRow(id);
+  const render = (p) => {
+    if (!p) return;
+    const sizing = p.sizing_result || {};
+    const reasoning = Array.isArray(sizing.reasoning) ? sizing.reasoning
+      : (sizing.reasoning ? [sizing.reasoning] : []);
+    const status = String(p.status || '').toUpperCase();
+    const actions = (CFG.commandsEnabled && status === 'PENDING')
+      ? `<div class="cc-actions">
+          <button type="button" data-cc-approve="${esc(p.entity_id || p.id)}" class="primary">Approve</button>
+          <button type="button" data-cc-reject="${esc(p.entity_id || p.id)}" class="reject">Reject</button>
+        </div>` : '';
+    const orderIds = p.order_ids || p.broker_order_ids || [];
+    openDrawer(`<h3>Proposal #${esc(p.entity_id || p.id)} — ${esc(p.action || '')}
+        ${esc(p.symbol || '')}</h3>
+      <p>status <strong>${esc(status)}</strong> · source ${esc(p.source || '—')}
+        · confidence ${esc(p.confidence ?? '—')} · expires ${esc(p.expires_at || '—')}</p>
+      <p class="dim">conId ${esc(p.conid ?? p.instrument_id ?? '—')}
+        · qty ${esc(p.quantity ?? 'auto')} · amount ${money(p.amount, p.currency)}
+        · group ${esc(p.group || '—')}</p>
+      ${orderIds.length
+        ? `<p class="dim">orders: ${esc(Array.isArray(orderIds) ? orderIds.join(', ') : orderIds)}</p>`
+        : ''}
+      <h4>Position sizing reasoning</h4>
+      ${reasoning.length
+        ? '<ol>' + reasoning.map(step => `<li>${esc(step)}</li>`).join('') + '</ol>'
+        : '<p class="dim">No sizing reasoning recorded.</p>'}
+      <h4>Rationale</h4>
+      <p>${esc(p.reasoning || '—')}</p>
+      ${p.thesis ? `<h4>Thesis</h4><p>${esc(p.thesis)}</p>` : ''}
+      ${actions}`, invoker);
+  };
+  render(local);
+  // Enrich from trader when possible (history / fields missing from SSE row).
+  const numericId = String(id).replace(/^proposal:/, '');
+  if (!/^\d+$/.test(numericId)) return;
+  fetch(`/api/proposals/${encodeURIComponent(numericId)}`, {
+    credentials: 'same-origin',
+    headers: { 'Accept': 'application/json' },
+  }).then(r => r.ok ? r.json() : null).then(body => {
+    if (!body || body.error) return;
+    const merged = Object.assign({}, local || {}, body, {
+      entity_id: (local && local.entity_id) || body.id || id,
+    });
+    render(merged);
+  }).catch(() => {});
 }
 
 /* ---------------- freshness ticker ---------------------------------------- */
@@ -991,11 +1038,69 @@ function ccCloseCommandDrawers() {
 }
 
 function ccOpenProposalDrawer() {
-  document.getElementById('cc-proposal-drawer').hidden = false;
+  const d = document.getElementById('cc-proposal-drawer');
+  const status = document.getElementById('cc-resolve-status');
+  if (status) {
+    status.textContent = '';
+    status.className = 'cc-resolve-status';
+  }
+  d.hidden = false;
 }
 
 function ccCloseProposalDrawer() {
   document.getElementById('cc-proposal-drawer').hidden = true;
+}
+
+async function ccResolveSymbol() {
+  const form = document.getElementById('cc-proposal-form');
+  const status = document.getElementById('cc-resolve-status');
+  const sym = String(form.resolve_symbol.value || '').trim().toUpperCase();
+  const exchange = String(form.resolve_exchange.value || '').trim();
+  const currency = String(form.resolve_currency.value || '').trim();
+  if (!sym) {
+    status.textContent = 'Enter a symbol to resolve.';
+    status.className = 'cc-resolve-status err';
+    form.resolve_symbol.focus();
+    return;
+  }
+  status.textContent = `Resolving ${sym}…`;
+  status.className = 'cc-resolve-status';
+  const qs = new URLSearchParams({ symbol: sym });
+  if (exchange) qs.set('exchange', exchange);
+  if (currency) qs.set('currency', currency);
+  try {
+    const res = await fetch('/api/resolve?' + qs.toString(), {
+      credentials: 'same-origin',
+      headers: { 'Accept': 'application/json' },
+    });
+    const body = await res.json();
+    if (!res.ok) {
+      status.textContent = body.error || (`HTTP ${res.status}`);
+      status.className = 'cc-resolve-status err';
+      return;
+    }
+    const instruments = body.instruments || [];
+    if (!instruments.length) {
+      status.textContent = `No contract found for ${sym}`
+        + (exchange ? ` on ${exchange}` : '')
+        + ' — try exchange/currency hints.';
+      status.className = 'cc-resolve-status err';
+      return;
+    }
+    const first = instruments[0];
+    const conid = first.instrument_id || first.conId || first.conid;
+    form.conid.value = conid;
+    const more = instruments.length > 1
+      ? ` (${instruments.length} matches — using first; set exchange if wrong)`
+      : '';
+    status.textContent = `${first.symbol || sym} → conId ${conid}`
+      + ` · ${first.primary_exchange || first.exchange || '—'}`
+      + ` · ${first.currency || '—'}${more}`;
+    status.className = 'cc-resolve-status ok';
+  } catch (err) {
+    status.textContent = String(err.message || err);
+    status.className = 'cc-resolve-status err';
+  }
 }
 
 function ccProposalBody(form, commandId) {
@@ -1038,6 +1143,13 @@ document.getElementById('cc-proposal-cancel').addEventListener('click',
     ccCloseProposalDrawer);
 document.getElementById('cc-proposal-close').addEventListener('click',
     ccCloseProposalDrawer);
+const resolveBtn = document.getElementById('cc-resolve-symbol');
+if (resolveBtn) {
+  resolveBtn.addEventListener('click', (ev) => {
+    ev.preventDefault();
+    ccResolveSymbol();
+  });
+}
 }
 
 /* ---- Close position drawer (pre-filled reducing proposal) ---- */

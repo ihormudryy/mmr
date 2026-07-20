@@ -137,7 +137,7 @@
     <h3>Example A — Manual buy on paper {{ info('Best first exercise. Leave quantity and amount empty for automatic position sizing.') }}</h3>
     <ol class="guide-steps">
       <li>Terminal: <code>mmr resolve AAPL</code> → note the <strong>conId</strong>.</li>
-      <li>Trading → Action queue → <strong>New proposal</strong>.</li>
+      <li>Trading → Action queue → <strong>New proposal</strong> → Resolve a symbol (or paste conId).</li>
       <li>conId + Side <code>BUY</code>; leave size empty; confidence e.g. <code>0.6</code>; short reasoning.</li>
       <li><strong>Create proposal</strong> → review card → <strong>Approve</strong>.</li>
       <li>Watch Working orders → Executions → Positions.</li>
@@ -193,7 +193,7 @@
       <li>Optional: check <strong>propose</strong> so signals become proposals.</li>
       <li>Deploy → Enable on Trading when needed.</li>
     </ol>
-    <p class="guide-note">Undeploy: <code>mmr strategies undeploy orb_demo</code></p>
+    <p class="guide-note">Undeploy is on the Deploy tab (confirm), or: <code>mmr strategies undeploy orb_demo</code></p>
   </section>
 
   <section class="guide-section">

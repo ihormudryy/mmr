@@ -15,7 +15,7 @@ jobs:
       - run: uv python install 3.12.13
       - run: uv sync --python 3.12.13 --frozen --extra test
       - run: uv run --frozen python -c 'import platform; assert platform.python_version() == "3.12.13"'
-      - run: uv run --frozen pytest tests/ --timeout=30 -q --ignore=tests/test_ibrx_async.py
+      - run: uv run --frozen pytest tests/ --timeout=30 --timeout-method=thread -q --ignore=tests/test_ibrx_async.py
 
   async-ibrx:
     name: Async IB reactive (quarantined, required)

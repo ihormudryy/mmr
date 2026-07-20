@@ -45,19 +45,13 @@
                 <input type="hidden" name="csrf_token" value="{{ csrf_token }}" />
                 <div class="wl-members-head">
                   <strong>Members</strong>
-                  <span class="param-hint">{{ w.count }} symbol{% if w.count != 1 %}s{% endif %}{% if w.truncated %} (showing first {{ w.symbol_list|length }}){% endif %}</span>
+                  <span class="param-hint wl-count-hint" data-wl-count="{{ w.name }}">{{ w.count }} symbol{% if w.count != 1 %}s{% endif %}</span>
                   <button type="button" class="wl-select-all" data-wl="{{ w.name }}">Select all</button>
                   <button type="button" class="wl-select-none" data-wl="{{ w.name }}">Clear</button>
                   <button type="submit" class="reject">Remove selected</button>
                 </div>
                 <div class="wl-member-list" data-wl-members="{{ w.name }}" aria-live="polite">
-                  {% if w.symbol_list %}
-                    {% for sym in w.symbol_list %}
-                    <label><input type="checkbox" name="symbols" value="{{ sym }}" /> {{ sym }}</label>
-                    {% endfor %}
-                  {% else %}
-                    <span class="dim">No symbols yet — add some below.</span>
-                  {% endif %}
+                  <span class="dim">Unfold to load members…</span>
                 </div>
               </form>
               <form class="param-form" method="post" action="/watchlists/{{ w.name }}/add">

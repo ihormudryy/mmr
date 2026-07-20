@@ -46,6 +46,7 @@ function makeContext() {
     } },
     getElementById: getElement,
     querySelector: () => element(),
+    querySelectorAll: () => [],
     addEventListener() {},
     createElement: () => element(),
   };

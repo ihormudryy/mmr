@@ -88,9 +88,65 @@
     });
   });
 
+  function escapeHtml(s) {
+    return String(s)
+      .replace(/&/g, '&amp;')
+      .replace(/</g, '&lt;')
+      .replace(/>/g, '&gt;')
+      .replace(/"/g, '&quot;');
+  }
+
+  function loadWatchlistMembers(panel) {
+    var name = panel.getAttribute('data-wl-panel');
+    var box = panel.querySelector('[data-wl-members]');
+    if (!name || !box || box.getAttribute('data-loaded') === '1') return;
+    box.innerHTML = '<span class="dim">Loading…</span>';
+    fetch('/watchlists/' + encodeURIComponent(name) + '/members', {
+      credentials: 'same-origin',
+      headers: { 'Accept': 'application/json' },
+    }).then(function (r) {
+      if (!r.ok) throw new Error('HTTP ' + r.status);
+      return r.json();
+    }).then(function (data) {
+      var syms = data.symbols || [];
+      var count = data.count != null ? data.count : syms.length;
+      var truncated = !!data.truncated;
+      box.setAttribute('data-loaded', '1');
+      var preview = document.querySelector(
+          '.wl-row[data-wl-name="' + name.replace(/"/g, '') + '"] .wrap-wide');
+      if (preview) {
+        preview.textContent = syms.length
+          ? (syms.join(', ') + (truncated ? ' …' : ''))
+          : '—';
+      }
+      var hint = panel.querySelector('[data-wl-count="' + name + '"]');
+      if (hint) {
+        hint.textContent = count + ' symbol' + (count !== 1 ? 's' : '')
+          + (truncated ? ' (showing first ' + syms.length + ')' : '');
+      }
+      if (!syms.length) {
+        box.innerHTML = '<span class="dim">No symbols yet — add some below.</span>';
+        return;
+      }
+      box.innerHTML = syms.map(function (sym) {
+        var s = escapeHtml(sym);
+        return '<label><input type="checkbox" name="symbols" value="' + s + '" /> '
+          + s + '</label>';
+      }).join('');
+    }).catch(function () {
+      box.removeAttribute('data-loaded');
+      box.innerHTML = '<span class="banner err">Failed to load members</span>';
+    });
+  }
+
   document.querySelectorAll('.dash-admin-pane .setup-unfold').forEach(function (btn) {
     btn.addEventListener('click', function () {
+      var panel = document.getElementById(btn.dataset.target);
+      var opening = panel && panel.style.display === 'none';
       toggleSetupParams(btn.dataset.target, btn);
+      if (opening && panel && panel.hasAttribute('data-wl-panel')) {
+        loadWatchlistMembers(panel);
+      }
     });
   });
 

@@ -490,64 +490,22 @@ def _get_accessor():
 
 
 def fetch_watchlists() -> list[dict]:
-    """List watchlists with symbol previews for the Watchlists tab.
+    """List watchlist names + counts only.
 
-    Loads each universe's symbols on page render (``get_universe``) so the
-    Preview column and unfold checkbox list are populated without a second
-    round-trip. Fan-out is parallelized; per-universe failures degrade to an
-    empty symbol list rather than blanking the whole tab.
+    Deliberately avoids N per-universe ``get_universe`` calls on the /cc page
+    load path — that fan-out blocked the uvicorn worker and kept TestClient /
+    browsers spinning while manage RPC timed out. Symbol previews and the
+    checkbox member list load lazily via ``GET /watchlists/{name}/members``
+    when a row is unfolded.
     """
-    from concurrent.futures import ThreadPoolExecutor, as_completed
-
     client = get_manage_client()
     listed = client.trader_query('list_universes')
-    entries = list(listed.get('universes') or [])
-    if not entries:
-        return []
-
-    def _one(entry: dict) -> dict:
-        name = str(entry.get('name') or '')
-        count = int(entry.get('count') or 0)
-        symbols: list[str] = []
-        truncated = False
-        try:
-            resp = client.trader_query('get_universe', {
-                'name': name,
-                'symbol_limit': 200,
-            })
-            symbols = [
-                str(s).strip().upper()
-                for s in (resp.get('symbols') or [])
-                if str(s).strip()
-            ]
-            count = int(resp.get('count') or count)
-            truncated = count > len(symbols)
-        except Exception as exc:  # noqa: BLE001
-            logger.warning('watchlist preview %s failed: %s', name, exc)
-        preview = ', '.join(symbols) if symbols else '—'
-        return {
-            'name': name,
-            'count': count,
-            'symbols': preview,
-            'symbol_list': symbols,
-            'truncated': truncated,
-        }
-
-    rows: list[dict] = []
-    workers = min(8, max(1, len(entries)))
-    with ThreadPoolExecutor(max_workers=workers) as pool:
-        futs = {pool.submit(_one, e): e for e in entries}
-        by_name = {}
-        for fut in as_completed(futs):
-            row = fut.result()
-            by_name[row['name']] = row
-    # Stable order matching list_universes sort.
-    for entry in entries:
-        name = str(entry.get('name') or '')
-        rows.append(by_name.get(name) or {
-            'name': name,
+    rows = []
+    for entry in listed.get('universes') or []:
+        rows.append({
+            'name': entry['name'],
             'count': int(entry.get('count') or 0),
-            'symbols': '—',
+            'symbols': '',
             'symbol_list': [],
             'truncated': False,
         })
@@ -1398,6 +1356,121 @@ def _register_legacy_routes(application: FastAPI) -> None:
             logger.warning('deploy failed: %s', exc)
             msg = f'deploy error: {type(exc).__name__}: {exc}'
         return _flash(msg)
+
+
+    @application.post('/strategies/{name}/undeploy')
+    def undeploy_strategy(name: str, request: Request, csrf_token: str = Form(''),
+                          session: str = Depends(require_session)):
+        """Remove a strategy from strategy_runtime.yaml and reload strategy_service."""
+        _check_csrf(csrf_token)
+        strat = (name or '').strip()
+        if not strat or strat == 'global':
+            return _flash(f'cannot undeploy {strat!r}', tab='deploy')
+
+        def _undeploy() -> str:
+            if not _STRATEGY_CONFIG_PATH.exists():
+                return f'no strategy_runtime.yaml — nothing to undeploy for "{strat}"'
+            config = yaml.safe_load(_STRATEGY_CONFIG_PATH.read_text()) or {}
+            entries = list(config.get('strategies') or [])
+            kept = [e for e in entries if e.get('name') != strat]
+            if len(kept) == len(entries):
+                return f'strategy "{strat}" not found in config'
+            config['strategies'] = kept
+            tmp = str(_STRATEGY_CONFIG_PATH) + '.tmp'
+            with open(tmp, 'w') as f:
+                yaml.safe_dump(config, f, sort_keys=False)
+            os.replace(tmp, _STRATEGY_CONFIG_PATH)
+            try:
+                client = get_manage_client()
+                reload_result = client.strategy_command('reload_strategies', {})
+                if not reload_result.get('ok'):
+                    return (f'undeployed "{strat}" from config but reload failed — '
+                            'strategy_service picks it up on the next reconcile')
+            except TypedRpcRemoteError as exc:
+                return (f'undeployed "{strat}" from config but reload failed '
+                        f'({exc.code}: {exc}) — next reconcile will drop it')
+            except Exception as exc:  # noqa: BLE001
+                return (f'undeployed "{strat}" from config but reload failed '
+                        f'({type(exc).__name__}: {exc}) — next reconcile will drop it')
+            return f'undeployed "{strat}"'
+
+        try:
+            msg = _undeploy()
+        except Exception as exc:  # noqa: BLE001
+            logger.warning('undeploy %s failed: %s', strat, exc)
+            msg = f'undeploy failed: {type(exc).__name__}: {exc}'
+        return _flash(msg, tab='deploy')
+
+
+    @application.get('/api/resolve')
+    def api_resolve(symbol: str = '', exchange: str = '', currency: str = '',
+                    sec_type: str = 'STK',
+                    session: str = Depends(require_session)):
+        """Resolve a ticker to IB instrument(s) for the New proposal drawer."""
+        sym = (symbol or '').strip().upper()
+        if not sym:
+            return JSONResponse({'error': 'symbol required'}, status_code=400)
+        if sym.isdigit():
+            return JSONResponse({
+                'error': 'numeric input looks like a conId — paste it in Instrument conId directly',
+            }, status_code=400)
+        try:
+            resp = get_manage_client().trader_query('discover_instrument', {
+                'symbol': sym,
+                'exchange': (exchange or '').strip(),
+                'currency': (currency or '').strip(),
+                'sec_type': (sec_type or 'STK').strip() or 'STK',
+            })
+            instruments = resp.get('instruments') or []
+            return JSONResponse({
+                'symbol': sym,
+                'instruments': instruments,
+                'count': len(instruments),
+            })
+        except TypedRpcRemoteError as exc:
+            return JSONResponse({'error': f'{exc.code}: {exc}'}, status_code=502)
+        except Exception as exc:  # noqa: BLE001
+            logger.warning('api resolve %s failed: %s', sym, exc)
+            return JSONResponse(
+                {'error': f'{type(exc).__name__}: {exc}'}, status_code=502)
+
+    @application.get('/api/proposals')
+    def api_list_proposals(status: str = '', limit: int = 50,
+                           session: str = Depends(require_session)):
+        """List proposals (optional status filter) for Action queue history."""
+        lim = max(1, min(int(limit or 50), 200))
+        body: dict = {'limit': lim}
+        st = (status or '').strip().upper()
+        if st and st != 'ALL':
+            body['status'] = st
+        try:
+            resp = get_manage_client().trader_query('list_proposals', body)
+            return JSONResponse({
+                'proposals': resp.get('proposals') or [],
+                'status': st or 'ALL',
+            })
+        except TypedRpcRemoteError as exc:
+            return JSONResponse({'error': f'{exc.code}: {exc}'}, status_code=502)
+        except Exception as exc:  # noqa: BLE001
+            logger.warning('api list_proposals failed: %s', exc)
+            return JSONResponse(
+                {'error': f'{type(exc).__name__}: {exc}'}, status_code=502)
+
+    @application.get('/api/proposals/{proposal_id}')
+    def api_get_proposal(proposal_id: int,
+                         session: str = Depends(require_session)):
+        """Full proposal payload for the detail drawer."""
+        try:
+            resp = get_manage_client().trader_query(
+                'get_proposal', {'proposal_id': int(proposal_id)})
+            return JSONResponse(resp)
+        except TypedRpcRemoteError as exc:
+            code = 404 if exc.code in ('PROPOSAL_NOT_FOUND', 'NOT_FOUND') else 502
+            return JSONResponse({'error': f'{exc.code}: {exc}'}, status_code=code)
+        except Exception as exc:  # noqa: BLE001
+            logger.warning('api get_proposal %s failed: %s', proposal_id, exc)
+            return JSONResponse(
+                {'error': f'{type(exc).__name__}: {exc}'}, status_code=502)
 
 
 def create_app(cc: CommandCenter | None = None) -> FastAPI:

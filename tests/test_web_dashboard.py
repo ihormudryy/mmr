@@ -440,6 +440,12 @@ class StubManageClient:
         self.accessor = accessor
         self.stub = stub_sdk
         self.calls: list[tuple] = []
+        self.proposals: list[dict] = [{
+            'id': 7, 'proposal_id': 7, 'status': 'EXECUTED',
+            'action': 'BUY', 'symbol': 'AAPL', 'conid': 265598,
+            'source': 'manual', 'confidence': 0.7,
+            'sizing_result': {'reasoning': ['base $5k']},
+        }]
 
     @staticmethod
     def _instrument(symbol: str, conid: int) -> dict:
@@ -471,6 +477,15 @@ class StubManageClient:
             if conid:
                 return {'instruments': [self._instrument(sym, conid)]}
             return {'instruments': []}
+        if method == 'list_proposals':
+            return {'proposals': list(self.proposals)}
+        if method == 'get_proposal':
+            pid = int(body['proposal_id'])
+            for p in self.proposals:
+                if int(p.get('id') or p.get('proposal_id') or 0) == pid:
+                    return dict(p)
+            from trader.messaging.typed_rpc import TypedRpcRemoteError
+            raise TypedRpcRemoteError('PROPOSAL_NOT_FOUND', 'missing')
         raise AssertionError(f'unexpected trader_query {method!r}')
 
     def trader_command(self, method: str, body: dict):
@@ -658,10 +673,11 @@ class TestWatchlistRoutes:
         assert 'wl-name-toggle' in html
         assert 'wl-member-list' in html
         assert '▸ manage' not in html
-        assert 'AAPL' in html and 'MSFT' in html  # preview + checkbox list on load
+        assert 'Unfold to load members' in html
+        assert 'mylist' in html
 
-    def test_fetch_watchlists_includes_symbol_previews(self, manage_client, monkeypatch):
-        """Page load populates Preview via get_universe (parallel per list)."""
+    def test_fetch_watchlists_is_list_only(self, manage_client, monkeypatch):
+        """Page load must not fan out get_universe (lazy members endpoint)."""
         calls = []
         orig = manage_client.trader_query
 
@@ -672,9 +688,11 @@ class TestWatchlistRoutes:
         monkeypatch.setattr(manage_client, 'trader_query', _track)
         rows = webapp.fetch_watchlists()
         assert 'list_universes' in calls
-        assert calls.count('get_universe') >= 1
-        assert rows[0]['symbol_list'] == ['AAPL', 'MSFT']
-        assert 'AAPL' in rows[0]['symbols']
+        assert 'get_universe' not in calls
+        assert rows[0]['name'] == 'mylist'
+        assert rows[0]['count'] == 2
+        assert rows[0]['symbol_list'] == []
+        assert rows[0]['symbols'] == ''
 
     def test_flash_redirects_to_cc_watchlists(self, client, accessor, stub_resolving):
         r = client.post('/watchlists/create',
@@ -684,6 +702,35 @@ class TestWatchlistRoutes:
         assert r.headers['location'].startswith('/cc?flash=')
         assert '#watchlists' in r.headers['location']
         assert 'flash_test' in accessor.universes
+
+
+class TestResolveAndProposalsApi:
+    def test_resolve_returns_instrument(self, client, manage_client):
+        r = client.get('/api/resolve', params={'symbol': 'AAPL'})
+        assert r.status_code == 200
+        body = r.json()
+        assert body['count'] == 1
+        assert body['instruments'][0]['instrument_id'] == 265598
+
+    def test_resolve_rejects_empty_and_numeric(self, client, manage_client):
+        assert client.get('/api/resolve').status_code == 400
+        assert client.get('/api/resolve', params={'symbol': '265598'}).status_code == 400
+
+    def test_resolve_unknown_symbol(self, client, manage_client):
+        r = client.get('/api/resolve', params={'symbol': 'NOPE123'})
+        assert r.status_code == 200
+        assert r.json()['count'] == 0
+
+    def test_get_proposal(self, client, manage_client):
+        r = client.get('/api/proposals/7')
+        assert r.status_code == 200
+        assert r.json()['status'] == 'EXECUTED'
+        assert r.json()['symbol'] == 'AAPL'
+
+    def test_list_proposals(self, client, manage_client):
+        r = client.get('/api/proposals')
+        assert r.status_code == 200
+        assert len(r.json()['proposals']) >= 1
 
 
 class TestDeployRoute:
@@ -724,6 +771,34 @@ class TestDeployRoute:
                    and c[2].get('name') == 'deploy_mom_test' for c in manage_client.calls)
         assert any(c[0] == 'trader_command' and c[1] == 'add_universe_symbols'
                    for c in manage_client.calls)
+
+    def test_undeploy_removes_yaml_and_reloads(
+            self, client, stub, manage_client, stub_resolving, deploy_config):
+        import yaml
+        self._deploy(client)
+        manage_client.calls.clear()
+        r = client.post('/strategies/mom_test/undeploy',
+                        data={'csrf_token': _csrf()}, follow_redirects=False)
+        assert r.status_code == 303
+        assert '#deploy' in r.headers['location']
+        cfg = yaml.safe_load(deploy_config.read_text())
+        assert not any(e.get('name') == 'mom_test' for e in cfg.get('strategies') or [])
+        assert ('strategy_command', 'reload_strategies', {}) in manage_client.calls
+
+    def test_undeploy_global_refused(self, client, deploy_config):
+        r = client.post('/strategies/global/undeploy',
+                        data={'csrf_token': _csrf()}, follow_redirects=False)
+        assert r.status_code == 303
+        assert 'cannot undeploy' in r.headers['location'].lower() or 'flash=' in r.headers['location']
+
+    def test_deploy_tab_has_undeploy_control(self, client):
+        # Deploy tab lists live strategy_service rows (stub: orb_googl), not
+        # freshly-written YAML names until reload returns them.
+        html = client.get('/cc').text
+        assert '/strategies/orb_googl/undeploy' in html
+        assert 'data-proposal-filter="terminal"' in html
+        # cc-resolve-symbol lives inside the commands_enabled drawer block;
+        # default test flags leave commands off, so it must not be required.
 
     def test_deploy_with_watchlist_target(self, client, stub, accessor,
                                           stub_resolving, deploy_config):
@@ -850,7 +925,7 @@ class TestLegacyAccessTokenDoubleGate:
     a valid dashboard session cookie."""
 
     @pytest.fixture
-    def alias_client(self, stub, monkeypatch):
+    def alias_client(self, stub, manage_client, monkeypatch):
         from web.command_center import CommandCenter, CommandCenterConfig
         from web.command_center.session import DashboardCredentials
         from cc_fakes import NullBridge, NullQuotePlane
@@ -858,6 +933,9 @@ class TestLegacyAccessTokenDoubleGate:
         # _ACCESS_TOKEN directly (normally read from os.environ at import
         # time) while ALSO being the token load_dashboard_credentials would
         # hand to the SessionManager.
+        # manage_client is required: /cc overlays Deploy/Watchlists via typed
+        # RPC; without a stub the manage fetch hits real ZMQ and used to wedge
+        # Starlette's TestClient portal after the page timeout.
         monkeypatch.setattr(webapp, '_ACCESS_TOKEN', TEST_TOKEN)
         cc = CommandCenter(
             CommandCenterConfig(),

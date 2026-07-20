@@ -11,7 +11,7 @@
     </h2>
     <p class="note">Enter <strong>symbols</strong> (e.g. AAPL, MSFT) or pick a <strong>watchlist</strong> to deploy.
       Use <strong>Enable</strong> / <strong>Disable</strong> on a deployed row to put it RUNNING.
-      Undeploy → <code>mmr strategies undeploy NAME</code></p>
+      <strong>Undeploy</strong> removes it from config and reloads strategy_service.</p>
     {% if errors.strategies %}<p class="banner err">{{ errors.strategies }}</p>{% endif %}
     {% if strategies %}
     <table>
@@ -21,7 +21,7 @@
         <th>Auto {{ info('off (—): signals are only recorded. propose: each signal creates a PENDING proposal you approve on the Trading tab. Full auto-execution is not supported.') }}</th>
         <th>Bar {{ info('Bar size the strategy consumes. It is evaluated once per newly completed bar of this size — matching how it was backtested — not on every tick.') }}</th>
         <th>ConIds {{ info('Explicit IB contract IDs when the strategy lists conids. universe:NAME means it is bound to a named watchlist/universe and follows that membership — not missing data. A blank (—) means neither conids nor universe is configured. Verify contracts with mmr resolve SYMBOL before hardcoding.') }}</th>
-        <th>Actions {{ info('Enable/Disable applies immediately via strategy_service and persists across restarts. The global strategy cannot be toggled here.') }}</th>
+        <th>Actions {{ info('Enable/Disable applies immediately via strategy_service. Undeploy removes the YAML entry and reloads — confirm carefully.') }}</th>
       </tr></thead>
       <tbody>
       {% for s in strategies %}
@@ -34,18 +34,26 @@
           <td>{% if s.auto_execute == 'propose' %}<span class="chip on">propose</span>{% elif s.auto_execute %}<span class="chip err">{{ s.auto_execute }}</span>{% else %}<span class="dim">—</span>{% endif %}</td>
           <td>{{ s.bar_size or '—' }}</td>
           <td class="dim">{{ s.conids or '—' }}</td>
-          <td>
+          <td class="wl-actions">
             {% if s.name == 'global' %}
               <span class="dim">—</span>
-            {% elif s.enabled %}
+            {% else %}
+              {% if s.enabled %}
               <form class="param-form inline" method="post" action="/strategies/{{ s.name }}/disable-live">
                 <input type="hidden" name="csrf_token" value="{{ csrf_token }}" />
                 <button type="submit" class="reject">Disable</button>
               </form>
-            {% else %}
+              {% else %}
               <form class="param-form inline" method="post" action="/strategies/{{ s.name }}/enable-live">
                 <input type="hidden" name="csrf_token" value="{{ csrf_token }}" />
                 <button type="submit" class="primary">Enable</button>
+              </form>
+              {% endif %}
+              <form class="param-form inline setup-delete-form" method="post"
+                    action="/strategies/{{ s.name }}/undeploy"
+                    data-confirm="Undeploy {{ s.name }}? Removes it from strategy_runtime.yaml and reloads.">
+                <input type="hidden" name="csrf_token" value="{{ csrf_token }}" />
+                <button type="submit" class="reject">Undeploy</button>
               </form>
             {% endif %}
           </td>

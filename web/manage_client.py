@@ -70,16 +70,19 @@ class ManageRpcClient:
                 client = self._client_factory(role, endpoint)
                 client.connect()
                 self._clients[bucket] = client
-            try:
-                return client.call(method, payload, dict)
-            except (TypedRpcRemoteError, TimeoutError, OSError) as exc:
-                logger.warning('manage typed call %s failed: %s', method, exc)
-                try:
-                    client.close()
-                except Exception:  # noqa: BLE001
-                    pass
+        try:
+            return client.call(method, payload, dict)
+        except (TypedRpcRemoteError, TimeoutError, OSError) as exc:
+            logger.warning('manage typed call %s failed: %s', method, exc)
+            with self._lock:
+                client = self._clients[bucket]
+                if client is not None:
+                    try:
+                        client.close()
+                    except Exception:  # noqa: BLE001
+                        pass
                 self._clients[bucket] = None
-                raise
+            raise
 
     def trader_query(self, method: str, body: dict[str, Any] | None = None) -> dict[str, Any]:
         return self._call('trader_query', 'query',
@@ -110,7 +113,8 @@ def get_manage_client() -> ManageRpcClient:
     global _CLIENT
     with _CLIENT_LOCK:
         if _CLIENT is None:
-            _CLIENT = ManageRpcClient()
+            timeout_s = float(os.environ.get('MMR_MANAGE_RPC_TIMEOUT_S', '3'))
+            _CLIENT = ManageRpcClient(timeout_s=timeout_s)
         return _CLIENT
 
 

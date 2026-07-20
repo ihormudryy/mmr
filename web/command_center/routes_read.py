@@ -13,7 +13,7 @@ from sse_starlette.sse import EventSourceResponse
 logger = logging.getLogger("web.command_center.routes")
 
 SSE_PING_SECONDS = 10
-MANAGE_PAGE_TIMEOUT_S = float(os.environ.get('MMR_MANAGE_PAGE_TIMEOUT_S', '12'))
+MANAGE_PAGE_TIMEOUT_S = float(os.environ.get('MMR_MANAGE_PAGE_TIMEOUT_S', '5'))
 
 
 def create_read_router(cc, templates, manage_context_provider=None,
@@ -105,13 +105,10 @@ def create_read_router(cc, templates, manage_context_provider=None,
             "flash": flash,
         }
         if manage_context_provider is not None:
-            # Never block the single uvicorn worker on synchronous typed-RPC
-            # while serving /cc — that stalled /api/snapshot and left the
-            # browser tab spinning until every manage fetcher finished.
-            fallback = empty_manage_context or (lambda flash='', error='': {
-                'strategies': [], 'available_strategies': [], 'watchlists': [],
-                'deployed_count': 0, 'flash': flash, 'errors': {'page': error} if error else {},
-            })
+            # Seed the Deploy/Watchlists tabs from local disk + YAML immediately
+            # so a slow RPC overlay never leaves both sections blank.
+            if empty_manage_context is not None:
+                ctx.update(empty_manage_context(flash))
             try:
                 ctx.update(await asyncio.wait_for(
                     asyncio.to_thread(manage_context_provider, flash),
@@ -119,12 +116,25 @@ def create_read_router(cc, templates, manage_context_provider=None,
                 ))
             except asyncio.TimeoutError:
                 logger.warning('manage context exceeded %.0fs on /cc', MANAGE_PAGE_TIMEOUT_S)
-                ctx.update(fallback(
-                    flash,
-                    error=f'setup tab timed out after {MANAGE_PAGE_TIMEOUT_S:.0f}s'))
+                page_errors = dict(ctx.get('errors') or {})
+                page_errors['page'] = (
+                    f'live sections timed out after {MANAGE_PAGE_TIMEOUT_S:.0f}s '
+                    '— showing local data'
+                )
+                ctx['errors'] = page_errors
             except Exception as exc:  # noqa: BLE001 - degrade, don't 500 the page
                 logger.warning('manage context failed on /cc: %s', exc)
-                ctx.update(fallback(flash, error=f'{type(exc).__name__}: {exc}'))
+                if empty_manage_context is not None:
+                    ctx.update(empty_manage_context(
+                        flash,
+                        error=f'{type(exc).__name__}: {exc}',
+                    ))
+                else:
+                    ctx.update({
+                        'strategies': [], 'available_strategies': [], 'watchlists': [],
+                        'deployed_count': 0,
+                        'errors': {'page': f'{type(exc).__name__}: {exc}'},
+                    })
         return templates.TemplateResponse(request, "command_center.html", ctx)
 
     return router

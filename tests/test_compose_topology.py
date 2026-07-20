@@ -139,6 +139,14 @@ def test_only_dashboard_and_typed_query_command_ports_are_published():
     assert any("42102" in p for p in published)
 
 
+def test_strategy_binds_typed_rpc_on_all_interfaces():
+    """Dashboard deploy tab calls strategy:42105 cross-container; loopback-only
+    binds (the trader.yaml default) refuse those connections."""
+    compose = _load_yaml("docker-compose.yml")
+    env = compose["services"]["strategy"]["environment"]
+    assert env.get("TYPED_BIND_ADDRESS") == "tcp://0.0.0.0"
+
+
 def test_network_is_private_mmr_internal():
     compose = _load_yaml("docker-compose.yml")
     assert "mmr-internal" in compose["networks"]

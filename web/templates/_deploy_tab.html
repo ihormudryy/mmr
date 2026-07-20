@@ -1,6 +1,7 @@
 {% macro info(text) %}<span class="info" tabindex="0">i<span class="tip">{{ text }}</span></span>{% endmacro %}
 
 <div class="dash-admin-body">
+  {% if errors.page %}<p class="banner err">{{ errors.page }}</p>{% endif %}
 
   <section class="full">
     <h2>Deployed strategies
@@ -8,8 +9,8 @@
       <span class="chip on">{{ deployed_count }} loaded</span>
     </h2>
     <p class="note">Enable / disable / params → <strong>Trading</strong> tab · Undeploy → <code>mmr strategies undeploy NAME</code></p>
-    {% if errors.strategies %}<p class="banner err">{{ errors.strategies }}</p>
-    {% elif strategies %}
+    {% if errors.strategies %}<p class="banner err">{{ errors.strategies }}</p>{% endif %}
+    {% if strategies %}
     <table>
       <thead><tr>
         <th>Name</th><th>State</th><th>Auto</th><th>Bar</th><th>ConIds</th>
@@ -37,8 +38,8 @@
       {{ info('Every Strategy implementation found in the strategies/ directory (static scan — nothing is executed). Deploy attaches one to symbols or a watchlist, loads it immediately, and enables it.') }}
       <span class="chip">{{ available_strategies|length }}</span>
     </h2>
-    {% if errors.available %}<p class="banner err">{{ errors.available }}</p>
-    {% elif available_strategies %}
+    {% if errors.available %}<p class="banner err">{{ errors.available }}</p>{% endif %}
+    {% if available_strategies %}
     <table>
       <thead><tr>
         <th>Name {{ info('Hover for the class docstring.') }}</th>

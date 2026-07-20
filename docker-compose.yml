@@ -270,6 +270,11 @@ services:
     cpus: 1.0
     environment:
       <<: *mmr-common-env
+      # Typed query/command sockets (42104/42105) must bind 0.0.0.0 so sibling
+      # containers (dashboard deploy tab, trader coordinator) can reach them
+      # via the "strategy" DNS name — same fix as the trader service's
+      # TYPED_BIND_ADDRESS (loopback-only binds refuse cross-container TCP).
+      TYPED_BIND_ADDRESS: tcp://0.0.0.0
       # This service's own RPC server bind.
       ZMQ_STRATEGY_RPC_SERVER_ADDRESS: tcp://0.0.0.0
       # Outbound: subscribes to trader's ticker PubSub and MessageBus, and
@@ -293,7 +298,7 @@ services:
       # strategy-service "verified" boolean).
       - ${HOME}/.local/share/mmr/artifacts:/home/trader/.local/share/mmr/artifacts:ro
     healthcheck:
-      test: ["CMD", "python3", "-c", "import socket; socket.create_connection(('127.0.0.1', 42005), timeout=3).close()"]
+      test: ["CMD", "python3", "-c", "import socket; socket.create_connection(('127.0.0.1', 42105), timeout=3).close()"]
       interval: 30s
       timeout: 5s
       retries: 3
@@ -337,6 +342,7 @@ services:
     command: ["python", "-m", "web.app"]
     depends_on:
       - trader
+      - strategy
     mem_limit: 1g
     cpus: 0.5
     environment:

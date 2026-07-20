@@ -455,10 +455,25 @@ def _humanize_class_name(class_name: str) -> str:
     return re.sub(r'(?<=[a-z0-9])(?=[A-Z])|(?<=[A-Z])(?=[A-Z][a-z])', ' ', class_name)
 
 
-# Strategies live next to this package in the repo checkout; override for
-# non-standard layouts with MMR_STRATEGIES_DIR.
-_STRATEGIES_DIR = os.environ.get(
-    'MMR_STRATEGIES_DIR', str(Path(__file__).parent.parent / 'strategies'))
+def _resolve_strategies_dir() -> Path:
+    """Resolve the on-disk strategies/ directory (same precedence as ``mmr
+    strategies available``: ``MMR_STRATEGIES_DIR``, then repo-root
+    ``strategies/``)."""
+    override = os.environ.get('MMR_STRATEGIES_DIR')
+    if override:
+        return Path(override).expanduser()
+    root = Path(__file__).resolve().parent.parent
+    if (root / 'pyproject.toml').exists():
+        return root / 'strategies'
+    cur = root
+    while cur != cur.parent:
+        if (cur / 'pyproject.toml').exists():
+            return cur / 'strategies'
+        cur = cur.parent
+    return root / 'strategies'
+
+
+_STRATEGIES_DIR = str(_resolve_strategies_dir())
 
 # The runtime's actual config (same file strategy_service reads/reconciles).
 _STRATEGY_CONFIG_PATH = Path('~/.config/mmr/strategy_runtime.yaml').expanduser()
@@ -523,17 +538,59 @@ def _resolve_symbols(symbols: list[str], exchange: str = '', currency: str = '',
     return resolved, missing
 
 
-def fetch_strategies() -> list[dict]:
-    rows = get_manage_client().strategy_query('list_strategies').get('strategies') or []
+def _normalize_strategy_rows(rows: list[dict], *, from_config: bool = False) -> list[dict]:
     for r in rows:
-        state = str(r.get('state') or '').upper()
+        state = str(r.get('state') or ('CONFIG' if from_config else '')).upper()
+        r['state'] = state
         r['enabled'] = state in _ENABLED_STATES
         if isinstance(r.get('conids'), (list, tuple)):
             r['conids'] = ', '.join(str(c) for c in r['conids'])
+        elif r.get('conids') is None and r.get('universe'):
+            r['conids'] = str(r['universe'])
         r['display_name'] = _humanize_class_name(str(r.get('class_name') or '')) or r.get('name')
         if not isinstance(r.get('params'), dict):
             r['params'] = {}
+        if from_config:
+            r['from_config'] = True
     return rows
+
+
+def fetch_deployed_from_config() -> list[dict]:
+    """YAML-only deployed list — mirrors ``mmr strategies list`` fallback."""
+    if not _STRATEGY_CONFIG_PATH.exists():
+        return []
+    config = yaml.safe_load(_STRATEGY_CONFIG_PATH.read_text()) or {}
+    rows = []
+    for entry in config.get('strategies') or []:
+        conids = entry.get('conids')
+        rows.append({
+            'name': entry.get('name', ''),
+            'state': 'CONFIG',
+            'bar_size': entry.get('bar_size'),
+            'conids': conids,
+            'universe': entry.get('universe'),
+            'class_name': entry.get('class_name', ''),
+            'description': entry.get('description', ''),
+            'auto_execute': entry.get('auto_execute'),
+            'params': dict(entry.get('params') or {}),
+        })
+    return _normalize_strategy_rows(rows, from_config=True)
+
+
+def fetch_strategies() -> tuple[list[dict], str | None]:
+    """Live list from strategy_service, with YAML fallback when unreachable."""
+    try:
+        rows = get_manage_client().strategy_query('list_strategies').get('strategies') or []
+        return _normalize_strategy_rows(rows), None
+    except Exception as exc:  # noqa: BLE001 - degrade to config like the CLI
+        logger.warning('list_strategies RPC failed, falling back to config: %s', exc)
+        fallback = fetch_deployed_from_config()
+        if fallback:
+            return fallback, (
+                f'strategy_service unreachable ({type(exc).__name__}); '
+                'showing local config (may be stale vs live runtime)'
+            )
+        raise
 
 
 def fetch_available_strategies() -> list[dict]:
@@ -564,12 +621,32 @@ def _flash(msg: str) -> RedirectResponse:
 
 
 def _empty_manage_context(flash: str = '', *, error: str = '') -> dict[str, Any]:
-    errors = {'page': error} if error else {}
+    ctx = _manage_page_local_bootstrap(flash)
+    if error:
+        ctx['errors'] = {**ctx.get('errors', {}), 'page': error}
+    return ctx
+
+
+def _manage_page_local_bootstrap(flash: str = '') -> dict[str, Any]:
+    """Instant deploy-tab slices — local scan + YAML, no RPC."""
+    errors: dict[str, str] = {}
+    try:
+        available = fetch_available_strategies()
+    except Exception as exc:  # noqa: BLE001
+        logger.warning('available strategies scan failed: %s', exc)
+        available = []
+        errors['available'] = f'{type(exc).__name__}: {exc}'
+
+    strategies = fetch_deployed_from_config()
+    deployed_classes = {s.get('class_name') for s in strategies if s.get('class_name')}
+    for a in available:
+        a['deployed'] = a.get('class') in deployed_classes
+
     return {
-        'strategies': [],
-        'available_strategies': [],
+        'strategies': strategies,
+        'available_strategies': available,
         'watchlists': [],
-        'deployed_count': 0,
+        'deployed_count': len(strategies),
         'flash': flash,
         'csrf_token': _CSRF_TOKEN,
         'errors': errors,
@@ -577,40 +654,81 @@ def _empty_manage_context(flash: str = '', *, error: str = '') -> dict[str, Any]
 
 
 def _manage_page_context(flash: str = '') -> tuple[dict[str, Any], dict[str, str]]:
-    """Fetch only the sections /manage needs — no trader RPC on the hot path."""
-    from concurrent.futures import ThreadPoolExecutor, as_completed
+    """Fetch deploy/watchlist sections for /cc.
 
-    sections: dict[str, Any] = {}
-    errors: dict[str, str] = {}
-    fetchers: dict[str, Callable[[], Any]] = {
+    Local scans run first; RPC overlays live strategy state + watchlists with a
+    short deadline and without waiting for hung threads on pool shutdown.
+    """
+    from concurrent.futures import ThreadPoolExecutor, wait
+
+    ctx = _manage_page_local_bootstrap(flash)
+    errors = dict(ctx.get('errors') or {})
+    sections: dict[str, Any] = {
+        'strategies': ctx['strategies'],
+        'watchlists': ctx['watchlists'],
+    }
+
+    rpc_fetchers: dict[str, Callable[[], Any]] = {
         'strategies': fetch_strategies,
-        'available': fetch_available_strategies,
         'watchlists': fetch_watchlists,
     }
-    timeout_s = float(os.environ.get('MMR_MANAGE_FETCH_TIMEOUT_S', '8'))
-    with ThreadPoolExecutor(max_workers=len(fetchers)) as pool:
-        future_map = {pool.submit(fn): key for key, fn in fetchers.items()}
-        try:
-            done = as_completed(future_map, timeout=timeout_s)
-            for fut in done:
-                key = future_map[fut]
-                try:
-                    sections[key] = fut.result()
-                except Exception as exc:  # noqa: BLE001 - surface, don't crash the page
-                    logger.warning('manage section %s failed: %s', key, exc)
-                    sections[key] = None
+    timeout_s = float(os.environ.get('MMR_MANAGE_FETCH_TIMEOUT_S', '3'))
+    pool = ThreadPoolExecutor(max_workers=len(rpc_fetchers))
+    future_map = {pool.submit(fn): key for key, fn in rpc_fetchers.items()}
+    try:
+        done, pending = wait(future_map.keys(), timeout=timeout_s)
+        for fut in done:
+            key = future_map[fut]
+            try:
+                result = fut.result()
+                if key == 'strategies':
+                    rows, warn = result
+                    sections[key] = rows
+                    if warn:
+                        errors[key] = warn
+                    elif key in errors and errors[key].startswith('strategy_service'):
+                        errors.pop(key, None)
+                else:
+                    sections[key] = result
+            except Exception as exc:  # noqa: BLE001 - surface, don't crash the page
+                logger.warning('manage section %s failed: %s', key, exc)
+                if key == 'strategies':
+                    fallback = fetch_deployed_from_config()
+                    sections[key] = fallback or ctx['strategies']
+                    if fallback:
+                        errors[key] = (
+                            f'{type(exc).__name__}: {exc}; '
+                            'showing local config (may be stale vs live runtime)'
+                        )
+                    else:
+                        errors[key] = f'{type(exc).__name__}: {exc}'
+                else:
+                    sections[key] = []
                     errors[key] = f'{type(exc).__name__}: {exc}'
-        except TimeoutError:
-            logger.warning('manage page context timed out after %.0fs', timeout_s)
-            errors['page'] = f'timed out after {timeout_s:.0f}s — setup tab may be incomplete'
-            for fut, key in future_map.items():
-                sections.setdefault(key, None)
-                if key not in errors and not fut.done():
-                    errors[key] = 'still loading when page deadline hit'
+        if pending:
+            logger.warning('manage RPC still pending after %.0fs', timeout_s)
+            errors.setdefault(
+                'page',
+                f'some live sections still loading after {timeout_s:.0f}s — showing local data',
+            )
+            for fut in pending:
+                fut.cancel()
+                key = future_map[fut]
+                if key == 'strategies':
+                    sections[key] = sections.get(key) or ctx['strategies']
+                    errors.setdefault(
+                        key,
+                        'strategy_service still loading; showing local config (may be stale)',
+                    )
+                else:
+                    sections.setdefault(key, [])
+                    errors.setdefault(key, 'still loading when page deadline hit')
+    finally:
+        pool.shutdown(wait=False, cancel_futures=True)
 
     strategies = sections.get('strategies') or []
     deployed_classes = {s.get('class_name') for s in strategies if s.get('class_name')}
-    available = sections.get('available') or []
+    available = ctx['available_strategies']
     for a in available:
         a['deployed'] = a.get('class') in deployed_classes
 

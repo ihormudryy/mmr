@@ -285,7 +285,7 @@ class TestDashboardRendering:
 
     def test_unfold_deploy_editor_rendered(self, client):
         html = client.get('/cc').text
-        assert 'toggleSetupParams' in html
+        assert '/static/dash_admin.js' in html
         assert 'name="watchlist"' in html
 
     def test_available_strategies_listed(self, client):
@@ -293,6 +293,31 @@ class TestDashboardRendering:
         assert 'Momentum' in html
         assert 'momentum.py' in html
         assert 'deployed' in html.lower()
+
+    def test_available_strategies_survive_strategy_rpc_failure(
+            self, client, manage_client, monkeypatch):
+        """Local AST scan must not be blanked when strategy_service is down."""
+        def _fail(method, body=None):
+            if method == 'list_strategies':
+                raise ConnectionError('strategy down')
+            return manage_client.trader_query(method, body)
+
+        monkeypatch.setattr(manage_client, 'strategy_query', _fail)
+        html = client.get('/cc').text
+        assert 'Momentum' in html
+        assert 'momentum.py' in html
+
+    def test_deployed_strategies_fallback_to_config(
+            self, client, manage_client, deploy_config, monkeypatch):
+        """Mirrors ``mmr strategies list`` YAML fallback when RPC fails."""
+        def _fail(method, body=None):
+            raise ConnectionError('strategy down')
+
+        monkeypatch.setattr(manage_client, 'strategy_query', _fail)
+        html = client.get('/cc').text
+        assert 'orb_googl' in html
+        assert 'strategy_service unreachable' in html
+        assert 'CONFIG' in html
 
     def test_tooltips_present(self, client):
         html = client.get('/cc').text
@@ -306,9 +331,9 @@ class TestDashboardRendering:
 
     def test_tooltips_use_viewport_positioning(self, client):
         """Tips must escape section overflow:hidden — fixed positioning with
-        viewport clamping, computed on hover by positionSetupTip()."""
+        viewport clamping, computed on hover by dash_admin.js."""
         html = client.get('/cc').text
-        assert 'function positionSetupTip' in html
+        assert '/static/dash_admin.js' in html
         assert 'position: fixed' in html
 
 
@@ -324,16 +349,21 @@ class TestTabs:
 
     def test_legacy_setup_hashes_map_to_new_tabs(self, client):
         html = client.get('/cc').text
-        assert 'setup-strategies' in html
-        assert 'setup-watchlists' in html
-        assert 'normalizeDashTab' in html or 'setup-strategies' in html
+        assert '/static/dash_admin.js' in html
 
     def test_tab_state_survives_auto_refresh(self, client):
         """Tab selection is kept in location.hash, which location.reload()
         preserves — switching tabs must survive the 30s refresh."""
         html = client.get('/cc').text
-        assert 'location.hash' in html
-        assert 'parseHash' in html
+        assert '/static/dash_admin.js' in html
+
+    def test_cc_has_no_inline_script(self, client):
+        """Strict CSP on /cc allows script-src 'self' only — no inline JS."""
+        html = client.get('/cc').text
+        assert '<script>' not in html
+        assert '<script ' in html
+        assert '/static/dash_admin.js' in html
+        assert '/static/command_center.js' in html
 
 
 # ---------------------------------------------------------------------------
@@ -703,7 +733,8 @@ class TestManagePage:
 
     def test_cc_default_hash_is_trading(self, client):
         html = client.get('/cc').text
-        assert "location.hash || '#trading'" in html or '#trading' in html
+        assert 'data-dash-tab="trading"' in html
+        assert '/static/dash_admin.js' in html
 
 
 class TestLegacyAccessTokenDoubleGate:

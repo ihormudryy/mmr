@@ -130,12 +130,15 @@ command_authority:
 
 # Deterministic automation configuration (P3).
 # When enabled, only a single signed artifact bundle runs under strict control.
+# All defaults are false/empty — enable per-deployment via ~/.config/mmr/trader.yaml.
+# live_enabled remains false until P4; paper vertical slice only.
 automation:
   enabled: false
   live_enabled: false
   artifact_bundle_path: ''
   public_key_ring_path: ''
   expected_artifact_id: ''
+  strategy_name: ''
 
 # Massive.com (formerly Polygon.io)
 massive_api_key: ''

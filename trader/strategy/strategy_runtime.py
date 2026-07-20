@@ -235,12 +235,13 @@ class StrategyRuntime():
         trader_typed_address: str = '',
         service_hmac_key_file: str = '',
         ib_account: str = '',
-        # [P3 Task 2] Artifact verification gate
+        # [P3 Task 2 / Task 9] Artifact verification + one-strategy intent emission
         automation_enabled: bool = False,
         automation_live_enabled: bool = False,
         automation_artifact_bundle_path: str = '',
         automation_public_key_ring_path: str = '',
         automation_expected_artifact_id: str = '',
+        automation_strategy_name: str = '',
     ):
         self.ib_server_address = ib_server_address
         self.ib_server_port = ib_server_port
@@ -296,9 +297,14 @@ class StrategyRuntime():
         self.automation_artifact_bundle_path: str = automation_artifact_bundle_path
         self.automation_public_key_ring_path: str = automation_public_key_ring_path
         self.automation_expected_artifact_id: str = automation_expected_artifact_id
+        self.automation_strategy_name: str = automation_strategy_name
         # Lazily initialised in _get_artifact_verifier() the first time automation
-        # config is complete; None means "not yet built".
+        # config is complete; None means "not yet built". VerifiedArtifact for
+        # the one allowlisted strategy is stored after load-time verify (Task 9).
         self._artifact_verifier: Optional[Any] = None
+        self._verified_artifact: Optional[Any] = None
+        self._verified_artifact_strategy: Optional[str] = None
+        self.intent_emitter: Optional[Any] = None
         self._revisions: Optional[StrategyRevisionStore] = None
         # Last state-name announced per strategy (via the ack outbox). Resets
         # on restart, so every strategy is re-announced once per process —
@@ -453,6 +459,10 @@ class StrategyRuntime():
                 paper_trading=self.paper_trading,
                 account_id=self.ib_account,
             )
+            # [P3 Task 9] Intent emitter is built once a verified artifact for
+            # the configured one-strategy name is available (see
+            # _verify_artifact_at_load / _maybe_build_intent_emitter).
+            self._maybe_build_intent_emitter()
 
         except Exception as ex:
             raise self.create_strategy_exception(
@@ -1002,6 +1012,15 @@ class StrategyRuntime():
             expected_artifact_id=expected_artifact_id,
             now=_dt.datetime.now(_dt.timezone.utc),
         )
+        # Only the configured one-strategy name may hold a verified artifact
+        # for automated intent emission (P3 Task 9).
+        if (
+            self.automation_strategy_name
+            and strategy_name == self.automation_strategy_name
+        ):
+            self._verified_artifact = verified
+            self._verified_artifact_strategy = strategy_name
+            self._maybe_build_intent_emitter()
         logging.info(
             'strategy %s artifact verified: id=%s key=%s mode=%s codes=%s',
             strategy_name,
@@ -1200,6 +1219,74 @@ class StrategyRuntime():
                 logging.exception(
                     'signal→proposal bridge failed for %s conId %s',
                     getattr(strategy, 'name', '?'), conId)
+
+        # [P3 Task 9] Deterministic automation: emit typed ExecutionIntent after
+        # a completed bar. Never constructs IB orders / legacy RPC / journal
+        # writes — IntentEmitter is a thin typed adapter only.
+        emitter = getattr(self, 'intent_emitter', None)
+        if emitter is not None:
+            try:
+                last_bar = frame.index[-1]
+                if hasattr(last_bar, 'to_pydatetime'):
+                    bar_ts = last_bar.to_pydatetime()
+                else:
+                    bar_ts = last_bar
+                if getattr(bar_ts, 'tzinfo', None) is None:
+                    bar_ts = bar_ts.replace(tzinfo=dt.timezone.utc)
+                session_id = (
+                    f"xnys-{bar_ts.astimezone(dt.timezone.utc).date().isoformat()}"
+                )
+                emitter.on_signal(
+                    strategy_name=strategy.name,
+                    signal=signal,
+                    completed_bar_timestamp=bar_ts,
+                    session_id=session_id,
+                )
+            except Exception:
+                logging.exception(
+                    'intent emitter failed for %s conId %s',
+                    getattr(strategy, 'name', '?'), conId)
+
+    def _maybe_build_intent_emitter(self) -> None:
+        """Construct IntentEmitter once automation config + verified artifact exist."""
+        if not self.automation_enabled:
+            self.intent_emitter = None
+            return
+        if not self.automation_strategy_name:
+            return
+        if self._verified_artifact is None:
+            return
+        if self._verified_artifact_strategy != self.automation_strategy_name:
+            return
+        client = getattr(self, '_trader_command_client', None)
+        if client is None:
+            return
+        from trader.strategy.intent_emitter import IntentEmitter, IntentEmitterContext
+
+        digest = self._verified_artifact.manifest_digest
+        # Bundle digest used on the wire is the configured path's content
+        # identity when available; fall back to the verified manifest digest.
+        bundle_digest = digest if digest.startswith('sha256:') else f'sha256:{digest}'
+        account_mode = 'paper' if self.paper_trading else 'live'
+        self.intent_emitter = IntentEmitter(
+            command_client=client,
+            context=IntentEmitterContext(
+                enabled=True,
+                live_enabled=self.automation_live_enabled,
+                strategy_name=self.automation_strategy_name,
+                artifact=self._verified_artifact,
+                artifact_digest=digest,
+                eligibility_attestation_digest=digest,
+                artifact_bundle_digest=bundle_digest,
+                account_mode=account_mode,
+            ),
+        )
+        logging.info(
+            'intent emitter armed for strategy %s artifact %s mode=%s',
+            self.automation_strategy_name,
+            self._verified_artifact.artifact_id,
+            account_mode,
+        )
 
     def _maybe_check_exits(self, strategy: Strategy, conId: int,
                            frame: pd.DataFrame) -> None:

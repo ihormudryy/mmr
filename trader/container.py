@@ -117,6 +117,7 @@ class Container():
         self.configuration['automation_artifact_bundle_path'] = self.mmr_config.automation.artifact_bundle_path
         self.configuration['automation_public_key_ring_path'] = self.mmr_config.automation.public_key_ring_path
         self.configuration['automation_expected_artifact_id'] = self.mmr_config.automation.expected_artifact_id
+        self.configuration['automation_strategy_name'] = self.mmr_config.automation.strategy_name
 
     @classmethod
     def create(cls, config_file: str = '') -> 'Container':

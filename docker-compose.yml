@@ -223,6 +223,11 @@ services:
       - ${HOME}/.config/mmr:/home/trader/.config/mmr
       - mmr_db_data:/home/trader/.local/share/mmr/data
       - ${HOME}/.local/share/mmr/logs:/home/trader/.local/share/mmr/logs
+      # P3 Task 9: read-only signed artifact bundles for paper automation.
+      # Defaults stay disabled in trader.yaml; mount is always present so a
+      # paper enable does not require a compose edit. Live mode additionally
+      # refuses writable mounts inside ArtifactVerifier.
+      - ${HOME}/.local/share/mmr/artifacts:/home/trader/.local/share/mmr/artifacts:ro
     healthcheck:
       # LIVENESS ONLY. Semantic trading readiness is exposed by typed
       # get_status and gates automation; it must not restart-loop a healthy,
@@ -283,6 +288,10 @@ services:
       - ${HOME}/.config/mmr:/home/trader/.config/mmr
       - mmr_db_data:/home/trader/.local/share/mmr/data
       - ${HOME}/.local/share/mmr/logs:/home/trader/.local/share/mmr/logs
+      # P3 Task 9: same read-only artifact tree the trader verifies again at
+      # command time (strategy load verifies once; trader never trusts a
+      # strategy-service "verified" boolean).
+      - ${HOME}/.local/share/mmr/artifacts:/home/trader/.local/share/mmr/artifacts:ro
     healthcheck:
       test: ["CMD", "python3", "-c", "import socket; socket.create_connection(('127.0.0.1', 42005), timeout=3).close()"]
       interval: 30s

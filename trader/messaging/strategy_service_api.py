@@ -63,6 +63,20 @@ class StrategyServiceApi(RPCHandler):
         return [StrategyConfig.from_strategy(strategy) for strategy in self.strategy.get_strategies()]
 
     @rpcmethod
+    def get_automation_status(self) -> Dict:
+        """Read-only automation gate status (P3 Task 9). Never mutates state."""
+        return {
+            'enabled': bool(getattr(self.strategy, 'automation_enabled', False)),
+            'live_enabled': bool(getattr(self.strategy, 'automation_live_enabled', False)),
+            'strategy_name': getattr(self.strategy, 'automation_strategy_name', '') or '',
+            'expected_artifact_id': getattr(
+                self.strategy, 'automation_expected_artifact_id', '') or '',
+            'artifact_bundle_path': getattr(
+                self.strategy, 'automation_artifact_bundle_path', '') or '',
+            'emitter_armed': getattr(self.strategy, 'intent_emitter', None) is not None,
+        }
+
+    @rpcmethod
     async def reload_strategies(self) -> SuccessFail[List[StrategyConfig]]:
         try:
             await self.strategy._reconcile()

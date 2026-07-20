@@ -1,11 +1,14 @@
-# Trading-Income Operations Runbook — P1 Command Plane
+# Trading-Income Operations Runbook — P1 Command Plane + P3 Automation
 
 > Scope: activating the trader-owned command authority (proposal → approve →
-> broker order → correlated terminal state) in **paper** mode. Live activation
-> is out of scope for P1 and stays refused at startup.
+> broker order → correlated terminal state) in **paper** mode, and the P3
+> one-strategy deterministic automation vertical slice (also **paper** only).
+> Live activation is out of scope for P1/P3 and stays refused at startup /
+> `automation.live_enabled: false`.
 >
 > Design: `docs/superpowers/specs/2026-07-18-command-plane-activation-design.md`
-> Plan: `docs/superpowers/plans/2026-07-18-trading-income-p1-safety-command-plane.md`
+> Plan (P1): `docs/superpowers/plans/2026-07-18-trading-income-p1-safety-command-plane.md`
+> Plan (P3): `docs/superpowers/plans/2026-07-18-trading-income-p3-deterministic-automation.md`
 
 ## What "activated" means
 
@@ -14,6 +17,14 @@ approval into a real broker order. When disabled (the default), the trader is
 read-only + strategy-state-ack: no proposal can be approved into an order. When
 enabled in paper, `approve_proposal` runs the full risk-gated, generation-fenced,
 pre-dispatch-revalidated saga and dispatches through `TradingRuntimeOrderDispatch`.
+
+P3 automation adds a second *typed* entry into that same coordinator:
+`execute_automated_intent` (strategy-service principal only). Strategies emit
+canonical `ExecutionIntent` messages after completed session-valid bars; they
+never construct IB orders, never use legacy dill RPC, and never mutate the
+domain journal. The trader re-verifies the signed artifact, claims the
+deterministic command ID, runs session/liquidity risk, and dispatches the
+protective-order saga on the existing expressive-order path.
 
 ## Activation prerequisites (paper)
 
@@ -37,9 +48,27 @@ Keep `command_authority.enabled: false` in `config_defaults/trader.yaml`. Enable
 per-deployment via the user config (`~/.config/mmr/trader.yaml`) or env, never in
 the checked-in defaults.
 
+### P3 automation config (defaults — all false/empty)
+
+```yaml
+automation:
+  enabled: false
+  live_enabled: false          # stays false through P3; P4 owns live canary
+  artifact_bundle_path: ''     # e.g. ~/.local/share/mmr/artifacts/<id>
+  public_key_ring_path: ''     # directory of trusted *.pem verification keys
+  expected_artifact_id: ''     # exact artifact id; no fuzzy match
+  strategy_name: ''            # exact one-strategy name allowed to emit intents
+```
+
+Compose mounts `~/.local/share/mmr/artifacts` read-only into `trader` and
+`strategy`. Do not enable `automation.enabled` until the synthetic automation
+drill is green **and** the manual IB paper soak (below) is recorded.
+
 ## The release gate — two halves, both required
 
-### 1. Synthetic failure drills — `scripts/command_plane_drill.py`
+### 1. Synthetic failure drills
+
+#### P1 command plane — `scripts/command_plane_drill.py`
 
 In-process battery over a real DuckDB journal + command ledger + coordinator +
 proposal/approval services + reconciler, behind deterministic fake broker/quote/
@@ -70,13 +99,46 @@ The pytest wrapper (also part of the gate):
 pytest tests/integration/test_command_plane_activation.py -q
 ```
 
-### 2. Manual IB-paper session soak — `scripts/run_paper_soak.py`
+#### P3 automation vertical slice — `scripts/automation_paper_drill.py`
 
-During market hours, against the real paper stack, run one complete session soak
-and record the report path, commit digest, and config digest. This exercises the
-real IB feed, the real dispatch path, and real reconciliation latency — none of
-which the synthetic drills cover. **This manual gate may not be replaced by
-synthetic fixtures.**
+In-process battery over intent emission → coordinator → protective saga →
+broker events → attribution → flatten → sealed replay. No IB. Proves:
+
+- duplicate completed bar → identical intent/command → one bracket submit;
+- typed `execute_automated_intent` only (no legacy mutation path);
+- stale quote / rejected stop / ambiguous submit / disconnect+duplicate /
+  crash-restart / missed deadline → breaker or no duplicate exposure;
+- sealed forensic replay matches.
+
+```bash
+python3 scripts/automation_paper_drill.py
+python3 scripts/automation_paper_drill.py --json --output automation-drill.json
+python3 scripts/automation_paper_drill.py --soak-seconds 120   # ~2 min synthetic soak
+pytest tests/integration/test_automated_vertical_slice.py tests/automation/ -q --timeout=60
+```
+
+### 2. Manual IB-paper session soak — non-fungible P3 release gate
+
+During market hours, against the real paper stack, run **one complete IB paper
+session** with automation allocation set to the minimum safe test size, and
+record:
+
+- sealed replay bundle path + manifest digest
+- automation drill report path (synthetic half)
+- `~/.config/mmr/trader.yaml` automation block (enabled, artifact id, strategy name)
+- `git rev-parse HEAD` commit digest
+- config digest (`sha256` of the deployed trader.yaml)
+
+Suggested soak driver (P1 soak script; extend with automation allocation notes):
+
+```bash
+python3 scripts/run_paper_soak.py   # during RTH; real IB paper profile
+```
+
+**This manual IB-paper session soak is the P3 release gate.** Synthetic drills
+and the in-process vertical-slice suite do **not** replace it. Do not claim P3
+complete, and do not treat soak data as P4 promotion evidence, unless the soak
+is fully qualified under the research attestation rules.
 
 Also run before sign-off:
 
@@ -95,10 +157,22 @@ docker compose config --quiet                                     # compose vali
 | `restart_unresolved` | crash between claim and ack → rescan_on_startup + reconcile after restart; exactly one order, no resubmission |
 | `stale_quote_blocks_dispatch` | live approval refuses a stale executable quote (QUOTE_STALE); nothing dispatches |
 | `notional_cap_blocks_dispatch` | the DispatchGuard rejects an over-ceiling notional (ORDER_NOTIONAL_LIMIT) before any dispatch |
-
 | `liquidation_flat_only_from_broker_truth` | FLAT needs a fresh broker snapshot with zero positions and working orders; never an RPC ack |
 | `circuit_breaker_trips_and_persists` | a critical liquidation failure trips and persists the breaker |
 | `semantic_readiness_gates_activation` | a tripped breaker makes automation semantically unready |
+
+### P3 automation drill scenarios
+
+| Scenario | Proves |
+|----------|--------|
+| `happy_path` | bar → identical intent on replay → one protected order → attribution → sealed replay |
+| `stale_quote` | DispatchGuard QUOTE_STALE; no bracket |
+| `rejected_stop` | broker reject → REJECTED/UNKNOWN; no duplicate exposure |
+| `ambiguous_submission` | OUTCOME_UNKNOWN; exact replay does not re-dispatch |
+| `disconnect_duplicate_event` | duplicate broker event is idempotent |
+| `crash_restart` | PROTECTED saga resumes; no second submit |
+| `missed_deadline` | FLAT_DEADLINE_MISSED trips breaker |
+| `emitter_no_journal_mutation` | non-allowlisted strategy cannot emit; no legacy RPC |
 
 Automation stays prohibited until all drills are green and the manual IB-paper
 soak is signed off.
@@ -107,6 +181,9 @@ soak is signed off.
 
 - **Immediate:** set `DASHBOARD_COMMANDS_ENABLED=false` (UI) and pause new
   exposure via `pause_trading` (risk-reducing; no preflight required).
+- **Automation off:** set `automation.enabled: false` (and/or clear
+  `automation.strategy_name`) and restart strategy_service — intent emission
+  stops; in-flight commands remain durable in the trader ledger.
 - **Full disable:** set `command_authority.enabled: false` and restart the
   trader. In-flight commands remain durable in the ledger and are resolved by the
   reconciler on next start — disabling the authority does not orphan them.

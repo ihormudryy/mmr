@@ -182,13 +182,13 @@
 
 **Interfaces:** Consumes the complete P3 command, strategy, protection, session, attribution, and replay contracts; produces the first one-strategy paper release report.
 
-- [ ] Add `automation.enabled`, `automation.live_enabled`, exact artifact ID, bundle path, public key ring, and one-strategy name. All default false/empty.
-- [ ] Emit intents only after completed session-valid bars. The strategy runtime must not construct IB orders, use legacy RPC, or mutate the journal.
-- [ ] Test full typed transport: duplicate bar -> identical intent -> one coordinator command -> protected paper order -> broker events -> attribution -> time exit/flatten -> sealed replay.
-- [ ] Inject stale quote, rejected stop, ambiguous submission, disconnect, duplicate event, crash/restart, and missed deadline; assert breaker and no duplicate exposure.
-- [ ] Run focused integration tests, canonical full suite, Compose configuration, and a two-minute synthetic drill.
-- [ ] Run one complete IB paper session with automation allocation set to the minimum safe test size; record bundle/report/config/commit digests. This is the P3 release gate, not evidence toward P4 unless its data is fully qualified.
-- [ ] Commit `feat(automation): complete one-strategy paper vertical slice`.
+- [x] Add `automation.enabled`, `automation.live_enabled`, exact artifact ID, bundle path, public key ring, and one-strategy name. All default false/empty.
+- [x] Emit intents only after completed session-valid bars. The strategy runtime must not construct IB orders, use legacy RPC, or mutate the journal.
+- [x] Test full typed transport: duplicate bar -> identical intent -> one coordinator command -> protected paper order -> broker events -> attribution -> time exit/flatten -> sealed replay.
+- [x] Inject stale quote, rejected stop, ambiguous submission, disconnect, duplicate event, crash/restart, and missed deadline; assert breaker and no duplicate exposure.
+- [x] Run focused integration tests, canonical full suite, Compose configuration, and a two-minute synthetic drill.
+- [ ] Run one complete IB paper session with automation allocation set to the minimum safe test size; record bundle/report/config/commit digests. This is the P3 release gate, not evidence toward P4 unless its data is fully qualified. *(Non-fungible manual gate — software slice does not claim this complete; see `docs/superpowers/rollout/trading-income-operations-runbook.md` §Manual IB-paper session soak.)*
+- [x] Commit `feat(automation): complete one-strategy paper vertical slice`.
 
 ## P3 exit criteria
 

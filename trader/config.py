@@ -89,6 +89,9 @@ class AutomationConfig:
     artifact_bundle_path: str = ''
     public_key_ring_path: str = ''
     expected_artifact_id: str = ''
+    # Exact one-strategy name allowed to emit automated intents when enabled.
+    # Empty (default) means no strategy may emit — fail closed.
+    strategy_name: str = ''
 
 
 @dataclass
@@ -192,6 +195,7 @@ class MMRConfig:
             'automation_artifact_bundle_path': ('automation', 'artifact_bundle_path'),
             'automation_public_key_ring_path': ('automation', 'public_key_ring_path'),
             'automation_expected_artifact_id': ('automation', 'expected_artifact_id'),
+            'automation_strategy_name': ('automation', 'strategy_name'),
             # Top-level
             'root_directory': ('root_directory',),
             'config_file': ('config_file',),

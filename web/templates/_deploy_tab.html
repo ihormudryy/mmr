@@ -33,14 +33,14 @@
             {% if s.name == 'global' %}
               <span class="dim">—</span>
             {% elif s.enabled %}
-              <form method="post" action="/strategies/{{ s.name }}/disable-live" style="display:inline">
+              <form class="param-form inline" method="post" action="/strategies/{{ s.name }}/disable-live">
                 <input type="hidden" name="csrf_token" value="{{ csrf_token }}" />
                 <button type="submit" class="reject">Disable</button>
               </form>
             {% else %}
-              <form method="post" action="/strategies/{{ s.name }}/enable-live" style="display:inline">
+              <form class="param-form inline" method="post" action="/strategies/{{ s.name }}/enable-live">
                 <input type="hidden" name="csrf_token" value="{{ csrf_token }}" />
-                <button type="submit">Enable</button>
+                <button type="submit" class="primary">Enable</button>
               </form>
             {% endif %}
           </td>
@@ -78,7 +78,7 @@
           <td class="dim">{{ a['class'] }}</td>
           <td class="dim">{{ a.file }}</td>
           <td>{% if a.mode == 'parse_error' %}<span class="chip err">parse error</span>{% else %}<span class="chip">{{ a.mode }}</span>{% endif %}</td>
-          <td class="dim" style="white-space:normal; max-width:340px; text-align:left">{% if a.tunables %}{% for k, v in a.tunables.items() %}{{ k }}={{ v }}{{ ', ' if not loop.last }}{% endfor %}{% else %}—{% endif %}</td>
+          <td class="dim wrap">{% if a.tunables %}{% for k, v in a.tunables.items() %}{{ k }}={{ v }}{{ ', ' if not loop.last }}{% endfor %}{% else %}—{% endif %}</td>
           <td>{% if a.deployed %}<span class="chip on">deployed</span>{% else %}<span class="chip off">on disk</span>{% endif %}</td>
           <td><button class="unfold setup-unfold" type="button" data-label="deploy"
                      data-target="dep-{{ loop.index }}">▸ deploy</button></td>
@@ -89,8 +89,8 @@
               <input type="hidden" name="csrf_token" value="{{ csrf_token }}" />
               <input type="hidden" name="file" value="{{ a.file }}" />
               <input type="hidden" name="class" value="{{ a['class'] }}" />
-              <label>name <input name="name" value="{{ a.file[:-3] }}" style="width:130px" /></label>
-              <label>symbols <input name="symbols" placeholder="AAPL, MSFT" style="width:140px" /></label>
+              <label>name <input class="w-name" name="name" value="{{ a.file[:-3] }}" /></label>
+              <label>symbols <input class="w-symbols" name="symbols" placeholder="AAPL, MSFT" /></label>
               <label>or watchlist
                 <select name="watchlist">
                   <option value="">—</option>
@@ -104,12 +104,12 @@
                   {% endfor %}
                 </select>
               </label>
-              <label>history days <input name="days" value="90" style="width:52px" /></label>
+              <label>history days <input class="w-days" name="days" value="90" /></label>
               {% for k, v in (a.tunables or {}).items() %}
-                <label>{{ k }} <input name="param_{{ k }}" value="{{ v if v is not none else '' }}" style="width:80px" /></label>
+                <label>{{ k }} <input class="w-sm" name="param_{{ k }}" value="{{ v if v is not none else '' }}" /></label>
               {% endfor %}
               <label><input type="checkbox" name="auto_propose" /> propose signals</label>
-              <button type="submit">Deploy &amp; enable</button>
+              <button type="submit" class="primary">Deploy &amp; enable</button>
             </form>
           </td>
         </tr>

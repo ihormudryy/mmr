@@ -159,3 +159,44 @@ def test_activate_rejects_malformed_attestation(tmp_path):
     with pytest.raises(CommandValidationError) as exc_info:
         service.activate(cmd)
     assert exc_info.value.code == "ATTESTATION_MALFORMED"
+
+
+def _suspend_cmd(*, command_id="alloc-suspend-1", source="operator", account_id=ACCOUNT):
+    return CommandRequest(
+        command_id=command_id,
+        action="suspend_allocation",
+        account_id=account_id,
+        target_type="allocation_authority",
+        target_id=account_id,
+        expected_version=None,
+        body={"reason": "operator suspend"},
+        source=source,
+    )
+
+
+def test_suspend_happy_path(tmp_path):
+    signer = _keypair()
+    service = _service(tmp_path, signer)
+    activated = service.activate(_activate_cmd(_signed(signer)))
+    outcome = service.suspend(_suspend_cmd())
+    assert outcome["strategy_id"] == STRATEGY
+    assert outcome["authority_digest"] == activated["authority_digest"]
+    assert outcome["event"] == "DEACTIVATED"
+    assert service._authority_store.active_for_account(ACCOUNT, now=NOW) is None
+
+
+def test_suspend_rejects_when_not_active(tmp_path):
+    signer = _keypair()
+    service = _service(tmp_path, signer)
+    with pytest.raises(CommandValidationError) as exc_info:
+        service.suspend(_suspend_cmd())
+    assert exc_info.value.code == "NOT_ACTIVE"
+
+
+def test_suspend_rejects_non_operator_source(tmp_path):
+    signer = _keypair()
+    service = _service(tmp_path, signer)
+    service.activate(_activate_cmd(_signed(signer)))
+    with pytest.raises(CommandValidationError) as exc_info:
+        service.suspend(_suspend_cmd(source="dashboard"))
+    assert exc_info.value.code == "AUTOMATIC_SUSPEND_FORBIDDEN"

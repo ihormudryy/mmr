@@ -343,9 +343,14 @@ class TestTabs:
         assert 'data-dash-tab="trading"' in html
         assert 'data-dash-tab="deploy"' in html
         assert 'data-dash-tab="watchlists"' in html
+        assert 'data-dash-tab="guide"' in html
         assert 'id="dash-trading"' in html
         assert 'id="dash-deploy"' in html
         assert 'id="dash-watchlists"' in html
+        assert 'id="dash-guide"' in html
+        assert 'guide-wrap' in html
+        assert 'class="info"' in html  # hover info bubbles on Guide tab
+        assert 'Manual buy on paper' in html
 
     def test_legacy_setup_hashes_map_to_new_tabs(self, client):
         html = client.get('/cc').text

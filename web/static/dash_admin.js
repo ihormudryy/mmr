@@ -32,12 +32,13 @@
   }
 
   function hideAdminTips() {
-    document.querySelectorAll('.dash-admin-pane .tip').forEach(function (t) {
+    document.querySelectorAll('.dash-admin-pane .tip, #dash-guide .tip').forEach(function (t) {
       t.style.display = 'none';
     });
   }
 
-  document.querySelectorAll('.dash-admin-pane .info, .dash-admin-pane .hover-tip')
+  document.querySelectorAll(
+      '.dash-admin-pane .info, .dash-admin-pane .hover-tip, #dash-guide .info, #dash-guide .hover-tip')
     .forEach(function (el) {
       var tip = el.querySelector('.tip');
       if (!tip) return;
@@ -55,6 +56,7 @@
   function normalizeDashTab(raw) {
     if (!raw || raw === 'trading') return 'trading';
     if (raw === 'scaling') return 'scaling';
+    if (raw === 'guide' || raw === 'help') return 'guide';
     if (raw === 'manage' || raw === 'setup' || raw === 'setup-strategies') return 'deploy';
     if (raw === 'setup-watchlists') return 'watchlists';
     if (ADMIN_TABS[raw]) return raw;

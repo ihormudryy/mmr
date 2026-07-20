@@ -8,11 +8,11 @@
       <span class="chip">{{ watchlists|length }}</span>
     </h2>
     {% if errors.watchlists %}<p class="banner err">{{ errors.watchlists }}</p>{% endif %}
-    <div style="padding: 10px 16px; border-bottom: 1px solid var(--border)">
+    <div class="toolbar">
       <form class="param-form" method="post" action="/watchlists/create">
         <input type="hidden" name="csrf_token" value="{{ csrf_token }}" />
-        <label>new watchlist <input name="name" placeholder="my_etfs" style="width:150px" /></label>
-        <button type="submit">Create</button>
+        <label>new watchlist <input class="w-symbols" name="name" placeholder="my_etfs" /></label>
+        <button type="submit" class="primary">Create</button>
         <span class="param-hint">a-z, 0-9, dash, underscore</span>
       </form>
     </div>
@@ -28,37 +28,39 @@
       {% for w in watchlists %}
         <tr>
           <td class="sym">{{ w.name }}</td>
-          <td class="dim" style="white-space:normal; max-width:520px; text-align:left">{{ w.symbols or '—' }}</td>
+          <td class="dim wrap-wide">{{ w.symbols or '—' }}</td>
           <td>{{ w.count }}</td>
           <td><button class="unfold setup-unfold" type="button" data-label="manage"
                      data-target="wl-{{ loop.index }}">▸ manage</button></td>
         </tr>
         <tr id="wl-{{ loop.index }}" class="param-row" style="display:none">
           <td colspan="4">
-            <form class="param-form" method="post" action="/watchlists/{{ w.name }}/add">
-              <input type="hidden" name="csrf_token" value="{{ csrf_token }}" />
-              <label>add symbols <input name="symbols" placeholder="AAPL, MSFT, SPY" style="width:180px" /></label>
-              <label>exchange <input name="exchange" placeholder="(US: empty)" style="width:80px" /></label>
-              <label>currency <input name="currency" placeholder="USD" style="width:56px" /></label>
-              <button type="submit">Add</button>
-            </form>
-            <form class="param-form" method="post" action="/watchlists/{{ w.name }}/upload" enctype="multipart/form-data" style="margin-top:8px">
-              <input type="hidden" name="csrf_token" value="{{ csrf_token }}" />
-              <label>CSV upload <input type="file" name="file" accept=".csv,text/csv" /></label>
-              <button type="submit">Upload</button>
-              <span class="param-hint">symbol column (+optional exchange,currency) or one symbol per line</span>
-            </form>
-            <form class="param-form" method="post" action="/watchlists/{{ w.name }}/remove" style="margin-top:8px">
-              <input type="hidden" name="csrf_token" value="{{ csrf_token }}" />
-              <label>remove symbol <input name="symbol" placeholder="AAPL" style="width:90px" /></label>
-              <button type="submit">Remove</button>
-            </form>
-            <form class="param-form setup-delete-form" method="post"
-                  action="/watchlists/{{ w.name }}/delete" style="margin-top:8px"
-                  data-confirm="Delete watchlist {{ w.name }} ({{ w.count }} symbols)?">
-              <input type="hidden" name="csrf_token" value="{{ csrf_token }}" />
-              <button class="reject" type="submit">Delete watchlist</button>
-            </form>
+            <div class="param-stack">
+              <form class="param-form" method="post" action="/watchlists/{{ w.name }}/add">
+                <input type="hidden" name="csrf_token" value="{{ csrf_token }}" />
+                <label>add symbols <input class="w-symbols" name="symbols" placeholder="AAPL, MSFT, SPY" /></label>
+                <label>exchange <input class="w-sm" name="exchange" placeholder="(US: empty)" /></label>
+                <label>currency <input class="w-xs" name="currency" placeholder="USD" /></label>
+                <button type="submit" class="primary">Add</button>
+              </form>
+              <form class="param-form" method="post" action="/watchlists/{{ w.name }}/upload" enctype="multipart/form-data">
+                <input type="hidden" name="csrf_token" value="{{ csrf_token }}" />
+                <label>CSV upload <input type="file" name="file" accept=".csv,text/csv" /></label>
+                <button type="submit" class="primary">Upload</button>
+                <span class="param-hint">symbol column (+optional exchange,currency) or one symbol per line</span>
+              </form>
+              <form class="param-form" method="post" action="/watchlists/{{ w.name }}/remove">
+                <input type="hidden" name="csrf_token" value="{{ csrf_token }}" />
+                <label>remove symbol <input class="w-sm" name="symbol" placeholder="AAPL" /></label>
+                <button type="submit">Remove</button>
+              </form>
+              <form class="param-form setup-delete-form" method="post"
+                    action="/watchlists/{{ w.name }}/delete"
+                    data-confirm="Delete watchlist {{ w.name }} ({{ w.count }} symbols)?">
+                <input type="hidden" name="csrf_token" value="{{ csrf_token }}" />
+                <button class="reject" type="submit">Delete watchlist</button>
+              </form>
+            </div>
           </td>
         </tr>
       {% endfor %}

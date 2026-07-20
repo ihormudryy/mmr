@@ -244,6 +244,12 @@ class DashboardState:
                 self._retention_evicted = True
                 self._forget_revision_if_untracked("fill", evicted)
         elif entity_type == "account":
+            # UI historically looked for `mode`; broker payloads emit
+            # `account_mode`. Keep both keys so clients never see UNKNOWN
+            # when the authority field is present under either name.
+            mode = row.get("account_mode") or row.get("mode")
+            if mode is not None:
+                row = {**row, "account_mode": mode, "mode": mode}
             self.accounts[entity_id] = row
         elif entity_type == "position":
             self.positions[entity_id] = row

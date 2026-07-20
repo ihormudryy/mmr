@@ -297,13 +297,23 @@ const ageOf = iso => iso ? (Date.now() - Date.parse(iso)) / 1000 : null;
 const fmtAge = s => s === null ? 'no data' : s < 60 ? `${Math.round(s)}s`
   : s < 3600 ? `${Math.round(s / 60)}m` : `${(s / 3600).toFixed(1)}h`;
 
+function ccAccountModeValue(account) {
+  // Wire contract uses `account_mode` (BrokerAccountRow.to_payload). Older
+  // fixtures / docs used `mode` — accept both so the badge never stays
+  // UNKNOWN when the account row is present.
+  if (!account) return null;
+  const raw = account.account_mode || account.mode;
+  if (raw == null || raw === '') return null;
+  return String(raw).toLowerCase();
+}
+
 function renderStatusBar() {
   const v = store.view; if (!v) return;
   const account = v.accounts[0] || {};
   const badge = document.getElementById('mode-badge');
-  const mode = String(account.mode || 'unknown').toLowerCase();
+  const mode = ccAccountModeValue(account) || 'unknown';
   badge.textContent = mode.toUpperCase();
-  badge.className = 'badge ' + (mode === 'live' ? 'live' : 'paper');
+  badge.className = 'badge ' + (mode === 'live' ? 'live' : mode === 'paper' ? 'paper' : '');
   document.getElementById('account-id').textContent =
     account.entity_id || account.account_id || '—';
   const chips = document.getElementById('dependency-chips');
@@ -449,9 +459,9 @@ function renderStrategies() {
     const name = esc(ccStrategyName(s));
     const actions = CFG.commandsEnabled ? `<td>
         ${enabled
-          ? `<button type="button" data-cc-strategy-action="disable"
+          ? `<button type="button" class="reject" data-cc-strategy-action="disable"
                data-cc-strategy="${name}">Disable</button>`
-          : `<button type="button" data-cc-strategy-action="enable"
+          : `<button type="button" class="primary" data-cc-strategy-action="enable"
                data-cc-strategy="${name}">Enable</button>`}
         <button type="button" data-cc-strategy-action="params"
           data-cc-strategy="${name}">Edit params</button>
@@ -481,7 +491,7 @@ function renderPauseControl() {
   const control = (v.trading_control || []).find(tc =>
       tc.account_id === accountId || tc.entity_id === accountId);
   if (!control) {
-    stateEl.textContent = 'unknown (no trading_control data)';
+    stateEl.textContent = 'waiting for trading_control…';
     toggle.textContent = 'Pause new trading';
     toggle.disabled = true;
     toggle.onclick = null;
@@ -549,6 +559,15 @@ function renderScaling() {
   document.getElementById('scaling-expires').textContent =
     scaling.expires_at ? esc(String(scaling.expires_at)) : '—';
 
+  const suspendBtn = document.getElementById('scaling-suspend');
+  if (suspendBtn) {
+    const gross = Number(scaling.max_gross_allocation);
+    suspendBtn.disabled = !(
+      (lifecycle === 'active' || lifecycle === 'authorized')
+      && Number.isFinite(gross) && gross > 0
+    );
+  }
+
   const body = document.getElementById('scaling-authorities-body');
   const rows = scaling.authorities || [];
   if (!rows.length) {
@@ -591,7 +610,12 @@ function closeDrawer() {
 
 document.getElementById('drawer-close').addEventListener('click', closeDrawer);
 document.addEventListener('keydown', e => {
-  if (e.key === 'Escape' && !document.getElementById('drawer').hidden) closeDrawer();
+  if (e.key !== 'Escape') return;
+  if (!document.getElementById('drawer').hidden) {
+    closeDrawer();
+    return;
+  }
+  if (CFG.commandsEnabled) ccCloseCommandDrawers();
 });
 
 document.getElementById('proposal-cards').addEventListener('click', e => {
@@ -627,8 +651,8 @@ function showProposalDrawer(id, invoker) {
   // passed through unchanged, no adapter needed).
   const actions = (CFG.commandsEnabled && String(p.status || '').toUpperCase() === 'PENDING')
     ? `<div class="cc-actions">
-        <button type="button" data-cc-approve="${esc(p.entity_id)}">Approve</button>
-        <button type="button" data-cc-reject="${esc(p.entity_id)}">Reject</button>
+        <button type="button" data-cc-approve="${esc(p.entity_id)}" class="primary">Approve</button>
+        <button type="button" data-cc-reject="${esc(p.entity_id)}" class="reject">Reject</button>
       </div>` : '';
   openDrawer(`<h3>Proposal #${esc(p.entity_id)} — ${esc(p.action || '')}
       ${esc(p.symbol || '')}</h3>
@@ -858,8 +882,23 @@ async function ccSubmitCommand(kind, label, url, body) {
 
 /* ---- New proposal drawer ---- */
 
+function ccCloseCommandDrawers() {
+  const ids = [
+    'cc-proposal-drawer', 'cc-close-drawer', 'cc-confirm-drawer',
+    'cc-cancel-all-dialog', 'cc-strategy-params-dialog',
+  ];
+  for (const id of ids) {
+    const el = document.getElementById(id);
+    if (el && !el.hidden) el.hidden = true;
+  }
+}
+
 function ccOpenProposalDrawer() {
   document.getElementById('cc-proposal-drawer').hidden = false;
+}
+
+function ccCloseProposalDrawer() {
+  document.getElementById('cc-proposal-drawer').hidden = true;
 }
 
 function ccProposalBody(form, commandId) {
@@ -893,11 +932,15 @@ document.getElementById('cc-proposal-form').addEventListener('submit',
       // logical command; never re-minted (see ccNewCommandId).
       const commandId = ccNewCommandId();
       const body = ccProposalBody(evt.target, commandId);
-      document.getElementById('cc-proposal-drawer').hidden = true;
+      ccCloseProposalDrawer();
       await ccSubmitCommand('create_proposal',
           `New proposal ${body.action} conId ${body.conid}`,
           '/api/commands/proposals', body);
     });
+document.getElementById('cc-proposal-cancel').addEventListener('click',
+    ccCloseProposalDrawer);
+document.getElementById('cc-proposal-close').addEventListener('click',
+    ccCloseProposalDrawer);
 }
 
 /* ---- Close position drawer (pre-filled reducing proposal) ---- */
@@ -938,6 +981,13 @@ document.getElementById('cc-close-form').addEventListener('submit',
           `/api/commands/positions/${d.dataset.account}/${d.dataset.conid}/close`,
           body);
     });
+const ccCloseCloseDrawer = () => {
+  document.getElementById('cc-close-drawer').hidden = true;
+};
+document.getElementById('cc-close-cancel').addEventListener('click',
+    ccCloseCloseDrawer);
+document.getElementById('cc-close-drawer-x').addEventListener('click',
+    ccCloseCloseDrawer);
 }
 
 /* ===================== [M1-C] Task 4: approve / reject / preflight ======
@@ -1295,7 +1345,7 @@ document.getElementById('cc-cancel-all-abort').addEventListener('click',
 
 function ccDashboardAccountMode() {
   const v = store.view;
-  return v && v.accounts && v.accounts[0] ? v.accounts[0].mode : null;
+  return v && v.accounts && v.accounts[0] ? ccAccountModeValue(v.accounts[0]) : null;
 }
 
 function ccAccountModeFor(accountId) {
@@ -1303,7 +1353,7 @@ function ccAccountModeFor(accountId) {
   if (!v || !v.accounts) return null;
   const acct = v.accounts.find((a) =>
       a.account_id === accountId || a.entity_id === accountId) || v.accounts[0];
-  return acct ? acct.mode : null;
+  return ccAccountModeValue(acct);
 }
 
 function ccStrategyName(strategy) {
@@ -1525,6 +1575,97 @@ if (CFG.commandsEnabled) {
   document.getElementById('cc-params-cancel').addEventListener('click', () => {
     document.getElementById('cc-strategy-params-dialog').hidden = true;
   });
+}
+
+/* ===================== Allocation activate / suspend (Scaling tab) =========
+ * Activate always runs the preflight confirm ceremony (coordinator
+ * requires_preflight=True — same as the CLI/SDK path). Signing stays
+ * offline; this UI only pastes already-signed attestation JSON. Suspend is
+ * risk-reducing and a single POST, mirroring deactivate_live_canary. */
+
+function ccParseAttestationJson(raw) {
+  let parsed;
+  try {
+    parsed = JSON.parse(raw);
+  } catch (err) {
+    ccToast('error', `Attestation JSON is invalid: ${err.message || err}`);
+    return null;
+  }
+  if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) {
+    ccToast('error', 'Attestation must be a JSON object');
+    return null;
+  }
+  return parsed;
+}
+
+async function ccActivateAllocation() {
+  const raw = (document.getElementById('scaling-attestation').value || '').trim();
+  const reason = (document.getElementById('scaling-reason').value || '').trim();
+  if (!raw) {
+    ccToast('error', 'Paste or upload a signed attestation JSON first');
+    return;
+  }
+  if (!reason) {
+    ccToast('error', 'Reason is required');
+    return;
+  }
+  const attestation = ccParseAttestationJson(raw);
+  if (!attestation) return;
+
+  const url = '/api/commands/allocation/activate';
+  const label = 'Activate allocation';
+  // Always ceremony — activate_allocation requires a consumed preflight nonce
+  // in both paper and live (unlike approve_proposal's paper single-POST path).
+  await ccRunLiveCeremony(
+      'activate_allocation', label, 'activate_allocation',
+      {attestation, reason}, null,
+      (commandId, nonce) => ccSubmitCommand('activate_allocation', label, url, {
+        command_id: commandId,
+        attestation,
+        reason,
+        preflight_nonce: nonce,
+      }));
+}
+
+async function ccSuspendAllocation() {
+  const reason = (document.getElementById('scaling-reason').value || '').trim();
+  if (!reason) {
+    ccToast('error', 'Reason is required to suspend allocation');
+    return;
+  }
+  if (!window.confirm(
+      `Suspend the active allocation authority?\n\nReason: ${reason}`)) {
+    return;
+  }
+  await ccSubmitCommand('suspend_allocation', 'Suspend allocation',
+      '/api/commands/allocation/suspend', {
+        command_id: ccNewCommandId(),
+        reason,
+      });
+}
+
+if (CFG.commandsEnabled) {
+  const activateBtn = document.getElementById('scaling-activate');
+  const suspendBtn = document.getElementById('scaling-suspend');
+  const fileInput = document.getElementById('scaling-attestation-file');
+  if (activateBtn) {
+    activateBtn.addEventListener('click', () => { ccActivateAllocation(); });
+  }
+  if (suspendBtn) {
+    suspendBtn.addEventListener('click', () => { ccSuspendAllocation(); });
+  }
+  if (fileInput) {
+    fileInput.addEventListener('change', async () => {
+      const file = fileInput.files && fileInput.files[0];
+      if (!file) return;
+      try {
+        const text = await file.text();
+        document.getElementById('scaling-attestation').value = text.trim();
+      } catch (err) {
+        ccToast('error', `Failed to read file: ${err.message || err}`);
+      }
+    });
+  }
 }
 
 /* ---------------- boot ----------------------------------------------------- */

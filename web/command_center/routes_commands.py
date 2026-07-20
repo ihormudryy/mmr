@@ -448,6 +448,7 @@ class ClosePositionBody(BaseModel):
 # pass-through to the coordinator.
 _PREFLIGHT_ACTIONS = (
     "approve_proposal", "resume_trading", "cancel_order", "cancel_orders",
+    "activate_allocation",
 )
 
 
@@ -696,6 +697,27 @@ class ResumeTradingBody(BaseModel):
     preflight_nonce: str | None = None
 
 
+class ActivateAllocationBody(BaseModel):
+    """Mirrors ``ActivateAllocationRequest``. Coordinator requires a
+    preflight nonce in both paper and live (``requires_preflight=True``);
+    private-key signing stays offline — this body only carries already-
+    signed attestation JSON."""
+
+    model_config = ConfigDict(extra="forbid")
+    command_id: str = _COMMAND_ID
+    attestation: dict[str, Any]
+    reason: str = Field(min_length=1, max_length=200)
+    preflight_nonce: str | None = None
+
+
+class SuspendAllocationBody(BaseModel):
+    """Risk-reducing: deactivate active allocation authority. No nonce."""
+
+    model_config = ConfigDict(extra="forbid")
+    command_id: str = _COMMAND_ID
+    reason: str = Field(min_length=1, max_length=200)
+
+
 @router.post("/api/commands/strategies/{strategy_name}/enable")
 def enable_strategy(strategy_name: str, body: StrategyControlBody, request: Request,
                     session: str = Depends(require_command_auth)):
@@ -772,11 +794,46 @@ def resume_trading(body: ResumeTradingBody, request: Request,
     return _receipt_json(receipt)
 
 
+@router.post("/api/commands/allocation/activate")
+def activate_allocation(body: ActivateAllocationBody, request: Request,
+                        session: str = Depends(require_command_auth)):
+    # Always requires a preflight nonce (coordinator ``requires_preflight=True``),
+    # in both paper and live. Signing stays offline; this route only forwards
+    # already-signed attestation JSON. Unlike approve/cancel, presence of a
+    # nonce is NOT a live-only signal here — do not gate on
+    # ``live_commands_enabled`` via ``_reject_live_targeted_without_flag``.
+    if body.preflight_nonce is None:
+        raise CommandApiError(428, "PREFLIGHT_REQUIRED",
+                              "activate_allocation requires a preflight nonce")
+    receipt = _gateway(request).execute("activate_allocation", {
+        "command_id": body.command_id,
+        "attestation": body.attestation,
+        "reason": body.reason,
+        "preflight_nonce": body.preflight_nonce,
+        "session_fingerprint": session_fingerprint(session),
+    })
+    return _receipt_json(receipt)
+
+
+@router.post("/api/commands/allocation/suspend")
+def suspend_allocation(body: SuspendAllocationBody, request: Request,
+                       session: str = Depends(require_command_auth)):
+    # Risk-reducing: immediate in both modes, no live-gate / nonce.
+    receipt = _gateway(request).execute("suspend_allocation", {
+        "command_id": body.command_id,
+        "reason": body.reason,
+    })
+    return _receipt_json(receipt)
+
+
 @router.post("/api/preflight")
 def preflight(body: PreflightBody, request: Request,
              session: str = Depends(require_command_auth)):
     flags: CommandFlags = request.app.state.command_flags
-    if not flags.live_commands_enabled:
+    # activate_allocation always needs a nonce (even paper). Other preflight
+    # actions are live-ceremony only and stay behind the live-commands flag.
+    if (not flags.live_commands_enabled
+            and body.action != "activate_allocation"):
         raise CommandApiError(403, "LIVE_COMMANDS_DISABLED",
                               "live commands are disabled "
                               "(DASHBOARD_LIVE_COMMANDS_ENABLED=false)")

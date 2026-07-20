@@ -858,6 +858,44 @@ class AllocationActivationService:
             "authority_digest": digest,
         }
 
+    def suspend(self, cmd) -> dict[str, Any]:
+        """Risk-reducing: deactivate the account's active allocation authority.
+
+        Mirrors ``deactivate_live_canary`` — never requires a preflight nonce.
+        Uses ``record_deactivated`` (not a zero-ceiling override) so the
+        authority lifecycle reads as suspended/DEACTIVATED in the read model.
+        """
+        body = cmd.body
+        reason = str(body.get("reason", "")).strip()
+        if not reason:
+            raise _validation_error("REASON_REQUIRED", "suspension requires an explicit reason")
+        if cmd.source != REQUIRED_ACTIVATION_SOURCE:
+            raise _validation_error(
+                "AUTOMATIC_SUSPEND_FORBIDDEN",
+                f"allocation suspension must be an explicit operator action, got source={cmd.source!r}",
+            )
+        account_id = cmd.account_id
+        if not account_id:
+            raise _validation_error("ACCOUNT_REQUIRED", "suspension requires a pinned account_id")
+
+        now = _as_utc(self._now())
+        active = self._authority_store.active_for_account(account_id, now=now)
+        if active is None:
+            raise _validation_error(
+                "NOT_ACTIVE",
+                f"no active allocation authority for account {account_id!r}",
+            )
+
+        self._authority_store.record_deactivated(
+            active.authority_digest, command_id=cmd.command_id, reason=reason, now=now,
+        )
+        return {
+            "strategy_id": active.strategy_id,
+            "authority_digest": active.authority_digest,
+            "event": "DEACTIVATED",
+            "stage": active.stage,
+        }
+
 
 def _validation_error(code: str, message: str) -> CommandValidationError:
     return CommandValidationError(code, message)

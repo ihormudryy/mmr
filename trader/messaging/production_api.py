@@ -813,6 +813,28 @@ class ActivateAllocationRequest(BaseModel):
         return value.strip()
 
 
+class SuspendAllocationRequest(BaseModel):
+    """Suspends the account's active allocation authority (risk-reducing).
+    Mirrors ``deactivate_live_canary``: never requires a preflight nonce."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    command_id: str
+    reason: str = Field(min_length=1, max_length=200)
+
+    @field_validator("command_id")
+    @classmethod
+    def _command_id_has_no_colon(cls, value: str) -> str:
+        return _reject_colon_in_command_id(value)
+
+    @field_validator("reason")
+    @classmethod
+    def _reason_is_not_blank(cls, value: str) -> str:
+        if not value.strip():
+            raise ValueError("reason must not be blank")
+        return value.strip()
+
+
 class GetTradingControlRequest(BaseModel):
     """No fields: this always reads the coordinator's own configured
     account, exactly like the command above never accepts one."""
@@ -1149,6 +1171,18 @@ def _activate_allocation_rpc_handler(coordinator: TradingCommandCoordinator, acc
             body={"attestation": parsed.attestation, "reason": parsed.reason},
             source="operator",
             preflight_nonce=parsed.preflight_nonce, session_fingerprint=parsed.session_fingerprint,
+        )
+        return _receipt_to_dict(coordinator.execute(request))
+    return _handler
+
+
+def _suspend_allocation_rpc_handler(coordinator: TradingCommandCoordinator, account_id: Optional[str]):
+    def _handler(parsed: SuspendAllocationRequest) -> Dict[str, Any]:
+        request = CommandRequest(
+            command_id=parsed.command_id, action="suspend_allocation", account_id=account_id,
+            target_type="allocation_authority", target_id=account_id or "", expected_version=None,
+            body={"reason": parsed.reason},
+            source="operator",
         )
         return _receipt_to_dict(coordinator.execute(request))
     return _handler
@@ -1673,9 +1707,16 @@ def register_command_authority(
         coordinator.register_action(
             "activate_allocation", allocation_service.activate, requires_preflight=True,
         )
+        coordinator.register_action(
+            "suspend_allocation", allocation_service.suspend, requires_preflight=False,
+        )
         registry.register(
             "command", "activate_allocation", ActivateAllocationRequest, dict,
             _activate_allocation_rpc_handler(coordinator, account_id),
+        )
+        registry.register(
+            "command", "suspend_allocation", SuspendAllocationRequest, dict,
+            _suspend_allocation_rpc_handler(coordinator, account_id),
         )
 
     if automated_intent_service is not None:

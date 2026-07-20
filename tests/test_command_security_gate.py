@@ -89,6 +89,11 @@ COMMAND_ROUTES = [
      {"command_id": CMD_ID, "reason": "hold"}),
     ("POST", "/api/commands/resume",
      {"command_id": CMD_ID, "expected_control_revision": 1, "reason": "resume"}),
+    ("POST", "/api/commands/allocation/activate",
+     {"command_id": CMD_ID, "attestation": {"strategy_id": "orb"},
+      "reason": "scale", "preflight_nonce": "n-1"}),
+    ("POST", "/api/commands/allocation/suspend",
+     {"command_id": CMD_ID, "reason": "drawdown"}),
 ]
 
 

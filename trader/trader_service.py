@@ -205,6 +205,44 @@ def _maybe_start_liquidation_recovery(trader: Trader, loop: AbstractEventLoop) -
         logging.error('failed to start liquidation recovery: {}'.format(ex))
 
 
+async def _session_controller_loop(controller, *, interval: float = 5.0) -> None:
+    """Tick absolute session deadlines until flat or incident."""
+    while True:
+        try:
+            now = dt.datetime.now(dt.timezone.utc)
+            state = controller.run_due(now)
+            if state.state not in ('FLAT', 'INCIDENT', 'CLOSED'):
+                logging.debug(
+                    'session controller %s state=%s cutoff=%s',
+                    state.session_date, state.state, state.entry_cutoff_reached,
+                )
+        except Exception as ex:
+            logging.error('session controller tick failed: {}'.format(ex))
+        await asyncio.sleep(interval)
+
+
+def _maybe_start_session_recovery(trader: Trader, loop: AbstractEventLoop) -> None:
+    """P3 Task 6: resume session deadlines BEFORE semantic readiness / run().
+
+    Session recovery must precede readiness so a restart mid-flatten cannot
+    open a window where automation is 'ready' but deadlines are unenforced.
+    """
+    controller = getattr(trader, 'session_controller', None)
+    if controller is None:
+        return
+    try:
+        now = dt.datetime.now(dt.timezone.utc)
+        state = controller.recover(now)
+        if state.state not in ('FLAT', 'CLOSED'):
+            logging.warning(
+                'resumed session %s in state %s (incident=%s)',
+                state.session_date, state.state, state.incident,
+            )
+        loop.create_task(_session_controller_loop(controller))
+    except Exception as ex:
+        logging.error('failed to start session recovery: {}'.format(ex))
+
+
 def _seed_trading_control(trader: Trader, container: Container) -> TradingControlStore:
     """[M1-F3] Task 4: seed the durable per-account pause gate BEFORE this
     service is considered ready (i.e. before ``trader.run()`` starts the
@@ -323,6 +361,8 @@ def main(simulation: bool,
         # docstring) -- a no-op here today, never a startup regression.
         _maybe_start_command_reconciliation(trader, loop)
         _maybe_start_liquidation_recovery(trader, loop)
+        # P3 Task 6: session deadline recovery must start before readiness/run.
+        _maybe_start_session_recovery(trader, loop)
 
         ip_address = get_network_ip()
         logging.debug('starting trading_runtime at network address: {}'.format(ip_address))

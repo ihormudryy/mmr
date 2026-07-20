@@ -134,6 +134,7 @@ class CommandStack:
     liquidation_service: LiquidationService
     session_risk: Any = None  # SessionRiskController when automation stack is active
     protective_order_saga: Any = None  # ProtectiveOrderSaga (P3 Task 5)
+    session_controller: Any = None  # SessionController (P3 Task 6)
     dispatch_guard: Any = None
 
 
@@ -430,6 +431,26 @@ def build_command_stack(
         now=now,
         db=trader.journal_db,
     )
+    # P3 Task 6 — exchange-aware session deadlines / flatten scheduler.
+    from trader.automation.session_controller import (
+        SessionCancelAdapter,
+        SessionController,
+        SessionTimeExitAdapter,
+        apply_session_controller_migration,
+    )
+    apply_session_controller_migration(migrator)
+    session_controller = SessionController(
+        journal=journal,
+        db=trader.journal_db,
+        calendar=XNYSCalendarPolicy(),
+        broker=broker_snapshot,
+        cancel=SessionCancelAdapter(_LiquidationDispatch(dispatch)),
+        liquidation=liquidation_service,
+        breaker=circuit_breaker,
+        time_exit=SessionTimeExitAdapter(_LiquidationDispatch(dispatch)),
+        account_id=trader.ib_account,
+        now=now,
+    )
     stack = CommandStack(
         journal=journal,
         repository=repository,
@@ -449,6 +470,7 @@ def build_command_stack(
         liquidation_service=liquidation_service,
         session_risk=session_risk,
         protective_order_saga=protective_order_saga,
+        session_controller=session_controller,
         dispatch_guard=dispatch_guard,
     )
     trader.command_ledger = ledger
@@ -460,4 +482,5 @@ def build_command_stack(
     trader.liquidation_service = liquidation_service
     trader.session_risk = session_risk
     trader.protective_order_saga = protective_order_saga
+    trader.session_controller = session_controller
     return stack

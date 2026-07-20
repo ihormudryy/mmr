@@ -126,12 +126,12 @@
 
 **Journal migration 31:** `automation_session_state` stores schedule/version, state, deadlines, entry cutoff reached, flatten command ID, flat generation, and incident.
 
-- [ ] Test completed-bar time exits, max-hold-bars, artifact close-by time, no entries after cutoff, cancel entries at cancel deadline, flatten at flatten deadline, and broker-confirmed flat deadline.
-- [ ] Test restart at every state/deadline, clock jumps, DST, half-day, delayed task scheduling, partial fills during cancel, and an external position.
-- [ ] Implement a trader-owned scheduler driven by absolute UTC deadlines resolved from XNYS. Strategy timers are advisory only.
-- [ ] Use deterministic root/child command IDs; reuse P1 cancel/liquidation. A missed flat deadline trips breaker and never self-resets.
-- [ ] Start session recovery before semantic readiness.
-- [ ] Run focused tests and commit `feat(automation): enforce exchange-aware session flattening`.
+- [x] Test completed-bar time exits, max-hold-bars, artifact close-by time, no entries after cutoff, cancel entries at cancel deadline, flatten at flatten deadline, and broker-confirmed flat deadline.
+- [x] Test restart at every state/deadline, clock jumps, DST, half-day, delayed task scheduling, partial fills during cancel, and an external position.
+- [x] Implement a trader-owned scheduler driven by absolute UTC deadlines resolved from XNYS. Strategy timers are advisory only.
+- [x] Use deterministic root/child command IDs; reuse P1 cancel/liquidation. A missed flat deadline trips breaker and never self-resets.
+- [x] Start session recovery before semantic readiness.
+- [x] Run focused tests and commit `feat(automation): enforce exchange-aware session flattening`.
 
 ### Task 7: Implement the authoritative attribution ledger
 

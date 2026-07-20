@@ -29,6 +29,8 @@ _IMMEDIATE = {
     "ACCOUNT_MISMATCH",
     "INSTRUMENT_HALT",
     "DRAWDOWN_BREACH",
+    # P3 Task 6 — missed session flat confirmation
+    "MISSED_FLAT_DEADLINE",
 }
 _ROLLING = {
     "QUOTE_FAILURE": (3, dt.timedelta(minutes=5)),

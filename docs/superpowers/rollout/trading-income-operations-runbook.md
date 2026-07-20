@@ -69,6 +69,9 @@ Nested `automation:` (shown above) is the preferred user-config form; flat
 
 ## Hybrid mode (paper auto / live propose)
 
+**Operator setup walkthrough:** [`docs/PAPER_AUTOMATION_SETUP.md`](../../PAPER_AUTOMATION_SETUP.md)
+(info checklist, Docker → authority → Activate/bootstrap → P1/P3 gates → kill switches).
+
 Approved design: `docs/superpowers/specs/2026-07-20-hybrid-paper-auto-live-propose-design.md`.
 
 | Mode | Automation | Human approve |

@@ -72,6 +72,8 @@ pip install -e ".[test]"
 
 On first run, `start_mmr.sh` auto-launches the setup wizard to configure IB Gateway host/port, account numbers, Massive.com API key, and trading mode. Re-run anytime with `./start_mmr.sh --setup`. Settings are saved to `~/.config/mmr/trader.yaml`.
 
+For **unattended paper automation** (one signed strategy, release gates, dashboard Activate), see [`docs/PAPER_AUTOMATION_SETUP.md`](docs/PAPER_AUTOMATION_SETUP.md).
+
 ### Requirements
 
 - Python >= 3.12

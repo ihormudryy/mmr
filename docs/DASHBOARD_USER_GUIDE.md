@@ -16,6 +16,7 @@ This markdown file is a readable copy for the repo; prefer the Guide tab in the 
 | Propose / approve / close / pause | Guide tab → Trading examples A–D |
 | Deploy + watchlists | Guide tab → Deploy / Watchlists examples |
 | Allocation activate / suspend | Guide tab → Scaling |
+| Unattended paper automation (Activate / bootstrap) | [`PAPER_AUTOMATION_SETUP.md`](PAPER_AUTOMATION_SETUP.md) |
 
 ## CLI companions
 

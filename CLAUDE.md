@@ -4,6 +4,8 @@
 > coverage, backups, restart policy, Monday plan) lives in
 > [`docs/OPERATIONAL_STATE.md`](docs/OPERATIONAL_STATE.md) — read it first when
 > resuming operational work. Code backlog is in `docs/AUDIT_ROADMAP.md`.
+> Unattended paper automation setup:
+> [`docs/PAPER_AUTOMATION_SETUP.md`](docs/PAPER_AUTOMATION_SETUP.md).
 
 ## Project Overview
 

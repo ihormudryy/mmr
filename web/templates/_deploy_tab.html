@@ -6,16 +6,17 @@
 
   <section class="full">
     <h2>Deployed strategies
-      {{ info('Currently loaded by strategy_service. Enable, disable, and live param edits live in the Trading tab — not here.') }}
+      {{ info('Currently loaded by strategy_service. Enable puts a strategy RUNNING so it receives bars; Disable stops it without undeploying.') }}
       <span class="chip on">{{ deployed_count }} loaded</span>
     </h2>
     <p class="note">Enter <strong>symbols</strong> (e.g. AAPL, MSFT) or pick a <strong>watchlist</strong> to deploy.
-      Enable / disable / params → <strong>Trading</strong> tab · Undeploy → <code>mmr strategies undeploy NAME</code></p>
+      Use <strong>Enable</strong> / <strong>Disable</strong> on a deployed row to put it RUNNING.
+      Undeploy → <code>mmr strategies undeploy NAME</code></p>
     {% if errors.strategies %}<p class="banner err">{{ errors.strategies }}</p>{% endif %}
     {% if strategies %}
     <table>
       <thead><tr>
-        <th>Name</th><th>State</th><th>Auto</th><th>Bar</th><th>ConIds</th>
+        <th>Name</th><th>State</th><th>Auto</th><th>Bar</th><th>ConIds</th><th>Actions</th>
       </tr></thead>
       <tbody>
       {% for s in strategies %}
@@ -28,6 +29,21 @@
           <td>{% if s.auto_execute == 'propose' %}<span class="chip on">propose</span>{% elif s.auto_execute %}<span class="chip err">{{ s.auto_execute }}</span>{% else %}<span class="dim">—</span>{% endif %}</td>
           <td>{{ s.bar_size or '—' }}</td>
           <td class="dim">{{ s.conids or '—' }}</td>
+          <td>
+            {% if s.name == 'global' %}
+              <span class="dim">—</span>
+            {% elif s.enabled %}
+              <form method="post" action="/strategies/{{ s.name }}/disable-live" style="display:inline">
+                <input type="hidden" name="csrf_token" value="{{ csrf_token }}" />
+                <button type="submit" class="reject">Disable</button>
+              </form>
+            {% else %}
+              <form method="post" action="/strategies/{{ s.name }}/enable-live" style="display:inline">
+                <input type="hidden" name="csrf_token" value="{{ csrf_token }}" />
+                <button type="submit">Enable</button>
+              </form>
+            {% endif %}
+          </td>
         </tr>
       {% endfor %}
       </tbody>

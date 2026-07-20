@@ -506,6 +506,9 @@ class StubManageClient:
         if method == 'enable_strategy_by_name':
             self.stub.calls.append(('enable', body['strategy_name']))
             return {'ok': True, 'state': 'RUNNING'}
+        if method == 'disable_strategy_by_name':
+            self.stub.calls.append(('disable', body['strategy_name']))
+            return {'ok': True, 'state': 'DISABLED'}
         raise AssertionError(f'unexpected strategy_command {method!r}')
 
 
@@ -733,6 +736,23 @@ class TestDeployRoute:
         assert 'data-dash-tab="deploy"' in html
         assert '/strategies/' not in html or '/strategies/deploy' in html
         assert '/strategies/orb_googl/enable' not in html
+        assert '/strategies/orb_googl/disable-live' in html
+
+    def test_enable_live_calls_strategy_command(self, client, stub, manage_client):
+        r = client.post('/strategies/orb_googl/enable-live',
+                        data={'csrf_token': _csrf()}, follow_redirects=False)
+        assert r.status_code == 303
+        assert 'enabled' in r.headers['location']
+        assert ('strategy_command', 'enable_strategy_by_name',
+                {'strategy_name': 'orb_googl'}) in manage_client.calls
+
+    def test_disable_live_calls_strategy_command(self, client, stub, manage_client):
+        r = client.post('/strategies/orb_googl/disable-live',
+                        data={'csrf_token': _csrf()}, follow_redirects=False)
+        assert r.status_code == 303
+        assert 'disabled' in r.headers['location']
+        assert ('strategy_command', 'disable_strategy_by_name',
+                {'strategy_name': 'orb_googl'}) in manage_client.calls
 
 
 class TestManagePage:

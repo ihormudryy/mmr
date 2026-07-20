@@ -350,8 +350,9 @@ def make_test_client(*, commands_enabled: bool):
     return client
 
 
-# States that count as "live / enabled" (mirrors strategy_runtime semantics).
-_ENABLED_STATES = {'RUNNING', 'WAITING_HISTORICAL_DATA', 'INSTALLED'}
+# States that count as "live / enabled" (dispatchable — mirrors
+# command_center.js DISPATCHABLE_STRATEGY). INSTALLED means loaded but idle.
+_ENABLED_STATES = {'RUNNING', 'WAITING_HISTORICAL_DATA'}
 
 # ---------------------------------------------------------------------------
 # Shared SDK connection
@@ -555,7 +556,11 @@ def _normalize_strategy_rows(rows: list[dict], *, from_config: bool = False) -> 
 
 
 def fetch_deployed_from_config() -> list[dict]:
-    """YAML-only deployed list — mirrors ``mmr strategies list`` fallback."""
+    """YAML-only deployed list — mirrors ``mmr strategies list`` fallback.
+
+    State is tagged ``CONFIG`` so the UI never confuses offline YAML with a
+    live runtime state (RUNNING / INSTALLED / …).
+    """
     if not _STRATEGY_CONFIG_PATH.exists():
         return []
     config = yaml.safe_load(_STRATEGY_CONFIG_PATH.read_text()) or {}
@@ -574,6 +579,41 @@ def fetch_deployed_from_config() -> list[dict]:
             'params': dict(entry.get('params') or {}),
         })
     return _normalize_strategy_rows(rows, from_config=True)
+
+
+def _manage_page_local_bootstrap(flash: str = '') -> dict[str, Any]:
+    """Instant deploy-tab slices — local scan + YAML names, no live state.
+
+    Strategy rows from YAML are included for the available-table ``deployed``
+    badge, but with state ``…`` so a timed-out live fetch never paints
+    ``CONFIG`` as if it were the runtime status.
+    """
+    errors: dict[str, str] = {}
+    try:
+        available = fetch_available_strategies()
+    except Exception as exc:  # noqa: BLE001
+        logger.warning('available strategies scan failed: %s', exc)
+        available = []
+        errors['available'] = f'{type(exc).__name__}: {exc}'
+
+    strategies = fetch_deployed_from_config()
+    for s in strategies:
+        s['state'] = '…'
+        s['enabled'] = False
+    deployed_classes = {s.get('class_name') for s in strategies if s.get('class_name')}
+    for a in available:
+        a['deployed'] = a.get('class') in deployed_classes
+
+    return {
+        'strategies': strategies,
+        'available_strategies': available,
+        'watchlists': [],
+        'deployed_count': len(strategies),
+        'flash': flash,
+        'flash_err': _flash_is_error(flash),
+        'csrf_token': _CSRF_TOKEN,
+        'errors': errors,
+    }
 
 
 def fetch_strategies() -> tuple[list[dict], str | None]:
@@ -640,107 +680,61 @@ def _empty_manage_context(flash: str = '', *, error: str = '') -> dict[str, Any]
     return ctx
 
 
-def _manage_page_local_bootstrap(flash: str = '') -> dict[str, Any]:
-    """Instant deploy-tab slices — local scan + YAML, no RPC."""
-    errors: dict[str, str] = {}
-    try:
-        available = fetch_available_strategies()
-    except Exception as exc:  # noqa: BLE001
-        logger.warning('available strategies scan failed: %s', exc)
-        available = []
-        errors['available'] = f'{type(exc).__name__}: {exc}'
-
-    strategies = fetch_deployed_from_config()
-    deployed_classes = {s.get('class_name') for s in strategies if s.get('class_name')}
-    for a in available:
-        a['deployed'] = a.get('class') in deployed_classes
-
-    return {
-        'strategies': strategies,
-        'available_strategies': available,
-        'watchlists': [],
-        'deployed_count': len(strategies),
-        'flash': flash,
-        'flash_err': _flash_is_error(flash),
-        'csrf_token': _CSRF_TOKEN,
-        'errors': errors,
-    }
-
-
 def _manage_page_context(flash: str = '') -> tuple[dict[str, Any], dict[str, str]]:
     """Fetch deploy/watchlist sections for /cc.
 
-    Local scans run first; RPC overlays live strategy state + watchlists with a
-    short deadline and without waiting for hung threads on pool shutdown.
+    Live strategy state is fetched first (blocking) so the Deployed table
+    never paints YAML ``CONFIG`` placeholders when strategy_service is up.
+    Watchlists overlay afterward under a short remaining budget.
     """
     from concurrent.futures import ThreadPoolExecutor, wait
 
     ctx = _manage_page_local_bootstrap(flash)
     errors = dict(ctx.get('errors') or {})
-    sections: dict[str, Any] = {
-        'strategies': ctx['strategies'],
-        'watchlists': ctx['watchlists'],
-    }
+    strategies = ctx['strategies']
+    watchlists: list[dict] = list(ctx.get('watchlists') or [])
 
-    rpc_fetchers: dict[str, Callable[[], Any]] = {
-        'strategies': fetch_strategies,
-        'watchlists': fetch_watchlists,
-    }
-    timeout_s = float(os.environ.get('MMR_MANAGE_FETCH_TIMEOUT_S', '3'))
-    pool = ThreadPoolExecutor(max_workers=len(rpc_fetchers))
-    future_map = {pool.submit(fn): key for key, fn in rpc_fetchers.items()}
+    # 1. Strategies — primary; give the typed client room for a cold connect.
     try:
-        done, pending = wait(future_map.keys(), timeout=timeout_s)
-        for fut in done:
-            key = future_map[fut]
-            try:
-                result = fut.result()
-                if key == 'strategies':
-                    rows, warn = result
-                    sections[key] = rows
-                    if warn:
-                        errors[key] = warn
-                    elif key in errors and errors[key].startswith('strategy_service'):
-                        errors.pop(key, None)
-                else:
-                    sections[key] = result
-            except Exception as exc:  # noqa: BLE001 - surface, don't crash the page
-                logger.warning('manage section %s failed: %s', key, exc)
-                if key == 'strategies':
-                    fallback = fetch_deployed_from_config()
-                    sections[key] = fallback or ctx['strategies']
-                    if fallback:
-                        errors[key] = (
-                            f'{type(exc).__name__}: {exc}; '
-                            'showing local config (may be stale vs live runtime)'
-                        )
-                    else:
-                        errors[key] = f'{type(exc).__name__}: {exc}'
-                else:
-                    sections[key] = []
-                    errors[key] = f'{type(exc).__name__}: {exc}'
-        if pending:
-            logger.warning('manage RPC still pending after %.0fs', timeout_s)
-            errors.setdefault(
-                'page',
-                f'some live sections still loading after {timeout_s:.0f}s — showing local data',
+        rows, warn = fetch_strategies()
+        strategies = rows
+        if warn:
+            errors['strategies'] = warn
+        else:
+            errors.pop('strategies', None)
+    except Exception as exc:  # noqa: BLE001
+        logger.warning('manage strategies failed: %s', exc)
+        fallback = fetch_deployed_from_config()
+        strategies = fallback or strategies
+        if fallback:
+            errors['strategies'] = (
+                f'{type(exc).__name__}: {exc}; '
+                'showing local config (may be stale vs live runtime)'
             )
-            for fut in pending:
-                fut.cancel()
-                key = future_map[fut]
-                if key == 'strategies':
-                    sections[key] = sections.get(key) or ctx['strategies']
-                    errors.setdefault(
-                        key,
-                        'strategy_service still loading; showing local config (may be stale)',
-                    )
-                else:
-                    sections.setdefault(key, [])
-                    errors.setdefault(key, 'still loading when page deadline hit')
+        else:
+            errors['strategies'] = f'{type(exc).__name__}: {exc}'
+
+    # 2. Watchlists — secondary; don't block Deployed status on this.
+    timeout_s = float(os.environ.get('MMR_MANAGE_FETCH_TIMEOUT_S', '5'))
+    pool = ThreadPoolExecutor(max_workers=1)
+    try:
+        fut = pool.submit(fetch_watchlists)
+        done, pending = wait([fut], timeout=timeout_s)
+        if done:
+            try:
+                watchlists = fut.result()
+                errors.pop('watchlists', None)
+            except Exception as exc:  # noqa: BLE001
+                logger.warning('manage watchlists failed: %s', exc)
+                watchlists = []
+                errors['watchlists'] = f'{type(exc).__name__}: {exc}'
+        if pending:
+            logger.warning('manage watchlists still pending after %.0fs', timeout_s)
+            fut.cancel()
+            errors.setdefault('watchlists', 'still loading when page deadline hit')
     finally:
         pool.shutdown(wait=False, cancel_futures=True)
 
-    strategies = sections.get('strategies') or []
     deployed_classes = {s.get('class_name') for s in strategies if s.get('class_name')}
     available = ctx['available_strategies']
     for a in available:
@@ -749,7 +743,7 @@ def _manage_page_context(flash: str = '') -> tuple[dict[str, Any], dict[str, str
     return ({
         'strategies': strategies,
         'available_strategies': available,
-        'watchlists': sections.get('watchlists') or [],
+        'watchlists': watchlists,
         'deployed_count': len(strategies),
         'flash': flash,
         'flash_err': _flash_is_error(flash),
@@ -1133,6 +1127,45 @@ def _register_legacy_routes(application: FastAPI) -> None:
             msg = f'{name} delete failed: {type(exc).__name__}: {exc}'
         return _flash(msg)
 
+
+    @application.post('/strategies/{name}/enable-live')
+    def enable_strategy_live(name: str, request: Request, csrf_token: str = Form(''),
+                             session: str = Depends(require_session)):
+        """Enable a loaded strategy via strategy_service typed RPC.
+
+        Companion to Deploy-tab controls. Distinct from the legacy
+        ``/strategies/{name}/enable`` path (locked when command-center
+        mutations own trading) — this is the same manage surface as deploy.
+        """
+        _check_csrf(csrf_token)
+        try:
+            result = get_manage_client().strategy_command(
+                'enable_strategy_by_name', {'strategy_name': name})
+            state = result.get('state') or 'RUNNING'
+            msg = f'{name} enabled ({state})'
+        except TypedRpcRemoteError as exc:
+            msg = f'{name} enable failed: {exc.code}: {exc}'
+        except Exception as exc:  # noqa: BLE001
+            logger.warning('enable-live %s failed: %s', name, exc)
+            msg = f'{name} enable failed: {type(exc).__name__}: {exc}'
+        return _flash(msg)
+
+    @application.post('/strategies/{name}/disable-live')
+    def disable_strategy_live(name: str, request: Request, csrf_token: str = Form(''),
+                              session: str = Depends(require_session)):
+        """Disable a running strategy via strategy_service typed RPC."""
+        _check_csrf(csrf_token)
+        try:
+            result = get_manage_client().strategy_command(
+                'disable_strategy_by_name', {'strategy_name': name})
+            state = result.get('state') or 'DISABLED'
+            msg = f'{name} disabled ({state})'
+        except TypedRpcRemoteError as exc:
+            msg = f'{name} disable failed: {exc.code}: {exc}'
+        except Exception as exc:  # noqa: BLE001
+            logger.warning('disable-live %s failed: %s', name, exc)
+            msg = f'{name} disable failed: {type(exc).__name__}: {exc}'
+        return _flash(msg)
 
     @application.post('/strategies/deploy')
     async def deploy_strategy(request: Request, session: str = Depends(require_session)):

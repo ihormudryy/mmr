@@ -20,6 +20,7 @@ from trader.messaging.clientserver import (
     TopicPubSub
 )
 from trader.messaging.manage_contracts import (
+    DisableStrategyByNameRequest,
     EnableStrategyByNameRequest,
     ListStrategiesRequest,
     ReloadStrategiesRequest,
@@ -221,6 +222,16 @@ def _enable_strategy_by_name_handler(runtime: 'StrategyRuntime'):
     return _handler
 
 
+def _disable_strategy_by_name_handler(runtime: 'StrategyRuntime'):
+    def _handler(parsed: DisableStrategyByNameRequest) -> Dict[str, Any]:
+        state = runtime.disable_strategy(parsed.strategy_name)
+        name = state.name if hasattr(state, 'name') else str(state)
+        if name == 'ERROR':
+            raise _DispatchProblem('NOT_FOUND', f'strategy {parsed.strategy_name!r} not found')
+        return {'ok': True, 'state': name}
+    return _handler
+
+
 def register_strategy_control_authority(
     command_registry: TypedRpcRegistry, query_registry: TypedRpcRegistry, runtime: 'StrategyRuntime',
 ) -> None:
@@ -262,6 +273,10 @@ def register_strategy_control_authority(
     command_registry.register(
         'command', 'enable_strategy_by_name', EnableStrategyByNameRequest, dict,
         _enable_strategy_by_name_handler(runtime), execution='thread',
+    )
+    command_registry.register(
+        'command', 'disable_strategy_by_name', DisableStrategyByNameRequest, dict,
+        _disable_strategy_by_name_handler(runtime), execution='thread',
     )
 
 
@@ -580,6 +595,7 @@ class StrategyRuntime():
             if name == implementation.name:
                 state = implementation.enable()
                 self._persist_enabled(name, True)
+                self._announce_and_drain(name)
                 return state
         return StrategyState.ERROR
 
@@ -597,6 +613,7 @@ class StrategyRuntime():
             'recovered strategy %r from ERROR after instruments became resolvable',
             strategy.name,
         )
+        self._announce_and_drain(strategy.name)
 
     @log_method
     def disable_strategy(self, name: str) -> StrategyState:
@@ -604,8 +621,26 @@ class StrategyRuntime():
             if name == implementation.name:
                 state = implementation.disable()
                 self._persist_enabled(name, False)
+                self._announce_and_drain(name)
                 return state
         return StrategyState.ERROR
+
+    def _announce_and_drain(self, name: str) -> None:
+        """Push the new observable state to the trader journal immediately.
+
+        Without this, enable/disable only update local runtime state — the
+        command-center Trading Strategies panel stays stale until the next
+        30s reconcile announces the transition.
+        """
+        try:
+            self._announce_strategy_states()
+        except Exception as ex:
+            logging.warning('announce after %s state change failed: %s', name, ex)
+            return
+        try:
+            self._drain_ack_outbox()
+        except Exception as ex:
+            logging.warning('ack-outbox drain after %s state change failed: %s', name, ex)
 
     @log_method
     def get_strategy(self, name: str) -> Optional[Strategy]:

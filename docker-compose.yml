@@ -357,10 +357,16 @@ services:
       MMR_DILL_STRICT: "1"
       # Session auth: login token + >=32-byte HMAC session secret, sourced from
       # .env (gitignored). The command center raises CredentialConfigError ->
-      # POST /session 500 without both. Read-only dashboard: commands stay
-      # disabled (DASHBOARD_COMMANDS_ENABLED unset -> false).
+      # POST /session 500 without both. Command affordances (Trading-tab
+      # enable/disable/approve) default off; set DASHBOARD_COMMANDS_ENABLED=true
+      # in .env to turn them on (must be passed through here — Compose does
+      # not auto-inject arbitrary .env keys into the service environment).
       DASHBOARD_TOKEN: ${DASHBOARD_TOKEN:-}
       DASHBOARD_SESSION_SECRET: ${DASHBOARD_SESSION_SECRET:-}
+      DASHBOARD_COMMANDS_ENABLED: ${DASHBOARD_COMMANDS_ENABLED:-false}
+      DASHBOARD_LIVE_COMMANDS_ENABLED: ${DASHBOARD_LIVE_COMMANDS_ENABLED:-false}
+      DASHBOARD_LIVE_ACCOUNT_ID: ${DASHBOARD_LIVE_ACCOUNT_ID:-}
+      DASHBOARD_LIVE_MAX_ORDER_NOTIONAL: ${DASHBOARD_LIVE_MAX_ORDER_NOTIONAL:-}
       # Shared service HMAC key for the typed-RPC seam to the trader (the read
       # bridge + command gateway authenticate with it). Same 0600 key the trader
       # loads via trader.yaml's service_hmac_key_file; it's already on the

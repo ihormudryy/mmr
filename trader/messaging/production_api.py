@@ -99,6 +99,7 @@ from trader.messaging.strategy_trader_contracts import (
     ResolveInstrumentRequest,
     ResolveInstrumentResponse,
 )
+from trader.messaging.manage_surface import register_manage_surface
 from trader.messaging.trader_service_api import TraderServiceApi
 from trader.messaging.typed_rpc import (
     HmacServiceAuthenticator,
@@ -1498,6 +1499,7 @@ def build_production_registry(
         'query', 'publish_instrument', PublishInstrumentRequest,
         PublishInstrumentResponse, _publish_instrument_handler(api),
     )
+    register_manage_surface(registry, api)
 
     if command_stack is not None:
         register_command_authority(

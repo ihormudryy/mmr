@@ -378,6 +378,8 @@ services:
       MMR_TYPED_QUERY_ENDPOINT: tcp://trader:42101
       MMR_TYPED_FEED_ENDPOINT: tcp://trader:42103
       MMR_TYPED_COMMAND_ENDPOINT: tcp://trader:42102
+      MMR_TYPED_STRATEGY_QUERY_ENDPOINT: tcp://strategy:42105
+      MMR_TYPED_STRATEGY_COMMAND_ENDPOINT: tcp://strategy:42104
       MMR_PUBSUB_ADDRESS: tcp://trader
     ports:
       - "127.0.0.1:7424:7424"

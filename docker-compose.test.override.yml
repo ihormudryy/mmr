@@ -32,12 +32,3 @@ services:
     command: ["python", "-m", "trader.trader_service", "--simulation", "True"]
     environment:
       MMR_FAKE_BROKER: "1"
-      # Legacy SDK fetchers (/manage deployed list, legacy dashboard) dial port
-      # 42001 — only bound when simulation AND unsafe_legacy_rpc are both true.
-      UNSAFE_LEGACY_RPC: "true"
-  dashboard:
-    # /manage watchlist CRUD reads/writes universes in duckdb_path. The base
-    # dashboard service deliberately omits the DB volume (read-model-only);
-    # the test profile mounts it so deploy+watchlist e2e can run end-to-end.
-    volumes:
-      - mmr_db_data:/home/trader/.local/share/mmr/data

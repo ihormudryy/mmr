@@ -143,7 +143,7 @@ def stub_cc():
 
 
 @pytest.fixture
-def client(stub, stub_cc):
+def client(stub, stub_cc, manage_client):
     from web.app import create_app
     app = create_app(stub_cc)
     test_client = TestClient(app)
@@ -393,11 +393,111 @@ class StubAccessor:
 _RESOLVABLE = {'AAPL': 265598, 'MSFT': 272093, 'GLD': 51529211}
 
 
+class StubManageClient:
+    """In-process fake for web.manage_client typed RPC calls."""
+
+    def __init__(self, accessor: StubAccessor, stub_sdk: StubSDK):
+        self.accessor = accessor
+        self.stub = stub_sdk
+        self.calls: list[tuple] = []
+
+    @staticmethod
+    def _instrument(symbol: str, conid: int) -> dict:
+        return {
+            'instrument_id': conid,
+            'symbol': symbol,
+            'exchange': 'SMART',
+            'primary_exchange': 'NASDAQ',
+            'currency': 'USD',
+            'security_type': 'STK',
+            'time_zone_id': 'America/New_York',
+        }
+
+    def trader_query(self, method: str, body: dict | None = None):
+        body = body or {}
+        if method == 'list_universes':
+            return {'universes': [
+                {'name': name, 'count': count}
+                for name, count in self.accessor.list_universes_count().items()]}
+        if method == 'get_universe':
+            name = body['name']
+            limit = int(body.get('symbol_limit') or 40)
+            defs = self.accessor.get(name).security_definitions
+            return {'name': name, 'count': len(defs),
+                    'symbols': [d.symbol for d in defs[:limit]]}
+        if method == 'discover_instrument':
+            sym = str(body['symbol']).upper()
+            conid = _RESOLVABLE.get(sym)
+            if conid:
+                return {'instruments': [self._instrument(sym, conid)]}
+            return {'instruments': []}
+        raise AssertionError(f'unexpected trader_query {method!r}')
+
+    def trader_command(self, method: str, body: dict):
+        self.calls.append(('trader_command', method, body))
+        name = body.get('name')
+        if method == 'create_universe':
+            if name in self.accessor.universes:
+                from trader.messaging.typed_rpc import TypedRpcRemoteError
+                raise TypedRpcRemoteError('ALREADY_EXISTS', 'exists')
+            self.accessor.universes[name] = []
+            return {'ok': True, 'name': name}
+        if method == 'add_universe_symbols':
+            added, missing = [], []
+            for sym in body.get('symbols') or []:
+                sym = str(sym).upper()
+                conid = _RESOLVABLE.get(sym)
+                if conid:
+                    self.accessor.insert(name, _sd(sym, conid))
+                    added.append({'symbol': sym, 'instrument_id': conid})
+                else:
+                    missing.append(sym)
+            return {'added': added, 'missing': missing}
+        if method == 'remove_universe_symbol':
+            universe = self.accessor.get(name)
+            match = universe.find_symbol(body['symbol'])
+            if match is None:
+                from trader.messaging.typed_rpc import TypedRpcRemoteError
+                raise TypedRpcRemoteError('NOT_FOUND', 'missing')
+            self.accessor.universes[name] = [
+                d for d in self.accessor.universes[name] if d.conId != match.conId]
+            return {'ok': True}
+        if method == 'delete_universe':
+            self.accessor.delete(name)
+            return {'ok': True}
+        if method == 'import_universe_csv':
+            count = self.accessor.update_from_csv_str(name, body['csv_text'])
+            return {'imported': count, 'added': [], 'missing': []}
+        raise AssertionError(f'unexpected trader_command {method!r}')
+
+    def strategy_query(self, method: str, body: dict | None = None):
+        if method == 'list_strategies':
+            rows = self.stub.strategies().to_dict('records')
+            return {'strategies': rows}
+        raise AssertionError(f'unexpected strategy_query {method!r}')
+
+    def strategy_command(self, method: str, body: dict | None = None):
+        body = body or {}
+        self.calls.append(('strategy_command', method, body))
+        if method == 'reload_strategies':
+            return {'ok': True, 'strategies': []}
+        if method == 'enable_strategy_by_name':
+            self.stub.calls.append(('enable', body['strategy_name']))
+            return {'ok': True, 'state': 'RUNNING'}
+        raise AssertionError(f'unexpected strategy_command {method!r}')
+
+
 @pytest.fixture
 def accessor(monkeypatch):
     acc = StubAccessor()
-    monkeypatch.setattr(webapp, '_get_accessor', lambda: acc)
     return acc
+
+
+@pytest.fixture
+def manage_client(accessor, stub, monkeypatch):
+    client = StubManageClient(accessor, stub)
+    monkeypatch.setattr(webapp, 'get_manage_client', lambda: client)
+    return client
 
 
 @pytest.fixture
@@ -501,7 +601,7 @@ class TestDeployRoute:
         return client.post('/strategies/deploy', data=data, follow_redirects=False)
 
     def test_deploy_writes_yaml_reloads_and_enables(
-            self, client, stub, accessor, stub_resolving, deploy_config):
+            self, client, stub, manage_client, stub_resolving, deploy_config):
         import yaml
         r = self._deploy(client)
         assert r.status_code == 303
@@ -511,8 +611,7 @@ class TestDeployRoute:
         assert entry['class_name'] == 'Momentum'
         assert entry['conids'] == [265598]
         assert ('enable', 'mom_test') in stub.calls
-        # resolved secdef registered so resolve_symbol(conId) works at load
-        assert ('insert', 'strat_mom_test', 'AAPL') in accessor.calls
+        assert ('strategy_command', 'reload_strategies', {}) in manage_client.calls
 
     def test_deploy_with_watchlist_target(self, client, stub, accessor,
                                           stub_resolving, deploy_config):
@@ -573,7 +672,7 @@ class TestDeployRoute:
 
 
 class TestManagePage:
-    def test_manage_renders_without_heavy_fetchers(self, client, stub, monkeypatch):
+    def test_manage_renders_without_heavy_fetchers(self, client, stub, manage_client, monkeypatch):
         """ /manage must not fan out legacy overview fetchers (cash, risk, …). """
         def _boom():
             raise AssertionError('legacy fetcher must not run on /manage')

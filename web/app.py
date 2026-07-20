@@ -46,6 +46,8 @@ from starlette.concurrency import run_in_threadpool
 
 from trader.operations.health import build_health_payload
 from trader.strategy.inspect import scan_strategies
+from trader.messaging.typed_rpc import TypedRpcRemoteError
+from web.manage_client import get_manage_client
 from web.command_center import (
     CommandCenter,
     CommandCenterConfig,
@@ -465,7 +467,7 @@ _WATCHLIST_NAME_RE = re.compile(r'^[a-z0-9_-]{1,40}$')
 
 
 def _get_accessor():
-    """UniverseAccessor over the local DuckDB — watchlists ARE universes."""
+    """Legacy local DuckDB accessor — retained for tests that patch it directly."""
     from trader.container import Container
     from trader.data.universe import UniverseAccessor
     cfg = Container.instance().config()
@@ -473,16 +475,20 @@ def _get_accessor():
 
 
 def fetch_watchlists() -> list[dict]:
-    accessor = _get_accessor()
+    client = get_manage_client()
+    listed = client.trader_query('list_universes')
     rows = []
-    for name, count in sorted(accessor.list_universes_count().items()):
+    for entry in listed.get('universes') or []:
+        name = entry['name']
+        count = int(entry.get('count') or 0)
         symbols = ''
         try:
-            defs = accessor.get(name).security_definitions
-            symbols = ', '.join(d.symbol for d in defs[:40])
-            if count > 40:
-                symbols += f', +{count - 40} more'
-        except Exception as exc:  # pragma: no cover - defensive
+            detail = client.trader_query('get_universe', {'name': name, 'symbol_limit': 40})
+            parts = detail.get('symbols') or []
+            symbols = ', '.join(parts)
+            if count > len(parts):
+                symbols += f', +{count - len(parts)} more'
+        except Exception as exc:  # noqa: BLE001
             logger.warning('watchlist %s read failed: %s', name, exc)
         rows.append({'name': name, 'count': count, 'symbols': symbols})
     return rows
@@ -493,27 +499,31 @@ def _split_symbols(raw: str) -> list[str]:
 
 
 def _resolve_symbols(symbols: list[str], exchange: str = '', currency: str = '',
-                     sec_type: str = 'STK') -> tuple[list, list[str]]:
-    """Resolve each symbol via IB (precision over convenience — never guess).
-    Returns (resolved SecurityDefinitions, unresolved symbol names)."""
+                     sec_type: str = 'STK') -> tuple[list[dict], list[str]]:
+    """Resolve each symbol via the trader typed query surface."""
+    client = get_manage_client()
     resolved, missing = [], []
     for sym in symbols:
         try:
-            defs = _call(lambda m: m.resolve(
-                sym, sec_type=sec_type, exchange=exchange, currency=currency),
-                retry=False)
+            resp = client.trader_query('discover_instrument', {
+                'symbol': sym,
+                'exchange': exchange,
+                'currency': currency,
+                'sec_type': sec_type,
+            })
+            instruments = resp.get('instruments') or []
         except Exception as exc:
             logger.warning('resolve %s failed: %s', sym, exc)
-            defs = None
-        if defs:
-            resolved.append(defs[0])
+            instruments = []
+        if instruments:
+            resolved.append(instruments[0])
         else:
             missing.append(sym)
     return resolved, missing
 
 
 def fetch_strategies() -> list[dict]:
-    rows = _records(_call(lambda m: m.strategies()))
+    rows = get_manage_client().strategy_query('list_strategies').get('strategies') or []
     for r in rows:
         state = str(r.get('state') or '').upper()
         r['enabled'] = state in _ENABLED_STATES
@@ -882,12 +892,11 @@ def _register_legacy_routes(application: FastAPI) -> None:
         if not _WATCHLIST_NAME_RE.match(wl):
             return _flash(f'invalid watchlist name {name!r} — use a-z, 0-9, -, _ (max 40)')
         try:
-            accessor = _get_accessor()
-            if wl in accessor.list_universes_count():
-                return _flash(f'watchlist "{wl}" already exists')
-            universe = accessor.get(wl)          # creates-on-read semantics
-            accessor.update(universe)            # persist the (empty) universe
+            get_manage_client().trader_command('create_universe', {'name': wl})
             msg = f'watchlist "{wl}" created — add symbols or upload a CSV'
+        except TypedRpcRemoteError as exc:
+            msg = (f'watchlist "{wl}" already exists' if exc.code == 'ALREADY_EXISTS'
+                   else f'create failed: {exc.code}: {exc}')
         except Exception as exc:  # noqa: BLE001
             logger.warning('watchlist create %s failed: %s', wl, exc)
             msg = f'create failed: {type(exc).__name__}: {exc}'
@@ -905,13 +914,18 @@ def _register_legacy_routes(application: FastAPI) -> None:
         if not syms:
             return _flash('no symbols given')
         try:
-            resolved, missing = _resolve_symbols(syms, exchange=exchange, currency=currency)
-            accessor = _get_accessor()
-            for sd in resolved:
-                accessor.insert(name, sd)
+            result = get_manage_client().trader_command('add_universe_symbols', {
+                'name': name,
+                'symbols': syms,
+                'exchange': exchange,
+                'currency': currency,
+            })
+            added = result.get('added') or []
+            missing = result.get('missing') or []
             parts = []
-            if resolved:
-                parts.append('added ' + ', '.join(f'{d.symbol} ({d.conId})' for d in resolved))
+            if added:
+                parts.append('added ' + ', '.join(
+                    f'{a["symbol"]} ({a["instrument_id"]})' for a in added))
             if missing:
                 parts.append('UNRESOLVED (not added): ' + ', '.join(missing)
                              + ' — for non-US listings set exchange/currency')
@@ -947,29 +961,33 @@ def _register_legacy_routes(application: FastAPI) -> None:
             if not lines:
                 return 'CSV is empty'
             header = [h.strip().lower() for h in lines[0].split(',')]
-            accessor = _get_accessor()
+            client = get_manage_client()
             if 'conid' in header:
-                count = accessor.update_from_csv_str(name, text)
-                return f'{name}: imported {count} security definitions'
+                result = client.trader_command('import_universe_csv', {
+                    'name': name, 'csv_text': text,
+                })
+                return f'{name}: imported {result.get("imported", 0)} security definitions'
             if 'symbol' in header:
                 rows = list(_csv.DictReader(io.StringIO(text)))
                 rows = [{k.strip().lower(): (v or '').strip() for k, v in r.items()} for r in rows]
             else:
-                # headerless: one symbol per line
                 rows = [{'symbol': ln.split(',')[0].strip()} for ln in lines]
             added, missing = [], []
             for r in rows:
                 sym = (r.get('symbol') or '').upper()
                 if not sym:
                     continue
-                resolved, unres = _resolve_symbols(
-                    [sym], exchange=r.get('exchange', ''), currency=r.get('currency', ''),
-                    sec_type=r.get('sectype', 'STK') or 'STK')
-                if resolved:
-                    accessor.insert(name, resolved[0])
+                result = client.trader_command('add_universe_symbols', {
+                    'name': name,
+                    'symbols': [sym],
+                    'exchange': r.get('exchange', ''),
+                    'currency': r.get('currency', ''),
+                    'sec_type': r.get('sectype', 'STK') or 'STK',
+                })
+                if result.get('added'):
                     added.append(sym)
                 else:
-                    missing.extend(unres)
+                    missing.extend(result.get('missing') or [sym])
             msg = f'{name}: added {len(added)} symbol(s)'
             if missing:
                 msg += f'; UNRESOLVED: {", ".join(missing[:15])}'
@@ -990,15 +1008,13 @@ def _register_legacy_routes(application: FastAPI) -> None:
         _check_origin(request)
         _check_csrf(csrf_token)
         try:
-            accessor = _get_accessor()
-            universe = accessor.get(name)
-            match = universe.find_symbol(symbol.strip())
-            if not match:
-                return _flash(f'"{symbol}" not in {name}')
-            universe.security_definitions = [
-                d for d in universe.security_definitions if d.conId != match.conId]
-            accessor.update(universe)
-            msg = f'removed {match.symbol} from {name}'
+            get_manage_client().trader_command('remove_universe_symbol', {
+                'name': name,
+                'symbol': symbol.strip(),
+            })
+            msg = f'removed {symbol.strip().upper()} from {name}'
+        except TypedRpcRemoteError as exc:
+            msg = f'"{symbol}" not in {name}' if exc.code == 'NOT_FOUND' else f'{name} remove failed: {exc}'
         except Exception as exc:  # noqa: BLE001
             logger.warning('watchlist remove %s failed: %s', name, exc)
             msg = f'{name} remove failed: {type(exc).__name__}: {exc}'
@@ -1011,7 +1027,7 @@ def _register_legacy_routes(application: FastAPI) -> None:
         _check_origin(request)
         _check_csrf(csrf_token)
         try:
-            _get_accessor().delete(name)
+            get_manage_client().trader_command('delete_universe', {'name': name})
             msg = f'watchlist "{name}" deleted'
         except Exception as exc:  # noqa: BLE001
             logger.warning('watchlist delete %s failed: %s', name, exc)
@@ -1076,10 +1092,7 @@ def _register_legacy_routes(application: FastAPI) -> None:
                 if missing:
                     return ('deploy aborted — unresolved: ' + ', '.join(missing)
                             + ' (nothing written)')
-                accessor = _get_accessor()
-                for sd in resolved:
-                    accessor.insert(f'strat_{name}', sd)
-                entry['conids'] = [sd.conId for sd in resolved]
+                entry['conids'] = [int(sd['instrument_id']) for sd in resolved]
             else:
                 entry['universe'] = watchlist
             if auto_propose:
@@ -1094,17 +1107,21 @@ def _register_legacy_routes(application: FastAPI) -> None:
             os.replace(tmp, _STRATEGY_CONFIG_PATH)
 
             # 4. Load it now (not in 30s) and enable it, per the one-click ask.
+            client = get_manage_client()
             try:
-                reload_result = _call(lambda m: m.reload_strategies(), retry=False)
-                if hasattr(reload_result, 'is_success') and not reload_result.is_success():
-                    return (f'"{name}" written to config but reload failed: '
-                            f'{_result_error(reload_result)} — it loads on the next '
-                            'reconcile; enable it from the Command Center')
-                enable_result = _call(lambda m: m.enable_strategy(name), retry=False)
-                if hasattr(enable_result, 'is_success') and not enable_result.is_success():
-                    return (f'"{name}" deployed but enable failed: '
-                            f'{_result_error(enable_result)} — enable it from the '
+                reload_result = client.strategy_command('reload_strategies', {})
+                if not reload_result.get('ok'):
+                    return (f'"{name}" written to config but reload failed — it loads on the '
+                            'next reconcile; enable it from the Command Center')
+                enable_result = client.strategy_command('enable_strategy_by_name', {
+                    'strategy_name': name,
+                })
+                if not enable_result.get('ok'):
+                    return (f'"{name}" deployed but enable failed — enable it from the '
                             'Command Center')
+            except TypedRpcRemoteError as exc:
+                return (f'"{name}" written to config but service call failed ({exc.code}: {exc}) '
+                        '— it loads on the next reconcile; enable it from the Command Center')
             except Exception as exc:
                 return (f'"{name}" written to config but service call failed '
                         f'({type(exc).__name__}: {exc}) — it loads on the next '

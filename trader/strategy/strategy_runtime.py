@@ -19,6 +19,11 @@ from trader.messaging.clientserver import (
     RPCServer,
     TopicPubSub
 )
+from trader.messaging.manage_contracts import (
+    EnableStrategyByNameRequest,
+    ListStrategiesRequest,
+    ReloadStrategiesRequest,
+)
 from trader.messaging.typed_rpc import (
     HmacServiceAuthenticator,
     TypedRpcClient,
@@ -174,6 +179,48 @@ def _get_strategy_receipt_handler(runtime: 'StrategyRuntime'):
     return _handler
 
 
+def _strategy_row(config: StrategyConfig) -> Dict[str, Any]:
+    state = config.state.name if hasattr(config.state, 'name') else str(config.state)
+    return {
+        'name': config.name,
+        'state': state,
+        'bar_size': str(config.bar_size) if config.bar_size is not None else None,
+        'conids': list(config.conids or []),
+        'universe': config.universe,
+        'class_name': config.class_name,
+        'description': config.description,
+        'auto_execute': config.auto_execute,
+        'params': dict(config.params or {}),
+    }
+
+
+def _list_strategies_handler(runtime: 'StrategyRuntime'):
+    def _handler(_parsed: ListStrategiesRequest) -> Dict[str, Any]:
+        rows = [_strategy_row(StrategyConfig.from_strategy(s))
+                for s in runtime.get_strategies()]
+        return {'strategies': rows}
+    return _handler
+
+
+def _reload_strategies_handler(runtime: 'StrategyRuntime'):
+    async def _handler(_parsed: ReloadStrategiesRequest) -> Dict[str, Any]:
+        await runtime._reconcile()
+        rows = [_strategy_row(StrategyConfig.from_strategy(s))
+                for s in runtime.get_strategies()]
+        return {'ok': True, 'strategies': rows}
+    return _handler
+
+
+def _enable_strategy_by_name_handler(runtime: 'StrategyRuntime'):
+    def _handler(parsed: EnableStrategyByNameRequest) -> Dict[str, Any]:
+        state = runtime.enable_strategy(parsed.strategy_name)
+        name = state.name if hasattr(state, 'name') else str(state)
+        if name == 'ERROR':
+            raise _DispatchProblem('NOT_FOUND', f'strategy {parsed.strategy_name!r} not found')
+        return {'ok': True, 'state': name}
+    return _handler
+
+
 def register_strategy_control_authority(
     command_registry: TypedRpcRegistry, query_registry: TypedRpcRegistry, runtime: 'StrategyRuntime',
 ) -> None:
@@ -203,6 +250,18 @@ def register_strategy_control_authority(
     query_registry.register(
         'query', 'get_strategy_receipt', _GetStrategyReceiptRequest, dict,
         _get_strategy_receipt_handler(runtime),
+    )
+    query_registry.register(
+        'query', 'list_strategies', ListStrategiesRequest, dict,
+        _list_strategies_handler(runtime), execution='thread',
+    )
+    command_registry.register(
+        'command', 'reload_strategies', ReloadStrategiesRequest, dict,
+        _reload_strategies_handler(runtime),
+    )
+    command_registry.register(
+        'command', 'enable_strategy_by_name', EnableStrategyByNameRequest, dict,
+        _enable_strategy_by_name_handler(runtime), execution='thread',
     )
 
 

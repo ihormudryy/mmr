@@ -11,6 +11,8 @@ import yaml
 from trader.automation.paper_activation import (
     PaperAutomationActivationError,
     PaperAutomationActivationService,
+    _redacted_automation_diff,
+    _redacted_strategy_params_diff,
 )
 
 
@@ -147,6 +149,56 @@ def test_activate_uses_documented_gate_error_codes(
         service.activate(strategy_name=strategy_name, reason="operator approved")
 
     assert exc.value.code == expected_code
+
+
+def test_redacted_automation_diff_reports_only_changed_keys() -> None:
+    before = {"enabled": False, "strategy_name": ""}
+    after = {
+        "enabled": True,
+        "live_enabled": False,
+        "strategy_name": "orb_gld",
+        "artifact_bundle_path": "/tmp/bundle",
+    }
+
+    diff = _redacted_automation_diff(before, after)
+
+    assert diff == {
+        "enabled": {"old": False, "new": True},
+        "strategy_name": {"old": "", "new": "orb_gld"},
+        "artifact_bundle_path": {"old": None, "new": "/tmp/bundle"},
+        "live_enabled": {"old": None, "new": False},
+    }
+    assert "private_key_path" not in diff
+
+
+def test_redacted_strategy_params_diff_never_includes_private_keys() -> None:
+    before = {"RANGE_MINUTES": 45}
+    after = {"RANGE_MINUTES": 45, "artifact_bundle_path": "/tmp/bundle"}
+
+    diff = _redacted_strategy_params_diff(before, after)
+
+    assert diff == {
+        "artifact_bundle_path": {"old": None, "new": "/tmp/bundle"},
+    }
+    assert "RANGE_MINUTES" not in diff
+
+
+def test_activate_logs_redacted_diff_shape(tmp_path: Path, caplog) -> None:
+    import logging
+
+    caplog.set_level(logging.INFO)
+    service = _service(tmp_path)
+
+    with patch(
+        "trader.automation.paper_activation.export_fixture_paper_eligible_bundle",
+        _fake_export,
+    ):
+        service.activate(strategy_name="orb_gld", reason="operator approved")
+
+    assert any("diff=" in record.message for record in caplog.records)
+    log_text = " ".join(record.message for record in caplog.records)
+    assert "private_key" not in log_text
+    assert "BEGIN" not in log_text
 
 
 def test_activate_writes_atomic_yaml_and_returns_restart_required(

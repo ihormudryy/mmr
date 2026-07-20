@@ -72,6 +72,31 @@ def _load_yaml_mapping(path: Path) -> dict:
     return value
 
 
+def _redacted_automation_diff(before: dict, after: dict) -> dict:
+    keys = (
+        "enabled",
+        "live_enabled",
+        "artifact_bundle_path",
+        "public_key_ring_path",
+        "expected_artifact_id",
+        "strategy_name",
+    )
+    return {
+        k: {"old": before.get(k), "new": after.get(k)}
+        for k in keys
+        if before.get(k) != after.get(k)
+    }
+
+
+def _redacted_strategy_params_diff(before: dict, after: dict) -> dict:
+    keys = ("artifact_bundle_path",)
+    return {
+        k: {"old": before.get(k), "new": after.get(k)}
+        for k in keys
+        if before.get(k) != after.get(k)
+    }
+
+
 class PaperAutomationActivationService:
     """Prepare durable paper automation config without hot-arming services."""
 
@@ -162,15 +187,15 @@ class PaperAutomationActivationService:
             raise
 
         bundle_path = self._share_dir / "artifacts" / artifact_id
+        before_automation = dict(automation)
         params = strategy.get("params")
         if params is None:
             params = {}
             strategy["params"] = params
         if not isinstance(params, dict):
             raise ValueError(f"strategy {strategy_name!r} params must be a mapping")
+        before_params = dict(params)
         params["artifact_bundle_path"] = str(bundle_path)
-        if strategy.get("auto_execute") == "propose":
-            strategy.pop("auto_execute")
 
         automation.update(
             {
@@ -188,14 +213,12 @@ class PaperAutomationActivationService:
         _atomic_write_yaml(self._strategy_yaml_path, strategy_data)
         _atomic_write_yaml(self._trader_yaml_path, trader_data)
         logger.info(
-            "paper automation config updated: %s",
+            "paper automation config updated: diff=%s",
             {
-                "enabled": True,
-                "live_enabled": False,
-                "artifact_bundle_path": str(bundle_path),
-                "public_key_ring_path": str(verify_dir),
-                "expected_artifact_id": artifact_id,
-                "strategy_name": strategy_name,
+                "automation": _redacted_automation_diff(before_automation, automation),
+                "strategy_params": _redacted_strategy_params_diff(
+                    before_params, params
+                ),
             },
         )
         self._last_activated_at = self._now().isoformat()

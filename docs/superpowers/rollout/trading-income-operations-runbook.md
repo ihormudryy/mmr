@@ -190,6 +190,19 @@ docker compose config --quiet                                     # compose vali
 Automation stays prohibited until all drills are green and the manual IB-paper
 soak is signed off.
 
+## P5 scaling rollback
+
+- **Immediate scale-down:** run `scripts/scaling_fault_drill.py --json` offline to
+  validate degradation/risk gates, then apply a restrictive allocation override
+  via the degradation monitor path (never increases authority).
+- **Suspend trading exposure:** `pause_trading` (no preflight) plus
+  `deactivate-canary` / allocation override to zero gross ceiling.
+- **Authority revocation:** revoke signed allocation/canary keys in the offline
+  key ring; restart trader_service so verifiers reload trusted keys.
+- **Return to paper:** disable live allocation activation config, redeploy paper
+  artifact bundle, and confirm `scaling.status` in `/api/snapshot` reads
+  `unknown` or `inactive` before resuming research.
+
 ## Rollback / kill switch
 
 - **Immediate:** set `DASHBOARD_COMMANDS_ENABLED=false` (UI) and pause new

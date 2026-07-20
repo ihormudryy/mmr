@@ -112,6 +112,7 @@ class DashboardState:
         self.proposals_terminal = _BoundedStore()
         self.orders_terminal = _BoundedStore()
         self.fills = _BoundedStore()
+        self.allocation_authorities: dict[str, dict] = {}
 
     def install_baseline(self, snapshot: SnapshotWithCursor, stream_id: str) -> None:
         for entity_type, rows in snapshot.entities.items():
@@ -265,6 +266,8 @@ class DashboardState:
             if evicted is not None:
                 self._retention_evicted = True
                 self._forget_revision_if_untracked("command", evicted)
+        elif entity_type == "allocation_authority":
+            self.allocation_authorities[entity_id] = row
         else:
             logger.warning("unknown entity_type %r ignored", entity_type)
 
@@ -287,6 +290,8 @@ class DashboardState:
             self.trading_control.pop(entity_id, None)
         elif entity_type == "command":
             self.commands.remove(entity_id)
+        elif entity_type == "allocation_authority":
+            self.allocation_authorities.pop(entity_id, None)
         if entity_type == "proposal":
             self.proposals_terminal.remove(entity_id)
         elif entity_type == "order":
@@ -340,6 +345,36 @@ class DashboardState:
             "reconciliation": list(self.reconciliation.values()),
             "trading_control": list(self.trading_control.values()),
             "commands": list(self.commands.values()),
+            "scaling": self._scaling_view(),
+        }
+
+    def _scaling_view(self) -> dict:
+        """Authoritative allocation/scaling read model — never infer green from absence."""
+        authorities = list(self.allocation_authorities.values())
+        if not authorities:
+            return {
+                "status": "unknown",
+                "message": "No allocation authority events received yet",
+                "authorities": [],
+            }
+        active = [
+            row for row in authorities
+            if str(row.get("event", "")).upper() in {"ISSUED", "ACTIVATED", "OVERRIDE"}
+        ]
+        if not active:
+            return {
+                "status": "inactive",
+                "message": "Allocation authorities present but none currently active",
+                "authorities": authorities,
+            }
+        latest = max(active, key=lambda r: int(r.get("entity_revision", 0)))
+        return {
+            "status": "active",
+            "stage": latest.get("stage"),
+            "max_gross_allocation": latest.get("max_gross_allocation"),
+            "expires_at": latest.get("expires_at"),
+            "event": latest.get("event"),
+            "authorities": authorities,
         }
 
     def ring_depth(self) -> int:
@@ -409,6 +444,8 @@ class DashboardState:
             return entity_id in self.trading_control
         elif entity_type == "command":
             return entity_id in self.commands
+        elif entity_type == "allocation_authority":
+            return entity_id in self.allocation_authorities
         return False
 
     def _forget_revision_if_untracked(self, entity_type: str, entity_id: str) -> None:

@@ -850,6 +850,8 @@ def activate_paper_automation(
     request: Request,
     session: str = Depends(require_command_auth),
 ):
+    # Always requires a preflight nonce (coordinator requires_preflight=True),
+    # in both paper and live — same session binding as activate_allocation.
     if body.preflight_nonce is None:
         raise CommandApiError(
             428, "PREFLIGHT_REQUIRED",
@@ -860,6 +862,7 @@ def activate_paper_automation(
         "strategy_name": body.strategy_name,
         "reason": body.reason,
         "preflight_nonce": body.preflight_nonce,
+        "session_fingerprint": session_fingerprint(session),
     })
     return _receipt_json(receipt)
 

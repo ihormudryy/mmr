@@ -915,6 +915,7 @@ class ActivatePaperAutomationRequest(BaseModel):
     strategy_name: str = Field(min_length=1)
     reason: str = Field(min_length=1, max_length=200)
     preflight_nonce: Optional[str] = None
+    session_fingerprint: Optional[str] = None
 
     @field_validator("command_id")
     @classmethod
@@ -1340,8 +1341,9 @@ def _activate_paper_automation_rpc_handler(
             target_id=parsed.strategy_name,
             expected_version=None,
             body={"strategy_name": parsed.strategy_name, "reason": parsed.reason},
-            source="operator",
+            source="dashboard",
             preflight_nonce=parsed.preflight_nonce,
+            session_fingerprint=parsed.session_fingerprint,
         )
         return _receipt_to_dict(coordinator.execute(request))
 

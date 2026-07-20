@@ -1069,6 +1069,9 @@ def test_activate_paper_automation_forwards_with_nonce(gateway):
     assert body["strategy_name"] == "orb"
     assert body["reason"] == "enable reviewed strategy"
     assert body["preflight_nonce"] == "n-paper"
+    # Nonce consume binds session fingerprint; omitting it made Activate
+    # always fail with PREFLIGHT_REQUIRED after a successful preflight.
+    assert body["session_fingerprint"]
 
 
 def test_deactivate_paper_automation_is_immediate(gateway):

@@ -367,6 +367,9 @@
       color: var(--dim);
       font-size: 11px;
     }
+    #dash-trading .info,
+    #dash-scaling .info,
+    #dash-guide .info,
     .dash-admin-pane .info {
       position: relative;
       display: inline-flex;
@@ -386,12 +389,21 @@
       vertical-align: middle;
       flex-shrink: 0;
     }
+    #dash-trading .info:hover,
+    #dash-trading .info:focus,
+    #dash-scaling .info:hover,
+    #dash-scaling .info:focus,
+    #dash-guide .info:hover,
+    #dash-guide .info:focus,
     .dash-admin-pane .info:hover,
     .dash-admin-pane .info:focus {
       color: var(--accent);
       border-color: var(--accent);
       outline: none;
     }
+    #dash-trading .tip,
+    #dash-scaling .tip,
+    #dash-guide .tip,
     .dash-admin-pane .tip {
       display: none;
       position: fixed;
@@ -1001,6 +1013,7 @@
     }
   </style>
 </head>
+{% macro info(text) %}<span class="info" tabindex="0" role="button" aria-label="More info">i<span class="tip">{{ text }}</span></span>{% endmacro %}
 <body data-degraded-after-ms="{{ degraded_after_ms }}"
       data-poll-interval-ms="{{ poll_interval_ms }}"
       data-commands-enabled="{{ 'true' if commands_enabled else 'false' }}">
@@ -1029,7 +1042,7 @@
   <div id="account-cards" aria-label="Account summary"></div>
   <main class="grid">
     <section id="positions-panel" aria-label="Positions">
-      <h2>Positions</h2>
+      <h2>Positions {{ info('Live holdings from IB. Unrealized P&amp;L vs average cost; Day P&amp;L since session start. Close starts an exit proposal — Approve still required.') }}</h2>
       <table>
         <thead><tr>
           <th>Instrument</th><th>Qty</th><th>Avg</th><th>Last</th><th>Ccy</th>
@@ -1041,22 +1054,23 @@
       </table>
     </section>
     <aside id="action-rail" aria-label="Pending proposals">
-      <h2>Action queue <span class="dim">(read-only)</span>
+      <h2>Action queue {{ info('PENDING proposals awaiting Approve or Reject. Nothing hits the broker until you Approve. New proposal asks for an exact conId (not a ticker) so the wrong exchange listing cannot be guessed.') }}
+        <span class="dim">(read-only)</span>
         {% if commands_enabled %}<button id="cc-open-proposal" type="button">
           New proposal</button>{% endif %}
       </h2>
       <div id="proposal-cards"></div>
     </aside>
     <div class="lower">
-      <section id="orders-panel"><h2>Working orders
+      <section id="orders-panel"><h2>Working orders {{ info('Open broker orders still working at IB. Cancel removes one; Cancel all clears every open order.') }}
         {% if commands_enabled %}<button id="cc-cancel-all-open"
                 type="button">Cancel all</button>{% endif %}</h2>
         <div id="order-groups"></div></section>
-      <section id="fills-panel"><h2>Recent executions</h2>
+      <section id="fills-panel"><h2>Recent executions {{ info('Fills that actually traded — time, side, qty, price, and commission.') }}</h2>
         <table><thead><tr><th>Time</th><th>Instrument</th><th>Side</th>
           <th>Qty</th><th>Price</th><th>Commission</th></tr></thead>
           <tbody id="fills-body"></tbody></table></section>
-      <section id="strategies-panel"><h2>Strategies
+      <section id="strategies-panel"><h2>Strategies {{ info('Live strategy_service rows. Enable/Disable here is immediate. Pause new trading blocks new exposure without unloading strategies. Full deploy/undeploy is on the Deploy tab.') }}
         {% if commands_enabled %}
         <div id="cc-pause-control" class="cc-pause">
           <button id="cc-pause-toggle" type="button"
@@ -1070,7 +1084,7 @@
           {% if commands_enabled %}<th data-cc-col="strategy-actions">Actions</th>{% endif %}
           </tr></thead>
           <tbody id="strategies-body"></tbody></table></section>
-      <section id="risk-panel"><h2>Risk &amp; reconciliation</h2>
+      <section id="risk-panel"><h2>Risk &amp; reconciliation {{ info('Authoritative risk projection: concentration, group budgets, and reconciliation warnings. Empty until the risk service publishes a projection.') }}</h2>
         <div id="risk-body" data-state="unavailable">Risk unavailable — waiting
           for an authoritative risk projection.</div></section>
     </div>
@@ -1079,7 +1093,7 @@
   <div id="dash-scaling" class="dash-pane" aria-label="Scaling and allocation">
     <main class="grid">
       <section id="scaling-panel">
-        <h2>Allocation &amp; scaling
+        <h2>Allocation &amp; scaling {{ info('Signed allocation ceilings for live capital. Prepare and sign offline with mmr research allocation prepare/sign, then paste the attestation here. Private keys never enter this browser. Suspend is risk-reducing and immediate.') }}
           <span id="scaling-lifecycle" class="scaling-status" data-lifecycle="unknown">unknown</span>
         </h2>
         <p id="scaling-message" class="scaling-note">Waiting for authoritative allocation events…</p>
@@ -1133,7 +1147,7 @@
         </table>
       </section>
       <section id="paper-auto-panel" aria-label="Paper automation">
-        <h2>Paper automation
+        <h2>Paper automation {{ info('Paper mode only. Writes keys, fixture artifact, and YAML for one strategy; restart trader and strategy services to arm. Needs command authority. Private keys never enter this browser.') }}
           <span id="paper-auto-lifecycle" class="scaling-status"
                 data-lifecycle="unknown">unknown</span>
         </h2>

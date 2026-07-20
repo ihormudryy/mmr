@@ -309,7 +309,7 @@
         <th>State {{ info('RUNNING: receiving bars and emitting signals. DISABLED: loaded but inactive. ERROR: failed to load or subscribe — check strategy_service logs.') }}</th>
         <th>Auto {{ info('off: signals are only recorded. propose: each signal creates a PENDING proposal you approve here. Full auto-execution is not supported.') }}</th>
         <th>Bar {{ info('Bar size the strategy consumes. It is evaluated once per newly completed bar of this size — matching how it was backtested — not on every tick.') }}</th>
-        <th>ConIds {{ info('IB contract IDs the strategy is subscribed to, with the resolved symbol. A conId identifies the exact instrument and exchange listing — verify with `mmr resolve SYMBOL` before changing config.') }}</th>
+        <th>ConIds {{ info('Explicit IB contract IDs when the strategy lists conids. universe:NAME means it is bound to a named watchlist/universe and follows that membership — not missing data. A blank (—) means neither conids nor universe is configured. Verify contracts with `mmr resolve SYMBOL` before changing config.') }}</th>
         <th>Actions {{ info('Enable/Disable applies immediately and persists across restarts. ▸ unfolds the parameter editor — saved values apply live (hot-swap) and persist to the YAML config.') }}</th>
       </tr></thead>
       <tbody>

@@ -1,4 +1,4 @@
-{% macro info(text) %}<span class="info" tabindex="0">i<span class="tip">{{ text }}</span></span>{% endmacro %}
+{% macro info(text) %}<span class="info" tabindex="0" role="button" aria-label="More info">i<span class="tip">{{ text }}</span></span>{% endmacro %}
 
 <div class="dash-admin-body">
   {% if flash %}<p class="banner{% if flash_err %} err{% endif %}">{{ flash }}</p>{% endif %}
@@ -6,7 +6,7 @@
 
   <section class="full">
     <h2>Deployed strategies
-      {{ info('Currently loaded by strategy_service. Enable puts a strategy RUNNING so it receives bars; Disable stops it without undeploying.') }}
+      {{ info('Currently loaded by strategy_service from strategy_runtime.yaml. Enable puts a strategy RUNNING so it receives bars; Disable stops it without undeploying.') }}
       <span class="chip on">{{ deployed_count }} loaded</span>
     </h2>
     <p class="note">Enter <strong>symbols</strong> (e.g. AAPL, MSFT) or pick a <strong>watchlist</strong> to deploy.
@@ -16,7 +16,12 @@
     {% if strategies %}
     <table>
       <thead><tr>
-        <th>Name</th><th>State</th><th>Auto</th><th>Bar</th><th>ConIds</th><th>Actions</th>
+        <th>Name {{ info('Hover a name for the strategy description (thesis + backtest provenance). The small text is the config name in strategy_runtime.yaml.') }}</th>
+        <th>State {{ info('RUNNING: receiving bars and emitting signals. DISABLED / INSTALLED: loaded but inactive. ERROR: failed to load or subscribe — check strategy_service logs. CONFIG: YAML fallback when strategy_service is unreachable.') }}</th>
+        <th>Auto {{ info('off (—): signals are only recorded. propose: each signal creates a PENDING proposal you approve on the Trading tab. Full auto-execution is not supported.') }}</th>
+        <th>Bar {{ info('Bar size the strategy consumes. It is evaluated once per newly completed bar of this size — matching how it was backtested — not on every tick.') }}</th>
+        <th>ConIds {{ info('Explicit IB contract IDs when the strategy lists conids. universe:NAME means it is bound to a named watchlist/universe and follows that membership — not missing data. A blank (—) means neither conids nor universe is configured. Verify contracts with mmr resolve SYMBOL before hardcoding.') }}</th>
+        <th>Actions {{ info('Enable/Disable applies immediately via strategy_service and persists across restarts. The global strategy cannot be toggled here.') }}</th>
       </tr></thead>
       <tbody>
       {% for s in strategies %}
@@ -61,11 +66,12 @@
     <table>
       <thead><tr>
         <th>Name {{ info('Hover for the class docstring.') }}</th>
-        <th>Class</th><th>File</th>
+        <th>Class {{ info('Python class name used by mmr backtest / strategies deploy.') }}</th>
+        <th>File {{ info('Source file under strategies/.') }}</th>
         <th>Mode {{ info('precompute: fast vectorized path — safe for 1-min backtests. on_prices: legacy per-bar path — O(N²) in backtests, fine live.') }}</th>
-        <th>Tunables {{ info('Parameters you can override per deployment (defaults shown).') }}</th>
-        <th>Status</th>
-        <th>Actions</th>
+        <th>Tunables {{ info('Parameters you can override per deployment (defaults shown). These are the --param knobs for backtests and editable params after deploying.') }}</th>
+        <th>Status {{ info('deployed: this class already appears in strategy_runtime.yaml. on disk: available to deploy.') }}</th>
+        <th>Actions {{ info('Deploy writes the strategy into strategy_runtime.yaml attached to your symbols or a watchlist, loads it immediately, and enables it. Tick propose so signals become PENDING proposals.') }}</th>
       </tr></thead>
       <tbody>
       {% for a in available_strategies %}

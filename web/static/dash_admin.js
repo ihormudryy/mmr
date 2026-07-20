@@ -32,13 +32,15 @@
   }
 
   function hideAdminTips() {
-    document.querySelectorAll('.dash-admin-pane .tip, #dash-guide .tip').forEach(function (t) {
-      t.style.display = 'none';
-    });
+    document.querySelectorAll(
+        '#dash-trading .tip, #dash-scaling .tip, #dash-guide .tip, .dash-admin-pane .tip')
+      .forEach(function (t) { t.style.display = 'none'; });
   }
 
   document.querySelectorAll(
-      '.dash-admin-pane .info, .dash-admin-pane .hover-tip, #dash-guide .info, #dash-guide .hover-tip')
+      '#dash-trading .info, #dash-scaling .info, ' +
+      '.dash-admin-pane .info, .dash-admin-pane .hover-tip, ' +
+      '#dash-guide .info, #dash-guide .hover-tip')
     .forEach(function (el) {
       var tip = el.querySelector('.tip');
       if (!tip) return;

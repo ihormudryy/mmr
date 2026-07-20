@@ -321,13 +321,26 @@ class TestDashboardRendering:
 
     def test_tooltips_present(self, client):
         html = client.get('/cc').text
-        assert html.count('class="info"') >= 4
+        assert html.count('class="info"') >= 10
         assert 'class="tip"' in html
+        assert 'Action queue' in html
+        assert 'Paper automation' in html
 
     def test_bar_and_conids_columns_have_tooltips(self, client):
         html = client.get('/cc').text
-        assert 'completed bar of this size' not in html  # legacy-only tip
+        assert 'universe:NAME' in html
         assert 'IB contract IDs' in html
+        assert 'evaluated once per newly completed bar' in html
+
+    def test_empty_conids_with_universe_display(self):
+        rows = webapp._normalize_strategy_rows([
+            {'name': 'u', 'state': 'RUNNING', 'conids': [], 'universe': 'my_etfs'},
+            {'name': 'c', 'state': 'RUNNING', 'conids': [265598], 'universe': 'ignored'},
+            {'name': 'n', 'state': 'RUNNING', 'conids': [], 'universe': None},
+        ])
+        assert rows[0]['conids'] == 'universe:my_etfs'
+        assert rows[1]['conids'] == '265598'
+        assert rows[2]['conids'] == ''
 
     def test_tooltips_use_viewport_positioning(self, client):
         """Tips must escape section overflow:hidden — fixed positioning with

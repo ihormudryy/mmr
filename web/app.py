@@ -543,10 +543,19 @@ def _normalize_strategy_rows(rows: list[dict], *, from_config: bool = False) -> 
         state = str(r.get('state') or ('CONFIG' if from_config else '')).upper()
         r['state'] = state
         r['enabled'] = state in _ENABLED_STATES
-        if isinstance(r.get('conids'), (list, tuple)):
-            r['conids'] = ', '.join(str(c) for c in r['conids'])
-        elif r.get('conids') is None and r.get('universe'):
-            r['conids'] = str(r['universe'])
+        # Live list_strategies always sends conids as a list (possibly empty).
+        # Empty list must still fall through to universe — otherwise universe-
+        # bound strategies show a blank ConIds cell (looks like missing data).
+        raw_conids = r.get('conids')
+        universe = r.get('universe')
+        if isinstance(raw_conids, (list, tuple)) and raw_conids:
+            r['conids'] = ', '.join(str(c) for c in raw_conids)
+        elif isinstance(raw_conids, str) and raw_conids.strip():
+            r['conids'] = raw_conids.strip()
+        elif universe:
+            r['conids'] = f'universe:{universe}'
+        else:
+            r['conids'] = ''
         r['display_name'] = _humanize_class_name(str(r.get('class_name') or '')) or r.get('name')
         if not isinstance(r.get('params'), dict):
             r['params'] = {}

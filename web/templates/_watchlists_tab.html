@@ -1,4 +1,4 @@
-{% macro info(text) %}<span class="info" tabindex="0">i<span class="tip">{{ text }}</span></span>{% endmacro %}
+{% macro info(text) %}<span class="info" tabindex="0" role="button" aria-label="More info">i<span class="tip">{{ text }}</span></span>{% endmacro %}
 
 <div class="dash-admin-body">
 
@@ -19,10 +19,10 @@
     {% if watchlists %}
     <table>
       <thead><tr>
-        <th>Name</th>
+        <th>Name {{ info('Universe name stored in DuckDB. Use this exact name when deploying a strategy to a watchlist.') }}</th>
         <th>Symbols {{ info('Members of this watchlist, resolved to exact IB contract IDs when added.') }}</th>
-        <th>Count</th>
-        <th>Actions</th>
+        <th>Count {{ info('Number of resolved instruments currently in the watchlist.') }}</th>
+        <th>Actions {{ info('Manage unfolds: add symbols (set exchange/currency for non-US), upload CSV, remove a symbol, or delete the watchlist.') }}</th>
       </tr></thead>
       <tbody>
       {% for w in watchlists %}

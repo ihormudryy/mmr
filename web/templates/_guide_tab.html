@@ -125,12 +125,12 @@
       <tbody>
         <tr><td>Account cards</td><td>Cash, equity, P&amp;L at a glance</td></tr>
         <tr><td>Positions {{ info('Close starts an exit proposal — Approve still required.') }}</td><td>What you hold; <strong>Close</strong> to exit</td></tr>
-        <tr><td>Action queue</td><td>Pending proposals; <strong>New proposal</strong>, Approve / Reject</td></tr>
-        <tr><td>Working orders</td><td>Open broker orders; Cancel or <strong>Cancel all</strong></td></tr>
-        <tr><td>Recent executions</td><td>Fills (what actually traded)</td></tr>
-        <tr><td>Strategies</td><td>Running algos; Enable / Disable</td></tr>
-        <tr><td>Pause new trading</td><td>Stop new exposure (Strategies header)</td></tr>
-        <tr><td>Risk</td><td>Warnings (concentration, etc.)</td></tr>
+        <tr><td>Action queue {{ info('Nothing hits the broker until Approve. New proposal needs an exact conId.') }}</td><td>Pending proposals; <strong>New proposal</strong>, Approve / Reject</td></tr>
+        <tr><td>Working orders {{ info('Open broker orders still working at IB.') }}</td><td>Open broker orders; Cancel or <strong>Cancel all</strong></td></tr>
+        <tr><td>Recent executions {{ info('Fills that actually traded.') }}</td><td>Fills (what actually traded)</td></tr>
+        <tr><td>Strategies {{ info('Live runtime rows; full deploy is on the Deploy tab.') }}</td><td>Running algos; Enable / Disable</td></tr>
+        <tr><td>Pause new trading {{ info('Blocks new exposure without unloading strategies.') }}</td><td>Stop new exposure (Strategies header)</td></tr>
+        <tr><td>Risk {{ info('Concentration, group budgets, reconciliation warnings.') }}</td><td>Warnings (concentration, etc.)</td></tr>
       </tbody>
     </table>
 

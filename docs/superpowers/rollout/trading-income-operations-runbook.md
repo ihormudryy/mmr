@@ -64,6 +64,47 @@ Compose mounts `~/.local/share/mmr/artifacts` read-only into `trader` and
 `strategy`. Do not enable `automation.enabled` until the synthetic automation
 drill is green **and** the manual IB paper soak (below) is recorded.
 
+Nested `automation:` (shown above) is the preferred user-config form; flat
+`automation_*` keys and env vars still override when present.
+
+## Hybrid mode (paper auto / live propose)
+
+Approved design: `docs/superpowers/specs/2026-07-20-hybrid-paper-auto-live-propose-design.md`.
+
+| Mode | Automation | Human approve |
+|------|------------|---------------|
+| **Paper** | One signed strategy → `execute_automated_intent` | Other strategies may use `auto_execute: propose` |
+| **Live** | `automation.enabled: false` (never `live_enabled`) | `auto_execute: propose` + `command_authority.live_enabled` |
+
+Rules operators must not violate:
+
+- **R1:** The automated strategy must not also set `auto_execute: propose`.
+- **R3:** Never set `automation.live_enabled: true` (startup refuses).
+- **R5:** Exactly one `automation.strategy_name`.
+
+### Bootstrap keys + fixture artifact
+
+Generates Ed25519 keys under `~/.config/mmr/keys/` (private `0o600`, public
+verify ring separate from private) and exports one fixture `PAPER_ELIGIBLE`
+bundle under `~/.local/share/mmr/artifacts/`. Prints the YAML snippets to paste.
+
+```bash
+python3 scripts/bootstrap_paper_automation.py --strategy-name YOUR_STRATEGY
+# overwrite keys only when intentional:
+python3 scripts/bootstrap_paper_automation.py --force --strategy-name YOUR_STRATEGY
+```
+
+Then enable **P1 command authority first** (automation still off), pass the P1
+IB-paper soak, then enable automation and pass the P3 soak:
+
+```bash
+python3 scripts/p1_release_gate.py --synthetic-only
+python3 scripts/p1_release_gate.py --ib-paper --watch-minutes 390   # XNYS RTH
+# after automation block is enabled with the bootstrap paths:
+python3 scripts/p3_release_gate.py --synthetic-only
+python3 scripts/p3_release_gate.py --ib-paper --watch-minutes 390
+```
+
 ## The release gate — two halves, both required
 
 Run the unified gate:

@@ -1864,6 +1864,7 @@ def build_production_registry(
             liquidation_service=command_stack.liquidation_service,
             canary_service=command_stack.canary_service,
             allocation_service=command_stack.allocation_service,
+            automated_intent_service=command_stack.automated_intent_service,
         )
         register_strategy_state_ingest(registry, command_stack.journal)
     elif command_coordinator is not None and proposal_service is not None and proposal_repository is not None:

@@ -92,7 +92,13 @@ class Trader():
                  typed_feed_port: int = 42103,
                  service_hmac_key_file: str = '',
                  unsafe_legacy_rpc: bool = False,
-                 command_authority: Optional[dict] = None):
+                 command_authority: Optional[dict] = None,
+                 automation_enabled: bool = False,
+                 automation_live_enabled: bool = False,
+                 automation_artifact_bundle_path: str = '',
+                 automation_public_key_ring_path: str = '',
+                 automation_expected_artifact_id: str = '',
+                 automation_strategy_name: str = ''):
         self.ib_server_address = ib_server_address
         self.ib_server_port = ib_server_port
         self.trading_runtime_ib_client_id = trading_runtime_ib_client_id
@@ -106,6 +112,12 @@ class Trader():
         self.universe_library = universe_library
         self.simulation: bool = simulation
         self.paper_trading = paper_trading
+        self.automation_enabled = bool(automation_enabled)
+        self.automation_live_enabled = bool(automation_live_enabled)
+        self.automation_artifact_bundle_path = automation_artifact_bundle_path or ''
+        self.automation_public_key_ring_path = automation_public_key_ring_path or ''
+        self.automation_expected_artifact_id = automation_expected_artifact_id or ''
+        self.automation_strategy_name = automation_strategy_name or ''
         # When True, `place_order_simple` (the direct buy/sell RPC path) is
         # rejected unless the caller explicitly sets `skip_risk_gate=True`
         # (close-all / liquidation). All actionable new trades must come

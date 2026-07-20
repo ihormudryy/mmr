@@ -201,3 +201,77 @@ def test_enabled_stack_attaches_recovery_components_to_trader(tmp_path):
     assert trader.automation_circuit_breaker is stack.circuit_breaker
     assert trader.semantic_readiness is stack.semantic_readiness
     assert stack.circuit_breaker.store.get().state == "CLEAR"
+    assert stack.automated_intent_service is None
+
+
+def _automation_key_ring(tmp_path):
+    from cryptography.hazmat.primitives.asymmetric import ed25519
+
+    from trader.research.signing import public_key_pem
+
+    keys = tmp_path / "keys"
+    keys.mkdir()
+    priv = ed25519.Ed25519PrivateKey.generate()
+    (keys / "verify.pem").write_bytes(public_key_pem(priv.public_key()))
+    return str(keys)
+
+
+def test_paper_automation_registers_execute_automated_intent(tmp_path):
+    from trader.trading.command_stack import build_command_stack
+
+    trader = _trader(tmp_path)
+    trader.automation_enabled = True
+    trader.automation_live_enabled = False
+    trader.automation_public_key_ring_path = _automation_key_ring(tmp_path)
+    trader.automation_artifact_bundle_path = str(tmp_path / "artifacts")
+    trader.automation_expected_artifact_id = "artifact-test-1"
+    (tmp_path / "artifacts").mkdir()
+
+    stack = build_command_stack(trader, _policy(), now=lambda: NOW)
+    assert stack is not None
+    assert stack.automated_intent_service is not None
+
+    registry = build_production_registry(
+        trader,
+        HmacServiceAuthenticator(b"k" * 32, now=lambda: 1_700_000_000.0),
+        snapshot_service=DomainSnapshotService(trader.domain_journal),
+        feed_service=DomainFeedService(trader.domain_journal),
+        command_stack=stack,
+    )
+    assert registry.contains("command", "execute_automated_intent")
+
+
+def test_automation_disabled_does_not_register_automated_intent(tmp_path):
+    from trader.trading.command_stack import build_command_stack
+
+    trader = _trader(tmp_path)
+    trader.automation_enabled = False
+    stack = build_command_stack(trader, _policy(), now=lambda: NOW)
+    registry = build_production_registry(
+        trader,
+        HmacServiceAuthenticator(b"k" * 32, now=lambda: 1_700_000_000.0),
+        snapshot_service=DomainSnapshotService(trader.domain_journal),
+        feed_service=DomainFeedService(trader.domain_journal),
+        command_stack=stack,
+    )
+    assert stack.automated_intent_service is None
+    assert not registry.contains("command", "execute_automated_intent")
+
+
+def test_automation_live_enabled_refused_at_stack_build(tmp_path):
+    from trader.trading.command_stack import (
+        CommandStackConfigurationError,
+        build_command_stack,
+    )
+
+    trader = _trader(tmp_path)
+    trader.automation_enabled = True
+    trader.automation_live_enabled = True
+    trader.automation_public_key_ring_path = _automation_key_ring(tmp_path)
+    trader.automation_artifact_bundle_path = str(tmp_path / "artifacts")
+    trader.automation_expected_artifact_id = "artifact-test-1"
+    (tmp_path / "artifacts").mkdir()
+
+    with pytest.raises(CommandStackConfigurationError) as exc:
+        build_command_stack(trader, _policy(), now=lambda: NOW)
+    assert exc.value.code == "AUTOMATION_LIVE_REFUSED"

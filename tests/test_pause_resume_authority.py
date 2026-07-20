@@ -238,6 +238,21 @@ def test_live_resume_nonce_is_bound_to_reason_revision_and_session(authority):
     assert a.controls.get("U111111").new_exposure_paused is True
 
 
+def test_preflight_activate_paper_automation_accepts_strategy_and_reason(authority):
+    a = authority()
+    ticket = _invoke(a.registry, "preflight_command", {
+        "command_id": "activate-paper-preflight",
+        "action": "activate_paper_automation",
+        "params": {"strategy_name": "orb_gld", "reason": "operator reviewed"},
+        "session_fingerprint": "session-fingerprint-one",
+    })
+    assert ticket["nonce"]
+    assert ticket["summary"]["side"] == "ACTIVATE_PAPER_AUTOMATION"
+    assert ticket["summary"]["instrument"] == "orb_gld"
+    assert ticket["summary"]["order_type"] == "PAPER_AUTOMATION"
+    assert "restart_required" in ticket["summary"]["warnings"][0]
+
+
 def test_browser_uses_split_routes_and_waits_for_authoritative_command_state():
     source = Path("web/static/command_center.js").read_text()
     assert "ccSubmitCommand('pause_trading'" in source

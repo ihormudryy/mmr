@@ -534,6 +534,7 @@ class PreflightCommandRequest(BaseModel):
         allowed = {
             "approve_proposal", "resume_trading", "cancel_order", "cancel_orders",
             "liquidate_account", "activate_live_canary", "activate_allocation",
+            "activate_paper_automation",
         }
         if value not in allowed:
             raise ValueError(f"action must be one of {sorted(allowed)}")
@@ -1496,6 +1497,34 @@ def _preflight_command_handler(
                 "warnings": [
                     "Allocation authority is re-verified in full (signature, policy, "
                     "expiry, revocation, exact bindings) again on submit.",
+                ],
+            })
+        elif parsed.action == "activate_paper_automation":
+            exact_params(params, {"strategy_name", "reason"})
+            strategy_name = str(params["strategy_name"]).strip()
+            reason = str(params["reason"]).strip()
+            if not strategy_name:
+                reject("strategy_name must not be blank")
+            if not reason:
+                reject("activation reason must not be blank")
+            request = CommandRequest(
+                command_id=parsed.command_id,
+                action=parsed.action,
+                account_id=account_id,
+                target_type="paper_automation",
+                target_id=strategy_name,
+                expected_version=None,
+                body={"strategy_name": strategy_name, "reason": reason},
+                source="dashboard",
+                session_fingerprint=parsed.session_fingerprint,
+            )
+            summary.update({
+                "side": "ACTIVATE_PAPER_AUTOMATION",
+                "instrument": strategy_name,
+                "order_type": "PAPER_AUTOMATION",
+                "warnings": [
+                    "Writes keys/artifact/YAML and returns restart_required; "
+                    "services must restart to arm IntentEmitter.",
                 ],
             })
         elif parsed.action == "cancel_order":

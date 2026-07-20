@@ -239,10 +239,17 @@ def test_rpc_round_trip_preserves_error_types():
             client.rpc().raise_custom()
     finally:
         client.close()
+        server = server_obj.get('server')
         loop = server_obj.get('loop')
-        if loop:
-            loop.call_soon_threadsafe(loop.stop)
+        if loop is not None:
+            def _shutdown():
+                if server is not None:
+                    server.close()
+                loop.stop()
+
+            loop.call_soon_threadsafe(_shutdown)
         t.join(timeout=3.0)
+        assert not t.is_alive(), 'RPC server thread did not stop after close'
 
 
 class TestSendNeverBlocksForever:

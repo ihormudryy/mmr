@@ -474,8 +474,10 @@ class TickData(Data):
             min_date = dateify(self.library.min_date(symbol=self._to_symbol(contract)), timezone=self.zone)
             max_date = dateify(self.library.max_date(symbol=self._to_symbol(contract)), timezone=self.zone)
         except ValueError:
-            return (dateify(dt.datetime(1970, 1, 1), timezone=self.zone),
-                    dateify(dt.datetime(1970, 1, 1), timezone=self.zone))
+            # Use dt.date so dateify attaches the zone without converting a
+            # naive local datetime (which shifts 1970-01-01 to 1969-12-31 in NY).
+            return (dateify(dt.date(1970, 1, 1), timezone=self.zone),
+                    dateify(dt.date(1970, 1, 1), timezone=self.zone))
         return (min_date, max_date)
 
     def summary(
@@ -491,8 +493,10 @@ class TickData(Data):
             max_date = self.library.max_date(symbol=self._to_symbol(contract))
         except ValueError:
             empty_series = pd.Series(dtype='float64')
-            return (dateify(dt.datetime(1970, 1, 1), self.zone),
-                    dateify(dt.datetime(1970, 1, 1), self.zone),
+            # Use dt.date so dateify attaches the zone without converting a
+            # naive local datetime (which shifts 1970-01-01 to 1969-12-31 in NY).
+            return (dateify(dt.date(1970, 1, 1), self.zone),
+                    dateify(dt.date(1970, 1, 1), self.zone),
                     empty_series, empty_series)
         min_date_range = DateRange(min_date, min_date)
         max_date_range = DateRange(max_date, max_date + dt.timedelta(days=1))

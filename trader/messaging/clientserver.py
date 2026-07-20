@@ -548,10 +548,28 @@ class RPCServer(Generic[T]):
             logging.exception(f"RPCServer failed to send response: {exc}")
 
     def close(self):
-        if self._serve_task:
+        """Stop serving and release ZMQ resources.
+
+        Closes the socket with LINGER=0 before terminating the context so
+        ``ctx.term()`` cannot block waiting for an open socket — the same
+        hang that wedges pytest when a leaked Context is later GC'd.
+        Safe to call more than once.
+        """
+        if self._serve_task is not None:
             self._serve_task.cancel()
-        if self.socket:
-            self.socket.close()
+            self._serve_task = None
+        if self.socket is not None:
+            try:
+                self.socket.close(linger=0)
+            except Exception:
+                pass
+            self.socket = None
+        if self.ctx is not None:
+            try:
+                self.ctx.term()
+            except Exception:
+                pass
+            self.ctx = None
 
 
 # ---------------------------------------------------------------------------
@@ -655,8 +673,27 @@ class RPCClient(Generic[T]):
             return future
 
     def close(self):
-        if self.socket:
-            self.socket.close()
+        """Drop the DEALER socket and terminate the ZMQ context.
+
+        LINGER=0 first so ``ctx.term()`` returns immediately. Without an
+        explicit ``term()``, a later Context ``__del__`` can block forever
+        if any socket is still open — hanging unrelated tests during GC.
+        Safe to call more than once.
+        """
+        with self._lock:
+            if self.socket is not None:
+                try:
+                    self.socket.close(linger=0)
+                except Exception:
+                    pass
+                self.socket = None
+            self.is_setup = False
+            if self.ctx is not None:
+                try:
+                    self.ctx.term()
+                except Exception:
+                    pass
+                self.ctx = None
 
 
 # ---------------------------------------------------------------------------

@@ -358,7 +358,8 @@ def test_replayed_request_is_rejected_over_the_wire(typed_servers, client_authen
     assert second["ok"] is False
     assert second["problem"]["code"] == "REPLAY_ERROR"
 
-    sock.close()
+    sock.close(linger=0)
+    ctx.term()
 
 
 # ---------------------------------------------------------------------------
@@ -395,7 +396,8 @@ def test_wire_format_is_plain_json_and_response_is_signed(typed_servers):
     with pytest.raises(AuthenticationError):
         auth.verify_response(tampered)
 
-    sock.close()
+    sock.close(linger=0)
+    ctx.term()
 
 
 def test_bad_request_signature_over_the_wire_yields_authentication_error(typed_servers):
@@ -416,7 +418,8 @@ def test_bad_request_signature_over_the_wire_yields_authentication_error(typed_s
     response = TypedRpcResponse.model_validate(payload)
     auth.verify_response(response)
 
-    sock.close()
+    sock.close(linger=0)
+    ctx.term()
 
 
 def test_client_rejects_a_response_signed_with_the_wrong_key(typed_servers):

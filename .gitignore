@@ -6,9 +6,12 @@ __pycache__/
 .ipynb_checkpoints/
 .vscode/
 .devcontainer/
+.idea/
+.superpowers/
 
 *.csv
 *.tar*
+.env.bak-*
 
 scratch/
 .trader.history

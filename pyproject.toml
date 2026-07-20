@@ -102,6 +102,10 @@ include = ["trader*", "web*"]
 testpaths = ["tests"]
 python_files = ["test_*.py"]
 python_functions = ["test_*"]
+# Default per-test budget so a leaked ZMQ Context.term() (or similar C-level
+# block) fails the test instead of wedging the whole suite forever.
+timeout = 30
+timeout_method = "signal"
 
 [tool.isort]
 multi_line_output = 3

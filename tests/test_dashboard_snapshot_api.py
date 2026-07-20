@@ -170,6 +170,40 @@ class TestSnapshotApi:
             assert second["sequence"] == body["sequence"] + 1
             assert second["positions"][0]["quantity"] == 77
 
+    @pytest.mark.asyncio
+    async def test_snapshot_includes_paper_automation_status(self, client, cc):
+        class QueryClient:
+            def call(self, method, body, response_model, timeout=None):
+                assert (method, body, response_model) == (
+                    "get_paper_automation_status", {}, dict)
+                assert timeout is not None
+                return {"enabled": True, "strategy_name": "orb",
+                        "restart_required": True}
+
+        _seed(cc)
+        cc._query_client = QueryClient()
+        async with client as c:
+            await _login(c)
+            body = (await c.get("/api/snapshot")).json()
+        assert body["paper_automation"] == {
+            "enabled": True, "strategy_name": "orb", "restart_required": True,
+        }
+
+    @pytest.mark.asyncio
+    async def test_snapshot_degrades_when_paper_automation_query_unavailable(
+            self, client, cc):
+        class UnavailableQueryClient:
+            def call(self, method, body, response_model, timeout=None):
+                raise ConnectionError("typed query socket unavailable")
+
+        _seed(cc)
+        cc._query_client = UnavailableQueryClient()
+        async with client as c:
+            await _login(c)
+            response = await c.get("/api/snapshot")
+        assert response.status_code == 200
+        assert response.json()["paper_automation"] is None
+
 
 class TestEventsEndpoint:
     @pytest.mark.asyncio

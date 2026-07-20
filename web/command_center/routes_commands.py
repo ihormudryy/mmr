@@ -448,7 +448,7 @@ class ClosePositionBody(BaseModel):
 # pass-through to the coordinator.
 _PREFLIGHT_ACTIONS = (
     "approve_proposal", "resume_trading", "cancel_order", "cancel_orders",
-    "activate_allocation",
+    "activate_allocation", "activate_paper_automation",
 )
 
 
@@ -718,6 +718,24 @@ class SuspendAllocationBody(BaseModel):
     reason: str = Field(min_length=1, max_length=200)
 
 
+class ActivatePaperAutomationBody(BaseModel):
+    """Prepare restart-required paper automation configuration."""
+
+    model_config = ConfigDict(extra="forbid")
+    command_id: str = _COMMAND_ID
+    strategy_name: str = Field(min_length=1)
+    reason: str = Field(min_length=1, max_length=200)
+    preflight_nonce: str | None = None
+
+
+class DeactivatePaperAutomationBody(BaseModel):
+    """Persist paper automation disablement; no preflight is required."""
+
+    model_config = ConfigDict(extra="forbid")
+    command_id: str = _COMMAND_ID
+    reason: str = Field(min_length=1, max_length=200)
+
+
 @router.post("/api/commands/strategies/{strategy_name}/enable")
 def enable_strategy(strategy_name: str, body: StrategyControlBody, request: Request,
                     session: str = Depends(require_command_auth)):
@@ -826,14 +844,49 @@ def suspend_allocation(body: SuspendAllocationBody, request: Request,
     return _receipt_json(receipt)
 
 
+@router.post("/api/commands/paper-automation/activate")
+def activate_paper_automation(
+    body: ActivatePaperAutomationBody,
+    request: Request,
+    session: str = Depends(require_command_auth),
+):
+    if body.preflight_nonce is None:
+        raise CommandApiError(
+            428, "PREFLIGHT_REQUIRED",
+            "activate_paper_automation requires a preflight nonce",
+        )
+    receipt = _gateway(request).execute("activate_paper_automation", {
+        "command_id": body.command_id,
+        "strategy_name": body.strategy_name,
+        "reason": body.reason,
+        "preflight_nonce": body.preflight_nonce,
+    })
+    return _receipt_json(receipt)
+
+
+@router.post("/api/commands/paper-automation/deactivate")
+def deactivate_paper_automation(
+    body: DeactivatePaperAutomationBody,
+    request: Request,
+    session: str = Depends(require_command_auth),
+):
+    receipt = _gateway(request).execute("deactivate_paper_automation", {
+        "command_id": body.command_id,
+        "reason": body.reason,
+    })
+    return _receipt_json(receipt)
+
+
 @router.post("/api/preflight")
 def preflight(body: PreflightBody, request: Request,
              session: str = Depends(require_command_auth)):
     flags: CommandFlags = request.app.state.command_flags
-    # activate_allocation always needs a nonce (even paper). Other preflight
-    # actions are live-ceremony only and stay behind the live-commands flag.
+    # Allocation and paper-automation activation always need a nonce, even on
+    # paper. Other preflight actions are live-only.
     if (not flags.live_commands_enabled
-            and body.action != "activate_allocation"):
+            and body.action not in {
+                "activate_allocation", "activate_paper_automation",
+            }):
         raise CommandApiError(403, "LIVE_COMMANDS_DISABLED",
                               "live commands are disabled "
                               "(DASHBOARD_LIVE_COMMANDS_ENABLED=false)")

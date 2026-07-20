@@ -94,6 +94,11 @@ COMMAND_ROUTES = [
       "reason": "scale", "preflight_nonce": "n-1"}),
     ("POST", "/api/commands/allocation/suspend",
      {"command_id": CMD_ID, "reason": "drawdown"}),
+    ("POST", "/api/commands/paper-automation/activate",
+     {"command_id": CMD_ID, "strategy_name": "orb", "reason": "enable",
+      "preflight_nonce": "n-paper"}),
+    ("POST", "/api/commands/paper-automation/deactivate",
+     {"command_id": CMD_ID, "reason": "operator stop"}),
 ]
 
 

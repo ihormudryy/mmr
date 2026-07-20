@@ -14,6 +14,8 @@ logger = logging.getLogger("web.command_center.routes")
 
 SSE_PING_SECONDS = 10
 MANAGE_PAGE_TIMEOUT_S = float(os.environ.get('MMR_MANAGE_PAGE_TIMEOUT_S', '12'))
+PAPER_AUTOMATION_QUERY_TIMEOUT_S = float(
+    os.environ.get("MMR_PAPER_AUTOMATION_QUERY_TIMEOUT_S", "1"))
 
 
 def create_read_router(cc, templates, manage_context_provider=None,
@@ -41,6 +43,19 @@ def create_read_router(cc, templates, manage_context_provider=None,
         if not cc.state.has_baseline:
             return JSONResponse({"detail": "snapshot not ready"}, status_code=503)
         view = cc.state.snapshot_view()
+        view["paper_automation"] = None
+        query_client = getattr(cc, "_query_client", None)
+        if query_client is not None:
+            try:
+                view["paper_automation"] = await asyncio.to_thread(
+                    query_client.call,
+                    "get_paper_automation_status",
+                    {},
+                    dict,
+                    timeout=PAPER_AUTOMATION_QUERY_TIMEOUT_S,
+                )
+            except Exception as exc:  # noqa: BLE001 - optional read-model enrichment
+                logger.debug("paper automation status unavailable: %s", exc)
         view["health"] = cc.bridge.health() if cc.bridge else {
             "lifecycle": "starting", "reconnects": 0, "cursor": None, "sources": {}}
         return JSONResponse(view)

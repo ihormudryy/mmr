@@ -1042,3 +1042,54 @@ def test_allocation_routes_disabled_returns_403_before_gateway(gateway):
         assert r.status_code == 403
         assert r.json()["code"] == "COMMANDS_DISABLED"
     assert gateway.calls == []
+
+
+def test_activate_paper_automation_requires_preflight_nonce(gateway):
+    client = make_client(gateway)
+    r = client.post("/api/commands/paper-automation/activate",
+                    json={"command_id": CMD_ID, "strategy_name": "orb",
+                          "reason": "enable reviewed strategy"},
+                    headers=HEADERS)
+    assert r.status_code == 428
+    assert r.json()["code"] == "PREFLIGHT_REQUIRED"
+    assert gateway.calls == []
+
+
+def test_activate_paper_automation_forwards_with_nonce(gateway):
+    client = make_client(gateway)
+    r = client.post("/api/commands/paper-automation/activate",
+                    json={"command_id": CMD_ID, "strategy_name": "orb",
+                          "reason": "enable reviewed strategy",
+                          "preflight_nonce": "n-paper"},
+                    headers=HEADERS)
+    assert r.status_code == 202
+    method, body = gateway.calls[0]
+    assert method == "activate_paper_automation"
+    assert body["command_id"] == CMD_ID
+    assert body["strategy_name"] == "orb"
+    assert body["reason"] == "enable reviewed strategy"
+    assert body["preflight_nonce"] == "n-paper"
+
+
+def test_deactivate_paper_automation_is_immediate(gateway):
+    client = make_client(gateway)
+    r = client.post("/api/commands/paper-automation/deactivate",
+                    json={"command_id": CMD_ID, "reason": "operator stop"},
+                    headers=HEADERS)
+    assert r.status_code == 202
+    assert gateway.calls == [("deactivate_paper_automation", {
+        "command_id": CMD_ID, "reason": "operator stop",
+    })]
+
+
+def test_preflight_allows_paper_automation_activation_without_live_commands(gateway):
+    client = make_client(gateway)
+    r = client.post("/api/preflight",
+                    json={"command_id": CMD_ID,
+                          "action": "activate_paper_automation",
+                          "params": {"strategy_name": "orb",
+                                     "reason": "enable reviewed strategy"}},
+                    headers=HEADERS)
+    assert r.status_code == 200
+    assert gateway.calls[0][0] == "preflight_command"
+    assert gateway.calls[0][1]["action"] == "activate_paper_automation"

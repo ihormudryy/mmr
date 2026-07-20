@@ -474,7 +474,7 @@ User configs live in `~/.config/mmr/` (auto-copied from `config_defaults/` on fi
 
 | File | Purpose |
 |------|---------|
-| `trader.yaml` | IB connection, DuckDB path, ZMQ/typed ports, `default_data_source`, API keys |
+| `trader.yaml` | IB connection, DuckDB path, ZMQ/typed ports, `default_data_source`, `unsafe_legacy_rpc`, API keys |
 | `position_sizing.yaml` | Base size, risk level, ATR params, hard limits |
 | `trading_filters.yaml` | Symbol/exchange denylist and allowlist |
 | `strategy_runtime.yaml` | Strategy definitions (module, class, conids, bar_size) |
@@ -507,24 +507,25 @@ mmr/
 │   ├── strategy_service.py        # Strategy runtime entry point
 │   ├── data_service.py            # Data service entry point
 │   ├── mmr_cli.py                 # CLI REPL (80+ commands)
-│   ├── sdk.py                     # ZMQ RPC client wrapper
+│   ├── sdk.py                     # Typed HMAC + local stores (CLI wrapper)
 │   ├── container.py               # DI container
 │   ├── config.py                  # Typed config dataclasses
 │   ├── objects.py                 # Domain enums (Action, BarSize, etc.)
 │   ├── common/                    # Logging, helpers, RxPY utilities
 │   ├── data/                      # DuckDB stores, universe, market data
-│   ├── listeners/                 # IB + Massive.com data adapters
-│   ├── messaging/                 # ZMQ RPC, PubSub, MessageBus
+│   ├── listeners/                 # IB + Massive + TwelveData adapters
+│   ├── messaging/                 # Typed HMAC RPC, legacy dill RPC, PubSub, MessageBus
 │   ├── trading/                   # Runtime, executioner, risk, sizing, proposals
 │   ├── strategy/                  # Strategy runtime
 │   ├── simulation/                # Backtester + statistical-confidence tests + lookahead checker
 │   └── tools/                     # Idea scanner, depth chart, options chain
+├── web/                           # FastAPI dashboard + command center
 ├── strategies/                    # User strategy implementations
-├── config_defaults/                       # Bundled defaults
+├── config_defaults/               # Bundled defaults (copied to ~/.config/mmr/ on first run)
 ├── skills/                        # Claude skills (mmr, mmr-loop, news)
 ├── CLAUDE.md                      # Claude Code context (architecture, commands, workflows)
 ├── tests/                         # pytest suite (no IB required)
-├── docker-compose.yml             # Split services: ib-gateway, trader, strategy, data, dashboard, scheduler
+├── docker-compose.yml             # Split: ib-gateway, trader, strategy, data, dashboard, scheduler
 ├── Dockerfile                     # Debian bookworm, Python 3.12
 ├── docker.sh                      # Build/up/exec/backup helper (immutable images; rebuild after code changes)
 ├── start_mmr.sh                   # Local non-Docker startup (tmux + health checks)
@@ -538,7 +539,7 @@ The interpreter is pinned to exactly **Python 3.12.13** via `.python-version` �
 ```bash
 uv sync --python 3.12.13 --frozen --extra test
 uv run --frozen --extra test pytest tests/ --timeout=30 -q --ignore=tests/test_ibrx_async.py
-# → 880 passed
+# Prefer the live pytest summary — suite size drifts (~3600+ collected)
 ```
 
 All tests are unit tests using temporary DuckDB databases — no IB connection required.
@@ -549,14 +550,15 @@ Coverage highlights:
 
 - **Core logic:** `test_backtester*`, `test_backtest_stats`, `test_backtest_params`, `test_backtest_store`, `test_sweep`, `test_position_sizing`, `test_portfolio_risk`, `test_risk_gate`, `test_idea_scanner`
 - **Stores:** `test_duckdb_store` (including concurrent-writer), `test_event_store`, `test_proposal_store` (state machine), `test_position_groups`
-- **Messaging:** `test_clientserver_rpc` (error-type preservation, dill policy, threaded round-trip)
-- **Runtime:** `test_trading_runtime` (PnL race, portfolio routing, bracket rollback), `test_executioner` (filter + gate rejection paths), `test_strategy_runtime_reconcile` (sandbox, `yaml.safe_load`, partial-write mtime recovery)
-- **Integration:** `test_propose_approve_integration` (end-to-end propose → approve → execute, plus failure paths)
-- **Correctness:** `test_backtester.py::test_no_lookahead_fill_at_next_bar_open` hand-crafts bars that prove fills come from bar `t+1`'s open, not bar `t`'s close
+- **Messaging:** `test_clientserver_rpc`, `test_production_rpc_security`, typed/CLI surface coverage in `test_sdk`
+- **Runtime:** `test_trading_runtime`, `test_executioner`, `test_strategy_runtime_reconcile`
+- **Dashboard:** `test_web_dashboard` (command center, deploy, auth gates)
+- **Integration:** `test_propose_approve_integration`
+- **Correctness:** `test_backtester.py::test_no_lookahead_fill_at_next_bar_open`
 
 ## Dependencies
 
-Core: `ib_async`, `duckdb`, `pyzmq`, `msgpack`, `reactivex`, `pandas`, `numpy`, `pyarrow`, `rich`, `massive` (Polygon.io), `scikit-learn`, `vectorbt`, `exchange-calendars`, `matplotlib`
+Core: `ib_async`, `duckdb`, `pyzmq`, `msgpack`, `reactivex`, `pandas`, `numpy`, `pyarrow`, `rich`, `massive` (Polygon.io), `twelvedata`, `fastapi`, `scikit-learn`, `vectorbt`, `exchange-calendars`, `matplotlib`
 
 Full list in `pyproject.toml`. Install with `pip install -e .`
 

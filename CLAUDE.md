@@ -119,9 +119,9 @@ mmr/
 ├── pycron/pycron.py           # Process manager / scheduler
 │
 ├── config_defaults/           # Template defaults (copied to ~/.config/mmr/ on first run only; edits here don't affect a running system)
-│   ├── trader.yaml            # IB connection, ZMQ ports, DuckDB path
-│   ├── pycron.yaml            # Service job definitions (Docker mode)
-│   ├── no_docker_pycron.yaml  # Service job definitions (non-Docker)
+│   ├── trader.yaml            # IB, typed/legacy ports, DuckDB, data source defaults
+│   ├── pycron.yaml            # Scheduler cron jobs (split Docker)
+│   ├── no_docker_pycron.yaml  # All-in-one process manager (non-Docker)
 │   ├── strategy_runtime.yaml  # Strategy definitions
 │   ├── position_sizing.yaml   # Position sizing defaults (base size, risk level, limits)
 │   ├── trading_filters.yaml   # Trading filter config (denylist, allowlist, exchanges)
@@ -133,7 +133,7 @@ mmr/
 │   ├── strategy_service.py    # Entry point: strategy runtime
 │   ├── data_service.py        # Entry point: data download service (RPC + direct)
 │   ├── mmr_cli.py             # Entry point: CLI REPL (argparse + prompt_toolkit)
-│   ├── sdk.py                 # SDK used by mmr_cli (ZMQ RPC client wrapper)
+│   ├── sdk.py                 # SDK used by mmr_cli (typed HMAC + local stores)
 │   ├── __main__.py            # python -m trader support
 │   ├── container.py           # DI container (Singleton, YAML + env var resolution)
 │   ├── config.py              # Typed config dataclasses (IBConfig, StorageConfig, ZMQConfig)
@@ -161,9 +161,14 @@ mmr/
 │   │   ├── ibreactive.py      # IBAIORx: RxPY wrapper around ib_async
 │   │   ├── ib_history_worker.py
 │   │   ├── massive_history.py # Massive.com REST history worker
-│   │   └── massive_reactive.py # Massive.com WebSocket streaming
+│   │   ├── massive_reactive.py # Massive.com WebSocket streaming
+│   │   ├── twelvedata_history.py
+│   │   └── twelvedata_reactive.py
 │   ├── messaging/
-│   │   ├── clientserver.py    # ZMQ RPC, PubSub, MessageBus
+│   │   ├── typed_rpc.py       # Typed HMAC RPC (production CLI/dashboard)
+│   │   ├── production_api.py  # Production query/command registries
+│   │   ├── cli_surface.py     # CLI-facing typed handlers
+│   │   ├── clientserver.py    # Legacy dill RPC, PubSub, MessageBus
 │   │   ├── trader_service_api.py
 │   │   ├── strategy_service_api.py
 │   │   └── data_service_api.py
@@ -187,7 +192,7 @@ mmr/
 │   │   ├── backtest_stats.py  # PSR, t-test, bootstrap CI, skew/kurt, MC streak — "is this real?"
 │   │   └── lookahead_check.py # assert_no_lookahead walk-forward consistency check
 │   └── tools/                 # Importable scripts (moved from scripts/)
-│       ├── idea_scanner.py    # IdeaScanner (Massive) + IBIdeaScanner (IB international)
+│       ├── idea_scanner.py    # Massive + TwelveData + IBIdeaScanner
 │       ├── depth_chart.py     # Market depth chart (PNG) + Rich table rendering
 │       ├── chain.py           # Options chain analysis
 │       ├── trader_check.py    # Service health check
@@ -210,29 +215,22 @@ mmr/
 ├── tests/                     # Test suite (pytest)
 │   ├── conftest.py            # Shared fixtures (DuckDB, strategies, OHLCV data)
 │   ├── test_backtester.py
-│   ├── test_book.py
-│   ├── test_config.py
-│   ├── test_container.py
-│   ├── test_duckdb_store.py
-│   ├── test_event_store.py
-│   ├── test_depth.py          # 19 tests: depth chart PNG rendering, Rich table output
-│   ├── test_idea_scanner.py   # 123 tests: presets, indicators, IB scanner, tickers path, fundamentals, news
-│   ├── test_portfolio.py
-│   ├── test_position_sizing.py # 90 tests: sizing, confidence, risk, volatility/ATR, liquidity, resize deltas
-│   ├── test_position_groups.py # 22 tests: group store CRUD, member management
-│   ├── test_portfolio_risk.py  # 18 tests: concentration, HHI, group budgets, correlation, warnings
-│   ├── test_proposal.py
-│   ├── test_proposal_store.py
-│   ├── test_risk_gate.py
+│   ├── test_idea_scanner.py
+│   ├── test_position_sizing.py
+│   ├── test_portfolio_risk.py
 │   ├── test_sdk.py
-│   ├── test_serialization.py
-│   ├── test_strategy.py
-│   └── test_trading_filter.py
+│   ├── test_production_rpc_security.py
+│   ├── test_web_dashboard.py
+│   └── ...                    # plus stores, runtime, sweeps, propose/approve, etc.
+
+├── web/                       # FastAPI dashboard + command center (typed RPC only)
+│   ├── app.py
+│   └── command_center/        # Read UI, SSE, approve/reject/cancel bridge
 │
 ├── Dockerfile                 # Debian bookworm + Python venv
-├── docker-compose.yml         # IB Gateway sidecar + MMR container
+├── docker-compose.yml         # Split: ib-gateway, trader, strategy, data, dashboard, scheduler
 ├── docker.sh                  # Docker/Podman build/deploy helper
-├── start_mmr.sh               # Startup script (tmux + pycron)
+├── start_mmr.sh               # Local (non-split) startup — tmux + pycron
 └── pyproject.toml             # Package config, dependencies, entry points
 ```
 
@@ -384,7 +382,7 @@ news AAPL                                    # News for a ticker
 news AAPL --limit 20                         # More articles
 news AAPL --source benzinga                  # Benzinga source
 news AAPL --detail                           # Full details + sentiment
-movers                           # Top stock gainers (default)
+movers                           # Defaults to Massive; same entitlement rules as ideas
 movers --market crypto           # Crypto gainers
 movers --market indices          # Index gainers
 movers --losers                  # Stock losers
@@ -396,12 +394,9 @@ scan hot-volume                  # Hot by volume change
 scan --scan-code HIGH_OPT_VOLUME # Raw IB scanner code
 scan gainers --above-price 10 --num 30  # Filtered
 scan --instrument ETF --location STK.US  # ETFs
-ideas                                        # Momentum scan (default, US/Massive)
-ideas gap-up                                 # Gap-up preset
-ideas mean-reversion                         # Mean-reversion preset
-ideas breakout                               # Breakout preset
-ideas gap-down                               # Gap-down preset
-ideas volatile                               # Volatile/scalping preset
+ideas                                        # Momentum (default Massive; Basic → TD quote fallback)
+ideas gap-up / mean-reversion / breakout / gap-down / volatile
+ideas --source twelvedata --tickers AAPL MSFT NVDA AMD  # TwelveData quotes path
 ideas momentum --tickers AAPL MSFT AMD NVDA  # Scan specific tickers
 ideas momentum --universe sp500              # Scan a universe
 ideas gap-up --min-price 10                  # Override preset filter
@@ -412,7 +407,7 @@ ideas momentum --fundamentals                # Enrich with financial ratios (PE,
 ideas momentum --news                        # Enrich with latest news headline + sentiment
 ideas mean-reversion --news --fundamentals   # Full picture: technicals + fundamentals + news
 ideas gap-up -t AAPL MSFT --fundamentals     # Specific tickers with fundamentals
-ideas momentum --location STK.AU.ASX --tickers BHP CBA CSL  # ASX via IB
+ideas momentum --location STK.AU.ASX --tickers BHP CBA CSL  # ASX via IB (legacy path)
 ideas mean-reversion --location STK.AU.ASX --tickers BHP CBA --detail  # ASX with enrichment
 ideas gap-up --location STK.HK.SEHK --tickers 0700 0005     # Hong Kong via IB
 propose AMD BUY --market --quantity 100 --bracket 180 150 --reasoning "Breakout above resistance"
@@ -423,7 +418,7 @@ proposals                                    # List pending proposals
 proposals --all                              # All statuses
 proposals --status EXECUTED                  # Filter by status
 proposals show 3                             # Full detail for proposal #3
-approve 3                                    # Execute proposal #3 (requires trader_service)
+approve 3                                    # Execute proposal #3 (typed RPC 42102)
 reject 3 --reason "Changed thesis"           # Reject proposal #3
 group list                                   # List groups with members + allocation
 group create mining --budget 20              # Create group with 20% max allocation
@@ -529,7 +524,7 @@ User configs live in `~/.config/mmr/`. On first run, bundled defaults from `conf
 
 **`~/.config/mmr/logging.yaml`**: Python logging config (Rich console handler + rotating file handlers).
 
-**`.env`** (gitignored): IB Gateway credentials (TWS_USERID, TWS_PASSWORD, TRADING_MODE, IB_ACCOUNT).
+**`.env`** (gitignored): IB Gateway credentials (`TWS_USERID`, `TWS_PASSWORD`, `TRADING_MODE`, `IB_ACCOUNT`) plus `MMR_HMAC_SECRET` for typed RPC service auth in split Docker.
 
 ## Logging
 
@@ -552,19 +547,19 @@ Logs are written to `~/.local/share/mmr/logs/` with per-session timestamps (e.g.
 
 ## Dependencies
 
-Key packages: `ib_async`, `duckdb`, `pyzmq`, `msgpack`, `reactivex`, `pandas`, `numpy`, `pyarrow`, `dill`, `rich`, `backoff`, `psutil`, `exchange-calendars`, `massive`.
+Key packages: `ib_async`, `duckdb`, `pyzmq`, `msgpack`, `reactivex`, `pandas`, `numpy`, `pyarrow`, `dill`, `rich`, `backoff`, `psutil`, `exchange-calendars`, `massive`, `twelvedata`, `fastapi` (dashboard).
 
 Python >= 3.12. Install: `pip install -e .` or `pip install -r requirements.txt`
 
 ## Testing
 
-Tests use pytest with shared fixtures in `tests/conftest.py`. All tests are unit tests that use temporary DuckDB databases (no IB connection required). The suite currently runs **1059 tests in ~48s** with zero failures:
+Tests use pytest with shared fixtures in `tests/conftest.py`. All tests are unit tests that use temporary DuckDB databases (no IB connection required). The suite is large (~3600+ collected, and growing):
 
 ```bash
 pytest tests/ --timeout=30 -q --ignore=tests/test_ibrx_async.py
 ```
 
-`test_ibrx_async.py` is excluded because it spins up long-lived asyncio tasks that interact with a mocked ib_async event loop; it works in isolation but flakes in the full suite.
+`test_ibrx_async.py` is excluded because it spins up long-lived asyncio tasks that interact with a mocked ib_async event loop; it works in isolation but flakes in the full suite. Prefer the live pytest summary over any count in this file.
 
 Fixtures include edge-case OHLCV shapes (`ohlcv_with_gaps`, `ohlcv_high_volatility`, `ohlcv_zero_volume`, `ohlcv_halted`) in addition to the clean `sample_ohlcv`. Use the edge-case ones when testing indicator computation, position sizing, or backtesting against realistic-ugly data.
 
@@ -583,6 +578,8 @@ Key behaviour-focused test files:
 - `test_portfolio_risk.py::TestSignedExposure` — hedged vs stacked correlation clusters, long/short exposure breakdown
 - `test_duckdb_store.py::TestConcurrentAccess` — multi-thread write serialization
 - `test_container.py::TestContainerHardening` — missing-param diagnostics, env-var coercion, YAML safety
+- `test_production_rpc_security.py` / `test_sdk.py` — typed HMAC surface, CLI routing away from unbound 42001
+- `test_web_dashboard.py` — command center + deploy routes
 
 Some test files have import errors due to missing optional dependencies (`aioreactive`) — these are pre-existing and can be ignored: `test_aiorx.py`, `test_aiozmq_simple.py`, `test_disposable.py`, `test_mmr_client.py`, `test_mmr_server.py`, `test_perf2.py`, `test_performance.py`.
 
@@ -848,11 +845,11 @@ CPU-bound bar-by-bar replay. Time scales with number of bars × strategy complex
 
 | Operation | Time | Notes |
 |-----------|------|-------|
-| `ideas` (Massive, movers, momentum preset) | ~4s | 2 snapshot + ~40 indicator calls (parallelized) |
-| `ideas momentum --tickers AAPL MSFT AMD` | ~2s | 1 batch snapshot + ~6 indicator calls |
-| `ideas --presets` | ~1s | No API calls, prints preset table |
-| `ideas volatile --num 25` | ~4s | Same as movers, just more output rows |
-| `ideas momentum --location STK.AU.ASX --tickers BHP CBA CSL` | ~30-90s | IB path: sequential snapshots + history |
+| `ideas` (Massive Starter+) | ~4s | movers + indicators |
+| `ideas` (Massive Basic → TD fallback) | ~few s | liquid quote set + local indicators |
+| `ideas --source twelvedata --tickers …` | ~few s | quotes; movers need Pro+ |
+| `ideas --presets` | ~1s | No API calls |
+| `ideas momentum --location STK.AU.ASX --tickers …` | ~30-90s | IB path (legacy) |
 
 #### Strategy Management
 All local file/YAML operations.
@@ -866,8 +863,8 @@ All local file/YAML operations.
 #### Test Suite
 | Operation | Time |
 |-----------|------|
-| Full working suite (483 tests) | ~20s |
-| Single test file | ~1-2s |
+| Full suite (~3600+ tests) | minutes (prefer CI / local uv run) |
+| Single test file | ~1-5s |
 
 #### Python Import Overhead
 All commands have ~1s baseline overhead for Python startup + importing trader modules (pandas, numpy, duckdb, etc.). This is unavoidable and included in all timings above.

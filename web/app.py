@@ -1178,11 +1178,27 @@ def _register_legacy_routes(application: FastAPI) -> None:
             # 3. Target instruments. Symbols resolve via IB and register their
             # security definitions locally (strategy load needs resolve_symbol
             # to hit) in a per-deploy watchlist for provenance.
+            client = get_manage_client()
             if symbols:
                 resolved, missing = _resolve_symbols(symbols)
                 if missing:
                     return ('deploy aborted — unresolved: ' + ', '.join(missing)
                             + ' (nothing written)')
+                univ = f'deploy_{name}'
+                try:
+                    client.trader_command('create_universe', {'name': univ})
+                except TypedRpcRemoteError as exc:
+                    if exc.code != 'ALREADY_EXISTS':
+                        return f'deploy aborted — could not create watchlist {univ}: {exc}'
+                add_result = client.trader_command('add_universe_symbols', {
+                    'name': univ,
+                    'symbols': symbols,
+                })
+                still_missing = list(add_result.get('missing') or [])
+                if still_missing:
+                    return ('deploy aborted — unresolved: ' + ', '.join(still_missing)
+                            + ' (nothing written)')
+                entry['universe'] = univ
                 entry['conids'] = [int(sd['instrument_id']) for sd in resolved]
             else:
                 entry['universe'] = watchlist
@@ -1198,7 +1214,6 @@ def _register_legacy_routes(application: FastAPI) -> None:
             os.replace(tmp, _STRATEGY_CONFIG_PATH)
 
             # 4. Load it now (not in 30s) and enable it, per the one-click ask.
-            client = get_manage_client()
             try:
                 reload_result = client.strategy_command('reload_strategies', {})
                 if not reload_result.get('ok'):

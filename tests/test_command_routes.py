@@ -220,6 +220,17 @@ def test_cross_origin_mutation_is_rejected(gateway):
     assert gateway.calls == []
 
 
+def test_loopback_origin_aliases_accepted(gateway):
+    """localhost vs 127.0.0.1 must not reject same-machine dashboard POSTs."""
+    client = make_client(gateway)
+    headers = dict(HEADERS)
+    headers["Origin"] = "http://127.0.0.1:7424"
+    headers["Host"] = "localhost:7424"
+    r = client.post("/api/commands/proposals", json=_proposal_body(), headers=headers)
+    assert r.status_code == 202, r.text
+    assert gateway.calls
+
+
 def test_csrf_token_endpoint_returns_session_bound_token(gateway, monkeypatch):
     monkeypatch.undo()  # use the real session_csrf_token, not the fixture's stub
     client = make_client(gateway)

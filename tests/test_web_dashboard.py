@@ -631,11 +631,24 @@ class TestWatchlistRoutes:
 
 class TestDeployRoute:
     def _deploy(self, client, **extra):
+        headers = extra.pop('headers', None)
         data = {'csrf_token': _csrf(), 'file': 'momentum.py', 'class': 'Momentum',
                 'name': 'mom_test', 'bar_size': '1 min', 'days': '90',
                 'symbols': 'AAPL'}
         data.update(extra)
-        return client.post('/strategies/deploy', data=data, follow_redirects=False)
+        kwargs = {'follow_redirects': False}
+        if headers:
+            kwargs['headers'] = headers
+        return client.post('/strategies/deploy', data=data, **kwargs)
+
+    def test_deploy_accepts_localhost_origin_against_127_host(
+            self, client, stub, manage_client, stub_resolving, deploy_config):
+        headers = {
+            'Origin': 'http://localhost:7424',
+            'Host': '127.0.0.1:7424',
+        }
+        r = self._deploy(client, headers=headers)
+        assert r.status_code == 303, r.text
 
     def test_deploy_writes_yaml_reloads_and_enables(
             self, client, stub, manage_client, stub_resolving, deploy_config):
@@ -647,8 +660,13 @@ class TestDeployRoute:
         assert entry['module'] == 'strategies/momentum.py'
         assert entry['class_name'] == 'Momentum'
         assert entry['conids'] == [265598]
+        assert entry['universe'] == 'deploy_mom_test'
         assert ('enable', 'mom_test') in stub.calls
         assert ('strategy_command', 'reload_strategies', {}) in manage_client.calls
+        assert any(c[0] == 'trader_command' and c[1] == 'create_universe'
+                   and c[2].get('name') == 'deploy_mom_test' for c in manage_client.calls)
+        assert any(c[0] == 'trader_command' and c[1] == 'add_universe_symbols'
+                   for c in manage_client.calls)
 
     def test_deploy_with_watchlist_target(self, client, stub, accessor,
                                           stub_resolving, deploy_config):

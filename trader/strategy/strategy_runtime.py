@@ -583,6 +583,21 @@ class StrategyRuntime():
                 return state
         return StrategyState.ERROR
 
+    def _maybe_recover_from_instrument_error(self, strategy: Strategy) -> None:
+        """If a strategy was forced into ERROR solely because its conIds were
+        missing from the local universe, and those instruments now resolve
+        (and it was previously enabled), move it back to RUNNING so multi-
+        strategy books recover without a manual restart."""
+        if strategy.state != StrategyState.ERROR:
+            return
+        if self._load_enabled(strategy.name) is not True:
+            return
+        strategy.enable()
+        logging.info(
+            'recovered strategy %r from ERROR after instruments became resolvable',
+            strategy.name,
+        )
+
     @log_method
     def disable_strategy(self, name: str) -> StrategyState:
         for implementation in self.strategy_implementations:
@@ -1372,7 +1387,13 @@ class StrategyRuntime():
         if contract.conId not in self.strategies:
             self.strategies[contract.conId] = []
             self.strategies[contract.conId].append(strategy)
-            self._trader_gateway.publish_instrument(contract.conId, delayed=False)
+            try:
+                self._trader_gateway.publish_instrument(contract.conId, delayed=False)
+            except Exception as ex:  # noqa: BLE001 - one bad publish must not abort startup
+                logging.warning(
+                    'publish_instrument(%s) failed for strategy %s (will retry on reconcile): %s',
+                    contract.conId, strategy.name, ex,
+                )
         elif contract.conId in self.strategies and strategy not in self.strategies[contract.conId]:
             self.strategies[contract.conId].append(strategy)
 
@@ -1625,9 +1646,11 @@ class StrategyRuntime():
                         instrument = self._trader_gateway.resolve_instrument(conId)
                         if instrument:
                             self.subscribe(strategy, instrument.to_contract())
+                            self._maybe_recover_from_instrument_error(strategy)
 
                 if strategy.universe:
                     self.subscribe_universe(strategy, strategy.universe)
+                    self._maybe_recover_from_instrument_error(strategy)
         except (TimeoutError, ConnectionError) as ex:
             logging.debug('reconciliation RPC failed (trader_service may be restarting): %s', ex)
 
@@ -1690,11 +1713,15 @@ class StrategyRuntime():
                         if instrument:
                             self.subscribe(strategy, instrument.to_contract())
                         else:
-                            logging.error('could not find security definition for conId {} for strategy {}. Disabling strategy.'
-                                          .format(conId, strategy))
-                            strategy.on_error(
-                                Exception('could not find security definition for conId {} for strategy {}. Disabling strategy.'
-                                          .format(conId, strategy))
+                            # Do NOT force ERROR — a missing local definition is
+                            # often transient (empty DB, trader still starting,
+                            # IB qualify pending). Reconcile retries; permanent
+                            # ERROR blocked every other strategy looking "broken"
+                            # when only instruments were unregistered.
+                            logging.warning(
+                                'could not find security definition for conId %s '
+                                'for strategy %s — will retry on reconcile',
+                                conId, strategy.name,
                             )
                 if strategy.universe:
                     self.subscribe_universe(strategy, strategy.universe)

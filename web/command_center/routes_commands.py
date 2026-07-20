@@ -193,16 +193,68 @@ def _command_api_error_handler(request: Request, exc: CommandApiError) -> JSONRe
                                           exc.correlation_id))
 
 
+_LOOPBACK_HOSTS = frozenset({"localhost", "127.0.0.1", "::1"})
+
+
+def _split_netloc(netloc: str) -> tuple[str, int | None]:
+    """Split ``host[:port]`` or ``[ipv6]:port`` into host + optional port."""
+    netloc = (netloc or "").strip().lower()
+    if not netloc:
+        return "", None
+    if netloc.startswith("["):
+        host_part, _, port_str = netloc.partition("]")
+        host = host_part.strip("[]").lower()
+        port_str = port_str.lstrip(":")
+    else:
+        host, _, port_str = netloc.rpartition(":")
+        if port_str.isdigit():
+            host = host.lower()
+        else:
+            host = netloc.lower()
+            port_str = ""
+    port = int(port_str) if port_str.isdigit() else None
+    return host, port
+
+
+def _canonical_host(host: str) -> str:
+    return "loopback" if host in _LOOPBACK_HOSTS else host
+
+
+def _same_origin_netloc(origin_netloc: str, host_header: str) -> bool:
+    """True when two Host/Origin netlocs refer to the same dashboard origin."""
+    oh, op = _split_netloc(origin_netloc)
+    hh, hp = _split_netloc(host_header)
+    if _canonical_host(oh) != _canonical_host(hh):
+        return False
+    if op is not None and hp is not None:
+        return op == hp
+    return True
+
+
 def _check_origin(request: Request) -> None:
-    origin = request.headers.get("origin")
     host = request.headers.get("host", "")
-    if not origin or not host:
+    if not host:
         raise CommandApiError(403, "ORIGIN_REJECTED",
                               "mutations require a same-origin browser request")
-    parsed = urlsplit(origin)
-    if parsed.scheme not in ("http", "https") or parsed.netloc != host:
+
+    origin = request.headers.get("origin")
+    if origin:
+        parsed = urlsplit(origin)
+        if (parsed.scheme in ("http", "https")
+                and _same_origin_netloc(parsed.netloc, host)):
+            return
         raise CommandApiError(403, "ORIGIN_REJECTED",
                               "cross-origin mutation rejected")
+
+    referer = request.headers.get("referer")
+    if referer:
+        parsed_ref = urlsplit(referer)
+        if (parsed_ref.scheme in ("http", "https")
+                and _same_origin_netloc(parsed_ref.netloc, host)):
+            return
+
+    raise CommandApiError(403, "ORIGIN_REJECTED",
+                          "mutations require a same-origin browser request")
 
 
 def require_session(request: Request) -> str:

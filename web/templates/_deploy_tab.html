@@ -1,13 +1,6 @@
 {% macro info(text) %}<span class="info" tabindex="0">i<span class="tip">{{ text }}</span></span>{% endmacro %}
 
-<nav class="setup-tabs">
-  <button type="button" class="setup-tab active" data-setup-tab="strategies">Strategies
-    <span class="chip on">{{ deployed_count }}</span></button>
-  <button type="button" class="setup-tab" data-setup-tab="watchlists">Watchlists
-    <span class="chip">{{ watchlists|length }}</span></button>
-</nav>
-
-<div id="setup-tab-strategies" class="setup-pane active">
+<div class="dash-admin-body">
 
   <section class="full">
     <h2>Deployed strategies
@@ -109,74 +102,4 @@
   </section>
 
 </div>
-
-<div id="setup-tab-watchlists" class="setup-pane">
-
-  <section class="full">
-    <h2>Watchlists
-      {{ info('Your own groups of stocks/ETFs to follow. Deploy a strategy onto a watchlist (Strategies sub-tab) and it monitors every member for signals. Stored as universes in the local DB; symbols resolve to exact IB contracts — never guessed.') }}
-      <span class="chip">{{ watchlists|length }}</span>
-    </h2>
-    {% if errors.watchlists %}<p class="banner err">{{ errors.watchlists }}</p>{% endif %}
-    <div style="padding: 10px 16px; border-bottom: 1px solid var(--border)">
-      <form class="param-form" method="post" action="/watchlists/create">
-        <input type="hidden" name="csrf_token" value="{{ csrf_token }}" />
-        <label>new watchlist <input name="name" placeholder="my_etfs" style="width:150px" /></label>
-        <button type="submit">Create</button>
-        <span class="param-hint">a-z, 0-9, dash, underscore</span>
-      </form>
-    </div>
-    {% if watchlists %}
-    <table>
-      <thead><tr>
-        <th>Name</th>
-        <th>Symbols {{ info('Members of this watchlist, resolved to exact IB contract IDs when added.') }}</th>
-        <th>Count</th>
-        <th>Actions</th>
-      </tr></thead>
-      <tbody>
-      {% for w in watchlists %}
-        <tr>
-          <td class="sym">{{ w.name }}</td>
-          <td class="dim" style="white-space:normal; max-width:520px; text-align:left">{{ w.symbols or '—' }}</td>
-          <td>{{ w.count }}</td>
-          <td><button class="unfold setup-unfold" type="button" data-label="manage"
-                     data-target="wl-{{ loop.index }}">▸ manage</button></td>
-        </tr>
-        <tr id="wl-{{ loop.index }}" class="param-row" style="display:none">
-          <td colspan="4">
-            <form class="param-form" method="post" action="/watchlists/{{ w.name }}/add">
-              <input type="hidden" name="csrf_token" value="{{ csrf_token }}" />
-              <label>add symbols <input name="symbols" placeholder="AAPL, MSFT, SPY" style="width:180px" /></label>
-              <label>exchange <input name="exchange" placeholder="(US: empty)" style="width:80px" /></label>
-              <label>currency <input name="currency" placeholder="USD" style="width:56px" /></label>
-              <button type="submit">Add</button>
-            </form>
-            <form class="param-form" method="post" action="/watchlists/{{ w.name }}/upload" enctype="multipart/form-data" style="margin-top:8px">
-              <input type="hidden" name="csrf_token" value="{{ csrf_token }}" />
-              <label>CSV upload <input type="file" name="file" accept=".csv,text/csv" /></label>
-              <button type="submit">Upload</button>
-              <span class="param-hint">symbol column (+optional exchange,currency) or one symbol per line</span>
-            </form>
-            <form class="param-form" method="post" action="/watchlists/{{ w.name }}/remove" style="margin-top:8px">
-              <input type="hidden" name="csrf_token" value="{{ csrf_token }}" />
-              <label>remove symbol <input name="symbol" placeholder="AAPL" style="width:90px" /></label>
-              <button type="submit">Remove</button>
-            </form>
-            <form class="param-form setup-delete-form" method="post"
-                  action="/watchlists/{{ w.name }}/delete" style="margin-top:8px"
-                  data-confirm="Delete watchlist {{ w.name }} ({{ w.count }} symbols)?">
-              <input type="hidden" name="csrf_token" value="{{ csrf_token }}" />
-              <button class="reject" type="submit">Delete watchlist</button>
-            </form>
-          </td>
-        </tr>
-      {% endfor %}
-      </tbody>
-    </table>
-    {% else %}<p class="empty">No watchlists yet — create one above, then add symbols or upload a CSV.</p>{% endif %}
-  </section>
-
-</div>
-
-<p class="setup-foot">Deploy + watchlist CRUD · auto-refreshes every 30s while this tab is open (paused while an editor is open)</p>
+<p class="setup-foot">Strategy deploy · auto-refreshes every 30s while this tab is open (paused while a deploy form is open)</p>

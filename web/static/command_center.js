@@ -124,6 +124,8 @@ function applySnapshot(view) {
   // server-stamped generated_at so quote ages are skew-corrected.
   store.serverClockOffsetMs = ccServerClockOffsetMs(view.generated_at, Date.now());
   if (view.health) store.health = view.health;
+  const boot = document.getElementById('boot-banner');
+  if (boot) boot.hidden = true;
   renderAll();
   return true;
 }

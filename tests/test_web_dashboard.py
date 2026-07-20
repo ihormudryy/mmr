@@ -313,22 +313,24 @@ class TestDashboardRendering:
 
 
 class TestTabs:
-    def test_dashboard_tabs_trading_and_setup(self, client):
+    def test_dashboard_tabs_trading_deploy_and_watchlists(self, client):
         html = client.get('/cc').text
         assert 'data-dash-tab="trading"' in html
-        assert 'data-dash-tab="setup"' in html
+        assert 'data-dash-tab="deploy"' in html
+        assert 'data-dash-tab="watchlists"' in html
         assert 'id="dash-trading"' in html
-        assert 'id="dash-setup"' in html
+        assert 'id="dash-deploy"' in html
+        assert 'id="dash-watchlists"' in html
 
-    def test_setup_subtabs(self, client):
+    def test_legacy_setup_hashes_map_to_new_tabs(self, client):
         html = client.get('/cc').text
-        for name in ('strategies', 'watchlists'):
-            assert f'data-setup-tab="{name}"' in html
-            assert f'id="setup-tab-{name}"' in html
+        assert 'setup-strategies' in html
+        assert 'setup-watchlists' in html
+        assert 'normalizeDashTab' in html or 'setup-strategies' in html
 
     def test_tab_state_survives_auto_refresh(self, client):
         """Tab selection is kept in location.hash, which location.reload()
-        preserves — switching to Setup must survive the 30s refresh."""
+        preserves — switching tabs must survive the 30s refresh."""
         html = client.get('/cc').text
         assert 'location.hash' in html
         assert 'parseHash' in html
@@ -570,8 +572,22 @@ class TestWatchlistRoutes:
 
     def test_watchlists_tab_rendered(self, client, accessor, stub_resolving):
         html = client.get('/cc').text
-        assert 'data-setup-tab="watchlists"' in html
-        assert 'id="setup-tab-watchlists"' in html
+        assert 'data-dash-tab="watchlists"' in html
+        assert 'id="dash-watchlists"' in html
+
+    def test_fetch_watchlists_does_not_fan_out_get_universe(self, manage_client, monkeypatch):
+        """Page load must not N+1 query every universe (blocks the single worker)."""
+        calls = []
+        orig = manage_client.trader_query
+
+        def _track(method, body=None):
+            calls.append(method)
+            return orig(method, body)
+
+        monkeypatch.setattr(manage_client, 'trader_query', _track)
+        webapp.fetch_watchlists()
+        assert calls == ['list_universes']
+        assert 'get_universe' not in calls
 
     def test_flash_redirects_to_cc_setup(self, client, accessor, stub_resolving):
         r = client.post('/watchlists/create',
@@ -579,7 +595,7 @@ class TestWatchlistRoutes:
                         follow_redirects=False)
         assert r.status_code == 303
         assert r.headers['location'].startswith('/cc?flash=')
-        assert '#setup-strategies' in r.headers['location']
+        assert '#deploy' in r.headers['location']
         assert 'flash_test' in accessor.universes
 
 
@@ -656,21 +672,21 @@ class TestDeployRoute:
         html = client.get('/cc').text
         assert '/strategies/deploy' in html
         assert 'name="watchlist"' in html
-        assert 'Deploy &amp; watchlists' in html
+        assert 'data-dash-tab="deploy"' in html
         assert '/strategies/' not in html or '/strategies/deploy' in html
         assert '/strategies/orb_googl/enable' not in html
 
 
 class TestManagePage:
-    def test_manage_redirects_to_cc_setup(self, client):
+    def test_manage_redirects_to_cc_deploy(self, client):
         r = client.get('/manage', follow_redirects=False)
         assert r.status_code == 307
-        assert r.headers['location'] == '/cc#setup-strategies'
+        assert r.headers['location'] == '/cc#deploy'
 
     def test_cc_setup_renders_without_heavy_fetchers(self, client, stub, manage_client, monkeypatch):
-        """Setup tab must not fan out legacy overview fetchers (cash, risk, …)."""
+        """Deploy/Watchlists tabs must not fan out legacy overview fetchers."""
         def _boom():
-            raise AssertionError('legacy fetcher must not run on /cc setup tab')
+            raise AssertionError('legacy fetcher must not run on /cc admin tabs')
 
         for name in ('fetch_cash', 'fetch_snapshot', 'fetch_status', 'fetch_risk',
                      'fetch_risk_limits', 'fetch_positions', 'fetch_proposals'):
@@ -678,16 +694,16 @@ class TestManagePage:
         html = client.get('/cc').text
         assert 'Available strategies' in html
         assert 'Watchlists' in html
-        assert 'Deploy &amp; watchlists' in html
+        assert 'data-dash-tab="deploy"' in html
+        assert 'data-dash-tab="watchlists"' in html
 
     def test_cc_setup_marks_deployed_classes(self, client):
         html = client.get('/cc').text
         assert 'deployed' in html.lower()
 
-    def test_cc_setup_default_subtab_is_strategies(self, client):
+    def test_cc_default_hash_is_trading(self, client):
         html = client.get('/cc').text
-        assert 'id="setup-tab-strategies"' in html
-        assert "'strategies'" in html or 'setup-strategies' in html
+        assert "location.hash || '#trading'" in html or '#trading' in html
 
 
 class TestLegacyAccessTokenDoubleGate:

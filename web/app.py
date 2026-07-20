@@ -475,22 +475,23 @@ def _get_accessor():
 
 
 def fetch_watchlists() -> list[dict]:
+    """List watchlist names + counts only.
+
+    Deliberately avoids N per-universe ``get_universe`` calls on the /cc page
+    load path -- that fan-out blocked the single uvicorn worker for tens of
+    seconds and kept the browser tab spinning while /api/snapshot queued behind
+    it. Symbol previews belong in a future lazy-load endpoint; manage rows
+    still expose add/remove/upload actions without them.
+    """
     client = get_manage_client()
     listed = client.trader_query('list_universes')
     rows = []
     for entry in listed.get('universes') or []:
-        name = entry['name']
-        count = int(entry.get('count') or 0)
-        symbols = ''
-        try:
-            detail = client.trader_query('get_universe', {'name': name, 'symbol_limit': 40})
-            parts = detail.get('symbols') or []
-            symbols = ', '.join(parts)
-            if count > len(parts):
-                symbols += f', +{count - len(parts)} more'
-        except Exception as exc:  # noqa: BLE001
-            logger.warning('watchlist %s read failed: %s', name, exc)
-        rows.append({'name': name, 'count': count, 'symbols': symbols})
+        rows.append({
+            'name': entry['name'],
+            'count': int(entry.get('count') or 0),
+            'symbols': '',
+        })
     return rows
 
 
@@ -559,11 +560,26 @@ def _flash(msg: str) -> RedirectResponse:
     # Deploy + watchlist POST routes redirect back to the unified dashboard's
     # Setup tab so the post/redirect/get loop stays on the page the form was
     # submitted from.
-    return RedirectResponse(url=f'/cc?flash={quote(msg)}#setup-strategies', status_code=303)
+    return RedirectResponse(url=f'/cc?flash={quote(msg)}#deploy', status_code=303)
+
+
+def _empty_manage_context(flash: str = '', *, error: str = '') -> dict[str, Any]:
+    errors = {'page': error} if error else {}
+    return {
+        'strategies': [],
+        'available_strategies': [],
+        'watchlists': [],
+        'deployed_count': 0,
+        'flash': flash,
+        'csrf_token': _CSRF_TOKEN,
+        'errors': errors,
+    }
 
 
 def _manage_page_context(flash: str = '') -> tuple[dict[str, Any], dict[str, str]]:
     """Fetch only the sections /manage needs — no trader RPC on the hot path."""
+    from concurrent.futures import ThreadPoolExecutor, as_completed
+
     sections: dict[str, Any] = {}
     errors: dict[str, str] = {}
     fetchers: dict[str, Callable[[], Any]] = {
@@ -571,13 +587,26 @@ def _manage_page_context(flash: str = '') -> tuple[dict[str, Any], dict[str, str
         'available': fetch_available_strategies,
         'watchlists': fetch_watchlists,
     }
-    for key, fn in fetchers.items():
+    timeout_s = float(os.environ.get('MMR_MANAGE_FETCH_TIMEOUT_S', '8'))
+    with ThreadPoolExecutor(max_workers=len(fetchers)) as pool:
+        future_map = {pool.submit(fn): key for key, fn in fetchers.items()}
         try:
-            sections[key] = fn()
-        except Exception as exc:  # noqa: BLE001 - surface, don't crash the page
-            logger.warning('manage section %s failed: %s', key, exc)
-            sections[key] = None
-            errors[key] = f'{type(exc).__name__}: {exc}'
+            done = as_completed(future_map, timeout=timeout_s)
+            for fut in done:
+                key = future_map[fut]
+                try:
+                    sections[key] = fut.result()
+                except Exception as exc:  # noqa: BLE001 - surface, don't crash the page
+                    logger.warning('manage section %s failed: %s', key, exc)
+                    sections[key] = None
+                    errors[key] = f'{type(exc).__name__}: {exc}'
+        except TimeoutError:
+            logger.warning('manage page context timed out after %.0fs', timeout_s)
+            errors['page'] = f'timed out after {timeout_s:.0f}s — setup tab may be incomplete'
+            for fut, key in future_map.items():
+                sections.setdefault(key, None)
+                if key not in errors and not fut.done():
+                    errors[key] = 'still loading when page deadline hit'
 
     strategies = sections.get('strategies') or []
     deployed_classes = {s.get('class_name') for s in strategies if s.get('class_name')}
@@ -677,7 +706,7 @@ def _register_legacy_routes(application: FastAPI) -> None:
     def manage_page(request: Request, flash: str = ''):
         """Deprecated alias — unified dashboard lives at /cc."""
         _check_access(request)
-        url = f'/cc?flash={quote(flash)}#setup-strategies' if flash else '/cc#setup-strategies'
+        url = f'/cc?flash={quote(flash)}#deploy' if flash else '/cc#deploy'
         return RedirectResponse(url=url, status_code=307)
 
 
@@ -1193,6 +1222,7 @@ def create_app(cc: CommandCenter | None = None) -> FastAPI:
     application.include_router(create_read_router(
         center, _TEMPLATES,
         manage_context_provider=lambda flash='': _manage_page_context(flash=flash)[0],
+        empty_manage_context=_empty_manage_context,
     ))
     # NEW route only: `/api/cc-health`. Never touches the G0 `/healthz` /
     # `/readyz` / `/api/health` routes registered by `_register_legacy_routes`

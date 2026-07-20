@@ -68,6 +68,7 @@ class ManageRpcClient:
             client = self._clients[bucket]
             if client is None:
                 client = self._client_factory(role, endpoint)
+                client.connect()
                 self._clients[bucket] = client
             try:
                 return client.call(method, payload, dict)

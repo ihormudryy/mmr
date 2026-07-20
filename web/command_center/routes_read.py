@@ -1,6 +1,7 @@
 """Read-only routes: snapshot (also the degraded polling fallback), SSE, page."""
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
 import os
@@ -12,9 +13,11 @@ from sse_starlette.sse import EventSourceResponse
 logger = logging.getLogger("web.command_center.routes")
 
 SSE_PING_SECONDS = 10
+MANAGE_PAGE_TIMEOUT_S = float(os.environ.get('MMR_MANAGE_PAGE_TIMEOUT_S', '12'))
 
 
-def create_read_router(cc, templates, manage_context_provider=None) -> APIRouter:
+def create_read_router(cc, templates, manage_context_provider=None,
+                       empty_manage_context=None) -> APIRouter:
     router = APIRouter()
 
     def _require_session(request: Request) -> str:
@@ -102,7 +105,26 @@ def create_read_router(cc, templates, manage_context_provider=None) -> APIRouter
             "flash": flash,
         }
         if manage_context_provider is not None:
-            ctx.update(manage_context_provider(flash=flash))
+            # Never block the single uvicorn worker on synchronous typed-RPC
+            # while serving /cc — that stalled /api/snapshot and left the
+            # browser tab spinning until every manage fetcher finished.
+            fallback = empty_manage_context or (lambda flash='', error='': {
+                'strategies': [], 'available_strategies': [], 'watchlists': [],
+                'deployed_count': 0, 'flash': flash, 'errors': {'page': error} if error else {},
+            })
+            try:
+                ctx.update(await asyncio.wait_for(
+                    asyncio.to_thread(manage_context_provider, flash),
+                    timeout=MANAGE_PAGE_TIMEOUT_S,
+                ))
+            except asyncio.TimeoutError:
+                logger.warning('manage context exceeded %.0fs on /cc', MANAGE_PAGE_TIMEOUT_S)
+                ctx.update(fallback(
+                    flash,
+                    error=f'setup tab timed out after {MANAGE_PAGE_TIMEOUT_S:.0f}s'))
+            except Exception as exc:  # noqa: BLE001 - degrade, don't 500 the page
+                logger.warning('manage context failed on /cc: %s', exc)
+                ctx.update(fallback(flash, error=f'{type(exc).__name__}: {exc}'))
         return templates.TemplateResponse(request, "command_center.html", ctx)
 
     return router

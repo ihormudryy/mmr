@@ -362,6 +362,9 @@ class Trader():
                     'outside the fullstack test-profile runner.'
                 )
                 self.client.connect_fake(self.ib_account)
+                # connect_fake does not emit IB connectedEvent; broker sync and
+                # the command-center snapshot barrier live in connected_event().
+                self._fake_broker_schedule_connected = True
             else:
                 self.client.connect()
 
@@ -834,6 +837,16 @@ class Trader():
             self.disposables.clear()
             with self._pnl_subscriptions_lock:
                 self.pnl_subscriptions.clear()
+
+            if self._fake_broker_enabled():
+                # connect_fake leaves a never-dialed IB() instance: live
+                # reqPositionsAsync/reqAccountUpdates would hang forever, so
+                # promote one empty broker generation from the stub client and
+                # skip event subscriptions entirely.
+                if getattr(self, 'broker_ingest', None) is not None:
+                    await self.broker_ingest.run_broker_sync(
+                        self._fake_broker_sync_client())
+                return
 
             await self.setup_subscriptions()
 
@@ -2122,7 +2135,39 @@ class Trader():
         task = asyncio.create_task(_load_test_helper())
 
     def run(self, *args):
+        if getattr(self, '_fake_broker_schedule_connected', False):
+            self._fake_broker_schedule_connected = False
+            loop = asyncio.get_event_loop()
+            loop.create_task(self.connected_event())
         self.client.run(*args)
+
+    def _fake_broker_sync_client(self):
+        """Minimal IB stand-in so run_broker_sync can promote a generation
+        under MMR_FAKE_BROKER without dialing a real Gateway socket."""
+        from types import SimpleNamespace
+
+        account = self.ib_account
+
+        class _FakeIB:
+            def accountValues(self, _account_id):
+                return [SimpleNamespace(
+                    account=account, tag='NetLiquidation',
+                    currency='USD', value='100000',
+                )]
+
+            async def reqPositionsAsync(self):
+                return []
+
+            async def reqAllOpenOrdersAsync(self):
+                return []
+
+            async def reqCompletedOrdersAsync(self, *, apiOnly):
+                return []
+
+            async def reqExecutionsAsync(self):
+                return []
+
+        return SimpleNamespace(ib=_FakeIB())
 
 
 class TradingRuntimeOrderDispatch:

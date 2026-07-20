@@ -67,7 +67,7 @@
       display:flex; justify-content:space-between; }
     #drawer { position:fixed; inset:0; background:rgba(0,0,0,.6); z-index:50;
       display:flex; align-items:flex-start; justify-content:center; padding:6vh 16px; }
-    #drawer[hidden] { display:none; }
+    #drawer[hidden] { display:none !important; pointer-events:none; }
     #drawer-box { background:var(--panel); border:1px solid var(--border);
       border-radius:10px; width:min(720px,100%); max-height:82vh; overflow:auto; }
     #drawer-close { float:right; margin:8px; background:transparent; border:none;
@@ -76,72 +76,63 @@
     .flash { padding:10px 24px; background:rgba(88,166,255,.1); color:var(--accent);
       border-bottom:1px solid var(--border); }
     .dash-tabs { display:flex; gap:6px; padding:10px 24px 0; background:var(--panel);
-      border-bottom:1px solid var(--border); }
+      border-bottom:1px solid var(--border); position:relative; z-index:20; }
     .dash-tab { background:transparent; border:1px solid transparent; border-bottom:none;
       color:var(--dim); padding:8px 16px; border-radius:8px 8px 0 0; cursor:pointer;
-      font:inherit; font-size:13px; }
+      font:inherit; font-size:13px; display:inline-flex; align-items:center; gap:8px; }
     .dash-tab:hover { color:var(--fg); }
     .dash-tab.active { background:var(--bg); color:var(--fg); border-color:var(--border);
       margin-bottom:-1px; padding-bottom:9px; font-weight:600; }
     .dash-pane { display:none; }
     .dash-pane.active { display:block; }
-    #dash-setup { padding:0 0 24px; }
-    #dash-setup .setup-tabs { display:flex; gap:6px; padding:10px 24px 0;
-      background:var(--panel); border-bottom:1px solid var(--border); }
-    #dash-setup .setup-tab { background:transparent; border:1px solid transparent;
-      border-bottom:none; color:var(--dim); padding:8px 16px; border-radius:8px 8px 0 0;
-      cursor:pointer; font:inherit; font-size:13px; display:flex; align-items:center; gap:8px; }
-    #dash-setup .setup-tab:hover { color:var(--fg); }
-    #dash-setup .setup-tab.active { background:var(--bg); color:var(--fg);
-      border-color:var(--border); margin-bottom:-1px; padding-bottom:9px; font-weight:600; }
-    #dash-setup .setup-pane { display:none; padding:20px 24px; gap:22px;
+    .dash-admin-pane { padding:0 0 24px; }
+    .dash-admin-pane .dash-admin-body { display:grid; padding:20px 24px; gap:22px;
       grid-template-columns:repeat(auto-fit, minmax(440px, 1fr)); }
-    #dash-setup .setup-pane.active { display:grid; }
-    #dash-setup section { background:var(--panel); border:1px solid var(--border);
+    .dash-admin-pane section { background:var(--panel); border:1px solid var(--border);
       border-radius:10px; overflow:hidden; }
-    #dash-setup section.full { grid-column:1 / -1; }
-    #dash-setup section > h2 { margin:0; padding:12px 16px; font-size:13px;
+    .dash-admin-pane section.full { grid-column:1 / -1; }
+    .dash-admin-pane section > h2 { margin:0; padding:12px 16px; font-size:13px;
       text-transform:uppercase; letter-spacing:.6px; color:var(--dim);
       border-bottom:1px solid var(--border); display:flex;
       justify-content:space-between; align-items:center; }
-    #dash-setup .chip.on { background:rgba(63,185,80,.15); color:var(--pos); }
-    #dash-setup .chip.off { background:rgba(125,135,148,.15); color:var(--dim); }
-    #dash-setup .chip.err { background:rgba(248,81,73,.15); color:var(--neg); }
-    #dash-setup .banner { padding:10px 16px; margin:0; font-size:13px; }
-    #dash-setup .banner.err { color:var(--neg); background:rgba(248,81,73,.08); }
-    #dash-setup .note { padding:10px 16px; color:var(--dim); font-size:12.5px;
+    .dash-admin-pane .chip.on { background:rgba(63,185,80,.15); color:var(--pos); }
+    .dash-admin-pane .chip.off { background:rgba(125,135,148,.15); color:var(--dim); }
+    .dash-admin-pane .chip.err { background:rgba(248,81,73,.15); color:var(--neg); }
+    .dash-admin-pane .banner { padding:10px 16px; margin:0; font-size:13px; }
+    .dash-admin-pane .banner.err { color:var(--neg); background:rgba(248,81,73,.08); }
+    .dash-admin-pane .note { padding:10px 16px; color:var(--dim); font-size:12.5px;
       border-bottom:1px solid var(--border); }
-    #dash-setup button { font:inherit; border:1px solid var(--border); border-radius:6px;
+    .dash-admin-pane button { font:inherit; border:1px solid var(--border); border-radius:6px;
       cursor:pointer; padding:4px 10px; background:var(--chip); color:var(--fg); }
-    #dash-setup button.reject { color:var(--neg); }
-    #dash-setup .setup-foot { padding:8px 24px; color:var(--dim); font-size:11px; }
-    #dash-setup .empty { padding:16px; color:var(--dim); }
-    #dash-setup .info { position:relative; display:inline-block; margin-left:6px;
+    .dash-admin-pane button.reject { color:var(--neg); }
+    .dash-admin-pane .setup-foot { padding:8px 24px; color:var(--dim); font-size:11px; }
+    .dash-admin-pane .empty { padding:16px; color:var(--dim); }
+    .dash-admin-pane .info { position:relative; display:inline-block; margin-left:6px;
       color:var(--dim); cursor:help; font-size:10px; font-weight:600; font-style:normal;
       border:1px solid var(--border); border-radius:50%; width:15px; height:15px;
       line-height:13px; text-align:center; vertical-align:middle; }
-    #dash-setup .info:hover, #dash-setup .info:focus { color:var(--accent);
+    .dash-admin-pane .info:hover, .dash-admin-pane .info:focus { color:var(--accent);
       border-color:var(--accent); outline:none; }
-    #dash-setup .tip { display:none; position: fixed; z-index:60; width:max-content;
+    .dash-admin-pane .tip { display:none; position: fixed; z-index:60; width:max-content;
       max-width:300px; white-space:normal; background:#1c222b; border:1px solid var(--border);
       border-radius:8px; padding:8px 11px; color:var(--fg); font-size:12px;
       font-weight:400; text-align:left; letter-spacing:normal; text-transform:none;
-      line-height:1.5; box-shadow:0 8px 24px rgba(0,0,0,.5); }
-    #dash-setup .hover-tip { cursor:help; }
-    #dash-setup .strat-config-name { color:var(--dim); font-size:11px; font-weight:400; }
-    #dash-setup button.unfold { padding:2px 8px; font-size:12px; }
-    #dash-setup tr.param-row > td { background:var(--bg); padding:10px 16px; text-align:left; }
-    #dash-setup .param-form { display:flex; flex-wrap:wrap; gap:10px; align-items:center; }
-    #dash-setup .param-form label { display:flex; gap:6px; align-items:center;
+      line-height:1.5; box-shadow:0 8px 24px rgba(0,0,0,.5); pointer-events:none; }
+    .dash-admin-pane .hover-tip { cursor:help; }
+    .dash-admin-pane .strat-config-name { color:var(--dim); font-size:11px; font-weight:400; }
+    .dash-admin-pane button.unfold { padding:2px 8px; font-size:12px; }
+    .dash-admin-pane tr.param-row > td { background:var(--bg); padding:10px 16px; text-align:left; }
+    .dash-admin-pane .param-form { display:flex; flex-wrap:wrap; gap:10px; align-items:center; }
+    .dash-admin-pane .param-form label { display:flex; gap:6px; align-items:center;
       color:var(--dim); font-size:12px; }
-    #dash-setup .param-form input, #dash-setup .param-form select {
+    .dash-admin-pane .param-form input, .dash-admin-pane .param-form select {
       background:var(--panel); border:1px solid var(--border); color:var(--fg);
       border-radius:6px; padding:4px 7px; font:inherit; font-size:12.5px; }
-    #dash-setup .param-form input { width:110px; }
-    #dash-setup .param-form button { background:rgba(88,166,255,.15);
+    .dash-admin-pane .param-form input { width:110px; }
+    .dash-admin-pane .param-form button { background:rgba(88,166,255,.15);
       border-color:var(--accent); color:var(--accent); font-weight:600; }
-    #dash-setup .param-hint { color:var(--dim); font-size:11px; }
-    #dash-setup td.sym { font-weight:600; }
+    .dash-admin-pane .param-hint { color:var(--dim); font-size:11px; }
+    .dash-admin-pane td.sym { font-weight:600; }
   </style>
 </head>
 <body data-degraded-after-ms="{{ degraded_after_ms }}"
@@ -150,6 +141,7 @@
   <div id="degraded-banner" role="alert" hidden>
     ⚠ Realtime stream degraded — polling snapshots every 5 s. Data may be stale.
   </div>
+  <div id="boot-banner" class="flash" role="status">Loading live data…</div>
   <header id="status-bar">
     <span id="mode-badge" class="badge">…</span>
     <span id="account-id" class="num">—</span>
@@ -160,7 +152,10 @@
   {% if flash %}<div class="flash">{{ flash }}</div>{% endif %}
   <nav class="dash-tabs" aria-label="Dashboard sections">
     <button type="button" class="dash-tab active" data-dash-tab="trading">Trading</button>
-    <button type="button" class="dash-tab" data-dash-tab="setup">Deploy &amp; watchlists</button>
+    <button type="button" class="dash-tab" data-dash-tab="deploy">Deploy
+      <span class="chip on">{{ deployed_count|default(0) }}</span></button>
+    <button type="button" class="dash-tab" data-dash-tab="watchlists">Watchlists
+      <span class="chip">{{ watchlists|length|default(0) }}</span></button>
   </nav>
   <div id="dash-trading" class="dash-pane active">
   <div id="account-cards" aria-label="Account summary"></div>
@@ -202,8 +197,11 @@
     </div>
   </main>
   </div>
-  <div id="dash-setup" class="dash-pane">
-    {% include "_manage_tab.html" %}
+  <div id="dash-deploy" class="dash-pane dash-admin-pane">
+    {% include "_deploy_tab.html" %}
+  </div>
+  <div id="dash-watchlists" class="dash-pane dash-admin-pane">
+    {% include "_watchlists_tab.html" %}
   </div>
   <div id="drawer" role="dialog" aria-modal="true" aria-label="Detail" hidden>
     <div id="drawer-box">
@@ -390,12 +388,12 @@
         tip.style.left = left + 'px';
         tip.style.top = Math.max(top, margin) + 'px';
       }
-      function hideSetupTips() {
-        document.querySelectorAll('#dash-setup .tip').forEach(function (t) {
+      function hideAdminTips() {
+        document.querySelectorAll('.dash-admin-pane .tip').forEach(function (t) {
           t.style.display = 'none';
         });
       }
-      document.querySelectorAll('#dash-setup .info, #dash-setup .hover-tip').forEach(function (el) {
+      document.querySelectorAll('.dash-admin-pane .info, .dash-admin-pane .hover-tip').forEach(function (el) {
         var tip = el.querySelector('.tip');
         if (!tip) return;
         var show = function () { positionSetupTip(el, tip); };
@@ -405,21 +403,20 @@
         el.addEventListener('focus', show);
         el.addEventListener('blur', hide);
       });
-      window.addEventListener('scroll', hideSetupTips, true);
+      window.addEventListener('scroll', hideAdminTips, true);
 
-      function activateSetupTab(name) {
-        if (!document.getElementById('setup-tab-' + name)) name = 'strategies';
-        document.querySelectorAll('#dash-setup .setup-tab').forEach(function (b) {
-          b.classList.toggle('active', b.dataset.setupTab === name);
-        });
-        document.querySelectorAll('#dash-setup .setup-pane').forEach(function (p) {
-          p.classList.toggle('active', p.id === 'setup-tab-' + name);
-        });
-        hideSetupTips();
-        return name;
+      var ADMIN_TABS = { deploy: true, watchlists: true };
+
+      function normalizeDashTab(raw) {
+        if (!raw || raw === 'trading') return 'trading';
+        if (raw === 'manage' || raw === 'setup' || raw === 'setup-strategies') return 'deploy';
+        if (raw === 'setup-watchlists') return 'watchlists';
+        if (ADMIN_TABS[raw]) return raw;
+        return 'trading';
       }
 
-      function activateDashTab(name, setupSub) {
+      function activateDashTab(name) {
+        name = normalizeDashTab(name);
         if (!document.getElementById('dash-' + name)) name = 'trading';
         document.querySelectorAll('.dash-tab').forEach(function (b) {
           b.classList.toggle('active', b.dataset.dashTab === name);
@@ -427,30 +424,22 @@
         document.querySelectorAll('.dash-pane').forEach(function (p) {
           p.classList.toggle('active', p.id === 'dash-' + name);
         });
-        var hash = name;
-        if (name === 'setup') {
-          hash = 'setup-' + activateSetupTab(setupSub || 'strategies');
-        }
-        history.replaceState(null, '', '#' + hash);
+        hideAdminTips();
+        history.replaceState(null, '', '#' + name);
       }
 
       document.querySelectorAll('.dash-tab').forEach(function (b) {
         b.addEventListener('click', function () {
-          activateDashTab(b.dataset.dashTab, b.dataset.dashTab === 'setup' ? 'strategies' : null);
-        });
-      });
-      document.querySelectorAll('#dash-setup .setup-tab').forEach(function (b) {
-        b.addEventListener('click', function () {
-          activateDashTab('setup', b.dataset.setupTab);
+          activateDashTab(b.dataset.dashTab);
         });
       });
 
-      document.querySelectorAll('#dash-setup .setup-unfold').forEach(function (btn) {
+      document.querySelectorAll('.dash-admin-pane .setup-unfold').forEach(function (btn) {
         btn.addEventListener('click', function () {
           toggleSetupParams(btn.dataset.target, btn);
         });
       });
-      document.querySelectorAll('#dash-setup .setup-delete-form').forEach(function (form) {
+      document.querySelectorAll('.dash-admin-pane .setup-delete-form').forEach(function (form) {
         form.addEventListener('submit', function (ev) {
           var msg = form.dataset.confirm || 'Delete this watchlist?';
           if (!window.confirm(msg)) ev.preventDefault();
@@ -459,21 +448,15 @@
 
       function parseHash() {
         var raw = (location.hash || '#trading').replace('#', '');
-        if (raw === 'manage') raw = 'setup-strategies';
-        if (raw.indexOf('setup') === 0) {
-          var sub = raw === 'setup' ? 'strategies' : raw.replace('setup-', '');
-          activateDashTab('setup', sub);
-        } else {
-          activateDashTab('trading');
-        }
+        activateDashTab(raw);
       }
       parseHash();
       window.addEventListener('hashchange', parseHash);
 
       setInterval(function () {
-        var setup = document.getElementById('dash-setup');
-        if (!setup || !setup.classList.contains('active')) return;
-        if (_setupOpenEditors === 0) location.reload();
+        var active = document.querySelector('.dash-pane.dash-admin-pane.active');
+        if (!active || _setupOpenEditors !== 0) return;
+        location.reload();
       }, 30000);
     })();
   </script>

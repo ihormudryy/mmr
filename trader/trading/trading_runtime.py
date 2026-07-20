@@ -348,6 +348,17 @@ class Trader():
             self.broker_state_store.migrate(journal_migrator)
             from trader.trading.risk_producer import ReconciliationProducer
             ReconciliationProducer(journal_db, self.domain_journal).migrate(journal_migrator)
+            # Shrink the WAL window so an ungraceful restart is less likely to
+            # hit DuckDB's unreplayable-WAL INTERNAL Error (connect_duckdb
+            # recovers by quarantining the .wal, but checkpointing keeps the
+            # durable file current).
+            try:
+                self.domain_journal.connect().execute('CHECKPOINT')
+            except Exception as checkpoint_exc:  # noqa: BLE001
+                logging.warning(
+                    'journal CHECKPOINT after migrate failed (non-fatal): %s',
+                    checkpoint_exc,
+                )
             self.broker_ingest = BrokerIngest(
                 db=journal_db,
                 journal=self.domain_journal,

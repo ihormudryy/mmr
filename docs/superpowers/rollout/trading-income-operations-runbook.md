@@ -66,6 +66,14 @@ drill is green **and** the manual IB paper soak (below) is recorded.
 
 ## The release gate — two halves, both required
 
+Run the unified gate:
+
+```bash
+python3 scripts/p1_release_gate.py --synthetic-only --json --output p1-synthetic.json
+# Full manual gate during XNYS RTH with command authority enabled (automation OFF):
+python3 scripts/p1_release_gate.py --ib-paper --watch-minutes 390 --json --output p1-manual-soak.json
+```
+
 ### 1. Synthetic failure drills
 
 #### P1 command plane — `scripts/command_plane_drill.py`
@@ -143,6 +151,11 @@ is fully qualified under the research attestation rules.
 Also run before sign-off:
 
 ```bash
+python3 scripts/p3_release_gate.py --json --output p3-gate.json
+# CI / pre-RTH: synthetic half only (manual soak may stay pending)
+python3 scripts/p3_release_gate.py --synthetic-only --json --output p3-synthetic.json
+# Full manual gate during XNYS RTH with automation enabled:
+python3 scripts/p3_release_gate.py --ib-paper --watch-minutes 390 --json --output manual-soak.json
 pytest tests/ --timeout=30 -q --ignore=tests/test_ibrx_async.py   # canonical suite
 docker compose config --quiet                                     # compose validity
 ```

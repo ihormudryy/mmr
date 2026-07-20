@@ -211,6 +211,10 @@ services:
       # trading_runtime.py's typed_bind_address (G0 Task 5 fix). Feed
       # (42103) binds 0.0.0.0 too but is never host-published (see ports).
       TYPED_BIND_ADDRESS: tcp://0.0.0.0
+      # CLI inside this container (`mmr resolve`) uses the same HMAC key file
+      # as the typed server. Absolute path avoids '~' expansion surprises
+      # when trader.yaml still has the portable spelling.
+      MMR_SERVICE_HMAC_KEY_FILE: /home/trader/.config/mmr/service_hmac.key
       # Outbound: trader opens an RPCClient to strategy_service's own RPC
       # server (trading_runtime.py's self.zmq_strategy_client) -- must
       # target the strategy container by name, not 0.0.0.0.
@@ -390,6 +394,10 @@ services:
       MMR_TYPED_QUERY_ENDPOINT: tcp://trader:42101
       MMR_TYPED_FEED_ENDPOINT: tcp://trader:42103
       MMR_TYPED_COMMAND_ENDPOINT: tcp://trader:42102
+      # SDK typed clients (mmr resolve / propose) use this host; without it they
+      # fall back to trader.yaml's typed_bind_address (loopback) and miss the
+      # trader container. Prefer this over parsing MMR_TYPED_*_ENDPOINT.
+      TRADER_TYPED_ADDRESS: tcp://trader
       MMR_TYPED_STRATEGY_QUERY_ENDPOINT: tcp://strategy:42105
       MMR_TYPED_STRATEGY_COMMAND_ENDPOINT: tcp://strategy:42104
       MMR_PUBSUB_ADDRESS: tcp://trader

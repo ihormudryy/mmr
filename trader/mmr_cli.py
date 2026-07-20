@@ -1291,6 +1291,14 @@ def build_parser() -> argparse.ArgumentParser:
                                        help='JSON file with signed attestation from `research allocation sign`')
     activate_allocation_p.add_argument('--reason', required=True)
 
+    suspend_allocation_p = sub.add_parser(
+        'suspend-allocation', help='Suspend the active allocation authority (risk-reducing)',
+        epilog='Examples:\n'
+               '  suspend-allocation --reason "drawdown exceeded soft limit"',
+        formatter_class=fmt,
+    )
+    suspend_allocation_p.add_argument('--reason', required=True)
+
     # group (position groups)
     group_p = sub.add_parser('group', help='Manage position groups',
                               epilog='Examples:\n'
@@ -1943,6 +1951,7 @@ def dispatch(mmr: MMR, args: argparse.Namespace) -> bool:
         'snapshot', 'snap', 'snapshot-batch', 'depth', 'resolve',
         'listen', 'watch', 'scan',
         'approve', 'activate-canary', 'deactivate-canary', 'activate-allocation',
+        'suspend-allocation',
         'resize-positions',
         'portfolio-risk', 'prisk',
         'portfolio-snapshot', 'psnap',
@@ -2455,6 +2464,8 @@ def dispatch(mmr: MMR, args: argparse.Namespace) -> bool:
 
         elif cmd == 'activate-allocation':
             _handle_activate_allocation(mmr, args)
+        elif cmd == 'suspend-allocation':
+            _handle_suspend_allocation(mmr, args)
 
         elif cmd == 'deactivate-canary':
             _handle_deactivate_canary(mmr, args)
@@ -2934,6 +2945,15 @@ def _handle_activate_allocation(mmr: MMR, args: argparse.Namespace):
     else:
         error = str(result.error or result.exception or 'Unknown error')
         print_status(f'Allocation activation failed: {error}', success=False)
+
+
+def _handle_suspend_allocation(mmr: MMR, args: argparse.Namespace):
+    result = mmr.suspend_allocation(args.reason)
+    if result.is_success():
+        print_json_result(result.obj or {}, title='Allocation authority suspended')
+    else:
+        error = str(result.error or result.exception or 'Unknown error')
+        print_status(f'Allocation suspension failed: {error}', success=False)
 
 
 def _handle_deactivate_canary(mmr: MMR, args: argparse.Namespace):
@@ -11559,7 +11579,11 @@ def repl(mmr: MMR):
 # Entry point
 # ------------------------------------------------------------------
 
-_LOCAL_ONLY_COMMANDS = {'backtest', 'bt', 'data', 'propose', 'proposals', 'reject', 'market-hours', 'mh', 'session', 'group', 'research'}
+# resolve uses typed RPC (42101), not legacy dill 42001 — skip legacy connect.
+_LOCAL_ONLY_COMMANDS = {
+    'backtest', 'bt', 'data', 'propose', 'proposals', 'reject', 'resolve',
+    'market-hours', 'mh', 'session', 'group', 'research',
+}
 _LOCAL_ONLY_STRAT_ACTIONS = {'create', 'deploy', 'undeploy', 'signals', 'backtest'}
 
 

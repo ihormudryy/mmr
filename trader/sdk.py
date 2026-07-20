@@ -189,17 +189,19 @@ class MMR:
         self._timeout = timeout
 
         # [M1-F3] Task 8: typed, HMAC-authenticated query/command sockets --
-        # the ONLY path `propose`/`proposals`/`reject`/`approve` use to reach
-        # trader_service's command-authority coordinator (registered via
-        # `register_command_authority` in `trader/messaging/production_api.py`).
-        # Same host as the legacy RPC (`_rpc_address`); only the ports differ
-        # (`typed_query_port`/`typed_command_port` in trader.yaml). Lazily
-        # connected on first use (see `_ensure_typed_clients`) so a plain
-        # `mmr portfolio` doesn't require a configured service_hmac_key_file.
-        self._typed_address = (os.getenv('TYPED_RPC_SERVER_ADDRESS') or None) or cfg.get('typed_bind_address', 'tcp://127.0.0.1')
+        # propose / resolve / approve / manage go here. Legacy dill RPC
+        # (42001) is NOT bound in the split-container topology, so clients
+        # must dial the typed query/command ports (42101/42102). Address
+        # resolution: TRADER_TYPED_ADDRESS / TYPED_RPC_SERVER_ADDRESS /
+        # MMR_TYPED_*_ENDPOINT host, then yaml typed_bind with 0.0.0.0→loopback.
+        # Lazily connected on first use (see `_ensure_typed_clients`).
+        self._typed_address = self._resolve_typed_client_address(cfg)
         self._typed_query_port = cfg.get('typed_query_port', 42101)
         self._typed_command_port = cfg.get('typed_command_port', 42102)
-        self._service_hmac_key_file = cfg.get('service_hmac_key_file', '')
+        self._service_hmac_key_file = (
+            (os.getenv('MMR_SERVICE_HMAC_KEY_FILE') or '').strip()
+            or cfg.get('service_hmac_key_file', '')
+        )
         self._typed_query_client: Optional['TypedRpcClient'] = None
         self._typed_command_client: Optional['TypedRpcClient'] = None
 
@@ -308,6 +310,89 @@ class MMR:
             raise ConnectionError("Not connected. Call .connect() first.")
         return self._client
 
+    @staticmethod
+    def _resolve_typed_client_address(cfg: dict) -> str:
+        """Host for typed query/command clients (not the bind address).
+
+        Precedence: ``TRADER_TYPED_ADDRESS`` / ``TYPED_RPC_SERVER_ADDRESS`` →
+        host of ``MMR_TYPED_QUERY_ENDPOINT`` / ``MMR_TYPED_COMMAND_ENDPOINT`` →
+        yaml ``typed_bind_address`` with all-interfaces remapped to loopback
+        (a client cannot dial ``tcp://0.0.0.0``).
+        """
+        for key in ('TRADER_TYPED_ADDRESS', 'TYPED_RPC_SERVER_ADDRESS'):
+            val = (os.getenv(key) or '').strip()
+            if val:
+                return val
+        for key in ('MMR_TYPED_QUERY_ENDPOINT', 'MMR_TYPED_COMMAND_ENDPOINT'):
+            endpoint = (os.getenv(key) or '').strip()
+            if not endpoint:
+                continue
+            from urllib.parse import urlparse
+            parsed = urlparse(endpoint)
+            if parsed.scheme and parsed.hostname:
+                return f'{parsed.scheme}://{parsed.hostname}'
+        bind = (cfg.get('typed_bind_address') or 'tcp://127.0.0.1').strip()
+        # Server bind env (TYPED_BIND_ADDRESS) may override yaml in compose;
+        # honour it only when remapping the client target.
+        env_bind = (os.getenv('TYPED_BIND_ADDRESS') or '').strip()
+        if env_bind:
+            bind = env_bind
+        if bind in ('tcp://0.0.0.0', 'tcp://*', 'tcp://[::]', 'tcp://::'):
+            return 'tcp://127.0.0.1'
+        return bind or 'tcp://127.0.0.1'
+
+    @staticmethod
+    def _instrument_id(symbol: Union[str, int]) -> Optional[int]:
+        """Treat ints and all-digit strings as exact conIds (never as tickers)."""
+        if type(symbol) is int:
+            return symbol
+        if type(symbol) is str and symbol.isnumeric():
+            return int(symbol)
+        return None
+
+    @staticmethod
+    def _security_definition_from_wire(row: dict) -> SecurityDefinition:
+        """Rebuild a SecurityDefinition from typed-RPC instrument wire fields."""
+        return SecurityDefinition(
+            symbol=str(row.get('symbol') or ''),
+            exchange=str(row.get('exchange') or ''),
+            conId=int(row.get('instrument_id') or 0),
+            secType=str(row.get('security_type') or 'STK'),
+            primaryExchange=str(row.get('primary_exchange') or ''),
+            currency=str(row.get('currency') or ''),
+            tradingClass='',
+            includeExpired=False,
+            secIdType='',
+            secId='',
+            description='',
+            minTick=0.01,
+            orderTypes='',
+            validExchanges='',
+            priceMagnifier=1.0,
+            longName='',
+            category='',
+            subcategory='',
+            tradingHours='',
+            timeZoneId=str(row.get('time_zone_id') or ''),
+            liquidHours='',
+            stockType='',
+            minSize=1.0,
+            sizeIncrement=1.0,
+            suggestedSizeIncrement=1.0,
+            bondType='',
+            couponType='',
+            callable=False,
+            putable=False,
+            coupon=0.0,
+            convertable=False,
+            maturity='',
+            issueDate='',
+            nextOptionDate='',
+            nextOptionPartial=False,
+            nextOptionType='',
+            marketRuleIds='',
+        )
+
     # ------------------------------------------------------------------
     # Symbol resolution (internal helper)
     # ------------------------------------------------------------------
@@ -322,58 +407,46 @@ class MMR:
     ) -> List[SecurityDefinition]:
         """Resolve a symbol string or conId to SecurityDefinition(s) via trader_service.
 
-        Lookup order:
-          1. Local universe DB (``Trader.resolve_symbol``). If the caller passed
-             ``exchange``/``universe``, they filter the DB query.
-          2. For integer conIds: return empty if step 1 missed — no IB fallback,
-             conIds must be exact.
-          3. For string symbols: IB discovery via ``resolve_contract``. We ship
-             a Contract populated with whatever hints the caller gave (empty
-             exchange/currency included) and let IB's ``reqContractDetails``
-             return every matching listing. Previous behaviour defaulted empty
-             hints to ``exchange='SMART', currency='USD'`` — that silently
-             picked wrong ADRs for ASX/SEHK/TSE primary listings, which is the
-             "close enough lookup" CLAUDE.md explicitly forbids.
+        Uses the typed query socket (``discover_instrument`` /
+        ``resolve_instrument``) — legacy dill RPC port 42001 is not bound in
+        the split-container topology.
 
-        Returns every surviving candidate after collapsing venue duplicates
-        (same conId, same currency — IB reports each stock on every venue it
-        trades, e.g. AAPL on NASDAQ/BATS/ARCA/ISLAND, which all share one
-        conId). Cross-exchange dual-listings (BHP on ASX vs NYSE) have
-        *different* conIds so they survive and come back as real ambiguity
-        the caller has to resolve.
+        Lookup order (server-side):
+          1. Local universe DB. ``exchange`` filters the query; ``universe`` is
+             accepted for API compatibility but not forwarded on the typed
+             wire (discover has no universe field).
+          2. For conIds (int or all-digit string): exact ``resolve_instrument``
+             — may qualify the same conId via IB ``Contract(conId=N)``, never
+             a fuzzy ticker search (``4391`` must not become TSEJ ``"4391"``).
+          3. For string symbols: IB discovery with the caller's exchange/
+             currency hints (empty included — no SMART/USD defaults).
+
+        Returns candidates after collapsing venue duplicates (same conId +
+        currency). Dual listings with different conIds survive as ambiguity.
         """
-        result = consume(
-            self._rpc.rpc(return_type=list[SecurityDefinition]).resolve_symbol(
-                symbol, exchange, universe, sec_type
+        del universe  # typed discover_instrument has no universe filter
+        instrument_id = self._instrument_id(symbol)
+        if instrument_id is not None:
+            response = self._typed_query.call(
+                'resolve_instrument',
+                {'instrument_id': instrument_id},
+                dict,
             )
+            rows = response.get('instruments') or []
+            return [self._security_definition_from_wire(r) for r in rows]
+
+        response = self._typed_query.call(
+            'discover_instrument',
+            {
+                'symbol': str(symbol),
+                'exchange': exchange or '',
+                'currency': currency or '',
+                'sec_type': sec_type or 'STK',
+            },
+            dict,
         )
-        if result:
-            return result
-
-        # No IB fallback for integer conIds — must be exact.
-        if type(symbol) is int:
-            return []
-
-        if sec_type == 'CASH':
-            # Forex is always IDEALPRO; parse EURUSD-style into base + quote.
-            pair = str(symbol).replace('/', '').replace('C:', '').upper()
-            base = pair[:3] if len(pair) == 6 else pair
-            quote_ccy = pair[3:] if len(pair) == 6 else 'USD'
-            contract = Contract(symbol=base, secType='CASH', exchange='IDEALPRO', currency=quote_ccy)
-        else:
-            # Ship whatever hints the caller gave — empty strings included.
-            # reqContractDetails interprets an unset exchange as "any" and
-            # returns the full candidate list.
-            contract = Contract(
-                symbol=str(symbol),
-                exchange=exchange,
-                secType=sec_type or 'STK',
-                currency=currency,
-            )
-
-        candidates = consume(
-            self._rpc.rpc(return_type=list[SecurityDefinition]).resolve_contract(contract)
-        )
+        rows = response.get('instruments') or []
+        candidates = [self._security_definition_from_wire(r) for r in rows]
         return self._dedupe_venue_duplicates(candidates)
 
     @staticmethod
@@ -435,18 +508,25 @@ class MMR:
                 sec = d
                 break
             else:
-                # No definition matched the hints — re-resolve via IB directly
-                if isinstance(symbol, str):
-                    direct = consume(
-                        self._rpc.rpc(return_type=list[SecurityDefinition]).resolve_contract(
-                            Contract(
-                                symbol=symbol,
-                                exchange=exchange or 'SMART',
-                                secType=sec_type or 'STK',
-                                currency=currency or 'USD',
-                            )
-                        )
+                # No definition matched the hints — ask discover again with
+                # the caller's exchange/currency (SMART/USD only when the
+                # hint itself was empty). Same role as the old IB
+                # resolve_contract fallback when the local universe lied.
+                if isinstance(symbol, str) and not self._instrument_id(symbol):
+                    response = self._typed_query.call(
+                        'discover_instrument',
+                        {
+                            'symbol': str(symbol),
+                            'exchange': exchange or 'SMART',
+                            'currency': currency or 'USD',
+                            'sec_type': sec_type or 'STK',
+                        },
+                        dict,
                     )
+                    direct = [
+                        self._security_definition_from_wire(r)
+                        for r in (response.get('instruments') or [])
+                    ]
                     if direct:
                         sec = direct[0]
         elif len(definitions) > 1:
@@ -1652,6 +1732,29 @@ class MMR:
         if receipt.state == 'RESOLVED':
             return SuccessFail.success(obj=receipt.outcome)
         return SuccessFail.fail(error=f'allocation activation rejected: {receipt.error_code or receipt.state}')
+
+    def suspend_allocation(self, reason: str) -> SuccessFail:
+        """Suspend the account's active allocation authority via ``suspend_allocation``.
+        REQUIRES trader_service. Risk-reducing: no preflight nonce needed,
+        mirroring ``deactivate_live_canary``."""
+        import uuid
+        from trader.domain.commands import CommandReceipt
+        from trader.messaging.typed_rpc import TypedRpcRemoteError
+
+        try:
+            receipt = self._typed_command.call(
+                'suspend_allocation',
+                {'command_id': f'sdk-{uuid.uuid4()}', 'reason': reason},
+                CommandReceipt,
+            )
+        except TypedRpcRemoteError as ex:
+            return SuccessFail.fail(error=f'allocation suspension rejected: {ex.code}: {ex.message}', exception=ex)
+        except (TimeoutError, ConnectionError) as ex:
+            return SuccessFail.fail(error=f'suspend_allocation did not complete: {ex}', exception=ex)
+
+        if receipt.state == 'RESOLVED':
+            return SuccessFail.success(obj=receipt.outcome)
+        return SuccessFail.fail(error=f'allocation suspension rejected: {receipt.error_code or receipt.state}')
 
     def deactivate_live_canary(self, strategy_id: str, reason: str) -> SuccessFail:
         """Suspend an ACTIVE canary authority via ``deactivate_live_canary``.

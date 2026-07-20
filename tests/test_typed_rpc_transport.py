@@ -629,6 +629,15 @@ class TestLoadServiceHmacKey:
         # And it's directly usable to construct a real authenticator.
         HmacServiceAuthenticator(loaded)
 
+    def test_expands_user_home_in_path(self, tmp_path, monkeypatch):
+        key_path = tmp_path / "service_hmac.key"
+        key_bytes = b"w" * 32
+        key_path.write_bytes(key_bytes)
+        key_path.chmod(0o600)
+        monkeypatch.setenv('HOME', str(tmp_path))
+        loaded = load_service_hmac_key('~/service_hmac.key')
+        assert loaded == key_bytes
+
     def test_does_not_strip_trailing_newline(self, tmp_path):
         # Deliberately NOT stripped -- see load_service_hmac_key's docstring:
         # stripping would risk silently truncating real key material that

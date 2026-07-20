@@ -585,6 +585,9 @@ def load_service_hmac_key(path: str) -> bytes:
             "service_hmac_key_file is not configured (empty path) -- "
             "production startup requires a real key file"
         )
+    # trader.yaml ships '~/.config/mmr/...' — expand before existence checks
+    # so in-container `mmr resolve` finds the same key the trader service does.
+    path = os.path.expanduser(path)
     if not os.path.isfile(path):
         raise ServiceHmacKeyError(f"service HMAC key file not found: {path!r}")
 

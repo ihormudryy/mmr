@@ -125,6 +125,27 @@ class FakeTypedClient:
         raise AssertionError(f'FakeTypedClient.call({method!r}, ...) with no queued response')
 
 
+def _wire_instrument(sec) -> dict:
+    """Project a FakeSecurityDefinition (or similar) to typed-RPC wire shape."""
+    return {
+        'instrument_id': int(sec.conId),
+        'symbol': str(sec.symbol),
+        'exchange': str(sec.exchange),
+        'primary_exchange': str(sec.primaryExchange),
+        'currency': str(sec.currency),
+        'security_type': str(sec.secType),
+        'time_zone_id': str(getattr(sec, 'timeZoneId', '') or ''),
+    }
+
+
+def _mmr_with_typed(typed: FakeTypedClient, mock_client=None) -> MMR:
+    """MMR wired to a FakeTypedClient for resolve / discover paths."""
+    mmr = _make_mmr_with_mock(mock_client or _make_mock_rpc())
+    mmr._typed_query_client = typed
+    mmr._typed_command_client = typed
+    return mmr
+
+
 @pytest.fixture
 def typed():
     """A fresh `FakeTypedClient` per test."""
@@ -564,26 +585,26 @@ class TestTrading:
 
     def test_buy_calls_rpc(self):
         mock_client = _make_mock_rpc()
-
-        # Mock resolve_symbol to return a definition
-        sec_def = FakeSecurityDefinition()
-        mock_client.rpc.return_value.resolve_symbol.return_value = [sec_def]
-
-        # Mock place_order_simple to return success
+        typed = FakeTypedClient()
+        typed.queue_query('discover_instrument', {
+            'instruments': [_wire_instrument(FakeSecurityDefinition())],
+        })
         mock_client.rpc.return_value.place_order_simple.return_value = SuccessFail.success()
 
-        mmr = _make_mmr_with_mock(mock_client)
+        mmr = _mmr_with_typed(typed, mock_client)
         result = mmr.buy('AMD', market=True, quantity=10)
 
         assert result.is_success()
 
     def test_sell_calls_rpc(self):
         mock_client = _make_mock_rpc()
-        sec_def = FakeSecurityDefinition()
-        mock_client.rpc.return_value.resolve_symbol.return_value = [sec_def]
+        typed = FakeTypedClient()
+        typed.queue_query('discover_instrument', {
+            'instruments': [_wire_instrument(FakeSecurityDefinition())],
+        })
         mock_client.rpc.return_value.place_order_simple.return_value = SuccessFail.success()
 
-        mmr = _make_mmr_with_mock(mock_client)
+        mmr = _mmr_with_typed(typed, mock_client)
         result = mmr.sell('AMD', market=True, quantity=10)
 
         assert result.is_success()
@@ -690,13 +711,15 @@ class TestToMarket:
 class TestSnapshot:
     def test_snapshot_returns_dict(self):
         mock_client = _make_mock_rpc()
-        sec_def = FakeSecurityDefinition()
-        mock_client.rpc.return_value.resolve_symbol.return_value = [sec_def]
+        typed = FakeTypedClient()
+        typed.queue_query('discover_instrument', {
+            'instruments': [_wire_instrument(FakeSecurityDefinition())],
+        })
 
         ticker = FakeTicker()
         mock_client.rpc.return_value.get_snapshot.return_value = ticker
 
-        mmr = _make_mmr_with_mock(mock_client)
+        mmr = _mmr_with_typed(typed, mock_client)
         result = mmr.snapshot('AMD')
 
         assert isinstance(result, dict)
@@ -705,95 +728,102 @@ class TestSnapshot:
         assert result['ask'] == 150.5
 
 
+class TestResolveTypedAddress:
+    def test_trader_typed_address_wins(self, monkeypatch):
+        monkeypatch.setenv('TRADER_TYPED_ADDRESS', 'tcp://trader')
+        monkeypatch.setenv('TYPED_RPC_SERVER_ADDRESS', 'tcp://other')
+        assert MMR._resolve_typed_client_address({}) == 'tcp://trader'
+
+    def test_endpoint_host_extracted(self, monkeypatch):
+        monkeypatch.delenv('TRADER_TYPED_ADDRESS', raising=False)
+        monkeypatch.delenv('TYPED_RPC_SERVER_ADDRESS', raising=False)
+        monkeypatch.setenv('MMR_TYPED_QUERY_ENDPOINT', 'tcp://trader:42101')
+        assert MMR._resolve_typed_client_address({}) == 'tcp://trader'
+
+    def test_all_interfaces_bind_maps_to_loopback(self, monkeypatch):
+        monkeypatch.delenv('TRADER_TYPED_ADDRESS', raising=False)
+        monkeypatch.delenv('TYPED_RPC_SERVER_ADDRESS', raising=False)
+        monkeypatch.delenv('MMR_TYPED_QUERY_ENDPOINT', raising=False)
+        monkeypatch.delenv('MMR_TYPED_COMMAND_ENDPOINT', raising=False)
+        monkeypatch.setenv('TYPED_BIND_ADDRESS', 'tcp://0.0.0.0')
+        assert MMR._resolve_typed_client_address({}) == 'tcp://127.0.0.1'
+
+
 class TestResolve:
     def test_resolve_returns_list(self):
-        mock_client = _make_mock_rpc()
+        typed = FakeTypedClient()
         sec_def = FakeSecurityDefinition()
-        mock_client.rpc.return_value.resolve_symbol.return_value = [sec_def]
-
-        mmr = _make_mmr_with_mock(mock_client)
+        typed.queue_query('discover_instrument', {'instruments': [_wire_instrument(sec_def)]})
+        mmr = _mmr_with_typed(typed)
         result = mmr.resolve('AMD')
 
         assert len(result) == 1
         assert result[0].symbol == 'AMD'
+        assert typed.queries[0].method == 'discover_instrument'
 
     def test_resolve_contract_raises_on_empty(self):
-        mock_client = _make_mock_rpc()
-        mock_client.rpc.return_value.resolve_symbol.return_value = []
-        mock_client.rpc.return_value.resolve_contract.return_value = []
-
-        mmr = _make_mmr_with_mock(mock_client)
+        typed = FakeTypedClient()
+        typed.queue_query('discover_instrument', {'instruments': []})
+        mmr = _mmr_with_typed(typed)
         with pytest.raises(ValueError, match="Could not resolve"):
             mmr._resolve_contract('NOTREAL')
 
 
 class TestResolveIBDiscovery:
-    """The v2 resolve() ships partial Contracts (no SMART/USD defaults) so
-    IB's reqContractDetails does the discovery. Previously we forced
-    exchange='SMART' currency='USD' when the caller didn't pass hints,
-    which silently picked wrong ADRs for non-US primary listings. The
-    dedupe layer collapses venue duplicates (same conId) while preserving
-    real cross-exchange ambiguity (different conIds)."""
+    """resolve() dials typed discover_instrument with the caller's hints
+    (empty exchange/currency included — no SMART/USD defaults). Server
+    does local + IB discovery; the client dedupes venue duplicates."""
 
-    def test_no_hints_passes_empty_exchange_currency_to_ib(self):
-        """Regression guard for the "close enough" bug. With no exchange
-        or currency hints, we must NOT pre-fill the Contract with
-        SMART/USD — IB does the discovery and we rank what comes back."""
-        mock_client = _make_mock_rpc()
-        mock_client.rpc.return_value.resolve_symbol.return_value = []
+    def test_no_hints_passes_empty_exchange_currency(self):
+        typed = FakeTypedClient()
         asx_def = FakeSecurityDefinition(
             symbol='STO', conId=9999, exchange='ASX',
             primaryExchange='ASX', currency='AUD',
         )
-        mock_client.rpc.return_value.resolve_contract.return_value = [asx_def]
-
-        mmr = _make_mmr_with_mock(mock_client)
+        typed.queue_query('discover_instrument', {'instruments': [_wire_instrument(asx_def)]})
+        mmr = _mmr_with_typed(typed)
         result = mmr.resolve('STO')
 
-        # The call to resolve_contract must have sent exchange='', currency=''
-        # (not 'SMART' / 'USD').
-        call_args = mock_client.rpc.return_value.resolve_contract.call_args
-        sent_contract = call_args.args[0]
-        assert sent_contract.exchange == '', f'expected empty exchange, got {sent_contract.exchange!r}'
-        assert sent_contract.currency == '', f'expected empty currency, got {sent_contract.currency!r}'
-        assert sent_contract.symbol == 'STO'
+        body = typed.queries[0].body
+        assert body['exchange'] == ''
+        assert body['currency'] == ''
+        assert body['symbol'] == 'STO'
         assert len(result) == 1
         assert result[0].exchange == 'ASX'
 
     def test_hints_flow_through(self):
-        """When hints ARE passed, use them — no defaulting."""
-        mock_client = _make_mock_rpc()
-        mock_client.rpc.return_value.resolve_symbol.return_value = []
-        mock_client.rpc.return_value.resolve_contract.return_value = []
-
-        mmr = _make_mmr_with_mock(mock_client)
+        typed = FakeTypedClient()
+        typed.queue_query('discover_instrument', {'instruments': []})
+        mmr = _mmr_with_typed(typed)
         mmr.resolve('BHP', exchange='ASX', currency='AUD')
-        sent = mock_client.rpc.return_value.resolve_contract.call_args.args[0]
-        assert sent.exchange == 'ASX'
-        assert sent.currency == 'AUD'
+        body = typed.queries[0].body
+        assert body['exchange'] == 'ASX'
+        assert body['currency'] == 'AUD'
 
-    def test_integer_conid_does_not_hit_ib(self):
-        """Integer conIds must be exact — no IB discovery fallback even
-        when the local DB misses."""
-        mock_client = _make_mock_rpc()
-        mock_client.rpc.return_value.resolve_symbol.return_value = []
+    def test_integer_conid_uses_resolve_instrument_not_discover(self):
+        """All-digit / int inputs must hit resolve_instrument (exact conId),
+        never discover_instrument (which would search ticker \"4391\")."""
+        typed = FakeTypedClient()
+        typed.queue_query('resolve_instrument', {'instruments': []})
+        mmr = _mmr_with_typed(typed)
+        assert mmr.resolve(4391) == []
+        assert typed.queries[0].method == 'resolve_instrument'
+        assert typed.queries[0].body == {'instrument_id': 4391}
 
-        mmr = _make_mmr_with_mock(mock_client)
-        result = mmr.resolve(4391)
-        assert result == []
-        mock_client.rpc.return_value.resolve_contract.assert_not_called()
+    def test_numeric_string_uses_resolve_instrument(self):
+        typed = FakeTypedClient()
+        typed.queue_query('resolve_instrument', {'instruments': []})
+        mmr = _mmr_with_typed(typed)
+        assert mmr.resolve('4391') == []
+        assert typed.queries[0].method == 'resolve_instrument'
+        assert typed.queries[0].body == {'instrument_id': 4391}
 
 
 class TestResolveDedupe:
-    """Venue-duplicate collapsing: IB reports a stock on every venue it
-    trades (NASDAQ, BATS, ARCA, ISLAND, …) all sharing one conId. One
-    row per *listing* is what the caller wants."""
+    """Venue-duplicate collapsing on the client after typed wire rows."""
 
     def test_venue_duplicates_collapse_by_conid_and_currency(self):
-        mock_client = _make_mock_rpc()
-        mock_client.rpc.return_value.resolve_symbol.return_value = []
-        # All 4 "copies" of AAPL share conId 265598, currency USD — just
-        # different exchanges.
+        typed = FakeTypedClient()
         venues = [
             FakeSecurityDefinition(symbol='AAPL', conId=265598, exchange='NASDAQ',
                                    primaryExchange='NASDAQ', currency='USD'),
@@ -804,47 +834,46 @@ class TestResolveDedupe:
             FakeSecurityDefinition(symbol='AAPL', conId=265598, exchange='ISLAND',
                                    primaryExchange='NASDAQ', currency='USD'),
         ]
-        mock_client.rpc.return_value.resolve_contract.return_value = venues
-
-        mmr = _make_mmr_with_mock(mock_client)
+        typed.queue_query('discover_instrument', {
+            'instruments': [_wire_instrument(v) for v in venues],
+        })
+        mmr = _mmr_with_typed(typed)
         result = mmr.resolve('AAPL')
         assert len(result) == 1, f'expected 1 after dedupe, got {len(result)}'
-        # The row we kept should be the primary-exchange one
         assert result[0].exchange == 'NASDAQ'
         assert result[0].primaryExchange == 'NASDAQ'
 
     def test_dual_listing_survives_dedupe(self):
-        """Dual-listed tickers (BHP on ASX + NYSE) have *different* conIds,
-        so dedupe keeps both and surfaces real ambiguity to the caller."""
-        mock_client = _make_mock_rpc()
-        mock_client.rpc.return_value.resolve_symbol.return_value = []
-        mock_client.rpc.return_value.resolve_contract.return_value = [
-            FakeSecurityDefinition(symbol='BHP', conId=1001, exchange='ASX',
-                                   primaryExchange='ASX', currency='AUD'),
-            FakeSecurityDefinition(symbol='BHP', conId=2002, exchange='NYSE',
-                                   primaryExchange='NYSE', currency='USD'),
-        ]
-        mmr = _make_mmr_with_mock(mock_client)
+        typed = FakeTypedClient()
+        typed.queue_query('discover_instrument', {
+            'instruments': [
+                _wire_instrument(FakeSecurityDefinition(
+                    symbol='BHP', conId=1001, exchange='ASX',
+                    primaryExchange='ASX', currency='AUD')),
+                _wire_instrument(FakeSecurityDefinition(
+                    symbol='BHP', conId=2002, exchange='NYSE',
+                    primaryExchange='NYSE', currency='USD')),
+            ],
+        })
+        mmr = _mmr_with_typed(typed)
         result = mmr.resolve('BHP')
         assert len(result) == 2
         currencies = {r.currency for r in result}
         assert currencies == {'AUD', 'USD'}
 
     def test_dedupe_prefers_primary_exchange_match(self):
-        """Within a conId group, keep the row where exchange ==
-        primaryExchange (the "home" listing, not a routed venue copy).
-        Previous row gets dropped even when seen first."""
-        mock_client = _make_mock_rpc()
-        mock_client.rpc.return_value.resolve_symbol.return_value = []
-        mock_client.rpc.return_value.resolve_contract.return_value = [
-            # Routed venue copy comes first
-            FakeSecurityDefinition(symbol='AAPL', conId=265598, exchange='BATS',
-                                   primaryExchange='NASDAQ', currency='USD'),
-            # Primary listing comes second — should win
-            FakeSecurityDefinition(symbol='AAPL', conId=265598, exchange='NASDAQ',
-                                   primaryExchange='NASDAQ', currency='USD'),
-        ]
-        mmr = _make_mmr_with_mock(mock_client)
+        typed = FakeTypedClient()
+        typed.queue_query('discover_instrument', {
+            'instruments': [
+                _wire_instrument(FakeSecurityDefinition(
+                    symbol='AAPL', conId=265598, exchange='BATS',
+                    primaryExchange='NASDAQ', currency='USD')),
+                _wire_instrument(FakeSecurityDefinition(
+                    symbol='AAPL', conId=265598, exchange='NASDAQ',
+                    primaryExchange='NASDAQ', currency='USD')),
+            ],
+        })
+        mmr = _mmr_with_typed(typed)
         result = mmr.resolve('AAPL')
         assert len(result) == 1
         assert result[0].exchange == 'NASDAQ'
@@ -854,11 +883,9 @@ class TestResolveDedupe:
         assert mmr._dedupe_venue_duplicates([]) == []
 
     def test_unknown_symbol_returns_empty(self):
-        """IB has no listing → empty list, no error raised."""
-        mock_client = _make_mock_rpc()
-        mock_client.rpc.return_value.resolve_symbol.return_value = []
-        mock_client.rpc.return_value.resolve_contract.return_value = []
-        mmr = _make_mmr_with_mock(mock_client)
+        typed = FakeTypedClient()
+        typed.queue_query('discover_instrument', {'instruments': []})
+        mmr = _mmr_with_typed(typed)
         assert mmr.resolve('ZZZZZZ') == []
 
 
@@ -866,8 +893,7 @@ class TestResolveContractExchangeCurrency:
     """Test that _resolve_contract respects exchange/currency hints."""
 
     def test_prefers_asx_when_exchange_hint_given(self):
-        """With exchange='ASX', pick the ASX definition over the US one."""
-        mock_client = _make_mock_rpc()
+        typed = FakeTypedClient()
         us_def = FakeSecurityDefinition(
             symbol='BHP', conId=1234, exchange='SMART',
             primaryExchange='NYSE', currency='USD',
@@ -876,20 +902,19 @@ class TestResolveContractExchangeCurrency:
             symbol='BHP', conId=5678, exchange='ASX',
             primaryExchange='ASX', currency='AUD',
         )
-        mock_client.rpc.return_value.resolve_symbol.return_value = [us_def, asx_def]
-
-        mmr = _make_mmr_with_mock(mock_client)
+        typed.queue_query('discover_instrument', {
+            'instruments': [_wire_instrument(us_def), _wire_instrument(asx_def)],
+        })
+        mmr = _mmr_with_typed(typed)
         contract = mmr._resolve_contract('BHP', exchange='ASX')
 
         assert contract.conId == 5678
         assert contract.currency == 'AUD'
-        # Non-US exchanges use SMART routing with primaryExchange set
         assert contract.exchange == 'SMART'
         assert contract.primaryExchange == 'ASX'
 
     def test_prefers_currency_hint(self):
-        """With currency='AUD', pick the AUD definition."""
-        mock_client = _make_mock_rpc()
+        typed = FakeTypedClient()
         us_def = FakeSecurityDefinition(
             symbol='BHP', conId=1234, exchange='SMART',
             primaryExchange='NYSE', currency='USD',
@@ -898,17 +923,17 @@ class TestResolveContractExchangeCurrency:
             symbol='BHP', conId=5678, exchange='ASX',
             primaryExchange='ASX', currency='AUD',
         )
-        mock_client.rpc.return_value.resolve_symbol.return_value = [us_def, asx_def]
-
-        mmr = _make_mmr_with_mock(mock_client)
+        typed.queue_query('discover_instrument', {
+            'instruments': [_wire_instrument(us_def), _wire_instrument(asx_def)],
+        })
+        mmr = _mmr_with_typed(typed)
         contract = mmr._resolve_contract('BHP', currency='AUD')
 
         assert contract.conId == 5678
         assert contract.currency == 'AUD'
 
     def test_exchange_and_currency_together(self):
-        """Both exchange and currency narrow the selection."""
-        mock_client = _make_mock_rpc()
+        typed = FakeTypedClient()
         us_def = FakeSecurityDefinition(
             symbol='BHP', conId=1111, exchange='SMART',
             primaryExchange='NYSE', currency='USD',
@@ -921,16 +946,20 @@ class TestResolveContractExchangeCurrency:
             symbol='BHP', conId=3333, exchange='ASX',
             primaryExchange='ASX', currency='AUD',
         )
-        mock_client.rpc.return_value.resolve_symbol.return_value = [us_def, lse_def, asx_def]
-
-        mmr = _make_mmr_with_mock(mock_client)
+        typed.queue_query('discover_instrument', {
+            'instruments': [
+                _wire_instrument(us_def),
+                _wire_instrument(lse_def),
+                _wire_instrument(asx_def),
+            ],
+        })
+        mmr = _mmr_with_typed(typed)
         contract = mmr._resolve_contract('BHP', exchange='ASX', currency='AUD')
 
         assert contract.conId == 3333
 
     def test_no_hint_prefers_usd(self):
-        """Without hints, the existing US/USD preference is preserved."""
-        mock_client = _make_mock_rpc()
+        typed = FakeTypedClient()
         asx_def = FakeSecurityDefinition(
             symbol='BHP', conId=5678, exchange='ASX',
             primaryExchange='ASX', currency='AUD',
@@ -939,18 +968,17 @@ class TestResolveContractExchangeCurrency:
             symbol='BHP', conId=1234, exchange='SMART',
             primaryExchange='NYSE', currency='USD',
         )
-        # ASX listed first, but USD should still win
-        mock_client.rpc.return_value.resolve_symbol.return_value = [asx_def, us_def]
-
-        mmr = _make_mmr_with_mock(mock_client)
+        typed.queue_query('discover_instrument', {
+            'instruments': [_wire_instrument(asx_def), _wire_instrument(us_def)],
+        })
+        mmr = _mmr_with_typed(typed)
         contract = mmr._resolve_contract('BHP')
 
         assert contract.conId == 1234
         assert contract.currency == 'USD'
 
     def test_matches_primary_exchange(self):
-        """exchange hint should match against primaryExchange too."""
-        mock_client = _make_mock_rpc()
+        typed = FakeTypedClient()
         us_def = FakeSecurityDefinition(
             symbol='BHP', conId=1234, exchange='SMART',
             primaryExchange='NYSE', currency='USD',
@@ -959,16 +987,16 @@ class TestResolveContractExchangeCurrency:
             symbol='BHP', conId=5678, exchange='SMART',
             primaryExchange='ASX', currency='AUD',
         )
-        mock_client.rpc.return_value.resolve_symbol.return_value = [us_def, asx_def]
-
-        mmr = _make_mmr_with_mock(mock_client)
+        typed.queue_query('discover_instrument', {
+            'instruments': [_wire_instrument(us_def), _wire_instrument(asx_def)],
+        })
+        mmr = _mmr_with_typed(typed)
         contract = mmr._resolve_contract('BHP', exchange='ASX')
 
         assert contract.conId == 5678
 
     def test_case_insensitive_hints(self):
-        """exchange/currency hints should be case-insensitive."""
-        mock_client = _make_mock_rpc()
+        typed = FakeTypedClient()
         us_def = FakeSecurityDefinition(
             symbol='BHP', conId=1234, exchange='SMART',
             primaryExchange='NYSE', currency='USD',
@@ -977,17 +1005,18 @@ class TestResolveContractExchangeCurrency:
             symbol='BHP', conId=5678, exchange='ASX',
             primaryExchange='ASX', currency='AUD',
         )
-        mock_client.rpc.return_value.resolve_symbol.return_value = [us_def, asx_def]
-
-        mmr = _make_mmr_with_mock(mock_client)
+        typed.queue_query('discover_instrument', {
+            'instruments': [_wire_instrument(us_def), _wire_instrument(asx_def)],
+        })
+        mmr = _mmr_with_typed(typed)
         contract = mmr._resolve_contract('BHP', exchange='asx', currency='aud')
 
         assert contract.conId == 5678
 
     def test_re_resolves_via_ib_when_universe_returns_wrong_exchange(self):
-        """When the local universe only has a USD def but caller wants ASX/AUD,
-        re-resolve via IB with the correct exchange/currency."""
-        mock_client = _make_mock_rpc()
+        """When discover returns only a USD def but caller wants ASX/AUD,
+        re-call discover with the correct exchange/currency."""
+        typed = FakeTypedClient()
         us_def = FakeSecurityDefinition(
             symbol='NAB', conId=1111, exchange='SMART',
             primaryExchange='NYSE', currency='USD',
@@ -996,34 +1025,31 @@ class TestResolveContractExchangeCurrency:
             symbol='NAB', conId=9999, exchange='ASX',
             primaryExchange='ASX', currency='AUD',
         )
-        # Universe returns only the US definition
-        mock_client.rpc.return_value.resolve_symbol.return_value = [us_def]
-        # IB re-resolve returns the ASX definition
-        mock_client.rpc.return_value.resolve_contract.return_value = [asx_def]
+        typed.queue_query('discover_instrument', {'instruments': [_wire_instrument(us_def)]})
+        typed.queue_query('discover_instrument', {'instruments': [_wire_instrument(asx_def)]})
 
-        mmr = _make_mmr_with_mock(mock_client)
+        mmr = _mmr_with_typed(typed)
         contract = mmr._resolve_contract('NAB', exchange='ASX', currency='AUD')
 
         assert contract.conId == 9999
         assert contract.currency == 'AUD'
         assert contract.primaryExchange == 'ASX'
+        assert len(typed.queries) == 2
 
     def test_single_matching_def_no_re_resolve(self):
-        """When the single definition matches the hints, don't re-resolve."""
-        mock_client = _make_mock_rpc()
+        typed = FakeTypedClient()
         asx_def = FakeSecurityDefinition(
             symbol='NAB', conId=9999, exchange='ASX',
             primaryExchange='ASX', currency='AUD',
         )
-        mock_client.rpc.return_value.resolve_symbol.return_value = [asx_def]
+        typed.queue_query('discover_instrument', {'instruments': [_wire_instrument(asx_def)]})
 
-        mmr = _make_mmr_with_mock(mock_client)
+        mmr = _mmr_with_typed(typed)
         contract = mmr._resolve_contract('NAB', exchange='ASX', currency='AUD')
 
         assert contract.conId == 9999
         assert contract.currency == 'AUD'
-        # resolve_contract (IB fallback) should NOT have been called
-        mock_client.rpc.return_value.resolve_contract.assert_not_called()
+        assert len(typed.queries) == 1
 
 
 class TestStrategies:
@@ -1430,8 +1456,10 @@ class TestTypedProposalAdapters:
         assert typed.commands[0].body['expected_version'] == 5
 
     def test_sdk_propose_and_reject_are_typed_calls(self, mmr, typed):
-        mmr._rpc.rpc().resolve_symbol.return_value = [
-            FakeSecurityDefinition(symbol='AAPL', conId=265598)]
+        typed.queue_query('discover_instrument', {
+            'instruments': [_wire_instrument(
+                FakeSecurityDefinition(symbol='AAPL', conId=265598))],
+        })
         typed.queue_command('create_proposal', CommandReceipt(
             'c1', 'c1', 'RESOLVED', {'proposal_id': 41, 'revision': 1}, None, False))
         created = mmr.propose(symbol='AAPL', action='BUY', confidence=0.7, group='tech')
@@ -1445,8 +1473,10 @@ class TestTypedProposalAdapters:
         """A bracket/stop/limit execution spec must be refused loudly, not
         silently downgraded to a plain market order (CreateProposalRequest
         doesn't carry an execution spec yet)."""
-        mmr._rpc.rpc().resolve_symbol.return_value = [
-            FakeSecurityDefinition(symbol='AAPL', conId=265598)]
+        typed.queue_query('discover_instrument', {
+            'instruments': [_wire_instrument(
+                FakeSecurityDefinition(symbol='AAPL', conId=265598))],
+        })
         spec = ExecutionSpec(exit_type='STOP_LOSS', stop_loss_price=140.0)
         result = mmr.propose(symbol='AAPL', action='BUY', quantity=10, execution=spec)
         assert not result.is_success()

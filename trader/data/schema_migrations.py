@@ -14,7 +14,8 @@ double-apply DDL that assumes it is fresh. Callers must stay inside their
 assigned range.
 
 P1 command-plane safety continues the F3-owned range: migration 24 is the
-durable automation breaker and incident ledger.
+durable automation breaker and incident ledger. P3 deterministic automation
+owns **30-39** (protective order sagas begin at migration 30).
 
 ``SchemaMigrator`` is deliberately storage-agnostic about *which* file it
 targets — it operates on whatever ``DuckDBConnection`` it is constructed

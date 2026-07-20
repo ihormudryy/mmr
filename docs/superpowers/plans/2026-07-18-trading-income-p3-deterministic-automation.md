@@ -107,12 +107,12 @@
 
 **Journal migration 30:** `automated_order_sagas` keyed by command/order group with states `VALIDATED`, `SUBMITTING`, `ENTRY_WORKING`, `PARTIALLY_FILLED`, `PROTECTED`, `EXITING`, `CLOSED`, `OUTCOME_UNKNOWN`, `SAFETY_FAILED`.
 
-- [ ] Test broker-native bracket/OCA construction, deterministic order refs, transmit ordering, parent/child quantity, stop side/price, and no unrestricted market fallback.
-- [ ] Test parent rejection, child rejection, missing protection, partial parent fill, protection quantity adjustment, stop fill, target fill, cancel race, disconnect, duplicate broker events, and restart.
-- [ ] Assert an entry fill without confirmed working protection immediately trips P1 breaker and starts verified liquidation.
-- [ ] Implement saga transitions transactionally with domain events and command correlation. Broker events, not submit returns, advance working/filled states.
-- [ ] Re-run P1 dispatch guard immediately before the first IB side effect.
-- [ ] Run focused tests and commit `feat(automation): add broker-protective order saga`.
+- [x] Test broker-native bracket/OCA construction, deterministic order refs, transmit ordering, parent/child quantity, stop side/price, and no unrestricted market fallback.
+- [x] Test parent rejection, child rejection, missing protection, partial parent fill, protection quantity adjustment, stop fill, target fill, cancel race, disconnect, duplicate broker events, and restart.
+- [x] Assert an entry fill without confirmed working protection immediately trips P1 breaker and starts verified liquidation.
+- [x] Implement saga transitions transactionally with domain events and command correlation. Broker events, not submit returns, advance working/filled states.
+- [x] Re-run P1 dispatch guard immediately before the first IB side effect.
+- [x] Run focused tests and commit `feat(automation): add broker-protective order saga`.
 
 ### Task 6: Add session deadlines and deterministic time exits
 

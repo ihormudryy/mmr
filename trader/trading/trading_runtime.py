@@ -1431,6 +1431,9 @@ class Trader():
                     tif=spec.tif,
                     outsideRth=spec.outside_rth,
                 )
+                if spec.oca_group:
+                    tp.ocaGroup = spec.oca_group
+                    tp.ocaType = 1  # cancel remaining on fill
                 tp_trade = await _place_and_wait(contract, tp)
                 if tp_trade is None:
                     # Roll back the staged entry — it was transmit=False so no
@@ -1455,6 +1458,9 @@ class Trader():
                     tif=spec.tif,
                     outsideRth=spec.outside_rth,
                 )
+                if spec.oca_group:
+                    sl.ocaGroup = spec.oca_group
+                    sl.ocaType = 1
                 sl_trade = await _place_and_wait(contract, sl)
                 if sl_trade is None:
                     # Same as above: cancel TP + entry before the bracket is

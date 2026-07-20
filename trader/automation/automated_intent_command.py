@@ -6,6 +6,9 @@ module validates principal + intent identity, re-verifies the artifact bundle,
 audits authority digests (via the coordinator's RECEIVED audit of ``body``),
 and dispatches through an injected port so tests can prove exactly-once
 delivery without talking to IB.
+
+When a ``ProtectiveOrderSaga`` is injected, session risk + DispatchGuard +
+bracket submit run inside ``saga.start`` (Task 5) instead of a bare dispatch.
 """
 from __future__ import annotations
 
@@ -22,7 +25,7 @@ from trader.automation.models import (
     TimeExitPolicy,
 )
 from trader.domain.commands import CommandReceipt
-from trader.trading.command_coordinator import CommandRequest
+from trader.trading.command_coordinator import BrokerRejectedError, CommandRequest
 from trader.trading.order_correlation import encode_order_ref
 
 STRATEGY_PRINCIPAL = "strategy_service"
@@ -44,6 +47,11 @@ class ArtifactVerifierPort(Protocol):
         *,
         revoked_digests: tuple[str, ...] = (),
     ) -> Any:
+        ...
+
+
+class ProtectiveSagaPort(Protocol):
+    def start(self, *, intent, approval, request, artifact, session_state, allocation) -> Any:
         ...
 
 
@@ -132,6 +140,10 @@ class AutomatedIntentCommandService:
         now: Callable[[], dt.datetime],
         bundle_root: Path,
         schedule_reconcile: Optional[Callable[[str], None]] = None,
+        protective_saga: Optional[ProtectiveSagaPort] = None,
+        approval_factory: Optional[Callable[..., Any]] = None,
+        session_state_factory: Optional[Callable[..., Any]] = None,
+        allocation_factory: Optional[Callable[..., Any]] = None,
     ):
         self._ledger = ledger
         self._audit = audit
@@ -144,6 +156,10 @@ class AutomatedIntentCommandService:
         self._now = now
         self._bundle_root = Path(bundle_root)
         self._schedule_reconcile = schedule_reconcile
+        self._protective_saga = protective_saga
+        self._approval_factory = approval_factory
+        self._session_state_factory = session_state_factory
+        self._allocation_factory = allocation_factory
 
     def execute(self, cmd: CommandRequest) -> CommandReceipt:
         if cmd.source not in _ALLOWED_PRINCIPALS:
@@ -174,7 +190,7 @@ class AutomatedIntentCommandService:
 
         bundle_path = self._bundle_path(str(bundle_digest))
         try:
-            self._verifier.verify(
+            artifact = self._verifier.verify(
                 bundle_path,
                 intent.account_mode,
                 intent.artifact_id,
@@ -212,6 +228,12 @@ class AutomatedIntentCommandService:
             self._transition(cmd, "VALIDATED", "REJECTED", error_code=code)
             return self._receipt(cmd.command_id, "REJECTED", code, True)
 
+        # Task 5 path: protective saga owns risk + guard + bracket submit.
+        if self._protective_saga is not None and self._approval_factory is not None:
+            return self._execute_via_saga(
+                cmd, intent, artifact, order_group_id, bundle_digest,
+            )
+
         try:
             submitted = self._dispatch.submit(
                 intent=intent, order_group_id=order_group_id, order_ref=order_ref,
@@ -227,6 +249,69 @@ class AutomatedIntentCommandService:
             )
 
         order_ids = list(getattr(submitted, "order_ids", []) or [])
+        return self._finish_submitted(
+            cmd, intent, order_group_id, order_ids, bundle_digest,
+        )
+
+    def _execute_via_saga(
+        self, cmd, intent, artifact, order_group_id, bundle_digest,
+    ) -> CommandReceipt:
+        approval = self._approval_factory(intent=intent, command=cmd)
+        session_state = (
+            self._session_state_factory(intent=intent, command=cmd)
+            if self._session_state_factory is not None else None
+        )
+        allocation = (
+            self._allocation_factory(intent=intent, artifact=artifact, command=cmd)
+            if self._allocation_factory is not None else None
+        )
+        try:
+            saga_state = self._protective_saga.start(
+                intent=intent,
+                approval=approval,
+                request=cmd,
+                artifact=artifact,
+                session_state=session_state,
+                allocation=allocation,
+            )
+        except BrokerRejectedError:
+            self._transition(cmd, "SUBMITTING", "REJECTED", error_code="BROKER_REJECTED")
+            return self._receipt(cmd.command_id, "REJECTED", "BROKER_REJECTED", False)
+        except Exception:
+            self._transition(
+                cmd, "SUBMITTING", "OUTCOME_UNKNOWN", error_code="DISPATCH_AMBIGUOUS",
+            )
+            if self._schedule_reconcile is not None:
+                self._schedule_reconcile(cmd.command_id)
+            return self._receipt(
+                cmd.command_id, "OUTCOME_UNKNOWN", "DISPATCH_AMBIGUOUS", False,
+            )
+
+        if saga_state.state == "CLOSED" and saga_state.error_code:
+            self._transition(
+                cmd, "SUBMITTING", "REJECTED", error_code=saga_state.error_code,
+            )
+            return self._receipt(
+                cmd.command_id, "REJECTED", saga_state.error_code, False,
+            )
+        if saga_state.state == "OUTCOME_UNKNOWN":
+            self._transition(
+                cmd, "SUBMITTING", "OUTCOME_UNKNOWN", error_code="DISPATCH_AMBIGUOUS",
+            )
+            if self._schedule_reconcile is not None:
+                self._schedule_reconcile(cmd.command_id)
+            return self._receipt(
+                cmd.command_id, "OUTCOME_UNKNOWN", "DISPATCH_AMBIGUOUS", False,
+            )
+
+        order_ids = list(saga_state.submitted_order_ids or [])
+        return self._finish_submitted(
+            cmd, intent, order_group_id, order_ids, bundle_digest,
+        )
+
+    def _finish_submitted(
+        self, cmd, intent, order_group_id, order_ids, bundle_digest,
+    ) -> CommandReceipt:
         outcome = {
             "order_ids": order_ids,
             "order_group_id": order_group_id,

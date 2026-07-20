@@ -183,3 +183,22 @@ async def test_skip_risk_gate_bypasses_gates():
 
     await ex.place_order(pair, condition=ExecutorCondition.NO_CHECKS, skip_risk_gate=True)
     assert trader.client.subscribe_place_order.call_count == 1
+
+
+def test_execution_spec_carries_oca_group_for_protective_brackets():
+    """P3 Task 5: bracket children share an explicit OCA group via ExecutionSpec."""
+    from trader.trading.proposal import ExecutionSpec
+
+    spec = ExecutionSpec(
+        order_type='LIMIT',
+        limit_price=160.0,
+        exit_type='BRACKET',
+        take_profit_price=200.0,
+        stop_loss_price=150.0,
+        oca_group='oca-og-auto-1',
+        outside_rth=False,
+    )
+    assert spec.validate() == []
+    round_trip = ExecutionSpec.from_dict(spec.to_dict())
+    assert round_trip.oca_group == 'oca-og-auto-1'
+    assert round_trip.exit_type == 'BRACKET'

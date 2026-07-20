@@ -133,6 +133,8 @@ class CommandStack:
     semantic_readiness: SemanticReadiness
     liquidation_service: LiquidationService
     session_risk: Any = None  # SessionRiskController when automation stack is active
+    protective_order_saga: Any = None  # ProtectiveOrderSaga (P3 Task 5)
+    dispatch_guard: Any = None
 
 
 _REQUIRED_TRADER_PORTS = (
@@ -209,6 +211,12 @@ def build_command_stack(
     apply_preflight_nonce_migration(migrator)
     apply_circuit_breaker_migration(migrator)
     apply_liquidation_migration(migrator)
+    from trader.automation.protective_order_saga import (
+        ProtectiveBracketDispatch,
+        ProtectiveOrderSaga,
+        apply_protective_order_saga_migration,
+    )
+    apply_protective_order_saga_migration(migrator)
 
     repository = ProposalRepository(journal)
     ledger = CommandLedger(journal)
@@ -407,6 +415,21 @@ def build_command_stack(
         breaker=circuit_breaker,
         now=now,
     )
+    # P3 Task 5 — protective entry saga over existing expressive-order path.
+    protective_dispatch = ProtectiveBracketDispatch(dispatch)
+    protective_order_saga = ProtectiveOrderSaga(
+        journal=journal,
+        ledger=ledger,
+        dispatch=protective_dispatch,
+        dispatch_guard=dispatch_guard,
+        session_risk=session_risk,
+        breaker=circuit_breaker,
+        liquidation=liquidation_service,
+        account_id=trader.ib_account,
+        account_mode=account_mode,
+        now=now,
+        db=trader.journal_db,
+    )
     stack = CommandStack(
         journal=journal,
         repository=repository,
@@ -425,6 +448,8 @@ def build_command_stack(
         semantic_readiness=semantic_readiness,
         liquidation_service=liquidation_service,
         session_risk=session_risk,
+        protective_order_saga=protective_order_saga,
+        dispatch_guard=dispatch_guard,
     )
     trader.command_ledger = ledger
     trader.command_reconciler = reconciler
@@ -434,4 +459,5 @@ def build_command_stack(
     trader.semantic_readiness = semantic_readiness
     trader.liquidation_service = liquidation_service
     trader.session_risk = session_risk
+    trader.protective_order_saga = protective_order_saga
     return stack

@@ -46,6 +46,8 @@ class ExecutionSpec:
     tif: str = 'DAY'
     outside_rth: bool = True
     good_till_date: Optional[str] = None
+    # Broker-native OCA group for attached stop+target children (P3 automation).
+    oca_group: Optional[str] = None
 
     def to_dict(self) -> dict:
         return {k: v for k, v in asdict(self).items() if v is not None}

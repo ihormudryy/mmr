@@ -185,9 +185,74 @@ def test_one_registry_contains_reads_feed_ingest_and_landed_commands(tmp_path):
         ("command", "cancel_order"),
         ("command", "pause_trading"),
         ("command", "resume_trading"),
+        ("command", "activate_paper_automation"),
+        ("command", "deactivate_paper_automation"),
+        ("query", "get_paper_automation_status"),
     }
     for role, method in expected:
         assert registry.contains(role, method), (role, method)
+
+
+def test_enabled_stack_wires_paper_automation_service_and_preflight_policy(
+    tmp_path, monkeypatch,
+):
+    from trader.trading.command_stack import build_command_stack
+
+    home = tmp_path / "home"
+    trader_yaml = tmp_path / "custom" / "trader.yaml"
+    strategy_yaml = tmp_path / "custom" / "strategies.yaml"
+    monkeypatch.setenv("HOME", str(home))
+    monkeypatch.setenv("TRADER_CONFIG", str(trader_yaml))
+    trader = _trader(tmp_path)
+    trader.strategy_config_file = str(strategy_yaml)
+
+    stack = build_command_stack(trader, _policy(), now=lambda: NOW)
+
+    service = stack.paper_automation_service
+    assert service._trader_yaml_path == trader_yaml
+    assert service._strategy_yaml_path == strategy_yaml
+    assert service._config_dir == home / ".config" / "mmr"
+    assert service._share_dir == home / ".local" / "share" / "mmr"
+    assert service._account_mode == "paper"
+    assert service._command_authority_enabled is True
+
+    registry = build_production_registry(
+        trader,
+        HmacServiceAuthenticator(b"k" * 32, now=lambda: 1_700_000_000.0),
+        command_stack=stack,
+    )
+    assert registry.contains("command", "activate_paper_automation")
+    assert registry.contains("command", "deactivate_paper_automation")
+    assert registry.contains("query", "get_paper_automation_status")
+    assert stack.coordinator._actions["activate_paper_automation"].requires_preflight is True
+    assert stack.coordinator._actions["deactivate_paper_automation"].requires_preflight is False
+
+
+def test_paper_automation_action_maps_activation_error_code():
+    from trader.automation.paper_activation import PaperAutomationActivationError
+    from trader.messaging.production_api import _paper_automation_action
+    from trader.trading.command_coordinator import CommandRequest, CommandValidationError
+
+    class RefusingService:
+        def activate(self, **_kwargs):
+            raise PaperAutomationActivationError("NOT_PAPER", "paper account required")
+
+    action = _paper_automation_action(RefusingService(), activate=True)
+    request = CommandRequest(
+        command_id="activate-paper-1",
+        action="activate_paper_automation",
+        account_id="DU111111",
+        target_type="paper_automation",
+        target_id="orb_gld",
+        expected_version=None,
+        body={"strategy_name": "orb_gld", "reason": "operator approved"},
+        source="operator",
+    )
+
+    with pytest.raises(CommandValidationError) as exc:
+        action(request)
+
+    assert exc.value.code == "NOT_PAPER"
 
 
 def test_enabled_stack_attaches_recovery_components_to_trader(tmp_path):

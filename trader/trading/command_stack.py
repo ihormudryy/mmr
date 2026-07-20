@@ -3,7 +3,9 @@ from __future__ import annotations
 
 import asyncio
 import datetime as dt
+import os
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Any, Callable, Optional
 
 from trader.data.proposal_repository import (
@@ -301,6 +303,7 @@ class CommandStack:
     # canary public-key ring is configured (dormant by default; see build_command_stack)
     allocation_service: Any = None  # AllocationActivationService (P5 Task 3)
     automated_intent_service: Any = None  # AutomatedIntentCommandService (paper automation)
+    paper_automation_service: Any = None  # Restart-required paper activation authority
 
 
 _REQUIRED_TRADER_PORTS = (
@@ -854,6 +857,24 @@ def build_command_stack(
             command_id, now(),
         ),
     )
+    from trader.automation.paper_activation import PaperAutomationActivationService
+
+    trader_yaml_path = Path(
+        os.environ.get("TRADER_CONFIG", "~/.config/mmr/trader.yaml")
+    ).expanduser()
+    strategy_yaml_path = Path(
+        getattr(trader, "strategy_config_file", None)
+        or "~/.config/mmr/strategy_runtime.yaml"
+    ).expanduser()
+    paper_automation_service = PaperAutomationActivationService(
+        trader_yaml_path=trader_yaml_path,
+        strategy_yaml_path=strategy_yaml_path,
+        config_dir=Path("~/.config/mmr").expanduser(),
+        share_dir=Path("~/.local/share/mmr").expanduser(),
+        account_mode=account_mode,
+        command_authority_enabled=policy.enabled,
+        now=now,
+    )
 
     stack = CommandStack(
         journal=journal,
@@ -883,6 +904,7 @@ def build_command_stack(
         canary_service=canary_service,
         allocation_service=allocation_service,
         automated_intent_service=automated_intent_service,
+        paper_automation_service=paper_automation_service,
     )
     trader.command_ledger = ledger
     trader.command_reconciler = reconciler

@@ -835,6 +835,54 @@ class SuspendAllocationRequest(BaseModel):
         return value.strip()
 
 
+class ActivatePaperAutomationRequest(BaseModel):
+    """Prepare restart-required paper automation materials and configuration."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    command_id: str
+    strategy_name: str = Field(min_length=1)
+    reason: str = Field(min_length=1, max_length=200)
+    preflight_nonce: Optional[str] = None
+
+    @field_validator("command_id")
+    @classmethod
+    def _command_id_has_no_colon(cls, value: str) -> str:
+        return _reject_colon_in_command_id(value)
+
+    @field_validator("strategy_name", "reason")
+    @classmethod
+    def _value_is_not_blank(cls, value: str) -> str:
+        if not value.strip():
+            raise ValueError("value must not be blank")
+        return value.strip()
+
+
+class DeactivatePaperAutomationRequest(BaseModel):
+    """Persist paper automation disablement; takes effect after restart."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    command_id: str
+    reason: str = Field(min_length=1, max_length=200)
+
+    @field_validator("command_id")
+    @classmethod
+    def _command_id_has_no_colon(cls, value: str) -> str:
+        return _reject_colon_in_command_id(value)
+
+    @field_validator("reason")
+    @classmethod
+    def _reason_is_not_blank(cls, value: str) -> str:
+        if not value.strip():
+            raise ValueError("reason must not be blank")
+        return value.strip()
+
+
+class GetPaperAutomationStatusRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+
 class GetTradingControlRequest(BaseModel):
     """No fields: this always reads the coordinator's own configured
     account, exactly like the command above never accepts one."""
@@ -1188,6 +1236,70 @@ def _suspend_allocation_rpc_handler(coordinator: TradingCommandCoordinator, acco
     return _handler
 
 
+def _paper_automation_action(paper_automation_service, *, activate: bool):
+    """Translate coded activation refusals into command receipts."""
+    from trader.automation.paper_activation import PaperAutomationActivationError
+
+    def _action(command: CommandRequest) -> Dict[str, Any]:
+        try:
+            if activate:
+                return paper_automation_service.activate(
+                    strategy_name=command.body["strategy_name"],
+                    reason=command.body["reason"],
+                )
+            return paper_automation_service.deactivate(reason=command.body["reason"])
+        except PaperAutomationActivationError as exc:
+            raise CommandValidationError(exc.code, str(exc)) from exc
+
+    return _action
+
+
+def _activate_paper_automation_rpc_handler(
+    coordinator: TradingCommandCoordinator, account_id: Optional[str],
+):
+    def _handler(parsed: ActivatePaperAutomationRequest) -> Dict[str, Any]:
+        request = CommandRequest(
+            command_id=parsed.command_id,
+            action="activate_paper_automation",
+            account_id=account_id,
+            target_type="paper_automation",
+            target_id=parsed.strategy_name,
+            expected_version=None,
+            body={"strategy_name": parsed.strategy_name, "reason": parsed.reason},
+            source="operator",
+            preflight_nonce=parsed.preflight_nonce,
+        )
+        return _receipt_to_dict(coordinator.execute(request))
+
+    return _handler
+
+
+def _deactivate_paper_automation_rpc_handler(
+    coordinator: TradingCommandCoordinator, account_id: Optional[str],
+):
+    def _handler(parsed: DeactivatePaperAutomationRequest) -> Dict[str, Any]:
+        request = CommandRequest(
+            command_id=parsed.command_id,
+            action="deactivate_paper_automation",
+            account_id=account_id,
+            target_type="paper_automation",
+            target_id=account_id or "",
+            expected_version=None,
+            body={"reason": parsed.reason},
+            source="operator",
+        )
+        return _receipt_to_dict(coordinator.execute(request))
+
+    return _handler
+
+
+def _get_paper_automation_status_handler(paper_automation_service):
+    def _handler(_parsed: GetPaperAutomationStatusRequest) -> Dict[str, Any]:
+        return dataclasses.asdict(paper_automation_service.status())
+
+    return _handler
+
+
 def _liquidate_account_rpc_handler(coordinator: TradingCommandCoordinator, account_id: Optional[str]):
     def _handler(parsed: LiquidateAccountRequest) -> Dict[str, Any]:
         request = CommandRequest(
@@ -1492,6 +1604,7 @@ def register_command_authority(
     automated_intent_service=None,
     canary_service=None,
     allocation_service=None,
+    paper_automation_service=None,
 ) -> None:
     """Wire the command-authority surface onto ``registry``.
 
@@ -1719,6 +1832,30 @@ def register_command_authority(
             _suspend_allocation_rpc_handler(coordinator, account_id),
         )
 
+    if paper_automation_service is not None:
+        coordinator.register_action(
+            "activate_paper_automation",
+            _paper_automation_action(paper_automation_service, activate=True),
+            requires_preflight=True,
+        )
+        coordinator.register_action(
+            "deactivate_paper_automation",
+            _paper_automation_action(paper_automation_service, activate=False),
+            requires_preflight=False,
+        )
+        registry.register(
+            "command", "activate_paper_automation", ActivatePaperAutomationRequest, dict,
+            _activate_paper_automation_rpc_handler(coordinator, account_id),
+        )
+        registry.register(
+            "command", "deactivate_paper_automation", DeactivatePaperAutomationRequest, dict,
+            _deactivate_paper_automation_rpc_handler(coordinator, account_id),
+        )
+        registry.register(
+            "query", "get_paper_automation_status", GetPaperAutomationStatusRequest, dict,
+            _get_paper_automation_status_handler(paper_automation_service),
+        )
+
     if automated_intent_service is not None:
         # P3 Task 3: strategy-service principal only. No dashboard HTTP route.
         coordinator.register_action(
@@ -1905,6 +2042,7 @@ def build_production_registry(
             liquidation_service=command_stack.liquidation_service,
             canary_service=command_stack.canary_service,
             allocation_service=command_stack.allocation_service,
+            paper_automation_service=command_stack.paper_automation_service,
             automated_intent_service=command_stack.automated_intent_service,
         )
         register_strategy_state_ingest(registry, command_stack.journal)

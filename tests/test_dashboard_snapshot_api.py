@@ -397,7 +397,8 @@ class TestCommandCenterPage:
             html = (await c.get("/cc")).text
             for element_id in ("status-bar", "mode-badge", "account-id",
                                "dependency-chips", "last-event-time",
-                               "account-cards", "positions-panel", "action-rail",
+                               "quick-stats", "band-netliq", "band-daypnl",
+                               "positions-panel", "action-rail",
                                "orders-panel", "fills-panel", "strategies-panel",
                                "risk-panel", "degraded-banner", "drawer"):
                 assert f'id="{element_id}"' in html

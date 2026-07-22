@@ -25,21 +25,67 @@
   function positionSetupTip(anchor, tip) {
     tip.style.display = 'block';
     var r = anchor.getBoundingClientRect();
-    var margin = 8, gap = 7;
+    var margin = 8, gap = 8;
     var tw = tip.offsetWidth, th = tip.offsetHeight;
-    var left = r.left + r.width / 2 - tw / 2;
+    // Prefer to the right of the icon (after the label text), then left,
+    // then below/above — never leave the tip clipped off-screen.
+    var left = r.right + gap;
+    var top = r.top + (r.height / 2) - (th / 2);
+    if (left + tw > window.innerWidth - margin) {
+      left = r.left - tw - gap;
+    }
+    if (left < margin) {
+      left = Math.max(margin, Math.min(
+          r.left + r.width / 2 - tw / 2,
+          window.innerWidth - tw - margin));
+      top = r.bottom + gap;
+      if (top + th > window.innerHeight - margin) top = r.top - th - gap;
+    }
     left = Math.max(margin, Math.min(left, window.innerWidth - tw - margin));
-    var top = r.bottom + gap;
-    if (top + th > window.innerHeight - margin) top = r.top - th - gap;
+    top = Math.max(margin, Math.min(top, window.innerHeight - th - margin));
     tip.style.left = left + 'px';
-    tip.style.top = Math.max(top, margin) + 'px';
+    tip.style.top = top + 'px';
   }
 
   function hideAdminTips() {
     document.querySelectorAll(
         '#dash-trading .tip, #dash-scaling .tip, #dash-guide .tip, '
         + '.dash-admin-pane .tip, .cc-drawer .tip')
-      .forEach(function (t) { t.style.display = 'none'; });
+      .forEach(function (t) {
+        t.style.display = 'none';
+        t.classList.remove('tip-pinned');
+      });
+    document.querySelectorAll(
+        '#dash-trading .info, #dash-scaling .info, #dash-guide .info, '
+        + '.dash-admin-pane .info, .dash-admin-pane .hover-tip, '
+        + '.cc-drawer .info')
+      .forEach(function (el) {
+        el.classList.remove('tip-open');
+        if (el.getAttribute('aria-expanded') != null) {
+          el.setAttribute('aria-expanded', 'false');
+        }
+      });
+  }
+
+  function unpinTip(tip, anchor) {
+    tip.classList.remove('tip-pinned');
+    tip.style.display = 'none';
+    if (anchor) {
+      anchor.classList.remove('tip-open');
+      if (anchor.getAttribute('aria-expanded') != null) {
+        anchor.setAttribute('aria-expanded', 'false');
+      }
+    }
+  }
+
+  function pinTip(anchor, tip) {
+    hideAdminTips();
+    tip.classList.add('tip-pinned');
+    anchor.classList.add('tip-open');
+    if (anchor.getAttribute('aria-expanded') != null) {
+      anchor.setAttribute('aria-expanded', 'true');
+    }
+    positionSetupTip(anchor, tip);
   }
 
   document.querySelectorAll(
@@ -50,13 +96,40 @@
     .forEach(function (el) {
       var tip = el.querySelector('.tip');
       if (!tip) return;
-      var show = function () { positionSetupTip(el, tip); };
-      var hide = function () { tip.style.display = 'none'; };
+      var show = function () {
+        if (tip.classList.contains('tip-pinned')) return;
+        positionSetupTip(el, tip);
+      };
+      var hide = function () {
+        if (tip.classList.contains('tip-pinned')) return;
+        tip.style.display = 'none';
+      };
       el.addEventListener('mouseenter', show);
       el.addEventListener('mouseleave', hide);
       el.addEventListener('focus', show);
       el.addEventListener('blur', hide);
+      // Click (and keyboard activate) pins the tip open with its text —
+      // needed on touch / when hover isn't available.
+      el.addEventListener('click', function (e) {
+        e.preventDefault();
+        e.stopPropagation();
+        if (tip.classList.contains('tip-pinned')) {
+          unpinTip(tip, el);
+        } else {
+          pinTip(el, tip);
+        }
+      });
+      el.addEventListener('keydown', function (e) {
+        if (e.key !== 'Enter' && e.key !== ' ') return;
+        e.preventDefault();
+        e.stopPropagation();
+        el.click();
+      });
     });
+  document.addEventListener('click', hideAdminTips);
+  document.addEventListener('keydown', function (e) {
+    if (e.key === 'Escape') hideAdminTips();
+  });
   window.addEventListener('scroll', hideAdminTips, true);
 
   var ADMIN_TABS = { deploy: true, watchlists: true };

@@ -1,11 +1,11 @@
-{% macro info(text) %}<span class="info" tabindex="0" role="button" aria-label="More info">i<span class="tip">{{ text }}</span></span>{% endmacro %}
+{% macro info(text) %}<span class="info" tabindex="0" role="button" aria-label="More info" aria-expanded="false">i<span class="tip">{{ text }}</span></span>{% endmacro %}
 
 <div class="guide-wrap">
   <header class="guide-hero">
     <h1>Dashboard user guide</h1>
     <p class="guide-lead">
       Control room for your paper or live IB account at
-      <code>/cc</code>. Hover the <span class="info" tabindex="0">i<span class="tip">Same info bubbles as on the Deploy and Watchlists tabs — hover or focus to read.</span></span>
+      <code>/cc</code>. Hover or click the <span class="info" tabindex="0" role="button" aria-label="More info" aria-expanded="false">i<span class="tip">Same info bubbles as on the Deploy and Watchlists tabs — hover, focus, or click the icon to read.</span></span>
       bubbles for extra help.
     </p>
     <p class="guide-note">

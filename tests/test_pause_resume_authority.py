@@ -254,7 +254,8 @@ def test_preflight_activate_paper_automation_accepts_strategy_and_reason(authori
 
 
 def test_browser_uses_split_routes_and_waits_for_authoritative_command_state():
-    source = Path("web/static/command_center.js").read_text()
+    # Pause/resume live in the extracted commands module (not the shell).
+    source = Path("web/static/command_center_commands.js").read_text()
     assert "ccSubmitCommand('pause_trading'" in source
     assert "ccSubmitCommand('resume_trading'" in source
     assert "'/api/commands/pause'" in source

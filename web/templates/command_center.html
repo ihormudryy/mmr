@@ -760,14 +760,19 @@
     }
     #dash-trading .info:hover,
     #dash-trading .info:focus,
+    #dash-trading .info.tip-open,
     #dash-scaling .info:hover,
     #dash-scaling .info:focus,
+    #dash-scaling .info.tip-open,
     #dash-guide .info:hover,
     #dash-guide .info:focus,
+    #dash-guide .info.tip-open,
     .dash-admin-pane .info:hover,
     .dash-admin-pane .info:focus,
+    .dash-admin-pane .info.tip-open,
     .cc-drawer .info:hover,
-    .cc-drawer .info:focus {
+    .cc-drawer .info:focus,
+    .cc-drawer .info.tip-open {
       color: var(--accent);
       border-color: var(--accent);
       outline: none;
@@ -1429,12 +1434,21 @@
       align-items: stretch;
       gap: var(--space-3);
     }
+    /* Block (not column-flex) so the caption text and trailing .info icon
+       stay on one inline row; inputs sit on the next line as blocks. */
     .cc-drawer label {
-      display: flex;
-      flex-direction: column;
-      gap: 6px;
+      display: block;
       color: var(--dim);
       font-size: 12px;
+      line-height: 1.4;
+    }
+    .cc-drawer label > input,
+    .cc-drawer label > select,
+    .cc-drawer label > textarea {
+      display: block;
+      width: 100%;
+      box-sizing: border-box;
+      margin-top: 6px;
     }
     .cc-drawer input,
     .cc-drawer select,
@@ -1447,6 +1461,13 @@
       font: inherit;
       font-size: 13px;
       caret-color: var(--accent);
+    }
+    /* Keep section title + info icon glued together under space-between h2s. */
+    .h-title {
+      display: inline-flex;
+      align-items: center;
+      gap: 0;
+      min-width: 0;
     }
     .cc-drawer fieldset {
       border: 1px solid var(--border);
@@ -1507,7 +1528,7 @@
     }
   </style>
 </head>
-{% macro info(text) %}<span class="info" tabindex="0" role="button" aria-label="More info">i<span class="tip">{{ text }}</span></span>{% endmacro %}
+{% macro info(text) %}<span class="info" tabindex="0" role="button" aria-label="More info" aria-expanded="false">i<span class="tip">{{ text }}</span></span>{% endmacro %}
 <body data-degraded-after-ms="{{ degraded_after_ms }}"
       data-poll-interval-ms="{{ poll_interval_ms }}"
       data-commands-enabled="{{ 'true' if commands_enabled else 'false' }}">
@@ -1576,7 +1597,7 @@
     <!-- Action queue promoted to a full-width 3-up strip directly under the
          command band: approving proposals is the riskiest job on this page. -->
     <section id="action-rail" aria-label="Pending proposals">
-      <h2>Action queue {{ info('PENDING proposals awaiting Approve or Reject. History shows terminal proposals from the live feed (and can refresh via API). New proposal can resolve a ticker to an exact conId.') }}
+      <h2><span class="h-title">Action queue {{ info('PENDING proposals awaiting Approve or Reject. History shows terminal proposals from the live feed (and can refresh via API). New proposal can resolve a ticker to an exact conId.') }}</span>
         {% if not commands_enabled %}<span class="dim">(read-only)</span>{% endif %}
       </h2>
       <div class="proposal-filter" role="group" aria-label="Proposal filter">
@@ -1588,7 +1609,7 @@
     </section>
     <div id="quick-stats" aria-label="Account summary"></div>
     <section id="positions-panel" aria-label="Positions">
-      <h2>Positions {{ info('Live holdings from IB. Unrealized P&amp;L vs average cost; Day P&amp;L since session start. Close starts an exit proposal — Approve still required.') }}
+      <h2><span class="h-title">Positions {{ info('Live holdings from IB. Unrealized P&amp;L vs average cost; Day P&amp;L since session start. Close starts an exit proposal — Approve still required.') }}</span>
         <span id="positions-meta" class="h-meta"></span></h2>
       <table>
         <thead><tr>
@@ -1601,21 +1622,21 @@
       </table>
     </section>
     <div class="lower">
-      <section id="orders-panel"><h2>Working orders {{ info('Open broker orders still working at IB. Cancel removes one; Cancel all clears every open order.') }}
+      <section id="orders-panel"><h2><span class="h-title">Working orders {{ info('Open broker orders still working at IB. Cancel removes one; Cancel all clears every open order.') }}</span>
         {% if commands_enabled %}<button id="cc-cancel-all-open"
                 type="button" class="reject">Cancel all</button>{% endif %}</h2>
         <div id="order-groups"></div></section>
-      <section id="fills-panel"><h2>Recent executions {{ info('Fills that actually traded — time, side, qty, price, and commission.') }}</h2>
+      <section id="fills-panel"><h2><span class="h-title">Recent executions {{ info('Fills that actually traded — time, side, qty, price, and commission.') }}</span></h2>
         <table><thead><tr><th>Time</th><th>Instrument</th><th>Side</th>
           <th>Qty</th><th>Price</th><th>Commission</th></tr></thead>
           <tbody id="fills-body"></tbody></table></section>
-      <section id="strategies-panel"><h2>Strategies {{ info('Live strategy_service rows. Enable/Disable here is immediate. Pause new trading blocks new exposure without unloading strategies. Full deploy/undeploy is on the Deploy tab.') }}</h2>
+      <section id="strategies-panel"><h2><span class="h-title">Strategies {{ info('Live strategy_service rows. Enable/Disable here is immediate. Pause new trading blocks new exposure without unloading strategies. Full deploy/undeploy is on the Deploy tab.') }}</span></h2>
         <table><thead><tr><th>Strategy</th><th>State</th><th>Enabled</th>
           <th>Last activity</th><th>Error</th>
           {% if commands_enabled %}<th data-cc-col="strategy-actions">Actions</th>{% endif %}
           </tr></thead>
           <tbody id="strategies-body"></tbody></table></section>
-      <section id="risk-panel"><h2>Risk &amp; reconciliation {{ info('Authoritative risk projection: concentration, group budgets, and reconciliation warnings. Empty until the risk service publishes a projection.') }}</h2>
+      <section id="risk-panel"><h2><span class="h-title">Risk &amp; reconciliation {{ info('Authoritative risk projection: concentration, group budgets, and reconciliation warnings. Empty until the risk service publishes a projection.') }}</span></h2>
         <div id="risk-body" data-state="unavailable">Risk unavailable — waiting
           for an authoritative risk projection.</div></section>
     </div>
@@ -1623,7 +1644,7 @@
   <div id="dash-scaling" class="dash-pane" aria-label="Scaling and allocation">
     <main class="grid">
       <section id="scaling-panel">
-        <h2>Allocation &amp; scaling {{ info('Signed allocation ceilings for live capital. Prepare and sign offline with mmr research allocation prepare/sign, then paste the attestation here. Private keys never enter this browser. Suspend is risk-reducing and immediate.') }}
+        <h2><span class="h-title">Allocation &amp; scaling {{ info('Signed allocation ceilings for live capital. Prepare and sign offline with mmr research allocation prepare/sign, then paste the attestation here. Private keys never enter this browser. Suspend is risk-reducing and immediate.') }}</span>
           <span id="scaling-lifecycle" class="scaling-status" data-lifecycle="unknown">unknown</span>
         </h2>
         <p id="scaling-message" class="scaling-note">Waiting for authoritative allocation events…</p>
@@ -1679,7 +1700,7 @@
         </table>
       </section>
       <section id="paper-auto-panel" aria-label="Paper automation">
-        <h2>Paper automation {{ info('Paper mode only. Writes keys, fixture artifact, and YAML for one strategy, then hot-arms execute_automated_intent + IntentEmitter without restart when Activate succeeds. Needs command authority. Private keys never enter this browser.') }}
+        <h2><span class="h-title">Paper automation {{ info('Paper mode only. Writes keys, fixture artifact, and YAML for one strategy, then hot-arms execute_automated_intent + IntentEmitter without restart when Activate succeeds. Needs command authority. Private keys never enter this browser.') }}</span>
           <span id="paper-auto-lifecycle" class="scaling-status"
                 data-lifecycle="unknown">unknown</span>
         </h2>

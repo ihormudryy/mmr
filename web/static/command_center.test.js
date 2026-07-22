@@ -14,6 +14,12 @@ const util = require('./cc_util.js');
 
 const source = fs.readFileSync(path.join(__dirname, 'command_center.js'), 'utf8')
   .replace(/\nresync\(\);\s*$/, '\n');
+// The command surface now lives in a sibling classic script that the page
+// loads (defer) just before command_center.js. Evaluate it in the SAME VM
+// context first so the moved functions (ccResolveSymbol, ccSubmitCommand,
+// ccOpenResearchProposal, ...) resolve exactly as they do in the browser.
+const commandsSource = fs.readFileSync(
+  path.join(__dirname, 'command_center_commands.js'), 'utf8');
 
 function element() {
   const handlers = new Map();
@@ -84,6 +90,8 @@ function makeContext({commandsEnabled = false} = {}) {
     clearTimeout,
     window: { location: { href: '' } },
   });
+  vm.runInContext(commandsSource, context,
+    { filename: 'command_center_commands.js' });
   vm.runInContext(source, context, { filename: 'command_center.js' });
   return { context, elements, run: (code) => vm.runInContext(code, context) };
 }

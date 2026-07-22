@@ -451,19 +451,51 @@ async function ccRequestPreflight(commandId, action, params, expectedVersion) {
 
 function ccOpenConfirmDrawer(ticket, onConfirm, onExpired) {
   const d = document.getElementById('cc-confirm-drawer');
-  const s = ticket.summary;
+  const s = ticket.summary || {};
   const set = (name, value) => {
-    d.querySelector(`[data-field=${name}]`).textContent =
-        value === null || value === undefined ? '—' : String(value);
+    const el = d.querySelector(`[data-field=${name}]`);
+    if (!el) return;
+    el.textContent = value === null || value === undefined ? '—' : String(value);
   };
+  // Order fields (qty / notional / price / drift) only apply to trade
+  // preflights. Control commands (paper automation, resume, cancel, …) leave
+  // them null — hide the rows instead of showing a wall of dashes.
+  const showTrade = [s.quantity, s.notional, s.latest_price, s.drift_bps]
+      .some((v) => v !== null && v !== undefined && v !== '');
+  d.querySelectorAll('.cc-confirm-trade').forEach((el) => {
+    el.hidden = !showTrade;
+  });
+  const reason = (s.reason || '').trim();
+  d.querySelectorAll('.cc-confirm-reason').forEach((el) => {
+    el.hidden = !reason;
+  });
+
+  const title = d.querySelector('#cc-confirm-title');
+  const instrumentLabel = d.querySelector('[data-label-for="instrument"]');
+  if (s.order_type === 'PAPER_AUTOMATION') {
+    if (title) title.textContent = 'Confirm paper automation';
+    if (instrumentLabel) instrumentLabel.textContent = 'Strategy';
+  } else if (showTrade) {
+    if (title) title.textContent = 'Confirm live command';
+    if (instrumentLabel) instrumentLabel.textContent = 'Instrument';
+  } else {
+    if (title) title.textContent = 'Confirm command';
+    if (instrumentLabel) instrumentLabel.textContent =
+        (s.order_type === 'CONTROL' || s.order_type === 'ORDER CONTROL')
+          ? 'Target' : 'Instrument';
+  }
+
   set('side', s.side);
   set('instrument', s.instrument);
-  set('quantity', s.quantity);
-  set('notional', s.notional);
+  if (showTrade) {
+    set('quantity', s.quantity);
+    set('notional', s.notional);
+    set('latest_price', s.latest_price);
+    set('drift_bps', s.drift_bps);
+  }
   set('order_type', s.order_type);
-  set('latest_price', s.latest_price);
-  set('drift_bps', s.drift_bps);
-  set('account', `${s.account_id} (${String(s.account_mode).toUpperCase()})`);
+  if (reason) set('reason', reason);
+  set('account', `${s.account_id} (${String(s.account_mode || '').toUpperCase()})`);
   const warnings = d.querySelector('[data-field=warnings]');
   warnings.replaceChildren(...(s.warnings || []).map((w) => {
     const li = document.createElement('li');

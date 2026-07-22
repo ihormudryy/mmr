@@ -250,6 +250,9 @@ def test_preflight_activate_paper_automation_accepts_strategy_and_reason(authori
     assert ticket["summary"]["side"] == "ACTIVATE_PAPER_AUTOMATION"
     assert ticket["summary"]["instrument"] == "orb_gld"
     assert ticket["summary"]["order_type"] == "PAPER_AUTOMATION"
+    assert ticket["summary"]["reason"] == "operator reviewed"
+    assert ticket["summary"]["quantity"] is None
+    assert ticket["summary"]["latest_price"] is None
     assert "restart_required" in ticket["summary"]["warnings"][0]
 
 

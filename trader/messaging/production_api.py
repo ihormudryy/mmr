@@ -1532,6 +1532,7 @@ def _preflight_command_handler(
                 "side": "RESUME",
                 "instrument": "new trading",
                 "order_type": "CONTROL",
+                "reason": reason,
                 "warnings": [
                     "Resume permits new exposure; readiness and reconciliation are checked again on submit."
                 ],
@@ -1617,6 +1618,7 @@ def _preflight_command_handler(
                 "side": "ACTIVATE_PAPER_AUTOMATION",
                 "instrument": strategy_name,
                 "order_type": "PAPER_AUTOMATION",
+                "reason": reason,
                 "warnings": [
                     "Writes keys/artifact/YAML and returns restart_required; "
                     "services must restart to arm IntentEmitter.",

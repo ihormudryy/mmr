@@ -1874,15 +1874,21 @@
        PENDING-proposal actions (command_center.js's UI-wiring pass, event
        delegation on #drawer-content). -->
   <aside id="cc-confirm-drawer" class="cc-drawer cc-drawer-live" hidden>
-    <h2>Confirm live command</h2>
+    <h2 id="cc-confirm-title">Confirm command</h2>
     <dl>
-      <dt>Side</dt><dd data-field=side></dd>
-      <dt>Instrument</dt><dd data-field=instrument></dd>
-      <dt>Quantity</dt><dd data-field=quantity></dd>
-      <dt>Notional</dt><dd data-field=notional></dd>
+      <dt data-label-for="side">Side</dt><dd data-field=side></dd>
+      <dt data-label-for="instrument">Instrument</dt><dd data-field=instrument></dd>
+      <dt class="cc-confirm-trade">Quantity</dt>
+      <dd class="cc-confirm-trade" data-field=quantity></dd>
+      <dt class="cc-confirm-trade">Notional</dt>
+      <dd class="cc-confirm-trade" data-field=notional></dd>
       <dt>Order type</dt><dd data-field=order_type></dd>
-      <dt>Latest price</dt><dd data-field=latest_price></dd>
-      <dt>Drift (bps)</dt><dd data-field=drift_bps></dd>
+      <dt class="cc-confirm-trade">Latest price</dt>
+      <dd class="cc-confirm-trade" data-field=latest_price></dd>
+      <dt class="cc-confirm-trade">Drift (bps)</dt>
+      <dd class="cc-confirm-trade" data-field=drift_bps></dd>
+      <dt class="cc-confirm-reason" hidden>Reason</dt>
+      <dd class="cc-confirm-reason" data-field=reason hidden></dd>
       <dt>Account</dt><dd data-field=account></dd>
     </dl>
     <ul data-field=warnings class="cc-warnings"></ul>

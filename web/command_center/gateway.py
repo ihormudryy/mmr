@@ -20,18 +20,12 @@ from __future__ import annotations
 
 import logging
 import os
-import threading
 from dataclasses import dataclass
 from typing import Any, Callable, Mapping
-from urllib.parse import urlparse
 
 from trader.domain.commands import CommandReceipt
-from trader.messaging.typed_rpc import (
-    HmacServiceAuthenticator,
-    TypedRpcClient,
-    TypedRpcRemoteError,
-    load_service_hmac_key,
-)
+from trader.messaging.typed_rpc import TypedRpcClient, TypedRpcRemoteError
+from web.trader_link import TraderLink, TraderLinkError, build_authenticator, connect_client
 
 logger = logging.getLogger("web.command_center.gateway")
 
@@ -85,33 +79,27 @@ class DashboardCommandGateway:
 
     def __init__(self, client_factory: Callable[[], TypedRpcClient],
                  timeout_s: float = 5.0):
-        self._client_factory = client_factory
-        self._client: TypedRpcClient | None = None
-        self._lock = threading.Lock()  # command-only; never shared with reads
+        # One command-only TraderLink: it owns the lazy build, reconnect, and
+        # the serialization lock (never shared with the read/feed links), so a
+        # slow read elsewhere can never stall an urgent approve/reject/cancel.
+        self._link = TraderLink(client_factory=client_factory)
         self._timeout_s = timeout_s
 
     # -- typed call plumbing -------------------------------------------------
     def _call(self, method: str, body: dict[str, Any]) -> dict[str, Any]:
         correlation = body.get("command_id")
-        with self._lock:
-            try:
-                if self._client is None:
-                    self._client = self._client_factory()
-                return self._client.call(method, body, dict)
-            except TypedRpcRemoteError as exc:
-                code = getattr(exc, "code", "UPSTREAM_ERROR") or "UPSTREAM_ERROR"
-                raise GatewayError(
-                    code=code,
-                    message=getattr(exc, "message", None) or str(exc),
-                    retryable=code in _RETRYABLE_CODES,
-                    correlation_id=correlation,
-                ) from exc
-            except TimeoutError as exc:
-                # NOTE: TimeoutError is an OSError subclass in Python 3, so
-                # this clause MUST precede the (ConnectionError, OSError)
-                # clause below -- otherwise the broader OSError catch would
-                # shadow it and mislabel a timeout as COMMAND_CHANNEL_DOWN.
-                self._reset_locked()
+        try:
+            return self._link.call(method, body)
+        except TypedRpcRemoteError as exc:
+            code = getattr(exc, "code", "UPSTREAM_ERROR") or "UPSTREAM_ERROR"
+            raise GatewayError(
+                code=code,
+                message=getattr(exc, "message", None) or str(exc),
+                retryable=code in _RETRYABLE_CODES,
+                correlation_id=correlation,
+            ) from exc
+        except TraderLinkError as exc:
+            if exc.kind == "timeout":
                 raise GatewayError(
                     code="OUTCOME_UNKNOWN",
                     message="no acknowledgement from the command coordinator; "
@@ -119,25 +107,12 @@ class DashboardCommandGateway:
                     retryable=False,
                     correlation_id=correlation,
                 ) from exc
-            except (ConnectionError, OSError) as exc:
-                self._reset_locked()
-                raise GatewayError(
-                    code="COMMAND_CHANNEL_DOWN",
-                    message="command channel unavailable",
-                    retryable=True,
-                    correlation_id=correlation,
-                ) from exc
-
-    def _reset_locked(self) -> None:
-        """Discard the current client (stale DEALER identity) so the next
-        call builds a fresh one. Must be called only while holding ``_lock``.
-        """
-        client, self._client = self._client, None
-        if client is not None:
-            try:
-                client.close()
-            except Exception:  # noqa: BLE001 - already discarding
-                logger.debug("discarding command client failed", exc_info=True)
+            raise GatewayError(
+                code="COMMAND_CHANNEL_DOWN",
+                message="command channel unavailable",
+                retryable=True,
+                correlation_id=correlation,
+            ) from exc
 
     # -- public surface ------------------------------------------------------
     def execute(self, method: str, body: dict[str, Any]) -> CommandReceipt:
@@ -190,22 +165,6 @@ class DashboardCommandGateway:
         )
 
 
-def _parse_typed_endpoint(endpoint: str) -> tuple[str, int]:
-    """Split a ``tcp://host:port`` endpoint into ``TypedRpcClient``'s
-    separate ``address``/``port`` constructor args.
-
-    Deliberately duplicated (not imported) from
-    ``web/command_center/__init__.py``'s identical helper: this module's own
-    docstring commits to being independent from the event bridge/query-client
-    wiring, so it doesn't reach into a sibling module's private helper for a
-    one-off string split.
-    """
-    parsed = urlparse(endpoint)
-    if parsed.scheme != "tcp" or not parsed.hostname or parsed.port is None:
-        raise ValueError(f"typed command endpoint must be tcp://host:port, got {endpoint!r}")
-    return f"tcp://{parsed.hostname}", parsed.port
-
-
 def build_command_gateway(env: Mapping[str, str] = os.environ) -> DashboardCommandGateway:
     """Production wiring for ``DashboardCommandGateway``.
 
@@ -227,15 +186,14 @@ def build_command_gateway(env: Mapping[str, str] = os.environ) -> DashboardComma
     change mid-process.
     """
     endpoint = env.get("MMR_TYPED_COMMAND_ENDPOINT", "tcp://127.0.0.1:42102")
-    address, port = _parse_typed_endpoint(endpoint)
-    key_file = (env.get("MMR_SERVICE_HMAC_KEY_FILE") or "").strip()
     timeout_s = float(env.get("DASHBOARD_COMMAND_TIMEOUT_S", "5.0"))
-    authenticator = HmacServiceAuthenticator(load_service_hmac_key(key_file))
+    # Load + validate the key file ONCE here (not per reconnect): TraderLink
+    # rebuilds the client after every timeout/connection reset, and re-reading
+    # a value that can't change mid-process would be wasteful.
+    authenticator = build_authenticator(env)
 
     def _factory() -> TypedRpcClient:
-        client = TypedRpcClient(
-            "command", authenticator, address=address, port=port, timeout=timeout_s)
-        client.connect()
-        return client
+        return connect_client(
+            "command", endpoint, authenticator=authenticator, timeout=timeout_s)
 
     return DashboardCommandGateway(client_factory=_factory, timeout_s=timeout_s)

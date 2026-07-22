@@ -118,4 +118,6 @@ def test_preflight_parses_ticket(gateway, fake):
 
 
 def test_gateway_serializes_calls_with_its_own_lock(gateway):
-    assert isinstance(gateway._lock, type(threading.Lock()))
+    # The command serialization lock now lives on the gateway's dedicated
+    # command-only TraderLink (never shared with the read/feed links).
+    assert isinstance(gateway._link._lock, type(threading.Lock()))

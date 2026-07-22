@@ -31,6 +31,23 @@ Two **adapters** sit over that one command interface:
   CLI/SDK path (`trader/sdk.py`) is the third caller of the same underlying
   commands.
 
+### Trader transport (`TraderLink`)
+
+`web/trader_link.py` is the one shared **typed-RPC transport** to the trader /
+strategy services. One `TraderLink` == one socket (a role at a
+`tcp://host:port` endpoint); it owns endpoint parsing, HMAC-authenticator
+build, lazy client build, reconnect-after-transport-failure, and a per-socket
+serialization lock, and raises exactly one `TraderLinkError`
+(`kind=timeout|unavailable`, `+cause`) while letting `TypedRpcRemoteError` (a
+healthy-socket application rejection) propagate. The typed stacks compose it:
+`DashboardCommandGateway` holds one command-only `TraderLink` (its lock never
+shared with reads); `ManageRpcClient` holds one per bucket; the event bridge
+reuses only the construction primitives (`parse_endpoint` /
+`build_authenticator` / `connect_client`) because it owns its own
+cursor-resnapshot reconnect at a higher layer. The legacy `_get_mmr` full-RPC
+SDK in `web/app.py` is a **different protocol**, deliberately outside
+`TraderLink`, pending a separate legacy-SDK removal.
+
 Safety rule embedded in the surface: a **LIVE** account routes every
 risk-increasing command through a signed preflight confirmation (nonce +
 authoritative summary) before it transmits; **paper** approve is one-click (the

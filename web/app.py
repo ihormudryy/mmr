@@ -380,6 +380,15 @@ _mmr_lock = threading.Lock()
 _mmr: Optional[Any] = None
 
 
+# NOTE (architecture review candidate 2): this is the legacy full-RPC dill
+# SDK transport — a DIFFERENT protocol from the typed-RPC stacks now unified
+# behind web/trader_link.py (command gateway, manage client, event-bridge
+# clients). It is mostly severed (only fetch_status via /api/health still uses
+# it; `/` redirects to /cc precisely because these fetchers hang against a
+# split-container trader that serves only the typed sockets). It is left as-is,
+# pending a separate legacy-SDK removal — not folded into TraderLink, which
+# would only make that adapter a lowest-common-denominator over two unrelated
+# protocols.
 def _get_mmr():
     global _mmr
     if _mmr is None:

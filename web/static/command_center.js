@@ -336,18 +336,31 @@ function renderAccountCards() {
   const v = store.view; if (!v) return;
   const account = v.accounts[0] || {};
   // Net liquidation must render for a flat account too (spec §8.1): the value
-  // comes from the account entity, never derived from positions.
-  const cards = [
-    ['Net liquidation', money(account.net_liquidation, account.currency)],
-    ['Daily P&L', money(account.daily_pnl, account.currency)],
+  // comes from the account entity, never derived from positions. The two
+  // headline figures live in the command band; the rest fills the
+  // quick-stats row under the action queue.
+  const netEl = document.getElementById('band-netliq');
+  if (netEl) netEl.textContent = money(account.net_liquidation, account.currency);
+  const dayEl = document.getElementById('band-daypnl');
+  if (dayEl) {
+    const pnl = account.daily_pnl;
+    dayEl.textContent = (pnl > 0 ? '+' : '') + money(pnl, account.currency);
+    dayEl.className = 'band-v' + (pnl > 0 ? ' pos' : pnl < 0 ? ' neg' : '');
+  }
+  const stats = [
     ['Exposure', money(account.gross_exposure, account.currency)],
     ['Buying power', money(account.buying_power, account.currency)],
     ['Margin cushion', account.margin_cushion !== undefined && account.margin_cushion !== null
       ? `${fmt.format(account.margin_cushion * 100)}%` : '—'],
+    ['Open positions', fmt.format((v.positions || []).length)],
+    ['Working orders', fmt.format(((v.orders || {}).active || []).length)],
   ];
-  document.getElementById('account-cards').innerHTML = cards.map(([k, val]) =>
-    `<div class="card"><div class="k">${k}</div><div class="v">${esc(val)}</div></div>`
-  ).join('');
+  const quick = document.getElementById('quick-stats');
+  if (quick) {
+    quick.innerHTML = stats.map(([k, val]) =>
+      `<div class="q"><div class="k">${k}</div><div class="v">${esc(val)}</div></div>`
+    ).join('');
+  }
 }
 
 function renderPositions() {
@@ -365,7 +378,7 @@ function renderPositions() {
     const stale = quoteAge === null || quoteAge > CFG.staleAfterS;
     const pnl = p.unrealized_pnl;
     return `<tr class="${stale ? 'stale' : ''}" data-entity="${esc(p.entity_id)}">
-      <td>${esc(p.symbol || conid)}</td>
+      <td class="sym">${esc(p.symbol || conid)}</td>
       <td class="num">${fmt.format(p.quantity ?? 0)}</td>
       <td class="num">${money(p.avg_cost)}</td>
       <td class="num">${money(last)}</td>
@@ -374,7 +387,8 @@ function renderPositions() {
       <td class="num">${p.base_market_value !== undefined
         ? money(p.base_market_value, p.base_currency) : '— (no conversion)'}</td>
       <td class="num ${pnl >= 0 ? 'pos' : 'neg'}">${money(pnl)}</td>
-      <td class="num">${money(p.daily_pnl)}</td>
+      <td class="num ${p.daily_pnl > 0 ? 'pos' : p.daily_pnl < 0 ? 'neg' : ''}">${
+        money(p.daily_pnl)}</td>
       <td><span class="age">${fmtAge(quoteAge)}</span></td>
       ${CFG.commandsEnabled ? `<td><button type="button"
         data-cc-close-position="${esc(p.entity_id)}">Close</button></td>` : ''}
@@ -401,15 +415,24 @@ function renderProposals() {
   const cards = rows.map(p => {
     const age = ageOf(p.created_at);
     const status = String(p.status || '').toUpperCase();
+    const side = String(p.action || p.side || '').toUpperCase();
+    const sideCls = side === 'BUY' ? 'buy' : side === 'SELL' ? 'sell' : '';
+    const thesis = p.thesis || p.reasoning || '';
     return `<div class="proposal-card" tabindex="0" role="button"
         data-proposal="${esc(p.entity_id)}"
         aria-label="Proposal ${esc(p.entity_id)} details">
-      <strong>#${esc(p.entity_id)} ${esc(p.action || p.side || '')}
-        ${esc(p.symbol || '')}</strong>
-      <div class="dim">qty ${esc(p.quantity ?? 'auto')} · notional
-        ${money(p.amount, p.currency)} · conf ${esc(p.confidence ?? '—')}</div>
-      <div class="dim">status ${esc(status)} · source ${esc(p.source || '—')}
-        · <span class="age">${fmtAge(age)} old</span></div>
+      <div class="prop-top">
+        <span class="side ${sideCls}">${esc(side || '—')}</span>
+        <span class="prop-sym">${esc(p.symbol || '')}</span>
+        <span class="prop-age"><span class="age">${fmtAge(age)} old</span></span>
+      </div>
+      <div class="prop-meta"><span>#${esc(p.entity_id)}</span>
+        <span>qty <b>${esc(p.quantity ?? 'auto')}</b></span>
+        <span>notional <b>${money(p.amount, p.currency)}</b></span>
+        <span>conf <b>${esc(p.confidence ?? '—')}</b></span>
+        <span>status <b>${esc(status)}</b></span>
+        <span>source ${esc(p.source || '—')}</span></div>
+      ${thesis ? `<div class="prop-thesis">${esc(thesis)}</div>` : ''}
     </div>`;
   });
   const emptyMsg = PROPOSAL_FILTER.mode === 'pending'
@@ -485,10 +508,13 @@ function renderStrategies() {
         <button type="button" data-cc-strategy-action="params"
           data-cc-strategy="${name}">Edit params</button>
       </td>` : '';
-    return `<tr><td>${name}</td><td>${esc(state)}</td>
-      <td>${enabled ? '● enabled' : '○ not dispatchable'}</td>
+    const stateCls = state === 'ERROR' ? 'err' : enabled ? 'run' : '';
+    return `<tr><td class="sym">${name}</td>
+      <td><span class="state-chip ${stateCls}">${esc(state)}</span></td>
+      <td><span class="dotstate ${enabled ? 'on' : 'off'}"><i class="d"></i>${
+        enabled ? 'enabled' : 'not dispatchable'}</span></td>
       <td><span class="age">${fmtAge(ageOf(s.last_activity_at))}</span></td>
-      <td class="${s.last_error ? 'neg' : 'dim'}">${
+      <td class="err-note ${s.last_error ? 'neg' : 'dim'}">${
         s.last_error ? '⚠ ' + esc(s.last_error) : '—'}</td>${actions}</tr>`;
   }).join('');
   renderPauseControl();

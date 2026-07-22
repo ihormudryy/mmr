@@ -39,19 +39,34 @@ function makeElement({id = '', tool = '', disabled = false} = {}) {
 function makeFetch() {
   const queued = [];
   const calls = [];
+  const response = (reply) => ({
+    ok: reply.status >= 200 && reply.status < 300,
+    status: reply.status,
+    async json() { return reply.body; },
+  });
   const fetch = async (url, options) => {
     calls.push({url: String(url), options});
     if (!queued.length) throw new Error(`unexpected fetch: ${url}`);
     const reply = queued.shift();
+    if (reply.promise) return response(await reply.promise);
     if (reply.networkError) throw reply.networkError;
-    return {
-      ok: reply.status >= 200 && reply.status < 300,
-      status: reply.status,
-      async json() { return reply.body; },
-    };
+    return response(reply);
   };
   fetch.enqueue = (status, body) => queued.push({status, body});
   fetch.reject = (message) => queued.push({networkError: new Error(message)});
+  fetch.defer = () => {
+    let resolve;
+    let reject;
+    const promise = new Promise((resolvePromise, rejectPromise) => {
+      resolve = resolvePromise;
+      reject = rejectPromise;
+    });
+    queued.push({promise});
+    return {
+      resolve(status, body) { resolve({status, body}); },
+      reject(message) { reject(new Error(message)); },
+    };
+  };
   fetch.calls = calls;
   fetch.queued = queued;
   return fetch;

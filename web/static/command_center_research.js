@@ -10,6 +10,7 @@
     selected: null,
     loading: false,
     error: null,
+    generation: 0,
   });
   const state = {
     presets: slot(),
@@ -68,6 +69,8 @@
   }
 
   async function request(target, path, params) {
+    const generation = target.generation + 1;
+    target.generation = generation;
     target.loading = true;
     target.error = null;
     render();
@@ -79,6 +82,7 @@
         headers: {Accept: 'application/json'},
       });
       const body = await response.json();
+      if (target.generation !== generation) return null;
       if (!response.ok) {
         target.error = {
           code: body && body.error && body.error.code
@@ -99,6 +103,7 @@
       if (path !== 'presets') clearConfigurationError();
       return body;
     } catch (error) {
+      if (target.generation !== generation) return null;
       target.error = {
         code: 'NETWORK_ERROR',
         message: String(error && error.message ? error.message : error),
@@ -106,6 +111,7 @@
       };
       return null;
     } finally {
+      if (target.generation !== generation) return;
       target.loading = false;
       render();
     }

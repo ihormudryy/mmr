@@ -89,6 +89,69 @@ function response(data, title, meta = {}) {
     assert.match(h.elements.get('research-status').textContent, /offline/i);
   });
 
+  await test('a latest same-tool response wins when an older success arrives later', async () => {
+    const h = makeHarness();
+    h.loadProductionScript();
+    const older = h.fetch.defer();
+    const newer = h.fetch.defer();
+    const oldRun = h.api.run('ideas', new URLSearchParams({preset: 'old'}));
+    const newRun = h.api.run('ideas', new URLSearchParams({preset: 'new'}));
+
+    newer.resolve(200, response([{ticker: 'NEW'}], 'Ideas: new', {
+      tool: 'ideas', observed_at: 'new-time',
+    }));
+    await newRun;
+    older.resolve(200, response([{ticker: 'OLD'}], 'Ideas: old', {
+      tool: 'ideas', observed_at: 'old-time',
+    }));
+    await oldRun;
+
+    assert.equal(h.api.state.ideas.data[0].ticker, 'NEW');
+    assert.equal(h.api.state.ideas.title, 'Ideas: new');
+    assert.equal(h.api.state.ideas.meta.observed_at, 'new-time');
+    assert.equal(h.api.state.ideas.selected.ticker, 'NEW');
+    assert.equal(h.api.state.ideas.error, null);
+    assert.equal(h.api.state.ideas.loading, false);
+  });
+
+  await test('a stale error cannot replace the latest successful same-tool state', async () => {
+    const h = makeHarness();
+    h.loadProductionScript();
+    const older = h.fetch.defer();
+    const newer = h.fetch.defer();
+    const oldRun = h.api.run('movers', new URLSearchParams({direction: 'losers'}));
+    const newRun = h.api.run('movers', new URLSearchParams({direction: 'gainers'}));
+
+    newer.resolve(200, response([{ticker: 'NEW'}], 'New movers', {tool: 'movers'}));
+    await newRun;
+    older.resolve(502, {error: {code: 'RESEARCH_UPSTREAM_ERROR',
+      message: 'Old request failed.', retryable: true}});
+    await oldRun;
+
+    assert.equal(h.api.state.movers.data[0].ticker, 'NEW');
+    assert.equal(h.api.state.movers.error, null);
+    assert.equal(h.api.state.movers.loading, false);
+  });
+
+  await test('a stale settlement leaves loading true until the current request settles', async () => {
+    const h = makeHarness();
+    h.loadProductionScript();
+    const older = h.fetch.defer();
+    const newer = h.fetch.defer();
+    const oldRun = h.api.run('ideas', new URLSearchParams({preset: 'old'}));
+    const newRun = h.api.run('ideas', new URLSearchParams({preset: 'new'}));
+
+    older.resolve(200, response([{ticker: 'OLD'}], 'Ideas: old', {tool: 'ideas'}));
+    await oldRun;
+    assert.equal(h.api.state.ideas.loading, true);
+    assert.equal(h.api.state.ideas.data, null);
+
+    newer.resolve(200, response([{ticker: 'NEW'}], 'Ideas: new', {tool: 'ideas'}));
+    await newRun;
+    assert.equal(h.api.state.ideas.loading, false);
+    assert.equal(h.api.state.ideas.data[0].ticker, 'NEW');
+  });
+
   await test('valid empty response is rendered as no results rather than an error', async () => {
     const h = makeHarness();
     h.loadProductionScript();

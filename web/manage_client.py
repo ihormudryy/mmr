@@ -10,13 +10,16 @@ import logging
 import os
 import threading
 from typing import Any, Callable
-from urllib.parse import urlparse
 
 from trader.messaging.typed_rpc import (
-    HmacServiceAuthenticator,
     TypedRpcClient,
     TypedRpcRemoteError,
-    load_service_hmac_key,
+)
+from web.trader_link import (
+    TraderLink,
+    TraderLinkError,
+    build_authenticator,
+    parse_endpoint,
 )
 
 logger = logging.getLogger(__name__)
@@ -25,38 +28,37 @@ _DEFAULT_TRADER_QUERY = 'tcp://127.0.0.1:42101'
 _DEFAULT_TRADER_COMMAND = 'tcp://127.0.0.1:42102'
 _DEFAULT_STRATEGY_QUERY = 'tcp://127.0.0.1:42105'
 _DEFAULT_STRATEGY_COMMAND = 'tcp://127.0.0.1:42104'
-
-
-def _split_endpoint(endpoint: str) -> tuple[str, int]:
-    parsed = urlparse(endpoint)
-    if parsed.scheme != 'tcp' or not parsed.hostname or parsed.port is None:
-        raise ValueError(f'typed endpoint must be tcp://host:port, got {endpoint!r}')
-    return f'tcp://{parsed.hostname}', parsed.port
-
-
-def _authenticator(env: os._Environ = os.environ) -> HmacServiceAuthenticator:
-    key_path = env.get('MMR_SERVICE_HMAC_KEY_FILE', '~/.config/mmr/service_hmac.key')
-    return HmacServiceAuthenticator(load_service_hmac_key(key_path))
+_DEFAULT_HMAC_KEY_PATH = '~/.config/mmr/service_hmac.key'
 
 
 class ManageRpcClient:
-    """Lazy, thread-safe typed clients for manage-page operations."""
+    """Lazy, thread-safe typed clients for manage-page operations.
+
+    Each of the four buckets is a TraderLink (one typed-RPC socket) built on
+    first use, sharing the transport plumbing (parse/auth/connect/reconnect/
+    lock) with the command gateway via web/trader_link.py. This client keeps
+    its caller contract: on a transport failure it re-raises the original
+    ``TimeoutError``/``OSError`` (not TraderLinkError), and ``TypedRpcRemoteError``
+    still propagates — so the manage routes' existing ``except`` clauses are
+    unchanged.
+    """
 
     def __init__(self, *, client_factory: Callable[[str, str], TypedRpcClient] | None = None,
                  timeout_s: float = 15.0, env: os._Environ = os.environ):
         self._timeout_s = timeout_s
         self._env = env
         self._client_factory = client_factory or self._default_client_factory
-        self._clients: dict[str, TypedRpcClient | None] = {
+        self._links: dict[str, TraderLink | None] = {
             'trader_query': None, 'trader_command': None,
             'strategy_query': None, 'strategy_command': None,
         }
         self._lock = threading.Lock()
 
     def _default_client_factory(self, role: str, endpoint: str) -> TypedRpcClient:
-        address, port = _split_endpoint(endpoint)
-        return TypedRpcClient(role, _authenticator(self._env), address=address,
-                              port=port, timeout=self._timeout_s)
+        address, port = parse_endpoint(endpoint)
+        return TypedRpcClient(
+            role, build_authenticator(self._env, default_key_path=_DEFAULT_HMAC_KEY_PATH),
+            address=address, port=port, timeout=self._timeout_s)
 
     def _endpoint(self, var: str, default: str) -> str:
         return self._env.get(var, default)
@@ -70,6 +72,16 @@ class ManageRpcClient:
         'discover_instrument',
     })
 
+    def _link_factory(self, role: str, endpoint: str) -> Callable[[], TypedRpcClient]:
+        # TraderLink does not connect; the manage contract is "code connects,
+        # not the injected factory" (its tests assert connect() is called), so
+        # wrap the (role, endpoint) factory to build AND connect.
+        def _build() -> TypedRpcClient:
+            client = self._client_factory(role, endpoint)
+            client.connect()
+            return client
+        return _build
+
     def _call(self, bucket: str, role: str, endpoint: str, method: str,
               body: dict[str, Any] | None = None,
               *, timeout: float | None = None) -> dict[str, Any]:
@@ -78,23 +90,25 @@ class ManageRpcClient:
         if call_timeout is None and method in self._IB_HEAVY_METHODS:
             call_timeout = max(self._timeout_s, 45.0)
         with self._lock:
-            client = self._clients[bucket]
-            if client is None:
-                client = self._client_factory(role, endpoint)
-                client.connect()
-                self._clients[bucket] = client
+            link = self._links[bucket]
+            if link is None:
+                link = TraderLink(role, endpoint,
+                                  client_factory=self._link_factory(role, endpoint),
+                                  timeout=self._timeout_s)
+                self._links[bucket] = link
         try:
-            return client.call(method, payload, dict, timeout=call_timeout)
-        except (TypedRpcRemoteError, TimeoutError, OSError) as exc:
+            return link.call(method, payload, timeout=call_timeout)
+        except TraderLinkError as exc:
+            # TraderLink already discarded its client; surface the ORIGINAL
+            # TimeoutError/OSError so the manage routes' except clauses see the
+            # same exception type they always have.
+            logger.warning('manage typed call %s failed: %s', method, exc.cause or exc)
+            raise (exc.cause or exc)
+        except TypedRpcRemoteError as exc:
+            # Healthy socket, application-level rejection: preserve the historical
+            # discard-the-client-and-re-raise behaviour.
             logger.warning('manage typed call %s failed: %s', method, exc)
-            with self._lock:
-                client = self._clients[bucket]
-                if client is not None:
-                    try:
-                        client.close()
-                    except Exception:  # noqa: BLE001
-                        pass
-                self._clients[bucket] = None
+            link.close()
             raise
 
     def trader_query(self, method: str, body: dict[str, Any] | None = None) -> dict[str, Any]:

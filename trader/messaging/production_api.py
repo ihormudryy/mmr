@@ -509,6 +509,18 @@ class CreateProposalRequest(BaseModel):
     group: str = ""
     max_price_drift_bps: Optional[float] = None
     preflight_nonce: Optional[str] = None
+    # Signal→proposal bridge fields (trader/strategy/signal_proposer.py).
+    # ``source`` attributes the proposal to its origin ("strategy:<name>");
+    # empty means the dashboard. The time-based exit trio round-trips onto
+    # the proposal record's metadata so ``check_exits`` can recover an
+    # executed entry's exit rules via ``list_proposals``. Before these were
+    # declared, extra="forbid" REJECTED every bridge proposal at the wire —
+    # armed auto_execute:propose strategies could not create proposals at
+    # all.
+    source: str = ""
+    max_hold_bars: Optional[int] = None
+    close_by_time: Optional[str] = None  # ISO time "HH:MM:SS"
+    close_by_tz: Optional[str] = None    # IANA tz the time is in
 
     @field_validator("command_id")
     @classmethod
@@ -1003,6 +1015,9 @@ def _create_proposal_action(proposal_service: ProposalCommandService):
             reasoning=body.get("reasoning", ""), confidence=body.get("confidence", 0.0),
             thesis=body.get("thesis", ""), group=body.get("group", ""),
             max_price_drift_bps=body.get("max_price_drift_bps"),
+            max_hold_bars=body.get("max_hold_bars"),
+            close_by_time=body.get("close_by_time"),
+            close_by_tz=body.get("close_by_tz"),
         )
         try:
             record = proposal_service.create_proposal(
@@ -1030,10 +1045,15 @@ def _reject_proposal_action(proposal_service: ProposalCommandService):
 def _create_proposal_rpc_handler(coordinator: TradingCommandCoordinator, account_id: Optional[str]):
     def _handler(parsed: CreateProposalRequest) -> Dict[str, Any]:
         payload = parsed.model_dump(exclude={"command_id", "preflight_nonce"})
+        # Attribute the command to its declared origin (the signal→proposal
+        # bridge sends "strategy:<name>") so the proposal record's source —
+        # which check_exits filters on — survives the round trip. Absent or
+        # empty means the dashboard, the previous hard-coded value.
         request = CommandRequest(
             command_id=parsed.command_id, action="create_proposal", account_id=account_id,
             target_type="proposal", target_id="", expected_version=None,
-            body=payload, source="dashboard", preflight_nonce=parsed.preflight_nonce,
+            body=payload, source=parsed.source or "dashboard",
+            preflight_nonce=parsed.preflight_nonce,
         )
         receipt = coordinator.execute(request)
         return _receipt_to_dict(receipt)

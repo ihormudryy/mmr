@@ -32,7 +32,13 @@ def _rsi(close: pd.Series, period: int) -> pd.Series:
 
 
 class VwapReversion(Strategy):
-    """Intraday VWAP mean reversion with RSI confirmation — resets VWAP daily."""
+    """Intraday VWAP mean reversion with RSI confirmation — resets VWAP daily.
+
+    RSI is Cutler's variant (SMA of gains/losses) — values differ slightly
+    from Wilder's smoothed RSI on most charting platforms. RTH-only: the
+    VWAP accumulates only regular-session bars and entries/exits are gated
+    to the session, so extended-hours prints can't skew the baseline.
+    """
 
     ENTRY_STD = 1.5           # σ from session VWAP to trigger entry
     RSI_PERIOD = 14
@@ -40,40 +46,48 @@ class VwapReversion(Strategy):
     RSI_OVERBOUGHT = 65
     STD_WINDOW = 30           # rolling std of (close − VWAP)
     MIN_BARS = 40
+    SESSION_TZ = 'America/New_York'
+    RTH_OPEN_MIN = 9 * 60 + 30
+    RTH_CLOSE_MIN = 16 * 60
+    # Intraday strategy: flatten before the close rather than holding the
+    # reversion bet overnight.
+    EOD_HOUR = 15
+    EOD_MINUTE = 55
 
     def precompute(self, prices: pd.DataFrame) -> Dict[str, Any]:
         if len(prices) < self.MIN_BARS:
             return {}
 
-        # Session VWAP: group by calendar date of the index, cumsum
-        # price × volume / cumsum volume within each day. When we hand
-        # precompute the full history the groupby spans every day, but the
-        # cumulative arithmetic within a day only uses bars at or before the
-        # current bar — so position i depends only on bars [i within same
-        # day, up to i]. No cross-day leakage.
+        # Session VWAP: group by the TRADING day (session tz), cumsum
+        # price × volume / cumsum volume within each day. Cumulative
+        # arithmetic within a day only uses bars at or before the current
+        # bar — position i depends only on bars [0..i]. No cross-day leakage.
         close = prices['close']
         volume = prices['volume']
-        # Reset the session VWAP on the US TRADING day, not the UTC calendar day.
-        # index.normalize() alone buckets by UTC midnight, which lands mid-session
-        # in ET — so the VWAP reset happened at the wrong bar and the intraday
-        # signal was computed against a bogus session boundary.
         idx = prices.index
         if idx.tz is not None:
-            local = idx.tz_convert('America/New_York')
+            local = idx.tz_convert(self.SESSION_TZ)
         else:
-            local = idx.tz_localize('UTC').tz_convert('America/New_York')
+            local = idx.tz_localize('UTC').tz_convert(self.SESSION_TZ)
         day = local.normalize()
-        pv = close * volume
-        cum_pv = pv.groupby(day).cumsum()
-        cum_v = volume.groupby(day).cumsum()
-        # If a bar has zero cumulative volume (rare — day just started with
-        # a zero-volume bar), fall back to close so we don't divide by zero.
-        vwap = (cum_pv / cum_v.replace(0, np.nan)).fillna(close)
+        local_minute = (local.hour * 60 + local.minute)
+        rth_mask = ((local_minute >= self.RTH_OPEN_MIN)
+                    & (local_minute < self.RTH_CLOSE_MIN)).to_numpy()
+        rth_ser = pd.Series(rth_mask, index=prices.index)
 
-        # Rolling std of (close − VWAP). Within-day would be more precise
-        # but a fixed rolling window is cheaper and close enough for 1-min.
+        # RTH-anchored VWAP: extended-hours bars contribute nothing.
+        pv = (close * volume).where(rth_ser, 0.0)
+        v = volume.where(rth_ser, 0.0)
+        cum_pv = pv.groupby(day).cumsum()
+        cum_v = v.groupby(day).cumsum()
+        vwap = cum_pv / cum_v.replace(0, np.nan)
+
+        # Rolling std of (close − VWAP). NaN outside RTH (vwap is NaN
+        # there); min_periods keeps the first RTH bars of a day usable
+        # while the window still spans overnight NaNs.
         diff = close - vwap
-        std = diff.rolling(self.STD_WINDOW).std()
+        std = diff.rolling(self.STD_WINDOW,
+                           min_periods=max(10, self.STD_WINDOW // 2)).std()
 
         rsi = _rsi(close, self.RSI_PERIOD)
 
@@ -82,10 +96,13 @@ class VwapReversion(Strategy):
             'vwap':  vwap.to_numpy(),
             'std':   std.to_numpy(),
             'rsi':   rsi.to_numpy(),
+            'rth':   rth_mask,
         }
 
     def on_bar(self, prices: pd.DataFrame, state: Dict[str, Any], index: int) -> Optional[Signal]:
         if not state or index < self.MIN_BARS:
+            return None
+        if not state['rth'][index]:
             return None
 
         close = state['close'][index]
@@ -102,10 +119,25 @@ class VwapReversion(Strategy):
         z = (close - vwap) / std
 
         # BUY: meaningfully below VWAP and RSI oversold (classic dip-buy).
+        # Edge-triggered: the condition is a state that persists while the
+        # dip lasts; only the bar where it FORMS may emit, otherwise the
+        # backtester pyramids per bar and the live bridge spams proposals.
         if z < -self.ENTRY_STD and rsi < self.RSI_OVERSOLD:
+            prev_std = state['std'][index - 1]
+            prev_rsi = state['rsi'][index - 1]
+            prev_formed = (
+                not np.isnan(prev_vwap) and not np.isnan(prev_std)
+                and prev_std > 0 and not np.isnan(prev_rsi)
+                and ((prev_close - prev_vwap) / prev_std) < -self.ENTRY_STD
+                and prev_rsi < self.RSI_OVERSOLD
+            )
+            if prev_formed:
+                return None
             return Signal(
                 source_name=self.name, action=Action.BUY,
                 probability=0.65, risk=0.35,
+                close_by_time=dtime(self.EOD_HOUR, self.EOD_MINUTE),
+                close_by_tz=self.SESSION_TZ,
             )
 
         # EXIT LONG / enter-short symmetric: fire SELL when price CROSSES

@@ -14,6 +14,7 @@ targets gap days — a distinct intraday regime.
 from trader.trading.strategy import Signal, Strategy
 from trader.objects import Action
 from typing import Any, Dict, Optional
+from datetime import time as dtime
 
 import numpy as np
 import pandas as pd
@@ -49,19 +50,21 @@ class GapReversion(Strategy):
         low = prices["low"].to_numpy()
         volume = prices["volume"].to_numpy()
 
-        # Session VWAP — vectorised: group by ET date, cumsum within day.
-        n = len(prices)
+        # Session VWAP — RTH-anchored: pre/after-market bars contribute
+        # nothing, so thin extended-hours prints can't skew the fade target
+        # (and backtest-vs-live can't diverge on session coverage).
         et_date_series = pd.Series(et_date_arr, index=prices.index)
-        pv_series = prices["close"] * prices["volume"]
+        rth_ser = pd.Series(rth_mask, index=prices.index)
+        pv_series = (prices["close"] * prices["volume"]).where(rth_ser, 0.0)
+        v_series = prices["volume"].where(rth_ser, 0.0)
         cum_pv = pv_series.groupby(et_date_series).cumsum()
-        cum_v = prices["volume"].groupby(et_date_series).cumsum()
-        vwap_s = (cum_pv / cum_v.replace(0, np.nan)).fillna(prices["close"])
+        cum_v = v_series.groupby(et_date_series).cumsum()
+        vwap_s = cum_pv / cum_v.replace(0, np.nan)
         vwap = vwap_s.to_numpy()
 
         # Gap per day — vectorised. For each ET date, first RTH open /
         # prior ET date's last RTH close - 1.
-        rth_series = pd.Series(rth_mask, index=prices.index)
-        date_rth = et_date_series.where(rth_series)  # NaN outside RTH
+        date_rth = et_date_series.where(rth_ser)  # NaN outside RTH
         # first RTH open + last RTH close per day
         opens = prices["open"].groupby(date_rth).first()
         closes = prices["close"].groupby(date_rth).last()
@@ -76,6 +79,9 @@ class GapReversion(Strategy):
         # eod_flat flag — bars at/after 15:45 ET
         eod_flat = (et_minute >= self.EOD_CLOSE_MIN) & rth_mask
 
+        # Day ordinal per bar so on_bar can require same-session crossings.
+        day_ord = pd.factorize(et_date_series)[0]
+
         return {
             "close": close,
             "vwap": vwap,
@@ -85,6 +91,7 @@ class GapReversion(Strategy):
             "rth": rth_mask,
             "eod_flat": eod_flat,
             "et_minute": et_minute,
+            "day_ord": day_ord,
         }
 
     def on_bar(self, prices: pd.DataFrame, state: Dict[str, Any], index: int) -> Optional[Signal]:
@@ -101,15 +108,25 @@ class GapReversion(Strategy):
         prev_close = state["close"][index - 1]
         prev_vwap = state["vwap"][index - 1]
 
-        # EOD flat — emit SELL to close any open long. Backtester rejects
-        # actual shorts, so this acts as a safety exit at 15:45 ET.
-        if state["eod_flat"][index]:
+        # EOD flat — one SELL at the FIRST 15:45 bar (edge-triggered), as a
+        # backstop for the close_by_time the BUY already carries. The
+        # previous version emitted a SELL on EVERY bar from 15:45 to 16:00,
+        # every day, position or not — pure signal spam.
+        if state["eod_flat"][index] and not state["eod_flat"][index - 1]:
             return Signal(
                 source_name=self.name, action=Action.SELL,
                 probability=0.55, risk=0.45,
             )
+        if state["eod_flat"][index]:
+            return None
 
         if np.isnan(vwap) or np.isnan(prev_vwap) or np.isnan(gap) or np.isnan(vol_avg) or vol_avg <= 0:
+            return None
+        # Crossing comparisons must be within the same session, against an
+        # RTH bar — not yesterday's close or a pre-market print.
+        if state["day_ord"][index] != state["day_ord"][index - 1]:
+            return None
+        if not state["rth"][index - 1]:
             return None
 
         abs_gap = abs(gap)
@@ -119,11 +136,14 @@ class GapReversion(Strategy):
         vol_ok = vol > vol_avg * self.VOL_MULT
 
         # GAP-DOWN FADE: gap < 0 → expect revert UP. BUY when close crosses
-        # from below vwap to at-or-above vwap with volume.
+        # from below vwap to at-or-above vwap with volume. Carries the EOD
+        # flat rule (ET) so the fade never holds overnight.
         if gap < 0 and prev_close < prev_vwap and close >= vwap and vol_ok:
             return Signal(
                 source_name=self.name, action=Action.BUY,
                 probability=0.62, risk=0.38,
+                close_by_time=dtime(self.EOD_CLOSE_MIN // 60, self.EOD_CLOSE_MIN % 60),
+                close_by_tz="America/New_York",
             )
 
         # GAP-UP FADE: gap > 0 → expect revert DOWN. SELL (exit/short) when

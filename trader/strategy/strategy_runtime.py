@@ -85,6 +85,48 @@ def _whattoshow_for_contract(contract: Contract) -> WhatToShow:
     return WhatToShow.TRADES
 
 
+def _apply_uppercase_params(instance: Strategy, params: Dict[str, Any]) -> None:
+    """Apply upper-case config params as instance-attribute overrides.
+
+    Mirrors ``Backtester.apply_param_overrides`` so a deployment's
+    ``params: {VOLUME_MULT: 1.3}`` means the same thing live as in the
+    backtest that validated it: the value shadows the upper-case class
+    attribute via ``setattr`` on the instance. The value is coerced to the
+    class attribute's current type (YAML usually delivers the right type
+    already); an upper-case key with no matching class attribute raises
+    ``ValueError`` naming the known tunables — a config typo must refuse the
+    load, not silently run with defaults. Lower-case keys are left alone
+    (they live in ``StrategyContext.params`` for ``self.params.get(...)``).
+    """
+    cls = type(instance)
+    known = [k for k in dir(cls) if k.isupper() and not k.startswith('_')]
+    for key, raw in (params or {}).items():
+        if not isinstance(key, str) or not key.isupper():
+            continue
+        if not hasattr(cls, key):
+            raise ValueError(
+                f'unknown upper-case param {key!r} for {cls.__name__} — '
+                f'known tunables: {sorted(known)}')
+        current = getattr(cls, key)
+        try:
+            if isinstance(current, bool):
+                value = (raw.strip().lower() in ('1', 'true', 'yes', 'on')
+                         if isinstance(raw, str) else bool(raw))
+            elif isinstance(current, int) and not isinstance(current, bool):
+                value = int(raw)
+            elif isinstance(current, float):
+                value = float(raw)
+            elif isinstance(current, str):
+                value = str(raw)
+            else:
+                value = raw
+        except (TypeError, ValueError) as exc:
+            raise ValueError(
+                f'param {key}={raw!r} not coercible to '
+                f'{type(current).__name__}: {exc}') from exc
+        setattr(instance, key, value)
+
+
 class ControlRevisionConflict(Exception):
     """[M1-F3] Task 7. The caller's ``expected_control_revision`` did not
     match the strategy's CURRENT ``control_revision`` -- a stale forwarded
@@ -1324,6 +1366,11 @@ class StrategyRuntime():
                 if self._last_dispatched_bar.get(dkey) == last_bar:
                     continue
                 self._last_dispatched_bar[dkey] = last_bar
+                # Stamp which instrument this dispatch is for BEFORE calling
+                # on_prices — multi-instrument strategies (pairs) read
+                # ``self.dispatch_conid`` instead of guessing identity from
+                # the shape of the data.
+                strategy._dispatch_conid = conId
                 signal = strategy.on_prices(frame)
             except Exception as ex:
                 logging.exception(
@@ -1743,6 +1790,23 @@ class StrategyRuntime():
                     params=params if params else {},
                 )
                 instance.install(context)
+
+                # Apply upper-case params as instance-attribute overrides,
+                # mirroring the backtester's apply_param_overrides semantics.
+                # Before this, a deployed `params: {VOLUME_MULT: 1.0}` was
+                # accepted by config and then silently ignored live (only
+                # values a strategy hand-read from self.params applied) — the
+                # armed ORB deployments ran with the class-default 1.5 while
+                # their backtest validation used the configured value. An
+                # unknown upper-case key refuses the load (fail loudly, like
+                # every other config error here); lower-case keys stay in
+                # context.params for the self.params.get(...) idiom.
+                try:
+                    _apply_uppercase_params(instance, params or {})
+                except ValueError as exc:
+                    logging.error('refusing to load strategy %s: %s', name, exc)
+                    return
+
                 # Give the strategy a reference to the runtime for subscriptions
                 instance.strategy_runtime = self
 

@@ -68,6 +68,39 @@ def _safe_log_value(value: Any) -> Any:
     return f"<{type(value).__name__}>"
 
 
+def _upstream_research_error(tool: str, exc: BaseException) -> ResearchError:
+    """Map provider failures to stable ResearchError codes without leaking secrets."""
+    from trader.tools.idea_scanner import IdeaScannerError, is_data_entitlement_error
+
+    text = str(exc)
+    if isinstance(exc, IdeaScannerError):
+        return ResearchError(502, "RESEARCH_UPSTREAM_ERROR", text[:500], True)
+    if is_data_entitlement_error(exc):
+        return ResearchError(
+            502,
+            "RESEARCH_NOT_ENTITLED",
+            (
+                f"{tool.title()} needs a Massive Starter+ plan for snapshots/movers, "
+                "or a TwelveData key for automatic fallback."
+            ),
+            False,
+        )
+    low = text.lower()
+    if "429" in text or "too many" in low or "rate limit" in low:
+        return ResearchError(
+            502,
+            "RESEARCH_RATE_LIMITED",
+            f"{tool.title()} hit a provider rate limit; retry shortly.",
+            True,
+        )
+    return ResearchError(
+        502,
+        "RESEARCH_UPSTREAM_ERROR",
+        f"{tool.title()} provider request failed.",
+        True,
+    )
+
+
 class ResearchService:
     """Run slow provider calls outside the dashboard's normal request workers."""
 
@@ -157,12 +190,7 @@ class ResearchService:
                 self._slots.release()
                 outcome = "upstream_error"
                 logger.warning("research %s submit failed: %s", tool, type(exc).__name__)
-                raise ResearchError(
-                    502,
-                    "RESEARCH_UPSTREAM_ERROR",
-                    f"{tool.title()} provider request failed.",
-                    True,
-                ) from exc
+                raise _upstream_research_error(tool, exc) from exc
 
             future.add_done_callback(self._release_slot)
             wrapped = asyncio.wrap_future(future)
@@ -186,12 +214,7 @@ class ResearchService:
             except Exception as exc:
                 outcome = "upstream_error"
                 logger.warning("research %s failed: %s", tool, type(exc).__name__)
-                raise ResearchError(
-                    502,
-                    "RESEARCH_UPSTREAM_ERROR",
-                    f"{tool.title()} provider request failed.",
-                    True,
-                ) from exc
+                raise _upstream_research_error(tool, exc) from exc
         finally:
             logger.info(
                 "research tool=%s outcome=%s duration_ms=%d params=%r",
@@ -237,7 +260,8 @@ def build_research_service() -> ResearchService:
         try:
             from trader.container import Container
 
-            api_key = Container.instance().config().get("massive_api_key", "")
+            config = Container.instance().config()
+            api_key = config.get("massive_api_key", "")
         except Exception:
             # Config failures must not stop the dashboard from starting; a request
             # receives the stable MASSIVE_NOT_CONFIGURED response instead.
@@ -247,6 +271,19 @@ def build_research_service() -> ResearchService:
 
         from massive import RESTClient
 
-        return MassiveResearch(RESTClient(api_key=api_key))
+        td_client = None
+        td_key = config.get("twelvedata_api_key", "") if isinstance(config, dict) else ""
+        if isinstance(td_key, str) and td_key.strip():
+            try:
+                from twelvedata import TDClient
+
+                td_client = TDClient(apikey=td_key)
+            except Exception:
+                logger.warning(
+                    "TwelveData client unavailable; Massive entitlement fallback disabled",
+                    exc_info=True,
+                )
+
+        return MassiveResearch(RESTClient(api_key=api_key), td_client=td_client)
 
     return ResearchService(provider_factory)

@@ -207,3 +207,50 @@ def test_benzinga_uses_published_url_and_teaser():
         "tickers": ["AAPL"], "sentiment": "", "author": "Reporter",
         "url": "https://example.test/a", "teaser": "Quarterly results",
     }]
+
+
+def test_ideas_falls_back_to_twelvedata_on_massive_entitlement(monkeypatch):
+    class MassiveScanner:
+        def __init__(self, client):
+            pass
+
+        def scan(self, **kwargs):
+            raise RuntimeError('NOT_AUTHORIZED not entitled')
+
+    class TdScanner:
+        def __init__(self, client):
+            assert client == "td"
+
+        def scan(self, **kwargs):
+            frame = pd.DataFrame([{"ticker": "AAPL", "score": 1.0}])
+            frame.attrs = {}
+            return frame
+
+    monkeypatch.setattr("trader.tools.massive_research.IdeaScanner", MassiveScanner)
+    monkeypatch.setattr(
+        "trader.tools.massive_research.TwelveDataIdeaScanner", TdScanner)
+
+    result = MassiveResearch(object(), td_client="td").ideas(
+        preset="momentum", source="movers", tickers=None,
+        universe_symbols=None, top_n=5, custom_filters=None,
+        fundamentals=False, news=False, names=False)
+
+    assert result.provider == "twelvedata"
+    assert result.data[0]["ticker"] == "AAPL"
+    assert "Starter+" in (result.notice or "")
+
+
+def test_snapshot_falls_back_to_twelvedata_on_massive_entitlement():
+    client = NS(get_snapshot_ticker=lambda **kwargs: (_ for _ in ()).throw(
+        RuntimeError('{"status":"NOT_AUTHORIZED","message":"not entitled"}')))
+    td = NS(quote=lambda symbol: NS(as_json=lambda: {
+        "symbol": "AAPL", "open": 100, "high": 110, "low": 99, "close": 105,
+        "volume": 1_000, "previous_close": 104, "change": 1, "percent_change": 0.96,
+    }))
+
+    result = MassiveResearch(client, td_client=td).snapshot("aapl")
+
+    assert result.provider == "twelvedata"
+    assert result.data["ticker"] == "AAPL"
+    assert result.data["last"] == 105.0
+    assert result.data["bid"] is None

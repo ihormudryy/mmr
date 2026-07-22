@@ -32,11 +32,21 @@
 
   function paramsFromForm(form) {
     const params = new URLSearchParams();
-    for (const [name, value] of new FormData(form).entries()) {
+    const entries = Array.from(new FormData(form).entries());
+    const source = String(
+      (entries.find(([name]) => name === 'source') || [])[1] || '',
+    );
+    for (const [name, value] of entries) {
       if (name === 'tickers') {
+        // Ideas API rejects tickers unless source=tickers.
+        if (source !== 'tickers' || value === '') continue;
         String(value).split(/[\s,]+/).filter(Boolean).forEach((ticker) => {
           params.append('tickers', ticker.toUpperCase());
         });
+      } else if (name === 'universe') {
+        // Ideas API rejects universe unless source=universe.
+        if (source !== 'universe' || value === '') continue;
+        params.append(name, value);
       } else if (value !== '') {
         params.append(name, value);
       }
@@ -218,9 +228,84 @@
     return '';
   }
 
-  function valueText(value) {
-    if (value !== null && typeof value === 'object') return JSON.stringify(value);
-    return value;
+  function isPlainObject(value) {
+    return value !== null && typeof value === 'object' && !Array.isArray(value);
+  }
+
+  function hasEntries(value) {
+    return isPlainObject(value) && Object.keys(value).length > 0;
+  }
+
+  function toNumber(value) {
+    if (value === null || value === undefined || value === '') return null;
+    const number = Number(value);
+    return Number.isFinite(number) ? number : null;
+  }
+
+  function formatNumber(value, digits = 2) {
+    const number = toNumber(value);
+    if (number === null) return '—';
+    return number.toLocaleString(undefined, {
+      maximumFractionDigits: digits,
+      minimumFractionDigits: Number.isInteger(number) ? 0 : Math.min(digits, 2),
+    });
+  }
+
+  function formatPct(value) {
+    const number = toNumber(value);
+    if (number === null) return '—';
+    const sign = number > 0 ? '+' : '';
+    return `${sign}${formatNumber(number, 2)}%`;
+  }
+
+  function formatVolume(value) {
+    const number = toNumber(value);
+    if (number === null) return '—';
+    const abs = Math.abs(number);
+    if (abs >= 1e9) return `${formatNumber(number / 1e9, 2)}B`;
+    if (abs >= 1e6) return `${formatNumber(number / 1e6, 2)}M`;
+    if (abs >= 1e3) return `${formatNumber(number / 1e3, 1)}K`;
+    return formatNumber(number, 0);
+  }
+
+  function formatMoney(value) {
+    const number = toNumber(value);
+    if (number === null) return '—';
+    const abs = Math.abs(number);
+    if (abs >= 1e12) return `$${formatNumber(number / 1e12, 2)}T`;
+    if (abs >= 1e9) return `$${formatNumber(number / 1e9, 2)}B`;
+    if (abs >= 1e6) return `$${formatNumber(number / 1e6, 2)}M`;
+    return `$${formatNumber(number, 2)}`;
+  }
+
+  function signedClass(value) {
+    const number = toNumber(value);
+    if (number === null || number === 0) return '';
+    return number > 0 ? ' research-pos' : ' research-neg';
+  }
+
+  function labelize(key) {
+    return String(key || '')
+      .replace(/_/g, ' ')
+      .replace(/\b\w/g, (ch) => ch.toUpperCase());
+  }
+
+  function formatFieldValue(key, value) {
+    if (value === null || value === undefined || value === '') return '—';
+    const lower = String(key).toLowerCase();
+    if (lower.includes('pct') || lower.includes('percent') || lower.endsWith('_change')) {
+      return formatPct(value);
+    }
+    if (lower.includes('volume') || lower === 'last_size' || lower.endsWith('_size')) {
+      return formatVolume(value);
+    }
+    if (lower.includes('market_cap') || lower === 'mkt_cap') {
+      return formatMoney(value);
+    }
+    if (typeof value === 'number' || (typeof value === 'string' && value.trim() !== '' && Number.isFinite(Number(value)))) {
+      return formatNumber(value, lower.includes('score') ? 1 : 2);
+    }
+    return String(value);
   }
 
   function metaMarkup(target) {
@@ -236,11 +321,166 @@
     </header>`;
   }
 
+  function metricCell(label, value, className = '') {
+    return `<div class="research-metric${className}">
+      <span class="research-metric-label">${esc(label)}</span>
+      <span class="research-metric-value">${esc(value)}</span>
+    </div>`;
+  }
+
+  function fieldListMarkup(entries) {
+    if (!entries.length) return '';
+    return `<dl class="research-fields">${entries.map(([key, value]) =>
+      `<dt>${esc(labelize(key))}</dt><dd>${esc(formatFieldValue(key, value))}</dd>`
+    ).join('')}</dl>`;
+  }
+
+  function nestedObjectMarkup(title, data) {
+    if (!hasEntries(data)) return '';
+    const entries = Object.entries(data).filter(([, value]) =>
+      value !== null && value !== undefined && value !== ''
+      && !isPlainObject(value) && !Array.isArray(value));
+    if (!entries.length) return '';
+    return `<section class="research-section">
+      <h4>${esc(title)}</h4>
+      ${fieldListMarkup(entries)}
+    </section>`;
+  }
+
+  function detailsMarkup(details) {
+    if (!hasEntries(details)) return '';
+    const cap = details.market_cap != null
+      ? `<p class="research-company-cap">Market cap ${esc(formatMoney(details.market_cap))}</p>`
+      : '';
+    const description = details.description
+      ? `<p class="research-company-desc">${esc(details.description)}</p>`
+      : '';
+    const rest = Object.entries(details).filter(([key]) =>
+      !['name', 'market_cap', 'description'].includes(key));
+    if (!cap && !description && !rest.length) return '';
+    return `<section class="research-section" data-research-details>
+      <h4>Company</h4>
+      ${cap}${description}
+      ${fieldListMarkup(rest)}
+    </section>`;
+  }
+
+  function ratiosMarkup(ratios) {
+    if (!hasEntries(ratios)) return '';
+    const cells = Object.entries(ratios)
+      .filter(([, value]) => value !== null && value !== undefined && value !== '')
+      .map(([key, value]) => metricCell(labelize(key), formatFieldValue(key, value)))
+      .join('');
+    if (!cells) return '';
+    return `<section class="research-section" data-research-ratios>
+      <h4>Ratios</h4>
+      <div class="research-metrics">${cells}</div>
+    </section>`;
+  }
+
+  function newsItemMarkup(news) {
+    if (!hasEntries(news) && !Array.isArray(news)) return '';
+    const items = Array.isArray(news) ? news : [news];
+    const articles = items.filter((item) => hasEntries(item) || (item && item.title)).map((item) => {
+      const title = item.title || 'Untitled';
+      const meta = [item.published, item.author, item.sentiment]
+        .filter((part) => part !== null && part !== undefined && String(part).trim())
+        .map((part) => esc(part))
+        .join(' · ');
+      const body = item.teaser ? `<p>${esc(item.teaser)}</p>` : '';
+      const link = item.url
+        ? `<a href="${esc(item.url)}" target="_blank" rel="noopener noreferrer">${esc(title)}</a>`
+        : esc(title);
+      return `<article class="research-news-item"><strong>${link}</strong>
+        ${meta ? `<p class="research-news-meta">${meta}</p>` : ''}${body}</article>`;
+    }).join('');
+    if (!articles) return '';
+    return `<section class="research-section" data-research-news>
+      <h4>News</h4>${articles}
+    </section>`;
+  }
+
   function objectMarkup(data) {
     if (data === null || data === undefined) return '';
     if (typeof data !== 'object') return `<p>${esc(data)}</p>`;
-    return `<dl>${Object.entries(data).map(([key, value]) =>
-      `<dt>${esc(key)}</dt><dd>${esc(valueText(value))}</dd>`).join('')}</dl>`;
+    if (Array.isArray(data)) {
+      return data.map((row) => `<article>${detailMarkup(row)}</article>`).join('');
+    }
+    return detailMarkup(data);
+  }
+
+  function detailMarkup(data) {
+    if (!isPlainObject(data)) {
+      return typeof data === 'object' ? '' : `<p>${esc(data)}</p>`;
+    }
+
+    const ticker = String(data.ticker ?? data.symbol ?? '').trim();
+    const details = isPlainObject(data.details) ? data.details : null;
+    const ratios = isPlainObject(data.ratios) ? data.ratios : null;
+    const news = data.news;
+    const day = isPlainObject(data.day) ? data.day : null;
+    const previousDay = isPlainObject(data.previous_day) ? data.previous_day : null;
+    const changePct = data.change_pct ?? data.change_percent ?? data.percent_change;
+    const change = data.change;
+    const companyName = (details && details.name) || data.name || '';
+
+    const consumed = new Set([
+      'ticker', 'symbol', 'details', 'ratios', 'news', 'day', 'previous_day',
+      'name', 'market', 'change_pct', 'change_percent', 'percent_change', 'change',
+      'open', 'close', 'high', 'low', 'volume', 'last', 'price', 'bid', 'ask',
+      'bid_size', 'ask_size', 'last_size', 'score', 'vwap',
+    ]);
+
+    const headlineMetrics = [];
+    const close = data.close ?? data.last ?? data.price ?? (day && day.close);
+    if (close != null) headlineMetrics.push(metricCell('Price', formatNumber(close)));
+    if (change != null) {
+      headlineMetrics.push(metricCell('Change', formatNumber(change), signedClass(change)));
+    }
+    if (changePct != null) {
+      headlineMetrics.push(metricCell('Change %', formatPct(changePct), signedClass(changePct)));
+    }
+    if (data.score != null) headlineMetrics.push(metricCell('Score', formatNumber(data.score, 1)));
+    const volume = data.volume ?? (day && day.volume);
+    if (volume != null) headlineMetrics.push(metricCell('Volume', formatVolume(volume)));
+    if (data.open != null || (day && day.open != null)) {
+      headlineMetrics.push(metricCell('Open', formatNumber(data.open ?? day.open)));
+    }
+    if (data.bid != null) headlineMetrics.push(metricCell('Bid', formatNumber(data.bid)));
+    if (data.ask != null) headlineMetrics.push(metricCell('Ask', formatNumber(data.ask)));
+
+    const leftovers = Object.entries(data).filter(([key, value]) => {
+      if (consumed.has(key)) return false;
+      if (value === null || value === undefined || value === '') return false;
+      if (isPlainObject(value) || Array.isArray(value)) return false;
+      return true;
+    });
+
+    const nestedSections = Object.entries(data)
+      .filter(([key, value]) => !consumed.has(key) && hasEntries(value))
+      .map(([key, value]) => nestedObjectMarkup(labelize(key), value))
+      .join('');
+
+    const header = ticker || companyName ? `<header class="research-detail-head">
+      <div>
+        ${ticker ? `<h3 class="research-ticker">${esc(ticker)}</h3>` : ''}
+        ${companyName ? `<p class="research-company-name">${esc(companyName)}</p>` : ''}
+        ${data.market ? `<p class="research-market">${esc(labelize(data.market))}</p>` : ''}
+      </div>
+      ${changePct != null ? `<span class="research-change-badge${signedClass(changePct)}">${esc(formatPct(changePct))}</span>` : ''}
+    </header>` : '';
+
+    return `<div class="research-detail-card">
+      ${header}
+      ${headlineMetrics.length ? `<div class="research-metrics">${headlineMetrics.join('')}</div>` : ''}
+      ${nestedObjectMarkup('Session', day)}
+      ${nestedObjectMarkup('Previous day', previousDay)}
+      ${detailsMarkup(details)}
+      ${ratiosMarkup(ratios)}
+      ${newsItemMarkup(news)}
+      ${nestedSections}
+      ${fieldListMarkup(leftovers)}
+    </div>`;
   }
 
   function proposalsEnabled() {
@@ -316,9 +556,12 @@
     const rows = Array.isArray(target.data) ? target.data : [];
     const rowMarkup = rows.map((row, index) => {
       const name = row && (row.ticker ?? row.symbol ?? row.name ?? '');
-      const measure = row && (row.change_pct ?? row.change_percent ?? row.score ?? row.price ?? '');
+      const changePct = row && (row.change_pct ?? row.change_percent ?? row.percent_change);
+      const measureRaw = changePct ?? (row && (row.score ?? row.price ?? row.close ?? ''));
+      const measure = changePct != null ? formatPct(changePct)
+        : (measureRaw === '' || measureRaw == null ? '' : formatFieldValue('score', measureRaw));
       const selected = target.selected === row;
-      return `<button type="button" class="research-row${selected ? ' selected' : ''}" data-research-row="${index}" tabindex="0" aria-pressed="${selected ? 'true' : 'false'}"><strong>${esc(name)}</strong><span>${esc(measure)}</span></button>`;
+      return `<button type="button" class="research-row${selected ? ' selected' : ''}" data-research-row="${index}" tabindex="0" aria-pressed="${selected ? 'true' : 'false'}"><strong>${esc(name)}</strong><span class="${signedClass(changePct).trim()}">${esc(measure)}</span></button>`;
     }).join('');
     root.innerHTML = metaMarkup(target) + rowMarkup;
     return root.innerHTML;
@@ -332,7 +575,7 @@
       root.innerHTML = '<p class="dim">Select a result to inspect it.</p>';
       return root.innerHTML;
     }
-    root.innerHTML = objectMarkup(target.selected) + metaMarkup(target)
+    root.innerHTML = metaMarkup(target) + detailMarkup(target.selected)
       + proposalMarkup(target.selected, currentTool);
     return root.innerHTML;
   }

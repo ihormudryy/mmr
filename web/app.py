@@ -25,6 +25,8 @@ Design notes:
 from __future__ import annotations
 
 import contextlib
+import hashlib
+import hmac
 import html as _html
 import logging
 import os
@@ -164,12 +166,24 @@ async def _lifespan(_app: FastAPI):
 _TEMPLATES = Jinja2Templates(directory=str(Path(__file__).parent / 'templates'))
 
 
-# CSRF: a per-process token embedded as a hidden field in every approve/reject
-# form and verified on POST. This blocks the blind cross-origin / injected POST
-# that could otherwise place a live order (the endpoints have no other auth).
-# Even with reasoning now sanitized, defense-in-depth: a mutating endpoint that
-# places real orders must not be triggerable by a forged request.
-_CSRF_TOKEN = secrets.token_urlsafe(32)
+# CSRF: a token embedded as a hidden field in every mutating HTML form and
+# verified on POST. Prefer deriving it from DASHBOARD_SESSION_SECRET so the
+# value survives dashboard container recreate (baked images rotate a pure
+# process-random token and leave open /cc tabs with a 403 CSRF mismatch).
+# Fall back to a process-random token when the secret is missing (tests /
+# misconfig) so forms still have *some* CSRF gate.
+def _derive_html_csrf_token() -> str:
+    secret = (os.environ.get('DASHBOARD_SESSION_SECRET') or '').strip()
+    if len(secret) >= 32:
+        return hmac.new(
+            secret.encode('utf-8'),
+            b'mmr-dashboard-html-form-csrf-v1',
+            hashlib.sha256,
+        ).hexdigest()
+    return secrets.token_urlsafe(32)
+
+
+_CSRF_TOKEN = _derive_html_csrf_token()
 
 # Optional shared-secret gate for the whole dashboard. When MMR_WEB_TOKEN is set,
 # every request must present it (?token= or X-MMR-Token header). Unset ⇒ open,
@@ -218,7 +232,10 @@ def _has_valid_dashboard_session(request: Request) -> bool:
 
 def _check_csrf(token: str) -> None:
     if not secrets.compare_digest(token or '', _CSRF_TOKEN):
-        raise HTTPException(status_code=403, detail='CSRF token mismatch')
+        raise HTTPException(
+            status_code=403,
+            detail='CSRF token mismatch — reload /cc and try again',
+        )
 
 
 # ---------------------------------------------------------------------------

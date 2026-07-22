@@ -192,11 +192,134 @@
   font-variant-numeric: tabular-nums;
 }
 
-#dash-research .research-detail dl {
+#dash-research .research-row span.research-pos,
+#dash-research .research-pos .research-metric-value,
+#dash-research .research-change-badge.research-pos {
+  color: var(--pos, #1f7a4c);
+}
+
+#dash-research .research-row span.research-neg,
+#dash-research .research-neg .research-metric-value,
+#dash-research .research-change-badge.research-neg {
+  color: var(--neg);
+}
+
+#dash-research .research-detail-card {
+  display: grid;
+  gap: var(--space-3);
+}
+
+#dash-research .research-detail-head {
+  display: flex;
+  justify-content: space-between;
+  gap: var(--space-3);
+  align-items: flex-start;
+}
+
+#dash-research .research-ticker {
+  margin: 0;
+  font: 800 22px/1.1 var(--font-heading);
+  letter-spacing: .02em;
+}
+
+#dash-research .research-company-name {
+  margin: 4px 0 0;
+  color: var(--fg);
+  font-size: 13px;
+}
+
+#dash-research .research-market,
+#dash-research .research-company-cap,
+#dash-research .research-news-meta {
+  margin: 2px 0 0;
+  color: var(--dim);
+  font-size: 12px;
+}
+
+#dash-research .research-change-badge {
+  flex: 0 0 auto;
+  padding: 6px 10px;
+  border: 1px solid var(--border-soft);
+  border-radius: var(--radius);
+  font: 800 14px/1 var(--font-heading);
+  font-variant-numeric: tabular-nums;
+}
+
+#dash-research .research-metrics {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(96px, 1fr));
+  gap: 8px;
+}
+
+#dash-research .research-metric {
+  padding: 8px 10px;
+  background: var(--panel-2);
+  border: 1px solid var(--border-soft);
+  border-radius: var(--radius);
+}
+
+#dash-research .research-metric-label {
+  display: block;
+  color: var(--dim);
+  font-size: 11px;
+  letter-spacing: .04em;
+  text-transform: uppercase;
+}
+
+#dash-research .research-metric-value {
+  display: block;
+  margin-top: 4px;
+  color: var(--fg);
+  font-variant-numeric: tabular-nums;
+  font-size: 14px;
+  font-weight: 700;
+}
+
+#dash-research .research-section h4 {
+  margin: 0 0 8px;
+  font: 800 12px/1.2 var(--font-heading);
+  letter-spacing: .05em;
+  text-transform: uppercase;
+  color: var(--dim);
+}
+
+#dash-research .research-company-desc {
+  margin: 8px 0 0;
+  color: var(--fg);
+  font-size: 12.5px;
+  line-height: 1.45;
+}
+
+#dash-research .research-news-item {
+  margin: 0 0 10px;
+  padding: 8px 10px;
+  background: var(--panel-2);
+  border: 1px solid var(--border-soft);
+  border-radius: var(--radius);
+}
+
+#dash-research .research-news-item strong {
+  display: block;
+  font-size: 13px;
+}
+
+#dash-research .research-news-item a {
+  color: var(--fg);
+}
+
+#dash-research .research-news-item p {
+  margin: 6px 0 0;
+  color: var(--dim);
+  font-size: 12.5px;
+  line-height: 1.4;
+}
+
+#dash-research .research-detail dl,
+#dash-research .research-fields {
   display: grid;
   grid-template-columns: minmax(90px, 140px) minmax(0, 1fr);
   gap: 6px 12px;
-  margin: 0 0 var(--space-3);
+  margin: 0;
   font-size: 12.5px;
 }
 

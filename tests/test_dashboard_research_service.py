@@ -111,6 +111,23 @@ async def test_provider_exception_is_sanitized():
 
 
 @pytest.mark.asyncio
+async def test_entitlement_and_rate_limit_map_to_stable_codes():
+    service = ResearchService(lambda: object(), workers=1)
+    with pytest.raises(ResearchError) as entitled:
+        await service.run("snapshot", lambda provider: (_ for _ in ()).throw(
+            RuntimeError('NOT_AUTHORIZED not entitled')))
+    assert entitled.value.code == "RESEARCH_NOT_ENTITLED"
+    assert entitled.value.retryable is False
+
+    with pytest.raises(ResearchError) as limited:
+        await service.run("news", lambda provider: (_ for _ in ()).throw(
+            RuntimeError("too many 429 error responses")))
+    assert limited.value.code == "RESEARCH_RATE_LIMITED"
+    assert limited.value.retryable is True
+    service.close()
+
+
+@pytest.mark.asyncio
 async def test_log_contains_timing_and_sanitized_params(caplog):
     service = ResearchService(lambda: object(), workers=1)
     with caplog.at_level("INFO", logger="web.command_center.research"):

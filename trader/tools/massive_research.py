@@ -10,7 +10,14 @@ from typing import Any
 
 import pandas as pd
 
-from trader.tools.idea_scanner import IdeaScanner, list_presets
+from trader.tools.idea_scanner import (
+    LIQUID_US_FALLBACK_TICKERS,
+    IdeaScanner,
+    TwelveDataIdeaScanner,
+    entitlement_fallback_notice,
+    is_data_entitlement_error,
+    list_presets,
+)
 
 _MOVERS_DETAIL_WORKERS = 8
 
@@ -68,10 +75,15 @@ def _quote_price(quote: Any, side: str) -> Any:
 
 
 class MassiveResearch:
-    """Normalize Massive REST-client responses for research consumers."""
+    """Normalize Massive REST-client responses for research consumers.
 
-    def __init__(self, client: Any):
+    Optional ``td_client`` enables the same Stocks-Basic entitlement fallback
+    the CLI uses (TwelveData quotes / movers) when Massive rejects snapshots.
+    """
+
+    def __init__(self, client: Any, td_client: Any | None = None):
         self._client = client
+        self._td_client = td_client
 
     def presets(self) -> ResearchResult:
         return ResearchResult(_records(list_presets()), "Idea Scanner Presets", "local")
@@ -89,22 +101,52 @@ class MassiveResearch:
         news: bool,
         names: bool,
     ) -> ResearchResult:
-        frame = IdeaScanner(self._client).scan(
-            preset=preset,
-            source=source,
-            tickers=tickers,
-            universe_symbols=universe_symbols,
-            top_n=top_n,
-            custom_filters=custom_filters,
-            fundamentals=fundamentals,
-            news=news,
-            names=names,
-        )
-        return ResearchResult(
-            _records(frame),
-            f"Ideas: {preset}",
-            notice=frame.attrs.get("ideas_notice"),
-        )
+        try:
+            frame = IdeaScanner(self._client).scan(
+                preset=preset,
+                source=source,
+                tickers=tickers,
+                universe_symbols=universe_symbols,
+                top_n=top_n,
+                custom_filters=custom_filters,
+                fundamentals=fundamentals,
+                news=news,
+                names=names,
+            )
+            return ResearchResult(
+                _records(frame),
+                f"Ideas: {preset}",
+                notice=frame.attrs.get("ideas_notice"),
+            )
+        except Exception as exc:
+            if not is_data_entitlement_error(exc) or self._td_client is None:
+                raise
+            notice = entitlement_fallback_notice("massive", str(exc))
+            fb_source = source
+            fb_tickers = tickers
+            fb_universe = universe_symbols
+            if source == "movers" or (not tickers and not universe_symbols):
+                fb_source = "tickers"
+                fb_tickers = list(LIQUID_US_FALLBACK_TICKERS)
+                fb_universe = None
+            frame = TwelveDataIdeaScanner(self._td_client).scan(
+                preset=preset,
+                source=fb_source,
+                tickers=fb_tickers,
+                universe_symbols=fb_universe,
+                top_n=top_n,
+                custom_filters=custom_filters,
+                fundamentals=fundamentals,
+                news=False,
+                names=names,
+            )
+            frame.attrs["ideas_notice"] = notice
+            return ResearchResult(
+                _records(frame),
+                f"Ideas: {preset}",
+                provider="twelvedata",
+                notice=notice,
+            )
 
     def movers(
         self,
@@ -114,9 +156,18 @@ class MassiveResearch:
         limit: int,
         detail: bool = False,
     ) -> ResearchResult:
-        snapshots = list(self._client.get_snapshot_direction(
-            market_type=market, direction=direction,
-        ))[:limit]
+        title = f"{market.title()} Movers ({direction})"
+        try:
+            snapshots = list(self._client.get_snapshot_direction(
+                market_type=market, direction=direction,
+            ))[:limit]
+        except Exception as exc:
+            if not is_data_entitlement_error(exc) or self._td_client is None:
+                raise
+            return self._movers_from_twelvedata(
+                market=market, direction=direction, limit=limit, detail=detail,
+                notice=entitlement_fallback_notice("massive", str(exc)),
+            )
         rows = []
         for snapshot in snapshots:
             day = getattr(snapshot, "day", None)
@@ -131,13 +182,21 @@ class MassiveResearch:
             })
         if detail:
             rows = self._enrich_movers(rows)
-        return ResearchResult(json_clean(rows), f"{market.title()} Movers ({direction})")
+        return ResearchResult(json_clean(rows), title)
 
     def snapshot(self, symbol: str) -> ResearchResult:
         ticker = symbol.strip().upper()
-        snapshot = self._client.get_snapshot_ticker(
-            market_type="stocks", ticker=ticker,
-        )
+        try:
+            snapshot = self._client.get_snapshot_ticker(
+                market_type="stocks", ticker=ticker,
+            )
+        except Exception as exc:
+            if not is_data_entitlement_error(exc) or self._td_client is None:
+                raise
+            return self._snapshot_from_twelvedata(
+                ticker,
+                notice=entitlement_fallback_notice("massive", str(exc)),
+            )
         data = {
             "ticker": getattr(snapshot, "ticker", ticker) or ticker,
             "change": getattr(snapshot, "todays_change", None),
@@ -166,6 +225,112 @@ class MassiveResearch:
             articles = self._client.list_ticker_news(ticker=symbol, limit=limit)
         rows = [self._news_row(article, source) for article in articles]
         return ResearchResult(json_clean(rows[:limit]), f"News: {symbol}")
+
+    def _snapshot_from_twelvedata(self, ticker: str, *, notice: str) -> ResearchResult:
+        payload = self._td_client.quote(symbol=ticker).as_json()
+
+        def _num(key: str) -> Any:
+            value = payload.get(key)
+            if value in (None, ""):
+                return None
+            try:
+                return float(value)
+            except (TypeError, ValueError):
+                return None
+
+        close = _num("close")
+        data = {
+            "ticker": str(payload.get("symbol") or ticker).upper(),
+            "change": _num("change"),
+            "change_pct": _num("percent_change"),
+            "day": {
+                "open": _num("open"),
+                "high": _num("high"),
+                "low": _num("low"),
+                "close": close,
+                "volume": _num("volume"),
+                "vwap": None,
+            },
+            "previous_day": {"close": _num("previous_close"), "volume": None},
+            "bid": None,
+            "ask": None,
+            "bid_size": None,
+            "ask_size": None,
+            "last": close,
+            "last_size": None,
+        }
+        return ResearchResult(
+            json_clean(data), f"Snapshot: {ticker}",
+            provider="twelvedata", notice=notice,
+        )
+
+    def _movers_from_twelvedata(
+        self,
+        *,
+        market: str,
+        direction: str,
+        limit: int,
+        detail: bool,
+        notice: str,
+    ) -> ResearchResult:
+        title = f"{market.title()} Movers ({direction})"
+        rows: list[dict[str, Any]] = []
+        try:
+            payload = self._td_client.get_market_movers(
+                market=market, direction=direction,
+            ).as_json()
+            entries = payload if isinstance(payload, list) else payload.get("values", [])
+            for entry in entries[:limit]:
+                rows.append({
+                    "ticker": entry.get("symbol", "") or "",
+                    "open": None,
+                    "close": entry.get("last"),
+                    "volume": entry.get("volume"),
+                    "change": entry.get("change"),
+                    "change_pct": entry.get("percent_change"),
+                    "market": market,
+                })
+        except Exception as td_exc:
+            if not is_data_entitlement_error(td_exc):
+                raise
+            notice = entitlement_fallback_notice("twelvedata", str(td_exc))
+            for quote in self._td_batch_quote(list(LIQUID_US_FALLBACK_TICKERS)):
+                rows.append({
+                    "ticker": quote.get("symbol", "") or "",
+                    "open": quote.get("open"),
+                    "close": quote.get("close") or quote.get("last"),
+                    "volume": quote.get("volume"),
+                    "change": quote.get("change"),
+                    "change_pct": quote.get("percent_change"),
+                    "market": market,
+                })
+            rows.sort(
+                key=lambda row: float(row.get("change_pct") or 0.0),
+                reverse=(direction != "losers"),
+            )
+            rows = rows[:limit]
+        if detail:
+            rows = self._enrich_movers(rows)
+        return ResearchResult(
+            json_clean(rows), title, provider="twelvedata", notice=notice,
+        )
+
+    def _td_batch_quote(self, symbols: list[str]) -> list[dict[str, Any]]:
+        """Fetch TwelveData quotes for a symbol list (same shape as TD /quote)."""
+        joined = ",".join(symbol for symbol in symbols if symbol)
+        if not joined:
+            return []
+        payload = self._td_client.quote(symbol=joined).as_json()
+        if isinstance(payload, dict) and "symbol" in payload:
+            return [payload]
+        if isinstance(payload, dict):
+            return [
+                item for item in payload.values()
+                if isinstance(item, dict) and ("symbol" in item or "close" in item)
+            ]
+        if isinstance(payload, list):
+            return [item for item in payload if isinstance(item, dict)]
+        return []
 
     def _enrich_movers(self, rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
         if not rows:

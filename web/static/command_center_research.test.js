@@ -70,6 +70,13 @@ function proposalTarget() {
     assert.deepEqual(params.getAll('tickers'), ['AAPL', 'MSFT', 'AAPL']);
     assert.equal(params.get('fundamentals'), 'true');
     assert.equal(params.get('news'), 'false');
+
+    const moversParams = h.api.paramsFromForm(h.form('ideas', [
+      ['source', 'movers'], ['tickers', 'MSFT'], ['universe', 'keep'], ['num', '15'],
+    ], [{name: 'fundamentals', checked: false}, {name: 'news', checked: false}]));
+    assert.equal(moversParams.get('source'), 'movers');
+    assert.deepEqual(moversParams.getAll('tickers'), []);
+    assert.equal(moversParams.get('universe'), null);
   });
 
   await test('tool state and selection survive switching and a failed refresh', async () => {
@@ -236,6 +243,41 @@ function proposalTarget() {
     assert.match(html, /&lt;svg/);
     assert.match(html, /&lt;b&gt;/);
     assert.match(html, /&lt;i&gt;/);
+  });
+
+  await test('movers detail card formats metrics and nested company copy', async () => {
+    const h = makeHarness();
+    h.loadProductionScript();
+    h.api.selectTool('movers');
+    h.fetch.enqueue(200, response([{
+      ticker: 'AMD',
+      open: 526.6,
+      close: 557.105,
+      volume: 1358484,
+      change: 12.67501,
+      change_pct: 2.32812,
+      market: 'stocks',
+      details: {
+        name: 'Advanced Micro Devices',
+        market_cap: 821121563781.23,
+        description: 'Designs semiconductors for PCs and data centers.',
+      },
+      ratios: {},
+      news: {},
+    }], 'Stocks Movers (gainers)'));
+    await h.api.run('movers', new URLSearchParams());
+    h.api.selectRow(0);
+
+    const detail = h.elements.get('research-detail').innerHTML;
+    assert.match(detail, /research-ticker/);
+    assert.match(detail, />AMD</);
+    assert.match(detail, /Advanced Micro Devices/);
+    assert.match(detail, /\+2\.33%/);
+    assert.match(detail, /1\.36M/);
+    assert.match(detail, /\$821\.12B/);
+    assert.match(detail, /Designs semiconductors/);
+    assert.doesNotMatch(detail, /\{"name":/);
+    assert.match(h.elements.get('research-results').innerHTML, /\+2\.33%/);
   });
 
   await test('result rows support click and keyboard Enter selection', async () => {

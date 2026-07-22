@@ -1,13 +1,20 @@
 from __future__ import annotations
 
+import asyncio
+import socket
 import threading
+import time
 from typing import Any
 
+import httpx
 import pytest
+import uvicorn
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
+from sse_starlette.sse import AppStatus
 
 from cc_fakes import NullBridge, NullQuotePlane
+from trader.domain.events import SnapshotWithCursor
 from trader.tools.massive_research import ResearchResult
 from web.app import create_app
 from web.command_center import CommandCenter, CommandCenterConfig
@@ -102,7 +109,22 @@ def research_service(
 
 
 @pytest.fixture
-def research_cc() -> CommandCenter:
+def research_cc(monkeypatch) -> CommandCenter:
+    class EmptyManageClient:
+        def trader_query(self, method, body=None):
+            if method == "list_universes":
+                return {"universes": []}
+            return {}
+
+        def strategy_query(self, method, body=None):
+            if method == "list_strategies":
+                return {"strategies": []}
+            return {}
+
+    monkeypatch.setattr(
+        "web.app.get_manage_client",
+        lambda: EmptyManageClient(),
+    )
     return CommandCenter(
         CommandCenterConfig(),
         credentials_loader=lambda: DashboardCredentials(
@@ -598,3 +620,131 @@ def test_create_app_stores_and_closes_injected_research_service(
     with TestClient(app):
         assert service.close_calls == 0
     assert service.close_calls == 1
+
+
+class BlockingResearchProvider:
+    def __init__(self, started: threading.Barrier, release: threading.Event):
+        self.started = started
+        self.release = release
+
+    def snapshot(self, symbol: str) -> ResearchResult:
+        self.started.wait(timeout=2)
+        self.release.wait(timeout=3)
+        return ResearchResult({"ticker": symbol}, f"Snapshot: {symbol}")
+
+
+@pytest.fixture
+def blocking_research_service():
+    release = threading.Event()
+    started = threading.Barrier(5)
+    provider = BlockingResearchProvider(started, release)
+    service = ResearchService(
+        lambda: provider,
+        workers=4,
+        timeouts={"snapshot": 4.0},
+    )
+    try:
+        yield service, release, started
+    finally:
+        release.set()
+        service.close()
+
+
+def _research_free_port() -> int:
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as probe:
+        probe.bind(("127.0.0.1", 0))
+        return probe.getsockname()[1]
+
+
+def _seed_research_baseline(cc: CommandCenter) -> None:
+    cc.state.install_baseline(
+        SnapshotWithCursor(
+            source_cursor=0,
+            broker_generation=1,
+            entities={
+                "account": [{
+                    "entity_id": "DU123",
+                    "entity_revision": 1,
+                    "net_liquidation": 50_000.0,
+                    "mode": "paper",
+                }],
+            },
+        ),
+        stream_id="stream-research-isolation",
+    )
+
+
+async def _login_async(client: httpx.AsyncClient) -> None:
+    response = await client.post("/session", data={"token": TOKEN})
+    assert response.status_code in (200, 303)
+
+
+@pytest.fixture
+def research_server(
+    research_cc: CommandCenter,
+    blocking_research_service,
+):
+    service, release, started = blocking_research_service
+    _seed_research_baseline(research_cc)
+    application = create_app(research_cc, research_service=service)
+
+    AppStatus.should_exit = False
+    AppStatus.should_exit_event = None
+    port = _research_free_port()
+    config = uvicorn.Config(
+        application,
+        host="127.0.0.1",
+        port=port,
+        log_level="warning",
+        lifespan="off",
+    )
+    server = uvicorn.Server(config)
+    thread = threading.Thread(target=server.run, daemon=True)
+    thread.start()
+    deadline = time.monotonic() + 5.0
+    while not server.started and thread.is_alive() and time.monotonic() < deadline:
+        time.sleep(0.01)
+    if not server.started:
+        server.should_exit = True
+        thread.join(timeout=5.0)
+        pytest.fail("test uvicorn server failed to start within 5s")
+
+    try:
+        yield f"http://127.0.0.1:{port}", release, started
+    finally:
+        release.set()
+        server.should_exit = True
+        thread.join(timeout=5.0)
+        assert not thread.is_alive(), "test uvicorn server failed to stop within 5s"
+
+
+@pytest.mark.asyncio
+async def test_saturated_research_pool_does_not_block_trading_sse(
+    research_server,
+):
+    base_url, release, all_started = research_server
+    async with httpx.AsyncClient(base_url=base_url, timeout=5) as client:
+        await _login_async(client)
+        scans = [
+            asyncio.create_task(client.get(
+                "/api/research/snapshot",
+                params={"symbol": f"T{i}"},
+            ))
+            for i in range(4)
+        ]
+        try:
+            await asyncio.to_thread(all_started.wait, 2)
+            started = time.monotonic()
+            async with client.stream("GET", "/api/events") as response:
+                assert response.status_code == 200
+                async for line in response.aiter_lines():
+                    if line == "event: quotes.snapshot":
+                        break
+            assert time.monotonic() - started < 1.0
+        finally:
+            release.set()
+            scan_results = await asyncio.gather(*scans, return_exceptions=True)
+        assert all(
+            isinstance(result, httpx.Response) and result.status_code == 200
+            for result in scan_results
+        )

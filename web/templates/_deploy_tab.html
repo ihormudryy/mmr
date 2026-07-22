@@ -1,7 +1,11 @@
 {% macro info(text) %}<span class="info" tabindex="0" role="button" aria-label="More info">i<span class="tip">{{ text }}</span></span>{% endmacro %}
 
 <div class="dash-admin-body">
-  {% if flash %}<p class="banner{% if flash_err %} err{% endif %}">{{ flash }}</p>{% endif %}
+  {% if flash %}<p class="banner flash{% if flash_err %} err{% endif %}" data-flash-banner role="status">
+    <span class="flash-msg">{{ flash }}</span>
+    <button type="button" class="flash-dismiss" data-flash-dismiss
+            aria-label="Dismiss notification">×</button>
+  </p>{% endif %}
   {% if errors.page %}<p class="banner err">{{ errors.page }}</p>{% endif %}
 
   <section class="full">

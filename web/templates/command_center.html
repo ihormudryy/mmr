@@ -149,10 +149,32 @@
       min-width: 58px;
     }
     .flash {
+      display: flex;
+      align-items: flex-start;
+      gap: var(--space-3);
       padding: 10px var(--space-6);
       background: color-mix(in srgb, var(--fg) 6%, transparent);
       color: var(--fg);
       border-bottom: 1px solid var(--border);
+    }
+    .flash > .flash-msg { flex: 1 1 auto; min-width: 0; }
+    .flash > .flash-dismiss {
+      flex: 0 0 auto;
+      margin: -2px -8px -2px 0;
+      padding: 2px 10px;
+      border: none;
+      background: transparent;
+      color: inherit;
+      font: inherit;
+      font-size: 18px;
+      line-height: 1.2;
+      cursor: pointer;
+      opacity: 0.7;
+    }
+    .flash > .flash-dismiss:hover,
+    .flash > .flash-dismiss:focus-visible {
+      opacity: 1;
+      outline: 1px solid var(--border);
     }
     .flash.err {
       background: color-mix(in srgb, var(--neg) 10%, transparent);
@@ -599,10 +621,32 @@
     }
     .dash-admin-pane section.full { grid-column: 1 / -1; }
     .dash-admin-pane .banner {
+      display: flex;
+      align-items: flex-start;
+      gap: var(--space-3);
       padding: 10px var(--space-4);
       margin: 0;
       font-size: 13px;
       border-bottom: 1px solid var(--border);
+    }
+    .dash-admin-pane .banner .flash-msg { flex: 1 1 auto; min-width: 0; }
+    .dash-admin-pane .banner .flash-dismiss {
+      flex: 0 0 auto;
+      margin: -2px -6px -2px 0;
+      padding: 2px 8px;
+      border: none;
+      background: transparent;
+      color: inherit;
+      font: inherit;
+      font-size: 16px;
+      line-height: 1.2;
+      cursor: pointer;
+      opacity: 0.7;
+    }
+    .dash-admin-pane .banner .flash-dismiss:hover,
+    .dash-admin-pane .banner .flash-dismiss:focus-visible {
+      opacity: 1;
+      outline: 1px solid var(--border);
     }
     .dash-admin-pane .banner.err {
       color: var(--neg);
@@ -1455,7 +1499,11 @@
     </div>
     {% endif %}
   </header>
-  {% if flash %}<div class="flash{% if flash_err %} err{% endif %}">{{ flash }}</div>{% endif %}
+  {% if flash %}<div class="flash{% if flash_err %} err{% endif %}" data-flash-banner role="status">
+    <span class="flash-msg">{{ flash }}</span>
+    <button type="button" class="flash-dismiss" data-flash-dismiss
+            aria-label="Dismiss notification">×</button>
+  </div>{% endif %}
   <div id="dash-trading" class="dash-pane active">
     <!-- Action queue promoted to a full-width 3-up strip directly under the
          command band: approving proposals is the riskiest job on this page. -->

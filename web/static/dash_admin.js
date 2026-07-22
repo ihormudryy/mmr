@@ -203,6 +203,25 @@
     });
   });
 
+  function clearFlashQuery() {
+    try {
+      var url = new URL(window.location.href);
+      if (!url.searchParams.has('flash') && !url.searchParams.has('flash_err')) return;
+      url.searchParams.delete('flash');
+      url.searchParams.delete('flash_err');
+      history.replaceState(null, '', url.pathname + url.search + url.hash);
+    } catch (e) { /* ignore */ }
+  }
+
+  document.querySelectorAll('[data-flash-dismiss]').forEach(function (btn) {
+    btn.addEventListener('click', function () {
+      document.querySelectorAll('[data-flash-banner]').forEach(function (el) {
+        el.remove();
+      });
+      clearFlashQuery();
+    });
+  });
+
   function parseHash() {
     var raw = (location.hash || '#trading').replace('#', '');
     activateDashTab(raw);

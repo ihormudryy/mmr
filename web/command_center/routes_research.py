@@ -9,6 +9,7 @@ from fastapi import APIRouter, Depends, Query, Request
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse
 
+from trader.tools.idea_scanner import PRESETS
 from web.command_center.research import ResearchError, ResearchService
 
 
@@ -161,6 +162,12 @@ def create_research_router(
             "max_change", "fundamentals", "news", "names",
         }
         reject_unknown(request, allowed)
+        if preset not in PRESETS:
+            raise validation_error(
+                "preset",
+                f"Unknown preset: {preset}. Available: {', '.join(sorted(PRESETS))}",
+                preset,
+            )
         normalized = list(dict.fromkeys(
             ticker.strip().upper() for ticker in tickers if ticker.strip()))
         if len(normalized) > 100:
@@ -173,6 +180,18 @@ def create_research_router(
         if source == "universe" and not universe.strip():
             raise validation_error(
                 "universe", "universe is required when source=universe", universe)
+        if source == "movers" and normalized:
+            raise validation_error(
+                "tickers", "tickers are not allowed when source=movers", tickers)
+        if source == "movers" and universe.strip():
+            raise validation_error(
+                "universe", "universe is not allowed when source=movers", universe)
+        if source == "tickers" and universe.strip():
+            raise validation_error(
+                "universe", "universe is not allowed when source=tickers", universe)
+        if source == "universe" and normalized:
+            raise validation_error(
+                "tickers", "tickers are not allowed when source=universe", tickers)
         if (
             min_price is not None
             and max_price is not None

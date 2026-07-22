@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import math
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import Any
@@ -10,6 +11,8 @@ from typing import Any
 import pandas as pd
 
 from trader.tools.idea_scanner import IdeaScanner, list_presets
+
+_MOVERS_DETAIL_WORKERS = 8
 
 
 @dataclass(frozen=True)
@@ -26,10 +29,20 @@ def json_clean(value: Any) -> Any:
         return {str(key): json_clean(item) for key, item in value.items()}
     if isinstance(value, (list, tuple)):
         return [json_clean(item) for item in value]
+    if value is None or value is pd.NA or value is pd.NaT:
+        return None
+    try:
+        if pd.isna(value):
+            return None
+    except (TypeError, ValueError):
+        pass
     if isinstance(value, float) and not math.isfinite(value):
         return None
-    if hasattr(value, "item"):
-        return json_clean(value.item())
+    if hasattr(value, "item") and not isinstance(value, (bytes, str)):
+        try:
+            return json_clean(value.item())
+        except (ValueError, TypeError, AttributeError):
+            return None
     if isinstance(value, (datetime, pd.Timestamp)):
         return value.astimezone(timezone.utc).isoformat().replace("+00:00", "Z")
     return value
@@ -43,6 +56,15 @@ def _records(frame: pd.DataFrame | None) -> list[dict[str, Any]]:
 
 def _attrs(obj: Any, names: tuple[str, ...]) -> dict[str, Any]:
     return {name: getattr(obj, name, None) for name in names} if obj else {}
+
+
+def _quote_price(quote: Any, side: str) -> Any:
+    if quote is None:
+        return None
+    value = getattr(quote, side, None)
+    if value is not None:
+        return value
+    return getattr(quote, f"{side}_price", None)
 
 
 class MassiveResearch:
@@ -127,8 +149,8 @@ class MassiveResearch:
             "previous_day": _attrs(
                 getattr(snapshot, "prev_day", None), ("close", "volume"),
             ),
-            "bid": getattr(getattr(snapshot, "last_quote", None), "bid", None),
-            "ask": getattr(getattr(snapshot, "last_quote", None), "ask", None),
+            "bid": _quote_price(getattr(snapshot, "last_quote", None), "bid"),
+            "ask": _quote_price(getattr(snapshot, "last_quote", None), "ask"),
             "bid_size": getattr(getattr(snapshot, "last_quote", None), "bid_size", None),
             "ask_size": getattr(getattr(snapshot, "last_quote", None), "ask_size", None),
             "last": getattr(getattr(snapshot, "last_trade", None), "price", None),
@@ -146,36 +168,45 @@ class MassiveResearch:
         return ResearchResult(json_clean(rows[:limit]), f"News: {symbol}")
 
     def _enrich_movers(self, rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
-        for row in rows:
-            ticker = row["ticker"]
-            try:
-                details = self._client.get_ticker_details(ticker)
-                row["details"] = _attrs(details, ("name", "market_cap", "description"))
-            except Exception:
-                row["details"] = {}
-            try:
-                ratios = list(self._client.list_financials_ratios(ticker=ticker, limit=1))
-                ratio = ratios[0] if ratios else None
-                row["ratios"] = {
-                    label: getattr(ratio, field, None)
-                    for field, label in (
-                        ("price_to_earnings", "pe"),
-                        ("debt_to_equity", "de"),
-                        ("return_on_equity", "roe"),
-                        ("earnings_per_share", "eps"),
-                        ("dividend_yield", "div_yield"),
-                    )
-                    if ratio is not None
-                }
-            except Exception:
-                row["ratios"] = {}
-            try:
-                articles = list(self._client.list_ticker_news(ticker=ticker, limit=1))
-                article = articles[0] if articles else None
-                row["news"] = self._news_row(article, "polygon") if article else {}
-            except Exception:
-                row["news"] = {}
+        if not rows:
+            return rows
+        workers = min(_MOVERS_DETAIL_WORKERS, len(rows))
+        with ThreadPoolExecutor(
+            max_workers=workers, thread_name_prefix="cc-movers-detail",
+        ) as pool:
+            list(pool.map(self._enrich_mover_row, rows))
         return rows
+
+    def _enrich_mover_row(self, row: dict[str, Any]) -> dict[str, Any]:
+        ticker = row["ticker"]
+        try:
+            details = self._client.get_ticker_details(ticker)
+            row["details"] = _attrs(details, ("name", "market_cap", "description"))
+        except Exception:
+            row["details"] = {}
+        try:
+            ratios = list(self._client.list_financials_ratios(ticker=ticker, limit=1))
+            ratio = ratios[0] if ratios else None
+            row["ratios"] = {
+                label: getattr(ratio, field, None)
+                for field, label in (
+                    ("price_to_earnings", "pe"),
+                    ("debt_to_equity", "de"),
+                    ("return_on_equity", "roe"),
+                    ("earnings_per_share", "eps"),
+                    ("dividend_yield", "div_yield"),
+                )
+                if ratio is not None
+            }
+        except Exception:
+            row["ratios"] = {}
+        try:
+            articles = list(self._client.list_ticker_news(ticker=ticker, limit=1))
+            article = articles[0] if articles else None
+            row["news"] = self._news_row(article, "polygon") if article else {}
+        except Exception:
+            row["news"] = {}
+        return row
 
     @staticmethod
     def _news_row(article: Any, source: str) -> dict[str, Any]:

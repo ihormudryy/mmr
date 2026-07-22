@@ -1274,12 +1274,14 @@ async function ccResolveSymbol() {
     const body = await res.json();
     if (!isCurrent()) return;
     if (!res.ok) {
+      form.conid.value = '';
       status.textContent = body.error || (`HTTP ${res.status}`);
       status.className = 'cc-resolve-status err';
       return;
     }
     const instruments = body.instruments || [];
     if (!instruments.length) {
+      form.conid.value = '';
       status.textContent = `No contract found for ${sym}`
         + (exchange ? ` on ${exchange}` : '')
         + ' — try exchange/currency hints.';
@@ -1298,11 +1300,35 @@ async function ccResolveSymbol() {
     status.className = 'cc-resolve-status ok';
   } catch (err) {
     if (!isCurrent()) return;
+    form.conid.value = '';
     status.textContent = String(err.message || err);
     status.className = 'cc-resolve-status err';
   } finally {
     if (isCurrent()) ccResolveAbortController = null;
   }
+}
+
+function ccInvalidateResolvedConId(event) {
+  const form = document.getElementById('cc-proposal-form');
+  if (!form) return;
+  const target = event && event.target;
+  const field = target && (
+    target.name
+    || (target === form.resolve_symbol ? 'resolve_symbol' : null)
+    || (target === form.resolve_exchange ? 'resolve_exchange' : null)
+    || (target === form.resolve_currency ? 'resolve_currency' : null)
+  );
+  if (field !== 'resolve_symbol'
+      && field !== 'resolve_exchange'
+      && field !== 'resolve_currency') {
+    return;
+  }
+  ccResolveGeneration += 1;
+  if (ccResolveAbortController) {
+    ccResolveAbortController.abort();
+    ccResolveAbortController = null;
+  }
+  form.conid.value = '';
 }
 
 function ccProposalBody(form, commandId) {
@@ -1341,6 +1367,8 @@ document.getElementById('cc-proposal-form').addEventListener('submit',
           `New proposal ${body.action} conId ${body.conid}`,
           '/api/commands/proposals', body);
     });
+document.getElementById('cc-proposal-form').addEventListener(
+    'input', ccInvalidateResolvedConId);
 document.getElementById('cc-proposal-cancel').addEventListener('click',
     ccCloseProposalDrawer);
 document.getElementById('cc-proposal-close').addEventListener('click',

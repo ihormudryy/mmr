@@ -210,6 +210,11 @@
     if (target.loading) return 'Loading…';
     if (target.error) return target.error.message;
     if (Array.isArray(target.data) && target.data.length === 0) return 'No results.';
+    if (target.data !== null && typeof target.data === 'object'
+        && !Array.isArray(target.data)
+        && Object.keys(target.data).length === 0) {
+      return 'No results.';
+    }
     return '';
   }
 
@@ -222,10 +227,12 @@
     if (!target.title && !target.meta) return '';
     const provider = target.meta && target.meta.provider;
     const observedAt = target.meta && target.meta.observed_at;
+    const notice = target.meta && target.meta.notice;
     return `<header class="research-result-meta">
       ${target.title ? `<strong>${esc(target.title)}</strong>` : ''}
       ${provider ? `<span data-research-provider>${esc(provider)}</span>` : ''}
       ${observedAt ? `<time data-research-observed>${esc(observedAt)}</time>` : ''}
+      ${notice ? `<span data-research-notice>${esc(notice)}</span>` : ''}
     </header>`;
   }
 
@@ -277,7 +284,9 @@
   function lookupPart(name, target) {
     const status = statusFor(target);
     let content = '';
-    if (name === 'news' && Array.isArray(target.data)) {
+    if (status === 'No results.') {
+      content = '';
+    } else if (name === 'news' && Array.isArray(target.data)) {
       content = target.data.map((row) => `<article>${objectMarkup(row)}</article>`).join('');
     } else if (target.data !== null) {
       content = objectMarkup(target.data);

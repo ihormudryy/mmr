@@ -359,6 +359,24 @@ def test_ideas_cross_field_validation_precedes_admission(
     assert research_service.admissions == 0
 
 
+@pytest.mark.parametrize("path", [
+    "/api/research/ideas?preset=not-a-real-preset",
+    "/api/research/ideas?source=movers&tickers=AAPL",
+    "/api/research/ideas?source=movers&universe=STK.US.LIQUID",
+    "/api/research/ideas?source=tickers&tickers=AAPL&universe=STK.US.LIQUID",
+    "/api/research/ideas?source=universe&universe=STK.US.LIQUID&tickers=AAPL",
+])
+def test_ideas_rejects_unknown_presets_and_incompatible_source_arguments(
+    logged_in_research_client,
+    research_service,
+    path,
+):
+    response = logged_in_research_client.get(path)
+
+    assert response.status_code == 422
+    assert research_service.admissions == 0
+
+
 def test_ideas_rejects_more_than_100_normalized_tickers_before_admission(
     logged_in_research_client,
     research_service,

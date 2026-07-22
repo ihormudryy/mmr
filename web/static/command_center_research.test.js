@@ -186,6 +186,20 @@ function proposalTarget() {
     assert.equal(h.elements.get('research-results').innerHTML.includes('research-error'), false);
   });
 
+  await test('valid empty snapshot object is rendered as no results', async () => {
+    const h = makeHarness();
+    h.loadProductionScript();
+    h.api.selectTool('lookup');
+    h.fetch.enqueue(200, response({}, 'Snapshot', {tool: 'snapshot'}));
+    h.fetch.enqueue(200, response([], 'News', {tool: 'news'}));
+
+    await h.api.run('lookup', new URLSearchParams({symbol: 'AAPL'}));
+
+    assert.match(h.elements.get('research-status').textContent, /no results/i);
+    assert.match(h.elements.get('research-results').innerHTML,
+      /data-lookup-part="snapshot"[\s\S]*No results\./);
+  });
+
   await test('missing configuration is shown safely in a visible banner', async () => {
     const h = makeHarness();
     h.loadProductionScript();
@@ -277,6 +291,22 @@ function proposalTarget() {
     assert.match(results, /massive/);
     assert.match(results, /2026-07-22T10:00:00Z/);
     assert.match(detail, /massive/);
+  });
+
+  await test('provider notice is escaped in result and detail metadata', async () => {
+    const h = makeHarness();
+    h.loadProductionScript();
+    h.fetch.enqueue(200, response([{ticker: 'AAPL'}], 'Ideas: momentum', {
+      tool: 'ideas', notice: '<img src=x onerror=alert(1)> entitlement fallback',
+    }));
+
+    await h.api.run('ideas', new URLSearchParams());
+
+    const results = h.elements.get('research-results').innerHTML;
+    const detail = h.elements.get('research-detail').innerHTML;
+    assert.doesNotMatch(results + detail, /<img/);
+    assert.match(results, /&lt;img src=x onerror=alert\(1\)&gt; entitlement fallback/);
+    assert.match(detail, /&lt;img src=x onerror=alert\(1\)&gt; entitlement fallback/);
   });
 
   await test('Propose is absent when the server-rendered partial disables it', async () => {

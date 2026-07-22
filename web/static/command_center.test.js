@@ -16,6 +16,7 @@ const source = fs.readFileSync(path.join(__dirname, 'command_center.js'), 'utf8'
   .replace(/\nresync\(\);\s*$/, '\n');
 
 function element() {
+  const handlers = new Map();
   return {
     hidden: true,
     innerHTML: '',
@@ -24,7 +25,13 @@ function element() {
     value: '',
     dataset: {},
     classList: { add() {}, remove() {}, toggle() {} },
-    addEventListener() {},
+    addEventListener(type, callback) {
+      if (!handlers.has(type)) handlers.set(type, []);
+      handlers.get(type).push(callback);
+    },
+    dispatch(type, event = {}) {
+      for (const callback of handlers.get(type) || []) callback(event);
+    },
     appendChild() {},
     replaceChildren() {},
     focus() {},
@@ -34,7 +41,7 @@ function element() {
   };
 }
 
-function makeContext() {
+function makeContext({commandsEnabled = false} = {}) {
   const elements = new Map();
   const getElement = (id) => {
     if (!elements.has(id)) elements.set(id, element());
@@ -42,7 +49,8 @@ function makeContext() {
   };
   const document = {
     body: { dataset: {
-      commandsEnabled: 'false', degradedAfterMs: '15000', pollIntervalMs: '5000',
+      commandsEnabled: commandsEnabled ? 'true' : 'false',
+      degradedAfterMs: '15000', pollIntervalMs: '5000',
     } },
     getElementById: getElement,
     querySelector: () => element(),
@@ -275,6 +283,52 @@ async function test(name, fn) {
     assert.equal(form.resolve_symbol.value, 'MSFT');
     assert.equal(form.conid.value, 202);
     assert.match(run("document.getElementById('cc-resolve-status').textContent"), /MSFT/);
+  });
+
+  await test('editing any resolved instrument hint clears its conId', async () => {
+    const {context, run} = makeContext({commandsEnabled: true});
+    const form = run("document.getElementById('cc-proposal-form')");
+    for (const name of [
+      'resolve_symbol', 'resolve_exchange', 'resolve_currency', 'conid',
+    ]) form[name] = element();
+    form.resolve_symbol.value = 'AAPL';
+    form.resolve_exchange.value = 'NASDAQ';
+    form.resolve_currency.value = 'USD';
+    context.fetch = async () => ({ok: true, async json() { return {instruments: [{
+      symbol: 'AAPL', instrument_id: 101, primary_exchange: 'NASDAQ', currency: 'USD',
+    }]}; }});
+
+    await run('ccResolveSymbol()');
+    assert.equal(form.conid.value, 101);
+    for (const name of ['resolve_symbol', 'resolve_exchange', 'resolve_currency']) {
+      form.conid.value = 101;
+      form.dispatch('input', {target: form[name]});
+      assert.equal(form.conid.value, '', `${name} edit must invalidate conId`);
+    }
+  });
+
+  await test('failed and no-match resolution retries cannot retain a prior conId', async () => {
+    const {context, run} = makeContext({commandsEnabled: true});
+    const form = run("document.getElementById('cc-proposal-form')");
+    for (const name of [
+      'resolve_symbol', 'resolve_exchange', 'resolve_currency', 'conid',
+    ]) form[name] = element();
+    form.resolve_symbol.value = 'AAPL';
+    form.resolve_exchange.value = 'NASDAQ';
+    form.resolve_currency.value = 'USD';
+    const responses = [
+      {ok: true, async json() { return {instruments: []}; }},
+      {ok: false, status: 502, async json() { return {error: 'resolve failed'}; }},
+    ];
+    context.fetch = async () => responses.shift();
+
+    form.conid.value = 101;
+    await run('ccResolveSymbol()');
+    assert.equal(form.conid.value, '');
+
+    form.conid.value = 202;
+    await run('ccResolveSymbol()');
+    assert.equal(form.conid.value, '');
   });
 
   console.log(`command_center.test.js: ${passed} tests passed`);

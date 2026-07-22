@@ -1,14 +1,23 @@
 """Regime-Adaptive Strategy: switches between momentum and mean-reversion.
 
 Detects the current market regime using the Hurst exponent:
-  - H > 0.55 → trending regime → use momentum (20/50 EMA crossover)
+  - H > 0.55 → trending regime → use momentum (10/30 EMA crossover)
   - H < 0.45 → mean-reverting regime → use Bollinger Band bounce
   - 0.45 ≤ H ≤ 0.55 → random walk → no trade (sit out)
 
 The Hurst exponent is estimated via the rescaled range (R/S) method
 over a rolling window.  This gives the strategy an adaptive edge:
 it doesn't force momentum trades in choppy markets, and doesn't
-fade trends.
+fade trends. R/S estimates are statistically meaningless on short
+samples — HURST_WINDOW defaults to 256 returns (the old default of 60
+produced noise around 0.5 and constant regime whipsaw).
+
+Position state is tracked PER INSTRUMENT (keyed by the runtime-stamped
+dispatch conid): a single shared flag cross-contaminated regime exits
+when the strategy was deployed on more than one conid. Note the state
+is in-memory only — a service restart forgets an open regime position,
+so the strategy will not emit its regime-exit SELL for entries made
+before the restart.
 
 Also incorporates volatility-adjusted position sizing via the
 signal probability: higher confidence in regime = higher probability.
@@ -67,7 +76,9 @@ def _hurst_rs(series: np.ndarray, max_lag: int = 20) -> float:
 class RegimeAdaptive(Strategy):
     """Switches between momentum and mean-reversion based on Hurst exponent."""
 
-    HURST_WINDOW = 60     # bars for Hurst estimation
+    # R/S Hurst needs hundreds of samples for a stable estimate; 60 was
+    # statistical noise (constant whipsaw across the 0.45/0.55 thresholds).
+    HURST_WINDOW = 256    # returns used for the Hurst estimate
     TREND_THRESHOLD = 0.55
     REVERT_THRESHOLD = 0.45
 
@@ -79,16 +90,21 @@ class RegimeAdaptive(Strategy):
     BB_PERIOD = 20
     BB_STD = 2.0
 
-    MIN_BARS = 50
+    MIN_BARS = 300        # HURST_WINDOW + indicator warm-up margin
 
     def __init__(self):
         super().__init__()
-        self._last_regime: Optional[str] = None  # 'trending', 'reverting', 'neutral'
-        self._position_open = False
+        # Regime + position state PER instrument (dispatch conid; None key
+        # covers unstamped single-instrument callers like the backtester).
+        self._last_regime: dict = {}
+        self._position_open: dict = {}
 
     def on_prices(self, prices: pd.DataFrame) -> Optional[Signal]:
         if len(prices) < self.MIN_BARS:
             return None
+
+        key = self.dispatch_conid
+        position_open = self._position_open.get(key, False)
 
         close = prices['close']
         returns = close.pct_change(fill_method=None).dropna().values
@@ -106,12 +122,12 @@ class RegimeAdaptive(Strategy):
         else:
             regime = 'neutral'
 
-        self._last_regime = regime
+        self._last_regime[key] = regime
 
         # --- Neutral regime: close positions and sit out ---
         if regime == 'neutral':
-            if self._position_open:
-                self._position_open = False
+            if position_open:
+                self._position_open[key] = False
                 return Signal(
                     source_name=self.name,
                     action=Action.SELL,
@@ -131,8 +147,8 @@ class RegimeAdaptive(Strategy):
 
             # Bullish crossover
             if curr_fast > curr_slow and prev_fast <= prev_slow:
-                if not self._position_open:
-                    self._position_open = True
+                if not position_open:
+                    self._position_open[key] = True
                     # Higher Hurst = stronger trend = higher confidence
                     prob = min(0.85, 0.5 + (hurst - 0.5) * 2)
                     return Signal(
@@ -145,8 +161,8 @@ class RegimeAdaptive(Strategy):
 
             # Bearish crossover — exit long
             if curr_fast < curr_slow and prev_fast >= prev_slow:
-                if self._position_open:
-                    self._position_open = False
+                if position_open:
+                    self._position_open[key] = False
                     return Signal(
                         source_name=self.name,
                         action=Action.SELL,
@@ -158,7 +174,8 @@ class RegimeAdaptive(Strategy):
         # --- Mean-reverting regime: Bollinger Band bounce ---
         if regime == 'reverting':
             sma = close.rolling(self.BB_PERIOD).mean()
-            std = close.rolling(self.BB_PERIOD).std()
+            # Population std — the textbook Bollinger definition.
+            std = close.rolling(self.BB_PERIOD).std(ddof=0)
             lower = sma - self.BB_STD * std
             upper = sma + self.BB_STD * std
 
@@ -171,8 +188,8 @@ class RegimeAdaptive(Strategy):
                 return None
 
             # Buy when price touches lower band
-            if last_close <= last_lower and not self._position_open:
-                self._position_open = True
+            if last_close <= last_lower and not position_open:
+                self._position_open[key] = True
                 prob = min(0.85, 0.5 + (0.5 - hurst) * 2)
                 return Signal(
                     source_name=self.name,
@@ -183,8 +200,8 @@ class RegimeAdaptive(Strategy):
                 )
 
             # Sell when price reaches SMA (mean reversion target)
-            if last_close >= last_sma and self._position_open:
-                self._position_open = False
+            if last_close >= last_sma and position_open:
+                self._position_open[key] = False
                 return Signal(
                     source_name=self.name,
                     action=Action.SELL,

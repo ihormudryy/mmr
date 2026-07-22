@@ -16,6 +16,7 @@ the date portion of the index; we assert no-lookahead in tests.
 from trader.trading.strategy import Signal, Strategy
 from trader.objects import Action
 from typing import Any, Dict, Optional
+from datetime import time as dtime
 
 import numpy as np
 import pandas as pd
@@ -70,9 +71,9 @@ class VwapReversion(Strategy):
         else:
             local = idx.tz_localize('UTC').tz_convert(self.SESSION_TZ)
         day = local.normalize()
-        local_minute = (local.hour * 60 + local.minute)
+        local_minute = np.asarray(local.hour) * 60 + np.asarray(local.minute)
         rth_mask = ((local_minute >= self.RTH_OPEN_MIN)
-                    & (local_minute < self.RTH_CLOSE_MIN)).to_numpy()
+                    & (local_minute < self.RTH_CLOSE_MIN))
         rth_ser = pd.Series(rth_mask, index=prices.index)
 
         # RTH-anchored VWAP: extended-hours bars contribute nothing.

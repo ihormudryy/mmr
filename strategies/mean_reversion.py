@@ -30,7 +30,9 @@ class MeanReversion(Strategy):
         close = prices['close']
 
         sma = close.rolling(window).mean()
-        std = close.rolling(window).std()
+        # Population std - the textbook Bollinger definition (sample std
+        # made the bands ~2.6% wider at window 20).
+        std = close.rolling(window).std(ddof=0)
         upper = sma + num_std * std
         lower = sma - num_std * std
 

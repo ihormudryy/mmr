@@ -14,7 +14,9 @@ import pandas as pd
 
 
 def compute_rsi(series: pd.Series, period: int = 14) -> pd.Series:
-    """Compute RSI from a price series."""
+    """Compute RSI from a price series (Cutler variant: simple moving
+    average of gains/losses, not Wilder smoothing - values differ
+    slightly from most charting platforms)."""
     delta = series.diff()
     gain = delta.where(delta > 0, 0.0)
     loss = (-delta).where(delta < 0, 0.0)

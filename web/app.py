@@ -61,6 +61,8 @@ from web.command_center.routes_commands import (
     require_session,
 )
 from web.command_center.routes_read import create_read_router
+from web.command_center.research import ResearchService, build_research_service
+from web.command_center.routes_research import create_research_router
 from web.command_center.session import (
     SESSION_COOKIE,
     CredentialConfigError,
@@ -1473,7 +1475,10 @@ def _register_legacy_routes(application: FastAPI) -> None:
                 {'error': f'{type(exc).__name__}: {exc}'}, status_code=502)
 
 
-def create_app(cc: CommandCenter | None = None) -> FastAPI:
+def create_app(
+    cc: CommandCenter | None = None,
+    research_service: ResearchService | None = None,
+) -> FastAPI:
     """Build the FastAPI application: the command center (session gate, SSE
     fan-out, typed read model) plus the legacy SDK-backed dashboard, sharing
     one process and one `/session` login.
@@ -1492,6 +1497,7 @@ def create_app(cc: CommandCenter | None = None) -> FastAPI:
     """
     center = cc or CommandCenter(CommandCenterConfig.from_env(),
                                  commands_enabled=_COMMAND_FLAGS.commands_enabled)
+    research = research_service or build_research_service()
 
     @contextlib.asynccontextmanager
     async def _app_lifespan(fastapi_app: FastAPI):
@@ -1511,12 +1517,16 @@ def create_app(cc: CommandCenter | None = None) -> FastAPI:
         # `center.lifespan`'s own `finally` (bridge.stop()/quote_plane.stop()),
         # so `/readyz` goes false as soon as shutdown begins, not only once that
         # teardown finishes.
-        async with center.lifespan(fastapi_app):
-            async with _lifespan(fastapi_app):
-                yield
+        try:
+            async with center.lifespan(fastapi_app):
+                async with _lifespan(fastapi_app):
+                    yield
+        finally:
+            research.close()
 
     application = FastAPI(title='MMR Dashboard', lifespan=_app_lifespan)
     application.state.command_center = center
+    application.state.research_service = research
     # [M1-C] Already-validated at module import (see `_COMMAND_FLAGS` above) --
     # every app instance (including test-built ones via `create_app(stub_cc)`)
     # gets the same fail-closed flags on `app.state`, not a per-instance reload.
@@ -1587,6 +1597,7 @@ def create_app(cc: CommandCenter | None = None) -> FastAPI:
         manage_context_provider=lambda flash='': _manage_page_context(flash=flash)[0],
         empty_manage_context=_empty_manage_context,
     ))
+    application.include_router(create_research_router(center, research))
     # NEW route only: `/api/cc-health`. Never touches the G0 `/healthz` /
     # `/readyz` / `/api/health` routes registered by `_register_legacy_routes`
     # below -- see the M1-R Task 7 addendum for why those must stay as-is.

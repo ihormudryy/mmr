@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import logging
 import math
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
@@ -20,6 +21,7 @@ from trader.tools.idea_scanner import (
 )
 
 _MOVERS_DETAIL_WORKERS = 8
+logger = logging.getLogger(__name__)
 
 
 @dataclass(frozen=True)
@@ -116,12 +118,14 @@ class MassiveResearch:
             return ResearchResult(
                 _records(frame),
                 f"Ideas: {preset}",
-                notice=frame.attrs.get("ideas_notice"),
+                # Dashboard UI: never surface CLI entitlement notices (vendor
+                # plan text / --tickers hints). Provider badge is enough.
+                notice=None,
             )
         except Exception as exc:
             if not is_data_entitlement_error(exc) or self._td_client is None:
                 raise
-            notice = entitlement_fallback_notice("massive", str(exc))
+            logger.warning("%s", entitlement_fallback_notice("massive", str(exc)))
             fb_source = source
             fb_tickers = tickers
             fb_universe = universe_symbols
@@ -140,12 +144,11 @@ class MassiveResearch:
                 news=False,
                 names=names,
             )
-            frame.attrs["ideas_notice"] = notice
             return ResearchResult(
                 _records(frame),
                 f"Ideas: {preset}",
                 provider="twelvedata",
-                notice=notice,
+                notice=None,
             )
 
     def movers(
@@ -164,9 +167,9 @@ class MassiveResearch:
         except Exception as exc:
             if not is_data_entitlement_error(exc) or self._td_client is None:
                 raise
+            logger.warning("%s", entitlement_fallback_notice("massive", str(exc)))
             return self._movers_from_twelvedata(
                 market=market, direction=direction, limit=limit, detail=detail,
-                notice=entitlement_fallback_notice("massive", str(exc)),
             )
         rows = []
         for snapshot in snapshots:
@@ -193,10 +196,8 @@ class MassiveResearch:
         except Exception as exc:
             if not is_data_entitlement_error(exc) or self._td_client is None:
                 raise
-            return self._snapshot_from_twelvedata(
-                ticker,
-                notice=entitlement_fallback_notice("massive", str(exc)),
-            )
+            logger.warning("%s", entitlement_fallback_notice("massive", str(exc)))
+            return self._snapshot_from_twelvedata(ticker)
         data = {
             "ticker": getattr(snapshot, "ticker", ticker) or ticker,
             "change": getattr(snapshot, "todays_change", None),
@@ -226,7 +227,7 @@ class MassiveResearch:
         rows = [self._news_row(article, source) for article in articles]
         return ResearchResult(json_clean(rows[:limit]), f"News: {symbol}")
 
-    def _snapshot_from_twelvedata(self, ticker: str, *, notice: str) -> ResearchResult:
+    def _snapshot_from_twelvedata(self, ticker: str) -> ResearchResult:
         payload = self._td_client.quote(symbol=ticker).as_json()
 
         def _num(key: str) -> Any:
@@ -261,7 +262,7 @@ class MassiveResearch:
         }
         return ResearchResult(
             json_clean(data), f"Snapshot: {ticker}",
-            provider="twelvedata", notice=notice,
+            provider="twelvedata", notice=None,
         )
 
     def _movers_from_twelvedata(
@@ -271,7 +272,6 @@ class MassiveResearch:
         direction: str,
         limit: int,
         detail: bool,
-        notice: str,
     ) -> ResearchResult:
         title = f"{market.title()} Movers ({direction})"
         rows: list[dict[str, Any]] = []
@@ -293,7 +293,9 @@ class MassiveResearch:
         except Exception as td_exc:
             if not is_data_entitlement_error(td_exc):
                 raise
-            notice = entitlement_fallback_notice("twelvedata", str(td_exc))
+            logger.warning(
+                "%s", entitlement_fallback_notice("twelvedata", str(td_exc)),
+            )
             for quote in self._td_batch_quote(list(LIQUID_US_FALLBACK_TICKERS)):
                 rows.append({
                     "ticker": quote.get("symbol", "") or "",
@@ -312,7 +314,7 @@ class MassiveResearch:
         if detail:
             rows = self._enrich_movers(rows)
         return ResearchResult(
-            json_clean(rows), title, provider="twelvedata", notice=notice,
+            json_clean(rows), title, provider="twelvedata", notice=None,
         )
 
     def _td_batch_quote(self, symbols: list[str]) -> list[dict[str, Any]]:

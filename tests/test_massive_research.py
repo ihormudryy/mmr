@@ -237,7 +237,7 @@ def test_ideas_falls_back_to_twelvedata_on_massive_entitlement(monkeypatch):
 
     assert result.provider == "twelvedata"
     assert result.data[0]["ticker"] == "AAPL"
-    assert "Starter+" in (result.notice or "")
+    assert result.notice is None
 
 
 def test_snapshot_falls_back_to_twelvedata_on_massive_entitlement():

@@ -735,11 +735,14 @@ async def test_saturated_research_pool_does_not_block_trading_sse(
         try:
             await asyncio.to_thread(all_started.wait, 2)
             started = time.monotonic()
+            saw_quotes_snapshot = False
             async with client.stream("GET", "/api/events") as response:
                 assert response.status_code == 200
                 async for line in response.aiter_lines():
                     if line == "event: quotes.snapshot":
+                        saw_quotes_snapshot = True
                         break
+            assert saw_quotes_snapshot
             assert time.monotonic() - started < 1.0
         finally:
             release.set()

@@ -11,6 +11,7 @@ from cc_fakes import NullBridge, NullQuotePlane
 from trader.tools.massive_research import ResearchResult
 from web.app import create_app
 from web.command_center import CommandCenter, CommandCenterConfig
+from web.command_center.flags import CommandFlags
 from web.command_center.research import ResearchError, ResearchService
 from web.command_center.routes_research import create_research_router
 from web.command_center.session import (
@@ -193,6 +194,56 @@ def test_read_only_page_keeps_research_without_propose(logged_in_research_client
     html = logged_in_research_client.get("/cc").text
     assert 'id="dash-research"' in html
     assert 'data-research-propose-enabled="false"' in html
+
+
+def test_research_reads_and_proposal_shell_follow_command_flag(
+    monkeypatch,
+    research_cc,
+):
+    import web.app as webapp
+
+    monkeypatch.setattr(
+        webapp,
+        "_manage_page_context",
+        lambda flash="": ({}, None),
+    )
+    payloads: dict[bool, list[dict[str, Any]]] = {}
+    paths = [
+        "/api/research/presets",
+        "/api/research/ideas",
+        "/api/research/movers",
+        "/api/research/snapshot?symbol=AAPL",
+        "/api/research/news?ticker=AAPL",
+    ]
+    for enabled in (False, True):
+        monkeypatch.setattr(
+            webapp,
+            "_COMMAND_FLAGS",
+            CommandFlags(enabled, False, None, None),
+        )
+        provider = FakeResearchProvider()
+        service = RecordingResearchService(provider)
+        client = None
+        try:
+            client = TestClient(webapp.create_app(research_cc, service))
+            _login(client)
+            page = client.get("/cc")
+            assert page.status_code == 200
+            assert (
+                f'data-research-propose-enabled="{str(enabled).lower()}"'
+                in page.text
+            )
+            assert ('id="cc-proposal-form"' in page.text) is enabled
+
+            responses = [client.get(path) for path in paths]
+            assert [response.status_code for response in responses] == [200] * 5
+            payloads[enabled] = [response.json() for response in responses]
+        finally:
+            if client is not None:
+                client.close()
+            service.close()
+
+    assert payloads[False] == payloads[True]
 
 
 def test_snapshot_success_is_cli_shaped(logged_in_research_client):

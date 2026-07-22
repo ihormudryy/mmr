@@ -202,6 +202,47 @@ async function test(name, fn) {
     assert.match(html, />45s<\/span>/);
   });
 
+  await test('research proposal resets stale intent and resolves only the instrument', async () => {
+    const {elements, run} = makeContext();
+    const form = run("document.getElementById('cc-proposal-form')");
+    const fieldNames = [
+      'resolve_symbol', 'resolve_exchange', 'resolve_currency', 'conid',
+      'action', 'quantity', 'amount', 'confidence', 'group', 'thesis',
+      'reasoning',
+    ];
+    for (const name of fieldNames) form[name] = element();
+    for (const name of fieldNames) form[name].value = `stale-${name}`;
+    form.resetCalls = 0;
+    form.reset = () => {
+      form.resetCalls += 1;
+      for (const name of fieldNames) form[name].value = '';
+      form.action.value = 'BUY';
+    };
+    run(`globalThis.resolveCalls = 0;
+         globalThis.submitCalls = 0;
+         ccResolveSymbol = async () => { globalThis.resolveCalls += 1; };
+         ccSubmitCommand = async () => { globalThis.submitCalls += 1; };`);
+
+    await run(`ccOpenResearchProposal({
+      ticker: ' aapl ', exchange: ' NASDAQ ', currency: ' USD ',
+      action: 'SELL', quantity: 100, amount: 999, confidence: 1,
+      thesis: 'provider intent', reasoning: 'provider reasoning'
+    })`);
+
+    assert.equal(form.resetCalls, 1);
+    assert.equal(form.resolve_symbol.value, 'AAPL');
+    assert.equal(form.resolve_exchange.value, 'NASDAQ');
+    assert.equal(form.resolve_currency.value, 'USD');
+    assert.equal(form.conid.value, '');
+    assert.equal(form.action.value, 'BUY');
+    for (const name of [
+      'quantity', 'amount', 'confidence', 'group', 'thesis', 'reasoning',
+    ]) assert.equal(form[name].value, '');
+    assert.equal(elements.get('cc-proposal-drawer').hidden, false);
+    assert.equal(run('globalThis.resolveCalls'), 1);
+    assert.equal(run('globalThis.submitCalls'), 0);
+  });
+
   console.log(`command_center.test.js: ${passed} tests passed`);
 })().catch((error) => {
   console.error(error);

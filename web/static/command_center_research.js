@@ -236,6 +236,44 @@
       `<dt>${esc(key)}</dt><dd>${esc(valueText(value))}</dd>`).join('')}</dl>`;
   }
 
+  function proposalsEnabled() {
+    if (typeof document.querySelector !== 'function') return false;
+    const root = document.querySelector('[data-research-propose-enabled]');
+    return Boolean(root && root.dataset.researchProposeEnabled === 'true');
+  }
+
+  function equityResult(data, tool) {
+    if (!data || typeof data !== 'object') return false;
+    if (!String(data.ticker ?? data.symbol ?? '').trim()) return false;
+    const allowed = new Set([
+      'stock', 'stocks', 'equity', 'equities', 'stk', 'common stock',
+    ]);
+    const classifications = [
+      data.market, data.market_type, data.asset_class, data.asset_type,
+      data.security_type, data.sec_type,
+    ].filter((value) => value !== null && value !== undefined && String(value).trim());
+    if (classifications.some((value) =>
+      !allowed.has(String(value).trim().toLowerCase()))) return false;
+    if (tool === 'movers') {
+      return allowed.has(String(data.market ?? '').trim().toLowerCase());
+    }
+    return tool === 'ideas' || tool === 'lookup';
+  }
+
+  function proposalInstrument(data) {
+    return {
+      ticker: String(data.ticker ?? data.symbol ?? '').trim().toUpperCase(),
+      exchange: String(data.exchange ?? data.primary_exchange ?? '').trim(),
+      currency: String(data.currency ?? '').trim(),
+    };
+  }
+
+  function proposalMarkup(data, tool) {
+    if (!proposalsEnabled() || !equityResult(data, tool)) return '';
+    return '<button type="button" class="research-propose" '
+      + 'data-research-propose>Propose</button>';
+  }
+
   function lookupPart(name, target) {
     const status = statusFor(target);
     let content = '';
@@ -285,7 +323,8 @@
       root.innerHTML = '<p class="dim">Select a result to inspect it.</p>';
       return root.innerHTML;
     }
-    root.innerHTML = objectMarkup(target.selected) + metaMarkup(target);
+    root.innerHTML = objectMarkup(target.selected) + metaMarkup(target)
+      + proposalMarkup(target.selected, currentTool);
     return root.innerHTML;
   }
 
@@ -298,6 +337,21 @@
     return event.target && event.target.closest
       ? event.target.closest('[data-research-row]')
       : null;
+  }
+
+  function proposalFromEvent(event) {
+    return event.target && event.target.closest
+      ? event.target.closest('[data-research-propose]')
+      : null;
+  }
+
+  function openSelectedProposal() {
+    const target = currentTool === 'lookup' ? state.lookup.snapshot : state[currentTool];
+    if (!proposalsEnabled() || !equityResult(target.selected, currentTool)) return false;
+    const hook = globalThis.ccOpenResearchProposal;
+    if (typeof hook !== 'function') return false;
+    hook(proposalInstrument(target.selected));
+    return true;
   }
 
   globalThis.CCResearch = {
@@ -319,6 +373,7 @@
     }
     const controls = document.getElementById('research-controls');
     const results = document.getElementById('research-results');
+    const detail = document.getElementById('research-detail');
     if (controls) {
       controls.addEventListener('submit', (event) => {
         event.preventDefault();
@@ -337,6 +392,11 @@
         if (!row) return;
         event.preventDefault();
         selectRow(Number(row.dataset.researchRow));
+      });
+    }
+    if (detail) {
+      detail.addEventListener('click', (event) => {
+        if (proposalFromEvent(event)) openSelectedProposal();
       });
     }
     renderControls();

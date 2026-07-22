@@ -18,6 +18,27 @@ function response(data, title, meta = {}) {
   return {data, title, meta: {provider: 'massive', ...meta}};
 }
 
+function proposalHarness(enabled) {
+  const h = makeHarness();
+  const root = {dataset: {researchProposeEnabled: enabled ? 'true' : 'false'}};
+  h.document.querySelector = (selector) => (
+    selector === '[data-research-propose-enabled]' ? root : null
+  );
+  h.context.proposalCalls = [];
+  h.context.ccOpenResearchProposal = (instrument) => {
+    h.context.proposalCalls.push(instrument);
+  };
+  h.loadProductionScript();
+  return h;
+}
+
+function proposalTarget() {
+  const button = {dataset: {researchPropose: ''}};
+  return {closest(selector) {
+    return selector === '[data-research-propose]' ? button : null;
+  }};
+}
+
 (async () => {
   await test('initialization fetches presets only and does not scan', async () => {
     const h = makeHarness();
@@ -256,6 +277,84 @@ function response(data, title, meta = {}) {
     assert.match(results, /massive/);
     assert.match(results, /2026-07-22T10:00:00Z/);
     assert.match(detail, /massive/);
+  });
+
+  await test('Propose is absent when the server-rendered partial disables it', async () => {
+    const h = proposalHarness(false);
+    h.fetch.enqueue(200, response([{ticker: 'AAPL'}], 'Ideas', {tool: 'ideas'}));
+    await h.api.run('ideas', new URLSearchParams());
+
+    assert.doesNotMatch(h.elements.get('research-detail').innerHTML,
+      /data-research-propose/);
+  });
+
+  await test('eligible Ideas proposal delegates only the instrument and never posts', async () => {
+    const h = proposalHarness(true);
+    h.fetch.enqueue(200, response([], 'Presets', {
+      tool: 'presets', provider: 'local',
+    }));
+    await h.start();
+    h.fetch.enqueue(200, response([{
+      ticker: 'AAPL', exchange: 'NASDAQ', currency: 'USD', action: 'SELL',
+      quantity: 100, confidence: 1, thesis: 'provider thesis',
+    }], 'Ideas', {tool: 'ideas'}));
+    await h.api.run('ideas', new URLSearchParams());
+    const fetchCount = h.fetch.calls.length;
+
+    assert.match(h.elements.get('research-detail').innerHTML,
+      /data-research-propose/);
+    h.elements.get('research-detail').dispatch('click', {
+      target: proposalTarget(),
+    });
+
+    assert.equal(h.context.proposalCalls.length, 1);
+    assert.deepEqual(
+      JSON.parse(JSON.stringify(h.context.proposalCalls[0])),
+      {ticker: 'AAPL', exchange: 'NASDAQ', currency: 'USD'},
+    );
+    assert.equal(h.fetch.calls.length, fetchCount);
+    assert.equal(h.fetch.calls.some((call) =>
+      call.url === '/api/commands/proposals'), false);
+  });
+
+  await test('Propose is limited to stock Movers and rejects non-equity records', async () => {
+    const h = proposalHarness(true);
+    h.api.selectTool('movers');
+    for (const market of ['crypto', 'indices', 'options', 'futures']) {
+      h.fetch.enqueue(200, response([{ticker: 'NOPE', market}], 'Movers', {
+        tool: 'movers',
+      }));
+      await h.api.run('movers', new URLSearchParams({market}));
+      assert.doesNotMatch(h.elements.get('research-detail').innerHTML,
+        /data-research-propose/);
+    }
+
+    h.fetch.enqueue(200, response([{
+      ticker: 'NVDA', market: 'stocks', exchange: 'NASDAQ', currency: 'USD',
+    }], 'Movers', {tool: 'movers'}));
+    await h.api.run('movers', new URLSearchParams({market: 'stocks'}));
+    assert.match(h.elements.get('research-detail').innerHTML,
+      /data-research-propose/);
+  });
+
+  await test('Lookup stock snapshot can propose while explicit non-equity data cannot', async () => {
+    const h = proposalHarness(true);
+    h.api.selectTool('lookup');
+    h.fetch.enqueue(200, response({
+      ticker: 'AAPL', exchange: 'NASDAQ', currency: 'USD',
+    }, 'Snapshot', {tool: 'snapshot'}));
+    h.fetch.enqueue(200, response([], 'News', {tool: 'news'}));
+    await h.api.run('lookup', new URLSearchParams({symbol: 'AAPL'}));
+    assert.match(h.elements.get('research-detail').innerHTML,
+      /data-research-propose/);
+
+    h.fetch.enqueue(200, response({
+      ticker: 'SPX', asset_class: 'index',
+    }, 'Snapshot', {tool: 'snapshot'}));
+    h.fetch.enqueue(200, response([], 'News', {tool: 'news'}));
+    await h.api.run('lookup', new URLSearchParams({symbol: 'SPX'}));
+    assert.doesNotMatch(h.elements.get('research-detail').innerHTML,
+      /data-research-propose/);
   });
 
   await test('disabled Later tools cannot select or request', async () => {

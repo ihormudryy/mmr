@@ -1220,6 +1220,21 @@ function ccOpenProposalDrawer() {
   d.hidden = false;
 }
 
+async function ccOpenResearchProposal(instrument) {
+  const form = document.getElementById('cc-proposal-form');
+  if (!form) return;
+  const selected = instrument || {};
+  form.reset();
+  form.resolve_symbol.value = String(selected.ticker || selected.symbol || '')
+      .trim().toUpperCase();
+  form.resolve_exchange.value = String(selected.exchange || '').trim();
+  form.resolve_currency.value = String(selected.currency || '').trim();
+  form.conid.value = '';
+  ccOpenProposalDrawer();
+  await ccResolveSymbol();
+}
+globalThis.ccOpenResearchProposal = ccOpenResearchProposal;
+
 function ccCloseProposalDrawer() {
   document.getElementById('cc-proposal-drawer').hidden = true;
 }

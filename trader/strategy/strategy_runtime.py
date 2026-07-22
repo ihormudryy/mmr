@@ -794,6 +794,27 @@ class StrategyRuntime():
             raise ValueError(
                 f'strategy {name!r} not found in {self.strategy_config_file}')
 
+        # Validate upper-case keys against the live class BEFORE persisting:
+        # upper-case params are instance-attribute overrides (see
+        # _apply_uppercase_params), so a typo'd key would be written to YAML,
+        # fail the reload below, and leave a config on disk that refuses to
+        # load on every restart. Reject it up front instead — the config
+        # must never carry a key the strategy can't apply.
+        live = self.get_strategy(name)
+        if live is not None:
+            cls = type(live)
+            for key, raw in params.items():
+                if not (isinstance(key, str) and key.isupper() and key):
+                    continue
+                if isinstance(raw, str) and raw.strip() == '':
+                    continue  # deletion — always allowed
+                if not hasattr(cls, key):
+                    known = sorted(k for k in dir(cls)
+                                   if k.isupper() and not k.startswith('_'))
+                    raise ValueError(
+                        f'unknown upper-case param {key!r} for {cls.__name__} '
+                        f'— known tunables: {known}')
+
         merged = dict(entry.get('params') or {})
         for key, raw in params.items():
             if not key:

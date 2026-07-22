@@ -76,13 +76,28 @@ def _saved_params(rt) -> dict:
 
 class TestUpdateStrategyParams:
     def test_updates_yaml_and_coerces_types(self, runtime):
+        # Upper-case keys must exist on the class (they're instance-attr
+        # overrides applied at load); lower-case keys are free-form
+        # (self.params.get idiom) and get blind type coercion.
         result = runtime.update_strategy_params(
-            'tunable', {'RANGE_MINUTES': '45', 'VOLUME_MULT': '1.5', 'FLAG': 'true'})
+            'tunable', {'RANGE_MINUTES': '45', 'vol_mult': '1.5', 'flag': 'true'})
         saved = _saved_params(runtime)
         assert saved['RANGE_MINUTES'] == 45          # int, not '45'
-        assert saved['VOLUME_MULT'] == 1.5           # float
-        assert saved['FLAG'] is True                 # bool
+        assert saved['vol_mult'] == 1.5              # float
+        assert saved['flag'] is True                 # bool
         assert result['params'] == saved
+
+    def test_unknown_uppercase_param_rejected_before_persisting(self, runtime):
+        """A typo'd upper-case key must be refused UP FRONT: were it
+        persisted first, the fail-loud loader would refuse the reload — and
+        every later restart — leaving a config on disk the strategy can't
+        load."""
+        with pytest.raises(ValueError) as exc:
+            runtime.update_strategy_params('tunable', {'VOLUME_MULTT': '2.0'})
+        assert 'VOLUME_MULTT' in str(exc.value)
+        assert 'RANGE_MINUTES' in str(exc.value)     # known tunables listed
+        assert _saved_params(runtime) == {'RANGE_MINUTES': 30}  # YAML untouched
+        assert runtime.get_strategy('tunable') is not None      # instance intact
 
     def test_hot_swaps_live_instance(self, runtime):
         old = runtime.strategy_implementations[0]

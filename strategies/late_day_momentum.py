@@ -56,11 +56,13 @@ class LateDayMomentum(Strategy):
         close = prices["close"].to_numpy()
         volume = prices["volume"].to_numpy()
 
-        # Session VWAP
-        pv = prices["close"] * prices["volume"]
+        # Session VWAP, RTH-anchored — extended-hours prints contribute
+        # nothing to the trend baseline.
+        pv = (prices["close"] * prices["volume"]).where(rth_mask_ser, 0.0)
+        v = prices["volume"].where(rth_mask_ser, 0.0)
         cum_pv = pv.groupby(et_date).cumsum()
-        cum_v = prices["volume"].groupby(et_date).cumsum()
-        vwap = (cum_pv / cum_v.replace(0, np.nan)).fillna(prices["close"]).to_numpy()
+        cum_v = v.groupby(et_date).cumsum()
+        vwap = (cum_pv / cum_v.replace(0, np.nan)).to_numpy()
 
         # Daily range (cumulative max-min so far in the day, RTH only)
         rth_high = prices["high"].where(rth_mask_ser)
@@ -126,9 +128,30 @@ class LateDayMomentum(Strategy):
         if close < prev_close:
             return None
 
+        # Edge-trigger: the qualifiers are states that can hold for much of
+        # the 45-min entry window — emit only on the bar where the full
+        # setup FORMS, so the backtester doesn't pyramid 10% of cash per bar
+        # and the live bridge doesn't propose every minute of a trend day.
+        if index >= 2 and state["entry_window"][index - 1]:
+            p = index - 1
+            pv, pr, pd5 = state["vwap"][p], state["day_range_so_far"][p], state["prior5_mean"][p]
+            pvol, pvol_avg = state["vol"][p], state["vol_avg"][p]
+            pc, pc_prev = state["close"][p], state["close"][p - 1]
+            prev_formed = (
+                not any(np.isnan(x) for x in (pv, pr, pd5, pvol_avg))
+                and pvol_avg > 0 and pd5 > 0
+                and (pc - pv) / pv * 100.0 >= self.VWAP_PREMIUM_PCT
+                and pr >= pd5 * self.RANGE_EXPANSION
+                and pvol >= pvol_avg * self.VOL_MULT
+                and pc >= pc_prev
+            )
+            if prev_formed:
+                return None
+
         return Signal(
             source_name=self.name, action=Action.BUY,
             probability=0.65, risk=0.35,
             close_by_time=dtime(self.EOD_HOUR, self.EOD_MINUTE),
+            close_by_tz="America/New_York",
             max_hold_bars=self.MAX_HOLD_BARS,
         )

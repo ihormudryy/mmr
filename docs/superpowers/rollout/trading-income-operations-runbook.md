@@ -64,7 +64,65 @@ Compose mounts `~/.local/share/mmr/artifacts` read-only into `trader` and
 `strategy`. Do not enable `automation.enabled` until the synthetic automation
 drill is green **and** the manual IB paper soak (below) is recorded.
 
+Nested `automation:` (shown above) is the preferred user-config form; flat
+`automation_*` keys and env vars still override when present.
+
+## Hybrid mode (paper auto / live propose)
+
+**Operator setup walkthrough:** [`docs/PAPER_AUTOMATION_SETUP.md`](../../PAPER_AUTOMATION_SETUP.md)
+(info checklist, Docker → authority → Activate/bootstrap → P1/P3 gates → kill switches).
+
+Approved design: `docs/superpowers/specs/2026-07-20-hybrid-paper-auto-live-propose-design.md`.
+
+| Mode | Automation | Human approve |
+|------|------------|---------------|
+| **Paper** | One signed strategy → `execute_automated_intent` | Other strategies may use `auto_execute: propose` |
+| **Live** | `automation.enabled: false` (never `live_enabled`) | `auto_execute: propose` + `command_authority.live_enabled` |
+
+Rules operators must not violate:
+
+- **R1:** The automated strategy must not also set `auto_execute: propose`.
+- **R3:** Never set `automation.live_enabled: true` (startup refuses).
+- **R5:** Exactly one `automation.strategy_name`.
+
+### Bootstrap keys + fixture artifact
+
+Generates Ed25519 keys under `~/.config/mmr/keys/` (private `0o600`, public
+verify ring separate from private) and exports one fixture `PAPER_ELIGIBLE`
+bundle under `~/.local/share/mmr/artifacts/`. Prints the YAML snippets to paste.
+
+**Dashboard path (preferred when command authority is up):** Scaling tab →
+**Paper automation** → select strategy → **Activate paper automation**
+(preflight ceremony). Phase 1 returns `restart_required` — restart trader and
+strategy services to arm. **Deactivate** clears durable enablement (also needs
+a restart to match). Equivalent offline CLI:
+
+```bash
+python3 scripts/bootstrap_paper_automation.py --strategy-name YOUR_STRATEGY
+# overwrite keys only when intentional:
+python3 scripts/bootstrap_paper_automation.py --force --strategy-name YOUR_STRATEGY
+```
+
+Then enable **P1 command authority first** (automation still off), pass the P1
+IB-paper soak, then enable automation and pass the P3 soak:
+
+```bash
+python3 scripts/p1_release_gate.py --synthetic-only
+python3 scripts/p1_release_gate.py --ib-paper --watch-minutes 390   # XNYS RTH
+# after automation block is enabled with the bootstrap paths:
+python3 scripts/p3_release_gate.py --synthetic-only
+python3 scripts/p3_release_gate.py --ib-paper --watch-minutes 390
+```
+
 ## The release gate — two halves, both required
+
+Run the unified gate:
+
+```bash
+python3 scripts/p1_release_gate.py --synthetic-only --json --output p1-synthetic.json
+# Full manual gate during XNYS RTH with command authority enabled (automation OFF):
+python3 scripts/p1_release_gate.py --ib-paper --watch-minutes 390 --json --output p1-manual-soak.json
+```
 
 ### 1. Synthetic failure drills
 
@@ -143,6 +201,11 @@ is fully qualified under the research attestation rules.
 Also run before sign-off:
 
 ```bash
+python3 scripts/p3_release_gate.py --json --output p3-gate.json
+# CI / pre-RTH: synthetic half only (manual soak may stay pending)
+python3 scripts/p3_release_gate.py --synthetic-only --json --output p3-synthetic.json
+# Full manual gate during XNYS RTH with automation enabled:
+python3 scripts/p3_release_gate.py --ib-paper --watch-minutes 390 --json --output manual-soak.json
 pytest tests/ --timeout=30 -q --ignore=tests/test_ibrx_async.py   # canonical suite
 docker compose config --quiet                                     # compose validity
 ```
@@ -176,6 +239,28 @@ docker compose config --quiet                                     # compose vali
 
 Automation stays prohibited until all drills are green and the manual IB-paper
 soak is signed off.
+
+## P4 paper / canary soak (operational)
+
+Software cannot pass these gates. Use the sanitized templates and fill only digests:
+
+- Paper: [`trading-income-paper-log.md`](trading-income-paper-log.md) — ≥30 calendar days, 20 sessions, 50 RT, 5 instruments
+- Canary: [`trading-income-canary-log.md`](trading-income-canary-log.md) — ≥30 live sessions, 75 RT, 5 instruments, zero capital-safety incidents
+
+Daily: run `scripts/session_open_check.py` / `scripts/session_close_check.py`, seal replay, and never edit counters manually after a failed gate.
+
+## P5 scaling rollback
+
+- **Immediate scale-down:** run `scripts/scaling_fault_drill.py --json` offline to
+  validate degradation/risk gates, then apply a restrictive allocation override
+  via the degradation monitor path (never increases authority).
+- **Suspend trading exposure:** `pause_trading` (no preflight) plus
+  `deactivate-canary` / allocation override to zero gross ceiling.
+- **Authority revocation:** revoke signed allocation/canary keys in the offline
+  key ring; restart trader_service so verifiers reload trusted keys.
+- **Return to paper:** disable live allocation activation config, redeploy paper
+  artifact bundle, and confirm `scaling.status` in `/api/snapshot` reads
+  `unknown` or `inactive` before resuming research.
 
 ## Rollback / kill switch
 

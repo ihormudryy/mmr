@@ -103,6 +103,12 @@ def setup_logging(default_path='',
         logging.basicConfig(level=default_level)
         print('Failed to load configuration file. Using default configs')
 
+    # After dictConfig: numba's SSA rewrite dumps every IR stmt at DEBUG.
+    # With root handlers at DEBUG that turns a first-run JIT (vectorbt MACD/
+    # ewm) into multi-minute console spam and blows pytest's 30s budget on CI.
+    for _noisy in ('numba', 'numba.core', 'numba.core.ssa', 'llvmlite'):
+        logging.getLogger(_noisy).setLevel(logging.WARNING)
+
     global_loggers[module_name] = logging.getLogger(module_name)
     return global_loggers[module_name]
 

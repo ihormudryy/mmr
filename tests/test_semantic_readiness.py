@@ -18,6 +18,7 @@ def _ready(**overrides):
         session_open=lambda now: True,
         command_stack_active=lambda: True,
         quotes_ready=lambda: True,
+        pre_session_checklist=lambda: True,
     )
     checks.update(overrides)
     return SemanticReadiness(**checks)
@@ -31,6 +32,7 @@ def test_all_checks_are_required_and_reported():
         "ib_connected", "account_pinned", "broker_generation_current",
         "journal_writable", "reconciliation_safe", "control_readable",
         "breaker_clear", "xnys_session_open", "command_stack_active", "quotes_ready",
+        "pre_session_checklist",
     }
 
 
@@ -45,6 +47,7 @@ def test_each_failed_or_raising_check_blocks_automation():
         "breaker_clear": "breaker_clear",
         "command_stack_active": "command_stack_active",
         "quotes_ready": "quotes_ready",
+        "pre_session_checklist": "pre_session_checklist",
     }
     for argument, report_name in names.items():
         report = _ready(**{argument: lambda: False}).evaluate(NOW)

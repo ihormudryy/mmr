@@ -143,7 +143,7 @@ from uuid import uuid4
 
 import duckdb
 
-from trader.data.duckdb_store import DuckDBConnection
+from trader.data.duckdb_store import DuckDBConnection, connect_duckdb
 from trader.data.schema_migrations import SchemaMigrator
 from trader.domain.events import DomainEvent, DomainMutation
 
@@ -330,7 +330,7 @@ class DomainJournal:
         # One persistent, this-process-shared connection to the dedicated
         # file (BLOCKER-1). Writers obtain their own cursor via connect()
         # rather than sharing this object directly across threads.
-        self._shared_conn = duckdb.connect(db.db_path)
+        self._shared_conn = connect_duckdb(db.db_path)
         # Defensive, in-process serialization of mutate()'s critical
         # section. Not required for correctness under the intended
         # single-writer-thread topology (see [M1-F2] Architecture: all

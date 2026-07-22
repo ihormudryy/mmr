@@ -126,6 +126,100 @@ class PromotionAttributionReport:
 
 
 @dataclass(frozen=True)
+class CapacityAttributionRecord:
+    """One resolved trade's execution-quality fields for capacity monitoring."""
+
+    trade_id: str
+    instrument_id: str
+    requested_quantity: float
+    filled_quantity: float
+    spread_bps: Optional[float]
+    slippage_bps: Optional[float]
+    partial_fill: bool
+    depth_available: bool
+    adv: Optional[float] = None
+    participation_rate: Optional[float] = None
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "trade_id": self.trade_id,
+            "instrument_id": self.instrument_id,
+            "requested_quantity": self.requested_quantity,
+            "filled_quantity": self.filled_quantity,
+            "spread_bps": self.spread_bps,
+            "slippage_bps": self.slippage_bps,
+            "partial_fill": self.partial_fill,
+            "depth_available": self.depth_available,
+            "adv": self.adv,
+            "participation_rate": self.participation_rate,
+        }
+
+
+@dataclass(frozen=True)
+class CapacityAttributionWindow:
+    """Capacity-relevant attribution slice — caller or ``export_capacity_window``."""
+
+    records: tuple[CapacityAttributionRecord, ...]
+    sparse: bool = False
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "records": tuple(r.to_dict() for r in self.records),
+            "sparse": self.sparse,
+        }
+
+
+def export_capacity_window(
+    report: PromotionAttributionReport,
+    *,
+    instrument_by_trade: Optional[Mapping[str, str]] = None,
+    adv_by_instrument: Optional[Mapping[str, float]] = None,
+    requested_by_trade: Optional[Mapping[str, float]] = None,
+    depth_available: bool = True,
+    min_records: int = 5,
+) -> CapacityAttributionWindow:
+    """Extract capacity-relevant fields from resolved promotion attributions.
+
+    ``instrument_by_trade`` and ``requested_by_trade`` supply identifiers and
+    intended size when they are not present on ``TradeAttribution`` itself.
+    ``adv_by_instrument`` optionally enriches records with ADV for participation
+    checks downstream."""
+    instrument_by_trade = dict(instrument_by_trade or {})
+    requested_by_trade = dict(requested_by_trade or {})
+    adv_by_instrument = {str(k): float(v) for k, v in (adv_by_instrument or {}).items()}
+
+    records: list[CapacityAttributionRecord] = []
+    for attr in report.resolved:
+        instrument_id = instrument_by_trade.get(attr.trade_id, attr.trade_id)
+        entry_qty = sum((_dec(f.get("quantity")) for f in attr.fills), Decimal("0"))
+        exit_qty = sum((_dec(f.get("quantity")) for f in attr.exit_fills), Decimal("0"))
+        filled = float(min(entry_qty, exit_qty) if exit_qty > 0 else entry_qty)
+        requested = float(requested_by_trade.get(attr.trade_id, filled or entry_qty or 0))
+        partial = requested > 0 and filled < requested
+        adv = adv_by_instrument.get(str(instrument_id))
+        participation = (filled / adv) if adv and adv > 0 else None
+        records.append(
+            CapacityAttributionRecord(
+                trade_id=attr.trade_id,
+                instrument_id=str(instrument_id),
+                requested_quantity=requested,
+                filled_quantity=filled,
+                spread_bps=float(attr.spread_bps) if attr.spread_bps is not None else None,
+                slippage_bps=float(attr.slippage_bps) if attr.slippage_bps is not None else None,
+                partial_fill=partial,
+                depth_available=depth_available,
+                adv=adv,
+                participation_rate=participation,
+            )
+        )
+
+    return CapacityAttributionWindow(
+        records=tuple(records),
+        sparse=len(records) < min_records,
+    )
+
+
+@dataclass(frozen=True)
 class _FillState:
     exec_id: str
     leg: str
@@ -512,4 +606,14 @@ class AttributionLedger:
         return PromotionAttributionReport(
             resolved=tuple(resolved),
             unresolved=tuple(unresolved),
+        )
+
+    def canary_attribution_view(self) -> "CanaryAttributionView":
+        """Canary-scoped P&L summary for ``CanaryRiskController`` (P4 Task 6)."""
+        from trader.promotion.canary_risk import build_canary_attribution_view
+
+        report = self.promotion_attribution()
+        return build_canary_attribution_view(
+            report.resolved,
+            unresolved_trade_ids=[t.trade_id for t in report.unresolved],
         )

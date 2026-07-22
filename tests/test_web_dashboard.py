@@ -143,7 +143,7 @@ def stub_cc():
 
 
 @pytest.fixture
-def client(stub, stub_cc):
+def client(stub, stub_cc, manage_client):
     from web.app import create_app
     app = create_app(stub_cc)
     test_client = TestClient(app)
@@ -211,7 +211,7 @@ def test_failed_approval_never_flashes_submitted(client, stub):
 
 def test_risk_fetch_failure_is_unavailable_not_green(client, stub):
     stub.risk_error = ConnectionError("risk RPC down")
-    html = client.get("/legacy").text
+    html = client.get("/cc").text
     assert "Risk unavailable" in html
     assert "No active risk warnings" not in html
 
@@ -272,76 +272,116 @@ class TestParamsRoute:
 
 class TestDashboardRendering:
     def test_human_readable_names_and_description(self, client):
-        html = client.get('/legacy').text
+        html = client.get('/cc').text
         assert 'Opening Range Breakout' in html   # humanized class name
         assert 'orb_googl' in html                # config name still visible
         assert 'sweep run 309' in html            # description present (hover)
 
-    def test_toggle_buttons_match_state(self, client):
-        html = client.get('/legacy').text
-        assert '/strategies/orb_googl/disable' in html   # RUNNING → Disable
-        assert '/strategies/vwap_cat/enable' in html     # DISABLED → Enable
+    def test_setup_tab_has_deploy_not_legacy_toggle_forms(self, client):
+        html = client.get('/cc').text
+        assert '/strategies/deploy' in html
+        # Live enable/disable lives in the Trading tab (JS), not setup forms
+        assert '/strategies/orb_googl/enable' not in html
 
-    def test_unfold_param_editor_rendered(self, client):
-        html = client.get('/legacy').text
-        assert '/strategies/orb_googl/params' in html
-        assert 'param_RANGE_MINUTES' in html
-        assert 'new_key' in html
+    def test_unfold_deploy_editor_rendered(self, client):
+        html = client.get('/cc').text
+        assert '/static/dash_admin.js' in html
+        assert 'name="watchlist"' in html
 
     def test_available_strategies_listed(self, client):
-        html = client.get('/legacy').text
+        html = client.get('/cc').text
         assert 'Momentum' in html
         assert 'momentum.py' in html
-        # deployed class is marked as such, not repeated as available-only
         assert 'deployed' in html.lower()
 
+    def test_available_strategies_survive_strategy_rpc_failure(
+            self, client, manage_client, monkeypatch):
+        """Local AST scan must not be blanked when strategy_service is down."""
+        def _fail(method, body=None):
+            if method == 'list_strategies':
+                raise ConnectionError('strategy down')
+            return manage_client.trader_query(method, body)
+
+        monkeypatch.setattr(manage_client, 'strategy_query', _fail)
+        html = client.get('/cc').text
+        assert 'Momentum' in html
+        assert 'momentum.py' in html
+
+    def test_deployed_strategies_fallback_to_config(
+            self, client, manage_client, deploy_config, monkeypatch):
+        """Mirrors ``mmr strategies list`` YAML fallback when RPC fails."""
+        def _fail(method, body=None):
+            raise ConnectionError('strategy down')
+
+        monkeypatch.setattr(manage_client, 'strategy_query', _fail)
+        html = client.get('/cc').text
+        assert 'orb_googl' in html
+        assert 'strategy_service unreachable' in html
+        assert 'CONFIG' in html
+
     def test_tooltips_present(self, client):
-        html = client.get('/legacy').text
-        assert html.count('class="info"') >= 8    # ⓘ across sections/metrics
+        html = client.get('/cc').text
+        assert html.count('class="info"') >= 10
         assert 'class="tip"' in html
+        assert 'Action queue' in html
+        assert 'Paper automation' in html
 
     def test_bar_and_conids_columns_have_tooltips(self, client):
-        html = client.get('/legacy').text
-        assert 'completed bar of this size' in html      # Bar column tip
-        assert 'IB contract IDs' in html                 # ConIds column tip
+        html = client.get('/cc').text
+        assert 'universe:NAME' in html
+        assert 'IB contract IDs' in html
+        assert 'evaluated once per newly completed bar' in html
+
+    def test_empty_conids_with_universe_display(self):
+        rows = webapp._normalize_strategy_rows([
+            {'name': 'u', 'state': 'RUNNING', 'conids': [], 'universe': 'my_etfs'},
+            {'name': 'c', 'state': 'RUNNING', 'conids': [265598], 'universe': 'ignored'},
+            {'name': 'n', 'state': 'RUNNING', 'conids': [], 'universe': None},
+        ])
+        assert rows[0]['conids'] == 'universe:my_etfs'
+        assert rows[1]['conids'] == '265598'
+        assert rows[2]['conids'] == ''
 
     def test_tooltips_use_viewport_positioning(self, client):
         """Tips must escape section overflow:hidden — fixed positioning with
-        viewport clamping, computed on hover by positionTip()."""
-        html = client.get('/legacy').text
-        assert 'function positionTip' in html
+        viewport clamping, computed on hover by dash_admin.js."""
+        html = client.get('/cc').text
+        assert '/static/dash_admin.js' in html
         assert 'position: fixed' in html
 
 
 class TestTabs:
-    def test_three_tabs_with_overview_default(self, client):
-        html = client.get('/legacy').text
-        for name in ('overview', 'strategies', 'risk'):
-            assert f'data-tab="{name}"' in html
-            assert f'id="tab-{name}"' in html
-        # overview is the default-active pane
-        assert 'id="tab-overview" class="tabpane active"' in html
+    def test_dashboard_tabs_trading_deploy_and_watchlists(self, client):
+        html = client.get('/cc').text
+        assert 'data-dash-tab="trading"' in html
+        assert 'data-dash-tab="deploy"' in html
+        assert 'data-dash-tab="watchlists"' in html
+        assert 'data-dash-tab="guide"' in html
+        assert 'id="dash-trading"' in html
+        assert 'id="dash-deploy"' in html
+        assert 'id="dash-watchlists"' in html
+        assert 'id="dash-guide"' in html
+        assert 'guide-wrap' in html
+        assert 'class="info"' in html  # hover info bubbles on Guide tab
+        assert 'Manual buy on paper' in html
 
-    def test_sections_live_in_the_right_panes(self, client):
-        html = client.get('/legacy').text
-        overview = html.index('id="tab-overview"')
-        strategies = html.index('id="tab-strategies"')
-        risk = html.index('id="tab-risk"')
-        # Overview holds cash, positions, proposals (cash folded into first tab)
-        assert overview < html.index('Cash by currency') < strategies
-        assert overview < html.index('Positions &amp; P&amp;L') < strategies
-        assert overview < html.index('>Proposals') < strategies
-        # Strategies pane holds deployed + available tables
-        assert strategies < html.index('/strategies/orb_googl/disable') < risk
-        assert strategies < html.index('Available strategies') < risk
-        # Risk pane holds the risk metrics
-        assert html.index('Gross exposure') > risk
+    def test_legacy_setup_hashes_map_to_new_tabs(self, client):
+        html = client.get('/cc').text
+        assert '/static/dash_admin.js' in html
 
     def test_tab_state_survives_auto_refresh(self, client):
         """Tab selection is kept in location.hash, which location.reload()
-        preserves — switching to Strategies must survive the 15s refresh."""
-        html = client.get('/legacy').text
-        assert 'location.hash' in html
+        preserves — switching tabs must survive the 30s refresh."""
+        html = client.get('/cc').text
+        assert '/static/dash_admin.js' in html
+
+    def test_cc_has_no_inline_script(self, client):
+        """Strict CSP on /cc allows script-src 'self' only — no inline JS."""
+        html = client.get('/cc').text
+        assert '<script>' not in html
+        assert '<script ' in html
+        assert '/static/dash_admin.js' in html
+        assert '/static/command_center.js' in html
 
 
 # ---------------------------------------------------------------------------
@@ -393,11 +433,139 @@ class StubAccessor:
 _RESOLVABLE = {'AAPL': 265598, 'MSFT': 272093, 'GLD': 51529211}
 
 
+class StubManageClient:
+    """In-process fake for web.manage_client typed RPC calls."""
+
+    def __init__(self, accessor: StubAccessor, stub_sdk: StubSDK):
+        self.accessor = accessor
+        self.stub = stub_sdk
+        self.calls: list[tuple] = []
+        self.proposals: list[dict] = [{
+            'id': 7, 'proposal_id': 7, 'status': 'EXECUTED',
+            'action': 'BUY', 'symbol': 'AAPL', 'conid': 265598,
+            'source': 'manual', 'confidence': 0.7,
+            'sizing_result': {'reasoning': ['base $5k']},
+        }]
+
+    @staticmethod
+    def _instrument(symbol: str, conid: int) -> dict:
+        return {
+            'instrument_id': conid,
+            'symbol': symbol,
+            'exchange': 'SMART',
+            'primary_exchange': 'NASDAQ',
+            'currency': 'USD',
+            'security_type': 'STK',
+            'time_zone_id': 'America/New_York',
+        }
+
+    def trader_query(self, method: str, body: dict | None = None):
+        body = body or {}
+        if method == 'list_universes':
+            return {'universes': [
+                {'name': name, 'count': count}
+                for name, count in self.accessor.list_universes_count().items()]}
+        if method == 'get_universe':
+            name = body['name']
+            limit = int(body.get('symbol_limit') or 40)
+            defs = self.accessor.get(name).security_definitions
+            return {'name': name, 'count': len(defs),
+                    'symbols': [d.symbol for d in defs[:limit]]}
+        if method == 'discover_instrument':
+            sym = str(body['symbol']).upper()
+            conid = _RESOLVABLE.get(sym)
+            if conid:
+                return {'instruments': [self._instrument(sym, conid)]}
+            return {'instruments': []}
+        if method == 'list_proposals':
+            return {'proposals': list(self.proposals)}
+        if method == 'get_proposal':
+            pid = int(body['proposal_id'])
+            for p in self.proposals:
+                if int(p.get('id') or p.get('proposal_id') or 0) == pid:
+                    return dict(p)
+            from trader.messaging.typed_rpc import TypedRpcRemoteError
+            raise TypedRpcRemoteError('PROPOSAL_NOT_FOUND', 'missing')
+        raise AssertionError(f'unexpected trader_query {method!r}')
+
+    def trader_command(self, method: str, body: dict):
+        self.calls.append(('trader_command', method, body))
+        name = body.get('name')
+        if method == 'create_universe':
+            if name in self.accessor.universes:
+                from trader.messaging.typed_rpc import TypedRpcRemoteError
+                raise TypedRpcRemoteError('ALREADY_EXISTS', 'exists')
+            self.accessor.universes[name] = []
+            return {'ok': True, 'name': name}
+        if method == 'add_universe_symbols':
+            from trader.messaging.typed_rpc import TypedRpcRemoteError
+            from trader.common.symbol_validation import (
+                SymbolValidationError, validate_symbol_list,
+            )
+            try:
+                symbols = validate_symbol_list(list(body.get('symbols') or []))
+            except SymbolValidationError as exc:
+                raise TypedRpcRemoteError('VALIDATION_ERROR', str(exc)) from exc
+            missing = [sym for sym in symbols if sym not in _RESOLVABLE]
+            if missing:
+                raise TypedRpcRemoteError(
+                    'VALIDATION_ERROR',
+                    'unknown symbol(s), nothing added: ' + ', '.join(missing),
+                )
+            added = []
+            for sym in symbols:
+                conid = _RESOLVABLE[sym]
+                self.accessor.insert(name, _sd(sym, conid))
+                added.append({'symbol': sym, 'instrument_id': conid})
+            return {'added': added, 'missing': []}
+        if method == 'remove_universe_symbol':
+            universe = self.accessor.get(name)
+            match = universe.find_symbol(body['symbol'])
+            if match is None:
+                from trader.messaging.typed_rpc import TypedRpcRemoteError
+                raise TypedRpcRemoteError('NOT_FOUND', 'missing')
+            self.accessor.universes[name] = [
+                d for d in self.accessor.universes[name] if d.conId != match.conId]
+            return {'ok': True}
+        if method == 'delete_universe':
+            self.accessor.delete(name)
+            return {'ok': True}
+        if method == 'import_universe_csv':
+            count = self.accessor.update_from_csv_str(name, body['csv_text'])
+            return {'imported': count, 'added': [], 'missing': []}
+        raise AssertionError(f'unexpected trader_command {method!r}')
+
+    def strategy_query(self, method: str, body: dict | None = None):
+        if method == 'list_strategies':
+            rows = self.stub.strategies().to_dict('records')
+            return {'strategies': rows}
+        raise AssertionError(f'unexpected strategy_query {method!r}')
+
+    def strategy_command(self, method: str, body: dict | None = None):
+        body = body or {}
+        self.calls.append(('strategy_command', method, body))
+        if method == 'reload_strategies':
+            return {'ok': True, 'strategies': []}
+        if method == 'enable_strategy_by_name':
+            self.stub.calls.append(('enable', body['strategy_name']))
+            return {'ok': True, 'state': 'RUNNING'}
+        if method == 'disable_strategy_by_name':
+            self.stub.calls.append(('disable', body['strategy_name']))
+            return {'ok': True, 'state': 'DISABLED'}
+        raise AssertionError(f'unexpected strategy_command {method!r}')
+
+
 @pytest.fixture
 def accessor(monkeypatch):
     acc = StubAccessor()
-    monkeypatch.setattr(webapp, '_get_accessor', lambda: acc)
     return acc
+
+
+@pytest.fixture
+def manage_client(accessor, stub, monkeypatch):
+    client = StubManageClient(accessor, stub)
+    monkeypatch.setattr(webapp, 'get_manage_client', lambda: client)
+    return client
 
 
 @pytest.fixture
@@ -446,8 +614,29 @@ class TestWatchlistRoutes:
         r = client.post('/watchlists/mylist/add',
                         data={'csrf_token': _csrf(), 'symbols': 'NOPE123'},
                         follow_redirects=False)
-        assert 'NOPE123' in r.headers['location']
+        assert r.status_code == 303
+        loc = r.headers['location']
+        assert 'flash_err=1' in loc
+        assert 'NOPE123' in loc or 'unknown' in loc.lower()
         assert not any(c[0] == 'insert' for c in accessor.calls)
+
+    def test_add_rejects_format_trash(self, client, accessor, stub_resolving):
+        r = client.post('/watchlists/mylist/add',
+                        data={'csrf_token': _csrf(), 'symbols': '!!!, $$$'},
+                        follow_redirects=False)
+        assert r.status_code == 303
+        assert 'flash_err=1' in r.headers['location']
+        assert not any(c[0] == 'insert' for c in accessor.calls)
+
+    def test_add_rejects_batch_when_any_unknown(self, client, accessor, stub_resolving):
+        """Fail closed: valid + trash must not insert the valid ones."""
+        before = list(accessor.universes.get('mylist') or [])
+        r = client.post('/watchlists/mylist/add',
+                        data={'csrf_token': _csrf(), 'symbols': 'AAPL, NOTAREAL'},
+                        follow_redirects=False)
+        assert r.status_code == 303
+        assert 'flash_err=1' in r.headers['location']
+        assert accessor.universes.get('mylist') == before
 
     def test_upload_simple_csv_resolves_rows(self, client, accessor, stub_resolving):
         csv_bytes = b'symbol\nAAPL\nGLD\n'
@@ -473,29 +662,131 @@ class TestWatchlistRoutes:
                     follow_redirects=False)
         assert all(d.symbol != 'AAPL' for d in accessor.universes['mylist'])
 
+    def test_remove_multiple_symbols_via_checkboxes(self, client, accessor, stub_resolving):
+        from urllib.parse import urlencode
+        body = urlencode([
+            ('csrf_token', _csrf()),
+            ('symbols', 'AAPL'),
+            ('symbols', 'MSFT'),
+        ])
+        r = client.post(
+            '/watchlists/mylist/remove',
+            content=body,
+            headers={'Content-Type': 'application/x-www-form-urlencoded'},
+            follow_redirects=False,
+        )
+        assert r.status_code == 303
+        assert '#watchlists' in r.headers['location']
+        assert accessor.universes['mylist'] == []
+
+    def test_members_endpoint_lazy_loads_symbols(self, client, accessor, stub_resolving):
+        r = client.get('/watchlists/mylist/members')
+        assert r.status_code == 200
+        body = r.json()
+        assert body['name'] == 'mylist'
+        assert body['count'] == 2
+        assert body['symbols'] == ['AAPL', 'MSFT']
+        assert body['truncated'] is False
+
+    def test_members_rejects_bad_name(self, client, accessor, stub_resolving):
+        r = client.get('/watchlists/Not_Valid!/members')
+        assert r.status_code == 400
+
     def test_delete_watchlist(self, client, accessor, stub_resolving):
         client.post('/watchlists/mylist/delete',
                     data={'csrf_token': _csrf()}, follow_redirects=False)
         assert 'mylist' not in accessor.universes
 
     def test_watchlists_tab_rendered(self, client, accessor, stub_resolving):
-        html = client.get('/legacy').text
-        assert 'data-tab="watchlists"' in html
-        assert 'id="tab-watchlists"' in html
+        html = client.get('/cc').text
+        assert 'data-dash-tab="watchlists"' in html
+        assert 'id="dash-watchlists"' in html
+        assert 'wl-name-toggle' in html
+        assert 'wl-member-list' in html
+        assert '▸ manage' not in html
+        assert 'Unfold to load members' in html
         assert 'mylist' in html
-        assert 'AAPL' in html
+
+    def test_fetch_watchlists_is_list_only(self, manage_client, monkeypatch):
+        """Page load must not fan out get_universe (lazy members endpoint)."""
+        calls = []
+        orig = manage_client.trader_query
+
+        def _track(method, body=None):
+            calls.append(method)
+            return orig(method, body)
+
+        monkeypatch.setattr(manage_client, 'trader_query', _track)
+        rows = webapp.fetch_watchlists()
+        assert 'list_universes' in calls
+        assert 'get_universe' not in calls
+        assert rows[0]['name'] == 'mylist'
+        assert rows[0]['count'] == 2
+        assert rows[0]['symbol_list'] == []
+        assert rows[0]['symbols'] == ''
+
+    def test_flash_redirects_to_cc_watchlists(self, client, accessor, stub_resolving):
+        r = client.post('/watchlists/create',
+                        data={'csrf_token': _csrf(), 'name': 'flash_test'},
+                        follow_redirects=False)
+        assert r.status_code == 303
+        assert r.headers['location'].startswith('/cc?flash=')
+        assert '#watchlists' in r.headers['location']
+        assert 'flash_test' in accessor.universes
+
+
+class TestResolveAndProposalsApi:
+    def test_resolve_returns_instrument(self, client, manage_client):
+        r = client.get('/api/resolve', params={'symbol': 'AAPL'})
+        assert r.status_code == 200
+        body = r.json()
+        assert body['count'] == 1
+        assert body['instruments'][0]['instrument_id'] == 265598
+
+    def test_resolve_rejects_empty_and_numeric(self, client, manage_client):
+        assert client.get('/api/resolve').status_code == 400
+        assert client.get('/api/resolve', params={'symbol': '265598'}).status_code == 400
+
+    def test_resolve_unknown_symbol(self, client, manage_client):
+        r = client.get('/api/resolve', params={'symbol': 'NOPE123'})
+        assert r.status_code == 200
+        assert r.json()['count'] == 0
+
+    def test_get_proposal(self, client, manage_client):
+        r = client.get('/api/proposals/7')
+        assert r.status_code == 200
+        assert r.json()['status'] == 'EXECUTED'
+        assert r.json()['symbol'] == 'AAPL'
+
+    def test_list_proposals(self, client, manage_client):
+        r = client.get('/api/proposals')
+        assert r.status_code == 200
+        assert len(r.json()['proposals']) >= 1
 
 
 class TestDeployRoute:
     def _deploy(self, client, **extra):
+        headers = extra.pop('headers', None)
         data = {'csrf_token': _csrf(), 'file': 'momentum.py', 'class': 'Momentum',
                 'name': 'mom_test', 'bar_size': '1 min', 'days': '90',
                 'symbols': 'AAPL'}
         data.update(extra)
-        return client.post('/strategies/deploy', data=data, follow_redirects=False)
+        kwargs = {'follow_redirects': False}
+        if headers:
+            kwargs['headers'] = headers
+        return client.post('/strategies/deploy', data=data, **kwargs)
+
+    def test_deploy_accepts_localhost_origin_against_127_host(
+            self, client, stub, manage_client, stub_resolving, deploy_config):
+        headers = {
+            'Origin': 'http://localhost:7424',
+            'Host': '127.0.0.1:7424',
+        }
+        r = self._deploy(client, headers=headers)
+        assert r.status_code == 303, r.text
 
     def test_deploy_writes_yaml_reloads_and_enables(
-            self, client, stub, accessor, stub_resolving, deploy_config):
+            self, client, stub, manage_client, stub_resolving, deploy_config):
         import yaml
         r = self._deploy(client)
         assert r.status_code == 303
@@ -504,9 +795,41 @@ class TestDeployRoute:
         assert entry['module'] == 'strategies/momentum.py'
         assert entry['class_name'] == 'Momentum'
         assert entry['conids'] == [265598]
+        assert entry['universe'] == 'deploy_mom_test'
         assert ('enable', 'mom_test') in stub.calls
-        # resolved secdef registered so resolve_symbol(conId) works at load
-        assert ('insert', 'strat_mom_test', 'AAPL') in accessor.calls
+        assert ('strategy_command', 'reload_strategies', {}) in manage_client.calls
+        assert any(c[0] == 'trader_command' and c[1] == 'create_universe'
+                   and c[2].get('name') == 'deploy_mom_test' for c in manage_client.calls)
+        assert any(c[0] == 'trader_command' and c[1] == 'add_universe_symbols'
+                   for c in manage_client.calls)
+
+    def test_undeploy_removes_yaml_and_reloads(
+            self, client, stub, manage_client, stub_resolving, deploy_config):
+        import yaml
+        self._deploy(client)
+        manage_client.calls.clear()
+        r = client.post('/strategies/mom_test/undeploy',
+                        data={'csrf_token': _csrf()}, follow_redirects=False)
+        assert r.status_code == 303
+        assert '#deploy' in r.headers['location']
+        cfg = yaml.safe_load(deploy_config.read_text())
+        assert not any(e.get('name') == 'mom_test' for e in cfg.get('strategies') or [])
+        assert ('strategy_command', 'reload_strategies', {}) in manage_client.calls
+
+    def test_undeploy_global_refused(self, client, deploy_config):
+        r = client.post('/strategies/global/undeploy',
+                        data={'csrf_token': _csrf()}, follow_redirects=False)
+        assert r.status_code == 303
+        assert 'cannot undeploy' in r.headers['location'].lower() or 'flash=' in r.headers['location']
+
+    def test_deploy_tab_has_undeploy_control(self, client):
+        # Deploy tab lists live strategy_service rows (stub: orb_googl), not
+        # freshly-written YAML names until reload returns them.
+        html = client.get('/cc').text
+        assert '/strategies/orb_googl/undeploy' in html
+        assert 'data-proposal-filter="terminal"' in html
+        # cc-resolve-symbol lives inside the commands_enabled drawer block;
+        # default test flags leave commands off, so it must not be required.
 
     def test_deploy_with_watchlist_target(self, client, stub, accessor,
                                           stub_resolving, deploy_config):
@@ -556,10 +879,70 @@ class TestDeployRoute:
         cfg = yaml.safe_load(deploy_config.read_text())
         assert not any(e.get('name') == 'mom_test' for e in cfg['strategies'])
 
+    def test_deploy_without_targets_shows_error_flash(self, client, stub, accessor,
+                                                      stub_resolving, deploy_config):
+        import yaml
+        r = self._deploy(client, symbols='', watchlist='')
+        loc = r.headers['location']
+        assert 'needs%20symbols' in loc or 'needs symbols' in loc
+        assert 'flash_err=1' in loc
+        cfg = yaml.safe_load(deploy_config.read_text())
+        assert not any(e.get('name') == 'mom_test' for e in cfg['strategies'])
+
     def test_deploy_form_rendered_in_available_table(self, client, accessor, stub_resolving):
-        html = client.get('/legacy').text
+        html = client.get('/cc').text
         assert '/strategies/deploy' in html
         assert 'name="watchlist"' in html
+        assert 'data-dash-tab="deploy"' in html
+        assert '/strategies/' not in html or '/strategies/deploy' in html
+        assert '/strategies/orb_googl/enable' not in html
+        assert '/strategies/orb_googl/disable-live' in html
+
+    def test_enable_live_calls_strategy_command(self, client, stub, manage_client):
+        r = client.post('/strategies/orb_googl/enable-live',
+                        data={'csrf_token': _csrf()}, follow_redirects=False)
+        assert r.status_code == 303
+        assert 'enabled' in r.headers['location']
+        assert ('strategy_command', 'enable_strategy_by_name',
+                {'strategy_name': 'orb_googl'}) in manage_client.calls
+
+    def test_disable_live_calls_strategy_command(self, client, stub, manage_client):
+        r = client.post('/strategies/orb_googl/disable-live',
+                        data={'csrf_token': _csrf()}, follow_redirects=False)
+        assert r.status_code == 303
+        assert 'disabled' in r.headers['location']
+        assert ('strategy_command', 'disable_strategy_by_name',
+                {'strategy_name': 'orb_googl'}) in manage_client.calls
+
+
+class TestManagePage:
+    def test_manage_redirects_to_cc_deploy(self, client):
+        r = client.get('/manage', follow_redirects=False)
+        assert r.status_code == 307
+        assert r.headers['location'] == '/cc#deploy'
+
+    def test_cc_setup_renders_without_heavy_fetchers(self, client, stub, manage_client, monkeypatch):
+        """Deploy/Watchlists tabs must not fan out legacy overview fetchers."""
+        def _boom():
+            raise AssertionError('legacy fetcher must not run on /cc admin tabs')
+
+        for name in ('fetch_cash', 'fetch_snapshot', 'fetch_status', 'fetch_risk',
+                     'fetch_risk_limits', 'fetch_positions', 'fetch_proposals'):
+            monkeypatch.setattr(webapp, name, _boom)
+        html = client.get('/cc').text
+        assert 'Available strategies' in html
+        assert 'Watchlists' in html
+        assert 'data-dash-tab="deploy"' in html
+        assert 'data-dash-tab="watchlists"' in html
+
+    def test_cc_setup_marks_deployed_classes(self, client):
+        html = client.get('/cc').text
+        assert 'deployed' in html.lower()
+
+    def test_cc_default_hash_is_trading(self, client):
+        html = client.get('/cc').text
+        assert 'data-dash-tab="trading"' in html
+        assert '/static/dash_admin.js' in html
 
 
 class TestLegacyAccessTokenDoubleGate:
@@ -573,7 +956,7 @@ class TestLegacyAccessTokenDoubleGate:
     a valid dashboard session cookie."""
 
     @pytest.fixture
-    def alias_client(self, stub, monkeypatch):
+    def alias_client(self, stub, manage_client, monkeypatch):
         from web.command_center import CommandCenter, CommandCenterConfig
         from web.command_center.session import DashboardCredentials
         from cc_fakes import NullBridge, NullQuotePlane
@@ -581,6 +964,9 @@ class TestLegacyAccessTokenDoubleGate:
         # _ACCESS_TOKEN directly (normally read from os.environ at import
         # time) while ALSO being the token load_dashboard_credentials would
         # hand to the SessionManager.
+        # manage_client is required: /cc overlays Deploy/Watchlists via typed
+        # RPC; without a stub the manage fetch hits real ZMQ and used to wedge
+        # Starlette's TestClient portal after the page timeout.
         monkeypatch.setattr(webapp, '_ACCESS_TOKEN', TEST_TOKEN)
         cc = CommandCenter(
             CommandCenterConfig(),
@@ -596,17 +982,17 @@ class TestLegacyAccessTokenDoubleGate:
 
     def test_cookie_session_satisfies_legacy_token_gate(self, alias_client):
         alias_client.post("/session", data={"token": TEST_TOKEN})
-        assert alias_client.get("/legacy").status_code == 200
+        assert alias_client.get("/cc").status_code == 200
 
     def test_no_session_still_blocked(self, alias_client):
-        response = alias_client.get("/legacy", follow_redirects=False)
+        response = alias_client.get("/cc", follow_redirects=False)
         assert response.status_code in (303, 401)
 
     def test_canonical_config_unaffected(self, client):
         """The ordinary `client` fixture never sets `_ACCESS_TOKEN` (mirrors
         canonical DASHBOARD_TOKEN config, MMR_WEB_TOKEN unset) -- must keep
         working exactly as before."""
-        assert client.get("/legacy").status_code == 200
+        assert client.get("/cc").status_code == 200
 
 
 class TestEntrypointWorkerGuard:

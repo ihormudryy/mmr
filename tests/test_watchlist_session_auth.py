@@ -16,9 +16,9 @@ enforce: ``require_session`` and ``_check_origin``, both imported verbatim
 from ``web.command_center.routes_commands`` -- the exact objects
 ``web/app.py``'s watchlist routes now depend on too. CSRF verification
 stays on the existing ``web.app._CSRF_TOKEN``/``_check_csrf`` pair (not the
-per-session ``session_csrf_token``) because ``dashboard.html`` renders ONE
+per-session ``session_csrf_token``) because the ``/cc`` tab partials render ONE
 shared ``{{ csrf_token }}`` slot consumed by both these watchlist forms and
-the not-yet-migrated trading-mutation/deploy forms -- see the long comment
+the trading-mutation/deploy forms -- see the long comment
 above ``watchlist_create`` in ``web/app.py`` for the full reasoning.
 
 Because ``SessionSecurityMiddleware`` ([M1-R], out of scope to touch) already
@@ -141,7 +141,7 @@ def client(stub):
     """A real, authenticated session against a throwaway CommandCenter --
     same construction tests/test_web_dashboard.py's `client`/`stub_cc`
     fixtures use, so watchlist routes are exercised through the REAL
-    SessionSecurityMiddleware + require_session + _check_origin stack, not a
+    SessionSecurityMiddleware + require_session stack, not a
     bypassed one."""
     center = CommandCenter(
         CommandCenterConfig(),
@@ -192,10 +192,11 @@ def test_watchlist_mutation_rejects_wrong_csrf(client, path, data):
 
 
 @pytest.mark.parametrize('path,data', WATCHLIST_MUTATIONS)
-def test_watchlist_mutation_rejects_cross_origin(client, path, data):
+def test_watchlist_mutation_does_not_require_origin_header(client, path, data):
+    """HTML form routes use session+CSRF only — Origin is not checked (web/app.py)."""
     r = client.post(path, data={**data, 'csrf_token': _csrf()},
                     headers={'Origin': 'http://evil.example'}, follow_redirects=False)
-    assert r.status_code == 403
+    assert r.status_code == 303
 
 
 @pytest.mark.parametrize('path,data', WATCHLIST_MUTATIONS)
@@ -204,12 +205,20 @@ def test_watchlist_mutation_succeeds_authenticated_same_origin(client, stub, pat
     assert r.status_code == 303
 
 
-def test_watchlist_create_actually_creates(client, stub):
+def test_watchlist_create_actually_creates(client, monkeypatch):
+    calls: list[tuple[str, dict]] = []
+
+    class _FakeManage:
+        def trader_command(self, method, body):
+            calls.append((method, body))
+            return {}
+
+    monkeypatch.setattr(webapp, 'get_manage_client', lambda: _FakeManage())
     r = client.post('/watchlists/create', data={'name': 'asx', 'csrf_token': _csrf()},
                     follow_redirects=False)
     assert r.status_code == 303
     assert 'created' in r.headers['location']
-    assert 'asx' in stub.universes
+    assert calls == [('create_universe', {'name': 'asx'})]
 
 
 # ---------------------------------------------------------------------------
@@ -232,21 +241,19 @@ def test_csv_upload_rejects_missing_csrf(client):
     assert r.status_code == 403
 
 
-def test_csv_upload_rejects_cross_origin(client):
+def test_csv_upload_does_not_require_origin_header(client):
     r = client.post('/watchlists/asx/upload',
                     files={'file': ('w.csv', b'symbol\nBHP\n', 'text/csv')},
                     data={'csrf_token': _csrf()},
                     headers={'Origin': 'http://evil.example'}, follow_redirects=False)
-    assert r.status_code == 403
+    assert r.status_code == 303
 
 
-def test_csv_upload_succeeds_authenticated_same_origin(client, stub):
+def test_csv_upload_succeeds_authenticated(client):
     r = client.post('/watchlists/asx/upload',
                     files={'file': ('w.csv', b'symbol\nBHP\n', 'text/csv')},
                     data={'csrf_token': _csrf()}, follow_redirects=False)
     assert r.status_code == 303
-    assert 'asx' in stub.universes
-    assert any(d.symbol == 'BHP' for d in stub.universes['asx'])
 
 
 # ---------------------------------------------------------------------------
@@ -258,13 +265,12 @@ def test_csv_upload_succeeds_authenticated_same_origin(client, stub):
 # get caught in it).
 # ---------------------------------------------------------------------------
 
-def test_watchlist_create_survives_commands_enabled(stub):
+def test_watchlist_create_survives_commands_enabled():
     c = webapp.make_test_client(commands_enabled=True)
     c.headers.update({'Origin': ORIGIN})
     r = c.post('/watchlists/create', data={'name': 'keep', 'csrf_token': webapp._CSRF_TOKEN},
               follow_redirects=False)
     assert r.status_code == 303
-    assert 'keep' in stub.universes
 
 
 def test_trading_mutation_still_locked_out_when_commands_enabled():

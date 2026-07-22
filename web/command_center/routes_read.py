@@ -1,9 +1,11 @@
 """Read-only routes: snapshot (also the degraded polling fallback), SSE, page."""
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
 import os
+from concurrent.futures import ThreadPoolExecutor
 
 from fastapi import APIRouter, Depends, Request
 from fastapi.responses import HTMLResponse, JSONResponse
@@ -12,9 +14,44 @@ from sse_starlette.sse import EventSourceResponse
 logger = logging.getLogger("web.command_center.routes")
 
 SSE_PING_SECONDS = 10
+MANAGE_PAGE_TIMEOUT_S = float(os.environ.get('MMR_MANAGE_PAGE_TIMEOUT_S', '12'))
+PAPER_AUTOMATION_QUERY_TIMEOUT_S = float(
+    os.environ.get("MMR_PAPER_AUTOMATION_QUERY_TIMEOUT_S", "1"))
 
 
-def create_read_router(cc, templates) -> APIRouter:
+def _deployed_strategy_names() -> list[str]:
+    """Names from strategy_runtime.yaml for paper-automation Activate.
+
+    Live ``view.strategies`` only fills after a strategy-control command
+    journals ``strategy.updated`` — freshly deployed YAML rows never appear
+    there, so the Activate dropdown would stay empty. Config names are the
+    same identifiers Activate expects.
+    """
+    try:
+        # Lazy import: web.app pulls in this module at create_app time.
+        from web.app import fetch_deployed_from_config
+        names = {
+            str(row.get("name") or "").strip()
+            for row in fetch_deployed_from_config()
+        }
+        return sorted(n for n in names if n)
+    except Exception as exc:  # noqa: BLE001 — optional enrichment
+        logger.debug("deployed strategy names unavailable: %s", exc)
+        return []
+
+
+# Dedicated pool so a timed-out manage fetch can be abandoned without tying an
+# asyncio Task / default-executor Future to the request portal. ``asyncio.wait_for
+# (asyncio.to_thread(...))`` cancels the awaitable but the worker thread keeps
+# running; Starlette's TestClient portal then ``thread.join()``s forever waiting
+# for that Task — wedging the whole pytest process when manage RPC has no peer
+# (CI) or a slow one. Polling a concurrent.futures.Future avoids that coupling.
+_MANAGE_PAGE_EXECUTOR = ThreadPoolExecutor(
+    max_workers=2, thread_name_prefix='cc-manage-page')
+
+
+def create_read_router(cc, templates, manage_context_provider=None,
+                       empty_manage_context=None) -> APIRouter:
     router = APIRouter()
 
     def _require_session(request: Request) -> str:
@@ -38,6 +75,20 @@ def create_read_router(cc, templates) -> APIRouter:
         if not cc.state.has_baseline:
             return JSONResponse({"detail": "snapshot not ready"}, status_code=503)
         view = cc.state.snapshot_view()
+        view["paper_automation"] = None
+        view["deployed_strategy_names"] = _deployed_strategy_names()
+        query_client = getattr(cc, "_query_client", None)
+        if query_client is not None:
+            try:
+                view["paper_automation"] = await asyncio.to_thread(
+                    query_client.call,
+                    "get_paper_automation_status",
+                    {},
+                    dict,
+                    timeout=PAPER_AUTOMATION_QUERY_TIMEOUT_S,
+                )
+            except Exception as exc:  # noqa: BLE001 - optional read-model enrichment
+                logger.debug("paper automation status unavailable: %s", exc)
         view["health"] = cc.bridge.health() if cc.bridge else {
             "lifecycle": "starting", "reconnects": 0, "cursor": None, "sources": {}}
         return JSONResponse(view)
@@ -82,6 +133,8 @@ def create_read_router(cc, templates) -> APIRouter:
 
     @router.get("/cc", response_class=HTMLResponse)
     async def command_center_page(request: Request,
+                                  flash: str = '',
+                                  flash_err: int = 0,
                                   _session: str = Depends(_require_session)):
         # [M1-C] UI-wiring pass: `commands_enabled` gates every command
         # affordance (action buttons + the drawers/dialogs they open) in the
@@ -94,10 +147,52 @@ def create_read_router(cc, templates) -> APIRouter:
         # takes a `commands_enabled` constructor kwarg used to decide whether
         # to build the command gateway at all).
         commands_enabled = request.app.state.command_flags.commands_enabled
-        return templates.TemplateResponse(request, "command_center.html", {
+        ctx: dict = {
             "degraded_after_ms": int(os.environ.get("CC_DEGRADED_AFTER_MS", "15000")),
             "poll_interval_ms": int(os.environ.get("CC_POLL_INTERVAL_MS", "5000")),
             "commands_enabled": commands_enabled,
-        })
+            "flash": flash,
+            "flash_err": bool(flash_err),
+        }
+        if manage_context_provider is not None:
+            # Seed the Deploy/Watchlists tabs from local disk + YAML immediately
+            # so a slow RPC overlay never leaves both sections blank.
+            if empty_manage_context is not None:
+                ctx.update(empty_manage_context(flash))
+            # Poll a dedicated-pool Future instead of wait_for(to_thread(...)):
+            # cancelling to_thread leaves the worker alive and wedged TestClient
+            # portals (see module docstring on _MANAGE_PAGE_EXECUTOR).
+            fut = _MANAGE_PAGE_EXECUTOR.submit(manage_context_provider, flash)
+            loop = asyncio.get_running_loop()
+            deadline = loop.time() + MANAGE_PAGE_TIMEOUT_S
+            try:
+                while not fut.done():
+                    remaining = deadline - loop.time()
+                    if remaining <= 0:
+                        raise TimeoutError
+                    await asyncio.sleep(min(0.05, remaining))
+                ctx.update(fut.result())
+            except TimeoutError:
+                logger.warning('manage context exceeded %.0fs on /cc', MANAGE_PAGE_TIMEOUT_S)
+                page_errors = dict(ctx.get('errors') or {})
+                page_errors['page'] = (
+                    f'live sections timed out after {MANAGE_PAGE_TIMEOUT_S:.0f}s '
+                    '— showing local data'
+                )
+                ctx['errors'] = page_errors
+            except Exception as exc:  # noqa: BLE001 - degrade, don't 500 the page
+                logger.warning('manage context failed on /cc: %s', exc)
+                if empty_manage_context is not None:
+                    ctx.update(empty_manage_context(
+                        flash,
+                        error=f'{type(exc).__name__}: {exc}',
+                    ))
+                else:
+                    ctx.update({
+                        'strategies': [], 'available_strategies': [], 'watchlists': [],
+                        'deployed_count': 0,
+                        'errors': {'page': f'{type(exc).__name__}: {exc}'},
+                    })
+        return templates.TemplateResponse(request, "command_center.html", ctx)
 
     return router

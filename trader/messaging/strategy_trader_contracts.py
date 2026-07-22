@@ -5,10 +5,11 @@ through the trader's typed ``query`` socket instead of the legacy dill RPC
 (port 42001, never bound in the split-container production posture). These are
 the request/response models for that boundary.
 
-This is a deliberately minimal subset (resolve + publish). The broader
-strategy→trader typed surface (universe listing, signal recording, account /
-position reads, typed proposal creation) is tracked separately; these names
-match that larger design so the two can converge without a rename.
+This is a deliberately minimal subset (resolve + publish). Universe listing,
+symbol discovery, and watchlist CRUD for the /manage dashboard are registered
+on the trader typed query/command sockets via ``manage_surface``; the broader
+strategy→trader typed surface (signal recording, account / position reads beyond
+manage) is tracked separately.
 """
 from __future__ import annotations
 

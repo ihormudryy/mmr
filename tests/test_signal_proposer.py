@@ -184,18 +184,33 @@ def test_signal_proposer_suppresses_entries_when_paused_stale_or_unavailable(pro
 
 
 # ---------------------------------------------------------------------------
-# Gating: paper-only
+# Gating: paper always; live only with live command authority (R2)
 # ---------------------------------------------------------------------------
 
 class TestGating:
-    def test_live_mode_is_noop(self, typed):
+    def test_live_mode_without_authority_is_noop(self, typed):
         proposer = SignalProposer(
             command_client=typed, query_client=typed,
             paper_trading=False, account_id='DU111111',
+            live_authority_enabled=False,
         )
         pid = proposer.on_signal('orb', _signal(Action.BUY), _frame())
         assert pid is None
         assert typed.commands == [] and typed.queries == []
+
+    def test_live_mode_with_authority_creates_proposal(self, typed):
+        proposer = SignalProposer(
+            command_client=typed, query_client=typed,
+            paper_trading=False, account_id='U1234567',
+            live_authority_enabled=True,
+        )
+        typed.queue_query('get_trading_control', {
+            'new_exposure_paused': False, 'revision': 1,
+        })
+        typed.queue_command('create_proposal', CommandReceipt(
+            's1', 's1', 'RESOLVED', {'proposal_id': 7, 'revision': 1}, None, False))
+        assert proposer.on_signal('orb', _signal(Action.BUY), _frame()) == 7
+        assert typed.commands and typed.commands[0].method == 'create_proposal'
 
 
 # ---------------------------------------------------------------------------
@@ -239,10 +254,11 @@ class TestCheckExits:
         typed.fail_next_query('list_proposals', ConnectionError('down'))
         assert proposer.check_exits('orb', 4391, _frame()) is None
 
-    def test_live_mode_short_circuits_without_a_query(self, typed):
+    def test_live_mode_without_authority_short_circuits_without_a_query(self, typed):
         proposer = SignalProposer(
             command_client=typed, query_client=typed,
             paper_trading=False, account_id='DU111111',
+            live_authority_enabled=False,
         )
         assert proposer.check_exits('orb', 4391, _frame()) is None
         assert typed.queries == []
@@ -344,6 +360,47 @@ class TestRuntimeIntegration:
         sig = Signal(source_name='s', action=Action.BUY, probability=0.5, risk=0.5)
         rt._dispatch_signal(installed_strategy, sig, conId=4391, frame=_frame())
         assert rt.signal_proposer.signals == []
+
+    def test_dispatch_signal_skips_proposer_when_intent_emitter_armed(
+            self, tmp_path, installed_strategy):
+        """R1: IntentEmitter XOR SignalProposer — never both for one signal."""
+        rt = _make_runtime(tmp_path)
+        installed_strategy.ctx.auto_execute = 'propose'
+
+        class _RecordingEmitter:
+            def __init__(self):
+                self.calls = []
+
+            def on_signal(self, **kwargs):
+                self.calls.append(kwargs)
+
+        rt.intent_emitter = _RecordingEmitter()  # type: ignore
+        rt.automation_strategy_name = installed_strategy.name
+        sig = Signal(source_name='s', action=Action.BUY, probability=0.5, risk=0.5)
+        rt._dispatch_signal(installed_strategy, sig, conId=4391, frame=_frame())
+        assert rt.signal_proposer.signals == []
+        assert len(rt.intent_emitter.calls) == 1
+
+    def test_dispatch_signal_proposes_when_emitter_not_for_this_strategy(
+            self, tmp_path, installed_strategy):
+        rt = _make_runtime(tmp_path)
+        installed_strategy.ctx.auto_execute = 'propose'
+
+        class _RecordingEmitter:
+            def __init__(self):
+                self.calls = []
+
+            def on_signal(self, **kwargs):
+                self.calls.append(kwargs)
+
+        rt.intent_emitter = _RecordingEmitter()  # type: ignore
+        # Emitter is armed for a *different* strategy name; IntentEmitter
+        # itself no-ops, but exclusivity keys off whether the emitter is
+        # armed for *this* strategy.
+        rt.automation_strategy_name = 'other_auto'
+        sig = Signal(source_name='s', action=Action.BUY, probability=0.5, risk=0.5)
+        rt._dispatch_signal(installed_strategy, sig, conId=4391, frame=_frame())
+        assert len(rt.signal_proposer.signals) == 1
 
     def test_maybe_check_exits_in_propose_mode(self, tmp_path, installed_strategy):
         rt = _make_runtime(tmp_path)

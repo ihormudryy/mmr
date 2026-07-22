@@ -1,5 +1,30 @@
 # Trading Income Research Runbook
 
+## P2 release gate
+
+Run the unified gate:
+
+```bash
+python3 scripts/p2_release_gate.py --synthetic-only --json --output p2-synthetic.json
+# After exporting a bundle from a qualified experiment family:
+python3 scripts/p2_release_gate.py --bundle ~/.local/share/mmr/artifacts/<artifact-id> \
+  --manual-attestation-report p2-attestation.json
+```
+
+Manual attestation report JSON (non-fungible — real qualified data required):
+
+```json
+{
+  "artifact_id": "artifact-<32hex>",
+  "bundle_path": "~/.local/share/mmr/artifacts/<artifact-id>",
+  "bundle_manifest_digest": "sha256:<hex>",
+  "attestation_state": "PAPER_ELIGIBLE",
+  "commit_digest": "<git rev-parse HEAD>",
+  "config_digest": "sha256:<deployed trader.yaml>",
+  "passed": true
+}
+```
+
 ## Reproducing an Artifact Bundle
 When a new strategy is published, it is distributed as a read-only artifact bundle containing all the necessary evidence for evaluation and eligibility. To verify the bundle and replay its execution:
 

@@ -1086,9 +1086,12 @@ def build_parser() -> argparse.ArgumentParser:
                            help='Enrich with company name, ratios, and news (card view; Massive only)')
     movers_p.add_argument('--num', '-n', type=int, default=20,
                            help='Number of results (default: 20)')
+    # Massive-first: TD /market_movers requires Pro+ and is not covered by
+    # default_data_source (which is often twelvedata for cheap history/quotes).
     movers_p.add_argument('--source', choices=['massive', 'twelvedata'],
-                          default=_src_default(['massive', 'twelvedata'], 'massive'),
-                           help='Data source (default: massive)')
+                          default='massive',
+                           help='Data source (default: massive). '
+                                'twelvedata needs a Pro+ plan for market movers.')
 
     # scan
     scan_p = sub.add_parser('scan', help='IB market scanner',
@@ -1170,9 +1173,13 @@ def build_parser() -> argparse.ArgumentParser:
                           help='How many top-ranked symbols to enrich with article bodies (default: 3)')
     ideas_p.add_argument('--location', '-l', default=None,
                           help='IB market location (e.g. STK.AU.ASX, STK.CA, STK.HK.SEHK)')
+    # Massive-first for US ideas (design principle). Do NOT inherit
+    # default_data_source=twelvedata — TD market movers is Pro+-only and would
+    # 403 on Basic/Starter keys that still work for quotes/history.
     ideas_p.add_argument('--source', choices=['massive', 'twelvedata'],
-                         default=_src_default(['massive', 'twelvedata'], 'massive'),
+                         default='massive',
                           help='Data source for US equities (default: massive). '
+                               'twelvedata needs a Pro+ plan for movers discovery. '
                                'Ignored when --location is set (IB path).')
 
     # propose
@@ -1254,6 +1261,50 @@ def build_parser() -> argparse.ArgumentParser:
     reject_p.add_argument('proposal_id', type=int, nargs='?', default=None, help='Proposal ID to reject')
     reject_p.add_argument('--all', action='store_true', default=False, help='Reject all pending proposals')
     reject_p.add_argument('--reason', default='', help='Rejection reason')
+
+    # activate-canary / deactivate-canary [P4 Task 5] — the ONLINE half of
+    # the signed live-canary flow. The attestation itself is produced fully
+    # OFFLINE by `research canary prepare` + `research canary sign`; this
+    # command only ever transmits the already-signed wire attestation
+    # (public material + signature), never a private key.
+    activate_canary_p = sub.add_parser(
+        'activate-canary', help='Activate a signed live-canary authority',
+        epilog='Examples:\n'
+               '  activate-canary --attestation-file attestation.json \\\n'
+               '      --reason "canary after 30d clean paper"',
+        formatter_class=fmt,
+    )
+    activate_canary_p.add_argument('--attestation-file', required=True,
+                                   help='JSON file with the signed attestation from `research canary sign`')
+    activate_canary_p.add_argument('--reason', required=True)
+
+    deactivate_canary_p = sub.add_parser(
+        'deactivate-canary', help='Deactivate (suspend) an ACTIVE live-canary authority',
+        epilog='Examples:\n'
+               '  deactivate-canary orb_756733 --reason "unexpected drawdown"',
+        formatter_class=fmt,
+    )
+    deactivate_canary_p.add_argument('strategy_id', help='Strategy id whose canary authority to suspend')
+    deactivate_canary_p.add_argument('--reason', required=True)
+
+    activate_allocation_p = sub.add_parser(
+        'activate-allocation', help='Activate a signed allocation authority',
+        epilog='Examples:\n'
+               '  activate-allocation --attestation-file allocation.json \\\n'
+               '      --reason "Scale 1 after clean canary"',
+        formatter_class=fmt,
+    )
+    activate_allocation_p.add_argument('--attestation-file', required=True,
+                                       help='JSON file with signed attestation from `research allocation sign`')
+    activate_allocation_p.add_argument('--reason', required=True)
+
+    suspend_allocation_p = sub.add_parser(
+        'suspend-allocation', help='Suspend the active allocation authority (risk-reducing)',
+        epilog='Examples:\n'
+               '  suspend-allocation --reason "drawdown exceeded soft limit"',
+        formatter_class=fmt,
+    )
+    suspend_allocation_p.add_argument('--reason', required=True)
 
     # group (position groups)
     group_p = sub.add_parser('group', help='Manage position groups',
@@ -1687,6 +1738,98 @@ def build_parser() -> argparse.ArgumentParser:
     rat_verify.add_argument('--instruments', nargs='+', required=True)
     rat_verify.add_argument('--now', default='', help='Override "now" (ISO-8601 UTC); default: current time')
 
+    # research canary — P4 Task 5: offline prepare/sign/verify of a signed
+    # live-canary activation authority. NONE of these three subcommands ever
+    # transmit private key material anywhere -- `prepare` reads the trader's
+    # own local journal DB (read-only) and emits an UNSIGNED payload; `sign`
+    # loads the private key ONLY from a local file and never leaves this
+    # process; `verify` takes only a PUBLIC key file. The separate
+    # `activate-canary`/`deactivate-canary` commands (below) send only the
+    # already-signed wire attestation over RPC.
+    rc_p = research_sub.add_parser(
+        'canary', help='Prepare / sign / verify a live-canary activation authority',
+        epilog='Examples:\n'
+               '  research canary prepare --strategy-id orb_756733 --account-id U1234567 \\\n'
+               '      --artifact-digest sha256:... --allowlist-digest sha256:... \\\n'
+               '      --ruleset-digest sha256:... --max-gross-allocation 0.05 \\\n'
+               '      --instrument AAPL --public-key-id key-2026 --ttl-days 7 \\\n'
+               '      --operator alice --reason "canary after 30d clean paper" > payload.json\n'
+               '  research canary sign --payload-file payload.json --key-file ~/.keys/canary.pem \\\n'
+               '      > attestation.json\n'
+               '  research canary verify --attestation-file attestation.json \\\n'
+               '      --public-key-file ~/.keys/canary_pub.pem --account-id U1234567 \\\n'
+               '      --artifact-digest sha256:... --allowlist-digest sha256:... --ruleset-digest sha256:...',
+        formatter_class=fmt,
+    )
+    rc_sub = rc_p.add_subparsers(dest='canary_action')
+
+    rc_prepare = rc_sub.add_parser(
+        'prepare', help='Produce an UNSIGNED canary payload from the strategy\'s current PAPER_PASSED window')
+    rc_prepare.add_argument('--strategy-id', required=True)
+    rc_prepare.add_argument('--account-id', required=True, help='Exact live account this authority is scoped to')
+    rc_prepare.add_argument('--artifact-digest', required=True)
+    rc_prepare.add_argument('--allowlist-digest', required=True)
+    rc_prepare.add_argument('--ruleset-digest', required=True)
+    rc_prepare.add_argument('--max-gross-allocation', type=float, required=True,
+                            help='Must be in (0, 0.06]')
+    rc_prepare.add_argument('--instrument', required=True, help='Exactly one instrument symbol')
+    rc_prepare.add_argument('--public-key-id', required=True,
+                            help='Key id of the OFFLINE signing key that will sign this payload')
+    rc_prepare.add_argument('--ttl-days', type=int, default=7, help='Expiry in days (default 7)')
+    rc_prepare.add_argument('--operator', required=True)
+    rc_prepare.add_argument('--reason', required=True)
+
+    rc_sign = rc_sub.add_parser('sign', help='Sign an unsigned canary payload (fully offline)')
+    rc_sign.add_argument('--payload-file', required=True,
+                         help='JSON file with the unsigned payload from `research canary prepare`')
+    rc_sign.add_argument('--key-file', required=True,
+                         help='Path to the offline Ed25519 private key (PKCS8 PEM, 0o600)')
+
+    rc_verify = rc_sub.add_parser('verify', help='Verify a signed canary attestation against expected bindings')
+    rc_verify.add_argument('--attestation-file', required=True,
+                           help='JSON file with the signed attestation from `research canary sign`')
+    rc_verify.add_argument('--public-key-file', required=True,
+                           help='Path to the Ed25519 PUBLIC verification key (PEM)')
+    rc_verify.add_argument('--account-id', required=True)
+    rc_verify.add_argument('--artifact-digest', required=True)
+    rc_verify.add_argument('--allowlist-digest', required=True)
+    rc_verify.add_argument('--ruleset-digest', required=True)
+    rc_verify.add_argument('--now', default='', help='Override "now" (ISO-8601 UTC); default: current time')
+
+    ra_p = research_sub.add_parser(
+        'allocation', help='Prepare / sign / verify a signed allocation authority (P5 scaling)',
+        formatter_class=fmt,
+    )
+    ra_sub = ra_p.add_subparsers(dest='allocation_action')
+    ra_prepare = ra_sub.add_parser('prepare', help='Unsigned allocation payload from ScalingGate evidence')
+    ra_prepare.add_argument('--strategy-id', required=True)
+    ra_prepare.add_argument('--target-stage', required=True, choices=['SCALE_1', 'SCALE_2', 'STEADY'])
+    ra_prepare.add_argument('--current-allocation-stage', default='')
+    ra_prepare.add_argument('--account-id', required=True)
+    ra_prepare.add_argument('--account-mode', required=True, choices=['paper', 'live'])
+    ra_prepare.add_argument('--artifact-digest', required=True)
+    ra_prepare.add_argument('--allowlist-digest', required=True)
+    ra_prepare.add_argument('--ruleset-digest', required=True)
+    ra_prepare.add_argument('--max-gross-allocation', type=float, required=True)
+    ra_prepare.add_argument('--public-key-id', required=True)
+    ra_prepare.add_argument('--ttl-days', type=int, default=30)
+    ra_prepare.add_argument('--operator', required=True)
+    ra_prepare.add_argument('--reason', required=True)
+    ra_prepare.add_argument('--authority-started-at', default='')
+    ra_prepare.add_argument('--capacity-review-passed', action='store_true')
+    ra_sign = ra_sub.add_parser('sign', help='Sign an unsigned allocation payload (offline)')
+    ra_sign.add_argument('--payload-file', required=True)
+    ra_sign.add_argument('--key-file', required=True)
+    ra_verify = ra_sub.add_parser('verify', help='Verify a signed allocation attestation')
+    ra_verify.add_argument('--attestation-file', required=True)
+    ra_verify.add_argument('--public-key-file', required=True)
+    ra_verify.add_argument('--strategy-id', required=True)
+    ra_verify.add_argument('--account-id', required=True)
+    ra_verify.add_argument('--account-mode', required=True)
+    ra_verify.add_argument('--artifact-digest', required=True)
+    ra_verify.add_argument('--allowlist-digest', required=True)
+    ra_verify.add_argument('--ruleset-digest', required=True)
+
     # data
     data_p = sub.add_parser('data', help='Local data exploration (no service needed)',
                             epilog='Examples:\n'
@@ -1814,7 +1957,8 @@ def dispatch(mmr: MMR, args: argparse.Namespace) -> bool:
         'buy', 'sell', 'cancel', 'cancel-all', 'close', 'protect',
         'snapshot', 'snap', 'snapshot-batch', 'depth', 'resolve',
         'listen', 'watch', 'scan',
-        'approve',
+        'approve', 'activate-canary', 'deactivate-canary', 'activate-allocation',
+        'suspend-allocation',
         'resize-positions',
         'portfolio-risk', 'prisk',
         'portfolio-snapshot', 'psnap',
@@ -2322,6 +2466,17 @@ def dispatch(mmr: MMR, args: argparse.Namespace) -> bool:
         elif cmd == 'reject':
             _handle_reject(mmr, args)
 
+        elif cmd == 'activate-canary':
+            _handle_activate_canary(mmr, args)
+
+        elif cmd == 'activate-allocation':
+            _handle_activate_allocation(mmr, args)
+        elif cmd == 'suspend-allocation':
+            _handle_suspend_allocation(mmr, args)
+
+        elif cmd == 'deactivate-canary':
+            _handle_deactivate_canary(mmr, args)
+
         elif cmd == 'group':
             _handle_group(mmr, args)
 
@@ -2756,6 +2911,65 @@ def _handle_reject(mmr: MMR, args: argparse.Namespace):
         print_status(f'Proposal #{args.proposal_id} rejected')
     else:
         print_status(f'Reject failed: proposal #{args.proposal_id} not found or not PENDING', success=False)
+
+
+def _handle_activate_canary(mmr: MMR, args: argparse.Namespace):
+    """[P4 Task 5] Send an already-signed canary attestation for activation.
+
+    Never touches private key material: ``--attestation-file`` is the
+    PUBLIC wire form produced offline by `research canary sign`."""
+    import json as _json
+
+    try:
+        with open(args.attestation_file, 'r') as f:
+            attestation = _json.load(f)
+    except (OSError, _json.JSONDecodeError) as exc:
+        print_status(f'Failed to read attestation file: {exc}', success=False)
+        return
+
+    result = mmr.activate_live_canary(attestation, args.reason)
+    if result.is_success():
+        print_json_result(result.obj or {}, title='Live canary activated')
+    else:
+        error = str(result.error or result.exception or 'Unknown error')
+        print_status(f'Canary activation failed: {error}', success=False)
+
+
+def _handle_activate_allocation(mmr: MMR, args: argparse.Namespace):
+    """[P5 Task 3] Send an already-signed allocation attestation for activation."""
+    import json as _json
+
+    try:
+        with open(args.attestation_file, 'r') as f:
+            attestation = _json.load(f)
+    except (OSError, _json.JSONDecodeError) as exc:
+        print_status(f'Failed to read attestation file: {exc}', success=False)
+        return
+
+    result = mmr.activate_allocation(attestation, args.reason)
+    if result.is_success():
+        print_json_result(result.obj or {}, title='Allocation authority activated')
+    else:
+        error = str(result.error or result.exception or 'Unknown error')
+        print_status(f'Allocation activation failed: {error}', success=False)
+
+
+def _handle_suspend_allocation(mmr: MMR, args: argparse.Namespace):
+    result = mmr.suspend_allocation(args.reason)
+    if result.is_success():
+        print_json_result(result.obj or {}, title='Allocation authority suspended')
+    else:
+        error = str(result.error or result.exception or 'Unknown error')
+        print_status(f'Allocation suspension failed: {error}', success=False)
+
+
+def _handle_deactivate_canary(mmr: MMR, args: argparse.Namespace):
+    result = mmr.deactivate_live_canary(args.strategy_id, args.reason)
+    if result.is_success():
+        print_json_result(result.obj or {}, title='Live canary deactivated')
+    else:
+        error = str(result.error or result.exception or 'Unknown error')
+        print_status(f'Canary deactivation failed: {error}', success=False)
 
 
 def _handle_group(mmr: MMR, args: argparse.Namespace):
@@ -4186,9 +4400,7 @@ def _handle_strategy_deploy(args: argparse.Namespace):
                     new_defs = []
                     for cid in unregistered:
                         try:
-                            resolved = rpc_mmr._rpc.rpc().resolve_contract(
-                                Contract(conId=int(cid))
-                            )
+                            resolved = rpc_mmr.resolve(int(cid))
                             if resolved:
                                 new_defs.append(resolved[0])
                         except Exception as ex:
@@ -5048,9 +5260,13 @@ def _handle_research(args: argparse.Namespace):
         _handle_research_review(args)
     elif action == 'attest':
         _handle_research_attest(args)
+    elif action == 'canary':
+        _handle_research_canary(args)
+    elif action == 'allocation':
+        _handle_research_allocation(args)
     else:
         print_status(
-            'Usage: research {family|trial|artifact|import-legacy|review|attest} ...',
+            'Usage: research {family|trial|artifact|import-legacy|review|attest|canary|allocation} ...',
             success=False)
 
 
@@ -5459,6 +5675,348 @@ def _handle_research_attest_verify(args: argparse.Namespace):
         'public_key_id': verified.public_key_id,
         'payload_digest': verified.payload_digest,
     }, title='Attestation verified')
+
+
+# --- research canary — P4 Task 5: offline prepare/sign/verify --------------
+
+def _journal_duckdb_path() -> str:
+    """Resolve the trader's operational journal DB path -- same file the
+    running trader_service reads/writes via ``command_stack.py``. Env
+    override wins; otherwise config, then the documented default.
+
+    ``research canary prepare`` opens this file to read the strategy's
+    CURRENT stage + evidence window -- deliberately the trader's own durable
+    truth, never a value the operator supplies by hand, so a stale/forged
+    "trust me it's clean" window can't be smuggled into the payload.
+    """
+    import os
+    from pathlib import Path
+    path = os.environ.get('MMR_JOURNAL_DUCKDB')
+    if not path:
+        try:
+            from trader.container import Container
+            cfg = Container.instance().config()
+            path = cfg.get('journal_duckdb_path')
+        except Exception:
+            path = None
+        path = path or '~/.local/share/mmr/data/mmr_journal.duckdb'
+    p = Path(path).expanduser()
+    p.parent.mkdir(parents=True, exist_ok=True)
+    return str(p)
+
+
+def _promotion_controller_for_cli():
+    """Build a read-mostly ``PromotionController`` against the trader's own
+    journal DB. ``prepare_canary`` itself never writes (it uses
+    ``EvidenceStore.rebuild_window``, not the persisting ``project``) --
+    opening this alongside a live trader_service is safe for that reason,
+    though a concurrent WRITE from this process is never attempted here.
+    """
+    from trader.data.domain_journal import DomainJournal
+    from trader.data.duckdb_store import DuckDBConnection
+    from trader.data.schema_migrations import SchemaMigrator
+    from trader.promotion.controller import PromotionController
+    from trader.promotion.evidence_store import EvidenceStore, apply_evidence_migrations
+    from trader.promotion.stage import PromotionStageMachine, apply_stage_migration
+
+    db = DuckDBConnection.get_instance(_journal_duckdb_path())
+    migrator = SchemaMigrator(db)
+    journal = DomainJournal(db)
+    journal.migrate(migrator)
+    apply_stage_migration(migrator)
+    apply_evidence_migrations(migrator)
+    stage_machine = PromotionStageMachine(journal=journal, db=db)
+    evidence_store = EvidenceStore(journal=journal, db=db)
+    return PromotionController(evidence_store=evidence_store, stage_machine=stage_machine)
+
+
+def _handle_research_canary(args: argparse.Namespace):
+    """Offline prepare/sign/verify of a signed live-canary authority -- no
+    service needed. NEVER transmits private key material (see subcommand
+    docstrings)."""
+    action = getattr(args, 'canary_action', None)
+    if action == 'prepare':
+        _handle_research_canary_prepare(args)
+    elif action == 'sign':
+        _handle_research_canary_sign(args)
+    elif action == 'verify':
+        _handle_research_canary_verify(args)
+    else:
+        print_status('Usage: research canary {prepare|sign|verify} ...', success=False)
+
+
+def _canary_payload_public_view(fields: dict) -> dict:
+    """JSON-safe projection of an unsigned/signed canary payload dict."""
+    view = dict(fields)
+    for key in ('issued_at', 'expires_at'):
+        value = view.get(key)
+        if hasattr(value, 'isoformat'):
+            view[key] = value.isoformat()
+    if 'permitted_instruments' in view:
+        view['permitted_instruments'] = list(view['permitted_instruments'])
+    return view
+
+
+def _handle_research_canary_prepare(args: argparse.Namespace):
+    import datetime as _dt
+
+    from trader.promotion.controller import PromotionPreparationError
+
+    controller = _promotion_controller_for_cli()
+    now = _dt.datetime.now(_dt.timezone.utc)
+    expires_at = now + _dt.timedelta(days=args.ttl_days)
+    try:
+        payload = controller.prepare_canary(
+            args.strategy_id, account_id=args.account_id, artifact_digest=args.artifact_digest,
+            allowlist_digest=args.allowlist_digest, ruleset_digest=args.ruleset_digest,
+            max_gross_allocation=args.max_gross_allocation, permitted_instruments=(args.instrument,),
+            public_key_id=args.public_key_id, expires_at=expires_at, operator=args.operator,
+            reason=args.reason, now=now,
+        )
+    except PromotionPreparationError as exc:
+        print_status(f'Canary preparation refused: {exc}', success=False)
+        return
+    except Exception as exc:  # noqa: BLE001 - CanaryValidationError et al are dynamic
+        print_status(f'Canary preparation refused: {exc}', success=False)
+        return
+    print_json_result(_canary_payload_public_view(payload), title='Unsigned canary payload prepared')
+
+
+def _handle_research_canary_sign(args: argparse.Namespace):
+    import json as _json
+
+    from trader.promotion.canary_attestation import canary_attestation_to_wire, sign_canary_payload
+    from trader.research.signing import AttestationSigner, InsecureKeyFile, InvalidKeyType, MalformedKey
+
+    try:
+        with open(args.payload_file, 'r') as f:
+            unsigned = _json.load(f)
+    except (OSError, _json.JSONDecodeError) as exc:
+        print_status(f'Failed to read payload file: {exc}', success=False)
+        return
+    unsigned['issued_at'] = _parse_iso_datetime(unsigned['issued_at'])
+    unsigned['expires_at'] = _parse_iso_datetime(unsigned['expires_at'])
+    unsigned['permitted_instruments'] = tuple(unsigned.get('permitted_instruments', ()))
+
+    try:
+        # Loads the private key from a LOCAL file only, for the lifetime of
+        # this offline process; never serialized, logged, or sent anywhere.
+        signer = AttestationSigner.from_key_file(args.key_file)
+    except InsecureKeyFile as exc:
+        print_status(f'Insecure key file: {exc}', success=False)
+        return
+    except (InvalidKeyType, MalformedKey) as exc:
+        print_status(f'Invalid signing key: {exc}', success=False)
+        return
+
+    try:
+        attestation = sign_canary_payload(signer, unsigned)
+    except (KeyError, ValueError) as exc:
+        print_status(f'Failed to sign canary payload: {exc}', success=False)
+        return
+    print_json_result(canary_attestation_to_wire(attestation), title='Canary authority signed')
+
+
+def _handle_research_canary_verify(args: argparse.Namespace):
+    import datetime as _dt
+    import json as _json
+
+    from trader.promotion.canary_attestation import (
+        CanaryAuthorityError, CanaryAuthorityVerifier, ExpectedCanaryBindings,
+        canary_attestation_from_wire,
+    )
+    from trader.research.signing import InvalidKeyType, MalformedKey, load_verify_key
+
+    try:
+        with open(args.attestation_file, 'r') as f:
+            wire = _json.load(f)
+    except (OSError, _json.JSONDecodeError) as exc:
+        print_status(f'Failed to read attestation file: {exc}', success=False)
+        return
+    try:
+        attestation = canary_attestation_from_wire(wire)
+    except (KeyError, ValueError, TypeError) as exc:
+        print_status(f'Malformed attestation: {exc}', success=False)
+        return
+
+    try:
+        public_key = load_verify_key(args.public_key_file)
+    except (InvalidKeyType, MalformedKey) as exc:
+        print_status(f'Invalid public key: {exc}', success=False)
+        return
+
+    if args.now:
+        try:
+            now = _parse_iso_datetime(args.now)
+        except ValueError as exc:
+            print_status(f'Invalid --now: {exc}', success=False)
+            return
+    else:
+        now = _dt.datetime.now(_dt.timezone.utc)
+
+    expected = ExpectedCanaryBindings(
+        account_id=args.account_id, artifact_digest=args.artifact_digest,
+        allowlist_digest=args.allowlist_digest, ruleset_digest=args.ruleset_digest,
+    )
+    verifier = CanaryAuthorityVerifier([public_key])
+    try:
+        verified = verifier.verify(attestation, expected, now=now)
+    except CanaryAuthorityError as exc:
+        print_json_result({
+            'result': 'FAIL', 'error': type(exc).__name__, 'detail': str(exc),
+        }, title='Canary authority verification FAILED')
+        return
+    print_json_result({
+        'result': 'PASS',
+        'strategy_id': verified.strategy_id,
+        'account_id': verified.account_id,
+        'max_gross_allocation': verified.max_gross_allocation,
+        'permitted_instruments': list(verified.permitted_instruments),
+        'artifact_digest': verified.artifact_digest,
+        'allowlist_digest': verified.allowlist_digest,
+        'ruleset_digest': verified.ruleset_digest,
+        'expires_at': verified.expires_at.isoformat(),
+        'public_key_id': verified.public_key_id,
+        'payload_digest': verified.payload_digest,
+    }, title='Canary authority verified')
+
+
+def _allocation_payload_public_view(fields: dict) -> dict:
+    view = dict(fields)
+    for key in ('issued_at', 'expires_at'):
+        value = view.get(key)
+        if hasattr(value, 'isoformat'):
+            view[key] = value.isoformat()
+    return view
+
+
+def _handle_research_allocation(args: argparse.Namespace):
+    action = getattr(args, 'allocation_action', None)
+    if action == 'prepare':
+        _handle_research_allocation_prepare(args)
+    elif action == 'sign':
+        _handle_research_allocation_sign(args)
+    elif action == 'verify':
+        _handle_research_allocation_verify(args)
+    else:
+        print_status('Usage: research allocation {prepare|sign|verify} ...', success=False)
+
+
+def _handle_research_allocation_prepare(args: argparse.Namespace):
+    import datetime as _dt
+    from trader.promotion.controller import PromotionPreparationError
+
+    controller = _promotion_controller_for_cli()
+    now = _dt.datetime.now(_dt.timezone.utc)
+    authority_started_at = None
+    if args.authority_started_at:
+        authority_started_at = _parse_iso_datetime(args.authority_started_at)
+    try:
+        payload = controller.prepare_allocation(
+            args.strategy_id,
+            target_stage=args.target_stage,
+            current_allocation_stage=args.current_allocation_stage or None,
+            account_id=args.account_id,
+            account_mode=args.account_mode,
+            artifact_digest=args.artifact_digest,
+            allowlist_digest=args.allowlist_digest,
+            ruleset_digest=args.ruleset_digest,
+            max_gross_allocation=args.max_gross_allocation,
+            public_key_id=args.public_key_id,
+            expires_at=now + _dt.timedelta(days=args.ttl_days),
+            operator=args.operator,
+            reason=args.reason,
+            authority_started_at=authority_started_at,
+            capacity_review_passed=bool(args.capacity_review_passed),
+        )
+    except PromotionPreparationError as exc:
+        print_status(str(exc), success=False)
+        return
+    print_json_result(_allocation_payload_public_view(payload), title='Unsigned allocation payload prepared')
+
+
+def _handle_research_allocation_sign(args: argparse.Namespace):
+    import json as _json
+    from trader.promotion.allocation_attestation import allocation_attestation_to_wire, sign_allocation_payload
+    from trader.research.signing import InsecureKeyFile, InvalidKeyType, MalformedKey, load_signing_key
+
+    try:
+        with open(args.payload_file, 'r') as f:
+            unsigned = _json.load(f)
+    except (OSError, _json.JSONDecodeError) as exc:
+        print_status(f'Failed to read payload file: {exc}', success=False)
+        return
+    try:
+        signer = load_signing_key(args.key_file)
+    except (InsecureKeyFile, InvalidKeyType, MalformedKey) as exc:
+        print_status(f'Invalid signing key: {exc}', success=False)
+        return
+    try:
+        attestation = sign_allocation_payload(signer, unsigned)
+    except (KeyError, ValueError) as exc:
+        print_status(f'Failed to sign allocation payload: {exc}', success=False)
+        return
+    print_json_result(allocation_attestation_to_wire(attestation), title='Allocation authority signed')
+
+
+def _handle_research_allocation_verify(args: argparse.Namespace):
+    import datetime as _dt
+    import json as _json
+    from trader.promotion.allocation_attestation import (
+        AllocationAttestationVerifier,
+        AllocationAuthorityError,
+        ExpectedAllocationBindings,
+        allocation_attestation_from_wire,
+    )
+    from trader.research.signing import InvalidKeyType, MalformedKey, load_verify_key
+
+    try:
+        with open(args.attestation_file, 'r') as f:
+            wire = _json.load(f)
+    except (OSError, _json.JSONDecodeError) as exc:
+        print_status(f'Failed to read attestation file: {exc}', success=False)
+        return
+    try:
+        attestation = allocation_attestation_from_wire(wire)
+    except (KeyError, ValueError, TypeError) as exc:
+        print_status(f'Malformed attestation: {exc}', success=False)
+        return
+    try:
+        public_key = load_verify_key(args.public_key_file)
+    except (InvalidKeyType, MalformedKey) as exc:
+        print_status(f'Invalid public key: {exc}', success=False)
+        return
+    expected = ExpectedAllocationBindings(
+        account_id=args.account_id,
+        account_mode=args.account_mode,
+        artifact_digest=args.artifact_digest,
+        allowlist_digest=args.allowlist_digest,
+        ruleset_digest=args.ruleset_digest,
+        strategy_id=args.strategy_id,
+    )
+    verifier = AllocationAttestationVerifier({attestation.public_key_id: public_key})
+    now = _dt.datetime.now(_dt.timezone.utc)
+    try:
+        verified = verifier.verify(attestation, expected=expected, now=now)
+    except AllocationAuthorityError as exc:
+        print_json_result({'result': 'FAIL', 'error': type(exc).__name__, 'detail': str(exc)},
+                          title='Allocation authority verification FAILED')
+        return
+    print_json_result({
+        'result': 'PASS',
+        'strategy_id': verified.strategy_id,
+        'stage': verified.stage,
+        'max_gross_allocation': verified.max_gross_allocation,
+        'payload_digest': verified.payload_digest,
+    }, title='Allocation authority verified')
+
+
+def _parse_iso_datetime(value: str):
+    import datetime as _dt
+    parsed = _dt.datetime.fromisoformat(value)
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=_dt.timezone.utc)
+    return parsed
 
 
 # --- backtests list: per-metric quality classification -----------------
@@ -8016,7 +8574,7 @@ def _handle_data_download(args: argparse.Namespace):
         )
         candidate.connect()
         # Soft probe — if trader_service isn't up, skip silently
-        candidate._rpc.rpc().get_status()  # type: ignore[attr-defined]
+        candidate._typed_query.call('get_status', {}, dict)
         rpc_mmr = candidate
     except Exception:
         # connect() may have opened a socket before the probe failed — close the
@@ -9868,7 +10426,7 @@ def _handle_diagnose(mmr: MMR, args: argparse.Namespace):
         )
         return
     try:
-        result = mmr._rpc.rpc(return_type=dict).diagnose_portfolio_feed()
+        result = mmr._typed_query.call('diagnose_portfolio_feed', {}, dict)
     except Exception as ex:
         print_status(f'diagnose failed: {ex}', success=False)
         return
@@ -9932,8 +10490,14 @@ def _handle_scan(mmr: MMR, args: argparse.Namespace):
     # guessing at the scanner subscription matrix.
     if getattr(args, 'list_locations', False):
         try:
-            locs = mmr._rpc.rpc(return_type=list[dict]).scanner_locations()
+            locs = mmr._legacy_or_raise('scan --list-locations').rpc(
+                return_type=list[dict]
+            ).scanner_locations()
         except Exception as ex:
+            try:
+                mmr._map_legacy_route_error('scan --list-locations', ex)
+            except ConnectionError as mapped:
+                ex = mapped
             print_status(f'Failed to fetch scanner locations: {ex}', success=False)
             return
         if _json_mode:
@@ -10057,6 +10621,10 @@ def _handle_ideas(mmr: MMR, args: argparse.Namespace):
         location=args.location,
         data_source=data_source,
     )
+
+    notice = getattr(df, 'attrs', {}).get('ideas_notice') if df is not None else None
+    if notice and not _json_mode:
+        console.print(f'[yellow]{notice}[/yellow]')
 
     location_label = f' [{args.location}]' if args.location else ''
     source_label = ' — TwelveData' if data_source == 'twelvedata' and not args.location else ''
@@ -10832,8 +11400,7 @@ def _handle_watch(mmr: MMR, args: argparse.Namespace | None = None):
                 # Fetch account summary for footer
                 account_summary = None
                 try:
-                    from trader.messaging.clientserver import consume
-                    acct_vals = consume(mmr._rpc.rpc(return_type=dict).get_account_values())
+                    acct_vals = mmr._account_values()
                     if acct_vals:
                         account_summary = {}
                         for key, display in (('TotalCashValue', 'cash'), ('AvailableFunds', 'available'), ('NetLiquidation', 'net_liq')):
@@ -10920,16 +11487,38 @@ def _build_completer(parser: argparse.ArgumentParser):
     return MMRCompleter()
 
 
+def _repl_history():
+    """prompt_toolkit history for the interactive REPL.
+
+    Prefer ``~/.local/share/mmr/logs/.mmr_repl_history`` — that directory is
+    bind-mounted writable in the split-container topology (root FS is
+    ``read_only: true``, so the old ``~/.local/share/mmr/.mmr_repl_history``
+    path raises ``EROFS``). Fall back through ``$TMPDIR`` then in-memory so
+    a read-only host never crashes the REPL on Enter.
+    """
+    import os
+    from prompt_toolkit.history import FileHistory, InMemoryHistory
+
+    candidates = [
+        Path('~/.local/share/mmr/logs').expanduser() / '.mmr_repl_history',
+        Path(os.environ.get('TMPDIR') or '/tmp') / '.mmr_repl_history',
+    ]
+    for history_file in candidates:
+        try:
+            history_file.parent.mkdir(parents=True, exist_ok=True)
+            with open(history_file, 'a'):
+                pass
+            return FileHistory(str(history_file))
+        except OSError:
+            continue
+    return InMemoryHistory()
+
+
 def repl(mmr: MMR):
     """Interactive REPL with prompt_toolkit."""
     from prompt_toolkit import PromptSession
     from prompt_toolkit.auto_suggest import AutoSuggestFromHistory
-    from prompt_toolkit.history import FileHistory
     from prompt_toolkit.key_binding import KeyBindings
-
-    history_dir = Path('~/.local/share/mmr').expanduser()
-    history_dir.mkdir(parents=True, exist_ok=True)
-    history_file = history_dir / '.mmr_repl_history'
 
     parser = build_parser()
 
@@ -10964,7 +11553,7 @@ def repl(mmr: MMR):
         return [(style, f'[{tag}]'), ('', ' mmr> ')]
 
     session = PromptSession(
-        history=FileHistory(str(history_file)),
+        history=_repl_history(),
         auto_suggest=AutoSuggestFromHistory(),
         completer=_build_completer(parser),
         vi_mode=vi_mode[0],
@@ -11026,8 +11615,25 @@ def repl(mmr: MMR):
 # Entry point
 # ------------------------------------------------------------------
 
-_LOCAL_ONLY_COMMANDS = {'backtest', 'bt', 'data', 'propose', 'proposals', 'reject', 'market-hours', 'mh', 'session', 'group', 'research'}
-_LOCAL_ONLY_STRAT_ACTIONS = {'create', 'deploy', 'undeploy', 'signals', 'backtest'}
+# These commands use typed RPC (42101/42102 / strategy 42104/42105) or are fully
+# local — skip legacy dill connect on port 42001 (unbound in split containers).
+_LOCAL_ONLY_COMMANDS = {
+    'backtest', 'bt', 'data', 'propose', 'proposals', 'reject', 'resolve',
+    'portfolio', 'p', 'portfolio-snapshot', 'psnap', 'portfolio-diff', 'pdiff',
+    'portfolio-risk', 'prisk',
+    'positions', 'orders', 'trades', 'account', 'status', 's',
+    'snapshot', 'snap', 'snapshot-batch', 'depth',
+    'risk-limits', 'rl', 'reconcile', 'diagnose', 'approve', 'listen',
+    'ideas', 'scan-ideas',
+    'market-hours', 'mh', 'session', 'group', 'research',
+}
+# strategies list/enable/disable/reload hit strategy typed ports; create/deploy
+# etc. are YAML-local. Legacy connect is never needed for strategies/*.
+_LOCAL_ONLY_STRAT_ACTIONS = {
+    'create', 'deploy', 'undeploy', 'signals', 'backtest',
+    'enable', 'disable', 'reload', 'inspect', 'available', 'avail', 'list-files',
+    None,  # default list action
+}
 
 
 def main():

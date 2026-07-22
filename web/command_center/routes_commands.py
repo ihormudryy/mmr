@@ -193,16 +193,84 @@ def _command_api_error_handler(request: Request, exc: CommandApiError) -> JSONRe
                                           exc.correlation_id))
 
 
+_LOOPBACK_HOSTS = frozenset({"localhost", "127.0.0.1", "::1"})
+
+
+def _split_netloc(netloc: str) -> tuple[str, int | None]:
+    """Split ``host[:port]`` or ``[ipv6]:port`` into host + optional port."""
+    netloc = (netloc or "").strip().lower()
+    if not netloc:
+        return "", None
+    if netloc.startswith("["):
+        host_part, _, port_str = netloc.partition("]")
+        host = host_part.strip("[]").lower()
+        port_str = port_str.lstrip(":")
+    else:
+        host, _, port_str = netloc.rpartition(":")
+        if port_str.isdigit():
+            host = host.lower()
+        else:
+            host = netloc.lower()
+            port_str = ""
+    port = int(port_str) if port_str.isdigit() else None
+    return host, port
+
+
+def _canonical_host(host: str) -> str:
+    return "loopback" if host in _LOOPBACK_HOSTS else host
+
+
+def _same_origin_netloc(origin_netloc: str, host_header: str) -> bool:
+    """True when two Host/Origin netlocs refer to the same dashboard origin."""
+    oh, op = _split_netloc(origin_netloc)
+    hh, hp = _split_netloc(host_header)
+    if _canonical_host(oh) != _canonical_host(hh):
+        return False
+    if op is not None and hp is not None:
+        return op == hp
+    return True
+
+
+def _request_host(request: Request) -> str:
+    forwarded = request.headers.get("x-forwarded-host", "")
+    if forwarded:
+        return forwarded.split(",", 1)[0].strip()
+    return request.headers.get("host", "")
+
+
+def _header_matches_host(header_value: str, host: str) -> bool:
+    parsed = urlsplit(header_value)
+    return (parsed.scheme in ("http", "https")
+            and _same_origin_netloc(parsed.netloc, host))
+
+
 def _check_origin(request: Request) -> None:
-    origin = request.headers.get("origin")
-    host = request.headers.get("host", "")
-    if not origin or not host:
+    """Same-origin gate for JSON command API routes (``/api/commands/*``).
+
+    HTML form POST routes under ``web/app.py`` intentionally skip this check
+    and rely on session cookie + CSRF instead — browser Origin/Host pairs are
+    too flaky behind port maps and loopback aliases for deploy/watchlists.
+    """
+    host = _request_host(request)
+    if not host:
         raise CommandApiError(403, "ORIGIN_REJECTED",
                               "mutations require a same-origin browser request")
-    parsed = urlsplit(origin)
-    if parsed.scheme not in ("http", "https") or parsed.netloc != host:
-        raise CommandApiError(403, "ORIGIN_REJECTED",
-                              "cross-origin mutation rejected")
+
+    sec_fetch_site = (request.headers.get("sec-fetch-site") or "").lower()
+    if sec_fetch_site == "same-origin":
+        return
+
+    origin = request.headers.get("origin")
+    if origin and origin.lower() != "null":
+        if _header_matches_host(origin, host):
+            return
+
+    referer = request.headers.get("referer")
+    if referer and _header_matches_host(referer, host):
+        return
+
+    raise CommandApiError(403, "ORIGIN_REJECTED",
+                          "cross-origin mutation rejected")
 
 
 def require_session(request: Request) -> str:
@@ -380,6 +448,7 @@ class ClosePositionBody(BaseModel):
 # pass-through to the coordinator.
 _PREFLIGHT_ACTIONS = (
     "approve_proposal", "resume_trading", "cancel_order", "cancel_orders",
+    "activate_allocation", "activate_paper_automation",
 )
 
 
@@ -628,6 +697,45 @@ class ResumeTradingBody(BaseModel):
     preflight_nonce: str | None = None
 
 
+class ActivateAllocationBody(BaseModel):
+    """Mirrors ``ActivateAllocationRequest``. Coordinator requires a
+    preflight nonce in both paper and live (``requires_preflight=True``);
+    private-key signing stays offline — this body only carries already-
+    signed attestation JSON."""
+
+    model_config = ConfigDict(extra="forbid")
+    command_id: str = _COMMAND_ID
+    attestation: dict[str, Any]
+    reason: str = Field(min_length=1, max_length=200)
+    preflight_nonce: str | None = None
+
+
+class SuspendAllocationBody(BaseModel):
+    """Risk-reducing: deactivate active allocation authority. No nonce."""
+
+    model_config = ConfigDict(extra="forbid")
+    command_id: str = _COMMAND_ID
+    reason: str = Field(min_length=1, max_length=200)
+
+
+class ActivatePaperAutomationBody(BaseModel):
+    """Prepare restart-required paper automation configuration."""
+
+    model_config = ConfigDict(extra="forbid")
+    command_id: str = _COMMAND_ID
+    strategy_name: str = Field(min_length=1)
+    reason: str = Field(min_length=1, max_length=200)
+    preflight_nonce: str | None = None
+
+
+class DeactivatePaperAutomationBody(BaseModel):
+    """Persist paper automation disablement; no preflight is required."""
+
+    model_config = ConfigDict(extra="forbid")
+    command_id: str = _COMMAND_ID
+    reason: str = Field(min_length=1, max_length=200)
+
+
 @router.post("/api/commands/strategies/{strategy_name}/enable")
 def enable_strategy(strategy_name: str, body: StrategyControlBody, request: Request,
                     session: str = Depends(require_command_auth)):
@@ -704,11 +812,84 @@ def resume_trading(body: ResumeTradingBody, request: Request,
     return _receipt_json(receipt)
 
 
+@router.post("/api/commands/allocation/activate")
+def activate_allocation(body: ActivateAllocationBody, request: Request,
+                        session: str = Depends(require_command_auth)):
+    # Always requires a preflight nonce (coordinator ``requires_preflight=True``),
+    # in both paper and live. Signing stays offline; this route only forwards
+    # already-signed attestation JSON. Unlike approve/cancel, presence of a
+    # nonce is NOT a live-only signal here — do not gate on
+    # ``live_commands_enabled`` via ``_reject_live_targeted_without_flag``.
+    if body.preflight_nonce is None:
+        raise CommandApiError(428, "PREFLIGHT_REQUIRED",
+                              "activate_allocation requires a preflight nonce")
+    receipt = _gateway(request).execute("activate_allocation", {
+        "command_id": body.command_id,
+        "attestation": body.attestation,
+        "reason": body.reason,
+        "preflight_nonce": body.preflight_nonce,
+        "session_fingerprint": session_fingerprint(session),
+    })
+    return _receipt_json(receipt)
+
+
+@router.post("/api/commands/allocation/suspend")
+def suspend_allocation(body: SuspendAllocationBody, request: Request,
+                       session: str = Depends(require_command_auth)):
+    # Risk-reducing: immediate in both modes, no live-gate / nonce.
+    receipt = _gateway(request).execute("suspend_allocation", {
+        "command_id": body.command_id,
+        "reason": body.reason,
+    })
+    return _receipt_json(receipt)
+
+
+@router.post("/api/commands/paper-automation/activate")
+def activate_paper_automation(
+    body: ActivatePaperAutomationBody,
+    request: Request,
+    session: str = Depends(require_command_auth),
+):
+    # Always requires a preflight nonce (coordinator requires_preflight=True),
+    # in both paper and live — same session binding as activate_allocation.
+    if body.preflight_nonce is None:
+        raise CommandApiError(
+            428, "PREFLIGHT_REQUIRED",
+            "activate_paper_automation requires a preflight nonce",
+        )
+    receipt = _gateway(request).execute("activate_paper_automation", {
+        "command_id": body.command_id,
+        "strategy_name": body.strategy_name,
+        "reason": body.reason,
+        "preflight_nonce": body.preflight_nonce,
+        "session_fingerprint": session_fingerprint(session),
+    })
+    return _receipt_json(receipt)
+
+
+@router.post("/api/commands/paper-automation/deactivate")
+def deactivate_paper_automation(
+    body: DeactivatePaperAutomationBody,
+    request: Request,
+    session: str = Depends(require_command_auth),
+):
+    receipt = _gateway(request).execute("deactivate_paper_automation", {
+        "command_id": body.command_id,
+        "reason": body.reason,
+    })
+    return _receipt_json(receipt)
+
+
 @router.post("/api/preflight")
 def preflight(body: PreflightBody, request: Request,
              session: str = Depends(require_command_auth)):
     flags: CommandFlags = request.app.state.command_flags
-    if not flags.live_commands_enabled:
+    # Allocation and paper-automation activation always need a nonce, even on
+    # paper. Other preflight actions are live-only.
+    if (not flags.live_commands_enabled
+            and body.action not in {
+                "activate_allocation", "activate_paper_automation",
+            }):
         raise CommandApiError(403, "LIVE_COMMANDS_DISABLED",
                               "live commands are disabled "
                               "(DASHBOARD_LIVE_COMMANDS_ENABLED=false)")

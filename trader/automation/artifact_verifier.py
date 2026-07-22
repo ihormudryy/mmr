@@ -11,6 +11,12 @@
 7. Expected-binding match (artifact id, allowlist, ruleset, mode, allocation, instruments).
 8. Read-only mount enforcement in live mode (writable mounts are rejected).
 
+P5 signed allocation authorities (``trader.promotion.allocation_attestation``) are a
+separate verification path from P2 eligibility and P4 canary activation — they govern
+the runtime gross-exposure ceiling ladder and are checked by ``AllocationPolicy`` (Task 2),
+not by this verifier. The artifact ``max_gross_allocation`` here remains the research
+bundle ceiling; the signed allocation authority may only ratify a lower runtime ceiling.
+
 Only a ``VerifiedArtifact`` returned by this function may be passed downstream.
 Callers must NOT cache raw attestation dicts or pass strategy-service "verified"
 booleans — every load and every command re-runs the full chain.
@@ -94,6 +100,13 @@ class VerifiedArtifact:
     public_key_id: str
     # Compact reason codes from the eligibility decision (safe to persist)
     verification_reason_codes: Tuple[str, ...]
+    # Attested allowlist/ruleset digests — surfaced (P4 Task 5) so a
+    # downstream binding check (e.g. a canary activation authority's
+    # "unchanged digests" requirement) can compare against the EXACT
+    # digests this verification run just cryptographically confirmed,
+    # without re-parsing attestation.json itself.
+    allowlist_digest: str = ""
+    ruleset_digest: str = ""
 
 
 # ---------------------------------------------------------------------------
@@ -238,6 +251,8 @@ class ArtifactVerifier:
             expires_at=verified.expires_at,
             public_key_id=verified.public_key_id,
             verification_reason_codes=tuple(attestation.reason_codes),
+            allowlist_digest=verified.allowlist_digest,
+            ruleset_digest=verified.ruleset_digest,
         )
 
     # ------------------------------------------------------------------

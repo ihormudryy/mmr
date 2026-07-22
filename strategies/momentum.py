@@ -1,8 +1,16 @@
 """Momentum Strategy using Rate of Change (ROC).
 
-Buys when 10-day momentum crosses above a threshold.
-Sells when 10-day momentum crosses below a negative threshold.
-Uses volume confirmation to filter low-conviction signals.
+Buys when N-PERIOD momentum crosses above a threshold; sells when it
+crosses below the negative threshold. Uses volume confirmation to filter
+low-conviction signals.
+
+PERIODS ARE IN BARS, NOT DAYS — the defaults (roc_period=10,
+roc_threshold=5.0) were designed for DAILY bars ("10-day ROC crosses
+5%"). Deployed on 1-min bars those same numbers mean "a 5% move within
+10 minutes", which essentially never happens in liquid names — the
+strategy is dead as configured. For intraday bars re-parameterize (e.g.
+roc_period 30-60 bars, roc_threshold 0.3-1.0%) and re-validate with a
+backtest before arming.
 """
 
 from trader.trading.strategy import Signal, Strategy
@@ -25,6 +33,10 @@ class Momentum(Strategy):
         roc_period = self.params.get('roc_period', 10)
         roc_threshold = self.params.get('roc_threshold', 5.0)
         vol_avg_period = self.params.get('vol_avg_period', 20)
+        # Volume gate multiplier. 1.0 = "above the rolling average", per the
+        # docstring. The previous hard-coded 0.8 passed BELOW-average volume
+        # — a near-no-op filter that contradicted the documented intent.
+        vol_mult = float(self.params.get('vol_mult', 1.0))
 
         if len(prices) < max(roc_period + 5, vol_avg_period):
             return None
@@ -50,7 +62,7 @@ class Momentum(Strategy):
         volume_confirmed = (
             not np.isnan(avg_volume)
             and not np.isnan(current_volume)
-            and current_volume > avg_volume * 0.8
+            and current_volume > avg_volume * vol_mult
         )
 
         # Buy: ROC crosses above threshold with volume confirmation

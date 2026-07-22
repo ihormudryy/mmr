@@ -4,6 +4,9 @@ Living snapshot of the **deployed/running** state (config, strategies, data, inf
 and the reasoning behind it. Distinct from `AUDIT_ROADMAP.md` (code backlog).
 Update the date + relevant sections when the running config changes.
 
+How to arm unattended paper automation from scratch:
+[`PAPER_AUTOMATION_SETUP.md`](PAPER_AUTOMATION_SETUP.md).
+
 **Last updated: 2026-07-05 (Sun) — paper trading, account `DUM422056`.**
 
 ---

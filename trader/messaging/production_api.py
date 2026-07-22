@@ -82,6 +82,8 @@ from __future__ import annotations
 import asyncio
 import dataclasses
 import datetime as dt
+import logging
+import os
 from dataclasses import asdict
 from decimal import Decimal
 from typing import TYPE_CHECKING, Any, Dict, Literal, Optional
@@ -99,6 +101,7 @@ from trader.messaging.strategy_trader_contracts import (
     ResolveInstrumentRequest,
     ResolveInstrumentResponse,
 )
+from trader.messaging.manage_surface import register_manage_surface
 from trader.messaging.trader_service_api import TraderServiceApi
 from trader.messaging.typed_rpc import (
     HmacServiceAuthenticator,
@@ -165,6 +168,76 @@ def _no_arg_handler(fn):
     return _handler
 
 
+def _finite_or_none(value: Any) -> Optional[float]:
+    """JSON-safe float: NaN/Inf → None (typed RPC uses ``allow_nan=False``)."""
+    try:
+        number = float(value)
+    except (TypeError, ValueError):
+        return None
+    if number != number or number in (float('inf'), float('-inf')):
+        return None
+    return number
+
+
+def _portfolio_summary_to_wire(summary: Any) -> Dict[str, Any]:
+    """Project a ``PortfolioSummary`` (or duck-typed equivalent) to JSON-safe fields."""
+    if isinstance(summary, (list, tuple)) and not hasattr(summary, 'account'):
+        contract, position, mkt_price, mkt_value, avg_cost, unrealized, realized, account, daily = summary
+    else:
+        contract = summary.contract
+        position = summary.position
+        mkt_price = summary.marketPrice
+        mkt_value = summary.marketValue
+        avg_cost = summary.averageCost
+        unrealized = summary.unrealizedPNL
+        realized = summary.realizedPNL
+        account = summary.account
+        daily = summary.dailyPNL
+    if isinstance(contract, dict):
+        con_id = int(contract.get('conId') or 0)
+        symbol = str(contract.get('localSymbol') or contract.get('symbol') or '')
+        sec_type = str(contract.get('secType') or 'STK')
+        currency = str(contract.get('currency') or '')
+        exchange = str(contract.get('exchange') or '')
+        primary = str(contract.get('primaryExchange') or '')
+    else:
+        con_id = int(getattr(contract, 'conId', 0) or 0)
+        symbol = str(getattr(contract, 'localSymbol', None) or getattr(contract, 'symbol', '') or '')
+        sec_type = str(getattr(contract, 'secType', 'STK') or 'STK')
+        currency = str(getattr(contract, 'currency', '') or '')
+        exchange = str(getattr(contract, 'exchange', '') or '')
+        primary = str(getattr(contract, 'primaryExchange', '') or '')
+    return {
+        'account': str(account or ''),
+        'instrument_id': con_id,
+        'symbol': symbol,
+        'security_type': sec_type,
+        'currency': currency,
+        'exchange': exchange,
+        'primary_exchange': primary,
+        'position': float(position or 0.0),
+        'market_price': _finite_or_none(mkt_price) or 0.0,
+        'market_value': _finite_or_none(mkt_value) or 0.0,
+        'average_cost': _finite_or_none(avg_cost) or 0.0,
+        'unrealized_pnl': _finite_or_none(unrealized),
+        'realized_pnl': _finite_or_none(realized),
+        'daily_pnl': _finite_or_none(daily),
+    }
+
+
+def _portfolio_summary_handler(api: TraderServiceApi):
+    """Typed replacement for legacy ``get_portfolio_summary`` (port 42001).
+
+    Uses the trader's sync body directly so the typed server's default
+    ``execution='thread'`` path does not nest another event loop.
+    """
+    def _handler(_body: Dict[str, Any]) -> Dict[str, Any]:
+        sync = getattr(api.trader, '_get_portfolio_summary_sync', None)
+        summaries = sync() if sync is not None else []
+        return {'positions': [_portfolio_summary_to_wire(s) for s in summaries]}
+    return _handler
+
+
 def _instrument_to_wire(definition: Any) -> Dict[str, Any]:
     """Project a resolved ``SecurityDefinition`` down to the JSON-safe fields
     the strategy runtime needs: the six that build an IB ``Contract`` plus the
@@ -182,16 +255,124 @@ def _instrument_to_wire(definition: Any) -> Dict[str, Any]:
     }
 
 
-def _resolve_instrument_handler(api: TraderServiceApi):
-    """Resolve a conId against the trader's OWN universe DB (local lookup, no
-    IB fallback — identical semantics to the legacy ``resolve_symbol``) and
-    return the JSON-safe projection. An empty list means "not in the universe";
-    the strategy treats that as a disabled instrument, exactly as before.
+_INSTRUMENTS_UNIVERSE = '_instruments'
 
-    Async because ``resolve_symbol`` offloads its blocking DuckDB read to a
-    thread — the handler must not run that inline on the shared trader loop."""
+
+def _stub_security_definition(instrument_id: int):
+    """Minimal SecurityDefinition for fake-broker / offline seeding.
+
+    Carries enough fields for ``_instrument_to_wire`` + Contract construction.
+    Symbol is ``C{conId}`` — operators should replace via real IB discovery
+    before live trading; this exists so paper/fake multi-strategy books with
+    YAML conIds don't stay stuck in ERROR on an empty universe DB.
+    """
+    from trader.data.data_access import SecurityDefinition
+    return SecurityDefinition(
+        symbol=f'C{int(instrument_id)}',
+        exchange='SMART',
+        conId=int(instrument_id),
+        secType='STK',
+        primaryExchange='NASDAQ',
+        currency='USD',
+        tradingClass='',
+        includeExpired=False,
+        secIdType='',
+        secId='',
+        description='',
+        minTick=0.01,
+        orderTypes='',
+        validExchanges='',
+        priceMagnifier=1.0,
+        longName='',
+        category='',
+        subcategory='',
+        tradingHours='',
+        timeZoneId='America/New_York',
+        liquidHours='',
+        stockType='',
+        minSize=1.0,
+        sizeIncrement=1.0,
+        suggestedSizeIncrement=1.0,
+        bondType='',
+        couponType='',
+        callable=False,
+        putable=False,
+        coupon=0.0,
+        convertable=False,
+        maturity='',
+        issueDate='',
+        nextOptionDate='',
+        nextOptionPartial=False,
+        nextOptionType='',
+        marketRuleIds='',
+    )
+
+
+def _cache_resolved_instrument(api: TraderServiceApi, definition) -> None:
+    """Persist a newly qualified SecurityDefinition into a bookkeeping
+    universe so later local resolves and publish_instrument succeed."""
+    try:
+        trader = api.trader
+        accessor = getattr(trader, 'universe_accessor', None)
+        if accessor is None:
+            from trader.data.universe import UniverseAccessor
+            accessor = UniverseAccessor(trader.duckdb_path, trader.universe_library)
+        universe = accessor.get(_INSTRUMENTS_UNIVERSE)
+        if any(int(d.conId) == int(definition.conId) for d in universe.security_definitions):
+            return
+        accessor.insert(_INSTRUMENTS_UNIVERSE, definition)
+    except Exception as exc:  # noqa: BLE001 - resolve still succeeds; cache is best-effort
+        logging.warning(
+            'failed to cache instrument %s into %s: %s',
+            getattr(definition, 'conId', '?'), _INSTRUMENTS_UNIVERSE, exc,
+        )
+
+
+async def _ensure_instrument(api: TraderServiceApi, instrument_id: int) -> list:
+    """Local resolve, then exact-conId IB qualify, then fake-broker stub.
+
+    Shared by ``resolve_instrument`` and ``publish_instrument`` so a strategy
+    that just resolved an instrument can also publish it without a second
+    local-only miss.
+    """
+    definitions = await api.resolve_symbol(instrument_id)
+    if definitions:
+        return definitions
+    try:
+        definitions = await api.resolve_contract(Contract(conId=instrument_id))
+    except Exception as exc:  # noqa: BLE001 - fall through to stub/empty
+        logging.warning(
+            'resolve_contract(%s) failed during instrument resolve: %s',
+            instrument_id, exc,
+        )
+        definitions = []
+    if not definitions and os.environ.get('MMR_FAKE_BROKER') == '1':
+        # Env check (not _fake_broker_enabled()) — connect() already enforced
+        # the fail-loud gate; calling it again from a query handler can raise
+        # mid-request if account flags drift.
+        definitions = [_stub_security_definition(instrument_id)]
+    if definitions:
+        _cache_resolved_instrument(api, definitions[0])
+        cached = await api.resolve_symbol(instrument_id)
+        if cached:
+            return cached
+    return definitions
+
+
+def _resolve_instrument_handler(api: TraderServiceApi):
+    """Resolve a conId for strategy subscription.
+
+    Prefer the trader's local universe DB (same as legacy ``resolve_symbol``).
+    On a miss, qualify the *exact* conId via IB ``reqContractDetails`` —
+    ``Contract(conId=N)`` is an unambiguous primary-key lookup, not a fuzzy
+    symbol search — and cache the definition so subsequent resolves and
+    ``publish_instrument`` hit the local DB.
+
+    Under ``MMR_FAKE_BROKER=1`` (no IB), seed a stub definition so multi-
+    strategy YAML books with hardcoded conIds can leave ERROR and subscribe.
+    """
     async def _handler(parsed: ResolveInstrumentRequest) -> Dict[str, Any]:
-        definitions = await api.resolve_symbol(parsed.instrument_id)
+        definitions = await _ensure_instrument(api, int(parsed.instrument_id))
         return {"instruments": [_instrument_to_wire(d) for d in definitions]}
     return _handler
 
@@ -204,7 +385,7 @@ def _publish_instrument_handler(api: TraderServiceApi):
     ``publish_contract`` call runs inline on the trader loop where ib_async
     lives, matching the legacy RPC's behaviour."""
     async def _handler(parsed: PublishInstrumentRequest) -> Dict[str, Any]:
-        definitions = await api.resolve_symbol(parsed.instrument_id)
+        definitions = await _ensure_instrument(api, int(parsed.instrument_id))
         if not definitions:
             raise _DispatchProblem(
                 "INSTRUMENT_NOT_FOUND",
@@ -218,7 +399,18 @@ def _publish_instrument_handler(api: TraderServiceApi):
             conId=d.conId, symbol=d.symbol, secType=d.secType, exchange=d.exchange,
             primaryExchange=d.primaryExchange, currency=d.currency,
         )
-        api.publish_contract(contract=contract, delayed=parsed.delayed)
+        try:
+            api.publish_contract(contract=contract, delayed=parsed.delayed)
+        except ConnectionError:
+            # Fake-broker / disconnected IB: instrument is resolved and cached
+            # but there is no live market-data socket. Treat as published so
+            # multi-strategy startup does not crash; reconcile retries later.
+            if os.environ.get('MMR_FAKE_BROKER') != '1':
+                raise
+            logging.warning(
+                'publish_contract(%s) skipped under MMR_FAKE_BROKER (not connected)',
+                parsed.instrument_id,
+            )
         return {"published": True}
     return _handler
 
@@ -317,6 +509,18 @@ class CreateProposalRequest(BaseModel):
     group: str = ""
     max_price_drift_bps: Optional[float] = None
     preflight_nonce: Optional[str] = None
+    # Signal→proposal bridge fields (trader/strategy/signal_proposer.py).
+    # ``source`` attributes the proposal to its origin ("strategy:<name>");
+    # empty means the dashboard. The time-based exit trio round-trips onto
+    # the proposal record's metadata so ``check_exits`` can recover an
+    # executed entry's exit rules via ``list_proposals``. Before these were
+    # declared, extra="forbid" REJECTED every bridge proposal at the wire —
+    # armed auto_execute:propose strategies could not create proposals at
+    # all.
+    source: str = ""
+    max_hold_bars: Optional[int] = None
+    close_by_time: Optional[str] = None  # ISO time "HH:MM:SS"
+    close_by_tz: Optional[str] = None    # IANA tz the time is in
 
     @field_validator("command_id")
     @classmethod
@@ -409,7 +613,11 @@ class PreflightCommandRequest(BaseModel):
     @field_validator("action")
     @classmethod
     def _known_action(cls, value: str) -> str:
-        allowed = {"approve_proposal", "resume_trading", "cancel_order", "cancel_orders", "liquidate_account"}
+        allowed = {
+            "approve_proposal", "resume_trading", "cancel_order", "cancel_orders",
+            "liquidate_account", "activate_live_canary", "activate_allocation",
+            "activate_paper_automation",
+        }
         if value not in allowed:
             raise ValueError(f"action must be one of {sorted(allowed)}")
         return value
@@ -606,6 +814,159 @@ class RecordStateAcknowledgedRequest(BaseModel):
     payload: Dict[str, Any] = {}
 
 
+class ActivateLiveCanaryRequest(BaseModel):
+    """[P4 Task 5] Activates a signed canary authority for exactly one
+    strategy on the trader's OWN pinned live account. ``attestation`` is the
+    full wire form of a ``CanaryAttestation`` produced entirely OFFLINE by
+    ``mmr research canary sign`` -- it carries a signature and public key ID,
+    never a private key. Risk-increasing and live-only, so this ALWAYS
+    requires a preflight nonce (unlike ``resume_trading``, which only
+    requires one when the pinned account mode is live -- a canary authority
+    is definitionally live-only, so there is no paper-mode carve-out here).
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    command_id: str
+    attestation: Dict[str, Any]
+    reason: str = Field(min_length=1, max_length=200)
+    preflight_nonce: Optional[str] = None
+    session_fingerprint: Optional[str] = None
+
+    @field_validator("command_id")
+    @classmethod
+    def _command_id_has_no_colon(cls, value: str) -> str:
+        return _reject_colon_in_command_id(value)
+
+    @field_validator("reason")
+    @classmethod
+    def _reason_is_not_blank(cls, value: str) -> str:
+        if not value.strip():
+            raise ValueError("reason must not be blank")
+        return value.strip()
+
+
+class DeactivateLiveCanaryRequest(BaseModel):
+    """[P4 Task 5] Suspends an ACTIVE canary authority for ``strategy_id``.
+    Risk-reducing (mirrors ``pause_trading``): never requires a preflight
+    nonce."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    command_id: str
+    strategy_id: str
+    reason: str = Field(min_length=1, max_length=200)
+
+    @field_validator("command_id")
+    @classmethod
+    def _command_id_has_no_colon(cls, value: str) -> str:
+        return _reject_colon_in_command_id(value)
+
+    @field_validator("reason")
+    @classmethod
+    def _reason_is_not_blank(cls, value: str) -> str:
+        if not value.strip():
+            raise ValueError("reason must not be blank")
+        return value.strip()
+
+
+class ActivateAllocationRequest(BaseModel):
+    """[P5 Task 3] Activates a signed allocation authority for the trader's
+    pinned account. ``attestation`` is the wire form from offline
+    ``research allocation sign``. Risk-increasing — requires preflight nonce."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    command_id: str
+    attestation: Dict[str, Any]
+    reason: str = Field(min_length=1, max_length=200)
+    preflight_nonce: Optional[str] = None
+    session_fingerprint: Optional[str] = None
+
+    @field_validator("command_id")
+    @classmethod
+    def _command_id_has_no_colon(cls, value: str) -> str:
+        return _reject_colon_in_command_id(value)
+
+    @field_validator("reason")
+    @classmethod
+    def _reason_is_not_blank(cls, value: str) -> str:
+        if not value.strip():
+            raise ValueError("reason must not be blank")
+        return value.strip()
+
+
+class SuspendAllocationRequest(BaseModel):
+    """Suspends the account's active allocation authority (risk-reducing).
+    Mirrors ``deactivate_live_canary``: never requires a preflight nonce."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    command_id: str
+    reason: str = Field(min_length=1, max_length=200)
+
+    @field_validator("command_id")
+    @classmethod
+    def _command_id_has_no_colon(cls, value: str) -> str:
+        return _reject_colon_in_command_id(value)
+
+    @field_validator("reason")
+    @classmethod
+    def _reason_is_not_blank(cls, value: str) -> str:
+        if not value.strip():
+            raise ValueError("reason must not be blank")
+        return value.strip()
+
+
+class ActivatePaperAutomationRequest(BaseModel):
+    """Prepare restart-required paper automation materials and configuration."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    command_id: str
+    strategy_name: str = Field(min_length=1)
+    reason: str = Field(min_length=1, max_length=200)
+    preflight_nonce: Optional[str] = None
+    session_fingerprint: Optional[str] = None
+
+    @field_validator("command_id")
+    @classmethod
+    def _command_id_has_no_colon(cls, value: str) -> str:
+        return _reject_colon_in_command_id(value)
+
+    @field_validator("strategy_name", "reason")
+    @classmethod
+    def _value_is_not_blank(cls, value: str) -> str:
+        if not value.strip():
+            raise ValueError("value must not be blank")
+        return value.strip()
+
+
+class DeactivatePaperAutomationRequest(BaseModel):
+    """Persist paper automation disablement; takes effect after restart."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    command_id: str
+    reason: str = Field(min_length=1, max_length=200)
+
+    @field_validator("command_id")
+    @classmethod
+    def _command_id_has_no_colon(cls, value: str) -> str:
+        return _reject_colon_in_command_id(value)
+
+    @field_validator("reason")
+    @classmethod
+    def _reason_is_not_blank(cls, value: str) -> str:
+        if not value.strip():
+            raise ValueError("reason must not be blank")
+        return value.strip()
+
+
+class GetPaperAutomationStatusRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+
 class GetTradingControlRequest(BaseModel):
     """No fields: this always reads the coordinator's own configured
     account, exactly like the command above never accepts one."""
@@ -654,6 +1015,9 @@ def _create_proposal_action(proposal_service: ProposalCommandService):
             reasoning=body.get("reasoning", ""), confidence=body.get("confidence", 0.0),
             thesis=body.get("thesis", ""), group=body.get("group", ""),
             max_price_drift_bps=body.get("max_price_drift_bps"),
+            max_hold_bars=body.get("max_hold_bars"),
+            close_by_time=body.get("close_by_time"),
+            close_by_tz=body.get("close_by_tz"),
         )
         try:
             record = proposal_service.create_proposal(
@@ -681,10 +1045,15 @@ def _reject_proposal_action(proposal_service: ProposalCommandService):
 def _create_proposal_rpc_handler(coordinator: TradingCommandCoordinator, account_id: Optional[str]):
     def _handler(parsed: CreateProposalRequest) -> Dict[str, Any]:
         payload = parsed.model_dump(exclude={"command_id", "preflight_nonce"})
+        # Attribute the command to its declared origin (the signal→proposal
+        # bridge sends "strategy:<name>") so the proposal record's source —
+        # which check_exits filters on — survives the round trip. Absent or
+        # empty means the dashboard, the previous hard-coded value.
         request = CommandRequest(
             command_id=parsed.command_id, action="create_proposal", account_id=account_id,
             target_type="proposal", target_id="", expected_version=None,
-            body=payload, source="dashboard", preflight_nonce=parsed.preflight_nonce,
+            body=payload, source=parsed.source or "dashboard",
+            preflight_nonce=parsed.preflight_nonce,
         )
         receipt = coordinator.execute(request)
         return _receipt_to_dict(receipt)
@@ -903,6 +1272,130 @@ def _pause_trading_rpc_handler(coordinator: TradingCommandCoordinator, account_i
     return _handler
 
 
+def _activate_live_canary_rpc_handler(coordinator: TradingCommandCoordinator, account_id: Optional[str]):
+    def _handler(parsed: ActivateLiveCanaryRequest) -> Dict[str, Any]:
+        strategy_id = str(parsed.attestation.get("strategy_id", ""))
+        request = CommandRequest(
+            command_id=parsed.command_id, action="activate_live_canary", account_id=account_id,
+            target_type="canary_authority", target_id=strategy_id, expected_version=None,
+            body={"attestation": parsed.attestation, "reason": parsed.reason},
+            # Human-operator-only surface: never "dashboard" (browser
+            # automation) or "strategy_service" (a strategy can never
+            # activate its own live canary) -- enforced again, redundantly,
+            # inside CanaryActivationService.activate itself.
+            source="operator",
+            preflight_nonce=parsed.preflight_nonce, session_fingerprint=parsed.session_fingerprint,
+        )
+        return _receipt_to_dict(coordinator.execute(request))
+    return _handler
+
+
+def _deactivate_live_canary_rpc_handler(coordinator: TradingCommandCoordinator, account_id: Optional[str]):
+    def _handler(parsed: DeactivateLiveCanaryRequest) -> Dict[str, Any]:
+        request = CommandRequest(
+            command_id=parsed.command_id, action="deactivate_live_canary", account_id=account_id,
+            target_type="canary_authority", target_id=parsed.strategy_id, expected_version=None,
+            body={"strategy_id": parsed.strategy_id, "reason": parsed.reason},
+            source="operator",
+        )
+        return _receipt_to_dict(coordinator.execute(request))
+    return _handler
+
+
+def _activate_allocation_rpc_handler(coordinator: TradingCommandCoordinator, account_id: Optional[str]):
+    def _handler(parsed: ActivateAllocationRequest) -> Dict[str, Any]:
+        strategy_id = str(parsed.attestation.get("strategy_id", ""))
+        request = CommandRequest(
+            command_id=parsed.command_id, action="activate_allocation", account_id=account_id,
+            target_type="allocation_authority", target_id=strategy_id, expected_version=None,
+            body={"attestation": parsed.attestation, "reason": parsed.reason},
+            source="operator",
+            preflight_nonce=parsed.preflight_nonce, session_fingerprint=parsed.session_fingerprint,
+        )
+        return _receipt_to_dict(coordinator.execute(request))
+    return _handler
+
+
+def _suspend_allocation_rpc_handler(coordinator: TradingCommandCoordinator, account_id: Optional[str]):
+    def _handler(parsed: SuspendAllocationRequest) -> Dict[str, Any]:
+        request = CommandRequest(
+            command_id=parsed.command_id, action="suspend_allocation", account_id=account_id,
+            target_type="allocation_authority", target_id=account_id or "", expected_version=None,
+            body={"reason": parsed.reason},
+            source="operator",
+        )
+        return _receipt_to_dict(coordinator.execute(request))
+    return _handler
+
+
+def _paper_automation_action(paper_automation_service, *, activate: bool):
+    """Translate coded activation refusals into command receipts."""
+    from trader.automation.paper_activation import PaperAutomationActivationError
+    from trader.automation.paper_materials import PaperMaterialsError
+
+    def _action(command: CommandRequest) -> Dict[str, Any]:
+        try:
+            if activate:
+                return paper_automation_service.activate(
+                    strategy_name=command.body["strategy_name"],
+                    reason=command.body["reason"],
+                )
+            return paper_automation_service.deactivate(reason=command.body["reason"])
+        except PaperAutomationActivationError as exc:
+            raise CommandValidationError(exc.code, str(exc)) from exc
+        except (PaperMaterialsError, FileExistsError) as exc:
+            raise CommandValidationError("PAPER_MATERIALS_ERROR", str(exc)) from exc
+
+    return _action
+
+
+def _activate_paper_automation_rpc_handler(
+    coordinator: TradingCommandCoordinator, account_id: Optional[str],
+):
+    def _handler(parsed: ActivatePaperAutomationRequest) -> Dict[str, Any]:
+        request = CommandRequest(
+            command_id=parsed.command_id,
+            action="activate_paper_automation",
+            account_id=account_id,
+            target_type="paper_automation",
+            target_id=parsed.strategy_name,
+            expected_version=None,
+            body={"strategy_name": parsed.strategy_name, "reason": parsed.reason},
+            source="dashboard",
+            preflight_nonce=parsed.preflight_nonce,
+            session_fingerprint=parsed.session_fingerprint,
+        )
+        return _receipt_to_dict(coordinator.execute(request))
+
+    return _handler
+
+
+def _deactivate_paper_automation_rpc_handler(
+    coordinator: TradingCommandCoordinator, account_id: Optional[str],
+):
+    def _handler(parsed: DeactivatePaperAutomationRequest) -> Dict[str, Any]:
+        request = CommandRequest(
+            command_id=parsed.command_id,
+            action="deactivate_paper_automation",
+            account_id=account_id,
+            target_type="paper_automation",
+            target_id=account_id or "",
+            expected_version=None,
+            body={"reason": parsed.reason},
+            source="operator",
+        )
+        return _receipt_to_dict(coordinator.execute(request))
+
+    return _handler
+
+
+def _get_paper_automation_status_handler(paper_automation_service):
+    def _handler(_parsed: GetPaperAutomationStatusRequest) -> Dict[str, Any]:
+        return dataclasses.asdict(paper_automation_service.status())
+
+    return _handler
+
+
 def _liquidate_account_rpc_handler(coordinator: TradingCommandCoordinator, account_id: Optional[str]):
     def _handler(parsed: LiquidateAccountRequest) -> Dict[str, Any]:
         request = CommandRequest(
@@ -1039,8 +1532,96 @@ def _preflight_command_handler(
                 "side": "RESUME",
                 "instrument": "new trading",
                 "order_type": "CONTROL",
+                "reason": reason,
                 "warnings": [
                     "Resume permits new exposure; readiness and reconciliation are checked again on submit."
+                ],
+            })
+        elif parsed.action == "activate_live_canary":
+            exact_params(params, {"attestation", "reason"})
+            attestation = params["attestation"]
+            if not isinstance(attestation, dict):
+                reject("attestation must be an object")
+            reason = str(params["reason"]).strip()
+            if not reason:
+                reject("activation reason must not be blank")
+            strategy_id = str(attestation.get("strategy_id", ""))
+            request = CommandRequest(
+                command_id=parsed.command_id,
+                action=parsed.action,
+                account_id=account_id,
+                target_type="canary_authority",
+                target_id=strategy_id,
+                expected_version=None,
+                body={"attestation": attestation, "reason": reason},
+                source="operator",
+                session_fingerprint=parsed.session_fingerprint,
+            )
+            summary.update({
+                "side": "ACTIVATE_CANARY",
+                "instrument": strategy_id,
+                "order_type": "LIVE_CANARY_AUTHORITY",
+                "warnings": [
+                    "Live canary authority is re-verified in full (signature, policy, "
+                    "expiry, revocation, exact bindings) again on submit.",
+                ],
+            })
+        elif parsed.action == "activate_allocation":
+            exact_params(params, {"attestation", "reason"})
+            attestation = params["attestation"]
+            if not isinstance(attestation, dict):
+                reject("attestation must be an object")
+            reason = str(params["reason"]).strip()
+            if not reason:
+                reject("activation reason must not be blank")
+            strategy_id = str(attestation.get("strategy_id", ""))
+            request = CommandRequest(
+                command_id=parsed.command_id,
+                action=parsed.action,
+                account_id=account_id,
+                target_type="allocation_authority",
+                target_id=strategy_id,
+                expected_version=None,
+                body={"attestation": attestation, "reason": reason},
+                source="operator",
+                session_fingerprint=parsed.session_fingerprint,
+            )
+            summary.update({
+                "side": "ACTIVATE_ALLOCATION",
+                "instrument": strategy_id,
+                "order_type": "ALLOCATION_AUTHORITY",
+                "warnings": [
+                    "Allocation authority is re-verified in full (signature, policy, "
+                    "expiry, revocation, exact bindings) again on submit.",
+                ],
+            })
+        elif parsed.action == "activate_paper_automation":
+            exact_params(params, {"strategy_name", "reason"})
+            strategy_name = str(params["strategy_name"]).strip()
+            reason = str(params["reason"]).strip()
+            if not strategy_name:
+                reject("strategy_name must not be blank")
+            if not reason:
+                reject("activation reason must not be blank")
+            request = CommandRequest(
+                command_id=parsed.command_id,
+                action=parsed.action,
+                account_id=account_id,
+                target_type="paper_automation",
+                target_id=strategy_name,
+                expected_version=None,
+                body={"strategy_name": strategy_name, "reason": reason},
+                source="dashboard",
+                session_fingerprint=parsed.session_fingerprint,
+            )
+            summary.update({
+                "side": "ACTIVATE_PAPER_AUTOMATION",
+                "instrument": strategy_name,
+                "order_type": "PAPER_AUTOMATION",
+                "reason": reason,
+                "warnings": [
+                    "Writes keys/artifact/YAML and returns restart_required; "
+                    "services must restart to arm IntentEmitter.",
                 ],
             })
         elif parsed.action == "cancel_order":
@@ -1147,6 +1728,9 @@ def register_command_authority(
     liquidation_service=None,
     strategy_control_service: Optional[StrategyControlCommandService] = None,
     automated_intent_service=None,
+    canary_service=None,
+    allocation_service=None,
+    paper_automation_service=None,
 ) -> None:
     """Wire the command-authority surface onto ``registry``.
 
@@ -1198,6 +1782,17 @@ def register_command_authority(
     internal strategy_service -> trader acknowledgement, not a
     user-initiated command, so it carries no ledger/audit row of its own).
     Omitted (the default) leaves the strategy-control surface unregistered.
+
+    [P4 Task 5]: when ``canary_service`` (a ``CanaryActivationService``) is
+    also supplied, ALSO registers ``activate_live_canary`` (non-saga --
+    stage-machine + authority-store transitions are the whole action, no
+    broker order is dispatched; ALWAYS requires a preflight nonce, since a
+    canary authority is definitionally live-only) and
+    ``deactivate_live_canary`` (non-saga, risk-reducing, never requires a
+    preflight nonce -- mirrors ``pause_trading``). Omitted (the default)
+    leaves the live-canary surface unregistered, which is the case until an
+    operator's canary public-key ring is configured (see
+    ``command_stack.build_command_stack``).
     """
     if any(service is not None for service in (controls, preflight_nonces, approval_service,
                                                 cancel_service)):
@@ -1329,6 +1924,62 @@ def register_command_authority(
         registry.register(
             "command", "record_state_acknowledged", RecordStateAcknowledgedRequest, dict,
             _record_state_acknowledged_handler(strategy_control_service),
+        )
+
+    if canary_service is not None:
+        coordinator.register_action(
+            "activate_live_canary", canary_service.activate, requires_preflight=True,
+        )
+        coordinator.register_action(
+            "deactivate_live_canary", canary_service.deactivate, requires_preflight=False,
+        )
+        registry.register(
+            "command", "activate_live_canary", ActivateLiveCanaryRequest, dict,
+            _activate_live_canary_rpc_handler(coordinator, account_id),
+        )
+        registry.register(
+            "command", "deactivate_live_canary", DeactivateLiveCanaryRequest, dict,
+            _deactivate_live_canary_rpc_handler(coordinator, account_id),
+        )
+
+    if allocation_service is not None:
+        coordinator.register_action(
+            "activate_allocation", allocation_service.activate, requires_preflight=True,
+        )
+        coordinator.register_action(
+            "suspend_allocation", allocation_service.suspend, requires_preflight=False,
+        )
+        registry.register(
+            "command", "activate_allocation", ActivateAllocationRequest, dict,
+            _activate_allocation_rpc_handler(coordinator, account_id),
+        )
+        registry.register(
+            "command", "suspend_allocation", SuspendAllocationRequest, dict,
+            _suspend_allocation_rpc_handler(coordinator, account_id),
+        )
+
+    if paper_automation_service is not None:
+        coordinator.register_action(
+            "activate_paper_automation",
+            _paper_automation_action(paper_automation_service, activate=True),
+            requires_preflight=True,
+        )
+        coordinator.register_action(
+            "deactivate_paper_automation",
+            _paper_automation_action(paper_automation_service, activate=False),
+            requires_preflight=False,
+        )
+        registry.register(
+            "command", "activate_paper_automation", ActivatePaperAutomationRequest, dict,
+            _activate_paper_automation_rpc_handler(coordinator, account_id),
+        )
+        registry.register(
+            "command", "deactivate_paper_automation", DeactivatePaperAutomationRequest, dict,
+            _deactivate_paper_automation_rpc_handler(coordinator, account_id),
+        )
+        registry.register(
+            "query", "get_paper_automation_status", GetPaperAutomationStatusRequest, dict,
+            _get_paper_automation_status_handler(paper_automation_service),
         )
 
     if automated_intent_service is not None:
@@ -1475,6 +2126,11 @@ def build_production_registry(
     # Read: account balances (cash, net liquidation, buying power, etc.),
     # scoped to the configured account — see TraderServiceApi.get_account_values.
     registry.register('query', 'get_account_values', dict, dict, _no_arg_handler(api.get_account_values))
+    # Read: portfolio rows with P&L — typed replacement for legacy dill
+    # ``get_portfolio_summary`` (port 42001 is unbound in split containers).
+    registry.register(
+        'query', 'get_portfolio_summary', dict, dict, _portfolio_summary_handler(api),
+    )
     # Read: current risk-gate limits. Note this is the READ half only —
     # there is deliberately no typed `set_risk_limits` query or command here;
     # mutating limits stays behind the offline-simulation legacy path until
@@ -1498,6 +2154,9 @@ def build_production_registry(
         'query', 'publish_instrument', PublishInstrumentRequest,
         PublishInstrumentResponse, _publish_instrument_handler(api),
     )
+    register_manage_surface(registry, api)
+    from trader.messaging.cli_surface import register_cli_surface
+    register_cli_surface(registry, api)
 
     if command_stack is not None:
         register_command_authority(
@@ -1514,6 +2173,10 @@ def build_production_registry(
             approval_service=command_stack.approval_service,
             cancel_service=command_stack.cancel_service,
             liquidation_service=command_stack.liquidation_service,
+            canary_service=command_stack.canary_service,
+            allocation_service=command_stack.allocation_service,
+            paper_automation_service=command_stack.paper_automation_service,
+            automated_intent_service=command_stack.automated_intent_service,
         )
         register_strategy_state_ingest(registry, command_stack.journal)
     elif command_coordinator is not None and proposal_service is not None and proposal_repository is not None:

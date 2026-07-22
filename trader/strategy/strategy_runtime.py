@@ -19,6 +19,12 @@ from trader.messaging.clientserver import (
     RPCServer,
     TopicPubSub
 )
+from trader.messaging.manage_contracts import (
+    DisableStrategyByNameRequest,
+    EnableStrategyByNameRequest,
+    ListStrategiesRequest,
+    ReloadStrategiesRequest,
+)
 from trader.messaging.typed_rpc import (
     HmacServiceAuthenticator,
     TypedRpcClient,
@@ -77,6 +83,48 @@ def _whattoshow_for_contract(contract: Contract) -> WhatToShow:
     if sec_type == 'CASH':
         return WhatToShow.MIDPOINT
     return WhatToShow.TRADES
+
+
+def _apply_uppercase_params(instance: Strategy, params: Dict[str, Any]) -> None:
+    """Apply upper-case config params as instance-attribute overrides.
+
+    Mirrors ``Backtester.apply_param_overrides`` so a deployment's
+    ``params: {VOLUME_MULT: 1.3}`` means the same thing live as in the
+    backtest that validated it: the value shadows the upper-case class
+    attribute via ``setattr`` on the instance. The value is coerced to the
+    class attribute's current type (YAML usually delivers the right type
+    already); an upper-case key with no matching class attribute raises
+    ``ValueError`` naming the known tunables — a config typo must refuse the
+    load, not silently run with defaults. Lower-case keys are left alone
+    (they live in ``StrategyContext.params`` for ``self.params.get(...)``).
+    """
+    cls = type(instance)
+    known = [k for k in dir(cls) if k.isupper() and not k.startswith('_')]
+    for key, raw in (params or {}).items():
+        if not isinstance(key, str) or not key.isupper():
+            continue
+        if not hasattr(cls, key):
+            raise ValueError(
+                f'unknown upper-case param {key!r} for {cls.__name__} — '
+                f'known tunables: {sorted(known)}')
+        current = getattr(cls, key)
+        try:
+            if isinstance(current, bool):
+                value = (raw.strip().lower() in ('1', 'true', 'yes', 'on')
+                         if isinstance(raw, str) else bool(raw))
+            elif isinstance(current, int) and not isinstance(current, bool):
+                value = int(raw)
+            elif isinstance(current, float):
+                value = float(raw)
+            elif isinstance(current, str):
+                value = str(raw)
+            else:
+                value = raw
+        except (TypeError, ValueError) as exc:
+            raise ValueError(
+                f'param {key}={raw!r} not coercible to '
+                f'{type(current).__name__}: {exc}') from exc
+        setattr(instance, key, value)
 
 
 class ControlRevisionConflict(Exception):
@@ -174,6 +222,108 @@ def _get_strategy_receipt_handler(runtime: 'StrategyRuntime'):
     return _handler
 
 
+def _strategy_row(config: StrategyConfig) -> Dict[str, Any]:
+    state = config.state.name if hasattr(config.state, 'name') else str(config.state)
+    return {
+        'name': config.name,
+        'state': state,
+        'bar_size': str(config.bar_size) if config.bar_size is not None else None,
+        'conids': list(config.conids or []),
+        'universe': config.universe,
+        'class_name': config.class_name,
+        'description': config.description,
+        'auto_execute': config.auto_execute,
+        'params': dict(config.params or {}),
+    }
+
+
+def _list_strategies_handler(runtime: 'StrategyRuntime'):
+    def _handler(_parsed: ListStrategiesRequest) -> Dict[str, Any]:
+        rows = [_strategy_row(StrategyConfig.from_strategy(s))
+                for s in runtime.get_strategies()]
+        return {'strategies': rows}
+    return _handler
+
+
+def _reload_strategies_handler(runtime: 'StrategyRuntime'):
+    async def _handler(_parsed: ReloadStrategiesRequest) -> Dict[str, Any]:
+        await runtime._reconcile()
+        rows = [_strategy_row(StrategyConfig.from_strategy(s))
+                for s in runtime.get_strategies()]
+        return {'ok': True, 'strategies': rows}
+    return _handler
+
+
+def _enable_strategy_by_name_handler(runtime: 'StrategyRuntime'):
+    def _handler(parsed: EnableStrategyByNameRequest) -> Dict[str, Any]:
+        state = runtime.enable_strategy(parsed.strategy_name)
+        name = state.name if hasattr(state, 'name') else str(state)
+        if name == 'ERROR':
+            raise _DispatchProblem('NOT_FOUND', f'strategy {parsed.strategy_name!r} not found')
+        return {'ok': True, 'state': name}
+    return _handler
+
+
+def _disable_strategy_by_name_handler(runtime: 'StrategyRuntime'):
+    def _handler(parsed: DisableStrategyByNameRequest) -> Dict[str, Any]:
+        state = runtime.disable_strategy(parsed.strategy_name)
+        name = state.name if hasattr(state, 'name') else str(state)
+        if name == 'ERROR':
+            raise _DispatchProblem('NOT_FOUND', f'strategy {parsed.strategy_name!r} not found')
+        return {'ok': True, 'state': name}
+    return _handler
+
+
+class PaperAutomationArmError(Exception):
+    """Coded refusal to hot-arm paper automation on strategy_service."""
+
+    def __init__(self, code: str, message: str) -> None:
+        super().__init__(message)
+        self.code = code
+
+
+class ArmPaperAutomationRequest(BaseModel):
+    model_config = ConfigDict(extra='forbid')
+    strategy_name: str
+    artifact_bundle_path: str
+    public_key_ring_path: str
+    expected_artifact_id: str
+
+
+class DisarmPaperAutomationRequest(BaseModel):
+    model_config = ConfigDict(extra='forbid')
+
+
+class GetPaperAutomationArmRequest(BaseModel):
+    model_config = ConfigDict(extra='forbid')
+
+
+def _arm_paper_automation_handler(runtime: 'StrategyRuntime'):
+    def _handler(parsed: ArmPaperAutomationRequest) -> Dict[str, Any]:
+        try:
+            return runtime.arm_paper_automation(
+                strategy_name=parsed.strategy_name,
+                artifact_bundle_path=parsed.artifact_bundle_path,
+                public_key_ring_path=parsed.public_key_ring_path,
+                expected_artifact_id=parsed.expected_artifact_id,
+            )
+        except PaperAutomationArmError as exc:
+            raise _DispatchProblem(exc.code, str(exc)) from exc
+    return _handler
+
+
+def _disarm_paper_automation_handler(runtime: 'StrategyRuntime'):
+    def _handler(_parsed: DisarmPaperAutomationRequest) -> Dict[str, Any]:
+        return runtime.disarm_paper_automation()
+    return _handler
+
+
+def _get_paper_automation_arm_handler(runtime: 'StrategyRuntime'):
+    def _handler(_parsed: GetPaperAutomationArmRequest) -> Dict[str, Any]:
+        return runtime.get_paper_automation_arm()
+    return _handler
+
+
 def register_strategy_control_authority(
     command_registry: TypedRpcRegistry, query_registry: TypedRpcRegistry, runtime: 'StrategyRuntime',
 ) -> None:
@@ -203,6 +353,34 @@ def register_strategy_control_authority(
     query_registry.register(
         'query', 'get_strategy_receipt', _GetStrategyReceiptRequest, dict,
         _get_strategy_receipt_handler(runtime),
+    )
+    query_registry.register(
+        'query', 'list_strategies', ListStrategiesRequest, dict,
+        _list_strategies_handler(runtime), execution='thread',
+    )
+    command_registry.register(
+        'command', 'reload_strategies', ReloadStrategiesRequest, dict,
+        _reload_strategies_handler(runtime),
+    )
+    command_registry.register(
+        'command', 'enable_strategy_by_name', EnableStrategyByNameRequest, dict,
+        _enable_strategy_by_name_handler(runtime), execution='thread',
+    )
+    command_registry.register(
+        'command', 'disable_strategy_by_name', DisableStrategyByNameRequest, dict,
+        _disable_strategy_by_name_handler(runtime), execution='thread',
+    )
+    command_registry.register(
+        'command', 'arm_paper_automation', ArmPaperAutomationRequest, dict,
+        _arm_paper_automation_handler(runtime), execution='thread',
+    )
+    command_registry.register(
+        'command', 'disarm_paper_automation', DisarmPaperAutomationRequest, dict,
+        _disarm_paper_automation_handler(runtime), execution='thread',
+    )
+    query_registry.register(
+        'query', 'get_paper_automation_arm', GetPaperAutomationArmRequest, dict,
+        _get_paper_automation_arm_handler(runtime),
     )
 
 
@@ -242,6 +420,7 @@ class StrategyRuntime():
         automation_public_key_ring_path: str = '',
         automation_expected_artifact_id: str = '',
         automation_strategy_name: str = '',
+        live_authority_enabled: bool = False,
     ):
         self.ib_server_address = ib_server_address
         self.ib_server_port = ib_server_port
@@ -251,6 +430,7 @@ class StrategyRuntime():
         self.universe_library = universe_library
         self.simulation: bool = simulation
         self.paper_trading = paper_trading
+        self.live_authority_enabled = bool(live_authority_enabled)
         self.zmq_pubsub_server_address = zmq_pubsub_server_address
         self.zmq_pubsub_server_port = zmq_pubsub_server_port
         self.zmq_rpc_server_address = zmq_rpc_server_address
@@ -447,17 +627,16 @@ class StrategyRuntime():
             self._trader_gateway = StrategyTraderGateway(
                 query_client=self._trader_query_client)
 
-            # [M1-F3] Task 8: signal → PENDING proposal bridge for
-            # auto_execute: 'propose' strategies (paper mode only; see
-            # signal_proposer.py). Thin typed adapter -- holds no
-            # ProposalStore handle, routes every mutation through the
-            # trader's command-authority coordinator via the typed clients
-            # just constructed above.
+        # [M1-F3] Task 8: signal → PENDING proposal bridge for
+            # auto_execute: 'propose' strategies. Live requires
+            # live_authority_enabled (command_authority.live_enabled).
+            # Thin typed adapter -- holds no ProposalStore handle.
             self.signal_proposer = SignalProposer(
                 command_client=self._trader_command_client,
                 query_client=self._trader_query_client,
                 paper_trading=self.paper_trading,
                 account_id=self.ib_account,
+                live_authority_enabled=bool(self.live_authority_enabled),
             )
             # [P3 Task 9] Intent emitter is built once a verified artifact for
             # the configured one-strategy name is available (see
@@ -521,8 +700,25 @@ class StrategyRuntime():
             if name == implementation.name:
                 state = implementation.enable()
                 self._persist_enabled(name, True)
+                self._announce_and_drain(name)
                 return state
         return StrategyState.ERROR
+
+    def _maybe_recover_from_instrument_error(self, strategy: Strategy) -> None:
+        """If a strategy was forced into ERROR solely because its conIds were
+        missing from the local universe, and those instruments now resolve
+        (and it was previously enabled), move it back to RUNNING so multi-
+        strategy books recover without a manual restart."""
+        if strategy.state != StrategyState.ERROR:
+            return
+        if self._load_enabled(strategy.name) is not True:
+            return
+        strategy.enable()
+        logging.info(
+            'recovered strategy %r from ERROR after instruments became resolvable',
+            strategy.name,
+        )
+        self._announce_and_drain(strategy.name)
 
     @log_method
     def disable_strategy(self, name: str) -> StrategyState:
@@ -530,8 +726,26 @@ class StrategyRuntime():
             if name == implementation.name:
                 state = implementation.disable()
                 self._persist_enabled(name, False)
+                self._announce_and_drain(name)
                 return state
         return StrategyState.ERROR
+
+    def _announce_and_drain(self, name: str) -> None:
+        """Push the new observable state to the trader journal immediately.
+
+        Without this, enable/disable only update local runtime state — the
+        command-center Trading Strategies panel stays stale until the next
+        30s reconcile announces the transition.
+        """
+        try:
+            self._announce_strategy_states()
+        except Exception as ex:
+            logging.warning('announce after %s state change failed: %s', name, ex)
+            return
+        try:
+            self._drain_ack_outbox()
+        except Exception as ex:
+            logging.warning('ack-outbox drain after %s state change failed: %s', name, ex)
 
     @log_method
     def get_strategy(self, name: str) -> Optional[Strategy]:
@@ -579,6 +793,27 @@ class StrategyRuntime():
         if entry is None:
             raise ValueError(
                 f'strategy {name!r} not found in {self.strategy_config_file}')
+
+        # Validate upper-case keys against the live class BEFORE persisting:
+        # upper-case params are instance-attribute overrides (see
+        # _apply_uppercase_params), so a typo'd key would be written to YAML,
+        # fail the reload below, and leave a config on disk that refuses to
+        # load on every restart. Reject it up front instead — the config
+        # must never carry a key the strategy can't apply.
+        live = self.get_strategy(name)
+        if live is not None:
+            cls = type(live)
+            for key, raw in params.items():
+                if not (isinstance(key, str) and key.isupper() and key):
+                    continue
+                if isinstance(raw, str) and raw.strip() == '':
+                    continue  # deletion — always allowed
+                if not hasattr(cls, key):
+                    known = sorted(k for k in dir(cls)
+                                   if k.isupper() and not k.startswith('_'))
+                    raise ValueError(
+                        f'unknown upper-case param {key!r} for {cls.__name__} '
+                        f'— known tunables: {known}')
 
         merged = dict(entry.get('params') or {})
         for key, raw in params.items():
@@ -1152,6 +1387,11 @@ class StrategyRuntime():
                 if self._last_dispatched_bar.get(dkey) == last_bar:
                     continue
                 self._last_dispatched_bar[dkey] = last_bar
+                # Stamp which instrument this dispatch is for BEFORE calling
+                # on_prices — multi-instrument strategies (pairs) read
+                # ``self.dispatch_conid`` instead of guessing identity from
+                # the shape of the data.
+                strategy._dispatch_conid = conId
                 signal = strategy.on_prices(frame)
             except Exception as ex:
                 logging.exception(
@@ -1208,23 +1448,17 @@ class StrategyRuntime():
         # Publish signal via MessageBus for cross-strategy use and subscribers
         self.zmq_messagebus_client.write('signal', signal)
 
-        # auto_execute: propose — signal becomes a PENDING proposal awaiting
-        # human approval (dashboard / `mmr approve`). Guarded separately so a
-        # bridge failure never blocks the record/publish path above.
-        proposer = getattr(self, 'signal_proposer', None)
-        if proposer is not None and strategy.auto_execute == 'propose':
-            try:
-                proposer.on_signal(strategy.name, signal, frame)
-            except Exception:
-                logging.exception(
-                    'signal→proposal bridge failed for %s conId %s',
-                    getattr(strategy, 'name', '?'), conId)
-
-        # [P3 Task 9] Deterministic automation: emit typed ExecutionIntent after
-        # a completed bar. Never constructs IB orders / legacy RPC / journal
-        # writes — IntentEmitter is a thin typed adapter only.
+        # R1 exclusivity: IntentEmitter XOR SignalProposer for the same signal.
+        # When automation is armed for THIS strategy, emit intents only.
         emitter = getattr(self, 'intent_emitter', None)
-        if emitter is not None:
+        auto_name = getattr(self, 'automation_strategy_name', '') or ''
+        emitter_for_this = (
+            emitter is not None
+            and bool(auto_name)
+            and strategy.name == auto_name
+        )
+
+        if emitter_for_this:
             try:
                 last_bar = frame.index[-1]
                 if hasattr(last_bar, 'to_pydatetime'):
@@ -1245,6 +1479,19 @@ class StrategyRuntime():
             except Exception:
                 logging.exception(
                     'intent emitter failed for %s conId %s',
+                    getattr(strategy, 'name', '?'), conId)
+            return
+
+        # auto_execute: propose — signal becomes a PENDING proposal awaiting
+        # human approval (dashboard / `mmr approve`). Guarded separately so a
+        # bridge failure never blocks the record/publish path above.
+        proposer = getattr(self, 'signal_proposer', None)
+        if proposer is not None and strategy.auto_execute == 'propose':
+            try:
+                proposer.on_signal(strategy.name, signal, frame)
+            except Exception:
+                logging.exception(
+                    'signal→proposal bridge failed for %s conId %s',
                     getattr(strategy, 'name', '?'), conId)
 
     def _maybe_build_intent_emitter(self) -> None:
@@ -1288,6 +1535,108 @@ class StrategyRuntime():
             account_mode,
         )
 
+    def get_paper_automation_arm(self) -> Dict[str, Any]:
+        """Read model for hot-arm verify (trader asks strategy after commit)."""
+        armed = (
+            bool(self.automation_enabled)
+            and self.intent_emitter is not None
+            and bool(self.automation_strategy_name)
+        )
+        return {
+            'armed': armed,
+            'strategy_name': self.automation_strategy_name or None,
+            'artifact_id': self.automation_expected_artifact_id or None,
+        }
+
+    def disarm_paper_automation(self) -> Dict[str, Any]:
+        """Clear in-memory IntentEmitter + automation binding (hot-arm teardown)."""
+        self.intent_emitter = None
+        self._verified_artifact = None
+        self._verified_artifact_strategy = None
+        self._artifact_verifier = None
+        self.automation_enabled = False
+        self.automation_strategy_name = ''
+        self.automation_expected_artifact_id = ''
+        self.automation_artifact_bundle_path = ''
+        self.automation_public_key_ring_path = ''
+        logging.info('paper automation disarmed in strategy runtime')
+        return {'ok': True, 'armed': False}
+
+    def arm_paper_automation(
+        self,
+        *,
+        strategy_name: str,
+        artifact_bundle_path: str,
+        public_key_ring_path: str,
+        expected_artifact_id: str,
+    ) -> Dict[str, Any]:
+        """Hot-arm IntentEmitter for one strategy without process restart."""
+        if self.automation_live_enabled:
+            raise PaperAutomationArmError(
+                'LIVE_AUTOMATION_REFUSED',
+                'live automation cannot be hot-armed',
+            )
+        if not self.paper_trading:
+            raise PaperAutomationArmError(
+                'NOT_PAPER',
+                'paper automation hot-arm requires paper_trading=true',
+            )
+        if getattr(self, '_trader_command_client', None) is None:
+            raise PaperAutomationArmError(
+                'TRADER_CLIENT_MISSING',
+                'trader typed command client is not connected; cannot arm IntentEmitter',
+            )
+        name = (strategy_name or '').strip()
+        if not name:
+            raise PaperAutomationArmError(
+                'STRATEGY_NOT_FOUND',
+                'strategy_name is required to arm paper automation',
+            )
+        bundle = (artifact_bundle_path or '').strip()
+        key_ring = (public_key_ring_path or '').strip()
+        artifact_id = (expected_artifact_id or '').strip()
+        if not bundle or not key_ring or not artifact_id:
+            raise PaperAutomationArmError(
+                'AUTOMATION_CONFIG_INCOMPLETE',
+                'artifact_bundle_path, public_key_ring_path, and expected_artifact_id are required',
+            )
+
+        # Clear any prior arm, then bind the new materials.
+        self.intent_emitter = None
+        self._verified_artifact = None
+        self._verified_artifact_strategy = None
+        self._artifact_verifier = None
+
+        self.automation_enabled = True
+        self.automation_live_enabled = False
+        self.automation_artifact_bundle_path = bundle
+        self.automation_public_key_ring_path = key_ring
+        self.automation_expected_artifact_id = artifact_id
+        self.automation_strategy_name = name
+
+        try:
+            self._verify_artifact_at_load(name, bundle)
+        except Exception as exc:
+            self.disarm_paper_automation()
+            raise PaperAutomationArmError(
+                'ARM_FAILED',
+                f'artifact verify failed for {name!r}: {exc}',
+            ) from exc
+
+        if self.intent_emitter is None:
+            self.disarm_paper_automation()
+            raise PaperAutomationArmError(
+                'ARM_FAILED',
+                f'IntentEmitter was not built for strategy {name!r}',
+            )
+
+        return {
+            'ok': True,
+            'armed': True,
+            'strategy_name': name,
+            'artifact_id': artifact_id,
+        }
+
     def _maybe_check_exits(self, strategy: Strategy, conId: int,
                            frame: pd.DataFrame) -> None:
         """Bridge hook: propose time-based exit closes for propose-mode
@@ -1313,7 +1662,13 @@ class StrategyRuntime():
         if contract.conId not in self.strategies:
             self.strategies[contract.conId] = []
             self.strategies[contract.conId].append(strategy)
-            self._trader_gateway.publish_instrument(contract.conId, delayed=False)
+            try:
+                self._trader_gateway.publish_instrument(contract.conId, delayed=False)
+            except Exception as ex:  # noqa: BLE001 - one bad publish must not abort startup
+                logging.warning(
+                    'publish_instrument(%s) failed for strategy %s (will retry on reconcile): %s',
+                    contract.conId, strategy.name, ex,
+                )
         elif contract.conId in self.strategies and strategy not in self.strategies[contract.conId]:
             self.strategies[contract.conId].append(strategy)
 
@@ -1456,6 +1811,23 @@ class StrategyRuntime():
                     params=params if params else {},
                 )
                 instance.install(context)
+
+                # Apply upper-case params as instance-attribute overrides,
+                # mirroring the backtester's apply_param_overrides semantics.
+                # Before this, a deployed `params: {VOLUME_MULT: 1.0}` was
+                # accepted by config and then silently ignored live (only
+                # values a strategy hand-read from self.params applied) — the
+                # armed ORB deployments ran with the class-default 1.5 while
+                # their backtest validation used the configured value. An
+                # unknown upper-case key refuses the load (fail loudly, like
+                # every other config error here); lower-case keys stay in
+                # context.params for the self.params.get(...) idiom.
+                try:
+                    _apply_uppercase_params(instance, params or {})
+                except ValueError as exc:
+                    logging.error('refusing to load strategy %s: %s', name, exc)
+                    return
+
                 # Give the strategy a reference to the runtime for subscriptions
                 instance.strategy_runtime = self
 
@@ -1566,9 +1938,11 @@ class StrategyRuntime():
                         instrument = self._trader_gateway.resolve_instrument(conId)
                         if instrument:
                             self.subscribe(strategy, instrument.to_contract())
+                            self._maybe_recover_from_instrument_error(strategy)
 
                 if strategy.universe:
                     self.subscribe_universe(strategy, strategy.universe)
+                    self._maybe_recover_from_instrument_error(strategy)
         except (TimeoutError, ConnectionError) as ex:
             logging.debug('reconciliation RPC failed (trader_service may be restarting): %s', ex)
 
@@ -1631,11 +2005,15 @@ class StrategyRuntime():
                         if instrument:
                             self.subscribe(strategy, instrument.to_contract())
                         else:
-                            logging.error('could not find security definition for conId {} for strategy {}. Disabling strategy.'
-                                          .format(conId, strategy))
-                            strategy.on_error(
-                                Exception('could not find security definition for conId {} for strategy {}. Disabling strategy.'
-                                          .format(conId, strategy))
+                            # Do NOT force ERROR — a missing local definition is
+                            # often transient (empty DB, trader still starting,
+                            # IB qualify pending). Reconcile retries; permanent
+                            # ERROR blocked every other strategy looking "broken"
+                            # when only instruments were unregistered.
+                            logging.warning(
+                                'could not find security definition for conId %s '
+                                'for strategy %s — will retry on reconcile',
+                                conId, strategy.name,
                             )
                 if strategy.universe:
                     self.subscribe_universe(strategy, strategy.universe)

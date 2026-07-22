@@ -25,6 +25,8 @@ Design notes:
 from __future__ import annotations
 
 import contextlib
+import hashlib
+import hmac
 import html as _html
 import logging
 import os
@@ -46,6 +48,8 @@ from starlette.concurrency import run_in_threadpool
 
 from trader.operations.health import build_health_payload
 from trader.strategy.inspect import scan_strategies
+from trader.messaging.typed_rpc import TypedRpcRemoteError
+from web.manage_client import get_manage_client
 from web.command_center import (
     CommandCenter,
     CommandCenterConfig,
@@ -55,11 +59,12 @@ from web.command_center import (
 from web.command_center.flags import CommandFlags, load_command_flags
 from web.command_center.health import create_health_router
 from web.command_center.routes_commands import (
-    _check_origin,
     install_command_routes,
     require_session,
 )
 from web.command_center.routes_read import create_read_router
+from web.command_center.research import ResearchService, build_research_service
+from web.command_center.routes_research import create_research_router
 from web.command_center.session import (
     SESSION_COOKIE,
     CredentialConfigError,
@@ -161,12 +166,24 @@ async def _lifespan(_app: FastAPI):
 _TEMPLATES = Jinja2Templates(directory=str(Path(__file__).parent / 'templates'))
 
 
-# CSRF: a per-process token embedded as a hidden field in every approve/reject
-# form and verified on POST. This blocks the blind cross-origin / injected POST
-# that could otherwise place a live order (the endpoints have no other auth).
-# Even with reasoning now sanitized, defense-in-depth: a mutating endpoint that
-# places real orders must not be triggerable by a forged request.
-_CSRF_TOKEN = secrets.token_urlsafe(32)
+# CSRF: a token embedded as a hidden field in every mutating HTML form and
+# verified on POST. Prefer deriving it from DASHBOARD_SESSION_SECRET so the
+# value survives dashboard container recreate (baked images rotate a pure
+# process-random token and leave open /cc tabs with a 403 CSRF mismatch).
+# Fall back to a process-random token when the secret is missing (tests /
+# misconfig) so forms still have *some* CSRF gate.
+def _derive_html_csrf_token() -> str:
+    secret = (os.environ.get('DASHBOARD_SESSION_SECRET') or '').strip()
+    if len(secret) >= 32:
+        return hmac.new(
+            secret.encode('utf-8'),
+            b'mmr-dashboard-html-form-csrf-v1',
+            hashlib.sha256,
+        ).hexdigest()
+    return secrets.token_urlsafe(32)
+
+
+_CSRF_TOKEN = _derive_html_csrf_token()
 
 # Optional shared-secret gate for the whole dashboard. When MMR_WEB_TOKEN is set,
 # every request must present it (?token= or X-MMR-Token header). Unset ⇒ open,
@@ -215,7 +232,10 @@ def _has_valid_dashboard_session(request: Request) -> bool:
 
 def _check_csrf(token: str) -> None:
     if not secrets.compare_digest(token or '', _CSRF_TOKEN):
-        raise HTTPException(status_code=403, detail='CSRF token mismatch')
+        raise HTTPException(
+            status_code=403,
+            detail='CSRF token mismatch — reload /cc and try again',
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -349,8 +369,9 @@ def make_test_client(*, commands_enabled: bool):
     return client
 
 
-# States that count as "live / enabled" (mirrors strategy_runtime semantics).
-_ENABLED_STATES = {'RUNNING', 'WAITING_HISTORICAL_DATA', 'INSTALLED'}
+# States that count as "live / enabled" (dispatchable — mirrors
+# command_center.js DISPATCHABLE_STRATEGY). INSTALLED means loaded but idle.
+_ENABLED_STATES = {'RUNNING', 'WAITING_HISTORICAL_DATA'}
 
 # ---------------------------------------------------------------------------
 # Shared SDK connection
@@ -359,6 +380,15 @@ _mmr_lock = threading.Lock()
 _mmr: Optional[Any] = None
 
 
+# NOTE (architecture review candidate 2): this is the legacy full-RPC dill
+# SDK transport — a DIFFERENT protocol from the typed-RPC stacks now unified
+# behind web/trader_link.py (command gateway, manage client, event-bridge
+# clients). It is mostly severed (only fetch_status via /api/health still uses
+# it; `/` redirects to /cc precisely because these fetchers hang against a
+# split-container trader that serves only the typed sockets). It is left as-is,
+# pending a separate legacy-SDK removal — not folded into TraderLink, which
+# would only make that adapter a lowest-common-denominator over two unrelated
+# protocols.
 def _get_mmr():
     global _mmr
     if _mmr is None:
@@ -453,10 +483,25 @@ def _humanize_class_name(class_name: str) -> str:
     return re.sub(r'(?<=[a-z0-9])(?=[A-Z])|(?<=[A-Z])(?=[A-Z][a-z])', ' ', class_name)
 
 
-# Strategies live next to this package in the repo checkout; override for
-# non-standard layouts with MMR_STRATEGIES_DIR.
-_STRATEGIES_DIR = os.environ.get(
-    'MMR_STRATEGIES_DIR', str(Path(__file__).parent.parent / 'strategies'))
+def _resolve_strategies_dir() -> Path:
+    """Resolve the on-disk strategies/ directory (same precedence as ``mmr
+    strategies available``: ``MMR_STRATEGIES_DIR``, then repo-root
+    ``strategies/``)."""
+    override = os.environ.get('MMR_STRATEGIES_DIR')
+    if override:
+        return Path(override).expanduser()
+    root = Path(__file__).resolve().parent.parent
+    if (root / 'pyproject.toml').exists():
+        return root / 'strategies'
+    cur = root
+    while cur != cur.parent:
+        if (cur / 'pyproject.toml').exists():
+            return cur / 'strategies'
+        cur = cur.parent
+    return root / 'strategies'
+
+
+_STRATEGIES_DIR = str(_resolve_strategies_dir())
 
 # The runtime's actual config (same file strategy_service reads/reconciles).
 _STRATEGY_CONFIG_PATH = Path('~/.config/mmr/strategy_runtime.yaml').expanduser()
@@ -465,7 +510,7 @@ _WATCHLIST_NAME_RE = re.compile(r'^[a-z0-9_-]{1,40}$')
 
 
 def _get_accessor():
-    """UniverseAccessor over the local DuckDB — watchlists ARE universes."""
+    """Legacy local DuckDB accessor — retained for tests that patch it directly."""
     from trader.container import Container
     from trader.data.universe import UniverseAccessor
     cfg = Container.instance().config()
@@ -473,18 +518,25 @@ def _get_accessor():
 
 
 def fetch_watchlists() -> list[dict]:
-    accessor = _get_accessor()
+    """List watchlist names + counts only.
+
+    Deliberately avoids N per-universe ``get_universe`` calls on the /cc page
+    load path — that fan-out blocked the uvicorn worker and kept TestClient /
+    browsers spinning while manage RPC timed out. Symbol previews and the
+    checkbox member list load lazily via ``GET /watchlists/{name}/members``
+    when a row is unfolded.
+    """
+    client = get_manage_client()
+    listed = client.trader_query('list_universes')
     rows = []
-    for name, count in sorted(accessor.list_universes_count().items()):
-        symbols = ''
-        try:
-            defs = accessor.get(name).security_definitions
-            symbols = ', '.join(d.symbol for d in defs[:40])
-            if count > 40:
-                symbols += f', +{count - 40} more'
-        except Exception as exc:  # pragma: no cover - defensive
-            logger.warning('watchlist %s read failed: %s', name, exc)
-        rows.append({'name': name, 'count': count, 'symbols': symbols})
+    for entry in listed.get('universes') or []:
+        rows.append({
+            'name': entry['name'],
+            'count': int(entry.get('count') or 0),
+            'symbols': '',
+            'symbol_list': [],
+            'truncated': False,
+        })
     return rows
 
 
@@ -492,37 +544,140 @@ def _split_symbols(raw: str) -> list[str]:
     return [s.strip().upper() for s in re.split(r'[,\s;]+', raw or '') if s.strip()]
 
 
+def _parse_symbols_or_flash(raw: str, *, tab: str = 'watchlists'):
+    """Split + format-validate symbols; return list or an error RedirectResponse."""
+    from trader.common.symbol_validation import SymbolValidationError, validate_symbol_list
+    try:
+        return validate_symbol_list(_split_symbols(raw))
+    except SymbolValidationError as exc:
+        return _flash(f'invalid symbols — {exc}', tab=tab)
+
+
 def _resolve_symbols(symbols: list[str], exchange: str = '', currency: str = '',
-                     sec_type: str = 'STK') -> tuple[list, list[str]]:
-    """Resolve each symbol via IB (precision over convenience — never guess).
-    Returns (resolved SecurityDefinitions, unresolved symbol names)."""
+                     sec_type: str = 'STK') -> tuple[list[dict], list[str]]:
+    """Resolve each symbol via the trader typed query surface."""
+    client = get_manage_client()
     resolved, missing = [], []
     for sym in symbols:
         try:
-            defs = _call(lambda m: m.resolve(
-                sym, sec_type=sec_type, exchange=exchange, currency=currency),
-                retry=False)
+            resp = client.trader_query('discover_instrument', {
+                'symbol': sym,
+                'exchange': exchange,
+                'currency': currency,
+                'sec_type': sec_type,
+            })
+            instruments = resp.get('instruments') or []
         except Exception as exc:
             logger.warning('resolve %s failed: %s', sym, exc)
-            defs = None
-        if defs:
-            resolved.append(defs[0])
+            instruments = []
+        if instruments:
+            resolved.append(instruments[0])
         else:
             missing.append(sym)
     return resolved, missing
 
 
-def fetch_strategies() -> list[dict]:
-    rows = _records(_call(lambda m: m.strategies()))
+def _normalize_strategy_rows(rows: list[dict], *, from_config: bool = False) -> list[dict]:
     for r in rows:
-        state = str(r.get('state') or '').upper()
+        state = str(r.get('state') or ('CONFIG' if from_config else '')).upper()
+        r['state'] = state
         r['enabled'] = state in _ENABLED_STATES
-        if isinstance(r.get('conids'), (list, tuple)):
-            r['conids'] = ', '.join(str(c) for c in r['conids'])
+        # Live list_strategies always sends conids as a list (possibly empty).
+        # Empty list must still fall through to universe — otherwise universe-
+        # bound strategies show a blank ConIds cell (looks like missing data).
+        raw_conids = r.get('conids')
+        universe = r.get('universe')
+        if isinstance(raw_conids, (list, tuple)) and raw_conids:
+            r['conids'] = ', '.join(str(c) for c in raw_conids)
+        elif isinstance(raw_conids, str) and raw_conids.strip():
+            r['conids'] = raw_conids.strip()
+        elif universe:
+            r['conids'] = f'universe:{universe}'
+        else:
+            r['conids'] = ''
         r['display_name'] = _humanize_class_name(str(r.get('class_name') or '')) or r.get('name')
         if not isinstance(r.get('params'), dict):
             r['params'] = {}
+        if from_config:
+            r['from_config'] = True
     return rows
+
+
+def fetch_deployed_from_config() -> list[dict]:
+    """YAML-only deployed list — mirrors ``mmr strategies list`` fallback.
+
+    State is tagged ``CONFIG`` so the UI never confuses offline YAML with a
+    live runtime state (RUNNING / INSTALLED / …).
+    """
+    if not _STRATEGY_CONFIG_PATH.exists():
+        return []
+    config = yaml.safe_load(_STRATEGY_CONFIG_PATH.read_text()) or {}
+    rows = []
+    for entry in config.get('strategies') or []:
+        conids = entry.get('conids')
+        rows.append({
+            'name': entry.get('name', ''),
+            'state': 'CONFIG',
+            'bar_size': entry.get('bar_size'),
+            'conids': conids,
+            'universe': entry.get('universe'),
+            'class_name': entry.get('class_name', ''),
+            'description': entry.get('description', ''),
+            'auto_execute': entry.get('auto_execute'),
+            'params': dict(entry.get('params') or {}),
+        })
+    return _normalize_strategy_rows(rows, from_config=True)
+
+
+def _manage_page_local_bootstrap(flash: str = '') -> dict[str, Any]:
+    """Instant deploy-tab slices — local scan + YAML names, no live state.
+
+    Strategy rows from YAML are included for the available-table ``deployed``
+    badge, but with state ``…`` so a timed-out live fetch never paints
+    ``CONFIG`` as if it were the runtime status.
+    """
+    errors: dict[str, str] = {}
+    try:
+        available = fetch_available_strategies()
+    except Exception as exc:  # noqa: BLE001
+        logger.warning('available strategies scan failed: %s', exc)
+        available = []
+        errors['available'] = f'{type(exc).__name__}: {exc}'
+
+    strategies = fetch_deployed_from_config()
+    for s in strategies:
+        s['state'] = '…'
+        s['enabled'] = False
+    deployed_classes = {s.get('class_name') for s in strategies if s.get('class_name')}
+    for a in available:
+        a['deployed'] = a.get('class') in deployed_classes
+
+    return {
+        'strategies': strategies,
+        'available_strategies': available,
+        'watchlists': [],
+        'deployed_count': len(strategies),
+        'flash': flash,
+        'flash_err': _flash_is_error(flash),
+        'csrf_token': _CSRF_TOKEN,
+        'errors': errors,
+    }
+
+
+def fetch_strategies() -> tuple[list[dict], str | None]:
+    """Live list from strategy_service, with YAML fallback when unreachable."""
+    try:
+        rows = get_manage_client().strategy_query('list_strategies').get('strategies') or []
+        return _normalize_strategy_rows(rows), None
+    except Exception as exc:  # noqa: BLE001 - degrade to config like the CLI
+        logger.warning('list_strategies RPC failed, falling back to config: %s', exc)
+        fallback = fetch_deployed_from_config()
+        if fallback:
+            return fallback, (
+                f'strategy_service unreachable ({type(exc).__name__}); '
+                'showing local config (may be stale vs live runtime)'
+            )
+        raise
 
 
 def fetch_available_strategies() -> list[dict]:
@@ -545,11 +700,105 @@ def fetch_proposals() -> list[dict]:
     return rows
 
 
-def _flash(msg: str) -> RedirectResponse:
-    # Legacy POST routes redirect back to the legacy page (now /legacy, since
-    # `/` redirects to the command center) so the post/redirect/get loop stays
-    # on the page the form was submitted from.
-    return RedirectResponse(url=f'/legacy?flash={quote(msg)}', status_code=303)
+def _flash(msg: str, *, tab: str = 'deploy') -> RedirectResponse:
+    # Deploy + watchlist POST routes redirect back to the matching /cc tab so
+    # the post/redirect/get loop stays on the page the form was submitted from.
+    err = _flash_is_error(msg)
+    q = quote(msg)
+    suffix = '&flash_err=1' if err else ''
+    hash_tab = tab if tab in ('deploy', 'watchlists', 'trading', 'scaling', 'guide') else 'deploy'
+    return RedirectResponse(url=f'/cc?flash={q}{suffix}#{hash_tab}', status_code=303)
+
+
+def _flash_is_error(msg: str) -> bool:
+    """Classify operator-facing failure strings for error-styled banners."""
+    lower = (msg or '').lower()
+    needles = (
+        'failed', 'aborted', 'invalid', 'unknown strategy', 'nothing was written',
+        'needs symbols', 'unresolved', 'already deployed', 'not deploying',
+        'deploy error', 'could not create', 'no symbols', 'not found',
+        'unknown symbol', 'nothing added',
+    )
+    return any(n in lower for n in needles)
+
+
+def _empty_manage_context(flash: str = '', *, error: str = '') -> dict[str, Any]:
+    ctx = _manage_page_local_bootstrap(flash)
+    if error:
+        ctx['errors'] = {**ctx.get('errors', {}), 'page': error}
+    return ctx
+
+
+def _manage_page_context(flash: str = '') -> tuple[dict[str, Any], dict[str, str]]:
+    """Fetch deploy/watchlist sections for /cc.
+
+    Live strategy state is fetched first (blocking) so the Deployed table
+    never paints YAML ``CONFIG`` placeholders when strategy_service is up.
+    Watchlists overlay afterward under a short remaining budget.
+    """
+    from concurrent.futures import ThreadPoolExecutor, wait
+
+    ctx = _manage_page_local_bootstrap(flash)
+    errors = dict(ctx.get('errors') or {})
+    strategies = ctx['strategies']
+    watchlists: list[dict] = list(ctx.get('watchlists') or [])
+
+    # 1. Strategies — primary; give the typed client room for a cold connect.
+    try:
+        rows, warn = fetch_strategies()
+        strategies = rows
+        if warn:
+            errors['strategies'] = warn
+        else:
+            errors.pop('strategies', None)
+    except Exception as exc:  # noqa: BLE001
+        logger.warning('manage strategies failed: %s', exc)
+        fallback = fetch_deployed_from_config()
+        strategies = fallback or strategies
+        if fallback:
+            errors['strategies'] = (
+                f'{type(exc).__name__}: {exc}; '
+                'showing local config (may be stale vs live runtime)'
+            )
+        else:
+            errors['strategies'] = f'{type(exc).__name__}: {exc}'
+
+    # 2. Watchlists — secondary; don't block Deployed status on this.
+    timeout_s = float(os.environ.get('MMR_MANAGE_FETCH_TIMEOUT_S', '5'))
+    pool = ThreadPoolExecutor(max_workers=1)
+    try:
+        fut = pool.submit(fetch_watchlists)
+        done, pending = wait([fut], timeout=timeout_s)
+        if done:
+            try:
+                watchlists = fut.result()
+                errors.pop('watchlists', None)
+            except Exception as exc:  # noqa: BLE001
+                logger.warning('manage watchlists failed: %s', exc)
+                watchlists = []
+                errors['watchlists'] = f'{type(exc).__name__}: {exc}'
+        if pending:
+            logger.warning('manage watchlists still pending after %.0fs', timeout_s)
+            fut.cancel()
+            errors.setdefault('watchlists', 'still loading when page deadline hit')
+    finally:
+        pool.shutdown(wait=False, cancel_futures=True)
+
+    deployed_classes = {s.get('class_name') for s in strategies if s.get('class_name')}
+    available = ctx['available_strategies']
+    for a in available:
+        a['deployed'] = a.get('class') in deployed_classes
+
+    return ({
+        'strategies': strategies,
+        'available_strategies': available,
+        'watchlists': watchlists,
+        'deployed_count': len(strategies),
+        'flash': flash,
+        'flash_err': _flash_is_error(flash),
+        'csrf_token': _CSRF_TOKEN,
+        'errors': errors,
+    }, errors)
 
 
 def _coerce_yaml_value(text: str):
@@ -629,69 +878,20 @@ def _register_legacy_routes(application: FastAPI) -> None:
         return RedirectResponse('/cc', status_code=307)
 
 
+    @application.get('/manage')
+    def manage_page(request: Request, flash: str = ''):
+        """Deprecated alias — unified dashboard lives at /cc."""
+        _check_access(request)
+        url = f'/cc?flash={quote(flash)}#deploy' if flash else '/cc#deploy'
+        return RedirectResponse(url=url, status_code=307)
+
+
     @application.get('/legacy')
     def dashboard(request: Request, flash: str = ''):
+        """Deprecated alias — unified dashboard lives at /cc."""
         _check_access(request)
-        sections: dict[str, Any] = {}
-        errors: dict[str, str] = {}
-        fetchers: dict[str, Callable[[], Any]] = {
-            'cash': fetch_cash,
-            'snapshot': fetch_snapshot,
-            'status': fetch_status,
-            'risk': fetch_risk,
-            'risk_limits': fetch_risk_limits,
-            'positions': fetch_positions,
-            'strategies': fetch_strategies,
-            'proposals': fetch_proposals,
-            'available': fetch_available_strategies,
-            'watchlists': fetch_watchlists,
-        }
-        for key, fn in fetchers.items():
-            try:
-                sections[key] = fn()
-            except Exception as exc:  # noqa: BLE001 - surface, don't crash the page
-                logger.warning('dashboard section %s failed: %s', key, exc)
-                sections[key] = None
-                errors[key] = f'{type(exc).__name__}: {exc}'
-
-        strategies = sections.get('strategies') or []
-        # Mark scanned classes that are already deployed so the "available"
-        # table distinguishes on-disk-only strategies from live ones.
-        deployed_classes = {s.get('class_name') for s in strategies if s.get('class_name')}
-        available = sections.get('available') or []
-        for a in available:
-            a['deployed'] = a.get('class') in deployed_classes
-
-        # Explicit risk tri-state — never infer "ok" from a missing/failed
-        # report. "unavailable" takes priority even if a stale/None risk value
-        # happens to carry no warnings; "ok" only applies when the fetch itself
-        # succeeded.
-        risk_obj = sections.get('risk')
-        risk_warnings = (risk_obj.get('warnings') or []) if isinstance(risk_obj, dict) else []
-        if 'risk' in errors:
-            risk_state = 'unavailable'
-        elif risk_warnings:
-            risk_state = 'warning'
-        else:
-            risk_state = 'ok'
-
-        return _TEMPLATES.TemplateResponse(request, 'dashboard.html', {
-            'cash': sections.get('cash'),
-            'snapshot': sections.get('snapshot'),
-            'status': sections.get('status'),
-            'risk': sections.get('risk'),
-            'risk_state': risk_state,
-            'risk_limits': sections.get('risk_limits'),
-            'positions': sections.get('positions') or [],
-            'strategies': strategies,
-            'available_strategies': available,
-            'watchlists': sections.get('watchlists') or [],
-            'enabled_count': sum(1 for s in strategies if s.get('enabled')),
-            'proposals': sections.get('proposals') or [],
-            'errors': errors,
-            'flash': flash,
-            'csrf_token': _CSRF_TOKEN,
-        })
+        url = f'/cc?flash={quote(flash)}#trading' if flash else '/cc#trading'
+        return RedirectResponse(url=url, status_code=307)
 
 
     @application.post('/proposals/{pid}/approve',
@@ -812,45 +1012,78 @@ def _register_legacy_routes(application: FastAPI) -> None:
     # same dependency `web/command_center/routes_commands.py`'s command
     # routes already enforce (reached the same way, via
     # `request.app.state.command_center.require_session`) -- and the same
-    # `_check_origin` strict same-origin check, imported verbatim rather
-    # than reimplemented. A request without a valid session cookie now hard
-    # 401s (or is redirected by `SessionSecurityMiddleware` before even
-    # reaching here, since that middleware already gates every non-exempt
-    # path); a request whose Origin doesn't match Host now hard 403s -- a
-    # protection no legacy route had before.
+    # Session cookie (``Depends(require_session)``) plus ``_check_csrf`` on
+    # the shared Jinja token. Origin is NOT checked here — HTML form POST
+    # Origin/Host pairs break behind loopback aliases and port maps; the
+    # JSON command API keeps the strict ``_check_origin`` gate instead.
     #
     # CSRF verification is deliberately LEFT on the existing `_check_csrf`/
     # `_CSRF_TOKEN` pair rather than switched to `session_csrf_token` (the
-    # per-session-derived token `require_command_auth` uses): `dashboard.html`
-    # renders ONE shared `{{ csrf_token }}` Jinja slot, read by both these
-    # watchlist forms AND the not-yet-migrated trading-mutation/deploy forms
-    # (approve/reject/enable/disable/params/deploy — out of this task's
-    # scope, and the template itself is out of scope to edit). Re-deriving
-    # the rendered value from the session would silently break those other
-    # forms' real submissions the moment `dashboard()` re-renders — a bigger
+    # per-session-derived token `require_command_auth` uses): the `/cc`
+    # tab partials (`_watchlists_tab.html` for these watchlist forms,
+    # `_deploy_tab.html` for the trading-mutation/deploy forms —
+    # approve/reject/enable/disable/params/deploy) all render ONE shared
+    # `{{ csrf_token }}` Jinja slot that these POST routes still serve.
+    # Re-deriving the rendered value from the session would silently break
+    # those forms' real submissions the moment the page re-renders — a bigger
     # regression than the narrower theoretical gain of a per-session CSRF
     # secret in a single-operator dashboard. See the Task 1 report for the
-    # full drift note.
+    # full drift note. (The old server-rendered `dashboard.html`/`manage.html`
+    # pages that first carried these forms were retired; `/`, `/legacy`, and
+    # `/manage` now 307-redirect into `/cc`.)
     # -------------------------------------------------------------------
+    @application.get('/watchlists/{name}/members')
+    def watchlist_members(name: str, session: str = Depends(require_session)):
+        """Lazy member list for the Watchlists tab unfold (avoids N get_universe
+        calls on every /cc page load — see ``fetch_watchlists``)."""
+        from fastapi.responses import JSONResponse
+        wl = (name or '').strip()
+        if not _WATCHLIST_NAME_RE.match(wl):
+            return JSONResponse({'error': 'invalid watchlist name'}, status_code=400)
+        try:
+            resp = get_manage_client().trader_query('get_universe', {
+                'name': wl,
+                'symbol_limit': 200,
+            })
+            symbols = [
+                str(s).strip().upper()
+                for s in (resp.get('symbols') or [])
+                if str(s).strip()
+            ]
+            count = int(resp.get('count') or len(symbols))
+            return JSONResponse({
+                'name': resp.get('name') or wl,
+                'count': count,
+                'symbols': symbols,
+                'truncated': count > len(symbols),
+            })
+        except TypedRpcRemoteError as exc:
+            code = 404 if exc.code == 'NOT_FOUND' else 502
+            return JSONResponse({'error': f'{exc.code}: {exc}'}, status_code=code)
+        except Exception as exc:  # noqa: BLE001
+            logger.warning('watchlist members %s failed: %s', wl, exc)
+            return JSONResponse(
+                {'error': f'{type(exc).__name__}: {exc}'}, status_code=502)
+
     @application.post('/watchlists/create')
     def watchlist_create(request: Request, name: str = Form(''), csrf_token: str = Form(''),
                          session: str = Depends(require_session)):
-        _check_origin(request)
         _check_csrf(csrf_token)
         wl = (name or '').strip().lower()
         if not _WATCHLIST_NAME_RE.match(wl):
-            return _flash(f'invalid watchlist name {name!r} — use a-z, 0-9, -, _ (max 40)')
+            return _flash(
+                f'invalid watchlist name {name!r} — use a-z, 0-9, -, _ (max 40)',
+                tab='watchlists')
         try:
-            accessor = _get_accessor()
-            if wl in accessor.list_universes_count():
-                return _flash(f'watchlist "{wl}" already exists')
-            universe = accessor.get(wl)          # creates-on-read semantics
-            accessor.update(universe)            # persist the (empty) universe
+            get_manage_client().trader_command('create_universe', {'name': wl})
             msg = f'watchlist "{wl}" created — add symbols or upload a CSV'
+        except TypedRpcRemoteError as exc:
+            msg = (f'watchlist "{wl}" already exists' if exc.code == 'ALREADY_EXISTS'
+                   else f'create failed: {exc.code}: {exc}')
         except Exception as exc:  # noqa: BLE001
             logger.warning('watchlist create %s failed: %s', wl, exc)
             msg = f'create failed: {type(exc).__name__}: {exc}'
-        return _flash(msg)
+        return _flash(msg, tab='watchlists')
 
 
     @application.post('/watchlists/{name}/add')
@@ -858,27 +1091,37 @@ def _register_legacy_routes(application: FastAPI) -> None:
                       exchange: str = Form(''), currency: str = Form(''),
                       csrf_token: str = Form(''),
                       session: str = Depends(require_session)):
-        _check_origin(request)
         _check_csrf(csrf_token)
-        syms = _split_symbols(symbols)
-        if not syms:
-            return _flash('no symbols given')
+        parsed = _parse_symbols_or_flash(symbols, tab='watchlists')
+        if not isinstance(parsed, list):
+            return parsed
         try:
-            resolved, missing = _resolve_symbols(syms, exchange=exchange, currency=currency)
-            accessor = _get_accessor()
-            for sd in resolved:
-                accessor.insert(name, sd)
+            result = get_manage_client().trader_command('add_universe_symbols', {
+                'name': name,
+                'symbols': parsed,
+                'exchange': exchange,
+                'currency': currency,
+            })
+            added = result.get('added') or []
             parts = []
-            if resolved:
-                parts.append('added ' + ', '.join(f'{d.symbol} ({d.conId})' for d in resolved))
-            if missing:
-                parts.append('UNRESOLVED (not added): ' + ', '.join(missing)
-                             + ' — for non-US listings set exchange/currency')
+            if added:
+                parts.append('added ' + ', '.join(
+                    f'{a["symbol"]} ({a["instrument_id"]})' for a in added))
             msg = f'{name}: ' + ('; '.join(parts) or 'nothing to do')
+        except TypedRpcRemoteError as exc:
+            logger.warning('watchlist add %s failed: %s', name, exc)
+            msg = f'{name} add failed: {exc.code}: {exc}'
         except Exception as exc:  # noqa: BLE001
             logger.warning('watchlist add %s failed: %s', name, exc)
-            msg = f'{name} add failed: {type(exc).__name__}: {exc}'
-        return _flash(msg)
+            detail = f'{type(exc).__name__}: {exc}'
+            if isinstance(exc, TimeoutError) or 'timed out' in str(exc).lower():
+                detail += (
+                    ' — IB resolve is slow or upstream is down; try fewer '
+                    'symbols, set exchange/currency for non-US, or raise '
+                    'MMR_MANAGE_RPC_TIMEOUT_S'
+                )
+            msg = f'{name} add failed: {detail}'
+        return _flash(msg, tab='watchlists')
 
 
     @application.post('/watchlists/{name}/upload')
@@ -889,15 +1132,15 @@ def _register_legacy_routes(application: FastAPI) -> None:
         """CSV upload. Simple shape: a `symbol` column (optional exchange/
         currency/sectype columns) or one symbol per line — rows resolve via IB.
         Full SecurityDefinition exports (conId column) import directly."""
-        _check_origin(request)
         _check_csrf(csrf_token)
         raw = await file.read()
         if len(raw) > 1_000_000:
-            return _flash('CSV too large (max 1 MB)')
+            return _flash('CSV too large (max 1 MB)', tab='watchlists')
         try:
             text = raw.decode('utf-8-sig')
         except UnicodeDecodeError:
-            return _flash('file is not UTF-8 text — export as plain CSV')
+            return _flash('file is not UTF-8 text — export as plain CSV',
+                          tab='watchlists')
 
         def _import() -> str:
             import csv as _csv
@@ -906,29 +1149,33 @@ def _register_legacy_routes(application: FastAPI) -> None:
             if not lines:
                 return 'CSV is empty'
             header = [h.strip().lower() for h in lines[0].split(',')]
-            accessor = _get_accessor()
+            client = get_manage_client()
             if 'conid' in header:
-                count = accessor.update_from_csv_str(name, text)
-                return f'{name}: imported {count} security definitions'
+                result = client.trader_command('import_universe_csv', {
+                    'name': name, 'csv_text': text,
+                })
+                return f'{name}: imported {result.get("imported", 0)} security definitions'
             if 'symbol' in header:
                 rows = list(_csv.DictReader(io.StringIO(text)))
                 rows = [{k.strip().lower(): (v or '').strip() for k, v in r.items()} for r in rows]
             else:
-                # headerless: one symbol per line
                 rows = [{'symbol': ln.split(',')[0].strip()} for ln in lines]
             added, missing = [], []
             for r in rows:
                 sym = (r.get('symbol') or '').upper()
                 if not sym:
                     continue
-                resolved, unres = _resolve_symbols(
-                    [sym], exchange=r.get('exchange', ''), currency=r.get('currency', ''),
-                    sec_type=r.get('sectype', 'STK') or 'STK')
-                if resolved:
-                    accessor.insert(name, resolved[0])
+                result = client.trader_command('add_universe_symbols', {
+                    'name': name,
+                    'symbols': [sym],
+                    'exchange': r.get('exchange', ''),
+                    'currency': r.get('currency', ''),
+                    'sec_type': r.get('sectype', 'STK') or 'STK',
+                })
+                if result.get('added'):
                     added.append(sym)
                 else:
-                    missing.extend(unres)
+                    missing.extend(result.get('missing') or [sym])
             msg = f'{name}: added {len(added)} symbol(s)'
             if missing:
                 msg += f'; UNRESOLVED: {", ".join(missing[:15])}'
@@ -939,51 +1186,109 @@ def _register_legacy_routes(application: FastAPI) -> None:
         except Exception as exc:  # noqa: BLE001
             logger.warning('watchlist upload %s failed: %s', name, exc)
             msg = f'{name} upload failed: {type(exc).__name__}: {exc}'
-        return _flash(msg)
+        return _flash(msg, tab='watchlists')
 
 
     @application.post('/watchlists/{name}/remove')
-    def watchlist_remove(name: str, request: Request, symbol: str = Form(''),
-                         csrf_token: str = Form(''),
-                         session: str = Depends(require_session)):
-        _check_origin(request)
-        _check_csrf(csrf_token)
-        try:
-            accessor = _get_accessor()
-            universe = accessor.get(name)
-            match = universe.find_symbol(symbol.strip())
-            if not match:
-                return _flash(f'"{symbol}" not in {name}')
-            universe.security_definitions = [
-                d for d in universe.security_definitions if d.conId != match.conId]
-            accessor.update(universe)
-            msg = f'removed {match.symbol} from {name}'
-        except Exception as exc:  # noqa: BLE001
-            logger.warning('watchlist remove %s failed: %s', name, exc)
-            msg = f'{name} remove failed: {type(exc).__name__}: {exc}'
-        return _flash(msg)
+    async def watchlist_remove(name: str, request: Request,
+                               session: str = Depends(require_session)):
+        """Remove one or more symbols (checkbox multi-select or legacy single)."""
+        form = await request.form()
+        _check_csrf(str(form.get('csrf_token') or ''))
+        selected = [
+            str(s).strip().upper()
+            for s in form.getlist('symbols')
+            if str(s).strip()
+        ]
+        legacy = str(form.get('symbol') or '').strip().upper()
+        if legacy and legacy not in selected:
+            selected.append(legacy)
+        if not selected:
+            return _flash('no symbols selected to remove', tab='watchlists')
+        client = get_manage_client()
+        removed, missing = [], []
+        for sym in selected:
+            try:
+                client.trader_command('remove_universe_symbol', {
+                    'name': name,
+                    'symbol': sym,
+                })
+                removed.append(sym)
+            except TypedRpcRemoteError as exc:
+                if exc.code == 'NOT_FOUND':
+                    missing.append(sym)
+                else:
+                    return _flash(f'{name} remove failed: {exc}', tab='watchlists')
+            except Exception as exc:  # noqa: BLE001
+                logger.warning('watchlist remove %s/%s failed: %s', name, sym, exc)
+                return _flash(
+                    f'{name} remove failed: {type(exc).__name__}: {exc}',
+                    tab='watchlists')
+        parts = []
+        if removed:
+            parts.append('removed ' + ', '.join(removed))
+        if missing:
+            parts.append('not found: ' + ', '.join(missing))
+        return _flash(f'{name}: ' + '; '.join(parts), tab='watchlists')
 
 
     @application.post('/watchlists/{name}/delete')
     def watchlist_delete(name: str, request: Request, csrf_token: str = Form(''),
                          session: str = Depends(require_session)):
-        _check_origin(request)
         _check_csrf(csrf_token)
         try:
-            _get_accessor().delete(name)
+            get_manage_client().trader_command('delete_universe', {'name': name})
             msg = f'watchlist "{name}" deleted'
         except Exception as exc:  # noqa: BLE001
             logger.warning('watchlist delete %s failed: %s', name, exc)
             msg = f'{name} delete failed: {type(exc).__name__}: {exc}'
+        return _flash(msg, tab='watchlists')
+
+
+    @application.post('/strategies/{name}/enable-live')
+    def enable_strategy_live(name: str, request: Request, csrf_token: str = Form(''),
+                             session: str = Depends(require_session)):
+        """Enable a loaded strategy via strategy_service typed RPC.
+
+        Companion to Deploy-tab controls. Distinct from the legacy
+        ``/strategies/{name}/enable`` path (locked when command-center
+        mutations own trading) — this is the same manage surface as deploy.
+        """
+        _check_csrf(csrf_token)
+        try:
+            result = get_manage_client().strategy_command(
+                'enable_strategy_by_name', {'strategy_name': name})
+            state = result.get('state') or 'RUNNING'
+            msg = f'{name} enabled ({state})'
+        except TypedRpcRemoteError as exc:
+            msg = f'{name} enable failed: {exc.code}: {exc}'
+        except Exception as exc:  # noqa: BLE001
+            logger.warning('enable-live %s failed: %s', name, exc)
+            msg = f'{name} enable failed: {type(exc).__name__}: {exc}'
         return _flash(msg)
 
+    @application.post('/strategies/{name}/disable-live')
+    def disable_strategy_live(name: str, request: Request, csrf_token: str = Form(''),
+                              session: str = Depends(require_session)):
+        """Disable a running strategy via strategy_service typed RPC."""
+        _check_csrf(csrf_token)
+        try:
+            result = get_manage_client().strategy_command(
+                'disable_strategy_by_name', {'strategy_name': name})
+            state = result.get('state') or 'DISABLED'
+            msg = f'{name} disabled ({state})'
+        except TypedRpcRemoteError as exc:
+            msg = f'{name} disable failed: {exc.code}: {exc}'
+        except Exception as exc:  # noqa: BLE001
+            logger.warning('disable-live %s failed: %s', name, exc)
+            msg = f'{name} disable failed: {type(exc).__name__}: {exc}'
+        return _flash(msg)
 
     @application.post('/strategies/deploy')
-    async def deploy_strategy(request: Request):
+    async def deploy_strategy(request: Request, session: str = Depends(require_session)):
         """Deploy an on-disk strategy: validate against the scanner (keeps the
         strategies-dir sandbox), resolve/attach the target instruments, append
         the YAML entry atomically, then reload + enable via RPC."""
-        _check_access(request)
         form = await request.form()
         _check_csrf(str(form.get('csrf_token') or ''))
 
@@ -992,7 +1297,7 @@ def _register_legacy_routes(application: FastAPI) -> None:
         name = str(form.get('name') or '').strip().lower()
         bar_size = str(form.get('bar_size') or '1 min').strip()
         days = str(form.get('days') or '90').strip()
-        symbols = _split_symbols(str(form.get('symbols') or ''))
+        symbols_raw = str(form.get('symbols') or '')
         watchlist = str(form.get('watchlist') or '').strip()
         auto_propose = bool(form.get('auto_propose'))
         params = {k[len('param_'):]: _coerce_yaml_value(str(v))
@@ -1000,6 +1305,16 @@ def _register_legacy_routes(application: FastAPI) -> None:
                   if k.startswith('param_') and str(v).strip() != ''}
 
         def _deploy() -> str:
+            from trader.common.symbol_validation import (
+                SymbolValidationError, validate_symbol_list,
+            )
+            target_watchlist = watchlist
+            try:
+                symbols = validate_symbol_list(_split_symbols(symbols_raw)) if symbols_raw.strip() else []
+            except SymbolValidationError as exc:
+                return f'invalid symbols — {exc}'
+            if symbols and target_watchlist:
+                target_watchlist = ''  # symbols win when both are filled in
             # 1. The (file, class) pair must come from the scanner — a forged
             # form must not be able to point the runtime at an arbitrary path.
             known = {(r['file'], r['class']) for r in scan_strategies(_STRATEGIES_DIR)}
@@ -1007,8 +1322,9 @@ def _register_legacy_routes(application: FastAPI) -> None:
                 return f'unknown strategy {class_name} in {file_name} — not deploying'
             if not _WATCHLIST_NAME_RE.match(name or ''):
                 return f'invalid deployment name {name!r} — use a-z, 0-9, -, _ (max 40)'
-            if bool(symbols) == bool(watchlist):
-                return 'give either symbols or a watchlist (exactly one)'
+            if not symbols and not target_watchlist:
+                return ('deploy needs symbols (e.g. AAPL, MSFT) or a watchlist target '
+                        '— nothing was written')
 
             # 2. Config: reject duplicate names before doing any work.
             if _STRATEGY_CONFIG_PATH.exists():
@@ -1030,17 +1346,30 @@ def _register_legacy_routes(application: FastAPI) -> None:
             # 3. Target instruments. Symbols resolve via IB and register their
             # security definitions locally (strategy load needs resolve_symbol
             # to hit) in a per-deploy watchlist for provenance.
+            client = get_manage_client()
             if symbols:
                 resolved, missing = _resolve_symbols(symbols)
                 if missing:
                     return ('deploy aborted — unresolved: ' + ', '.join(missing)
                             + ' (nothing written)')
-                accessor = _get_accessor()
-                for sd in resolved:
-                    accessor.insert(f'strat_{name}', sd)
-                entry['conids'] = [sd.conId for sd in resolved]
+                univ = f'deploy_{name}'
+                try:
+                    client.trader_command('create_universe', {'name': univ})
+                except TypedRpcRemoteError as exc:
+                    if exc.code != 'ALREADY_EXISTS':
+                        return f'deploy aborted — could not create watchlist {univ}: {exc}'
+                add_result = client.trader_command('add_universe_symbols', {
+                    'name': univ,
+                    'symbols': symbols,
+                })
+                still_missing = list(add_result.get('missing') or [])
+                if still_missing:
+                    return ('deploy aborted — unresolved: ' + ', '.join(still_missing)
+                            + ' (nothing written)')
+                entry['universe'] = univ
+                entry['conids'] = [int(sd['instrument_id']) for sd in resolved]
             else:
-                entry['universe'] = watchlist
+                entry['universe'] = target_watchlist
             if auto_propose:
                 entry['auto_execute'] = 'propose'
             if params:
@@ -1054,21 +1383,24 @@ def _register_legacy_routes(application: FastAPI) -> None:
 
             # 4. Load it now (not in 30s) and enable it, per the one-click ask.
             try:
-                reload_result = _call(lambda m: m.reload_strategies(), retry=False)
-                if hasattr(reload_result, 'is_success') and not reload_result.is_success():
-                    return (f'"{name}" written to config but reload failed: '
-                            f'{_result_error(reload_result)} — it loads on the next '
-                            'reconcile; enable it from the Strategies tab')
-                enable_result = _call(lambda m: m.enable_strategy(name), retry=False)
-                if hasattr(enable_result, 'is_success') and not enable_result.is_success():
-                    return (f'"{name}" deployed but enable failed: '
-                            f'{_result_error(enable_result)} — enable it from the '
-                            'Strategies tab')
+                reload_result = client.strategy_command('reload_strategies', {})
+                if not reload_result.get('ok'):
+                    return (f'"{name}" written to config but reload failed — it loads on the '
+                            'next reconcile; enable it from the Command Center')
+                enable_result = client.strategy_command('enable_strategy_by_name', {
+                    'strategy_name': name,
+                })
+                if not enable_result.get('ok'):
+                    return (f'"{name}" deployed but enable failed — enable it from the '
+                            'Command Center')
+            except TypedRpcRemoteError as exc:
+                return (f'"{name}" written to config but service call failed ({exc.code}: {exc}) '
+                        '— it loads on the next reconcile; enable it from the Command Center')
             except Exception as exc:
                 return (f'"{name}" written to config but service call failed '
                         f'({type(exc).__name__}: {exc}) — it loads on the next '
-                        'reconcile; enable it from the Strategies tab')
-            target = ', '.join(symbols) if symbols else f'watchlist {watchlist}'
+                        'reconcile; enable it from the Command Center')
+            target = ', '.join(symbols) if symbols else f'watchlist {target_watchlist}'
             return f'deployed & enabled "{name}" ({class_name}) on {target}'
 
         try:
@@ -1079,7 +1411,125 @@ def _register_legacy_routes(application: FastAPI) -> None:
         return _flash(msg)
 
 
-def create_app(cc: CommandCenter | None = None) -> FastAPI:
+    @application.post('/strategies/{name}/undeploy')
+    def undeploy_strategy(name: str, request: Request, csrf_token: str = Form(''),
+                          session: str = Depends(require_session)):
+        """Remove a strategy from strategy_runtime.yaml and reload strategy_service."""
+        _check_csrf(csrf_token)
+        strat = (name or '').strip()
+        if not strat or strat == 'global':
+            return _flash(f'cannot undeploy {strat!r}', tab='deploy')
+
+        def _undeploy() -> str:
+            if not _STRATEGY_CONFIG_PATH.exists():
+                return f'no strategy_runtime.yaml — nothing to undeploy for "{strat}"'
+            config = yaml.safe_load(_STRATEGY_CONFIG_PATH.read_text()) or {}
+            entries = list(config.get('strategies') or [])
+            kept = [e for e in entries if e.get('name') != strat]
+            if len(kept) == len(entries):
+                return f'strategy "{strat}" not found in config'
+            config['strategies'] = kept
+            tmp = str(_STRATEGY_CONFIG_PATH) + '.tmp'
+            with open(tmp, 'w') as f:
+                yaml.safe_dump(config, f, sort_keys=False)
+            os.replace(tmp, _STRATEGY_CONFIG_PATH)
+            try:
+                client = get_manage_client()
+                reload_result = client.strategy_command('reload_strategies', {})
+                if not reload_result.get('ok'):
+                    return (f'undeployed "{strat}" from config but reload failed — '
+                            'strategy_service picks it up on the next reconcile')
+            except TypedRpcRemoteError as exc:
+                return (f'undeployed "{strat}" from config but reload failed '
+                        f'({exc.code}: {exc}) — next reconcile will drop it')
+            except Exception as exc:  # noqa: BLE001
+                return (f'undeployed "{strat}" from config but reload failed '
+                        f'({type(exc).__name__}: {exc}) — next reconcile will drop it')
+            return f'undeployed "{strat}"'
+
+        try:
+            msg = _undeploy()
+        except Exception as exc:  # noqa: BLE001
+            logger.warning('undeploy %s failed: %s', strat, exc)
+            msg = f'undeploy failed: {type(exc).__name__}: {exc}'
+        return _flash(msg, tab='deploy')
+
+
+    @application.get('/api/resolve')
+    def api_resolve(symbol: str = '', exchange: str = '', currency: str = '',
+                    sec_type: str = 'STK',
+                    session: str = Depends(require_session)):
+        """Resolve a ticker to IB instrument(s) for the New proposal drawer."""
+        sym = (symbol or '').strip().upper()
+        if not sym:
+            return JSONResponse({'error': 'symbol required'}, status_code=400)
+        if sym.isdigit():
+            return JSONResponse({
+                'error': 'numeric input looks like a conId — paste it in Instrument conId directly',
+            }, status_code=400)
+        try:
+            resp = get_manage_client().trader_query('discover_instrument', {
+                'symbol': sym,
+                'exchange': (exchange or '').strip(),
+                'currency': (currency or '').strip(),
+                'sec_type': (sec_type or 'STK').strip() or 'STK',
+            })
+            instruments = resp.get('instruments') or []
+            return JSONResponse({
+                'symbol': sym,
+                'instruments': instruments,
+                'count': len(instruments),
+            })
+        except TypedRpcRemoteError as exc:
+            return JSONResponse({'error': f'{exc.code}: {exc}'}, status_code=502)
+        except Exception as exc:  # noqa: BLE001
+            logger.warning('api resolve %s failed: %s', sym, exc)
+            return JSONResponse(
+                {'error': f'{type(exc).__name__}: {exc}'}, status_code=502)
+
+    @application.get('/api/proposals')
+    def api_list_proposals(status: str = '', limit: int = 50,
+                           session: str = Depends(require_session)):
+        """List proposals (optional status filter) for Action queue history."""
+        lim = max(1, min(int(limit or 50), 200))
+        body: dict = {'limit': lim}
+        st = (status or '').strip().upper()
+        if st and st != 'ALL':
+            body['status'] = st
+        try:
+            resp = get_manage_client().trader_query('list_proposals', body)
+            return JSONResponse({
+                'proposals': resp.get('proposals') or [],
+                'status': st or 'ALL',
+            })
+        except TypedRpcRemoteError as exc:
+            return JSONResponse({'error': f'{exc.code}: {exc}'}, status_code=502)
+        except Exception as exc:  # noqa: BLE001
+            logger.warning('api list_proposals failed: %s', exc)
+            return JSONResponse(
+                {'error': f'{type(exc).__name__}: {exc}'}, status_code=502)
+
+    @application.get('/api/proposals/{proposal_id}')
+    def api_get_proposal(proposal_id: int,
+                         session: str = Depends(require_session)):
+        """Full proposal payload for the detail drawer."""
+        try:
+            resp = get_manage_client().trader_query(
+                'get_proposal', {'proposal_id': int(proposal_id)})
+            return JSONResponse(resp)
+        except TypedRpcRemoteError as exc:
+            code = 404 if exc.code in ('PROPOSAL_NOT_FOUND', 'NOT_FOUND') else 502
+            return JSONResponse({'error': f'{exc.code}: {exc}'}, status_code=code)
+        except Exception as exc:  # noqa: BLE001
+            logger.warning('api get_proposal %s failed: %s', proposal_id, exc)
+            return JSONResponse(
+                {'error': f'{type(exc).__name__}: {exc}'}, status_code=502)
+
+
+def create_app(
+    cc: CommandCenter | None = None,
+    research_service: ResearchService | None = None,
+) -> FastAPI:
     """Build the FastAPI application: the command center (session gate, SSE
     fan-out, typed read model) plus the legacy SDK-backed dashboard, sharing
     one process and one `/session` login.
@@ -1098,6 +1548,7 @@ def create_app(cc: CommandCenter | None = None) -> FastAPI:
     """
     center = cc or CommandCenter(CommandCenterConfig.from_env(),
                                  commands_enabled=_COMMAND_FLAGS.commands_enabled)
+    research = research_service or build_research_service()
 
     @contextlib.asynccontextmanager
     async def _app_lifespan(fastapi_app: FastAPI):
@@ -1117,12 +1568,16 @@ def create_app(cc: CommandCenter | None = None) -> FastAPI:
         # `center.lifespan`'s own `finally` (bridge.stop()/quote_plane.stop()),
         # so `/readyz` goes false as soon as shutdown begins, not only once that
         # teardown finishes.
-        async with center.lifespan(fastapi_app):
-            async with _lifespan(fastapi_app):
-                yield
+        try:
+            async with center.lifespan(fastapi_app):
+                async with _lifespan(fastapi_app):
+                    yield
+        finally:
+            research.close()
 
     application = FastAPI(title='MMR Dashboard', lifespan=_app_lifespan)
     application.state.command_center = center
+    application.state.research_service = research
     # [M1-C] Already-validated at module import (see `_COMMAND_FLAGS` above) --
     # every app instance (including test-built ones via `create_app(stub_cc)`)
     # gets the same fail-closed flags on `app.state`, not a per-instance reload.
@@ -1188,7 +1643,12 @@ def create_app(cc: CommandCenter | None = None) -> FastAPI:
     application.include_router(create_session_router(
         center.ensure_session_manager, center.limiter,
         cookie_secure=center.config.cookie_secure))
-    application.include_router(create_read_router(center, _TEMPLATES))
+    application.include_router(create_read_router(
+        center, _TEMPLATES,
+        manage_context_provider=lambda flash='': _manage_page_context(flash=flash)[0],
+        empty_manage_context=_empty_manage_context,
+    ))
+    application.include_router(create_research_router(center, research))
     # NEW route only: `/api/cc-health`. Never touches the G0 `/healthz` /
     # `/readyz` / `/api/health` routes registered by `_register_legacy_routes`
     # below -- see the M1-R Task 7 addendum for why those must stay as-is.

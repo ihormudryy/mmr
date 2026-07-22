@@ -1,0 +1,142 @@
+{% macro info(text) %}<span class="info" tabindex="0" role="button" aria-label="More info" aria-expanded="false">i<span class="tip">{{ text }}</span></span>{% endmacro %}
+
+<div class="dash-admin-body">
+  {% if flash %}<p class="banner flash{% if flash_err %} err{% endif %}" data-flash-banner role="status">
+    <span class="flash-msg">{{ flash }}</span>
+    <button type="button" class="flash-dismiss" data-flash-dismiss
+            aria-label="Dismiss notification">×</button>
+  </p>{% endif %}
+  {% if errors.page %}<p class="banner err">{{ errors.page }}</p>{% endif %}
+
+  <section class="full">
+    <h2>Deployed strategies
+      {{ info('Currently loaded by strategy_service from strategy_runtime.yaml. Enable puts a strategy RUNNING so it receives bars; Disable stops it without undeploying.') }}
+      <span class="chip on">{{ deployed_count }} loaded</span>
+    </h2>
+    <p class="note">Enter <strong>symbols</strong> (e.g. AAPL, MSFT) or pick a <strong>watchlist</strong> to deploy.
+      Use <strong>Enable</strong> / <strong>Disable</strong> on a deployed row to put it RUNNING.
+      <strong>Undeploy</strong> removes it from config and reloads strategy_service.</p>
+    {% if errors.strategies %}<p class="banner err">{{ errors.strategies }}</p>{% endif %}
+    {% if strategies %}
+    <table>
+      <thead><tr>
+        <th>Name {{ info('Hover a name for the strategy description (thesis + backtest provenance). The small text is the config name in strategy_runtime.yaml.') }}</th>
+        <th>State {{ info('RUNNING: receiving bars and emitting signals. DISABLED / INSTALLED: loaded but inactive. ERROR: failed to load or subscribe — check strategy_service logs. CONFIG: YAML fallback when strategy_service is unreachable.') }}</th>
+        <th>Auto {{ info('off (—): signals are only recorded. propose: each signal creates a PENDING proposal you approve on the Trading tab. Full auto-execution is not supported.') }}</th>
+        <th>Bar {{ info('Bar size the strategy consumes. It is evaluated once per newly completed bar of this size — matching how it was backtested — not on every tick.') }}</th>
+        <th>ConIds {{ info('Explicit IB contract IDs when the strategy lists conids. universe:NAME means it is bound to a named watchlist/universe and follows that membership — not missing data. A blank (—) means neither conids nor universe is configured. Verify contracts with mmr resolve SYMBOL before hardcoding.') }}</th>
+        <th>Actions {{ info('Enable/Disable applies immediately via strategy_service. Undeploy removes the YAML entry and reloads — confirm carefully.') }}</th>
+      </tr></thead>
+      <tbody>
+      {% for s in strategies %}
+        <tr>
+          <td class="sym">
+            <span class="hover-tip">{{ s.display_name }}{% if s.description %}<span class="tip">{{ s.description }}</span>{% endif %}</span>
+            <div class="strat-config-name">{{ s.name }}</div>
+          </td>
+          <td><span class="chip {{ 'on' if s.enabled else ('err' if s.state == 'ERROR' else 'off') }}">{{ s.state }}</span></td>
+          <td>{% if s.auto_execute == 'propose' %}<span class="chip on">propose</span>{% elif s.auto_execute %}<span class="chip err">{{ s.auto_execute }}</span>{% else %}<span class="dim">—</span>{% endif %}</td>
+          <td>{{ s.bar_size or '—' }}</td>
+          <td class="dim">{{ s.conids or '—' }}</td>
+          <td class="wl-actions">
+            {% if s.name == 'global' %}
+              <span class="dim">—</span>
+            {% else %}
+              {% if s.enabled %}
+              <form class="param-form inline" method="post" action="/strategies/{{ s.name }}/disable-live">
+                <input type="hidden" name="csrf_token" value="{{ csrf_token }}" />
+                <button type="submit" class="reject">Disable</button>
+              </form>
+              {% else %}
+              <form class="param-form inline" method="post" action="/strategies/{{ s.name }}/enable-live">
+                <input type="hidden" name="csrf_token" value="{{ csrf_token }}" />
+                <button type="submit" class="primary">Enable</button>
+              </form>
+              {% endif %}
+              <form class="param-form inline setup-delete-form" method="post"
+                    action="/strategies/{{ s.name }}/undeploy"
+                    data-confirm="Undeploy {{ s.name }}? Removes it from strategy_runtime.yaml and reloads.">
+                <input type="hidden" name="csrf_token" value="{{ csrf_token }}" />
+                <button type="submit" class="reject">Undeploy</button>
+              </form>
+            {% endif %}
+          </td>
+        </tr>
+      {% endfor %}
+      </tbody>
+    </table>
+    {% else %}<p class="empty">No strategies deployed yet — pick one below.</p>{% endif %}
+  </section>
+
+  <section class="full">
+    <h2>Available strategies
+      {{ info('Every Strategy implementation found in the strategies/ directory (static scan — nothing is executed). Deploy attaches one to symbols or a watchlist, loads it immediately, and enables it.') }}
+      <span class="chip">{{ available_strategies|length }}</span>
+    </h2>
+    {% if errors.available %}<p class="banner err">{{ errors.available }}</p>{% endif %}
+    {% if available_strategies %}
+    <table>
+      <thead><tr>
+        <th>Name {{ info('Hover for the class docstring.') }}</th>
+        <th>Class {{ info('Python class name used by mmr backtest / strategies deploy.') }}</th>
+        <th>File {{ info('Source file under strategies/.') }}</th>
+        <th>Mode {{ info('precompute: fast vectorized path — safe for 1-min backtests. on_prices: legacy per-bar path — O(N²) in backtests, fine live.') }}</th>
+        <th>Tunables {{ info('Parameters you can override per deployment (defaults shown). These are the --param knobs for backtests and editable params after deploying.') }}</th>
+        <th>Status {{ info('deployed: this class already appears in strategy_runtime.yaml. on disk: available to deploy.') }}</th>
+        <th>Actions {{ info('Deploy writes the strategy into strategy_runtime.yaml attached to your symbols or a watchlist, loads it immediately, and enables it. Tick propose so signals become PENDING proposals.') }}</th>
+      </tr></thead>
+      <tbody>
+      {% for a in available_strategies %}
+        {% if a['class'] %}
+        <tr>
+          <td class="sym">
+            <span class="hover-tip">{{ a.display_name }}{% if a.docstring_full %}<span class="tip">{{ a.docstring_full }}</span>{% endif %}</span>
+            {% if a.docstring %}<div class="strat-config-name">{{ a.docstring }}</div>{% endif %}
+          </td>
+          <td class="dim">{{ a['class'] }}</td>
+          <td class="dim">{{ a.file }}</td>
+          <td>{% if a.mode == 'parse_error' %}<span class="chip err">parse error</span>{% else %}<span class="chip">{{ a.mode }}</span>{% endif %}</td>
+          <td class="dim wrap">{% if a.tunables %}{% for k, v in a.tunables.items() %}{{ k }}={{ v }}{{ ', ' if not loop.last }}{% endfor %}{% else %}—{% endif %}</td>
+          <td>{% if a.deployed %}<span class="chip on">deployed</span>{% else %}<span class="chip off">on disk</span>{% endif %}</td>
+          <td><button class="unfold setup-unfold" type="button" data-label="deploy"
+                     data-target="dep-{{ loop.index }}">▸ deploy</button></td>
+        </tr>
+        <tr id="dep-{{ loop.index }}" class="param-row" style="display:none">
+          <td colspan="7">
+            <form class="param-form" method="post" action="/strategies/deploy">
+              <input type="hidden" name="csrf_token" value="{{ csrf_token }}" />
+              <input type="hidden" name="file" value="{{ a.file }}" />
+              <input type="hidden" name="class" value="{{ a['class'] }}" />
+              <label>name <input class="w-name" name="name" value="{{ a.file[:-3] }}" /></label>
+              <label>symbols <input class="w-symbols" name="symbols" placeholder="AAPL, MSFT" /></label>
+              <label>or watchlist
+                <select name="watchlist">
+                  <option value="">—</option>
+                  {% for w in watchlists %}<option value="{{ w.name }}">{{ w.name }} ({{ w.count }})</option>{% endfor %}
+                </select>
+              </label>
+              <label>bar
+                <select name="bar_size">
+                  {% for b in ['1 min', '5 mins', '15 mins', '30 mins', '1 hour', '1 day'] %}
+                  <option value="{{ b }}">{{ b }}</option>
+                  {% endfor %}
+                </select>
+              </label>
+              <label>history days <input class="w-days" name="days" value="90" /></label>
+              {% for k, v in (a.tunables or {}).items() %}
+                <label>{{ k }} <input class="w-sm" name="param_{{ k }}" value="{{ v if v is not none else '' }}" /></label>
+              {% endfor %}
+              <label><input type="checkbox" name="auto_propose" /> propose signals</label>
+              <button type="submit" class="primary">Deploy &amp; enable</button>
+            </form>
+          </td>
+        </tr>
+        {% endif %}
+      {% endfor %}
+      </tbody>
+    </table>
+    {% else %}<p class="empty">No strategy files found.</p>{% endif %}
+  </section>
+
+</div>
+<p class="setup-foot">Strategy deploy · auto-refreshes every 30s while this tab is open (paused while a deploy form is open)</p>

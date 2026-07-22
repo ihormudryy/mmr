@@ -72,6 +72,8 @@ pip install -e ".[test]"
 
 On first run, `start_mmr.sh` auto-launches the setup wizard to configure IB Gateway host/port, account numbers, Massive.com API key, and trading mode. Re-run anytime with `./start_mmr.sh --setup`. Settings are saved to `~/.config/mmr/trader.yaml`.
 
+For **unattended paper automation** (one signed strategy, release gates, dashboard Activate), see [`docs/PAPER_AUTOMATION_SETUP.md`](docs/PAPER_AUTOMATION_SETUP.md).
+
 ### Requirements
 
 - Python >= 3.12
@@ -83,51 +85,48 @@ On first run, `start_mmr.sh` auto-launches the setup wizard to configure IB Gate
 ```
 ┌─────────────────────────────────────────────────────────────────────┐
 │                      Claude Code / LLM Agent                        │
-│  CLAUDE.md (context) + mmr CLI --json (tools)                       │
+│  CLAUDE.md + mmr CLI --json                                         │
 │  MONITOR → ANALYZE → PROPOSE → DIGEST → sleep → repeat              │
 └────────────────────────────┬────────────────────────────────────────┘
                              │ Bash: mmr --json <command>
 ┌────────────────────────────▼────────────────────────────────────────┐
-│                         mmr_cli / sdk.py                            │
-│              80+ commands, JSON output, prompt_toolkit REPL         │
+│                    mmr_cli / sdk.py (typed HMAC RPC)                │
+│         reads + propose/approve on 42101/42102 (+ strategy 42105)   │
 └──────┬──────────────────┬──────────────────┬────────────────────────┘
-       │ ZMQ RPC          │ ZMQ RPC          │ ZMQ PubSub
+       │ typed            │ ZMQ RPC          │ typed / PubSub
        ▼                  ▼                  ▼
 ┌──────────────┐  ┌──────────────┐  ┌──────────────────────┐
-│trader_service│  │ data_service │  │  strategy_service    │
-│  port 42001  │  │  port 42003  │  │  port 42005          │
-│              │  │              │  │                      │
-│ IBAIORx ─────┼──┼──► IB Gateway│  │ Strategy runtime     │
-│ Executioner  │  │  Massive.com │  │ RxPY pipelines       │
-│ Portfolio    │  │  DuckDB      │  │ MessageBus (42006)   │
-│ Risk Gate    │  │              │  │                      │
-│ Book Subject │  │              │  │                      │
-└──────────────┘  └──────────────┘  └──────────────────────┘
+│   trader     │  │    data      │  │      strategy        │
+│ 42101/42102  │  │   42003      │  │ 42104/42105 + 42002  │
+│ IB + risk    │  │ Massive/TD/IB│  │ StrategyRuntime      │
+│ propose gate │  │ DuckDB hist  │  │ MessageBus 42006     │
+└──────┬───────┘  └──────────────┘  └──────────┬───────────┘
        │                                       │
        │          ┌──────────────┐             │
        └──────────┤  IB Gateway  ├─────────────┘
-                  │  (ib_async)  │
                   └──────────────┘
+         dashboard (web) ── typed clients ──► trader + strategy
+         scheduler (pycron) ── cron only (refresh, backups)
 ```
 
 ### Services
 
-| Service | Port | Role |
-|---------|------|------|
-| **trader_service** | 42001 (RPC), 42002 (PubSub) | Trading runtime — order execution, portfolio, market data streaming, risk gate. Detects IB Gateway upstream connectivity loss and exposes it via `status` |
-| **data_service** | 42003 (RPC) | Historical data downloads (Massive.com + IB), DuckDB storage |
-| **strategy_service** | 42005 (RPC), 42006 (MessageBus) | Loads and runs strategies, receives tick streams, emits signals. Reconciliation loop (30s) auto-detects new strategies and portfolio changes |
-| **mmr_cli** | — | Interactive REPL or one-shot commands, connects to services via ZMQ |
+| Service | Ports | Role |
+|---------|-------|------|
+| **trader** | 42101 query, 42102 command (HMAC); PubSub 42002; MessageBus 42006 | Trading runtime, portfolio, risk, propose/approve. Legacy dill **42001 unbound** in split production |
+| **strategy** | 42104 command, 42105 query; dials trader typed | Loads/runs strategies; 30s reconcile |
+| **data** | 42003 RPC | History downloads (Massive, TwelveData, IB) → DuckDB |
+| **dashboard** | HTTP (compose-published) | Read UI + command center (typed RPC only) |
+| **scheduler** | — | pycron one-shot jobs (data refresh, backups) |
+| **mmr CLI** | — | REPL / one-shot; typed RPC to trader/strategy |
 
 ### Messaging (ZeroMQ)
 
-All inter-service communication uses ZeroMQ with msgpack serialization — no HTTP, no web frameworks. Three patterns:
+- **Typed HMAC RPC** (production) — JSON-safe pydantic handlers. CLI and dashboard use this for almost all trader/strategy ops. Direct `buy`/`sell`/`cancel` are not on the production command surface — use **propose → approve** or the dashboard.
+- **Legacy dill RPC** — msgpack + optional dill; data_service still uses 42003; trader 42001 only in offline simulation (`unsafe_legacy_rpc` + `--simulation`).
+- **PubSub / MessageBus** — live ticks and strategy signals (unchanged).
 
-- **RPC** (DEALER/ROUTER) — synchronous request/reply. CLI calls `trader_service` methods via `@rpcmethod` decorated handlers. `RPCClient[T]` uses `__getattr__` chaining so calls look like `client.rpc().place_order(...)`. Server-side exceptions are preserved across the wire — stdlib types reconstruct as themselves, custom types go through a caller-supplied `error_table`, and unknown types surface as `RPCError` that still carries the original type name and args.
-- **PubSub** (PUB/SUB) — one-way broadcast of live ticker data. Topic filtering at the socket level, zero server-side bookkeeping. Ideal for high-frequency market data.
-- **MessageBus** (DEALER/ROUTER with subscription tracking) — targeted routing for strategy signals. The server knows who subscribes to which topics and routes accordingly.
-
-The msgpack `EXT_OBJECT` fallback uses dill, which can execute arbitrary Python on untrusted input. Set `MMR_DILL_STRICT=1` to refuse the fallback entirely, or call `set_dill_whitelist([Type1, Type2, ...])` to allow only specific classes.
+Set `MMR_DILL_STRICT=1` to refuse dill `EXT_OBJECT` on the legacy path.
 
 ### Storage (DuckDB)
 
@@ -141,12 +140,13 @@ Every query runs through a per-database lock that opens, executes, and closes th
 
 ### Market Data
 
-| Source | Coverage | Speed | Use Case |
-|--------|----------|-------|----------|
-| **Massive.com** (Polygon.io) | US equities | ~4s full scan | Primary for US — server-side indicators, batch snapshots, fundamentals, news with sentiment |
-| **IB APIs** | International (ASX, TSE, SEHK, EU, etc.) | ~30-90s | Scanner, snapshots, reqHistoricalData. Falls back here for non-US markets |
+| Source | Coverage | Notes |
+|--------|----------|-------|
+| **Massive.com** (Polygon.io) | US equities | Primary for ideas/movers when plan includes snapshots (**Starter+**). Stocks Basic returns `NOT_AUTHORIZED` on movers — CLI falls back to TwelveData quotes |
+| **TwelveData** | US quotes/history | Default for cheap history (`default_data_source: twelvedata`). `/market_movers` needs **Pro+**; quotes work on Basic |
+| **IB APIs** | International + IB-only tools | ASX/TSE/SEHK/EU via `ideas --location`; scanner/depth when subscribed |
 
-Yahoo Finance is explicitly not used.
+Yahoo Finance is not used.
 
 ## Claude Code Integration
 
@@ -203,7 +203,7 @@ Compare to `portfolio` which returns ~2000+ tokens of full position detail. The 
 
 ## The Propose → Approve Pipeline
 
-The LLM (or human) never places trades directly. Instead:
+In **split Docker production**, direct `buy`/`sell`/`cancel` hit unbound legacy RPC and fail with a clear error. The supported path is propose → review → approve (CLI or dashboard command center):
 
 ```bash
 # 1. Create a proposal with reasoning
@@ -246,12 +246,17 @@ session                      # Sizing config, remaining capacity
 ### Trading
 
 ```bash
+# Production (split Docker): use proposals — direct buy/sell need offline legacy RPC
+propose AMD BUY --market --confidence 0.7 --reasoning "…"
+approve 42
+reject 42 --reason "…"
+
+# Offline simulation only (unsafe_legacy_rpc + simulation):
 buy AMD --market --amount 100.0
-buy EUR --sectype CASH --market --quantity 20000
 sell AMD --market --quantity 10
-cancel 123                   # Cancel order by ID
-cancel-all                   # Cancel all orders
-close 1                      # Close position by row number
+cancel 123
+cancel-all
+close 1
 ```
 
 ### Proposals
@@ -282,28 +287,20 @@ group delete mining
 ### Scanning & Ideas
 
 ```bash
-# US via Massive.com (~4s)
+# US — Massive by default (Starter+ for movers). Basic keys auto-fall back
+# to TwelveData quotes on a liquid set (yellow notice in the REPL).
 ideas                        # Momentum (default)
-ideas gap-up                 # Gap-up preset
-ideas mean-reversion         # Mean-reversion preset
-ideas breakout               # Breakout preset
-ideas volatile               # Volatile/scalping
-ideas momentum --tickers AAPL MSFT AMD NVDA
+ideas gap-up / mean-reversion / breakout / volatile
+ideas --source twelvedata --tickers AAPL MSFT NVDA AMD   # works on TD Basic quotes
 ideas momentum --universe sp500
 ideas momentum --fundamentals --news --detail
 
-# International via IB (~30-90s)
+# International via IB (~30-90s; needs legacy/IB path)
 ideas momentum --location STK.AU.ASX --tickers BHP CBA CSL
-ideas gap-up --location STK.HK.SEHK --tickers 0700 0005
 
-# IB scanner
-scan                         # Top gainers (default)
-scan losers / scan active / scan hot-volume
-scan --instrument ETF --location STK.US
-
-# Market movers
-movers                       # Stock gainers
-movers --market crypto --losers
+# IB scanner (legacy path)
+scan
+movers                       # defaults to Massive; same entitlement rules as ideas
 ```
 
 ### Market Data
@@ -479,11 +476,12 @@ User configs live in `~/.config/mmr/` (auto-copied from `config_defaults/` on fi
 
 | File | Purpose |
 |------|---------|
-| `trader.yaml` | IB connection, DuckDB path, ZMQ ports |
+| `trader.yaml` | IB connection, DuckDB path, ZMQ/typed ports, `default_data_source`, `unsafe_legacy_rpc`, API keys |
 | `position_sizing.yaml` | Base size, risk level, ATR params, hard limits |
 | `trading_filters.yaml` | Symbol/exchange denylist and allowlist |
 | `strategy_runtime.yaml` | Strategy definitions (module, class, conids, bar_size) |
-| `pycron.yaml` | Service scheduling and auto-restart |
+| `data_refresh.yaml` | Declarative OHLCV refresh jobs |
+| `pycron.yaml` | Scheduler cron jobs (split Docker) / service defs (local) |
 | `logging.yaml` | Rich console + rotating file handlers |
 
 Environment variables override config values (uppercased parameter name). The `TRADER_CONFIG` env var overrides the config file path.
@@ -511,28 +509,29 @@ mmr/
 │   ├── strategy_service.py        # Strategy runtime entry point
 │   ├── data_service.py            # Data service entry point
 │   ├── mmr_cli.py                 # CLI REPL (80+ commands)
-│   ├── sdk.py                     # ZMQ RPC client wrapper
+│   ├── sdk.py                     # Typed HMAC + local stores (CLI wrapper)
 │   ├── container.py               # DI container
 │   ├── config.py                  # Typed config dataclasses
 │   ├── objects.py                 # Domain enums (Action, BarSize, etc.)
 │   ├── common/                    # Logging, helpers, RxPY utilities
 │   ├── data/                      # DuckDB stores, universe, market data
-│   ├── listeners/                 # IB + Massive.com data adapters
-│   ├── messaging/                 # ZMQ RPC, PubSub, MessageBus
+│   ├── listeners/                 # IB + Massive + TwelveData adapters
+│   ├── messaging/                 # Typed HMAC RPC, legacy dill RPC, PubSub, MessageBus
 │   ├── trading/                   # Runtime, executioner, risk, sizing, proposals
 │   ├── strategy/                  # Strategy runtime
 │   ├── simulation/                # Backtester + statistical-confidence tests + lookahead checker
 │   └── tools/                     # Idea scanner, depth chart, options chain
+├── web/                           # FastAPI dashboard + command center
 ├── strategies/                    # User strategy implementations
-├── config_defaults/                       # Bundled defaults
+├── config_defaults/               # Bundled defaults (copied to ~/.config/mmr/ on first run)
 ├── skills/                        # Claude skills (mmr, mmr-loop, news)
 ├── CLAUDE.md                      # Claude Code context (architecture, commands, workflows)
-├── tests/                         # 1000+ tests (pytest, no IB required)
-├── docker-compose.yml             # IB Gateway + MMR containers
-├── Dockerfile                     # Debian bookworm, Python 3.12.13 (pinned)
-├── docker.sh                      # Docker/Podman build helper
-├── start_mmr.sh                   # Service startup (tmux + health checks)
-└── pyproject.toml                 # Package config + 58 dependencies
+├── tests/                         # pytest suite (no IB required)
+├── docker-compose.yml             # Split: ib-gateway, trader, strategy, data, dashboard, scheduler
+├── Dockerfile                     # Debian bookworm, Python 3.12
+├── docker.sh                      # Build/up/exec/backup helper (immutable images; rebuild after code changes)
+├── start_mmr.sh                   # Local non-Docker startup (tmux + health checks)
+└── pyproject.toml
 ```
 
 ## Testing
@@ -542,7 +541,7 @@ The interpreter is pinned to exactly **Python 3.12.13** via `.python-version` �
 ```bash
 uv sync --python 3.12.13 --frozen --extra test
 uv run --frozen --extra test pytest tests/ --timeout=30 -q --ignore=tests/test_ibrx_async.py
-# → 880 passed
+# Prefer the live pytest summary — suite size drifts (~3600+ collected)
 ```
 
 All tests are unit tests using temporary DuckDB databases — no IB connection required.
@@ -553,14 +552,15 @@ Coverage highlights:
 
 - **Core logic:** `test_backtester*`, `test_backtest_stats`, `test_backtest_params`, `test_backtest_store`, `test_sweep`, `test_position_sizing`, `test_portfolio_risk`, `test_risk_gate`, `test_idea_scanner`
 - **Stores:** `test_duckdb_store` (including concurrent-writer), `test_event_store`, `test_proposal_store` (state machine), `test_position_groups`
-- **Messaging:** `test_clientserver_rpc` (error-type preservation, dill policy, threaded round-trip)
-- **Runtime:** `test_trading_runtime` (PnL race, portfolio routing, bracket rollback), `test_executioner` (filter + gate rejection paths), `test_strategy_runtime_reconcile` (sandbox, `yaml.safe_load`, partial-write mtime recovery)
-- **Integration:** `test_propose_approve_integration` (end-to-end propose → approve → execute, plus failure paths)
-- **Correctness:** `test_backtester.py::test_no_lookahead_fill_at_next_bar_open` hand-crafts bars that prove fills come from bar `t+1`'s open, not bar `t`'s close
+- **Messaging:** `test_clientserver_rpc`, `test_production_rpc_security`, typed/CLI surface coverage in `test_sdk`
+- **Runtime:** `test_trading_runtime`, `test_executioner`, `test_strategy_runtime_reconcile`
+- **Dashboard:** `test_web_dashboard` (command center, deploy, auth gates)
+- **Integration:** `test_propose_approve_integration`
+- **Correctness:** `test_backtester.py::test_no_lookahead_fill_at_next_bar_open`
 
 ## Dependencies
 
-Core: `ib_async`, `duckdb`, `pyzmq`, `msgpack`, `reactivex`, `pandas`, `numpy`, `pyarrow`, `rich`, `massive` (Polygon.io), `scikit-learn`, `vectorbt`, `exchange-calendars`, `matplotlib`
+Core: `ib_async`, `duckdb`, `pyzmq`, `msgpack`, `reactivex`, `pandas`, `numpy`, `pyarrow`, `rich`, `massive` (Polygon.io), `twelvedata`, `fastapi`, `scikit-learn`, `vectorbt`, `exchange-calendars`, `matplotlib`
 
 Full list in `pyproject.toml`. Install with `pip install -e .`
 

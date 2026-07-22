@@ -16,8 +16,9 @@ are now the server's job (``ProposalCommandService.create_proposal``) — this
 class only gates (paper-only, pause-aware) and translates.
 
 Semantics deliberately mirror the backtester (long-only): BUY proposes a new
-auto-sized entry, SELL proposes closing the currently-held long. Gated to
-paper trading: in live mode every call is a warn-once no-op.
+auto-sized entry, SELL proposes closing the currently-held long. Paper mode
+always allows the bridge; live mode requires ``live_authority_enabled``
+(command_authority live policy). Without that flag live is a warn-once no-op.
 
 Command ids are generated as ``f'strategy-{uuid.uuid4()}'`` (hyphen, not the
 ``strategy:`` colon used for the ``source`` field below) because
@@ -30,24 +31,24 @@ models, not by this module's own fake-client tests, and fixed here (a
 local, in-scope string-format choice, not a change to the frozen wire
 schema).
 
-KNOWN WIRE-CONTRACT GAP (do not silently "fix" by editing production_api.py
-— that reconciliation is an integration-gate item spanning the dashboard
-bridge, SDK, and this module together): ``CreateProposalRequest`` is
-``extra="forbid"`` and does not declare ``source``, ``max_hold_bars``, or
-``close_by_time`` fields, so a real typed server would reject a body
-carrying them. This module still sends them (matching the design's intent
-that a proposal can be traced back to the strategy that raised it) because
-that is the fixture contract the Task 8 tests are written against; against
-the REAL server today the request would need those fields added to
-``CreateProposalRequest`` first. A consequence: ``check_exits`` cannot
-currently recover a bridge entry's ``max_hold_bars``/``close_by_time`` from
-``list_proposals`` (the server doesn't persist or echo unrecognised
-fields), so ``_exit_reason`` is a documented no-op seam until that gap is
-closed — see its docstring.
+WIRE CONTRACT (gap closed 2026-07-22, end-to-end): ``CreateProposalRequest``
+now declares ``source``, ``max_hold_bars``, ``close_by_time`` and
+``close_by_tz``; the RPC handler threads ``source`` onto the command (so the
+record's source is ``strategy:<name>``, which ``check_exits`` filters on),
+and ``ProposalCommandService`` persists the exit trio onto the record's
+``metadata`` so ``list_proposals`` echoes them back. Previously the server's
+``extra="forbid"`` REJECTED every body this module sent — armed
+``auto_execute: propose`` strategies could not create a single proposal
+against the real server (only the fake-client tests passed). ``_exit_reason``
+is now implemented against the round-tripped metadata: ``max_hold_bars``
+counts completed bars since the entry's execution; ``close_by_time`` is
+compared in ``close_by_tz`` (session-local, e.g. "flat by 15:45
+America/New_York"), never against the raw UTC bar clock.
 
 Spec: docs/superpowers/specs/2026-07-15-signal-propose-bridge-design.md
 """
 
+import datetime as dt
 import logging
 import uuid
 from typing import Optional
@@ -60,7 +61,11 @@ from trader.trading.strategy import Signal
 
 
 class SignalProposer:
-    """Creates PENDING proposals from strategy signals (paper mode only).
+    """Creates PENDING proposals from strategy signals.
+
+    Paper mode always allows the bridge. Live mode allows it only when
+    ``live_authority_enabled`` is true (command_authority live policy armed).
+    Otherwise live is a warn-once no-op.
 
     Holds two typed clients rather than one — ``command_client`` (bound to
     the ``command`` role) is the ONLY thing this class can use to mutate
@@ -78,11 +83,13 @@ class SignalProposer:
         paper_trading: bool,
         account_id: str,
         proposal_ttl_minutes: int = 30,
+        live_authority_enabled: bool = False,
     ):
         self._command_client = command_client
         self._query_client = query_client
         self.paper_trading = paper_trading
         self._account_id = account_id
+        self.live_authority_enabled = bool(live_authority_enabled)
         # Retained for constructor/signature compatibility -- proposal TTL
         # is now entirely server-owned (`ProposalCommandService`'s own
         # `ttl` param feeding `ProposalCreateRequest`/`create_proposal`);
@@ -125,6 +132,7 @@ class SignalProposer:
             'source': f'{self.SOURCE_PREFIX}{strategy_name}',
             'max_hold_bars': signal.max_hold_bars,
             'close_by_time': signal.close_by_time.isoformat() if signal.close_by_time else None,
+            'close_by_tz': getattr(signal, 'close_by_tz', None) if signal.close_by_time else None,
         }
         try:
             receipt = self._command_client.call('create_proposal', body, CommandReceipt)
@@ -221,11 +229,15 @@ class SignalProposer:
     def _gate(self, strategy_name: str) -> bool:
         if self.paper_trading:
             return True
+        if self.live_authority_enabled:
+            return True
         if strategy_name not in self._live_warned:
             self._live_warned.add(strategy_name)
             logging.warning(
-                'auto_execute: propose is paper-only — ignoring signals from %s '
-                'in LIVE mode', strategy_name)
+                'auto_execute: propose ignored for %s in LIVE mode — '
+                'enable command_authority.live_enabled (pinned account) '
+                'for human-approve proposals, or run paper',
+                strategy_name)
         return False
 
     def _entries_allowed(self) -> bool:
@@ -242,14 +254,57 @@ class SignalProposer:
         return not control.get('new_exposure_paused', True)
 
     def _exit_reason(self, entry: dict, frame: pd.DataFrame) -> Optional[str]:
-        """Named seam for the max_hold_bars/close_by_time trigger check.
+        """Evaluate an executed bridge entry's time-based exit rules.
 
-        KNOWN GAP: ``CreateProposalRequest`` doesn't declare (and
-        ``ProposalRecord.to_payload()`` doesn't carry) either field today,
-        so an entry re-fetched via ``list_proposals`` has no trigger config
-        to evaluate against — this always returns None until that wire
-        contract is extended to round-trip them. Kept as its own method
-        (rather than inlined into ``check_exits``) so closing the gap is a
-        one-line change in exactly one place.
+        The rules round-trip on the proposal record's ``metadata``
+        (``max_hold_bars`` / ``close_by_time`` / ``close_by_tz`` — persisted
+        by ``ProposalCommandService.create_proposal``). Returns a short
+        human-readable reason string when a rule has triggered, else None.
+
+        - ``max_hold_bars``: completed bars in ``frame`` strictly after the
+          entry's ``updated_at`` (the PENDING→EXECUTED transition time — the
+          closest persisted stamp to the fill).
+        - ``close_by_time``: the latest bar's time-of-day, compared IN the
+          rule's declared timezone (``close_by_tz``, default UTC). Bars are
+          UTC-keyed, so comparing the raw index clock against a session-local
+          target like 15:45 ET would fire ~4-5 hours early.
         """
+        metadata = entry.get('metadata') or {}
+        if not isinstance(metadata, dict):
+            return None
+
+        last_ts = frame.index[-1]
+        try:
+            last_ts = pd.Timestamp(last_ts)
+            last_utc = last_ts.tz_localize('UTC') if last_ts.tzinfo is None else last_ts.tz_convert('UTC')
+        except (TypeError, ValueError):
+            return None
+
+        max_hold = metadata.get('max_hold_bars')
+        if max_hold is not None:
+            executed_at = entry.get('updated_at')
+            try:
+                entry_ts = pd.Timestamp(executed_at)
+                entry_utc = (entry_ts.tz_localize('UTC') if entry_ts.tzinfo is None
+                             else entry_ts.tz_convert('UTC'))
+                idx = pd.DatetimeIndex(frame.index)
+                idx_utc = idx.tz_localize('UTC') if idx.tz is None else idx.tz_convert('UTC')
+                bars_since = int((idx_utc > entry_utc).sum())
+                if bars_since >= int(max_hold):
+                    return f'max_hold_bars={int(max_hold)}'
+            except (TypeError, ValueError) as ex:
+                logging.warning('check_exits: unparsable max_hold context for '
+                                'proposal %s: %s', entry.get('id'), ex)
+
+        close_by = metadata.get('close_by_time')
+        if close_by:
+            try:
+                target = dt.time.fromisoformat(str(close_by))
+                tz_name = metadata.get('close_by_tz') or 'UTC'
+                local = last_utc.tz_convert(tz_name)
+                if local.time() >= target:
+                    return f'close_by_time={close_by} {tz_name}'
+            except (TypeError, ValueError) as ex:
+                logging.warning('check_exits: unparsable close_by_time for '
+                                'proposal %s: %s', entry.get('id'), ex)
         return None

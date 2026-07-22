@@ -283,6 +283,16 @@ class TestTypedRpcRegistry:
         assert registry.contains("command", "get_status") is False
         assert registry.contains("query", "missing") is False
 
+    def test_unregister_removes_method_and_allows_reregister(self):
+        registry = TypedRpcRegistry()
+        registry.register("command", "execute_automated_intent", EmptyBody, dict, _handle_get_status)
+        assert registry.unregister("command", "execute_automated_intent") is True
+        assert registry.contains("command", "execute_automated_intent") is False
+        assert registry.resolve("command", "execute_automated_intent") is None
+        assert registry.unregister("command", "execute_automated_intent") is False
+        registry.register("command", "execute_automated_intent", EmptyBody, dict, _handle_get_status)
+        assert registry.contains("command", "execute_automated_intent") is True
+
 
 # ---------------------------------------------------------------------------
 # Successful round trips on each role
@@ -628,6 +638,15 @@ class TestLoadServiceHmacKey:
         assert loaded == key_bytes
         # And it's directly usable to construct a real authenticator.
         HmacServiceAuthenticator(loaded)
+
+    def test_expands_user_home_in_path(self, tmp_path, monkeypatch):
+        key_path = tmp_path / "service_hmac.key"
+        key_bytes = b"w" * 32
+        key_path.write_bytes(key_bytes)
+        key_path.chmod(0o600)
+        monkeypatch.setenv('HOME', str(tmp_path))
+        loaded = load_service_hmac_key('~/service_hmac.key')
+        assert loaded == key_bytes
 
     def test_does_not_strip_trailing_newline(self, tmp_path):
         # Deliberately NOT stripped -- see load_service_hmac_key's docstring:

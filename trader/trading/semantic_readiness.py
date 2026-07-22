@@ -35,6 +35,7 @@ class SemanticReadiness:
         session_open: Callable[[dt.datetime], bool],
         command_stack_active: Callable[[], bool],
         quotes_ready: Callable[[], bool],
+        pre_session_checklist: Callable[[], bool] | None = None,
     ):
         self._checks = (
             ("ib_connected", ib_connected),
@@ -46,6 +47,7 @@ class SemanticReadiness:
             ("breaker_clear", breaker_clear),
             ("command_stack_active", command_stack_active),
             ("quotes_ready", quotes_ready),
+            ("pre_session_checklist", pre_session_checklist or (lambda: True)),
         )
         self._session_open = session_open
 

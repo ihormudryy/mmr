@@ -913,6 +913,13 @@ class TradingCommandCoordinator:
         """
         self._actions[action] = _ActionRegistration(handler, requires_preflight, saga)
 
+    def unregister_action(self, action: str) -> bool:
+        """Remove a previously registered action handler (hot-arm teardown)."""
+        if action not in self._actions:
+            return False
+        del self._actions[action]
+        return True
+
     def reconciliation_complete_for_account(
         self, account_id: str, *, exclude_command_id: Optional[str] = None,
     ) -> bool:
@@ -1027,7 +1034,13 @@ class TradingCommandCoordinator:
                 # command's CURRENT state rather than assuming RECEIVED.
                 self._fallback_outcome_unknown(request)
                 raise
-            row = self._transition(request, "RECEIVED", "REJECTED", error_code=exc.code)
+            # Persist the human-readable message so the gateway/API can
+            # surface it (otherwise clients only see "command rejected").
+            row = self._transition(
+                request, "RECEIVED", "REJECTED",
+                error_code=exc.code,
+                outcome={"message": exc.message},
+            )
             return _row_to_receipt(row)
         except Exception:
             # Fail loud at the surface (the original exception is

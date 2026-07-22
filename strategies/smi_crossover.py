@@ -84,10 +84,13 @@ class SMICrossOver(Strategy):
         exits = state.get('exits')
         if entries is None or exits is None or index < self.SLOW_WINDOW:
             return None
+        # probability feeds live position sizing (proposer confidence) —
+        # the old 0.0 sized proposals at zero confidence; source_name must be
+        # the DEPLOYED name or event attribution / proposal dedupe breaks.
         if entries[index]:
-            return Signal('smi_crossover', Action.BUY, 0.0, 0.0)
+            return Signal(self.name or 'smi_crossover', Action.BUY, 0.6, 0.4)
         if exits[index]:
-            return Signal('smi_crossover', Action.SELL, 0.0, 0.0)
+            return Signal(self.name or 'smi_crossover', Action.SELL, 0.6, 0.4)
         return None
 
     # ----- live-trading path (unchanged) --------------------------------
@@ -106,9 +109,9 @@ class SMICrossOver(Strategy):
         entries = fast_ma.ma_crossed_above(slow_ma)  # type: ignore
         exits = fast_ma.ma_crossed_below(slow_ma)  # type: ignore
         if bool(entries.iloc[-1]):
-            return Signal('smi_crossover', Action.BUY, 0.0, 0.0)
+            return Signal(self.name or 'smi_crossover', Action.BUY, 0.6, 0.4)
         if bool(exits.iloc[-1]):
-            return Signal('smi_crossover', Action.SELL, 0.0, 0.0)
+            return Signal(self.name or 'smi_crossover', Action.SELL, 0.6, 0.4)
         return None
 
     def on_error(self, error):

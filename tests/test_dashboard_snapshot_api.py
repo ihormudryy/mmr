@@ -214,6 +214,9 @@ class TestSnapshotApi:
             "strategy_name": "orb",
             "restart_required": True,
         }
+        assert "deployed_strategy_names" in body
+        assert isinstance(body["deployed_strategy_names"], list)
+
 
     @pytest.mark.asyncio
     async def test_snapshot_degrades_when_paper_automation_query_unavailable(
@@ -228,7 +231,9 @@ class TestSnapshotApi:
             await _login(c)
             response = await c.get("/api/snapshot")
         assert response.status_code == 200
-        assert response.json()["paper_automation"] is None
+        body = response.json()
+        assert body["paper_automation"] is None
+        assert isinstance(body.get("deployed_strategy_names"), list)
 
 
 class TestEventsEndpoint:

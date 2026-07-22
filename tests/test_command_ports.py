@@ -32,9 +32,10 @@ MARGIN = {"initMarginAfter": 5000.0, "equityWithLoanAfter": 100000.0}
 NOW = dt.datetime(2026, 7, 18, 14, 30, tzinfo=dt.timezone.utc)
 
 
-def _ticker(bid=209.5, ask=210.0, last=209.8, time=NOW, market_data_type=1, halted=0):
+def _ticker(bid=209.5, ask=210.0, last=209.8, close=None, time=NOW,
+            market_data_type=1, halted=0):
     return SimpleNamespace(
-        bid=bid, ask=ask, last=last, time=time,
+        bid=bid, ask=ask, last=last, close=close, time=time,
         marketDataType=market_data_type, halted=halted)
 
 
@@ -157,6 +158,14 @@ class TestQuoteAuthority:
         assert self._auth(trader).executable_quote(CONID, side="BUY").price == 210.0
         assert self._auth(trader).executable_quote(CONID, side="SELL").price == 209.5
 
+    def test_ask_bid_aliases_match_buy_sell(self):
+        # Production create_proposal / dispatch_guard pass "ask"/"bid", not BUY/SELL.
+        trader = _fake_trader(snapshot=_ticker(bid=209.5, ask=210.0, last=1.0))
+        ask_q = self._auth(trader).executable_quote(CONID, side="ask")
+        bid_q = self._auth(trader).executable_quote(CONID, side="bid")
+        assert ask_q is not None and ask_q.price == 210.0 and ask_q.side == "ask"
+        assert bid_q is not None and bid_q.price == 209.5 and bid_q.side == "bid"
+
     def test_carries_real_market_timestamp_and_feed_type(self):
         ts = NOW - dt.timedelta(seconds=8)
         trader = _fake_trader(snapshot=_ticker(time=ts, market_data_type=3))  # 3 = delayed
@@ -176,8 +185,31 @@ class TestQuoteAuthority:
 
     def test_none_when_price_missing_or_nonpositive(self):
         nan = float("nan")
-        for tk in (_ticker(ask=nan), _ticker(ask=None), _ticker(ask=0.0), _ticker(ask=-1.0)):
-            assert self._auth(_fake_trader(snapshot=tk)).executable_quote(CONID, side="BUY") is None
+        # Exhaust ask/bid AND last/close so the last-price fallback cannot rescue.
+        for tk in (
+            _ticker(ask=nan, bid=nan, last=nan, close=None),
+            _ticker(ask=None, bid=None, last=None, close=None),
+            _ticker(ask=0.0, bid=0.0, last=0.0, close=0.0),
+            _ticker(ask=-1.0, bid=-1.0, last=-1.0, close=-1.0),
+        ):
+            assert self._auth(_fake_trader(snapshot=tk)).executable_quote(CONID, side="ask") is None
+
+    def test_falls_back_to_last_when_book_empty(self):
+        # After-hours / delayed: IB often returns bid=ask=-1 with a usable last.
+        trader = _fake_trader(snapshot=_ticker(
+            bid=-1.0, ask=-1.0, last=212.06, market_data_type=3))
+        q = self._auth(trader).executable_quote(CONID, side="ask")
+        assert q is not None
+        assert q.price == 212.06
+        assert q.side == "ask"
+        assert q.feed_type == "delayed"
+        assert q.bid is None and q.ask is None
+
+    def test_falls_back_to_close_when_last_also_missing(self):
+        trader = _fake_trader(snapshot=_ticker(
+            bid=None, ask=None, last=None, close=200.5, market_data_type=2))
+        q = self._auth(trader).executable_quote(CONID, side="bid")
+        assert q is not None and q.price == 200.5
 
     def test_none_when_no_market_timestamp(self):
         # A quote with no real market time can't be aged -> not tradable.
@@ -202,20 +234,24 @@ class TestQuoteAuthority:
 
         trader = _fake_trader()
         trader.client.get_snapshot = get_snapshot
-        q = self._auth(trader).executable_quote(CONID, side="BUY")
+        q = self._auth(trader).executable_quote(CONID, side="ask")
         assert q is not None
         assert q.price == 100.0
         assert q.feed_type == "delayed"
 
     def test_falls_back_to_delayed_when_realtime_has_no_price(self):
-        delayed_tk = _ticker(ask=101.5, market_data_type=3)
+        delayed_tk = _ticker(ask=101.5, last=None, market_data_type=3)
 
         def get_snapshot(contract, delayed=False):
-            return _ticker(ask=None) if not delayed else delayed_tk
+            # Realtime: empty book AND no last — force the delayed retry.
+            return (
+                _ticker(ask=None, bid=None, last=None, close=None)
+                if not delayed else delayed_tk
+            )
 
         trader = _fake_trader()
         trader.client.get_snapshot = get_snapshot
-        q = self._auth(trader).executable_quote(CONID, side="BUY")
+        q = self._auth(trader).executable_quote(CONID, side="ask")
         assert q is not None and q.price == 101.5 and q.feed_type == "delayed"
 
     def test_no_delayed_fallback_when_already_delayed(self):

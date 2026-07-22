@@ -18,6 +18,28 @@ MANAGE_PAGE_TIMEOUT_S = float(os.environ.get('MMR_MANAGE_PAGE_TIMEOUT_S', '12'))
 PAPER_AUTOMATION_QUERY_TIMEOUT_S = float(
     os.environ.get("MMR_PAPER_AUTOMATION_QUERY_TIMEOUT_S", "1"))
 
+
+def _deployed_strategy_names() -> list[str]:
+    """Names from strategy_runtime.yaml for paper-automation Activate.
+
+    Live ``view.strategies`` only fills after a strategy-control command
+    journals ``strategy.updated`` — freshly deployed YAML rows never appear
+    there, so the Activate dropdown would stay empty. Config names are the
+    same identifiers Activate expects.
+    """
+    try:
+        # Lazy import: web.app pulls in this module at create_app time.
+        from web.app import fetch_deployed_from_config
+        names = {
+            str(row.get("name") or "").strip()
+            for row in fetch_deployed_from_config()
+        }
+        return sorted(n for n in names if n)
+    except Exception as exc:  # noqa: BLE001 — optional enrichment
+        logger.debug("deployed strategy names unavailable: %s", exc)
+        return []
+
+
 # Dedicated pool so a timed-out manage fetch can be abandoned without tying an
 # asyncio Task / default-executor Future to the request portal. ``asyncio.wait_for
 # (asyncio.to_thread(...))`` cancels the awaitable but the worker thread keeps
@@ -54,6 +76,7 @@ def create_read_router(cc, templates, manage_context_provider=None,
             return JSONResponse({"detail": "snapshot not ready"}, status_code=503)
         view = cc.state.snapshot_view()
         view["paper_automation"] = None
+        view["deployed_strategy_names"] = _deployed_strategy_names()
         query_client = getattr(cc, "_query_client", None)
         if query_client is not None:
             try:

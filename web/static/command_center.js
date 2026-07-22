@@ -792,10 +792,17 @@ function renderPaperAutomation() {
   const select = document.getElementById('paper-auto-strategy');
   if (select) {
     const previous = select.value;
-    const strategies = (v && v.strategies) || [];
-    const names = strategies.map(ccStrategyName).filter(Boolean);
+    const live = ((v && v.strategies) || []).map(ccStrategyName).filter(Boolean);
+    // Journaled strategy rows are empty until a control command acknowledges
+    // state; Activate still needs YAML-deployed names — merge both.
+    const deployed = (v && v.deployed_strategy_names) || [];
+    const names = Array.from(new Set(live.concat(deployed))).filter(Boolean)
+        .sort((a, b) => String(a).localeCompare(String(b)));
     const bound = (pa && pa.strategy_name) || '';
-    const options = ['<option value="">Select a strategy…</option>']
+    const placeholder = names.length
+      ? 'Select a strategy…'
+      : 'No deployed strategies — use the Deploy tab first';
+    const options = [`<option value="">${esc(placeholder)}</option>`]
         .concat(names.map(name =>
           `<option value="${esc(name)}">${esc(name)}</option>`));
     select.innerHTML = options.join('');
@@ -849,6 +856,11 @@ function renderPaperAutomation() {
     if (strategySelected) {
       items.push(_checklistItem('ok', 'Strategy selected',
         `Using <code>${esc(select.value)}</code>.`));
+    } else if (select && ((v && v.deployed_strategy_names) || []).length === 0
+               && ((v && v.strategies) || []).length === 0) {
+      items.push(_checklistItem('blocked', 'Strategy selected',
+        'No strategies in live feed or <code>strategy_runtime.yaml</code>. '
+        + 'Deploy one on the Deploy tab, then reload.'));
     } else {
       items.push(_checklistItem('wait', 'Strategy selected',
         'Pick the one strategy to arm (must not use propose while automated).'));

@@ -1,0 +1,23 @@
+<div class="research-layout" data-research-propose-enabled="{{ 'true' if commands_enabled else 'false' }}">
+  <nav class="research-tools" aria-label="Research tools">
+    <button type="button" class="research-tool active" data-research-tool="ideas"
+            aria-pressed="true">Ideas</button>
+    <button type="button" class="research-tool" data-research-tool="movers"
+            aria-pressed="false">Movers</button>
+    <button type="button" class="research-tool" data-research-tool="lookup"
+            aria-pressed="false">Lookup</button>
+    {% for tool in ('scan', 'depth', 'options', 'forex') %}
+    <button type="button" class="research-tool" data-research-tool="{{ tool }}"
+            data-research-later="true" disabled>{{ tool|title }} <span>Later</span></button>
+    {% endfor %}
+  </nav>
+  <section class="research-workspace" aria-label="Research workspace" aria-live="polite">
+    <div id="research-config-banner" class="research-banner" hidden></div>
+    <div id="research-controls"></div>
+    <p id="research-status" role="status"></p>
+    <div id="research-results" tabindex="-1"></div>
+  </section>
+  <aside id="research-detail" class="research-detail" aria-label="Research detail">
+    <p class="dim">Select a result to inspect it.</p>
+  </aside>
+</div>

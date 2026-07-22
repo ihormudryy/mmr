@@ -1,6 +1,8 @@
 # Dashboard Research Tab Implementation Plan
 
-> **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
+> **Status:** Phase 1 implemented on `feat/dashboard-research-phase1` (provider → service → API → shell → client → propose → isolation gate). Hardening follow-ups for notice escaping, resolve invalidation, ideas source validation, and concurrent movers detail are included.
+
+> **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [x]` / `- [ ]`) syntax for tracking.
 
 **Goal:** Add the Phase 1 Command Center Research tab with Massive-backed Ideas, Movers, Snapshot, and News, plus safe entry into the existing proposal drawer.
 
@@ -54,7 +56,7 @@
 - Consumes: `IdeaScanner`, `list_presets`, and a Massive REST-client-shaped object.
 - Produces: `ResearchResult(data, title, provider="massive", notice=None)` and `MassiveResearch.presets()`, `.ideas(...)`, `.movers(...)`, `.snapshot(symbol)`, `.news(...)`.
 
-- [ ] **Step 1: Write failing normalization and delegation tests**
+- [x] **Step 1: Write failing normalization and delegation tests**
 
 ```python
 # tests/test_massive_research.py
@@ -106,13 +108,13 @@ def test_news_normalizes_polygon_and_benzinga_rows():
     }]
 ```
 
-- [ ] **Step 2: Run the tests and verify the module is missing**
+- [x] **Step 2: Run the tests and verify the module is missing**
 
 Run: `.venv/bin/python -m pytest tests/test_massive_research.py -q`
 
 Expected: collection fails with `ModuleNotFoundError: trader.tools.massive_research`.
 
-- [ ] **Step 3: Implement the provider boundary**
+- [x] **Step 3: Implement the provider boundary**
 
 ```python
 # trader/tools/massive_research.py
@@ -275,7 +277,7 @@ class MassiveResearch:
         }
 ```
 
-- [ ] **Step 4: Add provider edge-case tests and make them pass**
+- [x] **Step 4: Add provider edge-case tests and make them pass**
 
 Append these concrete cases: `test_empty_provider_iterators_return_empty_data`,
 `test_ideas_delegates_all_scan_arguments`, `test_movers_applies_limit_and_direction`,
@@ -312,7 +314,7 @@ Run:
 
 Expected: PASS.
 
-- [ ] **Step 5: Commit the provider unit**
+- [x] **Step 5: Commit the provider unit**
 
 ```bash
 git add trader/tools/massive_research.py tests/test_massive_research.py
@@ -329,7 +331,7 @@ git commit -m "feat(research): add Massive provider helpers"
 - Consumes: `MassiveResearch`, a zero-argument provider factory, and a clock.
 - Produces: `ResearchService.run(tool, operation, log_params=None) -> dict`, `ResearchService.presets() -> dict`, `ResearchService.close()`, and `ResearchError(status, code, message, retryable)`.
 
-- [ ] **Step 1: Write failing service tests**
+- [x] **Step 1: Write failing service tests**
 
 ```python
 # tests/test_dashboard_research_service.py
@@ -389,13 +391,13 @@ async def test_missing_provider_maps_to_configuration_error():
         503, "MASSIVE_NOT_CONFIGURED", False)
 ```
 
-- [ ] **Step 2: Run the tests and verify the module is missing**
+- [x] **Step 2: Run the tests and verify the module is missing**
 
 Run: `.venv/bin/python -m pytest tests/test_dashboard_research_service.py -q`
 
 Expected: collection fails with `ModuleNotFoundError`.
 
-- [ ] **Step 3: Implement executor admission and stable errors**
+- [x] **Step 3: Implement executor admission and stable errors**
 
 ```python
 # web/command_center/research.py
@@ -503,7 +505,7 @@ provider factory when blank, and lazily import/create `massive.RESTClient` only
 when a request needs it. Catch configuration-file errors as not configured so
 `create_app()` and `/cc` still boot.
 
-- [ ] **Step 4: Complete error, sanitization, and shutdown tests**
+- [x] **Step 4: Complete error, sanitization, and shutdown tests**
 
 Use these exact assertions, with `timeouts` reduced to milliseconds so the test
 never sleeps for production budgets:
@@ -556,7 +558,7 @@ Run:
 
 Expected: PASS.
 
-- [ ] **Step 5: Commit the service unit**
+- [x] **Step 5: Commit the service unit**
 
 ```bash
 git add web/command_center/research.py tests/test_dashboard_research_service.py
@@ -574,7 +576,7 @@ git commit -m "feat(research): isolate provider calls from dashboard work"
 - Consumes: `ResearchService`, `ResearchError`, `CommandCenter.require_session`.
 - Produces: `create_research_router(cc, service) -> APIRouter` and `create_app(cc=None, research_service=None)`.
 
-- [ ] **Step 1: Write failing authenticated route tests**
+- [x] **Step 1: Write failing authenticated route tests**
 
 ```python
 # tests/test_dashboard_research_api.py
@@ -610,13 +612,13 @@ Build fixtures with the existing `CommandCenter`, `DashboardCredentials`, and
 null bridge/quote fakes. Inject a `ResearchService` whose provider is a small
 fake implementing all five provider methods; do not patch global config.
 
-- [ ] **Step 2: Run route tests and verify 404 failures**
+- [x] **Step 2: Run route tests and verify 404 failures**
 
 Run: `.venv/bin/python -m pytest tests/test_dashboard_research_api.py -q`
 
 Expected: authenticated Research requests fail with `404 Not Found`.
 
-- [ ] **Step 3: Add validated query models and routes**
+- [x] **Step 3: Add validated query models and routes**
 
 ```python
 # web/command_center/routes_research.py
@@ -749,7 +751,7 @@ the production default constructs `UniverseAccessor` from
 Tests inject a pure dictionary-backed loader. Validate `max_price >= min_price`
 with the same 422 shape before calling the loader or service.
 
-- [ ] **Step 4: Wire the service into `create_app` and lifespan**
+- [x] **Step 4: Wire the service into `create_app` and lifespan**
 
 ```python
 # web/app.py additions
@@ -782,7 +784,7 @@ def create_app(cc: CommandCenter | None = None,
 Install the research router beside `create_read_router`, before legacy route
 registration. Preserve the current command flags and lifecycle ordering.
 
-- [ ] **Step 5: Complete API error-contract and lifecycle tests**
+- [x] **Step 5: Complete API error-contract and lifecycle tests**
 
 Add parametrized assertions for the four stable error envelopes, valid empty
 data, every query bound/enum, repeated ticker normalization, session enforcement
@@ -792,7 +794,7 @@ on all routes, no CSRF requirement, and service closure at lifespan exit. Run:
 
 Expected: PASS.
 
-- [ ] **Step 6: Commit the API unit**
+- [x] **Step 6: Commit the API unit**
 
 ```bash
 git add web/command_center/routes_research.py web/app.py tests/test_dashboard_research_api.py
@@ -811,7 +813,7 @@ git commit -m "feat(research): expose session-gated dashboard routes"
 - Consumes: `commands_enabled` template context and the existing `dash-tab`/`dash-pane` behavior.
 - Produces: stable DOM IDs/data attributes consumed by Task 5.
 
-- [ ] **Step 1: Add failing page-marker tests**
+- [x] **Step 1: Add failing page-marker tests**
 
 ```python
 def test_research_shell_is_the_sixth_tab(logged_in_research_client):
@@ -830,13 +832,13 @@ def test_read_only_page_keeps_research_without_propose(logged_in_research_client
     assert 'data-research-propose-enabled="false"' in html
 ```
 
-- [ ] **Step 2: Run the marker tests and verify failure**
+- [x] **Step 2: Run the marker tests and verify failure**
 
 Run: `.venv/bin/python -m pytest tests/test_dashboard_research_api.py -q -k shell`
 
 Expected: FAIL because the Research tab marker is absent.
 
-- [ ] **Step 3: Add the partial and stylesheet**
+- [x] **Step 3: Add the partial and stylesheet**
 
 ```html
 <!-- web/templates/_research_tab.html -->
@@ -871,13 +873,13 @@ detail pane below the global command band, visible `:focus-visible`, and a
 single-column layout at `max-width: 960px`. Do not modify the active visual
 redesign beyond these Research selectors.
 
-- [ ] **Step 4: Run marker and existing page tests**
+- [x] **Step 4: Run marker and existing page tests**
 
 Run: `.venv/bin/python -m pytest tests/test_dashboard_research_api.py tests/test_web_dashboard.py -q`
 
 Expected: PASS.
 
-- [ ] **Step 5: Commit the shell unit**
+- [x] **Step 5: Commit the shell unit**
 
 ```bash
 git add web/templates/_research_tab.html web/static/command_center_research.css web/templates/command_center.html tests/test_dashboard_research_api.py
@@ -895,7 +897,7 @@ git commit -m "feat(research): add command center research shell"
 - Consumes: Task 4 DOM markers and the five `/api/research/*` response contracts.
 - Produces: `globalThis.CCResearch` with `state`, `selectTool`, `run`, `selectRow`, and pure render helpers.
 
-- [ ] **Step 1: Write failing dependency-free JavaScript tests**
+- [x] **Step 1: Write failing dependency-free JavaScript tests**
 
 ```javascript
 // web/static/command_center_research.test.js
@@ -932,7 +934,7 @@ Create `research_test_harness.js` beside the test with the same dependency-free
 VM/DOM technique as `command_center.test.js`; it supplies queued fetch
 responses, elements, `URLSearchParams`, and `document.querySelectorAll`.
 
-- [ ] **Step 2: Add the pytest launcher and verify failure**
+- [x] **Step 2: Add the pytest launcher and verify failure**
 
 ```python
 # tests/test_command_center_research_js.py
@@ -957,7 +959,7 @@ Run: `.venv/bin/python -m pytest tests/test_command_center_research_js.py -q`
 
 Expected: FAIL because the production script/harness does not exist.
 
-- [ ] **Step 3: Implement the focused client module**
+- [x] **Step 3: Implement the focused client module**
 
 ```javascript
 // web/static/command_center_research.js
@@ -1124,7 +1126,7 @@ Expand the Ideas form literal with inputs named `min_price`, `max_price`,
 text from the escaped error message and unhide it. Every provider value passed
 to `innerHTML` must go through `esc`.
 
-- [ ] **Step 4: Complete state and rendering tests**
+- [x] **Step 4: Complete state and rendering tests**
 
 Append named tests for `tool state retention`, `initialization fetches presets only`,
 `valid empty response`, `network error`, `HTML escaping`, `row click and Enter`,
@@ -1137,7 +1139,7 @@ state slot plus its rendered DOM marker; Lookup assertions use
 
 Expected: PASS.
 
-- [ ] **Step 5: Commit the client unit**
+- [x] **Step 5: Commit the client unit**
 
 ```bash
 git add web/static/command_center_research.js web/static/command_center_research.test.js web/static/research_test_harness.js tests/test_command_center_research_js.py
@@ -1157,7 +1159,7 @@ git commit -m "feat(research): render scanner workflows in the browser"
 - Consumes: existing `ccOpenProposalDrawer()`, `ccResolveSymbol()`, and command-gated drawer DOM.
 - Produces: `globalThis.ccOpenResearchProposal({ticker, exchange, currency})`.
 
-- [ ] **Step 1: Write failing proposal reset/prefill tests**
+- [x] **Step 1: Write failing proposal reset/prefill tests**
 
 ```javascript
 // append in web/static/command_center.test.js
@@ -1185,13 +1187,13 @@ Add Research-client assertions that Propose is absent when the partial's
 dataset is false, present only for equity/Ideas/Lookup data when true, and calls
 `ccOpenResearchProposal` without posting a command.
 
-- [ ] **Step 2: Run both Node suites and verify failure**
+- [x] **Step 2: Run both Node suites and verify failure**
 
 Run: `.venv/bin/python -m pytest tests/test_command_center_js.py tests/test_command_center_research_js.py -q`
 
 Expected: FAIL because `ccOpenResearchProposal` is undefined.
 
-- [ ] **Step 3: Implement the proposal prefill hook**
+- [x] **Step 3: Implement the proposal prefill hook**
 
 ```javascript
 // web/static/command_center.js beside ccOpenProposalDrawer
@@ -1214,7 +1216,7 @@ In the Research module, read `data-research-propose-enabled`; render Propose
 only for Ideas, stock Movers, and Lookup. Delegate clicks to the global hook.
 Do not copy proposal submission code or prefill any intent field.
 
-- [ ] **Step 4: Add server-rendered feature-flag assertions**
+- [x] **Step 4: Add server-rendered feature-flag assertions**
 
 Use monkeypatching of `web.app._COMMAND_FLAGS` following existing command-page
 tests. Assert Research API routes return the same data with commands on or off,
@@ -1225,7 +1227,7 @@ Run: `.venv/bin/python -m pytest tests/test_command_center_js.py tests/test_comm
 
 Expected: PASS.
 
-- [ ] **Step 5: Commit the proposal bridge**
+- [x] **Step 5: Commit the proposal bridge**
 
 ```bash
 git add web/static/command_center.js web/static/command_center.test.js web/static/command_center_research.js web/static/command_center_research.test.js tests/test_dashboard_research_api.py
@@ -1241,7 +1243,7 @@ git commit -m "feat(research): open proposals from resolved equity results"
 - Consumes: complete Phase 1 feature.
 - Produces: a regression gate proving saturated Research work does not block Command Center reads/SSE.
 
-- [ ] **Step 1: Write the saturated-pool isolation test**
+- [x] **Step 1: Write the saturated-pool isolation test**
 
 Create a real-uvicorn async fixture using the `_free_port`, null bridge/quote,
 credentials, login, and baseline-seeding helpers already defined in
@@ -1298,14 +1300,14 @@ async def test_saturated_research_pool_does_not_block_trading_sse(research_serve
         await asyncio.gather(*scans)
 ```
 
-- [ ] **Step 2: Run the isolation test and fix only genuine integration defects**
+- [x] **Step 2: Run the isolation test and fix only genuine integration defects**
 
 Run: `.venv/bin/python -m pytest tests/test_dashboard_research_api.py -q -k saturated`
 
 Expected: PASS in under five seconds. If it fails, fix executor ownership,
 lifespan wiring, or the test fixture; do not relax the one-second SSE assertion.
 
-- [ ] **Step 3: Run focused Phase 1 verification**
+- [x] **Step 3: Run focused Phase 1 verification**
 
 Run:
 
@@ -1320,7 +1322,7 @@ Run:
 
 Expected: all pass, with only pre-existing environment-dependent skips.
 
-- [ ] **Step 4: Run adjacent Command Center regression tests**
+- [x] **Step 4: Run adjacent Command Center regression tests**
 
 Run:
 
@@ -1335,13 +1337,13 @@ Run:
 
 Expected: all pass.
 
-- [ ] **Step 5: Run the full suite**
+- [x] **Step 5: Run the full suite**
 
 Run: `.venv/bin/python -m pytest -q --timeout-method=thread`
 
 Expected: all tests pass; browser-extra tests may skip when Playwright is not installed.
 
-- [ ] **Step 6: Check the final diff and commit the release gate**
+- [x] **Step 6: Check the final diff and commit the release gate**
 
 Run:
 

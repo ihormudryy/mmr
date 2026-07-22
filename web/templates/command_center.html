@@ -158,6 +158,14 @@
       color: var(--fg);
       border-bottom: 1px solid var(--border);
     }
+    /* `.flash { display:flex }` and `#degraded-banner` padding rules otherwise
+       beat the UA `[hidden] { display:none }` and leave boot/flash banners
+       stuck on screen after JS sets `.hidden = true`. */
+    #boot-banner[hidden],
+    #degraded-banner[hidden],
+    .flash[hidden] {
+      display: none !important;
+    }
     .flash > .flash-msg { flex: 1 1 auto; min-width: 0; }
     .flash > .flash-dismiss {
       flex: 0 0 auto;

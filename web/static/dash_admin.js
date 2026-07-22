@@ -214,13 +214,23 @@
     } catch (e) { /* ignore */ }
   }
 
-  document.querySelectorAll('[data-flash-dismiss]').forEach(function (btn) {
-    btn.addEventListener('click', function () {
-      document.querySelectorAll('[data-flash-banner]').forEach(function (el) {
-        el.remove();
-      });
-      clearFlashQuery();
+  function dismissFlashBanners() {
+    document.querySelectorAll('[data-flash-banner]').forEach(function (el) {
+      el.hidden = true;
+      if (typeof el.setAttribute === 'function') el.setAttribute('hidden', '');
+      if (typeof el.remove === 'function') el.remove();
     });
+    clearFlashQuery();
+  }
+
+  // Delegate so dismiss keeps working even if the banner is re-rendered or
+  // the original node-level listener was lost after a partial DOM update.
+  document.addEventListener('click', function (ev) {
+    var target = ev.target;
+    if (!target || typeof target.closest !== 'function') return;
+    if (!target.closest('[data-flash-dismiss]')) return;
+    ev.preventDefault();
+    dismissFlashBanners();
   });
 
   function parseHash() {

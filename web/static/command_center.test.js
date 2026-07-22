@@ -174,6 +174,43 @@ async function test(name, fn) {
     assert.equal(elements.get('degraded-banner').hidden, false);
   });
 
+  await test('first applied snapshot hides the boot loading banner', () => {
+    const {run} = makeContext();
+    const boot = run("document.getElementById('boot-banner')");
+    boot.hidden = false;
+    const view = emptyView();
+    view.stream_id = 'stream-boot';
+    view.sequence = 1;
+    run(`applySnapshot(${JSON.stringify(view)});`);
+    assert.equal(boot.hidden, true);
+  });
+
+  await test('pause control resolves trading_control by account_id without waiting', () => {
+    const {run} = makeContext({commandsEnabled: true});
+    const stateEl = run("document.getElementById('cc-pause-state')");
+    const toggle = run("document.getElementById('cc-pause-toggle')");
+    run(`store.view = {
+      accounts: [{entity_id: 'DU123', account_mode: 'paper'}],
+      trading_control: [{account_id: 'DU123', entity_id: 'DU123',
+                         new_exposure_paused: false, revision: 3}],
+    };
+    renderPauseControl();`);
+    assert.equal(stateEl.textContent, '● active');
+    assert.equal(toggle.disabled, false);
+    assert.match(toggle.textContent, /Pause new trading/);
+  });
+
+  await test('pause control uses the sole trading_control row when ids drift', () => {
+    const {run} = makeContext({commandsEnabled: true});
+    const stateEl = run("document.getElementById('cc-pause-state')");
+    run(`store.view = {
+      accounts: [{entity_id: 'acct:DU123', account_id: 'DU123'}],
+      trading_control: [{account_id: 'DU123', new_exposure_paused: true, revision: 2}],
+    };
+    renderPauseControl();`);
+    assert.equal(stateEl.textContent, '⏸ paused');
+  });
+
   await test('snapshot fetch is aborted at its deadline and reports failure', async () => {
     const { context, run } = makeContext();
     let suppliedSignal = null;

@@ -372,6 +372,13 @@ class Trader():
             )
             for adapter in broker_materialized_adapters(self.broker_state_store):
                 self.snapshot_service.register_adapter(adapter)
+            # Pause gate rows live in domain_materialized_entities (seeded /
+            # updated by TradingControlStore). Without this adapter the
+            # command-center baseline snapshot never includes trading_control,
+            # so the pause control sticks on "waiting…" until a live mutation.
+            from trader.data.materialized_state import GenericEntityAdapter
+            self.snapshot_service.register_adapter(
+                GenericEntityAdapter("trading_control"))
             self.feed_service = DomainFeedService(self.domain_journal)
             self.client.ib.connectedEvent += self.connected_event
             self.client.ib.disconnectedEvent += self.disconnected_event

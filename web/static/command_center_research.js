@@ -172,33 +172,33 @@
       return `<option value="${esc(value)}">${esc(value)}</option>`;
     }).join('');
     const forms = {
-      ideas: `<form data-research-form="ideas" class="research-form">
+      ideas: `<form data-research-form="ideas" class="param-form research-form">
         <label>Preset <select name="preset" id="research-preset">${presetOptions}</select></label>
         <label>Source <select name="source"><option value="movers">Movers</option><option value="tickers">Tickers</option><option value="universe">Universe</option></select></label>
-        <label>Tickers <input name="tickers" placeholder="AAPL MSFT"></label>
-        <label>Universe <input name="universe"></label>
-        <label>Results <input name="num" type="number" min="1" max="50" value="15"></label>
-        <label>Min price <input name="min_price" type="number" min="0" step="any"></label>
-        <label>Max price <input name="max_price" type="number" min="0" step="any"></label>
-        <label>Min volume <input name="min_volume" type="number" min="0" step="1"></label>
-        <label>Min change % <input name="min_change" type="number" step="any"></label>
-        <label>Max change % <input name="max_change" type="number" step="any"></label>
+        <label>Tickers <input name="tickers" class="w-symbols" placeholder="AAPL MSFT"></label>
+        <label>Universe <input name="universe" class="w-name"></label>
+        <label>Results <input name="num" class="w-xs" type="number" min="1" max="50" value="15"></label>
+        <label>Min price <input name="min_price" class="w-sm" type="number" min="0" step="any"></label>
+        <label>Max price <input name="max_price" class="w-sm" type="number" min="0" step="any"></label>
+        <label>Min volume <input name="min_volume" class="w-sm" type="number" min="0" step="1"></label>
+        <label>Min change % <input name="min_change" class="w-sm" type="number" step="any"></label>
+        <label>Max change % <input name="max_change" class="w-sm" type="number" step="any"></label>
         <label><input name="fundamentals" type="checkbox"> Fundamentals</label>
         <label><input name="news" type="checkbox"> News</label>
         <label><input name="names" type="checkbox"> Names</label>
         <button type="submit">Run Ideas</button>
       </form>`,
-      movers: `<form data-research-form="movers" class="research-form">
+      movers: `<form data-research-form="movers" class="param-form research-form">
         <label>Market <select name="market"><option>stocks</option><option>crypto</option><option>indices</option><option>options</option><option>futures</option></select></label>
         <label>Direction <select name="direction"><option>gainers</option><option>losers</option></select></label>
-        <label>Results <input name="num" type="number" min="1" max="100" value="20"></label>
+        <label>Results <input name="num" class="w-xs" type="number" min="1" max="100" value="20"></label>
         <label><input name="detail" type="checkbox"> Detail</label>
         <button type="submit">Run Movers</button>
       </form>`,
-      lookup: `<form data-research-form="lookup" class="research-form">
-        <label>Ticker <input name="symbol" required maxlength="32"></label>
+      lookup: `<form data-research-form="lookup" class="param-form research-form">
+        <label>Ticker <input name="symbol" class="w-name" required maxlength="32"></label>
         <label>News source <select name="source"><option>polygon</option><option>benzinga</option></select></label>
-        <label>News limit <input name="limit" type="number" min="1" max="50" value="10"></label>
+        <label>News limit <input name="limit" class="w-xs" type="number" min="1" max="50" value="10"></label>
         <button type="submit">Lookup</button>
       </form>`,
     };

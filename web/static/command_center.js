@@ -125,7 +125,10 @@ function applySnapshot(view) {
   store.serverClockOffsetMs = ccServerClockOffsetMs(view.generated_at, Date.now());
   if (view.health) store.health = view.health;
   const boot = document.getElementById('boot-banner');
-  if (boot) boot.hidden = true;
+  if (boot) {
+    boot.hidden = true;
+    if (typeof boot.setAttribute === 'function') boot.setAttribute('hidden', '');
+  }
   renderAll();
   return true;
 }
@@ -587,6 +590,29 @@ function renderStrategyAlert() {
  * wiring task's own placement ("renderStrategies(...): ... and the
  * pause/resume control"), even though trading_control is account-scoped,
  * not per-strategy. */
+function ccFindTradingControl(view, accountId) {
+  const controls = (view && view.trading_control) || [];
+  if (!controls.length) return null;
+  const accounts = (view && view.accounts) || [];
+  const account = accounts[0] || {};
+  const candidates = [accountId, account.entity_id, account.account_id]
+    .filter((value) => value !== null && value !== undefined && value !== '')
+    .map((value) => String(value));
+  if (candidates.length) {
+    const match = controls.find((tc) => {
+      const ids = [tc.account_id, tc.entity_id]
+        .filter((value) => value !== null && value !== undefined && value !== '')
+        .map((value) => String(value));
+      return ids.some((id) => candidates.includes(id));
+    });
+    if (match) return match;
+  }
+  // Single-account books often have one control row; prefer it over an
+  // infinite "waiting…" state when the account id field naming drifts.
+  if (controls.length === 1) return controls[0];
+  return null;
+}
+
 function renderPauseControl() {
   if (!CFG.commandsEnabled) return;
   const toggle = document.getElementById('cc-pause-toggle');
@@ -595,10 +621,12 @@ function renderPauseControl() {
   const v = store.view; if (!v) return;
   const account = (v.accounts || [])[0] || {};
   const accountId = account.entity_id || account.account_id;
-  const control = (v.trading_control || []).find(tc =>
-      tc.account_id === accountId || tc.entity_id === accountId);
+  const control = ccFindTradingControl(v, accountId);
   if (!control) {
-    stateEl.textContent = 'waiting for trading_control…';
+    const controls = v.trading_control || [];
+    stateEl.textContent = controls.length
+      ? 'trading control account mismatch'
+      : 'trading control unavailable';
     toggle.textContent = 'Pause new trading';
     toggle.disabled = true;
     toggle.onclick = null;
@@ -607,10 +635,12 @@ function renderPauseControl() {
   toggle.disabled = false;
   const paused = !!control.new_exposure_paused;
   const revision = control.revision;
+  const pauseAccountId = control.account_id || control.entity_id || accountId;
   stateEl.textContent = paused ? '⏸ paused' : '● active';
   toggle.textContent = paused ? 'Resume new trading' : 'Pause new trading';
-  toggle.onclick = () => ccSetPause(accountId, !paused, revision);
+  toggle.onclick = () => ccSetPause(pauseAccountId, !paused, revision);
 }
+globalThis.ccFindTradingControl = ccFindTradingControl;
 
 function renderRisk() {
   const v = store.view; if (!v) return;

@@ -22,7 +22,16 @@ DEFAULT_TIMEOUTS = {
     "news": 15.0,
     "ideas": 30.0,
 }
-_SENSITIVE_PARAM_PARTS = ("api_key", "apikey", "authorization", "password", "secret", "token")
+_SENSITIVE_PARAM_PARTS = (
+    "apikey",
+    "accesskey",
+    "authorization",
+    "credentials",
+    "credential",
+    "password",
+    "secret",
+    "token",
+)
 
 
 @dataclass(frozen=True)
@@ -40,8 +49,13 @@ def _safe_log_params(params: dict[str, Any] | None) -> dict[str, Any]:
     return {
         str(key): _safe_log_value(value)
         for key, value in params.items()
-        if not any(part in str(key).lower() for part in _SENSITIVE_PARAM_PARTS)
+        if not _is_sensitive_param_key(key)
     }
+
+
+def _is_sensitive_param_key(key: Any) -> bool:
+    canonical = "".join(character for character in str(key).lower() if character.isalnum())
+    return any(part in canonical for part in _SENSITIVE_PARAM_PARTS)
 
 
 def _safe_log_value(value: Any) -> Any:
@@ -72,6 +86,8 @@ class ResearchService:
             max_workers=workers, thread_name_prefix="cc-research"
         )
         self._slots = threading.BoundedSemaphore(workers)
+        self._wrapped_futures: set[asyncio.Future[ResearchResult]] = set()
+        self._wrapped_futures_lock = threading.Lock()
         self._timeouts = {**DEFAULT_TIMEOUTS, **(timeouts or {})}
         self._clock = clock or self._utc_now
         self._closed = False
@@ -97,6 +113,22 @@ class ResearchService:
         del completed
         self._slots.release()
 
+    def _retain_and_drain(self, wrapped: asyncio.Future[ResearchResult]) -> None:
+        """Consume a late provider failure after its request waiter has left."""
+        with self._wrapped_futures_lock:
+            self._wrapped_futures.add(wrapped)
+
+        def drain(completed: asyncio.Future[ResearchResult]) -> None:
+            try:
+                completed.exception()
+            except asyncio.CancelledError:
+                pass
+            finally:
+                with self._wrapped_futures_lock:
+                    self._wrapped_futures.discard(completed)
+
+        wrapped.add_done_callback(drain)
+
     async def run(
         self,
         tool: str,
@@ -119,44 +151,47 @@ class ResearchService:
             )
 
         try:
-            future = self._executor.submit(lambda: operation(self._get_provider()))
-        except Exception as exc:
-            self._slots.release()
-            outcome = "upstream_error"
-            logger.warning("research %s submit failed: %s", tool, type(exc).__name__)
-            raise ResearchError(
-                502,
-                "RESEARCH_UPSTREAM_ERROR",
-                f"{tool.title()} provider request failed.",
-                True,
-            ) from exc
+            try:
+                future = self._executor.submit(lambda: operation(self._get_provider()))
+            except Exception as exc:
+                self._slots.release()
+                outcome = "upstream_error"
+                logger.warning("research %s submit failed: %s", tool, type(exc).__name__)
+                raise ResearchError(
+                    502,
+                    "RESEARCH_UPSTREAM_ERROR",
+                    f"{tool.title()} provider request failed.",
+                    True,
+                ) from exc
 
-        future.add_done_callback(self._release_slot)
-        try:
-            result = await asyncio.wait_for(
-                asyncio.shield(asyncio.wrap_future(future)), self._timeouts[tool]
-            )
-            outcome = "ok"
-        except asyncio.TimeoutError as exc:
-            outcome = "timeout"
-            raise ResearchError(
-                504,
-                "RESEARCH_TIMEOUT",
-                f"{tool.title()} did not complete within {self._timeouts[tool]:g} seconds.",
-                True,
-            ) from exc
-        except ResearchError:
-            outcome = "configuration_error"
-            raise
-        except Exception as exc:
-            outcome = "upstream_error"
-            logger.warning("research %s failed: %s", tool, type(exc).__name__)
-            raise ResearchError(
-                502,
-                "RESEARCH_UPSTREAM_ERROR",
-                f"{tool.title()} provider request failed.",
-                True,
-            ) from exc
+            future.add_done_callback(self._release_slot)
+            wrapped = asyncio.wrap_future(future)
+            self._retain_and_drain(wrapped)
+            try:
+                result = await asyncio.wait_for(
+                    asyncio.shield(wrapped), self._timeouts[tool]
+                )
+                outcome = "ok"
+            except asyncio.TimeoutError as exc:
+                outcome = "timeout"
+                raise ResearchError(
+                    504,
+                    "RESEARCH_TIMEOUT",
+                    f"{tool.title()} did not complete within {self._timeouts[tool]:g} seconds.",
+                    True,
+                ) from exc
+            except ResearchError:
+                outcome = "configuration_error"
+                raise
+            except Exception as exc:
+                outcome = "upstream_error"
+                logger.warning("research %s failed: %s", tool, type(exc).__name__)
+                raise ResearchError(
+                    502,
+                    "RESEARCH_UPSTREAM_ERROR",
+                    f"{tool.title()} provider request failed.",
+                    True,
+                ) from exc
         finally:
             logger.info(
                 "research tool=%s outcome=%s duration_ms=%d params=%r",

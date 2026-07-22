@@ -4,11 +4,20 @@
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <title>MMR Dashboard</title>
-  <link rel="preconnect" href="https://fonts.googleapis.com">
-  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
-  <link href="https://fonts.googleapis.com/css2?family=Archivo:wght@400;600;700;800&display=swap"
-        rel="stylesheet">
+  <!-- Theme boot must run before first paint so a stored dark preference
+       doesn't flash light; the strict CSP (script-src 'self') forbids
+       inline scripts, hence a tiny synchronous external file. -->
+  <script src="/static/cc_theme.js"></script>
   <style>
+    /* Archivo is self-hosted: the strict CSP (style-src/font-src 'self')
+       blocks Google Fonts, and the dashboard must work without internet. */
+    @font-face {
+      font-family: "Archivo";
+      font-style: normal;
+      font-weight: 400 800;
+      font-display: swap;
+      src: url(/static/fonts/archivo-latin-var.woff2) format("woff2");
+    }
     /* Modernist (claude.ai/design "Dashboard Redesign", direction 1c):
        Archivo throughout, a visible modular grid drawn with 2px rules, zero
        corner radius, light ground, red reserved for the primary action and
@@ -39,6 +48,27 @@
       --radius: 0px;
       --radius-lg: 0px;
       --shadow-lg: 0 12px 32px color-mix(in srgb, #2d2b2b 22%, transparent);
+      color-scheme: light;
+    }
+    /* Dark theme — design direction 1b: the same modular grid on a warm
+       dark ground for long sessions. Toggled by cc_theme.js via
+       data-theme on <html>, persisted in localStorage. */
+    :root[data-theme="dark"] {
+      --bg: #1b1917;
+      --panel: #1b1917;
+      --panel-2: #242120;
+      --border: color-mix(in srgb, #f4f1ef 24%, transparent);
+      --border-soft: color-mix(in srgb, #f4f1ef 12%, transparent);
+      --fg: #f4f1ef;
+      --dim: color-mix(in srgb, #f4f1ef 55%, transparent);
+      --pos: #54c07a;
+      --neg: #ff5a3d;
+      --accent: #ff5a3d;
+      --accent-deep: #ff9783;
+      --warn: #e0a53a;
+      --chip: #242120;
+      --shadow-lg: 0 12px 32px rgba(0, 0, 0, .55);
+      color-scheme: dark;
     }
     * { box-sizing: border-box; }
     body {
@@ -113,6 +143,11 @@
     .dash-tab .chip::before { display: none; }
     .dash-tab.active .chip { background: var(--accent); color: var(--bg); }
     #last-event-time { margin-left: auto; color: var(--dim); font-size: 12px; align-self: center; }
+    #theme-toggle {
+      align-self: center;
+      margin: 0 0 0 var(--space-4);
+      min-width: 58px;
+    }
     .flash {
       padding: 10px var(--space-6);
       background: color-mix(in srgb, var(--fg) 6%, transparent);
@@ -1353,6 +1388,8 @@
     <button type="button" class="dash-tab" data-dash-tab="guide">Guide</button>
     <span id="last-event-time" title="Latest authoritative event time">
       last event: <span class="v">—</span></span>
+    <button type="button" id="theme-toggle" aria-pressed="false"
+            title="Switch color theme">Dark</button>
   </nav>
   <!-- Command band (design 1c): identity + dependency health | net liq |
        day P&L | the two account-scoped actions. Sits above the tab panes

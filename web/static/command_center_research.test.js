@@ -1,0 +1,217 @@
+'use strict';
+
+const assert = require('node:assert/strict');
+const {makeHarness} = require('./research_test_harness.js');
+
+let passed = 0;
+async function test(name, callback) {
+  try {
+    await callback();
+    passed += 1;
+  } catch (error) {
+    error.message = `${name}: ${error.message}`;
+    throw error;
+  }
+}
+
+function response(data, title, meta = {}) {
+  return {data, title, meta: {provider: 'massive', ...meta}};
+}
+
+(async () => {
+  await test('initialization fetches presets only and does not scan', async () => {
+    const h = makeHarness();
+    h.fetch.enqueue(200, response([{preset: 'momentum'}, {preset: 'value'}], 'Presets', {
+      tool: 'presets', provider: 'local',
+    }));
+    h.loadProductionScript();
+    await h.start();
+
+    assert.deepEqual(h.fetch.calls.map((call) => call.url), ['/api/research/presets']);
+    assert.equal(h.api.state.presets.data.length, 2);
+    assert.match(h.elements.get('research-controls').innerHTML, /momentum/);
+    assert.equal(h.api.state.ideas.data, null);
+  });
+
+  await test('Ideas controls include all filters and repeat normalized tickers', async () => {
+    const h = makeHarness();
+    h.loadProductionScript();
+    h.api.renderControls();
+    const html = h.elements.get('research-controls').innerHTML;
+    for (const name of [
+      'preset', 'source', 'tickers', 'universe', 'num', 'min_price', 'max_price',
+      'min_volume', 'min_change', 'max_change', 'fundamentals', 'news', 'names',
+    ]) assert.match(html, new RegExp(`name="${name}"`));
+
+    const params = h.api.paramsFromForm(h.form('ideas', [
+      ['source', 'tickers'], ['tickers', ' aapl, msft  AAPL '], ['num', '12'],
+    ], [{name: 'fundamentals', checked: true}, {name: 'news', checked: false}]));
+    assert.deepEqual(params.getAll('tickers'), ['AAPL', 'MSFT', 'AAPL']);
+    assert.equal(params.get('fundamentals'), 'true');
+    assert.equal(params.get('news'), 'false');
+  });
+
+  await test('tool state and selection survive switching and a failed refresh', async () => {
+    const h = makeHarness();
+    h.loadProductionScript();
+    h.fetch.enqueue(200, response([
+      {ticker: 'AAPL', score: 5}, {ticker: 'MSFT', score: 4},
+    ], 'Ideas: momentum', {tool: 'ideas', observed_at: '2026-07-22T10:00:00Z'}));
+    await h.api.run('ideas', new URLSearchParams({preset: 'momentum'}));
+    h.api.selectRow(1);
+    const priorMeta = h.api.state.ideas.meta;
+
+    h.api.selectTool('movers');
+    h.api.selectTool('ideas');
+    assert.equal(h.api.state.ideas.selected.ticker, 'MSFT');
+    assert.match(h.elements.get('research-results').innerHTML, /AAPL/);
+
+    h.fetch.enqueue(502, {error: {code: 'RESEARCH_UPSTREAM_ERROR',
+      message: 'Ideas provider request failed.', retryable: true}});
+    await h.api.run('ideas', new URLSearchParams({preset: 'momentum'}));
+    assert.equal(h.api.state.ideas.data.length, 2);
+    assert.equal(h.api.state.ideas.selected.ticker, 'MSFT');
+    assert.equal(h.api.state.ideas.meta, priorMeta);
+    assert.match(h.elements.get('research-status').textContent, /provider request failed/i);
+  });
+
+  await test('network failure preserves last successful result', async () => {
+    const h = makeHarness();
+    h.loadProductionScript();
+    h.api.selectTool('movers');
+    h.fetch.enqueue(200, response([{ticker: 'NVDA'}], 'Movers', {tool: 'movers'}));
+    await h.api.run('movers', new URLSearchParams());
+    h.fetch.reject('offline');
+    await h.api.run('movers', new URLSearchParams());
+
+    assert.equal(h.api.state.movers.data[0].ticker, 'NVDA');
+    assert.equal(h.api.state.movers.error.code, 'NETWORK_ERROR');
+    assert.match(h.elements.get('research-status').textContent, /offline/i);
+  });
+
+  await test('valid empty response is rendered as no results rather than an error', async () => {
+    const h = makeHarness();
+    h.loadProductionScript();
+    h.api.selectTool('movers');
+    h.fetch.enqueue(200, response([], 'Movers', {tool: 'movers'}));
+    await h.api.run('movers', new URLSearchParams());
+
+    assert.deepEqual(h.api.state.movers.data, []);
+    assert.equal(h.api.state.movers.error, null);
+    assert.match(h.elements.get('research-status').textContent, /no results/i);
+    assert.equal(h.elements.get('research-results').innerHTML.includes('research-error'), false);
+  });
+
+  await test('missing configuration is shown safely in a visible banner', async () => {
+    const h = makeHarness();
+    h.loadProductionScript();
+    h.fetch.enqueue(503, {error: {code: 'MASSIVE_NOT_CONFIGURED',
+      message: '<img src=x onerror=alert(1)> Massive API key is not configured.',
+      retryable: false}});
+    await h.api.run('movers', new URLSearchParams());
+
+    const banner = h.elements.get('research-config-banner');
+    assert.equal(banner.hidden, false);
+    assert.equal(banner.innerHTML, '');
+    assert.match(banner.textContent, /^<img/);
+    assert.equal(h.api.state.movers.error.code, 'MASSIVE_NOT_CONFIGURED');
+  });
+
+  await test('every provider field rendered through innerHTML is escaped', async () => {
+    const h = makeHarness();
+    h.loadProductionScript();
+    h.fetch.enqueue(200, response([{
+      ticker: '<script>alert(1)</script>',
+      label: '<img src=x onerror=alert(2)>',
+      nested: {value: '<svg onload=alert(3)>'},
+    }], '<b>unsafe title</b>', {
+      tool: 'ideas', provider: '<i>bad provider</i>', observed_at: '<time>bad</time>',
+    }));
+    await h.api.run('ideas', new URLSearchParams());
+    h.api.selectRow(0);
+
+    const html = h.elements.get('research-results').innerHTML
+      + h.elements.get('research-detail').innerHTML;
+    assert.doesNotMatch(html, /<script>|<img|<svg|<b>|<i>|<time>/);
+    assert.match(html, /&lt;script&gt;/);
+    assert.match(html, /&lt;img/);
+    assert.match(html, /&lt;svg/);
+    assert.match(html, /&lt;b&gt;/);
+    assert.match(html, /&lt;i&gt;/);
+  });
+
+  await test('result rows support click and keyboard Enter selection', async () => {
+    const h = makeHarness();
+    h.loadProductionScript();
+    h.fetch.enqueue(200, response([], 'Presets', {tool: 'presets', provider: 'local'}));
+    await h.start();
+    h.fetch.enqueue(200, response([{ticker: 'AAPL'}, {ticker: 'MSFT'}], 'Ideas'));
+    await h.api.run('ideas', new URLSearchParams());
+    const results = h.elements.get('research-results');
+
+    results.dispatch('click', {target: h.rowTarget(1)});
+    assert.equal(h.api.state.ideas.selected.ticker, 'MSFT');
+    results.dispatch('keydown', {key: 'Enter', preventDefault() {}, target: h.rowTarget(0)});
+    assert.equal(h.api.state.ideas.selected.ticker, 'AAPL');
+    assert.match(results.innerHTML, /tabindex="0"/);
+  });
+
+  await test('Lookup snapshot success and News failure remain independent', async () => {
+    const h = makeHarness();
+    h.loadProductionScript();
+    h.api.selectTool('lookup');
+    h.fetch.enqueue(200, response({ticker: 'AAPL', price: 222}, 'Snapshot', {
+      tool: 'snapshot', observed_at: '2026-07-22T10:00:00Z',
+    }));
+    h.fetch.enqueue(502, {error: {code: 'RESEARCH_UPSTREAM_ERROR',
+      message: 'News provider request failed.', retryable: true}});
+    await h.api.run('lookup', new URLSearchParams({symbol: 'AAPL', limit: '5', source: 'benzinga'}));
+
+    assert.equal(h.api.state.lookup.snapshot.data.price, 222);
+    assert.equal(h.api.state.lookup.snapshot.error, null);
+    assert.equal(h.api.state.lookup.news.data, null);
+    assert.equal(h.api.state.lookup.news.error.code, 'RESEARCH_UPSTREAM_ERROR');
+    const html = h.elements.get('research-results').innerHTML;
+    assert.match(html, /data-lookup-part="snapshot"/);
+    assert.match(html, /AAPL/);
+    assert.match(html, /data-lookup-part="news"/);
+    assert.match(html, /News provider request failed/);
+    assert.match(h.fetch.calls[0].url, /\/snapshot\?symbol=AAPL$/);
+    assert.match(h.fetch.calls[1].url, /\/news\?ticker=AAPL&limit=5&source=benzinga$/);
+  });
+
+  await test('provider and observed-time labels render with results and detail', async () => {
+    const h = makeHarness();
+    h.loadProductionScript();
+    h.fetch.enqueue(200, response([{ticker: 'AAPL'}], 'Ideas: momentum', {
+      tool: 'ideas', observed_at: '2026-07-22T10:00:00Z',
+    }));
+    await h.api.run('ideas', new URLSearchParams());
+    const results = h.elements.get('research-results').innerHTML;
+    const detail = h.elements.get('research-detail').innerHTML;
+    assert.match(results, /Ideas: momentum/);
+    assert.match(results, /massive/);
+    assert.match(results, /2026-07-22T10:00:00Z/);
+    assert.match(detail, /massive/);
+  });
+
+  await test('disabled Later tools cannot select or request', async () => {
+    const h = makeHarness();
+    h.loadProductionScript();
+    h.fetch.enqueue(200, response([], 'Presets', {tool: 'presets', provider: 'local'}));
+    await h.start();
+    h.fetch.calls.length = 0;
+    const disabled = h.tools.find((tool) => tool.dataset.researchTool === 'scan');
+    disabled.dispatch('click');
+    const result = await h.api.run('scan', new URLSearchParams());
+
+    assert.equal(result, null);
+    assert.equal(h.fetch.calls.length, 0);
+    assert.equal(h.api.activeTool(), 'ideas');
+  });
+
+  console.log(`command_center_research.test.js: ${passed} tests passed`);
+})().catch((error) => {
+  console.error(error);
+  process.exitCode = 1;
+});

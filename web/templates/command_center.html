@@ -737,7 +737,8 @@
     #dash-trading .info,
     #dash-scaling .info,
     #dash-guide .info,
-    .dash-admin-pane .info {
+    .dash-admin-pane .info,
+    .cc-drawer .info {
       position: relative;
       display: inline-flex;
       align-items: center;
@@ -764,7 +765,9 @@
     #dash-guide .info:hover,
     #dash-guide .info:focus,
     .dash-admin-pane .info:hover,
-    .dash-admin-pane .info:focus {
+    .dash-admin-pane .info:focus,
+    .cc-drawer .info:hover,
+    .cc-drawer .info:focus {
       color: var(--accent);
       border-color: var(--accent);
       outline: none;
@@ -772,7 +775,8 @@
     #dash-trading .tip,
     #dash-scaling .tip,
     #dash-guide .tip,
-    .dash-admin-pane .tip {
+    .dash-admin-pane .tip,
+    .cc-drawer .tip {
       display: none;
       position: fixed;
       z-index: 60;
@@ -1775,34 +1779,40 @@
     </h2>
     <form id="cc-proposal-form">
       <div class="cc-resolve-row">
-        <label>Symbol
+        <label>Symbol {{ info('Ticker to resolve via IB into an exact contract ID. Prefer the listed US symbol unless you set exchange/currency for a non-US listing.') }}
           <input name="resolve_symbol" type="text" maxlength="32"
                  placeholder="AAPL" autocomplete="off"></label>
-        <label>Exchange
+        <label>Exchange {{ info('Optional primary exchange hint (e.g. ASX, SEHK). Leave empty for US SMART routing — wrong exchange can resolve the wrong listing.') }}
           <input name="resolve_exchange" type="text" maxlength="16"
                  placeholder="(US: empty)"></label>
-        <label>Currency
+        <label>Currency {{ info('Optional currency hint (USD, AUD, …) paired with exchange for international symbols.') }}
           <input name="resolve_currency" type="text" maxlength="8"
                  placeholder="USD"></label>
         <button type="button" id="cc-resolve-symbol" class="primary">Resolve</button>
       </div>
       <p id="cc-resolve-status" class="cc-resolve-status" aria-live="polite"></p>
-      <label>Instrument conId
+      <label>Instrument conId {{ info('Interactive Brokers contract ID. Research Propose fills this after Resolve. Never guess — a wrong conId trades the wrong instrument.') }}
         <input name="conid" type="number" step="1" min="1" required
                placeholder="resolved or paste conId"></label>
-      <label>Side
+      <label>Side {{ info('BUY opens or adds a long; SELL reduces or closes a long. Research defaults from the scanner signal when present.') }}
         <select name="action"><option>BUY</option><option>SELL</option></select>
       </label>
       <fieldset>
-        <legend>Size — leave both empty for automatic position sizing</legend>
-        <label>Quantity <input name="quantity" type="number" step="any" min="0"></label>
-        <label>Notional amount <input name="amount" type="number" step="0.01" min="0"></label>
+        <legend>Size — leave both empty for automatic position sizing
+          {{ info('Blank quantity and amount lets the PositionSizer choose size from account, confidence, volatility (ATR), and liquidity. Fill only one if you need a fixed size.') }}</legend>
+        <label>Quantity {{ info('Share/contract count. Leave empty with amount empty for auto-sizing.') }}
+          <input name="quantity" type="number" step="any" min="0"></label>
+        <label>Notional amount {{ info('Dollar (or account currency) notional to spend. Leave empty with quantity empty for auto-sizing.') }}
+          <input name="amount" type="number" step="0.01" min="0"></label>
       </fieldset>
-      <label>Confidence (0–1)
+      <label>Confidence (0–1) {{ info('How strongly you believe the thesis. Scales position size (higher → larger). Research prefills from score or move size; you can override.') }}
         <input name="confidence" type="number" step="0.05" min="0" max="1"></label>
-      <label>Group tag <input name="group" maxlength="40"></label>
-      <label>Thesis <input name="thesis" maxlength="4000"></label>
-      <label>Reasoning <textarea name="reasoning" rows="4"></textarea></label>
+      <label>Group tag {{ info('Optional portfolio group (e.g. tech, mining) for allocation budgets. Research Propose uses “research” by default.') }}
+        <input name="group" maxlength="40"></label>
+      <label>Thesis {{ info('Short one-line summary shown on proposal cards. Research prefills ticker + company/source.') }}
+        <input name="thesis" maxlength="4000"></label>
+      <label>Reasoning {{ info('Longer notes for review/audit before approve. Research prefills key metrics from the selected row.') }}
+        <textarea name="reasoning" rows="4"></textarea></label>
       <div class="cc-drawer-actions">
         <button type="submit" data-cc-command="create_proposal">Create proposal</button>
         <button type="button" id="cc-proposal-cancel">Cancel</button>

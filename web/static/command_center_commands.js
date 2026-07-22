@@ -251,12 +251,32 @@ async function ccOpenResearchProposal(instrument) {
   const form = document.getElementById('cc-proposal-form');
   if (!form) return;
   const selected = instrument || {};
+  const setValue = (name, value) => {
+    if (!form[name]) return;
+    form[name].value = value;
+  };
   form.reset();
-  form.resolve_symbol.value = String(selected.ticker || selected.symbol || '')
-      .trim().toUpperCase();
-  form.resolve_exchange.value = String(selected.exchange || '').trim();
-  form.resolve_currency.value = String(selected.currency || '').trim();
-  form.conid.value = '';
+  setValue('resolve_symbol', String(selected.ticker || selected.symbol || '')
+      .trim().toUpperCase());
+  setValue('resolve_exchange', String(selected.exchange || '').trim());
+  setValue('resolve_currency', String(selected.currency || '').trim());
+  setValue('conid', '');
+  const action = String(selected.action || 'BUY').trim().toUpperCase();
+  setValue('action', (action === 'SELL') ? 'SELL' : 'BUY');
+  // Leave quantity/amount blank so the server auto-sizes from confidence.
+  setValue('quantity', '');
+  setValue('amount', '');
+  if (selected.confidence != null && selected.confidence !== '') {
+    const confidence = Number(selected.confidence);
+    setValue('confidence', Number.isFinite(confidence)
+      ? String(Math.min(1, Math.max(0, confidence)))
+      : '');
+  } else {
+    setValue('confidence', '');
+  }
+  setValue('group', String(selected.group || '').trim());
+  setValue('thesis', String(selected.thesis || '').trim());
+  setValue('reasoning', String(selected.reasoning || ''));
   ccOpenProposalDrawer();
   await ccResolveSymbol();
 }

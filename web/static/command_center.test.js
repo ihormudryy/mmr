@@ -256,7 +256,7 @@ async function test(name, fn) {
     assert.match(html, />45s<\/span>/);
   });
 
-  await test('research proposal resets stale intent and resolves only the instrument', async () => {
+  await test('research proposal prefills research defaults, keeps size blank, and resolves', async () => {
     const {elements, run} = makeContext();
     const form = run("document.getElementById('cc-proposal-form')");
     const fieldNames = [
@@ -279,8 +279,8 @@ async function test(name, fn) {
 
     await run(`ccOpenResearchProposal({
       ticker: ' aapl ', exchange: ' NASDAQ ', currency: ' USD ',
-      action: 'SELL', quantity: 100, amount: 999, confidence: 1,
-      thesis: 'provider intent', reasoning: 'provider reasoning'
+      action: 'SELL', quantity: 100, amount: 999, confidence: 0.7,
+      group: 'research', thesis: 'provider intent', reasoning: 'provider reasoning'
     })`);
 
     assert.equal(form.resetCalls, 1);
@@ -288,10 +288,13 @@ async function test(name, fn) {
     assert.equal(form.resolve_exchange.value, 'NASDAQ');
     assert.equal(form.resolve_currency.value, 'USD');
     assert.equal(form.conid.value, '');
-    assert.equal(form.action.value, 'BUY');
-    for (const name of [
-      'quantity', 'amount', 'confidence', 'group', 'thesis', 'reasoning',
-    ]) assert.equal(form[name].value, '');
+    assert.equal(form.action.value, 'SELL');
+    assert.equal(form.quantity.value, '');
+    assert.equal(form.amount.value, '');
+    assert.equal(form.confidence.value, '0.7');
+    assert.equal(form.group.value, 'research');
+    assert.equal(form.thesis.value, 'provider intent');
+    assert.equal(form.reasoning.value, 'provider reasoning');
     assert.equal(elements.get('cc-proposal-drawer').hidden, false);
     assert.equal(run('globalThis.resolveCalls'), 1);
     assert.equal(run('globalThis.submitCalls'), 0);

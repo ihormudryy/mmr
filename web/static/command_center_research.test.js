@@ -360,15 +360,16 @@ function proposalTarget() {
       /data-research-propose/);
   });
 
-  await test('eligible Ideas proposal delegates only the instrument and never posts', async () => {
+  await test('eligible Ideas proposal prefills research defaults and never posts', async () => {
     const h = proposalHarness(true);
     h.fetch.enqueue(200, response([], 'Presets', {
       tool: 'presets', provider: 'local',
     }));
     await h.start();
     h.fetch.enqueue(200, response([{
-      ticker: 'AAPL', exchange: 'NASDAQ', currency: 'USD', action: 'SELL',
-      quantity: 100, confidence: 1, thesis: 'provider thesis',
+      ticker: 'AAPL', exchange: 'NASDAQ', currency: 'USD', signal: 'BUY',
+      score: 72, change_pct: 3.2, price: 210, volume: 12_000_000,
+      details: {name: 'Apple Inc', description: 'Consumer electronics.'},
     }], 'Ideas', {tool: 'ideas'}));
     await h.api.run('ideas', new URLSearchParams());
     const fetchCount = h.fetch.calls.length;
@@ -380,10 +381,17 @@ function proposalTarget() {
     });
 
     assert.equal(h.context.proposalCalls.length, 1);
-    assert.deepEqual(
-      JSON.parse(JSON.stringify(h.context.proposalCalls[0])),
-      {ticker: 'AAPL', exchange: 'NASDAQ', currency: 'USD'},
-    );
+    const payload = h.context.proposalCalls[0];
+    assert.equal(payload.ticker, 'AAPL');
+    assert.equal(payload.exchange, 'NASDAQ');
+    assert.equal(payload.currency, 'USD');
+    assert.equal(payload.action, 'BUY');
+    assert.equal(payload.confidence, 0.72);
+    assert.equal(payload.group, 'research');
+    assert.match(payload.thesis, /Apple Inc/);
+    assert.match(payload.reasoning, /Score: 72/);
+    assert.match(payload.reasoning, /Change: \+3\.20%/);
+    assert.match(payload.reasoning, /Consumer electronics/);
     assert.equal(h.fetch.calls.length, fetchCount);
     assert.equal(h.fetch.calls.some((call) =>
       call.url === '/api/commands/proposals'), false);

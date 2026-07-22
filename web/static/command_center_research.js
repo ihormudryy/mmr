@@ -507,11 +507,87 @@
     return tool === 'ideas' || tool === 'lookup';
   }
 
-  function proposalInstrument(data) {
+  function proposalConfidence(data) {
+    const score = Number(data && data.score);
+    if (Number.isFinite(score) && score > 0) {
+      return Math.round(Math.min(0.95, Math.max(0.35, score / 100)) * 100) / 100;
+    }
+    const changePct = Math.abs(Number(
+      data && (data.change_pct ?? data.change_percent ?? data.percent_change)));
+    if (Number.isFinite(changePct) && changePct > 0) {
+      return Math.round(Math.min(0.85, Math.max(0.4, 0.45 + (changePct / 25))) * 100) / 100;
+    }
+    return 0.55;
+  }
+
+  function proposalAction(data) {
+    const signal = String(data && data.signal || '').trim().toUpperCase();
+    if (signal === 'BUY' || signal === 'SELL') return signal;
+    return 'BUY';
+  }
+
+  function proposalThesis(data, tool) {
+    const ticker = String(data.ticker ?? data.symbol ?? '').trim().toUpperCase();
+    const company = data.details && data.details.name
+      ? String(data.details.name).trim()
+      : String(data.name || '').trim();
+    const label = tool === 'ideas' ? 'Ideas scan'
+      : (tool === 'movers' ? 'Movers' : 'Lookup');
+    if (company) return `${label}: ${ticker} — ${company}`.slice(0, 4000);
+    return `${label}: ${ticker}`.slice(0, 4000);
+  }
+
+  function proposalReasoning(data, tool) {
+    const lines = [];
+    const ticker = String(data.ticker ?? data.symbol ?? '').trim().toUpperCase();
+    lines.push(`Prefill from Research ${tool || 'result'} for ${ticker}.`);
+    if (data.signal != null && String(data.signal).trim()) {
+      lines.push(`Scanner signal: ${String(data.signal).trim()}.`);
+    }
+    if (data.score != null && data.score !== '') {
+      lines.push(`Score: ${formatNumber(data.score, 1)}.`);
+    }
+    const changePct = data.change_pct ?? data.change_percent ?? data.percent_change;
+    if (changePct != null && changePct !== '') {
+      lines.push(`Change: ${formatPct(changePct)}.`);
+    }
+    const price = data.close ?? data.last ?? data.price
+      ?? (data.day && data.day.close);
+    if (price != null && price !== '') {
+      lines.push(`Price: ${formatNumber(price)}.`);
+    }
+    const volume = data.volume ?? (data.day && data.day.volume);
+    if (volume != null && volume !== '') {
+      lines.push(`Volume: ${formatVolume(volume)}.`);
+    }
+    if (data.gap_pct != null && data.gap_pct !== '') {
+      lines.push(`Gap: ${formatPct(data.gap_pct)}.`);
+    }
+    if (data.rel_vol != null && data.rel_vol !== '') {
+      lines.push(`Rel volume: ${formatNumber(data.rel_vol, 2)}×.`);
+    }
+    if (data.details && data.details.description) {
+      lines.push(String(data.details.description).trim().slice(0, 400));
+    }
+    if (data.news && data.news.title) {
+      const sentiment = data.news.sentiment ? ` (${data.news.sentiment})` : '';
+      lines.push(`News: ${String(data.news.title).trim()}${sentiment}`);
+    }
+    lines.push('Quantity/amount left blank for automatic position sizing.');
+    return lines.join('\n').slice(0, 8000);
+  }
+
+  function proposalInstrument(data, tool) {
+    const row = data || {};
     return {
-      ticker: String(data.ticker ?? data.symbol ?? '').trim().toUpperCase(),
-      exchange: String(data.exchange ?? data.primary_exchange ?? '').trim(),
-      currency: String(data.currency ?? '').trim(),
+      ticker: String(row.ticker ?? row.symbol ?? '').trim().toUpperCase(),
+      exchange: String(row.exchange ?? row.primary_exchange ?? '').trim(),
+      currency: String(row.currency ?? '').trim(),
+      action: proposalAction(row),
+      confidence: proposalConfidence(row),
+      group: 'research',
+      thesis: proposalThesis(row, tool),
+      reasoning: proposalReasoning(row, tool),
     };
   }
 
@@ -602,7 +678,7 @@
     if (!proposalsEnabled() || !equityResult(target.selected, currentTool)) return false;
     const hook = globalThis.ccOpenResearchProposal;
     if (typeof hook !== 'function') return false;
-    hook(proposalInstrument(target.selected));
+    hook(proposalInstrument(target.selected, currentTool));
     return true;
   }
 

@@ -1,0 +1,121 @@
+/* Research is intentionally self-contained so the command center's existing
+   layout and visual system remain the source of truth for every other tab. */
+#dash-research {
+  padding: var(--space-5) var(--space-6) var(--space-6);
+}
+
+#dash-research .research-layout {
+  display: grid;
+  grid-template-columns: 220px minmax(0, 1fr) minmax(280px, .75fr);
+  align-items: start;
+  gap: var(--space-4);
+}
+
+#dash-research .research-tools {
+  display: grid;
+  gap: var(--space-2);
+}
+
+#dash-research .research-tool {
+  width: 100%;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: var(--space-2);
+  padding: var(--space-3) var(--space-4);
+  background: transparent;
+  border: 1px solid var(--border-soft);
+  border-radius: var(--radius);
+  color: var(--dim);
+  cursor: pointer;
+  font: 800 12px/1.2 var(--font-heading);
+  letter-spacing: .05em;
+  text-align: left;
+  text-transform: uppercase;
+}
+
+#dash-research .research-tool:hover:not(:disabled),
+#dash-research .research-tool.active {
+  border-color: var(--border);
+  color: var(--fg);
+  background: color-mix(in srgb, var(--fg) 4%, transparent);
+}
+
+#dash-research .research-tool.active {
+  box-shadow: inset 3px 0 0 var(--accent);
+}
+
+#dash-research .research-tool:disabled {
+  cursor: not-allowed;
+  opacity: .65;
+}
+
+#dash-research .research-tool span {
+  color: var(--dim);
+  font-size: 10px;
+  letter-spacing: .08em;
+}
+
+#dash-research .research-workspace,
+#dash-research .research-detail {
+  min-width: 0;
+  background: var(--panel);
+  border: 1px solid var(--border);
+}
+
+#dash-research .research-workspace {
+  min-height: 320px;
+}
+
+#dash-research .research-detail {
+  position: sticky;
+  top: var(--space-5);
+  min-height: 180px;
+  padding: var(--space-4);
+}
+
+#dash-research .research-banner,
+#dash-research #research-status {
+  margin: 0;
+  padding: var(--space-3) var(--space-4);
+  border-bottom: 1px solid var(--border-soft);
+}
+
+#dash-research .research-banner {
+  color: var(--warn);
+  background: color-mix(in srgb, var(--warn) 10%, transparent);
+}
+
+#dash-research #research-controls,
+#dash-research #research-results {
+  padding: var(--space-4);
+}
+
+#dash-research #research-status:empty {
+  display: none;
+}
+
+#dash-research :focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 2px;
+}
+
+@media (max-width: 960px) {
+  #dash-research .research-layout {
+    grid-template-columns: 1fr;
+  }
+
+  #dash-research .research-tools {
+    grid-template-columns: repeat(auto-fit, minmax(130px, 1fr));
+  }
+
+  #dash-research .research-detail {
+    position: static;
+  }
+}
+
+@media (max-width: 720px) {
+  #dash-research {
+    padding: var(--space-4);
+  }
+}

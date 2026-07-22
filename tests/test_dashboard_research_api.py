@@ -176,6 +176,25 @@ def test_research_routes_require_session(app_with_research):
         assert client.get(f"/api/research/{path}").status_code == 401
 
 
+def test_research_shell_is_the_sixth_tab(logged_in_research_client):
+    html = logged_in_research_client.get("/cc").text
+    assert 'data-dash-tab="research"' in html
+    assert 'id="dash-research"' in html
+    assert html.index('data-dash-tab="research"') > html.index(
+        'data-dash-tab="guide"')
+    for tool in (
+        "ideas", "movers", "lookup", "scan", "depth", "options", "forex",
+    ):
+        assert f'data-research-tool="{tool}"' in html
+    assert html.count('data-research-later="true"') == 4
+
+
+def test_read_only_page_keeps_research_without_propose(logged_in_research_client):
+    html = logged_in_research_client.get("/cc").text
+    assert 'id="dash-research"' in html
+    assert 'data-research-propose-enabled="false"' in html
+
+
 def test_snapshot_success_is_cli_shaped(logged_in_research_client):
     response = logged_in_research_client.get("/api/research/snapshot?symbol=aapl")
     assert response.status_code == 200

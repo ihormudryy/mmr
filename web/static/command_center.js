@@ -314,6 +314,10 @@ function renderStatusBar() {
   const mode = ccAccountModeValue(account) || 'unknown';
   badge.textContent = mode.toUpperCase();
   badge.className = 'badge ' + (mode === 'live' ? 'live' : mode === 'paper' ? 'paper' : '');
+  // LIVE-mode red command band (design 1c): tint the whole band on a real
+  // account so a live book can never be mistaken for paper.
+  const band = document.getElementById('status-bar');
+  if (band) band.classList.toggle('live', mode === 'live');
   document.getElementById('account-id').textContent =
     account.entity_id || account.account_id || '—';
   const chips = document.getElementById('dependency-chips');
@@ -554,6 +558,28 @@ function renderStrategies() {
         s.last_error ? '⚠ ' + esc(s.last_error) : '—'}</td>${actions}</tr>`;
   }).join('');
   renderPauseControl();
+  renderStrategyAlert();
+}
+
+// Strategy-error alert banner (design 1c error-prevention layer): a red band
+// under the tabs whenever a strategy row is in ERROR, naming the first one and
+// counting the rest. Elevates a failure that would otherwise only show as one
+// red row in the Strategies panel below the fold.
+function renderStrategyAlert() {
+  const el = document.getElementById('strategy-alert');
+  if (!el) return;
+  const v = store.view;
+  const errs = ((v && v.strategies) || []).filter(s =>
+    String(s.strategy_state || s.runtime_state || s.state || '').toUpperCase() === 'ERROR');
+  if (!errs.length) { el.hidden = true; return; }
+  const n = errs.length;
+  el.querySelector('.sa-badge').textContent = `${n} ${n === 1 ? 'error' : 'errors'}`;
+  const first = errs[0];
+  const detail = first.last_error ? ` — ${first.last_error}` : '';
+  const more = n > 1 ? ` · +${n - 1} more` : '';
+  el.querySelector('.sa-msg').textContent =
+    `${ccStrategyName(first)} halted${detail}${more}`;
+  el.hidden = false;
 }
 
 /* ---- [M1-C] UI-wiring pass: account-level pause/resume control ----------
@@ -927,6 +953,20 @@ document.querySelectorAll('[data-proposal-filter]').forEach(btn => {
     renderProposals();
   });
 });
+
+// Strategy-error alert "Review strategies →": switch to the Trading tab
+// (dash_admin.js owns the .dash-tab click) and scroll the Strategies panel
+// into view. Guarded — the banner only exists once the page has rendered.
+(() => {
+  const link = document.querySelector('#strategy-alert .sa-link');
+  if (!link) return;
+  link.addEventListener('click', () => {
+    const tab = document.querySelector('.dash-tab[data-dash-tab="trading"]');
+    if (tab) tab.click();
+    const panel = document.getElementById('strategies-panel');
+    if (panel) panel.scrollIntoView({ behavior: 'smooth', block: 'start' });
+  });
+})();
 
 function ccFindProposalRow(id) {
   const v = store.view; if (!v) return null;

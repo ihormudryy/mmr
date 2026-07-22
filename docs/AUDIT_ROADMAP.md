@@ -253,6 +253,33 @@ e2b2fd1 (VwapReclaim on_prices). These are the residual robustness items.
   source: `TradingTab.dc.html` (claude.ai/design project
   `7f8df979-0181-41aa-b7d2-30e828cd4d95`), Risk & reconciliation panel.
 
+### H2 — Proposal exposure-impact line  (M, low risk)
+
+- **Symptom:** the Modernist redesign's `TradingTab` component shows a
+  **Δ exposure** line on each proposal card — e.g. "AAPL 10.6% → 12.9% · tech
+  48% → 51%" for a directional buy, "energy 0% → 4.2% · gross +$17.7k" for a
+  new sector, "market-neutral · gross +$9.4k" for a beta-weighted pair — so an
+  operator sees how approving *this* proposal moves the book before clicking.
+  The redesign shipped the cards without it because the projected delta is not
+  in the proposal payload.
+- **Mechanism:** the proposal event (`ProposalRecord.to_payload`,
+  `trader/data/proposal_repository.py`) carries symbol/side/qty/amount but no
+  projected exposure. Computing the "before → after" weights needs the current
+  portfolio weights (from `PortfolioRiskAnalyzer`) combined with the proposed
+  fill — i.e. a hypothetical re-run of the concentration/sector/group math with
+  the proposal applied.
+- **Fix:** add a projected-impact block to the proposal payload
+  `{concentration_before_pct, concentration_after_pct, sector, sector_before_pct,
+  sector_after_pct, gross_delta, market_neutral}` computed at propose time (and
+  refreshed if the book moves materially), then render it as `.tt-prop-impact`
+  in `renderProposals` (`web/static/command_center.js`).
+- **NOTE:** do **not** approximate this from notional alone on the client — a
+  reducing/hedging trade or a short would be mis-stated, and a wrong
+  exposure-impact number on a trading dashboard is exactly the "close enough"
+  the project's precision rule forbids. Compute it authoritatively server-side
+  or omit it. Pairs well with **H1** (both surface the same portfolio-risk
+  math). Design source: `TradingTab.dc.html`, proposal card `Δ exposure` line.
+
 ---
 
 ## Recommended sequence

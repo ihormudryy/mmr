@@ -223,6 +223,48 @@
       background: var(--bg);
       border-bottom: 2px solid var(--border);
     }
+    /* LIVE-mode red command band (design 1c error-prevention layer): a real
+       account (mode=live) tints the whole band and adds a red inset spine so
+       the operator can never mistake a live book for paper. Toggled by
+       renderStatusBar() adding .live to #status-bar. */
+    #status-bar.live {
+      background: color-mix(in srgb, var(--neg) 12%, transparent);
+      box-shadow: inset 5px 0 0 var(--neg);
+    }
+    /* Strategy-error alert banner */
+    #strategy-alert {
+      display: flex;
+      align-items: center;
+      gap: 12px;
+      padding: 11px var(--space-6);
+      background: color-mix(in srgb, var(--neg) 12%, transparent);
+      border-bottom: 2px solid var(--neg);
+      font-size: 13.5px;
+      color: var(--fg);
+    }
+    #strategy-alert[hidden] { display: none; }
+    #strategy-alert .sa-badge {
+      font: 800 10.5px/1 var(--font-heading);
+      letter-spacing: .06em;
+      text-transform: uppercase;
+      background: var(--neg);
+      color: #fff;
+      padding: 5px 8px;
+      white-space: nowrap;
+    }
+    #strategy-alert .sa-link {
+      margin-left: auto;
+      background: transparent;
+      border: none;
+      color: var(--neg);
+      font: 800 13px/1 var(--font-heading);
+      letter-spacing: .02em;
+      text-transform: none;
+      cursor: pointer;
+      white-space: nowrap;
+      padding: 4px 2px;
+    }
+    #strategy-alert .sa-link:hover { text-decoration: underline; color: var(--neg); }
     #band-identity { display: flex; flex-direction: column; gap: var(--space-3); justify-content: center; }
     #band-identity .band-id-row { display: flex; align-items: center; gap: var(--space-3); }
     #account-id {
@@ -346,6 +388,10 @@
     .age { font-size: 11px; color: var(--dim); }
     tr.stale .age, .stale-marker { color: var(--warn); font-weight: 600; }
     tr.stale .age::before, .stale-marker::before { content: "⚠ "; color: var(--warn); }
+    /* Stale-data signal elevated (design 1c error-prevention layer): a red
+       row tint + red inset border, not just the ⚠ on the age cell. */
+    tr.stale td { background: color-mix(in srgb, var(--neg) 8%, transparent); }
+    tr.stale td:first-child { box-shadow: inset 4px 0 0 var(--neg); }
     td.sym { font-weight: 800; text-align: left; }
     td.wrap, th.wrap {
       white-space: normal;
@@ -1469,6 +1515,14 @@
     <button type="button" id="theme-toggle" aria-pressed="false"
             title="Switch color theme">Dark</button>
   </nav>
+  <!-- Strategy-error alert (design 1c error-prevention layer): a red band
+       under the tabs whenever a strategy is in ERROR. Populated by
+       renderStrategyAlert() in command_center.js; hidden when none. -->
+  <div id="strategy-alert" role="alert" hidden>
+    <span class="sa-badge"></span>
+    <span class="sa-msg"></span>
+    <button type="button" class="sa-link" data-dash-tab="trading">Review strategies →</button>
+  </div>
   <!-- Command band (design 1c): identity + dependency health | net liq |
        day P&L | the two account-scoped actions. Sits above the tab panes
        because everything in it is account-global, not tab-local. -->

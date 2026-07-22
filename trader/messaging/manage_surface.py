@@ -30,6 +30,7 @@ from trader.messaging.manage_contracts import (
 )
 from trader.messaging.trader_service_api import TraderServiceApi
 from trader.messaging.typed_rpc import TypedRpcRegistry, _DispatchProblem
+from trader.common.symbol_validation import SymbolValidationError, validate_symbol_list
 from trader.sdk import MMR
 
 if TYPE_CHECKING:
@@ -126,13 +127,13 @@ def _discover_instrument_handler(api: TraderServiceApi):
 
 def _add_universe_symbols_handler(api: TraderServiceApi):
     async def _handler(parsed: AddUniverseSymbolsRequest) -> Dict[str, Any]:
-        # IB resolve is the slow part (often multi-second per symbol). Run a
-        # bounded fan-out so a 5–10 symbol watchlist add fits inside the
-        # dashboard manage client's RPC budget instead of serialising until
-        # TimeoutError at 10s.
-        symbols = [s.strip().upper() for s in parsed.symbols if s and s.strip()]
-        if not symbols:
-            return {'added': [], 'missing': []}
+        # Format-gate first (reject trash without IB). Then bounded IB resolve
+        # fan-out. Existence is fail-closed: if ANY symbol does not resolve,
+        # insert nothing — never partially accept garbage alongside real names.
+        try:
+            symbols = validate_symbol_list(list(parsed.symbols or []))
+        except SymbolValidationError as exc:
+            raise _DispatchProblem('VALIDATION_ERROR', str(exc)) from exc
 
         sem = asyncio.Semaphore(4)
 
@@ -145,18 +146,25 @@ def _add_universe_symbols_handler(api: TraderServiceApi):
             return sym, instruments
 
         results = await asyncio.gather(*(_one(s) for s in symbols))
-        accessor = _accessor(api.trader)
-        added, missing = [], []
-        # Preserve request order for the flash message.
         by_sym = {sym: instruments for sym, instruments in results}
+        missing = [sym for sym in symbols if not by_sym.get(sym)]
+        if missing:
+            hint = (
+                ' — for non-US listings set exchange/currency'
+                if not (parsed.exchange or parsed.currency) else ''
+            )
+            raise _DispatchProblem(
+                'VALIDATION_ERROR',
+                'unknown symbol(s), nothing added: ' + ', '.join(missing) + hint,
+            )
+
+        accessor = _accessor(api.trader)
+        added = []
         for sym in symbols:
-            instruments = by_sym.get(sym) or []
-            if instruments:
-                accessor.insert(parsed.name, instruments[0])
-                added.append({'symbol': sym, 'instrument_id': int(instruments[0].conId)})
-            else:
-                missing.append(sym)
-        return {'added': added, 'missing': missing}
+            instruments = by_sym[sym]
+            accessor.insert(parsed.name, instruments[0])
+            added.append({'symbol': sym, 'instrument_id': int(instruments[0].conId)})
+        return {'added': added, 'missing': []}
     return _handler
 
 

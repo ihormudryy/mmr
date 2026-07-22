@@ -498,16 +498,26 @@ class StubManageClient:
             self.accessor.universes[name] = []
             return {'ok': True, 'name': name}
         if method == 'add_universe_symbols':
-            added, missing = [], []
-            for sym in body.get('symbols') or []:
-                sym = str(sym).upper()
-                conid = _RESOLVABLE.get(sym)
-                if conid:
-                    self.accessor.insert(name, _sd(sym, conid))
-                    added.append({'symbol': sym, 'instrument_id': conid})
-                else:
-                    missing.append(sym)
-            return {'added': added, 'missing': missing}
+            from trader.messaging.typed_rpc import TypedRpcRemoteError
+            from trader.common.symbol_validation import (
+                SymbolValidationError, validate_symbol_list,
+            )
+            try:
+                symbols = validate_symbol_list(list(body.get('symbols') or []))
+            except SymbolValidationError as exc:
+                raise TypedRpcRemoteError('VALIDATION_ERROR', str(exc)) from exc
+            missing = [sym for sym in symbols if sym not in _RESOLVABLE]
+            if missing:
+                raise TypedRpcRemoteError(
+                    'VALIDATION_ERROR',
+                    'unknown symbol(s), nothing added: ' + ', '.join(missing),
+                )
+            added = []
+            for sym in symbols:
+                conid = _RESOLVABLE[sym]
+                self.accessor.insert(name, _sd(sym, conid))
+                added.append({'symbol': sym, 'instrument_id': conid})
+            return {'added': added, 'missing': []}
         if method == 'remove_universe_symbol':
             universe = self.accessor.get(name)
             match = universe.find_symbol(body['symbol'])
@@ -604,8 +614,29 @@ class TestWatchlistRoutes:
         r = client.post('/watchlists/mylist/add',
                         data={'csrf_token': _csrf(), 'symbols': 'NOPE123'},
                         follow_redirects=False)
-        assert 'NOPE123' in r.headers['location']
+        assert r.status_code == 303
+        loc = r.headers['location']
+        assert 'flash_err=1' in loc
+        assert 'NOPE123' in loc or 'unknown' in loc.lower()
         assert not any(c[0] == 'insert' for c in accessor.calls)
+
+    def test_add_rejects_format_trash(self, client, accessor, stub_resolving):
+        r = client.post('/watchlists/mylist/add',
+                        data={'csrf_token': _csrf(), 'symbols': '!!!, $$$'},
+                        follow_redirects=False)
+        assert r.status_code == 303
+        assert 'flash_err=1' in r.headers['location']
+        assert not any(c[0] == 'insert' for c in accessor.calls)
+
+    def test_add_rejects_batch_when_any_unknown(self, client, accessor, stub_resolving):
+        """Fail closed: valid + trash must not insert the valid ones."""
+        before = list(accessor.universes.get('mylist') or [])
+        r = client.post('/watchlists/mylist/add',
+                        data={'csrf_token': _csrf(), 'symbols': 'AAPL, NOTAREAL'},
+                        follow_redirects=False)
+        assert r.status_code == 303
+        assert 'flash_err=1' in r.headers['location']
+        assert accessor.universes.get('mylist') == before
 
     def test_upload_simple_csv_resolves_rows(self, client, accessor, stub_resolving):
         csv_bytes = b'symbol\nAAPL\nGLD\n'

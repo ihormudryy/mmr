@@ -516,6 +516,15 @@ def _split_symbols(raw: str) -> list[str]:
     return [s.strip().upper() for s in re.split(r'[,\s;]+', raw or '') if s.strip()]
 
 
+def _parse_symbols_or_flash(raw: str, *, tab: str = 'watchlists'):
+    """Split + format-validate symbols; return list or an error RedirectResponse."""
+    from trader.common.symbol_validation import SymbolValidationError, validate_symbol_list
+    try:
+        return validate_symbol_list(_split_symbols(raw))
+    except SymbolValidationError as exc:
+        return _flash(f'invalid symbols — {exc}', tab=tab)
+
+
 def _resolve_symbols(symbols: list[str], exchange: str = '', currency: str = '',
                      sec_type: str = 'STK') -> tuple[list[dict], list[str]]:
     """Resolve each symbol via the trader typed query surface."""
@@ -680,6 +689,7 @@ def _flash_is_error(msg: str) -> bool:
         'failed', 'aborted', 'invalid', 'unknown strategy', 'nothing was written',
         'needs symbols', 'unresolved', 'already deployed', 'not deploying',
         'deploy error', 'could not create', 'no symbols', 'not found',
+        'unknown symbol', 'nothing added',
     )
     return any(n in lower for n in needles)
 
@@ -1052,26 +1062,25 @@ def _register_legacy_routes(application: FastAPI) -> None:
                       csrf_token: str = Form(''),
                       session: str = Depends(require_session)):
         _check_csrf(csrf_token)
-        syms = _split_symbols(symbols)
-        if not syms:
-            return _flash('no symbols given', tab='watchlists')
+        parsed = _parse_symbols_or_flash(symbols, tab='watchlists')
+        if not isinstance(parsed, list):
+            return parsed
         try:
             result = get_manage_client().trader_command('add_universe_symbols', {
                 'name': name,
-                'symbols': syms,
+                'symbols': parsed,
                 'exchange': exchange,
                 'currency': currency,
             })
             added = result.get('added') or []
-            missing = result.get('missing') or []
             parts = []
             if added:
                 parts.append('added ' + ', '.join(
                     f'{a["symbol"]} ({a["instrument_id"]})' for a in added))
-            if missing:
-                parts.append('UNRESOLVED (not added): ' + ', '.join(missing)
-                             + ' — for non-US listings set exchange/currency')
             msg = f'{name}: ' + ('; '.join(parts) or 'nothing to do')
+        except TypedRpcRemoteError as exc:
+            logger.warning('watchlist add %s failed: %s', name, exc)
+            msg = f'{name} add failed: {exc.code}: {exc}'
         except Exception as exc:  # noqa: BLE001
             logger.warning('watchlist add %s failed: %s', name, exc)
             detail = f'{type(exc).__name__}: {exc}'
@@ -1258,7 +1267,7 @@ def _register_legacy_routes(application: FastAPI) -> None:
         name = str(form.get('name') or '').strip().lower()
         bar_size = str(form.get('bar_size') or '1 min').strip()
         days = str(form.get('days') or '90').strip()
-        symbols = _split_symbols(str(form.get('symbols') or ''))
+        symbols_raw = str(form.get('symbols') or '')
         watchlist = str(form.get('watchlist') or '').strip()
         auto_propose = bool(form.get('auto_propose'))
         params = {k[len('param_'):]: _coerce_yaml_value(str(v))
@@ -1266,7 +1275,14 @@ def _register_legacy_routes(application: FastAPI) -> None:
                   if k.startswith('param_') and str(v).strip() != ''}
 
         def _deploy() -> str:
+            from trader.common.symbol_validation import (
+                SymbolValidationError, validate_symbol_list,
+            )
             target_watchlist = watchlist
+            try:
+                symbols = validate_symbol_list(_split_symbols(symbols_raw)) if symbols_raw.strip() else []
+            except SymbolValidationError as exc:
+                return f'invalid symbols — {exc}'
             if symbols and target_watchlist:
                 target_watchlist = ''  # symbols win when both are filled in
             # 1. The (file, class) pair must come from the scanner — a forged

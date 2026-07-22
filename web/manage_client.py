@@ -61,9 +61,22 @@ class ManageRpcClient:
     def _endpoint(self, var: str, default: str) -> str:
         return self._env.get(var, default)
 
+    # IB-backed manage commands (per-symbol resolve) routinely need >10s wall
+    # when adding several tickers; keep a higher floor even if the env default
+    # is left at the legacy short value.
+    _IB_HEAVY_METHODS = frozenset({
+        'add_universe_symbols',
+        'import_universe_csv',
+        'discover_instrument',
+    })
+
     def _call(self, bucket: str, role: str, endpoint: str, method: str,
-              body: dict[str, Any] | None = None) -> dict[str, Any]:
+              body: dict[str, Any] | None = None,
+              *, timeout: float | None = None) -> dict[str, Any]:
         payload = body if body is not None else {}
+        call_timeout = timeout
+        if call_timeout is None and method in self._IB_HEAVY_METHODS:
+            call_timeout = max(self._timeout_s, 45.0)
         with self._lock:
             client = self._clients[bucket]
             if client is None:
@@ -71,7 +84,7 @@ class ManageRpcClient:
                 client.connect()
                 self._clients[bucket] = client
         try:
-            return client.call(method, payload, dict)
+            return client.call(method, payload, dict, timeout=call_timeout)
         except (TypedRpcRemoteError, TimeoutError, OSError) as exc:
             logger.warning('manage typed call %s failed: %s', method, exc)
             with self._lock:
@@ -113,7 +126,10 @@ def get_manage_client() -> ManageRpcClient:
     global _CLIENT
     with _CLIENT_LOCK:
         if _CLIENT is None:
-            timeout_s = float(os.environ.get('MMR_MANAGE_RPC_TIMEOUT_S', '10'))
+            # Default 45s: watchlist add resolves via IB (multi-second/symbol).
+            # Override with MMR_MANAGE_RPC_TIMEOUT_S; IB-heavy methods still
+            # floor at 45s inside ManageRpcClient._call.
+            timeout_s = float(os.environ.get('MMR_MANAGE_RPC_TIMEOUT_S', '45'))
             _CLIENT = ManageRpcClient(timeout_s=timeout_s)
         return _CLIENT
 

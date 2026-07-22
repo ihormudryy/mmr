@@ -1074,7 +1074,14 @@ def _register_legacy_routes(application: FastAPI) -> None:
             msg = f'{name}: ' + ('; '.join(parts) or 'nothing to do')
         except Exception as exc:  # noqa: BLE001
             logger.warning('watchlist add %s failed: %s', name, exc)
-            msg = f'{name} add failed: {type(exc).__name__}: {exc}'
+            detail = f'{type(exc).__name__}: {exc}'
+            if isinstance(exc, TimeoutError) or 'timed out' in str(exc).lower():
+                detail += (
+                    ' — IB resolve is slow or upstream is down; try fewer '
+                    'symbols, set exchange/currency for non-US, or raise '
+                    'MMR_MANAGE_RPC_TIMEOUT_S'
+                )
+            msg = f'{name} add failed: {detail}'
         return _flash(msg, tab='watchlists')
 
 

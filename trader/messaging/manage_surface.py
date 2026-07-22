@@ -6,6 +6,7 @@ or a co-located DuckDB file.
 """
 from __future__ import annotations
 
+import asyncio
 import csv
 import io
 import logging
@@ -125,16 +126,31 @@ def _discover_instrument_handler(api: TraderServiceApi):
 
 def _add_universe_symbols_handler(api: TraderServiceApi):
     async def _handler(parsed: AddUniverseSymbolsRequest) -> Dict[str, Any]:
+        # IB resolve is the slow part (often multi-second per symbol). Run a
+        # bounded fan-out so a 5–10 symbol watchlist add fits inside the
+        # dashboard manage client's RPC budget instead of serialising until
+        # TimeoutError at 10s.
+        symbols = [s.strip().upper() for s in parsed.symbols if s and s.strip()]
+        if not symbols:
+            return {'added': [], 'missing': []}
+
+        sem = asyncio.Semaphore(4)
+
+        async def _one(sym: str):
+            async with sem:
+                instruments = await _discover_one(
+                    api, sym, exchange=parsed.exchange, currency=parsed.currency,
+                    sec_type=parsed.sec_type,
+                )
+            return sym, instruments
+
+        results = await asyncio.gather(*(_one(s) for s in symbols))
         accessor = _accessor(api.trader)
         added, missing = [], []
-        for sym in parsed.symbols:
-            sym = sym.strip().upper()
-            if not sym:
-                continue
-            instruments = await _discover_one(
-                api, sym, exchange=parsed.exchange, currency=parsed.currency,
-                sec_type=parsed.sec_type,
-            )
+        # Preserve request order for the flash message.
+        by_sym = {sym: instruments for sym, instruments in results}
+        for sym in symbols:
+            instruments = by_sym.get(sym) or []
             if instruments:
                 accessor.insert(parsed.name, instruments[0])
                 added.append({'symbol': sym, 'instrument_id': int(instruments[0].conId)})

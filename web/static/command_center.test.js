@@ -69,6 +69,7 @@ function makeContext() {
     EventSource: FakeEventSource,
     fetch: async () => { throw new Error('unexpected fetch'); },
     FormData: class { entries() { return []; } get() { return null; } },
+    URLSearchParams,
     setInterval: () => 1,
     clearInterval() {},
     setTimeout,
@@ -241,6 +242,39 @@ async function test(name, fn) {
     assert.equal(elements.get('cc-proposal-drawer').hidden, false);
     assert.equal(run('globalThis.resolveCalls'), 1);
     assert.equal(run('globalThis.submitCalls'), 0);
+  });
+
+  await test('a stale symbol resolution cannot overwrite a newer instrument conId', async () => {
+    const {context, run} = makeContext();
+    const form = run("document.getElementById('cc-proposal-form')");
+    for (const name of [
+      'resolve_symbol', 'resolve_exchange', 'resolve_currency', 'conid',
+    ]) form[name] = element();
+    form.reset = () => {
+      form.resolve_symbol.value = '';
+      form.resolve_exchange.value = '';
+      form.resolve_currency.value = '';
+      form.conid.value = '';
+    };
+    const pending = [];
+    context.fetch = (_url, _options) => new Promise((resolve) => pending.push(resolve));
+
+    const first = run("ccOpenResearchProposal({ticker: 'AAPL'})");
+    const second = run("ccOpenResearchProposal({ticker: 'MSFT'})");
+    assert.equal(pending.length, 2);
+
+    pending[1]({ok: true, async json() { return {instruments: [{
+      symbol: 'MSFT', instrument_id: 202, primary_exchange: 'NASDAQ', currency: 'USD',
+    }]}; }});
+    await second;
+    pending[0]({ok: true, async json() { return {instruments: [{
+      symbol: 'AAPL', instrument_id: 101, primary_exchange: 'NASDAQ', currency: 'USD',
+    }]}; }});
+    await first;
+
+    assert.equal(form.resolve_symbol.value, 'MSFT');
+    assert.equal(form.conid.value, 202);
+    assert.match(run("document.getElementById('cc-resolve-status').textContent"), /MSFT/);
   });
 
   console.log(`command_center.test.js: ${passed} tests passed`);

@@ -1239,9 +1239,17 @@ function ccCloseProposalDrawer() {
   document.getElementById('cc-proposal-drawer').hidden = true;
 }
 
+let ccResolveGeneration = 0;
+let ccResolveAbortController = null;
+
 async function ccResolveSymbol() {
   const form = document.getElementById('cc-proposal-form');
   const status = document.getElementById('cc-resolve-status');
+  const generation = ++ccResolveGeneration;
+  if (ccResolveAbortController) ccResolveAbortController.abort();
+  const controller = new AbortController();
+  ccResolveAbortController = controller;
+  const isCurrent = () => generation === ccResolveGeneration;
   const sym = String(form.resolve_symbol.value || '').trim().toUpperCase();
   const exchange = String(form.resolve_exchange.value || '').trim();
   const currency = String(form.resolve_currency.value || '').trim();
@@ -1249,6 +1257,7 @@ async function ccResolveSymbol() {
     status.textContent = 'Enter a symbol to resolve.';
     status.className = 'cc-resolve-status err';
     form.resolve_symbol.focus();
+    if (isCurrent()) ccResolveAbortController = null;
     return;
   }
   status.textContent = `Resolving ${sym}…`;
@@ -1260,8 +1269,10 @@ async function ccResolveSymbol() {
     const res = await fetch('/api/resolve?' + qs.toString(), {
       credentials: 'same-origin',
       headers: { 'Accept': 'application/json' },
+      signal: controller.signal,
     });
     const body = await res.json();
+    if (!isCurrent()) return;
     if (!res.ok) {
       status.textContent = body.error || (`HTTP ${res.status}`);
       status.className = 'cc-resolve-status err';
@@ -1286,8 +1297,11 @@ async function ccResolveSymbol() {
       + ` · ${first.currency || '—'}${more}`;
     status.className = 'cc-resolve-status ok';
   } catch (err) {
+    if (!isCurrent()) return;
     status.textContent = String(err.message || err);
     status.className = 'cc-resolve-status err';
+  } finally {
+    if (isCurrent()) ccResolveAbortController = null;
   }
 }
 

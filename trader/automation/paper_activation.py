@@ -410,6 +410,19 @@ class PaperAutomationActivationService:
             self._last_error = str(exc)
             if isinstance(exc, (PaperAutomationActivationError, PaperMaterialsError)):
                 raise
+            # Errno 30 / EROFS: Compose used to mount artifacts :ro into trader.
+            # Hot-arm Activate must write the fixture bundle there — surface a
+            # actionable hint instead of a bare OSError.
+            err = getattr(exc, "errno", None)
+            if err in (30, getattr(__import__("errno"), "EROFS", 30)) or (
+                isinstance(exc, OSError) and "Read-only file system" in str(exc)
+            ):
+                raise PaperAutomationActivationError(
+                    "HOT_ARM_FAILED",
+                    f"{exc} — trader's artifacts volume must be writable "
+                    f"(remove :ro from the artifacts mount in docker-compose.yml "
+                    f"for the trader service, recreate the container, retry)",
+                ) from exc
             raise PaperAutomationActivationError("HOT_ARM_FAILED", str(exc)) from exc
 
     def _persist_after_hot_arm(

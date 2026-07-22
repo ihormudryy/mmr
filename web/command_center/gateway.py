@@ -126,7 +126,11 @@ class DashboardCommandGateway:
             retryable=bool(raw.get("retryable", False)),
         )
         if receipt.state == "REJECTED":
-            message = (receipt.outcome or {}).get("message", "command rejected")
+            message = (
+                (receipt.outcome or {}).get("message")
+                or receipt.error_code
+                or "command rejected"
+            )
             raise GatewayError(
                 code=receipt.error_code or "COMMAND_REJECTED",
                 message=message,

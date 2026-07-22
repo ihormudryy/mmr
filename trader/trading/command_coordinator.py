@@ -1034,7 +1034,13 @@ class TradingCommandCoordinator:
                 # command's CURRENT state rather than assuming RECEIVED.
                 self._fallback_outcome_unknown(request)
                 raise
-            row = self._transition(request, "RECEIVED", "REJECTED", error_code=exc.code)
+            # Persist the human-readable message so the gateway/API can
+            # surface it (otherwise clients only see "command rejected").
+            row = self._transition(
+                request, "RECEIVED", "REJECTED",
+                error_code=exc.code,
+                outcome={"message": exc.message},
+            )
             return _row_to_receipt(row)
         except Exception:
             # Fail loud at the surface (the original exception is

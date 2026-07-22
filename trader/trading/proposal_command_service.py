@@ -143,7 +143,8 @@ class ProposalCommandService:
         if quote is None or quote.price <= 0:
             raise ProposalCreationRefused(
                 "QUOTE_UNAVAILABLE",
-                f"no executable {side} quote for conId {request.conid}",
+                f"no executable {side} quote for conId {request.conid} "
+                f"(realtime and delayed IB market data both unavailable)",
             )
         if quote.conid != request.conid or quote.side != side:
             raise ProposalCreationRefused("QUOTE_UNAVAILABLE", "quote identity or side mismatch")

@@ -227,12 +227,31 @@ class TraderQuoteAuthority:
         self._delayed = delayed
 
     def executable_quote(self, conid: int, *, side: str) -> Optional[ExecutableQuote]:
+        quote = self._snapshot_quote(conid, side, delayed=self._delayed)
+        if quote is not None:
+            return quote
+        # Realtime IB API market data often needs an extra subscription
+        # (error 10089); delayed data is usually available on the same
+        # account. Prefer a delayed reference for paper sizing / proposal
+        # capture over failing closed with QUOTE_UNAVAILABLE. Live dispatch
+        # still rejects non-live feeds via FEED_NOT_LIVE in the guard.
+        if not self._delayed:
+            logger.info(
+                "realtime quote unavailable for conid %s; falling back to delayed",
+                conid,
+            )
+            return self._snapshot_quote(conid, side, delayed=True)
+        return None
+
+    def _snapshot_quote(
+        self, conid: int, side: str, *, delayed: bool,
+    ) -> Optional[ExecutableQuote]:
         try:
             contract = self._resolve_contract(conid)
             if contract is None:
                 return None
             ticker = self._run_coro(
-                self._trader.client.get_snapshot(contract, self._delayed))
+                self._trader.client.get_snapshot(contract, delayed))
             if ticker is None:
                 return None
             raw = (getattr(ticker, "ask", None) if side.upper() == "BUY"
@@ -252,7 +271,10 @@ class TraderQuoteAuthority:
                 ask=_usable_price(getattr(ticker, "ask", None)),
             )
         except Exception as exc:  # noqa: BLE001 — no usable quote -> capture fails closed
-            logger.warning("executable_quote unavailable for conid %s: %s", conid, exc)
+            logger.warning(
+                "executable_quote unavailable for conid %s (delayed=%s): %s",
+                conid, delayed, exc,
+            )
             return None
 
 

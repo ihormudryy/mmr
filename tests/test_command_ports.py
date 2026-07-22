@@ -191,6 +191,50 @@ class TestQuoteAuthority:
         trader.client.get_snapshot = _boom
         assert self._auth(trader).executable_quote(CONID, side="BUY") is None
 
+    def test_falls_back_to_delayed_when_realtime_raises(self):
+        # IB error 10089: realtime API MD not subscribed; delayed usually works.
+        delayed_tk = _ticker(ask=100.0, market_data_type=3)
+
+        def get_snapshot(contract, delayed=False):
+            if not delayed:
+                raise RuntimeError("Error 10089: requested market data requires additional subscription")
+            return delayed_tk
+
+        trader = _fake_trader()
+        trader.client.get_snapshot = get_snapshot
+        q = self._auth(trader).executable_quote(CONID, side="BUY")
+        assert q is not None
+        assert q.price == 100.0
+        assert q.feed_type == "delayed"
+
+    def test_falls_back_to_delayed_when_realtime_has_no_price(self):
+        delayed_tk = _ticker(ask=101.5, market_data_type=3)
+
+        def get_snapshot(contract, delayed=False):
+            return _ticker(ask=None) if not delayed else delayed_tk
+
+        trader = _fake_trader()
+        trader.client.get_snapshot = get_snapshot
+        q = self._auth(trader).executable_quote(CONID, side="BUY")
+        assert q is not None and q.price == 101.5 and q.feed_type == "delayed"
+
+    def test_no_delayed_fallback_when_already_delayed(self):
+        calls = []
+
+        def get_snapshot(contract, delayed=False):
+            calls.append(delayed)
+            raise RuntimeError("reqMktData failed")
+
+        trader = _fake_trader()
+        trader.client.get_snapshot = get_snapshot
+        auth = TraderQuoteAuthority(
+            trader, run_coro=lambda x: x,
+            resolve_contract=lambda conid: SimpleNamespace(conId=conid),
+            delayed=True,
+        )
+        assert auth.executable_quote(CONID, side="BUY") is None
+        assert calls == [True]
+
 
 class TestAdaptersSatisfyCapture:
     """Broker state stays fenced while quote and what-if keep their clocks."""

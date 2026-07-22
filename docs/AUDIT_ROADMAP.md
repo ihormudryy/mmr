@@ -224,6 +224,37 @@ e2b2fd1 (VwapReclaim on_prices). These are the residual robustness items.
 
 ---
 
+## Cluster H — Dashboard / command center
+
+### H1 — Risk panel: render distance-to-limit bars, not just warnings  (S, low risk)
+
+- **Symptom:** the `/cc` Risk & reconciliation panel shows only the risk
+  projection's `warnings` strings (a breach is either present or absent). The
+  Modernist redesign's `TradingTab` component specifies utilization *bars* —
+  each limit drawn as a fill against its cap (e.g. "AAPL concentration 10.6% of
+  a 20% NAV cap", "Technology sector 48% of a 60% cap"), turning amber then red
+  as it approaches the limit — so an operator sees *distance to the limit*, not
+  just breaches. The redesign shipped the text list because the payload lacks
+  the numbers.
+- **Mechanism:** `PortfolioRiskAnalyzer` (`trader/trading/portfolio_risk.py`)
+  already computes per-position gross weights, HHI, and group-budget
+  utilization, but the dashboard-facing risk projection carries only
+  `warnings: [...]`. The command-center render (`renderRisk` in
+  `web/static/command_center.js`) has nothing structured to draw.
+- **Fix (payload → frontend):** extend the risk projection with structured
+  per-limit rows `{label, value_pct, cap_pct}` (concentration, sector, each
+  group budget) alongside the existing warnings, then render the design's bars
+  in `renderRisk` (fill width = value_pct/cap_pct; amber/red thresholds from
+  the component CSS `.tt-bar i.hot`/`.over`). Keep the warnings list as the
+  authoritative "fail loudly" surface; bars are the at-a-glance complement.
+- **NOTE:** no new risk *logic* — the numbers exist; this is projection payload
+  plumbing plus a render function. Especially useful while scaling paper
+  automation, where headroom-to-limit is the number you actually watch. Design
+  source: `TradingTab.dc.html` (claude.ai/design project
+  `7f8df979-0181-41aa-b7d2-30e828cd4d95`), Risk & reconciliation panel.
+
+---
+
 ## Recommended sequence
 
 1. **Cluster A (A1+A2, then A3)** — the capital-safety core; do first. ~1 week.

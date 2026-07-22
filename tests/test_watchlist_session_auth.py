@@ -16,9 +16,9 @@ enforce: ``require_session`` and ``_check_origin``, both imported verbatim
 from ``web.command_center.routes_commands`` -- the exact objects
 ``web/app.py``'s watchlist routes now depend on too. CSRF verification
 stays on the existing ``web.app._CSRF_TOKEN``/``_check_csrf`` pair (not the
-per-session ``session_csrf_token``) because ``dashboard.html`` renders ONE
+per-session ``session_csrf_token``) because the ``/cc`` tab partials render ONE
 shared ``{{ csrf_token }}`` slot consumed by both these watchlist forms and
-the not-yet-migrated trading-mutation/deploy forms -- see the long comment
+the trading-mutation/deploy forms -- see the long comment
 above ``watchlist_create`` in ``web/app.py`` for the full reasoning.
 
 Because ``SessionSecurityMiddleware`` ([M1-R], out of scope to touch) already

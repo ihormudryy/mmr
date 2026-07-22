@@ -991,16 +991,18 @@ def _register_legacy_routes(application: FastAPI) -> None:
     #
     # CSRF verification is deliberately LEFT on the existing `_check_csrf`/
     # `_CSRF_TOKEN` pair rather than switched to `session_csrf_token` (the
-    # per-session-derived token `require_command_auth` uses): `dashboard.html`
-    # renders ONE shared `{{ csrf_token }}` Jinja slot, read by both these
-    # watchlist forms AND the not-yet-migrated trading-mutation/deploy forms
-    # (approve/reject/enable/disable/params/deploy — out of this task's
-    # scope, and the template itself is out of scope to edit). Re-deriving
-    # the rendered value from the session would silently break those other
-    # forms' real submissions the moment `dashboard()` re-renders — a bigger
+    # per-session-derived token `require_command_auth` uses): the `/cc`
+    # tab partials (`_watchlists_tab.html` for these watchlist forms,
+    # `_deploy_tab.html` for the trading-mutation/deploy forms —
+    # approve/reject/enable/disable/params/deploy) all render ONE shared
+    # `{{ csrf_token }}` Jinja slot that these POST routes still serve.
+    # Re-deriving the rendered value from the session would silently break
+    # those forms' real submissions the moment the page re-renders — a bigger
     # regression than the narrower theoretical gain of a per-session CSRF
     # secret in a single-operator dashboard. See the Task 1 report for the
-    # full drift note.
+    # full drift note. (The old server-rendered `dashboard.html`/`manage.html`
+    # pages that first carried these forms were retired; `/`, `/legacy`, and
+    # `/manage` now 307-redirect into `/cc`.)
     # -------------------------------------------------------------------
     @application.get('/watchlists/{name}/members')
     def watchlist_members(name: str, session: str = Depends(require_session)):

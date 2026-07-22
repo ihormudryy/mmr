@@ -1,8 +1,14 @@
 /* Theme boot + toggle for the /cc dashboard.
  *
  * Loaded synchronously in <head> (the strict CSP forbids inline scripts) so
- * a stored dark preference applies before first paint — no light flash.
- * Light is the default (design direction 1c); "dark" is design direction 1b.
+ * the effective theme is stamped on <html> before first paint — no flash.
+ *
+ * Resolution order: an explicit stored choice wins; with no stored choice we
+ * follow the OS via prefers-color-scheme. The effective theme is written as
+ * an explicit data-theme="light|dark", so the stylesheet needs only a single
+ * [data-theme="dark"] rule and no prefers-color-scheme @media duplication.
+ * (The OS is read once at load; it is not live-listened for mid-session.)
+ * Directions from the design doc: light = 1c, dark = 1b.
  */
 'use strict';
 
@@ -10,14 +16,22 @@
   var KEY = 'cc-theme';
   var root = document.documentElement;
 
-  var stored = null;
-  try { stored = localStorage.getItem(KEY); } catch (err) { /* private mode */ }
-  if (stored === 'dark') root.dataset.theme = 'dark';
+  function storedChoice() {
+    try { return localStorage.getItem(KEY); } catch (err) { return null; }
+  }
+  function osPrefersDark() {
+    try { return window.matchMedia('(prefers-color-scheme: dark)').matches; }
+    catch (err) { return false; }
+  }
+
+  var choice = storedChoice();
+  var dark = choice ? choice === 'dark' : osPrefersDark();
+  root.dataset.theme = dark ? 'dark' : 'light';
 
   function syncButton(btn) {
-    var dark = root.dataset.theme === 'dark';
-    btn.textContent = dark ? 'Light' : 'Dark';
-    btn.setAttribute('aria-pressed', String(dark));
+    var isDark = root.dataset.theme === 'dark';
+    btn.textContent = isDark ? 'Light' : 'Dark';
+    btn.setAttribute('aria-pressed', String(isDark));
   }
 
   document.addEventListener('DOMContentLoaded', function () {
@@ -26,8 +40,7 @@
     syncButton(btn);
     btn.addEventListener('click', function () {
       var toDark = root.dataset.theme !== 'dark';
-      if (toDark) root.dataset.theme = 'dark';
-      else delete root.dataset.theme;
+      root.dataset.theme = toDark ? 'dark' : 'light';
       try { localStorage.setItem(KEY, toDark ? 'dark' : 'light'); }
       catch (err) { /* preference just won't persist */ }
       syncButton(btn);

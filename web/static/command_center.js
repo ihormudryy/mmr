@@ -365,6 +365,13 @@ function renderAccountCards() {
 
 function renderPositions() {
   const v = store.view; if (!v) return;
+  const meta = document.getElementById('positions-meta');
+  if (meta) {
+    const account = v.accounts[0] || {};
+    meta.textContent = `${v.positions.length} open`
+      + (account.gross_exposure !== undefined && account.gross_exposure !== null
+        ? ` · ${money(account.gross_exposure, account.currency)} gross` : '');
+  }
   const body = document.getElementById('positions-body');
   body.innerHTML = v.positions.map(p => {
     const conid = String(p.conid ?? (p.entity_id || '').split(':').pop());
@@ -411,6 +418,8 @@ function renderProposals() {
   const v = store.view; if (!v) return;
   const rail = document.getElementById('proposal-cards');
   if (!rail) return;
+  const pendingBtn = document.querySelector('[data-proposal-filter="pending"]');
+  if (pendingBtn) pendingBtn.textContent = `Pending ${(v.proposals.active || []).length}`;
   const rows = proposalFilterRows();
   const cards = rows.map(p => {
     const age = ageOf(p.created_at);
@@ -418,6 +427,17 @@ function renderProposals() {
     const side = String(p.action || p.side || '').toUpperCase();
     const sideCls = side === 'BUY' ? 'buy' : side === 'SELL' ? 'sell' : '';
     const thesis = p.thesis || p.reasoning || '';
+    // Inline Approve/Reject reuse the exact drawer command path
+    // (ccApproveProposal runs the live preflight ceremony when required);
+    // Details falls through to the card click -> detail drawer.
+    const actions = (CFG.commandsEnabled && status === 'PENDING')
+      ? `<div class="prop-actions">
+          <button type="button" class="primary"
+            data-cc-approve="${esc(p.entity_id)}">Approve</button>
+          <button type="button" class="reject"
+            data-cc-reject="${esc(p.entity_id)}">Reject</button>
+          <button type="button">Details</button>
+        </div>` : '';
     return `<div class="proposal-card" tabindex="0" role="button"
         data-proposal="${esc(p.entity_id)}"
         aria-label="Proposal ${esc(p.entity_id)} details">
@@ -433,6 +453,7 @@ function renderProposals() {
         <span>status <b>${esc(status)}</b></span>
         <span>source ${esc(p.source || '—')}</span></div>
       ${thesis ? `<div class="prop-thesis">${esc(thesis)}</div>` : ''}
+      ${actions}
     </div>`;
   });
   const emptyMsg = PROPOSAL_FILTER.mode === 'pending'
@@ -456,24 +477,39 @@ function renderOrders() {
     if (!groups.has(gid)) groups.set(gid, []);
     groups.get(gid).push(o);
   }
+  // Leg classification chip from the real `leg` field
+  // (order_correlation.classify_leg): entry vs protective (stop/take-profit/
+  // child legs). Unclassified legs get no chip — never a guessed one.
+  const kindOf = (leg) => {
+    const l = String(leg || '').toLowerCase();
+    if (l === 'entry') return ['ENTRY', 'entry'];
+    if (l === 'stop' || l === 'take_profit' || l.startsWith('child')) {
+      return ['PROTECTIVE', 'prot'];
+    }
+    return null;
+  };
   // Aggregate group status without hiding per-leg state (spec §8.4).
   document.getElementById('order-groups').innerHTML =
     [...groups.entries()].map(([gid, legs]) => {
       const statuses = [...new Set(legs.map(l => String(l.status || '')))];
       const filled = legs.reduce((n, l) => n + (l.filled_quantity || 0), 0);
       return `<div class="order-group">
-        <div class="group-head">${esc(gid)} — ${legs.length} leg(s),
-          ${esc(statuses.join(' / '))}, filled ${fmt.format(filled)}</div>
-        ${legs.map(l => `<div class="leg"><span>${esc(l.symbol || l.conid || '')}
+        <div class="group-head">${esc(gid)}<span class="n">${legs.length} leg(s) ·
+          ${esc(statuses.join(' / '))} · filled ${fmt.format(filled)}</span></div>
+        ${legs.map(l => {
+          const kind = kindOf(l.leg);
+          return `<div class="leg">
+          ${kind ? `<span class="kind ${kind[1]}">${kind[0]}</span>` : ''}
+          <span>${esc(l.symbol || l.conid || '')}
           ${esc(l.action || '')} ${fmt.format(l.quantity ?? 0)}
           @ ${esc(l.order_type || '')}</span>
-          <span>${esc(l.status || '')} · filled ${fmt.format(l.filled_quantity || 0)}
+          <span class="leg-r">${esc(l.status || '')} · filled ${fmt.format(l.filled_quantity || 0)}
           ${l.avg_fill_price ? '@ ' + money(l.avg_fill_price) : ''}
           ${CFG.commandsEnabled && activeIds.has(l.entity_id)
             ? ` <button type="button"
                 data-cc-cancel-order="${esc(l.entity_id)}">Cancel</button>` : ''}
-          </span></div>`
-        ).join('')}
+          </span></div>`;
+        }).join('')}
       </div>`;
     }).join('') || '<div class="order-group group-head dim">No orders.</div>';
 }
@@ -856,10 +892,26 @@ document.addEventListener('keydown', e => {
 });
 
 document.getElementById('proposal-cards').addEventListener('click', e => {
+  // Inline card actions first (rendered only when commands are enabled);
+  // anything else on the card — including the Details button — opens the
+  // detail drawer exactly as before.
+  const approveBtn = e.target.closest('[data-cc-approve]');
+  if (approveBtn) {
+    const p = ccFindProposalRow(approveBtn.dataset.ccApprove);
+    if (p) ccApproveProposal(p);
+    return;
+  }
+  const rejectBtn = e.target.closest('[data-cc-reject]');
+  if (rejectBtn) {
+    const p = ccFindProposalRow(rejectBtn.dataset.ccReject);
+    if (p) ccRejectProposal(p);
+    return;
+  }
   const card = e.target.closest('[data-proposal]');
   if (card) showProposalDrawer(card.dataset.proposal, card);
 });
 document.getElementById('proposal-cards').addEventListener('keydown', e => {
+  if (e.target.closest('button')) return;  // let inline actions keep native keys
   const card = e.target.closest('[data-proposal]');
   if (card && (e.key === 'Enter' || e.key === ' ')) {
     e.preventDefault();

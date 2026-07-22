@@ -397,6 +397,14 @@
       color: var(--accent);
     }
     section > h2 button, aside > h2 button { margin-left: auto; }
+    .h-meta {
+      margin-left: auto;
+      font: 600 11px/1.2 var(--font-body);
+      letter-spacing: 0;
+      text-transform: none;
+      color: var(--dim);
+      font-variant-numeric: tabular-nums;
+    }
 
     /* —— trading specifics —— */
     /* Action queue as a 3-up strip (cockpit): approving proposals is the
@@ -438,6 +446,7 @@
     }
     .prop-meta b { color: var(--fg); font-weight: 700; }
     .prop-thesis { font-size: 12.5px; margin-top: 10px; line-height: 1.5; text-wrap: pretty; }
+    .prop-actions { display: flex; gap: 8px; margin-top: 12px; }
     .proposal-filter {
       display: flex;
       flex-wrap: wrap;
@@ -469,17 +478,42 @@
     .order-group .group-head {
       padding: 9px var(--space-4);
       font: 800 12px/1.3 var(--font-heading);
+      display: flex;
+      align-items: center;
+      gap: 10px;
+    }
+    .order-group .group-head .n {
+      margin-left: auto;
+      font: 600 11px/1.3 var(--font-body);
+      color: var(--dim);
+      font-variant-numeric: tabular-nums;
     }
     .order-group .leg {
       padding: 7px var(--space-4) 7px var(--space-6);
       font-size: 12px;
       color: color-mix(in srgb, var(--fg) 75%, transparent);
       display: flex;
-      justify-content: space-between;
-      gap: var(--space-3);
+      gap: 10px;
       align-items: center;
       border-top: 1px solid var(--border-soft);
     }
+    .order-group .leg .leg-r {
+      margin-left: auto;
+      display: inline-flex;
+      gap: 8px;
+      align-items: center;
+      text-align: right;
+    }
+    .kind {
+      font: 800 9px/1 var(--font-heading);
+      letter-spacing: .08em;
+      padding: 3px 6px;
+      border: 1px solid var(--border-soft);
+      color: var(--dim);
+      flex: none;
+    }
+    .kind.entry { color: var(--pos); border-color: currentColor; }
+    .kind.prot { color: var(--warn); border-color: currentColor; }
     /* Strategy state chips + enabled dots (rendered by command_center.js). */
     .state-chip {
       font-size: 10px;
@@ -1438,7 +1472,8 @@
     </section>
     <div id="quick-stats" aria-label="Account summary"></div>
     <section id="positions-panel" aria-label="Positions">
-      <h2>Positions {{ info('Live holdings from IB. Unrealized P&amp;L vs average cost; Day P&amp;L since session start. Close starts an exit proposal — Approve still required.') }}</h2>
+      <h2>Positions {{ info('Live holdings from IB. Unrealized P&amp;L vs average cost; Day P&amp;L since session start. Close starts an exit proposal — Approve still required.') }}
+        <span id="positions-meta" class="h-meta"></span></h2>
       <table>
         <thead><tr>
           <th>Instrument</th><th>Qty</th><th>Avg</th><th>Last</th><th>Ccy</th>

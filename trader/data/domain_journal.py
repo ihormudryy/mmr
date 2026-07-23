@@ -153,6 +153,16 @@ WriteMaterialized = Callable[[duckdb.DuckDBPyConnection, int], None]
 # compaction if it is within this many days of `now` OR is at/after a
 # still-live active cursor (see `DomainJournal.compact`'s docstring).
 RETENTION_FLOOR = timedelta(days=30)
+STRATEGY_RUNTIME_METADATA_FIELDS = {
+    "class_name",
+    "bar_size",
+    "conids",
+    "universe",
+    "params",
+    "module",
+    "display_name",
+    "historical_days_prior",
+}
 
 
 class EventIdentityConflict(Exception):
@@ -809,6 +819,7 @@ class DomainJournal:
         revision: int,
         updated_at: datetime,
     ) -> None:
+        payload = self._materialized_payload(conn, mutation)
         conn.execute(
             """
             INSERT INTO domain_materialized_entities
@@ -827,10 +838,38 @@ class DomainJournal:
                 mutation.account_id,
                 revision,
                 mutation.operation == "delete",
-                mutation.payload,
+                payload,
                 updated_at,
             ],
         )
+
+    @staticmethod
+    def _is_missing_strategy_metadata(value: Any) -> bool:
+        return value is None or value == "" or value == [] or value == {}
+
+    def _materialized_payload(self, conn, mutation: DomainMutation) -> Any:
+        """Merge receipt-only strategy updates into the snapshot source."""
+        incoming = mutation.payload
+        if mutation.entity_type != "strategy" or mutation.operation == "delete":
+            return incoming
+        if not isinstance(incoming, dict):
+            return incoming
+        existing = conn.execute(
+            "SELECT payload FROM domain_materialized_entities "
+            "WHERE entity_type = ? AND entity_id = ? AND NOT deleted",
+            [mutation.entity_type, mutation.entity_id],
+        ).fetchone()
+        if existing is None or existing[0] is None:
+            return incoming
+        previous = json.loads(existing[0])
+        if not isinstance(previous, dict):
+            return incoming
+        merged = {**previous, **incoming}
+        for field in STRATEGY_RUNTIME_METADATA_FIELDS:
+            if field not in incoming or self._is_missing_strategy_metadata(incoming[field]):
+                if field in previous:
+                    merged[field] = previous[field]
+        return merged
 
     def _insert_journal_row(
         self,

@@ -55,6 +55,7 @@ from trader.trading.command_coordinator import (
     CommandRequest,
     StrategyControlCommandService,
     TradingCommandCoordinator,
+    acknowledge_strategy_state,
     apply_command_ledger_migration,
 )
 from trader.trading.strategy import StrategyState
@@ -442,6 +443,49 @@ def test_trader_journals_strategy_updated_only_after_acknowledgement(forwarding)
     strategy_events = [e for e in forwarding.journal.read_after(0, 100)
                        if e.event_type == "strategy.updated"]
     assert strategy_events[0].entity_revision == receipt.outcome["state_revision"]
+
+
+def test_strategy_materialized_snapshot_preserves_metadata_after_receipt_update(tmp_path):
+    from trader.data.materialized_state import GenericEntityAdapter
+    from trader.domain.snapshot_service import DomainSnapshotService
+
+    _, journal = _build_journal(tmp_path)
+    acknowledge_strategy_state(
+        journal,
+        "vwap_reclaim",
+        1,
+        0,
+        {
+            "strategy_name": "vwap_reclaim",
+            "strategy_state": "RUNNING",
+            "class_name": "VwapReclaim",
+            "bar_size": "1 min",
+            "conids": [756733],
+            "params": {"lookback": 20},
+        },
+        correlation_id="full-row",
+    )
+    acknowledge_strategy_state(
+        journal,
+        "vwap_reclaim",
+        2,
+        1,
+        {
+            "strategy_name": "vwap_reclaim",
+            "strategy_state": "DISABLED",
+            "control_revision": 1,
+        },
+        correlation_id="receipt-only",
+    )
+
+    snapshot = DomainSnapshotService(journal)
+    snapshot.register_adapter(GenericEntityAdapter("strategy"))
+    row = snapshot.snapshot_with_cursor().entities["strategy"][0]
+    assert row["strategy_state"] == "DISABLED"
+    assert row["class_name"] == "VwapReclaim"
+    assert row["bar_size"] == "1 min"
+    assert row["conids"] == [756733]
+    assert row["params"] == {"lookback": 20}
 
 
 class TestForwardingSagaEdgeCases:

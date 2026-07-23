@@ -107,9 +107,7 @@ def test_strategy_enable_disable_and_runtime_panel(
 
         row = _row_for_strategy(dashboard_client, strategy_name)
         assert row, f"strategy {strategy_name!r} disappeared from snapshot"
-        assert row.get("strategy_state") or row.get("state"), (
-            f"strategy state is absent: {row}"
-        )
+        _assert_runtime_row_fields(row)
     finally:
         if disabled:
             row = _row_for_strategy(dashboard_client, strategy_name)

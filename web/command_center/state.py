@@ -32,6 +32,16 @@ TERMINAL_ORDER_STATUSES = {
     "REJECTED",
     "INACTIVE",
 }
+STRATEGY_RUNTIME_METADATA_FIELDS = {
+    "class_name",
+    "bar_size",
+    "conids",
+    "universe",
+    "params",
+    "module",
+    "display_name",
+    "historical_days_prior",
+}
 
 
 def _utc_iso(epoch_seconds: float) -> str:
@@ -254,7 +264,7 @@ class DashboardState:
         elif entity_type == "position":
             self.positions[entity_id] = row
         elif entity_type == "strategy":
-            self.strategies[entity_id] = row
+            self.strategies[entity_id] = self._merge_strategy_row(entity_id, row)
         elif entity_type == "risk":
             evicted = self.risk.put(entity_id, row, now)
             if evicted is not None:
@@ -276,6 +286,19 @@ class DashboardState:
             self.allocation_authorities[entity_id] = row
         else:
             logger.warning("unknown entity_type %r ignored", entity_type)
+
+    def _merge_strategy_row(self, entity_id: str, row: dict) -> dict:
+        """Keep deployed metadata when a control receipt carries only state."""
+        previous = self.strategies.get(entity_id)
+        if previous is None:
+            return row
+        merged = {**previous, **row}
+        for field in STRATEGY_RUNTIME_METADATA_FIELDS:
+            value = row.get(field)
+            if field not in row or value is None or value == "" or value == [] or value == {}:
+                if field in previous:
+                    merged[field] = previous[field]
+        return merged
 
     def _remove(self, entity_type: str, entity_id: str) -> None:
         if entity_type == "account":

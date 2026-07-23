@@ -102,6 +102,11 @@ include = ["trader*", "web*"]
 testpaths = ["tests"]
 python_files = ["test_*.py"]
 python_functions = ["test_*"]
+# ``tests/__init__.py`` makes ``tests`` a real package (needed for
+# ``from tests.paper_e2e…``). That stops pytest from putting ``tests/`` on
+# ``sys.path``, which broke legacy bare imports (``from cc_fakes import…``,
+# ``from conftest import…``). Keep both import styles working.
+pythonpath = ["tests"]
 # Keep ordinary `pytest tests/` runs off the live paper suite. Explicit
 # `-m paper_e2e` (scripts/paper_e2e.sh) overrides this deselect.
 addopts = ["-m", "not paper_e2e"]

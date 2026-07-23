@@ -216,6 +216,7 @@ class TestSnapshotApi:
         }
         assert "deployed_strategy_names" in body
         assert isinstance(body["deployed_strategy_names"], list)
+        assert body["operating_mode"] in ("auto", "semi", "manual")
 
 
     @pytest.mark.asyncio

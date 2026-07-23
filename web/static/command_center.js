@@ -328,6 +328,60 @@ function renderStatusBar() {
     esc(health.lifecycle || 'unknown')}</span>`;
   document.querySelector('#last-event-time .v').textContent =
     v.last_event_at ? `${v.last_event_at} (${fmtAge(ageOf(v.last_event_at))} ago)` : '—';
+  renderOperatingMode();
+}
+
+const OP_MODE_META = {
+  auto: {
+    label: 'Auto',
+    title: 'Auto — at least one strategy has full automation (or paper automation is armed)',
+  },
+  semi: {
+    label: 'Semi',
+    title: 'Semi-manual — strategies propose; a human (or paper LLM) must Approve',
+  },
+  manual: {
+    label: 'Manual',
+    title: 'Fully manual — propose and approve by hand',
+  },
+};
+
+function ccStrategyFullAuto(s) {
+  const ae = s && s.auto_execute;
+  if (ae === true) return true;
+  if (typeof ae === 'string') {
+    const v = ae.trim().toLowerCase();
+    return v === 'true' || v === '1' || v === 'yes' || v === 'execute' || v === 'auto';
+  }
+  return false;
+}
+
+function ccOperatingMode(view) {
+  // Green as soon as one strategy is fully automated — not only when the
+  // whole book is automation-only.
+  const life = String(
+    (view && view.paper_automation && view.paper_automation.lifecycle) || ''
+  ).toLowerCase();
+  if (life === 'armed' || life === 'armed_unpersisted' || life === 'degraded'
+      || life === 'restart_required' || life === 'preparing') {
+    return 'auto';
+  }
+  const live = (view && view.strategies) || [];
+  if (live.some(ccStrategyFullAuto)) return 'auto';
+  const mode = String((view && view.operating_mode) || '').toLowerCase();
+  if (mode === 'auto' || mode === 'semi' || mode === 'manual') return mode;
+  return 'manual';
+}
+
+function renderOperatingMode() {
+  const el = document.getElementById('operating-mode');
+  if (!el) return;
+  const mode = ccOperatingMode(store.view || {});
+  const meta = OP_MODE_META[mode] || OP_MODE_META.manual;
+  el.dataset.mode = mode;
+  el.title = meta.title;
+  const label = el.querySelector('.op-label');
+  if (label) label.textContent = meta.label;
 }
 
 function renderAccountCards() {
@@ -482,39 +536,58 @@ function renderOrders() {
     }
     return null;
   };
-  // Aggregate group status without hiding per-leg state (spec §8.4).
+  // Legs only — no og-* group-head (noisy UUID + "N leg(s) · Cancelled").
+  // Show filled qty only when > 0 (skip "filled 0" on unfilled/cancelled).
   document.getElementById('order-groups').innerHTML =
-    [...groups.entries()].map(([gid, legs]) => {
-      const statuses = [...new Set(legs.map(l => String(l.status || '')))];
-      const filled = legs.reduce((n, l) => n + (l.filled_quantity || 0), 0);
+    [...groups.entries()].map(([, legs]) => {
       return `<div class="order-group">
-        <div class="group-head">${esc(gid)}<span class="n">${legs.length} leg(s) ·
-          ${esc(statuses.join(' / '))} · filled ${fmt.format(filled)}</span></div>
         ${legs.map(l => {
           const kind = kindOf(l.leg);
+          const filledQty = Number(l.filled_quantity) || 0;
+          const fillBits = [];
+          if (filledQty > 0) {
+            fillBits.push(`filled ${fmt.format(filledQty)}`);
+            if (l.avg_fill_price) fillBits.push('@ ' + money(l.avg_fill_price));
+          }
+          const statusBits = [l.status || '', ...fillBits].filter(Boolean);
           return `<div class="leg">
           ${kind ? `<span class="kind ${kind[1]}">${kind[0]}</span>` : ''}
           <span>${esc(l.symbol || l.conid || '')}
           ${esc(l.action || '')} ${fmt.format(l.quantity ?? 0)}
           @ ${esc(l.order_type || '')}</span>
-          <span class="leg-r">${esc(l.status || '')} · filled ${fmt.format(l.filled_quantity || 0)}
-          ${l.avg_fill_price ? '@ ' + money(l.avg_fill_price) : ''}
+          <span class="leg-r">${esc(statusBits.join(' · '))}
           ${CFG.commandsEnabled && activeIds.has(l.entity_id)
             ? ` <button type="button"
                 data-cc-cancel-order="${esc(l.entity_id)}">Cancel</button>` : ''}
           </span></div>`;
         }).join('')}
       </div>`;
-    }).join('') || '<div class="order-group group-head dim">No orders.</div>';
+    }).join('') || '<div class="order-group orders-empty">No orders.</div>';
+}
+
+function formatFillTime(value) {
+  if (value == null || value === '') return '';
+  const d = new Date(value);
+  if (Number.isNaN(d.getTime())) return String(value);
+  // Local clock, compact — Time column previously looked empty because the
+  // payload field is ``fill_time``, not ``time``.
+  return d.toLocaleString(undefined, {
+    year: 'numeric', month: '2-digit', day: '2-digit',
+    hour: '2-digit', minute: '2-digit', second: '2-digit', hour12: false,
+  });
 }
 
 function renderFills() {
   const v = store.view; if (!v) return;
   document.getElementById('fills-body').innerHTML = v.fills.slice(-50).reverse()
-    .map(f => `<tr><td>${esc(f.time || '')}</td><td>${esc(f.symbol || f.conid || '')}</td>
+    .map(f => {
+      const when = f.fill_time || f.time || f.source_timestamp || '';
+      return `<tr><td>${esc(formatFillTime(when))}</td>
+      <td>${esc(f.symbol || f.conid || '')}</td>
       <td>${esc(f.side || '')}</td><td class="num">${fmt.format(f.quantity ?? 0)}</td>
       <td class="num">${money(f.price)}</td>
-      <td class="num">${money(f.commission)}</td></tr>`).join('');
+      <td class="num">${money(f.commission)}</td></tr>`;
+    }).join('');
 }
 
 function renderStrategies() {

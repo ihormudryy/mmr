@@ -41,6 +41,62 @@ def _deployed_strategy_names() -> list[str]:
         return []
 
 
+_AUTO_LIFECYCLES = frozenset({
+    "armed", "armed_unpersisted", "degraded",
+    # Configured / activating full automation for a bound strategy — still Auto.
+    "restart_required", "preparing",
+})
+
+
+def _is_full_auto_execute(value: object) -> bool:
+    """True when a strategy is configured for full automation (not propose)."""
+    if value is True:
+        return True
+    if isinstance(value, str):
+        return value.strip().lower() in {"true", "1", "yes", "execute", "auto"}
+    return False
+
+
+def compute_operating_mode(
+    paper_automation: dict | None,
+    deployed_rows: list[dict] | None = None,
+) -> str:
+    """Account operating mode for the command-band indicator.
+
+    - ``auto``: paper automation armed/activating, **or any one strategy** with
+      full automation (``auto_execute: true`` / equivalent)
+    - ``semi``: at least one deployed strategy uses ``auto_execute: propose``
+      and none are fully automated
+    - ``manual``: human propose/approve only (default)
+    """
+    life = str((paper_automation or {}).get("lifecycle") or "").strip().lower()
+    if life in _AUTO_LIFECYCLES:
+        return "auto"
+    rows = list(deployed_rows or ())
+    if any(_is_full_auto_execute(row.get("auto_execute")) for row in rows):
+        return "auto"
+    if any(row.get("auto_execute") == "propose" for row in rows):
+        return "semi"
+    return "manual"
+
+
+def _operating_mode_for_snapshot(
+    paper_automation: dict | None,
+    view_strategies: list[dict] | None = None,
+) -> str:
+    try:
+        from web.app import fetch_deployed_from_config
+        deployed = list(fetch_deployed_from_config())
+    except Exception as exc:  # noqa: BLE001 — optional enrichment
+        logger.debug("operating mode deploy scan unavailable: %s", exc)
+        deployed = []
+    # One fully-automated live strategy is enough for Auto — merge journal rows.
+    for row in view_strategies or ():
+        if isinstance(row, dict):
+            deployed.append(row)
+    return compute_operating_mode(paper_automation, deployed)
+
+
 # Dedicated pool so a timed-out manage fetch can be abandoned without tying an
 # asyncio Task / default-executor Future to the request portal. ``asyncio.wait_for
 # (asyncio.to_thread(...))`` cancels the awaitable but the worker thread keeps
@@ -90,6 +146,10 @@ def create_read_router(cc, templates, manage_context_provider=None,
                 )
             except Exception as exc:  # noqa: BLE001 - optional read-model enrichment
                 logger.debug("paper automation status unavailable: %s", exc)
+        view["operating_mode"] = _operating_mode_for_snapshot(
+            view.get("paper_automation"),
+            view.get("strategies"),
+        )
         view["health"] = cc.bridge.health() if cc.bridge else {
             "lifecycle": "starting", "reconnects": 0, "cursor": None, "sources": {}}
         return JSONResponse(view)

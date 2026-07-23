@@ -402,7 +402,8 @@ class TestCommandCenterPage:
             html = (await c.get("/cc")).text
             for element_id in ("status-bar", "mode-badge", "account-id",
                                "dependency-chips", "last-event-time",
-                               "quick-stats", "band-netliq", "band-daypnl",
+                               "band-stats", "band-netliq", "band-daypnl",
+                               "band-exposure", "band-buying-power",
                                "positions-panel", "action-rail",
                                "orders-panel", "fills-panel", "strategies-panel",
                                "risk-panel", "degraded-banner", "drawer"):

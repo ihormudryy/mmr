@@ -119,6 +119,7 @@
         <tr><td>Health chips</td><td>Are trader / feeds / journal healthy?</td></tr>
         <tr><td><strong>Net liquidation</strong></td><td>Total account value right now</td></tr>
         <tr><td><strong>Day P&amp;L</strong></td><td>Today’s profit/loss — green up, red down</td></tr>
+        <tr><td><strong>Exposure / Buying power / Margin / counts</strong></td><td>Same command-band row — secondary figures next to the headlines</td></tr>
         <tr><td><strong>Pause new trading</strong> {{ info('Moved here from the Strategies panel — it is account-wide, not per-strategy.') }}</td><td>Emergency brake on new exposure</td></tr>
         <tr><td><strong>New proposal</strong> {{ info('Opens the New proposal drawer. Resolve a ticker to an exact conId first.') }}</td><td>Start a manual trade proposal</td></tr>
       </tbody>
@@ -129,7 +130,7 @@
   <section class="guide-section">
     <h2>Trading tab {{ info('Your live book: positions, proposals, orders, fills, strategies, pause, and risk.') }}</h2>
     <p>Laid out action-first, top to bottom: the pending <strong>Action queue</strong> sits
-      directly under the command band, then a <strong>quick-stats</strong> row, then your
+      directly under the command band, then your
       positions, and finally orders, fills, strategies, and risk side by side.</p>
     <table>
       <thead><tr><th>Area</th><th>What it is</th></tr></thead>
@@ -181,8 +182,14 @@
       <thead><tr><th>Action</th><th>How</th></tr></thead>
       <tbody>
         <tr>
+          <td><strong>Build unsigned JSON</strong> {{ info('Form with dropdowns for strategy / stage / mode. Digests stay paste-in. Private keys never enter the browser.') }}</td>
+          <td>Scaling → fill the form (or Prefill) → Generate → Copy/Download →
+            <code>mmr research allocation sign --payload-file … --key-file …</code>
+            → paste signed JSON into Activate.</td>
+        </tr>
+        <tr>
           <td><strong>Activate allocation</strong> {{ info('Live capital path. Private keys never enter the browser.') }}</td>
-          <td>Offline prepare → sign → paste/upload JSON + reason → Activate. Skip on paper — use Paper automation instead.</td>
+          <td>Paste/upload signed attestation JSON + reason → Activate. Skip on paper — use Paper automation instead.</td>
         </tr>
         <tr>
           <td><strong>Suspend</strong></td>

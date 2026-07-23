@@ -250,6 +250,44 @@ async function test(name, fn) {
     assert.match(errToast.className, /cc-toast-error/);
   });
 
+  // 7 — unsigned allocation payload builder (Scaling tab JSON helper).
+  await test('buildUnsignedAllocationPayload: happy path + stage ceiling', async () => {
+    const h = makeHarness();
+    const base = {
+      strategy_id: 'orb_googl',
+      account_id: 'DU123',
+      account_mode: 'paper',
+      stage: 'SCALE_1',
+      max_gross_allocation: 0.09,
+      ttl_days: 30,
+      artifact_digest: 'sha256:a',
+      allowlist_digest: 'sha256:b',
+      ruleset_digest: 'sha256:c',
+      evidence_digest: 'sha256:d',
+      operator: 'alice',
+      reason: 'scale after canary',
+      public_key_id: 'key-1',
+      issued_at: '2026-07-23T12:00:00.000Z',
+    };
+    const ok = h.api.buildUnsignedAllocationPayload(base);
+    assert.equal(ok.ok, true);
+    assert.equal(ok.payload.stage, 'SCALE_1');
+    assert.equal(ok.payload.max_gross_allocation, 0.09);
+    assert.equal(ok.payload.issued_at, '2026-07-23T12:00:00Z');
+    assert.equal(ok.payload.expires_at, '2026-08-22T12:00:00Z');
+    assert.equal(ok.payload.signature, undefined);
+
+    const over = h.api.buildUnsignedAllocationPayload({
+      ...base, max_gross_allocation: 0.10,
+    });
+    assert.equal(over.ok, false);
+    assert.ok(over.errors.some((e) => /ceiling/i.test(e)));
+
+    const missing = h.api.buildUnsignedAllocationPayload({ stage: 'SCALE_1' });
+    assert.equal(missing.ok, false);
+    assert.ok(missing.errors.length >= 3);
+  });
+
   console.log(`command_center_commands.test.js: ${passed} tests passed`);
 })().catch((error) => {
   console.error(error);

@@ -334,9 +334,8 @@ function renderAccountCards() {
   const v = store.view; if (!v) return;
   const account = v.accounts[0] || {};
   // Net liquidation must render for a flat account too (spec §8.1): the value
-  // comes from the account entity, never derived from positions. The two
-  // headline figures live in the command band; the rest fills the
-  // quick-stats row under the action queue.
+  // comes from the account entity, never derived from positions. Headline
+  // figures + secondary stats all live in the command band.
   const netEl = document.getElementById('band-netliq');
   if (netEl) netEl.textContent = money(account.net_liquidation, account.currency);
   const dayEl = document.getElementById('band-daypnl');
@@ -345,20 +344,17 @@ function renderAccountCards() {
     dayEl.textContent = (pnl > 0 ? '+' : '') + money(pnl, account.currency);
     dayEl.className = 'band-v' + (pnl > 0 ? ' pos' : pnl < 0 ? ' neg' : '');
   }
-  const stats = [
-    ['Exposure', money(account.gross_exposure, account.currency)],
-    ['Buying power', money(account.buying_power, account.currency)],
-    ['Margin cushion', account.margin_cushion !== undefined && account.margin_cushion !== null
-      ? `${fmt.format(account.margin_cushion * 100)}%` : '—'],
-    ['Open positions', fmt.format((v.positions || []).length)],
-    ['Working orders', fmt.format(((v.orders || {}).active || []).length)],
-  ];
-  const quick = document.getElementById('quick-stats');
-  if (quick) {
-    quick.innerHTML = stats.map(([k, val]) =>
-      `<div class="q"><div class="k">${k}</div><div class="v">${esc(val)}</div></div>`
-    ).join('');
-  }
+  const set = (id, text) => {
+    const el = document.getElementById(id);
+    if (el) el.textContent = text;
+  };
+  set('band-exposure', money(account.gross_exposure, account.currency));
+  set('band-buying-power', money(account.buying_power, account.currency));
+  set('band-cushion',
+    account.margin_cushion !== undefined && account.margin_cushion !== null
+      ? `${fmt.format(account.margin_cushion * 100)}%` : '—');
+  set('band-positions', fmt.format((v.positions || []).length));
+  set('band-orders', fmt.format(((v.orders || {}).active || []).length));
 }
 
 function renderPositions() {
@@ -686,6 +682,10 @@ function renderScaling() {
   document.getElementById('scaling-event').textContent = scaling.event || '—';
   document.getElementById('scaling-expires').textContent =
     scaling.expires_at ? esc(String(scaling.expires_at)) : '—';
+
+  if (globalThis.CCCommands) {
+    CCCommands.populateScalingStrategySelect(v);
+  }
 
   const suspendBtn = document.getElementById('scaling-suspend');
   if (suspendBtn) {
@@ -1313,9 +1313,9 @@ if (CFG.commandsEnabled) {
 }
 
 /* ---------------- boot ----------------------------------------------------- */
-if (CFG.commandsEnabled) {
-  // Inject live state + start the pending-command poll now that the store and
-  // command flags exist; also re-exposes globalThis.ccOpenResearchProposal.
+if (globalThis.CCCommands) {
+  // Inject live state + start the pending-command poll; also wires the
+  // allocation unsigned-JSON builder and re-exposes ccOpenResearchProposal.
   CCCommands.init({ view: () => store.view, config: CFG });
 }
 resync();

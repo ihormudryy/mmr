@@ -365,33 +365,39 @@
       letter-spacing: -.02em;
       font-variant-numeric: tabular-nums;
     }
+    /* Secondary account stats share one band cell; value size matches the
+       former quick-stats Buying power figure (20px). */
+    #band-stats {
+      border-left: 2px solid var(--border);
+      padding-left: var(--space-6);
+      display: flex;
+      flex-wrap: wrap;
+      align-items: center;
+      gap: 10px 22px;
+      flex: 1 1 280px;
+      min-width: 0;
+    }
+    #band-stats .band-stat {
+      display: flex;
+      flex-direction: column;
+      justify-content: center;
+      gap: 4px;
+    }
+    #band-stats .band-stat .band-k {
+      font-size: 10px;
+      letter-spacing: .06em;
+      color: var(--dim);
+    }
+    #band-stats .band-stat .band-v {
+      font: 800 20px/1 var(--font-heading);
+      letter-spacing: -.01em;
+    }
     #band-actions {
       margin-left: auto;
       display: flex;
       gap: 10px;
       align-items: center;
       flex-wrap: wrap;
-    }
-
-    /* —— quick stats row —— */
-    #quick-stats {
-      display: flex;
-      gap: 8px 28px;
-      flex-wrap: wrap;
-      padding: 14px var(--space-6);
-      border-bottom: 2px solid var(--border);
-    }
-    #quick-stats .q .k {
-      font-size: 10px;
-      font-weight: 700;
-      letter-spacing: .06em;
-      text-transform: uppercase;
-      color: var(--dim);
-    }
-    #quick-stats .q .v {
-      font: 800 20px/1 var(--font-heading);
-      margin-top: 6px;
-      font-variant-numeric: tabular-nums;
     }
 
     /* —— sections (modular grid: rules, not floating cards) —— */
@@ -1148,7 +1154,47 @@
       display: flex;
       flex-wrap: wrap;
       gap: var(--space-2);
-      margin-top: var(--space-1);
+      margin-top: 4px;
+    }
+    #dash-scaling .scaling-form-grid {
+      display: grid;
+      grid-template-columns: 1fr 1fr;
+      gap: var(--space-2);
+    }
+    @media (max-width: 640px) {
+      #dash-scaling .scaling-form-grid { grid-template-columns: 1fr; }
+    }
+    #dash-scaling .scaling-form-grid label.span-2 {
+      grid-column: 1 / -1;
+    }
+    #dash-scaling .scaling-controls input[type="number"] {
+      font: inherit;
+      font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+      font-size: 12px;
+      color: var(--fg);
+      background: var(--panel-2);
+      border: 1px solid var(--border);
+      border-radius: var(--radius);
+      padding: 8px 10px;
+      caret-color: var(--accent);
+    }
+    #dash-scaling .scaling-controls .hint {
+      margin: 0;
+      font-size: 12px;
+      color: var(--dim);
+      line-height: 1.4;
+    }
+    #dash-scaling .scaling-controls .hint code {
+      font-size: .92em;
+      padding: .05em .3em;
+    }
+    #dash-scaling #scaling-payload-out {
+      min-height: 180px;
+    }
+    #dash-scaling .scaling-controls .field-error {
+      color: var(--neg);
+      font-size: 12px;
+      margin: 0;
     }
     #dash-scaling .paper-auto-banner {
       margin: 0 var(--space-4) var(--space-3);
@@ -1582,6 +1628,7 @@
       .lower { grid-template-columns: 1fr; }
       #dash-trading .lower section:nth-of-type(odd) { border-right: none; }
       .band-cell { border-left: none; padding-left: 0; }
+      #band-stats { border-left: none; padding-left: 0; }
     }
     @media (max-width: 720px) {
       .dash-admin-pane .dash-admin-body {
@@ -1592,7 +1639,6 @@
       main.grid {
         padding: 0 var(--space-4) var(--space-4);
       }
-      #quick-stats { padding: var(--space-4); }
       .dash-tabs { padding-left: 0; padding-right: var(--space-4); }
       #status-bar { padding-left: var(--space-4); padding-right: var(--space-4); }
     }
@@ -1656,6 +1702,28 @@
       <span class="band-k">Day P&amp;L</span>
       <span id="band-daypnl" class="band-v">—</span>
     </div>
+    <div id="band-stats" aria-label="Account summary">
+      <div class="band-stat">
+        <span class="band-k">Exposure</span>
+        <span id="band-exposure" class="band-v">—</span>
+      </div>
+      <div class="band-stat">
+        <span class="band-k">Buying power</span>
+        <span id="band-buying-power" class="band-v">—</span>
+      </div>
+      <div class="band-stat">
+        <span class="band-k">Margin cushion</span>
+        <span id="band-cushion" class="band-v">—</span>
+      </div>
+      <div class="band-stat">
+        <span class="band-k">Open positions</span>
+        <span id="band-positions" class="band-v">—</span>
+      </div>
+      <div class="band-stat">
+        <span class="band-k">Working orders</span>
+        <span id="band-orders" class="band-v">—</span>
+      </div>
+    </div>
     {% if commands_enabled %}
     <div id="band-actions">
       <div id="cc-pause-control" class="cc-pause">
@@ -1686,7 +1754,6 @@
       </div>
       <div id="proposal-cards"></div>
     </section>
-    <div id="quick-stats" aria-label="Account summary"></div>
     <section id="positions-panel" aria-label="Positions">
       <h2><span class="h-title">Positions {{ info('Live holdings from IB. Unrealized P&amp;L vs average cost; Day P&amp;L since session start. Close starts an exit proposal — Approve still required.') }}</span>
         <span id="positions-meta" class="h-meta"></span></h2>
@@ -1743,10 +1810,97 @@
           <div class="scaling-card"><div class="label">Expires</div>
             <div id="scaling-expires" class="value">—</div></div>
         </div>
+        <div class="scaling-controls" id="scaling-payload-builder"
+             aria-label="Build unsigned allocation JSON for offline signing">
+          <h3>Build unsigned allocation JSON {{ info('Fills the fields that go into mmr research allocation sign. Private keys never enter this browser — copy the JSON, sign offline, then paste the signed attestation below to Activate.') }}</h3>
+          <p class="hint">Choose options below, generate JSON, then sign offline:
+            <code>mmr research allocation sign --payload-file payload.json --key-file ~/.config/mmr/keys/private/signing.pem</code>
+            Paste the signed result into Activate. Digests are not invented here — paste values from your research / evidence pipeline.</p>
+          <div class="scaling-form-grid">
+            <label>Strategy
+              <select id="scaling-payload-strategy">
+                <option value="">Select a strategy…</option>
+              </select>
+            </label>
+            <label>Or type strategy id
+              <input type="text" id="scaling-payload-strategy-custom"
+                     placeholder="orb_googl" autocomplete="off" spellcheck="false">
+            </label>
+            <label>Account id
+              <input type="text" id="scaling-payload-account"
+                     placeholder="DU… or U…" autocomplete="off" spellcheck="false">
+            </label>
+            <label>Account mode
+              <select id="scaling-payload-mode">
+                <option value="paper">paper</option>
+                <option value="live">live</option>
+              </select>
+            </label>
+            <label>Target stage
+              <select id="scaling-payload-stage">
+                <option value="SCALE_1">SCALE_1 (max 9%)</option>
+                <option value="SCALE_2">SCALE_2 (max 13.5%)</option>
+                <option value="STEADY">STEADY (max 15%)</option>
+                <option value="CANARY">CANARY (max 6%)</option>
+              </select>
+            </label>
+            <label>Max gross allocation
+              <input type="number" id="scaling-payload-ceiling" min="0.001" max="0.15"
+                     step="0.001" value="0.09" title="Fraction of equity, e.g. 0.09 = 9%">
+            </label>
+            <label>TTL (days)
+              <input type="number" id="scaling-payload-ttl" min="1" max="365"
+                     step="1" value="30">
+            </label>
+            <label>Public key id
+              <input type="text" id="scaling-payload-key-id"
+                     placeholder="key-2026" autocomplete="off" spellcheck="false">
+            </label>
+            <label>Operator
+              <input type="text" id="scaling-payload-operator"
+                     placeholder="your-name" autocomplete="off" spellcheck="false">
+            </label>
+            <label class="span-2">Reason
+              <input type="text" id="scaling-payload-reason" maxlength="200"
+                     placeholder="Scale 1 after clean canary" autocomplete="off">
+            </label>
+            <label class="span-2">Artifact digest
+              <input type="text" id="scaling-payload-artifact"
+                     placeholder="sha256:…" autocomplete="off" spellcheck="false">
+            </label>
+            <label class="span-2">Allowlist digest
+              <input type="text" id="scaling-payload-allowlist"
+                     placeholder="sha256:…" autocomplete="off" spellcheck="false">
+            </label>
+            <label class="span-2">Ruleset digest
+              <input type="text" id="scaling-payload-ruleset"
+                     placeholder="sha256:…" autocomplete="off" spellcheck="false">
+            </label>
+            <label class="span-2">Evidence digest
+              <input type="text" id="scaling-payload-evidence"
+                     placeholder="from ScalingGate / evidence window" autocomplete="off" spellcheck="false">
+            </label>
+          </div>
+          <p id="scaling-payload-error" class="field-error" hidden></p>
+          <div class="btn-row">
+            <button type="button" id="scaling-payload-generate" class="btn primary">
+              Generate unsigned JSON</button>
+            <button type="button" id="scaling-payload-copy" class="btn" disabled>
+              Copy JSON</button>
+            <button type="button" id="scaling-payload-download" class="btn" disabled>
+              Download payload.json</button>
+            <button type="button" id="scaling-payload-prefill" class="btn">
+              Prefill from dashboard</button>
+          </div>
+          <label class="span-2">Unsigned payload (sign offline — no signature field)
+            <textarea id="scaling-payload-out" spellcheck="false" readonly
+                      placeholder='Click "Generate unsigned JSON"'></textarea>
+          </label>
+        </div>
         {% if commands_enabled %}
         <div class="scaling-controls" id="scaling-controls"
              aria-label="Allocation operator controls">
-          <h3>Operator controls</h3>
+          <h3>Activate signed attestation</h3>
           <label>Signed attestation JSON
             <textarea id="scaling-attestation" spellcheck="false"
                       placeholder='{"strategy_id":"...","signature":"..."}'></textarea>

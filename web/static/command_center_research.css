@@ -98,7 +98,7 @@
   display: none;
 }
 
-/* Match Deploy/Watchlists `.param-form` density inside the Research pane. */
+/* Match Strategies/Portfolios `.param-form` density inside the Research pane. */
 #dash-research .research-form {
   display: flex;
   flex-wrap: wrap;

@@ -801,7 +801,7 @@ function renderPaperAutomation() {
     const bound = (pa && pa.strategy_name) || '';
     const placeholder = names.length
       ? 'Select a strategy…'
-      : 'No deployed strategies — use the Deploy tab first';
+      : 'No deployed strategies — use the Strategies tab first';
     const options = [`<option value="">${esc(placeholder)}</option>`]
         .concat(names.map(name =>
           `<option value="${esc(name)}">${esc(name)}</option>`));
@@ -860,7 +860,7 @@ function renderPaperAutomation() {
                && ((v && v.strategies) || []).length === 0) {
       items.push(_checklistItem('blocked', 'Strategy selected',
         'No strategies in live feed or <code>strategy_runtime.yaml</code>. '
-        + 'Deploy one on the Deploy tab, then reload.'));
+        + 'Deploy one on the Strategies tab, then reload.'));
     } else {
       items.push(_checklistItem('wait', 'Strategy selected',
         'Pick the one strategy to arm (must not use propose while automated).'));

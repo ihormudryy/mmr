@@ -755,7 +755,7 @@
     .cc-resolve-status.ok { color: var(--pos); }
     .cc-resolve-status.err { color: var(--neg); }
 
-    /* —— admin panes (Deploy / Watchlists) —— */
+    /* —— admin panes (Strategies / Portfolios) —— */
     .dash-admin-pane { padding: 0 0 var(--space-6); }
     .dash-admin-pane .dash-admin-body {
       display: grid;
@@ -1668,9 +1668,9 @@
   <nav class="dash-tabs" aria-label="Dashboard sections">
     <button type="button" class="dash-tab active" data-dash-tab="trading">Trading</button>
     <button type="button" class="dash-tab" data-dash-tab="scaling">Scaling</button>
-    <button type="button" class="dash-tab" data-dash-tab="deploy">Deploy
+    <button type="button" class="dash-tab" data-dash-tab="deploy">Strategies
       <span class="chip on">{{ deployed_count|default(0) }}</span></button>
-    <button type="button" class="dash-tab" data-dash-tab="watchlists">Watchlists
+    <button type="button" class="dash-tab" data-dash-tab="watchlists">Portfolios
       <span class="chip">{{ watchlists|length|default(0) }}</span></button>
     <button type="button" class="dash-tab" data-dash-tab="research">Research</button>
     <button type="button" class="dash-tab" data-dash-tab="guide">Guide</button>
@@ -1793,7 +1793,7 @@
         <table><thead><tr><th>Time</th><th>Instrument</th><th>Side</th>
           <th>Qty</th><th>Price</th><th>Commission</th></tr></thead>
           <tbody id="fills-body"></tbody></table></section>
-      <section id="strategies-panel"><h2><span class="h-title">Strategies {{ info('Live strategy_service rows. Enable/Disable here is immediate. Pause new trading blocks new exposure without unloading strategies. Full deploy/undeploy is on the Deploy tab.') }}</span></h2>
+      <section id="strategies-panel"><h2><span class="h-title">Strategies {{ info('Live strategy_service rows. Enable/Disable here is immediate. Pause new trading blocks new exposure without unloading strategies. Full deploy/undeploy is on the Strategies tab.') }}</span></h2>
         <table><thead><tr><th>Strategy</th><th>State</th><th>Enabled</th>
           <th>Last activity</th><th>Error</th>
           {% if commands_enabled %}<th data-cc-col="strategy-actions">Actions</th>{% endif %}

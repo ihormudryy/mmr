@@ -1,7 +1,7 @@
-/* Deploy + Watchlists tab wiring for /cc (CSP-safe — no inline script).
+/* Strategies + Portfolios tab wiring for /cc (CSP-safe — no inline script).
  * Tab clicks, hash routing, deploy/watchlist-row unfold, watchlist checkbox
  * multi-remove, delete confirm, tooltip positioning, and the 30s admin-pane
- * auto-refresh. */
+ * auto-refresh. Internal tab ids remain deploy / watchlists. */
 'use strict';
 
 (function () {
@@ -149,8 +149,10 @@
     if (raw === 'scaling') return 'scaling';
     if (raw === 'research') return 'research';
     if (raw === 'guide' || raw === 'help') return 'guide';
-    if (raw === 'manage' || raw === 'setup' || raw === 'setup-strategies') return 'deploy';
-    if (raw === 'setup-watchlists') return 'watchlists';
+    if (raw === 'manage' || raw === 'setup' || raw === 'setup-strategies'
+        || raw === 'strategies') return 'deploy';
+    if (raw === 'setup-watchlists' || raw === 'portfolios'
+        || raw === 'portfolio') return 'watchlists';
     if (ADMIN_TABS[raw]) return raw;
     return 'trading';
   }

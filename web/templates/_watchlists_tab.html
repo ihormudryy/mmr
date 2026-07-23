@@ -3,15 +3,15 @@
 <div class="dash-admin-body">
 
   <section class="full">
-    <h2>Watchlists
-      {{ info('Your own groups of stocks/ETFs to follow. Deploy a strategy onto a watchlist (Deploy tab) and it monitors every member for signals. Stored as universes in the local DB; symbols resolve to exact IB contracts — never guessed.') }}
+    <h2>Portfolios
+      {{ info('Your own groups of stocks/ETFs to follow. Deploy a strategy onto a portfolio (Strategies tab) and it monitors every member for signals. Stored as universes in the local DB; symbols resolve to exact IB contracts — never guessed.') }}
       <span class="chip">{{ watchlists|length }}</span>
     </h2>
     {% if errors.watchlists %}<p class="banner err">{{ errors.watchlists }}</p>{% endif %}
     <div class="toolbar">
       <form class="param-form" method="post" action="/watchlists/create">
         <input type="hidden" name="csrf_token" value="{{ csrf_token }}" />
-        <label>new watchlist <input class="w-symbols" name="name" placeholder="my_etfs" /></label>
+        <label>new portfolio <input class="w-symbols" name="name" placeholder="my_etfs" /></label>
         <button type="submit" class="primary">Create</button>
         <span class="param-hint">a-z, 0-9, dash, underscore</span>
       </form>
@@ -83,4 +83,4 @@
   </section>
 
 </div>
-<p class="setup-foot">Watchlist CRUD · click a name to manage members · auto-refreshes every 30s while this tab is open (paused while a panel is open)</p>
+<p class="setup-foot">Portfolio CRUD · click a name to manage members · auto-refreshes every 30s while this tab is open (paused while a panel is open)</p>

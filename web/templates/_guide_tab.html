@@ -5,7 +5,7 @@
     <h1>Dashboard user guide</h1>
     <p class="guide-lead">
       Control room for your paper or live IB account at
-      <code>/cc</code>. Hover or click the <span class="info" tabindex="0" role="button" aria-label="More info" aria-expanded="false">i<span class="tip">Same info bubbles as on the Deploy and Watchlists tabs — hover, focus, or click the icon to read.</span></span>
+      <code>/cc</code>. Hover or click the <span class="info" tabindex="0" role="button" aria-label="More info" aria-expanded="false">i<span class="tip">Same info bubbles as on the Strategies and Portfolios tabs — hover, focus, or click the icon to read.</span></span>
       bubbles for extra help.
     </p>
     <p class="guide-note">
@@ -108,7 +108,7 @@
 
   <section class="guide-section">
     <h2>Top of the page: tab row &amp; command band {{ info('The tab row switches sections; the command band below it is always visible and account-wide, whatever tab you are on.') }}</h2>
-    <p>The <strong>tab row</strong> holds the sections (Trading, Scaling, Deploy, Watchlists, Research, Guide), the
+    <p>The <strong>tab row</strong> holds the sections (Trading, Scaling, Strategies, Portfolios, Research, Guide), the
       <strong>last event</strong> freshness, and the <strong>Dark / Light</strong> theme toggle.</p>
     <p>The <strong>command band</strong> underneath is your account-wide control strip — the same on every tab.</p>
     <table>
@@ -140,7 +140,7 @@
         <tr><td>Positions {{ info('Header shows “N open · $X gross”. Close starts an exit proposal — Approve still required.') }}</td><td>What you hold; <strong>Close</strong> to exit</td></tr>
         <tr><td>Working orders {{ info('Open broker orders still working at IB. Each leg is tagged ENTRY (opening risk) or PROTECTIVE (a stop / take-profit guarding a position).') }}</td><td>Open broker orders with <strong>ENTRY / PROTECTIVE</strong> tags; Cancel or <strong>Cancel all</strong></td></tr>
         <tr><td>Recent executions {{ info('Fills that actually traded.') }}</td><td>Fills (what actually traded)</td></tr>
-        <tr><td>Strategies {{ info('Live runtime rows with RUNNING / ERROR state chips; full deploy is on the Deploy tab.') }}</td><td>Running algos; Enable / Disable / Edit params</td></tr>
+        <tr><td>Strategies {{ info('Live runtime rows with RUNNING / ERROR state chips; full deploy is on the Strategies tab.') }}</td><td>Running algos; Enable / Disable / Edit params</td></tr>
         <tr><td>Risk {{ info('Concentration, group budgets, reconciliation warnings.') }}</td><td>Warnings (concentration, etc.)</td></tr>
       </tbody>
     </table>
@@ -204,25 +204,25 @@
   </section>
 
   <section class="guide-section">
-    <h2>Deploy tab {{ info('Turns a strategy file into a running algo. Needs symbols OR a watchlist — exactly one.') }}</h2>
+    <h2>Strategies tab {{ info('Turns a strategy file into a running algo. Needs symbols OR a portfolio — exactly one.') }}</h2>
     <h3>Example E — Deploy on a small US list</h3>
     <ol class="guide-steps">
-      <li>Watchlists: create <code>tech_demo</code>, add <code>AAPL, MSFT</code>.</li>
-      <li>Deploy → unfold a strategy → name e.g. <code>orb_demo</code>.</li>
-      <li>Pick watchlist <code>tech_demo</code> (or type symbols — not both empty).</li>
+      <li>Portfolios: create <code>tech_demo</code>, add <code>AAPL, MSFT</code>.</li>
+      <li>Strategies → unfold a strategy → name e.g. <code>orb_demo</code>.</li>
+      <li>Pick portfolio <code>tech_demo</code> (or type symbols — not both empty).</li>
       <li>Optional: check <strong>propose</strong> so signals become proposals.</li>
       <li>Deploy → Enable on Trading when needed.</li>
     </ol>
-    <p class="guide-note">Undeploy is on the Deploy tab (confirm), or: <code>mmr strategies undeploy orb_demo</code></p>
+    <p class="guide-note">Undeploy is on the Strategies tab (confirm), or: <code>mmr strategies undeploy orb_demo</code></p>
   </section>
 
   <section class="guide-section">
-    <h2>Watchlists tab {{ info('Reusable symbol groups resolved to exact IB contracts — never guessed.') }}</h2>
+    <h2>Portfolios tab {{ info('Reusable symbol groups resolved to exact IB contracts — never guessed.') }}</h2>
     <h3>Example F — ASX names</h3>
     <ol class="guide-steps">
       <li>Create <code>asx_miners</code>.</li>
       <li>manage → symbols <code>BHP, RIO</code> → exchange <code>ASX</code> → currency <code>AUD</code> → Add.</li>
-      <li>Use that watchlist on Deploy so you get Australian listings, not a US ticker with the same letters.</li>
+      <li>Use that portfolio on Strategies so you get Australian listings, not a US ticker with the same letters.</li>
     </ol>
   </section>
 
@@ -254,7 +254,7 @@ mmr strategies undeploy NAME</code></pre>
     <ul class="guide-tips">
       <li>Use <strong>conIds</strong> in New proposal (exact contract).</li>
       <li>Drawers: <strong>Cancel</strong>, <strong>×</strong>, or <strong>Escape</strong> closes without sending.</li>
-      <li>Deploy needs symbols <em>or</em> watchlist — empty submit shows an error flash.</li>
+      <li>Strategies deploy needs symbols <em>or</em> portfolio — empty submit shows an error flash.</li>
       <li>Missing risk data ≠ “all clear.”</li>
       <li><strong>Pause new trading</strong> and <strong>New proposal</strong> live in the command band (top), not in the panels below.</li>
       <li><strong>Dark / Light</strong> toggle is in the tab row; it defaults to your OS theme.</li>

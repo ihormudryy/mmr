@@ -13,7 +13,7 @@
       {{ info('Currently loaded by strategy_service from strategy_runtime.yaml. Enable puts a strategy RUNNING so it receives bars; Disable stops it without undeploying.') }}
       <span class="chip on">{{ deployed_count }} loaded</span>
     </h2>
-    <p class="note">Enter <strong>symbols</strong> (e.g. AAPL, MSFT) or pick a <strong>watchlist</strong> to deploy.
+    <p class="note">Enter <strong>symbols</strong> (e.g. AAPL, MSFT) or pick a <strong>portfolio</strong> to deploy.
       Use <strong>Enable</strong> / <strong>Disable</strong> on a deployed row to put it RUNNING.
       <strong>Undeploy</strong> removes it from config and reloads strategy_service.</p>
     {% if errors.strategies %}<p class="banner err">{{ errors.strategies }}</p>{% endif %}
@@ -70,7 +70,7 @@
 
   <section class="full">
     <h2>Available strategies
-      {{ info('Every Strategy implementation found in the strategies/ directory (static scan — nothing is executed). Deploy attaches one to symbols or a watchlist, loads it immediately, and enables it.') }}
+      {{ info('Every Strategy implementation found in the strategies/ directory (static scan — nothing is executed). Deploy attaches one to symbols or a portfolio, loads it immediately, and enables it.') }}
       <span class="chip">{{ available_strategies|length }}</span>
     </h2>
     {% if errors.available %}<p class="banner err">{{ errors.available }}</p>{% endif %}
@@ -83,7 +83,7 @@
         <th>Mode {{ info('precompute: fast vectorized path — safe for 1-min backtests. on_prices: legacy per-bar path — O(N²) in backtests, fine live.') }}</th>
         <th>Tunables {{ info('Parameters you can override per deployment (defaults shown). These are the --param knobs for backtests and editable params after deploying.') }}</th>
         <th>Status {{ info('deployed: this class already appears in strategy_runtime.yaml. on disk: available to deploy.') }}</th>
-        <th>Actions {{ info('Deploy writes the strategy into strategy_runtime.yaml attached to your symbols or a watchlist, loads it immediately, and enables it. Tick propose so signals become PENDING proposals.') }}</th>
+        <th>Actions {{ info('Deploy writes the strategy into strategy_runtime.yaml attached to your symbols or a portfolio, loads it immediately, and enables it. Tick propose so signals become PENDING proposals.') }}</th>
       </tr></thead>
       <tbody>
       {% for a in available_strategies %}
@@ -109,7 +109,7 @@
               <input type="hidden" name="class" value="{{ a['class'] }}" />
               <label>name <input class="w-name" name="name" value="{{ a.file[:-3] }}" /></label>
               <label>symbols <input class="w-symbols" name="symbols" placeholder="AAPL, MSFT" /></label>
-              <label>or watchlist
+              <label>or portfolio
                 <select name="watchlist">
                   <option value="">—</option>
                   {% for w in watchlists %}<option value="{{ w.name }}">{{ w.name }} ({{ w.count }})</option>{% endfor %}

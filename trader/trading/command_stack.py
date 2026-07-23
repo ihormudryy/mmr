@@ -472,6 +472,18 @@ def _build_automated_intent_service(
     )
 
 
+def _load_position_sizer() -> Any:
+    """Load ``PositionSizer`` from ``~/.config/mmr/position_sizing.yaml``.
+
+    Required for dashboard/CLI proposals that leave quantity and amount blank
+    (auto-size from confidence). Without this, ``ProposalCommandService``
+    raises ``SIZING_BLOCKED: no position sizer is configured``.
+    """
+    from trader.trading.position_sizing import PositionSizingConfig, PositionSizer
+
+    return PositionSizer(PositionSizingConfig.load())
+
+
 def build_command_stack(
     trader: Any,
     policy: CommandAuthorityPolicy,
@@ -702,6 +714,7 @@ def build_command_stack(
         now=now,
         controls=controls,
         positions=positions,
+        sizer=_load_position_sizer(),
     )
     approval_service = ApprovalCommandService(
         journal=journal,

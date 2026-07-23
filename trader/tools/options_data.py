@@ -62,26 +62,26 @@ def chain_records(
         if snap.day:
             volume = getattr(snap.day, "volume", 0.0) or 0.0
         mid = (bid + ask) / 2.0 if (bid and ask) else 0.0
-        greeks = snap.greeks
-        delta = gamma = theta = vega = 0.0
-        if greeks:
-            delta = greeks.delta or 0.0
-            gamma = greeks.gamma or 0.0
-            theta = greeks.theta or 0.0
-            vega = greeks.vega or 0.0
         underlying_price = snap.underlying_asset.price or 0.0 if snap.underlying_asset else 0.0
-        rows.append({
+        row = {
             "ticker": details.ticker or "",
             "type": ct,
             "strike": strike,
             "expiration": details.expiration_date or expiration,
             "bid": bid, "ask": ask, "mid": mid, "last": last, "volume": volume,
             "open_interest": snap.open_interest or 0.0,
-            "iv": (snap.implied_volatility or 0.0) * 100.0,
-            "delta": delta, "gamma": gamma, "theta": theta, "vega": vega,
             "break_even": snap.break_even_price or 0.0,
             "underlying_price": underlying_price,
-        })
+        }
+        # No fabricated data: emit IV/greeks only when the payload carries them.
+        if snap.implied_volatility is not None:
+            row["iv"] = snap.implied_volatility * 100.0
+        if snap.greeks:
+            row["delta"] = snap.greeks.delta
+            row["gamma"] = snap.greeks.gamma
+            row["theta"] = snap.greeks.theta
+            row["vega"] = snap.greeks.vega
+        rows.append(row)
     rows.sort(key=lambda r: (r["type"], r["strike"]))
     return rows
 
@@ -99,7 +99,6 @@ def contract_snapshot(client: Any, option_ticker: str) -> dict:
         "strike": parsed["strike"],
         "right": parsed["right"],
         "break_even": snap.break_even_price or 0.0,
-        "implied_volatility": f"{(snap.implied_volatility or 0.0) * 100.0:.2f}%",
         "open_interest": snap.open_interest or 0.0,
     }
     if snap.last_quote:
@@ -108,6 +107,8 @@ def contract_snapshot(client: Any, option_ticker: str) -> dict:
         result["mid"] = ((snap.last_quote.bid or 0.0) + (snap.last_quote.ask or 0.0)) / 2.0
     if snap.last_trade:
         result["last"] = getattr(snap.last_trade, "price", 0.0) or 0.0
+    if snap.implied_volatility is not None:
+        result["implied_volatility"] = f"{snap.implied_volatility * 100.0:.2f}%"
     if snap.greeks:
         result["delta"] = snap.greeks.delta or 0.0
         result["gamma"] = snap.greeks.gamma or 0.0

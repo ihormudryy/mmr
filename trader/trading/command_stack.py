@@ -731,6 +731,7 @@ def build_command_stack(
         account_mode=account_mode,
         now=now,
         dispatch_guard=dispatch_guard,
+        paper_max_quote_age_seconds=policy.max_paper_quote_age_seconds,
     )
     cancel_service = CancelCommandService(
         journal=journal,

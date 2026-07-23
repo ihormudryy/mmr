@@ -125,8 +125,22 @@ command_authority:
   enabled: true            # master switch: build/register the authority at all
   live_enabled: false      # allow risk-increasing commands on a LIVE account
   live_account_id: ''      # must equal the trader's IB account when live_enabled
-  max_order_notional:      # hard per-order notional ceiling (required when live_enabled)
+  # Hard per-order notional ceiling, enforced in BOTH paper and live (required
+  # when live_enabled). Without it a fresh LLM/auto entry has no hard per-trade
+  # size cap — the risk gate's concentration limit only bounds ADDING to an
+  # existing position, not opening one. 25000 matches the position_sizing.yaml
+  # per-position ceiling ($25k). Raise per-deployment in ~/.config/mmr if your
+  # book legitimately needs larger single orders.
+  max_order_notional: 25000
   max_drift_bps: 50        # server-side price-drift ceiling (bps)
+  # Opt-in PAPER quote-staleness bound (seconds). Live mode always enforces a
+  # hard 5s age; paper otherwise checks only price-drift, so a market-closed /
+  # degraded-feed snapshot serving a cached last-value could pass. 1800 (30 min)
+  # is deliberately generous: paper commonly runs on ~15-min delayed data whose
+  # timestamp is legitimately old, so a tight bound would reject every delayed
+  # quote. This rejects hours-old cached values, not normal delayed data. Blank
+  # = off (legacy behaviour). Only relevant with automation / LLM auto-approve.
+  max_paper_quote_age_seconds: 1800
 
 # Deterministic automation configuration (P3).
 # When enabled, only a single signed artifact bundle runs under strict control.

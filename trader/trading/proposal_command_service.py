@@ -138,6 +138,26 @@ class ProposalCommandService:
         if not instrument_check.approved:
             raise ProposalCreationRefused("TRADING_FILTER_REJECTED", instrument_check.reason)
 
+        # Long-only bridge semantics (signal→propose spec): a strategy-sourced
+        # SELL only ever *closes* a held long — "ignored when flat". Enforce it
+        # here so a flat SELL is dropped at creation rather than becoming an
+        # exposure-increasing short proposal downstream. Only refuse when the
+        # position authority is present AND affirmatively reports flat: a
+        # missing authority must not block a legitimate exit (failing the other
+        # way would prevent risk reduction), and non-strategy (human/LLM)
+        # sources may intentionally open shorts.
+        if (
+            request.action == "SELL"
+            and source.startswith("strategy:")
+            and self._positions is not None
+            and self._positions.reducible_quantity(self._account_id, request.conid) <= 0
+        ):
+            raise ProposalCreationRefused(
+                "NO_LONG_TO_CLOSE",
+                f"strategy SELL for conId {request.conid} while flat is ignored "
+                f"(long-only bridge semantics)",
+            )
+
         if self._controls is not None and not self._is_reducing_close(request):
             try:
                 self._controls.require_unpaused(self._account_id)

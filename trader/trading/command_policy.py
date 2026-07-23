@@ -30,7 +30,8 @@ _TRUE_STRINGS = ("1", "true", "yes", "on")
 _FALSE_STRINGS = ("0", "false", "no", "off")
 
 _KNOWN_KEYS = frozenset(
-    {"enabled", "live_enabled", "live_account_id", "max_order_notional", "max_drift_bps"})
+    {"enabled", "live_enabled", "live_account_id", "max_order_notional",
+     "max_drift_bps", "max_paper_quote_age_seconds"})
 
 DEFAULT_MAX_DRIFT_BPS = 50.0
 
@@ -79,6 +80,12 @@ class CommandAuthorityPolicy:
     - ``max_order_notional``: hard ceiling on a single order's notional.
     - ``max_drift_bps``: server-side price-drift ceiling (caller values clamp to
       it; ignored entirely in live mode per the design).
+    - ``max_paper_quote_age_seconds``: opt-in PAPER quote-staleness bound. Live
+      mode always enforces a hard 5s age; paper historically enforced only the
+      drift band. When set, an approval whose executable quote is older than
+      this is refused ``QUOTE_STALE``. Deliberately generous (paper often runs
+      on ~15-min delayed data whose timestamp is legitimately old) — it targets
+      hours-old cached last-values, not normal delayed quotes. ``None`` = off.
     """
 
     enabled: bool = False
@@ -86,6 +93,7 @@ class CommandAuthorityPolicy:
     live_account_id: Optional[str] = None
     max_order_notional: Optional[float] = None
     max_drift_bps: float = DEFAULT_MAX_DRIFT_BPS
+    max_paper_quote_age_seconds: Optional[float] = None
 
     @staticmethod
     def from_config(raw: Optional[dict]) -> "CommandAuthorityPolicy":
@@ -107,6 +115,8 @@ class CommandAuthorityPolicy:
                 raw.get("max_order_notional"), "max_order_notional"),
             max_drift_bps=_as_optional_float(
                 raw.get("max_drift_bps", DEFAULT_MAX_DRIFT_BPS), "max_drift_bps"),
+            max_paper_quote_age_seconds=_as_optional_float(
+                raw.get("max_paper_quote_age_seconds"), "max_paper_quote_age_seconds"),
         )
 
 
@@ -131,6 +141,13 @@ def validate_command_policy(
         raise CommandPolicyError(
             f"command_authority.max_order_notional must be finite and > 0, "
             f"got {policy.max_order_notional!r}")
+
+    if policy.max_paper_quote_age_seconds is not None and (
+            not math.isfinite(policy.max_paper_quote_age_seconds)
+            or policy.max_paper_quote_age_seconds <= 0):
+        raise CommandPolicyError(
+            f"command_authority.max_paper_quote_age_seconds must be finite and > 0, "
+            f"got {policy.max_paper_quote_age_seconds!r}")
 
     if policy.live_enabled:
         if paper_trading:

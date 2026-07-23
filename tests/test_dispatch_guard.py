@@ -172,6 +172,17 @@ def test_live_missing_what_if_and_notional_limit_block_dispatch():
     assert notional.value.code == "ORDER_NOTIONAL_LIMIT"
 
 
+def test_paper_notional_limit_blocks_dispatch():
+    """#1: the per-order notional ceiling is enforced in PAPER too, not only
+    live — the hard per-trade size backstop an autonomous paper loop relies on
+    (the risk gate's concentration cap does not bound a fresh entry)."""
+    with pytest.raises(DispatchGuardError) as notional:
+        _guard(mode="paper", max_notional=500).revalidate(
+            _approved(mode="paper", quantity=5), _request(), NOW
+        )
+    assert notional.value.code == "ORDER_NOTIONAL_LIMIT"
+
+
 @pytest.mark.parametrize("margin", [{}, {"initMarginAfter": float("nan")},
                                      {"initMarginAfter": 1, "equityWithLoanAfter": float("inf")}])
 def test_live_invalid_what_if_blocks_dispatch(margin):

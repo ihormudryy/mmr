@@ -52,6 +52,24 @@ class FakeUniverse:
         )
 
 
+class FakePositions:
+    """Stand-in PositionAuthority. ``held`` is the broker-reported reducible
+    (long) quantity for the account/conid; 0 means flat."""
+
+    def __init__(self, held=0.0):
+        self.held = held
+
+    def reducible_quantity(self, account_id, conid):
+        return self.held
+
+
+def _bid_quote():
+    return ExecutableQuote(
+        conid=265598, side="bid", price=209.0, market_timestamp=NOW,
+        feed_type="live", session_state="continuous",
+    )
+
+
 @pytest.fixture
 def authority(tmp_path):
     db = DuckDBConnection.get_instance(str(tmp_path / "journal.duckdb"))
@@ -62,6 +80,7 @@ def authority(tmp_path):
     repository = ProposalRepository(journal)
     quotes = FakeQuotes()
     risk_gate = FakeRiskGate()
+    positions = FakePositions(held=0.0)
     service = ProposalCommandService(
         repository=repository,
         journal=journal,
@@ -72,10 +91,11 @@ def authority(tmp_path):
         account_mode="paper",
         now=lambda: NOW,
         ttl=dt.timedelta(minutes=5),
+        positions=positions,
     )
     return SimpleNamespace(
         db=db, journal=journal, repository=repository, quotes=quotes,
-        risk_gate=risk_gate, service=service,
+        risk_gate=risk_gate, positions=positions, service=service,
     )
 
 
@@ -128,6 +148,50 @@ def test_strategy_duplicate_pending_is_refused(authority):
 
     with pytest.raises(ProposalCreationRefused, match="DUPLICATE_PENDING"):
         authority.service.create_proposal(_request(), source="strategy:orb", correlation_id="c2")
+
+
+def test_strategy_sell_while_flat_is_refused(authority):
+    """Long-only bridge semantics: a strategy SELL with no held long is
+    'ignored when flat' — refused before it can become a short proposal."""
+    authority.positions.held = 0.0
+
+    with pytest.raises(ProposalCreationRefused, match="NO_LONG_TO_CLOSE"):
+        authority.service.create_proposal(
+            _request(action="SELL", amount=5_000.0),
+            source="strategy:orb", correlation_id="sell-flat",
+        )
+
+    assert authority.repository.list(status="PENDING", limit=10) == []
+    assert authority.journal.read_after(0, 10) == []
+
+
+def test_strategy_sell_with_held_long_proceeds(authority):
+    """A strategy SELL that actually reduces a held long is a legitimate
+    close and must be proposed."""
+    authority.positions.held = 100.0
+    authority.quotes.quote = _bid_quote()
+
+    record = authority.service.create_proposal(
+        _request(action="SELL", amount=5_000.0),
+        source="strategy:orb", correlation_id="sell-held",
+    )
+
+    assert record.status == "PENDING" and record.action == "SELL"
+    assert record.reference_quote_side == "bid"
+
+
+def test_manual_sell_while_flat_is_allowed(authority):
+    """The long-only 'ignore when flat' rule is a strategy-bridge semantic;
+    a human/LLM SELL (source != strategy:) may intentionally open a short."""
+    authority.positions.held = 0.0
+    authority.quotes.quote = _bid_quote()
+
+    record = authority.service.create_proposal(
+        _request(action="SELL", amount=5_000.0),
+        source="dashboard", correlation_id="sell-manual",
+    )
+
+    assert record.status == "PENDING" and record.action == "SELL"
 
 
 def test_reject_is_idempotent_and_journals_once(authority):

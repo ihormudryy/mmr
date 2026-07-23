@@ -257,13 +257,20 @@ def check_exposure_increasing_guards(
     now: dt.datetime,
     account_mode: str,
     outside_session_limit_enabled: bool = False,
+    paper_max_quote_age_seconds: Optional[float] = None,
 ) -> Optional[CommandProblem]:
     """Pure pre-dispatch guards for an exposure-INCREASING approval.
 
     Returns the first violated guard as a ``CommandProblem``, or ``None`` when
     the row may be dispatched. Live mode additionally demands a fresh,
-    live-feed, session-compatible executable-side quote; paper mode only
-    enforces the recorded price-drift band.
+    live-feed, session-compatible executable-side quote (hard 5s age). Paper
+    mode enforces the recorded price-drift band and, when
+    ``paper_max_quote_age_seconds`` is set, an age gate too: the guard is opt-in
+    and deliberately generous because paper commonly runs on ~15-min delayed
+    data whose ``market_timestamp`` is legitimately old — the bound is there to
+    reject hours-old cached last-values (market closed / degraded feed), not
+    normal delayed quotes. Left ``None`` it preserves the legacy paper
+    behaviour (drift band only).
     """
     expected_side = "ask" if record.action == "BUY" else "bid"
     if quote is None or quote.side != expected_side or not quote.price or quote.price <= 0:
@@ -277,6 +284,12 @@ def check_exposure_increasing_guards(
                 return CommandProblem("SESSION_INCOMPATIBLE", retryable=True)
         age = (now - quote.market_timestamp).total_seconds()
         if age > 5.0:
+            return CommandProblem("QUOTE_STALE", retryable=True)
+        if age < -MAX_SOURCE_CLOCK_SKEW_SECONDS:
+            return CommandProblem("SOURCE_CLOCK_SKEW", retryable=True)
+    elif paper_max_quote_age_seconds is not None:
+        age = (now - quote.market_timestamp).total_seconds()
+        if age > paper_max_quote_age_seconds:
             return CommandProblem("QUOTE_STALE", retryable=True)
         if age < -MAX_SOURCE_CLOCK_SKEW_SECONDS:
             return CommandProblem("SOURCE_CLOCK_SKEW", retryable=True)
@@ -1301,6 +1314,7 @@ class ApprovalCommandService:
         now: Callable[[], dt.datetime] = _utcnow,
         outside_session_limit_enabled: bool = False,
         dispatch_guard: Any = None,
+        paper_max_quote_age_seconds: Optional[float] = None,
     ):
         self._journal = journal
         self._ledger = ledger
@@ -1317,6 +1331,7 @@ class ApprovalCommandService:
         self._now = now
         self._outside_session_limit_enabled = outside_session_limit_enabled
         self._dispatch_guard = dispatch_guard
+        self._paper_max_quote_age_seconds = paper_max_quote_age_seconds
 
     # -- public saga entry point (the registered action handler) ----------
 
@@ -1595,6 +1610,7 @@ class ApprovalCommandService:
         quote = self._quotes.executable_quote(record.conid, side=side)
         problem = check_exposure_increasing_guards(
             record, quote, self._now_utc(), self._account_mode, self._outside_session_limit_enabled,
+            paper_max_quote_age_seconds=self._paper_max_quote_age_seconds,
         )
         if problem is not None:
             return problem, direction, {

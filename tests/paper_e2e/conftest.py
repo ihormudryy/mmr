@@ -22,10 +22,12 @@ class PaperStack:
     e2e_id: str
     allocation_armed: bool = False
     paper_automation_armed: bool = False
+    opened_conids: set[int] = field(default_factory=set)
     opened_positions: dict[int, float] = field(default_factory=dict)
 
     def register_opened_position(self, conid: int, quantity: float) -> None:
         """Record an E2E-opened position for run-scoped closeout."""
+        self.opened_conids.add(conid)
         self.opened_positions[conid] = quantity
 
 
@@ -115,64 +117,96 @@ def _teardown(stack: PaperStack) -> None:
     typed = stack.typed
     try:
         if "proposals" in stack.capabilities:
-            proposals = typed.query.call("list_proposals", {"status": "PENDING", "limit": 200}, dict)
+            proposals = typed.query.call(
+                "list_proposals", {"status": "PENDING", "limit": 200}, dict
+            )
             for proposal in proposals.get("proposals", []):
                 if _record_belongs_to_run(proposal, stack.e2e_id):
-                    typed.command.call(
-                        "reject_proposal",
-                        {
-                            "command_id": f"{stack.e2e_id}_reject_{proposal['id']}",
-                            "proposal_id": proposal["id"],
-                            "reason": "paper e2e teardown",
-                        },
-                        dict,
-                    )
-        universes = typed.query.call("list_universes", {}, dict)
-        for universe in universes.get("universes", []):
-            name = universe.get("name", "")
-            if name == stack.e2e_id or name.startswith(f"{stack.e2e_id}_"):
+                    try:
+                        typed.command.call(
+                            "reject_proposal",
+                            {
+                                "command_id": f"{stack.e2e_id}_reject_{proposal['id']}",
+                                "proposal_id": proposal["id"],
+                                "reason": "paper e2e teardown",
+                            },
+                            dict,
+                        )
+                    except Exception:
+                        pass
+        try:
+            universes = typed.query.call("list_universes", {}, dict)
+            for universe in universes.get("universes", []):
+                name = universe.get("name", "")
+                if name == stack.e2e_id or name.startswith(f"{stack.e2e_id}_"):
+                    try:
+                        typed.command.call(
+                            "delete_universe",
+                            {"name": name},
+                            dict,
+                        )
+                    except Exception:
+                        pass
+        except Exception:
+            pass
+
+        # Disarm before reducing E2E exposure so no automation or allocation
+        # authority remains active while the close proposals are approved.
+        if stack.paper_automation_armed:
+            try:
                 typed.command.call(
-                    "delete_universe",
-                    {"name": name},
-                    dict,
-                )
-        if stack.live_orders and "approval" in stack.capabilities:
-            for conid, quantity in stack.opened_positions.items():
-                close_id = f"{stack.e2e_id}_close_{conid}"
-                receipt = typed.command.call(
-                    "create_proposal",
+                    "deactivate_paper_automation",
                     {
-                        "command_id": close_id,
-                        "conid": conid,
-                        "action": "SELL" if quantity > 0 else "BUY",
-                        "quantity": abs(quantity),
-                        "reasoning": f"{stack.e2e_id} paper e2e position closeout",
-                        "source": stack.e2e_id,
+                        "command_id": f"{stack.e2e_id}_deactivate_automation",
+                        "reason": f"{stack.e2e_id} paper e2e teardown",
                     },
                     dict,
                 )
-                proposal = (receipt.get("outcome") or {}).get("id")
-                if proposal is not None:
-                    typed.command.call(
-                        "approve_proposal",
+            except Exception:
+                pass
+        if stack.allocation_armed:
+            try:
+                typed.command.call(
+                    "suspend_allocation",
+                    {
+                        "command_id": f"{stack.e2e_id}_suspend_allocation",
+                        "reason": f"{stack.e2e_id} paper e2e teardown",
+                    },
+                    dict,
+                )
+            except Exception:
+                pass
+
+        if stack.live_orders:
+            for conid in stack.opened_conids:
+                quantity = stack.opened_positions.get(conid)
+                if quantity is None:
+                    continue
+                close_id = f"{stack.e2e_id}_close_{conid}"
+                try:
+                    receipt = typed.command.call(
+                        "create_proposal",
                         {
-                            "command_id": f"{close_id}_approve",
-                            "proposal_id": proposal,
+                            "command_id": close_id,
+                            "conid": conid,
+                            "action": "SELL" if quantity > 0 else "BUY",
+                            "quantity": abs(quantity),
+                            "reasoning": f"{stack.e2e_id} paper e2e position closeout",
                         },
                         dict,
                     )
-        if stack.paper_automation_armed:
-            typed.command.call(
-                "deactivate_paper_automation",
-                {"command_id": f"{stack.e2e_id}_deactivate_automation"},
-                dict,
-            )
-        if stack.allocation_armed:
-            typed.command.call(
-                "suspend_allocation",
-                {"command_id": f"{stack.e2e_id}_suspend_allocation"},
-                dict,
-            )
+                    proposal = (receipt.get("outcome") or {}).get("id")
+                    if proposal is not None:
+                        typed.command.call(
+                            "approve_proposal",
+                            {
+                                "command_id": f"{close_id}_approve",
+                                "proposal_id": proposal,
+                            },
+                            dict,
+                        )
+                except Exception:
+                    pass
     except Exception:
         # Teardown is best effort: preserve the original test result while
         # never broadening cleanup beyond this run's exact prefix.

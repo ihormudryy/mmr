@@ -19,7 +19,10 @@
 - Strategy path param: `{strategy_name}`.
 - HMAC: `MMR_SERVICE_HMAC_KEY_FILE` / `~/.config/mmr/service_hmac.key` — not `MMR_HMAC_SECRET`.
 - Temp names / teardown: this-run `e2e_{pid}_{ts}` prefix only.
-- Timeouts: module default 120s; IB/research 180s; live-orders/restart 300s (override global 30s).
+- Timeouts: default 120s stamped via `pytest_collection_modifyitems` for items under `tests/paper_e2e/`; IB/research 180s; live-orders/restart 300s (override global 30s). **Do not** put `pytestmark` in `conftest.py` — it is a no-op there.
+- Capability command probes: **always body `{}`**. Never send a body that could pass server-side validation for a risk-increasing command (validation is the last gate before the handler). Registered → `VALIDATION_ERROR`; unwired → `METHOD_NOT_ALLOWED`.
+- Default `pytest tests/` must **not** collect/run paper e2e: `addopts = ["-m", "not paper_e2e"]` in `pyproject.toml`. Wrapper / explicit `-m paper_e2e` overrides. Optionally also require `MMR_PAPER_E2E=1` in the skip gate (wrapper exports it).
+- Typed access only through the public wrapper (`.query.call` / `.command.call`) — never `MMR._typed_query()` / `._typed_command()`.
 - Do not require CI to run these tests.
 
 ## File map
@@ -27,10 +30,10 @@
 | File | Responsibility |
 |------|----------------|
 | `tests/paper_e2e/__init__.py` | Package marker (empty or docstring) |
-| `tests/paper_e2e/conftest.py` | Autouse `paper_stack`, clients, `e2e_id`, teardown, timeouts/markers |
+| `tests/paper_e2e/conftest.py` | Autouse `paper_stack`, clients, `e2e_id`, teardown, `pytest_collection_modifyitems` |
 | `tests/paper_e2e/_probe.py` | Pure helpers: capability probe, form CSRF derive, error-code classification |
-| `tests/paper_e2e/_clients.py` | Dashboard httpx session + CSRF headers; typed SDK factory |
-| `tests/paper_e2e/test_probe_unit.py` | Unit tests for probe/CSRF (no Docker) |
+| `tests/paper_e2e/_clients.py` | Dashboard httpx session + CSRF headers; typed RPC wrapper (`.query` / `.command`) |
+| `tests/test_paper_e2e_probe.py` | Unit tests for probe/CSRF (**outside** `tests/paper_e2e/` so autouse never gates them) |
 | `tests/paper_e2e/test_smoke.py` | Layer A |
 | `tests/paper_e2e/test_dashboard_portfolios.py` | Portfolios |
 | `tests/paper_e2e/test_dashboard_strategies.py` | Strategies |
@@ -51,16 +54,16 @@
 **Files:**
 - Create: `tests/paper_e2e/__init__.py`
 - Create: `tests/paper_e2e/_probe.py`
-- Create: `tests/paper_e2e/test_probe_unit.py`
-- Modify: `pyproject.toml` (`[tool.pytest.ini_options]` markers)
+- Create: `tests/test_paper_e2e_probe.py` (outside the e2e package)
+- Modify: `pyproject.toml` (`[tool.pytest.ini_options]` markers + `addopts`)
 
 **Interfaces:**
 - Produces:
   - `capability_from_remote_error(code: str) -> Literal["absent", "present"]` — `"absent"` iff `code == "METHOD_NOT_ALLOWED"`; else `"present"`
   - `derive_html_form_csrf(session_secret: str) -> str` — `HMAC-SHA256(secret, b"mmr-dashboard-html-form-csrf-v1").hexdigest()` when `len(secret) >= 32`; raises `ValueError` if shorter
-  - `probe_command_registered(client, method: str, body: dict) -> bool` — calls `client.call(method, body, dict)`; returns `False` on `TypedRpcRemoteError` with `METHOD_NOT_ALLOWED`; returns `True` on success or any other remote error code; re-raises connection/auth errors
+  - `probe_command_registered(client, method: str) -> bool` — **always** calls `client.call(method, {}, dict)`. Returns `False` on `TypedRpcRemoteError` with `METHOD_NOT_ALLOWED`; returns `True` on success or any other remote error code (including `VALIDATION_ERROR`); re-raises connection/auth errors. **Invariant:** never pass a non-empty body — a validation-passing body must not be constructible by the probe for risk-arming commands.
 
-- [ ] **Step 1: Write failing unit tests** in `tests/paper_e2e/test_probe_unit.py`:
+- [ ] **Step 1: Write failing unit tests** in `tests/test_paper_e2e_probe.py`:
 
 ```python
 import pytest
@@ -89,14 +92,17 @@ def test_form_csrf_rejects_short_secret():
         derive_html_form_csrf("short")
 ```
 
-- [ ] **Step 2: Run** `.venv/bin/python -m pytest tests/paper_e2e/test_probe_unit.py -q --timeout=30`  
+- [ ] **Step 2: Run** `.venv/bin/python -m pytest tests/test_paper_e2e_probe.py -q --timeout=30`  
   Expected: FAIL (module missing).
 
-- [ ] **Step 3: Implement `tests/paper_e2e/_probe.py`** with the three helpers above. `probe_command_registered` imports `TypedRpcRemoteError` from `trader.messaging.typed_rpc`.
+- [ ] **Step 3: Implement `tests/paper_e2e/_probe.py`** with the three helpers above. `probe_command_registered` imports `TypedRpcRemoteError` from `trader.messaging.typed_rpc` and hardcodes body `{}`.
 
-- [ ] **Step 4: Add markers** to `pyproject.toml` under `[tool.pytest.ini_options]`:
+- [ ] **Step 4: Update `pyproject.toml`** under `[tool.pytest.ini_options]`:
 
 ```toml
+# Keep ordinary `pytest tests/` runs off the live paper suite. Explicit
+# `-m paper_e2e` (scripts/paper_e2e.sh) overrides this deselect.
+addopts = ["-m", "not paper_e2e"]
 markers = [
     "paper_e2e: live paper Docker stack (skip if down)",
     "paper_e2e_live_orders: places/arms real paper risk; needs MMR_PAPER_E2E_LIVE_ORDERS=1",
@@ -104,7 +110,7 @@ markers = [
 ]
 ```
 
-- [ ] **Step 5: Re-run unit tests — expect PASS.**
+- [ ] **Step 5: Re-run unit tests — expect PASS** (and confirm they are not under `tests/paper_e2e/`).
 
 - [ ] **Step 6: Commit** `test(paper_e2e): capability probe helpers and pytest markers`
 
@@ -122,64 +128,75 @@ markers = [
 - Consumes: Task 1 helpers
 - Produces fixtures:
   - `e2e_id: str` — `f"e2e_{os.getpid()}_{int(time.time())}"`
-  - `paper_stack` (autouse) — dataclass/namespace with `.dashboard_url`, `.capabilities: frozenset[str]`, `.sdk`, `.live_orders: bool`, `.restart: bool`
+  - `paper_stack` (autouse) — dataclass/namespace with `.dashboard_url`, `.capabilities: frozenset[str]`, `.typed` (wrapper), `.live_orders: bool`, `.restart: bool`
   - `dashboard_client` — httpx.Client with cookies; methods `login()`, `csrf_headers() -> dict`, `get/post`
-  - `typed_sdk` — connected `MMR` instance (or thin wrapper exposing `.query.call` / `.command.call`)
+  - `typed_rpc` — thin wrapper around `MMR` typed clients with **public** `.query.call(method, body, model)` and `.command.call(method, body, model)` only (no private SDK leakage)
   - `require_capability(name: str)` helper used by tests → `pytest.skip` if missing
   - Finalizer teardown scoped to `e2e_id` (reject pending proposals / delete universes matching prefix; live-orders close positions + disarm)
 
 Capability set keys: `trading_control`, `proposals`, `approval`, `strategy_control`, `allocation`, `paper_automation`.
 
-Probe bodies (harmless):
+**Command probe invariant (safety):** every command capability probe uses body `{}` exclusively via `probe_command_registered(client, method)`.
 
 | Method | Body |
 |--------|------|
-| `approve_proposal` | `{"proposal_id": -1}` |
-| `enable_strategy` | `{"strategy_name": "__e2e_probe__"}` |
-| `activate_allocation` | `{"nonce": "e2e-probe"}` (or minimal required fields — adjust to pass validation shape enough to avoid client-side encode errors; prefer empty/`{}` if model allows, else dummy strings) |
-| `suspend_allocation` | `{}` or minimal |
-| `activate_paper_automation` | minimal dummy |
-| `create_proposal` | omit or invalid conId so handler returns VALIDATION / NOT_FOUND without placing |
+| `approve_proposal` | `{}` |
+| `reject_proposal` | `{}` |
+| `create_proposal` | `{}` |
+| `enable_strategy` | `{}` |
+| `activate_allocation` | `{}` |
+| `suspend_allocation` | `{}` |
+| `activate_paper_automation` | `{}` |
+| `deactivate_paper_automation` | `{}` |
+| `pause_trading` | `{}` |
 
-Module pytestmark in conftest:
+Queries (`list_proposals`, `get_trading_control`, `get_paper_automation_status`, …) may use `{}` successfully when registered.
+
+**Marking / timeouts:** do **not** set `pytestmark` in `conftest.py` (ignored by pytest). Implement:
 
 ```python
-pytestmark = [
-    pytest.mark.paper_e2e,
-    pytest.mark.timeout(120),
-]
+# tests/paper_e2e/conftest.py
+def pytest_collection_modifyitems(config, items):
+    for item in items:
+        path = str(getattr(item, "fspath", "") or item.path)
+        if "/tests/paper_e2e/" not in path.replace("\\", "/"):
+            continue
+        item.add_marker(pytest.mark.paper_e2e)
+        if not any(m.name == "timeout" for m in item.iter_markers()):
+            item.add_marker(pytest.mark.timeout(120))
 ```
+
+Individual tests that need 180/300 still add `@pytest.mark.timeout(...)` explicitly (overrides the default stamp).
+
+**Opt-in:** at the top of `paper_stack`, if `os.environ.get("MMR_PAPER_E2E") != "1"`, `pytest.skip("set MMR_PAPER_E2E=1 or use scripts/paper_e2e.sh")` — defense in depth if someone overrides `addopts`. Wrapper always exports `MMR_PAPER_E2E=1`.
 
 Skip gate order (exact):
 
-1. `GET {url}/healthz` — assert `r.json()["ok"] is True` or skip
-2. Build typed clients; `get_status` or skip on connection/HMAC errors
-3. Paper mode + `ib_upstream_connected` or skip
-4. Fill `capabilities` via probes
+1. Require `MMR_PAPER_E2E=1` or skip
+2. `GET {url}/healthz` — assert `r.json()["ok"] is True` or skip
+3. Build typed wrapper; `get_status` or skip on connection/HMAC errors
+4. Paper mode + `ib_upstream_connected` or skip
+5. Fill `capabilities` via `{}` probes
 
 `dashboard_client.login()`: `POST /session` with form `token=<DASHBOARD_TOKEN or file contents>`.
 
 `csrf_headers()`: `GET /api/commands/csrf-token` → `{"X-CSRF-Token": ...}`.
 
-- [ ] **Step 1: Implement `_clients.py` + `conftest.py`** per interfaces (no placeholder stubs — full skip paths).
+- [ ] **Step 1: Implement `_clients.py` + `conftest.py`** per interfaces (no placeholder stubs — full skip paths + `pytest_collection_modifyitems`).
 
 - [ ] **Step 2: Write `test_stack_gate.py`:**
 
 ```python
-import pytest
-
-pytestmark = [pytest.mark.paper_e2e, pytest.mark.timeout(120)]
-
 def test_autouse_stack_fixture_provides_capabilities(paper_stack):
-    # When stack is up this runs; when down, autouse already skipped the module collection path —
-    # this test simply asserts frozenset type if reached.
     assert isinstance(paper_stack.capabilities, frozenset)
 
 def test_healthz_json_ok_field(dashboard_client, paper_stack):
     r = dashboard_client.get("/healthz")
-    assert r.status_code == 200
+    assert r.status_code == 200, f"healthz failed: {r.status_code} {r.text}"
     assert r.json()["ok"] is True
 ```
+
+(Markers/timeouts come from `pytest_collection_modifyitems` — no module `pytestmark` required, but adding an explicit module `pytestmark` is fine as belt-and-suspenders.)
 
 - [ ] **Step 3: Write `scripts/paper_e2e.sh`:**
 
@@ -188,12 +205,15 @@ def test_healthz_json_ok_field(dashboard_client, paper_stack):
 set -euo pipefail
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 cd "$ROOT"
+export MMR_PAPER_E2E=1
 exec "${PYTHON:-.venv/bin/python}" -m pytest -m paper_e2e -v --timeout=120 "$@"
 ```
 
-- [ ] **Step 4: Run with stack down** (stop dashboard briefly or unset URL to bad port):  
-  `MMR_PAPER_E2E_DASHBOARD_URL=http://127.0.0.1:9 .venv/bin/python -m pytest -m paper_e2e tests/paper_e2e -q`  
+- [ ] **Step 4: Run with stack down:**  
+  `MMR_PAPER_E2E=1 MMR_PAPER_E2E_DASHBOARD_URL=http://127.0.0.1:9 .venv/bin/python -m pytest -m paper_e2e tests/paper_e2e -q`  
   Expected: all skipped, exit 0.
+
+  Also: plain `.venv/bin/python -m pytest tests/test_paper_e2e_probe.py -q` still runs (not deselected by `not paper_e2e`).
 
 - [ ] **Step 5: Commit** `test(paper_e2e): autouse stack gate, clients, and runner script`
 
@@ -205,24 +225,21 @@ exec "${PYTHON:-.venv/bin/python}" -m pytest -m paper_e2e -v --timeout=120 "$@"
 - Create: `tests/paper_e2e/test_smoke.py`
 
 **Interfaces:**
-- Consumes: `paper_stack`, `dashboard_client`, `typed_sdk`, `e2e_id`
+- Consumes: `paper_stack`, `dashboard_client`, `typed_rpc`, `e2e_id`
 
 - [ ] **Step 1: Write tests** (ordered via naming `test_01_...` or a single `test_smoke_ladder` with steps):
 
 ```python
 import pytest
 
-pytestmark = [pytest.mark.paper_e2e, pytest.mark.timeout(180)]
-
-def test_smoke_ladder(dashboard_client, typed_sdk, paper_stack, e2e_id, require_capability):
+@pytest.mark.timeout(180)
+def test_smoke_ladder(dashboard_client, typed_rpc, paper_stack, e2e_id, require_capability):
     require_capability("proposals")
     assert dashboard_client.get("/readyz").status_code == 200
     dashboard_client.login()
-    # cc-health or /api/health — accept 200
     h = dashboard_client.get("/api/cc-health")
-    assert h.status_code in (200, 401)  # if 401, login failed — fail
-    assert h.status_code == 200
-    status = typed_sdk._typed_query().call("get_status", {}, dict)
+    assert h.status_code == 200, f"login/cc-health failed: {h.status_code} {h.text}"
+    status = typed_rpc.query.call("get_status", {}, dict)
     assert status  # non-empty
     # resolve AAPL via discover_instrument or resolve_instrument
     # create_proposal via POST /api/commands/proposals + csrf_headers
@@ -331,7 +348,7 @@ Do **not** deploy/undeploy operator YAML in v1 unless an `e2e_*` strategy name i
 
 - [ ] **Step 2: Commands file** — universe CRUD already in Task 4; here: `create_proposal`→`reject_proposal`; `pause_trading`→`resume_trading` in finally (capability `trading_control`); strategy enable/disable if capability (restore).
 
-- [ ] **Step 3: BYPASS-absent** — `typed_sdk._typed_command().call("place_order_simple", {}, dict)` expects `TypedRpcRemoteError.code == "METHOD_NOT_ALLOWED"`.
+- [ ] **Step 3: BYPASS-absent** — `typed_rpc.command.call("place_order_simple", {}, dict)` expects `TypedRpcRemoteError.code == "METHOD_NOT_ALLOWED"`.
 
 - [ ] **Step 4: Dashboard commands** — pause/resume HTTP with CSRF; cancel paths only against e2e-created orders if any.
 
@@ -392,7 +409,10 @@ Stack down → all tests skip (exit 0).
 ## Self-review notes
 
 - No phantom research propose path.
-- No `COMMAND_NOT_FOUND` as unwired signal.
+- No `COMMAND_NOT_FOUND` as unwired signal; probes use body `{}` only (never validation-passing risk-arm bodies).
 - Form CSRF isolated from JSON CSRF.
-- Concrete probe table and timeout numbers copied from spec.
-- Task 3–8 need a live paper stack for green proof; Task 1–2 + stack-down skip are verifiable without IB.
+- Markers/timeouts via `pytest_collection_modifyitems` (not conftest `pytestmark`).
+- Probe unit tests live in `tests/test_paper_e2e_probe.py` (outside autouse package).
+- Default `addopts = -m "not paper_e2e"`; wrapper sets `MMR_PAPER_E2E=1` + `-m paper_e2e`.
+- Typed access only through `.query` / `.command` wrapper.
+- Task 3–8 need a live paper stack for green proof; Task 1 + stack-down skip + probe units are verifiable without IB.

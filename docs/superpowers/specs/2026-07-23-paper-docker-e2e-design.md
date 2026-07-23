@@ -65,21 +65,21 @@ Probes in order; any hard failure → `pytest.skip(reason)`:
 
    Do **not** key the probe off `COMMAND_NOT_FOUND`: that is a handler-level code from the already-registered `get_command` path when a receipt id is missing (same family as `PROPOSAL_NOT_FOUND`). Catching it would miss the unwired case and leave tests red — the opposite of this gate.
 
-   Side-effect-free command probe: call with deliberately invalid / non-existent ids or empty body and branch on the error code:
+   Side-effect-free command probe: **always call with body `{}`**. Never send fields that could pass server-side validation for a risk-increasing command (validation is the last gate before the handler runs). Branch on the error code:
 
    - `METHOD_NOT_ALLOWED` → method unregistered → capability **absent** → skip
-   - `VALIDATION_ERROR` / `PROPOSAL_NOT_FOUND` / `COMMAND_NOT_FOUND` (or a successful query) → method **is** registered (capability present); the handler only rejected harmless args and did not execute the real action
+   - `VALIDATION_ERROR` / `PROPOSAL_NOT_FOUND` / `COMMAND_NOT_FOUND` (or a successful **query**) → method **is** registered (capability present); for commands, `{}` must fail validation before the handler — never execute the real action
 
 Capability keys (exact typed method ids):
 
 | Capability | Probe / evidence |
 |------------|------------------|
 | `trading_control` | `get_trading_control` succeeds |
-| `proposals` | `list_proposals` succeeds; mutations: probe `create_proposal` / `reject_proposal` with harmless args — anything other than `METHOD_NOT_ALLOWED` means registered |
-| `approval` | `approve_proposal` registered (live-orders only); probe with non-existent id — `PROPOSAL_NOT_FOUND`/`VALIDATION_ERROR` = present; `METHOD_NOT_ALLOWED` = absent |
-| `strategy_control` | probe `enable_strategy` with harmless args — not `METHOD_NOT_ALLOWED` = registered |
-| `allocation` | probe `activate_allocation` / `suspend_allocation` same way |
-| `paper_automation` | `get_paper_automation_status` succeeds; activate/deactivate probed under live-orders only |
+| `proposals` | `list_proposals` succeeds; mutations: `probe_command_registered(..., "create_proposal")` etc. with body `{}` |
+| `approval` | `approve_proposal` with `{}` — `VALIDATION_ERROR` = present; `METHOD_NOT_ALLOWED` = absent (live-orders only) |
+| `strategy_control` | `enable_strategy` with `{}` — not `METHOD_NOT_ALLOWED` = registered |
+| `allocation` | `activate_allocation` / `suspend_allocation` with `{}` |
+| `paper_automation` | `get_paper_automation_status` succeeds; activate/deactivate probed with `{}` under live-orders only |
 
 Missing HMAC key, connection refused, or upstream down → **skip**, never red on a laptop without Docker.
 
@@ -278,7 +278,8 @@ Tests that omit auth must expect 401/403.
 | Temp data naming | this-run `e2e_{pid}_{ts}` prefix only |
 | Portfolios CSRF | typed RPC mutations; form CSRF only for optional legacy probe |
 | Skip delivery | autouse `paper_stack` |
-| Unwired commands | capability probe → skip |
+| Unwired commands | capability probe on `METHOD_NOT_ALLOWED` via body `{}` only |
+| Autouse + markers | `paper_stack` autouse; stamps via `pytest_collection_modifyitems`; default `addopts -m "not paper_e2e"` |
 | Global 30s timeout | per-mark overrides 120 / 180 / 300 |
 | Live-orders cleanup | close positions; cannot reject EXECUTED |
 | HMAC docs drift | runbook + fix `PAPER_AUTOMATION_SETUP` / `CLAUDE.md` key-file |

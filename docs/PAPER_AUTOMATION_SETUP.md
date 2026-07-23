@@ -44,7 +44,8 @@ Paper LLM evaluate-approve (`approve_proposal` with `source=sdk`) is **not** the
 ### Host / Docker
 
 - Working Docker split stack (`./docker.sh -g` or `-b -u`)
-- `MMR_HMAC_SECRET` in `.env` (typed RPC)
+- `~/.config/mmr/service_hmac.key` (mode `0600`), exposed to services through
+  `MMR_SERVICE_HMAC_KEY_FILE` (typed RPC)
 - Writable: `~/.config/mmr/`, `~/.local/share/mmr/` (artifacts + logs)
 
 ### Optional API keys
@@ -74,7 +75,8 @@ Confirm in `.env` / compose:
 
 - `TRADING_MODE=paper`
 - `IB_ACCOUNT=<your DU… paper account>`
-- `MMR_HMAC_SECRET` set
+- `~/.config/mmr/service_hmac.key` exists with mode `0600` and is mounted as
+  `MMR_SERVICE_HMAC_KEY_FILE`
 - Later: `DASHBOARD_COMMANDS_ENABLED=true` if you’ll Activate from the UI
 
 Gateway up, VNC if needed (`vnc://localhost:5901`), `mmr status` shows IB
@@ -202,6 +204,24 @@ python3 scripts/automation_paper_drill.py
 | `pause_trading` | Risk-reducing pause |
 | `DASHBOARD_COMMANDS_ENABLED=false` | Hides UI commands only |
 | `command_authority.enabled: false` + restart trader | No new approve/auto dispatch |
+
+---
+
+## Paper Docker e2e
+
+With the paper stack up (`./docker.sh -b -u`, IB upstream connected):
+
+```bash
+./scripts/paper_e2e.sh
+# optional:
+MMR_PAPER_E2E_LIVE_ORDERS=1 ./scripts/paper_e2e.sh
+MMR_PAPER_E2E_RESTART=1 ./scripts/paper_e2e.sh -k restart
+```
+
+Uses `~/.config/mmr/service_hmac.key` (mode `0600`) and dashboard
+`DASHBOARD_TOKEN`.
+
+Stack down → all tests skip (exit 0).
 
 ---
 

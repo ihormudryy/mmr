@@ -526,7 +526,7 @@ User configs live in `~/.config/mmr/`. On first run, bundled defaults from `conf
 
 **`~/.config/mmr/logging.yaml`**: Python logging config (Rich console handler + rotating file handlers).
 
-**`.env`** (gitignored): IB Gateway credentials (`TWS_USERID`, `TWS_PASSWORD`, `TRADING_MODE`, `IB_ACCOUNT`) plus `MMR_HMAC_SECRET` for typed RPC service auth in split Docker.
+**`.env`** (gitignored): IB Gateway credentials (`TWS_USERID`, `TWS_PASSWORD`, `TRADING_MODE`, `IB_ACCOUNT`). Typed RPC service authentication in split Docker uses `~/.config/mmr/service_hmac.key` (mode `0600`), exposed via `MMR_SERVICE_HMAC_KEY_FILE`.
 
 ## Logging
 

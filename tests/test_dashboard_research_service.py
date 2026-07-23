@@ -204,3 +204,38 @@ async def test_submit_failure_releases_admission_slot_and_logs_telemetry(caplog)
     assert service._slots.acquire(blocking=False)
     service._slots.release()
     service.close()
+
+
+@pytest.mark.asyncio
+async def test_trader_backend_does_not_touch_massive_provider():
+    # provider factory would raise if called; trader backend must not call it
+    service = ResearchService(
+        lambda: (_ for _ in ()).throw(AssertionError("provider built")),
+        workers=1, clock=lambda: "2026-07-23T00:00:00Z")
+    body = await service.run(
+        "forex_snapshot", lambda: ResearchResult({"pair": "EUR/USD"}, "IB forex",
+                                                 provider="ib"),
+        backend="trader")
+    assert body["meta"]["provider"] == "ib"
+    assert body["data"] == {"pair": "EUR/USD"}
+    service.close()
+
+
+@pytest.mark.asyncio
+async def test_trader_backend_propagates_trader_link_unavailable():
+    service = ResearchService(lambda: object(), workers=1)
+    with pytest.raises(ResearchError) as caught:
+        await service.run(
+            "forex_snapshot",
+            lambda: (_ for _ in ()).throw(
+                ResearchError(503, "TRADER_LINK_UNAVAILABLE", "down", True)),
+            backend="trader")
+    assert caught.value.code == "TRADER_LINK_UNAVAILABLE"
+    service.close()
+
+
+def test_new_timeout_keys_present():
+    for key in ("options_chain", "options_snapshot", "options_expirations",
+                "options_implied", "forex_snapshot", "forex_quote",
+                "forex_movers", "forex_snapshot_all", "forex_convert"):
+        assert key in DEFAULT_TIMEOUTS

@@ -21,6 +21,15 @@ DEFAULT_TIMEOUTS = {
     "movers": 15.0,
     "news": 15.0,
     "ideas": 30.0,
+    "options_expirations": 10.0,
+    "options_chain": 20.0,
+    "options_snapshot": 10.0,
+    "options_implied": 20.0,
+    "forex_snapshot": 10.0,
+    "forex_quote": 10.0,
+    "forex_movers": 15.0,
+    "forex_snapshot_all": 20.0,
+    "forex_convert": 10.0,
 }
 _SENSITIVE_PARAM_PARTS = (
     "apikey",
@@ -167,6 +176,7 @@ class ResearchService:
         tool: str,
         operation: Callable[[MassiveResearch], ResearchResult],
         *,
+        backend: str = "massive",
         log_params: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
         started = time.monotonic()
@@ -185,7 +195,11 @@ class ResearchService:
 
         try:
             try:
-                future = self._executor.submit(lambda: operation(self._get_provider()))
+                if backend == "trader":
+                    future = self._executor.submit(operation)
+                else:
+                    future = self._executor.submit(
+                        lambda: operation(self._get_provider()))
             except Exception as exc:
                 self._slots.release()
                 outcome = "upstream_error"

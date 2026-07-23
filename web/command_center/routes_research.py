@@ -16,6 +16,13 @@ from web.command_center.research import ResearchError, ResearchService
 UniverseLoader = Callable[[str], list[str]]
 
 
+def _parse_pair(pair: str) -> tuple[str, str]:
+    raw = pair.upper().replace("C:", "").replace("/", "")
+    if len(raw) != 6 or not raw.isalpha():
+        raise ValueError(f"Cannot parse forex pair: {pair}")
+    return raw[:3], raw[3:]
+
+
 def _load_universe_symbols(name: str) -> list[str]:
     from trader.container import Container
     from trader.data.universe import UniverseAccessor
@@ -312,5 +319,120 @@ def create_research_router(
             "options_implied",
             lambda provider: provider.options_implied(symbol, expiration=expiration),
             log_params={"symbol": symbol.upper(), "expiration": expiration}))
+
+    from trader.tools.massive_research import ResearchResult
+
+    def _ib_forex_snapshot_op(pair: str):
+        base, quote = _parse_pair(pair)
+
+        def op():
+            qc = getattr(cc, "_query_client", None)
+            if qc is None:
+                raise ResearchError(503, "TRADER_LINK_UNAVAILABLE",
+                                    "Trader link unavailable for IB forex.", True)
+            try:
+                disc = qc.call("discover_instrument",
+                               {"symbol": base, "exchange": "IDEALPRO",
+                                "currency": quote, "sec_type": "CASH"}, dict)
+                instruments = disc.get("instruments") or []
+                if not instruments:
+                    raise ResearchError(502, "RESEARCH_UPSTREAM_ERROR",
+                                        f"Could not resolve forex pair {base}/{quote}.",
+                                        False)
+                conid = int(instruments[0]["instrument_id"])
+                snap = qc.call("get_snapshot",
+                               {"instrument_id": conid, "delayed": False}, dict)
+            except ResearchError:
+                raise
+            except Exception as exc:
+                raise ResearchError(503, "TRADER_LINK_UNAVAILABLE",
+                                    "IB forex snapshot unavailable.", True) from exc
+            s = snap.get("snapshot") or {}
+            return ResearchResult(
+                {"pair": f"{base}/{quote}", "bid": s.get("bid"), "ask": s.get("ask"),
+                 "last": s.get("last"), "open": s.get("open"), "high": s.get("high"),
+                 "low": s.get("low"), "close": s.get("close"), "time": s.get("time")},
+                f"Forex snapshot: {base}/{quote} (IB)", provider="ib")
+        return op
+
+    @router.get("/forex/snapshot")
+    async def forex_snapshot(
+        request: Request,
+        pair: str = Query(min_length=6, max_length=10),
+        source: Literal["massive", "ib", "twelvedata"] = "massive",
+        _session: str = Depends(require_session),
+    ):
+        reject_unknown(request, {"pair", "source"})
+        try:
+            _parse_pair(pair)
+        except ValueError as exc:
+            raise validation_error("pair", str(exc), pair)
+        if source == "ib":
+            return await run(lambda: service.run(
+                "forex_snapshot", _ib_forex_snapshot_op(pair),
+                backend="trader", log_params={"pair": pair, "source": source}))
+        return await run(lambda: service.run(
+            "forex_snapshot",
+            lambda provider: provider.forex_snapshot(pair, source=source),
+            log_params={"pair": pair, "source": source}))
+
+    @router.get("/forex/quote")
+    async def forex_quote(
+        request: Request,
+        from_: str = Query(alias="from", pattern=r"^[A-Za-z]{3}$"),
+        to: str = Query(pattern=r"^[A-Za-z]{3}$"),
+        source: Literal["massive", "ib", "twelvedata"] = "massive",
+        _session: str = Depends(require_session),
+    ):
+        reject_unknown(request, {"from", "to", "source"})
+        if source == "ib":
+            return await run(lambda: service.run(
+                "forex_quote", _ib_forex_snapshot_op(f"{from_}{to}"),
+                backend="trader", log_params={"from": from_, "to": to, "source": source}))
+        return await run(lambda: service.run(
+            "forex_quote",
+            lambda provider: provider.forex_quote(from_, to, source=source),
+            log_params={"from": from_.upper(), "to": to.upper(), "source": source}))
+
+    @router.get("/forex/movers")
+    async def forex_movers(
+        request: Request,
+        direction: Literal["gainers", "losers"] = "gainers",
+        _session: str = Depends(require_session),
+    ):
+        reject_unknown(request, {"direction"})
+        return await run(lambda: service.run(
+            "forex_movers", lambda provider: provider.forex_movers(direction),
+            log_params={"direction": direction}))
+
+    @router.get("/forex/snapshot-all")
+    async def forex_snapshot_all(
+        request: Request,
+        tickers: list[str] = Query(default=[]),
+        _session: str = Depends(require_session),
+    ):
+        reject_unknown(request, {"tickers"})
+        normalized = list(dict.fromkeys(t.strip().upper() for t in tickers if t.strip()))
+        if len(normalized) > 100:
+            raise validation_error("tickers", "At most 100 tickers", tickers,
+                                   error_type="too_long")
+        return await run(lambda: service.run(
+            "forex_snapshot_all",
+            lambda provider: provider.forex_snapshot_all(normalized or None),
+            log_params={"tickers": normalized}))
+
+    @router.get("/forex/convert")
+    async def forex_convert(
+        request: Request,
+        from_: str = Query(alias="from", pattern=r"^[A-Za-z]{3}$"),
+        to: str = Query(pattern=r"^[A-Za-z]{3}$"),
+        amount: float = Query(gt=0, le=1e12),
+        _session: str = Depends(require_session),
+    ):
+        reject_unknown(request, {"from", "to", "amount"})
+        return await run(lambda: service.run(
+            "forex_convert",
+            lambda provider: provider.forex_convert(from_, to, amount),
+            log_params={"from": from_.upper(), "to": to.upper(), "amount": amount}))
 
     return router

@@ -298,6 +298,6 @@ def build_research_service() -> ResearchService:
                     exc_info=True,
                 )
 
-        return MassiveResearch(RESTClient(api_key=api_key), td_client=td_client)
+        return MassiveResearch(RESTClient(api_key=api_key), td_client=td_client, api_key=api_key)
 
     return ResearchService(provider_factory)

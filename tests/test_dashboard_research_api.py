@@ -1019,3 +1019,15 @@ def test_forex_snapshot_ib_unresolved_instrument_returns_upstream_error(
     r = client.get("/api/research/forex/snapshot?pair=EURUSD&source=ib")
     assert r.status_code == 502
     assert r.json()["error"]["code"] == "RESEARCH_UPSTREAM_ERROR"
+
+
+def test_forex_snapshot_ib_call_failure_maps_to_trader_link_unavailable(
+        app_factory_with_query_client):
+    class _RaisingQueryClient:
+        def call(self, method, body, _type, timeout=None):
+            raise RuntimeError("socket boom")
+    client = app_factory_with_query_client(_RaisingQueryClient())
+    _login(client)
+    r = client.get("/api/research/forex/snapshot?pair=EURUSD&source=ib")
+    assert r.status_code == 503
+    assert r.json()["error"]["code"] == "TRADER_LINK_UNAVAILABLE"

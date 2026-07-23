@@ -207,10 +207,6 @@
     target.selected = target.data[index];
     renderResults();
     renderDetail();
-    if (currentTool === 'options' && target.selected && target.selected.ticker) {
-      request(state.options, 'options/snapshot',
-              new URLSearchParams({option_ticker: target.selected.ticker}));
-    }
     return true;
   }
 

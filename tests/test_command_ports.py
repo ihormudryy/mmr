@@ -211,10 +211,22 @@ class TestQuoteAuthority:
         q = self._auth(trader).executable_quote(CONID, side="bid")
         assert q is not None and q.price == 200.5
 
-    def test_none_when_no_market_timestamp(self):
-        # A quote with no real market time can't be aged -> not tradable.
-        trader = _fake_trader(snapshot=_ticker(time=None))
+    def test_none_when_no_market_timestamp_on_live(self):
+        # A live quote with no real market time can't be aged -> not tradable.
+        trader = _fake_trader(snapshot=_ticker(time=None, market_data_type=1))
         assert self._auth(trader).executable_quote(CONID, side="BUY") is None
+
+    def test_delayed_missing_timestamp_uses_receipt_time(self):
+        # Delayed ticks can have prices before a timestamp tick — don't fail closed.
+        trader = _fake_trader(snapshot=_ticker(
+            time=None, ask=100.0, market_data_type=3))
+        before = dt.datetime.now(dt.timezone.utc)
+        q = self._auth(trader).executable_quote(CONID, side="ask")
+        after = dt.datetime.now(dt.timezone.utc)
+        assert q is not None
+        assert q.price == 100.0
+        assert q.feed_type == "delayed"
+        assert before <= q.market_timestamp <= after
 
     def test_none_on_snapshot_failure(self):
         def _boom(contract, delayed=False):

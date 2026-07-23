@@ -17,10 +17,11 @@ by the injected ``run_coro`` (production: ``run_coroutine_threadsafe(coro,
 loop).result(timeout)``) so it never touches ib_async off-loop.
 
 The ``QuoteAuthority`` adapter carries the IB ``Ticker``'s REAL market timestamp
-(``ticker.time``), never a re-stamp to "now" — so a snapshot taken while the
-market is closed reports the old close time and is correctly detected as stale
-downstream, rather than reintroducing the "stale quote looks fresh" hazard just
-fixed on the read path.
+(``ticker.time``) when present, never inventing a "fresh" time for live quotes —
+so a snapshot taken while the market is closed reports the old close time and is
+correctly detected as stale downstream. Delayed/frozen ticks that arrive with a
+usable price but no ``ticker.time`` yet use a receipt timestamp (paper capture
+does not age-check delayed feeds); live still fails closed without a source time.
 """
 from __future__ import annotations
 
@@ -293,12 +294,28 @@ class TraderQuoteAuthority:
             if price is None:
                 return None
             market_timestamp = getattr(ticker, "time", None)
+            feed = _feed_type(ticker)
             if market_timestamp is None:
-                return None  # no real market time -> can't age it -> not tradable
+                # Delayed/frozen ticks often populate prices before a timestamp
+                # tick arrives. Rejecting those as QUOTE_UNAVAILABLE made paper
+                # propose/close fail even with a usable book. Live still requires
+                # a real source time (staleness must stay honest). Only trust the
+                # ticker's reported feed type — a delayed *request* can still
+                # return live-typed ticks.
+                if feed in ("delayed", "delayed-frozen", "frozen"):
+                    from datetime import datetime, timezone
+                    market_timestamp = datetime.now(timezone.utc)
+                    logger.info(
+                        "delayed/frozen quote missing ticker.time for conid %s; "
+                        "using receipt timestamp",
+                        conid,
+                    )
+                else:
+                    return None  # no real market time -> can't age it -> not tradable
             return ExecutableQuote(
                 conid=conid, side=side, price=price,
                 market_timestamp=market_timestamp,
-                feed_type=_feed_type(ticker),
+                feed_type=feed,
                 session_state=_session_state(ticker),
                 bid=_usable_price(getattr(ticker, "bid", None)),
                 ask=_usable_price(getattr(ticker, "ask", None)),

@@ -1733,20 +1733,28 @@ class StrategyRuntime():
         strategies_dir = os.path.abspath(os.path.expanduser(self.strategies_directory))
 
         # [P3 Task 2] Artifact verification gate — checked BEFORE the class module
-        # is loaded from disk.  Only active when automation is enabled and the
-        # strategy config carries an ``artifact_bundle_path`` key (so existing
-        # non-automated strategies are unaffected).  Fail closed: any verification
-        # failure is logged at ERROR and the strategy is refused.
+        # is loaded from disk. When automation is enabled and the strategy carries
+        # ``artifact_bundle_path``, fail closed on any verification failure.
+        # When automation is *disabled*, still load the strategy (soft-load) so it
+        # appears in Strategies / Scaling for Activate; attestation runs on arm.
         artifact_bundle_path_str = (params or {}).get('artifact_bundle_path', '')
         if artifact_bundle_path_str:
-            try:
-                self._verify_artifact_at_load(name, artifact_bundle_path_str)
-            except Exception as exc:
-                logging.error(
-                    'refusing to load strategy %s: artifact verification failed: %s',
-                    name, exc,
+            if not self.automation_enabled:
+                logging.warning(
+                    'strategy %s has artifact_bundle_path but automation is '
+                    'disabled; loading without attestation (Activate paper '
+                    'automation to arm and verify)',
+                    name,
                 )
-                return
+            else:
+                try:
+                    self._verify_artifact_at_load(name, artifact_bundle_path_str)
+                except Exception as exc:
+                    logging.error(
+                        'refusing to load strategy %s: artifact verification failed: %s',
+                        name, exc,
+                    )
+                    return
 
         def load_class_from_file(filename, classname):
             # Reject absolute paths and path traversal. Strategy modules must
@@ -1956,9 +1964,9 @@ class StrategyRuntime():
         # announce missed, e.g. ones loaded by this very reconcile), then
         # drain any acknowledgement-outbox rows the trader might have missed
         # (its record_state_acknowledged reply was lost, or this process
-        # restarted before draining). Isolated: a failure here must not skip
-        # config reload/re-subscription above, and every drained row is
-        # retried independently so one bad row doesn't block the rest.
+        # restarted before draining). Isolated from subscribe/reload above.
+        # Drain fail-fasts on trader timeout so one unreachable peer cannot
+        # hold this thread for limit × timeout seconds.
         try:
             self._announce_strategy_states()
         except Exception as ex:
@@ -2027,15 +2035,19 @@ class StrategyRuntime():
                     'startup instrument subscription failed for %r (trader typed '
                     'query unreachable; reconcile will retry): %s', strategy.name, ex)
 
-    def _drain_ack_outbox(self, limit: int = 50) -> None:
+    def _drain_ack_outbox(self, limit: int = 50, *, call_timeout: float = 3.0) -> None:
         """Push unacknowledged ``strategy_ack_outbox`` rows to the trader's
         typed ``record_state_acknowledged`` command. This is a BACKSTOP --
         the common case already acknowledges synchronously as part of the
         forwarded command's own reply (see
         ``command_coordinator.StrategyControlCommandService._forward``); this
-        loop only matters when that reply was lost in transit. Per-row
-        isolated: one row's failure must not block the rest, and an
-        unacknowledged row is simply retried on the next 30s tick."""
+        loop only matters when that reply was lost in transit.
+
+        Fail-fast on timeout/connection errors: one unreachable trader must
+        not burn ``limit × 10s`` on the strategy event loop (that starves
+        ``list_strategies`` and IB historical startup). Remaining rows retry
+        on the next reconcile tick.
+        """
         client = getattr(self, '_trader_command_client', None)
         if self._revisions is None or client is None:
             return
@@ -2047,7 +2059,16 @@ class StrategyRuntime():
                 'payload': row.payload,
             }
             try:
-                client.call('record_state_acknowledged', body, dict)
+                client.call(
+                    'record_state_acknowledged', body, dict, timeout=call_timeout,
+                )
+            except (TimeoutError, ConnectionError) as ex:
+                logging.debug(
+                    'record_state_acknowledged failed for %s state_revision %s '
+                    '(trader unreachable; aborting drain, will retry next cycle): %s',
+                    row.strategy_name, row.state_revision, ex,
+                )
+                return
             except Exception as ex:
                 logging.debug(
                     'record_state_acknowledged failed for %s state_revision %s '
@@ -2261,12 +2282,13 @@ class StrategyRuntime():
         # it's probably up to the strategy how they want to secure data
         self._subscribe_all_strategies()
 
-        # Announce the freshly loaded strategies to the trader's journal right
-        # away (don't wait for the first 30s reconcile tick) so the command
-        # center's Strategies panel populates as soon as the service is up.
+        # Announce the freshly loaded strategies into the local ack outbox so
+        # reconcile can push them to the trader journal. Do NOT drain here on
+        # the event loop: if the trader command socket is not answering yet,
+        # N strategies × 10s timeouts stall list_strategies / IB historical
+        # for a minute+ (seen as "Task-1 ... took 76 seconds").
         try:
             self._announce_strategy_states()
-            self._drain_ack_outbox()
         except Exception as ex:
             logging.warning('startup strategy state announce failed (reconcile will retry): %s', ex)
 

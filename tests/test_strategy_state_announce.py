@@ -215,3 +215,25 @@ class TestAnnounceDoesNotCallbackIntoTrader:
         state = rt.enable_strategy('orb')
         assert state == StrategyState.RUNNING
         assert any(r[0] == 'orb' for r in _outbox_rows(rt))
+
+
+class TestDrainAckOutboxFailFast:
+    def test_aborts_batch_after_trader_timeout(self, runtime_with_revisions):
+        rt = runtime_with_revisions
+        rt.strategy_implementations = [
+            _StubStrategy('a'), _StubStrategy('b'), _StubStrategy('c'),
+        ]
+        rt._announce_strategy_states()
+        calls = []
+
+        class _TimeoutClient:
+            def call(self, method, body, response_model, timeout=None):
+                calls.append((method, body.get('strategy_name'), timeout))
+                raise TimeoutError(f'typed RPC call to {method!r} timed out')
+
+        rt._trader_command_client = _TimeoutClient()
+        rt._drain_ack_outbox()
+        # One attempt then abort — must not walk every outbox row at 10s each.
+        assert len(calls) == 1
+        assert calls[0][0] == 'record_state_acknowledged'
+        assert calls[0][2] == 3.0

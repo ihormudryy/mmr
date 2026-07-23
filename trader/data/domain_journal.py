@@ -345,15 +345,18 @@ class DomainJournal:
         # released -- see `_signal_commit`.
         self._commit_condition = threading.Condition()
         self._latest_committed_cursor: int = 0
-        # Task 6: dedicated mutex serializing `compact()` against
-        # `DomainSnapshotService.snapshot_with_cursor`'s fenced, held-open
-        # read transaction -- the only other place in this process that
-        # spans multiple statements inside one transaction. Deliberately
-        # NOT `_write_lock` (see module docstring's "CHECKPOINT
-        # concurrency" section for why `snapshot_with_cursor` must never
-        # take that one). Public (no leading underscore): shared across
-        # module boundaries with `DomainSnapshotService`.
-        self.fenced_read_lock = threading.Lock()
+        # Serializes every multi-statement transaction on `_shared_conn`
+        # (snapshot reads, mutate/mutate_batch_work writes, compact).
+        # RLock so the same-thread fence test
+        # (`snapshot_with_cursor(on_read_started=mutate)`) can re-enter.
+        # Cross-thread mutate used to take only `_write_lock` while
+        # snapshot held this lock -- concurrent cursors on one DuckDB
+        # connection then deadlocked under load, exhausting the typed-RPC
+        # thread pool (dashboard snapshot + resolve_instrument timeouts).
+        # Lock order with writers: `_write_lock` THEN `fenced_read_lock`
+        # (same as `compact()`); never the reverse.
+        # Public (no leading underscore): shared with DomainSnapshotService.
+        self.fenced_read_lock = threading.RLock()
 
     # ------------------------------------------------------------------ #
     # Connection access
@@ -468,50 +471,54 @@ class DomainJournal:
         promoted-generation cursor) on the same connection before commit.
         """
         committed_events: tuple[DomainEvent, ...] = ()
+        # Same lock order as compact(): _write_lock then fenced_read_lock.
+        # fenced_read_lock is an RLock so same-thread on_read_started→mutate
+        # (fence tests) can re-enter while a cross-thread snapshot holds it.
         with self._write_lock:
-            conn.execute("BEGIN TRANSACTION")
-            try:
-                events: list[DomainEvent] = []
-                def append(
-                    mutation: DomainMutation,
-                    write_materialized: WriteMaterialized,
-                    event_id: Optional[str] = None,
-                ) -> DomainEvent:
-                    eid = event_id if event_id is not None else str(uuid4())
-                    existing = self._select_journal_row(conn, eid)
-                    if existing is not None:
-                        if not self._matches(existing, mutation):
-                            raise EventIdentityConflict(eid)
-                        event = self._row_to_event(existing)
-                    else:
-                        current_revision = self._read_current_revision(
-                        conn, mutation.entity_type, mutation.entity_id
-                        )
-                        next_revision = current_revision + 1
-                        write_materialized(conn, next_revision)
-                        received_ts = _utcnow()
-                        self._upsert_materialized(conn, mutation, next_revision, received_ts)
-                        event = self._insert_journal_row(
-                            conn, eid, mutation, next_revision, received_ts
-                        )
-                    events.append(event)
-                    return event
-
-                result = work(conn, append)
-                conn.execute("COMMIT")
-                committed_events = tuple(events)
-            except BaseException:
+            with self.fenced_read_lock:
+                conn.execute("BEGIN TRANSACTION")
                 try:
-                    conn.execute("ROLLBACK")
+                    events: list[DomainEvent] = []
+                    def append(
+                        mutation: DomainMutation,
+                        write_materialized: WriteMaterialized,
+                        event_id: Optional[str] = None,
+                    ) -> DomainEvent:
+                        eid = event_id if event_id is not None else str(uuid4())
+                        existing = self._select_journal_row(conn, eid)
+                        if existing is not None:
+                            if not self._matches(existing, mutation):
+                                raise EventIdentityConflict(eid)
+                            event = self._row_to_event(existing)
+                        else:
+                            current_revision = self._read_current_revision(
+                            conn, mutation.entity_type, mutation.entity_id
+                            )
+                            next_revision = current_revision + 1
+                            write_materialized(conn, next_revision)
+                            received_ts = _utcnow()
+                            self._upsert_materialized(conn, mutation, next_revision, received_ts)
+                            event = self._insert_journal_row(
+                                conn, eid, mutation, next_revision, received_ts
+                            )
+                        events.append(event)
+                        return event
+
+                    result = work(conn, append)
+                    conn.execute("COMMIT")
+                    committed_events = tuple(events)
                 except BaseException:
-                    # RA-11-style guard: a rollback failure (e.g. a failed
-                    # BEGIN left no open transaction) must never mask the
-                    # real exception being re-raised below.
-                    pass
-                raise
-        # `_write_lock` is released above (the `with` block has exited).
-        # ONLY NOW -- after both the durable COMMIT and the lock release --
-        # do we bump the in-memory cursor and wake long-poll readers.
+                    try:
+                        conn.execute("ROLLBACK")
+                    except BaseException:
+                        # RA-11-style guard: a rollback failure (e.g. a failed
+                        # BEGIN left no open transaction) must never mask the
+                        # real exception being re-raised below.
+                        pass
+                    raise
+        # `_write_lock` / `fenced_read_lock` released above. ONLY NOW -- after
+        # both the durable COMMIT and the lock release -- do we bump the
+        # in-memory cursor and wake long-poll readers.
         if committed_events:
             self._signal_commit(max(event.source_cursor for event in committed_events))
         return result

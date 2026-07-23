@@ -35,25 +35,13 @@ identical snapshot, so the returned ``source_cursor`` bounds exactly the
 revisions visible in the returned entities, with no gap and no overlap,
 regardless of what commits land on other cursors of the same connection
 instance while this transaction is still open. This is a genuine MVCC
-guarantee, not an artifact of serialization: nothing in this method takes a
-lock (in particular, NOT ``DomainJournal._write_lock``, which only guards
-``mutate()``'s own critical section) that would force a concurrent writer to
-wait -- see ``test_domain_snapshot.py``'s fence test, which proves the
-injected writer's commit lands durably (a real, completed, independent
-transaction) yet still isn't visible inside the reader's still-open one.
-
-This method DOES take ``journal.fenced_read_lock`` (Task 6) for the full
-span of its transaction -- that lock is a SEPARATE primitive from
-``_write_lock`` and exists solely to serialize this held-open,
-multi-statement read transaction against ``DomainJournal.compact()``'s
-own DELETE + ``CHECKPOINT`` (verified empirically that interleaving those
-is unreliable against DuckDB 1.4.4 -- see ``domain_journal.py``'s module
-docstring). Taking ``fenced_read_lock`` here is safe precisely because it
-is never the SAME lock ``mutate()`` takes: a caller-supplied
-``on_read_started`` hook that synchronously calls back into ``mutate()``
-on this same thread (this task's own fence test) only ever contends for
-``_write_lock``, never ``fenced_read_lock``, so no self-deadlock is
-possible.
+guarantee, not an artifact of serialization for *same-thread* fence
+callbacks: ``on_read_started`` may call ``mutate()`` on this thread, and
+``fenced_read_lock`` is an ``RLock`` so that re-enters. Cross-thread
+``mutate()`` now also takes ``fenced_read_lock`` (after ``_write_lock``)
+so it cannot run a write transaction on ``_shared_conn`` concurrently
+with this held-open read -- that interleaving deadlocked DuckDB under
+load and starved the typed-RPC thread pool.
 
 Broker-generation gate (activated by [M1-F2])
 --------------------------------------------------------------------------

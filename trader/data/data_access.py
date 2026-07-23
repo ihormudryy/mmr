@@ -131,6 +131,11 @@ class SecurityDefinition:
             return contract
         elif isinstance(definition, Contract):
             return definition
+        elif hasattr(definition, 'to_contract') and callable(getattr(definition, 'to_contract')):
+            # StrategyInstrument (and similar projections) expose an instance
+            # to_contract() so the strategy runtime can pass them through the
+            # same historical-fetch path as SecurityDefinition.
+            return definition.to_contract()
         else:
             raise ValueError('unable to cast type to Contract')
 

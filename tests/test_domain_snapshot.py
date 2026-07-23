@@ -17,6 +17,7 @@ uses a non-broker `proposal` entity (needs no generation), matching the
 brief's pre-flight resolution.
 """
 import datetime as dt
+import threading
 
 import pytest
 
@@ -192,6 +193,46 @@ def test_materialized_adapter_protocol_matches_generic_entity_adapter():
     adapter = GenericEntityAdapter("proposal")
     assert isinstance(adapter, MaterializedAdapter)
     assert adapter.entity_type == "proposal"
+
+
+def test_cross_thread_snapshot_and_mutate_do_not_deadlock(snapshot_service, writer):
+    """Regression: concurrent snapshot read + mutate on `_shared_conn` used
+    to interleave under separate locks and wedge DuckDB, starving typed RPC.
+    """
+    import time
+
+    writer.proposal(quantity=1, event_id="seed")
+    stop = threading.Event()
+    errors: list[BaseException] = []
+
+    def snap_loop():
+        try:
+            while not stop.is_set():
+                snapshot_service.snapshot_with_cursor()
+        except BaseException as ex:  # noqa: BLE001 — collect any wedge/error
+            errors.append(ex)
+
+    def write_loop():
+        try:
+            n = 0
+            while not stop.is_set():
+                n += 1
+                writer.proposal(quantity=n, event_id=f"w{n}")
+        except BaseException as ex:  # noqa: BLE001
+            errors.append(ex)
+
+    threads = [
+        threading.Thread(target=snap_loop, name="snap"),
+        threading.Thread(target=write_loop, name="write"),
+    ]
+    for t in threads:
+        t.start()
+    time.sleep(0.5)
+    stop.set()
+    for t in threads:
+        t.join(timeout=5)
+        assert not t.is_alive(), f"{t.name} did not finish — likely deadlock"
+    assert errors == []
 
 
 def test_deleted_proposal_is_excluded_from_active_snapshot(snapshot_service, writer):

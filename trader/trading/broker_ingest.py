@@ -364,6 +364,7 @@ class BrokerIngest:
         self.clock = clock or (lambda: dt.datetime.now(dt.timezone.utc))
         self.attribution_ledger = attribution_ledger
         self.protective_order_saga = protective_order_saga
+        self._suppress_side_effects = False
         self._queue: queue.Queue[
             AccountValueObservation | PositionObservation | PnLObservation | OrderObservation | FillObservation | CommissionObservation
         ] = queue.Queue()
@@ -467,7 +468,14 @@ class BrokerIngest:
             generation.complete.add(source)
 
     def promote_generation(self) -> int:
-        """Apply a complete staged generation in one journal transaction."""
+        """Apply a complete staged generation in one journal transaction.
+
+        ``_apply_lock`` is held only to validate/capture the generation and to
+        clear it afterwards — not across ``mutate_batch_work``. Holding the
+        lock for the whole DuckDB write deadlocked drain/mark_source and, when
+        combined with an un-cancellable ``asyncio.to_thread`` promote, left
+        typed-RPC workers wedged forever after a promote timeout.
+        """
         with self._apply_lock:
             generation = self._require_generation()
             missing = sorted(set(generation.required) - generation.complete)
@@ -475,15 +483,50 @@ class BrokerIngest:
                 raise GenerationIncomplete(
                     f"broker generation {generation.generation_id} is incomplete; missing: {', '.join(missing)}"
                 )
+            # Suppress attribution/db side-effects that would open a second
+            # journal connection while mutate_batch_work holds a write txn.
+            self._suppress_side_effects = True
+        try:
+            logging.getLogger(__name__).info(
+                "broker sync: promoting generation %s", generation.generation_id
+            )
             cursor = self.journal.mutate_batch_work(
                 self.journal.connect(),
-                lambda conn, append: self._promote_in_journal_transaction(conn, generation, append),
+                lambda conn, append: self._promote_in_journal_transaction(
+                    conn, generation, append
+                ),
             )
-            self._generation = None
+            try:
+                self.journal.connect().execute("CHECKPOINT")
+            except Exception as checkpoint_exc:  # noqa: BLE001
+                logging.getLogger(__name__).warning(
+                    "journal CHECKPOINT after promote failed (non-fatal): %s",
+                    checkpoint_exc,
+                )
+            logging.getLogger(__name__).info(
+                "broker sync: promoted generation %s cursor=%s",
+                generation.generation_id, cursor,
+            )
             return cursor
+        finally:
+            with self._apply_lock:
+                self._suppress_side_effects = False
+                if self._generation is generation:
+                    self._generation = None
 
     def abandon_generation(self, reason: str) -> None:
-        with self._apply_lock:
+        log = logging.getLogger(__name__)
+        # Try-lock: a wedged promote thread may still hold _apply_lock; blocking
+        # forever here (e.g. from run_broker_sync's timeout path) freezes the
+        # caller without recovering.
+        acquired = self._apply_lock.acquire(timeout=2.0)
+        if not acquired:
+            log.error(
+                "abandon_generation(%r) could not acquire apply lock in 2s — "
+                "promote may be wedged; generation left for next sync", reason,
+            )
+            return
+        try:
             generation = self._generation
             if generation is None:
                 return
@@ -496,6 +539,9 @@ class BrokerIngest:
                 )
             )
             self._generation = None
+            log.warning("broker sync: abandoned generation %s (%s)", generation.generation_id, reason)
+        finally:
+            self._apply_lock.release()
 
     def _require_generation(self) -> _Generation:
         if self._generation is None:
@@ -553,7 +599,20 @@ class BrokerIngest:
                 for fill in await client.ib.reqExecutionsAsync():
                     self.on_exec_details(None, fill)
                 self.mark_source_complete("executions")
-            await asyncio.to_thread(self._promote_after_drain)
+            # Promote is outside the IB-fetch timeout above, but must still
+            # be bounded: a wedged DuckDB promote previously held
+            # `_apply_lock` + journal write locks forever and starved every
+            # typed-RPC thread-pool worker (snapshot/resolve timeouts).
+            try:
+                await asyncio.wait_for(
+                    asyncio.to_thread(self._promote_after_drain),
+                    timeout=timeout_seconds,
+                )
+            except asyncio.TimeoutError as exc:
+                await asyncio.to_thread(
+                    self._abandon_if_active, f"broker sync promote timed out: {exc}"
+                )
+                return False
             return True
         except (asyncio.TimeoutError, ConnectionError, OSError) as exc:
             await asyncio.to_thread(self._abandon_if_active, f"broker sync failed: {exc}")
@@ -564,8 +623,16 @@ class BrokerIngest:
         self.promote_generation()
 
     def _abandon_if_active(self, reason: str) -> None:
-        with self._apply_lock:
+        acquired = self._apply_lock.acquire(timeout=2.0)
+        if not acquired:
+            logging.getLogger(__name__).error(
+                "abandon_if_active(%r) timed out waiting for apply lock", reason,
+            )
+            return
+        try:
             active = self._generation is not None
+        finally:
+            self._apply_lock.release()
         if active:
             self.abandon_generation(reason)
 
@@ -1104,6 +1171,8 @@ class BrokerIngest:
             )
 
     def _notify_attribution_order(self, order: BrokerOrderRow) -> None:
+        if self._suppress_side_effects:
+            return
         if not order.order_group_id:
             return
         trade_id = (
@@ -1128,6 +1197,8 @@ class BrokerIngest:
         )
 
     def _notify_attribution_fill(self, fill: BrokerFillRow) -> None:
+        if self._suppress_side_effects:
+            return
         trade_id = self._resolve_trade_id_for_fill(fill)
         leg = None
         if fill.order_entity_id:
@@ -1156,6 +1227,8 @@ class BrokerIngest:
         )
 
     def _notify_attribution_commission(self, obs: CommissionObservation) -> None:
+        if self._suppress_side_effects:
+            return
         try:
             stored = self.db.transaction(
                 lambda conn: self.store.get_fill_in_tx(
@@ -1199,6 +1272,8 @@ class BrokerIngest:
         )
 
     def _notify_protective_saga(self, order: BrokerOrderRow, obs: OrderObservation) -> None:
+        if self._suppress_side_effects:
+            return
         if self.protective_order_saga is None or not order.order_group_id:
             return
         from trader.automation.protective_order_saga import BrokerOrderEvent

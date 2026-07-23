@@ -120,6 +120,11 @@ scheduled) the paper soak.
 
 ### 5. Arm paper automation (one strategy)
 
+Strategies that already declare `params.artifact_bundle_path` still **load**
+when `automation.enabled` is false (soft-load): they appear in Strategies /
+Scaling so you can Activate them. Attestation runs on Activate / when
+automation is enabled — not at cold load while disarmed.
+
 #### Preferred — dashboard (Phase 2 hot-arm)
 
 1. Open the web dashboard / command center **Scaling** tab

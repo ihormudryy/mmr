@@ -519,12 +519,24 @@ class DuckDBObjectStore(ObjectStore):
             """,
             [key, blob],
         ))
+        # Portfolios/universes must survive an ungraceful container kill:
+        # without CHECKPOINT, a subsequent WAL-replay quarantine can drop
+        # the last uncheckpointed frames (see connect_duckdb recovery).
+        self.checkpoint()
 
     def delete(self, key: str) -> None:
         self._db.execute(
             f"DELETE FROM {self.TABLE_NAME} WHERE key = ?",
             [key],
         )
+        self.checkpoint()
+
+    def checkpoint(self) -> None:
+        """Force a durable checkpoint of the underlying DuckDB file."""
+        try:
+            self._db.execute_atomic(lambda conn: conn.execute('CHECKPOINT'))
+        except Exception as exc:  # noqa: BLE001 — never fail the caller on fsync
+            logger.warning('DuckDB CHECKPOINT after object_store mutate failed: %s', exc)
 
     def list_symbols(self) -> list[str]:
         def _list(conn):

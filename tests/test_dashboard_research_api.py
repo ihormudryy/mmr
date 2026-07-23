@@ -199,11 +199,12 @@ def test_research_routes_require_session(app_with_research):
         assert client.get(f"/api/research/{path}").status_code == 401
 
 
-def test_research_shell_is_the_sixth_tab(logged_in_research_client):
+def test_research_shell_precedes_guide_tab(logged_in_research_client):
     html = logged_in_research_client.get("/cc").text
     assert 'data-dash-tab="research"' in html
     assert 'id="dash-research"' in html
-    assert html.index('data-dash-tab="research"') > html.index(
+    # Guide is last in the tab row; Research sits immediately before it.
+    assert html.index('data-dash-tab="research"') < html.index(
         'data-dash-tab="guide"')
     for tool in (
         "ideas", "movers", "lookup", "scan", "depth", "options", "forex",

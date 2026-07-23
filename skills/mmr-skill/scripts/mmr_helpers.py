@@ -4,6 +4,7 @@ import os
 import re
 import subprocess
 import sys
+import time
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Union
 
@@ -87,6 +88,60 @@ async def _run_cli_json_str(*args: str, timeout: int = 30) -> str:
 async def _run_sdk_script(script: str, timeout: int = 30) -> str:
     async with _CLI_SLOTS:
         return await asyncio.to_thread(_run_sdk_script_sync, script, timeout=timeout)
+
+
+# ---------------------------------------------------------------------------
+# Paper evaluate-then-approve enforcement (spec:
+# docs/superpowers/specs/2026-07-23-paper-llm-approve-live-human-design.md).
+#
+# The server cannot see whether the LLM actually evaluated a proposal before
+# approving, so this layer enforces the checklist mechanically: approve()
+# refuses client-side (CHECKLIST_INCOMPLETE, no order sent) unless BOTH
+# proposal_show(id) for THAT proposal and a successful portfolio_risk() ran
+# within the freshness window. reject() is never gated (spec R4 — hygiene
+# must stay cheap). Quote/session sanity — the checklist's third step — is
+# enforced server-side at approve time (QUOTE_STALE / PRICE_DRIFT_EXCEEDED /
+# ORDER_NOTIONAL_LIMIT guards), so it needs no client tracking.
+# ---------------------------------------------------------------------------
+
+_EVAL_WINDOW_S = 900.0  # checklist evidence stays fresh for 15 minutes
+
+
+def _now() -> float:
+    """Module clock — separate function so tests can freeze/advance it."""
+    return time.time()
+
+
+_eval_state: Dict[str, Any] = {"risk_checked_at": 0.0, "shown": {}}
+
+
+def _record_proposal_shown(proposal_id: Any) -> None:
+    try:
+        _eval_state["shown"][int(proposal_id)] = _now()
+    except (TypeError, ValueError):
+        pass
+
+
+def _record_risk_checked() -> None:
+    _eval_state["risk_checked_at"] = _now()
+
+
+def _checklist_gaps(proposal_id: int) -> List[str]:
+    """Return the still-missing checklist steps for approving a proposal."""
+    now = _now()
+    gaps: List[str] = []
+    shown_at = _eval_state["shown"].get(int(proposal_id), 0.0)
+    if now - shown_at > _EVAL_WINDOW_S:
+        gaps.append(
+            f"await MMRHelpers.proposal_show({proposal_id})"
+            "  # read sizing, reasoning, and exit protection"
+        )
+    if now - _eval_state["risk_checked_at"] > _EVAL_WINDOW_S:
+        gaps.append(
+            "await MMRHelpers.portfolio_risk()"
+            "  # concentration, group budgets, remaining capacity"
+        )
+    return gaps
 
 
 # ---------------------------------------------------------------------------
@@ -2889,15 +2944,36 @@ class MMRHelpers:
         currency: str = "",
         enrich_news: bool = False,
         enrich_news_limit: int = 3,
+        stop_loss: Optional[float] = None,
+        take_profit: Optional[float] = None,
+        trailing_stop_pct: Optional[float] = None,
+        tif: str = "",
+        allow_duplicate: bool = False,
     ) -> dict:
         """Create a trade proposal (stored locally; not executed until
         ``approve()``). When neither ``quantity`` nor ``amount`` is
         given, auto-sizes via: base × risk × confidence × ATR-volatility
         (volatile = smaller, stable = larger). ATR/snapshot enrichment
-        needs trader_service; creation itself does not.
+        needs trader_service; creation itself does not. If auto-sizing is
+        not configured on the command path the server refuses with
+        ``SIZING_BLOCKED`` — pass an explicit ``amount`` then.
 
         ``action``: "BUY" | "SELL". ``group`` auto-registers the symbol
         into the named group. ``exchange``/``currency`` for international.
+
+        **Protective exits (recommended for unattended paper entries):**
+        ``stop_loss`` + ``take_profit`` together become a bracket order;
+        ``stop_loss`` alone attaches a stop; ``trailing_stop_pct`` attaches
+        a trailing stop (mutually exclusive with the fixed exits);
+        ``tif`` sets time-in-force (e.g. "GTC" so protection outlives the day).
+
+        **Duplicate guard:** before creating, this checks existing PENDING
+        proposals for the same symbol+action and refuses with
+        ``DUPLICATE_PENDING`` (the server only dedupes ``strategy:`` sources,
+        not LLM/manual ones). Decide on the existing proposal instead of
+        re-proposing; pass ``allow_duplicate=True`` only for a deliberate
+        second tranche. The check fails open — a broken pending-list read
+        never blocks creation (proposals are inert until approved).
 
         ``enrich_news=True`` calls the local ``~/dev/news`` scraper at
         ``http://127.0.0.1:8089`` (or ``$NEWS_SERVICE_URL``) and appends
@@ -2911,10 +2987,53 @@ class MMRHelpers:
         Example:
         result = await MMRHelpers.propose("AAPL", "BUY", confidence=0.7, reasoning="Breakout above resistance")
         result = await MMRHelpers.propose("BHP", "BUY", confidence=0.6, group="mining", exchange="ASX", currency="AUD")
+        # Protected entry — trailing stop follows the price up, GTC
+        result = await MMRHelpers.propose("AAPL", "BUY", amount=2000, confidence=0.7,
+            trailing_stop_pct=2.0, tif="GTC", reasoning="ORB confirmation")
         # With news enrichment (records article excerpts in the proposal's reasoning)
         result = await MMRHelpers.propose("AMD", "BUY", confidence=0.8,
             reasoning="Wells Fargo target raise to $615", enrich_news=True, enrich_news_limit=3)
         """
+        # Exit-style validation: the CLI has no take-profit-only order shape,
+        # and a trailing stop replaces (not augments) fixed exits.
+        if take_profit is not None and stop_loss is None:
+            return {
+                "success": False, "error_code": "INVALID_EXIT",
+                "message": "take_profit requires stop_loss too (they form a "
+                           "bracket order); there is no take-profit-only exit.",
+            }
+        if trailing_stop_pct is not None and (
+                stop_loss is not None or take_profit is not None):
+            return {
+                "success": False, "error_code": "INVALID_EXIT",
+                "message": "trailing_stop_pct is mutually exclusive with "
+                           "stop_loss/take_profit — pick one exit style.",
+            }
+
+        if not allow_duplicate:
+            try:
+                pending = await MMRHelpers.proposals()
+                rows = pending.get("data") or [] if isinstance(pending, dict) else []
+                sym_u = symbol.strip().upper()
+                act_u = action.strip().upper()
+                for row in rows:
+                    if (str(row.get("symbol", "")).strip().upper() == sym_u
+                            and str(row.get("action", "")).strip().upper() == act_u):
+                        return {
+                            "success": False,
+                            "error_code": "DUPLICATE_PENDING",
+                            "existing_proposal_id": row.get("id"),
+                            "message": (
+                                f"A PENDING {act_u} for {sym_u} already exists "
+                                f"(#{row.get('id')}). Evaluate and approve/reject "
+                                f"that one instead of re-proposing; pass "
+                                f"allow_duplicate=True only for a deliberate "
+                                f"second tranche."
+                            ),
+                        }
+            except Exception:
+                pass  # best-effort guard — never block creation on a read error
+
         args = ["propose", symbol, action]
         if market:
             args.append("--market")
@@ -2938,6 +3057,14 @@ class MMRHelpers:
             args.extend(["--exchange", exchange])
         if currency:
             args.extend(["--currency", currency])
+        if take_profit is not None and stop_loss is not None:
+            args.extend(["--bracket", str(take_profit), str(stop_loss)])
+        elif stop_loss is not None:
+            args.extend(["--stop-loss", str(stop_loss)])
+        if trailing_stop_pct is not None:
+            args.extend(["--trailing-stop-pct", str(trailing_stop_pct)])
+        if tif:
+            args.extend(["--tif", tif])
         if enrich_news:
             args.append("--enrich-news")
             args.extend(["--enrich-news-limit", str(enrich_news_limit)])
@@ -2988,29 +3115,60 @@ class MMRHelpers:
 
         Does NOT require trader_service.
 
+        Reading a proposal here also satisfies the ``proposal_show`` step of
+        the enforced evaluate-then-approve checklist for that proposal id.
+
         Example:
         result = await MMRHelpers.proposal_show(42)
         if result.get("status") == "FAILED":
             print("Reason:", result.get("rejection_reason"))
         """
-        return await _run_cli_json("proposals", "show", str(proposal_id))
+        result = await _run_cli_json("proposals", "show", str(proposal_id))
+        _record_proposal_shown(proposal_id)
+        return result
 
     @staticmethod
     async def approve(proposal_id: int) -> str:
         """
         Approve and execute a trade proposal. Requires trader_service.
 
-        **Paper:** allowed after careful evaluation (sizing, portfolio-risk,
-        quote/session). Decide approve **or** reject — never blind auto-approve.
+        **Paper:** allowed only after the evaluation checklist, which this
+        helper ENFORCES: ``proposal_show(id)`` for this proposal and a
+        successful ``portfolio_risk()`` must both have run within the last
+        15 minutes, or approve refuses client-side with
+        ``CHECKLIST_INCOMPLETE`` (no order is sent). Quote/session sanity is
+        enforced server-side (``QUOTE_STALE`` / ``PRICE_DRIFT_EXCEEDED`` /
+        ``ORDER_NOTIONAL_LIMIT``). Decide approve **or** reject — never
+        blind auto-approve. ``reject()`` is never gated.
 
         **Live:** refused — human must approve via Command Center live ceremony.
         The SDK returns ``LLM_LIVE_APPROVE_FORBIDDEN`` before placing an order.
 
+        Server refusals you may see (guardrails, not errors — do not retry
+        verbatim): ``QUOTE_STALE`` (wait for fresher data),
+        ``PRICE_DRIFT_EXCEEDED`` (reject + re-propose at current prices),
+        ``ORDER_NOTIONAL_LIMIT`` (re-propose smaller), ``RISK_REJECTED``
+        (reduce risk first), ``PROPOSAL_EXPIRED`` (re-propose if still valid).
+
         :param proposal_id: Proposal ID to approve
 
         Example:
-        result = await MMRHelpers.approve(42)
+        detail = await MMRHelpers.proposal_show(42)
+        risk = await MMRHelpers.portfolio_risk()
+        result = await MMRHelpers.approve(42)   # or reject(42, reason="…")
         """
+        gaps = _checklist_gaps(proposal_id)
+        if gaps:
+            steps = "\n".join(f"  {g}" for g in gaps)
+            return (
+                f"CHECKLIST_INCOMPLETE: approve #{proposal_id} refused "
+                f"client-side — no order was sent. The paper "
+                f"evaluate-then-approve policy requires fresh evaluation "
+                f"(within {int(_EVAL_WINDOW_S / 60)} minutes). Run:\n"
+                f"{steps}\n"
+                f"then approve again, or reject({proposal_id}, reason=...) "
+                f"if the thesis does not hold."
+            )
         # approve places a LIVE order. The CLI's own RPC timeout (~30s) handles a
         # slow trader_service by leaving the proposal APPROVED and printing an
         # UNKNOWN/reconcile message. Give the subprocess extra headroom beyond
@@ -3520,6 +3678,10 @@ class MMRHelpers:
         allocation vs budget, correlation clusters, warnings, and a plain-English
         summary. Returns JSON. Requires trader_service for portfolio data.
 
+        A successful call also satisfies the ``portfolio_risk`` step of the
+        enforced evaluate-then-approve checklist (a timed-out or errored call
+        does not count — a failed risk check is not a risk check).
+
         Example:
         report = await MMRHelpers.portfolio_risk()
         # report["data"]["hhi"] → 0.064
@@ -3527,7 +3689,11 @@ class MMRHelpers:
         # report["data"]["group_allocations"] → [{name, pct, budget_pct, over_budget}]
         # report["data"]["summary"] → "Portfolio has 17 positions..."
         """
-        return await _run_cli_json("portfolio-risk")
+        result = await _run_cli_json("portfolio-risk")
+        if isinstance(result, dict) and not result.get("error") \
+                and not result.get("timed_out"):
+            _record_risk_checked()
+        return result
 
     # ------------------------------------------------------------------
     # Position Groups

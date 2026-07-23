@@ -3,7 +3,7 @@ name: mmr-skill
 description: Operate the MMR algorithmic trading platform on Interactive Brokers. Trade stocks and options, manage portfolios, scan for ideas, create trade proposals with auto position sizing, manage universes, download historical data, analyze options chains, and control strategies. All operations are available via async Python helper methods.
 metadata:
   author: mmr
-  version: "2.0"
+  version: "2.2"
 ---
 
 # MMR Trading Skill
@@ -15,11 +15,18 @@ metadata:
 **NEVER BYPASS `propose → approve/reject` FOR ACTIONABLE TRADES.** Every new position (entry, add, rotation, cover) goes through this pipeline:
 
 1. `MMRHelpers.propose(symbol, action, ...)` — creates a reviewable plan
-2. **Evaluate** (required before decide):
-   - `proposal_show(N)` / `proposals show N` — sizing_result, reasoning, brackets
-   - `portfolio_risk()` / snapshot — concentration, group budget, remaining capacity
-   - Quote / session sanity (or document after-hours caveat)
+2. **Evaluate** (required before decide, and **mechanically enforced**):
+   - `proposal_show(N)` — sizing_result, reasoning, brackets
+   - `portfolio_risk()` — concentration, group budget, remaining capacity
+   - Quote / session sanity is enforced **server-side** at approve time
+     (`QUOTE_STALE`, `PRICE_DRIFT_EXCEEDED`, `ORDER_NOTIONAL_LIMIT`)
 3. Then **either** `approve(proposal_id)` **or** `reject(proposal_id, reason=...)` with a short written reason
+
+**The checklist is enforced, not advisory:** `approve()` refuses client-side
+with `CHECKLIST_INCOMPLETE` (no order is sent) unless `proposal_show(N)` for
+that proposal **and** a successful `portfolio_risk()` both ran within the last
+15 minutes. There is no override — run the two calls, then decide.
+`reject()` is never gated.
 
 ### Paper vs live
 
@@ -29,6 +36,33 @@ metadata:
 | **Live** | **Human only** via Command Center live ceremony. SDK/LLM `approve` is refused (`LLM_LIVE_APPROVE_FORBIDDEN`). You may still `reject` PENDING proposals. Propose + review only — stop before the wire. |
 
 Blind `auto_approve` is forbidden. Do not approve without completing the evaluation checklist.
+
+### Server guardrails — refusal codes are rules, not errors
+
+Paper approvals still pass hard server-side limits. Never retry a refusal
+verbatim; each code tells you what to change:
+
+| Code | Meaning | What to do |
+|------|---------|------------|
+| `SIZING_BLOCKED` | Auto-sizing not configured on the command path | Re-propose with explicit `amount=` |
+| `DUPLICATE_PENDING` | Same symbol+action already PENDING (helper-enforced for LLM sources; server-enforced for `strategy:`) | Decide the existing proposal instead |
+| `QUOTE_STALE` | Freshest quote too old to trade on (paper bound configurable, default 30 min) | Wait for live data / market hours |
+| `PRICE_DRIFT_EXCEEDED` | Price moved too far from the proposal's reference | Reject; re-propose at current price if the thesis holds |
+| `ORDER_NOTIONAL_LIMIT` | Order exceeds `command_authority.max_order_notional` (default $25k) | Re-propose smaller |
+| `NO_LONG_TO_CLOSE` | Strategy SELL while flat — dropped by design | Nothing; working as intended |
+| `RISK_REJECTED` | Portfolio limit breached (daily loss, open orders, …) | Reduce risk before adding |
+| `PROPOSAL_EXPIRED` | Sat unapproved past ~30 min | Re-propose if still valid |
+| `CHECKLIST_INCOMPLETE` | Client-side: evaluation not done or stale | Run the listed steps, then decide |
+| `LLM_LIVE_APPROVE_FORBIDDEN` | Non-human approve on a live account | Stop — a human approves on live |
+
+If `approve()` returns **UNKNOWN/timed-out**, the order MAY be live at the
+broker: do NOT re-approve — reconcile with `orders()` / `portfolio()` and
+`proposal_show(N)` first.
+
+**Unattended paper entries should carry protection:** prefer
+`propose(..., trailing_stop_pct=2.0, tif="GTC")` (or `stop_loss=`/
+`take_profit=` for a bracket) so a filled entry is never left unguarded
+between loop cycles.
 
 **Do NOT use `MMRHelpers.buy()` / `MMRHelpers.sell()` / `MMRHelpers.cli("buy ...")` to open or modify positions based on your own judgment.** Those exist for two narrow cases only:
 - Manual human-driven single-trade CLI usage (you're not human)
@@ -231,14 +265,25 @@ Trade proposals are stored locally and auto-sized based on confidence, ATR volat
 
 | Method | Service? | Description |
 |--------|----------|-------------|
-| `MMRHelpers.propose(symbol, action, confidence=, reasoning=, group=, ...)` | No* | Create proposal with auto position sizing |
+| `MMRHelpers.propose(symbol, action, confidence=, reasoning=, group=, stop_loss=, take_profit=, trailing_stop_pct=, tif=, allow_duplicate=, ...)` | No* | Create proposal with auto position sizing, optional protective exits, and a PENDING-duplicate guard |
 | `MMRHelpers.proposals(status=, all_statuses=)` | No | List proposals |
-| `MMRHelpers.approve(proposal_id)` | **Yes** | Execute a proposal |
-| `MMRHelpers.reject(proposal_id, reason=)` | No | Reject a proposal |
+| `MMRHelpers.approve(proposal_id)` | **Yes** | Execute a proposal — enforces the evaluation checklist (`CHECKLIST_INCOMPLETE` otherwise) |
+| `MMRHelpers.reject(proposal_id, reason=)` | No | Reject a proposal (never gated) |
 | `MMRHelpers.session_status()` | No | Full sizing config + portfolio state + capacity (JSON) |
 | `MMRHelpers.session_limits()` | No | View position sizing hard limits |
 
-*Auto-sizing requires trader_service for snapshot/ATR data; gracefully degrades without it.
+*Auto-sizing requires trader_service for snapshot/ATR data; gracefully degrades without it. On the typed command path auto-sizing may be disabled — a `SIZING_BLOCKED` refusal means re-propose with an explicit `amount=`.
+
+**Protective exits on propose**: `stop_loss=` alone attaches a stop;
+`stop_loss=` + `take_profit=` become a bracket; `trailing_stop_pct=` attaches
+a trailing stop (exclusive with the fixed exits); `tif="GTC"` keeps protection
+alive beyond the session. `take_profit` alone or trailing+fixed combinations
+are refused with `INVALID_EXIT` before any CLI call.
+
+**Duplicate guard on propose**: an existing PENDING proposal for the same
+symbol+action refuses with `DUPLICATE_PENDING` (decide the existing one
+instead); `allow_duplicate=True` bypasses for a deliberate second tranche.
+The check fails open if the pending list is unreadable.
 
 **Sizing pipeline**: `base_position × risk_multiplier × confidence_scale × volatility_adjustment`. With `base_position_pct=0.02` and a $1M account, base is $20K. Volatile stocks (high ATR%) get smaller positions; stable stocks get larger ones. The `sizing_result` in proposal metadata shows the full reasoning chain.
 
@@ -547,13 +592,17 @@ result = await MMRHelpers.ideas("momentum", location="STK.AU.ASX", tickers=["BHP
 for idea in result["data"]:
     print(f'{idea["ticker"]}: {idea["change_pct"]:+.2f}% score={idea["score"]}')
 
-# Create a proposal with auto position sizing
+# Create a proposal with auto position sizing and a protective trailing stop
 result = await MMRHelpers.propose("AAPL", "BUY", confidence=0.7,
-    reasoning="Breakout above 200-day MA on high volume")
+    reasoning="Breakout above 200-day MA on high volume",
+    trailing_stop_pct=2.0, tif="GTC")
 emit(result)
 
-# Approve a proposal (executes the trade)
-result = await MMRHelpers.approve(42)
+# Evaluate, then approve (the checklist is enforced — approve refuses
+# CHECKLIST_INCOMPLETE without these two fresh calls)
+detail = await MMRHelpers.proposal_show(42)
+risk = await MMRHelpers.portfolio_risk()
+result = await MMRHelpers.approve(42)   # or reject(42, reason="…")
 emit(result)
 ```
 
@@ -574,17 +623,21 @@ risk = await MMRHelpers.portfolio_risk()       # HHI, group budgets, warnings
 session = await MMRHelpers.session_status()    # remaining capacity
 ideas = await MMRHelpers.ideas("momentum", num=10)  # JSON dict
 
-# 3. PROPOSE — auto-sized, group-tagged, never auto-executes
+# 3. PROPOSE — auto-sized, group-tagged, protected, never auto-executes
 result = await MMRHelpers.propose("AAPL", "BUY", confidence=0.8,
     reasoning="Strong momentum, RSI 65, above 200-day MA",
-    group="tech", source="llm")
+    group="tech", source="llm", trailing_stop_pct=2.0, tif="GTC")
 # result["data"]["sizing_result"]["reasoning"] shows full ATR pipeline
 # result["data"]["proposal_id"] → 42
+# A PENDING duplicate for the same symbol+side refuses DUPLICATE_PENDING.
 
-# 4. REVIEW — check risk before approving
+# 4. EVALUATE → DECIDE — enforced checklist, then approve or reject
+detail = await MMRHelpers.proposal_show(42)
 risk = await MMRHelpers.portfolio_risk()
 if not risk["data"]["warnings"]:
     result = await MMRHelpers.approve(42)
+else:
+    result = await MMRHelpers.reject(42, reason="risk warnings present")
 ```
 
 Key for loop efficiency: `portfolio_snapshot()` and `portfolio_diff()` return small JSON (~500 tokens) vs `portfolio()` (~1000 tokens JSON). Use snapshot/diff for every cycle, full portfolio only when investigating.

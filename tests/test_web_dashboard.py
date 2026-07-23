@@ -363,7 +363,7 @@ class TestTabs:
         assert 'id="dash-guide"' in html
         assert 'guide-wrap' in html
         assert 'class="info"' in html  # hover info bubbles on Guide tab
-        assert 'Manual buy on paper' in html
+        assert 'your first paper trade' in html
 
     def test_legacy_setup_hashes_map_to_new_tabs(self, client):
         html = client.get('/cc').text
@@ -931,7 +931,7 @@ class TestManagePage:
             monkeypatch.setattr(webapp, name, _boom)
         html = client.get('/cc').text
         assert 'Available strategies' in html
-        assert 'Watchlists' in html
+        assert 'Portfolios' in html
         assert 'data-dash-tab="deploy"' in html
         assert 'data-dash-tab="watchlists"' in html
 

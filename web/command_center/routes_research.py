@@ -247,4 +247,70 @@ def create_research_router(
             },
         ))
 
+    @router.get("/options/expirations")
+    async def options_expirations(
+        request: Request,
+        symbol: str = Query(min_length=1, max_length=32,
+                            pattern=r"^[A-Za-z][A-Za-z0-9.\-]*$"),
+        _session: str = Depends(require_session),
+    ):
+        reject_unknown(request, {"symbol"})
+        return await run(lambda: service.run(
+            "options_expirations",
+            lambda provider: provider.options_expirations(symbol),
+            log_params={"symbol": symbol.upper()}))
+
+    @router.get("/options/chain")
+    async def options_chain(
+        request: Request,
+        symbol: str = Query(min_length=1, max_length=32,
+                            pattern=r"^[A-Za-z][A-Za-z0-9.\-]*$"),
+        expiration: str = Query("", pattern=r"^(\d{4}-\d{2}-\d{2})?$"),
+        type: Literal["call", "put"] | None = None,
+        strike_min: float | None = Query(None, gt=0),
+        strike_max: float | None = Query(None, gt=0),
+        _session: str = Depends(require_session),
+    ):
+        reject_unknown(request, {"symbol", "expiration", "type",
+                                 "strike_min", "strike_max"})
+        if (strike_min is not None and strike_max is not None
+                and strike_max < strike_min):
+            raise validation_error("strike_max",
+                                   "strike_max must be >= strike_min", strike_max)
+        return await run(lambda: service.run(
+            "options_chain",
+            lambda provider: provider.options_chain(
+                symbol, expiration=expiration or None, contract_type=type,
+                strike_min=strike_min, strike_max=strike_max),
+            log_params={"symbol": symbol.upper(), "expiration": expiration,
+                        "type": type, "strike_min": strike_min,
+                        "strike_max": strike_max}))
+
+    @router.get("/options/snapshot")
+    async def options_contract_snapshot(
+        request: Request,
+        option_ticker: str = Query(min_length=3, max_length=40,
+                                   pattern=r"^O:[A-Z0-9]+$"),
+        _session: str = Depends(require_session),
+    ):
+        reject_unknown(request, {"option_ticker"})
+        return await run(lambda: service.run(
+            "options_snapshot",
+            lambda provider: provider.options_snapshot(option_ticker),
+            log_params={"option_ticker": option_ticker}))
+
+    @router.get("/options/implied")
+    async def options_implied(
+        request: Request,
+        symbol: str = Query(min_length=1, max_length=32,
+                            pattern=r"^[A-Za-z][A-Za-z0-9.\-]*$"),
+        expiration: str = Query(pattern=r"^\d{4}-\d{2}-\d{2}$"),
+        _session: str = Depends(require_session),
+    ):
+        reject_unknown(request, {"symbol", "expiration"})
+        return await run(lambda: service.run(
+            "options_implied",
+            lambda provider: provider.options_implied(symbol, expiration=expiration),
+            log_params={"symbol": symbol.upper(), "expiration": expiration}))
+
     return router

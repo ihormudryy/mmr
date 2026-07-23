@@ -66,6 +66,26 @@ class FakeResearchProvider:
     def presets(self) -> ResearchResult:
         return ResearchResult([], "Presets", provider="local")
 
+    def options_expirations(self, symbol):
+        self.calls.append(("options_expirations", {"symbol": symbol}))
+        return ResearchResult([{"expiration": "2026-03-20", "dte": 240}],
+                              f"Options expirations: {symbol}")
+
+    def options_chain(self, symbol, *, expiration, contract_type, strike_min, strike_max):
+        self.calls.append(("options_chain", {"symbol": symbol, "expiration": expiration}))
+        return ResearchResult([{"ticker": "O:AAPL260320C00250000", "strike": 250.0}],
+                              f"Options chain: {symbol}")
+
+    def options_snapshot(self, option_ticker):
+        self.calls.append(("options_snapshot", {"option_ticker": option_ticker}))
+        return ResearchResult({"ticker": option_ticker, "strike": 250.0},
+                              f"Option: {option_ticker}")
+
+    def options_implied(self, symbol, *, expiration, risk_free_rate=0.05):
+        self.calls.append(("options_implied", {"symbol": symbol, "expiration": expiration}))
+        return ResearchResult({"x": [1], "market_implied": [0.5], "constant": [0.5]},
+                              f"Implied distribution: {symbol}")
+
 
 class RecordingResearchService(ResearchService):
     def __init__(self, provider: FakeResearchProvider) -> None:
@@ -770,3 +790,39 @@ async def test_saturated_research_pool_does_not_block_trading_sse(
             isinstance(result, httpx.Response) and result.status_code == 200
             for result in scan_results
         )
+
+
+def test_options_chain_success(logged_in_research_client):
+    r = logged_in_research_client.get(
+        "/api/research/options/chain?symbol=AAPL&expiration=2026-03-20&type=call")
+    assert r.status_code == 200
+    body = r.json()
+    assert body["meta"]["tool"] == "options_chain"
+    assert body["data"][0]["ticker"] == "O:AAPL260320C00250000"
+
+
+def test_options_routes_require_session(app_with_research):
+    client = TestClient(app_with_research)
+    for path in ("options/expirations?symbol=AAPL",
+                 "options/chain?symbol=AAPL",
+                 "options/snapshot?option_ticker=O:AAPL260320C00250000",
+                 "options/implied?symbol=AAPL&expiration=2026-03-20"):
+        assert client.get(f"/api/research/{path}").status_code == 401
+
+
+def test_options_chain_rejects_bad_type_and_strike_order(logged_in_research_client):
+    assert logged_in_research_client.get(
+        "/api/research/options/chain?symbol=AAPL&type=long").status_code == 422
+    assert logged_in_research_client.get(
+        "/api/research/options/chain?symbol=AAPL&strike_min=300&strike_max=100"
+    ).status_code == 422
+
+
+def test_options_chain_rejects_unknown_param(logged_in_research_client):
+    r = logged_in_research_client.get("/api/research/options/chain?symbol=AAPL&foo=1")
+    assert r.status_code == 422
+
+
+def test_options_implied_requires_expiration(logged_in_research_client):
+    assert logged_in_research_client.get(
+        "/api/research/options/implied?symbol=AAPL").status_code == 422

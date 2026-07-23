@@ -119,8 +119,10 @@ def test_resolve_then_propose_and_reject_via_command_api(
     proposal_id = (command.get("outcome") or {}).get("id")
     assert proposal_id is not None, f"create proposal has no outcome: {command}"
     proposal = typed_rpc.query.call("get_proposal", {"proposal_id": proposal_id}, dict)
-    assert e2e_id in proposal.get("group", "")
-    assert e2e_id in proposal.get("reasoning", "")
+    metadata = proposal.get("metadata") or {}
+    group = proposal.get("group") or metadata.get("group") or ""
+    assert e2e_id in group, f"proposal missing e2e group tag: {proposal}"
+    assert e2e_id in proposal.get("reasoning", ""), f"proposal missing e2e reasoning: {proposal}"
 
     rejected = dashboard_client.post(
         f"/api/commands/proposals/{proposal_id}/reject",

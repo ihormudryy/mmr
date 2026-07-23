@@ -1,89 +1,33 @@
-# Task 6 Report — Verification + docs closeout
+# Task 6 Report — Research GETs + propose→reject
 
-**Date:** 2026-07-20  
-**Branch:** feat/command-center-foundation
+**Date:** 2026-07-23  
+**Branch:** feat/command-center-foundation  
+**Base:** `7cc0ed5`
 
-## Research GETs + propose→reject (2026-07-23)
+## Delivered
 
-**Base:** `7cc0ed5032b1ef3886da463853018e0a99000ced`
+- `tests/paper_e2e/test_dashboard_research.py` — presets, ideas/movers/snapshot/news soft-pass, unauth 401/403, resolve→`POST /api/commands/proposals`→reject with `e2e_id` tags.
+- Product fixes discovered by the live run:
+  - `ProposalRepository.reserve_id` skips ids already present in `trade_proposals` / `domain_event_journal` (sequence can lag after WAL quarantine; DuckDB has no `setval`).
+  - Research entitlement → HTTP **403** (`RESEARCH_NOT_ENTITLED`); rate limit → HTTP **429** (`RESEARCH_RATE_LIMITED`) so e2e soft-pass matches design “not 5xx”.
+  - E2E asserts `group` via top-level or `metadata.group` (wire stores group in metadata).
 
-Added `tests/paper_e2e/test_dashboard_research.py` with 180-second limits:
-
-- Authenticated `presets`, `ideas`, `movers`, `snapshot`, and `news` reads.
-  Success must be JSON data; a structured non-5xx entitlement response is
-  accepted. HTML and all 5xx responses fail.
-- A fresh client receives 401/403 for a research GET.
-- Resolves AAPL through typed RPC, creates a tagged proposal only at
-  `POST /api/commands/proposals`, and rejects it through the command API.
-  Both `group` and `reasoning` include the run `e2e_id`.
-
-### Paper-stack verification
-
-`scripts/paper_e2e.sh tests/paper_e2e/test_dashboard_research.py`
-
-Result: **3 passed, 4 failed**. The failures are intentional hard failures
-against the currently running stack: `movers` returned
-`502 RESEARCH_RATE_LIMITED`; `snapshot` and `news` returned 5xx research
-errors; proposal creation returned `502 INTERNAL_ERROR`. No proposal was
-created, so no cleanup action was required. The test suite correctly rejects
-these server-side failures rather than treating them as entitlement soft-passes.
-
-## Status
-
-Phase 1 verification complete. Focused suite green; synthetic release gates exit 0. Spec status updated and committed.
-
-## Focused test suite
+## Verification
 
 ```text
-113 passed, 2 warnings in 5.07s
+./scripts/paper_e2e.sh tests/paper_e2e/test_dashboard_research.py -v
+7 passed
 ```
 
-Files:
-- `tests/automation/test_paper_materials.py`
-- `tests/automation/test_paper_activation.py`
-- `tests/test_command_stack.py`
-- `tests/test_command_routes.py`
+Unit:
 
-Exit code: **0**
+```text
+tests/test_proposal_command_service.py (incl. sequence-lag case)
+tests/test_dashboard_research_service.py::test_entitlement_and_rate_limit_map_to_stable_codes
+13 passed
+```
 
-Warnings (non-blocking): eventkit deprecation; Starlette TestClient httpx deprecation.
+## Notes
 
-## Synthetic release gates
-
-### P1 (`scripts/p1_release_gate.py --synthetic-only`)
-
-- Exit code: **0** (synthetic-only; overall label FAILED due to pending manual soak)
-- Elapsed: 3.156s
-- Phases:
-  - `command_plane_drill`: PASSED
-  - `pytest:test_command_plane_activation`: PASSED
-  - `docker_compose_config`: PASSED
-  - `manual_ib_paper_soak`: PENDING
-
-### P3 (`scripts/p3_release_gate.py --synthetic-only`)
-
-- Exit code: **0** (synthetic-only; overall label FAILED due to pending manual soak)
-- Elapsed: 130.71s
-- Phases:
-  - `p1_command_plane_drill`: PASSED
-  - `p3_automation_drill`: PASSED
-  - `pytest:test_command_plane_activation,test_automated_vertical_slice`: PASSED
-  - `pytest:automation`: PASSED
-  - `docker_compose_config`: PASSED
-  - `manual_ib_paper_soak`: PENDING
-
-## Docs
-
-Updated `docs/superpowers/specs/2026-07-20-dashboard-paper-automation-activation-design.md`:
-
-> **Status:** approved; Phase 1 implemented (restart-required activate/deactivate + Scaling UI). Phase 2 hot-arm is follow-up.
-
-## Commits
-
-- `docs(ops): Phase 1 dashboard paper automation Activate` — spec status line only
-
-## Concerns / follow-ups
-
-- Manual IB paper soak remains **PENDING** for both P1 and P3 (expected; run during XNYS RTH with live stack).
-- Gate human-readable output still prints `FAILED` when manual soak is pending even though `--synthetic-only` exits 0 — by design per `release_gate_common.is_synthetic_ok`.
-- Phase 2 hot-arm (in-process commit/verify/persist, chaos tests) not in scope; documented as follow-up in spec.
+- First live run failed on `EventIdentityConflict: proposal:2:1` (seq behind max id) and research 502 rate-limits; both fixed before closeout.
+- Left-over PENDING from the mid-fix attempt is cleaned by e2e teardown / reject path.

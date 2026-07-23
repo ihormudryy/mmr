@@ -182,6 +182,73 @@ class TestSnapshotAsync:
         assert asyncio.iscoroutine(coro)
         await coro
 
+    def test_delayed_subscribe_does_not_reset_to_live_before_ticks(self):
+        """Delayed snapshots must stay on type 3 until the wait finishes.
+
+        Flipping back to live immediately after reqMktData races IB and
+        surfaces 10089 even when delayed data is available.
+        """
+        from reactivex.subject import Subject
+
+        ibrx = _make_ibrx()
+        ibrx.ib.client = MagicMock(_reqIdSeq=42)
+        ibrx.ib.reqMktData = MagicMock(return_value=Ticker())
+        ibrx._contracts_source = MagicMock()
+        ibrx._contracts_source.call_event_subscriber_sync = MagicMock(
+            side_effect=lambda fn, asend_result=False: fn()
+        )
+        ibrx.contracts_subject = Subject()
+        ibrx.error_subject = Subject()
+        ibrx.error_disposables = {}
+        ibrx._filter_contract = lambda contract, ticker: True
+
+        md_types: list[int] = []
+        ibrx.ib.reqMarketDataType = MagicMock(side_effect=md_types.append)
+
+        ibrx._IBAIORx__subscribe_contract(
+            _make_contract(), one_time_snapshot=True, delayed=True
+        )
+
+        assert md_types == [3], (
+            f"delayed subscribe flipped market-data type mid-request: {md_types}"
+        )
+        assert ibrx.ib.reqMktData.called
+
+    @pytest.mark.asyncio
+    async def test_delayed_snapshot_restores_live_mode_after_wait(self):
+        """After a delayed snapshot wait, restore type 1 for streaming callers."""
+        from reactivex.subject import Subject
+
+        ibrx = _make_ibrx()
+        md_types: list[int] = []
+        ibrx.ib.reqMarketDataType = MagicMock(side_effect=md_types.append)
+
+        ticker = Ticker()
+        ticker.bid = 210.0
+        ticker.ask = 210.1
+        ticker.last = 210.05
+        push = Subject()
+
+        def _subscribe_contract(**kwargs):
+            assert kwargs.get("delayed") is True
+            ibrx.ib.reqMarketDataType(3)
+            return push
+
+        ibrx._IBAIORx__subscribe_contract = _subscribe_contract
+
+        async def _run():
+            task = asyncio.create_task(
+                ibrx.get_snapshot(_make_contract(), delayed=True)
+            )
+            await asyncio.sleep(0)
+            push.on_next(ticker)
+            return await task
+
+        result = await _run()
+        assert result.bid == 210.0
+        assert 1 in md_types
+        assert md_types[-1] == 1
+
 
 # ---------------------------------------------------------------------------
 # get_snapshots_batch — sequential but non-blocking

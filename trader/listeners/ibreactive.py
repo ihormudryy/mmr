@@ -487,6 +487,10 @@ class IBAIORx():
             # 2 = Frozen
             # 3 = Delayed
             # 4 = Delayed frozen
+            # Keep delayed mode for the life of this request. Flipping back to
+            # live (type 1) immediately after reqMktData races IB and makes
+            # delayed snapshots fail with 10089 even when delayed data is
+            # available ("Delayed market data is available" in the error text).
             logging.debug('reqMarketDataType(3)')
             self.ib.reqMarketDataType(3)
 
@@ -503,10 +507,6 @@ class IBAIORx():
             ),
             asend_result=False
         )
-
-        if delayed:
-            self.ib.reqMarketDataType(1)
-            logging.debug('reqMarketDataType(1)')
 
         def filter_reqid(error: IBAIORxError):
             return error.reqId == reqId
@@ -531,6 +531,9 @@ class IBAIORx():
             # 2 = Frozen
             # 3 = Delayed
             # 4 = Delayed frozen
+            # Keep delayed mode until the caller finishes consuming ticks.
+            # Resetting to live here races IB and surfaces 10089 on accounts
+            # that only have delayed API market data.
             logging.debug('reqMarketDataType(3)')
             self.ib.reqMarketDataType(3)
 
@@ -546,10 +549,6 @@ class IBAIORx():
             ),
             asend_result=False
         )
-
-        if delayed:
-            self.ib.reqMarketDataType(1)
-            logging.debug('reqMarketDataType(1)')
 
         def filter_contract(ticker):
             return self._filter_contract(contract, ticker)
@@ -736,14 +735,22 @@ class IBAIORx():
                 return existing
 
         # Explicitly force live market data mode (type 1) before every
-        # snapshot request. We've observed sessions get stuck in a state
-        # where reqMktData silently delivers no ticks — a stale
+        # *live* snapshot request. We've observed sessions get stuck in a
+        # state where reqMktData silently delivers no ticks — a stale
         # market-data-type setting from a prior delayed/frozen request
         # on the same connection appears to be the cause. Calling
         # reqMarketDataType(1) every time is cheap and idempotent.
+        # Delayed callers must leave type 3 in place for the whole wait;
+        # restoring live too early is what made delayed fallbacks fail
+        # with 10089 despite "Delayed market data is available".
         if not delayed:
             try:
                 self.ib.reqMarketDataType(1)
+            except Exception:
+                pass
+        else:
+            try:
+                self.ib.reqMarketDataType(3)
             except Exception:
                 pass
 
@@ -832,34 +839,44 @@ class IBAIORx():
         #   Phase 3 — if even the first event never arrives, raise so the
         #             caller sees a clear error instead of a silent hang.
         try:
-            await asyncio.wait_for(_complete_event.wait(), timeout=PARTIAL_WAIT)
-        except asyncio.TimeoutError:
-            # Didn't get the full bid/ask/last triple in time; accept
-            # whatever we have if at least one tick arrived.
-            remaining = max(0.5, wait_timeout - PARTIAL_WAIT)
             try:
-                await asyncio.wait_for(_first_event.wait(), timeout=remaining)
+                await asyncio.wait_for(_complete_event.wait(), timeout=PARTIAL_WAIT)
             except asyncio.TimeoutError:
-                subscription.dispose()
+                # Didn't get the full bid/ask/last triple in time; accept
+                # whatever we have if at least one tick arrived.
+                remaining = max(0.5, wait_timeout - PARTIAL_WAIT)
                 try:
-                    self.ib.cancelMktData(contract)
+                    await asyncio.wait_for(_first_event.wait(), timeout=remaining)
+                except asyncio.TimeoutError:
+                    subscription.dispose()
+                    try:
+                        self.ib.cancelMktData(contract)
+                    except Exception:
+                        pass
+                    sym = getattr(contract, 'symbol', '?')
+                    cid = getattr(contract, 'conId', '?')
+                    raise TimeoutError(
+                        f'No market data received for {sym} (conId={cid}) within {wait_timeout}s. '
+                        f'Check: (1) IB market-data subscription enabled for this exchange, '
+                        f'(2) symbol qualifies on the chosen exchange, '
+                        f'(3) market is open or pass delayed=True for frozen data.'
+                    )
+            observer.on_completed()
+            subscription.dispose()
+            await asyncio.sleep(0.1)
+            if thrown_exception is not None:
+                ex = cast(Exception, thrown_exception)
+                raise ex
+            return cast(Ticker, populated_ticker)
+        finally:
+            # Snapshot callers leave the shared IB connection in live mode
+            # afterwards so streaming subscribers aren't stuck on delayed.
+            if delayed:
+                try:
+                    self.ib.reqMarketDataType(1)
+                    logging.debug('reqMarketDataType(1) restored after delayed snapshot')
                 except Exception:
                     pass
-                sym = getattr(contract, 'symbol', '?')
-                cid = getattr(contract, 'conId', '?')
-                raise TimeoutError(
-                    f'No market data received for {sym} (conId={cid}) within {wait_timeout}s. '
-                    f'Check: (1) IB market-data subscription enabled for this exchange, '
-                    f'(2) symbol qualifies on the chosen exchange, '
-                    f'(3) market is open or pass delayed=True for frozen data.'
-                )
-        observer.on_completed()
-        subscription.dispose()
-        await asyncio.sleep(0.1)
-        if thrown_exception is not None:
-            ex = cast(Exception, thrown_exception)
-            raise ex
-        return cast(Ticker, populated_ticker)
 
     async def get_shortable_shares(
         self,

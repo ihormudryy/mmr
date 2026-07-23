@@ -328,11 +328,23 @@
     </div>`;
   }
 
-  function fieldListMarkup(entries) {
+  function metricEntriesMarkup(entries) {
     if (!entries.length) return '';
-    return `<dl class="research-fields">${entries.map(([key, value]) =>
-      `<dt>${esc(labelize(key))}</dt><dd>${esc(formatFieldValue(key, value))}</dd>`
-    ).join('')}</dl>`;
+    const cells = entries.map(([key, value]) => {
+      const lower = String(key).toLowerCase();
+      const signed = lower.includes('change') || lower.includes('pnl')
+        || lower.includes('return')
+        ? signedClass(value)
+        : '';
+      return metricCell(labelize(key), formatFieldValue(key, value), signed);
+    }).join('');
+    return `<div class="research-metrics">${cells}</div>`;
+  }
+
+  function fieldListMarkup(entries) {
+    // Prefer metric cells for scalar fields so Session / leftovers match
+    // headline Price/Change and Ratios (bordered panel cells, not plain dl text).
+    return metricEntriesMarkup(entries);
   }
 
   function nestedObjectMarkup(title, data) {
@@ -343,38 +355,39 @@
     if (!entries.length) return '';
     return `<section class="research-section">
       <h4>${esc(title)}</h4>
-      ${fieldListMarkup(entries)}
+      ${metricEntriesMarkup(entries)}
     </section>`;
   }
 
   function detailsMarkup(details) {
     if (!hasEntries(details)) return '';
     const cap = details.market_cap != null
-      ? `<p class="research-company-cap">Market cap ${esc(formatMoney(details.market_cap))}</p>`
+      ? metricCell('Market cap', formatMoney(details.market_cap))
       : '';
     const description = details.description
       ? `<p class="research-company-desc">${esc(details.description)}</p>`
       : '';
-    const rest = Object.entries(details).filter(([key]) =>
-      !['name', 'market_cap', 'description'].includes(key));
+    const rest = Object.entries(details).filter(([key, value]) =>
+      !['name', 'market_cap', 'description'].includes(key)
+      && value !== null && value !== undefined && value !== ''
+      && !isPlainObject(value) && !Array.isArray(value));
     if (!cap && !description && !rest.length) return '';
     return `<section class="research-section" data-research-details>
       <h4>Company</h4>
-      ${cap}${description}
-      ${fieldListMarkup(rest)}
+      ${cap || rest.length ? `<div class="research-metrics">${cap}${rest.map(([key, value]) =>
+        metricCell(labelize(key), formatFieldValue(key, value))).join('')}</div>` : ''}
+      ${description}
     </section>`;
   }
 
   function ratiosMarkup(ratios) {
     if (!hasEntries(ratios)) return '';
-    const cells = Object.entries(ratios)
-      .filter(([, value]) => value !== null && value !== undefined && value !== '')
-      .map(([key, value]) => metricCell(labelize(key), formatFieldValue(key, value)))
-      .join('');
-    if (!cells) return '';
+    const entries = Object.entries(ratios)
+      .filter(([, value]) => value !== null && value !== undefined && value !== '');
+    if (!entries.length) return '';
     return `<section class="research-section" data-research-ratios>
       <h4>Ratios</h4>
-      <div class="research-metrics">${cells}</div>
+      ${metricEntriesMarkup(entries)}
     </section>`;
   }
 

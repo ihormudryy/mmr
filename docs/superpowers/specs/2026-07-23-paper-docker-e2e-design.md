@@ -61,18 +61,25 @@ Probes in order; any hard failure → `pytest.skip(reason)`:
 2. Typed `get_status` via SDK/HMAC.
 3. Assert paper / non-live trading mode (from status or config).
 4. Assert `ib_upstream_connected` is true (else skip with IB/VNC hint).
-5. **Capability probe** — attempt cheap typed queries/commands that Layer B/C need; record a `capabilities` frozenset on the fixture. If a service is unwired, tests that need it **skip** with `COMMAND_NOT_FOUND` / missing capability — they must not fail red.
+5. **Capability probe** — attempt cheap typed queries/commands that Layer B/C need; record a `capabilities` frozenset on the fixture. If a service is unwired, the method string is simply never registered: `registry.resolve()` returns `None` and the typed RPC layer raises **`METHOD_NOT_ALLOWED`** (`typed_rpc.py` authenticate → resolve → validate → run). Tests that need a missing capability **skip** on that code — they must not fail red.
+
+   Do **not** key the probe off `COMMAND_NOT_FOUND`: that is a handler-level code from the already-registered `get_command` path when a receipt id is missing (same family as `PROPOSAL_NOT_FOUND`). Catching it would miss the unwired case and leave tests red — the opposite of this gate.
+
+   Side-effect-free command probe: call with deliberately invalid / non-existent ids or empty body and branch on the error code:
+
+   - `METHOD_NOT_ALLOWED` → method unregistered → capability **absent** → skip
+   - `VALIDATION_ERROR` / `PROPOSAL_NOT_FOUND` / `COMMAND_NOT_FOUND` (or a successful query) → method **is** registered (capability present); the handler only rejected harmless args and did not execute the real action
 
 Capability keys (exact typed method ids):
 
 | Capability | Probe / evidence |
 |------------|------------------|
 | `trading_control` | `get_trading_control` succeeds |
-| `proposals` | `list_proposals` succeeds; mutations need `create_proposal` / `reject_proposal` registered |
-| `approval` | `approve_proposal` registered (only required under live-orders) |
-| `strategy_control` | `enable_strategy` registered (or a no-op probe that distinguishes NOT_FOUND) |
-| `allocation` | `activate_allocation` / `suspend_allocation` registered |
-| `paper_automation` | `get_paper_automation_status` succeeds; activate/deactivate only under live-orders |
+| `proposals` | `list_proposals` succeeds; mutations: probe `create_proposal` / `reject_proposal` with harmless args — anything other than `METHOD_NOT_ALLOWED` means registered |
+| `approval` | `approve_proposal` registered (live-orders only); probe with non-existent id — `PROPOSAL_NOT_FOUND`/`VALIDATION_ERROR` = present; `METHOD_NOT_ALLOWED` = absent |
+| `strategy_control` | probe `enable_strategy` with harmless args — not `METHOD_NOT_ALLOWED` = registered |
+| `allocation` | probe `activate_allocation` / `suspend_allocation` same way |
+| `paper_automation` | `get_paper_automation_status` succeeds; activate/deactivate probed under live-orders only |
 
 Missing HMAC key, connection refused, or upstream down → **skip**, never red on a laptop without Docker.
 
@@ -238,7 +245,7 @@ Tests that omit auth must expect 401/403.
 
 - IB pacing / market-data gaps: retry once with backoff on resolve/snapshot; then **skip** with explicit reason — do not silent-pass or hang past the per-test timeout.
 - Entitlement-limited research: soft assert.
-- Unwired command services: **skip** via capability probe, not `COMMAND_NOT_FOUND` fail.
+- Unwired command services: **skip** via capability probe on `METHOD_NOT_ALLOWED`, not a red fail.
 - Never leave armed paper automation, active allocation, or **open e2e paper positions** without teardown best-effort.
 
 ## Success criteria

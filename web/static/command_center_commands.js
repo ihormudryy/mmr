@@ -887,14 +887,85 @@ function ccPositionForClose(position) {
 
 /* ---- Strategy params drawer open (Apply/Cancel wiring is below, guarded
  * with the rest of the cc-* static elements) ---- */
-function ccOpenStrategyParamsDrawer(strategy) {
+function ccEscAttr(value) {
+  return String(value ?? '')
+    .replace(/&/g, '&amp;')
+    .replace(/"/g, '&quot;')
+    .replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;');
+}
+
+function ccRenderStrategyParamsForm(form, {params, tunables}) {
+  const current = (params && typeof params === 'object') ? params : {};
+  const defaults = (tunables && typeof tunables === 'object') ? tunables : {};
+  const keys = [...new Set([...Object.keys(defaults), ...Object.keys(current)])]
+    .filter((k) => k && !String(k).startsWith('_'))
+    .sort();
+  if (!keys.length) {
+    form.innerHTML = '<p class="cc-hint">No tunable parameters for this strategy.</p>';
+    return;
+  }
+  form.innerHTML = keys.map((key) => {
+    const value = Object.prototype.hasOwnProperty.call(current, key)
+      ? current[key]
+      : defaults[key];
+    const shown = value == null ? '' : String(value);
+    return `<label>${ccEscAttr(key)}`
+      + `<input name="${ccEscAttr(key)}" value="${ccEscAttr(shown)}" `
+      + `autocomplete="off" spellcheck="false" /></label>`;
+  }).join('');
+}
+
+async function ccOpenStrategyParamsDrawer(strategy) {
   const d = document.getElementById('cc-strategy-params-dialog');
   if (!d) return;
   const name = ccStrategyName(strategy);
+  const form = document.getElementById('cc-strategy-params-form');
   document.getElementById('cc-params-strategy-name').textContent = name;
   d.dataset.strategyName = name;
   d.dataset.controlRevision = strategy.control_revision ?? '';
+  if (form) {
+    form.innerHTML = '<p class="cc-hint">Loading parameters…</p>';
+  }
   d.hidden = false;
+
+  let editor = null;
+  try {
+    const response = await fetch(
+      `/api/strategies/${encodeURIComponent(name)}/params`,
+      {credentials: 'same-origin', headers: {Accept: 'application/json'}},
+    );
+    if (response.ok) {
+      editor = await response.json();
+    } else if (form) {
+      const detail = await response.json().catch(() => ({}));
+      form.innerHTML = `<p class="cc-hint">${ccEscAttr(
+        detail.detail || `Could not load params (${response.status})`)}</p>`;
+    }
+  } catch (err) {
+    if (form) {
+      form.innerHTML = `<p class="cc-hint">${ccEscAttr(
+        err && err.message ? err.message : 'Could not load params')}</p>`;
+    }
+  }
+
+  if (!form || !editor) {
+    // Fall back to whatever the journal/strategy row already carries.
+    if (form && strategy && strategy.params) {
+      ccRenderStrategyParamsForm(form, {
+        params: strategy.params,
+        tunables: strategy.tunables || {},
+      });
+    }
+    return;
+  }
+  // Prefer live/YAML params; overlay any fresher row payload from the store.
+  const rowParams = (strategy && strategy.params && typeof strategy.params === 'object')
+    ? strategy.params : {};
+  ccRenderStrategyParamsForm(form, {
+    params: Object.assign({}, editor.params || {}, rowParams),
+    tunables: editor.tunables || {},
+  });
 }
 
 /* ===================== Allocation unsigned payload builder (Scaling tab) ===
@@ -1454,6 +1525,7 @@ globalThis.CCCommands = {
   updateStrategyParams: ccUpdateStrategyParams,
   setPause: ccSetPause,
   openStrategyParamsDrawer: ccOpenStrategyParamsDrawer,
+  renderStrategyParamsForm: ccRenderStrategyParamsForm,
   positionForClose: ccPositionForClose,
   activateAllocation: ccActivateAllocation,
   suspendAllocation: ccSuspendAllocation,

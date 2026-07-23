@@ -22,10 +22,11 @@ PAPER_AUTOMATION_QUERY_TIMEOUT_S = float(
 def _deployed_strategy_names() -> list[str]:
     """Names from strategy_runtime.yaml for paper-automation Activate.
 
-    Live ``view.strategies`` only fills after a strategy-control command
-    journals ``strategy.updated`` — freshly deployed YAML rows never appear
-    there, so the Activate dropdown would stay empty. Config names are the
-    same identifiers Activate expects.
+    Live ``view.strategies`` fills from journaled ``strategy.updated`` rows
+    (announce/ack + control commands) once the trader registers the
+    ``strategy`` materialized adapter. Freshly deployed YAML names can still
+    precede the first ack, so Activate also lists config names — the same
+    identifiers Activate expects.
     """
     try:
         # Lazy import: web.app pulls in this module at create_app time.
@@ -92,6 +93,25 @@ def create_read_router(cc, templates, manage_context_provider=None,
         view["health"] = cc.bridge.health() if cc.bridge else {
             "lifecycle": "starting", "reconnects": 0, "cursor": None, "sources": {}}
         return JSONResponse(view)
+
+    @router.get("/api/strategies/{strategy_name}/params")
+    async def api_strategy_params(
+        strategy_name: str, _session: str = Depends(_require_session),
+    ):
+        """Params + class tunables for the Trading-tab Params drawer."""
+        from web.app import resolve_strategy_params_editor
+
+        try:
+            payload = await asyncio.to_thread(
+                resolve_strategy_params_editor, strategy_name)
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("strategy params editor failed for %s: %s",
+                           strategy_name, exc)
+            return JSONResponse(
+                {"detail": f"{type(exc).__name__}: {exc}"}, status_code=502)
+        if payload is None:
+            return JSONResponse({"detail": "strategy not found"}, status_code=404)
+        return JSONResponse(payload)
 
     @router.get("/api/events")
     async def api_events(request: Request, _session: str = Depends(_require_session)):

@@ -135,10 +135,11 @@ def _parse_json_column(value: Any) -> Any:
 
 @dataclass(frozen=True)
 class StrategyCommandReceipt:
-    """[M1-F3] Task 7 -- FROZEN field order (per the task brief).
-
-    Returned by ``StrategyRuntime.apply_control_command`` (new or replayed)
-    and by ``StrategyRevisionStore.get_receipt``/``record_receipt_in_tx``.
+    """[M1-F3] Task 7 -- FROZEN field order for the persisted columns
+    (command_id … error). ``observable_state`` is wire-only: the runtime
+    StrategyState name after a COMMITTED apply, carried so the trader can
+    journal ``strategy_state`` correctly instead of the receipt literal
+    ``COMMITTED`` (which would blank the Strategies panel chip).
     """
 
     command_id: str
@@ -152,6 +153,7 @@ class StrategyCommandReceipt:
     control_revision: int
     state_revision: int
     error: Optional[str] = None
+    observable_state: Optional[str] = None
 
 
 @dataclass(frozen=True)

@@ -530,19 +530,34 @@ function renderStrategies() {
     const enabled = DISPATCHABLE_STRATEGY.has(state);
     const name = esc(ccStrategyName(s));
     const actions = CFG.commandsEnabled ? `<td>
+        <div class="cc-strategy-actions">
         ${enabled
           ? `<button type="button" class="reject" data-cc-strategy-action="disable"
                data-cc-strategy="${name}">Disable</button>`
           : `<button type="button" class="primary" data-cc-strategy-action="enable"
                data-cc-strategy="${name}">Enable</button>`}
         <button type="button" data-cc-strategy-action="params"
-          data-cc-strategy="${name}">Edit params</button>
+          data-cc-strategy="${name}">Params</button>
+        </div>
       </td>` : '';
     const stateCls = state === 'ERROR' ? 'err' : enabled ? 'run' : '';
-    return `<tr><td class="sym">${name}</td>
+    return `<tr><td class="sym">${name}${
+        (() => {
+          const bits = [];
+          if (s.class_name) bits.push(String(s.class_name));
+          if (s.bar_size) bits.push(String(s.bar_size));
+          const conids = Array.isArray(s.conids) ? s.conids : [];
+          if (conids.length) bits.push(conids.length === 1
+            ? `conId ${conids[0]}` : `${conids.length} conIds`);
+          else if (s.universe) bits.push(`universe ${s.universe}`);
+          return bits.length
+            ? `<div class="dim strat-meta">${esc(bits.join(' · '))}</div>`
+            : '';
+        })()
+      }</td>
       <td><span class="state-chip ${stateCls}">${esc(state)}</span></td>
       <td><span class="dotstate ${enabled ? 'on' : 'off'}"><i class="d"></i>${
-        enabled ? 'enabled' : 'not dispatchable'}</span></td>
+        enabled ? 'on' : 'off'}</span></td>
       <td><span class="age">${fmtAge(ageOf(s.last_activity_at))}</span></td>
       <td class="err-note ${s.last_error ? 'neg' : 'dim'}">${
         s.last_error ? '⚠ ' + esc(s.last_error) : '—'}</td>${actions}</tr>`;
@@ -1246,11 +1261,8 @@ if (CFG.commandsEnabled) {
     else if (action === 'params') CCCommands.openStrategyParamsDrawer(strategy);
   });
 
-  // Strategy params dialog: Apply / Cancel. The form is intentionally empty
-  // (no tunables schema yet -- see command_center.html's comment on
-  // #cc-strategy-params-dialog); Apply collects whatever it holds today
-  // (nothing) and still exercises the real ccUpdateStrategyParams(strategy,
-  // params) call so the CAS/live-ceremony path works once fields exist.
+  // Strategy params dialog: Apply / Cancel. Fields are filled by
+  // ccOpenStrategyParamsDrawer from GET /api/strategies/{name}/params.
   document.getElementById('cc-params-apply').addEventListener('click', () => {
     const d = document.getElementById('cc-strategy-params-dialog');
     const strategy = ccFindStrategy(d.dataset.strategyName) || {

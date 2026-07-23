@@ -457,6 +457,82 @@
     td.err-note { white-space: normal; min-width: 150px; max-width: 260px; text-align: left; }
     #dash-trading .lower section:nth-of-type(odd) { border-right: 2px solid var(--border); }
 
+    /* Strategies runtime panel: fit columns in the half-width frame (no
+       horizontal scroll). Global th/td nowrap + action buttons otherwise
+       push past the modular-grid cell. */
+    #strategies-panel table {
+      table-layout: fixed;
+      width: 100%;
+    }
+    #strategies-panel th,
+    #strategies-panel td {
+      white-space: normal;
+      overflow-wrap: anywhere;
+      word-break: break-word;
+      padding-left: 8px;
+      padding-right: 8px;
+    }
+    #strategies-panel th:nth-child(1),
+    #strategies-panel td:nth-child(1) { width: 28%; }
+    #strategies-panel th:nth-child(2),
+    #strategies-panel td:nth-child(2) { width: 14%; }
+    #strategies-panel th:nth-child(3),
+    #strategies-panel td:nth-child(3) { width: 12%; }
+    #strategies-panel th:nth-child(4),
+    #strategies-panel td:nth-child(4) { width: 10%; }
+    #strategies-panel th:nth-child(5),
+    #strategies-panel td:nth-child(5) { width: 16%; }
+    #strategies-panel th:nth-child(6),
+    #strategies-panel td:nth-child(6) { width: 20%; }
+    #strategies-panel td.err-note {
+      min-width: 0;
+      max-width: none;
+    }
+    #strategies-panel td.sym .strat-meta {
+      font-weight: 400;
+      font-size: 0.85em;
+      margin-top: 0.15em;
+      line-height: 1.35;
+    }
+    #strategies-panel .cc-strategy-actions {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 4px;
+      justify-content: flex-end;
+    }
+    #strategies-panel .cc-strategy-actions button {
+      padding: 5px 7px;
+      font-size: 9px;
+    }
+    #strategies-panel .dotstate { white-space: nowrap; }
+
+    /* Strategies tab (deploy): same nowrap overflow against full-width
+       framed sections with overflow:hidden. */
+    #dash-deploy section.full {
+      overflow-x: auto;
+    }
+    #dash-deploy section.full > table {
+      table-layout: fixed;
+      width: 100%;
+      min-width: 0;
+    }
+    #dash-deploy section.full > table th,
+    #dash-deploy section.full > table td {
+      white-space: normal;
+      overflow-wrap: anywhere;
+      word-break: break-word;
+      vertical-align: top;
+    }
+    #dash-deploy section.full > table td.wl-actions {
+      width: 9.5rem;
+    }
+    #dash-deploy section.full > table td.wl-actions .param-form.inline {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 4px;
+      margin: 0 0 4px;
+    }
+
     /* —— tables —— */
     table { width: 100%; border-collapse: collapse; font-variant-numeric: tabular-nums; }
     th, td {
@@ -1795,7 +1871,7 @@
           <tbody id="fills-body"></tbody></table></section>
       <section id="strategies-panel"><h2><span class="h-title">Strategies {{ info('Live strategy_service rows. Enable/Disable here is immediate. Pause new trading blocks new exposure without unloading strategies. Full deploy/undeploy is on the Strategies tab.') }}</span></h2>
         <table><thead><tr><th>Strategy</th><th>State</th><th>Enabled</th>
-          <th>Last activity</th><th>Error</th>
+          <th>Activity</th><th>Error</th>
           {% if commands_enabled %}<th data-cc-col="strategy-actions">Actions</th>{% endif %}
           </tr></thead>
           <tbody id="strategies-body"></tbody></table></section>
@@ -2171,23 +2247,15 @@
   </aside>
 
   <!-- [M1-C] Task 6 -- strategy parameter editor: typed fields, CAS on
-       control_revision. The <form> below is intentionally left empty here:
-       there is no strategy params/tunables schema in the reduced store yet
-       (the real "strategy" entity payload -- StrategyControlCommandService.
-       acknowledge_state -- carries {strategy_name, action, strategy_state,
-       control_revision, state_revision, error}, nothing about tunables), so
-       typed field generation stays a follow-up. The open/apply wiring is
-       done: a strategy row's "Edit params" action opens this dialog
-       (ccOpenStrategyParamsDrawer, command_center.js's UI-wiring pass) and
-       "Apply" collects whatever this empty form yields (nothing, today) and
-       calls ccUpdateStrategyParams(strategy, params). Server (F3's versioned
-       params schema) is still the real validation authority regardless of
-       what this form offers. -->
+       control_revision. Fields are filled at open time from
+       GET /api/strategies/{name}/params (YAML/live params + class tunables).
+       Apply collects the form and calls ccUpdateStrategyParams; the server
+       remains the validation authority. -->
   <aside id="cc-strategy-params-dialog" class="cc-drawer" hidden>
     <h2>Edit <span id="cc-params-strategy-name"></span> parameters</h2>
     <p class="cc-hint">Server validates every value against the strategy's
        versioned schema; unspecified risk effects are treated as
-       risk-increasing.</p>
+       risk-increasing. Clear a field to remove that override.</p>
     <form id="cc-strategy-params-form"></form>
     <button id="cc-params-apply" type="button"
             data-cc-command="update_strategy_params">Apply</button>

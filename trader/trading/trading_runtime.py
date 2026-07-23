@@ -377,8 +377,15 @@ class Trader():
             # command-center baseline snapshot never includes trading_control,
             # so the pause control sticks on "waiting…" until a live mutation.
             from trader.data.materialized_state import GenericEntityAdapter
+            # trading_control + strategy live in domain_materialized_entities
+            # (GenericEntityAdapter). Without the strategy adapter, acks still
+            # journal strategy.updated but snapshot_with_cursor never returns
+            # those rows — command-center Strategies panel stays empty after
+            # baseline install (live feed only sees *new* events past cursor).
             self.snapshot_service.register_adapter(
                 GenericEntityAdapter("trading_control"))
+            self.snapshot_service.register_adapter(
+                GenericEntityAdapter("strategy"))
             self.feed_service = DomainFeedService(self.domain_journal)
             self.client.ib.connectedEvent += self.connected_event
             self.client.ib.disconnectedEvent += self.disconnected_event

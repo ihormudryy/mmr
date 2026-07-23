@@ -532,6 +532,29 @@ class TestForwardingSagaEdgeCases:
             "smi_crossover", 1, 1, payload, correlation_id="corr-1")
         assert first == second
 
+    def test_acknowledge_state_allows_diverged_journal_and_state_revisions(self, tmp_path):
+        """Regression: journal entity_revision 4 vs strategy state_revision 6
+        used to raise _StrategyRevisionDrift → INTERNAL_ERROR on Disable."""
+        from trader.trading.command_coordinator import acknowledge_strategy_state
+
+        _, journal = _build_journal(tmp_path)
+        # Seed three prior acks so the next entity_revision is 4.
+        for rev in (1, 2, 3):
+            acknowledge_strategy_state(
+                journal, "vwap_reclaim_cat", rev, 0,
+                {"strategy_name": "vwap_reclaim_cat", "strategy_state": "RUNNING"},
+                correlation_id=f"seed-{rev}",
+            )
+        entity_revision = acknowledge_strategy_state(
+            journal, "vwap_reclaim_cat", 6, 1,
+            {"strategy_name": "vwap_reclaim_cat", "strategy_state": "DISABLED"},
+            correlation_id="disable-1",
+        )
+        assert entity_revision == 4
+        entity = journal.get_entity("strategy", "vwap_reclaim_cat")
+        assert entity is not None
+        assert entity["payload"]["strategy_state"] == "DISABLED"
+
 
 # ---------------------------------------------------------------------------
 # Production wiring -- both sides register the frozen typed method names.
@@ -739,3 +762,62 @@ class TestStrategyStateIngestRegistration:
         assert entity is not None
         # idempotent replay of the same state_revision
         assert registration.handler(parsed) == {"entity_revision": 1}
+
+    def test_strategy_adapter_exposes_journaled_rows_in_fenced_snapshot(self, tmp_path):
+        """Without GenericEntityAdapter('strategy'), snapshot_with_cursor omits
+        journaled strategy rows and the command-center Strategies panel stays
+        empty after baseline install (feed only sees events past the cursor)."""
+        from trader.data.materialized_state import GenericEntityAdapter
+        from trader.domain.snapshot_service import DomainSnapshotService
+        from trader.messaging.production_api import register_strategy_state_ingest
+        from trader.messaging.typed_rpc import TypedRpcRegistry
+
+        _, journal = _build_journal(tmp_path)
+        registry = TypedRpcRegistry()
+        register_strategy_state_ingest(registry, journal)
+        registration = registry.resolve("command", "record_state_acknowledged")
+        payload = {
+            "strategy_name": "vwap_reclaim_cat",
+            "strategy_state": "RUNNING",
+            "state": "RUNNING",
+            "control_revision": 0,
+            "class_name": "VwapReclaim",
+            "bar_size": "1 min",
+            "conids": [756733],
+        }
+        parsed = registration.request_model(
+            strategy_name="vwap_reclaim_cat", state_revision=1,
+            control_revision=0, payload=payload)
+        registration.handler(parsed)
+
+        service = DomainSnapshotService(journal)
+        service.register_adapter(GenericEntityAdapter("strategy"))
+        snapshot = service.snapshot_with_cursor()
+        rows = snapshot.entities["strategy"]
+        assert len(rows) == 1
+        assert rows[0]["entity_id"] == "vwap_reclaim_cat"
+        assert rows[0]["strategy_state"] == "RUNNING"
+        assert rows[0]["class_name"] == "VwapReclaim"
+        assert rows[0]["conids"] == [756733]
+
+
+def test_trader_registers_strategy_materialized_adapter():
+    """Regression: trading_control alone left Strategies panel empty."""
+    from pathlib import Path
+    src = Path(__file__).resolve().parents[1] / "trader" / "trading" / "trading_runtime.py"
+    text = src.read_text()
+    assert 'GenericEntityAdapter("trading_control")' in text
+    assert 'GenericEntityAdapter("strategy")' in text
+
+
+def test_enable_strategy_receipt_carries_observable_state(runtime):
+    current = runtime._revisions.control_revision("smi_crossover")
+    receipt = runtime.apply_control_command(
+        "cmd-obs", "smi_crossover", "enable_strategy",
+        expected_control_revision=current, params=None)
+    assert receipt.state == "COMMITTED"
+    assert receipt.observable_state is not None
+    assert receipt.observable_state != "COMMITTED"
+    assert receipt.observable_state in {
+        "RUNNING", "WAITING_HISTORICAL_DATA", "INSTALLED", "DISABLED", "ERROR",
+    }

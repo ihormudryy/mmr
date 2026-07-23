@@ -2008,6 +2008,7 @@ def _dict_to_strategy_receipt(data: Dict[str, Any]) -> StrategyCommandReceipt:
         action=data["action"], state=data["state"],
         control_revision=data["control_revision"], state_revision=data["state_revision"],
         error=data.get("error"),
+        observable_state=data.get("observable_state"),
     )
 
 
@@ -2185,8 +2186,13 @@ def build_production_registry(
             allocation_service=command_stack.allocation_service,
             paper_automation_service=command_stack.paper_automation_service,
             automated_intent_service=command_stack.automated_intent_service,
+            strategy_control_service=command_stack.strategy_control_service,
         )
-        register_strategy_state_ingest(registry, command_stack.journal)
+        # record_state_acknowledged is registered by register_command_authority
+        # when strategy_control_service is wired; otherwise keep the minimal
+        # ingest-only handler so strategy announce/drain still works.
+        if command_stack.strategy_control_service is None:
+            register_strategy_state_ingest(registry, command_stack.journal)
     elif command_coordinator is not None and proposal_service is not None and proposal_repository is not None:
         register_command_authority(
             registry, command_coordinator, proposal_service, proposal_repository,

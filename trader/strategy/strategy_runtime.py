@@ -924,7 +924,7 @@ class StrategyRuntime():
 
         existing = self._revisions.get_receipt(command_id)
         if existing is not None:
-            return existing
+            return self._receipt_with_observable_state(existing)
 
         current = self._revisions.control_revision(strategy_name)
         if expected_control_revision != current:
@@ -972,14 +972,33 @@ class StrategyRuntime():
 
         def _commit(conn):
             control = self._revisions.bump_control_revision_in_tx(conn, strategy_name)
+            payload = self._state_payload(strategy_name, control)
             state = self._revisions.bump_state_revision_in_tx(
-                conn, strategy_name, self._state_payload(strategy_name, control),
+                conn, strategy_name, payload,
             )
-            return self._revisions.record_receipt_in_tx(
+            receipt = self._revisions.record_receipt_in_tx(
                 conn, command_id, strategy_name, action, 'COMMITTED', control, state,
             )
+            # Wire-only: trader journals this as strategy_state (not COMMITTED).
+            return StrategyCommandReceipt(
+                command_id=receipt.command_id,
+                strategy_name=receipt.strategy_name,
+                action=receipt.action,
+                state=receipt.state,
+                control_revision=receipt.control_revision,
+                state_revision=receipt.state_revision,
+                error=receipt.error,
+                observable_state=payload.get('strategy_state') or payload.get('state'),
+            )
 
-        return self._revisions.db.transaction(_commit)
+        receipt = self._revisions.db.transaction(_commit)
+        # Match announce dedup so the next reconcile doesn't re-bump the same
+        # observable state we just wrote into the outbox.
+        if receipt.observable_state:
+            announced = getattr(self, '_announced_states', None)
+            if announced is not None:
+                announced[strategy_name] = receipt.observable_state
+        return receipt
 
     def _config_entries(self, strategy_name: str, params: Dict) -> tuple[Dict, Dict]:
         """Return ``(prior_entry, proposed_entry)`` -- the strategy's CURRENT
@@ -1094,14 +1113,77 @@ class StrategyRuntime():
             )
             return str(ex)
 
+    def _receipt_with_observable_state(
+        self, receipt: StrategyCommandReceipt,
+    ) -> StrategyCommandReceipt:
+        """Re-attach wire-only ``observable_state`` on idempotent receipt
+        replays (the ledger does not persist it)."""
+        if receipt.observable_state or receipt.state_revision <= 0:
+            return receipt
+        row = self._revisions.db.execute(
+            "SELECT payload FROM strategy_ack_outbox "
+            "WHERE strategy_name = ? AND state_revision = ? LIMIT 1",
+            [receipt.strategy_name, receipt.state_revision],
+            fetch='one',
+        )
+        if row is None:
+            return receipt
+        from trader.strategy.strategy_revisions import _parse_json_column
+        payload = _parse_json_column(row[0]) or {}
+        obs = payload.get('strategy_state') or payload.get('state')
+        if not obs:
+            return receipt
+        return StrategyCommandReceipt(
+            command_id=receipt.command_id,
+            strategy_name=receipt.strategy_name,
+            action=receipt.action,
+            state=receipt.state,
+            control_revision=receipt.control_revision,
+            state_revision=receipt.state_revision,
+            error=receipt.error,
+            observable_state=str(obs),
+        )
+
     def _state_payload(self, strategy_name: str, control_revision: int) -> Dict:
         strategy = self.get_strategy(strategy_name)
         state_name = strategy.state.name if strategy is not None else 'UNKNOWN'
-        return {
+        # `strategy_state` is the command-center canonical field (see
+        # command_center.js renderStrategies); keep `state` as a compat alias
+        # for older consumers / outbox rows written before this dual-key.
+        payload: Dict = {
             'strategy_name': strategy_name,
+            'strategy_state': state_name,
             'state': state_name,
             'control_revision': control_revision,
         }
+        if strategy is None:
+            return payload
+        bar_size = getattr(strategy, 'bar_size', None)
+        if bar_size is not None:
+            payload['bar_size'] = (
+                bar_size.value if hasattr(bar_size, 'value') else str(bar_size)
+            )
+        class_name = getattr(strategy, 'class_name', None)
+        if class_name:
+            payload['class_name'] = class_name
+        conids = getattr(strategy, 'conids', None) or []
+        if conids:
+            payload['conids'] = list(conids)
+        universe = getattr(strategy, 'universe', None)
+        if universe:
+            payload['universe'] = universe
+        last_error = getattr(strategy, 'last_error', None)
+        if last_error:
+            payload['last_error'] = str(last_error)
+        # Current YAML/context overrides — command-center Params drawer reads
+        # these from the strategy row when present (also served by GET
+        # /api/strategies/{name}/params from config + class tunables).
+        try:
+            params = dict(getattr(strategy, 'params', None) or {})
+        except Exception:
+            params = {}
+        payload['params'] = params
+        return payload
 
     def _record(
         self, command_id: str, strategy_name: str, action: str, state: str,

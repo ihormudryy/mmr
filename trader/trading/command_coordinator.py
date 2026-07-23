@@ -72,6 +72,7 @@ from __future__ import annotations
 import datetime as dt
 import itertools
 import json
+import logging
 from dataclasses import dataclass, field, replace
 from enum import Enum
 from typing import Any, Callable, Literal, Optional, Protocol
@@ -2170,34 +2171,36 @@ class StrategyControlPort(Protocol):
     def get_receipt(self, command_id: str) -> Optional[StrategyCommandReceipt]: ...
 
 
+logger = logging.getLogger(__name__)
+
+
 class _StrategyRevisionDrift(Exception):
-    """The journal's freshly computed ``entity_revision`` for a ``strategy``
-    entity diverged from the ``state_revision`` strategy_service reported for
-    this command. Would only fire if some OTHER writer journaled a
-    ``strategy.updated`` event for this entity outside
-    ``StrategyControlCommandService.acknowledge_state`` -- a producer bug,
-    never expected in normal operation (mirrors ``_ConcurrentProposalChange``'s
-    role for ``_assert_proposal_revision``)."""
+    """Legacy exception kept for import stability; no longer raised.
 
-
-def _assert_state_revision(expected: int) -> Callable[[duckdb.DuckDBPyConnection, int], None]:
-    """A ``write_materialized`` callback asserting the journal's freshly
-    computed ``entity_revision`` for entity_type ``"strategy"`` equals the
-    ``state_revision`` strategy_service reported for this command.
-
-    Per the m1f3 briefing's B3 correction: this does NOT (cannot) force
-    ``entity_revision = state_revision`` -- ``DomainMutation`` has no such
-    field and ``DomainJournal.mutate`` always computes the next revision
-    itself. Equality holds only because both counters start fresh at 0 and
-    advance in lockstep, one bump per acknowledged strategy-control command;
-    this assertion is the guard that would catch it drifting, not the
-    mechanism that makes it hold.
+    Journal ``entity_revision`` and strategy_service ``state_revision`` are
+    independent counters: announces, missed ack drains, and journal WAL
+    resets routinely desynchronize them. Treating drift as fatal blocked
+    enable/disable with INTERNAL_ERROR (see acknowledge_strategy_state).
     """
-    def _write(conn: duckdb.DuckDBPyConnection, revision: int) -> None:
-        if revision != expected:
-            raise _StrategyRevisionDrift(
-                f"journal revision {revision} diverged from strategy "
-                f"state_revision {expected}"
+
+
+def _strategy_ack_write(
+    expected_state_revision: int,
+) -> Callable[[duckdb.DuckDBPyConnection, int], None]:
+    """``write_materialized`` for strategy acks: observe drift, never abort.
+
+    Per the m1f3 briefing's B3 correction, ``DomainJournal.mutate`` always
+    computes the next ``entity_revision`` itself — it cannot be forced to
+    equal strategy_service's ``state_revision``. Idempotency is carried by
+    the deterministic ``event_id`` (``strategy:{name}:state:{N}``), not by
+    lockstep revision numbers.
+    """
+    def _write(_conn: duckdb.DuckDBPyConnection, revision: int) -> None:
+        if revision != expected_state_revision:
+            logger.warning(
+                "strategy journal entity_revision %s diverged from strategy "
+                "state_revision %s (missed acks or journal reset); continuing",
+                revision, expected_state_revision,
             )
     return _write
 
@@ -2247,7 +2250,7 @@ def acknowledge_strategy_state(
         event = journal.mutate(
             journal.connect(),
             mutation,
-            _assert_state_revision(state_revision),
+            _strategy_ack_write(state_revision),
             event_id=f"strategy:{strategy_name}:state:{state_revision}",
         )
         return event.entity_revision
@@ -2409,10 +2412,17 @@ class StrategyControlCommandService:
         payload = {
             "strategy_name": strategy_receipt.strategy_name,
             "action": strategy_receipt.action,
-            "strategy_state": strategy_receipt.state,
+            # Prefer the runtime StrategyState name (RUNNING/DISABLED/…).
+            # Falling back to receipt.state (COMMITTED) blanked the Strategies
+            # panel chip after every enable/disable until the next announce.
+            "strategy_state": (
+                strategy_receipt.observable_state or strategy_receipt.state
+            ),
+            "receipt_state": strategy_receipt.state,
             "control_revision": strategy_receipt.control_revision,
             "state_revision": strategy_receipt.state_revision,
             "error": strategy_receipt.error,
+            "last_error": strategy_receipt.error,
         }
         # Only a strategy-side COMMITTED actually bumped state_revision --
         # journal strategy.updated (asserting entity_revision == state_revision)
@@ -2934,10 +2944,12 @@ class OutcomeReconciler:
         payload = {
             "strategy_name": receipt.strategy_name,
             "action": receipt.action,
-            "strategy_state": receipt.state,
+            "strategy_state": receipt.observable_state or receipt.state,
+            "receipt_state": receipt.state,
             "control_revision": receipt.control_revision,
             "state_revision": receipt.state_revision,
             "error": receipt.error,
+            "last_error": receipt.error,
         }
         outcome = dict(payload)
 

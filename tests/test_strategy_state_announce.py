@@ -91,7 +91,9 @@ class TestAnnounceStrategyStates:
         import json
         payloads = {r[0]: json.loads(r[2]) for r in rows}
         assert payloads['alpha']['state'] == 'INSTALLED'
+        assert payloads['alpha']['strategy_state'] == 'INSTALLED'
         assert payloads['beta']['state'] == 'RUNNING'
+        assert payloads['beta']['strategy_state'] == 'RUNNING'
         assert payloads['alpha']['strategy_name'] == 'alpha'
 
     def test_idempotent_while_state_unchanged(self, runtime_with_revisions):

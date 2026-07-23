@@ -7,7 +7,7 @@ import logging
 from dataclasses import dataclass, field, replace
 from typing import Any, Callable, Optional, Protocol
 
-from trader.data.domain_journal import DomainJournal
+from trader.data.domain_journal import DomainJournal, EventIdentityConflict
 from trader.data.proposal_repository import ProposalDraft, ProposalRecord, ProposalRepository
 from trader.trading.trading_control import PauseStateUnavailable, TradingPausedError
 
@@ -234,12 +234,21 @@ class ProposalCommandService:
                 )
             written.append(self._repository.insert_pending_in_tx(conn, draft, revision))
 
-        self._journal.mutate(
-            self._journal.connect(),
-            self._repository.mutation_for(predicted, correlation_id),
-            write_materialized,
-            event_id=f"proposal:{proposal_id}:1",
-        )
+        try:
+            self._journal.mutate(
+                self._journal.connect(),
+                self._repository.mutation_for(predicted, correlation_id),
+                write_materialized,
+                event_id=f"proposal:{proposal_id}:1",
+            )
+        except EventIdentityConflict as exc:
+            # Sequence lag / recycled proposal ids must refuse cleanly so the
+            # coordinator REJECTS the command instead of parking OUTCOME_UNKNOWN
+            # (which blocks resume_trading via reconciliation_safe).
+            raise ProposalCreationRefused(
+                "PROPOSAL_IDENTITY_CONFLICT",
+                f"proposal event identity conflict for id {proposal_id}: {exc}",
+            ) from exc
         return written[0]
 
     def reject_proposal(

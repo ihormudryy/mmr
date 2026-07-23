@@ -2719,14 +2719,27 @@ class OutcomeReconciler:
         order path is irrelevant. Resolve ONLY when the proposal was positively
         confirmed created (its ``proposal.*`` journal event correlated to this
         command exists); otherwise stay unknown -- NEVER mark anything
-        FAILED."""
+        FAILED.
+
+        Exception: ``INTERNAL_ERROR`` / ``PROPOSAL_IDENTITY_CONFLICT`` with no
+        correlated proposal means the create transaction rolled back. Reject
+        those so they cannot wedge ``reconciliation_safe`` / resume forever.
+        """
         proposal_id = self._created_proposal_id(row.command_id)
-        if proposal_id is None:
-            return False
-        self._resolve_command_only(
-            row, {"proposal_id": proposal_id, "created": True}, now
-        )
-        return True
+        if proposal_id is not None:
+            self._resolve_command_only(
+                row, {"proposal_id": proposal_id, "created": True}, now
+            )
+            return True
+        if row.error_code in {"INTERNAL_ERROR", "PROPOSAL_IDENTITY_CONFLICT"}:
+            self._reject_command_only(
+                row,
+                error_code=row.error_code or "INTERNAL_ERROR",
+                outcome={"created": False, "reconciled": "never_committed"},
+                now=now,
+            )
+            return True
+        return False
 
     def _reconcile_reject(self, row: LedgerRow, now: dt.datetime) -> bool:
         """A wedged ``reject_proposal`` never dispatched an order. Resolve ONLY
@@ -2890,6 +2903,30 @@ class OutcomeReconciler:
             append(
                 self._command_mutation(row, "RESOLVED", now, outcome=outcome),
                 _noop_write, f"command:{row.command_id}:resolved",
+            )
+
+        self._journal.mutate_batch_work(self._journal.connect(), work)
+        self._plans.pop(row.command_id, None)
+
+    def _reject_command_only(
+        self,
+        row: LedgerRow,
+        *,
+        error_code: str,
+        outcome: dict[str, Any],
+        now: dt.datetime,
+    ) -> None:
+        """OUTCOME_UNKNOWN → REJECTED without touching proposals/orders."""
+        def work(conn: duckdb.DuckDBPyConnection, append) -> None:
+            self._ledger.transition_in_tx(
+                conn, row.command_id, row.state, "REJECTED",
+                error_code=error_code, outcome=outcome, now=now,
+            )
+            append(
+                self._command_mutation(
+                    row, "REJECTED", now, error_code=error_code, outcome=outcome,
+                ),
+                _noop_write, f"command:{row.command_id}:rejected",
             )
 
         self._journal.mutate_batch_work(self._journal.connect(), work)

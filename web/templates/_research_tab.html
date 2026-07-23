@@ -6,7 +6,11 @@
             aria-pressed="false">Movers</button>
     <button type="button" class="research-tool" data-research-tool="lookup"
             aria-pressed="false">Lookup</button>
-    {% for tool in ('scan', 'depth', 'options', 'forex') %}
+    <button type="button" class="research-tool" data-research-tool="options"
+            aria-pressed="false">Options</button>
+    <button type="button" class="research-tool" data-research-tool="forex"
+            aria-pressed="false">Forex</button>
+    {% for tool in ('scan', 'depth') %}
     <button type="button" class="research-tool" data-research-tool="{{ tool }}"
             data-research-later="true" disabled>{{ tool|title }} <span>Later</span></button>
     {% endfor %}

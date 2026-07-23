@@ -477,6 +477,35 @@ function proposalTarget() {
     assert.equal(h.api.activeTool(), 'ideas');
   });
 
+  await test('options chain tool fetches the chain endpoint', async () => {
+    const h = makeHarness();
+    h.fetch.enqueue(200, response([{preset: 'momentum'}], 'Presets', {tool: 'presets', provider: 'local'}));
+    h.loadProductionScript();
+    await h.start();
+    h.api.selectTool('options');
+    h.fetch.enqueue(200, response(
+      [{ticker: 'O:AAPL260320C00250000', strike: 250, mid: 12.2, change_pct: null}],
+      'Options chain: AAPL', {tool: 'options_chain', provider: 'massive'}));
+    await h.api.run('options', new URLSearchParams({symbol: 'AAPL', view: 'chain'}));
+    const url = h.fetch.calls[h.fetch.calls.length - 1].url;
+    assert.match(url, /\/api\/research\/options\/chain\?/);
+    assert.equal(h.api.state.options.data[0].strike, 250);
+  });
+
+  await test('forex snapshot tool dispatches by mode', async () => {
+    const h = makeHarness();
+    h.fetch.enqueue(200, response([{preset: 'x'}], 'Presets', {tool: 'presets', provider: 'local'}));
+    h.loadProductionScript();
+    await h.start();
+    h.api.selectTool('forex');
+    h.fetch.enqueue(200, response({pair: 'EUR/USD', bid: 1.08, ask: 1.081},
+      'Forex snapshot: EURUSD', {tool: 'forex_snapshot', provider: 'massive'}));
+    await h.api.run('forex', new URLSearchParams({mode: 'snapshot', pair: 'EURUSD', source: 'massive'}));
+    const url = h.fetch.calls[h.fetch.calls.length - 1].url;
+    assert.match(url, /\/api\/research\/forex\/snapshot\?/);
+    assert.equal(h.api.state.forex.selected.bid, 1.08);
+  });
+
   console.log(`command_center_research.test.js: ${passed} tests passed`);
 })().catch((error) => {
   console.error(error);

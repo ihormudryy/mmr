@@ -82,7 +82,7 @@ function makeHarness() {
   ];
   const elements = new Map(ids.map((id) => [id, makeElement({id})]));
   const tools = ['ideas', 'movers', 'lookup', 'scan', 'depth', 'options', 'forex']
-    .map((tool) => makeElement({tool, disabled: !['ideas', 'movers', 'lookup'].includes(tool)}));
+    .map((tool) => makeElement({tool, disabled: !['ideas', 'movers', 'lookup', 'options', 'forex'].includes(tool)}));
   const readyListeners = [];
   const fetch = makeFetch();
 

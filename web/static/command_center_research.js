@@ -2,7 +2,7 @@
 'use strict';
 
 (() => {
-  const supportedTools = new Set(['ideas', 'movers', 'lookup']);
+  const supportedTools = new Set(['ideas', 'movers', 'lookup', 'options', 'forex']);
   const slot = () => ({
     data: null,
     title: null,
@@ -17,6 +17,8 @@
     ideas: slot(),
     movers: slot(),
     lookup: {snapshot: slot(), news: slot()},
+    options: slot(),
+    forex: slot(),
   };
   let currentTool = 'ideas';
 
@@ -33,17 +35,18 @@
   function paramsFromForm(form) {
     const params = new URLSearchParams();
     const entries = Array.from(new FormData(form).entries());
+    const isIdeas = form.dataset && form.dataset.researchForm === 'ideas';
     const source = String(
       (entries.find(([name]) => name === 'source') || [])[1] || '',
     );
     for (const [name, value] of entries) {
-      if (name === 'tickers') {
+      if (isIdeas && name === 'tickers') {
         // Ideas API rejects tickers unless source=tickers.
         if (source !== 'tickers' || value === '') continue;
         String(value).split(/[\s,]+/).filter(Boolean).forEach((ticker) => {
           params.append('tickers', ticker.toUpperCase());
         });
-      } else if (name === 'universe') {
+      } else if (isIdeas && name === 'universe') {
         // Ideas API rejects universe unless source=universe.
         if (source !== 'universe' || value === '') continue;
         params.append(name, value);
@@ -143,6 +146,40 @@
       ]);
       return {snapshot, news};
     }
+    if (tool === 'options') {
+      const symbol = params.get('symbol') || '';
+      const view = params.get('view') || 'chain';
+      if (view === 'implied') {
+        const p = new URLSearchParams({symbol});
+        if (params.get('expiration')) p.set('expiration', params.get('expiration'));
+        return request(state.options, 'options/implied', p);
+      }
+      const p = new URLSearchParams({symbol});
+      for (const key of ['expiration', 'strike_min', 'strike_max']) {
+        if (params.get(key)) p.set(key, params.get(key));
+      }
+      if (params.get('type')) p.set('type', params.get('type'));
+      return request(state.options, 'options/chain', p);
+    }
+    if (tool === 'forex') {
+      const mode = params.get('mode') || 'snapshot';
+      const p = new URLSearchParams();
+      if (mode === 'snapshot') {
+        p.set('pair', params.get('pair') || ''); p.set('source', params.get('source') || 'massive');
+      } else if (mode === 'quote') {
+        p.set('from', params.get('from') || ''); p.set('to', params.get('to') || '');
+        p.set('source', params.get('source') || 'massive');
+      } else if (mode === 'movers') {
+        p.set('direction', params.get('direction') || 'gainers');
+      } else if (mode === 'snapshot-all') {
+        (params.get('tickers') || '').split(/[\s,]+/).filter(Boolean)
+          .forEach((t) => p.append('tickers', t.toUpperCase()));
+      } else if (mode === 'convert') {
+        p.set('from', params.get('from') || ''); p.set('to', params.get('to') || '');
+        p.set('amount', params.get('amount') || '');
+      }
+      return request(state.forex, `forex/${mode}`, p);
+    }
     return request(state[tool], tool, params);
   }
 
@@ -170,6 +207,10 @@
     target.selected = target.data[index];
     renderResults();
     renderDetail();
+    if (currentTool === 'options' && target.selected && target.selected.ticker) {
+      request(state.options, 'options/snapshot',
+              new URLSearchParams({option_ticker: target.selected.ticker}));
+    }
     return true;
   }
 
@@ -210,6 +251,27 @@
         <label>News source <select name="source"><option>polygon</option><option>benzinga</option></select></label>
         <label>News limit <input name="limit" class="w-xs" type="number" min="1" max="50" value="10"></label>
         <button type="submit">Lookup</button>
+      </form>`,
+      options: `<form data-research-form="options" class="param-form research-form">
+        <label>Symbol <input name="symbol" class="w-name" required maxlength="32"></label>
+        <label>Expiration <select name="expiration" id="research-option-exp"><option value="">Nearest</option></select></label>
+        <button type="button" data-research-load-expirations class="w-xs">⟳</button>
+        <label>Type <select name="type"><option value="">Any</option><option>call</option><option>put</option></select></label>
+        <label>Strike min <input name="strike_min" class="w-sm" type="number" min="0" step="any"></label>
+        <label>Strike max <input name="strike_max" class="w-sm" type="number" min="0" step="any"></label>
+        <label>View <select name="view"><option value="chain">Chain</option><option value="implied">Implied</option></select></label>
+        <button type="submit">Run Options</button>
+      </form>`,
+      forex: `<form data-research-form="forex" class="param-form research-form">
+        <label>Mode <select name="mode"><option>snapshot</option><option>quote</option><option>movers</option><option value="snapshot-all">All</option><option>convert</option></select></label>
+        <label>Pair <input name="pair" class="w-name" placeholder="EURUSD"></label>
+        <label>From <input name="from" class="w-xs" maxlength="3" placeholder="EUR"></label>
+        <label>To <input name="to" class="w-xs" maxlength="3" placeholder="USD"></label>
+        <label>Amount <input name="amount" class="w-sm" type="number" min="0" step="any"></label>
+        <label>Direction <select name="direction"><option>gainers</option><option>losers</option></select></label>
+        <label>Tickers <input name="tickers" class="w-symbols" placeholder="EURUSD GBPUSD"></label>
+        <label>Source <select name="source"><option>massive</option><option>ib</option><option>twelvedata</option></select></label>
+        <button type="submit">Run Forex</button>
       </form>`,
     };
     root.innerHTML = forms[currentTool];
@@ -686,6 +748,31 @@
       : null;
   }
 
+  function expirationsLoaderFromEvent(event) {
+    return event.target && event.target.closest
+      ? event.target.closest('[data-research-load-expirations]')
+      : null;
+  }
+
+  async function loadOptionExpirations(loader) {
+    const form = loader.closest && loader.closest('form');
+    const symbolField = form && form.querySelector && form.querySelector('[name="symbol"]');
+    const symbol = symbolField && symbolField.value;
+    if (!symbol) return false;
+    const res = await fetch(`/api/research/options/expirations?symbol=${encodeURIComponent(symbol)}`, {
+      credentials: 'same-origin',
+      headers: {Accept: 'application/json'},
+    });
+    if (!res.ok) return false;
+    const body = await res.json();
+    const select = document.getElementById('research-option-exp');
+    if (select && Array.isArray(body.data)) {
+      select.innerHTML = '<option value="">Nearest</option>' + body.data.map((row) =>
+        `<option value="${esc(row.expiration)}">${esc(row.expiration)} (${esc(String(row.dte))}d)</option>`).join('');
+    }
+    return true;
+  }
+
   function openSelectedProposal() {
     const target = currentTool === 'lookup' ? state.lookup.snapshot : state[currentTool];
     if (!proposalsEnabled() || !equityResult(target.selected, currentTool)) return false;
@@ -720,6 +807,12 @@
         event.preventDefault();
         const form = event.target;
         run(form.dataset.researchForm, paramsFromForm(form));
+      });
+      controls.addEventListener('click', (event) => {
+        const loader = expirationsLoaderFromEvent(event);
+        if (!loader) return;
+        event.preventDefault();
+        loadOptionExpirations(loader);
       });
     }
     if (results) {

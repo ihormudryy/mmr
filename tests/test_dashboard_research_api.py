@@ -299,7 +299,7 @@ def test_research_shell_precedes_guide_tab(logged_in_research_client):
         "ideas", "movers", "lookup", "scan", "depth", "options", "forex",
     ):
         assert f'data-research-tool="{tool}"' in html
-    assert html.count('data-research-later="true"') == 4
+    assert html.count('data-research-later="true"') == 2  # scan, depth only
 
 
 def test_read_only_page_keeps_research_without_propose(logged_in_research_client):

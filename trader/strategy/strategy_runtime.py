@@ -731,21 +731,26 @@ class StrategyRuntime():
         return StrategyState.ERROR
 
     def _announce_and_drain(self, name: str) -> None:
-        """Push the new observable state to the trader journal immediately.
+        """Queue the new observable state for the trader journal.
 
-        Without this, enable/disable only update local runtime state — the
-        command-center Trading Strategies panel stays stale until the next
-        30s reconcile announces the transition.
+        Writes a ``strategy_ack_outbox`` row only. Does **not** call the
+        trader's ``record_state_acknowledged`` here: enable/disable run inside
+        ``apply_control_command``, which is itself answering a trader→strategy
+        forward on the typed command path. Calling back into the trader's
+        command socket from that stack deadlocks (trader waits for our reply;
+        we wait for trader's ack) and surfaces as
+        ``record_state_acknowledged ... timed out after 10000ms``.
+
+        The trader's ``_forward`` journals ``strategy.updated`` as soon as
+        this handler returns (so the command-center Strategies panel updates
+        immediately). ``_drain_ack_outbox`` on the 30s reconcile tick is the
+        backstop that marks local outbox rows acknowledged.
         """
+        del name  # announce scans all loaded strategies; name keeps the call site clear
         try:
             self._announce_strategy_states()
         except Exception as ex:
-            logging.warning('announce after %s state change failed: %s', name, ex)
-            return
-        try:
-            self._drain_ack_outbox()
-        except Exception as ex:
-            logging.warning('ack-outbox drain after %s state change failed: %s', name, ex)
+            logging.warning('announce after strategy state change failed: %s', ex)
 
     @log_method
     def get_strategy(self, name: str) -> Optional[Strategy]:

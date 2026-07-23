@@ -152,3 +152,66 @@ class TestStartupSubscriptionIsolation:
         ]
         rt._subscribe_all_strategies()  # must not raise
         assert attempted == [111, 222]  # beta still attempted after alpha failed
+
+
+class TestAnnounceDoesNotCallbackIntoTrader:
+    """Regression: enable/disable used to call ``_drain_ack_outbox`` inline,
+    which dials the trader's typed command socket. When disable is answering
+    a trader→strategy forward, that callback deadlocks the command path and
+    logs ``record_state_acknowledged ... timed out after 10000ms``.
+    """
+
+    def test_disable_announces_without_calling_trader_command(self, runtime_with_revisions):
+        rt = runtime_with_revisions
+
+        class _Toggleable(_StubStrategy):
+            def disable(self):
+                self.state = StrategyState.DISABLED
+                return self.state
+
+            def enable(self):
+                self.state = StrategyState.RUNNING
+                return self.state
+
+        strat = _Toggleable('vwap_reclaim_cat', StrategyState.RUNNING)
+        rt.strategy_implementations = [strat]
+
+        class _BoomClient:
+            def call(self, *args, **kwargs):
+                raise AssertionError(
+                    'disable must not call trader command client (deadlock risk)'
+                )
+
+        rt._trader_command_client = _BoomClient()
+        state = rt.disable_strategy('vwap_reclaim_cat')
+        assert state == StrategyState.DISABLED
+        assert strat.state == StrategyState.DISABLED
+        # Outbox seeded for reconcile drain; trader is never dialed here.
+        rows = _outbox_rows(rt)
+        assert any(r[0] == 'vwap_reclaim_cat' for r in rows)
+
+    def test_enable_announces_without_calling_trader_command(self, runtime_with_revisions):
+        rt = runtime_with_revisions
+
+        class _Toggleable(_StubStrategy):
+            def disable(self):
+                self.state = StrategyState.DISABLED
+                return self.state
+
+            def enable(self):
+                self.state = StrategyState.RUNNING
+                return self.state
+
+        strat = _Toggleable('orb', StrategyState.DISABLED)
+        rt.strategy_implementations = [strat]
+
+        class _BoomClient:
+            def call(self, *args, **kwargs):
+                raise AssertionError(
+                    'enable must not call trader command client (deadlock risk)'
+                )
+
+        rt._trader_command_client = _BoomClient()
+        state = rt.enable_strategy('orb')
+        assert state == StrategyState.RUNNING
+        assert any(r[0] == 'orb' for r in _outbox_rows(rt))

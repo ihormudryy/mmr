@@ -239,6 +239,8 @@ time. Depth table and PNG/export behavior are designed as part of that phase.
 
 ### Phase 3: options and forex
 
+**Status:** shipped (sub-project A, 2026-07-23); IB-backed forex snapshot/quote included via typed get_snapshot.
+
 Phase 3 adds options expirations, chain, snapshot, and implied-distribution
 views, followed by forex snapshot, quote, movers, bulk snapshot, and conversion.
 Massive-backed operations remain local to the web process. IB-backed operations

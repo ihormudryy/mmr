@@ -3156,35 +3156,13 @@ class MMR:
         """Parse a Massive option ticker like ``O:AAPL260320C00250000`` into components.
 
         Returns dict with keys: symbol, expiration, right, strike.
+
+        Delegates to `trader.tools.options_data.parse_option_ticker` — the shared
+        implementation used by the CLI and the dashboard research provider — so
+        there is exactly one parser to keep correct.
         """
-        t = ticker
-        if t.startswith('O:'):
-            t = t[2:]
-
-        # Format: SYMBOL YYMMDD C/P STRIKE*1000 (strike is 8 digits, 3 implied decimals)
-        # Find where the date starts — first digit run after the symbol
-        i = 0
-        while i < len(t) and t[i].isalpha():
-            i += 1
-        symbol = t[:i]
-        rest = t[i:]  # e.g. 260320C00250000
-
-        if len(rest) < 9:
-            raise ValueError(f"Cannot parse option ticker: {ticker}")
-
-        date_str = rest[:6]  # YYMMDD
-        right = rest[6]      # C or P
-        strike_str = rest[7:]
-
-        expiration = f'20{date_str[:2]}-{date_str[2:4]}-{date_str[4:6]}'
-        strike = float(strike_str) / 1000.0
-
-        return {
-            'symbol': symbol,
-            'expiration': expiration,
-            'right': right,
-            'strike': strike,
-        }
+        from trader.tools.options_data import parse_option_ticker
+        return parse_option_ticker(ticker)
 
     @staticmethod
     def _build_massive_option_ticker(symbol: str, expiration: str, strike: float, right: str) -> str:
@@ -3205,12 +3183,12 @@ class MMR:
         -------
         str
             Ticker like ``O:AAPL260320C00250000``.
+
+        Delegates to `trader.tools.options_data.build_option_ticker` — see
+        `_parse_massive_option_ticker` for why.
         """
-        from datetime import datetime
-        dt_obj = datetime.strptime(expiration, '%Y-%m-%d')
-        date_str = dt_obj.strftime('%y%m%d')
-        strike_int = int(strike * 1000)
-        return f'O:{symbol}{date_str}{right.upper()}{strike_int:08d}'
+        from trader.tools.options_data import build_option_ticker
+        return build_option_ticker(symbol, expiration, strike, right)
 
     def _resolve_option_contract(
         self,
@@ -3329,87 +3307,39 @@ class MMR:
             last, volume, open_interest, iv, delta, gamma, theta, vega,
             break_even, underlying_price.
         """
-        import datetime as dt_mod
+        from trader.tools.chain import get_option_dates
+        from trader.tools.options_data import chain_records
+        from massive import RESTClient
+
         cfg = self._container.config()
         api_key = cfg.get('massive_api_key', '')
         if not api_key:
             raise ValueError("massive_api_key not configured in trader.yaml")
 
         if not expiration:
-            from trader.tools.chain import get_option_dates
             dates = get_option_dates(symbol, api_key=api_key)
             if not dates:
                 return pd.DataFrame()
             expiration = dates[0]
 
-        from massive import RESTClient
-        client = RESTClient(api_key=api_key)
-
-        rows = []
-        for snap in client.list_snapshot_options_chain(
-            underlying_asset=symbol,
-            params={'expiration_date': expiration},
-        ):
-            details = snap.details
-            if not details or not details.strike_price:
-                continue
-
-            ct = (details.contract_type or '').lower()
-            if contract_type and ct != contract_type.lower():
-                continue
-
-            strike = details.strike_price
-            if strike_min is not None and strike < strike_min:
-                continue
-            if strike_max is not None and strike > strike_max:
-                continue
-
-            bid = ask = last = volume = 0.0
-            if snap.last_quote:
-                bid = snap.last_quote.bid or 0.0
-                ask = snap.last_quote.ask or 0.0
-            if snap.last_trade:
-                last = getattr(snap.last_trade, 'price', 0.0) or 0.0
-            if snap.day:
-                volume = getattr(snap.day, 'volume', 0.0) or 0.0
-
-            mid = (bid + ask) / 2.0 if (bid and ask) else 0.0
-
-            greeks = snap.greeks
-            delta = gamma = theta = vega = 0.0
-            if greeks:
-                delta = greeks.delta or 0.0
-                gamma = greeks.gamma or 0.0
-                theta = greeks.theta or 0.0
-                vega = greeks.vega or 0.0
-
-            underlying_price = 0.0
-            if snap.underlying_asset:
-                underlying_price = snap.underlying_asset.price or 0.0
-
-            rows.append({
-                'ticker': details.ticker or '',
-                'type': ct,
-                'strike': strike,
-                'expiration': details.expiration_date or expiration,
-                'bid': bid,
-                'ask': ask,
-                'mid': mid,
-                'last': last,
-                'volume': volume,
-                'open_interest': snap.open_interest or 0.0,
-                'iv': (snap.implied_volatility or 0.0) * 100.0,  # as percentage
-                'delta': delta,
-                'gamma': gamma,
-                'theta': theta,
-                'vega': vega,
-                'break_even': snap.break_even_price or 0.0,
-                'underlying_price': underlying_price,
-            })
+        rows = chain_records(
+            RESTClient(api_key=api_key), symbol,
+            expiration=expiration, contract_type=contract_type,
+            strike_min=strike_min, strike_max=strike_max,
+        )
 
         df = pd.DataFrame(rows)
         if not df.empty:
-            df = df.sort_values(by=['type', 'strike']).reset_index(drop=True)
+            # chain_records omits iv/greeks keys entirely when the Massive
+            # payload doesn't carry them (no-fabrication — must not read as
+            # 0.0). Reindex to the full documented column set so every
+            # column always exists; missing values become NaN, not 0.0, and
+            # the CLI's unconditional per-row formatting never KeyErrors.
+            columns = ["ticker", "type", "strike", "expiration", "bid", "ask",
+                       "mid", "last", "volume", "open_interest", "iv",
+                       "delta", "gamma", "theta", "vega", "break_even",
+                       "underlying_price"]
+            df = df.reindex(columns=columns)
         return df
 
     def options_snapshot(self, option_ticker: str) -> dict:
@@ -3425,56 +3355,15 @@ class MMR:
         dict
             Snapshot details including greeks, quote, underlying price.
         """
+        from trader.tools.options_data import contract_snapshot
+        from massive import RESTClient
+
         cfg = self._container.config()
         api_key = cfg.get('massive_api_key', '')
         if not api_key:
             raise ValueError("massive_api_key not configured in trader.yaml")
 
-        parsed = self._parse_massive_option_ticker(option_ticker)
-        # The Massive API wants the ticker without the O: prefix
-        ticker_clean = option_ticker
-        if ticker_clean.startswith('O:'):
-            ticker_clean = ticker_clean[2:]
-
-        from massive import RESTClient
-        client = RESTClient(api_key=api_key)
-        snap = client.get_snapshot_option(
-            underlying_asset=parsed['symbol'],
-            option_contract=ticker_clean,
-        )
-
-        result = {
-            'ticker': option_ticker,
-            'symbol': parsed['symbol'],
-            'expiration': parsed['expiration'],
-            'strike': parsed['strike'],
-            'right': parsed['right'],
-            'break_even': snap.break_even_price or 0.0,
-            'implied_volatility': f'{(snap.implied_volatility or 0.0) * 100.0:.2f}%',
-            'open_interest': snap.open_interest or 0.0,
-        }
-
-        if snap.last_quote:
-            result['bid'] = snap.last_quote.bid or 0.0
-            result['ask'] = snap.last_quote.ask or 0.0
-            result['mid'] = ((snap.last_quote.bid or 0.0) + (snap.last_quote.ask or 0.0)) / 2.0
-
-        if snap.last_trade:
-            result['last'] = getattr(snap.last_trade, 'price', 0.0) or 0.0
-
-        if snap.greeks:
-            result['delta'] = snap.greeks.delta or 0.0
-            result['gamma'] = snap.greeks.gamma or 0.0
-            result['theta'] = snap.greeks.theta or 0.0
-            result['vega'] = snap.greeks.vega or 0.0
-
-        if snap.underlying_asset:
-            result['underlying_price'] = snap.underlying_asset.price or 0.0
-
-        if snap.day:
-            result['volume'] = getattr(snap.day, 'volume', 0.0) or 0.0
-
-        return result
+        return contract_snapshot(RESTClient(api_key=api_key), option_ticker)
 
     def options_implied(
         self,

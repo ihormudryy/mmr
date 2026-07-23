@@ -17,8 +17,12 @@ Living deployed state (armed names, accounts) lives in
 | **One** paper strategy places protected orders without human approve | Yes — **paper automation** (`execute_automated_intent`) |
 | Many strategies all auto-trade unsupervised | No — **exactly one** `automation.strategy_name` |
 | `auto_execute: true` (blind auto) | No — refused at load |
-| Other strategies queue trades for you | Yes — `auto_execute: propose` → `approve` (CLI or dashboard) |
+| Other strategies queue trades for you | Yes — `auto_execute: propose` → PENDING; on **paper** the LLM may evaluate then approve/reject; on **live** a human must approve |
 | Same automation on **live** | No — `automation.live_enabled` must stay `false` |
+| LLM approve on paper after evaluation | Yes — not blind auto-approve; see `2026-07-23-paper-llm-approve-live-human-design.md` |
+| LLM approve on live | No — `LLM_LIVE_APPROVE_FORBIDDEN`; Command Center + preflight only |
+
+Paper LLM evaluate-approve (`approve_proposal` with `source=sdk`) is **not** the same as paper automation (`execute_automated_intent`).
 
 ---
 

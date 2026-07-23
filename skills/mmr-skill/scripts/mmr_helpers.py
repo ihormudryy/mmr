@@ -3000,6 +3000,12 @@ class MMRHelpers:
         """
         Approve and execute a trade proposal. Requires trader_service.
 
+        **Paper:** allowed after careful evaluation (sizing, portfolio-risk,
+        quote/session). Decide approve **or** reject — never blind auto-approve.
+
+        **Live:** refused — human must approve via Command Center live ceremony.
+        The SDK returns ``LLM_LIVE_APPROVE_FORBIDDEN`` before placing an order.
+
         :param proposal_id: Proposal ID to approve
 
         Example:

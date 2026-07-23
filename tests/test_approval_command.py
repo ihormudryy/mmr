@@ -256,12 +256,12 @@ def _build_approval(tmp_path, *, account_mode, account_id):
         )
         return written[0]
 
-    def execute_approve(record, command_id, expected_version=None):
+    def execute_approve(record, command_id, expected_version=None, source="dashboard"):
         ev = record.revision if expected_version is None else expected_version
         request = CommandRequest(
             command_id=command_id, action="approve_proposal", account_id=account_id,
             target_type="proposal", target_id=str(record.id), expected_version=ev,
-            body={"proposal_id": record.id}, source="dashboard",
+            body={"proposal_id": record.id}, source=source,
             preflight_nonce=f"nonce-{command_id}",
         )
         return coordinator.execute(request)
@@ -358,6 +358,42 @@ def test_live_mode_requires_fresh_live_executable_side_quote(approval_live):
 def test_live_ineligible_row_cannot_be_approved_live(approval_live):
     record = approval_live.pending(conid=265598, action="BUY", live_approval_eligible=False)
     assert approval_live.execute_approve(record, "c1").error_code == "LIVE_INELIGIBLE"
+
+
+def test_paper_sdk_source_may_approve(approval):
+    """Paper: LLM/SDK evaluate-then-approve is allowed (source=sdk)."""
+    record = approval.pending(conid=265598, action="BUY")
+    receipt = approval.execute_approve(record, "cmd-sdk-paper", source="sdk")
+    assert receipt.state == "SUBMITTED"
+    assert approval.repo.get(record.id).status == "EXECUTED"
+
+
+def test_live_sdk_source_refused(approval_live):
+    """Live: non-human approve actors are refused before dispatch."""
+    record = approval_live.pending(conid=265598, action="BUY")
+    approval_live.quotes.set(265598, ask=210.0, feed_type="live", age_seconds=0.5)
+    for source in ("sdk", "cli", "llm"):
+        receipt = approval_live.execute_approve(
+            record, f"cmd-{source}", source=source,
+        )
+        assert receipt.state == "REJECTED"
+        assert receipt.error_code == "LLM_LIVE_APPROVE_FORBIDDEN"
+        assert receipt.retryable is False
+    assert approval_live.orders.submissions == []
+    assert approval_live.repo.get(record.id).status == "PENDING"
+
+
+def test_live_dashboard_source_still_approves(approval_live):
+    """Live human path (dashboard + preflight) remains allowed."""
+    # Live accounts seed paused for new exposure; resume before approve.
+    approval_live.controls.set(
+        "U1234567", False, 1, "resume-1", "test unpause", NOW,
+    )
+    record = approval_live.pending(conid=265598, action="BUY")
+    approval_live.quotes.set(265598, ask=210.0, feed_type="live", age_seconds=0.5)
+    receipt = approval_live.execute_approve(record, "cmd-dash", source="dashboard")
+    assert receipt.state == "SUBMITTED"
+    assert approval_live.repo.get(record.id).status == "EXECUTED"
 
 
 def test_position_reducing_exit_is_exempt_but_quantity_capped(approval):
@@ -628,6 +664,53 @@ def test_approve_proposal_rpc_surface_registers_and_drives_a_real_approve(approv
     assert result["state"] == "SUBMITTED"
     assert result["command_id"] == "cmd-rpc"
     assert approval.repo.get(record.id).status == "EXECUTED"
+
+
+def test_approve_proposal_rpc_stamps_sdk_source_and_allows_paper(approval):
+    registry = TypedRpcRegistry()
+    register_command_authority(
+        registry, approval.coordinator, _minimal_proposal_service(approval), approval.repo,
+        account_id="DU111111", account_mode="paper", controls=approval.controls,
+        resume_ready=lambda: True, reconciliation_complete=lambda command_id: True,
+        approval_service=approval.service,
+    )
+    record = approval.pending(conid=265598, action="BUY")
+    registration = registry.resolve("command", "approve_proposal")
+    parsed = ApproveProposalRequest(
+        command_id="cmd-rpc-sdk", proposal_id=record.id,
+        expected_version=record.revision, source="sdk",
+    )
+    result = registration.handler(parsed)
+    assert result["state"] == "SUBMITTED"
+
+
+def test_approve_proposal_rpc_live_refuses_sdk_source(approval_live):
+    registry = TypedRpcRegistry()
+    register_command_authority(
+        registry, approval_live.coordinator,
+        ProposalCommandService(
+            repository=approval_live.repo, journal=approval_live.journal,
+            risk_gate=approval_live.risk_gate, quotes=approval_live.quotes,
+            universe=SimpleNamespace(resolve_conid=lambda conid: None),
+            account_id="U1234567", account_mode="live", now=approval_live.now,
+            controls=approval_live.controls, positions=approval_live.positions,
+        ),
+        approval_live.repo,
+        account_id="U1234567", account_mode="live", controls=approval_live.controls,
+        resume_ready=lambda: True, reconciliation_complete=lambda command_id: True,
+        approval_service=approval_live.service,
+    )
+    record = approval_live.pending(conid=265598, action="BUY")
+    approval_live.quotes.set(265598, ask=210.0, feed_type="live", age_seconds=0.5)
+    registration = registry.resolve("command", "approve_proposal")
+    parsed = ApproveProposalRequest(
+        command_id="cmd-rpc-live-sdk", proposal_id=record.id,
+        expected_version=record.revision, source="sdk",
+        preflight_nonce="nonce-cmd-rpc-live-sdk",
+    )
+    result = registration.handler(parsed)
+    assert result["state"] == "REJECTED"
+    assert result["error_code"] == "LLM_LIVE_APPROVE_FORBIDDEN"
 
 
 def test_approve_proposal_request_model_rejects_extra_field():

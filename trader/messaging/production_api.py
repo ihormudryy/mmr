@@ -630,7 +630,13 @@ class ApproveProposalRequest(BaseModel):
     ``revision`` the caller reviewed -- a stale approval is rejected
     (``REVISION_MISMATCH``) rather than acting on a proposal that changed.
     The account is the coordinator's own configured account, never
-    request-supplied (there is no ``account_id`` field)."""
+    request-supplied (there is no ``account_id`` field).
+
+    ``source`` identifies the actor (``dashboard`` / ``sdk`` / ``cli`` /
+    ``llm``). On live, non-dashboard sources are refused
+    (``LLM_LIVE_APPROVE_FORBIDDEN``); on paper the LLM/SDK may approve after
+    evaluation. Default ``dashboard`` preserves the web gateway contract.
+    """
 
     model_config = ConfigDict(extra="forbid")
 
@@ -639,6 +645,7 @@ class ApproveProposalRequest(BaseModel):
     expected_version: int
     preflight_nonce: Optional[str] = None
     session_fingerprint: Optional[str] = None
+    source: str = "dashboard"
 
     @field_validator("command_id")
     @classmethod
@@ -1085,7 +1092,8 @@ def _approve_proposal_rpc_handler(coordinator: TradingCommandCoordinator, accoun
             command_id=parsed.command_id, action="approve_proposal", account_id=account_id,
             target_type="proposal", target_id=str(parsed.proposal_id),
             expected_version=parsed.expected_version,
-            body={"proposal_id": parsed.proposal_id}, source="dashboard",
+            body={"proposal_id": parsed.proposal_id},
+            source=(parsed.source or "dashboard").strip() or "dashboard",
             preflight_nonce=parsed.preflight_nonce,
             session_fingerprint=parsed.session_fingerprint,
         )

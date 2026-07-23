@@ -1250,6 +1250,12 @@ def _assert_proposal_revision(expected: int) -> Callable[[duckdb.DuckDBPyConnect
     return _write
 
 
+# Non-human approve actors. On live these are refused
+# (``LLM_LIVE_APPROVE_FORBIDDEN``); on paper they may approve after evaluation.
+# ``dashboard`` remains the human Command Center path (live + preflight).
+NON_HUMAN_APPROVE_SOURCES = frozenset({"sdk", "cli", "llm"})
+
+
 class ApprovalCommandService:
     """The approval saga -- the ONE command that dispatches real orders.
 
@@ -1272,6 +1278,9 @@ class ApprovalCommandService:
     THEN is the bracket dispatched. A clean rejection marks the proposal
     ``FAILED``; an ambiguous dispatch (timeout/disconnect) leaves it
     ``APPROVED`` for the Task-9 reconciler and NEVER auto-retries.
+
+    Live + ``source`` in ``NON_HUMAN_APPROVE_SOURCES`` is refused before
+    dispatch (``LLM_LIVE_APPROVE_FORBIDDEN``). Paper allows those sources.
     """
 
     def __init__(
@@ -1532,6 +1541,14 @@ class ApprovalCommandService:
             return reject("WRONG_ACCOUNT", False)
         if self._account_mode == "live" and not record.live_approval_eligible:
             return reject("LIVE_INELIGIBLE", False)
+        # Paper LLM/SDK may approve after evaluation; live requires a human
+        # dashboard path (preflight + source=dashboard). See
+        # docs/superpowers/specs/2026-07-23-paper-llm-approve-live-human-design.md.
+        if (
+            self._account_mode == "live"
+            and (cmd.source or "").strip().lower() in NON_HUMAN_APPROVE_SOURCES
+        ):
+            return reject("LLM_LIVE_APPROVE_FORBIDDEN", False)
         inflight = [
             r for r in self._ledger.unresolved_for_target("proposal", str(record.id))
             if r.command_id != cmd.command_id

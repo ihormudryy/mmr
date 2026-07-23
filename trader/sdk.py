@@ -1655,31 +1655,45 @@ class MMR:
         (a CAS guard against approving a proposal that changed since the
         caller last reviewed it). When omitted, the SDK fetches the
         proposal's current revision via ``get_proposal`` first.
+
+        On **live**, SDK/LLM approve is refused (``LLM_LIVE_APPROVE_FORBIDDEN``)
+        — use the Command Center live ceremony. On **paper**, the LLM may
+        approve after evaluation; this call stamps ``source=sdk``.
         """
         import uuid
         from trader.domain.commands import CommandReceipt
         from trader.messaging.typed_rpc import TypedRpcRemoteError
 
+        # Always fetch for the live gate (and revision when the caller omitted it).
+        try:
+            view = self._typed_query.call(
+                'get_proposal', {'proposal_id': proposal_id}, dict)
+        except TypedRpcRemoteError as ex:
+            # e.g. PROPOSAL_NOT_FOUND — a clean, expected refusal, not a
+            # transport failure.
+            return SuccessFail.fail(
+                error=f'Proposal #{proposal_id}: {ex.code}: {ex.message}', exception=ex)
+        except (TimeoutError, ConnectionError) as ex:
+            return SuccessFail.fail(
+                error=f'could not fetch proposal #{proposal_id} to approve: {ex}',
+                exception=ex)
+
+        if (view.get('account_mode') or '').lower() == 'live':
+            return SuccessFail.fail(error=(
+                f'Proposal #{proposal_id}: LLM_LIVE_APPROVE_FORBIDDEN — '
+                f'SDK/LLM cannot approve on a live account. Use the Command '
+                f'Center live ceremony (human + preflight), or reject the '
+                f'proposal if it should not trade.'
+            ))
+
         if expected_version is None:
-            try:
-                view = self._typed_query.call(
-                    'get_proposal', {'proposal_id': proposal_id}, dict)
-            except TypedRpcRemoteError as ex:
-                # e.g. PROPOSAL_NOT_FOUND — a clean, expected refusal, not a
-                # transport failure.
-                return SuccessFail.fail(
-                    error=f'Proposal #{proposal_id}: {ex.code}: {ex.message}', exception=ex)
-            except (TimeoutError, ConnectionError) as ex:
-                return SuccessFail.fail(
-                    error=f'could not fetch proposal #{proposal_id} to approve: {ex}',
-                    exception=ex)
             expected_version = view.get('revision')
 
         try:
             receipt = self._typed_command.call(
                 'approve_proposal',
                 {'command_id': f'sdk-{uuid.uuid4()}', 'proposal_id': proposal_id,
-                 'expected_version': expected_version},
+                 'expected_version': expected_version, 'source': 'sdk'},
                 CommandReceipt,
             )
         except (TimeoutError, ConnectionError) as ex:

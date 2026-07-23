@@ -579,6 +579,7 @@ def approve_proposal(pid: int, body: ApproveProposalBody, request: Request,
         "expected_version": body.expected_version,
         "preflight_nonce": body.preflight_nonce,
         "session_fingerprint": session_fingerprint(session),
+        "source": "dashboard",
     })
     return _receipt_json(receipt)
 

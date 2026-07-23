@@ -38,7 +38,7 @@ All configuration is set via `TradingLoop.config` before starting the loop.
 
 | Key | Default | Description |
 |-----|---------|-------------|
-| `auto_approve` | `false` | If true, auto-approves proposals below a confidence threshold. **Use with extreme caution.** |
+| `auto_approve` | `false` | **Must stay false.** Blind confidence-threshold fire is forbidden. On paper the loop/LLM evaluates then calls `approve` or `reject`; on live only a human may approve (`LLM_LIVE_APPROVE_FORBIDDEN` for SDK). |
 
 ## Context Management
 

@@ -1447,7 +1447,8 @@ class TestTypedProposalAdapters:
     this class)."""
 
     def test_sdk_approve_is_a_typed_command_with_no_store_write(self, mmr, typed):
-        typed.queue_query('get_proposal', {'proposal_id': 7, 'revision': 3, 'status': 'PENDING'})
+        typed.queue_query('get_proposal', {'proposal_id': 7, 'revision': 3, 'status': 'PENDING',
+                                          'account_mode': 'paper'})
         typed.queue_command('approve_proposal', CommandReceipt(
             command_id='sdk-x', correlation_id='sdk-x', state='SUBMITTED',
             outcome={'order_ids': [17], 'order_group_id': 'og-sdk-x'},
@@ -1458,10 +1459,12 @@ class TestTypedProposalAdapters:
         assert call.method == 'approve_proposal'
         assert call.body['proposal_id'] == 7 and call.body['expected_version'] == 3
         assert call.body['command_id'].startswith('sdk-')
+        assert call.body['source'] == 'sdk'
         assert typed.store_writes == []                       # no ProposalStore mutation anywhere
 
     def test_sdk_surfaces_outcome_unknown_without_marking_failed(self, mmr, typed):
-        typed.queue_query('get_proposal', {'proposal_id': 7, 'revision': 3, 'status': 'PENDING'})
+        typed.queue_query('get_proposal', {'proposal_id': 7, 'revision': 3, 'status': 'PENDING',
+                                          'account_mode': 'paper'})
         typed.queue_command('approve_proposal', CommandReceipt(
             command_id='sdk-x', correlation_id='sdk-x', state='OUTCOME_UNKNOWN',
             outcome=None, error_code='DISPATCH_AMBIGUOUS', retryable=False))
@@ -1470,16 +1473,28 @@ class TestTypedProposalAdapters:
         assert 'reconcil' in result.error.lower()             # loud ambiguity, never silent failure
         assert 'do not re-approve' in result.error.lower()
 
-    def test_sdk_approve_honors_explicit_expected_version_no_fetch(self, mmr, typed):
-        """When the caller already knows the revision (e.g. re-driving from
-        `proposals()`'s own `revision` column), approve() must not issue a
-        get_proposal fetch first."""
+    def test_sdk_approve_honors_explicit_expected_version_still_fetches_for_live_gate(self, mmr, typed):
+        """Caller-supplied revision is honored, but get_proposal still runs so
+        the live account_mode gate can refuse before the command RPC."""
+        typed.queue_query('get_proposal', {
+            'proposal_id': 9, 'revision': 99, 'status': 'PENDING', 'account_mode': 'paper',
+        })
         typed.queue_command('approve_proposal', CommandReceipt(
             'sdk-y', 'sdk-y', 'SUBMITTED', {'order_ids': [1]}, None, False))
         result = mmr.approve(9, expected_version=5)
         assert result.is_success()
-        assert typed.queries == []
+        assert len(typed.queries) == 1
         assert typed.commands[0].body['expected_version'] == 5
+        assert typed.commands[0].body['source'] == 'sdk'
+
+    def test_sdk_approve_refuses_live_account_mode_before_command(self, mmr, typed):
+        typed.queue_query('get_proposal', {
+            'proposal_id': 7, 'revision': 3, 'status': 'PENDING', 'account_mode': 'live',
+        })
+        result = mmr.approve(7)
+        assert not result.is_success()
+        assert 'LLM_LIVE_APPROVE_FORBIDDEN' in result.error
+        assert typed.commands == []
 
     def test_sdk_propose_and_reject_are_typed_calls(self, mmr, typed):
         typed.queue_query('discover_instrument', {

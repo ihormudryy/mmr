@@ -12,11 +12,23 @@ metadata:
 
 ## ⚠️ TRADING POLICY — READ THIS FIRST ⚠️
 
-**NEVER BYPASS `propose → approve` FOR ACTIONABLE TRADES.** Every new position (entry, add, rotation, cover) goes through this pipeline:
+**NEVER BYPASS `propose → approve/reject` FOR ACTIONABLE TRADES.** Every new position (entry, add, rotation, cover) goes through this pipeline:
 
 1. `MMRHelpers.propose(symbol, action, ...)` — creates a reviewable plan
-2. Inspect `sizing_result`, `portfolio_risk`, related proposals
-3. `MMRHelpers.approve(proposal_id)` — executes after review
+2. **Evaluate** (required before decide):
+   - `proposal_show(N)` / `proposals show N` — sizing_result, reasoning, brackets
+   - `portfolio_risk()` / snapshot — concentration, group budget, remaining capacity
+   - Quote / session sanity (or document after-hours caveat)
+3. Then **either** `approve(proposal_id)` **or** `reject(proposal_id, reason=...)` with a short written reason
+
+### Paper vs live
+
+| Mode | Who may approve |
+|------|-----------------|
+| **Paper** | **You (the LLM)** may `approve` or `reject` after the checklist above. Not blind auto-approve. |
+| **Live** | **Human only** via Command Center live ceremony. SDK/LLM `approve` is refused (`LLM_LIVE_APPROVE_FORBIDDEN`). You may still `reject` PENDING proposals. Propose + review only — stop before the wire. |
+
+Blind `auto_approve` is forbidden. Do not approve without completing the evaluation checklist.
 
 **Do NOT use `MMRHelpers.buy()` / `MMRHelpers.sell()` / `MMRHelpers.cli("buy ...")` to open or modify positions based on your own judgment.** Those exist for two narrow cases only:
 - Manual human-driven single-trade CLI usage (you're not human)

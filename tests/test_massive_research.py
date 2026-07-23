@@ -400,3 +400,22 @@ def test_forex_convert_reads_real_massive_attribute_names():
     assert result.data["bid"] == 1.0849
     assert result.data["ask"] == 1.0851
     assert "rate" not in result.data
+
+
+def test_forex_snapshot_twelvedata_uses_slash_symbol_and_notice():
+    from types import SimpleNamespace as NS
+    calls = []
+    td = NS(quote=lambda symbol: calls.append(symbol) or NS(as_json=lambda: {
+        "open": "1.08", "high": "1.09", "low": "1.07", "close": "1.085",
+        "change": "0.001", "percent_change": "0.09"}))
+    result = MassiveResearch(object(), td_client=td).forex_snapshot("EURUSD", source="twelvedata")
+    assert calls == ["EUR/USD"]
+    assert result.provider == "twelvedata"
+    assert "bid/ask" in (result.notice or "")
+    assert result.data["close"] == 1.085
+
+
+def test_forex_snapshot_rejects_unknown_source():
+    import pytest
+    with pytest.raises(ValueError):
+        MassiveResearch(object()).forex_snapshot("EURUSD", source="bogus")

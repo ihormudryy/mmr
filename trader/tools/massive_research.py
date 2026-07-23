@@ -296,7 +296,9 @@ class MassiveResearch:
         if not ticker.startswith("C:"):
             ticker = f"C:{ticker}"
         if source == "twelvedata":
-            payload = self._td_client.quote(symbol=ticker[2:]).as_json()
+            raw = pair.upper().replace("C:", "").replace("/", "")
+            td_symbol = f"{raw[:3]}/{raw[3:6]}"
+            payload = self._td_client.quote(symbol=td_symbol).as_json()
             data = {
                 "ticker": ticker,
                 "last": _td_float(payload, "close"),
@@ -311,26 +313,29 @@ class MassiveResearch:
                 json_clean(data), f"Forex snapshot: {ticker}",
                 provider="twelvedata", notice="TwelveData REST has no bid/ask.",
             )
-        snap = self._client.get_snapshot_ticker(market_type="forex", ticker=ticker)
-        data: dict[str, Any] = {"ticker": ticker}
-        if snap.day:
-            for field in ("open", "high", "low", "close", "volume", "vwap"):
-                data[field] = getattr(snap.day, field, None)
-        if snap.last_quote:
-            # Mirrors sdk.py's forex_snapshot massive branch: some Massive
-            # forex quote payloads use a bare "P" price field instead of
-            # separate bid/ask.
-            data["bid"] = (
-                getattr(snap.last_quote, "bid", None)
-                or getattr(snap.last_quote, "P", None)
-            )
-            data["ask"] = (
-                getattr(snap.last_quote, "ask", None)
-                or getattr(snap.last_quote, "P", None)
-            )
-        data["change"] = getattr(snap, "todays_change", None)
-        data["change_pct"] = getattr(snap, "todays_change_percent", None)
-        return ResearchResult(json_clean(data), f"Forex snapshot: {ticker}")
+        elif source == "massive":
+            snap = self._client.get_snapshot_ticker(market_type="forex", ticker=ticker)
+            data: dict[str, Any] = {"ticker": ticker}
+            if snap.day:
+                for field in ("open", "high", "low", "close", "volume", "vwap"):
+                    data[field] = getattr(snap.day, field, None)
+            if snap.last_quote:
+                # Mirrors sdk.py's forex_snapshot massive branch: some Massive
+                # forex quote payloads use a bare "P" price field instead of
+                # separate bid/ask.
+                data["bid"] = (
+                    getattr(snap.last_quote, "bid", None)
+                    or getattr(snap.last_quote, "P", None)
+                )
+                data["ask"] = (
+                    getattr(snap.last_quote, "ask", None)
+                    or getattr(snap.last_quote, "P", None)
+                )
+            data["change"] = getattr(snap, "todays_change", None)
+            data["change_pct"] = getattr(snap, "todays_change_percent", None)
+            return ResearchResult(json_clean(data), f"Forex snapshot: {ticker}")
+        else:
+            raise ValueError(f"unknown forex source: {source!r}")
 
     def forex_quote(self, from_ccy: str, to_ccy: str, *, source: str) -> ResearchResult:
         if source == "ib":
@@ -347,15 +352,18 @@ class MassiveResearch:
                 json_clean(data), f"Forex quote: {pair}",
                 provider="twelvedata", notice="TwelveData REST has no bid/ask.",
             )
-        result = self._client.get_last_forex_quote(from_ccy.upper(), to_ccy.upper())
-        data = {"pair": pair, "symbol": getattr(result, "symbol", pair)}
-        last = getattr(result, "last", None)
-        if last:
-            data["bid"] = getattr(last, "bid", None)
-            data["ask"] = getattr(last, "ask", None)
-            data["exchange"] = getattr(last, "exchange", None)
-            data["timestamp"] = getattr(last, "timestamp", None)
-        return ResearchResult(json_clean(data), f"Forex quote: {pair}")
+        elif source == "massive":
+            result = self._client.get_last_forex_quote(from_ccy.upper(), to_ccy.upper())
+            data = {"pair": pair, "symbol": getattr(result, "symbol", pair)}
+            last = getattr(result, "last", None)
+            if last:
+                data["bid"] = getattr(last, "bid", None)
+                data["ask"] = getattr(last, "ask", None)
+                data["exchange"] = getattr(last, "exchange", None)
+                data["timestamp"] = getattr(last, "timestamp", None)
+            return ResearchResult(json_clean(data), f"Forex quote: {pair}")
+        else:
+            raise ValueError(f"unknown forex source: {source!r}")
 
     def forex_movers(self, direction: str) -> ResearchResult:
         snaps = self._client.get_snapshot_direction(market_type="forex", direction=direction)

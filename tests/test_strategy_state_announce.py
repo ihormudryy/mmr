@@ -1,6 +1,6 @@
 """Strategy state announcement + split-container transport wiring.
 
-Covers the three coupled gaps that left the command center's Strategies
+Covers the coupled gaps that left the command center's Strategies
 panel permanently empty against a split-container deployment:
 
 1. Nothing ever *seeded* loaded strategies into the acknowledgement outbox —
@@ -18,6 +18,12 @@ panel permanently empty against a split-container deployment:
 3. ``run()``'s startup instrument-subscription loop had no per-strategy
    exception isolation — one dead legacy RPC aborted startup for every
    strategy. ``_subscribe_all_strategies`` isolates each strategy.
+
+4. Startup announced into the outbox but deferred drain until the 30s
+   reconcile loop, which only starts *after* ``get_historical_data()``.
+   A long IB backfill left the Trading-tab Strategies panel empty for
+   minutes. ``_schedule_startup_ack_drain`` runs drain in the background
+   concurrent with historical fetch.
 """
 
 import pytest
@@ -239,3 +245,71 @@ class TestDrainAckOutboxFailFast:
         assert len(calls) == 1
         assert calls[0][0] == 'record_state_acknowledged'
         assert calls[0][2] == 3.0
+
+
+class TestStartupAckDrain:
+    """Trading-tab strategies come from journaled strategy.updated rows.
+    Startup used to wait for get_historical_data() before the reconcile
+    loop drained the ack outbox — a long IB backfill left the panel empty.
+    Background drain must run concurrently and not block the event loop.
+    """
+
+    @pytest.mark.asyncio
+    async def test_startup_drain_empties_outbox(self, runtime_with_revisions):
+        rt = runtime_with_revisions
+        rt.strategy_implementations = [
+            _StubStrategy('alpha'), _StubStrategy('beta'),
+        ]
+        rt._announce_strategy_states()
+        assert _outbox_rows(rt)  # seeded
+
+        class _OkClient:
+            def call(self, method, body, response_model, timeout=None):
+                return {'entity_revision': body['state_revision']}
+
+        rt._trader_command_client = _OkClient()
+        await rt._startup_drain_ack_outbox(attempts=3, interval_s=0.0)
+        assert rt._revisions.unacknowledged_outbox(10) == []
+
+    @pytest.mark.asyncio
+    async def test_startup_drain_retries_after_timeout(self, runtime_with_revisions):
+        rt = runtime_with_revisions
+        rt.strategy_implementations = [_StubStrategy('alpha')]
+        rt._announce_strategy_states()
+        calls = {'n': 0}
+
+        class _FlakyClient:
+            def call(self, method, body, response_model, timeout=None):
+                calls['n'] += 1
+                if calls['n'] < 2:
+                    raise TimeoutError('trader not ready')
+                return {'entity_revision': 1}
+
+        rt._trader_command_client = _FlakyClient()
+        await rt._startup_drain_ack_outbox(attempts=5, interval_s=0.0)
+        assert calls['n'] >= 2
+        assert rt._revisions.unacknowledged_outbox(10) == []
+
+    @pytest.mark.asyncio
+    async def test_schedule_startup_drain_is_non_blocking(self, runtime_with_revisions):
+        rt = runtime_with_revisions
+        rt.strategy_implementations = [_StubStrategy('alpha')]
+        rt._announce_strategy_states()
+        gate = {'entered': False, 'release': False}
+
+        class _SlowClient:
+            def call(self, method, body, response_model, timeout=None):
+                gate['entered'] = True
+                while not gate['release']:
+                    import time
+                    time.sleep(0.01)
+                return {'entity_revision': 1}
+
+        rt._trader_command_client = _SlowClient()
+        task = rt._schedule_startup_ack_drain(attempts=1, interval_s=0.0)
+        assert task is not None
+        # Returns immediately even though the drain thread is blocked.
+        assert not task.done()
+        gate['release'] = True
+        await task
+        assert rt._revisions.unacknowledged_outbox(10) == []

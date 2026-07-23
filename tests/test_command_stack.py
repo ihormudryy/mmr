@@ -397,3 +397,22 @@ def test_automation_live_enabled_refused_at_stack_build(tmp_path):
     with pytest.raises(CommandStackConfigurationError) as exc:
         build_command_stack(trader, _policy(), now=lambda: NOW)
     assert exc.value.code == "AUTOMATION_LIVE_REFUSED"
+
+
+def test_frozen_command_stack_late_binds_automated_intent_service(tmp_path):
+    """Paper hot-arm late-binds execute path onto a frozen CommandStack."""
+    from dataclasses import FrozenInstanceError
+
+    from trader.trading.command_stack import CommandStack, build_command_stack
+
+    trader = _trader(tmp_path)
+    stack = build_command_stack(trader, _policy(), now=lambda: NOW)
+    assert isinstance(stack, CommandStack)
+    assert stack.automated_intent_service is None
+    with pytest.raises(FrozenInstanceError):
+        stack.automated_intent_service = object()
+    sentinel = object()
+    object.__setattr__(stack, "automated_intent_service", sentinel)
+    assert stack.automated_intent_service is sentinel
+    object.__setattr__(stack, "automated_intent_service", None)
+    assert stack.automated_intent_service is None

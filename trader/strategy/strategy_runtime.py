@@ -2165,6 +2165,75 @@ class StrategyRuntime():
                 continue
             self._revisions.mark_acknowledged(row.ack_id)
 
+    async def _startup_drain_ack_outbox(
+        self,
+        *,
+        attempts: int = 15,
+        interval_s: float = 2.0,
+        call_timeout: float = 3.0,
+    ) -> None:
+        """Retry ack-outbox drain off the event loop until empty or exhausted.
+
+        Runs while ``get_historical_data()`` may still be in flight so the
+        trader journals ``strategy.updated`` (and the command-center Trading
+        tab Strategies panel fills) without waiting for a multi-minute IB
+        backfill. Each drain call is ``asyncio.to_thread``'d — never inline
+        on the loop — so a slow/unreachable trader cannot stall ticks or
+        history. The 30s reconcile loop remains the durable backstop.
+        """
+        for attempt in range(1, attempts + 1):
+            try:
+                await asyncio.to_thread(
+                    self._drain_ack_outbox, 50, call_timeout=call_timeout,
+                )
+            except Exception as ex:
+                logging.warning(
+                    'startup ack-outbox drain failed (attempt %s/%s): %s',
+                    attempt, attempts, ex,
+                )
+            if self._revisions is None:
+                return
+            if not self._revisions.unacknowledged_outbox(1):
+                logging.debug(
+                    'startup ack-outbox drain complete on attempt %s/%s',
+                    attempt, attempts,
+                )
+                return
+            if attempt < attempts and interval_s > 0:
+                await asyncio.sleep(interval_s)
+        logging.warning(
+            'startup ack-outbox drain exhausted %s attempts with rows still '
+            'pending; reconcile loop will continue draining',
+            attempts,
+        )
+
+    def _schedule_startup_ack_drain(
+        self,
+        *,
+        attempts: int = 15,
+        interval_s: float = 2.0,
+        call_timeout: float = 3.0,
+    ) -> Optional[asyncio.Task]:
+        """Fire-and-forget ``_startup_drain_ack_outbox`` on the running loop.
+
+        Returns ``None`` when called outside a running event loop (unit tests
+        that only exercise sync paths). Does not await the drain.
+        """
+        try:
+            loop = asyncio.get_running_loop()
+        except RuntimeError:
+            return None
+        task = loop.create_task(
+            self._startup_drain_ack_outbox(
+                attempts=attempts,
+                interval_s=interval_s,
+                call_timeout=call_timeout,
+            ),
+            name='startup-ack-drain',
+        )
+        self._startup_ack_drain_task = task
+        return task
+
     async def _reconnect_historical_client(self):
         """Disconnect and reconnect the IB historical data client."""
         logging.info('reconnecting historical data IB client')
@@ -2370,15 +2439,18 @@ class StrategyRuntime():
         # it's probably up to the strategy how they want to secure data
         self._subscribe_all_strategies()
 
-        # Announce the freshly loaded strategies into the local ack outbox so
-        # reconcile can push them to the trader journal. Do NOT drain here on
-        # the event loop: if the trader command socket is not answering yet,
-        # N strategies × 10s timeouts stall list_strategies / IB historical
-        # for a minute+ (seen as "Task-1 ... took 76 seconds").
+        # Announce the freshly loaded strategies into the local ack outbox, then
+        # drain in a BACKGROUND task while IB historical runs. Inline drain on
+        # this coroutine used to either (a) stall history for N×timeouts when
+        # the trader was not ready, or (b) leave the Trading-tab Strategies
+        # panel empty until get_historical_data() finished (often minutes).
+        # Background + fail-fast drain fills the trader journal promptly;
+        # reconcile remains the durable backstop.
         try:
             self._announce_strategy_states()
         except Exception as ex:
             logging.warning('startup strategy state announce failed (reconcile will retry): %s', ex)
+        self._schedule_startup_ack_drain()
 
         logging.debug('starting connection to IB for historical data')
 

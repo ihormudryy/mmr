@@ -150,6 +150,16 @@ def create_read_router(cc, templates, manage_context_provider=None,
             view.get("paper_automation"),
             view.get("strategies"),
         )
+        try:
+            from web.command_center.market_session import market_session_status
+
+            view["market_session"] = market_session_status()
+        except Exception as exc:  # noqa: BLE001 — optional banner enrichment
+            logger.debug("market session unavailable: %s", exc)
+            view["market_session"] = {
+                "calendar": "XNAS", "exchange": "NASDAQ",
+                "open": None, "error": str(exc),
+            }
         view["health"] = cc.bridge.health() if cc.bridge else {
             "lifecycle": "starting", "reconnects": 0, "cursor": None, "sources": {}}
         return JSONResponse(view)

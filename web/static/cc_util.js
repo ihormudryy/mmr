@@ -54,6 +54,30 @@
     return healthBad || transportBad;
   }
 
+  /* NASDAQ (XNAS) regular session closed. ``open`` must be the boolean false;
+   * null/undefined means unknown (don't warn). */
+  function ccMarketClosed(marketSession) {
+    return !!(marketSession && marketSession.open === false);
+  }
+
+  const CC_BANNER_STREAM =
+    '⚠ Realtime stream degraded — polling snapshots every 5 s. Data may be stale.';
+  const CC_BANNER_MARKET =
+    '⚠ NASDAQ is closed — regular-session trading is not available until the next open.';
+  const CC_BANNER_BOTH =
+    '⚠ NASDAQ is closed, and the realtime stream is degraded — polling snapshots; data may be stale.';
+
+  function ccBannerMessage({ streamDegraded, marketClosed }) {
+    if (marketClosed && streamDegraded) return CC_BANNER_BOTH;
+    if (marketClosed) return CC_BANNER_MARKET;
+    if (streamDegraded) return CC_BANNER_STREAM;
+    return CC_BANNER_STREAM;
+  }
+
+  function ccBannerVisible({ streamDegraded, marketClosed }) {
+    return !!(streamDegraded || marketClosed);
+  }
+
   /* Guard against a late/overlapping snapshot rolling state backward: a slow
    * older fetch resolving after a newer one has already been applied. A
    * snapshot on a NEW stream is always accepted (a resync rotated the stream
@@ -91,6 +115,12 @@
     ccServerClockOffsetMs,
     ccQuoteAgeSeconds,
     ccIsDegraded,
+    ccMarketClosed,
+    ccBannerVisible,
+    ccBannerMessage,
+    CC_BANNER_STREAM,
+    CC_BANNER_MARKET,
+    CC_BANNER_BOTH,
     ccSnapshotSupersedes,
     ccAccountModeValue,
     ccStrategyName,

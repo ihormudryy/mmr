@@ -67,6 +67,13 @@ def create_health_router(cc) -> APIRouter:
             "replay_ring_events": cc.state.ring_depth(),
             "terminal_rows": cc.state.terminal_row_count(),
             "client_fifo_depth_max": cc.fanout.max_fifo_depth(),
+            "market_session": _market_session(),
         }
 
     return router
+
+
+def _market_session():
+    from web.command_center.market_session import market_session_status
+
+    return market_session_status()

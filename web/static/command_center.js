@@ -40,6 +40,8 @@ const store = {
   // server actually has live trader data -- not merely that the SSE socket to
   // the dashboard process is open.
   health: null,
+  // NASDAQ (XNAS) RTH from snapshot / cc-health — drives the market-closed banner.
+  marketSession: null,
   connection: { mode: 'connecting', degradedSince: null },
 };
 
@@ -124,6 +126,7 @@ function applySnapshot(view) {
   // server-stamped generated_at so quote ages are skew-corrected.
   store.serverClockOffsetMs = ccServerClockOffsetMs(view.generated_at, Date.now());
   if (view.health) store.health = view.health;
+  if (view.market_session) store.marketSession = view.market_session;
   const boot = document.getElementById('boot-banner');
   if (boot) {
     boot.hidden = true;
@@ -230,8 +233,11 @@ function stopPolling() {
   store.connection.mode = 'sse';
 }
 
-function setBanner(visible) {
-  document.getElementById('degraded-banner').hidden = !visible;
+function setBanner(visible, message) {
+  const el = document.getElementById('degraded-banner');
+  if (!el) return;
+  el.hidden = !visible;
+  if (message) el.textContent = message;
 }
 
 function currentSseState() {
@@ -254,7 +260,11 @@ function currentSseState() {
 
 function updateBanner() {
   const lifecycle = store.health && store.health.lifecycle;
-  setBanner(ccIsDegraded(lifecycle, currentSseState()));
+  const streamDegraded = ccIsDegraded(lifecycle, currentSseState());
+  const marketClosed = ccMarketClosed(store.marketSession);
+  const visible = ccBannerVisible({ streamDegraded, marketClosed });
+  const message = ccBannerMessage({ streamDegraded, marketClosed });
+  setBanner(visible, message);
 }
 
 async function refreshHealth() {
@@ -268,6 +278,7 @@ async function refreshHealth() {
     const h = await res.json();
     store.health = { lifecycle: h.lifecycle, sources: h.sources,
                      reconnects: h.reconnects, cursor: h.cursor };
+    if (h.market_session) store.marketSession = h.market_session;
     renderStatusBar();
     updateBanner();
   } catch (err) { /* transient; the next tick retries */ }
@@ -1011,6 +1022,7 @@ function renderAll() {
   renderStatusBar(); renderAccountCards(); renderPositions(); renderProposals();
   renderOrders(); renderFills(); renderStrategies(); renderRisk(); renderScaling();
   renderPaperAutomation();
+  updateBanner();
 }
 
 /* ---------------- drawer (keyboard + focus managed) ----------------------- */

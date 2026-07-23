@@ -72,6 +72,30 @@ test('degraded while polling', () => {
     { open: false, disconnectedForMs: null, degradedAfterMs: 15000, polling: true }), true);
 });
 
+/* ---- market-closed banner ---- */
+test('market closed only when open is boolean false', () => {
+  assert.equal(U.ccMarketClosed({ open: false }), true);
+  assert.equal(U.ccMarketClosed({ open: true }), false);
+  assert.equal(U.ccMarketClosed({ open: null }), false);
+  assert.equal(U.ccMarketClosed(null), false);
+});
+test('banner visible for stream degrade or market closed', () => {
+  assert.equal(U.ccBannerVisible({ streamDegraded: true, marketClosed: false }), true);
+  assert.equal(U.ccBannerVisible({ streamDegraded: false, marketClosed: true }), true);
+  assert.equal(U.ccBannerVisible({ streamDegraded: false, marketClosed: false }), false);
+});
+test('banner message prefers market+stream combo', () => {
+  assert.equal(
+    U.ccBannerMessage({ streamDegraded: false, marketClosed: true }),
+    U.CC_BANNER_MARKET);
+  assert.equal(
+    U.ccBannerMessage({ streamDegraded: true, marketClosed: false }),
+    U.CC_BANNER_STREAM);
+  assert.equal(
+    U.ccBannerMessage({ streamDegraded: true, marketClosed: true }),
+    U.CC_BANNER_BOTH);
+});
+
 /* ---- ccSnapshotSupersedes ---- */
 test('a new fenced stream always supersedes', () => {
   assert.equal(U.ccSnapshotSupersedes('stream-a', 99, { stream_id: 'stream-b', sequence: 0 }), true);

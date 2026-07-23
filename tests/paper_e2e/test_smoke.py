@@ -61,6 +61,11 @@ def test_smoke_ladder(
             "reasoning": f"{e2e_id} Layer A smoke proposal",
         },
     )
+    if create.status_code == 409 and "QUOTE_UNAVAILABLE" in create.text:
+        pytest.skip(
+            "IB executable quote unavailable for smoke propose "
+            f"(realtime and delayed): {create.text}"
+        )
     assert create.status_code == 202, (
         f"create proposal failed: {create.status_code} {create.text}"
     )

@@ -111,6 +111,11 @@ def test_resolve_then_propose_and_reject_via_command_api(
             "reasoning": f"{e2e_id} research proposal; reject by default",
         },
     )
+    if created.status_code == 409 and "QUOTE_UNAVAILABLE" in created.text:
+        pytest.skip(
+            "IB executable quote unavailable for propose→reject "
+            f"(realtime and delayed): {created.text}"
+        )
     assert created.status_code == 202, (
         f"create proposal failed: {created.status_code} {created.text}"
     )

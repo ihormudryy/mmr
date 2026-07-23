@@ -6,7 +6,7 @@ import logging
 import math
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
-from datetime import datetime, timezone
+from datetime import date, datetime, timezone
 from typing import Any
 
 import pandas as pd
@@ -76,6 +76,16 @@ def _quote_price(quote: Any, side: str) -> Any:
     return getattr(quote, f"{side}_price", None)
 
 
+def _td_float(payload: dict, key: str) -> Any:
+    value = payload.get(key)
+    if value in (None, ""):
+        return None
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return None
+
+
 class MassiveResearch:
     """Normalize Massive REST-client responses for research consumers.
 
@@ -83,9 +93,10 @@ class MassiveResearch:
     the CLI uses (TwelveData quotes / movers) when Massive rejects snapshots.
     """
 
-    def __init__(self, client: Any, td_client: Any | None = None):
+    def __init__(self, client: Any, td_client: Any | None = None, api_key: str = ""):
         self._client = client
         self._td_client = td_client
+        self._api_key = api_key
 
     def presets(self) -> ResearchResult:
         return ResearchResult(_records(list_presets()), "Idea Scanner Presets", "local")
@@ -226,6 +237,175 @@ class MassiveResearch:
             articles = self._client.list_ticker_news(ticker=symbol, limit=limit)
         rows = [self._news_row(article, source) for article in articles]
         return ResearchResult(json_clean(rows[:limit]), f"News: {symbol}")
+
+    # ---- options ---------------------------------------------------------
+
+    def options_expirations(self, symbol: str) -> ResearchResult:
+        from trader.tools.chain import get_option_dates
+        dates = get_option_dates(symbol, api_key=self._api_key)
+        today = date.today()
+        rows = [{
+            "expiration": expiration,
+            "dte": (date.fromisoformat(expiration) - today).days,
+        } for expiration in dates]
+        return ResearchResult(json_clean(rows), f"Options expirations: {symbol.upper()}")
+
+    def options_chain(
+        self,
+        symbol: str,
+        *,
+        expiration: str | None,
+        contract_type: str | None,
+        strike_min: float | None,
+        strike_max: float | None,
+    ) -> ResearchResult:
+        from trader.tools.chain import get_option_dates
+        from trader.tools.options_data import chain_records
+        exp = expiration
+        if not exp:
+            dates = get_option_dates(symbol, api_key=self._api_key)
+            if not dates:
+                return ResearchResult([], f"Options chain: {symbol.upper()}")
+            exp = dates[0]
+        rows = chain_records(
+            self._client, symbol, expiration=exp, contract_type=contract_type,
+            strike_min=strike_min, strike_max=strike_max,
+        )
+        return ResearchResult(json_clean(rows), f"Options chain: {symbol.upper()} {exp}")
+
+    def options_snapshot(self, option_ticker: str) -> ResearchResult:
+        from trader.tools.options_data import contract_snapshot
+        data = contract_snapshot(self._client, option_ticker)
+        return ResearchResult(json_clean(data), f"Option: {option_ticker}")
+
+    def options_implied(
+        self, symbol: str, *, expiration: str, risk_free_rate: float = 0.05,
+    ) -> ResearchResult:
+        from trader.tools.chain import implied_constant
+        data = implied_constant(symbol, expiration, risk_free_rate, api_key=self._api_key)
+        return ResearchResult(
+            json_clean(data), f"Implied distribution: {symbol.upper()} {expiration}",
+        )
+
+    # ---- forex -------------------------------------------------------------
+
+    def forex_snapshot(self, pair: str, *, source: str) -> ResearchResult:
+        if source == "ib":
+            raise ValueError("ib source is handled on the typed path, not the provider")
+        ticker = pair.upper()
+        if not ticker.startswith("C:"):
+            ticker = f"C:{ticker}"
+        if source == "twelvedata":
+            payload = self._td_client.quote(symbol=ticker[2:]).as_json()
+            data = {
+                "ticker": ticker,
+                "last": _td_float(payload, "close"),
+                "open": _td_float(payload, "open"),
+                "high": _td_float(payload, "high"),
+                "low": _td_float(payload, "low"),
+                "close": _td_float(payload, "close"),
+                "change": _td_float(payload, "change"),
+                "change_pct": _td_float(payload, "percent_change"),
+            }
+            return ResearchResult(
+                json_clean(data), f"Forex snapshot: {ticker}",
+                provider="twelvedata", notice="TwelveData REST has no bid/ask.",
+            )
+        snap = self._client.get_snapshot_ticker(market_type="forex", ticker=ticker)
+        data: dict[str, Any] = {"ticker": ticker}
+        if snap.day:
+            for field in ("open", "high", "low", "close", "volume", "vwap"):
+                data[field] = getattr(snap.day, field, None)
+        if snap.last_quote:
+            # Mirrors sdk.py's forex_snapshot massive branch: some Massive
+            # forex quote payloads use a bare "P" price field instead of
+            # separate bid/ask.
+            data["bid"] = (
+                getattr(snap.last_quote, "bid", None)
+                or getattr(snap.last_quote, "P", None)
+            )
+            data["ask"] = (
+                getattr(snap.last_quote, "ask", None)
+                or getattr(snap.last_quote, "P", None)
+            )
+        data["change"] = getattr(snap, "todays_change", None)
+        data["change_pct"] = getattr(snap, "todays_change_percent", None)
+        return ResearchResult(json_clean(data), f"Forex snapshot: {ticker}")
+
+    def forex_quote(self, from_ccy: str, to_ccy: str, *, source: str) -> ResearchResult:
+        if source == "ib":
+            raise ValueError("ib source is handled on the typed path, not the provider")
+        pair = f"{from_ccy.upper()}/{to_ccy.upper()}"
+        if source == "twelvedata":
+            payload = self._td_client.exchange_rate(symbol=pair).as_json()
+            data = {
+                "pair": pair,
+                "last": _td_float(payload, "rate"),
+                "timestamp": payload.get("timestamp"),
+            }
+            return ResearchResult(
+                json_clean(data), f"Forex quote: {pair}",
+                provider="twelvedata", notice="TwelveData REST has no bid/ask.",
+            )
+        result = self._client.get_last_forex_quote(from_ccy.upper(), to_ccy.upper())
+        data = {"pair": pair, "symbol": getattr(result, "symbol", pair)}
+        last = getattr(result, "last", None)
+        if last:
+            data["bid"] = getattr(last, "bid", None)
+            data["ask"] = getattr(last, "ask", None)
+            data["exchange"] = getattr(last, "exchange", None)
+            data["timestamp"] = getattr(last, "timestamp", None)
+        return ResearchResult(json_clean(data), f"Forex quote: {pair}")
+
+    def forex_movers(self, direction: str) -> ResearchResult:
+        snaps = self._client.get_snapshot_direction(market_type="forex", direction=direction)
+        rows = []
+        for snap in snaps:
+            row = {"ticker": getattr(snap, "ticker", "") or ""}
+            day = getattr(snap, "day", None)
+            if day:
+                row["close"] = getattr(day, "close", None)
+                row["volume"] = getattr(day, "volume", None)
+            row["change"] = getattr(snap, "todays_change", None)
+            row["change_pct"] = getattr(snap, "todays_change_percent", None)
+            rows.append(row)
+        return ResearchResult(json_clean(rows), f"Forex movers ({direction})")
+
+    def forex_snapshot_all(self, tickers: list[str] | None) -> ResearchResult:
+        ticker_arg = None
+        if tickers:
+            ticker_arg = [t if t.startswith("C:") else f"C:{t}" for t in tickers]
+        snaps = self._client.get_snapshot_all(market_type="forex", tickers=ticker_arg)
+        rows = []
+        for snap in snaps:
+            row = {"ticker": getattr(snap, "ticker", "") or ""}
+            day = getattr(snap, "day", None)
+            if day:
+                for field in ("open", "high", "low", "close", "volume"):
+                    row[field] = getattr(day, field, None)
+            row["change"] = getattr(snap, "todays_change", None)
+            row["change_pct"] = getattr(snap, "todays_change_percent", None)
+            rows.append(row)
+        return ResearchResult(json_clean(rows), "Forex snapshots")
+
+    def forex_convert(self, from_ccy: str, to_ccy: str, amount: float) -> ResearchResult:
+        # Attribute names (from_, to, initial_amount, converted, last.bid/ask)
+        # mirror sdk.py's forex_convert massive branch exactly — the real
+        # Massive SDK response has no "rate" field, so none is fabricated here.
+        result = self._client.get_real_time_currency_conversion(
+            from_ccy.upper(), to_ccy.upper(), amount=amount,
+        )
+        data = {
+            "from": getattr(result, "from_", from_ccy.upper()),
+            "to": getattr(result, "to", to_ccy.upper()),
+            "amount": getattr(result, "initial_amount", float(amount)),
+            "converted": getattr(result, "converted", None),
+        }
+        last = getattr(result, "last", None)
+        if last:
+            data["bid"] = getattr(last, "bid", None)
+            data["ask"] = getattr(last, "ask", None)
+        return ResearchResult(json_clean(data), f"Convert {from_ccy.upper()}→{to_ccy.upper()}")
 
     def _snapshot_from_twelvedata(self, ticker: str) -> ResearchResult:
         payload = self._td_client.quote(symbol=ticker).as_json()

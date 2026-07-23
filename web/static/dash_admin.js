@@ -24,25 +24,35 @@
 
   function positionSetupTip(anchor, tip) {
     tip.style.display = 'block';
-    var r = anchor.getBoundingClientRect();
+    // The page scales via CSS zoom on <html> (cc_theme.js text-scale
+    // slider). getBoundingClientRect() and window.inner* are in visual
+    // pixels, but the tip's style.left/top get re-multiplied by the zoom —
+    // so convert the rect and viewport into local (pre-zoom) units first.
+    // offsetWidth/offsetHeight are already local.
+    var z = anchor.currentCSSZoom
+        || parseFloat(getComputedStyle(document.documentElement).zoom) || 1;
+    var b = anchor.getBoundingClientRect();
+    var r = { left: b.left / z, right: b.right / z, top: b.top / z,
+              bottom: b.bottom / z, width: b.width / z, height: b.height / z };
+    var vw = window.innerWidth / z, vh = window.innerHeight / z;
     var margin = 8, gap = 8;
     var tw = tip.offsetWidth, th = tip.offsetHeight;
     // Prefer to the right of the icon (after the label text), then left,
     // then below/above — never leave the tip clipped off-screen.
     var left = r.right + gap;
     var top = r.top + (r.height / 2) - (th / 2);
-    if (left + tw > window.innerWidth - margin) {
+    if (left + tw > vw - margin) {
       left = r.left - tw - gap;
     }
     if (left < margin) {
       left = Math.max(margin, Math.min(
           r.left + r.width / 2 - tw / 2,
-          window.innerWidth - tw - margin));
+          vw - tw - margin));
       top = r.bottom + gap;
-      if (top + th > window.innerHeight - margin) top = r.top - th - gap;
+      if (top + th > vh - margin) top = r.top - th - gap;
     }
-    left = Math.max(margin, Math.min(left, window.innerWidth - tw - margin));
-    top = Math.max(margin, Math.min(top, window.innerHeight - th - margin));
+    left = Math.max(margin, Math.min(left, vw - tw - margin));
+    top = Math.max(margin, Math.min(top, vh - th - margin));
     tip.style.left = left + 'px';
     tip.style.top = top + 'px';
   }

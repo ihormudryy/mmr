@@ -149,6 +149,72 @@
       margin: 0 0 0 var(--space-4);
       min-width: 58px;
     }
+    /* —— text-scale slider (browser-zoom analog, wired in cc_theme.js) —— */
+    #zoom-control {
+      display: inline-flex;
+      align-items: center;
+      gap: 7px;
+      align-self: center;
+      margin-left: var(--space-4);
+    }
+    .zoom-a {
+      font: 800 10px/1 var(--font-heading);
+      color: var(--dim);
+    }
+    .zoom-a-lg { font-size: 15px; }
+    #zoom-slider {
+      appearance: none;
+      -webkit-appearance: none;
+      width: 96px;
+      height: 16px;
+      margin: 0;
+      padding: 0;
+      border: none;
+      background: transparent;
+      cursor: pointer;
+    }
+    #zoom-slider::-webkit-slider-runnable-track {
+      height: 2px;
+      background: var(--border);
+    }
+    #zoom-slider::-webkit-slider-thumb {
+      -webkit-appearance: none;
+      width: 12px;
+      height: 12px;
+      margin-top: -5px;
+      background: var(--fg);
+      border: none;
+      border-radius: 0;
+    }
+    #zoom-slider:hover::-webkit-slider-thumb,
+    #zoom-slider:focus-visible::-webkit-slider-thumb { background: var(--accent); }
+    #zoom-slider::-moz-range-track {
+      height: 2px;
+      background: var(--border);
+    }
+    #zoom-slider::-moz-range-thumb {
+      width: 12px;
+      height: 12px;
+      background: var(--fg);
+      border: none;
+      border-radius: 0;
+    }
+    #zoom-slider:hover::-moz-range-thumb,
+    #zoom-slider:focus-visible::-moz-range-thumb { background: var(--accent); }
+    #zoom-value {
+      font: 700 11px/1 var(--font-body);
+      letter-spacing: 0;
+      text-transform: none;
+      border: none;
+      background: transparent;
+      color: var(--dim);
+      padding: 2px 4px;
+      min-width: 40px;
+      text-align: right;
+      font-variant-numeric: tabular-nums;
+      cursor: pointer;
+    }
+    #zoom-value:hover:not(:disabled) { color: var(--accent); border: none; }
     .flash {
       display: flex;
       align-items: flex-start;
@@ -1547,6 +1613,15 @@
     <button type="button" class="dash-tab" data-dash-tab="research">Research</button>
     <span id="last-event-time" title="Latest authoritative event time">
       last event: <span class="v">—</span></span>
+    <span id="zoom-control"
+          title="Scale the page like browser zoom — click the % to reset">
+      <span class="zoom-a" aria-hidden="true">A</span>
+      <input type="range" id="zoom-slider" min="80" max="150" step="5"
+             value="100" aria-label="Page text scale, percent">
+      <span class="zoom-a zoom-a-lg" aria-hidden="true">A</span>
+      <button type="button" id="zoom-value"
+              title="Reset text scale to 100%">100%</button>
+    </span>
     <button type="button" id="theme-toggle" aria-pressed="false"
             title="Switch color theme">Dark</button>
   </nav>

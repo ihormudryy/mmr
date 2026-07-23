@@ -450,9 +450,19 @@ class AllocationAuthorityStore:
             payload={
                 "authority_digest": authority_digest,
                 "strategy_id": strategy_id,
+                "account_id": account_id,
+                "account_mode": account_mode,
                 "stage": stage,
                 "event": event,
                 "command_id": command_id,
+                "artifact_digest": artifact_digest,
+                "allowlist_digest": allowlist_digest,
+                "ruleset_digest": ruleset_digest,
+                "evidence_digest": evidence_digest,
+                "public_key_id": public_key_id,
+                "operator": operator,
+                "reason": reason,
+                "max_gross_allocation": float(max_gross_allocation),
             },
         )
         self.journal.mutate(

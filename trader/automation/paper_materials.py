@@ -45,6 +45,40 @@ def default_key_paths(config_dir: Path) -> tuple[Path, Path, Path]:
     return private_pem, verify_dir, public_pem
 
 
+def read_allocation_binding_hints(bundle_path: Path | str) -> dict[str, str]:
+    """Read digests + public_key_id from a research artifact ``attestation.json``.
+
+    Used by the Command Center Scaling form Prefill — never invents digests.
+    Returns only non-empty string fields present on the attestation. Does not
+    include ``evidence_digest`` (that comes from ScalingGate / prepare, not
+    the research eligibility attestation).
+    """
+    path = Path(bundle_path).expanduser()
+    attestation_path = path / "attestation.json" if path.is_dir() else path
+    if not attestation_path.is_file():
+        return {}
+    try:
+        raw = json.loads(attestation_path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return {}
+    if not isinstance(raw, dict):
+        return {}
+    hints: dict[str, str] = {}
+    for key in (
+        "artifact_digest",
+        "allowlist_digest",
+        "ruleset_digest",
+        "public_key_id",
+    ):
+        value = raw.get(key)
+        if value is None and key == "artifact_digest":
+            value = raw.get("artifact_id")
+        text = str(value).strip() if value is not None else ""
+        if text:
+            hints[key] = text
+    return hints
+
+
 def _evidence() -> EligibilityEvidence:
     return EligibilityEvidence(
         n_round_trips=250, n_instruments=10, expectancy_bps_baseline=5.0,

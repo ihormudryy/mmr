@@ -365,23 +365,36 @@
       letter-spacing: -.02em;
       font-variant-numeric: tabular-nums;
     }
-    /* Secondary account stats share one band cell; value size matches the
-       former quick-stats Buying power figure (20px). */
+    /* Secondary account stats: money row, then counts row underneath.
+       Value size matches the former quick-stats Buying power figure (20px). */
     #band-stats {
       border-left: 2px solid var(--border);
       padding-left: var(--space-6);
       display: flex;
-      flex-wrap: wrap;
-      align-items: center;
-      gap: 10px 22px;
+      flex-direction: column;
+      justify-content: center;
+      gap: 8px;
       flex: 1 1 280px;
       min-width: 0;
+    }
+    #band-stats .band-stats-row {
+      display: flex;
+      flex-wrap: wrap;
+      align-items: center;
+      gap: 10px 0;
     }
     #band-stats .band-stat {
       display: flex;
       flex-direction: column;
       justify-content: center;
       gap: 4px;
+      padding: 0 14px;
+    }
+    #band-stats .band-stat + .band-stat {
+      border-left: 1px solid var(--border);
+    }
+    #band-stats .band-stats-row > .band-stat:first-child {
+      padding-left: 0;
     }
     #band-stats .band-stat .band-k {
       font-size: 10px;
@@ -1703,25 +1716,29 @@
       <span id="band-daypnl" class="band-v">—</span>
     </div>
     <div id="band-stats" aria-label="Account summary">
-      <div class="band-stat">
-        <span class="band-k">Exposure</span>
-        <span id="band-exposure" class="band-v">—</span>
+      <div class="band-stats-row" aria-label="Capital stats">
+        <div class="band-stat">
+          <span class="band-k">Exposure</span>
+          <span id="band-exposure" class="band-v">—</span>
+        </div>
+        <div class="band-stat">
+          <span class="band-k">Buying power</span>
+          <span id="band-buying-power" class="band-v">—</span>
+        </div>
+        <div class="band-stat">
+          <span class="band-k">Margin cushion</span>
+          <span id="band-cushion" class="band-v">—</span>
+        </div>
       </div>
-      <div class="band-stat">
-        <span class="band-k">Buying power</span>
-        <span id="band-buying-power" class="band-v">—</span>
-      </div>
-      <div class="band-stat">
-        <span class="band-k">Margin cushion</span>
-        <span id="band-cushion" class="band-v">—</span>
-      </div>
-      <div class="band-stat">
-        <span class="band-k">Open positions</span>
-        <span id="band-positions" class="band-v">—</span>
-      </div>
-      <div class="band-stat">
-        <span class="band-k">Working orders</span>
-        <span id="band-orders" class="band-v">—</span>
+      <div class="band-stats-row" aria-label="Book counts">
+        <div class="band-stat">
+          <span class="band-k">Open positions</span>
+          <span id="band-positions" class="band-v">—</span>
+        </div>
+        <div class="band-stat">
+          <span class="band-k">Working orders</span>
+          <span id="band-orders" class="band-v">—</span>
+        </div>
       </div>
     </div>
     {% if commands_enabled %}
@@ -1815,7 +1832,12 @@
           <h3>Build unsigned allocation JSON {{ info('Fills the fields that go into mmr research allocation sign. Private keys never enter this browser — copy the JSON, sign offline, then paste the signed attestation below to Activate.') }}</h3>
           <p class="hint">Choose options below, generate JSON, then sign offline:
             <code>mmr research allocation sign --payload-file payload.json --key-file ~/.config/mmr/keys/private/signing.pem</code>
-            Paste the signed result into Activate. Digests are not invented here — paste values from your research / evidence pipeline.</p>
+            Paste the signed result into Activate. Prefill loads digests +
+            <code>public_key_id</code> from the paper-automation artifact
+            attestation (and from a prior allocation authority when present).
+            <code>evidence_digest</code> still comes from
+            <code>mmr research allocation prepare</code> / ScalingGate — it is
+            not on the research attestation.</p>
           <div class="scaling-form-grid">
             <label>Strategy
               <select id="scaling-payload-strategy">

@@ -1043,6 +1043,11 @@ function ccGenerateScalingPayload() {
   ccShowScalingPayloadError('');
   const text = `${JSON.stringify(result.payload, null, 2)}\n`;
   ccSetScalingPayloadOutput(text);
+  try {
+    if (result.payload.operator) {
+      localStorage.setItem(ALLOCATION_OPERATOR_STORAGE_KEY, result.payload.operator);
+    }
+  } catch (_) { /* ignore */ }
   ccToast('ok', 'Unsigned allocation JSON ready — sign offline, then Activate');
   return result.payload;
 }
@@ -1088,6 +1093,26 @@ function ccDownloadScalingPayload() {
   ccToast('ok', 'Downloaded allocation_payload.json');
 }
 
+const ALLOCATION_OPERATOR_STORAGE_KEY = 'mmr.cc.allocation.operator';
+
+function ccSetFormValueIfEmpty(id, value) {
+  const el = document.getElementById(id);
+  if (!el) return false;
+  const next = value == null ? '' : String(value).trim();
+  if (!next) return false;
+  if ((el.value || '').trim()) return false;
+  el.value = next;
+  return true;
+}
+
+function ccLatestScalingAuthority(view) {
+  const authorities = (view && view.scaling && view.scaling.authorities) || [];
+  if (!authorities.length) return null;
+  return [...authorities].sort(
+    (a, b) => Number(a.entity_revision || 0) - Number(b.entity_revision || 0),
+  ).at(-1) || null;
+}
+
 function ccPrefillScalingPayloadForm(view) {
   const v = view || _view() || {};
   const account = (v.accounts && v.accounts[0]) || {};
@@ -1098,6 +1123,9 @@ function ccPrefillScalingPayloadForm(view) {
     || account.mode
     || '').toLowerCase();
   const scaling = v.scaling || {};
+  const pa = v.paper_automation || {};
+  const authority = ccLatestScalingAuthority(v);
+
   const accountEl = document.getElementById('scaling-payload-account');
   if (accountEl && accountId && accountId !== '—') accountEl.value = accountId;
   const modeEl = document.getElementById('scaling-payload-mode');
@@ -1115,19 +1143,73 @@ function ccPrefillScalingPayloadForm(view) {
     }
   }
   const strategySelect = document.getElementById('scaling-payload-strategy');
-  if (strategySelect && scaling.strategy_id) {
-    const want = String(scaling.strategy_id);
-    const has = [...strategySelect.options].some((o) => o.value === want);
-    if (has) strategySelect.value = want;
+  const strategyWant = String(
+    scaling.strategy_id || pa.strategy_name || authority?.strategy_id || '',
+  ).trim();
+  if (strategySelect && strategyWant) {
+    const has = [...strategySelect.options].some((o) => o.value === strategyWant);
+    if (has) strategySelect.value = strategyWant;
     else {
       const custom = document.getElementById('scaling-payload-strategy-custom');
-      if (custom && !custom.value) custom.value = want;
+      if (custom && !custom.value) custom.value = strategyWant;
     }
   }
+
+  // Digests + key id: paper automation attestation first, then prior authority.
+  const digestSources = [pa, authority || {}];
+  for (const src of digestSources) {
+    ccSetFormValueIfEmpty('scaling-payload-artifact',
+      src.artifact_digest || src.artifact_id);
+    ccSetFormValueIfEmpty('scaling-payload-allowlist', src.allowlist_digest);
+    ccSetFormValueIfEmpty('scaling-payload-ruleset', src.ruleset_digest);
+    ccSetFormValueIfEmpty('scaling-payload-evidence', src.evidence_digest);
+    ccSetFormValueIfEmpty('scaling-payload-key-id', src.public_key_id);
+    ccSetFormValueIfEmpty('scaling-payload-operator', src.operator);
+  }
+
+  let storedOperator = '';
+  try {
+    storedOperator = localStorage.getItem(ALLOCATION_OPERATOR_STORAGE_KEY) || '';
+  } catch (_) { /* private mode / blocked storage */ }
+  ccSetFormValueIfEmpty('scaling-payload-operator', storedOperator);
+
   const reasonEl = document.getElementById('scaling-payload-reason');
   const activateReason = document.getElementById('scaling-reason');
   if (reasonEl && !reasonEl.value && activateReason && activateReason.value) {
     reasonEl.value = activateReason.value;
+  }
+  if (reasonEl && !reasonEl.value) {
+    const stage = (stageEl && stageEl.value) || 'SCALE_1';
+    const strategy = (
+      document.getElementById('scaling-payload-strategy-custom')?.value
+      || strategySelect?.value
+      || strategyWant
+      || 'strategy'
+    ).trim();
+    reasonEl.value = `Scale to ${stage} for ${strategy}`;
+  }
+
+  const stillMissing = [];
+  for (const [id, label] of [
+    ['scaling-payload-artifact', 'artifact_digest'],
+    ['scaling-payload-allowlist', 'allowlist_digest'],
+    ['scaling-payload-ruleset', 'ruleset_digest'],
+    ['scaling-payload-evidence', 'evidence_digest'],
+    ['scaling-payload-operator', 'operator'],
+    ['scaling-payload-key-id', 'public_key_id'],
+  ]) {
+    const el = document.getElementById(id);
+    if (!el || !(el.value || '').trim()) stillMissing.push(label);
+  }
+  if (stillMissing.length) {
+    ccToast(
+      'error',
+      `Prefill incomplete — still need: ${stillMissing.join(', ')}. `
+      + 'evidence_digest comes from `mmr research allocation prepare` '
+      + '(ScalingGate), not the research attestation.',
+    );
+  } else {
+    ccToast('ok', 'Prefill complete from paper artifact / allocation authority');
   }
 }
 

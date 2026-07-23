@@ -140,6 +140,8 @@ class StrategyCommandReceipt:
     StrategyState name after a COMMITTED apply, carried so the trader can
     journal ``strategy_state`` correctly instead of the receipt literal
     ``COMMITTED`` (which would blank the Strategies panel chip).
+    ``observable_payload`` is likewise wire-only and carries the complete
+    runtime state payload without changing the persisted receipt columns.
     """
 
     command_id: str
@@ -154,6 +156,7 @@ class StrategyCommandReceipt:
     state_revision: int
     error: Optional[str] = None
     observable_state: Optional[str] = None
+    observable_payload: Optional[dict] = None
 
 
 @dataclass(frozen=True)

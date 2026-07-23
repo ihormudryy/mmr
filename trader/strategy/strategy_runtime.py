@@ -989,6 +989,7 @@ class StrategyRuntime():
                 state_revision=receipt.state_revision,
                 error=receipt.error,
                 observable_state=payload.get('strategy_state') or payload.get('state'),
+                observable_payload=payload,
             )
 
         receipt = self._revisions.db.transaction(_commit)
@@ -1116,9 +1117,9 @@ class StrategyRuntime():
     def _receipt_with_observable_state(
         self, receipt: StrategyCommandReceipt,
     ) -> StrategyCommandReceipt:
-        """Re-attach wire-only ``observable_state`` on idempotent receipt
-        replays (the ledger does not persist it)."""
-        if receipt.observable_state or receipt.state_revision <= 0:
+        """Re-attach wire-only observable fields on idempotent receipt
+        replays (the receipt ledger does not persist them)."""
+        if (receipt.observable_state and receipt.observable_payload) or receipt.state_revision <= 0:
             return receipt
         row = self._revisions.db.execute(
             "SELECT payload FROM strategy_ack_outbox "
@@ -1126,12 +1127,16 @@ class StrategyRuntime():
             [receipt.strategy_name, receipt.state_revision],
             fetch='one',
         )
-        if row is None:
-            return receipt
-        from trader.strategy.strategy_revisions import _parse_json_column
-        payload = _parse_json_column(row[0]) or {}
+        payload = {}
+        if row is not None:
+            from trader.strategy.strategy_revisions import _parse_json_column
+            payload = _parse_json_column(row[0]) or {}
+        if not payload and receipt.state == 'COMMITTED':
+            payload = self._state_payload(
+                receipt.strategy_name, receipt.control_revision,
+            )
         obs = payload.get('strategy_state') or payload.get('state')
-        if not obs:
+        if not obs and not payload:
             return receipt
         return StrategyCommandReceipt(
             command_id=receipt.command_id,
@@ -1141,7 +1146,8 @@ class StrategyRuntime():
             control_revision=receipt.control_revision,
             state_revision=receipt.state_revision,
             error=receipt.error,
-            observable_state=str(obs),
+            observable_state=str(obs) if obs else receipt.observable_state,
+            observable_payload=payload or receipt.observable_payload,
         )
 
     def _state_payload(self, strategy_name: str, control_revision: int) -> Dict:

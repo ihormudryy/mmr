@@ -2009,6 +2009,7 @@ def _dict_to_strategy_receipt(data: Dict[str, Any]) -> StrategyCommandReceipt:
         control_revision=data["control_revision"], state_revision=data["state_revision"],
         error=data.get("error"),
         observable_state=data.get("observable_state"),
+        observable_payload=data.get("observable_payload"),
     )
 
 

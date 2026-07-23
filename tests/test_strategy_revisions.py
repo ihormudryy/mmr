@@ -445,6 +445,37 @@ def test_trader_journals_strategy_updated_only_after_acknowledgement(forwarding)
     assert strategy_events[0].entity_revision == receipt.outcome["state_revision"]
 
 
+def test_control_ack_journals_full_observable_payload(forwarding):
+    forwarding.port.canned("cmd-full-payload", StrategyCommandReceipt(
+        command_id="cmd-full-payload",
+        strategy_name="smi_crossover",
+        action="disable_strategy",
+        state="COMMITTED",
+        control_revision=5,
+        state_revision=9,
+        observable_state="DISABLED",
+        observable_payload={
+            "strategy_name": "smi_crossover",
+            "strategy_state": "DISABLED",
+            "class_name": "SMICrossOver",
+            "bar_size": "5 mins",
+            "conids": [756733],
+            "params": {"signal_period": 3},
+        },
+    ))
+
+    forwarding.coordinator.execute(_strategy_request(
+        "cmd-full-payload", "disable_strategy", expected_version=4))
+
+    strategy_event = next(
+        event for event in forwarding.journal.read_after(0, 100)
+        if event.event_type == "strategy.updated")
+    assert strategy_event.payload["class_name"] == "SMICrossOver"
+    assert strategy_event.payload["bar_size"] == "5 mins"
+    assert strategy_event.payload["conids"] == [756733]
+    assert strategy_event.payload["params"] == {"signal_period": 3}
+
+
 def test_strategy_materialized_snapshot_preserves_metadata_after_receipt_update(tmp_path):
     from trader.data.materialized_state import GenericEntityAdapter
     from trader.domain.snapshot_service import DomainSnapshotService
@@ -865,3 +896,6 @@ def test_enable_strategy_receipt_carries_observable_state(runtime):
     assert receipt.observable_state in {
         "RUNNING", "WAITING_HISTORICAL_DATA", "INSTALLED", "DISABLED", "ERROR",
     }
+    assert receipt.observable_payload is not None
+    assert receipt.observable_payload["strategy_name"] == "smi_crossover"
+    assert receipt.observable_payload["class_name"]

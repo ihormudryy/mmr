@@ -2409,7 +2409,8 @@ class StrategyControlCommandService:
             self._reconciler.schedule(cmd.command_id, self._now_utc())
             return self._receipt(cmd.command_id, "OUTCOME_UNKNOWN", "DISPATCH_AMBIGUOUS", False)
 
-        payload = {
+        payload = dict(strategy_receipt.observable_payload or {})
+        payload.update({
             "strategy_name": strategy_receipt.strategy_name,
             "action": strategy_receipt.action,
             # Prefer the runtime StrategyState name (RUNNING/DISABLED/…).
@@ -2423,7 +2424,7 @@ class StrategyControlCommandService:
             "state_revision": strategy_receipt.state_revision,
             "error": strategy_receipt.error,
             "last_error": strategy_receipt.error,
-        }
+        })
         # Only a strategy-side COMMITTED actually bumped state_revision --
         # journal strategy.updated (asserting entity_revision == state_revision)
         # ONLY in that case. A ROLLED_BACK outcome minted no new revision on

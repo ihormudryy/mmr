@@ -401,6 +401,10 @@
       border-radius: var(--radius-lg);
       overflow: hidden;
     }
+    /* Trading-tab sections don't get the boxed frame above — the modular
+       grid is drawn with the rules below instead. These border rules must
+       stay #dash-trading-scoped: they have to out-specify this ID reset, or
+       the panels (Working orders, Recent executions, …) render frameless. */
     #dash-trading section, #dash-trading aside { border: 0; overflow: visible; }
     section > h2, aside > h2 {
       margin: 0;
@@ -424,15 +428,15 @@
       letter-spacing: .1em;
       color: color-mix(in srgb, var(--fg) 60%, transparent);
     }
-    #action-rail { border-bottom: 2px solid var(--border); }
-    #positions-panel { border-bottom: 2px solid var(--border); }
+    #dash-trading #action-rail { border-bottom: 2px solid var(--border); }
+    #dash-trading #positions-panel { border-bottom: 2px solid var(--border); }
     .lower {
       display: grid;
       grid-template-columns: minmax(0, 1fr) minmax(0, 1fr);
     }
-    .lower section { border-bottom: 2px solid var(--border); overflow-x: auto; }
+    #dash-trading .lower section { border-bottom: 2px solid var(--border); overflow-x: auto; }
     td.err-note { white-space: normal; min-width: 150px; max-width: 260px; text-align: left; }
-    .lower section:nth-of-type(odd) { border-right: 2px solid var(--border); }
+    #dash-trading .lower section:nth-of-type(odd) { border-right: 2px solid var(--border); }
 
     /* —— tables —— */
     table { width: 100%; border-collapse: collapse; font-variant-numeric: tabular-nums; }
@@ -1576,7 +1580,7 @@
 
     @media (max-width: 960px) {
       .lower { grid-template-columns: 1fr; }
-      .lower section:nth-of-type(odd) { border-right: none; }
+      #dash-trading .lower section:nth-of-type(odd) { border-right: none; }
       .band-cell { border-left: none; padding-left: 0; }
     }
     @media (max-width: 720px) {

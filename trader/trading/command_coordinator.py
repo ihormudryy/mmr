@@ -720,11 +720,16 @@ class CommandLedger:
 
         A row is reconcilable iff it has committed a dispatch-or-ambiguity
         transition -- ``SUBMITTING`` (claimed, dispatch may or may not have
-        reached the broker: the classic crash-between-claim-and-ack window) or
-        ``OUTCOME_UNKNOWN`` (a persisted ambiguous outcome). ``RECEIVED``/
-        ``VALIDATED`` never dispatched, and the terminal states are done."""
+        reached the broker: the classic crash-between-claim-and-ack window),
+        ``OUTCOME_UNKNOWN`` (a persisted ambiguous outcome), or ``SUBMITTED``
+        (dispatch ack recorded but not yet promoted to a terminal
+        ``RESOLVED``/``REJECTED`` — e.g. ``cancel_order`` happy-path ends at
+        ``SUBMITTED`` until the target order is observed terminal).
+        ``RECEIVED``/``VALIDATED`` never dispatched, and the terminal states
+        are done."""
         rows = self._journal.connect().execute(
-            f"{self._SELECT} WHERE state IN ('SUBMITTING', 'OUTCOME_UNKNOWN') "
+            f"{self._SELECT} WHERE state IN "
+            "('SUBMITTING', 'OUTCOME_UNKNOWN', 'SUBMITTED') "
             "ORDER BY created_at",
         ).fetchall()
         return [_row_to_ledger_row(row) for row in rows]
@@ -2641,7 +2646,7 @@ class OutcomeReconciler:
     def reconcile_once(self, command_id: str, now: dt.datetime) -> ReconcileResult:
         now = _as_utc(now)
         row = self._ledger.get(command_id)
-        if row is None or row.state not in ("SUBMITTING", "OUTCOME_UNKNOWN"):
+        if row is None or row.state not in ("SUBMITTING", "OUTCOME_UNKNOWN", "SUBMITTED"):
             # Already terminal (or gone) -- drop it and report resolved.
             self._plans.pop(command_id, None)
             return ReconcileResult(command_id, resolved=True, critical=False)

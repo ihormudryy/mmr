@@ -105,6 +105,49 @@ def _request(**overrides):
     return ProposalCreateRequest(**values)
 
 
+def test_reserve_id_skips_ids_already_materialized_when_sequence_lags(authority):
+    """WAL quarantine can leave rows while DuckDB sequence last_value resets."""
+    conn = authority.journal.connect()
+    # Occupy id 1 without consuming nextval — the desync shape after a
+    # discarded WAL where checkpointed rows outlive sequence state.
+    conn.execute(
+        """
+        INSERT INTO trade_proposals (
+            id, symbol, action, quantity, amount, execution, reasoning,
+            confidence, thesis, source, metadata, status, created_at,
+            updated_at, order_ids, rejection_reason, sec_type, account_id,
+            account_mode, conid, reference_price, reference_timestamp,
+            reference_quote_side, reference_feed_type, max_price_drift_bps,
+            expires_at, live_approval_eligible, revision, order_group_id
+        ) VALUES (
+            1, 'AAPL', 'BUY', 1.0, NULL, '{}', 'orphan', 0.5, '', 'manual', '{}',
+            'REJECTED', ?, ?, '[]', 'seed', 'STK', 'DU111111', 'paper', 265598,
+            210.0, ?, 'ask', 'live', 50.0, ?, false, 1, NULL
+        )
+        """,
+        [NOW.replace(tzinfo=None), NOW.replace(tzinfo=None), NOW, NOW],
+    )
+    conn.execute(
+        """
+        INSERT INTO domain_event_journal (
+            event_id, entity_revision, event_type, entity_type, entity_id,
+            operation, account_id, source, source_timestamp, received_timestamp,
+            correlation_id, payload
+        ) VALUES (
+            'proposal:1:1', 1, 'proposal.updated', 'proposal', '1',
+            'upsert', 'DU111111', 'trader_service', ?, ?, 'seed', '{}'
+        )
+        """,
+        [NOW, NOW],
+    )
+
+    created = authority.service.create_proposal(
+        _request(group="tech"), source="dashboard", correlation_id="cmd-after-lag"
+    )
+    assert created.id == 2
+    assert created.status == "PENDING"
+
+
 def test_create_is_guard_complete_and_journaled(authority):
     record = authority.service.create_proposal(
         _request(group="tech"), source="dashboard", correlation_id="cmd-1"

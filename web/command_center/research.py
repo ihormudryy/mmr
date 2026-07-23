@@ -77,7 +77,7 @@ def _upstream_research_error(tool: str, exc: BaseException) -> ResearchError:
         return ResearchError(502, "RESEARCH_UPSTREAM_ERROR", text[:500], True)
     if is_data_entitlement_error(exc):
         return ResearchError(
-            502,
+            403,
             "RESEARCH_NOT_ENTITLED",
             (
                 f"{tool.title()} needs a Massive Starter+ plan for snapshots/movers, "
@@ -88,7 +88,7 @@ def _upstream_research_error(tool: str, exc: BaseException) -> ResearchError:
     low = text.lower()
     if "429" in text or "too many" in low or "rate limit" in low:
         return ResearchError(
-            502,
+            429,
             "RESEARCH_RATE_LIMITED",
             f"{tool.title()} hit a provider rate limit; retry shortly.",
             True,

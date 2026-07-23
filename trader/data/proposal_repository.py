@@ -276,12 +276,32 @@ class ProposalRepository:
 
         DuckDB sequences may have gaps after a failed transaction; gaps are
         harmless and preferable to inventing a second identity allocator.
+
+        Also skip ids that already exist as rows or journal events. After an
+        unreplayable-WAL quarantine, checkpointed ``trade_proposals`` rows can
+        outlive the sequence's last_value (DuckDB has no ``setval``), so a naive
+        ``nextval`` would reuse ``proposal:{id}:1`` and raise
+        ``EventIdentityConflict``.
         """
-        row = self._journal.connect().execute(
-            "SELECT nextval('trade_proposals_id_seq')"
-        ).fetchone()
-        assert row is not None
-        return int(row[0])
+        conn = self._journal.connect()
+        for _ in range(10_000):
+            row = conn.execute(
+                "SELECT nextval('trade_proposals_id_seq')"
+            ).fetchone()
+            assert row is not None
+            proposal_id = int(row[0])
+            taken = conn.execute(
+                "SELECT 1 FROM trade_proposals WHERE id = ? "
+                "UNION ALL "
+                "SELECT 1 FROM domain_event_journal WHERE event_id = ? "
+                "LIMIT 1",
+                [proposal_id, f"proposal:{proposal_id}:1"],
+            ).fetchone()
+            if taken is None:
+                return proposal_id
+        raise RuntimeError(
+            "unable to reserve an unused trade_proposals id after 10000 nextval calls"
+        )
 
     def get(self, proposal_id: int) -> Optional[ProposalRecord]:
         row = self._journal.connect().execute(

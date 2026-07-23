@@ -117,12 +117,14 @@ async def test_entitlement_and_rate_limit_map_to_stable_codes():
         await service.run("snapshot", lambda provider: (_ for _ in ()).throw(
             RuntimeError('NOT_AUTHORIZED not entitled')))
     assert entitled.value.code == "RESEARCH_NOT_ENTITLED"
+    assert entitled.value.status == 403
     assert entitled.value.retryable is False
 
     with pytest.raises(ResearchError) as limited:
         await service.run("news", lambda provider: (_ for _ in ()).throw(
             RuntimeError("too many 429 error responses")))
     assert limited.value.code == "RESEARCH_RATE_LIMITED"
+    assert limited.value.status == 429
     assert limited.value.retryable is True
     service.close()
 

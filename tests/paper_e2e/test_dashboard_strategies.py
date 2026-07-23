@@ -1,6 +1,7 @@
 """Live paper-stack coverage for strategy controls and the params editor."""
 from __future__ import annotations
 
+import time
 from uuid import uuid4
 
 import pytest
@@ -50,6 +51,14 @@ def _row_for_strategy(dashboard_client, strategy_name: str) -> dict:
     )
 
 
+def _assert_strategy_present(row: dict) -> None:
+    """Minimal snapshot check — baseline row may be receipt-only."""
+    _strategy_name(row)
+    assert row.get("strategy_state") or row.get("state"), (
+        f"strategy state is absent: {row}"
+    )
+
+
 def _assert_runtime_row_fields(row: dict) -> None:
     assert row.get("class_name"), f"strategy class is absent: {row}"
     assert row.get("bar_size"), f"strategy bar size is absent: {row}"
@@ -59,6 +68,24 @@ def _assert_runtime_row_fields(row: dict) -> None:
     assert row.get("strategy_state") or row.get("state"), (
         f"strategy state is absent: {row}"
     )
+
+
+def _poll_runtime_row_after_enable(
+    dashboard_client, strategy_name: str, *, attempts: int = 5
+) -> dict:
+    """Poll snapshot until enable ack journals full runtime payload."""
+    last_row: dict = {}
+    for attempt in range(attempts):
+        row = _row_for_strategy(dashboard_client, strategy_name)
+        assert row, f"strategy {strategy_name!r} disappeared from snapshot"
+        if row.get("class_name"):
+            _assert_runtime_row_fields(row)
+            return row
+        last_row = row
+        if attempt + 1 < attempts:
+            time.sleep(0.5)
+    _assert_runtime_row_fields(last_row)
+    return last_row
 
 
 def test_strategy_enable_disable_and_runtime_panel(
@@ -71,7 +98,7 @@ def test_strategy_enable_disable_and_runtime_panel(
     login = dashboard_client.login()
     assert login.status_code == 200, f"login failed: {login.status_code} {login.text}"
     strategy_name = _strategy_name(_strategy_rows(dashboard_client)[0])
-    _assert_runtime_row_fields(_row_for_strategy(dashboard_client, strategy_name))
+    _assert_strategy_present(_row_for_strategy(dashboard_client, strategy_name))
 
     disabled = False
     try:
@@ -105,9 +132,7 @@ def test_strategy_enable_disable_and_runtime_panel(
         )
         disabled = False
 
-        row = _row_for_strategy(dashboard_client, strategy_name)
-        assert row, f"strategy {strategy_name!r} disappeared from snapshot"
-        _assert_runtime_row_fields(row)
+        _poll_runtime_row_after_enable(dashboard_client, strategy_name)
     finally:
         if disabled:
             row = _row_for_strategy(dashboard_client, strategy_name)

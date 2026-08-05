@@ -46,7 +46,7 @@
   - `class RpcScannerProvider` implementing it over an RPC client.
   - `IBIdeaScanner(provider: ScannerDataProvider)` (constructor signature change).
 
-- [ ] **Step 1: Write a failing regression test** proving `IBIdeaScanner` works through `RpcScannerProvider` wrapping the existing mock. Add to `tests/test_idea_scanner.py`:
+- [x] **Step 1: Write a failing regression test** proving `IBIdeaScanner` works through `RpcScannerProvider` wrapping the existing mock. Add to `tests/test_idea_scanner.py`:
 
 ```python
 def test_scan_through_rpc_provider(mock_rpc):
@@ -71,12 +71,12 @@ def test_scan_through_rpc_provider(mock_rpc):
     rpc_mock.scanner_data.assert_called_with(scan_code='TOP_PERC_GAIN', location_code='STK.AU.ASX', num_rows=30)
 ```
 
-- [ ] **Step 2: Run — expect failure**
+- [x] **Step 2: Run — expect failure**
 
 Run: `.venv/bin/python -m pytest tests/test_idea_scanner.py::test_scan_through_rpc_provider -q`
 Expected: FAIL — `RpcScannerProvider` undefined / constructor mismatch.
 
-- [ ] **Step 3: Add the protocol + `RpcScannerProvider`** near the top of the `IBIdeaScanner` section in `trader/tools/idea_scanner.py` (import `Protocol` from `typing` at the top of the file if not present):
+- [x] **Step 3: Add the protocol + `RpcScannerProvider`** near the top of the `IBIdeaScanner` section in `trader/tools/idea_scanner.py` (import `Protocol` from `typing` at the top of the file if not present):
 
 ```python
 class ScannerDataProvider(Protocol):
@@ -122,7 +122,7 @@ class RpcScannerProvider:
         return consume(self._rpc.rpc(return_type=list[dict]).get_news_headlines(con_id, provider_codes, count))
 ```
 
-- [ ] **Step 4: Refactor `IBIdeaScanner` to use the provider.** In `trader/tools/idea_scanner.py`:
+- [x] **Step 4: Refactor `IBIdeaScanner` to use the provider.** In `trader/tools/idea_scanner.py`:
 
 Constructor (line 1074-1075):
 ```python
@@ -151,7 +151,7 @@ Replace the six call sites (delete the local `from ... import consume` at line 1
 
 `_build_candidates` (static, 1400-1475) is unchanged.
 
-- [ ] **Step 5: Update the CLI construction** in `trader/sdk.py` (~line 4016), keeping the `_legacy_or_raise` gate above it intact:
+- [x] **Step 5: Update the CLI construction** in `trader/sdk.py` (~line 4016), keeping the `_legacy_or_raise` gate above it intact:
 
 ```python
             from trader.tools.idea_scanner import IBIdeaScanner, RpcScannerProvider
@@ -159,7 +159,7 @@ Replace the six call sites (delete the local `from ... import consume` at line 1
             scanner = IBIdeaScanner(RpcScannerProvider(self._rpc))
 ```
 
-- [ ] **Step 6: Update the existing tests** in `tests/test_idea_scanner.py` to construct through the provider. The `ib_scanner` fixture (line ~1030) and every `IBIdeaScanner(mock_rpc)` (25 sites) become `IBIdeaScanner(RpcScannerProvider(mock_rpc))`. Update the fixture:
+- [x] **Step 6: Update the existing tests** in `tests/test_idea_scanner.py` to construct through the provider. The `ib_scanner` fixture (line ~1030) and every `IBIdeaScanner(mock_rpc)` (25 sites) become `IBIdeaScanner(RpcScannerProvider(mock_rpc))`. Update the fixture:
 
 ```python
 @pytest.fixture
@@ -169,12 +169,12 @@ def ib_scanner(mock_rpc):
 ```
 and search/replace `IBIdeaScanner(mock_rpc)` → `IBIdeaScanner(RpcScannerProvider(mock_rpc))` in the test bodies. The per-test `rpc_mock.<method>.return_value = ...` stubbing is unchanged (RpcScannerProvider drives the same `.rpc().method()` chain).
 
-- [ ] **Step 7: Run the full scanner suite — expect PASS**
+- [x] **Step 7: Run the full scanner suite — expect PASS**
 
 Run: `.venv/bin/python -m pytest tests/test_idea_scanner.py -q`
 Expected: PASS (existing behavior preserved + the new provider test).
 
-- [ ] **Step 8: Commit**
+- [x] **Step 8: Commit**
 
 ```bash
 git add trader/tools/idea_scanner.py trader/sdk.py tests/test_idea_scanner.py
@@ -193,7 +193,7 @@ git commit -m "refactor(scanner): IBIdeaScanner takes a ScannerDataProvider; RPC
 - Consumes: `ScannerDataProvider` protocol (Task 1); a `Trader`-like object with the six async methods + `_main_loop`.
 - Produces: `TraderScannerProvider(trader, *, timeout=90.0)` — a `ScannerDataProvider` that bridges each sync call to `trader.<m>(...)` on `trader._main_loop` via `run_coroutine_threadsafe(...).result(timeout)`; raises `RuntimeError` if `_main_loop` is None/not running.
 
-- [ ] **Step 1: Write failing tests** in `tests/test_scanner_bridge.py`:
+- [x] **Step 1: Write failing tests** in `tests/test_scanner_bridge.py`:
 
 ```python
 import asyncio
@@ -255,12 +255,12 @@ def test_bridge_raises_when_loop_absent():
         p.scanner_data(scan_code='X', location_code='Y', num_rows=1)
 ```
 
-- [ ] **Step 2: Run — expect failure**
+- [x] **Step 2: Run — expect failure**
 
 Run: `.venv/bin/python -m pytest tests/test_scanner_bridge.py -q`
 Expected: FAIL — module missing.
 
-- [ ] **Step 3: Implement `trader/messaging/scanner_bridge.py`:**
+- [x] **Step 3: Implement `trader/messaging/scanner_bridge.py`:**
 
 ```python
 """In-process ScannerDataProvider: bridges IBIdeaScanner's sync calls to the
@@ -304,12 +304,12 @@ class TraderScannerProvider:
         return self._run(self._trader.get_news_headlines(con_id, provider_codes, count))
 ```
 
-- [ ] **Step 4: Run — expect PASS**
+- [x] **Step 4: Run — expect PASS**
 
 Run: `.venv/bin/python -m pytest tests/test_scanner_bridge.py -q`
 Expected: PASS.
 
-- [ ] **Step 5: Commit**
+- [x] **Step 5: Commit**
 
 ```bash
 git add trader/messaging/scanner_bridge.py tests/test_scanner_bridge.py
@@ -328,7 +328,7 @@ git commit -m "feat(scanner): TraderScannerProvider in-process bridge to trader 
 - Consumes: `IBIdeaScanner`, `RpcScannerProvider`? No — the handler uses `TraderScannerProvider` (Task 2); `PRESETS` from `idea_scanner`; `api.trader`.
 - Produces: query `scan_ideas` (RequestModel `ScanIdeasRequest`, response `dict` `{"rows": [...]}`).
 
-- [ ] **Step 1: Write failing handler tests** in `tests/test_scan_ideas_query.py` (mirror `tests/test_manage_surface.py`'s inline-registry idiom; use `execution='inline'` and a stub trader whose async methods return canned scanner/snapshot/history dicts). Cover: happy path returns rows; `IdeaScannerError` → `SCANNER_NO_RESULTS`; unknown preset → `VALIDATION_ERROR`; `_main_loop is None` → `SCANNER_UNAVAILABLE`.
+- [x] **Step 1: Write failing handler tests** in `tests/test_scan_ideas_query.py` (mirror `tests/test_manage_surface.py`'s inline-registry idiom; use `execution='inline'` and a stub trader whose async methods return canned scanner/snapshot/history dicts). Cover: happy path returns rows; `IdeaScannerError` → `SCANNER_NO_RESULTS`; unknown preset → `VALIDATION_ERROR`; `_main_loop is None` → `SCANNER_UNAVAILABLE`.
 
 ```python
 import asyncio, threading
@@ -401,12 +401,12 @@ def test_scan_ideas_unavailable_when_loop_none():
     assert e.value.code == 'SCANNER_UNAVAILABLE'
 ```
 
-- [ ] **Step 2: Run — expect failure**
+- [x] **Step 2: Run — expect failure**
 
 Run: `.venv/bin/python -m pytest tests/test_scan_ideas_query.py -q`
 Expected: FAIL — `ScanIdeasRequest`/`scan_ideas` undefined.
 
-- [ ] **Step 3: Implement** in `trader/messaging/cli_surface.py`. Add the request model near the others (~line 140):
+- [x] **Step 3: Implement** in `trader/messaging/cli_surface.py`. Add the request model near the others (~line 140):
 
 ```python
 class ScanIdeasRequest(BaseModel):
@@ -478,12 +478,12 @@ Register in `register_cli_surface` (near `get_market_depth`):
 
 > NOTE: confirm `_sanitize_numbers` exists in `cli_surface.py` (it's used by `get_market_depth`); if it only handles the depth shape, use it as-is on the records list — it recurses over dicts/lists. If absent, add a small numeric sanitizer (NaN/inf/numpy → JSON-safe) mirroring `web/.../massive_research.json_clean`.
 
-- [ ] **Step 4: Run — expect PASS**
+- [x] **Step 4: Run — expect PASS**
 
 Run: `.venv/bin/python -m pytest tests/test_scan_ideas_query.py -q`
 Expected: PASS (4 tests).
 
-- [ ] **Step 5: Commit**
+- [x] **Step 5: Commit**
 
 ```bash
 git add trader/messaging/cli_surface.py tests/test_scan_ideas_query.py
@@ -501,7 +501,7 @@ git commit -m "feat(scanner): scan_ideas typed query (enriched IB scan, fail-lou
 **Interfaces:**
 - Produces: query `scanner_locations` → `{"locations": list[dict]}` from `trader.scanner_locations()` (async; bridge via the trader loop).
 
-- [ ] **Step 1: Write failing test** (append to `tests/test_scan_ideas_query.py`):
+- [x] **Step 1: Write failing test** (append to `tests/test_scan_ideas_query.py`):
 
 ```python
 def test_scanner_locations_returns_list(running_loop):
@@ -513,12 +513,12 @@ def test_scanner_locations_returns_list(running_loop):
     assert out['locations'][0]['code'] == 'STK.US.MAJOR'
 ```
 
-- [ ] **Step 2: Run — expect failure** (`scanner_locations` unregistered).
+- [x] **Step 2: Run — expect failure** (`scanner_locations` unregistered).
 
 Run: `.venv/bin/python -m pytest tests/test_scan_ideas_query.py::test_scanner_locations_returns_list -q`
 Expected: FAIL.
 
-- [ ] **Step 3: Implement** in `cli_surface.py`:
+- [x] **Step 3: Implement** in `cli_surface.py`:
 
 ```python
 def _scanner_locations_handler(api: TraderServiceApi):
@@ -537,12 +537,12 @@ Register:
     registry.register('query', 'scanner_locations', dict, dict, _scanner_locations_handler(api))
 ```
 
-- [ ] **Step 4: Run — expect PASS**
+- [x] **Step 4: Run — expect PASS**
 
 Run: `.venv/bin/python -m pytest tests/test_scan_ideas_query.py -q`
 Expected: PASS (5 tests).
 
-- [ ] **Step 5: Commit**
+- [x] **Step 5: Commit**
 
 ```bash
 git add trader/messaging/cli_surface.py tests/test_scan_ideas_query.py
@@ -556,7 +556,7 @@ git commit -m "feat(scanner): scanner_locations companion query"
 **Files:**
 - Modify: `tests/test_production_rpc_security.py`
 
-- [ ] **Step 1: Add the two queries** to the registration-presence parametrized list and assert wrong-role rejection. Find the parametrized presence test (~`test_production_rpc_security.py:192`) and append `"scan_ideas"` and `"scanner_locations"` to the query-name list:
+- [x] **Step 1: Add the two queries** to the registration-presence parametrized list and assert wrong-role rejection. Find the parametrized presence test (~`test_production_rpc_security.py:192`) and append `"scan_ideas"` and `"scanner_locations"` to the query-name list:
 
 ```python
 @pytest.mark.parametrize("method", [
@@ -568,17 +568,17 @@ def test_query_registered(production_registry, method):
 
 (If `_FakeTrader` in that file lacks `scanner_data`/`scanner_locations`, no change is needed for a pure `contains(...)` presence check — it doesn't invoke the handler. Only add stub methods if you also add a behavioral/e2e case.)
 
-- [ ] **Step 2: Run the security + surface suites**
+- [x] **Step 2: Run the security + surface suites**
 
 Run: `.venv/bin/python -m pytest tests/test_production_rpc_security.py tests/test_scan_ideas_query.py tests/test_scanner_bridge.py -q`
 Expected: PASS.
 
-- [ ] **Step 3: Full regression**
+- [x] **Step 3: Full regression**
 
 Run: `.venv/bin/python -m pytest tests/test_idea_scanner.py tests/test_scan_ideas_query.py tests/test_scanner_bridge.py tests/test_production_rpc_security.py -q`
 Expected: PASS.
 
-- [ ] **Step 4: Commit**
+- [x] **Step 4: Commit**
 
 ```bash
 git add tests/test_production_rpc_security.py
@@ -589,8 +589,8 @@ git commit -m "test(scanner): register scan_ideas/scanner_locations in productio
 
 ## Final verification
 
-- [ ] `.venv/bin/python -m pytest tests/ --timeout=30 -q --ignore=tests/test_ibrx_async.py -k "scanner or idea_scanner or cli_surface or production_rpc"` → PASS.
-- [ ] `.venv/bin/python -m pytest tests/ --timeout=30 -q --ignore=tests/test_ibrx_async.py` → no new failures vs. baseline.
+- [x] `.venv/bin/python -m pytest tests/ --timeout=30 -q --ignore=tests/test_ibrx_async.py -k "scanner or idea_scanner or cli_surface or production_rpc"` → PASS.
+- [x] `.venv/bin/python -m pytest tests/ --timeout=30 -q --ignore=tests/test_ibrx_async.py` → no new failures vs. baseline.
 
 ## Self-review notes
 
@@ -598,3 +598,71 @@ git commit -m "test(scanner): register scan_ideas/scanner_locations in productio
 - **Execution model:** the `scan_ideas` handler is a sync `def`; in production the registry's `default_execution="thread"` runs it off the ROUTER loop, and `TraderScannerProvider` bridges every call (including `IBIdeaScanner`'s parallel history pool) back to `trader._main_loop`. Unit tests use `execution='inline'` + a loop running in a background thread so the bridge is exercised.
 - **Type consistency:** provider method names/signatures match across the protocol, `RpcScannerProvider`, `TraderScannerProvider`, and the `IBIdeaScanner` call sites; `_main_loop` guard consistent between the bridge, the `scan_ideas` handler, and `scanner_locations`.
 - **Risk:** Task 1 touches shared scanner code + 25 tests; the regression guard is that the existing tests pass unchanged (only the construction wrapper changes). `_sanitize_numbers` reuse is flagged for confirmation in Task 3.
+
+---
+
+## Execution notes (2026-08-05)
+
+Implemented in `59938dc` (Task 1), `e43364f` (Task 2), `bf63ece` (Tasks 3+4),
+`d6e7bbd` (Task 5). Deviations from the plan as written:
+
+1. **Task 1 Step 6 was not just a construction wrapper.** Four tests in
+   `TestLocationExchangeResolution` injected their fake contract definitions by
+   passing `consume=lambda _x: [...]` straight into `_resolve_symbols`. With
+   `consume` gone from the signature, the equivalent seam is the provider's
+   `resolve_contract`, so those four now stub
+   `mock_rpc.rpc.return_value.resolve_contract` (`return_value` where the fake
+   `consume` supplied defs, `side_effect` where the test also captures the
+   partial contract's exchange). Same defs reach the same code path; intent
+   preserved.
+
+2. **An empty DataFrame is `SCANNER_NO_RESULTS`, not `{"rows": []}`.** The
+   plan's draft handler returned an empty list when `df.empty`, which
+   contradicts its own Global Constraint ("Never a silent `[]`"). The scanner
+   returns an empty frame when every candidate is filtered out or none can be
+   built — indistinguishable, to a caller, from "the scan didn't run". It now
+   raises `SCANNER_NO_RESULTS` naming the preset and location.
+
+3. **`_sanitize_numbers` reuse confirmed** (the Task 3 NOTE asked for this): it
+   exists at `cli_surface.py:50` and recurses over dicts/lists, so it is
+   applied to the records list as-is. It is *load-bearing* here, not
+   belt-and-braces: when one candidate can compute an indicator and another
+   cannot, pandas produces a float64 `NaN`, and `canonical_json`
+   (`allow_nan=False`) refuses to sign it. Verified by constructing that case
+   and watching the raw frame fail to encode; pinned by
+   `test_scan_ideas_rows_are_json_wire_safe`. No numpy-scalar coercion was
+   added — this pandas version's `to_dict('records')` already yields Python
+   natives, so it would have been speculative.
+
+4. **Still trimmed, as the plan intended:** the spec's IB-level
+   `above_price`/`above_volume`/`market_cap_above` prefilter and `scan_code`
+   override are not exposed — `IBIdeaScanner.scan()` takes none of them and
+   adding them would change scan behaviour beyond a refactor.
+
+5. **Tests beyond the plan's list** (21 new overall): the bridge gained
+   forward-every-method, loop-stopped-mid-scan, and
+   exception-propagation cases; `scan_ideas` gained wire-safety,
+   validation-precedes-IB-work, `num` bounds, custom-filter forwarding, and a
+   `scanner_locations` unavailable case; the security suite asserts the two
+   queries are absent from the *command* socket and that `scan_ideas` resolves
+   to `thread` execution.
+
+### Pre-existing issues found while establishing a baseline (not caused by this work)
+
+- `tests/test_watchlist_session_auth.py` **hangs the full suite** at ~96%.
+  `watchlist_create` reaches a real ZMQ `socket.send` with no server bound, and
+  because it blocks in C, `--timeout=30` can only dump stacks — the run then
+  wedges and never reports. Two different tests in that file hang depending on
+  ordering (`test_watchlist_create_survives_commands_enabled` hangs even in
+  isolation), which points at cross-test pollution leaving the manage client
+  pointed at a live endpoint. Baselines here were taken with that file ignored.
+- `tests/test_user_guide.py::test_guide_template_has_info_bubbles_and_sections`
+  fails at `5c7a93a` and is fixed by the (separate, uncommitted) heading rename
+  in `web/templates/_guide_tab.html`.
+
+### Verification
+
+Baseline at `5c7a93a` (ignoring `test_ibrx_async.py` + `test_watchlist_session_auth.py`):
+`1 failed, 3930 passed, 3 skipped`. After this work: **`3952 passed, 3 skipped`,
+0 failed** — +22 = 21 new tests plus the `test_user_guide` failure the guide-tab
+edit resolves. No regressions.

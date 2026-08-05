@@ -4004,7 +4004,7 @@ class MMR:
                     'or run with `unsafe_legacy_rpc: true` + `--simulation True`.'
                 ) from None
 
-            from trader.tools.idea_scanner import IBIdeaScanner
+            from trader.tools.idea_scanner import IBIdeaScanner, RpcScannerProvider
 
             # Resolve universe to symbol list for IB path
             ib_universe_symbols = None
@@ -4021,7 +4021,7 @@ class MMR:
                 else:
                     return pd.DataFrame()
 
-            scanner = IBIdeaScanner(self._rpc)
+            scanner = IBIdeaScanner(RpcScannerProvider(self._rpc))
             return scanner.scan(
                 preset=preset,
                 location=location,

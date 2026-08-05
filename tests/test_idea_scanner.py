@@ -19,6 +19,7 @@ from trader.tools.idea_scanner import (
     LIQUID_US_FALLBACK_TICKERS,
     PRESETS,
     PRESET_SCAN_CODES,
+    RpcScannerProvider,
     ScanFilter,
     ScanPreset,
     apply_filters,
@@ -1028,7 +1029,34 @@ def mock_rpc():
 
 @pytest.fixture
 def ib_scanner(mock_rpc):
-    return IBIdeaScanner(mock_rpc)
+    return IBIdeaScanner(RpcScannerProvider(mock_rpc))
+
+
+def test_scan_through_rpc_provider(mock_rpc):
+    """Regression guard for the provider refactor: the RPC-backed provider must
+    drive the same ``.rpc(return_type=...).method(...)`` chain IBIdeaScanner
+    used inline, so the CLI path is behaviourally unchanged."""
+    rpc_mock = MagicMock()
+    mock_rpc.rpc.return_value = rpc_mock
+    rpc_mock.scanner_data.return_value = [
+        _make_scanner_result('BHP', conId=100),
+        _make_scanner_result('CBA', conId=200),
+    ]
+    rpc_mock.get_snapshots_batch.return_value = [
+        _make_ib_snapshot('BHP', conId=100, last=45.0, open_=43.0, high=46.0,
+                          low=42.5, volume=2_000_000),
+        _make_ib_snapshot('CBA', conId=200, last=100.0, open_=98.0, high=102.0,
+                          low=97.0, volume=1_500_000),
+    ]
+    rpc_mock.get_history_bars.return_value = _make_history_bars(base_price=40.0, num_bars=30)
+
+    scanner = IBIdeaScanner(RpcScannerProvider(mock_rpc))
+    df = scanner.scan(preset='momentum', location='STK.AU.ASX', top_n=10)
+    assert not df.empty
+    assert {'ticker', 'score', 'signal'} <= set(df.columns)
+    # provider forwarded the exact scanner_data kwargs
+    rpc_mock.scanner_data.assert_called_with(
+        scan_code='TOP_PERC_GAIN', location_code='STK.AU.ASX', num_rows=30)
 
 
 class TestIBIdeaScannerBuildCandidates:
@@ -1116,7 +1144,7 @@ class TestIBIdeaScannerScan:
         rpc_mock.get_snapshots_batch.return_value = snapshots
         rpc_mock.get_history_bars.return_value = history
 
-        scanner = IBIdeaScanner(mock_rpc)
+        scanner = IBIdeaScanner(RpcScannerProvider(mock_rpc))
         df = scanner.scan(preset='momentum', location='STK.AU.ASX', top_n=10)
 
         assert isinstance(df, pd.DataFrame)
@@ -1134,13 +1162,13 @@ class TestIBIdeaScannerScan:
         mock_rpc.rpc.return_value = rpc_mock
         rpc_mock.scanner_data.return_value = []
 
-        scanner = IBIdeaScanner(mock_rpc)
+        scanner = IBIdeaScanner(RpcScannerProvider(mock_rpc))
         with pytest.raises(IdeaScannerError) as exc:
             scanner.scan(preset='momentum', location='STK.AU.ASX')
         assert '--tickers' in str(exc.value)
 
     def test_unknown_preset_raises(self, mock_rpc):
-        scanner = IBIdeaScanner(mock_rpc)
+        scanner = IBIdeaScanner(RpcScannerProvider(mock_rpc))
         with pytest.raises(ValueError, match='Unknown preset'):
             scanner.scan(preset='nonexistent', location='STK.AU.ASX')
 
@@ -1175,7 +1203,7 @@ class TestIBIdeaScannerScan:
         rpc_mock.get_snapshots_batch.return_value = snapshots
         rpc_mock.get_history_bars.side_effect = history_side_effect
 
-        scanner = IBIdeaScanner(mock_rpc)
+        scanner = IBIdeaScanner(RpcScannerProvider(mock_rpc))
         # Default momentum min_price=5.0 would exclude CHEAP;
         # override to min_price=1.0 so CHEAP passes
         df = scanner.scan(preset='momentum', location='STK.AU.ASX',
@@ -1194,7 +1222,7 @@ class TestIBIdeaScannerScan:
         rpc_mock.get_snapshots_batch.return_value = snapshots
         rpc_mock.get_history_bars.return_value = history
 
-        scanner = IBIdeaScanner(mock_rpc)
+        scanner = IBIdeaScanner(RpcScannerProvider(mock_rpc))
         df = scanner.scan(preset='momentum', location='STK.AU.ASX',
                           custom_filters={'min_price': 1.0, 'min_volume': 0,
                                           'min_change_pct': None})
@@ -1220,7 +1248,7 @@ class TestIBIdeaScannerScan:
         rpc_mock.get_snapshots_batch.return_value = snapshots
         rpc_mock.get_history_bars.return_value = history
 
-        scanner = IBIdeaScanner(mock_rpc)
+        scanner = IBIdeaScanner(RpcScannerProvider(mock_rpc))
         df = scanner.scan(preset='momentum', location='STK.AU.ASX', top_n=5,
                           custom_filters={'min_price': 1.0, 'min_volume': 0,
                                           'min_change_pct': None})
@@ -1252,7 +1280,7 @@ class TestIBIdeaScannerScan:
         rpc_mock.get_snapshots_batch.return_value = snapshots
         rpc_mock.get_history_bars.side_effect = get_history_side_effect
 
-        scanner = IBIdeaScanner(mock_rpc)
+        scanner = IBIdeaScanner(RpcScannerProvider(mock_rpc))
         df = scanner.scan(preset='momentum', location='STK.AU.ASX',
                           custom_filters={'min_price': 1.0, 'min_volume': 0,
                                           'min_change_pct': None})
@@ -1375,7 +1403,7 @@ class TestIBIdeaScannerFundamentals:
         rpc_mock = self._setup_basic_scan(mock_rpc)
         rpc_mock.get_fundamental_data.return_value = _SAMPLE_REPORT_SNAPSHOT
 
-        scanner = IBIdeaScanner(mock_rpc)
+        scanner = IBIdeaScanner(RpcScannerProvider(mock_rpc))
         df = scanner.scan(preset='momentum', location='STK.AU.ASX',
                           fundamentals=True,
                           custom_filters={'min_price': 1.0, 'min_volume': 0,
@@ -1388,7 +1416,7 @@ class TestIBIdeaScannerFundamentals:
     def test_no_fundamentals_by_default(self, mock_rpc):
         rpc_mock = self._setup_basic_scan(mock_rpc)
 
-        scanner = IBIdeaScanner(mock_rpc)
+        scanner = IBIdeaScanner(RpcScannerProvider(mock_rpc))
         df = scanner.scan(preset='momentum', location='STK.AU.ASX',
                           custom_filters={'min_price': 1.0, 'min_volume': 0,
                                           'min_change_pct': None})
@@ -1398,7 +1426,7 @@ class TestIBIdeaScannerFundamentals:
         rpc_mock = self._setup_basic_scan(mock_rpc)
         rpc_mock.get_fundamental_data.side_effect = Exception('No data')
 
-        scanner = IBIdeaScanner(mock_rpc)
+        scanner = IBIdeaScanner(RpcScannerProvider(mock_rpc))
         df = scanner.scan(preset='momentum', location='STK.AU.ASX',
                           fundamentals=True,
                           custom_filters={'min_price': 1.0, 'min_volume': 0,
@@ -1427,7 +1455,7 @@ class TestIBIdeaScannerNews:
              'articleId': 'art123', 'headline': 'BHP posts record iron ore output'},
         ]
 
-        scanner = IBIdeaScanner(mock_rpc)
+        scanner = IBIdeaScanner(RpcScannerProvider(mock_rpc))
         df = scanner.scan(preset='momentum', location='STK.AU.ASX',
                           news=True,
                           custom_filters={'min_price': 1.0, 'min_volume': 0,
@@ -1440,7 +1468,7 @@ class TestIBIdeaScannerNews:
     def test_no_news_by_default(self, mock_rpc):
         rpc_mock = self._setup_basic_scan(mock_rpc)
 
-        scanner = IBIdeaScanner(mock_rpc)
+        scanner = IBIdeaScanner(RpcScannerProvider(mock_rpc))
         df = scanner.scan(preset='momentum', location='STK.AU.ASX',
                           custom_filters={'min_price': 1.0, 'min_volume': 0,
                                           'min_change_pct': None})
@@ -1453,7 +1481,7 @@ class TestIBIdeaScannerNews:
              'articleId': 'art123', 'headline': 'A' * 200},
         ]
 
-        scanner = IBIdeaScanner(mock_rpc)
+        scanner = IBIdeaScanner(RpcScannerProvider(mock_rpc))
         df = scanner.scan(preset='momentum', location='STK.AU.ASX',
                           news=True,
                           custom_filters={'min_price': 1.0, 'min_volume': 0,
@@ -1464,7 +1492,7 @@ class TestIBIdeaScannerNews:
         rpc_mock = self._setup_basic_scan(mock_rpc)
         rpc_mock.get_news_headlines.return_value = []
 
-        scanner = IBIdeaScanner(mock_rpc)
+        scanner = IBIdeaScanner(RpcScannerProvider(mock_rpc))
         df = scanner.scan(preset='momentum', location='STK.AU.ASX',
                           news=True,
                           custom_filters={'min_price': 1.0, 'min_volume': 0,
@@ -1475,7 +1503,7 @@ class TestIBIdeaScannerNews:
         rpc_mock = self._setup_basic_scan(mock_rpc)
         rpc_mock.get_news_headlines.side_effect = Exception('No news')
 
-        scanner = IBIdeaScanner(mock_rpc)
+        scanner = IBIdeaScanner(RpcScannerProvider(mock_rpc))
         df = scanner.scan(preset='momentum', location='STK.AU.ASX',
                           news=True,
                           custom_filters={'min_price': 1.0, 'min_volume': 0,
@@ -1490,7 +1518,7 @@ class TestIBIdeaScannerNews:
              'articleId': 'art123', 'headline': 'BHP beats estimates'},
         ]
 
-        scanner = IBIdeaScanner(mock_rpc)
+        scanner = IBIdeaScanner(RpcScannerProvider(mock_rpc))
         df = scanner.scan(preset='momentum', location='STK.AU.ASX',
                           fundamentals=True, news=True,
                           custom_filters={'min_price': 1.0, 'min_volume': 0,
@@ -1529,7 +1557,7 @@ class TestIBIdeaScannerTickersPath:
         rpc_mock.get_snapshots_batch.return_value = snapshots
         rpc_mock.get_history_bars.return_value = history
 
-        scanner = IBIdeaScanner(mock_rpc)
+        scanner = IBIdeaScanner(RpcScannerProvider(mock_rpc))
         df = scanner.scan(
             preset='momentum', location='STK.AU.ASX',
             tickers=['BHP', 'CBA'],
@@ -1554,7 +1582,7 @@ class TestIBIdeaScannerTickersPath:
         ]
         rpc_mock.get_history_bars.return_value = _make_history_bars(base_price=40.0, num_bars=20)
 
-        scanner = IBIdeaScanner(mock_rpc)
+        scanner = IBIdeaScanner(RpcScannerProvider(mock_rpc))
         scanner.scan(
             preset='momentum', location='STK.AU.ASX',
             tickers=['BHP'],
@@ -1581,7 +1609,7 @@ class TestIBIdeaScannerTickersPath:
         rpc_mock.get_snapshots_batch.return_value = snapshots
         rpc_mock.get_history_bars.return_value = history
 
-        scanner = IBIdeaScanner(mock_rpc)
+        scanner = IBIdeaScanner(RpcScannerProvider(mock_rpc))
         df = scanner.scan(
             preset='momentum', location='STK.AU.ASX',
             universe_symbols=['BHP'],
@@ -1604,7 +1632,7 @@ class TestIBIdeaScannerTickersPath:
         ]
         rpc_mock.get_history_bars.return_value = _make_history_bars(base_price=90.0, num_bars=20)
 
-        scanner = IBIdeaScanner(mock_rpc)
+        scanner = IBIdeaScanner(RpcScannerProvider(mock_rpc))
         df = scanner.scan(
             preset='momentum', location='STK.AU.ASX',
             tickers=['BHP', 'CBA'],
@@ -1624,7 +1652,7 @@ class TestIBIdeaScannerTickersPath:
         mock_rpc.rpc.return_value = rpc_mock
         rpc_mock.resolve_contract.return_value = []
 
-        scanner = IBIdeaScanner(mock_rpc)
+        scanner = IBIdeaScanner(RpcScannerProvider(mock_rpc))
         with pytest.raises(IdeaScannerError) as exc:
             scanner.scan(
                 preset='momentum', location='STK.AU.ASX',
@@ -1645,7 +1673,7 @@ class TestIBIdeaScannerTickersPath:
         ]
         rpc_mock.get_history_bars.return_value = _make_history_bars(base_price=90.0, num_bars=20)
 
-        scanner = IBIdeaScanner(mock_rpc)
+        scanner = IBIdeaScanner(RpcScannerProvider(mock_rpc))
         df = scanner.scan(
             preset='momentum', location='STK.AU.ASX',
             tickers=['BROKEN', 'CBA'],
@@ -1671,7 +1699,7 @@ class TestIBIdeaScannerTickersPath:
              'articleId': 'art123', 'headline': 'BHP record profits'},
         ]
 
-        scanner = IBIdeaScanner(mock_rpc)
+        scanner = IBIdeaScanner(RpcScannerProvider(mock_rpc))
         df = scanner.scan(
             preset='momentum', location='STK.AU.ASX',
             tickers=['BHP'],
@@ -1700,7 +1728,7 @@ class TestIBIdeaScannerTickersPath:
         ]
         rpc_mock.get_history_bars.return_value = _make_history_bars(base_price=140.0, num_bars=20)
 
-        scanner = IBIdeaScanner(mock_rpc)
+        scanner = IBIdeaScanner(RpcScannerProvider(mock_rpc))
         scanner.scan(
             preset='momentum', location='STK.CA',
             tickers=['RY'],
@@ -1721,28 +1749,27 @@ class TestLocationExchangeResolution:
     def test_asx_picks_local_listing_over_us_adr(self, ib_scanner, mock_rpc):
         adr = SimpleNamespace(symbol='BHP', conId=999, primaryExchange='NYSE', currency='USD')
         local = SimpleNamespace(symbol='BHP', conId=4036812, primaryExchange='ASX', currency='AUD')
-        contracts, conid_map = ib_scanner._resolve_symbols(
-            ['BHP'], 'STK.AU.ASX', consume=lambda _x: [adr, local])
+        mock_rpc.rpc.return_value.resolve_contract.return_value = [adr, local]
+        contracts, conid_map = ib_scanner._resolve_symbols(['BHP'], 'STK.AU.ASX')
         assert len(contracts) == 1
         assert contracts[0].conId == 4036812      # ASX local, NOT the NYSE ADR
         assert contracts[0].currency == 'AUD'
 
     def test_asx_rejects_when_only_adr_available(self, ib_scanner, mock_rpc):
         adr = SimpleNamespace(symbol='BHP', conId=999, primaryExchange='NYSE', currency='USD')
-        contracts, conid_map = ib_scanner._resolve_symbols(
-            ['BHP'], 'STK.AU.ASX', consume=lambda _x: [adr])
+        mock_rpc.rpc.return_value.resolve_contract.return_value = [adr]
+        contracts, conid_map = ib_scanner._resolve_symbols(['BHP'], 'STK.AU.ASX')
         assert contracts == []                    # refuse the wrong-market instrument
 
     def test_us_major_resolves_on_smart_not_major(self, ib_scanner, mock_rpc):
         captured = {}
+        aapl = SimpleNamespace(symbol='AAPL', conId=265598, primaryExchange='NASDAQ', currency='USD')
 
         def _resolve(partial):
             captured['exchange'] = partial.exchange
-            return 'defs'
+            return [aapl]
         mock_rpc.rpc.return_value.resolve_contract.side_effect = _resolve
-        aapl = SimpleNamespace(symbol='AAPL', conId=265598, primaryExchange='NASDAQ', currency='USD')
-        contracts, _ = ib_scanner._resolve_symbols(
-            ['AAPL'], 'STK.US.MAJOR', consume=lambda _x: [aapl])
+        contracts, _ = ib_scanner._resolve_symbols(['AAPL'], 'STK.US.MAJOR')
         assert captured['exchange'] == 'SMART'    # not the bogus 'MAJOR'
         assert len(contracts) == 1 and contracts[0].currency == 'USD'
 
@@ -1751,9 +1778,7 @@ class TestLocationExchangeResolution:
 
         def _resolve(partial):
             captured['exchange'] = partial.exchange
-            return 'defs'
+            return [SimpleNamespace(symbol='7203', conId=1, primaryExchange='TSEJ', currency='JPY')]
         mock_rpc.rpc.return_value.resolve_contract.side_effect = _resolve
-        ib_scanner._resolve_symbols(
-            ['7203'], 'STK.JP.TSE',
-            consume=lambda _x: [SimpleNamespace(symbol='7203', conId=1, primaryExchange='TSEJ', currency='JPY')])
+        ib_scanner._resolve_symbols(['7203'], 'STK.JP.TSE')
         assert captured['exchange'] == 'TSEJ'     # Tokyo, not Toronto's 'TSE'

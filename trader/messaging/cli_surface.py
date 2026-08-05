@@ -140,6 +140,28 @@ class GetMarketDepthRequest(BaseModel):
     is_smart_depth: bool = False
 
 
+class ScanIdeasRequest(BaseModel):
+    """Request for the enriched IB scan (``scan_ideas``).
+
+    ``num`` is bounded so a caller cannot trigger an unbounded IB scan; the
+    scanner internally discovers ``num * 3`` rows and fetches history for
+    ``num * 2`` of them.
+    """
+    model_config = ConfigDict(extra='forbid')
+    preset: str = 'momentum'
+    location: str = 'STK.US.MAJOR'
+    num: int = Field(default=15, ge=1, le=50)
+    min_price: Optional[float] = Field(default=None, gt=0)
+    max_price: Optional[float] = Field(default=None, gt=0)
+    min_volume: Optional[int] = Field(default=None, ge=0)
+    min_change: Optional[float] = None
+    max_change: Optional[float] = None
+    fundamentals: bool = False
+    news: bool = False
+    tickers: list[str] = Field(default_factory=list)
+    universe: str = ''
+
+
 def _ib_account_handler(api: TraderServiceApi):
     def _handler(_body: Dict[str, Any]) -> Dict[str, Any]:
         return {'account_id': str(api.trader.ib_account or '')}
@@ -267,6 +289,98 @@ def _get_market_depth_handler(api: TraderServiceApi):
     return _handler
 
 
+def _scanner_loop_or_raise(api: TraderServiceApi):
+    """The trader's event loop, or a loud SCANNER_UNAVAILABLE.
+
+    Every scanner call has to run on the trader's own loop; without it there is
+    nothing to fetch, and an empty result would read as "no matches" instead of
+    "not connected".
+    """
+    from trader.messaging.typed_rpc import _DispatchProblem
+    loop = getattr(api.trader, '_main_loop', None)
+    if loop is None or not loop.is_running():
+        raise _DispatchProblem(
+            'SCANNER_UNAVAILABLE', 'trader is not connected to IB Gateway')
+    return loop
+
+
+def _scan_ideas_handler(api: TraderServiceApi):
+    """Run the enriched IBIdeaScanner pipeline in-process on the trader.
+
+    Synchronous by design: production registers this under the registry's
+    ``thread`` execution so the blocking scan (and its internal history
+    ThreadPoolExecutor) stays off the ROUTER loop, while
+    ``TraderScannerProvider`` bridges each IB call back to ``_main_loop``.
+    """
+    def _handler(parsed: ScanIdeasRequest) -> Dict[str, Any]:
+        from trader.messaging.scanner_bridge import TraderScannerProvider
+        from trader.messaging.typed_rpc import _DispatchProblem
+        from trader.tools.idea_scanner import PRESETS, IBIdeaScanner, IdeaScannerError
+
+        # Validate before any IB work so a typo costs nothing.
+        if parsed.preset not in PRESETS:
+            raise _DispatchProblem(
+                'VALIDATION_ERROR',
+                f'unknown preset {parsed.preset!r}; '
+                f'available: {", ".join(sorted(PRESETS))}')
+        _scanner_loop_or_raise(api)
+
+        custom_filters = {k: v for k, v in {
+            'min_price': parsed.min_price, 'max_price': parsed.max_price,
+            'min_volume': parsed.min_volume,
+            'min_change_pct': parsed.min_change, 'max_change_pct': parsed.max_change,
+        }.items() if v is not None}
+
+        universe_symbols = None
+        if parsed.universe.strip():
+            from trader.container import Container
+            from trader.data.universe import UniverseAccessor
+            cfg = Container.instance().config()
+            accessor = UniverseAccessor(
+                cfg.get('duckdb_path', ''),
+                cfg.get('universe_library', 'Universes'),
+            )
+            universe = accessor.get(parsed.universe.strip())
+            universe_symbols = [d.symbol for d in (universe.security_definitions or [])]
+            if not universe_symbols:
+                raise _DispatchProblem(
+                    'VALIDATION_ERROR',
+                    f'universe {parsed.universe.strip()!r} is empty or unknown')
+
+        scanner = IBIdeaScanner(TraderScannerProvider(api.trader))
+        try:
+            df = scanner.scan(
+                preset=parsed.preset, location=parsed.location, top_n=parsed.num,
+                custom_filters=custom_filters or None,
+                fundamentals=parsed.fundamentals, news=parsed.news,
+                tickers=[t.strip().upper() for t in parsed.tickers if t.strip()] or None,
+                universe_symbols=universe_symbols,
+            )
+        except IdeaScannerError as exc:
+            raise _DispatchProblem('SCANNER_NO_RESULTS', str(exc)) from exc
+        except RuntimeError as exc:
+            # The bridge lost the trader's loop mid-scan.
+            raise _DispatchProblem('SCANNER_UNAVAILABLE', str(exc)) from exc
+
+        if df.empty:
+            raise _DispatchProblem(
+                'SCANNER_NO_RESULTS',
+                f'no candidates survived scoring/filters for preset '
+                f'{parsed.preset!r} at location {parsed.location!r}')
+        return {'rows': _sanitize_numbers(df.to_dict('records'))}
+    return _handler
+
+
+def _scanner_locations_handler(api: TraderServiceApi):
+    def _handler(_body: Dict[str, Any]) -> Dict[str, Any]:
+        import asyncio
+        loop = _scanner_loop_or_raise(api)
+        locations = asyncio.run_coroutine_threadsafe(
+            api.trader.scanner_locations(), loop).result(30)
+        return {'locations': _sanitize_numbers(list(locations or []))}
+    return _handler
+
+
 def register_cli_surface(registry: TypedRpcRegistry, api: TraderServiceApi) -> None:
     """Wire CLI/SDK typed query reads onto the trader production registry."""
     registry.register('query', 'get_ib_account', dict, dict, _ib_account_handler(api))
@@ -295,7 +409,13 @@ def register_cli_surface(registry: TypedRpcRegistry, api: TraderServiceApi) -> N
         'query', 'get_market_depth', GetMarketDepthRequest, dict,
         _get_market_depth_handler(api),
     )
+    registry.register(
+        'query', 'scan_ideas', ScanIdeasRequest, dict, _scan_ideas_handler(api),
+    )
+    registry.register(
+        'query', 'scanner_locations', dict, dict, _scanner_locations_handler(api),
+    )
 
 
 # Re-export for tests that build portfolio wires via production_api
-__all__ = ['register_cli_surface']
+__all__ = ['register_cli_surface', 'ScanIdeasRequest']

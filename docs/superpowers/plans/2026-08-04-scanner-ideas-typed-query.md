@@ -649,16 +649,13 @@ Implemented in `59938dc` (Task 1), `e43364f` (Task 2), `bf63ece` (Tasks 3+4),
 
 ### Pre-existing issues found while establishing a baseline (not caused by this work)
 
-- `tests/test_watchlist_session_auth.py` **hangs the full suite** at ~96%.
-  `watchlist_create` reaches a real ZMQ `socket.send` with no server bound, and
-  because it blocks in C, `--timeout=30` can only dump stacks — the run then
-  wedges and never reports. Two different tests in that file hang depending on
-  ordering (`test_watchlist_create_survives_commands_enabled` hangs even in
-  isolation), which points at cross-test pollution leaving the manage client
-  pointed at a live endpoint. Baselines here were taken with that file ignored.
+Both were **fixed in follow-up commits** — see "Suite-hang fix" below. Baselines
+during the scanner work itself were taken with the offending file ignored.
+
+- `tests/test_watchlist_session_auth.py` **hung the full suite** at ~96%.
 - `tests/test_user_guide.py::test_guide_template_has_info_bubbles_and_sections`
-  fails at `5c7a93a` and is fixed by the (separate, uncommitted) heading rename
-  in `web/templates/_guide_tab.html`.
+  failed at `5c7a93a`; fixed by the heading rename in
+  `web/templates/_guide_tab.html` (`0121e49`), which completes `46d7ff2`.
 
 ### Verification
 
@@ -666,3 +663,66 @@ Baseline at `5c7a93a` (ignoring `test_ibrx_async.py` + `test_watchlist_session_a
 `1 failed, 3930 passed, 3 skipped`. After this work: **`3952 passed, 3 skipped`,
 0 failed** — +22 = 21 new tests plus the `test_user_guide` failure the guide-tab
 edit resolves. No regressions.
+
+---
+
+## Suite-hang fix (follow-up)
+
+The suite hang had **two independent root causes**, one of them a production
+bug. Investigated with `superpowers:systematic-debugging`.
+
+### Root cause 1 — `TypedRpcClient` send could block forever (production bug)
+
+`_new_socket` set `IMMEDIATE=1` (never queue to a peer with no live connection)
+but left **`SNDTIMEO` at ZMQ's infinite default**, and `call` invoked
+`socket.send(payload)` in blocking mode. `zmq.Again`/EAGAIN is only raised when
+the socket is non-blocking or a send timeout expires, so with `IMMEDIATE=1` and
+no peer, `send` **waits for a peer forever** — and `call`'s
+`except zmq.Again: -> ConnectionError("no route to server")` handler, written
+precisely for this case, was unreachable dead code.
+
+Worse, the send happens while holding `self._lock`, so one unroutable call
+wedges the *entire client* permanently: even `close()` blocks acquiring that
+lock (observed directly in the failing test).
+
+Impact well beyond tests: any typed RPC caller — the dashboard's manage client,
+the CLI, strategy_service — hangs its calling thread indefinitely when the
+trader isn't reachable. That is the exact opposite of the "fail loudly, not
+silently" principle.
+
+This is a **regression of an already-fixed bug**: the legacy dill client hit it,
+fixed it the same way, and documented it in
+`clientserver.RPCClient._configure_socket` ("this wedged strategy_service at
+startup for its whole container lifetime"), with a regression test at
+`test_clientserver_rpc.TestSendNeverBlocksForever`. The typed client — the
+*production* path — reintroduced it.
+
+Fix: set `SNDTIMEO` from the client's own `timeout` (with the legacy client's
+`or 10.0` fallback so a 0/None timeout can't restore the infinite default).
+Covered by `TestTypedSendNeverBlocksForever` (raises instead of blocking,
+reports "no route to server", respects a short timeout, socket reusable
+afterwards) plus an `SNDTIMEO > 0` assertion in the socket-hygiene test.
+
+### Root cause 2 — `test_watchlist_session_auth.py` made real RPC calls
+
+Its `stub` fixture patched `_get_accessor`/`_mmr`/`scan_strategies` but **not
+`get_manage_client`**, and every watchlist mutation route calls
+`get_manage_client().trader_command(...)`. So the session/CSRF tests each opened
+a real typed-RPC DEALER to a trader no test binds.
+`test_watchlist_create_survives_commands_enabled` used no fixture at all.
+
+Before fix 1 that blocked forever; after fix 1 it merely became slow — the
+manage client's default `MMR_MANAGE_RPC_TIMEOUT_S` is **45s**, and ~10 tests
+reach those routes (~450s). Both fixes are therefore needed: fix 1 stops the
+hang, fix 2 stops the pointless network I/O.
+
+Fix: a module-level `_FakeManageClient` recording calls and returning `{}`,
+patched in `stub`, with the fixture added to the one test that lacked it (which
+now also asserts the `create_universe` call actually reached the client). The
+routes are defensive (`except Exception` → flash → 303), so these tests never
+depended on real RPC — they were only slow.
+
+Result: that file goes from an **infinite hang to 28 passed in 1.1s**, and
+`pytest tests/ --timeout=30 -q --ignore=tests/test_ibrx_async.py` — the command
+CLAUDE.md documents, which previously could not complete at all — now runs to
+completion.

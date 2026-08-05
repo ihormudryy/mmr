@@ -193,9 +193,20 @@ class TestProductionRegistryHasRealQueries:
         "get_positions", "get_open_orders", "get_trades", "get_ib_account",
         "get_fx_rates", "get_snapshot", "get_snapshots_batch", "get_market_depth",
         "get_published_contracts", "diagnose_portfolio_feed", "reconcile_with_broker",
+        "scan_ideas", "scanner_locations",
     ])
     def test_cli_surface_queries_are_registered(self, method, production_registry):
         assert production_registry.contains("query", method)
+
+    @pytest.mark.parametrize("method", ["scan_ideas", "scanner_locations"])
+    def test_scanner_queries_are_not_on_the_command_socket(self, method, production_registry):
+        """The scanner is a read: it must not be reachable as a command."""
+        assert not production_registry.contains("command", method)
+
+    def test_scan_ideas_runs_off_the_router_loop(self, production_registry):
+        """The scan blocks (IB round-trips + a history ThreadPoolExecutor), so it
+        must not execute inline on the ROUTER loop."""
+        assert production_registry.resolve("query", "scan_ideas").execution == "thread"
 
     def test_registered_query_handlers_actually_work(self, production_registry):
         """Not just "registered" -- the handler must return the real data,

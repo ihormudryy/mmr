@@ -371,3 +371,106 @@ class TestDigestWriting:
             results=[], elapsed_s=1.0, status='completed',
         )
         assert out == ''
+
+
+# ---------------------------------------------------------------------------
+# Sweep runner robustness (exception finalize + SIGINT restore)
+# ---------------------------------------------------------------------------
+
+@pytest.mark.asyncio
+async def test_run_sweeps_finalizes_on_job_exception(tmp_duckdb_path, monkeypatch):
+    """An unexpected exception mid-sweep must still finalize the row (not leave
+    status='running' forever)."""
+    import signal
+
+    from trader.data.backtest_store import BacktestStore
+    from trader import mmr_cli
+
+    store = BacktestStore(tmp_duckdb_path)
+    plans = [{
+        'spec': {
+            'name': 'boom', 'class': 'X', 'strategy': '/x',
+            'bar_size': '1 day', 'days': 5, 'concurrency': 1,
+            'param_grid': {}, 'note': '',
+        },
+        'jobs': [{'symbol': 'AAPL', 'params': {}}],
+    }]
+
+    async def _boom(*_a, **_k):
+        raise RuntimeError('subprocess launcher exploded')
+
+    monkeypatch.setattr(mmr_cli, '_execute_jobs_parallel', _boom)
+    monkeypatch.setattr(mmr_cli, '_write_sweep_digest', lambda **kw: '/tmp/d.md')
+    monkeypatch.setattr(mmr_cli, '_json_mode', True)
+
+    await mmr_cli._run_sweeps_async(
+        'sweeps: []', plans, bstore=store, auto_concurrency=lambda c: 1,
+    )
+    got = store.get_sweep(1)
+    assert got is not None
+    assert got.status == 'failed'
+    assert got.finished_at is not None
+
+
+@pytest.mark.asyncio
+async def test_run_sweeps_restores_sigint_handler(tmp_duckdb_path, monkeypatch):
+    import signal
+
+    from trader.data.backtest_store import BacktestStore
+    from trader import mmr_cli
+
+    store = BacktestStore(tmp_duckdb_path)
+    plans = [{
+        'spec': {
+            'name': 'ok', 'class': 'X', 'strategy': '/x',
+            'bar_size': '1 day', 'days': 5, 'concurrency': 1,
+            'param_grid': {}, 'note': '',
+        },
+        'jobs': [{'symbol': 'AAPL', 'params': {}}],
+    }]
+
+    async def _ok(*_a, **_k):
+        return [{'status': 'ok', 'job': plans[0]['jobs'][0]}]
+
+    monkeypatch.setattr(mmr_cli, '_execute_jobs_parallel', _ok)
+    monkeypatch.setattr(mmr_cli, '_write_sweep_digest', lambda **kw: '')
+    monkeypatch.setattr(mmr_cli, '_json_mode', True)
+
+    def _sentinel_handler(*_a):
+        pass
+
+    # Install a distinctive previous handler so we can detect restore.
+    try:
+        prev = signal.getsignal(signal.SIGINT)
+        signal.signal(signal.SIGINT, _sentinel_handler)
+    except (ValueError, AttributeError):
+        pytest.skip('cannot install SIGINT handler in this thread')
+
+    try:
+        await mmr_cli._run_sweeps_async(
+            'sweeps: []', plans, bstore=store, auto_concurrency=lambda c: 1,
+        )
+        assert signal.getsignal(signal.SIGINT) is _sentinel_handler
+    finally:
+        signal.signal(signal.SIGINT, prev)
+
+
+def test_options_buy_missing_price_emits_json(monkeypatch, capsys):
+    """Rich console lines must not corrupt --json for options buy/sell."""
+    import argparse
+    from trader import mmr_cli
+
+    monkeypatch.setattr(mmr_cli, '_json_mode', True)
+
+    class _Mmr:
+        pass
+
+    args = argparse.Namespace(
+        opt_action='buy', symbol='AAPL', market=False, limit=None,
+        expiration='2026-03-20', strike=250, right='C', quantity=1,
+    )
+    mmr_cli._handle_options(_Mmr(), args)
+    out = capsys.readouterr().out.strip()
+    payload = json.loads(out)
+    assert payload['success'] is False
+    assert 'market' in payload['message'].lower() or 'limit' in payload['message'].lower()

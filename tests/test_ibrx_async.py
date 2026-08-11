@@ -244,6 +244,32 @@ class TestSnapshotAsync:
         assert err.errorCode == 10089
 
     @pytest.mark.asyncio
+    async def test_farm_status_codes_do_not_propagate_as_errors(self):
+        """G2: transient farm connecting/disconnected must not log/propagate as ERROR."""
+        from trader.listeners.ibreactive import IBAIORxError
+
+        ibrx = _make_ibrx()
+        ibrx.error_subject = MagicMock()
+        for code, msg in (
+            (2103, 'Market data farm connection is broken:usfarm'),
+            (2105, 'HMDS data farm connection is broken:ushmds'),
+            (2119, 'Market data farm is connecting:usfarm'),
+            (2104, 'Market data farm connection is OK:usfarm'),
+        ):
+            ibrx.error_subject.reset_mock()
+            await ibrx._IBAIORx__handle_error(-1, code, msg, None)
+            ibrx.error_subject.on_next.assert_not_called()
+
+        # A real request error still propagates.
+        await ibrx._IBAIORx__handle_error(
+            42, 200, 'No security definition', _make_contract(),
+        )
+        assert ibrx.error_subject.on_next.called
+        err = ibrx.error_subject.on_next.call_args[0][0]
+        assert isinstance(err, IBAIORxError)
+        assert err.errorCode == 200
+
+    @pytest.mark.asyncio
     async def test_delayed_snapshot_restores_live_mode_after_wait(self):
         """After a delayed snapshot wait, restore type 1 for streaming callers."""
         from reactivex.subject import Subject

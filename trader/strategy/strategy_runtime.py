@@ -51,6 +51,7 @@ import inspect
 import os
 import pandas as pd
 import sys
+import threading
 import trader.messaging.strategy_service_api as bus
 import yaml
 
@@ -652,7 +653,12 @@ class StrategyRuntime():
     @log_method
     def _persist_enabled(self, name: str, enabled: bool) -> None:
         """Persist a strategy's enabled/disabled state so it survives a restart
-        (otherwise a runtime disable is silently undone when the config reloads)."""
+        (otherwise a runtime disable is silently undone when the config reloads).
+
+        Synchronous write — call via ``_schedule_persist_enabled`` from the
+        enable/disable RPC path so DuckDB contention cannot exceed the client's
+        typed-RPC timeout (G1).
+        """
         try:
             from trader.data.duckdb_store import DuckDBConnection
             db = DuckDBConnection.get_instance(self.duckdb_path)
@@ -668,6 +674,20 @@ class StrategyRuntime():
             db.execute_atomic(_w)
         except Exception as ex:
             logging.warning('could not persist enabled-state for %s: %s', name, ex)
+
+    def _schedule_persist_enabled(self, name: str, enabled: bool) -> None:
+        """Run ``_persist_enabled`` off the enable/disable RPC reply path.
+
+        Mass-enable under DuckDB contention used to block the reply until
+        ``execute_atomic`` finished (backoff up to ~45s), exceeding the client's
+        ~6s timeout even though the in-memory enable had already succeeded.
+        """
+        threading.Thread(
+            target=self._persist_enabled,
+            args=(name, enabled),
+            name=f'strategy-persist-{name}',
+            daemon=True,
+        ).start()
 
     def _load_enabled(self, name: str):
         """Return the persisted enabled state for *name* (True/False), or None if
@@ -699,7 +719,7 @@ class StrategyRuntime():
         for implementation in self.strategy_implementations:
             if name == implementation.name:
                 state = implementation.enable()
-                self._persist_enabled(name, True)
+                self._schedule_persist_enabled(name, True)
                 self._announce_and_drain(name)
                 return state
         return StrategyState.ERROR
@@ -725,7 +745,7 @@ class StrategyRuntime():
         for implementation in self.strategy_implementations:
             if name == implementation.name:
                 state = implementation.disable()
-                self._persist_enabled(name, False)
+                self._schedule_persist_enabled(name, False)
                 self._announce_and_drain(name)
                 return state
         return StrategyState.ERROR

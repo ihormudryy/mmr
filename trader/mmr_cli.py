@@ -7064,6 +7064,7 @@ async def _run_sweeps_async(
     """Run every sweep in the manifest, writing a digest when done."""
     import asyncio
     import hashlib
+    import logging as _logging
     import os
     import signal
     import datetime as dt
@@ -7080,80 +7081,114 @@ async def _run_sweeps_async(
                 'to finish, then exiting gracefully...[/]'
             )
 
+    prev_handler = None
     try:
+        prev_handler = signal.getsignal(signal.SIGINT)
         signal.signal(signal.SIGINT, _on_sigint)
     except (ValueError, AttributeError):
         # Not in the main thread — skip handler installation.
-        pass
+        prev_handler = None
 
-    for plan in plans:
-        spec = plan['spec']
-        jobs = plan['jobs']
-        concurrency = auto_concurrency(spec['concurrency'])
-        config_hash = hashlib.sha256(
-            json.dumps(jobs, sort_keys=True, default=str).encode()
-        ).hexdigest()[:16]
-
-        # Record the sweep up-front so partial runs are still discoverable.
-        sweep_id = bstore.create_sweep(SweepRecord(
-            name=spec['name'],
-            manifest_yaml=manifest_yaml,
-            config_hash=config_hash,
-            n_runs_planned=len(jobs),
-            concurrency=concurrency,
-            note=spec.get('note', ''),
-        ))
-
-        if not _json_mode:
-            console.print(
-                f'[bold]Sweep #{sweep_id}: {spec["name"]}[/] '
-                f'— {len(jobs)} jobs at concurrency={concurrency}'
-            )
-
-        t0 = dt.datetime.now()
-        results = await _execute_jobs_parallel(
-            jobs, concurrency=concurrency, sweep_id=sweep_id,
-            cancel_flag=cancel_requested,
-        )
-        elapsed = (dt.datetime.now() - t0).total_seconds()
-
-        ok = sum(1 for r in results if r.get('status') == 'ok')
-        fail = len(results) - ok
-        status = (
-            'cancelled' if cancel_requested['flag']
-            else 'completed' if fail == 0
-            else 'failed' if ok == 0
-            else 'completed'  # partial success still counts as completed
-        )
-        digest_path = _write_sweep_digest(
-            sweep_id=sweep_id, spec=spec, results=results,
-            elapsed_s=elapsed, status=status,
-        )
-        bstore.finalize_sweep(
-            sweep_id, status=status,
-            n_runs_successful=ok, n_runs_failed=fail,
-            digest_path=digest_path,
-        )
-        if not _json_mode:
-            console.print(
-                f'  → sweep #{sweep_id} {status}: {ok}/{len(jobs)} ok '
-                f'in {elapsed/60:.1f}m  |  digest: {digest_path}'
-            )
-
-        if cancel_requested['flag']:
-            break
-
-    if _json_mode:
-        # Emit a compact summary list of the sweep ids we just ran.
-        ran = []
+    try:
         for plan in plans:
-            ran.append({'name': plan['spec']['name'],
-                         'jobs': len(plan['jobs'])})
-        print(json.dumps(
-            {'data': {'sweeps_run': ran, 'cancelled': cancel_requested['flag']},
-             'title': 'Sweep Batch'}, default=str,
-        ))
+            spec = plan['spec']
+            jobs = plan['jobs']
+            concurrency = auto_concurrency(spec['concurrency'])
+            config_hash = hashlib.sha256(
+                json.dumps(jobs, sort_keys=True, default=str).encode()
+            ).hexdigest()[:16]
 
+            # Record the sweep up-front so partial runs are still discoverable.
+            sweep_id = bstore.create_sweep(SweepRecord(
+                name=spec['name'],
+                manifest_yaml=manifest_yaml,
+                config_hash=config_hash,
+                n_runs_planned=len(jobs),
+                concurrency=concurrency,
+                note=spec.get('note', ''),
+            ))
+
+            if not _json_mode:
+                console.print(
+                    f'[bold]Sweep #{sweep_id}: {spec["name"]}[/] '
+                    f'— {len(jobs)} jobs at concurrency={concurrency}'
+                )
+
+            t0 = dt.datetime.now()
+            results: List[Dict[str, Any]] = []
+            status = 'failed'
+            ok = 0
+            fail = len(jobs)
+            digest_path = ''
+            try:
+                results = await _execute_jobs_parallel(
+                    jobs, concurrency=concurrency, sweep_id=sweep_id,
+                    cancel_flag=cancel_requested,
+                )
+                elapsed = (dt.datetime.now() - t0).total_seconds()
+                ok = sum(1 for r in results if r.get('status') == 'ok')
+                fail = len(results) - ok
+                status = (
+                    'cancelled' if cancel_requested['flag']
+                    else 'completed' if fail == 0
+                    else 'failed' if ok == 0
+                    else 'completed'  # partial success still counts as completed
+                )
+                digest_path = _write_sweep_digest(
+                    sweep_id=sweep_id, spec=spec, results=results,
+                    elapsed_s=elapsed, status=status,
+                )
+            except Exception as ex:
+                elapsed = (dt.datetime.now() - t0).total_seconds()
+                status = 'cancelled' if cancel_requested['flag'] else 'failed'
+                ok = sum(1 for r in results if r.get('status') == 'ok')
+                fail = max(len(jobs) - ok, 1)
+                _logging.exception(
+                    'sweep #%s (%s) aborted after %.1fs: %s',
+                    sweep_id, spec['name'], elapsed, ex,
+                )
+                try:
+                    digest_path = _write_sweep_digest(
+                        sweep_id=sweep_id, spec=spec, results=results,
+                        elapsed_s=elapsed, status=status,
+                    )
+                except Exception:
+                    digest_path = ''
+            finally:
+                # Always finalize — a half-open 'running' row is worse than a
+                # failed/cancelled summary after an unexpected exception.
+                bstore.finalize_sweep(
+                    sweep_id, status=status,
+                    n_runs_successful=ok, n_runs_failed=fail,
+                    digest_path=digest_path,
+                )
+
+            if not _json_mode:
+                console.print(
+                    f'  → sweep #{sweep_id} {status}: {ok}/{len(jobs)} ok '
+                    f'in {(dt.datetime.now() - t0).total_seconds()/60:.1f}m  '
+                    f'|  digest: {digest_path}'
+                )
+
+            if cancel_requested['flag']:
+                break
+
+        if _json_mode:
+            # Emit a compact summary list of the sweep ids we just ran.
+            ran = []
+            for plan in plans:
+                ran.append({'name': plan['spec']['name'],
+                             'jobs': len(plan['jobs'])})
+            print(json.dumps(
+                {'data': {'sweeps_run': ran, 'cancelled': cancel_requested['flag']},
+                 'title': 'Sweep Batch'}, default=str,
+            ))
+    finally:
+        if prev_handler is not None:
+            try:
+                signal.signal(signal.SIGINT, prev_handler)
+            except (ValueError, AttributeError):
+                pass
 
 async def _execute_jobs_parallel(
     jobs: List[Dict[str, Any]],
@@ -10154,7 +10189,7 @@ def _handle_options(mmr: MMR, args: argparse.Namespace):
 
     action = getattr(args, 'opt_action', None)
     if not action:
-        console.print('[yellow]Usage: options expirations|chain|snapshot|implied|buy|sell[/yellow]')
+        print_status('Usage: options expirations|chain|snapshot|implied|buy|sell', success=False)
         return
 
     import logging as _logging
@@ -10164,7 +10199,7 @@ def _handle_options(mmr: MMR, args: argparse.Namespace):
         symbol = args.symbol.upper()
         dates = mmr.options_expirations(symbol)
         if not dates:
-            console.print(f'[dim]No expiration dates found for {symbol}[/dim]')
+            print_status(f'No expiration dates found for {symbol}', success=False)
             return
         import pandas as pd
         rows = []
@@ -10179,9 +10214,9 @@ def _handle_options(mmr: MMR, args: argparse.Namespace):
         symbol = args.symbol.upper()
         expiration = _resolve_expiration(mmr, symbol, args.expiration) if args.expiration else None
         if args.expiration and expiration is None:
-            console.print(f'[dim]No expiration dates found for {symbol}[/dim]')
+            print_status(f'No expiration dates found for {symbol}', success=False)
             return
-        if expiration and expiration != args.expiration:
+        if expiration and expiration != args.expiration and not _json_mode:
             console.print(f'[dim]Using expiration: {expiration}[/dim]')
         df = mmr.options_chain(
             symbol,
@@ -10191,7 +10226,11 @@ def _handle_options(mmr: MMR, args: argparse.Namespace):
             strike_max=args.strike_max,
         )
         if df.empty:
-            console.print(f'[dim]No chain data for {symbol}[/dim]')
+            print_status(f'No chain data for {symbol}', success=False)
+            return
+
+        if _json_mode:
+            print_df(df, title=f'Options Chain: {symbol}')
             return
 
         # Format for display
@@ -10230,11 +10269,14 @@ def _handle_options(mmr: MMR, args: argparse.Namespace):
         symbol = args.symbol.upper()
         expiration = _resolve_expiration(mmr, symbol, args.expiration)
         if not expiration:
-            console.print(f'[dim]No expiration dates found for {symbol}[/dim]')
+            print_status(f'No expiration dates found for {symbol}', success=False)
             return
-        if expiration != args.expiration:
+        if expiration != args.expiration and not _json_mode:
             console.print(f'[dim]Using expiration: {expiration}[/dim]')
         data = mmr.options_implied(symbol, expiration, args.risk_free_rate)
+        if _json_mode:
+            print_json_result(data, title=f'Implied: {symbol} {expiration}')
+            return
         from trader.tools.chain import plot_market_implied_vs_constant_console
         plot_market_implied_vs_constant_console(
             data['x'], data['market_implied'], data['constant'],
@@ -10244,13 +10286,13 @@ def _handle_options(mmr: MMR, args: argparse.Namespace):
     elif action == 'buy':
         symbol = args.symbol.upper()
         if not args.market and args.limit is None:
-            console.print('[red]Specify --market or --limit[/red]')
+            print_status('Specify --market or --limit', success=False)
             return
         expiration = _resolve_expiration(mmr, symbol, args.expiration)
         if not expiration:
-            console.print(f'[dim]No expiration dates found for {symbol}[/dim]')
+            print_status(f'No expiration dates found for {symbol}', success=False)
             return
-        if expiration != args.expiration:
+        if expiration != args.expiration and not _json_mode:
             console.print(f'[dim]Using expiration: {expiration}[/dim]')
         result = mmr.buy_option(
             symbol, expiration, args.strike, args.right,
@@ -10261,13 +10303,13 @@ def _handle_options(mmr: MMR, args: argparse.Namespace):
     elif action == 'sell':
         symbol = args.symbol.upper()
         if not args.market and args.limit is None:
-            console.print('[red]Specify --market or --limit[/red]')
+            print_status('Specify --market or --limit', success=False)
             return
         expiration = _resolve_expiration(mmr, symbol, args.expiration)
         if not expiration:
-            console.print(f'[dim]No expiration dates found for {symbol}[/dim]')
+            print_status(f'No expiration dates found for {symbol}', success=False)
             return
-        if expiration != args.expiration:
+        if expiration != args.expiration and not _json_mode:
             console.print(f'[dim]Using expiration: {expiration}[/dim]')
         result = mmr.sell_option(
             symbol, expiration, args.strike, args.right,
@@ -10276,7 +10318,7 @@ def _handle_options(mmr: MMR, args: argparse.Namespace):
         _print_trade_result(result, 'SELL', f'{symbol} {expiration} {args.strike}{args.right}')
 
     else:
-        console.print(f'[yellow]Unknown options action: {action}[/yellow]')
+        print_status(f'Unknown options action: {action}', success=False)
 
 
 def _handle_forex(mmr: MMR, args: argparse.Namespace):

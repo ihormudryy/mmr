@@ -105,13 +105,16 @@ unambiguous proposal-status divergences remains a deliberate future opt-in.
 - **Validate (paper)**: resolve BHP/CBA (ASX), 0700 (SEHK), a TSE name; confirm
   each lands on the local listing, not a US ADR.
 
-### C2 — universe resolver-cache invalidation  (S, low risk)
+### C2 — universe resolver-cache invalidation  ✅ DONE
 - **Problem** (`universe.py:145`): the resolver cache is never invalidated and
   its hit path bypasses exchange/sec_type filters, so a stale/loose entry can win.
 - **Approach**: key the cache on (conId/symbol, exchange, sec_type); invalidate
   on universe edits; make the hit path honour the same filters as a miss.
 - **Risk**: low — localized; add a cache-key test.
 - **Validate**: unit test — same symbol on two exchanges resolves distinctly.
+- **Status:** ✅ Hit path now applies exchange + sec_type + universe filters;
+  `invalidate_resolver_cache()` on `update`/`delete`; covered by
+  `tests/test_universe_resolver.py`.
 
 ---
 
@@ -160,16 +163,19 @@ unambiguous proposal-status divergences remains a deliberate future opt-in.
 
 ---
 
-## Cluster F — narrow CLI / polish  (S each, low risk)
+## Cluster F — narrow CLI / polish  ✅ DONE (S each, low risk)
 
-- **Options `--json` stdout** (`mmr_cli.py:8718`): options buy/sell emit Rich
-  console lines that corrupt `--json`; guard rendering behind `_json_mode`.
-- **Sweep exception safety** (`mmr_cli.py:6001`): one unexpected job exception
-  (or parent crash) leaves the sweep half-finalised; wrap per-job + finalize.
-- **Sweep SIGINT-restore** (`mmr_cli.py:5841`): save/restore the handler
-  (deferred earlier as a re-indent; do it with a small context manager).
-- **Data-download trader_service probe leak** (`mmr_cli.py:7323`): dead cleanup
-  branch leaks the RPC client on a failed probe.
+- **Options `--json` stdout** (`mmr_cli.py`): options buy/sell (and chain /
+  implied / errors) emit Rich console lines that corrupt `--json`; guard
+  rendering behind `_json_mode` / `print_status` / `print_df`. ✅
+- **Sweep exception safety**: one unexpected job exception (or parent crash)
+  leaves the sweep half-finalised; wrap per-job + `finalize_sweep` in
+  `try`/`finally`. ✅
+- **Sweep SIGINT-restore**: save/restore the handler with a small
+  install/`finally` restore. ✅
+- **Data-download trader_service probe leak**: dead cleanup branch leaked the
+  RPC client on a failed probe — already fixed (close `candidate` on the
+  failure path). ✅
 
 ---
 
@@ -180,7 +186,7 @@ path for bar-based strategies was rebuilt this session — see commits e2db6f3
 (ORB on_prices + exchange-aware session), e911fee (tick→bar resampling layer),
 e2b2fd1 (VwapReclaim on_prices). These are the residual robustness items.
 
-### G1 — mass-enable of strategies can time out the enable RPC under DB contention  (S, low risk)
+### G1 — mass-enable of strategies can time out the enable RPC under DB contention  ✅ DONE
 
 - **Symptom:** enabling many strategies in quick succession (observed: 11 at once
   after a restart) produced one `enable_strategy: RPC call ... timed out after
@@ -198,14 +204,15 @@ e2b2fd1 (VwapReclaim on_prices). These are the residual robustness items.
   leave a strategy not-enabled while the client already gave up.
 - **NOT caused by** the new priming/resampling (priming is lazy/on-first-tick,
   not on the enable path).
-- **Fix options (offline, pick one):** (a) stagger enables in the CLI loop with a
-  small delay; (b) raise the enable RPC timeout; (c) make `_persist_enabled`
-  fire-and-forget / off the RPC-reply path; (d) batch multiple enables into one
-  RPC + one DB write. (a) or (d) preferred.
+- **Fix:** `_schedule_persist_enabled` runs `_persist_enabled` on a daemon
+  thread so enable/disable return after the in-memory toggle + announce, without
+  waiting on DuckDB. Tiny crash-before-persist window (same ambiguity as a
+  timed-out client). Covered by
+  `test_enable_returns_before_slow_persist`.
 - **Validate:** enable 10+ strategies in a tight loop under concurrent load,
   confirm no enable RPC timeout and all reach RUNNING.
 
-### G2 — IB market-data-farm status codes logged at ERROR  (XS, cosmetic)
+### G2 — IB market-data-farm status codes logged at ERROR  ✅ DONE (XS, cosmetic)
 
 - **Symptom:** during the nightly IB Gateway restart/reconnect, farm-status
   messages (`errorCode 2119` "Market data farm is connecting", and the related
@@ -216,8 +223,9 @@ e2b2fd1 (VwapReclaim on_prices). These are the residual robustness items.
   codes fall through to the ERROR log path.
 - **Impact:** none functional — pure log noise, but it can mask a real error in a
   `grep -i error` scan (as it briefly did in this review).
-- **Fix:** add 2103/2105/2119 (and 2158 if not covered) to the suppressed/INFO
-  set in `__handle_error`, or log all `reqId == -1` farm-status codes at INFO.
+- **Fix:** 2103/2105/2119 log at INFO and return (no `error_subject`
+  propagation); OK codes remain silent. ✅
+  `tests/test_ibrx_async.py::test_farm_status_codes_do_not_propagate_as_errors`.
 - **NOTE:** the reconnect itself recovered cleanly (reentrancy guard fired,
   subscriptions republished, all strategies stayed RUNNING) — this is only about
   the log level of the status messages, not the reconnect behaviour.

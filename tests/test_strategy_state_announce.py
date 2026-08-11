@@ -224,6 +224,66 @@ class TestAnnounceDoesNotCallbackIntoTrader:
         assert state == StrategyState.RUNNING
         assert any(r[0] == 'orb' for r in _outbox_rows(rt))
 
+    def test_enable_returns_before_slow_persist(self, runtime_with_revisions):
+        """G1: DuckDB persist must not block the enable RPC reply."""
+        import threading
+        import time
+
+        rt = runtime_with_revisions
+
+        class _Toggleable(_StubStrategy):
+            def enable(self):
+                self.state = StrategyState.RUNNING
+                return self.state
+
+        rt.strategy_implementations = [_Toggleable('orb', StrategyState.DISABLED)]
+        started = threading.Event()
+        release = threading.Event()
+        calls = []
+
+        def _slow_persist(name, enabled):
+            calls.append((name, enabled))
+            started.set()
+            assert release.wait(timeout=5), 'test release never set'
+
+        rt._persist_enabled = _slow_persist
+        t0 = time.monotonic()
+        state = rt.enable_strategy('orb')
+        elapsed = time.monotonic() - t0
+        assert state == StrategyState.RUNNING
+        assert elapsed < 0.5, f'enable blocked on persist ({elapsed:.2f}s)'
+        assert started.wait(timeout=2), 'persist thread never started'
+        release.set()
+        # Give the daemon a moment to record the call.
+        deadline = time.monotonic() + 2
+        while not calls and time.monotonic() < deadline:
+            time.sleep(0.01)
+        assert calls == [('orb', True)]
+
+    def test_disable_schedules_persist(self, runtime_with_revisions):
+        import threading
+        import time
+
+        rt = runtime_with_revisions
+
+        class _Toggleable(_StubStrategy):
+            def disable(self):
+                self.state = StrategyState.DISABLED
+                return self.state
+
+        rt.strategy_implementations = [_Toggleable('orb', StrategyState.RUNNING)]
+        done = threading.Event()
+        calls = []
+
+        def _persist(name, enabled):
+            calls.append((name, enabled))
+            done.set()
+
+        rt._persist_enabled = _persist
+        assert rt.disable_strategy('orb') == StrategyState.DISABLED
+        assert done.wait(timeout=2)
+        assert calls == [('orb', False)]
+
 
 class TestDrainAckOutboxFailFast:
     def test_aborts_batch_after_trader_timeout(self, runtime_with_revisions):

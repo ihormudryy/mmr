@@ -281,7 +281,15 @@ class IBAIORx():
         global error_code
 
         # Farm OK / connectivity chatter — not request failures.
+        # 2104/2106/2107/2158 = farm OK / restored; 2103/2105/2119 = transient
+        # connecting/disconnected (G2 — was ERROR and masked real failures).
         if errorCode in (2104, 2106, 2107, 2158):
+            return
+        if errorCode in (2103, 2105, 2119):
+            logging.info(
+                'ibrx farm status reqId: {} errorCode: {}: {} contract: {}'.format(
+                    reqId, errorCode, errorString, contract
+                ))
             return
 
         # IB serves delayed ticks when live API MD isn't subscribed. This is

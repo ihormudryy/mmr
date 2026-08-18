@@ -7,102 +7,107 @@ Update the date + relevant sections when the running config changes.
 How to arm unattended paper automation from scratch:
 [`PAPER_AUTOMATION_SETUP.md`](PAPER_AUTOMATION_SETUP.md).
 
-**Last updated: 2026-07-05 (Sun) — paper trading, account `DUM422056`.**
+**Last updated: 2026-08-18 (Tue) — paper trading, command-center stack.**
 
 ---
 
-## Live strategy config (armed for Monday 2026-07-06 US open)
+## How this stack actually trades (2026)
 
-**5 strategies armed** (RUNNING + `auto_execute=True`), all individually
-backtested-positive over 1yr of 1-min data. D2 persists enabled-state across
-restarts.
+The July 5 notes below described five strategies with `auto_execute=True`.
+That path is **obsolete**: `auto_execute: true` is refused at load.
+
+Current model:
+
+| Mode | What happens |
+|------|----------------|
+| **Paper automation** | Exactly **one** strategy (`automation.strategy_name`) may place protected orders without human approve (`execute_automated_intent`). |
+| **Propose** | Other strategies may set `auto_execute: propose` → PENDING cards on `/cc` for approve/reject. |
+| **Live** | `automation.live_enabled` stays `false`. Human approve only. |
+
+Config (host, not git): `~/.config/mmr/trader.yaml` + `strategy_runtime.yaml`.
+
+- `command_authority.enabled: true`, `live_enabled: false`
+- `automation.enabled: true`, `strategy_name: momentum`
+- `momentum` must **not** also have `auto_execute: propose` (rule R1)
+
+Dashboard: Scaling tab → `lifecycle=armed` for momentum. Trading tab Strategies
+list comes from journaled `strategy.updated` (not from host `mmr strategies`).
+
+**Host CLI caveat:** `mmr strategies` from the Mac cannot reach strategy typed
+ports 42104/42105 (private Compose network). Use:
+
+```bash
+docker compose exec trader python -m trader.mmr_cli strategies
+```
+
+or the `/cc` Strategies panel. Trader ports 42101/42102 **are** published, so
+`mmr status` / `portfolio-snapshot` / `propose` / `approve` work from the host.
+
+---
+
+## Armed paper automation (current)
+
+| Strategy | Role | Notes |
+|---|---|---|
+| **momentum** | Single auto slot | Artifact bundle on disk; `auto_execute` off. Enable it before a soak (`INSTALLED` ≠ dispatchable). |
+| orb_* / ensemble | Optional propose | Human review on `/cc` if `auto_execute: propose`. |
+| global | Always present | Enable/Disable/Undeploy hidden by design. |
+
+Kill switches: Scaling **Deactivate**; `pause_trading`; `automation.enabled: false` + restart strategy.
+
+---
+
+## Historical note — 2026-07-05 paper book (superseded)
+
+The following was the **old** auto-execute book on account `DUM422056`. Kept as
+backtest evidence only — do **not** re-arm with `auto_execute=True`.
 
 | Strategy | Sym | conId | Class | 1yr return | PF | Notes |
 |---|---|---|---|---|---|---|
 | orb_googl | GOOGL | 208813719 | OpeningRangeBreakout | +13.9% | 2.45 | strongest |
 | orb_pltr | PLTR | 444857009 | OpeningRangeBreakout | +7.5% | 1.44 | |
-| orb_wds | WDS | 564155292 | OpeningRangeBreakout | +7.1% | 1.68 | ASX (Sydney session) |
-| vwap_reclaim_cat | CAT | 5437 | VwapReclaim | +4.7% | 1.44 | 55% win, −2.3% dd |
-| orb_bhp | BHP | 4036812 | OpeningRangeBreakout | +4.7% | 1.26 | ASX (Sydney session) |
+| orb_wds | WDS | 564155292 | OpeningRangeBreakout | +7.1% | 1.68 | ASX |
+| vwap_reclaim_cat | CAT | 5437 | VwapReclaim | +4.7% | 1.44 | |
+| orb_bhp | BHP | 4036812 | OpeningRangeBreakout | +4.7% | 1.26 | ASX |
 
-**ASX strategies** carry `params: {SESSION_TZ: Australia/Sydney, RTH_OPEN_MIN: 600,
-RTH_CLOSE_MIN: 960}`. US strategies use the class defaults (09:30 ET). The live
-runtime reads session config from `self.params` (see [[live-bar-strategies-fix]]).
-
-**Disabled** (validated marginal/losing — do NOT re-arm without new evidence):
-orb_cba, orb_rio, orb_fmg, orb_csl (marginal ASX), orb_gld (losing US −1.1% PF 0.81),
-orb_xlk (US +3.3% but −27% max drawdown — dropped as too volatile).
-
-Risk guardrails on the whole book: sizing ~$1,888/trade (FX-correct, ATR-adj),
-max 20 positions, 10%/$25k per position, **$2,000 daily-loss limit (shared)**.
-PLS position (3800sh, AUD) has a protective SELL STP @ 4.75.
+Disabled after that session (do not re-arm without new evidence): orb_cba,
+orb_rio, orb_fmg, orb_csl, orb_gld (losing), orb_xlk (too much drawdown).
 
 ---
 
 ## Backtest findings (2026-07-04/05, 1yr 1-min)
 
-- **ORB on ASX is marginal universe-wide.** Top-20 leaderboard: 11/20 positive,
-  median PF 0.89, negative median per-trade expectancy. Only BHP (PF 1.26) and
-  WDS (PF 1.68) have a genuine per-name edge. **Param sweep** (RANGE_MINUTES ×
-  VOLUME_MULT) confirmed the DEFAULTS (30 / 1.5) are already the best combo and
-  still only marginal (medPF 1.075, mean return −0.58%) — **tuning does not
-  rescue ORB on ASX**. Treat ORB-ASX as a per-name edge (BHP, WDS), not a
-  universe strategy.
-- **US ORB:** GOOGL strong (PF 2.45), PLTR/XLK positive, GLD losing.
-- **VWAP:** works on CAT (PF 1.44, +18.9bps); loses on every other US name tried
-  → correctly deployed only on CAT.
-- **Metric caveat:** `expectancy_bps` repeatedly disagrees with return/PF (e.g.
-  positive return + negative expectancy on fixed sizing) — treat return + PF as
-  the reliable metrics until the expectancy_bps calc is reconciled. (Worth an
-  AUDIT_ROADMAP item.)
-- **Not done:** statistical-confidence tests (PSR/t-test/bootstrap) — the script
-  hung on MC/bootstrap over large trade sets after ~3 of 6 survivors. Rerun with
-  iteration caps + per-strategy timeouts if wanted. No results saved; nothing
-  relies on partial numbers.
+- **ORB on ASX is marginal universe-wide.** Per-name edge only (BHP, WDS).
+- **US ORB:** GOOGL strong; GLD losing.
+- **VWAP:** CAT only among names tried.
+- Treat return + PF as the reliable metrics until `expectancy_bps` is reconciled.
 
 ---
 
 ## Data coverage
 
-- **ASX 1-min: all 53 universe symbols, a full year** (2025-07-06 → 2026-07-02).
-  ~5.1M ASX 1-min bars. Source: IB (only ASX intraday source).
-- **US 1-min:** deep history for the deployed names (GLD/GOOGL/XLK/PLTR/CAT).
-- History DB (`mmr_history.duckdb`) ~23.5M 1-min bars total; ~1.7 GB.
-- ASX daily was tz-migrated to Sydney-midnight keys + deduped (Cluster B).
+- **ASX 1-min:** 53 universe symbols, ~1 year as of 2026-07-02.
+- **US 1-min:** deep history for the historically deployed names.
+- DuckDB lives in named volume `mmr_db_data`. Backup: `./docker.sh -B` /
+  `mmr data backup`. Nightly pycron `db_backup`.
 
 ---
 
 ## Infrastructure
 
-- **DB backups:** `mmr data backup` (clean DuckDB snapshot via in-mem ATTACH +
-  COPY FROM DATABASE — safe on a live DB). Nightly pycron `db_backup` @ 22:17
-  (keep 7) to the host-mounted `~/.local/share/mmr/backups/`. `docker.sh -B` uses
-  the no-downtime path; `docker.sh up` seeds an empty volume from `backups/latest`.
-  Milestone backup `before_monday` on host.
-- **Restart policy:** `unless-stopped` (live + compose) — survives host reboot /
-  Docker restart. Changed from `on-failure` on 2026-07-04.
-- **Container** must stay running for market opens + nightly backups + armed
-  strategies. Paper mode; live creds preserved as .env comments (see
-  [[live_account_setup]]).
+- Split compose: ib-gateway, trader, strategy, data, dashboard, scheduler.
+- Restart policy: `unless-stopped`.
+- Paper mode; typed HMAC RPC. Dashboard on host loopback (default 7424).
 
 ---
 
-## Monday 2026-07-06 plan
+## Next operator session (paper soak)
 
-- US opens 06:30 PDT / 09:30 ET. ASX reopens Sun ~17:00 PDT (Mon 10:00 Sydney).
-- 5 strategies auto-execute from the open (live-watching if the container stays
-  up). Best-effort cron for a monitoring session; reliable path = prompt for a
-  live watch before the open.
-- Monitor script: `scratchpad/monitor.sh` (market-aware; may be gone if the
-  scratchpad is cleared — regenerate if needed).
-- The live path was just rebuilt this session (on_prices + tick→bar resampling +
-  priming); Monday is the first from-the-open clean test.
+1. `./docker.sh -b -u` after this polish (baked dashboard image).
+2. Confirm `mmr status` → IB upstream connected.
+3. Enable **momentum** from `/cc` or `docker compose exec trader … strategies enable momentum`.
+4. Scaling: `lifecycle=armed`, operating mode Auto.
+5. Leave the stack up through US RTH. Watch intents / protectives / fills.
+6. Host monitors: `mmr --json portfolio-snapshot`, `portfolio-diff`, `/cc` Risk bars.
 
----
-
-## Open items / follow-ups (offline)
-
-- Cluster G (AUDIT_ROADMAP): G1 mass-enable RPC timeout, G2 IB farm-status log noise.
-- `expectancy_bps` metric inconsistency (see above).
-- Statistical-confidence script needs timeouts/caps before rerun.
-- ORB-ASX: consider a proper train/test split before trusting BHP/WDS edges live.
+Do not arm a second automatic strategy. Do not set `automation.live_enabled`.

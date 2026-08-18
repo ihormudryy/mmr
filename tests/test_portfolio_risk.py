@@ -296,3 +296,47 @@ class TestCorrelation:
         analyzer = PortfolioRiskAnalyzer('/tmp/nonexistent.duckdb')
         report = analyzer.analyze(positions, 100_000.0)
         assert report.correlation_clusters == []
+
+
+class TestProjectionLimitRows:
+    def test_concentration_and_hhi_rows(self):
+        from types import SimpleNamespace
+
+        from trader.trading.portfolio_risk import (
+            enrich_risk_projection, projection_limit_rows,
+        )
+
+        analyzer = PortfolioRiskAnalyzer()
+        report = analyzer.analyze(_make_positions([('AAPL', 16_000), ('MSFT', 5_000)]), 100_000.0)
+        rows = {row['id']: row for row in projection_limit_rows(report)}
+        assert rows['concentration:AAPL']['value_pct'] == pytest.approx(16.0)
+        assert rows['concentration:AAPL']['cap_pct'] == 15.0
+        assert rows['hhi']['cap_pct'] == 15.0
+
+        snapshot = SimpleNamespace(
+            net_liquidation=100_000.0,
+            daily_pnl=-12.0,
+            open_order_count=2,
+            positions=(
+                SimpleNamespace(symbol='AAPL', market_value=16_000.0),
+                SimpleNamespace(symbol='MSFT', market_value=5_000.0),
+            ),
+        )
+        payload = enrich_risk_projection(snapshot, duckdb_path='')
+        assert payload['net_liquidation'] == 100_000.0
+        assert payload['open_order_count'] == 2
+        assert any('AAPL' in w for w in payload['warnings'])
+        assert any(row['id'] == 'concentration:AAPL' for row in payload['limits'])
+
+    def test_group_budget_row(self, tmp_duckdb_path):
+        from trader.trading.portfolio_risk import projection_limit_rows
+
+        store = PositionGroupStore(tmp_duckdb_path)
+        store.create_group('tech', max_allocation_pct=0.20)
+        store.add_member('tech', 'AAPL')
+        report = PortfolioRiskAnalyzer().analyze(
+            _make_positions([('AAPL', 10_000)]), 100_000.0, group_store=store,
+        )
+        rows = {row['id']: row for row in projection_limit_rows(report)}
+        assert rows['group:tech']['value_pct'] == pytest.approx(10.0)
+        assert rows['group:tech']['cap_pct'] == pytest.approx(20.0)

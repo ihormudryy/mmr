@@ -95,6 +95,41 @@ test('banner message prefers market+stream combo', () => {
     U.ccBannerMessage({ streamDegraded: true, marketClosed: true }),
     U.CC_BANNER_BOTH);
 });
+test('closed banner includes countdown when next_open is known', () => {
+  const nowMs = Date.parse('2026-08-13T10:17:00Z');
+  const nextOpen = '2026-08-13T13:30:00+00:00';
+  assert.equal(U.ccFormatDurationUntil(nextOpen, nowMs), '3h 13m');
+  assert.equal(
+    U.ccBannerMessage({
+      streamDegraded: false, marketClosed: true, nextOpen, nowMs,
+    }),
+    '⚠ NASDAQ is closed — regular-session trading is not available (opens in 3h 13m).');
+  assert.equal(
+    U.ccBannerMessage({
+      streamDegraded: true, marketClosed: true, nextOpen, nowMs,
+    }),
+    '⚠ NASDAQ is closed (opens in 3h 13m), and the realtime stream is degraded — polling snapshots; data may be stale.');
+});
+test('countdown formats days, minutes, seconds, and overdue', () => {
+  const t0 = Date.parse('2026-08-13T10:00:00Z');
+  assert.equal(U.ccFormatDurationUntil('2026-08-15T14:00:00Z', t0), '2d 4h');
+  assert.equal(U.ccFormatDurationUntil('2026-08-13T10:12:00Z', t0), '12m');
+  assert.equal(U.ccFormatDurationUntil('2026-08-13T10:00:45Z', t0), '45s');
+  assert.equal(U.ccFormatDurationUntil('2026-08-13T09:59:00Z', t0), 'soon');
+  assert.equal(U.ccFormatDurationUntil(null, t0), null);
+});
+test('risk bar tone is hot then over as utilization approaches the cap', () => {
+  const ok = U.ccRiskBarState({ label: 'AAPL concentration', value_pct: 5, cap_pct: 15 });
+  assert.equal(ok.tone, '');
+  assert.equal(ok.caption, 'AAPL concentration 5.0% of 15.0%');
+  const hot = U.ccRiskBarState({ label: 'AAPL concentration', value_pct: 11, cap_pct: 15 });
+  assert.equal(hot.tone, 'hot');
+  const over = U.ccRiskBarState({ label: 'AAPL concentration', value_pct: 16, cap_pct: 15 });
+  assert.equal(over.tone, 'over');
+  assert.equal(U.ccRiskBarState({ value_pct: 10, cap_pct: 0 }), null);
+  assert.equal(U.ccRiskWarningText({ message: 'AAPL is 16.0% of portfolio (>15%)' }),
+    'AAPL is 16.0% of portfolio (>15%)');
+});
 
 /* ---- ccSnapshotSupersedes ---- */
 test('a new fenced stream always supersedes', () => {

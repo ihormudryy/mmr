@@ -3801,7 +3801,10 @@ def _handle_strategies_list(mmr: MMR):
     except (ConnectionError, TimeoutError) as e:
         print_status(
             f'strategy_service unreachable ({e}); showing local config '
-            f'(may be stale if service runs on another host)',
+            f'(may be stale if service runs on another host). '
+            f'In split Docker, strategy ports are not published to the Mac — '
+            f'run `docker compose exec trader python -m trader.mmr_cli strategies` '
+            f'or use the dashboard Strategies panel.',
             success=False,
         )
         _handle_strategies_from_config()

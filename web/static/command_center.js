@@ -263,7 +263,12 @@ function updateBanner() {
   const streamDegraded = ccIsDegraded(lifecycle, currentSseState());
   const marketClosed = ccMarketClosed(store.marketSession);
   const visible = ccBannerVisible({ streamDegraded, marketClosed });
-  const message = ccBannerMessage({ streamDegraded, marketClosed });
+  const message = ccBannerMessage({
+    streamDegraded,
+    marketClosed,
+    nextOpen: store.marketSession && store.marketSession.next_open,
+    nowMs: Date.now(),
+  });
   setBanner(visible, message);
 }
 
@@ -744,12 +749,25 @@ function renderRisk() {
   }
   const rows = projections.map(([key, r]) => {
     const warnings = r.warnings || [];
+    const warningText = warnings.map(ccRiskWarningText).filter(Boolean);
+    const bars = (r.limits || []).map((limit) => {
+      const bar = ccRiskBarState(limit);
+      if (!bar) return '';
+      const toneClass = bar.tone ? ` ${bar.tone}` : '';
+      return `<div class="tt-limit"><span>${esc(bar.caption)}</span>`
+        + `<div class="tt-bar"><i class="${toneClass.trim()}" style="width:${bar.fillPct.toFixed(1)}%"></i></div></div>`;
+    }).join('');
     return `<div><strong>${esc(key)}</strong> — ${
-      warnings.length ? '⚠ ' + warnings.map(esc).join('; ')
-                      : 'no active warnings'}</div>`;
+      warningText.length ? '⚠ ' + warningText.map(esc).join('; ')
+                      : 'no active warnings'}</div>${bars}`;
   });
   const anyWarning = projections.some(([, r]) => (r.warnings || []).length);
-  el.dataset.state = anyWarning ? 'warning' : 'ok';
+  const anyOver = projections.some(([, r]) =>
+    (r.limits || []).some((limit) => {
+      const bar = ccRiskBarState(limit);
+      return bar && bar.tone === 'over';
+    }));
+  el.dataset.state = (anyWarning || anyOver) ? 'warning' : 'ok';
   el.innerHTML = rows.join('')
     + (v.reconciliation || []).map(r =>
       `<div class="dim">reconciliation ${esc(r.entity_id)}: ${

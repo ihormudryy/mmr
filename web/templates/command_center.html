@@ -759,6 +759,22 @@
     #risk-body { padding: 14px var(--space-4); font-size: 12.5px; }
     #risk-body[data-state="unavailable"] { color: var(--warn); }
     #risk-body[data-state="warning"] { color: var(--neg); }
+    #risk-body .tt-limit { margin: 8px 0 0; color: var(--fg); }
+    #risk-body .tt-limit span { display: block; font-size: 12px; color: var(--dim); }
+    #risk-body .tt-bar {
+      height: 6px;
+      margin-top: 4px;
+      background: var(--border-soft);
+      border-radius: 3px;
+      overflow: hidden;
+    }
+    #risk-body .tt-bar i {
+      display: block;
+      height: 100%;
+      background: var(--accent);
+    }
+    #risk-body .tt-bar i.hot { background: var(--warn); }
+    #risk-body .tt-bar i.over { background: var(--neg); }
     .order-group { border-bottom: 1px solid var(--border-soft); }
     /* Group-head (og-* / N leg(s) · status · filled) is redundant with per-leg
        rows — never show it, even if an older cached command_center.js still
@@ -1921,7 +1937,7 @@
           {% if commands_enabled %}<th data-cc-col="strategy-actions">Actions</th>{% endif %}
           </tr></thead>
           <tbody id="strategies-body"></tbody></table></section>
-      <section id="risk-panel"><h2><span class="h-title">Risk &amp; reconciliation {{ info('Authoritative risk projection: concentration, group budgets, and reconciliation warnings. Empty until the risk service publishes a projection.') }}</span></h2>
+      <section id="risk-panel"><h2><span class="h-title">Risk &amp; reconciliation {{ info('Authoritative risk projection: concentration vs 15% cap, group budgets, HHI, and reconciliation warnings. Bars show distance to each limit; warnings stay the fail-loud surface.') }}</span></h2>
         <div id="risk-body" data-state="unavailable">Risk unavailable — waiting
           for an authoritative risk projection.</div></section>
     </div>

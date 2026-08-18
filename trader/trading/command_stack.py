@@ -725,11 +725,13 @@ def build_command_stack(
 
     def compute_risk_projection():
         snapshot = broker_snapshot.capture(trader.ib_account)
-        return {
-            "net_liquidation": snapshot.net_liquidation,
-            "daily_pnl": snapshot.daily_pnl,
-            "open_order_count": snapshot.open_order_count,
-        }
+        from trader.trading.portfolio_risk import enrich_risk_projection
+
+        return enrich_risk_projection(
+            snapshot,
+            duckdb_path=trader.duckdb_path,
+            history_duckdb_path=getattr(trader, 'history_duckdb_path', '') or '',
+        )
 
     risk_producer = RiskProducer(
         trader.journal_db,

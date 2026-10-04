@@ -56,6 +56,14 @@ class ProposalCreateRequest:
     thesis: str = ""
     group: str = ""
     max_price_drift_bps: Optional[float] = None
+    # Time-based exit rules from the signal→proposal bridge. Persisted onto
+    # the record's metadata (not first-class columns) so ``list_proposals``
+    # echoes them back and SignalProposer.check_exits can evaluate an
+    # executed entry's exit condition. close_by_time is an ISO time string
+    # ("15:45:00"); close_by_tz names the IANA timezone it is expressed in.
+    max_hold_bars: Optional[int] = None
+    close_by_time: Optional[str] = None
+    close_by_tz: Optional[str] = None
 
 
 class ProposalCreationRefused(Exception):
@@ -143,7 +151,8 @@ class ProposalCommandService:
         if quote is None or quote.price <= 0:
             raise ProposalCreationRefused(
                 "QUOTE_UNAVAILABLE",
-                f"no executable {side} quote for conId {request.conid}",
+                f"no executable {side} quote for conId {request.conid} "
+                f"(realtime and delayed IB market data both unavailable)",
             )
         if quote.conid != request.conid or quote.side != side:
             raise ProposalCreationRefused("QUOTE_UNAVAILABLE", "quote identity or side mismatch")
@@ -153,7 +162,15 @@ class ProposalCommandService:
         quantity, amount = self._size(request, quote.price)
         now = self._as_utc(self._now())
         proposal_id = self._repository.reserve_id()
-        metadata = {"group": request.group} if request.group else {}
+        metadata: dict[str, Any] = {"group": request.group} if request.group else {}
+        # Round-trip the bridge's time-based exit rules on metadata so
+        # check_exits can recover them from list_proposals after execution.
+        if request.max_hold_bars is not None:
+            metadata["max_hold_bars"] = int(request.max_hold_bars)
+        if request.close_by_time:
+            metadata["close_by_time"] = str(request.close_by_time)
+            if request.close_by_tz:
+                metadata["close_by_tz"] = str(request.close_by_tz)
         draft = ProposalDraft(
             id=proposal_id,
             symbol=secdef.symbol,

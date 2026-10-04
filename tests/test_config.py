@@ -174,3 +174,41 @@ class TestMMRConfig:
         cfg.write_text("unsafe_legacy_rpc: true\n")
         config = MMRConfig.from_yaml(str(cfg))
         assert config.unsafe_legacy_rpc is True
+
+    def test_nested_automation_block_loads(self, tmp_path):
+        cfg = tmp_path / "cfg.yaml"
+        cfg.write_text(
+            "trading_mode: paper\n"
+            "automation:\n"
+            "  enabled: true\n"
+            "  live_enabled: false\n"
+            "  artifact_bundle_path: ~/artifacts/x\n"
+            "  public_key_ring_path: ~/keys\n"
+            "  expected_artifact_id: artifact-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\n"
+            "  strategy_name: orb_googl\n"
+        )
+        config = MMRConfig.from_yaml(str(cfg))
+        assert config.automation.enabled is True
+        assert config.automation.live_enabled is False
+        assert config.automation.strategy_name == "orb_googl"
+        assert config.automation.expected_artifact_id.startswith("artifact-")
+        assert "artifacts/x" in config.automation.artifact_bundle_path
+
+    def test_flat_automation_overrides_nested(self, tmp_path):
+        cfg = tmp_path / "cfg.yaml"
+        cfg.write_text(
+            "automation:\n"
+            "  enabled: true\n"
+            "  strategy_name: nested_name\n"
+            "automation_enabled: false\n"
+            "automation_strategy_name: flat_name\n"
+        )
+        config = MMRConfig.from_yaml(str(cfg))
+        assert config.automation.enabled is False
+        assert config.automation.strategy_name == "flat_name"
+
+    def test_automation_live_enabled_refused(self, tmp_path):
+        cfg = tmp_path / "cfg.yaml"
+        cfg.write_text("automation:\n  live_enabled: true\n")
+        with pytest.raises(ValueError, match="automation.live_enabled"):
+            MMRConfig.from_yaml(str(cfg))

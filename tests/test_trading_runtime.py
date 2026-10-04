@@ -13,7 +13,7 @@ Covers:
 import asyncio
 import threading
 import time
-from unittest.mock import MagicMock
+from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
@@ -688,6 +688,47 @@ class TestFakeBrokerGuard:
         msg = str(exc.value)
         assert 'paper_trading=False' in msg
         assert "ib_account='U26774889'" in msg
+
+
+class TestFakeBrokerSnapshotBootstrap:
+    """Fake broker must still promote a broker-sync generation so the
+    dashboard snapshot barrier clears in paper/sim e2e."""
+
+    def test_fake_sync_client_is_empty_but_complete(self, monkeypatch):
+        monkeypatch.setenv('MMR_FAKE_BROKER', '1')
+        t = object.__new__(Trader)
+        t.simulation = True
+        t.paper_trading = True
+        t.ib_account = 'DU12345'
+        sync = t._fake_broker_sync_client()
+        assert sync.ib.accountValues('DU12345')[0].value == '100000'
+
+    @pytest.mark.asyncio
+    async def test_connected_event_uses_fake_sync_client(self, monkeypatch):
+        monkeypatch.setenv('MMR_FAKE_BROKER', '1')
+        t = object.__new__(Trader)
+        t.simulation = True
+        t.paper_trading = True
+        t.ib_account = 'DU12345'
+        t._in_connected_event = False
+        t.disposables = []
+        t.pnl_subscriptions = {}
+        t._pnl_subscriptions_lock = threading.Lock()
+        t.zmq_pubsub_published_contracts = {}
+        t.setup_subscriptions = AsyncMock()
+        t._republish_ticker_subscriptions = MagicMock()
+        t._startup_reconciled = True
+
+        captured = {}
+
+        class _Ingest:
+            async def run_broker_sync(self, client):
+                captured['client'] = client
+
+        t.broker_ingest = _Ingest()
+        await t.connected_event()
+        assert captured['client'].ib.accountValues('DU12345')[0].value == '100000'
+        t.setup_subscriptions.assert_not_called()
 
 
 class TestGetAccountCashByCurrency:

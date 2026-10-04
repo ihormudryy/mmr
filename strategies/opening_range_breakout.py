@@ -2,9 +2,13 @@
 
 Defines the high and low of the first N minutes of each US trading day
 (default 30). After the opening range is established, BUY when close
-breaks above the range-high with above-average volume; SELL when close
-breaks below the range-low. Trades are filtered to regular trading hours
-(09:30–16:00 ET); pre-market and after-hours bars don't participate.
+breaks above the range-high with above-average volume; SELL (exit) when
+close breaks below the range-low — the exit deliberately has NO volume
+gate, so a quiet drift below the range still closes the position.
+Trades are filtered to regular trading hours (09:30–16:00 ET);
+pre-market and after-hours bars don't participate. Positions are flat
+by EOD_FLAT_MIN_BEFORE_CLOSE minutes before the session close (this is
+an intraday strategy — it must not hold overnight).
 
 Uses the precompute hook so the per-day range and volume average are
 computed once over the full series.
@@ -13,13 +17,14 @@ computed once over the full series.
 from trader.trading.strategy import Signal, Strategy
 from trader.objects import Action
 from typing import Any, Dict, Optional
+from datetime import time as dtime
 
 import numpy as np
 import pandas as pd
 
 
 class OpeningRangeBreakout(Strategy):
-    """30-minute opening-range breakout, volume-confirmed, RTH-only."""
+    """30-minute opening-range breakout, volume-confirmed, RTH-only, EOD flat."""
 
     RANGE_MINUTES = 30
     VOLUME_MULT = 1.5              # current bar volume must exceed this × 20-bar SMA
@@ -31,6 +36,10 @@ class OpeningRangeBreakout(Strategy):
     SESSION_TZ = 'America/New_York'
     RTH_OPEN_MIN = 9 * 60 + 30     # session open, minutes since SESSION_TZ midnight
     RTH_CLOSE_MIN = 16 * 60        # session close, minutes since SESSION_TZ midnight
+    # Flatten this many minutes before session close (close_by_time on the
+    # BUY signal, in SESSION_TZ — honored by the backtester's synthetic SELL
+    # and the live bridge's check_exits).
+    EOD_FLAT_MIN_BEFORE_CLOSE = 15
     MIN_BARS = 40
 
     def _cfg(self, key: str, default: Any) -> Any:
@@ -158,14 +167,22 @@ class OpeningRangeBreakout(Strategy):
 
         vol_ok = volume > vol_avg * self.VOLUME_MULT
 
-        # BUY: close crosses above ORB high with volume
+        # BUY: close crosses above ORB high with volume. Carries the EOD-flat
+        # rule (in SESSION_TZ) so an unexited breakout never holds overnight.
         if close > orb_h and prev_close <= orb_h and vol_ok:
+            session_tz = self._cfg('SESSION_TZ', self.SESSION_TZ)
+            rth_close = int(self._cfg('RTH_CLOSE_MIN', self.RTH_CLOSE_MIN))
+            flat_min = max(0, rth_close - int(self.EOD_FLAT_MIN_BEFORE_CLOSE))
             return Signal(
                 source_name=self.name, action=Action.BUY,
                 probability=0.60, risk=0.40,
+                close_by_time=dtime(flat_min // 60, flat_min % 60),
+                close_by_tz=session_tz,
             )
-        # SELL: close crosses below ORB low
-        if close < orb_l and prev_close >= orb_l and vol_ok:
+        # SELL: close crosses below ORB low. Exit path — deliberately NO
+        # volume gate: requiring above-average volume to LEAVE a losing
+        # breakout meant a quiet drift below the range never closed it.
+        if close < orb_l and prev_close >= orb_l:
             return Signal(
                 source_name=self.name, action=Action.SELL,
                 probability=0.60, risk=0.40,

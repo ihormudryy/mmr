@@ -154,6 +154,7 @@ def test_ledger_row_exists_before_validation_runs(coordinator, ledger):
     receipt = coordinator.execute(_request(action="noop"))
     assert seen["row"].state == "RECEIVED"        # insert precedes validation
     assert receipt.state == "REJECTED" and receipt.error_code == "RISK_REJECTED"
+    assert receipt.outcome == {"message": "concentration too high"}
 
 
 def test_audit_write_failure_fails_closed(coordinator):
@@ -229,6 +230,7 @@ def test_unexpected_handler_exception_does_not_affect_the_validation_error_path(
     receipt = coordinator.execute(_request(action="noop"))
     assert receipt.state == "REJECTED"
     assert receipt.error_code == "RISK_REJECTED"
+    assert receipt.outcome == {"message": "concentration too high"}
 
 
 def test_outcome_unknown_from_unexpected_error_survives_purge_expired(ledger, now):

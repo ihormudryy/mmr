@@ -3,7 +3,7 @@ from __future__ import annotations
 
 import datetime as dt
 from dataclasses import dataclass
-from typing import Callable
+from typing import Callable, Optional
 
 from trader.data.circuit_breaker_store import BreakerState, CircuitBreakerStore
 
@@ -31,6 +31,9 @@ _IMMEDIATE = {
     "DRAWDOWN_BREACH",
     # P3 Task 6 — missed session flat confirmation
     "MISSED_FLAT_DEADLINE",
+    # P4 Task 6 — canary capital-safety incidents
+    "DUPLICATE_SUBMISSION",
+    "UNEXPLAINED_POSITION",
 }
 _ROLLING = {
     "QUOTE_FAILURE": (3, dt.timedelta(minutes=5)),
@@ -50,6 +53,7 @@ class CircuitBreaker:
         reconciliation_complete: Callable[[], bool],
         session_key: Callable[[dt.datetime], str],
         disconnect_grace: dt.timedelta = dt.timedelta(seconds=30),
+        on_trip: Optional[Callable[[BreakerState], None]] = None,
     ):
         self.store = store
         self._now = now
@@ -57,11 +61,15 @@ class CircuitBreaker:
         self._reconciliation_complete = reconciliation_complete
         self._session_key = session_key
         self._disconnect_grace = disconnect_grace
+        # Optional hook for P5 degradation feed — caller may wire this to
+        # ``DegradationMonitor`` / ``AllocationAuthorityStore.apply_override``.
+        self._on_trip = on_trip
 
     def record(self, signal: BreakerSignal) -> BreakerState:
         if signal.kind not in _KNOWN:
             raise ValueError(f"unknown breaker signal {signal.kind!r}")
         now = self._now()
+        previous = self.store.get()
 
         def trip_reason(conn):
             if signal.kind in _IMMEDIATE:
@@ -77,7 +85,7 @@ class CircuitBreaker:
                     return "BROKER_DISCONNECTED", "broker disconnect exceeded grace period"
             return None
 
-        return self.store.apply_signal(
+        new_state = self.store.apply_signal(
             kind=signal.kind,
             detail=signal.detail,
             occurred_at=signal.occurred_at,
@@ -85,6 +93,13 @@ class CircuitBreaker:
             recorded_at=now,
             trip_reason=trip_reason,
         )
+        if (
+            self._on_trip is not None
+            and previous.state == "CLEAR"
+            and new_state.state == "TRIPPED"
+        ):
+            self._on_trip(new_state)
+        return new_state
 
     def reset(self, command_id: str, reason: str, operator_authority: str) -> BreakerState:
         if not command_id or not reason.strip() or not operator_authority.strip():

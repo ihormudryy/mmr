@@ -1,6 +1,7 @@
 import datetime as dt
 import dill
 import duckdb
+import logging
 import os
 import pandas as pd
 import threading
@@ -9,6 +10,76 @@ from pathlib import Path
 from typing import Any, Optional
 
 from trader.data.store import DataStore, ObjectStore
+
+logger = logging.getLogger(__name__)
+
+
+def is_unreplayable_wal_error(exc: BaseException) -> bool:
+    """True for the DuckDB WAL-replay INTERNAL Error that bricks open().
+
+    Known engine bug (e.g. duckdb#20543 / #22044): after an ungraceful
+    shutdown during certain DDL, replaying ``*.wal`` asserts
+    ``GetDefaultDatabase with no default database set``. The main
+    ``.duckdb`` file is often still intact; quarantining the WAL and
+    reopening recovers the last checkpointed state.
+    """
+    msg = str(exc)
+    return (
+        'Failure while replaying WAL file' in msg
+        and 'GetDefaultDatabase' in msg
+    )
+
+
+def quarantine_duckdb_wal(db_path: str) -> Path:
+    """Move ``{db_path}.wal`` aside. Returns the quarantine destination."""
+    path = Path(db_path).expanduser()
+    wal = Path(str(path) + '.wal')
+    if not wal.exists():
+        raise FileNotFoundError(f'no WAL to quarantine at {wal}')
+    stamp = dt.datetime.now(dt.timezone.utc).strftime('%Y%m%dT%H%M%SZ')
+    dest_dir = path.parent / f'corrupt_wal_quarantine_{stamp}'
+    dest_dir.mkdir(parents=True, exist_ok=True)
+    dest = dest_dir / wal.name
+    if dest.exists():
+        dest = dest_dir / f'{wal.name}.{os.getpid()}'
+    os.replace(wal, dest)
+    return dest
+
+
+def connect_duckdb(db_path: str, *, read_only: bool = False):
+    """``duckdb.connect`` with one automatic recovery for unreplayable WALs.
+
+    On the known WAL-replay INTERNAL Error, quarantines ``{path}.wal`` and
+    retries once. Fail-loud if the retry still fails (main file may be
+    corrupt too). A successful recovery keeps last-checkpointed state only —
+    uncheckpointed WAL frames were discarded.
+    """
+    path = str(Path(db_path).expanduser())
+    try:
+        return duckdb.connect(path, read_only=read_only)
+    except Exception as first:  # noqa: BLE001 — DuckDB raises InternalException
+        if read_only or not is_unreplayable_wal_error(first):
+            raise
+        try:
+            quarantined = quarantine_duckdb_wal(path)
+        except FileNotFoundError:
+            raise first from None
+        logger.error(
+            'DuckDB WAL replay failed for %s (%s). Quarantined WAL to %s '
+            'and retrying open — uncheckpointed frames were discarded. '
+            'See duckdb issues #20543 / #22044.',
+            path, first, quarantined,
+        )
+        try:
+            return duckdb.connect(path, read_only=read_only)
+        except Exception as second:  # noqa: BLE001
+            raise RuntimeError(
+                f'DuckDB open failed for {path} even after quarantining '
+                f'unreplayable WAL at {quarantined}. Restore the journal DB '
+                f'from backup, or delete {path} (+ .wal) to start a fresh '
+                f'journal (loses command ledger / domain events). '
+                f'Original error: {first}; retry error: {second}'
+            ) from second
 
 
 class DuckDBConnection:
@@ -145,7 +216,7 @@ class DuckDBConnection:
             # children, 0 actually persisted.
             for attempt in range(32):
                 try:
-                    conn = duckdb.connect(self.db_path)
+                    conn = connect_duckdb(self.db_path)
                     break
                 except duckdb.IOException as ex:
                     # Only retry on lock contention — not on malformed

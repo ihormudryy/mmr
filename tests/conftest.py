@@ -13,6 +13,11 @@ PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 if PROJECT_ROOT not in sys.path:
     sys.path.insert(0, PROJECT_ROOT)
 
+# Quiet numba before any test imports vectorbt. setup_logging() also does this
+# after dictConfig, but some tests never call it and inherit root DEBUG.
+for _noisy in ('numba', 'numba.core', 'numba.core.ssa', 'llvmlite'):
+    logging.getLogger(_noisy).setLevel(logging.WARNING)
+
 from trader.data.duckdb_store import DuckDBConnection, DuckDBDataStore, DuckDBObjectStore
 from trader.data.data_access import TickStorage
 from trader.data.event_store import EventStore
@@ -32,6 +37,13 @@ def _clear_duckdb_instances():
     yield
     DuckDBConnection._instances.clear()
 
+
+@pytest.fixture(scope='session', autouse=True)
+def _quiet_numba_loggers():
+    """Re-assert after any session-early setup_logging() dictConfig."""
+    for name in ('numba', 'numba.core', 'numba.core.ssa', 'llvmlite'):
+        logging.getLogger(name).setLevel(logging.WARNING)
+    yield
 
 # ---------------------------------------------------------------------------
 # DuckDB temp path

@@ -3,7 +3,9 @@ from __future__ import annotations
 
 import asyncio
 import datetime as dt
+import os
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Any, Callable, Optional
 
 from trader.data.proposal_repository import (
@@ -114,6 +116,163 @@ class _LiquidationBreaker:
         ))
 
 
+def _load_canary_public_keys(key_ring_path: str) -> list:
+    """Load every ``*.pem`` Ed25519 public key from ``key_ring_path``.
+
+    Mirrors ``StrategyRuntime._get_artifact_verifier``'s exact key-ring
+    loading convention (P3 Task 2) for consistency across services. Returns
+    an empty list (never raises) on any I/O/parse problem so a misconfigured
+    ring degrades to "canary activation stays dormant" rather than crashing
+    trader_service startup.
+    """
+    import glob as _glob
+    import logging
+    import os as _os
+
+    from trader.research import signing
+
+    keys: list = []
+    try:
+        abs_path = _os.path.abspath(_os.path.expanduser(key_ring_path))
+        pem_files = sorted(_glob.glob(_os.path.join(abs_path, "*.pem")))
+        for pem_path in pem_files:
+            try:
+                keys.append(signing.load_verify_key(pem_path))
+            except Exception as exc:
+                logging.error("failed to load canary public key %s: %s", pem_path, exc)
+    except Exception as exc:
+        logging.error("failed to enumerate canary key ring %s: %s", key_ring_path, exc)
+    return keys
+
+
+def _build_canary_service(
+    trader: Any,
+    stage_machine: Any,
+    evidence_store: Any,
+    authority_store: Any,
+    *,
+    account_id: str,
+    account_mode: str,
+    semantic_readiness: SemanticReadiness,
+    broker_flat_reconciled: Callable[[], bool],
+    breaker_clear: Callable[[], bool],
+    now: Callable[[], dt.datetime],
+) -> Optional[Any]:
+    """Build ``CanaryActivationService`` iff a canary signing-key ring AND an
+    artifact bundle to re-verify against are BOTH configured on ``trader``.
+
+    Absent either (the default -- no such attributes exist on ``Trader``
+    until ops config adds them), returns ``None`` and the two commands are
+    never registered (dormant), never partially wired.
+    """
+    key_ring_path = getattr(trader, "canary_public_key_ring_path", None)
+    bundle_path_str = getattr(trader, "canary_artifact_bundle_path", None)
+    expected_artifact_id = getattr(trader, "canary_expected_artifact_id", None)
+    if not key_ring_path or not bundle_path_str or not expected_artifact_id:
+        return None
+
+    public_keys = _load_canary_public_keys(key_ring_path)
+    if not public_keys:
+        return None
+
+    import os as _os
+    from pathlib import Path as _Path
+
+    from trader.automation.artifact_verifier import ArtifactVerifier
+    from trader.promotion.canary_attestation import CanaryAuthorityVerifier, ExpectedCanaryBindings
+    from trader.promotion.controller import CanaryActivationService
+
+    canary_verifier = CanaryAuthorityVerifier(trusted_public_keys=public_keys)
+    artifact_verifier = ArtifactVerifier(trusted_public_keys=public_keys)
+    bundle_path = _Path(_os.path.abspath(_os.path.expanduser(bundle_path_str)))
+
+    def expected_bindings():
+        # Re-run the FULL artifact chain (bundle integrity, signature,
+        # state/mode gate, expiry, revocation, read-only mount in live
+        # mode) fresh on every activation attempt -- never a cached copy.
+        verified = artifact_verifier.verify(bundle_path, "live", expected_artifact_id, now())
+        return ExpectedCanaryBindings(
+            account_id=account_id, artifact_digest=verified.artifact_id,
+            allowlist_digest=verified.allowlist_digest, ruleset_digest=verified.ruleset_digest,
+        )
+
+    return CanaryActivationService(
+        stage_machine=stage_machine, evidence_store=evidence_store, authority_store=authority_store,
+        verifier=canary_verifier, expected_bindings=expected_bindings,
+        semantic_readiness_ready=lambda: semantic_readiness.evaluate(now()).ready,
+        broker_flat_reconciled=broker_flat_reconciled, breaker_clear=breaker_clear, now=now,
+    )
+
+
+def _build_allocation_service(
+    trader: Any,
+    authority_store: Any,
+    *,
+    account_id: str,
+    account_mode: str,
+    semantic_readiness: SemanticReadiness,
+    broker_flat_reconciled: Callable[[], bool],
+    breaker_clear: Callable[[], bool],
+    now: Callable[[], dt.datetime],
+) -> Optional[Any]:
+    """Build ``AllocationActivationService`` when scaling keys + artifact are configured."""
+    key_ring_path = (
+        getattr(trader, "allocation_public_key_ring_path", None)
+        or getattr(trader, "canary_public_key_ring_path", None)
+    )
+    bundle_path_str = (
+        getattr(trader, "allocation_artifact_bundle_path", None)
+        or getattr(trader, "canary_artifact_bundle_path", None)
+    )
+    expected_artifact_id = (
+        getattr(trader, "allocation_expected_artifact_id", None)
+        or getattr(trader, "canary_expected_artifact_id", None)
+    )
+    if not key_ring_path or not bundle_path_str or not expected_artifact_id:
+        return None
+
+    public_keys = _load_canary_public_keys(key_ring_path)
+    if not public_keys:
+        return None
+
+    import os as _os
+    from pathlib import Path as _Path
+
+    from trader.automation.artifact_verifier import ArtifactVerifier
+    from trader.promotion.allocation_attestation import AllocationAttestationVerifier, ExpectedAllocationBindings
+    from trader.promotion.controller import AllocationActivationService
+
+    keys_by_id = {}
+    for key in public_keys:
+        from trader.research.signing import public_key_id
+        keys_by_id[public_key_id(key)] = key
+
+    allocation_verifier = AllocationAttestationVerifier(trusted_public_keys=keys_by_id)
+    artifact_verifier = ArtifactVerifier(trusted_public_keys=public_keys)
+    bundle_path = _Path(_os.path.abspath(_os.path.expanduser(bundle_path_str)))
+
+    def expected_bindings():
+        verified = artifact_verifier.verify(bundle_path, account_mode, expected_artifact_id, now())
+        return ExpectedAllocationBindings(
+            account_id=account_id,
+            account_mode=account_mode,
+            artifact_digest=verified.artifact_id,
+            allowlist_digest=verified.allowlist_digest,
+            ruleset_digest=verified.ruleset_digest,
+            strategy_id=getattr(trader, "allocation_strategy_id", "") or "default",
+        )
+
+    return AllocationActivationService(
+        authority_store=authority_store,
+        verifier=allocation_verifier,
+        expected_bindings=expected_bindings,
+        semantic_readiness_ready=lambda: semantic_readiness.evaluate(now()).ready,
+        broker_flat_reconciled=broker_flat_reconciled,
+        breaker_clear=breaker_clear,
+        now=now,
+    )
+
+
 @dataclass(frozen=True)
 class CommandStack:
     journal: Any
@@ -137,6 +296,15 @@ class CommandStack:
     session_controller: Any = None  # SessionController (P3 Task 6)
     attribution_ledger: Any = None  # AttributionLedger (P3 Task 7)
     dispatch_guard: Any = None
+    promotion_stage_machine: Any = None  # PromotionStageMachine (P4 Task 1)
+    promotion_evidence_store: Any = None  # EvidenceStore (P4 Task 1)
+    canary_authority_store: Any = None  # LiveActivationAuthorityStore (P4 Task 5)
+    canary_service: Any = None  # CanaryActivationService (P4 Task 5) -- None until a
+    # canary public-key ring is configured (dormant by default; see build_command_stack)
+    allocation_service: Any = None  # AllocationActivationService (P5 Task 3)
+    automated_intent_service: Any = None  # AutomatedIntentCommandService (paper automation)
+    paper_automation_service: Any = None  # Paper activation authority (Phase 1+2)
+    paper_hot_arm: Any = None  # ProductionPaperHotArmPorts when paper mode
 
 
 _REQUIRED_TRADER_PORTS = (
@@ -191,6 +359,119 @@ def _broker_ready(trader: Any) -> bool:
     return bool(readiness() if callable(readiness) else readiness)
 
 
+def _build_automated_intent_service(
+    trader: Any,
+    *,
+    ledger: CommandLedger,
+    audit: CommandAudit,
+    journal: Any,
+    controls: TradingControlStore,
+    dispatch: Any,
+    protective_order_saga: Any,
+    account_id: str,
+    account_mode: str,
+    now: Callable[[], dt.datetime],
+    schedule_reconcile: Optional[Callable[[str], None]],
+) -> Optional[Any]:
+    """Build ``AutomatedIntentCommandService`` for paper automation only.
+
+    Requires ``trader.automation_enabled`` and configured artifact path +
+    public key ring + expected artifact id. Live automation stays refused.
+    Returns ``None`` when dormant so ``execute_automated_intent`` is never
+    registered.
+    """
+    from types import SimpleNamespace
+    import os as _os
+    from pathlib import Path as _Path
+
+    if not getattr(trader, "automation_enabled", False):
+        return None
+    if getattr(trader, "automation_live_enabled", False):
+        raise CommandStackConfigurationError(
+            "AUTOMATION_LIVE_REFUSED",
+            "automation_live_enabled=true is refused (hybrid design R3)",
+        )
+    if account_mode != "paper":
+        return None
+    key_ring = getattr(trader, "automation_public_key_ring_path", "") or ""
+    bundle_path = getattr(trader, "automation_artifact_bundle_path", "") or ""
+    expected_id = getattr(trader, "automation_expected_artifact_id", "") or ""
+    if not key_ring or not bundle_path or not expected_id:
+        raise CommandStackConfigurationError(
+            "AUTOMATION_CONFIG_INCOMPLETE",
+            "automation_enabled requires artifact_bundle_path, "
+            "public_key_ring_path, and expected_artifact_id",
+        )
+
+    from trader.automation.artifact_verifier import ArtifactVerifier
+    from trader.automation.automated_intent_command import AutomatedIntentCommandService
+
+    public_keys = _load_canary_public_keys(key_ring)
+    if not public_keys:
+        raise CommandStackConfigurationError(
+            "AUTOMATION_KEY_RING_EMPTY",
+            f"no usable *.pem verify keys under {key_ring!r}",
+        )
+    verifier = ArtifactVerifier(trusted_public_keys=public_keys)
+    root = _Path(_os.path.abspath(_os.path.expanduser(bundle_path)))
+    bundle_root = root.parent if root.name.startswith("artifact-") else root
+
+    def approval_factory(*, intent, command):
+        from trader.data.broker_state import BrokerRiskSnapshot
+        from trader.trading.approval_context import (
+            ApprovalContext, ExecutableMarketEvidence,
+        )
+        from trader.trading.command_coordinator import RiskDirection
+        from trader.trading.proposal_command_service import ExecutableQuote
+
+        quote = ExecutableQuote(
+            conid=intent.conid, side=intent.side, price=0.0,
+            market_timestamp=now(), feed_type="realtime", session_state="open",
+            bid=0.0, ask=0.0,
+        )
+        snap = BrokerRiskSnapshot(
+            generation_id=0, source_cursor=0, promoted_at=now(),
+            account_id=account_id, account_mode=account_mode,
+            net_liquidation=0.0, daily_pnl=0.0, positions=(), working_orders=(),
+        )
+        return ApprovalContext(
+            conid=intent.conid, side=intent.side, quantity=0.0,
+            reference_price=0.0, max_drift_bps=50.0,
+            risk_direction=RiskDirection.INCREASING,
+            broker=snap,
+            market=ExecutableMarketEvidence(quote=quote, received_at=now()),
+            what_if=None,
+        )
+
+    return AutomatedIntentCommandService(
+        ledger=ledger,
+        audit=audit,
+        journal=journal,
+        controls=controls,
+        dispatch=dispatch,
+        artifact_verifier=verifier,
+        account_id=account_id,
+        account_mode=account_mode,
+        now=now,
+        bundle_root=bundle_root,
+        schedule_reconcile=schedule_reconcile,
+        protective_saga=protective_order_saga,
+        approval_factory=approval_factory,
+        session_state_factory=lambda **_kw: SimpleNamespace(
+            state="OPEN",
+            entry_cutoff_reached=False,
+            high_water_mark=None,
+            expected_account_id=account_id,
+            liquidity=None,
+        ),
+        allocation_factory=lambda **_kw: SimpleNamespace(
+            max_gross_allocation=0.06,
+            strategy_allocation=0.06,
+            max_gross_fraction=0.06,
+        ),
+    )
+
+
 def build_command_stack(
     trader: Any,
     policy: CommandAuthorityPolicy,
@@ -213,6 +494,37 @@ def build_command_stack(
     apply_preflight_nonce_migration(migrator)
     apply_circuit_breaker_migration(migrator)
     apply_liquidation_migration(migrator)
+    from trader.promotion.evidence_store import apply_evidence_migrations
+    from trader.promotion.stage import apply_stage_migration
+    from trader.promotion.controller import apply_live_activation_authority_migration
+
+    apply_stage_migration(migrator)
+    apply_evidence_migrations(migrator)
+    apply_live_activation_authority_migration(migrator)
+    from trader.promotion.canary_risk import apply_canary_risk_migration
+    from trader.operations.session_checklist import apply_session_checklist_migration
+
+    apply_canary_risk_migration(migrator)
+    apply_session_checklist_migration(migrator)
+    from trader.data.allocation_authority_store import apply_allocation_authority_migrations
+
+    apply_allocation_authority_migrations(migrator)
+    from trader.data.allocation_authority_store import AllocationAuthorityStore
+    from trader.data.portfolio_risk_authority_store import (
+        PortfolioRiskAuthorityStore,
+        apply_portfolio_risk_authority_migrations,
+    )
+    from trader.promotion.allocation_policy import AllocationPolicy
+    from trader.promotion.degradation_reaction import react_to_breaker_trip
+
+    apply_portfolio_risk_authority_migrations(migrator)
+    allocation_authority_store = AllocationAuthorityStore(
+        journal=journal, db=trader.journal_db, now=now,
+    )
+    portfolio_risk_authority_store = PortfolioRiskAuthorityStore(
+        journal=journal, db=trader.journal_db, now=now,
+    )
+    allocation_policy = AllocationPolicy(now=now)
     from trader.automation.protective_order_saga import (
         ProtectiveBracketDispatch,
         ProtectiveOrderSaga,
@@ -282,6 +594,10 @@ def build_command_stack(
         broker=broker_snapshot, quotes=quotes, margin=margin,
         controls=controls, risk_gate=trader.risk_gate, policy=policy,
         account_id=trader.ib_account, account_mode=account_mode,
+        allocation_policy=allocation_policy,
+        allocation_authority_lookup=lambda account_id, artifact_digest: (
+            allocation_authority_store.active_for(account_id, artifact_digest)
+        ),
     )
 
     def compute_risk_projection():
@@ -362,6 +678,12 @@ def build_command_stack(
         reset_ready=reset_ready,
         reconciliation_complete=reconciliation_safe,
         session_key=xnys_session_key,
+        on_trip=lambda state: react_to_breaker_trip(
+            allocation_authority_store,
+            account_id=trader.ib_account,
+            breaker_state=state,
+            now=now(),
+        ),
     )
     liquidation_service = LiquidationService(
         broker_snapshot, _LiquidationDispatch(dispatch),
@@ -415,6 +737,13 @@ def build_command_stack(
     session_risk = SessionRiskController(
         calendar=XNYSCalendarPolicy(),
         breaker=circuit_breaker,
+        allocation_policy=allocation_policy,
+        portfolio_authority_present=lambda account_id: (
+            portfolio_risk_authority_store.active_for(account_id) is not None
+        ),
+        strategy_count=lambda: allocation_authority_store.active_strategy_count(
+            trader.ib_account,
+        ),
         now=now,
     )
     # P3 Task 5 — protective entry saga over existing expressive-order path.
@@ -467,6 +796,90 @@ def build_command_stack(
     if ingest is not None:
         ingest.attribution_ledger = attribution_ledger
         ingest.protective_order_saga = protective_order_saga
+
+    # P4 Task 5 — promotion stage machine + evidence store + the
+    # append-only canary-authority ledger are always constructed (cheap,
+    # no external dependency) so `mmr strategies inspect`-style reporting
+    # and PromotionController.prepare_canary (which runs entirely offline,
+    # never through this stack) have a durable stage to read once a
+    # strategy starts accumulating paper evidence. The authenticated
+    # `activate_live_canary`/`deactivate_live_canary` COMMANDS, however,
+    # stay dormant (never registered -- see production_api.py's
+    # `canary_service is not None` guard) until a canary signing-key ring
+    # is actually configured: `trader.canary_public_key_ring_path`,
+    # `trader.canary_artifact_bundle_path`, and
+    # `trader.canary_expected_artifact_id` are ops config this task
+    # deliberately does not invent defaults for -- an unconfigured trader
+    # must never expose a live-canary activation surface.
+    from trader.promotion.controller import CanaryActivationService, LiveActivationAuthorityStore
+    from trader.promotion.evidence_store import EvidenceStore
+    from trader.promotion.stage import PromotionStageMachine
+
+    promotion_stage_machine = PromotionStageMachine(journal=journal, db=trader.journal_db, now=now)
+    promotion_evidence_store = EvidenceStore(journal=journal, db=trader.journal_db, now=now)
+    canary_authority_store = LiveActivationAuthorityStore(journal=journal, db=trader.journal_db, now=now)
+
+    def broker_flat_reconciled() -> bool:
+        # "Flat" (zero open positions, zero working orders) AND "reconciled"
+        # (no unresolved commands the ledger is still waiting on) -- both
+        # halves of the brief's "flat/reconciled broker state" gate.
+        snapshot = broker_snapshot.capture(trader.ib_account)
+        return (
+            len(snapshot.positions) == 0
+            and snapshot.open_order_count == 0
+            and reconciliation_safe()
+        )
+
+    canary_service = _build_canary_service(
+        trader, promotion_stage_machine, promotion_evidence_store, canary_authority_store,
+        account_id=trader.ib_account, account_mode=account_mode,
+        semantic_readiness=semantic_readiness, broker_flat_reconciled=broker_flat_reconciled,
+        breaker_clear=lambda: breaker_store.get().state == "CLEAR", now=now,
+    )
+    allocation_service = _build_allocation_service(
+        trader, allocation_authority_store,
+        account_id=trader.ib_account, account_mode=account_mode,
+        semantic_readiness=semantic_readiness, broker_flat_reconciled=broker_flat_reconciled,
+        breaker_clear=lambda: breaker_store.get().state == "CLEAR", now=now,
+    )
+
+    automated_intent_service = _build_automated_intent_service(
+        trader,
+        ledger=ledger,
+        audit=CommandAudit(journal),
+        journal=journal,
+        controls=controls,
+        dispatch=dispatch,
+        protective_order_saga=protective_order_saga,
+        account_id=trader.ib_account,
+        account_mode=account_mode,
+        now=now,
+        schedule_reconcile=lambda command_id: reconciler.schedule(
+            command_id, now(),
+        ),
+    )
+    from trader.automation.paper_activation import PaperAutomationActivationService
+    from trader.automation.paper_hot_arm import ProductionPaperHotArmPorts
+
+    trader_yaml_path = Path(
+        os.environ.get("TRADER_CONFIG", "~/.config/mmr/trader.yaml")
+    ).expanduser()
+    strategy_yaml_path = Path(
+        getattr(trader, "strategy_config_file", None)
+        or "~/.config/mmr/strategy_runtime.yaml"
+    ).expanduser()
+
+    paper_automation_service = PaperAutomationActivationService(
+        trader_yaml_path=trader_yaml_path,
+        strategy_yaml_path=strategy_yaml_path,
+        config_dir=Path("~/.config/mmr").expanduser(),
+        share_dir=Path("~/.local/share/mmr").expanduser(),
+        account_mode=account_mode,
+        command_authority_enabled=policy.enabled,
+        now=now,
+        hot_arm=None,
+    )
+
     stack = CommandStack(
         journal=journal,
         repository=repository,
@@ -489,7 +902,60 @@ def build_command_stack(
         session_controller=session_controller,
         attribution_ledger=attribution_ledger,
         dispatch_guard=dispatch_guard,
+        promotion_stage_machine=promotion_stage_machine,
+        promotion_evidence_store=promotion_evidence_store,
+        canary_authority_store=canary_authority_store,
+        canary_service=canary_service,
+        allocation_service=allocation_service,
+        automated_intent_service=automated_intent_service,
+        paper_automation_service=paper_automation_service,
     )
+
+    def _build_intent_for_hot_arm(trader_obj: Any):
+        return _build_automated_intent_service(
+            trader_obj,
+            ledger=ledger,
+            audit=CommandAudit(journal),
+            journal=journal,
+            controls=controls,
+            dispatch=dispatch,
+            protective_order_saga=protective_order_saga,
+            account_id=trader.ib_account,
+            account_mode=account_mode,
+            now=now,
+            schedule_reconcile=lambda command_id: reconciler.schedule(
+                command_id, now(),
+            ),
+        )
+
+    if account_mode == "paper":
+        hot_arm = ProductionPaperHotArmPorts(
+            trader=trader,
+            stack=stack,
+            account_id=trader.ib_account,
+            account_mode=account_mode,
+            now=now,
+            build_intent_service=_build_intent_for_hot_arm,
+        )
+        paper_automation_service._hot_arm = hot_arm
+        object.__setattr__(stack, "paper_hot_arm", hot_arm)
+
+    if automated_intent_service is not None:
+        paper_automation_service.mark_runtime_armed(
+            strategy_name=str(
+                getattr(trader, "automation_strategy_name", "") or ""
+            ),
+            artifact_id=str(
+                getattr(trader, "automation_expected_artifact_id", "") or ""
+            ),
+            artifact_bundle_path=str(
+                getattr(trader, "automation_artifact_bundle_path", "") or ""
+            ),
+            public_key_ring_path=str(
+                getattr(trader, "automation_public_key_ring_path", "") or ""
+            ),
+        )
+
     trader.command_ledger = ledger
     trader.command_reconciler = reconciler
     trader.command_stack = stack

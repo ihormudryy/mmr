@@ -63,6 +63,17 @@ def test_rejected_receipt_raises_gateway_error(gateway, fake):
     assert exc.value.correlation_id == "cmd-9"
 
 
+def test_rejected_without_outcome_message_uses_error_code(gateway, fake):
+    fake.response = {
+        "command_id": "cmd-9", "correlation_id": "cmd-9", "state": "REJECTED",
+        "outcome": None, "error_code": "QUOTE_UNAVAILABLE", "retryable": False,
+    }
+    with pytest.raises(GatewayError) as exc:
+        gateway.execute("create_proposal", {"command_id": "cmd-9"})
+    assert exc.value.code == "QUOTE_UNAVAILABLE"
+    assert exc.value.message == "QUOTE_UNAVAILABLE"
+
+
 def test_remote_error_maps_to_stable_contract(gateway, fake):
     fake.raise_exc = TypedRpcRemoteError(code="VERSION_CONFLICT", message="revision 4 expected 3")
     with pytest.raises(GatewayError) as exc:
@@ -118,4 +129,6 @@ def test_preflight_parses_ticket(gateway, fake):
 
 
 def test_gateway_serializes_calls_with_its_own_lock(gateway):
-    assert isinstance(gateway._lock, type(threading.Lock()))
+    # The command serialization lock now lives on the gateway's dedicated
+    # command-only TraderLink (never shared with the read/feed links).
+    assert isinstance(gateway._link._lock, type(threading.Lock()))

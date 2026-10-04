@@ -66,10 +66,33 @@
     return (view.sequence || 0) >= (appliedSequence || 0);
   }
 
+  /* Account mode ("paper"/"live"/null) off a broker-account row. The wire
+   * contract uses `account_mode` (BrokerAccountRow.to_payload); older
+   * fixtures/docs used `mode` — accept both so the LIVE/paper fork is never
+   * silently UNKNOWN when the row is present. Shared by the render side
+   * (status badge) and the command side (live-ceremony gating), so it lives
+   * here in the one DOM-free seam rather than being declared in both. */
+  function ccAccountModeValue(account) {
+    if (!account) return null;
+    const raw = account.account_mode || account.mode;
+    if (raw == null || raw === '') return null;
+    return String(raw).toLowerCase();
+  }
+
+  /* Canonical display/identity name for a strategy row. Shared by the
+   * Strategies render and by every strategy command (enable/disable/params),
+   * so it belongs in the shared seam, not duplicated per caller. */
+  function ccStrategyName(strategy) {
+    if (!strategy) return undefined;
+    return strategy.name || strategy.strategy_name || strategy.entity_id;
+  }
+
   return {
     ccServerClockOffsetMs,
     ccQuoteAgeSeconds,
     ccIsDegraded,
     ccSnapshotSupersedes,
+    ccAccountModeValue,
+    ccStrategyName,
   };
 }));

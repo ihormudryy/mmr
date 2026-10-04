@@ -3,92 +3,1614 @@
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>MMR Command Center</title>
+  <title>MMR Dashboard</title>
+  <!-- Theme boot must run before first paint so a stored dark preference
+       doesn't flash light; the strict CSP (script-src 'self') forbids
+       inline scripts, hence a tiny synchronous external file. -->
+  <script src="/static/cc_theme.js"></script>
+  <link rel="stylesheet" href="/static/command_center_research.css">
   <style>
-    :root { --bg:#0e1116; --panel:#171b22; --border:#262c36; --fg:#d7dce3;
-      --dim:#7d8794; --pos:#3fb950; --neg:#f85149; --accent:#58a6ff;
-      --warn:#d29922; --chip:#21262d; }
+    /* Archivo is self-hosted: the strict CSP (style-src/font-src 'self')
+       blocks Google Fonts, and the dashboard must work without internet. */
+    @font-face {
+      font-family: "Archivo";
+      font-style: normal;
+      font-weight: 400 800;
+      font-display: swap;
+      src: url(/static/fonts/archivo-latin-var.woff2) format("woff2");
+    }
+    /* Modernist (claude.ai/design "Dashboard Redesign", direction 1c):
+       Archivo throughout, a visible modular grid drawn with 2px rules, zero
+       corner radius, light ground, red reserved for the primary action and
+       true risk. Gains read green, losses/danger read the accent red,
+       numbers are tabular. */
+    :root {
+      --bg: #f3f2f2;
+      --panel: #f3f2f2;
+      --panel-2: #eae9e9;
+      --border: color-mix(in srgb, #201e1d 40%, transparent);
+      --border-soft: color-mix(in srgb, #201e1d 18%, transparent);
+      --fg: #201e1d;
+      --dim: color-mix(in srgb, #201e1d 55%, transparent);
+      --pos: #177a3b;
+      --neg: #ec3013;
+      --accent: #ec3013;
+      --accent-deep: #ae1800;
+      --warn: #b06f00;
+      --chip: #eae9e9;
+      --font-heading: "Archivo", system-ui, sans-serif;
+      --font-body: "Archivo", system-ui, sans-serif;
+      --space-1: 4px;
+      --space-2: 8px;
+      --space-3: 12px;
+      --space-4: 16px;
+      --space-5: 20px;
+      --space-6: 24px;
+      --radius: 0px;
+      --radius-lg: 0px;
+      --shadow-lg: 0 12px 32px color-mix(in srgb, #2d2b2b 22%, transparent);
+      color-scheme: light;
+    }
+    /* Dark theme — design direction 1b: the same modular grid on a warm
+       dark ground for long sessions. Toggled by cc_theme.js via
+       data-theme on <html>, persisted in localStorage. */
+    :root[data-theme="dark"] {
+      --bg: #1b1917;
+      --panel: #1b1917;
+      --panel-2: #242120;
+      --border: color-mix(in srgb, #f4f1ef 24%, transparent);
+      --border-soft: color-mix(in srgb, #f4f1ef 12%, transparent);
+      --fg: #f4f1ef;
+      --dim: color-mix(in srgb, #f4f1ef 55%, transparent);
+      --pos: #54c07a;
+      --neg: #ff5a3d;
+      --accent: #ff5a3d;
+      --accent-deep: #ff9783;
+      --warn: #e0a53a;
+      --chip: #242120;
+      --shadow-lg: 0 12px 32px rgba(0, 0, 0, .55);
+      color-scheme: dark;
+    }
     * { box-sizing: border-box; }
-    body { margin:0; background:var(--bg); color:var(--fg);
-      font:14px/1.45 -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif; }
-    #degraded-banner { padding:10px 24px; background:rgba(210,153,34,.15);
-      color:var(--warn); border-bottom:1px solid var(--border); font-weight:600; }
-    #status-bar { display:flex; gap:16px; align-items:center; flex-wrap:wrap;
-      padding:12px 24px; background:var(--panel); border-bottom:1px solid var(--border); }
-    .badge { padding:2px 10px; border-radius:999px; font-weight:700; font-size:12px;
-      background:var(--chip); }
-    .badge.live { background:rgba(248,81,73,.2); color:var(--neg); }
-    .badge.paper { background:rgba(88,166,255,.2); color:var(--accent); }
-    #dependency-chips { display:flex; gap:8px; flex-wrap:wrap; }
-    .chip { padding:2px 8px; border-radius:999px; font-size:11px; font-weight:600;
-      background:var(--chip); color:var(--dim); }
-    .chip[data-state="ok"] { background:rgba(63,185,80,.15); color:var(--pos); }
-    .chip[data-state="error"], .chip[data-state="unknown"] {
-      background:rgba(248,81,73,.15); color:var(--neg); }
-    #last-event-time { margin-left:auto; color:var(--dim); font-size:12px; }
-    #account-cards { display:grid; grid-template-columns:repeat(auto-fit, minmax(170px,1fr));
-      gap:14px; padding:16px 24px; }
-    .card { background:var(--panel); border:1px solid var(--border); border-radius:10px;
-      padding:12px 16px; }
-    .card .k { color:var(--dim); font-size:11px; text-transform:uppercase; letter-spacing:.5px; }
-    .card .v { font-size:20px; font-weight:700; font-variant-numeric:tabular-nums; }
-    main.grid { display:grid; gap:18px; padding:0 24px 24px;
-      grid-template-columns:minmax(0, 3fr) minmax(280px, 1fr); }
-    section, aside { background:var(--panel); border:1px solid var(--border);
-      border-radius:10px; overflow:hidden; }
-    section > h2, aside > h2 { margin:0; padding:11px 16px; font-size:12px;
-      text-transform:uppercase; letter-spacing:.6px; color:var(--dim);
-      border-bottom:1px solid var(--border); }
-    #positions-panel { grid-column:1; grid-row:1 / span 2; }
-    #action-rail { grid-column:2; grid-row:1 / span 2; }
-    .lower { grid-column:1 / -1; display:grid; gap:18px;
-      grid-template-columns:repeat(auto-fit, minmax(320px, 1fr)); }
-    table { width:100%; border-collapse:collapse; }
-    th, td { padding:7px 14px; text-align:right; white-space:nowrap; font-size:13px; }
-    th:first-child, td:first-child { text-align:left; }
-    thead th { color:var(--dim); font-weight:500; font-size:11px;
-      border-bottom:1px solid var(--border); }
-    tbody tr { border-top:1px solid var(--border); }
-    .pos { color:var(--pos); } .neg { color:var(--neg); } .dim { color:var(--dim); }
-    .num { font-variant-numeric:tabular-nums; }
-    .age { font-size:11px; color:var(--dim); }
-    tr.stale .age::before, .stale-marker::before { content:"⚠ "; color:var(--warn); }
-    .proposal-card { border-bottom:1px solid var(--border); padding:12px 16px; }
-    .proposal-card:focus { outline:2px solid var(--accent); outline-offset:-2px; }
-    #risk-body { padding:14px 16px; }
-    #risk-body[data-state="unavailable"] { color:var(--warn); }
-    #risk-body[data-state="warning"] { color:var(--neg); }
-    .order-group { border-bottom:1px solid var(--border); }
-    .order-group .group-head { padding:8px 16px; font-weight:600; }
-    .order-group .leg { padding:4px 16px 4px 32px; font-size:12px; color:var(--dim);
-      display:flex; justify-content:space-between; }
-    #drawer { position:fixed; inset:0; background:rgba(0,0,0,.6); z-index:50;
-      display:flex; align-items:flex-start; justify-content:center; padding:6vh 16px; }
-    #drawer[hidden] { display:none; }
-    #drawer-box { background:var(--panel); border:1px solid var(--border);
-      border-radius:10px; width:min(720px,100%); max-height:82vh; overflow:auto; }
-    #drawer-close { float:right; margin:8px; background:transparent; border:none;
-      color:var(--dim); font-size:18px; cursor:pointer; }
-    #drawer-content { padding:8px 20px 20px; }
+    body {
+      margin: 0;
+      background: var(--bg);
+      color: var(--fg);
+      font: 14px/1.5 var(--font-body);
+    }
+    a { color: var(--accent); text-underline-offset: 3px; }
+    :focus { outline: none; }
+    :focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
+    ::selection { background: color-mix(in srgb, var(--accent) 30%, transparent); }
+    code {
+      font-size: 12px;
+      background: var(--chip);
+      border: 1px solid var(--border-soft);
+      border-radius: var(--radius);
+      padding: 1px 5px;
+    }
+
+    /* —— chrome —— */
+    #degraded-banner {
+      padding: 10px var(--space-6);
+      background: color-mix(in srgb, var(--warn) 12%, transparent);
+      color: var(--warn);
+      border-bottom: 2px solid var(--border);
+      font-weight: 700;
+    }
+    .badge {
+      font: 800 10px/1 var(--font-heading);
+      letter-spacing: .12em;
+      text-transform: uppercase;
+      padding: 6px 10px;
+      border: 1px solid var(--accent);
+      color: var(--accent);
+      border-radius: var(--radius);
+    }
+    .badge.live { background: var(--accent); color: var(--bg); }
+    .badge.paper { background: transparent; color: var(--accent); }
+    #dependency-chips { display: flex; gap: 6px; flex-wrap: wrap; }
+    .chip {
+      display: inline-flex;
+      align-items: center;
+      gap: 6px;
+      padding: 5px 9px;
+      border: 1px solid var(--border-soft);
+      border-radius: var(--radius);
+      font-size: 11px;
+      font-weight: 600;
+      color: color-mix(in srgb, var(--fg) 70%, transparent);
+      line-height: 1.2;
+      vertical-align: middle;
+    }
+    .chip::before {
+      content: "";
+      width: 6px;
+      height: 6px;
+      flex: none;
+      background: color-mix(in srgb, var(--fg) 40%, transparent);
+    }
+    .chip.on, .chip[data-state="ok"] { color: var(--fg); }
+    .chip.on::before, .chip[data-state="ok"]::before { background: var(--pos); }
+    .chip.off { color: var(--dim); }
+    .chip.err, .chip[data-state="error"], .chip[data-state="unknown"] {
+      color: var(--neg);
+      border-color: color-mix(in srgb, var(--neg) 45%, transparent);
+    }
+    .chip.err::before, .chip[data-state="error"]::before,
+    .chip[data-state="unknown"]::before { background: var(--neg); }
+    /* Count chips inside tabs carry no health dot. */
+    .dash-tab .chip { border: 0; padding: 3px 6px; background: color-mix(in srgb, var(--fg) 9%, transparent); font-weight: 700; font-size: 10px; color: var(--fg); }
+    .dash-tab .chip::before { display: none; }
+    .dash-tab.active .chip { background: var(--accent); color: var(--bg); }
+    #last-event-time { margin-left: auto; color: var(--dim); font-size: 12px; align-self: center; }
+    #theme-toggle {
+      align-self: center;
+      margin: 0 0 0 var(--space-4);
+      min-width: 58px;
+    }
+    .flash {
+      display: flex;
+      align-items: flex-start;
+      gap: var(--space-3);
+      padding: 10px var(--space-6);
+      background: color-mix(in srgb, var(--fg) 6%, transparent);
+      color: var(--fg);
+      border-bottom: 1px solid var(--border);
+    }
+    /* `.flash { display:flex }` and `#degraded-banner` padding rules otherwise
+       beat the UA `[hidden] { display:none }` and leave boot/flash banners
+       stuck on screen after JS sets `.hidden = true`. */
+    #boot-banner[hidden],
+    #degraded-banner[hidden],
+    .flash[hidden] {
+      display: none !important;
+    }
+    .flash > .flash-msg { flex: 1 1 auto; min-width: 0; }
+    .flash > .flash-dismiss {
+      flex: 0 0 auto;
+      margin: -2px -8px -2px 0;
+      padding: 2px 10px;
+      border: none;
+      background: transparent;
+      color: inherit;
+      font: inherit;
+      font-size: 18px;
+      line-height: 1.2;
+      cursor: pointer;
+      opacity: 0.7;
+    }
+    .flash > .flash-dismiss:hover,
+    .flash > .flash-dismiss:focus-visible {
+      opacity: 1;
+      outline: 1px solid var(--border);
+    }
+    .flash.err {
+      background: color-mix(in srgb, var(--neg) 10%, transparent);
+      color: var(--neg);
+    }
+
+    /* —— tabs —— */
+    .dash-tabs {
+      display: flex;
+      padding: 0 var(--space-6) 0 0;
+      background: var(--bg);
+      border-bottom: 2px solid var(--border);
+      position: relative;
+      z-index: 20;
+    }
+    .dash-tab {
+      background: transparent;
+      border: none;
+      border-right: 1px solid var(--border-soft);
+      font: 800 12px/1 var(--font-heading);
+      letter-spacing: .05em;
+      text-transform: uppercase;
+      color: var(--dim);
+      padding: 14px 18px;
+      cursor: pointer;
+      display: inline-flex;
+      align-items: center;
+      gap: var(--space-2);
+      border-radius: 0;
+    }
+    .dash-tab:hover { color: var(--fg); background: color-mix(in srgb, var(--fg) 4%, transparent); }
+    .dash-tab.active {
+      color: var(--fg);
+      box-shadow: inset 0 -3px 0 var(--accent);
+    }
+    .dash-pane { display: none; }
+    .dash-pane.active { display: block; }
+
+    /* —— command band (status + net-liq + day P&L + actions) —— */
+    #status-bar {
+      display: flex;
+      align-items: stretch;
+      gap: var(--space-6);
+      flex-wrap: wrap;
+      padding: 16px var(--space-6);
+      background: var(--bg);
+      border-bottom: 2px solid var(--border);
+    }
+    /* LIVE-mode red command band (design 1c error-prevention layer): a real
+       account (mode=live) tints the whole band and adds a red inset spine so
+       the operator can never mistake a live book for paper. Toggled by
+       renderStatusBar() adding .live to #status-bar. */
+    #status-bar.live {
+      background: color-mix(in srgb, var(--neg) 12%, transparent);
+      box-shadow: inset 5px 0 0 var(--neg);
+    }
+    /* Strategy-error alert banner */
+    #strategy-alert {
+      display: flex;
+      align-items: center;
+      gap: 12px;
+      padding: 11px var(--space-6);
+      background: color-mix(in srgb, var(--neg) 12%, transparent);
+      border-bottom: 2px solid var(--neg);
+      font-size: 13.5px;
+      color: var(--fg);
+    }
+    #strategy-alert[hidden] { display: none; }
+    #strategy-alert .sa-badge {
+      font: 800 10.5px/1 var(--font-heading);
+      letter-spacing: .06em;
+      text-transform: uppercase;
+      background: var(--neg);
+      color: #fff;
+      padding: 5px 8px;
+      white-space: nowrap;
+    }
+    #strategy-alert .sa-link {
+      margin-left: auto;
+      background: transparent;
+      border: none;
+      color: var(--neg);
+      font: 800 13px/1 var(--font-heading);
+      letter-spacing: .02em;
+      text-transform: none;
+      cursor: pointer;
+      white-space: nowrap;
+      padding: 4px 2px;
+    }
+    #strategy-alert .sa-link:hover { text-decoration: underline; color: var(--neg); }
+    #band-identity { display: flex; flex-direction: column; gap: var(--space-3); justify-content: center; }
+    #band-identity .band-id-row { display: flex; align-items: center; gap: var(--space-3); }
+    #account-id {
+      font: 800 13px/1 var(--font-heading);
+      letter-spacing: .02em;
+    }
+    .band-cell {
+      border-left: 2px solid var(--border);
+      padding-left: var(--space-6);
+      display: flex;
+      flex-direction: column;
+      justify-content: center;
+      gap: 6px;
+    }
+    .band-k {
+      font: 800 10px/1 var(--font-heading);
+      letter-spacing: .14em;
+      text-transform: uppercase;
+      color: var(--accent);
+    }
+    .band-v {
+      font: 800 30px/1 var(--font-heading);
+      letter-spacing: -.02em;
+      font-variant-numeric: tabular-nums;
+    }
+    #band-actions {
+      margin-left: auto;
+      display: flex;
+      gap: 10px;
+      align-items: center;
+      flex-wrap: wrap;
+    }
+
+    /* —— quick stats row —— */
+    #quick-stats {
+      display: flex;
+      gap: 8px 28px;
+      flex-wrap: wrap;
+      padding: 14px var(--space-6);
+      border-bottom: 2px solid var(--border);
+    }
+    #quick-stats .q .k {
+      font-size: 10px;
+      font-weight: 700;
+      letter-spacing: .06em;
+      text-transform: uppercase;
+      color: var(--dim);
+    }
+    #quick-stats .q .v {
+      font: 800 20px/1 var(--font-heading);
+      margin-top: 6px;
+      font-variant-numeric: tabular-nums;
+    }
+
+    /* —— sections (modular grid: rules, not floating cards) —— */
+    section, aside {
+      background: var(--bg);
+      border: 1px solid var(--border);
+      border-radius: var(--radius-lg);
+      overflow: hidden;
+    }
+    #dash-trading section, #dash-trading aside { border: 0; overflow: visible; }
+    section > h2, aside > h2 {
+      margin: 0;
+      padding: var(--space-3) var(--space-4);
+      font: 800 11px/1.2 var(--font-heading);
+      text-transform: uppercase;
+      letter-spacing: .1em;
+      color: color-mix(in srgb, var(--fg) 60%, transparent);
+      border-bottom: 2px solid var(--border);
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+      gap: var(--space-3);
+      flex-wrap: wrap;
+    }
+    section > h3 {
+      margin: 0;
+      padding: var(--space-3) var(--space-4) var(--space-2);
+      font: 800 11px/1.2 var(--font-heading);
+      text-transform: uppercase;
+      letter-spacing: .1em;
+      color: color-mix(in srgb, var(--fg) 60%, transparent);
+    }
+    #action-rail { border-bottom: 2px solid var(--border); }
+    #positions-panel { border-bottom: 2px solid var(--border); }
+    .lower {
+      display: grid;
+      grid-template-columns: minmax(0, 1fr) minmax(0, 1fr);
+    }
+    .lower section { border-bottom: 2px solid var(--border); overflow-x: auto; }
+    td.err-note { white-space: normal; min-width: 150px; max-width: 260px; text-align: left; }
+    .lower section:nth-of-type(odd) { border-right: 2px solid var(--border); }
+
+    /* —— tables —— */
+    table { width: 100%; border-collapse: collapse; font-variant-numeric: tabular-nums; }
+    th, td {
+      padding: 8px var(--space-4);
+      text-align: right;
+      white-space: nowrap;
+      font-size: 12.5px;
+      vertical-align: middle;
+    }
+    th:first-child, td:first-child { text-align: left; }
+    thead th {
+      font: 800 10px/1 var(--font-heading);
+      letter-spacing: .08em;
+      text-transform: uppercase;
+      color: var(--dim);
+      border-bottom: 2px solid var(--border);
+      padding-top: 9px;
+      padding-bottom: 9px;
+    }
+    tbody tr { border-top: 1px solid var(--border-soft); }
+    tbody tr:first-child { border-top: none; }
+    tbody tr:hover { background: color-mix(in srgb, var(--fg) 4%, transparent); }
+    .pos { color: var(--pos); font-weight: 600; }
+    .neg { color: var(--neg); font-weight: 600; }
+    .dim { color: var(--dim); }
+    .num { font-variant-numeric: tabular-nums; }
+    .age { font-size: 11px; color: var(--dim); }
+    tr.stale .age, .stale-marker { color: var(--warn); font-weight: 600; }
+    tr.stale .age::before, .stale-marker::before { content: "⚠ "; color: var(--warn); }
+    /* Stale-data signal elevated (design 1c error-prevention layer): a red
+       row tint + red inset border, not just the ⚠ on the age cell. */
+    tr.stale td { background: color-mix(in srgb, var(--neg) 8%, transparent); }
+    tr.stale td:first-child { box-shadow: inset 4px 0 0 var(--neg); }
+    td.sym { font-weight: 800; text-align: left; }
+    td.wrap, th.wrap {
+      white-space: normal;
+      max-width: 340px;
+      text-align: left;
+    }
+    td.wrap-wide { white-space: normal; max-width: 520px; text-align: left; }
+
+    /* —— buttons (shared) —— */
+    button, .btn {
+      font: 800 10px/1.3 var(--font-heading);
+      letter-spacing: .05em;
+      text-transform: uppercase;
+      border: 1px solid var(--border);
+      border-radius: var(--radius);
+      cursor: pointer;
+      padding: 6px 10px;
+      background: transparent;
+      color: var(--fg);
+    }
+    button:hover:not(:disabled), .btn:hover:not(:disabled) {
+      border-color: var(--accent);
+      color: var(--accent);
+    }
+    button:disabled { opacity: .45; cursor: not-allowed; }
+    button.reject, .btn.reject {
+      color: var(--neg);
+      border-color: color-mix(in srgb, var(--neg) 45%, transparent);
+    }
+    button.reject:hover:not(:disabled), .btn.reject:hover:not(:disabled) {
+      background: color-mix(in srgb, var(--neg) 10%, transparent);
+      color: var(--neg);
+      border-color: color-mix(in srgb, var(--neg) 45%, transparent);
+    }
+    button.primary, .btn.primary {
+      background: var(--accent);
+      border-color: var(--accent);
+      color: var(--bg);
+    }
+    button.primary:hover:not(:disabled), .btn.primary:hover:not(:disabled) {
+      background: var(--accent-deep);
+      border-color: var(--accent-deep);
+      color: var(--bg);
+    }
+    button.unfold { padding: 4px 9px; }
+    /* Native file picker — style the system "Choose file" control to match. */
+    input[type="file"] {
+      font: inherit;
+      font-size: 12.5px;
+      color: var(--dim);
+      max-width: 320px;
+      border: none;
+      background: transparent;
+      padding: 0;
+      cursor: pointer;
+    }
+    input[type="file"]::file-selector-button {
+      font: 800 10px/1.3 var(--font-heading);
+      letter-spacing: .05em;
+      text-transform: uppercase;
+      border: 1px solid var(--border);
+      border-radius: var(--radius);
+      cursor: pointer;
+      padding: 6px 10px;
+      margin-right: 10px;
+      background: transparent;
+      color: var(--fg);
+    }
+    input[type="file"]::file-selector-button:hover {
+      border-color: var(--accent);
+      color: var(--accent);
+    }
+    section > h2 button, aside > h2 button { margin-left: auto; }
+    .h-meta {
+      margin-left: auto;
+      font: 600 11px/1.2 var(--font-body);
+      letter-spacing: 0;
+      text-transform: none;
+      color: var(--dim);
+      font-variant-numeric: tabular-nums;
+    }
+
+    /* —— trading specifics —— */
+    /* Action queue as a 3-up strip (cockpit): approving proposals is the
+       riskiest job, so it sits directly under the command band. */
+    #proposal-cards {
+      display: grid;
+      grid-template-columns: repeat(auto-fit, minmax(300px, 1fr));
+    }
+    .proposal-card {
+      border-right: 1px solid var(--border-soft);
+      border-bottom: 1px solid var(--border-soft);
+      padding: 14px var(--space-4);
+      cursor: pointer;
+    }
+    .proposal-card:hover { background: color-mix(in srgb, var(--fg) 4%, transparent); }
+    .proposal-card:focus {
+      outline: 2px solid var(--accent);
+      outline-offset: -2px;
+    }
+    .prop-top { display: flex; align-items: baseline; gap: 10px; }
+    .prop-sym { font: 800 16px/1 var(--font-heading); letter-spacing: -.01em; }
+    .prop-age { margin-left: auto; font-size: 11px; color: var(--dim); white-space: nowrap; }
+    .side {
+      font: 800 10px/1 var(--font-heading);
+      letter-spacing: .08em;
+      padding: 4px 7px;
+      border: 1px solid var(--border);
+      color: color-mix(in srgb, var(--fg) 70%, transparent);
+    }
+    .side.buy { border-color: var(--pos); color: var(--pos); }
+    .side.sell { border-color: var(--neg); color: var(--neg); }
+    .prop-meta {
+      font-size: 11.5px;
+      color: color-mix(in srgb, var(--fg) 60%, transparent);
+      margin-top: 8px;
+      display: flex;
+      gap: 4px 14px;
+      flex-wrap: wrap;
+    }
+    .prop-meta b { color: var(--fg); font-weight: 700; }
+    .prop-thesis { font-size: 12.5px; margin-top: 10px; line-height: 1.5; text-wrap: pretty; }
+    .prop-actions { display: flex; gap: 8px; margin-top: 12px; }
+    .proposal-filter {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 6px;
+      margin: 0;
+      padding: 10px var(--space-4);
+      border-bottom: 1px solid var(--border-soft);
+    }
+    .proposal-filter button {
+      font: 700 11px/1 var(--font-body);
+      letter-spacing: 0;
+      text-transform: none;
+      border: 1px solid var(--border-soft);
+      border-radius: var(--radius);
+      cursor: pointer;
+      padding: 6px 10px;
+      background: transparent;
+      color: var(--dim);
+    }
+    .proposal-filter button.active {
+      border-color: var(--accent);
+      color: var(--accent);
+      font-weight: 800;
+    }
+    #risk-body { padding: 14px var(--space-4); font-size: 12.5px; }
+    #risk-body[data-state="unavailable"] { color: var(--warn); }
+    #risk-body[data-state="warning"] { color: var(--neg); }
+    .order-group { border-bottom: 1px solid var(--border-soft); }
+    .order-group .group-head {
+      padding: 9px var(--space-4);
+      font: 800 12px/1.3 var(--font-heading);
+      display: flex;
+      align-items: center;
+      gap: 10px;
+    }
+    .order-group .group-head .n {
+      margin-left: auto;
+      font: 600 11px/1.3 var(--font-body);
+      color: var(--dim);
+      font-variant-numeric: tabular-nums;
+    }
+    .order-group .leg {
+      padding: 7px var(--space-4) 7px var(--space-6);
+      font-size: 12px;
+      color: color-mix(in srgb, var(--fg) 75%, transparent);
+      display: flex;
+      gap: 10px;
+      align-items: center;
+      border-top: 1px solid var(--border-soft);
+    }
+    .order-group .leg .leg-r {
+      margin-left: auto;
+      display: inline-flex;
+      gap: 8px;
+      align-items: center;
+      text-align: right;
+    }
+    .kind {
+      font: 800 9px/1 var(--font-heading);
+      letter-spacing: .08em;
+      padding: 3px 6px;
+      border: 1px solid var(--border-soft);
+      color: var(--dim);
+      flex: none;
+    }
+    .kind.entry { color: var(--pos); border-color: currentColor; }
+    .kind.prot { color: var(--warn); border-color: currentColor; }
+    /* Strategy state chips + enabled dots (rendered by command_center.js). */
+    .state-chip {
+      font-size: 10px;
+      font-weight: 700;
+      padding: 4px 8px;
+      border: 1px solid var(--border-soft);
+      white-space: nowrap;
+      color: var(--dim);
+    }
+    .state-chip.run { color: var(--pos); border-color: currentColor; }
+    .state-chip.err { color: var(--neg); border-color: currentColor; }
+    .dotstate { display: inline-flex; align-items: center; gap: 6px; }
+    .dotstate .d { width: 7px; height: 7px; flex: none; background: color-mix(in srgb, var(--fg) 40%, transparent); }
+    .dotstate.on .d { background: var(--pos); }
+
+    /* —— drawer (detail) —— */
+    #drawer {
+      position: fixed;
+      inset: 0;
+      background: color-mix(in srgb, #2d2b2b 50%, transparent);
+      z-index: 50;
+      display: flex;
+      align-items: flex-start;
+      justify-content: center;
+      padding: 6vh var(--space-4);
+    }
+    #drawer[hidden] { display: none !important; pointer-events: none; }
+    #drawer-box {
+      background: var(--bg);
+      border: 1px solid var(--border);
+      border-radius: var(--radius-lg);
+      box-shadow: var(--shadow-lg);
+      width: min(720px, 100%);
+      max-height: 82vh;
+      overflow: auto;
+    }
+    #drawer-box h3, #drawer-box h4 { font-family: var(--font-heading); font-weight: 800; letter-spacing: -.01em; }
+    #drawer-close {
+      float: right;
+      margin: var(--space-2);
+      background: transparent;
+      border: none;
+      color: var(--dim);
+      font-size: 18px;
+      cursor: pointer;
+      padding: var(--space-2);
+    }
+    #drawer-content { padding: var(--space-2) var(--space-5) var(--space-5); }
+
+    .dash-admin-pane td.wl-actions {
+      white-space: normal;
+    }
+    .dash-admin-pane td.wl-actions .param-form.inline {
+      display: inline-flex;
+      margin-right: 6px;
+      margin-bottom: 4px;
+    }
+    .cc-resolve-row {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 8px;
+      align-items: flex-end;
+      width: 100%;
+      margin-bottom: 8px;
+    }
+    .cc-resolve-row label { flex: 1 1 90px; margin: 0; }
+    .cc-resolve-status {
+      color: var(--dim);
+      font-size: 12px;
+      margin: 0 0 10px;
+      width: 100%;
+    }
+    .cc-resolve-status.ok { color: var(--pos); }
+    .cc-resolve-status.err { color: var(--neg); }
+
+    /* —— admin panes (Deploy / Watchlists) —— */
+    .dash-admin-pane { padding: 0 0 var(--space-6); }
+    .dash-admin-pane .dash-admin-body {
+      display: grid;
+      padding: var(--space-5) var(--space-6);
+      gap: var(--space-5);
+      grid-template-columns: repeat(auto-fit, minmax(440px, 1fr));
+    }
+    .dash-admin-pane section.full { grid-column: 1 / -1; }
+    .dash-admin-pane .banner {
+      display: flex;
+      align-items: flex-start;
+      gap: var(--space-3);
+      padding: 10px var(--space-4);
+      margin: 0;
+      font-size: 13px;
+      border-bottom: 1px solid var(--border);
+    }
+    .dash-admin-pane .banner .flash-msg { flex: 1 1 auto; min-width: 0; }
+    .dash-admin-pane .banner .flash-dismiss {
+      flex: 0 0 auto;
+      margin: -2px -6px -2px 0;
+      padding: 2px 8px;
+      border: none;
+      background: transparent;
+      color: inherit;
+      font: inherit;
+      font-size: 16px;
+      line-height: 1.2;
+      cursor: pointer;
+      opacity: 0.7;
+    }
+    .dash-admin-pane .banner .flash-dismiss:hover,
+    .dash-admin-pane .banner .flash-dismiss:focus-visible {
+      opacity: 1;
+      outline: 1px solid var(--border);
+    }
+    .dash-admin-pane .banner.err {
+      color: var(--neg);
+      background: color-mix(in srgb, var(--neg) 8%, transparent);
+    }
+    .dash-admin-pane .banner.ok {
+      color: var(--pos);
+      background: color-mix(in srgb, var(--pos) 8%, transparent);
+    }
+    .dash-admin-pane .note {
+      padding: 10px var(--space-4);
+      margin: 0;
+      color: var(--dim);
+      font-size: 12.5px;
+      border-bottom: 1px solid var(--border-soft);
+      line-height: 1.5;
+    }
+    .dash-admin-pane .toolbar {
+      padding: 10px var(--space-4);
+      border-bottom: 1px solid var(--border-soft);
+    }
+    .dash-admin-pane .empty {
+      padding: var(--space-4);
+      margin: 0;
+      color: var(--dim);
+    }
+    .dash-admin-pane .setup-foot {
+      padding: var(--space-2) var(--space-6);
+      margin: 0;
+      color: var(--dim);
+      font-size: 11px;
+    }
+    #dash-trading .info,
+    #dash-scaling .info,
+    #dash-guide .info,
+    .dash-admin-pane .info,
+    .cc-drawer .info {
+      position: relative;
+      display: inline-flex;
+      align-items: center;
+      justify-content: center;
+      margin-left: 6px;
+      color: var(--dim);
+      cursor: help;
+      font-size: 10px;
+      font-weight: 600;
+      font-style: normal;
+      letter-spacing: 0;
+      text-transform: none;
+      border: 1px solid var(--border-soft);
+      width: 15px;
+      height: 15px;
+      line-height: 1;
+      vertical-align: middle;
+      flex-shrink: 0;
+    }
+    #dash-trading .info:hover,
+    #dash-trading .info:focus,
+    #dash-trading .info.tip-open,
+    #dash-scaling .info:hover,
+    #dash-scaling .info:focus,
+    #dash-scaling .info.tip-open,
+    #dash-guide .info:hover,
+    #dash-guide .info:focus,
+    #dash-guide .info.tip-open,
+    .dash-admin-pane .info:hover,
+    .dash-admin-pane .info:focus,
+    .dash-admin-pane .info.tip-open,
+    .cc-drawer .info:hover,
+    .cc-drawer .info:focus,
+    .cc-drawer .info.tip-open {
+      color: var(--accent);
+      border-color: var(--accent);
+      outline: none;
+    }
+    #dash-trading .tip,
+    #dash-scaling .tip,
+    #dash-guide .tip,
+    .dash-admin-pane .tip,
+    .cc-drawer .tip {
+      display: none;
+      position: fixed;
+      z-index: 60;
+      width: max-content;
+      max-width: 300px;
+      white-space: normal;
+      background: var(--bg);
+      border: 1px solid var(--border);
+      border-radius: var(--radius);
+      padding: var(--space-2) 11px;
+      color: var(--fg);
+      font-size: 12px;
+      font-weight: 400;
+      font-family: var(--font-body);
+      text-align: left;
+      letter-spacing: normal;
+      text-transform: none;
+      line-height: 1.5;
+      box-shadow: var(--shadow-lg);
+      pointer-events: none;
+    }
+    .dash-admin-pane .hover-tip { cursor: help; }
+    .dash-admin-pane .strat-config-name {
+      color: var(--dim);
+      font-size: 11px;
+      font-weight: 400;
+      margin-top: 2px;
+    }
+    .dash-admin-pane tr.param-row > td {
+      background: var(--panel-2);
+      padding: var(--space-3) var(--space-4);
+      text-align: left;
+      white-space: normal;
+    }
+    .dash-admin-pane .param-stack {
+      display: flex;
+      flex-direction: column;
+      gap: var(--space-2);
+    }
+    .param-form {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 10px;
+      align-items: center;
+    }
+    .param-form.inline { display: inline-flex; }
+    .param-form label {
+      display: flex;
+      gap: 6px;
+      align-items: center;
+      color: var(--dim);
+      font-size: 12px;
+    }
+    .param-form input,
+    .param-form select,
+    .param-form textarea {
+      background: var(--panel-2);
+      border: 1px solid var(--border);
+      color: var(--fg);
+      border-radius: var(--radius);
+      padding: 5px 8px;
+      font: inherit;
+      font-size: 12.5px;
+      caret-color: var(--accent);
+    }
+    .param-form input[type="file"] {
+      max-width: 320px;
+      padding: 0;
+      background: transparent;
+      border: none;
+    }
+    .param-form input[type="file"]::file-selector-button {
+      background: var(--accent);
+      border-color: var(--accent);
+      color: var(--bg);
+    }
+    .param-form input[type="file"]::file-selector-button:hover {
+      background: var(--accent-deep);
+      border-color: var(--accent-deep);
+      color: var(--bg);
+    }
+    .param-form input[type="checkbox"] {
+      width: auto;
+      padding: 0;
+      accent-color: var(--accent);
+    }
+    .param-form input.w-name { width: 130px; }
+    .param-form input.w-symbols { width: 150px; }
+    .param-form input.w-sm { width: 80px; }
+    .param-form input.w-xs { width: 56px; }
+    .param-form input.w-days { width: 56px; }
+    .param-form button.primary,
+    .param-form button[type="submit"]:not(.reject) {
+      background: var(--accent);
+      border-color: var(--accent);
+      color: var(--bg);
+    }
+    .param-hint { color: var(--dim); font-size: 11px; }
+    .dash-admin-pane button.wl-name-toggle {
+      background: none;
+      border: none;
+      color: var(--fg);
+      font: inherit;
+      font-weight: 800;
+      letter-spacing: 0;
+      text-transform: none;
+      cursor: pointer;
+      padding: 0;
+      text-align: left;
+    }
+    .dash-admin-pane button.wl-name-toggle:hover {
+      color: var(--accent);
+      border-color: transparent;
+    }
+    .dash-admin-pane .wl-members-head {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 8px 10px;
+      align-items: center;
+      width: 100%;
+    }
+    .dash-admin-pane .wl-members-head button.reject {
+      color: var(--neg);
+    }
+    .dash-admin-pane .wl-member-list {
+      display: grid;
+      grid-template-columns: repeat(auto-fill, minmax(110px, 1fr));
+      gap: 6px 10px;
+      max-height: 260px;
+      overflow-y: auto;
+      width: 100%;
+      margin-top: 4px;
+      padding: 10px;
+      border: 1px solid var(--border);
+      border-radius: var(--radius);
+      background: var(--bg);
+      text-align: left;
+    }
+    .dash-admin-pane .wl-member-list label {
+      display: flex;
+      gap: 6px;
+      align-items: center;
+      color: var(--fg);
+      font-size: 12.5px;
+      cursor: pointer;
+    }
+    .dash-admin-pane .wl-member-list input[type="checkbox"] {
+      width: auto;
+      margin: 0;
+      accent-color: var(--accent);
+    }
+
+    /* —— scaling —— */
+    main.grid {
+      display: grid;
+      gap: 18px;
+      padding: 0 var(--space-6) var(--space-6);
+      grid-template-columns: 1fr;
+    }
+    #dash-scaling main.grid {
+      grid-template-columns: 1fr;
+      padding-top: var(--space-5);
+    }
+    #dash-scaling .scaling-status {
+      display: inline-block;
+      padding: 4px 8px;
+      border-radius: var(--radius);
+      border: 1px solid var(--border);
+      font-size: 11px;
+      font-weight: 700;
+      text-transform: none;
+      letter-spacing: normal;
+    }
+    #dash-scaling .scaling-status[data-lifecycle="active"] {
+      color: var(--pos); border-color: currentColor;
+    }
+    #dash-scaling .scaling-status[data-lifecycle="authorized"] {
+      color: var(--fg); border-color: var(--fg);
+    }
+    #dash-scaling .scaling-status[data-lifecycle="suspended"] {
+      color: var(--neg); border-color: currentColor;
+    }
+    #dash-scaling .scaling-status[data-lifecycle="inactive"],
+    #dash-scaling .scaling-status[data-lifecycle="unknown"] { color: var(--dim); }
+    #dash-scaling .scaling-cards {
+      display: grid;
+      gap: var(--space-3);
+      grid-template-columns: repeat(auto-fit, minmax(160px, 1fr));
+      margin: 0;
+      padding: var(--space-3) var(--space-4) var(--space-4);
+    }
+    #dash-scaling .scaling-card {
+      background: var(--panel-2);
+      border: 1px solid var(--border-soft);
+      border-radius: var(--radius);
+      padding: var(--space-3);
+    }
+    #dash-scaling .scaling-card .label {
+      color: var(--dim);
+      font-size: 10px;
+      font-weight: 700;
+      text-transform: uppercase;
+      letter-spacing: .06em;
+    }
+    #dash-scaling .scaling-card .value {
+      font: 800 18px/1.2 var(--font-heading);
+      margin-top: var(--space-1);
+      font-variant-numeric: tabular-nums;
+    }
+    #dash-scaling .scaling-note {
+      color: var(--dim);
+      font-size: 12.5px;
+      margin: 0;
+      padding: 0 var(--space-4) var(--space-3);
+      line-height: 1.5;
+    }
+    #dash-scaling .scaling-checklist {
+      list-style: none;
+      margin: 0 var(--space-4) var(--space-3);
+      padding: 0;
+      max-width: 720px;
+      display: grid;
+      gap: 6px;
+    }
+    #dash-scaling .scaling-checklist li {
+      display: flex;
+      gap: 8px;
+      align-items: flex-start;
+      font-size: 12.5px;
+      line-height: 1.45;
+      padding: 8px 10px;
+      border-radius: var(--radius);
+      border: 1px solid var(--border-soft);
+      background: transparent;
+    }
+    #dash-scaling .scaling-checklist li[data-state="ok"] {
+      border-color: color-mix(in srgb, var(--pos) 45%, transparent);
+    }
+    #dash-scaling .scaling-checklist li[data-state="blocked"] {
+      border-color: color-mix(in srgb, var(--neg) 45%, transparent);
+    }
+    #dash-scaling .scaling-checklist li[data-state="wait"] {
+      border-color: color-mix(in srgb, var(--warn) 45%, transparent);
+    }
+    #dash-scaling .scaling-checklist .mark {
+      flex: 0 0 auto;
+      font-weight: 700;
+      min-width: 1.1rem;
+    }
+    #dash-scaling .scaling-checklist li[data-state="ok"] .mark { color: var(--pos); }
+    #dash-scaling .scaling-checklist li[data-state="blocked"] .mark { color: var(--neg); }
+    #dash-scaling .scaling-checklist li[data-state="wait"] .mark { color: var(--warn); }
+    #dash-scaling .scaling-checklist code {
+      font-size: .92em;
+      padding: .05em .3em;
+    }
+    #dash-scaling .scaling-controls {
+      margin: var(--space-3) var(--space-4) var(--space-4);
+      padding: var(--space-3);
+      border: 1px solid var(--border);
+      border-radius: var(--radius);
+      display: flex;
+      flex-direction: column;
+      gap: var(--space-2);
+      max-width: 720px;
+    }
+    #dash-scaling .scaling-controls h3 {
+      margin: 0;
+      font: 800 13px/1.3 var(--font-heading);
+      letter-spacing: -.01em;
+    }
+    #dash-scaling .scaling-controls label {
+      display: flex;
+      flex-direction: column;
+      gap: 4px;
+      font-size: 12.5px;
+      color: var(--dim);
+    }
+    #dash-scaling .scaling-controls textarea,
+    #dash-scaling .scaling-controls input[type="text"],
+    #dash-scaling .scaling-controls select {
+      font: inherit;
+      font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+      font-size: 12px;
+      color: var(--fg);
+      background: var(--panel-2);
+      border: 1px solid var(--border);
+      border-radius: var(--radius);
+      padding: 8px 10px;
+      caret-color: var(--accent);
+    }
+    #dash-scaling .scaling-controls textarea { min-height: 140px; resize: vertical; }
+    #dash-scaling .scaling-controls .btn-row {
+      display: flex;
+      flex-wrap: wrap;
+      gap: var(--space-2);
+      margin-top: var(--space-1);
+    }
+    #dash-scaling .paper-auto-banner {
+      margin: 0 var(--space-4) var(--space-3);
+      padding: 10px var(--space-3);
+      border-radius: var(--radius);
+      border: 1px solid color-mix(in srgb, var(--warn) 45%, transparent);
+      background: color-mix(in srgb, var(--warn) 10%, transparent);
+      color: var(--warn);
+      font-size: 13px;
+      font-weight: 600;
+      line-height: 1.4;
+    }
+    #dash-scaling .scaling-status[data-lifecycle="restart_required"],
+    #dash-scaling .scaling-status[data-lifecycle="armed_unpersisted"] {
+      color: var(--warn); border-color: currentColor;
+    }
+    #dash-scaling .scaling-status[data-lifecycle="armed"] {
+      color: var(--pos); border-color: currentColor;
+    }
+    #dash-scaling .scaling-status[data-lifecycle="degraded"],
+    #dash-scaling .scaling-status[data-lifecycle="failed"] {
+      color: var(--neg); border-color: currentColor;
+    }
+    #dash-scaling .scaling-status[data-lifecycle="disabled"] {
+      color: var(--dim);
+    }
+    #paper-auto-panel {
+      margin-top: var(--space-5);
+      border-top: 2px solid var(--border);
+      padding-top: var(--space-4);
+    }
+
+    /* —— Guide tab —— */
+    #dash-guide {
+      padding: 0;
+    }
+    #dash-guide .guide-wrap {
+      max-width: 880px;
+      margin: 0 auto;
+      padding: var(--space-5) var(--space-6) var(--space-6);
+      display: flex;
+      flex-direction: column;
+      gap: var(--space-4);
+    }
+    #dash-guide .guide-hero,
+    #dash-guide .guide-section {
+      background: var(--bg);
+      border: 1px solid var(--border);
+      border-radius: var(--radius-lg);
+      padding: var(--space-4) var(--space-5);
+      overflow: visible;
+    }
+    #dash-guide .guide-hero {
+      padding-top: var(--space-5);
+      padding-bottom: var(--space-5);
+    }
+    #dash-guide .guide-hero h1 {
+      margin: 0 0 var(--space-3);
+      padding: 0;
+      border: none;
+      font: 800 22px/1.25 var(--font-heading);
+      letter-spacing: -0.02em;
+      text-transform: none;
+      color: var(--fg);
+      display: block;
+    }
+    #dash-guide .guide-lead {
+      margin: 0 0 var(--space-3);
+      font-size: 14px;
+      line-height: 1.55;
+      color: var(--fg);
+    }
+    #dash-guide .guide-note {
+      margin: 0;
+      padding: 10px var(--space-3);
+      border-radius: var(--radius);
+      background: color-mix(in srgb, var(--fg) 5%, transparent);
+      border: 1px solid var(--border-soft);
+      color: var(--dim);
+      font-size: 13px;
+      line-height: 1.5;
+    }
+    #dash-guide .guide-section h2 {
+      margin: 0 0 var(--space-3);
+      padding: 0 0 var(--space-3);
+      border-bottom: 2px solid var(--border);
+      font: 800 15px/1.35 var(--font-heading);
+      text-transform: none;
+      letter-spacing: -.01em;
+      color: var(--fg);
+      display: flex;
+      align-items: center;
+      flex-wrap: wrap;
+      gap: 6px;
+    }
+    #dash-guide .guide-section h3 {
+      margin: var(--space-4) 0 var(--space-2);
+      padding: 0;
+      font: 800 13.5px/1.35 var(--font-heading);
+      text-transform: none;
+      letter-spacing: 0;
+      color: var(--accent-deep);
+      display: flex;
+      align-items: center;
+      flex-wrap: wrap;
+      gap: 6px;
+    }
+    #dash-guide .guide-section h3:first-of-type { margin-top: var(--space-2); }
+    #dash-guide .guide-section p {
+      margin: 0 0 var(--space-3);
+      font-size: 14px;
+      line-height: 1.55;
+      color: var(--fg);
+    }
+    #dash-guide .guide-section > :last-child { margin-bottom: 0; }
+    #dash-guide .guide-steps,
+    #dash-guide .guide-tips {
+      margin: 0 0 var(--space-3);
+      padding-left: 1.35em;
+      font-size: 14px;
+      line-height: 1.55;
+    }
+    #dash-guide .guide-steps li,
+    #dash-guide .guide-tips li {
+      margin-bottom: 8px;
+    }
+    #dash-guide .guide-steps li:last-child,
+    #dash-guide .guide-tips li:last-child {
+      margin-bottom: 0;
+    }
+    #dash-guide table {
+      width: 100%;
+      border-collapse: collapse;
+      margin: 0 0 var(--space-3);
+      font-size: 13px;
+    }
+    #dash-guide th,
+    #dash-guide td {
+      text-align: left;
+      padding: 10px 12px;
+      border-bottom: 1px solid var(--border-soft);
+      vertical-align: top;
+      line-height: 1.45;
+      white-space: normal;
+    }
+    #dash-guide th {
+      color: var(--dim);
+      font: 800 10px/1.45 var(--font-heading);
+      text-transform: uppercase;
+      letter-spacing: .08em;
+      background: var(--panel-2);
+      border-bottom: 2px solid var(--border);
+    }
+    #dash-guide tbody tr:last-child td { border-bottom: none; }
+    #dash-guide code {
+      font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+      font-size: 12px;
+      background: var(--chip);
+      padding: 1px 5px;
+      border-radius: var(--radius);
+    }
+    #dash-guide .guide-pre {
+      background: var(--panel-2);
+      border: 1px solid var(--border-soft);
+      border-radius: var(--radius);
+      padding: var(--space-3) var(--space-4);
+      overflow-x: auto;
+      margin: 0;
+    }
+    #dash-guide .guide-pre code {
+      background: transparent;
+      border: none;
+      padding: 0;
+      font-size: 12.5px;
+      line-height: 1.6;
+      white-space: pre;
+    }
+    #dash-guide strong { color: var(--fg); font-weight: 700; }
+    /* Reuse Deploy-tab info bubbles on the Guide tab */
+    #dash-guide .info {
+      position: relative;
+      display: inline-flex;
+      align-items: center;
+      justify-content: center;
+      margin-left: 2px;
+      color: var(--dim);
+      cursor: help;
+      font-size: 10px;
+      font-weight: 700;
+      font-style: normal;
+      border: 1px solid var(--border-soft);
+      width: 15px;
+      height: 15px;
+      line-height: 1;
+      vertical-align: middle;
+      flex-shrink: 0;
+    }
+    #dash-guide .info:hover,
+    #dash-guide .info:focus {
+      color: var(--accent);
+      border-color: var(--accent);
+      outline: none;
+    }
+    #dash-guide .tip {
+      display: none;
+      position: fixed;
+      z-index: 60;
+      width: max-content;
+      max-width: 320px;
+      white-space: normal;
+      background: var(--bg);
+      border: 1px solid var(--border);
+      border-radius: var(--radius);
+      padding: var(--space-2) 11px;
+      color: var(--fg);
+      font-size: 12px;
+      font-weight: 400;
+      text-align: left;
+      letter-spacing: normal;
+      text-transform: none;
+      line-height: 1.5;
+      box-shadow: var(--shadow-lg);
+      pointer-events: none;
+    }
+    #dash-guide .hover-tip { cursor: help; }
+
+    @media (max-width: 720px) {
+      #dash-guide .guide-wrap {
+        padding: var(--space-4);
+        gap: var(--space-3);
+      }
+      #dash-guide .guide-hero,
+      #dash-guide .guide-section {
+        padding: var(--space-3) var(--space-4);
+      }
+      #dash-guide th,
+      #dash-guide td {
+        padding: 8px 8px;
+      }
+    }
+
+    /* —— command-center mutation chrome —— */
+    #cc-toasts {
+      position: fixed;
+      right: var(--space-4);
+      bottom: var(--space-4);
+      z-index: 70;
+      display: flex;
+      flex-direction: column;
+      gap: var(--space-2);
+      max-width: min(360px, calc(100vw - 32px));
+    }
+    .cc-toast {
+      padding: 10px var(--space-3);
+      border-radius: var(--radius);
+      border: 1px solid var(--border);
+      background: var(--bg);
+      box-shadow: var(--shadow-lg);
+      font-size: 13px;
+      font-weight: 600;
+    }
+    .cc-toast-ok { border-color: color-mix(in srgb, var(--pos) 45%, transparent); color: var(--pos); }
+    .cc-toast-err { border-color: color-mix(in srgb, var(--neg) 45%, transparent); color: var(--neg); }
+    .cc-toast-warn { border-color: color-mix(in srgb, var(--warn) 45%, transparent); color: var(--warn); }
+    #cc-pending-commands {
+      position: fixed;
+      left: var(--space-4);
+      bottom: var(--space-4);
+      z-index: 70;
+      display: flex;
+      flex-wrap: wrap;
+      gap: var(--space-2);
+      max-width: min(480px, calc(100vw - 32px));
+    }
+    .cc-pending {
+      padding: 6px 10px;
+      border-radius: var(--radius);
+      background: var(--bg);
+      border: 1px solid var(--border);
+      color: var(--fg);
+      font-size: 12px;
+      font-weight: 600;
+      box-shadow: var(--shadow-lg);
+    }
+    .cc-banner {
+      margin: 0 var(--space-6);
+      padding: 10px var(--space-4);
+      border-radius: var(--radius);
+      border: 1px solid var(--border);
+    }
+    .cc-banner-warn {
+      background: color-mix(in srgb, var(--warn) 10%, transparent);
+      color: var(--warn);
+      border-color: color-mix(in srgb, var(--warn) 45%, transparent);
+    }
+    #cc-open-proposal {
+      background: var(--accent);
+      border-color: var(--accent);
+      color: var(--bg);
+      padding: 9px 14px;
+    }
+    #cc-open-proposal:hover:not(:disabled) {
+      background: var(--accent-deep);
+      border-color: var(--accent-deep);
+      color: var(--bg);
+    }
+    .cc-drawer {
+      position: fixed;
+      top: 0;
+      right: 0;
+      width: min(420px, 100vw);
+      height: 100vh;
+      z-index: 55;
+      background: var(--bg);
+      border-left: 2px solid var(--border);
+      padding: var(--space-5);
+      overflow: auto;
+      box-shadow: var(--shadow-lg);
+    }
+    .cc-drawer[hidden] { display: none !important; }
+    .cc-drawer h2 {
+      margin: 0 0 var(--space-4);
+      font: 800 16px/1.3 var(--font-heading);
+      letter-spacing: -.01em;
+      text-transform: none;
+      color: var(--fg);
+      display: flex;
+      align-items: center;
+      gap: var(--space-2);
+    }
+    .cc-drawer-close {
+      margin-left: auto;
+      background: transparent !important;
+      border: none !important;
+      color: var(--dim);
+      font-size: 18px;
+      cursor: pointer;
+      padding: 2px 8px;
+      line-height: 1;
+      box-shadow: none !important;
+    }
+    .cc-drawer-close:hover { color: var(--fg); }
+    .cc-drawer-actions {
+      display: flex;
+      flex-wrap: wrap;
+      gap: var(--space-2);
+      margin-top: var(--space-1);
+    }
+    .cc-drawer form,
+    .cc-drawer .param-form {
+      display: flex;
+      flex-direction: column;
+      align-items: stretch;
+      gap: var(--space-3);
+    }
+    /* Block (not column-flex) so the caption text and trailing .info icon
+       stay on one inline row; inputs sit on the next line as blocks. */
+    .cc-drawer label {
+      display: block;
+      color: var(--dim);
+      font-size: 12px;
+      line-height: 1.4;
+    }
+    .cc-drawer label > input,
+    .cc-drawer label > select,
+    .cc-drawer label > textarea {
+      display: block;
+      width: 100%;
+      box-sizing: border-box;
+      margin-top: 6px;
+    }
+    .cc-drawer input,
+    .cc-drawer select,
+    .cc-drawer textarea {
+      background: var(--panel-2);
+      border: 1px solid var(--border);
+      color: var(--fg);
+      border-radius: var(--radius);
+      padding: 8px 10px;
+      font: inherit;
+      font-size: 13px;
+      caret-color: var(--accent);
+    }
+    /* Keep section title + info icon glued together under space-between h2s. */
+    .h-title {
+      display: inline-flex;
+      align-items: center;
+      gap: 0;
+      min-width: 0;
+    }
+    .cc-drawer fieldset {
+      border: 1px solid var(--border);
+      border-radius: var(--radius);
+      padding: var(--space-3);
+      margin: 0;
+    }
+    .cc-drawer legend { color: var(--dim); font-size: 12px; padding: 0 6px; }
+    .cc-drawer dl {
+      display: grid;
+      grid-template-columns: auto 1fr;
+      gap: 6px var(--space-3);
+      margin: 0 0 var(--space-4);
+    }
+    .cc-drawer dt { color: var(--dim); font-size: 12px; }
+    .cc-drawer dd { margin: 0; font-weight: 700; font-variant-numeric: tabular-nums; }
+    .cc-drawer .cc-warnings {
+      margin: 0 0 var(--space-4);
+      padding-left: 18px;
+      color: var(--warn);
+      font-size: 13px;
+    }
+    .cc-drawer .cc-hint {
+      color: var(--dim);
+      font-size: 12.5px;
+      margin: 0 0 var(--space-4);
+      line-height: 1.5;
+    }
+    .cc-drawer button + button { margin-left: 0; margin-top: 0; }
+    .cc-drawer-live { border-left: 3px solid var(--warn); }
+    .cc-pause {
+      display: inline-flex;
+      align-items: center;
+      gap: var(--space-2);
+      font-weight: 400;
+      text-transform: none;
+      letter-spacing: normal;
+    }
+    .cc-pause-state { color: var(--dim); font-size: 12px; }
+
+    @media (max-width: 960px) {
+      .lower { grid-template-columns: 1fr; }
+      .lower section:nth-of-type(odd) { border-right: none; }
+      .band-cell { border-left: none; padding-left: 0; }
+    }
+    @media (max-width: 720px) {
+      .dash-admin-pane .dash-admin-body {
+        grid-template-columns: 1fr;
+        padding: var(--space-4);
+        gap: var(--space-4);
+      }
+      main.grid {
+        padding: 0 var(--space-4) var(--space-4);
+      }
+      #quick-stats { padding: var(--space-4); }
+      .dash-tabs { padding-left: 0; padding-right: var(--space-4); }
+      #status-bar { padding-left: var(--space-4); padding-right: var(--space-4); }
+    }
   </style>
 </head>
+{% macro info(text) %}<span class="info" tabindex="0" role="button" aria-label="More info" aria-expanded="false">i<span class="tip">{{ text }}</span></span>{% endmacro %}
 <body data-degraded-after-ms="{{ degraded_after_ms }}"
       data-poll-interval-ms="{{ poll_interval_ms }}"
       data-commands-enabled="{{ 'true' if commands_enabled else 'false' }}">
   <div id="degraded-banner" role="alert" hidden>
     ⚠ Realtime stream degraded — polling snapshots every 5 s. Data may be stale.
   </div>
-  <header id="status-bar">
-    <span id="mode-badge" class="badge">…</span>
-    <span id="account-id" class="num">—</span>
-    <span id="dependency-chips" aria-label="Dependency health"></span>
+  <div id="boot-banner" class="flash" role="status">Loading live data…</div>
+  <nav class="dash-tabs" aria-label="Dashboard sections">
+    <button type="button" class="dash-tab active" data-dash-tab="trading">Trading</button>
+    <button type="button" class="dash-tab" data-dash-tab="scaling">Scaling</button>
+    <button type="button" class="dash-tab" data-dash-tab="deploy">Deploy
+      <span class="chip on">{{ deployed_count|default(0) }}</span></button>
+    <button type="button" class="dash-tab" data-dash-tab="watchlists">Watchlists
+      <span class="chip">{{ watchlists|length|default(0) }}</span></button>
+    <button type="button" class="dash-tab" data-dash-tab="guide">Guide</button>
+    <button type="button" class="dash-tab" data-dash-tab="research">Research</button>
     <span id="last-event-time" title="Latest authoritative event time">
       last event: <span class="v">—</span></span>
+    <button type="button" id="theme-toggle" aria-pressed="false"
+            title="Switch color theme">Dark</button>
+  </nav>
+  <!-- Strategy-error alert (design 1c error-prevention layer): a red band
+       under the tabs whenever a strategy is in ERROR. Populated by
+       renderStrategyAlert() in command_center.js; hidden when none. -->
+  <div id="strategy-alert" role="alert" hidden>
+    <span class="sa-badge"></span>
+    <span class="sa-msg"></span>
+    <button type="button" class="sa-link" data-dash-tab="trading">Review strategies →</button>
+  </div>
+  <!-- Command band (design 1c): identity + dependency health | net liq |
+       day P&L | the two account-scoped actions. Sits above the tab panes
+       because everything in it is account-global, not tab-local. -->
+  <header id="status-bar">
+    <div id="band-identity">
+      <div class="band-id-row">
+        <span id="mode-badge" class="badge">…</span>
+        <span id="account-id" class="num">—</span>
+      </div>
+      <span id="dependency-chips" aria-label="Dependency health"></span>
+    </div>
+    <div class="band-cell">
+      <span class="band-k">Net liquidation</span>
+      <span id="band-netliq" class="band-v">—</span>
+    </div>
+    <div class="band-cell">
+      <span class="band-k">Day P&amp;L</span>
+      <span id="band-daypnl" class="band-v">—</span>
+    </div>
+    {% if commands_enabled %}
+    <div id="band-actions">
+      <div id="cc-pause-control" class="cc-pause">
+        <span id="cc-pause-state" class="cc-pause-state"></span>
+        <button id="cc-pause-toggle" type="button"
+                data-cc-command="pause_trading">Pause new trading</button>
+      </div>
+      <button id="cc-open-proposal" type="button">New proposal</button>
+    </div>
+    {% endif %}
   </header>
-  <div id="account-cards" aria-label="Account summary"></div>
-  <main class="grid">
+  {% if flash %}<div class="flash{% if flash_err %} err{% endif %}" data-flash-banner role="status">
+    <span class="flash-msg">{{ flash }}</span>
+    <button type="button" class="flash-dismiss" data-flash-dismiss
+            aria-label="Dismiss notification">×</button>
+  </div>{% endif %}
+  <div id="dash-trading" class="dash-pane active">
+    <!-- Action queue promoted to a full-width 3-up strip directly under the
+         command band: approving proposals is the riskiest job on this page. -->
+    <section id="action-rail" aria-label="Pending proposals">
+      <h2><span class="h-title">Action queue {{ info('PENDING proposals awaiting Approve or Reject. History shows terminal proposals from the live feed (and can refresh via API). New proposal can resolve a ticker to an exact conId.') }}</span>
+        {% if not commands_enabled %}<span class="dim">(read-only)</span>{% endif %}
+      </h2>
+      <div class="proposal-filter" role="group" aria-label="Proposal filter">
+        <button type="button" data-proposal-filter="pending" class="active">Pending</button>
+        <button type="button" data-proposal-filter="all">All</button>
+        <button type="button" data-proposal-filter="terminal">History</button>
+      </div>
+      <div id="proposal-cards"></div>
+    </section>
+    <div id="quick-stats" aria-label="Account summary"></div>
     <section id="positions-panel" aria-label="Positions">
-      <h2>Positions</h2>
+      <h2><span class="h-title">Positions {{ info('Live holdings from IB. Unrealized P&amp;L vs average cost; Day P&amp;L since session start. Close starts an exit proposal — Approve still required.') }}</span>
+        <span id="positions-meta" class="h-meta"></span></h2>
       <table>
         <thead><tr>
           <th>Instrument</th><th>Qty</th><th>Avg</th><th>Last</th><th>Ccy</th>
@@ -99,30 +1621,150 @@
         <tbody id="positions-body"></tbody>
       </table>
     </section>
-    <aside id="action-rail" aria-label="Pending proposals">
-      <h2>Action queue <span class="dim">(read-only)</span></h2>
-      <div id="proposal-cards"></div>
-    </aside>
     <div class="lower">
-      <section id="orders-panel"><h2>Working orders
+      <section id="orders-panel"><h2><span class="h-title">Working orders {{ info('Open broker orders still working at IB. Cancel removes one; Cancel all clears every open order.') }}</span>
         {% if commands_enabled %}<button id="cc-cancel-all-open"
-                type="button">Cancel all</button>{% endif %}</h2>
+                type="button" class="reject">Cancel all</button>{% endif %}</h2>
         <div id="order-groups"></div></section>
-      <section id="fills-panel"><h2>Recent executions</h2>
+      <section id="fills-panel"><h2><span class="h-title">Recent executions {{ info('Fills that actually traded — time, side, qty, price, and commission.') }}</span></h2>
         <table><thead><tr><th>Time</th><th>Instrument</th><th>Side</th>
           <th>Qty</th><th>Price</th><th>Commission</th></tr></thead>
           <tbody id="fills-body"></tbody></table></section>
-      <section id="strategies-panel"><h2>Strategies</h2>
+      <section id="strategies-panel"><h2><span class="h-title">Strategies {{ info('Live strategy_service rows. Enable/Disable here is immediate. Pause new trading blocks new exposure without unloading strategies. Full deploy/undeploy is on the Deploy tab.') }}</span></h2>
         <table><thead><tr><th>Strategy</th><th>State</th><th>Enabled</th>
           <th>Last activity</th><th>Error</th>
           {% if commands_enabled %}<th data-cc-col="strategy-actions">Actions</th>{% endif %}
           </tr></thead>
           <tbody id="strategies-body"></tbody></table></section>
-      <section id="risk-panel"><h2>Risk &amp; reconciliation</h2>
+      <section id="risk-panel"><h2><span class="h-title">Risk &amp; reconciliation {{ info('Authoritative risk projection: concentration, group budgets, and reconciliation warnings. Empty until the risk service publishes a projection.') }}</span></h2>
         <div id="risk-body" data-state="unavailable">Risk unavailable — waiting
           for an authoritative risk projection.</div></section>
     </div>
-  </main>
+  </div>
+  <div id="dash-scaling" class="dash-pane" aria-label="Scaling and allocation">
+    <main class="grid">
+      <section id="scaling-panel">
+        <h2><span class="h-title">Allocation &amp; scaling {{ info('Signed allocation ceilings for live capital. Prepare and sign offline with mmr research allocation prepare/sign, then paste the attestation here. Private keys never enter this browser. Suspend is risk-reducing and immediate.') }}</span>
+          <span id="scaling-lifecycle" class="scaling-status" data-lifecycle="unknown">unknown</span>
+        </h2>
+        <p id="scaling-message" class="scaling-note">Waiting for authoritative allocation events…</p>
+        <p class="scaling-note"><strong>Live capital path.</strong> Prepare and
+          sign offline with <code>mmr research allocation prepare/sign</code>,
+          then paste the signed attestation JSON below. Private keys never
+          enter this browser. Suspend is risk-reducing and immediate.
+          <strong>Paper unattended trading</strong> uses
+          <em>Paper automation</em> below — not this attestation form.</p>
+        <div class="scaling-cards" aria-label="Current allocation summary">
+          <div class="scaling-card"><div class="label">Stage</div>
+            <div id="scaling-stage" class="value">—</div></div>
+          <div class="scaling-card"><div class="label">Signed ceiling</div>
+            <div id="scaling-ceiling" class="value">—</div></div>
+          <div class="scaling-card"><div class="label">Event</div>
+            <div id="scaling-event" class="value">—</div></div>
+          <div class="scaling-card"><div class="label">Expires</div>
+            <div id="scaling-expires" class="value">—</div></div>
+        </div>
+        {% if commands_enabled %}
+        <div class="scaling-controls" id="scaling-controls"
+             aria-label="Allocation operator controls">
+          <h3>Operator controls</h3>
+          <label>Signed attestation JSON
+            <textarea id="scaling-attestation" spellcheck="false"
+                      placeholder='{"strategy_id":"...","signature":"..."}'></textarea>
+          </label>
+          <label>Or upload attestation file
+            <input type="file" id="scaling-attestation-file"
+                   accept=".json,application/json">
+          </label>
+          <label>Reason
+            <input type="text" id="scaling-reason" maxlength="200"
+                   placeholder="Scale 1 after clean canary" required>
+          </label>
+          <div class="btn-row">
+            <button type="button" id="scaling-activate" class="btn primary"
+                    data-cc-command="activate_allocation">Activate allocation</button>
+            <button type="button" id="scaling-suspend" class="btn reject"
+                    data-cc-command="suspend_allocation">Suspend allocation</button>
+          </div>
+        </div>
+        {% endif %}
+        <h3>Authority history</h3>
+        <table>
+          <thead><tr>
+            <th>Strategy</th><th>Stage</th><th>Ceiling</th><th>Event</th>
+            <th>Expires</th><th>Revision</th>
+          </tr></thead>
+          <tbody id="scaling-authorities-body">
+            <tr><td colspan="6" class="dim">No allocation authority rows yet</td></tr>
+          </tbody>
+        </table>
+      </section>
+      <section id="paper-auto-panel" aria-label="Paper automation">
+        <h2><span class="h-title">Paper automation {{ info('Paper mode only. Writes keys, fixture artifact, and YAML for one strategy, then hot-arms execute_automated_intent + IntentEmitter without restart when Activate succeeds. Needs command authority. Private keys never enter this browser.') }}</span>
+          <span id="paper-auto-lifecycle" class="scaling-status"
+                data-lifecycle="unknown">unknown</span>
+        </h2>
+        <p id="paper-auto-banner-restart" class="paper-auto-banner" hidden
+           role="status">Config written. Restart trader and strategy services to arm.</p>
+        <p id="paper-auto-banner-partial" class="paper-auto-banner" hidden
+           role="status">Activation partially succeeded — click Activate again to complete.</p>
+        <p id="paper-auto-message" class="scaling-note">Waiting for paper automation status…</p>
+        <p class="scaling-note">Paper only. One strategy: writes keys/artifact/YAML
+          on the host, then hot-arms trader + strategy in-process. Private keys
+          never enter this browser. Activate stays disabled until the checklist
+          below is green.</p>
+        <div class="scaling-cards" aria-label="Paper automation summary">
+          <div class="scaling-card"><div class="label">Strategy</div>
+            <div id="paper-auto-strategy-value" class="value">—</div></div>
+          <div class="scaling-card"><div class="label">Account mode</div>
+            <div id="paper-auto-account-mode" class="value">—</div></div>
+          <div class="scaling-card"><div class="label">Command authority</div>
+            <div id="paper-auto-ca-ready" class="value">—</div></div>
+          <div class="scaling-card"><div class="label">Last activated</div>
+            <div id="paper-auto-last-activated" class="value">—</div></div>
+        </div>
+        <ul id="paper-auto-checklist" class="scaling-checklist"
+            aria-label="Paper automation readiness"></ul>
+        {% if commands_enabled %}
+        <div class="scaling-controls" id="paper-auto-controls"
+             aria-label="Paper automation operator controls">
+          <h3>Operator controls</h3>
+          <label>Strategy
+            <select id="paper-auto-strategy">
+              <option value="">Select a strategy…</option>
+            </select>
+          </label>
+          <label>Reason
+            <input type="text" id="paper-auto-reason" maxlength="200"
+                   placeholder="Arm paper automation after clean soak" required>
+          </label>
+          <div class="btn-row">
+            <button type="button" id="paper-auto-activate" class="btn primary"
+                    data-cc-command="activate_paper_automation"
+                    disabled
+                    title="Waiting for readiness checklist">Activate paper automation</button>
+            <button type="button" id="paper-auto-deactivate" class="btn reject"
+                    data-cc-command="deactivate_paper_automation"
+                    disabled
+                    title="Nothing armed to deactivate yet">Deactivate</button>
+          </div>
+        </div>
+        {% endif %}
+      </section>
+    </main>
+  </div>
+  <div id="dash-deploy" class="dash-pane dash-admin-pane">
+    {% include "_deploy_tab.html" %}
+  </div>
+  <div id="dash-watchlists" class="dash-pane dash-admin-pane">
+    {% include "_watchlists_tab.html" %}
+  </div>
+  <div id="dash-guide" class="dash-pane" aria-label="Dashboard user guide">
+    {% include "_guide_tab.html" %}
+  </div>
+  <div id="dash-research" class="dash-pane" aria-label="Research">
+    {% include "_research_tab.html" %}
+  </div>
   <div id="drawer" role="dialog" aria-modal="true" aria-label="Detail" hidden>
     <div id="drawer-box">
       <button id="drawer-close" aria-label="Close detail">×</button>
@@ -148,32 +1790,54 @@
   <div id="cc-outcome-unknown" class="cc-banner cc-banner-warn" hidden></div>
 
   <!-- [M1-C] New proposal drawer -- MARKET-only, auto-sized when quantity
-       and amount are both left blank. Asks for a conId (not a symbol): the
-       frozen create_proposal wire contract only knows conIds and this
-       dashboard has no resolve-by-symbol endpoint wired in yet, so asking
-       for the exact conId is "precision over convenience", not a shortcut. -->
-  <button id="cc-open-proposal" type="button">
-    New proposal
-  </button>
+       and amount are both left blank. Resolve a ticker to an exact conId
+       (precision over convenience); create_proposal still submits conId only.
+       Opened from #cc-open-proposal in the command band. -->
   <aside id="cc-proposal-drawer" class="cc-drawer" hidden>
-    <h2>New proposal</h2>
+    <h2>New proposal
+      <button type="button" class="cc-drawer-close" id="cc-proposal-close"
+              aria-label="Close new proposal">×</button>
+    </h2>
     <form id="cc-proposal-form">
-      <label>Instrument conId
-        <input name="conid" type="number" step="1" min="1" required></label>
-      <label>Side
+      <div class="cc-resolve-row">
+        <label>Symbol {{ info('Ticker to resolve via IB into an exact contract ID. Prefer the listed US symbol unless you set exchange/currency for a non-US listing.') }}
+          <input name="resolve_symbol" type="text" maxlength="32"
+                 placeholder="AAPL" autocomplete="off"></label>
+        <label>Exchange {{ info('Optional primary exchange hint (e.g. ASX, SEHK). Leave empty for US SMART routing — wrong exchange can resolve the wrong listing.') }}
+          <input name="resolve_exchange" type="text" maxlength="16"
+                 placeholder="(US: empty)"></label>
+        <label>Currency {{ info('Optional currency hint (USD, AUD, …) paired with exchange for international symbols.') }}
+          <input name="resolve_currency" type="text" maxlength="8"
+                 placeholder="USD"></label>
+        <button type="button" id="cc-resolve-symbol" class="primary">Resolve</button>
+      </div>
+      <p id="cc-resolve-status" class="cc-resolve-status" aria-live="polite"></p>
+      <label>Instrument conId {{ info('Interactive Brokers contract ID. Research Propose fills this after Resolve. Never guess — a wrong conId trades the wrong instrument.') }}
+        <input name="conid" type="number" step="1" min="1" required
+               placeholder="resolved or paste conId"></label>
+      <label>Side {{ info('BUY opens or adds a long; SELL reduces or closes a long. Research defaults from the scanner signal when present.') }}
         <select name="action"><option>BUY</option><option>SELL</option></select>
       </label>
       <fieldset>
-        <legend>Size — leave both empty for automatic position sizing</legend>
-        <label>Quantity <input name="quantity" type="number" step="any" min="0"></label>
-        <label>Notional amount <input name="amount" type="number" step="0.01" min="0"></label>
+        <legend>Size — leave both empty for automatic position sizing
+          {{ info('Blank quantity and amount lets the PositionSizer choose size from account, confidence, volatility (ATR), and liquidity. Fill only one if you need a fixed size.') }}</legend>
+        <label>Quantity {{ info('Share/contract count. Leave empty with amount empty for auto-sizing.') }}
+          <input name="quantity" type="number" step="any" min="0"></label>
+        <label>Notional amount {{ info('Dollar (or account currency) notional to spend. Leave empty with quantity empty for auto-sizing.') }}
+          <input name="amount" type="number" step="0.01" min="0"></label>
       </fieldset>
-      <label>Confidence (0–1)
+      <label>Confidence (0–1) {{ info('How strongly you believe the thesis. Scales position size (higher → larger). Research prefills from score or move size; you can override.') }}
         <input name="confidence" type="number" step="0.05" min="0" max="1"></label>
-      <label>Group tag <input name="group" maxlength="40"></label>
-      <label>Thesis <input name="thesis" maxlength="4000"></label>
-      <label>Reasoning <textarea name="reasoning" rows="4"></textarea></label>
-      <button type="submit" data-cc-command="create_proposal">Create proposal</button>
+      <label>Group tag {{ info('Optional portfolio group (e.g. tech, mining) for allocation budgets. Research Propose uses “research” by default.') }}
+        <input name="group" maxlength="40"></label>
+      <label>Thesis {{ info('Short one-line summary shown on proposal cards. Research prefills ticker + company/source.') }}
+        <input name="thesis" maxlength="4000"></label>
+      <label>Reasoning {{ info('Longer notes for review/audit before approve. Research prefills key metrics from the selected row.') }}
+        <textarea name="reasoning" rows="4"></textarea></label>
+      <div class="cc-drawer-actions">
+        <button type="submit" data-cc-command="create_proposal">Create proposal</button>
+        <button type="button" id="cc-proposal-cancel">Cancel</button>
+      </div>
     </form>
   </aside>
 
@@ -183,15 +1847,21 @@
        wired into renderPositions() by command_center.js's UI-wiring pass
        (event delegation on #positions-body, gated on CFG.commandsEnabled). -->
   <aside id="cc-close-drawer" class="cc-drawer" hidden>
-    <h2>Close position</h2>
+    <h2>Close position
+      <button type="button" class="cc-drawer-close" id="cc-close-drawer-x"
+              aria-label="Close">×</button>
+    </h2>
     <p><span data-field="instrument"></span> — reducing
        <strong data-field="side"></strong> (market by default)</p>
     <form id="cc-close-form">
       <label>Quantity (max = reducible quantity)
         <input name="quantity" type="number" step="any" min="0.000001" required></label>
       <label>Reasoning <textarea name="reasoning" rows="2"></textarea></label>
-      <button type="submit" data-cc-command="create_proposal">
-        Create close proposal</button>
+      <div class="cc-drawer-actions">
+        <button type="submit" data-cc-command="create_proposal">
+          Create close proposal</button>
+        <button type="button" id="cc-close-cancel">Cancel</button>
+      </div>
     </form>
   </aside>
 
@@ -204,15 +1874,21 @@
        PENDING-proposal actions (command_center.js's UI-wiring pass, event
        delegation on #drawer-content). -->
   <aside id="cc-confirm-drawer" class="cc-drawer cc-drawer-live" hidden>
-    <h2>Confirm live command</h2>
+    <h2 id="cc-confirm-title">Confirm command</h2>
     <dl>
-      <dt>Side</dt><dd data-field=side></dd>
-      <dt>Instrument</dt><dd data-field=instrument></dd>
-      <dt>Quantity</dt><dd data-field=quantity></dd>
-      <dt>Notional</dt><dd data-field=notional></dd>
+      <dt data-label-for="side">Side</dt><dd data-field=side></dd>
+      <dt data-label-for="instrument">Instrument</dt><dd data-field=instrument></dd>
+      <dt class="cc-confirm-trade">Quantity</dt>
+      <dd class="cc-confirm-trade" data-field=quantity></dd>
+      <dt class="cc-confirm-trade">Notional</dt>
+      <dd class="cc-confirm-trade" data-field=notional></dd>
       <dt>Order type</dt><dd data-field=order_type></dd>
-      <dt>Latest price</dt><dd data-field=latest_price></dd>
-      <dt>Drift (bps)</dt><dd data-field=drift_bps></dd>
+      <dt class="cc-confirm-trade">Latest price</dt>
+      <dd class="cc-confirm-trade" data-field=latest_price></dd>
+      <dt class="cc-confirm-trade">Drift (bps)</dt>
+      <dd class="cc-confirm-trade" data-field=drift_bps></dd>
+      <dt class="cc-confirm-reason" hidden>Reason</dt>
+      <dd class="cc-confirm-reason" data-field=reason hidden></dd>
       <dt>Account</dt><dd data-field=account></dd>
     </dl>
     <ul data-field=warnings class="cc-warnings"></ul>
@@ -263,23 +1939,14 @@
     <button id="cc-params-cancel" type="button">Cancel</button>
   </aside>
 
-  <!-- [M1-C] Task 6 -- pause new trading control (spec 9.4): pause is an
-       immediate absolute set (risk-reducing, no revision); resume is a
-       compare-and-set against the trading_control entity's current
-       `revision` (risk-increasing -- ccSetPause runs the live ceremony on a
-       live account). Populated/toggled by renderPauseControl()
-       (command_center.js's UI-wiring pass), called from renderStrategies(),
-       reading store.view.trading_control matched by account_id (no
-       CC.entity() accessor exists -- see command_center.js's Task 5/6 drift
-       notes above). -->
-  <div id="cc-pause-control" class="cc-pause">
-    <button id="cc-pause-toggle" type="button"
-            data-cc-command="pause_trading">Pause new trading</button>
-    <span id="cc-pause-state" class="cc-pause-state"></span>
-  </div>
+  <!-- [M1-C] Task 6 -- pause new trading control lives in the command band
+       (see #cc-pause-control above). -->
   {% endif %}
 
   <script src="/static/cc_util.js" defer></script>
+  <script src="/static/command_center_commands.js" defer></script>
   <script src="/static/command_center.js" defer></script>
+  <script src="/static/command_center_research.js" defer></script>
+  <script src="/static/dash_admin.js" defer></script>
 </body>
 </html>

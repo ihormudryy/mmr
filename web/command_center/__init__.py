@@ -8,7 +8,6 @@ import os
 from contextlib import asynccontextmanager
 from dataclasses import dataclass
 from typing import Callable, Optional
-from urllib.parse import urlparse
 
 from web.command_center.bridge import DashboardEventBridge
 from web.command_center.quotes import QuotePlane
@@ -66,45 +65,20 @@ def _assert_dill_strict(env=os.environ) -> None:
             "never executes dill payloads")
 
 
-def _parse_typed_endpoint(endpoint: str) -> tuple[str, int]:
-    """Split a ``tcp://host:port`` endpoint into ``TypedRpcClient``'s
-    separate ``address``/``port`` constructor args."""
-    parsed = urlparse(endpoint)
-    if parsed.scheme != "tcp" or not parsed.hostname or parsed.port is None:
-        raise ValueError(f"typed endpoint must be tcp://host:port, got {endpoint!r}")
-    return f"tcp://{parsed.hostname}", parsed.port
-
-
-def _typed_authenticator(env=os.environ):
-    """Build the shared-secret HMAC authenticator the typed clients sign
-    requests with (see ``trader/messaging/typed_rpc.py``). Reads the same
-    kind of service-HMAC key file the typed transport already documents
-    (``config_defaults/trader.yaml``'s ``service_hmac_key_file``) -- a
-    dashboard without the shared service credential fails closed (via
-    ``load_service_hmac_key``'s own checks) rather than falling back to an
-    ad-hoc key."""
-    from trader.messaging.typed_rpc import HmacServiceAuthenticator, load_service_hmac_key
-    key_file = (env.get("MMR_SERVICE_HMAC_KEY_FILE") or "").strip()
-    return HmacServiceAuthenticator(load_service_hmac_key(key_file))
-
-
 def _default_query_client(config: CommandCenterConfig):
-    from trader.messaging.typed_rpc import TypedRpcClient
-    address, port = _parse_typed_endpoint(config.typed_query_endpoint)
-    client = TypedRpcClient("query", _typed_authenticator(), address=address, port=port)
-    client.connect()
-    return client
+    # The event bridge owns its own cursor-resnapshot reconnect at a higher
+    # layer, so it holds a plain connected TypedRpcClient (not a TraderLink) —
+    # it only shares TraderLink's construction primitives (parse + auth +
+    # connect) so there is one copy of that plumbing across the dashboard.
+    from web.trader_link import connect_client
+    return connect_client("query", config.typed_query_endpoint)
 
 
 def _default_feed_client(config: CommandCenterConfig):
-    from trader.messaging.typed_rpc import TypedRpcClient
-    address, port = _parse_typed_endpoint(config.typed_feed_endpoint)
     # The feed client long-polls with a 10s wait_ms (see DashboardEventBridge
     # defaults); its own call timeout must comfortably exceed that.
-    client = TypedRpcClient("feed", _typed_authenticator(), address=address, port=port,
-                            timeout=15.0)
-    client.connect()
-    return client
+    from web.trader_link import connect_client
+    return connect_client("feed", config.typed_feed_endpoint, timeout=15.0)
 
 
 def _default_command_gateway(env=os.environ):

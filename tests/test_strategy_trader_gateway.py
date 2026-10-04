@@ -63,12 +63,18 @@ class _FakeTraderApi:
     a synchronous ``publish_contract`` that records what it was asked to
     stream (the real one wires an IB market-data subscription into pubsub)."""
 
-    def __init__(self, secdefs):
+    def __init__(self, secdefs, *, contract_secdefs=None):
         self._secdefs = secdefs  # conId -> secdef | absent
+        self._contract_secdefs = contract_secdefs or {}
         self.published = []
+        self.cached = []
 
     async def resolve_symbol(self, conId):
         sd = self._secdefs.get(conId)
+        return [sd] if sd is not None else []
+
+    async def resolve_contract(self, contract):
+        sd = self._contract_secdefs.get(getattr(contract, 'conId', None))
         return [sd] if sd is not None else []
 
     def publish_contract(self, contract, delayed):
@@ -217,6 +223,57 @@ def test_resolve_instrument_typed_roundtrip_unknown_returns_none():
     with _serve_query(registry) as client:
         gateway = StrategyTraderGateway(query_client=client)
         assert gateway.resolve_instrument(4391) is None
+
+
+def test_resolve_instrument_ib_fallback_qualifies_exact_conid(monkeypatch):
+    """Local miss + Contract(conId=N) hit must return the instrument (exact
+    primary-key qualify — not a fuzzy symbol search)."""
+    from trader.messaging import production_api as prod
+
+    cached = []
+
+    def _cache(api, definition):
+        cached.append(definition.conId)
+        api._secdefs[definition.conId] = definition
+
+    monkeypatch.setattr(prod, '_cache_resolved_instrument', _cache)
+    api = _FakeTraderApi({}, contract_secdefs={51529211: _fake_secdef(51529211, "GLD")})
+    registry = TypedRpcRegistry()
+    registry.register(
+        "query", "resolve_instrument", ResolveInstrumentRequest,
+        ResolveInstrumentResponse, _resolve_instrument_handler(api),
+    )
+    with _serve_query(registry) as client:
+        gateway = StrategyTraderGateway(query_client=client)
+        instrument = gateway.resolve_instrument(51529211)
+
+    assert instrument is not None
+    assert instrument.conId == 51529211
+    assert instrument.symbol == "GLD"
+    assert cached == [51529211]
+
+
+def test_resolve_instrument_fake_broker_seeds_stub(monkeypatch):
+    from trader.messaging import production_api as prod
+
+    cached = []
+    monkeypatch.setenv('MMR_FAKE_BROKER', '1')
+    monkeypatch.setattr(prod, '_cache_resolved_instrument',
+                        lambda api, d: cached.append(d.conId))
+    api = _FakeTraderApi({})
+    registry = TypedRpcRegistry()
+    registry.register(
+        "query", "resolve_instrument", ResolveInstrumentRequest,
+        ResolveInstrumentResponse, _resolve_instrument_handler(api),
+    )
+    with _serve_query(registry) as client:
+        gateway = StrategyTraderGateway(query_client=client)
+        instrument = gateway.resolve_instrument(5437)
+
+    assert instrument is not None
+    assert instrument.conId == 5437
+    assert instrument.symbol == "C5437"
+    assert cached == [5437]
 
 
 def test_publish_instrument_typed_roundtrip_drives_publish_contract():

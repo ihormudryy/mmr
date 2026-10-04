@@ -54,6 +54,26 @@ for `strategy` service reachability through this endpoint at all, so the
 `strategy_outage` scenario cannot assert "outage was surfaced" the way the
 other three can; it falls back to the post-recovery parity check alone
 (see `run_scenario` / `Scenario.probe`).
+
+P4 Task 2 (paper evidence gate) extension -- OPT-IN ONLY, fully backward
+compatible with every check above: six new `SoakThresholds` fields
+(`max_breaker_trips`, `min_readiness_pass_rate`, `max_reconciliation_mismatches`,
+`max_protection_gaps`, `max_missed_flats`, `max_replay_mismatches`) default to
+`None`, meaning "not required" -- `evaluate_soak` adds no new `Check` for a
+`None` threshold, so a caller that never sets them (every existing call site,
+including the default `SoakThresholds()` `main()` uses) sees byte-identical
+behavior to before this extension. A caller running the P4 paper soak sets
+whichever of these it wants enforced; once set, the same fail-closed
+"missing observation -> failing check" rule as `p95_critical_ms` etc. applies
+-- see `optional_metric` below. `evaluate_soak` also accepts an optional
+`config` mapping and `signer` (an `AttestationSigner` from
+`trader.research.signing`): when `config` is supplied the report carries a
+deterministic SHA-256 `config_digest` (via `trader.research.canonical`,
+the same primitive the research evidence chain digests over); when a
+`signer` is ALSO supplied, the digest is Ed25519-signed and the report
+additionally carries `config_signature` + `config_signer_key_id`, so a
+soak report can be bound to (and later verified against) the exact
+artifact/allowlist/risk-policy configuration it ran under.
 """
 from __future__ import annotations
 
@@ -68,9 +88,34 @@ import time
 import urllib.request
 from dataclasses import dataclass
 from pathlib import Path
+from typing import Any, Mapping, Optional
 
 sys.path.insert(0, str(Path(__file__).parent))
 from parity_compare import login  # noqa: E402
+
+_PROJECT_ROOT = Path(__file__).resolve().parent.parent
+if str(_PROJECT_ROOT) not in sys.path:
+    sys.path.insert(0, str(_PROJECT_ROOT))
+
+from trader.research.canonical import canonical_json_bytes, sha256_digest  # noqa: E402
+from trader.research.signing import AttestationSigner  # noqa: E402
+
+CONFIG_DIGEST_PREFIX = "paper_soak_config"
+
+
+def compute_config_digest(config: Mapping[str, Any]) -> str:
+    """Deterministic SHA-256 digest of a soak-run configuration (e.g. the
+    artifact/allowlist/risk-policy identity it ran under). Same canonical
+    bytes primitive the research evidence chain signs over."""
+    return sha256_digest(CONFIG_DIGEST_PREFIX, dict(config))
+
+
+def sign_config_digest(config: Mapping[str, Any], signer: AttestationSigner) -> str:
+    """Ed25519-sign the canonical bytes of ``config`` (not just its digest
+    string) so the signature covers the exact fields, not merely their
+    hash-of-a-hash. Deterministic: the same key + config always yields the
+    same signature."""
+    return signer.sign_message(canonical_json_bytes(dict(config)))
 
 
 @dataclass(frozen=True)
@@ -84,6 +129,15 @@ class SoakThresholds:
     replay_ring_max: int = 10_000
     client_fifo_max: int = 1_000
     terminal_rows_max: int = 500
+    # P4 Task 2 (paper evidence gate) additions -- see module docstring.
+    # `None` (the default) means "not required": evaluate_soak adds no
+    # check for it, so every pre-existing caller/test is unaffected.
+    max_breaker_trips: Optional[int] = None
+    min_readiness_pass_rate: Optional[float] = None
+    max_reconciliation_mismatches: Optional[int] = None
+    max_protection_gaps: Optional[int] = None
+    max_missed_flats: Optional[int] = None
+    max_replay_mismatches: Optional[int] = None
 
 
 @dataclass(frozen=True)
@@ -107,6 +161,9 @@ class SoakReport:
     checks: list[Check]
     scenarios: dict[str, str]
     passed: bool
+    config_digest: Optional[str] = None
+    config_signature: Optional[str] = None
+    config_signer_key_id: Optional[str] = None
 
     def to_json(self) -> str:
         return json.dumps({
@@ -114,18 +171,28 @@ class SoakReport:
             'passed': self.passed,
             'checks': [dataclasses.asdict(c) for c in self.checks],
             'scenarios': self.scenarios,
+            'config_digest': self.config_digest,
+            'config_signature': self.config_signature,
+            'config_signer_key_id': self.config_signer_key_id,
         }, indent=2)
 
 
 def evaluate_soak(samples: list[Sample], harness: dict,
                   scenario_outcomes: dict[str, str],
-                  t: SoakThresholds) -> SoakReport:
+                  t: SoakThresholds,
+                  *,
+                  config: Optional[Mapping[str, Any]] = None,
+                  signer: Optional[AttestationSigner] = None) -> SoakReport:
     """Pure, deterministic, fail-closed evaluation of one soak run.
 
     ``harness`` carries flat spec-13.3 metric keys (see module docstring
     for which of these the current `soak_harness.py` actually populates).
     A key absent from ``harness`` evaluates to a failed check -- missing
     data is never treated as "passing by default".
+
+    ``config``/``signer`` are keyword-only and both default to ``None`` so
+    every pre-existing positional call site is unaffected; see the module
+    docstring's P4 Task 2 extension note for what they add to the report.
     """
     checks: list[Check] = []
     post = [s for s in samples if s.minute >= t.warmup_minutes]
@@ -148,6 +215,22 @@ def evaluate_soak(samples: list[Sample], harness: dict,
         checks.append(Check(name.replace('max_', '') if name.startswith('max_')
                             else name, limit, observed, ok))
 
+    def optional_metric(name: str, limit: Optional[float], *, minimum: bool = False) -> None:
+        """Same fail-closed contract as ``metric``, but only added at all
+        when ``limit`` is not ``None`` -- see the P4 Task 2 docstring note:
+        this is what keeps every pre-existing threshold/report shape
+        unchanged unless a caller opts in."""
+        if limit is None:
+            return
+        observed = harness.get(name)
+        if observed is None:
+            ok = False
+        elif minimum:
+            ok = float(observed) >= limit
+        else:
+            ok = float(observed) <= limit
+        checks.append(Check(name, limit, observed, ok))
+
     metric('p95_critical_ms', t.p95_critical_ms_max)
     metric('unhandled_errors', t.max_unhandled_errors)
     metric('unresolved_commands', t.max_unresolved_commands)
@@ -155,14 +238,34 @@ def evaluate_soak(samples: list[Sample], harness: dict,
     metric('max_client_fifo_depth', t.client_fifo_max)
     metric('max_terminal_rows', t.terminal_rows_max)
 
+    # P4 Task 2: breaker/readiness/reconciliation/protection/flat/replay --
+    # opt-in only (see `optional_metric`).
+    optional_metric('breaker_trips', t.max_breaker_trips)
+    optional_metric('readiness_pass_rate', t.min_readiness_pass_rate, minimum=True)
+    optional_metric('reconciliation_mismatches', t.max_reconciliation_mismatches)
+    optional_metric('protection_gaps', t.max_protection_gaps)
+    optional_metric('missed_flats', t.max_missed_flats)
+    optional_metric('replay_mismatches', t.max_replay_mismatches)
+
     scenarios_ok = all(v in ('coherent', 'explicit-degraded')
                        for v in scenario_outcomes.values())
     checks.append(Check('scenarios_coherent', 1,
                         int(scenarios_ok), scenarios_ok))
+
+    config_digest = compute_config_digest(config) if config is not None else None
+    config_signature = None
+    config_signer_key_id = None
+    if config is not None and signer is not None:
+        config_signature = sign_config_digest(config, signer)
+        config_signer_key_id = signer.public_key_id
+
     return SoakReport(
         started_at=dt.datetime.now(dt.timezone.utc).isoformat(),
         checks=checks, scenarios=scenario_outcomes,
-        passed=all(c.passed for c in checks))
+        passed=all(c.passed for c in checks),
+        config_digest=config_digest,
+        config_signature=config_signature,
+        config_signer_key_id=config_signer_key_id)
 
 
 # --- sampling (real `dashboard` Compose container) --------------------------
@@ -409,6 +512,20 @@ def main() -> int:
                         help='post-recovery coherence command, e.g. '
                              '"python3 scripts/parity_compare.py"')
     parser.add_argument('--out', default='')
+    # P4 Task 2 additions -- all optional/opt-in, see module docstring.
+    parser.add_argument('--config-json', default='',
+                        help='path to a JSON file identifying the exact config this soak ran '
+                             'under (artifact/allowlist/risk-policy); adds config_digest to the '
+                             'report')
+    parser.add_argument('--signing-key', default='',
+                        help='path to an Ed25519 PKCS8 PEM private key (0o600); if given with '
+                             '--config-json, signs the config digest')
+    parser.add_argument('--max-breaker-trips', type=int, default=None)
+    parser.add_argument('--min-readiness-pass-rate', type=float, default=None)
+    parser.add_argument('--max-reconciliation-mismatches', type=int, default=None)
+    parser.add_argument('--max-protection-gaps', type=int, default=None)
+    parser.add_argument('--max-missed-flats', type=int, default=None)
+    parser.add_argument('--max-replay-mismatches', type=int, default=None)
     args = parser.parse_args()
 
     token = Path(args.token_file).read_text().strip()
@@ -450,7 +567,17 @@ def main() -> int:
     # follow-up) -- left absent so `evaluate_soak`'s existing fail-closed
     # default (`harness.get(name) is None` -> check fails) reports them
     # honestly as "not observed" rather than fabricating a passing zero.
-    report = evaluate_soak(samples, metrics, outcomes, SoakThresholds())
+    thresholds = SoakThresholds(
+        max_breaker_trips=args.max_breaker_trips,
+        min_readiness_pass_rate=args.min_readiness_pass_rate,
+        max_reconciliation_mismatches=args.max_reconciliation_mismatches,
+        max_protection_gaps=args.max_protection_gaps,
+        max_missed_flats=args.max_missed_flats,
+        max_replay_mismatches=args.max_replay_mismatches,
+    )
+    config = json.loads(Path(args.config_json).read_text()) if args.config_json else None
+    signer = AttestationSigner.from_key_file(args.signing_key) if args.signing_key else None
+    report = evaluate_soak(samples, metrics, outcomes, thresholds, config=config, signer=signer)
 
     stamp = dt.datetime.now(dt.timezone.utc).strftime('%Y%m%dT%H%M%SZ')
     out = Path(args.out) if args.out else \

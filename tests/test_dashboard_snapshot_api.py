@@ -60,8 +60,29 @@ def cc(monkeypatch):
 
 
 @pytest.fixture
-def app(cc):
+def app(cc, monkeypatch):
     from web.app import create_app
+
+    class _EmptyManage:
+        def trader_query(self, method, body=None):
+            if method == 'list_universes':
+                return {'universes': []}
+            return {}
+
+        def strategy_query(self, method, body=None):
+            if method == 'list_strategies':
+                return {'strategies': []}
+            return {}
+
+        def trader_command(self, method, body=None):
+            return {}
+
+        def strategy_command(self, method, body=None):
+            return {}
+
+    # /cc overlays Deploy/Watchlists via manage RPC; without a stub a missing
+    # peer (or a slow one) burns MANAGE_PAGE_TIMEOUT_S per page render.
+    monkeypatch.setattr('web.app.get_manage_client', lambda: _EmptyManage())
     return create_app(cc)
 
 
@@ -169,6 +190,50 @@ class TestSnapshotApi:
             second = (await c.get("/api/snapshot")).json()
             assert second["sequence"] == body["sequence"] + 1
             assert second["positions"][0]["quantity"] == 77
+
+    @pytest.mark.asyncio
+    async def test_snapshot_includes_paper_automation_status(self, client, cc):
+        class QueryClient:
+            def call(self, method, body, response_model, timeout=None):
+                assert (method, body, response_model) == (
+                    "get_paper_automation_status", {}, dict)
+                assert timeout is not None
+                return {
+                    "lifecycle": "restart_required",
+                    "strategy_name": "orb",
+                    "restart_required": True,
+                }
+
+        _seed(cc)
+        cc._query_client = QueryClient()
+        async with client as c:
+            await _login(c)
+            body = (await c.get("/api/snapshot")).json()
+        assert body["paper_automation"] == {
+            "lifecycle": "restart_required",
+            "strategy_name": "orb",
+            "restart_required": True,
+        }
+        assert "deployed_strategy_names" in body
+        assert isinstance(body["deployed_strategy_names"], list)
+
+
+    @pytest.mark.asyncio
+    async def test_snapshot_degrades_when_paper_automation_query_unavailable(
+            self, client, cc):
+        class UnavailableQueryClient:
+            def call(self, method, body, response_model, timeout=None):
+                raise ConnectionError("typed query socket unavailable")
+
+        _seed(cc)
+        cc._query_client = UnavailableQueryClient()
+        async with client as c:
+            await _login(c)
+            response = await c.get("/api/snapshot")
+        assert response.status_code == 200
+        body = response.json()
+        assert body["paper_automation"] is None
+        assert isinstance(body.get("deployed_strategy_names"), list)
 
 
 class TestEventsEndpoint:
@@ -337,7 +402,8 @@ class TestCommandCenterPage:
             html = (await c.get("/cc")).text
             for element_id in ("status-bar", "mode-badge", "account-id",
                                "dependency-chips", "last-event-time",
-                               "account-cards", "positions-panel", "action-rail",
+                               "quick-stats", "band-netliq", "band-daypnl",
+                               "positions-panel", "action-rail",
                                "orders-panel", "fills-panel", "strategies-panel",
                                "risk-panel", "degraded-banner", "drawer"):
                 assert f'id="{element_id}"' in html

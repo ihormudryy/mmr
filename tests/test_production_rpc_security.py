@@ -83,8 +83,9 @@ class _FakeClient:
 
 
 class _FakeTrader:
-    """Just enough of ``Trader`` for the three production query handlers
-    (``get_status``, ``get_account_values``, ``get_risk_limits``) to run."""
+    """Just enough of ``Trader`` for the production query handlers
+    (``get_status``, ``get_account_values``, ``get_portfolio_summary``,
+    ``get_risk_limits``) to run."""
 
     def __init__(self):
         self.ib_account = "DU12345"
@@ -93,6 +94,9 @@ class _FakeTrader:
 
     def status(self) -> dict:
         return {"ib_connected": True, "ib_upstream_connected": True}
+
+    def _get_portfolio_summary_sync(self):
+        return []
 
 
 @pytest.fixture()
@@ -182,6 +186,17 @@ class TestProductionRegistryHasRealQueries:
     def test_get_risk_limits_is_registered_as_query(self, production_registry):
         assert production_registry.contains("query", "get_risk_limits")
 
+    def test_get_portfolio_summary_is_registered_as_query(self, production_registry):
+        assert production_registry.contains("query", "get_portfolio_summary")
+
+    @pytest.mark.parametrize("method", [
+        "get_positions", "get_open_orders", "get_trades", "get_ib_account",
+        "get_fx_rates", "get_snapshot", "get_snapshots_batch", "get_market_depth",
+        "get_published_contracts", "diagnose_portfolio_feed", "reconcile_with_broker",
+    ])
+    def test_cli_surface_queries_are_registered(self, method, production_registry):
+        assert production_registry.contains("query", method)
+
     def test_registered_query_handlers_actually_work(self, production_registry):
         """Not just "registered" -- the handler must return the real data,
         proving build_production_registry wired live trader-backed methods
@@ -200,6 +215,10 @@ class TestProductionRegistryHasRealQueries:
         limits_reg = production_registry.resolve("query", "get_risk_limits")
         limits = limits_reg.handler({})
         assert isinstance(limits, dict) and limits  # a real, non-empty RiskLimits dump
+
+        portfolio_reg = production_registry.resolve("query", "get_portfolio_summary")
+        portfolio = portfolio_reg.handler({})
+        assert portfolio == {"positions": []}
 
 
 # ---------------------------------------------------------------------------

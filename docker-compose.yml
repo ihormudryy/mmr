@@ -211,6 +211,15 @@ services:
       # trading_runtime.py's typed_bind_address (G0 Task 5 fix). Feed
       # (42103) binds 0.0.0.0 too but is never host-published (see ports).
       TYPED_BIND_ADDRESS: tcp://0.0.0.0
+      # CLI inside this container (`mmr resolve`) uses the same HMAC key file
+      # as the typed server. Absolute path avoids '~' expansion surprises
+      # when trader.yaml still has the portable spelling.
+      MMR_SERVICE_HMAC_KEY_FILE: /home/trader/.config/mmr/service_hmac.key
+      # Strategy typed sockets live on the strategy container — needed when
+      # `mmr strategies` runs inside trader (list/enable/disable/reload).
+      STRATEGY_TYPED_ADDRESS: tcp://strategy
+      MMR_TYPED_STRATEGY_QUERY_ENDPOINT: tcp://strategy:42105
+      MMR_TYPED_STRATEGY_COMMAND_ENDPOINT: tcp://strategy:42104
       # Outbound: trader opens an RPCClient to strategy_service's own RPC
       # server (trading_runtime.py's self.zmq_strategy_client) -- must
       # target the strategy container by name, not 0.0.0.0.
@@ -223,11 +232,10 @@ services:
       - ${HOME}/.config/mmr:/home/trader/.config/mmr
       - mmr_db_data:/home/trader/.local/share/mmr/data
       - ${HOME}/.local/share/mmr/logs:/home/trader/.local/share/mmr/logs
-      # P3 Task 9: read-only signed artifact bundles for paper automation.
-      # Defaults stay disabled in trader.yaml; mount is always present so a
-      # paper enable does not require a compose edit. Live mode additionally
-      # refuses writable mounts inside ArtifactVerifier.
-      - ${HOME}/.local/share/mmr/artifacts:/home/trader/.local/share/mmr/artifacts:ro
+      # Paper-automation Activate (dashboard hot-arm) exports the fixture
+      # bundle HERE — must be writable on trader. Strategy keeps :ro below;
+      # ArtifactVerifier still refuses writable mounts in live mode.
+      - ${HOME}/.local/share/mmr/artifacts:/home/trader/.local/share/mmr/artifacts
     healthcheck:
       # LIVENESS ONLY. Semantic trading readiness is exposed by typed
       # get_status and gates automation; it must not restart-loop a healthy,
@@ -270,6 +278,11 @@ services:
     cpus: 1.0
     environment:
       <<: *mmr-common-env
+      # Typed query/command sockets (42104/42105) must bind 0.0.0.0 so sibling
+      # containers (dashboard deploy tab, trader coordinator) can reach them
+      # via the "strategy" DNS name — same fix as the trader service's
+      # TYPED_BIND_ADDRESS (loopback-only binds refuse cross-container TCP).
+      TYPED_BIND_ADDRESS: tcp://0.0.0.0
       # This service's own RPC server bind.
       ZMQ_STRATEGY_RPC_SERVER_ADDRESS: tcp://0.0.0.0
       # Outbound: subscribes to trader's ticker PubSub and MessageBus, and
@@ -284,6 +297,9 @@ services:
       # Without this the runtime falls back to TYPED_BIND_ADDRESS
       # (tcp://0.0.0.0 here -- its OWN bind), i.e. the wrong host.
       TRADER_TYPED_ADDRESS: tcp://trader
+      # Same HMAC key the dashboard / trader CLI use when calling strategy
+      # typed sockets (list/enable/disable/reload).
+      MMR_SERVICE_HMAC_KEY_FILE: /home/trader/.config/mmr/service_hmac.key
     volumes:
       - ${HOME}/.config/mmr:/home/trader/.config/mmr
       - mmr_db_data:/home/trader/.local/share/mmr/data
@@ -293,7 +309,7 @@ services:
       # strategy-service "verified" boolean).
       - ${HOME}/.local/share/mmr/artifacts:/home/trader/.local/share/mmr/artifacts:ro
     healthcheck:
-      test: ["CMD", "python3", "-c", "import socket; socket.create_connection(('127.0.0.1', 42005), timeout=3).close()"]
+      test: ["CMD", "python3", "-c", "import socket; socket.create_connection(('127.0.0.1', 42105), timeout=3).close()"]
       interval: 30s
       timeout: 5s
       retries: 3
@@ -337,6 +353,7 @@ services:
     command: ["python", "-m", "web.app"]
     depends_on:
       - trader
+      - strategy
     mem_limit: 1g
     cpus: 0.5
     environment:
@@ -351,10 +368,16 @@ services:
       MMR_DILL_STRICT: "1"
       # Session auth: login token + >=32-byte HMAC session secret, sourced from
       # .env (gitignored). The command center raises CredentialConfigError ->
-      # POST /session 500 without both. Read-only dashboard: commands stay
-      # disabled (DASHBOARD_COMMANDS_ENABLED unset -> false).
+      # POST /session 500 without both. Command affordances (Trading-tab
+      # enable/disable/approve) default off; set DASHBOARD_COMMANDS_ENABLED=true
+      # in .env to turn them on (must be passed through here — Compose does
+      # not auto-inject arbitrary .env keys into the service environment).
       DASHBOARD_TOKEN: ${DASHBOARD_TOKEN:-}
       DASHBOARD_SESSION_SECRET: ${DASHBOARD_SESSION_SECRET:-}
+      DASHBOARD_COMMANDS_ENABLED: ${DASHBOARD_COMMANDS_ENABLED:-false}
+      DASHBOARD_LIVE_COMMANDS_ENABLED: ${DASHBOARD_LIVE_COMMANDS_ENABLED:-false}
+      DASHBOARD_LIVE_ACCOUNT_ID: ${DASHBOARD_LIVE_ACCOUNT_ID:-}
+      DASHBOARD_LIVE_MAX_ORDER_NOTIONAL: ${DASHBOARD_LIVE_MAX_ORDER_NOTIONAL:-}
       # Shared service HMAC key for the typed-RPC seam to the trader (the read
       # bridge + command gateway authenticate with it). Same 0600 key the trader
       # loads via trader.yaml's service_hmac_key_file; it's already on the
@@ -378,6 +401,12 @@ services:
       MMR_TYPED_QUERY_ENDPOINT: tcp://trader:42101
       MMR_TYPED_FEED_ENDPOINT: tcp://trader:42103
       MMR_TYPED_COMMAND_ENDPOINT: tcp://trader:42102
+      # SDK typed clients (mmr resolve / propose) use this host; without it they
+      # fall back to trader.yaml's typed_bind_address (loopback) and miss the
+      # trader container. Prefer this over parsing MMR_TYPED_*_ENDPOINT.
+      TRADER_TYPED_ADDRESS: tcp://trader
+      MMR_TYPED_STRATEGY_QUERY_ENDPOINT: tcp://strategy:42105
+      MMR_TYPED_STRATEGY_COMMAND_ENDPOINT: tcp://strategy:42104
       MMR_PUBSUB_ADDRESS: tcp://trader
     ports:
       - "127.0.0.1:7424:7424"

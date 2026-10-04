@@ -327,10 +327,9 @@ class FakeSecurityDefinition:
 
 
 class _StubRPCClient:
-    """Minimal legacy RPC client -- `propose()` still resolves *symbol* to a
-    conId via `_resolve_contract`/`resolve_symbol` (a LOCAL universe lookup)
-    before it ever touches the typed command socket; `approve()`/`reject()`
-    don't use this at all anymore (fully typed)."""
+    """Minimal legacy RPC client kept for non-resolve RPCs. Symbol resolution
+    now goes through typed ``discover_instrument`` (see
+    ``_ResolveAwareTypedClient``); this stub's ``secdefs`` map feeds that."""
 
     def __init__(self, secdefs: dict):
         self.is_setup = True
@@ -350,17 +349,49 @@ class _StubRPCClient:
             def __call__(self, *args, **kwargs):
                 method = self._names[-1] if self._names else ''
                 outer.calls.append({'method': method, 'args': args, 'kwargs': kwargs})
-                if method == 'resolve_symbol':
-                    sym = args[0] if args else kwargs.get('symbol')
-                    return outer.secdefs.get(sym, [])
                 return None
 
         return _Chain()
 
 
+class _ResolveAwareTypedClient:
+    """Wraps the in-process typed client to serve ``discover_instrument`` /
+    ``resolve_instrument`` from the same local secdef map the old legacy
+    ``resolve_symbol`` stub used. Command-authority methods still hit the
+    real registry."""
+
+    def __init__(self, inner: _InProcessTypedClient, secdefs: dict):
+        self._inner = inner
+        self._by_symbol = secdefs
+        self._by_conid = {
+            int(d.conId): d for defs in secdefs.values() for d in defs
+        }
+
+    @staticmethod
+    def _wire(d) -> dict:
+        return {
+            'instrument_id': int(d.conId),
+            'symbol': str(d.symbol),
+            'exchange': str(getattr(d, 'exchange', '') or ''),
+            'primary_exchange': str(getattr(d, 'primaryExchange', '') or ''),
+            'currency': str(getattr(d, 'currency', '') or ''),
+            'security_type': str(getattr(d, 'secType', 'STK') or 'STK'),
+            'time_zone_id': '',
+        }
+
+    def call(self, method, body, response_model=None, timeout=None):
+        if method == 'discover_instrument':
+            defs = self._by_symbol.get(body.get('symbol'), [])
+            return {'instruments': [self._wire(d) for d in defs]}
+        if method == 'resolve_instrument':
+            d = self._by_conid.get(int(body['instrument_id']))
+            return {'instruments': [self._wire(d)] if d is not None else []}
+        return self._inner.call(method, body, response_model=response_model, timeout=timeout)
+
+
 def _make_mmr(stack, rpc_client) -> MMR:
     """Build a just-enough MMR wired to the in-process typed registry above
-    and a stub legacy RPC client (for `propose()`'s symbol resolution)."""
+    (command authority + symbol discovery)."""
     mmr = MMR.__new__(MMR)
     mmr._client = rpc_client
     mmr._data_client = None
@@ -378,7 +409,8 @@ def _make_mmr(stack, rpc_client) -> MMR:
     mmr._container = container
 
     mmr._typed_command_client = _InProcessTypedClient(stack.registry, 'command')
-    mmr._typed_query_client = _InProcessTypedClient(stack.registry, 'query')
+    query = _InProcessTypedClient(stack.registry, 'query')
+    mmr._typed_query_client = _ResolveAwareTypedClient(query, rpc_client.secdefs)
     return mmr
 
 

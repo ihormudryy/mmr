@@ -21,17 +21,23 @@ class Signal():
     quantity: float = 0.0
     date_time: dt.datetime = field(default_factory=dt.datetime.now)
     metadata: Dict[str, Any] = field(default_factory=dict)
-    # Time-based exit conditions — only honored in the backtester today
-    # (live-runtime treats them as None). A BUY signal with either field
-    # set causes the backtester to synthesize a SELL once the condition
-    # triggers: N bars elapsed since entry, or the current bar's time-
-    # of-day reaches ``close_by_time``. Both are optional; passing both
-    # means "whichever triggers first wins." Enables day-trading
-    # strategies (open-range breakout, VWAP reversion) to express their
-    # "flatten by 15:45 ET" / "bail if stagnant after 20 minutes" rules
-    # without every strategy re-implementing the same time-check logic.
+    # Time-based exit conditions, honored by the backtester (synthesized
+    # SELL) and by the live signal→proposal bridge (SignalProposer.
+    # check_exits proposes the close once the executed entry's condition
+    # triggers). A BUY signal with either field set exits after N bars
+    # elapsed since entry, or when the bar's time-of-day reaches
+    # ``close_by_time``. Both optional; both set means "whichever triggers
+    # first wins."
+    #
+    # ``close_by_time`` is interpreted in ``close_by_tz`` (IANA name, e.g.
+    # 'America/New_York'). Leaving close_by_tz None compares against the raw
+    # bar-index time-of-day — with UTC-keyed storage that is UTC, which for a
+    # session-local intent like "flat by 15:45 ET" is almost certainly WRONG
+    # (15:45 UTC is 10:45/11:45 ET). Strategies expressing session times MUST
+    # set close_by_tz.
     max_hold_bars: Optional[int] = None
     close_by_time: Optional[dt.time] = None
+    close_by_tz: Optional[str] = None
 
 
 class StrategyState(IntEnum):
@@ -173,6 +179,17 @@ class Strategy(ABC):
         return self._context.storage if self._context else None
 
     @property
+    def dispatch_conid(self) -> Optional[int]:
+        """ConId of the instrument the current ``on_prices`` call is for.
+
+        Stamped by the live strategy_runtime immediately before each
+        dispatch. None where nothing stamps it (e.g. the backtester's direct
+        ``on_bar`` path, which is single-instrument per replay timeline).
+        Multi-instrument strategies (pairs) must use this instead of
+        guessing identity from the data."""
+        return getattr(self, '_dispatch_conid', None)
+
+    @property
     def logging(self) -> Optional[Logger]:
         return self._context.logger if self._context else None
 
@@ -190,7 +207,8 @@ class Strategy(ABC):
         return self.state
 
     def on_prices(self, prices: pd.DataFrame) -> Optional[Signal]:
-        """Per-bar signal generation, legacy API.
+        """Per-bar signal generation, legacy API — and the ONLY hook the live
+        strategy_runtime dispatches.
 
         Receives the accumulated OHLCV slice up through the current bar.
         Easy to write, but recomputes indicators every bar — O(N²) total
@@ -198,12 +216,29 @@ class Strategy(ABC):
         vectorbt-backed indicators. For vectorbt / numba strategies, override
         ``precompute()`` + ``on_bar()`` instead.
 
-        Subclasses must implement at least one of ``on_prices`` (legacy) or
-        ``on_bar`` (fast path). The default here returns None so strategies
-        that only implement ``on_bar`` don't get AttributeError when the
-        backtester falls back.
+        Because the live runtime only calls ``on_prices``, a strategy that
+        implements just the fast path used to emit NOTHING live — silently.
+        This default therefore bridges: when a subclass overrides BOTH
+        ``precompute`` and ``on_bar`` (and not ``on_prices``), it runs the
+        same precompute over the accumulated window and evaluates ``on_bar``
+        at the latest bar — identical semantics, driven per-bar. O(N) per
+        call is fine live (one call per completed bar on a bounded window).
+        A subclass overriding neither hook still returns None.
         """
-        return None
+        cls = type(self)
+        overrides_precompute = cls.precompute is not Strategy.precompute
+        overrides_on_bar = cls.on_bar is not Strategy.on_bar
+        # Bridge only when BOTH fast-path hooks are overridden: on_bar's own
+        # default falls back to on_prices, so bridging with a default on_bar
+        # would recurse.
+        if not (overrides_precompute and overrides_on_bar):
+            return None
+        if prices is None or len(prices) == 0:
+            return None
+        state = self.precompute(prices)
+        if not state:
+            return None
+        return self.on_bar(prices, state, len(prices) - 1)
 
     # ------------------------------------------------------------------
     # Precompute hook — opt-in O(N) execution path for the backtester.

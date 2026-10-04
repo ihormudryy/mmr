@@ -284,6 +284,9 @@ class Backtester:
         #     'entry_bar_index': int,
         #     'max_hold_bars': Optional[int],
         #     'close_by_time': Optional[dt.time],
+        #     'close_by_tz': Optional[str],  # IANA tz close_by_time is in;
+        #                            # None = compare raw index time (UTC
+        #                            # with UTC-keyed storage).
         #     'pending_exit': bool,  # True once the synthetic SELL has been
         #                            # queued, so we don't re-trigger before
         #                            # the fill lands at next bar's open.
@@ -403,6 +406,7 @@ class Backtester:
                         'entry_bar_index': bar_index.get(conid, 0),
                         'max_hold_bars': signal.max_hold_bars,
                         'close_by_time': signal.close_by_time,
+                        'close_by_tz': getattr(signal, 'close_by_tz', None),
                         'pending_exit': False,
                     }
                 elif conid in exit_conditions:
@@ -489,10 +493,20 @@ class Backtester:
                         triggered = True
                         reason = f'max_hold_bars={cond["max_hold_bars"]}'
                 if not triggered and cond.get('close_by_time') is not None:
-                    t_of_day = (
-                        bar_ts_here.time() if hasattr(bar_ts_here, 'time')
-                        else None
-                    )
+                    # ``close_by_time`` is a session-local intent ("flat by
+                    # 15:45 ET"). Bars are keyed in UTC, so compare in the
+                    # signal's declared timezone — comparing the raw UTC
+                    # time-of-day against an ET target fired ~4-5 hours
+                    # early (15:45 UTC == 10:45/11:45 ET).
+                    t_of_day = None
+                    if hasattr(bar_ts_here, 'time'):
+                        ts = bar_ts_here
+                        tz_name = cond.get('close_by_tz')
+                        if tz_name:
+                            ts = pd.Timestamp(ts)
+                            ts = (ts.tz_localize('UTC') if ts.tzinfo is None
+                                  else ts).tz_convert(tz_name)
+                        t_of_day = ts.time()
                     if t_of_day is not None and t_of_day >= cond['close_by_time']:
                         triggered = True
                         reason = f'close_by_time={cond["close_by_time"]}'

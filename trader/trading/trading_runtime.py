@@ -92,7 +92,16 @@ class Trader():
                  typed_feed_port: int = 42103,
                  service_hmac_key_file: str = '',
                  unsafe_legacy_rpc: bool = False,
-                 command_authority: Optional[dict] = None):
+                 command_authority: Optional[dict] = None,
+                 strategy_typed_command_port: int = 42104,
+                 strategy_typed_query_port: int = 42105,
+                 strategy_typed_address: str = '',
+                 automation_enabled: bool = False,
+                 automation_live_enabled: bool = False,
+                 automation_artifact_bundle_path: str = '',
+                 automation_public_key_ring_path: str = '',
+                 automation_expected_artifact_id: str = '',
+                 automation_strategy_name: str = ''):
         self.ib_server_address = ib_server_address
         self.ib_server_port = ib_server_port
         self.trading_runtime_ib_client_id = trading_runtime_ib_client_id
@@ -106,6 +115,15 @@ class Trader():
         self.universe_library = universe_library
         self.simulation: bool = simulation
         self.paper_trading = paper_trading
+        self.strategy_typed_command_port = int(strategy_typed_command_port)
+        self.strategy_typed_query_port = int(strategy_typed_query_port)
+        self.strategy_typed_address = strategy_typed_address or ''
+        self.automation_enabled = bool(automation_enabled)
+        self.automation_live_enabled = bool(automation_live_enabled)
+        self.automation_artifact_bundle_path = automation_artifact_bundle_path or ''
+        self.automation_public_key_ring_path = automation_public_key_ring_path or ''
+        self.automation_expected_artifact_id = automation_expected_artifact_id or ''
+        self.automation_strategy_name = automation_strategy_name or ''
         # When True, `place_order_simple` (the direct buy/sell RPC path) is
         # rejected unless the caller explicitly sets `skip_risk_gate=True`
         # (close-all / liquidation). All actionable new trades must come
@@ -330,6 +348,17 @@ class Trader():
             self.broker_state_store.migrate(journal_migrator)
             from trader.trading.risk_producer import ReconciliationProducer
             ReconciliationProducer(journal_db, self.domain_journal).migrate(journal_migrator)
+            # Shrink the WAL window so an ungraceful restart is less likely to
+            # hit DuckDB's unreplayable-WAL INTERNAL Error (connect_duckdb
+            # recovers by quarantining the .wal, but checkpointing keeps the
+            # durable file current).
+            try:
+                self.domain_journal.connect().execute('CHECKPOINT')
+            except Exception as checkpoint_exc:  # noqa: BLE001
+                logging.warning(
+                    'journal CHECKPOINT after migrate failed (non-fatal): %s',
+                    checkpoint_exc,
+                )
             self.broker_ingest = BrokerIngest(
                 db=journal_db,
                 journal=self.domain_journal,
@@ -343,6 +372,13 @@ class Trader():
             )
             for adapter in broker_materialized_adapters(self.broker_state_store):
                 self.snapshot_service.register_adapter(adapter)
+            # Pause gate rows live in domain_materialized_entities (seeded /
+            # updated by TradingControlStore). Without this adapter the
+            # command-center baseline snapshot never includes trading_control,
+            # so the pause control sticks on "waiting…" until a live mutation.
+            from trader.data.materialized_state import GenericEntityAdapter
+            self.snapshot_service.register_adapter(
+                GenericEntityAdapter("trading_control"))
             self.feed_service = DomainFeedService(self.domain_journal)
             self.client.ib.connectedEvent += self.connected_event
             self.client.ib.disconnectedEvent += self.disconnected_event
@@ -362,6 +398,9 @@ class Trader():
                     'outside the fullstack test-profile runner.'
                 )
                 self.client.connect_fake(self.ib_account)
+                # connect_fake does not emit IB connectedEvent; broker sync and
+                # the command-center snapshot barrier live in connected_event().
+                self._fake_broker_schedule_connected = True
             else:
                 self.client.connect()
 
@@ -442,6 +481,10 @@ class Trader():
                 feed_service=self.feed_service,
                 command_stack=command_stack,
             )
+            if command_stack is not None:
+                hot_arm = getattr(command_stack, "paper_hot_arm", None)
+                if hot_arm is not None and hasattr(hot_arm, "attach_registry"):
+                    hot_arm.attach_registry(production_registry)
             if command_stack is None:
                 register_strategy_state_ingest(production_registry, self.domain_journal)
             self.typed_query_server = TypedRpcServer(
@@ -834,6 +877,16 @@ class Trader():
             self.disposables.clear()
             with self._pnl_subscriptions_lock:
                 self.pnl_subscriptions.clear()
+
+            if self._fake_broker_enabled():
+                # connect_fake leaves a never-dialed IB() instance: live
+                # reqPositionsAsync/reqAccountUpdates would hang forever, so
+                # promote one empty broker generation from the stub client and
+                # skip event subscriptions entirely.
+                if getattr(self, 'broker_ingest', None) is not None:
+                    await self.broker_ingest.run_broker_sync(
+                        self._fake_broker_sync_client())
+                return
 
             await self.setup_subscriptions()
 
@@ -2122,7 +2175,39 @@ class Trader():
         task = asyncio.create_task(_load_test_helper())
 
     def run(self, *args):
+        if getattr(self, '_fake_broker_schedule_connected', False):
+            self._fake_broker_schedule_connected = False
+            loop = asyncio.get_event_loop()
+            loop.create_task(self.connected_event())
         self.client.run(*args)
+
+    def _fake_broker_sync_client(self):
+        """Minimal IB stand-in so run_broker_sync can promote a generation
+        under MMR_FAKE_BROKER without dialing a real Gateway socket."""
+        from types import SimpleNamespace
+
+        account = self.ib_account
+
+        class _FakeIB:
+            def accountValues(self, _account_id):
+                return [SimpleNamespace(
+                    account=account, tag='NetLiquidation',
+                    currency='USD', value='100000',
+                )]
+
+            async def reqPositionsAsync(self):
+                return []
+
+            async def reqAllOpenOrdersAsync(self):
+                return []
+
+            async def reqCompletedOrdersAsync(self, *, apiOnly):
+                return []
+
+            async def reqExecutionsAsync(self):
+                return []
+
+        return SimpleNamespace(ib=_FakeIB())
 
 
 class TradingRuntimeOrderDispatch:

@@ -32,6 +32,16 @@ class ApprovalContextError(RuntimeError):
 
 
 @dataclass(frozen=True)
+class AllocationDispatchEvidence:
+    """Signed allocation context frozen at initial risk approval."""
+
+    artifact_digest: str
+    artifact_max_gross: float
+    authority_digest: Optional[str]
+    effective_gross_ceiling: float
+
+
+@dataclass(frozen=True)
 class ExecutableMarketEvidence:
     """Executable quote and its independent receipt clock."""
 
@@ -61,6 +71,7 @@ class ApprovalContext:
     broker: BrokerRiskSnapshot
     market: Optional[ExecutableMarketEvidence]
     what_if: Optional[WhatIfEvidence]
+    allocation: Optional[AllocationDispatchEvidence] = None
 
     def notional(self, quantity: float) -> float:
         if self.market is None:

@@ -130,3 +130,17 @@ loggers:
         level: DEBUG
         handlers: [strategy_service_handler, error_file_handler]
         propogate: no
+    # Cold vectorbt/numba JIT under DEBUG SSA dumps every IR stmt to the
+    # console and can exceed a 30s pytest budget on CI. Keep these quiet.
+    numba:
+        level: WARNING
+        propagate: no
+    numba.core:
+        level: WARNING
+        propagate: no
+    numba.core.ssa:
+        level: WARNING
+        propagate: no
+    llvmlite:
+        level: WARNING
+        propagate: no

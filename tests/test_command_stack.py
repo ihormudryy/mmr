@@ -185,9 +185,101 @@ def test_one_registry_contains_reads_feed_ingest_and_landed_commands(tmp_path):
         ("command", "cancel_order"),
         ("command", "pause_trading"),
         ("command", "resume_trading"),
+        ("command", "activate_paper_automation"),
+        ("command", "deactivate_paper_automation"),
+        ("query", "get_paper_automation_status"),
     }
     for role, method in expected:
         assert registry.contains(role, method), (role, method)
+
+
+def test_enabled_stack_wires_paper_automation_service_and_preflight_policy(
+    tmp_path, monkeypatch,
+):
+    from trader.trading.command_stack import build_command_stack
+
+    home = tmp_path / "home"
+    trader_yaml = tmp_path / "custom" / "trader.yaml"
+    strategy_yaml = tmp_path / "custom" / "strategies.yaml"
+    monkeypatch.setenv("HOME", str(home))
+    monkeypatch.setenv("TRADER_CONFIG", str(trader_yaml))
+    trader = _trader(tmp_path)
+    trader.strategy_config_file = str(strategy_yaml)
+
+    stack = build_command_stack(trader, _policy(), now=lambda: NOW)
+
+    service = stack.paper_automation_service
+    assert service._trader_yaml_path == trader_yaml
+    assert service._strategy_yaml_path == strategy_yaml
+    assert service._config_dir == home / ".config" / "mmr"
+    assert service._share_dir == home / ".local" / "share" / "mmr"
+    assert service._account_mode == "paper"
+    assert service._command_authority_enabled is True
+
+    registry = build_production_registry(
+        trader,
+        HmacServiceAuthenticator(b"k" * 32, now=lambda: 1_700_000_000.0),
+        command_stack=stack,
+    )
+    assert registry.contains("command", "activate_paper_automation")
+    assert registry.contains("command", "deactivate_paper_automation")
+    assert registry.contains("query", "get_paper_automation_status")
+    assert stack.coordinator._actions["activate_paper_automation"].requires_preflight is True
+    assert stack.coordinator._actions["deactivate_paper_automation"].requires_preflight is False
+
+
+def test_paper_automation_action_maps_activation_error_code():
+    from trader.automation.paper_activation import PaperAutomationActivationError
+    from trader.messaging.production_api import _paper_automation_action
+    from trader.trading.command_coordinator import CommandRequest, CommandValidationError
+
+    class RefusingService:
+        def activate(self, **_kwargs):
+            raise PaperAutomationActivationError("NOT_PAPER", "paper account required")
+
+    action = _paper_automation_action(RefusingService(), activate=True)
+    request = CommandRequest(
+        command_id="activate-paper-1",
+        action="activate_paper_automation",
+        account_id="DU111111",
+        target_type="paper_automation",
+        target_id="orb_gld",
+        expected_version=None,
+        body={"strategy_name": "orb_gld", "reason": "operator approved"},
+        source="operator",
+    )
+
+    with pytest.raises(CommandValidationError) as exc:
+        action(request)
+
+    assert exc.value.code == "NOT_PAPER"
+
+
+def test_paper_automation_action_maps_materials_error_code():
+    from trader.automation.paper_materials import PaperMaterialsError
+    from trader.messaging.production_api import _paper_automation_action
+    from trader.trading.command_coordinator import CommandRequest, CommandValidationError
+
+    class FailingService:
+        def activate(self, **_kwargs):
+            raise PaperMaterialsError("public key permissions too open")
+
+    action = _paper_automation_action(FailingService(), activate=True)
+    request = CommandRequest(
+        command_id="activate-paper-2",
+        action="activate_paper_automation",
+        account_id="DU111111",
+        target_type="paper_automation",
+        target_id="orb_gld",
+        expected_version=None,
+        body={"strategy_name": "orb_gld", "reason": "operator approved"},
+        source="operator",
+    )
+
+    with pytest.raises(CommandValidationError) as exc:
+        action(request)
+
+    assert exc.value.code == "PAPER_MATERIALS_ERROR"
 
 
 def test_enabled_stack_attaches_recovery_components_to_trader(tmp_path):
@@ -201,3 +293,77 @@ def test_enabled_stack_attaches_recovery_components_to_trader(tmp_path):
     assert trader.automation_circuit_breaker is stack.circuit_breaker
     assert trader.semantic_readiness is stack.semantic_readiness
     assert stack.circuit_breaker.store.get().state == "CLEAR"
+    assert stack.automated_intent_service is None
+
+
+def _automation_key_ring(tmp_path):
+    from cryptography.hazmat.primitives.asymmetric import ed25519
+
+    from trader.research.signing import public_key_pem
+
+    keys = tmp_path / "keys"
+    keys.mkdir()
+    priv = ed25519.Ed25519PrivateKey.generate()
+    (keys / "verify.pem").write_bytes(public_key_pem(priv.public_key()))
+    return str(keys)
+
+
+def test_paper_automation_registers_execute_automated_intent(tmp_path):
+    from trader.trading.command_stack import build_command_stack
+
+    trader = _trader(tmp_path)
+    trader.automation_enabled = True
+    trader.automation_live_enabled = False
+    trader.automation_public_key_ring_path = _automation_key_ring(tmp_path)
+    trader.automation_artifact_bundle_path = str(tmp_path / "artifacts")
+    trader.automation_expected_artifact_id = "artifact-test-1"
+    (tmp_path / "artifacts").mkdir()
+
+    stack = build_command_stack(trader, _policy(), now=lambda: NOW)
+    assert stack is not None
+    assert stack.automated_intent_service is not None
+
+    registry = build_production_registry(
+        trader,
+        HmacServiceAuthenticator(b"k" * 32, now=lambda: 1_700_000_000.0),
+        snapshot_service=DomainSnapshotService(trader.domain_journal),
+        feed_service=DomainFeedService(trader.domain_journal),
+        command_stack=stack,
+    )
+    assert registry.contains("command", "execute_automated_intent")
+
+
+def test_automation_disabled_does_not_register_automated_intent(tmp_path):
+    from trader.trading.command_stack import build_command_stack
+
+    trader = _trader(tmp_path)
+    trader.automation_enabled = False
+    stack = build_command_stack(trader, _policy(), now=lambda: NOW)
+    registry = build_production_registry(
+        trader,
+        HmacServiceAuthenticator(b"k" * 32, now=lambda: 1_700_000_000.0),
+        snapshot_service=DomainSnapshotService(trader.domain_journal),
+        feed_service=DomainFeedService(trader.domain_journal),
+        command_stack=stack,
+    )
+    assert stack.automated_intent_service is None
+    assert not registry.contains("command", "execute_automated_intent")
+
+
+def test_automation_live_enabled_refused_at_stack_build(tmp_path):
+    from trader.trading.command_stack import (
+        CommandStackConfigurationError,
+        build_command_stack,
+    )
+
+    trader = _trader(tmp_path)
+    trader.automation_enabled = True
+    trader.automation_live_enabled = True
+    trader.automation_public_key_ring_path = _automation_key_ring(tmp_path)
+    trader.automation_artifact_bundle_path = str(tmp_path / "artifacts")
+    trader.automation_expected_artifact_id = "artifact-test-1"
+    (tmp_path / "artifacts").mkdir()
+
+    with pytest.raises(CommandStackConfigurationError) as exc:
+        build_command_stack(trader, _policy(), now=lambda: NOW)
+    assert exc.value.code == "AUTOMATION_LIVE_REFUSED"

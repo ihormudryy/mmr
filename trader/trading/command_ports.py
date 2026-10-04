@@ -197,7 +197,8 @@ def _session_state(ticker) -> str:
 
 def _usable_price(value) -> Optional[float]:
     """A tradable price, or None. Rejects None, NaN, and non-positive values —
-    an empty/absent bid or ask must not become an executable quote."""
+    an empty/absent bid or ask must not become an executable quote. IB uses
+    ``-1`` as the "no top-of-book" sentinel — that is also rejected here."""
     if value is None:
         return None
     try:
@@ -209,14 +210,48 @@ def _usable_price(value) -> Optional[float]:
     return price
 
 
+def _side_wants_ask(side: str) -> bool:
+    """Map caller side tokens onto the ask vs bid leg.
+
+    Production callers pass ``"ask"`` / ``"bid"`` (proposal create, dispatch
+    guard, approval context). Tests and a few older paths pass ``"BUY"`` /
+    ``"SELL"``. Anything else is treated as bid-side so we never silently
+    invent an ask for an unknown token.
+    """
+    return side.upper() in ("BUY", "ASK")
+
+
+def _executable_price(ticker, *, side: str) -> Optional[float]:
+    """Crossable price for ``side``, with last/close fallback.
+
+    Prefer the live top-of-book (ask for buys, bid for sells). When the book
+    is empty — typical after hours, on delayed feeds without quote lines, or
+    when IB returns the ``-1`` sentinel — fall back to ``last`` then ``close``
+    so paper proposal sizing still has a reference. Live dispatch still
+    requires ``feed_type == "live"`` via the guard.
+    """
+    primary = (
+        getattr(ticker, "ask", None) if _side_wants_ask(side)
+        else getattr(ticker, "bid", None)
+    )
+    price = _usable_price(primary)
+    if price is not None:
+        return price
+    for attr in ("last", "close"):
+        price = _usable_price(getattr(ticker, attr, None))
+        if price is not None:
+            return price
+    return None
+
+
 class TraderQuoteAuthority:
     """``QuoteAuthority`` backed by a fresh IB snapshot (reqMktData ``Ticker``).
 
     Executable price = the BUY ask / SELL bid (the price you'd cross the spread
-    at). The quote carries the Ticker's REAL ``time`` so staleness is honest.
-    Returns None -- and the capture then fails closed -- when the contract can't
-    be resolved, the side has no usable price, the quote has no market
-    timestamp, or the snapshot fails."""
+    at), falling back to last/close when the book is empty. The quote carries
+    the Ticker's REAL ``time`` so staleness is honest. Returns None -- and the
+    capture then fails closed -- when the contract can't be resolved, no usable
+    price exists, the quote has no market timestamp, or the snapshot fails."""
 
     def __init__(self, trader, *, run_coro: Callable[[Any], Any],
                  resolve_contract: Callable[[int], Optional[Any]],
@@ -227,17 +262,34 @@ class TraderQuoteAuthority:
         self._delayed = delayed
 
     def executable_quote(self, conid: int, *, side: str) -> Optional[ExecutableQuote]:
+        quote = self._snapshot_quote(conid, side, delayed=self._delayed)
+        if quote is not None:
+            return quote
+        # Realtime IB API market data often needs an extra subscription
+        # (error 10089); delayed data is usually available on the same
+        # account. Prefer a delayed reference for paper sizing / proposal
+        # capture over failing closed with QUOTE_UNAVAILABLE. Live dispatch
+        # still rejects non-live feeds via FEED_NOT_LIVE in the guard.
+        if not self._delayed:
+            logger.info(
+                "realtime quote unavailable for conid %s; falling back to delayed",
+                conid,
+            )
+            return self._snapshot_quote(conid, side, delayed=True)
+        return None
+
+    def _snapshot_quote(
+        self, conid: int, side: str, *, delayed: bool,
+    ) -> Optional[ExecutableQuote]:
         try:
             contract = self._resolve_contract(conid)
             if contract is None:
                 return None
             ticker = self._run_coro(
-                self._trader.client.get_snapshot(contract, self._delayed))
+                self._trader.client.get_snapshot(contract, delayed))
             if ticker is None:
                 return None
-            raw = (getattr(ticker, "ask", None) if side.upper() == "BUY"
-                   else getattr(ticker, "bid", None))
-            price = _usable_price(raw)
+            price = _executable_price(ticker, side=side)
             if price is None:
                 return None
             market_timestamp = getattr(ticker, "time", None)
@@ -252,7 +304,10 @@ class TraderQuoteAuthority:
                 ask=_usable_price(getattr(ticker, "ask", None)),
             )
         except Exception as exc:  # noqa: BLE001 — no usable quote -> capture fails closed
-            logger.warning("executable_quote unavailable for conid %s: %s", conid, exc)
+            logger.warning(
+                "executable_quote unavailable for conid %s (delayed=%s): %s",
+                conid, delayed, exc,
+            )
             return None
 
 

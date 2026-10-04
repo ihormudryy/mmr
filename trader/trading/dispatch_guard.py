@@ -7,6 +7,7 @@ from dataclasses import dataclass
 from typing import Any, Optional
 
 from trader.data.broker_state import BrokerRiskSnapshotError
+from trader.promotion.allocation_policy import AllocationPolicy
 from trader.trading.command_policy import CommandAuthorityPolicy
 from trader.trading.trading_control import PauseStateUnavailable, TradingPausedError
 
@@ -47,6 +48,8 @@ class DispatchGuard:
     def __init__(
         self, *, broker, quotes, margin, controls, risk_gate,
         policy: CommandAuthorityPolicy, account_id: str, account_mode: str,
+        allocation_policy: Any = None,
+        allocation_authority_lookup: Any = None,
     ):
         self._broker = broker
         self._quotes = quotes
@@ -56,6 +59,8 @@ class DispatchGuard:
         self._policy = policy
         self._account_id = account_id
         self._account_mode = account_mode
+        self._allocation_policy = allocation_policy
+        self._allocation_authority_lookup = allocation_authority_lookup
 
     def revalidate(self, approved, request, now: dt.datetime) -> DispatchPermit:
         if request.account_id != self._account_id:
@@ -210,6 +215,34 @@ class DispatchGuard:
             leverage = self._risk_gate.check_leverage(margin, current.net_liquidation)
             if not leverage.approved:
                 raise DispatchGuardError("LEVERAGE_REJECTED", str(leverage.reason))
+
+        if (
+            self._allocation_policy is not None
+            and getattr(approved, "allocation", None) is not None
+            and _direction(approved.risk_direction) != "REDUCING"
+        ):
+            alloc_evidence = approved.allocation
+            authority = None
+            if self._allocation_authority_lookup is not None and alloc_evidence.authority_digest:
+                authority = self._allocation_authority_lookup(
+                    current.account_id, alloc_evidence.artifact_digest
+                )
+            decision = self._allocation_policy.revalidate_dispatch(
+                broker=current,
+                approved_broker=approved.broker,
+                conid=approved.conid,
+                side=approved.side,
+                quantity=abs(float(approved.quantity)),
+                entry_price=price,
+                authority=authority,
+                artifact_max_gross=alloc_evidence.artifact_max_gross,
+                artifact_digest=alloc_evidence.artifact_digest,
+                authority_digest=alloc_evidence.authority_digest,
+                effective_gross_ceiling=alloc_evidence.effective_gross_ceiling,
+            )
+            if not decision.approved:
+                code = decision.reason_codes[0] if decision.reason_codes else "GROSS_EXPOSURE"
+                raise DispatchGuardError(code, "allocation policy rejected at dispatch")
 
         return DispatchPermit(
             generation_id=current.generation_id,

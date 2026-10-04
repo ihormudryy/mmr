@@ -84,6 +84,27 @@ class TestReducer:
         assert env["operation"] == "delete"
         assert state.snapshot_view()["positions"] == []
 
+    def test_account_mode_aliases_account_mode_and_mode(self, state):
+        """Broker payloads use account_mode; badge historically read mode."""
+        state.apply(
+            _event(
+                event_id="acct-1",
+                event_type="account.updated",
+                entity_type="account",
+                entity_id="DU123",
+                source_cursor=10,
+                entity_revision=1,
+                payload={
+                    "account_id": "DU123",
+                    "account_mode": "paper",
+                    "net_liquidation": 100_000.0,
+                },
+            )
+        )
+        row = state.snapshot_view()["accounts"][0]
+        assert row["account_mode"] == "paper"
+        assert row["mode"] == "paper"
+
     def test_envelope_carries_full_contract(self, state):
         env = state.apply(_event(correlation_id="cmd-9"))
         for key in (

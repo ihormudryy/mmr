@@ -15,6 +15,8 @@ if PROJECT_ROOT not in sys.path:
 from trader.tools.idea_scanner import (
     IBIdeaScanner,
     IdeaScanner,
+    IdeaScannerError,
+    LIQUID_US_FALLBACK_TICKERS,
     PRESETS,
     PRESET_SCAN_CODES,
     ScanFilter,
@@ -23,6 +25,8 @@ from trader.tools.idea_scanner import (
     compute_ema,
     compute_rsi,
     compute_sma,
+    entitlement_fallback_notice,
+    is_data_entitlement_error,
     list_presets,
     parse_report_snapshot,
     to_dataframe,
@@ -169,6 +173,26 @@ class TestDiscovery:
             market_type='stocks',
         )
         assert len(snaps) == 1
+
+    def test_movers_not_authorized_raises_idea_scanner_error(self, scanner, mock_client):
+        mock_client.get_snapshot_direction.side_effect = Exception(
+            '{"status":"NOT_AUTHORIZED","message":"You are not entitled to this data."}'
+        )
+        with pytest.raises(IdeaScannerError, match='Starter\\+'):
+            scanner._discover('movers', None, None)
+
+
+class TestEntitlementHelpers:
+    def test_detects_massive_and_twelvedata_plan_errors(self):
+        assert is_data_entitlement_error(Exception('NOT_AUTHORIZED not entitled'))
+        assert is_data_entitlement_error(Exception('403 exclusively with pro or ultra'))
+        assert not is_data_entitlement_error(Exception('timeout'))
+
+    def test_fallback_notice_mentions_provider(self):
+        assert 'Massive' in entitlement_fallback_notice('massive')
+        assert 'TwelveData' in entitlement_fallback_notice('twelvedata')
+        assert len(LIQUID_US_FALLBACK_TICKERS) >= 5
+        assert len(LIQUID_US_FALLBACK_TICKERS) <= 8
 
     def test_market_scan_presets_auto_upgrade_source(self, scanner, mock_client):
         """Presets with use_market_scan=True should use 'market' source, not movers."""

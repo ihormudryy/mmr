@@ -190,12 +190,16 @@ class TestDetectsLeaks:
 # ---------------------------------------------------------------------------
 
 class TestCurrentStrategiesAreClean:
+    @pytest.mark.timeout(120)
     def test_vbt_macd_bb_no_lookahead(self):
         from strategies.vbt_macd_bb import VbtMacdBB
-        # Needs enough bars that MACD + BB warm up
+        # Needs enough bars that MACD + BB warm up; first-run numba JIT may
+        # take >30s on a cold CI runner.
         assert_no_lookahead(VbtMacdBB(), _ohlcv(400))
 
+    @pytest.mark.timeout(120)
     def test_smi_crossover_no_lookahead(self):
         from strategies.smi_crossover import SMICrossOver
-        # SLOW_WINDOW is 50; give it enough headroom above that
+        # SLOW_WINDOW is 50; give it enough headroom above that. First-run
+        # vectorbt/numba JIT may take >30s on a cold CI runner.
         assert_no_lookahead(SMICrossOver(), _ohlcv(400))

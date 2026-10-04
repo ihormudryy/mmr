@@ -25,7 +25,16 @@ class OpeningDriveFade(Strategy):
 
     DRIVE_WINDOW_MIN = 30          # first 30 min establishes the drive extreme
     ENTRY_WINDOW_END_MIN = 120     # entries allowed until 11:30 ET
-    DRIVE_ATR_MULT = 1.5           # drive must be >= 1.5 × ATR(14-day)
+    # Drive must be >= this × the 14-day DAILY average true range. NOTE: the
+    # original code computed "ATR" as the mean PER-1-MINUTE-BAR true range
+    # over ~14 days of bars — 1.5× an average one-minute range is a few
+    # cents, so the "notable drive" gate was trivially passed by any open.
+    # Against a real daily ATR, 1.5 would mean a 30-minute move exceeding
+    # 1.5 full daily ranges (flash-crash rare). 0.5 — half a typical day's
+    # range in the first 30 minutes — is a judgment default for "big
+    # directional drive"; re-validate with a sweep before arming.
+    DRIVE_ATR_MULT = 0.5
+    ATR_DAYS = 14                  # trailing days for the daily ATR
     RSI_PERIOD = 14
     RSI_OVERSOLD = 30
     VOL_EXHAUST_MULT = 0.75        # current bar vol < 0.75× 20-bar avg = exhaustion
@@ -53,29 +62,48 @@ class OpeningDriveFade(Strategy):
         low = prices["low"].to_numpy()
         volume = prices["volume"].to_numpy()
 
-        # Session VWAP
-        pv = prices["close"] * prices["volume"]
+        rth_mask_ser = pd.Series(rth_mask, index=prices.index)
+
+        # Session VWAP, RTH-anchored — extended-hours prints contribute
+        # nothing to the fade target.
+        pv = (prices["close"] * prices["volume"]).where(rth_mask_ser, 0.0)
+        v = prices["volume"].where(rth_mask_ser, 0.0)
         cum_pv = pv.groupby(et_date).cumsum()
-        cum_v = prices["volume"].groupby(et_date).cumsum()
-        vwap = (cum_pv / cum_v.replace(0, np.nan)).fillna(prices["close"]).to_numpy()
+        cum_v = v.groupby(et_date).cumsum()
+        vwap = (cum_pv / cum_v.replace(0, np.nan)).to_numpy()
 
         # Day-minutes since RTH open (negative pre-market)
         minutes_since_open = et_minute - self.RTH_OPEN_MIN
         drive_window_mask = rth_mask & (minutes_since_open < self.DRIVE_WINDOW_MIN)
         drive_ser = pd.Series(drive_window_mask, index=prices.index)
 
-        # Per-day: open at RTH, min during drive window
-        rth_mask_ser = pd.Series(rth_mask, index=prices.index)
-        day_open = prices["open"].where(rth_mask_ser).groupby(et_date).transform("first").to_numpy()
-        drive_low = prices["low"].where(drive_ser).groupby(et_date).transform("min").to_numpy()
+        # Per-day references, computed CAUSALLY (carry-forward, never
+        # broadcast backward): the previous transform('first')/('min') put
+        # the day's open and the eventual window-min on bars BEFORE they
+        # existed — future data at those indices per assert_no_lookahead.
+        first_rth = rth_mask_ser & (rth_mask_ser.groupby(et_date).cumsum() == 1)
+        day_open = prices["open"].where(first_rth).groupby(et_date).ffill().to_numpy()
+        # Running min of the low over the drive window; after the window it
+        # carries the window's final min forward for the rest of the day.
+        drive_low = (
+            prices["low"].where(drive_ser).groupby(et_date).cummin()
+            .groupby(et_date).ffill().to_numpy()
+        )
 
-        # ATR(14-day-worth-of-bars) — for 1-min data, ~14*390 = 5460 bars
-        tr1 = prices["high"] - prices["low"]
-        tr2 = (prices["high"] - prices["close"].shift()).abs()
-        tr3 = (prices["low"] - prices["close"].shift()).abs()
-        tr = pd.concat([tr1, tr2, tr3], axis=1).max(axis=1)
-        atr_bars = 14 * 390  # approximate — 14 trading days of 1-min bars
-        atr = tr.rolling(atr_bars, min_periods=390).mean().to_numpy()
+        # DAILY ATR over the prior ATR_DAYS sessions (RTH aggregates,
+        # shifted so today's still-forming range never contributes — the
+        # same causal per-day pattern LateDayMomentum uses).
+        day_high = prices["high"].where(rth_mask_ser).groupby(et_date).max()
+        day_low_full = prices["low"].where(rth_mask_ser).groupby(et_date).min()
+        day_close = prices["close"].where(rth_mask_ser).groupby(et_date).last()
+        prev_close_daily = day_close.shift(1)
+        tr_daily = pd.concat([
+            (day_high - day_low_full),
+            (day_high - prev_close_daily).abs(),
+            (day_low_full - prev_close_daily).abs(),
+        ], axis=1).max(axis=1)
+        atr_daily = tr_daily.shift(1).rolling(self.ATR_DAYS, min_periods=5).mean()
+        atr = et_date.map(atr_daily).to_numpy(dtype=float)
 
         # Drive magnitude: (day_open - drive_low)
         drive_down = day_open - drive_low
@@ -145,9 +173,31 @@ class OpeningDriveFade(Strategy):
         if low - drive_low > 0.2 * atr:
             return None
 
+        # Edge-trigger: the exhaustion conditions (RSI oversold + volume
+        # drying up + near the low) are states that can persist for several
+        # bars — emit only on the bar where the full setup FORMS, so the
+        # backtester doesn't pyramid per bar and the bridge doesn't spam.
+        if index >= 1:
+            p = index - 1
+            prev_formed = (
+                bool(state["entry_window"][p])
+                and not np.isnan(state["rsi"][p])
+                and not np.isnan(state["vol_avg"][p]) and state["vol_avg"][p] > 0
+                and not np.isnan(state["drive_down"][p]) and not np.isnan(state["atr"][p])
+                and state["atr"][p] > 0
+                and state["drive_down"][p] >= state["atr"][p] * self.DRIVE_ATR_MULT
+                and state["close"][p] < state["vwap"][p]
+                and state["rsi"][p] <= self.RSI_OVERSOLD
+                and state["vol"][p] <= state["vol_avg"][p] * self.VOL_EXHAUST_MULT
+                and (state["low"][p] - state["drive_low"][p]) <= 0.2 * state["atr"][p]
+            )
+            if prev_formed:
+                return None
+
         return Signal(
             source_name=self.name, action=Action.BUY,
             probability=0.62, risk=0.38,
             close_by_time=dtime(self.EOD_HOUR, self.EOD_MINUTE),
+            close_by_tz="America/New_York",
             max_hold_bars=self.MAX_HOLD_BARS,
         )

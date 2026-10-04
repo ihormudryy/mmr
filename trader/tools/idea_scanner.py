@@ -24,6 +24,50 @@ class IdeaScannerError(RuntimeError):
     DataFrame, per the project's "fail loudly" principle."""
 
 
+def is_data_entitlement_error(exc: BaseException) -> bool:
+    """True when the provider rejected the call for plan/tier reasons.
+
+    Massive Stocks Basic returns ``NOT_AUTHORIZED`` / "not entitled" on
+    snapshot + movers endpoints (Starter+ required). TwelveData Basic/Starter
+    returns HTTP 403 on ``/market_movers/*`` (Pro+ required). Quotes and
+    history on those same keys often still work.
+    """
+    text = str(exc).lower()
+    return (
+        'not_authorized' in text
+        or 'not entitled' in text
+        or 'exclusively with pro' in text
+        or 'consider upgrading' in text
+        or ('403' in text and ('upgrade' in text or 'pricing' in text or 'plan' in text))
+    )
+
+
+# Liquid large-cap US names used when market-movers APIs aren't entitled.
+# Kept ≤8 so a TwelveData Basic key (8 credits/min) can finish one scan
+# without a 429 — each /quote symbol costs 1 credit on most plans.
+LIQUID_US_FALLBACK_TICKERS: List[str] = [
+    'AAPL', 'MSFT', 'NVDA', 'AMZN', 'GOOGL', 'META', 'TSLA', 'AMD',
+]
+
+
+def entitlement_fallback_notice(provider: str, detail: str = '') -> str:
+    """Plain-English notice when we fall back off a movers endpoint."""
+    detail = (detail or '').strip()
+    suffix = f' ({detail[:160]})' if detail else ''
+    if provider == 'massive':
+        return (
+            'Massive Stocks Basic does not include snapshot/movers APIs '
+            '(Starter+ required); fell back to TwelveData quotes on a liquid '
+            f'US ticker set{suffix}. Upgrade Massive or pass --tickers / '
+            '--universe for a custom scan.'
+        )
+    return (
+        'TwelveData /market_movers requires Pro+; fell back to quotes on a '
+        f'liquid US ticker set{suffix}. Upgrade TwelveData or pass --tickers / '
+        '--universe for a custom scan.'
+    )
+
+
 # ------------------------------------------------------------------
 # Dataclasses
 # ------------------------------------------------------------------
@@ -591,6 +635,27 @@ class IdeaScanner:
         universe_symbols: Optional[List[str]],
     ) -> list:
         """Fetch raw snapshots from Massive.com."""
+        try:
+            return self._discover_raw(source, tickers, universe_symbols)
+        except Exception as ex:
+            if is_data_entitlement_error(ex):
+                raise IdeaScannerError(
+                    'Massive snapshot/movers not entitled on this API key '
+                    '(Stocks Basic excludes snapshots — need Starter+ at '
+                    'https://massive.com/pricing). '
+                    f'Detail: {ex}. '
+                    'Workaround: `ideas --source twelvedata --tickers AAPL MSFT NVDA` '
+                    'or `--universe NAME` (TwelveData quotes work on Basic), '
+                    'or upgrade the Massive plan.'
+                ) from ex
+            raise
+
+    def _discover_raw(
+        self,
+        source: str,
+        tickers: Optional[List[str]],
+        universe_symbols: Optional[List[str]],
+    ) -> list:
         if source == 'tickers' and tickers:
             return list(self._client.get_snapshot_all(
                 market_type='stocks', tickers=tickers,
@@ -1551,7 +1616,16 @@ class TwelveDataIdeaScanner:
         filters = merge_filters(scan_preset, custom_filters)
 
         # 1. Discover.
-        quotes = self._discover(source, tickers, universe_symbols, scan_preset)
+        notice: Optional[str] = None
+        try:
+            quotes = self._discover(source, tickers, universe_symbols, scan_preset)
+        except IdeaScannerError as ex:
+            # Movers (default) Pro+-gated; quotes still work on Basic/Starter.
+            if source in ('tickers', 'universe') or not is_data_entitlement_error(ex):
+                raise
+            notice = entitlement_fallback_notice('twelvedata', str(ex))
+            logger.warning(notice)
+            quotes = self._batch_quote(list(LIQUID_US_FALLBACK_TICKERS))
         if not quotes:
             return pd.DataFrame()
 
@@ -1609,7 +1683,10 @@ class TwelveDataIdeaScanner:
 
         # 10. News is a known gap on TwelveData — silently skip even if
         # requested. The caller's --news flag still controls column output.
-        return to_dataframe(candidates, fundamentals=fundamentals, news=news)
+        df = to_dataframe(candidates, fundamentals=fundamentals, news=news)
+        if notice:
+            df.attrs['ideas_notice'] = notice
+        return df
 
     # ------------------------------------------------------------------
     # Discovery
@@ -1663,9 +1740,18 @@ class TwelveDataIdeaScanner:
                     'percent_change': e.get('percent_change'),
                 })
         if errors and not combined:
+            detail = str(errors[0])
+            hint = ''
+            low = detail.lower()
+            if '403' in detail or 'pro or ultra' in low or 'exclusively with' in low:
+                hint = (
+                    ' TwelveData /market_movers requires a Pro+ plan. '
+                    'Use `ideas --tickers AAPL MSFT NVDA` (quotes work on Basic), '
+                    'or upgrade at https://twelvedata.com/pricing.'
+                )
             raise IdeaScannerError(
                 f'TwelveData movers discovery failed for all directions: '
-                f'{errors[0]}'
+                f'{errors[0]}.{hint}'
             ) from errors[0]
         return combined
 

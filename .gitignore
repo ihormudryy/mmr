@@ -8,6 +8,7 @@ __pycache__/
 .devcontainer/
 .idea/
 .superpowers/
+.DS_Store/
 
 *.csv
 *.tar*

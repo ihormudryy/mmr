@@ -104,8 +104,11 @@ python_files = ["test_*.py"]
 python_functions = ["test_*"]
 # Default per-test budget so a leaked ZMQ Context.term() (or similar C-level
 # block) fails the test instead of wedging the whole suite forever.
+# ``thread`` (not ``signal``): SIGALRM cannot interrupt C-level waits or
+# Starlette TestClient portal ``thread.join()`` after an abandoned manage RPC,
+# which is what made CI jobs hang until the runner killed them (~4:30).
 timeout = 30
-timeout_method = "signal"
+timeout_method = "thread"
 
 [tool.isort]
 multi_line_output = 3

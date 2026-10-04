@@ -189,19 +189,29 @@ class MMR:
         self._timeout = timeout
 
         # [M1-F3] Task 8: typed, HMAC-authenticated query/command sockets --
-        # the ONLY path `propose`/`proposals`/`reject`/`approve` use to reach
-        # trader_service's command-authority coordinator (registered via
-        # `register_command_authority` in `trader/messaging/production_api.py`).
-        # Same host as the legacy RPC (`_rpc_address`); only the ports differ
-        # (`typed_query_port`/`typed_command_port` in trader.yaml). Lazily
-        # connected on first use (see `_ensure_typed_clients`) so a plain
-        # `mmr portfolio` doesn't require a configured service_hmac_key_file.
-        self._typed_address = (os.getenv('TYPED_RPC_SERVER_ADDRESS') or None) or cfg.get('typed_bind_address', 'tcp://127.0.0.1')
+        # propose / resolve / approve / manage go here. Legacy dill RPC
+        # (42001) is NOT bound in the split-container topology, so clients
+        # must dial the typed query/command ports (42101/42102). Address
+        # resolution: TRADER_TYPED_ADDRESS / TYPED_RPC_SERVER_ADDRESS /
+        # MMR_TYPED_*_ENDPOINT host, then yaml typed_bind with 0.0.0.0→loopback.
+        # Lazily connected on first use (see `_ensure_typed_clients`).
+        self._typed_address = self._resolve_typed_client_address(cfg)
         self._typed_query_port = cfg.get('typed_query_port', 42101)
         self._typed_command_port = cfg.get('typed_command_port', 42102)
-        self._service_hmac_key_file = cfg.get('service_hmac_key_file', '')
+        self._service_hmac_key_file = (
+            (os.getenv('MMR_SERVICE_HMAC_KEY_FILE') or '').strip()
+            or cfg.get('service_hmac_key_file', '')
+        )
         self._typed_query_client: Optional['TypedRpcClient'] = None
         self._typed_command_client: Optional['TypedRpcClient'] = None
+        # Strategy-service typed ports (list/enable/disable/reload). Defaults
+        # match compose's published strategy endpoints; override via
+        # MMR_TYPED_STRATEGY_*_ENDPOINT or STRATEGY_TYPED_ADDRESS.
+        self._strategy_typed_address = self._resolve_strategy_typed_address(cfg)
+        self._strategy_typed_query_port = cfg.get('strategy_typed_query_port', 42105)
+        self._strategy_typed_command_port = cfg.get('strategy_typed_command_port', 42104)
+        self._strategy_typed_query_client: Optional['TypedRpcClient'] = None
+        self._strategy_typed_command_client: Optional['TypedRpcClient'] = None
 
         self._client: Optional[RPCClient[TraderServiceApi]] = None
         self._data_client: Optional[RPCClient[DataServiceApi]] = None
@@ -217,6 +227,14 @@ class MMR:
     # ------------------------------------------------------------------
     # Connection lifecycle
     # ------------------------------------------------------------------
+
+    _LEGACY_UNAVAILABLE = (
+        '{op} requires the offline-simulation legacy RPC (port 42001), which '
+        'is not bound in the split-container production topology. '
+        'Use `mmr propose` → `mmr approve` for new trades; cancel/close via '
+        'the dashboard command center where available; or run with '
+        '`unsafe_legacy_rpc: true` + `--simulation True` for direct orders.'
+    )
 
     def connect(self) -> 'MMR':
         """Connect to trader_service.  Returns *self* for chaining."""
@@ -268,6 +286,24 @@ class MMR:
         self._typed_query_client = query_client
         self._typed_command_client = command_client
 
+    def _ensure_strategy_typed_clients(self) -> None:
+        if self._strategy_typed_query_client is not None and self._strategy_typed_command_client is not None:
+            return
+        from trader.messaging.typed_rpc import HmacServiceAuthenticator, TypedRpcClient, load_service_hmac_key
+        authenticator = HmacServiceAuthenticator(load_service_hmac_key(self._service_hmac_key_file))
+        query_client = TypedRpcClient(
+            'query', authenticator, address=self._strategy_typed_address,
+            port=self._strategy_typed_query_port, timeout=self._timeout,
+        )
+        query_client.connect()
+        command_client = TypedRpcClient(
+            'command', authenticator, address=self._strategy_typed_address,
+            port=self._strategy_typed_command_port, timeout=self._timeout,
+        )
+        command_client.connect()
+        self._strategy_typed_query_client = query_client
+        self._strategy_typed_command_client = command_client
+
     @property
     def _typed_query(self) -> 'TypedRpcClient':
         self._ensure_typed_clients()
@@ -277,6 +313,16 @@ class MMR:
     def _typed_command(self) -> 'TypedRpcClient':
         self._ensure_typed_clients()
         return self._typed_command_client
+
+    @property
+    def _strategy_typed_query(self) -> 'TypedRpcClient':
+        self._ensure_strategy_typed_clients()
+        return self._strategy_typed_query_client
+
+    @property
+    def _strategy_typed_command(self) -> 'TypedRpcClient':
+        self._ensure_strategy_typed_clients()
+        return self._strategy_typed_command_client
 
     def close(self) -> None:
         """Disconnect and clean up resources."""
@@ -295,6 +341,12 @@ class MMR:
         if self._typed_command_client:
             self._typed_command_client.close()
             self._typed_command_client = None
+        if self._strategy_typed_query_client:
+            self._strategy_typed_query_client.close()
+            self._strategy_typed_query_client = None
+        if self._strategy_typed_command_client:
+            self._strategy_typed_command_client.close()
+            self._strategy_typed_command_client = None
 
     def __enter__(self) -> 'MMR':
         return self.connect()
@@ -307,6 +359,120 @@ class MMR:
         if self._client is None or not self._client.is_setup:
             raise ConnectionError("Not connected. Call .connect() first.")
         return self._client
+
+    def _legacy_or_raise(self, op: str):
+        """Return legacy RPC client, or raise a clear production-topology error."""
+        try:
+            return self._rpc
+        except ConnectionError as exc:
+            raise ConnectionError(self._LEGACY_UNAVAILABLE.format(op=op)) from exc
+
+    def _map_legacy_route_error(self, op: str, exc: BaseException) -> None:
+        """Rewrite ZMQ 'no route to server' into an actionable message."""
+        text = str(exc).lower()
+        if 'no route to server' in text or 'could not be sent' in text:
+            raise ConnectionError(self._LEGACY_UNAVAILABLE.format(op=op)) from exc
+        raise exc
+
+    @staticmethod
+    def _resolve_strategy_typed_address(cfg: dict) -> str:
+        for key in ('STRATEGY_TYPED_ADDRESS',):
+            val = (os.getenv(key) or '').strip()
+            if val:
+                return val
+        for key in ('MMR_TYPED_STRATEGY_QUERY_ENDPOINT', 'MMR_TYPED_STRATEGY_COMMAND_ENDPOINT'):
+            endpoint = (os.getenv(key) or '').strip()
+            if not endpoint:
+                continue
+            from urllib.parse import urlparse
+            parsed = urlparse(endpoint)
+            if parsed.scheme and parsed.hostname:
+                return f'{parsed.scheme}://{parsed.hostname}'
+        # Same-host default: strategy typed ports live beside trader.
+        return MMR._resolve_typed_client_address(cfg)
+
+    @staticmethod
+    def _resolve_typed_client_address(cfg: dict) -> str:
+        """Host for typed query/command clients (not the bind address).
+
+        Precedence: ``TRADER_TYPED_ADDRESS`` / ``TYPED_RPC_SERVER_ADDRESS`` →
+        host of ``MMR_TYPED_QUERY_ENDPOINT`` / ``MMR_TYPED_COMMAND_ENDPOINT`` →
+        yaml ``typed_bind_address`` with all-interfaces remapped to loopback
+        (a client cannot dial ``tcp://0.0.0.0``).
+        """
+        for key in ('TRADER_TYPED_ADDRESS', 'TYPED_RPC_SERVER_ADDRESS'):
+            val = (os.getenv(key) or '').strip()
+            if val:
+                return val
+        for key in ('MMR_TYPED_QUERY_ENDPOINT', 'MMR_TYPED_COMMAND_ENDPOINT'):
+            endpoint = (os.getenv(key) or '').strip()
+            if not endpoint:
+                continue
+            from urllib.parse import urlparse
+            parsed = urlparse(endpoint)
+            if parsed.scheme and parsed.hostname:
+                return f'{parsed.scheme}://{parsed.hostname}'
+        bind = (cfg.get('typed_bind_address') or 'tcp://127.0.0.1').strip()
+        # Server bind env (TYPED_BIND_ADDRESS) may override yaml in compose;
+        # honour it only when remapping the client target.
+        env_bind = (os.getenv('TYPED_BIND_ADDRESS') or '').strip()
+        if env_bind:
+            bind = env_bind
+        if bind in ('tcp://0.0.0.0', 'tcp://*', 'tcp://[::]', 'tcp://::'):
+            return 'tcp://127.0.0.1'
+        return bind or 'tcp://127.0.0.1'
+
+    @staticmethod
+    def _instrument_id(symbol: Union[str, int]) -> Optional[int]:
+        """Treat ints and all-digit strings as exact conIds (never as tickers)."""
+        if type(symbol) is int:
+            return symbol
+        if type(symbol) is str and symbol.isnumeric():
+            return int(symbol)
+        return None
+
+    @staticmethod
+    def _security_definition_from_wire(row: dict) -> SecurityDefinition:
+        """Rebuild a SecurityDefinition from typed-RPC instrument wire fields."""
+        return SecurityDefinition(
+            symbol=str(row.get('symbol') or ''),
+            exchange=str(row.get('exchange') or ''),
+            conId=int(row.get('instrument_id') or 0),
+            secType=str(row.get('security_type') or 'STK'),
+            primaryExchange=str(row.get('primary_exchange') or ''),
+            currency=str(row.get('currency') or ''),
+            tradingClass='',
+            includeExpired=False,
+            secIdType='',
+            secId='',
+            description='',
+            minTick=0.01,
+            orderTypes='',
+            validExchanges='',
+            priceMagnifier=1.0,
+            longName='',
+            category='',
+            subcategory='',
+            tradingHours='',
+            timeZoneId=str(row.get('time_zone_id') or ''),
+            liquidHours='',
+            stockType='',
+            minSize=1.0,
+            sizeIncrement=1.0,
+            suggestedSizeIncrement=1.0,
+            bondType='',
+            couponType='',
+            callable=False,
+            putable=False,
+            coupon=0.0,
+            convertable=False,
+            maturity='',
+            issueDate='',
+            nextOptionDate='',
+            nextOptionPartial=False,
+            nextOptionType='',
+            marketRuleIds='',
+        )
 
     # ------------------------------------------------------------------
     # Symbol resolution (internal helper)
@@ -322,58 +488,46 @@ class MMR:
     ) -> List[SecurityDefinition]:
         """Resolve a symbol string or conId to SecurityDefinition(s) via trader_service.
 
-        Lookup order:
-          1. Local universe DB (``Trader.resolve_symbol``). If the caller passed
-             ``exchange``/``universe``, they filter the DB query.
-          2. For integer conIds: return empty if step 1 missed — no IB fallback,
-             conIds must be exact.
-          3. For string symbols: IB discovery via ``resolve_contract``. We ship
-             a Contract populated with whatever hints the caller gave (empty
-             exchange/currency included) and let IB's ``reqContractDetails``
-             return every matching listing. Previous behaviour defaulted empty
-             hints to ``exchange='SMART', currency='USD'`` — that silently
-             picked wrong ADRs for ASX/SEHK/TSE primary listings, which is the
-             "close enough lookup" CLAUDE.md explicitly forbids.
+        Uses the typed query socket (``discover_instrument`` /
+        ``resolve_instrument``) — legacy dill RPC port 42001 is not bound in
+        the split-container topology.
 
-        Returns every surviving candidate after collapsing venue duplicates
-        (same conId, same currency — IB reports each stock on every venue it
-        trades, e.g. AAPL on NASDAQ/BATS/ARCA/ISLAND, which all share one
-        conId). Cross-exchange dual-listings (BHP on ASX vs NYSE) have
-        *different* conIds so they survive and come back as real ambiguity
-        the caller has to resolve.
+        Lookup order (server-side):
+          1. Local universe DB. ``exchange`` filters the query; ``universe`` is
+             accepted for API compatibility but not forwarded on the typed
+             wire (discover has no universe field).
+          2. For conIds (int or all-digit string): exact ``resolve_instrument``
+             — may qualify the same conId via IB ``Contract(conId=N)``, never
+             a fuzzy ticker search (``4391`` must not become TSEJ ``"4391"``).
+          3. For string symbols: IB discovery with the caller's exchange/
+             currency hints (empty included — no SMART/USD defaults).
+
+        Returns candidates after collapsing venue duplicates (same conId +
+        currency). Dual listings with different conIds survive as ambiguity.
         """
-        result = consume(
-            self._rpc.rpc(return_type=list[SecurityDefinition]).resolve_symbol(
-                symbol, exchange, universe, sec_type
+        del universe  # typed discover_instrument has no universe filter
+        instrument_id = self._instrument_id(symbol)
+        if instrument_id is not None:
+            response = self._typed_query.call(
+                'resolve_instrument',
+                {'instrument_id': instrument_id},
+                dict,
             )
+            rows = response.get('instruments') or []
+            return [self._security_definition_from_wire(r) for r in rows]
+
+        response = self._typed_query.call(
+            'discover_instrument',
+            {
+                'symbol': str(symbol),
+                'exchange': exchange or '',
+                'currency': currency or '',
+                'sec_type': sec_type or 'STK',
+            },
+            dict,
         )
-        if result:
-            return result
-
-        # No IB fallback for integer conIds — must be exact.
-        if type(symbol) is int:
-            return []
-
-        if sec_type == 'CASH':
-            # Forex is always IDEALPRO; parse EURUSD-style into base + quote.
-            pair = str(symbol).replace('/', '').replace('C:', '').upper()
-            base = pair[:3] if len(pair) == 6 else pair
-            quote_ccy = pair[3:] if len(pair) == 6 else 'USD'
-            contract = Contract(symbol=base, secType='CASH', exchange='IDEALPRO', currency=quote_ccy)
-        else:
-            # Ship whatever hints the caller gave — empty strings included.
-            # reqContractDetails interprets an unset exchange as "any" and
-            # returns the full candidate list.
-            contract = Contract(
-                symbol=str(symbol),
-                exchange=exchange,
-                secType=sec_type or 'STK',
-                currency=currency,
-            )
-
-        candidates = consume(
-            self._rpc.rpc(return_type=list[SecurityDefinition]).resolve_contract(contract)
-        )
+        rows = response.get('instruments') or []
+        candidates = [self._security_definition_from_wire(r) for r in rows]
         return self._dedupe_venue_duplicates(candidates)
 
     @staticmethod
@@ -435,18 +589,25 @@ class MMR:
                 sec = d
                 break
             else:
-                # No definition matched the hints — re-resolve via IB directly
-                if isinstance(symbol, str):
-                    direct = consume(
-                        self._rpc.rpc(return_type=list[SecurityDefinition]).resolve_contract(
-                            Contract(
-                                symbol=symbol,
-                                exchange=exchange or 'SMART',
-                                secType=sec_type or 'STK',
-                                currency=currency or 'USD',
-                            )
-                        )
+                # No definition matched the hints — ask discover again with
+                # the caller's exchange/currency (SMART/USD only when the
+                # hint itself was empty). Same role as the old IB
+                # resolve_contract fallback when the local universe lied.
+                if isinstance(symbol, str) and not self._instrument_id(symbol):
+                    response = self._typed_query.call(
+                        'discover_instrument',
+                        {
+                            'symbol': str(symbol),
+                            'exchange': exchange or 'SMART',
+                            'currency': currency or 'USD',
+                            'sec_type': sec_type or 'STK',
+                        },
+                        dict,
                     )
+                    direct = [
+                        self._security_definition_from_wire(r)
+                        for r in (response.get('instruments') or [])
+                    ]
                     if direct:
                         sec = direct[0]
         elif len(definitions) > 1:
@@ -544,48 +705,54 @@ class MMR:
         }
 
     def portfolio(self) -> pd.DataFrame:
-        """Portfolio with P&L (matches the old ``portfolio`` CLI command)."""
-        summaries = self._rpc.rpc(
-            return_type=list[PortfolioSummary]
-        ).get_portfolio_summary()
+        """Portfolio with P&L (matches the old ``portfolio`` CLI command).
 
+        Uses typed ``get_portfolio_summary`` — legacy dill port 42001 is not
+        bound in the split-container topology.
+        """
+        response = self._typed_query.call('get_portfolio_summary', {}, dict)
         rows = []
-        for p in summaries:
-            # PortfolioSummary is a NamedTuple; msgpack may deserialize as a plain list
-            if isinstance(p, (list, tuple)) and not hasattr(p, 'account'):
-                contract, position, mkt_price, mkt_value, avg_cost, unrealized, realized, account, daily = p
-            else:
-                contract, position, mkt_price, mkt_value = p.contract, p.position, p.marketPrice, p.marketValue
-                avg_cost, unrealized, realized, account, daily = p.averageCost, p.unrealizedPNL, p.realizedPNL, p.account, p.dailyPNL
-
-            con = self._extract_contract(contract)
-            symbol = con['symbol']
+        for p in response.get('positions') or []:
+            symbol = str(p.get('symbol') or '')
+            daily = p.get('daily_pnl')
+            unrealized = p.get('unrealized_pnl')
+            realized = p.get('realized_pnl')
             rows.append({
-                'account': account,
-                'conId': con['conId'],
+                'account': p.get('account', ''),
+                'conId': int(p.get('instrument_id') or 0),
                 'symbol': symbol,
-                'position': position,
-                'mktPrice': mkt_price,
-                'avgCost': avg_cost,
-                'marketValue': mkt_value,
-                'currency': con.get('currency', ''),
-                'unrealizedPNL': unrealized,
-                'realizedPNL': realized,
-                'dailyPNL': daily,
+                'position': float(p.get('position') or 0.0),
+                'mktPrice': float(p.get('market_price') or 0.0),
+                'avgCost': float(p.get('average_cost') or 0.0),
+                'marketValue': float(p.get('market_value') or 0.0),
+                'currency': p.get('currency', ''),
+                'unrealizedPNL': float('nan') if unrealized is None else float(unrealized),
+                'realizedPNL': float('nan') if realized is None else float(realized),
+                'dailyPNL': float('nan') if daily is None else float(daily),
             })
-
-            # Cache the raw contract for close_position (avoids re-resolution
-            # which fails for international stocks not in the local universe).
-            self._contract_map[symbol] = self._to_contract(contract)
+            # Cache contract for close_position (avoids re-resolution which
+            # fails for international stocks not in the local universe).
+            if symbol:
+                self._contract_map[symbol] = Contract(
+                    conId=int(p.get('instrument_id') or 0),
+                    symbol=symbol,
+                    secType=str(p.get('security_type') or 'STK'),
+                    exchange=str(p.get('exchange') or 'SMART'),
+                    primaryExchange=str(p.get('primary_exchange') or ''),
+                    currency=str(p.get('currency') or ''),
+                )
 
         df = pd.DataFrame(rows)
         if not df.empty:
             df = df.sort_values(by='dailyPNL', ascending=False).reset_index(drop=True)
-            # Update position map for close-by-number
             self._position_map = {
                 i + 1: row['symbol'] for i, row in df.iterrows()
             }
         return df
+
+    def _account_values(self) -> dict:
+        """Account value tags via typed query (JSON-safe dict)."""
+        return self._typed_query.call('get_account_values', {}, dict) or {}
 
     def _fx_rates(self) -> dict:
         """Per-currency multipliers to the account's base currency (base → 1.0).
@@ -594,7 +761,9 @@ class MMR:
         currencies as already-base (rate 1.0).
         """
         try:
-            return consume(self._rpc.rpc(return_type=dict).get_fx_rates()) or {}
+            response = self._typed_query.call('get_fx_rates', {}, dict) or {}
+            rates = response.get('rates')
+            return rates if isinstance(rates, dict) else {}
         except Exception as ex:
             logging.warning('could not fetch FX rates, treating values as base: %s', ex)
             return {}
@@ -612,30 +781,32 @@ class MMR:
         return value * float(fx_rates.get(currency, 1.0) or 1.0)
 
     def positions(self) -> pd.DataFrame:
-        """Raw positions (no P&L)."""
-        pos_list = self._rpc.rpc(
-            return_type=list[Position]
-        ).get_positions()
-
+        """Raw positions (no P&L) via typed ``get_positions``."""
+        response = self._typed_query.call('get_positions', {}, dict)
         rows = []
-        for p in pos_list:
-            # Position is a NamedTuple; msgpack may deserialize as a plain list
-            if isinstance(p, (list, tuple)) and not hasattr(p, 'account'):
-                account, contract, position, avg_cost = p[0], p[1], p[2], p[3]
-            else:
-                account, contract, position, avg_cost = p.account, p.contract, p.position, p.avgCost
-
-            con = self._extract_contract(contract)
+        for p in response.get('positions') or []:
+            qty = float(p.get('position') or 0.0)
+            avg = float(p.get('average_cost') or 0.0)
+            symbol = str(p.get('symbol') or '')
             rows.append({
-                'account': account,
-                'conId': con['conId'],
-                'symbol': con['symbol'],
-                'secType': con['secType'],
-                'position': position,
-                'avgCost': avg_cost,
-                'currency': con['currency'],
-                'total': position * avg_cost,
+                'account': p.get('account', ''),
+                'conId': int(p.get('instrument_id') or 0),
+                'symbol': symbol,
+                'secType': p.get('security_type', 'STK'),
+                'position': qty,
+                'avgCost': avg,
+                'currency': p.get('currency', ''),
+                'total': qty * avg,
             })
+            if symbol:
+                self._contract_map[symbol] = Contract(
+                    conId=int(p.get('instrument_id') or 0),
+                    symbol=symbol,
+                    secType=str(p.get('security_type') or 'STK'),
+                    exchange=str(p.get('exchange') or 'SMART'),
+                    primaryExchange=str(p.get('primary_exchange') or ''),
+                    currency=str(p.get('currency') or ''),
+                )
 
         df = pd.DataFrame(rows)
         if not df.empty:
@@ -651,103 +822,70 @@ class MMR:
 
     def orders(self) -> pd.DataFrame:
         """Open orders with full detail (symbol, name, prices, account %)."""
-        trades_raw: dict[int, list[Trade]] = self._rpc.rpc(
-            return_type=dict[int, list[Trade]]
-        ).get_trades()
-
-        if not trades_raw:
+        response = self._typed_query.call('get_open_orders', {}, dict)
+        orders = response.get('orders') or []
+        if not orders:
             return pd.DataFrame()
 
-        # Filter to active (non-terminal) orders only
-        _terminal = {'Cancelled', 'Filled', 'Inactive', 'ApiCancelled'}
-        trades_raw = {
-            tid: tl for tid, tl in trades_raw.items()
-            if tl[0].orderStatus.status not in _terminal
-        }
-        if not trades_raw:
-            return pd.DataFrame()
-
-        # Get net liquidation for account % calculation
         net_liq = 0.0
         try:
-            acct_vals = consume(self._rpc.rpc(return_type=dict).get_account_values())
+            acct_vals = self._account_values()
             net_liq = float(acct_vals.get('NetLiquidation', {}).get('value', 0))
         except Exception:
             pass
 
-        # Resolve company names + snapshots for unique symbols.
-        # Use the contract from the trade (has correct exchange/currency) to avoid
-        # failing on international stocks not in the local universe.
-        name_cache: dict[str, str] = {}
         snap_cache: dict[str, dict] = {}
-        contract_cache: dict[str, object] = {}
-        for trade_list in trades_raw.values():
-            con = trade_list[0].contract
-            contract_cache.setdefault(con.symbol, con)
-
-        # Batch snapshot for bid/ask context — single RPC instead of N.
-        order_contracts = []
-        sym_order = []
-        for sym, con in contract_cache.items():
-            order_contracts.append(self._to_contract(con))
-            sym_order.append(sym)
-            name_cache[sym] = ''  # company name not available without per-symbol resolve
-
-        if order_contracts:
+        ids = sorted({
+            int(o.get('instrument_id') or 0)
+            for o in orders if o.get('instrument_id')
+        })
+        ids = [i for i in ids if i > 0]
+        if ids:
             try:
-                batch_snaps = consume(
-                    self._rpc.rpc(return_type=list[dict]).get_snapshots_batch(
-                        order_contracts, True
-                    )
+                batch = self._typed_query.call(
+                    'get_snapshots_batch',
+                    {'instrument_ids': ids, 'delayed': True},
+                    dict,
                 )
-                for i, snap_dict in enumerate(batch_snaps or []):
-                    sym = sym_order[i]
-                    snap_cache[sym] = {
-                        'bid': snap_dict.get('bid'),
-                        'ask': snap_dict.get('ask'),
-                        'last': snap_dict.get('last'),
+                for snap in batch.get('snapshots') or []:
+                    snap_cache[str(snap.get('symbol') or '')] = {
+                        'bid': snap.get('bid'),
+                        'ask': snap.get('ask'),
+                        'last': snap.get('last'),
                     }
             except Exception:
                 pass
-        for sym in sym_order:
-            snap_cache.setdefault(sym, {})
 
         rows = []
-        for trade_id, trade_list in trades_raw.items():
-            t = trade_list[0]
-            o = t.order
-            snap = snap_cache.get(t.contract.symbol, {})
-            bid = snap.get('bid')
-            ask = snap.get('ask')
-            last = snap.get('last')
-            # Estimate order value from the best available price
-            # IB uses 1.7976931348623157e+308 as sentinel for "no price"
-            _lmt = o.lmtPrice if o.lmtPrice and o.lmtPrice < 1e300 else 0
-            _aux = o.auxPrice if o.auxPrice and o.auxPrice < 1e300 else 0
+        for o in orders:
+            symbol = str(o.get('symbol') or '')
+            snap = snap_cache.get(symbol, {})
+            _lmt = o.get('limit_price') or 0
+            _aux = o.get('aux_price') or 0
             price = _lmt or _aux or 0
-            order_value = price * (o.totalQuantity or 0) if price else None
+            qty = float(o.get('quantity') or 0)
+            order_value = price * qty if price else None
             acct_pct = (order_value / net_liq * 100) if order_value and net_liq > 0 else None
-
             rows.append({
-                'orderId': o.orderId,
-                'symbol': t.contract.symbol,
-                'name': name_cache.get(t.contract.symbol, ''),
-                'action': o.action,
-                'orderType': o.orderType,
-                'quantity': o.totalQuantity,
-                'lmtPrice': o.lmtPrice if o.lmtPrice and o.lmtPrice < 1e300 else None,
-                'auxPrice': o.auxPrice if o.auxPrice and o.auxPrice < 1e300 else None,
+                'orderId': o.get('order_id'),
+                'symbol': symbol,
+                'name': '',
+                'action': o.get('action'),
+                'orderType': o.get('order_type'),
+                'quantity': qty,
+                'lmtPrice': _lmt or None,
+                'auxPrice': _aux or None,
                 'orderValue': round(order_value, 2) if order_value else None,
                 'acctPct': round(acct_pct, 1) if acct_pct else None,
-                'status': t.orderStatus.status,
-                'filled': t.orderStatus.filled,
-                'remaining': t.orderStatus.remaining,
-                'avgFillPrice': t.orderStatus.avgFillPrice if t.orderStatus.avgFillPrice else None,
-                'tif': o.tif,
-                'parentId': o.parentId if o.parentId else None,
-                'bid': bid,
-                'ask': ask,
-                'last': last,
+                'status': o.get('status'),
+                'filled': o.get('filled'),
+                'remaining': o.get('remaining'),
+                'avgFillPrice': o.get('avg_fill_price'),
+                'tif': o.get('tif'),
+                'parentId': None,
+                'bid': snap.get('bid'),
+                'ask': snap.get('ask'),
+                'last': snap.get('last'),
             })
 
         df = pd.DataFrame(rows)
@@ -757,23 +895,19 @@ class MMR:
 
     def trades(self) -> pd.DataFrame:
         """Active trades in the book."""
-        trades_raw: dict[int, list[Trade]] = self._rpc.rpc(
-            return_type=dict[int, list[Trade]]
-        ).get_trades()
-
+        response = self._typed_query.call('get_trades', {}, dict)
         rows = []
-        for trade_id, trade_list in trades_raw.items():
-            t = trade_list[0]
+        for t in response.get('trades') or []:
             rows.append({
-                'conId': t.contract.conId,
-                'symbol': t.contract.symbol,
-                'orderId': t.order.orderId,
-                'action': t.order.action,
-                'status': t.orderStatus.status,
-                'filled': t.orderStatus.filled,
-                'orderType': t.order.orderType,
-                'lmtPrice': t.order.lmtPrice,
-                'totalQuantity': t.order.totalQuantity,
+                'conId': t.get('instrument_id'),
+                'symbol': t.get('symbol'),
+                'orderId': t.get('order_id'),
+                'action': t.get('action'),
+                'status': t.get('status'),
+                'filled': t.get('filled'),
+                'orderType': t.get('order_type'),
+                'lmtPrice': t.get('limit_price'),
+                'totalQuantity': t.get('quantity'),
             })
 
         df = pd.DataFrame(rows)
@@ -810,18 +944,23 @@ class MMR:
             contract = self._resolve_contract(symbol, sec_type=sec_type,
                                               exchange=exchange, currency=currency)
 
-        return consume(
-            self._rpc.rpc(return_type=SuccessFail[Trade]).place_order_simple(
-                contract=contract,
-                action=action,
-                equity_amount=amount,
-                quantity=quantity,
-                limit_price=limit_price,
-                market_order=market,
-                stop_loss_percentage=stop_loss_percentage,
-                debug=debug,
+        try:
+            return consume(
+                self._legacy_or_raise('direct buy/sell').rpc(
+                    return_type=SuccessFail[Trade]
+                ).place_order_simple(
+                    contract=contract,
+                    action=action,
+                    equity_amount=amount,
+                    quantity=quantity,
+                    limit_price=limit_price,
+                    market_order=market,
+                    stop_loss_percentage=stop_loss_percentage,
+                    debug=debug,
+                )
             )
-        )
+        except Exception as exc:
+            self._map_legacy_route_error('direct buy/sell', exc)
 
     def buy(
         self,
@@ -865,17 +1004,35 @@ class MMR:
 
     def cancel(self, order_id: int) -> SuccessFail:
         """Cancel a single order by ID."""
-        return self._rpc.rpc(return_type=SuccessFail[Trade]).cancel_order(order_id)
+        try:
+            return self._legacy_or_raise('cancel').rpc(
+                return_type=SuccessFail[Trade]
+            ).cancel_order(order_id)
+        except Exception as exc:
+            self._map_legacy_route_error('cancel', exc)
 
     def cancel_all(self) -> SuccessFail:
         """Cancel all open orders."""
-        return self._rpc.rpc(return_type=SuccessFail[list[int]]).cancel_all()
+        try:
+            return self._legacy_or_raise('cancel-all').rpc(
+                return_type=SuccessFail[list[int]]
+            ).cancel_all()
+        except Exception as exc:
+            self._map_legacy_route_error('cancel-all', exc)
 
     def to_market(self, order_id: int) -> SuccessFail:
         """Cancel an open limit order and re-place as market, preserving stop-loss children."""
-        trades_raw: dict[int, list[Trade]] = self._rpc.rpc(
-            return_type=dict[int, list[Trade]]
-        ).get_trades()
+        # Needs cancel + place_expressive_order on legacy RPC (not on typed production surface).
+        try:
+            rpc = self._legacy_or_raise('to-market')
+        except ConnectionError:
+            raise
+        try:
+            trades_raw: dict[int, list[Trade]] = rpc.rpc(
+                return_type=dict[int, list[Trade]]
+            ).get_trades()
+        except Exception as exc:
+            self._map_legacy_route_error('to-market', exc)
 
         if not trades_raw or order_id not in trades_raw:
             return SuccessFail.fail(error=f'Order #{order_id} not found')
@@ -938,7 +1095,7 @@ class MMR:
         # recompute the still-unfilled quantity. If it fully filled in the window,
         # there is nothing left to convert.
         try:
-            trades_after = self._rpc.rpc(
+            trades_after = rpc.rpc(
                 return_type=dict[int, list[Trade]]
             ).get_trades()
             if trades_after and order_id in trades_after:
@@ -957,7 +1114,9 @@ class MMR:
             spec = ExecutionSpec(order_type='MARKET')
 
         return consume(
-            self._rpc.rpc(return_type=SuccessFail[list[Trade]]).place_expressive_order(
+            self._legacy_or_raise('place expressive order').rpc(
+                return_type=SuccessFail[list[Trade]]
+            ).place_expressive_order(
                 contract=contract,
                 action=action,
                 quantity=remaining,
@@ -991,7 +1150,7 @@ class MMR:
         from trader.trading.position_sizing import PortfolioState
         state = PortfolioState()
         try:
-            acct_vals = consume(self._rpc.rpc(return_type=dict).get_account_values())
+            acct_vals = self._account_values()
             if acct_vals:
                 state.net_liquidation = float(acct_vals.get('NetLiquidation', {}).get('value', 0))
                 state.gross_position_value = float(acct_vals.get('GrossPositionValue', {}).get('value', 0))
@@ -1047,7 +1206,7 @@ class MMR:
         positions against live IB open-orders / executions / positions. Places
         or cancels nothing.
         """
-        return consume(self._rpc.rpc(return_type=dict).reconcile_with_broker())
+        return self._typed_query.call('reconcile_with_broker', {}, dict) or {}
 
     def risk_report(self) -> dict:
         """Generate a portfolio risk report. Requires trader_service for portfolio data."""
@@ -1070,7 +1229,7 @@ class MMR:
 
         # Let RPC failures propagate — silently defaulting net_liq to 0 makes
         # every exposure %/HHI/group-budget number wrong without signaling why.
-        acct_vals = consume(self._rpc.rpc(return_type=dict).get_account_values())
+        acct_vals = self._account_values()
         net_liq = float(acct_vals.get('NetLiquidation', {}).get('value', 0)) if acct_vals else 0.0
 
         analyzer = PortfolioRiskAnalyzer(duckdb_path, history_duckdb_path)
@@ -1096,7 +1255,7 @@ class MMR:
         # Fetch account values before the empty-position check: a flat
         # account still holds cash, and net_liquidation must reflect that
         # instead of silently reporting 0 just because there are no positions.
-        acct_vals = consume(self._rpc.rpc(return_type=dict).get_account_values())
+        acct_vals = self._account_values()
         net_liq = float(acct_vals.get('NetLiquidation', {}).get('value', 0)) if acct_vals else 0.0
 
         if portfolio_df is None or portfolio_df.empty:
@@ -1544,6 +1703,162 @@ class MMR:
                   f'{receipt.error_code or receipt.state}')
 
     # ------------------------------------------------------------------
+    # [P4 Task 5] Signed live-canary activation
+    # ------------------------------------------------------------------
+
+    def activate_live_canary(self, attestation: Dict[str, Any], reason: str) -> SuccessFail:
+        """Activate a signed canary authority via the command-authority
+        coordinator's ``activate_live_canary`` command. REQUIRES
+        trader_service (typed query + command sockets).
+
+        ``attestation`` is the JSON wire form of an offline-signed
+        ``CanaryAttestation`` (produced entirely by ``mmr research canary
+        sign`` -- see ``canary_attestation_to_wire``); it carries a
+        signature and public key ID, NEVER a private key, so nothing this
+        method sends over the wire can ever leak signing material.
+
+        ``activate_live_canary`` is always risk-increasing (a canary
+        authority is definitionally live-only), so unlike ``approve``, this
+        method itself drives the two-step preflight-nonce ceremony
+        (``preflight_command`` mint, then the confirming command) rather
+        than skipping it — there is no paper-mode carve-out to lean on.
+        """
+        import uuid
+        from trader.domain.commands import CommandReceipt
+        from trader.messaging.typed_rpc import TypedRpcRemoteError
+
+        command_id = f'sdk-{uuid.uuid4()}'
+        session_fingerprint = uuid.uuid4().hex
+
+        try:
+            preflight = self._typed_command.call(
+                'preflight_command',
+                {
+                    'command_id': command_id, 'action': 'activate_live_canary',
+                    'params': {'attestation': attestation, 'reason': reason},
+                    'session_fingerprint': session_fingerprint,
+                },
+                dict,
+            )
+        except TypedRpcRemoteError as ex:
+            return SuccessFail.fail(error=f'canary activation preflight refused: {ex.code}: {ex.message}',
+                                    exception=ex)
+        except (TimeoutError, ConnectionError) as ex:
+            return SuccessFail.fail(error=f'canary activation preflight did not complete: {ex}', exception=ex)
+
+        try:
+            receipt = self._typed_command.call(
+                'activate_live_canary',
+                {
+                    'command_id': command_id, 'attestation': attestation, 'reason': reason,
+                    'preflight_nonce': preflight['nonce'], 'session_fingerprint': session_fingerprint,
+                },
+                CommandReceipt,
+            )
+        except TypedRpcRemoteError as ex:
+            return SuccessFail.fail(error=f'canary activation rejected: {ex.code}: {ex.message}', exception=ex)
+        except (TimeoutError, ConnectionError) as ex:
+            return SuccessFail.fail(
+                error=f'activate_live_canary did not complete: {ex}. Check `mmr proposals`/status before retrying.',
+                exception=ex)
+
+        if receipt.state == 'RESOLVED':
+            return SuccessFail.success(obj=receipt.outcome)
+        return SuccessFail.fail(error=f'canary activation rejected: {receipt.error_code or receipt.state}')
+
+    def activate_allocation(self, attestation: Dict[str, Any], reason: str) -> SuccessFail:
+        """Activate a signed allocation authority via ``activate_allocation``.
+        REQUIRES trader_service. Risk-increasing — drives preflight nonce ceremony."""
+        import uuid
+        from trader.domain.commands import CommandReceipt
+        from trader.messaging.typed_rpc import TypedRpcRemoteError
+
+        command_id = f'sdk-{uuid.uuid4()}'
+        session_fingerprint = uuid.uuid4().hex
+
+        try:
+            preflight = self._typed_command.call(
+                'preflight_command',
+                {
+                    'command_id': command_id, 'action': 'activate_allocation',
+                    'params': {'attestation': attestation, 'reason': reason},
+                    'session_fingerprint': session_fingerprint,
+                },
+                dict,
+            )
+        except TypedRpcRemoteError as ex:
+            return SuccessFail.fail(error=f'allocation activation preflight refused: {ex.code}: {ex.message}',
+                                    exception=ex)
+        except (TimeoutError, ConnectionError) as ex:
+            return SuccessFail.fail(error=f'allocation activation preflight did not complete: {ex}', exception=ex)
+
+        try:
+            receipt = self._typed_command.call(
+                'activate_allocation',
+                {
+                    'command_id': command_id, 'attestation': attestation, 'reason': reason,
+                    'preflight_nonce': preflight['nonce'], 'session_fingerprint': session_fingerprint,
+                },
+                CommandReceipt,
+            )
+        except TypedRpcRemoteError as ex:
+            return SuccessFail.fail(error=f'allocation activation rejected: {ex.code}: {ex.message}', exception=ex)
+        except (TimeoutError, ConnectionError) as ex:
+            return SuccessFail.fail(
+                error=f'activate_allocation did not complete: {ex}. Check status before retrying.',
+                exception=ex)
+
+        if receipt.state == 'RESOLVED':
+            return SuccessFail.success(obj=receipt.outcome)
+        return SuccessFail.fail(error=f'allocation activation rejected: {receipt.error_code or receipt.state}')
+
+    def suspend_allocation(self, reason: str) -> SuccessFail:
+        """Suspend the account's active allocation authority via ``suspend_allocation``.
+        REQUIRES trader_service. Risk-reducing: no preflight nonce needed,
+        mirroring ``deactivate_live_canary``."""
+        import uuid
+        from trader.domain.commands import CommandReceipt
+        from trader.messaging.typed_rpc import TypedRpcRemoteError
+
+        try:
+            receipt = self._typed_command.call(
+                'suspend_allocation',
+                {'command_id': f'sdk-{uuid.uuid4()}', 'reason': reason},
+                CommandReceipt,
+            )
+        except TypedRpcRemoteError as ex:
+            return SuccessFail.fail(error=f'allocation suspension rejected: {ex.code}: {ex.message}', exception=ex)
+        except (TimeoutError, ConnectionError) as ex:
+            return SuccessFail.fail(error=f'suspend_allocation did not complete: {ex}', exception=ex)
+
+        if receipt.state == 'RESOLVED':
+            return SuccessFail.success(obj=receipt.outcome)
+        return SuccessFail.fail(error=f'allocation suspension rejected: {receipt.error_code or receipt.state}')
+
+    def deactivate_live_canary(self, strategy_id: str, reason: str) -> SuccessFail:
+        """Suspend an ACTIVE canary authority via ``deactivate_live_canary``.
+        REQUIRES trader_service. Risk-reducing: no preflight nonce needed,
+        mirroring ``reject``."""
+        import uuid
+        from trader.domain.commands import CommandReceipt
+        from trader.messaging.typed_rpc import TypedRpcRemoteError
+
+        try:
+            receipt = self._typed_command.call(
+                'deactivate_live_canary',
+                {'command_id': f'sdk-{uuid.uuid4()}', 'strategy_id': strategy_id, 'reason': reason},
+                CommandReceipt,
+            )
+        except TypedRpcRemoteError as ex:
+            return SuccessFail.fail(error=f'canary deactivation rejected: {ex.code}: {ex.message}', exception=ex)
+        except (TimeoutError, ConnectionError) as ex:
+            return SuccessFail.fail(error=f'deactivate_live_canary did not complete: {ex}', exception=ex)
+
+        if receipt.state == 'RESOLVED':
+            return SuccessFail.success(obj=receipt.outcome)
+        return SuccessFail.fail(error=f'canary deactivation rejected: {receipt.error_code or receipt.state}')
+
+    # ------------------------------------------------------------------
     # Protective orders for existing positions
     # ------------------------------------------------------------------
 
@@ -1581,7 +1896,9 @@ class MMR:
                 return SuccessFail.fail(error=f"Could not resolve symbol {symbol}: {ex}")
 
         return consume(
-            self._rpc.rpc(return_type=SuccessFail[Trade]).place_standalone_order(
+            self._legacy_or_raise('place standalone order').rpc(
+                return_type=SuccessFail[Trade]
+            ).place_standalone_order(
                 contract=contract,
                 action=action.upper(),
                 quantity=quantity,
@@ -1645,7 +1962,9 @@ class MMR:
             except ValueError:
                 return SuccessFail.fail(error=f"Could not resolve symbol: {symbol}")
         return consume(
-            self._rpc.rpc(return_type=SuccessFail[Trade]).place_order_simple(
+            self._legacy_or_raise('place order').rpc(
+                return_type=SuccessFail[Trade]
+            ).place_order_simple(
                 contract=contract,
                 action=action,
                 equity_amount=None,
@@ -1701,59 +2020,47 @@ class MMR:
 
         target_total = total_value * scale_factor
 
-        # Find associated protective orders for each position
-        trades_raw: dict = {}
+        # Find associated protective orders for each position (typed open orders).
+        open_orders: list = []
         try:
-            trades_raw = self._rpc.rpc(
-                return_type=dict[int, list[Trade]]
-            ).get_trades()
+            open_orders = (
+                self._typed_query.call('get_open_orders', {}, dict).get('orders') or []
+            )
         except Exception:
             pass
 
-        if trades_raw:
-            _terminal = {'Cancelled', 'Filled', 'Inactive', 'ApiCancelled'}
-            trades_raw = {
-                tid: tl for tid, tl in trades_raw.items()
-                if tl[0].orderStatus.status not in _terminal
-            }
-
         for adj in adjustments:
             associated = []
-            if trades_raw:
-                con_id = adj['conId']
-                pos_direction = 'LONG' if adj['current_qty'] > 0 else 'SHORT'
-                for tid, tl in trades_raw.items():
-                    t = tl[0]
-                    t_con_id = t.contract.conId if hasattr(t.contract, 'conId') else (t.contract.get('conId') if isinstance(t.contract, dict) else 0)
-                    if t_con_id != con_id:
-                        continue
-                    o = t.order
-                    order_type = o.orderType or ''
-                    order_action = o.action or ''
+            con_id = adj['conId']
+            pos_direction = 'LONG' if adj['current_qty'] > 0 else 'SHORT'
+            for o in open_orders:
+                t_con_id = int(o.get('instrument_id') or 0)
+                if t_con_id != con_id:
+                    continue
+                order_type = o.get('order_type') or ''
+                order_action = o.get('action') or ''
 
-                    # Protective orders are opposite direction to position
-                    is_protective = (
-                        (pos_direction == 'LONG' and order_action == 'SELL') or
-                        (pos_direction == 'SHORT' and order_action == 'BUY')
-                    )
-                    is_stop_type = order_type in ('STP', 'STP LMT', 'TRAIL')
-                    is_tp = order_type == 'LMT' and (o.parentId or 0) > 0
+                # Protective orders are opposite direction to position
+                is_protective = (
+                    (pos_direction == 'LONG' and order_action == 'SELL') or
+                    (pos_direction == 'SHORT' and order_action == 'BUY')
+                )
+                is_stop_type = order_type in ('STP', 'STP LMT', 'TRAIL')
+                is_tp = order_type == 'LMT' and int(o.get('parent_id') or 0) > 0
 
-                    if is_protective and (is_stop_type or is_tp):
-                        aux = o.auxPrice if hasattr(o, 'auxPrice') and o.auxPrice and o.auxPrice < 1e300 else 0
-                        lmt = o.lmtPrice if hasattr(o, 'lmtPrice') and o.lmtPrice and o.lmtPrice < 1e300 else 0
-                        trail_pct = getattr(o, 'trailingPercent', 0) or 0
-
-                        associated.append({
-                            'orderId': o.orderId,
-                            'orderType': order_type,
-                            'action': order_action,
-                            'quantity': float(o.totalQuantity or 0),
-                            'auxPrice': float(aux),
-                            'lmtPrice': float(lmt),
-                            'trailingPercent': float(trail_pct),
-                            'tif': o.tif or 'GTC',
-                        })
+                if is_protective and (is_stop_type or is_tp):
+                    aux = o.get('aux_price') or 0
+                    lmt = o.get('limit_price') or 0
+                    associated.append({
+                        'orderId': o.get('order_id'),
+                        'orderType': order_type,
+                        'action': order_action,
+                        'quantity': float(o.get('quantity') or 0),
+                        'auxPrice': float(aux),
+                        'lmtPrice': float(lmt),
+                        'trailingPercent': 0.0,
+                        'tif': o.get('tif') or 'GTC',
+                    })
 
             adj['associated_orders'] = associated
 
@@ -1793,7 +2100,9 @@ class MMR:
                 cached_contract = self._contract_map.get(symbol)
                 if cached_contract:
                     order_result = consume(
-                        self._rpc.rpc(return_type=SuccessFail[Trade]).place_order_simple(
+                        self._legacy_or_raise('place order').rpc(
+                            return_type=SuccessFail[Trade]
+                        ).place_order_simple(
                             contract=cached_contract,
                             action=action,
                             equity_amount=None,
@@ -1877,7 +2186,9 @@ class MMR:
 
                 try:
                     place_result = consume(
-                        self._rpc.rpc(return_type=SuccessFail[Trade]).place_standalone_order(
+                        self._legacy_or_raise('place standalone order').rpc(
+                            return_type=SuccessFail[Trade]
+                        ).place_standalone_order(
                             contract=contract,
                             action=order_info['action'],
                             quantity=new_qty,
@@ -1958,37 +2269,29 @@ class MMR:
                 'name': payload.get('name', ''),
             }
         contract = self._resolve_contract(symbol, exchange=exchange, currency=currency)
-        ticker = consume(
-            self._rpc.rpc(return_type=Ticker).get_snapshot(contract, delayed)
+        response = self._typed_query.call(
+            'get_snapshot',
+            {'instrument_id': int(contract.conId), 'delayed': bool(delayed)},
+            dict,
         )
-
-        # Handle deserialized ticker — contract may be dict/list after msgpack round-trip
-        sym = ''
-        con_id = ''
-        tc = getattr(ticker, 'contract', None)
-        if tc:
-            if isinstance(tc, dict):
-                sym = tc.get('symbol', '')
-                con_id = tc.get('conId', '')
-            elif hasattr(tc, 'symbol'):
-                sym = tc.symbol
-                con_id = tc.conId
-
+        snap = response.get('snapshot') or {}
+        def _nan(v):
+            return float('nan') if v is None else v
         return {
-            'symbol': sym,
-            'conId': con_id,
-            'time': getattr(ticker, 'time', None),
-            'bid': getattr(ticker, 'bid', float('nan')),
-            'bidSize': getattr(ticker, 'bidSize', float('nan')),
-            'ask': getattr(ticker, 'ask', float('nan')),
-            'askSize': getattr(ticker, 'askSize', float('nan')),
-            'last': getattr(ticker, 'last', float('nan')),
-            'lastSize': getattr(ticker, 'lastSize', float('nan')),
-            'open': getattr(ticker, 'open', float('nan')),
-            'high': getattr(ticker, 'high', float('nan')),
-            'low': getattr(ticker, 'low', float('nan')),
-            'close': getattr(ticker, 'close', float('nan')),
-            'halted': getattr(ticker, 'halted', float('nan')),
+            'symbol': snap.get('symbol') or contract.symbol,
+            'conId': snap.get('instrument_id') or contract.conId,
+            'time': snap.get('time'),
+            'bid': _nan(snap.get('bid')),
+            'bidSize': _nan(snap.get('bid_size')),
+            'ask': _nan(snap.get('ask')),
+            'askSize': _nan(snap.get('ask_size')),
+            'last': _nan(snap.get('last')),
+            'lastSize': _nan(snap.get('last_size')),
+            'open': _nan(snap.get('open')),
+            'high': _nan(snap.get('high')),
+            'low': _nan(snap.get('low')),
+            'close': _nan(snap.get('close')),
+            'halted': _nan(snap.get('halted')),
         }
 
     def snapshot_batch(self, symbols: list[str], exchange: str = '',
@@ -2049,22 +2352,50 @@ class MMR:
                     })
             return results
 
-        contracts = []
+        ids = []
         for sym in symbols:
             contract = self._resolve_contract(sym, exchange=exchange, currency=currency)
-            contracts.append(contract)
-        return consume(
-            self._rpc.rpc(return_type=list[dict]).get_snapshots_batch(contracts, True)
-        ) or []
+            ids.append(int(contract.conId))
+        if not ids:
+            return []
+        response = self._typed_query.call(
+            'get_snapshots_batch',
+            {'instrument_ids': ids, 'delayed': True},
+            dict,
+        )
+        rows = []
+        for snap in response.get('snapshots') or []:
+            rows.append({
+                'conId': snap.get('instrument_id'),
+                'symbol': snap.get('symbol'),
+                'exchange': snap.get('exchange'),
+                'currency': snap.get('currency'),
+                'bid': snap.get('bid'),
+                'ask': snap.get('ask'),
+                'last': snap.get('last'),
+                'open': snap.get('open'),
+                'high': snap.get('high'),
+                'low': snap.get('low'),
+                'close': snap.get('close'),
+                'volume': snap.get('volume'),
+            })
+        return rows
 
     def depth(self, symbol: Union[str, int], num_rows: int = 5,
               exchange: str = '', currency: str = '',
               is_smart_depth: bool = False) -> dict:
         """Get Level 2 market depth (order book) for *symbol*."""
         contract = self._resolve_contract(symbol, exchange=exchange, currency=currency)
-        return consume(
-            self._rpc.rpc(return_type=dict).get_market_depth(contract, num_rows, is_smart_depth)
+        response = self._typed_query.call(
+            'get_market_depth',
+            {
+                'instrument_id': int(contract.conId),
+                'num_rows': int(num_rows),
+                'is_smart_depth': bool(is_smart_depth),
+            },
+            dict,
         )
+        return response.get('depth') or {'bids': [], 'asks': []}
 
     def subscribe_ticks(
         self,
@@ -2081,8 +2412,12 @@ class MMR:
         Call ``subscription.stop()`` to unsubscribe.
         """
         contract = self._resolve_contract(symbol, exchange=exchange, currency=currency)
-        # Tell trader_service to publish ticks for this contract
-        self._rpc.rpc().publish_contract(contract, delayed)
+        # Tell trader_service to publish ticks for this contract (typed query)
+        self._typed_query.call(
+            'publish_instrument',
+            {'instrument_id': int(contract.conId), 'delayed': bool(delayed)},
+            dict,
+        )
 
         sub = Subscription()
 
@@ -2118,65 +2453,81 @@ class MMR:
     # ------------------------------------------------------------------
 
     def strategies(self) -> pd.DataFrame:
-        """List configured strategies."""
-        result: SuccessFail = consume(
-            self._rpc.rpc(return_type=SuccessFail[list[StrategyConfig]]).get_strategies()
-        )
-        if result.is_success() and result.obj:
-            rows = []
-            for s in result.obj:
-                # Emit the state NAME ("RUNNING"), never the number: since
-                # Python 3.11 str(IntEnum) is the numeric value ("3"), which
-                # broke every name-based consumer (web dashboard enabled
-                # count, CLI state column).
-                state = s.state
-                try:
-                    state_name = StrategyState(int(state)).name
-                except (ValueError, TypeError):
-                    state_name = str(state)
-                row = {
-                    'name': s.name,
-                    'state': state_name,
-                    # Transport-independent dispatchable flag — callers
-                    # (dashboard, LLM loop) should derive "is this strategy
-                    # actually running" from this, not from re-deriving their
-                    # own state allowlist against the raw state string.
-                    'dispatchable': is_dispatchable_strategy_state(state_name),
-                    'bar_size': str(s.bar_size),
-                    'conids': s.conids or [],
-                    'hist_days_prior': s.historical_days_prior,
-                    'auto_execute': getattr(s, 'auto_execute', False),
-                    'class_name': getattr(s, 'class_name', '') or '',
-                    'description': getattr(s, 'description', '') or '',
-                }
-                params = getattr(s, 'params', None)
-                if params:
-                    row['params'] = params
-                rows.append(row)
-            return pd.DataFrame(rows)
-        return pd.DataFrame()
+        """List configured strategies via strategy typed query (42105)."""
+        response = self._strategy_typed_query.call('list_strategies', {}, dict)
+        rows = []
+        for s in response.get('strategies') or []:
+            state_name = str(s.get('state') or '')
+            row = {
+                'name': s.get('name'),
+                'state': state_name,
+                'dispatchable': is_dispatchable_strategy_state(state_name),
+                'bar_size': str(s.get('bar_size') or ''),
+                'conids': s.get('conids') or [],
+                'hist_days_prior': s.get('historical_days_prior'),
+                'auto_execute': s.get('auto_execute', False),
+                'class_name': s.get('class_name') or '',
+                'description': s.get('description') or '',
+            }
+            params = s.get('params')
+            if params:
+                row['params'] = params
+            rows.append(row)
+        return pd.DataFrame(rows) if rows else pd.DataFrame()
 
     def enable_strategy(self, name: str) -> SuccessFail:
-        """Enable a strategy by name."""
-        return consume(self._rpc.rpc().enable_strategy(name))
+        """Enable a strategy by name (strategy typed command)."""
+        try:
+            response = self._strategy_typed_command.call(
+                'enable_strategy_by_name', {'strategy_name': name}, dict,
+            )
+            if response.get('ok'):
+                return SuccessFail.success(response)
+            return SuccessFail.fail(error=response.get('error') or f'enable failed: {name}')
+        except Exception as exc:
+            return SuccessFail.fail(error=str(exc))
 
     def disable_strategy(self, name: str) -> SuccessFail:
-        """Disable a strategy by name."""
-        return consume(self._rpc.rpc().disable_strategy(name))
+        """Disable a strategy by name (strategy typed command)."""
+        try:
+            response = self._strategy_typed_command.call(
+                'disable_strategy_by_name', {'strategy_name': name}, dict,
+            )
+            if response.get('ok'):
+                return SuccessFail.success(response)
+            return SuccessFail.fail(error=response.get('error') or f'disable failed: {name}')
+        except Exception as exc:
+            return SuccessFail.fail(error=str(exc))
 
     def update_strategy_params(self, name: str, params: dict) -> SuccessFail:
-        """Update a strategy's params — persisted to YAML and hot-swapped
-        live (no service restart needed). Empty-string value deletes a key."""
-        return consume(self._rpc.rpc().update_strategy_params(name, params))
+        """Update a strategy's params — requires command-center ceremony in production.
+
+        Direct dill RPC is unbound; use the dashboard command center
+        ``update_strategy_params`` flow (command_id + control revision).
+        """
+        try:
+            return consume(
+                self._legacy_or_raise('update_strategy_params').rpc().update_strategy_params(
+                    name, params,
+                )
+            )
+        except Exception as exc:
+            self._map_legacy_route_error('update_strategy_params', exc)
 
     def reload_strategies(self) -> SuccessFail:
         """Reload strategies from YAML config and re-subscribe to instruments."""
-        return consume(self._rpc.rpc().reload_strategies())
+        try:
+            response = self._strategy_typed_command.call('reload_strategies', {}, dict)
+            if response.get('ok'):
+                return SuccessFail.success(response)
+            return SuccessFail.fail(error=response.get('error') or 'reload failed')
+        except Exception as exc:
+            return SuccessFail.fail(error=str(exc))
 
     def check_ib_upstream(self) -> Optional[str]:
         """Check if IB Gateway has upstream connectivity. Returns error string or None if OK."""
         try:
-            svc_status = consume(self._rpc.rpc(return_type=dict).get_status())
+            svc_status = self._typed_query.call('get_status', {}, dict)
             if not svc_status.get('ib_upstream_connected', True):
                 return svc_status.get('ib_upstream_error', 'IB Gateway is not connected to IBKR servers')
         except Exception:
@@ -2303,7 +2654,8 @@ class MMR:
 
     def account(self) -> str:
         """Return the IB account ID."""
-        return consume(self._rpc.rpc(return_type=str).get_ib_account())
+        response = self._typed_query.call('get_ib_account', {}, dict)
+        return str(response.get('account_id') or '')
 
     def account_cash(self) -> dict:
         """Per-currency cash balances for the configured account.
@@ -2313,15 +2665,22 @@ class MMR:
         configured ``ib_account`` — a multi-account login won't leak another
         account's cash.
         """
-        return consume(self._rpc.rpc(return_type=dict).get_account_cash_by_currency())
+        return self._typed_query.call('get_account_cash_by_currency', {}, dict) or {}
 
     def get_risk_limits(self) -> dict:
         """Get current risk gate limits from trader_service."""
-        return consume(self._rpc.rpc(return_type=dict).get_risk_limits())
+        return self._typed_query.call('get_risk_limits', {}, dict) or {}
 
     def set_risk_limits(self, **kwargs) -> dict:
-        """Update risk gate limits on trader_service. Returns updated limits."""
-        return consume(self._rpc.rpc(return_type=dict).set_risk_limits(**kwargs))
+        """Update risk gate limits — not on the typed production surface."""
+        try:
+            return consume(
+                self._legacy_or_raise('set_risk_limits').rpc(
+                    return_type=dict
+                ).set_risk_limits(**kwargs)
+            )
+        except Exception as exc:
+            self._map_legacy_route_error('set_risk_limits', exc)
 
     # ------------------------------------------------------------------
     # Trading filters (local YAML, no RPC needed)
@@ -2401,14 +2760,16 @@ class MMR:
             pending_proposals: int
         """
         try:
-            acct = consume(self._rpc.rpc(return_type=str).get_ib_account())
+            acct = self.account()
+            if not acct:
+                return {'connected': False}
         except Exception:
             return {'connected': False}
 
         result: dict = {'connected': True, 'account': acct}
 
         try:
-            svc_status = consume(self._rpc.rpc(return_type=dict).get_status())
+            svc_status = self._typed_query.call('get_status', {}, dict)
             result['ib_upstream_connected'] = svc_status.get('ib_upstream_connected', True)
             if not result['ib_upstream_connected']:
                 result['ib_upstream_error'] = svc_status.get('ib_upstream_error', 'unknown')
@@ -2416,9 +2777,7 @@ class MMR:
             pass
 
         try:
-            acct_vals = consume(
-                self._rpc.rpc(return_type=dict).get_account_values()
-            )
+            acct_vals = self._account_values()
             if acct_vals and 'NetLiquidation' in acct_vals:
                 # Raw structured account values (value + currency separated).
                 # Lets consumers do math; CLI formats for display.
@@ -2484,23 +2843,21 @@ class MMR:
             )
 
         try:
-            summaries = consume(
-                self._rpc.rpc(return_type=list[PortfolioSummary]).get_portfolio_summary()
-            )
+            portfolio_df = self.portfolio()
             positions = []
-            for p in (summaries or []):
-                if isinstance(p, (list, tuple)) and not hasattr(p, 'account'):
-                    _, position, _, _, _, unrealized, realized, _, daily = p
-                else:
-                    position, unrealized, realized, daily = (
-                        p.position, p.unrealizedPNL, p.realizedPNL, p.dailyPNL
-                    )
-                if abs(position) > 0:
-                    positions.append((unrealized, realized, daily))
+            if portfolio_df is not None and not portfolio_df.empty:
+                for _, row in portfolio_df.iterrows():
+                    position = float(row.get('position') or 0.0)
+                    if abs(position) > 0:
+                        positions.append((
+                            row.get('unrealizedPNL'),
+                            row.get('realizedPNL'),
+                            row.get('dailyPNL'),
+                        ))
 
             result['positions'] = len(positions)
 
-            # Raw P&L floats. NaN-guard so json serializers don\'t emit
+            # Raw P&L floats. NaN-guard so json serializers don't emit
             # non-conformant `NaN` (which the agent saw as "[red]-$nan[/red]"
             # bleed-through under the old Rich-formatted path).
             def _safe(val):
@@ -2524,18 +2881,14 @@ class MMR:
             result['positions'] = None
 
         try:
-            orders = consume(
-                self._rpc.rpc(return_type=dict[int, list[Order]]).get_orders()
-            )
-            result['open_orders'] = sum(len(v) for v in (orders or {}).values())
+            orders_resp = self._typed_query.call('get_open_orders', {}, dict)
+            result['open_orders'] = len(orders_resp.get('orders') or [])
         except Exception:
             result['open_orders'] = None
 
         try:
-            pubs = consume(
-                self._rpc.rpc(return_type=list[int]).get_published_contracts()
-            )
-            result['streaming'] = len(pubs or [])
+            pubs = self._typed_query.call('get_published_contracts', {}, dict)
+            result['streaming'] = len(pubs.get('instrument_ids') or [])
         except Exception:
             pass
 
@@ -2884,9 +3237,14 @@ class MMR:
             multiplier='100',
         )
 
-        defs: List[SecurityDefinition] = consume(
-            self._rpc.rpc(return_type=list[SecurityDefinition]).resolve_contract(partial)
-        )
+        try:
+            defs: List[SecurityDefinition] = consume(
+                self._legacy_or_raise('options resolve').rpc(
+                    return_type=list[SecurityDefinition]
+                ).resolve_contract(partial)
+            )
+        except Exception as exc:
+            self._map_legacy_route_error('options resolve', exc)
         if not defs:
             raise ValueError(
                 f"Could not resolve option contract: {symbol} {expiration} {strike} {right}"
@@ -3170,7 +3528,9 @@ class MMR:
         contract = self._resolve_option_contract(symbol, expiration, strike, right)
 
         return consume(
-            self._rpc.rpc(return_type=SuccessFail[Trade]).place_order_simple(
+            self._legacy_or_raise('place order').rpc(
+                return_type=SuccessFail[Trade]
+            ).place_order_simple(
                 contract=contract,
                 action='BUY',
                 equity_amount=None,
@@ -3217,7 +3577,9 @@ class MMR:
         contract = self._resolve_option_contract(symbol, expiration, strike, right)
 
         return consume(
-            self._rpc.rpc(return_type=SuccessFail[Trade]).place_order_simple(
+            self._legacy_or_raise('place order').rpc(
+                return_type=SuccessFail[Trade]
+            ).place_order_simple(
                 contract=contract,
                 action='SELL',
                 equity_amount=None,
@@ -3306,22 +3668,27 @@ class MMR:
         else:
             # IB source
             base, quote_ccy = self._parse_forex_pair(pair)
-            contract = self._resolve_contract(base, sec_type='CASH')
-            ticker_data: Ticker = consume(
-                self._rpc.rpc(return_type=Ticker).get_snapshot(contract, False)
+            contract = self._resolve_contract(
+                base, sec_type='CASH', exchange='IDEALPRO', currency=quote_ccy,
             )
+            response = self._typed_query.call(
+                'get_snapshot',
+                {'instrument_id': int(contract.conId), 'delayed': False},
+                dict,
+            )
+            s = response.get('snapshot') or {}
             return {
                 'pair': f'{base}/{quote_ccy}',
-                'bid': ticker_data.bid,
-                'bidSize': ticker_data.bidSize,
-                'ask': ticker_data.ask,
-                'askSize': ticker_data.askSize,
-                'last': ticker_data.last,
-                'open': ticker_data.open,
-                'high': ticker_data.high,
-                'low': ticker_data.low,
-                'close': ticker_data.close,
-                'time': ticker_data.time,
+                'bid': s.get('bid'),
+                'bidSize': s.get('bid_size'),
+                'ask': s.get('ask'),
+                'askSize': s.get('ask_size'),
+                'last': s.get('last'),
+                'open': s.get('open'),
+                'high': s.get('high'),
+                'low': s.get('low'),
+                'close': s.get('close'),
+                'time': s.get('time'),
             }
 
     def forex_quote(self, from_currency: str, to_currency: str, source: str = 'ib') -> dict:
@@ -3361,17 +3728,23 @@ class MMR:
                 out['timestamp'] = result.last.timestamp
             return out
         else:
-            # IB source — use snapshot on CASH contract
-            contract = self._resolve_contract(from_currency.upper(), sec_type='CASH')
-            ticker_data: Ticker = consume(
-                self._rpc.rpc(return_type=Ticker).get_snapshot(contract, False)
+            # IB source — use typed snapshot on CASH contract
+            contract = self._resolve_contract(
+                from_currency.upper(), sec_type='CASH',
+                exchange='IDEALPRO', currency=to_currency.upper(),
             )
+            response = self._typed_query.call(
+                'get_snapshot',
+                {'instrument_id': int(contract.conId), 'delayed': False},
+                dict,
+            )
+            s = response.get('snapshot') or {}
             return {
                 'pair': f'{from_currency.upper()}/{to_currency.upper()}',
-                'bid': ticker_data.bid,
-                'ask': ticker_data.ask,
-                'last': ticker_data.last,
-                'time': ticker_data.time,
+                'bid': s.get('bid'),
+                'ask': s.get('ask'),
+                'last': s.get('last'),
+                'time': s.get('time'),
             }
 
     def forex_snapshot_all(self, tickers: Optional[List[str]] = None) -> pd.DataFrame:
@@ -3715,6 +4088,19 @@ class MMR:
 
         # IB path: use IBIdeaScanner for international markets
         if location:
+            # IBIdeaScanner still needs legacy dill RPC for scanner/history/
+            # fundamentals/news — those aren't on the typed production surface yet.
+            try:
+                self._legacy_or_raise('ideas --location')
+            except ConnectionError:
+                raise ConnectionError(
+                    'ideas --location (IB international path) requires the '
+                    'offline-simulation legacy RPC (port 42001), which is not '
+                    'bound in the split-container production topology. '
+                    'Use `ideas` without --location for US (Massive/TwelveData), '
+                    'or run with `unsafe_legacy_rpc: true` + `--simulation True`.'
+                ) from None
+
             from trader.tools.idea_scanner import IBIdeaScanner
 
             # Resolve universe to symbol list for IB path
@@ -3775,20 +4161,61 @@ class MMR:
                 names=names,
             )
 
-        # Massive path (default): US markets
-        from trader.tools.idea_scanner import IdeaScanner
-        scanner = IdeaScanner(self._massive_client)
-        return scanner.scan(
-            preset=preset,
-            source=source,
-            tickers=tickers,
-            universe_symbols=universe_symbols,
-            top_n=top_n,
-            custom_filters=custom_filters or None,
-            fundamentals=fundamentals,
-            news=news,
-            names=names,
+        # Massive path (default): US markets. Stocks Basic has no snapshots —
+        # fall back to TwelveData quotes on entitlement errors so bare `ideas`
+        # still works when the user has a TD key (common for history).
+        from trader.tools.idea_scanner import (
+            IdeaScanner,
+            IdeaScannerError,
+            LIQUID_US_FALLBACK_TICKERS,
+            TwelveDataIdeaScanner,
+            entitlement_fallback_notice,
+            is_data_entitlement_error,
         )
+        try:
+            scanner = IdeaScanner(self._massive_client)
+            return scanner.scan(
+                preset=preset,
+                source=source,
+                tickers=tickers,
+                universe_symbols=universe_symbols,
+                top_n=top_n,
+                custom_filters=custom_filters or None,
+                fundamentals=fundamentals,
+                news=news,
+                names=names,
+            )
+        except Exception as ex:
+            if not is_data_entitlement_error(ex):
+                raise
+            notice = entitlement_fallback_notice('massive', str(ex))
+            logging.warning(notice)
+            fb_source = source
+            fb_tickers = tickers
+            fb_universe = universe_symbols
+            if source == 'movers' or (not tickers and not universe_symbols):
+                fb_source = 'tickers'
+                fb_tickers = list(LIQUID_US_FALLBACK_TICKERS)
+                fb_universe = None
+            try:
+                td = TwelveDataIdeaScanner(self._twelvedata_client)
+                df = td.scan(
+                    preset=preset,
+                    source=fb_source,
+                    tickers=fb_tickers,
+                    universe_symbols=fb_universe,
+                    top_n=top_n,
+                    custom_filters=custom_filters or None,
+                    fundamentals=fundamentals,
+                    news=False,  # TD has no news
+                    names=names,
+                )
+            except Exception as td_ex:
+                raise IdeaScannerError(
+                    f'{notice} TwelveData fallback also failed: {td_ex}'
+                ) from td_ex
+            df.attrs['ideas_notice'] = notice
+            return df
 
     def scan(
         self,
@@ -3808,17 +4235,20 @@ class MMR:
             allowed, reason = tf.is_allowed('', location=location_code)
             if not allowed:
                 raise ValueError(f'Trading filter blocked location {location_code}: {reason}')
-        results = consume(
-            self._rpc.rpc(return_type=list[dict]).scanner_data(
-                scan_code=scan_code,
-                instrument=instrument,
-                location_code=location_code,
-                num_rows=num_rows,
-                above_price=above_price,
-                above_volume=above_volume,
-                market_cap_above=market_cap_above,
+        try:
+            results = consume(
+                self._legacy_or_raise('scan').rpc(return_type=list[dict]).scanner_data(
+                    scan_code=scan_code,
+                    instrument=instrument,
+                    location_code=location_code,
+                    num_rows=num_rows,
+                    above_price=above_price,
+                    above_volume=above_volume,
+                    market_cap_above=market_cap_above,
+                )
             )
-        )
+        except Exception as exc:
+            self._map_legacy_route_error('scan', exc)
         return pd.DataFrame(results) if results else pd.DataFrame()
 
     def forex_convert(

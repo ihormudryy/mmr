@@ -254,6 +254,44 @@ class MMRConfig:
                 else:
                     setattr(section, attr, str(value))
 
+        # Nested ``automation:`` block (preferred in trader.yaml). Applied
+        # before env/flat overrides already handled above would have set
+        # values — only fill attributes that were not set by flat keys/env.
+        # Re-apply flat keys after nested so flat/env still win when present.
+        nested_auto = raw.get('automation')
+        if isinstance(nested_auto, dict):
+            auto = config.automation
+            bool_keys = ('enabled', 'live_enabled')
+            str_keys = (
+                'artifact_bundle_path', 'public_key_ring_path',
+                'expected_artifact_id', 'strategy_name',
+            )
+            for key in bool_keys:
+                flat = f'automation_{key}'
+                if flat.upper() in os.environ or flat in raw:
+                    continue
+                if key not in nested_auto:
+                    continue
+                val = nested_auto[key]
+                setattr(
+                    auto, key,
+                    str(val).strip().lower() in ('1', 'true', 'yes', 'on')
+                    if not isinstance(val, bool) else bool(val),
+                )
+            for key in str_keys:
+                flat = f'automation_{key}'
+                if flat.upper() in os.environ or flat in raw:
+                    continue
+                if key not in nested_auto or nested_auto[key] is None:
+                    continue
+                setattr(auto, key, str(nested_auto[key]))
+
+        if config.automation.live_enabled:
+            raise ValueError(
+                'automation.live_enabled=true is refused until live canary '
+                'activation is explicitly opted in (hybrid design R3)'
+            )
+
         # Fall back to native MASSIVE_API_KEY env var if not set via config
         if not config.massive.api_key:
             env_key = os.getenv('MASSIVE_API_KEY', '')

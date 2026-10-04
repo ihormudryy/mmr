@@ -593,3 +593,61 @@ def test_monotonic_raising_order_size_cannot_approve_after_reject(qty, bump):
     )
     if not base.approved:
         assert not raised.approved
+
+
+# ---------------------------------------------------------------------------
+# P5 Task 7 — portfolio risk budget at session risk
+# ---------------------------------------------------------------------------
+
+def test_second_strategy_blocked_without_portfolio_authority():
+    controller = SessionRiskController(
+        calendar=XNYSCalendarPolicy(opening_stabilization=dt.timedelta(minutes=5)),
+        portfolio_authority_present=lambda _account: False,
+        strategy_count=lambda: 2,
+        now=lambda: NOW,
+    )
+    decision = controller.evaluate(
+        make_intent(),
+        make_artifact(),
+        make_approval(),
+        make_session(),
+        AllocationCeiling(max_gross_fraction=0.06),
+    )
+    assert "PORTFOLIO_AUTHORITY_ABSENT" in decision.reason_codes
+    assert decision.approved is False
+
+
+def test_second_strategy_ok_with_portfolio_authority():
+    controller = SessionRiskController(
+        calendar=XNYSCalendarPolicy(opening_stabilization=dt.timedelta(minutes=5)),
+        portfolio_authority_present=lambda _account: True,
+        strategy_count=lambda: 2,
+        now=lambda: NOW,
+    )
+    decision = controller.evaluate(
+        make_intent(),
+        make_artifact(),
+        make_approval(),
+        make_session(),
+        AllocationCeiling(max_gross_fraction=0.06),
+    )
+    assert "PORTFOLIO_AUTHORITY_ABSENT" not in decision.reason_codes
+    assert decision.approved is True
+
+
+def test_single_strategy_unchanged_without_portfolio_authority():
+    controller = SessionRiskController(
+        calendar=XNYSCalendarPolicy(opening_stabilization=dt.timedelta(minutes=5)),
+        portfolio_authority_present=lambda _account: False,
+        strategy_count=lambda: 1,
+        now=lambda: NOW,
+    )
+    decision = controller.evaluate(
+        make_intent(),
+        make_artifact(),
+        make_approval(),
+        make_session(),
+        AllocationCeiling(max_gross_fraction=0.06),
+    )
+    assert "PORTFOLIO_AUTHORITY_ABSENT" not in decision.reason_codes
+    assert decision.approved is True

@@ -38,9 +38,14 @@ def _make_mmr_with_mock(mock_client) -> MMR:
     mmr._timeout = 5
     mmr._subscriptions = []
     mmr._position_map = {}
+    mmr._contract_map = {}
     mmr._container = MagicMock()
     mmr._container.config.return_value = {'massive_api_key': 'test_key'}
     mmr._container.config_file = '/tmp/test_trader.yaml'
+    mmr._typed_query_client = None
+    mmr._typed_command_client = None
+    mmr._strategy_typed_query_client = None
+    mmr._strategy_typed_command_client = None
     return mmr
 
 

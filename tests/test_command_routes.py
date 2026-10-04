@@ -220,6 +220,17 @@ def test_cross_origin_mutation_is_rejected(gateway):
     assert gateway.calls == []
 
 
+def test_loopback_origin_aliases_accepted(gateway):
+    """localhost vs 127.0.0.1 must not reject same-machine dashboard POSTs."""
+    client = make_client(gateway)
+    headers = dict(HEADERS)
+    headers["Origin"] = "http://127.0.0.1:7424"
+    headers["Host"] = "localhost:7424"
+    r = client.post("/api/commands/proposals", json=_proposal_body(), headers=headers)
+    assert r.status_code == 202, r.text
+    assert gateway.calls
+
+
 def test_csrf_token_endpoint_returns_session_bound_token(gateway, monkeypatch):
     monkeypatch.undo()  # use the real session_csrf_token, not the fixture's stub
     client = make_client(gateway)
@@ -961,3 +972,127 @@ def test_strategy_and_pause_routes_disabled_returns_403_before_gateway(gateway):
         assert r.status_code == 403
         assert r.json()["code"] == "COMMANDS_DISABLED"
     assert gateway.calls == []
+
+
+def test_activate_allocation_requires_preflight_nonce(gateway):
+    client = make_client(gateway)
+    r = client.post("/api/commands/allocation/activate",
+                    json={"command_id": CMD_ID,
+                          "attestation": {"strategy_id": "orb"},
+                          "reason": "scale"},
+                    headers=HEADERS)
+    assert r.status_code == 428
+    assert r.json()["code"] == "PREFLIGHT_REQUIRED"
+    assert gateway.calls == []
+
+
+def test_activate_allocation_forwards_with_nonce_on_paper(gateway):
+    # Paper dashboards (live_commands=False) still need a nonce for
+    # activate_allocation; the route must not treat nonce presence as a
+    # live-only signal.
+    client = make_client(gateway)
+    attestation = {"strategy_id": "orb", "signature": "sig"}
+    r = client.post("/api/commands/allocation/activate",
+                    json={"command_id": CMD_ID, "attestation": attestation,
+                          "reason": "scale 1", "preflight_nonce": "n-alloc"},
+                    headers=HEADERS)
+    assert r.status_code == 202
+    method, body = gateway.calls[0]
+    assert method == "activate_allocation"
+    assert body["command_id"] == CMD_ID
+    assert body["attestation"] == attestation
+    assert body["reason"] == "scale 1"
+    assert body["preflight_nonce"] == "n-alloc"
+    assert body["session_fingerprint"]  # opaque, non-empty
+
+
+def test_suspend_allocation_is_single_post(gateway):
+    client = make_client(gateway)
+    r = client.post("/api/commands/allocation/suspend",
+                    json={"command_id": CMD_ID, "reason": "drawdown"},
+                    headers=HEADERS)
+    assert r.status_code == 202
+    assert gateway.calls == [("suspend_allocation", {
+        "command_id": CMD_ID, "reason": "drawdown",
+    })]
+
+
+def test_preflight_allows_activate_allocation_without_live_commands(gateway):
+    client = make_client(gateway)  # paper-only flags
+    r = client.post("/api/preflight",
+                    json={"command_id": CMD_ID, "action": "activate_allocation",
+                          "params": {"attestation": {"strategy_id": "orb"},
+                                     "reason": "scale"}},
+                    headers=HEADERS)
+    assert r.status_code == 200
+    assert gateway.calls[0][0] == "preflight_command"
+    assert gateway.calls[0][1]["action"] == "activate_allocation"
+
+
+def test_allocation_routes_disabled_returns_403_before_gateway(gateway):
+    client = make_client(gateway, flags=CommandFlags(False, False, None, None))
+    for url, body in [
+        ("/api/commands/allocation/activate",
+         {"command_id": CMD_ID, "attestation": {"strategy_id": "orb"},
+          "reason": "scale", "preflight_nonce": "n-1"}),
+        ("/api/commands/allocation/suspend",
+         {"command_id": CMD_ID, "reason": "drawdown"}),
+    ]:
+        r = client.post(url, json=body, headers=HEADERS)
+        assert r.status_code == 403
+        assert r.json()["code"] == "COMMANDS_DISABLED"
+    assert gateway.calls == []
+
+
+def test_activate_paper_automation_requires_preflight_nonce(gateway):
+    client = make_client(gateway)
+    r = client.post("/api/commands/paper-automation/activate",
+                    json={"command_id": CMD_ID, "strategy_name": "orb",
+                          "reason": "enable reviewed strategy"},
+                    headers=HEADERS)
+    assert r.status_code == 428
+    assert r.json()["code"] == "PREFLIGHT_REQUIRED"
+    assert gateway.calls == []
+
+
+def test_activate_paper_automation_forwards_with_nonce(gateway):
+    client = make_client(gateway)
+    r = client.post("/api/commands/paper-automation/activate",
+                    json={"command_id": CMD_ID, "strategy_name": "orb",
+                          "reason": "enable reviewed strategy",
+                          "preflight_nonce": "n-paper"},
+                    headers=HEADERS)
+    assert r.status_code == 202
+    method, body = gateway.calls[0]
+    assert method == "activate_paper_automation"
+    assert body["command_id"] == CMD_ID
+    assert body["strategy_name"] == "orb"
+    assert body["reason"] == "enable reviewed strategy"
+    assert body["preflight_nonce"] == "n-paper"
+    # Nonce consume binds session fingerprint; omitting it made Activate
+    # always fail with PREFLIGHT_REQUIRED after a successful preflight.
+    assert body["session_fingerprint"]
+
+
+def test_deactivate_paper_automation_is_immediate(gateway):
+    client = make_client(gateway)
+    r = client.post("/api/commands/paper-automation/deactivate",
+                    json={"command_id": CMD_ID, "reason": "operator stop"},
+                    headers=HEADERS)
+    assert r.status_code == 202
+    assert gateway.calls == [("deactivate_paper_automation", {
+        "command_id": CMD_ID, "reason": "operator stop",
+    })]
+
+
+def test_preflight_allows_paper_automation_activation_without_live_commands(gateway):
+    client = make_client(gateway)
+    r = client.post("/api/preflight",
+                    json={"command_id": CMD_ID,
+                          "action": "activate_paper_automation",
+                          "params": {"strategy_name": "orb",
+                                     "reason": "enable reviewed strategy"}},
+                    headers=HEADERS)
+    assert r.status_code == 200
+    assert gateway.calls[0][0] == "preflight_command"
+    assert gateway.calls[0][1]["action"] == "activate_paper_automation"

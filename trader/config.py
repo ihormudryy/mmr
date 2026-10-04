@@ -117,6 +117,13 @@ class TypedRpcConfig:
     service_hmac_key_file: str = ''
 
 
+# docker-compose passes these as `KEY: ${KEY:-}`, so an unset host variable
+# arrives as '' and must not blank a key set in trader.yaml.
+_BLANKABLE_ENV_KEYS = frozenset({
+    'massive_api_key', 'twelvedata_api_key', 'alpaca_api_key_id', 'alpaca_api_secret_key',
+})
+
+
 @dataclass
 class MMRConfig:
     ib: IBConfig = field(default_factory=IBConfig)
@@ -225,6 +232,8 @@ class MMRConfig:
         for flat_key, nested_path in config._FLAT_KEY_MAP.items():
             # Check env var override first (uppercase)
             env_val = os.getenv(flat_key.upper())
+            if flat_key in _BLANKABLE_ENV_KEYS and env_val is not None and not env_val.strip():
+                env_val = None
             yaml_val = raw.get(flat_key)
 
             value = env_val if env_val is not None else yaml_val
@@ -313,12 +322,6 @@ class MMRConfig:
             env_key = os.getenv('TWELVEDATA_API_KEY', '')
             if env_key:
                 config.twelvedata.api_key = env_key
-
-        # Fall back to native ALPACA_* env vars if not set via config
-        if not config.alpaca.api_key_id:
-            config.alpaca.api_key_id = os.getenv('ALPACA_API_KEY_ID', '')
-        if not config.alpaca.secret_key:
-            config.alpaca.secret_key = os.getenv('ALPACA_API_SECRET_KEY', '')
 
         # Derive paper_trading flag from trading_mode
         config.paper_trading = config.trading_mode == 'paper'

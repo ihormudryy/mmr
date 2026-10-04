@@ -1,8 +1,8 @@
-"""MMR Trading Loop Engine — autonomous trading state machine for LLMVM.
+"""MMR Trading Loop Engine — proposal-only monitoring loop for LLMVM.
 
 This module provides the TradingLoop class which registers hooks into the
 LLMVM runtime to create a continuous MONITOR → ANALYZE → PROPOSE → DIGEST
-trading cycle.
+trading cycle. Auto-approval and broker execution are not supported here.
 
 Requires the 'mmr' skill to be loaded first (provides MMRHelpers).
 """
@@ -35,7 +35,7 @@ DEFAULT_CONFIG = {
 
     # Risk
     "risk_hhi_warning": 0.15,           # HHI above this triggers warning
-    "auto_approve": False,              # NEVER auto-approve by default
+    "auto_approve": False,              # Reserved: auto-approval is unsupported
 
     # Context management
     "compact_after_cycle": True,        # compact context after each DIGEST phase
@@ -53,7 +53,7 @@ DEFAULT_CONFIG = {
 
 
 class TradingLoop:
-    """Autonomous trading loop state machine.
+    """Proposal-only trading loop state machine.
 
     Usage in LLMVM:
         await load_skill("mmr-skill", "all")
@@ -76,8 +76,24 @@ class TradingLoop:
     }
 
     @classmethod
+    async def _validate_proposal_only(cls):
+        """Refuse unsupported approval mode, stopping any active loop.
+
+        Recheck the mutable config at startup and runtime await boundaries.
+        This guards this helper only, not other tools in the LLMVM session.
+        """
+        if cls.config.get("auto_approve", False):
+            if cls._state["running"]:
+                await cls.stop()
+            raise ValueError(
+                "auto_approve is unsupported: this helper is proposal-only. "
+                "Set auto_approve=False; proposals require explicit user approval."
+            )
+
+    @classmethod
     async def start(cls):
         """Start the trading loop by registering hooks."""
+        await cls._validate_proposal_only()
         if cls._state["running"]:
             print("Trading loop is already running.")
             return
@@ -144,6 +160,8 @@ class TradingLoop:
         if not cls._state["running"]:
             return HookResult()
 
+        await cls._validate_proposal_only()
+
         # If the user typed something (interrupt + new instruction), let the
         # LLM respond immediately instead of sleeping through it.
         if ctx.messages:
@@ -193,6 +211,7 @@ class TradingLoop:
         if cls._state["tracked_positions"] and monitor_elapsed >= monitor_interval:
             cls._state["last_monitor_time"] = time.time()
             alerts = await cls._check_tracked_positions()
+            await cls._validate_proposal_only()
             if alerts:
                 alert_text = "\n".join(alerts)
                 return HookResult(
@@ -226,6 +245,7 @@ class TradingLoop:
         print("\n".join(parts))
 
         await asyncio.sleep(sleep_time)
+        await cls._validate_proposal_only()
         return HookResult(continue_loop=True)
 
     @classmethod
@@ -479,7 +499,9 @@ async def start_trading_loop(**overrides):
         await start_trading_loop(scan_interval_seconds=300, location="STK.AU.ASX")
     """
     for k, v in overrides.items():
-        if k in TradingLoop.config:
+        # Never discard an explicit approval request, even if the mutable
+        # config no longer contains the reserved key. start() must reject it.
+        if k in TradingLoop.config or k == "auto_approve":
             TradingLoop.config[k] = v
     await TradingLoop.start()
 

@@ -158,6 +158,34 @@ class TestQuoteAuthority:
         assert self._auth(trader).executable_quote(CONID, side="BUY").price == 210.0
         assert self._auth(trader).executable_quote(CONID, side="SELL").price == 209.5
 
+    def test_copies_same_snapshot_depth_without_another_market_read(self):
+        ticker = _ticker()
+        ticker.bidSize, ticker.askSize = 123.0, 456.0
+        trader = _fake_trader(snapshot=ticker)
+        calls = []
+        def snapshot(contract, delayed=False):
+            calls.append(contract)
+            return ticker
+        trader.client.get_snapshot = snapshot
+        quote = self._auth(trader).executable_quote(CONID, side="BUY")
+        assert quote.bid_size == 123.0
+        assert quote.ask_size == 456.0
+        assert len(calls) == 1
+
+    @pytest.mark.parametrize("size", [None, -1, float("nan"), float("inf")])
+    def test_unusable_depth_is_absent_not_fabricated(self, size):
+        ticker = _ticker()
+        ticker.bidSize = ticker.askSize = size
+        quote = self._auth(_fake_trader(snapshot=ticker)).executable_quote(CONID, side="BUY")
+        assert quote.bid_size is None
+        assert quote.ask_size is None
+
+    def test_zero_depth_is_preserved(self):
+        ticker = _ticker()
+        ticker.bidSize = ticker.askSize = 0.0
+        quote = self._auth(_fake_trader(snapshot=ticker)).executable_quote(CONID, side="BUY")
+        assert quote.bid_size == quote.ask_size == 0.0
+
     def test_ask_bid_aliases_match_buy_sell(self):
         # Production create_proposal / dispatch_guard pass "ask"/"bid", not BUY/SELL.
         trader = _fake_trader(snapshot=_ticker(bid=209.5, ask=210.0, last=1.0))

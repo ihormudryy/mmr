@@ -1,6 +1,6 @@
 ---
 name: mmr-loop-skill
-description: Autonomous trading loop for the MMR platform. Continuously monitors portfolio, scans for opportunities, creates trade proposals, and manages risk. Requires the 'mmr' skill to be loaded first. Use when the user asks to start monitoring, trading autonomously, or running a trading loop.
+description: Proposal-only portfolio monitoring and trade ideas.
 metadata:
   author: mmr
   version: "1.0"
@@ -9,7 +9,7 @@ metadata:
 
 # MMR Trading Loop
 
-This skill turns the MMR trading platform into an autonomous trading agent. It implements a phased state machine that continuously monitors your portfolio, scans for opportunities, and creates trade proposals for your review.
+This external LLMVM helper continuously monitors your portfolio, scans for opportunities, and creates trade proposals for your review. It is proposal-only, not an execution engine: it does not approve proposals or place broker orders. Use it for monitoring and proposal generation, not unattended trade execution.
 
 **Important**: This skill requires the `mmr` skill to be loaded first. Load both:
 ```
@@ -67,14 +67,24 @@ The loop reads configuration from the `TradingLoop.config` dict. Override before
 TradingLoop.config["scan_interval_seconds"] = 300  # 5 minutes between cycles
 TradingLoop.config["scan_presets"] = ["momentum", "mean-reversion"]
 TradingLoop.config["max_proposals_per_cycle"] = 1
-TradingLoop.config["auto_approve"] = False  # NEVER set to True without understanding the risks
+TradingLoop.config["auto_approve"] = False  # Auto-approval is unsupported; keep disabled
 ```
+
+`auto_approve` is a reserved compatibility option, not an execution switch.
+Setting it to `True` (or another truthy value, including a non-empty string)
+raises `ValueError` before startup through either `TradingLoop.start()` or
+`start_trading_loop(**overrides)`. If enabled while running, validation stops
+the loop and raises on the next hook invocation, or when an in-progress
+monitor check/sleep returns, before emitting further loop instructions.
+Restore `False` and explicitly start the loop again to resume. Approving a
+proposal remains a separate, explicit user-authorized workflow; neither a
+config change nor a generic request such as "fix them" authorizes execution.
 
 See [references/LOOP_CONFIG.md](references/LOOP_CONFIG.md) for full configuration reference.
 
 ## Safety Boundaries
 
-1. **Proposals, not trades**: The loop creates proposals but NEVER auto-executes. You approve or reject.
+1. **Proposals, not trades**: The loop creates proposals but NEVER auto-executes. Unsupported auto-approval configuration is rejected, not ignored. You approve or reject separately; this guard does not restrict unrelated helpers available in the external LLMVM session.
 2. **Position limits**: Respects `max_positions` from position_sizing.yaml. Stops proposing at the limit.
 3. **Group budgets**: Checks group allocation budgets before proposing. Over-budget = warning, not block.
 4. **Risk gate**: All approved trades still pass through the risk gate (max leverage, daily loss limit, etc.).

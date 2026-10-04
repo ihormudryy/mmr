@@ -25,6 +25,7 @@ fixed on the read path.
 from __future__ import annotations
 
 import logging
+import math
 import threading
 from typing import Any, Callable, Iterable, Optional
 
@@ -221,6 +222,15 @@ def _side_wants_ask(side: str) -> bool:
     return side.upper() in ("BUY", "ASK")
 
 
+def _usable_depth(value) -> Optional[float]:
+    """Preserve observed empty depth; absent/nonfinite IB sizes are unknown."""
+    try:
+        depth = float(value)
+    except (TypeError, ValueError, OverflowError):
+        return None
+    return depth if math.isfinite(depth) and depth >= 0 else None
+
+
 def _executable_price(ticker, *, side: str) -> Optional[float]:
     """Crossable price for ``side``, with last/close fallback.
 
@@ -302,6 +312,8 @@ class TraderQuoteAuthority:
                 session_state=_session_state(ticker),
                 bid=_usable_price(getattr(ticker, "bid", None)),
                 ask=_usable_price(getattr(ticker, "ask", None)),
+                bid_size=_usable_depth(getattr(ticker, "bidSize", None)),
+                ask_size=_usable_depth(getattr(ticker, "askSize", None)),
             )
         except Exception as exc:  # noqa: BLE001 — no usable quote -> capture fails closed
             logger.warning(

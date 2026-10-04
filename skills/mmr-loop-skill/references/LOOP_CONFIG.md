@@ -38,7 +38,15 @@ All configuration is set via `TradingLoop.config` before starting the loop.
 
 | Key | Default | Description |
 |-----|---------|-------------|
-| `auto_approve` | `false` | If true, auto-approves proposals below a confidence threshold. **Use with extreme caution.** |
+| `auto_approve` | `false` | Reserved compatibility option; auto-approval is unsupported. Keep disabled. `True` or any other truthy value raises `ValueError`; no confidence threshold enables execution. |
+
+This external LLMVM helper remains proposal-only. Both `TradingLoop.start()`
+and `start_trading_loop(**overrides)` validate this option before starting.
+If enabled during a running session, the next hook invocation (or return from
+an in-progress monitor check/sleep) stops the loop and raises before emitting
+further loop instructions. Set `auto_approve=False` and explicitly restart to
+resume. Proposals require a separate, explicit user approval workflow; this
+option never grants permission to execute trades.
 
 ## Context Management
 

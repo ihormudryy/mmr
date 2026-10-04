@@ -85,3 +85,29 @@ def test_cli_snapshot_prints_hint_error(capsys, command, method):
     _handle_snapshot(mmr, Namespace(symbol='BHP', symbols=['BHP'], delayed=False, exchange='ASX',
                                     currency='', source='alpaca'), command)
     assert 'need --source ib' in capsys.readouterr().out
+
+
+@pytest.mark.parametrize('yaml_text, env_value, expected', [
+    ('default_data_source: alpaca\n', None, 'ib'),
+    ('default_data_source: alpaca\ndata_providers: {quotes: alpaca}\n', None, 'alpaca'),
+    ('default_data_source: twelvedata\n', 'alpaca', 'alpaca'),
+    ('- just\n- a list\n', None, 'ib'),
+    ('data_providers: alpaca\n', None, 'ib'),
+    ('data_providers: alpaca\ndefault_data_source: twelvedata\n', None, 'twelvedata'),
+])
+def test_snapshot_source_default_template_and_malformed_config(trader_config, monkeypatch, yaml_text, env_value, expected):
+    from trader.mmr_cli import _snapshot_source_default
+    trader_config(yaml_text)
+    if env_value:
+        monkeypatch.setenv('MMR_DEFAULT_DATA_SOURCE', env_value)
+    assert _snapshot_source_default(QUOTE_CHOICES) == expected
+
+
+def test_default_data_source_does_not_change_registry_quotes_default():
+    from trader.data_providers import Capability
+    from trader.data_providers.registry import ProviderRegistry
+    registry = ProviderRegistry.from_config({'default_data_source': 'twelvedata'})
+    assert registry.default_source(Capability.QUOTES) == 'alpaca'
+    registry = ProviderRegistry.from_config({'default_data_source': 'twelvedata',
+                                             'data_providers': {'quotes': 'twelvedata'}})
+    assert registry.default_source(Capability.QUOTES) == 'twelvedata'

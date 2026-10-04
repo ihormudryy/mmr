@@ -20,9 +20,9 @@ MMR (Make Me Rich) is a Python-based algorithmic trading platform for Interactiv
 **Free providers first, IB fallback**:
 
 - **Default sources.** Alpaca (free Basic plan) is the default for US history (SIP feed, split-adjusted), `movers` and `news`.
-- **Quotes.** Alpaca can serve REST quotes (IEX feed) for `snapshot` / `snapshot-batch`. Default: `data_providers.quotes`, else an explicitly set `default_data_source` (or `MMR_DEFAULT_DATA_SOURCE`) if it names a quote source, else IB. REST sources cover US listings only, so `--exchange` / `--currency` need IB.
+- **Quotes.** Alpaca can serve REST quotes (IEX feed) for `snapshot` / `snapshot-batch`. Default: `data_providers.quotes`, else `MMR_DEFAULT_DATA_SOURCE` if it names a quote source, else a YAML `default_data_source` of `twelvedata` or `ib`, else IB. The template's `default_data_source: alpaca` is a history setting and does not switch snapshots; opt in with `data_providers.quotes: alpaca`. REST sources cover US listings only, so `--exchange` / `--currency` need IB.
 - **Opt-in sources.** Massive.com (Polygon.io) and TwelveData stay available with `--source massive|twelvedata`.
-- **No `default_data_source` inheritance.** `movers` and `news` never inherit it. Change their default with `data_providers.movers` / `data_providers.news`.
+- **Inheritance.** Only history inherits `default_data_source`. `movers`, `news` and REST quotes never do (the registry's REST-quotes default is Alpaca; the CLI snapshot rule above decides what `snapshot` uses). Change their default with `data_providers.movers` / `data_providers.news`.
 - **Ideas.** Bare `ideas` still defaults to Massive until phase 3b (it does **not** inherit `default_data_source`). If Massive snapshots aren't entitled (Stocks Basic), the scanner falls back to TwelveData quotes on a small liquid US set (or `--tickers` / `--universe`).
 - **International markets** (ASX, TSE, SEHK, etc.) use IB. Don't use Yahoo Finance.
 
@@ -352,7 +352,7 @@ backtests archive 42 43                     # hide from default list (reversible
 backtests unarchive 42                      # restore
 backtests delete 42                         # permanent
 backtests help                              # metric reference
-snapshot AMD                 # Price snapshot
+snapshot AMD                 # Price snapshot (default IB; --source alpaca|twelvedata for REST, US only)
 snapshot AAPL --source alpaca               # REST quote via Alpaca (IEX feed), US listings only; --exchange/--currency need IB
 snapshot-batch AAPL MSFT --source alpaca    # Batch quotes; rows have feed + error, unknown symbols reported per symbol
 depth AAPL                   # Level 2 order book (bids/asks + PNG chart)
@@ -528,7 +528,7 @@ CLI/SDK `resolve()` uses typed `discover_instrument` / `resolve_instrument` (421
 User configs live in `~/.config/mmr/`. On first run, bundled defaults from `config_defaults/` are copied there automatically (`container.ensure_config_dir()`). The `TRADER_CONFIG` env var overrides the config file path.
 
 **`~/.config/mmr/trader.yaml`**: IB connection (address, port, client IDs, account), DuckDB path, ZMQ port assignments. Env vars override config values (uppercased param name). Two CLI-only knobs the Container doesn't otherwise know about:
-- `default_data_source` (default `alpaca`) — default `--source` for history download, snapshot, watch, financials, fx where that choice is valid. It affects `data download` (history); other `--source` commands ignore it and use their own default. `snapshot` / `snapshot-batch` default: `data_providers.quotes`, else an explicitly set `default_data_source` (or `MMR_DEFAULT_DATA_SOURCE`) if it names a quote source, else IB. REST sources cover US listings only; `--exchange` / `--currency` need IB. For `data download` the order is: explicit `data_providers.history` → `MMR_DEFAULT_DATA_SOURCE` / `default_data_source` (`ib` is honoured) → registry default `alpaca`. **`movers` and `news` never inherit it** (set `data_providers.movers` / `data_providers.news` instead; defaults `alpaca`). **`ideas` still always defaults to `massive`** until phase 3b. Override the global default per-shell with `MMR_DEFAULT_DATA_SOURCE`.
+- `default_data_source` (default `alpaca`) — default `--source` for history download, watch, financials, fx where that choice is valid (watch, financials and fx read it through `_src_default`). `snapshot` / `snapshot-batch` are special: Default: `data_providers.quotes`, else `MMR_DEFAULT_DATA_SOURCE` if it names a quote source, else a YAML `default_data_source` of `twelvedata` or `ib`, else IB. The template's `default_data_source: alpaca` is a history setting and does not switch snapshots; opt in with `data_providers.quotes: alpaca`. REST sources cover US listings only; `--exchange` / `--currency` need IB. For `data download` the order is: explicit `data_providers.history` → `MMR_DEFAULT_DATA_SOURCE` / `default_data_source` (`ib` is honoured) → registry default `alpaca`. **`movers` and `news` never inherit it** (set `data_providers.movers` / `data_providers.news` instead; defaults `alpaca`). **`ideas` still always defaults to `massive`** until phase 3b. Override the global default per-shell with `MMR_DEFAULT_DATA_SOURCE`.
   - **Output changes (phase 3a):** news items use `summary` (was `teaser` / `description`); Benzinga `tags` are no longer in `news_detail`; batch snapshot rows (REST sources) gain `feed` and `error`.
   - **Stock `movers` returns fewer rows than `--num`** after filtering (on 2026-10-02, 16 of Alpaca's 50 top gainers survived). `movers --detail` on Alpaca shows names and headlines but no ratios, market cap or description until phase 4 (`--source massive` keeps them).
   - Alpaca movers intraday check (weekday, `last_updated` age < 30 min) is not yet confirmed; see `docs/OPERATIONAL_STATE.md`.
@@ -745,7 +745,7 @@ mmr --json ideas momentum --location STK.AU.ASX --tickers BHP RIO  # Internation
 
 **Step 3: Research candidates**
 ```bash
-mmr --json snapshot AAPL                    # Current price + bid/ask
+mmr --json snapshot AAPL --source ib        # Current price + bid/ask (bid/ask need IB; REST quotes are Alpaca IEX / TwelveData)
 mmr --json news AAPL --detail               # Recent news + sentiment
 mmr --json ratios AAPL                      # P/E, ROE, D/E, etc.
 ```

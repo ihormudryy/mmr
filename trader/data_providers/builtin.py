@@ -116,7 +116,7 @@ BUILTIN_DEFAULTS: dict[Capability, str] = {
 IB_HISTORY_SOURCE = 'ib'
 
 
-INHERITS_DEFAULT_DATA_SOURCE = frozenset({Capability.HISTORY, Capability.QUOTES})
+INHERITS_DEFAULT_DATA_SOURCE = frozenset({Capability.HISTORY})
 
 
 def source_choices(capability: Capability) -> list[str]:

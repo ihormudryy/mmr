@@ -268,23 +268,27 @@ def print_status(message, success=True):
 # Argparse parser
 # ------------------------------------------------------------------
 
+def _read_trader_config() -> dict:
+    """The parsed trader.yaml; {} when missing, unreadable or not a mapping."""
+    import os
+    import yaml
+    path = Path(os.environ.get('TRADER_CONFIG', '~/.config/mmr/trader.yaml')).expanduser()
+    try:
+        with path.open() as f:
+            config = yaml.safe_load(f)
+    except (OSError, yaml.YAMLError):
+        return {}
+    return config if isinstance(config, dict) else {}
+
+
+def _data_provider_overrides(config: dict) -> dict:
+    overrides = config.get('data_providers')
+    return overrides if isinstance(overrides, dict) else {}
+
+
 def _load_default_data_source() -> str:
     import os
-    val = os.environ.get('MMR_DEFAULT_DATA_SOURCE')
-    if val:
-        return val
-    try:
-        import yaml
-        path = Path(os.environ.get('TRADER_CONFIG', '~/.config/mmr/trader.yaml')).expanduser()
-        if path.exists():
-            with path.open() as f:
-                cfg = yaml.safe_load(f) or {}
-            val = cfg.get('default_data_source')
-            if val:
-                return val
-    except Exception:
-        pass
-    return 'alpaca'
+    return os.environ.get('MMR_DEFAULT_DATA_SOURCE') or _read_trader_config().get('default_data_source') or 'alpaca'
 
 
 _DEFAULT_DATA_SOURCE = _load_default_data_source()
@@ -294,32 +298,29 @@ def _src_default(choices, fallback):
     return _DEFAULT_DATA_SOURCE if _DEFAULT_DATA_SOURCE in choices else fallback
 
 
-def _read_trader_config() -> dict:
-    import os
-    import yaml
-    path = Path(os.environ.get('TRADER_CONFIG', '~/.config/mmr/trader.yaml')).expanduser()
-    try:
-        with path.open() as f:
-            return yaml.safe_load(f) or {}
-    except (OSError, yaml.YAMLError):
-        return {}
+# `default_data_source: alpaca` is the template value and is a history setting; it must not
+# move snapshots off IB. Only these values are read as a snapshot choice from the YAML.
+_YAML_SNAPSHOT_DEFAULTS = ('twelvedata', 'ib')
 
 
 def _snapshot_source_default(choices) -> str:
     """Default `--source` for snapshot commands.
 
-    Order: `data_providers.quotes`, then an explicitly set MMR_DEFAULT_DATA_SOURCE /
-    `default_data_source`, then IB. No implicit REST default: REST sources cover
-    US listings only, so a symbol with an exchange hint must not silently go there.
+    Order: `data_providers.quotes`, then MMR_DEFAULT_DATA_SOURCE, then a YAML
+    `default_data_source` of twelvedata or ib, then IB. REST sources cover US
+    listings only, so a symbol with an exchange hint must not silently go there.
     """
     import os
     config = _read_trader_config()
-    explicit_quotes_source = (config.get('data_providers') or {}).get('quotes')
+    explicit_quotes_source = _data_provider_overrides(config).get('quotes')
     if explicit_quotes_source in choices:
         return explicit_quotes_source
-    default_data_source = os.environ.get('MMR_DEFAULT_DATA_SOURCE') or config.get('default_data_source')
-    if default_data_source in choices:
-        return default_data_source
+    env_source = os.environ.get('MMR_DEFAULT_DATA_SOURCE')
+    if env_source in choices:
+        return env_source
+    yaml_source = config.get('default_data_source')
+    if yaml_source in _YAML_SNAPSHOT_DEFAULTS and yaml_source in choices:
+        return yaml_source
     return 'ib'
 
 
@@ -438,7 +439,7 @@ def build_parser() -> argparse.ArgumentParser:
     quote_sources = ['ib'] + source_choices(Capability.QUOTES)
     snap_p.add_argument('--source', choices=quote_sources,
                         default=_snapshot_source_default(quote_sources),
-                        help='Data source (default: data_providers.quotes, else default_data_source, else ib). '
+                        help='Data source (default: data_providers.quotes, else MMR_DEFAULT_DATA_SOURCE, else default_data_source twelvedata/ib, else ib). '
                              'REST sources need no trader_service and cover US listings only; '
                              'alpaca = IEX prices, twelvedata = no bid/ask.')
 
@@ -453,7 +454,7 @@ def build_parser() -> argparse.ArgumentParser:
     snap_batch_p.add_argument('--currency', default='', help='Currency hint (e.g. AUD, JPY, HKD)')
     snap_batch_p.add_argument('--source', choices=quote_sources,
                               default=_snapshot_source_default(quote_sources),
-                              help='Data source (default: data_providers.quotes, else default_data_source, else ib). '
+                              help='Data source (default: data_providers.quotes, else MMR_DEFAULT_DATA_SOURCE, else default_data_source twelvedata/ib, else ib). '
                                    'REST sources need no trader_service and cover US listings only; '
                                    'twelvedata batches up to 120 symbols per call.')
 

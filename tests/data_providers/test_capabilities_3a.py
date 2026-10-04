@@ -83,7 +83,7 @@ def test_missing_builtin_default_raises_provider_error():
 
 def test_builtin_inheritance_set_and_choices():
     from trader.data_providers.builtin import INHERITS_DEFAULT_DATA_SOURCE, source_choices
-    assert INHERITS_DEFAULT_DATA_SOURCE == frozenset({Capability.HISTORY, Capability.QUOTES})
+    assert INHERITS_DEFAULT_DATA_SOURCE == frozenset({Capability.HISTORY})
     assert source_choices(Capability.HISTORY) == ['alpaca', 'massive', 'twelvedata']
 
 

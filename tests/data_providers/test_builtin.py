@@ -68,3 +68,10 @@ def test_alpaca_env_overrides_yaml_like_massive(monkeypatch, tmp_path):
     config = MMRConfig.from_yaml(str(cfg))
     assert config.alpaca.api_key_id == 'env-id'
     assert config.alpaca.secret_key == 'yaml-secret'
+
+
+def test_alpaca_asset_directory_needs_both_keys():
+    from trader.data_providers.builtin import alpaca_asset_directory
+    assert alpaca_asset_directory({}) is None
+    assert alpaca_asset_directory({'alpaca_api_key_id': 'id', 'alpaca_api_secret_key': ' '}) is None
+    assert alpaca_asset_directory({'alpaca_api_key_id': 'id', 'alpaca_api_secret_key': 'secret'}) is not None

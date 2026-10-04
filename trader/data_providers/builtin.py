@@ -68,6 +68,17 @@ def _twelvedata_movers(config: Mapping[str, Any]):
     return TwelveDataMovers(TDClient(apikey=config['twelvedata_api_key']))
 
 
+def alpaca_asset_directory(config: Mapping[str, Any]):
+    """The cached Alpaca asset list, or None when Alpaca keys are not configured."""
+    if not all(str(config.get(key) or '').strip() for key in ('alpaca_api_key_id', 'alpaca_api_secret_key')):
+        return None
+    from trader.data_providers.alpaca.assets import ALPACA_PAPER_TRADING_URL, AlpacaAssetDirectory
+    from trader.data_providers.alpaca.client import AlpacaClient
+    client = AlpacaClient(config['alpaca_api_key_id'], config['alpaca_api_secret_key'],
+                          base_url=ALPACA_PAPER_TRADING_URL)
+    return AlpacaAssetDirectory(client)
+
+
 def builtin_specs() -> list[ProviderSpec]:
     return [
         ProviderSpec('alpaca', (('alpaca_api_key_id', 'ALPACA_API_KEY_ID'),

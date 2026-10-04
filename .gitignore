@@ -38,3 +38,7 @@ notebooks/
 /*-gate.json
 /*drill*.json
 .hypothesis/
+
+# Python build output
+build/
+dist/

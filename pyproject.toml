@@ -1,8 +1,27 @@
 [project]
 name = "mmr"
 version = "0.1.0"
-description = "Make Me Rich - Algorithmic Trading Platform"
+description = "LLM-native algorithmic trading platform for Interactive Brokers"
+readme = "README.md"
 requires-python = ">=3.12"
+authors = [
+    { name = "9600 Developments" },
+    { name = "Ihor Mudryy" },
+]
+keywords = [
+    "algorithmic-trading", "interactive-brokers", "trading", "backtesting",
+    "quantitative-finance", "duckdb", "zeromq", "llm",
+]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Intended Audience :: Developers",
+    "Intended Audience :: Financial and Insurance Industry",
+    "Operating System :: MacOS",
+    "Operating System :: POSIX :: Linux",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.12",
+    "Topic :: Office/Business :: Financial :: Investment",
+]
 dependencies = [
     "backoff>=2.2",
     "fastapi>=0.115",
@@ -73,6 +92,12 @@ streaming = [
 browser-test = [
     "playwright==1.55.0",
 ]
+
+[project.urls]
+Homepage = "https://github.com/ihormudryy/mmr"
+Documentation = "https://github.com/ihormudryy/mmr#readme"
+Issues = "https://github.com/ihormudryy/mmr/issues"
+Changelog = "https://github.com/ihormudryy/mmr/blob/master/CHANGELOG.md"
 
 [project.scripts]
 trader-service = "trader.trader_service:main"

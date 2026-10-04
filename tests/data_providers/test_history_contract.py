@@ -46,3 +46,19 @@ def test_twelvedata_history_frame_matches_contract():
         # nothing when start == end (pre-existing quirk, see Known findings).
         df = worker.get_history('AAPL', BarSize.Mins1, dt.datetime(2024, 6, 3), dt.datetime(2024, 6, 4))
     assert_history_frame(df, BarSize.Mins1)
+
+
+def test_alpaca_history_frame_matches_contract():
+    import json
+    from pathlib import Path
+    from trader.data_providers.alpaca.history import AlpacaHistoryProvider
+
+    page = json.loads((Path(__file__).parent / 'fixtures' / 'alpaca_bars_aapl_1min_2023-01-03.json').read_text())
+
+    class OnePage:
+        def paginate(self, path, params):
+            yield page
+
+    provider = AlpacaHistoryProvider(OnePage(), now=lambda: dt.datetime(2026, 10, 4, tzinfo=dt.timezone.utc))
+    df = provider.get_history('AAPL', BarSize.Mins1, dt.datetime(2023, 1, 3), dt.datetime(2023, 1, 3))
+    assert_history_frame(df, BarSize.Mins1)

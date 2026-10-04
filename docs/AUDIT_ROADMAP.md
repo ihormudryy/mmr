@@ -314,8 +314,31 @@ merge. Fix opportunistically, or in the phase that touches the file.
 - `trader/data_providers/rate_limit.py`: `calls <= 0` / `max_tries < 1` not validated; `Retry-After` uses `isdigit()` (accepts `'²'`, then `float()` raises); 429 response not closed between retries; no threaded limiter test.
 - `trader/data_providers/alpaca/client.py`: a non-dict JSON error body raises `AttributeError` in `_error_for`; non-JSON 200 and `requests.RequestException` are not wrapped as `ProviderError` (still loud — callers log per symbol); each per-task `requests.Session` is never closed.
 - `trader/data_providers/alpaca/sessions.py`: no committed DST-straddling tests (verified manually); `sessions_in_range` `DateOutOfBounds` unwrapped for a far-future `now`; early-close days wait until 20:16 (conservative) — add a docstring note.
-- `trader/data_providers/alpaca/history.py`: `dt.date` input path untested (verified correct); tz-aware inputs use their own calendar date; missing `vw`/`n` become None silently; unknown tickers return an empty frame instead of an error (add the asset-list check in phase 3a); weekly/monthly requests mid-period store a partial bar (self-heals); "end cut" log fires on every run ending today.
+- `trader/data_providers/alpaca/history.py`: `dt.date` input path untested (verified correct); tz-aware inputs use their own calendar date; missing `vw`/`n` become None silently; unknown tickers return an empty frame instead of an error (still open after phase 3a: the asset list exists in `AlpacaAssetDirectory`, but `knows()` is not yet used for history); weekly/monthly requests mid-period store a partial bar (self-heals); "end cut" log fires on every run ending today.
 - `trader/mmr_cli.py`: mid-function `ProviderError` import in `_handle_data_download`; `_rest_history_worker` unannotated; `mmr data download` exits 0 after a setup failure (refresh path is fixed); REST sources never check that the security is US-listed (ad-hoc `data download BHP --source alpaca` would store NYSE ADR bars under an ASX conId).
 - `start_mmr.sh` setup wizard (Alpaca and Massive alike): writes an empty secret if left blank; says "configured" when the key line is missing from `trader.yaml`; `/` or `&` in a secret breaks the `sed`.
 - Tests: unused imports in `tests/data_providers/test_errors_and_capabilities.py` and `test_history_contract.py`; contract tests feed one row for Massive/TwelveData; data-refresh template test uses a cwd-relative path; live test assumes ET output (`hour == 4`).
 - Docs: `CLAUDE.md` Alpaca-keys paragraph is dense (split into bullets, define SIP; 20:16 includes a 1-minute margin); plan Task 11 Step 4 gate lacks the exact print command.
+
+## Free data providers — open minors (phase 3a, 2026-10-04)
+
+Small items found in the final review of phase 3a. None blocks merge.
+
+- `trader/sdk.py` `_provider`: the registry is rebuilt on every call and `TDClient` is created per call.
+- `trader/data_providers/errors.py`: `CapabilityNotSupported` prints "(no default)" wording for a missing default.
+- `tests/data_providers`: no tests for the builtin builders of the new capabilities (quotes, movers, news).
+- `trader/mmr_cli.py`: mid-function imports in `build_parser` and `_handle_download`.
+- `trader/data_providers/alpaca/quotes.py`: duplicate symbols in one call share a single row.
+- `trader/data_providers/alpaca/quotes.py`: loose NaN truthiness on `previous_close`.
+- `skills/mmr-skill/scripts/mmr_helpers.py`: helper `movers` hard-codes `--source massive` (phase 9).
+- `trader/data_providers/massive/news.py`: Benzinga `tags` dropped from `news_detail`; trailing `Z` on timestamps.
+- `news` JSON output drops the `sentiment` column when it is empty (unstable columns).
+- `trader/data_providers/alpaca/news.py`: a null `id` becomes `'None'`; `limit <= 0` is unguarded.
+- `movers --detail`: the asset directory is loaded twice.
+- `movers --detail` help still mentions ratios.
+- `trader/sdk.py`: `_provider(NEWS)` is called outside the per-ticker try block.
+- `trader/data_providers/alpaca/assets.py`: NaN ticker, future-dated cache and non-dict cached assets are not handled.
+- Alpaca IEX snapshot `volume` / `previous_close` are IEX-only (labelled `feed='iex'`).
+- Massive movers: `day.close` may be 0 pre-open (unverified).
+- `MMRHelpers.news` docstring is stale.
+- TwelveData multi-symbol code-400 is treated as a whole-call failure (unverified against real TwelveData).

@@ -162,16 +162,22 @@ massive_delayed: false
 # TwelveData (parallel history backend; set TWELVEDATA_API_KEY env var as alternative)
 twelvedata_api_key: ''
 
+# Alpaca market data (free Basic plan with a paper account). Default history
+# source for US stocks. Env vars ALPACA_API_KEY_ID / ALPACA_API_SECRET_KEY
+# are used when these are empty.
+alpaca_api_key_id: ''
+alpaca_api_secret_key: ''
+
 # CLI default for --source on commands that take it (history download,
 # snapshot, watch, financials, fx). Per-command --source still wins.
 # Override per-shell with MMR_DEFAULT_DATA_SOURCE.
-# Recognised values: massive, twelvedata, ib (only used where the choice
+# Recognised values: alpaca, massive, twelvedata, ib (only used where the choice
 # set for that command includes it; otherwise the command's own default
 # applies).
 # NOTE: `ideas` and `movers` always default to massive — TwelveData's
 # /market_movers endpoint requires Pro+, so inheriting twelvedata here
 # would 403 on Basic/Starter keys that still work for quotes/history.
-default_data_source: twelvedata
+default_data_source: alpaca
 
 # Equity-curve decimation at backtest-persist time. The full per-bar
 # series is ~9.9 MB per 1-min run (4,713 runs took ~47 GB pre-fix);

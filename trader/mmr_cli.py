@@ -284,7 +284,7 @@ def _load_default_data_source() -> str:
                 return val
     except Exception:
         pass
-    return 'massive'
+    return 'alpaca'
 
 
 _DEFAULT_DATA_SOURCE = _load_default_data_source()
@@ -828,6 +828,12 @@ def build_parser() -> argparse.ArgumentParser:
     hist_td_p.add_argument('--universe', default=None, help='Universe name to download')
     hist_td_p.add_argument('--bar_size', default='1 day', help='Bar size (default: "1 day")')
     hist_td_p.add_argument('--prev_days', type=int, default=30, help='Days of history (default: 30)')
+
+    hist_alpaca_p = hist_sub.add_parser('alpaca', help='Download history from Alpaca (free)')
+    hist_alpaca_p.add_argument('--symbol', default=None, help='Single symbol to download')
+    hist_alpaca_p.add_argument('--universe', default=None, help='Universe name to download')
+    hist_alpaca_p.add_argument('--bar_size', default='1 day', help='Bar size (default: "1 day")')
+    hist_alpaca_p.add_argument('--prev_days', type=int, default=30, help='Days of history (default: 30)')
 
     hist_ib_p = hist_sub.add_parser('ib', help='Download history from Interactive Brokers')
     hist_ib_p.add_argument('--symbol', default=None, help='Single symbol to download')
@@ -1850,7 +1856,7 @@ def build_parser() -> argparse.ArgumentParser:
 
     data_dl_p = data_sub.add_parser(
         'download',
-        help='Download data from Massive.com or TwelveData to local DuckDB'
+        help='Download data from Alpaca, Massive.com, TwelveData or IB to local DuckDB'
     )
     data_dl_p.add_argument('symbols', nargs='+', help='Symbols to download')
     data_dl_p.add_argument('--bar-size', default='1 day', help='Bar size (default: "1 day")')
@@ -1859,9 +1865,9 @@ def build_parser() -> argparse.ArgumentParser:
     data_dl_p.add_argument(
         '--source',
         choices=history_source_choices(),
-        default=_src_default(history_source_choices(), 'massive'),
-        help='Data source (default: from default_data_source in trader.yaml). Use `ib` for '
-             'international exchanges (ASX, SEHK, TSE, EU) — requires trader_service / IB Gateway.',
+        default=None,
+        help='Data source (default: data_providers.history, else default_data_source, else alpaca). '
+             'Use `ib` for international exchanges (ASX, SEHK, TSE, EU) — requires trader_service / IB Gateway.',
     )
     data_dl_p.add_argument(
         '--force', '-f',
@@ -8502,6 +8508,22 @@ def _rest_history_worker(source: str, cfg):
     return ProviderRegistry.from_config(cfg).get(Capability.HISTORY, source)
 
 
+def _default_history_source(cfg) -> str:
+    """Registry default for history, plus `ib`, which only the CLI knows.
+
+    An explicit `data_providers.history` always wins; otherwise
+    `default_data_source: ib` keeps IB instead of silently switching to Alpaca.
+    """
+    from trader.data_providers import Capability, ProviderRegistry
+    from trader.data_providers.builtin import IB_HISTORY_SOURCE
+    explicit_history_source = (cfg.get('data_providers') or {}).get('history')
+    if explicit_history_source:
+        return explicit_history_source
+    if cfg.get('default_data_source') == IB_HISTORY_SOURCE:
+        return IB_HISTORY_SOURCE
+    return ProviderRegistry.from_config(cfg).default_source(Capability.HISTORY)
+
+
 def _handle_data_download(args: argparse.Namespace):
     """Download data from the selected source directly to local DuckDB.
 
@@ -8520,7 +8542,7 @@ def _handle_data_download(args: argparse.Namespace):
     container = Container.instance()
     cfg = container.config()
     duckdb_path = cfg.get('duckdb_path', '')
-    source = getattr(args, 'source', 'massive')
+    source = getattr(args, 'source', None) or _default_history_source(cfg)
 
     from trader.data_providers import ProviderError
 
@@ -9151,10 +9173,10 @@ def _handle_data_migrate_symbols(args: argparse.Namespace):
 
 # ---- data refresh / data status -----------------------------------------
 
-# US-exchange codes that route to TwelveData by default. Anything else falls
+# US-exchange codes that route to Alpaca by default. Anything else falls
 # through to IB. Kept module-level so a future symbol-level override can
 # reference the same list.
-_US_EXCHANGES_FOR_TD = frozenset({
+_US_EXCHANGES = frozenset({
     'NASDAQ', 'NYSE', 'ARCA', 'AMEX', 'BATS', 'IEX', 'SMART',
 })
 
@@ -9180,16 +9202,16 @@ def _load_data_refresh_yaml() -> Dict[str, Any]:
 
 
 def _auto_source_for_universe(universe_symbols) -> str:
-    """Pick 'twelvedata' or 'ib' based on the dominant exchange in
-    ``universe_symbols``. Bias to TD when any meaningful fraction of the
-    universe is US-listed, since TD downloads cost ~nothing and IB
-    historical pacing is the bottleneck."""
+    """Pick 'alpaca' or 'ib' based on the dominant exchange in
+    ``universe_symbols``. Bias to Alpaca when most of the universe is
+    US-listed, since Alpaca is free and IB historical pacing is the
+    bottleneck."""
     if not universe_symbols:
         return 'ib'
     us_count = sum(1 for sd in universe_symbols
-                   if (sd.exchange or '').upper() in _US_EXCHANGES_FOR_TD
-                   or (sd.primaryExchange or '').upper() in _US_EXCHANGES_FOR_TD)
-    return 'twelvedata' if us_count >= len(universe_symbols) / 2 else 'ib'
+                   if (sd.exchange or '').upper() in _US_EXCHANGES
+                   or (sd.primaryExchange or '').upper() in _US_EXCHANGES)
+    return 'alpaca' if us_count >= len(universe_symbols) / 2 else 'ib'
 
 
 def _handle_data_refresh(args: argparse.Namespace):
@@ -9561,6 +9583,15 @@ def _handle_history(mmr: MMR, args: argparse.Namespace):
     elif action in ('twelvedata', 'td'):
         console.print('[dim]Pulling TwelveData history via data_service...[/dim]')
         result = mmr.pull_twelvedata(
+            symbols=symbols,
+            universe=universe,
+            bar_size=args.bar_size,
+            prev_days=args.prev_days,
+        )
+    elif action == 'alpaca':
+        console.print('[dim]Pulling Alpaca history via data_service...[/dim]')
+        result = mmr.pull_history(
+            'alpaca',
             symbols=symbols,
             universe=universe,
             bar_size=args.bar_size,

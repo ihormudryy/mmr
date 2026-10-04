@@ -379,6 +379,7 @@ print_api_keys() {
     echo "${DC_DIM}Data feed API keys${DC_RESET}"
     _api_key_status_d "Massive/Polygon" "massive_api_key"    "MASSIVE_API_KEY"    "$yaml_file"
     _api_key_status_d "TwelveData"      "twelvedata_api_key" "TWELVEDATA_API_KEY" "$yaml_file"
+    _api_key_status_d "Alpaca"          "alpaca_api_key_id"  "ALPACA_API_KEY_ID"  "$yaml_file"
     echo ""
 }
 

@@ -43,6 +43,8 @@ class DataService:
         self,
         massive_api_key: str = '',
         twelvedata_api_key: str = '',
+        alpaca_api_key_id: str = '',
+        alpaca_api_secret_key: str = '',
         ib_server_address: str = '127.0.0.1',
         ib_server_port: int = 7497,
         duckdb_path: str = '',
@@ -54,6 +56,8 @@ class DataService:
     ):
         self.massive_api_key = massive_api_key
         self.twelvedata_api_key = twelvedata_api_key
+        self.alpaca_api_key_id = alpaca_api_key_id
+        self.alpaca_api_secret_key = alpaca_api_secret_key
         self.ib_server_address = ib_server_address
         self.ib_server_port = ib_server_port
         self.duckdb_path = duckdb_path
@@ -70,6 +74,8 @@ class DataService:
         return {
             'massive_api_key': self.massive_api_key,
             'twelvedata_api_key': self.twelvedata_api_key,
+            'alpaca_api_key_id': self.alpaca_api_key_id,
+            'alpaca_api_secret_key': self.alpaca_api_secret_key,
         }
 
     def _resolve_symbols(

@@ -20,3 +20,51 @@ def test_from_config_builds_existing_workers():
     registry = ProviderRegistry.from_config({'massive_api_key': 'm', 'twelvedata_api_key': 't'})
     assert isinstance(registry.get(Capability.HISTORY, 'massive'), MassiveHistoryWorker)
     assert isinstance(registry.get(Capability.HISTORY, 'twelvedata'), TwelveDataHistoryWorker)
+
+
+def test_alpaca_is_the_default_history_source():
+    from trader.data_providers.alpaca.history import AlpacaHistoryProvider
+    registry = ProviderRegistry.from_config({'alpaca_api_key_id': 'k', 'alpaca_api_secret_key': 's'})
+    assert registry.default_source(Capability.HISTORY) == 'alpaca'
+    assert isinstance(registry.get(Capability.HISTORY), AlpacaHistoryProvider)
+
+
+def test_data_providers_override_beats_default_data_source():
+    registry = ProviderRegistry.from_config({'data_providers': {'history': 'massive'},
+                                             'default_data_source': 'twelvedata'})
+    assert registry.default_source(Capability.HISTORY) == 'massive'
+
+
+def test_download_parser_default_is_none_so_registry_decides():
+    from trader.mmr_cli import build_parser
+    assert build_parser().parse_args(['data', 'download', 'AAPL']).source is None
+
+
+def test_alpaca_missing_secret_names_env_var():
+    import pytest
+    from trader.data_providers.errors import ProviderNotConfigured
+    registry = ProviderRegistry.from_config({'alpaca_api_key_id': 'k'})
+    with pytest.raises(ProviderNotConfigured, match='ALPACA_API_SECRET_KEY'):
+        registry.get(Capability.HISTORY, 'alpaca')
+
+
+def test_alpaca_keys_load_from_env(monkeypatch, tmp_path):
+    from trader.config import MMRConfig
+    cfg = tmp_path / 'trader.yaml'
+    cfg.write_text('duckdb_path: data/mmr.duckdb\n')
+    monkeypatch.setenv('ALPACA_API_KEY_ID', 'env-id')
+    monkeypatch.setenv('ALPACA_API_SECRET_KEY', 'env-secret')
+    config = MMRConfig.from_yaml(str(cfg))
+    assert config.alpaca.api_key_id == 'env-id'
+    assert config.alpaca.secret_key == 'env-secret'
+
+
+def test_alpaca_env_overrides_yaml_like_massive(monkeypatch, tmp_path):
+    from trader.config import MMRConfig
+    cfg = tmp_path / 'trader.yaml'
+    cfg.write_text("alpaca_api_key_id: yaml-id\nalpaca_api_secret_key: yaml-secret\n")
+    monkeypatch.setenv('ALPACA_API_KEY_ID', 'env-id')
+    monkeypatch.delenv('ALPACA_API_SECRET_KEY', raising=False)
+    config = MMRConfig.from_yaml(str(cfg))
+    assert config.alpaca.api_key_id == 'env-id'
+    assert config.alpaca.secret_key == 'yaml-secret'

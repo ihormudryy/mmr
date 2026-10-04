@@ -27,6 +27,12 @@ class IBConfig:
 
 
 @dataclass
+class AlpacaConfig:
+    api_key_id: str = ''
+    secret_key: str = ''
+
+
+@dataclass
 class StorageConfig:
     duckdb_path: str = '~/.local/share/mmr/data/mmr.duckdb'
     history_duckdb_path: str = '~/.local/share/mmr/data/mmr_history.duckdb'
@@ -120,6 +126,7 @@ class MMRConfig:
     strategy: StrategyRuntimeConfig = field(default_factory=StrategyRuntimeConfig)
     massive: MassiveConfig = field(default_factory=MassiveConfig)
     twelvedata: TwelveDataConfig = field(default_factory=TwelveDataConfig)
+    alpaca: AlpacaConfig = field(default_factory=AlpacaConfig)
     typed_rpc: TypedRpcConfig = field(default_factory=TypedRpcConfig)
     automation: AutomationConfig = field(default_factory=AutomationConfig)
     root_directory: str = '.'
@@ -176,6 +183,9 @@ class MMRConfig:
             'massive_delayed': ('massive', 'delayed'),
             # TwelveData
             'twelvedata_api_key': ('twelvedata', 'api_key'),
+            # Alpaca
+            'alpaca_api_key_id': ('alpaca', 'api_key_id'),
+            'alpaca_api_secret_key': ('alpaca', 'secret_key'),
             # Typed RPC (G0 authenticated query/command/feed transport)
             # typed_bind_address is the interface the query/command/feed
             # ROUTER sockets BIND to (not publish -- publishing is a Compose
@@ -303,6 +313,12 @@ class MMRConfig:
             env_key = os.getenv('TWELVEDATA_API_KEY', '')
             if env_key:
                 config.twelvedata.api_key = env_key
+
+        # Fall back to native ALPACA_* env vars if not set via config
+        if not config.alpaca.api_key_id:
+            config.alpaca.api_key_id = os.getenv('ALPACA_API_KEY_ID', '')
+        if not config.alpaca.secret_key:
+            config.alpaca.secret_key = os.getenv('ALPACA_API_SECRET_KEY', '')
 
         # Derive paper_trading flag from trading_mode
         config.paper_trading = config.trading_mode == 'paper'

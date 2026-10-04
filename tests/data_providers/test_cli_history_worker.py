@@ -36,3 +36,40 @@ def test_dead_polygon_modules_are_gone():
     for name in ('trader.listeners.polygon_listener', 'trader.listeners.polygon_reactive',
                  'trader.batch.polygon_batch', 'trader.batch.polygon_queuer'):
         assert importlib.util.find_spec(name) is None, name
+
+
+def test_us_universe_auto_source_is_alpaca():
+    from types import SimpleNamespace
+    from trader.mmr_cli import _auto_source_for_universe
+    us = [SimpleNamespace(exchange='SMART', primaryExchange='NASDAQ')] * 3
+    asx = [SimpleNamespace(exchange='ASX', primaryExchange='ASX')] * 3
+    assert _auto_source_for_universe(us) == 'alpaca'
+    assert _auto_source_for_universe(asx) == 'ib'
+    assert _auto_source_for_universe([]) == 'ib'
+
+
+def test_history_alpaca_subcommand_parses():
+    from trader.mmr_cli import build_parser
+    args = build_parser().parse_args(['history', 'alpaca', '--symbol', 'AAPL'])
+    assert args.symbol == 'AAPL'
+
+
+def test_data_refresh_template_uses_alpaca_for_us_jobs():
+    from pathlib import Path
+    import yaml
+    jobs = yaml.safe_load(Path('config_defaults/data_refresh.yaml').read_text())['jobs']
+    assert jobs['us_top20_daily']['source'] == 'alpaca'
+    assert jobs['us_top20_1min']['source'] == 'alpaca'
+
+
+@pytest.mark.parametrize('config, expected', [
+    ({'default_data_source': 'ib'}, 'ib'),
+    ({'data_providers': {'history': 'ib'}}, 'ib'),
+    ({'data_providers': {'history': 'ib'}, 'default_data_source': 'massive'}, 'ib'),
+    ({'data_providers': {'history': 'massive'}, 'default_data_source': 'ib'}, 'massive'),
+    ({'default_data_source': 'massive'}, 'massive'),
+    ({}, 'alpaca'),
+])
+def test_default_history_source_keeps_ib_and_honours_overrides(config, expected):
+    from trader.mmr_cli import _default_history_source
+    assert _default_history_source(config) == expected

@@ -73,6 +73,8 @@ x-mmr-common-env: &mmr-common-env
   NEWS_SERVICE_URL: ${NEWS_SERVICE_URL:-http://host.docker.internal:8089}
   MASSIVE_API_KEY: ${MASSIVE_API_KEY:-}
   TWELVEDATA_API_KEY: ${TWELVEDATA_API_KEY:-}
+  ALPACA_API_KEY_ID: ${ALPACA_API_KEY_ID:-}
+  ALPACA_API_SECRET_KEY: ${ALPACA_API_SECRET_KEY:-}
   # Skip writing .pyc under the read-only, editable-installed source tree
   # (harmless if it happens -- CPython swallows bytecode-cache write
   # failures -- but this avoids relying on that silently-swallowed path).

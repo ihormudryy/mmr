@@ -21,7 +21,7 @@ one local commit per task, app working after every task.
 | 1 | `2026-10-04-free-data-providers-01-02-history.md` | registry foundation + history routing (TD, Massive behind registry; dead polygon code removed) | — | done |
 | 2 | same file | history | Alpaca | done |
 | 3a | `…-03a-quotes-movers-news.md` | quotes, movers (+filter), news | Alpaca | done |
-| 3b | `…-03b-scanner-merge.md` | one capability-based idea scanner; CLI `snapshot` default should honour `data_providers.quotes` (deferred from 3a) | — | after 3a |
+| 3b | `…-03b-scanner-merge.md` | one capability-based idea scanner | — | after 3a |
 | 3c | `…-03c-remove-fallback.md` | remove silent Massive→TD fallback | — | after 3b |
 | 4 | `…-04-fundamentals.md` | ratios, statements, 10-K sections | Finnhub, EDGAR | after 3c |
 | 5 | `…-05-options.md` | options | Alpaca (indicative) | after 4 |

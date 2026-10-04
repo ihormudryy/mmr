@@ -173,10 +173,12 @@ alpaca_api_secret_key: ''
 # Override per-shell with MMR_DEFAULT_DATA_SOURCE.
 # Recognised values: alpaca, massive, twelvedata, ib (only used where the choice
 # set for that command includes it; otherwise the command's own default
-# applies). It affects `data download` and the REST quote commands (`snapshot`,
-# `snapshot-batch`). `movers` and `news` never inherit it: use
-# data_providers.movers / data_providers.news below. `ideas` still defaults to
-# massive until phase 3b.
+# applies). It affects `data download`. `snapshot` / `snapshot-batch` default to
+# data_providers.quotes, else an explicitly set default_data_source (or
+# MMR_DEFAULT_DATA_SOURCE) if it names a quote source, else IB. REST sources
+# cover US listings only; --exchange/--currency need IB.
+# `movers` and `news` never inherit it: use data_providers.movers /
+# data_providers.news below. `ideas` still defaults to massive until phase 3b.
 default_data_source: alpaca
 
 # Optional per-capability override. Wins over default_data_source.

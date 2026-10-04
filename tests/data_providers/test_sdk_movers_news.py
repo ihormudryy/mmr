@@ -55,7 +55,13 @@ def test_asset_list_failure_only_turns_instrument_filter_off():
     mmr._alpaca_assets = MagicMock(side_effect=ProviderEntitlementError('alpaca rejected the API key'))
     out = mmr.movers('stocks', 'gainers', source='massive')
     assert out['ticker'].tolist() == ['HPAIW', 'AAPL']
-    assert all('warrant filter off' in note for note in out['note'])
+    assert all(note == 'warrant filter off: Alpaca asset list unavailable' for note in out['note'])
+
+
+def test_missing_alpaca_keys_say_not_configured():
+    out = _mmr(_frame(), assets=None).movers('stocks', 'gainers')
+    assert out['ticker'].tolist() == ['HPAIW', 'AAPL']
+    assert all(note == 'warrant filter off: Alpaca not configured' for note in out['note'])
 
 
 def test_crypto_movers_are_not_filtered():

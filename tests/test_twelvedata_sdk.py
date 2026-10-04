@@ -437,9 +437,15 @@ class TestMoversDetailTwelveData:
             assert row['ratios']['pe'] == 25.0
             assert row['news'] == {}  # TD has no news
         m.movers.assert_called_once_with(
-            market='stocks', direction='gainers', source='twelvedata',
+            market='stocks', direction='gainers', source='twelvedata', min_price=1.0,
         )
         assert m.ratios.call_count == 2
+
+    def test_min_price_reaches_movers(self):
+        m = _bind_only_mmr()
+        m.movers = MagicMock(return_value=pd.DataFrame())
+        m.movers_detail(source='twelvedata', min_price=0)
+        assert m.movers.call_args.kwargs['min_price'] == 0
 
     def test_empty_movers_returns_empty(self):
         m = _bind_only_mmr()

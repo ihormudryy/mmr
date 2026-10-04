@@ -3666,14 +3666,20 @@ class MMR:
         return directory.load() if directory else None
 
     def _movers_asset_directory(self):
-        """The asset list for movers enrichment, or None. A failure here never fails movers."""
+        """The asset list for movers enrichment and the note to show when it is missing.
+
+        A failure here never fails movers; it only turns the warrant filter off.
+        """
         import requests
         from trader.data_providers import ProviderError
+        from trader.data_providers.movers_filter import (
+            ASSET_LIST_UNAVAILABLE_NOTE, INSTRUMENT_FILTER_OFF_NOTE)
         try:
-            return self._alpaca_assets()
+            directory = self._alpaca_assets()
         except (ProviderError, requests.RequestException) as ex:
             logger.warning('alpaca asset list unavailable, movers warrant filter off: %s', ex)
-            return None
+            return None, ASSET_LIST_UNAVAILABLE_NOTE
+        return directory, INSTRUMENT_FILTER_OFF_NOTE
 
     def movers(
         self,
@@ -3692,7 +3698,8 @@ class MMR:
         from trader.data_providers.movers_filter import filter_stock_movers
         frame = self._provider(Capability.MOVERS, source).movers(market, direction)
         if market == 'stocks':
-            frame = filter_stock_movers(frame, min_price, self._movers_asset_directory())
+            assets, off_note = self._movers_asset_directory()
+            frame = filter_stock_movers(frame, min_price, assets, off_note)
         return frame
 
     def movers_detail(
@@ -3725,7 +3732,7 @@ class MMR:
         source = source or self._provider_default(Capability.MOVERS)
 
         if source == 'twelvedata':
-            df = self.movers(market=market, direction=direction, source='twelvedata')
+            df = self.movers(market=market, direction=direction, source='twelvedata', min_price=min_price)
             if df.empty:
                 return []
             rows = df.head(num).to_dict('records')
@@ -3888,7 +3895,7 @@ class MMR:
         from concurrent.futures import ThreadPoolExecutor
         from trader.data_providers import Capability
         frame = self.movers(market=market, direction=direction, source=source, min_price=min_price).head(num)
-        assets = self._movers_asset_directory() if market == 'stocks' else None
+        assets = self._movers_asset_directory()[0] if market == 'stocks' else None
         news_provider = self._provider(Capability.NEWS)
 
         def latest_headline(ticker: str) -> dict:

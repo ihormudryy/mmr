@@ -109,7 +109,7 @@ class DataService:
         self,
         sem: asyncio.Semaphore,
         source: str,
-        provider,
+        registry: ProviderRegistry,
         security: SecurityDefinition,
         date_range: DateRange,
         bar_size: BarSize,
@@ -118,6 +118,7 @@ class DataService:
         async with sem:
             self._running_count += 1
             try:
+                provider = registry.get(Capability.HISTORY, source)
                 logging.info('downloading {} {} from {} to {}'.format(
                     source, security.symbol, pdt(date_range.start), pdt(date_range.end)
                 ))
@@ -215,7 +216,8 @@ class DataService:
         Returns {'enqueued': N, 'completed': N, 'failed': N, 'errors': [...]}
         """
         try:
-            provider = ProviderRegistry.from_config(self._provider_config()).get(Capability.HISTORY, source)
+            registry = ProviderRegistry.from_config(self._provider_config())
+            registry.get(Capability.HISTORY, source)
         except ProviderError as ex:
             return {'enqueued': 0, 'completed': 0, 'failed': 0, 'errors': [str(ex)]}
 
@@ -254,7 +256,7 @@ class DataService:
                 date_ranges = [DateRange(start=tz_start, end=tz_end)]
 
             for dr in date_ranges:
-                tasks.append(self._download_rest_one(sem, source, provider, security, dr, bs, tick_data))
+                tasks.append(self._download_rest_one(sem, source, registry, security, dr, bs, tick_data))
 
         enqueued = len(tasks)
         if enqueued == 0:

@@ -2552,6 +2552,21 @@ class MMR:
     # Historical Data (via data_service RPC)
     # ------------------------------------------------------------------
 
+    def pull_history(
+        self,
+        source: str,
+        symbols: Optional[List[str]] = None,
+        universe: Optional[str] = None,
+        bar_size: str = '1 day',
+        prev_days: int = 30,
+    ) -> dict:
+        """Download historical data from any registry history source via the data_service."""
+        return consume(
+            self._data_rpc.rpc(return_type=dict).pull_history(
+                source=source, symbols=symbols, universe=universe, bar_size=bar_size, prev_days=prev_days,
+            )
+        )
+
     def pull_massive(
         self,
         symbols: Optional[List[str]] = None,

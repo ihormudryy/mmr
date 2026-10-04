@@ -78,7 +78,8 @@ The trader_service can be configured to **refuse direct buy/sell RPCs entirely**
 - **data_service required**: history_massive, history_twelvedata, history_ib
 - **massive_api_key or twelvedata_api_key** (no service needed): balance_sheet, income_statement, cash_flow, ratios, `data_download`, `ideas` (default US path), `forex_snapshot`, `forex_quote`, `forex_convert`, and the live ticker dashboard (`watch SYM... --source twelvedata`) — all accept `source="massive"|"twelvedata"` (`forex_*` also takes `"ib"` for trader_service routing)
 - **Alpaca keys** (no service needed): `movers`, `movers_detail`, `news` default to Alpaca (`source="massive"|"twelvedata"` stays opt-in for movers). `snapshot` / `snapshot_batch` default to IB (trader_service, bid/ask); `source="alpaca"|"twelvedata"` gives REST quotes for US tickers only (no exchange hints, no conIds)
-- **massive_api_key only** (no service needed): filing_section, `options_expirations`, `options_chain`, `options_snapshot`, `options_implied`, `forex_snapshot` (massive source), `forex_movers`, `stream`
+- **Alpaca keys for options data** (no service needed): `options_expirations`, `options_chain`, `options_snapshot`, `options_implied` default to Alpaca's free **indicative** feed (not the OPRA NBBO; greeks/IV only on liquid contracts). `source="massive"` gives OPRA and needs a Massive key with an options plan
+- **massive_api_key only** (no service needed): filing_section, `forex_snapshot` (massive source), `forex_movers`, `stream`
 - **No service needed**: universe_list, universe_show, universe_create, universe_delete, universe_remove, universe_import, status, market_hours, `data_summary`, `data_query`, `backtest`, `backtest_sweep`, `backtest_batch`, `backtests_list`, `backtests_show`, `backtests_confidence`, `backtests_archive`, `backtests_unarchive`, `sweep_run`, `sweeps_list`, `sweeps_show`, `strategies_inspect`, `strategy_create`, `strategy_deploy`, `strategy_undeploy`, `strategy_signals`, `strategy_backtest`, `propose`, `proposals`, `reject`, `session_limits`, `session_status`, `group_list`, `group_create`, `group_delete`, `group_show`, `group_add`, `group_remove`, `group_set`, `logs`
 
 ## Reality check first — `preflight()` before anything else
@@ -104,11 +105,11 @@ Returns a dict like:
     "diagnosis": ["All probed farms healthy..."]
   },
   "ib_market_data": {"works": false, "reason": "snapshot timed out — paper account likely has no live market-data subscription"},
-  "polygon_options": {"expirations_endpoint": true, "chain_endpoint": false, "tier": "free"},
+  "polygon_options": {"expirations_endpoint": true, "chain_endpoint": false, "tier": "free", "provider": "massive", "feed": "opra", "error": "massive refused options chain (NOT_AUTHORIZED: ...); use --source alpaca"},
   "local_data": {"symbols": 43, "bar_sizes": ["1 day", "1 min"], "has_daily": true, "canary_daily_rows": 8},
   "recommendations": [
     "IB live market data is unavailable. Avoid snapshot() / snapshots_batch() loops...",
-    "Polygon plan covers options_expirations only. options_chain returns NOT_AUTHORIZED — implied_move() will fall back to realized-vol.",
+    "Options chain is not entitled on massive (massive refused options chain (NOT_AUTHORIZED: ...)). implied_move() will fall back to realized-vol; use `--source alpaca` for the free indicative chain.",
     "Only 8 daily bars locally for QQQ. Top up via history_massive(...)."
   ]
 }
@@ -120,18 +121,18 @@ Returns a dict like:
 |---|---|---|
 | `snapshot()` / `history_*` time out on *every* symbol, including liquid US ones (AAPL, SPY) | IB Gateway logged in but data farms aren't connected (codes 2103/2105 broken). Almost always downstream of a session conflict — IBKR Mobile / TWS desktop / web logged in elsewhere as the same user is bumping the Gateway off. | `pf["ib_data_farms"]["ok"]` is false; check `session_conflict`, `farms` map for `"broken"` entries. Drill in with `MMRHelpers.ib_data_farms()` for fresh details. |
 | `snapshot()` returns `{"data": null, "timed_out": true}` for every symbol | IB Gateway connected but paper account has no live market-data subscription. `status()` says "connected" — that's misleading. | `pf["ib_market_data"]["works"]` |
-| `options_chain()` returns `BadResponse: NOT_AUTHORIZED` | Polygon plan tier doesn't include options. `options_expirations` works (free endpoint) but chain/snapshot don't. | `pf["polygon_options"]["chain_endpoint"]` |
+| `options_chain()` says `alpaca is not configured` or `massive refused options chain (NOT_AUTHORIZED ...)` | Options default to Alpaca: the Alpaca keys (`ALPACA_API_KEY_ID` / `ALPACA_API_SECRET_KEY`) are missing. Or the options source is Massive and its plan has no options data. | `pf["polygon_options"]["chain_endpoint"]` and `pf["polygon_options"]["error"]`; for Massive, use `source="alpaca"` |
 | `data_query("...", bar_size="1 day")` returns `[]` despite `data_summary` listing the symbol | Symbol is registered in the universe (so `data summary` shows it), but the actual stored bars are at a different `bar_size` (often 1 min only). | `pf["local_data"]["bar_sizes"]`, or just look at `data_query()`'s new `hint` field on empty results |
 | Local DuckDB has the symbol but only ~10 bars | Contract registered far back but data was never backfilled. Realized-vol estimates need ≥20–30 bars. | `pf["local_data"]["canary_daily_rows"]`; top up via `history_massive()` or `data_download()` |
 
 When `ib_market_data.works` is False — the most common failure mode on paper accounts — every price/quote question routes through:
 - **prices**: `data_query()` → fall back to `history_massive()` (downloads then queries)
 - **expected move / vol**: `implied_move()` (handles fallback chain internally)
-- **options chains**: only available on paid Polygon tier; otherwise pivot to `implied_move()` for vol estimates
+- **options chains**: `options_chain()` works on the free Alpaca indicative feed (needs Alpaca keys). If `pf["polygon_options"]["chain_endpoint"]` is false, pivot to `implied_move()` for vol estimates
 
 ## Earnings / event-driven moves — `implied_move()`
 
-Single helper that wraps the canonical "what's the implied move through this expiration?" calc with a three-tier fallback. Use this instead of hand-rolling ATM straddles.
+Single helper that wraps the canonical "what's the implied move through this expiration?" calc with a fallback to realized vol. Use this instead of hand-rolling ATM straddles.
 
 ```python
 # Implied move for GOOGL through Friday (e.g. earnings tonight)
@@ -146,8 +147,9 @@ Returns:
   "symbol": "GOOGL",
   "expiration": "2026-05-01",
   "dte_calendar": 2,
-  "method": "polygon_atm_straddle",   // or "realized_vol" on free tier
-  "confidence": "high",                // "high" for ATM straddle, "medium"/"low" for realized
+  "method": "atm_straddle",           // or "realized_vol"
+  "confidence": "medium",              // "high" for an OPRA straddle (--source massive), "medium" for Alpaca indicative or realized vol with ≥30 bars
+  "provider": "alpaca", "feed": "indicative",   // the options chain the straddle came from
   "spot": 167.45,
   "implied_move_pct": 5.42,            // 1-sigma % move
   "implied_move_dollar": 9.07,
@@ -155,11 +157,11 @@ Returns:
   "expected_high": 176.52,
   "atm_strike": 167.5, "call_mid": 4.7, "put_mid": 4.4,
   "annualized_vol_pct": null,
-  "notes": "ATM straddle from Polygon chain."
+  "notes": "ATM straddle from the alpaca options chain (indicative feed; indicative quotes, not OPRA NBBO)."
 }
 ```
 
-**Method selection:** `prefer="auto"` (default) tries Polygon ATM straddle first; falls back to realized-vol from local OHLCV (with Massive `list_aggs` top-up if local is thin) when Polygon options aren't available. Pass `prefer="realized"` to skip the Polygon attempt entirely (saves ~3s) when you already know from `preflight()` that the chain endpoint is gated.
+**Method selection:** `prefer="auto"` (default) tries the ATM straddle from the options chain first (Alpaca's free indicative feed by default). Confidence is `high` only on an OPRA feed (Massive), `medium` otherwise. It falls back to realized vol from local OHLCV (with Massive `list_aggs` top-up if local is thin) and says why in `fallback_reason` when: the chain is empty ("No chain data"), the source returns `NOT_AUTHORIZED`, there is no spot price, no strike has both a call and a put price, or the chain call times out, returns no JSON or raises. Any other failure the CLI reports (for example missing Alpaca keys, a rate limit) comes back in the result's `error`, not as a silent realized-vol number. Pass `prefer="realized"` to skip the chain attempt entirely (saves ~3s) when you already know from `preflight()` that the chain endpoint is unavailable.
 
 **Earnings caveat:** realized vol is a baseline, not a market-implied number. Earnings/event-driven moves often **double or triple** the realized-vol estimate. Treat it as a floor, not a forecast. The result's `notes` field flags this.
 
@@ -366,19 +368,18 @@ Shapes deliberately differ between sources — we pass through what each provide
 
 | Method | Service? | Description |
 |--------|----------|-------------|
-| `MMRHelpers.options_expirations(symbol)` | No* | List expiration dates with DTE (free Polygon tier) |
-| `MMRHelpers.options_chain(symbol, expiration=, contract_type=, strike_min=, strike_max=)` | No** | Full chain snapshot (strike, bid/ask, greeks, IV, OI) |
-| `MMRHelpers.options_snapshot(option_ticker)` | No** | Single contract detail |
-| `MMRHelpers.options_implied(symbol, expiration, risk_free_rate=0.05)` | No** | Market-implied vs constant-vol probability distribution |
-| `MMRHelpers.implied_move(symbol, expiration=, dte=, prefer="auto")` | No*** | **Expected 1-sigma move through expiration. Tries Polygon ATM straddle, falls back to realized-vol from local OHLCV. Use this for earnings analysis.** |
+| `MMRHelpers.options_expirations(symbol, source=)` | No* | List expiration dates with DTE |
+| `MMRHelpers.options_chain(symbol, expiration=, contract_type=, strike_min=, strike_max=, source=)` | No* | Full chain snapshot (strike, bid/ask, greeks, IV, OI); every row names `provider` and `feed` |
+| `MMRHelpers.options_snapshot(option_ticker, source=)` | No* | Single contract detail |
+| `MMRHelpers.options_implied(symbol, expiration, risk_free_rate=0.05, source=)` | No* | Market-implied vs constant-vol probability distribution over the quoted strike range (needs 8+ call strikes with an IV) |
+| `MMRHelpers.implied_move(symbol, expiration=, dte=, prefer="auto")` | No** | **Expected 1-sigma move through expiration. Tries the ATM straddle from the options chain (labelled with `provider` / `feed`), falls back to realized vol from local OHLCV and says why in `fallback_reason`. Use this for earnings analysis.** |
 | `MMRHelpers.buy_option(symbol, expiration, strike, right, quantity, limit_price=, market=)` | **Yes** | Buy option contracts |
 | `MMRHelpers.sell_option(symbol, expiration, strike, right, quantity, limit_price=, market=)` | **Yes** | Sell option contracts |
 
-\* Requires `massive_api_key` (free Polygon tier is enough).
-\** Requires the **paid Polygon options tier**. Free tier returns `NOT_AUTHORIZED`. Use `preflight()` to check `pf["polygon_options"]["chain_endpoint"]`.
-\*** Requires `massive_api_key` for ATM-straddle method, OR local OHLCV (any tier) for realized-vol fallback. Always returns *something* — handle the `method` field to know how confident the answer is.
+\* Default source: Alpaca's free **indicative** feed. Needs `ALPACA_API_KEY_ID` / `ALPACA_API_SECRET_KEY`. Indicative is not the OPRA NBBO, and illiquid contracts have no greeks/IV. `source="massive"` gives OPRA and needs a Massive key with an options plan (otherwise `NOT_AUTHORIZED`). Use `preflight()` to check `pf["polygon_options"]["chain_endpoint"]`.
+\** The ATM-straddle method uses the options source above. The realized-vol fallback needs local OHLCV or a Massive key. Missing keys, rate limits and bad input come back in `error`, so check `error` and `method` before using the number.
 
-`right`: `"C"` for call, `"P"` for put. `option_ticker` format: `O:AAPL260320C00250000` (symbol + YYMMDD + C/P + strike*1000 zero-padded to 8 digits).
+`right`: `"C"` for call, `"P"` for put. `option_ticker` format: `AAPL260320C00250000` (symbol + YYMMDD + C/P + strike*1000 zero-padded to 8 digits). The Massive form `O:AAPL260320C00250000` is also accepted; chain rows always use the bare form.
 
 ### Strategies
 
@@ -800,9 +801,9 @@ emit(exps + chain + implied + result)
 ### Pattern 10b: Earnings implied moves and hedge sizing
 
 When several names report tonight (or this week) and you want to size a QQQ
-hedge, use `implied_move()` directly. It does the right thing across all
-plan tiers without you having to bounce between Polygon errors and IB
-timeouts.
+hedge, use `implied_move()` directly. It uses the options chain when it can
+and falls back to realized vol (saying why) without you having to bounce
+between provider errors and IB timeouts.
 
 ```python
 # 1. Reality check (only needed once per session)
@@ -825,7 +826,7 @@ emit(qqq)
 ```
 
 `implied_move()` is safe to fan out via `asyncio.gather` — each call only
-touches Massive's REST API and local DuckDB, no shared trader_service
+touches the REST data providers and local DuckDB, no shared trader_service
 connection. (Don't gather `snapshot()` calls — those serialize through
 one ZMQ connection.)
 

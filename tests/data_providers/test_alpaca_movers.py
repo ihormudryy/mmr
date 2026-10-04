@@ -45,7 +45,7 @@ def test_crypto_path():
 def test_unsupported_market_raises():
     with pytest.raises(CapabilityNotSupported, match='indices movers') as info:
         AlpacaMovers(FakeClient(FIXTURE)).movers('indices', 'gainers')
-    assert info.value.supported == ['massive']
+    assert info.value.supported == ['etf_proxy', 'massive']
 
 
 def test_null_numbers_become_nan():

@@ -41,16 +41,22 @@ class AlpacaClient:
         )
         if response.status_code >= 400:
             raise _error_for(path, response)
-        return response.json()
+        try:
+            return response.json()
+        except ValueError as ex:
+            raise ProviderError(f'alpaca {path} returned a body that is not JSON') from ex
 
     def _send(self, path: str, params: Mapping[str, Any]):
         self._limiter.acquire()
-        return self._session.get(
-            self._base_url + path,
-            params=dict(params),
-            headers=self._headers,
-            timeout=REQUEST_TIMEOUT_SECS,
-        )
+        try:
+            return self._session.get(
+                self._base_url + path,
+                params=dict(params),
+                headers=self._headers,
+                timeout=REQUEST_TIMEOUT_SECS,
+            )
+        except requests.RequestException as ex:
+            raise ProviderError(f'alpaca {path} unreachable: {type(ex).__name__}') from ex
 
     def paginate(self, path: str, params: Mapping[str, Any]) -> Iterator[dict]:
         page_params = dict(params)

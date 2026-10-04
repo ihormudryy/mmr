@@ -1,13 +1,18 @@
 """Real Alpaca calls. Run with: MMR_LIVE_TESTS=1 ALPACA_API_KEY_ID=... ALPACA_API_SECRET_KEY=... pytest -m live"""
 
 import datetime as dt
+import math
 import os
+import re
 
 import pytest
 
 from trader.data_providers.capabilities import Capability
+from trader.data_providers.errors import ProviderEntitlementError, ProviderError
+from trader.data_providers.option_symbols import parse_option_symbol
 from trader.data_providers.registry import ProviderRegistry
 from trader.objects import BarSize
+from trader.tools.chain import implied_distribution
 
 pytestmark = [
     pytest.mark.live,
@@ -76,3 +81,102 @@ def test_live_movers_are_clean():
 
 def test_live_crypto_movers():
     assert len(_registry().get(Capability.MOVERS, 'alpaca').movers('crypto', 'gainers')) > 0
+
+
+def test_live_ideas_alpaca_momentum():
+    from trader.tools.idea_scanner import IdeaScanner
+    source = _registry().get(Capability.IDEAS, 'alpaca')
+    df = IdeaScanner(source).scan(preset='momentum', top_n=5)
+    notice = df.attrs.get('ideas_notice', '')
+    assert re.search(r'Alpaca discovery: \d+ symbols', notice)
+    assert 'not the full market' in notice and '15-minute delayed' in notice
+    assert df.attrs['ideas_provider'] == 'alpaca'
+    if not df.empty:
+        assert (df['volume'] > 0).all()
+
+
+def test_live_ideas_alpaca_tickers():
+    from trader.tools.idea_scanner import IdeaScanner
+    df = IdeaScanner(_registry().get(Capability.IDEAS, 'alpaca')).scan(
+        preset='momentum', source='tickers', tickers=['AAPL', 'MSFT', 'ZZZZQ'], top_n=5,
+        custom_filters={'min_change_pct': -100, 'max_change_pct': 100})
+    assert 'ZZZZQ' in df.attrs.get('ideas_notice', '')
+    assert df.attrs['ideas_provider'] == 'alpaca'
+    if not df.empty:
+        assert {'AAPL', 'MSFT'} & set(df['ticker'])
+
+
+def test_live_etf_proxy_index_movers():
+    registry = ProviderRegistry.from_config({
+        'alpaca_api_key_id': os.environ['ALPACA_API_KEY_ID'],
+        'alpaca_api_secret_key': os.environ['ALPACA_API_SECRET_KEY'],
+    })
+    frame = registry.get(Capability.MOVERS_INDICES, 'etf_proxy').movers('indices', 'gainers')
+    assert len(frame) == 15
+    assert frame['note'].str.startswith('ETF proxy for ').all()
+    assert frame['change_pct'].notna().sum() >= 12
+
+
+def _options():
+    return ProviderRegistry.from_config({
+        'alpaca_api_key_id': os.environ['ALPACA_API_KEY_ID'],
+        'alpaca_api_secret_key': os.environ['ALPACA_API_SECRET_KEY'],
+    }).get(Capability.OPTIONS, 'alpaca')
+
+
+def _expiration_at_least(days):
+    target = dt.date.today() + dt.timedelta(days=days)
+    return next(d for d in _options().expirations('AAPL') if dt.date.fromisoformat(d) >= target)
+
+
+def test_live_option_expirations_reach_months_ahead():
+    dates = _options().expirations('AAPL')
+    assert len(dates) > 10 and dates == sorted(dates)
+    assert dt.date.fromisoformat(dates[0]) >= dt.date.today() - dt.timedelta(days=1)
+    assert dt.date.fromisoformat(dates[-1]) - dt.date.today() > dt.timedelta(days=180)
+
+
+def test_live_option_chain_is_indicative_and_never_invents_greeks():
+    expiration = _expiration_at_least(30)
+    rows = _options().chain('AAPL', expiration)
+    assert len(rows) > 20
+    assert all(r['feed'] == 'indicative' and r['provider'] == 'alpaca' for r in rows)
+    assert all(r['expiration'] == expiration for r in rows)
+    assert all(math.isnan(r['delta']) == math.isnan(r['iv']) for r in rows)   # greeks and IV come together
+    assert any(not math.isnan(r['open_interest']) for r in rows)
+    assert rows[0]['underlying_price'] > 0
+
+
+def test_live_option_contract_matches_chain_row():
+    expiration = _expiration_at_least(30)
+    row = next(r for r in _options().chain('AAPL', expiration, 'call') if not math.isnan(r['iv']))
+    contract = _options().contract(parse_option_symbol('O:' + row['ticker']))
+    assert contract['ticker'] == row['ticker'] and contract['underlying'] == 'AAPL'
+    assert contract['feed'] == 'indicative'
+
+
+def test_live_unknown_underlying_is_loud():
+    with pytest.raises(ProviderError, match='invalid underlying'):
+        _options().expirations('ZZZZQ')
+    with pytest.raises(ProviderError, match='invalid underlying'):
+        _options().chain('ZZZZQ', _expiration_at_least(30))
+
+
+def test_live_implied_distribution_from_indicative_chain():
+    expiration = _expiration_at_least(30)
+    rows = _options().chain('AAPL', expiration, 'call')
+    result = implied_distribution(rows, expiration, 0.05, dt.date.today())
+    assert result['strikes_used'] >= 8 and result['feed'] == 'indicative'
+
+
+@pytest.mark.skipif(not os.getenv('MASSIVE_API_KEY'), reason='needs MASSIVE_API_KEY')
+def test_live_massive_options_entitlement_is_loud():
+    provider = ProviderRegistry.from_config({'massive_api_key': os.environ['MASSIVE_API_KEY']}) \
+        .get(Capability.OPTIONS, 'massive')
+    expiration = provider.expirations('AAPL')[0]     # the contracts list works on free Massive plans
+    try:
+        rows = provider.chain('AAPL', expiration)
+    except ProviderEntitlementError as ex:
+        assert 'NOT_AUTHORIZED' in str(ex) and '--source alpaca' in str(ex)
+    else:
+        assert rows and all(r['feed'] == 'opra' for r in rows)

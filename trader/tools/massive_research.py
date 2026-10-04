@@ -11,10 +11,11 @@ from typing import Any
 
 import pandas as pd
 
+from trader.data_providers.massive.scan import MassiveScanSource
+from trader.data_providers.twelvedata.scan import TwelveDataScanSource
 from trader.tools.idea_scanner import (
     LIQUID_US_FALLBACK_TICKERS,
     IdeaScanner,
-    TwelveDataIdeaScanner,
     entitlement_fallback_notice,
     is_data_entitlement_error,
     list_presets,
@@ -115,7 +116,7 @@ class MassiveResearch:
         names: bool,
     ) -> ResearchResult:
         try:
-            frame = IdeaScanner(self._client).scan(
+            frame = IdeaScanner(MassiveScanSource(self._client)).scan(
                 preset=preset,
                 source=source,
                 tickers=tickers,
@@ -144,7 +145,7 @@ class MassiveResearch:
                 fb_source = "tickers"
                 fb_tickers = list(LIQUID_US_FALLBACK_TICKERS)
                 fb_universe = None
-            frame = TwelveDataIdeaScanner(self._td_client).scan(
+            frame = IdeaScanner(TwelveDataScanSource(self._td_client)).scan(
                 preset=preset,
                 source=fb_source,
                 tickers=fb_tickers,

@@ -166,8 +166,9 @@ Every query runs through a per-database lock that opens, executes, and closes th
 
 | Source | Coverage | Notes |
 |--------|----------|-------|
-| **Alpaca** (free Basic plan) | US equities | Default for history (`default_data_source: alpaca`; SIP feed, split-adjusted), `movers` and `news`. Optional REST quotes with `snapshot --source alpaca` |
-| **Massive.com** (Polygon.io) | US equities | Default for `ideas` when the plan includes snapshots (**Starter+**). Stocks Basic returns `NOT_AUTHORIZED` — CLI falls back to TwelveData quotes |
+| **Alpaca** (free Basic plan) | US equities | Default for history (`default_data_source: alpaca`; SIP feed, split-adjusted), ideas, `movers` and `news`. Ideas use 15-minute-delayed prices and scan top movers + most-actives, not the full market. Default for `options` data (free indicative feed: delayed estimates, not the OPRA NBBO) and for `movers --market indices` (ETF proxies, not the indices). Optional REST quotes with `snapshot --source alpaca` |
+| **Frankfurter** (ECB, free, no key) | Forex | Default for `forex convert`, `forex snapshot-all` and `forex movers`. One ECB reference rate per business day, labelled with its date, not live |
+| **Massive.com** (Polygon.io) | US equities | Opt-in with `--source massive`. Full-market ideas/movers need snapshots (**Starter+**). Stocks Basic returns `NOT_AUTHORIZED` — `ideas --source massive` falls back to TwelveData quotes |
 | **TwelveData** | US quotes/history | Opt-in with `--source twelvedata`. `/market_movers` needs **Pro+**; quotes work on Basic |
 | **IB APIs** | International + IB-only tools | ASX/TSE/SEHK/EU via `ideas --location`; scanner/depth when subscribed |
 
@@ -312,20 +313,21 @@ group delete mining
 ### Scanning & Ideas
 
 ```bash
-# US — Massive by default (Starter+ for movers). Basic keys auto-fall back
-# to TwelveData quotes on a liquid set (yellow notice in the REPL).
+# US — Alpaca by default (free, 15-minute-delayed prices). Massive and
+# TwelveData are opt-in with --source.
 ideas                        # Momentum (default)
+ideas --source massive       # Full market; Basic keys fall back to TwelveData quotes
 ideas gap-up / mean-reversion / breakout / volatile
 ideas --source twelvedata --tickers AAPL MSFT NVDA AMD   # works on TD Basic quotes
 ideas momentum --universe sp500
-ideas momentum --fundamentals --news --detail
+ideas momentum --fundamentals --news --detail --source massive   # ratios need massive/twelvedata
 
 # International via IB (~30-90s; needs legacy/IB path)
 ideas momentum --location STK.AU.ASX --tickers BHP CBA CSL
 
 # IB scanner (legacy path)
 scan
-movers                       # defaults to Alpaca; --source massive for indices/options/futures
+movers                       # defaults to Alpaca; --market indices uses ETF proxies; --source massive for real indices/options/futures
 ```
 
 ### Market Data

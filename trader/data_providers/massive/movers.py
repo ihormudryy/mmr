@@ -6,7 +6,7 @@ from trader.data_providers.capabilities import sort_movers
 
 
 class MassiveMovers:
-    markets = frozenset({'stocks', 'crypto', 'indices', 'options', 'futures'})
+    markets = frozenset({'stocks', 'crypto', 'indices', 'options', 'futures', 'forex'})
 
     def __init__(self, client):
         self._client = client

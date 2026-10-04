@@ -77,3 +77,26 @@ def test_missing_or_blank_key_raises_not_configured(value):
 def test_each_get_returns_a_new_instance():
     registry = _registry(alpha_key='a')
     assert registry.get(Capability.HISTORY) is not registry.get(Capability.HISTORY)
+
+
+def _fallback_registry(**config):
+    specs = [ProviderSpec('generic', (), {Capability.MOVERS: object, Capability.MOVERS_INDICES: object}),
+             ProviderSpec('stocks_only', (), {Capability.MOVERS: object}),
+             ProviderSpec('builtin', (), {Capability.MOVERS_INDICES: object})]
+    return ProviderRegistry(config, specs, {Capability.MOVERS: 'stocks_only', Capability.MOVERS_INDICES: 'builtin'},
+                            falls_back_to={Capability.MOVERS_INDICES: Capability.MOVERS})
+
+
+def test_fallback_capability_override_is_used_when_it_serves_the_capability():
+    registry = _fallback_registry(data_providers={'movers': 'generic'})
+    assert registry.default_source(Capability.MOVERS_INDICES) == 'generic'
+
+
+def test_fallback_capability_override_is_skipped_when_it_does_not_serve_the_capability():
+    registry = _fallback_registry(data_providers={'movers': 'stocks_only'})
+    assert registry.default_source(Capability.MOVERS_INDICES) == 'builtin'
+
+
+def test_own_override_wins_over_fallback_capability():
+    registry = _fallback_registry(data_providers={'movers': 'generic', 'movers_indices': 'builtin'})
+    assert registry.default_source(Capability.MOVERS_INDICES) == 'builtin'

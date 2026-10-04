@@ -1,7 +1,10 @@
 """Latest prices from Alpaca's free IEX feed (IEX is a few percent of US volume)."""
 
+import datetime as dt
 import math
-from typing import Sequence
+from typing import Optional, Sequence
+
+import pandas as pd
 
 from trader.data_providers.alpaca._numbers import number_or_nan
 from trader.data_providers.capabilities import make_quote
@@ -9,6 +12,7 @@ from trader.data_providers.symbols import to_alpaca_symbol
 
 SNAPSHOTS_PATH = '/v2/stocks/snapshots'
 CHUNK_SIZE = 100
+MARKET_TIMEZONE = 'America/New_York'
 
 
 class AlpacaQuotes:
@@ -47,7 +51,7 @@ def _to_quote(symbol: str, alpaca_symbol: str, snapshot) -> dict:
     if math.isnan(last):
         return make_quote(symbol, feed='iex', error=f'alpaca snapshot has no latest trade for {alpaca_symbol}')
 
-    previous_close = number_or_nan(previous, 'c')
+    previous_close = _previous_session_close(trade, day, previous)
     change = last - previous_close
     return make_quote(
         symbol,
@@ -64,3 +68,27 @@ def _to_quote(symbol: str, alpaca_symbol: str, snapshot) -> dict:
         currency='USD',
         feed='iex',
     )
+
+
+def _previous_session_close(trade: dict, day: dict, previous: dict) -> float:
+    """Close of the session before the latest trade's session.
+
+    Before Monday's open dailyBar is still Friday's bar, so Friday is the previous
+    session, not prevDailyBar (Thursday). Without both dates there is no safe answer.
+    """
+    trade_date, bar_date = _market_date(trade.get('t')), _market_date(day.get('t'))
+    if trade_date is None or bar_date is None:
+        return float('nan')
+    if trade_date > bar_date:
+        return number_or_nan(day, 'c')
+    return number_or_nan(previous, 'c')
+
+
+def _market_date(timestamp) -> Optional[dt.date]:
+    if not timestamp:
+        return None
+    try:
+        # pandas, not datetime.fromisoformat: Alpaca sends nanoseconds.
+        return pd.Timestamp(timestamp).tz_convert(MARKET_TIMEZONE).date()
+    except (TypeError, ValueError):
+        return None

@@ -6,10 +6,10 @@ Covers:
 - ``MMR._td_fundamentals_to_df`` — payload → DataFrame conversion, ensuring
   the ``fiscal_date`` sort contract holds and nested groups land as dot-keyed
   columns without clobbering each other.
-- ``TwelveDataIdeaScanner._fetch_indicators`` — must use chronologically
+- ``TwelveDataScanSource._fetch_indicators`` — must use chronologically
   sorted closes (TwelveData returns newest-first by default). A value-sorted
   list would silently yield wrong RSI/EMA/SMA values.
-- ``TwelveDataIdeaScanner._build_candidates`` — must apply the same
+- ``TwelveDataScanSource._build_candidates`` — must apply the same
   preferred-stock / warrant / unit filter as the Massive and IB paths.
 """
 
@@ -20,7 +20,8 @@ import pandas as pd
 import pytest
 
 from trader.sdk import MMR
-from trader.tools.idea_scanner import TwelveDataIdeaScanner, compute_ema, compute_sma, IdeaScannerError
+from trader.data_providers.twelvedata.scan import TwelveDataScanSource
+from trader.tools.idea_scanner import compute_ema, compute_sma, IdeaScannerError
 
 
 class TestFlattenTDDict:
@@ -124,7 +125,7 @@ class TestTDFundamentalsToDF:
 
 
 # ---------------------------------------------------------------------------
-# TwelveDataIdeaScanner._fetch_indicators
+# TwelveDataScanSource._fetch_indicators
 # ---------------------------------------------------------------------------
 
 def _make_td_bars_newest_first(prices):
@@ -149,7 +150,7 @@ class TestTDScannerIndicators:
     so any resort or reverse breaks them silently."""
 
     def _scanner_with_prices(self, prices):
-        scanner = TwelveDataIdeaScanner(td_client=None)
+        scanner = TwelveDataScanSource(td_client=None)
         fake_ts = MagicMock()
         fake_ts.as_pandas.return_value = _make_td_bars_newest_first(prices)
         scanner._client = MagicMock()
@@ -174,7 +175,7 @@ class TestTDScannerIndicators:
         assert result['AAPL']['sma_20'] == pytest.approx(expected, rel=1e-6)
 
     def test_empty_df_returns_no_indicators(self):
-        scanner = TwelveDataIdeaScanner(td_client=None)
+        scanner = TwelveDataScanSource(td_client=None)
         fake_ts = MagicMock()
         fake_ts.as_pandas.return_value = pd.DataFrame()
         scanner._client = MagicMock()
@@ -184,7 +185,7 @@ class TestTDScannerIndicators:
 
 
 # ---------------------------------------------------------------------------
-# TwelveDataIdeaScanner._build_candidates — filter parity with Massive/IB
+# TwelveDataScanSource._build_candidates — filter parity with Massive/IB
 # ---------------------------------------------------------------------------
 
 def _q(sym: str, **kwargs):
@@ -199,8 +200,8 @@ def _q(sym: str, **kwargs):
 
 class TestTDScannerBuildCandidates:
 
-    def _scanner(self) -> TwelveDataIdeaScanner:
-        return TwelveDataIdeaScanner(td_client=None)
+    def _scanner(self) -> TwelveDataScanSource:
+        return TwelveDataScanSource(td_client=None)
 
     def test_filters_warrants_and_rights(self):
         quotes = [_q('AAPL'), _q('XYZW'), _q('FOO.U'), _q('BAR.R'), _q('BAZWS')]
@@ -231,7 +232,7 @@ class TestTDScannerBuildCandidates:
 
 
 # ---------------------------------------------------------------------------
-# TwelveDataIdeaScanner._fetch_fundamentals — rate-limit graceful degradation
+# TwelveDataScanSource._fetch_fundamentals — rate-limit graceful degradation
 # ---------------------------------------------------------------------------
 
 class TestTDScannerFundamentalsRateLimit:
@@ -240,7 +241,7 @@ class TestTDScannerFundamentalsRateLimit:
     complete with partial fundamentals rather than raise mid-scan."""
 
     def test_rate_limit_short_circuits_remaining_calls(self):
-        scanner = TwelveDataIdeaScanner(td_client=None)
+        scanner = TwelveDataScanSource(td_client=None)
 
         call_count = [0]
         first_5_ok_then_rate_limit = (
@@ -282,7 +283,7 @@ class TestTDScannerFundamentalsRateLimit:
     def test_non_rate_limit_errors_dont_trip_short_circuit(self):
         """A transient 500 on one symbol shouldn't stop us from fetching
         fundamentals on the remaining symbols."""
-        scanner = TwelveDataIdeaScanner(td_client=None)
+        scanner = TwelveDataScanSource(td_client=None)
 
         def get_statistics(symbol):
             if symbol == 'BROKEN':
@@ -304,7 +305,7 @@ class TestTDScannerFundamentalsRateLimit:
 
 
 # ---------------------------------------------------------------------------
-# TwelveDataIdeaScanner._discover error handling
+# TwelveDataScanSource._discover error handling
 # ---------------------------------------------------------------------------
 
 class TestTDScannerDiscoveryErrors:
@@ -312,7 +313,7 @@ class TestTDScannerDiscoveryErrors:
     empty) so auth / rate-limit errors can't be mistaken for "no movers"."""
 
     def test_both_directions_failing_raises(self):
-        scanner = TwelveDataIdeaScanner(td_client=None)
+        scanner = TwelveDataScanSource(td_client=None)
         scanner._client = MagicMock()
         scanner._client.get_market_movers.side_effect = RuntimeError('401 Unauthorized')
         with pytest.raises(IdeaScannerError, match='Unauthorized'):
@@ -321,7 +322,7 @@ class TestTDScannerDiscoveryErrors:
     def test_partial_failure_tolerated(self):
         """One direction fails, the other works — return what we got rather
         than fail the whole scan."""
-        scanner = TwelveDataIdeaScanner(td_client=None)
+        scanner = TwelveDataScanSource(td_client=None)
         scanner._client = MagicMock()
 
         call_count = [0]
@@ -355,56 +356,6 @@ class _StubTDPayload:
 def _bind_only_mmr() -> MMR:
     """Bypass __init__ so we don't need Container/RPC plumbing for shape tests."""
     return object.__new__(MMR)
-
-
-class TestForexSnapshotTwelveData:
-    def test_returns_normalized_dict(self):
-        m = _bind_only_mmr()
-        m._twelvedata_rest_client = MagicMock()
-        m._twelvedata_rest_client.quote.return_value = _StubTDPayload({
-            'symbol': 'EUR/USD',
-            'open': '1.08200', 'high': '1.08500', 'low': '1.08000',
-            'close': '1.08300', 'volume': '0',
-            'previous_close': '1.08100', 'change': '0.00200',
-            'percent_change': '0.18500',
-            'datetime': '2026-04-29',
-            'timestamp': 1777000000,
-            'is_market_open': True,
-        })
-        out = m.forex_snapshot('EURUSD', source='twelvedata')
-        assert out['pair'] == 'EUR/USD'
-        assert out['close'] == pytest.approx(1.083)
-        assert out['previous_close'] == pytest.approx(1.081)
-        assert out['change_pct'] == pytest.approx(0.185)
-        assert out['is_market_open'] is True
-        m._twelvedata_rest_client.quote.assert_called_once_with(symbol='EUR/USD')
-
-
-class TestForexQuoteTwelveData:
-    def test_returns_pair_last_timestamp(self):
-        m = _bind_only_mmr()
-        m._twelvedata_rest_client = MagicMock()
-        m._twelvedata_rest_client.exchange_rate.return_value = _StubTDPayload({
-            'symbol': 'EUR/USD', 'rate': 1.0876, 'timestamp': 1777000000,
-        })
-        out = m.forex_quote('EUR', 'USD', source='twelvedata')
-        assert out == {'pair': 'EUR/USD', 'last': 1.0876, 'timestamp': 1777000000}
-
-
-class TestForexConvertTwelveData:
-    def test_returns_converted_with_rate(self):
-        m = _bind_only_mmr()
-        m._twelvedata_rest_client = MagicMock()
-        m._twelvedata_rest_client.currency_conversion.return_value = _StubTDPayload({
-            'symbol': 'EUR/USD', 'rate': 1.1678,
-            'amount': 116.78, 'timestamp': 1777000000,
-        })
-        out = m.forex_convert('EUR', 'USD', 100.0, source='twelvedata')
-        assert out['from'] == 'EUR'
-        assert out['to'] == 'USD'
-        assert out['amount'] == 100.0
-        assert out['converted'] == pytest.approx(116.78)
-        assert out['rate'] == pytest.approx(1.1678)
 
 
 class TestMoversDetailTwelveData:

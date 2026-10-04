@@ -1,16 +1,31 @@
 from trader.data_providers.capabilities import (
+    FX_CONVERSION_FIELDS,
+    FX_RATE_FIELDS,
+    FX_RATES_COLUMNS,
     HISTORY_COLUMNS,
     MOVER_COLUMNS,
     NEWS_FIELDS,
+    OPTION_FIELDS,
     QUOTE_FIELDS,
     Capability,
+    Discovery,
+    ForexProvider,
     HistoryProvider,
     MoversProvider,
     NewsProvider,
+    OptionsProvider,
     QuoteProvider,
+    ScanSource,
+    make_fx_conversion,
+    make_fx_rate,
     make_news_item,
+    make_option_row,
     make_quote,
+    movers_capability,
+    option_mid,
+    sort_fx_rates,
     sort_movers,
+    sort_option_rows,
 )
 from trader.data_providers.errors import (
     CapabilityNotSupported,
@@ -22,10 +37,13 @@ from trader.data_providers.errors import (
 from trader.data_providers.registry import ProviderRegistry, ProviderSpec
 
 __all__ = [
-    'Capability', 'HISTORY_COLUMNS', 'HistoryProvider',
+    'Capability', 'Discovery', 'ScanSource', 'HISTORY_COLUMNS', 'HistoryProvider',
     'MOVER_COLUMNS', 'NEWS_FIELDS', 'QUOTE_FIELDS',
     'MoversProvider', 'NewsProvider', 'QuoteProvider', 'make_news_item', 'make_quote', 'sort_movers',
+    'FX_CONVERSION_FIELDS', 'FX_RATE_FIELDS', 'FX_RATES_COLUMNS', 'ForexProvider',
+    'make_fx_conversion', 'make_fx_rate', 'movers_capability', 'sort_fx_rates',
     'CapabilityNotSupported', 'ProviderEntitlementError', 'ProviderError',
     'ProviderNotConfigured', 'ProviderRateLimited',
     'ProviderRegistry', 'ProviderSpec',
+    'OPTION_FIELDS', 'OptionsProvider', 'make_option_row', 'option_mid', 'sort_option_rows',
 ]

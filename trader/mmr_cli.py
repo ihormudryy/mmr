@@ -38,14 +38,39 @@ _json_mode = False
 # Output helpers
 # ------------------------------------------------------------------
 
-def print_df(df, title=None):
-    """Render a pandas DataFrame as a rich table (or JSON if _json_mode)."""
+# Forex rates such as USD/GBP 0.7612 and changes such as -0.0013 vanish at 2 decimals.
+FX_DECIMALS = 5
+
+
+def _json_safe(value):
+    """Copy of `value` with NaN/inf floats (numpy ones too) replaced by None: bare NaN is not JSON."""
+    import math
+    import numpy as np
+    if isinstance(value, dict):
+        return {key: _json_safe(item) for key, item in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [_json_safe(item) for item in value]
+    if isinstance(value, (float, np.floating)) and not math.isfinite(value):
+        return None
+    return value
+
+
+def _dump_json(payload) -> str:
+    return json.dumps(_json_safe(payload), default=str, allow_nan=False)
+
+
+def print_df(df, title=None, decimals=2, json_extra=None):
+    """Render a pandas DataFrame as a rich table (or JSON if _json_mode).
+
+    `decimals` sets the digits of every float column except volume (FX_DECIMALS for forex).
+    ``json_extra`` adds top-level keys next to ``data`` and ``title`` in JSON mode.
+    """
     if _json_mode:
         if df is None or df.empty:
-            print(json.dumps({"data": [], "title": title}, default=str))
+            records = []
         else:
             records = json.loads(df.to_json(orient='records', date_format='iso'))
-            print(json.dumps({"data": records, "title": title}, default=str))
+        print(json.dumps({"data": records, "title": title, **(json_extra or {})}, default=str))
         return
 
     if df is None or df.empty:
@@ -53,7 +78,7 @@ def print_df(df, title=None):
         return
 
     # Columns that benefit from wrapping (long text)
-    wrap_cols = {'reasoning', 'thesis', 'rejection_reason'}
+    wrap_cols = {'reasoning', 'thesis', 'rejection_reason', 'note'}
 
     table = Table(title=title, show_lines=False, expand=True)
     for col in df.columns:
@@ -77,15 +102,15 @@ def print_df(df, title=None):
                 elif col in _signed_cols:
                     color = 'green' if val >= 0 else 'red'
                     sign = '+' if val > 0 else ''
-                    cells.append(f'[{color}]{sign}{val:,.2f}[/{color}]')
+                    cells.append(f'[{color}]{sign}{val:,.{decimals}f}[/{color}]')
                 elif col in _pct_cols:
                     color = 'green' if val >= 0 else 'red'
                     sign = '+' if val > 0 else ''
-                    cells.append(f'[{color}]{sign}{val:.2f}%[/{color}]')
+                    cells.append(f'[{color}]{sign}{val:.{decimals}f}%[/{color}]')
                 elif col == 'volume':
                     cells.append(f'{val:,.0f}')
                 else:
-                    cells.append(f'{val:,.2f}')
+                    cells.append(f'{val:,.{decimals}f}')
             else:
                 cells.append(str(val))
         table.add_row(*cells)
@@ -103,7 +128,7 @@ def print_df(df, title=None):
 def print_dict(d, title=None):
     """Render a dict as a two-column rich table (or JSON if _json_mode)."""
     if _json_mode:
-        print(json.dumps({"data": d if d else {}, "title": title}, default=str))
+        print(_dump_json({"data": d if d else {}, "title": title}))
         return
 
     if not d:
@@ -114,7 +139,7 @@ def print_dict(d, title=None):
     table.add_column("Key", style="bold")
     table.add_column("Value")
     for k, v in d.items():
-        table.add_row(str(k), str(v))
+        table.add_row(str(k), '[dim]-[/dim]' if _json_safe(v) is None else str(v))
     console.print(table)
 
 
@@ -238,7 +263,7 @@ def print_list(items, title=None):
 def print_json_result(data, title=None):
     """Print structured data as JSON (for handlers that build custom Rich tables)."""
     if _json_mode:
-        print(json.dumps({"data": data, "title": title}, default=str))
+        print(_dump_json({"data": data, "title": title}))
         return
     # Fallback: try print_dict or print_df
     if isinstance(data, dict):
@@ -322,6 +347,24 @@ def _snapshot_source_default(choices) -> str:
     if yaml_source in _YAML_SNAPSHOT_DEFAULTS and yaml_source in choices:
         return yaml_source
     return 'ib'
+
+
+def _forex_quote_source_default() -> str:
+    """Default `--source` for `forex snapshot` / `forex quote`: data_providers.forex, else IB.
+
+    default_data_source and MMR_DEFAULT_DATA_SOURCE are history settings and are ignored here.
+    A configured value that is not a forex source is returned as is, so the command fails
+    with the registry's "does not support forex" error instead of quietly using IB.
+    """
+    from trader.data_providers.builtin import IB_FOREX_SOURCE
+    return _data_provider_overrides(_read_trader_config()).get('forex') or IB_FOREX_SOURCE
+
+
+def _forex_needs_trader(args: argparse.Namespace) -> bool:
+    """Only IB-routed forex snapshot/quote talk to trader_service; registry forex sources are local."""
+    from trader.data_providers.builtin import IB_FOREX_SOURCE
+    return (getattr(args, 'fx_action', None) in ('snapshot', 'snap', 'quote')
+            and getattr(args, 'source', None) == IB_FOREX_SOURCE)
 
 
 def _load_equity_decimation() -> str:
@@ -435,7 +478,7 @@ def build_parser() -> argparse.ArgumentParser:
     snap_p.add_argument('--exchange', default='', help='Exchange hint (e.g. ASX, TSE, SEHK)')
     snap_p.add_argument('--currency', default='', help='Currency hint (e.g. AUD, JPY, HKD)')
     from trader.data_providers import Capability
-    from trader.data_providers.builtin import source_choices
+    from trader.data_providers.builtin import forex_quote_source_choices, source_choices
     quote_sources = ['ib'] + source_choices(Capability.QUOTES)
     snap_p.add_argument('--source', choices=quote_sources,
                         default=_snapshot_source_default(quote_sources),
@@ -1025,7 +1068,8 @@ def build_parser() -> argparse.ArgumentParser:
                                   '  options chain AAPL\n'
                                   '  options chain AAPL -e 3m --type call\n'
                                   '  options chain AAPL -e 2026-03-20 --strike-min 200 --strike-max 250\n'
-                                  '  options snapshot O:AAPL260320C00250000\n'
+                                  '  options snapshot AAPL260320C00250000      # O: prefix also accepted\n'
+                                  '  options chain AAPL --source massive        # OPRA via Massive (paid)\n'
                                   '  options implied AAPL                    # defaults to ~3 months\n'
                                   '  options implied AAPL -e 90d\n'
                                   '  options implied AAPL -e 6m\n'
@@ -1047,7 +1091,7 @@ def build_parser() -> argparse.ArgumentParser:
     opt_chain_p.add_argument('--strike-max', type=float, default=None, help='Maximum strike price')
 
     opt_snap_p = opt_sub.add_parser('snapshot', aliases=['snap'], help='Single option contract detail')
-    opt_snap_p.add_argument('ticker', help='Option ticker (e.g. O:AAPL260320C00250000)')
+    opt_snap_p.add_argument('ticker', help='Option symbol: AAPL261120C00250000 or O:AAPL261120C00250000')
 
     opt_impl_p = opt_sub.add_parser('implied', help='Implied probability distribution')
     opt_impl_p.add_argument('symbol', help='Underlying symbol')
@@ -1075,53 +1119,76 @@ def build_parser() -> argparse.ArgumentParser:
     opt_sell_p.add_argument('--market', action='store_true', default=False, help='Market order')
     opt_sell_p.add_argument('--limit', type=float, default=None, help='Limit price per contract')
 
+    option_sources = source_choices(Capability.OPTIONS)
+    for data_parser in (opt_exp_p, opt_chain_p, opt_snap_p, opt_impl_p):
+        data_parser.add_argument(
+            '--source', choices=option_sources, default=None,
+            help='Options data source (default: data_providers.options, else alpaca = free indicative '
+                 'feed, not OPRA NBBO; massive = OPRA, paid plan)')
+    for order_parser in (opt_buy_p, opt_sell_p):
+        order_parser.add_argument(
+            '--source', choices=option_sources, default=None,
+            help='Source used only to resolve a relative -e like 3m (orders always go to IB; '
+                 'exact dates need no data source)')
+
     # forex
-    fx_p = sub.add_parser('forex', aliases=['fx'], help='Forex data (IB or Massive.com)',
+    forex_quote_sources = forex_quote_source_choices()
+    fx_p = sub.add_parser('forex', aliases=['fx'],
+                           help='Forex: snapshot/quote via IB; free ECB daily rates for convert, snapshot-all, movers',
                            epilog='Examples:\n'
-                                  '  forex snapshot EURUSD              # via IB (default)\n'
+                                  '  forex snapshot EURUSD                       # via IB (default)\n'
+                                  '  forex snapshot EURUSD --source frankfurter  # ECB daily reference rate, not live\n'
                                   '  forex snapshot EURUSD --source massive\n'
-                                  '  forex quote EUR USD                # via IB (default)\n'
-                                  '  forex quote EUR USD --source massive\n'
-                                  '  forex snapshot-all                 # Massive only\n'
-                                  '  forex movers                       # Massive only\n'
-                                  '  forex movers --losers\n'
-                                  '  forex convert EUR USD 1000         # Massive only',
+                                  '  forex quote EUR USD                         # IB bid/ask (default)\n'
+                                  '  forex snapshot-all                          # ECB daily rates, every currency vs USD\n'
+                                  '  forex snapshot-all EUR JPY --base GBP\n'
+                                  '  forex movers                                # 10 FX majors/crosses, ECB day-over-day\n'
+                                  '  forex movers --losers --source massive\n'
+                                  '  forex convert EUR USD 1000                  # ECB daily rate (frankfurter)',
                            formatter_class=fmt)
     fx_sub = fx_p.add_subparsers(dest='fx_action')
 
     fx_snap_p = fx_sub.add_parser('snapshot', aliases=['snap'], help='Forex pair snapshot')
-    fx_snap_p.add_argument('pair', help='Currency pair (e.g. EURUSD)')
-    fx_snap_p.add_argument('--source', choices=['ib', 'massive', 'twelvedata'],
-                           default=_src_default(['ib', 'massive', 'twelvedata'], 'ib'),
-                            help='Data source (default: ib)')
+    fx_snap_p.add_argument('pair', help='Currency pair: EURUSD, EUR/USD or C:EURUSD')
+    fx_snap_p.add_argument('--source', choices=forex_quote_sources,
+                           default=_forex_quote_source_default(),
+                           help='Data source (default: data_providers.forex, else ib). '
+                                'frankfurter = ECB daily reference rate, not live')
 
-    fx_sub.add_parser('snapshot-all', help='All forex pair snapshots (Massive only)')
+    fx_all_p = fx_sub.add_parser('snapshot-all', help='Rates of --base against every (or the given) currency')
+    fx_all_p.add_argument('symbols', nargs='*', help='Quote currencies, e.g. EUR JPY (default: all)')
+    fx_all_p.add_argument('--base', default='USD', help='Base currency (default: USD)')
+    fx_all_p.add_argument('--source', choices=source_choices(Capability.FOREX), default=None,
+                          help='Data source (default: data_providers.forex, else the builtin default)')
 
-    fx_movers_p = fx_sub.add_parser('movers', help='Top forex movers (Massive only)')
+    fx_movers_p = fx_sub.add_parser('movers', help='Top forex movers')
     fx_movers_p.add_argument('--losers', action='store_true', default=False, help='Show losers instead of gainers')
+    fx_movers_p.add_argument('--source', choices=source_choices(Capability.MOVERS_FOREX), default=None,
+                             help='Data source (default: data_providers.movers_forex, else data_providers.movers '
+                                  'if it serves forex (massive), else computed_fx)')
 
     fx_quote_p = fx_sub.add_parser('quote', help='Last forex quote')
     fx_quote_p.add_argument('from_currency', help='From currency (e.g. EUR)')
     fx_quote_p.add_argument('to_currency', help='To currency (e.g. USD)')
-    fx_quote_p.add_argument('--source', choices=['ib', 'massive', 'twelvedata'],
-                            default=_src_default(['ib', 'massive', 'twelvedata'], 'ib'),
-                             help='Data source (default: ib)')
+    fx_quote_p.add_argument('--source', choices=forex_quote_sources,
+                            default=_forex_quote_source_default(),
+                            help='Data source (default: data_providers.forex, else ib). '
+                                'frankfurter = ECB daily reference rate, not live')
 
-    fx_convert_p = fx_sub.add_parser('convert', help='Currency conversion (Massive only)')
+    fx_convert_p = fx_sub.add_parser('convert', help='Currency conversion')
     fx_convert_p.add_argument('from_currency', help='From currency (e.g. EUR)')
     fx_convert_p.add_argument('to_currency', help='To currency (e.g. USD)')
     fx_convert_p.add_argument('amount', type=float, help='Amount to convert')
-    fx_convert_p.add_argument('--source', choices=['massive', 'twelvedata'],
-                              default=_src_default(['massive', 'twelvedata'], 'massive'),
-                              help='Data source (default: massive). twelvedata uses TD\'s '
-                                   '/currency_conversion endpoint.')
+    fx_convert_p.add_argument('--source', choices=source_choices(Capability.FOREX), default=None,
+                              help='Data source (default: data_providers.forex, else the builtin default)')
 
     # movers
     movers_p = sub.add_parser(
         'movers', help='Top market movers (default: Alpaca; stocks drop sub-$1 names, warrants, rights, units)')
     movers_p.add_argument('--market', '-m', default='stocks',
                            choices=['stocks', 'crypto', 'indices', 'options', 'futures'],
-                           help='Market type (default: stocks)')
+                           help='Market type (default: stocks). indices = ETF proxies (SPY, QQQ, DIA, IWM, '
+                                'sector SPDRs; Alpaca IEX prices) unless --source massive')
     movers_p.add_argument('--losers', action='store_true', default=False,
                            help='Show losers instead of gainers')
     movers_p.add_argument('--detail', action='store_true', default=False,
@@ -1133,8 +1200,11 @@ def build_parser() -> argparse.ArgumentParser:
                                'warrants/rights/units and unknown prices are still dropped')
     # Movers never inherit default_data_source (often twelvedata for cheap history/quotes);
     # TD /market_movers requires Pro+.
-    movers_p.add_argument('--source', choices=source_choices(Capability.MOVERS), default=None,
-                          help='Data source (default: data_providers.movers, else the builtin default). '
+    movers_sources = sorted(set(source_choices(Capability.MOVERS)) | set(source_choices(Capability.MOVERS_INDICES)))
+    movers_p.add_argument('--source', choices=movers_sources, default=None,
+                          help='Data source (default: data_providers.movers; for indices data_providers.movers_indices, '
+                               'else data_providers.movers if it serves indices (massive), else etf_proxy; '
+                               'stocks/crypto fall back to alpaca). '
                                'twelvedata needs a Pro+ plan for market movers.')
 
     # scan
@@ -1172,14 +1242,15 @@ def build_parser() -> argparse.ArgumentParser:
     # ideas
     ideas_p = sub.add_parser('ideas', aliases=['scan-ideas'], help='Scan for trading ideas',
                               epilog='Examples:\n'
-                                     '  ideas                             # Momentum scan (default, US/Massive)\n'
+                                     '  ideas                             # Momentum scan (default, US/Alpaca, 15-min delayed)\n'
+                                     '  ideas --source massive            # full-market Massive scan (paid plan)\n'
                                      '  ideas gap-up                      # Gap-up scan\n'
                                      '  ideas momentum --tickers AAPL MSFT AMD NVDA\n'
                                      '  ideas mean-reversion --universe sp500\n'
                                      '  ideas gap-up --min-price 10\n'
                                      '  ideas volatile --num 25\n'
                                      '  ideas --presets                   # List all presets\n'
-                                     '  ideas momentum --detail           # With fundamentals + news\n'
+                                     '  ideas momentum --detail           # Names + news + ratios where the source has them\n'
                                      '  ideas momentum --location STK.AU.ASX  # ASX (IB-backed)\n'
                                      '  ideas gap-up --location STK.CA        # Canada (IB-backed)',
                               formatter_class=fmt)
@@ -1204,11 +1275,12 @@ def build_parser() -> argparse.ArgumentParser:
     ideas_p.add_argument('--presets', action='store_true', default=False,
                           help='List all available presets and exit')
     ideas_p.add_argument('--detail', action='store_true', default=False,
-                          help='Enrich with fundamentals + news (shortcut for --fundamentals --news)')
+                          help='Add company names, news and (where the source has them) ratios')
     ideas_p.add_argument('--fundamentals', '-f', action='store_true', default=False,
-                          help='Enrich results with financial ratios (PE, D/E, ROE, etc.)')
+                          help='Enrich results with financial ratios (PE, D/E, ROE, etc.); needs a source '
+                               'with ratios (massive, twelvedata or IB --location)')
     ideas_p.add_argument('--news', action='store_true', default=False,
-                          help='Enrich results with latest news headline and sentiment')
+                          help='Enrich results with the latest news headline; sentiment only on massive')
     ideas_p.add_argument('--news-bodies', dest='news_bodies', action='store_true', default=False,
                           help='Fetch full article bodies via the local news service '
                                '(~/dev/news at :8089) for the top N results — answers '
@@ -1217,14 +1289,9 @@ def build_parser() -> argparse.ArgumentParser:
                           help='How many top-ranked symbols to enrich with article bodies (default: 3)')
     ideas_p.add_argument('--location', '-l', default=None,
                           help='IB market location (e.g. STK.AU.ASX, STK.CA, STK.HK.SEHK)')
-    # Massive-first for US ideas (design principle). Do NOT inherit
-    # default_data_source=twelvedata — TD market movers is Pro+-only and would
-    # 403 on Basic/Starter keys that still work for quotes/history.
-    ideas_p.add_argument('--source', choices=['massive', 'twelvedata'],
-                         default='massive',
-                          help='Data source for US equities (default: massive). '
-                               'twelvedata needs a Pro+ plan for movers discovery. '
-                               'Ignored when --location is set (IB path).')
+    ideas_p.add_argument('--source', choices=source_choices(Capability.IDEAS), default=None,
+                         help='Data source for US equities (default: data_providers.ideas, else the '
+                              'builtin default). Ignored when --location is set (IB path).')
 
     # propose
     propose_p = sub.add_parser('propose', help='Create a trade proposal',
@@ -9848,45 +9915,37 @@ def _parse_relative_expiration(expr: str) -> int:
     return -1
 
 
-def _resolve_expiration(mmr: MMR, symbol: str, expiration_arg: str | None, default_days: int = 90) -> str | None:
+def _resolve_expiration(mmr: MMR, symbol: str, expiration_arg: str | None, default_days: int = 90,
+                        source: str | None = None) -> str | None:
     """Resolve an expiration argument to a concrete YYYY-MM-DD date.
 
-    Handles:
-    - None → default (~default_days out, find closest available)
-    - '2026-03-20' → exact date (returned as-is)
-    - '90d', '3m', '6 months' → relative, find closest available expiration
+    - None → closest listed expiration to `default_days` out
+    - '2026-03-20' → validated and returned as-is (no data provider involved)
+    - '90d', '3m', '6 months' → closest listed expiration, from the OPTIONS `source`
 
-    Returns the resolved expiration string, or None if no expirations found.
+    Returns None when the provider lists no expirations; raises ValueError for anything
+    that is neither a real YYYY-MM-DD date nor a relative expression.
     """
     import datetime as dt_mod
+    from trader.data_providers.option_symbols import parse_expiration_date
 
     if expiration_arg is None:
         target_days = default_days
     else:
         target_days = _parse_relative_expiration(expiration_arg)
         if target_days == -1:
-            # It's an exact date string, return as-is
-            return expiration_arg
+            try:
+                return parse_expiration_date(expiration_arg.strip()).isoformat()
+            except ValueError:
+                raise ValueError(f'expiration must be YYYY-MM-DD or relative like "90d", "3m": '
+                                 f'got {expiration_arg!r}') from None
 
-    # Fetch available expirations and find the closest to target
-    dates = mmr.options_expirations(symbol)
+    dates = mmr.options_expirations(symbol, source=source)
     if not dates:
         return None
 
-    today = dt_mod.date.today()
-    target_date = today + dt_mod.timedelta(days=target_days)
-
-    # Find closest expiration to target
-    best = None
-    best_diff = float('inf')
-    for d in dates:
-        exp_date = dt_mod.datetime.strptime(d, '%Y-%m-%d').date()
-        diff = abs((exp_date - target_date).days)
-        if diff < best_diff:
-            best_diff = diff
-            best = d
-
-    return best
+    target_date = dt_mod.date.today() + dt_mod.timedelta(days=target_days)
+    return min(dates, key=lambda d: abs((dt_mod.date.fromisoformat(d) - target_date).days))
 
 
 # ---- news service (~/dev/news scraper) integration -----------------------
@@ -10271,184 +10330,239 @@ def _handle_news(mmr: MMR, args: argparse.Namespace):
         print_status(str(ex), success=False)
 
 
-def _handle_options(mmr: MMR, args: argparse.Namespace):
-    """Options data and trading commands."""
-    import datetime as dt_mod
+_OPTION_FEED_NOTES = {
+    'indicative': 'indicative feed — not OPRA NBBO; greeks/IV only on liquid contracts',
+    'opra': 'OPRA feed',
+}
+_CHAIN_TABLE_COLUMNS = (   # (header, row key, format spec, suffix)
+    ('strike', 'strike', '.2f', ''), ('bid', 'bid', '.2f', ''), ('ask', 'ask', '.2f', ''),
+    ('mid', 'mid', '.2f', ''), ('last', 'last', '.2f', ''), ('volume', 'volume', '.0f', ''),
+    ('OI', 'open_interest', '.0f', ''), ('iv%', 'iv', '.1f', '%'), ('delta', 'delta', '.4f', ''),
+    ('gamma', 'gamma', '.4f', ''), ('theta', 'theta', '.4f', ''), ('vega', 'vega', '.4f', ''),
+    ('break_even', 'break_even', '.2f', ''),
+)
+_MISSING_OPTION_VALUE = '—'
 
+
+def _is_missing_option_value(value) -> bool:
+    import math
+    return value is None or value == '' or (isinstance(value, float) and math.isnan(value))
+
+
+def _format_option_number(value, spec: str, suffix: str = '') -> str:
+    if _is_missing_option_value(value):
+        return _MISSING_OPTION_VALUE
+    return f'{value:{spec}}{suffix}'
+
+
+def _option_feed_label(provider: str, feed: str) -> str:
+    return f'{provider}, {_OPTION_FEED_NOTES.get(feed, f"{feed} feed")}'
+
+
+def _without_nan(value):
+    """NaN and ±inf → None (also inside dicts, lists and tuples), so --json prints valid JSON."""
+    import math
+    import numbers
+    import numpy as np
+    if isinstance(value, np.generic):
+        value = value.item()
+    if isinstance(value, dict):
+        return {key: _without_nan(item) for key, item in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [_without_nan(item) for item in value]
+    if isinstance(value, numbers.Real) and not isinstance(value, bool) and not math.isfinite(value):
+        return None
+    return value
+
+
+def _note_resolved_expiration(resolved: str, requested) -> None:
+    if resolved != requested and not _json_mode:
+        console.print(f'[dim]Using expiration: {resolved}[/dim]')
+
+
+def _options_provider_name(mmr: MMR, args: argparse.Namespace) -> str:
+    from trader.data_providers import Capability
+    return getattr(args, 'source', None) or mmr._provider_default(Capability.OPTIONS)
+
+
+def _handle_options(mmr: MMR, args: argparse.Namespace):
+    """Options data (OPTIONS capability) and trading (IB) commands."""
+    handlers = {
+        'expirations': _options_expirations, 'exp': _options_expirations,
+        'chain': _options_chain,
+        'snapshot': _options_snapshot, 'snap': _options_snapshot,
+        'implied': _options_implied,
+        'buy': _options_order, 'sell': _options_order,
+    }
     action = getattr(args, 'opt_action', None)
-    if not action:
+    if action not in handlers:
         print_status('Usage: options expirations|chain|snapshot|implied|buy|sell', success=False)
         return
 
     import logging as _logging
     _logging.getLogger('urllib3').setLevel(_logging.WARNING)
+    from trader.data_providers import ProviderError
+    try:
+        handlers[action](mmr, args)
+    except ProviderError as ex:
+        print_status(str(ex), success=False)
 
-    if action in ('expirations', 'exp'):
-        symbol = args.symbol.upper()
-        dates = mmr.options_expirations(symbol)
-        if not dates:
-            print_status(f'No expiration dates found for {symbol}', success=False)
-            return
-        import pandas as pd
-        rows = []
-        today = dt_mod.date.today()
-        for d in dates:
-            exp_date = dt_mod.datetime.strptime(d, '%Y-%m-%d').date()
-            dte = (exp_date - today).days
-            rows.append({'expiration': d, 'DTE': dte})
-        print_df(pd.DataFrame(rows), title=f'Expirations: {symbol}')
 
-    elif action == 'chain':
-        symbol = args.symbol.upper()
-        expiration = _resolve_expiration(mmr, symbol, args.expiration) if args.expiration else None
-        if args.expiration and expiration is None:
-            print_status(f'No expiration dates found for {symbol}', success=False)
-            return
-        if expiration and expiration != args.expiration and not _json_mode:
-            console.print(f'[dim]Using expiration: {expiration}[/dim]')
-        df = mmr.options_chain(
-            symbol,
-            expiration=expiration,
-            contract_type=args.contract_type,
-            strike_min=args.strike_min,
-            strike_max=args.strike_max,
-        )
-        if df.empty:
-            print_status(f'No chain data for {symbol}', success=False)
-            return
+def _print_no_expirations(mmr: MMR, args: argparse.Namespace, symbol: str) -> None:
+    provider = _options_provider_name(mmr, args)
+    print_status(f'No expiration dates found for {symbol} from {provider}', success=False)
 
-        if _json_mode:
-            print_df(df, title=f'Options Chain: {symbol}')
-            return
 
-        # Format for display
-        table = Table(title=f'Options Chain: {symbol} ({df.iloc[0]["expiration"]})')
-        table.add_column('type', style='bold')
-        for col in ['strike', 'bid', 'ask', 'mid', 'last', 'volume', 'OI', 'iv%',
-                     'delta', 'gamma', 'theta', 'vega', 'break_even']:
-            table.add_column(col, justify='right')
+def _options_expirations(mmr: MMR, args: argparse.Namespace):
+    import datetime as dt_mod
+    symbol = args.symbol.upper()
+    dates = mmr.options_expirations(symbol, source=getattr(args, 'source', None))
+    if not dates:
+        _print_no_expirations(mmr, args, symbol)
+        return
+    provider = _options_provider_name(mmr, args)
+    today = dt_mod.date.today()
+    rows = [{'expiration': d, 'DTE': (dt_mod.date.fromisoformat(d) - today).days} for d in dates]
+    import pandas as pd
+    print_df(pd.DataFrame(rows), title=f'Expirations: {symbol} ({provider})', json_extra={'provider': provider})
 
-        for _, row in df.iterrows():
-            ct = row['type']
-            type_style = '[cyan]call[/cyan]' if ct == 'call' else '[magenta]put[/magenta]'
-            table.add_row(
-                type_style,
-                f'{row["strike"]:.2f}',
-                f'{row["bid"]:.2f}',
-                f'{row["ask"]:.2f}',
-                f'{row["mid"]:.2f}',
-                f'{row["last"]:.2f}',
-                f'{row["volume"]:.0f}',
-                f'{row["open_interest"]:.0f}',
-                f'{row["iv"]:.1f}%',
-                f'{row["delta"]:.4f}',
-                f'{row["gamma"]:.4f}',
-                f'{row["theta"]:.4f}',
-                f'{row["vega"]:.4f}',
-                f'{row["break_even"]:.2f}',
-            )
-        console.print(table)
 
-    elif action in ('snapshot', 'snap'):
-        result = mmr.options_snapshot(args.ticker)
-        print_dict(result, title=f'Option Snapshot: {args.ticker}')
+def _options_chain(mmr: MMR, args: argparse.Namespace):
+    symbol = args.symbol.upper()
+    source = getattr(args, 'source', None)
+    expiration = None
+    if args.expiration:
+        expiration = _resolve_expiration(mmr, symbol, args.expiration, source=source)
+        if expiration is None:
+            _print_no_expirations(mmr, args, symbol)
+            return
+        _note_resolved_expiration(expiration, args.expiration)
+    df = mmr.options_chain(symbol, expiration=expiration, contract_type=args.contract_type,
+                           strike_min=args.strike_min, strike_max=args.strike_max, source=source)
+    if df.empty:
+        provider = _options_provider_name(mmr, args)
+        suffix = f' expiring {expiration}' if expiration else ''
+        print_status(f'No chain data for {symbol}{suffix} from {provider}', success=False)
+        return
 
-    elif action == 'implied':
-        symbol = args.symbol.upper()
-        expiration = _resolve_expiration(mmr, symbol, args.expiration)
-        if not expiration:
-            print_status(f'No expiration dates found for {symbol}', success=False)
-            return
-        if expiration != args.expiration and not _json_mode:
-            console.print(f'[dim]Using expiration: {expiration}[/dim]')
-        data = mmr.options_implied(symbol, expiration, args.risk_free_rate)
-        if _json_mode:
-            print_json_result(data, title=f'Implied: {symbol} {expiration}')
-            return
-        from trader.tools.chain import plot_market_implied_vs_constant_console
-        plot_market_implied_vs_constant_console(
-            data['x'], data['market_implied'], data['constant'],
-            f'{symbol} for {expiration}, constant vs market implied'
-        )
+    first = df.iloc[0]
+    title = f'Options Chain: {symbol} ({first["expiration"]}) — {_option_feed_label(first["provider"], first["feed"])}'
+    if _json_mode:
+        print_df(df, title=title)
+        return
 
-    elif action == 'buy':
-        symbol = args.symbol.upper()
-        if not args.market and args.limit is None:
-            print_status('Specify --market or --limit', success=False)
-            return
-        expiration = _resolve_expiration(mmr, symbol, args.expiration)
-        if not expiration:
-            print_status(f'No expiration dates found for {symbol}', success=False)
-            return
-        if expiration != args.expiration and not _json_mode:
-            console.print(f'[dim]Using expiration: {expiration}[/dim]')
-        result = mmr.buy_option(
-            symbol, expiration, args.strike, args.right,
-            args.quantity, limit_price=args.limit, market=args.market,
-        )
-        _print_trade_result(result, 'BUY', f'{symbol} {expiration} {args.strike}{args.right}')
+    table = Table(title=title)
+    table.add_column('type', style='bold')
+    for header, _, _, _ in _CHAIN_TABLE_COLUMNS:
+        table.add_column(header, justify='right')
+    for _, row in df.iterrows():
+        type_cell = '[cyan]call[/cyan]' if row['type'] == 'call' else '[magenta]put[/magenta]'
+        table.add_row(type_cell, *(_format_option_number(row[key], spec, suffix)
+                                   for _, key, spec, suffix in _CHAIN_TABLE_COLUMNS))
+    console.print(table)
 
-    elif action == 'sell':
-        symbol = args.symbol.upper()
-        if not args.market and args.limit is None:
-            print_status('Specify --market or --limit', success=False)
-            return
-        expiration = _resolve_expiration(mmr, symbol, args.expiration)
-        if not expiration:
-            print_status(f'No expiration dates found for {symbol}', success=False)
-            return
-        if expiration != args.expiration and not _json_mode:
-            console.print(f'[dim]Using expiration: {expiration}[/dim]')
-        result = mmr.sell_option(
-            symbol, expiration, args.strike, args.right,
-            args.quantity, limit_price=args.limit, market=args.market,
-        )
-        _print_trade_result(result, 'SELL', f'{symbol} {expiration} {args.strike}{args.right}')
 
-    else:
-        print_status(f'Unknown options action: {action}', success=False)
+def _options_snapshot(mmr: MMR, args: argparse.Namespace):
+    result = mmr.options_snapshot(args.ticker, source=getattr(args, 'source', None))
+    title = f'Option Snapshot: {result["ticker"]} — {_option_feed_label(result["provider"], result["feed"])}'
+    if _json_mode:
+        print_dict(_without_nan(result), title=title)
+        return
+    print_dict({key: (_MISSING_OPTION_VALUE if _is_missing_option_value(value) else value)
+                for key, value in result.items()}, title=title)
+
+
+def _options_implied(mmr: MMR, args: argparse.Namespace):
+    symbol = args.symbol.upper()
+    source = getattr(args, 'source', None)
+    expiration = _resolve_expiration(mmr, symbol, args.expiration, source=source)
+    if not expiration:
+        _print_no_expirations(mmr, args, symbol)
+        return
+    _note_resolved_expiration(expiration, args.expiration)
+    data = mmr.options_implied(symbol, expiration, args.risk_free_rate, source=source)
+    if _json_mode:
+        print_json_result(_without_nan(data), title=f'Implied: {symbol} {expiration}')
+        return
+    console.print(f'[dim]{data["strikes_used"]} call strikes with an IV used, {data["strikes_excluded"]} '
+                  f'without IV excluded — {_option_feed_label(data["provider"], data["feed"])}[/dim]')
+    from trader.tools.chain import plot_market_implied_vs_constant_console
+    plot_market_implied_vs_constant_console(
+        data['x'], data['market_implied'], data['constant'],
+        f'{symbol} for {expiration}, constant vs market implied'
+    )
+
+
+def _options_order(mmr: MMR, args: argparse.Namespace):
+    """Options orders go to IB; only a relative -e asks the OPTIONS data source for expirations."""
+    symbol = args.symbol.upper()
+    if not args.market and args.limit is None:
+        print_status('Specify --market or --limit', success=False)
+        return
+    expiration = _resolve_expiration(mmr, symbol, args.expiration, source=getattr(args, 'source', None))
+    if not expiration:
+        _print_no_expirations(mmr, args, symbol)
+        return
+    _note_resolved_expiration(expiration, args.expiration)
+    place = mmr.buy_option if args.opt_action == 'buy' else mmr.sell_option
+    result = place(symbol, expiration, args.strike, args.right, args.quantity,
+                   limit_price=args.limit, market=args.market)
+    _print_trade_result(result, args.opt_action.upper(), f'{symbol} {expiration} {args.strike}{args.right}')
 
 
 def _handle_forex(mmr: MMR, args: argparse.Namespace):
-    """Forex data commands."""
+    """Forex commands. snapshot/quote default to IB; the others use a registry source."""
     import logging as _logging
     _logging.getLogger('urllib3').setLevel(_logging.WARNING)
+    from trader.data_providers import ProviderError
 
     action = getattr(args, 'fx_action', None)
     if not action:
         console.print('[yellow]Usage: forex snapshot|snapshot-all|movers|quote|convert[/yellow]')
         return
-
     try:
-        if action in ('snapshot', 'snap'):
-            source = getattr(args, 'source', 'ib')
-            result = mmr.forex_snapshot(args.pair.upper(), source=source)
-            print_dict(result, title=f'Forex Snapshot: {args.pair.upper()} ({source})')
+        _run_forex_action(mmr, args, action)
+    except (ValueError, ProviderError) as ex:
+        print_status(str(ex), success=False)
 
-        elif action == 'snapshot-all':
-            df = mmr.forex_snapshot_all()
-            print_df(df, title='Forex Snapshots')
 
-        elif action == 'movers':
-            direction = 'losers' if args.losers else 'gainers'
-            df = mmr.forex_movers(direction=direction)
-            print_df(df, title=f'Forex Movers ({direction})')
+def _run_forex_action(mmr: MMR, args: argparse.Namespace, action: str):
+    # Currency codes go to the SDK as typed: it checks them for ASCII before upper-casing.
+    from trader.data_providers import Capability
+    if action in ('snapshot', 'snap'):
+        result = mmr.forex_snapshot(args.pair, source=args.source)
+        print_dict(result, title=f"Forex Snapshot: {result['pair']} ({args.source})")
+    elif action == 'quote':
+        result = mmr.forex_quote(args.from_currency, args.to_currency, source=args.source)
+        print_dict(result, title=f"Forex Quote: {result['pair']} ({args.source})")
+    elif action == 'convert':
+        source = args.source or mmr._provider_default(Capability.FOREX)
+        result = mmr.forex_convert(args.from_currency, args.to_currency, args.amount, source=source)
+        print_dict(result, title=f"Convert: {result['amount']:g} {result['from']} → {result['to']} ({source})")
+    elif action == 'snapshot-all':
+        source = args.source or mmr._provider_default(Capability.FOREX)
+        rates = mmr.forex_snapshot_all(base=args.base, symbols=args.symbols or None, source=source)
+        print_df(rates, title=f'Forex Rates vs {args.base.upper()} ({source}){_ecb_daily_label(source, rates)}',
+                 decimals=FX_DECIMALS)
+    elif action == 'movers':
+        source = args.source or mmr._provider_default(Capability.MOVERS_FOREX)
+        direction = 'losers' if args.losers else 'gainers'
+        movers = mmr.forex_movers(direction=direction, source=source)
+        print_df(movers, title=f'Forex Movers ({direction}) — {source}{_ecb_daily_label(source, movers)}',
+                 decimals=FX_DECIMALS)
+    else:
+        console.print(f'[yellow]Unknown forex action: {action}[/yellow]')
 
-        elif action == 'quote':
-            source = getattr(args, 'source', 'ib')
-            result = mmr.forex_quote(args.from_currency.upper(), args.to_currency.upper(), source=source)
-            print_dict(result, title=f'Forex Quote: {args.from_currency.upper()}/{args.to_currency.upper()} ({source})')
 
-        elif action == 'convert':
-            source = getattr(args, 'source', 'massive')
-            result = mmr.forex_convert(args.from_currency.upper(), args.to_currency.upper(), args.amount, source=source)
-            title_src = f' ({source})' if source != 'massive' else ''
-            print_dict(result, title=f'Convert: {args.amount} {args.from_currency.upper()} → {args.to_currency.upper()}{title_src}')
+_ECB_DAILY_SOURCES = ('frankfurter', 'computed_fx')
 
-        else:
-            console.print(f'[yellow]Unknown forex action: {action}[/yellow]')
-    except ValueError as e:
-        console.print(f'[red]{e}[/red]')
+
+def _ecb_daily_label(source: str, frame) -> str:
+    """Title suffix saying the rows are ECB daily rates, with the ECB date the provider put in attrs."""
+    if source not in _ECB_DAILY_SOURCES:
+        return ''
+    as_of = getattr(frame, 'attrs', {}).get('as_of')
+    return f' — ECB daily, not live, {as_of}' if as_of else ' — ECB daily, not live'
 
 
 SCAN_PRESETS = {
@@ -10467,9 +10581,9 @@ def _handle_movers(mmr: MMR, args: argparse.Namespace):
     direction = 'losers' if args.losers else 'gainers'
     market = args.market
 
-    from trader.data_providers import Capability, ProviderError
+    from trader.data_providers import ProviderError, movers_capability
     try:
-        source = getattr(args, 'source', None) or mmr._provider_default(Capability.MOVERS)
+        source = getattr(args, 'source', None) or mmr._provider_default(movers_capability(market))
         _print_movers(mmr, args, market, direction, source)
     except ProviderError as ex:
         print_status(str(ex), success=False)
@@ -10481,17 +10595,23 @@ def _print_movers(mmr: MMR, args: argparse.Namespace, market: str, direction: st
         if args.num and len(df) > args.num:
             df = df.head(args.num)
         title_suffix = f' — {source}'
-        print_df(df, title=f'{market.title()} Movers ({direction}){title_suffix}')
+        decimals = FX_DECIMALS if market in ('indices', 'forex') else 2
+        print_df(df, title=f'{market.title()} Movers ({direction}){title_suffix}', decimals=decimals)
         return
 
+    from trader.data_providers import movers_capability
+    mmr._provider(movers_capability(market), source)  # fails on a bad source before any notice or request
     # Detail card view — TD path skips news (TD has no news endpoint) but
     # still enriches each row with name + ratios via TD /statistics calls.
-    if source == 'twelvedata':
+    if source == 'twelvedata' and not _json_mode:
         console.print(
             '[dim]TwelveData detail mode: ~100 credits per ticker for ratios, no news.[/dim]'
         )
     movers = mmr.movers_detail(market=market, direction=direction, num=args.num, source=source,
                                min_price=args.min_price)
+    if _json_mode:
+        print_json_result(movers, title=f'{market.title()} Movers ({direction}) — {source}')
+        return
     if not movers:
         console.print('[dim]No data[/dim]')
         return
@@ -10505,27 +10625,30 @@ def _print_movers(mmr: MMR, args: argparse.Namespace, market: str, direction: st
         news = m.get('news', {})
 
         name = details.get('name', '')
-        change = m.get('change', 0) or 0
-        change_pct = m.get('change_pct', 0) or 0
-        close = m.get('close', 0) or 0
+        change = _json_safe(m.get('change'))
+        change_pct = _json_safe(m.get('change_pct'))
+        close = _json_safe(m.get('close'))
         volume = m.get('volume')
         mkt_cap = details.get('market_cap')
 
-        color = 'green' if change >= 0 else 'red'
-        sign = '+' if change > 0 else ''
-
         # Header: ticker, price, change from open
-        open_price = m.get('open', 0) or 0
+        open_price = _json_safe(m.get('open'))
         open_str = f' from ${open_price:,.2f}' if open_price else ''
-        console.print(
-            f'[bold]{ticker}[/bold]  '
-            f'${close:,.2f}  '
-            f'[{color}]{sign}{change:,.2f} ({sign}{change_pct:.2f}%){open_str}[/{color}]'
-        )
+        close_str = '—' if close is None else f'${close:,.2f}'
+        if change is None:
+            change_str = '[dim]—[/dim]'
+        else:
+            color = 'green' if change >= 0 else 'red'
+            sign = '+' if change > 0 else ''
+            pct_str = '—' if change_pct is None else f'{sign}{change_pct:.2f}%'
+            change_str = f'[{color}]{sign}{change:,.2f} ({pct_str}){open_str}[/{color}]'
+        console.print(f'[bold]{ticker}[/bold]  {close_str}  {change_str}')
 
         # Company name
         if name:
             console.print(f'[dim]{name}[/dim]')
+        if m.get('note'):
+            console.print(f"[dim]{m.get('provider', '')}: {m['note']}[/dim]")
 
         # Stats line: volume, market cap, ratios
         stats = []
@@ -10735,41 +10858,51 @@ def _handle_ideas(mmr: MMR, args: argparse.Namespace):
     else:
         source = 'movers'
 
-    # --detail is shortcut for --fundamentals --news + company names
-    use_fundamentals = args.fundamentals or args.detail
+    # --detail adds news + company names; it adds ratios only where the source has them (fundamentals_if_available)
+    use_fundamentals = args.fundamentals
     use_news = args.news or args.detail
     use_names = args.detail
 
-    data_source = getattr(args, 'source', 'massive')
-    # News isn't available on the TwelveData path — tell the user once up-front
-    # so an empty `headline` column doesn't look like a silent bug.
-    if data_source == 'twelvedata' and use_news and not args.location:
-        console.print('[yellow]Note: TwelveData has no news endpoint — news columns will be empty.[/yellow]')
+    data_source = getattr(args, 'source', None)
 
-    df = mmr.scan_ideas(
-        preset=args.preset,
-        source=source,
-        tickers=args.tickers,
-        universe=args.universe,
-        top_n=args.num,
-        min_price=args.min_price,
-        max_price=args.max_price,
-        min_volume=args.min_volume,
-        min_change_pct=args.min_change,
-        max_change_pct=args.max_change,
-        fundamentals=use_fundamentals,
-        news=use_news,
-        names=use_names,
-        location=args.location,
-        data_source=data_source,
-    )
+    from trader.data_providers import ProviderError
+    from trader.tools.idea_scanner import IdeaScannerError
+    try:
+        df = mmr.scan_ideas(
+            preset=args.preset,
+            source=source,
+            tickers=args.tickers,
+            universe=args.universe,
+            top_n=args.num,
+            min_price=args.min_price,
+            max_price=args.max_price,
+            min_volume=args.min_volume,
+            min_change_pct=args.min_change,
+            max_change_pct=args.max_change,
+            fundamentals=use_fundamentals,
+            news=use_news,
+            names=use_names,
+            location=args.location,
+            data_source=data_source,
+            fundamentals_if_available=args.detail,
+        )
+    except (ProviderError, IdeaScannerError) as ex:
+        print_status(str(ex), success=False)
+        return
 
-    notice = getattr(df, 'attrs', {}).get('ideas_notice') if df is not None else None
-    if notice and not _json_mode:
-        console.print(f'[yellow]{notice}[/yellow]')
+    attrs = getattr(df, 'attrs', {}) if df is not None else {}
+    provider = attrs.get('ideas_provider')
+    notice = attrs.get('ideas_notice', '')
+    if not _json_mode:
+        if notice:
+            console.print(f'[yellow]{notice}[/yellow]')
+        # Keyed on the provider that answered, so a config-selected or fallback TwelveData scan is labelled too.
+        if provider == 'twelvedata' and use_news and not args.location:
+            console.print('[yellow]Note: TwelveData has no news endpoint — news columns will be empty.[/yellow]')
 
     location_label = f' [{args.location}]' if args.location else ''
-    source_label = ' — TwelveData' if data_source == 'twelvedata' and not args.location else ''
+    shown_source = provider or data_source
+    source_label = f' — {shown_source}' if shown_source and not args.location else ''
     title = f'Ideas: {args.preset}{location_label}{source_label}'
 
     # Optional body enrichment via the local news scraper service.
@@ -10826,7 +10959,7 @@ def _handle_ideas(mmr: MMR, args: argparse.Namespace):
                 )
 
     if _json_mode:
-        print_df(df, title=title)
+        print_df(df, title=title, json_extra={'provider': provider, 'notice': notice})
         return
 
     if df.empty:
@@ -11804,12 +11937,9 @@ def main():
         # trader_service entirely — they hit a REST endpoint directly.
         if cmd in ('snapshot', 'snap', 'snapshot-batch') and getattr(args, 'source', 'ib') != 'ib':
             is_local = True
-        # Forex commands routed via twelvedata (or massive REST) don't need IB.
-        if cmd == 'forex':
-            fx_action = getattr(args, 'fx_action', None) or getattr(args, 'forex_action', None)
-            fx_source = getattr(args, 'source', '')
-            if fx_source in ('massive', 'twelvedata') or fx_action in ('snapshot-all', 'movers', 'convert'):
-                is_local = True
+        # Only IB-routed forex snapshot/quote need trader_service.
+        if cmd in ('forex', 'fx') and not _forex_needs_trader(args):
+            is_local = True
 
         # Suppress logs by default; only show with --debug
         if not getattr(args, 'debug', False):

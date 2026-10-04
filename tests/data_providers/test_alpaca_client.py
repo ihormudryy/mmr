@@ -1,4 +1,5 @@
 import pytest
+import requests
 
 from trader.data_providers.alpaca.client import AlpacaClient
 from trader.data_providers.errors import ProviderEntitlementError, ProviderError
@@ -22,6 +23,19 @@ class FakeSession:
     def get(self, url, params=None, headers=None, timeout=None):
         self.requests.append({'url': url, 'params': dict(params or {}), 'headers': headers, 'timeout': timeout})
         return self._responses.pop(0)
+
+
+class RaisingSession:
+    def __init__(self, error):
+        self._error = error
+
+    def get(self, url, params=None, headers=None, timeout=None):
+        raise self._error
+
+
+class NotJsonResponse(FakeResponse):
+    def json(self):
+        raise requests.JSONDecodeError('Expecting value', '<html>', 0)
 
 
 class NoWaitLimiter:
@@ -95,3 +109,20 @@ def test_limiter_acquired_on_429_retry():
 
     assert result == {'ok': True}
     assert limiter.acquire_count == 2, f"Expected limiter.acquire() to be called 2 times, got {limiter.acquire_count}"
+
+
+@pytest.mark.parametrize('error', [
+    requests.ConnectionError('connection refused'),
+    requests.Timeout('read timed out'),
+])
+def test_transport_errors_raise_provider_error(error):
+    client = AlpacaClient('kid', 'secret', session=RaisingSession(error), limiter=NoWaitLimiter())
+    with pytest.raises(ProviderError, match='alpaca /v2/stocks/bars unreachable') as raised:
+        client.get_json('/v2/stocks/bars', {})
+    assert raised.value.__cause__ is error
+
+
+def test_non_json_success_body_raises_provider_error():
+    client, _ = _client(NotJsonResponse(200, None))
+    with pytest.raises(ProviderError, match='alpaca /v2/stocks/bars returned a body that is not JSON'):
+        client.get_json('/v2/stocks/bars', {})

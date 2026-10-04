@@ -162,6 +162,37 @@ def _mid(row: dict) -> Optional[float]:
     return None
 
 
+def _source_args(source: Optional[str]) -> List[str]:
+    """``--source`` CLI args, or none so the CLI's configured default applies."""
+    return ["--source", source] if source else []
+
+
+# Feed each options provider serves; used only when a probe returned no rows to read it from.
+_OPTIONS_FEED_BY_PROVIDER = {"alpaca": "indicative", "massive": "opra"}
+
+# Messages of auth / entitlement / not-configured failures from `mmr options ...`.
+_OPTIONS_UNAVAILABLE_MARKERS = ("NOT_AUTHORIZED", "is not configured", "rejected the API key", "refused")
+
+
+def _chain_probe_outcome(response) -> tuple:
+    """Return (endpoint_reachable, error_message) for an `options chain --json` probe.
+
+    A success:false that is not an auth / entitlement / not-configured failure
+    (for example "No chain data ... from alpaca" for an empty strike range)
+    means the endpoint answered, so it counts as reachable. A rate limit or
+    an HTTP 500 on the probe also counts as reachable.
+    """
+    if not isinstance(response, dict):
+        return False, str(response)
+    if response.get("timed_out") or response.get("error"):
+        return False, str(response.get("error") or "timed out")
+    if response.get("success") is False:
+        message = response.get("message") or ""
+        if any(marker in message for marker in _OPTIONS_UNAVAILABLE_MARKERS):
+            return False, message
+    return True, None
+
+
 async def _last_close_local_or_remote(symbol: str) -> Optional[float]:
     """Get the most recent daily close for a symbol.
 
@@ -489,8 +520,9 @@ class MMRHelpers:
 
           * IB is "connected" but the paper account has no live market-data
             subscription (every ``snapshot()`` times out at 30s).
-          * The Polygon plan tier doesn't include options chains
-            (``options_chain()`` returns ``NOT_AUTHORIZED``).
+          * The options data source is not configured or not entitled
+            (Alpaca keys missing, or a Massive plan without options
+            returns ``NOT_AUTHORIZED``).
           * Local DuckDB has the symbol registered but only minute bars,
             not daily — so ``data_query("...", bar_size="1 day")`` returns
             empty.
@@ -505,8 +537,14 @@ class MMRHelpers:
               "trader_service": {"connected": bool, "ib_upstream": bool, "account": str},
               "ib_market_data": {"works": bool, "reason": str | None,
                                  "last_price": float | None},
+              # Key name is historical; it describes whichever provider serves options.
+              # tier "paid" means "the chain works" (kept for compatibility; the
+              # free Alpaca feed reports "paid" too), "free" = expirations only.
               "polygon_options": {"expirations_endpoint": bool,
-                                  "chain_endpoint": bool, "tier": "free|paid|none"},
+                                  "chain_endpoint": bool, "tier": "free|paid|none",
+                                  "provider": "alpaca" | "massive" | None,
+                                  "feed": "indicative" | "opra" | None,
+                                  "error": str | None},   # why the chain is unavailable
               "local_data": {"symbols": int, "bar_sizes": list[str],
                              "has_daily": bool, "has_minute": bool,
                              "canary_daily_rows": int},
@@ -519,7 +557,7 @@ class MMRHelpers:
                 # Skip snapshot() loops; route through implied_move() / history_massive()
                 ...
             if not pf["polygon_options"]["chain_endpoint"]:
-                # Don't try options_chain — use implied_move() with realized-vol fallback
+                # Don't try options_chain — read pf["polygon_options"]["error"] for why
                 ...
         """
         report: dict = {
@@ -529,7 +567,8 @@ class MMRHelpers:
                               "diagnosis": []},
             "ib_market_data": {"works": False, "reason": None, "last_price": None},
             "polygon_options": {"expirations_endpoint": False, "chain_endpoint": False,
-                                "tier": "none"},
+                                "tier": "none", "provider": None, "feed": None,
+                                "error": None},
             "local_data": {"symbols": 0, "bar_sizes": [], "has_daily": False,
                            "has_minute": False, "canary_daily_rows": 0},
             "recommendations": [],
@@ -601,15 +640,18 @@ class MMRHelpers:
                 "trader_service or IB upstream not connected"
             )
 
-        # --- 3. Polygon options tier probes ---
-        # options expirations is a free endpoint on Polygon's cheapest tier;
-        # options chain requires the paid tier. Probing both lets us label
-        # the plan as "free" / "paid" / "none".
+        # --- 3. Options data probes ---
+        # Expirations is the cheap endpoint; the chain is the one that needs an
+        # entitlement. The probe range is far out of the money on purpose: an
+        # empty chain ("No chain data ... from alpaca") still proves the
+        # endpoint works. Provider and feed come from the CLI output.
+        options = report["polygon_options"]
         try:
             exps = await _run_cli_json("options", "expirations", canary_symbol, timeout=20)
             data = exps.get("data") if isinstance(exps, dict) else None
             if isinstance(data, list) and len(data) > 0:
-                report["polygon_options"]["expirations_endpoint"] = True
+                options["expirations_endpoint"] = True
+                options["provider"] = exps.get("provider")
         except Exception:
             pass
         try:
@@ -617,21 +659,25 @@ class MMRHelpers:
                 "options", "chain", canary_symbol, "--strike-min", "10000",
                 "--strike-max", "10001", timeout=20,
             )
-            msg = (chain.get("message") or "") if isinstance(chain, dict) else str(chain)
-            if "NOT_AUTHORIZED" in msg:
-                report["polygon_options"]["chain_endpoint"] = False
-            elif chain.get("success") is not False:
-                # Either a successful empty result (no strikes in 10000–10001 range)
-                # or actual data — the endpoint is reachable either way.
-                report["polygon_options"]["chain_endpoint"] = True
+            options["chain_endpoint"], options["error"] = _chain_probe_outcome(chain)
+            rows = chain.get("data") if isinstance(chain, dict) else None
+            if isinstance(rows, list) and rows and isinstance(rows[0], dict):
+                options["provider"] = rows[0].get("provider") or options["provider"]
+                options["feed"] = rows[0].get("feed")
+            elif isinstance(chain, dict):
+                named = re.search(r"from (\w+)\s*$", chain.get("message") or "")
+                if named:
+                    options["provider"] = named.group(1)
         except Exception:
             pass
-        if report["polygon_options"]["chain_endpoint"]:
-            report["polygon_options"]["tier"] = "paid"
-        elif report["polygon_options"]["expirations_endpoint"]:
-            report["polygon_options"]["tier"] = "free"
+        if options["feed"] is None:
+            options["feed"] = _OPTIONS_FEED_BY_PROVIDER.get(options["provider"])
+        if options["chain_endpoint"]:
+            options["tier"] = "paid"
+        elif options["expirations_endpoint"]:
+            options["tier"] = "free"
         else:
-            report["polygon_options"]["tier"] = "none"
+            options["tier"] = "none"
 
         # --- 4. Local DuckDB inventory ---
         try:
@@ -680,18 +726,22 @@ class MMRHelpers:
                 "data_query() for prices, and implied_move() for vol/move estimates."
             )
 
-        if report["polygon_options"]["tier"] == "none":
-            recs.append(
-                "Polygon API key is missing or invalid. options_* helpers will "
-                "fail; implied_move() will fall back to realized-vol from local "
-                "OHLCV (lower confidence)."
-            )
-        elif report["polygon_options"]["tier"] == "free":
-            recs.append(
-                "Polygon plan covers options_expirations only. options_chain "
-                "and options_snapshot return NOT_AUTHORIZED — implied_move() "
-                "will fall back to realized-vol."
-            )
+        options = report["polygon_options"]
+        if not options["chain_endpoint"]:
+            reason = options["error"] or "no expirations and no chain came back"
+            provider = options["provider"] or "the options provider"
+            if "NOT_AUTHORIZED" in reason:
+                recs.append(
+                    f"Options chain is not entitled on {provider} ({reason}). "
+                    "implied_move() will fall back to realized-vol; use "
+                    "`--source alpaca` for the free indicative chain."
+                )
+            else:
+                recs.append(
+                    f"Options data is unavailable: {reason}. options_* helpers "
+                    "will fail and implied_move() will return this error; fix "
+                    "it or call implied_move(prefer='realized')."
+                )
 
         # If the farm probe surfaced a hard fail, lift its diagnosis lines
         # to the top of recommendations — they're the most actionable.
@@ -1560,18 +1610,21 @@ class MMRHelpers:
     # ------------------------------------------------------------------
 
     @staticmethod
-    async def options_expirations(symbol: str) -> str:
+    async def options_expirations(symbol: str, source: Optional[str] = None) -> str:
         """
         Get available expiration dates for a symbol's options.
         Shows dates with days-to-expiration (DTE).
-        Does NOT require trader_service. Requires massive_api_key in config.
+        Does NOT require trader_service. The default source is Alpaca's free
+        indicative feed (needs ALPACA_API_KEY_ID / ALPACA_API_SECRET_KEY);
+        ``source="massive"`` is OPRA and needs a Massive key with an options plan.
 
         :param symbol: Stock ticker (e.g. "AAPL")
+        :param source: "alpaca" or "massive". Default: the configured options source (Alpaca).
 
         Example:
         result = await MMRHelpers.options_expirations("AAPL")
         """
-        return await _run_cli("options", "expirations", symbol)
+        return await _run_cli("options", "expirations", symbol, *_source_args(source))
 
     @staticmethod
     async def options_chain(
@@ -1580,17 +1633,24 @@ class MMRHelpers:
         contract_type: Optional[str] = None,
         strike_min: Optional[float] = None,
         strike_max: Optional[float] = None,
+        source: Optional[str] = None,
     ) -> str:
         """
         Get options chain snapshot for a symbol.
         Shows strike, bid, ask, mid, last, volume, open interest, IV, greeks, break-even.
-        Does NOT require trader_service. Requires massive_api_key in config.
+        Every row names its ``provider`` and ``feed``. On the default Alpaca
+        indicative feed, illiquid contracts have no greeks/IV (blank) and
+        break-even is always blank.
+        Does NOT require trader_service. The default source is Alpaca's free
+        indicative feed (needs ALPACA_API_KEY_ID / ALPACA_API_SECRET_KEY);
+        ``source="massive"`` is OPRA and needs a Massive key with an options plan.
 
         :param symbol: Stock ticker (e.g. "AAPL")
         :param expiration: Filter by expiration date (YYYY-MM-DD). Default: nearest.
         :param contract_type: Filter by "call" or "put"
         :param strike_min: Minimum strike price
         :param strike_max: Maximum strike price
+        :param source: "alpaca" or "massive". Default: the configured options source (Alpaca).
 
         Example:
         result = await MMRHelpers.options_chain("AAPL", expiration="2026-03-20", contract_type="call")
@@ -1605,43 +1665,52 @@ class MMRHelpers:
             args.extend(["--strike-min", str(strike_min)])
         if strike_max is not None:
             args.extend(["--strike-max", str(strike_max)])
-        return await _run_cli(*args)
+        return await _run_cli(*args, *_source_args(source))
 
     @staticmethod
-    async def options_snapshot(option_ticker: str) -> str:
+    async def options_snapshot(option_ticker: str, source: Optional[str] = None) -> str:
         """
         Get detailed snapshot for a single option contract.
         Shows greeks, bid/ask, IV, open interest, break-even, underlying price.
-        Does NOT require trader_service. Requires massive_api_key in config.
+        Does NOT require trader_service. The default source is Alpaca's free
+        indicative feed (needs ALPACA_API_KEY_ID / ALPACA_API_SECRET_KEY);
+        ``source="massive"`` is OPRA and needs a Massive key with an options plan.
 
-        :param option_ticker: Massive option ticker (e.g. "O:AAPL260320C00250000")
+        :param option_ticker: OCC option symbol (e.g. "AAPL260320C00250000");
+            the Massive form with an ``O:`` prefix is also accepted.
+        :param source: "alpaca" or "massive". Default: the configured options source (Alpaca).
 
         Example:
-        result = await MMRHelpers.options_snapshot("O:AAPL260320C00250000")
+        result = await MMRHelpers.options_snapshot("AAPL260320C00250000")
         """
-        return await _run_cli("options", "snapshot", option_ticker)
+        return await _run_cli("options", "snapshot", option_ticker, *_source_args(source))
 
     @staticmethod
     async def options_implied(
         symbol: str,
         expiration: str,
         risk_free_rate: float = 0.05,
+        source: Optional[str] = None,
     ) -> str:
         """
         Get implied probability distribution for an options expiration.
-        Shows market-implied vs constant-vol probability chart.
-        Does NOT require trader_service. Requires massive_api_key in config.
+        Shows market-implied vs constant-vol probability chart over the
+        quoted strike range. Needs at least 8 call strikes with an IV.
+        Does NOT require trader_service. The default source is Alpaca's free
+        indicative feed (needs ALPACA_API_KEY_ID / ALPACA_API_SECRET_KEY);
+        ``source="massive"`` is OPRA and needs a Massive key with an options plan.
 
         :param symbol: Stock ticker (e.g. "AAPL")
         :param expiration: Expiration date (YYYY-MM-DD)
         :param risk_free_rate: Risk-free rate (default 0.05)
+        :param source: "alpaca" or "massive". Default: the configured options source (Alpaca).
 
         Example:
         result = await MMRHelpers.options_implied("AAPL", "2026-03-20")
         """
         args = ["options", "implied", symbol, "-e", expiration,
                 "--risk-free-rate", str(risk_free_rate)]
-        return await _run_cli(*args)
+        return await _run_cli(*args, *_source_args(source))
 
     @staticmethod
     async def implied_move(
@@ -1657,10 +1726,12 @@ class MMRHelpers:
         Canonical "earnings implied move" / hedging-window helper. Tries data
         sources in order of confidence and returns the first that works:
 
-          1. ``polygon_atm_straddle`` — pulls ATM call+put from
-             ``options_chain``, computes ``(call_mid + put_mid) / spot``.
-             Highest confidence (market-implied). Requires the paid Polygon
-             options tier.
+          1. ``atm_straddle`` — pulls ATM call+put from ``options chain``
+             (default source Alpaca's free indicative feed, ``medium``
+             confidence; ``high`` only on an OPRA feed, i.e. the configured
+             options source is Massive), computes
+             ``(call_mid + put_mid) / spot``. Market-implied. The result
+             names the ``provider`` and ``feed`` it used.
           2. ``realized_vol`` — pulls ``history_days`` of daily closes
              (local DuckDB → Massive list_aggs top-up if local is thin),
              computes annualised log-return stdev, scales by
@@ -1677,10 +1748,19 @@ class MMRHelpers:
         :param history_days: Lookback window for realized-vol fallback
             (default 90 calendar days). 30+ is reasonable; 60–90 smooths
             out single-event noise.
-        :param prefer: ``"auto"`` (default — try Polygon first then
-            realized vol), ``"polygon"`` (only Polygon, fail if not
-            authorized), or ``"realized"`` (skip Polygon entirely — useful
-            if you already know the plan tier from preflight()).
+        :param prefer: ``"auto"`` (default — try the options chain first,
+            then realized vol), ``"polygon"`` (only the options chain; name
+            kept for compatibility), or ``"realized"`` (skip the chain
+            entirely — useful if preflight() says it is unavailable).
+            With ``auto``, these fall back to realized vol and say why in
+            ``fallback_reason``: an empty chain ("No chain data"),
+            ``NOT_AUTHORIZED``, no spot price to pick the ATM strike, no
+            strike with both a call and a put price, a timed-out or
+            unparseable CLI reply, or an exception in the chain step. Any
+            other failure the CLI reports (missing keys, rate limit, bad
+            input) is returned in ``error``, not hidden behind realized vol.
+            With ``"polygon"`` an empty chain, a timeout or an exception is
+            an error too.
 
         :return: Dict with shape::
 
@@ -1689,7 +1769,7 @@ class MMRHelpers:
               "expiration": "2026-05-01",
               "dte_calendar": 2,
               "dte_trading": 2,
-              "method": "realized_vol" | "polygon_atm_straddle",
+              "method": "realized_vol" | "atm_straddle",
               "confidence": "high" | "medium" | "low",
               "spot": 167.45,
               "implied_move_pct": 1.92,            # 1-sigma % move
@@ -1697,8 +1777,10 @@ class MMRHelpers:
               "expected_low": 164.24,              # spot * (1 - move)
               "expected_high": 170.66,             # spot * (1 + move)
               "annualized_vol_pct": 21.3,          # only set for realized_vol
-              "atm_strike": null,                  # only set for polygon
-              "call_mid": null, "put_mid": null,   # only set for polygon
+              "atm_strike": null,                  # only set for atm_straddle
+              "call_mid": null, "put_mid": null,   # only set for atm_straddle
+              "provider": "alpaca", "feed": "indicative",  # only set for atm_straddle
+              "fallback_reason": null,             # why realized_vol replaced the straddle (auto mode)
               "source_rows": 63,                   # bars used (realized_vol)
               "notes": "...",
             }
@@ -1717,7 +1799,7 @@ class MMRHelpers:
         # --- Resolve expiration / DTE ---
         today = _dt.date.today()
         if expiration is None and dte is None:
-            # Nearest weekly: ask options_expirations (free Polygon endpoint)
+            # Nearest weekly: ask options_expirations
             try:
                 exps = await _run_cli_json("options", "expirations", symbol, timeout=20)
                 data = exps.get("data") or []
@@ -1765,17 +1847,25 @@ class MMRHelpers:
             "atm_strike": None,
             "call_mid": None,
             "put_mid": None,
+            "provider": None,
+            "feed": None,
+            "fallback_reason": None,
             "source_rows": 0,
             "notes": "",
         }
 
-        # --- Tier 1: Polygon ATM straddle ---
+        # --- Tier 1: ATM straddle from the options chain ---
         if prefer in ("auto", "polygon"):
             try:
                 # We need spot first to pick ATM. Pull narrow strike window
                 # around the most recent close from local OHLCV (free).
                 spot = await _last_close_local_or_remote(symbol)
-                if spot is not None:
+                if spot is None:
+                    result["fallback_reason"] = (
+                        f"no spot price (recent close) for {symbol} to pick the ATM strike; "
+                        "options chain not queried"
+                    )
+                else:
                     win = max(spot * 0.05, 5.0)
                     chain_json = await _run_cli_json(
                         "options", "chain", symbol,
@@ -1784,16 +1874,31 @@ class MMRHelpers:
                         "--strike-max", str(round(spot + win, 2)),
                         timeout=30,
                     )
-                    msg = (chain_json.get("message") or "") if isinstance(chain_json, dict) else ""
-                    if "NOT_AUTHORIZED" in msg:
+                    chain_json = chain_json if isinstance(chain_json, dict) else {}
+                    msg = chain_json.get("message") or ""
+                    if chain_json.get("timed_out") or chain_json.get("error"):
+                        # No CLI verdict at all: the subprocess timed out or printed no JSON.
+                        reason = f"options chain: {chain_json.get('error') or 'timed out'}"
                         if prefer == "polygon":
-                            result["method"] = "polygon_atm_straddle"
+                            result["method"] = "atm_straddle"
+                            result["error"] = reason
+                            return result
+                        result["fallback_reason"] = reason
+                    elif "NOT_AUTHORIZED" in msg:
+                        if prefer == "polygon":
+                            result["method"] = "atm_straddle"
                             result["error"] = (
-                                "Polygon plan does not include options chain. "
-                                "Re-run with prefer='realized' or use 'auto'."
+                                f"{msg} Re-run with prefer='realized' or use 'auto'."
                             )
                             return result
-                        # else fall through to realized vol
+                        result["fallback_reason"] = msg
+                    elif chain_json.get("success") is False:
+                        if prefer == "auto" and "No chain data" in msg:
+                            result["fallback_reason"] = msg
+                        else:
+                            result["method"] = "atm_straddle"
+                            result["error"] = msg or "options chain request failed"
+                            return result
                     else:
                         rows = chain_json.get("data") or []
                         # Build call/put strike→mid maps
@@ -1803,13 +1908,23 @@ class MMRHelpers:
                                 if r.get("type") == "put" and _mid(r) is not None}
                         common = sorted(set(calls) & set(puts),
                                         key=lambda k: abs(k - spot))
-                        if common:
+                        if not common:
+                            result["fallback_reason"] = (
+                                f"no strike near {spot} has both a call and put price "
+                                f"({len(rows)} chain rows)"
+                            )
+                        else:
                             atm = common[0]
                             cm, pm = calls[atm], puts[atm]
                             move_pct = (cm + pm) / spot * 100
+                            provider = rows[0].get("provider") or "unknown"
+                            feed = rows[0].get("feed") or "unknown"
+                            indicative = feed == "indicative"
                             result.update({
-                                "method": "polygon_atm_straddle",
-                                "confidence": "high",
+                                "method": "atm_straddle",
+                                "confidence": "high" if feed == "opra" else "medium",
+                                "provider": provider,
+                                "feed": feed,
                                 "spot": spot,
                                 "implied_move_pct": round(move_pct, 3),
                                 "implied_move_dollar": round(cm + pm, 4),
@@ -1819,15 +1934,17 @@ class MMRHelpers:
                                 "call_mid": cm,
                                 "put_mid": pm,
                                 "source_rows": len(rows),
-                                "notes": "ATM straddle from Polygon chain.",
+                                "notes": (f"ATM straddle from the {provider} options chain ({feed} feed"
+                                          + ("; indicative quotes, not OPRA NBBO" if indicative else "")
+                                          + ")."),
                             })
                             return result
             except Exception as e:
                 if prefer == "polygon":
-                    result["method"] = "polygon_atm_straddle"
+                    result["method"] = "atm_straddle"
                     result["error"] = f"{type(e).__name__}: {e}"
                     return result
-                # else fall through
+                result["fallback_reason"] = f"options chain step failed: {type(e).__name__}: {e}"
 
         # --- Tier 2: Realized vol fallback ---
         try:
@@ -3211,15 +3328,21 @@ class MMRHelpers:
         news: bool = False,
         news_bodies: bool = False,
         news_bodies_limit: int = 3,
-        source: str = "massive",
+        source: Optional[str] = None,
     ) -> dict:
         """
         Scan for trading ideas using technical indicators and scoring.
-        Returns JSON dict with list of scored candidates.
+        Returns JSON dict with list of scored candidates, plus ``provider``
+        (the source that answered) and ``notice`` (delayed data, dropped or
+        unknown symbols, fallbacks).
 
         Source selection:
-        - ``source="massive"`` (default): US only, ~4s scan, news+sentiment
-          enrichment available, Polygon-style ratios.
+        - ``source=None`` (default): the CLI default — ``data_providers.ideas``,
+          else Alpaca (free, US only, 15-minute delayed prices, discovery from
+          top movers + most-actives, headline news without sentiment, no
+          fundamentals).
+        - ``source="massive"``: US only, ~4s scan, news+sentiment
+          enrichment available, Polygon-style ratios. Needs a paid plan.
         - ``source="twelvedata"``: US only, ~8-15s scan (local indicator
           compute from one time_series call per ticker), richer fundamentals
           via get_statistics. NEWS IS NOT AVAILABLE on this path — news=True
@@ -3233,10 +3356,11 @@ class MMRHelpers:
         :param num: Number of results (default 15)
         :param location: IB location code (e.g. "STK.AU.ASX"). Overrides source.
         :param detail: Show all columns including indicators
-        :param fundamentals: Enrich with financial ratios (slower). On
+        :param fundamentals: Enrich with financial ratios (slower). Needs
+            source="massive" or "twelvedata" (errors on Alpaca). On
             TwelveData, ~100 credits per enriched ticker.
-        :param news: Enrich with latest news + sentiment from the underlying
-            data provider (Polygon/Massive). MASSIVE ONLY — headline only.
+        :param news: Enrich with the latest headline. Sentiment only on
+            source="massive"; TwelveData has no news.
         :param news_bodies: Enrich the top ``news_bodies_limit`` results
             with FULL article bodies via the local ~/dev/news scraper at
             ``http://127.0.0.1:8089``. Adds ``news_title``/``news_url``/
@@ -3245,7 +3369,8 @@ class MMRHelpers:
             enriched ticker). Degrades silently if news service is down.
         :param news_bodies_limit: How many top-ranked tickers to enrich
             with article bodies (default 3). Each adds search+scrape time.
-        :param source: "massive" (default) or "twelvedata". Ignored if location is set.
+        :param source: None (CLI default, Alpaca), "alpaca", "massive" or
+            "twelvedata". Ignored if location is set.
 
         Example:
         result = await MMRHelpers.ideas()
@@ -3263,7 +3388,7 @@ class MMRHelpers:
             args.extend(["--universe", universe])
         if location:
             args.extend(["--location", location])
-        else:
+        elif source:
             args.extend(["--source", source])
         if detail:
             args.append("--detail")
@@ -3274,9 +3399,9 @@ class MMRHelpers:
         if news_bodies:
             args.append("--news-bodies")
             args.extend(["--news-bodies-limit", str(news_bodies_limit)])
-        # TwelveData scans add ~1s per indicator-fetched ticker (one time_series
-        # call each) vs Massive's batched server-side indicators.
-        timeout = 120 if location else (60 if source == "twelvedata" else 30)
+        # Alpaca and TwelveData fetch daily bars per ticker for indicators;
+        # Massive batches them server-side.
+        timeout = 120 if location else (30 if source == "massive" else 60)
         if news_bodies:
             # ~5s per scraped article (search + scrape + parse); cap headroom.
             timeout = max(timeout, 30 + int(news_bodies_limit) * 10)
@@ -3551,7 +3676,7 @@ class MMRHelpers:
         from_currency: str,
         to_currency: str,
         amount: float,
-        source: str = "massive",
+        source: Optional[str] = None,
     ) -> str:
         """
         Convert an amount between currencies.
@@ -3559,17 +3684,18 @@ class MMRHelpers:
         :param from_currency: Base currency (e.g. "EUR")
         :param to_currency: Quote currency (e.g. "USD")
         :param amount: Amount in the base currency
-        :param source: "massive" (default, returns bid/ask + converted) or
-            "twelvedata" (uses /currency_conversion; returns rate + converted).
+        :param source: None (default) uses the CLI default: data_providers.forex,
+            else free ECB daily rates (frankfurter, not live). "massive" returns
+            bid/ask + converted; "twelvedata" returns rate + converted.
 
         Example:
         result = await MMRHelpers.forex_convert("EUR", "USD", 100.0)
         result = await MMRHelpers.forex_convert("EUR", "USD", 100.0, source="twelvedata")
         """
-        return await _run_cli(
-            "forex", "convert", from_currency, to_currency, str(amount),
-            "--source", source,
-        )
+        args = ["forex", "convert", from_currency, to_currency, str(amount)]
+        if source:
+            args += ["--source", source]
+        return await _run_cli(*args)
 
     @staticmethod
     async def forex_movers(losers: bool = False) -> str:

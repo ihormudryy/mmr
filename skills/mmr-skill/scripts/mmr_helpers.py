@@ -785,8 +785,7 @@ class MMRHelpers:
             args.extend(["--exchange", exchange])
         if currency:
             args.extend(["--currency", currency])
-        if source and source != "ib":
-            args.extend(["--source", source])
+        args.extend(["--source", source or "ib"])
         return await _run_cli_json(*args, timeout=timeout)
 
     @staticmethod
@@ -820,8 +819,7 @@ class MMRHelpers:
             args.extend(["--exchange", exchange])
         if currency:
             args.extend(["--currency", currency])
-        if source and source != "ib":
-            args.extend(["--source", source])
+        args.extend(["--source", source or "ib"])
         return await _run_cli_json(*args, timeout=timeout)
 
     @staticmethod

@@ -239,3 +239,28 @@ def test_propose_trailing_conflicts_with_fixed_exits(helpers):
 
     assert result.get("error_code") == "INVALID_EXIT"
     assert "propose" not in _cli_json_commands(helpers)
+
+
+# ---------------------------------------------------------------------------
+# snapshot helpers: --source is always forwarded so the CLI config default cannot win
+# ---------------------------------------------------------------------------
+
+def test_snapshot_forwards_ib_source_by_default(helpers):
+    asyncio.run(helpers.H.snapshot("BHP", exchange="ASX", currency="AUD"))
+
+    args = helpers.calls["cli_json"][-1]
+    assert args[args.index("--source") + 1] == "ib"
+
+
+def test_snapshots_batch_forwards_ib_source_by_default(helpers):
+    asyncio.run(helpers.H.snapshots_batch(["BHP", "CBA"], exchange="ASX", currency="AUD"))
+
+    args = helpers.calls["cli_json"][-1]
+    assert args[args.index("--source") + 1] == "ib"
+
+
+def test_snapshot_forwards_explicit_rest_source(helpers):
+    asyncio.run(helpers.H.snapshot("AAPL", source="alpaca"))
+
+    args = helpers.calls["cli_json"][-1]
+    assert args[args.index("--source") + 1] == "alpaca"

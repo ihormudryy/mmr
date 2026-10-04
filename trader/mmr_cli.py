@@ -8528,6 +8528,21 @@ def _default_history_source(cfg) -> str:
     return ProviderRegistry.from_config(effective_config).default_source(Capability.HISTORY)
 
 
+def _download_setup_failure(message: str, symbol_count: int) -> Dict[str, Any]:
+    """Report a failure before any download started, in the shape of a normal result.
+
+    Batch callers (`data refresh`) read the summary, so a bare return would
+    look like success.
+    """
+    summary = {'completed': 0, 'skipped_up_to_date': 0,
+               'failed': symbol_count, 'rows_written': 0}
+    if _json_mode:
+        print(json.dumps({'success': False, 'message': message, **summary}))
+    else:
+        print_status(message, success=False)
+    return {**summary, 'error': message}
+
+
 def _handle_data_download(args: argparse.Namespace):
     """Download data from the selected source directly to local DuckDB.
 
@@ -8555,12 +8570,10 @@ def _handle_data_download(args: argparse.Namespace):
         try:
             worker = _rest_history_worker(source, cfg)
         except ProviderError as ex:
-            print_status(str(ex), success=False)
-            return
+            return _download_setup_failure(str(ex), len(args.symbols))
 
     if not duckdb_path:
-        print_status('duckdb_path not configured', success=False)
-        return
+        return _download_setup_failure('duckdb_path not configured', len(args.symbols))
 
     bar_size = BarSize.parse_str(getattr(args, 'bar_size', '1 day'))
     history_path = cfg.get('history_duckdb_path', '') or duckdb_path
@@ -9314,7 +9327,8 @@ def _handle_data_refresh(args: argparse.Namespace):
                                 'symbols': len(symbols), 'bar_size': bar_size,
                                 'days': days, 'downloaded': summary.get('completed', 0),
                                 'failed_symbols': dl_failed,
-                                **({} if job_ok else {'error': f'{dl_failed} symbol(s) failed to download'})})
+                                **({} if job_ok else {'error': summary.get('error')
+                                                      or f'{dl_failed} symbol(s) failed to download'})})
             finally:
                 _json_mode = saved_json_mode
         except Exception as ex:

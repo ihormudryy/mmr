@@ -21,6 +21,15 @@ DEFAULT_TIMEOUTS = {
     "movers": 15.0,
     "news": 15.0,
     "ideas": 30.0,
+    "options_expirations": 10.0,
+    "options_chain": 20.0,
+    "options_snapshot": 10.0,
+    "options_implied": 20.0,
+    "forex_snapshot": 10.0,
+    "forex_quote": 10.0,
+    "forex_movers": 15.0,
+    "forex_snapshot_all": 20.0,
+    "forex_convert": 10.0,
 }
 _SENSITIVE_PARAM_PARTS = (
     "apikey",
@@ -77,7 +86,7 @@ def _upstream_research_error(tool: str, exc: BaseException) -> ResearchError:
         return ResearchError(502, "RESEARCH_UPSTREAM_ERROR", text[:500], True)
     if is_data_entitlement_error(exc):
         return ResearchError(
-            502,
+            403,
             "RESEARCH_NOT_ENTITLED",
             (
                 f"{tool.title()} needs a Massive Starter+ plan for snapshots/movers, "
@@ -88,7 +97,7 @@ def _upstream_research_error(tool: str, exc: BaseException) -> ResearchError:
     low = text.lower()
     if "429" in text or "too many" in low or "rate limit" in low:
         return ResearchError(
-            502,
+            429,
             "RESEARCH_RATE_LIMITED",
             f"{tool.title()} hit a provider rate limit; retry shortly.",
             True,
@@ -167,6 +176,7 @@ class ResearchService:
         tool: str,
         operation: Callable[[MassiveResearch], ResearchResult],
         *,
+        backend: str = "massive",
         log_params: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
         started = time.monotonic()
@@ -185,7 +195,11 @@ class ResearchService:
 
         try:
             try:
-                future = self._executor.submit(lambda: operation(self._get_provider()))
+                if backend == "trader":
+                    future = self._executor.submit(operation)
+                else:
+                    future = self._executor.submit(
+                        lambda: operation(self._get_provider()))
             except Exception as exc:
                 self._slots.release()
                 outcome = "upstream_error"
@@ -284,6 +298,6 @@ def build_research_service() -> ResearchService:
                     exc_info=True,
                 )
 
-        return MassiveResearch(RESTClient(api_key=api_key), td_client=td_client)
+        return MassiveResearch(RESTClient(api_key=api_key), td_client=td_client, api_key=api_key)
 
     return ResearchService(provider_factory)

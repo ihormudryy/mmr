@@ -379,6 +379,7 @@ print_api_keys() {
     echo "${DC_DIM}Data feed API keys${DC_RESET}"
     _api_key_status_d "Massive/Polygon" "massive_api_key"    "MASSIVE_API_KEY"    "$yaml_file"
     _api_key_status_d "TwelveData"      "twelvedata_api_key" "TWELVEDATA_API_KEY" "$yaml_file"
+    _api_key_status_d "Alpaca"          "alpaca_api_key_id"  "ALPACA_API_KEY_ID"  "$yaml_file"
     echo ""
 }
 
@@ -551,6 +552,24 @@ build() {
     echo "Building MMR image..."
     echo ""
     $COMPOSE -f "$BUILDDIR/docker-compose.yml" build
+    # Every rebuild retags mmr:latest and leaves the previous image as
+    # <none> plus BuildKit intermediates. Without a reclaim pass, repeated
+    # `./docker.sh -b -u` grows Docker Desktop disk without bound.
+    # Non-`--all` builder prune keeps cache mounts (pip) for the next build.
+    reclaim_build_cache
+}
+
+reclaim_build_cache() {
+    echo ""
+    echo "Reclaiming dangling images + unused build cache from this rebuild..."
+    if [[ "$RUNTIME" == "docker" ]]; then
+        $RUNTIME image prune --force >/dev/null
+        $RUNTIME builder prune --force >/dev/null
+    else
+        # Podman: dangling images + unused build/storage leftovers.
+        $RUNTIME image prune --force >/dev/null 2>&1 || true
+        $RUNTIME system prune --force >/dev/null 2>&1 || true
+    fi
 }
 
 up() {
@@ -687,6 +706,37 @@ down() {
     $RUNTIME network rm mmr_default 2>/dev/null || true
 }
 
+# Compose declares volume ``mmr_db_data``; with top-level ``name: mmr`` Docker
+# materializes it as ``mmr_mmr_db_data``. Seed/backup MUST target that live
+# volume — the unprefixed ``mmr_db_data`` is a stale sibling that can still
+# contain an old DB, which made seed_db_if_empty() skip restoring Portfolios
+# after ``docker compose down --volumes`` / ``./docker.sh -c``.
+db_data_volume() {
+    local declared="mmr_db_data"
+    local project
+    # Prefer compose project name; fall back to the yaml ``name:`` default.
+    project="$($COMPOSE -f "$BUILDDIR/docker-compose.yml" config --format json 2>/dev/null \
+        | python3 -c 'import json,sys; print(json.load(sys.stdin).get("name") or "mmr")' 2>/dev/null \
+        || true)"
+    if [[ -z "${project}" ]]; then
+        project="mmr"
+    fi
+    local prefixed="${project}_${declared}"
+    if [[ -n "${MMR_DB_VOLUME:-}" ]]; then
+        echo "$MMR_DB_VOLUME"
+        return
+    fi
+    if $RUNTIME volume inspect "$prefixed" >/dev/null 2>&1; then
+        echo "$prefixed"
+    elif $RUNTIME volume inspect "$declared" >/dev/null 2>&1; then
+        echo "$declared"
+    else
+        # Not created yet (first ``-u``) — use the compose-prefixed name so
+        # seed writes into the volume services will actually mount.
+        echo "$prefixed"
+    fi
+}
+
 backup() {
     # Snapshot the DuckDB files to the host-visible backups/ dir.
     local name="$BACKUP_NAME"
@@ -712,10 +762,12 @@ backup() {
         name="$(date +%Y-%m-%d_%H-%M-%S)"
     fi
     local dest_host="$HOME/.local/share/mmr/backups/$name"
+    local vol
+    vol="$(db_data_volume)"
     mkdir -p "$dest_host"
-    echo "Scheduler is not running — plain-copy snapshot to $dest_host/"
+    echo "Scheduler is not running — plain-copy snapshot from volume '$vol' to $dest_host/"
     $RUNTIME run --rm \
-        -v mmr_db_data:/src:ro \
+        -v "$vol":/src:ro \
         -v "$dest_host":/dst \
         alpine sh -c 'cp -v /src/*.duckdb /dst/ 2>&1; ls -lh /dst/'
     echo "Backup complete: $dest_host/"
@@ -726,7 +778,8 @@ backup() {
 # whatever the image happened to seed — the "stale seed" trap. Never overwrites a
 # volume that already has data; no-ops when there's no latest backup.
 seed_db_if_empty() {
-    local vol="mmr_db_data"
+    local vol
+    vol="$(db_data_volume)"
     local latest_link="$HOME/.local/share/mmr/backups/latest"
     local latest
     latest=$(cd -P "$latest_link" 2>/dev/null && pwd) || return 0

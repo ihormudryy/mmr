@@ -3,7 +3,7 @@ name: mmr-skill
 description: Operate the MMR algorithmic trading platform on Interactive Brokers. Trade stocks and options, manage portfolios, scan for ideas, create trade proposals with auto position sizing, manage universes, download historical data, analyze options chains, and control strategies. All operations are available via async Python helper methods.
 metadata:
   author: mmr
-  version: "2.0"
+  version: "2.2"
 ---
 
 # MMR Trading Skill
@@ -12,11 +12,57 @@ metadata:
 
 ## ⚠️ TRADING POLICY — READ THIS FIRST ⚠️
 
-**NEVER BYPASS `propose → approve` FOR ACTIONABLE TRADES.** Every new position (entry, add, rotation, cover) goes through this pipeline:
+**NEVER BYPASS `propose → approve/reject` FOR ACTIONABLE TRADES.** Every new position (entry, add, rotation, cover) goes through this pipeline:
 
 1. `MMRHelpers.propose(symbol, action, ...)` — creates a reviewable plan
-2. Inspect `sizing_result`, `portfolio_risk`, related proposals
-3. `MMRHelpers.approve(proposal_id)` — executes after review
+2. **Evaluate** (required before decide, and **mechanically enforced**):
+   - `proposal_show(N)` — sizing_result, reasoning, brackets
+   - `portfolio_risk()` — concentration, group budget, remaining capacity
+   - Quote / session sanity is enforced **server-side** at approve time
+     (`QUOTE_STALE`, `PRICE_DRIFT_EXCEEDED`, `ORDER_NOTIONAL_LIMIT`)
+3. Then **either** `approve(proposal_id)` **or** `reject(proposal_id, reason=...)` with a short written reason
+
+**The checklist is enforced, not advisory:** `approve()` refuses client-side
+with `CHECKLIST_INCOMPLETE` (no order is sent) unless `proposal_show(N)` for
+that proposal **and** a successful `portfolio_risk()` both ran within the last
+15 minutes. There is no override — run the two calls, then decide.
+`reject()` is never gated.
+
+### Paper vs live
+
+| Mode | Who may approve |
+|------|-----------------|
+| **Paper** | **You (the LLM)** may `approve` or `reject` after the checklist above. Not blind auto-approve. |
+| **Live** | **Human only** via Command Center live ceremony. SDK/LLM `approve` is refused (`LLM_LIVE_APPROVE_FORBIDDEN`). You may still `reject` PENDING proposals. Propose + review only — stop before the wire. |
+
+Blind `auto_approve` is forbidden. Do not approve without completing the evaluation checklist.
+
+### Server guardrails — refusal codes are rules, not errors
+
+Paper approvals still pass hard server-side limits. Never retry a refusal
+verbatim; each code tells you what to change:
+
+| Code | Meaning | What to do |
+|------|---------|------------|
+| `SIZING_BLOCKED` | Auto-sizing not configured on the command path | Re-propose with explicit `amount=` |
+| `DUPLICATE_PENDING` | Same symbol+action already PENDING (helper-enforced for LLM sources; server-enforced for `strategy:`) | Decide the existing proposal instead |
+| `QUOTE_STALE` | Freshest quote too old to trade on (paper bound configurable, default 30 min) | Wait for live data / market hours |
+| `PRICE_DRIFT_EXCEEDED` | Price moved too far from the proposal's reference | Reject; re-propose at current price if the thesis holds |
+| `ORDER_NOTIONAL_LIMIT` | Order exceeds `command_authority.max_order_notional` (default $25k) | Re-propose smaller |
+| `NO_LONG_TO_CLOSE` | Strategy SELL while flat — dropped by design | Nothing; working as intended |
+| `RISK_REJECTED` | Portfolio limit breached (daily loss, open orders, …) | Reduce risk before adding |
+| `PROPOSAL_EXPIRED` | Sat unapproved past ~30 min | Re-propose if still valid |
+| `CHECKLIST_INCOMPLETE` | Client-side: evaluation not done or stale | Run the listed steps, then decide |
+| `LLM_LIVE_APPROVE_FORBIDDEN` | Non-human approve on a live account | Stop — a human approves on live |
+
+If `approve()` returns **UNKNOWN/timed-out**, the order MAY be live at the
+broker: do NOT re-approve — reconcile with `orders()` / `portfolio()` and
+`proposal_show(N)` first.
+
+**Unattended paper entries should carry protection:** prefer
+`propose(..., trailing_stop_pct=2.0, tif="GTC")` (or `stop_loss=`/
+`take_profit=` for a bracket) so a filled entry is never left unguarded
+between loop cycles.
 
 **Do NOT use `MMRHelpers.buy()` / `MMRHelpers.sell()` / `MMRHelpers.cli("buy ...")` to open or modify positions based on your own judgment.** Those exist for two narrow cases only:
 - Manual human-driven single-trade CLI usage (you're not human)
@@ -30,8 +76,9 @@ The trader_service can be configured to **refuse direct buy/sell RPCs entirely**
 
 - **trader_service required**: portfolio, positions, orders, trades, account, resolve, snapshot, depth, buy, sell, cancel, cancel_all, close_all_positions, resize_positions, approve, strategies (list/enable/disable/reload), `universe_add`, `buy_option`, `sell_option`, `risk`, `scan`, `ideas` (with `--location` for international markets), `listen`, `watch`
 - **data_service required**: history_massive, history_twelvedata, history_ib
-- **massive_api_key or twelvedata_api_key** (no service needed): balance_sheet, income_statement, cash_flow, ratios, `data_download`, `ideas` (default US path), `movers`, `movers_detail`, `snapshot`, `snapshot_batch`, `forex_snapshot`, `forex_quote`, `forex_convert`, and the live ticker dashboard (`watch SYM... --source twelvedata`) — all accept `source="massive"|"twelvedata"` (`forex_*` also takes `"ib"` for trader_service routing)
-- **massive_api_key only** (no service needed): filing_section, `options_expirations`, `options_chain`, `options_snapshot`, `options_implied`, `news`, `forex_snapshot` (massive source), `forex_movers`, `stream`
+- **massive_api_key or twelvedata_api_key** (no service needed): balance_sheet, income_statement, cash_flow, ratios, `data_download`, `ideas` (default US path), `forex_snapshot`, `forex_quote`, `forex_convert`, and the live ticker dashboard (`watch SYM... --source twelvedata`) — all accept `source="massive"|"twelvedata"` (`forex_*` also takes `"ib"` for trader_service routing)
+- **Alpaca keys** (no service needed): `movers`, `movers_detail`, `news` default to Alpaca (`source="massive"|"twelvedata"` stays opt-in for movers). `snapshot` / `snapshot_batch` default to IB (trader_service, bid/ask); `source="alpaca"|"twelvedata"` gives REST quotes for US tickers only (no exchange hints, no conIds)
+- **massive_api_key only** (no service needed): filing_section, `options_expirations`, `options_chain`, `options_snapshot`, `options_implied`, `forex_snapshot` (massive source), `forex_movers`, `stream`
 - **No service needed**: universe_list, universe_show, universe_create, universe_delete, universe_remove, universe_import, status, market_hours, `data_summary`, `data_query`, `backtest`, `backtest_sweep`, `backtest_batch`, `backtests_list`, `backtests_show`, `backtests_confidence`, `backtests_archive`, `backtests_unarchive`, `sweep_run`, `sweeps_list`, `sweeps_show`, `strategies_inspect`, `strategy_create`, `strategy_deploy`, `strategy_undeploy`, `strategy_signals`, `strategy_backtest`, `propose`, `proposals`, `reject`, `session_limits`, `session_status`, `group_list`, `group_create`, `group_delete`, `group_show`, `group_add`, `group_remove`, `group_set`, `logs`
 
 ## Reality check first — `preflight()` before anything else
@@ -128,7 +175,7 @@ Most data-fetching helpers accept `source="massive"|"twelvedata"`. Quick rules:
 
 - **Default is `"massive"`** for every method that takes `source`. Keep it unless you have a reason to switch.
 - **TwelveData for fundamentals depth** — `ratios(..., source="twelvedata")` returns ~60 flat-keyed fields (valuations, margins, MRQ balance sheet, TTM cash flow, share stats, dividend history) vs Massive's ~11 TTM ratios.
-- **Massive for news + filings + bulk forex** — TwelveData has no news endpoint, no SEC filing sections, no full-market `forex_snapshot_all`, no `forex_movers`, and no L2 depth. Everything else (`snapshot`, `snapshot_batch`, `forex_snapshot`, `forex_quote`, `forex_convert`, `movers`, `movers_detail`, `ratios`, balance sheet/income/cash flow, history, ideas, live `watch` streaming) now has a TwelveData branch.
+- **Massive for filings + bulk forex** — TwelveData has no SEC filing sections, no full-market `forex_snapshot_all`, no `forex_movers`, and no L2 depth. Everything else (`snapshot`, `snapshot_batch`, `forex_snapshot`, `forex_quote`, `forex_convert`, `movers`, `movers_detail`, `ratios`, balance sheet/income/cash flow, history, ideas, live `watch` streaming) now has a TwelveData branch.
 - **REST snapshots have no bid/ask on TwelveData** — `snapshot(..., source="twelvedata")` returns OHLC + last + change_pct via `/quote`; `bid` and `ask` come back as `NaN`. To get streaming bid/ask from TwelveData, use `watch SYM... --source twelvedata` (WebSocket), which requires a TD Pro plan or higher.
 - **TwelveData for 1-min data with pre/post-market** — intraday (1/5/15/30-min) defaults to `prepost=true` returning ~960 bars/day (04:00-19:59 ET). Massive returns 24h. If you care about overnight prints, stay on Massive; if you want regular+extended session and nothing else, TwelveData is fine.
 - **Watch rate limits on TwelveData.** A Grow plan is 610 credits/min and `get_statistics` costs ~100 credits per call. Scanner's `_fetch_fundamentals` now handles this gracefully — it short-circuits remaining tickers when it sees a rate-limit error and returns partial fundamentals rather than raising. Single-shot `ratios(source="twelvedata")` in tight loops will hit the wall after ~6 calls.
@@ -219,14 +266,25 @@ Trade proposals are stored locally and auto-sized based on confidence, ATR volat
 
 | Method | Service? | Description |
 |--------|----------|-------------|
-| `MMRHelpers.propose(symbol, action, confidence=, reasoning=, group=, ...)` | No* | Create proposal with auto position sizing |
+| `MMRHelpers.propose(symbol, action, confidence=, reasoning=, group=, stop_loss=, take_profit=, trailing_stop_pct=, tif=, allow_duplicate=, ...)` | No* | Create proposal with auto position sizing, optional protective exits, and a PENDING-duplicate guard |
 | `MMRHelpers.proposals(status=, all_statuses=)` | No | List proposals |
-| `MMRHelpers.approve(proposal_id)` | **Yes** | Execute a proposal |
-| `MMRHelpers.reject(proposal_id, reason=)` | No | Reject a proposal |
+| `MMRHelpers.approve(proposal_id)` | **Yes** | Execute a proposal — enforces the evaluation checklist (`CHECKLIST_INCOMPLETE` otherwise) |
+| `MMRHelpers.reject(proposal_id, reason=)` | No | Reject a proposal (never gated) |
 | `MMRHelpers.session_status()` | No | Full sizing config + portfolio state + capacity (JSON) |
 | `MMRHelpers.session_limits()` | No | View position sizing hard limits |
 
-*Auto-sizing requires trader_service for snapshot/ATR data; gracefully degrades without it.
+*Auto-sizing requires trader_service for snapshot/ATR data; gracefully degrades without it. On the typed command path auto-sizing may be disabled — a `SIZING_BLOCKED` refusal means re-propose with an explicit `amount=`.
+
+**Protective exits on propose**: `stop_loss=` alone attaches a stop;
+`stop_loss=` + `take_profit=` become a bracket; `trailing_stop_pct=` attaches
+a trailing stop (exclusive with the fixed exits); `tif="GTC"` keeps protection
+alive beyond the session. `take_profit` alone or trailing+fixed combinations
+are refused with `INVALID_EXIT` before any CLI call.
+
+**Duplicate guard on propose**: an existing PENDING proposal for the same
+symbol+action refuses with `DUPLICATE_PENDING` (decide the existing one
+instead); `allow_duplicate=True` bypasses for a deliberate second tranche.
+The check fails open if the pending list is unreadable.
 
 **Sizing pipeline**: `base_position × risk_multiplier × confidence_scale × volatility_adjustment`. With `base_position_pct=0.02` and a $1M account, base is $20K. Volatile stocks (high ATR%) get smaller positions; stable stocks get larger ones. The `sizing_result` in proposal metadata shows the full reasoning chain.
 
@@ -279,7 +337,7 @@ If you're running a long/short book, read `net_exposure_pct` first — a $1M lon
 | Method | Service? | Description |
 |--------|----------|-------------|
 | `MMRHelpers.ideas(preset, tickers=, universe=, num=, location=, source=, ...)` | No*/Yes** | scan for trading ideas with technical scoring |
-| `MMRHelpers.news(ticker="", limit=10, detail=False)` | No* | Market news with optional sentiment (Massive only) |
+| `MMRHelpers.news(ticker="", limit=10, detail=False)` | No (needs Alpaca keys by default) | Market news. The helper has no `source` parameter: it uses the CLI default (Alpaca, no sentiment). Sentiment needs the CLI `mmr news --source polygon` until the helper gains a source parameter (phase 9). JSON items use `summary` (was `teaser`/`description`) |
 | `MMRHelpers.movers(market="stocks", losers=False, num=20, source="massive")` | No* | Top market movers |
 
 *Requires `massive_api_key` (default) or `twelvedata_api_key` (when `source="twelvedata"`). **Requires trader_service when using `location=` for international markets; `location=` overrides `source=`.
@@ -535,13 +593,17 @@ result = await MMRHelpers.ideas("momentum", location="STK.AU.ASX", tickers=["BHP
 for idea in result["data"]:
     print(f'{idea["ticker"]}: {idea["change_pct"]:+.2f}% score={idea["score"]}')
 
-# Create a proposal with auto position sizing
+# Create a proposal with auto position sizing and a protective trailing stop
 result = await MMRHelpers.propose("AAPL", "BUY", confidence=0.7,
-    reasoning="Breakout above 200-day MA on high volume")
+    reasoning="Breakout above 200-day MA on high volume",
+    trailing_stop_pct=2.0, tif="GTC")
 emit(result)
 
-# Approve a proposal (executes the trade)
-result = await MMRHelpers.approve(42)
+# Evaluate, then approve (the checklist is enforced — approve refuses
+# CHECKLIST_INCOMPLETE without these two fresh calls)
+detail = await MMRHelpers.proposal_show(42)
+risk = await MMRHelpers.portfolio_risk()
+result = await MMRHelpers.approve(42)   # or reject(42, reason="…")
 emit(result)
 ```
 
@@ -562,17 +624,21 @@ risk = await MMRHelpers.portfolio_risk()       # HHI, group budgets, warnings
 session = await MMRHelpers.session_status()    # remaining capacity
 ideas = await MMRHelpers.ideas("momentum", num=10)  # JSON dict
 
-# 3. PROPOSE — auto-sized, group-tagged, never auto-executes
+# 3. PROPOSE — auto-sized, group-tagged, protected, never auto-executes
 result = await MMRHelpers.propose("AAPL", "BUY", confidence=0.8,
     reasoning="Strong momentum, RSI 65, above 200-day MA",
-    group="tech", source="llm")
+    group="tech", source="llm", trailing_stop_pct=2.0, tif="GTC")
 # result["data"]["sizing_result"]["reasoning"] shows full ATR pipeline
 # result["data"]["proposal_id"] → 42
+# A PENDING duplicate for the same symbol+side refuses DUPLICATE_PENDING.
 
-# 4. REVIEW — check risk before approving
+# 4. EVALUATE → DECIDE — enforced checklist, then approve or reject
+detail = await MMRHelpers.proposal_show(42)
 risk = await MMRHelpers.portfolio_risk()
 if not risk["data"]["warnings"]:
     result = await MMRHelpers.approve(42)
+else:
+    result = await MMRHelpers.reject(42, reason="risk warnings present")
 ```
 
 Key for loop efficiency: `portfolio_snapshot()` and `portfolio_diff()` return small JSON (~500 tokens) vs `portfolio()` (~1000 tokens JSON). Use snapshot/diff for every cycle, full portfolio only when investigating.

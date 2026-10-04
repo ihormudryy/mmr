@@ -887,14 +887,460 @@ function ccPositionForClose(position) {
 
 /* ---- Strategy params drawer open (Apply/Cancel wiring is below, guarded
  * with the rest of the cc-* static elements) ---- */
-function ccOpenStrategyParamsDrawer(strategy) {
+function ccEscAttr(value) {
+  return String(value ?? '')
+    .replace(/&/g, '&amp;')
+    .replace(/"/g, '&quot;')
+    .replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;');
+}
+
+function ccRenderStrategyParamsForm(form, {params, tunables}) {
+  const current = (params && typeof params === 'object') ? params : {};
+  const defaults = (tunables && typeof tunables === 'object') ? tunables : {};
+  const keys = [...new Set([...Object.keys(defaults), ...Object.keys(current)])]
+    .filter((k) => k && !String(k).startsWith('_'))
+    .sort();
+  if (!keys.length) {
+    form.innerHTML = '<p class="cc-hint">No tunable parameters for this strategy.</p>';
+    return;
+  }
+  form.innerHTML = keys.map((key) => {
+    const value = Object.prototype.hasOwnProperty.call(current, key)
+      ? current[key]
+      : defaults[key];
+    const shown = value == null ? '' : String(value);
+    return `<label>${ccEscAttr(key)}`
+      + `<input name="${ccEscAttr(key)}" value="${ccEscAttr(shown)}" `
+      + `autocomplete="off" spellcheck="false" /></label>`;
+  }).join('');
+}
+
+async function ccOpenStrategyParamsDrawer(strategy) {
   const d = document.getElementById('cc-strategy-params-dialog');
   if (!d) return;
   const name = ccStrategyName(strategy);
+  const form = document.getElementById('cc-strategy-params-form');
   document.getElementById('cc-params-strategy-name').textContent = name;
   d.dataset.strategyName = name;
   d.dataset.controlRevision = strategy.control_revision ?? '';
+  if (form) {
+    form.innerHTML = '<p class="cc-hint">Loading parameters…</p>';
+  }
   d.hidden = false;
+
+  let editor = null;
+  try {
+    const response = await fetch(
+      `/api/strategies/${encodeURIComponent(name)}/params`,
+      {credentials: 'same-origin', headers: {Accept: 'application/json'}},
+    );
+    if (response.ok) {
+      editor = await response.json();
+    } else if (form) {
+      const detail = await response.json().catch(() => ({}));
+      form.innerHTML = `<p class="cc-hint">${ccEscAttr(
+        detail.detail || `Could not load params (${response.status})`)}</p>`;
+    }
+  } catch (err) {
+    if (form) {
+      form.innerHTML = `<p class="cc-hint">${ccEscAttr(
+        err && err.message ? err.message : 'Could not load params')}</p>`;
+    }
+  }
+
+  if (!form || !editor) {
+    // Fall back to whatever the journal/strategy row already carries.
+    if (form && strategy && strategy.params) {
+      ccRenderStrategyParamsForm(form, {
+        params: strategy.params,
+        tunables: strategy.tunables || {},
+      });
+    }
+    return;
+  }
+  // Prefer live/YAML params; overlay any fresher row payload from the store.
+  const rowParams = (strategy && strategy.params && typeof strategy.params === 'object')
+    ? strategy.params : {};
+  ccRenderStrategyParamsForm(form, {
+    params: Object.assign({}, editor.params || {}, rowParams),
+    tunables: editor.tunables || {},
+  });
+}
+
+/* ===================== Allocation unsigned payload builder (Scaling tab) ===
+ * Offline prepare helper: builds the unsigned JSON that
+ * `mmr research allocation sign` expects. Never signs in-browser. */
+
+const ALLOCATION_STAGE_CEILINGS = Object.freeze({
+  CANARY: 0.06,
+  SCALE_1: 0.09,
+  SCALE_2: 0.135,
+  STEADY: 0.15,
+});
+
+function ccIsoUtc(date) {
+  return new Date(date).toISOString().replace(/\.\d{3}Z$/, 'Z');
+}
+
+function ccBuildUnsignedAllocationPayload(fields) {
+  const strategyId = String(fields.strategy_id || '').trim();
+  const accountId = String(fields.account_id || '').trim();
+  const accountMode = String(fields.account_mode || '').trim().toLowerCase();
+  const stage = String(fields.stage || '').trim().toUpperCase();
+  const artifact = String(fields.artifact_digest || '').trim();
+  const allowlist = String(fields.allowlist_digest || '').trim();
+  const ruleset = String(fields.ruleset_digest || '').trim();
+  const evidence = String(fields.evidence_digest || '').trim();
+  const operator = String(fields.operator || '').trim();
+  const reason = String(fields.reason || '').trim();
+  const publicKeyId = String(fields.public_key_id || '').trim();
+  const ceiling = Number(fields.max_gross_allocation);
+  const ttlDays = Number(fields.ttl_days);
+  const errors = [];
+
+  if (!strategyId) errors.push('strategy_id is required');
+  if (!accountId) errors.push('account_id is required');
+  if (accountMode !== 'paper' && accountMode !== 'live') {
+    errors.push('account_mode must be paper or live');
+  }
+  if (!(stage in ALLOCATION_STAGE_CEILINGS)) {
+    errors.push('stage must be CANARY, SCALE_1, SCALE_2, or STEADY');
+  }
+  if (!Number.isFinite(ceiling) || ceiling <= 0) {
+    errors.push('max_gross_allocation must be a positive fraction');
+  } else if (stage in ALLOCATION_STAGE_CEILINGS
+             && ceiling > ALLOCATION_STAGE_CEILINGS[stage] + 1e-12) {
+    errors.push(
+      `max_gross_allocation ${ceiling} exceeds ${stage} ceiling `
+      + `${ALLOCATION_STAGE_CEILINGS[stage]}`);
+  }
+  if (!Number.isFinite(ttlDays) || ttlDays < 1) {
+    errors.push('ttl_days must be >= 1');
+  }
+  if (!artifact) errors.push('artifact_digest is required');
+  if (!allowlist) errors.push('allowlist_digest is required');
+  if (!ruleset) errors.push('ruleset_digest is required');
+  if (!evidence) errors.push('evidence_digest is required');
+  if (!operator) errors.push('operator is required');
+  if (!reason) errors.push('reason is required');
+  if (!publicKeyId) errors.push('public_key_id is required');
+
+  if (errors.length) {
+    return { ok: false, errors, payload: null };
+  }
+
+  const issued = fields.issued_at
+    ? new Date(fields.issued_at)
+    : new Date();
+  if (Number.isNaN(issued.getTime())) {
+    return { ok: false, errors: ['issued_at is not a valid datetime'], payload: null };
+  }
+  const expires = new Date(issued.getTime() + ttlDays * 24 * 60 * 60 * 1000);
+  return {
+    ok: true,
+    errors: [],
+    payload: {
+      strategy_id: strategyId,
+      account_id: accountId,
+      account_mode: accountMode,
+      stage,
+      artifact_digest: artifact,
+      allowlist_digest: allowlist,
+      ruleset_digest: ruleset,
+      max_gross_allocation: ceiling,
+      evidence_digest: evidence,
+      issued_at: ccIsoUtc(issued),
+      expires_at: ccIsoUtc(expires),
+      operator,
+      reason,
+      public_key_id: publicKeyId,
+    },
+  };
+}
+
+function ccScalingPayloadFieldsFromForm() {
+  const custom = (document.getElementById('scaling-payload-strategy-custom')?.value || '')
+      .trim();
+  const selected = (document.getElementById('scaling-payload-strategy')?.value || '')
+      .trim();
+  return {
+    strategy_id: custom || selected,
+    account_id: document.getElementById('scaling-payload-account')?.value,
+    account_mode: document.getElementById('scaling-payload-mode')?.value,
+    stage: document.getElementById('scaling-payload-stage')?.value,
+    max_gross_allocation: document.getElementById('scaling-payload-ceiling')?.value,
+    ttl_days: document.getElementById('scaling-payload-ttl')?.value,
+    artifact_digest: document.getElementById('scaling-payload-artifact')?.value,
+    allowlist_digest: document.getElementById('scaling-payload-allowlist')?.value,
+    ruleset_digest: document.getElementById('scaling-payload-ruleset')?.value,
+    evidence_digest: document.getElementById('scaling-payload-evidence')?.value,
+    operator: document.getElementById('scaling-payload-operator')?.value,
+    reason: document.getElementById('scaling-payload-reason')?.value,
+    public_key_id: document.getElementById('scaling-payload-key-id')?.value,
+  };
+}
+
+function ccShowScalingPayloadError(message) {
+  const el = document.getElementById('scaling-payload-error');
+  if (!el) return;
+  if (!message) {
+    el.hidden = true;
+    el.textContent = '';
+    return;
+  }
+  el.hidden = false;
+  el.textContent = message;
+}
+
+function ccSetScalingPayloadOutput(text) {
+  const out = document.getElementById('scaling-payload-out');
+  if (out) out.value = text || '';
+  const has = !!(text && text.trim());
+  const copyBtn = document.getElementById('scaling-payload-copy');
+  const dlBtn = document.getElementById('scaling-payload-download');
+  if (copyBtn) copyBtn.disabled = !has;
+  if (dlBtn) dlBtn.disabled = !has;
+}
+
+function ccGenerateScalingPayload() {
+  const result = ccBuildUnsignedAllocationPayload(ccScalingPayloadFieldsFromForm());
+  if (!result.ok) {
+    ccShowScalingPayloadError(result.errors.join('; '));
+    ccSetScalingPayloadOutput('');
+    ccToast('error', 'Fix the form fields before generating JSON');
+    return null;
+  }
+  ccShowScalingPayloadError('');
+  const text = `${JSON.stringify(result.payload, null, 2)}\n`;
+  ccSetScalingPayloadOutput(text);
+  try {
+    if (result.payload.operator) {
+      localStorage.setItem(ALLOCATION_OPERATOR_STORAGE_KEY, result.payload.operator);
+    }
+  } catch (_) { /* ignore */ }
+  ccToast('ok', 'Unsigned allocation JSON ready — sign offline, then Activate');
+  return result.payload;
+}
+
+async function ccCopyScalingPayload() {
+  const text = (document.getElementById('scaling-payload-out')?.value || '').trim();
+  if (!text) {
+    ccToast('error', 'Generate JSON first');
+    return;
+  }
+  try {
+    if (navigator.clipboard && navigator.clipboard.writeText) {
+      await navigator.clipboard.writeText(text);
+    } else {
+      const out = document.getElementById('scaling-payload-out');
+      out.focus();
+      out.select();
+      document.execCommand('copy');
+    }
+    ccToast('ok', 'Unsigned JSON copied');
+  } catch (err) {
+    ccToast('error', `Copy failed: ${err.message || err}`);
+  }
+}
+
+function ccDownloadScalingPayload() {
+  const text = (document.getElementById('scaling-payload-out')?.value || '').trim();
+  if (!text) {
+    ccToast('error', 'Generate JSON first');
+    return;
+  }
+  const blob = new Blob([text.endsWith('\n') ? text : `${text}\n`], {
+    type: 'application/json',
+  });
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement('a');
+  a.href = url;
+  a.download = 'allocation_payload.json';
+  document.body.appendChild(a);
+  a.click();
+  a.remove();
+  URL.revokeObjectURL(url);
+  ccToast('ok', 'Downloaded allocation_payload.json');
+}
+
+const ALLOCATION_OPERATOR_STORAGE_KEY = 'mmr.cc.allocation.operator';
+
+function ccSetFormValueIfEmpty(id, value) {
+  const el = document.getElementById(id);
+  if (!el) return false;
+  const next = value == null ? '' : String(value).trim();
+  if (!next) return false;
+  if ((el.value || '').trim()) return false;
+  el.value = next;
+  return true;
+}
+
+function ccLatestScalingAuthority(view) {
+  const authorities = (view && view.scaling && view.scaling.authorities) || [];
+  if (!authorities.length) return null;
+  return [...authorities].sort(
+    (a, b) => Number(a.entity_revision || 0) - Number(b.entity_revision || 0),
+  ).at(-1) || null;
+}
+
+function ccPrefillScalingPayloadForm(view) {
+  const v = view || _view() || {};
+  const account = (v.accounts && v.accounts[0]) || {};
+  const accountId = account.account_id || account.account || account.id
+    || (document.getElementById('account-id')?.textContent || '').trim();
+  const mode = (ccDashboardAccountMode()
+    || account.account_mode
+    || account.mode
+    || '').toLowerCase();
+  const scaling = v.scaling || {};
+  const pa = v.paper_automation || {};
+  const authority = ccLatestScalingAuthority(v);
+
+  const accountEl = document.getElementById('scaling-payload-account');
+  if (accountEl && accountId && accountId !== '—') accountEl.value = accountId;
+  const modeEl = document.getElementById('scaling-payload-mode');
+  if (modeEl && (mode === 'paper' || mode === 'live')) modeEl.value = mode;
+  const stageEl = document.getElementById('scaling-payload-stage');
+  if (stageEl && scaling.stage && scaling.stage in ALLOCATION_STAGE_CEILINGS) {
+    stageEl.value = scaling.stage;
+  }
+  const ceilingEl = document.getElementById('scaling-payload-ceiling');
+  if (ceilingEl && stageEl) {
+    const stage = stageEl.value;
+    if (stage in ALLOCATION_STAGE_CEILINGS) {
+      ceilingEl.value = String(ALLOCATION_STAGE_CEILINGS[stage]);
+      ceilingEl.max = String(ALLOCATION_STAGE_CEILINGS[stage]);
+    }
+  }
+  const strategySelect = document.getElementById('scaling-payload-strategy');
+  const strategyWant = String(
+    scaling.strategy_id || pa.strategy_name || authority?.strategy_id || '',
+  ).trim();
+  if (strategySelect && strategyWant) {
+    const has = [...strategySelect.options].some((o) => o.value === strategyWant);
+    if (has) strategySelect.value = strategyWant;
+    else {
+      const custom = document.getElementById('scaling-payload-strategy-custom');
+      if (custom && !custom.value) custom.value = strategyWant;
+    }
+  }
+
+  // Digests + key id: paper automation attestation first, then prior authority.
+  const digestSources = [pa, authority || {}];
+  for (const src of digestSources) {
+    ccSetFormValueIfEmpty('scaling-payload-artifact',
+      src.artifact_digest || src.artifact_id);
+    ccSetFormValueIfEmpty('scaling-payload-allowlist', src.allowlist_digest);
+    ccSetFormValueIfEmpty('scaling-payload-ruleset', src.ruleset_digest);
+    ccSetFormValueIfEmpty('scaling-payload-evidence', src.evidence_digest);
+    ccSetFormValueIfEmpty('scaling-payload-key-id', src.public_key_id);
+    ccSetFormValueIfEmpty('scaling-payload-operator', src.operator);
+  }
+
+  let storedOperator = '';
+  try {
+    storedOperator = localStorage.getItem(ALLOCATION_OPERATOR_STORAGE_KEY) || '';
+  } catch (_) { /* private mode / blocked storage */ }
+  ccSetFormValueIfEmpty('scaling-payload-operator', storedOperator);
+
+  const reasonEl = document.getElementById('scaling-payload-reason');
+  const activateReason = document.getElementById('scaling-reason');
+  if (reasonEl && !reasonEl.value && activateReason && activateReason.value) {
+    reasonEl.value = activateReason.value;
+  }
+  if (reasonEl && !reasonEl.value) {
+    const stage = (stageEl && stageEl.value) || 'SCALE_1';
+    const strategy = (
+      document.getElementById('scaling-payload-strategy-custom')?.value
+      || strategySelect?.value
+      || strategyWant
+      || 'strategy'
+    ).trim();
+    reasonEl.value = `Scale to ${stage} for ${strategy}`;
+  }
+
+  const stillMissing = [];
+  for (const [id, label] of [
+    ['scaling-payload-artifact', 'artifact_digest'],
+    ['scaling-payload-allowlist', 'allowlist_digest'],
+    ['scaling-payload-ruleset', 'ruleset_digest'],
+    ['scaling-payload-evidence', 'evidence_digest'],
+    ['scaling-payload-operator', 'operator'],
+    ['scaling-payload-key-id', 'public_key_id'],
+  ]) {
+    const el = document.getElementById(id);
+    if (!el || !(el.value || '').trim()) stillMissing.push(label);
+  }
+  if (stillMissing.length) {
+    ccToast(
+      'error',
+      `Prefill incomplete — still need: ${stillMissing.join(', ')}. `
+      + 'evidence_digest comes from `mmr research allocation prepare` '
+      + '(ScalingGate), not the research attestation.',
+    );
+  } else {
+    ccToast('ok', 'Prefill complete from paper artifact / allocation authority');
+  }
+}
+
+function ccSyncScalingStageCeiling() {
+  const stageEl = document.getElementById('scaling-payload-stage');
+  const ceilingEl = document.getElementById('scaling-payload-ceiling');
+  if (!stageEl || !ceilingEl) return;
+  const stage = stageEl.value;
+  const max = ALLOCATION_STAGE_CEILINGS[stage];
+  if (!Number.isFinite(max)) return;
+  ceilingEl.max = String(max);
+  const current = Number(ceilingEl.value);
+  if (!Number.isFinite(current) || current > max || current <= 0) {
+    ceilingEl.value = String(max);
+  }
+}
+
+function ccPopulateScalingStrategySelect(view) {
+  const select = document.getElementById('scaling-payload-strategy');
+  if (!select) return;
+  const v = view || _view() || {};
+  const live = ((v.strategies) || []).map((s) => {
+    if (typeof s === 'string') return s;
+    return s.name || s.strategy_name || s.entity_id || '';
+  }).filter(Boolean);
+  const deployed = (v.deployed_strategy_names) || [];
+  const names = [...new Set([...live, ...deployed].map(String))].sort();
+  const previous = select.value;
+  select.replaceChildren();
+  const blank = document.createElement('option');
+  blank.value = '';
+  blank.textContent = 'Select a strategy…';
+  select.appendChild(blank);
+  for (const n of names) {
+    const opt = document.createElement('option');
+    opt.value = n;
+    opt.textContent = n;
+    select.appendChild(opt);
+  }
+  if (previous && names.includes(previous)) select.value = previous;
+}
+
+function ccInitScalingPayloadBuilder() {
+  const builder = document.getElementById('scaling-payload-builder');
+  if (!builder || builder.dataset.wired === '1') return;
+  builder.dataset.wired = '1';
+  document.getElementById('scaling-payload-generate')
+      ?.addEventListener('click', () => { ccGenerateScalingPayload(); });
+  document.getElementById('scaling-payload-copy')
+      ?.addEventListener('click', () => { ccCopyScalingPayload(); });
+  document.getElementById('scaling-payload-download')
+      ?.addEventListener('click', () => { ccDownloadScalingPayload(); });
+  document.getElementById('scaling-payload-prefill')
+      ?.addEventListener('click', () => {
+        ccPrefillScalingPayloadForm();
+        ccToast('ok', 'Form prefilled from dashboard where available');
+      });
+  document.getElementById('scaling-payload-stage')
+      ?.addEventListener('change', () => { ccSyncScalingStageCeiling(); });
+  ccSyncScalingStageCeiling();
 }
 
 /* ===================== Allocation activate / suspend (Scaling tab) =========
@@ -1048,6 +1494,7 @@ function init(options) {
   _config = opts.config || {};
   globalThis.ccOpenResearchProposal = ccOpenResearchProposal;
   setInterval(ccCheckPendingCommands, 400);
+  ccInitScalingPayloadBuilder();
 }
 
 globalThis.CCCommands = {
@@ -1078,6 +1525,7 @@ globalThis.CCCommands = {
   updateStrategyParams: ccUpdateStrategyParams,
   setPause: ccSetPause,
   openStrategyParamsDrawer: ccOpenStrategyParamsDrawer,
+  renderStrategyParamsForm: ccRenderStrategyParamsForm,
   positionForClose: ccPositionForClose,
   activateAllocation: ccActivateAllocation,
   suspendAllocation: ccSuspendAllocation,
@@ -1087,6 +1535,12 @@ globalThis.CCCommands = {
   reconcileCommand: ccReconcileCommand,
   resolveCommand: ccResolveCommand,
   dashboardAccountMode: ccDashboardAccountMode,
+  buildUnsignedAllocationPayload: ccBuildUnsignedAllocationPayload,
+  allocationStageCeilings: ALLOCATION_STAGE_CEILINGS,
+  populateScalingStrategySelect: ccPopulateScalingStrategySelect,
+  prefillScalingPayloadForm: ccPrefillScalingPayloadForm,
+  initScalingPayloadBuilder: ccInitScalingPayloadBuilder,
+  generateScalingPayload: ccGenerateScalingPayload,
   paperAutomationAllowed: ccPaperAutomationAllowed,
   isLive: ccIsLive,
   isPaper: ccIsPaper,

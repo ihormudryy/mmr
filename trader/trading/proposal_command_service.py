@@ -7,7 +7,7 @@ import logging
 from dataclasses import dataclass, field, replace
 from typing import Any, Callable, Optional, Protocol
 
-from trader.data.domain_journal import DomainJournal
+from trader.data.domain_journal import DomainJournal, EventIdentityConflict
 from trader.data.proposal_repository import ProposalDraft, ProposalRecord, ProposalRepository
 from trader.trading.trading_control import PauseStateUnavailable, TradingPausedError
 
@@ -140,6 +140,26 @@ class ProposalCommandService:
         if not instrument_check.approved:
             raise ProposalCreationRefused("TRADING_FILTER_REJECTED", instrument_check.reason)
 
+        # Long-only bridge semantics (signal→propose spec): a strategy-sourced
+        # SELL only ever *closes* a held long — "ignored when flat". Enforce it
+        # here so a flat SELL is dropped at creation rather than becoming an
+        # exposure-increasing short proposal downstream. Only refuse when the
+        # position authority is present AND affirmatively reports flat: a
+        # missing authority must not block a legitimate exit (failing the other
+        # way would prevent risk reduction), and non-strategy (human/LLM)
+        # sources may intentionally open shorts.
+        if (
+            request.action == "SELL"
+            and source.startswith("strategy:")
+            and self._positions is not None
+            and self._positions.reducible_quantity(self._account_id, request.conid) <= 0
+        ):
+            raise ProposalCreationRefused(
+                "NO_LONG_TO_CLOSE",
+                f"strategy SELL for conId {request.conid} while flat is ignored "
+                f"(long-only bridge semantics)",
+            )
+
         if self._controls is not None and not self._is_reducing_close(request):
             try:
                 self._controls.require_unpaused(self._account_id)
@@ -216,12 +236,21 @@ class ProposalCommandService:
                 )
             written.append(self._repository.insert_pending_in_tx(conn, draft, revision))
 
-        self._journal.mutate(
-            self._journal.connect(),
-            self._repository.mutation_for(predicted, correlation_id),
-            write_materialized,
-            event_id=f"proposal:{proposal_id}:1",
-        )
+        try:
+            self._journal.mutate(
+                self._journal.connect(),
+                self._repository.mutation_for(predicted, correlation_id),
+                write_materialized,
+                event_id=f"proposal:{proposal_id}:1",
+            )
+        except EventIdentityConflict as exc:
+            # Sequence lag / recycled proposal ids must refuse cleanly so the
+            # coordinator REJECTS the command instead of parking OUTCOME_UNKNOWN
+            # (which blocks resume_trading via reconciliation_safe).
+            raise ProposalCreationRefused(
+                "PROPOSAL_IDENTITY_CONFLICT",
+                f"proposal event identity conflict for id {proposal_id}: {exc}",
+            ) from exc
         return written[0]
 
     def reject_proposal(

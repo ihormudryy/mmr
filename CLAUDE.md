@@ -17,7 +17,14 @@ MMR (Make Me Rich) is a Python-based algorithmic trading platform for Interactiv
 
 **Fail loudly, not silently**: When an IB API call fails (scanner error 162, market data not subscribed, contract not found), surface the error to the caller. Don't swallow exceptions and return empty results — the user needs to know *why* something failed so they can fix it (subscribe to market data, use a different location code, etc.).
 
-**Massive first, IB fallback**: For US markets, Massive.com (Polygon.io) is the primary data source for ideas/movers when the plan includes snapshots (Starter+). TwelveData is the default for cheap US history/quotes (`default_data_source: twelvedata`). International markets (ASX, TSE, SEHK, etc.) use IB. Don't use Yahoo Finance. Bare `ideas` / `movers` always default to Massive (they do **not** inherit `default_data_source`); if Massive snapshots aren't entitled (Stocks Basic), the scanner falls back to TwelveData quotes on a small liquid US set (or `--tickers` / `--universe`).
+**Free providers first, IB fallback**:
+
+- **Default sources.** Alpaca (free Basic plan) is the default for US history (SIP feed, split-adjusted), `movers` and `news`.
+- **Quotes.** Alpaca can serve REST quotes (IEX feed) for `snapshot` / `snapshot-batch`. Default: `data_providers.quotes`, else `MMR_DEFAULT_DATA_SOURCE` if it names a quote source, else a YAML `default_data_source` of `twelvedata` or `ib`, else IB. The template's `default_data_source: alpaca` is a history setting and does not switch snapshots; opt in with `data_providers.quotes: alpaca`. REST sources cover US listings only, so `--exchange` / `--currency` need IB.
+- **Opt-in sources.** Massive.com (Polygon.io) and TwelveData stay available with `--source massive|twelvedata`.
+- **Inheritance.** Only history inherits `default_data_source`. `movers`, `news` and REST quotes never do (the registry's REST-quotes default is Alpaca; the CLI snapshot rule above decides what `snapshot` uses). Change their default with `data_providers.movers` / `data_providers.news`.
+- **Ideas.** Bare `ideas` still defaults to Massive until phase 3b (it does **not** inherit `default_data_source`). If Massive snapshots aren't entitled (Stocks Basic), the scanner falls back to TwelveData quotes on a small liquid US set (or `--tickers` / `--universe`).
+- **International markets** (ASX, TSE, SEHK, etc.) use IB. Don't use Yahoo Finance.
 
 **No sentiment analysis on IB path**: IB's news API doesn't provide sentiment scoring. On the Massive path, sentiment comes from Polygon's insights. On the IB path, we only show the headline — no fake or estimated sentiment.
 
@@ -45,7 +52,8 @@ trader.strategy_service ──► StrategyRuntime (strategy_runtime.py)
 
 trader.data_service ──► DataService (data_service.py)
                           ├── Concurrent history downloads
-                          ├── MassiveHistoryWorker, TwelveDataHistoryWorker, IBHistoryWorker
+                          ├── REST history via ProviderRegistry (trader/data_providers/): AlpacaHistoryProvider (default), MassiveHistoryWorker, TwelveDataHistoryWorker
+                          ├── IBHistoryWorker (IB history, separate contract-based path)
                           └── ZMQ RPC Server (42003)
 
 web/app.py (dashboard) ──► typed query/command + strategy typed ports
@@ -112,7 +120,7 @@ Additional patterns:
 
 **Idea scanner**: Raises `IdeaScannerError` (not an empty DataFrame) on IB discovery failure or when every ticker fails to resolve. Massive movers/snapshots require Stocks Starter+; TwelveData `/market_movers` requires Pro+. Entitlement errors fall back to TwelveData quote scans (liquid US set or `--tickers`/`--universe`) with a yellow CLI notice. Batch IB ops use `asyncio.gather` / `ThreadPoolExecutor` — keep DuckDB warm via `data refresh` so IB historical isn't on the hot path.
 
-**Data refresh loop** (`trader/mmr_cli.py:_handle_data_refresh` + `config_defaults/data_refresh.yaml`): Declarative jobs `{universe, source?, bar_size, days, force?}` keep universes' OHLCV current in the local DuckDB. Pycron owns the schedule (`data_refresh_us` and `data_refresh_asx` cron entries in `pycron.yaml`); the YAML owns *what* to fetch. Source auto-detects from the universe's dominant exchange when omitted (US → twelvedata; else IB). Incremental by default — only missing date ranges are fetched — so a daily cron run costs ~seconds for fresh windows. `mmr data status` shows per-(job, bar_size) coverage and stale-days, color-coded; `mmr data refresh JOB [JOB ...]` runs jobs ad-hoc. Failures in one job are isolated (per-job result, batch keeps going) and don't take down the cron entry.
+**Data refresh loop** (`trader/mmr_cli.py:_handle_data_refresh` + `config_defaults/data_refresh.yaml`): Declarative jobs `{universe, source?, bar_size, days, force?}` keep universes' OHLCV current in the local DuckDB. Pycron owns the schedule (`data_refresh_us` and `data_refresh_asx` cron entries in `pycron.yaml`); the YAML owns *what* to fetch. Source auto-detects from the universe's dominant exchange when omitted (US → alpaca; else IB). A US job without Alpaca keys fails loudly (names `ALPACA_API_KEY_ID`); there is no silent fallback. Incremental by default — only missing date ranges are fetched — so a daily cron run costs ~seconds for fresh windows. `mmr data status` shows per-(job, bar_size) coverage and stale-days, color-coded; `mmr data refresh JOB [JOB ...]` runs jobs ad-hoc. Failures in one job are isolated (per-job result, batch keeps going) and don't take down the cron entry.
 
 ## Project Structure
 
@@ -149,6 +157,7 @@ mmr/
 │   │   ├── exceptions.py      # TraderException, TraderConnectionException
 │   │   ├── contract_sink.py
 │   │   └── dataclass_cache.py # Cache with reactive update notifications
+│   ├── data_providers/        # Provider registry + Alpaca/Massive/TwelveData history providers
 │   ├── data/
 │   │   ├── store.py           # Abstract DataStore/ObjectStore + DateRange
 │   │   ├── duckdb_store.py    # DuckDB implementations (DuckDBDataStore, DuckDBObjectStore)
@@ -343,7 +352,9 @@ backtests archive 42 43                     # hide from default list (reversible
 backtests unarchive 42                      # restore
 backtests delete 42                         # permanent
 backtests help                              # metric reference
-snapshot AMD                 # Price snapshot
+snapshot AMD                 # Price snapshot (default IB; --source alpaca|twelvedata for REST, US only)
+snapshot AAPL --source alpaca               # REST quote via Alpaca (IEX feed), US listings only; --exchange/--currency need IB
+snapshot-batch AAPL MSFT --source alpaca    # Batch quotes; rows have feed + error, unknown symbols reported per symbol
 depth AAPL                   # Level 2 order book (bids/asks + PNG chart)
 depth AAPL --rows 10         # More price levels (max depends on subscription)
 depth BHP --exchange ASX --currency AUD  # International depth
@@ -358,6 +369,7 @@ history list --bar_size "1 day"  # Filter by bar size
 history massive --symbol AAPL --bar_size "1 day" --prev_days 30
 history massive --universe portfolio --bar_size "1 day" --prev_days 30
 history ib --symbol AAPL --universe portfolio --bar_size "1 min" --prev_days 5
+history alpaca --symbol AAPL --bar_size "1 day" --prev_days 30
 stream AAPL MSFT AMD         # Stream from Massive.com
 stream AAPL --trades         # Stream trades instead of aggs
 stream EURUSD GBPUSD --feed forex           # Forex 1-min aggs
@@ -379,14 +391,15 @@ options snapshot O:AAPL260320C00250000                # Single contract detail
 options implied AAPL -e 2026-03-20                    # Probability distribution
 options buy AAPL -e 2026-03-20 -s 250 -r C -q 5 --market
 options sell AAPL -e 2026-03-20 -s 250 -r C -q 5 --limit 3.50
-news                                         # General market news
+news                                         # General market news (default Alpaca)
 news AAPL                                    # News for a ticker
 news AAPL --limit 20                         # More articles
-news AAPL --source benzinga                  # Benzinga source
-news AAPL --detail                           # Full details + sentiment
-movers                           # Defaults to Massive; same entitlement rules as ideas
-movers --market crypto           # Crypto gainers
-movers --market indices          # Index gainers
+news AAPL --source polygon                   # Massive (Polygon) news; --source benzinga for Benzinga
+news AAPL --detail                           # Full details; sentiment only with --source polygon
+movers                           # Default Alpaca; drops names under --min-price (default 1.0) and warrants/rights/units
+movers --min-price 5             # Stricter price floor
+movers --market crypto           # Crypto gainers (Alpaca)
+movers --market indices --source massive   # Indices/options/futures need Massive
 movers --losers                  # Stock losers
 movers --market crypto --losers  # Crypto losers
 scan                             # Top gainers (default preset)
@@ -515,18 +528,25 @@ CLI/SDK `resolve()` uses typed `discover_instrument` / `resolve_instrument` (421
 User configs live in `~/.config/mmr/`. On first run, bundled defaults from `config_defaults/` are copied there automatically (`container.ensure_config_dir()`). The `TRADER_CONFIG` env var overrides the config file path.
 
 **`~/.config/mmr/trader.yaml`**: IB connection (address, port, client IDs, account), DuckDB path, ZMQ port assignments. Env vars override config values (uppercased param name). Two CLI-only knobs the Container doesn't otherwise know about:
-- `default_data_source` (default `twelvedata`) — default `--source` for history download, snapshot, watch, financials, fx where that choice is valid. **`ideas` and `movers` always default to `massive`** (Massive-first; TD movers is Pro+-gated). Override the global default per-shell with `MMR_DEFAULT_DATA_SOURCE`.
+- `default_data_source` (default `alpaca`) — default `--source` for history download, watch, financials, fx where that choice is valid (watch, financials and fx read it through `_src_default`). `snapshot` / `snapshot-batch` are special: Default: `data_providers.quotes`, else `MMR_DEFAULT_DATA_SOURCE` if it names a quote source, else a YAML `default_data_source` of `twelvedata` or `ib`, else IB. The template's `default_data_source: alpaca` is a history setting and does not switch snapshots; opt in with `data_providers.quotes: alpaca`. REST sources cover US listings only; `--exchange` / `--currency` need IB. For `data download` the order is: explicit `data_providers.history` → `MMR_DEFAULT_DATA_SOURCE` / `default_data_source` (`ib` is honoured) → registry default `alpaca`. **`movers` and `news` never inherit it** (set `data_providers.movers` / `data_providers.news` instead; defaults `alpaca`). **`ideas` still always defaults to `massive`** until phase 3b. Override the global default per-shell with `MMR_DEFAULT_DATA_SOURCE`.
+  - **Output changes (phase 3a):** news items use `summary` (was `teaser` / `description`); Benzinga `tags` are no longer in `news_detail`; batch snapshot rows (REST sources) gain `feed` and `error`.
+  - **Stock `movers` returns fewer rows than `--num`** after filtering (on 2026-10-02, 16 of Alpaca's 50 top gainers survived). `movers --detail` on Alpaca shows names and headlines but no ratios, market cap or description until phase 4 (`--source massive` keeps them).
+  - Alpaca movers intraday check (weekday, `last_updated` age < 30 min) is not yet confirmed; see `docs/OPERATIONAL_STATE.md`.
 - `equity_decimation` (default `daily`) — how aggressively backtest persist downsamples `equity_curve_json`. `daily` ≈ 17 KB/run vs ~9.9 MB raw 1-min; statistically lossless for PSR/Sharpe-CI. Override with `MMR_EQUITY_DECIMATION`.
 
 **`~/.config/mmr/pycron.yaml`**: Service definitions with cron scheduling, auto-restart, dependency ordering. Also hosts `data_refresh_us` / `data_refresh_asx` cron entries that drive the data-refresh loop (see below).
 
-**`~/.config/mmr/data_refresh.yaml`**: Declarative refresh jobs that keep universes' OHLCV current in the local DuckDB. Each job is `{universe, source, bar_size, days, force?}`. Pycron owns the *when* (`data_refresh_*` entries in `pycron.yaml`), this file owns the *what*. Source auto-detects from the universe's dominant exchange (US → twelvedata, else IB) when omitted. Commands: `mmr data refresh <job> [<job> ...]` runs jobs ad-hoc, `mmr data refresh --all` runs everything, `mmr data status` shows per-(job, bar_size) freshness with stale-day coloring. Refresh is incremental by default (only missing date ranges fetched, so daily crons are cheap); set `force: true` to refetch the full window.
+**Alpaca keys** (`alpaca_api_key_id`, `alpaca_api_secret_key` in `trader.yaml`; env `ALPACA_API_KEY_ID` / `ALPACA_API_SECRET_KEY`). Non-empty env vars override flat YAML keys, same as Massive; empty env values (docker compose passes unset keys as `""`) are ignored for the four provider API keys. Alpaca history: SIP feed, `adjustment=split` (matches TwelveData `splits` and Massive `adjusted`), 1-min back to 2016 incl. pre/post market, no seconds bars. Only completed NYSE sessions are returned (after 20:16 ET: post-market ends 20:00 plus the 15-min SIP delay). Free Basic plan with a paper account — no paid plan needed. Providers live in `trader/data_providers/` (`ProviderRegistry.from_config/get/default_source/sources_for`); `data_service.pull_history(source, …)` serves them (`pull_massive` / `pull_twelvedata` are aliases) and builds a fresh provider per download task. `mmr history alpaca --symbol/--universe` downloads via the data service. Live checks: `MMR_LIVE_TESTS=1` + keys, `pytest -m live`.
+
+**Known quirk (left as is):** `TwelveDataHistoryWorker` returns nothing for intraday bars when start == end, so `data download --source twelvedata` can skip single-day gaps.
+
+**`~/.config/mmr/data_refresh.yaml`**: Declarative refresh jobs that keep universes' OHLCV current in the local DuckDB. Each job is `{universe, source, bar_size, days, force?}`. Pycron owns the *when* (`data_refresh_*` entries in `pycron.yaml`), this file owns the *what*. Source auto-detects from the universe's dominant exchange (US → alpaca, else IB) when omitted. Commands: `mmr data refresh <job> [<job> ...]` runs jobs ad-hoc, `mmr data refresh --all` runs everything, `mmr data status` shows per-(job, bar_size) freshness with stale-day coloring. Refresh is incremental by default (only missing date ranges fetched, so daily crons are cheap); set `force: true` to refetch the full window.
 
 **`~/.config/mmr/strategy_runtime.yaml`**: Strategy name, Python module path, class name, bar_size, conids/universe, historical_days_prior.
 
 **`~/.config/mmr/logging.yaml`**: Python logging config (Rich console handler + rotating file handlers).
 
-**`.env`** (gitignored): IB Gateway credentials (`TWS_USERID`, `TWS_PASSWORD`, `TRADING_MODE`, `IB_ACCOUNT`) plus `MMR_HMAC_SECRET` for typed RPC service auth in split Docker.
+**`.env`** (gitignored): IB Gateway credentials (`TWS_USERID`, `TWS_PASSWORD`, `TRADING_MODE`, `IB_ACCOUNT`). Typed RPC service authentication in split Docker uses `~/.config/mmr/service_hmac.key` (mode `0600`), exposed via `MMR_SERVICE_HMAC_KEY_FILE`.
 
 ## Logging
 
@@ -653,7 +673,7 @@ mmr --json data query AAPL --bar-size "1 day" --days 30    # Read OHLCV from loc
 mmr data status                                            # Freshness per (universe, bar_size) job from data_refresh.yaml
 ```
 
-**Step 2: Download historical data** (no service needed, requires massive_api_key)
+**Step 2: Download historical data** (no service needed, requires Alpaca keys; `--source massive|twelvedata|ib` to override)
 ```bash
 mmr data download AAPL MSFT --bar-size "1 day" --days 365  # Ad-hoc download
 mmr data refresh us_top20_daily                            # Declarative — runs a named job from data_refresh.yaml
@@ -725,7 +745,7 @@ mmr --json ideas momentum --location STK.AU.ASX --tickers BHP RIO  # Internation
 
 **Step 3: Research candidates**
 ```bash
-mmr --json snapshot AAPL                    # Current price + bid/ask
+mmr --json snapshot AAPL --source ib        # Current price + bid/ask (bid/ask need IB; REST quotes are Alpaca IEX / TwelveData)
 mmr --json news AAPL --detail               # Recent news + sentiment
 mmr --json ratios AAPL                      # P/E, ROE, D/E, etc.
 ```
@@ -768,11 +788,11 @@ mmr reject 42 --reason "Group over budget"  # Reject with reason
 - `strategies create`, `strategies deploy`, `strategies undeploy`, `strategies inspect`, `strategies signals`, `strategies backtest`
 - `universe list/show/create/delete/remove/import`
 - `propose`, `proposals`, `reject`, `group *`, `session`
-- `ideas` / `movers` (Massive or TwelveData API keys; no trader_service)
-- `financials`, `options`, `news` (Massive key)
+- `ideas` (Massive or TwelveData API keys), `movers` / `news` (Alpaca keys by default; no trader_service)
+- `financials`, `options` (Massive key)
 
 **Requires trader typed RPC (42101/42102)** — production path; no legacy 42001:
-- `portfolio`, `positions`, `orders`, `trades`, `account`, `status`, `resolve`, `snapshot` (IB), `depth`
+- `portfolio`, `positions`, `orders`, `trades`, `account`, `status`, `resolve`, `snapshot` (IB source), `depth`
 - `approve`, `portfolio-risk` / `psnap` / `pdiff`, `reconcile`, `diagnose`
 - `listen` (publish_instrument + PubSub)
 
@@ -808,10 +828,10 @@ Common conIds: AAPL=265598, MSFT=272093, NVDA=4815747. Note: conIds can become s
 
 ### Command Latency Reference
 
-All timings measured on local macOS. Network commands (download) depend on Massive.com API latency. Set appropriate timeouts — in particular, 1-min backtests on 16K+ bars take 10-15s.
+All timings measured on local macOS. Network commands (download) depend on the provider's API latency (timings below were measured on Massive; Alpaca history needs no paid plan). Set appropriate timeouts — in particular, 1-min backtests on 16K+ bars take 10-15s.
 
 #### Data Download (`mmr data download`)
-Downloads historical data from Massive.com REST API to local DuckDB. Sequential per symbol (not parallelized).
+Downloads historical data from the default source (Alpaca; Massive shown here) to local DuckDB. Sequential per symbol (not parallelized).
 
 | Operation | Time | Notes |
 |-----------|------|-------|

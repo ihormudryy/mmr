@@ -10,7 +10,7 @@ When ``--location`` is provided, ``IBIdeaScanner`` uses IB's scanner API +
 import logging
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass, field
-from typing import Any, Callable, Dict, List, Optional
+from typing import Any, Callable, Dict, List, Optional, Protocol
 
 import pandas as pd
 
@@ -1058,6 +1058,72 @@ def parse_report_snapshot(xml_str: str) -> Dict[str, Any]:
     return data
 
 
+class ScannerDataProvider(Protocol):
+    """Synchronous data access for :class:`IBIdeaScanner`.
+
+    Two implementations: :class:`RpcScannerProvider` (CLI / offline simulation,
+    over the legacy dill RPC client) and
+    ``trader.messaging.scanner_bridge.TraderScannerProvider`` (in-process, used
+    by the ``scan_ideas`` typed query on the trader).
+
+    Every method is *synchronous* and returns plain ``list``/``list[dict]``/
+    ``str`` — the scanner runs a ThreadPoolExecutor over ``get_history_bars``
+    and must never receive a coroutine.
+    """
+
+    def scanner_data(self, *, scan_code: str, location_code: str, num_rows: int) -> list[dict]: ...
+
+    def get_snapshots_batch(self, contracts: list, delayed_ok: bool) -> list[dict]: ...
+
+    def get_history_bars(self, contract, duration: str, bar_size: str) -> list[dict]: ...
+
+    def resolve_contract(self, partial) -> list: ...
+
+    def get_fundamental_data(self, contract, report_type: str) -> str: ...
+
+    def get_news_headlines(self, con_id: int, provider_codes: str, count: int) -> list[dict]: ...
+
+
+class RpcScannerProvider:
+    """:class:`ScannerDataProvider` backed by the legacy dill RPC client.
+
+    Wraps exactly the calls ``IBIdeaScanner`` used to make inline, so the CLI
+    path (``mmr ideas --location ...``) is unchanged.
+    """
+
+    def __init__(self, rpc_client):
+        self._rpc = rpc_client
+
+    def scanner_data(self, *, scan_code, location_code, num_rows):
+        from trader.messaging.clientserver import consume
+        return consume(self._rpc.rpc(return_type=list[dict]).scanner_data(
+            scan_code=scan_code, location_code=location_code, num_rows=num_rows))
+
+    def get_snapshots_batch(self, contracts, delayed_ok):
+        from trader.messaging.clientserver import consume
+        return consume(self._rpc.rpc(return_type=list[dict]).get_snapshots_batch(
+            contracts, delayed_ok))
+
+    def get_history_bars(self, contract, duration, bar_size):
+        from trader.messaging.clientserver import consume
+        return consume(self._rpc.rpc(return_type=list[dict]).get_history_bars(
+            contract, duration, bar_size))
+
+    def resolve_contract(self, partial):
+        from trader.messaging.clientserver import consume
+        return consume(self._rpc.rpc(return_type=list).resolve_contract(partial))
+
+    def get_fundamental_data(self, contract, report_type):
+        from trader.messaging.clientserver import consume
+        return consume(self._rpc.rpc(return_type=str).get_fundamental_data(
+            contract, report_type))
+
+    def get_news_headlines(self, con_id, provider_codes, count):
+        from trader.messaging.clientserver import consume
+        return consume(self._rpc.rpc(return_type=list[dict]).get_news_headlines(
+            con_id, provider_codes, count))
+
+
 class IBIdeaScanner:
     """IB-backed idea scanner for international markets.
 
@@ -1071,8 +1137,8 @@ class IBIdeaScanner:
     The scoring/filtering/formatting logic is shared with :class:`IdeaScanner`.
     """
 
-    def __init__(self, rpc_client):
-        self._rpc = rpc_client
+    def __init__(self, provider: 'ScannerDataProvider'):
+        self._provider = provider
 
     def scan(
         self,
@@ -1116,7 +1182,6 @@ class IBIdeaScanner:
                 return pd.DataFrame()
 
         from ib_async.contract import Contract
-        from trader.messaging.clientserver import consume
 
         scan_preset = PRESETS.get(preset)
         if not scan_preset:
@@ -1140,7 +1205,7 @@ class IBIdeaScanner:
             # back nothing, which almost always means bad tickers or IB being
             # unhealthy. "Fail loudly" per project policy.
             contracts, conid_map = self._resolve_symbols(
-                symbols_to_resolve, location, consume,
+                symbols_to_resolve, location,
             )
             if not contracts:
                 raise IdeaScannerError(
@@ -1151,12 +1216,10 @@ class IBIdeaScanner:
         else:
             # Use IB scanner for discovery
             scan_code = PRESET_SCAN_CODES.get(preset, 'TOP_PERC_GAIN')
-            scanner_results = consume(
-                self._rpc.rpc(return_type=list[dict]).scanner_data(
-                    scan_code=scan_code,
-                    location_code=location,
-                    num_rows=top_n * 3,
-                )
+            scanner_results = self._provider.scanner_data(
+                scan_code=scan_code,
+                location_code=location,
+                num_rows=top_n * 3,
             )
             if not scanner_results:
                 # Distinguish "API failed" from "no matches". The previous
@@ -1194,9 +1257,7 @@ class IBIdeaScanner:
                 conid_map[r['symbol']] = r['conId']
 
         # 3. Get snapshots via RPC → IB
-        snapshots = consume(
-            self._rpc.rpc(return_type=list[dict]).get_snapshots_batch(contracts, True)
-        )
+        snapshots = self._provider.get_snapshots_batch(contracts, True)
 
         # 4. Get history for prev_close/prev_volume + local indicator computation
         #    in parallel. Limit history fetches to top candidates. If >50%
@@ -1212,9 +1273,7 @@ class IBIdeaScanner:
 
         def _fetch_one(contract):
             try:
-                bars = consume(
-                    self._rpc.rpc(return_type=list[dict]).get_history_bars(contract, '60 D', '1 day')
-                )
+                bars = self._provider.get_history_bars(contract, '60 D', '1 day')
                 return (contract.symbol, bars, None)
             except Exception as ex:
                 return (contract.symbol, None, ex)
@@ -1283,7 +1342,7 @@ class IBIdeaScanner:
         # 10. Optionally enrich with fundamentals (IB ReportSnapshot)
         if fundamentals and candidates:
             fund_data = self._fetch_fundamentals(
-                contracts, candidates, consume,
+                contracts, candidates,
             )
             for c in candidates:
                 if c['ticker'] in fund_data:
@@ -1292,7 +1351,7 @@ class IBIdeaScanner:
         # 11. Optionally enrich with news (IB reqHistoricalNews)
         if news and candidates:
             news_data = self._fetch_news(
-                candidates, conid_map, consume,
+                candidates, conid_map,
             )
             for c in candidates:
                 if c['ticker'] in news_data:
@@ -1308,7 +1367,6 @@ class IBIdeaScanner:
         self,
         symbols: List[str],
         location: str,
-        consume,
     ) -> tuple:
         """Resolve explicit symbol names to IB Contracts via resolve_contract RPC.
 
@@ -1351,9 +1409,7 @@ class IBIdeaScanner:
         for sym in symbols:
             try:
                 partial = Contract(symbol=sym, secType='STK', exchange=resolution_exchange)
-                defs = consume(
-                    self._rpc.rpc(return_type=list).resolve_contract(partial)
-                )
+                defs = self._provider.resolve_contract(partial)
                 if not defs:
                     logger.warning('Could not resolve %s on %s (location=%s)',
                                    sym, resolution_exchange, location)
@@ -1482,7 +1538,6 @@ class IBIdeaScanner:
         self,
         contracts: list,
         candidates: List[Dict],
-        consume,
     ) -> Dict[str, Dict[str, Any]]:
         """Fetch fundamental data via IB reqFundamentalData for each candidate."""
         # Build symbol → contract lookup from the full contract list
@@ -1497,9 +1552,7 @@ class IBIdeaScanner:
             if not contract:
                 continue
             try:
-                xml_str = consume(
-                    self._rpc.rpc(return_type=str).get_fundamental_data(contract, 'ReportSnapshot')
-                )
+                xml_str = self._provider.get_fundamental_data(contract, 'ReportSnapshot')
                 data = parse_report_snapshot(xml_str)
                 if data:
                     results[symbol] = data
@@ -1516,7 +1569,6 @@ class IBIdeaScanner:
         self,
         candidates: List[Dict],
         conid_map: Dict[str, int],
-        consume,
     ) -> Dict[str, Dict[str, Optional[str]]]:
         """Fetch latest news headlines via IB reqHistoricalNews for each candidate."""
         results: Dict[str, Dict[str, Optional[str]]] = {}
@@ -1526,9 +1578,7 @@ class IBIdeaScanner:
             if not conId:
                 continue
             try:
-                headlines = consume(
-                    self._rpc.rpc(return_type=list[dict]).get_news_headlines(conId, '', 1)
-                )
+                headlines = self._provider.get_news_headlines(conId, '', 1)
                 if headlines:
                     h = headlines[0]
                     title = h.get('headline', '')

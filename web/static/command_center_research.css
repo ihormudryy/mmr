@@ -98,7 +98,7 @@
   display: none;
 }
 
-/* Match Deploy/Watchlists `.param-form` density inside the Research pane. */
+/* Match Strategies/Portfolios `.param-form` density inside the Research pane. */
 #dash-research .research-form {
   display: flex;
   flex-wrap: wrap;
@@ -275,8 +275,13 @@
   font-weight: 700;
 }
 
+#dash-research .research-section {
+  display: grid;
+  gap: 8px;
+}
+
 #dash-research .research-section h4 {
-  margin: 0 0 8px;
+  margin: 0;
   font: 800 12px/1.2 var(--font-heading);
   letter-spacing: .05em;
   text-transform: uppercase;

@@ -1,7 +1,7 @@
 """DataService: concurrent historical data downloader.
 
 Can run in two modes:
-1. Direct (from CLI): instantiate and call pull_massive()/pull_ib()
+1. Direct (from CLI): instantiate and call pull_history()/pull_ib()
 2. Persistent: start_server() runs a ZMQ RPC server on port 42003
 """
 
@@ -11,9 +11,8 @@ from trader.container import Container, default_config_path
 from trader.data.data_access import SecurityDefinition, TickData, TickStorage
 from trader.data.store import DateRange
 from trader.data.universe import Universe, UniverseAccessor
+from trader.data_providers import Capability, ProviderError, ProviderRegistry
 from trader.listeners.ib_history_worker import IBHistoryWorker
-from trader.listeners.massive_history import MassiveHistoryWorker
-from trader.listeners.twelvedata_history import TwelveDataHistoryWorker
 from trader.messaging.clientserver import RPCServer
 from trader.messaging.data_service_api import DataServiceApi
 from trader.objects import BarSize, WhatToShow
@@ -44,6 +43,8 @@ class DataService:
         self,
         massive_api_key: str = '',
         twelvedata_api_key: str = '',
+        alpaca_api_key_id: str = '',
+        alpaca_api_secret_key: str = '',
         ib_server_address: str = '127.0.0.1',
         ib_server_port: int = 7497,
         duckdb_path: str = '',
@@ -55,6 +56,8 @@ class DataService:
     ):
         self.massive_api_key = massive_api_key
         self.twelvedata_api_key = twelvedata_api_key
+        self.alpaca_api_key_id = alpaca_api_key_id
+        self.alpaca_api_secret_key = alpaca_api_secret_key
         self.ib_server_address = ib_server_address
         self.ib_server_port = ib_server_port
         self.duckdb_path = duckdb_path
@@ -66,6 +69,14 @@ class DataService:
         self._running_count = 0
         self._completed_count = 0
         self._failed_count = 0
+
+    def _provider_config(self) -> dict:
+        return {
+            'massive_api_key': self.massive_api_key,
+            'twelvedata_api_key': self.twelvedata_api_key,
+            'alpaca_api_key_id': self.alpaca_api_key_id,
+            'alpaca_api_secret_key': self.alpaca_api_secret_key,
+        }
 
     def _resolve_symbols(
         self,
@@ -100,9 +111,11 @@ class DataService:
         else:
             return []
 
-    async def _download_massive_one(
+    async def _download_rest_one(
         self,
         sem: asyncio.Semaphore,
+        source: str,
+        registry: ProviderRegistry,
         security: SecurityDefinition,
         date_range: DateRange,
         bar_size: BarSize,
@@ -111,67 +124,26 @@ class DataService:
         async with sem:
             self._running_count += 1
             try:
-                logging.info('downloading massive {} from {} to {}'.format(
-                    security.symbol, pdt(date_range.start), pdt(date_range.end)
+                provider = registry.get(Capability.HISTORY, source)
+                logging.info('downloading {} {} from {} to {}'.format(
+                    source, security.symbol, pdt(date_range.start), pdt(date_range.end)
                 ))
-
-                worker = MassiveHistoryWorker(self.massive_api_key)
                 df = await asyncio.to_thread(
-                    worker.get_history,
+                    provider.get_history,
                     ticker=security.symbol,
                     bar_size=bar_size,
                     start_date=dateify(date_range.start, timezone=security.timeZoneId, make_sod=True),
                     end_date=dateify(date_range.end, timezone=security.timeZoneId, make_eod=True),
                     timezone=security.timeZoneId if security.timeZoneId else 'US/Eastern',
                 )
-
                 if len(df) > 0:
                     tick_data.write(security, df)
                     logging.debug('wrote {} rows for {}'.format(len(df), security.symbol))
-
                 self._completed_count += 1
                 return {'symbol': security.symbol, 'rows': len(df), 'ok': True}
             except Exception as ex:
                 self._failed_count += 1
-                logging.error('massive download failed for {}: {}'.format(security.symbol, ex))
-                return {'symbol': security.symbol, 'error': str(ex), 'ok': False}
-            finally:
-                self._running_count -= 1
-
-    async def _download_twelvedata_one(
-        self,
-        sem: asyncio.Semaphore,
-        security: SecurityDefinition,
-        date_range: DateRange,
-        bar_size: BarSize,
-        tick_data: TickData,
-    ) -> dict:
-        async with sem:
-            self._running_count += 1
-            try:
-                logging.info('downloading twelvedata {} from {} to {}'.format(
-                    security.symbol, pdt(date_range.start), pdt(date_range.end)
-                ))
-
-                worker = TwelveDataHistoryWorker(self.twelvedata_api_key)
-                df = await asyncio.to_thread(
-                    worker.get_history,
-                    ticker=security.symbol,
-                    bar_size=bar_size,
-                    start_date=dateify(date_range.start, timezone=security.timeZoneId, make_sod=True),
-                    end_date=dateify(date_range.end, timezone=security.timeZoneId, make_eod=True),
-                    timezone=security.timeZoneId if security.timeZoneId else 'US/Eastern',
-                )
-
-                if len(df) > 0:
-                    tick_data.write(security, df)
-                    logging.debug('wrote {} rows for {}'.format(len(df), security.symbol))
-
-                self._completed_count += 1
-                return {'symbol': security.symbol, 'rows': len(df), 'ok': True}
-            except Exception as ex:
-                self._failed_count += 1
-                logging.error('twelvedata download failed for {}: {}'.format(security.symbol, ex))
+                logging.error('{} download failed for {}: {}'.format(source, security.symbol, ex))
                 return {'symbol': security.symbol, 'error': str(ex), 'ok': False}
             finally:
                 self._running_count -= 1
@@ -236,21 +208,24 @@ class DataService:
             finally:
                 self._running_count -= 1
 
-    async def pull_massive(
+    async def pull_history(
         self,
+        source: str,
         symbols: Optional[list[str]] = None,
         universe: Optional[str] = None,
         bar_size: str = '1 day',
         prev_days: int = 30,
         max_concurrent: int = 5,
     ) -> dict:
-        """Find missing date ranges, download from Massive concurrently, write to DuckDB.
+        """Find missing date ranges, download them from `source`, write to DuckDB.
 
         Returns {'enqueued': N, 'completed': N, 'failed': N, 'errors': [...]}
         """
-        if not self.massive_api_key:
-            return {'enqueued': 0, 'completed': 0, 'failed': 0,
-                    'errors': ['massive_api_key not configured']}
+        try:
+            registry = ProviderRegistry.from_config(self._provider_config())
+            registry.get(Capability.HISTORY, source)
+        except ProviderError as ex:
+            return {'enqueued': 0, 'completed': 0, 'failed': 0, 'errors': [str(ex)]}
 
         securities = self._resolve_symbols(symbols, universe)
         if not securities:
@@ -287,13 +262,13 @@ class DataService:
                 date_ranges = [DateRange(start=tz_start, end=tz_end)]
 
             for dr in date_ranges:
-                tasks.append(self._download_massive_one(sem, security, dr, bs, tick_data))
+                tasks.append(self._download_rest_one(sem, source, registry, security, dr, bs, tick_data))
 
         enqueued = len(tasks)
         if enqueued == 0:
             return {'enqueued': 0, 'completed': 0, 'failed': 0, 'errors': []}
 
-        logging.info('enqueued {} massive download tasks'.format(enqueued))
+        logging.info('enqueued {} {} download tasks'.format(enqueued, source))
         results = await asyncio.gather(*tasks, return_exceptions=True)
 
         errors = []
@@ -312,81 +287,13 @@ class DataService:
 
         return {'enqueued': enqueued, 'completed': completed, 'failed': failed, 'errors': errors}
 
-    async def pull_twelvedata(
-        self,
-        symbols: Optional[list[str]] = None,
-        universe: Optional[str] = None,
-        bar_size: str = '1 day',
-        prev_days: int = 30,
-        max_concurrent: int = 5,
-    ) -> dict:
-        """Find missing date ranges, download from TwelveData concurrently, write to DuckDB.
+    async def pull_massive(self, symbols=None, universe=None, bar_size='1 day',
+                           prev_days=30, max_concurrent=5) -> dict:
+        return await self.pull_history('massive', symbols, universe, bar_size, prev_days, max_concurrent)
 
-        Returns {'enqueued': N, 'completed': N, 'failed': N, 'errors': [...]}
-        """
-        if not self.twelvedata_api_key:
-            return {'enqueued': 0, 'completed': 0, 'failed': 0,
-                    'errors': ['twelvedata_api_key not configured']}
-
-        securities = self._resolve_symbols(symbols, universe)
-        if not securities:
-            return {'enqueued': 0, 'completed': 0, 'failed': 0,
-                    'errors': ['no securities resolved']}
-
-        bs = BarSize.parse_str(bar_size)
-        tick_data = TickStorage(self.history_duckdb_path).get_tickdata(bar_size=bs)
-
-        start_date = dateify(dt.datetime.now() - dt.timedelta(days=prev_days + 1), make_sod=True)
-        end_date = dateify(dt.datetime.now() - dt.timedelta(days=1), make_eod=True)
-
-        sem = asyncio.Semaphore(max_concurrent)
-        tasks = []
-
-        for security in securities:
-            tz_start = timezoneify(start_date, timezone=security.timeZoneId)
-            tz_end = timezoneify(end_date, timezone=security.timeZoneId)
-
-            exchange_calendar = _try_get_exchange_calendar(security)
-
-            try:
-                if exchange_calendar:
-                    date_ranges = tick_data.missing(
-                        security,
-                        exchange_calendar,
-                        date_range=DateRange(start=tz_start, end=tz_end),
-                    )
-                else:
-                    date_ranges = [DateRange(start=tz_start, end=tz_end)]
-            except Exception as ex:
-                logging.warning('missing() failed for {}: {}, downloading full range'.format(
-                    security.symbol, ex))
-                date_ranges = [DateRange(start=tz_start, end=tz_end)]
-
-            for dr in date_ranges:
-                tasks.append(self._download_twelvedata_one(sem, security, dr, bs, tick_data))
-
-        enqueued = len(tasks)
-        if enqueued == 0:
-            return {'enqueued': 0, 'completed': 0, 'failed': 0, 'errors': []}
-
-        logging.info('enqueued {} twelvedata download tasks'.format(enqueued))
-        results = await asyncio.gather(*tasks, return_exceptions=True)
-
-        errors = []
-        completed = 0
-        failed = 0
-        for r in results:
-            if isinstance(r, Exception):
-                failed += 1
-                errors.append(str(r))
-            elif isinstance(r, dict) and r.get('ok'):
-                completed += 1
-            else:
-                failed += 1
-                if isinstance(r, dict):
-                    errors.append(r.get('error', 'unknown error'))
-
-        return {'enqueued': enqueued, 'completed': completed, 'failed': failed, 'errors': errors}
+    async def pull_twelvedata(self, symbols=None, universe=None, bar_size='1 day',
+                              prev_days=30, max_concurrent=5) -> dict:
+        return await self.pull_history('twelvedata', symbols, universe, bar_size, prev_days, max_concurrent)
 
     async def pull_ib(
         self,

@@ -51,6 +51,7 @@ import inspect
 import os
 import pandas as pd
 import sys
+import threading
 import trader.messaging.strategy_service_api as bus
 import yaml
 
@@ -652,7 +653,12 @@ class StrategyRuntime():
     @log_method
     def _persist_enabled(self, name: str, enabled: bool) -> None:
         """Persist a strategy's enabled/disabled state so it survives a restart
-        (otherwise a runtime disable is silently undone when the config reloads)."""
+        (otherwise a runtime disable is silently undone when the config reloads).
+
+        Synchronous write — call via ``_schedule_persist_enabled`` from the
+        enable/disable RPC path so DuckDB contention cannot exceed the client's
+        typed-RPC timeout (G1).
+        """
         try:
             from trader.data.duckdb_store import DuckDBConnection
             db = DuckDBConnection.get_instance(self.duckdb_path)
@@ -668,6 +674,20 @@ class StrategyRuntime():
             db.execute_atomic(_w)
         except Exception as ex:
             logging.warning('could not persist enabled-state for %s: %s', name, ex)
+
+    def _schedule_persist_enabled(self, name: str, enabled: bool) -> None:
+        """Run ``_persist_enabled`` off the enable/disable RPC reply path.
+
+        Mass-enable under DuckDB contention used to block the reply until
+        ``execute_atomic`` finished (backoff up to ~45s), exceeding the client's
+        ~6s timeout even though the in-memory enable had already succeeded.
+        """
+        threading.Thread(
+            target=self._persist_enabled,
+            args=(name, enabled),
+            name=f'strategy-persist-{name}',
+            daemon=True,
+        ).start()
 
     def _load_enabled(self, name: str):
         """Return the persisted enabled state for *name* (True/False), or None if
@@ -699,7 +719,7 @@ class StrategyRuntime():
         for implementation in self.strategy_implementations:
             if name == implementation.name:
                 state = implementation.enable()
-                self._persist_enabled(name, True)
+                self._schedule_persist_enabled(name, True)
                 self._announce_and_drain(name)
                 return state
         return StrategyState.ERROR
@@ -725,27 +745,32 @@ class StrategyRuntime():
         for implementation in self.strategy_implementations:
             if name == implementation.name:
                 state = implementation.disable()
-                self._persist_enabled(name, False)
+                self._schedule_persist_enabled(name, False)
                 self._announce_and_drain(name)
                 return state
         return StrategyState.ERROR
 
     def _announce_and_drain(self, name: str) -> None:
-        """Push the new observable state to the trader journal immediately.
+        """Queue the new observable state for the trader journal.
 
-        Without this, enable/disable only update local runtime state — the
-        command-center Trading Strategies panel stays stale until the next
-        30s reconcile announces the transition.
+        Writes a ``strategy_ack_outbox`` row only. Does **not** call the
+        trader's ``record_state_acknowledged`` here: enable/disable run inside
+        ``apply_control_command``, which is itself answering a trader→strategy
+        forward on the typed command path. Calling back into the trader's
+        command socket from that stack deadlocks (trader waits for our reply;
+        we wait for trader's ack) and surfaces as
+        ``record_state_acknowledged ... timed out after 10000ms``.
+
+        The trader's ``_forward`` journals ``strategy.updated`` as soon as
+        this handler returns (so the command-center Strategies panel updates
+        immediately). ``_drain_ack_outbox`` on the 30s reconcile tick is the
+        backstop that marks local outbox rows acknowledged.
         """
+        del name  # announce scans all loaded strategies; name keeps the call site clear
         try:
             self._announce_strategy_states()
         except Exception as ex:
-            logging.warning('announce after %s state change failed: %s', name, ex)
-            return
-        try:
-            self._drain_ack_outbox()
-        except Exception as ex:
-            logging.warning('ack-outbox drain after %s state change failed: %s', name, ex)
+            logging.warning('announce after strategy state change failed: %s', ex)
 
     @log_method
     def get_strategy(self, name: str) -> Optional[Strategy]:
@@ -919,7 +944,7 @@ class StrategyRuntime():
 
         existing = self._revisions.get_receipt(command_id)
         if existing is not None:
-            return existing
+            return self._receipt_with_observable_state(existing)
 
         current = self._revisions.control_revision(strategy_name)
         if expected_control_revision != current:
@@ -967,14 +992,34 @@ class StrategyRuntime():
 
         def _commit(conn):
             control = self._revisions.bump_control_revision_in_tx(conn, strategy_name)
+            payload = self._state_payload(strategy_name, control)
             state = self._revisions.bump_state_revision_in_tx(
-                conn, strategy_name, self._state_payload(strategy_name, control),
+                conn, strategy_name, payload,
             )
-            return self._revisions.record_receipt_in_tx(
+            receipt = self._revisions.record_receipt_in_tx(
                 conn, command_id, strategy_name, action, 'COMMITTED', control, state,
             )
+            # Wire-only: trader journals this as strategy_state (not COMMITTED).
+            return StrategyCommandReceipt(
+                command_id=receipt.command_id,
+                strategy_name=receipt.strategy_name,
+                action=receipt.action,
+                state=receipt.state,
+                control_revision=receipt.control_revision,
+                state_revision=receipt.state_revision,
+                error=receipt.error,
+                observable_state=payload.get('strategy_state') or payload.get('state'),
+                observable_payload=payload,
+            )
 
-        return self._revisions.db.transaction(_commit)
+        receipt = self._revisions.db.transaction(_commit)
+        # Match announce dedup so the next reconcile doesn't re-bump the same
+        # observable state we just wrote into the outbox.
+        if receipt.observable_state:
+            announced = getattr(self, '_announced_states', None)
+            if announced is not None:
+                announced[strategy_name] = receipt.observable_state
+        return receipt
 
     def _config_entries(self, strategy_name: str, params: Dict) -> tuple[Dict, Dict]:
         """Return ``(prior_entry, proposed_entry)`` -- the strategy's CURRENT
@@ -1089,14 +1134,82 @@ class StrategyRuntime():
             )
             return str(ex)
 
+    def _receipt_with_observable_state(
+        self, receipt: StrategyCommandReceipt,
+    ) -> StrategyCommandReceipt:
+        """Re-attach wire-only observable fields on idempotent receipt
+        replays (the receipt ledger does not persist them)."""
+        if (receipt.observable_state and receipt.observable_payload) or receipt.state_revision <= 0:
+            return receipt
+        row = self._revisions.db.execute(
+            "SELECT payload FROM strategy_ack_outbox "
+            "WHERE strategy_name = ? AND state_revision = ? LIMIT 1",
+            [receipt.strategy_name, receipt.state_revision],
+            fetch='one',
+        )
+        payload = {}
+        if row is not None:
+            from trader.strategy.strategy_revisions import _parse_json_column
+            payload = _parse_json_column(row[0]) or {}
+        if not payload and receipt.state == 'COMMITTED':
+            payload = self._state_payload(
+                receipt.strategy_name, receipt.control_revision,
+            )
+        obs = payload.get('strategy_state') or payload.get('state')
+        if not obs and not payload:
+            return receipt
+        return StrategyCommandReceipt(
+            command_id=receipt.command_id,
+            strategy_name=receipt.strategy_name,
+            action=receipt.action,
+            state=receipt.state,
+            control_revision=receipt.control_revision,
+            state_revision=receipt.state_revision,
+            error=receipt.error,
+            observable_state=str(obs) if obs else receipt.observable_state,
+            observable_payload=payload or receipt.observable_payload,
+        )
+
     def _state_payload(self, strategy_name: str, control_revision: int) -> Dict:
         strategy = self.get_strategy(strategy_name)
         state_name = strategy.state.name if strategy is not None else 'UNKNOWN'
-        return {
+        # `strategy_state` is the command-center canonical field (see
+        # command_center.js renderStrategies); keep `state` as a compat alias
+        # for older consumers / outbox rows written before this dual-key.
+        payload: Dict = {
             'strategy_name': strategy_name,
+            'strategy_state': state_name,
             'state': state_name,
             'control_revision': control_revision,
         }
+        if strategy is None:
+            return payload
+        bar_size = getattr(strategy, 'bar_size', None)
+        if bar_size is not None:
+            payload['bar_size'] = (
+                bar_size.value if hasattr(bar_size, 'value') else str(bar_size)
+            )
+        class_name = getattr(strategy, 'class_name', None)
+        if class_name:
+            payload['class_name'] = class_name
+        conids = getattr(strategy, 'conids', None) or []
+        if conids:
+            payload['conids'] = list(conids)
+        universe = getattr(strategy, 'universe', None)
+        if universe:
+            payload['universe'] = universe
+        last_error = getattr(strategy, 'last_error', None)
+        if last_error:
+            payload['last_error'] = str(last_error)
+        # Current YAML/context overrides — command-center Params drawer reads
+        # these from the strategy row when present (also served by GET
+        # /api/strategies/{name}/params from config + class tunables).
+        try:
+            params = dict(getattr(strategy, 'params', None) or {})
+        except Exception:
+            params = {}
+        payload['params'] = params
+        return payload
 
     def _record(
         self, command_id: str, strategy_name: str, action: str, state: str,
@@ -1728,20 +1841,28 @@ class StrategyRuntime():
         strategies_dir = os.path.abspath(os.path.expanduser(self.strategies_directory))
 
         # [P3 Task 2] Artifact verification gate — checked BEFORE the class module
-        # is loaded from disk.  Only active when automation is enabled and the
-        # strategy config carries an ``artifact_bundle_path`` key (so existing
-        # non-automated strategies are unaffected).  Fail closed: any verification
-        # failure is logged at ERROR and the strategy is refused.
+        # is loaded from disk. When automation is enabled and the strategy carries
+        # ``artifact_bundle_path``, fail closed on any verification failure.
+        # When automation is *disabled*, still load the strategy (soft-load) so it
+        # appears in Strategies / Scaling for Activate; attestation runs on arm.
         artifact_bundle_path_str = (params or {}).get('artifact_bundle_path', '')
         if artifact_bundle_path_str:
-            try:
-                self._verify_artifact_at_load(name, artifact_bundle_path_str)
-            except Exception as exc:
-                logging.error(
-                    'refusing to load strategy %s: artifact verification failed: %s',
-                    name, exc,
+            if not self.automation_enabled:
+                logging.warning(
+                    'strategy %s has artifact_bundle_path but automation is '
+                    'disabled; loading without attestation (Activate paper '
+                    'automation to arm and verify)',
+                    name,
                 )
-                return
+            else:
+                try:
+                    self._verify_artifact_at_load(name, artifact_bundle_path_str)
+                except Exception as exc:
+                    logging.error(
+                        'refusing to load strategy %s: artifact verification failed: %s',
+                        name, exc,
+                    )
+                    return
 
         def load_class_from_file(filename, classname):
             # Reject absolute paths and path traversal. Strategy modules must
@@ -1951,9 +2072,9 @@ class StrategyRuntime():
         # announce missed, e.g. ones loaded by this very reconcile), then
         # drain any acknowledgement-outbox rows the trader might have missed
         # (its record_state_acknowledged reply was lost, or this process
-        # restarted before draining). Isolated: a failure here must not skip
-        # config reload/re-subscription above, and every drained row is
-        # retried independently so one bad row doesn't block the rest.
+        # restarted before draining). Isolated from subscribe/reload above.
+        # Drain fail-fasts on trader timeout so one unreachable peer cannot
+        # hold this thread for limit × timeout seconds.
         try:
             self._announce_strategy_states()
         except Exception as ex:
@@ -2022,15 +2143,19 @@ class StrategyRuntime():
                     'startup instrument subscription failed for %r (trader typed '
                     'query unreachable; reconcile will retry): %s', strategy.name, ex)
 
-    def _drain_ack_outbox(self, limit: int = 50) -> None:
+    def _drain_ack_outbox(self, limit: int = 50, *, call_timeout: float = 3.0) -> None:
         """Push unacknowledged ``strategy_ack_outbox`` rows to the trader's
         typed ``record_state_acknowledged`` command. This is a BACKSTOP --
         the common case already acknowledges synchronously as part of the
         forwarded command's own reply (see
         ``command_coordinator.StrategyControlCommandService._forward``); this
-        loop only matters when that reply was lost in transit. Per-row
-        isolated: one row's failure must not block the rest, and an
-        unacknowledged row is simply retried on the next 30s tick."""
+        loop only matters when that reply was lost in transit.
+
+        Fail-fast on timeout/connection errors: one unreachable trader must
+        not burn ``limit × 10s`` on the strategy event loop (that starves
+        ``list_strategies`` and IB historical startup). Remaining rows retry
+        on the next reconcile tick.
+        """
         client = getattr(self, '_trader_command_client', None)
         if self._revisions is None or client is None:
             return
@@ -2042,7 +2167,16 @@ class StrategyRuntime():
                 'payload': row.payload,
             }
             try:
-                client.call('record_state_acknowledged', body, dict)
+                client.call(
+                    'record_state_acknowledged', body, dict, timeout=call_timeout,
+                )
+            except (TimeoutError, ConnectionError) as ex:
+                logging.debug(
+                    'record_state_acknowledged failed for %s state_revision %s '
+                    '(trader unreachable; aborting drain, will retry next cycle): %s',
+                    row.strategy_name, row.state_revision, ex,
+                )
+                return
             except Exception as ex:
                 logging.debug(
                     'record_state_acknowledged failed for %s state_revision %s '
@@ -2050,6 +2184,75 @@ class StrategyRuntime():
                 )
                 continue
             self._revisions.mark_acknowledged(row.ack_id)
+
+    async def _startup_drain_ack_outbox(
+        self,
+        *,
+        attempts: int = 15,
+        interval_s: float = 2.0,
+        call_timeout: float = 3.0,
+    ) -> None:
+        """Retry ack-outbox drain off the event loop until empty or exhausted.
+
+        Runs while ``get_historical_data()`` may still be in flight so the
+        trader journals ``strategy.updated`` (and the command-center Trading
+        tab Strategies panel fills) without waiting for a multi-minute IB
+        backfill. Each drain call is ``asyncio.to_thread``'d — never inline
+        on the loop — so a slow/unreachable trader cannot stall ticks or
+        history. The 30s reconcile loop remains the durable backstop.
+        """
+        for attempt in range(1, attempts + 1):
+            try:
+                await asyncio.to_thread(
+                    self._drain_ack_outbox, 50, call_timeout=call_timeout,
+                )
+            except Exception as ex:
+                logging.warning(
+                    'startup ack-outbox drain failed (attempt %s/%s): %s',
+                    attempt, attempts, ex,
+                )
+            if self._revisions is None:
+                return
+            if not self._revisions.unacknowledged_outbox(1):
+                logging.debug(
+                    'startup ack-outbox drain complete on attempt %s/%s',
+                    attempt, attempts,
+                )
+                return
+            if attempt < attempts and interval_s > 0:
+                await asyncio.sleep(interval_s)
+        logging.warning(
+            'startup ack-outbox drain exhausted %s attempts with rows still '
+            'pending; reconcile loop will continue draining',
+            attempts,
+        )
+
+    def _schedule_startup_ack_drain(
+        self,
+        *,
+        attempts: int = 15,
+        interval_s: float = 2.0,
+        call_timeout: float = 3.0,
+    ) -> Optional[asyncio.Task]:
+        """Fire-and-forget ``_startup_drain_ack_outbox`` on the running loop.
+
+        Returns ``None`` when called outside a running event loop (unit tests
+        that only exercise sync paths). Does not await the drain.
+        """
+        try:
+            loop = asyncio.get_running_loop()
+        except RuntimeError:
+            return None
+        task = loop.create_task(
+            self._startup_drain_ack_outbox(
+                attempts=attempts,
+                interval_s=interval_s,
+                call_timeout=call_timeout,
+            ),
+            name='startup-ack-drain',
+        )
+        self._startup_ack_drain_task = task
+        return task
 
     async def _reconnect_historical_client(self):
         """Disconnect and reconnect the IB historical data client."""
@@ -2256,14 +2459,18 @@ class StrategyRuntime():
         # it's probably up to the strategy how they want to secure data
         self._subscribe_all_strategies()
 
-        # Announce the freshly loaded strategies to the trader's journal right
-        # away (don't wait for the first 30s reconcile tick) so the command
-        # center's Strategies panel populates as soon as the service is up.
+        # Announce the freshly loaded strategies into the local ack outbox, then
+        # drain in a BACKGROUND task while IB historical runs. Inline drain on
+        # this coroutine used to either (a) stall history for N×timeouts when
+        # the trader was not ready, or (b) leave the Trading-tab Strategies
+        # panel empty until get_historical_data() finished (often minutes).
+        # Background + fail-fast drain fills the trader journal promptly;
+        # reconcile remains the durable backstop.
         try:
             self._announce_strategy_states()
-            self._drain_ack_outbox()
         except Exception as ex:
             logging.warning('startup strategy state announce failed (reconcile will retry): %s', ex)
+        self._schedule_startup_ack_drain()
 
         logging.debug('starting connection to IB for historical data')
 

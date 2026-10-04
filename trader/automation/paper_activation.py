@@ -13,6 +13,7 @@ import yaml
 from trader.automation.paper_hot_arm import PaperHotArmPorts
 from trader.automation.paper_materials import (
     PaperMaterialsError,
+    read_allocation_binding_hints,
     verify_qualified_paper_bundle,
 )
 
@@ -41,6 +42,12 @@ class PaperAutomationStatus:
     account_mode: str
     last_activated_at: str | None
     phase: str | None = None
+    # Digests from attestation.json when the bundle is on disk — for Scaling
+    # Prefill. Never invent; omitted keys stay None.
+    artifact_digest: str | None = None
+    allowlist_digest: str | None = None
+    ruleset_digest: str | None = None
+    public_key_id: str | None = None
 
 
 def _atomic_write_yaml(path: Path, data: dict) -> None:
@@ -172,6 +179,10 @@ class PaperAutomationActivationService:
             or automation.get("artifact_bundle_path")
             or None
         )
+        if not artifact_bundle_path and artifact_id:
+            candidate = self._share_dir / "artifacts" / str(artifact_id)
+            if candidate.is_dir():
+                artifact_bundle_path = str(candidate)
 
         lifecycle = "disabled"
         restart_required = False
@@ -205,6 +216,9 @@ class PaperAutomationActivationService:
                 lifecycle = "restart_required"
                 restart_required = True
 
+        hints: dict[str, str] = {}
+        if artifact_bundle_path:
+            hints = read_allocation_binding_hints(artifact_bundle_path)
         return PaperAutomationStatus(
             lifecycle=lifecycle,
             strategy_name=strategy_name,
@@ -218,6 +232,10 @@ class PaperAutomationActivationService:
             account_mode=self._account_mode,
             last_activated_at=self._last_activated_at,
             phase=self._phase,
+            artifact_digest=hints.get("artifact_digest") or artifact_id,
+            allowlist_digest=hints.get("allowlist_digest"),
+            ruleset_digest=hints.get("ruleset_digest"),
+            public_key_id=hints.get("public_key_id"),
         )
 
     def activate(self, *, strategy_name: str, reason: str) -> dict:

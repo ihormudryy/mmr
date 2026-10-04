@@ -191,6 +191,36 @@ def test_one_registry_contains_reads_feed_ingest_and_landed_commands(tmp_path):
     }
     for role, method in expected:
         assert registry.contains(role, method), (role, method)
+    # Without HMAC/typed strategy clients on the stub trader, strategy-control
+    # stays unregistered (dormant). Production boots with typed_authenticator.
+    assert stack.strategy_control_service is None
+    assert not registry.contains("command", "disable_strategy")
+
+
+def test_strategy_control_registers_enable_disable_when_authenticator_present(tmp_path):
+    """Regression: METHOD_NOT_ALLOWED on Disable from the Strategies panel."""
+    from trader.trading.command_stack import build_command_stack
+
+    trader = _trader(tmp_path)
+    trader.typed_authenticator = HmacServiceAuthenticator(
+        b"k" * 32, now=lambda: 1_700_000_000.0)
+    trader.strategy_typed_address = "tcp://127.0.0.1"
+    trader.strategy_typed_command_port = 42104
+    trader.strategy_typed_query_port = 42105
+
+    stack = build_command_stack(trader, _policy(), now=lambda: NOW)
+    assert stack.strategy_control_service is not None
+
+    registry = build_production_registry(
+        trader,
+        trader.typed_authenticator,
+        command_stack=stack,
+    )
+    for method in ("enable_strategy", "disable_strategy", "update_strategy_params",
+                   "record_state_acknowledged"):
+        assert registry.contains("command", method), method
+    assert "disable_strategy" in stack.coordinator._actions
+    assert "enable_strategy" in stack.coordinator._actions
 
 
 def test_enabled_stack_wires_paper_automation_service_and_preflight_policy(
@@ -367,6 +397,25 @@ def test_automation_live_enabled_refused_at_stack_build(tmp_path):
     with pytest.raises(CommandStackConfigurationError) as exc:
         build_command_stack(trader, _policy(), now=lambda: NOW)
     assert exc.value.code == "AUTOMATION_LIVE_REFUSED"
+
+
+def test_frozen_command_stack_late_binds_automated_intent_service(tmp_path):
+    """Paper hot-arm late-binds execute path onto a frozen CommandStack."""
+    from dataclasses import FrozenInstanceError
+
+    from trader.trading.command_stack import CommandStack, build_command_stack
+
+    trader = _trader(tmp_path)
+    stack = build_command_stack(trader, _policy(), now=lambda: NOW)
+    assert isinstance(stack, CommandStack)
+    assert stack.automated_intent_service is None
+    with pytest.raises(FrozenInstanceError):
+        stack.automated_intent_service = object()
+    sentinel = object()
+    object.__setattr__(stack, "automated_intent_service", sentinel)
+    assert stack.automated_intent_service is sentinel
+    object.__setattr__(stack, "automated_intent_service", None)
+    assert stack.automated_intent_service is None
 
 
 def test_automation_approval_uses_fenced_broker_and_executable_quote(tmp_path, monkeypatch):

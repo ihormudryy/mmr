@@ -13,6 +13,7 @@ from trader.automation.paper_materials import (
     default_key_paths,
     ensure_signing_keypair,
     export_fixture_paper_eligible_bundle,
+    read_allocation_binding_hints,
     verify_qualified_paper_bundle,
 )
 
@@ -126,6 +127,17 @@ def test_export_fixture_bundle_is_candidate(tmp_path: Path) -> None:
 
     attestation = json.loads((bundle_path / "attestation.json").read_text())
     assert attestation["eligibility_state"] == "CANDIDATE"
+
+    hints = read_allocation_binding_hints(bundle_path)
+    assert hints["artifact_digest"] == artifact_id
+    assert hints["allowlist_digest"] == "allowlist-1"
+    assert hints["ruleset_digest"] == attestation["ruleset_digest"]
+    assert hints["public_key_id"] == signer.public_key_id
+    assert "evidence_digest" not in hints
+
+
+def test_read_allocation_binding_hints_missing_bundle(tmp_path: Path) -> None:
+    assert read_allocation_binding_hints(tmp_path / "missing") == {}
 
 
 def test_default_key_paths(tmp_path: Path) -> None:

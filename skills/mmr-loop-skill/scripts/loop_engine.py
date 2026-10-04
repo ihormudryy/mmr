@@ -31,11 +31,19 @@ DEFAULT_CONFIG = {
 
     # Thresholds for triggering analysis
     "position_move_pct": 0.015,         # 1.5% move triggers deeper analysis
-    "daily_pnl_alert_pct": 0.02,        # 2% daily portfolio loss triggers alert
+    # Daily-loss brake: when day P&L <= -this fraction of net liquidation the
+    # cycle goes RISK-OFF — no new proposals, no approvals of new entries.
+    "daily_pnl_alert_pct": 0.02,
 
     # Risk
-    "risk_hhi_warning": 0.15,           # HHI above this triggers warning
+    # HHI ceiling: above this the cycle must not add to existing concentrated
+    # names — diversify or do nothing.
+    "risk_hhi_warning": 0.15,
     "auto_approve": False,              # Reserved: auto-approval is unsupported
+
+    # Protective exit attached to every loop-created BUY proposal (percent
+    # trailing stop; 0/None disables — not recommended unattended).
+    "propose_trailing_stop_pct": 2.0,
 
     # Context management
     "compact_after_cycle": True,        # compact context after each DIGEST phase
@@ -257,6 +265,9 @@ class TradingLoop:
         currency = cls.config.get("currency", "")
         max_proposals = cls.config.get("max_proposals_per_cycle", 2)
         move_threshold = cls.config.get("position_move_pct", 0.015)
+        pnl_brake = cls.config.get("daily_pnl_alert_pct", 0.02)
+        hhi_ceiling = cls.config.get("risk_hhi_warning", 0.15)
+        trail_pct = cls.config.get("propose_trailing_stop_pct", 2.0)
 
         prompt = f"""[Trading Loop] Cycle {cycle_num} — {datetime.now().strftime('%H:%M:%S')}
 
@@ -273,7 +284,9 @@ elif status.get("data", {{}}).get("ib_upstream_connected") == False:
     print(f"IB Gateway not connected to IBKR: {{status['data'].get('ib_upstream_error', 'unknown')}}")
     print("Cannot resolve, snapshot, or trade — skipping to DIGEST")
 else:
-    print(f"Connected: {{status['data'].get('account', '?')}}")
+    account = status["data"].get("account", "")
+    is_paper = account.startswith("D")  # IB paper accounts are D…; the server pins this
+    print(f"Connected: {{account}} ({{'PAPER' if is_paper else 'LIVE'}})")
 ```
 
 If pre-flight fails, skip directly to PHASE 4 (DIGEST) with a note about the failure. Do NOT attempt portfolio, snapshot, or trading calls.
@@ -285,6 +298,10 @@ diff = await MMRHelpers.portfolio_diff()
 hours = await MMRHelpers.market_hours()
 print(json.dumps({{"pnl": snap["data"]["daily_pnl"], "positions": snap["data"]["position_count"], "top_mover": snap["data"]["movers"][0] if snap["data"]["movers"] else None}}, indent=2))
 print(f"Changes: {{len(diff['data']['changed'])}} moved, {{len(diff['data']['new'])}} new, {{len(diff['data']['removed'])}} removed, {{diff['data']['unchanged_count']}} flat")
+net_liq = snap["data"].get("net_liquidation") or 0
+risk_off = net_liq > 0 and snap["data"]["daily_pnl"] <= -{pnl_brake} * net_liq
+if risk_off:
+    print(f"RISK-OFF: day P&L {{snap['data']['daily_pnl']:.0f}} breaches the -{pnl_brake:.0%} daily-loss brake")
 print(hours)
 ```
 
@@ -292,11 +309,14 @@ Note: The current date/time is {datetime.now().strftime('%Y-%m-%d %H:%M')} LOCAL
 
 If ALL positions are unchanged AND no relevant markets are open, skip to PHASE 4 (DIGEST) with "No action — markets closed."
 
+**RISK-OFF brake:** if `risk_off` is True, do NOT create proposals this cycle. Say so in the digest and alert the operator.
+
 If any position moved >{move_threshold:.1%}, note it for deeper analysis.
 
 ## PHASE 2: ANALYZE
 Run these sequentially (DuckDB single-writer lock):
-1. `await MMRHelpers.portfolio_risk()` — check warnings, HHI, group budgets
+1. `await MMRHelpers.portfolio_risk()` — check warnings, HHI, group budgets.
+   If HHI > {hhi_ceiling}, the book is concentrated: do NOT propose adds to the dominant names — diversify or do nothing.
 2. `await MMRHelpers.session_status()` — check remaining_positions capacity"""
 
         if loc and tickers:
@@ -316,29 +336,33 @@ Run these sequentially (DuckDB single-writer lock):
 Analyze results:
 - Flag positions that moved significantly
 - Note any risk warnings (concentration, group over-budget, correlated clusters)
-- Identify actionable ideas from the scan (score > 6, not already held)
+- Identify actionable ideas from the scan (score > 6, not already held, and no PENDING proposal for the same symbol — check `await MMRHelpers.proposals()` first; `propose()` also refuses duplicates with DUPLICATE_PENDING)
 - If remaining_positions = 0, do NOT propose new positions
 
-## PHASE 3: PROPOSE (max {max_proposals} this cycle)
-For each actionable idea, create a proposal **sequentially** (do NOT use asyncio.gather — DuckDB allows only one writer at a time):
+## PHASE 3: PROPOSE (max {max_proposals} this cycle; skip entirely if RISK-OFF)
+For each actionable idea, create a proposal **sequentially** (do NOT use asyncio.gather — DuckDB allows only one writer at a time). Every loop entry carries a protective trailing stop:
 ```python
 result = await MMRHelpers.propose(symbol, "BUY", confidence=X,
-    reasoning="...", group="...", source="llm\""""
+    reasoning="...", group="...", source="llm",
+    trailing_stop_pct={trail_pct}, tif="GTC\""""
 
         if exchange:
             prompt += f',\n    exchange="{exchange}"'
         if currency:
             prompt += f',\n    currency="{currency}"'
 
-        prompt += """)
+        prompt += f""")
 # result["data"]["proposal_id"] and result["data"]["sizing_result"]["reasoning"]
+# If the server refuses SIZING_BLOCKED, re-propose with an explicit amount=.
 ```
 
 Set confidence based on signal strength: scan score 8+/10 → 0.8, 6-8 → 0.6, <6 → skip.
 Include the scan preset and key indicators in reasoning.
 Tag with appropriate group if one exists.
+Record every proposal_id you create and list them in the digest — the user approves or rejects them.
 
-Skip PROPOSE entirely if: no actionable ideas, at position limit, or risk warnings suggest reducing exposure.
+Skip PROPOSE entirely if: RISK-OFF, no actionable ideas, at position limit, or risk warnings suggest reducing exposure.
+
 """
 
         prompt += f"""## PHASE 4: DIGEST

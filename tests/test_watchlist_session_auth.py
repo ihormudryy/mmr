@@ -113,6 +113,34 @@ class _StubSDK:
         return [_sd(str(symbol).upper())]
 
 
+class _FakeManageClient:
+    """``ManageRpcClient`` stand-in.
+
+    Every watchlist mutation route calls ``get_manage_client().trader_command``,
+    so without this the tests below opened a REAL typed-RPC DEALER to a trader
+    that no test ever binds. Each such call burned the manage client's default
+    ``MMR_MANAGE_RPC_TIMEOUT_S`` (45s) -- and before ``TypedRpcClient`` set
+    SNDTIMEO it blocked forever, wedging the whole pytest run. These tests are
+    about session/CSRF/redirect behaviour; the RPC round-trip is not the
+    subject, so it gets stubbed.
+
+    Returns ``{}`` rather than a richer shape on purpose: the routes read
+    optional keys (``result.get('added')``, ``result.get('imported', 0)``) and
+    flash "nothing to do", which still exercises the real success redirect.
+    """
+
+    def __init__(self):
+        self.calls: list[tuple[str, dict]] = []
+
+    def trader_command(self, method, body):
+        self.calls.append((method, body))
+        return {}
+
+    def trader_query(self, method, body=None):
+        self.calls.append((method, body or {}))
+        return {}
+
+
 @pytest.fixture
 def stub(monkeypatch):
     accessor = _StubAccessor()
@@ -122,6 +150,9 @@ def stub(monkeypatch):
     monkeypatch.setattr(webapp, '_get_mmr', lambda: sdk)
     monkeypatch.setattr(webapp, '_reset_mmr', lambda: None)
     monkeypatch.setattr(webapp, 'scan_strategies', lambda *a, **k: [])
+    manage = _FakeManageClient()
+    monkeypatch.setattr(webapp, 'get_manage_client', lambda: manage)
+    accessor.manage = manage
     return accessor
 
 
@@ -265,12 +296,15 @@ def test_csv_upload_succeeds_authenticated(client):
 # get caught in it).
 # ---------------------------------------------------------------------------
 
-def test_watchlist_create_survives_commands_enabled():
+def test_watchlist_create_survives_commands_enabled(stub):
+    # `stub` is required for its get_manage_client patch -- this route reaches
+    # the real trader_command otherwise (see _FakeManageClient).
     c = webapp.make_test_client(commands_enabled=True)
     c.headers.update({'Origin': ORIGIN})
     r = c.post('/watchlists/create', data={'name': 'keep', 'csrf_token': webapp._CSRF_TOKEN},
               follow_redirects=False)
     assert r.status_code == 303
+    assert ('create_universe', {'name': 'keep'}) in stub.manage.calls
 
 
 def test_trading_mutation_still_locked_out_when_commands_enabled():

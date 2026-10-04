@@ -17,11 +17,8 @@
 #   universe   — name of a universe (mmr universe show <name>). Required
 #                (use a synthetic universe via `mmr universe create ...`
 #                + `mmr universe add ...` if you want an ad-hoc list).
-#   source     — 'twelvedata', 'massive', or 'ib'. Optional — when
-#                omitted, the runner auto-picks: US exchanges (NASDAQ,
-#                NYSE, SMART, ARCA) → 'twelvedata' (cheap, fast). All
-#                others (ASX, SEHK, TSE, EU, ...) → 'ib' (TwelveData
-#                doesn't cover international equities).
+#   source     — 'alpaca', 'twelvedata', 'massive', or 'ib'. Optional — when
+#                omitted, US exchanges → 'alpaca' (free, SIP), all others → 'ib'.
 #   bar_size   — "1 day", "1 min", etc. Same vocab as `mmr data download`.
 #   days       — lookback window. Keep 1-min windows small (90d for US,
 #                30d for ASX) — IB historical pacing is the bottleneck.
@@ -30,19 +27,18 @@
 #                date ranges are fetched, so a daily cron is cheap).
 
 jobs:
-  # ---- US (TwelveData) — runs after US after-hours close (20:30 ET) ----
-  # 1-min bars span 4:00 AM ET (pre) through 19:59 ET (post) for ~960
-  # bars/day. The TwelveData worker enables `prepost=true` automatically
-  # for 1/5/15/30-min US intraday bars (see twelvedata_history.py).
+  # ---- US (Alpaca, free) — runs after US after-hours close (20:30 ET) ----
+  # Alpaca SIP 1-min bars include pre- and post-market (04:00–20:00 ET). Only
+  # completed sessions are fetched (see trader/data_providers/alpaca/sessions.py).
   us_top20_daily:
     universe: downloads          # the auto-registered universe from `mmr data download`
-    source: twelvedata
+    source: alpaca
     bar_size: "1 day"
     days: 365
 
   us_top20_1min:
     universe: downloads
-    source: twelvedata
+    source: alpaca
     bar_size: "1 min"
     days: 90
 

@@ -22,10 +22,11 @@ PAPER_AUTOMATION_QUERY_TIMEOUT_S = float(
 def _deployed_strategy_names() -> list[str]:
     """Names from strategy_runtime.yaml for paper-automation Activate.
 
-    Live ``view.strategies`` only fills after a strategy-control command
-    journals ``strategy.updated`` — freshly deployed YAML rows never appear
-    there, so the Activate dropdown would stay empty. Config names are the
-    same identifiers Activate expects.
+    Live ``view.strategies`` fills from journaled ``strategy.updated`` rows
+    (announce/ack + control commands) once the trader registers the
+    ``strategy`` materialized adapter. Freshly deployed YAML names can still
+    precede the first ack, so Activate also lists config names — the same
+    identifiers Activate expects.
     """
     try:
         # Lazy import: web.app pulls in this module at create_app time.
@@ -38,6 +39,62 @@ def _deployed_strategy_names() -> list[str]:
     except Exception as exc:  # noqa: BLE001 — optional enrichment
         logger.debug("deployed strategy names unavailable: %s", exc)
         return []
+
+
+_AUTO_LIFECYCLES = frozenset({
+    "armed", "armed_unpersisted", "degraded",
+    # Configured / activating full automation for a bound strategy — still Auto.
+    "restart_required", "preparing",
+})
+
+
+def _is_full_auto_execute(value: object) -> bool:
+    """True when a strategy is configured for full automation (not propose)."""
+    if value is True:
+        return True
+    if isinstance(value, str):
+        return value.strip().lower() in {"true", "1", "yes", "execute", "auto"}
+    return False
+
+
+def compute_operating_mode(
+    paper_automation: dict | None,
+    deployed_rows: list[dict] | None = None,
+) -> str:
+    """Account operating mode for the command-band indicator.
+
+    - ``auto``: paper automation armed/activating, **or any one strategy** with
+      full automation (``auto_execute: true`` / equivalent)
+    - ``semi``: at least one deployed strategy uses ``auto_execute: propose``
+      and none are fully automated
+    - ``manual``: human propose/approve only (default)
+    """
+    life = str((paper_automation or {}).get("lifecycle") or "").strip().lower()
+    if life in _AUTO_LIFECYCLES:
+        return "auto"
+    rows = list(deployed_rows or ())
+    if any(_is_full_auto_execute(row.get("auto_execute")) for row in rows):
+        return "auto"
+    if any(row.get("auto_execute") == "propose" for row in rows):
+        return "semi"
+    return "manual"
+
+
+def _operating_mode_for_snapshot(
+    paper_automation: dict | None,
+    view_strategies: list[dict] | None = None,
+) -> str:
+    try:
+        from web.app import fetch_deployed_from_config
+        deployed = list(fetch_deployed_from_config())
+    except Exception as exc:  # noqa: BLE001 — optional enrichment
+        logger.debug("operating mode deploy scan unavailable: %s", exc)
+        deployed = []
+    # One fully-automated live strategy is enough for Auto — merge journal rows.
+    for row in view_strategies or ():
+        if isinstance(row, dict):
+            deployed.append(row)
+    return compute_operating_mode(paper_automation, deployed)
 
 
 # Dedicated pool so a timed-out manage fetch can be abandoned without tying an
@@ -89,9 +146,42 @@ def create_read_router(cc, templates, manage_context_provider=None,
                 )
             except Exception as exc:  # noqa: BLE001 - optional read-model enrichment
                 logger.debug("paper automation status unavailable: %s", exc)
+        view["operating_mode"] = _operating_mode_for_snapshot(
+            view.get("paper_automation"),
+            view.get("strategies"),
+        )
+        try:
+            from web.command_center.market_session import market_session_status
+
+            view["market_session"] = market_session_status()
+        except Exception as exc:  # noqa: BLE001 — optional banner enrichment
+            logger.debug("market session unavailable: %s", exc)
+            view["market_session"] = {
+                "calendar": "XNAS", "exchange": "NASDAQ",
+                "open": None, "error": str(exc),
+            }
         view["health"] = cc.bridge.health() if cc.bridge else {
             "lifecycle": "starting", "reconnects": 0, "cursor": None, "sources": {}}
         return JSONResponse(view)
+
+    @router.get("/api/strategies/{strategy_name}/params")
+    async def api_strategy_params(
+        strategy_name: str, _session: str = Depends(_require_session),
+    ):
+        """Params + class tunables for the Trading-tab Params drawer."""
+        from web.app import resolve_strategy_params_editor
+
+        try:
+            payload = await asyncio.to_thread(
+                resolve_strategy_params_editor, strategy_name)
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("strategy params editor failed for %s: %s",
+                           strategy_name, exc)
+            return JSONResponse(
+                {"detail": f"{type(exc).__name__}: {exc}"}, status_code=502)
+        if payload is None:
+            return JSONResponse({"detail": "strategy not found"}, status_code=404)
+        return JSONResponse(payload)
 
     @router.get("/api/events")
     async def api_events(request: Request, _session: str = Depends(_require_session)):

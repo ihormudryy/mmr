@@ -212,3 +212,47 @@ class TestMMRConfig:
         cfg.write_text("automation:\n  live_enabled: true\n")
         with pytest.raises(ValueError, match="automation.live_enabled"):
             MMRConfig.from_yaml(str(cfg))
+
+
+class TestEmptyEnvProviderKeys:
+    """docker-compose passes `KEY: ${KEY:-}`, so an unset host var arrives as ''."""
+
+    def _write(self, tmp_path):
+        cfg = tmp_path / "cfg.yaml"
+        cfg.write_text(
+            "alpaca_api_key_id: yaml-alpaca-id\n"
+            "alpaca_api_secret_key: yaml-alpaca-secret\n"
+            "massive_api_key: yaml-massive\n"
+            "twelvedata_api_key: yaml-twelve\n"
+        )
+        return str(cfg)
+
+    def test_empty_env_keeps_yaml_value(self, tmp_path, monkeypatch):
+        for name in ('ALPACA_API_KEY_ID', 'ALPACA_API_SECRET_KEY', 'MASSIVE_API_KEY', 'TWELVEDATA_API_KEY'):
+            monkeypatch.setenv(name, '')
+        config = MMRConfig.from_yaml(self._write(tmp_path))
+        assert config.alpaca.api_key_id == 'yaml-alpaca-id'
+        assert config.alpaca.secret_key == 'yaml-alpaca-secret'
+        assert config.massive.api_key == 'yaml-massive'
+        assert config.twelvedata.api_key == 'yaml-twelve'
+
+    def test_whitespace_env_keeps_yaml_value(self, tmp_path, monkeypatch):
+        monkeypatch.setenv('ALPACA_API_KEY_ID', '  ')
+        config = MMRConfig.from_yaml(self._write(tmp_path))
+        assert config.alpaca.api_key_id == 'yaml-alpaca-id'
+
+    def test_non_empty_env_overrides_yaml(self, tmp_path, monkeypatch):
+        monkeypatch.setenv('ALPACA_API_KEY_ID', 'env-alpaca-id')
+        monkeypatch.setenv('MASSIVE_API_KEY', 'env-massive')
+        config = MMRConfig.from_yaml(self._write(tmp_path))
+        assert config.alpaca.api_key_id == 'env-alpaca-id'
+        assert config.massive.api_key == 'env-massive'
+
+    def test_env_alone_still_sets_alpaca_keys(self, tmp_path, monkeypatch):
+        cfg = tmp_path / "cfg.yaml"
+        cfg.write_text("trading_mode: paper\n")
+        monkeypatch.setenv('ALPACA_API_KEY_ID', 'env-id')
+        monkeypatch.setenv('ALPACA_API_SECRET_KEY', 'env-secret')
+        config = MMRConfig.from_yaml(str(cfg))
+        assert config.alpaca.api_key_id == 'env-id'
+        assert config.alpaca.secret_key == 'env-secret'

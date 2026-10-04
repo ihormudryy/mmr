@@ -54,6 +54,57 @@
     return healthBad || transportBad;
   }
 
+  /* NASDAQ (XNAS) regular session closed. ``open`` must be the boolean false;
+   * null/undefined means unknown (don't warn). */
+  function ccMarketClosed(marketSession) {
+    return !!(marketSession && marketSession.open === false);
+  }
+
+  const CC_BANNER_STREAM =
+    '⚠ Realtime stream degraded — polling snapshots every 5 s. Data may be stale.';
+  const CC_BANNER_MARKET =
+    '⚠ NASDAQ is closed — regular-session trading is not available until the next open.';
+  const CC_BANNER_BOTH =
+    '⚠ NASDAQ is closed, and the realtime stream is degraded — polling snapshots; data may be stale.';
+
+  /* Human countdown from ``nowMs`` to an ISO timestamp. Null if unparsable. */
+  function ccFormatDurationUntil(iso, nowMs) {
+    if (!iso) return null;
+    const targetMs = Date.parse(iso);
+    if (Number.isNaN(targetMs)) return null;
+    const remaining = targetMs - (Number.isFinite(nowMs) ? nowMs : Date.now());
+    if (remaining <= 0) return 'soon';
+    const totalSec = Math.floor(remaining / 1000);
+    const days = Math.floor(totalSec / 86400);
+    const hours = Math.floor((totalSec % 86400) / 3600);
+    const minutes = Math.floor((totalSec % 3600) / 60);
+    const seconds = totalSec % 60;
+    if (days > 0) return hours > 0 ? `${days}d ${hours}h` : `${days}d`;
+    if (hours > 0) return minutes > 0 ? `${hours}h ${minutes}m` : `${hours}h`;
+    if (minutes > 0) return `${minutes}m`;
+    return `${seconds}s`;
+  }
+
+  function ccBannerMessage({ streamDegraded, marketClosed, nextOpen, nowMs }) {
+    const until = marketClosed ? ccFormatDurationUntil(nextOpen, nowMs) : null;
+    if (marketClosed && streamDegraded) {
+      return until
+        ? `⚠ NASDAQ is closed (opens in ${until}), and the realtime stream is degraded — polling snapshots; data may be stale.`
+        : CC_BANNER_BOTH;
+    }
+    if (marketClosed) {
+      return until
+        ? `⚠ NASDAQ is closed — regular-session trading is not available (opens in ${until}).`
+        : CC_BANNER_MARKET;
+    }
+    if (streamDegraded) return CC_BANNER_STREAM;
+    return CC_BANNER_STREAM;
+  }
+
+  function ccBannerVisible({ streamDegraded, marketClosed }) {
+    return !!(streamDegraded || marketClosed);
+  }
+
   /* Guard against a late/overlapping snapshot rolling state backward: a slow
    * older fetch resolving after a newer one has already been applied. A
    * snapshot on a NEW stream is always accepted (a resync rotated the stream
@@ -64,6 +115,31 @@
     if (!view || !view.stream_id) return false;
     if (view.stream_id !== appliedStreamId) return true;
     return (view.sequence || 0) >= (appliedSequence || 0);
+  }
+
+  /* Distance-to-limit bar math for the Risk panel. ``value_pct``/``cap_pct``
+   * are 0–100. Tone: empty < 2/3 of cap, ``hot`` approaching, ``over`` at/above. */
+  function ccRiskBarState(limit) {
+    const value = Number(limit && limit.value_pct);
+    const cap = Number(limit && limit.cap_pct);
+    if (!Number.isFinite(value) || !Number.isFinite(cap) || cap <= 0) return null;
+    const ratio = value / cap;
+    const fillPct = Math.max(0, Math.min(100, ratio * 100));
+    let tone = '';
+    if (ratio >= 1) tone = 'over';
+    else if (ratio >= (2 / 3)) tone = 'hot';
+    const label = (limit && limit.label) ? String(limit.label) : 'limit';
+    return {
+      fillPct,
+      tone,
+      caption: `${label} ${value.toFixed(1)}% of ${cap.toFixed(1)}%`,
+    };
+  }
+
+  function ccRiskWarningText(warning) {
+    if (warning == null) return '';
+    if (typeof warning === 'string') return warning;
+    return warning.message || String(warning);
   }
 
   /* Account mode ("paper"/"live"/null) off a broker-account row. The wire
@@ -91,8 +167,17 @@
     ccServerClockOffsetMs,
     ccQuoteAgeSeconds,
     ccIsDegraded,
+    ccMarketClosed,
+    ccBannerVisible,
+    ccFormatDurationUntil,
+    ccBannerMessage,
+    CC_BANNER_STREAM,
+    CC_BANNER_MARKET,
+    CC_BANNER_BOTH,
     ccSnapshotSupersedes,
     ccAccountModeValue,
+    ccRiskBarState,
+    ccRiskWarningText,
     ccStrategyName,
   };
 }));

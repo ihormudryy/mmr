@@ -2,256 +2,435 @@
 
 <div class="guide-wrap">
   <header class="guide-hero">
-    <h1>Dashboard user guide</h1>
+    <h1>Dashboard guide</h1>
     <p class="guide-lead">
-      Control room for your paper or live IB account at
-      <code>/cc</code>. Hover or click the <span class="info" tabindex="0" role="button" aria-label="More info" aria-expanded="false">i<span class="tip">Same info bubbles as on the Deploy and Watchlists tabs — hover, focus, or click the icon to read.</span></span>
-      bubbles for extra help.
+      This page explains every part of the dashboard in plain language, with
+      step-by-step examples. It assumes no trading experience. Wherever you see
+      an <span class="info" tabindex="0" role="button" aria-label="More info" aria-expanded="false">i<span class="tip">Bubbles like this one add detail without cluttering the page. Hover, focus, or click the icon to read; click again or press Escape to close.</span></span>
+      icon — here or anywhere else in the dashboard — hover or click it for extra help.
     </p>
     <p class="guide-note">
-      If commands are disabled you can watch everything but cannot place, approve, or cancel trades.
-      The <strong>Dark / Light</strong> button in the tab row switches the colour theme; it
-      follows your operating system by default and remembers your choice per browser.
+      <strong>Comfort settings:</strong> the tab row (top right) has a
+      <strong>Dark / Light</strong> button and a small <strong>A&nbsp;—&nbsp;A slider</strong>
+      that scales the whole page like browser zoom (80–150%; click the percentage
+      to reset). Both remember your choice in this browser.
+      <strong>Read-only mode:</strong> if trading commands are switched off on the
+      server, you can watch everything but buttons that would trade are hidden —
+      the Action queue header says <em>(read-only)</em>.
     </p>
   </header>
 
   <section class="guide-section">
-    <h2>If you are new to trading {{ info('Read this section once before approving anything on LIVE. Paper mode is the safe practice sandbox.') }}</h2>
-
-    <h3>What this dashboard is {{ info('Nothing spends real money until you are on LIVE and you Approve (and confirm) a trade.') }}</h3>
+    <h2>Start here — what this dashboard does {{ info('Five minutes here saves an hour of confusion later. Everything else in this guide builds on these two ideas: the trade lifecycle, and paper vs live.') }}</h2>
+    <p>
+      This is the control room for a brokerage account at Interactive Brokers (IB).
+      The one rule that makes it safe:
+      <strong>nothing is ever bought or sold until you press Approve.</strong>
+    </p>
+    <p>Every trade follows the same five steps:</p>
     <ol class="guide-steps">
-      <li><strong>Strategies</strong> (or you) suggest trades.</li>
-      <li>Suggestions become <strong>proposals</strong> — not trades yet.</li>
-      <li>You <strong>Approve</strong> → an <strong>order</strong> goes to the broker.</li>
-      <li>When filled, you hold a <strong>position</strong> (shares long or short).</li>
+      <li><strong>An idea appears.</strong> You have one, a strategy (an automatic rule) spots one, or the Research tab finds one.</li>
+      <li><strong>The idea becomes a proposal.</strong> A proposal is a written request: “buy this, roughly this much, because of this.” It is not a trade. It sits in the <strong>Action queue</strong> waiting for you.</li>
+      <li><strong>You decide.</strong> Read the card. <strong>Approve</strong> sends it to the broker; <strong>Reject</strong> throws it away. Ignored proposals quietly expire after about 30 minutes.</li>
+      <li><strong>The broker executes.</strong> An approved proposal becomes an <strong>order</strong>. When someone on the market takes the other side, the order <strong>fills</strong> — that is the actual trade.</li>
+      <li><strong>You now hold a position.</strong> Its value moves with the price. Later you close it (sell what you bought), and the profit or loss becomes final.</li>
     </ol>
 
-    <h3>Paper vs Live {{ info('Start on PAPER until propose → approve → fill → close feels boring. LIVE is real money with an extra confirm step.') }}</h3>
+    <h3>Paper vs Live {{ info('The badge is always visible in the command band under the tabs. On LIVE the whole band is tinted red so you can never mistake which account you are touching.') }}</h3>
     <table>
-      <thead><tr><th>Mode</th><th>Badge</th><th>Meaning</th></tr></thead>
+      <thead><tr><th>Badge</th><th>What it means</th><th>Attitude</th></tr></thead>
       <tbody>
-        <tr><td><strong>Paper</strong></td><td><span class="chip">PAPER</span></td><td>Practice money. Safe to learn flows.</td></tr>
-        <tr><td><strong>Live</strong></td><td><span class="chip err">LIVE</span></td><td>Real money. Confirm drawer before risk-increasing actions.</td></tr>
+        <tr>
+          <td><span class="chip">PAPER</span></td>
+          <td>A practice account with pretend money. Real prices, real mechanics, zero risk.</td>
+          <td>Experiment freely. Mistakes cost nothing.</td>
+        </tr>
+        <tr>
+          <td><span class="chip err">LIVE</span></td>
+          <td>Real money. Every risk-increasing action asks you to confirm a second time.</td>
+          <td>Slow down. Read every confirm dialog fully.</td>
+        </tr>
       </tbody>
     </table>
+    <p class="guide-note">
+      Stay on paper until the whole loop — propose, approve, watch the fill, close the
+      position — feels boring. Boring means you understand it.
+    </p>
+  </section>
 
-    <h3>Words you will see {{ info('conId is the exact IB contract. Never type only a ticker in New proposal — resolve first.') }}</h3>
+  <section class="guide-section">
+    <h2>The words, organized — a map for beginners {{ info('Trading jargon is mostly five small families of ideas. Skim this once, then come back whenever a word on the dashboard puzzles you.') }}</h2>
+
+    <h3>1 · Things you can trade {{ info('The dashboard never guesses which instrument you mean — that is why conIds exist. Two exchanges can list different companies under the same ticker letters.') }}</h3>
     <table>
       <thead><tr><th>Word</th><th>Plain meaning</th><th>Example</th></tr></thead>
       <tbody>
-        <tr>
-          <td><strong>Symbol / ticker</strong> {{ info('Human-readable name. Useful for watchlists and deploy; not enough for New proposal.') }}</td>
-          <td>Stock name</td>
-          <td><code>AAPL</code> (Apple)</td>
-        </tr>
-        <tr>
-          <td><strong>conId</strong> {{ info('Interactive Brokers contract id. Get it with: mmr resolve AAPL') }}</td>
-          <td>Exact contract id for proposals</td>
-          <td>AAPL often <code>265598</code> — always verify</td>
-        </tr>
-        <tr>
-          <td><strong>BUY / SELL</strong></td>
-          <td>Side of the trade</td>
-          <td>BUY opens/adds a long; SELL reduces/closes a long</td>
-        </tr>
-        <tr>
-          <td><strong>Proposal</strong> {{ info('A request only. Reject anytime before Approve — nothing was sent to the broker yet.') }}</td>
-          <td>Request to trade</td>
-          <td>“BUY AAPL, auto-size, confidence 0.7”</td>
-        </tr>
-        <tr>
-          <td><strong>Order</strong></td>
-          <td>Instruction at the broker</td>
-          <td>Market buy for 12 shares</td>
-        </tr>
-        <tr>
-          <td><strong>Fill</strong></td>
-          <td>Broker actually traded</td>
-          <td>Bought 12 @ $190.20</td>
-        </tr>
-        <tr>
-          <td><strong>Position</strong></td>
-          <td>What you hold now</td>
-          <td>+12 AAPL</td>
-        </tr>
-        <tr>
-          <td><strong>Working order</strong></td>
-          <td>Order not finished yet</td>
-          <td>Open stop-loss</td>
-        </tr>
-        <tr>
-          <td><strong>P&amp;L</strong></td>
-          <td>Profit and loss</td>
-          <td>Unrealized = open; Day = today</td>
-        </tr>
-        <tr>
-          <td><strong>Pause new trading</strong> {{ info('Emergency brake in the command band. Blocks new exposure; existing positions stay. Resume when ready.') }}</td>
-          <td>Block new risk</td>
-          <td>Strategies stop opening new trades</td>
-        </tr>
+        <tr><td><strong>Instrument</strong></td><td>Anything tradable — a stock, an ETF (a basket of stocks), etc.</td><td>Apple shares</td></tr>
+        <tr><td><strong>Symbol / ticker</strong></td><td>The short human name of an instrument.</td><td><code>AAPL</code> = Apple</td></tr>
+        <tr><td><strong>conId</strong> {{ info('Contract ID — the broker-exact identity of one listing on one exchange in one currency. The New proposal drawer has a Resolve button that finds it for you; you never have to memorize these.') }}</td><td>The broker’s exact ID for one specific listing. Tickers can be ambiguous; conIds never are.</td><td>AAPL → <code>265598</code></td></tr>
+        <tr><td><strong>Exchange &amp; currency</strong></td><td>Where it trades and in what money. Only needed for non-US instruments.</td><td>BHP on <code>ASX</code> in <code>AUD</code></td></tr>
+        <tr><td><strong>Quote</strong> {{ info('Bid = highest price a buyer offers right now. Ask = lowest price a seller accepts. Last = most recent actual trade. You effectively buy near the ask and sell near the bid.') }}</td><td>The current prices: bid, ask, and last trade.</td><td>bid 189.90 / ask 190.10</td></tr>
+        <tr><td><strong>Portfolio (here)</strong> {{ info('On the Portfolios tab this word means a named list you build, e.g. tech_demo. Elsewhere in finance it often means everything you own — on this dashboard that is called your positions or your book.') }}</td><td>A named list of symbols you build once and reuse — e.g. as the thing a strategy watches.</td><td><code>tech_demo</code> = AAPL, MSFT</td></tr>
       </tbody>
     </table>
 
-    <h3>Why “propose” instead of “buy now”? {{ info('Strategies with auto_execute: propose also create proposals — you still Approve or Reject each one.') }}</h3>
-    <p>So you can check size and thesis <strong>before</strong> anything hits the market.</p>
-
-    <h3>Safety habits</h3>
-    <ol class="guide-steps">
-      <li>Prefer <strong>paper</strong> until comfortable.</li>
-      <li>Prefer <strong>auto-sizing</strong> (leave quantity and amount empty).</li>
-      <li>Read the Action queue card before Approve.</li>
-      <li>On <strong>LIVE</strong>, read the confirm drawer (side, quantity, notional).</li>
-      <li>Use <strong>Pause new trading</strong> if something looks wrong.</li>
-      <li>Yellow/red chips or “Risk unavailable” → do <strong>not</strong> assume the book is fine.</li>
-    </ol>
-  </section>
-
-  <section class="guide-section">
-    <h2>Top of the page: tab row &amp; command band {{ info('The tab row switches sections; the command band below it is always visible and account-wide, whatever tab you are on.') }}</h2>
-    <p>The <strong>tab row</strong> holds the sections (Trading, Scaling, Deploy, Watchlists, Guide), the
-      <strong>last event</strong> freshness, and the <strong>Dark / Light</strong> theme toggle.</p>
-    <p>The <strong>command band</strong> underneath is your account-wide control strip — the same on every tab.</p>
+    <h3>2 · How a trade happens {{ info('This chain is the heart of the dashboard. Each arrow is visible on the Trading tab: Action queue → Working orders → Recent executions → Positions.') }}</h3>
+    <p><code>idea → proposal → (you approve) → order → fill → position → close → result</code></p>
     <table>
-      <thead><tr><th>Item</th><th>Meaning</th></tr></thead>
+      <thead><tr><th>Word</th><th>Plain meaning</th><th>Example</th></tr></thead>
       <tbody>
-        <tr><td><strong>PAPER / LIVE</strong></td><td>Account mode for this dashboard</td></tr>
-        <tr><td>Account id</td><td>Broker account the trader is bound to</td></tr>
-        <tr><td>Health chips</td><td>Are trader / feeds / journal healthy?</td></tr>
-        <tr><td><strong>Net liquidation</strong></td><td>Total account value right now</td></tr>
-        <tr><td><strong>Day P&amp;L</strong></td><td>Today’s profit/loss — green up, red down</td></tr>
-        <tr><td><strong>Pause new trading</strong> {{ info('Moved here from the Strategies panel — it is account-wide, not per-strategy.') }}</td><td>Emergency brake on new exposure</td></tr>
-        <tr><td><strong>New proposal</strong> {{ info('Opens the New proposal drawer. Resolve a ticker to an exact conId first.') }}</td><td>Start a manual trade proposal</td></tr>
+        <tr><td><strong>Signal</strong></td><td>A strategy’s “now looks interesting” moment.</td><td>“AAPL broke above its opening range”</td></tr>
+        <tr><td><strong>Proposal</strong></td><td>A request to trade, waiting for your decision. Costs nothing until approved.</td><td>“BUY AAPL, $500, confidence 0.6”</td></tr>
+        <tr><td><strong>BUY / SELL</strong> {{ info('On this dashboard the normal pattern is long-only: BUY opens or adds, SELL reduces or closes. Strategy SELL signals with nothing to close are automatically ignored. A human can still deliberately short via a manual SELL.') }}</td><td>BUY opens or adds to a holding; SELL reduces or closes it.</td><td>BUY 10, later SELL 10</td></tr>
+        <tr><td><strong>Order</strong></td><td>The instruction actually sitting at the broker after you approve.</td><td>Market buy, 10 shares</td></tr>
+        <tr><td><strong>Market vs limit order</strong> {{ info('Market: fills almost instantly at the best available price — you accept small slippage. Limit: fills only at your price or better — you might wait forever. Stop: dormant until price crosses a trigger, then acts; used for protection.') }}</td><td>Market = “at whatever the price is now”. Limit = “only at my price or better”.</td><td>LMT 189.50 waits for that price</td></tr>
+        <tr><td><strong>Fill / execution</strong></td><td>The moment the trade really happened, at a real price.</td><td>Bought 10 @ 190.02</td></tr>
+        <tr><td><strong>Position</strong></td><td>What you now hold. Positive = long (you own it); negative = short.</td><td>+10 AAPL</td></tr>
+        <tr><td><strong>Close</strong></td><td>The opposite trade that ends a position and locks in the result.</td><td>SELL 10 AAPL → flat</td></tr>
       </tbody>
     </table>
-    <p class="guide-note">Yellow <strong>Realtime stream degraded</strong> banner → data may lag; the page polls instead of streaming.</p>
-  </section>
 
-  <section class="guide-section">
-    <h2>Trading tab {{ info('Your live book: positions, proposals, orders, fills, strategies, pause, and risk.') }}</h2>
-    <p>Laid out action-first, top to bottom: the pending <strong>Action queue</strong> sits
-      directly under the command band, then a <strong>quick-stats</strong> row, then your
-      positions, and finally orders, fills, strategies, and risk side by side.</p>
+    <h3>3 · Ways you are protected {{ info('Several independent layers. Even if you approve carelessly on paper, hard server-side limits still bound each order.') }}</h3>
     <table>
-      <thead><tr><th>Area</th><th>What it is</th></tr></thead>
+      <thead><tr><th>Protection</th><th>Plain meaning</th></tr></thead>
       <tbody>
-        <tr><td>Action queue {{ info('Nothing hits the broker until Approve. Approve / Reject / Details sit right on each card; New proposal is in the command band.') }}</td><td>Pending proposals as cards; <strong>Approve</strong> / <strong>Reject</strong> / Details inline</td></tr>
-        <tr><td>Quick stats {{ info('The remainder of the old account cards; Net liq and Day P&amp;L moved up to the command band.') }}</td><td>Exposure, buying power, margin cushion, open-position &amp; working-order counts</td></tr>
-        <tr><td>Positions {{ info('Header shows “N open · $X gross”. Close starts an exit proposal — Approve still required.') }}</td><td>What you hold; <strong>Close</strong> to exit</td></tr>
-        <tr><td>Working orders {{ info('Open broker orders still working at IB. Each leg is tagged ENTRY (opening risk) or PROTECTIVE (a stop / take-profit guarding a position).') }}</td><td>Open broker orders with <strong>ENTRY / PROTECTIVE</strong> tags; Cancel or <strong>Cancel all</strong></td></tr>
-        <tr><td>Recent executions {{ info('Fills that actually traded.') }}</td><td>Fills (what actually traded)</td></tr>
-        <tr><td>Strategies {{ info('Live runtime rows with RUNNING / ERROR state chips; full deploy is on the Deploy tab.') }}</td><td>Running algos; Enable / Disable / Edit params</td></tr>
-        <tr><td>Risk {{ info('Concentration, group budgets, reconciliation warnings.') }}</td><td>Warnings (concentration, etc.)</td></tr>
+        <tr><td><strong>Approve-first</strong></td><td>Nobody — not even a strategy — trades without a human pressing Approve. (The single exception is the explicitly armed Paper automation on the Scaling tab, paper only.)</td></tr>
+        <tr><td><strong>Stop-loss</strong> {{ info('Example: buy at 190, stop at 185. If the price falls to 185 the stop sells automatically, capping the loss at roughly 5 per share instead of letting it grow.') }}</td><td>A standing order that sells automatically if the price falls to your pain limit.</td></tr>
+        <tr><td><strong>Take-profit</strong></td><td>A standing order that sells automatically when the price reaches your target.</td></tr>
+        <tr><td><strong>ENTRY vs PROTECTIVE tags</strong> {{ info('Shown on every leg in Working orders. Cancelling an ENTRY just abandons a pending trade. Cancelling a PROTECTIVE removes a safety net and can leave a position unguarded — think twice.') }}</td><td>Working-order legs are labeled: ENTRY opens risk, PROTECTIVE guards a position (stop-loss / take-profit).</td></tr>
+        <tr><td><strong>Pause new trading</strong></td><td>The emergency brake in the command band. Blocks all new risk immediately; existing positions and their protections stay untouched.</td></tr>
+        <tr><td><strong>Server-side limits</strong> {{ info('Enforced when you approve, on paper too: a per-order size ceiling, a price-drift band (refuses if the price ran away from the price on the card), a staleness check on the quote, a daily-loss brake, and instrument allow/deny lists. See the refusal table near the end.') }}</td><td>Hard caps the server applies to every order no matter who asked. If a rule trips, the action is refused with a short code.</td></tr>
+        <tr><td><strong>Proposal expiry</strong></td><td>Unattended proposals expire (≈30 minutes) instead of executing later at a very different price.</td></tr>
       </tbody>
     </table>
 
-    <h3>Example A — Manual buy on paper {{ info('Best first exercise. Leave quantity and amount empty for automatic position sizing.') }}</h3>
-    <ol class="guide-steps">
-      <li>Terminal: <code>mmr resolve AAPL</code> → note the <strong>conId</strong>.</li>
-      <li>Command band → <strong>New proposal</strong> → Resolve a symbol (or paste conId).</li>
-      <li>conId + Side <code>BUY</code>; leave size empty; confidence e.g. <code>0.6</code>; short reasoning.</li>
-      <li><strong>Create proposal</strong> → read the card → <strong>Approve</strong> right on it (or open <strong>Details</strong> first).</li>
-      <li>Watch Working orders → Executions → Positions.</li>
-    </ol>
-    <p class="guide-note">Reject instead of Approve anytime — nothing was sent yet.</p>
-
-    <h3>Example B — Close part of a position</h3>
-    <ol class="guide-steps">
-      <li>Positions → <strong>Close</strong>.</li>
-      <li>Lower quantity to close only part → Create → Approve.</li>
-    </ol>
-
-    <h3>Example C — Pause when unsure</h3>
-    <ol class="guide-steps">
-      <li>Command band → <strong>Pause new trading</strong> (immediate).</li>
-      <li><strong>Resume</strong> when ready (live may ask to confirm).</li>
-    </ol>
-
-    <h3>Example D — Cancel a stuck order {{ info('Cancelling a protective stop on LIVE is risk-increasing — it can leave a position unprotected and needs confirm.') }}</h3>
-    <ol class="guide-steps">
-      <li>Working orders → <strong>Cancel</strong> on the leg, or <strong>Cancel all</strong>.</li>
-      <li>Check the tag first: an <strong>ENTRY</strong> leg cancel just drops a pending order;
-        a <strong>PROTECTIVE</strong> leg cancel removes a stop/take-profit and can leave a
-        position unguarded.</li>
-    </ol>
-  </section>
-
-  <section class="guide-section">
-    <h2>Scaling tab {{ info('Advanced. Signed allocation ceiling (% of account). Skip while learning propose/approve.') }}</h2>
+    <h3>4 · Numbers that tell you how you are doing {{ info('All of these live in the command band and the quick-stats row on the Trading tab. Green = gain, red = loss, everywhere.') }}</h3>
     <table>
-      <thead><tr><th>Action</th><th>How</th></tr></thead>
+      <thead><tr><th>Number</th><th>Plain meaning</th></tr></thead>
       <tbody>
-        <tr>
-          <td><strong>Activate allocation</strong> {{ info('Live capital path. Private keys never enter the browser.') }}</td>
-          <td>Offline prepare → sign → paste/upload JSON + reason → Activate. Skip on paper — use Paper automation instead.</td>
-        </tr>
-        <tr>
-          <td><strong>Suspend</strong></td>
-          <td>Reason → Suspend (immediate, risk-reducing). Enabled only when an authority is active/authorized.</td>
-        </tr>
-        <tr>
-          <td><strong>Paper automation</strong> {{ info('Paper only. Needs command_authority.enabled=true. Hot-arms without restart when Activate succeeds.') }}</td>
-          <td>Enable <code>command_authority</code> in <code>~/.config/mmr/trader.yaml</code> → restart trader → Scaling checklist green → select strategy + reason → Activate. Deactivate only when armed.</td>
-        </tr>
+        <tr><td><strong>Net liquidation</strong></td><td>What the whole account would be worth if everything were sold right now. The single headline number.</td></tr>
+        <tr><td><strong>Day P&amp;L</strong></td><td>Profit and loss since today’s session started.</td></tr>
+        <tr><td><strong>Unrealized vs realized P&amp;L</strong> {{ info('Unrealized moves with every tick and can vanish; realized is history and cannot change. Positions show unrealized; Recent executions create realized.') }}</td><td>Unrealized = paper gain/loss on positions still open. Realized = locked in by closed trades.</td></tr>
+        <tr><td><strong>Gross exposure</strong></td><td>Total market value at risk across all positions, longs and shorts added together.</td></tr>
+        <tr><td><strong>Buying power</strong></td><td>How much more you could buy right now, given cash and margin rules.</td></tr>
+        <tr><td><strong>Margin cushion</strong> {{ info('Margin is money the broker requires you to keep as collateral. A thin cushion means a bad day could force the broker to sell your positions — the number to watch when it gets small.') }}</td><td>Spare room before the broker would start worrying. Bigger is safer.</td></tr>
+        <tr><td><strong>Confidence (0–1)</strong></td><td>How strongly the proposer believes the idea. Higher confidence → the auto-sizer suggests a larger position.</td></tr>
+        <tr><td><strong>Concentration</strong></td><td>Too many eggs in one basket — one symbol or sector dominating the account. The Risk panel warns about it.</td></tr>
+      </tbody>
+    </table>
+
+    <h3>5 · Who does what {{ info('Everyone funnels into the same Action queue, and only Approve turns any of it into a real order. One queue, one gate.') }}</h3>
+    <table>
+      <thead><tr><th>Actor</th><th>Role</th></tr></thead>
+      <tbody>
+        <tr><td><strong>You</strong></td><td>Create manual proposals, approve or reject everything, pause, close, cancel.</td></tr>
+        <tr><td><strong>Strategies</strong> {{ info('Deployed and managed on the Strategies tab. A strategy set to “propose” files a proposal card whenever its rule fires; a strategy without it only records its signals for study.') }}</td><td>Small programs that watch price bars for one rule (e.g. “breakout after the open”) and suggest trades.</td></tr>
+        <tr><td><strong>Research tools</strong></td><td>Scanners on the Research tab that surface candidates and can pre-fill a proposal for you.</td></tr>
+        <tr><td><strong>Paper automation</strong></td><td>The one sanctioned exception to approve-first: a single, explicitly armed strategy may place protected orders by itself — paper only, Scaling tab.</td></tr>
+        <tr><td><strong>The broker (IB)</strong></td><td>Interactive Brokers — holds the account, receives orders, reports fills and prices.</td></tr>
       </tbody>
     </table>
   </section>
 
   <section class="guide-section">
-    <h2>Deploy tab {{ info('Turns a strategy file into a running algo. Needs symbols OR a watchlist — exactly one.') }}</h2>
-    <h3>Example E — Deploy on a small US list</h3>
-    <ol class="guide-steps">
-      <li>Watchlists: create <code>tech_demo</code>, add <code>AAPL, MSFT</code>.</li>
-      <li>Deploy → unfold a strategy → name e.g. <code>orb_demo</code>.</li>
-      <li>Pick watchlist <code>tech_demo</code> (or type symbols — not both empty).</li>
-      <li>Optional: check <strong>propose</strong> so signals become proposals.</li>
-      <li>Deploy → Enable on Trading when needed.</li>
-    </ol>
-    <p class="guide-note">Undeploy is on the Deploy tab (confirm), or: <code>mmr strategies undeploy orb_demo</code></p>
+    <h2>The screen, top to bottom {{ info('These parts are identical on every tab — the tab row, the command band beneath it, and the warning banners that appear above them when something needs attention.') }}</h2>
+
+    <h3>Tab row</h3>
+    <table>
+      <thead><tr><th>Item</th><th>What it does</th></tr></thead>
+      <tbody>
+        <tr><td><strong>Trading</strong></td><td>The main working screen: proposals, positions, orders, fills, strategies, risk.</td></tr>
+        <tr><td><strong>Scaling</strong></td><td>Advanced: signed capital ceilings for live, and Paper automation. Skip while learning.</td></tr>
+        <tr><td><strong>Strategies</strong></td><td>Deploy strategy files onto symbols or a portfolio; enable, disable, undeploy.</td></tr>
+        <tr><td><strong>Portfolios</strong></td><td>Build reusable symbol lists (create, add members, CSV upload).</td></tr>
+        <tr><td><strong>Guide</strong></td><td>This page.</td></tr>
+        <tr><td><strong>Research</strong></td><td>Scanners: Ideas, Movers, Lookup — with one-click proposal pre-fill.</td></tr>
+        <tr><td><strong>last event</strong> {{ info('The timestamp of the newest authoritative event received from the server. If it stops advancing during market hours, the data feed may be stuck — check the health chips.') }}</td><td>Freshness clock for the live data feed.</td></tr>
+        <tr><td><strong>A — A slider</strong></td><td>Scales the whole page 80–150%, like browser zoom. Click the % to reset to 100%.</td></tr>
+        <tr><td><strong>Dark / Light</strong></td><td>Colour theme. Dark by default; your choice is remembered.</td></tr>
+      </tbody>
+    </table>
+
+    <h3>Command band {{ info('Account-wide and always visible, whatever tab you are on. On LIVE the band is tinted red with a red spine on the left edge.') }}</h3>
+    <table>
+      <thead><tr><th>Item</th><th>What it shows / does</th></tr></thead>
+      <tbody>
+        <tr><td><strong>PAPER / LIVE badge + account id</strong></td><td>Which account this dashboard is bound to. Check it before approving anything.</td></tr>
+        <tr><td><strong>Health chips</strong> {{ info('Each chip is one dependency: IB gateway, market data, strategy service, and so on. Green dot = fine. A red chip means part of the picture may be missing — treat data with suspicion until it is green.') }}</td><td>One dot per system dependency. All green = trust the screen.</td></tr>
+        <tr><td><strong>Net liquidation · Day P&amp;L</strong></td><td>The two headline account numbers.</td></tr>
+        <tr><td><strong>Exposure · Buying power · Margin cushion · counts</strong></td><td>Secondary figures: gross exposure, remaining buying power, margin cushion, and how many open positions / working orders exist.</td></tr>
+        <tr><td><strong>Pause new trading</strong></td><td>The emergency brake. One click blocks all new exposure; Resume re-enables it (live asks to confirm).</td></tr>
+        <tr><td><strong>New proposal</strong></td><td>Opens the manual proposal drawer (see Example A below).</td></tr>
+      </tbody>
+    </table>
+
+    <h3>Banners you may see</h3>
+    <table>
+      <thead><tr><th>Banner</th><th>Meaning</th><th>What to do</th></tr></thead>
+      <tbody>
+        <tr><td>Yellow <strong>“Realtime stream degraded”</strong></td><td>The live feed dropped; the page falls back to polling snapshots every few seconds. Data may lag slightly.</td><td>Usually self-heals. If it persists, check the health chips.</td></tr>
+        <tr><td>Yellow <strong>“NASDAQ is closed”</strong></td><td>Outside NASDAQ regular hours (or a holiday). Regular-session trading is not available. The banner includes time remaining until the next open.</td><td>Wait for the next open; paper delayed quotes may still work for research.</td></tr>
+        <tr><td>Red <strong>strategy error band</strong></td><td>At least one strategy is in ERROR state.</td><td>Click <em>Review strategies</em>; read the error in the Strategies panel.</td></tr>
+      </tbody>
+    </table>
   </section>
 
   <section class="guide-section">
-    <h2>Watchlists tab {{ info('Reusable symbol groups resolved to exact IB contracts — never guessed.') }}</h2>
-    <h3>Example F — ASX names</h3>
+    <h2>Trading tab — the main screen {{ info('Laid out action-first: the decisions waiting for you sit at the top, your holdings in the middle, and the supporting panels underneath.') }}</h2>
+
+    <h3>Action queue {{ info('Filters: Pending shows cards awaiting a decision (the count is in the button). All adds everything. History shows finished proposals — executed, rejected, expired, failed.') }}</h3>
+    <p>
+      Every proposal is a card: side (BUY/SELL), symbol, age, quantity (or “auto”),
+      notional value, confidence, status, source (who proposed it), and the thesis.
+      On a PENDING card: <strong>Approve</strong> sends it to the broker,
+      <strong>Reject</strong> discards it, <strong>Details</strong> opens the full record.
+      On LIVE, Approve additionally opens a red confirm dialog restating side,
+      quantity, and value — read it, then confirm.
+    </p>
+
+    <h3>Positions {{ info('Last price and its age come from live quotes. A row with a red tint and a ⚠ next to the age means the quote is stale — the shown price may be out of date; do not make decisions from it.') }}</h3>
+    <p>
+      Everything you currently hold: quantity, average cost, last price, market value,
+      unrealized P&amp;L, day P&amp;L, and quote freshness. <strong>Close</strong> on a row opens
+      a pre-filled exit proposal — lower the quantity to close only part. It still
+      needs your Approve; nothing sells on the click itself.
+    </p>
+
+    <h3>Working orders {{ info('Orders are grouped: an entry with its protective stop/take-profit legs shows as one family. The tags tell you which is which.') }}</h3>
+    <p>
+      Orders sitting at the broker, not yet filled. Each leg is tagged
+      <strong>ENTRY</strong> (would open new risk) or <strong>PROTECTIVE</strong>
+      (guards an existing position). <strong>Cancel</strong> removes one leg;
+      <strong>Cancel all</strong> (top right, with a strong confirm) removes every
+      working order — including protective stops, which leaves positions unguarded.
+      Use Cancel all only when you understand exactly why.
+    </p>
+
+    <h3>Recent executions</h3>
+    <p>The receipt tape: time, instrument, side, quantity, price, commission for every actual fill.</p>
+
+    <h3>Strategies (runtime panel) {{ info('This panel controls the running instances. Deploying new strategies or removing them happens on the Strategies tab; this is the on/off and tuning surface.') }}</h3>
+    <p>
+      Live strategy rows with state chips — RUNNING (working normally), ERROR
+      (something failed; the note column says what). <strong>Enable / Disable</strong>
+      switch a strategy on or off immediately. <strong>Edit params</strong> opens a
+      dialog to adjust its tunable settings on the fly (takes effect without a restart).
+    </p>
+
+    <h3>Risk &amp; reconciliation {{ info('“Reconciliation” means comparing the dashboard’s records with what the broker says you actually hold, and flagging any mismatch — e.g. a position whose protective stop has disappeared.') }}</h3>
+    <p>
+      Warnings about the shape of the whole account: concentration, group budgets
+      over their limit, positions without protection, record mismatches.
+      <strong>“Risk unavailable” is not good news</strong> — it means the risk check
+      cannot run, not that everything is fine.
+    </p>
+
+    <h3>Manual buy on paper — your first paper trade {{ info('The best first exercise. Total cost if it goes badly: pretend money.') }}</h3>
     <ol class="guide-steps">
-      <li>Create <code>asx_miners</code>.</li>
-      <li>manage → symbols <code>BHP, RIO</code> → exchange <code>ASX</code> → currency <code>AUD</code> → Add.</li>
-      <li>Use that watchlist on Deploy so you get Australian listings, not a US ticker with the same letters.</li>
+      <li>Check the command band says <span class="chip">PAPER</span>.</li>
+      <li>Click <strong>New proposal</strong>. In the drawer, type <code>AAPL</code> in Symbol and click <strong>Resolve</strong> — the exact conId fills itself in. (For a non-US stock, set Exchange and Currency first, e.g. <code>ASX</code> / <code>AUD</code>.)</li>
+      <li>Side <code>BUY</code>. Enter a small <strong>Notional amount</strong>, e.g. <code>500</code> — that means “buy about $500 worth”. (You can instead leave quantity and amount empty to let the server size it from your confidence; if sizing is not configured it answers <code>SIZING_BLOCKED</code> — just set an amount.)</li>
+      <li>Confidence <code>0.6</code>, and one honest line of reasoning — future-you will read it.</li>
+      <li><strong>Create proposal</strong>. The card appears in the Action queue.</li>
+      <li>Read your own card as if a stranger wrote it. Then <strong>Approve</strong>.</li>
+      <li>Watch it flow: Working orders (briefly) → Recent executions (the fill) → Positions (your new holding).</li>
     </ol>
+    <p class="guide-note">Change of heart at step 6? <strong>Reject</strong>. Nothing was sent; nothing is lost.</p>
+
+    <h3>Example B — close some or all of it</h3>
+    <ol class="guide-steps">
+      <li>Positions → the AAPL row → <strong>Close</strong>.</li>
+      <li>The drawer is pre-filled with the full quantity — lower it to close only part.</li>
+      <li>Create → the exit card appears in the queue → <strong>Approve</strong>.</li>
+      <li>After the fill, the position shrinks or disappears, and the result becomes realized P&amp;L.</li>
+    </ol>
+
+    <h3>Example C — something feels wrong</h3>
+    <ol class="guide-steps">
+      <li>Command band → <strong>Pause new trading</strong>. Instant; blocks all new risk.</li>
+      <li>Reject any pending proposals you do not fully understand.</li>
+      <li>Investigate calmly (health chips, Risk panel, Strategies panel).</li>
+      <li><strong>Resume</strong> when satisfied.</li>
+    </ol>
+
+    <h3>Example D — cancel an order without hurting yourself</h3>
+    <ol class="guide-steps">
+      <li>Working orders → find the leg → <strong>look at its tag first</strong>.</li>
+      <li><strong>ENTRY</strong>: cancelling just abandons a pending trade. Safe.</li>
+      <li><strong>PROTECTIVE</strong>: cancelling removes a stop-loss or take-profit — the position it guarded is then unprotected. Only do this deliberately (e.g. right before closing the position itself).</li>
+    </ol>
+  </section>
+
+  <section class="guide-section">
+    <h2>Research tab — finding candidates {{ info('Three working tools; Scan, Depth, Options, and Forex are placeholders marked “Later”. Results depend on the market-data plans configured on the server — if a tool needs a missing subscription, a banner says so.') }}</h2>
+    <table>
+      <thead><tr><th>Tool</th><th>What it does</th><th>Main controls</th></tr></thead>
+      <tbody>
+        <tr>
+          <td><strong>Ideas</strong> {{ info('Presets are ready-made recipes: momentum (already moving, may keep going), gap-up (jumped at the open), mean-reversion (stretched far from average, may snap back), breakout, volatile, gap-down. Start with momentum.') }}</td>
+          <td>Scores stocks against a preset recipe and ranks them.</td>
+          <td>Preset · source (market movers, your tickers, or a portfolio/universe) · result count · price/volume/change filters · optional fundamentals &amp; news enrichment</td>
+        </tr>
+        <tr>
+          <td><strong>Movers</strong></td>
+          <td>Today’s biggest gainers or losers, raw and unscored.</td>
+          <td>Market (stocks / crypto / indices …) · gainers or losers · count</td>
+        </tr>
+        <tr>
+          <td><strong>Lookup</strong></td>
+          <td>One symbol in depth: snapshot plus recent news headlines.</td>
+          <td>Ticker · news source · headline count</td>
+        </tr>
+      </tbody>
+    </table>
+    <p>
+      Click any result row to inspect it in the detail panel on the right.
+      A scanner hit is a <em>candidate</em>, not a verdict — read the numbers and the
+      news before proposing.
+    </p>
+    <h3>Example E — from scan to proposal</h3>
+    <ol class="guide-steps">
+      <li>Research → <strong>Ideas</strong> → preset <code>momentum</code> → Run Ideas.</li>
+      <li>Click a row that looks interesting; read its metrics and headlines in the detail panel.</li>
+      <li>Click <strong>Propose</strong> on the detail — the New proposal drawer opens pre-filled: resolved conId, side, confidence from the score, thesis and reasoning from the row (group tag <code>research</code>).</li>
+      <li>Adjust the size, then Create — and decide on the card in the Action queue like any other proposal.</li>
+    </ol>
+  </section>
+
+  <section class="guide-section">
+    <h2>Strategies tab — deploying automatic rules {{ info('Deploying means: write the strategy into the runtime config attached to your chosen symbols, load it immediately, and enable it. The strategy service also re-reads config within ~30 seconds by itself.') }}</h2>
+    <p>Two tables:</p>
+    <ul class="guide-tips">
+      <li><strong>Deployed strategies</strong> — what is loaded right now: state (RUNNING / DISABLED / ERROR), whether it proposes (the <span class="chip on">propose</span> chip), bar size, and the symbols or portfolio it watches. Actions: <strong>Enable / Disable / Undeploy</strong> (undeploy removes it from config, with a confirm).</li>
+      <li><strong>Available strategies</strong> — every strategy file found on disk, with its description, tunable parameters and their defaults. <strong>▸ deploy</strong> unfolds the deploy form.</li>
+    </ul>
+    <p class="guide-note">
+      The deploy form needs symbols <em>or</em> a portfolio — exactly one, not both,
+      not neither. <strong>Bar size</strong> is how often the strategy thinks: a
+      “5 mins” strategy re-evaluates once per completed 5-minute price bar.
+      Tick <strong>propose signals</strong> so its ideas appear as cards in your
+      Action queue — otherwise signals are only recorded for study.
+    </p>
+    <h3>Example F — deploy one strategy on two stocks</h3>
+    <ol class="guide-steps">
+      <li>Portfolios tab: create <code>tech_demo</code>, add <code>AAPL, MSFT</code> (Example G shows how).</li>
+      <li>Strategies tab → Available strategies → pick one → <strong>▸ deploy</strong>.</li>
+      <li>Name it (e.g. <code>orb_demo</code>), choose portfolio <code>tech_demo</code>, keep the default bar size and parameters.</li>
+      <li>Tick <strong>propose signals</strong> → <strong>Deploy &amp; enable</strong>.</li>
+      <li>Watch the Trading tab’s Strategies panel: RUNNING. When its rule fires, a card appears in your Action queue — approve or reject it like any other.</li>
+    </ol>
+  </section>
+
+  <section class="guide-section">
+    <h2>Portfolios tab — reusable symbol lists {{ info('Stored as universes in the local database. Every symbol is resolved to an exact IB contract when added — never guessed from the ticker letters.') }}</h2>
+    <p>
+      Create a list once, then point strategies at it. Click a portfolio’s name to
+      unfold its member panel: tick-and-remove members, add symbols, upload a CSV
+      (a <code>symbol</code> column, optionally <code>exchange</code> and
+      <code>currency</code>), or delete the whole list.
+    </p>
+    <h3>Example G — an Australian portfolio (why exchange &amp; currency matter)</h3>
+    <ol class="guide-steps">
+      <li>Create <code>asx_miners</code> (names: letters, digits, dash, underscore).</li>
+      <li>Unfold it → add symbols <code>BHP, RIO</code> with exchange <code>ASX</code> and currency <code>AUD</code>.</li>
+      <li>Result: the real Australian listings. Without the hints you could silently get a US-listed instrument that happens to share the ticker letters.</li>
+    </ol>
+  </section>
+
+  <section class="guide-section">
+    <h2>Scaling tab — advanced controls {{ info('Nothing here is needed for everyday propose-and-approve trading. Come back after the learning path at the bottom of this guide.') }}</h2>
+
+    <h3>Allocation &amp; scaling (live capital ceilings) {{ info('The signing dance exists so that raising real-money limits requires a private key that never touches this browser. The dashboard only builds and accepts JSON documents.') }}</h3>
+    <p>
+      A signed permission slip that caps how much real capital one strategy may use.
+      Flow: fill the form → <strong>Generate unsigned JSON</strong> → sign it offline
+      with the CLI (<code>mmr research allocation sign …</code>) → paste the signed
+      version → <strong>Activate</strong>. <strong>Suspend</strong> (with a reason)
+      immediately revokes an active authority — it is risk-reducing and always available.
+      The Authority history table below records every change.
+    </p>
+
+    <h3>Paper automation {{ info('The checklist above the controls must be green first — command authority enabled, paper account, artifacts writable. Expect lifecycle “armed” after Activate; “armed_unpersisted” means click Activate once more to finish saving; “failed” means read the error.') }}</h3>
+    <p>
+      The one sanctioned exception to approve-first: <strong>exactly one</strong>
+      chosen strategy is armed to place its own protected orders (entry plus
+      stop-loss) without a human click — <strong>paper accounts only</strong>; the
+      server refuses to arm this on live. Pick the strategy, write a reason,
+      <strong>Activate</strong>; <strong>Deactivate</strong> stands it down instantly.
+    </p>
+    <p class="guide-note">
+      <strong>Kill switches, strongest first:</strong> Deactivate paper automation
+      (Scaling) · Pause new trading (command band) · disable the strategy
+      (Trading → Strategies panel). All are immediate.
+    </p>
+  </section>
+
+  <section class="guide-section">
+    <h2>When the system says no — refusal codes {{ info('These are guardrails, not errors. Each refusal is one specific safety rule that fired. The code appears in the toast message or on the proposal card.') }}</h2>
+    <table>
+      <thead><tr><th>Code</th><th>In plain words</th><th>What to do</th></tr></thead>
+      <tbody>
+        <tr><td><code>SIZING_BLOCKED</code></td><td>You left quantity and amount empty, and automatic sizing is not configured on this server.</td><td>Enter a quantity or a notional amount.</td></tr>
+        <tr><td><code>QUOTE_UNAVAILABLE</code></td><td>No usable current price for this instrument (market data missing).</td><td>Check market hours and data subscriptions; try again.</td></tr>
+        <tr><td><code>QUOTE_STALE</code></td><td>The freshest available price is too old to trade on safely.</td><td>Wait for live data; typical outside market hours.</td></tr>
+        <tr><td><code>PRICE_DRIFT_EXCEEDED</code></td><td>The price has moved too far from what the proposal card showed — approving now would fill far from what you read.</td><td>Reject and re-propose at current prices if still interested.</td></tr>
+        <tr><td><code>ORDER_NOTIONAL_LIMIT</code></td><td>The order is bigger than the per-order size ceiling configured on the server.</td><td>Propose a smaller size (or raise the configured ceiling deliberately).</td></tr>
+        <tr><td><code>TRADING_PAUSED</code></td><td>Pause new trading is on; new risk is blocked.</td><td>Resume first — or enjoy the pause you asked for.</td></tr>
+        <tr><td><code>TRADING_FILTER_REJECTED</code></td><td>This instrument is on a deny list (or missing from the allow list).</td><td>Intentional guardrail; pick another instrument.</td></tr>
+        <tr><td><code>DUPLICATE_PENDING</code></td><td>That strategy already has an identical proposal waiting.</td><td>Nothing — it prevents double-ordering. Decide on the existing card.</td></tr>
+        <tr><td><code>NO_LONG_TO_CLOSE</code></td><td>A strategy sent SELL but you hold nothing to sell — ignored rather than allowed to open an accidental short.</td><td>Nothing; working as intended.</td></tr>
+        <tr><td><code>PROPOSAL_EXPIRED</code></td><td>The card sat unapproved past its time limit (≈30 min) — the price context it was written in is gone.</td><td>Re-propose if the idea still holds.</td></tr>
+        <tr><td><code>RISK_REJECTED</code></td><td>A portfolio-level limit would be breached — daily loss brake, too many open orders, or similar.</td><td>Read the detail; reduce risk before adding more.</td></tr>
+      </tbody>
+    </table>
+  </section>
+
+  <section class="guide-section">
+    <h2>Is everything healthy? {{ info('Rule of thumb: green chips + advancing “last event” + no banners = trust the screen. Anything else: verify before acting.') }}</h2>
+    <ul class="guide-tips">
+      <li><strong>Health chips</strong> (command band): all green dots = all systems connected. A red chip names the broken dependency.</li>
+      <li><strong>last event</strong> (tab row): should keep advancing during market hours.</li>
+      <li><strong>Stale position rows</strong> (red tint + ⚠ age): that price is old — do not act on it.</li>
+      <li><strong>“Risk unavailable”</strong> in the Risk panel means the check cannot run — never read it as “no problems”.</li>
+      <li><strong>Missing data is a warning, not an all-clear.</strong> When in doubt: Pause, investigate, Resume.</li>
+    </ul>
   </section>
 
   <section class="guide-section">
     <h2>Suggested learning path</h2>
     <ol class="guide-steps">
-      <li>Confirm badge says <strong>PAPER</strong>.</li>
-      <li>Do Example A (manual propose → approve → position).</li>
-      <li>Do Example B (close it).</li>
-      <li>Build a tiny watchlist and deploy one strategy with propose.</li>
-      <li>Approve or reject one strategy-made proposal.</li>
-      <li>Only then consider LIVE — treat every confirm as real money.</li>
+      <li>Confirm the badge says <span class="chip">PAPER</span>.</li>
+      <li>Skim “The words, organized” above once.</li>
+      <li>Example A — first manual trade; Example B — close it.</li>
+      <li>Example C — practice Pause / Resume once, calmly, so it is familiar before you ever need it.</li>
+      <li>Example G then F — build a small portfolio, deploy one strategy with <em>propose</em>.</li>
+      <li>Approve or reject a few strategy proposals; read every card properly.</li>
+      <li>Example E — drive one proposal from Research.</li>
+      <li>Only then consider LIVE — and treat every red confirm dialog as real money, because it is.</li>
     </ol>
   </section>
 
   <section class="guide-section">
-    <h2>CLI companions {{ info('These run outside the browser. resolve is the most useful for New proposal.') }}</h2>
-    <pre class="guide-pre"><code>mmr resolve AAPL
-mmr --json portfolio-snapshot
-mmr research allocation prepare …
-mmr research allocation sign …
-mmr activate-allocation …
-mmr suspend-allocation --reason "…"
-mmr strategies undeploy NAME</code></pre>
+    <h2>CLI companions {{ info('The command-line tool covers everything the dashboard does and more — backtesting, data downloads, bulk operations. These are the commands most useful alongside the dashboard.') }}</h2>
+    <pre class="guide-pre"><code>mmr resolve AAPL                  # ticker → exact conId
+mmr --json portfolio-snapshot     # compact account summary
+mmr proposals                     # the Action queue, in a terminal
+mmr approve 42 / mmr reject 42 --reason "…"
+mmr strategies                    # runtime strategy list
+mmr strategies undeploy NAME
+mmr data status                   # is local market data fresh?</code></pre>
   </section>
 
   <section class="guide-section guide-section-last">
-    <h2>Tips</h2>
+    <h2>Quick tips</h2>
     <ul class="guide-tips">
-      <li>Use <strong>conIds</strong> in New proposal (exact contract).</li>
-      <li>Drawers: <strong>Cancel</strong>, <strong>×</strong>, or <strong>Escape</strong> closes without sending.</li>
-      <li>Deploy needs symbols <em>or</em> watchlist — empty submit shows an error flash.</li>
-      <li>Missing risk data ≠ “all clear.”</li>
-      <li><strong>Pause new trading</strong> and <strong>New proposal</strong> live in the command band (top), not in the panels below.</li>
-      <li><strong>Dark / Light</strong> toggle is in the tab row; it defaults to your OS theme.</li>
-      <li>When confused: Pause → reject pending proposals → investigate → Resume.</li>
+      <li>Always <strong>Resolve</strong> in the proposal drawer — the conId is the exact contract; ticker letters alone can be ambiguous.</li>
+      <li>Any drawer closes without sending: <strong>Cancel</strong>, <strong>×</strong>, or <strong>Escape</strong>.</li>
+      <li><strong>Pause new trading</strong> and <strong>New proposal</strong> live in the command band, on every tab.</li>
+      <li>Check the <strong>ENTRY / PROTECTIVE</strong> tag before cancelling any order.</li>
+      <li>Write reasoning you would understand three weeks later.</li>
+      <li>A refusal code is the system protecting you — read it, don’t fight it.</li>
+      <li>Confused? Pause → reject what you don’t understand → investigate → Resume.</li>
     </ul>
   </section>
 </div>

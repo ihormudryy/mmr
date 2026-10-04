@@ -268,23 +268,27 @@ def print_status(message, success=True):
 # Argparse parser
 # ------------------------------------------------------------------
 
+def _read_trader_config() -> dict:
+    """The parsed trader.yaml; {} when missing, unreadable or not a mapping."""
+    import os
+    import yaml
+    path = Path(os.environ.get('TRADER_CONFIG', '~/.config/mmr/trader.yaml')).expanduser()
+    try:
+        with path.open() as f:
+            config = yaml.safe_load(f)
+    except (OSError, yaml.YAMLError):
+        return {}
+    return config if isinstance(config, dict) else {}
+
+
+def _data_provider_overrides(config: dict) -> dict:
+    overrides = config.get('data_providers')
+    return overrides if isinstance(overrides, dict) else {}
+
+
 def _load_default_data_source() -> str:
     import os
-    val = os.environ.get('MMR_DEFAULT_DATA_SOURCE')
-    if val:
-        return val
-    try:
-        import yaml
-        path = Path(os.environ.get('TRADER_CONFIG', '~/.config/mmr/trader.yaml')).expanduser()
-        if path.exists():
-            with path.open() as f:
-                cfg = yaml.safe_load(f) or {}
-            val = cfg.get('default_data_source')
-            if val:
-                return val
-    except Exception:
-        pass
-    return 'massive'
+    return os.environ.get('MMR_DEFAULT_DATA_SOURCE') or _read_trader_config().get('default_data_source') or 'alpaca'
 
 
 _DEFAULT_DATA_SOURCE = _load_default_data_source()
@@ -292,6 +296,32 @@ _DEFAULT_DATA_SOURCE = _load_default_data_source()
 
 def _src_default(choices, fallback):
     return _DEFAULT_DATA_SOURCE if _DEFAULT_DATA_SOURCE in choices else fallback
+
+
+# `default_data_source: alpaca` is the template value and is a history setting; it must not
+# move snapshots off IB. Only these values are read as a snapshot choice from the YAML.
+_YAML_SNAPSHOT_DEFAULTS = ('twelvedata', 'ib')
+
+
+def _snapshot_source_default(choices) -> str:
+    """Default `--source` for snapshot commands.
+
+    Order: `data_providers.quotes`, then MMR_DEFAULT_DATA_SOURCE, then a YAML
+    `default_data_source` of twelvedata or ib, then IB. REST sources cover US
+    listings only, so a symbol with an exchange hint must not silently go there.
+    """
+    import os
+    config = _read_trader_config()
+    explicit_quotes_source = _data_provider_overrides(config).get('quotes')
+    if explicit_quotes_source in choices:
+        return explicit_quotes_source
+    env_source = os.environ.get('MMR_DEFAULT_DATA_SOURCE')
+    if env_source in choices:
+        return env_source
+    yaml_source = config.get('default_data_source')
+    if yaml_source in _YAML_SNAPSHOT_DEFAULTS and yaml_source in choices:
+        return yaml_source
+    return 'ib'
 
 
 def _load_equity_decimation() -> str:
@@ -404,10 +434,14 @@ def build_parser() -> argparse.ArgumentParser:
     snap_p.add_argument('--delayed', action='store_true', default=False, help='Use delayed market data')
     snap_p.add_argument('--exchange', default='', help='Exchange hint (e.g. ASX, TSE, SEHK)')
     snap_p.add_argument('--currency', default='', help='Currency hint (e.g. AUD, JPY, HKD)')
-    snap_p.add_argument('--source', choices=['ib', 'twelvedata'],
-                        default=_src_default(['ib', 'twelvedata'], 'ib'),
-                        help='Data source (default: ib). twelvedata uses REST /quote — '
-                             'no bid/ask, but no trader_service or IB connection required.')
+    from trader.data_providers import Capability
+    from trader.data_providers.builtin import source_choices
+    quote_sources = ['ib'] + source_choices(Capability.QUOTES)
+    snap_p.add_argument('--source', choices=quote_sources,
+                        default=_snapshot_source_default(quote_sources),
+                        help='Data source (default: data_providers.quotes, else MMR_DEFAULT_DATA_SOURCE, else default_data_source twelvedata/ib, else ib). '
+                             'REST sources need no trader_service and cover US listings only; '
+                             'alpaca = IEX prices, twelvedata = no bid/ask.')
 
     # snapshot-batch
     snap_batch_p = sub.add_parser('snapshot-batch', help='Batch price snapshots (JSON)',
@@ -418,10 +452,11 @@ def build_parser() -> argparse.ArgumentParser:
     snap_batch_p.add_argument('symbols', nargs='+', help='Symbols to snapshot')
     snap_batch_p.add_argument('--exchange', default='', help='Exchange hint (e.g. ASX, TSE, SEHK)')
     snap_batch_p.add_argument('--currency', default='', help='Currency hint (e.g. AUD, JPY, HKD)')
-    snap_batch_p.add_argument('--source', choices=['ib', 'twelvedata'],
-                              default=_src_default(['ib', 'twelvedata'], 'ib'),
-                              help='Data source (default: ib). twelvedata batches up to '
-                                   '120 symbols per /quote call.')
+    snap_batch_p.add_argument('--source', choices=quote_sources,
+                              default=_snapshot_source_default(quote_sources),
+                              help='Data source (default: data_providers.quotes, else MMR_DEFAULT_DATA_SOURCE, else default_data_source twelvedata/ib, else ib). '
+                                   'REST sources need no trader_service and cover US listings only; '
+                                   'twelvedata batches up to 120 symbols per call.')
 
     # depth
     depth_p = sub.add_parser('depth', help='Market depth (Level 2 order book)',
@@ -829,6 +864,12 @@ def build_parser() -> argparse.ArgumentParser:
     hist_td_p.add_argument('--bar_size', default='1 day', help='Bar size (default: "1 day")')
     hist_td_p.add_argument('--prev_days', type=int, default=30, help='Days of history (default: 30)')
 
+    hist_alpaca_p = hist_sub.add_parser('alpaca', help='Download history from Alpaca (free)')
+    hist_alpaca_p.add_argument('--symbol', default=None, help='Single symbol to download')
+    hist_alpaca_p.add_argument('--universe', default=None, help='Universe name to download')
+    hist_alpaca_p.add_argument('--bar_size', default='1 day', help='Bar size (default: "1 day")')
+    hist_alpaca_p.add_argument('--prev_days', type=int, default=30, help='Days of history (default: 30)')
+
     hist_ib_p = hist_sub.add_parser('ib', help='Download history from Interactive Brokers')
     hist_ib_p.add_argument('--symbol', default=None, help='Single symbol to download')
     hist_ib_p.add_argument('--universe', default=None, help='Universe name to download')
@@ -888,20 +929,20 @@ def build_parser() -> argparse.ArgumentParser:
     fin_filing_p.add_argument('--limit', type=int, default=1, help='Number of filings (default: 1, most recent)')
 
     # news
-    news_p = sub.add_parser('news', help='Market news from Polygon/Benzinga (headlines)',
+    news_p = sub.add_parser('news', help='News headlines (default source: see data_providers.news)',
                              epilog='Examples:\n'
                                     '  news                          # General market news\n'
                                     '  news AAPL                     # News for AAPL\n'
                                     '  news AAPL --limit 20          # More articles\n'
-                                    '  news AAPL --source benzinga   # Use Benzinga source\n'
+                                    '  news AAPL --source benzinga   # Massive Benzinga feed\n'
                                     '  news AAPL --detail            # Full article details + sentiment\n'
                                     '\n'
                                     '  See also: news-fetch / news-search / news-enrich (~/dev/news scraper service)',
                              formatter_class=fmt)
     news_p.add_argument('ticker', nargs='?', default=None, help='Ticker to filter (optional)')
     news_p.add_argument('--limit', type=int, default=10, help='Number of articles (default: 10)')
-    news_p.add_argument('--source', default='polygon', choices=['polygon', 'benzinga'],
-                         help='News source (default: polygon)')
+    news_p.add_argument('--source', default=None, choices=source_choices(Capability.NEWS),
+                        help='News source (default: data_providers.news, else the builtin default)')
     news_p.add_argument('--detail', action='store_true', default=False,
                          help='Show full article details with descriptions/sentiment')
 
@@ -1076,22 +1117,25 @@ def build_parser() -> argparse.ArgumentParser:
                                    '/currency_conversion endpoint.')
 
     # movers
-    movers_p = sub.add_parser('movers', help='Top market movers (Massive.com or TwelveData)')
+    movers_p = sub.add_parser(
+        'movers', help='Top market movers (default: Alpaca; stocks drop sub-$1 names, warrants, rights, units)')
     movers_p.add_argument('--market', '-m', default='stocks',
                            choices=['stocks', 'crypto', 'indices', 'options', 'futures'],
                            help='Market type (default: stocks)')
     movers_p.add_argument('--losers', action='store_true', default=False,
                            help='Show losers instead of gainers')
     movers_p.add_argument('--detail', action='store_true', default=False,
-                           help='Enrich with company name, ratios, and news (card view; Massive only)')
+                           help='Enrich with company name, ratios, and news (card view)')
     movers_p.add_argument('--num', '-n', type=int, default=20,
                            help='Number of results (default: 20)')
-    # Massive-first: TD /market_movers requires Pro+ and is not covered by
-    # default_data_source (which is often twelvedata for cheap history/quotes).
-    movers_p.add_argument('--source', choices=['massive', 'twelvedata'],
-                          default='massive',
-                           help='Data source (default: massive). '
-                                'twelvedata needs a Pro+ plan for market movers.')
+    movers_p.add_argument('--min-price', type=float, default=1.0,
+                          help='Drop stock movers below this price (default: 1.0). 0 keeps all prices; '
+                               'warrants/rights/units and unknown prices are still dropped')
+    # Movers never inherit default_data_source (often twelvedata for cheap history/quotes);
+    # TD /market_movers requires Pro+.
+    movers_p.add_argument('--source', choices=source_choices(Capability.MOVERS), default=None,
+                          help='Data source (default: data_providers.movers, else the builtin default). '
+                               'twelvedata needs a Pro+ plan for market movers.')
 
     # scan
     scan_p = sub.add_parser('scan', help='IB market scanner',
@@ -1850,18 +1894,18 @@ def build_parser() -> argparse.ArgumentParser:
 
     data_dl_p = data_sub.add_parser(
         'download',
-        help='Download data from Massive.com or TwelveData to local DuckDB'
+        help='Download history to local DuckDB (default source: Alpaca; see --source)'
     )
     data_dl_p.add_argument('symbols', nargs='+', help='Symbols to download')
     data_dl_p.add_argument('--bar-size', default='1 day', help='Bar size (default: "1 day")')
     data_dl_p.add_argument('--days', type=int, default=365, help='Days of history (default: 365)')
+    from trader.data_providers.builtin import history_source_choices
     data_dl_p.add_argument(
         '--source',
-        choices=['massive', 'twelvedata', 'ib'],
-        default=_src_default(['massive', 'twelvedata', 'ib'], 'massive'),
-        help='Data source (default: massive). Use `ib` for international '
-             'exchanges (ASX, SEHK, TSE, EU) where massive/twelvedata do '
-             'not have coverage — requires trader_service / IB Gateway.',
+        choices=history_source_choices(),
+        default=None,
+        help='Data source (default: data_providers.history, else default_data_source, else alpaca). '
+             'Use `ib` for international exchanges (ASX, SEHK, TSE, EU) — requires trader_service / IB Gateway.',
     )
     data_dl_p.add_argument(
         '--force', '-f',
@@ -2137,20 +2181,8 @@ def dispatch(mmr: MMR, args: argparse.Namespace) -> bool:
         elif cmd == 'trades':
             print_df(mmr.trades(), title='Trades')
 
-        elif cmd in ('snapshot', 'snap'):
-            source = getattr(args, 'source', 'ib')
-            result = mmr.snapshot(args.symbol, delayed=args.delayed,
-                                  exchange=args.exchange, currency=args.currency,
-                                  source=source)
-            title = f'Snapshot: {args.symbol}' + (f' ({source})' if source != 'ib' else '')
-            print_dict(result, title=title)
-
-        elif cmd == 'snapshot-batch':
-            source = getattr(args, 'source', 'ib')
-            results = mmr.snapshot_batch(args.symbols, exchange=args.exchange,
-                                          currency=args.currency, source=source)
-            title = 'Snapshots' + (f' ({source})' if source != 'ib' else '')
-            print(json.dumps({"data": results, "title": title}, default=str))
+        elif cmd in ('snapshot', 'snap', 'snapshot-batch'):
+            _handle_snapshot(mmr, args, cmd)
 
         elif cmd == 'depth':
             _handle_depth(mmr, args)
@@ -3801,7 +3833,10 @@ def _handle_strategies_list(mmr: MMR):
     except (ConnectionError, TimeoutError) as e:
         print_status(
             f'strategy_service unreachable ({e}); showing local config '
-            f'(may be stale if service runs on another host)',
+            f'(may be stale if service runs on another host). '
+            f'In split Docker, strategy ports are not published to the Mac — '
+            f'run `docker compose exec trader python -m trader.mmr_cli strategies` '
+            f'or use the dashboard Strategies panel.',
             success=False,
         )
         _handle_strategies_from_config()
@@ -7064,6 +7099,7 @@ async def _run_sweeps_async(
     """Run every sweep in the manifest, writing a digest when done."""
     import asyncio
     import hashlib
+    import logging as _logging
     import os
     import signal
     import datetime as dt
@@ -7080,80 +7116,114 @@ async def _run_sweeps_async(
                 'to finish, then exiting gracefully...[/]'
             )
 
+    prev_handler = None
     try:
+        prev_handler = signal.getsignal(signal.SIGINT)
         signal.signal(signal.SIGINT, _on_sigint)
     except (ValueError, AttributeError):
         # Not in the main thread — skip handler installation.
-        pass
+        prev_handler = None
 
-    for plan in plans:
-        spec = plan['spec']
-        jobs = plan['jobs']
-        concurrency = auto_concurrency(spec['concurrency'])
-        config_hash = hashlib.sha256(
-            json.dumps(jobs, sort_keys=True, default=str).encode()
-        ).hexdigest()[:16]
-
-        # Record the sweep up-front so partial runs are still discoverable.
-        sweep_id = bstore.create_sweep(SweepRecord(
-            name=spec['name'],
-            manifest_yaml=manifest_yaml,
-            config_hash=config_hash,
-            n_runs_planned=len(jobs),
-            concurrency=concurrency,
-            note=spec.get('note', ''),
-        ))
-
-        if not _json_mode:
-            console.print(
-                f'[bold]Sweep #{sweep_id}: {spec["name"]}[/] '
-                f'— {len(jobs)} jobs at concurrency={concurrency}'
-            )
-
-        t0 = dt.datetime.now()
-        results = await _execute_jobs_parallel(
-            jobs, concurrency=concurrency, sweep_id=sweep_id,
-            cancel_flag=cancel_requested,
-        )
-        elapsed = (dt.datetime.now() - t0).total_seconds()
-
-        ok = sum(1 for r in results if r.get('status') == 'ok')
-        fail = len(results) - ok
-        status = (
-            'cancelled' if cancel_requested['flag']
-            else 'completed' if fail == 0
-            else 'failed' if ok == 0
-            else 'completed'  # partial success still counts as completed
-        )
-        digest_path = _write_sweep_digest(
-            sweep_id=sweep_id, spec=spec, results=results,
-            elapsed_s=elapsed, status=status,
-        )
-        bstore.finalize_sweep(
-            sweep_id, status=status,
-            n_runs_successful=ok, n_runs_failed=fail,
-            digest_path=digest_path,
-        )
-        if not _json_mode:
-            console.print(
-                f'  → sweep #{sweep_id} {status}: {ok}/{len(jobs)} ok '
-                f'in {elapsed/60:.1f}m  |  digest: {digest_path}'
-            )
-
-        if cancel_requested['flag']:
-            break
-
-    if _json_mode:
-        # Emit a compact summary list of the sweep ids we just ran.
-        ran = []
+    try:
         for plan in plans:
-            ran.append({'name': plan['spec']['name'],
-                         'jobs': len(plan['jobs'])})
-        print(json.dumps(
-            {'data': {'sweeps_run': ran, 'cancelled': cancel_requested['flag']},
-             'title': 'Sweep Batch'}, default=str,
-        ))
+            spec = plan['spec']
+            jobs = plan['jobs']
+            concurrency = auto_concurrency(spec['concurrency'])
+            config_hash = hashlib.sha256(
+                json.dumps(jobs, sort_keys=True, default=str).encode()
+            ).hexdigest()[:16]
 
+            # Record the sweep up-front so partial runs are still discoverable.
+            sweep_id = bstore.create_sweep(SweepRecord(
+                name=spec['name'],
+                manifest_yaml=manifest_yaml,
+                config_hash=config_hash,
+                n_runs_planned=len(jobs),
+                concurrency=concurrency,
+                note=spec.get('note', ''),
+            ))
+
+            if not _json_mode:
+                console.print(
+                    f'[bold]Sweep #{sweep_id}: {spec["name"]}[/] '
+                    f'— {len(jobs)} jobs at concurrency={concurrency}'
+                )
+
+            t0 = dt.datetime.now()
+            results: List[Dict[str, Any]] = []
+            status = 'failed'
+            ok = 0
+            fail = len(jobs)
+            digest_path = ''
+            try:
+                results = await _execute_jobs_parallel(
+                    jobs, concurrency=concurrency, sweep_id=sweep_id,
+                    cancel_flag=cancel_requested,
+                )
+                elapsed = (dt.datetime.now() - t0).total_seconds()
+                ok = sum(1 for r in results if r.get('status') == 'ok')
+                fail = len(results) - ok
+                status = (
+                    'cancelled' if cancel_requested['flag']
+                    else 'completed' if fail == 0
+                    else 'failed' if ok == 0
+                    else 'completed'  # partial success still counts as completed
+                )
+                digest_path = _write_sweep_digest(
+                    sweep_id=sweep_id, spec=spec, results=results,
+                    elapsed_s=elapsed, status=status,
+                )
+            except Exception as ex:
+                elapsed = (dt.datetime.now() - t0).total_seconds()
+                status = 'cancelled' if cancel_requested['flag'] else 'failed'
+                ok = sum(1 for r in results if r.get('status') == 'ok')
+                fail = max(len(jobs) - ok, 1)
+                _logging.exception(
+                    'sweep #%s (%s) aborted after %.1fs: %s',
+                    sweep_id, spec['name'], elapsed, ex,
+                )
+                try:
+                    digest_path = _write_sweep_digest(
+                        sweep_id=sweep_id, spec=spec, results=results,
+                        elapsed_s=elapsed, status=status,
+                    )
+                except Exception:
+                    digest_path = ''
+            finally:
+                # Always finalize — a half-open 'running' row is worse than a
+                # failed/cancelled summary after an unexpected exception.
+                bstore.finalize_sweep(
+                    sweep_id, status=status,
+                    n_runs_successful=ok, n_runs_failed=fail,
+                    digest_path=digest_path,
+                )
+
+            if not _json_mode:
+                console.print(
+                    f'  → sweep #{sweep_id} {status}: {ok}/{len(jobs)} ok '
+                    f'in {(dt.datetime.now() - t0).total_seconds()/60:.1f}m  '
+                    f'|  digest: {digest_path}'
+                )
+
+            if cancel_requested['flag']:
+                break
+
+        if _json_mode:
+            # Emit a compact summary list of the sweep ids we just ran.
+            ran = []
+            for plan in plans:
+                ran.append({'name': plan['spec']['name'],
+                             'jobs': len(plan['jobs'])})
+            print(json.dumps(
+                {'data': {'sweeps_run': ran, 'cancelled': cancel_requested['flag']},
+                 'title': 'Sweep Batch'}, default=str,
+            ))
+    finally:
+        if prev_handler is not None:
+            try:
+                signal.signal(signal.SIGINT, prev_handler)
+            except (ValueError, AttributeError):
+                pass
 
 async def _execute_jobs_parallel(
     jobs: List[Dict[str, Any]],
@@ -8459,6 +8529,46 @@ def _try_get_exchange_calendar_for(security):
     return None
 
 
+def _rest_history_worker(source: str, cfg):
+    from trader.data_providers import Capability, ProviderRegistry
+    return ProviderRegistry.from_config(cfg).get(Capability.HISTORY, source)
+
+
+def _default_history_source(cfg) -> str:
+    """Registry default for history, plus `ib`, which only the CLI knows.
+
+    An explicit `data_providers.history` always wins. Next comes the per-shell
+    MMR_DEFAULT_DATA_SOURCE, then `default_data_source` from config. An `ib`
+    default is kept instead of silently switching to Alpaca.
+    """
+    import os
+    from trader.data_providers import Capability, ProviderRegistry
+    from trader.data_providers.builtin import IB_HISTORY_SOURCE
+    explicit_history_source = (cfg.get('data_providers') or {}).get('history')
+    if explicit_history_source:
+        return explicit_history_source
+    default_data_source = os.environ.get('MMR_DEFAULT_DATA_SOURCE') or cfg.get('default_data_source')
+    if default_data_source == IB_HISTORY_SOURCE:
+        return IB_HISTORY_SOURCE
+    effective_config = {**cfg, 'default_data_source': default_data_source}
+    return ProviderRegistry.from_config(effective_config).default_source(Capability.HISTORY)
+
+
+def _download_setup_failure(message: str, symbol_count: int) -> Dict[str, Any]:
+    """Report a failure before any download started, in the shape of a normal result.
+
+    Batch callers (`data refresh`) read the summary, so a bare return would
+    look like success.
+    """
+    summary = {'completed': 0, 'skipped_up_to_date': 0,
+               'failed': symbol_count, 'rows_written': 0}
+    if _json_mode:
+        print(json.dumps({'success': False, 'message': message, **summary}))
+    else:
+        print_status(message, success=False)
+    return {**summary, 'error': message}
+
+
 def _handle_data_download(args: argparse.Namespace):
     """Download data from the selected source directly to local DuckDB.
 
@@ -8477,43 +8587,26 @@ def _handle_data_download(args: argparse.Namespace):
     container = Container.instance()
     cfg = container.config()
     duckdb_path = cfg.get('duckdb_path', '')
-    source = getattr(args, 'source', 'massive')
+    source = getattr(args, 'source', None) or _default_history_source(cfg)
 
-    api_key = ''
-    if source == 'twelvedata':
-        api_key = cfg.get('twelvedata_api_key', '')
-        if not api_key:
-            print_status('twelvedata_api_key not configured (set TWELVEDATA_API_KEY env var)', success=False)
-            return
-    elif source == 'massive':
-        api_key = cfg.get('massive_api_key', '')
-        if not api_key:
-            print_status('massive_api_key not configured in trader.yaml', success=False)
-            return
-    elif source == 'ib':
-        # IB needs no API key — uses the trader_service / Gateway connection.
-        # We'll spin a short-lived IBHistoryWorker connection per call.
-        pass
-    else:
-        print_status(f'Unknown source: {source!r}', success=False)
-        return
+    from trader.data_providers import ProviderError
+
+    worker = None
+    if source != 'ib':
+        try:
+            worker = _rest_history_worker(source, cfg)
+        except ProviderError as ex:
+            return _download_setup_failure(str(ex), len(args.symbols))
 
     if not duckdb_path:
-        print_status('duckdb_path not configured', success=False)
-        return
+        return _download_setup_failure('duckdb_path not configured', len(args.symbols))
 
     bar_size = BarSize.parse_str(getattr(args, 'bar_size', '1 day'))
     history_path = cfg.get('history_duckdb_path', '') or duckdb_path
     storage = TickStorage(history_path)
     accessor = UniverseAccessor(duckdb_path, cfg.get('universe_library', 'Universes'))
 
-    if source == 'twelvedata':
-        from trader.listeners.twelvedata_history import TwelveDataHistoryWorker
-        worker = TwelveDataHistoryWorker(twelvedata_api_key=api_key)
-    elif source == 'massive':
-        from trader.listeners.massive_history import MassiveHistoryWorker
-        worker = MassiveHistoryWorker(massive_api_key=api_key)
-    else:  # source == 'ib'
+    if source == 'ib':
         from trader.listeners.ib_history_worker import IBHistoryWorker
         import os as _os
         # docker-entrypoint.sh writes the resolved IB_SERVER_* values to
@@ -9123,10 +9216,10 @@ def _handle_data_migrate_symbols(args: argparse.Namespace):
 
 # ---- data refresh / data status -----------------------------------------
 
-# US-exchange codes that route to TwelveData by default. Anything else falls
+# US-exchange codes that route to Alpaca by default. Anything else falls
 # through to IB. Kept module-level so a future symbol-level override can
 # reference the same list.
-_US_EXCHANGES_FOR_TD = frozenset({
+_US_EXCHANGES = frozenset({
     'NASDAQ', 'NYSE', 'ARCA', 'AMEX', 'BATS', 'IEX', 'SMART',
 })
 
@@ -9152,16 +9245,16 @@ def _load_data_refresh_yaml() -> Dict[str, Any]:
 
 
 def _auto_source_for_universe(universe_symbols) -> str:
-    """Pick 'twelvedata' or 'ib' based on the dominant exchange in
-    ``universe_symbols``. Bias to TD when any meaningful fraction of the
-    universe is US-listed, since TD downloads cost ~nothing and IB
-    historical pacing is the bottleneck."""
+    """Pick 'alpaca' or 'ib' based on the dominant exchange in
+    ``universe_symbols``. Bias to Alpaca when most of the universe is
+    US-listed, since Alpaca is free and IB historical pacing is the
+    bottleneck."""
     if not universe_symbols:
         return 'ib'
     us_count = sum(1 for sd in universe_symbols
-                   if (sd.exchange or '').upper() in _US_EXCHANGES_FOR_TD
-                   or (sd.primaryExchange or '').upper() in _US_EXCHANGES_FOR_TD)
-    return 'twelvedata' if us_count >= len(universe_symbols) / 2 else 'ib'
+                   if (sd.exchange or '').upper() in _US_EXCHANGES
+                   or (sd.primaryExchange or '').upper() in _US_EXCHANGES)
+    return 'alpaca' if us_count >= len(universe_symbols) / 2 else 'ib'
 
 
 def _handle_data_refresh(args: argparse.Namespace):
@@ -9260,7 +9353,8 @@ def _handle_data_refresh(args: argparse.Namespace):
                                 'symbols': len(symbols), 'bar_size': bar_size,
                                 'days': days, 'downloaded': summary.get('completed', 0),
                                 'failed_symbols': dl_failed,
-                                **({} if job_ok else {'error': f'{dl_failed} symbol(s) failed to download'})})
+                                **({} if job_ok else {'error': summary.get('error')
+                                                      or f'{dl_failed} symbol(s) failed to download'})})
             finally:
                 _json_mode = saved_json_mode
         except Exception as ex:
@@ -9373,6 +9467,23 @@ def _handle_data_status():
         table.add_row(r['job'], r['universe'] or '—', r['bar_size'],
                       cov, last, f'[{style}]{stale}[/{style}]')
     console.print(table)
+
+
+def _handle_snapshot(mmr: MMR, args: argparse.Namespace, cmd: str):
+    from trader.data_providers import ProviderError
+    source = getattr(args, 'source', 'ib')
+    suffix = f' ({source})' if source != 'ib' else ''
+    try:
+        if cmd == 'snapshot-batch':
+            results = mmr.snapshot_batch(args.symbols, exchange=args.exchange,
+                                         currency=args.currency, source=source)
+            print(json.dumps({'data': results, 'title': 'Snapshots' + suffix}, default=str))
+        else:
+            result = mmr.snapshot(args.symbol, delayed=args.delayed, exchange=args.exchange,
+                                  currency=args.currency, source=source)
+            print_dict(result, title=f'Snapshot: {args.symbol}{suffix}')
+    except (ProviderError, ValueError) as ex:
+        print_status(str(ex), success=False)
 
 
 def _handle_depth(mmr: MMR, args: argparse.Namespace):
@@ -9533,6 +9644,15 @@ def _handle_history(mmr: MMR, args: argparse.Namespace):
     elif action in ('twelvedata', 'td'):
         console.print('[dim]Pulling TwelveData history via data_service...[/dim]')
         result = mmr.pull_twelvedata(
+            symbols=symbols,
+            universe=universe,
+            bar_size=args.bar_size,
+            prev_days=args.prev_days,
+        )
+    elif action == 'alpaca':
+        console.print('[dim]Pulling Alpaca history via data_service...[/dim]')
+        result = mmr.pull_history(
+            'alpaca',
             symbols=symbols,
             universe=universe,
             bar_size=args.bar_size,
@@ -10096,8 +10216,9 @@ def _handle_news_universe(args: argparse.Namespace):
 
 
 def _handle_news(mmr: MMR, args: argparse.Namespace):
-    """Fetch news from Massive.com (headline path)."""
+    """Fetch news headlines from a registry news source."""
     import logging as _logging
+    from trader.data_providers import ProviderError
     _logging.getLogger('urllib3').setLevel(_logging.WARNING)
 
     ticker = args.ticker.upper() if args.ticker else None
@@ -10118,7 +10239,7 @@ def _handle_news(mmr: MMR, args: argparse.Namespace):
                     f'[dim]{a["published"]}  |  {a["author"]}'
                     f'{"  |  " + tickers_str if tickers_str else ""}[/dim]'
                 )
-                desc = a.get('description') or a.get('teaser', '')
+                desc = a.get('summary', '')
                 if desc:
                     console.print(desc)
                 insights = a.get('insights', [])
@@ -10141,11 +10262,13 @@ def _handle_news(mmr: MMR, args: argparse.Namespace):
             # Truncate title for table display
             if 'title' in df.columns:
                 df['title'] = df['title'].str[:80]
-            if 'teaser' in df.columns:
-                df['teaser'] = df['teaser'].str[:60]
+            if 'summary' in df.columns:
+                df['summary'] = df['summary'].str[:60]
             print_df(df, title=title_label)
     except ValueError as e:
         console.print(f'[red]{e}[/red]')
+    except ProviderError as ex:
+        print_status(str(ex), success=False)
 
 
 def _handle_options(mmr: MMR, args: argparse.Namespace):
@@ -10154,7 +10277,7 @@ def _handle_options(mmr: MMR, args: argparse.Namespace):
 
     action = getattr(args, 'opt_action', None)
     if not action:
-        console.print('[yellow]Usage: options expirations|chain|snapshot|implied|buy|sell[/yellow]')
+        print_status('Usage: options expirations|chain|snapshot|implied|buy|sell', success=False)
         return
 
     import logging as _logging
@@ -10164,7 +10287,7 @@ def _handle_options(mmr: MMR, args: argparse.Namespace):
         symbol = args.symbol.upper()
         dates = mmr.options_expirations(symbol)
         if not dates:
-            console.print(f'[dim]No expiration dates found for {symbol}[/dim]')
+            print_status(f'No expiration dates found for {symbol}', success=False)
             return
         import pandas as pd
         rows = []
@@ -10179,9 +10302,9 @@ def _handle_options(mmr: MMR, args: argparse.Namespace):
         symbol = args.symbol.upper()
         expiration = _resolve_expiration(mmr, symbol, args.expiration) if args.expiration else None
         if args.expiration and expiration is None:
-            console.print(f'[dim]No expiration dates found for {symbol}[/dim]')
+            print_status(f'No expiration dates found for {symbol}', success=False)
             return
-        if expiration and expiration != args.expiration:
+        if expiration and expiration != args.expiration and not _json_mode:
             console.print(f'[dim]Using expiration: {expiration}[/dim]')
         df = mmr.options_chain(
             symbol,
@@ -10191,7 +10314,11 @@ def _handle_options(mmr: MMR, args: argparse.Namespace):
             strike_max=args.strike_max,
         )
         if df.empty:
-            console.print(f'[dim]No chain data for {symbol}[/dim]')
+            print_status(f'No chain data for {symbol}', success=False)
+            return
+
+        if _json_mode:
+            print_df(df, title=f'Options Chain: {symbol}')
             return
 
         # Format for display
@@ -10230,11 +10357,14 @@ def _handle_options(mmr: MMR, args: argparse.Namespace):
         symbol = args.symbol.upper()
         expiration = _resolve_expiration(mmr, symbol, args.expiration)
         if not expiration:
-            console.print(f'[dim]No expiration dates found for {symbol}[/dim]')
+            print_status(f'No expiration dates found for {symbol}', success=False)
             return
-        if expiration != args.expiration:
+        if expiration != args.expiration and not _json_mode:
             console.print(f'[dim]Using expiration: {expiration}[/dim]')
         data = mmr.options_implied(symbol, expiration, args.risk_free_rate)
+        if _json_mode:
+            print_json_result(data, title=f'Implied: {symbol} {expiration}')
+            return
         from trader.tools.chain import plot_market_implied_vs_constant_console
         plot_market_implied_vs_constant_console(
             data['x'], data['market_implied'], data['constant'],
@@ -10244,13 +10374,13 @@ def _handle_options(mmr: MMR, args: argparse.Namespace):
     elif action == 'buy':
         symbol = args.symbol.upper()
         if not args.market and args.limit is None:
-            console.print('[red]Specify --market or --limit[/red]')
+            print_status('Specify --market or --limit', success=False)
             return
         expiration = _resolve_expiration(mmr, symbol, args.expiration)
         if not expiration:
-            console.print(f'[dim]No expiration dates found for {symbol}[/dim]')
+            print_status(f'No expiration dates found for {symbol}', success=False)
             return
-        if expiration != args.expiration:
+        if expiration != args.expiration and not _json_mode:
             console.print(f'[dim]Using expiration: {expiration}[/dim]')
         result = mmr.buy_option(
             symbol, expiration, args.strike, args.right,
@@ -10261,13 +10391,13 @@ def _handle_options(mmr: MMR, args: argparse.Namespace):
     elif action == 'sell':
         symbol = args.symbol.upper()
         if not args.market and args.limit is None:
-            console.print('[red]Specify --market or --limit[/red]')
+            print_status('Specify --market or --limit', success=False)
             return
         expiration = _resolve_expiration(mmr, symbol, args.expiration)
         if not expiration:
-            console.print(f'[dim]No expiration dates found for {symbol}[/dim]')
+            print_status(f'No expiration dates found for {symbol}', success=False)
             return
-        if expiration != args.expiration:
+        if expiration != args.expiration and not _json_mode:
             console.print(f'[dim]Using expiration: {expiration}[/dim]')
         result = mmr.sell_option(
             symbol, expiration, args.strike, args.right,
@@ -10276,7 +10406,7 @@ def _handle_options(mmr: MMR, args: argparse.Namespace):
         _print_trade_result(result, 'SELL', f'{symbol} {expiration} {args.strike}{args.right}')
 
     else:
-        console.print(f'[yellow]Unknown options action: {action}[/yellow]')
+        print_status(f'Unknown options action: {action}', success=False)
 
 
 def _handle_forex(mmr: MMR, args: argparse.Namespace):
@@ -10336,13 +10466,21 @@ def _handle_movers(mmr: MMR, args: argparse.Namespace):
 
     direction = 'losers' if args.losers else 'gainers'
     market = args.market
-    source = getattr(args, 'source', 'massive')
 
+    from trader.data_providers import Capability, ProviderError
+    try:
+        source = getattr(args, 'source', None) or mmr._provider_default(Capability.MOVERS)
+        _print_movers(mmr, args, market, direction, source)
+    except ProviderError as ex:
+        print_status(str(ex), success=False)
+
+
+def _print_movers(mmr: MMR, args: argparse.Namespace, market: str, direction: str, source: str):
     if not args.detail:
-        df = mmr.movers(market=market, direction=direction, source=source)
+        df = mmr.movers(market=market, direction=direction, source=source, min_price=args.min_price)
         if args.num and len(df) > args.num:
             df = df.head(args.num)
-        title_suffix = ' — TwelveData' if source == 'twelvedata' else ''
+        title_suffix = f' — {source}'
         print_df(df, title=f'{market.title()} Movers ({direction}){title_suffix}')
         return
 
@@ -10352,7 +10490,8 @@ def _handle_movers(mmr: MMR, args: argparse.Namespace):
         console.print(
             '[dim]TwelveData detail mode: ~100 credits per ticker for ratios, no news.[/dim]'
         )
-    movers = mmr.movers_detail(market=market, direction=direction, num=args.num, source=source)
+    movers = mmr.movers_detail(market=market, direction=direction, num=args.num, source=source,
+                               min_price=args.min_price)
     if not movers:
         console.print('[dim]No data[/dim]')
         return
@@ -10369,7 +10508,7 @@ def _handle_movers(mmr: MMR, args: argparse.Namespace):
         change = m.get('change', 0) or 0
         change_pct = m.get('change_pct', 0) or 0
         close = m.get('close', 0) or 0
-        volume = m.get('volume', 0) or 0
+        volume = m.get('volume')
         mkt_cap = details.get('market_cap')
 
         color = 'green' if change >= 0 else 'red'
@@ -10389,7 +10528,9 @@ def _handle_movers(mmr: MMR, args: argparse.Namespace):
             console.print(f'[dim]{name}[/dim]')
 
         # Stats line: volume, market cap, ratios
-        stats = [f'vol {volume:,.0f}']
+        stats = []
+        if volume is not None and volume == volume:
+            stats.append(f'vol {volume:,.0f}')
         if mkt_cap:
             if mkt_cap >= 1e12:
                 stats.append(f'cap ${mkt_cap/1e12:.1f}T')
@@ -10401,7 +10542,8 @@ def _handle_movers(mmr: MMR, args: argparse.Namespace):
             val = ratios.get(label)
             if val is not None:
                 stats.append(f'{label.upper()} {val:g}')
-        console.print(f'[dim]{" | ".join(stats)}[/dim]')
+        if stats:
+            console.print(f'[dim]{" | ".join(stats)}[/dim]')
 
         # News line
         headline = news.get('headline')

@@ -125,8 +125,22 @@ command_authority:
   enabled: true            # master switch: build/register the authority at all
   live_enabled: false      # allow risk-increasing commands on a LIVE account
   live_account_id: ''      # must equal the trader's IB account when live_enabled
-  max_order_notional:      # hard per-order notional ceiling (required when live_enabled)
+  # Hard per-order notional ceiling, enforced in BOTH paper and live (required
+  # when live_enabled). Without it a fresh LLM/auto entry has no hard per-trade
+  # size cap — the risk gate's concentration limit only bounds ADDING to an
+  # existing position, not opening one. 25000 matches the position_sizing.yaml
+  # per-position ceiling ($25k). Raise per-deployment in ~/.config/mmr if your
+  # book legitimately needs larger single orders.
+  max_order_notional: 25000
   max_drift_bps: 50        # server-side price-drift ceiling (bps)
+  # Opt-in PAPER quote-staleness bound (seconds). Live mode always enforces a
+  # hard 5s age; paper otherwise checks only price-drift, so a market-closed /
+  # degraded-feed snapshot serving a cached last-value could pass. 1800 (30 min)
+  # is deliberately generous: paper commonly runs on ~15-min delayed data whose
+  # timestamp is legitimately old, so a tight bound would reject every delayed
+  # quote. This rejects hours-old cached values, not normal delayed data. Blank
+  # = off (legacy behaviour). Only relevant with automation / LLM auto-approve.
+  max_paper_quote_age_seconds: 1800
 
 # Deterministic automation configuration (P3).
 # When enabled, only a single signed artifact bundle runs under strict control.
@@ -148,16 +162,32 @@ massive_delayed: false
 # TwelveData (parallel history backend; set TWELVEDATA_API_KEY env var as alternative)
 twelvedata_api_key: ''
 
+# Alpaca market data (free Basic plan with a paper account). Default history
+# source for US stocks. Env vars ALPACA_API_KEY_ID / ALPACA_API_SECRET_KEY
+# are used when these are empty.
+alpaca_api_key_id: ''
+alpaca_api_secret_key: ''
+
 # CLI default for --source on commands that take it (history download,
 # snapshot, watch, financials, fx). Per-command --source still wins.
 # Override per-shell with MMR_DEFAULT_DATA_SOURCE.
-# Recognised values: massive, twelvedata, ib (only used where the choice
+# Recognised values: alpaca, massive, twelvedata, ib (only used where the choice
 # set for that command includes it; otherwise the command's own default
-# applies).
-# NOTE: `ideas` and `movers` always default to massive — TwelveData's
-# /market_movers endpoint requires Pro+, so inheriting twelvedata here
-# would 403 on Basic/Starter keys that still work for quotes/history.
-default_data_source: twelvedata
+# applies). It affects `data download`. `snapshot` / `snapshot-batch` default to
+# data_providers.quotes, else MMR_DEFAULT_DATA_SOURCE if it names a quote source,
+# else a default_data_source of twelvedata or ib, else IB. `alpaca` here does NOT
+# switch snapshots (set data_providers.quotes: alpaca for that). REST sources
+# cover US listings only; --exchange/--currency need IB.
+# `movers` and `news` never inherit it: use data_providers.movers /
+# data_providers.news below. `ideas` still defaults to massive until phase 3b.
+default_data_source: alpaca
+
+# Optional per-capability override. Wins over default_data_source.
+# data_providers:
+#   history: alpaca
+#   quotes: alpaca    # snapshot default; unset = IB
+#   movers: alpaca
+#   news: alpaca
 
 # Equity-curve decimation at backtest-persist time. The full per-bar
 # series is ~9.9 MB per 1-min run (4,713 runs took ~47 GB pre-fix);

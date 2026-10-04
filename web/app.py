@@ -689,6 +689,59 @@ def fetch_available_strategies() -> list[dict]:
     return rows
 
 
+def resolve_strategy_params_editor(name: str) -> dict | None:
+    """Current params + class tunables for the command-center Params drawer.
+
+    Prefers live ``list_strategies`` when strategy_service is reachable, else
+    YAML. Tunables come from the static AST scan of ``strategies/`` so the
+    form shows defaults even when YAML has no overrides yet.
+    """
+    strategy_name = (name or '').strip()
+    if not strategy_name:
+        return None
+
+    live_row = None
+    try:
+        rows, _warn = fetch_strategies()
+        live_row = next(
+            (r for r in rows if str(r.get('name') or '') == strategy_name),
+            None,
+        )
+    except Exception as exc:  # noqa: BLE001 — YAML fallback
+        logger.debug('live strategies unavailable for params editor: %s', exc)
+
+    yaml_row = next(
+        (r for r in fetch_deployed_from_config()
+         if str(r.get('name') or '') == strategy_name),
+        None,
+    )
+    if live_row is None and yaml_row is None:
+        return None
+
+    class_name = (
+        (live_row or {}).get('class_name')
+        or (yaml_row or {}).get('class_name')
+        or ''
+    )
+    params = dict((live_row or {}).get('params') or {})
+    if not params and yaml_row is not None:
+        params = dict(yaml_row.get('params') or {})
+
+    tunables: dict = {}
+    if class_name:
+        for available in fetch_available_strategies():
+            if available.get('class') == class_name:
+                tunables = dict(available.get('tunables') or {})
+                break
+
+    return {
+        'strategy_name': strategy_name,
+        'class_name': class_name,
+        'params': params,
+        'tunables': tunables,
+    }
+
+
 def fetch_proposals() -> list[dict]:
     # No status filter -> every proposal, with a 'status' column.
     rows = _records(_call(lambda m: m.proposals(limit=100)))

@@ -52,6 +52,24 @@ class FakeUniverse:
         )
 
 
+class FakePositions:
+    """Stand-in PositionAuthority. ``held`` is the broker-reported reducible
+    (long) quantity for the account/conid; 0 means flat."""
+
+    def __init__(self, held=0.0):
+        self.held = held
+
+    def reducible_quantity(self, account_id, conid):
+        return self.held
+
+
+def _bid_quote():
+    return ExecutableQuote(
+        conid=265598, side="bid", price=209.0, market_timestamp=NOW,
+        feed_type="live", session_state="continuous",
+    )
+
+
 @pytest.fixture
 def authority(tmp_path):
     db = DuckDBConnection.get_instance(str(tmp_path / "journal.duckdb"))
@@ -62,6 +80,7 @@ def authority(tmp_path):
     repository = ProposalRepository(journal)
     quotes = FakeQuotes()
     risk_gate = FakeRiskGate()
+    positions = FakePositions(held=0.0)
     service = ProposalCommandService(
         repository=repository,
         journal=journal,
@@ -72,10 +91,11 @@ def authority(tmp_path):
         account_mode="paper",
         now=lambda: NOW,
         ttl=dt.timedelta(minutes=5),
+        positions=positions,
     )
     return SimpleNamespace(
         db=db, journal=journal, repository=repository, quotes=quotes,
-        risk_gate=risk_gate, service=service,
+        risk_gate=risk_gate, positions=positions, service=service,
     )
 
 
@@ -83,6 +103,49 @@ def _request(**overrides):
     values = dict(conid=265598, action="BUY", confidence=0.7, amount=5_000.0)
     values.update(overrides)
     return ProposalCreateRequest(**values)
+
+
+def test_reserve_id_skips_ids_already_materialized_when_sequence_lags(authority):
+    """WAL quarantine can leave rows while DuckDB sequence last_value resets."""
+    conn = authority.journal.connect()
+    # Occupy id 1 without consuming nextval — the desync shape after a
+    # discarded WAL where checkpointed rows outlive sequence state.
+    conn.execute(
+        """
+        INSERT INTO trade_proposals (
+            id, symbol, action, quantity, amount, execution, reasoning,
+            confidence, thesis, source, metadata, status, created_at,
+            updated_at, order_ids, rejection_reason, sec_type, account_id,
+            account_mode, conid, reference_price, reference_timestamp,
+            reference_quote_side, reference_feed_type, max_price_drift_bps,
+            expires_at, live_approval_eligible, revision, order_group_id
+        ) VALUES (
+            1, 'AAPL', 'BUY', 1.0, NULL, '{}', 'orphan', 0.5, '', 'manual', '{}',
+            'REJECTED', ?, ?, '[]', 'seed', 'STK', 'DU111111', 'paper', 265598,
+            210.0, ?, 'ask', 'live', 50.0, ?, false, 1, NULL
+        )
+        """,
+        [NOW.replace(tzinfo=None), NOW.replace(tzinfo=None), NOW, NOW],
+    )
+    conn.execute(
+        """
+        INSERT INTO domain_event_journal (
+            event_id, entity_revision, event_type, entity_type, entity_id,
+            operation, account_id, source, source_timestamp, received_timestamp,
+            correlation_id, payload
+        ) VALUES (
+            'proposal:1:1', 1, 'proposal.updated', 'proposal', '1',
+            'upsert', 'DU111111', 'trader_service', ?, ?, 'seed', '{}'
+        )
+        """,
+        [NOW, NOW],
+    )
+
+    created = authority.service.create_proposal(
+        _request(group="tech"), source="dashboard", correlation_id="cmd-after-lag"
+    )
+    assert created.id == 2
+    assert created.status == "PENDING"
 
 
 def test_create_is_guard_complete_and_journaled(authority):
@@ -128,6 +191,50 @@ def test_strategy_duplicate_pending_is_refused(authority):
 
     with pytest.raises(ProposalCreationRefused, match="DUPLICATE_PENDING"):
         authority.service.create_proposal(_request(), source="strategy:orb", correlation_id="c2")
+
+
+def test_strategy_sell_while_flat_is_refused(authority):
+    """Long-only bridge semantics: a strategy SELL with no held long is
+    'ignored when flat' — refused before it can become a short proposal."""
+    authority.positions.held = 0.0
+
+    with pytest.raises(ProposalCreationRefused, match="NO_LONG_TO_CLOSE"):
+        authority.service.create_proposal(
+            _request(action="SELL", amount=5_000.0),
+            source="strategy:orb", correlation_id="sell-flat",
+        )
+
+    assert authority.repository.list(status="PENDING", limit=10) == []
+    assert authority.journal.read_after(0, 10) == []
+
+
+def test_strategy_sell_with_held_long_proceeds(authority):
+    """A strategy SELL that actually reduces a held long is a legitimate
+    close and must be proposed."""
+    authority.positions.held = 100.0
+    authority.quotes.quote = _bid_quote()
+
+    record = authority.service.create_proposal(
+        _request(action="SELL", amount=5_000.0),
+        source="strategy:orb", correlation_id="sell-held",
+    )
+
+    assert record.status == "PENDING" and record.action == "SELL"
+    assert record.reference_quote_side == "bid"
+
+
+def test_manual_sell_while_flat_is_allowed(authority):
+    """The long-only 'ignore when flat' rule is a strategy-bridge semantic;
+    a human/LLM SELL (source != strategy:) may intentionally open a short."""
+    authority.positions.held = 0.0
+    authority.quotes.quote = _bid_quote()
+
+    record = authority.service.create_proposal(
+        _request(action="SELL", amount=5_000.0),
+        source="dashboard", correlation_id="sell-manual",
+    )
+
+    assert record.status == "PENDING" and record.action == "SELL"
 
 
 def test_reject_is_idempotent_and_journals_once(authority):

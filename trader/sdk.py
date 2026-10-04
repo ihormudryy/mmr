@@ -36,6 +36,25 @@ import zmq
 logger = logging.getLogger(__name__)
 
 
+def _quote_to_snapshot(quote: dict) -> dict:
+    nan = float('nan')
+    return {
+        'symbol': quote['symbol'], 'conId': '', 'time': quote['time'],
+        'bid': quote['bid'], 'bidSize': quote['bid_size'], 'ask': quote['ask'], 'askSize': quote['ask_size'],
+        'last': quote['last'], 'lastSize': nan, 'open': quote['open'], 'high': quote['high'],
+        'low': quote['low'], 'close': quote['close'], 'volume': quote['volume'],
+        'previous_close': quote['previous_close'], 'change': quote['change'],
+        'change_pct': quote['change_pct'], 'halted': nan, 'exchange': quote['exchange'],
+        'currency': quote['currency'], 'name': quote['name'], 'feed': quote['feed'],
+    }
+
+
+def _quote_to_batch_row(quote: dict) -> dict:
+    keys = ('symbol', 'time', 'bid', 'ask', 'last', 'open', 'high', 'low', 'close', 'volume',
+            'previous_close', 'change', 'change_pct', 'exchange', 'currency', 'feed', 'error')
+    return {key: quote[key] for key in keys}
+
+
 class Subscription:
     """Handle returned by :meth:`MMR.subscribe_ticks`.  Call :meth:`stop` to unsubscribe."""
 
@@ -1655,31 +1674,45 @@ class MMR:
         (a CAS guard against approving a proposal that changed since the
         caller last reviewed it). When omitted, the SDK fetches the
         proposal's current revision via ``get_proposal`` first.
+
+        On **live**, SDK/LLM approve is refused (``LLM_LIVE_APPROVE_FORBIDDEN``)
+        — use the Command Center live ceremony. On **paper**, the LLM may
+        approve after evaluation; this call stamps ``source=sdk``.
         """
         import uuid
         from trader.domain.commands import CommandReceipt
         from trader.messaging.typed_rpc import TypedRpcRemoteError
 
+        # Always fetch for the live gate (and revision when the caller omitted it).
+        try:
+            view = self._typed_query.call(
+                'get_proposal', {'proposal_id': proposal_id}, dict)
+        except TypedRpcRemoteError as ex:
+            # e.g. PROPOSAL_NOT_FOUND — a clean, expected refusal, not a
+            # transport failure.
+            return SuccessFail.fail(
+                error=f'Proposal #{proposal_id}: {ex.code}: {ex.message}', exception=ex)
+        except (TimeoutError, ConnectionError) as ex:
+            return SuccessFail.fail(
+                error=f'could not fetch proposal #{proposal_id} to approve: {ex}',
+                exception=ex)
+
+        if (view.get('account_mode') or '').lower() == 'live':
+            return SuccessFail.fail(error=(
+                f'Proposal #{proposal_id}: LLM_LIVE_APPROVE_FORBIDDEN — '
+                f'SDK/LLM cannot approve on a live account. Use the Command '
+                f'Center live ceremony (human + preflight), or reject the '
+                f'proposal if it should not trade.'
+            ))
+
         if expected_version is None:
-            try:
-                view = self._typed_query.call(
-                    'get_proposal', {'proposal_id': proposal_id}, dict)
-            except TypedRpcRemoteError as ex:
-                # e.g. PROPOSAL_NOT_FOUND — a clean, expected refusal, not a
-                # transport failure.
-                return SuccessFail.fail(
-                    error=f'Proposal #{proposal_id}: {ex.code}: {ex.message}', exception=ex)
-            except (TimeoutError, ConnectionError) as ex:
-                return SuccessFail.fail(
-                    error=f'could not fetch proposal #{proposal_id} to approve: {ex}',
-                    exception=ex)
             expected_version = view.get('revision')
 
         try:
             receipt = self._typed_command.call(
                 'approve_proposal',
                 {'command_id': f'sdk-{uuid.uuid4()}', 'proposal_id': proposal_id,
-                 'expected_version': expected_version},
+                 'expected_version': expected_version, 'source': 'sdk'},
                 CommandReceipt,
             )
         except (TimeoutError, ConnectionError) as ex:
@@ -2220,6 +2253,16 @@ class MMR:
     # Market Data
     # ------------------------------------------------------------------
 
+    @staticmethod
+    def _reject_exchange_hints_for_rest_source(source: str, exchange: str, currency: str) -> None:
+        if exchange or currency:
+            raise ValueError(f"--exchange/--currency need --source ib; {source} covers US listings only")
+
+    @staticmethod
+    def _reject_conids_for_rest_source(source: str, symbols: list) -> None:
+        if any(isinstance(symbol, int) or str(symbol).isdigit() for symbol in symbols):
+            raise ValueError(f"conIds need --source ib; {source} takes ticker symbols")
+
     def snapshot(self, symbol: Union[str, int], delayed: bool = False,
                  exchange: str = '', currency: str = '',
                  source: str = 'ib') -> dict:
@@ -2228,46 +2271,17 @@ class MMR:
         Parameters
         ----------
         source : str
-            'ib' (default) routes via trader_service / IB. 'twelvedata'
-            uses TD's REST ``/quote`` endpoint — fast and IB-free, but
-            ``bid``/``ask`` come back as ``NaN`` (TD's REST quote doesn't
-            expose level-1 quote sides; subscribe to the WebSocket via
-            ``watch --source twelvedata`` for streaming bid/ask).
+            'ib' (default) routes via trader_service / IB. Any other value is a
+            registry quotes source (e.g. 'alpaca' — IEX prices, 'twelvedata' — no bid/ask).
         """
-        if source == 'twelvedata':
-            td_symbol = str(symbol).upper()
-            payload = self._twelvedata_client.quote(symbol=td_symbol).as_json()
-            def _f(k):
-                v = payload.get(k)
-                if v in (None, ''):
-                    return float('nan')
-                try:
-                    return float(v)
-                except (TypeError, ValueError):
-                    return float('nan')
-            return {
-                'symbol': payload.get('symbol', td_symbol),
-                'conId': '',
-                'time': payload.get('datetime'),
-                'bid': float('nan'),
-                'bidSize': float('nan'),
-                'ask': float('nan'),
-                'askSize': float('nan'),
-                'last': _f('close'),
-                'lastSize': float('nan'),
-                'open': _f('open'),
-                'high': _f('high'),
-                'low': _f('low'),
-                'close': _f('close'),
-                'volume': _f('volume'),
-                'previous_close': _f('previous_close'),
-                'change': _f('change'),
-                'change_pct': _f('percent_change'),
-                'halted': float('nan'),
-                'exchange': payload.get('exchange', ''),
-                'currency': payload.get('currency', ''),
-                'name': payload.get('name', ''),
-            }
+        if source != 'ib':
+            self._reject_exchange_hints_for_rest_source(source, exchange, currency)
+            self._reject_conids_for_rest_source(source, [symbol])
+            from trader.data_providers import Capability
+            quote = self._provider(Capability.QUOTES, source).quotes([str(symbol)])[0]
+            if quote['error']:
+                raise ValueError(quote['error'])
+            return _quote_to_snapshot(quote)
         contract = self._resolve_contract(symbol, exchange=exchange, currency=currency)
         response = self._typed_query.call(
             'get_snapshot',
@@ -2301,56 +2315,14 @@ class MMR:
         Parameters
         ----------
         source : str
-            'ib' (default) routes via trader_service. 'twelvedata' uses
-            TD's ``/quote`` endpoint with comma-joined symbols (chunked at
-            120/call, the upper bound on most TD plans). Same bid/ask
-            limitation as :meth:`snapshot` — REST quote doesn't expose
-            level-1 sides.
+            'ib' (default) routes via trader_service / IB. Any other value is a
+            registry quotes source (e.g. 'alpaca' — IEX prices, 'twelvedata' — no bid/ask).
         """
-        if source == 'twelvedata':
-            results: list[dict] = []
-            chunk_size = 120
-            for i in range(0, len(symbols), chunk_size):
-                chunk = symbols[i:i + chunk_size]
-                joined = ','.join(s.upper() for s in chunk)
-                raw = self._twelvedata_client.quote(symbol=joined).as_json()
-                # TD returns either a single dict (one symbol) or
-                # {SYMBOL: {...}} keyed by uppercase ticker (multiple).
-                if isinstance(raw, dict) and 'symbol' in raw and len(chunk) == 1:
-                    payload_map = {raw.get('symbol', chunk[0].upper()): raw}
-                else:
-                    payload_map = raw if isinstance(raw, dict) else {}
-                for sym in chunk:
-                    payload = payload_map.get(sym.upper()) or payload_map.get(sym) or {}
-                    if not payload:
-                        results.append({'symbol': sym.upper(), 'last': float('nan')})
-                        continue
-                    def _f(k, p=payload):
-                        v = p.get(k)
-                        if v in (None, ''):
-                            return float('nan')
-                        try:
-                            return float(v)
-                        except (TypeError, ValueError):
-                            return float('nan')
-                    results.append({
-                        'symbol': payload.get('symbol', sym.upper()),
-                        'time': payload.get('datetime'),
-                        'bid': float('nan'),
-                        'ask': float('nan'),
-                        'last': _f('close'),
-                        'open': _f('open'),
-                        'high': _f('high'),
-                        'low': _f('low'),
-                        'close': _f('close'),
-                        'volume': _f('volume'),
-                        'previous_close': _f('previous_close'),
-                        'change': _f('change'),
-                        'change_pct': _f('percent_change'),
-                        'exchange': payload.get('exchange', ''),
-                        'currency': payload.get('currency', ''),
-                    })
-            return results
+        if source != 'ib':
+            self._reject_exchange_hints_for_rest_source(source, exchange, currency)
+            self._reject_conids_for_rest_source(source, symbols)
+            from trader.data_providers import Capability
+            return [_quote_to_batch_row(q) for q in self._provider(Capability.QUOTES, source).quotes(symbols)]
 
         ids = []
         for sym in symbols:
@@ -2537,6 +2509,21 @@ class MMR:
     # ------------------------------------------------------------------
     # Historical Data (via data_service RPC)
     # ------------------------------------------------------------------
+
+    def pull_history(
+        self,
+        source: str,
+        symbols: Optional[List[str]] = None,
+        universe: Optional[str] = None,
+        bar_size: str = '1 day',
+        prev_days: int = 30,
+    ) -> dict:
+        """Download historical data from any registry history source via the data_service."""
+        return consume(
+            self._data_rpc.rpc(return_type=dict).pull_history(
+                source=source, symbols=symbols, universe=universe, bar_size=bar_size, prev_days=prev_days,
+            )
+        )
 
     def pull_massive(
         self,
@@ -2905,6 +2892,14 @@ class MMR:
     # Financial Statements (via Massive.com REST API)
     # ------------------------------------------------------------------
 
+    def _provider(self, capability, source: Optional[str] = None):
+        from trader.data_providers import ProviderRegistry
+        return ProviderRegistry.from_config(self._container.config()).get(capability, source)
+
+    def _provider_default(self, capability) -> str:
+        from trader.data_providers import ProviderRegistry
+        return ProviderRegistry.from_config(self._container.config()).default_source(capability)
+
     @property
     def _massive_client(self):
         """Lazy-init Massive.com REST client."""
@@ -3142,35 +3137,13 @@ class MMR:
         """Parse a Massive option ticker like ``O:AAPL260320C00250000`` into components.
 
         Returns dict with keys: symbol, expiration, right, strike.
+
+        Delegates to `trader.tools.options_data.parse_option_ticker` — the shared
+        implementation used by the CLI and the dashboard research provider — so
+        there is exactly one parser to keep correct.
         """
-        t = ticker
-        if t.startswith('O:'):
-            t = t[2:]
-
-        # Format: SYMBOL YYMMDD C/P STRIKE*1000 (strike is 8 digits, 3 implied decimals)
-        # Find where the date starts — first digit run after the symbol
-        i = 0
-        while i < len(t) and t[i].isalpha():
-            i += 1
-        symbol = t[:i]
-        rest = t[i:]  # e.g. 260320C00250000
-
-        if len(rest) < 9:
-            raise ValueError(f"Cannot parse option ticker: {ticker}")
-
-        date_str = rest[:6]  # YYMMDD
-        right = rest[6]      # C or P
-        strike_str = rest[7:]
-
-        expiration = f'20{date_str[:2]}-{date_str[2:4]}-{date_str[4:6]}'
-        strike = float(strike_str) / 1000.0
-
-        return {
-            'symbol': symbol,
-            'expiration': expiration,
-            'right': right,
-            'strike': strike,
-        }
+        from trader.tools.options_data import parse_option_ticker
+        return parse_option_ticker(ticker)
 
     @staticmethod
     def _build_massive_option_ticker(symbol: str, expiration: str, strike: float, right: str) -> str:
@@ -3191,12 +3164,12 @@ class MMR:
         -------
         str
             Ticker like ``O:AAPL260320C00250000``.
+
+        Delegates to `trader.tools.options_data.build_option_ticker` — see
+        `_parse_massive_option_ticker` for why.
         """
-        from datetime import datetime
-        dt_obj = datetime.strptime(expiration, '%Y-%m-%d')
-        date_str = dt_obj.strftime('%y%m%d')
-        strike_int = int(strike * 1000)
-        return f'O:{symbol}{date_str}{right.upper()}{strike_int:08d}'
+        from trader.tools.options_data import build_option_ticker
+        return build_option_ticker(symbol, expiration, strike, right)
 
     def _resolve_option_contract(
         self,
@@ -3315,87 +3288,39 @@ class MMR:
             last, volume, open_interest, iv, delta, gamma, theta, vega,
             break_even, underlying_price.
         """
-        import datetime as dt_mod
+        from trader.tools.chain import get_option_dates
+        from trader.tools.options_data import chain_records
+        from massive import RESTClient
+
         cfg = self._container.config()
         api_key = cfg.get('massive_api_key', '')
         if not api_key:
             raise ValueError("massive_api_key not configured in trader.yaml")
 
         if not expiration:
-            from trader.tools.chain import get_option_dates
             dates = get_option_dates(symbol, api_key=api_key)
             if not dates:
                 return pd.DataFrame()
             expiration = dates[0]
 
-        from massive import RESTClient
-        client = RESTClient(api_key=api_key)
-
-        rows = []
-        for snap in client.list_snapshot_options_chain(
-            underlying_asset=symbol,
-            params={'expiration_date': expiration},
-        ):
-            details = snap.details
-            if not details or not details.strike_price:
-                continue
-
-            ct = (details.contract_type or '').lower()
-            if contract_type and ct != contract_type.lower():
-                continue
-
-            strike = details.strike_price
-            if strike_min is not None and strike < strike_min:
-                continue
-            if strike_max is not None and strike > strike_max:
-                continue
-
-            bid = ask = last = volume = 0.0
-            if snap.last_quote:
-                bid = snap.last_quote.bid or 0.0
-                ask = snap.last_quote.ask or 0.0
-            if snap.last_trade:
-                last = getattr(snap.last_trade, 'price', 0.0) or 0.0
-            if snap.day:
-                volume = getattr(snap.day, 'volume', 0.0) or 0.0
-
-            mid = (bid + ask) / 2.0 if (bid and ask) else 0.0
-
-            greeks = snap.greeks
-            delta = gamma = theta = vega = 0.0
-            if greeks:
-                delta = greeks.delta or 0.0
-                gamma = greeks.gamma or 0.0
-                theta = greeks.theta or 0.0
-                vega = greeks.vega or 0.0
-
-            underlying_price = 0.0
-            if snap.underlying_asset:
-                underlying_price = snap.underlying_asset.price or 0.0
-
-            rows.append({
-                'ticker': details.ticker or '',
-                'type': ct,
-                'strike': strike,
-                'expiration': details.expiration_date or expiration,
-                'bid': bid,
-                'ask': ask,
-                'mid': mid,
-                'last': last,
-                'volume': volume,
-                'open_interest': snap.open_interest or 0.0,
-                'iv': (snap.implied_volatility or 0.0) * 100.0,  # as percentage
-                'delta': delta,
-                'gamma': gamma,
-                'theta': theta,
-                'vega': vega,
-                'break_even': snap.break_even_price or 0.0,
-                'underlying_price': underlying_price,
-            })
+        rows = chain_records(
+            RESTClient(api_key=api_key), symbol,
+            expiration=expiration, contract_type=contract_type,
+            strike_min=strike_min, strike_max=strike_max,
+        )
 
         df = pd.DataFrame(rows)
         if not df.empty:
-            df = df.sort_values(by=['type', 'strike']).reset_index(drop=True)
+            # chain_records omits iv/greeks keys entirely when the Massive
+            # payload doesn't carry them (no-fabrication — must not read as
+            # 0.0). Reindex to the full documented column set so every
+            # column always exists; missing values become NaN, not 0.0, and
+            # the CLI's unconditional per-row formatting never KeyErrors.
+            columns = ["ticker", "type", "strike", "expiration", "bid", "ask",
+                       "mid", "last", "volume", "open_interest", "iv",
+                       "delta", "gamma", "theta", "vega", "break_even",
+                       "underlying_price"]
+            df = df.reindex(columns=columns)
         return df
 
     def options_snapshot(self, option_ticker: str) -> dict:
@@ -3411,56 +3336,15 @@ class MMR:
         dict
             Snapshot details including greeks, quote, underlying price.
         """
+        from trader.tools.options_data import contract_snapshot
+        from massive import RESTClient
+
         cfg = self._container.config()
         api_key = cfg.get('massive_api_key', '')
         if not api_key:
             raise ValueError("massive_api_key not configured in trader.yaml")
 
-        parsed = self._parse_massive_option_ticker(option_ticker)
-        # The Massive API wants the ticker without the O: prefix
-        ticker_clean = option_ticker
-        if ticker_clean.startswith('O:'):
-            ticker_clean = ticker_clean[2:]
-
-        from massive import RESTClient
-        client = RESTClient(api_key=api_key)
-        snap = client.get_snapshot_option(
-            underlying_asset=parsed['symbol'],
-            option_contract=ticker_clean,
-        )
-
-        result = {
-            'ticker': option_ticker,
-            'symbol': parsed['symbol'],
-            'expiration': parsed['expiration'],
-            'strike': parsed['strike'],
-            'right': parsed['right'],
-            'break_even': snap.break_even_price or 0.0,
-            'implied_volatility': f'{(snap.implied_volatility or 0.0) * 100.0:.2f}%',
-            'open_interest': snap.open_interest or 0.0,
-        }
-
-        if snap.last_quote:
-            result['bid'] = snap.last_quote.bid or 0.0
-            result['ask'] = snap.last_quote.ask or 0.0
-            result['mid'] = ((snap.last_quote.bid or 0.0) + (snap.last_quote.ask or 0.0)) / 2.0
-
-        if snap.last_trade:
-            result['last'] = getattr(snap.last_trade, 'price', 0.0) or 0.0
-
-        if snap.greeks:
-            result['delta'] = snap.greeks.delta or 0.0
-            result['gamma'] = snap.greeks.gamma or 0.0
-            result['theta'] = snap.greeks.theta or 0.0
-            result['vega'] = snap.greeks.vega or 0.0
-
-        if snap.underlying_asset:
-            result['underlying_price'] = snap.underlying_asset.price or 0.0
-
-        if snap.day:
-            result['volume'] = getattr(snap.day, 'volume', 0.0) or 0.0
-
-        return result
+        return contract_snapshot(RESTClient(api_key=api_key), option_ticker)
 
     def options_implied(
         self,
@@ -3790,81 +3674,73 @@ class MMR:
             rows.append(row)
         return pd.DataFrame(rows)
 
+    def _alpaca_assets(self):
+        from trader.data_providers.builtin import alpaca_asset_directory
+        directory = alpaca_asset_directory(self._container.config())
+        return directory.load() if directory else None
+
+    def _movers_asset_directory(self):
+        """The asset list for movers enrichment and the note to show when it is missing.
+
+        A failure here never fails movers; it only turns the warrant filter off.
+        """
+        import requests
+        from trader.data_providers import ProviderError
+        from trader.data_providers.movers_filter import (
+            ASSET_LIST_UNAVAILABLE_NOTE, INSTRUMENT_FILTER_OFF_NOTE)
+        try:
+            directory = self._alpaca_assets()
+        except (ProviderError, requests.RequestException, TypeError, ValueError, AttributeError) as ex:
+            logger.warning('alpaca asset list unavailable, movers warrant filter off: %s', ex)
+            return None, ASSET_LIST_UNAVAILABLE_NOTE
+        return directory, INSTRUMENT_FILTER_OFF_NOTE
+
+    @staticmethod
+    def _keeps_stock_mover(snap, min_price: float, assets) -> bool:
+        """Same rule as `filter_stock_movers`, for a raw Massive snapshot."""
+        close = getattr(snap.day, 'close', None) if snap.day else None
+        if close is None or pd.isna(close) or close < min_price:
+            return False
+        return assets is None or not assets.is_derivative_unit(snap.ticker or '')
+
     def movers(
         self,
         market: str = 'stocks',
         direction: str = 'gainers',
-        source: str = 'massive',
+        source: Optional[str] = None,
+        min_price: float = 1.0,
     ) -> pd.DataFrame:
-        """Get top movers.
+        """Top movers for `market` from a registry movers source.
 
-        Parameters
-        ----------
-        market : str
-            'stocks', 'crypto', 'indices', 'options', 'futures'. Forex has
-            its own command (see ``forex_movers``).
-        direction : str
-            'gainers' or 'losers'.
-        source : str
-            'massive' (default) or 'twelvedata'. TwelveData only provides
-            gainers/losers for a restricted set of markets (stocks).
+        Stock movers drop names under `min_price` and, when Alpaca is configured, warrants,
+        rights and units. `source=None` uses `data_providers.movers`, else the builtin default;
+        movers never inherit `default_data_source`. Forex has its own command (see ``forex_movers``).
         """
-        if source == 'twelvedata':
-            payload = self._twelvedata_client.get_market_movers(
-                market=market, direction=direction,
-            ).as_json()
-            # TD returns a list of {symbol, name, exchange, last, high, low,
-            # volume, change, percent_change, ...}. Re-map to our schema so
-            # downstream callers don't have to branch.
-            entries = payload if isinstance(payload, list) else payload.get('values', [])
-            rows = []
-            for e in entries:
-                rows.append({
-                    'ticker': e.get('symbol', ''),
-                    'name': e.get('name', ''),
-                    'exchange': e.get('exchange', ''),
-                    'close': e.get('last'),
-                    'volume': e.get('volume'),
-                    'change': e.get('change'),
-                    'change_pct': e.get('percent_change'),
-                })
-            df = pd.DataFrame(rows)
-            if not df.empty and 'change_pct' in df.columns:
-                df = df.sort_values(
-                    'change_pct',
-                    ascending=(direction == 'losers'),
-                ).reset_index(drop=True)
-            return df
-
-        snaps = self._massive_client.get_snapshot_direction(
-            market_type=market, direction=direction,
-        )
-        rows = []
-        for snap in snaps:
-            row = {'ticker': snap.ticker or ''}
-            if snap.day:
-                row['close'] = getattr(snap.day, 'close', None)
-                row['volume'] = getattr(snap.day, 'volume', None)
-            if snap.todays_change is not None:
-                row['change'] = snap.todays_change
-            if snap.todays_change_percent is not None:
-                row['change_pct'] = snap.todays_change_percent
-            rows.append(row)
-        return pd.DataFrame(rows)
+        from trader.data_providers import Capability
+        from trader.data_providers.movers_filter import filter_stock_movers
+        frame = self._provider(Capability.MOVERS, source).movers(market, direction)
+        if market == 'stocks':
+            assets, off_note = self._movers_asset_directory()
+            frame = filter_stock_movers(frame, min_price, assets, off_note)
+        return frame
 
     def movers_detail(
         self,
         market: str = 'stocks',
         direction: str = 'gainers',
         num: int = 20,
-        source: str = 'massive',
+        source: Optional[str] = None,
+        min_price: float = 1.0,
     ) -> list[dict]:
-        """Get movers enriched with company name, ratios, and (Massive only) news.
+        """Get movers enriched with company name, ratios, and news.
 
         Parameters
         ----------
         source : str
-            'massive' (default) — full enrichment via Massive snapshots,
+            Defaults to the registry movers default (Alpaca).
+            'alpaca' (and any other registry source) — names and the latest
+            headline per ticker. No ratios until phase 4.
+            'massive' — full enrichment via Massive snapshots,
             ticker details, ratios, and news.
             'twelvedata' — composes :meth:`movers` (TD) + :meth:`ratios`
             (TD) per ticker. Skips news (TD has no news endpoint) and
@@ -3873,9 +3749,12 @@ class MMR:
             in your plan's credit budget.
         """
         from concurrent.futures import ThreadPoolExecutor, as_completed
+        from trader.data_providers import Capability
+
+        source = source or self._provider_default(Capability.MOVERS)
 
         if source == 'twelvedata':
-            df = self.movers(market=market, direction=direction, source='twelvedata')
+            df = self.movers(market=market, direction=direction, source='twelvedata', min_price=min_price)
             if df.empty:
                 return []
             rows = df.head(num).to_dict('records')
@@ -3934,102 +3813,139 @@ class MMR:
                 })
             return results
 
-        snaps = self._massive_client.get_snapshot_direction(
-            market_type=market, direction=direction,
-        )
+        if source == 'massive':
+            snaps = self._massive_client.get_snapshot_direction(
+                market_type=market, direction=direction,
+            )
 
-        # Build base data from snapshots
-        movers = []
-        for snap in snaps[:num]:
-            ticker = snap.ticker or ''
-            if not ticker:
-                continue
-            row = {
-                'ticker': ticker,
-                'open': getattr(snap.day, 'open', None) if snap.day else None,
-                'close': getattr(snap.day, 'close', None) if snap.day else None,
-                'volume': getattr(snap.day, 'volume', None) if snap.day else None,
-                'change': snap.todays_change,
-                'change_pct': snap.todays_change_percent,
-            }
-            movers.append(row)
+            if market == 'stocks':
+                assets = self._movers_asset_directory()[0]
+                snaps = [snap for snap in snaps if self._keeps_stock_mover(snap, min_price, assets)]
 
-        if not movers:
-            return []
+            # Build base data from snapshots
+            movers = []
+            for snap in snaps[:num]:
+                ticker = snap.ticker or ''
+                if not ticker:
+                    continue
+                row = {
+                    'ticker': ticker,
+                    'open': getattr(snap.day, 'open', None) if snap.day else None,
+                    'close': getattr(snap.day, 'close', None) if snap.day else None,
+                    'volume': getattr(snap.day, 'volume', None) if snap.day else None,
+                    'change': snap.todays_change,
+                    'change_pct': snap.todays_change_percent,
+                }
+                movers.append(row)
 
-        tickers = [m['ticker'] for m in movers]
+            if not movers:
+                return []
 
-        # Parallel fetch: ticker details, ratios, news
-        details_map = {}
-        ratios_map = {}
-        news_map = {}
+            tickers = [m['ticker'] for m in movers]
 
-        def fetch_details(t):
-            try:
-                d = self._massive_client.get_ticker_details(t)
-                return (t, {'name': d.name, 'market_cap': d.market_cap, 'description': d.description})
-            except Exception:
-                return (t, {})
+            # Parallel fetch: ticker details, ratios, news
+            details_map = {}
+            ratios_map = {}
+            news_map = {}
 
-        def fetch_ratios(t):
-            try:
-                results = list(self._massive_client.list_financials_ratios(ticker=t, limit=1))
-                if not results:
+            def fetch_details(t):
+                try:
+                    d = self._massive_client.get_ticker_details(t)
+                    return (t, {'name': d.name, 'market_cap': d.market_cap, 'description': d.description})
+                except Exception:
                     return (t, {})
-                r = results[0]
-                data = {}
-                for attr, label in [
-                    ('price_to_earnings', 'pe'), ('debt_to_equity', 'de'),
-                    ('return_on_equity', 'roe'), ('earnings_per_share', 'eps'),
-                    ('dividend_yield', 'div_yield'),
-                ]:
-                    val = getattr(r, attr, None)
-                    if val is not None:
-                        data[label] = round(float(val), 2)
-                return (t, data)
-            except Exception:
-                return (t, {})
 
-        def fetch_news(t):
-            try:
-                articles = list(self._massive_client.list_ticker_news(ticker=t, limit=1))
-                if not articles:
+            def fetch_ratios(t):
+                try:
+                    results = list(self._massive_client.list_financials_ratios(ticker=t, limit=1))
+                    if not results:
+                        return (t, {})
+                    r = results[0]
+                    data = {}
+                    for attr, label in [
+                        ('price_to_earnings', 'pe'), ('debt_to_equity', 'de'),
+                        ('return_on_equity', 'roe'), ('earnings_per_share', 'eps'),
+                        ('dividend_yield', 'div_yield'),
+                    ]:
+                        val = getattr(r, attr, None)
+                        if val is not None:
+                            data[label] = round(float(val), 2)
+                    return (t, data)
+                except Exception:
                     return (t, {})
-                a = articles[0]
-                sentiment = ''
-                if a.insights:
-                    sentiments = [i.sentiment for i in a.insights if i.sentiment]
-                    sentiment = ', '.join(sentiments)
-                return (t, {'headline': a.title, 'sentiment': sentiment})
-            except Exception:
-                return (t, {})
 
-        with ThreadPoolExecutor(max_workers=10) as pool:
-            futures = []
-            for t in tickers:
-                futures.append(pool.submit(fetch_details, t))
-                futures.append(pool.submit(fetch_ratios, t))
-                futures.append(pool.submit(fetch_news, t))
+            def fetch_news(t):
+                try:
+                    articles = list(self._massive_client.list_ticker_news(ticker=t, limit=1))
+                    if not articles:
+                        return (t, {})
+                    a = articles[0]
+                    sentiment = ''
+                    if a.insights:
+                        sentiments = [i.sentiment for i in a.insights if i.sentiment]
+                        sentiment = ', '.join(sentiments)
+                    return (t, {'headline': a.title, 'sentiment': sentiment})
+                except Exception:
+                    return (t, {})
 
-            for future in as_completed(futures):
-                ticker, data = future.result()
-                fn = future._args[0] if hasattr(future, '_args') else ''
-                # Determine which map to update based on keys
-                if 'name' in data:
-                    details_map[ticker] = data
-                elif 'headline' in data:
-                    news_map[ticker] = data
-                elif data and 'name' not in data and 'headline' not in data:
-                    ratios_map[ticker] = data
+            with ThreadPoolExecutor(max_workers=10) as pool:
+                futures = []
+                for t in tickers:
+                    futures.append(pool.submit(fetch_details, t))
+                    futures.append(pool.submit(fetch_ratios, t))
+                    futures.append(pool.submit(fetch_news, t))
 
-        # Merge into results
-        for m in movers:
-            t = m['ticker']
-            m['details'] = details_map.get(t, {})
-            m['ratios'] = ratios_map.get(t, {})
-            m['news'] = news_map.get(t, {})
+                for future in as_completed(futures):
+                    ticker, data = future.result()
+                    # Determine which map to update based on keys
+                    if 'name' in data:
+                        details_map[ticker] = data
+                    elif 'headline' in data:
+                        news_map[ticker] = data
+                    elif data and 'name' not in data and 'headline' not in data:
+                        ratios_map[ticker] = data
 
-        return movers
+            # Merge into results
+            for m in movers:
+                t = m['ticker']
+                m['details'] = details_map.get(t, {})
+                m['ratios'] = ratios_map.get(t, {})
+                m['news'] = news_map.get(t, {})
+
+            return movers
+
+        return self._movers_detail_from_capabilities(market, direction, num, source, min_price)
+
+    def _movers_detail_from_capabilities(self, market, direction, num, source, min_price) -> list[dict]:
+        from concurrent.futures import ThreadPoolExecutor
+        from trader.data_providers import Capability
+        frame = self.movers(market=market, direction=direction, source=source, min_price=min_price).head(num)
+        assets = self._movers_asset_directory()[0] if market == 'stocks' else None
+        news_provider = self._provider(Capability.NEWS)
+
+        def latest_headline(ticker: str) -> dict:
+            try:
+                items = news_provider.news(ticker, 1)
+            except Exception as ex:
+                logger.warning('headline fetch failed for %s: %s', ticker, ex)
+                return {}
+            return {'headline': items[0]['title'], 'sentiment': items[0]['sentiment']} if items else {}
+
+        tickers = frame['ticker'].tolist()
+        with ThreadPoolExecutor(max_workers=5) as pool:
+            headlines = dict(zip(tickers, pool.map(latest_headline, tickers)))
+        return [{
+            'ticker': row.ticker,
+            'open': None,
+            'close': row.close,
+            'volume': None if pd.isna(row.volume) else row.volume,
+            'change': row.change,
+            'change_pct': row.change_pct,
+            'details': {'name': row.name or '', 'exchange': assets.exchange(row.ticker) if assets else '',
+                        'description': ''},
+            'ratios': {},
+            'news': headlines.get(row.ticker, {}),
+        } for row in frame.itertuples(index=False)]
 
     def scan_ideas(
         self,
@@ -4101,7 +4017,7 @@ class MMR:
                     'or run with `unsafe_legacy_rpc: true` + `--simulation True`.'
                 ) from None
 
-            from trader.tools.idea_scanner import IBIdeaScanner
+            from trader.tools.idea_scanner import IBIdeaScanner, RpcScannerProvider
 
             # Resolve universe to symbol list for IB path
             ib_universe_symbols = None
@@ -4118,7 +4034,7 @@ class MMR:
                 else:
                     return pd.DataFrame()
 
-            scanner = IBIdeaScanner(self._rpc)
+            scanner = IBIdeaScanner(RpcScannerProvider(self._rpc))
             return scanner.scan(
                 preset=preset,
                 location=location,
@@ -4305,122 +4221,29 @@ class MMR:
         return out
 
     # ------------------------------------------------------------------
-    # News (Massive.com REST API)
+    # News (provider registry)
     # ------------------------------------------------------------------
 
-    def news(
-        self,
-        ticker: Optional[str] = None,
-        limit: int = 10,
-        source: str = 'polygon',
-    ) -> pd.DataFrame:
-        """Get news articles, optionally filtered by ticker.
+    def news(self, ticker: Optional[str] = None, limit: int = 10,
+             source: Optional[str] = None) -> pd.DataFrame:
+        """News headlines from a registry news source ('alpaca', 'polygon', 'benzinga')."""
+        from trader.data_providers import Capability
+        items = self._provider(Capability.NEWS, source).news(ticker, limit)
+        frame = pd.DataFrame([{
+            'published': i['published'], 'title': i['title'], 'tickers': ', '.join(i['tickers']),
+            'author': i['author'], 'url': i['url'], 'summary': i['summary'], 'sentiment': i['sentiment'],
+        } for i in items], columns=['published', 'title', 'tickers', 'author', 'url', 'summary', 'sentiment'])
+        if not frame['sentiment'].astype(bool).any():
+            frame = frame.drop(columns='sentiment')
+        return frame
 
-        Parameters
-        ----------
-        ticker : str, optional
-            Stock ticker to filter (e.g. "AAPL"). None for general news.
-        limit : int
-            Max articles to return (default 10).
-        source : str
-            "polygon" (default) or "benzinga".
-        """
-        rows = []
-        if source == 'benzinga':
-            articles = self._massive_client.list_benzinga_news(
-                tickers=ticker, limit=limit,
-            )
-            for a in articles:
-                rows.append({
-                    'published': a.published or '',
-                    'title': a.title or '',
-                    'tickers': ', '.join(a.tickers) if a.tickers else '',
-                    'author': a.author or '',
-                    'url': a.url or '',
-                    'teaser': a.teaser or '',
-                })
-                if len(rows) >= limit:
-                    break
-        else:
-            articles = self._massive_client.list_ticker_news(
-                ticker=ticker, limit=limit,
-            )
-            for a in articles:
-                sentiment = ''
-                if a.insights:
-                    sentiments = [i.sentiment for i in a.insights if i.sentiment]
-                    sentiment = ', '.join(sentiments)
-                rows.append({
-                    'published': (a.published_utc or '')[:19],
-                    'title': a.title or '',
-                    'tickers': ', '.join(a.tickers) if a.tickers else '',
-                    'sentiment': sentiment,
-                    'author': a.author or '',
-                    'url': a.article_url or '',
-                })
-                if len(rows) >= limit:
-                    break
-        return pd.DataFrame(rows)
-
-    def news_detail(
-        self,
-        ticker: Optional[str] = None,
-        limit: int = 5,
-        source: str = 'polygon',
-    ) -> List[dict]:
-        """Get news articles with full descriptions/teasers.
-
-        Parameters
-        ----------
-        ticker : str, optional
-            Stock ticker to filter.
-        limit : int
-            Max articles (default 5).
-        source : str
-            "polygon" or "benzinga".
-        """
-        results = []
-        if source == 'benzinga':
-            articles = self._massive_client.list_benzinga_news(
-                tickers=ticker, limit=limit,
-            )
-            for a in articles:
-                results.append({
-                    'title': a.title or '',
-                    'published': a.published or '',
-                    'author': a.author or '',
-                    'tickers': a.tickers or [],
-                    'tags': a.tags or [],
-                    'url': a.url or '',
-                    'teaser': a.teaser or '',
-                })
-                if len(results) >= limit:
-                    break
-        else:
-            articles = self._massive_client.list_ticker_news(
-                ticker=ticker, limit=limit,
-            )
-            for a in articles:
-                insights = []
-                if a.insights:
-                    for i in a.insights:
-                        insights.append({
-                            'ticker': i.ticker,
-                            'sentiment': i.sentiment,
-                            'reasoning': i.sentiment_reasoning,
-                        })
-                results.append({
-                    'title': a.title or '',
-                    'published': (a.published_utc or '')[:19],
-                    'author': a.author or '',
-                    'tickers': a.tickers or [],
-                    'description': a.description or '',
-                    'insights': insights,
-                    'url': a.article_url or '',
-                })
-                if len(results) >= limit:
-                    break
-        return results
+    def news_detail(self, ticker: Optional[str] = None, limit: int = 5,
+                    source: Optional[str] = None) -> List[dict]:
+        """News with summaries and (where the provider has it) per-ticker sentiment insights."""
+        from trader.data_providers import Capability
+        keys = ('title', 'published', 'author', 'tickers', 'url', 'summary', 'insights')
+        return [{key: item[key] for key in keys}
+                for item in self._provider(Capability.NEWS, source).news(ticker, limit)]
 
     # ------------------------------------------------------------------
     # Market hours (local-only, no service needed)

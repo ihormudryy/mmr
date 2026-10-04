@@ -69,6 +69,12 @@ def test_command_center_includes_scaling_tab_markup():
     assert 'data-dash-tab="scaling"' in html
     assert 'id="dash-scaling"' in html
     assert 'id="scaling-authorities-body"' in html
+    assert 'id="scaling-payload-builder"' in html
+    assert 'id="scaling-payload-generate"' in html
+    assert 'id="scaling-payload-out"' in html
     js = (ROOT / "web" / "static" / "command_center.js").read_text()
     assert "function renderScaling()" in js
     assert "renderScaling()" in js
+    cmds = (ROOT / "web" / "static" / "command_center_commands.js").read_text()
+    assert "ccBuildUnsignedAllocationPayload" in cmds
+    assert "ALLOCATION_STAGE_CEILINGS" in cmds

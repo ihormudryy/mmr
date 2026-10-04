@@ -63,9 +63,26 @@ if [ \"$1\" = \"info\" ]; then
   fi
   exit 0
 fi
-if [ \"$1\" = \"compose\" ] && [ \"${MMR_FAKE_SCHEDULER:-}\" = \"1\" ]; then
+if [ \"$1\" = \"compose\" ]; then
   case \" $* \" in
-    *\" ps -q scheduler \"*) printf '%s\\n' scheduler-container ;;
+    *\" ps -q scheduler \"*)
+      if [ \"${MMR_FAKE_SCHEDULER:-}\" = \"1\" ]; then
+        printf '%s\\n' scheduler-container
+      fi
+      ;;
+    *\" config --format json \"*)
+      # Match docker-compose.yml ``name: mmr`` so db_data_volume() resolves
+      # the project-prefixed live volume in helper tests.
+      printf '%s\\n' '{\"name\":\"mmr\"}'
+      ;;
+  esac
+  exit 0
+fi
+# Pretend the compose-prefixed DB volume exists; the unprefixed sibling does not.
+if [ \"$1\" = \"volume\" ] && [ \"${2:-}\" = \"inspect\" ]; then
+  case \"${3:-}\" in
+    mmr_mmr_db_data) exit 0 ;;
+    *) exit 1 ;;
   esac
 fi
 exit 0
@@ -142,6 +159,16 @@ def test_build_does_not_target_retired_mmr_service(fake_docker: FakeDocker):
     assert "build mmr" not in result.log
 
 
+def test_build_reclaims_dangling_cache_after_success(fake_docker: FakeDocker):
+    """Repeated -b must not accumulate dangling <none> images / BuildKit cache."""
+    result = fake_docker.run("-b")
+
+    assert result.returncode == 0, result.stdout
+    assert "image prune --force" in result.log
+    assert "builder prune --force" in result.log
+    assert "builder prune --all" not in result.log
+
+
 def test_sync_fails_loudly_for_read_only_images(fake_docker: FakeDocker):
     result = fake_docker.run("-s")
 
@@ -189,9 +216,15 @@ def test_backup_uses_scheduler_when_running(fake_docker: FakeDocker):
     assert "exec -T scheduler python3 -m trader.mmr_cli data backup --keep 30" in result.log
 
 
-def test_backup_fallback_uses_split_volume(fake_docker: FakeDocker):
+def test_backup_fallback_uses_compose_project_volume(fake_docker: FakeDocker):
+    """Compose ``name: mmr`` + volume ``mmr_db_data`` → ``mmr_mmr_db_data``.
+
+    Backing up the unprefixed sibling leaves Portfolios on the live volume
+    unsaved and made empty-volume seed skip restore after ``down --volumes``.
+    """
     result = fake_docker.run("-B")
 
     assert result.returncode == 0, result.stdout
-    assert "-v mmr_db_data:/src:ro" in result.log
-    assert "mmr_mmr_db_data" not in result.log
+    assert "-v mmr_mmr_db_data:/src:ro" in result.log
+    # Must not target the stale unprefixed sibling volume.
+    assert "-v mmr_db_data:/src:ro" not in result.log

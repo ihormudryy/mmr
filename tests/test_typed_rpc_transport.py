@@ -529,6 +529,101 @@ def test_client_socket_hygiene_options(query_client):
     assert query_client.socket.getsockopt(zmq.LINGER) == 0
     assert query_client.socket.getsockopt(zmq.IMMEDIATE) == 1
     assert query_client.socket.getsockopt(zmq.MAXMSGSIZE) == MAX_REQUEST_BYTES
+    # SNDTIMEO must be finite -- see TestTypedSendNeverBlocksForever.
+    sndtimeo = query_client.socket.getsockopt(zmq.SNDTIMEO)
+    assert sndtimeo > 0, 'SNDTIMEO left at ZMQ infinite default (-1)'
+    assert sndtimeo == int(query_client.timeout * 1000)
+
+
+class TestTypedSendNeverBlocksForever:
+    """Regression: ``_new_socket`` set IMMEDIATE=1 but left SNDTIMEO at ZMQ's
+    infinite default, so ``socket.send`` toward a peer that never binds blocked
+    the calling thread *forever* instead of raising ``zmq.Again``.
+
+    That made ``call``'s own ``except zmq.Again -> ConnectionError`` handler --
+    written precisely to surface "no route to server" -- unreachable dead code.
+    The legacy dill client had the identical bug and fixed it the same way
+    (``clientserver.RPCClient._configure_socket``, covered by
+    ``test_clientserver_rpc.TestSendNeverBlocksForever``); the typed production
+    client reintroduced it.
+
+    Real-world impact: any typed RPC caller (the dashboard's manage client, the
+    CLI, strategy_service) wedges its thread permanently when the trader isn't
+    reachable -- the opposite of fail-loud. It also hung the pytest suite via
+    ``tests/test_watchlist_session_auth.py``.
+    """
+
+    def _unroutable_client(self, timeout: float) -> TypedRpcClient:
+        client = TypedRpcClient(
+            'query',
+            HmacServiceAuthenticator(HMAC_KEY, now=time.time),
+            port=_free_port(),   # nothing ever binds this port
+            timeout=timeout,
+        )
+        client.connect()
+        return client
+
+    def test_unroutable_send_raises_instead_of_blocking(self):
+        client = self._unroutable_client(timeout=1.0)
+        result: dict = {}
+
+        def _call():
+            try:
+                client.call('get_status', {}, dict)
+                result['outcome'] = 'returned'
+            except (ConnectionError, TimeoutError) as ex:
+                result['outcome'] = 'raised'
+                result['error'] = ex
+            except Exception as ex:  # pragma: no cover - diagnostic
+                result['outcome'] = 'other'
+                result['error'] = ex
+
+        thread = threading.Thread(target=_call, daemon=True)
+        thread.start()
+        thread.join(timeout=20.0)
+        try:
+            assert not thread.is_alive(), (
+                'typed RPC send to an unbound port blocked past 20s '
+                '— SNDTIMEO left at the infinite default')
+            assert result.get('outcome') == 'raised', result
+        finally:
+            client.close()
+
+    def test_unroutable_send_reports_no_route(self):
+        """The failure must name the transport problem, not look like a slow
+        server: a ConnectionError saying 'no route to server'."""
+        client = self._unroutable_client(timeout=1.0)
+        try:
+            with pytest.raises(ConnectionError, match='no route to server'):
+                client.call('get_status', {}, dict)
+        finally:
+            client.close()
+
+    def test_send_timeout_is_bounded_by_the_client_timeout(self):
+        """The send deadline tracks the client's own timeout rather than some
+        unrelated constant, so a caller that asks for a short timeout gets one."""
+        client = self._unroutable_client(timeout=0.5)
+        try:
+            started = time.monotonic()
+            with pytest.raises(ConnectionError):
+                client.call('get_status', {}, dict)
+            elapsed = time.monotonic() - started
+            assert elapsed < 5.0, f'send blocked {elapsed:.1f}s for a 0.5s timeout'
+        finally:
+            client.close()
+
+    def test_socket_is_reusable_after_an_unroutable_send(self):
+        """The Again path resets the socket; the client must stay usable (a
+        service that comes up later has to be reachable without a restart)."""
+        client = self._unroutable_client(timeout=0.5)
+        try:
+            for _ in range(2):
+                with pytest.raises(ConnectionError):
+                    client.call('get_status', {}, dict)
+            assert client.socket is not None
+            assert client.socket.getsockopt(zmq.IMMEDIATE) == 1
+        finally:
+            client.close()
 
 
 def test_server_socket_hygiene_options(typed_servers):

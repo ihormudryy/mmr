@@ -40,6 +40,8 @@ const store = {
   // server actually has live trader data -- not merely that the SSE socket to
   // the dashboard process is open.
   health: null,
+  // NASDAQ (XNAS) RTH from snapshot / cc-health — drives the market-closed banner.
+  marketSession: null,
   connection: { mode: 'connecting', degradedSince: null },
 };
 
@@ -124,6 +126,7 @@ function applySnapshot(view) {
   // server-stamped generated_at so quote ages are skew-corrected.
   store.serverClockOffsetMs = ccServerClockOffsetMs(view.generated_at, Date.now());
   if (view.health) store.health = view.health;
+  if (view.market_session) store.marketSession = view.market_session;
   const boot = document.getElementById('boot-banner');
   if (boot) {
     boot.hidden = true;
@@ -230,8 +233,11 @@ function stopPolling() {
   store.connection.mode = 'sse';
 }
 
-function setBanner(visible) {
-  document.getElementById('degraded-banner').hidden = !visible;
+function setBanner(visible, message) {
+  const el = document.getElementById('degraded-banner');
+  if (!el) return;
+  el.hidden = !visible;
+  if (message) el.textContent = message;
 }
 
 function currentSseState() {
@@ -254,7 +260,16 @@ function currentSseState() {
 
 function updateBanner() {
   const lifecycle = store.health && store.health.lifecycle;
-  setBanner(ccIsDegraded(lifecycle, currentSseState()));
+  const streamDegraded = ccIsDegraded(lifecycle, currentSseState());
+  const marketClosed = ccMarketClosed(store.marketSession);
+  const visible = ccBannerVisible({ streamDegraded, marketClosed });
+  const message = ccBannerMessage({
+    streamDegraded,
+    marketClosed,
+    nextOpen: store.marketSession && store.marketSession.next_open,
+    nowMs: Date.now(),
+  });
+  setBanner(visible, message);
 }
 
 async function refreshHealth() {
@@ -268,6 +283,7 @@ async function refreshHealth() {
     const h = await res.json();
     store.health = { lifecycle: h.lifecycle, sources: h.sources,
                      reconnects: h.reconnects, cursor: h.cursor };
+    if (h.market_session) store.marketSession = h.market_session;
     renderStatusBar();
     updateBanner();
   } catch (err) { /* transient; the next tick retries */ }
@@ -328,15 +344,68 @@ function renderStatusBar() {
     esc(health.lifecycle || 'unknown')}</span>`;
   document.querySelector('#last-event-time .v').textContent =
     v.last_event_at ? `${v.last_event_at} (${fmtAge(ageOf(v.last_event_at))} ago)` : '—';
+  renderOperatingMode();
+}
+
+const OP_MODE_META = {
+  auto: {
+    label: 'Auto',
+    title: 'Auto — at least one strategy has full automation (or paper automation is armed)',
+  },
+  semi: {
+    label: 'Semi',
+    title: 'Semi-manual — strategies propose; a human (or paper LLM) must Approve',
+  },
+  manual: {
+    label: 'Manual',
+    title: 'Fully manual — propose and approve by hand',
+  },
+};
+
+function ccStrategyFullAuto(s) {
+  const ae = s && s.auto_execute;
+  if (ae === true) return true;
+  if (typeof ae === 'string') {
+    const v = ae.trim().toLowerCase();
+    return v === 'true' || v === '1' || v === 'yes' || v === 'execute' || v === 'auto';
+  }
+  return false;
+}
+
+function ccOperatingMode(view) {
+  // Green as soon as one strategy is fully automated — not only when the
+  // whole book is automation-only.
+  const life = String(
+    (view && view.paper_automation && view.paper_automation.lifecycle) || ''
+  ).toLowerCase();
+  if (life === 'armed' || life === 'armed_unpersisted' || life === 'degraded'
+      || life === 'restart_required' || life === 'preparing') {
+    return 'auto';
+  }
+  const live = (view && view.strategies) || [];
+  if (live.some(ccStrategyFullAuto)) return 'auto';
+  const mode = String((view && view.operating_mode) || '').toLowerCase();
+  if (mode === 'auto' || mode === 'semi' || mode === 'manual') return mode;
+  return 'manual';
+}
+
+function renderOperatingMode() {
+  const el = document.getElementById('operating-mode');
+  if (!el) return;
+  const mode = ccOperatingMode(store.view || {});
+  const meta = OP_MODE_META[mode] || OP_MODE_META.manual;
+  el.dataset.mode = mode;
+  el.title = meta.title;
+  const label = el.querySelector('.op-label');
+  if (label) label.textContent = meta.label;
 }
 
 function renderAccountCards() {
   const v = store.view; if (!v) return;
   const account = v.accounts[0] || {};
   // Net liquidation must render for a flat account too (spec §8.1): the value
-  // comes from the account entity, never derived from positions. The two
-  // headline figures live in the command band; the rest fills the
-  // quick-stats row under the action queue.
+  // comes from the account entity, never derived from positions. Headline
+  // figures + secondary stats all live in the command band.
   const netEl = document.getElementById('band-netliq');
   if (netEl) netEl.textContent = money(account.net_liquidation, account.currency);
   const dayEl = document.getElementById('band-daypnl');
@@ -345,20 +414,17 @@ function renderAccountCards() {
     dayEl.textContent = (pnl > 0 ? '+' : '') + money(pnl, account.currency);
     dayEl.className = 'band-v' + (pnl > 0 ? ' pos' : pnl < 0 ? ' neg' : '');
   }
-  const stats = [
-    ['Exposure', money(account.gross_exposure, account.currency)],
-    ['Buying power', money(account.buying_power, account.currency)],
-    ['Margin cushion', account.margin_cushion !== undefined && account.margin_cushion !== null
-      ? `${fmt.format(account.margin_cushion * 100)}%` : '—'],
-    ['Open positions', fmt.format((v.positions || []).length)],
-    ['Working orders', fmt.format(((v.orders || {}).active || []).length)],
-  ];
-  const quick = document.getElementById('quick-stats');
-  if (quick) {
-    quick.innerHTML = stats.map(([k, val]) =>
-      `<div class="q"><div class="k">${k}</div><div class="v">${esc(val)}</div></div>`
-    ).join('');
-  }
+  const set = (id, text) => {
+    const el = document.getElementById(id);
+    if (el) el.textContent = text;
+  };
+  set('band-exposure', money(account.gross_exposure, account.currency));
+  set('band-buying-power', money(account.buying_power, account.currency));
+  set('band-cushion',
+    account.margin_cushion !== undefined && account.margin_cushion !== null
+      ? `${fmt.format(account.margin_cushion * 100)}%` : '—');
+  set('band-positions', fmt.format((v.positions || []).length));
+  set('band-orders', fmt.format(((v.orders || {}).active || []).length));
 }
 
 function renderPositions() {
@@ -486,39 +552,58 @@ function renderOrders() {
     }
     return null;
   };
-  // Aggregate group status without hiding per-leg state (spec §8.4).
+  // Legs only — no og-* group-head (noisy UUID + "N leg(s) · Cancelled").
+  // Show filled qty only when > 0 (skip "filled 0" on unfilled/cancelled).
   document.getElementById('order-groups').innerHTML =
-    [...groups.entries()].map(([gid, legs]) => {
-      const statuses = [...new Set(legs.map(l => String(l.status || '')))];
-      const filled = legs.reduce((n, l) => n + (l.filled_quantity || 0), 0);
+    [...groups.entries()].map(([, legs]) => {
       return `<div class="order-group">
-        <div class="group-head">${esc(gid)}<span class="n">${legs.length} leg(s) ·
-          ${esc(statuses.join(' / '))} · filled ${fmt.format(filled)}</span></div>
         ${legs.map(l => {
           const kind = kindOf(l.leg);
+          const filledQty = Number(l.filled_quantity) || 0;
+          const fillBits = [];
+          if (filledQty > 0) {
+            fillBits.push(`filled ${fmt.format(filledQty)}`);
+            if (l.avg_fill_price) fillBits.push('@ ' + money(l.avg_fill_price));
+          }
+          const statusBits = [l.status || '', ...fillBits].filter(Boolean);
           return `<div class="leg">
           ${kind ? `<span class="kind ${kind[1]}">${kind[0]}</span>` : ''}
           <span>${esc(l.symbol || l.conid || '')}
           ${esc(l.action || '')} ${fmt.format(l.quantity ?? 0)}
           @ ${esc(l.order_type || '')}</span>
-          <span class="leg-r">${esc(l.status || '')} · filled ${fmt.format(l.filled_quantity || 0)}
-          ${l.avg_fill_price ? '@ ' + money(l.avg_fill_price) : ''}
+          <span class="leg-r">${esc(statusBits.join(' · '))}
           ${CFG.commandsEnabled && activeIds.has(l.entity_id)
             ? ` <button type="button"
                 data-cc-cancel-order="${esc(l.entity_id)}">Cancel</button>` : ''}
           </span></div>`;
         }).join('')}
       </div>`;
-    }).join('') || '<div class="order-group group-head dim">No orders.</div>';
+    }).join('') || '<div class="order-group orders-empty">No orders.</div>';
+}
+
+function formatFillTime(value) {
+  if (value == null || value === '') return '';
+  const d = new Date(value);
+  if (Number.isNaN(d.getTime())) return String(value);
+  // Local clock, compact — Time column previously looked empty because the
+  // payload field is ``fill_time``, not ``time``.
+  return d.toLocaleString(undefined, {
+    year: 'numeric', month: '2-digit', day: '2-digit',
+    hour: '2-digit', minute: '2-digit', second: '2-digit', hour12: false,
+  });
 }
 
 function renderFills() {
   const v = store.view; if (!v) return;
   document.getElementById('fills-body').innerHTML = v.fills.slice(-50).reverse()
-    .map(f => `<tr><td>${esc(f.time || '')}</td><td>${esc(f.symbol || f.conid || '')}</td>
+    .map(f => {
+      const when = f.fill_time || f.time || f.source_timestamp || '';
+      return `<tr><td>${esc(formatFillTime(when))}</td>
+      <td>${esc(f.symbol || f.conid || '')}</td>
       <td>${esc(f.side || '')}</td><td class="num">${fmt.format(f.quantity ?? 0)}</td>
       <td class="num">${money(f.price)}</td>
-      <td class="num">${money(f.commission)}</td></tr>`).join('');
+      <td class="num">${money(f.commission)}</td></tr>`;
+    }).join('');
 }
 
 function renderStrategies() {
@@ -534,19 +619,34 @@ function renderStrategies() {
     const enabled = DISPATCHABLE_STRATEGY.has(state);
     const name = esc(ccStrategyName(s));
     const actions = CFG.commandsEnabled ? `<td>
+        <div class="cc-strategy-actions">
         ${enabled
           ? `<button type="button" class="reject" data-cc-strategy-action="disable"
                data-cc-strategy="${name}">Disable</button>`
           : `<button type="button" class="primary" data-cc-strategy-action="enable"
                data-cc-strategy="${name}">Enable</button>`}
         <button type="button" data-cc-strategy-action="params"
-          data-cc-strategy="${name}">Edit params</button>
+          data-cc-strategy="${name}">Params</button>
+        </div>
       </td>` : '';
     const stateCls = state === 'ERROR' ? 'err' : enabled ? 'run' : '';
-    return `<tr><td class="sym">${name}</td>
+    return `<tr><td class="sym">${name}${
+        (() => {
+          const bits = [];
+          if (s.class_name) bits.push(String(s.class_name));
+          if (s.bar_size) bits.push(String(s.bar_size));
+          const conids = Array.isArray(s.conids) ? s.conids : [];
+          if (conids.length) bits.push(conids.length === 1
+            ? `conId ${conids[0]}` : `${conids.length} conIds`);
+          else if (s.universe) bits.push(`universe ${s.universe}`);
+          return bits.length
+            ? `<div class="dim strat-meta">${esc(bits.join(' · '))}</div>`
+            : '';
+        })()
+      }</td>
       <td><span class="state-chip ${stateCls}">${esc(state)}</span></td>
       <td><span class="dotstate ${enabled ? 'on' : 'off'}"><i class="d"></i>${
-        enabled ? 'enabled' : 'not dispatchable'}</span></td>
+        enabled ? 'on' : 'off'}</span></td>
       <td><span class="age">${fmtAge(ageOf(s.last_activity_at))}</span></td>
       <td class="err-note ${s.last_error ? 'neg' : 'dim'}">${
         s.last_error ? '⚠ ' + esc(s.last_error) : '—'}</td>${actions}</tr>`;
@@ -649,12 +749,25 @@ function renderRisk() {
   }
   const rows = projections.map(([key, r]) => {
     const warnings = r.warnings || [];
+    const warningText = warnings.map(ccRiskWarningText).filter(Boolean);
+    const bars = (r.limits || []).map((limit) => {
+      const bar = ccRiskBarState(limit);
+      if (!bar) return '';
+      const toneClass = bar.tone ? ` ${bar.tone}` : '';
+      return `<div class="tt-limit"><span>${esc(bar.caption)}</span>`
+        + `<div class="tt-bar"><i class="${toneClass.trim()}" style="width:${bar.fillPct.toFixed(1)}%"></i></div></div>`;
+    }).join('');
     return `<div><strong>${esc(key)}</strong> — ${
-      warnings.length ? '⚠ ' + warnings.map(esc).join('; ')
-                      : 'no active warnings'}</div>`;
+      warningText.length ? '⚠ ' + warningText.map(esc).join('; ')
+                      : 'no active warnings'}</div>${bars}`;
   });
   const anyWarning = projections.some(([, r]) => (r.warnings || []).length);
-  el.dataset.state = anyWarning ? 'warning' : 'ok';
+  const anyOver = projections.some(([, r]) =>
+    (r.limits || []).some((limit) => {
+      const bar = ccRiskBarState(limit);
+      return bar && bar.tone === 'over';
+    }));
+  el.dataset.state = (anyWarning || anyOver) ? 'warning' : 'ok';
   el.innerHTML = rows.join('')
     + (v.reconciliation || []).map(r =>
       `<div class="dim">reconciliation ${esc(r.entity_id)}: ${
@@ -686,6 +799,10 @@ function renderScaling() {
   document.getElementById('scaling-event').textContent = scaling.event || '—';
   document.getElementById('scaling-expires').textContent =
     scaling.expires_at ? esc(String(scaling.expires_at)) : '—';
+
+  if (globalThis.CCCommands) {
+    CCCommands.populateScalingStrategySelect(v);
+  }
 
   const suspendBtn = document.getElementById('scaling-suspend');
   if (suspendBtn) {
@@ -801,7 +918,7 @@ function renderPaperAutomation() {
     const bound = (pa && pa.strategy_name) || '';
     const placeholder = names.length
       ? 'Select a strategy…'
-      : 'No deployed strategies — use the Deploy tab first';
+      : 'No deployed strategies — use the Strategies tab first';
     const options = [`<option value="">${esc(placeholder)}</option>`]
         .concat(names.map(name =>
           `<option value="${esc(name)}">${esc(name)}</option>`));
@@ -860,7 +977,7 @@ function renderPaperAutomation() {
                && ((v && v.strategies) || []).length === 0) {
       items.push(_checklistItem('blocked', 'Strategy selected',
         'No strategies in live feed or <code>strategy_runtime.yaml</code>. '
-        + 'Deploy one on the Deploy tab, then reload.'));
+        + 'Deploy one on the Strategies tab, then reload.'));
     } else {
       items.push(_checklistItem('wait', 'Strategy selected',
         'Pick the one strategy to arm (must not use propose while automated).'));
@@ -923,6 +1040,7 @@ function renderAll() {
   renderStatusBar(); renderAccountCards(); renderPositions(); renderProposals();
   renderOrders(); renderFills(); renderStrategies(); renderRisk(); renderScaling();
   renderPaperAutomation();
+  updateBanner();
 }
 
 /* ---------------- drawer (keyboard + focus managed) ----------------------- */
@@ -1246,11 +1364,8 @@ if (CFG.commandsEnabled) {
     else if (action === 'params') CCCommands.openStrategyParamsDrawer(strategy);
   });
 
-  // Strategy params dialog: Apply / Cancel. The form is intentionally empty
-  // (no tunables schema yet -- see command_center.html's comment on
-  // #cc-strategy-params-dialog); Apply collects whatever it holds today
-  // (nothing) and still exercises the real ccUpdateStrategyParams(strategy,
-  // params) call so the CAS/live-ceremony path works once fields exist.
+  // Strategy params dialog: Apply / Cancel. Fields are filled by
+  // ccOpenStrategyParamsDrawer from GET /api/strategies/{name}/params.
   document.getElementById('cc-params-apply').addEventListener('click', () => {
     const d = document.getElementById('cc-strategy-params-dialog');
     const strategy = ccFindStrategy(d.dataset.strategyName) || {
@@ -1313,9 +1428,9 @@ if (CFG.commandsEnabled) {
 }
 
 /* ---------------- boot ----------------------------------------------------- */
-if (CFG.commandsEnabled) {
-  // Inject live state + start the pending-command poll now that the store and
-  // command flags exist; also re-exposes globalThis.ccOpenResearchProposal.
+if (globalThis.CCCommands) {
+  // Inject live state + start the pending-command poll; also wires the
+  // allocation unsigned-JSON builder and re-exposes ccOpenResearchProposal.
   CCCommands.init({ view: () => store.view, config: CFG });
 }
 resync();

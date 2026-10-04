@@ -1,0 +1,173 @@
+from unittest.mock import MagicMock
+
+import pandas as pd
+
+from trader.data_providers.capabilities import Capability, make_news_item
+from trader.data_providers.registry import ProviderRegistry
+
+
+def _frame():
+    return pd.DataFrame([
+        {'ticker': 'HPAIW', 'name': '', 'close': 3.0, 'volume': float('nan'), 'change': 1.0, 'change_pct': 99.0,
+         'provider': 'alpaca', 'note': ''},
+        {'ticker': 'PENNY', 'name': '', 'close': 0.2, 'volume': float('nan'), 'change': 0.1, 'change_pct': 50.0,
+         'provider': 'alpaca', 'note': ''},
+        {'ticker': 'AAPL', 'name': '', 'close': 300.0, 'volume': float('nan'), 'change': 3.0, 'change_pct': 1.0,
+         'provider': 'alpaca', 'note': ''},
+    ])
+
+
+def _mmr(frame, news_items=(), assets=None):
+    from trader.sdk import MMR
+    mmr = object.__new__(MMR)
+    movers_provider, news_provider = MagicMock(), MagicMock()
+    movers_provider.movers.return_value = frame
+    news_provider.news.return_value = list(news_items)
+    mmr._provider = MagicMock(side_effect=lambda cap, source=None:
+                              movers_provider if cap == Capability.MOVERS else news_provider)
+    mmr._provider_default = MagicMock(return_value='alpaca')
+    mmr._alpaca_assets = MagicMock(return_value=assets)
+    return mmr
+
+
+class _Assets:
+    def load(self):
+        return self
+
+    def is_derivative_unit(self, symbol):
+        return symbol.endswith('W')
+
+    def name(self, symbol):
+        return {'AAPL': 'Apple Inc.'}.get(symbol, '')
+
+    def exchange(self, symbol):
+        return 'NASDAQ'
+
+
+def test_stock_movers_are_filtered():
+    out = _mmr(_frame(), assets=_Assets()).movers('stocks', 'gainers')
+    assert out['ticker'].tolist() == ['AAPL'] and out.loc[0, 'name'] == 'Apple Inc.'
+
+
+def test_asset_list_failure_only_turns_instrument_filter_off():
+    from trader.data_providers.errors import ProviderEntitlementError
+    mmr = _mmr(_frame())
+    mmr._alpaca_assets = MagicMock(side_effect=ProviderEntitlementError('alpaca rejected the API key'))
+    out = mmr.movers('stocks', 'gainers', source='massive')
+    assert out['ticker'].tolist() == ['HPAIW', 'AAPL']
+    assert all(note == 'warrant filter off: Alpaca asset list unavailable' for note in out['note'])
+
+
+def test_missing_alpaca_keys_say_not_configured():
+    out = _mmr(_frame(), assets=None).movers('stocks', 'gainers')
+    assert out['ticker'].tolist() == ['HPAIW', 'AAPL']
+    assert all(note == 'warrant filter off: Alpaca not configured' for note in out['note'])
+
+
+def test_crypto_movers_are_not_filtered():
+    out = _mmr(_frame(), assets=_Assets()).movers('crypto', 'gainers')
+    assert len(out) == 3
+
+
+def test_movers_default_ignores_default_data_source():
+    registry = ProviderRegistry.from_config({'default_data_source': 'twelvedata'})
+    assert registry.default_source(Capability.MOVERS) == 'alpaca'
+    assert registry.default_source(Capability.NEWS) == 'alpaca'
+
+
+def test_movers_detail_from_capabilities():
+    news = [make_news_item(title='Apple up', sentiment='')]
+    detail = _mmr(_frame(), news_items=news, assets=_Assets()).movers_detail('stocks', 'gainers', num=5)
+    assert [d['ticker'] for d in detail] == ['AAPL']
+    row = detail[0]
+    assert row['details'] == {'name': 'Apple Inc.', 'exchange': 'NASDAQ', 'description': ''}
+    assert row['news'] == {'headline': 'Apple up', 'sentiment': ''}
+    assert row['ratios'] == {} and row['close'] == 300.0 and row['open'] is None
+
+
+def test_cli_min_price_flag():
+    from trader.mmr_cli import build_parser
+    assert build_parser().parse_args(['movers', '--min-price', '0']).min_price == 0.0
+    assert build_parser().parse_args(['movers']).min_price == 1.0
+
+
+def _detail_row(ticker, volume):
+    return {'ticker': ticker, 'close': 300.0, 'open': None, 'change': 3.0, 'change_pct': 1.0, 'volume': volume,
+            'details': {'name': 'Apple Inc.'}, 'ratios': {}, 'news': {}}
+
+
+def _printed_movers_detail(*rows):
+    from argparse import Namespace
+    from trader.mmr_cli import _print_movers, console
+    mmr = MagicMock()
+    mmr.movers_detail.return_value = list(rows)
+    args = Namespace(detail=True, num=5, min_price=1.0)
+    with console.capture() as capture:
+        _print_movers(mmr, args, 'stocks', 'gainers', 'alpaca')
+    return capture.get()
+
+
+def test_movers_detail_omits_volume_when_unknown():
+    for unknown in (None, float('nan')):
+        assert 'vol' not in _printed_movers_detail(_detail_row('AAPL', unknown))
+
+
+def test_movers_detail_shows_known_volume():
+    assert 'vol 1,000' in _printed_movers_detail(_detail_row('AAPL', 1000.0))
+
+
+def _massive_snapshot(ticker, close):
+    from types import SimpleNamespace
+    day = SimpleNamespace(open=1.0, close=close, volume=1000)
+    return SimpleNamespace(ticker=ticker, day=day, todays_change=0.5, todays_change_percent=5.0)
+
+
+def _massive_detail_mmr(assets):
+    mmr = _mmr(_frame(), assets=assets)
+    client = MagicMock()
+    client.get_snapshot_direction.return_value = [
+        _massive_snapshot('PENNY', 0.5), _massive_snapshot('HPAIW', 3.0),
+        _massive_snapshot('NOPRICE', None), _massive_snapshot('AAPL', 300.0),
+    ]
+    client.get_ticker_details.side_effect = RuntimeError('no details')
+    client.list_financials_ratios.return_value = []
+    client.list_ticker_news.return_value = []
+    mmr._massive_rest_client = client
+    return mmr
+
+
+def test_massive_movers_detail_applies_the_stock_filter():
+    detail = _massive_detail_mmr(_Assets()).movers_detail('stocks', 'gainers', num=5, source='massive')
+    assert [row['ticker'] for row in detail] == ['AAPL']
+
+
+def test_massive_movers_detail_honours_min_price_and_keeps_units_without_alpaca():
+    detail = _massive_detail_mmr(None).movers_detail('stocks', 'gainers', num=5, source='massive', min_price=0)
+    assert [row['ticker'] for row in detail] == ['PENNY', 'HPAIW', 'AAPL']
+
+
+def test_massive_movers_detail_takes_num_after_filtering():
+    detail = _massive_detail_mmr(_Assets()).movers_detail('stocks', 'gainers', num=1, source='massive')
+    assert [row['ticker'] for row in detail] == ['AAPL']
+
+
+def test_massive_crypto_movers_detail_is_not_filtered():
+    detail = _massive_detail_mmr(_Assets()).movers_detail('crypto', 'gainers', num=5, source='massive')
+    assert len(detail) == 4
+
+
+def test_malformed_asset_payload_only_turns_instrument_filter_off():
+    from trader.data_providers.movers_filter import ASSET_LIST_UNAVAILABLE_NOTE
+    for error in (TypeError('bad'), ValueError('bad'), AttributeError('bad')):
+        mmr = _mmr(_frame())
+        mmr._alpaca_assets = MagicMock(side_effect=error)
+        assert mmr._movers_asset_directory() == (None, ASSET_LIST_UNAVAILABLE_NOTE)
+
+
+def test_headline_fetch_failure_is_logged_and_skipped(caplog):
+    mmr = _mmr(_frame(), assets=_Assets())
+    mmr._provider(Capability.NEWS).news.side_effect = RuntimeError('boom')
+    with caplog.at_level('WARNING'):
+        detail = mmr.movers_detail('stocks', 'gainers', num=5)
+    assert detail[0]['news'] == {}
+    assert 'headline fetch failed for AAPL: boom' in caplog.text

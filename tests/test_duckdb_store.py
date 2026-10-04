@@ -100,6 +100,21 @@ class TestDuckDBObjectStore:
         result = object_store.read("to_delete")
         assert result is None
 
+    def test_write_checkpoints_for_durability(self, object_store, monkeypatch):
+        """Universe/Portfolio blobs must flush past WAL so a restart cannot drop them."""
+        calls = []
+        original = object_store.checkpoint
+
+        def spy():
+            calls.append(True)
+            return original()
+
+        monkeypatch.setattr(object_store, "checkpoint", spy)
+        object_store.write("keep", {"symbols": ["AAPL"]})
+        assert calls == [True]
+        object_store.delete("keep")
+        assert calls == [True, True]
+
 
 def _sample_df_with_bar_size(n=10, start="2024-01-02 09:30", bar_size="1 day"):
     dates = pd.date_range(start, periods=n, freq="1min", tz="UTC")

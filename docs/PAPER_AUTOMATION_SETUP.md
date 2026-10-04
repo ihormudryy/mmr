@@ -17,8 +17,12 @@ Living deployed state (armed names, accounts) lives in
 | **One** paper strategy places protected orders without human approve | Yes — **paper automation** (`execute_automated_intent`) |
 | Many strategies all auto-trade unsupervised | No — **exactly one** `automation.strategy_name` |
 | `auto_execute: true` (blind auto) | No — refused at load |
-| Other strategies queue trades for you | Yes — `auto_execute: propose` → `approve` (CLI or dashboard) |
+| Other strategies queue trades for you | Yes — `auto_execute: propose` → PENDING; on **paper** the LLM may evaluate then approve/reject; on **live** a human must approve |
 | Same automation on **live** | No — `automation.live_enabled` must stay `false` |
+| LLM approve on paper after evaluation | Yes — not blind auto-approve; see `2026-07-23-paper-llm-approve-live-human-design.md` |
+| LLM approve on live | No — `LLM_LIVE_APPROVE_FORBIDDEN`; Command Center + preflight only |
+
+Paper LLM evaluate-approve (`approve_proposal` with `source=sdk`) is **not** the same as paper automation (`execute_automated_intent`).
 
 ---
 
@@ -40,7 +44,8 @@ Living deployed state (armed names, accounts) lives in
 ### Host / Docker
 
 - Working Docker split stack (`./docker.sh -g` or `-b -u`)
-- `MMR_HMAC_SECRET` in `.env` (typed RPC)
+- `~/.config/mmr/service_hmac.key` (mode `0600`), exposed to services through
+  `MMR_SERVICE_HMAC_KEY_FILE` (typed RPC)
 - Writable: `~/.config/mmr/`, `~/.local/share/mmr/` (artifacts + logs)
 
 ### Optional API keys
@@ -70,7 +75,8 @@ Confirm in `.env` / compose:
 
 - `TRADING_MODE=paper`
 - `IB_ACCOUNT=<your DU… paper account>`
-- `MMR_HMAC_SECRET` set
+- `~/.config/mmr/service_hmac.key` exists with mode `0600` and is mounted as
+  `MMR_SERVICE_HMAC_KEY_FILE`
 - Later: `DASHBOARD_COMMANDS_ENABLED=true` if you’ll Activate from the UI
 
 Gateway up, VNC if needed (`vnc://localhost:5901`), `mmr status` shows IB
@@ -141,6 +147,11 @@ remain in force; a valid research bundle does not bypass them.
 A signature proves origin and integrity, **not that metrics were measured**.
 The operator must audit the underlying trials, datasets, holdout, costs and
 review. Neither fixture data nor a successful plumbing drill is promotion evidence.
+
+Strategies that already declare `params.artifact_bundle_path` still **load**
+when `automation.enabled` is false (soft-load): they appear in Strategies /
+Scaling so you can Activate them. Attestation runs on Activate / when
+automation is enabled — not at cold load while disarmed.
 
 #### Preferred — dashboard (Phase 2 hot-arm)
 
@@ -243,6 +254,24 @@ python3 scripts/automation_paper_drill.py
 | `pause_trading` | Risk-reducing pause |
 | `DASHBOARD_COMMANDS_ENABLED=false` | Hides UI commands only |
 | `command_authority.enabled: false` + restart trader | No new approve/auto dispatch |
+
+---
+
+## Paper Docker e2e
+
+With the paper stack up (`./docker.sh -b -u`, IB upstream connected):
+
+```bash
+./scripts/paper_e2e.sh
+# optional:
+MMR_PAPER_E2E_LIVE_ORDERS=1 ./scripts/paper_e2e.sh
+MMR_PAPER_E2E_RESTART=1 ./scripts/paper_e2e.sh -k restart
+```
+
+Uses `~/.config/mmr/service_hmac.key` (mode `0600`) and dashboard
+`DASHBOARD_TOKEN`.
+
+Stack down → all tests skip (exit 0).
 
 ---
 

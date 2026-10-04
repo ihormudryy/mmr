@@ -66,6 +66,50 @@ class FakeResearchProvider:
     def presets(self) -> ResearchResult:
         return ResearchResult([], "Presets", provider="local")
 
+    def options_expirations(self, symbol):
+        self.calls.append(("options_expirations", {"symbol": symbol}))
+        return ResearchResult([{"expiration": "2026-03-20", "dte": 240}],
+                              f"Options expirations: {symbol}")
+
+    def options_chain(self, symbol, *, expiration, contract_type, strike_min, strike_max):
+        self.calls.append(("options_chain", {"symbol": symbol, "expiration": expiration}))
+        return ResearchResult([{"ticker": "O:AAPL260320C00250000", "strike": 250.0}],
+                              f"Options chain: {symbol}")
+
+    def options_snapshot(self, option_ticker):
+        self.calls.append(("options_snapshot", {"option_ticker": option_ticker}))
+        return ResearchResult({"ticker": option_ticker, "strike": 250.0},
+                              f"Option: {option_ticker}")
+
+    def options_implied(self, symbol, *, expiration, risk_free_rate=0.05):
+        self.calls.append(("options_implied", {"symbol": symbol, "expiration": expiration}))
+        return ResearchResult({"x": [1], "market_implied": [0.5], "constant": [0.5]},
+                              f"Implied distribution: {symbol}")
+
+    def forex_snapshot(self, pair, *, source):
+        self.calls.append(("forex_snapshot", {"pair": pair, "source": source}))
+        return ResearchResult({"ticker": f"C:{pair}", "bid": 1.08, "ask": 1.081},
+                              f"Forex snapshot: {pair}")
+
+    def forex_quote(self, from_ccy, to_ccy, *, source):
+        self.calls.append(("forex_quote", {"from": from_ccy, "to": to_ccy}))
+        return ResearchResult({"pair": f"{from_ccy}/{to_ccy}", "bid": 1.08},
+                              f"Forex quote: {from_ccy}/{to_ccy}")
+
+    def forex_movers(self, direction):
+        self.calls.append(("forex_movers", {"direction": direction}))
+        return ResearchResult([{"ticker": "C:EURUSD", "change_pct": 0.4}],
+                              f"Forex movers ({direction})")
+
+    def forex_snapshot_all(self, tickers):
+        self.calls.append(("forex_snapshot_all", {"tickers": tickers}))
+        return ResearchResult([{"ticker": "C:EURUSD"}], "Forex snapshots")
+
+    def forex_convert(self, from_ccy, to_ccy, amount):
+        self.calls.append(("forex_convert", {"from": from_ccy, "to": to_ccy, "amount": amount}))
+        return ResearchResult({"from": from_ccy, "to": to_ccy, "amount": amount,
+                               "converted": amount * 1.08}, "Convert")
+
 
 class RecordingResearchService(ResearchService):
     def __init__(self, provider: FakeResearchProvider) -> None:
@@ -147,6 +191,51 @@ def app_with_research(
     return create_app(research_cc, research_service)
 
 
+class _FakeQueryClient:
+    def __init__(self, mapping):
+        self._mapping = mapping  # method -> dict
+
+    def call(self, method, body, _type, timeout=None):
+        return self._mapping[method]
+
+
+@pytest.fixture
+def app_factory_with_query_client(monkeypatch, research_service: ResearchService):
+    class EmptyManageClient:
+        def trader_query(self, method, body=None):
+            if method == "list_universes":
+                return {"universes": []}
+            return {}
+
+        def strategy_query(self, method, body=None):
+            if method == "list_strategies":
+                return {"strategies": []}
+            return {}
+
+    monkeypatch.setattr(
+        "web.app.get_manage_client",
+        lambda: EmptyManageClient(),
+    )
+
+    def build(query_client) -> TestClient:
+        cc = CommandCenter(
+            CommandCenterConfig(),
+            credentials_loader=lambda: DashboardCredentials(
+                token=TOKEN,
+                session_secret=SECRET,
+                legacy_alias_used=False,
+            ),
+            query_client_factory=lambda: None,
+            feed_client_factory=lambda: None,
+            bridge_factory=lambda *args, **kwargs: NullBridge(),
+            quote_plane_factory=lambda loop, deliver: NullQuotePlane(),
+        )
+        cc._query_client = query_client
+        return TestClient(create_app(cc, research_service))
+
+    return build
+
+
 @pytest.fixture
 def logged_in_research_client(app_with_research) -> TestClient:
     client = TestClient(app_with_research)
@@ -199,17 +288,18 @@ def test_research_routes_require_session(app_with_research):
         assert client.get(f"/api/research/{path}").status_code == 401
 
 
-def test_research_shell_is_the_sixth_tab(logged_in_research_client):
+def test_research_shell_precedes_guide_tab(logged_in_research_client):
     html = logged_in_research_client.get("/cc").text
     assert 'data-dash-tab="research"' in html
     assert 'id="dash-research"' in html
-    assert html.index('data-dash-tab="research"') > html.index(
+    # Guide is last in the tab row; Research sits immediately before it.
+    assert html.index('data-dash-tab="research"') < html.index(
         'data-dash-tab="guide"')
     for tool in (
         "ideas", "movers", "lookup", "scan", "depth", "options", "forex",
     ):
         assert f'data-research-tool="{tool}"' in html
-    assert html.count('data-research-later="true"') == 4
+    assert html.count('data-research-later="true"') == 2  # scan, depth only
 
 
 def test_read_only_page_keeps_research_without_propose(logged_in_research_client):
@@ -769,3 +859,175 @@ async def test_saturated_research_pool_does_not_block_trading_sse(
             isinstance(result, httpx.Response) and result.status_code == 200
             for result in scan_results
         )
+
+
+def test_options_chain_success(logged_in_research_client):
+    r = logged_in_research_client.get(
+        "/api/research/options/chain?symbol=AAPL&expiration=2026-03-20&type=call")
+    assert r.status_code == 200
+    body = r.json()
+    assert body["meta"]["tool"] == "options_chain"
+    assert body["data"][0]["ticker"] == "O:AAPL260320C00250000"
+
+
+def test_options_routes_require_session(app_with_research):
+    client = TestClient(app_with_research)
+    for path in ("options/expirations?symbol=AAPL",
+                 "options/chain?symbol=AAPL",
+                 "options/snapshot?option_ticker=O:AAPL260320C00250000",
+                 "options/implied?symbol=AAPL&expiration=2026-03-20"):
+        assert client.get(f"/api/research/{path}").status_code == 401
+
+
+def test_options_chain_rejects_bad_type_and_strike_order(logged_in_research_client):
+    assert logged_in_research_client.get(
+        "/api/research/options/chain?symbol=AAPL&type=long").status_code == 422
+    assert logged_in_research_client.get(
+        "/api/research/options/chain?symbol=AAPL&strike_min=300&strike_max=100"
+    ).status_code == 422
+
+
+def test_options_chain_rejects_unknown_param(logged_in_research_client):
+    r = logged_in_research_client.get("/api/research/options/chain?symbol=AAPL&foo=1")
+    assert r.status_code == 422
+
+
+def test_options_implied_requires_expiration(logged_in_research_client):
+    assert logged_in_research_client.get(
+        "/api/research/options/implied?symbol=AAPL").status_code == 422
+
+
+def test_forex_snapshot_massive(logged_in_research_client):
+    r = logged_in_research_client.get("/api/research/forex/snapshot?pair=EURUSD")
+    assert r.status_code == 200
+    assert r.json()["meta"]["tool"] == "forex_snapshot"
+
+
+def test_forex_quote_massive(logged_in_research_client):
+    r = logged_in_research_client.get("/api/research/forex/quote?from=EUR&to=USD")
+    assert r.status_code == 200
+    body = r.json()
+    assert body["meta"]["tool"] == "forex_quote"
+    assert body["data"]["pair"] == "EUR/USD"
+
+
+def test_forex_movers_massive(logged_in_research_client):
+    r = logged_in_research_client.get("/api/research/forex/movers?direction=losers")
+    assert r.status_code == 200
+    assert r.json()["meta"]["tool"] == "forex_movers"
+
+
+def test_forex_snapshot_all_massive(logged_in_research_client):
+    r = logged_in_research_client.get(
+        "/api/research/forex/snapshot-all?tickers=EURUSD&tickers=GBPUSD")
+    assert r.status_code == 200
+    assert r.json()["meta"]["tool"] == "forex_snapshot_all"
+
+
+def test_forex_convert_massive(logged_in_research_client):
+    r = logged_in_research_client.get(
+        "/api/research/forex/convert?from=EUR&to=USD&amount=100")
+    assert r.status_code == 200
+    body = r.json()
+    assert body["meta"]["tool"] == "forex_convert"
+    assert body["data"]["converted"] == pytest.approx(108.0)
+
+
+def test_forex_snapshot_rejects_bad_pair(logged_in_research_client):
+    assert logged_in_research_client.get(
+        "/api/research/forex/snapshot?pair=EURUS").status_code == 422
+
+
+def test_forex_movers_rejects_source_param(logged_in_research_client):
+    assert logged_in_research_client.get(
+        "/api/research/forex/movers?direction=gainers&source=ib").status_code == 422
+
+
+def test_forex_snapshot_all_rejects_source_param(logged_in_research_client):
+    assert logged_in_research_client.get(
+        "/api/research/forex/snapshot-all?tickers=EURUSD&source=ib").status_code == 422
+
+
+def test_forex_convert_rejects_source_param(logged_in_research_client):
+    assert logged_in_research_client.get(
+        "/api/research/forex/convert?from=EUR&to=USD&amount=100&source=ib"
+    ).status_code == 422
+
+
+def test_forex_convert_rejects_nonpositive_amount(logged_in_research_client):
+    assert logged_in_research_client.get(
+        "/api/research/forex/convert?from=EUR&to=USD&amount=0").status_code == 422
+
+
+def test_forex_quote_rejects_bad_currency_code(logged_in_research_client):
+    assert logged_in_research_client.get(
+        "/api/research/forex/quote?from=EU&to=USD").status_code == 422
+
+
+def test_forex_routes_require_session(app_with_research):
+    client = TestClient(app_with_research)
+    for path in ("forex/snapshot?pair=EURUSD",
+                 "forex/quote?from=EUR&to=USD",
+                 "forex/movers?direction=gainers",
+                 "forex/snapshot-all",
+                 "forex/convert?from=EUR&to=USD&amount=100"):
+        assert client.get(f"/api/research/{path}").status_code == 401
+
+
+def test_forex_snapshot_ib_uses_typed_query(app_factory_with_query_client):
+    # app whose cc._query_client returns a resolved instrument + snapshot
+    client = app_factory_with_query_client(_FakeQueryClient({
+        "discover_instrument": {"instruments": [{"instrument_id": 12087792}]},
+        "get_snapshot": {"snapshot": {"bid": 1.0849, "ask": 1.0851, "last": 1.085}},
+    }))
+    _login(client)
+    r = client.get("/api/research/forex/snapshot?pair=EURUSD&source=ib")
+    assert r.status_code == 200
+    body = r.json()
+    assert body["meta"]["provider"] == "ib"
+    assert body["data"]["bid"] == 1.0849
+
+
+def test_forex_quote_ib_uses_typed_query(app_factory_with_query_client):
+    client = app_factory_with_query_client(_FakeQueryClient({
+        "discover_instrument": {"instruments": [{"instrument_id": 12087792}]},
+        "get_snapshot": {"snapshot": {"bid": 1.0849, "ask": 1.0851, "last": 1.085}},
+    }))
+    _login(client)
+    r = client.get("/api/research/forex/quote?from=EUR&to=USD&source=ib")
+    assert r.status_code == 200
+    body = r.json()
+    assert body["meta"]["provider"] == "ib"
+    assert body["data"]["ask"] == 1.0851
+
+
+def test_forex_snapshot_ib_down_returns_trader_link_unavailable(
+        app_factory_with_query_client):
+    client = app_factory_with_query_client(None)  # no query client
+    _login(client)
+    r = client.get("/api/research/forex/snapshot?pair=EURUSD&source=ib")
+    assert r.status_code == 503
+    assert r.json()["error"]["code"] == "TRADER_LINK_UNAVAILABLE"
+
+
+def test_forex_snapshot_ib_unresolved_instrument_returns_upstream_error(
+        app_factory_with_query_client):
+    client = app_factory_with_query_client(_FakeQueryClient({
+        "discover_instrument": {"instruments": []},
+    }))
+    _login(client)
+    r = client.get("/api/research/forex/snapshot?pair=EURUSD&source=ib")
+    assert r.status_code == 502
+    assert r.json()["error"]["code"] == "RESEARCH_UPSTREAM_ERROR"
+
+
+def test_forex_snapshot_ib_call_failure_maps_to_trader_link_unavailable(
+        app_factory_with_query_client):
+    class _RaisingQueryClient:
+        def call(self, method, body, _type, timeout=None):
+            raise RuntimeError("socket boom")
+    client = app_factory_with_query_client(_RaisingQueryClient())
+    _login(client)
+    r = client.get("/api/research/forex/snapshot?pair=EURUSD&source=ib")
+    assert r.status_code == 503
+    assert r.json()["error"]["code"] == "TRADER_LINK_UNAVAILABLE"

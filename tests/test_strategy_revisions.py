@@ -55,6 +55,7 @@ from trader.trading.command_coordinator import (
     CommandRequest,
     StrategyControlCommandService,
     TradingCommandCoordinator,
+    acknowledge_strategy_state,
     apply_command_ledger_migration,
 )
 from trader.trading.strategy import StrategyState
@@ -444,6 +445,80 @@ def test_trader_journals_strategy_updated_only_after_acknowledgement(forwarding)
     assert strategy_events[0].entity_revision == receipt.outcome["state_revision"]
 
 
+def test_control_ack_journals_full_observable_payload(forwarding):
+    forwarding.port.canned("cmd-full-payload", StrategyCommandReceipt(
+        command_id="cmd-full-payload",
+        strategy_name="smi_crossover",
+        action="disable_strategy",
+        state="COMMITTED",
+        control_revision=5,
+        state_revision=9,
+        observable_state="DISABLED",
+        observable_payload={
+            "strategy_name": "smi_crossover",
+            "strategy_state": "DISABLED",
+            "class_name": "SMICrossOver",
+            "bar_size": "5 mins",
+            "conids": [756733],
+            "params": {"signal_period": 3},
+        },
+    ))
+
+    forwarding.coordinator.execute(_strategy_request(
+        "cmd-full-payload", "disable_strategy", expected_version=4))
+
+    strategy_event = next(
+        event for event in forwarding.journal.read_after(0, 100)
+        if event.event_type == "strategy.updated")
+    assert strategy_event.payload["class_name"] == "SMICrossOver"
+    assert strategy_event.payload["bar_size"] == "5 mins"
+    assert strategy_event.payload["conids"] == [756733]
+    assert strategy_event.payload["params"] == {"signal_period": 3}
+
+
+def test_strategy_materialized_snapshot_preserves_metadata_after_receipt_update(tmp_path):
+    from trader.data.materialized_state import GenericEntityAdapter
+    from trader.domain.snapshot_service import DomainSnapshotService
+
+    _, journal = _build_journal(tmp_path)
+    acknowledge_strategy_state(
+        journal,
+        "vwap_reclaim",
+        1,
+        0,
+        {
+            "strategy_name": "vwap_reclaim",
+            "strategy_state": "RUNNING",
+            "class_name": "VwapReclaim",
+            "bar_size": "1 min",
+            "conids": [756733],
+            "params": {"lookback": 20},
+        },
+        correlation_id="full-row",
+    )
+    acknowledge_strategy_state(
+        journal,
+        "vwap_reclaim",
+        2,
+        1,
+        {
+            "strategy_name": "vwap_reclaim",
+            "strategy_state": "DISABLED",
+            "control_revision": 1,
+        },
+        correlation_id="receipt-only",
+    )
+
+    snapshot = DomainSnapshotService(journal)
+    snapshot.register_adapter(GenericEntityAdapter("strategy"))
+    row = snapshot.snapshot_with_cursor().entities["strategy"][0]
+    assert row["strategy_state"] == "DISABLED"
+    assert row["class_name"] == "VwapReclaim"
+    assert row["bar_size"] == "1 min"
+    assert row["conids"] == [756733]
+    assert row["params"] == {"lookback": 20}
+
+
 class TestForwardingSagaEdgeCases:
     def test_forward_timeout_degrades_to_outcome_unknown_and_schedules_reconcile(self, forwarding):
         forwarding.port.raise_on_forward(TimeoutError("no reply"))
@@ -531,6 +606,29 @@ class TestForwardingSagaEdgeCases:
         second = service.acknowledge_state(
             "smi_crossover", 1, 1, payload, correlation_id="corr-1")
         assert first == second
+
+    def test_acknowledge_state_allows_diverged_journal_and_state_revisions(self, tmp_path):
+        """Regression: journal entity_revision 4 vs strategy state_revision 6
+        used to raise _StrategyRevisionDrift → INTERNAL_ERROR on Disable."""
+        from trader.trading.command_coordinator import acknowledge_strategy_state
+
+        _, journal = _build_journal(tmp_path)
+        # Seed three prior acks so the next entity_revision is 4.
+        for rev in (1, 2, 3):
+            acknowledge_strategy_state(
+                journal, "vwap_reclaim_cat", rev, 0,
+                {"strategy_name": "vwap_reclaim_cat", "strategy_state": "RUNNING"},
+                correlation_id=f"seed-{rev}",
+            )
+        entity_revision = acknowledge_strategy_state(
+            journal, "vwap_reclaim_cat", 6, 1,
+            {"strategy_name": "vwap_reclaim_cat", "strategy_state": "DISABLED"},
+            correlation_id="disable-1",
+        )
+        assert entity_revision == 4
+        entity = journal.get_entity("strategy", "vwap_reclaim_cat")
+        assert entity is not None
+        assert entity["payload"]["strategy_state"] == "DISABLED"
 
 
 # ---------------------------------------------------------------------------
@@ -739,3 +837,65 @@ class TestStrategyStateIngestRegistration:
         assert entity is not None
         # idempotent replay of the same state_revision
         assert registration.handler(parsed) == {"entity_revision": 1}
+
+    def test_strategy_adapter_exposes_journaled_rows_in_fenced_snapshot(self, tmp_path):
+        """Without GenericEntityAdapter('strategy'), snapshot_with_cursor omits
+        journaled strategy rows and the command-center Strategies panel stays
+        empty after baseline install (feed only sees events past the cursor)."""
+        from trader.data.materialized_state import GenericEntityAdapter
+        from trader.domain.snapshot_service import DomainSnapshotService
+        from trader.messaging.production_api import register_strategy_state_ingest
+        from trader.messaging.typed_rpc import TypedRpcRegistry
+
+        _, journal = _build_journal(tmp_path)
+        registry = TypedRpcRegistry()
+        register_strategy_state_ingest(registry, journal)
+        registration = registry.resolve("command", "record_state_acknowledged")
+        payload = {
+            "strategy_name": "vwap_reclaim_cat",
+            "strategy_state": "RUNNING",
+            "state": "RUNNING",
+            "control_revision": 0,
+            "class_name": "VwapReclaim",
+            "bar_size": "1 min",
+            "conids": [756733],
+        }
+        parsed = registration.request_model(
+            strategy_name="vwap_reclaim_cat", state_revision=1,
+            control_revision=0, payload=payload)
+        registration.handler(parsed)
+
+        service = DomainSnapshotService(journal)
+        service.register_adapter(GenericEntityAdapter("strategy"))
+        snapshot = service.snapshot_with_cursor()
+        rows = snapshot.entities["strategy"]
+        assert len(rows) == 1
+        assert rows[0]["entity_id"] == "vwap_reclaim_cat"
+        assert rows[0]["strategy_state"] == "RUNNING"
+        assert rows[0]["class_name"] == "VwapReclaim"
+        assert rows[0]["conids"] == [756733]
+
+
+def test_trader_registers_strategy_materialized_adapter():
+    """Regression: trading_control alone left Strategies panel empty."""
+    from pathlib import Path
+    src = Path(__file__).resolve().parents[1] / "trader" / "trading" / "trading_runtime.py"
+    text = src.read_text()
+    assert 'GenericEntityAdapter("trading_control")' in text
+    assert 'GenericEntityAdapter("strategy")' in text
+
+
+def test_enable_strategy_receipt_carries_observable_state(runtime):
+    current = runtime._revisions.control_revision("smi_crossover")
+    receipt = runtime.apply_control_command(
+        "cmd-obs", "smi_crossover", "enable_strategy",
+        expected_control_revision=current, params=None)
+    assert receipt.state == "COMMITTED"
+    assert receipt.observable_state is not None
+    assert receipt.observable_state != "COMMITTED"
+    assert receipt.observable_state in {
+        "RUNNING", "WAITING_HISTORICAL_DATA", "INSTALLED", "DISABLED", "ERROR",
+    }
+    assert receipt.observable_payload is not None
+    assert receipt.observable_payload["strategy_name"] == "smi_crossover"
+    assert receipt.observable_payload["class_name"]

@@ -137,7 +137,7 @@ api_key_status() {
 # Print all the data-feed API keys in one block.
 #
 # Sources, in priority order:
-#   1. Exported env var (MASSIVE_API_KEY, TWELVEDATA_API_KEY)
+#   1. Exported env var (MASSIVE_API_KEY, TWELVEDATA_API_KEY, ALPACA_API_KEY_ID)
 #   2. ~/.config/mmr/secrets.env if it exists (sourced for KEY=VALUE lines).
 #      This is a convenient way to keep keys out of trader.yaml (which
 #      gets copied around) and out of shell history.
@@ -161,6 +161,7 @@ print_api_keys() {
     printf '  %sData feed API keys%s\n' "$C_DIM" "$C_RESET"
     api_key_status "Massive/Polygon"  "massive_api_key"     "MASSIVE_API_KEY"     "$yaml_file"
     api_key_status "TwelveData"       "twelvedata_api_key"  "TWELVEDATA_API_KEY"  "$yaml_file"
+    api_key_status "Alpaca"           "alpaca_api_key_id"   "ALPACA_API_KEY_ID"   "$yaml_file"
 }
 
 # Bring up the sibling news scraper docker stack (~/dev/news by default,
@@ -489,6 +490,29 @@ run_setup() {
     live_port="${live_port:-${current_live_port:-7496}}"
     sed -i.bak "s/^ib_live_port:.*/ib_live_port: ${live_port}/" "$TRADER_CONFIG"
 
+    # ── Alpaca API Keys ──
+    echo ""
+    echo "Alpaca market data keys (free Basic plan with a paper account)."
+    echo "Default history source for US stocks (SIP, split-adjusted)."
+    echo "Get keys at: https://alpaca.markets"
+    echo ""
+
+    local current_alpaca_key_id
+    current_alpaca_key_id=$(grep '^alpaca_api_key_id:' "$TRADER_CONFIG" | awk '{print $2}' | tr -d "'\"")
+    local alpaca_key_id alpaca_secret_key
+    if [ -n "$current_alpaca_key_id" ]; then
+        local masked_alpaca_key_id="${current_alpaca_key_id:0:4}...${current_alpaca_key_id: -4}"
+        read -p "Alpaca API key ID [${masked_alpaca_key_id}]: " alpaca_key_id
+    else
+        read -p "Alpaca API key ID (leave empty to skip): " alpaca_key_id
+    fi
+    if [ -n "$alpaca_key_id" ]; then
+        read -s -p "Alpaca API secret key: " alpaca_secret_key
+        echo ""
+        sed -i.bak "s/^alpaca_api_key_id:.*/alpaca_api_key_id: '${alpaca_key_id}'/" "$TRADER_CONFIG"
+        sed -i.bak "s/^alpaca_api_secret_key:.*/alpaca_api_secret_key: '${alpaca_secret_key}'/" "$TRADER_CONFIG"
+    fi
+
     # ── Massive API Key ──
     echo ""
     echo "Massive.com (Polygon.io) API key for US market data."
@@ -532,6 +556,11 @@ run_setup() {
         kv "Massive API key:" "configured"
     else
         kv "Massive API key:" "not set (US scanning/data disabled)"
+    fi
+    if [ -n "$alpaca_key_id" ] || [ -n "$current_alpaca_key_id" ]; then
+        kv "Alpaca API keys:" "configured"
+    else
+        kv "Alpaca API keys:" "not set (default US history downloads will fail)"
     fi
     kv "DuckDB:"          "$db_path"
     echo ""

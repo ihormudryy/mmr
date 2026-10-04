@@ -1,0 +1,8 @@
+[{"symbol": "AAPL", "name": "Apple Inc. Common Stock", "exchange": "NASDAQ", "class": "us_equity", "tradable": true, "status": "active"},
+ {"symbol": "BRK.B", "name": "BERKSHIRE HATHAWAY Class B", "exchange": "NYSE", "class": "us_equity", "tradable": true, "status": "active"},
+ {"symbol": "HPAIW", "name": "Helport AI Limited Warrants", "exchange": "NASDAQ", "class": "us_equity", "tradable": true, "status": "active"},
+ {"symbol": "GLLRF", "name": "GLOBAL LTS ACQUISITION CORP Rights", "exchange": "OTC", "class": "us_equity", "tradable": false, "status": "active"},
+ {"symbol": "KVAUF", "name": "Keen Vision Acquisition Corporation Units", "exchange": "OTC", "class": "us_equity", "tradable": false, "status": "active"},
+ {"symbol": "BBAI.WS", "name": "BigBear.ai Holdings, Inc. Redeemable warrants, each full warrant exercisable for one share of common stock at an exercise price of $11.50 per share", "exchange": "NYSE", "class": "us_equity", "tradable": true, "status": "active"},
+ {"symbol": "UNTC", "name": "Unit Corporation Common Stock", "exchange": "OTC", "class": "us_equity", "tradable": true, "status": "active"},
+ {"symbol": "PRIAF", "name": "PRIOR1TY INTELLIGENCE GROUP PLC Ordinary Shares (United Kingdom)", "exchange": "OTC", "class": "us_equity", "tradable": false, "status": "active"}]

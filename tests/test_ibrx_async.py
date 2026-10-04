@@ -182,6 +182,202 @@ class TestSnapshotAsync:
         assert asyncio.iscoroutine(coro)
         await coro
 
+    def test_delayed_subscribe_does_not_reset_to_live_before_ticks(self):
+        """Delayed snapshots must stay on type 3 until the wait finishes.
+
+        Flipping back to live immediately after reqMktData races IB and
+        surfaces 10089 even when delayed data is available.
+        """
+        from reactivex.subject import Subject
+
+        ibrx = _make_ibrx()
+        ibrx.ib.client = MagicMock(_reqIdSeq=42)
+        ibrx.ib.reqMktData = MagicMock(return_value=Ticker())
+        ibrx._contracts_source = MagicMock()
+        ibrx._contracts_source.call_event_subscriber_sync = MagicMock(
+            side_effect=lambda fn, asend_result=False: fn()
+        )
+        ibrx.contracts_subject = Subject()
+        ibrx.error_subject = Subject()
+        ibrx.error_disposables = {}
+        ibrx._filter_contract = lambda contract, ticker: True
+
+        md_types: list[int] = []
+        ibrx.ib.reqMarketDataType = MagicMock(side_effect=md_types.append)
+
+        ibrx._IBAIORx__subscribe_contract(
+            _make_contract(), one_time_snapshot=True, delayed=True
+        )
+
+        assert md_types == [3], (
+            f"delayed subscribe flipped market-data type mid-request: {md_types}"
+        )
+        assert ibrx.ib.reqMktData.called
+
+    @pytest.mark.asyncio
+    async def test_error_10167_does_not_abort_snapshot_subscription(self):
+        """10167 means delayed data is being shown — not a hard failure.
+
+        Propagating it via error_subject made delayed fallback abort before
+        ticks arrived → QUOTE_UNAVAILABLE on propose for paper accounts.
+        """
+        from trader.listeners.ibreactive import IBAIORxError
+
+        ibrx = _make_ibrx()
+        ibrx.error_subject = MagicMock()
+        await ibrx._IBAIORx__handle_error(
+            166, 10167,
+            "Requested market data is not subscribed. Displaying delayed market data.",
+            _make_contract(),
+        )
+        ibrx.error_subject.on_next.assert_not_called()
+
+        # A real subscription failure must still propagate.
+        await ibrx._IBAIORx__handle_error(
+            167, 10089,
+            "Requested market data requires additional subscription for API.",
+            _make_contract(),
+        )
+        assert ibrx.error_subject.on_next.called
+        err = ibrx.error_subject.on_next.call_args[0][0]
+        assert isinstance(err, IBAIORxError)
+        assert err.errorCode == 10089
+
+    @pytest.mark.asyncio
+    async def test_farm_status_codes_do_not_propagate_as_errors(self):
+        """G2: transient farm connecting/disconnected must not log/propagate as ERROR."""
+        from trader.listeners.ibreactive import IBAIORxError
+
+        ibrx = _make_ibrx()
+        ibrx.error_subject = MagicMock()
+        for code, msg in (
+            (2103, 'Market data farm connection is broken:usfarm'),
+            (2105, 'HMDS data farm connection is broken:ushmds'),
+            (2119, 'Market data farm is connecting:usfarm'),
+            (2104, 'Market data farm connection is OK:usfarm'),
+        ):
+            ibrx.error_subject.reset_mock()
+            await ibrx._IBAIORx__handle_error(-1, code, msg, None)
+            ibrx.error_subject.on_next.assert_not_called()
+
+        # A real request error still propagates.
+        await ibrx._IBAIORx__handle_error(
+            42, 200, 'No security definition', _make_contract(),
+        )
+        assert ibrx.error_subject.on_next.called
+        err = ibrx.error_subject.on_next.call_args[0][0]
+        assert isinstance(err, IBAIORxError)
+        assert err.errorCode == 200
+
+    @pytest.mark.asyncio
+    async def test_delayed_snapshot_restores_live_mode_after_wait(self):
+        """After a delayed snapshot wait, restore type 1 for streaming callers."""
+        from reactivex.subject import Subject
+
+        ibrx = _make_ibrx()
+        md_types: list[int] = []
+        ibrx.ib.reqMarketDataType = MagicMock(side_effect=md_types.append)
+
+        ticker = Ticker()
+        ticker.bid = 210.0
+        ticker.ask = 210.1
+        ticker.last = 210.05
+        push = Subject()
+
+        def _subscribe_contract(**kwargs):
+            assert kwargs.get("delayed") is True
+            ibrx.ib.reqMarketDataType(3)
+            return push
+
+        ibrx._IBAIORx__subscribe_contract = _subscribe_contract
+
+        async def _run():
+            task = asyncio.create_task(
+                ibrx.get_snapshot(_make_contract(), delayed=True)
+            )
+            await asyncio.sleep(0)
+            push.on_next(ticker)
+            return await task
+
+        result = await _run()
+        assert result.bid == 210.0
+        assert 1 in md_types
+        assert md_types[-1] == 1
+
+    @pytest.mark.asyncio
+    async def test_concurrent_delayed_snapshots_do_not_restore_live_mid_wait(self):
+        """First delayed finisher must not flip type 1 under a sibling wait."""
+        from reactivex.subject import Subject
+
+        ibrx = _make_ibrx()
+        md_types: list[int] = []
+        ibrx.ib.reqMarketDataType = MagicMock(side_effect=md_types.append)
+
+        push_a = Subject()
+        push_b = Subject()
+        pushes = [push_a, push_b]
+        call_i = {'n': 0}
+
+        def _subscribe_contract(**kwargs):
+            assert kwargs.get("delayed") is True
+            idx = call_i['n']
+            call_i['n'] += 1
+            return pushes[idx]
+
+        ibrx._IBAIORx__subscribe_contract = _subscribe_contract
+
+        ticker_a = Ticker()
+        ticker_a.bid = 1.0
+        ticker_a.ask = 1.1
+        ticker_a.last = 1.05
+        ticker_b = Ticker()
+        ticker_b.bid = 2.0
+        ticker_b.ask = 2.1
+        ticker_b.last = 2.05
+
+        task_a = asyncio.create_task(
+            ibrx.get_snapshot(_make_contract(conId=1), delayed=True)
+        )
+        task_b = asyncio.create_task(
+            ibrx.get_snapshot(_make_contract(conId=2), delayed=True)
+        )
+        await asyncio.sleep(0)
+
+        # A completes first while B is still waiting — must NOT restore live yet.
+        push_a.on_next(ticker_a)
+        await asyncio.sleep(0.15)
+        assert task_a.done()
+        assert not task_b.done()
+        assert ibrx._delayed_md_leases == 1
+        assert md_types.count(1) == 0, (
+            f"live restored while sibling delayed wait still open: {md_types}"
+        )
+
+        push_b.on_next(ticker_b)
+        ra, rb = await asyncio.gather(task_a, task_b)
+        assert ra.bid == 1.0 and rb.bid == 2.0
+        assert ibrx._delayed_md_leases == 0
+        assert md_types[-1] == 1
+
+    def test_live_streaming_subscribe_selects_type_1(self):
+        """Live publish must explicitly select type 1 (not inherit delayed)."""
+        from reactivex.subject import Subject
+
+        ibrx = _make_ibrx()
+        ibrx.ib.client = MagicMock(_reqIdSeq=7)
+        ibrx.ib.reqMktData = MagicMock(return_value=Ticker())
+        ibrx._contracts_source = MagicMock()
+        ibrx._contracts_source.call_event_subscriber_sync = MagicMock(
+            side_effect=lambda fn, asend_result=False: fn()
+        )
+        ibrx.error_subject = Subject()
+        md_types: list[int] = []
+        ibrx.ib.reqMarketDataType = MagicMock(side_effect=md_types.append)
+        ibrx._streaming_delayed = 0
+
+        ibrx.subscribe_contract_direct(_make_contract(), delayed=False)
+        assert md_types == [1]
+
 
 # ---------------------------------------------------------------------------
 # get_snapshots_batch — sequential but non-blocking

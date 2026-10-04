@@ -280,6 +280,31 @@ function proposalTarget() {
     assert.match(h.elements.get('research-results').innerHTML, /\+2\.33%/);
   });
 
+  await test('Session / previous_day / leftovers render as metric cells', async () => {
+    const h = makeHarness();
+    h.loadProductionScript();
+    h.api.selectTool('movers');
+    h.fetch.enqueue(200, response([{
+      ticker: 'NVDA',
+      change_pct: 1.5,
+      day: {open: 100, high: 110, low: 99, close: 108, volume: 1_500_000},
+      previous_day: {open: 98, close: 100, volume: 900_000},
+      custom_metric: 42,
+      ratios: {pe: 45.2, pb: 12.1},
+    }], 'Movers'));
+    await h.api.run('movers', new URLSearchParams());
+    h.api.selectRow(0);
+
+    const detail = h.elements.get('research-detail').innerHTML;
+    assert.match(detail, />Session</);
+    assert.match(detail, />Previous day</);
+    assert.match(detail, /research-metric-label[^>]*>Open</);
+    assert.match(detail, /research-metric-value[^>]*>100</);
+    assert.match(detail, /data-research-ratios[\s\S]*research-metric/);
+    assert.match(detail, /research-metric-label[^>]*>Custom Metric</);
+    assert.doesNotMatch(detail, /<dl class="research-fields"/);
+  });
+
   await test('result rows support click and keyboard Enter selection', async () => {
     const h = makeHarness();
     h.loadProductionScript();
@@ -450,6 +475,35 @@ function proposalTarget() {
     assert.equal(result, null);
     assert.equal(h.fetch.calls.length, 0);
     assert.equal(h.api.activeTool(), 'ideas');
+  });
+
+  await test('options chain tool fetches the chain endpoint', async () => {
+    const h = makeHarness();
+    h.fetch.enqueue(200, response([{preset: 'momentum'}], 'Presets', {tool: 'presets', provider: 'local'}));
+    h.loadProductionScript();
+    await h.start();
+    h.api.selectTool('options');
+    h.fetch.enqueue(200, response(
+      [{ticker: 'O:AAPL260320C00250000', strike: 250, mid: 12.2, change_pct: null}],
+      'Options chain: AAPL', {tool: 'options_chain', provider: 'massive'}));
+    await h.api.run('options', new URLSearchParams({symbol: 'AAPL', view: 'chain'}));
+    const url = h.fetch.calls[h.fetch.calls.length - 1].url;
+    assert.match(url, /\/api\/research\/options\/chain\?/);
+    assert.equal(h.api.state.options.data[0].strike, 250);
+  });
+
+  await test('forex snapshot tool dispatches by mode', async () => {
+    const h = makeHarness();
+    h.fetch.enqueue(200, response([{preset: 'x'}], 'Presets', {tool: 'presets', provider: 'local'}));
+    h.loadProductionScript();
+    await h.start();
+    h.api.selectTool('forex');
+    h.fetch.enqueue(200, response({pair: 'EUR/USD', bid: 1.08, ask: 1.081},
+      'Forex snapshot: EURUSD', {tool: 'forex_snapshot', provider: 'massive'}));
+    await h.api.run('forex', new URLSearchParams({mode: 'snapshot', pair: 'EURUSD', source: 'massive'}));
+    const url = h.fetch.calls[h.fetch.calls.length - 1].url;
+    assert.match(url, /\/api\/research\/forex\/snapshot\?/);
+    assert.equal(h.api.state.forex.selected.bid, 1.08);
   });
 
   console.log(`command_center_research.test.js: ${passed} tests passed`);

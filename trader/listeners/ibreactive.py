@@ -200,15 +200,76 @@ class IBAIORx():
             ops.flat_map(mapper)
         )
 
-        self.contracts_cache: Dict[Contract, Observable] = {}
+        self.contracts_cache: Dict[tuple, Observable] = {}
         self.bars_cache: Dict[Contract, Observable[RealTimeBarList]] = {}
         self.historical_subscribers: Dict[Contract, int] = {}
         self.history_worker: Optional[IBHistoryWorker] = None
         self.pnl_cache: Dict[int, bool] = {}
         self._shutdown: bool = True
+        # Connection-scoped market-data type coordination. IB's
+        # reqMarketDataType is global per socket: restoring live in one
+        # delayed snapshot's finally while another is still waiting recreates
+        # the 10089/empty-tick race. Leases keep type 3 until all delayed
+        # snapshot waits finish; live snapshots wait for those leases.
+        self._md_async_lock: Optional[asyncio.Lock] = None
+        self._md_cv: Optional[asyncio.Condition] = None
+        self._delayed_md_leases: int = 0
+        self._streaming_delayed: int = 0
 
         # try binding helper methods to things we care about
         Contract.to_df = Helpers.to_df  # type: ignore
+
+    def _ensure_md_coordinator(self) -> None:
+        """Lazily bind asyncio primitives (tests construct via ``__new__``)."""
+        if getattr(self, '_md_async_lock', None) is None:
+            self._md_async_lock = asyncio.Lock()
+            self._md_cv = asyncio.Condition(self._md_async_lock)
+        if not hasattr(self, '_delayed_md_leases'):
+            self._delayed_md_leases = 0
+        if not hasattr(self, '_streaming_delayed'):
+            self._streaming_delayed = 0
+
+    async def _md_acquire_delayed(self) -> None:
+        self._ensure_md_coordinator()
+        assert self._md_cv is not None
+        async with self._md_cv:
+            self._delayed_md_leases += 1
+            try:
+                self.ib.reqMarketDataType(3)
+            except Exception:
+                pass
+
+    async def _md_release_delayed(self) -> None:
+        self._ensure_md_coordinator()
+        assert self._md_cv is not None
+        async with self._md_cv:
+            self._delayed_md_leases = max(0, self._delayed_md_leases - 1)
+            if self._delayed_md_leases == 0 and self._streaming_delayed == 0:
+                try:
+                    self.ib.reqMarketDataType(1)
+                    logging.debug(
+                        'reqMarketDataType(1) restored after delayed snapshot leases=0'
+                    )
+                except Exception:
+                    pass
+            self._md_cv.notify_all()
+
+    async def _md_ensure_live(self) -> None:
+        """Select live MD type once no delayed snapshot lease is outstanding.
+
+        Waiting avoids flipping type 1 under a concurrent delayed wait (10089).
+        Delayed *streaming* subscriptions may still be active; forcing live in
+        that case matches prior behaviour (live snapshot wins the shared type).
+        """
+        self._ensure_md_coordinator()
+        assert self._md_cv is not None
+        async with self._md_cv:
+            while self._delayed_md_leases > 0:
+                await self._md_cv.wait()
+            try:
+                self.ib.reqMarketDataType(1)
+            except Exception:
+                pass
 
     def __enter__(self):
         return self.connect()
@@ -219,7 +280,27 @@ class IBAIORx():
     async def __handle_error(self, reqId, errorCode, errorString, contract):
         global error_code
 
+        # Farm OK / connectivity chatter — not request failures.
+        # 2104/2106/2107/2158 = farm OK / restored; 2103/2105/2119 = transient
+        # connecting/disconnected (G2 — was ERROR and masked real failures).
         if errorCode in (2104, 2106, 2107, 2158):
+            return
+        if errorCode in (2103, 2105, 2119):
+            logging.info(
+                'ibrx farm status reqId: {} errorCode: {}: {} contract: {}'.format(
+                    reqId, errorCode, errorString, contract
+                ))
+            return
+
+        # IB serves delayed ticks when live API MD isn't subscribed. This is
+        # informational ("Displaying delayed market data"); treating it as a
+        # hard error aborts get_snapshot before any tick arrives and surfaces
+        # as QUOTE_UNAVAILABLE on propose/close even though delayed data works.
+        if errorCode == 10167:
+            logging.info(
+                'ibrx reqId: {} errorCode: 10167 (delayed MD notice): {} contract: {}'.format(
+                    reqId, errorString, contract
+                ))
             return
 
         if errorCode == 202:
@@ -482,13 +563,18 @@ class IBAIORx():
     ) -> Observable[IBAIORxError]:
         generic_tick_list = ''.join(str(int(x)) for x in tick_list)
 
+        # Always select the intended feed. Leaving a prior delayed stream's
+        # type 3 active made subsequent live publish_contract calls silently
+        # receive delayed ticks. Delayed mode stays for the life of this
+        # stream — do not flip back to live immediately after reqMktData
+        # (that races IB and surfaces 10089 on delayed-only accounts).
         if delayed:
-            # 1 = Live
-            # 2 = Frozen
-            # 3 = Delayed
-            # 4 = Delayed frozen
-            logging.debug('reqMarketDataType(3)')
+            logging.debug('reqMarketDataType(3) streaming')
             self.ib.reqMarketDataType(3)
+            self._streaming_delayed = getattr(self, '_streaming_delayed', 0) + 1
+        else:
+            logging.debug('reqMarketDataType(1) streaming')
+            self.ib.reqMarketDataType(1)
 
         # reqMktData immediately returns with an empty ticker
         # and starts the subscription
@@ -503,10 +589,6 @@ class IBAIORx():
             ),
             asend_result=False
         )
-
-        if delayed:
-            self.ib.reqMarketDataType(1)
-            logging.debug('reqMarketDataType(1)')
 
         def filter_reqid(error: IBAIORxError):
             return error.reqId == reqId
@@ -531,6 +613,9 @@ class IBAIORx():
             # 2 = Frozen
             # 3 = Delayed
             # 4 = Delayed frozen
+            # Keep delayed mode until the caller finishes consuming ticks.
+            # Resetting to live here races IB and surfaces 10089 on accounts
+            # that only have delayed API market data.
             logging.debug('reqMarketDataType(3)')
             self.ib.reqMarketDataType(3)
 
@@ -547,10 +632,6 @@ class IBAIORx():
             asend_result=False
         )
 
-        if delayed:
-            self.ib.reqMarketDataType(1)
-            logging.debug('reqMarketDataType(1)')
-
         def filter_contract(ticker):
             return self._filter_contract(contract, ticker)
 
@@ -562,7 +643,8 @@ class IBAIORx():
         contract_filter.subscribe(xs)
 
         # error handling, which will listen to the error source, and pipe
-        # any errors through to the subscriber
+        # any errors through to the subscriber. Informational MD notices
+        # (10167) are filtered in ``__handle_error`` and never reach here.
         def handle_error(error: IBAIORxError):
             logging.error('__subscribe_snapshot() had error: {}'.format(error))
             xs.on_error(Exception(error))
@@ -590,9 +672,15 @@ class IBAIORx():
         one_time_snapshot: bool = False,
         delayed: bool = False,
     ) -> Observable[Ticker]:
-        if contract not in self.contracts_cache:
-            self.contracts_cache[contract] = self.__subscribe_contract(contract, tick_list, one_time_snapshot, delayed)
-        return self.contracts_cache[contract]
+        # Include feed mode + tick list in the cache key so a live stream
+        # isn't reused for a delayed request (or vice versa).
+        generic_tick_list = ''.join(str(int(x)) for x in tick_list)
+        cache_key = (contract, bool(delayed), bool(one_time_snapshot), generic_tick_list)
+        if cache_key not in self.contracts_cache:
+            self.contracts_cache[cache_key] = self.__subscribe_contract(
+                contract, tick_list, one_time_snapshot, delayed
+            )
+        return self.contracts_cache[cache_key]
 
     def unsubscribe_contract(self, contract: Contract):
         raise ValueError('not implemented')
@@ -736,16 +824,20 @@ class IBAIORx():
                 return existing
 
         # Explicitly force live market data mode (type 1) before every
-        # snapshot request. We've observed sessions get stuck in a state
-        # where reqMktData silently delivers no ticks — a stale
+        # *live* snapshot request. We've observed sessions get stuck in a
+        # state where reqMktData silently delivers no ticks — a stale
         # market-data-type setting from a prior delayed/frozen request
         # on the same connection appears to be the cause. Calling
         # reqMarketDataType(1) every time is cheap and idempotent.
-        if not delayed:
-            try:
-                self.ib.reqMarketDataType(1)
-            except Exception:
-                pass
+        # Delayed callers must leave type 3 in place for the whole wait;
+        # restoring live too early is what made delayed fallbacks fail
+        # with 10089 despite "Delayed market data is available".
+        # Concurrent delayed snapshots share a lease so the first finisher
+        # cannot restore type 1 under a sibling still waiting.
+        if delayed:
+            await self._md_acquire_delayed()
+        else:
+            await self._md_ensure_live()
 
 
         # Two-phase completion semantics:
@@ -832,34 +924,41 @@ class IBAIORx():
         #   Phase 3 — if even the first event never arrives, raise so the
         #             caller sees a clear error instead of a silent hang.
         try:
-            await asyncio.wait_for(_complete_event.wait(), timeout=PARTIAL_WAIT)
-        except asyncio.TimeoutError:
-            # Didn't get the full bid/ask/last triple in time; accept
-            # whatever we have if at least one tick arrived.
-            remaining = max(0.5, wait_timeout - PARTIAL_WAIT)
             try:
-                await asyncio.wait_for(_first_event.wait(), timeout=remaining)
+                await asyncio.wait_for(_complete_event.wait(), timeout=PARTIAL_WAIT)
             except asyncio.TimeoutError:
-                subscription.dispose()
+                # Didn't get the full bid/ask/last triple in time; accept
+                # whatever we have if at least one tick arrived.
+                remaining = max(0.5, wait_timeout - PARTIAL_WAIT)
                 try:
-                    self.ib.cancelMktData(contract)
-                except Exception:
-                    pass
-                sym = getattr(contract, 'symbol', '?')
-                cid = getattr(contract, 'conId', '?')
-                raise TimeoutError(
-                    f'No market data received for {sym} (conId={cid}) within {wait_timeout}s. '
-                    f'Check: (1) IB market-data subscription enabled for this exchange, '
-                    f'(2) symbol qualifies on the chosen exchange, '
-                    f'(3) market is open or pass delayed=True for frozen data.'
-                )
-        observer.on_completed()
-        subscription.dispose()
-        await asyncio.sleep(0.1)
-        if thrown_exception is not None:
-            ex = cast(Exception, thrown_exception)
-            raise ex
-        return cast(Ticker, populated_ticker)
+                    await asyncio.wait_for(_first_event.wait(), timeout=remaining)
+                except asyncio.TimeoutError:
+                    subscription.dispose()
+                    try:
+                        self.ib.cancelMktData(contract)
+                    except Exception:
+                        pass
+                    sym = getattr(contract, 'symbol', '?')
+                    cid = getattr(contract, 'conId', '?')
+                    raise TimeoutError(
+                        f'No market data received for {sym} (conId={cid}) within {wait_timeout}s. '
+                        f'Check: (1) IB market-data subscription enabled for this exchange, '
+                        f'(2) symbol qualifies on the chosen exchange, '
+                        f'(3) market is open or pass delayed=True for frozen data.'
+                    )
+            observer.on_completed()
+            subscription.dispose()
+            await asyncio.sleep(0.1)
+            if thrown_exception is not None:
+                ex = cast(Exception, thrown_exception)
+                raise ex
+            return cast(Ticker, populated_ticker)
+        finally:
+            # Drop this request's delayed lease. Live is restored only when
+            # every concurrent delayed snapshot has finished (and no delayed
+            # streaming subscription is holding type 3).
+            if delayed:
+                await self._md_release_delayed()
 
     async def get_shortable_shares(
         self,

@@ -216,6 +216,7 @@ class TestSnapshotApi:
         }
         assert "deployed_strategy_names" in body
         assert isinstance(body["deployed_strategy_names"], list)
+        assert body["operating_mode"] in ("auto", "semi", "manual")
 
 
     @pytest.mark.asyncio
@@ -402,7 +403,8 @@ class TestCommandCenterPage:
             html = (await c.get("/cc")).text
             for element_id in ("status-bar", "mode-badge", "account-id",
                                "dependency-chips", "last-event-time",
-                               "quick-stats", "band-netliq", "band-daypnl",
+                               "band-stats", "band-netliq", "band-daypnl",
+                               "band-exposure", "band-buying-power",
                                "positions-panel", "action-rail",
                                "orders-panel", "fills-panel", "strategies-panel",
                                "risk-panel", "degraded-banner", "drawer"):

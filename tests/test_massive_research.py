@@ -254,3 +254,168 @@ def test_snapshot_falls_back_to_twelvedata_on_massive_entitlement():
     assert result.data["ticker"] == "AAPL"
     assert result.data["last"] == 105.0
     assert result.data["bid"] is None
+
+
+# ---------------------------------------------------------------------------
+# Task 2: options + forex provider methods
+# ---------------------------------------------------------------------------
+
+
+def test_options_chain_returns_records(monkeypatch):
+    from types import SimpleNamespace as NS
+    snap = NS(
+        details=NS(ticker="O:AAPL260320C00250000", contract_type="call",
+                   strike_price=250.0, expiration_date="2026-03-20"),
+        last_quote=NS(bid=12.0, ask=12.4), last_trade=NS(price=12.2),
+        day=NS(volume=1500),
+        greeks=NS(delta=0.55, gamma=0.02, theta=-0.03, vega=0.10),
+        open_interest=800, implied_volatility=0.31, break_even_price=262.0,
+        underlying_asset=NS(price=248.0),
+    )
+    client = NS(list_snapshot_options_chain=lambda **kw: [snap])
+    result = MassiveResearch(client).options_chain(
+        "AAPL", expiration="2026-03-20", contract_type=None,
+        strike_min=None, strike_max=None)
+    assert isinstance(result, ResearchResult)
+    assert result.data[0]["ticker"] == "O:AAPL260320C00250000"
+    assert result.title == "Options chain: AAPL 2026-03-20"
+
+
+def test_options_expirations_computes_dte(monkeypatch):
+    import trader.tools.massive_research as mod
+    monkeypatch.setattr(
+        "trader.tools.chain.get_option_dates",
+        lambda symbol, api_key="": ["2026-03-20", "2026-04-17"])
+    result = MassiveResearch(object(), api_key="k").options_expirations("AAPL")
+    assert [row["expiration"] for row in result.data] == ["2026-03-20", "2026-04-17"]
+    assert all("dte" in row for row in result.data)
+
+
+def test_options_snapshot_normalizes_single_contract():
+    from types import SimpleNamespace as NS
+    snap = NS(
+        break_even_price=262.0, open_interest=800,
+        last_quote=NS(bid=12.0, ask=12.4), last_trade=NS(price=12.2),
+        implied_volatility=0.31,
+        greeks=NS(delta=0.55, gamma=0.02, theta=-0.03, vega=0.10),
+        underlying_asset=NS(price=248.0), day=NS(volume=1500),
+    )
+    client = NS(get_snapshot_option=lambda **kw: snap)
+    result = MassiveResearch(client).options_snapshot("O:AAPL260320C00250000")
+    assert result.data["ticker"] == "O:AAPL260320C00250000"
+    assert result.data["bid"] == 12.0
+    assert result.data["delta"] == 0.55
+    assert result.title == "Option: O:AAPL260320C00250000"
+
+
+def test_options_implied_delegates_to_chain_helper(monkeypatch):
+    monkeypatch.setattr(
+        "trader.tools.chain.implied_constant",
+        lambda symbol, date, rfr, api_key="": {
+            "x": [1.0, 2.0], "market_implied": [0.1, 0.2], "constant": [0.15, 0.15]})
+    result = MassiveResearch(object(), api_key="k").options_implied(
+        "AAPL", expiration="2026-03-20")
+    assert result.data["x"] == [1.0, 2.0]
+    assert result.title == "Implied distribution: AAPL 2026-03-20"
+
+
+def test_forex_snapshot_massive_normalizes():
+    from types import SimpleNamespace as NS
+    client = NS(get_snapshot_ticker=lambda **kw: NS(
+        day=NS(open=1.08, high=1.09, low=1.07, close=1.085, volume=0, vwap=1.08),
+        last_quote=NS(bid=1.0849, ask=1.0851),
+        todays_change=0.001, todays_change_percent=0.09))
+    result = MassiveResearch(client).forex_snapshot("EURUSD", source="massive")
+    assert result.data["ticker"] == "C:EURUSD"
+    assert result.data["bid"] == 1.0849
+    assert result.provider == "massive"
+
+
+def test_forex_snapshot_rejects_ib_source():
+    import pytest
+    with pytest.raises(ValueError):
+        MassiveResearch(object()).forex_snapshot("EURUSD", source="ib")
+
+
+def test_forex_quote_twelvedata_emits_no_bidask_notice():
+    from types import SimpleNamespace as NS
+    td = NS(exchange_rate=lambda symbol: NS(as_json=lambda: {
+        "rate": 1.085, "timestamp": 1_753_000_000}))
+    result = MassiveResearch(object(), td_client=td).forex_quote(
+        "EUR", "USD", source="twelvedata")
+    assert result.provider == "twelvedata"
+    assert result.data["last"] == 1.085
+    assert "bid/ask" in (result.notice or "")
+
+
+def test_forex_quote_rejects_ib_source():
+    import pytest
+    with pytest.raises(ValueError):
+        MassiveResearch(object()).forex_quote("EUR", "USD", source="ib")
+
+
+def test_forex_quote_massive_reads_result_last_bid_ask():
+    from types import SimpleNamespace as NS
+    client = NS(get_last_forex_quote=lambda base, quote: NS(
+        symbol="EUR/USD", last=NS(bid=1.0849, ask=1.0851,
+                                   exchange=48, timestamp=1_753_000_000)))
+    result = MassiveResearch(client).forex_quote("EUR", "USD", source="massive")
+    assert result.data["bid"] == 1.0849
+    assert result.data["ask"] == 1.0851
+    assert result.provider == "massive"
+
+
+def test_forex_movers_normalizes_rows():
+    from types import SimpleNamespace as NS
+    snaps = [NS(ticker="C:EURUSD", todays_change=0.001, todays_change_percent=0.09,
+                day=NS(close=1.085, volume=0))]
+    client = NS(get_snapshot_direction=lambda **kw: snaps)
+    result = MassiveResearch(client).forex_movers("gainers")
+    assert result.data == [{
+        "ticker": "C:EURUSD", "close": 1.085, "volume": 0,
+        "change": 0.001, "change_pct": 0.09,
+    }]
+    assert result.title == "Forex movers (gainers)"
+
+
+def test_forex_snapshot_all_normalizes_rows():
+    from types import SimpleNamespace as NS
+    snaps = [NS(ticker="C:EURUSD", todays_change=0.001, todays_change_percent=0.09,
+                day=NS(open=1.08, high=1.09, low=1.07, close=1.085, volume=0))]
+    client = NS(get_snapshot_all=lambda **kw: snaps)
+    result = MassiveResearch(client).forex_snapshot_all(["EURUSD"])
+    assert result.data[0]["ticker"] == "C:EURUSD"
+    assert result.data[0]["close"] == 1.085
+
+
+def test_forex_convert_reads_real_massive_attribute_names():
+    from types import SimpleNamespace as NS
+    client = NS(get_real_time_currency_conversion=lambda *a, **kw: NS(
+        from_="EUR", to="USD", initial_amount=1000.0, converted=1085.0,
+        last=NS(bid=1.0849, ask=1.0851)))
+    result = MassiveResearch(client).forex_convert("eur", "usd", 1000.0)
+    assert result.data["from"] == "EUR"
+    assert result.data["to"] == "USD"
+    assert result.data["converted"] == 1085.0
+    assert result.data["bid"] == 1.0849
+    assert result.data["ask"] == 1.0851
+    assert "rate" not in result.data
+
+
+def test_forex_snapshot_twelvedata_uses_slash_symbol_and_notice():
+    from types import SimpleNamespace as NS
+    calls = []
+    td = NS(quote=lambda symbol: calls.append(symbol) or NS(as_json=lambda: {
+        "open": "1.08", "high": "1.09", "low": "1.07", "close": "1.085",
+        "change": "0.001", "percent_change": "0.09"}))
+    result = MassiveResearch(object(), td_client=td).forex_snapshot("EURUSD", source="twelvedata")
+    assert calls == ["EUR/USD"]
+    assert result.provider == "twelvedata"
+    assert "bid/ask" in (result.notice or "")
+    assert result.data["close"] == 1.085
+
+
+def test_forex_snapshot_rejects_unknown_source():
+    import pytest
+    with pytest.raises(ValueError):
+        MassiveResearch(object()).forex_snapshot("EURUSD", source="bogus")

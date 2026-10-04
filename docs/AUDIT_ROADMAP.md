@@ -105,13 +105,16 @@ unambiguous proposal-status divergences remains a deliberate future opt-in.
 - **Validate (paper)**: resolve BHP/CBA (ASX), 0700 (SEHK), a TSE name; confirm
   each lands on the local listing, not a US ADR.
 
-### C2 — universe resolver-cache invalidation  (S, low risk)
+### C2 — universe resolver-cache invalidation  ✅ DONE
 - **Problem** (`universe.py:145`): the resolver cache is never invalidated and
   its hit path bypasses exchange/sec_type filters, so a stale/loose entry can win.
 - **Approach**: key the cache on (conId/symbol, exchange, sec_type); invalidate
   on universe edits; make the hit path honour the same filters as a miss.
 - **Risk**: low — localized; add a cache-key test.
 - **Validate**: unit test — same symbol on two exchanges resolves distinctly.
+- **Status:** ✅ Hit path now applies exchange + sec_type + universe filters;
+  `invalidate_resolver_cache()` on `update`/`delete`; covered by
+  `tests/test_universe_resolver.py`.
 
 ---
 
@@ -160,16 +163,19 @@ unambiguous proposal-status divergences remains a deliberate future opt-in.
 
 ---
 
-## Cluster F — narrow CLI / polish  (S each, low risk)
+## Cluster F — narrow CLI / polish  ✅ DONE (S each, low risk)
 
-- **Options `--json` stdout** (`mmr_cli.py:8718`): options buy/sell emit Rich
-  console lines that corrupt `--json`; guard rendering behind `_json_mode`.
-- **Sweep exception safety** (`mmr_cli.py:6001`): one unexpected job exception
-  (or parent crash) leaves the sweep half-finalised; wrap per-job + finalize.
-- **Sweep SIGINT-restore** (`mmr_cli.py:5841`): save/restore the handler
-  (deferred earlier as a re-indent; do it with a small context manager).
-- **Data-download trader_service probe leak** (`mmr_cli.py:7323`): dead cleanup
-  branch leaks the RPC client on a failed probe.
+- **Options `--json` stdout** (`mmr_cli.py`): options buy/sell (and chain /
+  implied / errors) emit Rich console lines that corrupt `--json`; guard
+  rendering behind `_json_mode` / `print_status` / `print_df`. ✅
+- **Sweep exception safety**: one unexpected job exception (or parent crash)
+  leaves the sweep half-finalised; wrap per-job + `finalize_sweep` in
+  `try`/`finally`. ✅
+- **Sweep SIGINT-restore**: save/restore the handler with a small
+  install/`finally` restore. ✅
+- **Data-download trader_service probe leak**: dead cleanup branch leaked the
+  RPC client on a failed probe — already fixed (close `candidate` on the
+  failure path). ✅
 
 ---
 
@@ -180,7 +186,7 @@ path for bar-based strategies was rebuilt this session — see commits e2db6f3
 (ORB on_prices + exchange-aware session), e911fee (tick→bar resampling layer),
 e2b2fd1 (VwapReclaim on_prices). These are the residual robustness items.
 
-### G1 — mass-enable of strategies can time out the enable RPC under DB contention  (S, low risk)
+### G1 — mass-enable of strategies can time out the enable RPC under DB contention  ✅ DONE
 
 - **Symptom:** enabling many strategies in quick succession (observed: 11 at once
   after a restart) produced one `enable_strategy: RPC call ... timed out after
@@ -198,14 +204,15 @@ e2b2fd1 (VwapReclaim on_prices). These are the residual robustness items.
   leave a strategy not-enabled while the client already gave up.
 - **NOT caused by** the new priming/resampling (priming is lazy/on-first-tick,
   not on the enable path).
-- **Fix options (offline, pick one):** (a) stagger enables in the CLI loop with a
-  small delay; (b) raise the enable RPC timeout; (c) make `_persist_enabled`
-  fire-and-forget / off the RPC-reply path; (d) batch multiple enables into one
-  RPC + one DB write. (a) or (d) preferred.
+- **Fix:** `_schedule_persist_enabled` runs `_persist_enabled` on a daemon
+  thread so enable/disable return after the in-memory toggle + announce, without
+  waiting on DuckDB. Tiny crash-before-persist window (same ambiguity as a
+  timed-out client). Covered by
+  `test_enable_returns_before_slow_persist`.
 - **Validate:** enable 10+ strategies in a tight loop under concurrent load,
   confirm no enable RPC timeout and all reach RUNNING.
 
-### G2 — IB market-data-farm status codes logged at ERROR  (XS, cosmetic)
+### G2 — IB market-data-farm status codes logged at ERROR  ✅ DONE (XS, cosmetic)
 
 - **Symptom:** during the nightly IB Gateway restart/reconnect, farm-status
   messages (`errorCode 2119` "Market data farm is connecting", and the related
@@ -216,8 +223,9 @@ e2b2fd1 (VwapReclaim on_prices). These are the residual robustness items.
   codes fall through to the ERROR log path.
 - **Impact:** none functional — pure log noise, but it can mask a real error in a
   `grep -i error` scan (as it briefly did in this review).
-- **Fix:** add 2103/2105/2119 (and 2158 if not covered) to the suppressed/INFO
-  set in `__handle_error`, or log all `reqId == -1` farm-status codes at INFO.
+- **Fix:** 2103/2105/2119 log at INFO and return (no `error_subject`
+  propagation); OK codes remain silent. ✅
+  `tests/test_ibrx_async.py::test_farm_status_codes_do_not_propagate_as_errors`.
 - **NOTE:** the reconnect itself recovered cleanly (reentrancy guard fired,
   subscriptions republished, all strategies stayed RUNNING) — this is only about
   the log level of the status messages, not the reconnect behaviour.
@@ -226,7 +234,7 @@ e2b2fd1 (VwapReclaim on_prices). These are the residual robustness items.
 
 ## Cluster H — Dashboard / command center
 
-### H1 — Risk panel: render distance-to-limit bars, not just warnings  (S, low risk)
+### H1 — Risk panel: render distance-to-limit bars, not just warnings  ✅ DONE
 
 - **Symptom:** the `/cc` Risk & reconciliation panel shows only the risk
   projection's `warnings` strings (a breach is either present or absent). The
@@ -241,17 +249,10 @@ e2b2fd1 (VwapReclaim on_prices). These are the residual robustness items.
   utilization, but the dashboard-facing risk projection carries only
   `warnings: [...]`. The command-center render (`renderRisk` in
   `web/static/command_center.js`) has nothing structured to draw.
-- **Fix (payload → frontend):** extend the risk projection with structured
-  per-limit rows `{label, value_pct, cap_pct}` (concentration, sector, each
-  group budget) alongside the existing warnings, then render the design's bars
-  in `renderRisk` (fill width = value_pct/cap_pct; amber/red thresholds from
-  the component CSS `.tt-bar i.hot`/`.over`). Keep the warnings list as the
-  authoritative "fail loudly" surface; bars are the at-a-glance complement.
-- **NOTE:** no new risk *logic* — the numbers exist; this is projection payload
-  plumbing plus a render function. Especially useful while scaling paper
-  automation, where headroom-to-limit is the number you actually watch. Design
-  source: `TradingTab.dc.html` (claude.ai/design project
-  `7f8df979-0181-41aa-b7d2-30e828cd4d95`), Risk & reconciliation panel.
+- **Fix (payload → frontend):** `enrich_risk_projection` adds `limits`
+  `{id, label, value_pct, cap_pct}` (concentration vs 15% cap, group budgets,
+  HHI vs 0.15) and string `warnings`; `renderRisk` draws `.tt-bar` fills
+  (amber ≥ 2/3 of cap, red ≥ cap). Warnings stay the fail-loud surface.
 
 ### H2 — Proposal exposure-impact line  (M, low risk)
 
@@ -302,3 +303,43 @@ Cluster A's **OrderLifecycleTracker** (subscribe once to
 order-id → status) is the keystone: A1 (ack), A2 (events), and A3
 (reconciliation) all read from it, and it's the natural home for future
 order-related features. Build it first, thin, and layer the three behaviours on top.
+
+## Free data providers — open minors (phases 1–2, 2026-10-04)
+
+Small items found in review of `feat/free-data-providers` phases 1–2. None blocks
+merge. Fix opportunistically, or in the phase that touches the file.
+
+- `trader/data_providers/errors.py`: `ProviderNotConfigured` / `CapabilityNotSupported` are not picklable (one formatted arg) — matters only across legacy dill RPC. Empty `missing` list gives a malformed message.
+- `trader/data_providers/registry.py`: `default_source` raises a bare `KeyError` when a capability has no builtin default — make it a `ProviderError` when phase 3 adds capabilities. A non-mapping `data_providers:` config gives `AttributeError`.
+- `trader/data_providers/rate_limit.py`: `calls <= 0` / `max_tries < 1` not validated; `Retry-After` uses `isdigit()` (accepts `'²'`, then `float()` raises); 429 response not closed between retries; no threaded limiter test.
+- `trader/data_providers/alpaca/client.py`: a non-dict JSON error body raises `AttributeError` in `_error_for`; non-JSON 200 and `requests.RequestException` are not wrapped as `ProviderError` (still loud — callers log per symbol); each per-task `requests.Session` is never closed.
+- `trader/data_providers/alpaca/sessions.py`: no committed DST-straddling tests (verified manually); `sessions_in_range` `DateOutOfBounds` unwrapped for a far-future `now`; early-close days wait until 20:16 (conservative) — add a docstring note.
+- `trader/data_providers/alpaca/history.py`: `dt.date` input path untested (verified correct); tz-aware inputs use their own calendar date; missing `vw`/`n` become None silently; unknown tickers return an empty frame instead of an error (still open after phase 3a: the asset list exists in `AlpacaAssetDirectory`, but `knows()` is not yet used for history); weekly/monthly requests mid-period store a partial bar (self-heals); "end cut" log fires on every run ending today.
+- `trader/mmr_cli.py`: mid-function `ProviderError` import in `_handle_data_download`; `_rest_history_worker` unannotated; `mmr data download` exits 0 after a setup failure (refresh path is fixed); REST sources never check that the security is US-listed (ad-hoc `data download BHP --source alpaca` would store NYSE ADR bars under an ASX conId).
+- `start_mmr.sh` setup wizard (Alpaca and Massive alike): writes an empty secret if left blank; says "configured" when the key line is missing from `trader.yaml`; `/` or `&` in a secret breaks the `sed`.
+- Tests: unused imports in `tests/data_providers/test_errors_and_capabilities.py` and `test_history_contract.py`; contract tests feed one row for Massive/TwelveData; data-refresh template test uses a cwd-relative path; live test assumes ET output (`hour == 4`).
+- Docs: `CLAUDE.md` Alpaca-keys paragraph is dense (split into bullets, define SIP; 20:16 includes a 1-minute margin); plan Task 11 Step 4 gate lacks the exact print command.
+
+## Free data providers — open minors (phase 3a, 2026-10-04)
+
+Small items found in the final review of phase 3a. None blocks merge.
+
+- `trader/sdk.py` `_provider`: the registry is rebuilt on every call and `TDClient` is created per call.
+- `trader/data_providers/errors.py`: `CapabilityNotSupported` prints "(no default)" wording for a missing default.
+- `tests/data_providers`: no tests for the builtin builders of the new capabilities (quotes, movers, news).
+- `trader/mmr_cli.py`: mid-function imports in `build_parser` and `_handle_download`.
+- `trader/data_providers/alpaca/quotes.py`: duplicate symbols in one call share a single row.
+- `trader/data_providers/alpaca/quotes.py`: loose NaN truthiness on `previous_close`.
+- `skills/mmr-skill/scripts/mmr_helpers.py`: helper `movers` hard-codes `--source massive` (phase 9).
+- `trader/data_providers/massive/news.py`: Benzinga `tags` dropped from `news_detail`; trailing `Z` on timestamps.
+- `news` JSON output drops the `sentiment` column when it is empty (unstable columns).
+- `trader/data_providers/alpaca/news.py`: a null `id` becomes `'None'`; `limit <= 0` is unguarded.
+- `movers --detail`: the asset directory is loaded twice.
+- `movers --detail` help still mentions ratios.
+- `trader/sdk.py`: `_provider(NEWS)` is called outside the per-ticker try block.
+- `trader/data_providers/alpaca/assets.py`: NaN ticker, future-dated cache and non-dict cached assets are not handled.
+- Alpaca IEX snapshot `volume` / `previous_close` are IEX-only (labelled `feed='iex'`).
+- Massive movers: `day.close` may be 0 pre-open (unverified).
+- `MMRHelpers.news` docstring is stale.
+- TwelveData multi-symbol code-400 is treated as a whole-call failure (unverified against real TwelveData).
+- `trader/mmr_cli.py` `_read_trader_config`: catches only OSError/YAMLError; an undecodable `trader.yaml` (UnicodeDecodeError) now raises at import, where the old loader caught every exception. Widen to `(OSError, ValueError, yaml.YAMLError)`.

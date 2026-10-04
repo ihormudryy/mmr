@@ -54,6 +54,22 @@ class TestPolicyParsing:
         with pytest.raises(CommandPolicyError, match="max_order_notional"):
             CommandAuthorityPolicy.from_config({"max_order_notional": "lots"})
 
+    def test_parses_paper_quote_age_bound(self):
+        p = CommandAuthorityPolicy.from_config({"max_paper_quote_age_seconds": 1800})
+        assert p.max_paper_quote_age_seconds == 1800.0
+
+    def test_paper_quote_age_defaults_none(self):
+        assert CommandAuthorityPolicy.from_config(None).max_paper_quote_age_seconds is None
+
+    def test_non_numeric_paper_quote_age_is_rejected(self):
+        with pytest.raises(CommandPolicyError, match="max_paper_quote_age_seconds"):
+            CommandAuthorityPolicy.from_config({"max_paper_quote_age_seconds": "soon"})
+
+    def test_enabled_rejects_non_positive_paper_quote_age(self):
+        p = CommandAuthorityPolicy(enabled=True, max_paper_quote_age_seconds=0.0)
+        with pytest.raises(CommandPolicyError, match="max_paper_quote_age_seconds"):
+            validate_command_policy(p, trader_account_id="DUpaper", paper_trading=True)
+
 
 class TestPolicyValidation:
     def test_disabled_skips_all_checks(self):

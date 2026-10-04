@@ -27,6 +27,12 @@ class IBConfig:
 
 
 @dataclass
+class AlpacaConfig:
+    api_key_id: str = ''
+    secret_key: str = ''
+
+
+@dataclass
 class StorageConfig:
     duckdb_path: str = '~/.local/share/mmr/data/mmr.duckdb'
     history_duckdb_path: str = '~/.local/share/mmr/data/mmr_history.duckdb'
@@ -111,6 +117,13 @@ class TypedRpcConfig:
     service_hmac_key_file: str = ''
 
 
+# docker-compose passes these as `KEY: ${KEY:-}`, so an unset host variable
+# arrives as '' and must not blank a key set in trader.yaml.
+_BLANKABLE_ENV_KEYS = frozenset({
+    'massive_api_key', 'twelvedata_api_key', 'alpaca_api_key_id', 'alpaca_api_secret_key',
+})
+
+
 @dataclass
 class MMRConfig:
     ib: IBConfig = field(default_factory=IBConfig)
@@ -120,6 +133,7 @@ class MMRConfig:
     strategy: StrategyRuntimeConfig = field(default_factory=StrategyRuntimeConfig)
     massive: MassiveConfig = field(default_factory=MassiveConfig)
     twelvedata: TwelveDataConfig = field(default_factory=TwelveDataConfig)
+    alpaca: AlpacaConfig = field(default_factory=AlpacaConfig)
     typed_rpc: TypedRpcConfig = field(default_factory=TypedRpcConfig)
     automation: AutomationConfig = field(default_factory=AutomationConfig)
     root_directory: str = '.'
@@ -176,6 +190,9 @@ class MMRConfig:
             'massive_delayed': ('massive', 'delayed'),
             # TwelveData
             'twelvedata_api_key': ('twelvedata', 'api_key'),
+            # Alpaca
+            'alpaca_api_key_id': ('alpaca', 'api_key_id'),
+            'alpaca_api_secret_key': ('alpaca', 'secret_key'),
             # Typed RPC (G0 authenticated query/command/feed transport)
             # typed_bind_address is the interface the query/command/feed
             # ROUTER sockets BIND to (not publish -- publishing is a Compose
@@ -215,6 +232,8 @@ class MMRConfig:
         for flat_key, nested_path in config._FLAT_KEY_MAP.items():
             # Check env var override first (uppercase)
             env_val = os.getenv(flat_key.upper())
+            if flat_key in _BLANKABLE_ENV_KEYS and env_val is not None and not env_val.strip():
+                env_val = None
             yaml_val = raw.get(flat_key)
 
             value = env_val if env_val is not None else yaml_val

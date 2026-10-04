@@ -140,6 +140,48 @@ class TestReducer:
         assert row["entity_id"] == "DU123:authoritative"
         assert row["entity_revision"] == 7
 
+    def test_strategy_receipt_update_preserves_runtime_metadata(self, state):
+        state.apply(
+            _event(
+                event_id="strategy-full",
+                source_cursor=10,
+                entity_revision=1,
+                event_type="strategy.updated",
+                entity_type="strategy",
+                entity_id="vwap_reclaim",
+                payload={
+                    "strategy_name": "vwap_reclaim",
+                    "strategy_state": "RUNNING",
+                    "class_name": "VwapReclaim",
+                    "bar_size": "1 min",
+                    "conids": [756733],
+                    "params": {"lookback": 20},
+                },
+            )
+        )
+        state.apply(
+            _event(
+                event_id="strategy-receipt",
+                source_cursor=11,
+                entity_revision=2,
+                event_type="strategy.updated",
+                entity_type="strategy",
+                entity_id="vwap_reclaim",
+                payload={
+                    "strategy_name": "vwap_reclaim",
+                    "strategy_state": "DISABLED",
+                    "control_revision": 1,
+                },
+            )
+        )
+
+        row = state.snapshot_view()["strategies"][0]
+        assert row["strategy_state"] == "DISABLED"
+        assert row["class_name"] == "VwapReclaim"
+        assert row["bar_size"] == "1 min"
+        assert row["conids"] == [756733]
+        assert row["params"] == {"lookback": 20}
+
 
 class TestLifecycleCollections:
     def test_terminal_proposal_moves_out_of_active(self, state):

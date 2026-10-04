@@ -109,6 +109,31 @@
     }
     .badge.live { background: var(--accent); color: var(--bg); }
     .badge.paper { background: transparent; color: var(--accent); }
+    /* Operating mode: auto (armed paper automation) / semi (propose) / manual. */
+    .op-mode {
+      display: inline-flex;
+      align-items: center;
+      gap: 7px;
+      padding: 5px 9px;
+      border: 1px solid var(--border-soft);
+      font: 800 10px/1 var(--font-heading);
+      letter-spacing: .08em;
+      text-transform: uppercase;
+      color: var(--dim);
+    }
+    .op-mode .op-dot {
+      width: 8px;
+      height: 8px;
+      flex: none;
+      border-radius: 50%;
+      background: var(--neg);
+    }
+    .op-mode[data-mode="auto"] { color: var(--pos); border-color: color-mix(in srgb, var(--pos) 45%, transparent); }
+    .op-mode[data-mode="auto"] .op-dot { background: var(--pos); }
+    .op-mode[data-mode="semi"] { color: var(--warn); border-color: color-mix(in srgb, var(--warn) 45%, transparent); }
+    .op-mode[data-mode="semi"] .op-dot { background: var(--warn); }
+    .op-mode[data-mode="manual"] { color: var(--neg); border-color: color-mix(in srgb, var(--neg) 45%, transparent); }
+    .op-mode[data-mode="manual"] .op-dot { background: var(--neg); }
     #dependency-chips { display: flex; gap: 6px; flex-wrap: wrap; }
     .chip {
       display: inline-flex;
@@ -149,6 +174,72 @@
       margin: 0 0 0 var(--space-4);
       min-width: 58px;
     }
+    /* —— text-scale slider (browser-zoom analog, wired in cc_theme.js) —— */
+    #zoom-control {
+      display: inline-flex;
+      align-items: center;
+      gap: 7px;
+      align-self: center;
+      margin-left: var(--space-4);
+    }
+    .zoom-a {
+      font: 800 10px/1 var(--font-heading);
+      color: var(--dim);
+    }
+    .zoom-a-lg { font-size: 15px; }
+    #zoom-slider {
+      appearance: none;
+      -webkit-appearance: none;
+      width: 96px;
+      height: 16px;
+      margin: 0;
+      padding: 0;
+      border: none;
+      background: transparent;
+      cursor: pointer;
+    }
+    #zoom-slider::-webkit-slider-runnable-track {
+      height: 2px;
+      background: var(--border);
+    }
+    #zoom-slider::-webkit-slider-thumb {
+      -webkit-appearance: none;
+      width: 12px;
+      height: 12px;
+      margin-top: -5px;
+      background: var(--fg);
+      border: none;
+      border-radius: 0;
+    }
+    #zoom-slider:hover::-webkit-slider-thumb,
+    #zoom-slider:focus-visible::-webkit-slider-thumb { background: var(--accent); }
+    #zoom-slider::-moz-range-track {
+      height: 2px;
+      background: var(--border);
+    }
+    #zoom-slider::-moz-range-thumb {
+      width: 12px;
+      height: 12px;
+      background: var(--fg);
+      border: none;
+      border-radius: 0;
+    }
+    #zoom-slider:hover::-moz-range-thumb,
+    #zoom-slider:focus-visible::-moz-range-thumb { background: var(--accent); }
+    #zoom-value {
+      font: 700 11px/1 var(--font-body);
+      letter-spacing: 0;
+      text-transform: none;
+      border: none;
+      background: transparent;
+      color: var(--dim);
+      padding: 2px 4px;
+      min-width: 40px;
+      text-align: right;
+      font-variant-numeric: tabular-nums;
+      cursor: pointer;
+    }
+    #zoom-value:hover:not(:disabled) { color: var(--accent); border: none; }
     .flash {
       display: flex;
       align-items: flex-start;
@@ -290,14 +381,63 @@
     }
     .band-k {
       font: 800 10px/1 var(--font-heading);
-      letter-spacing: .14em;
+      letter-spacing: .08em;
       text-transform: uppercase;
-      color: var(--accent);
+      color: var(--dim);
     }
     .band-v {
-      font: 800 30px/1 var(--font-heading);
-      letter-spacing: -.02em;
+      font: 800 18px/1.1 var(--font-heading);
+      letter-spacing: -.01em;
       font-variant-numeric: tabular-nums;
+      min-height: 1.1em;
+    }
+    /* All account figures share one parent: two equal-height sub-rows, equal
+       column tracks, one label/value size (no oversized Net liq / Day P&L). */
+    #band-stats {
+      border-left: 2px solid var(--border);
+      padding-left: var(--space-6);
+      display: grid;
+      grid-template-rows: 1fr 1fr;
+      align-content: stretch;
+      gap: 10px 0;
+      flex: 1 1 420px;
+      min-width: 0;
+      align-self: stretch;
+    }
+    #band-stats .band-stats-row {
+      display: grid;
+      grid-template-columns: repeat(5, minmax(0, 1fr));
+      align-items: stretch;
+      min-height: 0;
+    }
+    #band-stats .band-stat {
+      display: flex;
+      flex-direction: column;
+      justify-content: center;
+      gap: 4px;
+      padding: 0 12px;
+      min-width: 0;
+    }
+    #band-stats .band-stat + .band-stat {
+      border-left: 1px solid var(--border);
+    }
+    #band-stats .band-stats-row > .band-stat:first-child {
+      padding-left: 0;
+    }
+    #band-stats .band-stat .band-k {
+      font: 800 10px/1.1 var(--font-heading);
+      letter-spacing: .08em;
+      color: var(--dim);
+      white-space: nowrap;
+      overflow: hidden;
+      text-overflow: ellipsis;
+    }
+    #band-stats .band-stat .band-v {
+      font: 800 18px/1.1 var(--font-heading);
+      letter-spacing: -.01em;
+      white-space: nowrap;
+      overflow: hidden;
+      text-overflow: ellipsis;
     }
     #band-actions {
       margin-left: auto;
@@ -307,27 +447,6 @@
       flex-wrap: wrap;
     }
 
-    /* —— quick stats row —— */
-    #quick-stats {
-      display: flex;
-      gap: 8px 28px;
-      flex-wrap: wrap;
-      padding: 14px var(--space-6);
-      border-bottom: 2px solid var(--border);
-    }
-    #quick-stats .q .k {
-      font-size: 10px;
-      font-weight: 700;
-      letter-spacing: .06em;
-      text-transform: uppercase;
-      color: var(--dim);
-    }
-    #quick-stats .q .v {
-      font: 800 20px/1 var(--font-heading);
-      margin-top: 6px;
-      font-variant-numeric: tabular-nums;
-    }
-
     /* —— sections (modular grid: rules, not floating cards) —— */
     section, aside {
       background: var(--bg);
@@ -335,6 +454,10 @@
       border-radius: var(--radius-lg);
       overflow: hidden;
     }
+    /* Trading-tab sections don't get the boxed frame above — the modular
+       grid is drawn with the rules below instead. These border rules must
+       stay #dash-trading-scoped: they have to out-specify this ID reset, or
+       the panels (Working orders, Recent executions, …) render frameless. */
     #dash-trading section, #dash-trading aside { border: 0; overflow: visible; }
     section > h2, aside > h2 {
       margin: 0;
@@ -343,6 +466,7 @@
       text-transform: uppercase;
       letter-spacing: .1em;
       color: color-mix(in srgb, var(--fg) 60%, transparent);
+      background: var(--panel-2);
       border-bottom: 2px solid var(--border);
       display: flex;
       justify-content: space-between;
@@ -358,15 +482,98 @@
       letter-spacing: .1em;
       color: color-mix(in srgb, var(--fg) 60%, transparent);
     }
-    #action-rail { border-bottom: 2px solid var(--border); }
-    #positions-panel { border-bottom: 2px solid var(--border); }
+    #dash-trading #action-rail { border-bottom: 2px solid var(--border); }
+    #dash-trading #positions-panel { border-bottom: 2px solid var(--border); }
     .lower {
       display: grid;
       grid-template-columns: minmax(0, 1fr) minmax(0, 1fr);
     }
-    .lower section { border-bottom: 2px solid var(--border); overflow-x: auto; }
+    #dash-trading .lower section { border-bottom: 2px solid var(--border); overflow-x: auto; }
     td.err-note { white-space: normal; min-width: 150px; max-width: 260px; text-align: left; }
-    .lower section:nth-of-type(odd) { border-right: 2px solid var(--border); }
+    #dash-trading .lower section:nth-of-type(odd) { border-right: 2px solid var(--border); }
+
+    /* Strategies runtime panel: fit columns in the half-width frame (no
+       horizontal scroll). Global th/td nowrap + action buttons otherwise
+       push past the modular-grid cell. */
+    #strategies-panel table {
+      table-layout: fixed;
+      width: 100%;
+    }
+    #strategies-panel th,
+    #strategies-panel td {
+      white-space: normal;
+      overflow-wrap: anywhere;
+      word-break: break-word;
+      padding-left: 8px;
+      padding-right: 8px;
+    }
+    #strategies-panel th:nth-child(1),
+    #strategies-panel td:nth-child(1) { width: 28%; }
+    #strategies-panel th:nth-child(2),
+    #strategies-panel td:nth-child(2) { width: 14%; }
+    #strategies-panel th:nth-child(3),
+    #strategies-panel td:nth-child(3) { width: 12%; }
+    #strategies-panel th:nth-child(4),
+    #strategies-panel td:nth-child(4) { width: 10%; }
+    #strategies-panel th:nth-child(5),
+    #strategies-panel td:nth-child(5) { width: 16%; }
+    #strategies-panel th:nth-child(6),
+    #strategies-panel td:nth-child(6) { width: 20%; }
+    #strategies-panel td.err-note {
+      min-width: 0;
+      max-width: none;
+    }
+    #strategies-panel td.sym .strat-meta {
+      font-weight: 400;
+      font-size: 0.85em;
+      margin-top: 0.15em;
+      line-height: 1.35;
+    }
+    #strategies-panel .cc-strategy-actions {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 4px;
+      justify-content: flex-end;
+    }
+    #strategies-panel .cc-strategy-actions button {
+      padding: 5px 7px;
+      font-size: 9px;
+    }
+    #strategies-panel .dotstate { white-space: nowrap; }
+
+    /* Strategies tab (deploy): same nowrap overflow against full-width
+       framed sections with overflow:hidden. */
+    #dash-deploy section.full {
+      overflow-x: auto;
+    }
+    #dash-deploy section.full > table {
+      table-layout: fixed;
+      width: 100%;
+      min-width: 0;
+    }
+    #dash-deploy section.full > table th,
+    #dash-deploy section.full > table td {
+      white-space: normal;
+      overflow-wrap: anywhere;
+      word-break: break-word;
+      vertical-align: top;
+    }
+    #dash-deploy section.full > table td.wl-actions {
+      width: auto;
+      white-space: nowrap;
+      vertical-align: middle;
+    }
+    #dash-deploy section.full > table td.wl-actions .param-form.inline {
+      display: inline-flex;
+      flex-wrap: nowrap;
+      align-items: center;
+      gap: 4px;
+      margin: 0 6px 0 0;
+      vertical-align: middle;
+    }
+    #dash-deploy section.full > table td.wl-actions .param-form.inline:last-child {
+      margin-right: 0;
+    }
 
     /* —— tables —— */
     table { width: 100%; border-collapse: collapse; font-variant-numeric: tabular-nums; }
@@ -383,6 +590,7 @@
       letter-spacing: .08em;
       text-transform: uppercase;
       color: var(--dim);
+      background: var(--panel-2);
       border-bottom: 2px solid var(--border);
       padding-top: 9px;
       padding-bottom: 9px;
@@ -551,22 +759,35 @@
     #risk-body { padding: 14px var(--space-4); font-size: 12.5px; }
     #risk-body[data-state="unavailable"] { color: var(--warn); }
     #risk-body[data-state="warning"] { color: var(--neg); }
-    .order-group { border-bottom: 1px solid var(--border-soft); }
-    .order-group .group-head {
-      padding: 9px var(--space-4);
-      font: 800 12px/1.3 var(--font-heading);
-      display: flex;
-      align-items: center;
-      gap: 10px;
+    #risk-body .tt-limit { margin: 8px 0 0; color: var(--fg); }
+    #risk-body .tt-limit span { display: block; font-size: 12px; color: var(--dim); }
+    #risk-body .tt-bar {
+      height: 6px;
+      margin-top: 4px;
+      background: var(--border-soft);
+      border-radius: 3px;
+      overflow: hidden;
     }
-    .order-group .group-head .n {
-      margin-left: auto;
-      font: 600 11px/1.3 var(--font-body);
+    #risk-body .tt-bar i {
+      display: block;
+      height: 100%;
+      background: var(--accent);
+    }
+    #risk-body .tt-bar i.hot { background: var(--warn); }
+    #risk-body .tt-bar i.over { background: var(--neg); }
+    .order-group { border-bottom: 1px solid var(--border-soft); }
+    /* Group-head (og-* / N leg(s) · status · filled) is redundant with per-leg
+       rows — never show it, even if an older cached command_center.js still
+       emits the markup. */
+    .order-group > .group-head { display: none; }
+    .order-group.orders-empty {
+      display: block;
+      padding: 9px var(--space-4);
       color: var(--dim);
-      font-variant-numeric: tabular-nums;
+      font: 600 12px/1.3 var(--font-body);
     }
     .order-group .leg {
-      padding: 7px var(--space-4) 7px var(--space-6);
+      padding: 7px var(--space-4);
       font-size: 12px;
       color: color-mix(in srgb, var(--fg) 75%, transparent);
       display: flex;
@@ -574,6 +795,7 @@
       align-items: center;
       border-top: 1px solid var(--border-soft);
     }
+    .order-group .leg:first-child { border-top: 0; }
     .order-group .leg .leg-r {
       margin-left: auto;
       display: inline-flex;
@@ -666,7 +888,7 @@
     .cc-resolve-status.ok { color: var(--pos); }
     .cc-resolve-status.err { color: var(--neg); }
 
-    /* —— admin panes (Deploy / Watchlists) —— */
+    /* —— admin panes (Strategies / Portfolios) —— */
     .dash-admin-pane { padding: 0 0 var(--space-6); }
     .dash-admin-pane .dash-admin-body {
       display: grid;
@@ -1078,7 +1300,47 @@
       display: flex;
       flex-wrap: wrap;
       gap: var(--space-2);
-      margin-top: var(--space-1);
+      margin-top: 4px;
+    }
+    #dash-scaling .scaling-form-grid {
+      display: grid;
+      grid-template-columns: 1fr 1fr;
+      gap: var(--space-2);
+    }
+    @media (max-width: 640px) {
+      #dash-scaling .scaling-form-grid { grid-template-columns: 1fr; }
+    }
+    #dash-scaling .scaling-form-grid label.span-2 {
+      grid-column: 1 / -1;
+    }
+    #dash-scaling .scaling-controls input[type="number"] {
+      font: inherit;
+      font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+      font-size: 12px;
+      color: var(--fg);
+      background: var(--panel-2);
+      border: 1px solid var(--border);
+      border-radius: var(--radius);
+      padding: 8px 10px;
+      caret-color: var(--accent);
+    }
+    #dash-scaling .scaling-controls .hint {
+      margin: 0;
+      font-size: 12px;
+      color: var(--dim);
+      line-height: 1.4;
+    }
+    #dash-scaling .scaling-controls .hint code {
+      font-size: .92em;
+      padding: .05em .3em;
+    }
+    #dash-scaling #scaling-payload-out {
+      min-height: 180px;
+    }
+    #dash-scaling .scaling-controls .field-error {
+      color: var(--neg);
+      font-size: 12px;
+      margin: 0;
     }
     #dash-scaling .paper-auto-banner {
       margin: 0 var(--space-4) var(--space-3);
@@ -1510,8 +1772,9 @@
 
     @media (max-width: 960px) {
       .lower { grid-template-columns: 1fr; }
-      .lower section:nth-of-type(odd) { border-right: none; }
+      #dash-trading .lower section:nth-of-type(odd) { border-right: none; }
       .band-cell { border-left: none; padding-left: 0; }
+      #band-stats { border-left: none; padding-left: 0; }
     }
     @media (max-width: 720px) {
       .dash-admin-pane .dash-admin-body {
@@ -1522,7 +1785,6 @@
       main.grid {
         padding: 0 var(--space-4) var(--space-4);
       }
-      #quick-stats { padding: var(--space-4); }
       .dash-tabs { padding-left: 0; padding-right: var(--space-4); }
       #status-bar { padding-left: var(--space-4); padding-right: var(--space-4); }
     }
@@ -1539,14 +1801,23 @@
   <nav class="dash-tabs" aria-label="Dashboard sections">
     <button type="button" class="dash-tab active" data-dash-tab="trading">Trading</button>
     <button type="button" class="dash-tab" data-dash-tab="scaling">Scaling</button>
-    <button type="button" class="dash-tab" data-dash-tab="deploy">Deploy
+    <button type="button" class="dash-tab" data-dash-tab="deploy">Strategies
       <span class="chip on">{{ deployed_count|default(0) }}</span></button>
-    <button type="button" class="dash-tab" data-dash-tab="watchlists">Watchlists
+    <button type="button" class="dash-tab" data-dash-tab="watchlists">Portfolios
       <span class="chip">{{ watchlists|length|default(0) }}</span></button>
-    <button type="button" class="dash-tab" data-dash-tab="guide">Guide</button>
     <button type="button" class="dash-tab" data-dash-tab="research">Research</button>
+    <button type="button" class="dash-tab" data-dash-tab="guide">Guide</button>
     <span id="last-event-time" title="Latest authoritative event time">
       last event: <span class="v">—</span></span>
+    <span id="zoom-control"
+          title="Scale the page like browser zoom — click the % to reset">
+      <span class="zoom-a" aria-hidden="true">A</span>
+      <input type="range" id="zoom-slider" min="80" max="150" step="5"
+             value="100" aria-label="Page text scale, percent">
+      <span class="zoom-a zoom-a-lg" aria-hidden="true">A</span>
+      <button type="button" id="zoom-value"
+              title="Reset text scale to 100%">100%</button>
+    </span>
     <button type="button" id="theme-toggle" aria-pressed="false"
             title="Switch color theme">Dark</button>
   </nav>
@@ -1565,17 +1836,48 @@
     <div id="band-identity">
       <div class="band-id-row">
         <span id="mode-badge" class="badge">…</span>
+        <span id="operating-mode" class="op-mode" data-mode="manual"
+              title="Fully manual — propose and approve by hand">
+          <i class="op-dot" aria-hidden="true"></i>
+          <span class="op-label">Manual</span>
+        </span>
         <span id="account-id" class="num">—</span>
       </div>
       <span id="dependency-chips" aria-label="Dependency health"></span>
     </div>
-    <div class="band-cell">
-      <span class="band-k">Net liquidation</span>
-      <span id="band-netliq" class="band-v">—</span>
-    </div>
-    <div class="band-cell">
-      <span class="band-k">Day P&amp;L</span>
-      <span id="band-daypnl" class="band-v">—</span>
+    <div id="band-stats" aria-label="Account summary">
+      <div class="band-stats-row" aria-label="Capital stats">
+        <div class="band-stat">
+          <span class="band-k">Net liquidation</span>
+          <span id="band-netliq" class="band-v">—</span>
+        </div>
+        <div class="band-stat">
+          <span class="band-k">Day P&amp;L</span>
+          <span id="band-daypnl" class="band-v">—</span>
+        </div>
+        <div class="band-stat">
+          <span class="band-k">Exposure</span>
+          <span id="band-exposure" class="band-v">—</span>
+        </div>
+        <div class="band-stat">
+          <span class="band-k">Buying power</span>
+          <span id="band-buying-power" class="band-v">—</span>
+        </div>
+        <div class="band-stat">
+          <span class="band-k">Margin cushion</span>
+          <span id="band-cushion" class="band-v">—</span>
+        </div>
+      </div>
+      <div class="band-stats-row" aria-label="Book counts">
+        <div class="band-stat">
+          <span class="band-k">Open positions</span>
+          <span id="band-positions" class="band-v">—</span>
+        </div>
+        <div class="band-stat">
+          <span class="band-k">Working orders</span>
+          <span id="band-orders" class="band-v">—</span>
+        </div>
+      </div>
     </div>
     {% if commands_enabled %}
     <div id="band-actions">
@@ -1607,7 +1909,6 @@
       </div>
       <div id="proposal-cards"></div>
     </section>
-    <div id="quick-stats" aria-label="Account summary"></div>
     <section id="positions-panel" aria-label="Positions">
       <h2><span class="h-title">Positions {{ info('Live holdings from IB. Unrealized P&amp;L vs average cost; Day P&amp;L since session start. Close starts an exit proposal — Approve still required.') }}</span>
         <span id="positions-meta" class="h-meta"></span></h2>
@@ -1630,13 +1931,13 @@
         <table><thead><tr><th>Time</th><th>Instrument</th><th>Side</th>
           <th>Qty</th><th>Price</th><th>Commission</th></tr></thead>
           <tbody id="fills-body"></tbody></table></section>
-      <section id="strategies-panel"><h2><span class="h-title">Strategies {{ info('Live strategy_service rows. Enable/Disable here is immediate. Pause new trading blocks new exposure without unloading strategies. Full deploy/undeploy is on the Deploy tab.') }}</span></h2>
+      <section id="strategies-panel"><h2><span class="h-title">Strategies {{ info('Live strategy_service rows. Enable/Disable here is immediate. Pause new trading blocks new exposure without unloading strategies. Full deploy/undeploy is on the Strategies tab.') }}</span></h2>
         <table><thead><tr><th>Strategy</th><th>State</th><th>Enabled</th>
-          <th>Last activity</th><th>Error</th>
+          <th>Activity</th><th>Error</th>
           {% if commands_enabled %}<th data-cc-col="strategy-actions">Actions</th>{% endif %}
           </tr></thead>
           <tbody id="strategies-body"></tbody></table></section>
-      <section id="risk-panel"><h2><span class="h-title">Risk &amp; reconciliation {{ info('Authoritative risk projection: concentration, group budgets, and reconciliation warnings. Empty until the risk service publishes a projection.') }}</span></h2>
+      <section id="risk-panel"><h2><span class="h-title">Risk &amp; reconciliation {{ info('Authoritative risk projection: concentration vs 15% cap, group budgets, HHI, and reconciliation warnings. Bars show distance to each limit; warnings stay the fail-loud surface.') }}</span></h2>
         <div id="risk-body" data-state="unavailable">Risk unavailable — waiting
           for an authoritative risk projection.</div></section>
     </div>
@@ -1664,10 +1965,102 @@
           <div class="scaling-card"><div class="label">Expires</div>
             <div id="scaling-expires" class="value">—</div></div>
         </div>
+        <div class="scaling-controls" id="scaling-payload-builder"
+             aria-label="Build unsigned allocation JSON for offline signing">
+          <h3>Build unsigned allocation JSON {{ info('Fills the fields that go into mmr research allocation sign. Private keys never enter this browser — copy the JSON, sign offline, then paste the signed attestation below to Activate.') }}</h3>
+          <p class="hint">Choose options below, generate JSON, then sign offline:
+            <code>mmr research allocation sign --payload-file payload.json --key-file ~/.config/mmr/keys/private/signing.pem</code>
+            Paste the signed result into Activate. Prefill loads digests +
+            <code>public_key_id</code> from the paper-automation artifact
+            attestation (and from a prior allocation authority when present).
+            <code>evidence_digest</code> still comes from
+            <code>mmr research allocation prepare</code> / ScalingGate — it is
+            not on the research attestation.</p>
+          <div class="scaling-form-grid">
+            <label>Strategy
+              <select id="scaling-payload-strategy">
+                <option value="">Select a strategy…</option>
+              </select>
+            </label>
+            <label>Or type strategy id
+              <input type="text" id="scaling-payload-strategy-custom"
+                     placeholder="orb_googl" autocomplete="off" spellcheck="false">
+            </label>
+            <label>Account id
+              <input type="text" id="scaling-payload-account"
+                     placeholder="DU… or U…" autocomplete="off" spellcheck="false">
+            </label>
+            <label>Account mode
+              <select id="scaling-payload-mode">
+                <option value="paper">paper</option>
+                <option value="live">live</option>
+              </select>
+            </label>
+            <label>Target stage
+              <select id="scaling-payload-stage">
+                <option value="SCALE_1">SCALE_1 (max 9%)</option>
+                <option value="SCALE_2">SCALE_2 (max 13.5%)</option>
+                <option value="STEADY">STEADY (max 15%)</option>
+                <option value="CANARY">CANARY (max 6%)</option>
+              </select>
+            </label>
+            <label>Max gross allocation
+              <input type="number" id="scaling-payload-ceiling" min="0.001" max="0.15"
+                     step="0.001" value="0.09" title="Fraction of equity, e.g. 0.09 = 9%">
+            </label>
+            <label>TTL (days)
+              <input type="number" id="scaling-payload-ttl" min="1" max="365"
+                     step="1" value="30">
+            </label>
+            <label>Public key id
+              <input type="text" id="scaling-payload-key-id"
+                     placeholder="key-2026" autocomplete="off" spellcheck="false">
+            </label>
+            <label>Operator
+              <input type="text" id="scaling-payload-operator"
+                     placeholder="your-name" autocomplete="off" spellcheck="false">
+            </label>
+            <label class="span-2">Reason
+              <input type="text" id="scaling-payload-reason" maxlength="200"
+                     placeholder="Scale 1 after clean canary" autocomplete="off">
+            </label>
+            <label class="span-2">Artifact digest
+              <input type="text" id="scaling-payload-artifact"
+                     placeholder="sha256:…" autocomplete="off" spellcheck="false">
+            </label>
+            <label class="span-2">Allowlist digest
+              <input type="text" id="scaling-payload-allowlist"
+                     placeholder="sha256:…" autocomplete="off" spellcheck="false">
+            </label>
+            <label class="span-2">Ruleset digest
+              <input type="text" id="scaling-payload-ruleset"
+                     placeholder="sha256:…" autocomplete="off" spellcheck="false">
+            </label>
+            <label class="span-2">Evidence digest
+              <input type="text" id="scaling-payload-evidence"
+                     placeholder="from ScalingGate / evidence window" autocomplete="off" spellcheck="false">
+            </label>
+          </div>
+          <p id="scaling-payload-error" class="field-error" hidden></p>
+          <div class="btn-row">
+            <button type="button" id="scaling-payload-generate" class="btn primary">
+              Generate unsigned JSON</button>
+            <button type="button" id="scaling-payload-copy" class="btn" disabled>
+              Copy JSON</button>
+            <button type="button" id="scaling-payload-download" class="btn" disabled>
+              Download payload.json</button>
+            <button type="button" id="scaling-payload-prefill" class="btn">
+              Prefill from dashboard</button>
+          </div>
+          <label class="span-2">Unsigned payload (sign offline — no signature field)
+            <textarea id="scaling-payload-out" spellcheck="false" readonly
+                      placeholder='Click "Generate unsigned JSON"'></textarea>
+          </label>
+        </div>
         {% if commands_enabled %}
         <div class="scaling-controls" id="scaling-controls"
              aria-label="Allocation operator controls">
-          <h3>Operator controls</h3>
+          <h3>Activate signed attestation</h3>
           <label>Signed attestation JSON
             <textarea id="scaling-attestation" spellcheck="false"
                       placeholder='{"strategy_id":"...","signature":"..."}'></textarea>
@@ -1916,23 +2309,15 @@
   </aside>
 
   <!-- [M1-C] Task 6 -- strategy parameter editor: typed fields, CAS on
-       control_revision. The <form> below is intentionally left empty here:
-       there is no strategy params/tunables schema in the reduced store yet
-       (the real "strategy" entity payload -- StrategyControlCommandService.
-       acknowledge_state -- carries {strategy_name, action, strategy_state,
-       control_revision, state_revision, error}, nothing about tunables), so
-       typed field generation stays a follow-up. The open/apply wiring is
-       done: a strategy row's "Edit params" action opens this dialog
-       (ccOpenStrategyParamsDrawer, command_center.js's UI-wiring pass) and
-       "Apply" collects whatever this empty form yields (nothing, today) and
-       calls ccUpdateStrategyParams(strategy, params). Server (F3's versioned
-       params schema) is still the real validation authority regardless of
-       what this form offers. -->
+       control_revision. Fields are filled at open time from
+       GET /api/strategies/{name}/params (YAML/live params + class tunables).
+       Apply collects the form and calls ccUpdateStrategyParams; the server
+       remains the validation authority. -->
   <aside id="cc-strategy-params-dialog" class="cc-drawer" hidden>
     <h2>Edit <span id="cc-params-strategy-name"></span> parameters</h2>
     <p class="cc-hint">Server validates every value against the strategy's
        versioned schema; unspecified risk effects are treated as
-       risk-increasing.</p>
+       risk-increasing. Clear a field to remove that override.</p>
     <form id="cc-strategy-params-form"></form>
     <button id="cc-params-apply" type="button"
             data-cc-command="update_strategy_params">Apply</button>

@@ -7,6 +7,12 @@ import logging
 import math
 
 
+# Concentration / HHI thresholds used by both warnings and dashboard limit bars.
+CONCENTRATION_WARN_PCT = 0.10
+CONCENTRATION_CRIT_PCT = 0.15
+HHI_WARN = 0.15
+
+
 @dataclass
 class RiskReport:
     total_positions: int = 0
@@ -126,13 +132,13 @@ class PortfolioRiskAnalyzer:
         # Concentration warnings
         warnings = []
         for sym, pct in weights.items():
-            if pct > 0.15:
+            if pct > CONCENTRATION_CRIT_PCT:
                 warnings.append({
                     'level': 'critical',
                     'message': f'{sym} is {pct:.1%} of portfolio (>15%)',
                     'symbols': [sym],
                 })
-            elif pct > 0.10:
+            elif pct > CONCENTRATION_WARN_PCT:
                 warnings.append({
                     'level': 'warning',
                     'message': f'{sym} is {pct:.1%} of portfolio (>10%)',
@@ -140,7 +146,7 @@ class PortfolioRiskAnalyzer:
                 })
 
         # HHI warning
-        if report.hhi > 0.15:
+        if report.hhi > HHI_WARN:
             warnings.append({
                 'level': 'warning',
                 'message': f'Portfolio concentration (HHI={report.hhi:.3f}) is high — consider diversifying',
@@ -379,3 +385,97 @@ class PortfolioRiskAnalyzer:
             parts.append('No risk issues detected.')
 
         return ' '.join(parts)
+
+
+def projection_limit_rows(report: RiskReport) -> list[dict]:
+    """Structured ``{id, label, value_pct, cap_pct}`` rows for the dashboard bars.
+
+    Percentages are 0–100. Concentration uses the 15% critical cap; group
+    budgets use each group's configured allocation; HHI is scaled ×100 against
+    the 0.15 warning threshold (shown as 15).
+    """
+    rows: List[dict] = []
+    crit_cap = round(CONCENTRATION_CRIT_PCT * 100, 2)
+    for pos in report.top_positions:
+        symbol = pos.get('symbol') or '?'
+        rows.append({
+            'id': f'concentration:{symbol}',
+            'label': f'{symbol} concentration',
+            'value_pct': round(float(pos.get('pct') or 0) * 100, 2),
+            'cap_pct': crit_cap,
+        })
+    for group in report.group_allocations:
+        cap = float(group.get('budget_pct') or 0)
+        if cap <= 0:
+            continue
+        cap_pct = round(cap * 100, 2) if cap <= 1.0 else round(cap, 2)
+        rows.append({
+            'id': f"group:{group.get('name') or '?'}",
+            'label': f"{group.get('name') or '?'} group",
+            'value_pct': round(float(group.get('pct') or 0) * 100, 2),
+            'cap_pct': cap_pct,
+        })
+    if report.total_positions > 0:
+        rows.append({
+            'id': 'hhi',
+            'label': 'Portfolio HHI',
+            'value_pct': round(float(report.hhi or 0) * 100, 2),
+            'cap_pct': round(HHI_WARN * 100, 2),
+        })
+    return rows
+
+
+def enrich_risk_projection(
+    snapshot,
+    *,
+    duckdb_path: str = '',
+    history_duckdb_path: str = '',
+    group_store=None,
+) -> dict:
+    """Broker snapshot plus analyzer-derived warnings/limit rows.
+
+    Enrichment failures never drop the broker numbers — the operator still
+    sees NL / PnL / open orders, and ``limits`` stays empty.
+    """
+    payload = {
+        'net_liquidation': snapshot.net_liquidation,
+        'daily_pnl': snapshot.daily_pnl,
+        'open_order_count': snapshot.open_order_count,
+        'warnings': [],
+        'limits': [],
+    }
+    try:
+        positions = [
+            {
+                'symbol': getattr(row, 'symbol', '') or '',
+                'marketValue': float(getattr(row, 'market_value', 0) or 0),
+            }
+            for row in (getattr(snapshot, 'positions', ()) or ())
+        ]
+        analyzer = PortfolioRiskAnalyzer(
+            duckdb_path=duckdb_path,
+            history_duckdb_path=history_duckdb_path or duckdb_path,
+        )
+        store = group_store
+        if store is None and duckdb_path:
+            try:
+                from trader.data.position_groups import PositionGroupStore
+                store = PositionGroupStore(duckdb_path)
+            except Exception as ex:
+                logging.warning('position groups unavailable for risk projection: %s', ex)
+                store = None
+        report = analyzer.analyze(
+            positions, float(snapshot.net_liquidation or 0), store,
+        )
+        payload['warnings'] = [
+            w.get('message', str(w)) if isinstance(w, dict) else str(w)
+            for w in report.warnings
+        ]
+        payload['limits'] = projection_limit_rows(report)
+        payload['hhi'] = report.hhi
+        payload['gross_exposure_pct'] = report.gross_exposure_pct
+        payload['net_exposure_pct'] = report.net_exposure_pct
+        payload['summary'] = report.summary
+    except Exception as ex:
+        logging.warning('risk projection enrichment failed: %s', ex, exc_info=True)
+    return payload

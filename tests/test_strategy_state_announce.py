@@ -1,6 +1,6 @@
 """Strategy state announcement + split-container transport wiring.
 
-Covers the three coupled gaps that left the command center's Strategies
+Covers the coupled gaps that left the command center's Strategies
 panel permanently empty against a split-container deployment:
 
 1. Nothing ever *seeded* loaded strategies into the acknowledgement outbox —
@@ -18,6 +18,12 @@ panel permanently empty against a split-container deployment:
 3. ``run()``'s startup instrument-subscription loop had no per-strategy
    exception isolation — one dead legacy RPC aborted startup for every
    strategy. ``_subscribe_all_strategies`` isolates each strategy.
+
+4. Startup announced into the outbox but deferred drain until the 30s
+   reconcile loop, which only starts *after* ``get_historical_data()``.
+   A long IB backfill left the Trading-tab Strategies panel empty for
+   minutes. ``_schedule_startup_ack_drain`` runs drain in the background
+   concurrent with historical fetch.
 """
 
 import pytest
@@ -91,7 +97,9 @@ class TestAnnounceStrategyStates:
         import json
         payloads = {r[0]: json.loads(r[2]) for r in rows}
         assert payloads['alpha']['state'] == 'INSTALLED'
+        assert payloads['alpha']['strategy_state'] == 'INSTALLED'
         assert payloads['beta']['state'] == 'RUNNING'
+        assert payloads['beta']['strategy_state'] == 'RUNNING'
         assert payloads['alpha']['strategy_name'] == 'alpha'
 
     def test_idempotent_while_state_unchanged(self, runtime_with_revisions):
@@ -152,3 +160,216 @@ class TestStartupSubscriptionIsolation:
         ]
         rt._subscribe_all_strategies()  # must not raise
         assert attempted == [111, 222]  # beta still attempted after alpha failed
+
+
+class TestAnnounceDoesNotCallbackIntoTrader:
+    """Regression: enable/disable used to call ``_drain_ack_outbox`` inline,
+    which dials the trader's typed command socket. When disable is answering
+    a trader→strategy forward, that callback deadlocks the command path and
+    logs ``record_state_acknowledged ... timed out after 10000ms``.
+    """
+
+    def test_disable_announces_without_calling_trader_command(self, runtime_with_revisions):
+        rt = runtime_with_revisions
+
+        class _Toggleable(_StubStrategy):
+            def disable(self):
+                self.state = StrategyState.DISABLED
+                return self.state
+
+            def enable(self):
+                self.state = StrategyState.RUNNING
+                return self.state
+
+        strat = _Toggleable('vwap_reclaim_cat', StrategyState.RUNNING)
+        rt.strategy_implementations = [strat]
+
+        class _BoomClient:
+            def call(self, *args, **kwargs):
+                raise AssertionError(
+                    'disable must not call trader command client (deadlock risk)'
+                )
+
+        rt._trader_command_client = _BoomClient()
+        state = rt.disable_strategy('vwap_reclaim_cat')
+        assert state == StrategyState.DISABLED
+        assert strat.state == StrategyState.DISABLED
+        # Outbox seeded for reconcile drain; trader is never dialed here.
+        rows = _outbox_rows(rt)
+        assert any(r[0] == 'vwap_reclaim_cat' for r in rows)
+
+    def test_enable_announces_without_calling_trader_command(self, runtime_with_revisions):
+        rt = runtime_with_revisions
+
+        class _Toggleable(_StubStrategy):
+            def disable(self):
+                self.state = StrategyState.DISABLED
+                return self.state
+
+            def enable(self):
+                self.state = StrategyState.RUNNING
+                return self.state
+
+        strat = _Toggleable('orb', StrategyState.DISABLED)
+        rt.strategy_implementations = [strat]
+
+        class _BoomClient:
+            def call(self, *args, **kwargs):
+                raise AssertionError(
+                    'enable must not call trader command client (deadlock risk)'
+                )
+
+        rt._trader_command_client = _BoomClient()
+        state = rt.enable_strategy('orb')
+        assert state == StrategyState.RUNNING
+        assert any(r[0] == 'orb' for r in _outbox_rows(rt))
+
+    def test_enable_returns_before_slow_persist(self, runtime_with_revisions):
+        """G1: DuckDB persist must not block the enable RPC reply."""
+        import threading
+        import time
+
+        rt = runtime_with_revisions
+
+        class _Toggleable(_StubStrategy):
+            def enable(self):
+                self.state = StrategyState.RUNNING
+                return self.state
+
+        rt.strategy_implementations = [_Toggleable('orb', StrategyState.DISABLED)]
+        started = threading.Event()
+        release = threading.Event()
+        calls = []
+
+        def _slow_persist(name, enabled):
+            calls.append((name, enabled))
+            started.set()
+            assert release.wait(timeout=5), 'test release never set'
+
+        rt._persist_enabled = _slow_persist
+        t0 = time.monotonic()
+        state = rt.enable_strategy('orb')
+        elapsed = time.monotonic() - t0
+        assert state == StrategyState.RUNNING
+        assert elapsed < 0.5, f'enable blocked on persist ({elapsed:.2f}s)'
+        assert started.wait(timeout=2), 'persist thread never started'
+        release.set()
+        # Give the daemon a moment to record the call.
+        deadline = time.monotonic() + 2
+        while not calls and time.monotonic() < deadline:
+            time.sleep(0.01)
+        assert calls == [('orb', True)]
+
+    def test_disable_schedules_persist(self, runtime_with_revisions):
+        import threading
+        import time
+
+        rt = runtime_with_revisions
+
+        class _Toggleable(_StubStrategy):
+            def disable(self):
+                self.state = StrategyState.DISABLED
+                return self.state
+
+        rt.strategy_implementations = [_Toggleable('orb', StrategyState.RUNNING)]
+        done = threading.Event()
+        calls = []
+
+        def _persist(name, enabled):
+            calls.append((name, enabled))
+            done.set()
+
+        rt._persist_enabled = _persist
+        assert rt.disable_strategy('orb') == StrategyState.DISABLED
+        assert done.wait(timeout=2)
+        assert calls == [('orb', False)]
+
+
+class TestDrainAckOutboxFailFast:
+    def test_aborts_batch_after_trader_timeout(self, runtime_with_revisions):
+        rt = runtime_with_revisions
+        rt.strategy_implementations = [
+            _StubStrategy('a'), _StubStrategy('b'), _StubStrategy('c'),
+        ]
+        rt._announce_strategy_states()
+        calls = []
+
+        class _TimeoutClient:
+            def call(self, method, body, response_model, timeout=None):
+                calls.append((method, body.get('strategy_name'), timeout))
+                raise TimeoutError(f'typed RPC call to {method!r} timed out')
+
+        rt._trader_command_client = _TimeoutClient()
+        rt._drain_ack_outbox()
+        # One attempt then abort — must not walk every outbox row at 10s each.
+        assert len(calls) == 1
+        assert calls[0][0] == 'record_state_acknowledged'
+        assert calls[0][2] == 3.0
+
+
+class TestStartupAckDrain:
+    """Trading-tab strategies come from journaled strategy.updated rows.
+    Startup used to wait for get_historical_data() before the reconcile
+    loop drained the ack outbox — a long IB backfill left the panel empty.
+    Background drain must run concurrently and not block the event loop.
+    """
+
+    @pytest.mark.asyncio
+    async def test_startup_drain_empties_outbox(self, runtime_with_revisions):
+        rt = runtime_with_revisions
+        rt.strategy_implementations = [
+            _StubStrategy('alpha'), _StubStrategy('beta'),
+        ]
+        rt._announce_strategy_states()
+        assert _outbox_rows(rt)  # seeded
+
+        class _OkClient:
+            def call(self, method, body, response_model, timeout=None):
+                return {'entity_revision': body['state_revision']}
+
+        rt._trader_command_client = _OkClient()
+        await rt._startup_drain_ack_outbox(attempts=3, interval_s=0.0)
+        assert rt._revisions.unacknowledged_outbox(10) == []
+
+    @pytest.mark.asyncio
+    async def test_startup_drain_retries_after_timeout(self, runtime_with_revisions):
+        rt = runtime_with_revisions
+        rt.strategy_implementations = [_StubStrategy('alpha')]
+        rt._announce_strategy_states()
+        calls = {'n': 0}
+
+        class _FlakyClient:
+            def call(self, method, body, response_model, timeout=None):
+                calls['n'] += 1
+                if calls['n'] < 2:
+                    raise TimeoutError('trader not ready')
+                return {'entity_revision': 1}
+
+        rt._trader_command_client = _FlakyClient()
+        await rt._startup_drain_ack_outbox(attempts=5, interval_s=0.0)
+        assert calls['n'] >= 2
+        assert rt._revisions.unacknowledged_outbox(10) == []
+
+    @pytest.mark.asyncio
+    async def test_schedule_startup_drain_is_non_blocking(self, runtime_with_revisions):
+        rt = runtime_with_revisions
+        rt.strategy_implementations = [_StubStrategy('alpha')]
+        rt._announce_strategy_states()
+        gate = {'entered': False, 'release': False}
+
+        class _SlowClient:
+            def call(self, method, body, response_model, timeout=None):
+                gate['entered'] = True
+                while not gate['release']:
+                    import time
+                    time.sleep(0.01)
+                return {'entity_revision': 1}
+
+        rt._trader_command_client = _SlowClient()
+        task = rt._schedule_startup_ack_drain(attempts=1, interval_s=0.0)
+        assert task is not None
+        # Returns immediately even though the drain thread is blocked.
+        assert not task.done()
+        gate['release'] = True
+        await task
+        assert rt._revisions.unacknowledged_outbox(10) == []

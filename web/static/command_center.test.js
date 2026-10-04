@@ -379,6 +379,26 @@ async function test(name, fn) {
     assert.equal(form.conid.value, '');
   });
 
+  await test('risk panel draws distance-to-limit bars from projection limits', () => {
+    const { elements, run } = makeContext();
+    const view = emptyView();
+    view.health = { sources: { journal: { state: 'ok' } } };
+    view.risk = {
+      'projection:DU1': {
+        warnings: ['AAPL is 16.0% of portfolio (>15%)'],
+        limits: [
+          { id: 'concentration:AAPL', label: 'AAPL concentration', value_pct: 16, cap_pct: 15 },
+          { id: 'hhi', label: 'Portfolio HHI', value_pct: 8, cap_pct: 15 },
+        ],
+      },
+    };
+    run(`store.view = ${JSON.stringify(view)}; renderRisk();`);
+    const body = elements.get('risk-body');
+    assert.ok(body.innerHTML.includes('AAPL concentration 16.0% of 15.0%'));
+    assert.ok(body.innerHTML.includes('tt-bar'));
+    assert.equal(body.dataset.state, 'warning');
+  });
+
   console.log(`command_center.test.js: ${passed} tests passed`);
 })().catch((error) => {
   console.error(error);

@@ -72,6 +72,7 @@ from __future__ import annotations
 import datetime as dt
 import itertools
 import json
+import logging
 from dataclasses import dataclass, field, replace
 from enum import Enum
 from typing import Any, Callable, Literal, Optional, Protocol
@@ -257,13 +258,20 @@ def check_exposure_increasing_guards(
     now: dt.datetime,
     account_mode: str,
     outside_session_limit_enabled: bool = False,
+    paper_max_quote_age_seconds: Optional[float] = None,
 ) -> Optional[CommandProblem]:
     """Pure pre-dispatch guards for an exposure-INCREASING approval.
 
     Returns the first violated guard as a ``CommandProblem``, or ``None`` when
     the row may be dispatched. Live mode additionally demands a fresh,
-    live-feed, session-compatible executable-side quote; paper mode only
-    enforces the recorded price-drift band.
+    live-feed, session-compatible executable-side quote (hard 5s age). Paper
+    mode enforces the recorded price-drift band and, when
+    ``paper_max_quote_age_seconds`` is set, an age gate too: the guard is opt-in
+    and deliberately generous because paper commonly runs on ~15-min delayed
+    data whose ``market_timestamp`` is legitimately old — the bound is there to
+    reject hours-old cached last-values (market closed / degraded feed), not
+    normal delayed quotes. Left ``None`` it preserves the legacy paper
+    behaviour (drift band only).
     """
     expected_side = "ask" if record.action == "BUY" else "bid"
     if quote is None or quote.side != expected_side or not quote.price or quote.price <= 0:
@@ -277,6 +285,12 @@ def check_exposure_increasing_guards(
                 return CommandProblem("SESSION_INCOMPATIBLE", retryable=True)
         age = (now - quote.market_timestamp).total_seconds()
         if age > 5.0:
+            return CommandProblem("QUOTE_STALE", retryable=True)
+        if age < -MAX_SOURCE_CLOCK_SKEW_SECONDS:
+            return CommandProblem("SOURCE_CLOCK_SKEW", retryable=True)
+    elif paper_max_quote_age_seconds is not None:
+        age = (now - quote.market_timestamp).total_seconds()
+        if age > paper_max_quote_age_seconds:
             return CommandProblem("QUOTE_STALE", retryable=True)
         if age < -MAX_SOURCE_CLOCK_SKEW_SECONDS:
             return CommandProblem("SOURCE_CLOCK_SKEW", retryable=True)
@@ -706,11 +720,16 @@ class CommandLedger:
 
         A row is reconcilable iff it has committed a dispatch-or-ambiguity
         transition -- ``SUBMITTING`` (claimed, dispatch may or may not have
-        reached the broker: the classic crash-between-claim-and-ack window) or
-        ``OUTCOME_UNKNOWN`` (a persisted ambiguous outcome). ``RECEIVED``/
-        ``VALIDATED`` never dispatched, and the terminal states are done."""
+        reached the broker: the classic crash-between-claim-and-ack window),
+        ``OUTCOME_UNKNOWN`` (a persisted ambiguous outcome), or ``SUBMITTED``
+        (dispatch ack recorded but not yet promoted to a terminal
+        ``RESOLVED``/``REJECTED`` — e.g. ``cancel_order`` happy-path ends at
+        ``SUBMITTED`` until the target order is observed terminal).
+        ``RECEIVED``/``VALIDATED`` never dispatched, and the terminal states
+        are done."""
         rows = self._journal.connect().execute(
-            f"{self._SELECT} WHERE state IN ('SUBMITTING', 'OUTCOME_UNKNOWN') "
+            f"{self._SELECT} WHERE state IN "
+            "('SUBMITTING', 'OUTCOME_UNKNOWN', 'SUBMITTED') "
             "ORDER BY created_at",
         ).fetchall()
         return [_row_to_ledger_row(row) for row in rows]
@@ -1250,6 +1269,12 @@ def _assert_proposal_revision(expected: int) -> Callable[[duckdb.DuckDBPyConnect
     return _write
 
 
+# Non-human approve actors. On live these are refused
+# (``LLM_LIVE_APPROVE_FORBIDDEN``); on paper they may approve after evaluation.
+# ``dashboard`` remains the human Command Center path (live + preflight).
+NON_HUMAN_APPROVE_SOURCES = frozenset({"sdk", "cli", "llm"})
+
+
 class ApprovalCommandService:
     """The approval saga -- the ONE command that dispatches real orders.
 
@@ -1272,6 +1297,9 @@ class ApprovalCommandService:
     THEN is the bracket dispatched. A clean rejection marks the proposal
     ``FAILED``; an ambiguous dispatch (timeout/disconnect) leaves it
     ``APPROVED`` for the Task-9 reconciler and NEVER auto-retries.
+
+    Live + ``source`` in ``NON_HUMAN_APPROVE_SOURCES`` is refused before
+    dispatch (``LLM_LIVE_APPROVE_FORBIDDEN``). Paper allows those sources.
     """
 
     def __init__(
@@ -1292,6 +1320,7 @@ class ApprovalCommandService:
         now: Callable[[], dt.datetime] = _utcnow,
         outside_session_limit_enabled: bool = False,
         dispatch_guard: Any = None,
+        paper_max_quote_age_seconds: Optional[float] = None,
     ):
         self._journal = journal
         self._ledger = ledger
@@ -1308,6 +1337,7 @@ class ApprovalCommandService:
         self._now = now
         self._outside_session_limit_enabled = outside_session_limit_enabled
         self._dispatch_guard = dispatch_guard
+        self._paper_max_quote_age_seconds = paper_max_quote_age_seconds
 
     # -- public saga entry point (the registered action handler) ----------
 
@@ -1532,6 +1562,14 @@ class ApprovalCommandService:
             return reject("WRONG_ACCOUNT", False)
         if self._account_mode == "live" and not record.live_approval_eligible:
             return reject("LIVE_INELIGIBLE", False)
+        # Paper LLM/SDK may approve after evaluation; live requires a human
+        # dashboard path (preflight + source=dashboard). See
+        # docs/superpowers/specs/2026-07-23-paper-llm-approve-live-human-design.md.
+        if (
+            self._account_mode == "live"
+            and (cmd.source or "").strip().lower() in NON_HUMAN_APPROVE_SOURCES
+        ):
+            return reject("LLM_LIVE_APPROVE_FORBIDDEN", False)
         inflight = [
             r for r in self._ledger.unresolved_for_target("proposal", str(record.id))
             if r.command_id != cmd.command_id
@@ -1578,6 +1616,7 @@ class ApprovalCommandService:
         quote = self._quotes.executable_quote(record.conid, side=side)
         problem = check_exposure_increasing_guards(
             record, quote, self._now_utc(), self._account_mode, self._outside_session_limit_enabled,
+            paper_max_quote_age_seconds=self._paper_max_quote_age_seconds,
         )
         if problem is not None:
             return problem, direction, {
@@ -2137,34 +2176,36 @@ class StrategyControlPort(Protocol):
     def get_receipt(self, command_id: str) -> Optional[StrategyCommandReceipt]: ...
 
 
+logger = logging.getLogger(__name__)
+
+
 class _StrategyRevisionDrift(Exception):
-    """The journal's freshly computed ``entity_revision`` for a ``strategy``
-    entity diverged from the ``state_revision`` strategy_service reported for
-    this command. Would only fire if some OTHER writer journaled a
-    ``strategy.updated`` event for this entity outside
-    ``StrategyControlCommandService.acknowledge_state`` -- a producer bug,
-    never expected in normal operation (mirrors ``_ConcurrentProposalChange``'s
-    role for ``_assert_proposal_revision``)."""
+    """Legacy exception kept for import stability; no longer raised.
 
-
-def _assert_state_revision(expected: int) -> Callable[[duckdb.DuckDBPyConnection, int], None]:
-    """A ``write_materialized`` callback asserting the journal's freshly
-    computed ``entity_revision`` for entity_type ``"strategy"`` equals the
-    ``state_revision`` strategy_service reported for this command.
-
-    Per the m1f3 briefing's B3 correction: this does NOT (cannot) force
-    ``entity_revision = state_revision`` -- ``DomainMutation`` has no such
-    field and ``DomainJournal.mutate`` always computes the next revision
-    itself. Equality holds only because both counters start fresh at 0 and
-    advance in lockstep, one bump per acknowledged strategy-control command;
-    this assertion is the guard that would catch it drifting, not the
-    mechanism that makes it hold.
+    Journal ``entity_revision`` and strategy_service ``state_revision`` are
+    independent counters: announces, missed ack drains, and journal WAL
+    resets routinely desynchronize them. Treating drift as fatal blocked
+    enable/disable with INTERNAL_ERROR (see acknowledge_strategy_state).
     """
-    def _write(conn: duckdb.DuckDBPyConnection, revision: int) -> None:
-        if revision != expected:
-            raise _StrategyRevisionDrift(
-                f"journal revision {revision} diverged from strategy "
-                f"state_revision {expected}"
+
+
+def _strategy_ack_write(
+    expected_state_revision: int,
+) -> Callable[[duckdb.DuckDBPyConnection, int], None]:
+    """``write_materialized`` for strategy acks: observe drift, never abort.
+
+    Per the m1f3 briefing's B3 correction, ``DomainJournal.mutate`` always
+    computes the next ``entity_revision`` itself — it cannot be forced to
+    equal strategy_service's ``state_revision``. Idempotency is carried by
+    the deterministic ``event_id`` (``strategy:{name}:state:{N}``), not by
+    lockstep revision numbers.
+    """
+    def _write(_conn: duckdb.DuckDBPyConnection, revision: int) -> None:
+        if revision != expected_state_revision:
+            logger.warning(
+                "strategy journal entity_revision %s diverged from strategy "
+                "state_revision %s (missed acks or journal reset); continuing",
+                revision, expected_state_revision,
             )
     return _write
 
@@ -2214,7 +2255,7 @@ def acknowledge_strategy_state(
         event = journal.mutate(
             journal.connect(),
             mutation,
-            _assert_state_revision(state_revision),
+            _strategy_ack_write(state_revision),
             event_id=f"strategy:{strategy_name}:state:{state_revision}",
         )
         return event.entity_revision
@@ -2373,14 +2414,22 @@ class StrategyControlCommandService:
             self._reconciler.schedule(cmd.command_id, self._now_utc())
             return self._receipt(cmd.command_id, "OUTCOME_UNKNOWN", "DISPATCH_AMBIGUOUS", False)
 
-        payload = {
+        payload = dict(strategy_receipt.observable_payload or {})
+        payload.update({
             "strategy_name": strategy_receipt.strategy_name,
             "action": strategy_receipt.action,
-            "strategy_state": strategy_receipt.state,
+            # Prefer the runtime StrategyState name (RUNNING/DISABLED/…).
+            # Falling back to receipt.state (COMMITTED) blanked the Strategies
+            # panel chip after every enable/disable until the next announce.
+            "strategy_state": (
+                strategy_receipt.observable_state or strategy_receipt.state
+            ),
+            "receipt_state": strategy_receipt.state,
             "control_revision": strategy_receipt.control_revision,
             "state_revision": strategy_receipt.state_revision,
             "error": strategy_receipt.error,
-        }
+            "last_error": strategy_receipt.error,
+        })
         # Only a strategy-side COMMITTED actually bumped state_revision --
         # journal strategy.updated (asserting entity_revision == state_revision)
         # ONLY in that case. A ROLLED_BACK outcome minted no new revision on
@@ -2597,7 +2646,7 @@ class OutcomeReconciler:
     def reconcile_once(self, command_id: str, now: dt.datetime) -> ReconcileResult:
         now = _as_utc(now)
         row = self._ledger.get(command_id)
-        if row is None or row.state not in ("SUBMITTING", "OUTCOME_UNKNOWN"):
+        if row is None or row.state not in ("SUBMITTING", "OUTCOME_UNKNOWN", "SUBMITTED"):
             # Already terminal (or gone) -- drop it and report resolved.
             self._plans.pop(command_id, None)
             return ReconcileResult(command_id, resolved=True, critical=False)
@@ -2675,14 +2724,27 @@ class OutcomeReconciler:
         order path is irrelevant. Resolve ONLY when the proposal was positively
         confirmed created (its ``proposal.*`` journal event correlated to this
         command exists); otherwise stay unknown -- NEVER mark anything
-        FAILED."""
+        FAILED.
+
+        Exception: ``INTERNAL_ERROR`` / ``PROPOSAL_IDENTITY_CONFLICT`` with no
+        correlated proposal means the create transaction rolled back. Reject
+        those so they cannot wedge ``reconciliation_safe`` / resume forever.
+        """
         proposal_id = self._created_proposal_id(row.command_id)
-        if proposal_id is None:
-            return False
-        self._resolve_command_only(
-            row, {"proposal_id": proposal_id, "created": True}, now
-        )
-        return True
+        if proposal_id is not None:
+            self._resolve_command_only(
+                row, {"proposal_id": proposal_id, "created": True}, now
+            )
+            return True
+        if row.error_code in {"INTERNAL_ERROR", "PROPOSAL_IDENTITY_CONFLICT"}:
+            self._reject_command_only(
+                row,
+                error_code=row.error_code or "INTERNAL_ERROR",
+                outcome={"created": False, "reconciled": "never_committed"},
+                now=now,
+            )
+            return True
+        return False
 
     def _reconcile_reject(self, row: LedgerRow, now: dt.datetime) -> bool:
         """A wedged ``reject_proposal`` never dispatched an order. Resolve ONLY
@@ -2851,6 +2913,30 @@ class OutcomeReconciler:
         self._journal.mutate_batch_work(self._journal.connect(), work)
         self._plans.pop(row.command_id, None)
 
+    def _reject_command_only(
+        self,
+        row: LedgerRow,
+        *,
+        error_code: str,
+        outcome: dict[str, Any],
+        now: dt.datetime,
+    ) -> None:
+        """OUTCOME_UNKNOWN → REJECTED without touching proposals/orders."""
+        def work(conn: duckdb.DuckDBPyConnection, append) -> None:
+            self._ledger.transition_in_tx(
+                conn, row.command_id, row.state, "REJECTED",
+                error_code=error_code, outcome=outcome, now=now,
+            )
+            append(
+                self._command_mutation(
+                    row, "REJECTED", now, error_code=error_code, outcome=outcome,
+                ),
+                _noop_write, f"command:{row.command_id}:rejected",
+            )
+
+        self._journal.mutate_batch_work(self._journal.connect(), work)
+        self._plans.pop(row.command_id, None)
+
     def _resolve_order(self, row: LedgerRow, found: list, now: dt.datetime) -> None:
         """OUTCOME_UNKNOWN/SUBMITTING -> RESOLVED with the found broker aliases;
         marks the associated proposal EXECUTED (submission evidence) in the same
@@ -2901,10 +2987,12 @@ class OutcomeReconciler:
         payload = {
             "strategy_name": receipt.strategy_name,
             "action": receipt.action,
-            "strategy_state": receipt.state,
+            "strategy_state": receipt.observable_state or receipt.state,
+            "receipt_state": receipt.state,
             "control_revision": receipt.control_revision,
             "state_revision": receipt.state_revision,
             "error": receipt.error,
+            "last_error": receipt.error,
         }
         outcome = dict(payload)
 

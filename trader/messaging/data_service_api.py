@@ -7,6 +7,18 @@ class DataServiceApi(RPCHandler):
         self.service = service
 
     @rpcmethod
+    async def pull_history(
+        self,
+        source: str,
+        symbols: Optional[list[str]] = None,
+        universe: Optional[str] = None,
+        bar_size: str = '1 day',
+        prev_days: int = 30,
+        max_concurrent: int = 5,
+    ) -> dict:
+        return await self.service.pull_history(source, symbols, universe, bar_size, prev_days, max_concurrent)
+
+    @rpcmethod
     async def pull_massive(
         self,
         symbols: Optional[list[str]] = None,

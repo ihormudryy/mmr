@@ -75,6 +75,116 @@ class _UnavailableStrategyControl:
         return None
 
 
+class _JournalOrLiveStrategySnapshot:
+    """``StrategySnapshotPort``: journal first, then strategy_service list."""
+
+    def __init__(self, journal, query_provider):
+        self._journal = journal
+        # Either a TypedRpcClient or a lazy port exposing ``query_client``.
+        self._query_provider = query_provider
+
+    def _query_client(self):
+        provider = self._query_provider
+        if provider is None:
+            return None
+        if hasattr(provider, "query_client"):
+            return provider.query_client
+        return provider
+
+    def exists(self, strategy_name: str) -> bool:
+        if self._journal.get_entity("strategy", strategy_name) is not None:
+            return True
+        client = self._query_client()
+        if client is None:
+            return False
+        try:
+            response = client.call("list_strategies", {}, dict)
+        except Exception:
+            return False
+        for row in response.get("strategies") or []:
+            name = row.get("name") or row.get("strategy_name")
+            if name == strategy_name:
+                return True
+        return False
+
+
+def _strategy_control_credentials_ready(trader: Any) -> bool:
+    """True when enable/disable can be registered (HMAC available)."""
+    if getattr(trader, "typed_authenticator", None) is not None:
+        return True
+    return bool(getattr(trader, "service_hmac_key_file", "") or "")
+
+
+class _LazyTypedStrategyControlPort:
+    """Connects to strategy typed sockets on first forward/get_receipt.
+
+    Eager connect at ``build_command_stack`` time left open ZMQ contexts that
+    hung pytest teardown (``Context.term``) and also failed when strategy
+    wasn't up yet during trader boot.
+    """
+
+    def __init__(self, trader: Any):
+        self._trader = trader
+        self._port = None
+        self._query = None
+
+    def _ensure(self):
+        if self._port is not None:
+            return self._port
+        port, query = _connect_strategy_control_port(self._trader)
+        if port is None:
+            raise RuntimeError("strategy control authority is not configured")
+        self._port = port
+        self._query = query
+        return self._port
+
+    @property
+    def query_client(self):
+        self._ensure()
+        return self._query
+
+    def forward(self, request):
+        return self._ensure().forward(request)
+
+    def get_receipt(self, command_id: str):
+        return self._ensure().get_receipt(command_id)
+
+
+def _connect_strategy_control_port(trader: Any):
+    """Typed one-way trader → strategy_service control port, or ``(None, None)``."""
+    from trader.messaging.production_api import TypedStrategyControlPort
+    from trader.messaging.typed_rpc import (
+        HmacServiceAuthenticator,
+        TypedRpcClient,
+        load_service_hmac_key,
+    )
+
+    authenticator = getattr(trader, "typed_authenticator", None)
+    if authenticator is None:
+        key_file = getattr(trader, "service_hmac_key_file", "") or ""
+        if not key_file:
+            return None, None
+        try:
+            authenticator = HmacServiceAuthenticator(load_service_hmac_key(key_file))
+        except Exception:
+            return None, None
+
+    address = (getattr(trader, "strategy_typed_address", None) or "").strip()
+    if not address:
+        address = "tcp://127.0.0.1"
+    cmd_port = int(getattr(trader, "strategy_typed_command_port", 42104) or 42104)
+    qry_port = int(getattr(trader, "strategy_typed_query_port", 42105) or 42105)
+    command_client = TypedRpcClient(
+        "command", authenticator, address=address, port=cmd_port, timeout=30.0,
+    )
+    query_client = TypedRpcClient(
+        "query", authenticator, address=address, port=qry_port, timeout=30.0,
+    )
+    command_client.connect()
+    query_client.connect()
+    return TypedStrategyControlPort(command_client, query_client), query_client
+
+
 class _BrokerStoreOrderView:
     def __init__(self, store, journal):
         self._store = store
@@ -305,6 +415,7 @@ class CommandStack:
     automated_intent_service: Any = None  # AutomatedIntentCommandService (paper automation)
     paper_automation_service: Any = None  # Paper activation authority (Phase 1+2)
     paper_hot_arm: Any = None  # ProductionPaperHotArmPorts when paper mode
+    strategy_control_service: Any = None  # StrategyControlCommandService when wired
 
 
 _REQUIRED_TRADER_PORTS = (
@@ -449,6 +560,18 @@ def _build_automated_intent_service(
     )
 
 
+def _load_position_sizer() -> Any:
+    """Load ``PositionSizer`` from ``~/.config/mmr/position_sizing.yaml``.
+
+    Required for dashboard/CLI proposals that leave quantity and amount blank
+    (auto-size from confidence). Without this, ``ProposalCommandService``
+    raises ``SIZING_BLOCKED: no position sizer is configured``.
+    """
+    from trader.trading.position_sizing import PositionSizingConfig, PositionSizer
+
+    return PositionSizer(PositionSizingConfig.load())
+
+
 def build_command_stack(
     trader: Any,
     policy: CommandAuthorityPolicy,
@@ -579,11 +702,13 @@ def build_command_stack(
 
     def compute_risk_projection():
         snapshot = broker_snapshot.capture(trader.ib_account)
-        return {
-            "net_liquidation": snapshot.net_liquidation,
-            "daily_pnl": snapshot.daily_pnl,
-            "open_order_count": snapshot.open_order_count,
-        }
+        from trader.trading.portfolio_risk import enrich_risk_projection
+
+        return enrich_risk_projection(
+            snapshot,
+            duckdb_path=trader.duckdb_path,
+            history_duckdb_path=getattr(trader, 'history_duckdb_path', '') or '',
+        )
 
     risk_producer = RiskProducer(
         trader.journal_db,
@@ -599,7 +724,10 @@ def build_command_stack(
     dispatch = TradingRuntimeOrderDispatch(trader, policy=policy)
     orders_view = _BrokerStoreOrderView(trader.broker_state_store, journal)
     alerts = LoggingCriticalAlertPort(now=now)
-    strategy = _UnavailableStrategyControl()
+    strategy_port = None
+    if _strategy_control_credentials_ready(trader):
+        strategy_port = _LazyTypedStrategyControlPort(trader)
+    strategy = strategy_port if strategy_port is not None else _UnavailableStrategyControl()
     reconciler = OutcomeReconciler(
         journal=journal,
         ledger=ledger,
@@ -610,6 +738,18 @@ def build_command_stack(
         orders_view=orders_view,
         now=now,
     )
+    strategy_control_service = None
+    if strategy_port is not None:
+        from trader.trading.command_coordinator import StrategyControlCommandService
+
+        strategy_control_service = StrategyControlCommandService(
+            journal=journal,
+            ledger=ledger,
+            port=strategy_port,
+            snapshot=_JournalOrLiveStrategySnapshot(journal, strategy_port),
+            reconciler=reconciler,
+            now=now,
+        )
     coordinator = TradingCommandCoordinator(
         journal=journal,
         ledger=ledger,
@@ -679,6 +819,7 @@ def build_command_stack(
         now=now,
         controls=controls,
         positions=positions,
+        sizer=_load_position_sizer(),
     )
     approval_service = ApprovalCommandService(
         journal=journal,
@@ -695,6 +836,7 @@ def build_command_stack(
         account_mode=account_mode,
         now=now,
         dispatch_guard=dispatch_guard,
+        paper_max_quote_age_seconds=policy.max_paper_quote_age_seconds,
     )
     cancel_service = CancelCommandService(
         journal=journal,
@@ -887,6 +1029,7 @@ def build_command_stack(
         allocation_service=allocation_service,
         automated_intent_service=automated_intent_service,
         paper_automation_service=paper_automation_service,
+        strategy_control_service=strategy_control_service,
     )
 
     def _build_intent_for_hot_arm(trader_obj: Any):

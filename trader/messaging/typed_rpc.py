@@ -1122,6 +1122,17 @@ class TypedRpcClient:
         socket.setsockopt(zmq.IMMEDIATE, 1)
         socket.setsockopt(zmq.MAXMSGSIZE, MAX_REQUEST_BYTES)
         socket.setsockopt(zmq.IDENTITY, uuid.uuid4().bytes)
+        # SNDTIMEO must NEVER stay at ZMQ's infinite default. IMMEDIATE=1 means
+        # an unconnected DEALER refuses to *queue* -- but in blocking mode a
+        # refused send WAITS for a peer instead of raising, so `call`'s
+        # `except zmq.Again -> ConnectionError` below would be unreachable dead
+        # code and the calling thread would wedge forever holding `self._lock`
+        # (permanently disabling the whole client, not just that one call).
+        # The legacy dill client hit exactly this and fixed it the same way --
+        # see clientserver.RPCClient._configure_socket. Mirror its fallback so
+        # a 0/None timeout can't reintroduce the infinite default.
+        effective_timeout = self.timeout if self.timeout else 10.0
+        socket.setsockopt(zmq.SNDTIMEO, int(effective_timeout * 1000))
         socket.connect(self.address)
         return socket
 

@@ -975,7 +975,12 @@ def test_create_wedge_resolves_by_proposal_creation_not_order_path(recon):
     assert recon.orders.find_calls == []                # order path never consulted for a create
 
 
-def test_create_wedge_without_committed_proposal_stays_unknown(recon):
+def test_create_wedge_without_committed_proposal_rejects_internal_error(recon):
+    """INTERNAL_ERROR with no correlated proposal means the create rolled back.
+
+    Staying OUTCOME_UNKNOWN forever wedges resume_trading via reconciliation_safe;
+    reject those deterministic never-committed creates.
+    """
     coord = _recon_coordinator(recon)
 
     def wedge_before_create(cmd):
@@ -991,8 +996,11 @@ def test_create_wedge_without_committed_proposal_stays_unknown(recon):
 
     recon.orders.enumeration_ok = True
     result = recon.reconciler.reconcile_once("cc-2", recon.now())
-    assert result.resolved is False                     # not positively confirmed -> stay unknown
-    assert recon.ledger.get("cc-2").state == "OUTCOME_UNKNOWN"
+    assert result.resolved is True
+    row = recon.ledger.get("cc-2")
+    assert row.state == "REJECTED"
+    assert row.error_code == "INTERNAL_ERROR"
+    assert row.outcome.get("created") is False
     assert recon.orders.find_calls == []
 
 

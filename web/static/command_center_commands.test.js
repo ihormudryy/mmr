@@ -115,6 +115,13 @@ function makeHarness() {
     setTimeout: clock.setTimeout, clearTimeout: clock.clearTimeout,
     setInterval: clock.setInterval, clearInterval: clock.clearInterval,
     window: { confirm: () => state.confirmReturn, location: { href: '' } },
+    localStorage: {
+      _store: Object.create(null),
+      getItem(k) { return Object.prototype.hasOwnProperty.call(this._store, k)
+        ? this._store[k] : null; },
+      setItem(k, v) { this._store[k] = String(v); },
+      removeItem(k) { delete this._store[k]; },
+    },
   });
 
   const source = fs.readFileSync(
@@ -248,6 +255,81 @@ async function test(name, fn) {
     const errToast = h.getEl('cc-toasts').children.at(-1);
     assert.match(errToast.textContent, /rejected \(RISK\)/);
     assert.match(errToast.className, /cc-toast-error/);
+  });
+
+  // 7 — unsigned allocation payload builder (Scaling tab JSON helper).
+  await test('buildUnsignedAllocationPayload: happy path + stage ceiling', async () => {
+    const h = makeHarness();
+    const base = {
+      strategy_id: 'orb_googl',
+      account_id: 'DU123',
+      account_mode: 'paper',
+      stage: 'SCALE_1',
+      max_gross_allocation: 0.09,
+      ttl_days: 30,
+      artifact_digest: 'sha256:a',
+      allowlist_digest: 'sha256:b',
+      ruleset_digest: 'sha256:c',
+      evidence_digest: 'sha256:d',
+      operator: 'alice',
+      reason: 'scale after canary',
+      public_key_id: 'key-1',
+      issued_at: '2026-07-23T12:00:00.000Z',
+    };
+    const ok = h.api.buildUnsignedAllocationPayload(base);
+    assert.equal(ok.ok, true);
+    assert.equal(ok.payload.stage, 'SCALE_1');
+    assert.equal(ok.payload.max_gross_allocation, 0.09);
+    assert.equal(ok.payload.issued_at, '2026-07-23T12:00:00Z');
+    assert.equal(ok.payload.expires_at, '2026-08-22T12:00:00Z');
+    assert.equal(ok.payload.signature, undefined);
+
+    const over = h.api.buildUnsignedAllocationPayload({
+      ...base, max_gross_allocation: 0.10,
+    });
+    assert.equal(over.ok, false);
+    assert.ok(over.errors.some((e) => /ceiling/i.test(e)));
+
+    const missing = h.api.buildUnsignedAllocationPayload({ stage: 'SCALE_1' });
+    assert.equal(missing.ok, false);
+    assert.ok(missing.errors.length >= 3);
+  });
+
+  await test('prefillScalingPayloadForm: digests from paper_automation + evidence from authority', () => {
+    const h = makeHarness();
+    const strategy = h.getEl('scaling-payload-strategy');
+    strategy.options = [{ value: 'orb_googl' }, { value: '' }];
+    strategy.value = '';
+    h.setView({
+      accounts: [{ account_id: 'DU999', account_mode: 'paper' }],
+      paper_automation: {
+        strategy_name: 'orb_googl',
+        artifact_digest: 'afe3e4e54c3f6d37',
+        allowlist_digest: 'allowlist-1',
+        ruleset_digest: 'ruleset-abc',
+        public_key_id: 'ed25519-deadbeef',
+      },
+      scaling: {
+        stage: 'SCALE_1',
+        strategy_id: 'orb_googl',
+        authorities: [{
+          entity_revision: 2,
+          strategy_id: 'orb_googl',
+          evidence_digest: 'sha256:evidence-from-authority',
+          operator: 'alice',
+        }],
+      },
+    });
+    h.api.prefillScalingPayloadForm();
+    assert.equal(h.getEl('scaling-payload-account').value, 'DU999');
+    assert.equal(h.getEl('scaling-payload-mode').value, 'paper');
+    assert.equal(h.getEl('scaling-payload-artifact').value, 'afe3e4e54c3f6d37');
+    assert.equal(h.getEl('scaling-payload-allowlist').value, 'allowlist-1');
+    assert.equal(h.getEl('scaling-payload-ruleset').value, 'ruleset-abc');
+    assert.equal(h.getEl('scaling-payload-key-id').value, 'ed25519-deadbeef');
+    assert.equal(h.getEl('scaling-payload-evidence').value, 'sha256:evidence-from-authority');
+    assert.equal(h.getEl('scaling-payload-operator').value, 'alice');
+    assert.match(h.getEl('scaling-payload-reason').value, /SCALE_1/);
   });
 
   console.log(`command_center_commands.test.js: ${passed} tests passed`);

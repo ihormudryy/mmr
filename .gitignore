@@ -31,3 +31,10 @@ scratch/
 config_defaults/local_*
 
 notebooks/
+
+# Local release-gate / soak / drill reports written at the repo root
+/p[0-9]-*.json
+/*-soak.json
+/*-gate.json
+/*drill*.json
+.hypothesis/

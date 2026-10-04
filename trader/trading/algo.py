@@ -1,2 +1,0 @@
-class Algo():
-    pass

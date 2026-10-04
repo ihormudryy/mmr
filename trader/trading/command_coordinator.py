@@ -2179,16 +2179,6 @@ class StrategyControlPort(Protocol):
 logger = logging.getLogger(__name__)
 
 
-class _StrategyRevisionDrift(Exception):
-    """Legacy exception kept for import stability; no longer raised.
-
-    Journal ``entity_revision`` and strategy_service ``state_revision`` are
-    independent counters: announces, missed ack drains, and journal WAL
-    resets routinely desynchronize them. Treating drift as fatal blocked
-    enable/disable with INTERNAL_ERROR (see acknowledge_strategy_state).
-    """
-
-
 def _strategy_ack_write(
     expected_state_revision: int,
 ) -> Callable[[duckdb.DuckDBPyConnection, int], None]:

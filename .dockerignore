@@ -23,3 +23,11 @@ third_party
 __pycache__
 logs
 !data/*.csv
+# Local tooling and agent state: never part of the image
+.worktrees
+.claude
+.superpowers
+.hypothesis
+.idea
+.DS_Store
+*.egg-info

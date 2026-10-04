@@ -34,7 +34,7 @@ def test_download_parser_offers_registry_sources():
 def test_dead_polygon_modules_are_gone():
     import importlib.util
     for name in ('trader.listeners.polygon_listener', 'trader.listeners.polygon_reactive',
-                 'trader.batch.polygon_batch', 'trader.batch.polygon_queuer'):
+                 'trader.batch'):
         assert importlib.util.find_spec(name) is None, name
 
 

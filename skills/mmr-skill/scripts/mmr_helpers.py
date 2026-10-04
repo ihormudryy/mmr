@@ -203,10 +203,6 @@ async def _last_close_local_or_remote(symbol: str) -> Optional[float]:
     return None
 
 
-# Back-compat alias for any external callers that imported the old name.
-_last_close_local_or_massive = _last_close_local_or_remote
-
-
 async def _twelvedata_last_close(symbol: str) -> Optional[float]:
     """Single ``/quote`` call to TwelveData; returns ``previous_close`` (the
     most recently completed session's close). Costs ~1 TD credit."""

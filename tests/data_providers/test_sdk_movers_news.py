@@ -89,3 +89,28 @@ def test_cli_min_price_flag():
     from trader.mmr_cli import build_parser
     assert build_parser().parse_args(['movers', '--min-price', '0']).min_price == 0.0
     assert build_parser().parse_args(['movers']).min_price == 1.0
+
+
+def _detail_row(ticker, volume):
+    return {'ticker': ticker, 'close': 300.0, 'open': None, 'change': 3.0, 'change_pct': 1.0, 'volume': volume,
+            'details': {'name': 'Apple Inc.'}, 'ratios': {}, 'news': {}}
+
+
+def _printed_movers_detail(*rows):
+    from argparse import Namespace
+    from trader.mmr_cli import _print_movers, console
+    mmr = MagicMock()
+    mmr.movers_detail.return_value = list(rows)
+    args = Namespace(detail=True, num=5, min_price=1.0)
+    with console.capture() as capture:
+        _print_movers(mmr, args, 'stocks', 'gainers', 'alpaca')
+    return capture.get()
+
+
+def test_movers_detail_omits_volume_when_unknown():
+    for unknown in (None, float('nan')):
+        assert 'vol' not in _printed_movers_detail(_detail_row('AAPL', unknown))
+
+
+def test_movers_detail_shows_known_volume():
+    assert 'vol 1,000' in _printed_movers_detail(_detail_row('AAPL', 1000.0))

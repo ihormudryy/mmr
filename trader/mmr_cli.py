@@ -10507,7 +10507,7 @@ def _print_movers(mmr: MMR, args: argparse.Namespace, market: str, direction: st
         change = m.get('change', 0) or 0
         change_pct = m.get('change_pct', 0) or 0
         close = m.get('close', 0) or 0
-        volume = m.get('volume', 0) or 0
+        volume = m.get('volume')
         mkt_cap = details.get('market_cap')
 
         color = 'green' if change >= 0 else 'red'
@@ -10527,7 +10527,9 @@ def _print_movers(mmr: MMR, args: argparse.Namespace, market: str, direction: st
             console.print(f'[dim]{name}[/dim]')
 
         # Stats line: volume, market cap, ratios
-        stats = [f'vol {volume:,.0f}']
+        stats = []
+        if volume is not None and volume == volume:
+            stats.append(f'vol {volume:,.0f}')
         if mkt_cap:
             if mkt_cap >= 1e12:
                 stats.append(f'cap ${mkt_cap/1e12:.1f}T')
@@ -10539,7 +10541,8 @@ def _print_movers(mmr: MMR, args: argparse.Namespace, market: str, direction: st
             val = ratios.get(label)
             if val is not None:
                 stats.append(f'{label.upper()} {val:g}')
-        console.print(f'[dim]{" | ".join(stats)}[/dim]')
+        if stats:
+            console.print(f'[dim]{" | ".join(stats)}[/dim]')
 
         # News line
         headline = news.get('headline')

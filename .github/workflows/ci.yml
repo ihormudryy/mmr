@@ -10,8 +10,8 @@ jobs:
     name: Test suite (Python 3.12.13)
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-      - uses: astral-sh/setup-uv@v6
+      - uses: actions/checkout@v7
+      - uses: astral-sh/setup-uv@v7
       - run: uv python install 3.12.13
       - run: uv sync --python 3.12.13 --frozen --extra test
       - run: uv run --frozen python -c 'import platform; assert platform.python_version() == "3.12.13"'
@@ -21,8 +21,8 @@ jobs:
     name: Async IB reactive (quarantined, required)
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-      - uses: astral-sh/setup-uv@v6
+      - uses: actions/checkout@v7
+      - uses: astral-sh/setup-uv@v7
       - run: uv python install 3.12.13
       - run: uv sync --python 3.12.13 --frozen --extra test
       - run: uv run --frozen python -c 'import platform; assert platform.python_version() == "3.12.13"'
@@ -41,7 +41,7 @@ jobs:
     name: Full-stack process-supervision gate (test profile, fake broker)
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - name: Provision ~/.config/mmr for a fresh runner (config + HMAC key)
         # Compose bind-mounts ${HOME}/.config/mmr into every service's
         # /home/trader/.config/mmr, SHADOWING the Dockerfile's baked-in

@@ -76,6 +76,16 @@ service when you need a shell outside the default trader service.
 Split services run immutable, read-only images. `-s` and `-a` are retired;
 rebuild and recreate with `./docker.sh -b -u` after code changes.
 
+### Prebuilt Image
+
+Each [release](https://github.com/ihormudryy/mmr/releases) publishes the shared MMR image to GitHub Container Registry for `linux/amd64` and `linux/arm64`. To skip the local build, pull it and tag it as the image Compose expects:
+
+```bash
+docker pull ghcr.io/ihormudryy/mmr:latest      # or a version, e.g. :0.1.0
+docker tag ghcr.io/ihormudryy/mmr:latest mmr:latest
+./docker.sh -u
+```
+
 ### Local Install (No Docker)
 
 ```bash

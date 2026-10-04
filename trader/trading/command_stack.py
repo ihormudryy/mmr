@@ -483,6 +483,10 @@ def _build_automated_intent_service(
     account_mode: str,
     now: Callable[[], dt.datetime],
     schedule_reconcile: Optional[Callable[[str], None]],
+    broker: Any,
+    quotes: Any,
+    margin: Any,
+    policy: CommandAuthorityPolicy,
 ) -> Optional[Any]:
     """Build ``AutomatedIntentCommandService`` for paper automation only.
 
@@ -491,7 +495,6 @@ def _build_automated_intent_service(
     Returns ``None`` when dormant so ``execute_automated_intent`` is never
     registered.
     """
-    from types import SimpleNamespace
     import os as _os
     from pathlib import Path as _Path
 
@@ -516,6 +519,8 @@ def _build_automated_intent_service(
 
     from trader.automation.artifact_verifier import ArtifactVerifier
     from trader.automation.automated_intent_command import AutomatedIntentCommandService
+    from trader.automation.production_evidence import ProductionAutomationEvidence
+    from trader.automation.paper_materials import require_qualified_research_evidence
 
     public_keys = _load_canary_public_keys(key_ring)
     if not public_keys:
@@ -525,34 +530,13 @@ def _build_automated_intent_service(
         )
     verifier = ArtifactVerifier(trusted_public_keys=public_keys)
     root = _Path(_os.path.abspath(_os.path.expanduser(bundle_path)))
-    bundle_root = root.parent if root.name.startswith("artifact-") else root
-
-    def approval_factory(*, intent, command):
-        from trader.data.broker_state import BrokerRiskSnapshot
-        from trader.trading.approval_context import (
-            ApprovalContext, ExecutableMarketEvidence,
-        )
-        from trader.trading.command_coordinator import RiskDirection
-        from trader.trading.proposal_command_service import ExecutableQuote
-
-        quote = ExecutableQuote(
-            conid=intent.conid, side=intent.side, price=0.0,
-            market_timestamp=now(), feed_type="realtime", session_state="open",
-            bid=0.0, ask=0.0,
-        )
-        snap = BrokerRiskSnapshot(
-            generation_id=0, source_cursor=0, promoted_at=now(),
-            account_id=account_id, account_mode=account_mode,
-            net_liquidation=0.0, daily_pnl=0.0, positions=(), working_orders=(),
-        )
-        return ApprovalContext(
-            conid=intent.conid, side=intent.side, quantity=0.0,
-            reference_price=0.0, max_drift_bps=50.0,
-            risk_direction=RiskDirection.INCREASING,
-            broker=snap,
-            market=ExecutableMarketEvidence(quote=quote, received_at=now()),
-            what_if=None,
-        )
+    evidence = ProductionAutomationEvidence(
+        broker=broker, quotes=quotes, margin=margin,
+        history=getattr(trader, "data", None), journal=journal,
+        account_id=account_id, account_mode=account_mode,
+        strategy_id=getattr(trader, "automation_strategy_name", None),
+        max_drift_bps=policy.max_drift_bps, now=now,
+    )
 
     return AutomatedIntentCommandService(
         ledger=ledger,
@@ -564,22 +548,15 @@ def _build_automated_intent_service(
         account_id=account_id,
         account_mode=account_mode,
         now=now,
-        bundle_root=bundle_root,
+        bundle_root=root.parent,
+        configured_bundle_path=root,
+        expected_artifact_id=expected_id,
+        bundle_evidence_validator=require_qualified_research_evidence,
         schedule_reconcile=schedule_reconcile,
         protective_saga=protective_order_saga,
-        approval_factory=approval_factory,
-        session_state_factory=lambda **_kw: SimpleNamespace(
-            state="OPEN",
-            entry_cutoff_reached=False,
-            high_water_mark=None,
-            expected_account_id=account_id,
-            liquidity=None,
-        ),
-        allocation_factory=lambda **_kw: SimpleNamespace(
-            max_gross_allocation=0.06,
-            strategy_allocation=0.06,
-            max_gross_fraction=0.06,
-        ),
+        approval_factory=evidence.approval_factory,
+        session_state_factory=evidence.session_state_factory,
+        allocation_factory=evidence.allocation_factory,
     )
 
 
@@ -987,6 +964,7 @@ def build_command_stack(
 
     automated_intent_service = _build_automated_intent_service(
         trader,
+        broker=broker_snapshot, quotes=quotes, margin=margin, policy=policy,
         ledger=ledger,
         audit=CommandAudit(journal),
         journal=journal,
@@ -1057,6 +1035,7 @@ def build_command_stack(
     def _build_intent_for_hot_arm(trader_obj: Any):
         return _build_automated_intent_service(
             trader_obj,
+            broker=broker_snapshot, quotes=quotes, margin=margin, policy=policy,
             ledger=ledger,
             audit=CommandAudit(journal),
             journal=journal,

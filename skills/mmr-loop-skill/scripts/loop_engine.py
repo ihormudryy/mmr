@@ -1,15 +1,8 @@
-"""MMR Trading Loop Engine — autonomous trading state machine for LLMVM.
+"""MMR Trading Loop Engine — proposal-only monitoring loop for LLMVM.
 
 This module provides the TradingLoop class which registers hooks into the
-LLMVM runtime to create a continuous PRE-FLIGHT → MONITOR → ANALYZE →
-PROPOSE → [paper: EVALUATE → APPROVE|REJECT] → DIGEST trading cycle.
-
-Paper-mode cycles include the EVALUATE & DECIDE phase: every proposal the
-loop creates is evaluated (proposal_show + portfolio_risk — enforced by
-MMRHelpers.approve's CHECKLIST_INCOMPLETE gate) and then explicitly approved
-or rejected, never left to expire unattended. On live the phase is skipped —
-a human approves in the Command Center (the server refuses SDK/LLM approve
-with LLM_LIVE_APPROVE_FORBIDDEN).
+LLMVM runtime to create a continuous MONITOR → ANALYZE → PROPOSE → DIGEST
+trading cycle. Auto-approval and broker execution are not supported here.
 
 Requires the 'mmr' skill to be loaded first (provides MMRHelpers).
 """
@@ -35,7 +28,6 @@ DEFAULT_CONFIG = {
     "scan_presets": ["momentum", "mean-reversion", "breakout", "volatile", "gap-down"],
     "scan_num": 10,                     # ideas per scan
     "max_proposals_per_cycle": 2,       # max proposals created per cycle
-    "max_decisions_per_cycle": 4,       # max approve/reject decisions per cycle (paper)
 
     # Thresholds for triggering analysis
     "position_move_pct": 0.015,         # 1.5% move triggers deeper analysis
@@ -47,7 +39,7 @@ DEFAULT_CONFIG = {
     # HHI ceiling: above this the cycle must not add to existing concentrated
     # names — diversify or do nothing.
     "risk_hhi_warning": 0.15,
-    "auto_approve": False,              # NEVER auto-approve by default
+    "auto_approve": False,              # Reserved: auto-approval is unsupported
 
     # Protective exit attached to every loop-created BUY proposal (percent
     # trailing stop; 0/None disables — not recommended unattended).
@@ -69,7 +61,7 @@ DEFAULT_CONFIG = {
 
 
 class TradingLoop:
-    """Autonomous trading loop state machine.
+    """Proposal-only trading loop state machine.
 
     Usage in LLMVM:
         await load_skill("mmr-skill", "all")
@@ -92,8 +84,24 @@ class TradingLoop:
     }
 
     @classmethod
+    async def _validate_proposal_only(cls):
+        """Refuse unsupported approval mode, stopping any active loop.
+
+        Recheck the mutable config at startup and runtime await boundaries.
+        This guards this helper only, not other tools in the LLMVM session.
+        """
+        if cls.config.get("auto_approve", False):
+            if cls._state["running"]:
+                await cls.stop()
+            raise ValueError(
+                "auto_approve is unsupported: this helper is proposal-only. "
+                "Set auto_approve=False; proposals require explicit user approval."
+            )
+
+    @classmethod
     async def start(cls):
         """Start the trading loop by registering hooks."""
+        await cls._validate_proposal_only()
         if cls._state["running"]:
             print("Trading loop is already running.")
             return
@@ -160,6 +168,8 @@ class TradingLoop:
         if not cls._state["running"]:
             return HookResult()
 
+        await cls._validate_proposal_only()
+
         # If the user typed something (interrupt + new instruction), let the
         # LLM respond immediately instead of sleeping through it.
         if ctx.messages:
@@ -209,6 +219,7 @@ class TradingLoop:
         if cls._state["tracked_positions"] and monitor_elapsed >= monitor_interval:
             cls._state["last_monitor_time"] = time.time()
             alerts = await cls._check_tracked_positions()
+            await cls._validate_proposal_only()
             if alerts:
                 alert_text = "\n".join(alerts)
                 return HookResult(
@@ -242,6 +253,7 @@ class TradingLoop:
         print("\n".join(parts))
 
         await asyncio.sleep(sleep_time)
+        await cls._validate_proposal_only()
         return HookResult(continue_loop=True)
 
     @classmethod
@@ -252,7 +264,6 @@ class TradingLoop:
         exchange = cls.config.get("exchange", "")
         currency = cls.config.get("currency", "")
         max_proposals = cls.config.get("max_proposals_per_cycle", 2)
-        max_decisions = cls.config.get("max_decisions_per_cycle", 4)
         move_threshold = cls.config.get("position_move_pct", 0.015)
         pnl_brake = cls.config.get("daily_pnl_alert_pct", 0.02)
         hhi_ceiling = cls.config.get("risk_hhi_warning", 0.15)
@@ -278,7 +289,7 @@ else:
     print(f"Connected: {{account}} ({{'PAPER' if is_paper else 'LIVE'}})")
 ```
 
-If pre-flight fails, skip directly to PHASE 5 (DIGEST) with a note about the failure. Do NOT attempt portfolio, snapshot, or trading calls. Remember `is_paper` — it decides PHASE 4.
+If pre-flight fails, skip directly to PHASE 4 (DIGEST) with a note about the failure. Do NOT attempt portfolio, snapshot, or trading calls.
 
 ## PHASE 1: MONITOR
 ```python
@@ -296,9 +307,9 @@ print(hours)
 
 Note: The current date/time is {datetime.now().strftime('%Y-%m-%d %H:%M')} LOCAL. Australia (ASX) is ~14-17 hours AHEAD of US Pacific — if it's Sunday evening in the US, it's Monday in Australia and ASX may be OPEN. Check the market_hours output for actual status.
 
-If ALL positions are unchanged AND no relevant markets are open, skip to PHASE 5 (DIGEST) with "No action — markets closed."
+If ALL positions are unchanged AND no relevant markets are open, skip to PHASE 4 (DIGEST) with "No action — markets closed."
 
-**RISK-OFF brake:** if `risk_off` is True, do NOT create proposals and do NOT approve any new entries this cycle (rejecting and closing remain allowed). Say so in the digest and alert the operator.
+**RISK-OFF brake:** if `risk_off` is True, do NOT create proposals this cycle. Say so in the digest and alert the operator.
 
 If any position moved >{move_threshold:.1%}, note it for deeper analysis.
 
@@ -348,31 +359,13 @@ result = await MMRHelpers.propose(symbol, "BUY", confidence=X,
 Set confidence based on signal strength: scan score 8+/10 → 0.8, 6-8 → 0.6, <6 → skip.
 Include the scan preset and key indicators in reasoning.
 Tag with appropriate group if one exists.
-Record every proposal_id you create — PHASE 4 must decide each one.
+Record every proposal_id you create and list them in the digest — the user approves or rejects them.
 
 Skip PROPOSE entirely if: RISK-OFF, no actionable ideas, at position limit, or risk warnings suggest reducing exposure.
 
-## PHASE 4: EVALUATE & DECIDE (paper only; max {max_decisions} decisions)
-If NOT `is_paper`: skip this phase — on live a human approves in the Command Center (SDK approve is refused with LLM_LIVE_APPROVE_FORBIDDEN). You may still `reject` clearly-invalid pendings with a reason.
-
-If `is_paper`: decide EVERY proposal you created this cycle — never leave your own proposals to expire undecided. For each proposal id, sequentially:
-```python
-detail = await MMRHelpers.proposal_show(pid)   # checklist step 1 (enforced)
-# portfolio_risk() already ran in PHASE 2 — still fresh for the checklist.
-# Decide on the evidence: sizing sane? thesis still holds? no new risk warnings?
-result = await MMRHelpers.approve(pid)          # or: await MMRHelpers.reject(pid, reason="...")
-print(result)
-```
-Decision rules:
-- Approve only when sizing, thesis, and risk all hold — and never new entries while RISK-OFF.
-- Otherwise reject with a one-line reason. Rejecting is always allowed and never gated.
-- Also evaluate up to the remaining decision budget of OLDER pending proposals (e.g. from strategies) the same way.
-- Server refusals are guardrails, not errors — do NOT retry verbatim: QUOTE_STALE (wait for fresher data), PRICE_DRIFT_EXCEEDED (reject, re-propose at current price if still valid), ORDER_NOTIONAL_LIMIT (re-propose smaller), RISK_REJECTED (reduce risk first), CHECKLIST_INCOMPLETE (run the listed steps, then decide).
-- If approve returns UNKNOWN/timed-out: the order MAY be live. Do NOT re-approve — reconcile with `orders()` / `portfolio()` first.
-- After an approved entry fills, consider `track_position(symbol, "LONG", entry, qty)` so the monitor watches it.
 """
 
-        prompt += f"""## PHASE 5: DIGEST
+        prompt += f"""## PHASE 4: DIGEST
 Write a ONE-LINE summary, then compact:
 ```python
 _cycle = {cycle_num}
@@ -530,7 +523,9 @@ async def start_trading_loop(**overrides):
         await start_trading_loop(scan_interval_seconds=300, location="STK.AU.ASX")
     """
     for k, v in overrides.items():
-        if k in TradingLoop.config:
+        # Never discard an explicit approval request, even if the mutable
+        # config no longer contains the reserved key. start() must reject it.
+        if k in TradingLoop.config or k == "auto_approve":
             TradingLoop.config[k] = v
     await TradingLoop.start()
 

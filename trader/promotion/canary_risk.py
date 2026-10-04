@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import datetime as dt
 import hashlib
+import math
 from dataclasses import dataclass
 from decimal import Decimal
 from typing import Callable, Optional, Sequence
@@ -179,14 +180,21 @@ class CanaryRiskStore:
         return float(row[0]) if row else None
 
     def update_high_water_mark(self, value: float, now: dt.datetime) -> float:
-        current = self.get_high_water_mark()
-        new_hwm = max(current or 0.0, value)
+        if not math.isfinite(value) or value <= 0:
+            raise ValueError("high-water-mark observation must be finite and positive")
 
         def work(conn, append):
             existing = conn.execute(
-                "SELECT revision FROM canary_high_water_marks WHERE strategy_id=? AND account_id=?",
+                "SELECT revision, high_water_mark FROM canary_high_water_marks "
+                "WHERE strategy_id=? AND account_id=?",
                 [self.strategy_id, self.account_id],
             ).fetchone()
+            # Read/compare/write under the same journal transaction. A prior
+            # unlocked read can otherwise overwrite a competing higher peak.
+            current = float(existing[1]) if existing is not None else 0.0
+            if existing is not None and (not math.isfinite(current) or current <= 0):
+                raise ValueError("persisted high-water-mark must be finite and positive")
+            new_hwm = max(current, value)
             changed = False
             if existing is None:
                 conn.execute(
@@ -214,14 +222,15 @@ class CanaryRiskStore:
                     account_id=self.account_id,
                     source="trader_service",
                     source_timestamp=now,
-                    correlation_id=f"hwm:{self.strategy_id}:{revision}",
+                    correlation_id=f"hwm:{self.strategy_id}:{self.account_id}:{revision}",
                     payload={
                         "strategy_id": self.strategy_id,
                         "high_water_mark": new_hwm,
                         "revision": revision,
                     },
                 )
-                append(mutation, lambda _c, _r: None, f"hwm:{self.strategy_id}:{revision}")
+                append(mutation, lambda _c, _r: None,
+                       f"hwm:{self.strategy_id}:{self.account_id}:{revision}")
             return new_hwm
 
         return self.journal.mutate_batch_work(self.journal.connect(), work)

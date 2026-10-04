@@ -3,7 +3,6 @@ from __future__ import annotations
 
 import datetime as dt
 from pathlib import Path
-from unittest.mock import patch
 
 import pytest
 import yaml
@@ -75,10 +74,86 @@ def _service(
     )
 
 
-def _fake_export(*, signer, artifacts_root: Path) -> str:
-    del signer
-    (artifacts_root / ARTIFACT_ID).mkdir(parents=True, exist_ok=True)
-    return ARTIFACT_ID
+def _configured_service(tmp_path, **bundle_kwargs):
+    # Synthetic TEST data representing a pre-existing offline research export.
+    # Production activation must only read it, never mint or alter evidence.
+    from .paper_evidence_helpers import research_bundle
+
+    bundle_path, key_ring = research_bundle(tmp_path, **bundle_kwargs)
+    service = _service(
+        tmp_path,
+        automation={
+            "enabled": False, "live_enabled": False,
+            "artifact_bundle_path": str(bundle_path),
+            "public_key_ring_path": str(key_ring),
+            "expected_artifact_id": bundle_path.name, "strategy_name": "orb_gld",
+        },
+        strategies=[{
+            "name": "orb_gld", "module": "strategies/orb.py",
+            "class_name": "OpeningRangeBreakout", "params": {"minutes": 30},
+        }],
+    )
+    return service, bundle_path, key_ring
+
+
+@pytest.mark.parametrize("hot_arm", [False, True])
+def test_activation_consumes_existing_evidence_without_signing_key(tmp_path, hot_arm):
+    from trader.automation.paper_hot_arm import RecordingHotArmPorts
+
+    service, bundle_path, key_ring = _configured_service(tmp_path)
+    if hot_arm:
+        service._hot_arm = RecordingHotArmPorts()
+    before = {p: p.read_bytes() for p in bundle_path.iterdir()}
+
+    result = service.activate(strategy_name="orb_gld", reason="reviewed offline")
+
+    assert result["artifact_bundle_path"] == str(bundle_path)
+    assert result["artifact_id"] == bundle_path.name
+    assert result["public_key_ring_path"] == str(key_ring)
+    assert result["lifecycle"] == ("armed" if hot_arm else "restart_required")
+    assert {p: p.read_bytes() for p in before} == before
+    assert not (tmp_path / "config" / "keys").exists()
+    assert not (tmp_path / "share").exists()
+
+
+@pytest.mark.parametrize("hot_arm", [False, True])
+def test_activation_without_research_evidence_has_no_side_effects(tmp_path, hot_arm):
+    from trader.automation.paper_hot_arm import RecordingHotArmPorts
+
+    service = _service(tmp_path)
+    ports = RecordingHotArmPorts()
+    if hot_arm:
+        service._hot_arm = ports
+    before = {p: p.read_bytes() for p in (tmp_path / "config").glob("*.yaml")}
+
+    with pytest.raises(PaperAutomationActivationError) as exc:
+        service.activate(strategy_name="orb_gld", reason="not research evidence")
+
+    assert exc.value.code == "RESEARCH_EVIDENCE_REQUIRED"
+    assert {p: p.read_bytes() for p in before} == before
+    assert not (tmp_path / "config" / "keys").exists()
+    assert not (tmp_path / "share").exists()
+    assert ports.calls == []
+
+
+@pytest.mark.parametrize("change", [
+    {"module": "strategies/other.py"},
+    {"class_name": "OtherStrategy"},
+    {"params": {"minutes": 15}},
+    {"params": {"minutes": 30, "unresearched_override": True}},
+])
+def test_activation_rejects_strategy_not_bound_to_research(tmp_path, change):
+    service, _, _ = _configured_service(tmp_path)
+    path = tmp_path / "config" / "strategy_runtime.yaml"
+    data = yaml.safe_load(path.read_text())
+    data["strategies"][0].update(change)
+    _write_yaml(path, data)
+
+    with pytest.raises(PaperAutomationActivationError) as exc:
+        service.activate(strategy_name="orb_gld", reason="wrong strategy")
+
+    assert exc.value.code == "RESEARCH_EVIDENCE_INVALID"
+    assert yaml.safe_load((tmp_path / "config" / "trader.yaml").read_text())["automation"]["enabled"] is False
 
 
 def test_activate_refuses_without_command_authority(tmp_path: Path) -> None:
@@ -88,6 +163,40 @@ def test_activate_refuses_without_command_authority(tmp_path: Path) -> None:
         service.activate(strategy_name="orb_gld", reason="operator approved")
 
     assert exc.value.code == "COMMAND_AUTHORITY_REQUIRED"
+
+
+@pytest.mark.parametrize("failure", ["tampered", "untrusted", "expired", "malformed_key", "legacy_fixture"])
+@pytest.mark.parametrize("hot_arm", [False, True])
+def test_invalid_research_never_persists_or_commits(tmp_path, failure, hot_arm):
+    from trader.automation.paper_hot_arm import RecordingHotArmPorts
+    from trader.research.signing import AttestationSigner
+
+    service, bundle, keys = _configured_service(
+        tmp_path, **({"reviewer": "bootstrap"} if failure == "legacy_fixture" else {}),
+    )
+    ports = RecordingHotArmPorts()
+    if hot_arm:
+        service._hot_arm = ports
+    if failure == "tampered":
+        target = bundle / "trials.json"
+        target.chmod(0o644)
+        target.write_text("[]")
+        target.chmod(0o444)
+    elif failure == "untrusted":
+        (keys / "research.pem").write_bytes(AttestationSigner.generate().public_key_pem())
+    elif failure == "malformed_key":
+        (keys / "research.pem").write_text("not a public key")
+    elif failure == "expired":
+        service._now = lambda: NOW + dt.timedelta(days=100)
+    before = {p: p.read_bytes() for p in (tmp_path / "config").glob("*.yaml")}
+
+    with pytest.raises(PaperAutomationActivationError) as exc:
+        service.activate(strategy_name="orb_gld", reason="invalid evidence")
+
+    assert exc.value.code == "RESEARCH_EVIDENCE_INVALID"
+    assert ports.calls == []
+    assert {p: p.read_bytes() for p in before} == before
+    assert not (tmp_path / "config" / "keys").exists()
 
 
 def test_activate_refuses_strategy_with_propose_mode(tmp_path: Path) -> None:
@@ -187,13 +296,8 @@ def test_activate_logs_redacted_diff_shape(tmp_path: Path, caplog) -> None:
     import logging
 
     caplog.set_level(logging.INFO)
-    service = _service(tmp_path)
-
-    with patch(
-        "trader.automation.paper_activation.export_fixture_paper_eligible_bundle",
-        _fake_export,
-    ):
-        service.activate(strategy_name="orb_gld", reason="operator approved")
+    service, _, _ = _configured_service(tmp_path)
+    service.activate(strategy_name="orb_gld", reason="operator approved")
 
     assert any("diff=" in record.message for record in caplog.records)
     log_text = " ".join(record.message for record in caplog.records)
@@ -204,27 +308,20 @@ def test_activate_logs_redacted_diff_shape(tmp_path: Path, caplog) -> None:
 def test_activate_writes_atomic_yaml_and_returns_restart_required(
     tmp_path: Path,
 ) -> None:
-    service = _service(tmp_path)
-
-    with patch(
-        "trader.automation.paper_activation.export_fixture_paper_eligible_bundle",
-        _fake_export,
-    ):
-        result = service.activate(
-            strategy_name="orb_gld",
-            reason="operator approved paper activation",
-        )
+    service, bundle_path, key_ring = _configured_service(tmp_path)
+    result = service.activate(
+        strategy_name="orb_gld", reason="operator approved paper activation",
+    )
 
     config_dir = tmp_path / "config"
-    bundle_path = tmp_path / "share" / "artifacts" / ARTIFACT_ID
     assert result == {
         "lifecycle": "restart_required",
         "strategy_name": "orb_gld",
-        "artifact_id": ARTIFACT_ID,
+        "artifact_id": bundle_path.name,
         "artifact_bundle_path": str(bundle_path),
-        "public_key_ring_path": str(config_dir / "keys" / "verify"),
+        "public_key_ring_path": str(key_ring),
         "restart_required": True,
-        "reused_existing_keys": False,
+        "reused_existing_keys": True,
     }
 
     trader_data = yaml.safe_load((config_dir / "trader.yaml").read_text())
@@ -233,15 +330,15 @@ def test_activate_writes_atomic_yaml_and_returns_restart_required(
         "enabled": True,
         "live_enabled": False,
         "artifact_bundle_path": str(bundle_path),
-        "public_key_ring_path": str(config_dir / "keys" / "verify"),
-        "expected_artifact_id": ARTIFACT_ID,
+        "public_key_ring_path": str(key_ring),
+        "expected_artifact_id": bundle_path.name,
         "strategy_name": "orb_gld",
     }
     strategy_data = yaml.safe_load(
         (config_dir / "strategy_runtime.yaml").read_text()
     )
     strategy = strategy_data["strategies"][0]
-    assert strategy["params"]["RANGE_MINUTES"] == 45
+    assert strategy["params"]["minutes"] == 30
     assert strategy["params"]["artifact_bundle_path"] == str(bundle_path)
     assert "auto_execute" not in strategy
     assert not (config_dir / "trader.yaml.tmp").exists()
@@ -255,27 +352,19 @@ def test_activate_writes_atomic_yaml_and_returns_restart_required(
     assert status.armed_unpersisted is False
 
 
-def test_activate_reuses_existing_signing_keys(tmp_path: Path) -> None:
-    service = _service(tmp_path)
-    with patch(
-        "trader.automation.paper_activation.export_fixture_paper_eligible_bundle",
-        _fake_export,
-    ):
-        first = service.activate(strategy_name="orb_gld", reason="first")
+def test_activate_reuses_existing_public_keys(tmp_path: Path) -> None:
+    service, _, key_ring = _configured_service(tmp_path)
+    before = (key_ring / "research.pem").read_bytes()
+    first = service.activate(strategy_name="orb_gld", reason="first")
+    second = service.activate(strategy_name="orb_gld", reason="retry")
 
-    service = _service(tmp_path)
-    with patch(
-        "trader.automation.paper_activation.export_fixture_paper_eligible_bundle",
-        _fake_export,
-    ):
-        second = service.activate(strategy_name="orb_gld", reason="retry")
-
-    assert first["reused_existing_keys"] is False
+    assert first["reused_existing_keys"] is True
     assert second["reused_existing_keys"] is True
+    assert (key_ring / "research.pem").read_bytes() == before
 
 
 def test_activate_deactivate_activate_reuses_materials(tmp_path: Path) -> None:
-    service = _service(tmp_path)
+    service, bundle_path, _ = _configured_service(tmp_path)
 
     first = service.activate(strategy_name="orb_gld", reason="first activation")
     service.deactivate(reason="operator paused")
@@ -284,7 +373,7 @@ def test_activate_deactivate_activate_reuses_materials(tmp_path: Path) -> None:
     assert first["artifact_id"] == second["artifact_id"]
     assert first["artifact_bundle_path"] == second["artifact_bundle_path"]
     assert second["reused_existing_keys"] is True
-    assert len(list((tmp_path / "share" / "artifacts").iterdir())) == 1
+    assert len(list(bundle_path.parent.iterdir())) == 1
 
 
 def test_deactivate_clears_enabled_and_requires_restart(tmp_path: Path) -> None:

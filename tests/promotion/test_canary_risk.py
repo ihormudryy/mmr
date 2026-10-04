@@ -234,6 +234,53 @@ class TestResponseOrdering:
         )
 
 
+def test_competing_higher_equity_cannot_be_overwritten_by_stale_read(tmp_path, monkeypatch):
+    _, journal = _db(tmp_path)
+    store = CanaryRiskStore(journal, STRATEGY, ACCOUNT)
+    store.update_high_water_mark(100_000.0, NOW)
+    original = journal.mutate_batch_work
+
+    def competing_write(conn, work):
+        monkeypatch.setattr(journal, "mutate_batch_work", original)
+        # A second writer commits after the first writer starts but before its
+        # transaction: no threads/timing flakiness, real journal and database.
+        CanaryRiskStore(journal, STRATEGY, ACCOUNT).update_high_water_mark(150_000.0, NOW)
+        return original(conn, work)
+
+    monkeypatch.setattr(journal, "mutate_batch_work", competing_write)
+    assert store.update_high_water_mark(125_000.0, NOW) == 150_000.0
+    assert CanaryRiskStore(journal, STRATEGY, ACCOUNT).get_high_water_mark() == 150_000.0
+
+
+@pytest.mark.parametrize("value", [float("nan"), float("inf"), -1.0, 0.0])
+def test_hwm_rejects_nonfinite_or_nonpositive_observation(tmp_path, value):
+    _, journal = _db(tmp_path)
+    store = CanaryRiskStore(journal, STRATEGY, ACCOUNT)
+    with pytest.raises(ValueError, match="high.water.mark"):
+        store.update_high_water_mark(value, NOW)
+    assert store.get_high_water_mark() is None
+
+
+@pytest.mark.parametrize("value", [float("nan"), float("inf"), -1.0, 0.0])
+def test_hwm_rejects_corrupted_persisted_peak(tmp_path, value):
+    _, journal = _db(tmp_path)
+    store = CanaryRiskStore(journal, STRATEGY, ACCOUNT)
+    store.update_high_water_mark(100_000.0, NOW)
+    journal.connect().execute("UPDATE canary_high_water_marks SET high_water_mark=?", [value])
+    with pytest.raises(ValueError, match="high.water.mark"):
+        store.update_high_water_mark(110_000.0, NOW)
+
+
+def test_same_strategy_revision_is_independent_for_each_account(tmp_path):
+    _, journal = _db(tmp_path)
+    first = CanaryRiskStore(journal, STRATEGY, "DU111")
+    second = CanaryRiskStore(journal, STRATEGY, "DU222")
+    assert first.update_high_water_mark(100_000.0, NOW) == 100_000.0
+    assert second.update_high_water_mark(200_000.0, NOW) == 200_000.0
+    assert first.get_high_water_mark() == 100_000.0
+    assert second.get_high_water_mark() == 200_000.0
+
+
 class TestBreakerResetPolicy:
     def test_daily_loss_reset_blocked_same_session(self, tmp_path):
         _, journal = _db(tmp_path)

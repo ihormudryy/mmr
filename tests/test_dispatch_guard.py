@@ -204,6 +204,21 @@ def test_paper_missing_what_if_is_explicitly_recorded_not_zero_filled():
 
 
 @pytest.mark.parametrize(
+    ("quote", "code"),
+    [
+        (_quote(age=6), "QUOTE_STALE"),
+        (_quote(feed="delayed"), "FEED_NOT_LIVE"),
+        (_quote(state="halted"), "SESSION_INCOMPATIBLE"),
+    ],
+)
+def test_paper_automation_rechecks_market_readiness_at_dispatch(quote, code):
+    request = replace(_request(), action="execute_automated_intent", source="strategy_service")
+    with pytest.raises(DispatchGuardError) as error:
+        _guard(mode="paper", quote=quote).revalidate(_approved(), request, NOW)
+    assert error.value.code == code
+
+
+@pytest.mark.parametrize(
     ("snapshot", "code"),
     [
         (_snapshot(generation=1, cursor=20), "GENERATION_REGRESSION"),

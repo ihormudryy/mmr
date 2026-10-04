@@ -1,4 +1,4 @@
-"""Shared paper automation keygen + fixture PAPER_ELIGIBLE bundle export."""
+"""Public research verification and explicitly offline, non-authorizing fixtures."""
 from __future__ import annotations
 
 import datetime as dt
@@ -9,12 +9,13 @@ import stat
 import tempfile
 from pathlib import Path
 
+from trader.automation.artifact_verifier import ArtifactVerifier, ArtifactVerifierError, VerifiedArtifact
 from trader.data.duckdb_store import DuckDBConnection
 from trader.data.schema_migrations import SchemaMigrator
 from trader.research.artifact import ExperimentFamily, TRIAL_FAILED, TRIAL_SUCCEEDED
 from trader.research.attestation import AttestationRepository, build_attestation
 from trader.research.bundle import ResearchBundle
-from trader.research.canonical import sha256_digest
+from trader.research.canonical import canonical_json_bytes, sha256_digest
 from trader.research.eligibility import (
     EligibilityDecisionRepository,
     EligibilityEvidence,
@@ -26,7 +27,10 @@ from trader.research.rulesets.paper_v1 import PAPER_V1
 from trader.research.schema import apply_research_migrations
 from trader.research.signing import (
     AttestationSigner,
+    InvalidKeyType,
+    MalformedKey,
     generate_private_key_pem,
+    load_verify_key,
 )
 
 UTC = dt.timezone.utc
@@ -35,6 +39,67 @@ T0 = dt.datetime(2026, 7, 18, 12, 0, tzinfo=UTC)
 
 class PaperMaterialsError(Exception):
     """Raised when paper automation key/bundle material setup fails."""
+
+
+def verify_qualified_paper_bundle(
+    *,
+    bundle_path: Path,
+    public_key_ring_path: Path,
+    expected_artifact_id: str,
+    now: dt.datetime,
+    revoked_digests: frozenset[str] = frozenset(),
+    strategy: dict | None = None,
+) -> VerifiedArtifact:
+    """Read existing offline evidence using public keys only; never mint it."""
+    try:
+        keys = [load_verify_key(str(path)) for path in sorted(public_key_ring_path.glob("*.pem"))]
+        verified = ArtifactVerifier(keys).verify(
+            bundle_path, expected_mode="paper", expected_artifact_id=expected_artifact_id,
+            now=now, revoked_digests=revoked_digests,
+        )
+        require_qualified_research_evidence(bundle_path)
+        if strategy is not None:
+            family = json.loads((bundle_path / "family.json").read_text())
+            params = dict(strategy.get("params") or {})
+            params.pop("artifact_bundle_path", None)  # transport binding, not a strategy parameter
+            if (
+                strategy.get("module") != family["strategy_path"]
+                or strategy.get("class_name") != family["class_name"]
+                or canonical_json_bytes(params) != canonical_json_bytes(verified.parameters)
+            ):
+                raise PaperMaterialsError("strategy module, class or parameters do not match research artifact")
+        return verified
+    except (ArtifactVerifierError, InvalidKeyType, MalformedKey, OSError, ValueError, TypeError) as exc:
+        raise PaperMaterialsError(f"research evidence verification failed: {exc}") from exc
+
+
+def require_qualified_research_evidence(bundle_path: Path) -> None:
+    """Reject drill provenance AFTER full bundle/signature verification.
+
+    This is an additional gate for activation, cold start and dispatch, not a
+    replacement for ArtifactVerifier. Signatures establish integrity, not that
+    an experiment was measured. Operators must audit the offline evidence.
+    """
+    try:
+        family = json.loads((bundle_path / "family.json").read_text())
+        review = json.loads((bundle_path / "review.json").read_text())
+        decision = json.loads((bundle_path / "decision.json").read_text())
+        if (
+            review["reviewer"] == "bootstrap"  # pre-separation fixture bundles
+            or family["validation_protocol"].get("evidence_kind") == "offline_fixture"
+        ):
+            raise PaperMaterialsError("offline fixture is not qualified research or promotion evidence")
+        results = decision["results"]
+        if (
+            decision["state"] != "PAPER_ELIGIBLE"
+            or decision["passed"] is not True
+            or decision["ruleset_digest"] != PAPER_V1.digest
+            or len(results) != len(PAPER_V1.rules)
+            or {result["code"] for result in results} != {rule.code for rule in PAPER_V1.rules}
+        ):
+            raise PaperMaterialsError("complete passing paper-v1 quantitative research evidence required")
+    except (OSError, ValueError, KeyError, TypeError) as exc:
+        raise PaperMaterialsError(f"invalid research provenance: {exc}") from exc
 
 
 def default_key_paths(config_dir: Path) -> tuple[Path, Path, Path]:
@@ -77,21 +142,6 @@ def read_allocation_binding_hints(bundle_path: Path | str) -> dict[str, str]:
         if text:
             hints[key] = text
     return hints
-
-
-def _evidence() -> EligibilityEvidence:
-    return EligibilityEvidence(
-        n_round_trips=250, n_instruments=10, expectancy_bps_baseline=5.0,
-        expectancy_bps_1_5x=3.0, expectancy_bps_2x=1.0,
-        selection_adjusted_confidence=0.97, annualized_sharpe_ci_low=0.5,
-        profit_factor=1.5, walk_forward_positive_fraction=0.7,
-        max_month_profit_share=0.25, max_instrument_profit_share=0.30,
-        scaled_holdout_drawdown=-0.02, neighborhood_robust=True,
-        order_within_envelope=True, deterministic_replay_ok=True,
-        holdout_opened_once=True, benchmark_drawdown_ratio=0.40,
-        eligible_regime_positive_fraction=0.80, worst_eligible_regime_loss=-0.05,
-        regime_transitions_stable=True,
-    )
 
 
 def _write_private_key(path: Path, *, force: bool) -> None:
@@ -169,7 +219,7 @@ def _try_reuse_existing_fixture_bundle(
         return False
     if attestation.get("public_key_id") != signer.public_key_id:
         return False
-    if attestation.get("eligibility_state") != "PAPER_ELIGIBLE":
+    if attestation.get("eligibility_state") != "CANDIDATE":
         return False
     if manifest.get("artifact_id") != expected_artifact_id:
         return False
@@ -185,8 +235,15 @@ def export_fixture_paper_eligible_bundle(
     *,
     signer: AttestationSigner,
     artifacts_root: Path,
+    offline_fixture: bool = False,
 ) -> str:
-    """Build a fixture PAPER_ELIGIBLE research DB and export the signed bundle."""
+    """Export a non-authorizing offline fixture (historical API name).
+
+    The bundle is CANDIDATE / permitted_account_mode=none, never PAPER_ELIGIBLE.
+    It exercises export/verification plumbing, not qualification or promotion.
+    """
+    if offline_fixture is not True:
+        raise PaperMaterialsError("fixture export requires offline_fixture=True; never use for qualification")
     with tempfile.TemporaryDirectory(prefix="mmr-bootstrap-research-") as tmp:
         db = DuckDBConnection.get_instance(str(Path(tmp) / "research.duckdb"))
         apply_research_migrations(SchemaMigrator(db))
@@ -201,7 +258,9 @@ def export_fixture_paper_eligible_bundle(
             dataset_manifest_digest="dataset-1",
             search_space={"minutes": [15, 30]},
             cost_model={"slippage_bps": 2.0},
-            validation_protocol={"holdout": "2025-01-01/2025-12-31"},
+            validation_protocol={
+                "holdout": "2025-01-01/2025-12-31", "evidence_kind": "offline_fixture",
+            },
         )
         validation_folds = (
             {"kind": "walk_forward", "test": "2024"},
@@ -230,7 +289,8 @@ def export_fixture_paper_eligible_bundle(
             selected_parameters={"minutes": 30}, sealed_at=T0,
         )
         registry.open_holdout(artifact_id, opened_at=T0, passed=True, detail="passed")
-        decision = evaluate_eligibility(PAPER_V1, _evidence())
+        # No measured metrics exist. Missing evidence must fail every gate.
+        decision = evaluate_eligibility(PAPER_V1, EligibilityEvidence())
         EligibilityDecisionRepository(db).record(
             decision, artifact_id=artifact_id, recorded_at=T0,
         )
@@ -284,6 +344,7 @@ def export_fixture_paper_eligible_bundle(
             created_at=T0,
             expires_at=T0 + dt.timedelta(days=90),
             operator_approved_at=T0,
+            reason_codes=("offline_fixture_not_for_promotion",),
             evidence_refs=(
                 tuple(decision.evidence_refs)
                 + ((f"bundle_trials:{trial_digest}", f"bundle_folds:{folds_digest}"))
@@ -302,7 +363,7 @@ def export_fixture_paper_eligible_bundle(
                 return artifact_id
             raise PaperMaterialsError(
                 f"artifact directory {export_dir} exists but is not a valid "
-                f"PAPER_ELIGIBLE bundle for public_key_id={signer.public_key_id}"
+                f"offline fixture bundle for public_key_id={signer.public_key_id}"
             )
         try:
             ResearchBundle(db).export(artifact_id, export_dir)

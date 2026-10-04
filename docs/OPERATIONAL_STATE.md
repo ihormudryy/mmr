@@ -77,10 +77,27 @@ orb_rio, orb_fmg, orb_csl, orb_gld (losing), orb_xlk (too much drawdown).
 
 ## Backtest findings (2026-07-04/05, 1yr 1-min)
 
-- **ORB on ASX is marginal universe-wide.** Per-name edge only (BHP, WDS).
-- **US ORB:** GOOGL strong; GLD losing.
-- **VWAP:** CAT only among names tried.
-- Treat return + PF as the reliable metrics until `expectancy_bps` is reconciled.
+- **ORB on ASX is marginal universe-wide.** Top-20 leaderboard: 11/20 positive,
+  median PF 0.89, negative median per-trade expectancy. Only BHP (PF 1.26) and
+  WDS (PF 1.68) have a genuine per-name edge. **Param sweep** (RANGE_MINUTES ×
+  VOLUME_MULT) confirmed the DEFAULTS (30 / 1.5) are already the best combo and
+  still only marginal (medPF 1.075, mean return −0.58%) — **tuning does not
+  rescue ORB on ASX**. Treat ORB-ASX as a per-name edge (BHP, WDS), not a
+  universe strategy.
+- **US ORB:** GOOGL strong (PF 2.45), PLTR/XLK positive, GLD losing.
+- **VWAP:** works on CAT (PF 1.44, +18.9bps); loses on every other US name tried
+  → correctly deployed only on CAT.
+- **Metric interpretation:** `expectancy_bps` equally weights each SELL's net
+  P&L / closed entry notional; PF uses cash P&L sums. Both include allocated
+  entry and exit commissions. Unequal notionals (even with fixed share counts)
+  or partial exits can legitimately produce PF > 1 with negative expectancy;
+  total return also includes unrealized P&L. No calculation defect was
+  reproduced in deterministic regression tests; the historical runs above were
+  not rerun. See [metric semantics and examples](BACKTEST_METRICS.md).
+- **Not done:** statistical-confidence tests (PSR/t-test/bootstrap) — the script
+  hung on MC/bootstrap over large trade sets after ~3 of 6 survivors. Rerun with
+  iteration caps + per-strategy timeouts if wanted. No results saved; nothing
+  relies on partial numbers.
 
 ---
 
@@ -164,3 +181,13 @@ movers filter, crypto movers, history). Weekday intraday movers check: not run
 6. Host monitors: `mmr --json portfolio-snapshot`, `portfolio-diff`, `/cc` Risk bars.
 
 Do not arm a second automatic strategy. Do not set `automation.live_enabled`.
+
+---
+
+## Open items / follow-ups (offline)
+
+- Cluster G (AUDIT_ROADMAP): G1 mass-enable RPC timeout, G2 IB farm-status log noise.
+- Historical `expectancy_bps`/PF disagreements: reconcile original trade traces,
+  entry notionals and partial exits before alleging a calculation defect (see above).
+- Statistical-confidence script needs timeouts/caps before rerun.
+- ORB-ASX: consider a proper train/test split before trusting BHP/WDS edges live.

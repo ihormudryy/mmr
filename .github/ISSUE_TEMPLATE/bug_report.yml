@@ -1,0 +1,77 @@
+name: Bug report
+description: Something in MMR does not work as documented.
+title: "[Bug]: "
+labels: ["bug", "triage"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for the report. **Do not paste IB credentials, API keys, account numbers or `service_hmac.key`.**
+        For a security problem, stop here and follow [SECURITY.md](https://github.com/ihormudryy/mmr/blob/master/SECURITY.md).
+  - type: textarea
+    id: what-happened
+    attributes:
+      label: What happened?
+      description: What you did, what you expected, and what happened instead.
+    validations:
+      required: true
+  - type: textarea
+    id: reproduce
+    attributes:
+      label: Steps to reproduce
+      description: Exact commands, config snippets or strategy code.
+      placeholder: |
+        1. mmr --json propose AAPL BUY --market --quantity 10
+        2. mmr approve 3
+        3. ...
+    validations:
+      required: true
+  - type: input
+    id: version
+    attributes:
+      label: Version or commit
+      description: Release tag or output of `git rev-parse --short HEAD`.
+    validations:
+      required: true
+  - type: dropdown
+    id: deployment
+    attributes:
+      label: Deployment
+      options:
+        - Split Docker (docker.sh)
+        - Local hybrid (start_mmr.sh)
+        - Backtest / CLI only (no services)
+    validations:
+      required: true
+  - type: dropdown
+    id: trading-mode
+    attributes:
+      label: Trading mode
+      options:
+        - Paper
+        - Live
+        - Not relevant
+    validations:
+      required: true
+  - type: dropdown
+    id: data-source
+    attributes:
+      label: Data source involved
+      multiple: true
+      options:
+        - Interactive Brokers
+        - Alpaca
+        - Massive (Polygon.io)
+        - TwelveData
+        - Not relevant
+  - type: input
+    id: environment
+    attributes:
+      label: OS and Python version
+      placeholder: macOS 15, Python 3.12.13
+  - type: textarea
+    id: logs
+    attributes:
+      label: Logs
+      description: Relevant lines from `~/.local/share/mmr/logs/` or the CLI output. Remove secrets first.
+      render: shell

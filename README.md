@@ -9,16 +9,30 @@
 </p>
 
 <p align="center">
-  <img src="https://img.shields.io/badge/python-%3E%3D3.12-blue" alt="Python">
+  <a href="https://github.com/ihormudryy/mmr/actions/workflows/ci.yml"><img src="https://github.com/ihormudryy/mmr/actions/workflows/ci.yml/badge.svg?branch=master" alt="CI"></a>
+  <a href="https://github.com/ihormudryy/mmr/releases"><img src="https://img.shields.io/github/v/release/ihormudryy/mmr?include_prereleases&sort=semver" alt="Release"></a>
+  <img src="https://img.shields.io/badge/python-3.12-blue" alt="Python 3.12">
+  <a href="LICENSE.md"><img src="https://img.shields.io/badge/license-Apache%202.0%20%2B%20Commons%20Clause-lightgrey" alt="License"></a>
   <img src="https://img.shields.io/badge/IB-Gateway%20%2F%20TWS-red" alt="Interactive Brokers">
   <img src="https://img.shields.io/badge/storage-DuckDB-yellow" alt="DuckDB">
   <img src="https://img.shields.io/badge/messaging-ZeroMQ-green" alt="ZeroMQ">
-  <img src="https://img.shields.io/badge/license-Apache%202.0%20%2B%20Commons%20Clause-lightgrey" alt="License">
+</p>
+
+<p align="center">
+  <a href="#getting-started">Getting Started</a> ·
+  <a href="#architecture">Architecture</a> ·
+  <a href="#cli-reference">CLI Reference</a> ·
+  <a href="#writing-a-strategy">Writing a Strategy</a> ·
+  <a href="CONTRIBUTING.md">Contributing</a> ·
+  <a href="CHANGELOG.md">Changelog</a>
 </p>
 
 ---
 
 MMR is a Python trading platform built to be operated by both humans and LLMs. It connects to Interactive Brokers via [ib_async](https://github.com/ib-api-reloaded/ib_async), uses ZeroMQ for inter-service messaging, DuckDB for storage, and exposes every operation as a JSON-returning CLI command — making it a natural fit for LLM agents that trade autonomously.
+
+> [!WARNING]
+> MMR places real orders through your brokerage account. It is experimental software, provided without warranty, and nothing in it is financial advice. Start in **paper trading** and read the [Disclaimer](#disclaimer) before you connect a live account.
 
 ## Why LLM-Native?
 
@@ -36,7 +50,7 @@ Most trading platforms are built for humans staring at charts. MMR is built for 
 The fastest way to get running is Docker — one command builds the image, starts IB Gateway, prompts for your credentials, and SSH's you in:
 
 ```bash
-git clone https://github.com/9600dev/mmr.git
+git clone https://github.com/ihormudryy/mmr.git
 cd mmr
 ./docker.sh -g
 ```
@@ -70,7 +84,7 @@ pip install -e ".[test]"
 ./start_mmr.sh               # Start services
 ```
 
-On first run, `start_mmr.sh` auto-launches the setup wizard to configure IB Gateway host/port, account numbers, Massive.com API key, and trading mode. Re-run anytime with `./start_mmr.sh --setup`. Settings are saved to `~/.config/mmr/trader.yaml`.
+On first run, `start_mmr.sh` auto-launches the setup wizard to configure IB Gateway host/port, account numbers, trading mode, Alpaca API keys (free, the default US data source) and an optional Massive.com key. Re-run anytime with `./start_mmr.sh --setup`. Settings are saved to `~/.config/mmr/trader.yaml`.
 
 For **unattended paper automation** (one signed strategy, release gates, dashboard Activate), see [`docs/PAPER_AUTOMATION_SETUP.md`](docs/PAPER_AUTOMATION_SETUP.md).
 
@@ -115,7 +129,7 @@ For **unattended paper automation** (one signed strategy, release gates, dashboa
 |---------|-------|------|
 | **trader** | 42101 query, 42102 command (HMAC); PubSub 42002; MessageBus 42006 | Trading runtime, portfolio, risk, propose/approve. Legacy dill **42001 unbound** in split production |
 | **strategy** | 42104 command, 42105 query; dials trader typed | Loads/runs strategies; 30s reconcile |
-| **data** | 42003 RPC | History downloads (Massive, TwelveData, IB) → DuckDB |
+| **data** | 42003 RPC | History downloads (Alpaca, Massive, TwelveData, IB) → DuckDB |
 | **dashboard** | HTTP (compose-published) | Read UI + command center (typed RPC only) |
 | **scheduler** | — | pycron one-shot jobs (data refresh, backups) |
 | **mmr CLI** | — | REPL / one-shot; typed RPC to trader/strategy |
@@ -142,8 +156,9 @@ Every query runs through a per-database lock that opens, executes, and closes th
 
 | Source | Coverage | Notes |
 |--------|----------|-------|
-| **Massive.com** (Polygon.io) | US equities | Primary for ideas/movers when plan includes snapshots (**Starter+**). Stocks Basic returns `NOT_AUTHORIZED` on movers — CLI falls back to TwelveData quotes |
-| **TwelveData** | US quotes/history | Default for cheap history (`default_data_source: twelvedata`). `/market_movers` needs **Pro+**; quotes work on Basic |
+| **Alpaca** (free Basic plan) | US equities | Default for history (`default_data_source: alpaca`; SIP feed, split-adjusted), `movers` and `news`. Optional REST quotes with `snapshot --source alpaca` |
+| **Massive.com** (Polygon.io) | US equities | Default for `ideas` when the plan includes snapshots (**Starter+**). Stocks Basic returns `NOT_AUTHORIZED` — CLI falls back to TwelveData quotes |
+| **TwelveData** | US quotes/history | Opt-in with `--source twelvedata`. `/market_movers` needs **Pro+**; quotes work on Basic |
 | **IB APIs** | International + IB-only tools | ASX/TSE/SEHK/EU via `ideas --location`; scanner/depth when subscribed |
 
 Yahoo Finance is not used.
@@ -300,7 +315,7 @@ ideas momentum --location STK.AU.ASX --tickers BHP CBA CSL
 
 # IB scanner (legacy path)
 scan
-movers                       # defaults to Massive; same entitlement rules as ideas
+movers                       # defaults to Alpaca; --source massive for indices/options/futures
 ```
 
 ### Market Data
@@ -322,6 +337,7 @@ stream EURUSD --feed forex --quotes
 
 ```bash
 history list                 # Downloaded data inventory
+history alpaca --symbol AAPL --bar_size "1 day" --prev_days 30
 history massive --symbol AAPL --bar_size "1 day" --prev_days 30
 history ib --symbol AAPL --bar_size "1 min" --prev_days 5
 ```
@@ -541,7 +557,7 @@ The interpreter is pinned to exactly **Python 3.12.13** via `.python-version` �
 ```bash
 uv sync --python 3.12.13 --frozen --extra test
 uv run --frozen --extra test pytest tests/ --timeout=30 -q --ignore=tests/test_ibrx_async.py
-# Prefer the live pytest summary — suite size drifts (~3600+ collected)
+# Prefer the live pytest summary — the suite has 4,400+ tests and grows
 ```
 
 All tests are unit tests using temporary DuckDB databases — no IB connection required.
@@ -560,10 +576,26 @@ Coverage highlights:
 
 ## Dependencies
 
-Core: `ib_async`, `duckdb`, `pyzmq`, `msgpack`, `reactivex`, `pandas`, `numpy`, `pyarrow`, `rich`, `massive` (Polygon.io), `twelvedata`, `fastapi`, `scikit-learn`, `vectorbt`, `exchange-calendars`, `matplotlib`
+Core: `ib_async`, `duckdb`, `pyzmq`, `msgpack`, `reactivex`, `pandas`, `numpy`, `pyarrow`, `rich`, `httpx` (Alpaca REST), `massive` (Polygon.io), `twelvedata`, `fastapi`, `scikit-learn`, `vectorbt`, `exchange-calendars`, `matplotlib`
 
 Full list in `pyproject.toml`. Install with `pip install -e .`
 
+## Contributing
+
+Bug reports, strategy ideas and pull requests are welcome. Read [CONTRIBUTING.md](CONTRIBUTING.md) for the dev setup, test command and pull request checklist, and follow the [Code of Conduct](CODE_OF_CONDUCT.md). Questions and ideas go to [GitHub Discussions](https://github.com/ihormudryy/mmr/discussions).
+
+## Security
+
+Please do **not** open a public issue for a security problem. Report it privately as described in [SECURITY.md](SECURITY.md).
+
+## Disclaimer
+
+MMR is experimental software for research and education. It is provided "as is", without warranty of any kind (see the license). Nothing in this repository is financial, investment or trading advice. Trading involves substantial risk of loss; past backtest results do not predict future returns. You alone are responsible for every order MMR places on your behalf. Always test in an Interactive Brokers **paper** account first.
+
+## Acknowledgements
+
+MMR started as [9600dev/mmr](https://github.com/9600dev/mmr) by the 9600 Developments team. This repository continues that work. It builds on [ib_async](https://github.com/ib-api-reloaded/ib_async), [DuckDB](https://duckdb.org), [ZeroMQ](https://zeromq.org) and [vectorbt](https://github.com/polakowo/vectorbt).
+
 ## License
 
-Fair-code: Apache 2.0 with Commons Clause.
+MMR is **source-available** under the [Apache License 2.0 with the Commons Clause](LICENSE.md). You may use, modify and share it, but you may not sell it or a service whose value comes substantially from it. Because of the Commons Clause, this is not an OSI-approved open-source license.

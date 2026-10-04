@@ -32,6 +32,8 @@ from trader.research.canonical import sha256_digest
 
 REVIEW_DIGEST_PREFIX = "operator_review"
 RESEARCH_MIGRATION_REVIEWS = 8
+RESEARCH_MIGRATION_REVIEWER_KIND = 10
+REVIEWER_KINDS = ("human", "llm", "unknown")
 
 # Every narrative field that must be a non-empty, non-blank string. Kept as an
 # explicit tuple so the validation and the persisted schema can never drift.
@@ -75,6 +77,7 @@ class OperatorReview:
     episode_dominance: str
     # §8.5 the one non-narrative confirmation
     holdout_opened_once_confirmed: bool
+    reviewer_kind: str = "unknown"
 
     def __post_init__(self) -> None:
         for name in _NARRATIVE_FIELDS:
@@ -95,9 +98,13 @@ class OperatorReview:
                 "OperatorReview.holdout_opened_once_confirmed must be exactly "
                 "True; a review that cannot confirm the holdout was opened once "
                 "is not a valid review")
+        if self.reviewer_kind not in REVIEWER_KINDS:
+            raise ValueError(
+                f"OperatorReview.reviewer_kind must be one of {REVIEWER_KINDS}, "
+                f"got {self.reviewer_kind!r}")
 
     def _body(self) -> dict:
-        return {
+        body = {
             "artifact_id": self.artifact_id,
             "eligibility_decision_digest": self.eligibility_decision_digest,
             "reviewer": self.reviewer,
@@ -112,6 +119,10 @@ class OperatorReview:
             "episode_dominance": self.episode_dominance,
             "holdout_opened_once_confirmed": self.holdout_opened_once_confirmed,
         }
+        # Reviews recorded before reviewer_kind existed keep their digest.
+        if self.reviewer_kind != "unknown":
+            body["reviewer_kind"] = self.reviewer_kind
+        return body
 
     @property
     def digest(self) -> str:
@@ -152,6 +163,14 @@ def apply_review_migrations(migrator: SchemaMigrator) -> None:
                    statements=list(_REVIEW_STATEMENTS))
 
 
+def apply_reviewer_kind_migration(migrator: SchemaMigrator) -> None:
+    """Research DB migration 10: who wrote the review (human or llm)."""
+    migrator.apply(version=RESEARCH_MIGRATION_REVIEWER_KIND,
+                   name="research_operator_review_kind",
+                   statements=["ALTER TABLE operator_reviews ADD COLUMN IF NOT EXISTS "
+                               "reviewer_kind VARCHAR DEFAULT 'unknown'"])
+
+
 class OperatorReviewRepository:
     """Append-only, digest-keyed store for operator reviews.
 
@@ -175,14 +194,15 @@ class OperatorReviewRepository:
                 "eligibility_decision_digest, reviewer, reviewed_at, economic_rationale, "
                 "edge_survives_costs, known_failure_regimes, data_and_survivorship_limits, "
                 "parameter_sensitivity, operational_dependencies, capacity_and_decay, "
-                "episode_dominance, holdout_opened_once_confirmed) "
-                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                "episode_dominance, holdout_opened_once_confirmed, reviewer_kind) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
                 [digest, review.artifact_id, review.eligibility_decision_digest,
                  review.reviewer, review.reviewed_at, review.economic_rationale,
                  review.edge_survives_costs, review.known_failure_regimes,
                  review.data_and_survivorship_limits, review.parameter_sensitivity,
                  review.operational_dependencies, review.capacity_and_decay,
-                 review.episode_dominance, review.holdout_opened_once_confirmed])
+                 review.episode_dominance, review.holdout_opened_once_confirmed,
+                 review.reviewer_kind])
             return digest
 
         return self._db.transaction(_tx)
@@ -193,8 +213,8 @@ class OperatorReviewRepository:
                 "SELECT artifact_id, eligibility_decision_digest, reviewer, reviewed_at, "
                 "economic_rationale, edge_survives_costs, known_failure_regimes, "
                 "data_and_survivorship_limits, parameter_sensitivity, operational_dependencies, "
-                "capacity_and_decay, episode_dominance, holdout_opened_once_confirmed "
-                "FROM operator_reviews WHERE review_digest = ?",
+                "capacity_and_decay, episode_dominance, holdout_opened_once_confirmed, "
+                "reviewer_kind FROM operator_reviews WHERE review_digest = ?",
                 [review_digest]).fetchone()
             if r is None:
                 return None
@@ -207,9 +227,17 @@ class OperatorReviewRepository:
                 known_failure_regimes=r[6], data_and_survivorship_limits=r[7],
                 parameter_sensitivity=r[8], operational_dependencies=r[9],
                 capacity_and_decay=r[10], episode_dominance=r[11],
-                holdout_opened_once_confirmed=bool(r[12]))
+                holdout_opened_once_confirmed=bool(r[12]),
+                reviewer_kind=r[13] or "unknown")
 
         return self._db.transaction(_tx)
+
+
+def review_allowed_for(review: OperatorReview, account_mode: str) -> None:
+    """Paper accepts a human or an LLM review; live needs a human."""
+    if account_mode == "live" and review.reviewer_kind != "human":
+        raise ValueError(
+            f"a live attestation needs a human review; this one is {review.reviewer_kind!r}")
 
 
 # A convenience for callers/tests that want the mandatory field names.

@@ -43,6 +43,7 @@ from trader.research.artifact import (
     trial_id,
 )
 from trader.research.canonical import canonical_json_bytes
+from trader.research.strategy_paths import normalize_strategy_path
 
 RESEARCH_MIGRATION_FAMILIES = 3
 RESEARCH_MIGRATION_TRIALS = 4
@@ -369,6 +370,30 @@ class ExperimentRegistry:
 
         return self._db.transaction(_tx)
 
+    def strategy_trials(self, strategy_path: str, class_name: str) -> list[TrialRecord]:
+        """Terminal trials of EVERY family of one strategy file + class: the
+        multiple-testing denominator across families. A new family per param
+        tweak must not reset it, so paths compare repo-relative."""
+        target = normalize_strategy_path(strategy_path)
+
+        def _tx(conn):
+            families = conn.execute(
+                "SELECT family_id, strategy_path FROM experiment_families WHERE class_name = ?",
+                [class_name]).fetchall()
+            family_ids = [fid for fid, path in families
+                          if normalize_strategy_path(path) == target]
+            trials: list[TrialRecord] = []
+            for fid in family_ids:
+                rows = conn.execute(
+                    "SELECT trial_id, family_id, trial_key, parameters, status, started_at, "
+                    "finished_at, traceback_digest, safe_summary, archived "
+                    "FROM experiment_trials WHERE family_id = ? AND status != ? "
+                    "ORDER BY started_at, trial_key", [fid, TRIAL_RUNNING]).fetchall()
+                trials.extend(self._row_to_trial(conn, r[0], r[1:]) for r in rows)
+            return trials
+
+        return self._db.transaction(_tx)
+
     def set_trial_archived(self, trial_id: str, archived: bool) -> None:
         tid = trial_id
 
@@ -414,6 +439,14 @@ class ExperimentRegistry:
             return aid
 
         return self._db.transaction(_tx)
+
+    def family_artifacts(self, family_id: str) -> list[ArtifactRecord]:
+        def _tx(conn):
+            return [r[0] for r in conn.execute(
+                "SELECT artifact_id FROM strategy_artifacts WHERE family_id = ? "
+                "ORDER BY sealed_at", [family_id]).fetchall()]
+
+        return [self.get_artifact(aid) for aid in self._db.transaction(_tx)]
 
     def get_artifact(self, artifact_id: str) -> Optional[ArtifactRecord]:
         aid = artifact_id

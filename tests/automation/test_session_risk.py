@@ -651,3 +651,23 @@ def test_single_strategy_unchanged_without_portfolio_authority():
     )
     assert "PORTFOLIO_AUTHORITY_ABSENT" not in decision.reason_codes
     assert decision.approved is True
+
+
+def test_sell_without_quantity_closes_the_held_position():
+    held = make_broker(positions=(_position(CONID, 25, 2_500.0),))
+    decision = make_controller().evaluate(
+        make_intent(side="SELL", requested_quantity=None,
+                    stop_policy=StopPolicy(stop_price=Decimal("101"), order_type="STP")),
+        make_artifact(), make_approval(broker=held), make_session(),
+        AllocationCeiling(max_gross_fraction=0.06))
+    assert "QUANTITY_REQUIRED" not in decision.reason_codes
+    assert decision.approved_quantity == Decimal("25")
+
+
+def test_sell_without_quantity_and_nothing_held_is_long_only():
+    decision = make_controller().evaluate(
+        make_intent(side="SELL", requested_quantity=None,
+                    stop_policy=StopPolicy(stop_price=Decimal("101"), order_type="STP")),
+        make_artifact(), make_approval(), make_session(),
+        AllocationCeiling(max_gross_fraction=0.06))
+    assert "LONG_ONLY" in decision.reason_codes

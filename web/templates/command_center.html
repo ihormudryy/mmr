@@ -2093,7 +2093,7 @@
         </table>
       </section>
       <section id="paper-auto-panel" aria-label="Paper automation">
-        <h2><span class="h-title">Paper automation {{ info('Paper mode only. Writes keys, fixture artifact, and YAML for one strategy, then hot-arms execute_automated_intent + IntentEmitter without restart when Activate succeeds. Needs command authority. Private keys never enter this browser.') }}</span>
+        <h2><span class="h-title">Paper automation {{ info('Paper mode only. Arms a real eligible bundle from `mmr research attest bundle`, bound to the strategy (file, params, conids, bar size), writes the YAML for that one strategy, then hot-arms execute_automated_intent + IntentEmitter without restart when Activate succeeds. Refuses with NO_ELIGIBLE_BUNDLE when no bundle fits. Needs command authority. Private keys never enter this browser.') }}</span>
           <span id="paper-auto-lifecycle" class="scaling-status"
                 data-lifecycle="unknown">unknown</span>
         </h2>
@@ -2102,10 +2102,10 @@
         <p id="paper-auto-banner-partial" class="paper-auto-banner" hidden
            role="status">Activation partially succeeded — click Activate again to complete.</p>
         <p id="paper-auto-message" class="scaling-note">Waiting for paper automation status…</p>
-        <p class="scaling-note">Paper only. One strategy: writes keys/artifact/YAML
-          on the host, then hot-arms trader + strategy in-process. Private keys
-          never enter this browser. Activate stays disabled until the checklist
-          below is green.</p>
+        <p class="scaling-note">Paper only. One strategy: reads a bundle from
+          `mmr research attest bundle`, writes the YAML, then hot-arms trader +
+          strategy in-process. Private keys never enter this browser. Activate
+          stays disabled until the checklist below is green.</p>
         <div class="scaling-cards" aria-label="Paper automation summary">
           <div class="scaling-card"><div class="label">Strategy</div>
             <div id="paper-auto-strategy-value" class="value">—</div></div>

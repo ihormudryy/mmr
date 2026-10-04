@@ -65,6 +65,8 @@ class IntentEmitterContext:
     eligibility_attestation_digest: str
     artifact_bundle_digest: str
     account_mode: str  # paper | live
+    strategy_source_digest: str = ""
+    order_notional: Optional[Decimal] = None
 
 
 class IntentEmitter:
@@ -98,6 +100,7 @@ class IntentEmitter:
         signal: Signal,
         completed_bar_timestamp: dt.datetime,
         session_id: str,
+        reference_price: Optional[float] = None,
     ) -> Optional[CommandReceipt]:
         if not self._ctx.enabled:
             return None
@@ -148,6 +151,7 @@ class IntentEmitter:
                 completed_bar_timestamp=bar_ts,
                 signal_timestamp=signal_ts,
                 session_id=session_id,
+                reference_price=reference_price,
             )
         except Exception:
             logging.exception(
@@ -188,6 +192,7 @@ class IntentEmitter:
         completed_bar_timestamp: dt.datetime,
         signal_timestamp: dt.datetime,
         session_id: str,
+        reference_price: Optional[float] = None,
     ) -> ExecutionIntent:
         meta = dict(signal.metadata or {})
         params = dict(self._ctx.artifact.parameters or {})
@@ -250,6 +255,10 @@ class IntentEmitter:
             qty = _dec(signal.quantity)
         elif meta.get("requested_quantity") is not None:
             qty = _dec(meta["requested_quantity"])
+        elif side == "BUY" and self._ctx.order_notional and reference_price:
+            # Same size the evidence was measured at (attested order notional).
+            shares = int(self._ctx.order_notional // Decimal(str(reference_price)))
+            qty = Decimal(shares) if shares > 0 else None
 
         fields: dict[str, Any] = {
             "artifact_id": self._ctx.artifact.artifact_id,
@@ -332,4 +341,5 @@ class IntentEmitter:
             "signal_timestamp": _ts(intent.signal_timestamp),
             "completed_bar_timestamp": _ts(intent.completed_bar_timestamp),
             "artifact_bundle_digest": self._ctx.artifact_bundle_digest,
+            "strategy_source_digest": self._ctx.strategy_source_digest or None,
         }

@@ -10,12 +10,21 @@ from typing import Callable
 
 import yaml
 
+from trader.automation.artifact_verifier import ArtifactVerifier
+from trader.automation.bundle_finder import (
+    EligibleBundle,
+    NoEligibleBundle,
+    find_eligible_bundle,
+)
 from trader.automation.paper_hot_arm import PaperHotArmPorts
 from trader.automation.paper_materials import (
     PaperMaterialsError,
+    default_key_paths,
     read_allocation_binding_hints,
-    verify_qualified_paper_bundle,
 )
+from trader.research.evaluation_store import describe_latest_evaluation
+from trader.research.signing import InvalidKeyType, MalformedKey, load_verify_key
+from trader.research.strategy_paths import resolve_strategy_file
 
 logger = logging.getLogger(__name__)
 
@@ -259,7 +268,10 @@ class PaperAutomationActivationService:
             automation=automation,
             strategy_data=strategy_data,
         )
-        artifact_id, bundle_path, verify_dir = self._research_materials(automation, strategy)
+        _, verify_dir, _ = default_key_paths(self._config_dir)
+        eligible = self._eligible_bundle(strategy_name, strategy, trader_data)
+        artifact_id = eligible.artifact_id
+        bundle_path = eligible.path
         self._persist_enable(
             trader_data=trader_data,
             strategy_data=strategy_data,
@@ -293,8 +305,18 @@ class PaperAutomationActivationService:
             automation=automation,
             strategy_data=strategy_data,
         )
-        # Validate before all idempotent/retry shortcuts and before port writes.
-        artifact_id, bundle_path, verify_dir = self._research_materials(automation, strategy)
+        # Find and verify the bundle before all idempotent/retry shortcuts and
+        # before port writes. Nothing is committed yet, so a refusal needs no
+        # compensation, and the broad except below must not turn
+        # NO_ELIGIBLE_BUNDLE into HOT_ARM_FAILED.
+        self._phase = "find_bundle"
+        try:
+            eligible = self._eligible_bundle(strategy_name, strategy, trader_data)
+        finally:
+            self._phase = None
+        artifact_id = eligible.artifact_id
+        bundle_path = eligible.path
+        _, verify_dir, _ = default_key_paths(self._config_dir)
         if self._memory_armed and (
             self._memory_artifact_id != artifact_id
             or self._memory_bundle_path != str(bundle_path)
@@ -402,6 +424,54 @@ class PaperAutomationActivationService:
                 raise
             raise PaperAutomationActivationError("HOT_ARM_FAILED", str(exc)) from exc
 
+    def _eligible_bundle(
+        self, strategy_name: str, strategy: dict, trader_data: dict
+    ) -> EligibleBundle:
+        _, verify_dir, _ = default_key_paths(self._config_dir)
+        keys = self._load_verify_keys(verify_dir)
+        module = str(strategy.get("module", ""))
+        strategy_file = resolve_strategy_file(
+            module, str(trader_data.get("strategies_directory", "strategies"))
+        )
+        artifacts_root = self._share_dir / "artifacts"
+        try:
+            return find_eligible_bundle(
+                artifacts_root=artifacts_root,
+                verifier=ArtifactVerifier(keys),
+                strategy=strategy,
+                strategy_file=strategy_file,
+                now=self._now(),
+            )
+        except NoEligibleBundle as exc:
+            latest = describe_latest_evaluation(
+                artifacts_root / "evaluations",
+                module,
+                str(strategy.get("class_name", "")),
+            )
+            message = f"{strategy_name}: {exc}. {latest}"
+            if exc.reasons:
+                message += f". Bundles checked: {'; '.join(exc.reasons[:5])}"
+            raise self._no_eligible_bundle(message) from exc
+
+    def _load_verify_keys(self, verify_dir: Path) -> list:
+        try:
+            paths = sorted(verify_dir.glob("*.pem")) if verify_dir.is_dir() else []
+            keys = [load_verify_key(str(path)) for path in paths]
+        except (OSError, MalformedKey, InvalidKeyType) as exc:
+            raise self._no_eligible_bundle(
+                f"cannot load verify keys under {verify_dir}: {exc}"
+            ) from exc
+        if not keys:
+            raise self._no_eligible_bundle(
+                f"no verify keys under {verify_dir}; "
+                "run `mmr research attest bundle <artifact_id>` first"
+            )
+        return keys
+
+    def _no_eligible_bundle(self, message: str) -> PaperAutomationActivationError:
+        self._last_error = message
+        return PaperAutomationActivationError("NO_ELIGIBLE_BUNDLE", message)
+
     def _persist_after_hot_arm(
         self,
         *,
@@ -456,22 +526,6 @@ class PaperAutomationActivationService:
             "restart_required": False,
             "reused_existing_keys": reused,
         }
-
-    def _research_materials(self, automation: dict, strategy: dict) -> tuple[str, Path, Path]:
-        bundle_path = Path(automation["artifact_bundle_path"]).expanduser()
-        verify_dir = Path(automation["public_key_ring_path"]).expanduser()
-        try:
-            verified = verify_qualified_paper_bundle(
-                bundle_path=bundle_path,
-                public_key_ring_path=verify_dir,
-                expected_artifact_id=automation["expected_artifact_id"],
-                now=self._now(),
-                strategy=strategy,
-            )
-        except PaperMaterialsError as exc:
-            self._last_error = str(exc)
-            raise PaperAutomationActivationError("RESEARCH_EVIDENCE_INVALID", str(exc)) from exc
-        return verified.artifact_id, bundle_path, verify_dir
 
     def _deactivate_restart_required(self) -> dict:
         trader_data = _load_yaml_mapping(self._trader_yaml_path)
@@ -640,16 +694,6 @@ class PaperAutomationActivationService:
             raise PaperAutomationActivationError(
                 "AUTOMATION_ALREADY_BOUND",
                 f"paper automation is already bound to {self._memory_strategy!r}",
-            )
-        if not all(
-            isinstance(automation.get(key), str) and automation[key].strip()
-            for key in ("artifact_bundle_path", "public_key_ring_path", "expected_artifact_id")
-        ):
-            raise PaperAutomationActivationError(
-                "RESEARCH_EVIDENCE_REQUIRED",
-                "configure an existing research artifact_bundle_path, "
-                "public_key_ring_path and expected_artifact_id before activation; "
-                "activation does not generate research evidence",
             )
         return strategy
 

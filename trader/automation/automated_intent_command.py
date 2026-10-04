@@ -139,13 +139,13 @@ class AutomatedIntentCommandService:
         account_mode: str,
         now: Callable[[], dt.datetime],
         bundle_root: Path,
+        expected_artifact_id: str,
         schedule_reconcile: Optional[Callable[[str], None]] = None,
         protective_saga: Optional[ProtectiveSagaPort] = None,
         approval_factory: Optional[Callable[..., Any]] = None,
         session_state_factory: Optional[Callable[..., Any]] = None,
         allocation_factory: Optional[Callable[..., Any]] = None,
         configured_bundle_path: Optional[Path] = None,
-        expected_artifact_id: Optional[str] = None,
         bundle_evidence_validator: Optional[Callable[[Path], None]] = None,
     ):
         self._ledger = ledger
@@ -158,6 +158,9 @@ class AutomatedIntentCommandService:
         self._account_mode = account_mode
         self._now = now
         self._bundle_root = Path(bundle_root)
+        if not expected_artifact_id:
+            raise ValueError("expected_artifact_id is required: the service verifies only the armed artifact")
+        self._expected_artifact_id = expected_artifact_id
         self._schedule_reconcile = schedule_reconcile
         self._protective_saga = protective_saga
         self._approval_factory = approval_factory
@@ -166,7 +169,6 @@ class AutomatedIntentCommandService:
         self._configured_bundle_path = (
             Path(configured_bundle_path) if configured_bundle_path is not None else None
         )
-        self._expected_artifact_id = expected_artifact_id
         self._bundle_evidence_validator = bundle_evidence_validator
 
     def execute(self, cmd: CommandRequest) -> CommandReceipt:
@@ -191,24 +193,27 @@ class AutomatedIntentCommandService:
             self._transition(cmd, "RECEIVED", "REJECTED", error_code="ACCOUNT_MODE_MISMATCH")
             return self._receipt(cmd.command_id, "REJECTED", "ACCOUNT_MODE_MISMATCH", False)
 
-        if self._expected_artifact_id is not None and intent.artifact_id != self._expected_artifact_id:
-            code = "ARTIFACT_BINDING_MISMATCH"
-            self._transition(cmd, "RECEIVED", "REJECTED", error_code=code)
-            return self._receipt(cmd.command_id, "REJECTED", code, False)
+        if intent.artifact_id != self._expected_artifact_id:
+            self._transition(cmd, "RECEIVED", "REJECTED", error_code="ARTIFACT_NOT_ARMED")
+            return self._receipt(
+                cmd.command_id, "REJECTED", "ARTIFACT_NOT_ARMED", False,
+                outcome={"detail": f"intent names artifact {intent.artifact_id}, "
+                                   f"armed artifact is {self._expected_artifact_id}"},
+            )
 
         bundle_digest = cmd.body.get("artifact_bundle_digest")
         if not bundle_digest:
             self._transition(cmd, "RECEIVED", "REJECTED", error_code="BUNDLE_DIGEST_MISSING")
             return self._receipt(cmd.command_id, "REJECTED", "BUNDLE_DIGEST_MISSING", False)
 
-        # Production pins an operator-configured directory. A manifest digest
+        # Production pins the armed bundle directory. A manifest digest
         # is content identity, not the artifact directory name on disk.
         bundle_path = self._configured_bundle_path or self._bundle_path(str(bundle_digest))
         try:
             artifact = self._verifier.verify(
                 bundle_path,
                 intent.account_mode,
-                self._expected_artifact_id or intent.artifact_id,
+                self._expected_artifact_id,
                 self._now_utc(),
             )
             if self._bundle_evidence_validator is not None:
@@ -230,6 +235,16 @@ class AutomatedIntentCommandService:
                 code = "BUNDLE_DIGEST_MISMATCH"
                 self._transition(cmd, "RECEIVED", "REJECTED", error_code=code)
                 return self._receipt(cmd.command_id, "REJECTED", code, False)
+
+        source_mismatch = self._strategy_source_mismatch(
+            artifact, cmd.body.get("strategy_source_digest"),
+        )
+        if source_mismatch is not None:
+            self._transition(cmd, "RECEIVED", "REJECTED", error_code="STRATEGY_SOURCE_MISMATCH")
+            return self._receipt(
+                cmd.command_id, "REJECTED", "STRATEGY_SOURCE_MISMATCH", False,
+                outcome={"detail": source_mismatch},
+            )
 
         self._transition(cmd, "RECEIVED", "VALIDATED")
 
@@ -388,6 +403,16 @@ class AutomatedIntentCommandService:
                 outcome=outcome,
             )
         return self._receipt(cmd.command_id, "SUBMITTED", None, False, outcome=outcome)
+
+    @staticmethod
+    def _strategy_source_mismatch(artifact: Any, sent_digest: Optional[str]) -> Optional[str]:
+        """Why the intent's strategy file is not the attested one, or None when it is."""
+        attested = getattr(artifact, "attested_strategy", None)
+        if attested is None:
+            return "bundle attests no strategy"
+        if not sent_digest or sent_digest != attested.source_digest:
+            return "intent strategy source digest does not match the attested file"
+        return None
 
     def _bundle_path(self, bundle_digest: str) -> Path:
         # Digests may contain ':' (sha256:...); map to a filesystem-safe directory.

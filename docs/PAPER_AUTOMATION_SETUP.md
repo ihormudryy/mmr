@@ -38,7 +38,8 @@ Paper LLM evaluate-approve (`approve_proposal` with `source=sdk`) is **not** the
 ### Strategy choice (pick one for automation)
 
 - Strategy **name** as it appears in `strategy_runtime.yaml` (e.g. `orb_googl`)
-- Module / class / `conids` / `bar_size` already validated in backtests
+- Module / class / `conids` / `bar_size` already evaluated: you need a signed bundle
+  for exactly this strategy (see [Evidence before automation](#evidence-before-automation))
 - That strategy must **not** use `auto_execute: propose` while automation is armed (rule **R1**)
 
 ### Host / Docker
@@ -57,6 +58,59 @@ the automation order path itself.
 
 - Position sizing / daily loss / max positions (`position_sizing.yaml`, risk gate)
 - Willingness to run release gates (synthetic + one RTH paper soak)
+
+---
+
+## Evidence before automation
+
+> Phase A leaves the liquidity, benchmark and regime evidence missing, so
+> `evaluate` stops at stage `pre_holdout` (state `CANDIDATE`) until Phase B and
+> Activate refuses every strategy. Even with an eligible bundle, automated exits
+> are not safe yet, and `research evaluate` does not run in split Docker: see
+> **Known blockers (paper automation)** in
+> [`OPERATIONAL_STATE.md`](OPERATIONAL_STATE.md#known-blockers-paper-automation).
+
+1. Write a spec (see `research/example_spec.yaml`): strategy file (inside
+   `strategies/`, committed and clean), class, params, a neighbourhood, at least
+   8 distinct XNYS conids, bar size (15 minutes or shorter), period, walk-forward
+   settings, order notional and account equity. You also need 1-min (or your bar
+   size) bars in the local DuckDB for every conid (`mmr data download` /
+   `mmr data refresh`), every conid in a local universe, and a `calendar: XNYS`
+   key on the US venue in `~/.config/mmr/execution_costs.yaml` (older copies lack it;
+   `evaluate` refuses and names the key).
+2. `mmr research evaluate research/my_spec.yaml --dry-run` — validate, count jobs.
+   It does not read bars. `--workers N` sets the parallel backtest processes.
+3. `mmr research evaluate research/my_spec.yaml` — runs walk-forward backtests at
+   realistic costs (1x, 1.5x, 2x for the main point; neighbours at 1x) under the
+   live paper rules. The holdout is opened only if every other paper-v1 rule
+   passes. A failed holdout (no round trip, expectancy at or below zero, or a
+   drawdown over 3%) retires the artifact: stage `holdout_failed`, state
+   `RETIRED`, no decision, and it can never be attested. It prints the report
+   path; read it. The report is written to
+   `~/.local/share/mmr/reports/evaluation_<name>_<time>_<id>.md` (and `.json`).
+4. If the stage is `complete` and the state `PAPER_ELIGIBLE`:
+   `mmr research review submit --artifact-id ... --decision-id ... --reviewer-kind human|llm ...`
+   (`--artifact-id` is the evaluate output's `artifact_id`, `--decision-id` its
+   `decision_digest`. The review also needs `--reviewer`, the eight review fields
+   and `--holdout-opened-once`. An LLM may review paper bundles; live needs a
+   human. The reviewer name `bootstrap` marks old fixtures and is refused at
+   Activate and dispatch.)
+5. `mmr research attest bundle <artifact_id>` — signs and exports
+   `~/.local/share/mmr/artifacts/sha256_<digest>/` (the digest is the bundle
+   manifest digest). The first run also creates the signing key under
+   `~/.config/mmr/keys/`.
+6. Activate from `/cc`. It refuses (`NO_ELIGIBLE_BUNDLE`) unless that bundle is
+   bound to the strategy's current YAML entry and file. Editing the strategy
+   file, its upper-case params, conids or bar size needs a new evaluation. An
+   automated strategy cannot set lower-case params at all: the spec refuses
+   them, so the binding refuses any lower-case key in the YAML entry. The
+   refusal quotes the latest evaluation for that strategy.
+
+Bundles expire after 90 days. A decision is attested only once, so
+`research attest bundle` refuses to export an expired attestation again, or one
+signed by a different key than the current signing key. Renewal means
+evaluating again over a newer period, then reviewing and attesting the new
+artifact. `mmr research evaluations` lists past runs (`--limit N`, default 20).
 
 ---
 
@@ -122,31 +176,42 @@ scheduled) the paper soak.
 
 ### 5. Arm paper automation (one strategy)
 
-Activation **does not create evidence or signing keys**. First complete research,
-the quantitative `paper-v1` gate, independent operator review and offline signing,
-then export the sealed `ResearchBundle`. Install only that read-only bundle and
-the trusted **public** PEM key ring on the trader/strategy hosts. Keep private
-signing material offline; the activation request still needs only `strategy_name`
-and `reason`, never a private key or other raw secret.
+Activation **does not create evidence or signing keys**. It needs a bundle from
+`mmr research attest bundle` (see [Evidence before automation](#evidence-before-automation))
+under `~/.local/share/mmr/artifacts/sha256_<digest>/` and the matching public key
+in `~/.config/mmr/keys/verify/`. `research attest bundle` keeps the private
+signing key in `~/.config/mmr/keys/private/`; never commit it. If trader and
+strategy run on another host, install only the bundle and the public key ring
+there. The activation request needs only `strategy_name` and `reason`, never a
+private key or other raw secret.
 
-Configure `automation.artifact_bundle_path`, `automation.public_key_ring_path`
-and `automation.expected_artifact_id` in the trader's local YAML while keeping
-`automation.enabled: false`. The selected strategy's exact `module`, `class_name`
-and `params` must match the research family/artifact; only the transport parameter
-`artifact_bundle_path` is excluded from parameter comparison. No fuzzy path,
-parameter-name or identifier matching is performed.
+Activate checks every `sha256_*` bundle and arms the newest (by expiry) that:
 
-Activation verifies the complete signed bundle, expiry, trusted key and artifact
-binding, requires the complete passing current `paper-v1` decision, and rejects
-known bootstrap/offline fixture provenance before any YAML or hot-arm commit.
-`RESEARCH_EVIDENCE_REQUIRED` means paths/id are missing;
-`RESEARCH_EVIDENCE_INVALID` means verification or strategy binding failed.
-These checks also run on Activate retries. Other runtime/account/live gates
-remain in force; a valid research bundle does not bypass them.
+- verifies in paper mode: integrity, signature by a trusted key, expiry, not
+  `RETIRED`, holdout passed;
+- carries qualified research evidence (`require_qualified_research_evidence`):
+  a complete, passing, current `paper-v1` decision and no bootstrap or
+  offline-fixture provenance;
+- is bound to the strategy's current entry: file content hash, `class_name`,
+  `params` (exact, both directions, lower-case keys included; only the transport
+  key `artifact_bundle_path` is ignored), `conids` and `bar_size`. No fuzzy path,
+  parameter-name or identifier matching is performed.
+
+It then writes `automation.artifact_bundle_path` (that bundle directory),
+`public_key_ring_path`, `expected_artifact_id` and `strategy_name`, and sets the
+strategy's `params.artifact_bundle_path`. If no bundle qualifies it refuses with
+`NO_ELIGIBLE_BUNDLE` before any YAML or hot-arm commit; the message quotes the
+latest evaluation for the strategy and each bundle's reason. The checks run again
+on Activate retries; hot-arm refuses `AUTOMATION_ALREADY_BOUND` when a retry finds
+a different bundle than the armed one (Deactivate first). Order dispatch repeats
+the signature and qualified-evidence checks on the configured bundle directory.
+Other runtime/account/live gates remain in force; a valid bundle does not bypass
+them.
 
 A signature proves origin and integrity, **not that metrics were measured**.
 The operator must audit the underlying trials, datasets, holdout, costs and
-review. Neither fixture data nor a successful plumbing drill is promotion evidence.
+review (the evaluation report). Neither fixture data nor a successful plumbing
+drill is promotion evidence.
 
 Strategies that already declare `params.artifact_bundle_path` still **load**
 when `automation.enabled` is false (soft-load): they appear in Strategies /
@@ -165,23 +230,33 @@ See also [`DASHBOARD_USER_GUIDE.md`](DASHBOARD_USER_GUIDE.md).
 
 #### Offline verification / configuration helper
 
+Needs a bundle from `mmr research attest bundle` first (see
+[Evidence before automation](#evidence-before-automation)). The script only
+prints; it writes nothing:
+
 ```bash
-python3 scripts/bootstrap_paper_automation.py --strategy-name YOUR_STRATEGY \
-  --artifact-bundle-path /path/to/existing/research-bundle \
-  --public-key-ring-path /path/to/trusted/public-keys \
-  --expected-artifact-id <exact-artifact-id>
+python3 scripts/bootstrap_paper_automation.py \
+  --bundle ~/.local/share/mmr/artifacts/sha256_<digest> --strategy-name YOUR_STRATEGY
 ```
 
-This only verifies existing public material and prints **disabled** configuration;
-it creates no keys or evidence, changes no YAML and does not arm anything. It does
-not have the strategy YAML, so the activation service checks strategy binding.
-Paste the configuration into user config, e.g.:
+It reads the public key that `mmr research attest bundle` created and refuses
+unless that key signed the bundle. It then verifies the whole bundle (signature,
+expiry, qualified `paper-v1` evidence, no fixture provenance) and prints
+**disabled** configuration. It creates no keys or evidence, changes no YAML and
+does not arm anything. It does not have the strategy YAML, so Activate checks the
+strategy binding. Never commit these:
+
+- `~/.config/mmr/keys/private/signing.pem`
+- `~/.config/mmr/keys/verify/*.pem`
+- `~/.local/share/mmr/artifacts/sha256_<digest>/`
+
+Paste what the script prints into user config, e.g.:
 
 ```yaml
 automation:
   enabled: false  # Activate after strategy/evidence preflight
   live_enabled: false
-  artifact_bundle_path: /Users/you/.local/share/mmr/artifacts/<id>
+  artifact_bundle_path: /Users/you/.local/share/mmr/artifacts/sha256_<digest>
   public_key_ring_path: /Users/you/.config/mmr/keys/verify
   expected_artifact_id: <id>
   strategy_name: YOUR_STRATEGY   # exact name, only one
@@ -191,35 +266,25 @@ And on that strategy entry in `strategy_runtime.yaml`:
 
 ```yaml
 params:
-  artifact_bundle_path: /Users/you/.local/share/mmr/artifacts/<id>
+  artifact_bundle_path: /Users/you/.local/share/mmr/artifacts/sha256_<digest>
 # do NOT set auto_execute: propose on this strategy
 ```
 
 Use dashboard Activate after configuring both services. If hot-arm is unavailable,
 the activation service returns `restart_required`; restart trader + strategy then.
 
-#### Isolated offline fixtures (not activation)
+#### No fixture bundles
 
-```bash
-python3 scripts/bootstrap_paper_automation.py --offline-fixture \
-  --config-dir /path/to/disposable/drill-config \
-  --share-dir /path/to/disposable/drill-share
-```
+Production code no longer exports fixture bundles; the made-up-evidence fixture
+lives only in `tests/automation/fixture_bundle.py`. Bundles from older bootstrap
+runs (reviewer `bootstrap`, or `evidence_kind: offline_fixture`) are refused even
+if their signatures still verify. Do not add fixture public keys to the trust ring.
 
-Fixture keys/bundles live under separate `offline-fixtures/` subdirectories.
-The script labels the output and prints **no activation snippets**. Fixture
-attestations are `CANDIDATE`, with `permitted_account_mode: none` and signed
-`offline_fixture_not_for_promotion` provenance. They exercise export/integrity
-plumbing only and cannot authorize paper or live orders. The historical Python
-API name `export_fixture_paper_eligible_bundle` remains for compatibility, but
-requires `offline_fixture=True` and no longer emits a paper-eligible decision.
-Older bootstrap fixtures are rejected even if their signatures still verify.
-Do not add fixture public keys to the normal research trust ring.
-
-For integration: cold-start and dispatch callers must run
-`require_qualified_research_evidence(bundle_path)` from `paper_materials` **after**
-full `ArtifactVerifier` verification. This provenance/completeness check does not
-replace signature, expiry, revocation, live/account or risk verification.
+Activate and order dispatch run `require_qualified_research_evidence(bundle_path)`
+from `paper_materials` **after** full `ArtifactVerifier` verification. Strategy
+load (cold start) runs verification and the binding check, not this provenance
+check. It does not replace signature, expiry, revocation, live/account or risk
+verification.
 
 ### 6. Run the P3 automation gates
 
@@ -281,7 +346,8 @@ Stack down → all tests skip (exit 0).
 2. One validated strategy deployed
 3. `command_authority.enabled: true`, `live_enabled: false`
 4. P1 synthetic (+ paper soak)
-5. Configure verified existing research, then Activate **that one** name
+5. Evaluated, reviewed and attested bundle for that strategy; then Activate
+   **that one** name
 6. Restart trader + strategy
 7. P3 synthetic (+ paper soak)
 8. Monitor + know kill switches

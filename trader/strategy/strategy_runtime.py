@@ -39,12 +39,14 @@ from trader.strategy.signal_proposer import SignalProposer
 from trader.strategy.strategy_revisions import StrategyCommandReceipt, StrategyRevisionStore
 from trader.strategy.trader_gateway import StrategyTraderGateway
 from trader.trading.strategy import Signal, Strategy, StrategyConfig, StrategyContext, StrategyState
+from decimal import Decimal
 from typing import Any, cast, Dict, List, Optional
 
 import asyncio
 import backoff
 import datetime as dt
 import exchange_calendars
+import hashlib
 import importlib
 import importlib.util
 import inspect
@@ -485,6 +487,10 @@ class StrategyRuntime():
         self._artifact_verifier: Optional[Any] = None
         self._verified_artifact: Optional[Any] = None
         self._verified_artifact_strategy: Optional[str] = None
+        # SHA-256 of the strategy code that was verified and runs; it goes on
+        # every intent so the trader can compare it with the attested digest.
+        self._verified_source_digest: str = ''
+        self.automation_disarm_reason: str = ''
         self.intent_emitter: Optional[Any] = None
         self._revisions: Optional[StrategyRevisionStore] = None
         # Last state-name announced per strategy (via the ack outbox). Resets
@@ -809,7 +815,8 @@ class StrategyRuntime():
 
         Raises ``ValueError`` for an unknown strategy (nothing written) and
         ``RuntimeError`` if the reload after a successful write fails (the
-        config IS persisted at that point; a restart converges).
+        config IS persisted at that point, and a restart would fail the same
+        way until the params are fixed or reverted).
         """
         with open(self.strategy_config_file) as f:
             cfg = yaml.safe_load(f) or {}
@@ -890,7 +897,9 @@ class StrategyRuntime():
         if new is None:
             raise RuntimeError(
                 f'strategy {name!r} failed to reload after params update — the '
-                'config is persisted; restart strategy_service to converge')
+                'config is persisted, but the strategy does not load with it (the '
+                'log names the cause) and a restart would fail the same way; fix '
+                'or revert the params')
 
         # Re-attach the new instance to the conid dispatch lists its
         # predecessor occupied. Deliberately NO RPC here: this method runs
@@ -1323,9 +1332,50 @@ class StrategyRuntime():
             )
             return None
 
-    def _verify_artifact_at_load(self, strategy_name: str,
-                                 artifact_bundle_path_str: str) -> None:
+    def _strategy_file_path(self, module: str) -> str:
+        """The file ``load_strategy`` loads for ``module`` (same resolution rules)."""
+        strategies_dir = os.path.abspath(os.path.expanduser(self.strategies_directory))
+        requested = os.path.expanduser(module)
+        if os.path.isabs(requested):
+            return os.path.abspath(requested)
+        filepath = os.path.abspath(os.path.join(strategies_dir, requested))
+        if not os.path.exists(filepath):
+            filepath = os.path.abspath(requested)
+        return filepath
+
+    def _sandboxed_strategy_file(self, module: str, strategies_dir: str) -> str:
+        """The strategy file for ``module``, refusing anything outside
+        ``strategies_directory`` (a malicious YAML could otherwise load any .py)."""
+        filepath = self._strategy_file_path(module)
+        if not filepath.startswith(strategies_dir + os.sep) and filepath != strategies_dir:
+            raise ValueError(
+                f'strategy module {module!r} resolves outside strategies '
+                f'directory {strategies_dir!r}; refusing to load'
+            )
+        if not os.path.exists(filepath):
+            raise FileNotFoundError(f'strategy module not found: {filepath}')
+        return filepath
+
+    def _holds_automation_arm(self, name: str) -> bool:
+        return (bool(getattr(self, 'automation_enabled', False))
+                and name == (getattr(self, 'automation_strategy_name', '') or ''))
+
+    def _disarm_unverified_reload(self, name: str, cause: str) -> None:
+        """The armed strategy is reloading without passing bundle verification:
+        stop intent emission instead of running unattested code under the bundle."""
+        self.disarm_paper_automation()
+        self.automation_disarm_reason = (
+            f'AUTOMATION_DISARMED: strategy {name!r} reloaded without a verified bundle: {cause}')
+        logging.error('%s; Activate paper automation again once it binds', self.automation_disarm_reason)
+
+    def _verify_artifact_at_load(self, strategy_name: str, artifact_bundle_path_str: str, *,
+                                 module: str, class_name: Optional[str],
+                                 conids: Optional[List[int]], bar_size: Optional[str],
+                                 params: Optional[Dict], loaded_source_digest: str) -> None:
         """Run the full artifact verification chain at strategy load time.
+
+        ``loaded_source_digest`` is the SHA-256 of the strategy code that runs
+        (or is about to run); the binding compares it, not the file on disk now.
 
         Raises on any failure (fail-closed).  Logs the verification result
         (safe reason codes + public key ID only) at INFO level.
@@ -1360,6 +1410,11 @@ class StrategyRuntime():
             expected_artifact_id=expected_artifact_id,
             now=_dt.datetime.now(_dt.timezone.utc),
         )
+        from trader.automation.strategy_binding import check_strategy_binding
+        check_strategy_binding(
+            verified.attested_strategy, module_file=_Path(self._strategy_file_path(module)),
+            class_name=class_name or '', params=params, conids=conids, bar_size=bar_size or '',
+            loaded_source_digest=loaded_source_digest)
         # Only the configured one-strategy name may hold a verified artifact
         # for automated intent emission (P3 Task 9).
         if (
@@ -1368,6 +1423,7 @@ class StrategyRuntime():
         ):
             self._verified_artifact = verified
             self._verified_artifact_strategy = strategy_name
+            self._verified_source_digest = loaded_source_digest
             self._maybe_build_intent_emitter()
         logging.info(
             'strategy %s artifact verified: id=%s key=%s mode=%s codes=%s',
@@ -1588,6 +1644,7 @@ class StrategyRuntime():
                     signal=signal,
                     completed_bar_timestamp=bar_ts,
                     session_id=session_id,
+                    reference_price=float(frame['close'].iloc[-1]),
                 )
             except Exception:
                 logging.exception(
@@ -1621,6 +1678,12 @@ class StrategyRuntime():
         client = getattr(self, '_trader_command_client', None)
         if client is None:
             return
+        loaded_source_digest = getattr(self, '_verified_source_digest', '') or ''
+        if not loaded_source_digest:
+            logging.error(
+                'intent emitter not built for strategy %s: the loaded code has no source digest',
+                self.automation_strategy_name)
+            return
         from trader.strategy.intent_emitter import IntentEmitter, IntentEmitterContext
 
         digest = self._verified_artifact.manifest_digest
@@ -1628,6 +1691,9 @@ class StrategyRuntime():
         # identity when available; fall back to the verified manifest digest.
         bundle_digest = digest if digest.startswith('sha256:') else f'sha256:{digest}'
         account_mode = 'paper' if self.paper_trading else 'live'
+        attested = getattr(self._verified_artifact, 'attested_strategy', None)
+        order_notional = (Decimal(str(attested.order_notional))
+                          if attested is not None and attested.order_notional else None)
         self.intent_emitter = IntentEmitter(
             command_client=client,
             context=IntentEmitterContext(
@@ -1639,6 +1705,8 @@ class StrategyRuntime():
                 eligibility_attestation_digest=digest,
                 artifact_bundle_digest=bundle_digest,
                 account_mode=account_mode,
+                strategy_source_digest=loaded_source_digest,
+                order_notional=order_notional,
             ),
         )
         logging.info(
@@ -1666,6 +1734,7 @@ class StrategyRuntime():
         self.intent_emitter = None
         self._verified_artifact = None
         self._verified_artifact_strategy = None
+        self._verified_source_digest = ''
         self._artifact_verifier = None
         self.automation_enabled = False
         self.automation_strategy_name = ''
@@ -1718,7 +1787,9 @@ class StrategyRuntime():
         self.intent_emitter = None
         self._verified_artifact = None
         self._verified_artifact_strategy = None
+        self._verified_source_digest = ''
         self._artifact_verifier = None
+        self.automation_disarm_reason = ''
 
         self.automation_enabled = True
         self.automation_live_enabled = False
@@ -1727,8 +1798,17 @@ class StrategyRuntime():
         self.automation_expected_artifact_id = artifact_id
         self.automation_strategy_name = name
 
+        strategy = self.get_strategy(name)
+        if strategy is None:
+            self.disarm_paper_automation()
+            raise PaperAutomationArmError(
+                'STRATEGY_NOT_FOUND', f'strategy {name!r} is not loaded; load it before arming')
+
         try:
-            self._verify_artifact_at_load(name, bundle)
+            self._verify_artifact_at_load(
+                name, bundle, module=strategy.module, class_name=strategy.class_name,
+                conids=strategy.conids, bar_size=str(strategy.bar_size), params=strategy.params,
+                loaded_source_digest=getattr(strategy, 'loaded_source_digest', ''))
         except Exception as exc:
             self.disarm_paper_automation()
             raise PaperAutomationArmError(
@@ -1840,12 +1920,25 @@ class StrategyRuntime():
 
         strategies_dir = os.path.abspath(os.path.expanduser(self.strategies_directory))
 
+        # Read the module once: the digest the bundle binding checks is the
+        # digest of the exact bytes that run (spec section 7).
+        try:
+            filepath = self._sandboxed_strategy_file(module, strategies_dir)
+            with open(filepath, 'rb') as source_file:
+                source = source_file.read()
+        except Exception as ex:
+            logging.error('failed to load strategy %s (%s): %s', name, class_name, ex)
+            return
+        loaded_source_digest = hashlib.sha256(source).hexdigest()
+
         # [P3 Task 2] Artifact verification gate — checked BEFORE the class module
-        # is loaded from disk. When automation is enabled and the strategy carries
+        # is executed. When automation is enabled and the strategy carries
         # ``artifact_bundle_path``, fail closed on any verification failure.
         # When automation is *disabled*, still load the strategy (soft-load) so it
         # appears in Strategies / Scaling for Activate; attestation runs on arm.
+        # The armed strategy never reloads unverified: it disarms instead.
         artifact_bundle_path_str = (params or {}).get('artifact_bundle_path', '')
+        holds_automation_arm = self._holds_automation_arm(name)
         if artifact_bundle_path_str:
             if not self.automation_enabled:
                 logging.warning(
@@ -1856,37 +1949,23 @@ class StrategyRuntime():
                 )
             else:
                 try:
-                    self._verify_artifact_at_load(name, artifact_bundle_path_str)
+                    self._verify_artifact_at_load(
+                        name, artifact_bundle_path_str, module=module, class_name=class_name,
+                        conids=conids, bar_size=bar_size_str, params=params,
+                        loaded_source_digest=loaded_source_digest)
                 except Exception as exc:
+                    if holds_automation_arm:
+                        self._disarm_unverified_reload(
+                            name, f'artifact verification failed: {exc}')
                     logging.error(
                         'refusing to load strategy %s: artifact verification failed: %s',
                         name, exc,
                     )
                     return
+        elif holds_automation_arm:
+            self._disarm_unverified_reload(name, 'its params no longer name an artifact_bundle_path')
 
-        def load_class_from_file(filename, classname):
-            # Reject absolute paths and path traversal. Strategy modules must
-            # live under ``strategies_directory`` — otherwise a malicious YAML
-            # could load any .py on disk.
-            requested = os.path.expanduser(filename)
-            if os.path.isabs(requested):
-                # Allow absolute paths only if they resolve inside strategies_dir
-                filepath = os.path.abspath(requested)
-            else:
-                filepath = os.path.abspath(os.path.join(strategies_dir, requested))
-                # Also accept a project-root-relative path like "strategies/foo.py"
-                if not os.path.exists(filepath):
-                    filepath = os.path.abspath(requested)
-
-            if not filepath.startswith(strategies_dir + os.sep) and filepath != strategies_dir:
-                raise ValueError(
-                    f'strategy module {filename!r} resolves outside strategies '
-                    f'directory {strategies_dir!r}; refusing to load'
-                )
-
-            if not os.path.exists(filepath):
-                raise FileNotFoundError(f'strategy module not found: {filepath}')
-
+        def load_class_from_source(classname):
             # Namespace the module key by the strategy NAME (unique) rather
             # than the filename, so two strategies with the same basename
             # (e.g. strategies/a/ma.py and strategies/b/ma.py) don't clobber
@@ -1897,17 +1976,18 @@ class StrategyRuntime():
             spec = importlib.util.spec_from_file_location(module_name, filepath)
             if not spec or not spec.loader:
                 return None
-            module = importlib.util.module_from_spec(spec)
-            sys.modules[module_name] = module
+            module_object = importlib.util.module_from_spec(spec)
+            sys.modules[module_name] = module_object
             try:
-                spec.loader.exec_module(module)
+                # Execute the bytes that were hashed, never a second read of the file.
+                exec(compile(source, filepath, 'exec', dont_inherit=True), module_object.__dict__)
             except Exception:
                 sys.modules.pop(module_name, None)
                 raise
-            return getattr(module, classname, None)
+            return getattr(module_object, classname, None)
 
         try:
-            class_object = load_class_from_file(module, class_name)
+            class_object = load_class_from_source(class_name)
             if not class_object:
                 return
 
@@ -1951,6 +2031,7 @@ class StrategyRuntime():
 
                 # Give the strategy a reference to the runtime for subscriptions
                 instance.strategy_runtime = self
+                instance.loaded_source_digest = loaded_source_digest
 
                 # Restore the persisted enabled/disabled state so a runtime
                 # enable/disable survives a service restart. Unset (None) leaves

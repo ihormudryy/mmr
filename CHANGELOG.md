@@ -6,6 +6,17 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and
 
 ## [Unreleased]
 
+### Added
+
+- **Research evidence for paper automation**: `mmr research evaluate <spec.yaml>` runs walk-forward backtests under the live paper rules at 1x/1.5x/2x costs and records paper-v1 evidence; the holdout opens once, only after every other rule passes. `research evaluations`, `research review submit --reviewer-kind human|llm` and `research attest bundle` complete the flow. Example spec: `research/example_spec.yaml`.
+- **Bundle binding**: a bundle must attest the loaded strategy code, class, params, conids and bar size. It is checked at load, at arm and in Activate; dispatch rejects other artifacts (`ARTIFACT_NOT_ARMED`) and source mismatches (`STRATEGY_SOURCE_MISMATCH`).
+
+### Changed
+
+- **Activate** finds the newest eligible, qualified bundle bound to the strategy, or refuses with `NO_ELIGIBLE_BUNDLE` naming the latest evaluation. It no longer needs the bundle configured first. Production code can no longer create fixture bundles; `scripts/bootstrap_paper_automation.py` is read-only and takes `--bundle`.
+- **Backtest costs**: CLI backtests default to `--cost-model realistic` (per-venue broker commission, tick half-spread, square-root impact). A conid without a known venue fails loudly. `--cost-model legacy` keeps the old flat costs.
+- **`expectancy_bps`** is dollar-weighted (net P&L over entry notional), so its sign matches return and profit factor. Stored runs keep their old values.
+
 ## [0.1.0] - 2026-10-04
 
 First tagged release. It captures the platform as it runs today.

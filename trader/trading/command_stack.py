@@ -470,6 +470,12 @@ def _broker_ready(trader: Any) -> bool:
     return bool(readiness() if callable(readiness) else readiness)
 
 
+def _bundle_root_for(bundle_path: str) -> Path:
+    """A bundle directory's parent is the root order dispatch resolves digests under."""
+    root = Path(os.path.abspath(os.path.expanduser(bundle_path)))
+    return root.parent if root.name.startswith(("artifact-", "sha256_")) else root
+
+
 def _build_automated_intent_service(
     trader: Any,
     *,
@@ -495,9 +501,6 @@ def _build_automated_intent_service(
     Returns ``None`` when dormant so ``execute_automated_intent`` is never
     registered.
     """
-    import os as _os
-    from pathlib import Path as _Path
-
     if not getattr(trader, "automation_enabled", False):
         return None
     if getattr(trader, "automation_live_enabled", False):
@@ -529,7 +532,7 @@ def _build_automated_intent_service(
             f"no usable *.pem verify keys under {key_ring!r}",
         )
     verifier = ArtifactVerifier(trusted_public_keys=public_keys)
-    root = _Path(_os.path.abspath(_os.path.expanduser(bundle_path)))
+    root = Path(os.path.abspath(os.path.expanduser(bundle_path)))
     evidence = ProductionAutomationEvidence(
         broker=broker, quotes=quotes, margin=margin,
         history=getattr(trader, "data", None), journal=journal,
@@ -548,7 +551,7 @@ def _build_automated_intent_service(
         account_id=account_id,
         account_mode=account_mode,
         now=now,
-        bundle_root=root.parent,
+        bundle_root=_bundle_root_for(bundle_path),
         configured_bundle_path=root,
         expected_artifact_id=expected_id,
         bundle_evidence_validator=require_qualified_research_evidence,

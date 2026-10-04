@@ -709,6 +709,9 @@ class ExecuteAutomatedIntentRequest(BaseModel):
     signal_timestamp: dt.datetime
     completed_bar_timestamp: dt.datetime
     artifact_bundle_digest: str
+    # Content hash of the strategy file the emitting runtime loaded; the trader
+    # checks it against the attested source digest.
+    strategy_source_digest: Optional[str] = None
 
     @field_validator("command_id")
     @classmethod

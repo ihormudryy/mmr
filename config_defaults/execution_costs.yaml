@@ -1,0 +1,40 @@
+# TEMPLATE — copied to ~/.config/mmr/ on first run (container.ensure_config_dir).
+# Edits here do NOT affect a running system; edit ~/.config/mmr/execution_costs.yaml.
+#
+# Execution costs the backtester charges with --cost-model realistic (the
+# default). Each venue maps IB primary exchanges to a commission schedule and a
+# price-banded tick table. An instrument whose primary exchange is not listed
+# fails the backtest loudly, so add a venue before testing a new market.
+# calendar: the exchange session calendar; research evaluation needs it.
+#
+# Commission defaults are IBKR Fixed pricing (checked 2026-10-04). If your
+# account uses Tiered pricing, change them to match your statements.
+venues:
+  us:
+    primary_exchanges: [NASDAQ, NYSE, ARCA, AMEX, BATS, IEX]
+    calendar: XNYS
+    commission:
+      per_share: 0.005        # USD
+      minimum: 1.0            # USD per order
+      max_pct_of_value: 0.01  # capped at 1% of trade value
+    tick_table:               # [band floor price, tick]
+      - [0.0, 0.0001]
+      - [1.0, 0.01]
+  asx:
+    primary_exchanges: [ASX]
+    calendar: XASX
+    commission:
+      pct_of_value: 0.0008    # 0.08% of trade value
+      minimum: 6.0            # AUD per order
+    tick_table:
+      - [0.0, 0.001]
+      - [0.10, 0.005]
+      - [2.0, 0.01]
+
+# Estimated quoted spread in ticks (history has no bid/ask). A fill pays half
+# of it, but never less than min_half_spread_bps.
+spread_ticks: 1.0
+min_half_spread_bps: 0.5
+# Square-root impact: k * (high - low) / price * sqrt(quantity / volume),
+# using the bar known when the order was decided.
+impact_k: 0.1

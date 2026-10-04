@@ -450,9 +450,14 @@ Nightly sweeps drop a markdown digest to `~/.local/share/mmr/reports/sweep_<id>_
 When a new strategy is published, it is distributed as a read-only artifact bundle. To verify the bundle and replay its execution, use:
 
 ```bash
-mmr research attest verify --public-key-file <path_to_public_key> --bundle <path_to_bundle>
-python scripts/reproduce_experiment.py --bundle <path_to_bundle>
+mmr research attest verify --digest <payload_digest> --public-key-file <path_to_public_key> \
+    --artifact-digest <artifact_digest> --allowlist-digest <allowlist_digest> \
+    --ruleset-digest <ruleset_digest> --account-mode paper \
+    --max-gross-allocation <max_gross_allocation> --instruments <conid> [<conid> ...]
+python scripts/reproduce_experiment.py --bundle <path_to_bundle>   # placeholder: prints the path, no replay yet
 ```
+
+Take the values from the bundle's `attestation.json`. `attest verify` reads the stored attestation from the local research DB, so run it on the machine that ran `mmr research attest bundle`.
 
 **Note on Data Limitations:** Data vendors may introduce restatements, stock splits, or corrections over time. Because of this, a software-pass experiment will remain `CANDIDATE` until a real qualified dataset and family earn a signed paper attestation.
 

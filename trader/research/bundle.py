@@ -13,7 +13,8 @@ from typing import Any, Mapping, Sequence
 
 from trader.research import signing
 from trader.research.artifact import (
-    TRIAL_SUCCEEDED, ExperimentFamily, artifact_id as strategy_artifact_id, trial_id,
+    ARTIFACT_STATE_RETIRED, TRIAL_SUCCEEDED, ExperimentFamily,
+    artifact_id as strategy_artifact_id, trial_id,
 )
 from trader.research.attestation import (
     AttestationRepository, EligibilityAttestation, attestation_payload_bytes,
@@ -364,6 +365,10 @@ def _validate_payload_bindings(root: Path, manifest: Mapping[str, Any],
     try:
         if artifact["artifact_id"] != manifest["artifact_id"]:
             raise BundleError("artifact binding disagrees with manifest")
+        if artifact["state"] == ARTIFACT_STATE_RETIRED or artifact["holdout"]["passed"] is not True:
+            raise BundleError(
+                f"artifact did not pass its holdout (state {artifact['state']}, holdout passed "
+                f"{artifact['holdout']['passed']}); a failed holdout can never run")
         reconstructed_family = ExperimentFamily(
             strategy_path=family["strategy_path"], class_name=family["class_name"],
             repository_commit=family["repository_commit"],
@@ -447,7 +452,8 @@ def _validate_payload_bindings(root: Path, manifest: Mapping[str, Any],
             operational_dependencies=review["operational_dependencies"],
             capacity_and_decay=review["capacity_and_decay"],
             episode_dominance=review["episode_dominance"],
-            holdout_opened_once_confirmed=review["holdout_opened_once_confirmed"])
+            holdout_opened_once_confirmed=review["holdout_opened_once_confirmed"],
+            reviewer_kind=review.get("reviewer_kind", "unknown"))
         if review_object.digest != review["review_digest"]:
             raise BundleError("review digest binding disagrees")
         attestation_fields = {key: value for key, value in attestation.items()
@@ -557,7 +563,8 @@ def _review_public(review: OperatorReview) -> dict[str, Any]:
             "operational_dependencies": review.operational_dependencies,
             "capacity_and_decay": review.capacity_and_decay,
             "episode_dominance": review.episode_dominance,
-            "holdout_opened_once_confirmed": review.holdout_opened_once_confirmed}
+            "holdout_opened_once_confirmed": review.holdout_opened_once_confirmed,
+            "reviewer_kind": review.reviewer_kind}
 
 
 def _attestation_public(attestation: EligibilityAttestation) -> dict[str, Any]:

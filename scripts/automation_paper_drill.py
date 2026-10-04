@@ -57,6 +57,7 @@ from trader.automation.session_controller import (
     SessionController,
     apply_session_controller_migration,
 )
+from trader.automation.strategy_binding import AttestedStrategy
 from trader.data.attribution_store import apply_attribution_migrations
 from trader.data.broker_state import BrokerRiskSnapshot
 from trader.data.domain_journal import DomainJournal
@@ -96,6 +97,7 @@ ARTIFACT_DIGEST = "sha256:artifact-bundle-deadbeef"
 ATTEST_DIGEST = "b" * 64
 SESSION_ID = "xnys-2026-07-18"
 BUNDLE_DIGEST = ARTIFACT_DIGEST
+SOURCE_DIGEST = "d" * 64
 
 
 # ---------------------------------------------------------------------------
@@ -350,22 +352,27 @@ class SliceStack:
 
 
 def _artifact() -> VerifiedArtifact:
+    parameters = {
+        "entry_order_type": "LIMIT",
+        "limit_offset_bps": "5",
+        "stop_order_type": "STP",
+        "risk_fraction": "0.002",
+        "max_hold_bars": 10,
+    }
     return VerifiedArtifact(
         artifact_id=ARTIFACT_ID,
         manifest_digest="a" * 64,
         dataset_manifest_digest="c" * 64,
-        parameters={
-            "entry_order_type": "LIMIT",
-            "limit_offset_bps": "5",
-            "stop_order_type": "STP",
-            "risk_fraction": "0.002",
-            "max_hold_bars": 10,
-        },
+        parameters=parameters,
         allowlist=(str(CONID), "AAPL"),
         max_gross_allocation=0.06,
         expires_at=NOW + dt.timedelta(days=30),
         public_key_id="ed25519-test",
         verification_reason_codes=("RULES_PASS",),
+        attested_strategy=AttestedStrategy(
+            strategy_path="strategies/paper_slice_orb.py", class_name="PaperSliceOrb",
+            source_digest=SOURCE_DIGEST, parameters=parameters,
+            instruments=frozenset({str(CONID)}), bar_size="1 min", order_notional=None),
     )
 
 
@@ -488,6 +495,7 @@ def build_stack(
         account_mode="paper",
         now=clock,
         bundle_root=bundles,
+        expected_artifact_id=ARTIFACT_ID,
         protective_saga=saga,
         approval_factory=approval_factory,
         session_state_factory=lambda **kw: SimpleNamespace(
@@ -521,6 +529,7 @@ def build_stack(
             eligibility_attestation_digest=ATTEST_DIGEST,
             artifact_bundle_digest=BUNDLE_DIGEST,
             account_mode="paper",
+            strategy_source_digest=SOURCE_DIGEST,
         ),
         now=clock,
     )

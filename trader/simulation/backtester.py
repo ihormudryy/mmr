@@ -6,10 +6,11 @@ from trader.data.market_data import normalize_historical
 from trader.data.store import DateRange
 from trader.data.universe import UniverseAccessor
 from trader.objects import Action, BarSize
-from trader.simulation.slippage import FixedBPS, SlippageModel
+from trader.simulation.execution_costs import ExecutionCosts, FlatCosts
+from trader.simulation.slippage import SlippageModel
 from trader.trading.risk_gate import RiskGate, RiskLimits
 from trader.trading.strategy import Signal, Strategy, StrategyContext, StrategyState
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, TYPE_CHECKING
 
 import datetime as dt
 import importlib
@@ -22,6 +23,10 @@ import pandas as pd
 import sys
 
 
+if TYPE_CHECKING:
+    from trader.simulation.live_rules import PaperAutomationRules
+
+
 logging = setup_logging(module_name='backtester')
 
 
@@ -31,9 +36,20 @@ class BacktestConfig:
     end_date: dt.datetime = field(default_factory=dt.datetime.now)
     initial_capital: float = 100_000.0
     bar_size: BarSize = BarSize.Mins1
+    # Legacy flat-cost knobs, used only when ``cost_model`` is None.
     slippage_bps: float = 1.0
     commission_per_share: float = 0.005
     slippage_model: Optional['SlippageModel'] = None  # overrides slippage_bps when set
+    # Per-instrument execution costs (``RealisticCosts``). The CLI builds one
+    # by default; library callers that pass nothing get the legacy flat costs
+    # above.
+    cost_model: Optional['ExecutionCosts'] = None
+    # Size of a BUY that carries no quantity, instead of 10% of cash. Evidence
+    # runs set it to the paper order size so commission minimums count.
+    order_notional: Optional[float] = None
+    # Live paper-automation entry gates and end-of-day flatten. Evidence runs
+    # set it so a backtest cannot take trades paper trading would refuse.
+    live_rules: Optional['PaperAutomationRules'] = None
     # Fill policy. ``next_open`` is realistic: a signal emitted at bar t
     # executes at bar t+1's open. ``same_close`` reproduces the (lookahead-
     # biased) legacy behavior and is only intended for regression tests.
@@ -74,6 +90,12 @@ class BacktestResult:
     # Effective param overrides applied via ``apply_param_overrides``. Empty
     # when the run used class defaults. Populated by ``run_from_module``.
     applied_params: Dict[str, Any] = field(default_factory=dict)
+    # Entries the live rules refused, counted by reason code.
+    live_rule_blocks: Dict[str, int] = field(default_factory=dict)
+    # Conids whose bars loaded, in the order they were asked for. A conid
+    # without bars is skipped with a warning, so callers that need every
+    # conid compare this against what they requested.
+    loaded_conids: List[int] = field(default_factory=list)
 
 
 def _coerce_param(raw: Any, current: Any, key: str) -> Any:
@@ -155,8 +177,11 @@ class Backtester:
         self.config = config
         self.risk_limits = risk_limits or RiskLimits()
 
-        if self.config.slippage_model is None:
-            self.config.slippage_model = FixedBPS(self.config.slippage_bps)
+        self.costs: ExecutionCosts = self.config.cost_model or FlatCosts(
+            slippage_bps=self.config.slippage_bps,
+            commission_per_share=self.config.commission_per_share,
+            slippage_model=self.config.slippage_model,
+        )
 
     def _load_strategy_class(self, module_path: str, class_name: str):
         filepath = os.path.abspath(os.path.expanduser(module_path))
@@ -274,6 +299,11 @@ class Backtester:
         equity_timestamps: List[dt.datetime] = []
 
         cash = self.config.initial_capital
+        live_rules = self.config.live_rules
+        live_rule_blocks: Dict[str, int] = {}
+        last_equity = self.config.initial_capital
+        if live_rules is not None:
+            live_rules.reset(last_equity)
         positions: Dict[int, float] = {}  # conid -> quantity (positive=long, negative=short)
         position_entry_prices: Dict[int, float] = {}
         # Time-based exit conditions per open position. Recorded when a
@@ -354,7 +384,7 @@ class Backtester:
         # Used to call ``on_bar(full_prices, state, index)`` in O(1).
         bar_index: Dict[int, int] = {conid: -1 for conid in all_data}
 
-        def _execute_signal(signal, conid, signal_ts, bar_ts, bar_row, fill_basis):
+        def _execute_signal(signal, conid, signal_ts, bar_ts, reference_bar, fill_basis):
             nonlocal cash
             signal_event = TradingEvent(
                 event_type=EventType.SIGNAL,
@@ -379,15 +409,26 @@ class Backtester:
                     # accumulating BUYs, silently dropping the exit).
                     held = positions.get(conid, 0)
                     quantity = held if held > 0 else 0
+                elif self.config.order_notional is not None:
+                    quantity = math.floor(self.config.order_notional / fill_basis)
                 else:
                     quantity = math.floor((cash * 0.1) / fill_basis) if fill_basis > 0 else 0
             if quantity <= 0:
                 return
 
-            fill_price = self.config.slippage_model.calculate(fill_basis, quantity, signal.action, bar_row)
-            commission = quantity * self.config.commission_per_share
+            fill_price = self.costs.fill_price(conid, fill_basis, quantity, signal.action, reference_bar)
+            commission = self.costs.commission(conid, quantity, fill_price)
 
             if signal.action == Action.BUY:
+                if live_rules is not None:
+                    position_values = {c: q * last_prices.get(c, 0.0) for c, q in positions.items()}
+                    block = live_rules.entry_block_reason(
+                        ts=bar_ts, conid=conid, order_notional=quantity * fill_price,
+                        position_values=position_values,
+                        equity=cash + sum(position_values.values()))
+                    if block is not None:
+                        live_rule_blocks[block] = live_rule_blocks.get(block, 0) + 1
+                        return
                 cost = quantity * fill_price + commission
                 if cost > cash:
                     return
@@ -419,7 +460,7 @@ class Backtester:
                 if held <= 0:
                     return
                 sell_qty = min(quantity, held)
-                commission = sell_qty * self.config.commission_per_share
+                commission = self.costs.commission(conid, sell_qty, fill_price)
                 proceeds = sell_qty * fill_price - commission
                 cash += proceeds
                 positions[conid] = positions.get(conid, 0) - sell_qty
@@ -446,6 +487,20 @@ class Backtester:
             for conid in group['conid'].unique():
                 bars_this_ts[conid] = group[group['conid'] == conid].drop(columns=['conid'])
 
+            # 0. Live paper automation: track session equity, flatten before the close.
+            if live_rules is not None:
+                live_rules.mark(timestamp, last_equity)
+                if positions and live_rules.flatten_due(timestamp):
+                    for conid in list(positions):
+                        bar = bars_this_ts.get(conid)
+                        if bar is None or bar.empty or conid not in accumulated:
+                            continue
+                        flatten = Signal(source_name='__flatten__', action=Action.SELL,
+                                         probability=1.0, risk=0.0, quantity=positions[conid])
+                        _execute_signal(flatten, conid, timestamp, timestamp,
+                                        accumulated[conid].iloc[-1], float(bar['open'].iloc[0]))
+                    pending_signals = [p for p in pending_signals if p[0].action != Action.BUY]
+
             # 1. Execute any signals queued from the previous bar at THIS bar's open
             if self.config.fill_policy == 'next_open' and pending_signals:
                 still_pending = []
@@ -456,7 +511,10 @@ class Backtester:
                         still_pending.append((signal, conid, signal_ts))
                         continue
                     open_price = float(bar['open'].iloc[0])
-                    _execute_signal(signal, conid, signal_ts, timestamp, bar.iloc[-1], open_price)
+                    # Costs see the signal bar (the last one accumulated), not
+                    # this fill bar: its range and volume are not known at the open.
+                    _execute_signal(signal, conid, signal_ts, timestamp,
+                                    accumulated[conid].iloc[-1], open_price)
                 pending_signals = still_pending
 
             # 2. Accumulate this bar into the expanding window + update last prices
@@ -559,6 +617,7 @@ class Backtester:
             portfolio_value = cash
             for conid, qty in positions.items():
                 portfolio_value += qty * last_prices.get(conid, 0)
+            last_equity = portfolio_value
 
             equity_values.append(portfolio_value)
             equity_timestamps.append(
@@ -596,15 +655,15 @@ class Backtester:
 
         # Win rate + per-round-trip P&L tracking. Each SELL closes part or
         # all of an open position; we compute its P&L from the weighted
-        # average entry price and feed those P&Ls into profit_factor and
-        # expectancy_bps below.
+        # average entry price and feed those P&Ls (and their entry notionals)
+        # into profit_factor and expectancy_bps below.
         avg_entry: Dict[int, float] = {}   # conid -> weighted avg entry price
         avg_qty: Dict[int, float] = {}     # conid -> total held quantity
         avg_buy_comm: Dict[int, float] = {}  # conid -> weighted buy commission PER SHARE
         winning_trades = 0
         sell_trades = 0
         round_trip_pnl: List[float] = []           # dollar P&L per SELL
-        round_trip_return_pct: List[float] = []    # P&L / notional per SELL
+        round_trip_notional: List[float] = []      # entry notional per SELL
         for trade in trades:
             if trade.action == Action.BUY:
                 prev_qty = avg_qty.get(trade.conid, 0.0)
@@ -626,9 +685,7 @@ class Backtester:
                 buy_comm_alloc = avg_buy_comm.get(trade.conid, 0.0) * trade.quantity
                 pnl = (trade.price - entry_price) * trade.quantity - trade.commission - buy_comm_alloc
                 round_trip_pnl.append(pnl)
-                if entry_price > 0:
-                    notional = entry_price * trade.quantity
-                    round_trip_return_pct.append(pnl / notional if notional > 0 else 0.0)
+                round_trip_notional.append(entry_price * trade.quantity)
                 if entry_price > 0 and trade.price > entry_price:
                     winning_trades += 1
                 # Reduce tracked quantity
@@ -677,12 +734,14 @@ class Backtester:
         else:
             profit_factor = 0.0
 
-        # Expectancy per trade, in basis points of entry notional. This is
-        # what actually has to survive slippage/commissions in production —
-        # a strategy with +0.3 bps expectancy dies to 1 bps of real-world
-        # slippage. Reported per round-trip (SELL-closing-position).
-        if round_trip_return_pct:
-            expectancy_bps = float(np.mean(round_trip_return_pct) * 10_000)
+        # Expectancy in basis points of traded notional: total net P&L over
+        # total entry notional of the closed trades. Dollar-weighted on
+        # purpose — a plain mean of per-trade returns lets many small losers
+        # outvote one large winner and can disagree in sign with profit
+        # factor and return. This is what has to survive real-world costs.
+        traded_notional = sum(round_trip_notional)
+        if traded_notional > 0:
+            expectancy_bps = float(sum(round_trip_pnl) / traded_notional * 10_000)
         else:
             expectancy_bps = 0.0
 
@@ -710,6 +769,8 @@ class Backtester:
             time_in_market_pct=time_in_market_pct,
             start_date=self.config.start_date,
             end_date=self.config.end_date,
+            live_rule_blocks=dict(live_rule_blocks),
+            loaded_conids=list(all_data),
         )
 
         logging.info(

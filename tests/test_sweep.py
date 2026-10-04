@@ -474,3 +474,28 @@ def test_options_buy_missing_price_emits_json(monkeypatch, capsys):
     payload = json.loads(out)
     assert payload['success'] is False
     assert 'market' in payload['message'].lower() or 'limit' in payload['message'].lower()
+
+
+class TestSweepCostModel:
+
+    def _manifest(self, **extra):
+        return {'sweeps': [{'name': 's', 'strategy': '/x.py', 'class': 'X',
+                            'symbols': ['SPY'], **extra}]}
+
+    def test_defaults_to_the_realistic_cost_model(self):
+        assert _sweep_manifest_validate(self._manifest())[0]['cost_model'] == 'realistic'
+
+    def test_accepts_legacy(self):
+        cleaned = _sweep_manifest_validate(self._manifest(cost_model='legacy'))
+        assert cleaned[0]['cost_model'] == 'legacy'
+
+    def test_rejects_an_unknown_cost_model(self):
+        with pytest.raises(ValueError, match='cost_model'):
+            _sweep_manifest_validate(self._manifest(cost_model='cheap'))
+
+    def test_child_backtest_gets_the_cost_model(self):
+        from trader.mmr_cli import _sweep_backtest_command
+        job = {'strategy': '/x.py', 'class_name': 'X', 'conids': [1], 'days': 30,
+               'bar_size': '1 min', 'params': {}, 'note': '', 'cost_model': 'legacy'}
+        cmd = _sweep_backtest_command(job, sweep_id=7, python_executable='python')
+        assert cmd[cmd.index('--cost-model') + 1] == 'legacy'

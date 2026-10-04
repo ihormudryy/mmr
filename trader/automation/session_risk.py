@@ -257,6 +257,8 @@ class SessionRiskController:
                     reasons.append("SESSION_CLOSED")
 
         qty = intent.requested_quantity
+        if qty is None and intent.side == "SELL" and held > 0:
+            qty = Decimal(str(held))  # an exit without a size closes the position
         if qty is None:
             reasons.append("QUANTITY_REQUIRED")
             qty = Decimal("0")

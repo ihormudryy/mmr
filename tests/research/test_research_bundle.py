@@ -56,7 +56,8 @@ def _evidence() -> EligibilityEvidence:
 
 def build_populated_db(tmp_path, *, attestation_source_digest="source-1",
                        attestation_config_digest="config-1", validation_folds=None,
-                       include_bundle_evidence_refs=True, return_signer=False):
+                       include_bundle_evidence_refs=True, return_signer=False,
+                       holdout_passed=True):
     db = DuckDBConnection.get_instance(str(tmp_path / "research.duckdb"))
     apply_research_migrations(SchemaMigrator(db))
     registry = ExperimentRegistry(db)
@@ -82,7 +83,7 @@ def build_populated_db(tmp_path, *, attestation_source_digest="source-1",
     registry.set_trial_archived(failed, True)
     artifact_id = registry.seal_artifact(family.family_id, selected_trial_id=selected,
                                          selected_parameters={"minutes": 30}, sealed_at=T0)
-    registry.open_holdout(artifact_id, opened_at=T0, passed=True, detail="passed")
+    registry.open_holdout(artifact_id, opened_at=T0, passed=holdout_passed, detail="holdout")
     decision = evaluate_eligibility(PAPER_V1, _evidence())
     EligibilityDecisionRepository(db).record(decision, artifact_id=artifact_id, recorded_at=T0)
     review = OperatorReview(
@@ -266,6 +267,36 @@ def test_verify_rejects_self_consistent_semantic_payload_tampering(tmp_path, nam
     _rewrite_payload_and_manifest(root, name, mutate)
 
     with pytest.raises(BundleError):
+        bundle.verify(root, trusted_public_keys={signer.public_key_id: signer.public_key})
+
+
+@pytest.mark.parametrize("mutate", [
+    lambda artifact: artifact.__setitem__("state", "RETIRED"),
+    lambda artifact: artifact["holdout"].__setitem__("passed", False),
+], ids=["retired", "holdout-failed"])
+def test_verify_refuses_an_artifact_whose_holdout_did_not_pass(tmp_path, mutate):
+    from trader.research.bundle import BundleError, ResearchBundle
+
+    db, artifact_id, signer = build_populated_db(tmp_path, return_signer=True)
+    root = tmp_path / "bundle"
+    bundle = ResearchBundle(db)
+    bundle.export(artifact_id, root)
+    _rewrite_payload_and_manifest(root, "artifact.json", mutate)
+
+    with pytest.raises(BundleError, match="holdout"):
+        bundle.verify(root, trusted_public_keys={signer.public_key_id: signer.public_key})
+
+
+def test_verify_refuses_an_exported_failed_holdout(tmp_path):
+    from trader.research.bundle import BundleError, ResearchBundle
+
+    db, artifact_id, signer = build_populated_db(tmp_path, return_signer=True,
+                                                 holdout_passed=False)
+    root = tmp_path / "bundle"
+    bundle = ResearchBundle(db)
+    bundle.export(artifact_id, root)
+
+    with pytest.raises(BundleError, match="holdout"):
         bundle.verify(root, trusted_public_keys={signer.public_key_id: signer.public_key})
 
 

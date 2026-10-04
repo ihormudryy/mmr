@@ -234,9 +234,15 @@ services:
       - ${HOME}/.config/mmr:/home/trader/.config/mmr
       - mmr_db_data:/home/trader/.local/share/mmr/data
       - ${HOME}/.local/share/mmr/logs:/home/trader/.local/share/mmr/logs
-      # Paper-automation Activate (dashboard hot-arm) exports the fixture
-      # bundle HERE — must be writable on trader. Strategy keeps :ro below;
-      # ArtifactVerifier still refuses writable mounts in live mode.
+      # Paper-automation Activate (dashboard hot-arm) reads the bundles that
+      # `mmr research attest bundle` exports HERE (sha256_<digest>/), plus the
+      # evaluation summaries from `mmr research evaluate` (evaluations/), which
+      # it quotes when it refuses. Activate only reads them; the mount is
+      # writable on trader as it always was. The bars and the research DB live
+      # in the mmr_db_data volume. `mmr research evaluate` is not supported in
+      # split Docker yet (see Known blockers in docs/OPERATIONAL_STATE.md).
+      # Strategy keeps :ro below; ArtifactVerifier still refuses writable
+      # mounts in live mode.
       - ${HOME}/.local/share/mmr/artifacts:/home/trader/.local/share/mmr/artifacts
     healthcheck:
       # LIVENESS ONLY. Semantic trading readiness is exposed by typed

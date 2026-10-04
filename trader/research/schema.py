@@ -84,11 +84,12 @@ _QUALITY_STATEMENTS = (
 def apply_research_migrations(migrator: SchemaMigrator) -> None:
     """Set up the WHOLE offline research DB (idempotent): dataset manifests
     (migrations 1-2), the experiment registry (migrations 3-6), the eligibility
-    decision store (migration 7), operator reviews (migration 8), and eligibility
-    attestations + revocations (migration 9). The research DB is a single file,
-    so one call bootstraps every research table. The downstream migrations are
-    imported lazily to keep this module free of a hard dependency on the
-    registry/eligibility/attestation modules at import time."""
+    decision store (migration 7), operator reviews (migration 8), eligibility
+    attestations + revocations (migration 9), the operator-review kind
+    (migration 10), and the evaluation log (migration 11). The research DB is a
+    single file, so one call bootstraps every research table. The downstream
+    migrations are imported lazily to keep this module free of a hard
+    dependency on the registry/eligibility/attestation modules at import time."""
     migrator.apply(version=RESEARCH_MIGRATION_DATASET_MANIFESTS,
                    name="research_dataset_manifests",
                    statements=list(_MANIFEST_STATEMENTS))
@@ -103,6 +104,10 @@ def apply_research_migrations(migrator: SchemaMigrator) -> None:
     apply_review_migrations(migrator)
     from trader.research.attestation import apply_attestation_migrations
     apply_attestation_migrations(migrator)
+    from trader.research.review import apply_reviewer_kind_migration
+    apply_reviewer_kind_migration(migrator)
+    from trader.research.evaluation_store import apply_evaluation_migrations
+    apply_evaluation_migrations(migrator)
 
 
 class DigestConflict(Exception):

@@ -54,6 +54,8 @@ UTC = dt.timezone.utc
 NOW = dt.datetime(2026, 7, 18, 14, 30, tzinfo=UTC)
 ACCOUNT = "DU111111"
 ARTIFACT_DIGEST = "sha256:artifact-bundle-deadbeef"
+SOURCE_DIGEST = "src-attested"
+ARMED_ARTIFACT_ID = "artifact-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
 
 
 # ---------------------------------------------------------------------------
@@ -66,7 +68,7 @@ def _intent_fields(**overrides):
     target = TargetPolicy(target_price=Decimal("200"), order_type="LMT")
     time_exit = TimeExitPolicy(max_hold_bars=10, close_by=NOW + dt.timedelta(hours=2))
     fields = dict(
-        artifact_id="artifact-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        artifact_id=ARMED_ARTIFACT_ID,
         session_id="session-1",
         bar_id="bar-1",
         signal_id="signal-1",
@@ -149,6 +151,7 @@ def intent_to_wire(intent: ExecutionIntent, *, bundle_digest: str = ARTIFACT_DIG
         "signal_timestamp": _ts(intent.signal_timestamp),
         "completed_bar_timestamp": _ts(intent.completed_bar_timestamp),
         "artifact_bundle_digest": bundle_digest,
+        "strategy_source_digest": SOURCE_DIGEST,
     }
 
 
@@ -210,6 +213,7 @@ class FakeArtifactVerifier:
             expires_at=now + dt.timedelta(days=30),
             public_key_id="ed25519-test",
             verification_reason_codes=("RULES_PASS",),
+            attested_strategy=SimpleNamespace(source_digest=SOURCE_DIGEST),
         )
 
 
@@ -250,6 +254,7 @@ def _build_stack(tmp_path: Path, *, dispatch=None, verifier=None, now=None):
         account_mode="paper",
         now=clock,
         bundle_root=tmp_path / "bundles",
+        expected_artifact_id=ARMED_ARTIFACT_ID,
         schedule_reconcile=schedule.schedule,
     )
 
@@ -634,7 +639,7 @@ def test_configured_bundle_path_is_not_derived_from_wire_manifest_digest(tmp_pat
 @pytest.mark.parametrize(
     ("configured_id", "bundle_digest", "code"),
     [
-        ("artifact-other", "sha256:manifest-ok", "ARTIFACT_BINDING_MISMATCH"),
+        ("artifact-other", "sha256:manifest-ok", "ARTIFACT_NOT_ARMED"),
         (None, "sha256:different-manifest", "BUNDLE_DIGEST_MISMATCH"),
     ],
 )
@@ -685,3 +690,107 @@ def test_production_bundle_provenance_is_checked_after_signature_verification(tm
     assert receipt.error_code == "ARTIFACT_UNVERIFIED"
     assert len(checked) == 1
     assert stack.dispatch.calls == []
+
+
+# ---------------------------------------------------------------------------
+# Strategy source digest
+# ---------------------------------------------------------------------------
+
+class AttestingVerifier(FakeArtifactVerifier):
+    def verify(self, bundle_path, expected_mode, expected_artifact_id, now, *, revoked_digests=()):
+        artifact = super().verify(bundle_path, expected_mode, expected_artifact_id, now)
+        artifact.attested_strategy = SimpleNamespace(source_digest='src-attested')
+        return artifact
+
+
+class UnattestedVerifier(FakeArtifactVerifier):
+    """A verifier whose artifact carries no attested strategy at all."""
+
+    def __init__(self, *, keep_attribute_as_none: bool):
+        super().__init__()
+        self._keep_attribute_as_none = keep_attribute_as_none
+
+    def verify(self, bundle_path, expected_mode, expected_artifact_id, now, *, revoked_digests=()):
+        artifact = super().verify(bundle_path, expected_mode, expected_artifact_id, now)
+        if self._keep_attribute_as_none:
+            artifact.attested_strategy = None
+        else:
+            del artifact.attested_strategy
+        return artifact
+
+
+def _execute_with_body(stack, tmp_path, body):
+    (tmp_path / 'bundles').mkdir()
+    (tmp_path / 'bundles' / ARTIFACT_DIGEST.replace(':', '_')).mkdir()
+    intent = make_intent()
+    return stack.coordinator.execute(CommandRequest(
+        command_id=intent.command_id, action='execute_automated_intent', account_id=ACCOUNT,
+        target_type='intent', target_id=intent.intent_id, expected_version=None,
+        body=body, source='strategy_service'))
+
+
+@pytest.mark.parametrize('sent, expected_error', [
+    ('src-attested', None),
+    ('src-other', 'STRATEGY_SOURCE_MISMATCH'),
+    (None, 'STRATEGY_SOURCE_MISMATCH'),
+])
+def test_intent_source_digest_must_match_the_attested_file(tmp_path, sent, expected_error):
+    stack = _build_stack(tmp_path, verifier=AttestingVerifier())
+    intent = make_intent()
+    (tmp_path / 'bundles').mkdir()
+    (tmp_path / 'bundles' / ARTIFACT_DIGEST.replace(':', '_')).mkdir()
+    body = intent_to_request_body(intent)
+    body['strategy_source_digest'] = sent
+    receipt = stack.coordinator.execute(CommandRequest(
+        command_id=intent.command_id, action='execute_automated_intent', account_id=ACCOUNT,
+        target_type='intent', target_id=intent.intent_id, expected_version=None,
+        body=body, source='strategy_service'))
+    assert receipt.error_code == expected_error
+
+
+@pytest.mark.parametrize('keep_attribute_as_none', [True, False])
+def test_bundle_without_an_attested_strategy_rejects_the_intent(tmp_path, keep_attribute_as_none):
+    stack = _build_stack(
+        tmp_path, verifier=UnattestedVerifier(keep_attribute_as_none=keep_attribute_as_none))
+    body = intent_to_request_body(make_intent())
+    assert body['strategy_source_digest'] == SOURCE_DIGEST
+
+    receipt = _execute_with_body(stack, tmp_path, body)
+
+    assert receipt.state == 'REJECTED'
+    assert receipt.error_code == 'STRATEGY_SOURCE_MISMATCH'
+    assert 'attests no strategy' in receipt.outcome['detail']
+    assert stack.dispatch.calls == []
+
+
+def test_wire_model_carries_the_strategy_source_digest():
+    wire = intent_to_wire(make_intent())
+    wire['strategy_source_digest'] = 'src-1'
+    parsed = ExecuteAutomatedIntentRequest(**wire)
+    assert parsed.model_dump(mode='json')['strategy_source_digest'] == 'src-1'
+
+
+def test_an_intent_naming_an_artifact_that_is_not_armed_is_rejected(tmp_path):
+    stack = _build_stack(tmp_path)
+    other = make_intent(artifact_id="artifact-" + "b" * 32)
+    (tmp_path / "bundles" / ARTIFACT_DIGEST.replace(":", "_")).mkdir(parents=True)
+
+    receipt = stack.coordinator.execute(CommandRequest(
+        command_id=other.command_id, action="execute_automated_intent", account_id=ACCOUNT,
+        target_type="intent", target_id=other.intent_id, expected_version=None,
+        body=intent_to_request_body(other), source="strategy_service"))
+
+    assert (receipt.state, receipt.error_code) == ("REJECTED", "ARTIFACT_NOT_ARMED")
+    assert stack.verifier.calls == []
+    assert stack.dispatch.calls == []
+
+
+def test_the_service_refuses_to_start_without_an_armed_artifact(tmp_path):
+    from trader.automation.automated_intent_command import AutomatedIntentCommandService
+
+    with pytest.raises(ValueError, match="expected_artifact_id"):
+        AutomatedIntentCommandService(
+            ledger=None, audit=None, journal=None, controls=None,
+            dispatch=FakeIntentDispatch(), artifact_verifier=FakeArtifactVerifier(),
+            account_id=ACCOUNT, account_mode="paper", now=lambda: NOW,
+            bundle_root=tmp_path / "bundles", expected_artifact_id="")

@@ -277,6 +277,24 @@ class TestCostStress:
         res = cost_stress(run_fn, multipliers=(1.0, 2.0, 3.0))
         assert set(res.keys()) == {1.0, 2.0, 3.0}
 
+    def test_run_window_charges_a_per_instrument_cost_model(self, tmp_duckdb_path):
+        from trader.simulation.execution_costs import (
+            CommissionSchedule, RealisticCosts, TickTable, Venue,
+        )
+        _write_uptrend_bars(tmp_duckdb_path)
+        storage = TickStorage(duckdb_path=tmp_duckdb_path)
+        us = Venue(name='us', primary_exchanges=frozenset({'NASDAQ'}),
+                   commission=CommissionSchedule(per_share=0.005, minimum=1.0),
+                   ticks=TickTable([(0.0, 0.01)]))
+        costs = RealisticCosts(venue_by_conid={4391: us}, spread_ticks=1.0,
+                               min_half_spread_bps=0.5, impact_k=0.0)
+
+        result = run_window(lambda: _install(OneRoundTrip(), tmp_duckdb_path),
+                            [4391], storage=storage, window=_window(),
+                            cost=costs.scaled(2.0))
+
+        assert [t.commission for t in result.trades] == pytest.approx([2.0, 2.0])
+
 
 class TestTraceSignature:
     def test_identical_runs_identical_signature(self, tmp_duckdb_path):

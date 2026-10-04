@@ -1,14 +1,21 @@
 #!/usr/bin/env python3
-"""Verify existing public research material and print disabled activation config.
+"""Print the paper automation config snippets for a bundle from `mmr research attest bundle`.
 
-No normal-path key generation, evidence fabrication or activation. Explicit
---offline-fixture writes isolated, non-authorizing material for offline drills;
-it never prints activation snippets and cannot qualify a strategy for promotion.
+Read-only: it writes nothing and creates no keys or evidence. It refuses a bundle
+that the key ring under ``~/.config/mmr/keys/verify`` did not sign, then verifies
+the whole bundle (signature, expiry, qualified paper-v1 evidence, no fixture
+provenance) and prints **disabled** ``trader.yaml`` + strategy YAML snippets.
+It does not enable automation; Activate in the dashboard does, after it checks
+the strategy binding.
+
+Usage:
+    python3 scripts/bootstrap_paper_automation.py --bundle ~/.local/share/mmr/artifacts/sha256_<digest> --strategy-name <name>
 """
 from __future__ import annotations
 
 import argparse
 import datetime as dt
+import json
 import os
 import sys
 from pathlib import Path
@@ -20,13 +27,11 @@ if str(_PROJECT_ROOT) not in sys.path:
 from trader.automation.paper_materials import (
     PaperMaterialsError,
     default_key_paths,
-    ensure_signing_keypair,
-    export_fixture_paper_eligible_bundle,
     verify_qualified_paper_bundle,
 )
+from trader.research.signing import InvalidKeyType, MalformedKey, load_verify_key, public_key_id
 
 DEFAULT_CONFIG = Path(os.path.expanduser("~/.config/mmr"))
-DEFAULT_SHARE = Path(os.path.expanduser("~/.local/share/mmr"))
 
 
 def _print_snippets(
@@ -42,6 +47,9 @@ def _print_snippets(
     print(f"Public key ring:            {key_ring}")
     print(f"Artifact bundle:            {bundle_path}")
     print(f"Artifact id:                {artifact_id}")
+    print()
+    print("Note: Activate in /cc picks the newest eligible bundle bound to the strategy;")
+    print("it may arm a newer one than this and rewrites these keys itself.")
     print()
     print("1) Append to ~/.config/mmr/trader.yaml (paper only):")
     print()
@@ -67,8 +75,9 @@ def _print_snippets(
     print(f"      artifact_bundle_path: {bundle_path}")
     print()
     print("3) Activate via the dashboard after configuring the matching strategy.")
-    print("   A signature verifies integrity, not that performance was measured.")
-    print("   Other strategies may keep auto_execute: propose (human approve).")
+    print("   Activate checks that the bundle attests this strategy's file, class,")
+    print("   params, conids and bar size. A signature verifies integrity, not that")
+    print("   performance was measured. Other strategies may keep auto_execute: propose.")
     print()
     print("4) Release gates (P1 then P3):")
     print("   python3 scripts/p1_release_gate.py --synthetic-only")
@@ -79,63 +88,81 @@ def _print_snippets(
     print()
 
 
-def main() -> int:
+def _read_field(bundle: Path, file_name: str, field: str) -> str:
+    path = bundle / file_name
+    if not path.is_file():
+        raise ValueError(f"not a bundle (no {file_name}): {bundle}")
+    try:
+        value = json.loads(path.read_text(encoding="utf-8"))[field]
+    except (OSError, ValueError, KeyError, TypeError) as exc:
+        raise ValueError(
+            f"cannot read {field!r} from {path}: {type(exc).__name__}: {exc}"
+        ) from exc
+    if not isinstance(value, str) or not value:
+        raise ValueError(f"{field!r} in {path} is not a non-empty string")
+    return value
+
+
+def _read_bundle(bundle: Path) -> tuple[str, str]:
+    """Return ``(artifact_id, public_key_id)`` of an exported bundle, or raise ValueError."""
+    return (
+        _read_field(bundle, "manifest.json", "artifact_id"),
+        _read_field(bundle, "attestation.json", "public_key_id"),
+    )
+
+
+def _read_ring_key_id(public_key_path: Path) -> str:
+    if not public_key_path.is_file():
+        raise ValueError(
+            f"no signing key under {public_key_path.parent}; "
+            "run `mmr research attest bundle <artifact_id>` first"
+        )
+    try:
+        return public_key_id(load_verify_key(str(public_key_path)))
+    except (OSError, MalformedKey, InvalidKeyType) as exc:
+        raise ValueError(
+            f"cannot read signing key {public_key_path}: {type(exc).__name__}: {exc}"
+        ) from exc
+
+
+def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(
-        description="Verify existing paper research material; offline fixtures require explicit opt-in",
+        description="Print paper automation config snippets for a real research bundle",
     )
     parser.add_argument(
-        "--strategy-name", default="orb_googl",
+        "--bundle", type=Path, required=True,
+        help="Bundle directory from `mmr research attest bundle`",
+    )
+    parser.add_argument(
+        "--strategy-name", required=True,
         help="Exact automation_strategy_name to print in YAML snippets",
     )
     parser.add_argument(
         "--config-dir", type=Path, default=DEFAULT_CONFIG,
         help="Config root (default ~/.config/mmr)",
     )
-    parser.add_argument(
-        "--share-dir", type=Path, default=DEFAULT_SHARE,
-        help="Share root (default ~/.local/share/mmr)",
-    )
-    parser.add_argument(
-        "--force", action="store_true",
-        help="Overwrite isolated offline-fixture key files (never research keys)",
-    )
-    parser.add_argument("--offline-fixture", action="store_true",
-                        help="Export non-authorizing fixture for offline drills only")
-    parser.add_argument("--artifact-bundle-path", type=Path,
-                        help="Existing signed research bundle (no new evidence is created)")
-    parser.add_argument("--public-key-ring-path", type=Path,
-                        help="Existing trusted research public keys")
-    parser.add_argument("--expected-artifact-id", help="Exact existing research artifact id")
-    args = parser.parse_args()
-    research_args = (args.artifact_bundle_path, args.public_key_ring_path, args.expected_artifact_id)
-    if not args.offline_fixture and not all(research_args):
-        parser.error("existing research requires --artifact-bundle-path, --public-key-ring-path "
-                     "and --expected-artifact-id; use --offline-fixture only for offline drills")
+    args = parser.parse_args(argv)
+
+    _, key_ring, public_key = default_key_paths(args.config_dir)
+    bundle_path = args.bundle.expanduser().resolve()
 
     try:
-        if args.offline_fixture:
-            private_key, key_ring, public_key = default_key_paths(args.config_dir / "offline-fixtures")
-            signer, _reused = ensure_signing_keypair(
-                private_key_path=private_key, public_key_path=public_key, force=args.force,
-            )
-            artifacts_root = args.share_dir / "offline-fixtures" / "artifacts"
-            artifact_id = export_fixture_paper_eligible_bundle(
-                signer=signer, artifacts_root=artifacts_root, offline_fixture=True,
-            )
-            print("OFFLINE FIXTURE — not qualification or promotion evidence")
-            print("CANDIDATE; permitted_account_mode=none; never activate this bundle")
-            print(f"Fixture bundle: {artifacts_root / artifact_id}")
-            print(f"Isolated fixture public key ring: {key_ring}")
-            return 0
+        artifact_id, signed_by = _read_bundle(bundle_path)
+        ring_key_id = _read_ring_key_id(public_key)
+    except ValueError as exc:
+        print(exc, file=sys.stderr)
+        return 1
 
-        bundle_path = args.artifact_bundle_path.expanduser()
-        key_ring = args.public_key_ring_path.expanduser()
-        verified = verify_qualified_paper_bundle(
+    if signed_by != ring_key_id:
+        print(f"bundle signed by key {signed_by}, ring holds {ring_key_id}", file=sys.stderr)
+        return 1
+
+    try:
+        verify_qualified_paper_bundle(
             bundle_path=bundle_path, public_key_ring_path=key_ring,
-            expected_artifact_id=args.expected_artifact_id, now=dt.datetime.now(dt.timezone.utc),
+            expected_artifact_id=artifact_id, now=dt.datetime.now(dt.timezone.utc),
         )
-        artifact_id = verified.artifact_id
-    except (PaperMaterialsError, FileExistsError) as exc:
+    except PaperMaterialsError as exc:
         print(exc, file=sys.stderr)
         return 1
 

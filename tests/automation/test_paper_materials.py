@@ -1,4 +1,4 @@
-"""Tests for shared paper automation keygen + fixture bundle export."""
+"""Tests for paper automation key setup and bundle hints, using the test-only fixture bundle."""
 from __future__ import annotations
 
 import json
@@ -8,11 +8,11 @@ from unittest.mock import patch
 
 import pytest
 
+from tests.automation.fixture_bundle import export_fixture_paper_eligible_bundle
 from trader.automation.paper_materials import (
     PaperMaterialsError,
     default_key_paths,
     ensure_signing_keypair,
-    export_fixture_paper_eligible_bundle,
     read_allocation_binding_hints,
     verify_qualified_paper_bundle,
 )
@@ -51,6 +51,32 @@ def test_qualified_bundle_rejects_signed_but_empty_quantitative_decision(tmp_pat
         )
 
 
+def test_production_code_cannot_export_a_fixture_bundle() -> None:
+    import trader.automation.paper_materials as paper_materials
+
+    assert not hasattr(paper_materials, "export_fixture_paper_eligible_bundle")
+
+
+def test_test_fixture_bundle_is_never_qualified_evidence(tmp_path: Path) -> None:
+    from .paper_evidence_helpers import NOW
+
+    _, verify_dir, public_path = default_key_paths(tmp_path / "config")
+    signer, _ = ensure_signing_keypair(
+        private_key_path=tmp_path / "config" / "keys" / "private" / "signing.pem",
+        public_key_path=public_path,
+    )
+    artifact_id = export_fixture_paper_eligible_bundle(
+        signer=signer, artifacts_root=tmp_path / "artifacts",
+    )
+
+    with pytest.raises(PaperMaterialsError, match="fixture"):
+        verify_qualified_paper_bundle(
+            bundle_path=tmp_path / "artifacts" / artifact_id,
+            public_key_ring_path=verify_dir,
+            expected_artifact_id=artifact_id, now=NOW,
+        )
+
+
 def test_ensure_signing_keypair_writes_0600_and_reuses(tmp_path: Path) -> None:
     private_path = tmp_path / "keys" / "private" / "signing.pem"
     public_path = tmp_path / "keys" / "verify" / "paper-automation.pem"
@@ -73,40 +99,7 @@ def test_ensure_signing_keypair_writes_0600_and_reuses(tmp_path: Path) -> None:
     assert signer2.public_key_id == signer1.public_key_id
 
 
-def test_fixture_export_requires_explicit_offline_opt_in(tmp_path):
-    from trader.research.signing import AttestationSigner
-
-    with pytest.raises(PaperMaterialsError, match="offline_fixture=True"):
-        export_fixture_paper_eligible_bundle(
-            signer=AttestationSigner.generate(), artifacts_root=tmp_path / "artifacts",
-        )
-    assert not (tmp_path / "artifacts").exists()
-
-
-def test_offline_fixture_never_authorizes_paper_or_promotion(tmp_path):
-    from trader.research.signing import AttestationSigner
-    from trader.automation.artifact_verifier import ArtifactVerifier, ArtifactVerifierError
-    from .paper_evidence_helpers import NOW
-
-    signer = AttestationSigner.generate()
-    artifact_id = export_fixture_paper_eligible_bundle(
-        signer=signer, artifacts_root=tmp_path, offline_fixture=True,
-    )
-    bundle_path = tmp_path / artifact_id
-    attestation = json.loads((bundle_path / "attestation.json").read_text())
-    family = json.loads((bundle_path / "family.json").read_text())
-    assert attestation["eligibility_state"] == "CANDIDATE"
-    assert attestation["permitted_account_mode"] == "none"
-    assert "offline_fixture_not_for_promotion" in attestation["reason_codes"]
-    assert family["validation_protocol"]["evidence_kind"] == "offline_fixture"
-    for mode in ("paper", "live"):
-        with pytest.raises(ArtifactVerifierError):
-            ArtifactVerifier([signer.public_key]).verify(
-                bundle_path, expected_mode=mode, expected_artifact_id=artifact_id, now=NOW,
-            )
-
-
-def test_export_fixture_bundle_is_candidate(tmp_path: Path) -> None:
+def test_export_fixture_bundle_is_paper_eligible(tmp_path: Path) -> None:
     private_path = tmp_path / "keys" / "private" / "signing.pem"
     public_path = tmp_path / "keys" / "verify" / "paper-automation.pem"
     signer, _ = ensure_signing_keypair(
@@ -118,7 +111,6 @@ def test_export_fixture_bundle_is_candidate(tmp_path: Path) -> None:
     artifact_id = export_fixture_paper_eligible_bundle(
         signer=signer,
         artifacts_root=artifacts_root,
-        offline_fixture=True,
     )
 
     bundle_path = artifacts_root / artifact_id
@@ -126,7 +118,7 @@ def test_export_fixture_bundle_is_candidate(tmp_path: Path) -> None:
     assert (bundle_path / "manifest.json").is_file()
 
     attestation = json.loads((bundle_path / "attestation.json").read_text())
-    assert attestation["eligibility_state"] == "CANDIDATE"
+    assert attestation["eligibility_state"] == "PAPER_ELIGIBLE"
 
     hints = read_allocation_binding_hints(bundle_path)
     assert hints["artifact_digest"] == artifact_id
@@ -196,12 +188,10 @@ def test_export_fixture_bundle_reuses_existing_valid_bundle(tmp_path: Path) -> N
     first_id = export_fixture_paper_eligible_bundle(
         signer=signer,
         artifacts_root=artifacts_root,
-        offline_fixture=True,
     )
     second_id = export_fixture_paper_eligible_bundle(
         signer=signer,
         artifacts_root=artifacts_root,
-        offline_fixture=True,
     )
 
     assert first_id == second_id
@@ -221,7 +211,6 @@ def test_export_fixture_bundle_rejects_invalid_existing_dir(tmp_path: Path) -> N
     artifact_id = export_fixture_paper_eligible_bundle(
         signer=signer,
         artifacts_root=artifacts_root,
-        offline_fixture=True,
     )
     export_dir = artifacts_root / artifact_id
     os.chmod(export_dir, 0o755)
@@ -232,11 +221,10 @@ def test_export_fixture_bundle_rejects_invalid_existing_dir(tmp_path: Path) -> N
         encoding="utf-8",
     )
 
-    with pytest.raises(PaperMaterialsError, match="not a valid offline fixture bundle"):
+    with pytest.raises(PaperMaterialsError, match="not a valid PAPER_ELIGIBLE bundle"):
         export_fixture_paper_eligible_bundle(
             signer=signer,
             artifacts_root=artifacts_root,
-            offline_fixture=True,
         )
 
 
@@ -256,14 +244,13 @@ def test_export_fixture_bundle_cleans_up_orphan_dir_on_export_failure(
         raise RuntimeError("simulated export failure")
 
     with patch(
-        "trader.automation.paper_materials.ResearchBundle.export",
+        "tests.automation.fixture_bundle.ResearchBundle.export",
         _export_fail_after_mkdir,
     ):
         with pytest.raises(RuntimeError, match="simulated export failure"):
             export_fixture_paper_eligible_bundle(
                 signer=signer,
                 artifacts_root=artifacts_root,
-                offline_fixture=True,
             )
 
     orphan_dirs = list(artifacts_root.iterdir()) if artifacts_root.exists() else []

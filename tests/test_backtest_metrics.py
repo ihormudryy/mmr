@@ -91,8 +91,8 @@ class ScriptedStrategy(Strategy):
     exact sequence of fills so the metric math is deterministic."""
 
     def __init__(self, script: list):
-        """script: list aligned with bars. Each element is
-        'buy', 'sell', or None. Quantities default to 1."""
+        """script: list aligned with bars. Each element is 'buy', 'sell',
+        None, or an ('buy'|'sell', quantity) tuple. Quantities default to 1."""
         super().__init__()
         self._script = script
         self._i = 0
@@ -102,12 +102,13 @@ class ScriptedStrategy(Strategy):
         self._i += 1
         if i >= len(self._script) or self._script[i] is None:
             return None
-        action = Action.BUY if self._script[i] == 'buy' else Action.SELL
+        step = self._script[i]
+        side, quantity = step if isinstance(step, tuple) else (step, 1)
         return Signal(
             source_name=self.name or 'scripted',
-            action=action,
+            action=Action.BUY if side == 'buy' else Action.SELL,
             probability=0.5, risk=0.5,
-            quantity=1,
+            quantity=quantity,
         )
 
 
@@ -216,6 +217,34 @@ class TestExpectancyBps:
         # P&L = 101 - 100 = 1 on notional 100 → +100 bps
         assert r.total_trades == 2
         assert r.expectancy_bps == pytest.approx(100.0, rel=0.01)
+
+    def test_trades_are_weighted_by_notional(self, tmp_duckdb_path):
+        """Three 1-share losers (100 -> 99) and one 3-share winner (100 -> 102).
+        Dollars: -1 -1 -1 +6 = +3 on 600 notional -> +50 bps, profit factor 2.0.
+        A plain average of per-trade returns would say -25 bps and contradict
+        the profit factor."""
+        closes = [100, 100, 100, 99, 100, 100, 100, 99, 100, 100, 100, 99,
+                  100, 100, 100, 102, 102, 102]
+        _write_bars(tmp_duckdb_path, closes)
+        script = ['buy', None, 'sell', None, 'buy', None, 'sell', None,
+                  'buy', None, 'sell', None, ('buy', 3), None, ('sell', 3),
+                  None, None, None]
+        bt = _make_bt(tmp_duckdb_path)
+        strategy = _install(ScriptedStrategy(script), tmp_duckdb_path)
+        r = bt.run(strategy, [4391])
+        assert r.profit_factor == pytest.approx(2.0)
+        assert r.expectancy_bps == pytest.approx(50.0)
+
+    def test_partial_exits_are_weighted_by_quantity(self, tmp_duckdb_path):
+        """BUY 3 at 100, SELL 1 at 104, SELL 2 at 99.
+        Dollars: +4 -2 = +2 on 300 notional -> +66.7 bps."""
+        closes = [100, 100, 100, 104, 104, 99, 99, 99]
+        _write_bars(tmp_duckdb_path, closes)
+        script = [('buy', 3), None, ('sell', 1), None, ('sell', 2), None, None, None]
+        bt = _make_bt(tmp_duckdb_path)
+        strategy = _install(ScriptedStrategy(script), tmp_duckdb_path)
+        r = bt.run(strategy, [4391])
+        assert r.expectancy_bps == pytest.approx(2 / 300 * 10_000)
 
 
 class TestTimeInMarket:

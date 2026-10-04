@@ -41,6 +41,10 @@ class BacktestRecord:
     commission_per_share: float
     params: Dict[str, Any] = field(default_factory=dict)
     code_hash: str = ''
+    # Which execution-cost model priced the fills: 'realistic' (per-venue
+    # commission + tick spread + impact) or 'legacy' (slippage_bps +
+    # commission_per_share above).
+    cost_model: str = 'legacy'
 
     # Outputs (populated after run)
     total_trades: int = 0
@@ -192,7 +196,8 @@ class BacktestStore:
             created_at TIMESTAMP NOT NULL,
             note VARCHAR DEFAULT '',
             archived BOOLEAN DEFAULT FALSE,       -- soft-delete flag
-            sweep_id INTEGER DEFAULT NULL         -- FK into sweeps.id
+            sweep_id INTEGER DEFAULT NULL,        -- FK into sweeps.id
+            cost_model VARCHAR DEFAULT 'legacy'
         )
     """
 
@@ -231,7 +236,7 @@ class BacktestStore:
             sortino_ratio, calmar_ratio, profit_factor, expectancy_bps,
             time_in_market_pct,
             trades_json, equity_curve_json,
-            created_at, note, sweep_id
+            created_at, note, sweep_id, cost_model
         )
         VALUES (
             nextval('backtest_runs_id_seq'), ?, ?, ?, ?,
@@ -242,7 +247,7 @@ class BacktestStore:
             ?, ?, ?, ?,
             ?,
             ?, ?,
-            ?, ?, ?
+            ?, ?, ?, ?
         )
     """
 
@@ -257,6 +262,7 @@ class BacktestStore:
         ('time_in_market_pct', 'DOUBLE DEFAULT 0.0'),
         ('archived',           'BOOLEAN DEFAULT FALSE'),
         ('sweep_id',           'INTEGER DEFAULT NULL'),
+        ('cost_model',         "VARCHAR DEFAULT 'legacy'"),
     )
 
     # Explicit SELECT column list — we cannot rely on ``SELECT *`` because
@@ -276,7 +282,7 @@ class BacktestStore:
         'sortino_ratio', 'calmar_ratio', 'profit_factor',
         'expectancy_bps', 'time_in_market_pct',
         'trades_json', 'equity_curve_json',
-        'created_at', 'note', 'archived', 'sweep_id',
+        'created_at', 'note', 'archived', 'sweep_id', 'cost_model',
     )
     _SELECT_FIELDS = ', '.join(_SELECT_COLUMNS)
 
@@ -351,6 +357,7 @@ class BacktestStore:
                 now,
                 record.note,
                 record.sweep_id,
+                record.cost_model,
             ])
             row = conn.execute("SELECT currval('backtest_runs_id_seq')").fetchone()
             return row[0]
@@ -618,5 +625,6 @@ class BacktestStore:
                 note=row[28] if len(row) > 28 else '',
                 archived=bool(row[29]) if len(row) > 29 else False,
                 sweep_id=row[30] if len(row) > 30 else None,
+                cost_model=row[31] if len(row) > 31 else 'legacy',
             ))
         return out

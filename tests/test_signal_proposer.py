@@ -381,6 +381,23 @@ class TestRuntimeIntegration:
         assert rt.signal_proposer.signals == []
         assert len(rt.intent_emitter.calls) == 1
 
+    def test_dispatch_signal_passes_the_last_close_to_the_emitter_for_sizing(
+            self, tmp_path, installed_strategy):
+        rt = _make_runtime(tmp_path)
+
+        class _RecordingEmitter:
+            def __init__(self):
+                self.calls = []
+
+            def on_signal(self, **kwargs):
+                self.calls.append(kwargs)
+
+        rt.intent_emitter = _RecordingEmitter()  # type: ignore
+        rt.automation_strategy_name = installed_strategy.name
+        sig = Signal(source_name='s', action=Action.BUY, probability=0.5, risk=0.5)
+        rt._dispatch_signal(installed_strategy, sig, conId=4391, frame=_frame())
+        assert rt.intent_emitter.calls[0]['reference_price'] == 100.5
+
     def test_dispatch_signal_proposes_when_emitter_not_for_this_strategy(
             self, tmp_path, installed_strategy):
         rt = _make_runtime(tmp_path)

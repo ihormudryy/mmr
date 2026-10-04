@@ -1156,6 +1156,23 @@ just without article bodies attached. Use when you genuinely want
 the WHY recorded — they add real latency (~5s per article scrape)
 and aren't free.
 
+## Reviewing a research evaluation (paper only)
+
+When `mmr research evaluate` ends with stage `complete` and state `PAPER_ELIGIBLE`,
+you may write the operator review for a **paper** bundle with
+`--reviewer-kind llm`. Read the evaluation report first (path in the output). In
+each field, say what the evidence shows, not what you hope: the economic reason
+for the edge, why it survives the 2x cost stress, the regimes where it fails, the
+data limits, the neighbourhood results, operational dependencies, capacity, and
+whether one episode dominates. Never review a live bundle; live needs a human.
+
+The fields are `--economic-rationale`, `--edge-survives-costs`,
+`--known-failure-regimes`, `--data-limits`, `--parameter-sensitivity`,
+`--operational-dependencies`, `--capacity-and-decay` and `--episode-dominance`.
+`--artifact-id` is the evaluate output's `artifact_id` and `--decision-id` its
+`decision_digest`. Add
+`--holdout-opened-once` only after the report confirms the holdout was opened once.
+
 ## References
 
 For detailed documentation on specific topics, see:

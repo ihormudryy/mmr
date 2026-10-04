@@ -30,6 +30,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, FrozenSet, Literal, Mapping, Optional, Sequence, Tuple
 
+from trader.automation.strategy_binding import AttestedStrategy, load_attested_strategy
 from trader.research.attestation import (
     AttestationError,
     AttestationVerifier,
@@ -107,6 +108,9 @@ class VerifiedArtifact:
     # without re-parsing attestation.json itself.
     allowlist_digest: str = ""
     ruleset_digest: str = ""
+    # Strategy this bundle attests (file digest, class, params, instruments,
+    # bar size, order notional) for runtime binding checks.
+    attested_strategy: Optional[AttestedStrategy] = None
 
 
 # ---------------------------------------------------------------------------
@@ -240,6 +244,12 @@ class ArtifactVerifier:
         # ── 5. Extract strategy parameters from the already-checksum-verified
         #       artifact.json ───────────────────────────────────────────────
         parameters = self._load_parameters(bundle_path)
+        try:
+            attested_strategy = load_attested_strategy(
+                bundle_path, source_digest=attestation.source_digest,
+                parameters=parameters, instruments=verified.permitted_instruments)
+        except (OSError, ValueError, KeyError) as exc:
+            raise ArtifactVerifierError(f"failed to read family.json: {exc}") from exc
 
         return VerifiedArtifact(
             artifact_id=expected_artifact_id,
@@ -253,6 +263,7 @@ class ArtifactVerifier:
             verification_reason_codes=tuple(attestation.reason_codes),
             allowlist_digest=verified.allowlist_digest,
             ruleset_digest=verified.ruleset_digest,
+            attested_strategy=attested_strategy,
         )
 
     # ------------------------------------------------------------------

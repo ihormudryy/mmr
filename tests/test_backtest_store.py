@@ -59,6 +59,13 @@ class TestBacktestStore:
         assert got.note == 'regression test'
         assert got.created_at is not None
 
+    def test_cost_model_round_trips(self, tmp_duckdb_path):
+        store = BacktestStore(tmp_duckdb_path)
+        rec = _make_record()
+        rec.cost_model = 'realistic'
+        got = store.get(store.add(rec))
+        assert got.cost_model == 'realistic'
+
     def test_get_nonexistent(self, tmp_duckdb_path):
         store = BacktestStore(tmp_duckdb_path)
         assert store.get(999) is None
@@ -278,6 +285,8 @@ class TestSchemaMigration:
         # row had — NOT a timestamp, which is what used to happen.
         assert got.trades_json == ''
         assert got.note == 'pre-migration'
+        # Runs stored before cost models existed were all flat-cost runs.
+        assert got.cost_model == 'legacy'
 
         # New writes into the migrated table should also round-trip cleanly.
         new_rid = store.add(_make_record(class_name='PostMigration'))

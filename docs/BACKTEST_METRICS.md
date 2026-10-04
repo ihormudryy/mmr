@@ -23,8 +23,9 @@ entry_notional = entry_price * q
 
 Additional BUYs update the quantity-weighted entry basis. Partial SELLs reduce
 held quantity without changing the remaining per-share basis; closing the entire
-position resets it. Each SELL is one observation, including partial exits. It is
-not necessarily a complete flat-to-flat position cycle. `total_trades`, by
+position resets it. Each SELL contributes its P&L and its entry notional,
+including partial exits. It is not necessarily a complete flat-to-flat position
+cycle. `total_trades`, by
 contrast, counts executed BUY and SELL fills.
 
 Both metrics below use **net** P&L after allocated entry and exit commissions.
@@ -32,18 +33,22 @@ Slippage is already embedded in the fill prices. The expectancy denominator is
 entry fill notional, **excluding** commissions, not initial account capital or
 the full original position size when only part is sold.
 
-## Different weighting, not an automatic contradiction
+## Dollar-weighted expectancy (since 2026-10-04)
 
 ```text
 profit_factor = sum(positive net_pnl) / abs(sum(negative net_pnl))
-expectancy_bps = mean(net_pnl / entry_notional across SELLs) * 10,000
+expectancy_bps = sum(net_pnl) / sum(entry_notional) * 10,000   across closed SELLs
 ```
 
-PF aggregates cash gains and losses. Expectancy equally weights each SELL's
-return on its closed entry notional. Unequal notionals can therefore give
-opposite profitability indications in either direction. A fixed share count is
-not a fixed notional when entry prices vary. Fixed intended dollar sizing also
-need not mean identical executed notionals after share rounding or partial exits.
+Both metrics sum dollars, so expectancy always has the sign of the summed closed
+net P&L: with at least one net loss, PF > 1 means positive expectancy, PF = 1
+zero, PF < 1 negative. These are accounting relationships, not evidence of
+statistical significance or future profitability.
+
+Before 2026-10-04 expectancy was the plain mean of per-SELL returns
+(`mean(net_pnl / entry_notional)`). Many small losers could then outvote one
+large winner and the sign could disagree with PF and return. Runs stored before
+that date keep the old value; rerun before comparing.
 
 For example, with commission of $0.01/share on each side:
 
@@ -52,15 +57,14 @@ For example, with commission of $0.01/share on each side:
 | Buy 100 @ $100, sell 100 @ $102 | $10,000 | +$198.00 | +198 bps |
 | Buy 10 @ $100, sell 10 @ $95 | $1,000 | −$50.20 | −502 bps |
 
-The closed cash P&L is **+$147.80**, PF is **198 / 50.2 ≈ 3.9442**, but
-expectancy is **(198 − 502) / 2 = −152 bps**. This is a valid result, not evidence
-of an expectancy calculation defect.
+The closed cash P&L is **+$147.80** on $11,000 of entry notional, so expectancy
+is **147.8 / 11,000 ≈ +134 bps**, and PF is **198 / 50.2 ≈ 3.9442**. The old
+per-SELL mean gave (198 − 502) / 2 = −152 bps for the same fills.
 
-If every SELL has exactly the same positive entry notional, expectancy has the
-same sign as summed closed net P&L. With at least one net loss, PF > 1 then implies
-positive expectancy, PF = 1 implies zero expectancy, and PF < 1 implies negative
-expectancy. These are accounting relationships, not evidence of statistical
-significance or future profitability.
+A fixed share count is not a fixed notional when entry prices vary, and fixed
+intended dollar sizing need not mean identical executed notionals after share
+rounding or partial exits. Dollar weighting makes a large trade count for more,
+which is the point: it is the return on the money that was actually put at risk.
 
 ## Partial exits and commissions
 
@@ -68,14 +72,12 @@ Buying 100 @ $100, then selling 90 @ $102 and 10 @ $95, with the same fees, give
 
 - Net cash P&Ls +$178.20 and −$50.20, with allocated entry fees $0.90 and $0.10.
 - PF ≈ 3.5498 and total closed cash profit $128.00.
-- Expectancy −152 bps: the small losing exit has the same observation weight as
-  the large winning exit.
+- Expectancy +128 bps: $128 on $10,000 of entry notional. Partial exits are
+  weighted by their quantity.
 
 Splitting that 90-share winning exit into nine 10-share SELLs at the same price
-leaves cash P&L, proportional commissions and PF unchanged, but changes expectancy
-to **+128 bps**. This metric is sensitive to exit segmentation by definition; do
-not interpret it as a quantity-weighted portfolio return or mean position-cycle
-return. Compare like-for-like exit policies when using it to compare strategies.
+leaves cash P&L, proportional commissions, PF and expectancy unchanged
+(+128 bps). Exit segmentation no longer changes the metric.
 
 A positive price move need not be a net winner. Buying 10 @ $100 and selling
 10 @ $100.05 earns $0.50 before costs. With $0.03/share commissions on each side,
@@ -88,8 +90,8 @@ Without commissions the same fills give +5 bps and infinite PF.
 plus remaining positions marked at their latest closes. It includes unrealized
 P&L and entry fees on still-open positions; no hypothetical exit commission is
 charged for an unclosed position. PF and expectancy include only closed SELL
-quantities. Even with equal closed entry notionals, an open position can therefore
-make total return disagree with the closed-trade metrics.
+quantities, so an open position can make total return disagree with the
+closed-trade metrics.
 
 Implementation conventions:
 
@@ -98,13 +100,12 @@ Implementation conventions:
 - No positive or negative net SELL P&L: PF is zero (including all-breakeven SELLs).
 - Losses but no net wins: PF is zero.
 
-## Investigation outcome and verification
+## Verification
 
-No expectancy/PF calculation defect was reproduced in these deterministic cases;
-production metric code was left unchanged. Coverage includes both directions of
-sign disagreement, fixed shares versus fixed notional, both commission sides,
-partial exits, exit segmentation, weighted entries/additions after partial sales,
-basis reset after going flat, and unrealized-versus-realized returns.
+The deterministic cases cover sign agreement with cash P&L in both directions,
+fixed shares versus fixed notional, both commission sides, partial exits, exit
+segmentation, weighted entries/additions after partial sales, basis reset after
+going flat, and unrealized-versus-realized returns.
 
 Run the characterization and existing backtester/metric tests locally:
 
@@ -115,7 +116,5 @@ OPENBLAS_NUM_THREADS=1 OMP_NUM_THREADS=1 .venv/bin/python -m pytest \
 ```
 
 The original historical runs were not rerun. Explaining a particular historical
-disagreement still requires its actual fill trace, entry notionals, commissions,
-partial-exit grouping and remaining open positions. Neither return/PF nor
-expectancy should be declared universally more reliable merely because their
-signs differ.
+figure still requires its actual fill trace, entry notionals, commissions,
+partial-exit grouping and remaining open positions.

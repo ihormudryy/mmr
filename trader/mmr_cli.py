@@ -1540,11 +1540,15 @@ def build_parser() -> argparse.ArgumentParser:
     bt_p.add_argument('--days', type=int, default=365, help='Days of history (default: 365)')
     bt_p.add_argument('--capital', type=float, default=100000, help='Initial capital (default: 100000)')
     bt_p.add_argument('--bar-size', default='1 min', help='Bar size (default: "1 min")')
-    bt_p.add_argument('--slippage-model', default='fixed',
+    bt_p.add_argument('--cost-model', default='realistic', choices=['realistic', 'legacy'],
+                      help='Execution costs: realistic = per-venue commission + tick spread '
+                           '+ impact from execution_costs.yaml; legacy = flat slippage + '
+                           '$0.005/share (default: realistic)')
+    bt_p.add_argument('--slippage-model', default=None,
                       choices=['zero', 'fixed', 'sqrt', 'volatility'],
-                      help='Slippage model (default: fixed)')
-    bt_p.add_argument('--slippage-bps', type=float, default=1.0,
-                      help='BPS for fixed model (default: 1.0)')
+                      help='Legacy cost model only: slippage model (default: fixed)')
+    bt_p.add_argument('--slippage-bps', type=float, default=None,
+                      help='Legacy cost model only: BPS for the fixed model (default: 1.0)')
     # Saved by default so `backtests show` can compute statistical-
     # confidence tests (PSR, t-stat, bootstrap CIs, distribution stats,
     # losing-streak MC). Opt out with --no-save-trades for disk-tight runs.
@@ -1644,7 +1648,10 @@ def build_parser() -> argparse.ArgumentParser:
     sw_p.add_argument('--top', type=int, default=10,
                        help='Show only the top-N results in the leaderboard (default: 10)')
     sw_p.add_argument('--note', default='', help='Note stamped on every sweep run')
-    sw_p.add_argument('--slippage-bps', type=float, default=1.0)
+    sw_p.add_argument('--cost-model', default='realistic', choices=['realistic', 'legacy'],
+                       help='Execution costs (default: realistic); see `backtest --help`')
+    sw_p.add_argument('--slippage-bps', type=float, default=None,
+                       help='Legacy cost model only: BPS per side (default: 1.0)')
     sw_p.add_argument('--no-save-trades', dest='save_trades',
                        action='store_false', default=True,
                        help='Skip persisting per-run trade + equity detail')
@@ -1735,8 +1742,10 @@ def build_parser() -> argparse.ArgumentParser:
     # SEPARATE research DuckDB. No trader/strategy service is ever involved.
     research_p = sub.add_parser('research', help='Offline experiment registry (no service needed)',
                                 epilog='Examples:\n'
-                                       '  research family create -s strategies/orb.py --class OpeningRangeBreakout \\\n'
-                                       '      --dataset-digest <sha> --search-space \'{"RANGE_MINUTES":[15,30,45]}\'\n'
+                                       '  research evaluate research/orb_us.yaml --dry-run\n'
+                                       '  research evaluate research/orb_us.yaml\n'
+                                       '  research evaluations\n'
+                                       '  research attest bundle <artifact_id>\n'
                                        '  research family show <family_id>\n'
                                        '  research trial run <family_id> --conids 756733 --days 365 \\\n'
                                        '      --bar-size "1 day" --params \'{"RANGE_MINUTES":30}\'\n'
@@ -1783,6 +1792,16 @@ def build_parser() -> argparse.ArgumentParser:
     research_sub.add_parser('import-legacy',
                             help='Import BacktestStore history as LEGACY_UNQUALIFIED families')
 
+    re_eval = research_sub.add_parser(
+        'evaluate', help='Run real walk-forward evidence for a strategy spec (paper-v1)')
+    re_eval.add_argument('spec', help='Evaluation spec YAML (see docs/PAPER_AUTOMATION_SETUP.md)')
+    re_eval.add_argument('--dry-run', action='store_true',
+                         help='Validate the spec and show the job count; run nothing')
+    re_eval.add_argument('--workers', type=int, default=0,
+                         help='Parallel backtest processes (default: cpu count - 1, max 16)')
+    re_list = research_sub.add_parser('evaluations', help='List recent evaluations')
+    re_list.add_argument('--limit', type=int, default=20)
+
     # research review — the §8.5 mandatory qualitative review
     rr_p = research_sub.add_parser('review', help='Record a mandatory §8.5 qualitative review')
     rr_sub = rr_p.add_subparsers(dest='review_action')
@@ -1806,35 +1825,16 @@ def build_parser() -> argparse.ArgumentParser:
                            help='Assessment of implausible episode dominance')
     rr_submit.add_argument('--holdout-opened-once', action='store_true',
                            help='Confirm the holdout was opened exactly once (REQUIRED to be valid)')
+    rr_submit.add_argument('--reviewer-kind', required=True, choices=['human', 'llm'],
+                           help='Who wrote this review; live attestations need human')
 
     # research attest — sign / verify Ed25519 eligibility attestations
     rat_p = research_sub.add_parser('attest', help='Sign / verify eligibility attestations')
     rat_sub = rat_p.add_subparsers(dest='attest_action')
 
-    rat_paper = rat_sub.add_parser('paper',
-                                   help='Sign a PAPER attestation from a passing decision + review')
-    rat_paper.add_argument('--decision-id', required=True, help='Eligibility decision digest')
-    rat_paper.add_argument('--review-id', help='Operator review digest (required for --yes)')
-    rat_paper.add_argument('--key-file', required=True,
-                           help='Path to the offline Ed25519 private key (PKCS8 PEM, 0o600)')
-    rat_paper.add_argument('--artifact-digest', required=True)
-    rat_paper.add_argument('--source-digest', required=True)
-    rat_paper.add_argument('--config-digest', required=True)
-    rat_paper.add_argument('--dataset-digest', required=True)
-    rat_paper.add_argument('--allowlist-digest', required=True)
-    rat_paper.add_argument('--training-boundary', required=True)
-    rat_paper.add_argument('--validation-boundary', required=True)
-    rat_paper.add_argument('--holdout-boundary', required=True)
-    rat_paper.add_argument('--evidence-boundary', required=True)
-    rat_paper.add_argument('--cost-assumptions', default='{}', help='JSON object')
-    rat_paper.add_argument('--capacity-assumptions', default='{}', help='JSON object')
-    rat_paper.add_argument('--max-gross-allocation', type=float, required=True,
-                           help='Maximum gross allocation fraction (e.g. 0.06)')
-    rat_paper.add_argument('--instruments', nargs='+', required=True,
-                           help='Permitted instrument symbols')
-    rat_paper.add_argument('--ttl-days', type=int, default=90, help='Expiry in days (default 90)')
-    rat_paper.add_argument('--yes', action='store_true',
-                           help='Skip interactive confirmation (requires --review-id)')
+    rat_bundle = rat_sub.add_parser(
+        'bundle', help='Sign the attestation for a PAPER_ELIGIBLE artifact and export its bundle')
+    rat_bundle.add_argument('artifact_id', help='Artifact id (from `research evaluations`)')
 
     rat_verify = rat_sub.add_parser('verify',
                                     help='Verify a stored attestation against expected bindings')
@@ -4954,6 +4954,7 @@ def _handle_backtests(args: argparse.Namespace):
                 'period':               f'{str(r.start_date)[:10]} → {str(r.end_date)[:10]}',
                 'initial_capital':      r.initial_capital,
                 'fill_policy':          r.fill_policy,
+                'cost_model':           r.cost_model,
                 'slippage_bps':         r.slippage_bps,
                 'commission_per_share': r.commission_per_share,
                 'params':               r.params or {},
@@ -5049,6 +5050,7 @@ def _handle_backtests(args: argparse.Namespace):
         add('period',               f'{str(r.start_date)[:10]} → {str(r.end_date)[:10]}')
         add('initial_capital',      f'{r.initial_capital:,.2f}')
         add('fill_policy',          r.fill_policy)
+        add('cost_model',           r.cost_model)
         add('slippage_bps',         r.slippage_bps)
         add('commission_per_share', r.commission_per_share)
         # Render param overrides as "K=V, K=V" on a single line when there
@@ -5358,6 +5360,10 @@ def _handle_research(args: argparse.Namespace):
         _handle_research_artifact(args)
     elif action == 'import-legacy':
         _handle_research_import_legacy(args)
+    elif action == 'evaluate':
+        _handle_research_evaluate(args)
+    elif action == 'evaluations':
+        _handle_research_evaluations(args)
     elif action == 'review':
         _handle_research_review(args)
     elif action == 'attest':
@@ -5368,7 +5374,8 @@ def _handle_research(args: argparse.Namespace):
         _handle_research_allocation(args)
     else:
         print_status(
-            'Usage: research {family|trial|artifact|import-legacy|review|attest|canary|allocation} ...',
+            'Usage: research {family|trial|artifact|import-legacy|evaluate|evaluations|review|attest'
+            '|canary|allocation} ...',
             success=False)
 
 
@@ -5599,7 +5606,8 @@ def _handle_research_review(args: argparse.Namespace):
             operational_dependencies=args.operational_dependencies,
             capacity_and_decay=args.capacity_and_decay,
             episode_dominance=args.episode_dominance,
-            holdout_opened_once_confirmed=True)
+            holdout_opened_once_confirmed=True,
+            reviewer_kind=args.reviewer_kind)
     except ValueError as e:
         print_status(f'Invalid review: {e}', success=False)
         return
@@ -5612,109 +5620,129 @@ def _handle_research_review(args: argparse.Namespace):
     }, title='Operator review recorded')
 
 
+def _evaluation_paths():
+    from trader.container import Container, ensure_config_dir
+    from trader.research.evaluation import EvaluationPaths
+    from trader.research.strategy_paths import repo_root
+    from trader.simulation.execution_costs import EXECUTION_COSTS_FILE
+
+    cfg = Container.instance().config()
+    duckdb_path = cfg.get('duckdb_path', '')
+    return EvaluationPaths(
+        history_db=cfg.get('history_duckdb_path', '') or duckdb_path,
+        universe_db=duckdb_path,
+        universe_library=cfg.get('universe_library', 'Universes'),
+        execution_costs=str(ensure_config_dir() / EXECUTION_COSTS_FILE),
+        repo_root=repo_root(),
+        reports_dir=Path('~/.local/share/mmr/reports').expanduser(),
+        summaries_dir=_artifacts_root() / 'evaluations')
+
+
+def _signing_key_paths():
+    from trader.automation.paper_materials import default_key_paths
+    from trader.container import ensure_config_dir
+
+    private_pem, _verify_dir, public_pem = default_key_paths(ensure_config_dir())
+    return private_pem, public_pem
+
+
+def _artifacts_root():
+    return Path('~/.local/share/mmr/artifacts').expanduser()
+
+
+def _handle_research_evaluate(args: argparse.Namespace):
+    """Run real walk-forward evidence for a spec (no service needed)."""
+    from trader.data.universe import UniverseAccessor
+    from trader.research.evaluation import EvaluationError, evaluate
+    from trader.research.evaluation_data import EvaluationDataError
+    from trader.research.evaluation_jobs import default_workers
+    from trader.research.evaluation_spec import (
+        EvaluationSpecError, load_evaluation_spec, neighbour_points,
+    )
+    from trader.simulation.execution_costs import ExecutionCostError, load_execution_costs_config
+
+    try:
+        paths = _evaluation_paths()
+        spec = load_evaluation_spec(
+            args.spec, universe_accessor=UniverseAccessor(paths.universe_db, paths.universe_library),
+            costs_config=load_execution_costs_config(paths.execution_costs),
+            repo_root=paths.repo_root)
+        neighbours = neighbour_points(spec)
+        if args.dry_run:
+            print_json_result({
+                'spec': spec.name, 'strategy': spec.strategy_path, 'class': spec.class_name,
+                'conids': list(spec.conids), 'calendar': spec.calendar,
+                'parameter_points': 1 + len(neighbours),
+                'walk_forward_jobs': spec.folds * (3 + len(neighbours)),
+                'holdout_jobs_if_gate_passes': 2,
+            }, title='Evaluation dry run')
+            return
+        result = evaluate(spec, research_db=_research_db(), paths=paths, now=_research_now,
+                          max_workers=args.workers or default_workers())
+    except (EvaluationSpecError, EvaluationDataError, EvaluationError, ExecutionCostError,
+            OSError, ValueError) as exc:
+        print_status(str(exc), success=False)
+        sys.exit(1)
+    print_json_result({
+        'spec': result.spec_name, 'family_id': result.family_id, 'stage': result.stage,
+        'state': result.state, 'artifact_id': result.artifact_id,
+        'decision_digest': result.decision_digest, 'failed_rules': list(result.failed_rules),
+        'missing_rules': list(result.missing_rules), 'report': str(result.report_path),
+    }, title='Evaluation')
+
+
+def _handle_research_evaluations(args: argparse.Namespace):
+    from trader.research.evaluation_store import EvaluationRepository
+
+    rows = EvaluationRepository(_research_db()).list(limit=args.limit)
+    print_json_result([{
+        'created_at': r.created_at, 'spec': r.spec_name, 'strategy': r.strategy_path,
+        'class': r.class_name, 'family_id': r.family_id, 'stage': r.stage, 'state': r.state,
+        'artifact_id': r.artifact_id, 'failed_rules': list(r.failed_rules),
+        'missing_rules': list(r.missing_rules), 'report': r.report_path,
+    } for r in rows], title='Evaluations')
+
+
+def _bundle_expires_at(bundle: Path) -> Optional[str]:
+    """Expiry of the attestation inside an exported bundle; None when it cannot be read."""
+    try:
+        return json.loads((bundle / 'attestation.json').read_text())['expires_at']
+    except (OSError, ValueError, KeyError, TypeError):
+        return None
+
+
+def _handle_research_attest_bundle(args: argparse.Namespace):
+    from trader.automation.paper_materials import PaperMaterialsError, ensure_signing_keypair
+    from trader.research.attest_export import AttestExportError, attest_and_export
+    from trader.research.signing import InsecureKeyFile, InvalidKeyType, MalformedKey
+
+    private_pem, public_pem = _signing_key_paths()
+    try:
+        signer, _reused = ensure_signing_keypair(private_key_path=private_pem,
+                                                 public_key_path=public_pem)
+        bundle = attest_and_export(_research_db(), artifact_id=args.artifact_id, signer=signer,
+                                   artifacts_root=_artifacts_root(), now=_research_now())
+    except (AttestExportError, PaperMaterialsError, InsecureKeyFile, InvalidKeyType,
+            MalformedKey, FileExistsError) as exc:
+        print_status(str(exc), success=False)
+        sys.exit(1)
+    result = {'artifact_id': args.artifact_id, 'bundle': str(bundle),
+              'public_key_id': signer.public_key_id}
+    expires_at = _bundle_expires_at(bundle)
+    if expires_at is not None:
+        result['expires_at'] = expires_at
+    print_json_result(result, title='Attested bundle')
+
+
 def _handle_research_attest(args: argparse.Namespace):
     """Sign or verify an Ed25519 eligibility attestation (offline, no service)."""
     action = getattr(args, 'attest_action', None)
-    if action == 'paper':
-        _handle_research_attest_paper(args)
+    if action == 'bundle':
+        _handle_research_attest_bundle(args)
     elif action == 'verify':
         _handle_research_attest_verify(args)
     else:
-        print_status('Usage: research attest {paper|verify} ...', success=False)
-
-
-def _attestation_public_view(att) -> dict:
-    """Public-only projection of an attestation for display — NEVER key bytes."""
-    return {
-        'payload_digest': att.payload_digest,
-        'artifact_digest': att.artifact_digest,
-        'source_digest': att.source_digest,
-        'config_digest': att.config_digest,
-        'dataset_manifest_digest': att.dataset_manifest_digest,
-        'allowlist_digest': att.allowlist_digest,
-        'ruleset_name': att.ruleset_name,
-        'ruleset_version': att.ruleset_version,
-        'ruleset_digest': att.ruleset_digest,
-        'eligibility_state': att.eligibility_state,
-        'permitted_account_mode': att.permitted_account_mode,
-        'max_gross_allocation': att.max_gross_allocation,
-        'permitted_instruments': list(att.permitted_instruments),
-        'created_at': att.created_at,
-        'expires_at': att.expires_at,
-        'operator_approved_at': att.operator_approved_at,
-        'reason_codes': list(att.reason_codes),
-        'evidence_refs': list(att.evidence_refs),
-        'eligibility_decision_digest': att.eligibility_decision_digest,
-        'review_digest': att.review_digest,
-        'public_key_id': att.public_key_id,
-        'signature': att.signature,
-    }
-
-
-def _handle_research_attest_paper(args: argparse.Namespace):
-    import datetime as _dt
-    import json as _json
-    from trader.research.attestation import AttestationRepository, build_attestation
-    from trader.research.eligibility import EligibilityDecisionRepository
-    from trader.research.review import OperatorReviewRepository
-    from trader.research.signing import (
-        AttestationSigner, InsecureKeyFile, InvalidKeyType, MalformedKey)
-
-    db = _research_db()
-    decision = EligibilityDecisionRepository(db).get(args.decision_id)
-    if decision is None:
-        print_status(f'Eligibility decision not found: {args.decision_id}', success=False)
-        return
-    if not args.review_id:
-        print_status('Refusing to sign: --review-id is required (bind the qualitative review).',
-                     success=False)
-        return
-    review = OperatorReviewRepository(db).get(args.review_id)
-    if review is None:
-        print_status(f'Operator review not found: {args.review_id}', success=False)
-        return
-
-    # Require interactive confirmation UNLESS both --review-id and --yes are present.
-    if not args.yes:
-        confirm = input(
-            f'Sign a {decision.state} attestation for artifact {args.artifact_digest} '
-            f'with key {args.key_file}? [y/N] ')
-        if confirm.strip().lower() != 'y':
-            print_status('Aborted (no confirmation).', success=False)
-            return
-
-    try:
-        cost_assumptions = _json.loads(args.cost_assumptions)
-        capacity_assumptions = _json.loads(args.capacity_assumptions)
-    except _json.JSONDecodeError as e:
-        print_status(f'Invalid JSON assumptions: {e}', success=False)
-        return
-
-    try:
-        signer = AttestationSigner.from_key_file(args.key_file)
-    except InsecureKeyFile as e:
-        print_status(f'Insecure key file: {e}', success=False)
-        return
-    except (InvalidKeyType, MalformedKey) as e:
-        print_status(f'Invalid signing key: {e}', success=False)
-        return
-
-    created_at = _research_now()
-    expires_at = created_at + _dt.timedelta(days=args.ttl_days)
-    fields = build_attestation(
-        decision=decision, review=review, public_key_id=signer.public_key_id,
-        artifact_digest=args.artifact_digest, source_digest=args.source_digest,
-        config_digest=args.config_digest, dataset_manifest_digest=args.dataset_digest,
-        allowlist_digest=args.allowlist_digest, training_boundary=args.training_boundary,
-        validation_boundary=args.validation_boundary, holdout_boundary=args.holdout_boundary,
-        evidence_boundary=args.evidence_boundary, cost_assumptions=cost_assumptions,
-        capacity_assumptions=capacity_assumptions, max_gross_allocation=args.max_gross_allocation,
-        permitted_instruments=tuple(args.instruments), created_at=created_at,
-        expires_at=expires_at, operator_approved_at=created_at)
-    attestation = signer.sign(fields)
-    AttestationRepository(db).record(attestation)
-    print_json_result(_attestation_public_view(attestation),
-                      title=f'{attestation.eligibility_state} attestation signed')
+        print_status('Usage: research attest {bundle|verify} ...', success=False)
 
 
 def _handle_research_attest_verify(args: argparse.Namespace):
@@ -6599,7 +6627,7 @@ _BACKTEST_METRIC_HELP = [
     ),
     (
         'expectancy_bps',
-        'Average round-trip P&L as basis points of entry notional. What the strategy has to survive against real-world frictions.',
+        'Total net round-trip P&L divided by total entry notional, in basis points (dollar-weighted, so its sign matches profit_factor > 1). What the strategy has to survive against real-world frictions. Runs stored before 2026-10-04 used a plain per-trade average.',
         'Needs to clear your round-trip slippage + commissions with margin. +3 bps is OK, +10 bps is good, +30 bps+ is great.',
         'Very high expectancy on low-turnover is fine; very high expectancy on high-turnover means you probably optimized against the backtester\'s fill model.',
     ),
@@ -6896,6 +6924,7 @@ def _sweep_manifest_validate(manifest: Any) -> List[Dict[str, Any]]:
             days: 365                                 # default 365
             bar_size: "1 min"                         # default "1 min"
             concurrency: 8                            # default auto (cpu-1)
+            cost_model: realistic                     # default realistic; or legacy
             note: "..."                               # optional
 
     Returns the list of *validated* sweep dicts. Raises ValueError with
@@ -6929,6 +6958,11 @@ def _sweep_manifest_validate(manifest: Any) -> List[Dict[str, Any]]:
                 raise ValueError(
                     f"sweeps[{i}].param_grid[{k}] must be a non-empty list"
                 )
+        cost_model = raw.get('cost_model', 'realistic')
+        if cost_model not in ('realistic', 'legacy'):
+            raise ValueError(
+                f"sweeps[{i}].cost_model must be 'realistic' or 'legacy', got {cost_model!r}"
+            )
         cleaned.append({
             'name': raw['name'],
             'strategy': raw['strategy'],
@@ -6940,6 +6974,7 @@ def _sweep_manifest_validate(manifest: Any) -> List[Dict[str, Any]]:
             'days': int(raw.get('days', 365)),
             'bar_size': raw.get('bar_size', '1 min'),
             'concurrency': raw.get('concurrency'),  # None = auto-tune
+            'cost_model': cost_model,
             'note': raw.get('note', ''),
         })
     return cleaned
@@ -7031,6 +7066,7 @@ def _expand_sweep_jobs(
                 'bar_size': sweep['bar_size'],
                 'params': params,
                 'note': sweep['note'],
+                'cost_model': sweep['cost_model'],
             })
     return jobs
 
@@ -7154,6 +7190,27 @@ def _handle_sweep_run(args: argparse.Namespace):
         manifest_yaml, per_sweep_plans,
         bstore=bstore, auto_concurrency=_auto_concurrency,
     ))
+
+
+def _sweep_backtest_command(job: Dict[str, Any], sweep_id: int,
+                            python_executable: str) -> List[str]:
+    """The ``mmr backtest`` child-process command for one sweep job."""
+    cmd = [
+        python_executable, '-m', 'trader.mmr_cli', '--json', 'backtest',
+        '-s', job['strategy'],
+        '--class', job['class_name'],
+        '--conids', *[str(c) for c in job['conids']],
+        '--days', str(job['days']),
+        '--bar-size', job['bar_size'],
+        '--cost-model', job.get('cost_model', 'realistic'),
+        '--summary-only',
+        '--sweep-id', str(sweep_id),
+    ]
+    if job.get('params'):
+        cmd.extend(['--params', json.dumps(job['params'])])
+    if job.get('note'):
+        cmd.extend(['--note', job['note']])
+    return cmd
 
 
 async def _run_sweeps_async(
@@ -7319,20 +7376,7 @@ async def _execute_jobs_parallel(
         async with sem:
             if cancel_flag.get('flag'):
                 return {'status': 'cancelled', 'job': job}
-            cmd = [
-                mmr_py, '-m', 'trader.mmr_cli', '--json', 'backtest',
-                '-s', job['strategy'],
-                '--class', job['class_name'],
-                '--conids', *[str(c) for c in job['conids']],
-                '--days', str(job['days']),
-                '--bar-size', job['bar_size'],
-                '--summary-only',
-                '--sweep-id', str(sweep_id),
-            ]
-            if job.get('params'):
-                cmd.extend(['--params', json.dumps(job['params'])])
-            if job.get('note'):
-                cmd.extend(['--note', job['note']])
+            cmd = _sweep_backtest_command(job, sweep_id, mmr_py)
             proc = await asyncio.create_subprocess_exec(
                 *cmd,
                 stdout=asyncio.subprocess.PIPE,
@@ -7891,6 +7935,52 @@ def _handle_sweep_watch(args: argparse.Namespace):
         )
 
 
+def _resolve_cost_model(
+    cost_model_name: str,
+    conids: List[int],
+    accessor: Any,
+    slippage_model_name: Optional[str] = None,
+    slippage_bps: Optional[float] = None,
+    costs_config: Any = None,
+):
+    """Build the execution-cost model a CLI backtest prices its fills with.
+
+    ``realistic`` resolves each conid's venue (commission schedule + tick table)
+    from the universe DB and ``execution_costs.yaml`` and raises
+    ``ExecutionCostError`` for an unknown conid or exchange. ``legacy`` is the
+    old flat ``slippage_bps`` + $0.005/share.
+    """
+    from trader.simulation.execution_costs import (
+        FlatCosts, build_realistic_costs, load_execution_costs_config,
+    )
+    from trader.simulation.slippage import get_slippage_model
+
+    if cost_model_name == 'realistic':
+        if slippage_model_name is not None or slippage_bps is not None:
+            raise ValueError('--slippage-model / --slippage-bps only apply to --cost-model legacy')
+        return build_realistic_costs(conids, accessor, costs_config or load_execution_costs_config())
+    if cost_model_name == 'legacy':
+        model_name = slippage_model_name or 'fixed'
+        return FlatCosts(
+            slippage_bps=1.0 if slippage_bps is None else slippage_bps,
+            slippage_model=None if model_name == 'fixed' else get_slippage_model(model_name),
+        )
+    raise ValueError(f'unknown cost model: {cost_model_name!r}')
+
+
+def _cost_record_fields(costs: Any) -> Dict[str, Any]:
+    """The cost columns a ``BacktestRecord`` stores for *costs*."""
+    from trader.simulation.execution_costs import FlatCosts
+
+    if isinstance(costs, FlatCosts):
+        return {
+            'cost_model': costs.name,
+            'slippage_bps': costs.slippage_bps if costs.slippage_model is None else 0.0,
+            'commission_per_share': costs.commission_per_share,
+        }
+    return {'cost_model': costs.name, 'slippage_bps': 0.0, 'commission_per_share': 0.0}
+
+
 def _handle_backtest_sweep(args: argparse.Namespace):
     """Cartesian-product parameter sweep — run one backtest per grid point,
     persist each to the history store, and print a composite-score
@@ -7910,7 +8000,7 @@ def _handle_backtest_sweep(args: argparse.Namespace):
     from trader.data.data_access import TickStorage
     from trader.data.universe import UniverseAccessor
     from trader.simulation.backtester import Backtester, BacktestConfig
-    from trader.simulation.slippage import get_slippage_model
+    from trader.simulation.execution_costs import ExecutionCostError
     from trader.objects import BarSize
 
     # 1. Parse the grid first so bad input fails fast.
@@ -7956,13 +8046,22 @@ def _handle_backtest_sweep(args: argparse.Namespace):
         print_status('Provide --conids or --universe', success=False)
         return
 
+    try:
+        costs = _resolve_cost_model(
+            getattr(args, 'cost_model', 'realistic'), conids, accessor,
+            slippage_bps=getattr(args, 'slippage_bps', None),
+        )
+    except (ExecutionCostError, ValueError) as e:
+        print_status(str(e), success=False)
+        return
+
     bar_size = BarSize.parse_str(args.bar_size)
     config = BacktestConfig(
         start_date=dt.datetime.now() - dt.timedelta(days=args.days),
         end_date=dt.datetime.now(),
         initial_capital=args.capital,
         bar_size=bar_size,
-        slippage_model=get_slippage_model('fixed', bps=args.slippage_bps),
+        cost_model=costs,
     )
     backtester = Backtester(storage, config)
     code_hash = compute_strategy_hash(args.strategy)
@@ -8014,8 +8113,7 @@ def _handle_backtest_sweep(args: argparse.Namespace):
             bar_size=str(bar_size),
             initial_capital=config.initial_capital,
             fill_policy=config.fill_policy,
-            slippage_bps=args.slippage_bps,
-            commission_per_share=config.commission_per_share,
+            **_cost_record_fields(costs),
             params=dict(getattr(result, 'applied_params', {}) or {}),
             code_hash=code_hash,
             total_trades=result.total_trades,
@@ -8155,11 +8253,11 @@ def _handle_backtest(args: argparse.Namespace):
 
     history_path = cfg.get('history_duckdb_path', '') or duckdb_path
     storage = TickStorage(history_path)
+    accessor = UniverseAccessor(duckdb_path, cfg.get('universe_library', 'Universes'))
 
     # Resolve conids
     conids = args.conids
     if not conids and args.universe:
-        accessor = UniverseAccessor(duckdb_path, cfg.get('universe_library', 'Universes'))
         universe = accessor.get(args.universe)
         if not universe.security_definitions:
             print_status(f'Universe "{args.universe}" is empty', success=False)
@@ -8172,18 +8270,23 @@ def _handle_backtest(args: argparse.Namespace):
 
     bar_size = BarSize.parse_str(getattr(args, 'bar_size', '1 min'))
 
-    from trader.simulation.slippage import get_slippage_model
-    slippage_name = getattr(args, 'slippage_model', 'fixed')
-    slippage_bps = getattr(args, 'slippage_bps', 1.0)
-    model_kwargs = {'bps': slippage_bps} if slippage_name == 'fixed' else {}
-    slippage_model = get_slippage_model(slippage_name, **model_kwargs)
+    from trader.simulation.execution_costs import ExecutionCostError
+    try:
+        costs = _resolve_cost_model(
+            getattr(args, 'cost_model', 'realistic'), conids, accessor,
+            slippage_model_name=getattr(args, 'slippage_model', None),
+            slippage_bps=getattr(args, 'slippage_bps', None),
+        )
+    except (ExecutionCostError, ValueError) as e:
+        print_status(str(e), success=False)
+        return
 
     config = BacktestConfig(
         start_date=dt.datetime.now() - dt.timedelta(days=args.days),
         end_date=dt.datetime.now(),
         initial_capital=args.capital,
         bar_size=bar_size,
-        slippage_model=slippage_model,
+        cost_model=costs,
     )
 
     backtester = Backtester(storage, config)
@@ -8201,7 +8304,6 @@ def _handle_backtest(args: argparse.Namespace):
         return
 
     try:
-        accessor = UniverseAccessor(duckdb_path, cfg.get('universe_library', 'Universes'))
         result = backtester.run_from_module(
             args.strategy, args.class_name, conids,
             universe_accessor=accessor,
@@ -8242,6 +8344,7 @@ def _handle_backtest(args: argparse.Namespace):
         'win_rate':           win_rate_display,
         'time_in_market':     f'{result.time_in_market_pct:.1%}',
         'total_trades':       result.total_trades,
+        'cost_model':         costs.name,
         'start_date':         str(result.start_date)[:10],
         'end_date':           str(result.end_date)[:10],
         'final_equity':       f'{result.equity_curve.iloc[-1]:,.2f}' if len(result.equity_curve) > 0 else str(config.initial_capital),
@@ -8317,8 +8420,7 @@ def _handle_backtest(args: argparse.Namespace):
                 bar_size=str(bar_size),
                 initial_capital=config.initial_capital,
                 fill_policy=config.fill_policy,
-                slippage_bps=slippage_bps if slippage_name == 'fixed' else 0.0,
-                commission_per_share=config.commission_per_share,
+                **_cost_record_fields(costs),
                 params=params,
                 code_hash=compute_strategy_hash(args.strategy),
                 total_trades=result.total_trades,
@@ -8383,6 +8485,7 @@ def _handle_backtest(args: argparse.Namespace):
                 'win_rate':           (result.win_rate if result.total_trades > 0 else None),
                 'time_in_market_pct': result.time_in_market_pct,
                 'total_trades':       result.total_trades,
+                'cost_model':         costs.name,
                 'start_date':         str(result.start_date)[:10],
                 'end_date':           str(result.end_date)[:10],
                 'final_equity':       float(result.equity_curve.iloc[-1]) if len(result.equity_curve) > 0 else config.initial_capital,

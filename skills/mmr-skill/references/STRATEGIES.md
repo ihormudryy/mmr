@@ -390,6 +390,10 @@ Backtests default to `fill_policy='next_open'`: a signal emitted while observing
 
 If you're comparing against an older run or intentionally want the legacy behaviour (not recommended), `BacktestConfig(fill_policy='same_close')` reproduces it. The skill helpers always use the default.
 
+### Execution costs
+
+CLI backtests default to `--cost-model realistic`: the broker commission for the instrument's exchange (US: $0.005/share, $1 minimum; ASX: 0.08%, A$6 minimum), half a tick of spread, and impact from the signal bar. Settings live in `~/.config/mmr/execution_costs.yaml`. An instrument outside the local universe DB, or on an exchange with no venue configured, fails loudly. `--cost-model legacy` gives the old flat 1 bp + $0.005/share. Runs stored before 2026-10-04 are all legacy, so they look cheaper than new runs of the same strategy.
+
 When backtesting via CLI, the JSON summary contains the full practitioner-metric set:
 
 ```json

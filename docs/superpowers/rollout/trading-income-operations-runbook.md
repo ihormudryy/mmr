@@ -52,14 +52,14 @@ the checked-in defaults.
 automation:
   enabled: false
   live_enabled: false          # stays false through P3; P4 owns live canary
-  artifact_bundle_path: ''     # e.g. ~/.local/share/mmr/artifacts/<id>
+  artifact_bundle_path: ''     # e.g. ~/.local/share/mmr/artifacts/sha256_<digest>
   public_key_ring_path: ''     # directory of trusted *.pem verification keys
   expected_artifact_id: ''     # exact artifact id; no fuzzy match
   strategy_name: ''            # exact one-strategy name allowed to emit intents
 ```
 
-Compose mounts `~/.local/share/mmr/artifacts` read-only into `trader` and
-`strategy`. Do not enable `automation.enabled` until the synthetic automation
+Compose mounts `~/.local/share/mmr/artifacts` into `trader` (writable) and
+`strategy` (read-only). Do not enable `automation.enabled` until the synthetic automation
 drill is green **and** the manual IB paper soak (below) is recorded.
 
 Nested `automation:` (shown above) is the preferred user-config form; flat
@@ -83,11 +83,16 @@ Rules operators must not violate:
 - **R3:** Never set `automation.live_enabled: true` (startup refuses).
 - **R5:** Exactly one `automation.strategy_name`.
 
-### Bootstrap keys + fixture artifact
+### Evidence bundle + bootstrap snippets
 
-Generates Ed25519 keys under `~/.config/mmr/keys/` (private `0o600`, public
-verify ring separate from private) and exports one fixture `PAPER_ELIGIBLE`
-bundle under `~/.local/share/mmr/artifacts/`. Prints the YAML snippets to paste.
+The bundle comes from real research evidence: `mmr research evaluate` →
+`research review submit` → `research attest bundle <artifact_id>` (see
+[`PAPER_AUTOMATION_SETUP.md`](../../PAPER_AUTOMATION_SETUP.md#evidence-before-automation)).
+`research attest bundle` creates the Ed25519 keys under `~/.config/mmr/keys/`
+(private `0o600`, public verify ring separate from private) on first use and
+exports the bundle to `~/.local/share/mmr/artifacts/sha256_<digest>/`.
+`scripts/bootstrap_paper_automation.py` only reads that bundle and key, and
+prints the YAML snippets to paste. It writes nothing.
 
 **Dashboard path (preferred when command authority is up):** Scaling tab →
 **Paper automation** → select strategy → **Activate paper automation**
@@ -96,10 +101,13 @@ strategy services to arm. **Deactivate** clears durable enablement (also needs
 a restart to match). Equivalent offline CLI:
 
 ```bash
-python3 scripts/bootstrap_paper_automation.py --strategy-name YOUR_STRATEGY
-# overwrite keys only when intentional:
-python3 scripts/bootstrap_paper_automation.py --force --strategy-name YOUR_STRATEGY
+python3 scripts/bootstrap_paper_automation.py \
+  --bundle ~/.local/share/mmr/artifacts/sha256_<digest> --strategy-name YOUR_STRATEGY
 ```
+
+It refuses unless the key in `~/.config/mmr/keys/verify` signed that bundle and
+the bundle verifies with qualified `paper-v1` evidence (no fixture provenance).
+The `automation` block it prints stays `enabled: false`; Activate arms it.
 
 Then enable **P1 command authority first** (automation still off), pass the P1
 IB-paper soak, then enable automation and pass the P3 soak:

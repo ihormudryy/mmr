@@ -1,4 +1,4 @@
-"""Characterize cash-weighted PF vs equally weighted per-SELL expectancy.
+"""Characterize cash-weighted PF vs dollar-weighted expectancy.
 
 All metrics come from Backtester.run with real temporary DuckDB bars and
 next-open fills. These are synthetic accounting fixtures, not strategy evidence.
@@ -93,17 +93,14 @@ def run_fills(tmp_duckdb_path, make_strategy_context):
 
 
 @pytest.mark.parametrize(
-    "win_qty,win_exit,loss_qty,loss_exit,net_win,net_loss,expected_bps",
+    "win_qty,win_exit,loss_qty,loss_exit,net_win,net_loss",
     [
-        pytest.param(100, 102, 10, 95, 198, -50.2, -152,
-                     id="positive-cash-negative-expectancy"),
-        pytest.param(10, 105, 100, 98, 49.8, -202, 148,
-                     id="negative-cash-positive-expectancy"),
+        pytest.param(100, 102, 10, 95, 198, -50.2, id="large-winner-small-loser"),
+        pytest.param(10, 105, 100, 98, 49.8, -202, id="small-winner-large-loser"),
     ],
 )
-def test_varying_quantities_can_reverse_expectancy_sign(
-    run_fills, win_qty, win_exit, loss_qty, loss_exit,
-    net_win, net_loss, expected_bps,
+def test_varying_quantities_keep_expectancy_sign_with_cash_pnl(
+    run_fills, win_qty, win_exit, loss_qty, loss_exit, net_win, net_loss,
 ):
     result = run_fills([
         (Action.BUY, win_qty, 100),
@@ -111,11 +108,13 @@ def test_varying_quantities_can_reverse_expectancy_sign(
         (Action.BUY, loss_qty, 100),
         (Action.SELL, loss_qty, loss_exit),
     ])
+    entry_notional = (win_qty + loss_qty) * 100
     assert result.profit_factor == pytest.approx(net_win / -net_loss)
-    assert result.expectancy_bps == pytest.approx(expected_bps)
+    assert result.expectancy_bps == pytest.approx(
+        (net_win + net_loss) / entry_notional * 10_000)
     assert result.total_return == pytest.approx((net_win + net_loss) / 100_000)
-    assert (result.profit_factor > 1) != (result.expectancy_bps > 0)
-    assert (result.total_return > 0) != (result.expectancy_bps > 0)
+    assert (result.profit_factor > 1) == (result.expectancy_bps > 0)
+    assert (result.total_return > 0) == (result.expectancy_bps > 0)
 
 
 def test_fixed_share_count_does_not_mean_fixed_entry_notional(run_fills):
@@ -127,7 +126,7 @@ def test_fixed_share_count_does_not_mean_fixed_entry_notional(run_fills):
     ])
     # Entry notionals are 1000 and 100, despite every fill being 10 shares.
     assert result.profit_factor == pytest.approx(19.8 / 5.2)
-    assert result.expectancy_bps == pytest.approx(-161)
+    assert result.expectancy_bps == pytest.approx(14.6 / 1100 * 10_000)
     assert result.total_return == pytest.approx(14.6 / 100_000)
 
 
@@ -168,20 +167,20 @@ def test_both_commissions_can_turn_price_gain_into_net_loss(
     assert result.total_return == pytest.approx(net_pnl / 100_000)
 
 
-def test_partial_exits_get_equal_expectancy_weight_not_quantity_weight(run_fills):
+def test_partial_exits_are_weighted_by_quantity(run_fills):
     result = run_fills([
         (Action.BUY, 100, 100),
         (Action.SELL, 90, 102),
         (Action.SELL, 10, 95),
     ])
     # P&Ls: 180 - 0.90 - 0.90 = 178.20; -50 - 0.10 - 0.10 = -50.20.
-    # Each SELL gets one observation: mean(178.2/9000, -50.2/1000).
+    # Dollar-weighted: (178.2 - 50.2) / (9000 + 1000).
     assert result.profit_factor == pytest.approx(178.2 / 50.2)
-    assert result.expectancy_bps == pytest.approx(-152)
+    assert result.expectancy_bps == pytest.approx(128)
     assert result.total_return == pytest.approx(128 / 100_000)
 
 
-def test_splitting_same_price_exits_changes_expectancy_not_cash_pf(run_fills):
+def test_splitting_same_price_exits_changes_neither_expectancy_nor_pf(run_fills):
     combined = run_fills([
         (Action.BUY, 100, 100),
         (Action.SELL, 90, 102),
@@ -193,10 +192,10 @@ def test_splitting_same_price_exits_changes_expectancy_not_cash_pf(run_fills):
         (Action.SELL, 10, 95),
     ])
     # Same fills by quantity/price, same proportional fees and same cash P&L.
-    # Splitting one positive SELL into nine changes the observation weights.
+    # Dollar weighting makes exit segmentation irrelevant.
     assert split.total_return == pytest.approx(combined.total_return)
     assert split.profit_factor == pytest.approx(combined.profit_factor)
-    assert combined.expectancy_bps == pytest.approx(-152)
+    assert combined.expectancy_bps == pytest.approx(128)
     assert split.expectancy_bps == pytest.approx(128)
 
 
@@ -212,8 +211,9 @@ def test_weighted_entry_survives_partial_exit_addition_and_flat_reset(run_fills)
         (Action.SELL, 10, 49),  # fresh entry 50, net P&L -10.2
     ])
     assert result.profit_factor == pytest.approx((19.8 + 29.8) / (30.6 + 10.2))
-    expected_returns = [19.8 / 1150, -30.6 / 3300, 29.8 / 1100, -10.2 / 500]
-    assert result.expectancy_bps == pytest.approx(sum(expected_returns) / 4 * 10_000)
+    net_pnls = [19.8, -30.6, 29.8, -10.2]
+    entry_notionals = [1150, 3300, 1100, 500]
+    assert result.expectancy_bps == pytest.approx(sum(net_pnls) / sum(entry_notionals) * 10_000)
     # All shares are closed: realized P&L must reconcile to the cash ledger.
     assert result.total_return == pytest.approx(8.8 / 100_000)
 

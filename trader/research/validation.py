@@ -37,6 +37,7 @@ from trader.research.attribution import AttributionTable
 from trader.research.canonical import sha256_digest
 from trader.research.statistics import BootstrapCI
 from trader.simulation.backtester import Backtester, BacktestConfig, BacktestResult
+from trader.simulation.execution_costs import ExecutionCosts, FlatCosts
 
 VALIDATION_RESULT_PREFIX = "validation_result"
 
@@ -202,16 +203,9 @@ def validate_plan(plan: ValidationPlan) -> None:
 # --------------------------------------------------------------------------- #
 # Cost model + deterministic backtester adapter
 # --------------------------------------------------------------------------- #
-@dataclass(frozen=True)
-class CostModel:
-    """Execution-cost knobs the backtester already understands."""
-
-    slippage_bps: float = 1.0
-    commission_per_share: float = 0.005
-
-    def scaled(self, multiplier: float) -> "CostModel":
-        return CostModel(slippage_bps=self.slippage_bps * multiplier,
-                         commission_per_share=self.commission_per_share * multiplier)
+# Flat slippage + per-share commission. Research runs that want per-instrument
+# commission and spread pass a ``RealisticCosts`` to ``run_window`` instead.
+CostModel = FlatCosts
 
 
 def _as_datetime(value: Any) -> Any:
@@ -221,7 +215,7 @@ def _as_datetime(value: Any) -> Any:
 
 
 def run_window(strategy_factory: Callable[[], Any], conids: Sequence[int], *,
-               storage: Any, window: Window, cost: CostModel,
+               storage: Any, window: Window, cost: ExecutionCosts,
                bar_size: BarSize = BarSize.Mins1,
                initial_capital: float = 100_000.0,
                risk_limits: Any = None) -> BacktestResult:
@@ -238,8 +232,7 @@ def run_window(strategy_factory: Callable[[], Any], conids: Sequence[int], *,
         end_date=_as_datetime(window.end),
         initial_capital=initial_capital,
         bar_size=bar_size,
-        slippage_bps=cost.slippage_bps,
-        commission_per_share=cost.commission_per_share)
+        cost_model=cost)
     backtester = Backtester(storage=storage, config=config, risk_limits=risk_limits)
     strategy = strategy_factory()
     return backtester.run(strategy, list(conids))

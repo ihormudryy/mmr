@@ -47,9 +47,55 @@ or the `/cc` Strategies panel. Trader ports 42101/42102 **are** published, so
 
 ## Armed paper automation (current)
 
+> **Since 2026-10 (real paper evidence, Phase A):** Activate only arms a bundle
+> produced by `mmr research evaluate` → `research review submit` →
+> `research attest bundle`, bound to the strategy's file, class, params, conids
+> and bar size, with qualified (non-fixture) `paper-v1` evidence. The old fixture
+> bundle fails both the provenance and the binding check, so the `momentum` arm
+> stops after this ships. Phase A leaves the liquidity, benchmark
+> and regime evidence missing, so no strategy can be eligible until Phase B. Run
+> strategies with `auto_execute: propose` meanwhile.
+
+### Known blockers (paper automation)
+
+Armed paper automation cannot exit safely yet, and the evidence step has a gap in split Docker.
+
+- **Automated exits are not safe.**
+  - A SELL without a quantity is rejected at approval (`QUANTITY_REQUIRED` in
+    `trader/automation/production_evidence.py`), before `session_risk` could
+    size it to the held position. An exit signal without a size therefore does
+    not close an automated position; the entry's protective stop or a manual
+    close does.
+  - A SELL with a quantity goes through `build_bracket_plan`
+    (`trader/automation/protective_order_saga.py`), which attaches a reverse BUY
+    stop. The entry bracket's protective SELL stop also stays working, because
+    `reducible_quantity` (`trader/data/broker_state.py`) sums positions and
+    ignores working orders; approval's `LONG_ONLY` check (sell ≤ held) does not
+    cancel it. A full close could later re-open a long or leave the paper account
+    short. The fix needs a plain close order that cancels the entry's protective
+    stop, and a quantity for an unsized SELL from the fenced position.
+- **`research evaluate` does not run in split Docker yet.** The bars and the
+  research DB live in the `mmr_db_data` volume, but the read-only trader
+  container does not mount `~/.local/share/mmr/reports`, where the command writes
+  its report. The image also has no `.git` (`.dockerignore`), so the family
+  commit would be `unknown`. Run it on the host against copies of both the
+  history DB (bars) and the main DB (universes); it also writes the research DB
+  (`research_duckdb_path`, or `MMR_RESEARCH_DUCKDB`), so point that at a host
+  path. Or fix the mounts in a follow-up.
+
+Resolved: the production approval no longer builds an empty broker snapshot.
+`production_evidence.py` (2026-10-04) captures the fenced broker snapshot, a live
+executable quote and what-if margin, a durable high-water mark, 20-session
+liquidity from local daily bars, and the attested allocation (capped at 6%). So
+an automated BUY also needs a live quote in continuous trading and the 20 latest
+closed daily TRADES bars for the conid in the local DB, or approval rejects it
+(`FEED_NOT_LIVE`, `QUOTE_SESSION_INVALID`, `HISTORY_INVALID`, ...).
+
+### Current arms
+
 | Strategy | Role | Notes |
 |---|---|---|
-| **momentum** | Single auto slot | Artifact bundle on disk; `auto_execute` off. Enable it before a soak (`INSTALLED` ≠ dispatchable). |
+| **momentum** | Single auto slot | Armed with the old fixture bundle, which no longer passes the provenance or binding check (see the 2026-10 note). `auto_execute` off. Enable it before a soak (`INSTALLED` ≠ dispatchable). |
 | orb_* / ensemble | Optional propose | Human review on `/cc` if `auto_execute: propose`. |
 | global | Always present | Enable/Disable/Undeploy hidden by design. |
 
@@ -87,13 +133,12 @@ orb_rio, orb_fmg, orb_csl, orb_gld (losing), orb_xlk (too much drawdown).
 - **US ORB:** GOOGL strong (PF 2.45), PLTR/XLK positive, GLD losing.
 - **VWAP:** works on CAT (PF 1.44, +18.9bps); loses on every other US name tried
   → correctly deployed only on CAT.
-- **Metric interpretation:** `expectancy_bps` equally weights each SELL's net
-  P&L / closed entry notional; PF uses cash P&L sums. Both include allocated
-  entry and exit commissions. Unequal notionals (even with fixed share counts)
-  or partial exits can legitimately produce PF > 1 with negative expectancy;
-  total return also includes unrealized P&L. No calculation defect was
-  reproduced in deterministic regression tests; the historical runs above were
-  not rerun. See [metric semantics and examples](BACKTEST_METRICS.md).
+- **Metric interpretation:** `expectancy_bps` was a plain average of per-SELL
+  returns, so it could disagree in sign with return and PF. Since 2026-10-04 it
+  is dollar-weighted (total net P&L / total entry notional of closed SELLs), so
+  its sign matches PF > 1. Expectancy figures in stored runs and in the notes
+  above predate the change; rerun before comparing. Total return also includes
+  unrealized P&L. See [metric semantics and examples](BACKTEST_METRICS.md).
 - **Not done:** statistical-confidence tests (PSR/t-test/bootstrap) — the script
   hung on MC/bootstrap over large trade sets after ~3 of 6 survivors. Rerun with
   iteration caps + per-strategy timeouts if wanted. No results saved; nothing
@@ -226,6 +271,10 @@ message with no traceback.
 ---
 
 ## Next operator session (paper soak)
+
+The automation soak below is blocked until Phase B and the exit fix
+(see Known blockers). Until then, run strategies with `auto_execute: propose`
+and approve on `/cc`.
 
 1. `./docker.sh -b -u` after this polish (baked dashboard image).
 2. Confirm `mmr status` → IB upstream connected.

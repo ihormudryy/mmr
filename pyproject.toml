@@ -114,6 +114,7 @@ markers = [
     "paper_e2e: live paper Docker stack (skip if down)",
     "paper_e2e_live_orders: places/arms real paper risk; needs MMR_PAPER_E2E_LIVE_ORDERS=1",
     "paper_e2e_restart: restarts trader container; needs MMR_PAPER_E2E_RESTART=1",
+    "live: calls real provider APIs; needs MMR_LIVE_TESTS=1 and keys",
 ]
 # Default per-test budget so a leaked ZMQ Context.term() (or similar C-level
 # block) fails the test instead of wedging the whole suite forever.

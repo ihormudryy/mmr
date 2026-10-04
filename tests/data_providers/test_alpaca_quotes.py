@@ -75,3 +75,25 @@ def test_registered_as_default_quotes_source():
     registry = ProviderRegistry.from_config({'alpaca_api_key_id': 'k', 'alpaca_api_secret_key': 's'})
     assert registry.default_source(Capability.QUOTES) == 'alpaca'
     assert isinstance(registry.get(Capability.QUOTES), AlpacaQuotes)
+
+
+def test_snapshot_without_trade_is_error_row():
+    """Snapshot with no latestTrade should return error row, not good row with NaN last."""
+    snapshot = dict(FIXTURE['AAPL'])
+    del snapshot['latestTrade']
+    (quote,) = AlpacaQuotes(FakeClient([{'AAPL': snapshot}])).quotes(['AAPL'])
+    assert quote['error'] != '', "Should have error when no latestTrade"
+    assert 'no latest trade' in quote['error']
+    assert math.isnan(quote['last'])
+
+
+def test_null_fields_become_nan():
+    """JSON null values should become NaN, not raise TypeError."""
+    snapshot = dict(FIXTURE['AAPL'])
+    snapshot['latestQuote'] = dict(FIXTURE['AAPL']['latestQuote'])
+    snapshot['latestQuote']['bp'] = None
+    (quote,) = AlpacaQuotes(FakeClient([{'AAPL': snapshot}])).quotes(['AAPL'])
+    assert quote['error'] == '', "Should be good quote despite null bp"
+    assert math.isnan(quote['bid']), "bp: null should be NaN bid"
+    assert quote['ask'] == 350, "ap should still be 350"
+    assert quote['last'] == 333.75, "last price should be 333.75"

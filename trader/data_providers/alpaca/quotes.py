@@ -1,5 +1,6 @@
 """Latest prices from Alpaca's free IEX feed (IEX is a few percent of US volume)."""
 
+import math
 from typing import Sequence
 
 from trader.data_providers.capabilities import make_quote
@@ -7,6 +8,14 @@ from trader.data_providers.symbols import to_alpaca_symbol
 
 SNAPSHOTS_PATH = '/v2/stocks/snapshots'
 CHUNK_SIZE = 100
+
+
+def _number(mapping, key) -> float:
+    """Extract a number from mapping, handling missing keys and None values."""
+    value = mapping.get(key)
+    if value is None:
+        return float('nan')
+    return float(value)
 
 
 class AlpacaQuotes:
@@ -37,19 +46,25 @@ def _to_quote(symbol: str, alpaca_symbol: str, snapshot) -> dict:
     quote = snapshot.get('latestQuote') or {}
     day = snapshot.get('dailyBar') or {}
     previous = snapshot.get('prevDailyBar') or {}
+
     nan = float('nan')
-    last = float(trade.get('p', nan))
-    previous_close = float(previous.get('c', nan))
+    last = _number(trade, 'p')
+
+    # Error if no latest trade price
+    if math.isnan(last):
+        return make_quote(symbol, feed='iex', error=f'alpaca snapshot has no latest trade for {alpaca_symbol}')
+
+    previous_close = _number(previous, 'c')
     change = last - previous_close
     return make_quote(
         symbol,
         time=trade.get('t', ''),
         last=last,
-        bid=float(quote.get('bp', nan)), ask=float(quote.get('ap', nan)),
-        bid_size=float(quote.get('bs', nan)), ask_size=float(quote.get('as', nan)),
-        open=float(day.get('o', nan)), high=float(day.get('h', nan)),
-        low=float(day.get('l', nan)), close=float(day.get('c', nan)),
-        volume=float(day.get('v', nan)),
+        bid=_number(quote, 'bp'), ask=_number(quote, 'ap'),
+        bid_size=_number(quote, 'bs'), ask_size=_number(quote, 'as'),
+        open=_number(day, 'o'), high=_number(day, 'h'),
+        low=_number(day, 'l'), close=_number(day, 'c'),
+        volume=_number(day, 'v'),
         previous_close=previous_close,
         change=change,
         change_pct=change / previous_close * 100 if previous_close else nan,

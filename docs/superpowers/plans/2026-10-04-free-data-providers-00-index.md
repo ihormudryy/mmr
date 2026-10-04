@@ -18,8 +18,8 @@ one local commit per task, app working after every task.
 
 | # | Plan file | Capability | Free provider | Status |
 |---|---|---|---|---|
-| 1 | `2026-10-04-free-data-providers-01-02-history.md` | registry foundation + history routing (TD, Massive behind registry; dead polygon code removed) | — | planned |
-| 2 | same file | history | Alpaca | planned |
+| 1 | `2026-10-04-free-data-providers-01-02-history.md` | registry foundation + history routing (TD, Massive behind registry; dead polygon code removed) | — | done |
+| 2 | same file | history | Alpaca | done |
 | 3a | `…-03a-quotes-movers-news.md` | quotes, movers (+filter), news | Alpaca | to write after 2 |
 | 3b | `…-03b-scanner-merge.md` | one capability-based idea scanner | — | after 3a |
 | 3c | `…-03c-remove-fallback.md` | remove silent Massive→TD fallback | — | after 3b |

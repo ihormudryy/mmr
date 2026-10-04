@@ -158,7 +158,7 @@ registry = ProviderRegistry.from_config(config)
 provider = registry.get(Capability.HISTORY, source=None)  # None -> default
 ```
 
-- Providers are built lazily on first use, and cached.
+- A new provider is built per `get()`; adapters may keep their own HTTP session.
 - `source=None` means the per-capability default (table 4.3), overridable in
   config `data_providers:`.
 - Unknown source, or a source without that capability, raises
@@ -287,8 +287,8 @@ provider = registry.get(Capability.HISTORY, source=None)  # None -> default
 - Alpha Vantage has **no** local daily counter: every `mmr` command is a
   new process, so an in-memory 25/day counter would reset each time. The
   provider's own "quota used" response (below) is the only enforcement.
-- HTTP 429 → retry with exponential backoff (`backoff` package, already a
-  dependency), at most 3 tries, then `ProviderRateLimited`.
+- HTTP 429 → retry with exponential backoff (simple loop, honours
+  `Retry-After`), at most 3 tries, then `ProviderRateLimited`.
 - Alpha Vantage returns HTTP 200 with a `"Note"`/`"Information"` body when
   the daily quota is used up. That maps to `ProviderRateLimited`, never to
   empty data.
@@ -313,7 +313,7 @@ data_providers: {}           # optional per-capability override, e.g. {history: 
   to `source: alpaca`. Auto-detect: US exchanges → `alpaca`, else `ib`.
 - `docker-compose.yml`, `docker.sh`, `start_mmr.sh`: pass through and show
   status for the new keys; setup wizard asks for them.
-- New dependencies: `alpaca-py`, `finnhub-python`, `edgartools` (only if the
+- New dependencies: `alpaca-py` (streaming only, phase 7; REST uses `requests`), `finnhub-python`, `edgartools` (only if the
   phase-4 test passes; otherwise plain HTTP). With `edgartools`,
   `sec_edgar_user_agent` is passed to its `set_identity()`. Alpha Vantage and Frankfurter
   use plain `requests` (no SDK needed). `massive` and `twelvedata` stay.
@@ -338,6 +338,10 @@ data_providers: {}           # optional per-capability override, e.g. {history: 
   one real CLI run against the free providers for the phase's commands.
 
 ## 10. Delivery
+
+Slicing rule (from the plan index): each phase moves one capability behind the
+registry, wraps that capability's existing TwelveData/Massive code as adapters,
+and adds the free provider. Nothing else moves.
 
 One local commit per phase on `feat/free-data-providers`. No push and no PR
 unless asked; squash before any PR. Each phase leaves the app working.

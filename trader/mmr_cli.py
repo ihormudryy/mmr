@@ -1856,7 +1856,7 @@ def build_parser() -> argparse.ArgumentParser:
 
     data_dl_p = data_sub.add_parser(
         'download',
-        help='Download data from Alpaca, Massive.com, TwelveData or IB to local DuckDB'
+        help='Download history to local DuckDB (default source: Alpaca; see --source)'
     )
     data_dl_p.add_argument('symbols', nargs='+', help='Symbols to download')
     data_dl_p.add_argument('--bar-size', default='1 day', help='Bar size (default: "1 day")')

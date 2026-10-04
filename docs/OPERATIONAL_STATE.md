@@ -7,7 +7,7 @@ Update the date + relevant sections when the running config changes.
 How to arm unattended paper automation from scratch:
 [`PAPER_AUTOMATION_SETUP.md`](PAPER_AUTOMATION_SETUP.md).
 
-**Last updated: 2026-08-18 (Tue) — paper trading, command-center stack.**
+**Last updated: 2026-10-04 (Sun) — paper trading, command-center stack.**
 
 ---
 
@@ -90,6 +90,30 @@ orb_rio, orb_fmg, orb_csl, orb_gld (losing), orb_xlk (too much drawdown).
 - **US 1-min:** deep history for the historically deployed names.
 - DuckDB lives in named volume `mmr_db_data`. Backup: `./docker.sh -B` /
   `mmr data backup`. Nightly pycron `db_backup`.
+
+---
+
+## History data source (Alpaca default)
+
+Code default for `data download` and US `data refresh` jobs is now **Alpaca**
+(free Basic plan, SIP, split-adjusted). Config templates are copied only on
+first run, so the live host config does **not** change by itself. Operator steps:
+
+1. Edit `~/.config/mmr/trader.yaml`: set `alpaca_api_key_id` /
+   `alpaca_api_secret_key` (or env `ALPACA_API_KEY_ID` / `ALPACA_API_SECRET_KEY`)
+   and `default_data_source: alpaca`.
+2. Edit `~/.config/mmr/data_refresh.yaml`: change US jobs to `source: alpaca`.
+   A US job without Alpaca keys fails loudly (no silent fallback).
+3. Optional: `./docker.sh -B before_alpaca`, then a one-time forced US refetch
+   (`force: true` on the job) so stored history is all one source.
+4. Until step 3, stored US history may be a TwelveData/Massive to Alpaca splice.
+   The adjustment basis is the same (splits only), but the data vendor
+   differs, so small differences at the seam are possible.
+
+Alpaca returns only completed NYSE sessions (after 20:16 ET). TwelveData and
+Massive remain opt-in via `--source`. Known quirk, left as is: TwelveData
+returns nothing for intraday bars when start == end, so a single-day gap can
+be skipped with `--source twelvedata`.
 
 ---
 

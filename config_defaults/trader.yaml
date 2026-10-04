@@ -173,7 +173,8 @@ alpaca_api_secret_key: ''
 # Override per-shell with MMR_DEFAULT_DATA_SOURCE.
 # Recognised values: alpaca, massive, twelvedata, ib (only used where the choice
 # set for that command includes it; otherwise the command's own default
-# applies).
+# applies). `alpaca` only affects `data download` (history); other --source
+# commands ignore it and use their own default.
 # NOTE: `ideas` and `movers` always default to massive — TwelveData's
 # /market_movers endpoint requires Pro+, so inheriting twelvedata here
 # would 403 on Basic/Starter keys that still work for quotes/history.

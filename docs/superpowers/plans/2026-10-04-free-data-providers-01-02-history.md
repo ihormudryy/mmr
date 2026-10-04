@@ -2199,15 +2199,18 @@ Record the three findings in the commit body.
 
 - [ ] **Step 4: End-to-end CLI check**
 
-First redirect storage away from the user's live DuckDB, then **prove** the redirect took before downloading anything:
+Redirect storage away from the user's live DuckDB with a temp copy of the config, then **prove** the redirect took before downloading anything. Setting `DUCKDB_PATH` / `HISTORY_DUCKDB_PATH` does **not** redirect the CLI (verified), so do not rely on it.
 
 ```bash
 set -a; eval "$(grep -E '^ALPACA_API_(KEY_ID|SECRET_KEY)=' .env)"; set +a
-export DUCKDB_PATH="$(mktemp -d)/check.duckdb" HISTORY_DUCKDB_PATH="$DUCKDB_PATH"
+CHECK_DIR="$(mktemp -d)"
+cp config_defaults/trader.yaml "$CHECK_DIR/trader.yaml"
+# set duckdb_path and history_duckdb_path in the copy to "$CHECK_DIR/check.duckdb" and "$CHECK_DIR/check_history.duckdb"
+export TRADER_CONFIG="$CHECK_DIR/trader.yaml"
 .venv/bin/mmr --json data summary
 ```
 
-**Hard gate:** the summary must list no symbols. If it lists the user's symbols, the env redirect did not take — **stop, do not download**. Instead copy `config_defaults/trader.yaml` to a temp file, set `duckdb_path` and `history_duckdb_path` to a temp path, export `TRADER_CONFIG=<that file>`, and re-run `data summary` until it is empty.
+**Hard gate:** the summary must be empty **and** you must print the resolved `duckdb_path` / `history_duckdb_path` and confirm both are the temp paths. An empty summary alone can be a false pass when the live DB is also empty. If either path is not a temp path, **stop, do not download**.
 
 Only then:
 

@@ -3,6 +3,7 @@ from unittest.mock import MagicMock
 
 import pytest
 
+from trader.data_providers.errors import ProviderEntitlementError, ProviderError, ProviderRateLimited
 from trader.data_providers.twelvedata.quotes import TwelveDataQuotes
 
 
@@ -82,3 +83,25 @@ def test_single_symbol_error_response_becomes_error_row():
     quotes, _ = _quotes(bad, ['BADSYM'])
     assert len(quotes) == 1 and quotes[0]['symbol'] == 'BADSYM'
     assert 'not found' in quotes[0]['error']
+
+
+def _failure(code, message):
+    return {'code': code, 'message': message, 'status': 'error'}
+
+
+@pytest.mark.parametrize('symbols', [['AAPL', 'MSFT'], ['AAPL']])
+@pytest.mark.parametrize('code', [401, 403])
+def test_key_or_plan_error_raises_entitlement_error(symbols, code):
+    with pytest.raises(ProviderEntitlementError, match='invalid api key'):
+        _quotes(_failure(code, 'invalid api key'), symbols)
+
+
+@pytest.mark.parametrize('symbols', [['AAPL', 'MSFT'], ['AAPL']])
+def test_rate_limit_error_raises_rate_limited(symbols):
+    with pytest.raises(ProviderRateLimited, match='run out of credits'):
+        _quotes(_failure(429, 'run out of credits'), symbols)
+
+
+def test_whole_response_error_on_multi_symbol_call_raises():
+    with pytest.raises(ProviderError, match='twelvedata /quote failed: boom'):
+        _quotes(_failure(500, 'boom'), ['AAPL', 'MSFT'])

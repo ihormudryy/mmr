@@ -3,6 +3,7 @@
 from typing import Sequence
 
 from trader.data_providers.capabilities import make_quote
+from trader.data_providers.errors import ProviderEntitlementError, ProviderError, ProviderRateLimited
 
 CHUNK_SIZE = 120
 
@@ -21,10 +22,25 @@ class TwelveDataQuotes:
 
     def _payloads_by_symbol(self, chunk: list[str]) -> dict:
         raw = self._client.quote(symbol=','.join(chunk)).as_json()
+        if isinstance(raw, dict) and raw.get('status') == 'error':
+            _raise_if_request_failed(raw, single_symbol=len(chunk) == 1)
+            return {chunk[0]: raw}
         # One symbol comes back as a flat dict, several as {SYMBOL: {...}}.
-        if isinstance(raw, dict) and len(chunk) == 1 and ('symbol' in raw or _is_error(raw)):
+        if isinstance(raw, dict) and 'symbol' in raw and len(chunk) == 1:
             return {chunk[0]: raw}
         return raw if isinstance(raw, dict) else {}
+
+
+def _raise_if_request_failed(error: dict, single_symbol: bool) -> None:
+    """Key, plan and rate-limit errors fail the whole call. A bad single symbol is reported per symbol."""
+    message = f"twelvedata /quote failed: {error.get('message', 'unknown error')}"
+    code = str(error.get('code', ''))
+    if code in ('401', '403'):
+        raise ProviderEntitlementError(message)
+    if code == '429':
+        raise ProviderRateLimited(message)
+    if not single_symbol:
+        raise ProviderError(message)
 
 
 def _to_float(value) -> float:

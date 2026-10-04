@@ -342,3 +342,4 @@ Small items found in the final review of phase 3a. None blocks merge.
 - Massive movers: `day.close` may be 0 pre-open (unverified).
 - `MMRHelpers.news` docstring is stale.
 - TwelveData multi-symbol code-400 is treated as a whole-call failure (unverified against real TwelveData).
+- `trader/mmr_cli.py` `_read_trader_config`: catches only OSError/YAMLError; an undecodable `trader.yaml` (UnicodeDecodeError) now raises at import, where the old loader caught every exception. Widen to `(OSError, ValueError, yaml.YAMLError)`.

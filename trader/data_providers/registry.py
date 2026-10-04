@@ -27,6 +27,11 @@ class ProviderRegistry:
         self._specs = {spec.name: spec for spec in specs}
         self._defaults = dict(defaults)
 
+    @classmethod
+    def from_config(cls, config: Mapping[str, Any]) -> 'ProviderRegistry':
+        from trader.data_providers.builtin import BUILTIN_DEFAULTS, builtin_specs
+        return cls(config, builtin_specs(), BUILTIN_DEFAULTS)
+
     def sources_for(self, capability: Capability) -> list[str]:
         return sorted(name for name, spec in self._specs.items() if capability in spec.builders)
 

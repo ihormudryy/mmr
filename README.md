@@ -41,7 +41,7 @@ cd mmr
 ./docker.sh -g
 ```
 
-`./docker.sh -g` handles everything: builds the shared Docker image, prompts for your IB username/password/account, writes credentials to `.env` (gitignored), starts IB Gateway and the split MMR services, then opens a shell in the `trader` service. Compose starts each service directly; do not run the legacy monolithic `start_mmr.sh` launcher inside that shell.
+`./docker.sh -g` handles everything: builds the shared Docker image, prompts for your IB username/password/account, writes credentials to `.env` (gitignored), starts IB Gateway and the split MMR services, then opens a shell in the `trader` service. Compose starts each service directly; do not run `start_mmr.sh` inside that shell.
 
 Use `./docker.sh -e dashboard`, `./docker.sh -e strategy`, or another named
 service when you need a shell outside the default trader service.
@@ -396,7 +396,7 @@ backtest -s ... --param EMA_PERIOD=15 --param BAND_MULT=2.5   # override class a
 backtest -s ... --params '{"EMA_PERIOD": 15, "BAND_MULT": 2.5}'  # JSON form
 
 # Single-strategy parameter sweep — cartesian product, composite-score leaderboard
-bt-sweep -s strategies/orb.py --class OpeningRangeBreakout --conids 756733 --days 365 \
+bt-sweep -s strategies/opening_range_breakout.py --class OpeningRangeBreakout --conids 756733 --days 365 \
      --grid '{"RANGE_MINUTES":[15,30,45],"VOLUME_MULT":[1.2,1.3,1.5]}'
 
 # Declarative, cron-able nightly sweep (multi-strategy)
@@ -530,7 +530,7 @@ mmr/
 ├── docker-compose.yml             # Split: ib-gateway, trader, strategy, data, dashboard, scheduler
 ├── Dockerfile                     # Debian bookworm, Python 3.12
 ├── docker.sh                      # Build/up/exec/backup helper (immutable images; rebuild after code changes)
-├── start_mmr.sh                   # Local non-Docker startup (tmux + health checks)
+├── start_mmr.sh                   # Local hybrid startup (IB Gateway container + host services)
 └── pyproject.toml
 ```
 

@@ -23,8 +23,8 @@ strategies:
 
   # ---- Overnight sweep winners (2026-04-20) — paper ----
   # All 4 cleared the strict filter: PSR >= 0.95, sharpe-CI lower bound >= 0,
-  # DD < 5%, PF >= 1.5, positive pnl skew. See LLMVM-PROGRESS.md for the
-  # confidence block on each run_id.
+  # DD < 5%, PF >= 1.5, positive pnl skew. Run `mmr backtests confidence <run_id>`
+  # for the confidence block on each run.
 
   - name: orb_gld
     description: >-

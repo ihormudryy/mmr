@@ -53,14 +53,16 @@
 
 ## Plan files
 
-1. `[S0]` — [Semantic safety corrections](2026-07-15-command-center-s0-safety.md)
-2. `[G0]` — [Runtime and RPC security](2026-07-15-command-center-g0-platform-security.md)
-3. `[M1-F1]` — [Transactional journal, snapshot, and feed](2026-07-15-command-center-m1f-event-foundation.md)
-4. `[M1-F2]` — [Broker producers, correlation, and quote coverage](2026-07-15-command-center-m1f-broker-producers.md)
-5. `[M1-F3]` — [Proposal, command, pause, and strategy authority](2026-07-15-command-center-m1f-command-authority.md)
-6. `[M1-R]` — [Read-only realtime command center](2026-07-15-command-center-m1r-realtime-ui.md)
-7. `[M1-C]` — [Authenticated command surfaces](2026-07-15-command-center-m1c-commands.md)
-8. `[COMPAT]` — [Parity, soak, rollback, and legacy retirement](2026-07-15-command-center-compat-rollout.md)
+_All plans below are implemented; their plan files were removed (see git history)._
+
+1. `[S0]` — Semantic safety corrections
+2. `[G0]` — Runtime and RPC security
+3. `[M1-F1]` — Transactional journal, snapshot, and feed
+4. `[M1-F2]` — Broker producers, correlation, and quote coverage
+5. `[M1-F3]` — Proposal, command, pause, and strategy authority
+6. `[M1-R]` — Read-only realtime command center
+7. `[M1-C]` — Authenticated command surfaces
+8. `[COMPAT]` — Parity, soak, rollback, and legacy retirement
 
 ## Cross-plan interface freeze
 

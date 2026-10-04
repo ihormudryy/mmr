@@ -7,8 +7,6 @@
 > `automation.live_enabled: false`.
 >
 > Design: `docs/superpowers/specs/2026-07-18-command-plane-activation-design.md`
-> Plan (P1): `docs/superpowers/plans/2026-07-18-trading-income-p1-safety-command-plane.md`
-> Plan (P3): `docs/superpowers/plans/2026-07-18-trading-income-p3-deterministic-automation.md`
 
 ## What "activated" means
 

@@ -37,11 +37,13 @@ P1 and P2 may be implemented in parallel in isolated worktrees because P2 writes
 
 ## Plans
 
-1. [P1 — Safety and command-plane completion](2026-07-18-trading-income-p1-safety-command-plane.md)
-2. [P2 — Research evidence foundation](2026-07-18-trading-income-p2-research-evidence.md)
-3. [P3 — Deterministic automated execution](2026-07-18-trading-income-p3-deterministic-automation.md)
-4. [P4 — Paper and live-canary operations](2026-07-18-trading-income-p4-paper-live-canary.md)
-5. [P5 — Controlled scaling and portfolio reuse](2026-07-18-trading-income-p5-scaling-portfolio.md)
+_The software for every plan below is implemented and the plan files were removed (see git history). The release gates further down are still open._
+
+1. P1 — Safety and command-plane completion
+2. P2 — Research evidence foundation
+3. P3 — Deterministic automated execution
+4. P4 — Paper and live-canary operations
+5. P5 — Controlled scaling and portfolio reuse
 
 ## Frozen cross-program contracts
 

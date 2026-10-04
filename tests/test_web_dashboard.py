@@ -4,8 +4,6 @@ Drives web.app through FastAPI's TestClient with a stubbed SDK — no ZMQ, no
 services. Covers: enable/disable/params routes (CSRF, redirect, SDK calls),
 human-readable strategy rendering, the unfold param editor, the available-
 strategies section, and tooltip markup.
-
-Spec: docs/superpowers/specs/2026-07-15-dashboard-strategy-controls-design.md
 """
 
 import pandas as pd
@@ -196,7 +194,6 @@ class TestRootRedirectsToCommandCenter:
 # flash as "submitted", and a failed risk-report fetch must never render as
 # a green "no active warnings" pass row (that infers OK from a missing
 # report, which is exactly the false-safety bug this task closes).
-# Spec: docs/superpowers/plans/2026-07-15-command-center-s0-safety.md (Task 5)
 # ---------------------------------------------------------------------------
 def test_failed_approval_never_flashes_submitted(client, stub):
     stub.approve_result = SuccessFail.fail(error="broker rejected")
@@ -386,7 +383,6 @@ class TestTabs:
 
 # ---------------------------------------------------------------------------
 # Watchlists (universes UI) + deploy-from-disk
-# Spec: docs/superpowers/specs/2026-07-15-watchlists-and-ui-deploy-design.md
 # ---------------------------------------------------------------------------
 
 from types import SimpleNamespace

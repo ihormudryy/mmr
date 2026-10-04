@@ -1,8 +1,6 @@
 """Tests for StrategyRuntime.update_strategy_params — the dashboard's
 "edit params" backend: type coercion, atomic YAML persistence, and hot-swap
 of the live strategy instance (so changes apply without a service restart).
-
-Spec: docs/superpowers/specs/2026-07-15-dashboard-strategy-controls-design.md
 """
 
 from pathlib import Path

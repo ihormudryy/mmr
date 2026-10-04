@@ -126,12 +126,12 @@ Additional patterns:
 
 ```
 mmr/
-├── pycron/pycron.py           # Process manager / scheduler
+├── pycron/pycron.py           # Cron scheduler (data refresh, backups) — not a process supervisor
 │
 ├── config_defaults/           # Template defaults (copied to ~/.config/mmr/ on first run only; edits here don't affect a running system)
 │   ├── trader.yaml            # IB, typed/legacy ports, DuckDB, data source defaults
 │   ├── pycron.yaml            # Scheduler cron jobs (split Docker)
-│   ├── no_docker_pycron.yaml  # All-in-one process manager (non-Docker)
+│   ├── no_docker_pycron.yaml  # Cron jobs for non-Docker hosts (no services)
 │   ├── strategy_runtime.yaml  # Strategy definitions
 │   ├── position_sizing.yaml   # Position sizing defaults (base size, risk level, limits)
 │   ├── trading_filters.yaml   # Trading filter config (denylist, allowlist, exchanges)
@@ -149,7 +149,6 @@ mmr/
 │   ├── config.py              # Typed config dataclasses (IBConfig, StorageConfig, ZMQConfig)
 │   ├── objects.py             # Domain enums/dataclasses (Action, BarSize, etc.)
 │   ├── common/
-│   │   ├── singleton.py       # Singleton metaclass
 │   │   ├── helpers.py         # Utility functions (dateify, rich_table, etc.)
 │   │   ├── logging_helper.py  # Per-module logger setup from logging.yaml
 │   │   ├── reactivex.py       # RxPY helpers (AnonymousObserver, EventSubject)
@@ -198,7 +197,6 @@ mmr/
 │   ├── strategy/
 │   │   └── strategy_runtime.py # StrategyRuntime (loads/runs strategies)
 │   ├── simulation/
-│   │   ├── historical_simulator.py
 │   │   ├── backtester.py      # Backtester — replay historical data through strategies
 │   │   ├── backtest_stats.py  # PSR, t-test, bootstrap CI, skew/kurt, MC streak — "is this real?"
 │   │   └── lookahead_check.py # assert_no_lookahead walk-forward consistency check
@@ -207,6 +205,9 @@ mmr/
 │       ├── depth_chart.py     # Market depth chart (PNG) + Rich table rendering
 │       ├── chain.py           # Options chain analysis
 │       ├── trader_check.py    # Service health check
+│       ├── ib_health.py       # IB farm-status / upstream connectivity
+│       ├── massive_research.py
+│       ├── options_data.py    # Options data for research
 │       ├── zmq_pub_listener.py # ZMQ PubSub pretty printer
 │       ├── ib_instrument_scraper.py # IB product scraper
 │       └── ib_resolve.py      # IB symbol resolver
@@ -215,13 +216,15 @@ mmr/
 │   ├── global.py              # Global (no-op) strategy
 │   └── smi_crossover.py       # SMI crossover example
 │
-├── scripts/                   # Standalone operational scripts (not imported by library)
+├── scripts/                   # Operational scripts (not imported by trader/; some are imported by tests)
 │   ├── docker-entrypoint.sh   # Container entrypoint
 │   ├── ib-gateway-run.sh      # IB Gateway startup script
-│   ├── ib_status.py           # IB Gateway health check
-│   ├── reporting.py           # Trade reporting
-│   ├── test_pycron.py         # Pycron integration test
-│   └── test_pycron_sync.py    # Pycron sync test
+│   ├── ib_status.py           # IB status-page scraper (standalone; reads TRADER_CHECK)
+│   ├── p1/p2/p3_release_gate.py, release_gate_common.py  # Release gates
+│   ├── *_drill.py, run_paper_soak.py, soak_harness.py    # Fault drills + paper soak
+│   ├── session_open_check.py, session_close_check.py     # Daily operator checks
+│   ├── paper_e2e.sh, paper_evidence_report.py            # Paper end-to-end + evidence
+│   └── parity_compare.py, replay_trading_day.py, reproduce_experiment.py, bootstrap_paper_automation.py
 │
 ├── tests/                     # Test suite (pytest)
 │   ├── conftest.py            # Shared fixtures (DuckDB, strategies, OHLCV data)
@@ -241,7 +244,7 @@ mmr/
 ├── Dockerfile                 # Debian bookworm + Python venv
 ├── docker-compose.yml         # Split: ib-gateway, trader, strategy, data, dashboard, scheduler
 ├── docker.sh                  # Docker/Podman build/deploy helper
-├── start_mmr.sh               # Local (non-split) startup — tmux + pycron
+├── start_mmr.sh               # Local hybrid startup — IB Gateway container + host services
 └── pyproject.toml             # Package config, dependencies, entry points
 ```
 
@@ -256,7 +259,7 @@ Split-compose topology (`docker-compose.yml`) — each process is its own contai
 - **dashboard**: FastAPI web UI + command center (host port published).
 - **scheduler**: pycron for one-shot cron only (data refresh, backups) — not a multi-service supervisor.
 
-Do **not** run the legacy monolithic `start_mmr.sh` inside split containers (it collides on ports/client ids). Local non-Docker still uses `./start_mmr.sh`. Code changes require `./docker.sh -b -u` (sync `-s` is retired — images are immutable).
+Do **not** run `start_mmr.sh` inside split containers (it collides on ports/client ids). Local non-Docker uses `./start_mmr.sh` (hybrid: IB Gateway in a container, services on the host). Code changes require `./docker.sh -b -u` (sync `-s` is retired — images are immutable).
 
 IB Gateway API ports map to host `7496` (live) / `7497` (paper); VNC at `5901`.
 
@@ -285,9 +288,9 @@ Storage layout (host paths):
 
 # Local non-Docker
 ./start_mmr.sh --setup      # Wizard: IB + API keys
-./start_mmr.sh              # tmux + services
+./start_mmr.sh              # Hybrid: IB Gateway container + host services
 ./start_mmr.sh --paper
-./start_mmr.sh --no-tmux
+./start_mmr.sh --live
 
 # Individual services (local)
 python3 -m trader.trader_service
@@ -331,7 +334,7 @@ backtest -s strategies/keltner_breakout.py --class KeltnerBreakout --conids 7567
 backtest -s ... --params '{"EMA_PERIOD": 15, "BAND_MULT": 2.5}'   # JSON param overrides
 backtest -s ... --param EMA_PERIOD=15 --param BAND_MULT=2.5       # repeatable KEY=VALUE form
 backtest -s ... --summary-only --no-save-trades                    # skip trades blob + persist
-bt-sweep -s strategies/orb.py --class OpeningRangeBreakout --conids 756733 \
+bt-sweep -s strategies/opening_range_breakout.py --class OpeningRangeBreakout --conids 756733 \
      --grid '{"RANGE_MINUTES":[15,30,45],"VOLUME_MULT":[1.2,1.3,1.5]}' --days 365
 sweep run nightly.yaml                      # declarative multi-strategy sweep (cron-able)
 sweep run nightly.yaml --dry-run            # expand grid + estimate wall time
@@ -534,7 +537,7 @@ User configs live in `~/.config/mmr/`. On first run, bundled defaults from `conf
   - Alpaca movers intraday check (weekday, `last_updated` age < 30 min) is not yet confirmed; see `docs/OPERATIONAL_STATE.md`.
 - `equity_decimation` (default `daily`) — how aggressively backtest persist downsamples `equity_curve_json`. `daily` ≈ 17 KB/run vs ~9.9 MB raw 1-min; statistically lossless for PSR/Sharpe-CI. Override with `MMR_EQUITY_DECIMATION`.
 
-**`~/.config/mmr/pycron.yaml`**: Service definitions with cron scheduling, auto-restart, dependency ordering. Also hosts `data_refresh_us` / `data_refresh_asx` cron entries that drive the data-refresh loop (see below).
+**`~/.config/mmr/pycron.yaml`**: Cron jobs only (backups, data refresh). Hosts `data_refresh_us` / `data_refresh_asx` cron entries that drive the data-refresh loop (see below).
 
 **Alpaca keys** (`alpaca_api_key_id`, `alpaca_api_secret_key` in `trader.yaml`; env `ALPACA_API_KEY_ID` / `ALPACA_API_SECRET_KEY`). Non-empty env vars override flat YAML keys, same as Massive; empty env values (docker compose passes unset keys as `""`) are ignored for the four provider API keys. Alpaca history: SIP feed, `adjustment=split` (matches TwelveData `splits` and Massive `adjusted`), 1-min back to 2016 incl. pre/post market, no seconds bars. Only completed NYSE sessions are returned (after 20:16 ET: post-market ends 20:00 plus the 15-min SIP delay). Free Basic plan with a paper account — no paid plan needed. Providers live in `trader/data_providers/` (`ProviderRegistry.from_config/get/default_source/sources_for`); `data_service.pull_history(source, …)` serves them (`pull_massive` / `pull_twelvedata` are aliases) and builds a fresh provider per download task. `mmr history alpaca --symbol/--universe` downloads via the data service. Live checks: `MMR_LIVE_TESTS=1` + keys, `pytest -m live`.
 
@@ -602,8 +605,6 @@ Key behaviour-focused test files:
 - `test_container.py::TestContainerHardening` — missing-param diagnostics, env-var coercion, YAML safety
 - `test_production_rpc_security.py` / `test_sdk.py` — typed HMAC surface, CLI routing away from unbound 42001
 - `test_web_dashboard.py` — command center + deploy routes
-
-Some test files have import errors due to missing optional dependencies (`aioreactive`) — these are pre-existing and can be ignored: `test_aiorx.py`, `test_aiozmq_simple.py`, `test_disposable.py`, `test_mmr_client.py`, `test_mmr_server.py`, `test_perf2.py`, `test_performance.py`.
 
 ## Writing a Strategy
 

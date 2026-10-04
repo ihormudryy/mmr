@@ -404,10 +404,13 @@ def build_parser() -> argparse.ArgumentParser:
     snap_p.add_argument('--delayed', action='store_true', default=False, help='Use delayed market data')
     snap_p.add_argument('--exchange', default='', help='Exchange hint (e.g. ASX, TSE, SEHK)')
     snap_p.add_argument('--currency', default='', help='Currency hint (e.g. AUD, JPY, HKD)')
-    snap_p.add_argument('--source', choices=['ib', 'twelvedata'],
-                        default=_src_default(['ib', 'twelvedata'], 'ib'),
-                        help='Data source (default: ib). twelvedata uses REST /quote — '
-                             'no bid/ask, but no trader_service or IB connection required.')
+    from trader.data_providers import Capability
+    from trader.data_providers.builtin import source_choices
+    quote_sources = ['ib'] + source_choices(Capability.QUOTES)
+    snap_p.add_argument('--source', choices=quote_sources,
+                        default=_src_default(quote_sources, 'ib'),
+                        help='Data source (default: ib). Non-IB sources use REST and need no '
+                             'trader_service; alpaca = IEX prices, twelvedata = no bid/ask.')
 
     # snapshot-batch
     snap_batch_p = sub.add_parser('snapshot-batch', help='Batch price snapshots (JSON)',
@@ -418,10 +421,10 @@ def build_parser() -> argparse.ArgumentParser:
     snap_batch_p.add_argument('symbols', nargs='+', help='Symbols to snapshot')
     snap_batch_p.add_argument('--exchange', default='', help='Exchange hint (e.g. ASX, TSE, SEHK)')
     snap_batch_p.add_argument('--currency', default='', help='Currency hint (e.g. AUD, JPY, HKD)')
-    snap_batch_p.add_argument('--source', choices=['ib', 'twelvedata'],
-                              default=_src_default(['ib', 'twelvedata'], 'ib'),
-                              help='Data source (default: ib). twelvedata batches up to '
-                                   '120 symbols per /quote call.')
+    snap_batch_p.add_argument('--source', choices=quote_sources,
+                              default=_src_default(quote_sources, 'ib'),
+                              help='Data source (default: ib). Non-IB sources use REST and need no '
+                                   'trader_service; twelvedata batches up to 120 symbols per call.')
 
     # depth
     depth_p = sub.add_parser('depth', help='Market depth (Level 2 order book)',
@@ -2143,20 +2146,8 @@ def dispatch(mmr: MMR, args: argparse.Namespace) -> bool:
         elif cmd == 'trades':
             print_df(mmr.trades(), title='Trades')
 
-        elif cmd in ('snapshot', 'snap'):
-            source = getattr(args, 'source', 'ib')
-            result = mmr.snapshot(args.symbol, delayed=args.delayed,
-                                  exchange=args.exchange, currency=args.currency,
-                                  source=source)
-            title = f'Snapshot: {args.symbol}' + (f' ({source})' if source != 'ib' else '')
-            print_dict(result, title=title)
-
-        elif cmd == 'snapshot-batch':
-            source = getattr(args, 'source', 'ib')
-            results = mmr.snapshot_batch(args.symbols, exchange=args.exchange,
-                                          currency=args.currency, source=source)
-            title = 'Snapshots' + (f' ({source})' if source != 'ib' else '')
-            print(json.dumps({"data": results, "title": title}, default=str))
+        elif cmd in ('snapshot', 'snap', 'snapshot-batch'):
+            _handle_snapshot(mmr, args, cmd)
 
         elif cmd == 'depth':
             _handle_depth(mmr, args)
@@ -9441,6 +9432,23 @@ def _handle_data_status():
         table.add_row(r['job'], r['universe'] or '—', r['bar_size'],
                       cov, last, f'[{style}]{stale}[/{style}]')
     console.print(table)
+
+
+def _handle_snapshot(mmr: MMR, args: argparse.Namespace, cmd: str):
+    from trader.data_providers import ProviderError
+    source = getattr(args, 'source', 'ib')
+    suffix = f' ({source})' if source != 'ib' else ''
+    try:
+        if cmd == 'snapshot-batch':
+            results = mmr.snapshot_batch(args.symbols, exchange=args.exchange,
+                                         currency=args.currency, source=source)
+            print(json.dumps({'data': results, 'title': 'Snapshots' + suffix}, default=str))
+        else:
+            result = mmr.snapshot(args.symbol, delayed=args.delayed, exchange=args.exchange,
+                                  currency=args.currency, source=source)
+            print_dict(result, title=f'Snapshot: {args.symbol}{suffix}')
+    except ProviderError as ex:
+        print_status(str(ex), success=False)
 
 
 def _handle_depth(mmr: MMR, args: argparse.Namespace):

@@ -36,6 +36,25 @@ import zmq
 logger = logging.getLogger(__name__)
 
 
+def _quote_to_snapshot(quote: dict) -> dict:
+    nan = float('nan')
+    return {
+        'symbol': quote['symbol'], 'conId': '', 'time': quote['time'],
+        'bid': quote['bid'], 'bidSize': quote['bid_size'], 'ask': quote['ask'], 'askSize': quote['ask_size'],
+        'last': quote['last'], 'lastSize': nan, 'open': quote['open'], 'high': quote['high'],
+        'low': quote['low'], 'close': quote['close'], 'volume': quote['volume'],
+        'previous_close': quote['previous_close'], 'change': quote['change'],
+        'change_pct': quote['change_pct'], 'halted': nan, 'exchange': quote['exchange'],
+        'currency': quote['currency'], 'name': quote['name'], 'feed': quote['feed'],
+    }
+
+
+def _quote_to_batch_row(quote: dict) -> dict:
+    keys = ('symbol', 'time', 'bid', 'ask', 'last', 'open', 'high', 'low', 'close', 'volume',
+            'previous_close', 'change', 'change_pct', 'exchange', 'currency', 'feed', 'error')
+    return {key: quote[key] for key in keys}
+
+
 class Subscription:
     """Handle returned by :meth:`MMR.subscribe_ticks`.  Call :meth:`stop` to unsubscribe."""
 
@@ -2242,46 +2261,15 @@ class MMR:
         Parameters
         ----------
         source : str
-            'ib' (default) routes via trader_service / IB. 'twelvedata'
-            uses TD's REST ``/quote`` endpoint — fast and IB-free, but
-            ``bid``/``ask`` come back as ``NaN`` (TD's REST quote doesn't
-            expose level-1 quote sides; subscribe to the WebSocket via
-            ``watch --source twelvedata`` for streaming bid/ask).
+            'ib' (default) routes via trader_service / IB. Any other value is a
+            registry quotes source (e.g. 'alpaca' — IEX prices, 'twelvedata' — no bid/ask).
         """
-        if source == 'twelvedata':
-            td_symbol = str(symbol).upper()
-            payload = self._twelvedata_client.quote(symbol=td_symbol).as_json()
-            def _f(k):
-                v = payload.get(k)
-                if v in (None, ''):
-                    return float('nan')
-                try:
-                    return float(v)
-                except (TypeError, ValueError):
-                    return float('nan')
-            return {
-                'symbol': payload.get('symbol', td_symbol),
-                'conId': '',
-                'time': payload.get('datetime'),
-                'bid': float('nan'),
-                'bidSize': float('nan'),
-                'ask': float('nan'),
-                'askSize': float('nan'),
-                'last': _f('close'),
-                'lastSize': float('nan'),
-                'open': _f('open'),
-                'high': _f('high'),
-                'low': _f('low'),
-                'close': _f('close'),
-                'volume': _f('volume'),
-                'previous_close': _f('previous_close'),
-                'change': _f('change'),
-                'change_pct': _f('percent_change'),
-                'halted': float('nan'),
-                'exchange': payload.get('exchange', ''),
-                'currency': payload.get('currency', ''),
-                'name': payload.get('name', ''),
-            }
+        if source != 'ib':
+            from trader.data_providers import Capability
+            quote = self._provider(Capability.QUOTES, source).quotes([str(symbol)])[0]
+            if quote['error']:
+                raise ValueError(quote['error'])
+            return _quote_to_snapshot(quote)
         contract = self._resolve_contract(symbol, exchange=exchange, currency=currency)
         response = self._typed_query.call(
             'get_snapshot',
@@ -2315,56 +2303,12 @@ class MMR:
         Parameters
         ----------
         source : str
-            'ib' (default) routes via trader_service. 'twelvedata' uses
-            TD's ``/quote`` endpoint with comma-joined symbols (chunked at
-            120/call, the upper bound on most TD plans). Same bid/ask
-            limitation as :meth:`snapshot` — REST quote doesn't expose
-            level-1 sides.
+            'ib' (default) routes via trader_service / IB. Any other value is a
+            registry quotes source (e.g. 'alpaca' — IEX prices, 'twelvedata' — no bid/ask).
         """
-        if source == 'twelvedata':
-            results: list[dict] = []
-            chunk_size = 120
-            for i in range(0, len(symbols), chunk_size):
-                chunk = symbols[i:i + chunk_size]
-                joined = ','.join(s.upper() for s in chunk)
-                raw = self._twelvedata_client.quote(symbol=joined).as_json()
-                # TD returns either a single dict (one symbol) or
-                # {SYMBOL: {...}} keyed by uppercase ticker (multiple).
-                if isinstance(raw, dict) and 'symbol' in raw and len(chunk) == 1:
-                    payload_map = {raw.get('symbol', chunk[0].upper()): raw}
-                else:
-                    payload_map = raw if isinstance(raw, dict) else {}
-                for sym in chunk:
-                    payload = payload_map.get(sym.upper()) or payload_map.get(sym) or {}
-                    if not payload:
-                        results.append({'symbol': sym.upper(), 'last': float('nan')})
-                        continue
-                    def _f(k, p=payload):
-                        v = p.get(k)
-                        if v in (None, ''):
-                            return float('nan')
-                        try:
-                            return float(v)
-                        except (TypeError, ValueError):
-                            return float('nan')
-                    results.append({
-                        'symbol': payload.get('symbol', sym.upper()),
-                        'time': payload.get('datetime'),
-                        'bid': float('nan'),
-                        'ask': float('nan'),
-                        'last': _f('close'),
-                        'open': _f('open'),
-                        'high': _f('high'),
-                        'low': _f('low'),
-                        'close': _f('close'),
-                        'volume': _f('volume'),
-                        'previous_close': _f('previous_close'),
-                        'change': _f('change'),
-                        'change_pct': _f('percent_change'),
-                        'exchange': payload.get('exchange', ''),
-                        'currency': payload.get('currency', ''),
-                    })
-            return results
+        if source != 'ib':
+            from trader.data_providers import Capability
+            return [_quote_to_batch_row(q) for q in self._provider(Capability.QUOTES, source).quotes(symbols)]
 
         ids = []
         for sym in symbols:

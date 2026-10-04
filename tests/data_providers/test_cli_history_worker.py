@@ -70,6 +70,18 @@ def test_data_refresh_template_uses_alpaca_for_us_jobs():
     ({'default_data_source': 'massive'}, 'massive'),
     ({}, 'alpaca'),
 ])
-def test_default_history_source_keeps_ib_and_honours_overrides(config, expected):
+def test_default_history_source_keeps_ib_and_honours_overrides(monkeypatch, config, expected):
     from trader.mmr_cli import _default_history_source
+    monkeypatch.delenv('MMR_DEFAULT_DATA_SOURCE', raising=False)
+    assert _default_history_source(config) == expected
+
+
+@pytest.mark.parametrize('env_value, config, expected', [
+    ('ib', {}, 'ib'),
+    ('massive', {'default_data_source': 'twelvedata'}, 'massive'),
+    ('ib', {'data_providers': {'history': 'massive'}}, 'massive'),
+])
+def test_default_history_source_honours_mmr_default_data_source_env(monkeypatch, env_value, config, expected):
+    from trader.mmr_cli import _default_history_source
+    monkeypatch.setenv('MMR_DEFAULT_DATA_SOURCE', env_value)
     assert _default_history_source(config) == expected

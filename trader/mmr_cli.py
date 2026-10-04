@@ -8511,17 +8511,21 @@ def _rest_history_worker(source: str, cfg):
 def _default_history_source(cfg) -> str:
     """Registry default for history, plus `ib`, which only the CLI knows.
 
-    An explicit `data_providers.history` always wins; otherwise
-    `default_data_source: ib` keeps IB instead of silently switching to Alpaca.
+    An explicit `data_providers.history` always wins. Next comes the per-shell
+    MMR_DEFAULT_DATA_SOURCE, then `default_data_source` from config. An `ib`
+    default is kept instead of silently switching to Alpaca.
     """
+    import os
     from trader.data_providers import Capability, ProviderRegistry
     from trader.data_providers.builtin import IB_HISTORY_SOURCE
     explicit_history_source = (cfg.get('data_providers') or {}).get('history')
     if explicit_history_source:
         return explicit_history_source
-    if cfg.get('default_data_source') == IB_HISTORY_SOURCE:
+    default_data_source = os.environ.get('MMR_DEFAULT_DATA_SOURCE') or cfg.get('default_data_source')
+    if default_data_source == IB_HISTORY_SOURCE:
         return IB_HISTORY_SOURCE
-    return ProviderRegistry.from_config(cfg).default_source(Capability.HISTORY)
+    effective_config = {**cfg, 'default_data_source': default_data_source}
+    return ProviderRegistry.from_config(effective_config).default_source(Capability.HISTORY)
 
 
 def _handle_data_download(args: argparse.Namespace):

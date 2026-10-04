@@ -279,7 +279,7 @@ Modes (pick at most one):
                        or production-like setups.
 
   --cli                CLI-only — verify services are running (locally on
-                       127.0.0.1:42001/42003/42005) and launch the
+                       127.0.0.1:42101/42003/42105) and launch the
                        interactive `trader.mmr_cli`. Run this in a second
                        terminal once a normal `./start_mmr.sh` is up.
 
@@ -801,9 +801,11 @@ if [ "$CLI_MODE" = true ]; then
         warn "IB Gateway: not detected (container may not be running)"
     fi
 
-    # Check services are reachable via TCP
+    # Probe the ports the CLI actually talks to: the typed query sockets of
+    # trader (42101) and strategy (42105), plus data_service (42003). Legacy
+    # 42001 is only bound in offline simulation, so it is never a liveness signal.
     SERVICES_OK=true
-    for port_info in "42001:trader_service" "42003:data_service" "42005:strategy_service"; do
+    for port_info in "42101:trader_service" "42003:data_service" "42105:strategy_service"; do
         port="${port_info%%:*}"
         name="${port_info##*:}"
         if check_tcp_port 127.0.0.1 "$port"; then

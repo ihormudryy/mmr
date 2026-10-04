@@ -303,3 +303,19 @@ Cluster A's **OrderLifecycleTracker** (subscribe once to
 order-id → status) is the keystone: A1 (ack), A2 (events), and A3
 (reconciliation) all read from it, and it's the natural home for future
 order-related features. Build it first, thin, and layer the three behaviours on top.
+
+## Free data providers — open minors (phases 1–2, 2026-10-04)
+
+Small items found in review of `feat/free-data-providers` phases 1–2. None blocks
+merge. Fix opportunistically, or in the phase that touches the file.
+
+- `trader/data_providers/errors.py`: `ProviderNotConfigured` / `CapabilityNotSupported` are not picklable (one formatted arg) — matters only across legacy dill RPC. Empty `missing` list gives a malformed message.
+- `trader/data_providers/registry.py`: `default_source` raises a bare `KeyError` when a capability has no builtin default — make it a `ProviderError` when phase 3 adds capabilities. A non-mapping `data_providers:` config gives `AttributeError`.
+- `trader/data_providers/rate_limit.py`: `calls <= 0` / `max_tries < 1` not validated; `Retry-After` uses `isdigit()` (accepts `'²'`, then `float()` raises); 429 response not closed between retries; no threaded limiter test.
+- `trader/data_providers/alpaca/client.py`: a non-dict JSON error body raises `AttributeError` in `_error_for`; non-JSON 200 and `requests.RequestException` are not wrapped as `ProviderError` (still loud — callers log per symbol); each per-task `requests.Session` is never closed.
+- `trader/data_providers/alpaca/sessions.py`: no committed DST-straddling tests (verified manually); `sessions_in_range` `DateOutOfBounds` unwrapped for a far-future `now`; early-close days wait until 20:16 (conservative) — add a docstring note.
+- `trader/data_providers/alpaca/history.py`: `dt.date` input path untested (verified correct); tz-aware inputs use their own calendar date; missing `vw`/`n` become None silently; unknown tickers return an empty frame instead of an error (add the asset-list check in phase 3a); weekly/monthly requests mid-period store a partial bar (self-heals); "end cut" log fires on every run ending today.
+- `trader/mmr_cli.py`: mid-function `ProviderError` import in `_handle_data_download`; `_rest_history_worker` unannotated; `mmr data download` exits 0 after a setup failure (refresh path is fixed); REST sources never check that the security is US-listed (ad-hoc `data download BHP --source alpaca` would store NYSE ADR bars under an ASX conId).
+- `start_mmr.sh` setup wizard (Alpaca and Massive alike): writes an empty secret if left blank; says "configured" when the key line is missing from `trader.yaml`; `/` or `&` in a secret breaks the `sed`.
+- Tests: unused imports in `tests/data_providers/test_errors_and_capabilities.py` and `test_history_contract.py`; contract tests feed one row for Massive/TwelveData; data-refresh template test uses a cwd-relative path; live test assumes ET output (`hour == 4`).
+- Docs: `CLAUDE.md` Alpaca-keys paragraph is dense (split into bullets, define SIP; 20:16 includes a 1-minute margin); plan Task 11 Step 4 gate lacks the exact print command.

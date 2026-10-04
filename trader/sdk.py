@@ -3660,19 +3660,40 @@ class MMR:
             rows.append(row)
         return pd.DataFrame(rows)
 
+    def _alpaca_assets(self):
+        from trader.data_providers.builtin import alpaca_asset_directory
+        directory = alpaca_asset_directory(self._container.config())
+        return directory.load() if directory else None
+
+    def _movers_asset_directory(self):
+        """The asset list for movers enrichment, or None. A failure here never fails movers."""
+        import requests
+        from trader.data_providers import ProviderError
+        try:
+            return self._alpaca_assets()
+        except (ProviderError, requests.RequestException) as ex:
+            logger.warning('alpaca asset list unavailable, movers warrant filter off: %s', ex)
+            return None
+
     def movers(
         self,
         market: str = 'stocks',
         direction: str = 'gainers',
         source: Optional[str] = None,
+        min_price: float = 1.0,
     ) -> pd.DataFrame:
-        """Top movers for `market` ('stocks', 'crypto', 'indices', ...) from a registry movers source.
+        """Top movers for `market` from a registry movers source.
 
-        `source=None` uses the movers default (`data_providers.movers`, else the builtin default);
+        Stock movers drop names under `min_price` and, when Alpaca is configured, warrants,
+        rights and units. `source=None` uses `data_providers.movers`, else the builtin default;
         movers never inherit `default_data_source`. Forex has its own command (see ``forex_movers``).
         """
         from trader.data_providers import Capability
-        return self._provider(Capability.MOVERS, source).movers(market, direction)
+        from trader.data_providers.movers_filter import filter_stock_movers
+        frame = self._provider(Capability.MOVERS, source).movers(market, direction)
+        if market == 'stocks':
+            frame = filter_stock_movers(frame, min_price, self._movers_asset_directory())
+        return frame
 
     def movers_detail(
         self,
@@ -3680,13 +3701,17 @@ class MMR:
         direction: str = 'gainers',
         num: int = 20,
         source: Optional[str] = None,
+        min_price: float = 1.0,
     ) -> list[dict]:
-        """Get movers enriched with company name, ratios, and (Massive only) news.
+        """Get movers enriched with company name, ratios, and news.
 
         Parameters
         ----------
         source : str
-            'massive' (default) — full enrichment via Massive snapshots,
+            Defaults to the registry movers default (Alpaca).
+            'alpaca' (and any other registry source) — names and the latest
+            headline per ticker. No ratios until phase 4.
+            'massive' — full enrichment via Massive snapshots,
             ticker details, ratios, and news.
             'twelvedata' — composes :meth:`movers` (TD) + :meth:`ratios`
             (TD) per ticker. Skips news (TD has no news endpoint) and
@@ -3759,102 +3784,135 @@ class MMR:
                 })
             return results
 
-        snaps = self._massive_client.get_snapshot_direction(
-            market_type=market, direction=direction,
-        )
+        if source == 'massive':
+            snaps = self._massive_client.get_snapshot_direction(
+                market_type=market, direction=direction,
+            )
 
-        # Build base data from snapshots
-        movers = []
-        for snap in snaps[:num]:
-            ticker = snap.ticker or ''
-            if not ticker:
-                continue
-            row = {
-                'ticker': ticker,
-                'open': getattr(snap.day, 'open', None) if snap.day else None,
-                'close': getattr(snap.day, 'close', None) if snap.day else None,
-                'volume': getattr(snap.day, 'volume', None) if snap.day else None,
-                'change': snap.todays_change,
-                'change_pct': snap.todays_change_percent,
-            }
-            movers.append(row)
+            # Build base data from snapshots
+            movers = []
+            for snap in snaps[:num]:
+                ticker = snap.ticker or ''
+                if not ticker:
+                    continue
+                row = {
+                    'ticker': ticker,
+                    'open': getattr(snap.day, 'open', None) if snap.day else None,
+                    'close': getattr(snap.day, 'close', None) if snap.day else None,
+                    'volume': getattr(snap.day, 'volume', None) if snap.day else None,
+                    'change': snap.todays_change,
+                    'change_pct': snap.todays_change_percent,
+                }
+                movers.append(row)
 
-        if not movers:
-            return []
+            if not movers:
+                return []
 
-        tickers = [m['ticker'] for m in movers]
+            tickers = [m['ticker'] for m in movers]
 
-        # Parallel fetch: ticker details, ratios, news
-        details_map = {}
-        ratios_map = {}
-        news_map = {}
+            # Parallel fetch: ticker details, ratios, news
+            details_map = {}
+            ratios_map = {}
+            news_map = {}
 
-        def fetch_details(t):
-            try:
-                d = self._massive_client.get_ticker_details(t)
-                return (t, {'name': d.name, 'market_cap': d.market_cap, 'description': d.description})
-            except Exception:
-                return (t, {})
-
-        def fetch_ratios(t):
-            try:
-                results = list(self._massive_client.list_financials_ratios(ticker=t, limit=1))
-                if not results:
+            def fetch_details(t):
+                try:
+                    d = self._massive_client.get_ticker_details(t)
+                    return (t, {'name': d.name, 'market_cap': d.market_cap, 'description': d.description})
+                except Exception:
                     return (t, {})
-                r = results[0]
-                data = {}
-                for attr, label in [
-                    ('price_to_earnings', 'pe'), ('debt_to_equity', 'de'),
-                    ('return_on_equity', 'roe'), ('earnings_per_share', 'eps'),
-                    ('dividend_yield', 'div_yield'),
-                ]:
-                    val = getattr(r, attr, None)
-                    if val is not None:
-                        data[label] = round(float(val), 2)
-                return (t, data)
-            except Exception:
-                return (t, {})
 
-        def fetch_news(t):
-            try:
-                articles = list(self._massive_client.list_ticker_news(ticker=t, limit=1))
-                if not articles:
+            def fetch_ratios(t):
+                try:
+                    results = list(self._massive_client.list_financials_ratios(ticker=t, limit=1))
+                    if not results:
+                        return (t, {})
+                    r = results[0]
+                    data = {}
+                    for attr, label in [
+                        ('price_to_earnings', 'pe'), ('debt_to_equity', 'de'),
+                        ('return_on_equity', 'roe'), ('earnings_per_share', 'eps'),
+                        ('dividend_yield', 'div_yield'),
+                    ]:
+                        val = getattr(r, attr, None)
+                        if val is not None:
+                            data[label] = round(float(val), 2)
+                    return (t, data)
+                except Exception:
                     return (t, {})
-                a = articles[0]
-                sentiment = ''
-                if a.insights:
-                    sentiments = [i.sentiment for i in a.insights if i.sentiment]
-                    sentiment = ', '.join(sentiments)
-                return (t, {'headline': a.title, 'sentiment': sentiment})
+
+            def fetch_news(t):
+                try:
+                    articles = list(self._massive_client.list_ticker_news(ticker=t, limit=1))
+                    if not articles:
+                        return (t, {})
+                    a = articles[0]
+                    sentiment = ''
+                    if a.insights:
+                        sentiments = [i.sentiment for i in a.insights if i.sentiment]
+                        sentiment = ', '.join(sentiments)
+                    return (t, {'headline': a.title, 'sentiment': sentiment})
+                except Exception:
+                    return (t, {})
+
+            with ThreadPoolExecutor(max_workers=10) as pool:
+                futures = []
+                for t in tickers:
+                    futures.append(pool.submit(fetch_details, t))
+                    futures.append(pool.submit(fetch_ratios, t))
+                    futures.append(pool.submit(fetch_news, t))
+
+                for future in as_completed(futures):
+                    ticker, data = future.result()
+                    fn = future._args[0] if hasattr(future, '_args') else ''
+                    # Determine which map to update based on keys
+                    if 'name' in data:
+                        details_map[ticker] = data
+                    elif 'headline' in data:
+                        news_map[ticker] = data
+                    elif data and 'name' not in data and 'headline' not in data:
+                        ratios_map[ticker] = data
+
+            # Merge into results
+            for m in movers:
+                t = m['ticker']
+                m['details'] = details_map.get(t, {})
+                m['ratios'] = ratios_map.get(t, {})
+                m['news'] = news_map.get(t, {})
+
+            return movers
+
+        return self._movers_detail_from_capabilities(market, direction, num, source, min_price)
+
+    def _movers_detail_from_capabilities(self, market, direction, num, source, min_price) -> list[dict]:
+        from concurrent.futures import ThreadPoolExecutor
+        from trader.data_providers import Capability
+        frame = self.movers(market=market, direction=direction, source=source, min_price=min_price).head(num)
+        assets = self._movers_asset_directory() if market == 'stocks' else None
+        news_provider = self._provider(Capability.NEWS)
+
+        def latest_headline(ticker: str) -> dict:
+            try:
+                items = news_provider.news(ticker, 1)
             except Exception:
-                return (t, {})
+                return {}
+            return {'headline': items[0]['title'], 'sentiment': items[0]['sentiment']} if items else {}
 
-        with ThreadPoolExecutor(max_workers=10) as pool:
-            futures = []
-            for t in tickers:
-                futures.append(pool.submit(fetch_details, t))
-                futures.append(pool.submit(fetch_ratios, t))
-                futures.append(pool.submit(fetch_news, t))
-
-            for future in as_completed(futures):
-                ticker, data = future.result()
-                fn = future._args[0] if hasattr(future, '_args') else ''
-                # Determine which map to update based on keys
-                if 'name' in data:
-                    details_map[ticker] = data
-                elif 'headline' in data:
-                    news_map[ticker] = data
-                elif data and 'name' not in data and 'headline' not in data:
-                    ratios_map[ticker] = data
-
-        # Merge into results
-        for m in movers:
-            t = m['ticker']
-            m['details'] = details_map.get(t, {})
-            m['ratios'] = ratios_map.get(t, {})
-            m['news'] = news_map.get(t, {})
-
-        return movers
+        tickers = frame['ticker'].tolist()
+        with ThreadPoolExecutor(max_workers=5) as pool:
+            headlines = dict(zip(tickers, pool.map(latest_headline, tickers)))
+        return [{
+            'ticker': row.ticker,
+            'open': None,
+            'close': row.close,
+            'volume': None if pd.isna(row.volume) else row.volume,
+            'change': row.change,
+            'change_pct': row.change_pct,
+            'details': {'name': row.name or '', 'exchange': assets.exchange(row.ticker) if assets else '',
+                        'description': ''},
+            'ratios': {},
+            'news': headlines.get(row.ticker, {}),
+        } for row in frame.itertuples(index=False)]
 
     def scan_ideas(
         self,

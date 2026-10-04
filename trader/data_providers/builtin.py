@@ -26,6 +26,11 @@ def _alpaca_news(config: Mapping[str, Any]):
     return AlpacaNews(_alpaca_client(config))
 
 
+def _alpaca_movers(config: Mapping[str, Any]):
+    from trader.data_providers.alpaca.movers import AlpacaMovers
+    return AlpacaMovers(_alpaca_client(config))
+
+
 def _massive_history(config: Mapping[str, Any]):
     from trader.listeners.massive_history import MassiveHistoryWorker
     return MassiveHistoryWorker(massive_api_key=config['massive_api_key'])
@@ -85,6 +90,7 @@ def builtin_specs() -> list[ProviderSpec]:
                                 ('alpaca_api_secret_key', 'ALPACA_API_SECRET_KEY')),
                      {Capability.HISTORY: _alpaca_history,
                       Capability.QUOTES: _alpaca_quotes,
+                      Capability.MOVERS: _alpaca_movers,
                       Capability.NEWS: _alpaca_news}),
         ProviderSpec('massive', (('massive_api_key', 'MASSIVE_API_KEY'),),
                      {Capability.HISTORY: _massive_history,
@@ -101,8 +107,8 @@ def builtin_specs() -> list[ProviderSpec]:
 BUILTIN_DEFAULTS: dict[Capability, str] = {
     Capability.HISTORY: 'alpaca',
     Capability.QUOTES: 'alpaca',
-    Capability.MOVERS: 'massive',
-    Capability.NEWS: 'polygon',
+    Capability.MOVERS: 'alpaca',
+    Capability.NEWS: 'alpaca',
 }
 
 # IB history is contract-based and async, so it keeps its own code path and is

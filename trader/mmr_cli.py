@@ -1085,18 +1085,21 @@ def build_parser() -> argparse.ArgumentParser:
                                    '/currency_conversion endpoint.')
 
     # movers
-    movers_p = sub.add_parser('movers', help='Top market movers (Massive.com or TwelveData)')
+    movers_p = sub.add_parser(
+        'movers', help='Top market movers (default: Alpaca; stocks drop sub-$1 names, warrants, rights, units)')
     movers_p.add_argument('--market', '-m', default='stocks',
                            choices=['stocks', 'crypto', 'indices', 'options', 'futures'],
                            help='Market type (default: stocks)')
     movers_p.add_argument('--losers', action='store_true', default=False,
                            help='Show losers instead of gainers')
     movers_p.add_argument('--detail', action='store_true', default=False,
-                           help='Enrich with company name, ratios, and news (card view; Massive only)')
+                           help='Enrich with company name, ratios, and news (card view)')
     movers_p.add_argument('--num', '-n', type=int, default=20,
                            help='Number of results (default: 20)')
-    # Massive-first: TD /market_movers requires Pro+ and is not covered by
-    # default_data_source (which is often twelvedata for cheap history/quotes).
+    movers_p.add_argument('--min-price', type=float, default=1.0,
+                          help='Drop stock movers below this price (default: 1.0; 0 keeps all)')
+    # Movers never inherit default_data_source (often twelvedata for cheap history/quotes);
+    # TD /market_movers requires Pro+.
     movers_p.add_argument('--source', choices=source_choices(Capability.MOVERS), default=None,
                           help='Data source (default: data_providers.movers, else the builtin default). '
                                'twelvedata needs a Pro+ plan for market movers.')
@@ -10430,21 +10433,21 @@ def _handle_movers(mmr: MMR, args: argparse.Namespace):
 
     direction = 'losers' if args.losers else 'gainers'
     market = args.market
-    source = getattr(args, 'source', None)
 
-    from trader.data_providers import ProviderError
+    from trader.data_providers import Capability, ProviderError
     try:
+        source = getattr(args, 'source', None) or mmr._provider_default(Capability.MOVERS)
         _print_movers(mmr, args, market, direction, source)
     except ProviderError as ex:
         print_status(str(ex), success=False)
 
 
-def _print_movers(mmr: MMR, args: argparse.Namespace, market: str, direction: str, source: Optional[str]):
+def _print_movers(mmr: MMR, args: argparse.Namespace, market: str, direction: str, source: str):
     if not args.detail:
-        df = mmr.movers(market=market, direction=direction, source=source)
+        df = mmr.movers(market=market, direction=direction, source=source, min_price=args.min_price)
         if args.num and len(df) > args.num:
             df = df.head(args.num)
-        title_suffix = f' — {source}' if source else ''
+        title_suffix = f' — {source}'
         print_df(df, title=f'{market.title()} Movers ({direction}){title_suffix}')
         return
 
@@ -10454,7 +10457,8 @@ def _print_movers(mmr: MMR, args: argparse.Namespace, market: str, direction: st
         console.print(
             '[dim]TwelveData detail mode: ~100 credits per ticker for ratios, no news.[/dim]'
         )
-    movers = mmr.movers_detail(market=market, direction=direction, num=args.num, source=source)
+    movers = mmr.movers_detail(market=market, direction=direction, num=args.num, source=source,
+                               min_price=args.min_price)
     if not movers:
         console.print('[dim]No data[/dim]')
         return

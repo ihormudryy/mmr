@@ -2253,6 +2253,11 @@ class MMR:
     # Market Data
     # ------------------------------------------------------------------
 
+    @staticmethod
+    def _reject_exchange_hints_for_rest_source(source: str, exchange: str, currency: str) -> None:
+        if exchange or currency:
+            raise ValueError(f"--exchange/--currency need --source ib; {source} covers US listings only")
+
     def snapshot(self, symbol: Union[str, int], delayed: bool = False,
                  exchange: str = '', currency: str = '',
                  source: str = 'ib') -> dict:
@@ -2265,6 +2270,7 @@ class MMR:
             registry quotes source (e.g. 'alpaca' — IEX prices, 'twelvedata' — no bid/ask).
         """
         if source != 'ib':
+            self._reject_exchange_hints_for_rest_source(source, exchange, currency)
             from trader.data_providers import Capability
             quote = self._provider(Capability.QUOTES, source).quotes([str(symbol)])[0]
             if quote['error']:
@@ -2307,6 +2313,7 @@ class MMR:
             registry quotes source (e.g. 'alpaca' — IEX prices, 'twelvedata' — no bid/ask).
         """
         if source != 'ib':
+            self._reject_exchange_hints_for_rest_source(source, exchange, currency)
             from trader.data_providers import Capability
             return [_quote_to_batch_row(q) for q in self._provider(Capability.QUOTES, source).quotes(symbols)]
 

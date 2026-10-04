@@ -294,6 +294,35 @@ def _src_default(choices, fallback):
     return _DEFAULT_DATA_SOURCE if _DEFAULT_DATA_SOURCE in choices else fallback
 
 
+def _read_trader_config() -> dict:
+    import os
+    import yaml
+    path = Path(os.environ.get('TRADER_CONFIG', '~/.config/mmr/trader.yaml')).expanduser()
+    try:
+        with path.open() as f:
+            return yaml.safe_load(f) or {}
+    except (OSError, yaml.YAMLError):
+        return {}
+
+
+def _snapshot_source_default(choices) -> str:
+    """Default `--source` for snapshot commands.
+
+    Order: `data_providers.quotes`, then an explicitly set MMR_DEFAULT_DATA_SOURCE /
+    `default_data_source`, then IB. No implicit REST default: REST sources cover
+    US listings only, so a symbol with an exchange hint must not silently go there.
+    """
+    import os
+    config = _read_trader_config()
+    explicit_quotes_source = (config.get('data_providers') or {}).get('quotes')
+    if explicit_quotes_source in choices:
+        return explicit_quotes_source
+    default_data_source = os.environ.get('MMR_DEFAULT_DATA_SOURCE') or config.get('default_data_source')
+    if default_data_source in choices:
+        return default_data_source
+    return 'ib'
+
+
 def _load_equity_decimation() -> str:
     import os
     val = os.environ.get('MMR_EQUITY_DECIMATION')
@@ -408,9 +437,10 @@ def build_parser() -> argparse.ArgumentParser:
     from trader.data_providers.builtin import source_choices
     quote_sources = ['ib'] + source_choices(Capability.QUOTES)
     snap_p.add_argument('--source', choices=quote_sources,
-                        default=_src_default(quote_sources, 'ib'),
-                        help='Data source (default: ib). Non-IB sources use REST and need no '
-                             'trader_service; alpaca = IEX prices, twelvedata = no bid/ask.')
+                        default=_snapshot_source_default(quote_sources),
+                        help='Data source (default: data_providers.quotes, else default_data_source, else ib). '
+                             'REST sources need no trader_service and cover US listings only; '
+                             'alpaca = IEX prices, twelvedata = no bid/ask.')
 
     # snapshot-batch
     snap_batch_p = sub.add_parser('snapshot-batch', help='Batch price snapshots (JSON)',
@@ -422,9 +452,10 @@ def build_parser() -> argparse.ArgumentParser:
     snap_batch_p.add_argument('--exchange', default='', help='Exchange hint (e.g. ASX, TSE, SEHK)')
     snap_batch_p.add_argument('--currency', default='', help='Currency hint (e.g. AUD, JPY, HKD)')
     snap_batch_p.add_argument('--source', choices=quote_sources,
-                              default=_src_default(quote_sources, 'ib'),
-                              help='Data source (default: ib). Non-IB sources use REST and need no '
-                                   'trader_service; twelvedata batches up to 120 symbols per call.')
+                              default=_snapshot_source_default(quote_sources),
+                              help='Data source (default: data_providers.quotes, else default_data_source, else ib). '
+                                   'REST sources need no trader_service and cover US listings only; '
+                                   'twelvedata batches up to 120 symbols per call.')
 
     # depth
     depth_p = sub.add_parser('depth', help='Market depth (Level 2 order book)',
@@ -9449,7 +9480,7 @@ def _handle_snapshot(mmr: MMR, args: argparse.Namespace, cmd: str):
             result = mmr.snapshot(args.symbol, delayed=args.delayed, exchange=args.exchange,
                                   currency=args.currency, source=source)
             print_dict(result, title=f'Snapshot: {args.symbol}{suffix}')
-    except ProviderError as ex:
+    except (ProviderError, ValueError) as ex:
         print_status(str(ex), success=False)
 
 

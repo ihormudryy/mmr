@@ -18,9 +18,13 @@ ASSETS_PATH = '/v2/assets'
 DEFAULT_CACHE_PATH = Path('~/.local/share/mmr/cache/alpaca_assets.json').expanduser()
 CACHE_MAX_AGE = dt.timedelta(hours=24)
 
-# Security-type word at the end of the name, or followed by ", each" / "," (SPAC unit wording).
-# "Unit Corporation Common Stock" does not match.
-_DERIVATIVE_UNIT = re.compile(r'\b(warrants?|rights?|units?)\b\s*(,|$)', re.IGNORECASE)
+# Tested against Alpaca's full US-equity list (2026-10-04): flags 1,050 warrants/rights/SPAC
+# units, keeps MLP "Common Units", trusts and ADSs ("each representing the right to receive").
+_DERIVATIVE_UNIT = re.compile(
+    r'(?<!the )\b(warrants?|rights?)\b(?!\s+(management|group|holdings?|partners|inc\b|corp\b|company|trust))'
+    r'|(?<!common )\bunits?\b(?=\s*(,|\.|$|\(|-|\d|consisting|each|of\b|exp))',
+    re.IGNORECASE,
+)
 
 logger = logging.getLogger(__name__)
 

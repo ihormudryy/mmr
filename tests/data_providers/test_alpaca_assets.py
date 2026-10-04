@@ -3,6 +3,8 @@ import json
 import os
 from pathlib import Path
 
+import pytest
+
 from trader.data_providers.alpaca.assets import AlpacaAssetDirectory
 
 SAMPLE = json.loads((Path(__file__).parent / 'fixtures' / 'alpaca_assets_sample.json').read_text())
@@ -75,3 +77,33 @@ def test_corrupt_cache_is_refetched(tmp_path):
     client = FakeClient()
     assert AlpacaAssetDirectory(client, cache_path=cache, now=lambda: NOW).knows('AAPL')
     assert client.calls == 1
+
+
+REAL_NAMES = {
+    'MMVXF': ('MULTIMETAVERSE HLDGS LTD Warrant   01/04/2028', True),
+    'HGASW': ('Global Gas Corporation Warrant Exp 12/21/2028', True),
+    'HCVIU': ('HENNESSY CAP INVT CORP VI UNIT 1 CL A & 1/3 WT', True),
+    'ALSTF': ('ALPHA STAR ACQUISITION CORP Rights   12/13/2026', True),
+    'BLUWU': ('Blue Water Acquisition Corp. III Unit.', True),
+    'OXY.WS': ('Occidental Petroleum Corporation Warrants to Purchase Common Stock', True),
+    'HSPUF': ('HORIZON SPACE ACQUISITION I CORP USD UNITS CONSISTING ONE ORD SH & ONE RED WT & ONE RT '
+              '(Cayman Islands)', True),
+    'ASGI.RT': ('abrdn Global Infrastructure Income Fund Rights (expiring October 15, 2026)', True),
+    'ET': ('Energy Transfer LP Common Units representing limited partner interests', False),
+    'SPLP': ('Steel Partners Holdings L.P. Common Units, no par value', False),
+    'WDH': ('Waterdrop Inc. American Depositary Shares (each representing the right to receive '
+            '10 Class A Ordinary Shares)', False),
+    'OBTC': ('Osprey Bitcoin Trust Common Units of Beneficial Interest', False),
+    'PAGP': ('Plains GP Holdings, L.P. Class A Units representing Limited Partner Interests', False),
+}
+
+
+class RealNamesClient:
+    def get_json(self, path, params):
+        return [{'symbol': symbol, 'name': name} for symbol, (name, _) in REAL_NAMES.items()]
+
+
+@pytest.mark.parametrize('symbol,expected', [(symbol, flagged) for symbol, (_, flagged) in REAL_NAMES.items()])
+def test_real_alpaca_names_are_classified(symbol, expected):
+    assets = AlpacaAssetDirectory(RealNamesClient(), cache_path=None, now=lambda: NOW)
+    assert assets.is_derivative_unit(symbol) is expected

@@ -111,3 +111,21 @@ def test_default_data_source_does_not_change_registry_quotes_default():
     registry = ProviderRegistry.from_config({'default_data_source': 'twelvedata',
                                              'data_providers': {'quotes': 'twelvedata'}})
     assert registry.default_source(Capability.QUOTES) == 'twelvedata'
+
+
+@pytest.mark.parametrize('symbol', [4391, '4391'])
+def test_snapshot_rejects_conids_for_rest_sources(symbol):
+    mmr = object.__new__(MMR)
+    mmr._provider = MagicMock()
+    with pytest.raises(ValueError, match='conIds need --source ib; alpaca takes ticker symbols'):
+        mmr.snapshot(symbol, source='alpaca')
+    mmr._provider.assert_not_called()
+
+
+@pytest.mark.parametrize('symbols', [[4391], ['AAPL', '4391'], ['AAPL', 4391]])
+def test_snapshot_batch_rejects_any_conid_for_rest_sources(symbols):
+    mmr = object.__new__(MMR)
+    mmr._provider = MagicMock()
+    with pytest.raises(ValueError, match='conIds need --source ib; twelvedata takes ticker symbols'):
+        mmr.snapshot_batch(symbols, source='twelvedata')
+    mmr._provider.assert_not_called()

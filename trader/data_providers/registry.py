@@ -22,15 +22,18 @@ class ProviderRegistry:
         config: Mapping[str, Any],
         specs: Iterable[ProviderSpec],
         defaults: Mapping[Capability, str],
+        inherits_global_default: Optional[Iterable[Capability]] = None,
     ):
         self._config = config
         self._specs = {spec.name: spec for spec in specs}
         self._defaults = dict(defaults)
+        self._inherits_global_default = (frozenset(Capability) if inherits_global_default is None
+                                         else frozenset(inherits_global_default))
 
     @classmethod
     def from_config(cls, config: Mapping[str, Any]) -> 'ProviderRegistry':
-        from trader.data_providers.builtin import BUILTIN_DEFAULTS, builtin_specs
-        return cls(config, builtin_specs(), BUILTIN_DEFAULTS)
+        from trader.data_providers.builtin import BUILTIN_DEFAULTS, INHERITS_DEFAULT_DATA_SOURCE, builtin_specs
+        return cls(config, builtin_specs(), BUILTIN_DEFAULTS, INHERITS_DEFAULT_DATA_SOURCE)
 
     def sources_for(self, capability: Capability) -> list[str]:
         return sorted(name for name, spec in self._specs.items() if capability in spec.builders)
@@ -40,8 +43,10 @@ class ProviderRegistry:
         if overrides.get(capability.value):
             return overrides[capability.value]
         global_default = self._config.get('default_data_source')
-        if global_default in self.sources_for(capability):
+        if capability in self._inherits_global_default and global_default in self.sources_for(capability):
             return global_default
+        if capability not in self._defaults:
+            raise CapabilityNotSupported(capability.value, '(no default)', self.sources_for(capability))
         return self._defaults[capability]
 
     def get(self, capability: Capability, source: Optional[str] = None) -> object:

@@ -44,6 +44,12 @@ BUILTIN_DEFAULTS: dict[Capability, str] = {
 IB_HISTORY_SOURCE = 'ib'
 
 
+INHERITS_DEFAULT_DATA_SOURCE = frozenset({Capability.HISTORY, Capability.QUOTES})
+
+
+def source_choices(capability: Capability) -> list[str]:
+    return sorted(spec.name for spec in builtin_specs() if capability in spec.builders)
+
+
 def history_source_choices() -> list[str]:
-    rest_sources = sorted(spec.name for spec in builtin_specs() if Capability.HISTORY in spec.builders)
-    return rest_sources + [IB_HISTORY_SOURCE]
+    return source_choices(Capability.HISTORY) + [IB_HISTORY_SOURCE]

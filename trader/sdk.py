@@ -2934,6 +2934,14 @@ class MMR:
     # Financial Statements (via Massive.com REST API)
     # ------------------------------------------------------------------
 
+    def _provider(self, capability, source: Optional[str] = None):
+        from trader.data_providers import ProviderRegistry
+        return ProviderRegistry.from_config(self._container.config()).get(capability, source)
+
+    def _provider_default(self, capability) -> str:
+        from trader.data_providers import ProviderRegistry
+        return ProviderRegistry.from_config(self._container.config()).default_source(capability)
+
     @property
     def _massive_client(self):
         """Lazy-init Massive.com REST client."""

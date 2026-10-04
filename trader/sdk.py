@@ -4130,122 +4130,29 @@ class MMR:
         return out
 
     # ------------------------------------------------------------------
-    # News (Massive.com REST API)
+    # News (provider registry)
     # ------------------------------------------------------------------
 
-    def news(
-        self,
-        ticker: Optional[str] = None,
-        limit: int = 10,
-        source: str = 'polygon',
-    ) -> pd.DataFrame:
-        """Get news articles, optionally filtered by ticker.
+    def news(self, ticker: Optional[str] = None, limit: int = 10,
+             source: Optional[str] = None) -> pd.DataFrame:
+        """News headlines from a registry news source ('alpaca', 'polygon', 'benzinga')."""
+        from trader.data_providers import Capability
+        items = self._provider(Capability.NEWS, source).news(ticker, limit)
+        frame = pd.DataFrame([{
+            'published': i['published'], 'title': i['title'], 'tickers': ', '.join(i['tickers']),
+            'author': i['author'], 'url': i['url'], 'summary': i['summary'], 'sentiment': i['sentiment'],
+        } for i in items], columns=['published', 'title', 'tickers', 'author', 'url', 'summary', 'sentiment'])
+        if not frame['sentiment'].astype(bool).any():
+            frame = frame.drop(columns='sentiment')
+        return frame
 
-        Parameters
-        ----------
-        ticker : str, optional
-            Stock ticker to filter (e.g. "AAPL"). None for general news.
-        limit : int
-            Max articles to return (default 10).
-        source : str
-            "polygon" (default) or "benzinga".
-        """
-        rows = []
-        if source == 'benzinga':
-            articles = self._massive_client.list_benzinga_news(
-                tickers=ticker, limit=limit,
-            )
-            for a in articles:
-                rows.append({
-                    'published': a.published or '',
-                    'title': a.title or '',
-                    'tickers': ', '.join(a.tickers) if a.tickers else '',
-                    'author': a.author or '',
-                    'url': a.url or '',
-                    'teaser': a.teaser or '',
-                })
-                if len(rows) >= limit:
-                    break
-        else:
-            articles = self._massive_client.list_ticker_news(
-                ticker=ticker, limit=limit,
-            )
-            for a in articles:
-                sentiment = ''
-                if a.insights:
-                    sentiments = [i.sentiment for i in a.insights if i.sentiment]
-                    sentiment = ', '.join(sentiments)
-                rows.append({
-                    'published': (a.published_utc or '')[:19],
-                    'title': a.title or '',
-                    'tickers': ', '.join(a.tickers) if a.tickers else '',
-                    'sentiment': sentiment,
-                    'author': a.author or '',
-                    'url': a.article_url or '',
-                })
-                if len(rows) >= limit:
-                    break
-        return pd.DataFrame(rows)
-
-    def news_detail(
-        self,
-        ticker: Optional[str] = None,
-        limit: int = 5,
-        source: str = 'polygon',
-    ) -> List[dict]:
-        """Get news articles with full descriptions/teasers.
-
-        Parameters
-        ----------
-        ticker : str, optional
-            Stock ticker to filter.
-        limit : int
-            Max articles (default 5).
-        source : str
-            "polygon" or "benzinga".
-        """
-        results = []
-        if source == 'benzinga':
-            articles = self._massive_client.list_benzinga_news(
-                tickers=ticker, limit=limit,
-            )
-            for a in articles:
-                results.append({
-                    'title': a.title or '',
-                    'published': a.published or '',
-                    'author': a.author or '',
-                    'tickers': a.tickers or [],
-                    'tags': a.tags or [],
-                    'url': a.url or '',
-                    'teaser': a.teaser or '',
-                })
-                if len(results) >= limit:
-                    break
-        else:
-            articles = self._massive_client.list_ticker_news(
-                ticker=ticker, limit=limit,
-            )
-            for a in articles:
-                insights = []
-                if a.insights:
-                    for i in a.insights:
-                        insights.append({
-                            'ticker': i.ticker,
-                            'sentiment': i.sentiment,
-                            'reasoning': i.sentiment_reasoning,
-                        })
-                results.append({
-                    'title': a.title or '',
-                    'published': (a.published_utc or '')[:19],
-                    'author': a.author or '',
-                    'tickers': a.tickers or [],
-                    'description': a.description or '',
-                    'insights': insights,
-                    'url': a.article_url or '',
-                })
-                if len(results) >= limit:
-                    break
-        return results
+    def news_detail(self, ticker: Optional[str] = None, limit: int = 5,
+                    source: Optional[str] = None) -> List[dict]:
+        """News with summaries and (where the provider has it) per-ticker sentiment insights."""
+        from trader.data_providers import Capability
+        keys = ('title', 'published', 'author', 'tickers', 'url', 'summary', 'insights')
+        return [{key: item[key] for key in keys}
+                for item in self._provider(Capability.NEWS, source).news(ticker, limit)]
 
     # ------------------------------------------------------------------
     # Market hours (local-only, no service needed)

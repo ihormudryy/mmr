@@ -897,20 +897,20 @@ def build_parser() -> argparse.ArgumentParser:
     fin_filing_p.add_argument('--limit', type=int, default=1, help='Number of filings (default: 1, most recent)')
 
     # news
-    news_p = sub.add_parser('news', help='Market news from Polygon/Benzinga (headlines)',
+    news_p = sub.add_parser('news', help='News headlines (default source: see data_providers.news)',
                              epilog='Examples:\n'
                                     '  news                          # General market news\n'
                                     '  news AAPL                     # News for AAPL\n'
                                     '  news AAPL --limit 20          # More articles\n'
-                                    '  news AAPL --source benzinga   # Use Benzinga source\n'
+                                    '  news AAPL --source benzinga   # Massive Benzinga feed\n'
                                     '  news AAPL --detail            # Full article details + sentiment\n'
                                     '\n'
                                     '  See also: news-fetch / news-search / news-enrich (~/dev/news scraper service)',
                              formatter_class=fmt)
     news_p.add_argument('ticker', nargs='?', default=None, help='Ticker to filter (optional)')
     news_p.add_argument('--limit', type=int, default=10, help='Number of articles (default: 10)')
-    news_p.add_argument('--source', default='polygon', choices=['polygon', 'benzinga'],
-                         help='News source (default: polygon)')
+    news_p.add_argument('--source', default=None, choices=source_choices(Capability.NEWS),
+                        help='News source (default: data_providers.news, else the builtin default)')
     news_p.add_argument('--detail', action='store_true', default=False,
                          help='Show full article details with descriptions/sentiment')
 
@@ -10180,8 +10180,9 @@ def _handle_news_universe(args: argparse.Namespace):
 
 
 def _handle_news(mmr: MMR, args: argparse.Namespace):
-    """Fetch news from Massive.com (headline path)."""
+    """Fetch news headlines from a registry news source."""
     import logging as _logging
+    from trader.data_providers import ProviderError
     _logging.getLogger('urllib3').setLevel(_logging.WARNING)
 
     ticker = args.ticker.upper() if args.ticker else None
@@ -10202,7 +10203,7 @@ def _handle_news(mmr: MMR, args: argparse.Namespace):
                     f'[dim]{a["published"]}  |  {a["author"]}'
                     f'{"  |  " + tickers_str if tickers_str else ""}[/dim]'
                 )
-                desc = a.get('description') or a.get('teaser', '')
+                desc = a.get('summary', '')
                 if desc:
                     console.print(desc)
                 insights = a.get('insights', [])
@@ -10225,11 +10226,13 @@ def _handle_news(mmr: MMR, args: argparse.Namespace):
             # Truncate title for table display
             if 'title' in df.columns:
                 df['title'] = df['title'].str[:80]
-            if 'teaser' in df.columns:
-                df['teaser'] = df['teaser'].str[:60]
+            if 'summary' in df.columns:
+                df['summary'] = df['summary'].str[:60]
             print_df(df, title=title_label)
     except ValueError as e:
         console.print(f'[red]{e}[/red]')
+    except ProviderError as ex:
+        print_status(str(ex), success=False)
 
 
 def _handle_options(mmr: MMR, args: argparse.Namespace):

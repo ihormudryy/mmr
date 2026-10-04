@@ -1855,13 +1855,13 @@ def build_parser() -> argparse.ArgumentParser:
     data_dl_p.add_argument('symbols', nargs='+', help='Symbols to download')
     data_dl_p.add_argument('--bar-size', default='1 day', help='Bar size (default: "1 day")')
     data_dl_p.add_argument('--days', type=int, default=365, help='Days of history (default: 365)')
+    from trader.data_providers.builtin import history_source_choices
     data_dl_p.add_argument(
         '--source',
-        choices=['massive', 'twelvedata', 'ib'],
-        default=_src_default(['massive', 'twelvedata', 'ib'], 'massive'),
-        help='Data source (default: massive). Use `ib` for international '
-             'exchanges (ASX, SEHK, TSE, EU) where massive/twelvedata do '
-             'not have coverage — requires trader_service / IB Gateway.',
+        choices=history_source_choices(),
+        default=_src_default(history_source_choices(), 'massive'),
+        help='Data source (default: from default_data_source in trader.yaml). Use `ib` for '
+             'international exchanges (ASX, SEHK, TSE, EU) — requires trader_service / IB Gateway.',
     )
     data_dl_p.add_argument(
         '--force', '-f',
@@ -8497,6 +8497,11 @@ def _try_get_exchange_calendar_for(security):
     return None
 
 
+def _rest_history_worker(source: str, cfg):
+    from trader.data_providers import Capability, ProviderRegistry
+    return ProviderRegistry.from_config(cfg).get(Capability.HISTORY, source)
+
+
 def _handle_data_download(args: argparse.Namespace):
     """Download data from the selected source directly to local DuckDB.
 
@@ -8517,24 +8522,15 @@ def _handle_data_download(args: argparse.Namespace):
     duckdb_path = cfg.get('duckdb_path', '')
     source = getattr(args, 'source', 'massive')
 
-    api_key = ''
-    if source == 'twelvedata':
-        api_key = cfg.get('twelvedata_api_key', '')
-        if not api_key:
-            print_status('twelvedata_api_key not configured (set TWELVEDATA_API_KEY env var)', success=False)
+    from trader.data_providers import ProviderError
+
+    worker = None
+    if source != 'ib':
+        try:
+            worker = _rest_history_worker(source, cfg)
+        except ProviderError as ex:
+            print_status(str(ex), success=False)
             return
-    elif source == 'massive':
-        api_key = cfg.get('massive_api_key', '')
-        if not api_key:
-            print_status('massive_api_key not configured in trader.yaml', success=False)
-            return
-    elif source == 'ib':
-        # IB needs no API key — uses the trader_service / Gateway connection.
-        # We'll spin a short-lived IBHistoryWorker connection per call.
-        pass
-    else:
-        print_status(f'Unknown source: {source!r}', success=False)
-        return
 
     if not duckdb_path:
         print_status('duckdb_path not configured', success=False)
@@ -8545,13 +8541,7 @@ def _handle_data_download(args: argparse.Namespace):
     storage = TickStorage(history_path)
     accessor = UniverseAccessor(duckdb_path, cfg.get('universe_library', 'Universes'))
 
-    if source == 'twelvedata':
-        from trader.listeners.twelvedata_history import TwelveDataHistoryWorker
-        worker = TwelveDataHistoryWorker(twelvedata_api_key=api_key)
-    elif source == 'massive':
-        from trader.listeners.massive_history import MassiveHistoryWorker
-        worker = MassiveHistoryWorker(massive_api_key=api_key)
-    else:  # source == 'ib'
+    if source == 'ib':
         from trader.listeners.ib_history_worker import IBHistoryWorker
         import os as _os
         # docker-entrypoint.sh writes the resolved IB_SERVER_* values to

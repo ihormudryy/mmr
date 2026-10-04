@@ -173,16 +173,17 @@ alpaca_api_secret_key: ''
 # Override per-shell with MMR_DEFAULT_DATA_SOURCE.
 # Recognised values: alpaca, massive, twelvedata, ib (only used where the choice
 # set for that command includes it; otherwise the command's own default
-# applies). `alpaca` only affects `data download` (history); other --source
-# commands ignore it and use their own default.
-# NOTE: `ideas` and `movers` always default to massive — TwelveData's
-# /market_movers endpoint requires Pro+, so inheriting twelvedata here
-# would 403 on Basic/Starter keys that still work for quotes/history.
+# applies). It affects `data download` and the REST quote commands (`snapshot`,
+# `snapshot-batch`). `movers` and `news` never inherit it: use
+# data_providers.movers / data_providers.news below. `ideas` still defaults to
+# massive until phase 3b.
 default_data_source: alpaca
 
 # Optional per-capability override. Wins over default_data_source.
 # data_providers:
 #   history: alpaca
+#   movers: alpaca
+#   news: alpaca
 
 # Equity-curve decimation at backtest-persist time. The full per-bar
 # series is ~9.9 MB per 1-min run (4,713 runs took ~47 GB pre-fix);

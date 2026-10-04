@@ -336,7 +336,7 @@ If you're running a long/short book, read `net_exposure_pct` first — a $1M lon
 | Method | Service? | Description |
 |--------|----------|-------------|
 | `MMRHelpers.ideas(preset, tickers=, universe=, num=, location=, source=, ...)` | No*/Yes** | scan for trading ideas with technical scoring |
-| `MMRHelpers.news(ticker="", limit=10, detail=False)` | No* | Market news with optional sentiment (Massive only) |
+| `MMRHelpers.news(ticker="", limit=10, detail=False)` | No* | Market news (default Alpaca; sentiment only with `source="polygon"`). JSON items use `summary` (was `teaser`/`description`) |
 | `MMRHelpers.movers(market="stocks", losers=False, num=20, source="massive")` | No* | Top market movers |
 
 *Requires `massive_api_key` (default) or `twelvedata_api_key` (when `source="twelvedata"`). **Requires trader_service when using `location=` for international markets; `location=` overrides `source=`.

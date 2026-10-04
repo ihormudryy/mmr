@@ -20,8 +20,8 @@ one local commit per task, app working after every task.
 |---|---|---|---|---|
 | 1 | `2026-10-04-free-data-providers-01-02-history.md` | registry foundation + history routing (TD, Massive behind registry; dead polygon code removed) | — | done |
 | 2 | same file | history | Alpaca | done |
-| 3a | `…-03a-quotes-movers-news.md` | quotes, movers (+filter), news | Alpaca | to write after 2 |
-| 3b | `…-03b-scanner-merge.md` | one capability-based idea scanner | — | after 3a |
+| 3a | `…-03a-quotes-movers-news.md` | quotes, movers (+filter), news | Alpaca | done |
+| 3b | `…-03b-scanner-merge.md` | one capability-based idea scanner; CLI `snapshot` default should honour `data_providers.quotes` (deferred from 3a) | — | after 3a |
 | 3c | `…-03c-remove-fallback.md` | remove silent Massive→TD fallback | — | after 3b |
 | 4 | `…-04-fundamentals.md` | ratios, statements, 10-K sections | Finnhub, EDGAR | after 3c |
 | 5 | `…-05-options.md` | options | Alpaca (indicative) | after 4 |
@@ -41,5 +41,12 @@ stay small (they are registered in place until then).
   run) — set `default_data_source: alpaca`, add the Alpaca keys, change US
   jobs to `source: alpaca`. Optional: `./docker.sh -B before_alpaca`, then a
   one-time forced US refetch (spec §5 "Provenance").
+- After phase 3a: `mmr movers` and `mmr news` default to Alpaca **without any
+  config edit** (they ignore `default_data_source`). The CLI needs the Alpaca
+  keys: export `ALPACA_API_KEY_ID` / `ALPACA_API_SECRET_KEY`, or put them in
+  the live `~/.config/mmr/trader.yaml` (empty env values no longer blank YAML
+  keys). To keep Massive: set `data_providers: {movers: massive, news: polygon}`
+  in the live `trader.yaml`. Also confirm Alpaca movers `last_updated` is
+  intraday on a weekday (spec 3a check; not run on 2026-10-04, a Sunday).
 - Before phase 8: create a free Alpha Vantage key.
 - When IB Gateway is up: run the IB history-without-bundle check (spec §11).

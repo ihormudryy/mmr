@@ -38,3 +38,41 @@ def test_nvda_split_is_adjusted_with_no_jump():
     closes = df['close']
     assert closes.max() / closes.min() < 1.2
     assert closes.max() < 200
+
+
+def _alpaca_config():
+    return {
+        'alpaca_api_key_id': os.environ['ALPACA_API_KEY_ID'],
+        'alpaca_api_secret_key': os.environ['ALPACA_API_SECRET_KEY'],
+    }
+
+
+def _registry():
+    return ProviderRegistry.from_config(_alpaca_config())
+
+
+def test_live_quotes():
+    aapl, unknown = _registry().get(Capability.QUOTES, 'alpaca').quotes(['AAPL', 'ZZZZQ'])
+    assert aapl['error'] == '' and aapl['last'] > 0 and aapl['feed'] == 'iex'
+    assert 'no snapshot' in unknown['error']
+
+
+def test_live_news():
+    items = _registry().get(Capability.NEWS, 'alpaca').news('AAPL', 3)
+    assert 1 <= len(items) <= 3 and all(item['title'] for item in items)
+
+
+def test_live_movers_are_clean():
+    from trader.data_providers.builtin import alpaca_asset_directory
+    from trader.data_providers.movers_filter import filter_stock_movers
+    assets = alpaca_asset_directory(_alpaca_config())
+    raw = _registry().get(Capability.MOVERS, 'alpaca').movers('stocks', 'gainers')
+    clean = filter_stock_movers(raw, 1.0, assets)
+    assert len(raw) > 0
+    assert (clean['close'] >= 1.0).all()
+    assert not clean['ticker'].map(assets.is_derivative_unit).any()
+    assert assets.knows('AAPL') and assets.name('AAPL')
+
+
+def test_live_crypto_movers():
+    assert len(_registry().get(Capability.MOVERS, 'alpaca').movers('crypto', 'gainers')) > 0

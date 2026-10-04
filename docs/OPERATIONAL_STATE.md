@@ -129,6 +129,21 @@ Massive remain opt-in via `--source`. Known quirk, left as is: TwelveData
 returns nothing for intraday bars when start == end, so a single-day gap can
 be skipped with `--source twelvedata`.
 
+### Movers and news (phase 3a)
+
+From phase 3a, `mmr movers` and `mmr news` default to Alpaca **without any
+config edit** (they ignore `default_data_source`). The CLI needs the Alpaca
+keys: export `ALPACA_API_KEY_ID` / `ALPACA_API_SECRET_KEY`, or put them in the
+live `~/.config/mmr/trader.yaml` (empty env values no longer blank YAML keys).
+To keep Massive: set `data_providers: {movers: massive, news: polygon}` in the
+live `trader.yaml`.
+
+Live checks (2026-10-04): all gated Alpaca live tests passed (quotes, news,
+movers filter, crypto movers, history). Weekday intraday movers check: not run
+(outside US market hours, it was Sunday 08:16 ET).
+
+- TODO (operator): Confirm Alpaca movers `last_updated` is intraday on a weekday (spec 3a check)
+
 ---
 
 ## Infrastructure

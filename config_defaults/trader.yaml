@@ -169,7 +169,8 @@ alpaca_api_key_id: ''
 alpaca_api_secret_key: ''
 
 # CLI default for --source on commands that take it (history download,
-# snapshot, watch, financials, fx). Per-command --source still wins.
+# snapshot, watch, financials). Per-command --source still wins.
+# Forex commands never inherit it (see data_providers.forex below).
 # Override per-shell with MMR_DEFAULT_DATA_SOURCE.
 # Recognised values: alpaca, massive, twelvedata, ib (only used where the choice
 # set for that command includes it; otherwise the command's own default
@@ -188,6 +189,9 @@ default_data_source: alpaca
 #   quotes: alpaca    # snapshot default; unset = IB
 #   movers: alpaca
 #   news: alpaca
+#   forex: frankfurter          # forex convert/snapshot-all; also snapshot/quote (unset = IB)
+#   movers_forex: computed_fx
+#   movers_indices: etf_proxy
 
 # Equity-curve decimation at backtest-persist time. The full per-bar
 # series is ~9.9 MB per 1-min run (4,713 runs took ~47 GB pre-fix);

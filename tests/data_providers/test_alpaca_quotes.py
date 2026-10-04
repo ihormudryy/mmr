@@ -97,3 +97,34 @@ def test_null_fields_become_nan():
     assert math.isnan(quote['bid']), "bp: null should be NaN bid"
     assert quote['ask'] == 350, "ap should still be 350"
     assert quote['last'] == 333.75, "last price should be 333.75"
+
+
+def _snapshot_with_trade_at(timestamp):
+    snapshot = dict(FIXTURE['AAPL'])
+    snapshot['latestTrade'] = dict(FIXTURE['AAPL']['latestTrade'], t=timestamp, p=335.0)
+    return snapshot
+
+
+def test_premarket_trade_after_daily_bar_uses_daily_bar_close():
+    # Monday 08:00 ET while dailyBar is still Friday's bar: the previous session is dailyBar.
+    snapshot = _snapshot_with_trade_at('2026-10-05T12:00:00.123456789Z')
+    (quote,) = AlpacaQuotes(FakeClient([{'AAPL': snapshot}])).quotes(['AAPL'])
+    assert quote['previous_close'] == 333.75
+    assert quote['change'] == pytest.approx(1.25)
+    assert quote['change_pct'] == pytest.approx(1.25 / 333.75 * 100)
+
+
+def test_late_evening_utc_trade_on_daily_bar_date_uses_prev_daily_bar():
+    # 23:30 UTC on Friday is still Friday 19:30 ET.
+    snapshot = _snapshot_with_trade_at('2026-10-02T23:30:00Z')
+    (quote,) = AlpacaQuotes(FakeClient([{'AAPL': snapshot}])).quotes(['AAPL'])
+    assert quote['previous_close'] == 330.44
+
+
+def test_missing_daily_bar_leaves_change_nan():
+    snapshot = dict(FIXTURE['AAPL'])
+    del snapshot['dailyBar']
+    (quote,) = AlpacaQuotes(FakeClient([{'AAPL': snapshot}])).quotes(['AAPL'])
+    assert quote['error'] == '' and quote['last'] == 333.75
+    assert math.isnan(quote['close']) and math.isnan(quote['previous_close'])
+    assert math.isnan(quote['change']) and math.isnan(quote['change_pct'])

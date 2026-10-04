@@ -12,6 +12,7 @@ PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 if PROJECT_ROOT not in sys.path:
     sys.path.insert(0, PROJECT_ROOT)
 
+from trader.data_providers.massive.scan import MassiveScanSource
 from trader.tools.idea_scanner import (
     IBIdeaScanner,
     IdeaScanner,
@@ -114,7 +115,7 @@ def mock_client():
 
 @pytest.fixture
 def scanner(mock_client):
-    return IdeaScanner(mock_client)
+    return IdeaScanner(MassiveScanSource(mock_client))
 
 
 # ------------------------------------------------------------------
@@ -145,7 +146,7 @@ class TestDiscovery:
         mock_client.get_snapshot_direction.return_value = [
             _make_snapshot('AAPL', price=180, volume=1_000_000, change_pct=3.0),
         ]
-        snaps = scanner._discover('movers', None, None)
+        snaps = scanner.source._discover('movers', None, None)
         assert mock_client.get_snapshot_direction.call_count == 2
         assert len(snaps) == 2  # 1 from gainers + 1 from losers
 
@@ -153,7 +154,7 @@ class TestDiscovery:
         mock_client.get_snapshot_all.return_value = [
             _make_snapshot('AAPL'), _make_snapshot('MSFT'),
         ]
-        snaps = scanner._discover('tickers', ['AAPL', 'MSFT'], None)
+        snaps = scanner.source._discover('tickers', ['AAPL', 'MSFT'], None)
         mock_client.get_snapshot_all.assert_called_once_with(
             market_type='stocks', tickers=['AAPL', 'MSFT'],
         )
@@ -161,7 +162,7 @@ class TestDiscovery:
 
     def test_universe_source_uses_get_snapshot_all(self, scanner, mock_client):
         mock_client.get_snapshot_all.return_value = [_make_snapshot('AMD')]
-        snaps = scanner._discover('universe', None, ['AMD'])
+        snaps = scanner.source._discover('universe', None, ['AMD'])
         mock_client.get_snapshot_all.assert_called_once_with(
             market_type='stocks', tickers=['AMD'],
         )
@@ -169,7 +170,7 @@ class TestDiscovery:
 
     def test_market_source_uses_get_snapshot_all_no_tickers(self, scanner, mock_client):
         mock_client.get_snapshot_all.return_value = [_make_snapshot('XYZ')]
-        snaps = scanner._discover('market', None, None)
+        snaps = scanner.source._discover('market', None, None)
         mock_client.get_snapshot_all.assert_called_once_with(
             market_type='stocks',
         )
@@ -180,7 +181,7 @@ class TestDiscovery:
             '{"status":"NOT_AUTHORIZED","message":"You are not entitled to this data."}'
         )
         with pytest.raises(IdeaScannerError, match='Starter\\+'):
-            scanner._discover('movers', None, None)
+            scanner.source._discover('movers', None, None)
 
 
 class TestEntitlementHelpers:
@@ -218,26 +219,26 @@ class TestEntitlementHelpers:
 class TestBuildCandidates:
     def test_gap_pct_calculation(self, scanner):
         snap = _make_snapshot('TEST', price=110, day_open=105, prev_close=100)
-        candidates = scanner._build_candidates([snap])
+        candidates = scanner.source._build_candidates([snap])
         assert len(candidates) == 1
         # gap = (105 - 100) / 100 * 100 = 5.0%
         assert candidates[0]['gap_pct'] == 5.0
 
     def test_relative_volume_calculation(self, scanner):
         snap = _make_snapshot('TEST', volume=2_000_000, prev_volume=1_000_000)
-        candidates = scanner._build_candidates([snap])
+        candidates = scanner.source._build_candidates([snap])
         assert candidates[0]['rel_vol'] == 2.0
 
     def test_range_pct_calculation(self, scanner):
         snap = _make_snapshot('TEST', day_high=110, day_low=100)
-        candidates = scanner._build_candidates([snap])
+        candidates = scanner.source._build_candidates([snap])
         # range = (110 - 100) / 100 * 100 = 10.0%
         assert candidates[0]['range_pct'] == 10.0
 
     def test_deduplicates_tickers(self, scanner):
         snap1 = _make_snapshot('AAPL', price=180)
         snap2 = _make_snapshot('AAPL', price=181)
-        candidates = scanner._build_candidates([snap1, snap2])
+        candidates = scanner.source._build_candidates([snap1, snap2])
         assert len(candidates) == 1
 
     def test_skips_no_day_data(self, scanner):
@@ -245,27 +246,27 @@ class TestBuildCandidates:
             ticker='BAD', day=None, prev_day=None,
             last_quote=None, todays_change_percent=0.0,
         )
-        candidates = scanner._build_candidates([snap])
+        candidates = scanner.source._build_candidates([snap])
         assert len(candidates) == 0
 
     def test_skips_empty_ticker(self, scanner):
         snap = _make_snapshot('')
-        candidates = scanner._build_candidates([snap])
+        candidates = scanner.source._build_candidates([snap])
         assert len(candidates) == 0
 
     def test_skips_warrants(self, scanner):
         snap = _make_snapshot('AEVAW')
-        candidates = scanner._build_candidates([snap])
+        candidates = scanner.source._build_candidates([snap])
         assert len(candidates) == 0
 
     def test_skips_preferred_stocks(self, scanner):
         snap = _make_snapshot('KKRpD')
-        candidates = scanner._build_candidates([snap])
+        candidates = scanner.source._build_candidates([snap])
         assert len(candidates) == 0
 
     def test_keeps_normal_uppercase_tickers(self, scanner):
         snap = _make_snapshot('AAPL')
-        candidates = scanner._build_candidates([snap])
+        candidates = scanner.source._build_candidates([snap])
         assert len(candidates) == 1
 
     def test_spread_pct_uses_bid_ask_price_fields(self, scanner):
@@ -276,7 +277,7 @@ class TestBuildCandidates:
             bid_price=99.90, ask_price=100.10,
             bid=None, ask=None,
         )
-        candidates = scanner._build_candidates([snap])
+        candidates = scanner.source._build_candidates([snap])
         assert candidates[0]['spread_pct'] == pytest.approx(0.2, abs=0.01)
 
 
@@ -355,7 +356,7 @@ class TestIndicatorFetch:
         mock_client.get_rsi.return_value = _make_indicator_result(65.0)
         mock_client.get_ema.return_value = _make_indicator_result(48.5)
 
-        result = scanner._fetch_indicators(['AAPL'], ['rsi', 'ema_9'])
+        result = scanner.source._fetch_indicators(['AAPL'], ['rsi', 'ema_9'])
         assert result['AAPL']['rsi'] == 65.0
         assert result['AAPL']['ema_9'] == 48.5
 
@@ -363,7 +364,7 @@ class TestIndicatorFetch:
         mock_client.get_rsi.side_effect = Exception('API error')
         mock_client.get_ema.return_value = _make_indicator_result(50.0)
 
-        result = scanner._fetch_indicators(['AAPL'], ['rsi', 'ema_9'])
+        result = scanner.source._fetch_indicators(['AAPL'], ['rsi', 'ema_9'])
         assert result['AAPL']['rsi'] is None
         assert result['AAPL']['ema_9'] == 50.0
 
@@ -374,21 +375,21 @@ class TestIndicatorFetch:
             return _make_indicator_result(55.0)
 
         mock_client.get_rsi.side_effect = rsi_side_effect
-        result = scanner._fetch_indicators(['AAPL', 'BAD'], ['rsi'])
+        result = scanner.source._fetch_indicators(['AAPL', 'BAD'], ['rsi'])
         assert result['AAPL']['rsi'] == 55.0
         assert result['BAD']['rsi'] is None
 
     def test_empty_indicators_list(self, scanner, mock_client):
-        result = scanner._fetch_indicators(['AAPL'], [])
+        result = scanner.source._fetch_indicators(['AAPL'], [])
         assert result == {}
 
     def test_empty_tickers_list(self, scanner, mock_client):
-        result = scanner._fetch_indicators([], ['rsi'])
+        result = scanner.source._fetch_indicators([], ['rsi'])
         assert result == {}
 
     def test_fetches_sma_20_and_50(self, scanner, mock_client):
         mock_client.get_sma.return_value = _make_indicator_result(100.0)
-        result = scanner._fetch_indicators(['AAPL'], ['sma_20', 'sma_50'])
+        result = scanner.source._fetch_indicators(['AAPL'], ['sma_20', 'sma_50'])
         assert result['AAPL']['sma_20'] == 100.0
         assert result['AAPL']['sma_50'] == 100.0
         assert mock_client.get_sma.call_count == 2
@@ -667,7 +668,7 @@ class TestFundamentals:
         mock_client.list_financials_ratios.return_value = [
             _make_financial_ratio('AAPL'),
         ]
-        result = scanner._fetch_fundamentals(['AAPL'])
+        result = scanner.source._fetch_fundamentals(['AAPL'])
         assert 'AAPL' in result
         assert result['AAPL']['pe_ratio'] == 25.0
         assert result['AAPL']['debt_equity'] == 0.8
@@ -679,7 +680,7 @@ class TestFundamentals:
             return [_make_financial_ratio(ticker, pe=20.0 if ticker == 'AAPL' else 30.0)]
         mock_client.list_financials_ratios.side_effect = side_effect
 
-        result = scanner._fetch_fundamentals(['AAPL', 'MSFT'])
+        result = scanner.source._fetch_fundamentals(['AAPL', 'MSFT'])
         assert result['AAPL']['pe_ratio'] == 20.0
         assert result['MSFT']['pe_ratio'] == 30.0
 
@@ -690,17 +691,17 @@ class TestFundamentals:
             return [_make_financial_ratio(ticker)]
         mock_client.list_financials_ratios.side_effect = side_effect
 
-        result = scanner._fetch_fundamentals(['AAPL', 'BAD'])
+        result = scanner.source._fetch_fundamentals(['AAPL', 'BAD'])
         assert 'AAPL' in result
         assert 'BAD' not in result
 
     def test_fetch_fundamentals_empty_result(self, scanner, mock_client):
         mock_client.list_financials_ratios.return_value = []
-        result = scanner._fetch_fundamentals(['AAPL'])
+        result = scanner.source._fetch_fundamentals(['AAPL'])
         assert 'AAPL' not in result  # empty data dict is not stored
 
     def test_fetch_fundamentals_empty_tickers(self, scanner, mock_client):
-        result = scanner._fetch_fundamentals([])
+        result = scanner.source._fetch_fundamentals([])
         assert result == {}
 
     def test_scan_with_fundamentals_enriches_columns(self, scanner, mock_client):
@@ -737,7 +738,7 @@ class TestFundamentals:
         ratio.dividend_yield = None
         mock_client.list_financials_ratios.return_value = [ratio]
 
-        result = scanner._fetch_fundamentals(['AAPL'])
+        result = scanner.source._fetch_fundamentals(['AAPL'])
         assert result['AAPL']['div_yield'] is None
 
 
@@ -775,7 +776,7 @@ class TestNews:
         mock_client.list_ticker_news.return_value = [
             _make_news_article('AAPL', title='Apple hits record high'),
         ]
-        result = scanner._fetch_news(['AAPL'])
+        result = scanner.source._fetch_news(['AAPL'])
         assert 'AAPL' in result
         assert result['AAPL']['headline'] == 'Apple hits record high'
         assert result['AAPL']['sentiment'] == 'positive'
@@ -790,7 +791,7 @@ class TestNews:
             )]
         mock_client.list_ticker_news.side_effect = side_effect
 
-        result = scanner._fetch_news(['AAPL', 'MSFT'])
+        result = scanner.source._fetch_news(['AAPL', 'MSFT'])
         assert result['AAPL']['sentiment'] == 'positive'
         assert result['MSFT']['sentiment'] == 'negative'
 
@@ -801,17 +802,17 @@ class TestNews:
             return [_make_news_article(ticker)]
         mock_client.list_ticker_news.side_effect = side_effect
 
-        result = scanner._fetch_news(['AAPL', 'BAD'])
+        result = scanner.source._fetch_news(['AAPL', 'BAD'])
         assert 'AAPL' in result
         assert 'BAD' not in result
 
     def test_fetch_news_empty_result(self, scanner, mock_client):
         mock_client.list_ticker_news.return_value = []
-        result = scanner._fetch_news(['AAPL'])
+        result = scanner.source._fetch_news(['AAPL'])
         assert 'AAPL' not in result
 
     def test_fetch_news_empty_tickers(self, scanner, mock_client):
-        result = scanner._fetch_news([])
+        result = scanner.source._fetch_news([])
         assert result == {}
 
     def test_fetch_news_truncates_long_title(self, scanner, mock_client):
@@ -819,7 +820,7 @@ class TestNews:
         mock_client.list_ticker_news.return_value = [
             _make_news_article('AAPL', title=long_title),
         ]
-        result = scanner._fetch_news(['AAPL'])
+        result = scanner.source._fetch_news(['AAPL'])
         assert len(result['AAPL']['headline']) <= 120
 
     def test_fetch_news_matches_ticker_specific_insight(self, scanner, mock_client):
@@ -839,7 +840,7 @@ class TestNews:
             ],
         )
         mock_client.list_ticker_news.return_value = [article]
-        result = scanner._fetch_news(['AAPL'])
+        result = scanner.source._fetch_news(['AAPL'])
         assert result['AAPL']['sentiment'] == 'positive'
         assert 'AAPL surged' in result['AAPL']['catalyst']
 
@@ -879,7 +880,7 @@ class TestNews:
 
 class TestPresetDefinitions:
     def test_all_presets_have_valid_score_fn(self):
-        scanner = IdeaScanner(MagicMock())
+        scanner = IdeaScanner(MassiveScanSource(MagicMock()))
         for name, preset in PRESETS.items():
             assert hasattr(scanner, preset.score_fn), \
                 f'Preset {name} references missing score function: {preset.score_fn}'

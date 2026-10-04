@@ -1,17 +1,19 @@
 """Options chain analysis — probability distributions from market-implied volatility.
 
-Data sourced from Massive.com API. Keeps the binary options pricing math
-(d2, binary_call, binary_put, monte_carlo_binary, implied_constant_helper)
-data-source agnostic.
+Chain data comes from an OPTIONS provider as make_option_row() dicts. The
+binary-option pricing math (d2, binary_call, binary_put, monte_carlo_binary,
+implied_constant_helper) is data-source agnostic.
 """
 
 import datetime as dt
 import logging
+import math
+import numbers
 import numpy as np
 import pandas as pd
 
 from scipy.stats import norm
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Mapping, Sequence, Tuple
 from uniplot.uniplot import plot
 
 
@@ -47,8 +49,8 @@ def vol_by_strike(polymdl, K):
 
 
 def new_K(chain: pd.DataFrame):
-    newK = np.arange(1.0, chain.K.iloc[-1], 0.1)
-    return newK
+    """Strike grid over the fitted strikes only: the vol-smile polynomial is meaningless outside them."""
+    return np.arange(chain.K.min(), chain.K.max(), 0.1)
 
 
 def _get_massive_client(api_key: str = ''):
@@ -61,82 +63,6 @@ def _get_massive_client(api_key: str = ''):
         raise ValueError("massive_api_key not configured in trader.yaml")
     from massive import RESTClient
     return RESTClient(api_key=api_key)
-
-
-def get_option_dates(symbol: str, api_key: str = '') -> List[str]:
-    """Get unique expiration dates for a symbol via Massive API."""
-    logging.info('getting option dates for symbol %s', symbol)
-    client = _get_massive_client(api_key)
-    dates_seen = set()
-    for contract in client.list_options_contracts(
-        underlying_ticker=symbol,
-        expired=False,
-        limit=1000,
-        sort='expiration_date',
-        order='asc',
-    ):
-        if contract.expiration_date and contract.expiration_date not in dates_seen:
-            dates_seen.add(contract.expiration_date)
-    return sorted(dates_seen)
-
-
-def get_chains(symbol: str, date: str, api_key: str = '') -> Tuple[pd.DataFrame, pd.DataFrame]:
-    """Get call and put chain DataFrames with IV, T, S, K columns via Massive API."""
-    logging.info('getting option chain data for %s expiring %s', symbol, date)
-    client = _get_massive_client(api_key)
-
-    rows = []
-    for snap in client.list_snapshot_options_chain(
-        underlying_asset=symbol,
-        params={'expiration_date': date},
-    ):
-        details = snap.details
-        if not details or not details.strike_price:
-            continue
-
-        iv = snap.implied_volatility or 0.0
-        strike = details.strike_price
-        contract_type = (details.contract_type or '').lower()
-
-        bid = 0.0
-        ask = 0.0
-        if snap.last_quote:
-            bid = snap.last_quote.bid or 0.0
-            ask = snap.last_quote.ask or 0.0
-
-        underlying_price = 0.0
-        if snap.underlying_asset:
-            underlying_price = snap.underlying_asset.price or 0.0
-
-        rows.append({
-            'type': contract_type,
-            'strike': strike,
-            'IV': iv,
-            'bid': bid,
-            'ask': ask,
-            'underlying_price': underlying_price,
-            'T': (dt.datetime.strptime(date, '%Y-%m-%d') - dt.datetime.now()).days / 255.0,
-            'S': underlying_price,
-            'K': strike,
-        })
-
-    if not rows:
-        empty = pd.DataFrame(columns=['type', 'strike', 'IV', 'bid', 'ask',
-                                       'underlying_price', 'T', 'S', 'K'])
-        return (empty, empty.copy())
-
-    df = pd.DataFrame(rows)
-    calls = df[df['type'] == 'call'].sort_values('K').reset_index(drop=True)
-    puts = df[df['type'] == 'put'].sort_values('K').reset_index(drop=True)
-    return (calls, puts)
-
-
-def get_call_chain(symbol: str, date: str, api_key: str = '') -> pd.DataFrame:
-    return get_chains(symbol, date, api_key)[0]
-
-
-def get_put_chain(symbol: str, date: str, api_key: str = '') -> pd.DataFrame:
-    return get_chains(symbol, date, api_key)[1]
 
 
 def implied_constant_helper(chain: pd.DataFrame, risk_free_rate: float = 0.001):
@@ -190,12 +116,76 @@ def plot_market_implied_vs_constant_console(x, market_implied, constant, title):
     )
 
 
+MIN_IMPLIED_STRIKES = 8   # the degree-5 vol-smile fit needs more points than coefficients
+DAYS_PER_YEAR = 365.0     # provider IVs are annualised on calendar days
+
+
+def get_option_dates(symbol: str, api_key: str = '') -> List[str]:
+    """Expiration dates via Massive (dashboard path; the CLI/SDK use the OPTIONS capability)."""
+    from trader.data_providers.massive.options import MassiveOptions
+    logging.info('getting option dates for symbol %s', symbol)
+    return MassiveOptions(_get_massive_client(api_key)).expirations(symbol)
+
+
+def implied_inputs(
+    rows: Sequence[Mapping], expiration: str, today: dt.date,
+) -> Tuple[pd.DataFrame, List[Mapping], int]:
+    """The IV/K/S/T frame implied_constant_helper fits, built from calls with a usable IV.
+
+    Calls without an implied volatility (NaN, or zero/negative) are left out and counted:
+    fitting them as 0 would bend the smile.
+    """
+    days = (dt.date.fromisoformat(expiration) - today).days
+    if days <= 0:
+        raise ValueError(f'expiration {expiration} is not after {today}; '
+                         'the implied distribution needs time to expiry')
+    calls = [row for row in rows if row['type'] == 'call' and row['expiration'] == expiration]
+    if not calls:
+        raise ValueError(f'no call contracts for {expiration}')
+    usable = sorted((row for row in calls if _is_positive(row['iv'])), key=lambda row: row['strike'])
+    if len(usable) < MIN_IMPLIED_STRIKES:
+        raise ValueError(
+            f'only {len(usable)} of {len(calls)} call strikes have an implied volatility; '
+            f'need at least {MIN_IMPLIED_STRIKES} (illiquid expiration, or the indicative feed has no '
+            'greeks for it — try a nearer expiration or --source massive)')
+    spot = next((row['underlying_price'] for row in usable if _is_positive(row['underlying_price'])), None)
+    if spot is None:
+        raise ValueError('the chain has no underlying price; cannot centre the implied distribution')
+    frame = pd.DataFrame({
+        'IV': [row['iv'] / 100 for row in usable],
+        'K': [row['strike'] for row in usable],
+        'S': spot,
+        'T': days / DAYS_PER_YEAR,
+    })
+    return frame, usable, len(calls) - len(usable)
+
+
+def implied_distribution(
+    rows: Sequence[Mapping], expiration: str, risk_free_rate: float, today: dt.date,
+) -> Dict[str, Any]:
+    inputs, usable, excluded = implied_inputs(rows, expiration, today)
+    result = implied_constant_helper(inputs, risk_free_rate)
+    return {
+        'x': [float(value) for value in result['x']],
+        'market_implied': [float(value) for value in result['market_implied']],
+        'constant': [float(value) for value in result['constant']],
+        'strikes_used': len(usable),
+        'strikes_excluded': excluded,
+        'provider': usable[0]['provider'],
+        'feed': usable[0]['feed'],
+    }
+
+
+def _is_positive(value) -> bool:
+    return isinstance(value, numbers.Real) and not isinstance(value, bool) and math.isfinite(value) and value > 0
+
+
 def implied_constant(symbol: str, date: str, risk_free_rate: float = 0.001,
                      api_key: str = '') -> Dict[str, Any]:
-    calls, puts = get_chains(symbol, date, api_key)
-    if calls.empty:
-        raise ValueError(f'No call chain data for {symbol} expiring {date}')
-    return implied_constant_helper(calls, risk_free_rate)
+    """Implied distribution via Massive (dashboard path; the CLI/SDK use the OPTIONS capability)."""
+    from trader.data_providers.massive.options import MassiveOptions
+    rows = MassiveOptions(_get_massive_client(api_key)).chain(symbol, date, contract_type='call')
+    return implied_distribution(rows, date, risk_free_rate, dt.date.today())
 
 
 def plot_chain(

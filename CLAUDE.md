@@ -20,10 +20,17 @@ MMR (Make Me Rich) is a Python-based algorithmic trading platform for Interactiv
 **Free providers first, IB fallback**:
 
 - **Default sources.** Alpaca (free Basic plan) is the default for US history (SIP feed, split-adjusted), `movers` and `news`.
+- **Options data.** `options expirations|chain|snapshot|implied` default to Alpaca's free **indicative** feed: not the OPRA NBBO, greeks/IV only on liquid contracts, every row labelled `feed`. `--source massive` = OPRA (needs a Massive options plan). Orders (`options buy|sell`) stay on IB.
 - **Quotes.** Alpaca can serve REST quotes (IEX feed) for `snapshot` / `snapshot-batch`. Default: `data_providers.quotes`, else `MMR_DEFAULT_DATA_SOURCE` if it names a quote source, else a YAML `default_data_source` of `twelvedata` or `ib`, else IB. The template's `default_data_source: alpaca` is a history setting and does not switch snapshots; opt in with `data_providers.quotes: alpaca`. REST sources cover US listings only, so `--exchange` / `--currency` need IB.
+- **Forex and index movers.**
+  - *Defaults.* `forex snapshot` / `forex quote` use IB (change it only with `data_providers.forex`; a value that is not a forex source fails loudly with `CapabilityNotSupported`). `forex convert` and `forex snapshot-all` use free ECB daily reference rates from Frankfurter (`/v2` with `providers=ECB`, no key). `forex movers` uses `computed_fx`: 10 majors/crosses ranked by the ECB day-over-day change. `movers --market indices` uses `etf_proxy`: SPY, QQQ, DIA, IWM and the 11 sector SPDRs, ranked from Alpaca IEX prices. `data_providers.movers: massive` keeps Massive for index and forex movers too; `movers_indices` / `movers_forex` win over it.
+  - *Opt-in.* Massive is opt-in with `--source massive` for every command above (`--source massive` gives real indices). TwelveData is opt-in only for `forex snapshot` / `forex quote` / `forex convert`.
+  - *Labels.* ECB values are one rate per business day, not live: each carries its ECB date (`as_of`) and a note, and the forex tables say "ECB daily, not live" in the title. Values are rounded to 10 significant digits; forex tables and index movers show 5 decimals. ETF rows are labelled `(ETF proxy)` with volume left blank (IEX volume is a few percent of the market).
+  - *Strict input.* Pairs must be `EURUSD`, `EUR/USD` or `C:EURUSD`; `EUR` alone is an error. Amounts must be finite and > 0. A currency the ECB does not publish (e.g. COP) is an error.
+  - *Caveats.* `data_providers.forex: ib` breaks `forex convert` and `forex snapshot-all` (they need frankfurter, massive or twelvedata). Massive may return no bid/ask; not checked live (the Massive key is not entitled to forex; gated test: `tests/data_providers/test_live_massive_forex.py`). The IB IDEALPRO forex path has mocked tests only.
 - **Opt-in sources.** Massive.com (Polygon.io) and TwelveData stay available with `--source massive|twelvedata`.
-- **Inheritance.** Only history inherits `default_data_source`. `movers`, `news` and REST quotes never do (the registry's REST-quotes default is Alpaca; the CLI snapshot rule above decides what `snapshot` uses). Change their default with `data_providers.movers` / `data_providers.news`.
-- **Ideas.** Bare `ideas` still defaults to Massive until phase 3b (it does **not** inherit `default_data_source`). If Massive snapshots aren't entitled (Stocks Basic), the scanner falls back to TwelveData quotes on a small liquid US set (or `--tickers` / `--universe`).
+- **Inheritance.** Only history inherits `default_data_source`. `movers`, `news`, `ideas`, options, REST quotes and the forex commands never do (the registry's REST-quotes default is Alpaca; the CLI snapshot rule above decides what `snapshot` uses). Change their default with `data_providers.movers` / `data_providers.news` / `data_providers.ideas` / `data_providers.options` (forex: `data_providers.forex` / `movers_forex`; index movers: `movers_indices`; both movers fall back to `data_providers.movers` when that source serves them).
+- **Ideas.** Bare `ideas` defaults to Alpaca (it does **not** inherit `default_data_source`). Opt in to `--source massive|twelvedata`, or set `data_providers.ideas`. The Massive → TwelveData entitlement fallback runs only when the resolved source is Massive.
 - **International markets** (ASX, TSE, SEHK, etc.) use IB. Don't use Yahoo Finance.
 
 **No sentiment analysis on IB path**: IB's news API doesn't provide sentiment scoring. On the Massive path, sentiment comes from Polygon's insights. On the IB path, we only show the headline — no fake or estimated sentiment.
@@ -118,7 +125,7 @@ Additional patterns:
 
 **PnL subscription race**: `__subscribe_pnl` registers `(account, conId)` under `_pnl_subscriptions_lock` using first-claim-wins semantics. If the actual `subscribe_single_pnl` call fails, the registry entry is backed out so a retry can re-attempt. Portfolio updates fired from IB-eventkit threads are routed onto the main loop via `run_coroutine_threadsafe` (the main loop is captured in `connected_event`), so disk I/O during a universe update doesn't block the IB callback thread.
 
-**Idea scanner**: Raises `IdeaScannerError` (not an empty DataFrame) on IB discovery failure or when every ticker fails to resolve. Massive movers/snapshots require Stocks Starter+; TwelveData `/market_movers` requires Pro+. Entitlement errors fall back to TwelveData quote scans (liquid US set or `--tickers`/`--universe`) with a yellow CLI notice. Batch IB ops use `asyncio.gather` / `ThreadPoolExecutor` — keep DuckDB warm via `data refresh` so IB historical isn't on the hot path.
+**Idea scanner**: Raises `IdeaScannerError` (not an empty DataFrame) on IB discovery failure, when every ticker fails to resolve, or when every Alpaca indicator fetch fails. Massive movers/snapshots require Stocks Starter+; TwelveData `/market_movers` requires Pro+. When the source is Massive, entitlement errors fall back to TwelveData quote scans (liquid US set or `--tickers`/`--universe`) with a yellow CLI notice. Alpaca auth, entitlement and rate-limit errors stop the scan. Batch IB ops use `asyncio.gather` / `ThreadPoolExecutor` — keep DuckDB warm via `data refresh` so IB historical isn't on the hot path.
 
 **Data refresh loop** (`trader/mmr_cli.py:_handle_data_refresh` + `config_defaults/data_refresh.yaml`): Declarative jobs `{universe, source?, bar_size, days, force?}` keep universes' OHLCV current in the local DuckDB. Pycron owns the schedule (`data_refresh_us` and `data_refresh_asx` cron entries in `pycron.yaml`); the YAML owns *what* to fetch. Source auto-detects from the universe's dominant exchange when omitted (US → alpaca; else IB). A US job without Alpaca keys fails loudly (names `ALPACA_API_KEY_ID`); there is no silent fallback. Incremental by default — only missing date ranges are fetched — so a daily cron run costs ~seconds for fresh windows. `mmr data status` shows per-(job, bar_size) coverage and stale-days, color-coded; `mmr data refresh JOB [JOB ...]` runs jobs ad-hoc. Failures in one job are isolated (per-job result, batch keeps going) and don't take down the cron entry.
 
@@ -156,7 +163,7 @@ mmr/
 │   │   ├── exceptions.py      # TraderException, TraderConnectionException
 │   │   ├── contract_sink.py
 │   │   └── dataclass_cache.py # Cache with reactive update notifications
-│   ├── data_providers/        # Provider registry + Alpaca/Massive/TwelveData history providers
+│   ├── data_providers/        # Provider registry + Alpaca/Massive/TwelveData providers; options: option_symbols.py (OCC parser), alpaca/options.py, massive/options.py
 │   ├── data/
 │   │   ├── store.py           # Abstract DataStore/ObjectStore + DateRange
 │   │   ├── duckdb_store.py    # DuckDB implementations (DuckDBDataStore, DuckDBObjectStore)
@@ -201,7 +208,7 @@ mmr/
 │   │   ├── backtest_stats.py  # PSR, t-test, bootstrap CI, skew/kurt, MC streak — "is this real?"
 │   │   └── lookahead_check.py # assert_no_lookahead walk-forward consistency check
 │   └── tools/                 # Importable scripts (moved from scripts/)
-│       ├── idea_scanner.py    # Massive + TwelveData + IBIdeaScanner
+│       ├── idea_scanner.py    # IdeaScanner(source) pipeline + IBIdeaScanner
 │       ├── depth_chart.py     # Market depth chart (PNG) + Rich table rendering
 │       ├── chain.py           # Options chain analysis
 │       ├── trader_check.py    # Service health check
@@ -390,10 +397,11 @@ options chain AAPL                                    # Full chain snapshot (nea
 options chain AAPL --expiration 2026-03-20            # Specific expiration
 options chain AAPL -e 2026-03-20 --type call          # Calls only
 options chain AAPL -e 2026-03-20 --strike-min 200 --strike-max 250
-options snapshot O:AAPL260320C00250000                # Single contract detail
+options chain AAPL -e 3m --source massive             # OPRA via Massive (needs an options plan)
+options snapshot AAPL260320C00250000                  # Single contract detail (O: prefix also accepted)
 options implied AAPL -e 2026-03-20                    # Probability distribution
-options buy AAPL -e 2026-03-20 -s 250 -r C -q 5 --market
-options sell AAPL -e 2026-03-20 -s 250 -r C -q 5 --limit 3.50
+options buy AAPL -e 2026-03-20 -s 250 -r C -q 5 --market    # orders stay on IB; exact dates need no data source
+options sell AAPL -e 3m -s 250 -r C -q 5 --limit 3.50       # relative -e asks the options source (--source picks it)
 news                                         # General market news (default Alpaca)
 news AAPL                                    # News for a ticker
 news AAPL --limit 20                         # More articles
@@ -402,7 +410,8 @@ news AAPL --detail                           # Full details; sentiment only with
 movers                           # Default Alpaca; drops names under --min-price (default 1.0) and warrants/rights/units
 movers --min-price 5             # Stricter price floor
 movers --market crypto           # Crypto gainers (Alpaca)
-movers --market indices --source massive   # Indices/options/futures need Massive
+movers --market indices          # ETF proxies (SPY, QQQ, DIA, IWM, sector SPDRs) from Alpaca IEX prices — not the indices
+movers --market indices --source massive   # Real indices (paid); options/futures still need Massive
 movers --losers                  # Stock losers
 movers --market crypto --losers  # Crypto losers
 scan                             # Top gainers (default preset)
@@ -412,19 +421,20 @@ scan hot-volume                  # Hot by volume change
 scan --scan-code HIGH_OPT_VOLUME # Raw IB scanner code
 scan gainers --above-price 10 --num 30  # Filtered
 scan --instrument ETF --location STK.US  # ETFs
-ideas                                        # Momentum (default Massive; Basic → TD quote fallback)
+ideas                                        # Momentum (default Alpaca; free, delayed prices)
+ideas --source massive                       # Massive (full-market snapshots, ratios; paid plan; Basic → TD quote fallback)
 ideas gap-up / mean-reversion / breakout / gap-down / volatile
 ideas --source twelvedata --tickers AAPL MSFT NVDA AMD  # TwelveData quotes path
-ideas momentum --tickers AAPL MSFT AMD NVDA  # Scan specific tickers
+ideas momentum --tickers AAPL MSFT AMD NVDA  # Scan exactly these tickers (works on Alpaca)
 ideas momentum --universe sp500              # Scan a universe
 ideas gap-up --min-price 10                  # Override preset filter
 ideas volatile --num 25                      # Top 25 results
 ideas --presets                              # List all presets
-ideas momentum --detail                      # Show all columns incl. indicators
-ideas momentum --fundamentals                # Enrich with financial ratios (PE, D/E, ROE, etc.)
-ideas momentum --news                        # Enrich with latest news headline + sentiment
-ideas mean-reversion --news --fundamentals   # Full picture: technicals + fundamentals + news
-ideas gap-up -t AAPL MSFT --fundamentals     # Specific tickers with fundamentals
+ideas momentum --detail                      # Names + news + indicators (ratios only on massive/twelvedata/IB)
+ideas momentum --fundamentals --source massive  # Financial ratios (PE, D/E, ROE); errors on Alpaca until phase 4
+ideas momentum --news                        # Latest headline (sentiment only with --source massive)
+ideas mean-reversion --news --fundamentals --source massive  # Technicals + fundamentals + news
+ideas gap-up -t AAPL MSFT --fundamentals --source twelvedata  # Specific tickers with fundamentals
 ideas momentum --location STK.AU.ASX --tickers BHP CBA CSL  # ASX via IB (legacy path)
 ideas mean-reversion --location STK.AU.ASX --tickers BHP CBA --detail  # ASX with enrichment
 ideas gap-up --location STK.HK.SEHK --tickers 0700 0005     # Hong Kong via IB
@@ -453,38 +463,58 @@ resize-positions --max-bound 500000          # Trim portfolio to $500k
 resize-positions --min-bound 300000          # Grow portfolio to $300k
 resize-positions --max-bound 500000 --min-bound 300000  # Both bounds
 resize-positions --max-bound 500000 --dry-run  # Preview without executing
-forex snapshot EURUSD                        # Forex snapshot via IB (default)
-forex snapshot EURUSD --source massive       # Forex snapshot via Massive
-forex quote EUR USD                          # Last bid/ask via IB (default)
-forex quote EUR USD --source massive         # Last bid/ask via Massive
-forex snapshot-all                           # All forex snapshots (Massive only)
-forex movers                                 # Top forex gainers (Massive only)
-forex movers --losers                        # Top forex losers (Massive only)
-forex convert EUR USD 1000                   # Currency conversion (Massive only)
+forex snapshot EURUSD                        # IB (default; needs trader_service)
+forex snapshot EURUSD --source frankfurter   # ECB daily reference rate (free, not live)
+forex snapshot EURUSD --source massive       # Massive snapshot (paid)
+forex quote EUR USD                          # IB bid/ask (default)
+forex quote EUR USD --source frankfurter     # Same ECB daily rate as snapshot
+forex snapshot-all                           # ECB daily rates, every currency vs USD (Frankfurter)
+forex snapshot-all JPY GBP --base EUR        # Chosen currencies vs EUR
+forex movers                                 # 10 FX majors/crosses ranked by ECB day-over-day change (computed_fx)
+forex movers --losers --source massive       # Massive forex movers (paid)
+forex convert EUR USD 1000                   # ECB daily rate (Frankfurter); --source massive|twelvedata
 ```
 
 ## Ideas Scanner Architecture
 
-Three backends share scoring/filtering:
+One `IdeaScanner(source)` pipeline (discover → filter → indicators → score → rank) with three US scan sources, plus `IBIdeaScanner` for `--location`:
 
 ```
-ideas momentum                                  → IdeaScanner (Massive, US, ~4s) — needs Stocks Starter+
-ideas --source twelvedata --tickers …           → TwelveDataIdeaScanner (quotes + local indicators)
+ideas momentum                                  → IdeaScanner(AlpacaScanSource)     default, free
+ideas --source massive                          → IdeaScanner(MassiveScanSource)    paid plan
+ideas --source twelvedata --tickers …           → IdeaScanner(TwelveDataScanSource)
 ideas momentum --location STK.AU.ASX --tickers  → IBIdeaScanner (IB, international, ~30-90s)
 ```
 
-Bare `ideas` defaults to Massive. On Massive `NOT_AUTHORIZED` (Stocks Basic) or TwelveData movers 403 (non-Pro), the SDK falls back to TwelveData quotes on a small liquid US set (or your `--tickers`/`--universe`) and prints a yellow notice.
+Sources live in `trader/data_providers/<provider>/scan.py` and are picked through the provider registry (`Capability.IDEAS`). Bare `ideas` uses Alpaca. Change it with `data_providers.ideas` or `--source`. It never inherits `default_data_source`. The Massive → TwelveData fallback on `NOT_AUTHORIZED` (Stocks Basic) runs only when the resolved source is Massive; the SDK then scans a small liquid US set (or your `--tickers`/`--universe`) and prints a yellow notice.
 
-### IdeaScanner (Massive path — default)
+Every result carries `df.attrs['ideas_provider']`; Alpaca (and fallback) results also carry `df.attrs['ideas_notice']`. `mmr --json ideas` adds both as `provider` and `notice` next to `data` and `title`.
+
+### Alpaca source (default)
+
+```
+movers + most-actives (top 50 each)  →  delayed SIP snapshots  →  filter  →  daily bars + local RSI/EMA/SMA  →  score  →  rank
+```
+
+- Free. Discovery is the union of movers and most-actives, **not the full market**. The notice states how many symbols came back and names symbols with no snapshot, no previous close (dropped) or an invalid format.
+- Prices and volume are consolidated SIP snapshots, 15 minutes delayed.
+- `--tickers` / `--universe` scan exactly those symbols (de-duplicated). Preset filters still apply to them; relax with `--min-change` etc.
+- Indicators (RSI, EMA 9, SMA 20/50) are computed locally from Alpaca daily bars (120 calendar days, completed sessions only). Company names come from the Alpaca asset list.
+- Warrants, rights and units are dropped from discovery by the asset list. If the asset list is unavailable, the warrant check falls back to the ticker-suffix rule and the notice says so.
+- News is a headline only, no sentiment.
+- No fundamentals until phase 4: `--fundamentals` raises an error that names `--source massive|twelvedata`. `--detail` shows names, news and indicators, with a notice that ratios are not available.
+- Auth, entitlement and rate-limit errors stop the scan. If every ticker's indicators fail, the scan raises.
+
+### Massive source (`--source massive`)
 
 ```
 Massive movers / snapshot_all  →  filter  →  Massive indicator API (parallel)  →  score  →  rank
 ```
 
-- Fast (~4s) when entitled — server-side indicators, batch snapshots
+- Fast (~4s) when entitled: full-market snapshots, server-side indicators
 - US only; fundamentals + news with sentiment when plan allows
 
-### TwelveDataIdeaScanner (`--source twelvedata`)
+### TwelveData source (`--source twelvedata`)
 
 ```
 movers (Pro+) or batch /quote  →  filter  →  time_series + local RSI/EMA/SMA  →  score  →  rank
@@ -507,7 +537,7 @@ IB scanner / resolve_contract  →  get_snapshot (sequential)  →  reqHistorica
 - Fundamentals from `reqFundamentalData` (ReportSnapshot XML), news from `reqHistoricalNews` (no sentiment)
 - IB news headlines include metadata prefixes like `{A:800015:L:en}...` which are stripped before display
 
-### Shared module-level functions (used by Massive, TwelveData, and IB scanners)
+### Shared module-level functions (used by all scanners)
 
 - `PRESETS` dict, `ScanFilter`/`ScanPreset` dataclasses
 - Scoring functions: `_score_momentum`, `_score_gap_up`, `_score_gap_down`, `_score_mean_reversion`, `_score_breakout`, `_score_volatile`
@@ -531,8 +561,9 @@ CLI/SDK `resolve()` uses typed `discover_instrument` / `resolve_instrument` (421
 User configs live in `~/.config/mmr/`. On first run, bundled defaults from `config_defaults/` are copied there automatically (`container.ensure_config_dir()`). The `TRADER_CONFIG` env var overrides the config file path.
 
 **`~/.config/mmr/trader.yaml`**: IB connection (address, port, client IDs, account), DuckDB path, ZMQ port assignments. Env vars override config values (uppercased param name). Two CLI-only knobs the Container doesn't otherwise know about:
-- `default_data_source` (default `alpaca`) — default `--source` for history download, watch, financials, fx where that choice is valid (watch, financials and fx read it through `_src_default`). `snapshot` / `snapshot-batch` are special: Default: `data_providers.quotes`, else `MMR_DEFAULT_DATA_SOURCE` if it names a quote source, else a YAML `default_data_source` of `twelvedata` or `ib`, else IB. The template's `default_data_source: alpaca` is a history setting and does not switch snapshots; opt in with `data_providers.quotes: alpaca`. REST sources cover US listings only; `--exchange` / `--currency` need IB. For `data download` the order is: explicit `data_providers.history` → `MMR_DEFAULT_DATA_SOURCE` / `default_data_source` (`ib` is honoured) → registry default `alpaca`. **`movers` and `news` never inherit it** (set `data_providers.movers` / `data_providers.news` instead; defaults `alpaca`). **`ideas` still always defaults to `massive`** until phase 3b. Override the global default per-shell with `MMR_DEFAULT_DATA_SOURCE`.
+- `default_data_source` (default `alpaca`) — default `--source` for history download, watch, financials where that choice is valid (watch and financials read it through `_src_default`). `snapshot` / `snapshot-batch` are special: Default: `data_providers.quotes`, else `MMR_DEFAULT_DATA_SOURCE` if it names a quote source, else a YAML `default_data_source` of `twelvedata` or `ib`, else IB. The template's `default_data_source: alpaca` is a history setting and does not switch snapshots; opt in with `data_providers.quotes: alpaca`. REST sources cover US listings only; `--exchange` / `--currency` need IB. For `data download` the order is: explicit `data_providers.history` → `MMR_DEFAULT_DATA_SOURCE` / `default_data_source` (`ib` is honoured) → registry default `alpaca`. **`movers` and `news` never inherit it** (set `data_providers.movers` / `data_providers.news` instead; defaults `alpaca`). **Forex commands never inherit it either** (including `MMR_DEFAULT_DATA_SOURCE`): `forex snapshot`/`quote` default to IB, the rest to Frankfurter / `computed_fx`; override with `data_providers.forex` / `data_providers.movers_forex`, and `data_providers.movers_indices` for index movers (`data_providers.movers: massive` also moves both movers to Massive). A configured `data_providers.forex` that is not a forex source fails loudly (`CapabilityNotSupported`); `ib` there breaks `forex convert` and `forex snapshot-all`. **`ideas` never inherits it either** (default `alpaca`; set `data_providers.ideas` or use `--source`). Override the global default per-shell with `MMR_DEFAULT_DATA_SOURCE`.
   - **Output changes (phase 3a):** news items use `summary` (was `teaser` / `description`); Benzinga `tags` are no longer in `news_detail`; batch snapshot rows (REST sources) gain `feed` and `error`.
+  - **Output changes (phase 6):** forex `--source massive|twelvedata` results now use the shared keys (`pair`, `as_of`, `source`, `note`; TwelveData market state is in `note`); `forex quote --source massive|twelvedata` returns the same dict as `forex snapshot`; `forex snapshot-all` takes `--base` plus quote currencies; pairs must be exact (`EURUSD`, `EUR/USD`, `C:EURUSD`) — `EUR` alone is an error; missing numbers in every `--json` dict command (forex, and also `snapshot --source alpaca` and other dict output) are `null`, never bare `NaN` (which is not valid JSON); tables show `-`. Users who relied on `default_data_source: twelvedata` for forex must set `data_providers: {forex: twelvedata}`.
   - **Stock `movers` returns fewer rows than `--num`** after filtering (on 2026-10-02, 16 of Alpaca's 50 top gainers survived). `movers --detail` on Alpaca shows names and headlines but no ratios, market cap or description until phase 4 (`--source massive` keeps them).
   - Alpaca movers intraday check (weekday, `last_updated` age < 30 min) is not yet confirmed; see `docs/OPERATIONAL_STATE.md`.
 - `equity_decimation` (default `daily`) — how aggressively backtest persist downsamples `equity_curve_json`. `daily` ≈ 17 KB/run vs ~9.9 MB raw 1-min; statistically lossless for PSR/Sharpe-CI. Override with `MMR_EQUITY_DECIMATION`.
@@ -540,6 +571,17 @@ User configs live in `~/.config/mmr/`. On first run, bundled defaults from `conf
 **`~/.config/mmr/pycron.yaml`**: Cron jobs only (backups, data refresh). Hosts `data_refresh_us` / `data_refresh_asx` cron entries that drive the data-refresh loop (see below).
 
 **Alpaca keys** (`alpaca_api_key_id`, `alpaca_api_secret_key` in `trader.yaml`; env `ALPACA_API_KEY_ID` / `ALPACA_API_SECRET_KEY`). Non-empty env vars override flat YAML keys, same as Massive; empty env values (docker compose passes unset keys as `""`) are ignored for the four provider API keys. Alpaca history: SIP feed, `adjustment=split` (matches TwelveData `splits` and Massive `adjusted`), 1-min back to 2016 incl. pre/post market, no seconds bars. Only completed NYSE sessions are returned (after 20:16 ET: post-market ends 20:00 plus the 15-min SIP delay). Free Basic plan with a paper account — no paid plan needed. Providers live in `trader/data_providers/` (`ProviderRegistry.from_config/get/default_source/sources_for`); `data_service.pull_history(source, …)` serves them (`pull_massive` / `pull_twelvedata` are aliases) and builds a fresh provider per download task. `mmr history alpaca --symbol/--universe` downloads via the data service. Live checks: `MMR_LIVE_TESTS=1` + keys, `pytest -m live`.
+
+**Options data (phase 5).** Expirations must be `YYYY-MM-DD` or relative (`3m`, `90d`); anything else is rejected before any provider or IB call. Output changes:
+- Chain and snapshot rows share one shape (`OPTION_FIELDS`: the old columns plus `underlying, quote_time, last_time, provider, feed`). Titles and JSON say `feed: indicative` (Alpaca) or `opra` (Massive).
+- `ticker` is the bare OCC symbol for every source (Massive used to give `O:AAPL...`). `options snapshot` accepts both spellings.
+- Missing numbers are NaN: `—` in tables, `null` in JSON (they were `0.0` on Massive). Alpaca lists contracts that have no quote as rows with blank numbers. Alpaca `volume` is the daily-bar volume only for the quote's own session (older bar: 0; newer bar, no bar or no quote: blank); `open_interest` comes from the contracts API; `break_even` is blank. Alpaca `underlying_price` is the IEX last trade (one stock snapshot per call), not SIP; it also centres `options implied`.
+- `options snapshot` returns the row shape; `iv` is a number in percent (was the string `implied_volatility: "35.00%"`).
+- `options implied` reports `strikes_used` / `strikes_excluded`. It needs at least 8 call strikes with a real IV. It refuses a same-day or past expiration. It uses T = calendar days / 365 (was / 255, so distributions are narrower than before). The curve covers the quoted strike range only (it used to start at strike 1.0), so it no longer sums to 1.
+- The skill helper `implied_move` returns method `atm_straddle` with `provider` / `feed`. Confidence is `high` only on the OPRA feed, `medium` otherwise. In `auto` mode it falls back to realized vol and says why in `fallback_reason` (empty chain, NOT_AUTHORIZED, no spot price, no strike with a call and a put price, timeout or crash). Other CLI errors, such as missing keys or a rate limit, come back in `error`. The `options_*` helpers take `source=`.
+- An empty chain or expiry list prints a message naming the underlying and provider. An unknown underlying is a loud provider error. `--source massive` without an options plan prints the NOT_AUTHORIZED message and names `--source alpaca`.
+- Not yet verified live: Massive options (the key in use is not entitled). The `O:`-prefixed single-contract lookup and Massive response shapes are tested with fakes only.
+- Dashboard options routes still use Massive (phase 9). Its implied view shows a generic "provider request failed" (502) for too-few-strikes or same-day errors.
 
 **Known quirk (left as is):** `TwelveDataHistoryWorker` returns nothing for intraday bars when start == end, so `data download --source twelvedata` can skip single-day gaps.
 
@@ -739,7 +781,7 @@ Use `portfolio-snapshot` and `portfolio-diff` every cycle — they're small. If 
 
 **Step 2: Scan for opportunities**
 ```bash
-mmr --json ideas momentum --num 10          # US stocks via Massive (~4s)
+mmr --json ideas momentum --num 10          # US stocks via Alpaca (free, delayed prices)
 mmr --json ideas gap-up --tickers AAPL MSFT NVDA  # Specific tickers
 mmr --json ideas momentum --location STK.AU.ASX --tickers BHP RIO  # International via IB
 ```
@@ -789,13 +831,15 @@ mmr reject 42 --reason "Group over budget"  # Reject with reason
 - `strategies create`, `strategies deploy`, `strategies undeploy`, `strategies inspect`, `strategies signals`, `strategies backtest`
 - `universe list/show/create/delete/remove/import`
 - `propose`, `proposals`, `reject`, `group *`, `session`
-- `ideas` (Massive or TwelveData API keys), `movers` / `news` (Alpaca keys by default; no trader_service)
-- `financials`, `options` (Massive key)
+- `ideas`, `movers` / `news` (Alpaca keys by default; `ideas --source massive|twelvedata` needs that provider's key; no trader_service)
+- `financials` (Massive key), `options` data (Alpaca keys by default; `--source massive` needs a Massive options plan)
+- `forex convert|snapshot-all|movers` (Frankfurter, no key), `forex snapshot|quote --source frankfurter|massive|twelvedata`, `movers --market indices` (Alpaca keys)
 
 **Requires trader typed RPC (42101/42102)** — production path; no legacy 42001:
 - `portfolio`, `positions`, `orders`, `trades`, `account`, `status`, `resolve`, `snapshot` (IB source), `depth`
 - `approve`, `portfolio-risk` / `psnap` / `pdiff`, `reconcile`, `diagnose`
 - `listen` (publish_instrument + PubSub)
+- `forex snapshot`, `forex quote` (default IB source; IDEALPRO CASH contract)
 
 **Requires strategy typed RPC (42104/42105)**:
 - `strategies` list, `strategies enable|disable|reload`
@@ -868,8 +912,9 @@ CPU-bound bar-by-bar replay. Time scales with number of bars × strategy complex
 
 | Operation | Time | Notes |
 |-----------|------|-------|
-| `ideas` (Massive Starter+) | ~4s | movers + indicators |
-| `ideas` (Massive Basic → TD fallback) | ~few s | liquid quote set + local indicators |
+| `ideas` (Alpaca, default) | not measured | movers + most-actives, snapshots, daily bars per symbol |
+| `ideas --source massive` (Starter+) | ~4s | movers + indicators |
+| `ideas --source massive` (Basic → TD fallback) | ~few s | liquid quote set + local indicators |
 | `ideas --source twelvedata --tickers …` | ~few s | quotes; movers need Pro+ |
 | `ideas --presets` | ~1s | No API calls |
 | `ideas momentum --location STK.AU.ASX --tickers …` | ~30-90s | IB path (legacy) |

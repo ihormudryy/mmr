@@ -21,14 +21,14 @@ one local commit per task, app working after every task.
 | 1 | `2026-10-04-free-data-providers-01-02-history.md` | registry foundation + history routing (TD, Massive behind registry; dead polygon code removed) | — | done |
 | 2 | same file | history | Alpaca | done |
 | 3a | `…-03a-quotes-movers-news.md` | quotes, movers (+filter), news | Alpaca | done |
-| 3b | `…-03b-scanner-merge.md` | one capability-based idea scanner | — | after 3a |
+| 3b | `…-03b-scanner-merge.md` | one capability-based idea scanner | — | done |
 | 3c | `…-03c-remove-fallback.md` | remove silent Massive→TD fallback | — | after 3b |
 | 4 | `…-04-fundamentals.md` | ratios, statements, 10-K sections | Finnhub, EDGAR | after 3c |
-| 5 | `…-05-options.md` | options | Alpaca (indicative) | after 4 |
-| 6 | `…-06-forex-computed-movers.md` | FX rates/convert/snapshot-all, FX movers, index ETF movers | Frankfurter, computed | after 5 |
+| 5 | `…-05-options.md` | options | Alpaca (indicative) | done |
+| 6 | `…-06-forex-computed-movers.md` | FX rates/convert/snapshot-all, FX movers, index ETF movers | Frankfurter, computed | done |
 | 7 | `…-07-streaming.md` | streaming | Alpaca WebSocket | after 6 |
 | 8 | `…-08-sentiment.md` | news sentiment | Alpha Vantage | after 7 (needs key) |
-| 9 | `…-09-dashboard-docs.md` | dashboard research page, move provider modules into `trader/data_providers/{massive,twelvedata}/`, config templates, Docker/scripts, CLAUDE.md, skills docs | — | last |
+| 9 | `…-09-dashboard-docs.md` | dashboard research page, move provider modules into `trader/data_providers/{massive,twelvedata}/`, config templates, Docker/scripts, CLAUDE.md, skills docs | — | last. Also: dashboard options still use `massive_research` → `options_data.chain_records/contract_snapshot` (old normaliser, 0.0 fills, `O:` tickers); move them to the OPTIONS capability and delete those two functions; update SKILL.md options lines (massive_api_key) |
 
 Moving the existing `trader/listeners/massive_*.py` / `twelvedata_*.py`
 files into `trader/data_providers/` is deferred to phase 9 so earlier diffs
@@ -48,5 +48,18 @@ stay small (they are registered in place until then).
   keys). To keep Massive: set `data_providers: {movers: massive, news: polygon}`
   in the live `trader.yaml`. Also confirm Alpaca movers `last_updated` is
   intraday on a weekday (spec 3a check; not run on 2026-10-04, a Sunday).
+- After phase 5: `mmr options …` default to Alpaca indicative without a config
+  edit; set `data_providers: {options: massive}` to keep Massive (needs a
+  Massive options plan).
+- After phase 6: `forex convert`, `forex snapshot-all` and `forex movers` default to
+  free ECB daily rates (no key) and `movers --market indices` to ETF proxies
+  (Alpaca keys); `forex snapshot` / `forex quote` still default to IB. If you
+  relied on `default_data_source: twelvedata` for forex, set
+  `data_providers: {forex: twelvedata}` in the live `~/.config/mmr/trader.yaml`.
+  `data_providers: {movers: massive}` still keeps Massive for index and forex
+  movers (they fall back to it because Massive serves them); to choose them
+  one by one, set `movers_indices: massive` / `movers_forex: massive`.
+  TODO: when IB Gateway is up, verify `mmr forex snapshot EURUSD` and
+  `mmr forex quote EUR USD` (IB IDEALPRO CASH path; not live-verified in phase 6).
 - Before phase 8: create a free Alpha Vantage key.
 - When IB Gateway is up: run the IB history-without-bundle check (spec §11).

@@ -1,7 +1,10 @@
 """Trading ideas scanner — discover, enrich, filter, score, and rank day-trading candidates.
 
-Uses Massive.com REST API for snapshots and server-side technical indicators.
-No trader_service needed — only requires massive_api_key.
+``IdeaScanner`` runs one shared pipeline over a scan source picked through the
+provider registry (``Capability.IDEAS``): Alpaca (default, free, delayed prices),
+Massive or TwelveData. Each source lives in ``trader/data_providers/<provider>/scan.py``
+and supplies discovery, indicators, names, fundamentals and news. No
+trader_service needed — only the chosen provider's API key.
 
 When ``--location`` is provided, ``IBIdeaScanner`` uses IB's scanner API +
 ``get_snapshot()`` + ``reqHistoricalData`` for international markets.
@@ -10,9 +13,12 @@ When ``--location`` is provided, ``IBIdeaScanner`` uses IB's scanner API +
 import logging
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass, field
-from typing import Any, Callable, Dict, List, Optional, Protocol
+from typing import TYPE_CHECKING, Any, Callable, Dict, List, Optional, Protocol
 
 import pandas as pd
+
+if TYPE_CHECKING:
+    from trader.data_providers.capabilities import ScanSource
 
 logger = logging.getLogger(__name__)
 
@@ -493,14 +499,18 @@ def compute_sma(closes: List[float], window: int) -> Optional[float]:
 
 
 # ------------------------------------------------------------------
-# IdeaScanner (Massive.com-backed, US markets)
+# IdeaScanner (shared pipeline over a scan source)
 # ------------------------------------------------------------------
 
-class IdeaScanner:
-    """Discover → Enrich → Filter → Score → Rank pipeline for trading ideas."""
+def _join_notices(*notices: str) -> str:
+    return ' '.join(part.strip() for part in notices if part and part.strip())
 
-    def __init__(self, massive_client):
-        self._client = massive_client
+
+class IdeaScanner:
+    """Discover → Enrich → Filter → Score → Rank pipeline over one scan source."""
+
+    def __init__(self, source: 'ScanSource'):
+        self.source = source
 
     def scan(
         self,
@@ -513,6 +523,7 @@ class IdeaScanner:
         fundamentals: bool = False,
         news: bool = False,
         names: bool = False,
+        fundamentals_if_available: bool = False,
     ) -> pd.DataFrame:
         """Run the full scan pipeline.
 
@@ -534,6 +545,9 @@ class IdeaScanner:
             If True, enrich results with financial ratios (PE, D/E, ROE, etc.).
         news : bool
             If True, enrich results with latest news headline and sentiment.
+        fundamentals_if_available : bool
+            Like ``fundamentals``, but a source without ratios skips them and
+            says so in the notice instead of raising.
 
         Returns
         -------
@@ -544,224 +558,68 @@ class IdeaScanner:
         scan_preset = PRESETS.get(preset)
         if not scan_preset:
             raise ValueError(f'Unknown preset: {preset}. Available: {", ".join(PRESETS.keys())}')
-
-        # Merge custom filters with preset defaults
         filters = merge_filters(scan_preset, custom_filters)
+        if fundamentals and not self.source.supports_fundamentals:
+            # Raises the source's own explanation before any discovery or history call.
+            self.source.fundamentals([])
 
-        # 1. Discover candidates
-        # For market-scan presets using movers source, upgrade to full market scan
-        effective_source = source
-        if source == 'movers' and scan_preset.use_market_scan:
-            effective_source = 'market'
-        snapshots = self._discover(effective_source, tickers, universe_symbols)
-        if not snapshots:
-            return pd.DataFrame()
-
-        # 2. Build candidate dicts from snapshots
-        candidates = self._build_candidates(snapshots)
+        discovery = self.source.discover(source, tickers, universe_symbols, scan_preset.use_market_scan)
+        candidates = self._apply_filters(list(discovery.candidates), filters) if discovery.candidates else []
         if not candidates:
-            return pd.DataFrame()
+            return self._labelled(pd.DataFrame(), discovery.notice)
 
-        # 3. Filter
-        candidates = self._apply_filters(candidates, filters)
-        if not candidates:
-            return pd.DataFrame()
-
-        # 4. Pre-score without indicators to rank candidates locally.
-        #    This lets us cap indicator API calls for market-wide scans.
+        # Pre-score without indicators so market-wide scans can cap indicator API calls.
         score_fn = _SCORE_FUNCTIONS[scan_preset.score_fn]
         for c in candidates:
-            score, signal = score_fn(c)
-            c['_pre_score'] = score
-
-        # Cap indicator fetching: take the best candidates by pre-score,
-        # up to 3x top_n (or all if pool is small), to limit API calls.
+            c['_pre_score'], _ = score_fn(c)
         indicator_cap = max(top_n * 3, 30)
         if len(candidates) > indicator_cap:
             candidates.sort(key=lambda c: c['_pre_score'], reverse=True)
             candidates = candidates[:indicator_cap]
 
-        # 5. Fetch indicators for survivors
-        ticker_list = [c['ticker'] for c in candidates]
-        indicators = self._fetch_indicators(ticker_list, scan_preset.indicators)
-
-        # Merge indicators into candidates
+        indicators = self.source.indicators([c['ticker'] for c in candidates], scan_preset.indicators)
         for c in candidates:
-            t = c['ticker']
-            if t in indicators:
-                c.update(indicators[t])
-
-        # 6. Re-score with indicator data
-        for c in candidates:
+            c.update(indicators.get(c['ticker'], {}))
             score, signal = score_fn(c)
             c['score'] = round(score, 1)
             c['signal'] = signal
             c.pop('_pre_score', None)
 
-        # 7. Sort + top_n
         candidates.sort(key=lambda c: c['score'], reverse=True)
         candidates = candidates[:top_n]
+        top = [c['ticker'] for c in candidates]
 
-        # 8. Optionally fetch company names
         if names and candidates:
-            name_data = self._fetch_names([c['ticker'] for c in candidates])
+            name_data = self.source.names(top)
             for c in candidates:
-                c['name'] = name_data.get(c['ticker'], '')
-
-        # 9. Optionally enrich with financial ratios
+                c['name'] = name_data.get(c['ticker']) or c.get('name', '')
+        notice = discovery.notice
+        if fundamentals_if_available and not fundamentals:
+            if self.source.supports_fundamentals:
+                fundamentals = True
+            else:
+                notice = _join_notices(notice, self._no_fundamentals_notice())
         if fundamentals and candidates:
-            fund_data = self._fetch_fundamentals([c['ticker'] for c in candidates])
+            fund_data = self.source.fundamentals(top)
             for c in candidates:
-                if c['ticker'] in fund_data:
-                    c.update(fund_data[c['ticker']])
-
-        # 10. Optionally enrich with news
+                c.update(fund_data.get(c['ticker'], {}))
         if news and candidates:
-            news_data = self._fetch_news([c['ticker'] for c in candidates])
+            news_data = self.source.news(top)
             for c in candidates:
-                if c['ticker'] in news_data:
-                    c.update(news_data[c['ticker']])
+                c.update(news_data.get(c['ticker'], {}))
 
-        return self._to_dataframe(candidates, fundamentals=fundamentals, news=news)
+        return self._labelled(self._to_dataframe(candidates, fundamentals=fundamentals, news=news), notice)
 
-    # ------------------------------------------------------------------
-    # Discovery
-    # ------------------------------------------------------------------
+    def _no_fundamentals_notice(self) -> str:
+        provider = self.source.name.capitalize()
+        return (f'Fundamentals are not available from {provider} yet; '
+                'use --source massive or --source twelvedata for ratios.')
 
-    def _discover(
-        self,
-        source: str,
-        tickers: Optional[List[str]],
-        universe_symbols: Optional[List[str]],
-    ) -> list:
-        """Fetch raw snapshots from Massive.com."""
-        try:
-            return self._discover_raw(source, tickers, universe_symbols)
-        except Exception as ex:
-            if is_data_entitlement_error(ex):
-                raise IdeaScannerError(
-                    'Massive snapshot/movers not entitled on this API key '
-                    '(Stocks Basic excludes snapshots — need Starter+ at '
-                    'https://massive.com/pricing). '
-                    f'Detail: {ex}. '
-                    'Workaround: `ideas --source twelvedata --tickers AAPL MSFT NVDA` '
-                    'or `--universe NAME` (TwelveData quotes work on Basic), '
-                    'or upgrade the Massive plan.'
-                ) from ex
-            raise
-
-    def _discover_raw(
-        self,
-        source: str,
-        tickers: Optional[List[str]],
-        universe_symbols: Optional[List[str]],
-    ) -> list:
-        if source == 'tickers' and tickers:
-            return list(self._client.get_snapshot_all(
-                market_type='stocks', tickers=tickers,
-            ))
-        elif source == 'universe' and universe_symbols:
-            return list(self._client.get_snapshot_all(
-                market_type='stocks', tickers=universe_symbols,
-            ))
-        elif source == 'market':
-            # Full market scan — returns 10K+ snapshots. Filtering happens
-            # in _build_candidates and _apply_filters before any indicator
-            # API calls, so this is efficient (1 API call, local filtering).
-            return list(self._client.get_snapshot_all(
-                market_type='stocks',
-            ))
-        else:
-            # Movers: fetch both gainers and losers for a broader pool
-            gainers = list(self._client.get_snapshot_direction(
-                market_type='stocks', direction='gainers',
-            ))
-            losers = list(self._client.get_snapshot_direction(
-                market_type='stocks', direction='losers',
-            ))
-            return gainers + losers
-
-    # ------------------------------------------------------------------
-    # Candidate building
-    # ------------------------------------------------------------------
-
-    def _build_candidates(self, snapshots: list) -> List[Dict[str, Any]]:
-        """Extract structured data from TickerSnapshot objects."""
-        candidates = []
-        seen = set()
-        for snap in snapshots:
-            ticker = snap.ticker or ''
-            if not ticker or ticker in seen:
-                continue
-            # Skip warrants, units, rights, preferred stocks
-            # (e.g. AEVAW, SRTAW, KKRpD, ACHR.U). A bare trailing 'W' only counts
-            # as a warrant on a 5-char ticker (base+W) — otherwise legitimate
-            # names like SNOW, DOW, LOW, GEO were being silently dropped.
-            if ticker.endswith(('.WS', 'WS', '.U', '.R')) or (len(ticker) >= 5 and ticker.endswith('W')):
-                continue
-            if 'p' in ticker and ticker != ticker.upper():
-                # Preferred stock: contains lowercase 'p' (e.g. KKRpD)
-                continue
-            seen.add(ticker)
-
-            day = snap.day
-            prev_day = snap.prev_day
-            if not day:
-                continue
-
-            price = getattr(day, 'close', None) or 0.0
-            volume = getattr(day, 'volume', None) or 0
-            day_open = getattr(day, 'open', None) or 0.0
-            day_high = getattr(day, 'high', None) or 0.0
-            day_low = getattr(day, 'low', None) or 0.0
-            vwap = getattr(day, 'vwap', None) or 0.0
-
-            change_pct = snap.todays_change_percent or 0.0
-
-            # Gap: (open - prev_close) / prev_close
-            prev_close = 0.0
-            prev_volume = 0
-            if prev_day:
-                prev_close = getattr(prev_day, 'close', None) or 0.0
-                prev_volume = getattr(prev_day, 'volume', None) or 0
-
-            gap_pct = 0.0
-            if prev_close > 0:
-                gap_pct = ((day_open - prev_close) / prev_close) * 100.0
-
-            # Relative volume
-            rel_vol = 0.0
-            if prev_volume > 0:
-                rel_vol = volume / prev_volume
-
-            # Intraday range %
-            range_pct = 0.0
-            if day_low > 0:
-                range_pct = ((day_high - day_low) / day_low) * 100.0
-
-            # Spread — Massive API uses bid_price/ask_price fields
-            spread_pct = 0.0
-            if snap.last_quote and price > 0:
-                bid = (getattr(snap.last_quote, 'bid_price', None)
-                       or getattr(snap.last_quote, 'bid', None) or 0.0)
-                ask = (getattr(snap.last_quote, 'ask_price', None)
-                       or getattr(snap.last_quote, 'ask', None) or 0.0)
-                if bid > 0 and ask > 0:
-                    spread_pct = ((ask - bid) / price) * 100.0
-
-            candidates.append({
-                'ticker': ticker,
-                'price': round(price, 2),
-                'change_pct': round(change_pct, 2),
-                'volume': int(volume),
-                'gap_pct': round(gap_pct, 2),
-                'rel_vol': round(rel_vol, 2),
-                'range_pct': round(range_pct, 2),
-                'spread_pct': round(spread_pct, 3),
-                'vwap': round(vwap, 2),
-            })
-
-        return candidates
+    def _labelled(self, frame: pd.DataFrame, notice: str) -> pd.DataFrame:
+        frame.attrs['ideas_provider'] = self.source.name
+        if notice:
+            frame.attrs['ideas_notice'] = notice
+        return frame
 
     # ------------------------------------------------------------------
     # Filtering (delegates to module-level)
@@ -771,209 +629,6 @@ class IdeaScanner:
         from trader.trading.trading_filter import TradingFilter
         tf = TradingFilter.load()
         return apply_filters(candidates, filters, trading_filter=tf if not tf.is_empty() else None)
-
-    # ------------------------------------------------------------------
-    # Indicator fetching (parallel)
-    # ------------------------------------------------------------------
-
-    def _fetch_indicators(
-        self,
-        tickers: List[str],
-        needed: List[str],
-    ) -> Dict[str, Dict[str, Optional[float]]]:
-        """Fetch technical indicators in parallel via ThreadPoolExecutor."""
-        if not needed or not tickers:
-            return {}
-
-        results: Dict[str, Dict[str, Optional[float]]] = {t: {} for t in tickers}
-
-        def fetch_one(ticker: str, indicator: str) -> tuple:
-            """Returns (ticker, indicator_name, value)."""
-            try:
-                if indicator == 'rsi':
-                    res = self._client.get_rsi(
-                        ticker, timespan='day', window=14, limit=1,
-                    )
-                    vals = list(res.values) if hasattr(res, 'values') else []
-                    return (ticker, 'rsi', vals[0].value if vals else None)
-                elif indicator == 'ema_9':
-                    res = self._client.get_ema(
-                        ticker, timespan='day', window=9, limit=1,
-                    )
-                    vals = list(res.values) if hasattr(res, 'values') else []
-                    return (ticker, 'ema_9', vals[0].value if vals else None)
-                elif indicator == 'sma_20':
-                    res = self._client.get_sma(
-                        ticker, timespan='day', window=20, limit=1,
-                    )
-                    vals = list(res.values) if hasattr(res, 'values') else []
-                    return (ticker, 'sma_20', vals[0].value if vals else None)
-                elif indicator == 'sma_50':
-                    res = self._client.get_sma(
-                        ticker, timespan='day', window=50, limit=1,
-                    )
-                    vals = list(res.values) if hasattr(res, 'values') else []
-                    return (ticker, 'sma_50', vals[0].value if vals else None)
-                else:
-                    return (ticker, indicator, None)
-            except Exception as e:
-                logger.debug('indicator fetch failed: %s %s: %s', ticker, indicator, e)
-                return (ticker, indicator, None)
-
-        tasks = [(t, ind) for t in tickers for ind in needed]
-        with ThreadPoolExecutor(max_workers=5) as pool:
-            futures = {pool.submit(fetch_one, t, ind): (t, ind) for t, ind in tasks}
-            for future in as_completed(futures):
-                ticker, indicator, value = future.result()
-                results[ticker][indicator] = value
-
-        return results
-
-    # ------------------------------------------------------------------
-    # Fundamentals fetching (parallel)
-    # ------------------------------------------------------------------
-
-    # Fields to extract from FinancialRatio objects
-    _FUNDAMENTAL_FIELDS = [
-        ('price_to_earnings', 'pe_ratio'),
-        ('price_to_book', 'pb_ratio'),
-        ('price_to_sales', 'ps_ratio'),
-        ('debt_to_equity', 'debt_equity'),
-        ('return_on_equity', 'roe'),
-        ('return_on_assets', 'roa'),
-        ('dividend_yield', 'div_yield'),
-        ('ev_to_ebitda', 'ev_ebitda'),
-        ('market_cap', 'mkt_cap'),
-        ('earnings_per_share', 'eps'),
-        ('free_cash_flow', 'fcf'),
-    ]
-
-    def _fetch_names(
-        self,
-        tickers: List[str],
-    ) -> Dict[str, str]:
-        """Fetch company names in parallel via get_ticker_details."""
-        if not tickers:
-            return {}
-
-        results: Dict[str, str] = {}
-
-        def fetch_one(ticker: str) -> tuple:
-            try:
-                d = self._client.get_ticker_details(ticker)
-                return (ticker, d.name or '')
-            except Exception:
-                return (ticker, '')
-
-        with ThreadPoolExecutor(max_workers=5) as pool:
-            futures = {pool.submit(fetch_one, t): t for t in tickers}
-            for future in as_completed(futures):
-                ticker, name = future.result()
-                if name:
-                    results[ticker] = name
-
-        return results
-
-    def _fetch_fundamentals(
-        self,
-        tickers: List[str],
-    ) -> Dict[str, Dict[str, Optional[float]]]:
-        """Fetch financial ratios (TTM) in parallel for each ticker."""
-        if not tickers:
-            return {}
-
-        results: Dict[str, Dict[str, Optional[float]]] = {}
-
-        def fetch_one(ticker: str) -> tuple:
-            try:
-                ratios = list(self._client.list_financials_ratios(
-                    ticker=ticker, limit=1,
-                ))
-                if not ratios:
-                    return (ticker, {})
-                r = ratios[0]
-                data = {}
-                for api_field, col_name in self._FUNDAMENTAL_FIELDS:
-                    val = getattr(r, api_field, None)
-                    if val is not None:
-                        data[col_name] = round(float(val), 2) if col_name not in ('mkt_cap', 'fcf') else val
-                    else:
-                        data[col_name] = None
-                return (ticker, data)
-            except Exception as e:
-                logger.debug('fundamentals fetch failed: %s: %s', ticker, e)
-                return (ticker, {})
-
-        with ThreadPoolExecutor(max_workers=5) as pool:
-            futures = {pool.submit(fetch_one, t): t for t in tickers}
-            for future in as_completed(futures):
-                ticker, data = future.result()
-                if data:
-                    results[ticker] = data
-
-        return results
-
-    # ------------------------------------------------------------------
-    # News fetching (parallel)
-    # ------------------------------------------------------------------
-
-    def _fetch_news(
-        self,
-        tickers: List[str],
-    ) -> Dict[str, Dict[str, Optional[str]]]:
-        """Fetch latest news headline + sentiment in parallel for each ticker."""
-        if not tickers:
-            return {}
-
-        results: Dict[str, Dict[str, Optional[str]]] = {}
-
-        def fetch_one(ticker: str) -> tuple:
-            try:
-                articles = list(self._client.list_ticker_news(
-                    ticker=ticker, limit=1,
-                ))
-                if not articles:
-                    return (ticker, {})
-                a = articles[0]
-                # Extract sentiment for this specific ticker from insights
-                sentiment = ''
-                sentiment_reason = ''
-                if a.insights:
-                    for i in a.insights:
-                        if getattr(i, 'ticker', '') == ticker:
-                            sentiment = getattr(i, 'sentiment', '') or ''
-                            sentiment_reason = getattr(i, 'sentiment_reasoning', '') or ''
-                            break
-                    # Deliberately NO fallback to a.insights[0]: that would attribute
-                    # ANOTHER ticker's sentiment (a co-mentioned symbol in the same
-                    # article) to this one — confidently-wrong data. If there's no
-                    # insight for this ticker, sentiment stays empty (unknown).
-                title = a.title or ''
-                # Truncate long titles
-                if len(title) > 120:
-                    title = title[:117] + '...'
-                # Truncate long sentiment reasons
-                if len(sentiment_reason) > 200:
-                    sentiment_reason = sentiment_reason[:197] + '...'
-                published = (getattr(a, 'published_utc', '') or '')[:10]
-                return (ticker, {
-                    'headline': title,
-                    'news_date': published,
-                    'sentiment': sentiment,
-                    'catalyst': sentiment_reason,
-                })
-            except Exception as e:
-                logger.debug('news fetch failed: %s: %s', ticker, e)
-                return (ticker, {})
-
-        with ThreadPoolExecutor(max_workers=5) as pool:
-            futures = {pool.submit(fetch_one, t): t for t in tickers}
-            for future in as_completed(futures):
-                ticker, data = future.result()
-                if data:
-                    results[ticker] = data
-
-        return results
 
     # ------------------------------------------------------------------
     # Scoring (delegates to module-level functions)
@@ -1599,449 +1254,3 @@ class IBIdeaScanner:
                 logger.debug('News fetch failed for %s', symbol)
 
         return results
-
-
-class TwelveDataIdeaScanner:
-    """TwelveData-backed idea scanner for US equities.
-
-    Pipeline mirrors :class:`IdeaScanner` but uses TwelveData endpoints:
-
-    - Discovery: ``get_market_movers`` (movers preset) or batch ``quote``
-      (explicit tickers / universe).
-    - Snapshot: each ``quote`` dict carries open/high/low/close/volume,
-      previous_close for gap, and average_volume for relative volume.
-    - Indicators: ``time_series`` (50 daily bars) with local RSI/EMA/SMA
-      computation via the shared :func:`compute_rsi` / :func:`compute_ema`
-      / :func:`compute_sma` helpers. One API call per survivor ticker
-      regardless of how many indicators are needed.
-    - Fundamentals: ``get_statistics`` flattened and remapped to the
-      scanner's canonical field names (pe_ratio, pb_ratio, ... matching the
-      Massive path output).
-    - News: not supported by TwelveData's Python client — columns stay empty
-      and the ``news=True`` flag is accepted but has no effect. The CLI
-      prints a one-line notice so callers know.
-
-    Full-market scans ("use_market_scan" presets) require tickers or a
-    universe here — TwelveData doesn't expose a bulk snapshot endpoint.
-    """
-
-    # TwelveData statistics → scanner canonical field-name map.
-    # Source path (flattened from get_statistics) → destination column.
-    # NOTE: TwelveData's top-level group is "valuations_metrics" (with the
-    # 's'). Getting this wrong silently nulls every valuation column — we
-    # caught that in testing and it's worth calling out here so a refactor
-    # doesn't re-break it.
-    _TD_FUNDAMENTAL_FIELDS: List[tuple] = [
-        ('valuations_metrics.trailing_pe', 'pe_ratio'),
-        ('valuations_metrics.price_to_book_mrq', 'pb_ratio'),
-        ('valuations_metrics.price_to_sales_ttm', 'ps_ratio'),
-        ('valuations_metrics.enterprise_to_ebitda', 'ev_ebitda'),
-        ('valuations_metrics.market_capitalization', 'mkt_cap'),
-        ('financials.return_on_equity_ttm', 'roe'),
-        ('financials.return_on_assets_ttm', 'roa'),
-        ('financials.income_statement.diluted_eps_ttm', 'eps'),
-        ('financials.cash_flow.levered_free_cash_flow_ttm', 'fcf'),
-        ('financials.balance_sheet.total_debt_to_equity_mrq', 'debt_equity'),
-        ('dividends_and_splits.forward_annual_dividend_yield', 'div_yield'),
-    ]
-
-    def __init__(self, td_client):
-        self._client = td_client
-
-    def scan(
-        self,
-        preset: str = 'momentum',
-        source: str = 'movers',
-        tickers: Optional[List[str]] = None,
-        universe_symbols: Optional[List[str]] = None,
-        top_n: int = 15,
-        custom_filters: Optional[Dict[str, Any]] = None,
-        fundamentals: bool = False,
-        news: bool = False,
-        names: bool = False,
-    ) -> pd.DataFrame:
-        scan_preset = PRESETS.get(preset)
-        if not scan_preset:
-            raise ValueError(f'Unknown preset: {preset}. Available: {", ".join(PRESETS.keys())}')
-        filters = merge_filters(scan_preset, custom_filters)
-
-        # 1. Discover.
-        notice: Optional[str] = None
-        try:
-            quotes = self._discover(source, tickers, universe_symbols, scan_preset)
-        except IdeaScannerError as ex:
-            # Movers (default) Pro+-gated; quotes still work on Basic/Starter.
-            if source in ('tickers', 'universe') or not is_data_entitlement_error(ex):
-                raise
-            notice = entitlement_fallback_notice('twelvedata', str(ex))
-            logger.warning(notice)
-            quotes = self._batch_quote(list(LIQUID_US_FALLBACK_TICKERS))
-        if not quotes:
-            return pd.DataFrame()
-
-        # 2. Build candidates from TD quote payloads.
-        candidates = self._build_candidates(quotes)
-        if not candidates:
-            return pd.DataFrame()
-
-        # 3. Filter.
-        from trader.trading.trading_filter import TradingFilter
-        tf = TradingFilter.load()
-        candidates = apply_filters(
-            candidates, filters,
-            trading_filter=tf if not tf.is_empty() else None,
-        )
-        if not candidates:
-            return pd.DataFrame()
-
-        # 4. Pre-score to cap the indicator fetch.
-        score_fn = _SCORE_FUNCTIONS[scan_preset.score_fn]
-        for c in candidates:
-            pre_score, _ = score_fn(c)
-            c['_pre_score'] = pre_score
-        indicator_cap = max(top_n * 3, 30)
-        if len(candidates) > indicator_cap:
-            candidates.sort(key=lambda c: c['_pre_score'], reverse=True)
-            candidates = candidates[:indicator_cap]
-
-        # 5. Fetch indicators for survivors.
-        ticker_list = [c['ticker'] for c in candidates]
-        indicators = self._fetch_indicators(ticker_list, scan_preset.indicators)
-        for c in candidates:
-            if c['ticker'] in indicators:
-                c.update(indicators[c['ticker']])
-
-        # 6. Re-score.
-        for c in candidates:
-            score, signal = score_fn(c)
-            c['score'] = round(score, 1)
-            c['signal'] = signal
-            c.pop('_pre_score', None)
-
-        # 7. Sort + truncate.
-        candidates.sort(key=lambda c: c['score'], reverse=True)
-        candidates = candidates[:top_n]
-
-        # 8. Names already carried through from quote response — nothing extra.
-
-        # 9. Fundamentals.
-        if fundamentals and candidates:
-            fund_data = self._fetch_fundamentals([c['ticker'] for c in candidates])
-            for c in candidates:
-                if c['ticker'] in fund_data:
-                    c.update(fund_data[c['ticker']])
-
-        # 10. News is a known gap on TwelveData — silently skip even if
-        # requested. The caller's --news flag still controls column output.
-        df = to_dataframe(candidates, fundamentals=fundamentals, news=news)
-        if notice:
-            df.attrs['ideas_notice'] = notice
-        return df
-
-    # ------------------------------------------------------------------
-    # Discovery
-    # ------------------------------------------------------------------
-
-    def _discover(
-        self,
-        source: str,
-        tickers: Optional[List[str]],
-        universe_symbols: Optional[List[str]],
-        scan_preset: 'ScanPreset',
-    ) -> List[Dict[str, Any]]:
-        """Return a list of TwelveData quote dicts for candidate discovery."""
-        if source in ('tickers', 'universe'):
-            syms = tickers if source == 'tickers' else universe_symbols
-            if not syms:
-                return []
-            return self._batch_quote(syms)
-
-        # Default: movers. TwelveData's get_market_movers returns a compact
-        # record that matches a quote for scanner purposes — we normalize it
-        # into the same shape. Per MMR's "fail loudly" principle, we tolerate
-        # *one* direction failing (unlikely but plausible — rate-limit on the
-        # exact moment of one of two calls) but raise if BOTH fail so the
-        # caller sees an auth/rate-limit/outage issue rather than an empty
-        # result that looks like "no movers today."
-        combined: List[Dict[str, Any]] = []
-        errors: List[Exception] = []
-        for direction in ('gainers', 'losers'):
-            try:
-                payload = self._client.get_market_movers(
-                    market='stocks', direction=direction,
-                ).as_json()
-            except Exception as ex:
-                logger.warning('td movers %s fetch failed: %s', direction, ex)
-                errors.append(ex)
-                continue
-            entries = payload if isinstance(payload, list) else (payload or {}).get('values', [])
-            for e in entries:
-                combined.append({
-                    'symbol': e.get('symbol'),
-                    'name': e.get('name'),
-                    'close': e.get('last'),
-                    'high': e.get('high'),
-                    'low': e.get('low'),
-                    'open': e.get('open'),
-                    'previous_close': e.get('previous_close'),
-                    'volume': e.get('volume'),
-                    'average_volume': e.get('average_volume'),
-                    'change': e.get('change'),
-                    'percent_change': e.get('percent_change'),
-                })
-        if errors and not combined:
-            detail = str(errors[0])
-            hint = ''
-            low = detail.lower()
-            if '403' in detail or 'pro or ultra' in low or 'exclusively with' in low:
-                hint = (
-                    ' TwelveData /market_movers requires a Pro+ plan. '
-                    'Use `ideas --tickers AAPL MSFT NVDA` (quotes work on Basic), '
-                    'or upgrade at https://twelvedata.com/pricing.'
-                )
-            raise IdeaScannerError(
-                f'TwelveData movers discovery failed for all directions: '
-                f'{errors[0]}.{hint}'
-            ) from errors[0]
-        return combined
-
-    def _batch_quote(self, symbols: List[str]) -> List[Dict[str, Any]]:
-        """Fetch a batch of quotes. TwelveData supports comma-joined symbols
-        on /quote and returns a dict keyed by symbol. We re-shape to a list."""
-        # Dedupe while preserving order
-        seen = set()
-        unique = []
-        for s in symbols:
-            if s and s not in seen:
-                unique.append(s); seen.add(s)
-        if not unique:
-            return []
-
-        # TwelveData /quote accepts up to 120 symbols per call on most plans.
-        # Chunk to be safe.
-        out: List[Dict[str, Any]] = []
-        CHUNK = 100
-        for i in range(0, len(unique), CHUNK):
-            batch = unique[i:i + CHUNK]
-            try:
-                payload = self._client.quote(symbol=','.join(batch)).as_json()
-            except Exception as ex:
-                logger.warning('td batch quote failed (%s...): %s', batch[:3], ex)
-                continue
-            if isinstance(payload, dict) and 'symbol' in payload:
-                # Single-symbol response
-                out.append(payload)
-            elif isinstance(payload, dict):
-                for sym, item in payload.items():
-                    if isinstance(item, dict):
-                        # Some plans return {"code":..., "message":...} on error for a single
-                        # symbol — skip those so the rest of the batch still lands.
-                        if 'symbol' in item or 'close' in item:
-                            out.append(item)
-            elif isinstance(payload, list):
-                out.extend(payload)
-        return out
-
-    # ------------------------------------------------------------------
-    # Candidate building
-    # ------------------------------------------------------------------
-
-    def _build_candidates(self, quotes: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
-        candidates = []
-        seen = set()
-        for q in quotes:
-            ticker = q.get('symbol', '') or ''
-            if not ticker or ticker in seen:
-                continue
-            # Skip warrants, units, rights, preferred stocks — mirror the
-            # Massive/IB scanners so a `--source` switch doesn't change
-            # which tickers get surfaced (e.g. KKRpD is preferred stock;
-            # 'p' lowercase inside an otherwise-uppercase ticker is the
-            # convention across data providers).
-            if any(ticker.endswith(s) for s in ('W', 'WS', '.U', '.R')):
-                continue
-            if 'p' in ticker and ticker != ticker.upper():
-                continue
-            seen.add(ticker)
-
-            def _f(key, default=0.0):
-                v = q.get(key)
-                try:
-                    return float(v) if v not in (None, '') else default
-                except (TypeError, ValueError):
-                    return default
-
-            def _i(key, default=0):
-                v = q.get(key)
-                try:
-                    return int(float(v)) if v not in (None, '') else default
-                except (TypeError, ValueError):
-                    return default
-
-            price = _f('close')
-            if price <= 0:
-                continue
-            volume = _i('volume')
-            day_open = _f('open')
-            day_high = _f('high')
-            day_low = _f('low')
-            prev_close = _f('previous_close')
-            avg_volume = _i('average_volume')
-
-            change_pct = _f('percent_change')
-            gap_pct = 0.0
-            if prev_close > 0 and day_open > 0:
-                gap_pct = ((day_open - prev_close) / prev_close) * 100.0
-            rel_vol = 0.0
-            if avg_volume > 0 and volume > 0:
-                rel_vol = volume / avg_volume
-            range_pct = 0.0
-            if day_low > 0 and day_high > day_low:
-                range_pct = ((day_high - day_low) / day_low) * 100.0
-
-            candidates.append({
-                'ticker': ticker,
-                'name': q.get('name', '') or '',
-                'price': round(price, 2),
-                'change_pct': round(change_pct, 2),
-                'volume': volume,
-                'gap_pct': round(gap_pct, 2),
-                'rel_vol': round(rel_vol, 2),
-                'range_pct': round(range_pct, 2),
-                'spread_pct': 0.0,  # not in TD quote
-                'vwap': 0.0,
-            })
-        return candidates
-
-    # ------------------------------------------------------------------
-    # Indicators — local compute from one time_series call per ticker
-    # ------------------------------------------------------------------
-
-    def _fetch_indicators(
-        self,
-        tickers: List[str],
-        needed: List[str],
-    ) -> Dict[str, Dict[str, Optional[float]]]:
-        """Fetch 50 daily bars per ticker in parallel and compute indicators
-        locally. Cheaper than one call per (ticker, indicator)."""
-        if not needed or not tickers:
-            return {}
-
-        results: Dict[str, Dict[str, Optional[float]]] = {t: {} for t in tickers}
-
-        def fetch_one(ticker: str):
-            try:
-                ts = self._client.time_series(
-                    symbol=ticker, interval='1day', outputsize=60,
-                )
-                df = ts.as_pandas()
-                if df is None or df.empty:
-                    return ticker, {}
-                # TwelveData returns newest-first by default. RSI/EMA/SMA
-                # are position-sensitive — they assume chronological order,
-                # so sort by index (timestamp) ascending before extracting
-                # closes. Sorting closes by value would silently produce
-                # wrong indicator values.
-                df = df.sort_index(ascending=True)
-                closes = list(pd.to_numeric(df['close'], errors='coerce').dropna())
-                vals: Dict[str, Optional[float]] = {}
-                for indicator in needed:
-                    if indicator == 'rsi':
-                        vals['rsi'] = compute_rsi(closes, period=14)
-                    elif indicator == 'ema_9':
-                        vals['ema_9'] = compute_ema(closes, window=9)
-                    elif indicator == 'sma_20':
-                        vals['sma_20'] = compute_sma(closes, window=20)
-                    elif indicator == 'sma_50':
-                        vals['sma_50'] = compute_sma(closes, window=50)
-                return ticker, vals
-            except Exception as ex:
-                logger.debug('td indicator fetch failed for %s: %s', ticker, ex)
-                return ticker, {}
-
-        with ThreadPoolExecutor(max_workers=5) as pool:
-            futures = {pool.submit(fetch_one, t): t for t in tickers}
-            for fut in as_completed(futures):
-                ticker, vals = fut.result()
-                results[ticker].update(vals)
-        return results
-
-    # ------------------------------------------------------------------
-    # Fundamentals — get_statistics → canonical fields
-    # ------------------------------------------------------------------
-
-    def _fetch_fundamentals(
-        self,
-        tickers: List[str],
-    ) -> Dict[str, Dict[str, Optional[float]]]:
-        # TwelveData's get_statistics call is ~100 credits each. On a Grow
-        # plan (610 credits/min) that means a burst of 6-7 tickers exhausts
-        # the budget for the current minute. We:
-        #   1) Keep max_workers low (2) to spread requests out
-        #   2) Short-circuit the remaining fetches once we see a rate-limit
-        #      signal — so the scan completes with whatever fundamentals
-        #      landed rather than raising mid-flight
-        #   3) Warn once when rate-limiting happens so the user knows their
-        #      fundamentals coverage is partial
-        if not tickers:
-            return {}
-
-        import threading
-        rate_limit_hit = threading.Event()
-        results: Dict[str, Dict[str, Optional[float]]] = {}
-
-        def fetch_one(ticker: str):
-            if rate_limit_hit.is_set():
-                return ticker, {}
-            try:
-                payload = self._client.get_statistics(symbol=ticker).as_json()
-                stats = (payload or {}).get('statistics') or {}
-                flat = _flatten(stats)
-                out: Dict[str, Optional[float]] = {}
-                for td_path, col in TwelveDataIdeaScanner._TD_FUNDAMENTAL_FIELDS:
-                    v = flat.get(td_path)
-                    if v is None:
-                        out[col] = None
-                        continue
-                    try:
-                        out[col] = round(float(v), 4) if col not in ('mkt_cap', 'fcf') else float(v)
-                    except (TypeError, ValueError):
-                        out[col] = None
-                return ticker, out
-            except Exception as ex:
-                msg = str(ex).lower()
-                if 'api credits' in msg or 'rate limit' in msg or 'too many requests' in msg:
-                    if not rate_limit_hit.is_set():
-                        logger.warning(
-                            'td fundamentals hit rate limit on %s — remaining tickers '
-                            'in this scan will skip fundamentals. Wait ~60s and retry, '
-                            'or upgrade TwelveData plan credits/min.', ticker)
-                        rate_limit_hit.set()
-                else:
-                    logger.debug('td fundamentals fetch failed for %s: %s', ticker, ex)
-                return ticker, {}
-
-        # max_workers intentionally small — each get_statistics is ~100
-        # credits; bursting 5 in parallel is 500 credits in a fraction of a
-        # second, which crowds the 610/min Grow-plan budget.
-        with ThreadPoolExecutor(max_workers=2) as pool:
-            futures = {pool.submit(fetch_one, t): t for t in tickers}
-            for fut in as_completed(futures):
-                ticker, data = fut.result()
-                if data:
-                    results[ticker] = data
-        return results
-
-
-def _flatten(d: Dict[str, Any], prefix: str = '', sep: str = '.') -> Dict[str, Any]:
-    """Module-private flatten helper — keeps ``TwelveDataIdeaScanner``
-    self-contained without an SDK import. Same semantics as
-    :meth:`trader.sdk.MMR._flatten_td_dict`."""
-    out: Dict[str, Any] = {}
-    for k, v in d.items():
-        full = f'{prefix}{sep}{k}' if prefix else k
-        if isinstance(v, dict):
-            out.update(_flatten(v, full, sep))
-        else:
-            out[full] = v
-    return out

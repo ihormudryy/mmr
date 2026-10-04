@@ -7,6 +7,7 @@ from trader.data_providers.capabilities import sort_movers
 from trader.data_providers.errors import CapabilityNotSupported
 
 MAX_TOP = 50
+_OTHER_SOURCES_BY_MARKET = {'indices': ['etf_proxy', 'massive']}
 
 
 class AlpacaMovers:
@@ -17,7 +18,7 @@ class AlpacaMovers:
 
     def movers(self, market: str, direction: str) -> pd.DataFrame:
         if market not in self.markets:
-            raise CapabilityNotSupported(f'{market} movers', 'alpaca', ['massive'])
+            raise CapabilityNotSupported(f'{market} movers', 'alpaca', _OTHER_SOURCES_BY_MARKET.get(market, ['massive']))
         payload = self._client.get_json(f'/v1beta1/screener/{market}/movers', {'top': MAX_TOP})
         as_of = (payload.get('last_updated') or '')[:19]
         note = f'as of {as_of}Z' if as_of else ''

@@ -1,32 +1,26 @@
 """Shared, client-taking Massive option normalization for CLI + dashboard."""
 from __future__ import annotations
 
-from datetime import datetime
 from typing import Any
+
+from trader.data_providers.option_symbols import (
+    build_option_symbol, parse_option_symbol, to_massive_option_ticker,
+)
 
 
 def parse_option_ticker(ticker: str) -> dict:
-    """Parse ``O:AAPL260320C00250000`` → {symbol, expiration, right, strike}."""
-    t = ticker[2:] if ticker.startswith("O:") else ticker
-    i = 0
-    while i < len(t) and t[i].isalpha():
-        i += 1
-    symbol = t[:i]
-    rest = t[i:]
-    if len(rest) < 9:
-        raise ValueError(f"Cannot parse option ticker: {ticker}")
-    date_str, right, strike_str = rest[:6], rest[6], rest[7:]
+    """Parse ``O:AAPL260320C00250000`` (or the bare body) → {symbol, expiration, right, strike}."""
+    option = parse_option_symbol(ticker)
     return {
-        "symbol": symbol,
-        "expiration": f"20{date_str[:2]}-{date_str[2:4]}-{date_str[4:6]}",
-        "right": right,
-        "strike": float(strike_str) / 1000.0,
+        "symbol": option.root,
+        "expiration": option.expiration.isoformat(),
+        "right": option.right,
+        "strike": option.strike,
     }
 
 
 def build_option_ticker(symbol: str, expiration: str, strike: float, right: str) -> str:
-    date_str = datetime.strptime(expiration, "%Y-%m-%d").strftime("%y%m%d")
-    return f"O:{symbol}{date_str}{right.upper()}{int(strike * 1000):08d}"
+    return to_massive_option_ticker(build_option_symbol(symbol, expiration, strike, right))
 
 
 def chain_records(

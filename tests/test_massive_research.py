@@ -89,8 +89,8 @@ def test_ideas_delegates_all_scan_arguments(monkeypatch):
     captured = {}
 
     class Scanner:
-        def __init__(self, client):
-            captured["client"] = client
+        def __init__(self, source):
+            captured["client"] = source._client
 
         def scan(self, **kwargs):
             captured.update(kwargs)
@@ -210,25 +210,20 @@ def test_benzinga_uses_published_url_and_teaser():
 
 
 def test_ideas_falls_back_to_twelvedata_on_massive_entitlement(monkeypatch):
-    class MassiveScanner:
-        def __init__(self, client):
-            pass
+    class Scanner:
+        def __init__(self, source):
+            self.source = source
 
         def scan(self, **kwargs):
-            raise RuntimeError('NOT_AUTHORIZED not entitled')
-
-    class TdScanner:
-        def __init__(self, client):
-            assert client == "td"
-
-        def scan(self, **kwargs):
+            if self.source.name == "massive":
+                raise RuntimeError('NOT_AUTHORIZED not entitled')
+            assert self.source.name == "twelvedata"
+            assert self.source._client == "td"
             frame = pd.DataFrame([{"ticker": "AAPL", "score": 1.0}])
             frame.attrs = {}
             return frame
 
-    monkeypatch.setattr("trader.tools.massive_research.IdeaScanner", MassiveScanner)
-    monkeypatch.setattr(
-        "trader.tools.massive_research.TwelveDataIdeaScanner", TdScanner)
+    monkeypatch.setattr("trader.tools.massive_research.IdeaScanner", Scanner)
 
     result = MassiveResearch(object(), td_client="td").ideas(
         preset="momentum", source="movers", tickers=None,

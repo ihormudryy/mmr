@@ -161,6 +161,60 @@ movers filter, crypto movers, history). Weekday intraday movers check: not run
 
 - TODO (operator): Confirm Alpaca movers `last_updated` is intraday on a weekday (spec 3a check)
 
+### Idea scanner (phase 3b)
+
+From phase 3b, bare `mmr ideas` uses Alpaca **without any config edit** (it
+ignores `default_data_source`). It needs the Alpaca keys, like `movers` and
+`news`. Discovery is movers + most-actives (about 100-150 symbols, not the full
+market) with 15-minute-delayed prices. To keep Massive, set
+`data_providers: {ideas: massive}` in the live `trader.yaml`, or pass
+`--source massive|twelvedata` per call. `--fundamentals` needs one of those two
+until phase 4.
+
+Live checks (2026-10-04, Sunday): the two gated Alpaca ideas tests passed
+(momentum scan, explicit tickers with an unknown symbol). Weekday intraday
+quality was not checked.
+
+- TODO (operator): The weekday intraday movers check above also gates `ideas` discovery quality (same screener endpoints)
+
+---
+
+### Options (phase 5)
+
+`mmr options expirations|chain|snapshot|implied` default to Alpaca's free
+indicative feed **without any config edit** (options ignore
+`default_data_source`). Indicative (Alpaca's free, delayed estimate — not
+tradable quotes) is not the OPRA NBBO (the official consolidated best
+bid/offer): quotes are derived, trades delayed, greeks/IV only on liquid
+contracts (on 2026-10-04 AAPL
+2026-11-06 calls: 26 of 61 strikes had no usable IV, 35 were used by
+`implied`). Rows say `feed: indicative`. To keep Massive: set
+`data_providers: {options: massive}` in the live `trader.yaml`. This key's
+Massive plan returns NOT_AUTHORIZED for option snapshots (2026-10-04), so
+Massive options need a paid options plan, and Massive options are only tested
+with fakes. `options buy|sell` still go to IB.
+
+Live checks (2026-10-04, a Sunday, markets closed): 11 gated Alpaca live tests
+passed (history, quotes, news, movers, and the five new options tests); the
+Massive options test was skipped (no Massive key exported). Real CLI run:
+expirations, chain, snapshot (`O:` form), implied and the indicative-feed
+table worked. Quotes were the Friday 2026-10-02 close (`quote_time`
+19:59:59Z). The CLI `--source massive` call returned the NOT_AUTHORIZED
+message with no traceback.
+
+---
+
+## Forex and index movers (phase 6)
+
+`forex convert`, `forex snapshot-all` and `forex movers` default to free ECB daily reference rates (Frankfurter, no key) — one rate per business day about 16:00 CET, labelled with its date, not live. `movers --market indices` defaults to ETF proxies from Alpaca IEX prices (needs the Alpaca keys). `forex snapshot` / `forex quote` still default to IB. Users who relied on `default_data_source: twelvedata` for forex: set `data_providers: {forex: twelvedata}` in the live `~/.config/mmr/trader.yaml`.
+
+- `data_providers.forex: ib` breaks `forex convert` and `forex snapshot-all` (they need a REST forex source).
+- `data_providers: {movers: massive}` keeps Massive for index and forex movers too. To set them one by one: `movers_indices: massive` / `movers_forex: massive` (these win over `movers`).
+- Massive may return no forex bid/ask; not checked live.
+- Checked live on 2026-10-04 (Sunday): Frankfurter returns the Friday 2026-10-02 rate as the latest; Alpaca IEX ETF quotes are Friday's prices.
+- Massive forex bid/ask is read from the documented forex snapshot keys (the Massive key is not entitled). To check with an entitled key: `MMR_LIVE_TESTS=1 MASSIVE_API_KEY=... pytest -m live tests/data_providers/test_live_massive_forex.py`.
+- TODO (operator): when IB Gateway is up, verify mmr forex snapshot EURUSD and mmr forex quote EUR USD (IB IDEALPRO CASH path; not live-verified in phase 6).
+
 ---
 
 ## Infrastructure

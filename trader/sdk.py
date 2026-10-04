@@ -18,6 +18,7 @@ from ib_async.ticker import Ticker
 from trader.common.reactivex import SuccessFail
 from trader.data.data_access import PortfolioSummary, SecurityDefinition
 from trader.data.universe import Universe
+from trader.data_providers.builtin import IB_FOREX_SOURCE
 from trader.messaging.clientserver import consume, RPCClient, TopicPubSub, pack, unpack
 from trader.messaging.data_service_api import DataServiceApi
 from trader.messaging.trader_service_api import TraderServiceApi
@@ -3237,26 +3238,25 @@ class MMR:
         )
 
     # ------------------------------------------------------------------
-    # Options — Data (Massive API, no trader_service needed)
+    # Options — Data (OPTIONS capability; default alpaca indicative feed, no trader_service needed)
     # ------------------------------------------------------------------
 
-    def options_expirations(self, symbol: str) -> List[str]:
-        """Get available expiration dates for a symbol's options.
+    @staticmethod
+    def _check_chain_filters(contract_type: Optional[str], strike_min: Optional[float],
+                             strike_max: Optional[float]) -> None:
+        if contract_type not in (None, 'call', 'put'):
+            raise ValueError(f"contract_type must be 'call' or 'put', got {contract_type!r}")
+        if strike_min is not None and strike_max is not None and strike_min > strike_max:
+            raise ValueError(f'strike_min {strike_min} is above strike_max {strike_max}')
 
-        Parameters
-        ----------
-        symbol : str
-            Underlying symbol (e.g. "AAPL").
+    def options_expirations(self, symbol: str, source: Optional[str] = None) -> List[str]:
+        """Sorted YYYY-MM-DD expirations that have not passed.
 
-        Returns
-        -------
-        List[str]
-            Sorted list of expiration dates as YYYY-MM-DD strings.
+        `source=None` uses `data_providers.options`, else alpaca; options never inherit
+        `default_data_source`.
         """
-        from trader.tools.chain import get_option_dates
-        cfg = self._container.config()
-        api_key = cfg.get('massive_api_key', '')
-        return get_option_dates(symbol, api_key=api_key)
+        from trader.data_providers import Capability
+        return self._provider(Capability.OPTIONS, source).expirations(symbol)
 
     def options_chain(
         self,
@@ -3265,113 +3265,54 @@ class MMR:
         contract_type: Optional[str] = None,
         strike_min: Optional[float] = None,
         strike_max: Optional[float] = None,
+        source: Optional[str] = None,
     ) -> pd.DataFrame:
-        """Get options chain snapshot from Massive.com.
+        """One expiration's chain (nearest when `expiration` is None), columns OPTION_FIELDS.
 
-        Parameters
-        ----------
-        symbol : str
-            Underlying symbol (e.g. "AAPL").
-        expiration : str, optional
-            Filter to specific expiration (YYYY-MM-DD). If None, uses nearest.
-        contract_type : str, optional
-            Filter to "call" or "put".
-        strike_min : float, optional
-            Minimum strike price.
-        strike_max : float, optional
-            Maximum strike price.
-
-        Returns
-        -------
-        pd.DataFrame
-            Chain with columns: ticker, type, strike, expiration, bid, ask, mid,
-            last, volume, open_interest, iv, delta, gamma, theta, vega,
-            break_even, underlying_price.
+        Rows carry `provider` and `feed`; numbers the provider did not send are NaN.
         """
-        from trader.tools.chain import get_option_dates
-        from trader.tools.options_data import chain_records
-        from massive import RESTClient
-
-        cfg = self._container.config()
-        api_key = cfg.get('massive_api_key', '')
-        if not api_key:
-            raise ValueError("massive_api_key not configured in trader.yaml")
-
+        from trader.data_providers import OPTION_FIELDS, Capability
+        from trader.data_providers.option_symbols import parse_expiration_date
+        self._check_chain_filters(contract_type, strike_min, strike_max)
+        if expiration:
+            expiration = parse_expiration_date(expiration).isoformat()
+        provider = self._provider(Capability.OPTIONS, source)
         if not expiration:
-            dates = get_option_dates(symbol, api_key=api_key)
+            dates = provider.expirations(symbol)
             if not dates:
-                return pd.DataFrame()
+                return pd.DataFrame(columns=list(OPTION_FIELDS))
             expiration = dates[0]
+        rows = provider.chain(symbol, expiration, contract_type, strike_min, strike_max)
+        return pd.DataFrame(rows, columns=list(OPTION_FIELDS))
 
-        rows = chain_records(
-            RESTClient(api_key=api_key), symbol,
-            expiration=expiration, contract_type=contract_type,
-            strike_min=strike_min, strike_max=strike_max,
-        )
-
-        df = pd.DataFrame(rows)
-        if not df.empty:
-            # chain_records omits iv/greeks keys entirely when the Massive
-            # payload doesn't carry them (no-fabrication — must not read as
-            # 0.0). Reindex to the full documented column set so every
-            # column always exists; missing values become NaN, not 0.0, and
-            # the CLI's unconditional per-row formatting never KeyErrors.
-            columns = ["ticker", "type", "strike", "expiration", "bid", "ask",
-                       "mid", "last", "volume", "open_interest", "iv",
-                       "delta", "gamma", "theta", "vega", "break_even",
-                       "underlying_price"]
-            df = df.reindex(columns=columns)
-        return df
-
-    def options_snapshot(self, option_ticker: str) -> dict:
-        """Get detailed snapshot for a single option contract.
-
-        Parameters
-        ----------
-        option_ticker : str
-            Massive option ticker (e.g. ``O:AAPL260320C00250000``).
-
-        Returns
-        -------
-        dict
-            Snapshot details including greeks, quote, underlying price.
-        """
-        from trader.tools.options_data import contract_snapshot
-        from massive import RESTClient
-
-        cfg = self._container.config()
-        api_key = cfg.get('massive_api_key', '')
-        if not api_key:
-            raise ValueError("massive_api_key not configured in trader.yaml")
-
-        return contract_snapshot(RESTClient(api_key=api_key), option_ticker)
+    def options_snapshot(self, option_ticker: str, source: Optional[str] = None) -> dict:
+        """One contract; accepts `O:AAPL261120C00250000` or `AAPL261120C00250000`."""
+        from trader.data_providers import Capability
+        from trader.data_providers.option_symbols import parse_option_symbol
+        option = parse_option_symbol(option_ticker)
+        return self._provider(Capability.OPTIONS, source).contract(option)
 
     def options_implied(
         self,
         symbol: str,
         expiration: str,
         risk_free_rate: float = 0.05,
+        source: Optional[str] = None,
     ) -> Dict:
-        """Get implied probability distribution for an options expiration.
+        """Market-implied vs constant-vol distribution from the expiration's calls.
 
-        Parameters
-        ----------
-        symbol : str
-            Underlying symbol.
-        expiration : str
-            Expiration date as YYYY-MM-DD.
-        risk_free_rate : float
-            Risk-free rate (default 0.05).
-
-        Returns
-        -------
-        dict
-            Keys: x (strikes), market_implied (probabilities), constant (probabilities).
+        Calls without an implied volatility are excluded and counted
+        (`strikes_used`, `strikes_excluded`); too few usable strikes raise ValueError.
         """
-        from trader.tools.chain import implied_constant
-        cfg = self._container.config()
-        api_key = cfg.get('massive_api_key', '')
-        return implied_constant(symbol, expiration, risk_free_rate, api_key=api_key)
+        from trader.data_providers import Capability
+        from trader.data_providers.option_symbols import parse_expiration_date
+        from trader.tools.chain import implied_distribution
+        expiration = parse_expiration_date(expiration).isoformat()
+        rows = self._provider(Capability.OPTIONS, source).chain(symbol, expiration, 'call')
+        if not any(row['type'] == 'call' and row['expiration'] == expiration for row in rows):
+            provider_name = source or self._provider_default(Capability.OPTIONS)
+            raise ValueError(f'No call contracts for {symbol} {expiration} from {provider_name}')
+        return implied_distribution(rows, expiration, risk_free_rate, dt.date.today())
 
     # ------------------------------------------------------------------
     # Options — Trading (IB via trader_service)
@@ -3479,200 +3420,79 @@ class MMR:
     # Forex
     # ------------------------------------------------------------------
 
-    @staticmethod
-    def _parse_forex_pair(pair: str) -> tuple[str, str]:
-        """Parse 'EURUSD', 'EUR/USD', or 'C:EURUSD' into ('EUR', 'USD')."""
-        pair = pair.replace('/', '').replace('C:', '').upper()
-        if len(pair) == 6:
-            return pair[:3], pair[3:]
-        return pair, 'USD'
+    def forex_snapshot(self, pair: str, source: str = IB_FOREX_SOURCE) -> dict:
+        """Snapshot for a currency pair ('EURUSD', 'EUR/USD' or 'C:EURUSD').
 
-    def forex_snapshot(self, pair: str, source: str = 'ib') -> dict:
-        """Get a snapshot for a forex pair.
-
-        Parameters
-        ----------
-        pair : str
-            Currency pair (e.g. 'EURUSD', 'EUR/USD', 'C:EURUSD').
-        source : str
-            'ib' (default) uses Interactive Brokers via trader_service.
-            'massive' uses Massive.com REST API (requires forex plan).
-            'twelvedata' uses TwelveData REST /quote (no bid/ask — TD's
-            quote endpoint reports OHLC + last + change only; bid/ask are
-            on the WebSocket feed, not REST).
+        source 'ib' (default) resolves the IDEALPRO CASH contract via trader_service. Any other
+        value is a registry forex source: 'frankfurter' (ECB daily reference rate, not live; no
+        bid/ask), 'massive' or 'twelvedata' (no bid/ask).
         """
-        if source == 'twelvedata':
-            base, quote_ccy = self._parse_forex_pair(pair)
-            td_symbol = f'{base}/{quote_ccy}'
-            payload = self._twelvedata_client.quote(symbol=td_symbol).as_json()
-            def _f(k):
-                v = payload.get(k)
-                if v in (None, ''):
-                    return None
-                try:
-                    return float(v)
-                except (TypeError, ValueError):
-                    return None
-            return {
-                'pair': td_symbol,
-                'open': _f('open'),
-                'high': _f('high'),
-                'low': _f('low'),
-                'close': _f('close'),
-                'last': _f('close'),
-                'volume': _f('volume'),
-                'previous_close': _f('previous_close'),
-                'change': _f('change'),
-                'change_pct': _f('percent_change'),
-                'timestamp': payload.get('timestamp'),
-                'datetime': payload.get('datetime'),
-                'is_market_open': payload.get('is_market_open'),
-            }
-        if source == 'massive':
-            ticker = pair.upper()
-            if not ticker.startswith('C:'):
-                ticker = f'C:{ticker}'
-            snap = self._massive_client.get_snapshot_ticker(market_type='forex', ticker=ticker)
-            result = {'ticker': ticker}
-            if snap.day:
-                result['open'] = getattr(snap.day, 'open', None)
-                result['high'] = getattr(snap.day, 'high', None)
-                result['low'] = getattr(snap.day, 'low', None)
-                result['close'] = getattr(snap.day, 'close', None)
-                result['volume'] = getattr(snap.day, 'volume', None)
-                result['vwap'] = getattr(snap.day, 'vwap', None)
-            if snap.last_quote:
-                result['bid'] = getattr(snap.last_quote, 'bid', None) or getattr(snap.last_quote, 'P', None)
-                result['ask'] = getattr(snap.last_quote, 'ask', None) or getattr(snap.last_quote, 'P', None)
-            if snap.todays_change is not None:
-                result['change'] = snap.todays_change
-            if snap.todays_change_percent is not None:
-                result['change_pct'] = snap.todays_change_percent
-            return result
-        else:
-            # IB source
-            base, quote_ccy = self._parse_forex_pair(pair)
-            contract = self._resolve_contract(
-                base, sec_type='CASH', exchange='IDEALPRO', currency=quote_ccy,
-            )
-            response = self._typed_query.call(
-                'get_snapshot',
-                {'instrument_id': int(contract.conId), 'delayed': False},
-                dict,
-            )
-            s = response.get('snapshot') or {}
-            return {
-                'pair': f'{base}/{quote_ccy}',
-                'bid': s.get('bid'),
-                'bidSize': s.get('bid_size'),
-                'ask': s.get('ask'),
-                'askSize': s.get('ask_size'),
-                'last': s.get('last'),
-                'open': s.get('open'),
-                'high': s.get('high'),
-                'low': s.get('low'),
-                'close': s.get('close'),
-                'time': s.get('time'),
-            }
+        from trader.data_providers.symbols import parse_forex_pair
+        base, quote_currency = parse_forex_pair(pair)
+        if source == IB_FOREX_SOURCE:
+            return self._ib_forex_snapshot(base, quote_currency)
+        return self._forex_rate(base, quote_currency, source)
 
-    def forex_quote(self, from_currency: str, to_currency: str, source: str = 'ib') -> dict:
-        """Get the last forex quote for a currency pair.
+    def forex_quote(self, from_currency: str, to_currency: str, source: str = IB_FOREX_SOURCE) -> dict:
+        """Last quote for a currency pair. 'ib' (default) gives IB bid/ask; registry sources give
+        the same shared rate dict as :meth:`forex_snapshot`."""
+        from trader.data_providers.symbols import parse_forex_codes
+        base, quote_currency = parse_forex_codes(from_currency, to_currency)
+        if source != IB_FOREX_SOURCE:
+            return self._forex_rate(base, quote_currency, source)
+        snapshot = self._ib_forex_snapshot(base, quote_currency)
+        return {key: snapshot[key] for key in ('pair', 'bid', 'ask', 'last', 'time')}
 
-        Parameters
-        ----------
-        from_currency : str
-            Base currency (e.g. 'EUR').
-        to_currency : str
-            Quote currency (e.g. 'USD').
-        source : str
-            'ib' (default), 'massive', or 'twelvedata'. The TD path uses
-            the ``/exchange_rate`` endpoint and returns ``{pair, last,
-            timestamp}`` — bid/ask are not exposed on this REST endpoint.
-        """
-        if source == 'twelvedata':
-            td_symbol = f'{from_currency.upper()}/{to_currency.upper()}'
-            payload = self._twelvedata_client.exchange_rate(symbol=td_symbol).as_json()
-            rate = payload.get('rate')
-            try:
-                rate = float(rate) if rate is not None else None
-            except (TypeError, ValueError):
-                rate = None
-            return {
-                'pair': td_symbol,
-                'last': rate,
-                'timestamp': payload.get('timestamp'),
-            }
-        if source == 'massive':
-            result = self._massive_client.get_last_forex_quote(from_currency, to_currency)
-            out = {'symbol': result.symbol}
-            if result.last:
-                out['bid'] = result.last.bid
-                out['ask'] = result.last.ask
-                out['exchange'] = result.last.exchange
-                out['timestamp'] = result.last.timestamp
-            return out
-        else:
-            # IB source — use typed snapshot on CASH contract
-            contract = self._resolve_contract(
-                from_currency.upper(), sec_type='CASH',
-                exchange='IDEALPRO', currency=to_currency.upper(),
-            )
-            response = self._typed_query.call(
-                'get_snapshot',
-                {'instrument_id': int(contract.conId), 'delayed': False},
-                dict,
-            )
-            s = response.get('snapshot') or {}
-            return {
-                'pair': f'{from_currency.upper()}/{to_currency.upper()}',
-                'bid': s.get('bid'),
-                'ask': s.get('ask'),
-                'last': s.get('last'),
-                'time': s.get('time'),
-            }
+    def _forex_rate(self, base: str, quote_currency: str, source: str) -> dict:
+        from trader.data_providers import Capability
+        return self._provider(Capability.FOREX, source).rate(base, quote_currency)
 
-    def forex_snapshot_all(self, tickers: Optional[List[str]] = None) -> pd.DataFrame:
-        """Get snapshots for all forex pairs (Massive.com only)."""
-        ticker_arg = None
-        if tickers:
-            ticker_arg = [t if t.startswith('C:') else f'C:{t}' for t in tickers]
-        snaps = self._massive_client.get_snapshot_all(market_type='forex', tickers=ticker_arg)
-        rows = []
-        for snap in snaps:
-            row = {'ticker': snap.ticker or ''}
-            if snap.day:
-                row['open'] = getattr(snap.day, 'open', None)
-                row['high'] = getattr(snap.day, 'high', None)
-                row['low'] = getattr(snap.day, 'low', None)
-                row['close'] = getattr(snap.day, 'close', None)
-                row['volume'] = getattr(snap.day, 'volume', None)
-            if snap.todays_change is not None:
-                row['change'] = snap.todays_change
-            if snap.todays_change_percent is not None:
-                row['change_pct'] = snap.todays_change_percent
-            rows.append(row)
-        df = pd.DataFrame(rows)
-        if not df.empty and 'change_pct' in df.columns:
-            df = df.sort_values('change_pct', ascending=False).reset_index(drop=True)
-        return df
-
-    def forex_movers(self, direction: str = 'gainers') -> pd.DataFrame:
-        """Get top forex movers (Massive.com only)."""
-        snaps = self._massive_client.get_snapshot_direction(
-            market_type='forex', direction=direction,
+    def _ib_forex_snapshot(self, base: str, quote_currency: str) -> dict:
+        contract = self._resolve_contract(base, sec_type='CASH', exchange='IDEALPRO', currency=quote_currency)
+        response = self._typed_query.call(
+            'get_snapshot',
+            {'instrument_id': int(contract.conId), 'delayed': False},
+            dict,
         )
-        rows = []
-        for snap in snaps:
-            row = {'ticker': snap.ticker or ''}
-            if snap.day:
-                row['close'] = getattr(snap.day, 'close', None)
-                row['volume'] = getattr(snap.day, 'volume', None)
-            if snap.todays_change is not None:
-                row['change'] = snap.todays_change
-            if snap.todays_change_percent is not None:
-                row['change_pct'] = snap.todays_change_percent
-            rows.append(row)
-        return pd.DataFrame(rows)
+        snapshot = response.get('snapshot') or {}
+        return {
+            'pair': f'{base}/{quote_currency}',
+            'bid': snapshot.get('bid'),
+            'bidSize': snapshot.get('bid_size'),
+            'ask': snapshot.get('ask'),
+            'askSize': snapshot.get('ask_size'),
+            'last': snapshot.get('last'),
+            'open': snapshot.get('open'),
+            'high': snapshot.get('high'),
+            'low': snapshot.get('low'),
+            'close': snapshot.get('close'),
+            'time': snapshot.get('time'),
+        }
+
+    def forex_convert(self, from_currency: str, to_currency: str, amount: float,
+                      source: Optional[str] = None) -> dict:
+        """Convert `amount` with a registry forex source (default: `data_providers.forex`, else builtin)."""
+        import math
+        from trader.data_providers import Capability
+        from trader.data_providers.symbols import parse_forex_codes
+        base, quote_currency = parse_forex_codes(from_currency, to_currency)
+        if not math.isfinite(amount) or amount <= 0:
+            raise ValueError(f'amount must be a positive number, got {amount!r}')
+        return self._provider(Capability.FOREX, source).convert(base, quote_currency, float(amount))
+
+    def forex_snapshot_all(self, base: str = 'USD', symbols: Optional[List[str]] = None,
+                           source: Optional[str] = None) -> pd.DataFrame:
+        """Rates of `base` against each of `symbols` (None = every currency the source has)."""
+        from trader.data_providers import Capability
+        from trader.data_providers.symbols import parse_currency, parse_forex_codes
+        base = parse_currency(base)
+        quotes = list(dict.fromkeys(parse_forex_codes(base, symbol)[1] for symbol in symbols)) if symbols else None
+        return self._provider(Capability.FOREX, source).rates(base, quotes)
+
+    def forex_movers(self, direction: str = 'gainers', source: Optional[str] = None) -> pd.DataFrame:
+        """Forex movers from a registry source (default: `data_providers.movers_forex`, else builtin)."""
+        from trader.data_providers import Capability
+        return self._provider(Capability.MOVERS_FOREX, source).movers('forex', direction)
 
     def _alpaca_assets(self):
         from trader.data_providers.builtin import alpaca_asset_directory
@@ -3712,13 +3532,15 @@ class MMR:
     ) -> pd.DataFrame:
         """Top movers for `market` from a registry movers source.
 
+        Indices default to ETF proxies and forex to rates computed from the ECB daily rates.
+
         Stock movers drop names under `min_price` and, when Alpaca is configured, warrants,
-        rights and units. `source=None` uses `data_providers.movers`, else the builtin default;
-        movers never inherit `default_data_source`. Forex has its own command (see ``forex_movers``).
+        rights and units. `source=None` uses `data_providers.movers` (or `movers_indices` /
+        `movers_forex`), else the builtin default; movers never inherit `default_data_source`.
         """
-        from trader.data_providers import Capability
+        from trader.data_providers import movers_capability
         from trader.data_providers.movers_filter import filter_stock_movers
-        frame = self._provider(Capability.MOVERS, source).movers(market, direction)
+        frame = self._provider(movers_capability(market), source).movers(market, direction)
         if market == 'stocks':
             assets, off_note = self._movers_asset_directory()
             frame = filter_stock_movers(frame, min_price, assets, off_note)
@@ -3749,9 +3571,9 @@ class MMR:
             in your plan's credit budget.
         """
         from concurrent.futures import ThreadPoolExecutor, as_completed
-        from trader.data_providers import Capability
+        from trader.data_providers import movers_capability
 
-        source = source or self._provider_default(Capability.MOVERS)
+        source = source or self._provider_default(movers_capability(market))
 
         if source == 'twelvedata':
             df = self.movers(market=market, direction=direction, source='twelvedata', min_price=min_price)
@@ -3945,6 +3767,8 @@ class MMR:
                         'description': ''},
             'ratios': {},
             'news': headlines.get(row.ticker, {}),
+            'provider': row.provider,
+            'note': row.note,
         } for row in frame.itertuples(index=False)]
 
     def scan_ideas(
@@ -3963,7 +3787,8 @@ class MMR:
         news: bool = False,
         names: bool = False,
         location: Optional[str] = None,
-        data_source: str = 'massive',
+        data_source: Optional[str] = None,
+        fundamentals_if_available: bool = False,
     ) -> pd.DataFrame:
         """Scan for trading ideas using preset-based scoring.
 
@@ -3988,6 +3813,10 @@ class MMR:
         location : str, optional
             IB market location code (e.g. STK.AU.ASX, STK.CA). When set, uses
             IB scanner API instead of Massive.com (for international markets).
+        data_source : str, optional
+            Registry source for US equities (e.g. 'massive', 'twelvedata').
+            Default: ``data_providers.ideas`` from the config, else the builtin
+            default. Ignored when ``location`` is set.
         """
         # Build custom filter overrides
         custom_filters = {}
@@ -4013,7 +3842,7 @@ class MMR:
                     'ideas --location (IB international path) requires the '
                     'offline-simulation legacy RPC (port 42001), which is not '
                     'bound in the split-container production topology. '
-                    'Use `ideas` without --location for US (Massive/TwelveData), '
+                    'Use `ideas` without --location for US (Alpaca by default; --source massive|twelvedata), '
                     'or run with `unsafe_legacy_rpc: true` + `--simulation True`.'
                 ) from None
 
@@ -4040,7 +3869,7 @@ class MMR:
                 location=location,
                 top_n=top_n,
                 custom_filters=custom_filters or None,
-                fundamentals=fundamentals,
+                fundamentals=fundamentals or fundamentals_if_available,
                 news=news,
                 tickers=tickers if source == 'tickers' else None,
                 universe_symbols=ib_universe_symbols,
@@ -4061,46 +3890,37 @@ class MMR:
             else:
                 return pd.DataFrame()
 
-        # TwelveData path: US markets via TwelveData
-        if data_source == 'twelvedata':
-            from trader.tools.idea_scanner import TwelveDataIdeaScanner
-            scanner = TwelveDataIdeaScanner(self._twelvedata_client)
-            return scanner.scan(
-                preset=preset,
-                source=source,
-                tickers=tickers,
-                universe_symbols=universe_symbols,
-                top_n=top_n,
-                custom_filters=custom_filters or None,
-                fundamentals=fundamentals,
-                news=news,  # silently a no-op — TD client has no news endpoint
-                names=names,
-            )
-
-        # Massive path (default): US markets. Stocks Basic has no snapshots —
-        # fall back to TwelveData quotes on entitlement errors so bare `ideas`
-        # still works when the user has a TD key (common for history).
+        from trader.data_providers import Capability
         from trader.tools.idea_scanner import (
             IdeaScanner,
             IdeaScannerError,
             LIQUID_US_FALLBACK_TICKERS,
-            TwelveDataIdeaScanner,
             entitlement_fallback_notice,
             is_data_entitlement_error,
         )
+        resolved = data_source or self._provider_default(Capability.IDEAS)
+        scan_source = self._provider(Capability.IDEAS, resolved)
+        scan_kwargs = dict(
+            preset=preset,
+            source=source,
+            tickers=tickers,
+            universe_symbols=universe_symbols,
+            top_n=top_n,
+            custom_filters=custom_filters or None,
+            fundamentals=fundamentals,
+            news=news,
+            names=names,
+            fundamentals_if_available=fundamentals_if_available,
+        )
+        if resolved != 'massive':
+            return IdeaScanner(scan_source).scan(**scan_kwargs)
+
+        # Massive: Stocks Basic has no snapshots — fall back to TwelveData
+        # quotes on entitlement errors so bare `ideas` still works when the
+        # user has a TD key (common for history). Removed in phase 3c.
+        from trader.data_providers.twelvedata.scan import TwelveDataScanSource
         try:
-            scanner = IdeaScanner(self._massive_client)
-            return scanner.scan(
-                preset=preset,
-                source=source,
-                tickers=tickers,
-                universe_symbols=universe_symbols,
-                top_n=top_n,
-                custom_filters=custom_filters or None,
-                fundamentals=fundamentals,
-                news=news,
-                names=names,
-            )
+            return IdeaScanner(scan_source).scan(**scan_kwargs)
         except Exception as ex:
             if not is_data_entitlement_error(ex):
                 raise
@@ -4114,7 +3934,7 @@ class MMR:
                 fb_tickers = list(LIQUID_US_FALLBACK_TICKERS)
                 fb_universe = None
             try:
-                td = TwelveDataIdeaScanner(self._twelvedata_client)
+                td = IdeaScanner(TwelveDataScanSource(self._twelvedata_client))
                 df = td.scan(
                     preset=preset,
                     source=fb_source,
@@ -4125,6 +3945,7 @@ class MMR:
                     fundamentals=fundamentals,
                     news=False,  # TD has no news
                     names=names,
+                    fundamentals_if_available=fundamentals_if_available,
                 )
             except Exception as td_ex:
                 raise IdeaScannerError(
@@ -4166,59 +3987,6 @@ class MMR:
         except Exception as exc:
             self._map_legacy_route_error('scan', exc)
         return pd.DataFrame(results) if results else pd.DataFrame()
-
-    def forex_convert(
-        self,
-        from_currency: str,
-        to_currency: str,
-        amount: float,
-        source: str = 'massive',
-    ) -> dict:
-        """Convert an amount between currencies.
-
-        Parameters
-        ----------
-        source : str
-            'massive' (default) uses Massive.com's real-time conversion
-            (returns bid/ask alongside the converted amount).
-            'twelvedata' uses TD's ``/currency_conversion`` endpoint
-            (returns rate + converted amount; no bid/ask).
-        """
-        if source == 'twelvedata':
-            td_symbol = f'{from_currency.upper()}/{to_currency.upper()}'
-            payload = self._twelvedata_client.currency_conversion(
-                symbol=td_symbol, amount=amount,
-            ).as_json()
-            try:
-                rate = float(payload['rate']) if payload.get('rate') is not None else None
-            except (TypeError, ValueError):
-                rate = None
-            try:
-                converted = float(payload['amount']) if payload.get('amount') is not None else None
-            except (TypeError, ValueError):
-                converted = None
-            return {
-                'from': from_currency.upper(),
-                'to': to_currency.upper(),
-                'amount': float(amount),
-                'converted': converted,
-                'rate': rate,
-                'timestamp': payload.get('timestamp'),
-            }
-
-        result = self._massive_client.get_real_time_currency_conversion(
-            from_currency, to_currency, amount=amount,
-        )
-        out = {
-            'from': result.from_,
-            'to': result.to,
-            'amount': result.initial_amount,
-            'converted': result.converted,
-        }
-        if result.last:
-            out['bid'] = result.last.bid
-            out['ask'] = result.last.ask
-        return out
 
     # ------------------------------------------------------------------
     # News (provider registry)

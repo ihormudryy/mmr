@@ -22,7 +22,7 @@ class TwelveDataQuotes:
     def _payloads_by_symbol(self, chunk: list[str]) -> dict:
         raw = self._client.quote(symbol=','.join(chunk)).as_json()
         # One symbol comes back as a flat dict, several as {SYMBOL: {...}}.
-        if isinstance(raw, dict) and 'symbol' in raw and len(chunk) == 1:
+        if isinstance(raw, dict) and len(chunk) == 1 and ('symbol' in raw or _is_error(raw)):
             return {chunk[0]: raw}
         return raw if isinstance(raw, dict) else {}
 
@@ -36,9 +36,16 @@ def _to_float(value) -> float:
         return float('nan')
 
 
+def _is_error(payload: dict) -> bool:
+    return payload.get('status') == 'error' or 'code' in payload
+
+
 def _to_quote(symbol: str, payload: dict) -> dict:
     if not payload:
         return make_quote(symbol, feed='twelvedata', error=f'twelvedata returned no quote for {symbol}')
+    if _is_error(payload):
+        message = payload.get('message', 'unknown error')
+        return make_quote(symbol, feed='twelvedata', error=f'twelvedata error for {symbol}: {message}')
     return make_quote(
         payload.get('symbol', symbol),
         time=payload.get('datetime') or '',

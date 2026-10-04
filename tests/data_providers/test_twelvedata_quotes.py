@@ -67,3 +67,18 @@ def test_missing_symbol_returns_error_row():
     assert quotes[1]['symbol'] == 'MISSING'
     assert math.isnan(quotes[1]['last'])
     assert 'twelvedata returned no quote' in quotes[1]['error']
+
+
+def test_batch_error_payload_becomes_error_row():
+    bad = {'code': 400, 'message': '**symbol** not found: BADSYM', 'status': 'error'}
+    quotes, _ = _quotes({'AAPL': AAPL, 'BADSYM': bad}, ['AAPL', 'BADSYM'])
+    assert quotes[0]['error'] == '' and quotes[0]['last'] == pytest.approx(270.19)
+    assert quotes[1]['symbol'] == 'BADSYM' and 'not found' in quotes[1]['error']
+    assert math.isnan(quotes[1]['last'])
+
+
+def test_single_symbol_error_response_becomes_error_row():
+    bad = {'code': 400, 'message': '**symbol** not found: BADSYM', 'status': 'error'}
+    quotes, _ = _quotes(bad, ['BADSYM'])
+    assert len(quotes) == 1 and quotes[0]['symbol'] == 'BADSYM'
+    assert 'not found' in quotes[0]['error']

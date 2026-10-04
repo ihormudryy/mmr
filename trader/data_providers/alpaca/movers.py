@@ -2,6 +2,7 @@
 
 import pandas as pd
 
+from trader.data_providers.alpaca._numbers import number_or_nan
 from trader.data_providers.capabilities import sort_movers
 from trader.data_providers.errors import CapabilityNotSupported
 
@@ -22,10 +23,10 @@ class AlpacaMovers:
         note = f'as of {as_of}Z' if as_of else ''
         frame = pd.DataFrame([{
             'ticker': e.get('symbol', ''),
-            'close': float(e.get('price', float('nan'))),
+            'close': number_or_nan(e, 'price'),
             'volume': float('nan'),
-            'change': float(e.get('change', float('nan'))),
-            'change_pct': float(e.get('percent_change', float('nan'))),
+            'change': number_or_nan(e, 'change'),
+            'change_pct': number_or_nan(e, 'percent_change'),
             'provider': 'alpaca',
             'note': note,
         } for e in payload.get(direction) or []],

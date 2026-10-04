@@ -3690,7 +3690,7 @@ class MMR:
             ASSET_LIST_UNAVAILABLE_NOTE, INSTRUMENT_FILTER_OFF_NOTE)
         try:
             directory = self._alpaca_assets()
-        except (ProviderError, requests.RequestException) as ex:
+        except (ProviderError, requests.RequestException, TypeError, ValueError, AttributeError) as ex:
             logger.warning('alpaca asset list unavailable, movers warrant filter off: %s', ex)
             return None, ASSET_LIST_UNAVAILABLE_NOTE
         return directory, INSTRUMENT_FILTER_OFF_NOTE
@@ -3926,7 +3926,8 @@ class MMR:
         def latest_headline(ticker: str) -> dict:
             try:
                 items = news_provider.news(ticker, 1)
-            except Exception:
+            except Exception as ex:
+                logger.warning('headline fetch failed for %s: %s', ticker, ex)
                 return {}
             return {'headline': items[0]['title'], 'sentiment': items[0]['sentiment']} if items else {}
 

@@ -154,3 +154,20 @@ def test_massive_movers_detail_takes_num_after_filtering():
 def test_massive_crypto_movers_detail_is_not_filtered():
     detail = _massive_detail_mmr(_Assets()).movers_detail('crypto', 'gainers', num=5, source='massive')
     assert len(detail) == 4
+
+
+def test_malformed_asset_payload_only_turns_instrument_filter_off():
+    from trader.data_providers.movers_filter import ASSET_LIST_UNAVAILABLE_NOTE
+    for error in (TypeError('bad'), ValueError('bad'), AttributeError('bad')):
+        mmr = _mmr(_frame())
+        mmr._alpaca_assets = MagicMock(side_effect=error)
+        assert mmr._movers_asset_directory() == (None, ASSET_LIST_UNAVAILABLE_NOTE)
+
+
+def test_headline_fetch_failure_is_logged_and_skipped(caplog):
+    mmr = _mmr(_frame(), assets=_Assets())
+    mmr._provider(Capability.NEWS).news.side_effect = RuntimeError('boom')
+    with caplog.at_level('WARNING'):
+        detail = mmr.movers_detail('stocks', 'gainers', num=5)
+    assert detail[0]['news'] == {}
+    assert 'headline fetch failed for AAPL: boom' in caplog.text

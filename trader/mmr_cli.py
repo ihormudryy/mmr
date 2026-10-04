@@ -1129,7 +1129,8 @@ def build_parser() -> argparse.ArgumentParser:
     movers_p.add_argument('--num', '-n', type=int, default=20,
                            help='Number of results (default: 20)')
     movers_p.add_argument('--min-price', type=float, default=1.0,
-                          help='Drop stock movers below this price (default: 1.0; 0 keeps all)')
+                          help='Drop stock movers below this price (default: 1.0). 0 keeps all prices; '
+                               'warrants/rights/units and unknown prices are still dropped')
     # Movers never inherit default_data_source (often twelvedata for cheap history/quotes);
     # TD /market_movers requires Pro+.
     movers_p.add_argument('--source', choices=source_choices(Capability.MOVERS), default=None,

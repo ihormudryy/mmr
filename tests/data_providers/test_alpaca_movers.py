@@ -46,3 +46,11 @@ def test_unsupported_market_raises():
     with pytest.raises(CapabilityNotSupported, match='indices movers') as info:
         AlpacaMovers(FakeClient(FIXTURE)).movers('indices', 'gainers')
     assert info.value.supported == ['massive']
+
+
+def test_null_numbers_become_nan():
+    payload = {'gainers': [{'symbol': 'AAPL', 'price': None, 'change': None, 'percent_change': 2.0}],
+               'losers': [], 'last_updated': ''}
+    frame = AlpacaMovers(FakeClient(payload)).movers('stocks', 'gainers')
+    assert frame.loc[0, 'close'] != frame.loc[0, 'close'] and frame.loc[0, 'change'] != frame.loc[0, 'change']
+    assert frame.loc[0, 'change_pct'] == 2.0

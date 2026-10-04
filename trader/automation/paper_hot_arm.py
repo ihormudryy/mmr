@@ -210,12 +210,14 @@ class ProductionPaperHotArmPorts:
             "automation_expected_artifact_id": getattr(
                 self._trader, "automation_expected_artifact_id", ""
             ),
+            "automation_strategy_name": getattr(self._trader, "automation_strategy_name", ""),
         }
         self._trader.automation_enabled = True
         self._trader.automation_live_enabled = False
         self._trader.automation_artifact_bundle_path = artifact_bundle_path
         self._trader.automation_public_key_ring_path = public_key_ring_path
         self._trader.automation_expected_artifact_id = artifact_id
+        self._trader.automation_strategy_name = strategy_name
         try:
             service = self._build_intent_service(self._trader)
         finally:
@@ -241,7 +243,9 @@ class ProductionPaperHotArmPorts:
                 _execute_automated_intent_rpc_handler(coordinator, self._account_id),
             )
             self._late_registered = True
-        self._stack.automated_intent_service = service
+        # CommandStack is frozen; this is its deliberate hot-arm mutation,
+        # matching composition's late attachment of the hot-arm ports.
+        object.__setattr__(self._stack, "automated_intent_service", service)
         self._binding = {
             "strategy_name": strategy_name,
             "artifact_id": artifact_id,
@@ -254,6 +258,7 @@ class ProductionPaperHotArmPorts:
         self._trader.automation_artifact_bundle_path = artifact_bundle_path
         self._trader.automation_public_key_ring_path = public_key_ring_path
         self._trader.automation_expected_artifact_id = artifact_id
+        self._trader.automation_strategy_name = strategy_name
 
     def trader_compensate(self) -> None:
         from trader.trading.command_coordinator import (
@@ -282,7 +287,7 @@ class ProductionPaperHotArmPorts:
                 saga=True,
             )
 
-        self._stack.automated_intent_service = None
+        object.__setattr__(self._stack, "automated_intent_service", None)
         self._binding = None
         self._trader.automation_enabled = False
         self._trader.automation_expected_artifact_id = ""

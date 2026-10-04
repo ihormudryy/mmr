@@ -116,6 +116,32 @@ scheduled) the paper soak.
 
 ### 5. Arm paper automation (one strategy)
 
+Activation **does not create evidence or signing keys**. First complete research,
+the quantitative `paper-v1` gate, independent operator review and offline signing,
+then export the sealed `ResearchBundle`. Install only that read-only bundle and
+the trusted **public** PEM key ring on the trader/strategy hosts. Keep private
+signing material offline; the activation request still needs only `strategy_name`
+and `reason`, never a private key or other raw secret.
+
+Configure `automation.artifact_bundle_path`, `automation.public_key_ring_path`
+and `automation.expected_artifact_id` in the trader's local YAML while keeping
+`automation.enabled: false`. The selected strategy's exact `module`, `class_name`
+and `params` must match the research family/artifact; only the transport parameter
+`artifact_bundle_path` is excluded from parameter comparison. No fuzzy path,
+parameter-name or identifier matching is performed.
+
+Activation verifies the complete signed bundle, expiry, trusted key and artifact
+binding, requires the complete passing current `paper-v1` decision, and rejects
+known bootstrap/offline fixture provenance before any YAML or hot-arm commit.
+`RESEARCH_EVIDENCE_REQUIRED` means paths/id are missing;
+`RESEARCH_EVIDENCE_INVALID` means verification or strategy binding failed.
+These checks also run on Activate retries. Other runtime/account/live gates
+remain in force; a valid research bundle does not bypass them.
+
+A signature proves origin and integrity, **not that metrics were measured**.
+The operator must audit the underlying trials, datasets, holdout, costs and
+review. Neither fixture data nor a successful plumbing drill is promotion evidence.
+
 #### Preferred — dashboard (Phase 2 hot-arm)
 
 1. Open the web dashboard / command center **Scaling** tab
@@ -126,23 +152,23 @@ scheduled) the paper soak.
 
 See also [`DASHBOARD_USER_GUIDE.md`](DASHBOARD_USER_GUIDE.md).
 
-#### Offline equivalent
+#### Offline verification / configuration helper
 
 ```bash
-python3 scripts/bootstrap_paper_automation.py --strategy-name YOUR_STRATEGY
+python3 scripts/bootstrap_paper_automation.py --strategy-name YOUR_STRATEGY \
+  --artifact-bundle-path /path/to/existing/research-bundle \
+  --public-key-ring-path /path/to/trusted/public-keys \
+  --expected-artifact-id <exact-artifact-id>
 ```
 
-That creates (never commit these):
-
-- `~/.config/mmr/keys/private/signing.pem`
-- `~/.config/mmr/keys/verify/*.pem`
-- `~/.local/share/mmr/artifacts/<artifact_id>/`
-
-Paste what the script prints into user config, e.g.:
+This only verifies existing public material and prints **disabled** configuration;
+it creates no keys or evidence, changes no YAML and does not arm anything. It does
+not have the strategy YAML, so the activation service checks strategy binding.
+Paste the configuration into user config, e.g.:
 
 ```yaml
 automation:
-  enabled: true
+  enabled: false  # Activate after strategy/evidence preflight
   live_enabled: false
   artifact_bundle_path: /Users/you/.local/share/mmr/artifacts/<id>
   public_key_ring_path: /Users/you/.config/mmr/keys/verify
@@ -158,7 +184,31 @@ params:
 # do NOT set auto_execute: propose on this strategy
 ```
 
-Restart trader + strategy again.
+Use dashboard Activate after configuring both services. If hot-arm is unavailable,
+the activation service returns `restart_required`; restart trader + strategy then.
+
+#### Isolated offline fixtures (not activation)
+
+```bash
+python3 scripts/bootstrap_paper_automation.py --offline-fixture \
+  --config-dir /path/to/disposable/drill-config \
+  --share-dir /path/to/disposable/drill-share
+```
+
+Fixture keys/bundles live under separate `offline-fixtures/` subdirectories.
+The script labels the output and prints **no activation snippets**. Fixture
+attestations are `CANDIDATE`, with `permitted_account_mode: none` and signed
+`offline_fixture_not_for_promotion` provenance. They exercise export/integrity
+plumbing only and cannot authorize paper or live orders. The historical Python
+API name `export_fixture_paper_eligible_bundle` remains for compatibility, but
+requires `offline_fixture=True` and no longer emits a paper-eligible decision.
+Older bootstrap fixtures are rejected even if their signatures still verify.
+Do not add fixture public keys to the normal research trust ring.
+
+For integration: cold-start and dispatch callers must run
+`require_qualified_research_evidence(bundle_path)` from `paper_materials` **after**
+full `ArtifactVerifier` verification. This provenance/completeness check does not
+replace signature, expiry, revocation, live/account or risk verification.
 
 ### 6. Run the P3 automation gates
 
@@ -202,7 +252,7 @@ python3 scripts/automation_paper_drill.py
 2. One validated strategy deployed
 3. `command_authority.enabled: true`, `live_enabled: false`
 4. P1 synthetic (+ paper soak)
-5. Activate / bootstrap automation for **that one** name
+5. Configure verified existing research, then Activate **that one** name
 6. Restart trader + strategy
 7. P3 synthetic (+ paper soak)
 8. Monitor + know kill switches

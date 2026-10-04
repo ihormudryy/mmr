@@ -290,6 +290,27 @@ def _build_saga(tmp_path: Path, **overrides):
     return saga, guard, risk, dispatch, breaker, liquidation, journal, ledger, db
 
 
+def test_risk_evaluation_exception_is_a_known_pre_dispatch_rejection(tmp_path):
+    def unavailable(*args):
+        raise AttributeError("incomplete session evidence")
+
+    saga, guard, _, dispatch, _, _, _, _, _ = _build_saga(
+        tmp_path, risk=SimpleNamespace(evaluate=unavailable),
+    )
+    intent = make_intent()
+    state = saga.start(
+        intent=intent, approval=make_approval(),
+        request=FakeCommandRequest(intent.command_id),
+        artifact=object(), session_state=object(), allocation=object(),
+    )
+
+    assert state.state == "CLOSED"
+    assert state.error_code == "AUTOMATION_RISK_UNAVAILABLE"
+    assert saga.resume(intent.command_id) == state
+    assert dispatch.calls == []
+    assert guard.calls == 0
+
+
 # ---------------------------------------------------------------------------
 # Bracket / OCA construction (pure)
 # ---------------------------------------------------------------------------

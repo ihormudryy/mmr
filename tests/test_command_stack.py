@@ -367,3 +367,80 @@ def test_automation_live_enabled_refused_at_stack_build(tmp_path):
     with pytest.raises(CommandStackConfigurationError) as exc:
         build_command_stack(trader, _policy(), now=lambda: NOW)
     assert exc.value.code == "AUTOMATION_LIVE_REFUSED"
+
+
+def test_automation_approval_uses_fenced_broker_and_executable_quote(tmp_path, monkeypatch):
+    from decimal import Decimal
+
+    from trader.data.broker_state import BrokerRiskSnapshot
+    from trader.trading.command_ports import (
+        TraderBrokerAuthority, TraderBrokerRiskSnapshotAuthority, TraderQuoteAuthority,
+    )
+    from trader.trading.command_stack import build_command_stack
+    from trader.trading.proposal_command_service import ExecutableQuote
+
+    trader = _trader(tmp_path)
+    trader.automation_enabled = True
+    trader.automation_live_enabled = False
+    trader.automation_strategy_name = "qualified-paper-strategy"
+    trader.automation_public_key_ring_path = _automation_key_ring(tmp_path)
+    trader.automation_artifact_bundle_path = str(tmp_path / "artifacts")
+    trader.automation_expected_artifact_id = "artifact-test-1"
+    (tmp_path / "artifacts").mkdir()
+    snapshot = BrokerRiskSnapshot(
+        generation_id=7, source_cursor=35, promoted_at=NOW,
+        account_id=trader.ib_account, account_mode="paper",
+        net_liquidation=123_456.0, daily_pnl=-123.0, positions=(), working_orders=(),
+    )
+    quote = ExecutableQuote(
+        conid=265598, side="BUY", price=160.01,
+        market_timestamp=NOW - dt.timedelta(seconds=1),
+        feed_type="live", session_state="continuous", bid=160.0, ask=160.01,
+    )
+    monkeypatch.setattr(TraderBrokerRiskSnapshotAuthority, "capture", lambda *_: snapshot)
+    monkeypatch.setattr(TraderQuoteAuthority, "executable_quote", lambda *_, **__: quote)
+    monkeypatch.setattr(TraderBrokerAuthority, "what_if_margin", lambda *_: None)
+    stack = build_command_stack(trader, _policy(), now=lambda: NOW)
+    intent = SimpleNamespace(
+        conid=265598, side="BUY", requested_quantity=Decimal("10"),
+        account_mode="paper", artifact_id="artifact-test-1",
+    )
+
+    approval = stack.automated_intent_service._approval_factory(
+        intent=intent, command=SimpleNamespace(account_id=trader.ib_account),
+    )
+
+    assert approval.broker is snapshot
+    assert approval.market.quote is quote
+    assert approval.quantity == 10.0
+    assert approval.reference_price == quote.price
+    assert approval.market.quote.market_timestamp == NOW - dt.timedelta(seconds=1)
+
+
+def test_hot_arm_and_disarm_use_real_command_stack_and_strategy_binding(tmp_path):
+    from trader.trading.command_stack import build_command_stack
+
+    trader = _trader(tmp_path)
+    stack = build_command_stack(trader, _policy(), now=lambda: NOW)
+    assert stack is not None
+    registry = build_production_registry(
+        trader, HmacServiceAuthenticator(b"k" * 32), command_stack=stack,
+    )
+    ports = stack.paper_hot_arm
+    ports.attach_registry(registry)
+    ports.trader_commit(
+        strategy_name="qualified-paper-strategy", artifact_id="artifact-test-1",
+        artifact_bundle_path=str(tmp_path / "bundle"),
+        public_key_ring_path=_automation_key_ring(tmp_path),
+    )
+
+    assert registry.contains("command", "execute_automated_intent")
+    assert stack.automated_intent_service is not None
+    evidence = stack.automated_intent_service._approval_factory.__self__
+    assert evidence._strategy_id == "qualified-paper-strategy"
+    assert trader.automation_strategy_name == "qualified-paper-strategy"
+
+    ports.trader_compensate()
+    assert stack.automated_intent_service is None
+    assert not registry.contains("command", "execute_automated_intent")
+    assert trader.automation_enabled is False

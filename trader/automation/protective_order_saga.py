@@ -466,9 +466,26 @@ class ProtectiveOrderSaga:
         now = self._now_utc()
 
         # 1) Session / liquidity risk (Task 4) — before any IB side effect.
-        decision = self._session_risk.evaluate(
-            intent, artifact, approval, session_state, allocation,
-        )
+        try:
+            decision = self._session_risk.evaluate(
+                intent, artifact, approval, session_state, allocation,
+            )
+        except Exception as ex:
+            # A failed risk read/evaluation is a known no-submit outcome, not
+            # an ambiguous broker acknowledgement. Persist the refusal.
+            state = SagaState(
+                command_id=intent.command_id,
+                order_group_id=order_group_id,
+                order_ref=order_ref,
+                state="CLOSED",
+                account_id=self._account_id,
+                conid=intent.conid,
+                side=intent.side,
+                requested_quantity=_dec(intent.requested_quantity or 0),
+                error_code=getattr(ex, "code", None) or "AUTOMATION_RISK_UNAVAILABLE",
+            )
+            self._persist(state, now, from_state=None)
+            return state
         if not decision.approved:
             code = decision.reason_codes[0] if decision.reason_codes else "RISK_REJECTED"
             state = SagaState(

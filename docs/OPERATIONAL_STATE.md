@@ -51,10 +51,13 @@ PLS position (3800sh, AUD) has a protective SELL STP @ 4.75.
 - **US ORB:** GOOGL strong (PF 2.45), PLTR/XLK positive, GLD losing.
 - **VWAP:** works on CAT (PF 1.44, +18.9bps); loses on every other US name tried
   → correctly deployed only on CAT.
-- **Metric caveat:** `expectancy_bps` repeatedly disagrees with return/PF (e.g.
-  positive return + negative expectancy on fixed sizing) — treat return + PF as
-  the reliable metrics until the expectancy_bps calc is reconciled. (Worth an
-  AUDIT_ROADMAP item.)
+- **Metric interpretation:** `expectancy_bps` equally weights each SELL's net
+  P&L / closed entry notional; PF uses cash P&L sums. Both include allocated
+  entry and exit commissions. Unequal notionals (even with fixed share counts)
+  or partial exits can legitimately produce PF > 1 with negative expectancy;
+  total return also includes unrealized P&L. No calculation defect was
+  reproduced in deterministic regression tests; the historical runs above were
+  not rerun. See [metric semantics and examples](BACKTEST_METRICS.md).
 - **Not done:** statistical-confidence tests (PSR/t-test/bootstrap) — the script
   hung on MC/bootstrap over large trade sets after ~3 of 6 survivors. Rerun with
   iteration caps + per-strategy timeouts if wanted. No results saved; nothing
@@ -103,6 +106,7 @@ PLS position (3800sh, AUD) has a protective SELL STP @ 4.75.
 ## Open items / follow-ups (offline)
 
 - Cluster G (AUDIT_ROADMAP): G1 mass-enable RPC timeout, G2 IB farm-status log noise.
-- `expectancy_bps` metric inconsistency (see above).
+- Historical `expectancy_bps`/PF disagreements: reconcile original trade traces,
+  entry notionals and partial exits before alleging a calculation defect (see above).
 - Statistical-confidence script needs timeouts/caps before rerun.
 - ORB-ASX: consider a proper train/test split before trusting BHP/WDS edges live.

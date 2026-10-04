@@ -542,3 +542,146 @@ def test_rpc_registers_execute_automated_intent_for_strategy_principal(tmp_path)
     receipt = registration.handler(parsed)
     assert receipt["state"] in ("SUBMITTED", "RESOLVED")
     assert stack.dispatch.calls[0]["intent_id"] == intent.intent_id
+
+
+@pytest.mark.parametrize("stage", ["approval", "session_state", "allocation"])
+def test_evidence_read_failure_is_rejected_without_reconciliation(tmp_path, stage):
+    from trader.trading.approval_context import ApprovalContextError
+
+    stack = _build_stack(tmp_path)
+    intent = make_intent()
+
+    def missing_quote(**kwargs):
+        raise ApprovalContextError("NO_QUOTE", "no executable market evidence")
+
+    def must_not_start(**kwargs):
+        pytest.fail("saga started despite failed evidence capture")
+
+    stack.service._approval_factory = lambda **kwargs: object()
+    stack.service._session_state_factory = lambda **kwargs: object()
+    stack.service._allocation_factory = lambda **kwargs: object()
+    setattr(stack.service, f"_{stage}_factory", missing_quote)
+    stack.service._protective_saga = SimpleNamespace(start=must_not_start)
+    request = CommandRequest(
+        command_id=intent.command_id, action="execute_automated_intent",
+        account_id=ACCOUNT, target_type="intent", target_id=intent.intent_id,
+        expected_version=None, body=intent_to_request_body(intent),
+        source="strategy_service",
+    )
+
+    receipt = stack.coordinator.execute(request)
+
+    assert receipt.state == "REJECTED"
+    assert receipt.error_code == "NO_QUOTE"
+    assert stack.ledger.get(intent.command_id).state == "REJECTED"
+    assert stack.schedule.calls == 0
+    assert stack.dispatch.calls == []
+    assert stack.coordinator.execute(request).state == "REJECTED"
+
+
+def test_session_evidence_uses_the_same_approval_snapshot(tmp_path):
+    stack = _build_stack(tmp_path)
+    intent = make_intent()
+    approval = object()
+    session = object()
+    seen = []
+
+    def session_factory(*, intent, command, approval):
+        seen.append(approval)
+        return session
+
+    def start(**kwargs):
+        assert kwargs["approval"] is approval
+        assert kwargs["session_state"] is session
+        return SimpleNamespace(state="SUBMITTING", submitted_order_ids=[501])
+
+    stack.service._approval_factory = lambda **kwargs: approval
+    stack.service._session_state_factory = session_factory
+    stack.service._protective_saga = SimpleNamespace(start=start)
+    request = CommandRequest(
+        command_id=intent.command_id, action="execute_automated_intent",
+        account_id=ACCOUNT, target_type="intent", target_id=intent.intent_id,
+        expected_version=None, body=intent_to_request_body(intent),
+        source="strategy_service",
+    )
+
+    receipt = stack.coordinator.execute(request)
+
+    assert receipt.state == "SUBMITTED"
+    assert seen == [approval]
+
+
+def test_configured_bundle_path_is_not_derived_from_wire_manifest_digest(tmp_path):
+    stack = _build_stack(tmp_path)
+    intent = make_intent()
+    configured = tmp_path / "artifacts" / "0123456789abcdef"
+    stack.service._configured_bundle_path = configured
+    stack.service._expected_artifact_id = intent.artifact_id
+    request = CommandRequest(
+        command_id=intent.command_id, action="execute_automated_intent",
+        account_id=ACCOUNT, target_type="intent", target_id=intent.intent_id,
+        expected_version=None,
+        body=intent_to_request_body(intent, bundle_digest="sha256:manifest-ok"),
+        source="strategy_service",
+    )
+
+    receipt = stack.coordinator.execute(request)
+
+    assert receipt.state == "SUBMITTED"
+    assert stack.verifier.calls[0]["bundle_path"] == str(configured)
+
+
+@pytest.mark.parametrize(
+    ("configured_id", "bundle_digest", "code"),
+    [
+        ("artifact-other", "sha256:manifest-ok", "ARTIFACT_BINDING_MISMATCH"),
+        (None, "sha256:different-manifest", "BUNDLE_DIGEST_MISMATCH"),
+    ],
+)
+def test_configured_artifact_binding_cannot_be_changed_by_intent(
+    tmp_path, configured_id, bundle_digest, code,
+):
+    stack = _build_stack(tmp_path)
+    intent = make_intent()
+    stack.service._configured_bundle_path = tmp_path / "configured-artifact"
+    stack.service._expected_artifact_id = configured_id or intent.artifact_id
+    request = CommandRequest(
+        command_id=intent.command_id, action="execute_automated_intent",
+        account_id=ACCOUNT, target_type="intent", target_id=intent.intent_id,
+        expected_version=None,
+        body=intent_to_request_body(intent, bundle_digest=bundle_digest),
+        source="strategy_service",
+    )
+
+    receipt = stack.coordinator.execute(request)
+
+    assert receipt.state == "REJECTED"
+    assert receipt.error_code == code
+    assert stack.dispatch.calls == []
+
+
+def test_production_bundle_provenance_is_checked_after_signature_verification(tmp_path):
+    from trader.automation.paper_materials import PaperMaterialsError
+
+    stack = _build_stack(tmp_path)
+    intent = make_intent()
+    checked = []
+
+    def reject_fixture(path):
+        assert stack.verifier.calls  # never trust unsigned provenance
+        checked.append(path)
+        raise PaperMaterialsError("offline fixture is not qualified research")
+
+    stack.service._bundle_evidence_validator = reject_fixture
+    request = CommandRequest(
+        command_id=intent.command_id, action="execute_automated_intent",
+        account_id=ACCOUNT, target_type="intent", target_id=intent.intent_id,
+        expected_version=None, body=intent_to_request_body(intent),
+        source="strategy_service",
+    )
+    receipt = stack.coordinator.execute(request)
+
+    assert receipt.state == "REJECTED"
+    assert receipt.error_code == "ARTIFACT_UNVERIFIED"
+    assert len(checked) == 1
+    assert stack.dispatch.calls == []

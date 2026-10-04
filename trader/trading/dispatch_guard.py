@@ -140,7 +140,10 @@ class DispatchGuard:
             if float(quote.bid) > float(quote.ask):
                 raise DispatchGuardError("CROSSED_MARKET", "bid exceeds ask", retryable=True)
 
-        if self._account_mode == "live":
+        # Automated paper entries require executable evidence too; the manual
+        # paper proposal path may still use its documented delayed reference.
+        automated = getattr(request, "action", None) == "execute_automated_intent"
+        if self._account_mode == "live" or automated:
             if quote.feed_type != "live":
                 raise DispatchGuardError("FEED_NOT_LIVE", "live feed required", retryable=True)
             if quote.session_state != "continuous":

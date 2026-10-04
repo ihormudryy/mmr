@@ -22,6 +22,8 @@ class ExecutableQuote:
     session_state: str
     bid: Optional[float] = None
     ask: Optional[float] = None
+    bid_size: Optional[float] = None
+    ask_size: Optional[float] = None
 
 
 class QuoteAuthority(Protocol):

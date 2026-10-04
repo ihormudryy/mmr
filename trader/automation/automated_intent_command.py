@@ -144,6 +144,9 @@ class AutomatedIntentCommandService:
         approval_factory: Optional[Callable[..., Any]] = None,
         session_state_factory: Optional[Callable[..., Any]] = None,
         allocation_factory: Optional[Callable[..., Any]] = None,
+        configured_bundle_path: Optional[Path] = None,
+        expected_artifact_id: Optional[str] = None,
+        bundle_evidence_validator: Optional[Callable[[Path], None]] = None,
     ):
         self._ledger = ledger
         self._audit = audit
@@ -160,6 +163,11 @@ class AutomatedIntentCommandService:
         self._approval_factory = approval_factory
         self._session_state_factory = session_state_factory
         self._allocation_factory = allocation_factory
+        self._configured_bundle_path = (
+            Path(configured_bundle_path) if configured_bundle_path is not None else None
+        )
+        self._expected_artifact_id = expected_artifact_id
+        self._bundle_evidence_validator = bundle_evidence_validator
 
     def execute(self, cmd: CommandRequest) -> CommandReceipt:
         if cmd.source not in _ALLOWED_PRINCIPALS:
@@ -183,25 +191,45 @@ class AutomatedIntentCommandService:
             self._transition(cmd, "RECEIVED", "REJECTED", error_code="ACCOUNT_MODE_MISMATCH")
             return self._receipt(cmd.command_id, "REJECTED", "ACCOUNT_MODE_MISMATCH", False)
 
+        if self._expected_artifact_id is not None and intent.artifact_id != self._expected_artifact_id:
+            code = "ARTIFACT_BINDING_MISMATCH"
+            self._transition(cmd, "RECEIVED", "REJECTED", error_code=code)
+            return self._receipt(cmd.command_id, "REJECTED", code, False)
+
         bundle_digest = cmd.body.get("artifact_bundle_digest")
         if not bundle_digest:
             self._transition(cmd, "RECEIVED", "REJECTED", error_code="BUNDLE_DIGEST_MISSING")
             return self._receipt(cmd.command_id, "REJECTED", "BUNDLE_DIGEST_MISSING", False)
 
-        bundle_path = self._bundle_path(str(bundle_digest))
+        # Production pins an operator-configured directory. A manifest digest
+        # is content identity, not the artifact directory name on disk.
+        bundle_path = self._configured_bundle_path or self._bundle_path(str(bundle_digest))
         try:
             artifact = self._verifier.verify(
                 bundle_path,
                 intent.account_mode,
-                intent.artifact_id,
+                self._expected_artifact_id or intent.artifact_id,
                 self._now_utc(),
             )
+            if self._bundle_evidence_validator is not None:
+                self._bundle_evidence_validator(bundle_path)
         except Exception as ex:
             self._transition(cmd, "RECEIVED", "REJECTED", error_code="ARTIFACT_UNVERIFIED")
             return self._receipt(
                 cmd.command_id, "REJECTED", "ARTIFACT_UNVERIFIED", False,
                 outcome={"detail": str(ex)},
             )
+
+        if self._configured_bundle_path is not None:
+            manifest_digest = artifact.manifest_digest
+            expected_digest = (
+                manifest_digest if manifest_digest.startswith("sha256:")
+                else f"sha256:{manifest_digest}"
+            )
+            if bundle_digest != expected_digest:
+                code = "BUNDLE_DIGEST_MISMATCH"
+                self._transition(cmd, "RECEIVED", "REJECTED", error_code=code)
+                return self._receipt(cmd.command_id, "REJECTED", code, False)
 
         self._transition(cmd, "RECEIVED", "VALIDATED")
 
@@ -256,15 +284,24 @@ class AutomatedIntentCommandService:
     def _execute_via_saga(
         self, cmd, intent, artifact, order_group_id, bundle_digest,
     ) -> CommandReceipt:
-        approval = self._approval_factory(intent=intent, command=cmd)
-        session_state = (
-            self._session_state_factory(intent=intent, command=cmd)
-            if self._session_state_factory is not None else None
-        )
-        allocation = (
-            self._allocation_factory(intent=intent, artifact=artifact, command=cmd)
-            if self._allocation_factory is not None else None
-        )
+        assert self._approval_factory is not None
+        assert self._protective_saga is not None
+        try:
+            approval = self._approval_factory(intent=intent, command=cmd)
+            session_state = (
+                self._session_state_factory(intent=intent, command=cmd, approval=approval)
+                if self._session_state_factory is not None else None
+            )
+            allocation = (
+                self._allocation_factory(intent=intent, artifact=artifact, command=cmd)
+                if self._allocation_factory is not None else None
+            )
+        except Exception as ex:
+            # No broker mutation has been attempted. Do not strand the command
+            # in SUBMITTING or manufacture an ambiguous dispatch to reconcile.
+            code = getattr(ex, "code", None) or "AUTOMATION_EVIDENCE_UNAVAILABLE"
+            self._transition(cmd, "SUBMITTING", "REJECTED", error_code=code)
+            return self._receipt(cmd.command_id, "REJECTED", code, False)
         try:
             saga_state = self._protective_saga.start(
                 intent=intent,

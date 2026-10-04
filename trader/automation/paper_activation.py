@@ -13,9 +13,7 @@ import yaml
 from trader.automation.paper_hot_arm import PaperHotArmPorts
 from trader.automation.paper_materials import (
     PaperMaterialsError,
-    default_key_paths,
-    ensure_signing_keypair,
-    export_fixture_paper_eligible_bundle,
+    verify_qualified_paper_bundle,
 )
 
 logger = logging.getLogger(__name__)
@@ -243,23 +241,7 @@ class PaperAutomationActivationService:
             automation=automation,
             strategy_data=strategy_data,
         )
-        private_key_path, verify_dir, public_key_path = default_key_paths(
-            self._config_dir
-        )
-        try:
-            signer, reused = ensure_signing_keypair(
-                private_key_path=private_key_path,
-                public_key_path=public_key_path,
-            )
-            artifact_id = export_fixture_paper_eligible_bundle(
-                signer=signer,
-                artifacts_root=self._share_dir / "artifacts",
-            )
-        except PaperMaterialsError as exc:
-            self._last_error = str(exc)
-            raise
-
-        bundle_path = self._share_dir / "artifacts" / artifact_id
+        artifact_id, bundle_path, verify_dir = self._research_materials(automation, strategy)
         self._persist_enable(
             trader_data=trader_data,
             strategy_data=strategy_data,
@@ -280,11 +262,30 @@ class PaperAutomationActivationService:
             "artifact_bundle_path": str(bundle_path),
             "public_key_ring_path": str(verify_dir),
             "restart_required": True,
-            "reused_existing_keys": reused,
+            "reused_existing_keys": True,
         }
 
     def _activate_hot_arm(self, *, strategy_name: str) -> dict:
         assert self._hot_arm is not None
+        trader_data = _load_yaml_mapping(self._trader_yaml_path)
+        strategy_data = _load_yaml_mapping(self._strategy_yaml_path)
+        automation = dict(trader_data.get("automation") or {})
+        strategy = self._validate_activation(
+            strategy_name=strategy_name,
+            automation=automation,
+            strategy_data=strategy_data,
+        )
+        # Validate before all idempotent/retry shortcuts and before port writes.
+        artifact_id, bundle_path, verify_dir = self._research_materials(automation, strategy)
+        if self._memory_armed and (
+            self._memory_artifact_id != artifact_id
+            or self._memory_bundle_path != str(bundle_path)
+            or self._memory_key_ring != str(verify_dir)
+        ):
+            raise PaperAutomationActivationError(
+                "AUTOMATION_ALREADY_BOUND",
+                "deactivate before changing the armed research material binding",
+            )
         # Idempotent: already armed for the same strategy.
         if (
             self._memory_armed
@@ -300,15 +301,6 @@ class PaperAutomationActivationService:
                 "restart_required": False,
                 "reused_existing_keys": True,
             }
-
-        trader_data = _load_yaml_mapping(self._trader_yaml_path)
-        strategy_data = _load_yaml_mapping(self._strategy_yaml_path)
-        automation = dict(trader_data.get("automation") or {})
-        strategy = self._validate_activation(
-            strategy_name=strategy_name,
-            automation=automation,
-            strategy_data=strategy_data,
-        )
 
         # armed_unpersisted retry: memory already matches — persist only.
         if (
@@ -330,25 +322,7 @@ class PaperAutomationActivationService:
                 reused=True,
             )
 
-        private_key_path, verify_dir, public_key_path = default_key_paths(
-            self._config_dir
-        )
         try:
-            self._phase = "prepare_keys"
-            self._inject_fail("prepare_keys")
-            signer, reused = ensure_signing_keypair(
-                private_key_path=private_key_path,
-                public_key_path=public_key_path,
-            )
-
-            self._phase = "export_artifact"
-            self._inject_fail("export_artifact")
-            artifact_id = export_fixture_paper_eligible_bundle(
-                signer=signer,
-                artifacts_root=self._share_dir / "artifacts",
-            )
-            bundle_path = self._share_dir / "artifacts" / artifact_id
-
             self._phase = "trader_commit"
             self._hot_arm.trader_commit(
                 strategy_name=strategy_name,
@@ -356,7 +330,6 @@ class PaperAutomationActivationService:
                 artifact_bundle_path=str(bundle_path),
                 public_key_ring_path=str(verify_dir),
             )
-            trader_committed = True
             self._inject_fail("trader_commit")
 
             self._phase = "strategy_commit"
@@ -366,7 +339,6 @@ class PaperAutomationActivationService:
                 artifact_bundle_path=str(bundle_path),
                 public_key_ring_path=str(verify_dir),
             )
-            strategy_committed = True
             self._inject_fail("strategy_commit")
 
             self._phase = "verify"
@@ -392,7 +364,7 @@ class PaperAutomationActivationService:
                 artifact_id=artifact_id,
                 bundle_path=bundle_path,
                 verify_dir=verify_dir,
-                reused=reused,
+                reused=True,
             )
         except Exception as exc:
             # Compensate both sides; ports must be idempotent.
@@ -410,19 +382,6 @@ class PaperAutomationActivationService:
             self._last_error = str(exc)
             if isinstance(exc, (PaperAutomationActivationError, PaperMaterialsError)):
                 raise
-            # Errno 30 / EROFS: Compose used to mount artifacts :ro into trader.
-            # Hot-arm Activate must write the fixture bundle there — surface a
-            # actionable hint instead of a bare OSError.
-            err = getattr(exc, "errno", None)
-            if err in (30, getattr(__import__("errno"), "EROFS", 30)) or (
-                isinstance(exc, OSError) and "Read-only file system" in str(exc)
-            ):
-                raise PaperAutomationActivationError(
-                    "HOT_ARM_FAILED",
-                    f"{exc} — trader's artifacts volume must be writable "
-                    f"(remove :ro from the artifacts mount in docker-compose.yml "
-                    f"for the trader service, recreate the container, retry)",
-                ) from exc
             raise PaperAutomationActivationError("HOT_ARM_FAILED", str(exc)) from exc
 
     def _persist_after_hot_arm(
@@ -479,6 +438,22 @@ class PaperAutomationActivationService:
             "restart_required": False,
             "reused_existing_keys": reused,
         }
+
+    def _research_materials(self, automation: dict, strategy: dict) -> tuple[str, Path, Path]:
+        bundle_path = Path(automation["artifact_bundle_path"]).expanduser()
+        verify_dir = Path(automation["public_key_ring_path"]).expanduser()
+        try:
+            verified = verify_qualified_paper_bundle(
+                bundle_path=bundle_path,
+                public_key_ring_path=verify_dir,
+                expected_artifact_id=automation["expected_artifact_id"],
+                now=self._now(),
+                strategy=strategy,
+            )
+        except PaperMaterialsError as exc:
+            self._last_error = str(exc)
+            raise PaperAutomationActivationError("RESEARCH_EVIDENCE_INVALID", str(exc)) from exc
+        return verified.artifact_id, bundle_path, verify_dir
 
     def _deactivate_restart_required(self) -> dict:
         trader_data = _load_yaml_mapping(self._trader_yaml_path)
@@ -647,6 +622,16 @@ class PaperAutomationActivationService:
             raise PaperAutomationActivationError(
                 "AUTOMATION_ALREADY_BOUND",
                 f"paper automation is already bound to {self._memory_strategy!r}",
+            )
+        if not all(
+            isinstance(automation.get(key), str) and automation[key].strip()
+            for key in ("artifact_bundle_path", "public_key_ring_path", "expected_artifact_id")
+        ):
+            raise PaperAutomationActivationError(
+                "RESEARCH_EVIDENCE_REQUIRED",
+                "configure an existing research artifact_bundle_path, "
+                "public_key_ring_path and expected_artifact_id before activation; "
+                "activation does not generate research evidence",
             )
         return strategy
 

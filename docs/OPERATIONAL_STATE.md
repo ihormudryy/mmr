@@ -99,16 +99,30 @@ Code default for `data download` and US `data refresh` jobs is now **Alpaca**
 (free Basic plan, SIP, split-adjusted). Config templates are copied only on
 first run, so the live host config does **not** change by itself. Operator steps:
 
-1. Edit `~/.config/mmr/trader.yaml`: set `alpaca_api_key_id` /
-   `alpaca_api_secret_key` (or env `ALPACA_API_KEY_ID` / `ALPACA_API_SECRET_KEY`)
-   and `default_data_source: alpaca`.
-2. Edit `~/.config/mmr/data_refresh.yaml`: change US jobs to `source: alpaca`.
-   A US job without Alpaca keys fails loudly (no silent fallback).
-3. Optional: `./docker.sh -B before_alpaca`, then a one-time forced US refetch
-   (`force: true` on the job) so stored history is all one source.
-4. Until step 3, stored US history may be a TwelveData/Massive to Alpaca splice.
-   The adjustment basis is the same (splits only), but the data vendor
-   differs, so small differences at the seam are possible.
+1. Backup first: `./docker.sh -B before_alpaca`.
+2. Check the adjustment basis on the stored data. Inside the trader container
+   (`./docker.sh -e`) run
+   `mmr --json data query NVDA --bar-size "1 day" --days 900` (or run it against
+   the `-B` snapshot) and read the closes around 2024-06-07. About $120 means
+   split-adjusted. About $1,200 means not adjusted: **stop**, the Alpaca switch
+   would splice two price bases.
+3. Put the keys in the repo `.env`: `ALPACA_API_KEY_ID` and
+   `ALPACA_API_SECRET_KEY`. Docker compose passes them to the services.
+   `alpaca_api_key_id` / `alpaca_api_secret_key` in `~/.config/mmr/trader.yaml`
+   also work, because empty env values are ignored.
+4. Switch: set `default_data_source: alpaca` in `~/.config/mmr/trader.yaml` and
+   change US jobs to `source: alpaca` in `~/.config/mmr/data_refresh.yaml`.
+   A US job without Alpaca keys fails loudly (the job and the batch are marked
+   failed, no silent fallback).
+5. Optional: a one-time forced US refetch (`force: true` on the job) so stored
+   history is one source within each job's `days` window. Older stored bars stay
+   TwelveData/Massive.
+
+Until step 5, stored US history may be a TwelveData/Massive to Alpaca splice.
+The adjustment basis is documented as the same (TwelveData default
+`adjust=splits`, Massive `adjusted` = splits only). It has not yet been checked
+against stored data in the Docker volume: that is step 2. The vendor still
+differs, so small differences at the seam are possible.
 
 Alpaca returns only completed NYSE sessions (after 20:16 ET). TwelveData and
 Massive remain opt-in via `--source`. Known quirk, left as is: TwelveData

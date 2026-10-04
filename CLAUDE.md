@@ -150,6 +150,7 @@ mmr/
 │   │   ├── exceptions.py      # TraderException, TraderConnectionException
 │   │   ├── contract_sink.py
 │   │   └── dataclass_cache.py # Cache with reactive update notifications
+│   ├── data_providers/        # Provider registry + Alpaca/Massive/TwelveData history providers
 │   ├── data/
 │   │   ├── store.py           # Abstract DataStore/ObjectStore + DateRange
 │   │   ├── duckdb_store.py    # DuckDB implementations (DuckDBDataStore, DuckDBObjectStore)
@@ -359,6 +360,7 @@ history list --bar_size "1 day"  # Filter by bar size
 history massive --symbol AAPL --bar_size "1 day" --prev_days 30
 history massive --universe portfolio --bar_size "1 day" --prev_days 30
 history ib --symbol AAPL --universe portfolio --bar_size "1 min" --prev_days 5
+history alpaca --symbol AAPL --bar_size "1 day" --prev_days 30
 stream AAPL MSFT AMD         # Stream from Massive.com
 stream AAPL --trades         # Stream trades instead of aggs
 stream EURUSD GBPUSD --feed forex           # Forex 1-min aggs
@@ -521,7 +523,7 @@ User configs live in `~/.config/mmr/`. On first run, bundled defaults from `conf
 
 **`~/.config/mmr/pycron.yaml`**: Service definitions with cron scheduling, auto-restart, dependency ordering. Also hosts `data_refresh_us` / `data_refresh_asx` cron entries that drive the data-refresh loop (see below).
 
-**Alpaca keys** (`alpaca_api_key_id`, `alpaca_api_secret_key` in `trader.yaml`; env `ALPACA_API_KEY_ID` / `ALPACA_API_SECRET_KEY`). Env vars override flat YAML keys, same as Massive. Alpaca history: SIP feed, `adjustment=split` (matches TwelveData `splits` and Massive `adjusted`), 1-min back to 2016 incl. pre/post market, no seconds bars. Only completed NYSE sessions are returned (after 20:16 ET: post-market ends 20:00 plus the 15-min SIP delay). Free Basic plan with a paper account — no paid plan needed. Providers live in `trader/data_providers/` (`ProviderRegistry.from_config/get/default_source/sources_for`); `data_service.pull_history(source, …)` serves them (`pull_massive` / `pull_twelvedata` are aliases) and builds a fresh provider per download task. `mmr history alpaca --symbol/--universe` downloads via the data service. Live checks: `MMR_LIVE_TESTS=1` + keys, `pytest -m live`.
+**Alpaca keys** (`alpaca_api_key_id`, `alpaca_api_secret_key` in `trader.yaml`; env `ALPACA_API_KEY_ID` / `ALPACA_API_SECRET_KEY`). Non-empty env vars override flat YAML keys, same as Massive; empty env values (docker compose passes unset keys as `""`) are ignored for the four provider API keys. Alpaca history: SIP feed, `adjustment=split` (matches TwelveData `splits` and Massive `adjusted`), 1-min back to 2016 incl. pre/post market, no seconds bars. Only completed NYSE sessions are returned (after 20:16 ET: post-market ends 20:00 plus the 15-min SIP delay). Free Basic plan with a paper account — no paid plan needed. Providers live in `trader/data_providers/` (`ProviderRegistry.from_config/get/default_source/sources_for`); `data_service.pull_history(source, …)` serves them (`pull_massive` / `pull_twelvedata` are aliases) and builds a fresh provider per download task. `mmr history alpaca --symbol/--universe` downloads via the data service. Live checks: `MMR_LIVE_TESTS=1` + keys, `pytest -m live`.
 
 **Known quirk (left as is):** `TwelveDataHistoryWorker` returns nothing for intraday bars when start == end, so `data download --source twelvedata` can skip single-day gaps.
 

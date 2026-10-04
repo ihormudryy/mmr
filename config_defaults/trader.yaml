@@ -180,6 +180,10 @@ alpaca_api_secret_key: ''
 # would 403 on Basic/Starter keys that still work for quotes/history.
 default_data_source: alpaca
 
+# Optional per-capability override. Wins over default_data_source.
+# data_providers:
+#   history: alpaca
+
 # Equity-curve decimation at backtest-persist time. The full per-bar
 # series is ~9.9 MB per 1-min run (4,713 runs took ~47 GB pre-fix);
 # daily decimation drops this to ~17 KB with no statistical loss for

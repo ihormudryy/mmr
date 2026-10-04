@@ -15,9 +15,11 @@ ALPACA_LIMITER = RateLimiter(200, 60.0)
 
 
 class AlpacaClient:
-    """One requests.Session per client. data_service shares one client across its
-    download threads; requests.Session is used that way widely but is not formally
-    thread-safe, so keep per-call state out of this class."""
+    """One requests.Session per client, and one client per provider instance.
+
+    data_service builds a fresh provider (and so a fresh client) for each download
+    task. requests.Session is not formally thread-safe, so keep per-call state out
+    of this class."""
 
     def __init__(
         self,

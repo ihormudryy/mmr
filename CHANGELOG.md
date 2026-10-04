@@ -20,6 +20,7 @@ First tagged release. It captures the platform as it runs today.
 - **Backtesting**: next-bar-open fills (no look-ahead), parameter overrides and sweeps, YAML nightly sweep manifests, and statistical-confidence tests (PSR, t-test, bootstrap CI, skew/kurtosis, losing-streak Monte Carlo).
 - **Free data providers**: Alpaca is the default for US history, movers and news. Massive (Polygon.io), TwelveData and IB remain available with `--source`.
 - **Paper automation**: signed strategy bundles, release gates, fault drills and soak tooling.
+- **Prebuilt Docker image**: each release publishes `ghcr.io/ihormudryy/mmr` for `linux/amd64` and `linux/arm64`.
 - **LLM workflow**: every CLI command supports `--json`, compact portfolio snapshots and diffs, and Claude Code skills in `skills/`.
 
 ### Removed

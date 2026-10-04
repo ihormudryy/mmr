@@ -3695,6 +3695,14 @@ class MMR:
             return None, ASSET_LIST_UNAVAILABLE_NOTE
         return directory, INSTRUMENT_FILTER_OFF_NOTE
 
+    @staticmethod
+    def _keeps_stock_mover(snap, min_price: float, assets) -> bool:
+        """Same rule as `filter_stock_movers`, for a raw Massive snapshot."""
+        close = getattr(snap.day, 'close', None) if snap.day else None
+        if close is None or pd.isna(close) or close < min_price:
+            return False
+        return assets is None or not assets.is_derivative_unit(snap.ticker or '')
+
     def movers(
         self,
         market: str = 'stocks',
@@ -3810,6 +3818,10 @@ class MMR:
                 market_type=market, direction=direction,
             )
 
+            if market == 'stocks':
+                assets = self._movers_asset_directory()[0]
+                snaps = [snap for snap in snaps if self._keeps_stock_mover(snap, min_price, assets)]
+
             # Build base data from snapshots
             movers = []
             for snap in snaps[:num]:
@@ -3885,7 +3897,6 @@ class MMR:
 
                 for future in as_completed(futures):
                     ticker, data = future.result()
-                    fn = future._args[0] if hasattr(future, '_args') else ''
                     # Determine which map to update based on keys
                     if 'name' in data:
                         details_map[ticker] = data

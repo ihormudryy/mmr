@@ -114,3 +114,43 @@ def test_movers_detail_omits_volume_when_unknown():
 
 def test_movers_detail_shows_known_volume():
     assert 'vol 1,000' in _printed_movers_detail(_detail_row('AAPL', 1000.0))
+
+
+def _massive_snapshot(ticker, close):
+    from types import SimpleNamespace
+    day = SimpleNamespace(open=1.0, close=close, volume=1000)
+    return SimpleNamespace(ticker=ticker, day=day, todays_change=0.5, todays_change_percent=5.0)
+
+
+def _massive_detail_mmr(assets):
+    mmr = _mmr(_frame(), assets=assets)
+    client = MagicMock()
+    client.get_snapshot_direction.return_value = [
+        _massive_snapshot('PENNY', 0.5), _massive_snapshot('HPAIW', 3.0),
+        _massive_snapshot('NOPRICE', None), _massive_snapshot('AAPL', 300.0),
+    ]
+    client.get_ticker_details.side_effect = RuntimeError('no details')
+    client.list_financials_ratios.return_value = []
+    client.list_ticker_news.return_value = []
+    mmr._massive_rest_client = client
+    return mmr
+
+
+def test_massive_movers_detail_applies_the_stock_filter():
+    detail = _massive_detail_mmr(_Assets()).movers_detail('stocks', 'gainers', num=5, source='massive')
+    assert [row['ticker'] for row in detail] == ['AAPL']
+
+
+def test_massive_movers_detail_honours_min_price_and_keeps_units_without_alpaca():
+    detail = _massive_detail_mmr(None).movers_detail('stocks', 'gainers', num=5, source='massive', min_price=0)
+    assert [row['ticker'] for row in detail] == ['PENNY', 'HPAIW', 'AAPL']
+
+
+def test_massive_movers_detail_takes_num_after_filtering():
+    detail = _massive_detail_mmr(_Assets()).movers_detail('stocks', 'gainers', num=1, source='massive')
+    assert [row['ticker'] for row in detail] == ['AAPL']
+
+
+def test_massive_crypto_movers_detail_is_not_filtered():
+    detail = _massive_detail_mmr(_Assets()).movers_detail('crypto', 'gainers', num=5, source='massive')
+    assert len(detail) == 4

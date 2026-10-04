@@ -100,7 +100,7 @@ def test_symbol_mapping(raw, expected):
     assert to_alpaca_symbol(raw) == expected
 
 
-@pytest.mark.parametrize('raw', ['', '  ', 'AAPL;DROP', 'BRK  B', 'A/B'])
+@pytest.mark.parametrize('raw', ['', '  ', 'AAPL;DROP', 'BRK  B', 'A/B', 'ß', 'AAPLé'])
 def test_symbol_mapping_rejects_junk(raw):
     with pytest.raises(ValueError):
         to_alpaca_symbol(raw)

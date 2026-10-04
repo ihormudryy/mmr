@@ -49,6 +49,13 @@ def test_retry_returns_first_non_429_response():
     assert fake.sleeps == [1.0]
 
 
+def test_retry_caps_huge_retry_after_header():
+    responses = iter([FakeResponse(429, {'Retry-After': '86400'}), FakeResponse(200)])
+    fake = FakeClock()
+    call_with_retry(lambda: next(responses), provider='alpaca', sleep=fake.sleep)
+    assert fake.sleeps == [60.0]
+
+
 def test_retry_honours_retry_after_header():
     responses = iter([FakeResponse(429, {'Retry-After': '7'}), FakeResponse(200)])
     fake = FakeClock()

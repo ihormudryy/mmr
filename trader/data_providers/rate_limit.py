@@ -8,6 +8,7 @@ from typing import Callable
 from trader.data_providers.errors import ProviderRateLimited
 
 HTTP_TOO_MANY_REQUESTS = 429
+MAX_RETRY_AFTER_SECS = 60.0
 
 
 class RateLimiter:
@@ -49,5 +50,5 @@ def call_with_retry(send: Callable, *, provider: str, max_tries: int = 3,
 def _retry_delay(response, base_delay: float, attempt: int) -> float:
     retry_after = response.headers.get('Retry-After', '')
     if retry_after.isdigit():
-        return float(retry_after)
+        return min(float(retry_after), MAX_RETRY_AFTER_SECS)
     return base_delay * 2 ** (attempt - 1)

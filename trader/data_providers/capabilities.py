@@ -91,3 +91,14 @@ class NewsProvider(Protocol):
     def news(self, ticker: Optional[str], limit: int) -> list[dict]:
         """Newest first, at most `limit` make_news_item() dicts; ticker None means general news."""
         ...
+
+
+def sort_movers(frame: pd.DataFrame, direction: str) -> pd.DataFrame:
+    """Order a movers frame: MOVER_COLUMNS first, biggest move first for `direction`."""
+    for column in MOVER_COLUMNS:
+        if column not in frame.columns:
+            frame[column] = '' if column in ('ticker', 'name', 'provider', 'note') else float('nan')
+    extras = [c for c in frame.columns if c not in MOVER_COLUMNS]
+    frame = frame[list(MOVER_COLUMNS) + extras]
+    return frame.sort_values('change_pct', ascending=(direction == 'losers'), na_position='last') \
+                .reset_index(drop=True)

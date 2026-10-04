@@ -1097,10 +1097,9 @@ def build_parser() -> argparse.ArgumentParser:
                            help='Number of results (default: 20)')
     # Massive-first: TD /market_movers requires Pro+ and is not covered by
     # default_data_source (which is often twelvedata for cheap history/quotes).
-    movers_p.add_argument('--source', choices=['massive', 'twelvedata'],
-                          default='massive',
-                           help='Data source (default: massive). '
-                                'twelvedata needs a Pro+ plan for market movers.')
+    movers_p.add_argument('--source', choices=source_choices(Capability.MOVERS), default=None,
+                          help='Data source (default: data_providers.movers, else the builtin default). '
+                               'twelvedata needs a Pro+ plan for market movers.')
 
     # scan
     scan_p = sub.add_parser('scan', help='IB market scanner',
@@ -10428,13 +10427,21 @@ def _handle_movers(mmr: MMR, args: argparse.Namespace):
 
     direction = 'losers' if args.losers else 'gainers'
     market = args.market
-    source = getattr(args, 'source', 'massive')
+    source = getattr(args, 'source', None)
 
+    from trader.data_providers import ProviderError
+    try:
+        _print_movers(mmr, args, market, direction, source)
+    except ProviderError as ex:
+        print_status(str(ex), success=False)
+
+
+def _print_movers(mmr: MMR, args: argparse.Namespace, market: str, direction: str, source: Optional[str]):
     if not args.detail:
         df = mmr.movers(market=market, direction=direction, source=source)
         if args.num and len(df) > args.num:
             df = df.head(args.num)
-        title_suffix = ' — TwelveData' if source == 'twelvedata' else ''
+        title_suffix = f' — {source}' if source else ''
         print_df(df, title=f'{market.title()} Movers ({direction}){title_suffix}')
         return
 

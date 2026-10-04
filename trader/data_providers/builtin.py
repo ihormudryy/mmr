@@ -37,6 +37,18 @@ def _twelvedata_quotes(config: Mapping[str, Any]):
     return TwelveDataQuotes(TDClient(apikey=config['twelvedata_api_key']))
 
 
+def _massive_movers(config: Mapping[str, Any]):
+    from massive import RESTClient
+    from trader.data_providers.massive.movers import MassiveMovers
+    return MassiveMovers(RESTClient(api_key=config['massive_api_key']))
+
+
+def _twelvedata_movers(config: Mapping[str, Any]):
+    from twelvedata import TDClient
+    from trader.data_providers.twelvedata.movers import TwelveDataMovers
+    return TwelveDataMovers(TDClient(apikey=config['twelvedata_api_key']))
+
+
 def builtin_specs() -> list[ProviderSpec]:
     return [
         ProviderSpec('alpaca', (('alpaca_api_key_id', 'ALPACA_API_KEY_ID'),
@@ -44,16 +56,19 @@ def builtin_specs() -> list[ProviderSpec]:
                      {Capability.HISTORY: _alpaca_history,
                       Capability.QUOTES: _alpaca_quotes}),
         ProviderSpec('massive', (('massive_api_key', 'MASSIVE_API_KEY'),),
-                     {Capability.HISTORY: _massive_history}),
+                     {Capability.HISTORY: _massive_history,
+                      Capability.MOVERS: _massive_movers}),
         ProviderSpec('twelvedata', (('twelvedata_api_key', 'TWELVEDATA_API_KEY'),),
                      {Capability.HISTORY: _twelvedata_history,
-                      Capability.QUOTES: _twelvedata_quotes}),
+                      Capability.QUOTES: _twelvedata_quotes,
+                      Capability.MOVERS: _twelvedata_movers}),
     ]
 
 
 BUILTIN_DEFAULTS: dict[Capability, str] = {
     Capability.HISTORY: 'alpaca',
     Capability.QUOTES: 'alpaca',
+    Capability.MOVERS: 'massive',
 }
 
 # IB history is contract-based and async, so it keeps its own code path and is

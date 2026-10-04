@@ -3664,70 +3664,22 @@ class MMR:
         self,
         market: str = 'stocks',
         direction: str = 'gainers',
-        source: str = 'massive',
+        source: Optional[str] = None,
     ) -> pd.DataFrame:
-        """Get top movers.
+        """Top movers for `market` ('stocks', 'crypto', 'indices', ...) from a registry movers source.
 
-        Parameters
-        ----------
-        market : str
-            'stocks', 'crypto', 'indices', 'options', 'futures'. Forex has
-            its own command (see ``forex_movers``).
-        direction : str
-            'gainers' or 'losers'.
-        source : str
-            'massive' (default) or 'twelvedata'. TwelveData only provides
-            gainers/losers for a restricted set of markets (stocks).
+        `source=None` uses the movers default (`data_providers.movers`, else the builtin default);
+        movers never inherit `default_data_source`. Forex has its own command (see ``forex_movers``).
         """
-        if source == 'twelvedata':
-            payload = self._twelvedata_client.get_market_movers(
-                market=market, direction=direction,
-            ).as_json()
-            # TD returns a list of {symbol, name, exchange, last, high, low,
-            # volume, change, percent_change, ...}. Re-map to our schema so
-            # downstream callers don't have to branch.
-            entries = payload if isinstance(payload, list) else payload.get('values', [])
-            rows = []
-            for e in entries:
-                rows.append({
-                    'ticker': e.get('symbol', ''),
-                    'name': e.get('name', ''),
-                    'exchange': e.get('exchange', ''),
-                    'close': e.get('last'),
-                    'volume': e.get('volume'),
-                    'change': e.get('change'),
-                    'change_pct': e.get('percent_change'),
-                })
-            df = pd.DataFrame(rows)
-            if not df.empty and 'change_pct' in df.columns:
-                df = df.sort_values(
-                    'change_pct',
-                    ascending=(direction == 'losers'),
-                ).reset_index(drop=True)
-            return df
-
-        snaps = self._massive_client.get_snapshot_direction(
-            market_type=market, direction=direction,
-        )
-        rows = []
-        for snap in snaps:
-            row = {'ticker': snap.ticker or ''}
-            if snap.day:
-                row['close'] = getattr(snap.day, 'close', None)
-                row['volume'] = getattr(snap.day, 'volume', None)
-            if snap.todays_change is not None:
-                row['change'] = snap.todays_change
-            if snap.todays_change_percent is not None:
-                row['change_pct'] = snap.todays_change_percent
-            rows.append(row)
-        return pd.DataFrame(rows)
+        from trader.data_providers import Capability
+        return self._provider(Capability.MOVERS, source).movers(market, direction)
 
     def movers_detail(
         self,
         market: str = 'stocks',
         direction: str = 'gainers',
         num: int = 20,
-        source: str = 'massive',
+        source: Optional[str] = None,
     ) -> list[dict]:
         """Get movers enriched with company name, ratios, and (Massive only) news.
 
@@ -3743,6 +3695,9 @@ class MMR:
             in your plan's credit budget.
         """
         from concurrent.futures import ThreadPoolExecutor, as_completed
+        from trader.data_providers import Capability
+
+        source = source or self._provider_default(Capability.MOVERS)
 
         if source == 'twelvedata':
             df = self.movers(market=market, direction=direction, source='twelvedata')

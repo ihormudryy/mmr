@@ -21,6 +21,11 @@ def _alpaca_quotes(config: Mapping[str, Any]):
     return AlpacaQuotes(_alpaca_client(config))
 
 
+def _alpaca_news(config: Mapping[str, Any]):
+    from trader.data_providers.alpaca.news import AlpacaNews
+    return AlpacaNews(_alpaca_client(config))
+
+
 def _massive_history(config: Mapping[str, Any]):
     from trader.listeners.massive_history import MassiveHistoryWorker
     return MassiveHistoryWorker(massive_api_key=config['massive_api_key'])
@@ -68,7 +73,8 @@ def builtin_specs() -> list[ProviderSpec]:
         ProviderSpec('alpaca', (('alpaca_api_key_id', 'ALPACA_API_KEY_ID'),
                                 ('alpaca_api_secret_key', 'ALPACA_API_SECRET_KEY')),
                      {Capability.HISTORY: _alpaca_history,
-                      Capability.QUOTES: _alpaca_quotes}),
+                      Capability.QUOTES: _alpaca_quotes,
+                      Capability.NEWS: _alpaca_news}),
         ProviderSpec('massive', (('massive_api_key', 'MASSIVE_API_KEY'),),
                      {Capability.HISTORY: _massive_history,
                       Capability.MOVERS: _massive_movers}),

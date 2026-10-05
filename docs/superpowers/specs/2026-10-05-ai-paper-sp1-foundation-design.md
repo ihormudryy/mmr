@@ -200,6 +200,10 @@ protection loss do.
 - One-strategy automation SELL signals become a close command without a quantity.
   The size comes from the broker at reduce time. They no longer go through
   `build_bracket_plan`.
+- Time exits and one-strategy SELL closes use the reduction admission rules of
+  section 5.4, not `session_risk`. So a close still works after a daily-loss or
+  drawdown breach. This removes today's SELL-after-breach refusal on the old
+  path on purpose: blocking an exit does not reduce risk.
 - `ai_paper` `CLOSE` and `PARTIAL_CLOSE` decisions (section 5.4).
 
 The state machine already handles both sides (`reduce_position` derives the side
@@ -297,6 +301,7 @@ Every view says "paper". Nothing on it is proof of live edge.
 | `trader` | — | yes (hot-arm and reload, which the trader already sends: `trader/automation/paper_hot_arm.py:170`, `trader/trading/command_stack.py:175`) |
 | `scheduler` | yes | — |
 | `ai_supervisor`, `ai_research` | yes | no |
+| `telegram_bridge` (SP2) | yes (reads, pause/resume/flatten) | no |
 
 **Forwarding.** When the trader calls the strategy service for a user command,
 it signs as `trader`. The strategy ACL authorizes `trader`, not the original
@@ -329,8 +334,9 @@ grants rights.
 
 - Private: `~/.config/mmr/keys/rpc/<principal>.key`, mode `0600`. Public:
   `~/.config/mmr/keys/rpc/<principal>.pub`. Both created by `mmr keys init`.
-- Each container mounts its own private key and the public keys in its row of
-  the trust matrix. No container mounts another principal's private key, the
+- Each container mounts its own private key, the public keys of the callers it
+  accepts as a server, and the public keys of the servers it calls (to verify
+  their responses). No container mounts another principal's private key, the
   trader included.
 - Covers trader ports 42101–42103 and strategy ports 42104/42105.
 - Before the cutover, a split-service test runs real round trips over every
@@ -385,8 +391,8 @@ grants rights.
   be: dispatch uses the tighter of the approved and the current ceiling. An
   order above it is refused (`LIMIT_TIGHTENED_BEFORE_DISPATCH`).
 - This is a safety bug on the old path too. A failing test proves it first;
-  then it is fixed on both paths. This is the one deliberate exception to old-path
-  parity, and it can only make the old path stricter.
+  then it is fixed on both paths. This is the one deliberate exception to the
+  old-path risk-limit parity, and it can only make the old path stricter.
 - The 15% `STEADY_MAX_GROSS_FRACTION` cap stays in `AllocationPolicy`. It is the
   same constant as the ceiling's code maximum, not a second value.
 
@@ -667,6 +673,10 @@ also pass one real IB paper session.
   flatten.
 - It uses the real methods and the real keys. It never seeds the database and
   never skips the seal.
+- It runs on the host, as the operator, and reads the `ai_research` and
+  `ai_supervisor` private keys from `~/.config/mmr/keys/rpc/`, where
+  `mmr keys init` wrote them. No container gets those keys for it.
+- It refuses to run unless the account is paper and an experiment is `ARMED`.
 - It is not an autonomous loop. Orchestration stays in SP2.
 
 ## 7. SP1 delivery order

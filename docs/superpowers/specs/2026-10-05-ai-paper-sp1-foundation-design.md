@@ -1,7 +1,7 @@
 # AI Paper Bot — SP1 Foundation — Design Specification
 
 **Date:** 2026-10-05
-**Status:** Approved by the owner on 2026-10-05 after six review rounds. Implementation not started. Line numbers refer to this branch before the master rebase.
+**Status:** Approved by the owner on 2026-10-05 after six review rounds. Implementation not started. Rebased on master (`ad8716d8`); line numbers match that base.
 **Replaces:** the executing path of `2026-10-04-autonomous-ai-trading-module-design.md`.
 That spec and its review (`docs/reviews/2026-10-04-autonomous-ai-trading-module-review.md`)
 stay as background. Where they disagree with this document, this document wins.
@@ -405,7 +405,7 @@ grants rights.
     3% from the high-water mark;
   - 3 pending entry orders (new field, see below).
 - **Pending entry orders.** Today `session_risk` counts only filled positions
-  (`trader/automation/session_risk.py:279`), so unfilled entries on new conids
+  (`trader/automation/session_risk.py:280`), so unfilled entries on new conids
   are not bounded on this path. The `ai_paper` approval factory enforces it on
   `ENTER`: working non-protective orders in the fenced broker snapshot, plus
   this entry, must not exceed `max_pending_entry_orders`, and positions plus
@@ -542,7 +542,7 @@ It also holds style, decider verdict and the evidence reference.
   - **not** required: the entry window, the entry budget, daily-loss and
     drawdown checks, the current policy revision, or a matching deployment;
   - `session_risk` is not run for reductions (today it rejects a SELL after a
-    daily-loss or drawdown breach, `trader/automation/session_risk.py:226-244`);
+    daily-loss or drawdown breach, `trader/automation/session_risk.py:227-245`);
   - while `KILLED`, a reduction does not create work. It joins the kill flatten
     and returns that root id;
   - `STOPPED` refuses everything.

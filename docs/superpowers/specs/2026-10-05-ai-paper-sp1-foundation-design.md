@@ -1,7 +1,7 @@
 # AI Paper Bot — SP1 Foundation — Design Specification
 
 **Date:** 2026-10-05
-**Status:** Draft in review (revised twice on 2026-10-05 after review). Not approved. Implementation not started.
+**Status:** Draft in review (revised three times on 2026-10-05 after review). Not approved. Implementation not started. Line numbers refer to this branch before the master rebase.
 **Replaces:** the executing path of `2026-10-04-autonomous-ai-trading-module-design.md`.
 That spec and its review (`docs/reviews/2026-10-04-autonomous-ai-trading-module-review.md`)
 stay as background. Where they disagree with this document, this document wins.
@@ -93,33 +93,106 @@ results are read correctly.
   wired at `trader/trading/command_stack.py:902`) call `reduce` directly without
   cancelling the protective stop. After the close, the stop can fire and open a
   short. This was found by reading code; a failing test must confirm it first.
+- A close cannot simply cancel the stop today. `ProtectiveOrderSaga` treats a
+  bare stop cancel as lost protection (`stop_rejected`, then `SAFETY_FAILED` /
+  `MISSING_PROTECTION`) and starts an account-wide liquidation
+  (`trader/automation/protective_order_saga.py:676-722, 751-759`).
+- `LiquidationService._set` trips the breaker on every state except `FLAT`,
+  including healthy progress (`trader/trading/liquidation_service.py:155-156`).
+- Runs are keyed by cause command id, so two producers can reduce the same
+  position. `rescan()` returns after the first non-`FLAT` root, and
+  `FAILED_SAFE` counts as one, so an old failed run stops later runs from
+  advancing (`liquidation_service.py:21, 138-143, 179`).
 
 **Design.** Extend `LiquidationService` (`trader/trading/liquidation_service.py`)
 with a scope instead of adding a second close path.
 
-- `scope=account`: today's behaviour. Used by the session flatten, `/flatten`
-  and the kill line.
+- `scope=account`: today's behaviour. Used by the session flatten, `/flatten`,
+  protective failure and the kill line. Its breaker behaviour does not change.
 - `scope=conid`, full close:
   `REQUESTED → CANCELLING → VERIFYING → REDUCING → VERIFYING → CLOSED`.
   It cancels only that conid's working orders, waits for a newer broker
   generation that shows them gone, sends a reduce of the broker quantity, and
-  waits for a generation that shows a zero position.
+  waits for a generation that shows a zero position and no residual exits.
 - `scope=conid, quantity=q`, partial close: the same, then
   `REPROTECTING → VERIFYING → DONE`.
   - `q` is rounded to whole shares and must satisfy `0 < q < |position|`. If
     less than one share would remain, it becomes a full close.
   - A new `reduce_partial` in `trading_runtime` checks the side and the bound.
     `reduce_position` keeps its exact-size rule.
-  - After the reduce, the stop (and target, if one existed) is placed again for
-    the **remaining broker quantity**. The price is the original stop price, or
-    a new one from the decision, which must be on the protective side of the
-    current price.
-  - Re-protect orders use deterministic child ids. On recovery the service looks
-    for that order ref at the broker before it places anything.
+  - Re-protection uses the exit-only linked operation below.
   - If re-protect fails or misses its deadline: no retry with fresh ids. Escalate
     to a full close of that conid and trip the breaker.
 - All scopes keep the existing rules: never send another order without a newer
   broker generation, and a missed deadline means `FAILED_SAFE` plus the breaker.
+
+**Protection ownership.**
+
+- Before a scoped close cancels anything, it takes over protection from the
+  entry saga **durably, in one journal transaction**: the saga row moves to a new
+  state `CLOSE_OWNED` with the close root id and the order refs the close will
+  cancel.
+- A cancel event for one of those refs, on a `CLOSE_OWNED` saga, is expected. It
+  does not set `stop_rejected` and does not start a liquidation.
+- Any other loss of protection still is an incident, exactly as today: a cancel
+  or reject that the close did not request, a cancel on a saga that was not
+  handed over, or a leg vanishing outside a close.
+- After a partial close reaches `DONE`, ownership goes back to the saga for the
+  remaining quantity, with the new exit refs. The saga watches them the same way
+  as the original legs.
+- After a full close reaches `CLOSED`, the saga row is closed.
+
+**Breaker signals.** Routine progress of a scoped close (`REQUESTED`,
+`CANCELLING`, `REDUCING`, `VERIFYING`, `REPROTECTING`) never trips the breaker.
+Only `FAILED_SAFE`, a missed deadline, a re-protect failure and unexpected
+protection loss do.
+
+**One execution owner per position.**
+
+- A durable `exit_owner` table holds at most one owner per `(account, conid)` and
+  at most one account-wide owner per account: owner kind (`scoped_close`,
+  `account_flatten`), root command id, and state.
+- Every exit producer claims there first: time exits, one-strategy SELL, `ai_paper`
+  `CLOSE` / `PARTIAL_CLOSE`, protective failure, session flatten, `/flatten`, kill.
+- A scoped request for a conid that already has an owner does not create work. It
+  returns the existing root id (`JOINED`). A partial request against an existing
+  owner is refused (`EXIT_IN_PROGRESS`).
+- An account flatten takes over every scoped owner on that account:
+  1. it marks them `SUPERSEDED` in the same transaction as its claim;
+  2. superseded closes stop at once and never re-protect;
+  3. it waits for a broker generation that shows every child they submitted
+     (found by their deterministic order refs) as filled, cancelled or absent;
+  4. only then does it cancel and reduce.
+- While an account owner is active, every scoped request joins it.
+- Callers poll the **exact root id** they got back. A receipt of another root is
+  never accepted as their result.
+- `rescan()` advances every root that is not terminal. `FLAT`, `CLOSED`, `DONE`,
+  `SUPERSEDED` and `FAILED_SAFE` are terminal for rescan. `FAILED_SAFE` stays
+  latched for the breaker but no longer blocks other roots.
+
+**Exit-only linked stop and target.**
+
+- New `place_exit_oca` in `trading_runtime`. It places a stop and an optional
+  target for an existing position, both transmitted, in one OCA group. It never
+  creates an entry parent (unlike the bracket API) and never uses
+  `place_standalone_order` (which does not link orders).
+- Quantity is the remaining broker quantity. Side is derived from the broker
+  position. The stop price is the original stop or a new one from the decision,
+  which must be on the protective side of the current price.
+- Deterministic refs: `{root}-reprotect-stop`, `{root}-reprotect-target`, OCA
+  group `{root}-reprotect`.
+- A partial fill of one sibling must reduce the other to the remaining position.
+  The plan picks the IB OCA type and proves it with the fake broker and in the
+  real paper session.
+- Recovery, before placing anything, reads the broker by those refs:
+  - position zero: cancel any residual sibling; the close ends `CLOSED` (closed
+    by an exit), not `DONE`;
+  - one sibling present, the other missing: place only the missing one, in the
+    same group, for the remaining quantity;
+  - both present and working: no order; go to `VERIFYING`.
+- `DONE` means a broker generation shows the stop (and target, if any) working in
+  one group for the remaining quantity. `CLOSED` means zero position and no
+  residual exits. Nothing else counts.
 
 **Users of the safe close.**
 
@@ -152,9 +225,28 @@ The scoreboard is the only honest referee once the AI judges its own backtests.
 - `simulated_books`: a slot for simulated results, such as the "follow the signal"
   baseline. SP1 creates the table and the display. SP2 fills it. Every row is
   labelled `simulated`.
+- `benchmark_prices`: the exact SPY daily closes the scoreboard used, with
+  provider, bar date, fetch time and a benchmark version. Later data refreshes
+  never change a stored row; a correction is a new version.
+- `ai_costs`: one row per model call (SP2 fills it; SP1 creates it): call id,
+  provider, model, tokens, cost in USD, time, and the decision or job it served.
+- `equity_adjustments`: a commission or fill that arrives after its session's
+  `equity_daily` row was written. The old row is never edited.
+- Attribution comes from stored links, not from text: broker fill → order ref →
+  command → `ai_paper` decision → deployment record and policy revision.
 
-**Benchmarks.** SPY buy-and-hold from the experiment start (local daily bars),
-the simulated baseline book, and AI cost in USD with a "P&L minus AI cost" line.
+**Currency.**
+
+- The reporting currency is USD. AI costs and US commissions are USD.
+- Net liquidation is stored in the account base currency **and** in USD. Each
+  `equity_daily` row keeps the FX rate used, its source (IB account values) and
+  its time. If the base currency is USD, the rate is 1 and says so.
+- A row with no FX evidence for a non-USD base is not written as USD. It is an
+  incident.
+
+**Benchmarks.** SPY buy-and-hold from the experiment start (from
+`benchmark_prices`), the simulated baseline book, and AI cost in USD with a
+"P&L minus AI cost" line.
 
 **Metrics.** Return vs SPY, max drawdown, daily Sharpe (with a small-sample
 warning below 60 sessions), cash profit factor, win rate, turnover and fees.
@@ -163,8 +255,10 @@ Each can be split by strategy, decider and style.
 **Integrity.**
 
 - AI principals get read-only scoreboard methods (section 5.3).
-- `mmr scoreboard verify` rebuilds every number from `broker_fills` and
-  `equity_daily`. A mismatch is an incident.
+- `mmr scoreboard verify` rebuilds every number from its stored inputs:
+  `broker_fills`, `equity_daily` (with FX), `equity_adjustments`,
+  `benchmark_prices`, `ai_costs`, decisions, deployment records and policy
+  revisions. A mismatch is an incident.
 - No AI service mounts the trader database.
 
 **Output.**
@@ -180,12 +274,34 @@ Every view says "paper". Nothing on it is proof of live edge.
 
 ### 5.3 Service identities
 
-**Authentication.**
+**Authentication.** Asymmetric signatures (Ed25519, already used in
+`trader/research/signing.py`), not shared HMAC keys.
 
-- `TypedRpcRequest` gets a signed `principal` field, included in the signing bytes.
-- The server holds a keyring `{principal: key}`. It selects the key by
-  principal, verifies the signature and treats that principal as the caller.
-  Responses are signed with the same key.
+- Each principal has one private key. Only its own container mounts it.
+- Every server mounts the **public** keys of the principals it accepts. A public
+  key cannot sign, so mounting it gives no power.
+- `TypedRpcRequest` gets a `principal` field, included in the signed bytes. The
+  server selects the public key by principal, verifies the signature and the
+  existing timestamp and nonce rules, and treats that principal as the caller.
+- Each server also has its own private key (`trader`, `strategy`) and signs its
+  responses with it. Clients verify responses with the server's public key.
+- This works for both servers. The strategy service verifies `cli` and
+  `dashboard` with their public keys, and the trader with the `trader` public key.
+
+**Trust matrix** (caller → server). Anything not listed is refused.
+
+| Caller | Trader 42101–42103 | Strategy 42104/42105 |
+|---|---|---|
+| `cli`, `dashboard` | yes | yes |
+| `strategy` | yes (intent, resolve, publish, feed) | — |
+| `trader` | — | yes (hot-arm and reload, which the trader already sends: `trader/automation/paper_hot_arm.py:170`, `trader/trading/command_stack.py:175`) |
+| `scheduler` | yes | — |
+| `ai_supervisor`, `ai_research` | yes | no |
+
+**Forwarding.** When the trader calls the strategy service for a user command,
+it signs as `trader`. The strategy ACL authorizes `trader`, not the original
+user. The original principal is sent as `on_behalf_of` for the log only. It never
+grants rights.
 - Handlers receive the authenticated caller. The hard-coded
   `source="strategy_service"` (`trader/messaging/production_api.py:1124`) is
   replaced by it.
@@ -200,20 +316,26 @@ Every view says "paper". Nothing on it is proof of live edge.
 
 | Principal | Rights (summary) |
 |---|---|
+| `trader` | Strategy-service methods it forwards today (hot-arm, reload). |
 | `strategy` | `execute_automated_intent` (old path), resolve, publish. |
 | `dashboard`, `cli` | Reads, propose/approve/reject, cancel, pause, experiment start/resume/stop. |
 | `scheduler` | Data refresh. |
 | `ai_supervisor` | Reads, scoreboard read, `publish_ai_risk_policy`, `submit_ai_paper_decision`, pause. |
-| `ai_research` | Research jobs, market-data reads, `register_ai_deployment` (SP2). No trading methods. |
+| `ai_research` | Research jobs, market-data reads, `register_ai_deployment`. No trading methods. |
 | `telegram_bridge` (SP2) | Reads, pause/resume/flatten with confirmation. |
 | `ai_sandbox` (SP3) | None. No key. Pipes only. |
 
 **Keys.**
 
-- `~/.config/mmr/keys/rpc/<principal>.key`, mode `0600`, created by
-  `mmr keys init`.
-- Each container mounts only its own key. The trader mounts all of them.
+- Private: `~/.config/mmr/keys/rpc/<principal>.key`, mode `0600`. Public:
+  `~/.config/mmr/keys/rpc/<principal>.pub`. Both created by `mmr keys init`.
+- Each container mounts its own private key and the public keys in its row of
+  the trust matrix. No container mounts another principal's private key, the
+  trader included.
 - Covers trader ports 42101–42103 and strategy ports 42104/42105.
+- Before the cutover, a split-service test runs real round trips over every
+  edge of the trust matrix: CLI → trader, CLI → strategy, dashboard → both,
+  strategy → trader, trader → strategy, and `ai_supervisor` → trader.
 - Hard cutover: after `mmr keys init` and `./docker.sh -b -u`, the old
   `service_hmac.key` is refused. No dual-key mode.
 
@@ -247,6 +369,26 @@ Every view says "paper". Nothing on it is proof of live edge.
 - The old path passes `PAPER_LIMITS`. Its decisions do not change. The parity
   test calls `evaluate` (not a field comparison) on the old path and checks
   that gross still stops at 6%.
+- **Attested notional.** Master added `ORDER_EXCEEDS_ATTESTED_NOTIONAL` to
+  `session_risk` (commit `27c9ab96`). This branch is rebased on master before
+  the plan is written. The old path keeps the check, and the parity test covers
+  it. In `ai_paper` the deployment record carries `evidence_order_notional` (the
+  notional its evidence priced, required). An entry above it, beyond the same
+  `LIVE_NOTIONAL_TOLERANCE`, is refused with the same code.
+
+**Effective limits at dispatch.**
+
+- The current effective limits are checked again at the final dispatch check
+  (`AllocationPolicy` revalidation and `DispatchGuard`), not only at admission.
+- Today the dispatch re-check replaces a tighter current ceiling with the larger
+  approved one (`trader/promotion/allocation_policy.py:321-325`). The rule must
+  be: dispatch uses the tighter of the approved and the current ceiling. An
+  order above it is refused (`LIMIT_TIGHTENED_BEFORE_DISPATCH`).
+- This is a safety bug on the old path too. A failing test proves it first;
+  then it is fixed on both paths. This is the one deliberate exception to old-path
+  parity, and it can only make the old path stricter.
+- The 15% `STEADY_MAX_GROSS_FRACTION` cap stays in `AllocationPolicy`. It is the
+  same constant as the ceiling's code maximum, not a second value.
 
 **Owner ceiling.**
 
@@ -287,26 +429,42 @@ Every view says "paper". Nothing on it is proof of live edge.
   position ≤ gross; positions ≥ 1; daily loss and drawdown < 1.0.
 - A policy with any value above the owner ceiling is **refused**
   (`POLICY_ABOVE_CEILING`), not clamped. The AI sees exactly what is in force.
-- The effective limit is the tighter of policy and ceiling, field by field.
-- Timing rules:
-  - Tightening applies at once.
-  - Loosening applies from the next session only.
-  - The session daily-loss budget is frozen at the first entry of the session.
-  - A breach stays a breach, even if a later policy is looser.
+- Every accepted policy is a **published** revision (append-only).
+
+**Policy timing.**
+
+- The **effective** limits are what admission and dispatch use. They are
+  computed per field and stored as their own revision, with the published
+  revision they came from.
+- A newly published revision is split per field:
+  - a field tighter than the current effective value applies at once;
+  - a field looser than it is **queued** until the next session start;
+  - a mixed revision does both: its tighter fields now, its looser fields at the
+    next session.
+- At each session start the effective limits become the latest published
+  revision, capped by the owner ceiling. A restart is not a session start.
+- **Daily loss.** At session start the equity anchor (start net liquidation) is
+  frozen. The budget is `anchor × effective daily-loss fraction`. A tighter
+  fraction lowers it mid-session; a looser one waits for the next session. The
+  old path keeps today's formula; the anchor is passed only by `ai_paper`.
+- **Breach latch.** A daily-loss or drawdown breach sets a durable latch for the
+  rest of the session. No later revision clears it. It survives a restart.
 - No accepted policy means no new entries.
 
 **AI deployment record.** This stands in for the binding fields of the signed
 artifact in `ai_paper`: strategy file digest, class, params, conids, bar size.
 It also holds style, decider verdict and the evidence reference.
 
-- It is created by `register_ai_deployment` (`ai_research` in SP2, the sandbox
-  pipeline in SP3), never by `ai_supervisor`.
+- It is created by `register_ai_deployment` (`ai_research`), never by
+  `ai_supervisor`. SP1 builds the method, the store and the seal. SP2 and SP3
+  call it.
 - It is sealed (content digest, immutable) before any decision may reference it.
   A decision names it by digest and must match it, the same way bundle binding
   works today.
 - It is an experiment record, not `paper-v1` eligibility. It can never arm the
   old path.
-- SP1 defines the record, the seal and the check. SP2 and SP3 create records.
+- In SP1 the acceptance harness (section 6) registers a catalogue strategy
+  through the same method. The database is never seeded directly.
 
 **Command `submit_ai_paper_decision`.**
 
@@ -314,13 +472,26 @@ It also holds style, decider verdict and the evidence reference.
   (`ENTER`, `CLOSE`, `PARTIAL_CLOSE`), `conid`, `side`, `stop_price`,
   `target_price`, `quantity` (optional), `policy_revision`, `evidence_digest`,
   `expires_at`.
-- The handler checks only what is new:
+- **Entry admission** (`ENTER`). The handler checks only what is new:
   - the caller is `ai_supervisor` (its own key, section 5.3);
   - the mode is `ai_paper`, the experiment is `ARMED`;
-  - `policy_revision` is the current accepted revision;
+  - `policy_revision` is the latest published revision;
   - the deployment is sealed and matches; the decision has not expired;
   - the side is in an enabled style (V1: long only).
-- It then **translates the decision into a command for the existing
+- **Reduction admission** (`CLOSE`, `PARTIAL_CLOSE`). Separate rules, because a
+  close must work when entries are blocked:
+  - kept: the caller is `ai_supervisor`; the account fence; a broker-proven
+    position on that conid and side; the quantity bound; the exit owner check
+    (section 5.1); expiry;
+  - allowed while the experiment is `ARMED` or `PAUSED`;
+  - **not** required: the entry window, the entry budget, daily-loss and
+    drawdown checks, the current policy revision, or a matching deployment;
+  - `session_risk` is not run for reductions (today it rejects a SELL after a
+    daily-loss or drawdown breach, `trader/automation/session_risk.py:226-244`);
+  - while `KILLED`, a reduction does not create work. It joins the kill flatten
+    and returns that root id;
+  - `STOPPED` refuses everything.
+- An `ENTER` is then **translated into a command for the existing
   coordinator**. It does not keep its own admission list. The coordinator runs
   every check that already refuses an order: account fence, trading filter
   allowlist, long-only, liquidity, quote freshness, margin, calendar entry
@@ -413,14 +584,33 @@ ai_paper:
 
 Test-first for every part. Each change starts with a failing test.
 
-- **Safe close:** a test that reproduces "time exit leaves the stop live";
-  state-machine tests with fake broker generations (lost acknowledgement,
-  partial fill, cancel rejected, re-protect failure, missed deadline); a
-  production-composition test through `command_stack`.
+- **Safe close:**
+  - a test that reproduces "time exit leaves the stop live";
+  - state-machine tests with fake broker generations (lost acknowledgement,
+    partial fill, cancel rejected, re-protect failure, missed deadline);
+  - partially close one of two protected positions: the other position and its
+    orders stay untouched and the breaker stays clear;
+  - a stop cancel the close did not request still starts the emergency path;
+  - routine scoped-close progress does not trip the breaker;
+  - a time exit and an AI close on the same conid: one root, the second joins;
+  - an account flatten during a partial close: the close is superseded, does
+    not re-protect, its children are reconciled before the flatten orders;
+  - an old `FAILED_SAFE` root does not stop `rescan()` from advancing a newer one;
+  - a caller polling its root never accepts another root's receipt;
+  - exit OCA: one sibling fills before the other is acknowledged; recovery
+    places only the missing sibling; position zero cancels the residual exit;
+    `DONE` only with both siblings working for the remaining quantity;
+  - a production-composition test through `command_stack`.
 - **Scoreboard:** projection rebuilt from fills matches stored rows; partial
-  exits stay in one round trip; `verify` detects an edited row; the outbox sends
-  once per event id and retries after an outage.
-- **Identities:** wrong key rejected; principal outside the allow-list denied;
+  exits stay in one round trip; `verify` detects an edited row in any input
+  table; a late commission becomes an adjustment, not an edit; a non-USD base
+  without FX evidence is an incident; a data refresh does not change a stored
+  benchmark price; the outbox sends once per event id and retries after an
+  outage.
+- **Identities:** split-service round trips over every trust-matrix edge,
+  including CLI → strategy and trader → strategy; a forwarded call is authorized
+  as `trader`, never as `on_behalf_of`; no container image mounts another
+  principal's private key; wrong key rejected; principal outside the allow-list denied;
   method without an entry denied for all; source derived from the key, never
   from the body; a table test that AI principals cannot call `approve_proposal`,
   `execute_automated_intent`, `place_standalone_order` or set limits.
@@ -434,8 +624,18 @@ Test-first for every part. Each change starts with a failing test.
   - drawdown guard (with a test-only raised code maximum): drawdown ceiling above
     `PAPER_LIMITS.drawdown` fails load with the kill line off or looser than the
     ceiling, and loads with a tighter kill line;
-  - policy timing rules (mid-session loosening refused, breach persists, a
-    restart does not apply a queued loosening);
+  - policy timing: a looser field is queued (not applied, not refused) until
+    the next session; a mixed revision applies its tighter fields at once and
+    its looser fields at the next session; a tighter daily-loss fraction lowers
+    the budget mid-session on the frozen anchor; the breach latch survives a
+    looser revision and a restart; a restart does not apply a queued loosening;
+  - approval → policy tightening → dispatch: the stale approval cannot execute
+    above the new limit (`LIMIT_TIGHTENED_BEFORE_DISPATCH`), on both paths;
+  - attested notional: the old path still refuses `ORDER_EXCEEDS_ATTESTED_NOTIONAL`;
+    `ai_paper` refuses an entry above `evidence_order_notional`;
+  - reductions: `CLOSE` works while `PAUSED` and after a daily-loss breach;
+    is refused without a broker position; joins the flatten while `KILLED`;
+    is refused after `STOPPED`;
   - idempotent decisions; a **new** `decision_id` cannot retry a conid whose
     command or close is `OUTCOME_UNKNOWN`;
   - coordinator checks reached from a decision (account fence, allowlist,
@@ -456,18 +656,30 @@ Test-first for every part. Each change starts with a failing test.
   line survives a restart; both kill bases; AI principals cannot resume.
 
 A green suite is not a paper-session result. Before SP2 starts trading, SP1 must
-also pass one real IB paper session with a manual `submit_ai_paper_decision`
-entry, a partial close, a full close and the session flatten.
+also pass one real IB paper session.
+
+**Acceptance harness** (`mmr experiment acceptance`, run by the operator):
+
+- It registers a catalogue strategy with `register_ai_deployment`, signed with
+  the `ai_research` key, and the seal is applied as in production.
+- It publishes a policy and submits decisions with the `ai_supervisor` key:
+  one entry, a partial close, a full close; then it waits for the session
+  flatten.
+- It uses the real methods and the real keys. It never seeds the database and
+  never skips the seal.
+- It is not an autonomous loop. Orchestration stays in SP2.
 
 ## 7. SP1 delivery order
 
-1. Safe close (fixes a live bug in the existing path).
+0. Rebase on master (attested-notional check, commit `27c9ab96`).
+1. Safe close: protection ownership, exit owner, exit-only OCA (fixes a live bug
+   in the existing path).
 2. Service identities (needed before any new principal exists).
-3. `RiskLimits` as data, AI risk policy store, deployment record,
-   `submit_ai_paper_decision`.
+3. `RiskLimits` as data, dispatch re-check fix, AI risk policy store and timing,
+   deployment registration and seal, `submit_ai_paper_decision`.
 4. Experiments, arming and kill line.
 5. Scoreboard, `/cc` tab and the Telegram daily summary.
-6. Real IB paper session (section 6).
+6. Acceptance harness and the real IB paper session (section 6).
 
 ## 8. Roadmap after SP1 (not designed here)
 

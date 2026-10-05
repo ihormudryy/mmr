@@ -237,7 +237,7 @@ function proposalTarget() {
 
     const html = h.elements.get('research-results').innerHTML
       + h.elements.get('research-detail').innerHTML;
-    assert.doesNotMatch(html, /<script>|<img|<svg|<b>|<i>|<time>/);
+    assert.doesNotMatch(html, /<script>|<img|<svg|<b>|<i>|<time>/i);
     assert.match(html, /&lt;script&gt;/);
     assert.match(html, /&lt;img/);
     assert.match(html, /&lt;svg/);

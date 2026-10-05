@@ -158,7 +158,7 @@ def create_read_router(cc, templates, manage_context_provider=None,
             logger.debug("market session unavailable: %s", exc)
             view["market_session"] = {
                 "calendar": "XNAS", "exchange": "NASDAQ",
-                "open": None, "error": str(exc),
+                "open": None, "error": type(exc).__name__,
             }
         view["health"] = cc.bridge.health() if cc.bridge else {
             "lifecycle": "starting", "reconnects": 0, "cursor": None, "sources": {}}
@@ -178,7 +178,7 @@ def create_read_router(cc, templates, manage_context_provider=None,
             logger.warning("strategy params editor failed for %s: %s",
                            strategy_name, exc)
             return JSONResponse(
-                {"detail": f"{type(exc).__name__}: {exc}"}, status_code=502)
+                {"detail": type(exc).__name__}, status_code=502)
         if payload is None:
             return JSONResponse({"detail": "strategy not found"}, status_code=404)
         return JSONResponse(payload)

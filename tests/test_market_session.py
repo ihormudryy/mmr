@@ -49,4 +49,5 @@ def test_market_session_open_none_on_calendar_error():
         )
     assert payload["open"] is None
     assert payload["next_open"] is None
-    assert "RuntimeError" in payload["error"]
+    assert payload["error"] == "RuntimeError"
+    assert "no calendars" not in payload["error"]

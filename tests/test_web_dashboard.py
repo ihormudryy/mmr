@@ -1018,3 +1018,23 @@ class TestEntrypointWorkerGuard:
         webapp.main()
         assert len(calls) == 1
         assert calls[0][1]["workers"] == 1
+
+
+def test_flash_redirect_cannot_leave_the_site():
+    response = webapp._local_redirect(
+        '/cc?flash=',
+        'https://evil.example/phish?x=1#frag',
+        '#deploy',
+    )
+    location = response.headers['location']
+    assert location.startswith('/cc?flash=')
+    assert location.endswith('#deploy')
+    assert '://' not in location
+    assert 'evil.example' not in location.split('?', 1)[0]
+
+
+def test_public_error_omits_exception_message():
+    err = RuntimeError('secret path /tmp/key')
+    assert webapp._public_error(err) == 'RuntimeError'
+    remote = type('Remote', (Exception,), {'code': 'NOT_FOUND'})('raw detail')
+    assert webapp._public_error(remote) == 'NOT_FOUND'

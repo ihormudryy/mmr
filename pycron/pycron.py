@@ -440,7 +440,9 @@ class MainHandler(RequestHandler):
         restart_argument = self.get_query_arguments('restart')[0]
         job = self.job_scheduler.get_job(restart_argument)
         if job:
-            self.write(json.dumps({'result': '{} {}'.format('restarting', restart_argument)}))
+            # Do not echo the query argument. It is untrusted and this handler
+            # writes it straight into the response body.
+            self.write(json.dumps({'result': 'restarting'}))
             self.job_scheduler.restart_job(job)
         else:
             self.write(json.dumps({'result': 'failed'}))

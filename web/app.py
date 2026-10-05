@@ -753,14 +753,41 @@ def fetch_proposals() -> list[dict]:
     return rows
 
 
+def _local_redirect(
+    prefix: str, value: str, tail: str = '', *, status_code: int = 303,
+) -> RedirectResponse:
+    """Redirect under a constant local prefix.
+
+    ``value`` is quoted here. Callers must not pre-quote it. An f-string would
+    taint the whole URL, and Starlette leaves ``/`` and ``:`` unencoded in a
+    Location header, so an unquoted value could still leave the site.
+    """
+    if not prefix.startswith('/') or prefix.startswith('//') or chr(92) in prefix:
+        prefix = '/'
+    if tail and not tail.startswith(('#', '&')):
+        tail = ''
+    if '://' in tail or '//' in tail or chr(92) in tail:
+        tail = ''
+    url = prefix + quote(value, safe='') + tail
+    return RedirectResponse(url=url, status_code=status_code)
+
+
+def _public_error(exc: BaseException) -> str:
+    """Client-visible failure label. Never the exception message or traceback."""
+    code = getattr(exc, 'code', None)
+    if isinstance(code, str) and code.isidentifier() and len(code) <= 64:
+        return code
+    return type(exc).__name__
+
+
 def _flash(msg: str, *, tab: str = 'deploy') -> RedirectResponse:
     # Deploy + watchlist POST routes redirect back to the matching /cc tab so
     # the post/redirect/get loop stays on the page the form was submitted from.
     err = _flash_is_error(msg)
-    q = quote(msg)
+    q = msg
     suffix = '&flash_err=1' if err else ''
     hash_tab = tab if tab in ('deploy', 'watchlists', 'trading', 'scaling', 'guide') else 'deploy'
-    return RedirectResponse(url=f'/cc?flash={q}{suffix}#{hash_tab}', status_code=303)
+    return _local_redirect('/cc?flash=', q, suffix + '#' + hash_tab)
 
 
 def _flash_is_error(msg: str) -> bool:
@@ -935,16 +962,18 @@ def _register_legacy_routes(application: FastAPI) -> None:
     def manage_page(request: Request, flash: str = ''):
         """Deprecated alias — unified dashboard lives at /cc."""
         _check_access(request)
-        url = f'/cc?flash={quote(flash)}#deploy' if flash else '/cc#deploy'
-        return RedirectResponse(url=url, status_code=307)
+        if flash:
+            return _local_redirect('/cc?flash=', flash, '#deploy', status_code=307)
+        return RedirectResponse('/cc#deploy', status_code=307)
 
 
     @application.get('/legacy')
     def dashboard(request: Request, flash: str = ''):
         """Deprecated alias — unified dashboard lives at /cc."""
         _check_access(request)
-        url = f'/cc?flash={quote(flash)}#trading' if flash else '/cc#trading'
-        return RedirectResponse(url=url, status_code=307)
+        if flash:
+            return _local_redirect('/cc?flash=', flash, '#trading', status_code=307)
+        return RedirectResponse('/cc#trading', status_code=307)
 
 
     @application.post('/proposals/{pid}/approve',
@@ -962,7 +991,7 @@ def _register_legacy_routes(application: FastAPI) -> None:
         except Exception as exc:  # noqa: BLE001
             logger.warning('approve #%s failed: %s', pid, exc)
             msg = f'#{pid} approve error: {type(exc).__name__}: {exc}'
-        return RedirectResponse(url=f'/?flash={quote(msg)}', status_code=303)
+        return _local_redirect('/?flash=', msg)
 
 
     @application.post('/proposals/{pid}/reject',
@@ -976,7 +1005,7 @@ def _register_legacy_routes(application: FastAPI) -> None:
         except Exception as exc:  # noqa: BLE001
             logger.warning('reject #%s failed: %s', pid, exc)
             msg = f'#{pid} reject error: {type(exc).__name__}: {exc}'
-        return RedirectResponse(url=f'/?flash={quote(msg)}', status_code=303)
+        return _local_redirect('/?flash=', msg)
 
 
     @application.post('/strategies/{name}/enable',
@@ -993,7 +1022,7 @@ def _register_legacy_routes(application: FastAPI) -> None:
         except Exception as exc:  # noqa: BLE001
             logger.warning('enable %s failed: %s', name, exc)
             msg = f'{name} enable error: {type(exc).__name__}: {exc}'
-        return RedirectResponse(url=f'/?flash={quote(msg)}', status_code=303)
+        return _local_redirect('/?flash=', msg)
 
 
     @application.post('/strategies/{name}/disable',
@@ -1010,7 +1039,7 @@ def _register_legacy_routes(application: FastAPI) -> None:
         except Exception as exc:  # noqa: BLE001
             logger.warning('disable %s failed: %s', name, exc)
             msg = f'{name} disable error: {type(exc).__name__}: {exc}'
-        return RedirectResponse(url=f'/?flash={quote(msg)}', status_code=303)
+        return _local_redirect('/?flash=', msg)
 
 
     @application.post('/strategies/{name}/params',
@@ -1047,7 +1076,7 @@ def _register_legacy_routes(application: FastAPI) -> None:
         except Exception as exc:  # noqa: BLE001
             logger.warning('params update %s failed: %s', name, exc)
             msg = f'{name} params error: {type(exc).__name__}: {exc}'
-        return RedirectResponse(url=f'/?flash={quote(msg)}', status_code=303)
+        return _local_redirect('/?flash=', msg)
 
 
     # -------------------------------------------------------------------
@@ -1112,11 +1141,11 @@ def _register_legacy_routes(application: FastAPI) -> None:
             })
         except TypedRpcRemoteError as exc:
             code = 404 if exc.code == 'NOT_FOUND' else 502
-            return JSONResponse({'error': f'{exc.code}: {exc}'}, status_code=code)
+            return JSONResponse({'error': _public_error(exc)}, status_code=code)
         except Exception as exc:  # noqa: BLE001
             logger.warning('watchlist members %s failed: %s', wl, exc)
             return JSONResponse(
-                {'error': f'{type(exc).__name__}: {exc}'}, status_code=502)
+                {'error': _public_error(exc)}, status_code=502)
 
     @application.post('/watchlists/create')
     def watchlist_create(request: Request, name: str = Form(''), csrf_token: str = Form(''),
@@ -1534,11 +1563,11 @@ def _register_legacy_routes(application: FastAPI) -> None:
                 'count': len(instruments),
             })
         except TypedRpcRemoteError as exc:
-            return JSONResponse({'error': f'{exc.code}: {exc}'}, status_code=502)
+            return JSONResponse({'error': _public_error(exc)}, status_code=502)
         except Exception as exc:  # noqa: BLE001
             logger.warning('api resolve %s failed: %s', sym, exc)
             return JSONResponse(
-                {'error': f'{type(exc).__name__}: {exc}'}, status_code=502)
+                {'error': _public_error(exc)}, status_code=502)
 
     @application.get('/api/proposals')
     def api_list_proposals(status: str = '', limit: int = 50,
@@ -1556,11 +1585,11 @@ def _register_legacy_routes(application: FastAPI) -> None:
                 'status': st or 'ALL',
             })
         except TypedRpcRemoteError as exc:
-            return JSONResponse({'error': f'{exc.code}: {exc}'}, status_code=502)
+            return JSONResponse({'error': _public_error(exc)}, status_code=502)
         except Exception as exc:  # noqa: BLE001
             logger.warning('api list_proposals failed: %s', exc)
             return JSONResponse(
-                {'error': f'{type(exc).__name__}: {exc}'}, status_code=502)
+                {'error': _public_error(exc)}, status_code=502)
 
     @application.get('/api/proposals/{proposal_id}')
     def api_get_proposal(proposal_id: int,
@@ -1572,11 +1601,11 @@ def _register_legacy_routes(application: FastAPI) -> None:
             return JSONResponse(resp)
         except TypedRpcRemoteError as exc:
             code = 404 if exc.code in ('PROPOSAL_NOT_FOUND', 'NOT_FOUND') else 502
-            return JSONResponse({'error': f'{exc.code}: {exc}'}, status_code=code)
+            return JSONResponse({'error': _public_error(exc)}, status_code=code)
         except Exception as exc:  # noqa: BLE001
             logger.warning('api get_proposal %s failed: %s', proposal_id, exc)
             return JSONResponse(
-                {'error': f'{type(exc).__name__}: {exc}'}, status_code=502)
+                {'error': _public_error(exc)}, status_code=502)
 
 
 def create_app(

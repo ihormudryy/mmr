@@ -6,7 +6,10 @@ the major NASDAQ cash session (not NYSE-only holidays/hours).
 from __future__ import annotations
 
 import datetime as dt
+import logging
 from typing import Any
+
+logger = logging.getLogger(__name__)
 
 _CALENDAR = "XNAS"
 
@@ -63,5 +66,6 @@ def market_session_status(now: dt.datetime | None = None) -> dict[str, Any]:
             if nxt is not None:
                 payload["next_open"] = nxt.isoformat()
     except Exception as exc:  # noqa: BLE001 — banner enrichment must not break reads
-        payload["error"] = f"{type(exc).__name__}: {exc}"
+        logger.warning("market session unavailable: %s", exc)
+        payload["error"] = type(exc).__name__
     return payload

@@ -2827,7 +2827,8 @@ class MMR:
             # spammed but devs can `--debug` to see the underlying failure.
             logger.debug("status(): get_account_values RPC failed", exc_info=exc)
             result['account_values_warning'] = (
-                f"Failed to fetch account values: {type(exc).__name__}: {exc}"
+                f"Failed to fetch account values: {type(exc).__name__} "
+                "(see server logs)"
             )
 
         try:

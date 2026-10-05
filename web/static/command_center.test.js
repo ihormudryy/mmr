@@ -238,7 +238,7 @@ async function test(name, fn) {
   });
 
   await test('snapshot arrival does not reset a stale server-timestamped quote', () => {
-    const { elements, run } = makeContext();
+    const { elements, context, run } = makeContext();
     const generatedAt = '2026-07-15T12:00:00.000Z';
     const generatedMs = Date.parse(generatedAt);
     const view = emptyView();
@@ -248,8 +248,9 @@ async function test(name, fn) {
       101: { last: 42, server_received_timestamp:
         new Date(generatedMs - 45_000).toISOString() },
     };
-    run(`Date.now = () => ${generatedMs}; renderAll = () => {};
-         applySnapshot(${JSON.stringify(view)}); renderPositions();`);
+    context.__generatedMs = generatedMs;
+    context.__snapshotView = view;
+    run('Date.now = () => __generatedMs; renderAll = () => {}; applySnapshot(__snapshotView); renderPositions();');
 
     const html = elements.get('positions-body').innerHTML;
     assert.match(html, /<tr class="stale"/);

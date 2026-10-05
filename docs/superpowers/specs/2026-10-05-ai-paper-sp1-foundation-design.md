@@ -519,7 +519,9 @@ It also holds style, decider verdict and the evidence reference.
 - **Entry admission** (`ENTER`). The handler checks only what is new:
   - the caller is `ai_supervisor` (its own key, section 5.3);
   - the mode is `ai_paper`, the experiment is `ARMED`;
-  - `policy_revision` is the latest published revision;
+  - `policy_revision` is the latest published revision. This is a freshness
+    check only. Admission and dispatch still use the **effective** limits; a
+    queued looser field is not in force because its revision was accepted;
   - the deployment is sealed and matches; the decision has not expired;
   - the side is in an enabled style (V1: long only).
 - **Reduction admission** (`CLOSE`, `PARTIAL_CLOSE`). Separate rules, because a
@@ -587,8 +589,10 @@ first. On a hit:
 
 1. A durable `KILLED` state is set **before** any order. Admission refuses from
    that moment.
-2. `SessionController` starts an account-wide flatten through the existing
-   `LiquidationService`.
+2. `SessionController` claims the **account owner** in the exit table and starts
+   the flatten through `LiquidationService` under the takeover rules of
+   section 5.1. The kill is never a side call to `LiquidationService.start`
+   that skips those rules.
 3. A Telegram alert "kill started" goes out through the outbox.
 4. "Flat" is reported only after a broker generation shows no positions and no
    working orders. A missed deadline is `FAILED_SAFE` plus the breaker, as today.

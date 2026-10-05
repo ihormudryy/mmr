@@ -360,6 +360,74 @@ class TestArtifactAndHoldout:
 
 
 # --------------------------------------------------------------------------- #
+# One holdout per strategy and window
+# --------------------------------------------------------------------------- #
+class TestStrategyHoldoutWindows:
+    def _sealed(self, registry, tag, fold, *, path="strategies/orb.py",
+                cls="OpeningRangeBreakout", opened=False):
+        f = _family(strategy_path=path, class_name=cls, dataset_manifest_digest="ds-" + tag)
+        registry.create_family(f, created_at=T0, validation_folds=(fold,))
+        tid = registry.start_trial(f.family_id, trial_key="win",
+                                   parameters={"RANGE_MINUTES": 30}, started_at=T0)
+        registry.finish_trial(tid, status=TRIAL_SUCCEEDED, finished_at=T0,
+                              metrics={"sharpe": 2.0})
+        aid = registry.seal_artifact(f.family_id, selected_trial_id=tid,
+                                     selected_parameters={"RANGE_MINUTES": 30}, sealed_at=T0)
+        if opened:
+            registry.open_holdout(aid, opened_at=T0, passed=True)
+        return aid
+
+    @staticmethod
+    def _window(start, end):
+        return {"kind": "holdout", "start": start, "end": end}
+
+    def test_opened_holdout_windows_lists_only_parseable_opened_holdouts(self, registry):
+        a = self._sealed(registry, "a", self._window("2025-01-02", "2025-05-30"), opened=True)
+        self._sealed(registry, "b", self._window("2026-01-02", "2026-05-29"))
+        self._sealed(registry, "c", {"kind": "holdout", "test": "2025"}, opened=True)
+        self._sealed(registry, "d", self._window("2025-01-02", "2025-05-30"),
+                     cls="OtherClass", opened=True)
+
+        windows = registry.opened_holdout_windows("strategies/orb.py", "OpeningRangeBreakout")
+
+        assert [w["start"] for w in windows] == [dt.date(2025, 1, 2)]
+        assert windows[0]["end"] == dt.date(2025, 5, 30)
+        assert windows[0]["artifact_id"] == a
+
+    def test_open_holdout_refuses_an_overlapping_strategy_window(self, registry):
+        self._sealed(registry, "a", self._window("2025-01-02", "2025-05-30"), opened=True)
+        e = self._sealed(registry, "e", self._window("2025-05-01", "2025-08-29"))
+
+        with pytest.raises(HoldoutAlreadyOpened, match="2025-05-30"):
+            registry.open_holdout(e, opened_at=T0, passed=True)
+        assert registry.get_artifact(e).holdout_opened is False
+
+    def test_open_holdout_allows_a_later_window(self, registry):
+        self._sealed(registry, "a", self._window("2025-01-02", "2025-05-30"), opened=True)
+        f = self._sealed(registry, "f", self._window("2025-06-02", "2025-09-30"))
+
+        registry.open_holdout(f, opened_at=T0, passed=True)
+
+        assert registry.get_artifact(f).holdout_opened is True
+
+    def test_open_holdout_skips_unparseable_folds(self, registry):
+        self._sealed(registry, "c", {"kind": "holdout", "test": "2025"}, opened=True)
+        g = self._sealed(registry, "g", {"kind": "holdout", "test": "2025"})
+
+        registry.open_holdout(g, opened_at=T0, passed=True)
+
+        assert registry.get_artifact(g).holdout_opened is True
+
+    def test_absolute_and_relative_strategy_paths_are_one_strategy(self, registry):
+        self._sealed(registry, "a", self._window("2025-01-02", "2025-05-30"),
+                     path="/abs/repo/strategies/orb.py", opened=True)
+
+        windows = registry.opened_holdout_windows("strategies/orb.py", "OpeningRangeBreakout")
+
+        assert len(windows) == 1
+
+
+# --------------------------------------------------------------------------- #
 # Legacy import: recorded, but structurally unable to earn eligibility
 # --------------------------------------------------------------------------- #
 def _bt_record(rid, path="strategies/orb.py", cls="OpeningRangeBreakout", **over):

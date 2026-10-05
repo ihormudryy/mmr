@@ -63,9 +63,9 @@ the automation order path itself.
 
 ## Evidence before automation
 
-> Phase A leaves the liquidity, benchmark and regime evidence missing, so
-> `evaluate` stops at stage `pre_holdout` (state `CANDIDATE`) until Phase B and
-> Activate refuses every strategy. Even with an eligible bundle, automated exits
+> Phase B computes the liquidity, benchmark and regime evidence from SPY daily
+> bars, so a strategy can become eligible on real data; without eligible
+> evidence Activate refuses it. Even with an eligible bundle, automated exits
 > are not safe yet, and `research evaluate` does not run in split Docker: see
 > **Known blockers (paper automation)** in
 > [`OPERATIONAL_STATE.md`](OPERATIONAL_STATE.md#known-blockers-paper-automation).
@@ -78,9 +78,12 @@ the automation order path itself.
    `mmr data refresh`), every conid in a local universe, and a `calendar: XNYS`
    key on the US venue in `~/.config/mmr/execution_costs.yaml` (older copies lack it;
    `evaluate` refuses and names the key).
-2. `mmr research evaluate research/my_spec.yaml --dry-run` — validate, count jobs.
+2. Download SPY daily bars (required for regimes, benchmark and liquidity):
+   `mmr data download SPY --bar-size "1 day" --days 1100`. If the history is
+   short, `evaluate` stops and names the exact `--days` number.
+3. `mmr research evaluate research/my_spec.yaml --dry-run` — validate, count jobs.
    It does not read bars. `--workers N` sets the parallel backtest processes.
-3. `mmr research evaluate research/my_spec.yaml` — runs walk-forward backtests at
+4. `mmr research evaluate research/my_spec.yaml` — runs walk-forward backtests at
    realistic costs (1x, 1.5x, 2x for the main point; neighbours at 1x) under the
    live paper rules. The holdout is opened only if every other paper-v1 rule
    passes. A failed holdout (no round trip, expectancy at or below zero, or a
@@ -88,18 +91,18 @@ the automation order path itself.
    `RETIRED`, no decision, and it can never be attested. It prints the report
    path; read it. The report is written to
    `~/.local/share/mmr/reports/evaluation_<name>_<time>_<id>.md` (and `.json`).
-4. If the stage is `complete` and the state `PAPER_ELIGIBLE`:
+5. If the stage is `complete` and the state `PAPER_ELIGIBLE`:
    `mmr research review submit --artifact-id ... --decision-id ... --reviewer-kind human|llm ...`
    (`--artifact-id` is the evaluate output's `artifact_id`, `--decision-id` its
    `decision_digest`. The review also needs `--reviewer`, the eight review fields
    and `--holdout-opened-once`. An LLM may review paper bundles; live needs a
    human. The reviewer name `bootstrap` marks old fixtures and is refused at
    Activate and dispatch.)
-5. `mmr research attest bundle <artifact_id>` — signs and exports
+6. `mmr research attest bundle <artifact_id>` — signs and exports
    `~/.local/share/mmr/artifacts/sha256_<digest>/` (the digest is the bundle
    manifest digest). The first run also creates the signing key under
    `~/.config/mmr/keys/`.
-6. Activate from `/cc`. It refuses (`NO_ELIGIBLE_BUNDLE`) unless that bundle is
+7. Activate from `/cc`. It refuses (`NO_ELIGIBLE_BUNDLE`) unless that bundle is
    bound to the strategy's current YAML entry and file. Editing the strategy
    file, its upper-case params, conids or bar size needs a new evaluation. An
    automated strategy cannot set lower-case params at all: the spec refuses
@@ -111,6 +114,10 @@ Bundles expire after 90 days. A decision is attested only once, so
 signed by a different key than the current signing key. Renewal means
 evaluating again over a newer period, then reviewing and attesting the new
 artifact. `mmr research evaluations` lists past runs (`--limit N`, default 20).
+
+Live dispatch refuses an automated entry more than 5% above the attested order
+notional (`ORDER_EXCEEDS_ATTESTED_NOTIONAL`). A bundle whose family records no
+order notional refuses every automated entry with the same reason (fail closed).
 
 ---
 

@@ -17,6 +17,7 @@ trial. This module is OFFLINE-ONLY.
 from __future__ import annotations
 
 import hashlib
+import datetime as dt
 import json
 import math  # noqa: F401  (kept for symmetry with backtest_store helpers)
 from datetime import timezone
@@ -481,6 +482,7 @@ class ExperimentRegistry:
                             [aid]).fetchone() is not None:
                 raise HoldoutAlreadyOpened(
                     f"artifact {aid} holdout is write-once and was already opened")
+            self._refuse_overlapping_strategy_holdout(conn, aid)
             conn.execute(
                 "INSERT INTO holdout_access_log (artifact_id, opened_at, passed, detail) "
                 "VALUES (?, ?, ?, ?)", [aid, opened_at, bool(passed), detail])
@@ -491,6 +493,57 @@ class ExperimentRegistry:
                              [ARTIFACT_STATE_RETIRED, aid])
 
         return self._db.transaction(_tx)
+
+    def opened_holdout_windows(self, strategy_path: str, class_name: str) -> list[dict]:
+        return self._db.transaction(
+            lambda conn: self._opened_windows_tx(conn, strategy_path, class_name))
+
+    @staticmethod
+    def _parse_holdout_window(spec_json: str) -> Optional[tuple[dt.date, dt.date]]:
+        fold = json.loads(spec_json)
+        try:
+            return (dt.date.fromisoformat(str(fold["start"])),
+                    dt.date.fromisoformat(str(fold["end"])))
+        except (KeyError, ValueError):
+            return None  # legacy or fixture fold without dates
+
+    def _opened_windows_tx(self, conn, strategy_path: str, class_name: str) -> list[dict]:
+        target = normalize_strategy_path(strategy_path)
+        rows = conn.execute(
+            "SELECT f.family_id, f.strategy_path, h.artifact_id, v.spec "
+            "FROM experiment_families f "
+            "JOIN strategy_artifacts a ON a.family_id = f.family_id "
+            "JOIN holdout_access_log h ON h.artifact_id = a.artifact_id "
+            "JOIN validation_folds v ON v.family_id = f.family_id "
+            "WHERE f.class_name = ? AND v.kind = 'holdout'", [class_name]).fetchall()
+        windows = []
+        for family_id, path, artifact_id, spec_json in rows:
+            if normalize_strategy_path(path) != target:
+                continue
+            window = self._parse_holdout_window(spec_json)
+            if window is not None:
+                windows.append({"artifact_id": artifact_id, "family_id": family_id,
+                                "start": window[0], "end": window[1]})
+        return windows
+
+    def _refuse_overlapping_strategy_holdout(self, conn, artifact_id: str) -> None:
+        family_id, path, class_name = conn.execute(
+            "SELECT f.family_id, f.strategy_path, f.class_name FROM strategy_artifacts a "
+            "JOIN experiment_families f ON f.family_id = a.family_id "
+            "WHERE a.artifact_id = ?", [artifact_id]).fetchone()
+        own_specs = conn.execute(
+            "SELECT spec FROM validation_folds WHERE family_id = ? AND kind = 'holdout'",
+            [family_id]).fetchall()
+        for (spec_json,) in own_specs:
+            own = self._parse_holdout_window(spec_json)
+            if own is None:
+                continue
+            for w in self._opened_windows_tx(conn, path, class_name):
+                if w["artifact_id"] != artifact_id and own[0] <= w["end"] and w["start"] <= own[1]:
+                    raise HoldoutAlreadyOpened(
+                        f"strategy {path} class {class_name} already opened a holdout over "
+                        f"{w['start']}\u2013{w['end']} (artifact {w['artifact_id']}); "
+                        f"the next holdout must start after {w['end']}")
 
     # ---- legacy import -------------------------------------------------- #
     def import_legacy_backtests(self, records: Sequence[BacktestRecord],

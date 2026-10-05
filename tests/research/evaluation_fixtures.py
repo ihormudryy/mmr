@@ -26,6 +26,7 @@ from trader.research.signing import AttestationSigner
 from trader.simulation.execution_costs import load_execution_costs_config
 
 CONIDS = list(range(1001, 1009))
+SPY_CONID = 756733
 PERIOD = ('2024-02-01', '2024-03-28')
 HOLDOUT_RULES = {'expectancy_baseline_positive', 'holdout_drawdown_within_canary',
                  'deterministic_replay', 'holdout_opened_once'}
@@ -97,6 +98,24 @@ def write_trend_bars(duckdb_path: str, *, drift: float, start=PERIOD[0], end=PER
                              index=index)
         frame.index.name = 'date'
         store.write(str(conid), frame)
+    write_benchmark_bars(duckdb_path, end=end)
+
+
+def write_benchmark_bars(duckdb_path: str, *, start='2023-01-03', end=PERIOD[1],
+                         drift: float = 0.0002) -> None:
+    """SPY daily closes over real XNYS sessions, enough lookback for regimes.
+
+    Daily returns alternate drift +/- 0.5%: volatile enough for a real
+    volatility-matched benchmark, still one low-volatility bull regime."""
+    calendar = xcals.get_calendar('XNYS')
+    sessions = calendar.sessions_in_range(start, end)
+    index = pd.DatetimeIndex([pd.Timestamp(s.date(), tz='UTC') for s in sessions])
+    swing = np.where(np.arange(1, len(index)) % 2 == 1, 0.005, -0.005)
+    price = 400.0 * np.concatenate([[1.0], np.cumprod(1 + drift + swing)])
+    frame = pd.DataFrame({'open': price, 'high': price, 'low': price, 'close': price,
+                          'volume': 1_000_000.0, 'bar_size': '1 day'}, index=index)
+    frame.index.name = 'date'
+    DuckDBDataStore(duckdb_path).write(str(SPY_CONID), frame)
 
 
 def build_spec_file(repo: Path, **overrides) -> Path:

@@ -52,9 +52,11 @@ or the `/cc` Strategies panel. Trader ports 42101/42102 **are** published, so
 > `research attest bundle`, bound to the strategy's file, class, params, conids
 > and bar size, with qualified (non-fixture) `paper-v1` evidence. The old fixture
 > bundle fails both the provenance and the binding check, so the `momentum` arm
-> stops after this ships. Phase A leaves the liquidity, benchmark
-> and regime evidence missing, so no strategy can be eligible until Phase B. Run
-> strategies with `auto_execute: propose` meanwhile.
+> stops after this ships. Phase B is implemented: `research evaluate`
+> computes the liquidity, benchmark and regime evidence from SPY daily bars, so
+> eligibility now depends on the data (SPY bars are required; download them
+> first). The soak stays blocked by the automated-exit fix (and the split-Docker evidence gap below). Run strategies
+> with `auto_execute: propose` meanwhile.
 
 ### Known blockers (paper automation)
 
@@ -272,8 +274,8 @@ message with no traceback.
 
 ## Next operator session (paper soak)
 
-The automation soak below is blocked until Phase B and the exit fix
-(see Known blockers). Until then, run strategies with `auto_execute: propose`
+The automation soak below is blocked until the exit fix
+and the split-Docker evidence gap are resolved (see Known blockers). Until then, run strategies with `auto_execute: propose`
 and approve on `/cc`.
 
 1. `./docker.sh -b -u` after this polish (baked dashboard image).

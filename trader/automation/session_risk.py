@@ -30,6 +30,7 @@ from trader.promotion.portfolio_risk_budget import (
     BLOCK_POSITION_COUNT,
     PortfolioRiskBudget,
 )
+from trader.research.market_context import LIVE_NOTIONAL_TOLERANCE
 from trader.trading.approval_context import ApprovalContext
 from trader.trading.circuit_breaker import BreakerSignal
 
@@ -365,6 +366,13 @@ class SessionRiskController:
             post_position_value = existing_position_value + order_notional
             if post_position_value / equity > MAX_POSITION_FRACTION:
                 reasons.append("POSITION_PCT")
+
+            # The research evidence priced this notional; a missing one fails closed.
+            attested = artifact.attested_strategy
+            attested_notional = None if attested is None else attested.order_notional
+            if attested_notional is None or order_notional > (
+                    attested_notional * (1.0 + LIVE_NOTIONAL_TOLERANCE)):
+                reasons.append("ORDER_EXCEEDS_ATTESTED_NOTIONAL")
 
             # Trade risk from broker-native stop distance (hard 0.20%; intent
             # risk_fraction may only tighten, never loosen).

@@ -4,10 +4,11 @@ All notable changes to MMR are documented here.
 
 The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and the project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html). Until 1.0, minor versions may contain breaking changes.
 
-## [Unreleased]
+## [0.1.1] - 2026-10-05
 
 ### Added
 
+- **Phase B evidence**: `research evaluate` now computes the liquidity envelope, the vol-matched SPY benchmark and the regime values from SPY daily bars, so a strategy can reach `PAPER_ELIGIBLE` on real data. "Holdout opened once" is keyed on strategy + window across families. Automated entries larger than 105% of the attested order notional are refused (`ORDER_EXCEEDS_ATTESTED_NOTIONAL`).
 - **Research evidence for paper automation**: `mmr research evaluate <spec.yaml>` runs walk-forward backtests under the live paper rules at 1x/1.5x/2x costs and records paper-v1 evidence; the holdout opens once, only after every other rule passes. `research evaluations`, `research review submit --reviewer-kind human|llm` and `research attest bundle` complete the flow. Example spec: `research/example_spec.yaml`.
 - **Bundle binding**: a bundle must attest the loaded strategy code, class, params, conids and bar size. It is checked at load, at arm and in Activate; dispatch rejects other artifacts (`ARTIFACT_NOT_ARMED`) and source mismatches (`STRATEGY_SOURCE_MISMATCH`).
 
@@ -38,5 +39,5 @@ First tagged release. It captures the platform as it runs today.
 
 - Arctic, MongoDB and Redis era code (`trader/cli`, `trader/batch`, `trader/portfolio`), outdated docs and unused dependencies.
 
-[Unreleased]: https://github.com/ihormudryy/mmr/compare/v0.1.0...HEAD
+[0.1.1]: https://github.com/ihormudryy/mmr/compare/v0.1.0...v0.1.1
 [0.1.0]: https://github.com/ihormudryy/mmr/releases/tag/v0.1.0

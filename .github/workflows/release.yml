@@ -7,7 +7,17 @@ name: Release image
 on:
   release:
     types: [published]
+  # The release stage is manual: after merging to master, run this workflow
+  # from the Actions tab (or `gh workflow run release.yml -f version=X.Y.Z`).
+  # It tags the dispatched commit, creates the GitHub release from that
+  # version's CHANGELOG section, and publishes the image in the same run
+  # (a token-created release does not re-fire the `release` event).
   workflow_dispatch:
+    inputs:
+      version:
+        description: "Version to release, e.g. 0.1.1 (must have a CHANGELOG section); leave empty to only rebuild the image"
+        required: false
+        default: ""
   pull_request:
     paths:
       - Dockerfile
@@ -36,9 +46,39 @@ jobs:
       - run: uv sync --python 3.12.13 --frozen --extra test
       - run: uv run --frozen pytest tests/ --timeout=30 --timeout-method=thread -q --ignore=tests/test_ibrx_async.py
 
+  release:
+    name: Create GitHub release
+    needs: test
+    if: github.event_name == 'workflow_dispatch' && inputs.version != ''
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    env:
+      VERSION: ${{ inputs.version }}
+    steps:
+      - uses: actions/checkout@v7
+      - name: The project version must match
+        run: |
+          grep -q "^version = \"$VERSION\"" pyproject.toml \
+            || { echo "pyproject.toml does not say version = \"$VERSION\""; exit 1; }
+      - name: Release notes from the changelog
+        run: |
+          awk -v ver="$VERSION" '
+            $0 ~ "^## \\[" ver "\\]" { on = 1; next }
+            on && /^## \[/ { exit }
+            on { print }' CHANGELOG.md > notes.md
+          test -s notes.md || { echo "CHANGELOG.md has no section for $VERSION"; exit 1; }
+      - name: Create the tag and the release
+        # gh creates the v$VERSION tag at the dispatched commit.
+        run: gh release create "v$VERSION" --title "v$VERSION" --notes-file notes.md --target "$GITHUB_SHA"
+        env:
+          GH_TOKEN: ${{ github.token }}
+
   image:
     name: Build and push image
-    needs: test
+    # The release job is skipped on every event but a versioned dispatch;
+    # a skipped need does not stop this job (only a failure does).
+    needs: [test, release]
     # `needs` skips this job when `test` is skipped (pull requests), so
     # run it anyway unless the tests actually failed.
     if: ${{ !failure() && !cancelled() }}
@@ -67,7 +107,8 @@ jobs:
           tags: |
             type=semver,pattern={{version}}
             type=semver,pattern={{major}}.{{minor}}
-            type=raw,value=latest,enable=${{ github.event_name == 'release' && !github.event.release.prerelease }}
+            type=raw,value=${{ inputs.version }},enable=${{ github.event_name == 'workflow_dispatch' && inputs.version != '' }}
+            type=raw,value=latest,enable=${{ (github.event_name == 'release' && !github.event.release.prerelease) || (github.event_name == 'workflow_dispatch' && inputs.version != '') }}
             type=sha
             type=ref,event=pr
           labels: |

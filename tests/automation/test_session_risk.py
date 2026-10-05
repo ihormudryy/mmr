@@ -21,6 +21,7 @@ from trader.automation.models import (
     TargetPolicy,
     TimeExitPolicy,
 )
+from trader.automation.strategy_binding import AttestedStrategy
 from trader.automation.session_risk import (
     AllocationCeiling,
     AutomationSessionState,
@@ -79,8 +80,16 @@ def make_intent(**overrides) -> ExecutionIntent:
     return ExecutionIntent(**_intent_fields(**overrides))
 
 
+def make_attested_strategy(order_notional: Optional[float]) -> AttestedStrategy:
+    return AttestedStrategy(
+        strategy_path="strategies/orb.py", class_name="OpeningRangeBreakout",
+        source_digest="src-1", parameters={}, instruments=frozenset({str(CONID)}),
+        bar_size="1 min", order_notional=order_notional)
+
+
 def make_artifact(**overrides) -> VerifiedArtifact:
     base = dict(
+        attested_strategy=make_attested_strategy(1_000_000.0),
         artifact_id="artifact-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
         manifest_digest="sha256:manifest",
         dataset_manifest_digest="sha256:dataset",
@@ -671,3 +680,49 @@ def test_sell_without_quantity_and_nothing_held_is_long_only():
         make_artifact(), make_approval(), make_session(),
         AllocationCeiling(max_gross_fraction=0.06))
     assert "LONG_ONLY" in decision.reason_codes
+
+
+# ---------------------------------------------------------------------------
+# Attested order notional
+# ---------------------------------------------------------------------------
+
+def _evaluate_with_notional(intent, notional, approval):
+    return make_controller().evaluate(
+        intent, make_artifact(attested_strategy=make_attested_strategy(notional)),
+        approval, make_session(), AllocationCeiling(max_gross_fraction=0.06))
+
+
+def test_an_entry_over_the_attested_notional_is_refused():
+    decision = _evaluate_with_notional(
+        make_intent(requested_quantity=Decimal("11")), 1_000.0,  # $1,100 vs $1,000 * 1.05
+        make_approval(quantity=11.0, quote=make_quote(price=100.0)))
+    assert "ORDER_EXCEEDS_ATTESTED_NOTIONAL" in decision.reason_codes
+
+
+def test_an_entry_at_the_attested_notional_passes():
+    decision = _evaluate_with_notional(
+        make_intent(requested_quantity=Decimal("10")), 1_000.0,  # $1,000 == attested
+        make_approval(quantity=10.0, quote=make_quote(price=100.0)))
+    assert "ORDER_EXCEEDS_ATTESTED_NOTIONAL" not in decision.reason_codes
+
+
+def test_a_missing_attested_notional_refuses_the_entry():
+    decision = _evaluate_with_notional(
+        make_intent(), None, make_approval(quote=make_quote(price=100.0)))
+    assert "ORDER_EXCEEDS_ATTESTED_NOTIONAL" in decision.reason_codes
+
+
+def test_an_artifact_without_attested_strategy_refuses_the_entry():
+    decision = make_controller().evaluate(
+        make_intent(), make_artifact(attested_strategy=None), make_approval(),
+        make_session(), AllocationCeiling(max_gross_fraction=0.06))
+    assert "ORDER_EXCEEDS_ATTESTED_NOTIONAL" in decision.reason_codes
+
+
+def test_a_sell_is_never_checked_against_the_notional():
+    held = make_broker(positions=(_position(CONID, 100.0, 10_000.0),))
+    decision = _evaluate_with_notional(
+        make_intent(side="SELL", requested_quantity=Decimal("100"),
+                    stop_policy=StopPolicy(stop_price=Decimal("101"), order_type="STP")),
+        1_000.0, make_approval(quantity=100.0, broker=held, quote=make_quote(price=100.0)))
+    assert "ORDER_EXCEEDS_ATTESTED_NOTIONAL" not in decision.reason_codes

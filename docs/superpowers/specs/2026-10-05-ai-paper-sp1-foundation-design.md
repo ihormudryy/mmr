@@ -1,7 +1,7 @@
 # AI Paper Bot — SP1 Foundation — Design Specification
 
 **Date:** 2026-10-05
-**Status:** Approved in brainstorming; revised 2026-10-05 after a second review (owner ceiling, coordinator translation, kill-line order). Implementation not started.
+**Status:** Draft in review (revised twice on 2026-10-05 after review). Not approved. Implementation not started.
 **Replaces:** the executing path of `2026-10-04-autonomous-ai-trading-module-design.md`.
 That spec and its review (`docs/reviews/2026-10-04-autonomous-ai-trading-module-review.md`)
 stay as background. Where they disagree with this document, this document wins.
@@ -31,7 +31,7 @@ positions is not hands-off.
 |---|---|
 | Goal | Hands-off paper bot, full autonomy, maximise paper profit. |
 | AI decides | Strategy choice, trade choice, new symbols, reports, new strategy code. |
-| Risk limits | The AI sets them, under an owner ceiling in `trader.yaml`. The default ceiling is today's paper limits. Only the owner can raise it; the AI never can (revised 2026-10-05 after review). |
+| Risk limits | The AI sets them, under an owner ceiling in `trader.yaml`. The default ceiling is today's paper limits. The ceiling's code maximum is today's steady caps: only gross can rise (6% → 15%); every other field stays at today's value or tighter. The AI can never raise the ceiling (revised 2026-10-05 after review). |
 | Kill line | `experiment_kill_drawdown_pct`. Default `null` (off). The owner may set e.g. `20`. |
 | Account | The bot owns the paper account alone. It arms only when the account is flat. |
 | Decider | Pluggable interface. Jev is the first adapter. The "follow the signal" baseline is logged beside it. |
@@ -59,10 +59,9 @@ results are read correctly.
   (section 5.2) answers whether the bot works.
 - **AI-written code in V1.** More work before the first run. The sandbox must be
   correct from the first day (SP3).
-- **No default kill line.** The ceiling's drawdown limit still blocks new
-  entries, but it is checked only when a decision arrives and it does not
-  flatten. If the owner raises the drawdown ceiling, a bad run can use much
-  more of the paper account.
+- **No default kill line.** The 3% drawdown limit still blocks new entries, but
+  it is checked only when a decision arrives and it does not flatten. Open
+  positions keep running until their stops, the session flatten or `/flatten`.
 - **Partial exits.** The position has no stop for a few seconds during each
   partial close (section 5.1).
 
@@ -141,10 +140,12 @@ The scoreboard is the only honest referee once the AI judges its own backtests.
 
 - `experiments`: experiment id, start time, start net liquidation, config digest,
   enabled styles, kill line, state (`ARMED`, `PAUSED`, `KILLED`, `STOPPED`).
-- `equity_daily`: one row per session after `SessionController` reaches `FLAT`.
-  Start and end net liquidation, realized P&L, commissions, peak gross exposure,
-  trade count. `broker_account_state` keeps only the current value, so this
-  table is the missing history.
+- `equity_daily`: one row per session, written when the session ends in any
+  way: `FLAT`, `KILLED` or `FAILED_SAFE`. A `session_end_state` column records
+  which. Start and end net liquidation, realized P&L, commissions, peak gross
+  exposure, trade count, open positions at the end (zero after `FLAT`).
+  `broker_account_state` keeps only the current value, so this table is the
+  missing history. A killed or failed day is the row the scoreboard most needs.
 - `round_trips`: a projection rebuilt from `broker_fills`. Entry and exit fills,
   cash P&L after fees, and attribution: strategy version, decider, risk-policy
   revision, style. Partial exits belong to the same round trip.
@@ -200,7 +201,7 @@ Every view says "paper". Nothing on it is proof of live edge.
 | Principal | Rights (summary) |
 |---|---|
 | `strategy` | `execute_automated_intent` (old path), resolve, publish. |
-| `dashboard`, `cli` | Reads, propose/approve/reject, cancel, pause, experiment start/resume. |
+| `dashboard`, `cli` | Reads, propose/approve/reject, cancel, pause, experiment start/resume/stop. |
 | `scheduler` | Data refresh. |
 | `ai_supervisor` | Reads, scoreboard read, `publish_ai_risk_policy`, `submit_ai_paper_decision`, pause. |
 | `ai_research` | Research jobs, market-data reads, `register_ai_deployment` (SP2). No trading methods. |
@@ -222,14 +223,23 @@ Every view says "paper". Nothing on it is proof of live edge.
 
 - New `RiskLimits` dataclass: max positions, position fraction, gross fraction,
   per-trade risk fraction, daily-loss fraction, drawdown fraction, max pending
-  orders.
+  entry orders.
 - `PAPER_LIMITS` holds the limits that **actually run** on the paper path today.
   It is not a copy of the module constants:
   - gross 6% (the paper clamp in `production_evidence.allocation_factory`,
     `trader/automation/production_evidence.py:173`), **not** the 15% steady cap
     in `MAX_GROSS_FRACTION`;
   - position 5%, per-trade risk 0.20%, daily loss 0.50%, 3 positions, drawdown
-    3% from the high-water mark.
+    3% from the high-water mark;
+  - 3 pending entry orders (new field, see below).
+- **Pending entry orders.** Today `session_risk` counts only filled positions
+  (`trader/automation/session_risk.py:279`), so unfilled entries on new conids
+  are not bounded on this path. The `ai_paper` approval factory enforces it on
+  `ENTER`: working non-protective orders in the fenced broker snapshot, plus
+  this entry, must not exceed `max_pending_entry_orders`, and positions plus
+  conids with a working entry must not exceed `max_positions`
+  (`MAX_PENDING_ENTRIES`). It lives in the `ai_paper` factory, so the old path
+  does not change.
 - `SessionRiskController.evaluate` takes `limits`. `PortfolioRiskBudget` takes
   the same object, so its own copies of 0.50% and 3 positions
   (`trader/promotion/portfolio_risk_budget.py:21-22`) go away. There is no
@@ -240,13 +250,35 @@ Every view says "paper". Nothing on it is proof of live edge.
 
 **Owner ceiling.**
 
-- `ai_paper.limits_ceiling` in `trader.yaml`. Each missing key defaults to the
-  `PAPER_LIMITS` value. The ceiling must itself pass the structural checks below.
+- `ai_paper.limits_ceiling` in `trader.yaml`. A missing key defaults to the
+  `PAPER_LIMITS` value.
+- **Code maximum** (`STEADY_LIMITS`, from the existing hard ceilings in
+  `trader/automation/session_risk.py` and `trader/promotion/allocation_policy.py`,
+  not new literals):
+
+  | Field | `PAPER_LIMITS` (default) | Code maximum |
+  |---|---|---|
+  | gross | 6% | 15% (`STEADY_MAX_GROSS_FRACTION`, top of the promotion ladder) |
+  | position | 5% | 5% |
+  | per-trade risk | 0.20% | 0.20% |
+  | daily loss | 0.50% | 0.50% |
+  | positions | 3 | 3 |
+  | drawdown | 3% | 3% |
+  | pending entry orders | 3 | 3 |
+
+  So config can move only gross up. Any field may be set tighter. Going past
+  the steady caps is a code change, made only after this experiment has a
+  scoreboard.
+- A value of the wrong type, not finite, ≤ 0, or above the code maximum
+  **fails config load**. It never falls through to the AI policy.
 - Only the owner edits it. No AI principal has a method that writes it, and no
   AI container mounts `trader.yaml`.
 - A raised ceiling applies from the next session, never mid-session.
-- Config load refuses a drawdown ceiling above 3% while the kill line is off.
-  Without either, nothing would stop a falling account.
+- **Drawdown guard.** If the drawdown ceiling is above `PAPER_LIMITS.drawdown`,
+  the kill line must be set and must be no looser than the drawdown ceiling.
+  Otherwise config load fails. With today's code maximum this cannot fire from
+  YAML. It stays so that a later code change cannot reopen the hole. Legal
+  today: ceiling 3% with the kill line off, or ceiling 3% with a kill line of 20%.
 
 **AI risk policy** (`publish_ai_risk_policy`, `ai_supervisor` only).
 
@@ -293,11 +325,18 @@ It also holds style, decider verdict and the evidence reference.
   every check that already refuses an order: account fence, trading filter
   allowlist, long-only, liquidity, quote freshness, margin, calendar entry
   window, stop validity, and `session_risk` with the effective limits.
-- A new `ai_paper` approval factory feeds the coordinator. Today's
-  `approval_factory` is not reused unchanged, because it raises
-  `QUANTITY_REQUIRED` before `session_risk` can size.
-- Sizing (`ENTER`): the trader computes the maximum quantity from the effective
-  limits and the stop distance. A decision may ask for less, never more.
+- A new `ai_paper` approval factory feeds the coordinator. It captures the
+  same evidence as today's `approval_factory`: the fenced broker snapshot
+  (account, paper mode, complete fence), a live quote, margin, the high-water
+  mark and liquidity. Skipping `QUANTITY_REQUIRED` is the only rule it drops.
+- Sizing (`ENTER`): the maximum quantity is the **minimum** allowed by every
+  effective limit: per-trade risk over the stop distance, position fraction,
+  remaining gross, margin and liquidity. Whole shares, rounded down.
+  - No `quantity`: the trader uses the maximum.
+  - A `quantity` at or below the maximum is used as is.
+  - A `quantity` above the maximum is **refused** (`QUANTITY_ABOVE_MAXIMUM`),
+    not cut down.
+  - A maximum below one share refuses the entry.
 - `ENTER` uses the existing protective bracket saga. `CLOSE` and `PARTIAL_CLOSE`
   use the scoped close (section 5.1), never `build_bracket_plan`. A close takes
   its size from the broker.
@@ -312,6 +351,7 @@ It also holds style, decider verdict and the evidence reference.
 
 **Arming.** `mmr experiment start` arms only if:
 
+- `ai_paper.enabled` is `true`;
 - the account is paper;
 - it has no positions and no working orders, because the kill flatten is
   account-wide and must not close anything the bot does not own;
@@ -338,10 +378,17 @@ first. On a hit:
 4. "Flat" is reported only after a broker generation shows no positions and no
    working orders. A missed deadline is `FAILED_SAFE` plus the breaker, as today.
 
-**Pause, resume and restarts.**
+**Pause, resume, stop and restarts.**
 
 - Only `mmr experiment resume` (principals `cli` or `dashboard`) clears `KILLED`
-  or `PAUSED`. AI principals cannot.
+  or `PAUSED`. It arms the AI again. AI principals cannot call it.
+- `mmr experiment stop` (principals `cli` or `dashboard` only) moves an `ARMED`,
+  `PAUSED` or `KILLED` experiment to `STOPPED` without resuming it.
+  - It refuses (`NOT_FLAT`) while a liquidation is running or the broker shows a
+    position or a working order. Flatten first (`/flatten`), so no AI position
+    is left for another mode.
+  - `STOPPED` is final. It releases the one-strategy lock. A new run needs a new
+    `experiment start` and a new experiment id.
 - Arm, pause and kill states survive restarts.
 - A restart is not a new session. It does not apply a queued loosening (of the
   policy or the ceiling) and does not clear `KILLED`.
@@ -381,19 +428,29 @@ Test-first for every part. Each change starts with a failing test.
   - parity: the old path, run through `evaluate` and `PortfolioRiskBudget`, gives
     the same decisions with `PAPER_LIMITS`, and paper gross still stops at 6%;
   - an AI policy above the owner ceiling is refused (`POLICY_ABOVE_CEILING`);
-  - a drawdown ceiling above 3% with the kill line off is refused at config load;
+  - config load: gross up to 15% accepted; any other field above today's value,
+    or a non-finite, zero or negative value, fails load; a missing key takes
+    `PAPER_LIMITS`;
+  - drawdown guard (with a test-only raised code maximum): drawdown ceiling above
+    `PAPER_LIMITS.drawdown` fails load with the kill line off or looser than the
+    ceiling, and loads with a tighter kill line;
   - policy timing rules (mid-session loosening refused, breach persists, a
     restart does not apply a queued loosening);
   - idempotent decisions; a **new** `decision_id` cannot retry a conid whose
     command or close is `OUTCOME_UNKNOWN`;
   - coordinator checks reached from a decision (account fence, allowlist,
     quote freshness, margin, calendar, stop validity) each refuse with their
-    own code; sizing never above the maximum; a close never goes through
-    `build_bracket_plan`;
+    own code; the factory captures snapshot, quote, margin, high-water mark
+    and liquidity; the maximum is the minimum over every limit; a quantity
+    above it is refused, not cut; pending entries beyond the limit are refused;
+    a close never goes through `build_bracket_plan`;
   - a decision on an unsealed or mismatched deployment is refused;
     `ai_supervisor` cannot call `register_ai_deployment`.
-- **Arming and kill line:** arming refused with a leftover position or a working
-  order, or with only the old shared key; arming the one-strategy automation
+- **Arming and kill line:** arming refused with `ai_paper.enabled: false`, with a
+  leftover position or a working order, or with only the old shared key;
+  `experiment stop` refused while not flat, moves `KILLED` to `STOPPED` without
+  re-arming, releases the lock, and cannot be called by AI principals;
+  `equity_daily` gets a row after `KILLED` and after `FAILED_SAFE`; arming the one-strategy automation
   refused while an experiment is armed; `KILLED` is stored before the first
   flatten order; "flat" is not reported before the broker confirms it; the kill
   line survives a restart; both kill bases; AI principals cannot resume.

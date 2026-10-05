@@ -1,7 +1,7 @@
 # AI Paper Bot — SP1 Foundation — Design Specification
 
 **Date:** 2026-10-05
-**Status:** Draft in review (revised three times on 2026-10-05 after review). Not approved. Implementation not started. Line numbers refer to this branch before the master rebase.
+**Status:** Draft in review (revised four times on 2026-10-05 after review; owner approved the Ed25519 identities and the old-path close correction). Not approved as a whole. Implementation not started. Line numbers refer to this branch before the master rebase.
 **Replaces:** the executing path of `2026-10-04-autonomous-ai-trading-module-design.md`.
 That spec and its review (`docs/reviews/2026-10-04-autonomous-ai-trading-module-review.md`)
 stay as background. Where they disagree with this document, this document wins.
@@ -203,7 +203,16 @@ protection loss do.
 - Time exits and one-strategy SELL closes use the reduction admission rules of
   section 5.4, not `session_risk`. So a close still works after a daily-loss or
   drawdown breach. This removes today's SELL-after-breach refusal on the old
-  path on purpose: blocking an exit does not reduce risk.
+  path on purpose, as a safety correction: blocking an exit does not reduce risk.
+- "SELL" alone never qualifies for that exemption. Before it treats a request as
+  a reduction, the trader checks, on a fresh fenced broker snapshot:
+  - there is a current position on that conid;
+  - the side reduces it (SELL for a long);
+  - the quantity is at most the position (a close takes the broker quantity);
+  - the exit owner check passes, and competing working orders on that conid are
+    handed over or reconciled first, so the close cannot reverse exposure.
+  Anything else is an entry and goes through entry admission. Protection
+  hand-over and close/flatten arbitration apply as above.
 - `ai_paper` `CLOSE` and `PARTIAL_CLOSE` decisions (section 5.4).
 
 The state machine already handles both sides (`reduce_position` derives the side
@@ -291,6 +300,19 @@ Every view says "paper". Nothing on it is proof of live edge.
   responses with it. Clients verify responses with the server's public key.
 - This works for both servers. The strategy service verifies `cli` and
   `dashboard` with their public keys, and the trader with the `trader` public key.
+- RPC keys are separate from bundle-signing keys. Only the cryptographic code is
+  reused, never a key. A bundle key is refused as an RPC key and the other way round.
+- A principal's public key comes only from the server's trusted keyring on disk.
+  A request can name a principal but can never supply or point to a key.
+- Kept and extended from today:
+  - method ACLs (below);
+  - replay protection (timestamp window and nonce);
+  - the signed bytes cover the principal, the **destination** (server principal
+    and method) and the payload, so a request for one server or method cannot be
+    replayed against another;
+  - each response is signed with the server's own private key and names the
+    request id and a digest of the request, so a client accepts only the
+    response to its own request.
 
 **Trust matrix** (caller → server). Anything not listed is refused.
 
@@ -341,7 +363,9 @@ grants rights.
 - Covers trader ports 42101–42103 and strategy ports 42104/42105.
 - Before the cutover, a split-service test runs real round trips over every
   edge of the trust matrix: CLI → trader, CLI → strategy, dashboard → both,
-  strategy → trader, trader → strategy, and `ai_supervisor` → trader.
+  strategy → trader, trader → strategy, and `ai_supervisor` → trader. It also
+  sends a wrong-principal, a tampered, a replayed, a wrong-destination and a
+  legacy-HMAC request on each server, and all must be refused.
 - Hard cutover: after `mmr keys init` and `./docker.sh -b -u`, the old
   `service_hmac.key` is refused. No dual-key mode.
 
@@ -372,9 +396,12 @@ grants rights.
   the same object, so its own copies of 0.50% and 3 positions
   (`trader/promotion/portfolio_risk_budget.py:21-22`) go away. There is no
   second evaluator.
-- The old path passes `PAPER_LIMITS`. Its decisions do not change. The parity
-  test calls `evaluate` (not a field comparison) on the old path and checks
-  that gross still stops at 6%.
+- The old path passes `PAPER_LIMITS`. **Old-path entry admission and risk
+  ceilings remain unchanged. Time exits and one-strategy SELL exits use the
+  shared safe-close path; entry-only loss limits do not block broker-proven
+  reductions** (a safety correction, see section 5.1). The parity test calls
+  `evaluate` (not a field comparison) on the old path and checks that gross
+  still stops at 6%.
 - **Attested notional.** Master added `ORDER_EXCEEDS_ATTESTED_NOTIONAL` to
   `session_risk` (commit `27c9ab96`). This branch is rebased on master before
   the plan is written. The old path keeps the check, and the parity test covers
@@ -639,6 +666,10 @@ Test-first for every part. Each change starts with a failing test.
     above the new limit (`LIMIT_TIGHTENED_BEFORE_DISPATCH`), on both paths;
   - attested notional: the old path still refuses `ORDER_EXCEEDS_ATTESTED_NOTIONAL`;
     `ai_paper` refuses an entry above `evidence_order_notional`;
+  - old-path regression: after a loss breach, a new entry is refused, a safe
+    close of the held position is allowed, and an oversized close or a close
+    conflicting with another owner is refused; a SELL with no position, or
+    larger than the position, is treated as an entry and refused;
   - reductions: `CLOSE` works while `PAUSED` and after a daily-loss breach;
     is refused without a broker position; joins the flatten while `KILLED`;
     is refused after `STOPPED`;

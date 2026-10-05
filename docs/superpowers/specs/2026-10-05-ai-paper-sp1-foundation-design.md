@@ -1,7 +1,7 @@
 # AI Paper Bot — SP1 Foundation — Design Specification
 
 **Date:** 2026-10-05
-**Status:** Draft in review (revised five times on 2026-10-05 after review; owner approved the Ed25519 identities and the old-path close correction). Not approved as a whole. Implementation not started. Line numbers refer to this branch before the master rebase.
+**Status:** Approved by the owner on 2026-10-05 after six review rounds. Implementation not started. Line numbers refer to this branch before the master rebase.
 **Replaces:** the executing path of `2026-10-04-autonomous-ai-trading-module-design.md`.
 That spec and its review (`docs/reviews/2026-10-04-autonomous-ai-trading-module-review.md`)
 stay as background. Where they disagree with this document, this document wins.

@@ -5,6 +5,10 @@
 **Scope:** Autonomous, AI-directed **paper trading**, integrated with MMR, with supplementary Telegram communication.
 **Working name:** MMR AI Supervisor.
 
+> **Superseded (2026-10-05):** the executing path of this spec is replaced by
+> [`2026-10-05-ai-paper-sp1-foundation-design.md`](2026-10-05-ai-paper-sp1-foundation-design.md)
+> and its SP2/SP3 roadmap. Keep this file as background.
+
 This document specifies a product, not a running deployment. It does not authorize
 restarting containers, registering external accounts, or submitting broker orders.
 No live-trading authority is introduced by this design.

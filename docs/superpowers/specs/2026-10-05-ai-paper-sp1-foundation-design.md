@@ -162,7 +162,11 @@ protection loss do.
     to `zero`** in one transaction. The owner then reconciles its in-flight
     reduction, never re-protects (any replacement exits already submitted are
     cancelled), and closes the remainder. It ends `CLOSED`, not `DONE`;
-  - a partial request against any existing owner is refused (`EXIT_IN_PROGRESS`).
+  - a partial request against any existing owner is refused (`EXIT_IN_PROGRESS`);
+  - the account owner is checked first. If one is active, a full-close request
+    joins that flatten. It must never upgrade a scoped owner marked
+    `SUPERSEDED`, or the superseded close could start working again after the
+    flatten has taken over.
 - An account flatten takes over every scoped owner on that account, in this
   order:
   1. it marks them `SUPERSEDED` in the same transaction as its claim;
@@ -172,8 +176,13 @@ protection loss do.
   4. it **cancels every child it has positively identified as working**,
      including replacement protection. An unknown outcome forbids a duplicate
      submission; it never forbids cancelling an identified working order;
-  5. it waits for a fresh broker generation that shows those cancels and fills;
-  6. then it reduces the remaining position. No waiting for an exit to trigger.
+  5. it waits until **every** deterministic ref is confirmed filled, cancelled
+     or absent on a broker generation newer than that child's submission. A
+     child that was submitted but is not yet visible is still unknown, and an
+     unknown outcome must never be followed by a new reduce;
+  6. only then does it reduce the remaining position. No waiting for an exit to
+     trigger. If the deadline passes with any ref still unknown, the result is
+     `FAILED_SAFE`, never a second order.
 - While an account owner is active, every scoped request joins it.
 - Callers poll the **exact root id** they got back. A receipt of another root is
   never accepted as their result.
@@ -647,6 +656,10 @@ Test-first for every part. Each change starts with a failing test.
     not re-protect, its children are reconciled before the flatten orders;
   - kill during `REPROTECTING` with working replacement exits: the flatten
     cancels them and reaches `FLAT` without waiting for them to trigger;
+  - a submitted child not yet visible at the broker blocks the flatten's
+    reduce; at the deadline the result is `FAILED_SAFE` and no second order;
+  - a full-close request during an active flatten joins it and leaves the
+    `SUPERSEDED` scoped owner untouched;
   - an old `FAILED_SAFE` root does not stop `rescan()` from advancing a newer one;
   - a caller polling its root never accepts another root's receipt;
   - exit OCA: one sibling fills before the other is acknowledged; recovery

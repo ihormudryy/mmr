@@ -1,7 +1,7 @@
 # AI Paper Bot — SP1 Foundation — Design Specification
 
 **Date:** 2026-10-05
-**Status:** Draft in review (revised four times on 2026-10-05 after review; owner approved the Ed25519 identities and the old-path close correction). Not approved as a whole. Implementation not started. Line numbers refer to this branch before the master rebase.
+**Status:** Draft in review (revised five times on 2026-10-05 after review; owner approved the Ed25519 identities and the old-path close correction). Not approved as a whole. Implementation not started. Line numbers refer to this branch before the master rebase.
 **Replaces:** the executing path of `2026-10-04-autonomous-ai-trading-module-design.md`.
 That spec and its review (`docs/reviews/2026-10-04-autonomous-ai-trading-module-review.md`)
 stay as background. Where they disagree with this document, this document wins.
@@ -154,15 +154,26 @@ protection loss do.
   `account_flatten`), root command id, and state.
 - Every exit producer claims there first: time exits, one-strategy SELL, `ai_paper`
   `CLOSE` / `PARTIAL_CLOSE`, protective failure, session flatten, `/flatten`, kill.
-- A scoped request for a conid that already has an owner does not create work. It
-  returns the existing root id (`JOINED`). A partial request against an existing
-  owner is refused (`EXIT_IN_PROGRESS`).
-- An account flatten takes over every scoped owner on that account:
+- Every owner has a durable **goal**: `partial(q)` or `zero`. A goal can only
+  move from `partial(q)` to `zero`, never back.
+- A scoped request for a conid that already has an owner does not create a
+  competing root. It returns the existing root id (`JOINED`):
+  - a full-close request against a partial owner **upgrades that owner's goal
+    to `zero`** in one transaction. The owner then reconciles its in-flight
+    reduction, never re-protects (any replacement exits already submitted are
+    cancelled), and closes the remainder. It ends `CLOSED`, not `DONE`;
+  - a partial request against any existing owner is refused (`EXIT_IN_PROGRESS`).
+- An account flatten takes over every scoped owner on that account, in this
+  order:
   1. it marks them `SUPERSEDED` in the same transaction as its claim;
   2. superseded closes stop at once and never re-protect;
-  3. it waits for a broker generation that shows every child they submitted
-     (found by their deterministic order refs) as filled, cancelled or absent;
-  4. only then does it cancel and reduce.
+  3. it reads the broker by their deterministic order refs to find every child
+     they submitted: entry cancels, reduces, replacement stops and targets;
+  4. it **cancels every child it has positively identified as working**,
+     including replacement protection. An unknown outcome forbids a duplicate
+     submission; it never forbids cancelling an identified working order;
+  5. it waits for a fresh broker generation that shows those cancels and fills;
+  6. then it reduces the remaining position. No waiting for an exit to trigger.
 - While an account owner is active, every scoped request joins it.
 - Callers poll the **exact root id** they got back. A receipt of another root is
   never accepted as their result.
@@ -626,8 +637,12 @@ Test-first for every part. Each change starts with a failing test.
   - a stop cancel the close did not request still starts the emergency path;
   - routine scoped-close progress does not trip the breaker;
   - a time exit and an AI close on the same conid: one root, the second joins;
+  - a time exit (full close) arriving during a partial close upgrades the goal
+    to `zero`: the result is zero position and no residual exits, not `DONE`;
   - an account flatten during a partial close: the close is superseded, does
     not re-protect, its children are reconciled before the flatten orders;
+  - kill during `REPROTECTING` with working replacement exits: the flatten
+    cancels them and reaches `FLAT` without waiting for them to trigger;
   - an old `FAILED_SAFE` root does not stop `rescan()` from advancing a newer one;
   - a caller polling its root never accepts another root's receipt;
   - exit OCA: one sibling fills before the other is acknowledged; recovery
@@ -700,8 +715,9 @@ also pass one real IB paper session.
 - It registers a catalogue strategy with `register_ai_deployment`, signed with
   the `ai_research` key, and the seal is applied as in production.
 - It publishes a policy and submits decisions with the `ai_supervisor` key:
-  one entry, a partial close, a full close; then it waits for the session
-  flatten.
+  two entries on different conids; a partial close and then a full close of the
+  first; the second position is left open so the session flatten has something
+  real to close. It passes only if the flatten reaches `FLAT` on broker evidence.
 - It uses the real methods and the real keys. It never seeds the database and
   never skips the seal.
 - It runs on the host, as the operator, and reads the `ai_research` and

@@ -1,0 +1,4 @@
+# Default reviewer for every pull request. GitHub requests a review from
+# the owner automatically, except on PRs the owner authored (GitHub never
+# requests the author).
+* @ihormudryy

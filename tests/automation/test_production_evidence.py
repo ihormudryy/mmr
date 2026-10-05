@@ -369,7 +369,12 @@ def test_hwm_failure_is_fail_closed_and_opaque(monkeypatch):
 
 def artifact(**changes):
     from trader.automation.artifact_verifier import VerifiedArtifact
+    from trader.automation.strategy_binding import AttestedStrategy
     fields = dict(
+        attested_strategy=AttestedStrategy(
+            strategy_path="strategies/orb.py", class_name="OpeningRangeBreakout",
+            source_digest="src-1", parameters={}, instruments=frozenset({str(CONID)}),
+            bar_size="1 min", order_notional=1_000_000.0),
         artifact_id="artifact-test", manifest_digest="artifact-digest", dataset_manifest_digest="dataset-digest",
         parameters={}, allowlist=(str(CONID),), max_gross_allocation=0.1,
         expires_at=NOW + dt.timedelta(days=1), public_key_id="test-key", verification_reason_codes=("OK",),

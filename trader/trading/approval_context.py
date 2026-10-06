@@ -37,8 +37,9 @@ class InFlightEntry:
 
     ``unfilled_quantity`` may still be working at the broker (zero once a
     broker cancel or reject is recorded). ``filled_quantity`` was bought;
-    it counts until a position row or a broker enumeration newer than
-    ``filled_at`` proves the snapshot includes it.
+    it counts until the position quantity has grown by it from
+    ``baseline_position`` (the quantity when the entry was sent), or a
+    broker enumeration that began after ``filled_at`` is promoted.
     """
 
     order_group_id: str
@@ -47,6 +48,7 @@ class InFlightEntry:
     filled_quantity: float
     limit_price: float
     filled_at: Optional[dt.datetime] = None
+    baseline_position: Optional[float] = None
 
 
 @dataclass(frozen=True)

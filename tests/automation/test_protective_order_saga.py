@@ -1847,12 +1847,7 @@ def test_full_fill_counts_until_a_newer_position_or_generation_shows_it(tmp_path
 
     assert _try_entry(tmp_path, empty, 25, "lag").error_code == "GROSS_EXPOSURE_IN_FLIGHT"
 
-    # A position row stamped before the fill does not prove it.
-    stale = replace_snapshot(
-        empty, positions=(_held(CONID, 25, stamped=NOW - dt.timedelta(seconds=1)),),
-    )
-    assert _try_entry(tmp_path, stale, 6, "stale").state == "CLOSED"
-
+    # The position quantity shows the 25 shares: they are counted once.
     fresh = replace_snapshot(
         empty, positions=(_held(CONID, 25, stamped=NOW + dt.timedelta(seconds=1)),),
     )
@@ -1865,3 +1860,75 @@ def test_full_fill_counts_until_a_newer_position_or_generation_shows_it(tmp_path
         generation_started_at=NOW + dt.timedelta(seconds=1),
     )
     assert _try_entry(tmp_path, enumerated, 25, "enumerated").state == "SUBMITTING"
+
+
+# --- Round 3: fills on terminal paths, quantity proof, SAFETY_FAILED entry ---
+
+@pytest.mark.parametrize("events", [
+    pytest.param((("Submitted", 5), ("Inactive", 5)), id="inactive-after-partial"),
+    pytest.param((("Rejected", 5),), id="rejected-with-fill"),
+])
+def test_rejected_entry_keeps_its_filled_shares_reserved(tmp_path, events):
+    empty = _snapshot()
+    saga, *_ = _build_saga(tmp_path, guard=_group_guard(empty), risk=_sized_risk())
+    first = _start_entry(saga, _entry(CONID), empty)
+    for index, (status, filled) in enumerate(events):
+        state = saga.on_broker_event(_entry_fill(
+            first.order_group_id, status=status, filled=filled, event_id=f"e{index}",
+        ))
+    assert (state.state, state.filled_quantity) == ("CLOSED", Decimal(5))
+
+    # 36 shares fit alone, not with the 5 filled shares the position does not show.
+    assert _try_entry(tmp_path, empty, 36, "big").error_code == "GROSS_EXPOSURE_IN_FLIGHT"
+    assert _try_entry(tmp_path, empty, 25, "fits").state == "SUBMITTING"
+
+
+def test_pnl_only_position_update_does_not_prove_the_fill(tmp_path):
+    from dataclasses import replace as dc_replace
+
+    held_one = replace_snapshot(_snapshot(), positions=(_held(CONID, 1, stamped=NOW),))
+    saga, *_ = _build_saga(tmp_path, guard=_group_guard(held_one), risk=_sized_risk())
+    first = _start_entry(saga, _entry(CONID), held_one)
+    saga.on_broker_event(
+        _entry_fill(first.order_group_id, status="Submitted", filled=5, event_id="p5"),
+    )
+    working = (dc_replace(_working_entry(first.order_group_id, CONID), filled_quantity=5.0),)
+
+    # A PnL update refreshed the row after the fill; its quantity is still 1.
+    refreshed = replace_snapshot(
+        held_one, working_orders=working,
+        positions=(_held(CONID, 1, stamped=NOW + dt.timedelta(seconds=1)),),
+    )
+    # 160 + 3,201.80 + 800.45 + 2,241.26 = 6,403.51
+    assert _try_entry(tmp_path, refreshed, 14, "pnl").error_code == "GROSS_EXPOSURE_IN_FLIGHT"
+
+    grown = replace_snapshot(
+        refreshed, positions=(_held(CONID, 6, stamped=NOW + dt.timedelta(seconds=2)),),
+    )
+    # 960 + 3,201.80 + 1,600.90 fits; counting the 5 shares twice would not.
+    assert _try_entry(tmp_path, grown, 10, "grown").state == "SUBMITTING"
+
+
+def test_safety_failed_entry_keeps_its_unfilled_part_until_cancelled(tmp_path):
+    empty = _snapshot()
+    saga, *_ = _build_saga(tmp_path, guard=_group_guard(empty), risk=_sized_risk())
+    first = _start_entry(saga, _entry(CONID), empty)
+    group = first.order_group_id
+    saga.on_broker_event(_entry_fill(group, status="Submitted", filled=5, event_id="p5"))
+    failed = saga.on_broker_event(_event(group, leg="stop", status="Rejected", order_id=2))
+    assert failed.state == "SAFETY_FAILED"
+
+    # 20 unfilled + 5 filled are reserved: a second 25-share entry does not fit.
+    assert _try_entry(tmp_path, empty, 25, "a").error_code == "GROSS_EXPOSURE_IN_FLIGHT"
+
+    later = saga.on_broker_event(
+        _entry_fill(group, status="Submitted", filled=12, event_id="p12"),
+    )
+    assert (later.state, later.filled_quantity) == ("SAFETY_FAILED", Decimal(12))
+    cancelled = saga.on_broker_event(
+        _entry_fill(group, status="Cancelled", filled=12, event_id="c12"),
+    )
+    assert cancelled.entry_cancelled is True
+
+    # Only the 12 filled shares stay reserved: 4,002.25 + 1,921.08 fits.
+    assert _try_entry(tmp_path, empty, 25, "b").state == "SUBMITTING"

@@ -233,3 +233,58 @@ def test_snapshot_adapter_exposes_only_active_broker_rows_with_fenced_identity(e
     assert snapshot.entities["position"] == [{
         **replace(position, revision=event.entity_revision).to_payload(),
     }]
+
+
+def _group_order(order_entity_id, group, deleted=False, status="Cancelled"):
+    from trader.data.broker_state import BrokerOrderRow
+
+    return BrokerOrderRow(
+        order_entity_id=order_entity_id, account_id="DU123", conid=265598, symbol="AAPL",
+        order_group_id=group, leg="entry", is_external=False, action="BUY", order_type="LMT",
+        total_quantity=10.0, filled_quantity=0.0, avg_fill_price=None, limit_price=185.0,
+        stop_price=None, tif="DAY", status=status, deleted=deleted, revision=1,
+        source_timestamp=UTC_NOW,
+    )
+
+
+def _group_fill(order_entity_id):
+    return BrokerFillRow(
+        account_id="DU123", exec_id="0001.xyz", order_entity_id=order_entity_id, perm_id=1,
+        client_order_id=5, session_epoch="s1", conid=265598, side="BUY", quantity=10.0,
+        price=185.0, commission=None, commission_currency=None, realized_pnl=None,
+        fill_time=UTC_NOW, revision=1, source_timestamp=UTC_NOW,
+    )
+
+
+def _has_trace(env, group):
+    return env.db.transaction(
+        lambda conn: env.store.group_has_broker_trace_in_tx(conn, "DU123", group)
+    )
+
+
+def test_group_trace_is_absent_without_orders_or_executions(env):
+    assert _has_trace(env, "og-1") is False
+
+
+def test_group_trace_counts_terminal_and_deleted_orders(env):
+    env.db.transaction(lambda conn: env.store.upsert_order_in_tx(
+        conn, _group_order("o1", "og-1", deleted=True)))
+
+    assert _has_trace(env, "og-1") is True
+    assert _has_trace(env, "og-2") is False
+
+
+def test_group_trace_counts_an_execution_bound_to_the_group(env):
+    def seed(conn):
+        env.store.upsert_order_in_tx(conn, _group_order("o1", "og-1"))
+        env.store.upsert_fill_in_tx(conn, _group_fill("o1"))
+
+    env.db.transaction(seed)
+
+    assert _has_trace(env, "og-1") is True
+
+
+def test_group_trace_is_never_a_false_no_while_an_execution_is_unbound(env):
+    env.db.transaction(lambda conn: env.store.upsert_fill_in_tx(conn, _group_fill(None)))
+
+    assert _has_trace(env, "og-1") is True

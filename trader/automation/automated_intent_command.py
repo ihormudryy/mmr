@@ -3,12 +3,11 @@
 Routes a verified ``ExecutionIntent`` through the existing
 ``TradingCommandCoordinator``. Protective-order construction is Task 5; this
 module validates principal + intent identity, re-verifies the artifact bundle,
-audits authority digests (via the coordinator's RECEIVED audit of ``body``),
-and dispatches through an injected port so tests can prove exactly-once
-delivery without talking to IB.
+and audits authority digests (via the coordinator's RECEIVED audit of ``body``).
 
-When a ``ProtectiveOrderSaga`` is injected, session risk + DispatchGuard +
-bracket submit run inside ``saga.start`` (Task 5) instead of a bare dispatch.
+Session risk + DispatchGuard + bracket submit run inside
+``ProtectiveOrderSaga.start`` (Task 5). Without a saga the command is refused
+with ``SAGA_REQUIRED``: there is no unguarded send path.
 """
 from __future__ import annotations
 
@@ -26,7 +25,6 @@ from trader.automation.models import (
 )
 from trader.domain.commands import CommandReceipt
 from trader.trading.command_coordinator import BrokerRejectedError, CommandRequest
-from trader.trading.order_correlation import encode_order_ref
 
 STRATEGY_PRINCIPAL = "strategy_service"
 _ALLOWED_PRINCIPALS = frozenset({STRATEGY_PRINCIPAL})
@@ -252,6 +250,12 @@ class AutomatedIntentCommandService:
                 outcome={"detail": source_mismatch},
             )
 
+        if self._protective_saga is None or self._approval_factory is None:
+            # Without the saga there is no gross reservation or dispatch guard.
+            code = "SAGA_REQUIRED"
+            self._transition(cmd, "RECEIVED", "REJECTED", error_code=code)
+            return self._receipt(cmd.command_id, "REJECTED", code, False)
+
         self._transition(cmd, "RECEIVED", "VALIDATED")
 
         # A SELL on the long-only path is an exit, never a bracket (spec 5.1). It adds no
@@ -260,7 +264,6 @@ class AutomatedIntentCommandService:
             return self._execute_close(cmd, intent, artifact)
 
         order_group_id = f"og-{cmd.command_id}"
-        order_ref = encode_order_ref(order_group_id)
 
         try:
             self._claim(cmd, require_unpaused=True)
@@ -271,29 +274,8 @@ class AutomatedIntentCommandService:
             self._transition(cmd, "VALIDATED", "REJECTED", error_code=code)
             return self._receipt(cmd.command_id, "REJECTED", code, True)
 
-        # Task 5 path: protective saga owns risk + guard + bracket submit.
-        if self._protective_saga is not None and self._approval_factory is not None:
-            return self._execute_via_saga(
-                cmd, intent, artifact, order_group_id, bundle_digest,
-            )
-
-        try:
-            submitted = self._dispatch.submit(
-                intent=intent, order_group_id=order_group_id, order_ref=order_ref,
-            )
-        except Exception:
-            self._transition(
-                cmd, "SUBMITTING", "OUTCOME_UNKNOWN", error_code="DISPATCH_AMBIGUOUS",
-            )
-            if self._schedule_reconcile is not None:
-                self._schedule_reconcile(cmd.command_id)
-            return self._receipt(
-                cmd.command_id, "OUTCOME_UNKNOWN", "DISPATCH_AMBIGUOUS", False,
-            )
-
-        order_ids = list(getattr(submitted, "order_ids", []) or [])
-        return self._finish_submitted(
-            cmd, intent, order_group_id, order_ids, bundle_digest,
+        return self._execute_via_saga(
+            cmd, intent, artifact, order_group_id, bundle_digest,
         )
 
     def _execute_via_saga(

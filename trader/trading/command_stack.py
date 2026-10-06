@@ -32,6 +32,7 @@ from trader.trading.command_alerts import LoggingCriticalAlertPort
 from trader.trading.command_policy import CommandAuthorityPolicy
 from trader.trading.command_ports import (
     TraderBrokerAuthority,
+    BrokerStateOrphanEvidence,
     TraderBrokerRiskSnapshotAuthority,
     TraderPositionAuthority,
     TraderQuoteAuthority,
@@ -968,6 +969,9 @@ def build_command_stack(
         account_mode=account_mode,
         now=now,
         db=trader.journal_db,
+        orphan_evidence=BrokerStateOrphanEvidence(
+            db=trader.journal_db, store=trader.broker_state_store, snapshots=broker_snapshot,
+        ),
     )
     # The saga is the protection port of every close and the source of unhandled failures.
     liquidation_service.attach_protection(protective_order_saga)

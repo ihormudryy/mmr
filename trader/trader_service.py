@@ -381,6 +381,29 @@ def _maybe_start_session_recovery(
     loop.create_task(_session_controller_loop(controller, worker))
 
 
+async def _orphan_reservation_tick(saga, worker):
+    """One orphan sweep on the worker; reads broker state only, never sends."""
+    return await _on_worker(worker, saga.retire_orphan_reservations)
+
+
+async def _orphan_reservation_loop(
+    saga, worker, *, interval: float = 30.0, stuck_after: float = _WORKER_STUCK_AFTER_SECONDS,
+) -> None:
+    """Release entry reservations that a complete, newer broker enumeration disproves."""
+    await _watched_ticks(
+        'orphan reservation sweep', lambda: _orphan_reservation_tick(saga, worker),
+        interval=interval, stuck_after=stuck_after)
+
+
+def _maybe_start_orphan_reservation_sweep(
+    trader: Trader, loop: AbstractEventLoop, worker, stopping: Callable[[], bool] = _never_stopping,
+) -> None:
+    saga = getattr(trader, 'protective_order_saga', None)
+    if saga is None or stopping():
+        return
+    loop.create_task(_orphan_reservation_loop(saga, worker))
+
+
 def _finish_startup_shutdown(loop: AbstractEventLoop, shutdown: asyncio.Future | None) -> None:
     """Let a shutdown that began during startup recovery run to its end.
 
@@ -521,6 +544,7 @@ def main(simulation: bool,
         _maybe_start_liquidation_recovery(trader, loop, liquidation_worker, stopping)
         # P3 Task 6: session deadline recovery must start before readiness/run.
         _maybe_start_session_recovery(trader, loop, liquidation_worker, stopping)
+        _maybe_start_orphan_reservation_sweep(trader, loop, liquidation_worker, stopping)
         if stopping():
             _finish_startup_shutdown(loop, shutdown)
             logging.info('shutdown requested during startup recovery; not starting the trader loop')

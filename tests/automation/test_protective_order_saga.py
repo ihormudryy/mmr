@@ -1471,7 +1471,7 @@ OTHER_CONID = 272093
 ENTRY_SHARES = 25
 
 
-def _group_guard(snapshot, *, meet_other_thread=None):
+def _group_guard(snapshot, *, meet_other_thread=None, quote_clock=lambda: NOW):
     """A real DispatchGuard whose broker always returns ``snapshot``.
 
     ``meet_other_thread`` is a Barrier: the broker read waits for the other
@@ -1494,7 +1494,7 @@ def _group_guard(snapshot, *, meet_other_thread=None):
     class Quotes:
         def executable_quote(self, conid, *, side):
             return ExecutableQuote(
-                conid=conid, side="ask", price=160.01, market_timestamp=NOW,
+                conid=conid, side="ask", price=160.01, market_timestamp=quote_clock(),
                 feed_type="live", session_state="continuous", bid=159.99, ask=160.01,
             )
 
@@ -1960,3 +1960,232 @@ def test_a_close_owned_entry_stays_reserved_and_records_its_fills_and_cancel(tmp
 
     # Only the 12 filled shares stay reserved: 4,002.25 + 1,921.08 fits.
     assert _try_entry(tmp_path, empty, 25, "b").state == "SUBMITTING"
+
+
+# --- Orphan entry reservations (issue #51) ------------------------------------
+#
+# A SUBMITTING / OUTCOME_UNKNOWN row counts toward gross. If the send never
+# reached IB, no broker event ever moves it. Only a complete broker enumeration
+# that began after the send, and shows no order group or execution, retires it.
+
+SEND_GENERATION = 1
+AFTER_SETTLE = NOW + dt.timedelta(minutes=5)
+
+
+class FakeOrphanEvidence:
+    def __init__(self, *, generation=SEND_GENERATION, started_at=NOW - dt.timedelta(hours=1)):
+        self.generation = generation
+        self.started_at = started_at
+        self.group_seen = False
+        self.enumeration_error: Optional[BaseException] = None
+        self.group_error: Optional[BaseException] = None
+
+    def newer_enumeration(self, generation=SEND_GENERATION + 1, started_at=NOW + dt.timedelta(minutes=1)):
+        self.generation = generation
+        self.started_at = started_at
+
+    def latest_complete_enumeration(self, account_id):
+        from trader.automation.protective_order_saga import BrokerEnumeration
+
+        if self.enumeration_error is not None:
+            raise self.enumeration_error
+        return BrokerEnumeration(generation_id=self.generation, started_at=self.started_at)
+
+    def order_group_seen(self, account_id, order_group_id):
+        if self.group_error is not None:
+            raise self.group_error
+        return self.group_seen
+
+
+class Clock:
+    def __init__(self, at=NOW):
+        self.at = at
+
+    def __call__(self):
+        return self.at
+
+
+def _saga_with_evidence(tmp_path, snapshot, evidence, clock, **overrides):
+    return _build_saga(
+        tmp_path, guard=_group_guard(snapshot, quote_clock=clock), risk=_sized_risk(),
+        orphan_evidence=evidence, now=clock, **overrides,
+    )
+
+
+def _orphan_after_crash(tmp_path, *, ambiguous_send=False):
+    """A saga row left SUBMITTING (crash) or OUTCOME_UNKNOWN (lost send), then a restart."""
+    snapshot = _snapshot()
+    evidence, clock = FakeOrphanEvidence(), Clock()
+    saga, _, _, dispatch, *_ = _saga_with_evidence(tmp_path, snapshot, evidence, clock)
+    if ambiguous_send:
+        dispatch.raise_on_submit(TimeoutError("send never acknowledged"))
+    orphan = _start_entry(saga, _entry(CONID), snapshot)
+    expected = "OUTCOME_UNKNOWN" if ambiguous_send else "SUBMITTING"
+    assert orphan.state == expected
+    assert orphan.send_generation_id == SEND_GENERATION
+
+    restarted, _, _, dispatch2, _, _, _, _, db = _saga_with_evidence(
+        tmp_path, snapshot, evidence, clock,
+    )
+    blocked = _start_entry(restarted, _entry(OTHER_CONID), snapshot)
+    assert blocked.error_code == "GROSS_EXPOSURE_IN_FLIGHT"
+    return SimpleNamespace(
+        saga=restarted, orphan=orphan, evidence=evidence, clock=clock,
+        snapshot=snapshot, dispatch=dispatch2,
+    )
+
+
+def _state_of(env, command_id):
+    return env.saga._store.load(command_id).state
+
+
+@pytest.mark.parametrize("ambiguous_send", [False, True], ids=["crash-before-send", "send-not-acknowledged"])
+def test_orphan_row_is_retired_by_a_newer_complete_enumeration_and_a_new_entry_fits(
+    tmp_path, ambiguous_send,
+):
+    env = _orphan_after_crash(tmp_path, ambiguous_send=ambiguous_send)
+    env.evidence.newer_enumeration()
+    env.clock.at = AFTER_SETTLE
+
+    assert env.saga.retire_orphan_reservations() == (env.orphan.command_id,)
+
+    retired = env.saga._store.load(env.orphan.command_id)
+    assert (retired.state, retired.error_code) == ("NOT_SENT", "ORPHAN_NOT_SENT")
+    fits = _start_entry(env.saga, _entry(OTHER_CONID, signal="after"), env.snapshot)
+    assert (fits.state, fits.error_code) == ("SUBMITTING", None)
+    assert len(env.dispatch.calls) == 1
+
+
+def test_orphan_retirement_is_recorded_as_an_incident(tmp_path, caplog):
+    env = _orphan_after_crash(tmp_path)
+    env.evidence.newer_enumeration()
+    env.clock.at = AFTER_SETTLE
+
+    with caplog.at_level("ERROR"):
+        env.saga.retire_orphan_reservations()
+
+    assert any(
+        "ORPHAN_NOT_SENT" in record.getMessage() and env.orphan.command_id in record.getMessage()
+        for record in caplog.records
+    )
+
+
+def test_row_is_kept_when_the_enumeration_is_incomplete(tmp_path):
+    env = _orphan_after_crash(tmp_path)
+    env.evidence.newer_enumeration()
+    env.evidence.enumeration_error = RuntimeError("generation 2 is still staging")
+    env.clock.at = AFTER_SETTLE
+
+    assert env.saga.retire_orphan_reservations() == ()
+    assert _state_of(env, env.orphan.command_id) == "SUBMITTING"
+
+
+@pytest.mark.parametrize("generation, started_at, now", [
+    pytest.param(SEND_GENERATION, NOW + dt.timedelta(minutes=1), AFTER_SETTLE, id="same-generation"),
+    pytest.param(SEND_GENERATION + 1, NOW - dt.timedelta(seconds=1), AFTER_SETTLE, id="began-before-send"),
+    pytest.param(SEND_GENERATION + 1, NOW + dt.timedelta(seconds=5), NOW + dt.timedelta(seconds=10),
+                 id="inside-settle-window"),
+])
+def test_row_is_kept_when_the_enumeration_is_not_newer_than_the_send(
+    tmp_path, generation, started_at, now,
+):
+    env = _orphan_after_crash(tmp_path)
+    env.evidence.newer_enumeration(generation, started_at)
+    env.clock.at = now
+
+    assert env.saga.retire_orphan_reservations() == ()
+    assert _state_of(env, env.orphan.command_id) == "SUBMITTING"
+
+
+def test_row_is_kept_when_the_broker_shows_the_order_group_and_counts_once(tmp_path):
+    env = _orphan_after_crash(tmp_path)
+    env.evidence.newer_enumeration()
+    env.evidence.group_seen = True
+    env.clock.at = AFTER_SETTLE
+
+    assert env.saga.retire_orphan_reservations() == ()
+    assert _state_of(env, env.orphan.command_id) == "SUBMITTING"
+
+    # The broker's own working order carries the 4%; the row adds nothing on top.
+    visible = replace_snapshot(env.snapshot, working_orders=(
+        _working_entry(env.orphan.order_group_id, CONID),
+    ))
+    counting, *_ = _build_saga(
+        tmp_path, guard=_group_guard(visible, quote_clock=env.clock), risk=_sized_risk(6),
+        orphan_evidence=env.evidence, now=env.clock,
+    )
+    small = _start_entry(counting, _entry(OTHER_CONID, shares=6), visible)
+    assert small.state == "SUBMITTING"
+
+
+def test_row_is_kept_when_the_order_lookup_is_unreadable(tmp_path):
+    env = _orphan_after_crash(tmp_path)
+    env.evidence.newer_enumeration()
+    env.evidence.group_error = RuntimeError("broker state unreadable")
+    env.clock.at = AFTER_SETTLE
+
+    assert env.saga.retire_orphan_reservations() == ()
+    assert _state_of(env, env.orphan.command_id) == "SUBMITTING"
+
+
+def test_row_without_send_evidence_is_never_retired(tmp_path):
+    snapshot = _snapshot()
+    clock = Clock()
+    saga, *_ = _build_saga(
+        tmp_path, guard=_group_guard(snapshot), risk=_sized_risk(), now=clock,
+    )
+    row = _start_entry(saga, _entry(CONID), snapshot)
+    assert row.send_generation_id is None
+
+    evidence = FakeOrphanEvidence()
+    evidence.newer_enumeration()
+    clock.at = AFTER_SETTLE
+    sweeper, *_ = _build_saga(
+        tmp_path, guard=_group_guard(snapshot), risk=_sized_risk(),
+        orphan_evidence=evidence, now=clock,
+    )
+
+    assert sweeper.retire_orphan_reservations() == ()
+    assert sweeper._store.load(row.command_id).state == "SUBMITTING"
+
+
+def test_sweep_skips_while_an_entry_send_holds_the_account_lock(tmp_path):
+    from trader.automation.protective_order_saga import _account_entry_lock
+
+    env = _orphan_after_crash(tmp_path)
+    env.evidence.newer_enumeration()
+    env.clock.at = AFTER_SETTLE
+
+    with _account_entry_lock(ACCOUNT):
+        assert env.saga.retire_orphan_reservations() == ()
+    assert _state_of(env, env.orphan.command_id) == "SUBMITTING"
+
+
+def test_broker_event_for_a_retired_row_trips_the_breaker(tmp_path):
+    from trader.automation.protective_order_saga import BrokerOrderEvent
+
+    env = _orphan_after_crash(tmp_path)
+    env.evidence.newer_enumeration()
+    env.clock.at = AFTER_SETTLE
+    env.saga.retire_orphan_reservations()
+
+    env.saga.on_broker_event(BrokerOrderEvent(
+        order_group_id=env.orphan.order_group_id, leg="entry", status="Submitted",
+        filled_quantity=0, total_quantity=ENTRY_SHARES, order_id=5001,
+        event_id="late-1", source_timestamp=AFTER_SETTLE,
+    ))
+
+    assert [s.kind for s in env.saga._breaker.signals] == ["RECONCILIATION_DIVERGENCE"]
+    assert _state_of(env, env.orphan.command_id) == "NOT_SENT"
+
+
+def test_entry_is_refused_when_the_send_generation_cannot_be_recorded(tmp_path):
+    snapshot = _snapshot()
+    evidence = FakeOrphanEvidence()
+    evidence.enumeration_error = RuntimeError("no complete generation")
+    saga, _, _, dispatch, *_ = _saga_with_evidence(tmp_path, snapshot, evidence, Clock())
+
+    state = _start_entry(saga, _entry(CONID), snapshot)
+
+    assert (state.state, state.error_code) == ("CLOSED", "BROKER_GENERATION_UNAVAILABLE")
+    assert dispatch.calls == []

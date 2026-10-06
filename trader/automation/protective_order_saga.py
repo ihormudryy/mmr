@@ -10,6 +10,7 @@ from __future__ import annotations
 import contextlib
 import datetime as dt
 import json
+import logging
 import threading
 from dataclasses import dataclass, replace
 from decimal import Decimal, ROUND_HALF_UP
@@ -40,6 +41,7 @@ SAGA_STATES = frozenset({
     "OUTCOME_UNKNOWN",
     "SAFETY_FAILED",
     "CLOSE_OWNED",
+    "NOT_SENT",
 })
 
 # A stop that protects a released remainder: accepted and working, or already filled as the exit.
@@ -50,7 +52,11 @@ _WORKING_STATUSES = frozenset({
 _FILLED_STATUSES = frozenset({"Filled"})
 _CANCELLED_STATUSES = frozenset({"Cancelled", "ApiCancelled"})
 _REJECTED_STATUSES = frozenset({"Inactive", "Rejected"})
-_TERMINAL_SAGA = frozenset({"CLOSED", "SAFETY_FAILED"})
+_TERMINAL_SAGA = frozenset({"CLOSED", "SAFETY_FAILED", "NOT_SENT"})
+# A send that may not have reached the broker. Nothing else retires these rows.
+_UNCONFIRMED_SEND_SAGA = ("SUBMITTING", "OUTCOME_UNKNOWN")
+ORPHAN_NOT_SENT = "ORPHAN_NOT_SENT"
+DEFAULT_ORPHAN_SETTLE_SECONDS = 60.0
 # The entry may be at the broker with quantity still unfilled. VALIDATED is
 # not here: it is written before the dispatch guard, so nothing was sent yet.
 _IN_FLIGHT_SAGA = ("SUBMITTING", "OUTCOME_UNKNOWN", "ENTRY_WORKING", "PARTIALLY_FILLED")
@@ -343,6 +349,9 @@ class SagaState:
     filled_at: Optional[dt.datetime] = None
     # Broker position quantity of the conid when the entry was sent.
     baseline_position: Optional[Decimal] = None
+    # Broker enumeration generation and time at the send attempt (see retire_orphan_reservations).
+    send_generation_id: Optional[int] = None
+    send_attempted_at: Optional[str] = None
 
     @property
     def current_groups(self) -> tuple[str, ...]:
@@ -388,6 +397,8 @@ class SagaState:
             "baseline_position": (
                 None if self.baseline_position is None else str(self.baseline_position)
             ),
+            "send_generation_id": self.send_generation_id,
+            "send_attempted_at": self.send_attempted_at,
         }
 
     @classmethod
@@ -434,7 +445,33 @@ class SagaState:
                 _dec(payload["baseline_position"])
                 if payload.get("baseline_position") is not None else None
             ),
+            send_generation_id=(
+                int(payload["send_generation_id"])
+                if payload.get("send_generation_id") is not None else None
+            ),
+            send_attempted_at=payload.get("send_attempted_at"),
         )
+
+
+@dataclass(frozen=True)
+class BrokerEnumeration:
+    """A complete, promoted broker enumeration: its id and when it began."""
+
+    generation_id: int
+    started_at: dt.datetime
+
+
+class OrphanEvidencePort(Protocol):
+    def latest_complete_enumeration(self, account_id: str) -> BrokerEnumeration:
+        """Newest complete enumeration; raises when none can be read."""
+        ...
+
+    def order_group_seen(self, account_id: str, order_group_id: str) -> bool:
+        """True if the broker shows any order or execution for the group.
+
+        Must answer True when it cannot rule one out; raises when unreadable.
+        """
+        ...
 
 
 class BracketDispatchPort(Protocol):
@@ -580,6 +617,23 @@ class ProtectiveOrderSagaStore:
             ))
         return tuple(entries)
 
+    def require_revision_in_tx(self, conn, command_id: str, revision: int) -> None:
+        row = conn.execute(
+            "SELECT payload FROM automated_order_sagas WHERE command_id = ?", [command_id],
+        ).fetchone()
+        current = None if row is None else SagaState.from_payload(json.loads(row[0])).revision
+        if current != revision:
+            raise ValueError(f"saga {command_id} changed: revision {current}, expected {revision}")
+
+    def unconfirmed_sends(self, account_id: str) -> tuple[SagaState, ...]:
+        placeholders = ", ".join("?" for _ in _UNCONFIRMED_SEND_SAGA)
+        rows = self._db.execute(
+            f"SELECT payload FROM automated_order_sagas WHERE state IN ({placeholders})",
+            list(_UNCONFIRMED_SEND_SAGA), fetch="all",
+        )
+        states = (SagaState.from_payload(json.loads(payload)) for (payload,) in rows or ())
+        return tuple(state for state in states if state.account_id == account_id)
+
     def seen_event_in_tx(self, conn, event_id: str) -> bool:
         row = conn.execute(
             "SELECT 1 FROM automated_order_saga_events WHERE event_id = ?", [event_id],
@@ -698,6 +752,8 @@ class ProtectiveOrderSaga:
         now: Callable[[], dt.datetime],
         db: Any,
         liquidation_deadline_seconds: float = 300.0,
+        orphan_evidence: Optional[OrphanEvidencePort] = None,
+        orphan_settle_seconds: float = DEFAULT_ORPHAN_SETTLE_SECONDS,
     ):
         self._journal = journal
         self._ledger = ledger
@@ -711,6 +767,8 @@ class ProtectiveOrderSaga:
         self._now = now
         self._store = ProtectiveOrderSagaStore(db)
         self._liquidation_deadline_seconds = liquidation_deadline_seconds
+        self._orphan_evidence = orphan_evidence
+        self._orphan_settle = dt.timedelta(seconds=orphan_settle_seconds)
 
     # -- public API --------------------------------------------------------
 
@@ -871,8 +929,23 @@ class ProtectiveOrderSaga:
             self._persist(closed, now, from_state="VALIDATED")
             return closed
 
+        send_generation_id = None
+        if self._orphan_evidence is not None:
+            try:
+                send_generation_id = self._orphan_evidence.latest_complete_enumeration(
+                    self._account_id,
+                ).generation_id
+            except Exception:
+                closed = replace(
+                    validated, state="CLOSED", error_code="BROKER_GENERATION_UNAVAILABLE",
+                    revision=validated.revision + 1,
+                )
+                self._persist(closed, now, from_state="VALIDATED")
+                return closed
+
         submitting = replace(
             validated, state="SUBMITTING", revision=validated.revision + 1,
+            send_generation_id=send_generation_id, send_attempted_at=now.isoformat(),
             baseline_position=_dec(approval.broker.reducible_quantity(validated.conid)),
         )
         self._persist(submitting, now, from_state="VALIDATED")
@@ -937,6 +1010,9 @@ class ProtectiveOrderSaga:
             return state
         if state.state == "SAFETY_FAILED" and event.leg == "entry":
             return self._record_entry_after_safety_failure(state, event)
+        if state.state == "NOT_SENT":
+            self._report_event_for_retired_row(state, event)
+            return state
         if state.state in _TERMINAL_SAGA:
             return state
 
@@ -1144,6 +1220,95 @@ class ProtectiveOrderSaga:
         )
         self._persist(updated, self._now_utc(), from_state=state.state, event_id=event.event_id)
         return updated
+    # -- orphan reservations -----------------------------------------------
+
+    def retire_orphan_reservations(self) -> tuple[str, ...]:
+        """Retire SUBMITTING / OUTCOME_UNKNOWN rows the broker proves were never sent.
+
+        Such a row counts toward gross until a broker event moves it. After a
+        crash before the send, or a send that never reached IB, no event comes.
+        A row is retired only when a complete broker enumeration that began
+        after the send attempt, and after the generation recorded at the send,
+        shows no order group and no execution for it. Anything unreadable
+        keeps the row: the reservation fails closed. Returns the retired
+        command ids.
+        """
+        if self._orphan_evidence is None:
+            return ()
+        lock = _account_entry_lock(self._account_id)
+        # Never wait: an entry send holds this lock for up to the dispatch timeout.
+        if not lock.acquire(blocking=False):
+            return ()
+        try:
+            return self._retire_orphans()
+        finally:
+            lock.release()
+
+    def _retire_orphans(self) -> tuple[str, ...]:
+        candidates = self._store.unconfirmed_sends(self._account_id)
+        if not candidates:
+            return ()
+        now = self._now_utc()
+        try:
+            enumeration = self._orphan_evidence.latest_complete_enumeration(self._account_id)
+        except Exception:
+            logging.warning("orphan reservation check skipped: no complete broker enumeration")
+            return ()
+        retired = []
+        for state in candidates:
+            if self._retire_if_orphan(state, enumeration, now):
+                retired.append(state.command_id)
+        return tuple(retired)
+
+    def _retire_if_orphan(
+        self, state: SagaState, enumeration: BrokerEnumeration, now: dt.datetime,
+    ) -> bool:
+        if not self._enumeration_postdates_send(state, enumeration, now):
+            return False
+        try:
+            if self._orphan_evidence.order_group_seen(state.account_id, state.order_group_id):
+                return False
+            retired = replace(
+                state, state="NOT_SENT", error_code=ORPHAN_NOT_SENT,
+                revision=state.revision + 1,
+            )
+            self._persist(
+                retired, now, from_state=state.state, expected_revision=state.revision,
+            )
+        except Exception:
+            logging.exception("could not retire orphan reservation %s", state.command_id)
+            return False
+        logging.error(
+            "INCIDENT %s: saga %s (order group %s) was %s with no broker order or "
+            "execution in broker generation %s; reservation released",
+            ORPHAN_NOT_SENT, state.command_id, state.order_group_id, state.state,
+            enumeration.generation_id,
+        )
+        return True
+
+    def _enumeration_postdates_send(
+        self, state: SagaState, enumeration: BrokerEnumeration, now: dt.datetime,
+    ) -> bool:
+        if state.send_generation_id is None or state.send_attempted_at is None:
+            return False
+        attempted_at = _as_utc(dt.datetime.fromisoformat(state.send_attempted_at))
+        return (
+            enumeration.generation_id > state.send_generation_id
+            and _as_utc(enumeration.started_at) > attempted_at
+            and now - attempted_at >= self._orphan_settle
+        )
+
+    def _report_event_for_retired_row(self, state: SagaState, event: BrokerOrderEvent) -> None:
+        logging.critical(
+            "broker event %s for saga %s retired as %s: the order exists after all",
+            event.event_id, state.command_id, ORPHAN_NOT_SENT,
+        )
+        self._breaker.record(BreakerSignal(
+            kind="RECONCILIATION_DIVERGENCE",
+            occurred_at=self._now_utc(),
+            detail=f"broker order seen for retired saga {state.command_id}",
+            key=state.command_id,
+        ))
 
     # -- event application -------------------------------------------------
 
@@ -1257,8 +1422,11 @@ class ProtectiveOrderSaga:
         *,
         from_state: Optional[str],
         event_id: Optional[str] = None,
+        expected_revision: Optional[int] = None,
     ) -> None:
-        mutation, write, event_key = self._mutation(state, now, from_state=from_state, event_id=event_id)
+        mutation, write, event_key = self._mutation(
+            state, now, from_state=from_state, event_id=event_id, expected_revision=expected_revision,
+        )
         self._journal.mutate(self._journal.connect(), mutation, write, event_id=event_key)
 
     def _persist_all(self, items: list[tuple[SagaState, Optional[str]]], now: dt.datetime) -> None:
@@ -1272,7 +1440,7 @@ class ProtectiveOrderSaga:
         )
 
     def _mutation(self, state: SagaState, now: dt.datetime, *, from_state: Optional[str],
-                  event_id: Optional[str]):
+                  event_id: Optional[str], expected_revision: Optional[int] = None):
         if state.state not in SAGA_STATES:
             raise ValueError(f"invalid saga state {state.state!r}")
 
@@ -1299,6 +1467,8 @@ class ProtectiveOrderSaga:
         )
 
         def write(conn, _revision: int) -> None:
+            if expected_revision is not None:
+                self._store.require_revision_in_tx(conn, state.command_id, expected_revision)
             self._store.save_in_tx(conn, state, now)
             if event_id is not None:
                 self._store.record_event_in_tx(conn, event_id, state.command_id, now)

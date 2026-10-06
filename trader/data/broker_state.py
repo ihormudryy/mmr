@@ -474,6 +474,28 @@ class BrokerStateStore:
         ).fetchall()
         return [self._order_from_row(row) for row in rows]
 
+    def group_has_broker_trace_in_tx(
+        self, conn: Any, account_id: str, order_group_id: str
+    ) -> bool:
+        """True if any order (even deleted or terminal) or execution carries the group.
+
+        Executions not yet bound to an order are treated as a trace: they
+        could belong to the group, and this answer must never be a false no.
+        """
+        orders = conn.execute(
+            "SELECT 1 FROM broker_orders WHERE account_id = ? AND order_group_id = ? LIMIT 1",
+            [account_id, order_group_id],
+        ).fetchone()
+        if orders is not None:
+            return True
+        fills = conn.execute(
+            "SELECT 1 FROM broker_fills WHERE account_id = ? AND (order_entity_id IS NULL "
+            "OR order_entity_id IN (SELECT order_entity_id FROM broker_orders "
+            "WHERE account_id = ? AND order_group_id = ?)) LIMIT 1",
+            [account_id, account_id, order_group_id],
+        ).fetchone()
+        return fills is not None
+
     def select_working_orders_in_tx(self, conn: Any) -> list[BrokerOrderRow]:
         markers = ", ".join("?" for _ in _WORKING_ORDER_STATUSES)
         rows = conn.execute(

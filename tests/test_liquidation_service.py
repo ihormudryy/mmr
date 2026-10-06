@@ -1067,3 +1067,528 @@ def test_start_refuses_rebinding_root_to_another_scope(tmp_path):
     s.service.start(ACCOUNT, "root-2", DEADLINE, scope="conid", conid=2)
     with pytest.raises(ValueError):
         s.service.start(ACCOUNT, "root-2", DEADLINE, scope="conid", conid=1)
+# ---------------------------------------------------------------------------
+# Task 6: partial close, re-protect, escalation
+# ---------------------------------------------------------------------------
+
+from trader.trading.liquidation_service import LiquidationRefused  # noqa: E402
+
+
+def _priced(quantity=10.0, conid=1, price=100.0):
+    return _position(quantity, conid=conid, market_price=price)
+
+
+def _leg_row(status="Submitted", total=6.0, filled=0.0, group="p-1-reprotect-1-1", oca_type=2, action="SELL"):
+    """A re-protect leg's own broker row, with the OCA link the broker reports (Task 18)."""
+    return _row(status, filled=filled, total=total, oca_group=group, oca_type=oca_type, action=action)
+
+
+def _to_reprotect(tmp_path, *, target=120.0, stop=95.0, held=10.0, q=4.0, extra=()):
+    """Partial close of `q` that reaches REPROTECTING with the stop leg sent (generation 3)."""
+    left = held - q
+    protection = _Protection(stop_price=stop, target_price=target)
+    s = _stack(tmp_path, [_snapshot(1, [_priced(held)]), _snapshot(1, [_priced(held)]), _snapshot(2, [_priced(left)]),
+                          _snapshot(3, [_priced(left)]), *extra], protection=protection)
+    s.service.start(ACCOUNT, "p-1", DEADLINE, scope="conid", conid=1, quantity=q)      # gen 1: admit + partial reduce
+    s.dispatch.rows["p-1-reduce-1-1"] = [_row("Filled", filled=q, total=q)]
+    s.service.rescan()                                                                 # gen 2: fill observed
+    s.service.rescan()                                                                 # gen 3: fresh -> stop leg
+    return s, protection
+
+
+def test_partial_quantity_edge_cases(tmp_path):
+    """Review focus 2 / R15."""
+    s = _stack(tmp_path, [_snapshot(1, [_priced(10.0), _priced(10.5, conid=2)])], protection=_Protection())
+    with pytest.raises(LiquidationRefused) as ex:
+        s.service.start(ACCOUNT, "p-a", DEADLINE, scope="conid", conid=1, quantity=0.4)
+    assert ex.value.code == "PARTIAL_QUANTITY_INVALID"
+    for q in (10.0, 12.0):
+        with pytest.raises(LiquidationRefused) as ex:
+            s.service.start(ACCOUNT, f"p-{q:g}", DEADLINE, scope="conid", conid=1, quantity=q)
+        assert ex.value.code == "QUANTITY_ABOVE_POSITION"
+    assert s.registry.owner_for(ACCOUNT, 1) is None
+    receipt = s.service.start(ACCOUNT, "p-b", DEADLINE, scope="conid", conid=1, quantity=4.7)
+    assert (receipt.goal, receipt.goal_quantity) == ("partial", 4.0)
+    full = s.service.start(ACCOUNT, "p-c", DEADLINE, scope="conid", conid=2, quantity=10.0)
+    assert (full.goal, full.goal_quantity) == ("zero", None)          # 0.5 share would remain
+
+
+def test_live_position_at_or_below_q_at_dispatch_is_fully_closed(tmp_path):
+    """R15: the stop sold 7 of 10 during the cancel; the live 3 <= q=4, so close all 3."""
+    s = _stack(tmp_path, [_snapshot(1, [_priced(10.0)], [_stop_order()]), _snapshot(1, [_priced(10.0)], [_stop_order()]), _snapshot(2, [_priced(3.0)]),
+                          _snapshot(3, [_priced(3.0)])], protection=_Protection())
+    s.service.start(ACCOUNT, "p-1", DEADLINE, scope="conid", conid=1, quantity=4.0)
+    s.dispatch.entities["stop-1"] = _row("Cancelled", filled=7.0)
+    s.service.rescan()
+    receipt = s.service.rescan()
+    assert s.dispatch.calls[-1] == ("reduce", 1, "SELL", 3.0, "p-1-reduce-1-1")
+    assert receipt.goal == "zero"
+    assert s.registry.get("p-1").goal == "zero"
+
+
+def test_partial_close_sends_stop_then_target_and_ends_done(tmp_path):
+    """R13: the target is sent only after the stop is accepted, sized from the live position."""
+    s, protection = _to_reprotect(tmp_path, extra=(_snapshot(4, [_priced(6.0)]), _snapshot(5, [_priced(6.0)])))
+    assert s.dispatch.calls[0] == ("reduce_partial", 1, "SELL", 4.0, "p-1-reduce-1-1")
+    assert ("expect_reprotect", "p-1", ("p-1-reprotect-stop-1-1", "p-1-reprotect-target-1-1")) in protection.calls
+    assert s.dispatch.calls[-1] == ("place_exit_leg", 1, "stop", 6.0, 95.0, "p-1-reprotect-1-1",
+                                    "p-1-reprotect-stop-1-1")
+    receipt = s.service.receipt_for("p-1")
+    assert (receipt.state, receipt.phase) == ("VERIFYING", "reprotect")
+    assert [c.state for c in receipt.children if c.kind == "reprotect-target"] == ["PLANNED"]
+    s.dispatch.rows["p-1-reprotect-stop-1-1"] = [_leg_row()]
+    s.service.rescan()                                                    # gen 4: stop working -> target
+    assert s.dispatch.calls[-1] == ("place_exit_leg", 1, "target", 6.0, 120.0, "p-1-reprotect-1-1",
+                                    "p-1-reprotect-target-1-1")
+    s.dispatch.rows["p-1-reprotect-target-1-1"] = [_leg_row()]
+    receipt = s.service.rescan()                                          # gen 5: both working
+    assert receipt.state == "DONE"
+    assert protection.calls[-1] == ("release_after_partial", "p-1", 6.0, "p-1-reprotect-stop-1-1",
+                                    "p-1-reprotect-target-1-1")
+    assert s.registry.get("p-1").state == "RELEASED"
+    assert s.breaker.calls == []
+    outcome = s.service.close_resolution("p-1").outcome                  # what was asked, sold and kept
+    assert (outcome["requested_quantity"], outcome["filled_quantity"], outcome["remaining_quantity"]) == (4.0, 4.0, 6.0)
+
+
+def test_terminal_partial_fill_reprotects_the_actual_remainder(tmp_path):
+    """#22: SELL 4 fills 2 then is cancelled; the remaining 8 is protected, not the planned 6."""
+    s = _stack(tmp_path, [_snapshot(1, [_priced(10.0)]), _snapshot(1, [_priced(10.0)]), _snapshot(2, [_priced(8.0)]), _snapshot(3, [_priced(8.0)])],
+               protection=_Protection(target_price=None))
+    s.service.start(ACCOUNT, "p-1", DEADLINE, scope="conid", conid=1, quantity=4.0)
+    s.dispatch.rows["p-1-reduce-1-1"] = [_row("Cancelled", filled=2.0, total=4.0)]
+    s.service.rescan()
+    s.service.rescan()
+    assert s.dispatch.calls[-1] == ("place_exit_leg", 1, "stop", 8.0, 95.0, "p-1-reprotect-1-1",
+                                    "p-1-reprotect-stop-1-1")
+
+
+def test_done_checks_outstanding_quantity_and_sizes_the_target_from_the_live_position(tmp_path):
+    """#22 P2 / R13: the stop filled 2 of 6 before the target was sent."""
+    s, protection = _to_reprotect(tmp_path, extra=(
+        _snapshot(4, [_priced(4.0)]), _snapshot(5, [_priced(4.0)]), _snapshot(6, [_priced(4.0)])))
+    s.dispatch.rows["p-1-reprotect-stop-1-1"] = [_leg_row(total=6.0, filled=2.0)]
+    s.service.rescan()                       # gen 4: the stop fill is new -> wait for a newer generation
+    assert s.dispatch.calls[-1][2] == "stop"
+    s.service.rescan()                       # gen 5: target sized from the live 4
+    assert s.dispatch.calls[-1] == ("place_exit_leg", 1, "target", 4.0, 120.0, "p-1-reprotect-1-1",
+                                    "p-1-reprotect-target-1-1")
+    s.dispatch.rows["p-1-reprotect-target-1-1"] = [_leg_row(total=4.0)]
+    receipt = s.service.rescan()             # gen 6: outstanding 6-2=4 and 4 match the position
+    assert (receipt.state, receipt.remaining_quantity) == ("DONE", 4.0)
+    assert protection.calls[-1][2] == 4.0
+
+
+def test_recovery_after_restart_sends_only_the_planned_target(tmp_path):
+    """Review focus 5 / R20: the stop left, the process died before its fence; the restart sends only the target."""
+    protection = _Protection(stop_price=95.0, target_price=120.0)
+    s = _stack(tmp_path, [_snapshot(1, [_priced(10.0)]), _snapshot(1, [_priced(10.0)]), _snapshot(2, [_priced(6.0)]),
+                          _snapshot(3, [_priced(6.0)])], protection=protection)
+    s.service.start(ACCOUNT, "p-1", DEADLINE, scope="conid", conid=1, quantity=4.0)
+    s.dispatch.rows["p-1-reduce-1-1"] = [_row("Filled", filled=4.0, total=4.0)]
+    s.service.rescan()
+    real_leg = s.dispatch.place_exit_leg
+
+    def sent_then_crash(*args, **kwargs):
+        real_leg(*args, **kwargs)
+        raise _Crash()
+    s.dispatch.place_exit_leg = sent_then_crash
+    with pytest.raises(_Crash):
+        s.service.rescan()                                              # generation 3: the stop leaves
+    s.dispatch.place_exit_leg = real_leg
+    service = s.restart()
+    s.push(_snapshot(4, [_priced(6.0)]))
+    s.dispatch.rows["p-1-reprotect-stop-1-1"] = [_leg_row()]
+    service.rescan()
+    assert [c[2] for c in s.dispatch.calls if c[0] == "place_exit_leg"] == ["stop", "target"]
+
+
+def test_crash_while_the_target_is_promoted_never_sends_it_again(tmp_path):
+    """R20 / R30: the target was journaled UNKNOWN, the process died before its broker call."""
+    s, _protection = _to_reprotect(tmp_path, extra=(_snapshot(4, [_priced(6.0)]),))
+    s.dispatch.rows["p-1-reprotect-stop-1-1"] = [_leg_row()]
+
+    def crash(*_args, **_kwargs):
+        raise _Crash()
+    s.dispatch.place_exit_leg = crash
+    with pytest.raises(_Crash):
+        s.service.rescan()                                              # generation 4: target promoted
+    service = s.restart()
+    s.push(_snapshot(5, [_priced(6.0)]), _snapshot(6, [_priced(6.0)]))
+    receipt = service.rescan()                                          # fenced on 5; nothing proves it yet
+    assert [c.state for c in receipt.children if c.kind == "reprotect-target"] == ["UNKNOWN"]
+    service.rescan()                                                    # generation 6: proven absent
+    s.push(_snapshot(7, [_priced(6.0)]))
+    receipt = service.rescan()                                          # generation 7: escalate, no resend
+    assert receipt.escalated is True and receipt.goal == "zero"
+    assert [c[2] for c in s.dispatch.calls if c[0] == "place_exit_leg"] == ["stop"]
+
+
+def test_unknown_reprotect_leg_is_never_resent(tmp_path):
+    """R3 / R30: a stop whose send timed out stays UNKNOWN; once proven absent it escalates, never resent."""
+    s = _stack(tmp_path, [_snapshot(1, [_priced(10.0)]), _snapshot(1, [_priced(10.0)]), _snapshot(2, [_priced(6.0)]), _snapshot(3, [_priced(6.0)]),
+                          _snapshot(4, [_priced(6.0)]), _snapshot(5, [_priced(6.0)]), _snapshot(6, [_priced(6.0)])],
+               protection=_Protection(target_price=None))
+    s.dispatch.fail_after_send.add("place_exit_leg")
+    s.service.start(ACCOUNT, "p-1", DEADLINE, scope="conid", conid=1, quantity=4.0)
+    s.dispatch.rows["p-1-reduce-1-1"] = [_row("Filled", filled=4.0, total=4.0)]
+    s.service.rescan()
+    s.dispatch.staging = 1
+    s.service.rescan()                                  # gen 3: stop sent (fence 4), ack timed out
+    s.dispatch.staging = 0
+    receipt = s.service.rescan()                        # gen 4: no row, not newer than the fence
+    assert [c.state for c in receipt.children if c.kind == "reprotect-stop"] == ["UNKNOWN"]
+    assert [c.state for c in s.service.rescan().children if c.kind == "reprotect-stop"] == ["ABSENT"]   # gen 5
+    receipt = s.service.rescan()                        # gen 6: escalate; the stop is never placed again
+    assert receipt.escalated is True
+    assert len([c for c in s.dispatch.calls if c[0] == "place_exit_leg"]) == 1
+
+
+def test_a_reprotect_leg_refused_before_the_broker_escalates_and_is_never_retried(tmp_path):
+    """R30 / spec 5.1: re-protect failure means no retry with fresh ids; escalate to a full close."""
+    s = _stack(tmp_path, [_snapshot(1, [_priced(10.0)]), _snapshot(1, [_priced(10.0)]), _snapshot(2, [_priced(6.0)]),
+                          _snapshot(3, [_priced(6.0)]), _snapshot(4, [_priced(6.0)])],
+               protection=_Protection(target_price=None))
+    s.service.start(ACCOUNT, "p-1", DEADLINE, scope="conid", conid=1, quantity=4.0)
+    s.dispatch.rows["p-1-reduce-1-1"] = [_row("Filled", filled=4.0, total=4.0)]
+    s.service.rescan()
+    s.dispatch.refuse.add("place_exit_leg")
+    s.service.rescan()                                  # gen 3: stop refused before the broker -> NOT_SENT
+    receipt = s.service.rescan()                        # gen 4: escalate, no retry with a fresh id
+    assert receipt.escalated is True and receipt.goal == "zero"
+    assert any("REPROTECT_FAILED: stop leg NOT_SENT" in detail for _root, detail in s.breaker.calls)
+    assert s.dispatch.calls[-1] == ("reduce", 1, "SELL", 6.0, "p-1-reduce-1-2")
+
+
+def test_stop_fill_before_target_is_sent_ends_closed_without_a_target(tmp_path):
+    """R13: the stop filled fully before the target went out."""
+    s, protection = _to_reprotect(tmp_path, extra=(_snapshot(4, []), _snapshot(5, [])))
+    s.dispatch.rows["p-1-reprotect-stop-1-1"] = [_leg_row("Filled", filled=6.0)]
+    s.service.rescan()
+    receipt = s.service.rescan()
+    assert receipt.state == "CLOSED"
+    assert [c[2] for c in s.dispatch.calls if c[0] == "place_exit_leg"] == ["stop"]
+    assert [c.state for c in receipt.children if c.kind == "reprotect-target"] == ["NOT_SENT"]
+    assert protection.calls[-1] == ("close_after_full", "p-1")
+
+
+@pytest.mark.parametrize("order", ["target_first", "stop_first"])
+def test_target_fill_that_cancels_its_oca_stop_ends_closed_without_a_failure(tmp_path, order):
+    """R26 / R2-1: a normal exit is not a re-protect failure, whichever callback lands first."""
+    s, protection = _to_reprotect(tmp_path, extra=(
+        _snapshot(4, [_priced(6.0)]), _snapshot(5, [_priced(6.0)]), _snapshot(6, []), _snapshot(7, [])))
+    s.dispatch.rows["p-1-reprotect-stop-1-1"] = [_leg_row()]
+    s.service.rescan()                                                    # gen 4: target sent
+    rows = {"p-1-reprotect-target-1-1": [_leg_row("Filled", filled=6.0)],
+            "p-1-reprotect-stop-1-1": [_leg_row("Cancelled")]}
+    first, second = list(rows) if order == "target_first" else list(rows)[::-1]
+    s.dispatch.rows[first] = rows[first]
+    s.service.rescan()                                                    # gen 5: one callback seen
+    s.dispatch.rows[second] = rows[second]
+    for _ in range(2):
+        s.service.rescan()                                                # gens 6-7: flat, then behind the fill
+    receipt = s.service.receipt_for("p-1")
+    assert (receipt.state, receipt.escalated) == ("CLOSED", False)
+    assert s.breaker.calls == []
+    assert not any(c[0] in ("reduce", "cancel") for c in s.dispatch.calls)
+    assert protection.calls[-1] == ("close_after_full", "p-1")
+
+
+def test_partial_target_fill_waits_for_the_stop_to_match_the_remainder(tmp_path):
+    """R2-1: the target filled 2 of 6; the stop shrinks to 4 (OCA type 2); then DONE for 4."""
+    s, protection = _to_reprotect(tmp_path, extra=(
+        _snapshot(4, [_priced(6.0)]), _snapshot(5, [_priced(4.0)]), _snapshot(6, [_priced(4.0)]),
+        _snapshot(7, [_priced(4.0)])))
+    s.dispatch.rows["p-1-reprotect-stop-1-1"] = [_leg_row()]
+    s.service.rescan()                                                    # gen 4: target sent
+    s.dispatch.rows["p-1-reprotect-target-1-1"] = [_leg_row(filled=2.0)]
+    s.service.rescan()                                                    # gen 5: the fill is new
+    assert "outstanding 6.0 != position 4.0" in s.service.rescan().detail  # gen 6: stop still for 6
+    s.dispatch.rows["p-1-reprotect-stop-1-1"] = [_leg_row(total=4.0)]
+    receipt = s.service.rescan()                                          # gen 7
+    assert (receipt.state, receipt.remaining_quantity) == ("DONE", 4.0)
+    assert s.breaker.calls == []
+
+
+def test_a_leg_the_broker_does_not_link_by_oca_escalates(tmp_path):
+    """R13 / R38: DONE reads the OCA group and type from the broker row, not from the journal."""
+    s, _protection = _to_reprotect(tmp_path, target=None, extra=(_snapshot(4, [_priced(6.0)]),))
+    s.dispatch.rows["p-1-reprotect-stop-1-1"] = [_leg_row(oca_type=0)]
+    receipt = s.service.rescan()
+    assert receipt.escalated is True
+    assert any("not a linked protective leg" in detail for _root, detail in s.breaker.calls)
+
+
+def test_stop_that_goes_pending_submit_then_inactive_escalates(tmp_path):
+    """R13: PendingSubmit is a local echo, not acceptance; Inactive after it is a failed re-protect."""
+    s, _protection = _to_reprotect(tmp_path, extra=(_snapshot(4, [_priced(6.0)]), _snapshot(5, [_priced(6.0)])))
+    s.dispatch.rows["p-1-reprotect-stop-1-1"] = [_leg_row("PendingSubmit")]
+    receipt = s.service.rescan()
+    assert [c.state for c in receipt.children if c.kind == "reprotect-stop"] == ["UNKNOWN"]
+    s.dispatch.rows["p-1-reprotect-stop-1-1"] = [_leg_row("Inactive")]
+    receipt = s.service.rescan()
+    assert receipt.escalated is True and receipt.goal == "zero"
+    assert any("REPROTECT_FAILED" in detail for _root, detail in s.breaker.calls)
+    assert [c[2] for c in s.dispatch.calls if c[0] == "place_exit_leg"] == ["stop"]
+
+
+def test_target_rejected_escalates_and_cancels_the_working_stop(tmp_path):
+    stop_leg = _order("rs", group="p-1-reprotect-stop-1-1", total=6.0, order_type="STP")
+    s, _protection = _to_reprotect(tmp_path, extra=(
+        _snapshot(4, [_priced(6.0)], [stop_leg]), _snapshot(5, [_priced(6.0)], [stop_leg])))
+    s.dispatch.rows["p-1-reprotect-stop-1-1"] = [_leg_row()]
+    s.service.rescan()                                   # gen 4: target sent
+    s.dispatch.rows["p-1-reprotect-target-1-1"] = [_leg_row("Rejected")]
+    receipt = s.service.rescan()                         # gen 5: target rejected
+    assert receipt.escalated is True
+    assert s.dispatch.calls[-1] == ("cancel", "rs", "p-1-cancel-1-1")
+
+
+def test_reprotect_deadline_escalates_instead_of_failing_safe(tmp_path):
+    """R31: no child is UNKNOWN (the stop works), so the missed deadline escalates once."""
+    s, _protection = _to_reprotect(tmp_path, extra=(_snapshot(4, [_priced(6.0)]),))
+    s.dispatch.rows["p-1-reprotect-stop-1-1"] = [_leg_row()]
+    s.clock["now"] = DEADLINE + dt.timedelta(seconds=1)
+    receipt = s.service.rescan()
+    assert receipt.state != "FAILED_SAFE"
+    assert receipt.escalated is True and receipt.goal == "zero"
+    assert receipt.deadline == s.clock["now"] + dt.timedelta(seconds=300)
+    assert s.breaker.calls
+
+
+def test_position_zero_during_reprotect_cancels_the_residual_leg_and_ends_closed(tmp_path):
+    target_leg = _order("rt", group="p-1-reprotect-target-1-1", total=6.0)
+    s, protection = _to_reprotect(tmp_path, extra=(
+        _snapshot(4, [_priced(6.0)]), _snapshot(5, [], [target_leg]), _snapshot(6, [], [target_leg]),
+        _snapshot(7, [])))
+    s.dispatch.rows["p-1-reprotect-stop-1-1"] = [_leg_row()]
+    s.service.rescan()                                                    # gen 4: target sent
+    s.dispatch.rows["p-1-reprotect-target-1-1"] = [_leg_row()]
+    s.dispatch.rows["p-1-reprotect-stop-1-1"] = [_leg_row("Filled", filled=6.0)]
+    s.service.rescan()                                                    # gen 5: stop fill seen
+    s.service.rescan()                                                    # gen 6: cancel the residual target
+    assert s.dispatch.calls[-1] == ("cancel", "rt", "p-1-cancel-1-1")
+    s.dispatch.entities["rt"] = _row("Cancelled", total=6.0)
+    s.dispatch.rows["p-1-reprotect-target-1-1"] = [_leg_row("Cancelled")]
+    receipt = s.service.rescan()                                          # gen 7
+    assert receipt.state == "CLOSED"
+    assert protection.calls[-1] == ("close_after_full", "p-1")
+
+
+def test_partial_close_of_short_reprotects_above_price(tmp_path):
+    """Review focus 1."""
+    s = _stack(tmp_path, [_snapshot(1, [_priced(-10.0)]), _snapshot(1, [_priced(-10.0)]), _snapshot(2, [_priced(-6.0)]), _snapshot(3, [_priced(-6.0)])],
+               protection=_Protection(stop_price=105.0, target_price=None))
+    s.service.start(ACCOUNT, "p-1", DEADLINE, scope="conid", conid=1, quantity=4.0)
+    assert s.dispatch.calls[0] == ("reduce_partial", 1, "BUY", 4.0, "p-1-reduce-1-1")
+    s.dispatch.rows["p-1-reduce-1-1"] = [_row("Filled", filled=4.0, total=4.0)]
+    s.service.rescan()
+    s.service.rescan()
+    assert s.dispatch.calls[-1] == ("place_exit_leg", 1, "stop", 6.0, 105.0, "p-1-reprotect-1-1",
+                                    "p-1-reprotect-stop-1-1")
+
+
+def test_non_protective_stop_escalates_to_full_close_and_trips_breaker(tmp_path):
+    s = _stack(tmp_path, [_snapshot(1, [_priced(10.0)]), _snapshot(1, [_priced(10.0)]), _snapshot(2, [_priced(6.0)]), _snapshot(3, [_priced(6.0)])],
+               protection=_Protection(stop_price=101.0, target_price=None))     # above market on a long
+    s.service.start(ACCOUNT, "p-1", DEADLINE, scope="conid", conid=1, quantity=4.0)
+    s.dispatch.rows["p-1-reduce-1-1"] = [_row("Filled", filled=4.0, total=4.0)]
+    s.service.rescan()
+    receipt = s.service.rescan()
+    assert receipt.escalated is True and receipt.goal == "zero"
+    assert any("STOP_NOT_PROTECTIVE" in detail for _root, detail in s.breaker.calls)
+    assert s.dispatch.calls[-1] == ("reduce", 1, "SELL", 6.0, "p-1-reduce-1-2")
+
+
+def test_upgrade_to_zero_during_reprotect_cancels_replacement_exits_and_closes(tmp_path):
+    stop_leg = _order("rs", group="p-1-reprotect-stop-1-1", total=6.0, order_type="STP")
+    s, protection = _to_reprotect(tmp_path, extra=(
+        _snapshot(4, [_priced(6.0)], [stop_leg]), _snapshot(5, [_priced(6.0)]), _snapshot(6, []), _snapshot(7, [])))
+    s.dispatch.rows["p-1-reprotect-stop-1-1"] = [_leg_row()]
+    receipt = s.service.upgrade_to_zero("p-1")
+    assert (receipt.goal, receipt.phase) == ("zero", "cancel")
+    assert [c.state for c in receipt.children if c.kind == "reprotect-target"] == ["NOT_SENT"]
+    s.service.rescan()                                                     # gen 4: cancel the replacement stop
+    assert s.dispatch.calls[-1] == ("cancel", "rs", "p-1-cancel-1-1")
+    s.dispatch.entities["rs"] = _row("Cancelled", total=6.0)
+    s.dispatch.rows["p-1-reprotect-stop-1-1"] = [_leg_row("Cancelled")]   # the same order, by its own ref
+    s.service.rescan()                                                     # gen 5: reduce the remainder
+    assert s.dispatch.calls[-1] == ("reduce", 1, "SELL", 6.0, "p-1-reduce-1-2")
+    s.dispatch.rows["p-1-reduce-1-2"] = [_row("Filled", filled=6.0, total=6.0)]
+    s.service.rescan()
+    assert s.service.rescan().state == "CLOSED"
+    assert not any(c[0] == "release_after_partial" for c in protection.calls)
+    assert [c[2] for c in s.dispatch.calls if c[0] == "place_exit_leg"] == ["stop"]
+
+
+def test_restart_after_a_goal_upgrade_never_reprotects(tmp_path):
+    """R20: crash right after the upgrade transaction; the restarted root closes everything."""
+    s = _stack(tmp_path, [_snapshot(1, [_priced(10.0)]), _snapshot(1, [_priced(10.0)]), _snapshot(2, [_priced(6.0)]),
+                          _snapshot(3, [_priced(6.0)]), _snapshot(4, []), _snapshot(5, [])],
+               protection=_Protection())
+    s.service.start(ACCOUNT, "p-1", DEADLINE, scope="conid", conid=1, quantity=4.0)
+    s.service.upgrade_to_zero("p-1")
+    service = s.restart()
+    s.dispatch.rows["p-1-reduce-1-1"] = [_row("Filled", filled=4.0, total=4.0)]
+    service.rescan()
+    service.rescan()
+    assert s.dispatch.calls[-1] == ("reduce", 1, "SELL", 6.0, "p-1-reduce-1-2")
+    s.dispatch.rows["p-1-reduce-1-2"] = [_row("Filled", filled=6.0, total=6.0)]
+    service.rescan()
+    assert service.rescan().state == "CLOSED"
+    assert not any(c[0] == "place_exit_leg" for c in s.dispatch.calls)
+
+
+def test_reprotect_deadline_with_an_unknown_leg_is_failed_safe_with_no_order(tmp_path):
+    """R5 / R31: an UNKNOWN child at the deadline forbids every new order."""
+    s, _protection = _to_reprotect(tmp_path, extra=(_snapshot(4, [_priced(6.0)]),))
+    s.dispatch.complete = False
+    s.clock["now"] = DEADLINE + dt.timedelta(seconds=1)
+    sent = len(s.dispatch.calls)
+    assert s.service.rescan().state == "FAILED_SAFE"
+    assert len(s.dispatch.calls) == sent
+
+
+def test_partial_deadline_in_the_reduce_phase_escalates_to_a_full_close(tmp_path):
+    """R31 / D10: protection is already cancelled; a working partial reduce at the deadline is escalated once."""
+    s = _stack(tmp_path, [_snapshot(1, [_priced(10.0)]), _snapshot(1, [_priced(10.0)]), _snapshot(2, [_priced(8.0)]),
+                          _snapshot(3, [_priced(8.0)])], protection=_Protection())
+    s.service.start(ACCOUNT, "p-1", DEADLINE, scope="conid", conid=1, quantity=4.0)
+    s.dispatch.rows["p-1-reduce-1-1"] = [_row("Submitted", filled=2.0, total=4.0, entity="p-1-reduce-1-1:exit")]
+    s.clock["now"] = DEADLINE + dt.timedelta(seconds=1)
+    receipt = s.service.rescan()                                         # gen 2: reduce WORKING, nothing UNKNOWN
+    assert (receipt.state, receipt.escalated, receipt.goal) == ("CANCELLING", True, "zero")
+    assert receipt.deadline == s.clock["now"] + dt.timedelta(seconds=300)
+    s.dispatch.rows["p-1-reduce-1-1"] = [_row("Filled", filled=4.0, total=4.0)]
+    s.service.rescan()                                                   # gen 3: the fill is seen
+    s.push(_snapshot(4, [_priced(6.0)]))
+    s.service.rescan()                                                   # gen 4: close the live 6
+    assert s.dispatch.calls[-1] == ("reduce", 1, "SELL", 6.0, "p-1-reduce-1-2")
+
+
+def test_partial_deadline_with_an_unknown_reduce_is_failed_safe_with_no_order(tmp_path):
+    s = _stack(tmp_path, [_snapshot(1, [_priced(10.0)]), _snapshot(1, [_priced(10.0)]), _snapshot(2, [_priced(10.0)])],
+               protection=_Protection())
+    s.dispatch.complete = False
+    s.service.start(ACCOUNT, "p-1", DEADLINE, scope="conid", conid=1, quantity=4.0)
+    s.clock["now"] = DEADLINE + dt.timedelta(seconds=1)
+    assert s.service.rescan().state == "FAILED_SAFE"
+    assert [c[0] for c in s.dispatch.calls] == ["reduce_partial"]
+
+
+def test_invisible_partial_reduce_never_reprotects_or_reduces_again(tmp_path):
+    """#22: while the partial reduce is unknown, no leg and no second reduce goes out."""
+    s = _stack(tmp_path, [_snapshot(1, [_priced(10.0)]), _snapshot(1, [_priced(10.0)]), _snapshot(2, [_priced(10.0)]),
+                          _snapshot(3, [_priced(10.0)])], protection=_Protection())
+    s.dispatch.complete = False
+    s.service.start(ACCOUNT, "p-1", DEADLINE, scope="conid", conid=1, quantity=4.0)
+    for _ in range(2):
+        assert "outcome unknown" in s.service.rescan().detail
+    assert [c[0] for c in s.dispatch.calls] == ["reduce_partial"]
+
+
+@pytest.mark.parametrize("status", ["Rejected", "Cancelled"])
+def test_a_partial_reduce_that_sold_nothing_reprotects_and_ends_reduce_failed(tmp_path, status):
+    """R25 / R2-2: protection comes back, but the close is a failure, never DONE."""
+    protection = _Protection(stop_price=95.0, target_price=None)
+    s = _stack(tmp_path, [_snapshot(1, [_priced(10.0)]), _snapshot(1, [_priced(10.0)]), _snapshot(2, [_priced(10.0)]),
+                          _snapshot(3, [_priced(10.0)]), _snapshot(4, [_priced(10.0)])], protection=protection)
+    s.service.start(ACCOUNT, "p-1", DEADLINE, scope="conid", conid=1, quantity=4.0)
+    s.dispatch.rows["p-1-reduce-1-1"] = [_row(status, filled=0.0, total=4.0)]
+    s.service.rescan()                                                   # gen 2: stop for the untouched 10
+    assert s.dispatch.calls[-1] == ("place_exit_leg", 1, "stop", 10.0, 95.0, "p-1-reprotect-1-1",
+                                    "p-1-reprotect-stop-1-1")
+    s.dispatch.rows["p-1-reprotect-stop-1-1"] = [_leg_row(total=10.0)]
+    receipt = s.service.rescan()                                         # gen 3: the stop works
+    assert (receipt.state, receipt.remaining_quantity) == ("REDUCE_FAILED", 10.0)
+    assert protection.calls[-1][:3] == ("release_after_partial", "p-1", 10.0)
+    assert s.registry.get("p-1").state == "RELEASED"
+    resolution = s.service.close_resolution("p-1")
+    assert (resolution.success, resolution.error_code) == (False, "REDUCE_FAILED")
+    assert (resolution.outcome["requested_quantity"], resolution.outcome["filled_quantity"],
+            resolution.outcome["remaining_quantity"]) == (4.0, 0.0, 10.0)
+
+
+def test_restart_before_the_done_cleanup_finishes_the_release(tmp_path):
+    """R8 / R20: DONE and the owner release committed; the saga release is recovered."""
+    s, protection = _to_reprotect(tmp_path, target=None, extra=(_snapshot(4, [_priced(6.0)]),))
+    s.dispatch.rows["p-1-reprotect-stop-1-1"] = [_leg_row()]
+    protection.crash_on.add("release_after_partial")
+    with pytest.raises(_Crash):
+        s.service.rescan()
+    stored = s.store.receipt("p-1")
+    assert (stored.state, stored.cleanup_pending, s.registry.get("p-1").state) == ("DONE", True, "RELEASED")
+    s.restart().rescan()
+    assert s.store.receipt("p-1").cleanup_pending is False
+    assert protection.calls[-1][:2] == ("release_after_partial", "p-1")
+
+
+def test_partial_retry_after_the_fill_returns_its_root(tmp_path):
+    """R36 / D15: a retried partial command finds its root before any admission check."""
+    s = _stack(tmp_path, [_snapshot(1, [_priced(10.0)]), _snapshot(1, [_priced(10.0)])], protection=_Protection())
+    first = s.service.start(ACCOUNT, "p-1", DEADLINE, scope="conid", conid=1, quantity=4.7)
+    s.push(_snapshot(2, []))                                             # the position is gone now
+    captures = s.broker.calls
+    again = s.service.start(ACCOUNT, "p-1", DEADLINE, scope="conid", conid=1, quantity=4.7)
+    assert again.cause_command_id == first.cause_command_id == "p-1"
+    assert s.service.root_for("p-1") == "p-1"
+    assert s.broker.calls == captures + 1                               # the tick only, no admission capture
+
+
+def test_partial_request_against_an_owner_is_exit_in_progress_before_admission(tmp_path):
+    from trader.trading.exit_owner import ExitInProgress
+    s = _stack(tmp_path, [_snapshot(1, [_priced(10.0)])], protection=_Protection())
+    s.service.start(ACCOUNT, "c-1", DEADLINE, scope="conid", conid=1)
+    captures = s.broker.calls
+    with pytest.raises(ExitInProgress):
+        s.service.start(ACCOUNT, "p-2", DEADLINE, scope="conid", conid=1, quantity=12.0)
+    assert s.broker.calls == captures
+
+
+def test_upgrade_rolls_back_with_its_run_change(tmp_path):
+    """R6 / R20: the registry goal and the run goal change in one transaction or not at all."""
+    s = _stack(tmp_path, [_snapshot(1, [_priced(10.0)], [_stop_order()])], protection=_Protection())
+    s.service.start(ACCOUNT, "p-1", DEADLINE, scope="conid", conid=1, quantity=4.0)
+
+    def broken(conn, root_id, detail):
+        raise _Crash()
+    s.service._upgrade_run_in_tx = broken
+    with pytest.raises(_Crash):
+        s.service.upgrade_to_zero("p-1")
+    assert (s.registry.get("p-1").goal, s.store.receipt("p-1").goal) == ("partial", "partial")
+
+
+def test_a_stale_run_write_never_lowers_the_goal(tmp_path):
+    """#24: a write from an old receipt changes only its named fields on the current row."""
+    s = _stack(tmp_path, [_snapshot(1, [_priced(10.0)], [_stop_order()])], protection=_Protection())
+    stale = s.service.start(ACCOUNT, "p-1", DEADLINE, scope="conid", conid=1, quantity=4.0)
+    s.service.upgrade_to_zero("p-1")
+    s.service._set(stale, "VERIFYING", detail="late write")
+    assert (s.store.receipt("p-1").goal, s.store.receipt("p-1").detail) == ("zero", "late write")
+
+
+def test_dispatch_stops_when_the_owner_goal_and_the_run_goal_disagree(tmp_path):
+    """R7 / #24: a registry/cursor split is caught before any broker call."""
+    s = _stack(tmp_path, [_snapshot(1, [_priced(10.0)], [_stop_order()]), _snapshot(1, [_priced(10.0)], [_stop_order()]),
+                          _snapshot(2, [_priced(10.0)])], protection=_Protection())
+    s.service.start(ACCOUNT, "p-1", DEADLINE, scope="conid", conid=1, quantity=4.0)
+    s.dispatch.entities["stop-1"] = _row("Cancelled")
+    s.db.execute("UPDATE exit_owners SET goal = 'zero' WHERE root_id = 'p-1'", fetch="none")
+    s.service.rescan()
+    assert [c[0] for c in s.dispatch.calls] == ["cancel"]
+
+
+def test_an_inherited_reduce_never_counts_as_this_partials_reduce(tmp_path):
+    """A partial close that inherits an old reduce still sends its own partial reduce."""
+    s = _stack(tmp_path, [_snapshot(1, [_priced(10.0)])], protection=_Protection())
+    s.dispatch.staging = 1
+    s.service.start(ACCOUNT, "c-1", NOW + dt.timedelta(seconds=30), scope="conid", conid=1)
+    s.dispatch.staging = 0
+    s.clock["now"] = NOW + dt.timedelta(seconds=31)
+    s.dispatch.complete = False
+    assert s.service.rescan().state == "FAILED_SAFE"                     # c-1's reduce is UNKNOWN
+    s.dispatch.complete = True
+    s.push(_snapshot(2, [_priced(10.0)]), _snapshot(2, [_priced(10.0)]), _snapshot(3, [_priced(10.0)]))
+    s.dispatch.rows["c-1-reduce-1-1"] = [_row("Cancelled", filled=0.0)]
+    s.service.start(ACCOUNT, "p-2", NOW + dt.timedelta(minutes=5), scope="conid", conid=1, quantity=4.0)
+    assert s.dispatch.calls[-1] == ("reduce_partial", 1, "SELL", 4.0, "p-2-reduce-1-1")

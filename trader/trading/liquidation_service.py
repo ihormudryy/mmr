@@ -30,7 +30,7 @@ from trader.trading.exit_owner import (
     CLAIMED, JOINED_FLATTEN, STATE_ACTIVE, STATE_FAILED_SAFE, STATE_RELEASED, ExitOwnerRegistry,
     apply_exit_owner_migration,
 )
-from trader.trading.order_correlation import liquidation_child_id, liquidation_child_kind
+from trader.trading.order_correlation import liquidation_child_id, liquidation_child_kind, reprotect_oca_group
 
 log = logging.getLogger(__name__)
 
@@ -669,16 +669,31 @@ class LiquidationService:
         elif scope == "conid":
             if conid is None:
                 raise ValueError("conid scope requires a conid")
-            if quantity is not None:
-                raise LiquidationRefused("PARTIAL_CLOSE_UNAVAILABLE", "partial closes arrive in plan 1 task 6")
-            outcome, root = self._store.transaction(lambda conn: self._claim_scoped_in_tx(
-                conn, account_id, cause_command_id, int(conid), quantity, deadline, stop_price, target_price))
+            outcome, root = self._claim_scoped(account_id, cause_command_id, int(conid), quantity,
+                                               deadline, stop_price, target_price)
         else:
             raise ValueError(f"unknown liquidation scope {scope!r}")
         if outcome in (CLAIMED, "EXISTING"):
             with self._exclusive():
                 return self._tick(root)
         return self._store.receipt(root)
+
+    def _claim_scoped(self, account_id, cause, conid, quantity, deadline, stop_price, target_price):
+        """D15: a retry finds its root first; a partial request then learns ExitInProgress, and
+        only a new partial request is admitted against a broker snapshot before it claims."""
+        requested = None if quantity is None else float(quantity)
+        goal = "zero" if requested is None else "partial"
+        existing = self._store.transaction(lambda conn: self._existing_in_tx(
+            conn, account_id, cause, conid=conid, goal=goal, quantity=requested))
+        if existing is not None:
+            return existing
+        admitted = None
+        if requested is not None:
+            self._store.transaction(
+                lambda conn: self._registry.ensure_partial_allowed_in_tx(conn, account_id, conid))
+            admitted = self._admit_partial(account_id, conid, requested)
+        return self._store.transaction(lambda conn: self._claim_scoped_in_tx(
+            conn, account_id, cause, conid, requested, admitted, deadline, stop_price, target_price))
 
     def rescan(self) -> Optional[LiquidationReceipt]:
         """Finish pending cleanups, then advance every root that is not terminal."""
@@ -730,22 +745,58 @@ class LiquidationService:
         self._store.inherit_children_in_tx(conn, account_id=account_id, conid=None, to_root_id=cause, now=now)
         return (CLAIMED, cause)
 
-    def _claim_scoped_in_tx(self, conn, account_id, cause, conid, quantity, deadline, stop_price, target_price):
-        goal = "zero" if quantity is None else "partial"
-        existing = self._existing_in_tx(conn, account_id, cause, conid=conid, goal=goal, quantity=quantity)
+    def _claim_scoped_in_tx(self, conn, account_id, cause, conid, requested, admitted, deadline,
+                            stop_price, target_price):
+        """The join row keeps the request as it came in; the owner and run get the admitted goal."""
+        goal = "zero" if requested is None else "partial"
+        existing = self._existing_in_tx(conn, account_id, cause, conid=conid, goal=goal, quantity=requested)
         if existing is not None:
             return existing
         now = self._now()
         claim = self._registry.claim_scoped_in_tx(conn, account_id=account_id, conid=conid, root_id=cause,
-                                                  goal_quantity=quantity, now=now)
+                                                  goal_quantity=admitted, now=now)
         self._store.record_join_in_tx(conn, JoinRow(cause, claim.root_id, account_id, conid, claim.outcome,
-                                                    goal, quantity), now)
+                                                    goal, requested), now)
         if claim.outcome == CLAIMED:
             self._store.insert_run_in_tx(conn, LiquidationReceipt(
-                account_id, cause, "REQUESTED", deadline, scope="conid", conid=conid, goal=goal,
-                goal_quantity=quantity, stop_price=stop_price, target_price=target_price), now)
+                account_id, cause, "REQUESTED", deadline, scope="conid", conid=conid,
+                goal="zero" if admitted is None else "partial", goal_quantity=admitted,
+                stop_price=stop_price, target_price=target_price), now)
             self._store.inherit_children_in_tx(conn, account_id=account_id, conid=conid, to_root_id=cause, now=now)
         return (claim.outcome, claim.root_id)
+
+    def upgrade_to_zero(self, root_id: str) -> LiquidationReceipt:
+        """partial -> zero for an active scoped root, registry and run in one transaction."""
+        def write(conn):
+            self._registry.upgrade_goal_in_tx(conn, root_id, self._now())
+            self._upgrade_run_in_tx(conn, root_id, "goal upgraded to zero exposure")
+        self._store.transaction(write)
+        return self._store.receipt(root_id)
+
+    def _upgrade_run_in_tx(self, conn, root_id: str, detail: str) -> None:
+        run = self._store.get_run_in_tx(conn, root_id)
+        if run is None or run.state in RESCAN_TERMINAL or run.goal == "zero":
+            return
+        phase = "cancel" if run.phase in ("reduce", "reprotect") else run.phase
+        self._store.update_run_in_tx(conn, replace(run, goal="zero", goal_quantity=None, phase=phase,
+                                                   detail=detail), self._now())
+        self._store.drop_planned_in_tx(conn, root_id, self._now())
+
+    def _admit_partial(self, account_id: str, conid: int, requested: float) -> Optional[float]:
+        """R15 at start: whole shares, 0 < q < |position|; less than one share left = full close."""
+        shares = math.floor(float(requested))
+        if shares < 1:
+            raise LiquidationRefused("PARTIAL_QUANTITY_INVALID", f"{requested!r} rounds to {shares}")
+        snapshot = self._broker.capture(account_id)
+        position = self._position_for(snapshot, conid)
+        if position is None:
+            raise LiquidationRefused("NO_POSITION", f"no position on conid {conid}")
+        held = abs(float(position.quantity))
+        if shares >= held:
+            raise LiquidationRefused("QUANTITY_ABOVE_POSITION", f"{shares} >= {held}; send a full close")
+        if held - shares < 1:
+            return None
+        return float(shares)
 
     # -- one step of one root --------------------------------------------------------
 
@@ -757,17 +808,20 @@ class LiquidationService:
             return self._cleanup(receipt)
         if receipt.state in RESCAN_TERMINAL:
             return receipt
-        if self._now() >= receipt.deadline:
-            return self._on_deadline(receipt)
         try:
             snapshot = self._broker.capture(receipt.account_id)
             newest = int(self._dispatch.newest_generation())
+            if getattr(snapshot, "account_id", None) != receipt.account_id:
+                raise RuntimeError("broker snapshot account mismatch")
         except Exception as exc:
+            if self._now() >= receipt.deadline:
+                return self._on_deadline(receipt)
             return self._snapshot_unavailable(receipt, f"broker evidence unavailable: {exc}")
-        if getattr(snapshot, "account_id", None) != receipt.account_id:
-            return self._snapshot_unavailable(receipt, "broker snapshot account mismatch")
         receipt = self._fence_unsent(receipt, snapshot, newest)
         receipt = self._observe_children(receipt, snapshot, newest)
+        if self._now() >= receipt.deadline:
+            # The deadline decides on this tick's evidence: an UNKNOWN child means FAILED_SAFE (R31).
+            return self._on_deadline(receipt)
         if receipt.scope == "account":
             return self._advance_account(receipt, snapshot)
         return self._advance_conid(receipt, snapshot)
@@ -777,6 +831,14 @@ class LiquidationService:
         return self._set(receipt, state, detail=detail)
 
     def _on_deadline(self, receipt: LiquidationReceipt) -> LiquidationReceipt:
+        """R31 / D10: a partial close whose protection is already cancelled escalates once to a
+        full close of the live remainder, unless a child is UNKNOWN; everything else is FAILED_SAFE."""
+        unknown = any(c.state == "UNKNOWN" for c in receipt.children)
+        if (receipt.scope == "conid" and receipt.goal == "partial" and not receipt.escalated and not unknown
+                and receipt.phase in ("cancel", "reduce", "reprotect")):
+            label = "REPROTECT_DEADLINE" if receipt.phase == "reprotect" else "PARTIAL_DEADLINE"
+            self._escalate(receipt, f"{label}: the partial close missed its deadline in phase {receipt.phase}")
+            return self._store.receipt(receipt.cause_command_id)
         return self._finish(receipt, "FAILED_SAFE", detail="deadline elapsed without broker-confirmed result")
 
     # -- evidence (R4) ---------------------------------------------------------------
@@ -963,10 +1025,19 @@ class LiquidationService:
         return self._cleanup(self._store.receipt(root))
 
     def _cleanup(self, receipt: LiquidationReceipt) -> LiquidationReceipt:
-        """R8: the saga step is idempotent; recovery re-runs it until the flag clears."""
+        """R8: every saga step is idempotent; recovery re-runs it until the flag clears."""
         root = receipt.cause_command_id
-        if self._protection is not None and receipt.state in ("CLOSED", "FLAT"):
-            self._protection.close_after_full(close_root_id=root, now=self._now())
+        if self._protection is not None:
+            if receipt.state in ("CLOSED", "FLAT"):
+                self._protection.close_after_full(close_root_id=root, now=self._now())
+            elif receipt.state in ("DONE", "REDUCE_FAILED"):
+                stop, target = self._working_legs(receipt)
+                self._protection.release_after_partial(
+                    close_root_id=root, remaining_quantity=float(receipt.remaining_quantity),
+                    stop_group=stop.child_id, stop_status=self._leg_status(stop),
+                    target_group=None if target is None else target.child_id,
+                    target_status=None if target is None else self._leg_status(target),
+                    now=self._now())
 
         def write(conn):
             run = self._store.get_run_in_tx(conn, root)
@@ -1131,12 +1202,12 @@ class LiquidationService:
                                 detail="fresh broker snapshot confirms no positions or working orders")
         return self._submit_reduces(receipt, snapshot, positions)
 
-    def _submit_reduces(self, receipt, snapshot, positions) -> LiquidationReceipt:
+    def _submit_reduces(self, receipt, snapshot, positions, *, partial: Optional[float] = None) -> LiquidationReceipt:
         generation = int(snapshot.generation_id)
         children = self._reserve(receipt, lambda conn: [
             self._new_child(conn, receipt, kind="reduce", conid=int(p.conid), generation=generation,
                             side=_reducing_side(p.quantity),
-                            quantity=abs(float(p.quantity)))
+                            quantity=abs(float(p.quantity)) if partial is None else partial)
             for p in positions])
         if children is None:
             return self._store.receipt(receipt.cause_command_id)
@@ -1144,7 +1215,8 @@ class LiquidationService:
                             phase="reduce" if receipt.scope == "conid" else receipt.phase,
                             detail="submitting reduce-only orders")
         for child, position in zip(children, positions):
-            self._send(receipt, child, lambda p=position, c=child: self._dispatch.reduce(p, c.side, c.quantity, c.child_id))
+            send = self._dispatch.reduce if partial is None else self._dispatch.reduce_partial
+            self._send(receipt, child, lambda p=position, c=child, s=send: s(p, c.side, c.quantity, c.child_id))
         return self._wait(self._store.receipt(receipt.cause_command_id), generation,
                           "reduction submitted; awaiting broker evidence")
 
@@ -1186,6 +1258,8 @@ class LiquidationService:
         conid = int(receipt.conid)
         working = self._working_for(snapshot, conid)
         position = self._position_for(snapshot, conid)
+        if receipt.phase == "reprotect":
+            return self._advance_reprotect(receipt, snapshot, working, position)
         receipt = self._cancel_conid_orders(receipt, snapshot, working)
         why = self._blocking(receipt, generation)
         if why is not None:
@@ -1197,8 +1271,181 @@ class LiquidationService:
                 return self._wait(receipt, generation, "awaiting a newer generation to prove the position is closed")
             return self._finish(receipt, "CLOSED", generation_id=generation,
                                 detail="fresh broker generation shows no position and no working orders for conid")
+        if receipt.goal == "partial":
+            own = [c for c in receipt.children if c.kind == "reduce" and c.root_id == receipt.cause_command_id]
+            if any(c.state in ("FILLED", "CANCELLED", "REJECTED", "ABSENT") for c in own):
+                return self._start_reprotect(receipt, snapshot, position)
+            return self._submit_partial(receipt, snapshot, position)
         return self._submit_reduces(receipt, snapshot, (position,))
+
+    def _submit_partial(self, receipt, snapshot, position) -> LiquidationReceipt:
+        held = abs(float(position.quantity))
+        q = float(receipt.goal_quantity)
+        if held <= q or held - q < 1:
+            # R15 at dispatch: protection is already cancelled, so close the live remainder.
+            self.upgrade_to_zero(receipt.cause_command_id)
+            receipt = self._store.receipt(receipt.cause_command_id)
+            return self._submit_reduces(receipt, snapshot, (position,))
+        return self._submit_reduces(receipt, snapshot, (position,), partial=q)
 
     # -- re-protect (exit-only OCA, R13) ------------------------------------------------
 
+    @staticmethod
+    def _protective(position, stop_price: float, target_price: Optional[float]) -> Optional[str]:
+        price = getattr(position, "market_price", None)
+        if price is None or not math.isfinite(float(price)):
+            return "MARKET_PRICE_MISSING: cannot check the stop side without a market price"
+        long = float(position.quantity) > 0
+        if (long and not stop_price < price) or (not long and not stop_price > price):
+            return "STOP_NOT_PROTECTIVE: stop is not on the protective side of the market price"
+        if target_price is not None and ((long and not target_price > price) or (not long and not target_price < price)):
+            return "TARGET_NOT_VALID: target is not on the profit side of the market price"
+        return None
+
+    def _latest(self, receipt, kind: str) -> Optional[ChildRef]:
+        legs = [c for c in receipt.children if c.kind == kind and c.root_id == receipt.cause_command_id]
+        return max(legs, key=lambda c: c.attempt) if legs else None
+
+    def _working_legs(self, receipt) -> tuple[ChildRef, Optional[ChildRef]]:
+        return self._latest(receipt, "reprotect-stop"), self._latest(receipt, "reprotect-target")
+
+    def _leg_row(self, leg: ChildRef):
+        rows = list(self._dispatch.find_orders(leg.account_id, leg.child_id))
+        return rows[0] if len(rows) == 1 else None
+
+    def _leg_status(self, leg: ChildRef) -> str:
+        row = self._leg_row(leg)
+        return "Unknown" if row is None else str(getattr(row, "status", "Unknown"))
+
+    def _start_reprotect(self, receipt, snapshot, position) -> LiquidationReceipt:
+        generation = int(snapshot.generation_id)
+        if receipt.stop_price is None:
+            return self._escalate_now(receipt, snapshot, "STOP_PRICE_MISSING: no stop price for re-protect")
+        problem = self._protective(position, float(receipt.stop_price), receipt.target_price)
+        if problem is not None:
+            return self._escalate_now(receipt, snapshot, problem)
+        root = receipt.cause_command_id
+        remaining = abs(float(position.quantity))
+        side = _reducing_side(position.quantity)
+        conid = int(receipt.conid)
+        attempt = self._store.transaction(
+            lambda conn: self._store.next_attempt_in_tx(conn, root, "reprotect-stop", conid))
+        groups = (liquidation_child_id(root, "reprotect-stop", conid, attempt),) + (
+            (liquidation_child_id(root, "reprotect-target", conid, attempt),)
+            if receipt.target_price is not None else ())
+        if self._protection is not None:
+            # R2-4: the saga binds the replacement legs before they exist, so their events are never lost.
+            self._protection.expect_reprotect(close_root_id=root, groups=groups, now=self._now())
+
+        def build(conn):
+            group = reprotect_oca_group(root, conid, attempt)
+            legs = [self._new_child(conn, receipt, kind="reprotect-stop", conid=conid, generation=generation,
+                                    side=side, quantity=remaining, price=float(receipt.stop_price), oca_group=group)]
+            if receipt.target_price is not None:
+                legs.append(self._new_child(conn, receipt, kind="reprotect-target", conid=conid,
+                                            generation=generation, state="PLANNED", side=side,
+                                            quantity=remaining, price=float(receipt.target_price), oca_group=group))
+            return legs
+        legs = self._reserve(receipt, build)
+        if legs is None:
+            return self._store.receipt(root)
+        receipt = self._set(receipt, "REPROTECTING", generation_id=generation, phase="reprotect",
+                            detail="re-protect stop submitted; target waits for the stop")
+        self._send_leg(receipt, legs[0], position)
+        return self._wait(self._store.receipt(root), generation, "awaiting broker acceptance of the re-protect stop")
+
+    def _send_leg(self, receipt, leg: ChildRef, position) -> None:
+        self._send(receipt, leg, lambda: self._dispatch.place_exit_leg(
+            position, leg="stop" if leg.kind == "reprotect-stop" else "target", quantity=leg.quantity,
+            price=leg.price, oca_group=leg.oca_group, child_id=leg.child_id))
+
+    def _advance_reprotect(self, receipt, snapshot, working, position) -> LiquidationReceipt:
+        """R13, R26, R30: the legs' own rows decide; a normal exit ends CLOSED; a leg that
+        was refused, rejected, cancelled or lost is a re-protect failure (never sent again)."""
+        generation = int(snapshot.generation_id)
+        stop, target = self._working_legs(receipt)
+        if any(c.state == "UNKNOWN" for c in receipt.children):
+            return self._wait(receipt, generation, "awaiting broker evidence for a re-protect leg")
+        if not self._fresh(receipt, generation):
+            return self._wait(receipt, generation, "awaiting a broker generation newer than the last leg fill")
+        if position is None:
+            # R26: a target fill cancels its OCA stop (or the stop filled): the position was closed by an exit.
+            return self._finish_reprotect_closed(receipt, snapshot, working)
+        if stop.state == "CANCELLED" and target is not None and target.state in ("WORKING", "FILLED") \
+                and generation <= stop.observed_generation:
+            # R26: a target fill cancels its OCA stop; judge the cancel together with the target
+            # and the position on a newer generation, never on the callback that came first.
+            return self._wait(receipt, generation, "reconciling an OCA stop cancel with its target")
+        if stop.state != "WORKING":
+            return self._escalate_now(receipt, snapshot, f"REPROTECT_FAILED: stop leg {stop.state}")
+        remaining = abs(float(position.quantity))
+        if target is not None and target.state == "PLANNED":
+            sized = replace(target, state="UNKNOWN", quantity=remaining, fence_generation=generation)
+
+            def promote(conn):
+                self._store.update_child_in_tx(conn, sized, self._now())
+                return [sized]
+            if self._reserve(receipt, promote):
+                self._send_leg(receipt, sized, position)
+            return self._wait(self._store.receipt(receipt.cause_command_id), generation,
+                              "re-protect target submitted for the live remaining position")
+        if target is not None and target.state != "WORKING":
+            return self._escalate_now(receipt, snapshot, f"REPROTECT_FAILED: target leg {target.state}")
+        legs = [stop] + ([target] if target is not None else [])
+        if generation <= max(leg.sent_generation or leg.fence_generation for leg in legs):
+            return self._wait(receipt, generation, "awaiting a generation newer than the re-protect legs")
+        side = _reducing_side(position.quantity)
+        for leg in legs:
+            row = self._leg_row(leg)
+            linked = row is not None and getattr(row, "oca_group", None) == stop.oca_group \
+                and getattr(row, "oca_type", None) == 2 and getattr(row, "action", None) == side
+            if not linked:
+                return self._escalate_now(
+                    receipt, snapshot, f"REPROTECT_FAILED: {leg.child_id} is not a linked protective leg at the broker")
+            if leg.outstanding_quantity != remaining:
+                return self._wait(receipt, generation,
+                                  f"{leg.child_id} outstanding {leg.outstanding_quantity} != position {remaining}")
+        state = self._partial_outcome(receipt)
+        detail = ("re-protect legs working in one OCA group for the remaining quantity" if state == "DONE" else
+                  "the partial reduce sold nothing; the position is protected again, the close failed")
+        return self._finish(receipt, state, generation_id=generation, remaining_quantity=remaining, detail=detail)
+
+    def _partial_outcome(self, receipt) -> str:
+        """R25 / D4: protection restored is not the requested reduction. Only a proven fill is DONE."""
+        sold = sum(c.filled_quantity for c in receipt.children
+                   if c.kind == "reduce" and c.root_id == receipt.cause_command_id and c.state != "ABSENT")
+        return "DONE" if sold > 0 else "REDUCE_FAILED"
+
+    def _finish_reprotect_closed(self, receipt, snapshot, working) -> LiquidationReceipt:
+        generation = int(snapshot.generation_id)
+        receipt = self._cancel_conid_orders(receipt, snapshot, working)
+        why = self._blocking(receipt, generation)
+        if why is not None or working:
+            return self._wait(receipt, generation, f"position closed by an exit; cancelling residual legs ({why})")
+        if generation <= self._last_action_generation(receipt):
+            return self._wait(receipt, generation, "awaiting a newer generation to prove no residual exits")
+        return self._finish(receipt, "CLOSED", generation_id=generation,
+                            detail="position closed by a re-protect exit; no residual exits")
+
     # -- escalation ----------------------------------------------------------------------
+
+    def _escalate(self, receipt, reason: str) -> None:
+        """Give up on the partial goal: trip the breaker and continue as a full close."""
+        if self._breaker is not None:
+            self._breaker.trip_liquidation(receipt.cause_command_id, reason)
+        root = receipt.cause_command_id
+
+        def write(conn):
+            self._registry.upgrade_goal_in_tx(conn, root, self._now())
+            run = self._store.get_run_in_tx(conn, root)
+            self._store.update_run_in_tx(conn, replace(
+                run, state="CANCELLING", goal="zero", goal_quantity=None, phase="cancel", escalated=True,
+                deadline=self._now() + dt.timedelta(seconds=self._deadline_seconds),
+                detail=f"escalated to full close: {reason}"), self._now())
+            self._store.drop_planned_in_tx(conn, root, self._now())
+        self._store.transaction(write)
+
+    def _escalate_now(self, receipt, snapshot, reason: str) -> LiquidationReceipt:
+        self._escalate(receipt, reason)
+        return self._advance_conid(self._store.receipt(receipt.cause_command_id), snapshot)
+

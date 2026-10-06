@@ -5,6 +5,7 @@ from __future__ import annotations
 import os
 import time
 from pathlib import Path
+from collections.abc import Mapping
 from typing import Iterable
 
 from cryptography.hazmat.primitives import serialization
@@ -189,3 +190,58 @@ def legacy_hmac_envelope_bytes(now=None) -> bytes:
     return canonical_json({"method": "get_status", "request_id": "legacy", "nonce": "legacy-nonce",
                            "timestamp": now if now is not None else time.time(), "body": {},
                            "signature": "00" * 32})
+
+
+class AllowAllAcl(Mapping):
+    """Test-only allow-list: every (role, method) is open to every known principal.
+
+    For tests whose subject is not authorization. Production uses the
+    tables in ``trader.messaging.principals``.
+    """
+
+    def __getitem__(self, key):
+        return KNOWN_PRINCIPALS
+
+    def __contains__(self, key):
+        return True
+
+    def __iter__(self):
+        return iter(())
+
+    def __len__(self):
+        return 0
+
+
+ALLOW_ALL = AllowAllAcl()
+
+
+def full_command_stack_stub():
+    """A command stack whose every optional service is a Mock, so every method registers."""
+    from unittest.mock import MagicMock
+    from types import SimpleNamespace
+
+    names = ("coordinator", "proposal_service", "repository", "controls", "nonces",
+             "approval_service", "cancel_service", "liquidation_service", "canary_service",
+             "allocation_service", "paper_automation_service", "automated_intent_service",
+             "strategy_control_service", "journal")
+    stack = SimpleNamespace(**{name: MagicMock(name=name) for name in names})
+    stack.account_mode = "paper"
+    stack.resume_ready = lambda: True
+    stack.reconciliation_complete = lambda command_id: True
+    return stack
+
+
+def build_full_production_registry(identity=None):
+    """The production trader registry with every optional surface registered."""
+    from unittest.mock import MagicMock
+
+    from trader.messaging.production_api import build_production_registry
+
+    trader = MagicMock(name="trader")
+    trader.ib_account = "DU111111"
+    trader.paper_trading = True
+    return build_production_registry(
+        trader, identity or make_identities()["trader"],
+        snapshot_service=MagicMock(name="snapshot"), feed_service=MagicMock(name="feed"),
+        command_stack=full_command_stack_stub(),
+    )

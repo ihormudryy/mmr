@@ -102,6 +102,7 @@ from trader.messaging.strategy_trader_contracts import (
     ResolveInstrumentResponse,
 )
 from trader.messaging.manage_surface import register_manage_surface
+from trader.messaging.principals import TRADER_ACL, is_valid_principal_name
 from trader.messaging.trader_service_api import TraderServiceApi
 from trader.messaging.typed_rpc import (
     ServiceIdentity,
@@ -2022,6 +2023,12 @@ def _dict_to_strategy_receipt(data: Dict[str, Any]) -> StrategyCommandReceipt:
     )
 
 
+def _forwarded_on_behalf_of(request: CommandRequest) -> Optional[str]:
+    """The original caller for the strategy service's log; never used for authorization."""
+    source = getattr(request, "source", None)
+    return source if is_valid_principal_name(source) else None
+
+
 class TypedStrategyControlPort:
     """[M1-F3] Task 7. Concrete ``StrategyControlPort`` backed by a pair of
     ``TypedRpcClient``s (``command``/``query`` roles) against
@@ -2049,7 +2056,9 @@ class TypedStrategyControlPort:
         }
         if request.action == "update_strategy_params":
             body["params"] = request.body.get("params") or {}
-        response = self._command_client.call(request.action, body, dict)
+        # Signed as `trader`; the original caller rides along for the log only.
+        response = self._command_client.call(
+            request.action, body, dict, on_behalf_of=_forwarded_on_behalf_of(request))
         return _dict_to_strategy_receipt(response)
 
     def get_receipt(self, command_id: str) -> Optional[StrategyCommandReceipt]:
@@ -2133,7 +2142,7 @@ def build_production_registry(
     # Every production handler may touch DuckDB, IB state, or another service.
     # Keep that work off the ROUTER event loop by default; isolated registries
     # elsewhere retain TypedRpcRegistry's inline default.
-    registry = TypedRpcRegistry(default_execution="thread")
+    registry = TypedRpcRegistry(acl=TRADER_ACL, default_execution="thread")
     api = TraderServiceApi(trader)
 
     # Health: service connectivity (IB, storage, upstream) — the same dict

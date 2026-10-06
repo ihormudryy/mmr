@@ -26,7 +26,7 @@ from types import SimpleNamespace
 
 import pytest
 
-from tests.rpc_identity_fixtures import make_identities
+from tests.rpc_identity_fixtures import ALLOW_ALL, make_identities
 
 from trader.messaging.typed_rpc import (
     TypedRpcClient,
@@ -197,7 +197,7 @@ def _serve_query(registry):
 
 def test_resolve_instrument_typed_roundtrip():
     api = _FakeTraderApi({265598: _fake_secdef()})
-    registry = TypedRpcRegistry()
+    registry = TypedRpcRegistry(acl=ALLOW_ALL)
     registry.register(
         "query", "resolve_instrument", ResolveInstrumentRequest,
         ResolveInstrumentResponse, _resolve_instrument_handler(api),
@@ -215,7 +215,7 @@ def test_resolve_instrument_typed_roundtrip():
 
 def test_resolve_instrument_typed_roundtrip_unknown_returns_none():
     api = _FakeTraderApi({})
-    registry = TypedRpcRegistry()
+    registry = TypedRpcRegistry(acl=ALLOW_ALL)
     registry.register(
         "query", "resolve_instrument", ResolveInstrumentRequest,
         ResolveInstrumentResponse, _resolve_instrument_handler(api),
@@ -238,7 +238,7 @@ def test_resolve_instrument_ib_fallback_qualifies_exact_conid(monkeypatch):
 
     monkeypatch.setattr(prod, '_cache_resolved_instrument', _cache)
     api = _FakeTraderApi({}, contract_secdefs={51529211: _fake_secdef(51529211, "GLD")})
-    registry = TypedRpcRegistry()
+    registry = TypedRpcRegistry(acl=ALLOW_ALL)
     registry.register(
         "query", "resolve_instrument", ResolveInstrumentRequest,
         ResolveInstrumentResponse, _resolve_instrument_handler(api),
@@ -261,7 +261,7 @@ def test_resolve_instrument_fake_broker_seeds_stub(monkeypatch):
     monkeypatch.setattr(prod, '_cache_resolved_instrument',
                         lambda api, d: cached.append(d.conId))
     api = _FakeTraderApi({})
-    registry = TypedRpcRegistry()
+    registry = TypedRpcRegistry(acl=ALLOW_ALL)
     registry.register(
         "query", "resolve_instrument", ResolveInstrumentRequest,
         ResolveInstrumentResponse, _resolve_instrument_handler(api),
@@ -278,7 +278,7 @@ def test_resolve_instrument_fake_broker_seeds_stub(monkeypatch):
 
 def test_publish_instrument_typed_roundtrip_drives_publish_contract():
     api = _FakeTraderApi({265598: _fake_secdef()})
-    registry = TypedRpcRegistry()
+    registry = TypedRpcRegistry(acl=ALLOW_ALL)
     registry.register(
         "query", "publish_instrument", PublishInstrumentRequest,
         PublishInstrumentResponse, _publish_instrument_handler(api),
@@ -292,7 +292,7 @@ def test_publish_instrument_typed_roundtrip_drives_publish_contract():
 
 def test_publish_instrument_unknown_conid_raises_remote_error():
     api = _FakeTraderApi({})  # conId not in the trader's universe
-    registry = TypedRpcRegistry()
+    registry = TypedRpcRegistry(acl=ALLOW_ALL)
     registry.register(
         "query", "publish_instrument", PublishInstrumentRequest,
         PublishInstrumentResponse, _publish_instrument_handler(api),

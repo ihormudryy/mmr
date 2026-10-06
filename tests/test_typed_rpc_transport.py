@@ -47,7 +47,7 @@ from trader.messaging.typed_rpc import (
     canonical_json,
     request_digest,
 )
-from tests.rpc_identity_fixtures import make_identities
+from tests.rpc_identity_fixtures import ALLOW_ALL, make_identities
 
 
 def _sign(identity, method, request_id, nonce, body, role="query"):
@@ -115,7 +115,7 @@ def _handle_bad_response(_body: EmptyBody) -> dict:
 
 
 def _build_registry() -> TypedRpcRegistry:
-    registry = TypedRpcRegistry()
+    registry = TypedRpcRegistry(acl=ALLOW_ALL)
     registry.register("query", "get_status", EmptyBody, dict, _handle_get_status)
     registry.register("query", "slow_query", EmptyBody, dict, _handle_slow_query)
     registry.register("query", "bad_response", EmptyBody, StatusResponse, _handle_bad_response)
@@ -251,44 +251,44 @@ def test_unknown_and_dotted_methods_are_rejected(query_client):
 
 class TestTypedRpcRegistry:
     def test_register_rejects_invalid_role(self):
-        registry = TypedRpcRegistry()
+        registry = TypedRpcRegistry(acl=ALLOW_ALL)
         with pytest.raises(ValueError, match="socket_role"):
             registry.register("admin", "get_status", EmptyBody, dict, _handle_get_status)
 
     @pytest.mark.parametrize("method", ["", "_private", "trader.client.ib.reqGlobalCancel"])
     def test_register_rejects_invalid_method_names(self, method):
-        registry = TypedRpcRegistry()
+        registry = TypedRpcRegistry(acl=ALLOW_ALL)
         with pytest.raises(ValueError):
             registry.register("query", method, EmptyBody, dict, _handle_get_status)
 
     def test_method_can_only_be_registered_on_one_role(self):
-        registry = TypedRpcRegistry()
+        registry = TypedRpcRegistry(acl=ALLOW_ALL)
         registry.register("query", "get_status", EmptyBody, dict, _handle_get_status)
         with pytest.raises(ValueError, match="already registered"):
             registry.register("command", "get_status", EmptyBody, dict, _handle_get_status)
 
     def test_duplicate_registration_on_same_role_rejected(self):
-        registry = TypedRpcRegistry()
+        registry = TypedRpcRegistry(acl=ALLOW_ALL)
         registry.register("query", "get_status", EmptyBody, dict, _handle_get_status)
         with pytest.raises(ValueError, match="already registered"):
             registry.register("query", "get_status", EmptyBody, dict, _handle_get_status)
 
     def test_resolve_is_scoped_to_the_exact_role(self):
-        registry = TypedRpcRegistry()
+        registry = TypedRpcRegistry(acl=ALLOW_ALL)
         registry.register("command", "approve_proposal", ApproveProposalRequest, dict, _handle_approve_proposal)
         assert registry.resolve("command", "approve_proposal") is not None
         assert registry.resolve("query", "approve_proposal") is None
         assert registry.resolve("command", "missing") is None
 
     def test_contains(self):
-        registry = TypedRpcRegistry()
+        registry = TypedRpcRegistry(acl=ALLOW_ALL)
         registry.register("query", "get_status", EmptyBody, dict, _handle_get_status)
         assert registry.contains("query", "get_status") is True
         assert registry.contains("command", "get_status") is False
         assert registry.contains("query", "missing") is False
 
     def test_unregister_removes_method_and_allows_reregister(self):
-        registry = TypedRpcRegistry()
+        registry = TypedRpcRegistry(acl=ALLOW_ALL)
         registry.register("command", "execute_automated_intent", EmptyBody, dict, _handle_get_status)
         assert registry.unregister("command", "execute_automated_intent") is True
         assert registry.contains("command", "execute_automated_intent") is False

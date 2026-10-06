@@ -6,6 +6,7 @@ from uuid import uuid4
 import pytest
 
 from tests.rpc_identity_fixtures import (
+    ALLOW_ALL,
     ServedStack, legacy_hmac_envelope_bytes, make_identities, write_keyset,
 )
 from trader.messaging.rpc_keys import RpcKeyError
@@ -184,7 +185,7 @@ def stack():
         calls["n"] += 1
         return {"ok": 1}
 
-    registry = TypedRpcRegistry()
+    registry = TypedRpcRegistry(acl=ALLOW_ALL)
     registry.register("query", "get_status", dict, dict, _status)
     served = ServedStack({("trader", "query"): registry}, ids)
     served.calls = calls
@@ -246,7 +247,7 @@ def test_round_trip_over_sockets(stack):
 def test_server_identity_must_be_a_server_principal():
     ids = make_identities()
     with pytest.raises(ValueError):
-        TypedRpcServer("query", TypedRpcRegistry(), ids["cli"])
+        TypedRpcServer("query", TypedRpcRegistry(acl=ALLOW_ALL), ids["cli"])
 
 
 def test_client_must_name_a_server():

@@ -5,7 +5,7 @@ import threading
 
 import pytest
 
-from tests.rpc_identity_fixtures import make_identities
+from tests.rpc_identity_fixtures import ALLOW_ALL, make_identities
 from trader.messaging.typed_rpc import (
     TypedRpcRegistry,
     TypedRpcServer,
@@ -29,21 +29,21 @@ def _raw(auth, method: str, request_id: str):
 
 
 def test_registry_records_explicit_thread_execution():
-    registry = TypedRpcRegistry()
+    registry = TypedRpcRegistry(acl=ALLOW_ALL)
     registry.register("command", "slow", dict, dict, lambda _body: {}, execution="thread")
 
     assert registry.resolve("command", "slow").execution == "thread"
 
 
 def test_registry_rejects_unknown_execution_mode():
-    registry = TypedRpcRegistry()
+    registry = TypedRpcRegistry(acl=ALLOW_ALL)
 
     with pytest.raises(ValueError, match="execution"):
         registry.register("query", "bad", dict, dict, lambda _body: {}, execution="process")
 
 
 def test_registry_rejects_empty_execution_mode_instead_of_using_default():
-    registry = TypedRpcRegistry(default_execution="thread")
+    registry = TypedRpcRegistry(acl=ALLOW_ALL, default_execution="thread")
 
     with pytest.raises(ValueError, match="execution"):
         registry.register("query", "bad", dict, dict, lambda _body: {}, execution="")
@@ -55,7 +55,7 @@ def test_server_rejects_invalid_environment_capacity(monkeypatch, configured):
     auth = _Ids()
 
     with pytest.raises(ValueError, match="positive integer"):
-        TypedRpcServer("query", TypedRpcRegistry(), auth.server)
+        TypedRpcServer("query", TypedRpcRegistry(acl=ALLOW_ALL), auth.server)
 
 
 @pytest.mark.asyncio
@@ -63,7 +63,7 @@ async def test_thread_handler_does_not_block_second_request():
     auth = _Ids(now=lambda: 1_700_000_000.0)
     started = threading.Event()
     release = threading.Event()
-    registry = TypedRpcRegistry()
+    registry = TypedRpcRegistry(acl=ALLOW_ALL)
 
     def slow(_body):
         started.set()
@@ -99,7 +99,7 @@ async def test_saturated_server_replies_busy_without_invoking_handler():
     started = threading.Event()
     release = threading.Event()
     quick_calls = 0
-    registry = TypedRpcRegistry(default_execution="thread")
+    registry = TypedRpcRegistry(acl=ALLOW_ALL, default_execution="thread")
 
     def slow(_body):
         started.set()
@@ -139,7 +139,7 @@ async def test_aclose_stops_replies_after_bounded_drain():
     auth = _Ids(now=lambda: 1_700_000_000.0)
     started = threading.Event()
     release = threading.Event()
-    registry = TypedRpcRegistry(default_execution="thread")
+    registry = TypedRpcRegistry(acl=ALLOW_ALL, default_execution="thread")
 
     def slow(_body):
         started.set()
@@ -169,7 +169,7 @@ async def test_aclose_stops_replies_after_bounded_drain():
 @pytest.mark.asyncio
 async def test_aclose_waits_for_accept_loop_cancellation():
     auth = _Ids()
-    server = TypedRpcServer("query", TypedRpcRegistry(), auth.server)
+    server = TypedRpcServer("query", TypedRpcRegistry(acl=ALLOW_ALL), auth.server)
     accept_task = asyncio.create_task(asyncio.sleep(60))
     server._serve_task = accept_task
 

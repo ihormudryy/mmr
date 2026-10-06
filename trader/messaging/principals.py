@@ -50,3 +50,65 @@ def peers_for(principal: str) -> frozenset[str]:
     if not is_valid_principal_name(principal):
         raise ValueError(f"unknown principal {principal!r}")
     return SERVER_ACCEPTS.get(principal, frozenset()) | CALLS[principal]
+
+
+# ---------------------------------------------------------------------------
+# Per-method allow-list, keyed by (socket role, method). A production
+# registry refuses to register a method that has no entry here; an empty
+# set means "nobody". Later plans add their own methods' entries.
+# ---------------------------------------------------------------------------
+
+HUMAN = frozenset({"cli", "dashboard"})
+ACCOUNT_READERS = HUMAN | {"ai_supervisor"}
+MARKET_READERS = HUMAN | {"ai_supervisor", "ai_research"}
+
+_TRADER_ACCOUNT_READS = (
+    "get_status", "get_account_values", "get_portfolio_summary", "get_positions",
+    "get_open_orders", "get_trades", "get_risk_limits", "get_ib_account", "get_fx_rates",
+    "get_account_cash_by_currency", "get_command", "get_proposal",
+    "get_paper_automation_status", "diagnose_portfolio_feed", "snapshot_with_cursor",
+)
+_TRADER_MARKET_READS = (
+    "get_snapshot", "get_snapshots_batch", "get_market_depth", "get_published_contracts",
+    "list_universes", "get_universe", "scanner_locations", "scan_ideas",
+)
+_TRADER_HUMAN_COMMANDS = (
+    "approve_proposal", "reject_proposal", "cancel_order", "cancel_orders", "resume_trading",
+    "preflight_command", "liquidate_account", "enable_strategy", "disable_strategy",
+    "update_strategy_params", "deactivate_live_canary", "suspend_allocation",
+    "activate_paper_automation", "deactivate_paper_automation", "create_universe",
+    "delete_universe", "add_universe_symbols", "remove_universe_symbol", "import_universe_csv",
+)
+
+TRADER_ACL: Mapping[tuple[str, str], frozenset[str]] = {
+    **{("query", m): ACCOUNT_READERS for m in _TRADER_ACCOUNT_READS},
+    **{("query", m): MARKET_READERS for m in _TRADER_MARKET_READS},
+    ("query", "resolve_instrument"): MARKET_READERS | {"strategy"},
+    ("query", "discover_instrument"): MARKET_READERS | {"strategy"},
+    ("query", "publish_instrument"): HUMAN | {"strategy"},
+    ("query", "get_trading_control"): ACCOUNT_READERS | {"strategy"},
+    ("query", "list_proposals"): ACCOUNT_READERS | {"strategy"},
+    ("query", "reconcile_with_broker"): HUMAN,
+    ("feed", "read_domain_events"): HUMAN | {"strategy"},
+    ("command", "create_proposal"): HUMAN | {"strategy"},
+    ("command", "execute_automated_intent"): frozenset({"strategy"}),
+    ("command", "record_state_acknowledged"): frozenset({"strategy"}),
+    ("command", "pause_trading"): HUMAN | {"ai_supervisor"},
+    # Owner answer 5 (ruling 18): live activation is cli only. dashboard keeps
+    # the risk-reducing deactivate_live_canary / suspend_allocation.
+    ("command", "activate_live_canary"): frozenset({"cli"}),
+    ("command", "activate_allocation"): frozenset({"cli"}),
+    **{("command", m): HUMAN for m in _TRADER_HUMAN_COMMANDS},
+}
+
+STRATEGY_ACL: Mapping[tuple[str, str], frozenset[str]] = {
+    **{("command", m): frozenset({"trader"}) for m in (
+        "enable_strategy", "disable_strategy", "update_strategy_params",
+        "arm_paper_automation", "disarm_paper_automation")},
+    ("query", "get_strategy_receipt"): frozenset({"trader"}),
+    ("query", "get_paper_automation_arm"): frozenset({"trader"}),
+    ("query", "list_strategies"): HUMAN | {"trader"},
+    ("command", "reload_strategies"): HUMAN | {"trader"},
+    ("command", "enable_strategy_by_name"): HUMAN,
+    ("command", "disable_strategy_by_name"): HUMAN,
+}

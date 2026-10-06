@@ -25,6 +25,7 @@ from trader.messaging.manage_contracts import (
     ListStrategiesRequest,
     ReloadStrategiesRequest,
 )
+from trader.messaging.principals import STRATEGY_ACL
 from trader.messaging.typed_rpc import (
     ServiceIdentity,
     TypedRpcClient,
@@ -591,8 +592,8 @@ class StrategyRuntime():
             # revision bump + outbox row in ONE transaction) and NEVER calls
             # back into the trader while handling a request.
             self._rpc_identity = ServiceIdentity.load("strategy", self.rpc_keys_dir or None)
-            self._typed_command_registry = TypedRpcRegistry()
-            self._typed_query_registry = TypedRpcRegistry()
+            self._typed_command_registry = TypedRpcRegistry(acl=STRATEGY_ACL)
+            self._typed_query_registry = TypedRpcRegistry(acl=STRATEGY_ACL)
             register_strategy_control_authority(
                 self._typed_command_registry, self._typed_query_registry, self,
             )

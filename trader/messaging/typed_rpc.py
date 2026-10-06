@@ -61,7 +61,7 @@ import threading
 import time
 import uuid
 from dataclasses import dataclass
-from typing import Any, Callable, Dict, FrozenSet, Literal, Optional
+from typing import Any, Callable, Dict, FrozenSet, Iterator, Literal, Mapping, Optional
 
 import zmq
 import zmq.asyncio
@@ -583,8 +583,10 @@ class TypedRpcRegistration:
     method: str
     request_model: Any
     response_model: Any
-    handler: Callable[[Any], Any]
+    handler: Callable[..., Any]
     execution: Literal["inline", "thread"]
+    allowed_principals: FrozenSet[str] = frozenset()
+    with_caller: bool = False
 
 
 class TypedRpcRegistry:
@@ -596,10 +598,18 @@ class TypedRpcRegistry:
     happens to match something registered elsewhere.
     """
 
-    def __init__(self, *, default_execution: Literal["inline", "thread"] = "inline") -> None:
+    def __init__(
+        self,
+        *,
+        acl: Optional[Mapping[tuple, FrozenSet[str]]] = None,
+        default_execution: Literal["inline", "thread"] = "inline",
+    ) -> None:
         if default_execution not in ("inline", "thread"):
             raise ValueError("default_execution must be 'inline' or 'thread'")
         self.default_execution = default_execution
+        # With an acl every registration must have an entry (no silent dead
+        # method); without one (tests) every method denies everyone.
+        self._acl = acl
         self._by_role_method: Dict[tuple, TypedRpcRegistration] = {}
         self._method_role: Dict[str, str] = {}
 
@@ -609,9 +619,10 @@ class TypedRpcRegistry:
         method: str,
         request_model: Any,
         response_model: Any,
-        handler: Callable[[Any], Any],
+        handler: Callable[..., Any],
         *,
         execution: Optional[Literal["inline", "thread"]] = None,
+        with_caller: bool = False,
     ) -> None:
         if socket_role not in VALID_SOCKET_ROLES:
             raise ValueError(
@@ -630,6 +641,14 @@ class TypedRpcRegistry:
             )
         if (socket_role, method) in self._by_role_method:
             raise ValueError(f"method {method!r} is already registered on role {socket_role!r}")
+        if self._acl is None:
+            allowed: FrozenSet[str] = frozenset()
+        elif (socket_role, method) in self._acl:
+            allowed = frozenset(self._acl[(socket_role, method)])
+        else:
+            raise ValueError(
+                f"({socket_role!r}, {method!r}) has no allow-list entry in "
+                "trader.messaging.principals; add one before registering it")
 
         self._method_role[method] = socket_role
         self._by_role_method[(socket_role, method)] = TypedRpcRegistration(
@@ -639,6 +658,8 @@ class TypedRpcRegistry:
             response_model=response_model,
             handler=handler,
             execution=selected_execution,
+            allowed_principals=allowed,
+            with_caller=with_caller,
         )
 
     def unregister(self, socket_role: str, method: str) -> bool:
@@ -669,6 +690,9 @@ class TypedRpcRegistry:
 
     def contains(self, socket_role: str, method: str) -> bool:
         return (socket_role, method) in self._by_role_method
+
+    def registrations(self) -> Iterator[TypedRpcRegistration]:
+        return iter(list(self._by_role_method.values()))
 
 
 # ---------------------------------------------------------------------------
@@ -871,6 +895,13 @@ class TypedRpcServer:
                     f"method {request.method!r} is not registered on the "
                     f"{self.socket_role!r} socket",
                 )
+            if caller.principal not in registration.allowed_principals:
+                logging.warning(
+                    "typed rpc PERMISSION_DENIED principal=%s method=%s request_id=%s",
+                    caller.principal, request.method, request.request_id)
+                raise _DispatchProblem(
+                    "PERMISSION_DENIED",
+                    f"principal {caller.principal!r} may not call {request.method!r}")
 
             try:
                 parsed_body = _coerce_request_body(request.body, registration.request_model)
@@ -882,10 +913,11 @@ class TypedRpcServer:
                     "SERVER_BUSY", "server command capacity is temporarily exhausted")
             self._active_handlers += 1
             try:
+                handler_args = (parsed_body, caller) if registration.with_caller else (parsed_body,)
                 if registration.execution == "thread":
-                    result = await asyncio.to_thread(registration.handler, parsed_body)
+                    result = await asyncio.to_thread(registration.handler, *handler_args)
                 else:
-                    result = registration.handler(parsed_body)
+                    result = registration.handler(*handler_args)
                 if inspect.isawaitable(result):
                     result = await result
 

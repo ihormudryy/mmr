@@ -33,7 +33,7 @@ from collections import namedtuple
 
 import pytest
 
-from tests.rpc_identity_fixtures import make_identities
+from tests.rpc_identity_fixtures import ALLOW_ALL, make_identities
 import zmq
 
 from trader.messaging.legacy_offline_api import LegacyOfflineTraderServiceApi
@@ -299,7 +299,7 @@ class TestProductionRegistryOverRealTransport:
         command_port = _free_port()
 
         registry = build_production_registry(_FakeTrader(), authenticator)
-        empty_command_registry = TypedRpcRegistry()  # mirrors connect(): [M1-F3] fills this in later
+        empty_command_registry = TypedRpcRegistry(acl=ALLOW_ALL)  # mirrors connect(): [M1-F3] fills this in later
 
         query_server = TypedRpcServer("query", registry, authenticator, port=query_port)
         command_server = TypedRpcServer("command", empty_command_registry, authenticator, port=command_port)

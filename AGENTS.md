@@ -20,17 +20,17 @@ Every AI model works on GitHub under its own GitHub App, never under the owner's
 Get a token for your own key name before any `gh` call. A token is valid for 1 hour; get a new one per session or after a 401.
 
 ```bash
-export GH_TOKEN=$(~/.config/github-apps/gh-app-token openai)   # use your key name
+export GH_TOKEN=$(scripts/gh-app-token.sh openai)   # use your key name
 gh api repos/ihormudryy/mmr/issues/16/comments -f body='...'  # posts as mmr-openai[bot]
 gh pr review 46 --comment -b '...'
 ```
 
 Claude pushes a branch with its token like this:
-`git push "https://x-access-token:$(~/.config/github-apps/gh-app-token claude)@github.com/ihormudryy/mmr.git" <branch>`
+`git push "https://x-access-token:$(scripts/gh-app-token.sh claude)@github.com/ihormudryy/mmr.git" <branch>`
 
 Rules:
 - If you cannot get a token (script missing, error, 401 after a refresh), stop and tell the owner. Never fall back to the owner's own `gh` login for any write.
-- The script and keys exist only on the owner's Mac. If you run anywhere else, you have no token: ask the owner, do not post.
+- Run the script from the repo root. The keys (not the script) exist only on the owner's Mac, in `~/.config/github-apps/`. If you run anywhere else, you have no token: ask the owner, do not post.
 - The installed `gh` is old (2.22): `gh pr edit` fails. Use REST instead, e.g. `gh api --method PATCH repos/ihormudryy/mmr/pulls/N -f body='...'`.
 - Use only your own key name. Never print, log or commit a token, or anything in `~/.config/github-apps/` (private keys, mode 0600, on the owner's machine only).
 - Apps cannot change the project board (status, priority, iteration) because it belongs to a personal account. Leave board changes to the owner's account.

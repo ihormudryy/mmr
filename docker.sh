@@ -31,10 +31,12 @@ echo_usage() {
     echo "  -k --backup [--recipient FILE] (encrypt keys/rpc with age)"
     echo "  -k --restore FILE [--identity-file PATH [--delete-identity-file]]"
     echo "      (restore keys/rpc; the age identity is read from stdin by default)"
+    echo "  -K (key check: cutover gate; in an isolated compose project, check each"
+    echo "      container sees only its own key pair, its peers' .pub and an empty HMAC file)"
     echo
 }
 
-b=n c=n f=n u=n d=n s=n a=n g=n l=n e=n i=n r=n n=n B=n k=n
+b=n c=n f=n u=n d=n s=n a=n g=n l=n e=n i=n r=n n=n B=n k=n K=n
 BACKUP_NAME=""
 KEYS_ACTION="init"
 KEYS_ROTATE=""
@@ -69,6 +71,7 @@ while [[ $# -gt 0 ]]; do
     -r|--restart-ib) r=y; shift ;;
     -n|--news) n=y; shift ;;
     -k|--keys) k=y; shift ;;
+    -K|--key-check) K=y; shift ;;
     --rotate)
       [[ $# -ge 2 ]] || { echo "--rotate needs a principal"; exit 1; }
       KEYS_ROTATE="$2"; shift 2 ;;
@@ -102,7 +105,7 @@ while [[ $# -gt 0 ]]; do
   esac
 done
 
-if [[ $b == "n" && $c == "n" && $f == "n" && $u == "n" && $d == "n" && $s == "n" && $a == "n" && $g == "n" && $l == "n" && $e == "n" && $i == "n" && $r == "n" && $n == "n" && $B == "n" && $k == "n" ]]; then
+if [[ $b == "n" && $c == "n" && $f == "n" && $u == "n" && $d == "n" && $s == "n" && $a == "n" && $g == "n" && $l == "n" && $e == "n" && $i == "n" && $r == "n" && $n == "n" && $B == "n" && $k == "n" && $K == "n" ]]; then
     echo_usage
     exit 0
 fi
@@ -987,7 +990,38 @@ keys() {
     esac
 }
 
-echo "action: build=$b clean=$c force=$f up=$u down=$d sync=$s sync_all=$a go=$g logs=$l exec=$e ib-only=$i restart-ib=$r news=$n backup=$B${BACKUP_NAME:+($BACKUP_NAME)} | runtime: $RUNTIME"
+# Cutover gate (-K). Runs `mmr keys check-mount` as a one-shot container per
+# service in its own compose project, with the test override (fake broker,
+# --simulation True on trader). The entrypoint is replaced, so no service
+# process starts, no port is published and the live `mmr` project is not
+# touched. Each container decides pass/fail itself from the shared
+# principals.rpc_files_for formula.
+KEYCHECK_PROJECT="mmr-keycheck"
+KEYCHECK_SERVICES="trader strategy dashboard cli scheduler data"
+
+key_check() {
+    _require_rpc_keys
+    local compose_args=(-p "$KEYCHECK_PROJECT" -f "$BUILDDIR/docker-compose.yml"
+                        -f "$BUILDDIR/docker-compose.test.override.yml")
+    local failed="" svc
+    for svc in $KEYCHECK_SERVICES; do
+        if ! $COMPOSE "${compose_args[@]}" run --rm --no-deps -T --entrypoint python \
+                "$svc" -m trader.messaging.keys_cli check-mount "$svc"; then
+            failed="$failed $svc"
+        fi
+    done
+    # No --volumes: only this project's containers and network go. Its empty
+    # DB volume is removed by its project-prefixed name, never the live one.
+    $COMPOSE "${compose_args[@]}" down --remove-orphans || true
+    $RUNTIME volume rm "${KEYCHECK_PROJECT}_mmr_db_data" >/dev/null 2>&1 || true
+    if [[ -n "$failed" ]]; then
+        echo "Key check FAILED for:$failed. Do not cut over."
+        exit 1
+    fi
+    echo "Key check passed for every service (project $KEYCHECK_PROJECT)."
+}
+
+echo "action: build=$b clean=$c force=$f up=$u down=$d sync=$s sync_all=$a go=$g logs=$l exec=$e ib-only=$i restart-ib=$r news=$n backup=$B${BACKUP_NAME:+($BACKUP_NAME)} key-check=$K | runtime: $RUNTIME"
 
 if [[ $b == "y" ]]; then
     build
@@ -1039,4 +1073,7 @@ if [[ $B == "y" ]]; then
 fi
 if [[ $k == "y" ]]; then
     keys
+fi
+if [[ $K == "y" ]]; then
+    key_check
 fi

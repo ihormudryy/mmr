@@ -141,6 +141,7 @@ RPC keys (Docker):
 ./docker.sh -k              # RPC keys: mmr keys init in the one-shot keygen container
 ./docker.sh -k --rotate dashboard   # Rotate one principal (restart the listed services together)
 ./docker.sh -k --backup     # Encrypted (age) backup of keys/rpc
+./docker.sh -K              # Cutover gate: isolated mount-only RPC key check (project mmr-keycheck)
 docker compose run --rm cli strategies   # CLI commands that need the strategy ports
 ```
 
@@ -190,7 +191,7 @@ User configs live in `~/.config/mmr/`. On first run, bundled defaults from `conf
 
 **`~/.config/mmr/logging.yaml`**: Python logging config (Rich console handler + rotating file handlers).
 
-**`.env`** (gitignored): IB Gateway credentials (`TWS_USERID`, `TWS_PASSWORD`, `TRADING_MODE`, `IB_ACCOUNT`). Typed RPC authentication uses one Ed25519 keypair per principal in `~/.config/mmr/keys/rpc/` (`<principal>.key` mode `0600`, `<principal>.pub`), created by `mmr keys init` (Docker: `./docker.sh -k`). Each container mounts only its own private key and the public keys it needs. The SDK signs as `cli` unless `MMR_RPC_PRINCIPAL` names `ai_supervisor` / `ai_research`. The old `service_hmac.key` is retired (ignored with a warning; delete it by hand after the cutover, see `docs/OPERATIONAL_STATE.md`).
+**`.env`** (gitignored): IB Gateway credentials (`TWS_USERID`, `TWS_PASSWORD`, `TRADING_MODE`, `IB_ACCOUNT`). Typed RPC authentication uses one Ed25519 keypair per principal in `~/.config/mmr/keys/rpc/` (`<principal>.key` mode `0600`, `<principal>.pub`), created by `mmr keys init` (Docker: `./docker.sh -k`). Each container mounts only its own key pair and the public keys it needs; a missing or mismatched own `.pub` stops startup. The SDK signs as `cli` unless `MMR_RPC_PRINCIPAL` names `ai_supervisor` / `ai_research`. The old `service_hmac.key` is retired (ignored with a warning; delete it by hand after the cutover, see `docs/OPERATIONAL_STATE.md`).
 
 ## Logging
 

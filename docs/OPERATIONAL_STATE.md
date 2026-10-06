@@ -290,10 +290,16 @@ are separate; each loader refuses the other kind.
 0. **First setup / cutover (owner-run, in this order):**
    1. `./docker.sh -b` (image with `age` and the keygen entry point).
    2. `./docker.sh -k` (creates every missing keypair, as your host user).
-   3. Cutover gate: `docker compose --profile test run fullstack-tests`.
-      It proves the tmpfs + per-file bind overlay and the `cli` / `keygen`
-      services on your Docker Desktop / Podman. Abort the cutover on any
-      failure.
+   3. Cutover gate: `./docker.sh -K` (key check). It runs one short-lived
+      container per service (`trader`, `strategy`, `dashboard`, `cli`,
+      `scheduler`, `data`) in a separate compose project `mmr-keycheck`, with
+      `docker-compose.test.override.yml` (fake broker, `--simulation True`).
+      Each container only runs `mmr keys check-mount <service>`: it must see
+      exactly its own `.key`, its own `.pub` and its peers' `.pub`, and
+      `service_hmac.key` must read empty. No service process starts, no port
+      is published and the running `mmr` stack is not touched. Abort the
+      cutover on any failure. (The `fullstack-tests` profile is no longer the
+      cutover gate: it stops the dashboard and signals trader PID 1.)
    4. `./docker.sh -u`.
    5. Check `mmr status` from the host and the `/cc` dashboard.
 1. **Rotation** (one principal, e.g. a suspected leak):

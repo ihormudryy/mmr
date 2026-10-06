@@ -14,6 +14,7 @@ import sys
 from pathlib import Path
 from typing import Callable, Optional, TextIO
 
+from trader.messaging.principals import SERVICE_PRINCIPAL, rpc_files_for
 from trader.messaging.rpc_keys import (
     RESTART_ON_ROTATE,
     RpcKeyError,
@@ -54,6 +55,12 @@ def add_keys_parser(sub) -> argparse.ArgumentParser:
     source.add_argument('--identity-stdin', action='store_true', help='Read the age identity from stdin')
     source.add_argument('--identity-file', help='Read the age identity from this file')
     restore_p.add_argument('--keys-dir', help='Override the RPC keys directory')
+    check_p = keys_sub.add_parser(
+        'check-mount', help='Inside a service container: check it sees exactly its own keys '
+                            '(run by ./docker.sh -K)')
+    check_p.add_argument('service', help='Compose service name')
+    check_p.add_argument('--keys-dir', help='Override the RPC keys directory')
+    check_p.add_argument('--hmac-file', help='Override the retired HMAC key path')
     return keys_p
 
 
@@ -79,9 +86,40 @@ def _read_identity(args, stdin) -> bytes:
     return Path(args.identity_file).read_bytes()
 
 
+def _mount_problems(service: str, keys_dir: Path, hmac_file: Path) -> list[str]:
+    expected = rpc_files_for(SERVICE_PRINCIPAL[service])
+    seen = frozenset(os.listdir(keys_dir)) if keys_dir.is_dir() else frozenset()
+    problems = [f"unexpected {name}" for name in sorted(seen - expected)]
+    problems += [f"missing {name}" for name in sorted(expected - seen)]
+    if not hmac_file.exists():
+        problems.append(f"{hmac_file} is not mounted (expected /dev/null)")
+    elif hmac_file.read_bytes():
+        problems.append(f"{hmac_file} is readable and not empty")
+    return problems
+
+
+def check_mount(args, out: TextIO) -> int:
+    """Exit 0 only if this container sees exactly its own key pair, its peers' .pub and an empty HMAC file."""
+    if args.service not in SERVICE_PRINCIPAL:
+        out.write(f"Error: unknown service {args.service!r}; expected one of "
+                  f"{', '.join(sorted(SERVICE_PRINCIPAL))}\n")
+        return 2
+    keys_dir = _keys_dir(args)
+    hmac_file = (Path(args.hmac_file) if args.hmac_file
+                 else keys_dir.parent.parent / "service_hmac.key")
+    problems = _mount_problems(args.service, keys_dir, hmac_file)
+    if problems:
+        out.write(f"{args.service}: key mounts FAILED: {'; '.join(problems)}\n")
+        return 1
+    out.write(f"{args.service}: key mounts ok\n")
+    return 0
+
+
 def run_keys_command(args, *, in_container: bool, stdin=None, out: TextIO = None) -> int:
     out = out or sys.stdout
     stdin = stdin or sys.stdin
+    if getattr(args, 'keys_action', None) == 'check-mount':
+        return check_mount(args, out)
     if in_container and os.environ.get(KEYGEN_CONTAINER_ENV) != "1":
         out.write(
             "Refusing to manage RPC keys inside a service container: keys/rpc is a tmpfs "
@@ -102,7 +140,7 @@ def run_keys_command(args, *, in_container: bool, stdin=None, out: TextIO = None
             restored = restore_keys(Path(args.archive), _keys_dir(args), _read_identity(args, stdin))
             out.write(f"Restored RPC keys for: {', '.join(restored)}\n")
         else:
-            out.write("usage: mmr keys {init,backup,restore} ...\n")
+            out.write("usage: mmr keys {init,backup,restore,check-mount} ...\n")
             return 2
     except RpcKeyError as exc:
         out.write(f"Error: {exc}\n")
@@ -111,11 +149,12 @@ def run_keys_command(args, *, in_container: bool, stdin=None, out: TextIO = None
 
 
 def main(argv: Optional[list[str]] = None,
-         in_container: Callable[[], bool] = running_in_container) -> int:
+         in_container: Callable[[], bool] = running_in_container,
+         out: Optional[TextIO] = None) -> int:
     parser = argparse.ArgumentParser(prog='mmr')
     add_keys_parser(parser.add_subparsers(dest='command'))
     args = parser.parse_args(['keys', *(sys.argv[1:] if argv is None else argv)])
-    return run_keys_command(args, in_container=in_container())
+    return run_keys_command(args, in_container=in_container(), out=out)
 
 
 if __name__ == '__main__':

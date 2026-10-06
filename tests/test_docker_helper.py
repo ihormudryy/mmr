@@ -69,6 +69,11 @@ if [ \"$1\" = \"info\" ]; then
   exit 0
 fi
 if [ \"$1\" = \"compose\" ]; then
+  if [ -n \"${MMR_FAKE_KEYCHECK_FAIL:-}\" ]; then
+    case \" $* \" in
+      *\" check-mount ${MMR_FAKE_KEYCHECK_FAIL} \"*|*\" check-mount ${MMR_FAKE_KEYCHECK_FAIL}\") exit 1 ;;
+    esac
+  fi
   case \" $* \" in
     *\" ps -q scheduler \"*)
       if [ \"${MMR_FAKE_SCHEDULER:-}\" = \"1\" ]; then
@@ -382,3 +387,66 @@ def test_backup_fallback_uses_compose_project_volume(fake_docker: FakeDocker):
     assert "-v mmr_mmr_db_data:/src:ro" in result.log
     # Must not target the stale unprefixed sibling volume.
     assert "-v mmr_db_data:/src:ro" not in result.log
+
+
+# --- PR #50 round 1, finding 4: isolated, mount-only cutover gate ---
+
+KEYCHECK_SERVICES = {"trader", "strategy", "dashboard", "cli", "scheduler", "data"}
+
+
+def _compose_lines(fake_docker: FakeDocker) -> list[list[str]]:
+    log = fake_docker.log_path.read_text() if fake_docker.log_path.exists() else ""
+    return [shlex.split(line) for line in log.splitlines() if line.startswith("compose ")]
+
+
+def test_keycheck_covers_every_classified_service():
+    from trader.messaging.principals import SERVICE_PRINCIPAL
+    assert KEYCHECK_SERVICES == set(SERVICE_PRINCIPAL)
+
+
+def test_K_runs_the_mount_check_in_an_isolated_project_with_the_test_override(fake_docker: FakeDocker):
+    fake_docker.write_keys()
+    result = fake_docker.run("-K")
+
+    assert result.returncode == 0, result.stdout + result.completed.stderr
+    calls = _compose_lines(fake_docker)
+    assert calls
+    prefix = ["compose", "-p", "mmr-keycheck",
+              "-f", str(REPO_ROOT / "docker-compose.yml"),
+              "-f", str(REPO_ROOT / "docker-compose.test.override.yml")]
+    for call in calls:
+        assert call[:7] == prefix, call
+        assert "up" not in call and "--profile" not in call and "fullstack-tests" not in call
+        assert "-v" not in call and "--volumes" not in call
+    runs = [c[7:] for c in calls if c[7] == "run"]
+    checked = set()
+    for run in runs:
+        assert run[:6] == ["run", "--rm", "--no-deps", "-T", "--entrypoint", "python"], run
+        service = run[6]
+        assert run[7:] == ["-m", "trader.messaging.keys_cli", "check-mount", service]
+        checked.add(service)
+    assert checked == KEYCHECK_SERVICES
+    assert calls[-1][7:] == ["down", "--remove-orphans"]
+    assert "mmr-keycheck" in result.stdout and "passed" in result.stdout
+
+
+def test_K_with_a_missing_key_makes_no_compose_call(fake_docker: FakeDocker):
+    fake_docker.write_keys()
+    (fake_docker.rpc_dir / "trader.pub").unlink()
+    result = fake_docker.run("-K")
+    assert result.returncode != 0 and "trader.pub" in result.stdout
+    assert not _compose_lines(fake_docker)
+
+
+def test_K_fails_and_names_the_service_whose_mounts_are_wrong(fake_docker: FakeDocker):
+    fake_docker.write_keys()
+    result = fake_docker.run("-K", env={"MMR_FAKE_KEYCHECK_FAIL": "strategy"})
+    assert result.returncode != 0
+    assert "strategy" in result.stdout
+    assert _compose_lines(fake_docker)[-1][7:] == ["down", "--remove-orphans"]
+
+
+def test_runbook_names_the_isolated_key_check_as_the_cutover_gate():
+    text = (REPO_ROOT / "docs/OPERATIONAL_STATE.md").read_text()
+    assert "./docker.sh -K" in text
+    assert "docker compose --profile test run fullstack-tests" not in text

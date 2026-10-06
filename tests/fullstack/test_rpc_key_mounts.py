@@ -1,7 +1,9 @@
-"""Owner-run cutover gate: the tmpfs + per-file key binds work on this Docker.
+"""Optional fullstack check: the tmpfs + per-file key binds on a running stack.
 
-Runs only inside the `fullstack-tests` container (`docker compose --profile
-test run fullstack-tests`), like test_process_supervision.py.
+Runs only inside the `fullstack-tests` container, like
+test_process_supervision.py (which stops the dashboard and signals trader
+PID 1). It is NOT the cutover gate: the owner runs `./docker.sh -K`, an
+isolated, mount-only check (tests/test_docker_helper.py, keys_cli check-mount).
 """
 import os
 import socket

@@ -66,9 +66,10 @@ class _FakeIB:
         self.cancelled.append(order)
 
 
-def _working(action, quantity, *, filled=0.0, oca_group=""):
+def _working(action, quantity, *, filled=0.0, oca_group="", account=ACCOUNT):
     return SimpleNamespace(contract=SimpleNamespace(conId=CONID),
-                           order=SimpleNamespace(action=action, totalQuantity=quantity, ocaGroup=oca_group),
+                           order=SimpleNamespace(action=action, totalQuantity=quantity, ocaGroup=oca_group,
+                                                 account=account),
                            orderStatus=SimpleNamespace(filled=filled))
 
 
@@ -112,6 +113,19 @@ def test_reduce_only_subtracts_reducing_orders_already_working():
     assert _run(trader.place_reduce_only_order(_contract(), "SELL", 4.0, broker_quantity=10.0,
                                                order_ref="mmr:y")).is_success()
     assert [o.totalQuantity for o in trader.executioner.placed] == [4.0]
+
+
+def test_another_accounts_working_order_does_not_reduce_the_pinned_accounts_capacity():
+    """#38: the client cache may hold orders of another account; only the pinned account's count.
+    An order with no account is counted: an unknown owner fails closed."""
+    trader = _trader(held=10.0)
+    trader.client.ib.open_trades = [_working("SELL", 10.0, account="DU99999")]
+    assert _run(trader.place_reduce_only_order(_contract(), "SELL", 10.0, broker_quantity=10.0,
+                                               order_ref="mmr:x")).is_success()
+    trader.client.ib.open_trades = [_working("SELL", 10.0, account="")]
+    refused = _run(trader.place_reduce_only_order(_contract(), "SELL", 10.0, broker_quantity=10.0,
+                                                  order_ref="mmr:y"))
+    assert refused.error.startswith("reduce-only refused")
 
 
 # -- Task 14: the dispatch ---------------------------------------------------------------

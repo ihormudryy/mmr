@@ -1808,12 +1808,15 @@ class Trader():
 
         A stop whose cancel has not landed still sells, so a second reduce of
         the full position could reverse it. The sibling of ``oca_group`` does
-        not count: one OCA pair protects the same shares once.
+        not count: one OCA pair protects the same shares once. Only orders of
+        the pinned account count; an order with no account is counted, so an
+        unknown owner fails closed (#38).
         """
         return sum(
             max(float(t.order.totalQuantity) - float(getattr(t.orderStatus, 'filled', 0.0) or 0.0), 0.0)
             for t in self.client.ib.openTrades()
             if int(getattr(t.contract, 'conId', 0) or 0) == conid
+            and (getattr(t.order, 'account', '') or self.ib_account) == self.ib_account
             and t.order.action == reducing_side
             and not (oca_group and getattr(t.order, 'ocaGroup', '') == oca_group)
         )

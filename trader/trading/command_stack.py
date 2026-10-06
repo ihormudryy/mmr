@@ -4,6 +4,7 @@ from __future__ import annotations
 import asyncio
 import datetime as dt
 import os
+import time
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Callable, Optional
@@ -239,6 +240,39 @@ class _LiquidationDispatch:
         return self._dispatch.newest_generation()
 
 
+class _BrokerGenerationRefresh:
+    """Ask for a newer complete broker generation without waiting for it.
+
+    A promoted generation only changes when ``run_broker_sync`` runs, which
+    today is only at (re)connect. The close needs newer generations to see
+    absence and fresh positions (R4, R5), so it asks for one while it waits.
+    """
+    def __init__(self, trader, *, min_interval_seconds: float = 5.0,
+                 clock: Optional[Callable[[], float]] = None):
+        self._trader = trader
+        self._min_interval = min_interval_seconds
+        self._clock = clock or time.monotonic
+        self._last: Optional[float] = None
+
+    def request_refresh(self, account_id: str) -> None:
+        now = self._clock()
+        if self._last is not None and now - self._last < self._min_interval:
+            return
+        loop = getattr(self._trader, "_main_loop", None)
+        sync = getattr(getattr(self._trader, "broker_ingest", None), "run_broker_sync", None)
+        if loop is None or not loop.is_running() or sync is None:
+            return
+        self._last = now
+        future = asyncio.run_coroutine_threadsafe(sync(self._trader.client), loop)
+        future.add_done_callback(_log_refresh_failure)
+
+
+def _log_refresh_failure(future) -> None:
+    import logging
+    if not future.cancelled() and future.exception() is not None:
+        logging.getLogger(__name__).warning("broker generation refresh failed: %s", future.exception())
+
+
 class _LiquidationBreaker:
     def __init__(self, breaker: CircuitBreaker, now):
         self._breaker = breaker
@@ -427,6 +461,7 @@ class CommandStack:
     liquidation_service: Any  # SerializedLiquidation: every entry point on one worker (R12)
     session_risk: Any = None  # SessionRiskController when automation stack is active
     liquidation_worker: Any = None  # LiquidationWorker behind liquidation_service (R12)
+    exit_owner_registry: Any = None  # ExitOwnerRegistry (SP1 safe close)
     protective_order_saga: Any = None  # ProtectiveOrderSaga (P3 Task 5)
     session_controller: Any = None  # SessionController (P3 Task 6)
     attribution_ledger: Any = None  # AttributionLedger (P3 Task 7)
@@ -517,6 +552,7 @@ def _build_automated_intent_service(
     quotes: Any,
     margin: Any,
     policy: CommandAuthorityPolicy,
+    liquidation: Any = None,
 ) -> Optional[Any]:
     """Build ``AutomatedIntentCommandService`` for paper automation only.
 
@@ -584,6 +620,8 @@ def _build_automated_intent_service(
         approval_factory=evidence.approval_factory,
         session_state_factory=evidence.session_state_factory,
         allocation_factory=evidence.allocation_factory,
+        liquidation=liquidation,
+        broker=broker,
     )
 
 
@@ -766,6 +804,7 @@ def build_command_stack(
         repo=repository,
         orders_view=orders_view,
         now=now,
+        closes=liquidation_store,
     )
     strategy_control_service = None
     if strategy_port is not None:
@@ -839,6 +878,7 @@ def build_command_stack(
             breaker=_LiquidationBreaker(circuit_breaker, now),
             journal=journal, ledger=ledger,
             schedule_reconcile=lambda command_id: reconciler.schedule(command_id, now()),
+            refresh=_BrokerGenerationRefresh(trader),
         ),
         liquidation_worker, account_id=trader.ib_account, now=now,
     )
@@ -915,6 +955,8 @@ def build_command_stack(
         now=now,
         db=trader.journal_db,
     )
+    # The saga is the protection port of every close and the source of unhandled failures.
+    liquidation_service.attach_protection(protective_order_saga)
     # P3 Task 6 — exchange-aware session deadlines / flatten scheduler.
     from trader.automation.session_controller import (
         SessionCancelAdapter,
@@ -1012,6 +1054,7 @@ def build_command_stack(
         schedule_reconcile=lambda command_id: reconciler.schedule(
             command_id, now(),
         ),
+        liquidation=liquidation_service,
     )
     from trader.automation.paper_activation import PaperAutomationActivationService
     from trader.automation.paper_hot_arm import ProductionPaperHotArmPorts
@@ -1053,6 +1096,7 @@ def build_command_stack(
         semantic_readiness=semantic_readiness,
         liquidation_service=liquidation_service,
         liquidation_worker=liquidation_worker,
+        exit_owner_registry=exit_owner_registry,
         session_risk=session_risk,
         protective_order_saga=protective_order_saga,
         session_controller=session_controller,
@@ -1084,6 +1128,7 @@ def build_command_stack(
             schedule_reconcile=lambda command_id: reconciler.schedule(
                 command_id, now(),
             ),
+            liquidation=liquidation_service,
         )
 
     if account_mode == "paper":
@@ -1122,6 +1167,7 @@ def build_command_stack(
     trader.semantic_readiness = semantic_readiness
     trader.liquidation_service = liquidation_service
     trader.liquidation_worker = liquidation_worker
+    trader.exit_owner_registry = exit_owner_registry
     trader.session_risk = session_risk
     trader.protective_order_saga = protective_order_saga
     trader.session_controller = session_controller

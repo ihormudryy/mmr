@@ -867,6 +867,26 @@ def test_sell_that_is_not_a_reduction_is_refused(tmp_path, held, requested):
     assert liquidation.starts == [] and stack.dispatch.calls == []
 
 
+@pytest.mark.parametrize("bad", [1.5, True, "1", 0])
+def test_sell_intent_with_an_inexact_conid_is_invalid_before_any_broker_read(tmp_path, bad):
+    """#21 round 5: the body's conid is never coerced. The intent ids are derived for conid 1,
+    so ``int(bad)`` would have passed every id check and closed conid 1."""
+    liquidation = _FakeCloseLiquidation()
+    captures = []
+    broker = SimpleNamespace(capture=lambda account_id: captures.append(account_id) or _FakeBrokerSnapshot(
+        10.0).capture(account_id))
+    stack = _build_stack(tmp_path, liquidation=liquidation, broker=broker)
+    (tmp_path / "bundles" / ARTIFACT_DIGEST.replace(":", "_")).mkdir(parents=True, exist_ok=True)
+    intent = make_intent(side="SELL", conid=1)
+    body = dict(intent_to_request_body(intent), conid=bad)
+    receipt = stack.coordinator.execute(CommandRequest(
+        command_id=intent.command_id, action="execute_automated_intent", account_id=ACCOUNT,
+        target_type="intent", target_id=intent.intent_id, expected_version=None,
+        body=body, source="strategy_service"))
+    assert (receipt.state, receipt.error_code) == ("REJECTED", "INTENT_INVALID")
+    assert (captures, liquidation.starts, stack.dispatch.calls) == ([], [], [])
+
+
 def test_sell_intent_refused_while_another_close_owns_the_conid(tmp_path):
     from trader.trading.exit_owner import ExitInProgress
     stack = _build_stack(tmp_path, liquidation=_FakeCloseLiquidation(raise_exc=ExitInProgress("other-root")),

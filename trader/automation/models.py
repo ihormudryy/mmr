@@ -1,3 +1,4 @@
+import numbers
 from dataclasses import dataclass, asdict
 from datetime import datetime
 from decimal import Decimal
@@ -61,8 +62,8 @@ class ExecutionIntent:
             raise ValueError("completed_bar_timestamp must be timezone-aware")
         if self.completed_bar_timestamp > self.signal_timestamp:
             raise ValueError("completed_bar_timestamp must be <= signal_timestamp")
-        if self.conid <= 0:
-            raise ValueError("conid must be positive")
+        if isinstance(self.conid, bool) or not isinstance(self.conid, numbers.Integral) or self.conid <= 0:
+            raise ValueError(f"conid must be positive and an exact integer, got {self.conid!r}")
         if self.side not in ("BUY", "SELL"):
             raise ValueError("side must be BUY or SELL")
         if not (Decimal("0") < self.risk_fraction <= Decimal("1")):

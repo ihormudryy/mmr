@@ -90,7 +90,7 @@ def intent_from_body(body: Mapping[str, Any]) -> ExecutionIntent:
         intent_id=body["intent_id"],
         command_id=body["command_id"],
         account_mode=body["account_mode"],
-        conid=int(body["conid"]),
+        conid=body["conid"],  # never coerced: ExecutionIntent refuses 1.5, True or "1" (#21)
         side=body["side"],
         requested_quantity=(
             None if body.get("requested_quantity") is None

@@ -300,6 +300,7 @@ class AllocationPolicy:
         authority_digest: Optional[str],
         effective_gross_ceiling: float,
         in_flight_notional: float = 0.0,
+        risk_limits_gross: Optional[float] = None,
     ) -> AllocationDecision:
         """Immediate pre-dispatch gross re-check against a fresh broker snapshot.
 
@@ -322,12 +323,14 @@ class AllocationPolicy:
             account_id=broker.account_id,
             artifact_digest=artifact_digest,
             now=now,
+            risk_limits_gross=risk_limits_gross,
         )
         reasons.extend(auth_reasons)
         if authority_digest is not None and resolved_digest != authority_digest:
             reasons.append("ALLOCATION_AUTHORITY_CHANGED")
+        # A ceiling looser than the approved one is refused, not adopted (R2).
         if effective > effective_gross_ceiling + 1e-15:
-            reasons.append("ALLOCATION_CEILING_TIGHTENED")
+            reasons.append("ALLOCATION_CEILING_CHANGED")
         # A ceiling that got tighter since approval stays tighter: the lower one wins.
         ceiling_tightened = effective + 1e-15 < effective_gross_ceiling
 

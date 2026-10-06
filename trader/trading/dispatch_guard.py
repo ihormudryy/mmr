@@ -5,8 +5,9 @@ import datetime as dt
 import math
 from collections import defaultdict
 from dataclasses import dataclass
-from typing import Any, Optional
+from typing import Any, Callable, Optional
 
+from trader.automation.risk_limits import PAPER_LIMITS, RiskLimits
 from trader.data.broker_state import BrokerRiskSnapshotError
 from trader.promotion.allocation_policy import AllocationPolicy
 from trader.trading.command_policy import CommandAuthorityPolicy
@@ -15,6 +16,9 @@ from trader.trading.trading_control import PauseStateUnavailable, TradingPausedE
 
 MAX_QUOTE_AGE_SECONDS = 5.0
 MAX_SOURCE_CLOCK_SKEW_SECONDS = 30.0
+
+# Automated entries need executable live evidence at dispatch; manual paper proposals do not.
+AUTOMATED_ENTRY_ACTIONS = frozenset({"execute_automated_intent", "submit_ai_paper_decision"})
 
 
 class DispatchGuardError(RuntimeError):
@@ -135,6 +139,7 @@ class DispatchGuard:
         policy: CommandAuthorityPolicy, account_id: str, account_mode: str,
         allocation_policy: Any = None,
         allocation_authority_lookup: Any = None,
+        current_limits: Callable[[Any], RiskLimits] = lambda request: PAPER_LIMITS,
     ):
         self._broker = broker
         self._quotes = quotes
@@ -146,8 +151,15 @@ class DispatchGuard:
         self._account_mode = account_mode
         self._allocation_policy = allocation_policy
         self._allocation_authority_lookup = allocation_authority_lookup
+        self._current_limits = current_limits
 
-    def _recheck_allocation(self, approved, current, price: float, automated: bool) -> None:
+    def _limits_for(self, request) -> RiskLimits:
+        try:
+            return self._current_limits(request)
+        except Exception as exc:
+            raise DispatchGuardError("LIMITS_UNAVAILABLE", "current risk limits unavailable") from exc
+
+    def _recheck_allocation(self, approved, request, current, price: float, automated: bool) -> None:
         evidence = getattr(approved, "allocation", None)
         if evidence is None:
             # Only automated entries carry allocation evidence. Manual paper
@@ -157,6 +169,7 @@ class DispatchGuard:
                     "ALLOCATION_EVIDENCE_MISSING", "allocation evidence is required for entries"
                 )
             return
+        limits_now = self._limits_for(request)
         try:
             in_flight_notional = _unseen_in_flight_notional(evidence, current)
             authority = self._active_authority(current.account_id, evidence)
@@ -173,6 +186,7 @@ class DispatchGuard:
                 authority_digest=evidence.authority_digest,
                 effective_gross_ceiling=evidence.effective_gross_ceiling,
                 in_flight_notional=in_flight_notional,
+                risk_limits_gross=limits_now.gross_fraction,
             )
         except Exception as exc:
             raise DispatchGuardError(
@@ -277,7 +291,7 @@ class DispatchGuard:
 
         # Automated paper entries require executable evidence too; the manual
         # paper proposal path may still use its documented delayed reference.
-        automated = getattr(request, "action", None) == "execute_automated_intent"
+        automated = getattr(request, "action", None) in AUTOMATED_ENTRY_ACTIONS
         if self._account_mode == "live" or automated:
             if quote.feed_type != "live":
                 raise DispatchGuardError("FEED_NOT_LIVE", "live feed required", retryable=True)
@@ -358,7 +372,7 @@ class DispatchGuard:
             self._allocation_policy is not None
             and _direction(approved.risk_direction) != "REDUCING"
         ):
-            self._recheck_allocation(approved, current, price, automated)
+            self._recheck_allocation(approved, request, current, price, automated)
 
         return DispatchPermit(
             generation_id=current.generation_id,

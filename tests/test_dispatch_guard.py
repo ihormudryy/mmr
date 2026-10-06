@@ -344,7 +344,7 @@ def test_dispatch_keeps_refusing_a_looser_ceiling_than_approved():
     with pytest.raises(DispatchGuardError) as caught:
         guard.revalidate(approved, _automated_request(), NOW)
 
-    assert caught.value.code == "ALLOCATION_CEILING_TIGHTENED"
+    assert caught.value.code == "ALLOCATION_CEILING_CHANGED"
 
 
 def test_reducing_order_is_not_blocked_after_ceiling_tightens():
@@ -423,3 +423,80 @@ def test_suspended_authority_in_the_store_refuses_the_entry(tmp_path):
 
     with pytest.raises(DispatchGuardError):
         guard.revalidate(approved, _automated_request(), NOW)
+
+
+# --- Plan 3 Task 2: current risk limits at dispatch (on top of #47) ---------
+
+from trader.automation.risk_limits import PAPER_LIMITS  # noqa: E402
+
+
+def _limits_guard(current_limits, **guard_kw):
+    guard = _allocation_guard(authority=None)
+    guard._current_limits = current_limits
+    for name, value in guard_kw.items():
+        setattr(guard, name, value)
+    return guard
+
+
+def test_current_risk_limits_tighten_the_dispatch_ceiling():
+    # 2,100 held + 1,050 new = 3.15% of 100k: fits the approved 6%, not the current 3%.
+    guard = _limits_guard(lambda request: replace(PAPER_LIMITS, gross_fraction=0.03))
+    approved = _with_allocation(_approved(), _evidence(ceiling=0.06))
+
+    with pytest.raises(DispatchGuardError) as caught:
+        guard.revalidate(approved, _automated_request(), NOW)
+
+    assert caught.value.code == "LIMIT_TIGHTENED_BEFORE_DISPATCH"
+
+
+def test_unchanged_limits_still_dispatch():
+    guard = _limits_guard(lambda request: PAPER_LIMITS)
+    approved = _with_allocation(_approved(), _evidence(ceiling=0.06))
+
+    assert guard.revalidate(approved, _automated_request(), NOW).generation_id == 2
+
+
+def test_default_limits_provider_is_the_paper_constant():
+    guard = _allocation_guard(authority=None)
+
+    assert guard._current_limits(_automated_request()) == PAPER_LIMITS
+
+
+def test_looser_current_ceiling_keeps_its_refusal_under_the_new_name():  # R2
+    decision = AllocationPolicy(now=lambda: NOW).revalidate_dispatch(
+        broker=_snapshot(), approved_broker=_snapshot(), conid=CONID, side="BUY",
+        quantity=1.0, entry_price=210.0, authority=None, artifact_max_gross=0.15,
+        artifact_digest=ARTIFACT_ID, authority_digest=None, effective_gross_ceiling=0.06,
+        risk_limits_gross=0.10,
+    )
+
+    assert "ALLOCATION_CEILING_CHANGED" in decision.reason_codes
+    assert "ALLOCATION_CEILING_TIGHTENED" not in decision.reason_codes
+
+
+def test_limits_provider_failure_refuses():
+    def boom(request):
+        raise RuntimeError("store down")
+
+    guard = _limits_guard(boom)
+
+    with pytest.raises(DispatchGuardError) as caught:
+        guard.revalidate(_with_allocation(_approved(), _evidence()), _automated_request(), NOW)
+
+    assert caught.value.code == "LIMITS_UNAVAILABLE"
+
+
+def test_ai_paper_action_gets_the_automated_quote_rules():
+    guard = _guard(quote=_quote(feed="delayed"))
+    request = replace(_automated_request(), action="submit_ai_paper_decision")
+
+    with pytest.raises(DispatchGuardError) as caught:
+        guard.revalidate(_approved(), request, NOW)
+
+    assert caught.value.code == "FEED_NOT_LIVE"
+
+
+def test_automated_entry_actions_name_both_paths():
+    from trader.trading.dispatch_guard import AUTOMATED_ENTRY_ACTIONS
+
+    assert AUTOMATED_ENTRY_ACTIONS == frozenset({"execute_automated_intent", "submit_ai_paper_decision"})

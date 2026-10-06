@@ -47,6 +47,7 @@ from trader.trading.circuit_breaker import CircuitBreaker
 from trader.trading.circuit_breaker import BreakerSignal
 from trader.trading.exit_owner import ExitOwnerRegistry
 from trader.trading.liquidation_service import LiquidationService, LiquidationRunStore, apply_liquidation_migration
+from trader.trading.liquidation_worker import LiquidationWorker, SerializedLiquidation
 from trader.trading.order_correlation import encode_order_ref
 from trader.trading.semantic_readiness import (
     SemanticReadiness,
@@ -418,8 +419,9 @@ class CommandStack:
     reconciliation_complete: Callable[[str], bool]
     circuit_breaker: CircuitBreaker
     semantic_readiness: SemanticReadiness
-    liquidation_service: LiquidationService
+    liquidation_service: Any  # SerializedLiquidation: every entry point on one worker (R12)
     session_risk: Any = None  # SessionRiskController when automation stack is active
+    liquidation_worker: Any = None  # LiquidationWorker behind liquidation_service (R12)
     protective_order_saga: Any = None  # ProtectiveOrderSaga (P3 Task 5)
     session_controller: Any = None  # SessionController (P3 Task 6)
     attribution_ledger: Any = None  # AttributionLedger (P3 Task 7)
@@ -824,12 +826,16 @@ def build_command_stack(
             now=now(),
         ),
     )
-    liquidation_service = LiquidationService(
-        broker_snapshot, _LiquidationDispatch(dispatch, orders_view),
-        store=liquidation_store, registry=exit_owner_registry, now=now,
-        breaker=_LiquidationBreaker(circuit_breaker, now),
-        journal=journal, ledger=ledger,
-        schedule_reconcile=lambda command_id: reconciler.schedule(command_id, now()),
+    liquidation_worker = LiquidationWorker()
+    liquidation_service = SerializedLiquidation(
+        LiquidationService(
+            broker_snapshot, _LiquidationDispatch(dispatch, orders_view),
+            store=liquidation_store, registry=exit_owner_registry, now=now,
+            breaker=_LiquidationBreaker(circuit_breaker, now),
+            journal=journal, ledger=ledger,
+            schedule_reconcile=lambda command_id: reconciler.schedule(command_id, now()),
+        ),
+        liquidation_worker, account_id=trader.ib_account, now=now,
     )
     proposal_service = ProposalCommandService(
         repository=repository,
@@ -897,7 +903,8 @@ def build_command_stack(
         dispatch_guard=dispatch_guard,
         session_risk=session_risk,
         breaker=circuit_breaker,
-        liquidation=liquidation_service,
+        # The ingest thread reports protection failures; it must queue the flatten, not wait (R12).
+        liquidation=liquidation_service.nonblocking(),
         account_id=trader.ib_account,
         account_mode=account_mode,
         now=now,
@@ -1040,6 +1047,7 @@ def build_command_stack(
         circuit_breaker=circuit_breaker,
         semantic_readiness=semantic_readiness,
         liquidation_service=liquidation_service,
+        liquidation_worker=liquidation_worker,
         session_risk=session_risk,
         protective_order_saga=protective_order_saga,
         session_controller=session_controller,
@@ -1108,6 +1116,7 @@ def build_command_stack(
     trader.automation_circuit_breaker = circuit_breaker
     trader.semantic_readiness = semantic_readiness
     trader.liquidation_service = liquidation_service
+    trader.liquidation_worker = liquidation_worker
     trader.session_risk = session_risk
     trader.protective_order_saga = protective_order_saga
     trader.session_controller = session_controller

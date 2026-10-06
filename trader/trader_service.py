@@ -5,6 +5,7 @@ from trader.common.logging_helper import LogLevels, set_all_log_level, setup_log
 from trader.container import Container, default_config_path
 from trader.data.schema_migrations import SchemaMigrator
 from trader.trading.liquidation_service import LiquidationBusy
+from trader.trading.liquidation_worker import LiquidationWorker
 from trader.trading.trading_control import TradingControlStore, apply_trading_control_migration
 from trader.trading.trading_runtime import Trader
 
@@ -191,8 +192,19 @@ def _new_liquidation_worker() -> concurrent.futures.ThreadPoolExecutor:
     order wait times out, so process exit can be delayed by at most about the
     dispatch timeout (30s).
     """
-    return concurrent.futures.ThreadPoolExecutor(
-        max_workers=1, thread_name_prefix='liquidation-worker')
+    return LiquidationWorker()
+
+
+def _shared_liquidation_worker(trader, fallback):
+    """The worker the command stack built (R12), so RPC, ingest and these ticks share one thread.
+
+    ``fallback`` is shut down when the stack has its own worker.
+    """
+    built = getattr(trader, 'liquidation_worker', None)
+    if built is None:
+        return fallback
+    fallback.shutdown(wait=False)
+    return built
 
 
 async def _on_worker(worker, fn, *args):
@@ -491,6 +503,8 @@ def main(simulation: bool,
         loop.add_signal_handler(signal.SIGTERM, handle_sigint)
 
         trader.connect()
+        # R12: connect() built the command stack and its liquidation worker.
+        liquidation_worker = _shared_liquidation_worker(trader, liquidation_worker)
 
         # [M1-F3] Task 4: the durable per-account pause gate must be seeded
         # before this service is considered ready -- an exposure-increasing

@@ -68,6 +68,7 @@ class _Ingest:
         self.syncs = 0
         self.ready = True          # False: a newer generation is staging, the enumeration is not complete
         self.before_hold = None    # an ingest batch applied just before a close holds broker changes
+        self.after_hold = None     # an IB update that lands right after a close lets the hold go
 
     @property
     def is_ready(self):
@@ -80,7 +81,11 @@ class _Ingest:
             self.before_hold()
         if not self.ready:
             raise BrokerChangesBusy("broker generation is staging")
-        yield
+        try:
+            yield
+        finally:
+            if self.after_hold is not None:
+                self.after_hold()
 
     async def run_broker_sync(self, _client):
         self.syncs += 1
@@ -597,6 +602,48 @@ def test_a_stop_filled_at_release_that_closed_the_remainder_is_closed_without_an
     _partial_close_up_to_done(composed, stop_closed_the_remainder)
     assert composed.saga.resume("entry-1").state == "CLOSED"
     assert composed.stack.circuit_breaker.store.get().state == "CLEAR"
+
+
+def test_a_stop_fill_after_the_final_admission_hold_is_refused_at_the_order_boundary(composed):
+    """#22 round 8 (openai): the target's last admission hold read +6 and a stop with 6 outstanding.
+    Right after that hold the stop fills 2: IB's order status has it, the position cache and the
+    journal do not yet. The reduce-only boundary counts the OCA pair once (stop outstanding 4 != 6),
+    so the target of 6 is refused in the loop step that would place it: nothing sent, the target is
+    PLANNED again, no escalation. Once the fill is promoted the next tick sends a target of 4."""
+    og = composed.protected_entry()
+    composed.sim.promote()
+    composed.liquidation.start(ACCOUNT, "p-1", _et(11, 5), scope="conid", conid=CONID, quantity=4.0)
+    composed.cancel_landed(f"{og}:stop", f"{og}:take_profit")
+    composed.sim.promote()
+    composed.tick()                                                   # reduce 4
+    composed.sim.set_status(composed.sim.entity_for("p-1-reduce"), "Filled", filled=4.0)
+    composed.sim.held[CONID] = 6.0
+    for _ in range(2):                                                # fill seen, stop for 6
+        composed.sim.promote()
+        composed.tick()
+    stop = composed.sim.entity_for("p-1-reprotect-stop")
+    holds = []
+
+    def stop_fills_2_after_the_final_hold():
+        holds.append(1)
+        if len(holds) == 2:                                           # _target_still_admitted
+            composed.sim.trades[stop].orderStatus.filled = 2.0
+    composed.trader.broker_ingest.after_hold = stop_fills_2_after_the_final_hold
+    composed.sim.promote()
+    composed.tick()
+    composed.trader.broker_ingest.after_hold = None
+    assert len(holds) == 2
+    assert not any(p[0] == "p-1-reprotect-target-265598-1" for p in composed.sim.placed)
+    receipt = composed.liquidation.receipt_for("p-1")
+    assert next(c for c in receipt.children if c.kind == "reprotect-target").state == "PLANNED"
+    assert not receipt.escalated and composed.stack.circuit_breaker.store.get().state == "CLEAR"
+    composed.sim.set_status(stop, "Submitted", filled=2.0)
+    composed.sim.held[CONID] = 4.0
+    for _ in range(3):
+        composed.sim.promote()
+        composed.tick()
+    targets = [p for p in composed.sim.placed if p[0] == "p-1-reprotect-target-265598-1"]
+    assert [p[3] for p in targets] == [4.0]
 
 
 def test_target_leg_rejected_by_the_broker_escalates_to_a_full_close(composed):

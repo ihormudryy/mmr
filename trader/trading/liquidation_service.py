@@ -1378,8 +1378,8 @@ class LiquidationService:
             return False
         return True
 
-    def _send(self, receipt, child: ChildRef, call: Callable[[], Any]) -> None:
-        """One broker call for one journaled child (R2, D13).
+    def _send(self, receipt, child: ChildRef, call: Callable[[], Any]) -> Optional[str]:
+        """One broker call for one journaled child (R2, D13); the refusal code, or None.
 
         ``DispatchRefused`` is a proven refusal before the order left: NOT_SENT.
         Any other exception may have crossed the boundary: the child stays
@@ -1388,25 +1388,26 @@ class LiquidationService:
         """
         if not self._still_dispatchable(receipt.cause_command_id, receipt.goal):
             self._mark(child, "NOT_SENT")
-            return
+            return "STALE_DISPATCH"
         try:
             call()
         except DispatchRefused as ex:
             log.warning("liquidation child %s refused before the broker: %s", child.child_id, ex)
             self._mark(child, "NOT_SENT")
-            return
+            return ex.code
         except Exception:
             log.exception("liquidation child %s: outcome unknown after the broker call", child.child_id)
         try:
             fence = int(self._dispatch.newest_generation())
         except Exception:
             log.exception("liquidation child %s has no send fence; the next tick sets it", child.child_id)
-            return
+            return None
 
         def write(conn):
             current = self._store.child_in_tx(conn, child.child_id)
             self._store.update_child_in_tx(conn, replace(current, sent_generation=fence), self._now())
         self._store.transaction(write)
+        return None
 
     def _mark(self, child: ChildRef, state: str) -> None:
         self._store.transaction(
@@ -1650,8 +1651,8 @@ class LiquidationService:
         self._send_leg(receipt, legs[0], position)
         return self._wait(self._store.receipt(root), generation, "awaiting broker acceptance of the re-protect stop")
 
-    def _send_leg(self, receipt, leg: ChildRef, position) -> None:
-        self._send(receipt, leg, lambda: self._dispatch.place_exit_leg(
+    def _send_leg(self, receipt, leg: ChildRef, position) -> Optional[str]:
+        return self._send(receipt, leg, lambda: self._dispatch.place_exit_leg(
             position, leg="stop" if leg.kind == "reprotect-stop" else "target", quantity=leg.quantity,
             price=leg.price, oca_group=leg.oca_group, child_id=leg.child_id))
 
@@ -1741,6 +1742,12 @@ class LiquidationService:
         after that last read is caught by the next tick: a stop that is no
         longer WORKING, or a target larger than the position, escalates and
         cancels the target.
+
+        #22 round 8: the last fence is the order boundary itself
+        (``LIVE_SIZE_MISMATCH``). It checks the size against the live broker
+        cache in the same loop step that places the order. That refusal sent
+        nothing, so the target goes back to PLANNED, same child id (spec 5.1:
+        place only the missing sibling), and the next tick sizes it again.
         """
         try:
             with self._dispatch.hold_broker_changes():
@@ -1763,7 +1770,11 @@ class LiquidationService:
                 self._store.transaction(lambda conn: self._store.update_child_in_tx(conn, target, self._now()))
                 receipt = self._observe_children(receipt, snapshot, int(self._dispatch.newest_generation()))
                 return self._wait(receipt, generation, f"re-protect target not sent: {why}")
-            self._send_leg(receipt, sized, held)
+            if self._send_leg(receipt, sized, held) == LIVE_SIZE_MISMATCH:
+                self._store.transaction(lambda conn: self._store.update_child_in_tx(conn, target, self._now()))
+                receipt = self._observe_children(receipt, snapshot, int(self._dispatch.newest_generation()))
+                return self._wait(receipt, generation,
+                                  "re-protect target not sent: the live broker size changed at the order boundary")
         return self._wait(self._store.receipt(receipt.cause_command_id), generation,
                           "re-protect target submitted for the live remaining position")
 

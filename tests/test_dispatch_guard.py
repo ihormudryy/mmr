@@ -390,3 +390,36 @@ def test_no_allocation_policy_keeps_todays_behaviour():
     guard = _guard(margin={"initMarginAfter": 1000.0, "equityWithLoanAfter": 99_000.0})
 
     assert guard.revalidate(_approved(), _automated_request(), NOW).generation_id == 2
+
+
+def test_suspended_authority_in_the_store_refuses_the_entry(tmp_path):
+    from trader.data.allocation_authority_store import (
+        AllocationAuthorityStore, apply_allocation_authority_migrations,
+    )
+    from trader.data.domain_journal import DomainJournal
+    from trader.data.duckdb_store import DuckDBConnection
+    from trader.data.schema_migrations import SchemaMigrator
+
+    db = DuckDBConnection.get_instance(str(tmp_path / "auth.duckdb"))
+    migrator = SchemaMigrator(db)
+    journal = DomainJournal(db)
+    journal.migrate(migrator)
+    apply_allocation_authority_migrations(migrator)
+    store = AllocationAuthorityStore(journal=journal, db=db, now=lambda: NOW)
+    db.execute(
+        "INSERT INTO allocation_authorities "
+        "(authority_digest, strategy_id, account_id, account_mode, stage, "
+        "artifact_digest, allowlist_digest, ruleset_digest, max_gross_allocation, "
+        "evidence_digest, public_key_id, operator, reason, issued_at, expires_at, "
+        "event, recorded_at) VALUES "
+        "('d', 's', ?, 'paper', 'CANARY', ?, 'al', 'ru', 0.0, 'ev', 'k', "
+        "'op', 'suspended', ?, ?, 'OVERRIDE', ?)",
+        [ACCOUNT, ARTIFACT_ID, NOW, NOW + dt.timedelta(days=1), NOW],
+    )
+    assert store.active_for(ACCOUNT, ARTIFACT_ID) is None  # why the guard needs more
+
+    guard = _allocation_guard(lookup=store.authority_for_dispatch)
+    approved = _with_allocation(_approved(), _evidence(ceiling=0.06))
+
+    with pytest.raises(DispatchGuardError):
+        guard.revalidate(approved, _automated_request(), NOW)

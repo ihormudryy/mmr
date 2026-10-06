@@ -728,3 +728,70 @@ def test_trader_service_starts_session_recovery_before_readiness():
     run_marker = "logging.debug('starting trader run() loop')\n        trader.run()"
     assert run_marker in text
     assert text.index(marker) < text.index(run_marker)
+# ---------------------------------------------------------------------------
+# SP1 plan 1: time exits close through the scoped liquidation (Tasks 1, 11)
+# ---------------------------------------------------------------------------
+
+class _SimBroker:
+    """A broker with one long position and its working protective stop.
+
+    It is the snapshot port and the dispatch port at once; every capture is a
+    newer, complete broker generation.
+    """
+    def __init__(self, quantity: float = 10.0):
+        self.generation = 0
+        self.quantity = quantity
+        self.stop_working = True
+        self.rows: dict[str, list] = {}
+        self.calls: list[tuple] = []
+
+    def _stop_row(self, status: str = "Submitted") -> BrokerOrderRow:
+        return BrokerOrderRow(
+            order_entity_id="og-1:stop", account_id=ACCOUNT, conid=CONID, symbol="AAPL",
+            order_group_id="og-1", leg="stop", is_external=False, action="SELL", order_type="STP",
+            total_quantity=10.0, filled_quantity=0.0, avg_fill_price=None, limit_price=None,
+            stop_price=150.0, tif="DAY", status=status, deleted=False, revision=1,
+            source_timestamp=_utc(11, 0),
+        )
+
+    def capture(self, account_id):
+        self.generation += 1
+        positions = [_position(self.quantity)] if self.quantity else []
+        working = [self._stop_row()] if self.stop_working else []
+        return _snapshot(self.generation, positions, working)
+
+    def cancel(self, order, child_id):
+        self.calls.append(("cancel", order.order_entity_id))
+        self.stop_working = False
+
+    def reduce(self, position, side, quantity, child_id):
+        self.calls.append(("reduce", side, float(quantity)))
+        self.quantity -= float(quantity) if side == "SELL" else -float(quantity)
+        self.rows[child_id] = [SimpleNamespace(status="Filled", filled_quantity=float(quantity),
+                                               total_quantity=float(quantity))]
+
+    def find_orders(self, account_id, child_id):
+        return self.rows.get(child_id, [])
+
+    def get_order(self, order_entity_id):
+        return None if self.stop_working else self._stop_row("Cancelled")
+
+    def enumeration_complete(self):
+        return True
+
+    def newest_generation(self):
+        return self.generation
+
+
+@pytest.mark.xfail(strict=True, raises=AssertionError,
+                   reason="the time exit reduces without cancelling the stop; fixed in plan 1 task 11")
+def test_time_exit_leaves_no_live_stop_after_the_position_is_closed():
+    """Spec 5.1: a time exit must cancel the protective stop first. Today it only reduces,
+    so a live stop is left on a closed position and can open a short."""
+    from trader.automation.session_controller import SessionTimeExitAdapter
+
+    broker = _SimBroker()
+    adapter = SessionTimeExitAdapter(broker)                  # today's constructor
+    adapter.request_exit(command_id="exit-1", conid=CONID, quantity=Decimal("10"), side="BUY")
+    assert broker.quantity == 0.0
+    assert broker.stop_working is False, "a live stop on a closed position can open a short"

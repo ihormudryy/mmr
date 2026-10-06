@@ -1301,6 +1301,7 @@ class BrokerIngest:
                 f"{obs.filled_quantity}:{obs.source_timestamp.isoformat()}"
             ),
             source_timestamp=obs.source_timestamp,
+            order_entity_id=order.order_entity_id,
         )
         try:
             self.protective_order_saga.on_broker_event(event)

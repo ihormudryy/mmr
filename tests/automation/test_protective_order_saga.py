@@ -997,3 +997,432 @@ def test_saga_refuses_entry_that_only_fits_at_the_quote_not_at_the_entry_limit(t
     assert state.state == "CLOSED"
     assert state.error_code == "GROSS_EXPOSURE"
     assert dispatch.calls == []
+# ---------------------------------------------------------------------------
+# SP1 plan 1 Task 9: close ownership (CLOSE_OWNED), hand-over, release
+# ---------------------------------------------------------------------------
+
+from dataclasses import replace  # noqa: E402
+
+
+def _protected(tmp_path, **kw):
+    saga, intent, state, breaker, liquidation, dispatch = _started(tmp_path, **kw)
+    og = state.order_group_id
+    for leg, oid in (("entry", 1), ("stop", 2), ("take_profit", 3)):
+        saga.on_broker_event(_event(og, leg=leg, status="Submitted", order_id=oid))
+    state = saga.on_broker_event(_event(og, leg="entry", status="Filled", filled=10.0, total=10.0))
+    assert state.state == "PROTECTED"
+    return saga, intent, state, breaker, liquidation
+
+
+def _owned_event(order_group_id, *, leg, status, entity, filled=0.0, total=10.0):
+    from trader.automation.protective_order_saga import BrokerOrderEvent
+    return BrokerOrderEvent(order_group_id, leg, status, filled, total, 2,
+                            f"{entity}:{status}:{filled}", NOW, order_entity_id=entity)
+
+
+def _cancels(og, *entities):
+    from trader.trading.liquidation_service import CancelTarget
+    return tuple(CancelTarget(entity, og) for entity in entities)
+
+
+def test_migration_37_adds_ownership_columns_and_groups_table(tmp_path):
+    from trader.automation.protective_order_saga import PROTECTIVE_SAGA_OWNERSHIP_MIGRATION_VERSION
+    *_rest, db = _build_saga(tmp_path)
+    assert PROTECTIVE_SAGA_OWNERSHIP_MIGRATION_VERSION == 37
+    cols = {r[0] for r in db.execute("DESCRIBE automated_order_sagas", fetch="all")}
+    assert {"account_id", "conid", "close_root_id"} <= cols
+    assert "flatten_requested" in cols
+    group_cols = {r[0] for r in db.execute("DESCRIBE automated_order_saga_groups", fetch="all")}
+    assert group_cols == {"order_group_id", "command_id", "protection_generation"}
+    assert db.execute("SELECT name FROM schema_migrations WHERE version = 37", fetch="one") == ("sp1_saga_close_ownership",)
+
+
+def test_handover_records_exact_refs_and_generation_and_returns_prices(tmp_path):
+    saga, intent, state, *_ = _protected(tmp_path)
+    og = state.order_group_id
+    info = saga.handover(account_id=ACCOUNT, conid=CONID, close_root_id="close-1",
+                         cancels=_cancels(og, "og:stop", "og:tp") + _cancels("other", "x"), generation=7, now=NOW)
+    owned = saga.resume(intent.command_id)
+    assert (owned.state, owned.close_root_id, owned.handover_generation) == ("CLOSE_OWNED", "close-1", 7)
+    assert owned.expected_cancel_ids == ("og:stop", "og:tp")
+    assert (info.stop_price, info.target_price) == (150.0, 200.0)
+
+
+def test_expected_cancel_under_close_owned_is_not_an_incident(tmp_path):
+    saga, intent, state, breaker, liquidation = _protected(tmp_path)
+    og = state.order_group_id
+    saga.handover(account_id=ACCOUNT, conid=CONID, close_root_id="close-1",
+                  cancels=_cancels(og, "og:stop", "og:tp"), generation=7, now=NOW)
+    saga.on_broker_event(_owned_event(og, leg="stop", status="Cancelled", entity="og:stop"))
+    state = saga.on_broker_event(_owned_event(og, leg="take_profit", status="Cancelled", entity="og:tp"))
+    assert (state.state, state.stop_rejected) == ("CLOSE_OWNED", False)
+    assert breaker.signals == [] and liquidation.starts == []
+
+
+@pytest.mark.parametrize("status", ["Inactive", "Rejected"])
+def test_unexpected_reject_during_handover_is_still_an_incident(tmp_path, status):
+    """R14: only Cancelled/ApiCancelled of an expected ref is suppressed."""
+    saga, intent, state, breaker, liquidation = _protected(tmp_path)
+    og = state.order_group_id
+    saga.handover(account_id=ACCOUNT, conid=CONID, close_root_id="close-1",
+                  cancels=_cancels(og, "og:stop"), generation=7, now=NOW)
+    state = saga.on_broker_event(_owned_event(og, leg="stop", status=status, entity="og:stop"))
+    assert (state.state, state.error_code) == ("SAFETY_FAILED", "PROTECTION_LOST_DURING_CLOSE")
+    assert any(s.kind == "PROTECTIVE_ORDER_FAILURE" for s in breaker.signals)
+    assert liquidation.starts[0][1] == intent.command_id
+
+
+def test_cancel_of_a_ref_the_close_did_not_ask_for_is_an_incident(tmp_path):
+    saga, intent, state, breaker, liquidation = _protected(tmp_path)
+    og = state.order_group_id
+    saga.handover(account_id=ACCOUNT, conid=CONID, close_root_id="close-1",
+                  cancels=_cancels(og, "og:stop"), generation=7, now=NOW)
+    state = saga.on_broker_event(_owned_event(og, leg="take_profit", status="Cancelled", entity="og:tp"))
+    assert state.state == "SAFETY_FAILED"
+    assert len(liquidation.starts) == 1
+
+
+def test_late_entry_fill_event_while_owned_is_bookkeeping_only(tmp_path):
+    saga, intent, state, breaker, liquidation = _protected(tmp_path)
+    og = state.order_group_id
+    saga.handover(account_id=ACCOUNT, conid=CONID, close_root_id="close-1",
+                  cancels=_cancels(og, "og:stop"), generation=7, now=NOW)
+    saga.on_broker_event(_owned_event(og, leg="stop", status="Cancelled", entity="og:stop"))
+    state = saga.on_broker_event(_owned_event(og, leg="entry", status="Filled", entity="og:entry", filled=10.0))
+    assert state.state == "CLOSE_OWNED" and breaker.signals == []
+
+
+def test_unexpected_stop_cancel_without_handover_still_liquidates(tmp_path):
+    saga, intent, state, breaker, liquidation = _protected(tmp_path)
+    state = saga.on_broker_event(_event(state.order_group_id, leg="stop", status="Cancelled", order_id=2))
+    assert state.state == "SAFETY_FAILED"
+    assert any(s.kind == "PROTECTIVE_ORDER_FAILURE" for s in breaker.signals)
+    assert len(liquidation.starts) == 1
+
+
+def test_account_takeover_transfers_a_close_owned_saga_and_keeps_its_expected_refs(tmp_path):
+    """R14: the account root takes over a saga a scoped close already owns."""
+    saga, intent, state, breaker, liquidation = _protected(tmp_path)
+    og = state.order_group_id
+    saga.handover(account_id=ACCOUNT, conid=CONID, close_root_id="p-1",
+                  cancels=_cancels(og, "og:stop"), generation=7, now=NOW)
+    saga.handover_account(account_id=ACCOUNT, close_root_id="kill-1",
+                          cancels=_cancels(og, "og:tp"), generation=8, now=NOW)
+    owned = saga.resume(intent.command_id)
+    assert (owned.state, owned.close_root_id) == ("CLOSE_OWNED", "kill-1")
+    assert owned.expected_cancel_ids == ("og:stop", "og:tp")
+    saga.close_after_full(close_root_id="kill-1", now=NOW)
+    assert saga.resume(intent.command_id).state == "CLOSED"
+
+
+def test_release_after_partial_protects_the_remainder_with_the_new_legs(tmp_path):
+    saga, intent, state, breaker, liquidation = _protected(tmp_path)
+    og = state.order_group_id
+    saga.handover(account_id=ACCOUNT, conid=CONID, close_root_id="p-1",
+                  cancels=_cancels(og, "og:stop", "og:tp"), generation=7, now=NOW)
+    saga.release_after_partial(close_root_id="p-1", remaining_quantity=6.0,
+                               stop_group="p-1-reprotect-stop-265598-1", stop_status="PreSubmitted",
+                               target_group="p-1-reprotect-target-265598-1", target_status="Submitted", now=NOW)
+    released = saga.resume(intent.command_id)
+    assert (released.state, released.close_root_id, released.protection_generation) == ("PROTECTED", None, 1)
+    assert released.protection_quantity == Decimal("6")
+    assert released.current_groups == ("p-1-reprotect-stop-265598-1", "p-1-reprotect-target-265598-1")
+    state = saga.on_broker_event(_event("p-1-reprotect-stop-265598-1", leg="stop", status="Filled",
+                                        filled=6.0, total=6.0, order_id=9))
+    assert state.command_id == intent.command_id
+    assert state.state in ("EXITING", "CLOSED")
+    assert breaker.signals == []
+
+
+def test_retired_leg_event_does_not_change_current_protection(tmp_path):
+    """R14 / #25: a late cancel of the original stop after a release is ignored."""
+    saga, intent, state, breaker, liquidation = _protected(tmp_path)
+    og = state.order_group_id
+    saga.handover(account_id=ACCOUNT, conid=CONID, close_root_id="p-1",
+                  cancels=_cancels(og, "og:stop"), generation=7, now=NOW)
+    saga.release_after_partial(close_root_id="p-1", remaining_quantity=6.0,
+                               stop_group="p-1-reprotect-stop-265598-1", stop_status="Submitted",
+                               target_group=None, target_status=None, now=NOW)
+    state = saga.on_broker_event(_event(og, leg="stop", status="Cancelled", order_id=2, event_id="late-old-stop"))
+    assert state.state == "PROTECTED"
+    assert breaker.signals == [] and liquidation.starts == []
+    saga.handover(account_id=ACCOUNT, conid=CONID, close_root_id="p-2", cancels=(), generation=9, now=NOW)
+    saga.release_after_partial(close_root_id="p-2", remaining_quantity=3.0,
+                               stop_group="p-2-reprotect-stop-265598-1", stop_status="Submitted",
+                               target_group=None, target_status=None, now=NOW)
+    state = saga.on_broker_event(_event("p-1-reprotect-stop-265598-1", leg="stop", status="Cancelled",
+                                        order_id=9, event_id="late-first-replacement"))
+    assert (state.state, state.protection_quantity) == ("PROTECTED", Decimal("3"))
+    assert breaker.signals == []
+
+
+def test_close_after_full_closes_the_saga_without_error(tmp_path):
+    saga, intent, state, breaker, liquidation = _protected(tmp_path)
+    saga.handover(account_id=ACCOUNT, conid=CONID, close_root_id="close-1",
+                  cancels=_cancels(state.order_group_id, "og:stop"), generation=7, now=NOW)
+    saga.close_after_full(close_root_id="close-1", now=NOW)
+    closed = saga.resume(intent.command_id)
+    assert (closed.state, closed.error_code) == ("CLOSED", None)
+    later = saga.on_broker_event(_event(state.order_group_id, leg="stop", status="Cancelled", order_id=2))
+    assert later.state == "CLOSED" and breaker.signals == []
+
+
+def test_ownership_survives_a_restart(tmp_path):
+    saga, intent, state, *_ = _protected(tmp_path)
+    saga.handover(account_id=ACCOUNT, conid=CONID, close_root_id="close-1",
+                  cancels=_cancels(state.order_group_id, "og:stop"), generation=7, now=NOW)
+    from trader.automation.protective_order_saga import ProtectiveOrderSagaStore
+    db = DuckDBConnection.get_instance(str(tmp_path / "saga.duckdb"))
+    reloaded = ProtectiveOrderSagaStore(db).load_by_close_root("close-1")
+    assert [s.command_id for s in reloaded] == [intent.command_id]
+
+
+def test_handover_with_no_live_saga_returns_empty_prices(tmp_path):
+    saga, *_rest = _build_saga(tmp_path)
+    info = saga.handover(account_id=ACCOUNT, conid=999, close_root_id="close-x", cancels=(), generation=1, now=NOW)
+    assert (info.stop_price, info.target_price) == (None, None)
+
+
+def test_pending_replacement_legs_are_bound_before_release_and_their_loss_is_remembered(tmp_path):
+    """R2-4 / #25: events of the close's own legs reach the saga before release; a lost leg is an incident at release."""
+    saga, intent, state, breaker, liquidation = _protected(tmp_path)
+    og = state.order_group_id
+    saga.handover(account_id=ACCOUNT, conid=CONID, close_root_id="p-1",
+                  cancels=_cancels(og, "og:stop", "og:tp"), generation=7, now=NOW)
+    saga.expect_reprotect(close_root_id="p-1", groups=("p-1-reprotect-stop-265598-1",), now=NOW)
+    state = saga.on_broker_event(_owned_event("p-1-reprotect-stop-265598-1", leg="stop", status="Inactive",
+                                              entity="p-1-reprotect-stop-265598-1:stop"))
+    assert (state.state, state.pending_protection_lost) == ("CLOSE_OWNED", True)
+    assert breaker.signals == [] and liquidation.starts == []      # the close escalates on its own evidence
+    saga.release_after_partial(close_root_id="p-1", remaining_quantity=6.0,
+                               stop_group="p-1-reprotect-stop-265598-1", stop_status="Submitted",
+                               target_group=None, target_status=None, now=NOW)
+    released = saga.resume(intent.command_id)
+    assert (released.state, released.error_code) == ("SAFETY_FAILED", "PROTECTION_LOST_DURING_CLOSE")
+    assert liquidation.starts[0][1] == intent.command_id
+
+
+def test_release_with_a_stop_that_is_not_working_at_the_broker_is_an_incident(tmp_path):
+    """#25: the release takes the legs' broker status; it never assumes they work."""
+    saga, intent, state, breaker, liquidation = _protected(tmp_path)
+    saga.handover(account_id=ACCOUNT, conid=CONID, close_root_id="p-1",
+                  cancels=_cancels(state.order_group_id, "og:stop"), generation=7, now=NOW)
+    saga.release_after_partial(close_root_id="p-1", remaining_quantity=6.0,
+                               stop_group="p-1-reprotect-stop-265598-1", stop_status="Cancelled",
+                               target_group=None, target_status=None, now=NOW)
+    assert saga.resume(intent.command_id).state == "SAFETY_FAILED"
+    assert any(s.kind == "PROTECTIVE_ORDER_FAILURE" for s in breaker.signals)
+
+
+@pytest.mark.parametrize("taker", ["account", "upgrade"])
+def test_cancelling_pending_legs_after_a_takeover_or_upgrade_is_expected(tmp_path, taker):
+    """R2-4: the kill (or the upgraded close) cancels the replacement legs; that is not an incident."""
+    saga, intent, state, breaker, liquidation = _protected(tmp_path)
+    og = state.order_group_id
+    saga.handover(account_id=ACCOUNT, conid=CONID, close_root_id="p-1",
+                  cancels=_cancels(og, "og:stop"), generation=7, now=NOW)
+    saga.expect_reprotect(close_root_id="p-1", groups=("p-1-reprotect-stop-265598-1",), now=NOW)
+    leg = _cancels("p-1-reprotect-stop-265598-1", "p-1-reprotect-stop-265598-1:stop")
+    if taker == "account":
+        saga.handover_account(account_id=ACCOUNT, close_root_id="kill-1", cancels=leg, generation=8, now=NOW)
+    else:
+        saga.handover(account_id=ACCOUNT, conid=CONID, close_root_id="p-1", cancels=leg, generation=8, now=NOW)
+    restarted, *_rest = _build_saga(tmp_path)                       # a restart in between
+    state = restarted.on_broker_event(_owned_event("p-1-reprotect-stop-265598-1", leg="stop", status="Cancelled",
+                                                   entity="p-1-reprotect-stop-265598-1:stop"))
+    assert (state.state, state.pending_protection_lost) == ("CLOSE_OWNED", False)
+    assert breaker.signals == []
+
+
+def test_a_later_cancel_target_is_added_to_the_expected_set(tmp_path):
+    """R27 / R2-4: an order the close finds later is handed over before its cancel; an unasked cancel still fails."""
+    saga, intent, state, breaker, liquidation = _protected(tmp_path)
+    og = state.order_group_id
+    saga.handover(account_id=ACCOUNT, conid=CONID, close_root_id="close-1", cancels=_cancels(og, "og:stop"),
+                  generation=7, now=NOW)
+    saga.handover(account_id=ACCOUNT, conid=CONID, close_root_id="close-1", cancels=_cancels(og, "og:tp"),
+                  generation=8, now=NOW)
+    assert saga.resume(intent.command_id).expected_cancel_ids == ("og:stop", "og:tp")
+    state = saga.on_broker_event(_owned_event(og, leg="take_profit", status="Cancelled", entity="og:tp"))
+    assert state.state == "CLOSE_OWNED"
+    state = saga.on_broker_event(_owned_event(og, leg="take_profit", status="Cancelled", entity="og:other"))
+    assert state.state == "SAFETY_FAILED"
+
+
+def _race(saga, *, reader, writer):
+    """Run ``reader`` in a thread that stops right after its read; run ``writer``; let the reader save."""
+    import threading
+    read_done, go, result = threading.Event(), threading.Event(), {}
+    store = saga._store
+    real = store.load_by_group
+
+    def paused(group):
+        found = real(group)
+        if not read_done.is_set():
+            read_done.set()
+            go.wait(timeout=5)
+        return found
+    store.load_by_group = paused
+    thread = threading.Thread(target=lambda: result.setdefault("state", reader()))
+    thread.start()
+    assert read_done.wait(timeout=5)
+    writer()
+    go.set()
+    thread.join(timeout=10)
+    store.load_by_group = real
+    return result["state"]
+
+
+def test_an_ingest_event_racing_the_hand_over_never_loses_the_close_owner(tmp_path):
+    """R28 / R2-3: both read PROTECTED; the hand-over commits first; the event is applied again on top."""
+    saga, intent, state, breaker, liquidation = _protected(tmp_path)
+    og = state.order_group_id
+    state = _race(saga, reader=lambda: saga.on_broker_event(_event(og, leg="stop", status="PreSubmitted",
+                                                                   order_id=2, event_id="ib-working-7")),
+                  writer=lambda: saga.handover(account_id=ACCOUNT, conid=CONID, close_root_id="close-1",
+                                               cancels=_cancels(og, "og:stop"), generation=7, now=NOW))
+    stored = saga.resume(intent.command_id)
+    assert (stored.state, stored.close_root_id, stored.expected_cancel_ids) == ("CLOSE_OWNED", "close-1", ("og:stop",))
+    assert "ib-working-7" in stored.seen_event_ids
+
+
+def test_an_ingest_event_racing_the_release_keeps_the_new_protection_generation(tmp_path):
+    saga, intent, state, breaker, liquidation = _protected(tmp_path)
+    og = state.order_group_id
+    saga.handover(account_id=ACCOUNT, conid=CONID, close_root_id="p-1", cancels=_cancels(og, "og:stop"),
+                  generation=7, now=NOW)
+    _race(saga, reader=lambda: saga.on_broker_event(_owned_event(og, leg="stop", status="Cancelled", entity="og:stop")),
+          writer=lambda: saga.release_after_partial(
+              close_root_id="p-1", remaining_quantity=6.0, stop_group="p-1-reprotect-stop-265598-1",
+              stop_status="Submitted", target_group=None, target_status=None, now=NOW))
+    stored = saga.resume(intent.command_id)
+    assert (stored.state, stored.protection_generation, stored.current_groups) == (
+        "PROTECTED", 1, ("p-1-reprotect-stop-265598-1",))
+    assert breaker.signals == []                                     # the retried event is a retired leg's
+
+
+def test_an_ingest_event_racing_the_final_close_never_resurrects_the_saga(tmp_path):
+    saga, intent, state, breaker, liquidation = _protected(tmp_path)
+    og = state.order_group_id
+    saga.handover(account_id=ACCOUNT, conid=CONID, close_root_id="close-1", cancels=_cancels(og, "og:stop"),
+                  generation=7, now=NOW)
+    _race(saga, reader=lambda: saga.on_broker_event(_owned_event(og, leg="entry", status="Filled",
+                                                                 entity="og:entry", filled=10.0)),
+          writer=lambda: saga.close_after_full(close_root_id="close-1", now=NOW))
+    assert saga.resume(intent.command_id).state == "CLOSED"
+
+
+def test_a_stale_save_is_refused_with_a_revision_conflict(tmp_path):
+    from trader.automation.protective_order_saga import SagaRevisionConflict
+    saga, intent, state, *_ = _protected(tmp_path)
+    stale = saga.resume(intent.command_id)
+    saga.handover(account_id=ACCOUNT, conid=CONID, close_root_id="close-1", cancels=(), generation=7, now=NOW)
+    with pytest.raises(SagaRevisionConflict):
+        saga._persist(replace(stale, revision=stale.revision + 1), NOW, from_state=stale.state)
+
+
+def test_only_a_failure_seen_by_this_version_asks_the_worker_for_a_flatten(tmp_path):
+    """R29: a saga that was SAFETY_FAILED before the upgrade starts no flatten on the first deploy."""
+    saga, intent, state, breaker, liquidation = _protected(tmp_path)
+    historic = replace(saga.resume(intent.command_id), state="SAFETY_FAILED", revision=state.revision + 1)
+    saga._persist(historic, NOW, from_state="PROTECTED")             # as migration 37 leaves it
+    assert saga.unhandled_failures(ACCOUNT) == []
+    fresh, intent2, state2, *_ = _protected(tmp_path / "fresh")
+    fresh.on_broker_event(_event(state2.order_group_id, leg="stop", status="Cancelled", order_id=2))
+    assert fresh.unhandled_failures(ACCOUNT) == [intent2.command_id]
+
+
+def test_an_entry_event_saved_while_submit_bracket_waits_keeps_the_submitted_ids(tmp_path):
+    """Round-2 verification N1: the ingest thread saves the entry's Submitted event while
+    ``submit_bracket`` waits. ``start`` must not then fail its own write with a revision conflict
+    (DISPATCH_AMBIGUOUS, ids lost): it re-reads and adds the ids on top of the ingest's state.
+    (``_race`` pauses a read by order group; ``start`` holds a copy from before the call instead,
+    so the ingest runs inside the dispatch here.)"""
+    import threading
+
+    holder = {}
+
+    class _IngestDuringSubmit(FakeBracketDispatch):
+        def submit_bracket(self, *, plan, intent, account_id):
+            submitted = super().submit_bracket(plan=plan, intent=intent, account_id=account_id)
+            ingest = threading.Thread(target=lambda: holder.setdefault("event", holder["saga"].on_broker_event(
+                _event(plan.order_group_id, leg="entry", status="Submitted"))))
+            ingest.start()
+            ingest.join(timeout=5)
+            return submitted
+
+    saga, *_ = _build_saga(tmp_path, dispatch=_IngestDuringSubmit())
+    holder["saga"] = saga
+    intent = make_intent()
+    state = saga.start(
+        intent=intent, approval=make_approval(), request=FakeCommandRequest(intent.command_id),
+        artifact=SimpleNamespace(artifact_id=intent.artifact_id, allowlist=(str(CONID),),
+                                 max_gross_allocation=0.06, parameters={}),
+        session_state=SimpleNamespace(high_water_mark=100_000.0, expected_account_id=ACCOUNT, liquidity=None),
+        allocation=SimpleNamespace(max_gross_fraction=0.06),
+    )
+    assert holder["event"].state == "ENTRY_WORKING"
+    stored = saga.resume(intent.command_id)
+    assert (state.state, state.error_code) == ("ENTRY_WORKING", None)
+    assert stored.state == "ENTRY_WORKING" and stored.submitted_order_ids == state.submitted_order_ids
+    assert len(stored.submitted_order_ids) == 3
+
+
+def test_saga_rows_from_before_the_upgrade_survive_migration_37(tmp_path):
+    """R2-5 gap: a migration-30 journal with old payloads. Migration 37 backfills the columns; an old
+    PROTECTED saga still takes its broker events and a hand-over; an old SAFETY_FAILED saga asks for
+    no flatten (R29)."""
+    import json
+
+    from trader.automation.protective_order_saga import PROTECTIVE_ORDER_SAGA_MIGRATION_VERSION
+
+    db = DuckDBConnection.get_instance(str(tmp_path / "saga.duckdb"))
+    SchemaMigrator(db).apply(PROTECTIVE_ORDER_SAGA_MIGRATION_VERSION, "before_sp1", (
+        """CREATE TABLE IF NOT EXISTS automated_order_sagas (command_id VARCHAR PRIMARY KEY,
+           order_group_id VARCHAR NOT NULL, state VARCHAR NOT NULL, payload VARCHAR NOT NULL,
+           updated_at TIMESTAMPTZ NOT NULL)""",
+        "CREATE UNIQUE INDEX IF NOT EXISTS idx_automated_order_sagas_group ON automated_order_sagas(order_group_id)",
+        """CREATE TABLE IF NOT EXISTS automated_order_saga_events (event_id VARCHAR PRIMARY KEY,
+           command_id VARCHAR NOT NULL, recorded_at TIMESTAMPTZ NOT NULL)""",
+    ))
+    for command_id, state in (("old-1", "PROTECTED"), ("old-2", "SAFETY_FAILED")):
+        payload = {  # the payload keys of master before SP1
+            "command_id": command_id, "order_group_id": f"og-{command_id}", "order_ref": f"mmr:og-{command_id}",
+            "state": state, "account_id": ACCOUNT, "conid": CONID, "side": "BUY", "requested_quantity": "10",
+            "filled_quantity": "10", "protection_quantity": "10", "protection_working": True,
+            "protection_adjusted": False, "entry_working": False, "stop_working": True, "target_working": True,
+            "stop_filled": False, "target_filled": False, "entry_cancelled": False, "stop_rejected": False,
+            "target_rejected": False, "submitted_order_ids": [1, 2, 3], "seen_event_ids": [], "revision": 5,
+            "error_code": None, "plan_json": None}
+        db.execute("INSERT INTO automated_order_sagas VALUES (?, ?, ?, ?, ?)",
+                   [command_id, f"og-{command_id}", state, json.dumps(payload), NOW], fetch="none")
+
+    saga, *_ = _build_saga(tmp_path)
+    assert db.execute("SELECT account_id, conid FROM automated_order_sagas WHERE command_id = 'old-1'",
+                      fetch="one") == (ACCOUNT, CONID)
+    assert saga.unhandled_failures(ACCOUNT) == []
+    state = saga.on_broker_event(_event("og-old-1", leg="stop", status="Submitted", order_id=2))
+    assert state.state == "PROTECTED"
+    saga.handover(account_id=ACCOUNT, conid=CONID, close_root_id="close-1",
+                  cancels=_cancels("og-old-1", "og-old-1:stop"), generation=7, now=NOW)
+    owned = saga.resume("old-1")
+    assert (owned.state, owned.close_root_id, owned.expected_cancel_ids) == ("CLOSE_OWNED", "close-1",
+                                                                             ("og-old-1:stop",))
+
+
+def test_an_old_leg_event_after_a_release_and_a_restart_changes_nothing(tmp_path):
+    """#25 item 2: after the release the original bracket's legs are retired, also for a new process."""
+    saga, intent, state, breaker, liquidation = _protected(tmp_path)
+    og = state.order_group_id
+    saga.handover(account_id=ACCOUNT, conid=CONID, close_root_id="p-1", cancels=_cancels(og, "og:stop"),
+                  generation=7, now=NOW)
+    saga.release_after_partial(close_root_id="p-1", remaining_quantity=6.0,
+                               stop_group="p-1-reprotect-stop-265598-1", stop_status="Submitted",
+                               target_group=None, target_status=None, now=NOW)
+    before = saga.resume(intent.command_id)
+    restarted, *_rest = _build_saga(tmp_path, breaker=breaker)
+    after = restarted.on_broker_event(_owned_event(og, leg="stop", status="Inactive", entity="og:stop-late"))
+    assert (after.state, after.protection_generation, after.current_groups) == (
+        "PROTECTED", before.protection_generation, before.current_groups)
+    assert breaker.signals == []
+    assert "og:stop-late:Inactive:0.0" in restarted.resume(intent.command_id).seen_event_ids

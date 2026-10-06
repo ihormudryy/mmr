@@ -628,3 +628,8 @@ def test_broker_ingest_reclassifies_a_pre_sp1_reduce_stored_as_an_entry(tmp_path
                                                         legacy.order_entity_id, NOW)))
     _seen, rows = _forwarded_events(tmp_path, order_ref=ref, order_type="MKT", name=name)
     assert [(r.order_entity_id, r.leg) for r in rows] == [("flat-1-liquidation-reduce-265598:entry", "exit")]
+def test_broker_ingest_forwards_the_order_entity_id_to_the_saga(tmp_path):
+    """SP1 plan 1 Task 9 (R14): the saga matches expected cancels by order identity."""
+    seen, rows = _forwarded_events(tmp_path, order_ref=encode_order_ref(ORDER_GROUP), order_type="STP",
+                                   parent_id=5, name="entity-id.duckdb")
+    assert [e.order_entity_id for e in seen] == [r.order_entity_id for r in rows] == [f"{ORDER_GROUP}:stop"]

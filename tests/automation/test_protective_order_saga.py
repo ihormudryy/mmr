@@ -795,3 +795,57 @@ def test_execution_spec_from_plan_uses_bracket_not_market():
     assert spec["stop_loss_price"] == 150.0
     assert spec["take_profit_price"] == 200.0
     assert "MARKET" not in str(spec["order_type"])
+
+
+def test_busy_liquidation_keeps_protective_failure_root_for_rescan(tmp_path):
+    """Lock held elsewhere: the saga's liquidation is busy but the root survives."""
+    import threading
+
+    from trader.data.broker_state import BrokerPositionRow, BrokerRiskSnapshot
+    from trader.trading.liquidation_service import LiquidationBusy, LiquidationService
+
+    position = BrokerPositionRow(
+        account_id=ACCOUNT, conid=CONID, symbol="AAPL", sec_type="STK", exchange="SMART",
+        currency="USD", quantity=10.0, average_cost=None, market_price=None,
+        market_value=None, unrealized_pnl=None, realized_pnl=None, daily_pnl=None,
+        deleted=False, revision=1, source_timestamp=NOW,
+    )
+    snapshot = BrokerRiskSnapshot(
+        generation_id=1, source_cursor=1, promoted_at=NOW, account_id=ACCOUNT,
+        account_mode="paper", net_liquidation=100_000.0, daily_pnl=0.0,
+        positions=(position,), working_orders=(),
+    )
+    reduces = []
+    liquidation = LiquidationService(
+        SimpleNamespace(capture=lambda account_id: snapshot),
+        SimpleNamespace(reduce=lambda *args: reduces.append(args), cancel=lambda *args: None),
+        now=lambda: NOW, lock_timeout_seconds=0.05,
+    )
+    saga, intent, state, breaker, _, _ = _started(tmp_path, liquidation=liquidation)
+    og = state.order_group_id
+    saga.on_broker_event(_event(og, leg="entry", status="Submitted"))
+
+    held, release = threading.Event(), threading.Event()
+
+    def hold():
+        with liquidation._lock:
+            held.set()
+            release.wait(5.0)
+
+    holder = threading.Thread(target=hold)
+    holder.start()
+    assert held.wait(2.0)
+    try:
+        with pytest.raises(LiquidationBusy):
+            saga.on_broker_event(_event(og, leg="entry", status="Filled", filled=10.0, total=10.0))
+    finally:
+        release.set()
+        holder.join(2.0)
+
+    assert saga.resume(intent.command_id).state == "SAFETY_FAILED"
+    assert any(s.kind == "PROTECTIVE_ORDER_FAILURE" for s in breaker.signals)
+    assert reduces == []
+    receipt = liquidation.rescan()
+    assert receipt.cause_command_id == intent.command_id
+    assert receipt.state == "VERIFYING"
+    assert len(reduces) == 1

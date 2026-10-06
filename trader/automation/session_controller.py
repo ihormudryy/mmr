@@ -21,6 +21,7 @@ from trader.data.schema_migrations import SchemaMigrator
 from trader.domain.events import DomainMutation
 from trader.research.canonical import sha256_digest
 from trader.trading.circuit_breaker import BreakerSignal
+from trader.trading.liquidation_service import LiquidationBusy
 
 SESSION_CONTROLLER_MIGRATION_VERSION = 31
 SESSION_CONTROLLER_MIGRATION_NAME = "p3_automation_session_state"
@@ -665,7 +666,12 @@ class SessionController:
     ) -> SessionControllerState:
         cause = self.flatten_command_id(self._account_id, state.session_date)
         deadline = state.flat_deadline_utc or (now_utc + dt.timedelta(minutes=10))
-        self._liquidation.start(self._account_id, cause, deadline)
+        try:
+            self._liquidation.start(self._account_id, cause, deadline)
+        except LiquidationBusy:
+            # start() persisted the root before waiting for the lock, so
+            # _poll_flat's rescan() advances it once the lock frees up.
+            pass
         state = self._evolve(
             state,
             state="FLATTENING",

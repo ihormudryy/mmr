@@ -425,6 +425,69 @@ def test_missed_flat_deadline_trips_breaker_and_never_self_resets(tmp_path):
     assert controller.entries_allowed(clock[0]) is False
 
 
+class _RootGoesFailedSafe(FakeLiquidation):
+    """rescan() returns None, as the real service does once its only root is FAILED_SAFE."""
+    def rescan(self):
+        self.rescans += 1
+        return None
+
+
+def test_missed_flat_deadline_records_incident_when_rescan_finds_no_advanceable_root(tmp_path):
+    broker = FakeBroker([_snapshot(1, positions=[_position()])])
+    controller, _b, _c, liquidation, breaker, _t, _j, _db, clock = _build_controller(
+        tmp_path, broker=broker, liquidation=_RootGoesFailedSafe(),
+    )
+    clock[0] = _utc(15, 45)
+    controller.recover(clock[0])
+    state = controller.run_due(clock[0])
+    assert liquidation.starts
+    assert state.state == "FLATTENING"
+
+    clock[0] = _utc(15, 55)
+    state = controller.run_due(clock[0])
+    assert state.state == "INCIDENT"
+    assert any(s.kind == "MISSED_FLAT_DEADLINE" for s in breaker.signals)
+
+
+class _LockAlwaysBusy(FakeLiquidation):
+    """start() raises LiquidationBusy, as the real service does when the lock stays held."""
+    def start(self, account_id, cause_command_id, deadline):
+        from trader.trading.liquidation_service import LiquidationBusy
+
+        self.starts.append((account_id, cause_command_id, deadline))
+        raise LiquidationBusy("liquidation lock busy")
+
+
+def test_busy_liquidation_lock_still_reaches_incident_after_flat_deadline(tmp_path):
+    broker = FakeBroker([_snapshot(1, positions=[_position()])])
+    controller, _b, _c, liquidation, breaker, _t, _j, _db, clock = _build_controller(
+        tmp_path, broker=broker, liquidation=_LockAlwaysBusy(),
+    )
+    clock[0] = _utc(15, 45)
+    controller.recover(clock[0])
+    state = controller.run_due(clock[0])
+    assert liquidation.starts
+    assert state.state == "FLATTENING"
+    assert state.flatten_issued is True
+
+    clock[0] = _utc(15, 55)
+    state = controller.run_due(clock[0])
+    assert state.state == "INCIDENT"
+    assert any(s.kind == "MISSED_FLAT_DEADLINE" for s in breaker.signals)
+
+
+def test_recover_past_flat_deadline_with_busy_lock_records_incident(tmp_path):
+    broker = FakeBroker([_snapshot(1, positions=[_position()])])
+    controller, _b, _c, liquidation, breaker, _t, _j, _db, clock = _build_controller(
+        tmp_path, broker=broker, liquidation=_LockAlwaysBusy(),
+    )
+    clock[0] = _utc(15, 55)
+    state = controller.recover(clock[0])
+    assert liquidation.starts
+    assert state.state == "INCIDENT"
+    assert any(s.kind == "MISSED_FLAT_DEADLINE" for s in breaker.signals)
+
+
 def test_external_position_is_included_in_flatten(tmp_path):
     """External (non-automation) exposure is still flattened via liquidation."""
     broker = FakeBroker([
@@ -660,7 +723,7 @@ def test_trader_service_starts_session_recovery_before_readiness():
     src = Path(__file__).resolve().parents[2] / "trader" / "trader_service.py"
     text = src.read_text()
     # Pin the call site in main(), not earlier docstring mentions of trader.run().
-    marker = "_maybe_start_session_recovery(trader, loop)"
+    marker = "_maybe_start_session_recovery(trader, loop, liquidation_worker, stopping)"
     assert marker in text
     run_marker = "logging.debug('starting trader run() loop')\n        trader.run()"
     assert run_marker in text

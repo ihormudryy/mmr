@@ -22,7 +22,7 @@ uv sync --python 3.12.13 --frozen --extra test
 
 You do not need an Interactive Brokers account to run the tests. To run the full stack, see [Getting Started](README.md#getting-started) and use a **paper** account.
 
-[CLAUDE.md](CLAUDE.md) is the detailed architecture guide (services, ports, storage, CLI). Read the parts that touch your change.
+[AGENTS.md](AGENTS.md) is the detailed architecture guide (services, ports, storage, CLI). Read the parts that touch your change.
 
 ## Running the tests
 
@@ -37,7 +37,7 @@ Every test is a unit test with a temporary DuckDB database. A pull request must 
 
 ## Project rules
 
-These come from [CLAUDE.md](CLAUDE.md#design-principles). Reviews check them.
+These come from [AGENTS.md](AGENTS.md#design-principles). Reviews check them.
 
 - **Precision over convenience.** Contract IDs (conIds) resolve exactly or fail. No fuzzy matching, no "close enough" lookups, no turning an integer conId into a ticker string.
 - **Fail loudly.** When a broker or data call fails, raise an error the user can act on. Do not swallow exceptions and return empty results.
@@ -68,7 +68,7 @@ For a pull request:
 
 1. Branch from `master` and keep one concern per pull request.
 2. Run the tests above.
-3. Update the docs (`README.md`, `CLAUDE.md`, `docs/`) when behaviour or commands change.
+3. Update the docs (`README.md`, `AGENTS.md`, `docs/`) when behaviour or commands change.
 4. Add a line to the `Unreleased` section of [CHANGELOG.md](CHANGELOG.md) for user-facing changes.
 5. Fill in the pull request template.
 

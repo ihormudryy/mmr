@@ -49,7 +49,7 @@ match the call currently in flight (a transport-hygiene rule enforced by
 is a fresh client-generated UUID per call, so a stale-but-validly-signed
 response for a *different* call can never be mistaken for the current one.
 
-Security notes (see also CLAUDE.md's "Design Principles"): a flaw here is a
+Security notes (see also AGENTS.md's "Design Principles"): a flaw here is a
 trading-authorization bypass, so every check below is deliberate:
 
 1. Duplicate JSON keys are rejected at parse time via ``object_pairs_hook`` --
@@ -566,7 +566,7 @@ def load_service_hmac_key(path: str) -> bytes:
     genuinely a ``0x0a`` in the actual output of ``openssl rand`` (~1/256
     chance per key), which is exactly the kind of "close enough" data
     massaging this codebase's design principles forbid for trading-adjacent
-    secrets (see CLAUDE.md, "Precision over convenience"). Generate a
+    secrets (see AGENTS.md, "Precision over convenience"). Generate a
     compliant key with e.g.::
 
         openssl rand 32 > /path/to/service_hmac.key

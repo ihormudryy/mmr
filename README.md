@@ -109,7 +109,7 @@ For **unattended paper automation** (one signed strategy, release gates, dashboa
 ```
 ┌─────────────────────────────────────────────────────────────────────┐
 │                      Claude Code / LLM Agent                        │
-│  CLAUDE.md + mmr CLI --json                                         │
+│  AGENTS.md + mmr CLI --json                                         │
 │  MONITOR → ANALYZE → PROPOSE → DIGEST → sleep → repeat              │
 └────────────────────────────┬────────────────────────────────────────┘
                              │ Bash: mmr --json <command>
@@ -176,11 +176,11 @@ Yahoo Finance is not used.
 
 ## Claude Code Integration
 
-MMR is designed to be operated by [Claude Code](https://docs.anthropic.com/en/docs/claude-code) as an autonomous trading agent. The `CLAUDE.md` file provides Claude with complete platform context — architecture, all 80+ CLI commands, the propose/approve pipeline, risk management, and the LLM trading loop workflow. Claude interacts with MMR entirely through the `mmr` CLI with `--json` output via Bash.
+MMR is designed to be operated by [Claude Code](https://docs.anthropic.com/en/docs/claude-code) as an autonomous trading agent. The `AGENTS.md` file provides Claude with complete platform context — architecture, all 80+ CLI commands, the propose/approve pipeline, risk management, and the LLM trading loop workflow. Claude interacts with MMR entirely through the `mmr` CLI with `--json` output via Bash.
 
 ### How It Works
 
-Claude Code reads `CLAUDE.md` on startup, giving it full knowledge of the platform. It operates MMR by running CLI commands:
+Claude Code reads `CLAUDE.md` on startup, which imports `AGENTS.md`, giving it full knowledge of the platform. It operates MMR by running CLI commands:
 
 ```bash
 # Claude runs these via Bash tool
@@ -558,7 +558,8 @@ mmr/
 ├── strategies/                    # User strategy implementations
 ├── config_defaults/               # Bundled defaults (copied to ~/.config/mmr/ on first run)
 ├── skills/                        # Claude skills (mmr, mmr-loop, news)
-├── CLAUDE.md                      # Claude Code context (architecture, commands, workflows)
+├── AGENTS.md                      # Agent context (architecture, commands, workflows)
+├── CLAUDE.md                      # Claude Code entry point; imports AGENTS.md
 ├── tests/                         # pytest suite (no IB required)
 ├── docker-compose.yml             # Split: ib-gateway, trader, strategy, data, dashboard, scheduler
 ├── Dockerfile                     # Debian bookworm, Python 3.12

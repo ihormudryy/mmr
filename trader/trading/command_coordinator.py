@@ -2126,7 +2126,7 @@ class CancelCommandService:
 # is the only call the trader ever makes toward strategy_service on this path,
 # and the reply from that ONE call already carries strategy_service's own
 # committed-or-rolled-back outcome. There is deliberately no callback FROM
-# strategy_service back into the trader anywhere on this path (see CLAUDE.md
+# strategy_service back into the trader anywhere on this path (see AGENTS.md
 # memory: dashboard-strategy-controls -- a real deadlock already hit once when
 # a strategy_service RPC handler tried to call back into trader_service while
 # still handling an inbound request).

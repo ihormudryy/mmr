@@ -268,10 +268,13 @@ def test_startup_liquidation_recovery_without_trader_loop_sends_nothing_late(tmp
         assert time.monotonic() - started < 0.5
 
         [child] = service.receipt_for("root-1").children
-        assert (child.kind, child.state) == ("reduce", "UNKNOWN")
+        assert (child.kind, child.state) == ("reduce", "NOT_SENT")    # a proven refusal (R34)
         trader._main_loop = loop
         loop.run_until_complete(asyncio.sleep(0.05))
-        assert trader.orders == []
+        loop.run_until_complete(loop.run_in_executor(worker, lambda: None))   # a tick in flight has ended
+        # The refused attempt never leaves late; the recovery loop may send a new attempt (R3).
+        sent = [c for c in service.receipt_for("root-1").children if c.state != "NOT_SENT"]
+        assert len(trader.orders) == len(sent) and all(c.attempt > 1 for c in sent)
     finally:
         _close_loop(loop)
 

@@ -212,10 +212,13 @@ class _LiquidationDispatch:
         self._orders_view = orders_view
 
     def cancel(self, order, child_id: str) -> None:
-        self._dispatch.cancel(order.order_entity_id, encode_order_ref(child_id))
+        self._dispatch.cancel_on_loop(order.order_entity_id, encode_order_ref(child_id))
 
     def reduce(self, position, side: str, quantity: float, child_id: str) -> None:
         self._dispatch.reduce_position(position, side, quantity, encode_order_ref(child_id))
+
+    def reduce_partial(self, position, side: str, quantity: float, child_id: str) -> None:
+        self._dispatch.reduce_partial(position, side, quantity, encode_order_ref(child_id))
 
     def find_orders(self, account_id: str, child_id: str) -> list:
         return self._dispatch.find_by_order_ref(account_id, encode_order_ref(child_id))

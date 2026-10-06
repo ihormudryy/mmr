@@ -24,6 +24,7 @@ from trader.data.broker_state import BrokerPositionRow
 from trader.trading.command_coordinator import BrokerRejectedError, CancelAck
 from trader.trading.command_policy import CommandAuthorityPolicy
 from trader.trading.command_ports import CancelUnresolved
+from trader.trading.liquidation_service import DispatchRefused
 from trader.trading.order_correlation import encode_order_ref
 from trader.trading.trading_runtime import TradingRuntimeOrderDispatch
 
@@ -250,9 +251,9 @@ def test_reduce_position_uses_reduce_only_path_and_keeps_exact_size(running_loop
     assert dispatch.reduce_position(_position(10.0), "SELL", 10.0, "mmr:og-x") == ["trade"]
     assert trader.calls == [(1, "AAPL", "SELL", 10.0, 10.0, "mmr:og-x")]
 
-    with pytest.raises(ValueError, match="exactly reduce"):
+    with pytest.raises(DispatchRefused, match="exactly reduce"):
         dispatch.reduce_position(_position(10.0), "SELL", 5.0, "mmr:og-x")
-    with pytest.raises(ValueError, match="exactly reduce"):
+    with pytest.raises(DispatchRefused, match="exactly reduce"):
         dispatch.reduce_position(_position(10.0), "BUY", 10.0, "mmr:og-x")
     assert dispatch.reduce_position(_position(-4.0), "BUY", 4.0, "mmr:og-y") == ["trade"]
     assert trader.calls[-1] == (1, "AAPL", "BUY", 4.0, -4.0, "mmr:og-y")
@@ -263,7 +264,7 @@ def test_reduce_position_refuses_a_position_from_another_account(running_loop):
     loop, _ = running_loop
     trader = _ReduceTrader(loop)
     dispatch = TradingRuntimeOrderDispatch(trader, dispatch_timeout=2.0)
-    with pytest.raises(ValueError, match="account"):
+    with pytest.raises(DispatchRefused, match="account"):
         dispatch.reduce_position(_position(10.0, account="DU999"), "SELL", 10.0, "mmr:og-x")
     assert trader.calls == []
 
@@ -303,14 +304,23 @@ def test_reduce_position_refuses_on_the_trader_loop_thread(running_loop):
     assert trader.calls == []
 
 
-def test_reduce_position_refusal_is_broker_rejected(running_loop):
-    from trader.trading.command_coordinator import BrokerRejectedError
-
+def test_reduce_position_refusal_is_dispatch_refused(running_loop):
     loop, _ = running_loop
     trader = _ReduceTrader(loop, result=SuccessFail.fail(error="reduce-only refused: x"))
     dispatch = TradingRuntimeOrderDispatch(trader, dispatch_timeout=2.0)
-    with pytest.raises(BrokerRejectedError, match="reduce-only refused"):
+    with pytest.raises(DispatchRefused, match="reduce-only refused"):
         dispatch.reduce_position(_position(), "SELL", 10.0, "mmr:og-x")
+
+
+def test_reduce_position_ib_rejection_is_broker_rejected_not_refused(running_loop):
+    from trader.trading.command_coordinator import BrokerRejectedError
+
+    loop, _ = running_loop
+    trader = _ReduceTrader(loop, result=SuccessFail.fail(error="Order rejected by IB (entry status=Inactive)"))
+    dispatch = TradingRuntimeOrderDispatch(trader, dispatch_timeout=2.0)
+    with pytest.raises(BrokerRejectedError, match="rejected by IB") as raised:
+        dispatch.reduce_position(_position(), "SELL", 10.0, "mmr:og-x")
+    assert not isinstance(raised.value, DispatchRefused)
 
 
 def test_reduce_position_ambiguous_send_is_not_broker_rejected(running_loop):

@@ -1029,6 +1029,8 @@ def _reduce_trader(*, live_position=10.0, account='DU12345', paper=True, trade=N
         account=account, contract=SimpleNamespace(conId=1), position=live_position, avgCost=1.0)]
     trader.client = SimpleNamespace(ib=SimpleNamespace(
         positions=lambda acct='': list(positions) if acct == account else [],
+        isConnected=lambda: True,
+        openTrades=lambda: [],
         cancelOrder=lambda order: cancelled.append(order),
         accountValues=lambda: [],
         managedAccounts=lambda: [account],

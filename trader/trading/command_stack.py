@@ -34,6 +34,7 @@ from trader.trading.command_ports import (
     TraderBrokerRiskSnapshotAuthority,
     TraderPositionAuthority,
     TraderQuoteAuthority,
+    ingest_ready,
 )
 from trader.trading.preflight_nonce import (
     PreflightNonceGate,
@@ -466,8 +467,7 @@ def _resolve_contract(trader: Any, conid: int):
 def _broker_ready(trader: Any) -> bool:
     if not trader.is_ib_connected():
         return False
-    readiness = trader.broker_ingest.is_ready
-    return bool(readiness() if callable(readiness) else readiness)
+    return ingest_ready(trader.broker_ingest)
 
 
 def _bundle_root_for(bundle_path: str) -> Path:

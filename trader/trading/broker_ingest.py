@@ -780,6 +780,8 @@ class BrokerIngest:
             deleted=False,
             revision=current.revision if current else 0,
             source_timestamp=obs.source_timestamp,
+            oca_group=obs.oca_group or (current.oca_group if current else None),
+            oca_type=obs.oca_type or (current.oca_type if current else None),
         )
         if current is not None and not current.deleted and merged.same_fields(current):
             self.correlator.bind_aliases_in_tx(conn, entity_id, obs)

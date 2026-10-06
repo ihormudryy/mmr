@@ -2581,5 +2581,22 @@ class TradingRuntimeOrderDispatch:
         return store.select_active_orders_in_tx(journal.connect())
 
     def enumeration_complete(self) -> bool:
+        """A promoted broker generation exists and no newer one is staging."""
+        from trader.trading.command_ports import ingest_ready
         ingest = getattr(self._trader, 'broker_ingest', None)
-        return bool(ingest is not None and ingest.is_ready())
+        return ingest is not None and ingest_ready(ingest)
+
+    def newest_generation(self) -> int:
+        """The highest broker generation id, staging included (fence for a child order).
+
+        Raises when the broker store is not wired: a fence that cannot be read
+        must stop the close, never look like an old generation.
+        """
+        store = getattr(self._trader, 'broker_state_store', None)
+        journal = getattr(self._trader, 'domain_journal', None)
+        if store is None or journal is None:
+            raise RuntimeError('broker state store unavailable for a generation fence')
+        newest = store.newest_generation_in_tx(journal.connect())
+        if newest is None:
+            raise RuntimeError('no broker generation has been opened yet')
+        return newest

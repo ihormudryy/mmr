@@ -111,6 +111,8 @@ class OrderObservation:
     filled_quantity: float
     avg_fill_price: Optional[float]
     source_timestamp: dt.datetime
+    oca_group: Optional[str] = None
+    oca_type: Optional[int] = None
 
 
 def normalize_open_order(trade: Any, now: dt.datetime) -> OrderObservation:
@@ -133,6 +135,8 @@ def normalize_open_order(trade: Any, now: dt.datetime) -> OrderObservation:
         filled_quantity=float(status.filled or 0.0),
         avg_fill_price=_price_or_none(status.avgFillPrice),
         source_timestamp=now,
+        oca_group=getattr(order, "ocaGroup", None) or None,
+        oca_type=int(getattr(order, "ocaType", 0) or 0) or None,
     )
 
 

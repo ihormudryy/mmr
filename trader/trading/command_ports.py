@@ -75,6 +75,12 @@ class TraderPositionAuthority:
         return 0.0
 
 
+def ingest_ready(ingest: Any) -> bool:
+    """``BrokerIngest.is_ready`` is a property; some test doubles make it a method."""
+    readiness = ingest.is_ready
+    return bool(readiness() if callable(readiness) else readiness)
+
+
 class TraderBrokerAuthority:
     """``BrokerAuthority`` over live trader/account state.
 
@@ -98,7 +104,7 @@ class TraderBrokerAuthority:
     def is_ready(self) -> bool:
         ingest = getattr(self._trader, "broker_ingest", None)
         if ingest is not None:
-            return bool(ingest.is_ready())
+            return ingest_ready(ingest)
         return bool(self._trader.is_ib_connected())
 
     def net_liquidation(self) -> float:

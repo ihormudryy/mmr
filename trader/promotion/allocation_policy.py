@@ -320,9 +320,8 @@ class AllocationPolicy:
             reasons.append("ALLOCATION_AUTHORITY_CHANGED")
         if effective > effective_gross_ceiling + 1e-15:
             reasons.append("ALLOCATION_CEILING_TIGHTENED")
-        elif effective + 1e-15 < effective_gross_ceiling:
-            # Signed authority may only tighten between approval and dispatch.
-            effective = effective_gross_ceiling
+        # A ceiling that got tighter since approval stays tighter: the lower one wins.
+        ceiling_tightened = effective + 1e-15 < effective_gross_ceiling
 
         equity = float(broker.net_liquidation)
         if not _finite(equity) or equity <= 0:
@@ -350,7 +349,12 @@ class AllocationPolicy:
             projected_notional = current_notional + incremental
             projected_frac = projected_notional / equity
             if projected_frac > effective + 1e-15:
-                reasons.append("GROSS_EXPOSURE")
+                fitted_at_approval = projected_frac <= effective_gross_ceiling + 1e-15
+                reasons.append(
+                    "LIMIT_TIGHTENED_BEFORE_DISPATCH"
+                    if ceiling_tightened and fitted_at_approval
+                    else "GROSS_EXPOSURE"
+                )
 
         unique = tuple(dict.fromkeys(reasons))
         return AllocationDecision(

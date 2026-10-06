@@ -266,3 +266,127 @@ def test_reducing_permit_never_flips_or_increases_exposure(held, action, quantit
         with pytest.raises(DispatchGuardError) as error:
             guard.revalidate(approved, _request(), NOW)
         assert error.value.code == "REDUCTION_NOT_MONOTONIC"
+
+
+# --- Allocation ceiling re-check at dispatch (issue #47) ----------------------
+
+from types import SimpleNamespace
+
+from trader.promotion.allocation_policy import AllocationPolicy
+from trader.trading.approval_context import AllocationDispatchEvidence
+
+ARTIFACT_ID = "artifact-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+
+
+def _evidence(ceiling=0.06, authority_digest=None):
+    return AllocationDispatchEvidence(
+        artifact_digest=ARTIFACT_ID, artifact_max_gross=0.06,
+        authority_digest=authority_digest, effective_gross_ceiling=ceiling,
+    )
+
+
+def _authority(max_gross):
+    return SimpleNamespace(
+        account_id=ACCOUNT, account_mode="paper", artifact_digest=ARTIFACT_ID,
+        max_gross_allocation=max_gross, authority_digest=None, stage="CANARY",
+        expires_at=dt.datetime(2099, 1, 1, tzinfo=UTC),
+    )
+
+
+def _automated_request():
+    return CommandRequest(
+        command_id="cmd-auto", action="execute_automated_intent", account_id=ACCOUNT,
+        target_type="intent", target_id="i-1", expected_version=None,
+        body={}, source="strategy_service",
+    )
+
+
+def _allocation_guard(authority=None, lookup=None):
+    guard = _guard(margin={"initMarginAfter": 1000.0, "equityWithLoanAfter": 99_000.0})
+    guard._allocation_policy = AllocationPolicy(now=lambda: NOW)
+    guard._allocation_authority_lookup = lookup or (lambda account, artifact: authority)
+    return guard
+
+
+def _with_allocation(approved, evidence):
+    return replace(approved, allocation=evidence)
+
+
+def test_dispatch_refuses_when_ceiling_tightened_after_approval():
+    # The entry is about 3.2% of equity: it fit under 6% and does not fit under 2%.
+    guard = _allocation_guard(authority=_authority(0.02))
+    approved = _with_allocation(_approved(), _evidence(ceiling=0.06))
+
+    with pytest.raises(DispatchGuardError) as caught:
+        guard.revalidate(approved, _automated_request(), NOW)
+
+    assert caught.value.code == "LIMIT_TIGHTENED_BEFORE_DISPATCH"
+
+
+def test_dispatch_passes_when_ceiling_is_unchanged():
+    guard = _allocation_guard(authority=None)
+    approved = _with_allocation(_approved(), _evidence(ceiling=0.06))
+
+    assert guard.revalidate(approved, _automated_request(), NOW).generation_id == 2
+
+
+def test_dispatch_passes_when_ceiling_tightened_but_order_still_fits():
+    guard = _allocation_guard(authority=_authority(0.05))
+    approved = _with_allocation(_approved(), _evidence(ceiling=0.06))
+
+    assert guard.revalidate(approved, _automated_request(), NOW).generation_id == 2
+
+
+def test_dispatch_keeps_refusing_a_looser_ceiling_than_approved():
+    guard = _allocation_guard(authority=_authority(0.09))
+    approved = _with_allocation(_approved(), _evidence(ceiling=0.03))
+
+    with pytest.raises(DispatchGuardError) as caught:
+        guard.revalidate(approved, _automated_request(), NOW)
+
+    assert caught.value.code == "ALLOCATION_CEILING_TIGHTENED"
+
+
+def test_reducing_order_is_not_blocked_after_ceiling_tightens():
+    guard = _allocation_guard(authority=_authority(0.001))
+    approved = replace(
+        _with_allocation(_approved(direction=RiskDirection.REDUCING, quantity=5.0),
+                         _evidence(ceiling=0.06)),
+        side="SELL",
+    )
+
+    assert guard.revalidate(approved, _automated_request(), NOW).generation_id == 2
+
+
+def test_automated_entry_without_allocation_evidence_is_refused():
+    guard = _allocation_guard(authority=None)
+
+    with pytest.raises(DispatchGuardError) as caught:
+        guard.revalidate(_approved(), _automated_request(), NOW)
+
+    assert caught.value.code == "ALLOCATION_EVIDENCE_MISSING"
+
+
+def test_unreadable_allocation_authority_refuses_the_entry():
+    def broken_lookup(account, artifact):
+        raise RuntimeError("store offline")
+
+    guard = _allocation_guard(lookup=broken_lookup)
+    approved = _with_allocation(_approved(), _evidence())
+
+    with pytest.raises(DispatchGuardError) as caught:
+        guard.revalidate(approved, _automated_request(), NOW)
+
+    assert caught.value.code == "ALLOCATION_EVIDENCE_UNAVAILABLE"
+
+
+def test_manual_proposal_entry_without_allocation_evidence_is_unchanged():
+    guard = _allocation_guard(authority=_authority(0.001))
+
+    assert guard.revalidate(_approved(), _request(), NOW).generation_id == 2
+
+
+def test_no_allocation_policy_keeps_todays_behaviour():
+    guard = _guard(margin={"initMarginAfter": 1000.0, "equityWithLoanAfter": 99_000.0})
+
+    assert guard.revalidate(_approved(), _automated_request(), NOW).generation_id == 2

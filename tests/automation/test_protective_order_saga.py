@@ -158,8 +158,12 @@ class FakeDispatchGuard:
 
 
 class FakeSessionRisk:
-    def __init__(self, *, approved: bool = True, quantity: Decimal = Decimal("10")):
+    def __init__(self, *, approved: bool = True, quantity: Decimal = Decimal("10"),
+                 effective_gross_ceiling: Optional[float] = None,
+                 authority_digest: Optional[str] = None):
         self.calls = 0
+        self._ceiling = effective_gross_ceiling
+        self._authority_digest = authority_digest
         self._approved = approved
         self._quantity = quantity
         self._signals: tuple = ()
@@ -183,6 +187,8 @@ class FakeSessionRisk:
             approved_quantity=self._quantity,
             breaker_signals=(),
             equity_risk_fraction=0.001,
+            effective_gross_ceiling=self._ceiling,
+            authority_digest=self._authority_digest,
         )
 
 
@@ -849,3 +855,122 @@ def test_busy_liquidation_keeps_protective_failure_root_for_rescan(tmp_path):
     assert receipt.cause_command_id == intent.command_id
     assert receipt.state == "VERIFYING"
     assert len(reduces) == 1
+
+
+# --- Allocation evidence is attached by the saga's capture path (issue #47) ----
+
+def _live_quote():
+    return ExecutableQuote(
+        conid=CONID, side="ask", price=160.01, market_timestamp=NOW,
+        feed_type="live", session_state="continuous", bid=159.99, ask=160.01,
+    )
+
+
+def _saga_artifact(intent):
+    return SimpleNamespace(artifact_id=intent.artifact_id, allowlist=(str(CONID),),
+                           max_gross_allocation=0.06, parameters={})
+
+
+def _start_saga(saga, intent, approval=None):
+    return saga.start(
+        intent=intent,
+        approval=approval or make_approval(),
+        request=FakeCommandRequest(intent.command_id),
+        artifact=_saga_artifact(intent),
+        session_state=SimpleNamespace(
+            high_water_mark=100_000.0, expected_account_id=ACCOUNT, liquidity=None,
+        ),
+        allocation=SimpleNamespace(max_gross_fraction=0.06),
+    )
+
+
+def test_saga_attaches_allocation_evidence_before_dispatch_guard(tmp_path):
+    class RecordingGuard(FakeDispatchGuard):
+        def revalidate(self, approved, request, now):
+            self.seen = approved
+            return super().revalidate(approved, request, now)
+
+    guard = RecordingGuard()
+    risk = FakeSessionRisk(effective_gross_ceiling=0.05, authority_digest="auth-1")
+    saga, *_ = _build_saga(tmp_path, guard=guard, risk=risk)
+    intent = make_intent()
+
+    _start_saga(saga, intent)
+
+    evidence = guard.seen.allocation
+    assert evidence.artifact_digest == intent.artifact_id
+    assert evidence.artifact_max_gross == 0.06
+    assert evidence.authority_digest == "auth-1"
+    assert evidence.effective_gross_ceiling == 0.05
+
+
+def _real_guard(authority):
+    from trader.promotion.allocation_policy import AllocationPolicy
+    from trader.trading.command_policy import CommandAuthorityPolicy
+    from trader.trading.dispatch_guard import DispatchGuard
+
+    class Broker:
+        def capture(self, account_id):
+            return _snapshot()
+
+    class Quotes:
+        def executable_quote(self, conid, *, side):
+            return _live_quote()
+
+    class Margin:
+        def what_if_margin(self, conid, side, quantity):
+            return {"initMarginAfter": 1000.0, "equityWithLoanAfter": 99_000.0}
+
+    class Controls:
+        def require_unpaused(self, account_id):
+            return None
+
+    class Risk:
+        def check_leverage(self, margin, net_liq):
+            return SimpleNamespace(approved=True, reason="")
+
+    return DispatchGuard(
+        broker=Broker(), quotes=Quotes(), margin=Margin(), controls=Controls(),
+        risk_gate=Risk(),
+        policy=CommandAuthorityPolicy(
+            enabled=True, live_enabled=False, live_account_id=None,
+            max_order_notional=25_000.0, max_drift_bps=50.0,
+        ),
+        account_id=ACCOUNT, account_mode="paper",
+        allocation_policy=AllocationPolicy(now=lambda: NOW),
+        allocation_authority_lookup=lambda account, artifact: authority,
+    )
+
+
+def _tight_authority(max_gross):
+    return SimpleNamespace(
+        account_id=ACCOUNT, account_mode="paper", artifact_digest="artifact-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        max_gross_allocation=max_gross, authority_digest=None, stage="CANARY",
+        expires_at=dt.datetime(2099, 1, 1, tzinfo=UTC),
+    )
+
+
+def test_saga_refuses_entry_when_ceiling_tightens_between_approval_and_dispatch(tmp_path):
+    # $1,600 entry on $100k equity is 1.6%: fits 6%, does not fit 1%.
+    saga, _, _, dispatch, *_ = _build_saga(
+        tmp_path, guard=_real_guard(_tight_authority(0.01)),
+        risk=FakeSessionRisk(effective_gross_ceiling=0.06),
+    )
+
+    state = _start_saga(saga, make_intent(), make_approval(price=160.01))
+
+    assert state.state == "CLOSED"
+    assert state.error_code == "LIMIT_TIGHTENED_BEFORE_DISPATCH"
+    assert dispatch.calls == []
+
+
+def test_saga_dispatches_entry_when_ceiling_is_unchanged(tmp_path):
+    saga, _, _, dispatch, *_ = _build_saga(
+        tmp_path, guard=_real_guard(None),
+        risk=FakeSessionRisk(effective_gross_ceiling=0.06),
+    )
+
+    state = _start_saga(saga, make_intent(), make_approval(price=160.01))
+
+    assert state.state == "SUBMITTING"
+    assert len(dispatch.calls) == 1

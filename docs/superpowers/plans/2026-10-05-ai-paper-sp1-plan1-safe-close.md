@@ -64,6 +64,7 @@ Spec-implied inputs no test list in the spec names, and the review traces of rou
 9. **Event loop.** A tick awaited on the trader loop does not deadlock; a blocking call on the loop is refused. → Task 15 (master's `tests/test_trader_service_loops.py` already pins the ticks on a real loop).
 10. **The generation refresh (new behaviour).** The close asks for a fresh broker sync while it waits (ruling 1). This adds `run_broker_sync` calls during a session; `capture` raises `GENERATION_STAGING` while a sync is staging, so every reader of the broker snapshot can see short "unavailable" windows. Check this against the paper session in plan 6.
 11. **Round 2 traces.** A target fill that cancels its OCA stop ends `CLOSED` (Task 6 `test_target_fill_that_cancels_its_oca_stop_ends_closed_without_a_failure`); a partial reduce that sold nothing ends `REDUCE_FAILED`, never success (Task 6, Task 13); an ingest event racing the worker never loses the close owner (Task 9 race tests); an order found later is handed over before its cancel (Task 4 `test_hand_over_is_updated_before_every_cancel_batch`, Task 9); a run open before the upgrade settles its old reduce before any new one (Task 4 adoption tests).
+12. **Round 4 traces.** A `PendingCancel` stop never lets the target out or DONE commit (ruling 47); DONE and the owner release commit while broker changes are held (ruling 48); an old `FLAT` run and a late fill on a terminal child both block the next reduce (rulings 49, 50); a conId or partial quantity is never coerced (ruling 51); malformed close input is `NOT_SENT` (ruling 52); Task 18 runs green before Task 4 (ruling 53).
 
 
 ## Design amendments (review round 1)
@@ -162,13 +163,27 @@ PR #42 (`15f9e715`, "let liquidation exits skip entry gates and stop blocking th
 37. **`cancel_on_loop` is a separate method (Task 14).** Master's `cancel` (coordinator path) keeps matching the open trade off the loop and raising `CancelUnresolved`; three master tests pin that. The liquidation uses `cancel_on_loop`: the perm id read stays on the worker, the match and `cancelOrder` run on the loop, and "no live order" is `DispatchRefused("CANCEL_UNRESOLVED")`.
 38. **A busy session flatten polls its own cause (Task 11).** Master's `_issue_flatten` swallows `LiquidationBusy`. Only a root this call claimed waits for the lock (a join returns at once), so on `LiquidationBusy` the session persists and polls its own cause.
 39. **N1: the entry write after `submit_bracket` reads again (Task 9).** R28 made every saga save revision-checked, but `start` built its post-dispatch write from the `SUBMITTING` copy it held before the call. An ingest event saved meanwhile made it raise `SagaRevisionConflict` with the bracket live. `_after_dispatch` re-reads under `_retrying`: the submitted ids are added on top of the ingest's state, and an error state is written only while the saga is still `SUBMITTING`.
-40. **N2: every pre-upgrade run's old reduce is tracked (Task 4).** Migration 36 marks every old run that did not end `FLAT` (`pre_sp1_open`). On every tick, before the deadline check, a root journals ~~`{run}-liquidation-reduce-{conid}` of each marked run of its account, for each position in its scope, as an `UNKNOWN` child it owns (unless that child already exists). An account root then clears the marks.~~ one wildcard `UNKNOWN` child for each marked run of its account that has none yet (ruling 42), whatever its scope. The mark is cleared only in the transaction that settles that run's wildcard child, never on journaling. So the adopted run, the runs it superseded and old `FAILED_SAFE` runs all block a new reduce until their old orders are settled, also when no run was open at the upgrade.
+40. **N2: every pre-upgrade run's old reduce is tracked (Task 4).** Migration 36 marks every old run ~~that did not end `FLAT`~~, `FLAT` included (ruling 49), `pre_sp1_open`. On every tick, before the deadline check, a root journals ~~`{run}-liquidation-reduce-{conid}` of each marked run of its account, for each position in its scope, as an `UNKNOWN` child it owns (unless that child already exists). An account root then clears the marks.~~ one wildcard `UNKNOWN` child for each marked run of its account that has none yet (ruling 42), whatever its scope. The mark is cleared only in the transaction that settles that run's wildcard child, never on journaling. So the adopted run, the runs it superseded and old `FAILED_SAFE` runs all block a new reduce until their old orders are settled, also when no run was open at the upgrade.
 41. **Global constraint 21:** line numbers now cite master at `15f9e715`; where a task edits a file PR #42 changed, the task names functions, not lines.
 42. **A pre-upgrade run's reduces are one wildcard child (Task 4, Grok round 3 on #20).** Master's `liquidation_runs` stores no conid list, so the conids an old run sent reduces for are unknowable. A position missing from the snapshot is not evidence: the old reduce of a position already at 0 may not be in `working_orders` yet, and its late fill opens the other side. So each marked run becomes ONE `UNKNOWN` child (`child_id` `{run}-liquidation-reduce-*`, `conid` NULL, `ref_prefix` `{run}-liquidation-reduce-`), owned by the root that journals it and fenced on the newest generation (after the upgrade). It matches every broker row whose decoded ref is the prefix plus digits (`find_orders_with_prefix`). While it is `UNKNOWN` or `WORKING` it blocks every reduce of every scope on the account, account and position-scoped roots alike, whoever owns it (`_children_in_force` in `_blocking`, `_observe_children` and `_on_deadline`). It settles only on positive evidence (R22): every matching row terminal AND `enumeration_complete()` on a generation newer than its fence, even when the rows seen are terminal (another conid's order may still be invisible). A visible working match keeps it `WORKING`: waited on, never cancelled. An invisible one blocks to the deadline, then the normal deadline path; nothing is invented as `NOT_SENT` or `ABSENT`. Settled, it is `ABSENT` (no row), `FILLED` (any fill, the sum recorded) or `CANCELLED`; `ABSENT` and `FILLED` are fill-bearing, so sizing waits for a newer generation (R5). Its run's `pre_sp1_open` is cleared in the same transaction. Migration 36 is not shipped, so `liquidation_children.conid` becomes nullable and gains `ref_prefix` there.
 43. **A fill fence outlives its root (Task 4, Astra round 3 on #20, #23).** `_fresh` no longer looks only at the root's own children. `fill_watermark_in_tx` returns the newest `observed_generation` of any fill-bearing child (`ABSENT`, or `filled_quantity > filled_at_send`) on the scope: the whole account for an account root, the conid plus wildcard children for a conid root; any root, any state, so own, inherited, superseded, `FAILED_SAFE`, re-protect legs, cancelled stops that filled and pre-upgrade wildcard children all count, and it survives a restart (it is read from the journal). Every root needs a position generation strictly newer than it before it sizes or sends a reduce. Tests: a fill seen on the deadline tick fences the next root (Task 4); a settled legacy fill fences the next root across a restart (Task 4); an account takeover waits for the scoped root's fill (Task 7). A saga stop that fills while no close is open is not a liquidation child; the next close sees it only through the position snapshot.
-44. **DONE is decided from one read of the leg rows (Task 6, Astra round 3 on #22).** `_advance_reprotect` reads each leg's row once and takes the OCA link, side, status and quantities from that read. A row whose status is no longer accepted, or whose filled or outstanding quantity differs from the child, is observed again (`_observe_children`) and the tick waits; it never finishes on the old child values. Right before `_finish` the rows are read again and compared field by field (`_leg_fingerprint`, with `revision`); any change waits. Tests: stop cancelled after observation, stop partly filled after observation, row changed while DONE was decided.
+44. **DONE is decided from one read of the leg rows (Task 6, Astra round 3 on #22).** `_advance_reprotect` reads each leg's row once and takes the OCA link, side, status and quantities from that read. A row whose status is no longer accepted, or whose filled or outstanding quantity differs from the child, is observed again (`_observe_children`) and the tick waits; it never finishes on the old child values. ~~Right before `_finish` the rows are read again and compared field by field (`_leg_fingerprint`, with `revision`); any change waits.~~ The second read now happens while broker changes are held, together with the terminal write (ruling 48). Tests: stop cancelled after observation, stop partly filled after observation, row changed while DONE was decided.
 45. **An explicit empty OCA clears the link (Task 18, Astra round 3 on #45).** `OrderObservation.oca_reported` says the source carries OCA fields. When it does, `''` / `0` (normalised to `None`) overwrite the stored group and type; only a source without the fields keeps them. Tests through real `BrokerIngest` + DuckDB, with a readback through a new store.
 46. **Working reduces count only for the pinned account (Task 14, Astra round 3 on #38).** `_working_reduce_quantity` skips orders of another account; an order without an account is counted, so an unknown owner fails closed. Also: the Task 5 and Task 6 replacements of `start` keep `with self._exclusive():` around `_tick` (ruling 31, Astra on #21, #22), and the Task 6 test helper `_leg_row` forwards `entity` (Astra on #23).
+
+
+### Rulings made in review round 4
+
+Round 4 (`ba3f70fe`, reviewer summary on #16) found one blocker and six majors. Rulings 47–54 are binding like the others; struck-through text above is what they replace.
+
+47. **PendingCancel is live, never protection (Task 6, #22 blocker).** A broker row in `PendingCancel` is the child state `PENDING_CANCEL`: it blocks every new reduce like `WORKING` (`CHILD_LIVE`), it is re-read and inherited (`CHILD_OPEN`), and a cancel this root sent still covers its target. It is never healthy protection (`_BROKER_HEALTHY` = `Submitted`, `PreSubmitted`): the `PLANNED` target is sent only while the stop's own row is healthy right then; at DONE a `PendingCancel` row is a change (`_leg_changed`), so the leg is observed again and the tick waits. On a newer generation a `PENDING_CANCEL` stop escalates like a `CANCELLED` one (R26's wait still applies while its target is working or filled), and a position that is gone ends `CLOSED`. `_cancel_targets` does not cancel a leg that is already pending cancellation. `_legacy_evidence` keeps `PendingCancel` as `WORKING` (a wildcard child only blocks). Tests: Task 6 `test_a_pending_cancel_stop_never_gets_its_target_and_escalates`, `test_a_stop_that_goes_pending_cancel_while_done_is_decided_never_ends_done`.
+48. **DONE commits while broker changes are held (Task 6, #22 major).** The leg read and the terminal write were two steps, so an ingest batch between them could cancel or fill a leg and DONE (with the owner release) committed on old evidence. A journal transaction alone cannot fix it: broker rows are written through the domain journal's own connection and locks, not `journal_db.transaction`. So `BrokerIngest.hold_changes()` takes the ingest's `_apply_lock` (now an `RLock`, because the holder's snapshot read checks readiness under the same lock) and refuses while a generation is staging: live batches apply under that lock, and a promote runs only while a generation is staging, so nothing writes broker rows while it is held. `_finish_held` re-reads the leg rows (fingerprint with `revision`), captures the snapshot again (same promoted generation, same position quantity) and commits `DONE` / `REDUCE_FAILED` with the owner release inside the hold; cleanup (saga release, breaker, scheduling) runs after it. A change, an unreadable broker or a hold that cannot be taken (`BrokerChangesBusy`, 2 s) waits for the next tick. Lock order stays `LiquidationService._lock` before `BrokerIngest._apply_lock`. A leg that changes after the commit (the hold is released before cleanup) reaches the saga through `release_after_partial` and its own events: a later `Cancelled` is the saga's protection-lost path. Tests: Task 6 `test_an_ingest_update_before_the_terminal_write_never_commits_done[leg row|position|generation|hold busy]`, `test_done_commits_while_broker_changes_are_held`; the ingest's own `test_holding_broker_changes_stops_an_ingest_batch_until_released`, `test_broker_changes_cannot_be_held_while_a_generation_is_staging`.
+49. **Old FLAT runs are tracked too (Task 4, #20).** Master wrote `FLAT` from an empty promoted snapshot, which does not prove that an earlier reduce will not arrive late. Migration 36 marks every old run `pre_sp1_open`, `FLAT` included (`_OPEN_BEFORE_SP1` still decides owner adoption: a `FLAT` run never becomes an owner). Its wildcard child blocks every reduce on the account until ruling 42's positive evidence settles it. Cost: after the upgrade each account with old runs waits for one complete, newer enumeration before its first reduce. Tests: Task 4 `test_an_old_flat_runs_late_reduce_blocks_a_new_flatten`, Task 5 `test_an_old_flat_runs_late_reduce_blocks_a_scoped_close`.
+50. **A terminal child's late fill raises the fill fence (Task 4, #20).** IB can report `Cancelled` with 0 filled and later a fill. Every tick (`_observe_late_fills`, right after `_observe_children`) re-reads every settled child (`FILLED`, `CANCELLED`, `REJECTED`) of the scope, any root, wildcard children included, and moves only its fill, only upwards, with `observed_generation` = the newest generation. The state stays terminal; an empty or ambiguous lookup changes nothing. The watermark of ruling 43 then makes every root wait for a newer position generation before it sizes a reduce. Cost: one row lookup per settled child of the scope per tick, with no age limit (a known open item). Test: Task 4 `test_a_cancelled_child_that_reports_a_late_fill_fences_the_next_root` (an external order cancelled by an account flatten: the same cancel-child path as a stop, used because Task 4 has no stop fixture yet).
+51. **Exact identifiers at admission (Tasks 5 and 6, #21).** `start(scope="conid")` accepts only an exact positive integer conId (`numbers.Integral`, not a `bool`); `1.5`, `True`, `"1"`, `0` and `None` raise `LiquidationRefused("CONID_INVALID")` before any join row, owner, run, snapshot read or order. A partial quantity must be a finite real number (not a `bool` or a string), else `LiquidationRefused("PARTIAL_QUANTITY_INVALID")`. Tests: Task 5 `test_a_conid_that_is_not_an_exact_positive_integer_is_refused_before_any_claim`, Task 6 `test_a_partial_quantity_that_is_not_a_finite_number_is_refused_before_any_claim`.
+52. **Malformed close input is refused before scheduling (Tasks 14 and 10, #38 and the round-3 minor).** `reduce_position`, `reduce_partial` and `place_exit_leg` build the contract, the broker quantity, the size and (for a leg) the price before `run_coroutine_threadsafe` (`_close_inputs`, `_finite_number`). A missing field, a conId that is not an exact positive integer, an empty symbol, or a size or price that is `None`, a `bool`, a string or not finite is `DispatchRefused("REDUCE_ONLY_REFUSED")`, so the child is `NOT_SENT`. Only what follows the scheduling call may be "maybe sent". Tests: Task 14 `test_a_malformed_position_is_refused_before_anything_is_scheduled`, `test_a_quantity_that_is_not_a_finite_number_is_refused_before_anything_is_scheduled`; Task 10 `test_a_malformed_exit_leg_is_refused_before_anything_is_scheduled`.
+53. **Task 18's tests use master's dispatch only (#45).** Task 18 runs before Task 4, so the OCA-clear test reads the row through `TradingRuntimeOrderDispatch.find_by_order_ref(account, encode_order_ref(child_id))`; Task 14's `test_liquidation_dispatch_encodes_child_ids_and_reads_evidence` pins the adapter. Each task's Step 4 must be green before the next task starts.
+54. **The deadline decides on the tick's evidence from Task 4 on (found while fixing #20).** Task 4's and Task 5's `_tick` now observe the children (and late fills) before they look at the deadline, as Task 6's already did (R31 note 22). Ruling 43's `test_a_fill_seen_on_the_deadline_tick_fences_the_next_root` and ruling 50's test need it in plan order; the code at the end of the plan is unchanged.
 
 
 ## Review round 2
@@ -1218,7 +1233,7 @@ def _stop_trade(oca_group, oca_type, status="Submitted"):
 def test_an_explicit_empty_oca_clears_the_stored_link(env):
     """#45: the broker saying "no OCA" ('' and 0) is not a missing field; it clears the link, also after a
     restart, so a close cannot take the leg as linked protection and end DONE."""
-    from trader.trading.command_stack import _LiquidationDispatch
+    from trader.trading.order_correlation import encode_order_ref
 
     env.ingest.on_open_order(_stop_trade("p-1-reprotect-265598-1", 2))
     env.ingest.drain_once()
@@ -1229,7 +1244,7 @@ def test_an_explicit_empty_oca_clears_the_stored_link(env):
     restarted = BrokerStateStore(DuckDBConnection.get_instance(str(env.db.db_path)))
     [row] = restarted.select_active_orders_in_tx(env.journal.connect())
     assert (row.oca_group, row.oca_type) == (None, None)
-    [found] = _LiquidationDispatch(env.dispatch, None).find_orders(ACCOUNT, "p-1-reprotect-stop-265598-1")
+    [found] = env.dispatch.find_by_order_ref(ACCOUNT, encode_order_ref("p-1-reprotect-stop-265598-1"))
     assert found.oca_type != 2                     # DONE's link check needs type 2 and the group
 
 
@@ -1368,7 +1383,7 @@ def ingest_ready(ingest: Any) -> bool:
 - [ ] **Step 4: Run the tests**
 
 Run: `.venv/bin/python -m pytest tests/test_close_broker_evidence.py tests/test_broker_*.py tests/test_order_correlation.py tests/test_order_dispatch_ports.py tests/test_command_stack.py tests/test_command_coordinator.py -q --timeout=60`
-Expected: all PASS. Then the full suite: green.
+Expected: all PASS. Task 18 runs before Task 4, so its tests use only master's dispatch (`find_by_order_ref` + `encode_order_ref`), never Task 4's `_LiquidationDispatch` (ruling 53). Do not start Task 4 until this step is green. Then the full suite: green.
 
 - [ ] **Step 5: Commit**
 
@@ -1422,6 +1437,7 @@ class LiquidationDispatchPort(Protocol):
     get_order(order_entity_id) -> Optional[row]                        # incl. deleted rows
     enumeration_complete() -> bool                                     # Task 18
     newest_generation() -> int                                         # Task 18; staging included
+    # Task 6 adds hold_broker_changes() -> ContextManager (ruling 48); Task 6 adds child state PENDING_CANCEL (ruling 47)
 class LiquidationBreakerPort(Protocol):   trip_liquidation(cause_command_id, detail) -> None
 class GenerationRefreshPort(Protocol):    request_refresh(account_id) -> None       # never blocks
 @dataclass(frozen=True) class CancelTarget(order_entity_id: str, order_group_id: Optional[str])
@@ -1521,8 +1537,8 @@ from trader.data.duckdb_store import DuckDBConnection
 from trader.data.schema_migrations import SchemaMigrator
 from trader.trading.exit_owner import ExitOwnerRegistry, apply_exit_owner_migration
 from trader.trading.liquidation_service import (
-    ChildRef, DispatchRefused, LiquidationBusy, LiquidationReceipt, LiquidationRunStore, LiquidationService,
-    RunStateError, apply_liquidation_migration,
+    ChildRef, DispatchRefused, LiquidationBusy, LiquidationReceipt, LiquidationRefused, LiquidationRunStore,
+    LiquidationService, RunStateError, apply_liquidation_migration,
 )
 from trader.trading.order_correlation import matches_legacy_reduce
 
@@ -1884,7 +1900,8 @@ def test_an_adopted_run_settles_its_old_reduce_before_any_new_reduce_across_two_
     adopted = s.service.receipt_for("open-a")
     assert {(c.child_id, c.state, c.sent_generation) for c in adopted.children} == {
         (child, "UNKNOWN", 5) for child in ("open-a-liquidation-reduce-*", "open-b-liquidation-reduce-*",
-                                            "open-c-liquidation-reduce-*", "old-failed-liquidation-reduce-*")}
+                                            "open-c-liquidation-reduce-*", "old-failed-liquidation-reduce-*",
+                                            "old-flat-liquidation-reduce-*")}     # ruling 49: FLAT too
     s.service.rescan()
     s.restart()
     s.push(_snapshot(6, [_position()]))
@@ -2377,7 +2394,8 @@ def test_rescan_returns_none_when_only_failed_safe_roots_remain(tmp_path):
 # ---------------------------------------------------------------------------
 
 _OLD_REDUCES = {"open-a-liquidation-reduce-*", "open-b-liquidation-reduce-*",
-                "open-c-liquidation-reduce-*", "old-failed-liquidation-reduce-*"}
+                "open-c-liquidation-reduce-*", "old-failed-liquidation-reduce-*",
+                "old-flat-liquidation-reduce-*"}        # ruling 49: an old FLAT run is tracked too
 
 
 def test_a_superseded_legacy_runs_invisible_reduce_blocks_the_adopted_root(tmp_path):
@@ -2416,7 +2434,8 @@ def test_a_legacy_run_whose_deadline_passed_fails_safe_and_a_new_flatten_inherit
 def test_old_failed_safe_runs_reduces_are_tracked_even_with_no_run_open_at_the_upgrade(tmp_path):
     """N2: only FAILED_SAFE runs survived the upgrade; the first flatten after it still tracks them."""
     db = _legacy_db(tmp_path)
-    db.execute("DELETE FROM liquidation_runs WHERE cause_command_id LIKE 'open-%'", fetch="none")
+    db.execute("DELETE FROM liquidation_runs WHERE cause_command_id LIKE 'open-%' OR cause_command_id = 'old-flat'",
+               fetch="none")
     s = _stack(tmp_path, [_snapshot(5, [_position()]), _snapshot(6, [_position()]), _snapshot(7, [_position()])])
     receipt = s.service.start(ACCOUNT, "flat-new", DEADLINE)
     assert [(c.child_id, c.state) for c in receipt.children] == [("old-failed-liquidation-reduce-*", "UNKNOWN")]
@@ -2511,6 +2530,45 @@ def test_a_settled_legacy_fill_fences_the_next_root_across_a_restart(tmp_path):
     s.push(_snapshot(7, [_position(10.0)]))
     s.service.rescan()
     assert s.dispatch.calls == [("reduce", 1, "SELL", 10.0, "root-2-reduce-1-1")]
+
+
+# ---------------------------------------------------------------------------
+# Round-4 fixes (#20): legacy FLAT runs and late fills of terminal children
+# ---------------------------------------------------------------------------
+
+def test_an_old_flat_runs_late_reduce_blocks_a_new_flatten(tmp_path):
+    """Ruling 49: master wrote FLAT from an empty snapshot, which does not prove an earlier reduce will not
+    arrive late. The old FLAT run is tracked: its late reduce blocks every new reduce on the account."""
+    _legacy_db(tmp_path, (("old-flat", "FLAT", 1),))
+    s = _stack(tmp_path, [_snapshot(5, [_position()]), _snapshot(6, [_position()]), _snapshot(7, [_position()])])
+    s.dispatch.complete = False                              # the late reduce is not visible yet
+    receipt = s.service.start(ACCOUNT, "flat-new", DEADLINE)
+    assert [(c.child_id, c.state) for c in receipt.children] == [("old-flat-liquidation-reduce-*", "UNKNOWN")]
+    s.dispatch.rows["old-flat-liquidation-reduce-1"] = [_row("Submitted", entity="old-flat-liquidation-reduce-1:exit")]
+    assert "still working" in s.service.rescan().detail     # visible now: waited on, never cancelled
+    s.service.rescan()
+    assert s.dispatch.calls == []
+
+
+def test_a_cancelled_child_that_reports_a_late_fill_fences_the_next_root(tmp_path):
+    """Ruling 50: the order was reported Cancelled with 0 filled, then the broker reported 4 filled while
+    the position cache still said 10. The next root waits for a newer generation, then sells 6, not 10."""
+    s = _stack(tmp_path, [_snapshot(1, [_position()], [_order()])])
+    s.service.start(ACCOUNT, "root-1", DEADLINE)                                    # gen 1: cancel the order
+    s.dispatch.entities["external-1"] = _row("Cancelled", filled=0.0)
+    s.push(_snapshot(2, [_position()]))
+    s.clock["now"] = DEADLINE + dt.timedelta(seconds=1)
+    assert s.service.rescan().state == "FAILED_SAFE"         # gen 2: cancel CANCELLED with 0, then the deadline
+    s.dispatch.entities["external-1"] = _row("Cancelled", filled=4.0)
+    s.push(_snapshot(3, [_position()]))
+    receipt = s.service.start(ACCOUNT, "root-2", s.clock["now"] + dt.timedelta(minutes=5))
+    assert "newer than the last observed fill" in receipt.detail
+    assert [c[0] for c in s.dispatch.calls] == ["cancel"]    # no reduce sized from the stale 10
+    cancel = next(c for c in s.service.receipt_for("root-1").children if c.kind == "cancel")
+    assert (cancel.state, cancel.filled_quantity, cancel.observed_generation) == ("CANCELLED", 4.0, 3)
+    s.push(_snapshot(4, [_position(6.0)]))
+    s.service.rescan()
+    assert s.dispatch.calls[-1] == ("reduce", 1, "SELL", 6.0, "root-2-reduce-1-1")
 ```
 
 Append to `tests/test_command_stack.py`:
@@ -2804,6 +2862,8 @@ CHILD_STATES = frozenset({
     "PLANNED", "UNKNOWN", "WORKING", "FILLED", "CANCELLED", "REJECTED", "ABSENT", "NOT_SENT",
 })
 CHILD_TERMINAL = frozenset({"FILLED", "CANCELLED", "REJECTED", "ABSENT", "NOT_SENT"})
+# Terminal children whose broker row may still report a later fill (ruling 50).
+_FILL_MAY_GROW = ("FILLED", "CANCELLED", "REJECTED")
 _BROKER_ACCEPTED = frozenset({"PreSubmitted", "Submitted", "PendingCancel"})
 _BROKER_TERMINAL = {
     "Filled": "FILLED", "Cancelled": "CANCELLED", "ApiCancelled": "CANCELLED",
@@ -2820,8 +2880,10 @@ def apply_liquidation_migration(migrator: SchemaMigrator) -> None:
     run gets a join row; the oldest open run of an account becomes its ACTIVE
     account owner, in phase ``legacy`` (it acts only on a broker generation
     opened after the upgrade); other open runs of that account are SUPERSEDED
-    by it. Every old run that did not end FLAT is marked ``pre_sp1_open``: it
-    may have sent a reduce the journal does not know (N2). Such a run is
+    by it. Every old run, FLAT included, is marked ``pre_sp1_open``: it may
+    have sent a reduce the journal does not know (N2). An old FLAT was decided
+    from an empty snapshot, which does not prove that an earlier reduce will
+    not arrive late (ruling 49). Such a run is
     tracked by one wildcard child (``ref_prefix`` set, ``conid`` NULL), because
     old runs record no conids (ruling 42). Exit owners (migration 35) are
     applied first.
@@ -2848,7 +2910,7 @@ def apply_liquidation_migration(migrator: SchemaMigrator) -> None:
         "ALTER TABLE liquidation_runs ADD COLUMN IF NOT EXISTS superseded_by VARCHAR",
         "ALTER TABLE liquidation_runs ADD COLUMN IF NOT EXISTS cleanup_pending BOOLEAN DEFAULT FALSE",
         "ALTER TABLE liquidation_runs ADD COLUMN IF NOT EXISTS pre_sp1_open BOOLEAN DEFAULT FALSE",
-        "UPDATE liquidation_runs SET pre_sp1_open = TRUE WHERE state <> 'FLAT'",
+        "UPDATE liquidation_runs SET pre_sp1_open = TRUE",
         """CREATE TABLE IF NOT EXISTS liquidation_children (
             child_id VARCHAR PRIMARY KEY,
             root_id VARCHAR NOT NULL,
@@ -3182,6 +3244,19 @@ class LiquidationRunStore:
             "AND (state = 'ABSENT' OR filled_quantity > filled_at_send)" + conid_filter, params).fetchone()
         return None if row[0] is None else int(row[0])
 
+    def settled_children_in_tx(self, conn, account_id: str, conid: Optional[int]) -> tuple[ChildRef, ...]:
+        """Terminal children of the scope, any root, whose row may still report a later fill (ruling 50).
+
+        A conid scope also reads wildcard children (conid NULL), like the fill watermark.
+        """
+        conid_filter = "" if conid is None else " AND (conid = ? OR conid IS NULL)"
+        params: list = [account_id, *_FILL_MAY_GROW] + ([] if conid is None else [int(conid)])
+        rows = conn.execute(
+            f"SELECT {', '.join(_CHILD_COLUMNS)} FROM liquidation_children WHERE account_id = ? "
+            f"AND state IN ({', '.join('?' for _ in _FILL_MAY_GROW)})" + conid_filter + " ORDER BY child_id",
+            params).fetchall()
+        return tuple(_child_from_row(r) for r in rows)
+
     def legacy_reduces_in_tx(self, conn, account_id: str) -> tuple[ChildRef, ...]:
         """Every wildcard child of the account, whoever owns it (ruling 42)."""
         rows = conn.execute(
@@ -3510,17 +3585,21 @@ class LiquidationService:
             return self._cleanup(receipt)
         if receipt.state in RESCAN_TERMINAL:
             return receipt
-        if self._now() >= receipt.deadline:
-            return self._on_deadline(receipt)
         try:
             snapshot = self._broker.capture(receipt.account_id)
             newest = int(self._dispatch.newest_generation())
+            if getattr(snapshot, "account_id", None) != receipt.account_id:
+                raise RuntimeError("broker snapshot account mismatch")
         except Exception as exc:
+            if self._now() >= receipt.deadline:
+                return self._on_deadline(receipt)
             return self._snapshot_unavailable(receipt, f"broker evidence unavailable: {exc}")
-        if getattr(snapshot, "account_id", None) != receipt.account_id:
-            return self._snapshot_unavailable(receipt, "broker snapshot account mismatch")
         receipt = self._fence_unsent(receipt, snapshot, newest)
         receipt = self._observe_children(receipt, snapshot, newest)
+        receipt = self._observe_late_fills(receipt, newest)
+        if self._now() >= receipt.deadline:
+            # Ruling 54: the deadline decides on this tick's evidence, so a fill seen now still fences.
+            return self._on_deadline(receipt)
         return self._advance_account(receipt, snapshot)
 
     def _snapshot_unavailable(self, receipt, detail):
@@ -3603,6 +3682,41 @@ class LiquidationService:
                     self._store.clear_pre_sp1_mark_in_tx(conn, child.root_id)
         self._store.transaction(write)
         return self._store.receipt(receipt.cause_command_id)
+
+    def _observe_late_fills(self, receipt, newest: int) -> LiquidationReceipt:
+        """#20, ruling 50: a terminal child's row can report a fill later (``Cancelled`` with 0, then a fill).
+
+        Every settled child of the scope, any root, is read again. Only its
+        fill moves, only upwards, with ``observed_generation`` = ``newest``,
+        so the fill watermark makes every root wait for a newer position
+        generation. Its state stays terminal; an empty or ambiguous lookup
+        changes nothing.
+        """
+        settled = self._store.transaction(
+            lambda conn: self._store.settled_children_in_tx(conn, receipt.account_id, receipt.conid))
+        grown = [replace(child, filled_quantity=filled, observed_generation=newest) for child in settled
+                 for filled in (self._row_fill(child),) if filled is not None and filled > child.filled_quantity]
+        if not grown:
+            return receipt
+
+        def write(conn):
+            for child in grown:
+                self._store.update_child_in_tx(conn, child, self._now())
+        self._store.transaction(write)
+        return self._store.receipt(receipt.cause_command_id)
+
+    def _row_fill(self, child: ChildRef) -> Optional[float]:
+        """The fill the broker reports now for a child's own order(s); None when no single row answers."""
+        if child.ref_prefix is not None:
+            rows = list(self._dispatch.find_orders_with_prefix(child.account_id, child.ref_prefix))
+        elif child.kind == "cancel":
+            row = self._dispatch.get_order(child.target_order_entity_id)
+            rows = [] if row is None or getattr(row, "deleted", False) else [row]
+        else:
+            rows = list(self._dispatch.find_orders(child.account_id, child.child_id))
+        if not rows or (child.ref_prefix is None and len(rows) > 1):
+            return None
+        return sum(float(getattr(r, "filled_quantity", 0.0) or 0.0) for r in rows)
 
     def _children_in_force(self, receipt) -> tuple[ChildRef, ...]:
         """The root's own children plus every wildcard child of its account, whoever owns it (ruling 42)."""
@@ -4312,6 +4426,63 @@ def test_dispatch_refuses_before_the_boundary_with_dispatch_refused(loop_thread,
     assert trader.executioner.placed == []
 
 
+class _SpyTrader:
+    """Records every order the dispatch schedules on the trader loop."""
+    def __init__(self, loop):
+        self._main_loop = loop
+        self.ib_account = ACCOUNT
+        self.scheduled = []
+
+    async def place_reduce_only_order(self, *args, **kwargs):
+        self.scheduled.append((args, kwargs))
+        raise AssertionError("a malformed close input must never be scheduled")
+
+
+_MISSING = object()
+
+
+def _malformed(**fields):
+    position = dict(conid=CONID, symbol="AAPL", quantity=10.0, account_id=ACCOUNT)
+    position.update(fields)
+    return SimpleNamespace(**{k: v for k, v in position.items() if v is not _MISSING})
+
+
+_MALFORMED_POSITIONS = {
+    "no symbol": _malformed(symbol=_MISSING),
+    "empty symbol": _malformed(symbol=""),
+    "no conid": _malformed(conid=_MISSING),
+    "fractional conid": _malformed(conid=265598.5),
+    "string conid": _malformed(conid=str(CONID)),
+    "bool conid": _malformed(conid=True),
+    "no quantity": _malformed(quantity=_MISSING),
+    "None quantity": _malformed(quantity=None),
+    "NaN quantity": _malformed(quantity=float("nan")),
+}
+
+
+@pytest.mark.parametrize("position", _MALFORMED_POSITIONS.values(), ids=_MALFORMED_POSITIONS.keys())
+@pytest.mark.parametrize("call", ["reduce_position", "reduce_partial"])
+def test_a_malformed_position_is_refused_before_anything_is_scheduled(loop_thread, call, position):
+    """#38, ruling 52: built before the boundary, so DispatchRefused (NOT_SENT), never "maybe sent"."""
+    trader = _SpyTrader(loop_thread.loop)
+    dispatch = TradingRuntimeOrderDispatch(trader, dispatch_timeout=2.0)
+    with pytest.raises(DispatchRefused) as ex:
+        getattr(dispatch, call)(position, "SELL", 10.0 if call == "reduce_position" else 4.0, "mmr:x")
+    assert ex.value.code == "REDUCE_ONLY_REFUSED" and trader.scheduled == []
+
+
+@pytest.mark.parametrize("quantity", [None, "4", True, float("inf")])
+@pytest.mark.parametrize("call", ["reduce_position", "reduce_partial"])
+def test_a_quantity_that_is_not_a_finite_number_is_refused_before_anything_is_scheduled(loop_thread, call,
+                                                                                         quantity):
+    """The known minor of round 3: a None quantity raised TypeError, which the close read as maybe sent."""
+    trader = _SpyTrader(loop_thread.loop)
+    with pytest.raises(DispatchRefused) as ex:
+        getattr(TradingRuntimeOrderDispatch(trader, dispatch_timeout=2.0), call)(
+            _malformed(), "SELL", quantity, "mmr:x")
+    assert ex.value.code == "REDUCE_ONLY_REFUSED" and trader.scheduled == []
+
+
 def test_a_trader_refusal_is_dispatch_refused_and_an_ib_rejection_is_not(loop_thread):
     """R2 / R34: a refusal sent nothing (NOT_SENT); an IB rejection was sent (UNKNOWN until its row)."""
     trader = _trader(held=3.0)                      # IB now holds only 3
@@ -4611,18 +4782,19 @@ index c3d03cdb..1b2e1738 100644
          - any other exception, including ``TimeoutError``: the order may have
            been sent.
          """
-+        if side != self._reducing_side(position) or float(quantity) != abs(float(position.quantity)):
++        contract, held, size = self._close_inputs(position, quantity)
++        if side != self._side_for(held) or size != abs(held):
 +            self._refuse('liquidation order must exactly reduce the broker position')
-+        return self._reduce_only(position, side, quantity, order_ref)
++        return self._reduce_only(position, contract, held, side, size, order_ref)
 +
 +    def reduce_partial(self, position, side: str, quantity: float, order_ref: str):
 +        """Reduce-only MARKET order for a whole-share part strictly inside the position."""
-+        held = abs(float(position.quantity))
-+        if side != self._reducing_side(position):
++        contract, held, size = self._close_inputs(position, quantity)
++        if side != self._side_for(held):
 +            self._refuse('a partial reduce must be on the reducing side of a position')
-+        if not float(quantity).is_integer() or not 0 < float(quantity) < held:
++        if not size.is_integer() or not 0 < size < abs(held):
 +            self._refuse('a partial reduce needs a whole quantity strictly between 0 and the position')
-+        return self._reduce_only(position, side, quantity, order_ref)
++        return self._reduce_only(position, contract, held, side, size, order_ref)
 +
 +    def cancel_on_loop(self, order_entity_id: str, order_ref: str):
 +        """``cancel`` for the liquidation worker (R34, ruling 7).
@@ -4652,9 +4824,21 @@ index c3d03cdb..1b2e1738 100644
 +            raise DispatchRefused('CANCEL_UNRESOLVED', str(ex)) from ex
 +
 +    @staticmethod
-+    def _reducing_side(position) -> Optional[str]:
-+        held = float(position.quantity)
++    def _side_for(held: float) -> Optional[str]:
 +        return None if held == 0 else ('SELL' if held > 0 else 'BUY')
++
++    @classmethod
++    def _close_inputs(cls, position, quantity) -> tuple:
++        """Contract, broker quantity and order size, built before anything is scheduled (#38, ruling 52).
++
++        A missing field, a conId that is not an exact positive integer or a
++        size that is not a finite number is a refusal: nothing was sent.
++        """
++        try:
++            return (cls._contract_for(position), _finite_number(position.quantity, 'position quantity'),
++                    _finite_number(quantity, 'quantity'))
++        except (AttributeError, TypeError, ValueError) as ex:
++            cls._refuse(f'malformed close input: {ex}')
 +
 +    @staticmethod
 +    def _refuse(detail: str):
@@ -4663,15 +4847,26 @@ index c3d03cdb..1b2e1738 100644
 +
 +    @staticmethod
 +    def _contract_for(position) -> Contract:
++        conid, symbol = position.conid, position.symbol
++        if isinstance(conid, bool) or not isinstance(conid, numbers.Integral) or conid <= 0:
++            raise ValueError(f'conId {conid!r} is not a positive integer')
++        if not isinstance(symbol, str) or not symbol:
++            raise ValueError(f'symbol {symbol!r} is missing')
 +        return Contract(
-+            conId=int(position.conid), symbol=position.symbol,
++            conId=int(conid), symbol=symbol,
 +            secType=getattr(position, 'sec_type', None) or 'STK',
 +            exchange=getattr(position, 'exchange', None) or 'SMART',
 +            currency=getattr(position, 'currency', None) or 'USD',
 +        )
 +
-+    def _reduce_only(self, position, side: str, quantity: float, order_ref: str, **order):
-+        """One reduce-only order on the trader loop; maps the result to the errors above."""
++    def _reduce_only(self, position, contract: Contract, held: float, side: str, quantity: float,
++                     order_ref: str, **order):
++        """One reduce-only order on the trader loop; maps the result to the errors above.
++
++        Every argument is already built (``_close_inputs``): only the
++        scheduled coroutine can cross the boundary, so only what follows
++        ``run_coroutine_threadsafe`` may be "maybe sent".
++        """
          from trader.trading.command_coordinator import BrokerRejectedError
  
 -        broker_quantity = float(position.quantity)
@@ -4692,8 +4887,7 @@ index c3d03cdb..1b2e1738 100644
              self._trader.place_reduce_only_order(
 -                contract, side, abs(broker_quantity),
 -                broker_quantity=broker_quantity, order_ref=order_ref,
-+                self._contract_for(position), side, float(quantity),
-+                broker_quantity=float(position.quantity), order_ref=order_ref, **order,
++                contract, side, quantity, broker_quantity=held, order_ref=order_ref, **order,
              ), loop,
          )
          result = self._wait_on_loop(future, 'liquidation dispatch')
@@ -4731,6 +4925,19 @@ index c3d03cdb..1b2e1738 100644
                  f'{purpose} called on the trader loop thread; refused to avoid a deadlock, nothing sent')
          return loop
  
+```
+
+Add `import math` and `import numbers` to the module imports (the module-level `math` replaces the local `import math` in `_reduce_only_refusal`), and this helper right before `class TradingRuntimeOrderDispatch` (ruling 52):
+
+```python
+def _finite_number(value, label: str) -> float:
+    """A finite real number; ``None``, a bool or a string is refused, never coerced."""
+    if value is None or isinstance(value, (bool, str, bytes)):
+        raise ValueError(f'{label} {value!r} is not a number')
+    number = float(value)
+    if not math.isfinite(number):
+        raise ValueError(f'{label} {value!r} is not finite')
+    return number
 ```
 
 - [ ] **Step 4: Run the tests**
@@ -5337,12 +5544,12 @@ Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>"
 A conid root journals and honours the pre-upgrade wildcard children of ruling 42 like an account root: Task 4's `_track_pre_sp1_reduces` and `_blocking` run for every scope, so `CLOSED` and every reduce wait while any wildcard child of the account is unsettled, also for a conid the old run may never have touched. A conid root never clears another run's mark early; only the settle does. The last two tests below cover a scoped close of the old reduce's conid and of another conid.
 
 **Files:**
-- Modify: `trader/trading/liquidation_service.py` (`start`, `_tick`; new `_claim_scoped_in_tx`, `_position_for`, `_working_for`, `_cancel_conid_orders`, `_advance_conid`)
+- Modify: `trader/trading/liquidation_service.py` (`start`, `_tick`; new `_claim_scoped_in_tx`, `_position_for`, `_working_for`, `_cancel_conid_orders`, `_advance_conid`, `_exact_conid`)
 - Test: `tests/test_liquidation_service.py`
 
 **Interfaces:**
 - Consumes: Task 4 frozen model; `ExitOwnerRegistry.claim_scoped_in_tx`; `ProtectionOwnershipPort.handover`.
-- Produces: `start(..., scope="conid", conid=...)` returns the receipt of the root the caller must poll (another root after a join). `phase` goes `"" → "cancel" → "reduce"`. Until Task 6, a request with `quantity` raises `LiquidationRefused("PARTIAL_CLOSE_UNAVAILABLE")` before anything is written (ruling 18).
+- Produces: `start(..., scope="conid", conid=...)` returns the receipt of the root the caller must poll (another root after a join). `phase` goes `"" → "cancel" → "reduce"`. Until Task 6, a request with `quantity` raises `LiquidationRefused("PARTIAL_CLOSE_UNAVAILABLE")` before anything is written (ruling 18). A `conid` that is not an exact positive integer (`numbers.Integral`, not a `bool`) raises `LiquidationRefused("CONID_INVALID")` before any claim, read or order: `1.5`, `True` and `"1"` are never coerced (ruling 51).
 
 - [ ] **Step 1: Write the failing tests**
 
@@ -5513,6 +5720,27 @@ def test_start_refuses_rebinding_root_to_another_scope(tmp_path):
         s.service.start(ACCOUNT, "root-2", DEADLINE, scope="conid", conid=1)
 
 
+def test_an_old_flat_runs_late_reduce_blocks_a_scoped_close(tmp_path):
+    """Ruling 49 on the conid scope: the old FLAT run's wildcard child blocks a full close too."""
+    _legacy_db(tmp_path, (("old-flat", "FLAT", 1),))
+    s = _stack(tmp_path, [_snapshot(5, [_position()]), _snapshot(6, [_position()])], protection=_Protection())
+    s.dispatch.rows["old-flat-liquidation-reduce-1"] = [_row("Submitted", entity="old-flat-liquidation-reduce-1:exit")]
+    s.service.start(ACCOUNT, "close-1", DEADLINE, scope="conid", conid=1)
+    assert "still working" in s.service.rescan().detail
+    assert s.dispatch.calls == []
+
+
+@pytest.mark.parametrize("conid", [1.5, True, "1", 0, -1, None], ids=repr)
+def test_a_conid_that_is_not_an_exact_positive_integer_is_refused_before_any_claim(tmp_path, conid):
+    """#21, ruling 51: 1.5, True or "1" never become conId 1; nothing is claimed, read or sent."""
+    s = _stack(tmp_path, [_snapshot(1, [_position()])], protection=_Protection())
+    with pytest.raises(LiquidationRefused) as ex:
+        s.service.start(ACCOUNT, "close-1", DEADLINE, scope="conid", conid=conid)
+    assert ex.value.code == "CONID_INVALID"
+    assert s.service.root_for("close-1") is None and s.registry.owner_for(ACCOUNT, 1) is None
+    assert (s.broker.calls, s.dispatch.calls) == (0, [])
+
+
 def test_an_old_reduce_of_a_flat_position_blocks_a_scoped_close_of_that_conid(tmp_path):
     _legacy_db(tmp_path, (("flat-1", "FAILED_SAFE", 1),))
     s = _stack(tmp_path, [_snapshot(5, [_position(0.0)]), _snapshot(6, [_position(0.0)])])
@@ -5575,12 +5803,11 @@ Replace `start` and `_tick` with:
             outcome, root = self._store.transaction(
                 lambda conn: self._claim_account_in_tx(conn, account_id, cause_command_id, deadline))
         elif scope == "conid":
-            if conid is None:
-                raise ValueError("conid scope requires a conid")
+            conid = _exact_conid(conid)
             if quantity is not None:
                 raise LiquidationRefused("PARTIAL_CLOSE_UNAVAILABLE", "partial closes arrive in plan 1 task 6")
             outcome, root = self._store.transaction(lambda conn: self._claim_scoped_in_tx(
-                conn, account_id, cause_command_id, int(conid), quantity, deadline, stop_price, target_price))
+                conn, account_id, cause_command_id, conid, quantity, deadline, stop_price, target_price))
         else:
             raise ValueError(f"unknown liquidation scope {scope!r}")
         if outcome in (CLAIMED, "EXISTING"):
@@ -5598,20 +5825,36 @@ Replace `start` and `_tick` with:
             return self._cleanup(receipt)
         if receipt.state in RESCAN_TERMINAL:
             return receipt
-        if self._now() >= receipt.deadline:
-            return self._on_deadline(receipt)
         try:
             snapshot = self._broker.capture(receipt.account_id)
             newest = int(self._dispatch.newest_generation())
+            if getattr(snapshot, "account_id", None) != receipt.account_id:
+                raise RuntimeError("broker snapshot account mismatch")
         except Exception as exc:
+            if self._now() >= receipt.deadline:
+                return self._on_deadline(receipt)
             return self._snapshot_unavailable(receipt, f"broker evidence unavailable: {exc}")
-        if getattr(snapshot, "account_id", None) != receipt.account_id:
-            return self._snapshot_unavailable(receipt, "broker snapshot account mismatch")
         receipt = self._fence_unsent(receipt, snapshot, newest)
         receipt = self._observe_children(receipt, snapshot, newest)
+        receipt = self._observe_late_fills(receipt, newest)
+        if self._now() >= receipt.deadline:
+            return self._on_deadline(receipt)
         if receipt.scope == "account":
             return self._advance_account(receipt, snapshot)
         return self._advance_conid(receipt, snapshot)
+```
+
+Add `import numbers` to the module imports, and next to `_reducing_side` (ruling 51):
+
+```python
+def _exact_conid(conid) -> int:
+    """#21, ruling 51: an exact positive integer conId, or the close is refused before any claim.
+
+    ``1.5``, ``True`` and ``"265598"`` are never coerced: a coerced id can close another instrument.
+    """
+    if isinstance(conid, bool) or not isinstance(conid, numbers.Integral) or int(conid) <= 0:
+        raise LiquidationRefused("CONID_INVALID", f"conid must be a positive integer, got {conid!r}")
+    return int(conid)
 ```
 
 Add after `_claim_account_in_tx`:
@@ -5724,13 +5967,67 @@ Review round 2 rules in this task:
 
 **Files:**
 - Modify: `trader/trading/liquidation_service.py`
-- Test: `tests/test_liquidation_service.py`
+- Modify: `trader/trading/broker_ingest.py` (`hold_changes`, reentrant `_apply_lock`), `trader/trading/trading_runtime.py` and `trader/trading/command_stack.py` (`hold_broker_changes`)
+- Test: `tests/test_liquidation_service.py`, `tests/test_close_broker_evidence.py`
 
 **Interfaces:**
 - Consumes: `liquidation_child_id`, `reprotect_oca_group` (Task 2); `ExitOwnerRegistry.ensure_partial_allowed_in_tx` (Task 3); `LiquidationDispatchPort.reduce_partial` / `place_exit_leg` (frozen in Task 4; real in Tasks 14 and 10); `ProtectionOwnershipPort.expect_reprotect` / `release_after_partial` (frozen in Task 4; real in Task 9).
-- Produces: `upgrade_to_zero(root_id) -> LiquidationReceipt` (registry goal and run goal in one transaction; `PLANNED` children → `NOT_SENT`; a `reduce`/`reprotect` phase goes back to `cancel`, so replacement legs are cancelled). Terminal state `REDUCE_FAILED`. Quantity rules (R15): `q = floor(requested)`; `q < 1` → `LiquidationRefused("PARTIAL_QUANTITY_INVALID")`; `q ≥ |position|` → `LiquidationRefused("QUANTITY_ABOVE_POSITION")`; less than one share left → full close; live position `≤ q` (or less than one share left) at dispatch → close the live remainder. Stop side: long → stop below the market price, short → above; a target on the profit side; no market price → escalate.
+- Produces: `upgrade_to_zero(root_id) -> LiquidationReceipt` (registry goal and run goal in one transaction; `PLANNED` children → `NOT_SENT`; a `reduce`/`reprotect` phase goes back to `cancel`, so replacement legs are cancelled). Terminal state `REDUCE_FAILED`. Quantity rules (R15): `q = floor(requested)`; `q < 1` → `LiquidationRefused("PARTIAL_QUANTITY_INVALID")`; `q ≥ |position|` → `LiquidationRefused("QUANTITY_ABOVE_POSITION")`; less than one share left → full close; live position `≤ q` (or less than one share left) at dispatch → close the live remainder. Stop side: long → stop below the market price, short → above; a target on the profit side; no market price → escalate. A `quantity` that is not a finite real number (a `bool`, a string, NaN) → `LiquidationRefused("PARTIAL_QUANTITY_INVALID")` before any claim (ruling 51). Child state `PENDING_CANCEL` (ruling 47): live, blocks every reduce, never healthy protection. `LiquidationDispatchPort.hold_broker_changes()` and `BrokerChangesBusy` (ruling 48).
+
+Round 4 rules in this task:
+- **PendingCancel is not protection (ruling 47, #22 blocker).** The target is sent only while the stop's own row is `Submitted`/`PreSubmitted`; a `PendingCancel` stop is observed again (`PENDING_CANCEL`) and, on the next generation, escalates like a cancelled stop (or ends `CLOSED` when the position is gone). At DONE a `PendingCancel` row counts as a change.
+- **DONE commits under a hold (ruling 48, #22 major).** The terminal write of `DONE` / `REDUCE_FAILED` (and the owner release in it) runs while broker changes are held. Under the hold the leg rows, the position and the promoted generation are read again; any change, or a hold that cannot be taken, waits for the next tick.
 
 - [ ] **Step 1: Write the failing tests**
+
+In the fakes at the top of `tests/test_liquidation_service.py` (Task 4): import `from contextlib import contextmanager` and `BrokerChangesBusy`; replace `_Broker` with
+
+```python
+class _Broker:
+    """``held``: broker changes are held, so a capture repeats the last snapshot (``current``)."""
+    def __init__(self, snapshots):
+        self.snapshots = list(snapshots)
+        self.calls = 0
+        self.last = 0          # generation of the last captured snapshot
+        self.held = False
+        self.current = None
+
+    def capture(self, account_id):
+        self.calls += 1
+        if self.held and self.current is not None:
+            return self.current
+        value = self.snapshots.pop(0) if len(self.snapshots) > 1 else self.snapshots[0]
+        if isinstance(value, Exception):
+            raise value
+        self.last = value.generation_id
+        self.current = value
+        return value
+```
+
+give `_Dispatch.__init__` three more fields
+
+```python
+        self.before_hold = None                # an ingest batch applied just before the hold is taken
+        self.hold_busy = False
+        self.holds = 0
+```
+
+and add to `_Dispatch`:
+
+```python
+    @contextmanager
+    def hold_broker_changes(self):
+        if self.before_hold is not None:
+            self.before_hold()
+        if self.hold_busy:
+            raise BrokerChangesBusy("broker ingest busy")
+        self.holds += 1
+        self.broker.held = True
+        try:
+            yield
+        finally:
+            self.broker.held = False
+```
 
 Append to `tests/test_liquidation_service.py`:
 
@@ -5738,8 +6035,6 @@ Append to `tests/test_liquidation_service.py`:
 # ---------------------------------------------------------------------------
 # Task 6: partial close, re-protect, escalation
 # ---------------------------------------------------------------------------
-
-from trader.trading.liquidation_service import LiquidationRefused  # noqa: E402
 
 
 def _priced(quantity=10.0, conid=1, price=100.0):
@@ -5857,6 +6152,72 @@ def test_a_leg_row_that_changes_while_done_is_decided_is_read_again(tmp_path):
     s = _both_legs_working_next(tmp_path, [_leg_row()], [_leg_row()], [_leg_row("Cancelled")])
     receipt = s.service.rescan()
     assert receipt.state != "DONE" and s.service.close_resolution("p-1") is None
+
+
+@pytest.mark.parametrize("quantity", [True, "4", float("nan"), float("inf")], ids=repr)
+def test_a_partial_quantity_that_is_not_a_finite_number_is_refused_before_any_claim(tmp_path, quantity):
+    s = _stack(tmp_path, [_snapshot(1, [_position()])], protection=_Protection())
+    with pytest.raises(LiquidationRefused) as ex:
+        s.service.start(ACCOUNT, "p-1", DEADLINE, scope="conid", conid=1, quantity=quantity)
+    assert ex.value.code == "PARTIAL_QUANTITY_INVALID"
+    assert s.service.root_for("p-1") is None and (s.broker.calls, s.dispatch.calls) == (0, [])
+
+
+def test_a_pending_cancel_stop_never_gets_its_target_and_escalates(tmp_path):
+    """#22 blocker, ruling 47: a stop already pending cancellation is not protection. Its target is
+    never sent, and the close escalates instead of ending DONE."""
+    s, protection = _to_reprotect(tmp_path, extra=(_snapshot(4, [_priced(6.0)]), _snapshot(5, [_priced(6.0)])))
+    s.dispatch.rows["p-1-reprotect-stop-1-1"] = [_leg_row("PendingCancel")]
+    receipt = s.service.rescan()                                          # gen 4
+    stop = next(c for c in receipt.children if c.kind == "reprotect-stop")
+    assert stop.state == "PENDING_CANCEL" and receipt.state != "DONE"
+    receipt = s.service.rescan()                                          # gen 5: still pending cancel
+    assert receipt.goal == "zero" and receipt.escalated
+    assert not any(c[0] == "place_exit_leg" and c[2] == "target" for c in s.dispatch.calls)
+    assert s.registry.get("p-1").state == "ACTIVE" and s.service.close_resolution("p-1") is None
+
+
+def test_a_stop_that_goes_pending_cancel_while_done_is_decided_never_ends_done(tmp_path):
+    """#22 blocker: the stop's row turns PendingCancel after it was observed WORKING. DONE is not
+    committed and the owner is not released, on this generation or the next."""
+    s = _both_legs_working_next(tmp_path, [_leg_row()], [_leg_row("PendingCancel")])
+    receipt = s.service.rescan()                                          # gen 5
+    assert receipt.state != "DONE" and s.registry.get("p-1").state == "ACTIVE"
+    assert next(c for c in receipt.children if c.kind == "reprotect-stop").state == "PENDING_CANCEL"
+    receipt = s.service.rescan()                                          # gen 6
+    assert receipt.state != "DONE" and receipt.goal == "zero"
+    assert s.service.close_resolution("p-1") is None
+
+
+def _done_ready(tmp_path):
+    """Both legs working and matching on generation 5; the next tick would commit DONE."""
+    return _both_legs_working_next(tmp_path, [_leg_row()])
+
+
+_INGEST_BEFORE_THE_WRITE = {
+    "leg row": lambda s: s.dispatch.sequences.__setitem__("p-1-reprotect-stop-1-1", [[_leg_row("Cancelled")]]),
+    "position": lambda s: setattr(s.broker, "current", _snapshot(5, [_priced(4.0)])),
+    "generation": lambda s: setattr(s.broker, "current", _snapshot(6, [_priced(6.0)])),
+    "hold busy": lambda s: setattr(s.dispatch, "hold_busy", True),
+}
+
+
+@pytest.mark.parametrize("change", _INGEST_BEFORE_THE_WRITE.values(), ids=_INGEST_BEFORE_THE_WRITE.keys())
+def test_an_ingest_update_before_the_terminal_write_never_commits_done(tmp_path, change):
+    """#22 major, ruling 48: an ingest batch lands after the final read and before the terminal write.
+    The write is made while broker changes are held, after the rows, position and generation are read
+    again; any change (or a hold that cannot be taken) waits, and the owner stays ACTIVE."""
+    s = _done_ready(tmp_path)
+    s.dispatch.before_hold = lambda: change(s)
+    receipt = s.service.rescan()                                          # gen 5
+    assert receipt.state != "DONE" and "not committed" in receipt.detail
+    assert s.registry.get("p-1").state == "ACTIVE" and s.service.close_resolution("p-1") is None
+
+
+def test_done_commits_while_broker_changes_are_held(tmp_path):
+    s = _done_ready(tmp_path)
+    receipt = s.service.rescan()
+    assert receipt.state == "DONE" and s.dispatch.holds == 1
 
 
 def test_terminal_partial_fill_reprotects_the_actual_remainder(tmp_path):
@@ -6304,6 +6665,52 @@ def test_an_inherited_reduce_never_counts_as_this_partials_reduce(tmp_path):
 
 Note: a partial `start` reads one snapshot to admit the quantity, so these tests list generation 1 twice.
 
+Append to `tests/test_close_broker_evidence.py` (Task 18's file; it already has the real `BrokerIngest` fixture):
+
+```python
+# -- Task 6, ruling 48: the close's terminal write holds broker changes ----------------------
+
+def test_holding_broker_changes_stops_an_ingest_batch_until_released(env):
+    import threading
+
+    from trader.trading.command_stack import _LiquidationDispatch
+
+    applied = threading.Event()
+
+    def ingest_batch():
+        env.ingest.on_open_order(_stop_trade("p-1-reprotect-265598-1", 2))
+        env.ingest.drain_once()
+        applied.set()
+
+    with _LiquidationDispatch(env.dispatch, None).hold_broker_changes():
+        writer = threading.Thread(target=ingest_batch)
+        writer.start()
+        assert not applied.wait(0.3)                        # the batch waits for the hold
+        assert env.store.select_active_orders_in_tx(env.journal.connect()) == []
+        assert env.ingest.is_ready in (True, False)         # the holder may read readiness (reentrant)
+    writer.join(timeout=5)
+    assert applied.is_set() and len(env.store.select_active_orders_in_tx(env.journal.connect())) == 1
+
+
+def test_broker_changes_cannot_be_held_while_a_generation_is_staging(env):
+    from trader.trading.liquidation_service import BrokerChangesBusy
+
+    env.ingest.begin_generation()
+    with pytest.raises(BrokerChangesBusy, match="staging"):
+        with env.dispatch.hold_broker_changes():
+            pass
+    env.ingest.abandon_generation("test")
+    with env.dispatch.hold_broker_changes():
+        pass
+
+
+def test_broker_changes_cannot_be_held_without_an_ingest():
+    from trader.trading.liquidation_service import BrokerChangesBusy
+
+    with pytest.raises(BrokerChangesBusy):
+        TradingRuntimeOrderDispatch(SimpleNamespace()).hold_broker_changes()
+```
+
 - [ ] **Step 2: Run them to verify they fail**
 
 Run: `.venv/bin/python -m pytest tests/test_liquidation_service.py -q --timeout=30`
@@ -6329,10 +6736,8 @@ Expected: 38 failed (`PARTIAL_CLOSE_UNAVAILABLE`, `AttributeError: ... 'upgrade_
             outcome, root = self._store.transaction(
                 lambda conn: self._claim_account_in_tx(conn, account_id, cause_command_id, deadline))
         elif scope == "conid":
-            if conid is None:
-                raise ValueError("conid scope requires a conid")
-            outcome, root = self._claim_scoped(account_id, cause_command_id, int(conid), quantity,
-                                               deadline, stop_price, target_price)
+            outcome, root = self._claim_scoped(account_id, cause_command_id, _exact_conid(conid),
+                                               _requested_quantity(quantity), deadline, stop_price, target_price)
         else:
             raise ValueError(f"unknown liquidation scope {scope!r}")
         if outcome in (CLAIMED, "EXISTING"):
@@ -6343,7 +6748,7 @@ Expected: 38 failed (`PARTIAL_CLOSE_UNAVAILABLE`, `AttributeError: ... 'upgrade_
     def _claim_scoped(self, account_id, cause, conid, quantity, deadline, stop_price, target_price):
         """D15: a retry finds its root first; a partial request then learns ExitInProgress, and
         only a new partial request is admitted against a broker snapshot before it claims."""
-        requested = None if quantity is None else float(quantity)
+        requested = quantity
         goal = "zero" if requested is None else "partial"
         existing = self._store.transaction(lambda conn: self._existing_in_tx(
             conn, account_id, cause, conid=conid, goal=goal, quantity=requested))
@@ -6413,6 +6818,18 @@ Expected: 38 failed (`PARTIAL_CLOSE_UNAVAILABLE`, `AttributeError: ... 'upgrade_
         return float(shares)
 ```
 
+   Next to `_exact_conid` (Task 5), add (ruling 51: a quantity is never coerced either):
+
+```python
+def _requested_quantity(quantity) -> Optional[float]:
+    """A partial quantity is a finite real number (not a bool, not a string); None is a full close."""
+    if quantity is None:
+        return None
+    if isinstance(quantity, bool) or not isinstance(quantity, numbers.Real) or not math.isfinite(quantity):
+        raise LiquidationRefused("PARTIAL_QUANTITY_INVALID", f"quantity must be a finite number, got {quantity!r}")
+    return float(quantity)
+```
+
 3. Replace `_tick`, `_on_deadline` and `_cleanup`:
 
 ```python
@@ -6435,6 +6852,7 @@ Expected: 38 failed (`PARTIAL_CLOSE_UNAVAILABLE`, `AttributeError: ... 'upgrade_
             return self._snapshot_unavailable(receipt, f"broker evidence unavailable: {exc}")
         receipt = self._fence_unsent(receipt, snapshot, newest)
         receipt = self._observe_children(receipt, snapshot, newest)
+        receipt = self._observe_late_fills(receipt, newest)
         if self._now() >= receipt.deadline:
             # The deadline decides on this tick's evidence: an UNKNOWN child means FAILED_SAFE (R31).
             return self._on_deadline(receipt)
@@ -6616,8 +7034,11 @@ Expected: 38 failed (`PARTIAL_CLOSE_UNAVAILABLE`, `AttributeError: ... 'upgrade_
         was refused, rejected, cancelled or lost is a re-protect failure (never sent again).
 
         #22: DONE is decided from one read of each leg's row. A row that no
-        longer matches the child is observed again instead of finishing, and
-        the rows are read once more right before the terminal write.
+        longer matches the child is observed again instead of finishing. Only
+        a ``WORKING`` leg on a ``Submitted``/``PreSubmitted`` row is healthy
+        protection; ``PendingCancel`` is not (ruling 47). The terminal write
+        commits while broker changes are held, after the rows, the position
+        and the generation are read again (ruling 48).
         """
         generation = int(snapshot.generation_id)
         stop, target = self._working_legs(receipt)
@@ -6628,8 +7049,8 @@ Expected: 38 failed (`PARTIAL_CLOSE_UNAVAILABLE`, `AttributeError: ... 'upgrade_
         if position is None:
             # R26: a target fill cancels its OCA stop (or the stop filled): the position was closed by an exit.
             return self._finish_reprotect_closed(receipt, snapshot, working)
-        if stop.state == "CANCELLED" and target is not None and target.state in ("WORKING", "FILLED") \
-                and generation <= stop.observed_generation:
+        if stop.state in ("CANCELLED", "PENDING_CANCEL") and target is not None \
+                and target.state in ("WORKING", "FILLED") and generation <= stop.observed_generation:
             # R26: a target fill cancels its OCA stop; judge the cancel together with the target
             # and the position on a newer generation, never on the callback that came first.
             return self._wait(receipt, generation, "reconciling an OCA stop cancel with its target")
@@ -6637,6 +7058,11 @@ Expected: 38 failed (`PARTIAL_CLOSE_UNAVAILABLE`, `AttributeError: ... 'upgrade_
             return self._escalate_now(receipt, snapshot, f"REPROTECT_FAILED: stop leg {stop.state}")
         remaining = abs(float(position.quantity))
         if target is not None and target.state == "PLANNED":
+            status = self._leg_status(stop)
+            if status not in _BROKER_HEALTHY:
+                # Ruling 47: the target is sent only next to a stop whose row is healthy right now.
+                receipt = self._observe_children(receipt, snapshot, int(self._dispatch.newest_generation()))
+                return self._wait(receipt, generation, f"stop leg row is {status}, not healthy protection")
             sized = replace(target, state="UNKNOWN", quantity=remaining, fence_generation=generation)
 
             def promote(conn):
@@ -6666,24 +7092,61 @@ Expected: 38 failed (`PARTIAL_CLOSE_UNAVAILABLE`, `AttributeError: ... 'upgrade_
             if leg.outstanding_quantity != remaining:
                 return self._wait(receipt, generation,
                                   f"{leg.child_id} outstanding {leg.outstanding_quantity} != position {remaining}")
-        if [self._leg_fingerprint(self._leg_row(leg)) for leg in legs] != [self._leg_fingerprint(r) for r in rows]:
-            return self._wait(receipt, generation, "a re-protect leg changed while DONE was decided; reading it again")
         state = self._partial_outcome(receipt)
         detail = ("re-protect legs working in one OCA group for the remaining quantity" if state == "DONE" else
                   "the partial reduce sold nothing; the position is protected again, the close failed")
-        return self._finish(receipt, state, generation_id=generation, remaining_quantity=remaining, detail=detail)
+        return self._finish_held(receipt, state, generation=generation, legs=legs, rows=rows,
+                                 remaining=remaining, detail=detail)
+
+    def _finish_held(self, receipt, state: str, *, generation: int, legs, rows, remaining: float,
+                     detail: str) -> LiquidationReceipt:
+        """Ruling 48: DONE / REDUCE_FAILED and the owner release commit while broker changes are held.
+
+        Under the hold no ingest batch or generation promote can write, so
+        the rows, position and generation read again here are the ones the
+        terminal transaction commits against. Any change since the decision,
+        or a hold that cannot be taken, waits for the next tick.
+        """
+        try:
+            with self._dispatch.hold_broker_changes():
+                why = self._changed_since_decision(receipt, generation, legs, rows, remaining)
+                if why is None:
+                    self._commit_terminal(receipt, state, generation_id=generation,
+                                          remaining_quantity=remaining, detail=detail)
+        except BrokerChangesBusy as ex:
+            why = f"broker changes could not be held: {ex}"
+        if why is not None:
+            return self._wait(receipt, generation, f"{state} not committed: {why}")
+        return self._after_terminal(receipt, state, detail)
+
+    def _changed_since_decision(self, receipt, generation: int, legs, rows, remaining: float) -> Optional[str]:
+        try:
+            if [self._leg_fingerprint(self._leg_row(leg)) for leg in legs] != [self._leg_fingerprint(r) for r in rows]:
+                return "a re-protect leg row changed since the decision"
+            snapshot = self._broker.capture(receipt.account_id)
+        except Exception as ex:  # an unreadable broker is a reason to decide again, never to finish
+            return f"broker evidence unreadable under the hold: {ex}"
+        if int(snapshot.generation_id) != generation:
+            return f"broker generation moved from {generation} to {snapshot.generation_id}"
+        position = self._position_for(snapshot, receipt.conid)
+        if position is None or abs(float(position.quantity)) != remaining:
+            return "the position changed since the decision"
+        return None
 
     @staticmethod
     def _leg_changed(leg: ChildRef, row) -> bool:
-        """#22: True when the leg's row no longer says what the WORKING child recorded."""
+        """#22: True when the leg's row no longer says what the WORKING child recorded.
+
+        Only ``Submitted`` / ``PreSubmitted`` count: a ``PendingCancel`` row is changed (ruling 47).
+        """
         filled = float(getattr(row, "filled_quantity", 0.0) or 0.0)
         total = float(getattr(row, "total_quantity", 0.0) or 0.0)
-        return (getattr(row, "status", None) not in _BROKER_ACCEPTED or filled != leg.filled_quantity
+        return (getattr(row, "status", None) not in _BROKER_HEALTHY or filled != leg.filled_quantity
                 or max(total - filled, 0.0) != leg.outstanding_quantity)
 
     @staticmethod
     def _leg_fingerprint(row) -> Optional[tuple]:
-        """Everything DONE reads from a leg's row; it must not change before the terminal write (#22)."""
+        """Everything DONE reads from a leg's row; it must not change before the terminal write (#22, ruling 48)."""
         if row is None:
             return None
         return tuple(getattr(row, field, None) for field in
@@ -6729,17 +7192,109 @@ Expected: 38 failed (`PARTIAL_CLOSE_UNAVAILABLE`, `AttributeError: ... 'upgrade_
         return self._advance_conid(self._store.receipt(receipt.cause_command_id), snapshot)
 ```
 
+6. PendingCancel and the held terminal write (rulings 47, 48). In Task 4's code:
+
+   - constants: `CHILD_STATES` gains `"PENDING_CANCEL"`, and add
+     ```python
+     # Live at the broker: blocks every new reduce. Only WORKING is healthy protection (ruling 47).
+     CHILD_LIVE = ("WORKING", "PENDING_CANCEL")
+     CHILD_OPEN = ("UNKNOWN",) + CHILD_LIVE
+     _BROKER_HEALTHY = frozenset({"PreSubmitted", "Submitted"})
+     ```
+   - `_evidence`: a `PendingCancel` row is its own state, checked before `_BROKER_ACCEPTED`:
+     ```python
+             elif status == "PendingCancel":
+                 state = "PENDING_CANCEL"  # still live (it blocks), but never healthy protection (ruling 47)
+     ```
+     (`_legacy_evidence` keeps `PendingCancel` as `WORKING`: a wildcard child only blocks.)
+   - `_observe_children` re-reads `child.state in CHILD_OPEN`; `_blocking` blocks on `child.state in CHILD_LIVE` (detail `f"{child.child_id} still working ({child.state})"`); the cancels a root already sent cover their target while `c.state in CHILD_OPEN`; `inherit_children_in_tx` moves `state IN ('UNKNOWN', 'WORKING', 'PENDING_CANCEL')`. `_cancel_targets` still takes only `WORKING` legs: a leg pending cancellation is not cancelled again.
+   - a new error and port method (`from typing import ..., ContextManager`):
+     ```python
+     class BrokerChangesBusy(RuntimeError):
+         """Broker writes could not be held (lock busy, or a generation is staging); decide again later."""
+
+     # LiquidationDispatchPort
+         def hold_broker_changes(self) -> ContextManager[None]:
+             """No broker row or position changes while held; raises ``BrokerChangesBusy`` (ruling 48)."""
+     ```
+   - `_finish` splits so the DONE path can commit inside the hold and clean up after it:
+
+```python
+    def _finish(self, receipt, state: str, *, generation_id=None, detail="", **fields) -> LiquidationReceipt:
+        """(docstring unchanged)"""
+        self._commit_terminal(receipt, state, generation_id=generation_id, detail=detail, **fields)
+        return self._after_terminal(receipt, state, detail)
+
+    def _commit_terminal(self, receipt, state: str, *, generation_id=None, detail="", **fields) -> None:
+        root = receipt.cause_command_id
+        owner_state = STATE_RELEASED if state in OWNER_RELEASED_STATES else STATE_FAILED_SAFE
+
+        def write(conn):
+            run = self._store.get_run_in_tx(conn, root)
+            updated = replace(run, state=state, detail=detail, cleanup_pending=True,
+                              generation_id=run.generation_id if generation_id is None else generation_id,
+                              **fields)
+            self._store.update_run_in_tx(conn, updated, self._now())
+            self._store.drop_planned_in_tx(conn, root, self._now())
+            self._registry.finish_in_tx(conn, root, owner_state, self._now())
+        self._store.transaction(write)
+
+    def _after_terminal(self, receipt, state: str, detail: str) -> LiquidationReceipt:
+        root = receipt.cause_command_id
+        if self._breaker is not None and self._trips_breaker(receipt, state):
+            self._breaker.trip_liquidation(root, detail or state)
+        return self._cleanup(self._store.receipt(root))
+```
+
+   `trader/trading/broker_ingest.py`: `_apply_lock` becomes a `threading.RLock()` (the holder reads the snapshot, whose readiness check takes the lock again), and add (`from contextlib import contextmanager`):
+
+```python
+    @contextmanager
+    def hold_changes(self, timeout_seconds: float = 2.0):
+        """No broker row or position changes while held (SP1 ruling 48).
+
+        Live batches apply under ``_apply_lock``; a promote runs only while a
+        generation is staging, and staging begins under the same lock. So
+        holding the lock with no generation staging stops every broker write.
+        Raises ``BrokerChangesBusy`` when the lock is not free in time or a
+        generation is staging. Keep the held section short: ingest waits.
+        """
+        from trader.trading.liquidation_service import BrokerChangesBusy
+        if not self._apply_lock.acquire(timeout=timeout_seconds):
+            raise BrokerChangesBusy(f"broker ingest busy for more than {timeout_seconds}s")
+        try:
+            if self._generation is not None:
+                raise BrokerChangesBusy(f"broker generation {self._generation.generation_id} is staging")
+            yield
+        finally:
+            self._apply_lock.release()
+```
+
+   `TradingRuntimeOrderDispatch` (`trader/trading/trading_runtime.py`), next to `newest_generation`:
+
+```python
+    def hold_broker_changes(self):
+        """``BrokerIngest.hold_changes`` for the close's terminal write (SP1 ruling 48)."""
+        from trader.trading.liquidation_service import BrokerChangesBusy
+        ingest = getattr(self._trader, 'broker_ingest', None)
+        if ingest is None:
+            raise BrokerChangesBusy('no broker ingest to hold')
+        return ingest.hold_changes()
+```
+
+   `_LiquidationDispatch` (`trader/trading/command_stack.py`): `def hold_broker_changes(self): return self._dispatch.hold_broker_changes()`.
+
 Notes: `_escalate` never captures a snapshot; `_escalate_now` continues on the snapshot it holds, and `escalated=True` makes a second deadline miss `FAILED_SAFE`, so there is no loop. There is no `_retry_leg`: R30.
 
 - [ ] **Step 4: Run the tests**
 
-Run: `.venv/bin/python -m pytest tests/test_liquidation_service.py -q --timeout=30`
-Expected: 104 passed.
+Run: `.venv/bin/python -m pytest tests/test_liquidation_service.py tests/test_close_broker_evidence.py -q --timeout=30`
+Expected: all PASS (104 in `test_liquidation_service.py` before round 4; the round-4 tests are added on top).
 
 - [ ] **Step 5: Commit**
 
 ```bash
-git add trader/trading/liquidation_service.py tests/test_liquidation_service.py
+git add trader/trading/liquidation_service.py trader/trading/broker_ingest.py trader/trading/trading_runtime.py trader/trading/command_stack.py tests/test_liquidation_service.py tests/test_close_broker_evidence.py
 git commit -m "feat: partial close with a linked re-protect and escalation
 
 Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>"
@@ -8307,6 +8862,24 @@ def test_dispatch_place_exit_leg_derives_side_and_type(loop_thread):
         dispatch.place_exit_leg(_position(-6.0), leg="trail", quantity=6.0, price=1.0, oca_group="g", order_ref="mmr:x")
 
 
+@pytest.mark.parametrize("position,quantity,price", [
+    (_MALFORMED_POSITIONS["no symbol"], 6.0, 95.0),
+    (_MALFORMED_POSITIONS["fractional conid"], 6.0, 95.0),
+    (_MALFORMED_POSITIONS["None quantity"], 6.0, 95.0),
+    (_malformed(), None, 95.0),
+    (_malformed(), 6.0, None),
+    (_malformed(), 6.0, float("nan")),
+], ids=["no symbol", "fractional conid", "None position quantity", "None quantity", "None price", "NaN price"])
+@pytest.mark.parametrize("leg", ["stop", "target"])
+def test_a_malformed_exit_leg_is_refused_before_anything_is_scheduled(loop_thread, leg, position, quantity, price):
+    """#38, ruling 52: a leg built from bad input is NOT_SENT; the close never waits on it as UNKNOWN."""
+    trader = _SpyTrader(loop_thread.loop)
+    with pytest.raises(DispatchRefused) as ex:
+        TradingRuntimeOrderDispatch(trader, dispatch_timeout=2.0).place_exit_leg(
+            position, leg=leg, quantity=quantity, price=price, oca_group="g", order_ref="mmr:x")
+    assert ex.value.code == "REDUCE_ONLY_REFUSED" and trader.scheduled == []
+
+
 def test_liquidation_dispatch_sends_exit_legs_with_the_child_id_as_order_ref():
     from trader.trading.command_stack import _LiquidationDispatch
 
@@ -8435,19 +9008,24 @@ index 1b2e1738..7ae619bf 100644
              return 'no ib_account is configured on the trader'
 @@ -2527,6 +2554,18 @@ class TradingRuntimeOrderDispatch:
              self._refuse('a partial reduce needs a whole quantity strictly between 0 and the position')
-         return self._reduce_only(position, side, quantity, order_ref)
+         return self._reduce_only(position, contract, held, side, size, order_ref)
  
 +    def place_exit_leg(self, position, *, leg: str, quantity: float, price: float,
 +                       oca_group: str, order_ref: str):
 +        """One exit-only leg (stop or target) of a re-protect OCA pair."""
 +        if leg not in ('stop', 'target'):
 +            self._refuse(f'unknown exit leg {leg!r}')
-+        side = self._reducing_side(position)
++        contract, held, size = self._close_inputs(position, quantity)
++        try:
++            limit = _finite_number(price, 'price')
++        except (TypeError, ValueError) as ex:
++            self._refuse(f'malformed exit leg price: {ex}')
++        side = self._side_for(held)
 +        if side is None:
 +            self._refuse('no position to protect')
-+        return self._reduce_only(position, side, quantity, order_ref,
++        return self._reduce_only(position, contract, held, side, size, order_ref,
 +                                 order_type='STP' if leg == 'stop' else 'LMT',
-+                                 price=float(price), oca_group=oca_group)
++                                 price=limit, oca_group=oca_group)
 +
      def cancel_on_loop(self, order_entity_id: str, order_ref: str):
          """``cancel`` for the liquidation worker (R34, ruling 7).
@@ -9672,6 +10250,7 @@ from __future__ import annotations
 import asyncio
 import datetime as dt
 import threading
+from contextlib import contextmanager
 from dataclasses import replace
 from decimal import Decimal
 from types import SimpleNamespace
@@ -9687,6 +10266,7 @@ from trader.data.duckdb_store import DuckDBConnection
 from trader.data.schema_migrations import SchemaMigrator
 from trader.trading.command_coordinator import CommandRequest
 from trader.trading.command_policy import CommandAuthorityPolicy
+from trader.trading.liquidation_service import BrokerChangesBusy
 from trader.trading.order_correlation import classify_leg, decode_order_ref
 from trader.trading.risk_gate import RiskGate, RiskLimits
 from trader.trading.trading_runtime import Trader
@@ -9728,6 +10308,13 @@ class _Ingest:
     @property
     def is_ready(self):
         return self.ready
+
+    @contextmanager
+    def hold_changes(self):
+        """Ruling 48: the sim writes only inside a sync, so holding is refusing while one is staging."""
+        if not self.ready:
+            raise BrokerChangesBusy("broker generation is staging")
+        yield
 
     async def run_broker_sync(self, _client):
         self.syncs += 1

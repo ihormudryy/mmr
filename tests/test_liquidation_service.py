@@ -904,3 +904,166 @@ def test_old_failed_safe_runs_reduces_are_tracked_even_with_no_run_open_at_the_u
     s.service.rescan()                                       # 6: complete and newer, no row: ABSENT
     s.service.rescan()                                       # 7: newer than that observation: reduce
     assert s.dispatch.calls == [("reduce", 1, "SELL", 10.0, "flat-new-reduce-1-1")]
+
+# ---------------------------------------------------------------------------
+# Task 5: conid-scoped full close
+# ---------------------------------------------------------------------------
+
+def _stop_order(entity="stop-1", conid=1, group="og-entry-1", quantity=10.0):
+    return BrokerOrderRow(
+        order_entity_id=entity, account_id=ACCOUNT, conid=conid, symbol="AAPL",
+        order_group_id=group, leg="stop", is_external=False, action="SELL", order_type="STP",
+        total_quantity=quantity, filled_quantity=0, avg_fill_price=None, limit_price=None,
+        stop_price=95.0, tif="DAY", status="Submitted", deleted=False, revision=1,
+        source_timestamp=NOW,
+    )
+
+
+def test_full_close_hands_over_then_cancels_only_that_conids_orders(tmp_path):
+    protection = _Protection()
+    s = _stack(tmp_path, [_snapshot(1, [_position(), _position(5.0, conid=2)],
+                                    [_stop_order(), _stop_order("stop-2", conid=2, group="og-entry-2")])],
+               protection=protection)
+    receipt = s.service.start(ACCOUNT, "close-1", DEADLINE, scope="conid", conid=1)
+    assert protection.calls[0] == ("handover", 1, "close-1", ("stop-1",))
+    assert (receipt.state, receipt.phase) == ("VERIFYING", "cancel")
+    assert s.dispatch.calls == [("cancel", "stop-1", "close-1-cancel-1-1")]
+    child = receipt.children[0]
+    assert (child.kind, child.target_order_entity_id, child.fence_generation) == ("cancel", "stop-1", 1)
+    assert s.breaker.calls == []
+
+
+def test_full_close_reduces_only_after_the_cancel_is_terminal(tmp_path):
+    """D2: the stop's own row is the evidence. Cancelled with no fill allows the reduce, even on the same generation."""
+    s = _stack(tmp_path, [
+        _snapshot(1, [_position()], [_stop_order()]),
+        _snapshot(1, [_position()], [_stop_order()]),
+        _snapshot(1, [_position()], []),
+    ], protection=_Protection())
+    s.service.start(ACCOUNT, "close-1", DEADLINE, scope="conid", conid=1)
+    s.dispatch.entities["stop-1"] = _stop_order()                # the cancel has not landed yet
+    assert "still working" in s.service.rescan().detail
+    assert [c[0] for c in s.dispatch.calls] == ["cancel"]
+    s.dispatch.entities["stop-1"] = _row("Cancelled")
+    receipt = s.service.rescan()
+    assert receipt.phase == "reduce"
+    assert s.dispatch.calls[-1] == ("reduce", 1, "SELL", 10.0, "close-1-reduce-1-1")
+
+
+def test_full_close_waits_while_the_cancelled_stop_is_invisible(tmp_path):
+    """#21: the stop's row is gone on a generation that opened before the cancel; that proves nothing."""
+    s = _stack(tmp_path, [_snapshot(1, [_position()], [_stop_order()]), _snapshot(2, [_position()], [])],
+               protection=_Protection())
+    s.dispatch.staging = 1
+    s.service.start(ACCOUNT, "close-1", DEADLINE, scope="conid", conid=1)
+    s.dispatch.staging = 0
+    receipt = s.service.rescan()
+    assert "outcome unknown" in receipt.detail
+    assert [c[0] for c in s.dispatch.calls] == ["cancel"]
+
+
+def test_invisible_reduce_child_on_a_newer_generation_gets_no_second_scoped_reduce(tmp_path):
+    s = _stack(tmp_path, [_snapshot(1, [_position()]), _snapshot(2, [_position()])], protection=_Protection())
+    s.dispatch.staging = 1
+    s.service.start(ACCOUNT, "close-1", NOW + dt.timedelta(seconds=30), scope="conid", conid=1)
+    s.dispatch.staging = 0
+    s.service.rescan()
+    s.clock["now"] = NOW + dt.timedelta(seconds=31)
+    assert s.service.rescan().state == "FAILED_SAFE"
+    assert [c[0] for c in s.dispatch.calls] == ["reduce"]
+
+
+def test_filled_callback_after_position_capture_gets_no_second_scoped_reduce(tmp_path):
+    s = _stack(tmp_path, [_snapshot(1, [_position()]), _snapshot(2, [_position()]), _snapshot(3, [])],
+               protection=_Protection())
+    s.service.start(ACCOUNT, "close-1", DEADLINE, scope="conid", conid=1)
+    s.dispatch.rows["close-1-reduce-1-1"] = [_row("Filled", filled=10.0)]
+    s.service.rescan()
+    assert s.service.rescan().state == "CLOSED"
+    assert [c[0] for c in s.dispatch.calls] == ["reduce"]
+
+
+def test_full_close_ends_closed_and_releases_owner_and_saga(tmp_path):
+    protection = _Protection()
+    s = _stack(tmp_path, [_snapshot(1, [_position()]), _snapshot(2, []), _snapshot(3, [])], protection=protection)
+    s.service.start(ACCOUNT, "close-1", DEADLINE, scope="conid", conid=1)
+    s.dispatch.rows["close-1-reduce-1-1"] = [_row("Filled", filled=10.0)]
+    s.service.rescan()
+    assert s.service.rescan().state == "CLOSED"
+    assert protection.calls[-1] == ("close_after_full", "close-1")
+    assert s.registry.get("close-1").state == "RELEASED"
+    assert s.breaker.calls == []
+
+
+def test_close_ends_closed_without_reduce_when_the_stop_filled_in_the_cancel_race(tmp_path):
+    """Review focus 3."""
+    protection = _Protection()
+    s = _stack(tmp_path, [_snapshot(1, [_position()], [_stop_order()]), _snapshot(2, [], []), _snapshot(3, [], [])],
+               protection=protection)
+    s.service.start(ACCOUNT, "close-1", DEADLINE, scope="conid", conid=1)
+    s.dispatch.entities["stop-1"] = _row("Filled", filled=10.0)
+    assert s.service.rescan().state == "VERIFYING"           # the stop fill is a fill: wait one more generation
+    assert s.service.rescan().state == "CLOSED"
+    assert [c[0] for c in s.dispatch.calls] == ["cancel"]
+    assert ("close_after_full", "close-1") in protection.calls
+
+
+def test_full_close_of_short_reduces_with_buy(tmp_path):
+    """Review focus 1."""
+    s = _stack(tmp_path, [_snapshot(1, [_position(-7.0)])], protection=_Protection())
+    s.service.start(ACCOUNT, "close-1", DEADLINE, scope="conid", conid=1)
+    assert s.dispatch.calls == [("reduce", 1, "BUY", 7.0, "close-1-reduce-1-1")]
+
+
+def test_full_close_ignores_another_conids_position(tmp_path):
+    other = _position(5.0, conid=2)
+    s = _stack(tmp_path, [_snapshot(1, [_position(), other]), _snapshot(2, [other]), _snapshot(3, [other])],
+               protection=_Protection())
+    s.service.start(ACCOUNT, "close-1", DEADLINE, scope="conid", conid=1)
+    s.dispatch.rows["close-1-reduce-1-1"] = [_row("Filled", filled=10.0)]
+    s.service.rescan()
+    assert s.service.rescan().state == "CLOSED"
+    assert all(c[1] == 1 for c in s.dispatch.calls)
+
+
+def test_scoped_close_deadline_is_failed_safe_and_trips_breaker(tmp_path):
+    s = _stack(tmp_path, [_snapshot(1, [_position()])], protection=_Protection())
+    receipt = s.service.start(ACCOUNT, "close-1", NOW, scope="conid", conid=1)
+    assert receipt.state == "FAILED_SAFE"
+    assert s.dispatch.calls == []
+    assert s.breaker.calls == [("close-1", receipt.detail)]
+
+
+def test_cancel_rejected_by_the_broker_ends_failed_safe_without_reduce(tmp_path):
+    """Spec test list: cancel rejected. The stop stays working; no reduce is ever sent."""
+    s = _stack(tmp_path, [_snapshot(1, [_position()], [_stop_order()]), _snapshot(2, [_position()], [_stop_order()])],
+               protection=_Protection())
+    s.service.start(ACCOUNT, "close-1", NOW + dt.timedelta(seconds=30), scope="conid", conid=1)
+    s.dispatch.entities["stop-1"] = _row("Submitted")
+    assert "still working" in s.service.rescan().detail
+    s.clock["now"] = NOW + dt.timedelta(seconds=31)
+    assert s.service.rescan().state == "FAILED_SAFE"
+    assert [c[0] for c in s.dispatch.calls] == ["cancel"]
+
+
+def test_routine_scoped_progress_never_trips_the_breaker(tmp_path):
+    s = _stack(tmp_path, [_snapshot(1, [_position()], [_stop_order()]), _snapshot(2, [_position()], []),
+                          _snapshot(3, []), _snapshot(4, [])], protection=_Protection())
+    s.service.start(ACCOUNT, "close-1", DEADLINE, scope="conid", conid=1)
+    s.dispatch.entities["stop-1"] = _row("Cancelled")
+    s.service.rescan()
+    s.dispatch.rows["close-1-reduce-1-1"] = [_row("Filled", filled=10.0)]
+    s.service.rescan()
+    assert s.service.rescan().state == "CLOSED"
+    assert s.breaker.calls == []
+
+
+def test_start_refuses_rebinding_root_to_another_scope(tmp_path):
+    """Review focus 4."""
+    s = _stack(tmp_path, [_snapshot(1, [_position(), _position(5.0, conid=2)])], protection=_Protection())
+    s.service.start(ACCOUNT, "root-1", DEADLINE)
+    with pytest.raises(ValueError):
+        s.service.start(ACCOUNT, "root-1", DEADLINE, scope="conid", conid=1)
+    s.service.start(ACCOUNT, "root-2", DEADLINE, scope="conid", conid=2)
+    with pytest.raises(ValueError):
+        s.service.start(ACCOUNT, "root-2", DEADLINE, scope="conid", conid=1)

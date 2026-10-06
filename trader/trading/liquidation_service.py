@@ -666,6 +666,13 @@ class LiquidationService:
                 raise ValueError("account scope takes no conid or quantity")
             outcome, root = self._store.transaction(
                 lambda conn: self._claim_account_in_tx(conn, account_id, cause_command_id, deadline))
+        elif scope == "conid":
+            if conid is None:
+                raise ValueError("conid scope requires a conid")
+            if quantity is not None:
+                raise LiquidationRefused("PARTIAL_CLOSE_UNAVAILABLE", "partial closes arrive in plan 1 task 6")
+            outcome, root = self._store.transaction(lambda conn: self._claim_scoped_in_tx(
+                conn, account_id, cause_command_id, int(conid), quantity, deadline, stop_price, target_price))
         else:
             raise ValueError(f"unknown liquidation scope {scope!r}")
         if outcome in (CLAIMED, "EXISTING"):
@@ -723,6 +730,23 @@ class LiquidationService:
         self._store.inherit_children_in_tx(conn, account_id=account_id, conid=None, to_root_id=cause, now=now)
         return (CLAIMED, cause)
 
+    def _claim_scoped_in_tx(self, conn, account_id, cause, conid, quantity, deadline, stop_price, target_price):
+        goal = "zero" if quantity is None else "partial"
+        existing = self._existing_in_tx(conn, account_id, cause, conid=conid, goal=goal, quantity=quantity)
+        if existing is not None:
+            return existing
+        now = self._now()
+        claim = self._registry.claim_scoped_in_tx(conn, account_id=account_id, conid=conid, root_id=cause,
+                                                  goal_quantity=quantity, now=now)
+        self._store.record_join_in_tx(conn, JoinRow(cause, claim.root_id, account_id, conid, claim.outcome,
+                                                    goal, quantity), now)
+        if claim.outcome == CLAIMED:
+            self._store.insert_run_in_tx(conn, LiquidationReceipt(
+                account_id, cause, "REQUESTED", deadline, scope="conid", conid=conid, goal=goal,
+                goal_quantity=quantity, stop_price=stop_price, target_price=target_price), now)
+            self._store.inherit_children_in_tx(conn, account_id=account_id, conid=conid, to_root_id=cause, now=now)
+        return (claim.outcome, claim.root_id)
+
     # -- one step of one root --------------------------------------------------------
 
     def _tick(self, root_id: str) -> Optional[LiquidationReceipt]:
@@ -744,7 +768,9 @@ class LiquidationService:
             return self._snapshot_unavailable(receipt, "broker snapshot account mismatch")
         receipt = self._fence_unsent(receipt, snapshot, newest)
         receipt = self._observe_children(receipt, snapshot, newest)
-        return self._advance_account(receipt, snapshot)
+        if receipt.scope == "account":
+            return self._advance_account(receipt, snapshot)
+        return self._advance_conid(receipt, snapshot)
 
     def _snapshot_unavailable(self, receipt, detail):
         state = "OUTCOME_UNKNOWN" if receipt.scope == "account" else "VERIFYING"
@@ -1123,6 +1149,55 @@ class LiquidationService:
                           "reduction submitted; awaiting broker evidence")
 
     # -- conid scope --------------------------------------------------------------------
+
+    @staticmethod
+    def _position_for(snapshot, conid: int):
+        for position in snapshot.positions:
+            if int(position.conid) == int(conid) and float(position.quantity) != 0.0:
+                return position
+        return None
+
+    @staticmethod
+    def _working_for(snapshot, conid: int) -> tuple:
+        return tuple(o for o in snapshot.working_orders if int(o.conid) == int(conid))
+
+    def _cancel_conid_orders(self, receipt, snapshot, working) -> LiquidationReceipt:
+        """Hand over the orders about to be cancelled (D6), then cancel them."""
+        generation = int(snapshot.generation_id)
+        conid = int(receipt.conid)
+        targets = self._cancel_targets(receipt, working, conid)
+        if receipt.phase == "" or targets:
+            info = HandoverInfo(None, None)
+            if self._protection is not None:
+                info = self._protection.handover(
+                    account_id=receipt.account_id, conid=conid, close_root_id=receipt.cause_command_id,
+                    cancels=_targets(targets), generation=generation, now=self._now())
+            if receipt.phase == "":
+                receipt = self._set(
+                    receipt, "CANCELLING" if working else "VERIFYING", generation_id=generation, phase="cancel",
+                    opened_generation=generation,
+                    stop_price=receipt.stop_price if receipt.stop_price is not None else info.stop_price,
+                    target_price=receipt.target_price if receipt.target_price is not None else info.target_price,
+                    detail="protection handed over to the close")
+        return self._send_cancels(receipt, snapshot, targets)
+
+    def _advance_conid(self, receipt, snapshot) -> LiquidationReceipt:
+        generation = int(snapshot.generation_id)
+        conid = int(receipt.conid)
+        working = self._working_for(snapshot, conid)
+        position = self._position_for(snapshot, conid)
+        receipt = self._cancel_conid_orders(receipt, snapshot, working)
+        why = self._blocking(receipt, generation)
+        if why is not None:
+            return self._wait(receipt, generation, f"awaiting child confirmation: {why}")
+        if working:
+            return self._wait(receipt, generation, "awaiting broker confirmation that conid orders are gone")
+        if position is None:
+            if generation <= self._last_action_generation(receipt):
+                return self._wait(receipt, generation, "awaiting a newer generation to prove the position is closed")
+            return self._finish(receipt, "CLOSED", generation_id=generation,
+                                detail="fresh broker generation shows no position and no working orders for conid")
+        return self._submit_reduces(receipt, snapshot, (position,))
 
     # -- re-protect (exit-only OCA, R13) ------------------------------------------------
 

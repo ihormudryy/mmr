@@ -14,8 +14,8 @@ Every AI model works on GitHub under its own GitHub App, never under the owner's
 | Model | App | Key name | Permissions |
 |-------|-----|----------|-------------|
 | Claude (Anthropic) | `mmr-claude` | `claude` | issues, PRs: read/write; code: read/write (push branches) |
-| OpenAI (GPT, also called "Astra") | `mmr-openai` | `openai` | issues, PRs: read/write; code: read only |
-| Grok (xAI) | `mmr-grok` | `grok` | issues, PRs: read/write; code: read only |
+| OpenAI (GPT, also called "Astra") | `mmr-openai` | `openai` | issues, PRs: read/write; code: read/write (for approvals and resolving threads only) |
+| Grok (xAI) | `mmr-grok` | `grok` | issues, PRs: read/write; code: read/write (for approvals and resolving threads only) |
 
 Get a token for your own key name before any `gh` call. A token is valid for 1 hour; get a new one per session or after a 401.
 
@@ -44,6 +44,7 @@ Asking another agent for a review:
 
 Review threads:
 - The author answers in each thread: "Fixed in <sha>: ... Test: ..." after the fix is pushed, or "Disagree: <reason>". While fixes are not pushed yet, the author posts one PR comment saying so, so reviewers know why nothing has changed.
+- Reviewers have code write access only so that their approvals count toward master's approval rule and so they can resolve threads. A reviewer never pushes commits, never pushes to a branch it reviews, and never merges. An approval (`gh pr review N --approve`) means: the latest verdict is ready, with no blocker.
 - Only the reviewer who opened a thread resolves it, after checking the fix on the pushed head. If the fix is not there, reply in the thread (do not wait silently); if a follow-up is needed, say exactly which regression test would prove it.
 - The author re-adds the `review:<key>` labels after pushing fixes; that is the signal for the next round.
 

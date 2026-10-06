@@ -40,6 +40,8 @@ SAGA_STATES = frozenset({
     "CLOSE_OWNED",
 })
 
+# A stop that protects a released remainder: accepted and working, or already filled as the exit.
+_RELEASE_STOP_STATUSES = frozenset({"PreSubmitted", "Submitted", "Filled"})
 _WORKING_STATUSES = frozenset({
     "PendingSubmit", "PreSubmitted", "Submitted", "ApiPending", "PendingCancel",
 })
@@ -931,7 +933,12 @@ class ProtectiveOrderSaga:
                 released = self._apply_event(released, BrokerOrderEvent(
                     target_group, "take_profit", target_status or "Unknown", 0.0, float(remaining), 0,
                     f"release:{close_root_id}:target", now))
-            if keeper.pending_protection_lost or released.state not in ("PROTECTED", "EXITING", "CLOSED"):
+            # #22 round 5: the stop row can change after DONE committed and before this read. Live
+            # event handling counts PendingCancel (and not-yet-accepted statuses) as working; at
+            # release they are not protection.
+            stop_accepted = stop_status in _RELEASE_STOP_STATUSES
+            if keeper.pending_protection_lost or not stop_accepted \
+                    or released.state not in ("PROTECTED", "EXITING", "CLOSED"):
                 released = replace(released, state="SAFETY_FAILED", flatten_requested=True,
                                    error_code=released.error_code or "PROTECTION_LOST_DURING_CLOSE")
             closed = [replace(s, state="CLOSED", close_root_id=None, error_code="PROTECTION_MERGED",

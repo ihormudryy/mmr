@@ -1203,13 +1203,18 @@ def test_pending_replacement_legs_are_bound_before_release_and_their_loss_is_rem
     assert liquidation.starts[0][1] == intent.command_id
 
 
-def test_release_with_a_stop_that_is_not_working_at_the_broker_is_an_incident(tmp_path):
-    """#25: the release takes the legs' broker status; it never assumes they work."""
+@pytest.mark.parametrize("stop_status", ["Cancelled", "PendingCancel", "PendingSubmit", "ApiPending"])
+def test_release_with_a_stop_that_is_not_working_at_the_broker_is_an_incident(tmp_path, stop_status):
+    """#25: the release takes the legs' broker status; it never assumes they work.
+
+    #22 round 5: the stop row can turn PendingCancel after DONE was committed under the hold and
+    before this release reads it. A stop that is pending cancel (or not yet accepted) is not
+    protection, although live event handling counts it as working."""
     saga, intent, state, breaker, liquidation = _protected(tmp_path)
     saga.handover(account_id=ACCOUNT, conid=CONID, close_root_id="p-1",
                   cancels=_cancels(state.order_group_id, "og:stop"), generation=7, now=NOW)
     saga.release_after_partial(close_root_id="p-1", remaining_quantity=6.0,
-                               stop_group="p-1-reprotect-stop-265598-1", stop_status="Cancelled",
+                               stop_group="p-1-reprotect-stop-265598-1", stop_status=stop_status,
                                target_group=None, target_status=None, now=NOW)
     assert saga.resume(intent.command_id).state == "SAFETY_FAILED"
     assert any(s.kind == "PROTECTIVE_ORDER_FAILURE" for s in breaker.signals)

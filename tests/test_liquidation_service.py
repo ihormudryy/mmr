@@ -96,6 +96,7 @@ class _Dispatch:
         self.staging = 0
         self.complete = True
         self.before_hold = None                # an ingest batch applied just before the hold is taken
+        self.after_hold = None                 # an ingest batch applied right after the hold is let go
         self.hold_busy = False
         self.holds = 0
         self.executions: dict[str, float] = {}  # order entity id -> executions bound to it
@@ -158,6 +159,8 @@ class _Dispatch:
             yield
         finally:
             self.broker.held = False
+            if self.after_hold is not None:
+                self.after_hold()
 
 
 class _Breaker:
@@ -2485,3 +2488,43 @@ def test_an_unlinked_stop_at_target_admission_escalates(tmp_path):
     receipt = s.service.rescan()
     assert receipt.escalated and receipt.goal == "zero"
     assert any("not a linked protective leg" in detail for _root, detail in s.breaker.calls)
+
+
+def test_a_stop_fill_after_the_admission_hold_sends_no_target_of_the_old_size(tmp_path):
+    """#22 round 7 (grok): under the admission hold the position is +6 and the stop outstanding 6.
+    Right after the hold the stop fills 2 (still Submitted) and the position is +4. The target is
+    sent only from a read under a new hold just before the send, so no target of 6 goes out."""
+    s, _ = _to_reprotect(tmp_path, extra=(_snapshot(4, [_priced(6.0)]), _snapshot(5, [_priced(4.0)]),
+                                          _snapshot(6, [_priced(4.0)])))
+    s.dispatch.rows["p-1-reprotect-stop-1-1"] = [_leg_row()]
+
+    def stop_fills_2_after_the_hold():
+        s.dispatch.after_hold = None
+        s.dispatch.rows["p-1-reprotect-stop-1-1"] = [_leg_row(filled=2.0)]
+        s.broker.current, s.broker.last = _snapshot(5, [_priced(4.0)]), 5
+        s.broker.snapshots = [_snapshot(6, [_priced(4.0)])]
+    s.dispatch.after_hold = stop_fills_2_after_the_hold
+    receipt = s.service.rescan()                                          # gen 4
+    assert not any(c[0] == "place_exit_leg" and c[2] == "target" for c in s.dispatch.calls)
+    assert next(c for c in receipt.children if c.kind == "reprotect-target").state == "PLANNED"
+    s.service.rescan()                                                    # gen 6: sized from the live 4
+    targets = [c for c in s.dispatch.calls if c[0] == "place_exit_leg" and c[2] == "target"]
+    assert [c[3] for c in targets] == [4.0]
+
+
+def test_a_working_target_larger_than_the_position_is_cancelled_and_the_close_escalates(tmp_path):
+    """#22 round 7 (grok) safety net: a target of 6 went out, then the stop's earlier fill of 2 shows
+    and the position is +4. Nothing shrinks a target placed after that fill, so it could sell 6 of 4.
+    The tick cancels it and escalates to a full close instead of waiting."""
+    s, _ = _to_reprotect(tmp_path, extra=(_snapshot(4, [_priced(6.0)]), _snapshot(5, [_priced(4.0)]),
+                                          _snapshot(6, [_priced(4.0)]), _snapshot(7, [_priced(4.0)])))
+    s.dispatch.rows["p-1-reprotect-stop-1-1"] = [_leg_row(entity="stop-e")]
+    s.service.rescan()                                                    # gen 4: target of 6 sent
+    s.dispatch.rows["p-1-reprotect-stop-1-1"] = [_leg_row(filled=2.0, entity="stop-e")]
+    s.dispatch.rows["p-1-reprotect-target-1-1"] = [_leg_row(entity="target-e")]
+    s.service.rescan()                                                    # gen 5: the fill is new
+    receipt = s.service.rescan()                                          # gen 6
+    assert (receipt.goal, receipt.escalated) == ("zero", True)
+    assert any("target" in detail for _root, detail in s.breaker.calls)
+    assert any(c[0] == "cancel" and c[1] == "target-e" for c in s.dispatch.calls)
+    assert s.service.close_resolution("p-1") is None

@@ -1629,6 +1629,11 @@ class LiquidationService:
             if self._leg_changed(leg, row):
                 receipt = self._observe_children(receipt, snapshot, int(self._dispatch.newest_generation()))
                 return self._wait(receipt, generation, f"{leg.child_id} changed since it was observed; observed again")
+            if leg is target and leg.outstanding_quantity > remaining:
+                # #22 round 7: OCA shrinks a sibling only for a fill after both legs were in the group.
+                # A target sent after the stop's fill keeps its size and could sell more than is held.
+                return self._escalate_now(receipt, snapshot, f"REPROTECT_FAILED: target outstanding "
+                                          f"{leg.outstanding_quantity} > position {remaining}")
             if leg.outstanding_quantity != remaining:
                 return self._wait(receipt, generation,
                                   f"{leg.child_id} outstanding {leg.outstanding_quantity} != position {remaining}")
@@ -1645,17 +1650,19 @@ class LiquidationService:
 
     def _send_target(self, receipt, snapshot, stop: ChildRef, target: ChildRef, position,
                      generation: int) -> LiquidationReceipt:
-        """#22 rounds 5-6: the target is admitted on evidence read while broker changes are held.
+        """#22 rounds 5-7: the target is admitted on evidence read while broker changes are held.
 
         Under the hold the stop's row and the position are read together. The
         target is reserved only when the generation and the signed position
         are the ones decided on and the stop is healthy, linked in the OCA
         group, reducing, with its outstanding equal to the position; it is
         sized from that position. The send runs after the hold (its
-        acknowledgement can take the dispatch timeout) and only if the stop
-        row is still healthy just before it; otherwise the target goes back
-        to PLANNED, never sent. A stop that goes away after the send is
-        caught by the next tick (stop not WORKING escalates and cancels the target).
+        acknowledgement can take the dispatch timeout), and only when the same
+        admission, read again under a new hold just before it, gives the same
+        size; otherwise the target goes back to PLANNED, never sent. A change
+        after that last read is caught by the next tick: a stop that is no
+        longer WORKING, or a target larger than the position, escalates and
+        cancels the target.
         """
         try:
             with self._dispatch.hold_broker_changes():
@@ -1673,13 +1680,28 @@ class LiquidationService:
         if problem == "changed":
             return self._wait(receipt, generation, f"re-protect target not admitted: {why}")
         if reserved:
-            status = self._leg_status(stop)
-            if status not in _BROKER_HEALTHY:
+            why = self._target_still_admitted(receipt, stop, sized, held, generation)
+            if why is not None:
                 self._store.transaction(lambda conn: self._store.update_child_in_tx(conn, target, self._now()))
-                return self._stop_not_healthy(receipt, snapshot, generation, status)
+                receipt = self._observe_children(receipt, snapshot, int(self._dispatch.newest_generation()))
+                return self._wait(receipt, generation, f"re-protect target not sent: {why}")
             self._send_leg(receipt, sized, held)
         return self._wait(self._store.receipt(receipt.cause_command_id), generation,
                           "re-protect target submitted for the live remaining position")
+
+    def _target_still_admitted(self, receipt, stop: ChildRef, sized: ChildRef, position,
+                               generation: int) -> Optional[str]:
+        """#22 round 7: the admission again, under a new hold right before the send; None to send."""
+        try:
+            with self._dispatch.hold_broker_changes():
+                problem, why, held = self._target_admission(receipt, stop, position, generation)
+        except BrokerChangesBusy as ex:
+            return f"broker changes could not be held: {ex}"
+        if problem is not None:
+            return why
+        if abs(float(held.quantity)) != sized.quantity:
+            return f"position {abs(float(held.quantity))} != reserved target {sized.quantity}"
+        return None
 
     def _target_admission(self, receipt, stop: ChildRef, position, generation: int):
         """(problem, why, held position); problem is None, 'unhealthy', 'unlinked' or 'changed'. Call under the hold."""

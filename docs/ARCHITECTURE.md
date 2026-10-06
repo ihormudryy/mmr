@@ -24,7 +24,7 @@ Detail moved out of `AGENTS.md`. The short rules an agent must follow stay in `A
 
 ## Services
 
-Production Docker runs **split services** (not one monolithic process). The CLI and dashboard talk to trader/strategy over **typed HMAC RPC**; legacy dill RPC on 42001 is unbound unless offline simulation explicitly enables it.
+Production Docker runs **split services** (not one monolithic process). The CLI and dashboard talk to trader/strategy over **typed Ed25519 RPC** (one key per principal, allow-list in `trader/messaging/principals.py`); legacy dill RPC on 42001 is unbound unless offline simulation explicitly enables it.
 
 ```
 trader.trader_service ──► Trader (trading_runtime.py)
@@ -61,7 +61,7 @@ scheduler (pycron) ──► cron jobs only (data refresh, backups) — not the 
 
 **Messaging (pyzmq)**: Inter-process communication uses ZeroMQ (not HTTP) for latency and pub/sub. Two layers:
 
-**Typed HMAC RPC (production)** — JSON-safe request/reply on ROUTER sockets with HMAC service authentication (`trader/messaging/typed_rpc.py`). Trader query **42101**, command **42102**, feed **42103**; strategy command **42104**, query **42105**. The CLI/SDK and dashboard use this path for portfolio, resolve, propose/approve, strategies list/enable/disable/reload, snapshots, etc. Direct `buy`/`sell`/`cancel`/`set_risk_limits` are **not** registered on the production command surface (BYPASS methods) — use `propose` → `approve` or the dashboard command center; offline simulation can bind legacy dill RPC with `unsafe_legacy_rpc: true` + `--simulation True`.
+**Typed Ed25519 RPC (production)** — JSON-safe request/reply on ROUTER sockets (`trader/messaging/typed_rpc.py`). Each principal (`trader`, `strategy`, `cli`, `dashboard`, `ai_supervisor`, `ai_research`) signs with its own Ed25519 key; the request names the principal and its destination (server, role, method), and every response is signed by the server and bound to the request digest. Each registered method has an allow-list entry in `trader/messaging/principals.py` (`TRADER_ACL`, `STRATEGY_ACL`); a caller outside it gets `PERMISSION_DENIED`. Command authority (live approve = `dashboard`, `execute_automated_intent` = `strategy`) comes from the verified principal, never the body. No HMAC mode. Trader query **42101**, command **42102**, feed **42103**; strategy command **42104**, query **42105**. The CLI/SDK and dashboard use this path for portfolio, resolve, propose/approve, strategies list/enable/disable/reload, snapshots, etc. Direct `buy`/`sell`/`cancel`/`set_risk_limits` are **not** registered on the production command surface (BYPASS methods) — use `propose` → `approve` or the dashboard command center; offline simulation can bind legacy dill RPC with `unsafe_legacy_rpc: true` + `--simulation True`.
 
 **Legacy dill RPC** (`trader/messaging/clientserver.py`) — DEALER/ROUTER + msgpack (including dill ExtType). Ports **42001** (trader), **42003** (data), **42005** (strategy). Unbound for trader in split-container production. Still used by data_service and some IB-only tools (scanner, options resolve) when available.
 
@@ -135,6 +135,15 @@ Do **not** run `start_mmr.sh` inside split containers (it collides on ports/clie
 
 IB Gateway API ports map to host `7496` (live) / `7497` (paper); VNC at `5901`.
 
+RPC keys (Docker):
+
+```bash
+./docker.sh -k              # RPC keys: mmr keys init in the one-shot keygen container
+./docker.sh -k --rotate dashboard   # Rotate one principal (restart the listed services together)
+./docker.sh -k --backup     # Encrypted (age) backup of keys/rpc
+docker compose run --rm cli strategies   # CLI commands that need the strategy ports
+```
+
 Storage layout (host paths):
 - `~/.local/share/mmr/logs/` — bind mount
 - `~/.local/share/mmr/tws_settings/` — IB session state
@@ -181,7 +190,7 @@ User configs live in `~/.config/mmr/`. On first run, bundled defaults from `conf
 
 **`~/.config/mmr/logging.yaml`**: Python logging config (Rich console handler + rotating file handlers).
 
-**`.env`** (gitignored): IB Gateway credentials (`TWS_USERID`, `TWS_PASSWORD`, `TRADING_MODE`, `IB_ACCOUNT`). Typed RPC service authentication in split Docker uses `~/.config/mmr/service_hmac.key` (mode `0600`), exposed via `MMR_SERVICE_HMAC_KEY_FILE`.
+**`.env`** (gitignored): IB Gateway credentials (`TWS_USERID`, `TWS_PASSWORD`, `TRADING_MODE`, `IB_ACCOUNT`). Typed RPC authentication uses one Ed25519 keypair per principal in `~/.config/mmr/keys/rpc/` (`<principal>.key` mode `0600`, `<principal>.pub`), created by `mmr keys init` (Docker: `./docker.sh -k`). Each container mounts only its own private key and the public keys it needs. The SDK signs as `cli` unless `MMR_RPC_PRINCIPAL` names `ai_supervisor` / `ai_research`. The old `service_hmac.key` is retired (ignored with a warning; delete it by hand after the cutover, see `docs/OPERATIONAL_STATE.md`).
 
 ## Logging
 
@@ -191,11 +200,11 @@ Logs are written to `~/.local/share/mmr/logs/` with per-session timestamps (e.g.
 
 | Port  | Protocol | Service / role |
 |-------|----------|----------------|
-| 42101 | Typed query (HMAC) | trader — production CLI/dashboard reads |
-| 42102 | Typed command (HMAC) | trader — propose/approve, cancels via command center |
-| 42103 | Typed feed (HMAC) | trader — internal (not host-published) |
-| 42104 | Typed command (HMAC) | strategy — enable/disable/reload |
-| 42105 | Typed query (HMAC) | strategy — list_strategies |
+| 42101 | Typed query (Ed25519) | trader — production CLI/dashboard reads |
+| 42102 | Typed command (Ed25519) | trader — propose/approve, cancels via command center |
+| 42103 | Typed feed (Ed25519) | trader — internal (not host-published) |
+| 42104 | Typed command (Ed25519) | strategy — enable/disable/reload |
+| 42105 | Typed query (Ed25519) | strategy — list_strategies |
 | 42002 | PubSub | ticker broadcast |
 | 42003 | Legacy RPC | data_service |
 | 42005 | Legacy RPC | strategy (compat) |
@@ -223,5 +232,5 @@ Key behaviour-focused test files:
 - `test_portfolio_risk.py::TestSignedExposure` — hedged vs stacked correlation clusters, long/short exposure breakdown
 - `test_duckdb_store.py::TestConcurrentAccess` — multi-thread write serialization
 - `test_container.py::TestContainerHardening` — missing-param diagnostics, env-var coercion, YAML safety
-- `test_production_rpc_security.py` / `test_sdk.py` — typed HMAC surface, CLI routing away from unbound 42001
+- `test_production_rpc_security.py` / `test_sdk.py` — typed RPC surface, CLI routing away from unbound 42001
 - `test_web_dashboard.py` — command center + deploy routes

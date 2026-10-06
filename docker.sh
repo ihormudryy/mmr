@@ -27,11 +27,21 @@ echo_usage() {
     echo "      trader, data, strategy, dashboard, scheduler, ib-gateway)"
     echo "  -n (news: bring up the news scraper stack at \$NEWS_DIR)"
     echo "  -B [name] (backup DuckDB files to ~/.local/share/mmr/backups/)"
+    echo "  -k [--rotate P] (RPC keys: mmr keys init in the one-shot keygen container)"
+    echo "  -k --backup [--recipient FILE] (encrypt keys/rpc with age)"
+    echo "  -k --restore FILE [--identity-file PATH [--delete-identity-file]]"
+    echo "      (restore keys/rpc; the age identity is read from stdin by default)"
     echo
 }
 
-b=n c=n f=n u=n d=n s=n a=n g=n l=n e=n i=n r=n n=n B=n
+b=n c=n f=n u=n d=n s=n a=n g=n l=n e=n i=n r=n n=n B=n k=n
 BACKUP_NAME=""
+KEYS_ACTION="init"
+KEYS_ROTATE=""
+KEYS_RECIPIENT=""
+KEYS_ARCHIVE=""
+KEYS_IDENTITY_FILE=""
+KEYS_DELETE_IDENTITY_FILE=n
 EXEC_SERVICE="trader"
 
 # Parse and validate before probing Docker or Podman. An invalid requested
@@ -58,7 +68,24 @@ while [[ $# -gt 0 ]]; do
     -i|--ib-only) i=y; shift ;;
     -r|--restart-ib) r=y; shift ;;
     -n|--news) n=y; shift ;;
+    -k|--keys) k=y; shift ;;
+    --rotate)
+      [[ $# -ge 2 ]] || { echo "--rotate needs a principal"; exit 1; }
+      KEYS_ROTATE="$2"; shift 2 ;;
+    --recipient)
+      [[ $# -ge 2 ]] || { echo "--recipient needs a file"; exit 1; }
+      KEYS_RECIPIENT="$2"; shift 2 ;;
+    --restore)
+      [[ $# -ge 2 ]] || { echo "--restore needs a backup file"; exit 1; }
+      KEYS_ACTION="restore"; KEYS_ARCHIVE="$2"; shift 2 ;;
+    --identity-file)
+      [[ $# -ge 2 ]] || { echo "--identity-file needs a path"; exit 1; }
+      KEYS_IDENTITY_FILE="$2"; shift 2 ;;
+    --delete-identity-file) KEYS_DELETE_IDENTITY_FILE=y; shift ;;
     -B|--backup)
+      if [[ $k == "y" ]]; then
+        KEYS_ACTION="backup"; shift; continue
+      fi
       B=y
       shift
       if [[ $# -gt 0 && ! "$1" =~ ^- ]]; then
@@ -75,7 +102,7 @@ while [[ $# -gt 0 ]]; do
   esac
 done
 
-if [[ $b == "n" && $c == "n" && $f == "n" && $u == "n" && $d == "n" && $s == "n" && $a == "n" && $g == "n" && $l == "n" && $e == "n" && $i == "n" && $r == "n" && $n == "n" && $B == "n" ]]; then
+if [[ $b == "n" && $c == "n" && $f == "n" && $u == "n" && $d == "n" && $s == "n" && $a == "n" && $g == "n" && $l == "n" && $e == "n" && $i == "n" && $r == "n" && $n == "n" && $B == "n" && $k == "n" ]]; then
     echo_usage
     exit 0
 fi
@@ -491,22 +518,41 @@ check_env() {
     fi
 }
 
-_read_service_hmac_key_file() {
-    grep -E '^[[:space:]]*service_hmac_key_file[[:space:]]*:' "$1" 2>/dev/null \
-        | head -n1 \
-        | sed -E 's/^[[:space:]]*service_hmac_key_file[[:space:]]*:[[:space:]]*//' \
-        | sed -E "s/^['\"]//; s/['\"][[:space:]]*$//" \
-        | sed -E 's/[[:space:]]+$//' || true
+# The shared HMAC key is retired (SP1 Plan 2, ruling 14). Remove the yaml
+# line (keeping a .bak) and remind the operator about the key file. Nothing
+# here ever deletes service_hmac.key: rollback to a pre-cutover commit needs it.
+_retire_hmac_config() {
+    local trader_config="$1"
+    if grep -q -E '^[[:space:]]*service_hmac_key_file[[:space:]]*:' "$trader_config"; then
+        sed -i.bak -E '/^[[:space:]]*service_hmac_key_file[[:space:]]*:/d' "$trader_config"
+        echo "Removed the retired service_hmac_key_file line from $trader_config (backup: ${trader_config}.bak)"
+    fi
+    if [[ -e "$HOME/.config/mmr/service_hmac.key" ]]; then
+        echo "Note: retired HMAC key left in place at ~/.config/mmr/service_hmac.key;"
+        echo "      delete it when the cutover is verified (see docs/OPERATIONAL_STATE.md, RPC keys)."
+    fi
 }
 
-_write_portable_service_hmac_key_file() {
-    local yaml_file="$1"
-    local portable_path='~/.config/mmr/service_hmac.key'
-    if grep -q -E '^[[:space:]]*service_hmac_key_file[[:space:]]*:' "$yaml_file"; then
-        sed -i.bak "s|^[[:space:]]*service_hmac_key_file:.*|service_hmac_key_file: ${portable_path}|" "$yaml_file"
-        rm -f "${yaml_file}.bak"
-    else
-        printf '\nservice_hmac_key_file: %s\n' "$portable_path" >> "$yaml_file"
+# Every host key file docker-compose.yml binds, read from the compose file
+# itself (no second principal list). A missing per-file bind source would make
+# Docker create a directory in its place, so refuse before any compose call.
+_compose_rpc_key_files() {
+    grep -oE '\$\{HOME\}/\.config/mmr/keys/rpc/[a-z_]+\.(key|pub)' "$BUILDDIR/docker-compose.yml" \
+        | sed -E 's|^.*/||' | sort -u
+}
+
+_require_rpc_keys() {
+    local keys_dir="$HOME/.config/mmr/keys/rpc"
+    local missing="" name
+    for name in $(_compose_rpc_key_files); do
+        if [[ ! -f "$keys_dir/$name" || -L "$keys_dir/$name" ]]; then
+            missing="$missing $name"
+        fi
+    done
+    if [[ -n "$missing" ]]; then
+        echo "Error: RPC key files missing or not regular files in $keys_dir:$missing"
+        echo "Run ./docker.sh -k (mmr keys init in the keygen container) first."
+        exit 1
     fi
 }
 
@@ -514,9 +560,6 @@ ensure_split_config() {
     local config_dir="$HOME/.config/mmr"
     local trader_config="$config_dir/trader.yaml"
     local default_config
-    local configured_key
-    local portable_path='~/.config/mmr/service_hmac.key'
-    local host_key="$config_dir/service_hmac.key"
 
     mkdir -p "$config_dir"
     for default_config in "$BUILDDIR"/config_defaults/*.yaml; do
@@ -529,23 +572,7 @@ ensure_split_config() {
         exit 1
     fi
 
-    configured_key="$(_read_service_hmac_key_file "$trader_config")"
-    if [[ "$configured_key" == "$HOME/.config/mmr/service_hmac.key" ]]; then
-        # This is the old host-only spelling produced by start_mmr.sh. It
-        # names the same mounted file, so normalization is safe and makes it
-        # resolve correctly inside /home/trader as well.
-        _write_portable_service_hmac_key_file "$trader_config"
-        configured_key="$portable_path"
-    fi
-
-    if [[ -z "$configured_key" || "$configured_key" == "$portable_path" ]]; then
-        if [[ ! -f "$host_key" ]]; then
-            ( umask 177 && head -c 48 /dev/urandom > "$host_key" )
-            chmod 600 "$host_key"
-            echo "Provisioned local service HMAC key at $host_key"
-        fi
-        _write_portable_service_hmac_key_file "$trader_config"
-    fi
+    _retire_hmac_config "$trader_config"
 }
 
 build() {
@@ -573,6 +600,7 @@ reclaim_build_cache() {
 }
 
 up() {
+    _require_rpc_keys
     ensure_split_config
     check_env
     print_api_keys
@@ -877,6 +905,88 @@ sync_all() {
 
 }
 
+_known_principals() {
+    _compose_rpc_key_files | sed -E 's/\.(key|pub)$//' | sort -u
+}
+
+_check_rpc_key_modes() {
+    local keys_dir="$1" f mode
+    for f in "$keys_dir"/*.key "$keys_dir"/*.pub; do
+        [[ -e "$f" ]] || continue
+        mode="$(stat -c '%a' "$f" 2>/dev/null || stat -f '%Lp' "$f")"
+        case "$f" in
+            *.key) [[ "$mode" == "600" ]] || { echo "Error: $f has mode $mode, expected 600"; exit 1; } ;;
+            *.pub) [[ "$mode" == "644" ]] || { echo "Error: $f has mode $mode, expected 644"; exit 1; } ;;
+        esac
+    done
+}
+
+keys() {
+    local keys_dir="$HOME/.config/mmr/keys/rpc"
+    local user_spec
+    user_spec="$(id -u):$(id -g)"
+    if [[ -n "$KEYS_ROTATE" ]] && ! _known_principals | grep -qx -- "$KEYS_ROTATE"; then
+        echo "Error: unknown principal '$KEYS_ROTATE' (expected one of: $(_known_principals | tr '\n' ' '))"
+        exit 1
+    fi
+    # Create the bind source first so Docker never creates it as root.
+    mkdir -p "$keys_dir"
+    chmod 700 "$keys_dir"
+    case "$KEYS_ACTION" in
+        init)
+            if [[ -n "$KEYS_ROTATE" ]]; then
+                $COMPOSE -f "$BUILDDIR/docker-compose.yml" run --rm --no-deps --user "$user_spec" \
+                    keygen init --rotate "$KEYS_ROTATE"
+            else
+                $COMPOSE -f "$BUILDDIR/docker-compose.yml" run --rm --no-deps --user "$user_spec" \
+                    keygen init
+            fi
+            _check_rpc_key_modes "$keys_dir"
+            ;;
+        backup)
+            local recipient="${KEYS_RECIPIENT:-$HOME/.config/mmr/keys/rpc_backup_recipient.txt}"
+            if [[ ! -f "$recipient" ]]; then
+                echo "Error: no age recipient file at $recipient"
+                echo "Create an age key pair, keep the identity in 1Password, and save only the"
+                echo "public recipient: age-keygen | ... ; echo 'age1...' > $recipient"
+                exit 1
+            fi
+            local backup_dir="$HOME/.local/share/mmr/backups/rpc_keys"
+            mkdir -p "$backup_dir"
+            chmod 700 "$backup_dir"
+            local stamp
+            stamp="$(date -u +%Y%m%dT%H%M%SZ)"
+            $COMPOSE -f "$BUILDDIR/docker-compose.yml" run --rm --no-deps --user "$user_spec" \
+                -v "$recipient:/recipient.txt:ro" -v "$backup_dir:/backups" \
+                keygen backup --recipient /recipient.txt --out "/backups/rpc_keys_${stamp}.tar.age"
+            ;;
+        restore)
+            if [[ ! -f "$KEYS_ARCHIVE" ]]; then
+                echo "Error: backup file not found: $KEYS_ARCHIVE"
+                exit 1
+            fi
+            local archive
+            archive="$(cd "$(dirname "$KEYS_ARCHIVE")" && pwd)/$(basename "$KEYS_ARCHIVE")"
+            if [[ -n "$KEYS_IDENTITY_FILE" ]]; then
+                $COMPOSE -f "$BUILDDIR/docker-compose.yml" run --rm --no-deps -T --user "$user_spec" \
+                    -v "$archive:/restore/archive.tar.age:ro" -v "$KEYS_IDENTITY_FILE:/identity:ro" \
+                    keygen restore /restore/archive.tar.age --identity-file /identity
+                if [[ $KEYS_DELETE_IDENTITY_FILE == "y" ]]; then
+                    : >| "$KEYS_IDENTITY_FILE"
+                    rm -f -- "$KEYS_IDENTITY_FILE"
+                fi
+            else
+                # The identity streams from this script's stdin straight into
+                # the container; it is never written to disk or put on argv.
+                $COMPOSE -f "$BUILDDIR/docker-compose.yml" run --rm --no-deps -T --user "$user_spec" \
+                    -v "$archive:/restore/archive.tar.age:ro" \
+                    keygen restore /restore/archive.tar.age --identity-stdin
+            fi
+            _check_rpc_key_modes "$keys_dir"
+            ;;
+    esac
+}
+
 echo "action: build=$b clean=$c force=$f up=$u down=$d sync=$s sync_all=$a go=$g logs=$l exec=$e ib-only=$i restart-ib=$r news=$n backup=$B${BACKUP_NAME:+($BACKUP_NAME)} | runtime: $RUNTIME"
 
 if [[ $b == "y" ]]; then
@@ -926,4 +1036,7 @@ if [[ $g == "y" ]]; then
 fi
 if [[ $B == "y" ]]; then
     backup
+fi
+if [[ $k == "y" ]]; then
+    keys
 fi

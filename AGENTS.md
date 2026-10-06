@@ -85,15 +85,15 @@ Production Docker runs split services, one per container (`docker-compose.yml`):
 - **scheduler** (pycron): cron jobs only (data refresh, backups). Not a process supervisor.
 - **ib-gateway**: IB Gateway. Host ports `7496` live, `7497` paper; VNC `5901`.
 
-The CLI, SDK and dashboard talk to trader and strategy over **typed RPC**: JSON-safe pydantic messages, authenticated with HMAC (`trader/messaging/typed_rpc.py`, key file `~/.config/mmr/service_hmac.key`). The **legacy dill RPC** (`clientserver.py`) can run code on load; trader's port 42001 is unbound in production and only offline simulation turns it on. Ed25519 signatures are used for research attestations and paper-automation bundles, not for RPC.
+The CLI, SDK and dashboard talk to trader and strategy over **typed RPC** (`trader/messaging/typed_rpc.py`): JSON-safe pydantic messages signed with Ed25519. Each principal (`trader`, `strategy`, `cli`, `dashboard`, `ai_supervisor`, `ai_research`) has its own key pair in `~/.config/mmr/keys/rpc/` (`mmr keys init`; Docker `./docker.sh -k`). Every method has an allow-list entry in `trader/messaging/principals.py`; other callers get `PERMISSION_DENIED`. Command authority comes from the verified principal, never the body. No HMAC mode. The **legacy dill RPC** (`clientserver.py`) can run code on load; trader's port 42001 is unbound in production and only offline simulation turns it on. Research attestations and paper-automation bundles use separate Ed25519 keys; an RPC key is never accepted as a bundle key.
 
 | Port  | Protocol | Service / role |
 |-------|----------|----------------|
-| 42101 | Typed query (HMAC) | trader: CLI/dashboard reads |
-| 42102 | Typed command (HMAC) | trader: propose/approve, cancels |
-| 42103 | Typed feed (HMAC) | trader: internal |
-| 42104 | Typed command (HMAC) | strategy: enable/disable/reload |
-| 42105 | Typed query (HMAC) | strategy: list strategies |
+| 42101 | Typed query (Ed25519) | trader: CLI/dashboard reads |
+| 42102 | Typed command (Ed25519) | trader: propose/approve, cancels |
+| 42103 | Typed feed (Ed25519) | trader: internal |
+| 42104 | Typed command (Ed25519) | strategy: enable/disable/reload |
+| 42105 | Typed query (Ed25519) | strategy: list strategies |
 | 42002 | PubSub | ticker broadcast |
 | 42003 | Legacy RPC | data_service |
 | 42005 | Legacy RPC | strategy (compat) |
@@ -115,7 +115,7 @@ Top-level directories:
   - `auto_execute: propose` turns signals into PENDING proposals; `auto_execute: true` (full auto) is refused at load.
   - On paper an LLM may approve after its own evaluation. On live, a human must approve (`LLM_LIVE_APPROVE_FORBIDDEN`).
   - `automation.live_enabled` stays `false`. Automated paper entries need a signed, bound research bundle (see [docs/PAPER_AUTOMATION_SETUP.md](docs/PAPER_AUTOMATION_SETUP.md)).
-- **Never print secrets.** No tokens, API keys, `.env` values, HMAC keys or signing keys in logs, output, commits or PR text.
+- **Never print secrets.** No tokens, API keys, `.env` values, RPC private keys or signing keys in logs, output, commits or PR text.
 - **YAML:** load untrusted YAML with `yaml.safe_load`. No `!!python/object` tags.
 - **DuckDB:** access the database only through `DuckDBConnection.execute` / `execute_atomic` (short-lived connection under a lock). Never hold a long-lived connection; several services share the file.
 - **Dill:** keep dill off the production surface. `MMR_DILL_STRICT=1` refuses arbitrary objects.

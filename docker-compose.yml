@@ -89,6 +89,17 @@ x-mmr-common-env: &mmr-common-env
   # never auto-loaded), together with the `--simulation` flag the
   # fail-loud guard in trading_runtime.py's _fake_broker_enabled() requires.
 
+# RPC identity keys (SP1 Plan 2, spec 5.3). Each service mounts the whole
+# ~/.config/mmr, then a tmpfs over keys/rpc hides every host key, then
+# per-file read-only binds put back only that service's own private key and
+# the public keys it needs (trader.messaging.principals.peers_for). No
+# container mounts another principal's private key. Trap: a per-file bind of a
+# host file that does not exist makes Docker create a DIRECTORY in its place,
+# and the service then fails with a confusing error -- `./docker.sh -u`
+# refuses first when any referenced key file is missing (run ./docker.sh -k).
+# The retired service_hmac.key is hidden behind /dev/null in every container
+# that mounts ~/.config/mmr.
+
 x-mmr-hardening: &mmr-hardening
   # One shared image tag across all five services: `docker compose build`
   # builds it exactly once (identical build context/Dockerfile + identical
@@ -175,6 +186,15 @@ services:
       ZMQ_DATA_RPC_SERVER_ADDRESS: tcp://0.0.0.0
     volumes:
       - ${HOME}/.config/mmr:/home/trader/.config/mmr
+      # RPC keys: tmpfs hides the host keys/rpc dir; only this principal's
+      # private key and the public keys it needs are bound back in (read-only).
+      - type: tmpfs
+        target: /home/trader/.config/mmr/keys/rpc
+        tmpfs:
+          size: 65536
+          mode: 0755
+      # Retired shared HMAC key: unreadable in every container (ruling 14).
+      - /dev/null:/home/trader/.config/mmr/service_hmac.key:ro
       - mmr_db_data:/home/trader/.local/share/mmr/data
       - ${HOME}/.local/share/mmr/logs:/home/trader/.local/share/mmr/logs
     healthcheck:
@@ -213,12 +233,9 @@ services:
       # trading_runtime.py's typed_bind_address (G0 Task 5 fix). Feed
       # (42103) binds 0.0.0.0 too but is never host-published (see ports).
       TYPED_BIND_ADDRESS: tcp://0.0.0.0
-      # CLI inside this container (`mmr resolve`) uses the same HMAC key file
-      # as the typed server. Absolute path avoids '~' expansion surprises
-      # when trader.yaml still has the portable spelling.
-      MMR_SERVICE_HMAC_KEY_FILE: /home/trader/.config/mmr/service_hmac.key
-      # Strategy typed sockets live on the strategy container — needed when
-      # `mmr strategies` runs inside trader (list/enable/disable/reload).
+      # The trader's own strategy-control/hot-arm clients reach the strategy
+      # container here. (The `cli` key is never mounted in this container, so
+      # `mmr` CLI commands run in the one-shot `cli` service instead.)
       STRATEGY_TYPED_ADDRESS: tcp://strategy
       MMR_TYPED_STRATEGY_QUERY_ENDPOINT: tcp://strategy:42105
       MMR_TYPED_STRATEGY_COMMAND_ENDPOINT: tcp://strategy:42104
@@ -232,6 +249,21 @@ services:
       # typed feed (42103) intentionally NOT published -- private network only
     volumes:
       - ${HOME}/.config/mmr:/home/trader/.config/mmr
+      # RPC keys: tmpfs hides the host keys/rpc dir; only this principal's
+      # private key and the public keys it needs are bound back in (read-only).
+      - type: tmpfs
+        target: /home/trader/.config/mmr/keys/rpc
+        tmpfs:
+          size: 65536
+          mode: 0755
+      - ${HOME}/.config/mmr/keys/rpc/trader.key:/home/trader/.config/mmr/keys/rpc/trader.key:ro
+      - ${HOME}/.config/mmr/keys/rpc/ai_research.pub:/home/trader/.config/mmr/keys/rpc/ai_research.pub:ro
+      - ${HOME}/.config/mmr/keys/rpc/ai_supervisor.pub:/home/trader/.config/mmr/keys/rpc/ai_supervisor.pub:ro
+      - ${HOME}/.config/mmr/keys/rpc/cli.pub:/home/trader/.config/mmr/keys/rpc/cli.pub:ro
+      - ${HOME}/.config/mmr/keys/rpc/dashboard.pub:/home/trader/.config/mmr/keys/rpc/dashboard.pub:ro
+      - ${HOME}/.config/mmr/keys/rpc/strategy.pub:/home/trader/.config/mmr/keys/rpc/strategy.pub:ro
+      # Retired shared HMAC key: unreadable in every container (ruling 14).
+      - /dev/null:/home/trader/.config/mmr/service_hmac.key:ro
       - mmr_db_data:/home/trader/.local/share/mmr/data
       - ${HOME}/.local/share/mmr/logs:/home/trader/.local/share/mmr/logs
       # Paper-automation Activate (dashboard hot-arm) reads the bundles that
@@ -305,11 +337,21 @@ services:
       # Without this the runtime falls back to TYPED_BIND_ADDRESS
       # (tcp://0.0.0.0 here -- its OWN bind), i.e. the wrong host.
       TRADER_TYPED_ADDRESS: tcp://trader
-      # Same HMAC key the dashboard / trader CLI use when calling strategy
-      # typed sockets (list/enable/disable/reload).
-      MMR_SERVICE_HMAC_KEY_FILE: /home/trader/.config/mmr/service_hmac.key
     volumes:
       - ${HOME}/.config/mmr:/home/trader/.config/mmr
+      # RPC keys: tmpfs hides the host keys/rpc dir; only this principal's
+      # private key and the public keys it needs are bound back in (read-only).
+      - type: tmpfs
+        target: /home/trader/.config/mmr/keys/rpc
+        tmpfs:
+          size: 65536
+          mode: 0755
+      - ${HOME}/.config/mmr/keys/rpc/strategy.key:/home/trader/.config/mmr/keys/rpc/strategy.key:ro
+      - ${HOME}/.config/mmr/keys/rpc/cli.pub:/home/trader/.config/mmr/keys/rpc/cli.pub:ro
+      - ${HOME}/.config/mmr/keys/rpc/dashboard.pub:/home/trader/.config/mmr/keys/rpc/dashboard.pub:ro
+      - ${HOME}/.config/mmr/keys/rpc/trader.pub:/home/trader/.config/mmr/keys/rpc/trader.pub:ro
+      # Retired shared HMAC key: unreadable in every container (ruling 14).
+      - /dev/null:/home/trader/.config/mmr/service_hmac.key:ro
       - mmr_db_data:/home/trader/.local/share/mmr/data
       - ${HOME}/.local/share/mmr/logs:/home/trader/.local/share/mmr/logs
       # P3 Task 9: same read-only artifact tree the trader verifies again at
@@ -386,14 +428,9 @@ services:
       DASHBOARD_LIVE_COMMANDS_ENABLED: ${DASHBOARD_LIVE_COMMANDS_ENABLED:-false}
       DASHBOARD_LIVE_ACCOUNT_ID: ${DASHBOARD_LIVE_ACCOUNT_ID:-}
       DASHBOARD_LIVE_MAX_ORDER_NOTIONAL: ${DASHBOARD_LIVE_MAX_ORDER_NOTIONAL:-}
-      # Shared service HMAC key for the typed-RPC seam to the trader (the read
-      # bridge + command gateway authenticate with it). Same 0600 key the trader
-      # loads via trader.yaml's service_hmac_key_file; it's already on the
-      # ~/.config/mmr mount below. Without it the command center degrades at boot
-      # with ServiceHmacKeyError. (The read path additionally needs the trader's
-      # from-wire snapshot/event decoders -- integration-gate CRITICAL-1 -- before
-      # live data flows; this env only clears the credential prerequisite.)
-      MMR_SERVICE_HMAC_KEY_FILE: /home/trader/.config/mmr/service_hmac.key
+      # The typed-RPC seam to trader and strategy signs as the `dashboard`
+      # principal (keys/rpc/dashboard.key, mounted below). Without it the
+      # command center degrades at boot with an RpcKeyError.
       # Outbound RPC/PubSub to the trader container (see the addressing note
       # above). No 0.0.0.0 binds here -- the dashboard is a pure client.
       ZMQ_RPC_SERVER_ADDRESS: tcp://trader
@@ -420,6 +457,18 @@ services:
       - "127.0.0.1:7424:7424"
     volumes:
       - ${HOME}/.config/mmr:/home/trader/.config/mmr
+      # RPC keys: tmpfs hides the host keys/rpc dir; only this principal's
+      # private key and the public keys it needs are bound back in (read-only).
+      - type: tmpfs
+        target: /home/trader/.config/mmr/keys/rpc
+        tmpfs:
+          size: 65536
+          mode: 0755
+      - ${HOME}/.config/mmr/keys/rpc/dashboard.key:/home/trader/.config/mmr/keys/rpc/dashboard.key:ro
+      - ${HOME}/.config/mmr/keys/rpc/strategy.pub:/home/trader/.config/mmr/keys/rpc/strategy.pub:ro
+      - ${HOME}/.config/mmr/keys/rpc/trader.pub:/home/trader/.config/mmr/keys/rpc/trader.pub:ro
+      # Retired shared HMAC key: unreadable in every container (ruling 14).
+      - /dev/null:/home/trader/.config/mmr/service_hmac.key:ro
       - ${HOME}/.local/share/mmr/logs:/home/trader/.local/share/mmr/logs
     healthcheck:
       test: ["CMD", "curl", "-f", "http://127.0.0.1:7424/healthz"]
@@ -459,6 +508,15 @@ services:
       <<: *mmr-common-env
     volumes:
       - ${HOME}/.config/mmr:/home/trader/.config/mmr
+      # RPC keys: tmpfs hides the host keys/rpc dir; only this principal's
+      # private key and the public keys it needs are bound back in (read-only).
+      - type: tmpfs
+        target: /home/trader/.config/mmr/keys/rpc
+        tmpfs:
+          size: 65536
+          mode: 0755
+      # Retired shared HMAC key: unreadable in every container (ruling 14).
+      - /dev/null:/home/trader/.config/mmr/service_hmac.key:ro
       - mmr_db_data:/home/trader/.local/share/mmr/data
       - ${HOME}/.local/share/mmr/backups:/home/trader/.local/share/mmr/backups
       - ${HOME}/.local/share/mmr/logs:/home/trader/.local/share/mmr/logs
@@ -469,6 +527,64 @@ services:
       retries: 3
       start_period: 15s
 
+
+  # ── cli: one-shot `mmr` CLI client (owner answer 1) ──────────────────────
+  # `docker compose run --rm cli strategies` -- for commands that need the
+  # private strategy ports (strategies list/enable/disable/reload). Host
+  # `mmr ...` keeps using the loopback trader ports 42101/42102. Profile
+  # `tools`: `docker compose up` never starts it, so no long-lived container
+  # holds cli.key. It signs as `cli`.
+  cli:
+    <<: *mmr-hardening
+    build: *mmr-build
+    restart: "no"
+    profiles: ["tools"]
+    working_dir: /home/trader/mmr
+    entrypoint: ["python", "-m", "trader.mmr_cli"]
+    environment:
+      <<: *mmr-common-env
+      TRADER_TYPED_ADDRESS: tcp://trader
+      STRATEGY_TYPED_ADDRESS: tcp://strategy
+      MMR_TYPED_STRATEGY_QUERY_ENDPOINT: tcp://strategy:42105
+      MMR_TYPED_STRATEGY_COMMAND_ENDPOINT: tcp://strategy:42104
+    volumes:
+      - ${HOME}/.config/mmr:/home/trader/.config/mmr
+      - type: tmpfs
+        target: /home/trader/.config/mmr/keys/rpc
+        tmpfs:
+          size: 65536
+          mode: 0755
+      - ${HOME}/.config/mmr/keys/rpc/cli.key:/home/trader/.config/mmr/keys/rpc/cli.key:ro
+      - ${HOME}/.config/mmr/keys/rpc/strategy.pub:/home/trader/.config/mmr/keys/rpc/strategy.pub:ro
+      - ${HOME}/.config/mmr/keys/rpc/trader.pub:/home/trader/.config/mmr/keys/rpc/trader.pub:ro
+      - /dev/null:/home/trader/.config/mmr/service_hmac.key:ro
+      - ${HOME}/.local/share/mmr/logs:/home/trader/.local/share/mmr/logs
+
+  # ── keygen: one-shot RPC key management (owner answer 2) ─────────────────
+  # `./docker.sh -k [--rotate P | --backup | --restore FILE]` runs
+  # `mmr keys init|backup|restore` here as the HOST uid:gid, so key files land
+  # owned by the operator with modes 0600/0644. No network, no ~/.config/mmr
+  # mount, no tmpfs overlay: this is the only service that mounts the keys
+  # directory itself, and the only one that mounts it writable.
+  # Deliberately not merged with x-mmr-hardening: that anchor sets
+  # `networks`, which cannot be combined with `network_mode: none`.
+  keygen:
+    image: mmr:latest
+    build: *mmr-build
+    restart: "no"
+    profiles: ["tools"]
+    network_mode: none
+    read_only: true
+    tmpfs:
+      - /tmp
+    working_dir: /home/trader/mmr
+    entrypoint: ["python", "-m", "trader.messaging.keys_cli"]
+    environment:
+      MMR_KEYGEN_CONTAINER: "1"
+      MMR_RPC_KEYS_DIR: /keys
+      PYTHONDONTWRITEBYTECODE: "1"
+    volumes:
+      - ${HOME}/.config/mmr/keys/rpc:/keys
   # ── fullstack-tests: process-supervision gate (G0 Task 6, test profile) ──
   # NOT part of the production topology -- profiles:["test"] means a plain
   # `docker compose up` never creates this service. It is brought up with:

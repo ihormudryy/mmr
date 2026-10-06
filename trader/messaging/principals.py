@@ -112,3 +112,10 @@ STRATEGY_ACL: Mapping[tuple[str, str], frozenset[str]] = {
     ("command", "enable_strategy_by_name"): HUMAN,
     ("command", "disable_strategy_by_name"): HUMAN,
 }
+
+
+# Compose service -> the principal it signs as (None: no key, tmpfs only).
+SERVICE_PRINCIPAL: Mapping[str, str | None] = {
+    "trader": "trader", "strategy": "strategy", "dashboard": "dashboard", "cli": "cli",
+    "scheduler": None, "data": None,
+}

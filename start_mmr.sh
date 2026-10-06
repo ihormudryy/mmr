@@ -647,63 +647,29 @@ fi
 sed -i.bak "s/^trading_mode:.*/trading_mode: ${TRADING_MODE}/" "$TRADER_CONFIG"
 rm -f "${TRADER_CONFIG}.bak"
 
-# ─── HMAC Key Provisioning (local/offline convenience ONLY) ─────────────────
+# ─── RPC Key Provisioning (local hybrid) ─────────────────────────────────────
 #
-# G0 Task 4 made trader_service hard-refuse to start without a valid
-# service_hmac_key_file (mode 0600, >= 32 bytes) -- correct for production,
-# but config_defaults/trader.yaml ships `service_hmac_key_file: ''` (there's
-# no safe default secret to check in), so a bare `./start_mmr.sh --paper` on
-# a fresh checkout could no longer boot at all. This is scoped to local/dev
-# convenience by CONSTRUCTION, not by a flag that production could
-# accidentally inherit: the production container path never runs this
-# function at all — each Compose service's `command:` invokes
-# `python -m trader.<x>_service` directly (see docker-compose.yml),
-# bypassing this script entirely. Only start_mmr.sh's own hybrid/host and
-# --docker-wrapper convenience paths call this. docker-entrypoint.sh (the
-# actual production entrypoint) does NOT auto-generate a key — a missing/
-# invalid key there still hard-fails exactly as Task 4 intended.
-#
-# Deliberately minimal: only acts when the key is unset or the file is
-# missing (per the brief). It does not validate/repair an existing key's
-# mode or length — a key that exists but is otherwise malformed still fails
-# loudly via trader_service's own load_service_hmac_key() check, which is
-# the correct behavior (silently regenerating a key someone deliberately
-# placed there would be surprising).
-ensure_service_hmac_key() {
-    local yaml_file="$1"
-    local current_key
-    current_key=$(
-        grep -E '^[[:space:]]*service_hmac_key_file[[:space:]]*:' "$yaml_file" 2>/dev/null \
-            | head -n1 \
-            | sed -E 's/^[[:space:]]*service_hmac_key_file[[:space:]]*:[[:space:]]*//' \
-            | sed -E "s/^['\"]//; s/['\"][[:space:]]*\$//" \
-            | sed -E 's/[[:space:]]+$//'
-    )
-    # Expand a leading ~ so the existence check below is accurate.
-    local expanded_key="${current_key/#\~/$HOME}"
-
-    if [ -n "$current_key" ] && [ -f "$expanded_key" ]; then
-        return 0   # already provisioned — leave it alone
+# trader_service, strategy_service and the dashboard refuse to start without
+# their Ed25519 RPC keys in ~/.config/mmr/keys/rpc/ (spec 5.3). In this hybrid
+# mode every service runs as the same host user, so the keys cannot be
+# isolated from each other here; each process still loads only its own
+# private key. `keys init` is idempotent: it creates missing pairs and never
+# overwrites. Split Docker uses ./docker.sh -k instead. The retired
+# service_hmac.key is never read and never deleted by this script.
+ensure_rpc_keys() {
+    local keys_dir="${MMR_RPC_KEYS_DIR:-$HOME/.config/mmr/keys/rpc}"
+    local output
+    if ! output=$($PY -m trader.messaging.keys_cli init --keys-dir "$keys_dir" 2>&1); then
+        printf '%s\n' "$output"
+        warn "RPC key check failed in $keys_dir; fix it before starting the services"
+        exit 1
     fi
-
-    local key_dir
-    key_dir="$(dirname "$yaml_file")"
-    mkdir -p "$key_dir"
-    local key_path="$key_dir/service_hmac.key"
-    if [ ! -f "$key_path" ]; then
-        ( umask 177 && head -c 48 /dev/urandom > "$key_path" )
-        chmod 600 "$key_path"
-        warn "auto-provisioned service_hmac_key_file for local/paper use: $key_path"
-        info "  (production never auto-generates this — see docker-entrypoint.sh)"
+    if printf '%s\n' "$output" | grep -q ' created '; then
+        info "Created missing RPC keys in $keys_dir (mmr keys init)"
     fi
-
-    # This portable spelling resolves to the host key for local processes and
-    # to the same bind-mounted key under /home/trader in split Compose.
-    sed -i.bak "s|^service_hmac_key_file:.*|service_hmac_key_file: ~/.config/mmr/service_hmac.key|" "$yaml_file"
-    rm -f "${yaml_file}.bak"
 }
 
-ensure_service_hmac_key "$TRADER_CONFIG"
+ensure_rpc_keys
 
 # ─── Helper Functions ────────────────────────────────────────────────────────
 

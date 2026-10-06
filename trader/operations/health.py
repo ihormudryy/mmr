@@ -44,6 +44,7 @@ from typing import Any, Dict, Optional
 # future field doesn't need a redaction-list update to stay safe.
 _SECRET_MARKERS = (
     'service_hmac',
+    'rpc_key',
     'hmac_key',
     'dashboard_token',
     'web_token',

@@ -34,14 +34,18 @@ Dashboard: Scaling tab → `lifecycle=armed` for momentum. Trading tab Strategie
 list comes from journaled `strategy.updated` (not from host `mmr strategies`).
 
 **Host CLI caveat:** `mmr strategies` from the Mac cannot reach strategy typed
-ports 42104/42105 (private Compose network). Use:
+ports 42104/42105 (private Compose network). Use the one-shot `cli` service
+(it holds `cli.key`, `trader.pub` and `strategy.pub` only):
 
 ```bash
-docker compose exec trader python -m trader.mmr_cli strategies
+docker compose run --rm cli strategies
+docker compose run --rm cli strategies enable momentum
 ```
 
-or the `/cc` Strategies panel. Trader ports 42101/42102 **are** published, so
-`mmr status` / `portfolio-snapshot` / `propose` / `approve` work from the host.
+or the `/cc` Strategies panel. Exec'ing the CLI inside the `trader` container
+is refused: no long-lived container holds the `cli` key. Trader ports
+42101/42102 **are** published, so `mmr status` / `portfolio-snapshot` /
+`propose` / `approve` work from the host (signed as `cli`).
 
 ---
 
@@ -268,7 +272,59 @@ message with no traceback.
 
 - Split compose: ib-gateway, trader, strategy, data, dashboard, scheduler.
 - Restart policy: `unless-stopped`.
-- Paper mode; typed HMAC RPC. Dashboard on host loopback (default 7424).
+- Paper mode; typed Ed25519 RPC (one key per principal, allow-list in
+  `trader/messaging/principals.py`). Dashboard on host loopback (default 7424).
+
+## RPC keys (SP1 Plan 2)
+
+Keys live in `~/.config/mmr/keys/rpc/`: `<principal>.key` (mode 0600) and
+`<principal>.pub` (0644) for `trader`, `strategy`, `cli`, `dashboard`,
+`ai_supervisor`, `ai_research`. Each container mounts only its own private
+key and the public keys it needs (tmpfs overlay + per-file read-only binds).
+`./docker.sh -u` refuses to start while any key file the compose file names
+is missing. RPC keys and bundle-signing keys (`keys/verify`, `keys/private`)
+are separate; each loader refuses the other kind.
+
+0. **First setup / cutover (owner-run, in this order):**
+   1. `./docker.sh -b` (image with `age` and the keygen entry point).
+   2. `./docker.sh -k` (creates every missing keypair, as your host user).
+   3. Cutover gate: `docker compose --profile test run fullstack-tests`.
+      It proves the tmpfs + per-file bind overlay and the `cli` / `keygen`
+      services on your Docker Desktop / Podman. Abort the cutover on any
+      failure.
+   4. `./docker.sh -u`.
+   5. Check `mmr status` from the host and the `/cc` dashboard.
+1. **Rotation** (one principal, e.g. a suspected leak):
+   `./docker.sh -k --backup` first, then `./docker.sh -k --rotate <principal>`.
+   There is no overlap window: restart every service it lists **together**
+   (a bind mount keeps the old inode until restart). Requests in flight
+   during the switch fail with `AUTHENTICATION_ERROR`; clients retry. Then
+   check `mmr status`, `/cc`, and `docker compose run --rm cli strategies`.
+2. **Lost private key or lost host:** restore from the encrypted backup
+   (below). Without a backup, rotate that principal (all services that trust
+   it restart together).
+3. **Backup and restore** (age; the identity lives only in 1Password):
+   - Save the age **recipient** (public key) once at
+     `~/.config/mmr/keys/rpc_backup_recipient.txt`.
+   - Backup: `./docker.sh -k --backup` writes
+     `~/.local/share/mmr/backups/rpc_keys/rpc_keys_<UTC>.tar.age` (0600, dir
+     0700). Only `keys/rpc` is in it; DuckDB backups (`-B`, `data backup`)
+     never include RPC keys.
+   - Restore into an empty `keys/rpc`:
+     `op read <item> | ./docker.sh -k --restore FILE`. The identity streams
+     from stdin into the container; no tool stores, logs or prints it. With
+     `--identity-file PATH` the file is mounted read-only and deleted only
+     with `--delete-identity-file`.
+4. **HMAC retirement.** No code reads `service_hmac.key` any more and every
+   container sees `/dev/null` in its place. No tool deletes it. Delete it by
+   hand only after (a) the trust-matrix tests pass, (b) a manual `mmr status`
+   / `/cc` check on the running stack, and (c) the rollback decision is made
+   (rollback = checking out the pre-cutover commit, which needs the file):
+   `rm ~/.config/mmr/service_hmac.key`. If the file is already gone, Docker
+   may leave an empty placeholder at that path; it is harmless.
+5. Local hybrid (`./start_mmr.sh`) runs `mmr keys init` on the host when a
+   key is missing; all services run as one user there, so keys are not
+   isolated from each other.
 
 ---
 
@@ -280,7 +336,7 @@ and approve on `/cc`.
 
 1. `./docker.sh -b -u` after this polish (baked dashboard image).
 2. Confirm `mmr status` → IB upstream connected.
-3. Enable **momentum** from `/cc` or `docker compose exec trader … strategies enable momentum`.
+3. Enable **momentum** from `/cc` or `docker compose run --rm cli strategies enable momentum`.
 4. Scaling: `lifecycle=armed`, operating mode Auto.
 5. Leave the stack up through US RTH. Watch intents / protectives / fills.
 6. Host monitors: `mmr --json portfolio-snapshot`, `portfolio-diff`, `/cc` Risk bars.

@@ -1400,8 +1400,9 @@ class LiquidationService:
         if not positions:
             if generation <= self._last_action_generation(receipt):
                 return self._wait(receipt, generation, "awaiting fresh broker flat confirmation")
-            return self._finish(receipt, "FLAT", generation_id=generation,
-                                detail="fresh broker snapshot confirms no positions or working orders")
+            return self._finish_held(receipt, "FLAT", generation=generation,
+                                     detail="fresh broker snapshot confirms no positions or working orders",
+                                     still_true=lambda held: self._exposure_since_decision(receipt, held))
         return self._submit_reduces(receipt, snapshot, positions)
 
     def _submit_reduces(self, receipt, snapshot, positions, *, partial: Optional[float] = None) -> LiquidationReceipt:
@@ -1471,8 +1472,10 @@ class LiquidationService:
         if position is None:
             if generation <= self._last_action_generation(receipt):
                 return self._wait(receipt, generation, "awaiting a newer generation to prove the position is closed")
-            return self._finish(receipt, "CLOSED", generation_id=generation,
-                                detail="fresh broker generation shows no position and no working orders for conid")
+            return self._finish_held(
+                receipt, "CLOSED", generation=generation,
+                detail="fresh broker generation shows no position and no working orders for conid",
+                still_true=lambda held: self._exposure_since_decision(receipt, held))
         if receipt.goal == "partial":
             own = [c for c in receipt.children if c.kind == "reduce" and c.root_id == receipt.cause_command_id]
             if any(c.state in ("FILLED", "CANCELLED", "REJECTED", "ABSENT") for c in own):
@@ -1606,9 +1609,7 @@ class LiquidationService:
         side = _reducing_side(position.quantity)
         rows = [self._leg_row(leg) for leg in legs]
         for leg, row in zip(legs, rows):
-            linked = row is not None and getattr(row, "oca_group", None) == stop.oca_group \
-                and getattr(row, "oca_type", None) == 2 and getattr(row, "action", None) == side
-            if not linked:
+            if not self._linked(row, stop.oca_group, side):
                 return self._escalate_now(
                     receipt, snapshot, f"REPROTECT_FAILED: {leg.child_id} is not a linked protective leg at the broker")
         for leg, row in zip(legs, rows):
@@ -1621,8 +1622,9 @@ class LiquidationService:
         state = self._partial_outcome(receipt)
         detail = ("re-protect legs working in one OCA group for the remaining quantity" if state == "DONE" else
                   "the partial reduce sold nothing; the position is protected again, the close failed")
-        return self._finish_held(receipt, state, generation=generation, legs=legs, rows=rows,
-                                 held=float(position.quantity), detail=detail)
+        held = float(position.quantity)
+        return self._finish_held(receipt, state, generation=generation, detail=detail, remaining_quantity=abs(held),
+                                 still_true=lambda snapshot: self._legs_changed(receipt, legs, rows, held, snapshot))
 
     def _stop_not_healthy(self, receipt, snapshot, generation: int, status: str) -> LiquidationReceipt:
         receipt = self._observe_children(receipt, snapshot, int(self._dispatch.newest_generation()))
@@ -1630,74 +1632,119 @@ class LiquidationService:
 
     def _send_target(self, receipt, snapshot, stop: ChildRef, target: ChildRef, position,
                      generation: int) -> LiquidationReceipt:
-        """#22 round 5: the stop's row is read and the target reserved while broker changes are held.
+        """#22 rounds 5-6: the target is admitted on evidence read while broker changes are held.
 
-        No ingest batch can record a PendingCancel between that read and the
-        reservation. The send itself runs after the hold (its acknowledgement
-        can take the dispatch timeout) and only if the stop row is still
-        healthy just before it; otherwise the target goes back to PLANNED,
-        never sent. A stop that goes away after the send is caught by the next
-        tick (stop not WORKING escalates and cancels the target).
+        Under the hold the stop's row and the position are read together. The
+        target is reserved only when the generation and the signed position
+        are the ones decided on and the stop is healthy, linked in the OCA
+        group, reducing, with its outstanding equal to the position; it is
+        sized from that position. The send runs after the hold (its
+        acknowledgement can take the dispatch timeout) and only if the stop
+        row is still healthy just before it; otherwise the target goes back
+        to PLANNED, never sent. A stop that goes away after the send is
+        caught by the next tick (stop not WORKING escalates and cancels the target).
         """
-        sized = replace(target, state="UNKNOWN", quantity=abs(float(position.quantity)), fence_generation=generation)
-
-        def promote(conn):
-            self._store.update_child_in_tx(conn, sized, self._now())
-            return [sized]
         try:
             with self._dispatch.hold_broker_changes():
-                status = self._leg_status(stop)
-                reserved = status in _BROKER_HEALTHY and self._reserve(receipt, promote)
+                problem, why, held = self._target_admission(receipt, stop, position, generation)
+                sized = None if problem else replace(
+                    target, state="UNKNOWN", quantity=abs(float(held.quantity)), fence_generation=generation)
+                reserved = sized is not None and self._reserve(
+                    receipt, lambda conn: self._store.update_child_in_tx(conn, sized, self._now()) or [sized])
         except BrokerChangesBusy as ex:
             return self._wait(receipt, generation, f"re-protect target not admitted: {ex}")
-        if status not in _BROKER_HEALTHY:
-            return self._stop_not_healthy(receipt, snapshot, generation, status)
+        if problem == "unhealthy":
+            return self._stop_not_healthy(receipt, snapshot, generation, why)
+        if problem == "unlinked":
+            return self._escalate_now(receipt, snapshot, why)
+        if problem == "changed":
+            return self._wait(receipt, generation, f"re-protect target not admitted: {why}")
         if reserved:
             status = self._leg_status(stop)
             if status not in _BROKER_HEALTHY:
                 self._store.transaction(lambda conn: self._store.update_child_in_tx(conn, target, self._now()))
                 return self._stop_not_healthy(receipt, snapshot, generation, status)
-            self._send_leg(receipt, sized, position)
+            self._send_leg(receipt, sized, held)
         return self._wait(self._store.receipt(receipt.cause_command_id), generation,
                           "re-protect target submitted for the live remaining position")
 
-    def _finish_held(self, receipt, state: str, *, generation: int, legs, rows, held: float,
-                     detail: str) -> LiquidationReceipt:
-        """Ruling 48: DONE / REDUCE_FAILED and the owner release commit while broker changes are held.
+    def _target_admission(self, receipt, stop: ChildRef, position, generation: int):
+        """(problem, why, held position); problem is None, 'unhealthy', 'unlinked' or 'changed'. Call under the hold."""
+        row = self._leg_row(stop)
+        status = "Unknown" if row is None else str(getattr(row, "status", "Unknown"))
+        if status not in _BROKER_HEALTHY:
+            return "unhealthy", status, None
+        try:
+            snapshot = self._broker.capture(receipt.account_id)
+            filled = self._broker_fill(stop, [row])
+        except Exception as ex:
+            return "changed", f"broker evidence unreadable under the hold: {ex}", None
+        if int(snapshot.generation_id) != generation:
+            return "changed", f"broker generation moved from {generation} to {snapshot.generation_id}", None
+        held = self._position_for(snapshot, receipt.conid)
+        if held is None or float(held.quantity) != float(position.quantity):
+            return "changed", "the position changed since the decision", None
+        if not self._linked(row, stop.oca_group, _reducing_side(held.quantity)):
+            return "unlinked", f"REPROTECT_FAILED: {stop.child_id} is not a linked protective leg at the broker", None
+        outstanding = max(float(getattr(row, "total_quantity", 0.0) or 0.0) - filled, 0.0)
+        if outstanding != abs(float(held.quantity)):
+            return "changed", f"stop outstanding {outstanding} != position {abs(float(held.quantity))}", None
+        return None, "", held
 
-        Under the hold no ingest batch or generation promote can write, so
-        the rows, position and generation read again here are the ones the
-        terminal transaction commits against. Any change since the decision,
-        or a hold that cannot be taken, waits for the next tick. ``held`` is
-        the signed position the decision was made on (#22 round 5).
+    def _finish_held(self, receipt, state: str, *, generation: int, detail: str,
+                     still_true: Callable[[Any], Optional[str]], **fields) -> LiquidationReceipt:
+        """Ruling 48 for every terminal state that releases the owner: FLAT, CLOSED, DONE, REDUCE_FAILED.
+
+        Under the hold no ingest batch or generation promote can write. The
+        generation, every child (order row and bound executions), the unbound
+        executions and the scope (``still_true`` on the held snapshot) are
+        read again; the terminal transaction commits only when nothing changed
+        since the decision (#20-#23 round 6). A change is recorded by the
+        observation, so the next tick needs a newer generation to size or
+        decide again. A change, or a hold that cannot be taken, waits.
         """
         try:
             with self._dispatch.hold_broker_changes():
-                why = self._changed_since_decision(receipt, generation, legs, rows, held)
+                why = self._changed_under_hold(receipt, generation, still_true)
                 if why is None:
-                    self._commit_terminal(receipt, state, generation_id=generation,
-                                          remaining_quantity=abs(held), detail=detail)
+                    self._commit_terminal(receipt, state, generation_id=generation, detail=detail, **fields)
         except BrokerChangesBusy as ex:
             why = f"broker changes could not be held: {ex}"
         if why is not None:
             return self._wait(receipt, generation, f"{state} not committed: {why}")
         return self._after_terminal(receipt, state, detail)
 
-    def _changed_since_decision(self, receipt, generation: int, legs, rows, held: float) -> Optional[str]:
-        """Why the terminal write must not happen now; None when nothing changed.
-
-        The position compares signed (#22 round 5): a long that became a short
-        of the same size is a change, and every leg must still reduce it.
-        """
+    def _changed_under_hold(self, receipt, generation: int,
+                            still_true: Callable[[Any], Optional[str]]) -> Optional[str]:
+        """Why the terminal write must not happen now; None when nothing changed. Call under the hold."""
         try:
-            fresh = [self._leg_row(leg) for leg in legs]
-            if [self._leg_fingerprint(r) for r in fresh] != [self._leg_fingerprint(r) for r in rows]:
-                return "a re-protect leg row changed since the decision"
             snapshot = self._broker.capture(receipt.account_id)
+            if int(snapshot.generation_id) != generation:
+                return f"broker generation moved from {generation} to {snapshot.generation_id}"
+            newest = int(self._dispatch.newest_generation())
+            observed = self._observe_late_fills(self._observe_children(receipt, snapshot, newest), newest)
+            if observed is not receipt:
+                return "a child order or an execution bound to it changed since the decision"
+            if not self._fresh(receipt, generation):
+                return "an execution was recorded since the decision"
+            return still_true(snapshot)
         except Exception as ex:  # an unreadable broker is a reason to decide again, never to finish
             return f"broker evidence unreadable under the hold: {ex}"
-        if int(snapshot.generation_id) != generation:
-            return f"broker generation moved from {generation} to {snapshot.generation_id}"
+
+    def _exposure_since_decision(self, receipt, snapshot) -> Optional[str]:
+        """FLAT / CLOSED: the held snapshot must still show no position and no working order on the scope."""
+        if receipt.scope == "account":
+            exposed = any(float(p.quantity) != 0.0 for p in snapshot.positions) or bool(snapshot.working_orders)
+        else:
+            conid = int(receipt.conid)
+            exposed = self._position_for(snapshot, conid) is not None or bool(self._working_for(snapshot, conid))
+        return "a position or working order appeared since the decision" if exposed else None
+
+    def _legs_changed(self, receipt, legs, rows, held: float, snapshot) -> Optional[str]:
+        """DONE / REDUCE_FAILED: the leg rows and the signed position are the ones decided on (#22 round 5)."""
+        fresh = [self._leg_row(leg) for leg in legs]
+        if [self._leg_fingerprint(r) for r in fresh] != [self._leg_fingerprint(r) for r in rows]:
+            return "a re-protect leg row changed since the decision"
         position = self._position_for(snapshot, receipt.conid)
         if position is None or float(position.quantity) != held:
             return "the position changed since the decision"
@@ -1705,6 +1752,12 @@ class LiquidationService:
         if any(getattr(row, "action", None) != side for row in fresh):
             return f"a re-protect leg does not {side} the position"
         return None
+
+    @staticmethod
+    def _linked(row, oca_group: Optional[str], side: str) -> bool:
+        """A leg row the broker links into the close's OCA group, reducing the position."""
+        return row is not None and getattr(row, "oca_group", None) == oca_group \
+            and getattr(row, "oca_type", None) == 2 and getattr(row, "action", None) == side
 
     @staticmethod
     def _leg_changed(leg: ChildRef, row) -> bool:
@@ -1739,8 +1792,9 @@ class LiquidationService:
             return self._wait(receipt, generation, f"position closed by an exit; cancelling residual legs ({why})")
         if generation <= self._last_action_generation(receipt):
             return self._wait(receipt, generation, "awaiting a newer generation to prove no residual exits")
-        return self._finish(receipt, "CLOSED", generation_id=generation,
-                            detail="position closed by a re-protect exit; no residual exits")
+        return self._finish_held(receipt, "CLOSED", generation=generation,
+                                 detail="position closed by a re-protect exit; no residual exits",
+                                 still_true=lambda held: self._exposure_since_decision(receipt, held))
 
     # -- escalation ----------------------------------------------------------------------
 

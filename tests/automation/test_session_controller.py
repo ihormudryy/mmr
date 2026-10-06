@@ -13,6 +13,7 @@ Contract (plan §Task 6):
 from __future__ import annotations
 
 import datetime as dt
+from contextlib import contextmanager
 from decimal import Decimal
 from pathlib import Path
 from types import SimpleNamespace
@@ -799,7 +800,7 @@ class _SimBroker:
     """A broker with one long position and its working protective stop.
 
     It is the snapshot port and the dispatch port at once; every capture is a
-    newer, complete broker generation.
+    newer, complete broker generation, except while broker changes are held.
     """
     def __init__(self, quantity: float = 10.0):
         self.generation = 0
@@ -807,6 +808,7 @@ class _SimBroker:
         self.stop_working = True
         self.rows: dict[str, list] = {}
         self.calls: list[tuple] = []
+        self.held = False
 
     def _stop_row(self, status: str = "Submitted") -> BrokerOrderRow:
         return BrokerOrderRow(
@@ -818,7 +820,8 @@ class _SimBroker:
         )
 
     def capture(self, account_id):
-        self.generation += 1
+        if not self.held:
+            self.generation += 1
         positions = [_position(self.quantity)] if self.quantity else []
         working = [self._stop_row()] if self.stop_working else []
         return _snapshot(self.generation, positions, working)
@@ -850,6 +853,14 @@ class _SimBroker:
 
     def newest_generation(self):
         return self.generation
+
+    @contextmanager
+    def hold_broker_changes(self):
+        self.held = True
+        try:
+            yield
+        finally:
+            self.held = False
 
 
 class _SimProtection:

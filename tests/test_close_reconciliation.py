@@ -1,6 +1,7 @@
 # tests/test_close_reconciliation.py
 """SP1 plan 1 Task 17 (R17): commands that start or join a close resolve from that exact root."""
 import datetime as dt
+from contextlib import nullcontext
 from types import SimpleNamespace
 
 import pytest
@@ -194,7 +195,8 @@ def _service(env, snapshots, rows):
             status="Filled", filled_quantity=q, total_quantity=q)]),
         find_orders=lambda a, cid: rows.get(cid, []), get_order=lambda e: None,
         enumeration_complete=lambda: True, newest_generation=lambda: broker.last,
-        executed_quantities=lambda *a: {}, unbound_execution_since=lambda *a: False)
+        executed_quantities=lambda *a: {}, unbound_execution_since=lambda *a: False,
+        hold_broker_changes=nullcontext)
     return LiquidationService(broker, dispatch, store=env.store, registry=ExitOwnerRegistry(env.db),
                               now=lambda: NOW, journal=env.journal, ledger=env.ledger,
                               schedule_reconcile=lambda command_id: env.reconciler.schedule(command_id, NOW))

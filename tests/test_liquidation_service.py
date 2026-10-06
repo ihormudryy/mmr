@@ -2353,3 +2353,112 @@ def test_a_later_full_close_cancels_the_live_leg_of_a_done_root_before_any_reduc
     assert not any(c[0] == "reduce" for c in s.dispatch.calls)
     inherited = next(c for c in s.service.receipt_for("exit-1").children if c.kind == "reprotect-stop")
     assert inherited.owner_root_id == "exit-1"
+
+
+# ---------------------------------------------------------------------------
+# Round 6 review findings
+# ---------------------------------------------------------------------------
+
+def _flat_ready(tmp_path):
+    """Account flatten: the reduce filled on generation 2; generation 3 would commit FLAT."""
+    s = _stack(tmp_path, [_snapshot(1, [_position()]), _snapshot(2, []), _snapshot(3, [])])
+    s.service.start(ACCOUNT, "root-1", DEADLINE)
+    s.dispatch.rows["root-1-reduce-1-1"] = [_row("Filled", filled=10.0)]
+    s.service.rescan()
+    return s, "root-1", lambda: _snapshot(3, [_position(4.0)])
+
+
+def _closed_ready(tmp_path):
+    """Scoped full close: the reduce filled on generation 2; generation 3 would commit CLOSED."""
+    s = _stack(tmp_path, [_snapshot(1, [_position()]), _snapshot(2, []), _snapshot(3, [])], protection=_Protection())
+    s.service.start(ACCOUNT, "close-1", DEADLINE, scope="conid", conid=1)
+    s.dispatch.rows["close-1-reduce-1-1"] = [_row("Filled", filled=10.0)]
+    s.service.rescan()
+    return s, "close-1", lambda: _snapshot(3, [_position(4.0)])
+
+
+def _reprotect_closed_ready(tmp_path):
+    """The re-protect stop filled the remainder; generation 5 would commit CLOSED."""
+    s, _ = _to_reprotect(tmp_path, extra=(_snapshot(4, []), _snapshot(5, [])))
+    s.dispatch.rows["p-1-reprotect-stop-1-1"] = [_leg_row("Filled", filled=6.0)]
+    s.service.rescan()                                                    # gen 4: the fill fences
+    return s, "p-1", lambda: _snapshot(5, [_priced(6.0)])
+
+
+_FLAT_OR_CLOSED = {"flat": _flat_ready, "closed": _closed_ready, "reprotect closed": _reprotect_closed_ready}
+
+
+@pytest.mark.parametrize("ready", _FLAT_OR_CLOSED.values(), ids=_FLAT_OR_CLOSED.keys())
+def test_a_position_recorded_before_the_flat_or_closed_write_never_releases_the_owner(tmp_path, ready):
+    """#21/#22/#23 round 6: the tick captured no position; ingest then recorded one on the same
+    generation, before the terminal write. FLAT/CLOSED commit under the ingest hold after the
+    position is read again, so the owner stays ACTIVE and nothing reports success."""
+    s, root, with_position = ready(tmp_path)
+    s.dispatch.before_hold = lambda: setattr(s.broker, "current", with_position())
+    receipt = s.service.rescan()
+    assert receipt.state not in ("FLAT", "CLOSED") and "not committed" in receipt.detail
+    assert s.registry.get(root).state == "ACTIVE" and s.service.close_resolution(root) is None
+
+
+def test_an_execution_recorded_before_the_done_write_never_releases_the_owner(tmp_path):
+    """#20/#22 round 6: a 2-share execution bound to the stop arrives after the stop was observed,
+    with the order row still Submitted/0 and the position still 6. The held re-read counts bound
+    executions, so DONE is not committed and the fill is recorded for the next generation."""
+    s, _ = _to_reprotect(tmp_path, extra=(_snapshot(4, [_priced(6.0)]), _snapshot(5, [_priced(6.0)]),
+                                          _snapshot(6, [_priced(6.0)])))
+    s.dispatch.rows["p-1-reprotect-stop-1-1"] = [_leg_row(entity="stop-e")]
+    s.service.rescan()                                                    # gen 4: target sent
+    s.dispatch.rows["p-1-reprotect-target-1-1"] = [_leg_row(entity="target-e")]
+    s.dispatch.before_hold = lambda: s.dispatch.executions.__setitem__("stop-e", 2.0)
+    receipt = s.service.rescan()                                          # gen 5
+    assert receipt.state != "DONE" and s.registry.get("p-1").state == "ACTIVE"
+    assert next(c for c in receipt.children if c.kind == "reprotect-stop").filled_quantity == 2.0
+    receipt = s.service.rescan()                                          # gen 6: stop outstanding 4 != 6
+    assert receipt.state != "DONE" and s.service.close_resolution("p-1") is None
+
+
+def test_a_later_full_close_cancels_the_live_leg_of_a_done_root_before_any_reduce(tmp_path):
+    """#21/#22 round 6: a partial close ended DONE with its stop WORKING. A later full close's
+    snapshot omits that stop, but its row still answers by ref. The new root inherits the live leg,
+    cancels it and sends no reduce while it works."""
+    s, _ = _to_reprotect(tmp_path, target=None, extra=(_snapshot(4, [_priced(6.0)]),))
+    s.dispatch.rows["p-1-reprotect-stop-1-1"] = [_leg_row(entity="stop-e")]
+    assert s.service.rescan().state == "DONE"                             # gen 4
+    s.push(_snapshot(5, [_priced(6.0)]), _snapshot(6, [_priced(6.0)]))   # the stop is not in the snapshot
+    s.service.start(ACCOUNT, "exit-1", DEADLINE, scope="conid", conid=1)
+    s.service.rescan()
+    assert ("cancel", "stop-e", "exit-1-cancel-1-1") in s.dispatch.calls
+    assert not any(c[0] == "reduce" for c in s.dispatch.calls)
+    inherited = next(c for c in s.service.receipt_for("exit-1").children if c.kind == "reprotect-stop")
+    assert inherited.owner_root_id == "exit-1"
+
+
+_ADMISSION_CHANGES = {
+    "position grew": lambda s: setattr(s.broker, "current", _snapshot(4, [_priced(8.0)])),
+    "position reversed": lambda s: setattr(s.broker, "current", _snapshot(4, [_priced(-6.0)])),
+    "generation moved": lambda s: setattr(s.broker, "current", _snapshot(5, [_priced(6.0)])),
+    "stop lost its OCA link": lambda s: s.dispatch.rows.__setitem__(
+        "p-1-reprotect-stop-1-1", [_leg_row(group="")]),
+    "stop partly filled": lambda s: s.dispatch.rows.__setitem__(
+        "p-1-reprotect-stop-1-1", [_leg_row(filled=2.0)]),
+}
+
+
+@pytest.mark.parametrize("change", _ADMISSION_CHANGES.values(), ids=_ADMISSION_CHANGES.keys())
+def test_a_target_is_admitted_only_against_the_position_and_stop_read_under_the_hold(tmp_path, change):
+    """#22 round 6: the position and the stop row are read together under the hold. A changed size,
+    sign or generation, a stop without its OCA link, or a stop whose outstanding no longer matches
+    the position sends no target."""
+    s, _ = _to_reprotect(tmp_path, extra=(_snapshot(4, [_priced(6.0)]), _snapshot(5, [_priced(6.0)])))
+    s.dispatch.rows["p-1-reprotect-stop-1-1"] = [_leg_row()]
+    s.dispatch.before_hold = lambda: change(s)
+    s.service.rescan()                                                    # gen 4
+    assert not any(c[0] == "place_exit_leg" and c[2] == "target" for c in s.dispatch.calls)
+
+
+def test_an_unlinked_stop_at_target_admission_escalates(tmp_path):
+    s, _ = _to_reprotect(tmp_path, extra=(_snapshot(4, [_priced(6.0)]),))
+    s.dispatch.rows["p-1-reprotect-stop-1-1"] = [_leg_row(group="")]
+    receipt = s.service.rescan()
+    assert receipt.escalated and receipt.goal == "zero"
+    assert any("not a linked protective leg" in detail for _root, detail in s.breaker.calls)

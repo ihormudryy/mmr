@@ -30,11 +30,19 @@
 
 Each ruling is binding for this plan. Owner-visible ones are repeated under "Open questions".
 
-1. **Principals in SP1.** `trader`, `strategy`, `cli`, `dashboard`, `scheduler`, `ai_supervisor`, `ai_research`. `telegram_bridge` is SP2: a reserved name, no key, no allow-list entry. `ai_sandbox` never gets a name or key.
+1. **Principals in SP1.** `trader`, `strategy`, `cli`, `dashboard`, `ai_supervisor`, `ai_research` (six keypairs). `telegram_bridge` is SP2 and `scheduler` is retired by owner answer 3 (ruling 5): both are reserved names with no key and no allow-list entry. `ai_sandbox` never gets a name or key.
 2. **Strategy rights follow the code, not the spec's summary.** Spec 5.3 lists `strategy` → trader as "intent, resolve, publish, feed". The strategy service also calls `create_proposal` (`trader/strategy/signal_proposer.py:138,208`), `get_trading_control` and `list_proposals` (SignalProposer reads, `strategy_runtime.py:620-627`) and `record_state_acknowledged` (outbox backstop, `strategy_runtime.py:611-615`). Removing them would break `auto_execute: propose`. The allow-list grants them. Everything else is refused.
 3. **Trader → strategy rights** are the methods the trader sends today: `enable_strategy`, `disable_strategy`, `update_strategy_params`, `get_strategy_receipt` (coordinator forward, `production_api.py:2038-2058`), `list_strategies` (`command_stack.py:101`), `arm_paper_automation`, `disarm_paper_automation`, `get_paper_automation_arm` (`paper_hot_arm.py:306,321,339`) and `reload_strategies` (spec: "hot-arm and reload").
 4. **AI principals get only methods that exist today.** `ai_supervisor`: account and market reads, `pause_trading`. `ai_research`: market-data reads. Plans 3–5 add `publish_ai_risk_policy`, `submit_ai_paper_decision`, `register_ai_deployment`, the scoreboard read and experiment methods to the allow-list in the tasks that create them.
-5. **`scheduler`** runs pycron jobs (`config_defaults/pycron.yaml:35-66`: `data refresh` and `data backup`). `data refresh` reuses `_handle_data_download` (`mmr_cli.py:8742`), which probes the trader with `get_status` (:8840) and resolves unknown symbols through the SDK (`resolve_instrument` / `discover_instrument`, `sdk.py:531-540`, `mmr_cli.py:8872`). So `scheduler` gets exactly `get_status`, `resolve_instrument` and `discover_instrument` (spec: "scheduler: data refresh"), and the scheduler container sets `MMR_RPC_PRINCIPAL: scheduler`.
+5. **`scheduler` has no identity and no trading RPC rights** (owner answer 3). Its jobs run locally (`config_defaults/pycron.yaml:35-66`, container `docker-compose.yml:438`). Every scheduled command, checked against the ACL:
+
+   | pycron job | command | trader RPC it can reach | ACL needed |
+   |---|---|---|---|
+   | `data_refresh_us` (:38) | `data refresh us_top20_daily us_top20_1min` | `_handle_data_refresh` (`mmr_cli.py:9430`) reuses `_handle_data_download` (:8742), whose trader probe `get_status` (:8840) and symbol fallback `rpc_mmr.resolve` (:8872) sit inside `try/except` and are soft: no trader means `rpc_mmr = None` and unresolved symbols are counted as failed. Refresh symbols come from universes already in the local DB (`accessor.resolve_symbol` first, :8860) | none |
+   | `data_refresh_asx` (:50) | `data refresh asx_daily asx_1min` | same code path (IB history goes through the data service, not the typed trader ports) | none |
+   | `db_backup` (:62) | `data backup --keep 7` | `_handle_data_backup` (:9033) reads `duckdb_path` and copies files; no SDK call | none |
+
+   So the scheduler ACL is empty: `scheduler` is not in `KNOWN_PRINCIPALS`, has no key, and the container mounts only the `tmpfs` over `keys/rpc` (same as `data`). `MMR_RPC_PRINCIPAL=scheduler` is refused by the SDK. If a future pycron job really needs a trader read, the owner approves adding `scheduler` back with the exact method named; `tests/test_scheduler_acl.py` (Task 6) fails until the job list and the table below it agree. The cost of the soft fallback: a refresh job meeting a symbol that is not in the local DB no longer resolves it through the trader; it reports that symbol as failed (the CLAUDE.md "fail loudly" rule holds, nothing is guessed).
 6. **Where `source` comes from** (spec 6: "source derived from the key, never from the body").
    - `CommandRequest` gains `principal: Optional[str] = None`, set by RPC handlers from the authenticated caller and never from the body. It is not part of `canonical_request_hash` (identity of the command, not of the caller). Internal commands (coordinator children, recovery) keep `None`.
    - Authorization reads `principal`, not `source`: `execute_automated_intent` requires `principal == "strategy"` (`automated_intent_command.py:175`); live approval requires `principal == "dashboard"` (replaces the `NON_HUMAN_APPROVE_SOURCES` deny-list at `command_coordinator.py:1275,1570` with an allow of one).
@@ -47,10 +55,15 @@ Each ruling is binding for this plan. Owner-visible ones are repeated under "Ope
 10. **Unknown vs denied.** An unregistered method is `METHOD_NOT_ALLOWED` (as today). A registered method the caller may not call is `PERMISSION_DENIED`, logged at WARNING with principal, method and request id. `place_standalone_order` and `set_risk_limits` are not registered on the typed surface at all, so the AI table test expects `METHOD_NOT_ALLOWED` for them.
 11. **Allow-list shape.** The table lives in `principals.py`. A production registry is built with that table; registering a method with no entry raises at startup (no silent dead method). A registry built without a table (tests) denies every method. An entry may be an empty set (explicitly nobody).
 12. **Key file rules.** Private: regular file, not a symlink, mode exactly `0600`. Public: regular file, not a symlink, no group/world write bit. Directory mode is not checked (compose's `tmpfs` is root-owned `0755`). Two principals may not share a key. A server's own key may not equal a peer's.
-13. **Rotation.** `mmr keys init` creates missing pairs and never overwrites. `mmr keys init --rotate <principal>` writes a new pair (temp file + `os.replace`). There is no overlap window: every container that holds the old private or public key must be restarted (a bind mount keeps the old inode). The command prints which services those are.
-14. **HMAC retirement.** `HmacServiceAuthenticator`, `load_service_hmac_key`, `ServiceHmacKeyError`, `TypedRpcConfig.service_hmac_key_file` and every `MMR_SERVICE_HMAC_KEY_FILE` read are deleted. A leftover `service_hmac_key_file` in `trader.yaml` or a leftover env var is ignored with one WARNING naming it as retired (the key grants nothing any more). `docker.sh -u` stops provisioning it and removes the yaml line (keeps a `.bak`); it does not delete the old key file.
-15. **Host-only keygen and CLI.** `mmr keys init` refuses to run inside a container (`/.dockerenv` or `/run/.containerenv` exists): inside, `keys/rpc` is a `tmpfs` and the keys would be lost. The CLI and SDK sign as `cli` by default; `MMR_RPC_PRINCIPAL` may select another client principal (`scheduler`, `ai_supervisor`, `ai_research`); `trader`, `strategy` and `dashboard` are refused there. A principal without its private key file fails at the first typed call.
+13. **Rotation and recovery are a coordinated switch, not "generate and restart"** (owner answer 7). `mmr keys init` creates missing pairs and never overwrites. `mmr keys init --rotate <principal>` writes a new pair (temp file + `os.replace`). There is no overlap window: every server that trusts the principal (`peers_for` inverse) must load the new `.pub` at the same time, so every container holding the old private or public key is restarted together (a bind mount keeps the old inode), and requests in flight during the switch fail (`AUTHENTICATION_ERROR`; clients retry). The command prints the services and warns about in-flight requests. A lost private key is recovered the same way (rotate that principal), unless the encrypted backup (ruling 19) restores it. Procedure lives in `docs/OPERATIONAL_STATE.md` (Task 6); `tests/test_rpc_key_rotation.py` (Task 7) proves old-refused / new-accepted on every server that trusts the rotated principal.
+14. **HMAC retirement** (owner answer 6). `HmacServiceAuthenticator`, `load_service_hmac_key`, `ServiceHmacKeyError`, `TypedRpcConfig.service_hmac_key_file` and every `MMR_SERVICE_HMAC_KEY_FILE` read are deleted: the new RPC boundary refuses an HMAC envelope (`AUTHENTICATION_ERROR`). The container mounts are removed in the cutover: the three `MMR_SERVICE_HMAC_KEY_FILE` env lines (`docker-compose.yml:219,310,396`), the yaml line (`docker.sh -u` strips it, keeps a `.bak`) and the `docker.sh` provisioning code. A leftover `service_hmac_key_file` in `trader.yaml` or a leftover env var is ignored with one WARNING naming it as retired. **No tool ever deletes `service_hmac.key`.** `docker.sh -u` prints a reminder while the file exists. The operator deletes it by hand only after (a) Task 7 passes, (b) a manual `mmr status` / `/cc` check on the running stack, and (c) the rollback decision is made (rollback means checking out the pre-cutover commit, which needs the file): `rm ~/.config/mmr/service_hmac.key`. Known limit: each container still mounts the whole `~/.config/mmr` directory, so the file stays readable inside containers until the operator deletes it; nothing reads it (Task 7 `test_no_code_path_opens_the_retired_hmac_key`).
+
+15. **Host CLI plus a short-lived `cli` container** (owner answer 1). **Keygen runs in Docker** (owner answer 2): `./docker.sh -k [--rotate P]` runs `mmr keys init` in a one-shot `keygen` container (compose profile `tools`, `restart: "no"`, no network, no `tmpfs` overlay) that bind-mounts only the host `~/.config/mmr/keys/rpc` read-write and runs as the host uid:gid, so files land owned by the operator with modes `0600` / `0644`. `docker.sh` creates the host directory (mode `0700`) first so Docker never creates it as root, and checks the resulting modes afterwards. `mmr keys init|backup|restore` refuse to run in any other container (`/.dockerenv` or `/run/.containerenv` exists) unless `MMR_KEYGEN_CONTAINER=1`, which only the `keygen` service sets; inside every long-lived service `keys/rpc` is a `tmpfs` and keys would be lost. Running `mmr keys init` on the host stays possible but is not the documented path. The host CLI signs as `cli` (default) and reaches only the published loopback trader ports 42101/42102 (`mmr status`, `portfolio-snapshot`, `propose`, `approve`). Commands that need the private strategy ports (`strategies`, `strategies enable|disable|reload`) run in a new one-shot compose service `cli` (profile `tools`, never started by `-u`): `docker compose run --rm cli strategies`. It holds `cli.key` plus `trader.pub` and `strategy.pub` only. **The `cli` private key is never mounted in the `trader` container** (or any long-lived service), so `docker compose exec trader … mmr_cli` is refused and the runbook stops using it. `MMR_RPC_PRINCIPAL` may select `ai_supervisor` or `ai_research` for those clients; `trader`, `strategy`, `dashboard` and any reserved name are refused there. A principal without its private key file fails at the first typed call.
 16. **Local hybrid (`start_mmr.sh`).** All services run as the same host user, so key isolation between them is not possible there; each process still loads only its own private key. `start_mmr.sh` runs `mmr keys init` if any key is missing (it already auto-provisioned the HMAC key, `start_mmr.sh:650-706`).
+
+17. **Strategy control keeps both direct paths** (owner answer 4). `cli` and `dashboard` call the strategy service directly and are authenticated there as themselves (`enable_strategy_by_name`, `disable_strategy_by_name`, `reload_strategies`, `list_strategies`). Trader-originated hot-arm and the coordinator forward authenticate as `trader` (`on_behalf_of` is log-only, ruling 9). Nothing is routed through the trader that is not routed today; the Task 4 tables already say this and Task 7 pins both edges.
+18. **Live activation is `cli` only** (owner answer 5). `activate_live_canary` and `activate_allocation` allow only `cli`; the signed attestation, preflight nonce and `CanaryActivationService` / allocation checks are unchanged and still run (the RPC allow-list is an extra gate, not a replacement). `dashboard` keeps read/status methods and the risk-reducing `deactivate_live_canary` and `suspend_allocation`, which never need a preflight nonce (`production_api.py:911`). `activate_paper_automation` is out of scope and keeps `HUMAN`.
+19. **RPC key backup** (owner answer 7). RPC keys are backed up separately from DuckDB backups (`./docker.sh -B` and `data backup` never include `keys/rpc`) and separately from bundle-signing keys (`keys/verify`, the signer, are never in this archive). `mmr keys backup --recipient <file>` streams `tar` of `keys/rpc` (`*.key`, `*.pub`) into `age` (public-key encryption; the plaintext never touches disk) and writes `~/.local/share/mmr/backups/rpc_keys/rpc_keys_<UTC>.tar.age` with mode `0600` in a `0700` directory. Only the age identity (private) can decrypt it; the operator keeps that identity off the host (password manager or offline media). `mmr keys restore <file> --identity <file>` writes into an empty `keys/rpc` only and then re-runs the strict loaders. Tool choice (`age` vs `gpg` vs the macOS keychain) is an owner question.
 
 ## Review Focus
 
@@ -92,9 +105,9 @@ Inputs and failure modes the spec implies but its test list does not name. Each 
 
 **Interfaces:**
 - Produces:
-  - `principals.KNOWN_PRINCIPALS: frozenset[str]` = `{"trader","strategy","cli","dashboard","scheduler","ai_supervisor","ai_research"}`; `SERVER_PRINCIPALS = {"trader","strategy"}`; `CLIENT_PRINCIPALS = {"cli","scheduler","ai_supervisor","ai_research"}` (SDK-selectable); `RESERVED_PRINCIPALS = {"telegram_bridge"}`.
-  - `principals.SERVER_ACCEPTS: Mapping[str, frozenset[str]]` = `{"trader": {"cli","dashboard","strategy","scheduler","ai_supervisor","ai_research"}, "strategy": {"cli","dashboard","trader"}}`.
-  - `principals.CALLS: Mapping[str, frozenset[str]]` = `{"trader": {"strategy"}, "strategy": {"trader"}, "cli": {"trader","strategy"}, "dashboard": {"trader","strategy"}, "scheduler": {"trader"}, "ai_supervisor": {"trader"}, "ai_research": {"trader"}}`.
+  - `principals.KNOWN_PRINCIPALS: frozenset[str]` = `{"trader","strategy","cli","dashboard","ai_supervisor","ai_research"}`; `SERVER_PRINCIPALS = {"trader","strategy"}`; `CLIENT_PRINCIPALS = {"cli","ai_supervisor","ai_research"}` (SDK-selectable); `RESERVED_PRINCIPALS = {"telegram_bridge","scheduler"}` (no key, no ACL entry; ruling 5).
+  - `principals.SERVER_ACCEPTS: Mapping[str, frozenset[str]]` = `{"trader": {"cli","dashboard","strategy","ai_supervisor","ai_research"}, "strategy": {"cli","dashboard","trader"}}`.
+  - `principals.CALLS: Mapping[str, frozenset[str]]` = `{"trader": {"strategy"}, "strategy": {"trader"}, "cli": {"trader","strategy"}, "dashboard": {"trader","strategy"}, "ai_supervisor": {"trader"}, "ai_research": {"trader"}}`.
   - `principals.peers_for(principal) -> frozenset[str]` = `SERVER_ACCEPTS.get(p, ∅) | CALLS[p]`; raises `ValueError` for an unknown name.
   - `principals.is_valid_principal_name(name: object) -> bool`: `isinstance(name, str)` and `re.fullmatch(r"[a-z][a-z_]{1,31}", name)` and `name in KNOWN_PRINCIPALS`.
   - `key_purpose.RPC_KEYS_DIR_ENV = "MMR_RPC_KEYS_DIR"`; `default_rpc_keys_dir() -> Path`; `bundle_verify_dir_for(rpc_dir: Path) -> Path` (= `rpc_dir.parent / "verify"`); `rpc_public_raw(rpc_dir) -> frozenset[bytes]` (raw 32-byte keys of `*.pub`; missing dir → empty); `bundle_public_raw(verify_dir) -> frozenset[bytes]` (`*.pem`; missing dir → empty); `KeyPurposeError(Exception)`.
@@ -116,13 +129,14 @@ def test_default_rpc_keys_dir_is_isolated_in_tests(tmp_path):
     assert ".config/mmr" not in str(key_purpose.default_rpc_keys_dir())
 
 def test_peers_follow_the_trust_matrix():
-    assert principals.peers_for("trader") == {"cli","dashboard","strategy","scheduler","ai_supervisor","ai_research"}
+    assert principals.peers_for("trader") == {"cli","dashboard","strategy","ai_supervisor","ai_research"}
     assert principals.peers_for("strategy") == {"cli","dashboard","trader"}
     assert principals.peers_for("ai_research") == {"trader"}
-    with pytest.raises(ValueError):
-        principals.peers_for("telegram_bridge")
+    for reserved in ("telegram_bridge", "scheduler"):
+        with pytest.raises(ValueError):
+            principals.peers_for(reserved)
 
-@pytest.mark.parametrize("name", ["../verify/x", "/etc/passwd", "CLI", "cli\x00", "", "telegram_bridge", None, 7])
+@pytest.mark.parametrize("name", ["../verify/x", "/etc/passwd", "CLI", "cli\x00", "", "telegram_bridge", "scheduler", None, 7])
 def test_invalid_principal_names(name):
     assert not principals.is_valid_principal_name(name)
 
@@ -227,7 +241,7 @@ def _checked_path(keys_dir: Path, principal: str, suffix: str, *, private: bool)
 
 **Interfaces:**
 - Consumes: Task 1.
-- Produces: `rpc_keys.init_keys(keys_dir: Path, *, rotate: str | None = None) -> list[KeyInitRow]` where `KeyInitRow(principal: str, status: Literal["created","kept","rotated"], key_id: str)`; `rpc_keys.RESTART_ON_ROTATE: Mapping[str, tuple[str, ...]]` (compose services that mount the principal's private or public key, derived from `peers_for`). CLI: `mmr keys init [--rotate PRINCIPAL] [--keys-dir PATH]`.
+- Produces: `rpc_keys.init_keys(keys_dir: Path, *, rotate: str | None = None) -> list[KeyInitRow]`; `rpc_keys.backup_keys(keys_dir, out_path, recipients_file, *, run=_run_age) -> Path`; `rpc_keys.restore_keys(archive, keys_dir, identity_file, *, run=_run_age) -> list[str]` where `KeyInitRow(principal: str, status: Literal["created","kept","rotated"], key_id: str)`; `rpc_keys.RESTART_ON_ROTATE: Mapping[str, tuple[str, ...]]` (compose services that mount the principal's private or public key, derived from `peers_for`). CLI: `mmr keys init [--rotate PRINCIPAL] [--keys-dir PATH]`, `mmr keys backup --recipient FILE [--out PATH]`, `mmr keys restore FILE --identity FILE [--keys-dir PATH]`.
 
 - [ ] **Step 1: Write the failing tests**
 
@@ -268,16 +282,53 @@ def test_rotate_unknown_principal_is_refused(tmp_path):
     with pytest.raises(RpcKeyError):
         init_keys(tmp_path, rotate="telegram_bridge")
 
-def test_cli_refuses_inside_a_container(monkeypatch, tmp_path, capsys):
+def test_cli_refuses_inside_an_ordinary_container(monkeypatch, tmp_path, capsys):
     monkeypatch.setattr("trader.mmr_cli._running_in_container", lambda: True)
+    monkeypatch.delenv("MMR_KEYGEN_CONTAINER", raising=False)
     _run_cli(["keys", "init", "--keys-dir", str(tmp_path)])
-    assert "host" in capsys.readouterr().out and not any(tmp_path.iterdir())
+    assert "docker.sh -k" in capsys.readouterr().out and not any(tmp_path.iterdir())
+
+def test_cli_allows_keygen_in_the_one_shot_keygen_container(monkeypatch, tmp_path):
+    monkeypatch.setattr("trader.mmr_cli._running_in_container", lambda: True)
+    monkeypatch.setenv("MMR_KEYGEN_CONTAINER", "1")
+    _run_cli(["keys", "init", "--keys-dir", str(tmp_path)])
+    assert (tmp_path / "trader.key").exists()
 
 def test_cli_prints_restart_list_on_rotate(tmp_path, capsys):
     _run_cli(["keys", "init", "--keys-dir", str(tmp_path)])
     _run_cli(["keys", "init", "--keys-dir", str(tmp_path), "--rotate", "strategy"])
     out = capsys.readouterr().out
     assert "strategy" in out and "trader" in out and "dashboard" in out  # services holding strategy.key/.pub
+    assert "in-flight" in out                                            # requests fail during the switch
+```
+
+```python
+# tests/test_rpc_keys_backup.py  (fake `run` replaces the age binary; one real-age test skipped when age is absent)
+def test_backup_pipes_only_rpc_keys_into_the_encryptor_and_writes_no_plaintext(tmp_path):
+    keys = tmp_path / "config/keys"; init_keys(keys / "rpc"); (keys / "verify").mkdir(); (keys / "verify/paper.pem").write_text("bundle")
+    seen = {}
+    def fake_run(argv, stdin_bytes): seen["argv"], seen["tar"] = argv, stdin_bytes; return b"CIPHERTEXT"
+    out = backup_keys(keys / "rpc", tmp_path / "b/rpc_keys.tar.age", tmp_path / "recipient.txt", run=fake_run)
+    names = set(tarfile.open(fileobj=io.BytesIO(seen["tar"])).getnames())
+    assert names == {f"{p}.{e}" for p in KNOWN_PRINCIPALS for e in ("key", "pub")}   # no verify/ keys, no service_hmac.key
+    assert out.read_bytes() == b"CIPHERTEXT" and stat.S_IMODE(out.stat().st_mode) == 0o600
+    assert stat.S_IMODE(out.parent.stat().st_mode) == 0o700
+    assert not list(tmp_path.rglob("*.tar"))                                          # plaintext never on disk
+
+def test_backup_fails_loudly_without_the_encryptor(tmp_path, monkeypatch):
+    monkeypatch.setenv("PATH", "")
+    with pytest.raises(RpcKeyError, match="age"):
+        backup_keys(tmp_path, tmp_path / "x.age", tmp_path / "r.txt")
+
+def test_restore_refuses_a_non_empty_keys_dir_and_revalidates_modes(tmp_path):
+    ...  # fake `run` returns a tar; restore into empty dir -> strict loaders pass, .key 0600;
+         # into a dir that already has any *.key -> RpcKeyError, nothing overwritten
+
+@pytest.mark.skipif(shutil.which("age") is None or shutil.which("age-keygen") is None, reason="age not installed")
+def test_backup_restore_round_trip_with_real_age(tmp_path): ...
+
+def test_docker_db_backup_never_includes_rpc_keys():
+    assert "keys/rpc" not in Path("docker.sh").read_text().split("backup_databases")[1]   # -B path; see Task 6 for the real-file test
 ```
 
 ```python
@@ -300,9 +351,9 @@ def test_bundle_keys_still_load_when_no_rpc_dir_exists(tmp_path):
 - [ ] **Step 2: Run, expect FAIL.**
 - [ ] **Step 3: Implement.**
   - `init_keys`: `keys_dir.mkdir(parents=True, mode=0o700, exist_ok=True)`. For each known principal: both files present → load both with Task 1 loaders and require the derived public key to equal the `.pub` ("does not match"), status `kept`; neither present → create; exactly one → `RpcKeyError` (no repair). Create writes the private PEM with `os.open(tmp, O_WRONLY|O_CREAT|O_EXCL, 0o600)`, `fsync`, then `os.replace` onto `<p>.key`; same for `.pub` with `0o644`. Rotate writes both temp files first, then replaces `.key` then `.pub`. Unknown `rotate` → `RpcKeyError`.
-  - `RESTART_ON_ROTATE[p]` = compose services whose principal is `p` or has `p` in `peers_for` (`trader`→trader service; `strategy`→`strategy`; `dashboard`→`dashboard`; `scheduler`→`scheduler`; client principals map to no service).
+  - `RESTART_ON_ROTATE[p]` = compose services whose principal is `p` or has `p` in `peers_for` (`trader`→trader service; `strategy`→`strategy`; `dashboard`→`dashboard`; client principals map to no long-lived service: `cli` is the one-shot `cli` container, which re-reads its bind mounts on every run; the host CLI re-reads the file on every run).
   - `signing.load_signing_key` / `load_verify_key`: after the Ed25519 type check, compare the raw public bytes with `key_purpose.rpc_public_raw(key_purpose.default_rpc_keys_dir())` and raise `InvalidKeyType("key at … is an RPC identity key; bundle keys and RPC keys are separate")`. A `KeyPurposeError` from reading `keys/rpc` (a malformed `.pub`) is re-raised as `MalformedKey` naming that file, so the 17 call sites' existing `except (InsecureKeyFile, InvalidKeyType, MalformedKey)` still catch it (test: `test_malformed_rpc_pub_surfaces_as_malformed_key`). This covers all 17 bundle load sites (attest, allocation sign, `paper_activation._load_verify_keys` :456, `paper_materials.verify_qualified_paper_bundle` :37) without touching them.
-  - `mmr_cli`: `_running_in_container()` returns `Path("/.dockerenv").exists() or Path("/run/.containerenv").exists()`. The handler prints a table (principal, status, key id) and, on rotate, "restart these services: …". It needs no service.
+  - `mmr_cli`: `_running_in_container()` returns `Path("/.dockerenv").exists() or Path("/run/.containerenv").exists()`; the `keys` handlers refuse when it is true and `MMR_KEYGEN_CONTAINER != "1"`. The handler prints a table (principal, status, key id) and, on rotate, "restart these services: …". It needs no service.
 - [ ] **Step 4: Run, expect PASS**, then the full suite.
 - [ ] **Step 5: Commit** — `feat: add mmr keys init and refuse rpc keys as bundle keys`.
 
@@ -547,10 +598,9 @@ _TRADER_MARKET_READS = ("get_snapshot", "get_snapshots_batch", "get_market_depth
 
 TRADER_ACL = {
     **{("query", m): ACCOUNT_READERS for m in _TRADER_ACCOUNT_READS},
-    ("query", "get_status"): ACCOUNT_READERS | {"scheduler"},   # overrides the group entry
     **{("query", m): MARKET_READERS for m in _TRADER_MARKET_READS},
-    ("query", "resolve_instrument"): MARKET_READERS | {"strategy", "scheduler"},
-    ("query", "discover_instrument"): MARKET_READERS | {"strategy", "scheduler"},
+    ("query", "resolve_instrument"): MARKET_READERS | {"strategy"},
+    ("query", "discover_instrument"): MARKET_READERS | {"strategy"},
     ("query", "publish_instrument"): HUMAN | {"strategy"},
     ("query", "get_trading_control"): ACCOUNT_READERS | {"strategy"},
     ("query", "list_proposals"): ACCOUNT_READERS | {"strategy"},
@@ -560,11 +610,15 @@ TRADER_ACL = {
     ("command", "execute_automated_intent"): frozenset({"strategy"}),
     ("command", "record_state_acknowledged"): frozenset({"strategy"}),
     ("command", "pause_trading"): HUMAN | {"ai_supervisor"},
+    # Owner answer 5 (ruling 18): activation is cli only. dashboard keeps only the
+    # risk-reducing deactivate_live_canary / suspend_allocation (in the HUMAN group below).
+    ("command", "activate_live_canary"): frozenset({"cli"}),
+    ("command", "activate_allocation"): frozenset({"cli"}),
     **{("command", m): HUMAN for m in (
         "approve_proposal", "reject_proposal", "cancel_order", "cancel_orders", "resume_trading",
         "preflight_command", "liquidate_account", "enable_strategy", "disable_strategy",
-        "update_strategy_params", "activate_live_canary", "deactivate_live_canary",
-        "activate_allocation", "suspend_allocation", "activate_paper_automation",
+        "update_strategy_params", "deactivate_live_canary", "suspend_allocation",
+        "activate_paper_automation",
         "deactivate_paper_automation", "create_universe", "delete_universe",
         "add_universe_symbols", "remove_universe_symbol", "import_universe_csv")},
 }
@@ -581,7 +635,7 @@ STRATEGY_ACL = {
 }
 ```
 
-  Step 3 below cross-checks each entry against its caller; Task 7 proves every edge over sockets. `scheduler` appears only in `get_status`, `resolve_instrument` and `discover_instrument` (ruling 5).
+  Step 3 below cross-checks each entry against its caller; Task 7 proves every edge over sockets. `scheduler` appears in no entry (ruling 5), `activate_live_canary` and `activate_allocation` list only `cli` (ruling 18); the trust-matrix edges for strategy control keep both direct callers and `trader` (ruling 17).
 
 - [ ] **Step 1: Write the failing tests** (`tests/test_rpc_acl.py`)
 
@@ -619,6 +673,26 @@ def test_with_caller_handler_receives_the_authenticated_caller(served_with_acl):
                                       lambda b, caller: seen.append(caller) or {}, with_caller=True)
     served_with_acl.client("dashboard").call("whoami", {}, dict)
     assert seen == [RpcCaller("dashboard", None)]
+
+def test_scheduler_is_not_a_principal_and_appears_in_no_acl():
+    assert "scheduler" not in principals.KNOWN_PRINCIPALS and "scheduler" in principals.RESERVED_PRINCIPALS
+    for table in (TRADER_ACL, STRATEGY_ACL):
+        assert all("scheduler" not in allowed for allowed in table.values())
+
+@pytest.mark.parametrize("method", ["activate_live_canary", "activate_allocation"])
+def test_activation_is_cli_only(served_with_acl, method):
+    assert TRADER_ACL[("command", method)] == frozenset({"cli"})
+    for principal in ("dashboard", "strategy", "ai_supervisor", "ai_research"):
+        with pytest.raises(TypedRpcRemoteError) as exc:
+            served_with_acl.client(principal).call(method, ACTIVATION_BODY[method], dict)
+        assert exc.value.code == "PERMISSION_DENIED", (principal, method)
+
+@pytest.mark.parametrize("method", ["deactivate_live_canary", "suspend_allocation"])
+def test_dashboard_may_still_deactivate_and_suspend(served_with_acl, method):
+    served_with_acl.client("dashboard").call(method, DEACTIVATION_BODY[method], dict)   # reaches the handler
+
+def test_dashboard_may_read_status(served_with_acl):
+    served_with_acl.client("dashboard").call("get_paper_automation_status", {}, dict)
 
 def test_every_production_trader_method_has_an_entry():
     reg = build_full_production_registry()        # helper: command_stack fixtures from tests/test_command_stack.py
@@ -706,6 +780,12 @@ def test_create_proposal_label_cannot_impersonate(trader_served, principal, labe
         trader_served.client(principal).call("create_proposal", {**PROPOSAL_BODY, "source": label}, dict)
     assert exc.value.code == "PERMISSION_DENIED"
 
+def test_cli_activation_still_requires_the_signed_attestation_and_preflight(trader_served):
+    # Passing the allow-list is not enough: the existing checks run unchanged.
+    receipt = trader_served.client("cli").call("activate_live_canary", UNSIGNED_ACTIVATION_BODY, dict)
+    assert receipt["status"] != "EXECUTED" and receipt["error_code"]      # same rejection tests/promotion/test_canary_activation.py pins
+    # a preflight-less activation is refused the same way as before this plan
+
 AI_FORBIDDEN = ["approve_proposal", "execute_automated_intent", "liquidate_account", "resume_trading",
                 "activate_live_canary", "activate_allocation", "activate_paper_automation",
                 "create_proposal", "cancel_order"]
@@ -762,12 +842,12 @@ def _create_proposal_rpc_handler(coordinator, account_id):
 ### Task 6: Container mounts, `docker.sh`, `start_mmr.sh`, docs
 
 **Files:**
-- Modify: `docker-compose.yml` (services `data` :165, `trader` :192, `strategy` :272, `dashboard` :358, `scheduler` :438; drop `MMR_SERVICE_HMAC_KEY_FILE` at :219, :310, :396 and their comments), `docker.sh:494-548` (`_read_service_hmac_key_file`, `_write_portable_service_hmac_key_file`, `ensure_split_config`), `start_mmr.sh:650-706`, `trader/operations/health.py:45-55` (`_SECRET_MARKERS` += `"rpc_key"`, so a health payload never echoes an RPC key path), `CLAUDE.md` (Typed HMAC sections, ports table, `.env` paragraph), `docs/OPERATIONAL_STATE.md:40,168,283` (CLI on the host)
-- Test: `tests/test_compose_rpc_keys.py` (new), `tests/test_docker_helper.py:179,199` (replace), `tests/fullstack/test_rpc_key_mounts.py` (new, test profile only)
+- Modify: `docker-compose.yml` (services `data` :165, `trader` :192, `strategy` :272, `dashboard` :358, `scheduler` :438, new one-shot `cli` and `keygen`; drop `MMR_SERVICE_HMAC_KEY_FILE` at :219, :310, :396 and their comments), `docker.sh:494-548` and the option parser (new `-k [--rotate P]`; `_read_service_hmac_key_file`, `_write_portable_service_hmac_key_file`, `ensure_split_config`), `start_mmr.sh:650-706`, `trader/operations/health.py:45-55` (`_SECRET_MARKERS` += `"rpc_key"`, so a health payload never echoes an RPC key path), `CLAUDE.md` (Typed HMAC sections, ports table, `.env` paragraph), `docs/OPERATIONAL_STATE.md:40,168,283` (strategy commands move to the `cli` container; add the key rotation, recovery, backup and HMAC retirement runbook)
+- Test: `tests/test_compose_rpc_keys.py` (new), `tests/test_scheduler_acl.py` (new), `tests/test_docker_helper.py:179,199` (replace), `tests/fullstack/test_rpc_key_mounts.py` (new, test profile only)
 
 **Interfaces:**
 - Consumes: `principals.peers_for`, `SERVER_PRINCIPALS`.
-- Produces: `principals.SERVICE_PRINCIPAL: Mapping[str, str | None]` = `{"trader": "trader", "strategy": "strategy", "dashboard": "dashboard", "scheduler": "scheduler", "data": None}` (compose service → principal).
+- Produces: `principals.SERVICE_PRINCIPAL: Mapping[str, str | None]` = `{"trader": "trader", "strategy": "strategy", "dashboard": "dashboard", "cli": "cli", "scheduler": None, "data": None}` (compose service → principal; `None` = no key, `tmpfs` only).
 
 Mount pattern for one service (trader shown; the others follow `peers_for`):
 
@@ -783,12 +863,15 @@ Mount pattern for one service (trader shown; the others follow `peers_for`):
       - ${HOME}/.config/mmr/keys/rpc/strategy.pub:/home/trader/.config/mmr/keys/rpc/strategy.pub:ro
       - ${HOME}/.config/mmr/keys/rpc/cli.pub:/home/trader/.config/mmr/keys/rpc/cli.pub:ro
       - ${HOME}/.config/mmr/keys/rpc/dashboard.pub:/home/trader/.config/mmr/keys/rpc/dashboard.pub:ro
-      - ${HOME}/.config/mmr/keys/rpc/scheduler.pub:/home/trader/.config/mmr/keys/rpc/scheduler.pub:ro
       - ${HOME}/.config/mmr/keys/rpc/ai_supervisor.pub:/home/trader/.config/mmr/keys/rpc/ai_supervisor.pub:ro
       - ${HOME}/.config/mmr/keys/rpc/ai_research.pub:/home/trader/.config/mmr/keys/rpc/ai_research.pub:ro
 ```
 
-`data` gets only the `tmpfs` (no keys). `scheduler` also gets `MMR_RPC_PRINCIPAL: scheduler` in its `environment` (ruling 5; without it the SDK signs as `cli` and fails on a missing `cli.key`); the static test `test_scheduler_signs_as_scheduler` pins it. `ib-gateway` and `fullstack-tests` do not mount `~/.config/mmr` and need nothing.
+`data` and `scheduler` get only the `tmpfs` (no keys; ruling 5). The trader container's mounts do **not** include `cli.key` (only `cli.pub`).
+
+New one-shot service (ruling 15), same `<<: *mmr-hardening` but `restart: "no"`, `profiles: ["tools"]`, `entrypoint: ["python", "-m", "trader.mmr_cli"]`, no `depends_on`, no published ports. Its `environment` copies the dashboard's typed-address variables for trader and strategy (`TRADER_TYPED_ADDRESS: tcp://trader` and the strategy equivalent; the implementer copies the exact names from the `dashboard` block). Mounts: `~/.config/mmr`, the `tmpfs` overlay, `cli.key`, `trader.pub`, `strategy.pub` (all `:ro`). Use: `docker compose run --rm cli strategies`. `docker compose up` never starts it (profile), so no long-lived container holds `cli.key`. New one-shot service `keygen` (ruling 15): `<<: *mmr-hardening`, `restart: "no"`, `profiles: ["tools"]`, `network_mode: none`, `entrypoint: ["python", "-m", "trader.mmr_cli", "keys"]`, `environment: {MMR_KEYGEN_CONTAINER: "1", MMR_RPC_KEYS_DIR: /keys}`, one volume `${HOME}/.config/mmr/keys/rpc:/keys` (read-write; no `~/.config/mmr` mount, no `tmpfs`). `docker.sh -k` runs `docker compose run --rm --no-deps --user "$(id -u):$(id -g)" keygen init [--rotate P]`. It is the only service that mounts the keys directory writable, and the only mount of the whole directory.
+
+`ib-gateway` and `fullstack-tests` do not mount `~/.config/mmr` and need nothing.
 
 - [ ] **Step 1: Write the failing tests**
 
@@ -814,16 +897,63 @@ def test_no_service_mounts_another_principals_private_key(compose):
 
 def test_every_key_bind_is_read_only(compose): ...
 
+def test_cli_private_key_is_mounted_only_in_the_short_lived_cli_service(compose):
+    holders = [n for n, svc in compose["services"].items() if "cli.key" in (_visible_rpc_files(svc) or set())]
+    assert holders == ["cli"]       # keygen mounts the directory itself, checked below
+
+def test_keygen_service_is_one_shot_offline_and_the_only_writable_keys_mount(compose):
+    keygen = compose["services"]["keygen"]
+    assert keygen["profiles"] == ["tools"] and keygen["restart"] == "no" and keygen["network_mode"] == "none"
+    assert keygen["environment"]["MMR_KEYGEN_CONTAINER"] == "1"
+    writable = [n for n, svc in compose["services"].items()
+                if any("keys/rpc" in str(v) and not str(v).endswith(":ro") and "tmpfs" not in str(v) for v in svc.get("volumes", []))]
+    assert writable == ["keygen"]
+    cli = compose["services"]["cli"]
+    assert cli.get("profiles") == ["tools"] and cli.get("restart") == "no" and not cli.get("ports")
+
+def test_trader_container_has_cli_pub_but_never_cli_key(compose):
+    files = _visible_rpc_files(compose["services"]["trader"])
+    assert "cli.pub" in files and "cli.key" not in files
+
+def test_runbook_never_execs_the_cli_in_the_trader_container():
+    text = Path("docs/OPERATIONAL_STATE.md").read_text()
+    assert "exec trader python -m trader.mmr_cli" not in text and "docker compose run --rm cli" in text
+
 def test_no_service_references_the_retired_hmac_key(compose_text):
     assert "service_hmac" not in compose_text and "MMR_SERVICE_HMAC_KEY_FILE" not in compose_text
 ```
 
 ```python
 # tests/test_docker_helper.py (replaces :179 and :199)
+def test_k_runs_keygen_in_the_one_shot_container_as_the_host_user(fake_docker):
+    result = fake_docker.run("-k")
+    call = fake_docker.compose_calls[-1]
+    assert result.returncode == 0 and call[:3] == ["run", "--rm", "--no-deps"] and "keygen" in call and "init" in call
+    assert f"{os.getuid()}:{os.getgid()}" in call
+    assert stat.S_IMODE(os.lstat(fake_docker.home / ".config/mmr/keys/rpc").st_mode) == 0o700   # created by docker.sh, not by Docker
+
+def test_k_rotate_passes_the_principal_and_prints_the_restart_list(fake_docker):
+    write_keyset(fake_docker.home / ".config/mmr/keys/rpc")
+    result = fake_docker.run("-k", "--rotate", "dashboard")
+    assert fake_docker.compose_calls[-1][-2:] == ["--rotate", "dashboard"] and "restart" in result.stdout
+
+def test_k_rejects_an_unknown_principal_before_any_docker_call(fake_docker):
+    assert fake_docker.run("-k", "--rotate", "../x").returncode != 0 and not fake_docker.compose_calls
+
 def test_up_refuses_when_an_rpc_key_is_missing(fake_docker):
     write_keyset(fake_docker.home / ".config/mmr/keys/rpc"); (fake_docker.home / ".config/mmr/keys/rpc/strategy.pub").unlink()
     result = fake_docker.run("-u")
     assert result.returncode != 0 and "mmr keys init" in result.stdout and not fake_docker.compose_calls
+
+def test_up_never_deletes_an_existing_hmac_key_and_reminds_the_operator(fake_docker):
+    write_keyset(...); key = fake_docker.home / ".config/mmr/service_hmac.key"; key.write_text("old")
+    result = fake_docker.run("-u")
+    assert result.returncode == 0 and key.read_text() == "old" and "delete it when the cutover is verified" in result.stdout
+    assert "rm " not in Path("docker.sh").read_text().split("_require_rpc_keys")[1].split("}")[0]   # the helper itself never removes anything
+
+def test_db_backup_helper_excludes_the_rpc_key_directory(fake_docker):
+    write_keyset(...); fake_docker.run("-B", "t")
+    assert not list(fake_docker.backup_dir.rglob("*.key")) and not list(fake_docker.backup_dir.rglob("*.pub"))
 
 def test_up_no_longer_provisions_an_hmac_key_and_strips_the_yaml_line(fake_docker):
     write_keyset(...); fake_docker.trader_yaml.write_text("service_hmac_key_file: ~/.config/mmr/service_hmac.key\n")
@@ -836,19 +966,54 @@ def test_up_no_longer_provisions_an_hmac_key_and_strips_the_yaml_line(fake_docke
 ```python
 # tests/fullstack/test_rpc_key_mounts.py  (profile "test"; runs inside fullstack-tests with docker.sock)
 @pytest.mark.parametrize("service,principal", [("trader","trader"), ("strategy","strategy"),
-                                               ("dashboard","dashboard"), ("scheduler","scheduler"), ("data",None)])
+                                               ("dashboard","dashboard"), ("scheduler",None), ("data",None)])
 def test_container_lists_only_its_keys(docker_client, service, principal):
     out = _exec(docker_client, service, ["ls", "/home/trader/.config/mmr/keys/rpc"])
     expected = set() if principal is None else {f"{principal}.key"} | {f"{p}.pub" for p in peers_for(principal)}
     assert set(out.split()) == expected
 ```
 
+```python
+# tests/test_scheduler_acl.py  (owner answer 3: the scheduler ACL may not grow beyond what the listed jobs need)
+import yaml
+from trader.messaging import principals
+from trader.messaging.principals import TRADER_ACL, STRATEGY_ACL
+
+# Every pycron job and the typed methods it needs. Adding a job without a row fails the first test.
+SCHEDULED_JOB_RPC_NEEDS = {
+    "data_refresh_us": frozenset(),    # data refresh: get_status probe + resolve fallback are soft (mmr_cli.py:8840,8872)
+    "data_refresh_asx": frozenset(),
+    "db_backup": frozenset(),          # data backup: local files only
+}
+SCHEDULER_ACL_ALLOWED = frozenset().union(*SCHEDULED_JOB_RPC_NEEDS.values())
+
+def _pycron_jobs():
+    cfg = yaml.safe_load(Path("config_defaults/pycron.yaml").read_text())
+    return {j["name"]: j for j in cfg["jobs"]}      # implementer: use the real top-level key of that file
+
+def test_every_scheduled_job_is_classified():
+    assert set(_pycron_jobs()) == set(SCHEDULED_JOB_RPC_NEEDS)
+
+def test_scheduler_acl_never_grows_beyond_the_listed_jobs():
+    granted = {m for (_, m), who in {**TRADER_ACL, **STRATEGY_ACL}.items() if "scheduler" in who}
+    assert granted <= SCHEDULER_ACL_ALLOWED
+    assert "scheduler" not in principals.KNOWN_PRINCIPALS
+
+def test_scheduler_container_has_no_rpc_keys(compose):
+    assert _visible_rpc_files(compose["services"]["scheduler"]) == set()
+
+def test_data_refresh_survives_with_no_trader_and_no_keys(tmp_path, monkeypatch):
+    monkeypatch.delenv("MMR_RPC_PRINCIPAL", raising=False)         # empty keys dir (conftest fixture)
+    summary = run_data_download_for_known_local_symbol(tmp_path)    # helper in the test: symbol already in the local universe DB
+    assert summary["failed"] == 0                                   # probe failed softly, local resolution sufficed
+```
+
 - [ ] **Step 2: Run, expect FAIL.**
 - [ ] **Step 3: Implement.**
   - Compose: the mount block above per service, generated by hand from `peers_for` (the static test pins it). Remove the HMAC env lines and their comments; add one comment block near `x-mmr-hardening` explaining the overlay and the "missing file becomes a directory" trap.
-  - `docker.sh`: delete `_read_service_hmac_key_file` / `_write_portable_service_hmac_key_file` and the provisioning branch of `ensure_split_config`. Add `_require_rpc_keys`: derive the required host files from `docker-compose.yml` itself (`grep -oE '\$\{HOME\}/\.config/mmr/keys/rpc/[a-z_]+\.(key|pub)'`, no second principal list), and refuse `-u` if any is missing or not a regular file, printing `Run on the host: mmr keys init`. If `trader.yaml` has a `service_hmac_key_file:` line, remove it with `sed -i.bak`. If `~/.config/mmr/service_hmac.key` exists, print one line: "retired HMAC key left in place; delete it when the cutover is verified".
-  - `start_mmr.sh:650-706`: replace `ensure_service_hmac_key` with `ensure_rpc_keys`, which runs `python3 -m trader.mmr_cli keys init` (idempotent) — ruling 16.
-  - Docs: in `CLAUDE.md` replace "Typed HMAC RPC" wording with "Typed Ed25519 RPC (per-principal keys, allow-list in `trader/messaging/principals.py`)", the ports table protocol column, the `.env`/`service_hmac.key` sentence (now `~/.config/mmr/keys/rpc/`, `mmr keys init`), and add `mmr keys init` to the CLI command list. In `docs/OPERATIONAL_STATE.md` change `docker compose exec trader python -m trader.mmr_cli …` to the host `mmr …` form with a note that in-container CLI calls are refused (no `cli` key there).
+  - `docker.sh`: delete `_read_service_hmac_key_file` / `_write_portable_service_hmac_key_file` and the provisioning branch of `ensure_split_config`. Add `_require_rpc_keys`: derive the required host files from `docker-compose.yml` itself (`grep -oE '\$\{HOME\}/\.config/mmr/keys/rpc/[a-z_]+\.(key|pub)'`, no second principal list; the `cli` service's files count too, so `-u` fails early if `cli.key` is missing), and refuse `-u` if any is missing or not a regular file, printing `Run ./docker.sh -k`. If `trader.yaml` has a `service_hmac_key_file:` line, remove it with `sed -i.bak`. If `~/.config/mmr/service_hmac.key` exists, print one line: "retired HMAC key left in place; delete it when the cutover is verified".
+  - `start_mmr.sh:650-706`: replace `ensure_service_hmac_key` with `ensure_rpc_keys`, which runs `./docker.sh -k` (idempotent) when Docker is available, else `python3 -m trader.mmr_cli keys init` — ruling 16.
+  - Docs: in `CLAUDE.md` replace "Typed HMAC RPC" wording with "Typed Ed25519 RPC (per-principal keys, allow-list in `trader/messaging/principals.py`)", the ports table protocol column, the `.env`/`service_hmac.key` sentence (now `~/.config/mmr/keys/rpc/`, `mmr keys init`), and add `./docker.sh -k [--rotate P]` and `mmr keys init|backup|restore` to the CLI command list (`-k` is the documented keygen path). In `docs/OPERATIONAL_STATE.md` replace `docker compose exec trader python -m trader.mmr_cli …` (lines 40 and 283) with `docker compose run --rm cli …` for strategy commands, keep the host `mmr …` form for trader commands over the published ports, and state that exec into `trader` is refused (no `cli` key there). Add a "RPC keys" section: (0) first setup: `./docker.sh -b`, `./docker.sh -k`; **cutover step, owner-run before the first cutover `-u`: `docker compose --profile test run fullstack-tests`** (proves the `tmpfs` + per-file bind overlay, the `cli` and `keygen` services on your Docker Desktop/Podman; abort the cutover on any failure); then `./docker.sh -u`; (1) rotation: `mmr keys backup`, `./docker.sh -k --rotate <p>`, restart every listed service together (in-flight requests fail), run the Task 7 matrix; (2) lost private key or lost host: restore from the encrypted backup, else rotate that principal (all servers that trust it restart together); (3) backup and restore commands and where the age identity must live; (4) HMAC retirement: the checklist and `rm ~/.config/mmr/service_hmac.key` (ruling 14); (5) RPC keys and bundle-signing keys stay separate.
 - [ ] **Step 4: Run** the three test files (the fullstack one only with `docker compose --profile test run fullstack-tests`, which needs built images — owner step, not run in CI), then the full suite.
 - [ ] **Step 5: Commit** — `feat: mount per-principal rpc keys and retire hmac provisioning`.
 
@@ -872,13 +1037,14 @@ EDGES = [  # (caller, server, role, method) — one real allowed call per trust-
     ("cli", "strategy", "query", "list_strategies"),
     ("dashboard", "trader", "query", "get_positions"),
     ("dashboard", "strategy", "command", "enable_strategy_by_name"),
+    ("cli", "strategy", "command", "enable_strategy_by_name"),            # ruling 17: direct, as themselves
+    ("dashboard", "trader", "command", "deactivate_live_canary"),         # ruling 18
     ("strategy", "trader", "query", "resolve_instrument"),
     ("strategy", "trader", "command", "create_proposal"),   # valid_body uses source="strategy:matrix"
     ("trader", "strategy", "command", "enable_strategy"),
     ("trader", "strategy", "query", "get_paper_automation_arm"),
     ("ai_supervisor", "trader", "query", "get_account_values"),
     ("ai_research", "trader", "query", "get_snapshot"),
-    ("scheduler", "trader", "query", "resolve_instrument"),
 ]
 
 @pytest.mark.parametrize("caller,server,role,method", EDGES)
@@ -886,7 +1052,7 @@ def test_every_trust_matrix_edge_round_trips(stack, caller, server, role, method
     stack.client(caller, server, role).call(method, stack.valid_body(method), dict)
 
 NON_EDGES = [("ai_supervisor", "strategy"), ("ai_research", "strategy"), ("strategy", "strategy"),
-             ("trader", "trader"), ("scheduler", "strategy")]
+             ("trader", "trader")]
 
 @pytest.mark.parametrize("caller,server", NON_EDGES)
 def test_non_edges_are_refused(stack, caller, server):
@@ -908,12 +1074,49 @@ class TestEachServerRefuses:
     def test_legacy_hmac(self, stack, server):
         assert stack.raw_code(stack.legacy_hmac_envelope(), to=server) == "AUTHENTICATION_ERROR"
 
+def test_scheduler_has_no_identity(stack):
+    with pytest.raises(RpcKeyError):
+        stack.identity_for("scheduler")                        # no key, not a principal
+
+def test_dashboard_cannot_activate_but_cli_can_reach_the_handler(stack):
+    assert stack.raw_code(stack.signed("dashboard", "trader", "command", "activate_live_canary")) == "PERMISSION_DENIED"
+    assert stack.raw_code(stack.signed("cli", "trader", "command", "activate_live_canary")) != "PERMISSION_DENIED"
+
+def test_no_code_path_opens_the_retired_hmac_key(tmp_path, monkeypatch):
+    monkeypatch.setattr(builtins, "open", _fail_if_path_contains("service_hmac"))   # plus pathlib.Path.open / read_bytes
+    ServiceIdentity.load("trader", tmp_path); stack_roundtrip(tmp_path)
+
 def test_bundle_key_cannot_sign_rpc(stack, tmp_path):
     signer = AttestationSigner.generate()                    # a bundle key
     assert stack.raw_code(stack.signed_with_raw_key(signer, claim="cli")) == "AUTHENTICATION_ERROR"
 ```
 
   `stack.raw_code(...)` sends bytes on a raw DEALER and returns `problem.code` after verifying the reply with the server's real public key (so the refusal itself is authentic).
+
+```python
+# tests/test_rpc_key_rotation.py  (owner answer 7: rotation is a coordinated switch)
+@pytest.mark.parametrize("rotated", sorted(KNOWN_PRINCIPALS))
+def test_rotating_one_principal_flips_trust_on_every_server_that_trusts_it(tmp_path, rotated):
+    keys = tmp_path / "rpc"; init_keys(keys)
+    old_signer = ServiceIdentity.load(rotated, keys)           # keeps the old private key in memory
+    init_keys(keys, rotate=rotated)
+    trusting = [s for s in SERVER_PRINCIPALS if rotated in SERVER_ACCEPTS[s]]
+    for server in SERVER_PRINCIPALS:
+        stack = start_server(server, keys)                      # fresh process-equivalent: reloads keyring from disk
+        if server in trusting:
+            assert stack.raw_code(stack.signed_with(old_signer, to=server)) == "AUTHENTICATION_ERROR"   # old key refused
+            assert stack.raw_code(stack.signed_with(ServiceIdentity.load(rotated, keys), to=server)) != "AUTHENTICATION_ERROR"
+        else:
+            assert rotated not in stack.trusted_principals()    # rotation changes nothing there
+    if rotated in SERVER_PRINCIPALS:                            # a server's own key rotated: peers must reload too
+        peer = start_server("cli_view", keys)                   # client verifying the server reply with the new .pub
+        assert peer.client_accepts_reply_from(rotated)
+
+def test_running_server_keeps_the_old_keyring_until_restarted(tmp_path):
+    keys = tmp_path / "rpc"; init_keys(keys); server = start_server("trader", keys)
+    init_keys(keys, rotate="cli")
+    assert server.raw_code(server.signed_with(old_cli_identity, to="trader")) != "AUTHENTICATION_ERROR"   # why the restart list matters
+```
 
 - [ ] **Step 2: Run.** These tests pin behaviour built in Tasks 3–5 and should pass on the first run. Any failure is a defect in an earlier task: fix it there (same branch, a `fix:` commit naming the task), not by weakening this test.
 - [ ] **Step 3: Full suite**, then `grep -rn "Hmac\|service_hmac" trader web scripts config_defaults docker-compose.yml docker.sh start_mmr.sh` (only the retirement warning, its test and the docker.sh yaml cleanup may match).
@@ -941,6 +1144,7 @@ def test_bundle_key_cannot_sign_rpc(stack, tmp_path):
 | Keys at `~/.config/mmr/keys/rpc/<p>.key` (0600) / `.pub`, by `mmr keys init` | 1, 2 |
 | No container mounts another principal's private key | 6 |
 | Split-service round trips + five refusals on each server | 7 |
+| Owner answers 1, 3-7 (rulings 5, 13-15, 17-19): `cli` container, empty scheduler ACL with a guard test, direct strategy control, `cli`-only activation, HMAC never auto-deleted, encrypted key backup and tested rotation | 1, 2, 4, 5, 6, 7 |
 | Hard cutover, no dual-key mode, old key refused | 3, 6 |
 | AI principals cannot call `approve_proposal`, `execute_automated_intent`, `place_standalone_order` or set limits | 5 |
 | Source derived from the key, never the body | 5 |
@@ -949,11 +1153,9 @@ Not in this plan (by design): `publish_ai_risk_policy`, `submit_ai_paper_decisio
 
 ## Open questions for the owner
 
-1. **CLI inside containers.** Today's runbook runs `docker compose exec trader python -m trader.mmr_cli …` (`docs/OPERATIONAL_STATE.md:40,283`). After the cutover that fails: the trader container holds only `trader.key`, and `trader → trader` is not an edge. The plan moves the runbook to the host CLI. Alternative: a dedicated `cli` tools container that mounts `cli.key`. Which one?
-2. **How the owner runs `mmr keys init`.** The plan assumes a host Python install (`uv`/`.venv`). If you only run Docker, we need a `./docker.sh` subcommand that runs keygen in a throwaway container with `~/.config/mmr/keys/rpc` bind-mounted (and no `tmpfs` overlay); that also needs an explicit `--allow-container` flag past ruling 15. Do you want that?
-3. **`scheduler` rights.** `data refresh` needs `get_status`, `resolve_instrument` and `discover_instrument` on the trader (ruling 5). Confirm these three are all the scheduler should have.
-4. **Dashboard rights on strategy controls.** The plan gives `dashboard` and `cli` direct `enable/disable_strategy_by_name` and `reload_strategies` on the strategy service (they call them today), and the coordinator path through the trader. Keep both, or route all strategy control through the trader?
-5. **Live canary and allocation activation** stay callable by `cli` and `dashboard` (both today). The code comments call this a "human-operator-only surface". Restrict to `cli` only?
-6. **Old `service_hmac.key`.** The plan leaves the file and prints a reminder. Delete it automatically on the first successful `-u` instead?
-7. **Key backup.** `./docker.sh -B` backs up DuckDB, not `~/.config/mmr/keys`. Losing the keys only means re-running `mmr keys init` and restarting (no data is signed with RPC keys), so the plan adds no backup. Agree?
-8. **Docker/Podman overlay check.** The `tmpfs` + per-file bind overlay is pinned by a static compose test and a fullstack test, but it has not been run on your Docker Desktop or Podman. Please run `docker compose --profile test run fullstack-tests` once after `./docker.sh -b`, before the cutover `-u`.
+Answered (now rulings): CLI in containers and keygen in Docker (15), scheduler rights (5), strategy control (17), activation (18), old HMAC key (14), key backup (13, 19); the Docker overlay check is an explicit owner-run cutover step in Task 6 docs.
+
+New, from the owner answers:
+
+1. **Backup tool (ruling 19).** The plan proposes `age` with a public recipient file (small, no keyring, plaintext never on disk, offline private identity). Alternatives: `gpg`, or the macOS keychain / 1Password CLI. Which one? Where does the age identity live? `mmr keys backup|restore` run on the host (they need the `age` binary and the backups directory); do you want them in a one-shot container too?
+2. **Retired HMAC file visibility (ruling 14).** Containers mount the whole `~/.config/mmr`, so `service_hmac.key` stays readable inside them until you delete it by hand (nothing reads it). Accept that, or hide it with a `/dev/null` bind per service (Docker would create an empty host file if it is already gone)?

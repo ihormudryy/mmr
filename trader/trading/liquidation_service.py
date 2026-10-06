@@ -17,6 +17,7 @@ from __future__ import annotations
 import datetime as dt
 import logging
 import math
+import numbers
 import threading
 from contextlib import contextmanager
 from dataclasses import dataclass, replace
@@ -592,6 +593,25 @@ class LiquidationRunStore:
         return self._db.transaction(read)
 
 
+def _exact_conid(conid) -> int:
+    """#21, ruling 51: an exact positive integer conId, or the close is refused before any claim.
+
+    ``1.5``, ``True`` and ``"265598"`` are never coerced: a coerced id can close another instrument.
+    """
+    if isinstance(conid, bool) or not isinstance(conid, numbers.Integral) or int(conid) <= 0:
+        raise LiquidationRefused("CONID_INVALID", f"conid must be a positive integer, got {conid!r}")
+    return int(conid)
+
+
+def _requested_quantity(quantity) -> Optional[float]:
+    """A partial quantity is a finite real number (not a bool, not a string); None is a full close."""
+    if quantity is None:
+        return None
+    if isinstance(quantity, bool) or not isinstance(quantity, numbers.Real) or not math.isfinite(quantity):
+        raise LiquidationRefused("PARTIAL_QUANTITY_INVALID", f"quantity must be a finite number, got {quantity!r}")
+    return float(quantity)
+
+
 def _reducing_side(quantity: float) -> str:
     return "SELL" if float(quantity) > 0 else "BUY"
 
@@ -711,10 +731,8 @@ class LiquidationService:
             outcome, root = self._store.transaction(
                 lambda conn: self._claim_account_in_tx(conn, account_id, cause_command_id, deadline))
         elif scope == "conid":
-            if conid is None:
-                raise ValueError("conid scope requires a conid")
-            outcome, root = self._claim_scoped(account_id, cause_command_id, int(conid), quantity,
-                                               deadline, stop_price, target_price)
+            outcome, root = self._claim_scoped(account_id, cause_command_id, _exact_conid(conid),
+                                               _requested_quantity(quantity), deadline, stop_price, target_price)
         else:
             raise ValueError(f"unknown liquidation scope {scope!r}")
         if outcome in (CLAIMED, "EXISTING"):
@@ -725,7 +743,7 @@ class LiquidationService:
     def _claim_scoped(self, account_id, cause, conid, quantity, deadline, stop_price, target_price):
         """D15: a retry finds its root first; a partial request then learns ExitInProgress, and
         only a new partial request is admitted against a broker snapshot before it claims."""
-        requested = None if quantity is None else float(quantity)
+        requested = quantity
         goal = "zero" if requested is None else "partial"
         existing = self._store.transaction(lambda conn: self._existing_in_tx(
             conn, account_id, cause, conid=conid, goal=goal, quantity=requested))

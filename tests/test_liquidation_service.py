@@ -11,8 +11,8 @@ from trader.data.duckdb_store import DuckDBConnection
 from trader.data.schema_migrations import SchemaMigrator
 from trader.trading.exit_owner import ExitOwnerRegistry, apply_exit_owner_migration
 from trader.trading.liquidation_service import (
-    ChildRef, DispatchRefused, LiquidationBusy, LiquidationReceipt, LiquidationRunStore, LiquidationService,
-    RunStateError, apply_liquidation_migration,
+    ChildRef, DispatchRefused, LiquidationBusy, LiquidationReceipt, LiquidationRefused, LiquidationRunStore,
+    LiquidationService, RunStateError, apply_liquidation_migration,
 )
 from trader.trading.order_correlation import matches_legacy_reduce
 
@@ -1208,6 +1208,36 @@ def test_start_refuses_rebinding_root_to_another_scope(tmp_path):
         s.service.start(ACCOUNT, "root-2", DEADLINE, scope="conid", conid=1)
 
 
+def test_an_old_flat_runs_late_reduce_blocks_a_scoped_close(tmp_path):
+    """Ruling 49 on the conid scope: the old FLAT run's wildcard child blocks a full close too."""
+    _legacy_db(tmp_path, (("old-flat", "FLAT", 1),))
+    s = _stack(tmp_path, [_snapshot(5, [_position()]), _snapshot(6, [_position()])], protection=_Protection())
+    s.dispatch.rows["old-flat-liquidation-reduce-1"] = [_row("Submitted", entity="old-flat-liquidation-reduce-1:exit")]
+    s.service.start(ACCOUNT, "close-1", DEADLINE, scope="conid", conid=1)
+    assert "still working" in s.service.rescan().detail
+    assert s.dispatch.calls == []
+
+
+@pytest.mark.parametrize("conid", [1.5, True, "1", 0, -1, None], ids=repr)
+def test_a_conid_that_is_not_an_exact_positive_integer_is_refused_before_any_claim(tmp_path, conid):
+    """#21, ruling 51: 1.5, True or "1" never become conId 1; nothing is claimed, read or sent."""
+    s = _stack(tmp_path, [_snapshot(1, [_position()])], protection=_Protection())
+    with pytest.raises(LiquidationRefused) as ex:
+        s.service.start(ACCOUNT, "close-1", DEADLINE, scope="conid", conid=conid)
+    assert ex.value.code == "CONID_INVALID"
+    assert s.service.root_for("close-1") is None and s.registry.owner_for(ACCOUNT, 1) is None
+    assert (s.broker.calls, s.dispatch.calls) == (0, [])
+
+
+@pytest.mark.parametrize("quantity", [True, "4", float("nan"), float("inf")], ids=repr)
+def test_a_partial_quantity_that_is_not_a_finite_number_is_refused_before_any_claim(tmp_path, quantity):
+    s = _stack(tmp_path, [_snapshot(1, [_position()])], protection=_Protection())
+    with pytest.raises(LiquidationRefused) as ex:
+        s.service.start(ACCOUNT, "p-1", DEADLINE, scope="conid", conid=1, quantity=quantity)
+    assert ex.value.code == "PARTIAL_QUANTITY_INVALID"
+    assert s.service.root_for("p-1") is None and (s.broker.calls, s.dispatch.calls) == (0, [])
+
+
 def test_an_old_reduce_of_a_flat_position_blocks_a_scoped_close_of_that_conid(tmp_path):
     _legacy_db(tmp_path, (("flat-1", "FAILED_SAFE", 1),))
     s = _stack(tmp_path, [_snapshot(5, [_position(0.0)]), _snapshot(6, [_position(0.0)])])
@@ -1249,8 +1279,6 @@ def test_the_wildcard_blocks_a_scoped_close_of_another_conid(tmp_path):
 # ---------------------------------------------------------------------------
 # Task 6: partial close, re-protect, escalation
 # ---------------------------------------------------------------------------
-
-from trader.trading.liquidation_service import LiquidationRefused  # noqa: E402
 
 
 def _priced(quantity=10.0, conid=1, price=100.0):

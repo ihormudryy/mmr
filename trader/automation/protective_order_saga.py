@@ -904,12 +904,13 @@ class ProtectiveOrderSaga:
 
     def release_after_partial(self, *, close_root_id: str, remaining_quantity: float, stop_group: str,
                               stop_status: str, target_group: Optional[str], target_status: Optional[str],
-                              now: dt.datetime) -> None:
+                              now: dt.datetime, protection_problem: Optional[str] = None) -> None:
         """Back to protection of the remainder, judged from the legs' broker status at release.
 
         The new legs become the only live protection (a new protection
-        generation). A leg that is not working, or a pending leg lost while
-        the close owned the saga, is today's incident path.
+        generation). A leg that is not working, a pending leg lost while the
+        close owned the saga, or a ``protection_problem`` the close found
+        under its release hold (#22/#25 round 7) is today's incident path.
         """
         def attempt():
             states = self._store.load_by_close_root(close_root_id)
@@ -937,7 +938,7 @@ class ProtectiveOrderSaga:
             # event handling counts PendingCancel (and not-yet-accepted statuses) as working; at
             # release they are not protection.
             stop_accepted = stop_status in _RELEASE_STOP_STATUSES
-            if keeper.pending_protection_lost or not stop_accepted \
+            if protection_problem or keeper.pending_protection_lost or not stop_accepted \
                     or released.state not in ("PROTECTED", "EXITING", "CLOSED"):
                 released = replace(released, state="SAFETY_FAILED", flatten_requested=True,
                                    error_code=released.error_code or "PROTECTION_LOST_DURING_CLOSE")

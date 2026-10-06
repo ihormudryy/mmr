@@ -237,6 +237,7 @@ class _Protection:
         self.calls = []
         self.info = (stop_price, target_price)
         self.crash_on: set[str] = set()
+        self.release_problems: list = []    # the protection_problem of each release, in order
 
     def _call(self, name, *args):
         if name in self.crash_on:
@@ -256,7 +257,8 @@ class _Protection:
         self._call("expect_reprotect", close_root_id, tuple(groups))
 
     def release_after_partial(self, *, close_root_id, remaining_quantity, stop_group, stop_status,
-                              target_group, target_status, now):
+                              target_group, target_status, now, protection_problem=None):
+        self.release_problems.append(protection_problem)
         self._call("release_after_partial", close_root_id, remaining_quantity, stop_group, target_group)
 
     def close_after_full(self, *, close_root_id, now):
@@ -2528,3 +2530,76 @@ def test_a_working_target_larger_than_the_position_is_cancelled_and_the_close_es
     assert any("target" in detail for _root, detail in s.breaker.calls)
     assert any(c[0] == "cancel" and c[1] == "target-e" for c in s.dispatch.calls)
     assert s.service.close_resolution("p-1") is None
+
+
+def _done_with_a_busy_release(tmp_path):
+    """A partial close ends DONE with its stop working; the release hold is busy, so cleanup waits."""
+    s, protection = _to_reprotect(tmp_path, target=None, extra=(_snapshot(4, [_priced(6.0)]),))
+    s.dispatch.rows["p-1-reprotect-stop-1-1"] = [_leg_row(entity="stop-e")]
+    holds = []
+
+    def busy_after_done():
+        holds.append(1)
+        s.dispatch.hold_busy = len(holds) == 2
+    s.dispatch.before_hold = busy_after_done
+    receipt = s.service.rescan()                                          # gen 4: DONE, release busy
+    assert (receipt.state, receipt.cleanup_pending) == ("DONE", True)
+    s.dispatch.before_hold, s.dispatch.hold_busy = None, False
+    return s, protection
+
+
+@pytest.mark.parametrize("restart", [False, True], ids=["same process", "after a restart"])
+def test_a_pending_release_finishes_after_a_later_close_inherits_the_done_roots_stop(tmp_path, restart):
+    """#21/#22 round 7 (openai): the release hold was busy, the owner already released. A later full
+    close inherits the WORKING stop. The release still finds the legs its root wrote, so cleanup
+    finishes and the joined command resolves; it never crashes on a missing leg."""
+    s, protection = _done_with_a_busy_release(tmp_path)
+    s.push(_snapshot(5, [_priced(6.0)]), _snapshot(6, [_priced(6.0)]))
+    s.service.start(ACCOUNT, "exit-1", DEADLINE, scope="conid", conid=1)   # inherits the stop
+    assert next(c for c in s.service.receipt_for("exit-1").children
+                if c.kind == "reprotect-stop").owner_root_id == "exit-1"
+    if restart:
+        s.restart()
+    s.service.rescan()
+    assert s.store.receipt("p-1").cleanup_pending is False
+    assert protection.calls.count(("release_after_partial", "p-1", 6.0, "p-1-reprotect-stop-1-1", None)) == 1
+    assert s.service.close_resolution("p-1").state == "DONE"
+
+
+_RELEASE_CHANGES = {
+    "position grew": lambda s: setattr(s.broker, "current", _snapshot(4, [_priced(8.0)])),
+    "position closed": lambda s: setattr(s.broker, "current", _snapshot(4, [])),
+    "stop lost its OCA link": lambda s: s.dispatch.rows.__setitem__(
+        "p-1-reprotect-stop-1-1", [_leg_row(group="")]),
+    "stop no longer reduces": lambda s: s.dispatch.rows.__setitem__(
+        "p-1-reprotect-stop-1-1", [_leg_row(action="BUY")]),
+    "stop outstanding below the position": lambda s: s.dispatch.rows.__setitem__(
+        "p-1-reprotect-stop-1-1", [_leg_row(total=5.0)]),
+}
+
+
+@pytest.mark.parametrize("change", _RELEASE_CHANGES.values(), ids=_RELEASE_CHANGES.keys())
+def test_a_release_that_finds_broken_protection_under_its_hold_takes_the_safety_failure_path(
+        tmp_path, change):
+    """#22/#25 round 7 (openai): after DONE and before the release hold, the stop stays Submitted but
+    loses its OCA link or side, or the position no longer matches its outstanding. The release
+    re-checks all of it under the hold and hands the saga a protection problem, never PROTECTED."""
+    s, protection = _to_reprotect(tmp_path, target=None, extra=(_snapshot(4, [_priced(6.0)]),))
+    s.dispatch.rows["p-1-reprotect-stop-1-1"] = [_leg_row()]
+    holds = []
+
+    def ingest_after_done():
+        holds.append(1)
+        if len(holds) == 2:
+            change(s)
+    s.dispatch.before_hold = ingest_after_done
+    receipt = s.service.rescan()                                          # gen 4: DONE, then release
+    assert receipt.state == "DONE" and receipt.cleanup_pending is False
+    assert len(protection.release_problems) == 1 and protection.release_problems[0]
+
+
+def test_a_release_with_intact_protection_reports_no_problem(tmp_path):
+    s, protection = _to_reprotect(tmp_path, target=None, extra=(_snapshot(4, [_priced(6.0)]),))
+    s.dispatch.rows["p-1-reprotect-stop-1-1"] = [_leg_row()]
+    assert s.service.rescan().state == "DONE"
+    assert protection.release_problems == [None]

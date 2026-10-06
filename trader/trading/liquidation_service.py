@@ -257,7 +257,8 @@ class ProtectionOwnershipPort(Protocol):
     def expect_reprotect(self, *, close_root_id: str, groups: tuple[str, ...], now: dt.datetime) -> None: ...
     def release_after_partial(self, *, close_root_id: str, remaining_quantity: float,
                               stop_group: str, stop_status: str, target_group: Optional[str],
-                              target_status: Optional[str], now: dt.datetime) -> None: ...
+                              target_status: Optional[str], now: dt.datetime,
+                              protection_problem: Optional[str] = None) -> None: ...
     def close_after_full(self, *, close_root_id: str, now: dt.datetime) -> None: ...
 
 
@@ -485,6 +486,13 @@ class LiquidationRunStore:
         rows = conn.execute(
             f"SELECT {', '.join(_CHILD_COLUMNS)} FROM liquidation_children WHERE owner_root_id = ? "
             "ORDER BY fence_generation, child_id", [owner_root_id]).fetchall()
+        return tuple(_child_from_row(r) for r in rows)
+
+    def reprotect_legs_written_by_in_tx(self, conn, root_id: str) -> tuple[ChildRef, ...]:
+        """The re-protect legs a root wrote, whoever owns them now (#21/#22 round 7: its release target)."""
+        rows = conn.execute(
+            f"SELECT {', '.join(_CHILD_COLUMNS)} FROM liquidation_children WHERE root_id = ? "
+            "AND kind IN ('reprotect-stop', 'reprotect-target') ORDER BY child_id", [root_id]).fetchall()
         return tuple(_child_from_row(r) for r in rows)
 
     def child_in_tx(self, conn, child_id: str) -> Optional[ChildRef]:
@@ -1245,18 +1253,58 @@ class LiquidationService:
         return self._store.receipt(root)
 
     def _release_after_partial(self, receipt: LiquidationReceipt) -> None:
-        """#22/#25 round 6: call only while broker changes are held.
+        """#22/#25 rounds 6-7: call only while broker changes are held.
 
-        The legs' rows are read and the saga release is persisted with no
-        ingest batch in between, so the release never applies a stale status.
+        The legs are the ones this root wrote, read by writer: a later close
+        may own them by now (#21/#22 round 7). Their rows and the position are
+        read and the saga release is persisted with no ingest batch in
+        between, so the release never applies a stale status. A working stop
+        must still protect the held position (``_release_problem``);
+        otherwise the saga takes its safety-failure path.
         """
-        stop, target = self._working_legs(receipt)
+        root = receipt.cause_command_id
+        legs = self._store.transaction(lambda conn: self._store.reprotect_legs_written_by_in_tx(conn, root))
+        stop = max((c for c in legs if c.kind == "reprotect-stop"), key=lambda c: c.attempt, default=None)
+        target = max((c for c in legs if c.kind == "reprotect-target"), key=lambda c: c.attempt, default=None)
+        if stop is None:
+            raise RunStateError(f"root {root} is {receipt.state} but wrote no re-protect stop")
+        stop_row = self._leg_row(stop)
+        target_row = None if target is None else self._leg_row(target)
+        position = self._position_for(self._broker.capture(receipt.account_id), receipt.conid)
+        problem = self._release_problem(position, (stop, stop_row), (target, target_row))
+        if problem is not None:
+            log.error("liquidation %s release finds broken protection: %s", root, problem)
         self._protection.release_after_partial(
-            close_root_id=receipt.cause_command_id, remaining_quantity=float(receipt.remaining_quantity),
-            stop_group=stop.child_id, stop_status=self._leg_status(stop),
+            close_root_id=root,
+            remaining_quantity=float(receipt.remaining_quantity) if position is None
+            else abs(float(position.quantity)),
+            stop_group=stop.child_id, stop_status=self._row_status(stop_row),
             target_group=None if target is None else target.child_id,
-            target_status=None if target is None else self._leg_status(target),
-            now=self._now())
+            target_status=None if target is None else self._row_status(target_row),
+            now=self._now(), protection_problem=problem)
+
+    def _release_problem(self, position, *legs) -> Optional[str]:
+        """#22/#25 round 7: what breaks a working stop's protection of the held position; None if nothing.
+
+        A stop row that is not healthy is left to the saga's status rules. A
+        healthy stop, and a healthy target, must be linked in the OCA group,
+        reduce the position and have it all outstanding.
+        """
+        stop_row = legs[0][1]
+        if self._row_status(stop_row) not in _BROKER_HEALTHY:
+            return None
+        if position is None:
+            return "the stop works but there is no position"
+        side, held = _reducing_side(position.quantity), abs(float(position.quantity))
+        for leg, row in legs:
+            if leg is None or self._row_status(row) not in _BROKER_HEALTHY:
+                continue
+            if not self._linked(row, leg.oca_group, side):
+                return f"{leg.child_id} is not a linked leg that would {side} the position"
+            outstanding = max(float(getattr(row, "total_quantity", 0.0) or 0.0) - self._broker_fill(leg, [row]), 0.0)
+            if outstanding != held:
+                return f"{leg.child_id} outstanding {outstanding} != position {held}"
+        return None
 
     def _schedule_commands(self, root: str) -> None:
         """Hand every command waiting on this root to the reconciler, its only resolver (D12).
@@ -1532,7 +1580,10 @@ class LiquidationService:
         return rows[0] if len(rows) == 1 else None
 
     def _leg_status(self, leg: ChildRef) -> str:
-        row = self._leg_row(leg)
+        return self._row_status(self._leg_row(leg))
+
+    @staticmethod
+    def _row_status(row) -> str:
         return "Unknown" if row is None else str(getattr(row, "status", "Unknown"))
 
     def _start_reprotect(self, receipt, snapshot, position) -> LiquidationReceipt:
@@ -1706,7 +1757,7 @@ class LiquidationService:
     def _target_admission(self, receipt, stop: ChildRef, position, generation: int):
         """(problem, why, held position); problem is None, 'unhealthy', 'unlinked' or 'changed'. Call under the hold."""
         row = self._leg_row(stop)
-        status = "Unknown" if row is None else str(getattr(row, "status", "Unknown"))
+        status = self._row_status(row)
         if status not in _BROKER_HEALTHY:
             return "unhealthy", status, None
         try:

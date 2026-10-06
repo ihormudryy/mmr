@@ -1220,6 +1220,22 @@ def test_release_with_a_stop_that_is_not_working_at_the_broker_is_an_incident(tm
     assert any(s.kind == "PROTECTIVE_ORDER_FAILURE" for s in breaker.signals)
 
 
+def test_release_with_a_protection_problem_is_an_incident_even_with_a_submitted_stop(tmp_path):
+    """#22/#25 round 7: the close found the Submitted stop unlinked or undersized under its release
+    hold. The saga takes the safety-failure path instead of recording PROTECTED."""
+    saga, intent, state, breaker, liquidation = _protected(tmp_path)
+    saga.handover(account_id=ACCOUNT, conid=CONID, close_root_id="p-1",
+                  cancels=_cancels(state.order_group_id, "og:stop"), generation=7, now=NOW)
+    saga.release_after_partial(close_root_id="p-1", remaining_quantity=6.0,
+                               stop_group="p-1-reprotect-stop-265598-1", stop_status="Submitted",
+                               target_group=None, target_status=None, now=NOW,
+                               protection_problem="p-1-reprotect-stop-265598-1 outstanding 6.0 != position 8.0")
+    released = saga.resume(intent.command_id)
+    assert (released.state, released.flatten_requested) == ("SAFETY_FAILED", True)
+    assert any(s.kind == "PROTECTIVE_ORDER_FAILURE" for s in breaker.signals)
+    assert liquidation.starts[0][1] == intent.command_id
+
+
 @pytest.mark.parametrize("taker", ["account", "upgrade"])
 def test_cancelling_pending_legs_after_a_takeover_or_upgrade_is_expected(tmp_path, taker):
     """R2-4: the kill (or the upgraded close) cancels the replacement legs; that is not an incident."""

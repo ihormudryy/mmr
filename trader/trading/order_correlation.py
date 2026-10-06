@@ -124,6 +124,7 @@ class OrderObservation:
     source_timestamp: dt.datetime
     oca_group: Optional[str] = None
     oca_type: Optional[int] = None
+    oca_reported: bool = False   # True when the source carries OCA fields; '' / 0 then mean "no OCA" (#45)
 
 
 def normalize_open_order(trade: Any, now: dt.datetime) -> OrderObservation:
@@ -148,6 +149,7 @@ def normalize_open_order(trade: Any, now: dt.datetime) -> OrderObservation:
         source_timestamp=now,
         oca_group=getattr(order, "ocaGroup", None) or None,
         oca_type=int(getattr(order, "ocaType", 0) or 0) or None,
+        oca_reported=hasattr(order, "ocaGroup") and hasattr(order, "ocaType"),
     )
 
 

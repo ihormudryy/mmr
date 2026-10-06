@@ -460,6 +460,11 @@ class ServiceIdentity:
     def key_id(self) -> str:
         return self._key_id
 
+    @property
+    def public_key(self):
+        """This identity's own public key (not secret)."""
+        return self.__private_key.public_key()
+
     def trusted_principals(self) -> frozenset:
         return self._keyring.principals()
 
@@ -923,7 +928,11 @@ class TypedRpcServer:
 
                 try:
                     body = _coerce_response_value(result, registration.response_model)
-                except (ValidationError, TypeError) as exc:
+                    # The reply is signed over canonical JSON; a value that
+                    # cannot be encoded must fail here, in-taxonomy, not
+                    # later in _reply where the client would only time out.
+                    canonical_json(body)
+                except (ValidationError, TypeError, ValueError) as exc:
                     raise _DispatchProblem(
                         "VALIDATION_ERROR", f"handler returned an invalid response: {exc}") from exc
             finally:

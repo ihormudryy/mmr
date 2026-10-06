@@ -267,3 +267,14 @@ def test_load_from_real_key_files(tmp_path):
     identity = ServiceIdentity.load("strategy", tmp_path)
     assert identity.principal == "strategy"
     assert identity.trusted_principals() == {"cli", "dashboard", "trader"}
+
+
+def test_handler_returning_a_non_json_value_fails_loudly_not_silently():
+    ids = make_identities()
+    registry = TypedRpcRegistry(acl=ALLOW_ALL)
+    registry.register("query", "bad", dict, dict, lambda body: {"x": object()})
+    served = ServedStack({("trader", "query"): registry}, ids)
+    try:
+        assert served.raw_code(served.signed("cli", "trader", "query", "bad")) == "VALIDATION_ERROR"
+    finally:
+        served.close()

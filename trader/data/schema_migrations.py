@@ -15,7 +15,10 @@ assigned range.
 
 P1 command-plane safety continues the F3-owned range: migration 24 is the
 durable automation breaker and incident ledger. P3 deterministic automation
-owns **30-39** (protective order sagas begin at migration 30). P4 paper/live
+owns **30-39** (protective order sagas begin at migration 30; 31 session
+controller; 32-34 trade attribution; SP1 safe close: 35 exit owners, 36
+liquidation children and joins, 37 saga close ownership, 38 broker order OCA
+fields; 39 is the last free number). P4 paper/live
 canary promotion owns **40-49** (durable evidence windows begin at migration 40).
 P5 controlled scaling owns **50-59** (signed allocation authorities begin at
 migration 50; OVERRIDE event at 52; portfolio risk authority at 53).

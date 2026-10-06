@@ -98,7 +98,7 @@ def _stop_trade(oca_group, oca_type, status="Submitted"):
 def test_an_explicit_empty_oca_clears_the_stored_link(env):
     """#45: the broker saying "no OCA" ('' and 0) is not a missing field; it clears the link, also after a
     restart, so a close cannot take the leg as linked protection and end DONE."""
-    from trader.trading.command_stack import _LiquidationDispatch
+    from trader.trading.order_correlation import encode_order_ref
 
     env.ingest.on_open_order(_stop_trade("p-1-reprotect-265598-1", 2))
     env.ingest.drain_once()
@@ -109,7 +109,7 @@ def test_an_explicit_empty_oca_clears_the_stored_link(env):
     restarted = BrokerStateStore(DuckDBConnection.get_instance(str(env.db.db_path)))
     [row] = restarted.select_active_orders_in_tx(env.journal.connect())
     assert (row.oca_group, row.oca_type) == (None, None)
-    [found] = _LiquidationDispatch(env.dispatch, None).find_orders(ACCOUNT, "p-1-reprotect-stop-265598-1")
+    [found] = env.dispatch.find_by_order_ref(ACCOUNT, encode_order_ref("p-1-reprotect-stop-265598-1"))
     assert found.oca_type != 2                     # DONE's link check needs type 2 and the group
 
 

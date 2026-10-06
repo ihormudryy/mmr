@@ -21,7 +21,7 @@ import numbers
 import threading
 from contextlib import contextmanager
 from dataclasses import dataclass, replace
-from typing import Any, Callable, Optional, Protocol
+from typing import Any, Callable, ContextManager, Optional, Protocol
 
 from trader.data.schema_migrations import SchemaMigrator
 from trader.domain.commands import CommandReceipt
@@ -52,12 +52,16 @@ _SUCCESS_FOR_GOAL = {
 _FAILURE_CODES = {"FAILED_SAFE": "CLOSE_FAILED_SAFE", "REDUCE_FAILED": "REDUCE_FAILED"}
 
 CHILD_STATES = frozenset({
-    "PLANNED", "UNKNOWN", "WORKING", "FILLED", "CANCELLED", "REJECTED", "ABSENT", "NOT_SENT",
+    "PLANNED", "UNKNOWN", "WORKING", "PENDING_CANCEL", "FILLED", "CANCELLED", "REJECTED", "ABSENT", "NOT_SENT",
 })
 CHILD_TERMINAL = frozenset({"FILLED", "CANCELLED", "REJECTED", "ABSENT", "NOT_SENT"})
+# Live at the broker: blocks every new reduce. Only WORKING is healthy protection (ruling 47).
+CHILD_LIVE = ("WORKING", "PENDING_CANCEL")
+CHILD_OPEN = ("UNKNOWN",) + CHILD_LIVE
 # Terminal children whose broker row may still report a later fill (ruling 50).
 _FILL_MAY_GROW = ("FILLED", "CANCELLED", "REJECTED")
 _BROKER_ACCEPTED = frozenset({"PreSubmitted", "Submitted", "PendingCancel"})
+_BROKER_HEALTHY = frozenset({"PreSubmitted", "Submitted"})
 _BROKER_TERMINAL = {
     "Filled": "FILLED", "Cancelled": "CANCELLED", "ApiCancelled": "CANCELLED",
     "Inactive": "REJECTED", "Rejected": "REJECTED",
@@ -186,6 +190,10 @@ class RunStateError(RuntimeError):
     """A forbidden run change: a terminal or SUPERSEDED run, or a goal moving back to partial."""
 
 
+class BrokerChangesBusy(RuntimeError):
+    """Broker writes could not be held (lock busy, or a generation is staging); decide again later."""
+
+
 class _StaleDispatch(RuntimeError):
     """R7: the journal says this root may no longer dispatch."""
 
@@ -214,6 +222,8 @@ class LiquidationDispatchPort(Protocol):
     def get_order(self, order_entity_id: str) -> Optional[Any]: ...
     def enumeration_complete(self) -> bool: ...
     def newest_generation(self) -> int: ...
+    def hold_broker_changes(self) -> ContextManager[None]:
+        """No broker row or position changes while held; raises ``BrokerChangesBusy`` (ruling 48)."""
 
 
 class LiquidationBreakerPort(Protocol):
@@ -518,7 +528,7 @@ class LiquidationRunStore:
             params.append(int(conid))
         rows = conn.execute(
             "UPDATE liquidation_children SET owner_root_id = ?, updated_at = ? "
-            "WHERE account_id = ? AND state IN ('UNKNOWN', 'WORKING') AND owner_root_id <> ?"
+            "WHERE account_id = ? AND state IN ('UNKNOWN', 'WORKING', 'PENDING_CANCEL') AND owner_root_id <> ?"
             f"{conid_filter} AND owner_root_id IN ("
             "SELECT cause_command_id FROM liquidation_runs WHERE state IN ('SUPERSEDED', 'FAILED_SAFE')) "
             "RETURNING child_id", params).fetchall()
@@ -978,7 +988,7 @@ class LiquidationService:
         in the same transaction (ruling 42).
         """
         generation = int(snapshot.generation_id)
-        changed = [observed for child in self._children_in_force(receipt) if child.state in ("UNKNOWN", "WORKING")
+        changed = [observed for child in self._children_in_force(receipt) if child.state in CHILD_OPEN
                    for observed in (self._evidence(child, generation, newest),) if observed != child]
         if not changed:
             return receipt
@@ -1058,6 +1068,8 @@ class LiquidationService:
         total = float(getattr(row, "total_quantity", 0.0) or 0.0)
         if status in _BROKER_TERMINAL:
             state = _BROKER_TERMINAL[status]
+        elif status == "PendingCancel":
+            state = "PENDING_CANCEL"  # still live (it blocks), but never healthy protection (ruling 47)
         elif status in _BROKER_ACCEPTED:
             state = "WORKING"
         else:
@@ -1111,8 +1123,8 @@ class LiquidationService:
         for child in receipt.children:
             if child.state == "UNKNOWN":
                 return f"{child.child_id} outcome unknown"
-            if child.state == "WORKING":
-                return f"{child.child_id} still working"
+            if child.state in CHILD_LIVE:
+                return f"{child.child_id} still working ({child.state})"
         if not self._fresh(receipt, generation):
             return "awaiting a broker generation newer than the last observed fill"
         return None
@@ -1156,6 +1168,10 @@ class LiquidationService:
         The owner is released here, not in cleanup, so no claim can join a
         root that has already finished.
         """
+        self._commit_terminal(receipt, state, generation_id=generation_id, detail=detail, **fields)
+        return self._after_terminal(receipt, state, detail)
+
+    def _commit_terminal(self, receipt, state: str, *, generation_id=None, detail="", **fields) -> None:
         root = receipt.cause_command_id
         owner_state = STATE_RELEASED if state in OWNER_RELEASED_STATES else STATE_FAILED_SAFE
 
@@ -1168,6 +1184,9 @@ class LiquidationService:
             self._store.drop_planned_in_tx(conn, root, self._now())
             self._registry.finish_in_tx(conn, root, owner_state, self._now())
         self._store.transaction(write)
+
+    def _after_terminal(self, receipt, state: str, detail: str) -> LiquidationReceipt:
+        root = receipt.cause_command_id
         if self._breaker is not None and self._trips_breaker(receipt, state):
             self._breaker.trip_liquidation(root, detail or state)
         return self._cleanup(self._store.receipt(root))
@@ -1300,7 +1319,7 @@ class LiquidationService:
                     child.order_entity_id, child.conid, child.child_id, child.filled_quantity))
         covered = {c.target_order_entity_id for c in receipt.children
                    if c.kind == "cancel" and c.root_id == receipt.cause_command_id
-                   and c.state in ("UNKNOWN", "WORKING")}
+                   and c.state in CHILD_OPEN}
         return tuple(o for entity, o in found.items() if entity not in covered
                      and liquidation_child_kind(getattr(o, "order_group_id", None)) != "reduce")
 
@@ -1512,8 +1531,11 @@ class LiquidationService:
         was refused, rejected, cancelled or lost is a re-protect failure (never sent again).
 
         #22: DONE is decided from one read of each leg's row. A row that no
-        longer matches the child is observed again instead of finishing, and
-        the rows are read once more right before the terminal write.
+        longer matches the child is observed again instead of finishing. Only
+        a ``WORKING`` leg on a ``Submitted``/``PreSubmitted`` row is healthy
+        protection; ``PendingCancel`` is not (ruling 47). The terminal write
+        commits while broker changes are held, after the rows, the position
+        and the generation are read again (ruling 48).
         """
         generation = int(snapshot.generation_id)
         stop, target = self._working_legs(receipt)
@@ -1524,8 +1546,8 @@ class LiquidationService:
         if position is None:
             # R26: a target fill cancels its OCA stop (or the stop filled): the position was closed by an exit.
             return self._finish_reprotect_closed(receipt, snapshot, working)
-        if stop.state == "CANCELLED" and target is not None and target.state in ("WORKING", "FILLED") \
-                and generation <= stop.observed_generation:
+        if stop.state in ("CANCELLED", "PENDING_CANCEL") and target is not None \
+                and target.state in ("WORKING", "FILLED") and generation <= stop.observed_generation:
             # R26: a target fill cancels its OCA stop; judge the cancel together with the target
             # and the position on a newer generation, never on the callback that came first.
             return self._wait(receipt, generation, "reconciling an OCA stop cancel with its target")
@@ -1533,6 +1555,11 @@ class LiquidationService:
             return self._escalate_now(receipt, snapshot, f"REPROTECT_FAILED: stop leg {stop.state}")
         remaining = abs(float(position.quantity))
         if target is not None and target.state == "PLANNED":
+            status = self._leg_status(stop)
+            if status not in _BROKER_HEALTHY:
+                # Ruling 47: the target is sent only next to a stop whose row is healthy right now.
+                receipt = self._observe_children(receipt, snapshot, int(self._dispatch.newest_generation()))
+                return self._wait(receipt, generation, f"stop leg row is {status}, not healthy protection")
             sized = replace(target, state="UNKNOWN", quantity=remaining, fence_generation=generation)
 
             def promote(conn):
@@ -1562,24 +1589,61 @@ class LiquidationService:
             if leg.outstanding_quantity != remaining:
                 return self._wait(receipt, generation,
                                   f"{leg.child_id} outstanding {leg.outstanding_quantity} != position {remaining}")
-        if [self._leg_fingerprint(self._leg_row(leg)) for leg in legs] != [self._leg_fingerprint(r) for r in rows]:
-            return self._wait(receipt, generation, "a re-protect leg changed while DONE was decided; reading it again")
         state = self._partial_outcome(receipt)
         detail = ("re-protect legs working in one OCA group for the remaining quantity" if state == "DONE" else
                   "the partial reduce sold nothing; the position is protected again, the close failed")
-        return self._finish(receipt, state, generation_id=generation, remaining_quantity=remaining, detail=detail)
+        return self._finish_held(receipt, state, generation=generation, legs=legs, rows=rows,
+                                 remaining=remaining, detail=detail)
+
+    def _finish_held(self, receipt, state: str, *, generation: int, legs, rows, remaining: float,
+                     detail: str) -> LiquidationReceipt:
+        """Ruling 48: DONE / REDUCE_FAILED and the owner release commit while broker changes are held.
+
+        Under the hold no ingest batch or generation promote can write, so
+        the rows, position and generation read again here are the ones the
+        terminal transaction commits against. Any change since the decision,
+        or a hold that cannot be taken, waits for the next tick.
+        """
+        try:
+            with self._dispatch.hold_broker_changes():
+                why = self._changed_since_decision(receipt, generation, legs, rows, remaining)
+                if why is None:
+                    self._commit_terminal(receipt, state, generation_id=generation,
+                                          remaining_quantity=remaining, detail=detail)
+        except BrokerChangesBusy as ex:
+            why = f"broker changes could not be held: {ex}"
+        if why is not None:
+            return self._wait(receipt, generation, f"{state} not committed: {why}")
+        return self._after_terminal(receipt, state, detail)
+
+    def _changed_since_decision(self, receipt, generation: int, legs, rows, remaining: float) -> Optional[str]:
+        try:
+            if [self._leg_fingerprint(self._leg_row(leg)) for leg in legs] != [self._leg_fingerprint(r) for r in rows]:
+                return "a re-protect leg row changed since the decision"
+            snapshot = self._broker.capture(receipt.account_id)
+        except Exception as ex:  # an unreadable broker is a reason to decide again, never to finish
+            return f"broker evidence unreadable under the hold: {ex}"
+        if int(snapshot.generation_id) != generation:
+            return f"broker generation moved from {generation} to {snapshot.generation_id}"
+        position = self._position_for(snapshot, receipt.conid)
+        if position is None or abs(float(position.quantity)) != remaining:
+            return "the position changed since the decision"
+        return None
 
     @staticmethod
     def _leg_changed(leg: ChildRef, row) -> bool:
-        """#22: True when the leg's row no longer says what the WORKING child recorded."""
+        """#22: True when the leg's row no longer says what the WORKING child recorded.
+
+        Only ``Submitted`` / ``PreSubmitted`` count: a ``PendingCancel`` row is changed (ruling 47).
+        """
         filled = float(getattr(row, "filled_quantity", 0.0) or 0.0)
         total = float(getattr(row, "total_quantity", 0.0) or 0.0)
-        return (getattr(row, "status", None) not in _BROKER_ACCEPTED or filled != leg.filled_quantity
+        return (getattr(row, "status", None) not in _BROKER_HEALTHY or filled != leg.filled_quantity
                 or max(total - filled, 0.0) != leg.outstanding_quantity)
 
     @staticmethod
     def _leg_fingerprint(row) -> Optional[tuple]:
-        """Everything DONE reads from a leg's row; it must not change before the terminal write (#22)."""
+        """Everything DONE reads from a leg's row; it must not change before the terminal write (#22, ruling 48)."""
         if row is None:
             return None
         return tuple(getattr(row, field, None) for field in

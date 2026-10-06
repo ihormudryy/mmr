@@ -122,3 +122,46 @@ def test_an_observation_without_oca_fields_keeps_the_stored_link(env):
     env.ingest.drain_once()
     [row] = env.store.select_active_orders_in_tx(env.journal.connect())
     assert (row.oca_group, row.oca_type) == ("p-1-reprotect-265598-1", 2)
+
+
+# -- Task 6, ruling 48: the close's terminal write holds broker changes ----------------------
+
+def test_holding_broker_changes_stops_an_ingest_batch_until_released(env):
+    import threading
+
+    from trader.trading.command_stack import _LiquidationDispatch
+
+    applied = threading.Event()
+
+    def ingest_batch():
+        env.ingest.on_open_order(_stop_trade("p-1-reprotect-265598-1", 2))
+        env.ingest.drain_once()
+        applied.set()
+
+    with _LiquidationDispatch(env.dispatch, None).hold_broker_changes():
+        writer = threading.Thread(target=ingest_batch)
+        writer.start()
+        assert not applied.wait(0.3)                        # the batch waits for the hold
+        assert env.store.select_active_orders_in_tx(env.journal.connect()) == []
+        assert env.ingest.is_ready in (True, False)         # the holder may read readiness (reentrant)
+    writer.join(timeout=5)
+    assert applied.is_set() and len(env.store.select_active_orders_in_tx(env.journal.connect())) == 1
+
+
+def test_broker_changes_cannot_be_held_while_a_generation_is_staging(env):
+    from trader.trading.liquidation_service import BrokerChangesBusy
+
+    env.ingest.begin_generation()
+    with pytest.raises(BrokerChangesBusy, match="staging"):
+        with env.dispatch.hold_broker_changes():
+            pass
+    env.ingest.abandon_generation("test")
+    with env.dispatch.hold_broker_changes():
+        pass
+
+
+def test_broker_changes_cannot_be_held_without_an_ingest():
+    from trader.trading.liquidation_service import BrokerChangesBusy
+
+    with pytest.raises(BrokerChangesBusy):
+        TradingRuntimeOrderDispatch(SimpleNamespace()).hold_broker_changes()

@@ -2754,6 +2754,14 @@ class TradingRuntimeOrderDispatch:
         ingest = getattr(self._trader, 'broker_ingest', None)
         return ingest is not None and ingest_ready(ingest)
 
+    def hold_broker_changes(self):
+        """``BrokerIngest.hold_changes`` for the close's terminal write (SP1 ruling 48)."""
+        from trader.trading.liquidation_service import BrokerChangesBusy
+        ingest = getattr(self._trader, 'broker_ingest', None)
+        if ingest is None:
+            raise BrokerChangesBusy('no broker ingest to hold')
+        return ingest.hold_changes()
+
     def newest_generation(self) -> int:
         """The highest broker generation id, staging included (fence for a child order).
 

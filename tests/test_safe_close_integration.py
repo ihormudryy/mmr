@@ -13,6 +13,7 @@ from __future__ import annotations
 import asyncio
 import datetime as dt
 import threading
+from contextlib import contextmanager
 from dataclasses import replace
 from decimal import Decimal
 from types import SimpleNamespace
@@ -28,6 +29,7 @@ from trader.data.duckdb_store import DuckDBConnection
 from trader.data.schema_migrations import SchemaMigrator
 from trader.trading.command_coordinator import CommandRequest
 from trader.trading.command_policy import CommandAuthorityPolicy
+from trader.trading.liquidation_service import BrokerChangesBusy
 from trader.trading.order_correlation import classify_leg, decode_order_ref
 from trader.trading.risk_gate import RiskGate, RiskLimits
 from trader.trading.trading_runtime import Trader
@@ -69,6 +71,13 @@ class _Ingest:
     @property
     def is_ready(self):
         return self.ready
+
+    @contextmanager
+    def hold_changes(self):
+        """Ruling 48: the sim writes only inside a sync, so holding is refusing while one is staging."""
+        if not self.ready:
+            raise BrokerChangesBusy("broker generation is staging")
+        yield
 
     async def run_broker_sync(self, _client):
         self.syncs += 1

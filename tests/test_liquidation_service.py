@@ -2,6 +2,7 @@ import datetime as dt
 import logging
 import threading
 import time
+from contextlib import contextmanager
 from types import SimpleNamespace
 
 import pytest
@@ -11,8 +12,8 @@ from trader.data.duckdb_store import DuckDBConnection
 from trader.data.schema_migrations import SchemaMigrator
 from trader.trading.exit_owner import ExitOwnerRegistry, apply_exit_owner_migration
 from trader.trading.liquidation_service import (
-    ChildRef, DispatchRefused, LiquidationBusy, LiquidationReceipt, LiquidationRefused, LiquidationRunStore,
-    LiquidationService, RunStateError, apply_liquidation_migration,
+    BrokerChangesBusy, ChildRef, DispatchRefused, LiquidationBusy, LiquidationReceipt, LiquidationRefused,
+    LiquidationRunStore, LiquidationService, RunStateError, apply_liquidation_migration,
 )
 from trader.trading.order_correlation import matches_legacy_reduce
 
@@ -56,17 +57,23 @@ def _row(status, filled=0.0, total=10.0, entity=None, action="SELL", oca_group=N
 
 
 class _Broker:
+    """``held``: broker changes are held, so a capture repeats the last snapshot (``current``)."""
     def __init__(self, snapshots):
         self.snapshots = list(snapshots)
         self.calls = 0
         self.last = 0          # generation of the last captured snapshot
+        self.held = False
+        self.current = None
 
     def capture(self, account_id):
         self.calls += 1
+        if self.held and self.current is not None:
+            return self.current
         value = self.snapshots.pop(0) if len(self.snapshots) > 1 else self.snapshots[0]
         if isinstance(value, Exception):
             raise value
         self.last = value.generation_id
+        self.current = value
         return value
 
 
@@ -87,6 +94,9 @@ class _Dispatch:
         self.fail_after_send: set[str] = set() # methods that raise after the order was sent
         self.staging = 0
         self.complete = True
+        self.before_hold = None                # an ingest batch applied just before the hold is taken
+        self.hold_busy = False
+        self.holds = 0
 
     def _record(self, name, call):
         if name in self.refuse:
@@ -124,6 +134,19 @@ class _Dispatch:
 
     def newest_generation(self):
         return self.broker.last + self.staging
+
+    @contextmanager
+    def hold_broker_changes(self):
+        if self.before_hold is not None:
+            self.before_hold()
+        if self.hold_busy:
+            raise BrokerChangesBusy("broker ingest busy")
+        self.holds += 1
+        self.broker.held = True
+        try:
+            yield
+        finally:
+            self.broker.held = False
 
 
 class _Breaker:
@@ -1396,6 +1419,63 @@ def test_a_leg_row_that_changes_while_done_is_decided_is_read_again(tmp_path):
     s = _both_legs_working_next(tmp_path, [_leg_row()], [_leg_row()], [_leg_row("Cancelled")])
     receipt = s.service.rescan()
     assert receipt.state != "DONE" and s.service.close_resolution("p-1") is None
+
+
+def test_a_pending_cancel_stop_never_gets_its_target_and_escalates(tmp_path):
+    """#22 blocker, ruling 47: a stop already pending cancellation is not protection. Its target is
+    never sent, and the close escalates instead of ending DONE."""
+    s, protection = _to_reprotect(tmp_path, extra=(_snapshot(4, [_priced(6.0)]), _snapshot(5, [_priced(6.0)])))
+    s.dispatch.rows["p-1-reprotect-stop-1-1"] = [_leg_row("PendingCancel")]
+    receipt = s.service.rescan()                                          # gen 4
+    stop = next(c for c in receipt.children if c.kind == "reprotect-stop")
+    assert stop.state == "PENDING_CANCEL" and receipt.state != "DONE"
+    receipt = s.service.rescan()                                          # gen 5: still pending cancel
+    assert receipt.goal == "zero" and receipt.escalated
+    assert not any(c[0] == "place_exit_leg" and c[2] == "target" for c in s.dispatch.calls)
+    assert s.registry.get("p-1").state == "ACTIVE" and s.service.close_resolution("p-1") is None
+
+
+def test_a_stop_that_goes_pending_cancel_while_done_is_decided_never_ends_done(tmp_path):
+    """#22 blocker: the stop's row turns PendingCancel after it was observed WORKING. DONE is not
+    committed and the owner is not released, on this generation or the next."""
+    s = _both_legs_working_next(tmp_path, [_leg_row()], [_leg_row("PendingCancel")])
+    receipt = s.service.rescan()                                          # gen 5
+    assert receipt.state != "DONE" and s.registry.get("p-1").state == "ACTIVE"
+    assert next(c for c in receipt.children if c.kind == "reprotect-stop").state == "PENDING_CANCEL"
+    receipt = s.service.rescan()                                          # gen 6
+    assert receipt.state != "DONE" and receipt.goal == "zero"
+    assert s.service.close_resolution("p-1") is None
+
+
+def _done_ready(tmp_path):
+    """Both legs working and matching on generation 5; the next tick would commit DONE."""
+    return _both_legs_working_next(tmp_path, [_leg_row()])
+
+
+_INGEST_BEFORE_THE_WRITE = {
+    "leg row": lambda s: s.dispatch.sequences.__setitem__("p-1-reprotect-stop-1-1", [[_leg_row("Cancelled")]]),
+    "position": lambda s: setattr(s.broker, "current", _snapshot(5, [_priced(4.0)])),
+    "generation": lambda s: setattr(s.broker, "current", _snapshot(6, [_priced(6.0)])),
+    "hold busy": lambda s: setattr(s.dispatch, "hold_busy", True),
+}
+
+
+@pytest.mark.parametrize("change", _INGEST_BEFORE_THE_WRITE.values(), ids=_INGEST_BEFORE_THE_WRITE.keys())
+def test_an_ingest_update_before_the_terminal_write_never_commits_done(tmp_path, change):
+    """#22 major, ruling 48: an ingest batch lands after the final read and before the terminal write.
+    The write is made while broker changes are held, after the rows, position and generation are read
+    again; any change (or a hold that cannot be taken) waits, and the owner stays ACTIVE."""
+    s = _done_ready(tmp_path)
+    s.dispatch.before_hold = lambda: change(s)
+    receipt = s.service.rescan()                                          # gen 5
+    assert receipt.state != "DONE" and "not committed" in receipt.detail
+    assert s.registry.get("p-1").state == "ACTIVE" and s.service.close_resolution("p-1") is None
+
+
+def test_done_commits_while_broker_changes_are_held(tmp_path):
+    s = _done_ready(tmp_path)
+    receipt = s.service.rescan()
+    assert receipt.state == "DONE" and s.dispatch.holds == 1
 
 
 def test_terminal_partial_fill_reprotects_the_actual_remainder(tmp_path):

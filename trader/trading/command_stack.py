@@ -242,6 +242,9 @@ class _LiquidationDispatch:
     def newest_generation(self) -> int:
         return self._dispatch.newest_generation()
 
+    def hold_broker_changes(self):
+        return self._dispatch.hold_broker_changes()
+
 
 class _BrokerGenerationRefresh:
     """Ask for a newer complete broker generation without waiting for it.

@@ -13,6 +13,7 @@ import logging
 import queue
 import threading
 import uuid
+from contextlib import contextmanager
 from dataclasses import dataclass, replace
 from typing import Any, Callable, Optional
 
@@ -384,7 +385,9 @@ class BrokerIngest:
         ] = queue.Queue()
         self._ingest_seq = 0
         self._generation: Optional[_Generation] = None
-        self._apply_lock = threading.Lock()
+        # Reentrant: a close that holds broker changes (``hold_changes``) reads
+        # the snapshot, whose readiness check takes this lock again.
+        self._apply_lock = threading.RLock()
         self._stop = threading.Event()
         self._writer: Optional[threading.Thread] = None
         self.correlator = OrderCorrelator(store, self.session_epoch)
@@ -460,6 +463,26 @@ class BrokerIngest:
             )
             self._generation = _Generation(generation_id=generation_id, required=required)
             return generation_id
+
+    @contextmanager
+    def hold_changes(self, timeout_seconds: float = 2.0):
+        """No broker row or position changes while held (SP1 ruling 48).
+
+        Live batches apply under ``_apply_lock``; a promote runs only while a
+        generation is staging, and staging begins under the same lock. So
+        holding the lock with no generation staging stops every broker write.
+        Raises ``BrokerChangesBusy`` when the lock is not free in time or a
+        generation is staging. Keep the held section short: ingest waits.
+        """
+        from trader.trading.liquidation_service import BrokerChangesBusy
+        if not self._apply_lock.acquire(timeout=timeout_seconds):
+            raise BrokerChangesBusy(f"broker ingest busy for more than {timeout_seconds}s")
+        try:
+            if self._generation is not None:
+                raise BrokerChangesBusy(f"broker generation {self._generation.generation_id} is staging")
+            yield
+        finally:
+            self._apply_lock.release()
 
     @property
     def is_ready(self) -> bool:

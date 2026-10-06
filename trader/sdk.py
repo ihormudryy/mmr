@@ -1731,7 +1731,7 @@ class MMR:
             receipt = self._typed_command.call(
                 'approve_proposal',
                 {'command_id': f'sdk-{uuid.uuid4()}', 'proposal_id': proposal_id,
-                 'expected_version': expected_version, 'source': 'sdk'},
+                 'expected_version': expected_version},
                 CommandReceipt,
             )
         except (TimeoutError, ConnectionError) as ex:

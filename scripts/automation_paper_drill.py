@@ -267,7 +267,9 @@ class FakeTypedCommandClient:
             target_id=parsed.intent_id,
             expected_version=None,
             body=wire,
-            source="strategy_service",
+            # The drill stands in for the authenticated strategy service.
+            source="strategy",
+            principal="strategy",
         )
         receipt = self._coordinator.execute(request)
         return {

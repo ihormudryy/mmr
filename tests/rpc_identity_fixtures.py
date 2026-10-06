@@ -215,7 +215,28 @@ class AllowAllAcl(Mapping):
 ALLOW_ALL = AllowAllAcl()
 
 
-def full_command_stack_stub():
+class RecordingCoordinator:
+    """Stands in for the coordinator: records each CommandRequest, returns a RESOLVED receipt."""
+
+    def __init__(self):
+        from unittest.mock import MagicMock
+        self.requests = []
+        self._mock = MagicMock(name="coordinator")
+
+    @property
+    def last_request(self):
+        return self.requests[-1]
+
+    def execute(self, request):
+        from trader.domain.commands import CommandReceipt
+        self.requests.append(request)
+        return CommandReceipt(request.command_id, request.command_id, "RESOLVED", {}, None, False)
+
+    def __getattr__(self, name):
+        return getattr(self._mock, name)
+
+
+def full_command_stack_stub(coordinator=None):
     """A command stack whose every optional service is a Mock, so every method registers."""
     from unittest.mock import MagicMock
     from types import SimpleNamespace
@@ -225,13 +246,15 @@ def full_command_stack_stub():
              "allocation_service", "paper_automation_service", "automated_intent_service",
              "strategy_control_service", "journal")
     stack = SimpleNamespace(**{name: MagicMock(name=name) for name in names})
+    if coordinator is not None:
+        stack.coordinator = coordinator
     stack.account_mode = "paper"
     stack.resume_ready = lambda: True
     stack.reconciliation_complete = lambda command_id: True
     return stack
 
 
-def build_full_production_registry(identity=None):
+def build_full_production_registry(identity=None, coordinator=None):
     """The production trader registry with every optional surface registered."""
     from unittest.mock import MagicMock
 
@@ -243,5 +266,5 @@ def build_full_production_registry(identity=None):
     return build_production_registry(
         trader, identity or make_identities()["trader"],
         snapshot_service=MagicMock(name="snapshot"), feed_service=MagicMock(name="feed"),
-        command_stack=full_command_stack_stub(),
+        command_stack=full_command_stack_stub(coordinator),
     )

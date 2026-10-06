@@ -480,7 +480,6 @@ def test_paper_approve_is_single_post_with_expected_version(gateway):
     assert method == "approve_proposal"
     assert body == {"command_id": CMD_ID, "proposal_id": 7,
                     "expected_version": 3, "preflight_nonce": None,
-                    "source": "dashboard",
                     "session_fingerprint": body["session_fingerprint"]}
     assert body["session_fingerprint"]  # opaque, non-empty
 

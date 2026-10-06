@@ -84,6 +84,7 @@ import dataclasses
 import datetime as dt
 import logging
 import os
+import re
 from dataclasses import asdict
 from decimal import Decimal
 from typing import TYPE_CHECKING, Annotated, Any, Dict, Literal, Optional
@@ -106,6 +107,7 @@ from trader.messaging.principals import TRADER_ACL, is_valid_principal_name
 from trader.messaging.trader_service_api import TraderServiceApi
 from trader.messaging.typed_rpc import (
     ServiceIdentity,
+    RpcCaller,
     TypedRpcClient,
     TypedRpcRegistry,
     TypedRpcRemoteError,
@@ -516,8 +518,9 @@ class CreateProposalRequest(BaseModel):
     max_price_drift_bps: Optional[float] = None
     preflight_nonce: Optional[str] = None
     # Signal→proposal bridge fields (trader/strategy/signal_proposer.py).
-    # ``source`` attributes the proposal to its origin ("strategy:<name>");
-    # empty means the dashboard. The time-based exit trio round-trips onto
+    # ``source`` is an attribution LABEL only ("strategy:<name>" from the
+    # strategy principal); it is checked against the authenticated principal
+    # by ``attribution_label`` and empty becomes the principal's name. The time-based exit trio round-trips onto
     # the proposal record's metadata so ``check_exits`` can recover an
     # executed entry's exit rules via ``list_proposals``. Before these were
     # declared, extra="forbid" REJECTED every bridge proposal at the wire —
@@ -638,10 +641,10 @@ class ApproveProposalRequest(BaseModel):
     The account is the coordinator's own configured account, never
     request-supplied (there is no ``account_id`` field).
 
-    ``source`` identifies the actor (``dashboard`` / ``sdk`` / ``cli`` /
-    ``llm``). On live, non-dashboard sources are refused
+    The actor is the authenticated RPC principal, never a body field. On
+    live, any principal other than ``dashboard`` is refused
     (``LLM_LIVE_APPROVE_FORBIDDEN``); on paper the LLM/SDK may approve after
-    evaluation. Default ``dashboard`` preserves the web gateway contract.
+    evaluation.
     """
 
     model_config = ConfigDict(extra="forbid")
@@ -651,7 +654,6 @@ class ApproveProposalRequest(BaseModel):
     expected_version: int
     preflight_nonce: Optional[str] = None
     session_fingerprint: Optional[str] = None
-    source: str = "dashboard"
 
     @field_validator("command_id")
     @classmethod
@@ -1059,17 +1061,36 @@ def _reject_proposal_action(proposal_service: ProposalCommandService):
     return _action
 
 
+_STRATEGY_LABEL = re.compile(r"strategy:[A-Za-z0-9_.-]+")
+
+
+def attribution_label(principal: str, label: str) -> str:
+    """Check a body attribution label against the authenticated principal.
+
+    The strategy principal must label proposals ``strategy:<name>`` (what
+    ``check_exits`` filters on); nobody else may use a ``strategy:`` label.
+    An empty label becomes the principal's name.
+    """
+    label = (label or "").strip()
+    if principal == "strategy":
+        if not _STRATEGY_LABEL.fullmatch(label):
+            raise _DispatchProblem(
+                "PERMISSION_DENIED", "strategy proposals must be labelled strategy:<name>")
+        return label
+    if label.startswith("strategy:"):
+        raise _DispatchProblem(
+            "PERMISSION_DENIED", "only the strategy principal may use a strategy: label")
+    return label or principal
+
+
 def _create_proposal_rpc_handler(coordinator: TradingCommandCoordinator, account_id: Optional[str]):
-    def _handler(parsed: CreateProposalRequest) -> Dict[str, Any]:
-        payload = parsed.model_dump(exclude={"command_id", "preflight_nonce"})
-        # Attribute the command to its declared origin (the signal→proposal
-        # bridge sends "strategy:<name>") so the proposal record's source —
-        # which check_exits filters on — survives the round trip. Absent or
-        # empty means the dashboard, the previous hard-coded value.
+    def _handler(parsed: CreateProposalRequest, caller: RpcCaller) -> Dict[str, Any]:
+        label = attribution_label(caller.principal, parsed.source)
+        payload = {**parsed.model_dump(exclude={"command_id", "preflight_nonce"}), "source": label}
         request = CommandRequest(
             command_id=parsed.command_id, action="create_proposal", account_id=account_id,
             target_type="proposal", target_id="", expected_version=None,
-            body=payload, source=parsed.source or "dashboard",
+            body=payload, source=label, principal=caller.principal,
             preflight_nonce=parsed.preflight_nonce,
         )
         receipt = coordinator.execute(request)
@@ -1097,13 +1118,13 @@ def _approve_proposal_rpc_handler(coordinator: TradingCommandCoordinator, accoun
     so ``unresolved_for_target`` can enforce the one-live-command-per-proposal
     rule (``COMMAND_IN_FLIGHT``); ``expected_version`` rides the envelope so
     the atomic claim can reject a stale approval race-safely."""
-    def _handler(parsed: ApproveProposalRequest) -> Dict[str, Any]:
+    def _handler(parsed: ApproveProposalRequest, caller: RpcCaller) -> Dict[str, Any]:
         request = CommandRequest(
             command_id=parsed.command_id, action="approve_proposal", account_id=account_id,
             target_type="proposal", target_id=str(parsed.proposal_id),
             expected_version=parsed.expected_version,
             body={"proposal_id": parsed.proposal_id},
-            source=(parsed.source or "dashboard").strip() or "dashboard",
+            source=caller.principal, principal=caller.principal,
             preflight_nonce=parsed.preflight_nonce,
             session_fingerprint=parsed.session_fingerprint,
         )
@@ -1115,9 +1136,9 @@ def _approve_proposal_rpc_handler(coordinator: TradingCommandCoordinator, accoun
 def _execute_automated_intent_rpc_handler(
     coordinator: TradingCommandCoordinator, account_id: Optional[str],
 ):
-    """[P3 Task 3] Strategy-service principal only — never ``source=dashboard``."""
+    """[P3 Task 3] Strategy principal only; source and principal come from the key."""
 
-    def _handler(parsed: ExecuteAutomatedIntentRequest) -> Dict[str, Any]:
+    def _handler(parsed: ExecuteAutomatedIntentRequest, caller: RpcCaller) -> Dict[str, Any]:
         # JSON mode keeps ledger/audit persistence free of datetime objects.
         body = parsed.model_dump(mode="json")
         request = CommandRequest(
@@ -1128,7 +1149,8 @@ def _execute_automated_intent_rpc_handler(
             target_id=parsed.intent_id,
             expected_version=None,
             body=body,
-            source="strategy_service",
+            source=caller.principal,
+            principal=caller.principal,
         )
         receipt = coordinator.execute(request)
         return _receipt_to_dict(receipt)
@@ -1184,7 +1206,7 @@ def _strategy_control_rpc_handler(
     ``expected_control_revision``, ``target_type="strategy"``) and drives it
     through the coordinator, which dispatches to
     ``StrategyControlCommandService``'s forwarding saga."""
-    def _handler(parsed) -> Dict[str, Any]:
+    def _handler(parsed, caller: RpcCaller) -> Dict[str, Any]:
         body: Dict[str, Any] = {"strategy_name": parsed.strategy_name}
         if action == "update_strategy_params":
             body["params"] = parsed.params
@@ -1192,7 +1214,7 @@ def _strategy_control_rpc_handler(
             command_id=parsed.command_id, action=action, account_id=account_id,
             target_type="strategy", target_id=parsed.strategy_name,
             expected_version=parsed.expected_control_revision,
-            body=body, source="dashboard",
+            body=body, source="dashboard", principal=caller.principal,
         )
         receipt = coordinator.execute(request)
         return _receipt_to_dict(receipt)
@@ -1828,7 +1850,7 @@ def register_command_authority(
 
     registry.register(
         "command", "create_proposal", CreateProposalRequest, dict,
-        _create_proposal_rpc_handler(coordinator, account_id),
+        _create_proposal_rpc_handler(coordinator, account_id), with_caller=True,
     )
     registry.register(
         "command", "reject_proposal", RejectProposalRequest, dict,
@@ -1895,7 +1917,7 @@ def register_command_authority(
         )
         registry.register(
             "command", "approve_proposal", ApproveProposalRequest, dict,
-            _approve_proposal_rpc_handler(coordinator, account_id),
+            _approve_proposal_rpc_handler(coordinator, account_id), with_caller=True,
         )
 
     if cancel_service is not None:
@@ -1930,14 +1952,17 @@ def register_command_authority(
         registry.register(
             "command", "enable_strategy", EnableStrategyRequest, dict,
             _strategy_control_rpc_handler(coordinator, account_id, "enable_strategy"),
+            with_caller=True,
         )
         registry.register(
             "command", "disable_strategy", DisableStrategyRequest, dict,
             _strategy_control_rpc_handler(coordinator, account_id, "disable_strategy"),
+            with_caller=True,
         )
         registry.register(
             "command", "update_strategy_params", UpdateStrategyParamsRequest, dict,
             _strategy_control_rpc_handler(coordinator, account_id, "update_strategy_params"),
+            with_caller=True,
         )
         registry.register(
             "command", "record_state_acknowledged", RecordStateAcknowledgedRequest, dict,
@@ -2008,7 +2033,7 @@ def register_command_authority(
         )
         registry.register(
             "command", "execute_automated_intent", ExecuteAutomatedIntentRequest, dict,
-            _execute_automated_intent_rpc_handler(coordinator, account_id),
+            _execute_automated_intent_rpc_handler(coordinator, account_id), with_caller=True,
         )
 
 
@@ -2024,9 +2049,13 @@ def _dict_to_strategy_receipt(data: Dict[str, Any]) -> StrategyCommandReceipt:
 
 
 def _forwarded_on_behalf_of(request: CommandRequest) -> Optional[str]:
-    """The original caller for the strategy service's log; never used for authorization."""
-    source = getattr(request, "source", None)
-    return source if is_valid_principal_name(source) else None
+    """The authenticated original caller, for the strategy service's log only.
+
+    A ``source`` label such as ``dashboard`` or ``operator`` is never
+    forwarded; only the verified ``principal`` is.
+    """
+    principal = getattr(request, "principal", None)
+    return principal if is_valid_principal_name(principal) else None
 
 
 class TypedStrategyControlPort:

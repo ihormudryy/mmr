@@ -198,8 +198,8 @@ def test_forwarded_call_is_authorized_as_trader_not_on_behalf_of():
                                         stack.client("trader", "strategy", "query"))
         request = CommandRequest(
             command_id="c2", action="enable_strategy", account_id="DU1", target_type="strategy",
-            target_id="s", expected_version=1, body={"strategy_name": "s"}, source="dashboard",
-            preflight_nonce=None)
+            target_id="s", expected_version=1, body={"strategy_name": "s"}, source="operator",
+            principal="dashboard", preflight_nonce=None)
         try:
             port.forward(request)
         except Exception:

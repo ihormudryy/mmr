@@ -25,6 +25,9 @@ from unittest.mock import MagicMock
 
 import pytest
 
+from trader.messaging.principals import TRADER_ACL
+from trader.messaging.typed_rpc import RpcCaller
+
 from trader.common.reactivex import SuccessFailEnum
 from trader.data.domain_journal import DomainJournal
 from trader.data.duckdb_store import DuckDBConnection
@@ -230,9 +233,10 @@ class _InProcessTypedClient:
     (the documented `CommandReceipt`/`model_validate` wire gap is a property
     of the REAL `TypedRpcClient`, not of this in-process test double)."""
 
-    def __init__(self, registry: TypedRpcRegistry, role: str):
+    def __init__(self, registry: TypedRpcRegistry, role: str, principal: str = "cli"):
         self._registry = registry
         self._role = role
+        self._caller = RpcCaller(principal, None)
 
     def call(self, method, body, response_model=None, timeout=None):
         registration = self._registry.resolve(self._role, method)
@@ -241,8 +245,13 @@ class _InProcessTypedClient:
                 'METHOD_NOT_ALLOWED', f'{method!r} not registered on {self._role!r}')
         request_model = registration.request_model
         parsed = body if request_model is dict else request_model.model_validate(body)
+        if self._caller.principal not in registration.allowed_principals:
+            raise TypedRpcRemoteError('PERMISSION_DENIED', f'{method!r} denied')
         try:
-            result = registration.handler(parsed)
+            if registration.with_caller:
+                result = registration.handler(parsed, self._caller)
+            else:
+                result = registration.handler(parsed)
         except _DispatchProblem as exc:
             raise TypedRpcRemoteError(exc.code, str(exc)) from exc
         if response_model is dict or response_model is None:
@@ -299,7 +308,7 @@ def _build_stack(tmp_path):
         account_id=ACCOUNT_ID, account_mode=ACCOUNT_MODE, now=clock,
     )
 
-    registry = TypedRpcRegistry()
+    registry = TypedRpcRegistry(acl=TRADER_ACL)
     register_command_authority(
         registry, coordinator, proposal_service, repo,
         account_id=ACCOUNT_ID, account_mode="paper", controls=controls,

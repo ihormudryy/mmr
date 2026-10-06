@@ -1461,7 +1461,7 @@ class TestTypedProposalAdapters:
         assert call.method == 'approve_proposal'
         assert call.body['proposal_id'] == 7 and call.body['expected_version'] == 3
         assert call.body['command_id'].startswith('sdk-')
-        assert call.body['source'] == 'sdk'
+        assert 'source' not in call.body  # the actor is the signing principal
         assert typed.store_writes == []                       # no ProposalStore mutation anywhere
 
     def test_sdk_surfaces_outcome_unknown_without_marking_failed(self, mmr, typed):
@@ -1487,7 +1487,7 @@ class TestTypedProposalAdapters:
         assert result.is_success()
         assert len(typed.queries) == 1
         assert typed.commands[0].body['expected_version'] == 5
-        assert typed.commands[0].body['source'] == 'sdk'
+        assert 'source' not in typed.commands[0].body
 
     def test_sdk_approve_refuses_live_account_mode_before_command(self, mmr, typed):
         typed.queue_query('get_proposal', {

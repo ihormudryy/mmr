@@ -238,6 +238,7 @@ class ProductionPaperHotArmPorts:
                 ExecuteAutomatedIntentRequest,
                 dict,
                 _execute_automated_intent_rpc_handler(coordinator, self._account_id),
+                with_caller=True,
             )
             self._late_registered = True
         # CommandStack is frozen; this is its deliberate hot-arm mutation,

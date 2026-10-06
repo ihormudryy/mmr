@@ -31,7 +31,7 @@ def _request(*, command_id="cmd-1", action="approve_proposal", account_id="DU123
         command_id=command_id, action=action, account_id=account_id,
         target_type="proposal", target_id=target_id, expected_version=None,
         body=(body if body is not None else {"amount": 5000}),
-        source="dashboard", preflight_nonce=None,
+        source="dashboard", principal="dashboard", preflight_nonce=None,
         session_fingerprint=session_fingerprint)
 
 

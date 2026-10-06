@@ -26,8 +26,7 @@ from trader.automation.models import (
 from trader.domain.commands import CommandReceipt
 from trader.trading.command_coordinator import BrokerRejectedError, CommandRequest
 
-STRATEGY_PRINCIPAL = "strategy_service"
-_ALLOWED_PRINCIPALS = frozenset({STRATEGY_PRINCIPAL})
+STRATEGY_PRINCIPAL = "strategy"
 
 
 class IntentDispatchPort(Protocol):
@@ -176,7 +175,7 @@ class AutomatedIntentCommandService:
         self._bundle_evidence_validator = bundle_evidence_validator
 
     def execute(self, cmd: CommandRequest) -> CommandReceipt:
-        if cmd.source not in _ALLOWED_PRINCIPALS:
+        if cmd.principal != STRATEGY_PRINCIPAL:
             self._transition(cmd, "RECEIVED", "REJECTED", error_code="PRINCIPAL_FORBIDDEN")
             return self._receipt(cmd.command_id, "REJECTED", "PRINCIPAL_FORBIDDEN", False)
 

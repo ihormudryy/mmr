@@ -6,6 +6,8 @@ from types import SimpleNamespace
 
 import pytest
 
+from trader.messaging.typed_rpc import RpcCaller
+
 from tests.rpc_identity_fixtures import make_identities
 from pydantic import ValidationError
 
@@ -372,7 +374,7 @@ def test_create_and_reject_proposal_over_the_registry(production_registry):
     create_reg = production_registry.resolve("command", "create_proposal")
     from trader.messaging.production_api import CreateProposalRequest
     parsed = CreateProposalRequest(command_id="cmd-create-1", conid=265598, action="BUY", quantity=10)
-    receipt = create_reg.handler(parsed)
+    receipt = create_reg.handler(parsed, RpcCaller("dashboard", None))
     assert receipt["state"] == "RESOLVED"
     proposal_id = receipt["outcome"]["id"]
 
@@ -1313,7 +1315,7 @@ def gate(tmp_path):
         request = CommandRequest(
             command_id=command_id, action="approve_proposal", account_id="DU111111",
             target_type="proposal", target_id=str(record.id), expected_version=record.revision,
-            body={"proposal_id": record.id}, source="dashboard",
+            body={"proposal_id": record.id}, source="dashboard", principal="dashboard",
             preflight_nonce=f"nonce-{command_id}")
         return coordinator.execute(request)
 

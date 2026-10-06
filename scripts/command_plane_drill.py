@@ -288,7 +288,7 @@ def approve_request(command_id, proposal_id, expected_version) -> CommandRequest
     return CommandRequest(
         command_id=command_id, action="approve_proposal", account_id=ACCOUNT,
         target_type="proposal", target_id=str(proposal_id), expected_version=expected_version,
-        body={"proposal_id": proposal_id}, source="dashboard",
+        body={"proposal_id": proposal_id}, source="dashboard", principal="dashboard",
         preflight_nonce=f"nonce-{command_id}")
 
 
@@ -505,7 +505,7 @@ class LiveApproval:
         return self.coordinator.execute(CommandRequest(
             command_id=command_id, action="approve_proposal", account_id=ACCOUNT_LIVE,
             target_type="proposal", target_id=str(record.id), expected_version=record.revision,
-            body={"proposal_id": record.id}, source="dashboard",
+            body={"proposal_id": record.id}, source="dashboard", principal="dashboard",
             preflight_nonce=f"nonce-{command_id}"))
 
 

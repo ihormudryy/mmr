@@ -118,7 +118,7 @@ class _Dispatch:
     def reduce_partial(self, position, side, quantity, child_id):
         self._record("reduce_partial", ("reduce_partial", position.conid, side, quantity, child_id))
 
-    def place_exit_leg(self, position, *, leg, quantity, price, oca_group, child_id):
+    def place_exit_leg(self, position, *, leg, quantity, price, oca_group, child_id, sibling_child_id=None):
         self._record("place_exit_leg", ("place_exit_leg", position.conid, leg, quantity, price, oca_group, child_id))
 
     def find_orders(self, account_id, child_id):

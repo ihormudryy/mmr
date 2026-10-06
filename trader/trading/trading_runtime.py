@@ -71,6 +71,8 @@ class AccountNotPinnedError(Exception):
 REDUCE_ONLY_REFUSED = 'reduce-only refused'
 # A refusal because the live IB cache no longer matches the order's size: nothing was sent.
 LIVE_SIZE_REFUSED = 'live size mismatch'
+# A live size refusal because the leg already in the OCA group no longer works (#22 round 9).
+OCA_SIBLING_NOT_WORKING = 'OCA_SIBLING_NOT_WORKING'
 
 
 class Trader():
@@ -1709,13 +1711,16 @@ class Trader():
         order_type: str = 'MKT',
         price: Optional[float] = None,
         oca_group: Optional[str] = None,
+        oca_sibling_ref: Optional[str] = None,
     ) -> SuccessFail:
         """Send an order that can only shrink an existing position.
 
         ``order_type`` is ``MKT`` (full or partial reduce), or ``STP`` / ``LMT``
         with a positive ``price`` for the exit legs of a re-protect pair. An
         ``oca_group`` links the legs with ``ocaType=2``: a fill of one leg
-        reduces the other to what is left.
+        reduces the other to what is left. ``oca_sibling_ref`` names the leg
+        already in that group: it must be in ib_async's trade cache, working,
+        with exactly ``quantity`` outstanding.
 
         The emergency-exit path (liquidation, session flatten). It keeps the
         boundary checks — account and mode pin, contract, reduce-only side and
@@ -1738,7 +1743,8 @@ class Trader():
         """
         try:
             refusal = self._reduce_only_refusal(contract, side, quantity, broker_quantity,
-                                                order_type=order_type, price=price, oca_group=oca_group)
+                                                order_type=order_type, price=price, oca_group=oca_group,
+                                                oca_sibling_ref=oca_sibling_ref)
         except Exception as ex:
             refusal = f'pre-send check failed: {ex}'
         if refusal:
@@ -1773,6 +1779,7 @@ class Trader():
     def _reduce_only_refusal(
         self, contract: Contract, side: str, quantity: float, broker_quantity: float, *,
         order_type: str = 'MKT', price: Optional[float] = None, oca_group: Optional[str] = None,
+        oca_sibling_ref: Optional[str] = None,
     ) -> Optional[str]:
         if order_type not in self._REDUCE_ONLY_TYPES:
             return f'order type {order_type!r} is not a reduce-only type'
@@ -1801,8 +1808,46 @@ class Trader():
         if not math.isfinite(quantity) or not 0 < quantity <= abs(broker_quantity):
             return f'quantity {quantity} must be > 0 and <= |{broker_quantity}|'
 
-        mismatch = self._live_size_mismatch(int(contract.conId), side, quantity, broker_quantity, oca_group)
+        mismatch = (self._live_size_mismatch(int(contract.conId), side, quantity, broker_quantity, oca_group)
+                    or self._oca_sibling_problem(int(contract.conId), side, quantity, oca_group, oca_sibling_ref))
         return None if mismatch is None else f'{LIVE_SIZE_REFUSED}: {mismatch}'
+
+    def _oca_sibling_problem(self, conid: int, side: str, quantity: float, oca_group: Optional[str],
+                             sibling_ref: Optional[str]) -> Optional[str]:
+        """#22 round 9: why the named OCA sibling does not protect next to this leg; None when it does.
+
+        ``ib.openTrades()`` drops a trade once it is Filled, so a missing open
+        sibling proves nothing. ``ib.trades()`` keeps every trade of this
+        session, terminal ones included (ib_async 2.1 ``IB.trades``; the cache
+        is reset only on disconnect). A sibling that is missing (for example it
+        filled during a disconnect) or not working fails closed: a leg joining
+        an OCA group after its sibling filled is never shrunk by OCA.
+        """
+        if sibling_ref is None:
+            return None
+        if not oca_group:
+            return f'{OCA_SIBLING_NOT_WORKING}: sibling {sibling_ref} named without an OCA group'
+        matches = [
+            t for t in self.client.ib.trades()
+            if getattr(t.order, 'orderRef', None) == sibling_ref
+            and getattr(t.order, 'ocaGroup', '') == oca_group
+            and int(getattr(t.contract, 'conId', 0) or 0) == conid
+            and (getattr(t.order, 'account', '') or self.ib_account) == self.ib_account
+            and t.order.action == side
+        ]
+        if len(matches) != 1:
+            return f'{OCA_SIBLING_NOT_WORKING}: {len(matches)} trades of {sibling_ref} in OCA group {oca_group}'
+        status = getattr(matches[0].orderStatus, 'status', None)
+        if status not in ('PreSubmitted', 'Submitted'):
+            return f'{OCA_SIBLING_NOT_WORKING}: {sibling_ref} is {status}'
+        outstanding = self._outstanding(matches[0])
+        if outstanding != quantity:
+            return f'{OCA_SIBLING_NOT_WORKING}: {sibling_ref} outstanding {outstanding:g} != leg quantity {quantity:g}'
+        return None
+
+    @staticmethod
+    def _outstanding(trade) -> float:
+        return max(float(trade.order.totalQuantity) - float(getattr(trade.orderStatus, 'filled', 0.0) or 0.0), 0.0)
 
     def _live_size_mismatch(self, conid: int, side: str, quantity: float, broker_quantity: float,
                             oca_group: Optional[str]) -> Optional[str]:
@@ -1831,7 +1876,7 @@ class Trader():
         if not oca_group:
             return []
         return [
-            max(float(t.order.totalQuantity) - float(getattr(t.orderStatus, 'filled', 0.0) or 0.0), 0.0)
+            self._outstanding(t)
             for t in self.client.ib.openTrades()
             if int(getattr(t.contract, 'conId', 0) or 0) == conid
             and (getattr(t.order, 'account', '') or self.ib_account) == self.ib_account
@@ -1849,7 +1894,7 @@ class Trader():
         unknown owner fails closed (#38).
         """
         return sum(
-            max(float(t.order.totalQuantity) - float(getattr(t.orderStatus, 'filled', 0.0) or 0.0), 0.0)
+            self._outstanding(t)
             for t in self.client.ib.openTrades()
             if int(getattr(t.contract, 'conId', 0) or 0) == conid
             and (getattr(t.order, 'account', '') or self.ib_account) == self.ib_account
@@ -2605,8 +2650,12 @@ class TradingRuntimeOrderDispatch:
         return self._reduce_only(position, contract, held, side, size, order_ref)
 
     def place_exit_leg(self, position, *, leg: str, quantity: float, price: float,
-                       oca_group: str, order_ref: str):
-        """One exit-only leg (stop or target) of a re-protect OCA pair."""
+                       oca_group: str, order_ref: str, oca_sibling_ref: Optional[str] = None):
+        """One exit-only leg (stop or target) of a re-protect OCA pair.
+
+        ``oca_sibling_ref``: order ref of the leg already in ``oca_group``
+        (the stop, for a target); the boundary refuses unless it still works.
+        """
         if leg not in ('stop', 'target'):
             self._refuse(f'unknown exit leg {leg!r}')
         contract, held, size = self._close_inputs(position, quantity)
@@ -2619,7 +2668,7 @@ class TradingRuntimeOrderDispatch:
             self._refuse('no position to protect')
         return self._reduce_only(position, contract, held, side, size, order_ref,
                                  order_type='STP' if leg == 'stop' else 'LMT',
-                                 price=limit, oca_group=oca_group)
+                                 price=limit, oca_group=oca_group, oca_sibling_ref=oca_sibling_ref)
 
     def cancel_on_loop(self, order_entity_id: str, order_ref: str):
         """``cancel`` for the liquidation worker (R34, ruling 7).

@@ -97,6 +97,9 @@ class _Ingest:
         return True
 
 
+_IB_DONE = ("Filled", "Cancelled", "ApiCancelled", "Inactive")   # ib_async OrderStatus.DoneStates
+
+
 class _BrokerSim:
     """IB and the broker enumeration. Orders become visible only when promote() writes them."""
 
@@ -105,7 +108,7 @@ class _BrokerSim:
         self.held: dict[int, float] = {}
         self.orders: dict[str, BrokerOrderRow] = {}
         self.perm: dict[str, int] = {}
-        self.trades: dict[str, SimpleNamespace] = {}
+        self.ib_trades: dict[str, SimpleNamespace] = {}   # ib_async keeps terminal trades for the session
         self.hidden: set[str] = set()
         self.placed: list[tuple] = []
         self.cancelled: list[str] = []
@@ -125,15 +128,18 @@ class _BrokerSim:
     def managedAccounts(self):
         return [ACCOUNT]
 
+    def trades(self):
+        return list(self.ib_trades.values())
+
     def openTrades(self):
-        return list(self.trades.values())
+        return [t for t in self.ib_trades.values() if t.orderStatus.status not in _IB_DONE]
 
     def positions(self, account=None):
         return [SimpleNamespace(account=ACCOUNT, contract=SimpleNamespace(conId=c), position=q)
                 for c, q in self.held.items() if q]
 
     def cancelOrder(self, order):
-        entity = next(e for e, t in self.trades.items() if t.order is order)
+        entity = next(e for e, t in self.ib_trades.items() if t.order is order)
         self.cancelled.append(entity)
 
     # -- fake executioner ------------------------------------------------------------------
@@ -158,8 +164,8 @@ class _BrokerSim:
             self._next_perm += 1
             order = SimpleNamespace(permId=self._next_perm, action=action, totalQuantity=float(quantity), ocaGroup="")
         self.perm[entity] = order.permId
-        self.trades[entity] = SimpleNamespace(order=order, contract=SimpleNamespace(conId=conid),
-                                              orderStatus=SimpleNamespace(filled=0.0))
+        self.ib_trades[entity] = SimpleNamespace(order=order, contract=SimpleNamespace(conId=conid),
+                                                 orderStatus=SimpleNamespace(status=status, filled=0.0))
         self.orders[entity] = BrokerOrderRow(
             order_entity_id=entity, account_id=ACCOUNT, conid=conid, symbol="AAPL", order_group_id=group,
             leg=leg, is_external=False, action=action, order_type=order_type, total_quantity=float(quantity),
@@ -173,10 +179,11 @@ class _BrokerSim:
         self.orders[entity] = replace(row, status=status,
                                       filled_quantity=row.filled_quantity if filled is None else float(filled),
                                       total_quantity=row.total_quantity if total is None else float(total))
-        if status in ("Filled", "Cancelled", "ApiCancelled", "Inactive"):
-            self.trades.pop(entity, None)
-        elif entity in self.trades and filled is not None:
-            self.trades[entity].orderStatus.filled = float(filled)
+        trade = self.ib_trades.get(entity)
+        if trade is not None:
+            trade.orderStatus.status = status
+            if filled is not None:
+                trade.orderStatus.filled = float(filled)
 
     def entity_for(self, group_prefix):
         return next(e for e in self.orders if e.startswith(group_prefix))
@@ -405,7 +412,7 @@ def test_after_a_loss_breach_a_time_exit_hands_over_cancels_the_stop_and_reduces
     composed.tick()
     assert composed.liquidation.receipt_for("time-exit-1").state == "CLOSED"
     assert composed.saga.resume("entry-1").state == "CLOSED"
-    assert composed.sim.trades == {}                             # no stop is left working
+    assert composed.sim.openTrades() == []                       # no stop is left working
     assert composed.stack.circuit_breaker.store.get().state == "CLEAR"
 
 
@@ -548,7 +555,8 @@ def test_partial_close_of_one_of_two_positions_reprotects_the_actual_remainder(c
     late = composed.saga_event(og, "stop", f"{og}:stop", "Cancelled", event_id="late-original-stop")
     assert late.state == "PROTECTED"                                 # a retired leg, a new event id
     assert composed.saga.resume("entry-2").state == "PROTECTED"
-    assert {f"{other}:stop", f"{other}:take_profit"} <= set(composed.sim.trades)
+    assert {f"{other}:stop", f"{other}:take_profit"} <= {e for e, t in composed.sim.ib_trades.items()
+                                                          if t.orderStatus.status not in _IB_DONE}
     assert all(entity.startswith(og) for entity in composed.sim.cancelled)
     assert composed.stack.circuit_breaker.store.get().state == "CLEAR"
 
@@ -673,7 +681,7 @@ def test_a_stop_fill_after_the_final_admission_hold_is_refused_at_the_order_boun
     def stop_fills_2_after_the_final_hold():
         holds.append(1)
         if len(holds) == 2:                                           # _target_still_admitted
-            composed.sim.trades[stop].orderStatus.filled = 2.0
+            composed.sim.ib_trades[stop].orderStatus.filled = 2.0
     composed.trader.broker_ingest.after_hold = stop_fills_2_after_the_final_hold
     composed.sim.promote()
     composed.tick()
@@ -690,6 +698,48 @@ def test_a_stop_fill_after_the_final_admission_hold_is_refused_at_the_order_boun
         composed.tick()
     targets = [p for p in composed.sim.placed if p[0] == "p-1-reprotect-target-265598-1"]
     assert [p[3] for p in targets] == [4.0]
+
+
+def test_a_stop_filled_after_the_final_admission_hold_blocks_the_target_at_the_order_boundary(composed):
+    """#22 round 9 (openai): right after the target's last admission hold the stop fills all 6.
+    ib_async drops it from openTrades(), while the position cache still shows +6. A target sent now
+    joins a group whose stop already filled, so OCA cannot shrink it: it could sell 6 more. The
+    boundary finds the stop through ib.trades() (terminal trades included), sees Filled and refuses:
+    nothing sent, the target is PLANNED again. Once the flat position is seen the close ends CLOSED
+    (spec 5.1: the stop closed the remainder) and no target is ever placed."""
+    og = composed.protected_entry()
+    composed.sim.promote()
+    composed.liquidation.start(ACCOUNT, "p-1", _et(11, 5), scope="conid", conid=CONID, quantity=4.0)
+    composed.cancel_landed(f"{og}:stop", f"{og}:take_profit")
+    composed.sim.promote()
+    composed.tick()                                                   # reduce 4
+    composed.sim.set_status(composed.sim.entity_for("p-1-reduce"), "Filled", filled=4.0)
+    composed.sim.held[CONID] = 6.0
+    for _ in range(2):                                                # fill seen, stop for 6
+        composed.sim.promote()
+        composed.tick()
+    stop = composed.sim.entity_for("p-1-reprotect-stop")
+    holds = []
+
+    def stop_fills_after_the_final_hold():
+        holds.append(1)
+        if len(holds) == 2:                                           # _target_still_admitted
+            composed.sim.set_status(stop, "Filled", filled=6.0)
+    composed.trader.broker_ingest.after_hold = stop_fills_after_the_final_hold
+    composed.sim.promote()
+    composed.tick()
+    composed.trader.broker_ingest.after_hold = None
+    assert len(holds) == 2
+    assert not any(p[0] == "p-1-reprotect-target-265598-1" for p in composed.sim.placed)
+    receipt = composed.liquidation.receipt_for("p-1")
+    assert next(c for c in receipt.children if c.kind == "reprotect-target").state == "PLANNED"
+    composed.sim.held[CONID] = 0.0
+    for _ in range(3):
+        composed.sim.promote()
+        composed.tick()
+    assert not any(p[0] == "p-1-reprotect-target-265598-1" for p in composed.sim.placed)
+    assert composed.liquidation.receipt_for("p-1").state == "CLOSED"           # the stop closed the 6
+    assert composed.stack.circuit_breaker.store.get().state == "CLEAR"
 
 
 def test_target_leg_rejected_by_the_broker_escalates_to_a_full_close(composed):

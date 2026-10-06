@@ -222,7 +222,7 @@ class LiquidationDispatchPort(Protocol):
     def reduce(self, position: Any, side: str, quantity: float, child_id: str) -> None: ...
     def reduce_partial(self, position: Any, side: str, quantity: float, child_id: str) -> None: ...
     def place_exit_leg(self, position: Any, *, leg: str, quantity: float, price: float,
-                       oca_group: str, child_id: str) -> None: ...
+                       oca_group: str, child_id: str, sibling_child_id: Optional[str] = None) -> None: ...
     def find_orders(self, account_id: str, child_id: str) -> list: ...
     def find_orders_with_prefix(self, account_id: str, prefix: str) -> list: ...
     def get_order(self, order_entity_id: str) -> Optional[Any]: ...
@@ -1655,10 +1655,12 @@ class LiquidationService:
         self._send_leg(receipt, legs[0], position)
         return self._wait(self._store.receipt(root), generation, "awaiting broker acceptance of the re-protect stop")
 
-    def _send_leg(self, receipt, leg: ChildRef, position) -> Optional[str]:
+    def _send_leg(self, receipt, leg: ChildRef, position, sibling: Optional[ChildRef] = None) -> Optional[str]:
+        """``sibling``: the leg already in the OCA group; the boundary refuses unless it still works."""
         return self._send(receipt, leg, lambda: self._dispatch.place_exit_leg(
             position, leg="stop" if leg.kind == "reprotect-stop" else "target", quantity=leg.quantity,
-            price=leg.price, oca_group=leg.oca_group, child_id=leg.child_id))
+            price=leg.price, oca_group=leg.oca_group, child_id=leg.child_id,
+            sibling_child_id=None if sibling is None else sibling.child_id))
 
     def _advance_reprotect(self, receipt, snapshot, working, position) -> LiquidationReceipt:
         """R13, R26, R30: the legs' own rows decide; a normal exit ends CLOSED; a leg that
@@ -1752,6 +1754,9 @@ class LiquidationService:
         cache in the same loop step that places the order. That refusal sent
         nothing, so the target goes back to PLANNED, same child id (spec 5.1:
         place only the missing sibling), and the next tick sizes it again.
+        #22 round 9: the boundary also refuses unless the stop itself is
+        still working in ib_async's trade cache, so a target never joins the
+        group of a stop that already filled.
         """
         try:
             with self._dispatch.hold_broker_changes():
@@ -1774,7 +1779,7 @@ class LiquidationService:
                 self._store.transaction(lambda conn: self._store.update_child_in_tx(conn, target, self._now()))
                 receipt = self._observe_children(receipt, snapshot, int(self._dispatch.newest_generation()))
                 return self._wait(receipt, generation, f"re-protect target not sent: {why}")
-            if self._send_leg(receipt, sized, held) == LIVE_SIZE_MISMATCH:
+            if self._send_leg(receipt, sized, held, sibling=stop) == LIVE_SIZE_MISMATCH:
                 self._store.transaction(lambda conn: self._store.update_child_in_tx(conn, target, self._now()))
                 receipt = self._observe_children(receipt, snapshot, int(self._dispatch.newest_generation()))
                 return self._wait(receipt, generation,

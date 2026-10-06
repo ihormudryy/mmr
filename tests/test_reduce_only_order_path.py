@@ -51,6 +51,7 @@ class _FakeIB:
         self.held = held
         self.connected = True
         self.open_trades = []          # trades working at IB (reducing orders count against the bound)
+        self.done_trades = []          # terminal trades: ib_async keeps them in trades(), not openTrades()
         self.cancelled = []
 
     def isConnected(self):
@@ -62,15 +63,18 @@ class _FakeIB:
     def openTrades(self):
         return list(self.open_trades)
 
+    def trades(self):
+        return self.open_trades + self.done_trades
+
     def cancelOrder(self, order):
         self.cancelled.append(order)
 
 
-def _working(action, quantity, *, filled=0.0, oca_group="", account=ACCOUNT):
+def _working(action, quantity, *, filled=0.0, oca_group="", account=ACCOUNT, order_ref="", status="Submitted"):
     return SimpleNamespace(contract=SimpleNamespace(conId=CONID),
                            order=SimpleNamespace(action=action, totalQuantity=quantity, ocaGroup=oca_group,
-                                                 account=account),
-                           orderStatus=SimpleNamespace(filled=filled))
+                                                 account=account, orderRef=order_ref),
+                           orderStatus=SimpleNamespace(status=status, filled=filled))
 
 
 def _trader(*, held=10.0, verdict="accepted"):
@@ -385,8 +389,14 @@ def test_liquidation_dispatch_sends_exit_legs_with_the_child_id_as_order_ref():
     _LiquidationDispatch(inner, SimpleNamespace()).place_exit_leg(
         SimpleNamespace(conid=CONID, quantity=6.0), leg="stop", quantity=6.0, price=95.0, oca_group="g",
         child_id="p-1-reprotect-stop-265598-1")
+    _LiquidationDispatch(inner, SimpleNamespace()).place_exit_leg(
+        SimpleNamespace(conid=CONID, quantity=6.0), leg="target", quantity=6.0, price=120.0, oca_group="g",
+        child_id="p-1-reprotect-target-265598-1", sibling_child_id="p-1-reprotect-stop-265598-1")
     assert calls == [{"leg": "stop", "quantity": 6.0, "price": 95.0, "oca_group": "g",
-                      "order_ref": "mmr:p-1-reprotect-stop-265598-1"}]
+                      "order_ref": "mmr:p-1-reprotect-stop-265598-1", "oca_sibling_ref": None},
+                     {"leg": "target", "quantity": 6.0, "price": 120.0, "oca_group": "g",
+                      "order_ref": "mmr:p-1-reprotect-target-265598-1",
+                      "oca_sibling_ref": "mmr:p-1-reprotect-stop-265598-1"}]
 
 
 def test_target_leg_is_allowed_next_to_its_own_oca_stop_but_not_next_to_another_order():
@@ -415,3 +425,44 @@ def test_a_target_is_refused_when_its_oca_stop_already_filled_part_of_the_positi
     trader.client.ib.held = 4.0
     assert _run(trader.place_reduce_only_order(_contract(), "SELL", 4.0, broker_quantity=4.0, order_ref="mmr:t",
                                                order_type="LMT", price=120.0, oca_group=group)).is_success()
+
+
+_GROUP = "p-1-reprotect-265598-1"
+_STOP_REF = "mmr:p-1-reprotect-stop-265598-1"
+
+
+def _target_next_to(trader, sibling_ref=_STOP_REF):
+    return _run(trader.place_reduce_only_order(_contract(), "SELL", 6.0, broker_quantity=6.0, order_ref="mmr:t",
+                                               order_type="LMT", price=120.0, oca_group=_GROUP,
+                                               oca_sibling_ref=sibling_ref))
+
+
+def test_a_target_is_sent_next_to_its_working_oca_stop():
+    trader = _trader(held=6.0)
+    trader.client.ib.open_trades = [_working("SELL", 6.0, oca_group=_GROUP, order_ref=_STOP_REF)]
+    assert _target_next_to(trader).is_success()
+
+
+@pytest.mark.parametrize("status", ["Filled", "Cancelled", "Inactive"])
+def test_a_target_is_refused_when_its_oca_stop_is_terminal_but_the_position_cache_is_not(status):
+    """#22 round 9 (openai): the stop turned terminal after the last admission hold. ib_async drops it
+    from openTrades() while the position cache still shows +6. The boundary finds it in ib.trades(),
+    sees it is not working and refuses: a target joining the group now is never shrunk by OCA."""
+    trader = _trader(held=6.0)
+    trader.client.ib.done_trades = [_working("SELL", 6.0, filled=6.0 if status == "Filled" else 0.0,
+                                             oca_group=_GROUP, order_ref=_STOP_REF, status=status)]
+    refused = _target_next_to(trader)
+    assert refused.error.startswith(f"reduce-only refused: live size mismatch: OCA_SIBLING_NOT_WORKING: "
+                                    f"{_STOP_REF} is {status}")
+    assert trader.executioner.placed == []
+
+
+def test_a_target_is_refused_when_its_oca_stop_is_missing_or_pending_cancel():
+    """No trade of the named stop (for example it filled during a disconnect, which resets the cache)
+    or a stop that is pending cancel: no positive proof the stop still works, so nothing is sent."""
+    trader = _trader(held=6.0)
+    assert "OCA_SIBLING_NOT_WORKING: 0 trades" in _target_next_to(trader).error
+    trader.client.ib.open_trades = [_working("SELL", 6.0, oca_group=_GROUP, order_ref=_STOP_REF,
+                                             status="PendingCancel")]
+    assert "OCA_SIBLING_NOT_WORKING: mmr:p-1-reprotect-stop-265598-1 is PendingCancel" in _target_next_to(trader).error
+    assert trader.executioner.placed == []

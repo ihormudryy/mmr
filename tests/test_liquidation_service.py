@@ -1589,7 +1589,8 @@ def test_done_commits_while_broker_changes_are_held(tmp_path):
     s = _done_ready(tmp_path)
     before = s.dispatch.holds                     # the target admission took one hold (#22 round 5)
     receipt = s.service.rescan()
-    assert receipt.state == "DONE" and s.dispatch.holds == before + 1
+    # One hold for the DONE write, one for the saga release (#22/#25 round 6).
+    assert receipt.state == "DONE" and s.dispatch.holds == before + 2
 
 
 def test_terminal_partial_fill_reprotects_the_actual_remainder(tmp_path):
@@ -2339,26 +2340,6 @@ def test_a_full_close_during_an_unfinished_done_cleanup_starts_a_new_root(tmp_pa
 # Round 6 review findings
 # ---------------------------------------------------------------------------
 
-def test_a_later_full_close_cancels_the_live_leg_of_a_done_root_before_any_reduce(tmp_path):
-    """#21/#22 round 6: a partial close ended DONE with its stop WORKING. A later full close's
-    snapshot omits that stop, but its row still answers by ref. The new root inherits the live leg,
-    cancels it and sends no reduce while it works."""
-    s, _ = _to_reprotect(tmp_path, target=None, extra=(_snapshot(4, [_priced(6.0)]),))
-    s.dispatch.rows["p-1-reprotect-stop-1-1"] = [_leg_row(entity="stop-e")]
-    assert s.service.rescan().state == "DONE"                             # gen 4
-    s.push(_snapshot(5, [_priced(6.0)]), _snapshot(6, [_priced(6.0)]))   # the stop is not in the snapshot
-    s.service.start(ACCOUNT, "exit-1", DEADLINE, scope="conid", conid=1)
-    s.service.rescan()
-    assert ("cancel", "stop-e", "exit-1-cancel-1-1") in s.dispatch.calls
-    assert not any(c[0] == "reduce" for c in s.dispatch.calls)
-    inherited = next(c for c in s.service.receipt_for("exit-1").children if c.kind == "reprotect-stop")
-    assert inherited.owner_root_id == "exit-1"
-
-
-# ---------------------------------------------------------------------------
-# Round 6 review findings
-# ---------------------------------------------------------------------------
-
 def _flat_ready(tmp_path):
     """Account flatten: the reduce filled on generation 2; generation 3 would commit FLAT."""
     s = _stack(tmp_path, [_snapshot(1, [_position()]), _snapshot(2, []), _snapshot(3, [])])
@@ -2415,6 +2396,48 @@ def test_an_execution_recorded_before_the_done_write_never_releases_the_owner(tm
     assert next(c for c in receipt.children if c.kind == "reprotect-stop").filled_quantity == 2.0
     receipt = s.service.rescan()                                          # gen 6: stop outstanding 4 != 6
     assert receipt.state != "DONE" and s.service.close_resolution("p-1") is None
+
+
+def test_the_saga_release_reads_the_stop_row_while_broker_changes_are_held(tmp_path):
+    """#22/#25 round 6: ingest records PendingCancel after DONE committed. The release reads the
+    stop row and persists while broker changes are held, so it never applies a stale Submitted."""
+    s, protection = _to_reprotect(tmp_path, extra=(_snapshot(4, [_priced(6.0)]), _snapshot(5, [_priced(6.0)])))
+    s.dispatch.rows["p-1-reprotect-stop-1-1"] = [_leg_row()]
+    s.service.rescan()                                                    # gen 4: target sent
+    s.dispatch.rows["p-1-reprotect-target-1-1"] = [_leg_row()]
+    released = []
+    record = protection.release_after_partial
+
+    def release(**kwargs):
+        released.append((kwargs["stop_status"], s.broker.held))
+        record(**kwargs)
+    protection.release_after_partial = release
+    holds = []
+
+    def ingest_between_holds():
+        holds.append(1)
+        if len(holds) == 2:                                               # after the DONE write
+            s.dispatch.rows["p-1-reprotect-stop-1-1"] = [_leg_row("PendingCancel")]
+    s.dispatch.before_hold = ingest_between_holds
+    receipt = s.service.rescan()                                          # gen 5: DONE, then cleanup
+    assert receipt.state == "DONE"
+    assert released == [("PendingCancel", True)]
+
+
+def test_a_release_that_cannot_hold_broker_changes_stays_pending_and_retries(tmp_path):
+    s, protection = _to_reprotect(tmp_path, target=None, extra=(_snapshot(4, [_priced(6.0)]),))
+    s.dispatch.rows["p-1-reprotect-stop-1-1"] = [_leg_row()]
+    holds = []
+
+    def busy_after_done():
+        holds.append(1)
+        s.dispatch.hold_busy = len(holds) == 2
+    s.dispatch.before_hold = busy_after_done
+    receipt = s.service.rescan()
+    assert (receipt.state, receipt.cleanup_pending) == ("DONE", True)
+    assert not any(c[0] == "release_after_partial" for c in protection.calls)
+    receipt = s.service.rescan()
+    assert receipt.cleanup_pending is False and protection.calls[-1][0] == "release_after_partial"
 
 
 def test_a_later_full_close_cancels_the_live_leg_of_a_done_root_before_any_reduce(tmp_path):

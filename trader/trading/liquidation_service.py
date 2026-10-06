@@ -1230,13 +1230,12 @@ class LiquidationService:
             if receipt.state in ("CLOSED", "FLAT"):
                 self._protection.close_after_full(close_root_id=root, now=self._now())
             elif receipt.state in ("DONE", "REDUCE_FAILED"):
-                stop, target = self._working_legs(receipt)
-                self._protection.release_after_partial(
-                    close_root_id=root, remaining_quantity=float(receipt.remaining_quantity),
-                    stop_group=stop.child_id, stop_status=self._leg_status(stop),
-                    target_group=None if target is None else target.child_id,
-                    target_status=None if target is None else self._leg_status(target),
-                    now=self._now())
+                try:
+                    with self._dispatch.hold_broker_changes():
+                        self._release_after_partial(receipt)
+                except BrokerChangesBusy as ex:
+                    log.warning("liquidation %s release waits for the next rescan: %s", root, ex)
+                    return self._store.receipt(root)
 
         def write(conn):
             run = self._store.get_run_in_tx(conn, root)
@@ -1244,6 +1243,20 @@ class LiquidationService:
         self._store.transaction(write)
         self._schedule_commands(root)
         return self._store.receipt(root)
+
+    def _release_after_partial(self, receipt: LiquidationReceipt) -> None:
+        """#22/#25 round 6: call only while broker changes are held.
+
+        The legs' rows are read and the saga release is persisted with no
+        ingest batch in between, so the release never applies a stale status.
+        """
+        stop, target = self._working_legs(receipt)
+        self._protection.release_after_partial(
+            close_root_id=receipt.cause_command_id, remaining_quantity=float(receipt.remaining_quantity),
+            stop_group=stop.child_id, stop_status=self._leg_status(stop),
+            target_group=None if target is None else target.child_id,
+            target_status=None if target is None else self._leg_status(target),
+            now=self._now())
 
     def _schedule_commands(self, root: str) -> None:
         """Hand every command waiting on this root to the reconciler, its only resolver (D12).

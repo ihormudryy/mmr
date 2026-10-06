@@ -20,7 +20,7 @@
 - Command ids and child ids never contain `:` (they become IB `orderRef` values via `encode_order_ref`).
 - Routine progress of a scoped close never trips the breaker. Account-scope breaker behaviour is unchanged.
 - Test-first. Each task begins with a failing test. Run tests with `pytest <path> -q --timeout=30`. The full suite: `pytest tests/ -q --timeout=30 --ignore=tests/test_ibrx_async.py`.
-- Commit subjects follow the repo style (`feat:`, `fix:`, `test:`, `refactor:`), lowercase, imperative. Every commit ends with a blank line and `Co-Authored-By: Claude Fable 5.1 <noreply@anthropic.com>`.
+- Commit subjects follow the repo style (`feat:`, `fix:`, `test:`, `refactor:`), lowercase, imperative. Every commit ends with a blank line and `Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>`.
 - Old-path entry admission and risk ceilings do not change in this plan. The only old-path behaviour change is that time exits and SELL intents use the scoped close.
 - Nothing calls `SessionController.on_bar` live yet (checked: no caller in `trader/`). The time-exit bug is therefore latent, but the adapter is fixed here so the first live caller (SP2) is safe.
 
@@ -62,14 +62,14 @@ Five spec-implied inputs no test list in the spec names. Each has a test pinned 
 
 ### Task 1: Pin the latent time-exit bug with a failing test
 
-The spec requires a failing test before the fix. The test asserts the *desired* behaviour (a time exit asks the liquidation service for a scoped close of that conid, and never calls `reduce` directly). It fails today. It is committed marked `xfail(strict=True)` so the suite stays green; Task 10 removes the marker when it fixes the adapter.
+The spec requires a failing test before the fix. The test asserts the *desired* behaviour (a time exit asks the liquidation service for a scoped close of that conid, and never calls `reduce` directly). It fails today. It is committed marked `xfail(strict=True)` so the suite stays green; Task 11 removes the marker when it fixes the adapter.
 
 **Files:**
 - Test: `tests/automation/test_session_controller.py`
 
 **Interfaces:**
 - Consumes: `SessionTimeExitAdapter` (`trader/automation/session_controller.py:286`), today constructed as `SessionTimeExitAdapter(dispatch)`.
-- Produces: the contract Task 10 implements: `SessionTimeExitAdapter(liquidation, *, account_id, now, deadline_seconds=300.0)`; `request_exit(...)` calls `liquidation.start(account_id, command_id, deadline, scope="conid", conid=conid)`.
+- Produces: the contract Task 11 implements: `SessionTimeExitAdapter(liquidation, *, account_id, now, deadline_seconds=300.0)`; `request_exit(...)` calls `liquidation.start(account_id, command_id, deadline, scope="conid", conid=conid)`.
 
 - [ ] **Step 1: Write the failing test**
 
@@ -125,7 +125,7 @@ Expected: `1 xfailed`. (Today `SessionTimeExitAdapter.__init__` takes one positi
 git add tests/automation/test_session_controller.py
 git commit -m "test: pin time exit leaving the protective stop live
 
-Co-Authored-By: Claude Fable 5.1 <noreply@anthropic.com>"
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>"
 ```
 
 ---
@@ -234,7 +234,7 @@ Expected: PASS.
 git add trader/trading/order_correlation.py trader/trading/broker_ingest.py tests/test_command_ports.py
 git commit -m "feat: classify re-protect exit legs by order group
 
-Co-Authored-By: Claude Fable 5.1 <noreply@anthropic.com>"
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>"
 ```
 
 ---
@@ -591,7 +591,7 @@ Expected: 12 passed.
 git add trader/trading/exit_owner.py tests/test_exit_owner.py
 git commit -m "feat: durable exit owner registry for closes and flattens
 
-Co-Authored-By: Claude Fable 5.1 <noreply@anthropic.com>"
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>"
 ```
 
 ---
@@ -1087,7 +1087,7 @@ Expected: all PASS except the one `xfailed` from Task 1. `test_disconnect_is_out
 git add trader/trading/liquidation_service.py tests/test_liquidation_service.py
 git commit -m "refactor: liquidation receipt carries scope, goal, phase and child refs
 
-Co-Authored-By: Claude Fable 5.1 <noreply@anthropic.com>"
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>"
 ```
 
 ---
@@ -1442,7 +1442,7 @@ Expected: all PASS.
 git add trader/trading/liquidation_service.py tests/test_liquidation_service.py
 git commit -m "feat: conid-scoped full close with protection hand-over
 
-Co-Authored-By: Claude Fable 5.1 <noreply@anthropic.com>"
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>"
 ```
 
 ---
@@ -1869,7 +1869,7 @@ Expected: all PASS.
 git add trader/trading/liquidation_service.py tests/test_liquidation_service.py
 git commit -m "feat: partial close with linked re-protect and escalation
 
-Co-Authored-By: Claude Fable 5.1 <noreply@anthropic.com>"
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>"
 ```
 
 ---
@@ -2086,7 +2086,7 @@ Expected: all PASS.
 git add trader/trading/liquidation_service.py tests/test_liquidation_service.py
 git commit -m "feat: account flatten supersedes scoped closes and waits for every child
 
-Co-Authored-By: Claude Fable 5.1 <noreply@anthropic.com>"
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>"
 ```
 
 ---
@@ -2211,7 +2211,7 @@ Expected: all PASS.
 git add trader/trading/liquidation_service.py tests/test_liquidation_service.py
 git commit -m "feat: scoped closes claim through the exit owner registry
 
-Co-Authored-By: Claude Fable 5.1 <noreply@anthropic.com>"
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>"
 ```
 
 ---
@@ -2515,7 +2515,7 @@ Expected: all PASS, including `test_migration_30_creates_automated_order_sagas_t
 git add trader/automation/protective_order_saga.py tests/automation/test_protective_order_saga.py
 git commit -m "feat: protective saga hands protection over to a close
 
-Co-Authored-By: Claude Fable 5.1 <noreply@anthropic.com>"
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>"
 ```
 
 ---
@@ -2914,7 +2914,7 @@ Expected: all PASS (the bracket-rollback tests in `test_trading_runtime.py` stil
 git add trader/trading/trading_runtime.py trader/trading/command_stack.py tests/test_order_dispatch_ports.py tests/test_trader_place_exit_oca.py tests/test_command_stack_liquidation_dispatch.py
 git commit -m "feat: reduce-only partial reduce and exit-only OCA primitives
 
-Co-Authored-By: Claude Fable 5.1 <noreply@anthropic.com>"
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>"
 ```
 
 ---
@@ -3056,7 +3056,7 @@ Expected: all PASS, no xfail left.
 git add trader/automation/session_controller.py tests/automation/test_session_controller.py
 git commit -m "fix: time exits close through the scoped liquidation and poll their own root
 
-Co-Authored-By: Claude Fable 5.1 <noreply@anthropic.com>"
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>"
 ```
 
 ---
@@ -3231,7 +3231,7 @@ Expected: all PASS. Existing BUY-path tests are unaffected because they construc
 git add trader/automation/automated_intent_command.py tests/automation/test_automated_command_boundary.py
 git commit -m "feat: sell intents close through the scoped liquidation after a reduction proof
 
-Co-Authored-By: Claude Fable 5.1 <noreply@anthropic.com>"
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>"
 ```
 
 ---
@@ -3499,7 +3499,7 @@ Expected: all PASS. Pay attention to `tests/test_production_rpc_security.py` and
 git add trader/trading/command_stack.py tests/test_safe_close_integration.py tests/automation/test_session_controller.py
 git commit -m "feat: wire exit ownership, scoped closes and time exits into the command stack
 
-Co-Authored-By: Claude Fable 5.1 <noreply@anthropic.com>"
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>"
 ```
 
 ---

@@ -42,6 +42,11 @@ Asking another agent for a review:
 - Each reviewer finds its work with `gh api 'search/issues?q=repo:ihormudryy/mmr+is:open+label:review:<key>'`, posts its review as its own App, then removes its own label.
 - Prefer a PR review with line comments. Put a one-line verdict (ready / not yet) at the top and name the ticket for each finding.
 
+Review threads:
+- The author answers in each thread: "Fixed in <sha>: ... Test: ..." after the fix is pushed, or "Disagree: <reason>". While fixes are not pushed yet, the author posts one PR comment saying so, so reviewers know why nothing has changed.
+- Only the reviewer who opened a thread resolves it, after checking the fix on the pushed head. If the fix is not there, reply in the thread (do not wait silently); if a follow-up is needed, say exactly which regression test would prove it.
+- The author re-adds the `review:<key>` labels after pushing fixes; that is the signal for the next round.
+
 Automatic reviews: adding `review:openai` or `review:grok` to a PR also runs `.github/workflows/ai-review.yml`. It reads the diff (not the whole repo, no test run), asks the model through `scripts/ai_review.py` (backend `REVIEW_PROVIDER` = openrouter, bedrock or azure; model in `REVIEW_MODEL_OPENAI` / `REVIEW_MODEL_GROK` repo variables), posts the review as that App and removes the label. A full agentic review (reading code, running tests) is still done by the owner's tools.
 
 When a review is done (stopping rule):

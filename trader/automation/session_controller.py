@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import datetime as dt
 import json
+import logging
 from dataclasses import dataclass
 from decimal import Decimal
 from typing import Any, Callable, Optional, Protocol, Sequence
@@ -264,6 +265,12 @@ class SessionStateStore:
 # Adapters
 # ---------------------------------------------------------------------------
 
+def _is_own_entry(order: Any) -> bool:
+    """A working entry order of ours: not external, not a protective child, not a close's child."""
+    from trader.trading.order_correlation import liquidation_child_kind
+    return (getattr(order, "leg", None) == "entry" and not getattr(order, "is_external", False)
+            and liquidation_child_kind(getattr(order, "order_group_id", None)) is None)
+
 class SessionCancelAdapter:
     """Cancel working orders with deterministic child command ids."""
 
@@ -273,14 +280,25 @@ class SessionCancelAdapter:
     def cancel_working_entries(
         self, *, root_command_id: str, orders: Sequence[Any],
     ) -> list[str]:
+        """Cancel each entry; one that cannot be cancelled is logged and the others still go.
+
+        An entry cancel is idempotent at the broker, so it is not a journaled
+        child: a crash before ``cancel_issued`` is stored sends it again.
+        """
+        from trader.trading.liquidation_service import DispatchRefused
         child_ids: list[str] = []
         for index, order in enumerate(orders):
             child = f"{root_command_id}-{index}"
             child_ids.append(child)
-            if self._dispatch is not None:
-                cancel = getattr(self._dispatch, "cancel", None)
-                if cancel is not None:
-                    cancel(order, child)
+            cancel = getattr(self._dispatch, "cancel", None) if self._dispatch is not None else None
+            if cancel is None:
+                continue
+            try:
+                cancel(order, child)
+            except DispatchRefused as ex:
+                logging.getLogger(__name__).info("entry %s needs no cancel: %s", order.order_entity_id, ex)
+            except Exception:
+                logging.getLogger(__name__).exception("entry cancel %s failed", order.order_entity_id)
         return child_ids
 
 
@@ -507,6 +525,10 @@ class SessionController:
         ):
             state = self._issue_cancel(state, now_utc)
 
+        # 2b) A cancelled partly filled entry must not leave bigger protection than the position
+        if state.cancel_issued and not state.flatten_issued and state.state not in _TERMINAL:
+            self._close_oversized_protection(state)
+
         # 3) Flatten via P1 liquidation
         if (
             state.flatten_start_utc is not None
@@ -656,11 +678,13 @@ class SessionController:
         root = self.cancel_command_id(self._account_id, state.session_date)
         try:
             snapshot = self._broker.capture(self._account_id)
-            working = tuple(getattr(snapshot, "working_orders", ()) or ())
-            if working:
-                self._cancel.cancel_working_entries(
-                    root_command_id=root, orders=working,
-                )
+            entries = tuple(order for order in getattr(snapshot, "working_orders", ()) or ()
+                            if _is_own_entry(order))
+            # R16 / D16: only our working entries, a partly filled one included, so
+            # nothing fills after the cutoff. Protective children, exits and external
+            # orders are left to the flatten, which owns their protection.
+            if entries:
+                self._cancel.cancel_working_entries(root_command_id=root, orders=entries)
         except Exception:
             # Ambiguous cancel still marks issued; flatten reconciles remainder.
             pass
@@ -672,6 +696,24 @@ class SessionController:
         )
         self._persist(state, now_utc)
         return state
+
+    def _close_oversized_protection(self, state: SessionControllerState) -> None:
+        """D16: after an entry's remainder is cancelled, its children may still be sized for the
+        whole entry. A working stop or target for more than the position would reverse it, so the
+        conid is closed now through the scoped close (hand-over, cancel, reduce)."""
+        try:
+            snapshot = self._broker.capture(self._account_id)
+        except Exception:
+            return
+        held = {int(p.conid): float(p.quantity) for p in getattr(snapshot, "positions", ()) or ()
+                if float(p.quantity) != 0.0}
+        for conid, quantity in sorted(held.items()):
+            protective = [o for o in getattr(snapshot, "working_orders", ()) or ()
+                          if int(o.conid) == conid and not o.is_external and o.leg in ("stop", "take_profit")]
+            if any(float(o.total_quantity) - float(o.filled_quantity) > abs(quantity) for o in protective):
+                self._time_exit.request_exit(
+                    command_id=f"{self.cancel_command_id(self._account_id, state.session_date)}-protect-{conid}",
+                    conid=conid, quantity=Decimal(str(abs(quantity))), side="BUY" if quantity > 0 else "SELL")
 
     def _issue_flatten(
         self, state: SessionControllerState, now_utc: dt.datetime,

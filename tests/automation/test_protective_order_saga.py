@@ -1332,6 +1332,18 @@ def test_only_a_failure_seen_by_this_version_asks_the_worker_for_a_flatten(tmp_p
     assert fresh.unhandled_failures(ACCOUNT) == [intent2.command_id]
 
 
+
+def test_cancelling_the_rest_of_a_partly_filled_entry_keeps_protection(tmp_path):
+    """D16: the session cancels the entry's unfilled rest; the filled part stays protected, no incident."""
+    saga, intent, state, breaker, liquidation, _dispatch = _started(tmp_path)
+    og = state.order_group_id
+    saga.on_broker_event(_event(og, leg="stop", status="Submitted", order_id=2))
+    saga.on_broker_event(_event(og, leg="entry", status="Submitted", filled=4.0, order_id=1))
+    state = saga.on_broker_event(_event(og, leg="entry", status="Cancelled", filled=4.0, order_id=1))
+    assert (state.state, state.protection_quantity) == ("PARTIALLY_FILLED", Decimal("4"))
+    assert breaker.signals == [] and liquidation.starts == []
+
+
 def test_an_entry_event_saved_while_submit_bracket_waits_keeps_the_submitted_ids(tmp_path):
     """Round-2 verification N1: the ingest thread saves the entry's Submitted event while
     ``submit_bracket`` waits. ``start`` must not then fail its own write with a revision conflict

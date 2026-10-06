@@ -67,10 +67,12 @@ def _order(
     filled: float = 0.0,
     total: float = 10.0,
     is_external: bool = False,
+    group: str = "og-1",
+    action: str = "BUY",
 ) -> BrokerOrderRow:
     return BrokerOrderRow(
         order_entity_id=entity, account_id=ACCOUNT, conid=CONID, symbol="AAPL",
-        order_group_id="og-1", leg=leg, is_external=is_external, action="BUY",
+        order_group_id=group, leg=leg, is_external=is_external, action=action,
         order_type="LMT", total_quantity=total, filled_quantity=filled,
         avg_fill_price=None, limit_price=160.0, stop_price=None, tif="DAY",
         status="Submitted", deleted=False, revision=1,
@@ -348,6 +350,64 @@ def test_partial_fill_during_cancel_still_cancels_remainder(tmp_path):
     controller.run_due(clock[0])
     assert len(cancel.calls) == 1
     assert cancel.calls[0][1] == "ord-partial"
+
+
+def test_session_cancel_entries_keeps_protective_children(tmp_path):
+    """R16 / #27: stops, targets, a close's reduce and external orders are not cancelled."""
+    working = (
+        _order("og-1:entry", leg="entry"),
+        _order("og-2:stop", leg="stop", group="og-2", action="SELL"),
+        _order("og-2:take_profit", leg="take_profit", group="og-2", action="SELL"),
+        _order("ext-1", leg="entry", is_external=True, group=None),
+        _order("flat-1-liquidation-reduce-265598:entry", leg="entry",
+               group="flat-1-liquidation-reduce-265598", action="SELL"),
+    )
+    broker = FakeBroker([_snapshot(1, positions=[_position()], working=working)])
+    controller, _b, cancel, _l, breaker, _t, _j, _db, clock = _build_controller(tmp_path, broker=broker)
+    clock[0] = _utc(15, 35)
+    controller.recover(clock[0])
+    controller.run_due(clock[0])
+    assert [c[1] for c in cancel.calls] == ["og-1:entry"]
+    assert breaker.signals == []
+
+
+def test_protection_bigger_than_the_position_after_the_cancel_closes_the_conid(tmp_path):
+    """D16: the entry filled 4 of 10 and its rest was cancelled; a stop for 10 would reverse the position."""
+    working = (_order("og-1:stop", leg="stop", total=10.0, action="SELL"),)
+    broker = FakeBroker([_snapshot(1, positions=[_position(4.0)], working=working)])
+    controller, _b, _c, _l, _br, time_exit, _j, _db, clock = _build_controller(tmp_path, broker=broker)
+    clock[0] = _utc(15, 36)
+    controller.recover(clock[0])
+    controller.run_due(clock[0])
+    from trader.automation.session_controller import SessionController
+    root = SessionController.cancel_command_id(ACCOUNT, SESSION_DATE)
+    expected = {"command_id": f"{root}-protect-{CONID}", "conid": CONID, "quantity": Decimal("4.0"), "side": "BUY"}
+    assert time_exit.exits and all(e == expected for e in time_exit.exits)   # one root id: the close joins itself
+
+
+def test_protection_that_matches_the_position_is_left_to_the_flatten(tmp_path):
+    working = (_order("og-1:stop", leg="stop", total=4.0, action="SELL"),)
+    broker = FakeBroker([_snapshot(1, positions=[_position(4.0)], working=working)])
+    controller, _b, _c, _l, _br, time_exit, _j, _db, clock = _build_controller(tmp_path, broker=broker)
+    clock[0] = _utc(15, 36)
+    controller.recover(clock[0])
+    controller.run_due(clock[0])
+    assert time_exit.exits == []
+
+
+def test_an_entry_that_cannot_be_cancelled_does_not_stop_the_others():
+    from trader.automation.session_controller import SessionCancelAdapter
+    from trader.trading.liquidation_service import DispatchRefused
+
+    sent = []
+
+    def cancel(order, child):
+        if order.order_entity_id == "gone":
+            raise DispatchRefused("CANCEL_UNRESOLVED", "no live order")
+        sent.append(order.order_entity_id)
+    SessionCancelAdapter(SimpleNamespace(cancel=cancel)).cancel_working_entries(
+        root_command_id="session-cancel-x", orders=(_order("gone"), _order("og-2:entry")))
+    assert sent == ["og-2:entry"]
 
 
 def test_flatten_at_flatten_deadline_uses_liquidation(tmp_path):

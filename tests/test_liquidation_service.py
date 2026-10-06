@@ -2333,3 +2333,23 @@ def test_a_full_close_during_an_unfinished_done_cleanup_starts_a_new_root(tmp_pa
     assert receipt.cause_command_id == "exit-1"
     assert (s.service.receipt_for("p-1").state, s.service.receipt_for("p-1").goal) == ("DONE", "partial")
     assert s.registry.owner_for(ACCOUNT, 1).root_id == "exit-1"
+
+
+# ---------------------------------------------------------------------------
+# Round 6 review findings
+# ---------------------------------------------------------------------------
+
+def test_a_later_full_close_cancels_the_live_leg_of_a_done_root_before_any_reduce(tmp_path):
+    """#21/#22 round 6: a partial close ended DONE with its stop WORKING. A later full close's
+    snapshot omits that stop, but its row still answers by ref. The new root inherits the live leg,
+    cancels it and sends no reduce while it works."""
+    s, _ = _to_reprotect(tmp_path, target=None, extra=(_snapshot(4, [_priced(6.0)]),))
+    s.dispatch.rows["p-1-reprotect-stop-1-1"] = [_leg_row(entity="stop-e")]
+    assert s.service.rescan().state == "DONE"                             # gen 4
+    s.push(_snapshot(5, [_priced(6.0)]), _snapshot(6, [_priced(6.0)]))   # the stop is not in the snapshot
+    s.service.start(ACCOUNT, "exit-1", DEADLINE, scope="conid", conid=1)
+    s.service.rescan()
+    assert ("cancel", "stop-e", "exit-1-cancel-1-1") in s.dispatch.calls
+    assert not any(c[0] == "reduce" for c in s.dispatch.calls)
+    inherited = next(c for c in s.service.receipt_for("exit-1").children if c.kind == "reprotect-stop")
+    assert inherited.owner_root_id == "exit-1"

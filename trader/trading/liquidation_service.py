@@ -523,7 +523,12 @@ class LiquidationRunStore:
 
     def inherit_children_in_tx(self, conn, *, account_id: str, conid: Optional[int],
                                to_root_id: str, now: dt.datetime) -> int:
-        """R9: the new owner takes every open child of a SUPERSEDED or FAILED_SAFE root on its scope."""
+        """R9: the new owner takes every open child of an ended root on its scope.
+
+        That includes the WORKING re-protect legs a DONE / REDUCE_FAILED root
+        left behind (#21/#22 round 6): a later close must cancel them and wait
+        for them, even when its snapshot does not list them.
+        """
         conid_filter = "" if conid is None else " AND conid = ?"
         params: list = [to_root_id, now, account_id, to_root_id]
         if conid is not None:
@@ -532,7 +537,8 @@ class LiquidationRunStore:
             "UPDATE liquidation_children SET owner_root_id = ?, updated_at = ? "
             "WHERE account_id = ? AND state IN ('UNKNOWN', 'WORKING', 'PENDING_CANCEL') AND owner_root_id <> ?"
             f"{conid_filter} AND owner_root_id IN ("
-            "SELECT cause_command_id FROM liquidation_runs WHERE state IN ('SUPERSEDED', 'FAILED_SAFE')) "
+            "SELECT cause_command_id FROM liquidation_runs "
+            "WHERE state IN ('SUPERSEDED', 'FAILED_SAFE', 'DONE', 'REDUCE_FAILED')) "
             "RETURNING child_id", params).fetchall()
         return len(rows)
 

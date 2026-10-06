@@ -1702,8 +1702,16 @@ class Trader():
         *,
         broker_quantity: float,
         order_ref: str,
+        order_type: str = 'MKT',
+        price: Optional[float] = None,
+        oca_group: Optional[str] = None,
     ) -> SuccessFail:
-        """Send a MARKET order that can only shrink an existing position.
+        """Send an order that can only shrink an existing position.
+
+        ``order_type`` is ``MKT`` (full or partial reduce), or ``STP`` / ``LMT``
+        with a positive ``price`` for the exit legs of a re-protect pair. An
+        ``oca_group`` links the legs with ``ocaType=2``: a fill of one leg
+        reduces the other to what is left.
 
         The emergency-exit path (liquidation, session flatten). It keeps the
         boundary checks — account and mode pin, contract, reduce-only side and
@@ -1719,17 +1727,15 @@ class Trader():
         - ``fail(exception=...)``: the order may have been sent.
         """
         try:
-            refusal = self._reduce_only_refusal(contract, side, quantity, broker_quantity)
+            refusal = self._reduce_only_refusal(contract, side, quantity, broker_quantity,
+                                                order_type=order_type, price=price, oca_group=oca_group)
         except Exception as ex:
             refusal = f'pre-send check failed: {ex}'
         if refusal:
             logging.error('reduce-only order refused before send: %s', refusal)
             return SuccessFail.fail(error=f'{REDUCE_ONLY_REFUSED}: {refusal}')
 
-        order = MarketOrder(
-            action=side, totalQuantity=quantity, account=self.ib_account,
-            orderRef=order_ref, tif='DAY', outsideRth=False,
-        )
+        order = self._reduce_only_order(side, quantity, order_ref, order_type, price, oca_group)
         try:
             trade = await self._send_reduce_only(contract, order)
             return await self._confirm_reduce_only(trade)
@@ -1737,12 +1743,33 @@ class Trader():
             logging.error('reduce-only order may have been sent: %s', ex)
             return SuccessFail.fail(exception=ex)
 
+    _REDUCE_ONLY_TYPES = ('MKT', 'STP', 'LMT')
+
+    def _reduce_only_order(self, side: str, quantity: float, order_ref: str, order_type: str,
+                           price: Optional[float], oca_group: Optional[str]) -> Order:
+        common = dict(action=side, totalQuantity=quantity, account=self.ib_account,
+                      orderRef=order_ref, tif='DAY', outsideRth=False)
+        if order_type == 'STP':
+            order: Order = StopOrder(stopPrice=float(price), **common)
+        elif order_type == 'LMT':
+            order = LimitOrder(lmtPrice=float(price), **common)
+        else:
+            order = MarketOrder(**common)
+        if oca_group:
+            order.ocaGroup = oca_group
+            order.ocaType = 2  # a fill reduces the sibling to what is left
+        return order
+
     def _reduce_only_refusal(
         self, contract: Contract, side: str, quantity: float, broker_quantity: float, *,
-        oca_group: Optional[str] = None,
+        order_type: str = 'MKT', price: Optional[float] = None, oca_group: Optional[str] = None,
     ) -> Optional[str]:
         import math
 
+        if order_type not in self._REDUCE_ONLY_TYPES:
+            return f'order type {order_type!r} is not a reduce-only type'
+        if order_type != 'MKT' and (price is None or not math.isfinite(float(price)) or not float(price) > 0):
+            return f'{order_type} needs a positive price'
         account = self.ib_account
         if not account:
             return 'no ib_account is configured on the trader'
@@ -2526,6 +2553,18 @@ class TradingRuntimeOrderDispatch:
         if not float(quantity).is_integer() or not 0 < float(quantity) < held:
             self._refuse('a partial reduce needs a whole quantity strictly between 0 and the position')
         return self._reduce_only(position, side, quantity, order_ref)
+
+    def place_exit_leg(self, position, *, leg: str, quantity: float, price: float,
+                       oca_group: str, order_ref: str):
+        """One exit-only leg (stop or target) of a re-protect OCA pair."""
+        if leg not in ('stop', 'target'):
+            self._refuse(f'unknown exit leg {leg!r}')
+        side = self._reducing_side(position)
+        if side is None:
+            self._refuse('no position to protect')
+        return self._reduce_only(position, side, quantity, order_ref,
+                                 order_type='STP' if leg == 'stop' else 'LMT',
+                                 price=float(price), oca_group=oca_group)
 
     def cancel_on_loop(self, order_entity_id: str, order_ref: str):
         """``cancel`` for the liquidation worker (R34, ruling 7).

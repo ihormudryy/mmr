@@ -242,3 +242,71 @@ def test_liquidation_dispatch_encodes_child_ids_and_reads_evidence():
         ("reduce_partial", "SELL", 4.0, "mmr:p-1-reduce-265598-1"),
         ("find", ACCOUNT, "mmr:c-1-reduce-265598-1"),
     ]
+
+
+# -- Task 10: exit legs by order identity -----------------------------------------------
+
+def test_exit_legs_carry_price_oca_group_and_reduce_oca_type():
+    trader = _trader(held=6.0)
+    for order_type, price, ref in (("STP", 95.0, "mmr:p-1-reprotect-stop-265598-1"),
+                                   ("LMT", 120.0, "mmr:p-1-reprotect-target-265598-1")):
+        result = _run(trader.place_reduce_only_order(_contract(), "SELL", 6.0, broker_quantity=6.0, order_ref=ref,
+                                                     order_type=order_type, price=price,
+                                                     oca_group="p-1-reprotect-265598-1"))
+        assert result.is_success()
+    stop, target = trader.executioner.placed
+    assert (stop.orderType, stop.auxPrice, target.orderType, target.lmtPrice) == ("STP", 95.0, "LMT", 120.0)
+    for order in (stop, target):
+        assert (order.ocaGroup, order.ocaType, order.transmit, order.parentId, order.tif) == (
+            "p-1-reprotect-265598-1", 2, True, 0, "DAY")
+
+
+def test_an_exit_leg_rejected_by_ib_is_not_a_refusal():
+    """R13: IB's verdict for this order id; a rejected leg was sent, so it is not ``reduce-only refused``."""
+    trader = _trader(held=6.0, verdict="rejected")
+    result = _run(trader.place_reduce_only_order(_contract(), "SELL", 6.0, broker_quantity=6.0, order_ref="mmr:t",
+                                                 order_type="LMT", price=120.0, oca_group="g"))
+    assert result.exception is None and result.error.startswith("Order rejected by IB")
+    assert len(trader.executioner.placed) == 1
+
+
+@pytest.mark.parametrize("order_type,price", [("STP", None), ("LMT", 0.0), ("TRAIL", 1.0)])
+def test_exit_leg_without_a_valid_type_or_price_is_refused(order_type, price):
+    trader = _trader(held=6.0)
+    result = _run(trader.place_reduce_only_order(_contract(), "SELL", 6.0, broker_quantity=6.0, order_ref="mmr:x",
+                                                 order_type=order_type, price=price, oca_group="g"))
+    assert result.error.startswith("reduce-only refused") and trader.executioner.placed == []
+
+
+def test_dispatch_place_exit_leg_derives_side_and_type(loop_thread):
+    trader = _trader(held=-6.0)
+    dispatch = _dispatch(trader, loop_thread)
+    dispatch.place_exit_leg(_position(-6.0), leg="stop", quantity=6.0, price=105.0, oca_group="g", order_ref="mmr:s")
+    order = trader.executioner.placed[-1]
+    assert (order.action, order.orderType, order.auxPrice, order.ocaGroup) == ("BUY", "STP", 105.0, "g")
+    with pytest.raises(DispatchRefused):
+        dispatch.place_exit_leg(_position(-6.0), leg="trail", quantity=6.0, price=1.0, oca_group="g", order_ref="mmr:x")
+
+
+def test_liquidation_dispatch_sends_exit_legs_with_the_child_id_as_order_ref():
+    from trader.trading.command_stack import _LiquidationDispatch
+
+    calls = []
+    inner = SimpleNamespace(place_exit_leg=lambda p, **kw: calls.append(kw))
+    _LiquidationDispatch(inner, SimpleNamespace()).place_exit_leg(
+        SimpleNamespace(conid=CONID, quantity=6.0), leg="stop", quantity=6.0, price=95.0, oca_group="g",
+        child_id="p-1-reprotect-stop-265598-1")
+    assert calls == [{"leg": "stop", "quantity": 6.0, "price": 95.0, "oca_group": "g",
+                      "order_ref": "mmr:p-1-reprotect-stop-265598-1"}]
+
+
+def test_target_leg_is_allowed_next_to_its_own_oca_stop_but_not_next_to_another_order():
+    """D14: the working stop of the same OCA pair does not count against the target's bound."""
+    trader = _trader(held=6.0)
+    trader.client.ib.open_trades = [_working("SELL", 6.0, oca_group="p-1-reprotect-265598-1")]
+    target = _run(trader.place_reduce_only_order(_contract(), "SELL", 6.0, broker_quantity=6.0, order_ref="mmr:t",
+                                                 order_type="LMT", price=120.0, oca_group="p-1-reprotect-265598-1"))
+    assert target.is_success()
+    other = _run(trader.place_reduce_only_order(_contract(), "SELL", 6.0, broker_quantity=6.0, order_ref="mmr:u",
+                                                order_type="LMT", price=120.0, oca_group="another-group"))
+    assert other.error.startswith("reduce-only refused")

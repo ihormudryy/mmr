@@ -221,6 +221,11 @@ class _LiquidationDispatch:
     def reduce_partial(self, position, side: str, quantity: float, child_id: str) -> None:
         self._dispatch.reduce_partial(position, side, quantity, encode_order_ref(child_id))
 
+    def place_exit_leg(self, position, *, leg: str, quantity: float, price: float,
+                       oca_group: str, child_id: str) -> None:
+        self._dispatch.place_exit_leg(position, leg=leg, quantity=quantity, price=price,
+                                      oca_group=oca_group, order_ref=encode_order_ref(child_id))
+
     def find_orders(self, account_id: str, child_id: str) -> list:
         return self._dispatch.find_by_order_ref(account_id, encode_order_ref(child_id))
 

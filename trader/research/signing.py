@@ -43,7 +43,7 @@ from trader.research.key_purpose import (
     KeyPurposeError,
     default_rpc_keys_dir,
     raw_public_bytes,
-    rpc_public_raw,
+    rpc_identity_raw,
 )
 
 __all__ = [
@@ -147,7 +147,7 @@ def load_verify_key(path: str) -> Ed25519PublicKey:
 def _refuse_rpc_identity_key(public_key: Ed25519PublicKey, path: str) -> None:
     """Bundle keys and RPC identity keys are separate (spec 5.3)."""
     try:
-        rpc_keys = rpc_public_raw(default_rpc_keys_dir())
+        rpc_keys = rpc_identity_raw(default_rpc_keys_dir())
     except KeyPurposeError as exc:
         raise MalformedKey(str(exc)) from exc
     if raw_public_bytes(public_key) in rpc_keys:

@@ -12,7 +12,7 @@ import os
 from pathlib import Path
 
 from cryptography.hazmat.primitives import serialization
-from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PublicKey
+from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey, Ed25519PublicKey
 
 RPC_KEYS_DIR_ENV = "MMR_RPC_KEYS_DIR"
 
@@ -55,6 +55,32 @@ def _raw_public_keys_in(directory: Path, pattern: str) -> frozenset[bytes]:
 
 def rpc_public_raw(rpc_dir: Path) -> frozenset[bytes]:
     return _raw_public_keys_in(rpc_dir, "*.pub")
+
+
+def rpc_private_derived_raw(rpc_dir: Path) -> frozenset[bytes]:
+    """Public halves derived from every ``*.key`` in ``rpc_dir``.
+
+    A container may hold its own ``.key`` without the matching ``.pub``, so
+    the bundle loaders cannot rely on the ``.pub`` files alone.
+    """
+    rpc_dir = Path(rpc_dir)
+    if not rpc_dir.is_dir():
+        return frozenset()
+    found = set()
+    for path in sorted(rpc_dir.glob("*.key")):
+        try:
+            key = serialization.load_pem_private_key(path.read_bytes(), password=None)
+        except (ValueError, TypeError, OSError) as exc:
+            raise KeyPurposeError(f"{path} is not a readable private key PEM") from exc
+        if not isinstance(key, Ed25519PrivateKey):
+            raise KeyPurposeError(f"{path} is not an Ed25519 private key")
+        found.add(raw_public_bytes(key.public_key()))
+    return frozenset(found)
+
+
+def rpc_identity_raw(rpc_dir: Path) -> frozenset[bytes]:
+    """Every RPC public key visible in ``rpc_dir``: the ``.pub`` files and those derived from ``.key`` files."""
+    return rpc_public_raw(rpc_dir) | rpc_private_derived_raw(rpc_dir)
 
 
 def bundle_public_raw(verify_dir: Path) -> frozenset[bytes]:

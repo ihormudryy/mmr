@@ -1991,6 +1991,9 @@ class FakeOrphanEvidence:
             raise self.enumeration_error
         return BrokerEnumeration(generation_id=self.generation, started_at=self.started_at)
 
+    def entry_orders(self, account_id, order_group_id):
+        return []
+
     def has_trace_in_tx(self, conn, account_id, order_group_id, conid, since):
         if self.group_error is not None:
             raise self.group_error
@@ -2360,3 +2363,62 @@ def test_entry_is_refused_when_the_send_generation_cannot_be_recorded(tmp_path):
 
     assert (state.state, state.error_code) == ("CLOSED", "BROKER_GENERATION_UNAVAILABLE")
     assert dispatch.calls == []
+
+
+def test_late_rejection_with_a_fill_on_a_retired_row_is_unprotected_and_flattened(tmp_path):
+    env = _retired(tmp_path)
+    late = _late_entry_event(env, status="Inactive", filled=1, event_id="late-inactive")
+
+    state = env.saga.on_broker_event(late)
+
+    assert (state.state, state.error_code) == ("SAFETY_FAILED", "ORPHAN_ORDER_FILLED")
+    assert state.filled_quantity == Decimal(1)
+    kinds = [s.kind for s in env.saga._breaker.signals]
+    assert kinds == ["RECONCILIATION_DIVERGENCE", "PROTECTIVE_ORDER_FAILURE"]
+    assert len(env.saga._liquidation.starts) == 1
+
+    # A replay changes nothing; a later fill of the entry is still recorded.
+    env.saga.on_broker_event(late)
+    assert len(env.saga._breaker.signals) == 2
+    later = env.saga.on_broker_event(
+        _late_entry_event(env, status="Filled", filled=ENTRY_SHARES, event_id="late-filled"),
+    )
+    assert (later.state, later.filled_quantity) == ("SAFETY_FAILED", Decimal(ENTRY_SHARES))
+    assert len(env.saga._liquidation.starts) == 1
+
+
+def _open_order(group, *, status, filled, total=ENTRY_SHARES):
+    return SimpleNamespace(
+        order=SimpleNamespace(
+            account=ACCOUNT, orderId=5001, permId=9001, parentId=0,
+            orderRef=encode_order_ref(group), action="BUY", orderType="LMT",
+            totalQuantity=float(total), lmtPrice=160.09, auxPrice=0.0, tif="DAY",
+        ),
+        orderStatus=SimpleNamespace(status=status, filled=float(filled), avgFillPrice=160.0),
+        contract=SimpleNamespace(conId=CONID, symbol="AAPL"),
+    )
+
+
+def test_fill_seen_only_through_a_generation_promotion_is_flattened(tmp_path):
+    from trader.trading.broker_ingest import BROKER_SYNC_SOURCES, BrokerIngest
+
+    env = _retired(tmp_path)
+    evidence, store, db = _real_trace_evidence(env)
+    env.saga._orphan_evidence = evidence
+    ingest = BrokerIngest(
+        db, env.saga._journal, store, ACCOUNT, "paper", session_epoch="s2",
+        clock=lambda: AFTER_SETTLE, protective_order_saga=env.saga,
+    )
+
+    ingest.begin_generation()
+    ingest.on_open_order(_open_order(env.orphan.order_group_id, status="Filled", filled=25))
+    ingest.drain_once()
+    for source in BROKER_SYNC_SOURCES:
+        ingest.mark_source_complete(source)
+    ingest.promote_generation()
+
+    state = env.saga._store.load(env.orphan.command_id)
+    assert (state.state, state.filled_quantity) == ("SAFETY_FAILED", Decimal(ENTRY_SHARES))
+    assert [start[1] for start in env.saga._liquidation.starts] == [env.orphan.command_id]
+    # A second promotion with the same evidence does not trip again.
+    assert env.saga.reconcile_terminal_entries() == ()

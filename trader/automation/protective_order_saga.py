@@ -474,6 +474,10 @@ class OrphanEvidencePort(Protocol):
         """Newest complete enumeration; raises when none can be read."""
         ...
 
+    def entry_orders(self, account_id: str, order_group_id: str) -> list[Any]:
+        """Broker entry order rows of the group (deleted and terminal included)."""
+        ...
+
     def has_trace_in_tx(
         self, conn, account_id: str, order_group_id: str, conid: int, since: dt.datetime,
     ) -> bool:
@@ -636,6 +640,19 @@ class ProtectiveOrderSagaStore:
         current = None if row is None else SagaState.from_payload(json.loads(row[0])).revision
         if current != revision:
             raise ValueError(f"saga {command_id} changed: revision {current}, expected {revision}")
+
+    def terminal_entries(self, account_id: str) -> tuple[SagaState, ...]:
+        """NOT_SENT and CLOSED rows whose exit never filled: the saga thinks
+        they hold at most what they recorded."""
+        rows = self._db.execute(
+            "SELECT payload FROM automated_order_sagas WHERE state IN ('NOT_SENT', 'CLOSED')",
+            fetch="all",
+        )
+        states = (SagaState.from_payload(json.loads(payload)) for (payload,) in rows or ())
+        return tuple(
+            state for state in states
+            if state.account_id == account_id and not (state.stop_filled or state.target_filled)
+        )
 
     def unconfirmed_sends(self, account_id: str) -> tuple[SagaState, ...]:
         placeholders = ", ".join("?" for _ in _UNCONFIRMED_SEND_SAGA)
@@ -1029,7 +1046,7 @@ class ProtectiveOrderSaga:
         if state.state == "SAFETY_FAILED" and event.leg == "entry":
             return self._record_entry_after_safety_failure(state, event)
         if state.state == "NOT_SENT":
-            return self._reopen_retired_row(state, event)
+            return self._reopen_terminal_row(state, event)
         if state.state in _TERMINAL_SAGA:
             return state
 
@@ -1329,21 +1346,55 @@ class ProtectiveOrderSaga:
             and now - returned_at >= self._orphan_settle
         )
 
-    def _reopen_retired_row(self, state: SagaState, event: BrokerOrderEvent) -> SagaState:
-        """The order of a NOT_SENT row exists after all: reserve it again.
+    def reconcile_terminal_entries(self) -> tuple[str, ...]:
+        """After a generation promotion: route fills the saga never saw.
+
+        Promotion applies broker orders without saga events. A NOT_SENT or
+        CLOSED row whose broker entry order shows more fill than the row
+        recorded takes the same path as a late fill event. Returns the
+        command ids it reopened.
+        """
+        if self._orphan_evidence is None:
+            return ()
+        reopened = []
+        for state in self._store.terminal_entries(self._account_id):
+            unseen = self._unseen_entry_fill_event(state)
+            if unseen is not None and unseen.event_id not in state.seen_event_ids:
+                self._reopen_terminal_row(state, unseen)
+                reopened.append(state.command_id)
+        return tuple(reopened)
+
+    def _unseen_entry_fill_event(self, state: SagaState) -> Optional[BrokerOrderEvent]:
+        orders = self._orphan_evidence.entry_orders(state.account_id, state.order_group_id)
+        filled = [order for order in orders if _dec(order.filled_quantity) > state.filled_quantity]
+        if not filled:
+            return None
+        order = max(filled, key=lambda row: row.filled_quantity)
+        return BrokerOrderEvent(
+            order_group_id=state.order_group_id, leg="entry", status=order.status,
+            filled_quantity=float(order.filled_quantity),
+            total_quantity=float(order.total_quantity), order_id=0,
+            event_id=(
+                f"promotion:{order.order_entity_id}:{order.status}:{order.filled_quantity}"
+            ),
+            source_timestamp=order.source_timestamp,
+        )
+
+    def _reopen_terminal_row(self, state: SagaState, event: BrokerOrderEvent) -> SagaState:
+        """The broker shows an order of a NOT_SENT or CLOSED row: reserve it again.
 
         Any fill is unprotected as far as the saga knows, so it goes to
         SAFETY_FAILED, which trips the breaker and starts liquidation.
         """
         now = self._now_utc()
         logging.critical(
-            "broker event %s for saga %s retired as %s: the order exists after all",
-            event.event_id, state.command_id, ORPHAN_NOT_SENT,
+            "broker event %s for saga %s in %s: the order exists after all",
+            event.event_id, state.command_id, state.state,
         )
         self._breaker.record(BreakerSignal(
             kind="RECONCILIATION_DIVERGENCE",
             occurred_at=now,
-            detail=f"broker order seen for retired saga {state.command_id}",
+            detail=f"broker order seen for {state.state} saga {state.command_id}",
             key=state.command_id,
         ))
         reopened = self._apply_event(

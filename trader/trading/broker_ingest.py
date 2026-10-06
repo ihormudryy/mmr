@@ -544,12 +544,23 @@ class BrokerIngest:
                 "broker sync: promoted generation %s cursor=%s",
                 generation.generation_id, cursor,
             )
-            return cursor
         finally:
             with self._apply_lock:
                 self._suppress_side_effects = False
                 if self._generation is generation:
                     self._generation = None
+        self._reconcile_saga_after_promotion()
+        return cursor
+
+    def _reconcile_saga_after_promotion(self) -> None:
+        """Promotion applied orders without saga events; let the saga catch up."""
+        saga = self.protective_order_saga
+        if saga is None:
+            return
+        try:
+            saga.reconcile_terminal_entries()
+        except Exception:
+            logging.exception("protective saga reconciliation after promotion failed")
 
     def abandon_generation(self, reason: str) -> None:
         log = logging.getLogger(__name__)

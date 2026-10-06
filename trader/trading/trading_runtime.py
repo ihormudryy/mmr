@@ -40,6 +40,8 @@ from typing import cast, Dict, List, NamedTuple, Optional, Tuple, Union
 import asyncio
 import backoff
 import datetime as dt
+import math
+import numbers
 import os
 import reactivex as rx
 import reactivex.operators as ops
@@ -1764,8 +1766,6 @@ class Trader():
         self, contract: Contract, side: str, quantity: float, broker_quantity: float, *,
         order_type: str = 'MKT', price: Optional[float] = None, oca_group: Optional[str] = None,
     ) -> Optional[str]:
-        import math
-
         if order_type not in self._REDUCE_ONLY_TYPES:
             return f'order type {order_type!r} is not a reduce-only type'
         if order_type != 'MKT' and (price is None or not math.isfinite(float(price)) or not float(price) > 0):
@@ -2401,6 +2401,16 @@ class Trader():
         return SimpleNamespace(ib=_FakeIB())
 
 
+def _finite_number(value, label: str) -> float:
+    """A finite real number; ``None``, a bool or a string is refused, never coerced."""
+    if value is None or isinstance(value, (bool, str, bytes)):
+        raise ValueError(f'{label} {value!r} is not a number')
+    number = float(value)
+    if not math.isfinite(number):
+        raise ValueError(f'{label} {value!r} is not finite')
+    return number
+
+
 class TradingRuntimeOrderDispatch:
     """[M1-F3] Task 5: ``OrderDispatchPort`` over the trader's async
     ``place_expressive_order``.
@@ -2544,28 +2554,30 @@ class TradingRuntimeOrderDispatch:
         - any other exception, including ``TimeoutError``: the order may have
           been sent.
         """
-        if side != self._reducing_side(position) or float(quantity) != abs(float(position.quantity)):
+        contract, held, size = self._close_inputs(position, quantity)
+        if side != self._side_for(held) or size != abs(held):
             self._refuse('liquidation order must exactly reduce the broker position')
-        return self._reduce_only(position, side, quantity, order_ref)
+        return self._reduce_only(position, contract, held, side, size, order_ref)
 
     def reduce_partial(self, position, side: str, quantity: float, order_ref: str):
         """Reduce-only MARKET order for a whole-share part strictly inside the position."""
-        held = abs(float(position.quantity))
-        if side != self._reducing_side(position):
+        contract, held, size = self._close_inputs(position, quantity)
+        if side != self._side_for(held):
             self._refuse('a partial reduce must be on the reducing side of a position')
-        if not float(quantity).is_integer() or not 0 < float(quantity) < held:
+        if not size.is_integer() or not 0 < size < abs(held):
             self._refuse('a partial reduce needs a whole quantity strictly between 0 and the position')
-        return self._reduce_only(position, side, quantity, order_ref)
+        return self._reduce_only(position, contract, held, side, size, order_ref)
 
     def place_exit_leg(self, position, *, leg: str, quantity: float, price: float,
                        oca_group: str, order_ref: str):
         """One exit-only leg (stop or target) of a re-protect OCA pair."""
         if leg not in ('stop', 'target'):
             self._refuse(f'unknown exit leg {leg!r}')
-        side = self._reducing_side(position)
+        contract, held, size = self._close_inputs(position, quantity)
+        side = self._side_for(held)
         if side is None:
             self._refuse('no position to protect')
-        return self._reduce_only(position, side, quantity, order_ref,
+        return self._reduce_only(position, contract, held, side, size, order_ref,
                                  order_type='STP' if leg == 'stop' else 'LMT',
                                  price=float(price), oca_group=oca_group)
 
@@ -2597,9 +2609,21 @@ class TradingRuntimeOrderDispatch:
             raise DispatchRefused('CANCEL_UNRESOLVED', str(ex)) from ex
 
     @staticmethod
-    def _reducing_side(position) -> Optional[str]:
-        held = float(position.quantity)
+    def _side_for(held: float) -> Optional[str]:
         return None if held == 0 else ('SELL' if held > 0 else 'BUY')
+
+    @classmethod
+    def _close_inputs(cls, position, quantity) -> tuple:
+        """Contract, broker quantity and order size, built before anything is scheduled (#38, ruling 52).
+
+        A missing field, a conId that is not an exact positive integer or a
+        size that is not a finite number is a refusal: nothing was sent.
+        """
+        try:
+            return (cls._contract_for(position), _finite_number(position.quantity, 'position quantity'),
+                    _finite_number(quantity, 'quantity'))
+        except (AttributeError, TypeError, ValueError) as ex:
+            cls._refuse(f'malformed close input: {ex}')
 
     @staticmethod
     def _refuse(detail: str):
@@ -2608,15 +2632,26 @@ class TradingRuntimeOrderDispatch:
 
     @staticmethod
     def _contract_for(position) -> Contract:
+        conid, symbol = position.conid, position.symbol
+        if isinstance(conid, bool) or not isinstance(conid, numbers.Integral) or conid <= 0:
+            raise ValueError(f'conId {conid!r} is not a positive integer')
+        if not isinstance(symbol, str) or not symbol:
+            raise ValueError(f'symbol {symbol!r} is missing')
         return Contract(
-            conId=int(position.conid), symbol=position.symbol,
+            conId=int(conid), symbol=symbol,
             secType=getattr(position, 'sec_type', None) or 'STK',
             exchange=getattr(position, 'exchange', None) or 'SMART',
             currency=getattr(position, 'currency', None) or 'USD',
         )
 
-    def _reduce_only(self, position, side: str, quantity: float, order_ref: str, **order):
-        """One reduce-only order on the trader loop; maps the result to the errors above."""
+    def _reduce_only(self, position, contract: Contract, held: float, side: str, quantity: float,
+                     order_ref: str, **order):
+        """One reduce-only order on the trader loop; maps the result to the errors above.
+
+        Every argument is already built (``_close_inputs``): only the
+        scheduled coroutine can cross the boundary, so only what follows
+        ``run_coroutine_threadsafe`` may be "maybe sent".
+        """
         from trader.trading.command_coordinator import BrokerRejectedError
 
         position_account = getattr(position, 'account_id', None)
@@ -2625,8 +2660,7 @@ class TradingRuntimeOrderDispatch:
         loop = self._dispatch_loop('liquidation')
         future = asyncio.run_coroutine_threadsafe(
             self._trader.place_reduce_only_order(
-                self._contract_for(position), side, float(quantity),
-                broker_quantity=float(position.quantity), order_ref=order_ref, **order,
+                contract, side, quantity, broker_quantity=held, order_ref=order_ref, **order,
             ), loop,
         )
         result = self._wait_on_loop(future, 'liquidation dispatch')

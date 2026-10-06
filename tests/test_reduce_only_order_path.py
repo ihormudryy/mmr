@@ -182,6 +182,63 @@ def test_dispatch_refuses_before_the_boundary_with_dispatch_refused(loop_thread,
     assert trader.executioner.placed == []
 
 
+class _SpyTrader:
+    """Records every order the dispatch schedules on the trader loop."""
+    def __init__(self, loop):
+        self._main_loop = loop
+        self.ib_account = ACCOUNT
+        self.scheduled = []
+
+    async def place_reduce_only_order(self, *args, **kwargs):
+        self.scheduled.append((args, kwargs))
+        raise AssertionError("a malformed close input must never be scheduled")
+
+
+_MISSING = object()
+
+
+def _malformed(**fields):
+    position = dict(conid=CONID, symbol="AAPL", quantity=10.0, account_id=ACCOUNT)
+    position.update(fields)
+    return SimpleNamespace(**{k: v for k, v in position.items() if v is not _MISSING})
+
+
+_MALFORMED_POSITIONS = {
+    "no symbol": _malformed(symbol=_MISSING),
+    "empty symbol": _malformed(symbol=""),
+    "no conid": _malformed(conid=_MISSING),
+    "fractional conid": _malformed(conid=265598.5),
+    "string conid": _malformed(conid=str(CONID)),
+    "bool conid": _malformed(conid=True),
+    "no quantity": _malformed(quantity=_MISSING),
+    "None quantity": _malformed(quantity=None),
+    "NaN quantity": _malformed(quantity=float("nan")),
+}
+
+
+@pytest.mark.parametrize("position", _MALFORMED_POSITIONS.values(), ids=_MALFORMED_POSITIONS.keys())
+@pytest.mark.parametrize("call", ["reduce_position", "reduce_partial"])
+def test_a_malformed_position_is_refused_before_anything_is_scheduled(loop_thread, call, position):
+    """#38, ruling 52: built before the boundary, so DispatchRefused (NOT_SENT), never "maybe sent"."""
+    trader = _SpyTrader(loop_thread.loop)
+    dispatch = TradingRuntimeOrderDispatch(trader, dispatch_timeout=2.0)
+    with pytest.raises(DispatchRefused) as ex:
+        getattr(dispatch, call)(position, "SELL", 10.0 if call == "reduce_position" else 4.0, "mmr:x")
+    assert ex.value.code == "REDUCE_ONLY_REFUSED" and trader.scheduled == []
+
+
+@pytest.mark.parametrize("quantity", [None, "4", True, float("inf")])
+@pytest.mark.parametrize("call", ["reduce_position", "reduce_partial"])
+def test_a_quantity_that_is_not_a_finite_number_is_refused_before_anything_is_scheduled(loop_thread, call,
+                                                                                         quantity):
+    """The known minor of round 3: a None quantity raised TypeError, which the close read as maybe sent."""
+    trader = _SpyTrader(loop_thread.loop)
+    with pytest.raises(DispatchRefused) as ex:
+        getattr(TradingRuntimeOrderDispatch(trader, dispatch_timeout=2.0), call)(
+            _malformed(), "SELL", quantity, "mmr:x")
+    assert ex.value.code == "REDUCE_ONLY_REFUSED" and trader.scheduled == []
+
+
 def test_a_trader_refusal_is_dispatch_refused_and_an_ib_rejection_is_not(loop_thread):
     """R2 / R34: a refusal sent nothing (NOT_SENT); an IB rejection was sent (UNKNOWN until its row)."""
     trader = _trader(held=3.0)                      # IB now holds only 3

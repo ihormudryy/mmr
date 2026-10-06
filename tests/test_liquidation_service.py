@@ -3,6 +3,7 @@ import logging
 import threading
 import time
 from contextlib import contextmanager
+from dataclasses import replace
 from types import SimpleNamespace
 
 import pytest
@@ -1117,6 +1118,20 @@ def test_an_unbound_execution_blocks_sizing(tmp_path):
     assert [c[0] for c in s.dispatch.calls] == ["reduce"]
 
 
+def test_a_pending_cancel_order_in_the_snapshot_is_not_cancelled_again(tmp_path):
+    """#22 round 5: a working order already pending cancellation gets no second cancel. It stays
+    live, so no reduce is sent until the broker settles it."""
+    pending = replace(_order(), status="PendingCancel")
+    s = _stack(tmp_path, [_snapshot(1, [_position()], [pending]), _snapshot(2, [_position()], [pending])])
+    receipt = s.service.start(ACCOUNT, "root-1", DEADLINE)
+    assert s.dispatch.calls == [] and receipt.state == "VERIFYING"
+    s.service.rescan()
+    assert s.dispatch.calls == []
+    s.push(_snapshot(3, [_position()]))
+    s.service.rescan()
+    assert [c[0] for c in s.dispatch.calls] == ["reduce"]
+
+
 # ---------------------------------------------------------------------------
 # Task 5: conid-scoped full close
 # ---------------------------------------------------------------------------
@@ -1497,6 +1512,52 @@ def test_a_stop_that_goes_pending_cancel_while_done_is_decided_never_ends_done(t
     assert s.service.close_resolution("p-1") is None
 
 
+def test_a_pending_cancel_stop_escalates_only_on_a_newer_generation(tmp_path):
+    """#22 round 5: the stop is observed PendingCancel on generation 4 while its target is PLANNED.
+    The close does not escalate on the generation it observed that on; it does on generation 5."""
+    s, _ = _to_reprotect(tmp_path, extra=(_snapshot(4, [_priced(6.0)]), _snapshot(5, [_priced(6.0)])))
+    s.dispatch.rows["p-1-reprotect-stop-1-1"] = [_leg_row("PendingCancel")]
+    receipt = s.service.rescan()                                          # gen 4: observed here
+    stop = next(c for c in receipt.children if c.kind == "reprotect-stop")
+    assert (stop.state, stop.observed_generation) == ("PENDING_CANCEL", 4)
+    assert (receipt.goal, receipt.escalated) == ("partial", False) and s.breaker.calls == []
+    receipt = s.service.rescan()                                          # gen 5: still pending cancel
+    assert (receipt.goal, receipt.escalated) == ("zero", True)
+
+
+def test_a_stop_that_goes_pending_cancel_before_the_target_send_gets_no_target(tmp_path):
+    """#22 round 5 blocker: the stop row is healthy at the unheld check, then ingest records
+    PendingCancel before the target is sent. The target admission re-reads the stop while broker
+    changes are held, so no target is sent next to a stop known to be going away."""
+    s, _ = _to_reprotect(tmp_path, extra=(_snapshot(4, [_priced(6.0)]), _snapshot(5, [_priced(6.0)])))
+    s.dispatch.sequences["p-1-reprotect-stop-1-1"] = [
+        [_leg_row()], [_leg_row()], [_leg_row("PendingCancel")]]        # observe, check, held re-read
+    receipt = s.service.rescan()                                          # gen 4
+    assert not any(c[0] == "place_exit_leg" and c[2] == "target" for c in s.dispatch.calls)
+    target = next(c for c in receipt.children if c.kind == "reprotect-target")
+    assert target.state == "PLANNED" and receipt.state != "DONE"
+
+
+def test_a_stop_that_goes_pending_cancel_after_the_target_is_reserved_sends_no_target(tmp_path):
+    """#22 round 5: the stop row is read once more just before the send; a target reserved next to a
+    stop that is now going away returns to PLANNED, never sent."""
+    s, _ = _to_reprotect(tmp_path, extra=(_snapshot(4, [_priced(6.0)]), _snapshot(5, [_priced(6.0)])))
+    s.dispatch.sequences["p-1-reprotect-stop-1-1"] = [
+        [_leg_row()], [_leg_row()], [_leg_row()], [_leg_row("PendingCancel")]]   # ..., held, before send
+    receipt = s.service.rescan()
+    assert not any(c[0] == "place_exit_leg" and c[2] == "target" for c in s.dispatch.calls)
+    assert next(c for c in receipt.children if c.kind == "reprotect-target").state == "PLANNED"
+
+
+def test_a_target_is_not_admitted_while_broker_changes_cannot_be_held(tmp_path):
+    s, _ = _to_reprotect(tmp_path, extra=(_snapshot(4, [_priced(6.0)]), _snapshot(5, [_priced(6.0)])))
+    s.dispatch.rows["p-1-reprotect-stop-1-1"] = [_leg_row()]
+    s.dispatch.hold_busy = True
+    receipt = s.service.rescan()
+    assert "not admitted" in receipt.detail
+    assert not any(c[0] == "place_exit_leg" and c[2] == "target" for c in s.dispatch.calls)
+
+
 def _done_ready(tmp_path):
     """Both legs working and matching on generation 5; the next tick would commit DONE."""
     return _both_legs_working_next(tmp_path, [_leg_row()])
@@ -1507,6 +1568,8 @@ _INGEST_BEFORE_THE_WRITE = {
     "position": lambda s: setattr(s.broker, "current", _snapshot(5, [_priced(4.0)])),
     "generation": lambda s: setattr(s.broker, "current", _snapshot(6, [_priced(6.0)])),
     "hold busy": lambda s: setattr(s.dispatch, "hold_busy", True),
+    # #22 round 5: same generation, same size, other sign; the SELL legs cannot protect a short.
+    "reversed position": lambda s: setattr(s.broker, "current", _snapshot(5, [_priced(-6.0)])),
 }
 
 
@@ -1524,8 +1587,9 @@ def test_an_ingest_update_before_the_terminal_write_never_commits_done(tmp_path,
 
 def test_done_commits_while_broker_changes_are_held(tmp_path):
     s = _done_ready(tmp_path)
+    before = s.dispatch.holds                     # the target admission took one hold (#22 round 5)
     receipt = s.service.rescan()
-    assert receipt.state == "DONE" and s.dispatch.holds == 1
+    assert receipt.state == "DONE" and s.dispatch.holds == before + 1
 
 
 def test_terminal_partial_fill_reprotects_the_actual_remainder(tmp_path):

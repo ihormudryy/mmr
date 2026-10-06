@@ -2574,12 +2574,16 @@ class TradingRuntimeOrderDispatch:
         if leg not in ('stop', 'target'):
             self._refuse(f'unknown exit leg {leg!r}')
         contract, held, size = self._close_inputs(position, quantity)
+        try:
+            limit = _finite_number(price, 'price')
+        except (TypeError, ValueError) as ex:
+            self._refuse(f'malformed exit leg price: {ex}')
         side = self._side_for(held)
         if side is None:
             self._refuse('no position to protect')
         return self._reduce_only(position, contract, held, side, size, order_ref,
                                  order_type='STP' if leg == 'stop' else 'LMT',
-                                 price=float(price), oca_group=oca_group)
+                                 price=limit, oca_group=oca_group)
 
     def cancel_on_loop(self, order_entity_id: str, order_ref: str):
         """``cancel`` for the liquidation worker (R34, ruling 7).

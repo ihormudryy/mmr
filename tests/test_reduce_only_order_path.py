@@ -359,6 +359,24 @@ def test_dispatch_place_exit_leg_derives_side_and_type(loop_thread):
         dispatch.place_exit_leg(_position(-6.0), leg="trail", quantity=6.0, price=1.0, oca_group="g", order_ref="mmr:x")
 
 
+@pytest.mark.parametrize("position,quantity,price", [
+    (_MALFORMED_POSITIONS["no symbol"], 6.0, 95.0),
+    (_MALFORMED_POSITIONS["fractional conid"], 6.0, 95.0),
+    (_MALFORMED_POSITIONS["None quantity"], 6.0, 95.0),
+    (_malformed(), None, 95.0),
+    (_malformed(), 6.0, None),
+    (_malformed(), 6.0, float("nan")),
+], ids=["no symbol", "fractional conid", "None position quantity", "None quantity", "None price", "NaN price"])
+@pytest.mark.parametrize("leg", ["stop", "target"])
+def test_a_malformed_exit_leg_is_refused_before_anything_is_scheduled(loop_thread, leg, position, quantity, price):
+    """#38, ruling 52: a leg built from bad input is NOT_SENT; the close never waits on it as UNKNOWN."""
+    trader = _SpyTrader(loop_thread.loop)
+    with pytest.raises(DispatchRefused) as ex:
+        TradingRuntimeOrderDispatch(trader, dispatch_timeout=2.0).place_exit_leg(
+            position, leg=leg, quantity=quantity, price=price, oca_group="g", order_ref="mmr:x")
+    assert ex.value.code == "REDUCE_ONLY_REFUSED" and trader.scheduled == []
+
+
 def test_liquidation_dispatch_sends_exit_legs_with_the_child_id_as_order_ref():
     from trader.trading.command_stack import _LiquidationDispatch
 

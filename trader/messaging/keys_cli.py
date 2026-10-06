@@ -20,6 +20,7 @@ from trader.messaging.rpc_keys import (
     RpcKeyError,
     backup_keys,
     init_keys,
+    load_identity_material,
     restore_keys,
 )
 from trader.research.key_purpose import default_rpc_keys_dir
@@ -86,11 +87,25 @@ def _read_identity(args, stdin) -> bytes:
     return Path(args.identity_file).read_bytes()
 
 
+def _identity_problem(principal: str | None, keys_dir: Path) -> list[str]:
+    """Load the keys exactly as ``ServiceIdentity.load`` does at startup."""
+    if principal is None:
+        return []
+    try:
+        load_identity_material(principal, keys_dir)
+    except RpcKeyError as exc:
+        return [str(exc)]
+    return []
+
+
 def _mount_problems(service: str, keys_dir: Path, hmac_file: Path) -> list[str]:
-    expected = rpc_files_for(SERVICE_PRINCIPAL[service])
+    principal = SERVICE_PRINCIPAL[service]
+    expected = rpc_files_for(principal)
     seen = frozenset(os.listdir(keys_dir)) if keys_dir.is_dir() else frozenset()
     problems = [f"unexpected {name}" for name in sorted(seen - expected)]
     problems += [f"missing {name}" for name in sorted(expected - seen)]
+    if not problems:
+        problems += _identity_problem(principal, keys_dir)
     if not hmac_file.exists():
         problems.append(f"{hmac_file} is not mounted (expected /dev/null)")
     elif hmac_file.read_bytes():
@@ -99,7 +114,8 @@ def _mount_problems(service: str, keys_dir: Path, hmac_file: Path) -> list[str]:
 
 
 def check_mount(args, out: TextIO) -> int:
-    """Exit 0 only if this container sees exactly its own key pair, its peers' .pub and an empty HMAC file."""
+    """Exit 0 only if this container sees exactly its own key pair, its peers' .pub and an empty HMAC file,
+    and those keys load as they would at service startup (own pair matches)."""
     if args.service not in SERVICE_PRINCIPAL:
         out.write(f"Error: unknown service {args.service!r}; expected one of "
                   f"{', '.join(sorted(SERVICE_PRINCIPAL))}\n")

@@ -295,8 +295,9 @@ are separate; each loader refuses the other kind.
       `scheduler`, `data`) in a separate compose project `mmr-keycheck`, with
       `docker-compose.test.override.yml` (fake broker, `--simulation True`).
       Each container only runs `mmr keys check-mount <service>`: it must see
-      exactly its own `.key`, its own `.pub` and its peers' `.pub`, and
-      `service_hmac.key` must read empty. No service process starts, no port
+      exactly its own `.key`, its own `.pub` and its peers' `.pub`, those
+      keys must load the way the service loads them at startup (own pair
+      matches, modes, Ed25519), and `service_hmac.key` must read empty. No service process starts, no port
       is published and the running `mmr` stack is not touched. `-K` runs
       alone: combined with any other option (e.g. `-K -d`) it refuses before
       any Docker call. Abort the

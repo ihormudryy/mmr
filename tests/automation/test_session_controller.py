@@ -903,6 +903,21 @@ def test_time_exit_leaves_no_live_stop_after_the_position_is_closed(tmp_path):
     assert service.receipt_for("exit-1").state == "CLOSED"
 
 
+@pytest.mark.parametrize("bad", [1.5, True, "265598", 0])
+def test_time_exit_with_an_inexact_conid_claims_reads_and_sends_nothing(tmp_path, bad):
+    """#21 round 5: the adapter passes the conid as it came; admission refuses it before any claim."""
+    from trader.automation.session_controller import SessionTimeExitAdapter
+    from trader.trading.liquidation_service import LiquidationRefused
+
+    broker = _SimBroker()
+    service = _real_liquidation(tmp_path, broker, protection=_SimProtection(broker.calls))
+    adapter = SessionTimeExitAdapter(service, account_id=ACCOUNT, now=lambda: _utc(15, 0))
+    with pytest.raises(LiquidationRefused, match="CONID_INVALID|conid must be"):
+        adapter.request_exit(command_id="exit-1", conid=bad, quantity=Decimal("10"), side="BUY")
+    assert (broker.generation, broker.calls) == (0, [])
+    assert service.root_for("exit-1") is None
+
+
 def test_time_exit_adapter_starts_a_full_conid_close_without_a_quantity():
     """#27: a quantity would make a join refusable; the adapter never passes one."""
     from trader.automation.session_controller import SessionTimeExitAdapter

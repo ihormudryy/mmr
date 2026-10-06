@@ -325,7 +325,8 @@ class SessionTimeExitAdapter:
         deadline = _as_utc(self._now()) + dt.timedelta(seconds=self._deadline_seconds)
         try:
             # Never pass a quantity: only a partial request can be refused with ExitInProgress.
-            self._liquidation.start(self._account_id, command_id, deadline, scope="conid", conid=int(conid))
+            # The conid goes as it came: admission refuses 1.5, True or "1" (#21); int() would close another one.
+            self._liquidation.start(self._account_id, command_id, deadline, scope="conid", conid=conid)
         except ExitInProgress:
             return
 
@@ -705,11 +706,11 @@ class SessionController:
             snapshot = self._broker.capture(self._account_id)
         except Exception:
             return
-        held = {int(p.conid): float(p.quantity) for p in getattr(snapshot, "positions", ()) or ()
+        held = {p.conid: float(p.quantity) for p in getattr(snapshot, "positions", ()) or ()
                 if float(p.quantity) != 0.0}
         for conid, quantity in sorted(held.items()):
             protective = [o for o in getattr(snapshot, "working_orders", ()) or ()
-                          if int(o.conid) == conid and not o.is_external and o.leg in ("stop", "take_profit")]
+                          if o.conid == conid and not o.is_external and o.leg in ("stop", "take_profit")]
             if any(float(o.total_quantity) - float(o.filled_quantity) > abs(quantity) for o in protective):
                 self._time_exit.request_exit(
                     command_id=f"{self.cancel_command_id(self._account_id, state.session_date)}-protect-{conid}",

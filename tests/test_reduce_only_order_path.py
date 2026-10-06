@@ -109,7 +109,7 @@ def test_reduce_only_subtracts_reducing_orders_already_working():
     trader.client.ib.open_trades = [_working("SELL", 10.0, filled=4.0), _working("BUY", 5.0)]
     refused = _run(trader.place_reduce_only_order(_contract(), "SELL", 10.0, broker_quantity=10.0,
                                                   order_ref="mmr:x"))
-    assert refused.error.startswith("reduce-only refused: quantity 10 is above 4")
+    assert refused.error.startswith("reduce-only refused: live size mismatch: quantity 10 is above 4")
     assert _run(trader.place_reduce_only_order(_contract(), "SELL", 4.0, broker_quantity=10.0,
                                                order_ref="mmr:y")).is_success()
     assert [o.totalQuantity for o in trader.executioner.placed] == [4.0]
@@ -244,7 +244,7 @@ def test_a_trader_refusal_is_dispatch_refused_and_an_ib_rejection_is_not(loop_th
     trader = _trader(held=3.0)                      # IB now holds only 3
     with pytest.raises(DispatchRefused) as ex:
         _dispatch(trader, loop_thread).reduce_position(_position(10.0), "SELL", 10.0, "mmr:x")
-    assert ex.value.code == "REDUCE_ONLY_REFUSED" and trader.executioner.placed == []
+    assert ex.value.code == "LIVE_SIZE_MISMATCH" and trader.executioner.placed == []
     rejected = _trader(verdict="rejected")
     with pytest.raises(BrokerRejectedError) as ex:
         _dispatch(rejected, loop_thread).reduce_position(_position(10.0), "SELL", 10.0, "mmr:x")
@@ -399,3 +399,19 @@ def test_target_leg_is_allowed_next_to_its_own_oca_stop_but_not_next_to_another_
     other = _run(trader.place_reduce_only_order(_contract(), "SELL", 6.0, broker_quantity=6.0, order_ref="mmr:u",
                                                 order_type="LMT", price=120.0, oca_group="another-group"))
     assert other.error.startswith("reduce-only refused")
+
+
+def test_a_target_is_refused_when_its_oca_stop_already_filled_part_of_the_position():
+    """#22 round 8 (openai): the stop's partial fill reached ib_async's order status, but not yet its
+    position cache (+6). Counting the OCA pair once, the stop has 4 outstanding, so a target of 6
+    is a stale size: refused at the boundary, in the same loop step as placeOrder, nothing sent."""
+    group = "p-1-reprotect-265598-1"
+    trader = _trader(held=6.0)
+    trader.client.ib.open_trades = [_working("SELL", 6.0, filled=2.0, oca_group=group)]
+    target = _run(trader.place_reduce_only_order(_contract(), "SELL", 6.0, broker_quantity=6.0, order_ref="mmr:t",
+                                                 order_type="LMT", price=120.0, oca_group=group))
+    assert target.error.startswith("reduce-only refused: live size mismatch: OCA sibling outstanding 4")
+    assert trader.executioner.placed == []
+    trader.client.ib.held = 4.0
+    assert _run(trader.place_reduce_only_order(_contract(), "SELL", 4.0, broker_quantity=4.0, order_ref="mmr:t",
+                                               order_type="LMT", price=120.0, oca_group=group)).is_success()

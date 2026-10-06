@@ -69,6 +69,8 @@ class AccountNotPinnedError(Exception):
 
 # Prefix of a reduce-only refusal: nothing was sent.
 REDUCE_ONLY_REFUSED = 'reduce-only refused'
+# A refusal because the live IB cache no longer matches the order's size: nothing was sent.
+LIVE_SIZE_REFUSED = 'live size mismatch'
 
 
 class Trader():
@@ -1727,6 +1729,12 @@ class Trader():
         - ``fail(error=...)``: refused, nothing was sent (or IB rejected it
           with nothing filled).
         - ``fail(exception=...)``: the order may have been sent.
+
+        The size check (#22 round 8) reads ib_async's position and open-trade
+        caches. ib_async updates them on this loop, and nothing between the
+        check and ``placeOrder`` suspends this coroutine, so no position or
+        order status update can land in between. Keep it that way: an
+        ``await`` that yields before ``placeOrder`` would reopen the race.
         """
         try:
             refusal = self._reduce_only_refusal(contract, side, quantity, broker_quantity,
@@ -1793,15 +1801,43 @@ class Trader():
         if not math.isfinite(quantity) or not 0 < quantity <= abs(broker_quantity):
             return f'quantity {quantity} must be > 0 and <= |{broker_quantity}|'
 
-        live = self._live_position_quantity(int(contract.conId))
+        mismatch = self._live_size_mismatch(int(contract.conId), side, quantity, broker_quantity, oca_group)
+        return None if mismatch is None else f'{LIVE_SIZE_REFUSED}: {mismatch}'
+
+    def _live_size_mismatch(self, conid: int, side: str, quantity: float, broker_quantity: float,
+                            oca_group: Optional[str]) -> Optional[str]:
+        """Why the live IB caches do not allow this size; None when they do.
+
+        The OCA pair counts once: a working sibling of ``oca_group`` must have
+        exactly ``quantity`` outstanding, so a leg is never sized against a
+        fill of its sibling (#22 round 8).
+        """
+        live = self._live_position_quantity(conid)
         if live == 0 or (live > 0) != (broker_quantity > 0) or abs(live) < quantity:
-            return (f'live position cache shows {live} for conId {contract.conId}; '
+            return (f'live position cache shows {live} for conId {conid}; '
                     f'cannot {side} {quantity} against broker position {broker_quantity}')
-        working = self._working_reduce_quantity(int(contract.conId), reducing_side, oca_group)
+        working = self._working_reduce_quantity(conid, side, oca_group)
         if quantity > abs(live) - working:
             return (f'quantity {quantity:g} is above {abs(live) - working:g}: live position {live:g}, '
                     f'{working:g} already working to reduce it')
+        siblings = [outstanding for outstanding in self._oca_sibling_outstanding(conid, side, oca_group)
+                    if outstanding != quantity]
+        if siblings:
+            return f'OCA sibling outstanding {siblings[0]:g} != leg quantity {quantity:g}'
         return None
+
+    def _oca_sibling_outstanding(self, conid: int, reducing_side: str, oca_group: Optional[str]) -> list[float]:
+        """Outstanding quantity of each working order of ``oca_group`` on this position (pinned account)."""
+        if not oca_group:
+            return []
+        return [
+            max(float(t.order.totalQuantity) - float(getattr(t.orderStatus, 'filled', 0.0) or 0.0), 0.0)
+            for t in self.client.ib.openTrades()
+            if int(getattr(t.contract, 'conId', 0) or 0) == conid
+            and (getattr(t.order, 'account', '') or self.ib_account) == self.ib_account
+            and t.order.action == reducing_side
+            and getattr(t.order, 'ocaGroup', '') == oca_group
+        ]
 
     def _working_reduce_quantity(self, conid: int, reducing_side: str, oca_group: Optional[str]) -> float:
         """Outstanding quantity of open orders that already reduce this position (R35).
@@ -2630,9 +2666,9 @@ class TradingRuntimeOrderDispatch:
             cls._refuse(f'malformed close input: {ex}')
 
     @staticmethod
-    def _refuse(detail: str):
+    def _refuse(detail: str, code: str = 'REDUCE_ONLY_REFUSED'):
         from trader.trading.liquidation_service import DispatchRefused
-        raise DispatchRefused('REDUCE_ONLY_REFUSED', detail)
+        raise DispatchRefused(code, detail)
 
     @staticmethod
     def _contract_for(position) -> Contract:
@@ -2671,6 +2707,9 @@ class TradingRuntimeOrderDispatch:
         if result.is_success():
             return result.obj or []
         if result.error is not None:
+            if str(result.error).startswith(f'{REDUCE_ONLY_REFUSED}: {LIVE_SIZE_REFUSED}'):
+                from trader.trading.liquidation_service import LIVE_SIZE_MISMATCH
+                self._refuse(str(result.error), code=LIVE_SIZE_MISMATCH)
             if str(result.error).startswith(REDUCE_ONLY_REFUSED):
                 self._refuse(str(result.error))
             raise BrokerRejectedError(str(result.error))

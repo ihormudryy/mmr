@@ -312,6 +312,16 @@ def test_reduce_position_refusal_is_dispatch_refused(running_loop):
         dispatch.reduce_position(_position(), "SELL", 10.0, "mmr:og-x")
 
 
+def test_a_live_size_refusal_keeps_its_own_dispatch_code(running_loop):
+    """#22 round 8: the liquidation re-plans a target refused for a stale size, so the code must survive."""
+    loop, _ = running_loop
+    trader = _ReduceTrader(loop, result=SuccessFail.fail(error="reduce-only refused: live size mismatch: x"))
+    dispatch = TradingRuntimeOrderDispatch(trader, dispatch_timeout=2.0)
+    with pytest.raises(DispatchRefused) as refused:
+        dispatch.reduce_position(_position(), "SELL", 10.0, "mmr:og-x")
+    assert refused.value.code == "LIVE_SIZE_MISMATCH"
+
+
 def test_reduce_position_ib_rejection_is_broker_rejected_not_refused(running_loop):
     from trader.trading.command_coordinator import BrokerRejectedError
 

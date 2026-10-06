@@ -170,6 +170,10 @@ class LiquidationBusy(RuntimeError):
     """Another caller held the liquidation lock past the timeout; retry later."""
 
 
+# DispatchRefused code: the live broker cache at the order boundary no longer matches the order size.
+LIVE_SIZE_MISMATCH = "LIVE_SIZE_MISMATCH"
+
+
 class DispatchRefused(RuntimeError):
     """A proven refusal *before* the broker boundary. The child becomes NOT_SENT."""
 
@@ -210,7 +214,9 @@ class LiquidationDispatchPort(Protocol):
     """Reduce-only order boundary plus read-only broker evidence.
 
     Order methods raise ``DispatchRefused`` only for a proven refusal before
-    the broker boundary. Any other exception means the order may exist.
+    the broker boundary; code ``LIVE_SIZE_MISMATCH`` when the live position
+    or the OCA sibling read next to the send no longer matches the size.
+    Any other exception means the order may exist.
     """
     def cancel(self, order: Any, child_id: str) -> None: ...
     def reduce(self, position: Any, side: str, quantity: float, child_id: str) -> None: ...

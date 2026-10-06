@@ -141,7 +141,7 @@ The rules above were checked against the real code while the tasks were rewritte
 22. **The deadline decides on this tick's evidence (Task 6).** `_tick` reads the snapshot and the children's rows before it looks at the deadline, so "a child is UNKNOWN at the deadline" means unknown now, not in a stale journal row. When the broker cannot be read at the deadline, the journal's children decide.
 23. **Re-protect recovery.** Spec 5.1: "one sibling present, the other missing: place only the missing one." The only missing sibling that may be placed is the `PLANNED` target, which was never sent. A sent leg that is absent, refused, rejected or cancelled is a re-protect failure and escalates (R30). The spec names `place_exit_oca`, which transmits both legs in one call; the plan sends one leg at a time on the one reduce-only path, because R13 sends the target only after the stop is reconciled.
 24. **An OCA stop cancel is judged on the next generation.** A stop `Cancelled` while its target is working or filled is classified only on a generation newer than that observation, together with the target and the position, so the order of the two callbacks never turns a normal target exit into a failure (R26).
-25. **Adopting runs open before the upgrade (R29, R2-5).** Migration 36 gives every old run a join row and the oldest open run of an account an `ACTIVE` account owner (others are `SUPERSEDED` by it). On its first tick an adopted run journals, for every position the account holds, the reduce the old service may have sent (old ref `{root}-liquidation-reduce-{conid}`) as an `UNKNOWN` child fenced on the newest generation; nothing is invented as `NOT_SENT` or `ABSENT`. Task 2 classifies those old refs as `exit`, so no producer treats them as entries.
+25. **Adopting runs open before the upgrade (R29, R2-5).** Migration 36 gives every old run a join row and the oldest open run of an account an `ACTIVE` account owner (others are `SUPERSEDED` by it). On its first tick an adopted run journals ~~, for every position the account holds, the reduce the old service may have sent (old ref `{root}-liquidation-reduce-{conid}`) as an `UNKNOWN` child~~ one wildcard `UNKNOWN` child per old run for every reduce the old service may have sent (ruling 42), fenced on the newest generation; nothing is invented as `NOT_SENT` or `ABSENT`. Task 2 classifies those old refs as `exit`, so no producer treats them as entries.
 26. **A session that follows a `FAILED_SAFE` root goes `INCIDENT` at once (Task 11)** with a `LIQUIDATION_FAILED` signal, instead of polling a dead root until the flat deadline. R9 lets the operator start a new root, which inherits the unknown children.
 27. **`exit` in `classify_cancel`.** Cancelling a close's reduce keeps exposure the close was removing, so it is `INCREASING` (it needs the ceremony), like a protective leg.
 28. **Entry cancels of the session are not liquidation children.** A cancel is idempotent at the broker; a crash before `cancel_issued` is stored sends it again. They are not journaled as children (Task 16).
@@ -162,8 +162,13 @@ PR #42 (`15f9e715`, "let liquidation exits skip entry gates and stop blocking th
 37. **`cancel_on_loop` is a separate method (Task 14).** Master's `cancel` (coordinator path) keeps matching the open trade off the loop and raising `CancelUnresolved`; three master tests pin that. The liquidation uses `cancel_on_loop`: the perm id read stays on the worker, the match and `cancelOrder` run on the loop, and "no live order" is `DispatchRefused("CANCEL_UNRESOLVED")`.
 38. **A busy session flatten polls its own cause (Task 11).** Master's `_issue_flatten` swallows `LiquidationBusy`. Only a root this call claimed waits for the lock (a join returns at once), so on `LiquidationBusy` the session persists and polls its own cause.
 39. **N1: the entry write after `submit_bracket` reads again (Task 9).** R28 made every saga save revision-checked, but `start` built its post-dispatch write from the `SUBMITTING` copy it held before the call. An ingest event saved meanwhile made it raise `SagaRevisionConflict` with the bracket live. `_after_dispatch` re-reads under `_retrying`: the submitted ids are added on top of the ingest's state, and an error state is written only while the saga is still `SUBMITTING`.
-40. **N2: every pre-upgrade run's old reduce is tracked (Task 4).** Migration 36 marks every old run that did not end `FLAT` (`pre_sp1_open`). On every tick, before the deadline check, a root journals `{run}-liquidation-reduce-{conid}` of each marked run of its account, for each position in its scope, as an `UNKNOWN` child it owns (unless that child already exists). An account root then clears the marks. So the adopted run, the runs it superseded and old `FAILED_SAFE` runs all block a new reduce until their old orders are settled, also when no run was open at the upgrade.
+40. **N2: every pre-upgrade run's old reduce is tracked (Task 4).** Migration 36 marks every old run that did not end `FLAT` (`pre_sp1_open`). On every tick, before the deadline check, a root journals ~~`{run}-liquidation-reduce-{conid}` of each marked run of its account, for each position in its scope, as an `UNKNOWN` child it owns (unless that child already exists). An account root then clears the marks.~~ one wildcard `UNKNOWN` child for each marked run of its account that has none yet (ruling 42), whatever its scope. The mark is cleared only in the transaction that settles that run's wildcard child, never on journaling. So the adopted run, the runs it superseded and old `FAILED_SAFE` runs all block a new reduce until their old orders are settled, also when no run was open at the upgrade.
 41. **Global constraint 21:** line numbers now cite master at `15f9e715`; where a task edits a file PR #42 changed, the task names functions, not lines.
+42. **A pre-upgrade run's reduces are one wildcard child (Task 4, Grok round 3 on #20).** Master's `liquidation_runs` stores no conid list, so the conids an old run sent reduces for are unknowable. A position missing from the snapshot is not evidence: the old reduce of a position already at 0 may not be in `working_orders` yet, and its late fill opens the other side. So each marked run becomes ONE `UNKNOWN` child (`child_id` `{run}-liquidation-reduce-*`, `conid` NULL, `ref_prefix` `{run}-liquidation-reduce-`), owned by the root that journals it and fenced on the newest generation (after the upgrade). It matches every broker row whose decoded ref is the prefix plus digits (`find_orders_with_prefix`). While it is `UNKNOWN` or `WORKING` it blocks every reduce of every scope on the account, account and position-scoped roots alike, whoever owns it (`_children_in_force` in `_blocking`, `_observe_children` and `_on_deadline`). It settles only on positive evidence (R22): every matching row terminal AND `enumeration_complete()` on a generation newer than its fence, even when the rows seen are terminal (another conid's order may still be invisible). A visible working match keeps it `WORKING`: waited on, never cancelled. An invisible one blocks to the deadline, then the normal deadline path; nothing is invented as `NOT_SENT` or `ABSENT`. Settled, it is `ABSENT` (no row), `FILLED` (any fill, the sum recorded) or `CANCELLED`; `ABSENT` and `FILLED` are fill-bearing, so sizing waits for a newer generation (R5). Its run's `pre_sp1_open` is cleared in the same transaction. Migration 36 is not shipped, so `liquidation_children.conid` becomes nullable and gains `ref_prefix` there.
+43. **A fill fence outlives its root (Task 4, Astra round 3 on #20, #23).** `_fresh` no longer looks only at the root's own children. `fill_watermark_in_tx` returns the newest `observed_generation` of any fill-bearing child (`ABSENT`, or `filled_quantity > filled_at_send`) on the scope: the whole account for an account root, the conid plus wildcard children for a conid root; any root, any state, so own, inherited, superseded, `FAILED_SAFE`, re-protect legs, cancelled stops that filled and pre-upgrade wildcard children all count, and it survives a restart (it is read from the journal). Every root needs a position generation strictly newer than it before it sizes or sends a reduce. Tests: a fill seen on the deadline tick fences the next root (Task 4); a settled legacy fill fences the next root across a restart (Task 4); an account takeover waits for the scoped root's fill (Task 7). A saga stop that fills while no close is open is not a liquidation child; the next close sees it only through the position snapshot.
+44. **DONE is decided from one read of the leg rows (Task 6, Astra round 3 on #22).** `_advance_reprotect` reads each leg's row once and takes the OCA link, side, status and quantities from that read. A row whose status is no longer accepted, or whose filled or outstanding quantity differs from the child, is observed again (`_observe_children`) and the tick waits; it never finishes on the old child values. Right before `_finish` the rows are read again and compared field by field (`_leg_fingerprint`, with `revision`); any change waits. Tests: stop cancelled after observation, stop partly filled after observation, row changed while DONE was decided.
+45. **An explicit empty OCA clears the link (Task 18, Astra round 3 on #45).** `OrderObservation.oca_reported` says the source carries OCA fields. When it does, `''` / `0` (normalised to `None`) overwrite the stored group and type; only a source without the fields keeps them. Tests through real `BrokerIngest` + DuckDB, with a readback through a new store.
+46. **Working reduces count only for the pinned account (Task 14, Astra round 3 on #38).** `_working_reduce_quantity` skips orders of another account; an order without an account is counted, so an unknown owner fails closed. Also: the Task 5 and Task 6 replacements of `start` keep `with self._exclusive():` around `_tick` (ruling 31, Astra on #21, #22), and the Task 6 test helper `_leg_row` forwards `entity` (Astra on #23).
 
 
 ## Review round 2
@@ -1200,12 +1205,49 @@ def test_order_rows_carry_the_oca_group_and_type(env):
     env.ingest.drain_once()
     [row] = env.store.select_active_orders_in_tx(env.journal.connect())
     assert (row.oca_group, row.oca_type, row.leg) == ("p-1-reprotect-265598-1", 2, "stop")
+
+
+def _stop_trade(oca_group, oca_type, status="Submitted"):
+    order = SimpleNamespace(orderId=7, permId=70, parentId=0, orderRef="mmr:p-1-reprotect-stop-265598-1",
+                            account=ACCOUNT, action="SELL", orderType="STP", totalQuantity=6.0, lmtPrice=0.0,
+                            auxPrice=95.0, tif="DAY", ocaGroup=oca_group, ocaType=oca_type)
+    return SimpleNamespace(order=order, orderStatus=SimpleNamespace(status=status, filled=0.0, avgFillPrice=0.0),
+                           contract=SimpleNamespace(conId=265598, symbol="AAPL"))
+
+
+def test_an_explicit_empty_oca_clears_the_stored_link(env):
+    """#45: the broker saying "no OCA" ('' and 0) is not a missing field; it clears the link, also after a
+    restart, so a close cannot take the leg as linked protection and end DONE."""
+    from trader.trading.command_stack import _LiquidationDispatch
+
+    env.ingest.on_open_order(_stop_trade("p-1-reprotect-265598-1", 2))
+    env.ingest.drain_once()
+    env.ingest.on_open_order(_stop_trade("", 0))
+    env.ingest.drain_once()
+    [row] = env.store.select_active_orders_in_tx(env.journal.connect())
+    assert (row.oca_group, row.oca_type) == (None, None)
+    restarted = BrokerStateStore(DuckDBConnection.get_instance(str(env.db.db_path)))
+    [row] = restarted.select_active_orders_in_tx(env.journal.connect())
+    assert (row.oca_group, row.oca_type) == (None, None)
+    [found] = _LiquidationDispatch(env.dispatch, None).find_orders(ACCOUNT, "p-1-reprotect-stop-265598-1")
+    assert found.oca_type != 2                     # DONE's link check needs type 2 and the group
+
+
+def test_an_observation_without_oca_fields_keeps_the_stored_link(env):
+    env.ingest.on_open_order(_stop_trade("p-1-reprotect-265598-1", 2))
+    env.ingest.drain_once()
+    trade = _stop_trade("x", 0)
+    del trade.order.ocaGroup, trade.order.ocaType
+    env.ingest.on_open_order(trade)
+    env.ingest.drain_once()
+    [row] = env.store.select_active_orders_in_tx(env.journal.connect())
+    assert (row.oca_group, row.oca_type) == ("p-1-reprotect-265598-1", 2)
 ```
 
 - [ ] **Step 2: Run them to verify they fail**
 
 Run: `.venv/bin/python -m pytest tests/test_close_broker_evidence.py -q --timeout=30`
-Expected: 7 failed, 1 passed. The readiness tests fail with `TypeError: 'bool' object is not callable` (the bug), the generation tests with `AttributeError: ... 'newest_generation'`, the OCA test with `AttributeError: ... 'oca_group'`. `test_enumeration_is_not_complete_without_an_ingest` already passes.
+Expected: 9 failed, 1 passed. The readiness tests fail with `TypeError: 'bool' object is not callable` (the bug), the generation tests with `AttributeError: ... 'newest_generation'`, the three OCA tests with `AttributeError: ... 'oca_group'`. `test_enumeration_is_not_complete_without_an_ingest` already passes.
 
 - [ ] **Step 3: Implement**
 
@@ -1262,18 +1304,29 @@ Add before `latest_promoted_generation_in_tx`:
         return None if row is None or row[0] is None else int(row[0])
 ```
 
-`trader/trading/order_correlation.py`: add `oca_group: Optional[str] = None` and `oca_type: Optional[int] = None` as the last fields of `OrderObservation`, and in `normalize_open_order` after `source_timestamp=now,`:
+`trader/trading/order_correlation.py`: add as the last fields of `OrderObservation`:
+
+```python
+    oca_group: Optional[str] = None
+    oca_type: Optional[int] = None
+    oca_reported: bool = False   # True when the source carries OCA fields; '' / 0 then mean "no OCA" (#45)
+```
+
+and in `normalize_open_order` after `source_timestamp=now,`:
 
 ```python
         oca_group=getattr(order, "ocaGroup", None) or None,
         oca_type=int(getattr(order, "ocaType", 0) or 0) or None,
+        oca_reported=hasattr(order, "ocaGroup") and hasattr(order, "ocaType"),
 ```
+
+Ruling 45: a source that reports OCA fields overwrites the stored link, so an explicit empty group and type 0 clear it; only a source without the fields keeps the stored link.
 
 `trader/trading/broker_ingest.py` `_apply_order`: after `source_timestamp=obs.source_timestamp,` in the merged row:
 
 ```python
-            oca_group=obs.oca_group or (current.oca_group if current else None),
-            oca_type=obs.oca_type or (current.oca_type if current else None),
+            oca_group=obs.oca_group if obs.oca_reported else (current.oca_group if current else None),
+            oca_type=obs.oca_type if obs.oca_reported else (current.oca_type if current else None),
 ```
 
 `trader/trading/command_ports.py`: add before `class TraderBrokerAuthority` and use it in `TraderBrokerAuthority.is_ready` (`return ingest_ready(ingest)`):
@@ -1337,7 +1390,8 @@ This task freezes the data model every later task uses, and rebuilds the account
 - Modify (rewrite): `trader/trading/liquidation_service.py`
 - Modify: `trader/trading/command_stack.py` (`_LiquidationDispatch`, the registry and run store after `apply_liquidation_migration`, the `LiquidationService(` construction, the two session adapters)
 - Modify: `scripts/command_plane_drill.py` (`scn_liquidation`)
-- Test (rewrite): `tests/test_liquidation_service.py`; Test: `tests/test_command_stack.py`; modify master's `tests/test_trader_service_loops.py` (`_liquidation` builds the journal service) and `tests/automation/test_protective_order_saga.py` (`test_busy_liquidation_keeps_protective_failure_root_for_rescan` builds the journal service)
+- Modify: `trader/trading/order_correlation.py`, `trader/trading/command_ports.py`, `trader/trading/trading_runtime.py` (the ref-prefix lookup of ruling 42)
+- Test (rewrite): `tests/test_liquidation_service.py`; Test: `tests/test_command_stack.py`, `tests/test_order_correlation.py`; modify master's `tests/test_trader_service_loops.py` (`_liquidation` builds the journal service) and `tests/automation/test_protective_order_saga.py` (`test_busy_liquidation_keeps_protective_failure_root_for_rescan` builds the journal service)
 
 **Interfaces (frozen — every later task uses exactly these names and types):**
 
@@ -1364,6 +1418,7 @@ class LiquidationDispatchPort(Protocol):
     reduce_partial(position, side, quantity, child_id) -> None         # 0 < q < |position|
     place_exit_leg(position, *, leg, quantity, price, oca_group, child_id) -> None   # leg "stop" | "target"
     find_orders(account_id, child_id) -> list                          # rows whose decoded ref == child_id
+    find_orders_with_prefix(account_id, prefix) -> list                # rows whose decoded ref is prefix + digits (ruling 42)
     get_order(order_entity_id) -> Optional[row]                        # incl. deleted rows
     enumeration_complete() -> bool                                     # Task 18
     newest_generation() -> int                                         # Task 18; staging included
@@ -1381,7 +1436,8 @@ class ProtectionOwnershipPort(Protocol):  # ProtectiveOrderSaga implements it in
 
 @dataclass(frozen=True)
 class ChildRef:
-    child_id: str; root_id: str; owner_root_id: str; account_id: str; conid: int
+    child_id: str; root_id: str; owner_root_id: str; account_id: str
+    conid: Optional[int]           # None only for a pre-SP1 wildcard child (ruling 42)
     kind: str                      # cancel | reduce | reprotect-stop | reprotect-target
     attempt: int; state: str       # CHILD_STATES
     fence_generation: int          # generation of the snapshot it was planned on
@@ -1390,6 +1446,7 @@ class ChildRef:
     observed_generation=None       # newest generation (staging included) when last observed
     sent_generation=None           # newest generation (staging included) right after the send (R22)
     order_entity_id=None           # the child's own broker order row
+    ref_prefix=None                # pre-SP1 wildcard: every ref {prefix}{conid} (ruling 42)
     fill_bearing: bool             # property: ABSENT, or filled_quantity > filled_at_send
 
 @dataclass(frozen=True)
@@ -1415,7 +1472,9 @@ class LiquidationRunStore:                # the journal rows; R6 in-transaction 
     children_in_tx / child_in_tx / next_attempt_in_tx / insert_child_in_tx / update_child_in_tx / drop_planned_in_tx
     inherit_children_in_tx(conn, *, account_id, conid, to_root_id, now) -> int  # R9
     record_join_in_tx / join_for_in_tx / joins_resolving_to_in_tx
-    pre_sp1_roots_in_tx(conn, account_id) / mark_pre_sp1_tracked_in_tx(conn, root_ids)   # N2, ruling 40
+    pre_sp1_roots_in_tx(conn, account_id) / clear_pre_sp1_mark_in_tx(conn, run_id)       # N2, rulings 40, 42
+    legacy_reduces_in_tx(conn, account_id) -> tuple[ChildRef, ...]                       # every wildcard child, any owner
+    fill_watermark_in_tx(conn, account_id, conid) -> Optional[int]                       # ruling 43
     receipt(root_id) / root_for(command_id) / close_resolution(command_id)     # own transaction each
 
 class LiquidationService:
@@ -1431,13 +1490,13 @@ class LiquidationService:
     upgrade_to_zero(root_id) -> LiquidationReceipt                    # added in Task 6
 ```
 
-Journal tables of migration 36: `liquidation_runs` gains `scope, conid, goal, goal_quantity, phase, opened_generation, stop_price, target_price, remaining_quantity, escalated, superseded_by, cleanup_pending`; new `liquidation_children` (one row per child order, keyed by `child_id`, with `owner_root_id` for inheritance, `sent_generation` and `order_entity_id`); new `liquidation_joins` (one row per command that started or joined a root — R17's `(command_id, root_id)`). Migration 36 also adopts the runs that were open before the upgrade (R29): every old run gets a join row (so a retry of its command id is bound and returns it); the oldest open run of an account becomes its `ACTIVE` account owner in phase `legacy`; other open runs of that account become `SUPERSEDED` by it. Every old run that did not end `FLAT` is marked `pre_sp1_open` (ruling 40, N2). On its first tick a root (the adopted one, or the first one claimed after the upgrade) journals, for every marked run of its account and every position it holds in its scope, the reduce the old service may have sent (old ref `{run}-liquidation-reduce-{conid}`) as an `UNKNOWN` child it owns, fenced on the newest generation; an account root then clears the marks. That child is settled like any other (its own row, or a complete enumeration opened after the upgrade) before any new reduce; an invisible one blocks to the deadline. Nothing is invented as `NOT_SENT` or `ABSENT` to make the old run fit the new schema (R2-5).
+Journal tables of migration 36: `liquidation_runs` gains `scope, conid, goal, goal_quantity, phase, opened_generation, stop_price, target_price, remaining_quantity, escalated, superseded_by, cleanup_pending`; new `liquidation_children` (one row per child order, keyed by `child_id`, with `owner_root_id` for inheritance, `sent_generation` and `order_entity_id`); new `liquidation_joins` (one row per command that started or joined a root — R17's `(command_id, root_id)`). Migration 36 also adopts the runs that were open before the upgrade (R29): every old run gets a join row (so a retry of its command id is bound and returns it); the oldest open run of an account becomes its `ACTIVE` account owner in phase `legacy`; other open runs of that account become `SUPERSEDED` by it. Every old run that did not end `FLAT` is marked `pre_sp1_open` (ruling 40, N2). On its first tick a root of any scope (the adopted one, or the first one claimed after the upgrade) journals, for every marked run of its account, ONE wildcard `UNKNOWN` child it owns that stands for every reduce the old service may have sent (old refs `{run}-liquidation-reduce-{conid}`, any conid; ruling 42), fenced on the newest generation. The snapshot's positions are not used: master's runs record no conids, and a missing position is never evidence. While any wildcard child of the account is unsettled, it blocks every reduce of every root on the account, whoever owns it. It settles only when every matching broker row is terminal and a complete enumeration on a generation newer than its fence holds; a visible working match is waited on, never cancelled; an invisible one blocks to the deadline. The run's mark is cleared in the transaction that settles its wildcard child, never on journaling. Nothing is invented as `NOT_SENT` or `ABSENT` to make the old run fit the new schema (R2-5).
 
 Rules this task implements (they also hold for every later scope):
 - **Write-ahead (R1, R7).** `_reserve` re-reads the run and its owner, checks the root may still dispatch (owner `ACTIVE`, run not terminal, owner goal = run goal = the tick's goal), and writes the children as `UNKNOWN` in one transaction. Only then `_send` calls the broker, after one more re-read.
 - **Send (R2, R22, R34).** `DispatchRefused` → `NOT_SENT`; any other exception → stays `UNKNOWN`; both are logged (`log.exception` for the second). Right after the call the child gets `sent_generation` = `dispatch.newest_generation()`, the newest broker generation including a staging one. A child that never got it (a crash) is fenced at the start of the next tick (`_fence_unsent`): every entry point runs on one worker, so no send is in flight then. A cancel cut off that way becomes `NOT_SENT`, because sending a cancel again is harmless (R38, the cancel livelock of #20).
 - **Evidence (R4, R22, R23, ruling 7).** `_observe_children` classifies every `UNKNOWN`/`WORKING` child from its own broker row on each step. A terminal status counts at once, on any generation. An empty lookup is `ABSENT` only when `enumeration_complete()` is true and the snapshot's generation is newer than the child's `sent_generation`; otherwise the child stays as it is until the deadline. `observed_generation` is the newest generation (staging included) at the read, so the fill-freshness margin is the same as the send fence.
-- **Reduce rule (R5, R23, ruling 4).** `_blocking`: any `UNKNOWN` child, any `WORKING` child of any kind, or a snapshot not newer than the last observed fill stops every new reduce.
+- **Reduce rule (R5, R23, ruling 4).** `_blocking`: any `UNKNOWN` child, any `WORKING` child of any kind, or a snapshot not newer than the last observed fill stops every new reduce. The children checked are the root's own plus every wildcard child of its account, whoever owns it (ruling 42).
 - **Cancels (R23, R27, spec 5.1 step 4).** `_cancel_targets` is every working order of the scope in the snapshot, plus every working re-protect leg found by its own row (it may have appeared after the capture). A reduce order is never cancelled (not the root's own, not an inherited one, not a pre-SP1 one): it only reduces, and while it works it blocks. A cancel the root sent covers its target; an inherited cancel does not. Before every cancel batch the protection is handed over again with the new targets (`handover_account`), so the saga expects every cancel.
 - **Claims (R6, R10).** `start(scope="account")` claims, creates the run and records the join row in one transaction; `JOINED_FLATTEN` creates nothing and returns the existing root's receipt.
 - **Terminal + cleanup (R6, R8, R9, R24, ruling 9).** `_finish` writes the terminal state, `cleanup_pending` and the owner's end state (`RELEASED` for `OWNER_RELEASED_STATES`, else `FAILED_SAFE`) in one transaction; `_cleanup` runs the idempotent saga step and recovery re-runs it. `_set` changes only the named fields of the run as the journal has it now; the store refuses to change a terminal run or to lower a goal.
@@ -1446,7 +1505,7 @@ Rules this task implements (they also hold for every later scope):
 
 - [ ] **Step 1: Write the failing tests**
 
-Replace the whole of `tests/test_liquidation_service.py` with the following. Master's first eight tests are kept (one renamed to say what it now checks: `test_flat_requires_newer_generation_and_a_terminal_reduce_child`, R19); they now run on a real temporary DuckDB journal and the fake dispatch answers evidence lookups. Of the seven tests PR #42 added, five are kept on the journal (the section "Kept from master"), `test_rescan_skips_failed_safe_root_and_advances_a_busy_registered_root` is covered by `test_failed_safe_root_does_not_block_rescan_of_a_newer_root` plus the busy-start test, and the FLAT-resolves-the-command part of the busy flatten test is gone (R33, ruling 32). The last section holds the round-2 verification fixes for the upgrade (N2, R2-5). The fake's `newest_generation` is the last captured generation plus `staging`: a test sets `staging = 1` to model a broker sync that opened before the send.
+Replace the whole of `tests/test_liquidation_service.py` with the following. Master's first eight tests are kept (one renamed to say what it now checks: `test_flat_requires_newer_generation_and_a_terminal_reduce_child`, R19); they now run on a real temporary DuckDB journal and the fake dispatch answers evidence lookups. Of the seven tests PR #42 added, five are kept on the journal (the section "Kept from master"), `test_rescan_skips_failed_safe_root_and_advances_a_busy_registered_root` is covered by `test_failed_safe_root_does_not_block_rescan_of_a_newer_root` plus the busy-start test, and the FLAT-resolves-the-command part of the busy flatten test is gone (R33, ruling 32). The round-2 section holds the verification fixes for the upgrade (N2, R2-5); the last section holds the round-3 wildcard tests (ruling 42). The fake's `newest_generation` is the last captured generation plus `staging`: a test sets `staging = 1` to model a broker sync that opened before the send.
 
 ```python
 import datetime as dt
@@ -1465,6 +1524,7 @@ from trader.trading.liquidation_service import (
     ChildRef, DispatchRefused, LiquidationBusy, LiquidationReceipt, LiquidationRunStore, LiquidationService,
     RunStateError, apply_liquidation_migration,
 )
+from trader.trading.order_correlation import matches_legacy_reduce
 
 
 UTC = dt.timezone.utc
@@ -1531,6 +1591,7 @@ class _Dispatch:
         self.broker = broker
         self.calls = []
         self.rows: dict[str, list] = {}       # child id -> broker rows found by its order ref
+        self.sequences: dict[str, list] = {}  # child id -> successive answers; the last one repeats
         self.entities: dict[str, object] = {}  # order entity id -> broker row (cancel targets)
         self.refuse: set[str] = set()          # methods that raise DispatchRefused before the boundary
         self.fail_after_send: set[str] = set() # methods that raise after the order was sent
@@ -1557,7 +1618,13 @@ class _Dispatch:
         self._record("place_exit_leg", ("place_exit_leg", position.conid, leg, quantity, price, oca_group, child_id))
 
     def find_orders(self, account_id, child_id):
+        answers = self.sequences.get(child_id)
+        if answers:
+            return list(answers.pop(0) if len(answers) > 1 else answers[0])
         return list(self.rows.get(child_id, []))
+
+    def find_orders_with_prefix(self, account_id, prefix):
+        return [row for ref, rows in self.rows.items() if matches_legacy_reduce(ref, prefix) for row in rows]
 
     def get_order(self, order_entity_id):
         return self.entities.get(order_entity_id)
@@ -1778,17 +1845,19 @@ def test_migration_36_adds_safe_close_columns_children_and_joins(tmp_path):
     assert {"command_id", "root_id", "outcome", "requested_goal"} <= join_cols
 
 
-def _legacy_db(tmp_path):
-    """A journal as it was before SP1: migration 25 only, with old runs."""
+_LEGACY_RUNS = (("old-flat", "FLAT", 1), ("old-failed", "FAILED_SAFE", 2), ("open-a", "OUTCOME_UNKNOWN", 3),
+                ("open-b", "VERIFYING", 4), ("open-c", "REQUESTED", 5))
+
+
+def _legacy_db(tmp_path, runs=_LEGACY_RUNS):
+    """A journal as it was before SP1: migration 25 only, with old runs (root, state, minute)."""
     db = DuckDBConnection.get_instance(str(tmp_path / "liq.duckdb"))
     migrator = SchemaMigrator(db)
     migrator.apply(25, "p1_liquidation_runs", ("""CREATE TABLE IF NOT EXISTS liquidation_runs (
         cause_command_id VARCHAR PRIMARY KEY, account_id VARCHAR NOT NULL, state VARCHAR NOT NULL,
         deadline TIMESTAMPTZ NOT NULL, generation_id BIGINT, detail VARCHAR NOT NULL,
         updated_at TIMESTAMPTZ NOT NULL)""",))
-    for root, state, minute in (("old-flat", "FLAT", 1), ("old-failed", "FAILED_SAFE", 2),
-                                ("open-a", "OUTCOME_UNKNOWN", 3), ("open-b", "VERIFYING", 4),
-                                ("open-c", "REQUESTED", 5)):
+    for root, state, minute in runs:
         db.execute("INSERT INTO liquidation_runs VALUES (?, ?, ?, ?, 1, 'x', ?)",
                    [root, ACCOUNT, state, DEADLINE, NOW + dt.timedelta(minutes=minute)], fetch="none")
     return db
@@ -1814,8 +1883,8 @@ def test_an_adopted_run_settles_its_old_reduce_before_any_new_reduce_across_two_
     s.service.rescan()                                      # adopt: old reduce of conid 1 is UNKNOWN
     adopted = s.service.receipt_for("open-a")
     assert {(c.child_id, c.state, c.sent_generation) for c in adopted.children} == {
-        (child, "UNKNOWN", 5) for child in ("open-a-liquidation-reduce-1", "open-b-liquidation-reduce-1",
-                                            "open-c-liquidation-reduce-1", "old-failed-liquidation-reduce-1")}
+        (child, "UNKNOWN", 5) for child in ("open-a-liquidation-reduce-*", "open-b-liquidation-reduce-*",
+                                            "open-c-liquidation-reduce-*", "old-failed-liquidation-reduce-*")}
     s.service.rescan()
     s.restart()
     s.push(_snapshot(6, [_position()]))
@@ -2307,8 +2376,8 @@ def test_rescan_returns_none_when_only_failed_safe_roots_remain(tmp_path):
 # Round-2 verification fixes (N2, R2-5): every pre-upgrade run's old reduce is tracked
 # ---------------------------------------------------------------------------
 
-_OLD_REDUCES = {"open-a-liquidation-reduce-1", "open-b-liquidation-reduce-1",
-                "open-c-liquidation-reduce-1", "old-failed-liquidation-reduce-1"}
+_OLD_REDUCES = {"open-a-liquidation-reduce-*", "open-b-liquidation-reduce-*",
+                "open-c-liquidation-reduce-*", "old-failed-liquidation-reduce-*"}
 
 
 def test_a_superseded_legacy_runs_invisible_reduce_blocks_the_adopted_root(tmp_path):
@@ -2350,11 +2419,98 @@ def test_old_failed_safe_runs_reduces_are_tracked_even_with_no_run_open_at_the_u
     db.execute("DELETE FROM liquidation_runs WHERE cause_command_id LIKE 'open-%'", fetch="none")
     s = _stack(tmp_path, [_snapshot(5, [_position()]), _snapshot(6, [_position()]), _snapshot(7, [_position()])])
     receipt = s.service.start(ACCOUNT, "flat-new", DEADLINE)
-    assert [(c.child_id, c.state) for c in receipt.children] == [("old-failed-liquidation-reduce-1", "UNKNOWN")]
+    assert [(c.child_id, c.state) for c in receipt.children] == [("old-failed-liquidation-reduce-*", "UNKNOWN")]
     assert s.dispatch.calls == []
     s.service.rescan()                                       # 6: complete and newer, no row: ABSENT
     s.service.rescan()                                       # 7: newer than that observation: reduce
     assert s.dispatch.calls == [("reduce", 1, "SELL", 10.0, "flat-new-reduce-1-1")]
+
+
+# ---------------------------------------------------------------------------
+# Round-3 fix (#20, ruling 42): a pre-upgrade run's reduces are one wildcard child
+# ---------------------------------------------------------------------------
+
+def _pre_sp1_open(db, run_id):
+    return db.execute("SELECT pre_sp1_open FROM liquidation_runs WHERE cause_command_id = ?",
+                      [run_id], fetch="one")[0]
+
+
+def test_an_old_reduce_of_a_flat_position_blocks_the_adopted_run_until_it_settles(tmp_path):
+    """Ruling 42: the old reduce of a position already at 0 is not in working_orders yet. The run's
+    wildcard child blocks; its mark stays until a complete, newer enumeration settles it."""
+    _legacy_db(tmp_path, (("flat-1", "VERIFYING", 1),))
+    s = _stack(tmp_path, [_snapshot(5, [_position(0.0)]), _snapshot(6, [_position(0.0)])])
+    s.dispatch.complete = False                              # the old order is not visible yet
+    s.service.rescan()                                       # adopt at 5
+    receipt = s.service.rescan()                             # 6
+    assert [(c.child_id, c.conid, c.state) for c in receipt.children] == [
+        ("flat-1-liquidation-reduce-*", None, "UNKNOWN")]
+    assert receipt.state not in ("FLAT", "CLOSED") and "outcome unknown" in receipt.detail
+    assert _pre_sp1_open(s.db, "flat-1")
+    s.push(_snapshot(7, [_position(0.0)]))
+    s.dispatch.rows["flat-1-liquidation-reduce-1"] = [_row("Submitted", entity="flat-1-liquidation-reduce-1:exit")]
+    assert "still working" in s.service.rescan().detail     # visible and working: waited on, not cancelled
+    assert _pre_sp1_open(s.db, "flat-1")
+    s.push(_snapshot(8, [_position(0.0)]))
+    s.dispatch.rows["flat-1-liquidation-reduce-1"] = [_row("Cancelled", entity="flat-1-liquidation-reduce-1:exit")]
+    s.dispatch.complete = True
+    assert s.service.rescan().state == "FLAT"               # 8: complete and newer than the fence
+    assert s.service.receipt_for("flat-1").children[0].state == "CANCELLED"
+    assert not _pre_sp1_open(s.db, "flat-1")
+    assert s.dispatch.calls == []
+
+
+def test_an_old_reduce_that_stays_invisible_blocks_to_the_deadline(tmp_path):
+    _legacy_db(tmp_path, (("flat-1", "VERIFYING", 1),))
+    s = _stack(tmp_path, [_snapshot(5, [_position(0.0)]), _snapshot(6, [_position(0.0)]),
+                          _snapshot(7, [_position(0.0)])])
+    s.dispatch.complete = False
+    s.service.rescan()
+    s.service.rescan()
+    assert "outcome unknown" in s.service.rescan().detail
+    s.clock["now"] = DEADLINE + dt.timedelta(seconds=1)
+    assert s.service.rescan().state == "FAILED_SAFE"
+    assert s.dispatch.calls == [] and _pre_sp1_open(s.db, "flat-1")
+
+
+# ---------------------------------------------------------------------------
+# Round-3 fix (#20, ruling 43): a fill fence outlives the root that observed it
+# ---------------------------------------------------------------------------
+
+def test_a_fill_seen_on_the_deadline_tick_fences_the_next_root(tmp_path):
+    """Ruling 43: root-1's reduce sold 6 on the tick its deadline passed; the position cache still says 10.
+    root-2 claimed on that generation sends nothing; a newer generation shows the real remainder."""
+    s = _stack(tmp_path, [_snapshot(1, [_position()])])
+    s.service.start(ACCOUNT, "root-1", DEADLINE)
+    s.dispatch.rows["root-1-reduce-1-1"] = [_row("Cancelled", filled=6.0)]
+    s.push(_snapshot(2, [_position()]))
+    s.clock["now"] = DEADLINE + dt.timedelta(seconds=1)
+    assert s.service.rescan().state == "FAILED_SAFE"         # gen 2: the fill is observed, then the deadline
+    receipt = s.service.start(ACCOUNT, "root-2", s.clock["now"] + dt.timedelta(minutes=5))
+    assert "newer than the last observed fill" in receipt.detail
+    assert s.dispatch.calls == [("reduce", 1, "SELL", 10.0, "root-1-reduce-1-1")]
+    s.push(_snapshot(3, [_position(4.0)]))
+    s.service.rescan()
+    assert s.dispatch.calls[-1] == ("reduce", 1, "SELL", 4.0, "root-2-reduce-1-1")
+
+
+def test_a_settled_legacy_fill_fences_the_next_root_across_a_restart(tmp_path):
+    """Ruling 43: the old run's late reduce filled 10 of 20; the root that settled it dies at its deadline.
+    After a restart the next root waits for a generation newer than that fill."""
+    _legacy_db(tmp_path, (("flat-1", "FAILED_SAFE", 1),))
+    s = _stack(tmp_path, [_snapshot(5, [_position(20.0)])])
+    s.service.start(ACCOUNT, "root-1", DEADLINE)
+    s.dispatch.rows["flat-1-liquidation-reduce-1"] = [_row("Filled", filled=10.0)]
+    s.push(_snapshot(6, [_position(20.0)]))
+    s.clock["now"] = DEADLINE + dt.timedelta(seconds=1)
+    assert s.service.rescan().state == "FAILED_SAFE"
+    assert not _pre_sp1_open(s.db, "flat-1")                 # settled FILLED on generation 6
+    s.restart()
+    receipt = s.service.start(ACCOUNT, "root-2", s.clock["now"] + dt.timedelta(minutes=5))
+    assert "newer than the last observed fill" in receipt.detail and s.dispatch.calls == []
+    s.push(_snapshot(7, [_position(10.0)]))
+    s.service.rescan()
+    assert s.dispatch.calls == [("reduce", 1, "SELL", 10.0, "root-2-reduce-1-1")]
 ```
 
 Append to `tests/test_command_stack.py`:
@@ -2367,6 +2523,20 @@ def test_enabled_stack_applies_safe_close_migrations(tmp_path):
     build_command_stack(trader, _policy(), now=lambda: NOW)
     versions = {r[0] for r in trader.journal_db.execute("SELECT version FROM schema_migrations", fetch="all")}
     assert {35, 36} <= versions
+```
+
+Append to `tests/test_order_correlation.py` (and add `legacy_reduce_prefix, matches_legacy_reduce` to its `trader.trading.order_correlation` import):
+
+```python
+def test_a_legacy_reduce_prefix_matches_every_conid_of_its_run_only():
+    """Ruling 42: {run}-liquidation-reduce-{conid}, any conid; never another run or a new child."""
+    prefix = legacy_reduce_prefix("flat-1")
+    assert matches_legacy_reduce("flat-1-liquidation-reduce-265598", prefix)
+    assert matches_legacy_reduce("flat-1-liquidation-reduce-1", prefix)
+    assert not matches_legacy_reduce("flat-10-liquidation-reduce-1", prefix)
+    assert not matches_legacy_reduce("flat-1-liquidation-reduce-1-2", prefix)
+    assert not matches_legacy_reduce("flat-1-liquidation-reduce-", prefix)
+    assert not matches_legacy_reduce(None, prefix)
 ```
 
 Master's real-loop tests and the saga's busy-lock test move to the journal service (ruling 32):
@@ -2612,7 +2782,7 @@ from trader.trading.exit_owner import (
     CLAIMED, JOINED_FLATTEN, STATE_ACTIVE, STATE_FAILED_SAFE, STATE_RELEASED, ExitOwnerRegistry,
     apply_exit_owner_migration,
 )
-from trader.trading.order_correlation import liquidation_child_id, liquidation_child_kind
+from trader.trading.order_correlation import legacy_reduce_prefix, liquidation_child_id, liquidation_child_kind
 
 log = logging.getLogger(__name__)
 
@@ -2651,8 +2821,10 @@ def apply_liquidation_migration(migrator: SchemaMigrator) -> None:
     account owner, in phase ``legacy`` (it acts only on a broker generation
     opened after the upgrade); other open runs of that account are SUPERSEDED
     by it. Every old run that did not end FLAT is marked ``pre_sp1_open``: it
-    may have sent a reduce the journal does not know (N2). Exit owners
-    (migration 35) are applied first.
+    may have sent a reduce the journal does not know (N2). Such a run is
+    tracked by one wildcard child (``ref_prefix`` set, ``conid`` NULL), because
+    old runs record no conids (ruling 42). Exit owners (migration 35) are
+    applied first.
     """
     migrator.apply(LIQUIDATION_MIGRATION_VERSION, "p1_liquidation_runs", (
         """CREATE TABLE IF NOT EXISTS liquidation_runs (
@@ -2682,7 +2854,7 @@ def apply_liquidation_migration(migrator: SchemaMigrator) -> None:
             root_id VARCHAR NOT NULL,
             owner_root_id VARCHAR NOT NULL,
             account_id VARCHAR NOT NULL,
-            conid INTEGER NOT NULL,
+            conid INTEGER,
             kind VARCHAR NOT NULL,
             attempt INTEGER NOT NULL,
             state VARCHAR NOT NULL,
@@ -2698,6 +2870,7 @@ def apply_liquidation_migration(migrator: SchemaMigrator) -> None:
             observed_generation BIGINT,
             sent_generation BIGINT,
             order_entity_id VARCHAR,
+            ref_prefix VARCHAR,
             updated_at TIMESTAMPTZ NOT NULL
         )""",
         "CREATE INDEX IF NOT EXISTS idx_liquidation_children_owner ON liquidation_children(owner_root_id)",
@@ -2782,6 +2955,7 @@ class LiquidationDispatchPort(Protocol):
     def place_exit_leg(self, position: Any, *, leg: str, quantity: float, price: float,
                        oca_group: str, child_id: str) -> None: ...
     def find_orders(self, account_id: str, child_id: str) -> list: ...
+    def find_orders_with_prefix(self, account_id: str, prefix: str) -> list: ...
     def get_order(self, order_entity_id: str) -> Optional[Any]: ...
     def enumeration_complete(self) -> bool: ...
     def newest_generation(self) -> int: ...
@@ -2830,7 +3004,7 @@ class ChildRef:
     root_id: str                  # root that wrote it
     owner_root_id: str            # root that must reconcile it now (R9 inheritance)
     account_id: str
-    conid: int
+    conid: Optional[int]          # None only for a pre-SP1 wildcard child
     kind: str                     # cancel | reduce | reprotect-stop | reprotect-target
     attempt: int
     state: str                    # see CHILD_STATES
@@ -2846,6 +3020,7 @@ class ChildRef:
     observed_generation: Optional[int] = None   # newest generation (staging included) when last observed
     sent_generation: Optional[int] = None       # newest generation (staging included) right after the send
     order_entity_id: Optional[str] = None       # the broker row of this child's own order
+    ref_prefix: Optional[str] = None            # pre-SP1 wildcard: every ref {prefix}{conid} (ruling 42)
 
     @property
     def fill_bearing(self) -> bool:
@@ -2918,7 +3093,7 @@ _CHILD_COLUMNS = (
     "child_id", "root_id", "owner_root_id", "account_id", "conid", "kind", "attempt", "state",
     "fence_generation", "side", "quantity", "price", "oca_group", "target_order_entity_id",
     "filled_at_send", "filled_quantity", "outstanding_quantity", "observed_generation",
-    "sent_generation", "order_entity_id",
+    "sent_generation", "order_entity_id", "ref_prefix",
 )
 _JOIN_COLUMNS = ("command_id", "root_id", "account_id", "conid", "outcome", "requested_goal",
                  "requested_quantity")
@@ -2941,7 +3116,7 @@ def _run_from_row(row) -> LiquidationReceipt:
 
 def _child_from_row(row) -> ChildRef:
     values = dict(zip(_CHILD_COLUMNS, row))
-    values["conid"] = int(values["conid"])
+    values["conid"] = None if values["conid"] is None else int(values["conid"])
     values["attempt"] = int(values["attempt"])
     values["fence_generation"] = int(values["fence_generation"])
     return ChildRef(**values)
@@ -2985,14 +3160,34 @@ class LiquidationRunStore:
             [getattr(receipt, c) for c in _RUN_COLUMNS[1:]] + [now, receipt.cause_command_id])
 
     def pre_sp1_roots_in_tx(self, conn, account_id: str) -> list[str]:
-        """Runs from before the upgrade whose old reduces are not tracked yet (N2)."""
+        """Runs from before the upgrade whose old reduces are not settled yet (N2, ruling 42)."""
         return [r[0] for r in conn.execute(
             "SELECT cause_command_id FROM liquidation_runs WHERE account_id = ? AND pre_sp1_open "
             "ORDER BY updated_at, cause_command_id", [account_id]).fetchall()]
 
-    def mark_pre_sp1_tracked_in_tx(self, conn, root_ids: list[str]) -> None:
-        for root_id in root_ids:
-            conn.execute("UPDATE liquidation_runs SET pre_sp1_open = FALSE WHERE cause_command_id = ?", [root_id])
+    def clear_pre_sp1_mark_in_tx(self, conn, run_id: str) -> None:
+        """Only in the transaction that settles the run's wildcard child (ruling 42)."""
+        conn.execute("UPDATE liquidation_runs SET pre_sp1_open = FALSE WHERE cause_command_id = ?", [run_id])
+
+    def fill_watermark_in_tx(self, conn, account_id: str, conid: Optional[int]) -> Optional[int]:
+        """Newest generation at which any child of the scope was seen fill-bearing (ruling 43).
+
+        Any root, any state. A conid scope also counts wildcard children
+        (conid NULL), which may hold a fill of any conid.
+        """
+        conid_filter = "" if conid is None else " AND (conid = ? OR conid IS NULL)"
+        params: list = [account_id] + ([] if conid is None else [int(conid)])
+        row = conn.execute(
+            "SELECT MAX(observed_generation) FROM liquidation_children WHERE account_id = ? "
+            "AND (state = 'ABSENT' OR filled_quantity > filled_at_send)" + conid_filter, params).fetchone()
+        return None if row[0] is None else int(row[0])
+
+    def legacy_reduces_in_tx(self, conn, account_id: str) -> tuple[ChildRef, ...]:
+        """Every wildcard child of the account, whoever owns it (ruling 42)."""
+        rows = conn.execute(
+            f"SELECT {', '.join(_CHILD_COLUMNS)} FROM liquidation_children "
+            "WHERE account_id = ? AND ref_prefix IS NOT NULL ORDER BY child_id", [account_id]).fetchall()
+        return tuple(_child_from_row(r) for r in rows)
 
     def roots_to_advance_in_tx(self, conn) -> list[str]:
         """Roots with unfinished cleanup first, then every non-terminal root."""
@@ -3353,41 +3548,33 @@ class LiquidationService:
                 for child in unfenced:
                     self._store.update_child_in_tx(conn, child, self._now())
             self._store.transaction(write)
-        tracked = self._track_pre_sp1_reduces(receipt, snapshot, newest)
+        tracked = self._track_pre_sp1_reduces(receipt, newest)
         if receipt.phase == "legacy":
             return self._adopt_legacy(receipt, newest)
         return self._store.receipt(receipt.cause_command_id) if unfenced or tracked else receipt
 
-    def _track_pre_sp1_reduces(self, receipt, snapshot, newest: int) -> bool:
-        """R29 / N2: a run from before the upgrade may have sent a reduce the journal does not know.
+    def _track_pre_sp1_reduces(self, receipt, newest: int) -> bool:
+        """R29 / N2, ruling 42: a run from before the upgrade may have sent reduces the journal does not know.
 
-        For every run of the account that was open or FAILED_SAFE at the
-        upgrade (the adopted one, the ones it superseded, old FAILED_SAFE
-        ones) and every position the account holds now, the old service's
-        reduce (ref ``{run}-liquidation-reduce-{conid}``) becomes an UNKNOWN
-        child of this root, fenced on ``newest``: its own row, or a complete
-        enumeration opened after that, must settle it before any new reduce.
-        An account root marks those runs tracked; a conid root tracks only its
-        conid and leaves them for the next account root.
+        Old runs record no conids, so each run of the account that is still
+        marked ``pre_sp1_open`` becomes ONE wildcard ``UNKNOWN`` child of this
+        root: it stands for every ref ``{run}-liquidation-reduce-{conid}``,
+        fenced on ``newest``. The snapshot's positions are not used: a
+        missing position is never evidence. The mark is cleared only when the
+        child settles (``_observe_children``), never here.
         """
         def write(conn):
-            old_runs = self._store.pre_sp1_roots_in_tx(conn, receipt.account_id)
             added = False
-            for old in old_runs:
-                for p in snapshot.positions:
-                    if float(p.quantity) == 0.0 or (receipt.conid is not None and int(p.conid) != receipt.conid):
-                        continue
-                    child_id = f"{old}-liquidation-reduce-{int(p.conid)}"
-                    if self._store.child_in_tx(conn, child_id) is not None:
-                        continue
-                    self._store.insert_child_in_tx(conn, ChildRef(
-                        child_id=child_id, root_id=old, owner_root_id=receipt.cause_command_id,
-                        account_id=receipt.account_id, conid=int(p.conid), kind="reduce", attempt=0,
-                        state="UNKNOWN", fence_generation=newest, side=_reducing_side(p.quantity),
-                        quantity=abs(float(p.quantity)), sent_generation=newest), self._now())
-                    added = True
-            if receipt.scope == "account":
-                self._store.mark_pre_sp1_tracked_in_tx(conn, old_runs)
+            for old in self._store.pre_sp1_roots_in_tx(conn, receipt.account_id):
+                prefix = legacy_reduce_prefix(old)
+                child_id = f"{prefix}*"
+                if self._store.child_in_tx(conn, child_id) is not None:
+                    continue
+                self._store.insert_child_in_tx(conn, ChildRef(
+                    child_id=child_id, root_id=old, owner_root_id=receipt.cause_command_id,
+                    account_id=receipt.account_id, conid=None, kind="reduce", attempt=0, state="UNKNOWN",
+                    fence_generation=newest, sent_generation=newest, ref_prefix=prefix), self._now())
+                added = True
             return added
         return self._store.transaction(write)
 
@@ -3398,8 +3585,13 @@ class LiquidationService:
                          detail="adopted at the upgrade; old reduces are unknown until the broker settles them")
 
     def _observe_children(self, receipt, snapshot, newest: int) -> LiquidationReceipt:
+        """Classify this root's open children and every open wildcard child of its account.
+
+        A wildcard child that settles clears its run's ``pre_sp1_open`` mark
+        in the same transaction (ruling 42).
+        """
         generation = int(snapshot.generation_id)
-        changed = [observed for child in receipt.children if child.state in ("UNKNOWN", "WORKING")
+        changed = [observed for child in self._children_in_force(receipt) if child.state in ("UNKNOWN", "WORKING")
                    for observed in (self._evidence(child, generation, newest),) if observed != child]
         if not changed:
             return receipt
@@ -3407,8 +3599,16 @@ class LiquidationService:
         def write(conn):
             for child in changed:
                 self._store.update_child_in_tx(conn, child, self._now())
+                if child.ref_prefix is not None and child.state in CHILD_TERMINAL:
+                    self._store.clear_pre_sp1_mark_in_tx(conn, child.root_id)
         self._store.transaction(write)
         return self._store.receipt(receipt.cause_command_id)
+
+    def _children_in_force(self, receipt) -> tuple[ChildRef, ...]:
+        """The root's own children plus every wildcard child of its account, whoever owns it (ruling 42)."""
+        own = {c.child_id for c in receipt.children}
+        legacy = self._store.transaction(lambda conn: self._store.legacy_reduces_in_tx(conn, receipt.account_id))
+        return receipt.children + tuple(c for c in legacy if c.child_id not in own)
 
     def _evidence(self, child: ChildRef, generation: int, newest: int) -> ChildRef:
         """Classify one child from its own broker row (R4, D1, D2).
@@ -3417,6 +3617,8 @@ class LiquidationService:
         is absence only when a complete enumeration opened after the child's
         send fence shows nothing; otherwise the child stays as it is.
         """
+        if child.ref_prefix is not None:
+            return self._legacy_evidence(child, generation, newest)
         if child.kind == "cancel":
             row = self._dispatch.get_order(child.target_order_entity_id)
             rows = [] if row is None or getattr(row, "deleted", False) else [row]
@@ -3446,14 +3648,44 @@ class LiquidationService:
         return replace(child, state=state, filled_quantity=filled, outstanding_quantity=outstanding,
                        order_entity_id=entity, observed_generation=newest)
 
-    @staticmethod
-    def _fresh(receipt, generation: int) -> bool:
-        """R5: sizing needs a generation newer than every fill this root observed."""
-        return all(generation > c.observed_generation for c in receipt.children
-                   if c.fill_bearing and c.observed_generation is not None)
+    def _legacy_evidence(self, child: ChildRef, generation: int, newest: int) -> ChildRef:
+        """Ruling 42: a wildcard child settles only on positive evidence for every conid at once.
+
+        Every broker row matching the prefix must be terminal AND a complete
+        enumeration on a generation newer than the fence must hold, even when
+        rows are terminal: another conid's old reduce may still be invisible.
+        A visible working row keeps the child WORKING; it is waited on, never
+        cancelled.
+        """
+        rows = list(self._dispatch.find_orders_with_prefix(child.account_id, child.ref_prefix))
+        statuses = [getattr(r, "status", None) for r in rows]
+        filled = sum(float(getattr(r, "filled_quantity", 0.0) or 0.0) for r in rows)
+        if any(s not in _BROKER_TERMINAL for s in statuses):
+            state = "WORKING" if any(s in _BROKER_ACCEPTED for s in statuses) else "UNKNOWN"
+        elif generation > child.sent_generation and self._dispatch.enumeration_complete():
+            state = "ABSENT" if not rows else ("FILLED" if filled > 0 else "CANCELLED")
+        else:
+            state = "UNKNOWN"
+        if (state, filled) == (child.state, child.filled_quantity):
+            return child
+        return replace(child, state=state, filled_quantity=filled, observed_generation=newest)
+
+    def _fresh(self, receipt, generation: int) -> bool:
+        """R5, ruling 43: sizing needs a generation newer than every fill observed on the scope.
+
+        The fence is any root's: a fill seen by a root that has since ended,
+        been superseded or been restarted still binds the next root.
+        """
+        watermark = self._store.transaction(
+            lambda conn: self._store.fill_watermark_in_tx(conn, receipt.account_id, receipt.conid))
+        return watermark is None or generation > watermark
 
     def _blocking(self, receipt, generation: int) -> Optional[str]:
-        """R5, D2: a child that is unknown or still working stops every new reduce."""
+        """R5, D2: a child that is unknown or still working stops every new reduce.
+
+        Ruling 42: so does every wildcard child of the account, whoever owns it.
+        """
+        receipt = replace(receipt, children=self._children_in_force(receipt))
         for child in receipt.children:
             if child.state == "UNKNOWN":
                 return f"{child.child_id} outcome unknown"
@@ -3736,6 +3968,9 @@ class _LiquidationDispatch:
     def find_orders(self, account_id: str, child_id: str) -> list:
         return self._dispatch.find_by_order_ref(account_id, encode_order_ref(child_id))
 
+    def find_orders_with_prefix(self, account_id: str, prefix: str) -> list:
+        return self._dispatch.find_legacy_reduces(account_id, prefix)
+
     def get_order(self, order_entity_id: str):
         return self._orders_view.get_order(order_entity_id)
 
@@ -3766,6 +4001,38 @@ class _LiquidationDispatch:
 ```
 
 5. In the `SessionController(` call change both `_LiquidationDispatch(dispatch)` to `_LiquidationDispatch(dispatch, orders_view)`.
+
+The wildcard child (ruling 42) looks up a pre-SP1 run's reduces by ref prefix. In `trader/trading/order_correlation.py`, right after `_LEGACY_REDUCE`, add:
+
+```python
+def legacy_reduce_prefix(run_id: str) -> str:
+    """Prefix of every reduce ref a pre-SP1 run may have sent, whatever the conid."""
+    return f"{run_id}-liquidation-reduce-"
+
+
+def matches_legacy_reduce(order_group_id: Optional[str], prefix: str) -> bool:
+    """True for ``{prefix}{conid}``: the prefix followed by digits only."""
+    group = order_group_id or ""
+    return group.startswith(prefix) and group[len(prefix):].isdigit()
+```
+
+In `trader/trading/command_ports.py` import `matches_legacy_reduce` from `trader.trading.order_correlation` and add after `orders_matching_group`:
+
+```python
+def orders_matching_legacy_reduces(rows: Iterable[Any], account_id: str, prefix: str) -> list:
+    """Broker rows for (account, ``{prefix}{conid}``) of any conid: a pre-SP1 run's reduces."""
+    return [r for r in rows
+            if getattr(r, "account_id", None) == account_id
+            and matches_legacy_reduce(getattr(r, "order_group_id", None), prefix)]
+```
+
+In `trader/trading/trading_runtime.py`, on the dispatch class, right after `find_by_order_ref`:
+
+```python
+    def find_legacy_reduces(self, account_id: str, prefix: str) -> list:
+        from trader.trading.command_ports import orders_matching_legacy_reduces
+        return orders_matching_legacy_reduces(self._active_order_rows(), account_id, prefix)
+```
 
 In `scripts/command_plane_drill.py` replace `scn_liquidation` (it builds the service without a journal today):
 
@@ -3813,13 +4080,13 @@ def scn_liquidation(db_path: str) -> dict:
 
 - [ ] **Step 5: Run the tests**
 
-Run: `.venv/bin/python -m pytest tests/test_liquidation_service.py tests/test_command_stack.py tests/test_trader_service_loops.py tests/automation/test_protective_order_saga.py tests/integration/test_command_plane_activation.py tests/integration/test_p1_release_gate.py tests/integration/test_p3_release_gate.py -q --timeout=60`
-Expected: all PASS (47 in `test_liquidation_service.py`). Then the full suite: green.
+Run: `.venv/bin/python -m pytest tests/test_liquidation_service.py tests/test_command_stack.py tests/test_order_correlation.py tests/test_trader_service_loops.py tests/automation/test_protective_order_saga.py tests/integration/test_command_plane_activation.py tests/integration/test_p1_release_gate.py tests/integration/test_p3_release_gate.py -q --timeout=60`
+Expected: all PASS (51 in `test_liquidation_service.py`). Then the full suite: green.
 
 - [ ] **Step 6: Commit**
 
 ```bash
-git add trader/trading/liquidation_service.py trader/trading/command_stack.py scripts/command_plane_drill.py tests/test_liquidation_service.py tests/test_command_stack.py tests/test_trader_service_loops.py tests/automation/test_protective_order_saga.py
+git add trader/trading/liquidation_service.py trader/trading/command_stack.py trader/trading/order_correlation.py trader/trading/command_ports.py trader/trading/trading_runtime.py scripts/command_plane_drill.py tests/test_liquidation_service.py tests/test_command_stack.py tests/test_order_correlation.py tests/test_trader_service_loops.py tests/automation/test_protective_order_saga.py
 git commit -m "feat: journaled liquidation children and one-transaction account claims
 
 Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>"
@@ -3929,9 +4196,10 @@ class _FakeIB:
         self.cancelled.append(order)
 
 
-def _working(action, quantity, *, filled=0.0, oca_group=""):
+def _working(action, quantity, *, filled=0.0, oca_group="", account=ACCOUNT):
     return SimpleNamespace(contract=SimpleNamespace(conId=CONID),
-                           order=SimpleNamespace(action=action, totalQuantity=quantity, ocaGroup=oca_group),
+                           order=SimpleNamespace(action=action, totalQuantity=quantity, ocaGroup=oca_group,
+                                                 account=account),
                            orderStatus=SimpleNamespace(filled=filled))
 
 
@@ -3975,6 +4243,19 @@ def test_reduce_only_subtracts_reducing_orders_already_working():
     assert _run(trader.place_reduce_only_order(_contract(), "SELL", 4.0, broker_quantity=10.0,
                                                order_ref="mmr:y")).is_success()
     assert [o.totalQuantity for o in trader.executioner.placed] == [4.0]
+
+
+def test_another_accounts_working_order_does_not_reduce_the_pinned_accounts_capacity():
+    """#38: the client cache may hold orders of another account; only the pinned account's count.
+    An order with no account is counted: an unknown owner fails closed."""
+    trader = _trader(held=10.0)
+    trader.client.ib.open_trades = [_working("SELL", 10.0, account="DU99999")]
+    assert _run(trader.place_reduce_only_order(_contract(), "SELL", 10.0, broker_quantity=10.0,
+                                               order_ref="mmr:x")).is_success()
+    trader.client.ib.open_trades = [_working("SELL", 10.0, account="")]
+    refused = _run(trader.place_reduce_only_order(_contract(), "SELL", 10.0, broker_quantity=10.0,
+                                                  order_ref="mmr:y"))
+    assert refused.error.startswith("reduce-only refused")
 
 
 # -- Task 14: the dispatch ---------------------------------------------------------------
@@ -4208,7 +4489,7 @@ index 90f48751..83570bf7 100644
 - [ ] **Step 2: Run them to verify they fail**
 
 Run: `.venv/bin/python -m pytest tests/test_reduce_only_order_path.py tests/test_order_dispatch_ports.py tests/test_trading_runtime.py tests/test_trader_service_loops.py -q --timeout=30`
-Expected: 16 failed, 107 passed — in the new file the connection, R35, dispatch and adapter tests (`AttributeError: ... 'reduce_partial'` / `'cancel_on_loop'`, `DispatchRefused` not raised); in master's files the three assertions that now expect `DispatchRefused`, the new IB-rejection test and the loop test that now expects `NOT_SENT`
+Expected: 17 failed, 107 passed — in the new file the connection, R35 (two, one of them the pinned-account test), dispatch and adapter tests (`AttributeError: ... 'reduce_partial'` / `'cancel_on_loop'`, `DispatchRefused` not raised); in master's files the three assertions that now expect `DispatchRefused`, the new IB-rejection test and the loop test that now expects `NOT_SENT`
 
 - [ ] **Step 3: Implement**
 
@@ -4276,7 +4557,7 @@ index c3d03cdb..1b2e1738 100644
          if int(contract.conId or 0) <= 0 or not contract.symbol:
              return f'invalid contract (conId={contract.conId!r}, symbol={contract.symbol!r})'
          try:
-@@ -1763,8 +1770,27 @@ class Trader():
+@@ -1763,8 +1770,30 @@ class Trader():
          if live == 0 or (live > 0) != (broker_quantity > 0) or abs(live) < quantity:
              return (f'live position cache shows {live} for conId {contract.conId}; '
                      f'cannot {side} {quantity} against broker position {broker_quantity}')
@@ -4291,12 +4572,15 @@ index c3d03cdb..1b2e1738 100644
 +
 +        A stop whose cancel has not landed still sells, so a second reduce of
 +        the full position could reverse it. The sibling of ``oca_group`` does
-+        not count: one OCA pair protects the same shares once.
++        not count: one OCA pair protects the same shares once. Only orders of
++        the pinned account count; an order with no account is counted, so an
++        unknown owner fails closed (#38).
 +        """
 +        return sum(
 +            max(float(t.order.totalQuantity) - float(getattr(t.orderStatus, 'filled', 0.0) or 0.0), 0.0)
 +            for t in self.client.ib.openTrades()
 +            if int(getattr(t.contract, 'conId', 0) or 0) == conid
++            and (getattr(t.order, 'account', '') or self.ib_account) == self.ib_account
 +            and t.order.action == reducing_side
 +            and not (oca_group and getattr(t.order, 'ocaGroup', '') == oca_group)
 +        )
@@ -4304,7 +4588,7 @@ index c3d03cdb..1b2e1738 100644
      def _live_position_quantity(self, conid: int) -> float:
          """Signed quantity from ib_async's position cache (no IB request)."""
          return sum(
-@@ -2471,7 +2497,7 @@ class TradingRuntimeOrderDispatch:
+@@ -2471,7 +2500,7 @@ class TradingRuntimeOrderDispatch:
          return CancelAck(order_entity_id=order_entity_id, cancelled=True)
  
      def reduce_position(self, position, side: str, quantity: float, order_ref: str):
@@ -4313,7 +4597,7 @@ index c3d03cdb..1b2e1738 100644
  
          This intentionally bypasses proposal semantics and the entry gates
          (``Trader.place_reduce_only_order``), but not the trader's one
-@@ -2481,57 +2507,115 @@ class TradingRuntimeOrderDispatch:
+@@ -2481,57 +2510,115 @@ class TradingRuntimeOrderDispatch:
  
          Must be called off the trader loop (the liquidation worker or an RPC
          thread). Errors:
@@ -4452,7 +4736,7 @@ index c3d03cdb..1b2e1738 100644
 - [ ] **Step 4: Run the tests**
 
 Run: `.venv/bin/python -m pytest tests/test_reduce_only_order_path.py tests/test_order_dispatch_ports.py tests/test_trading_runtime.py tests/test_trader_service_loops.py tests/test_liquidation_service.py tests/test_production_rpc_security.py tests/test_cancel_command.py -q --timeout=30`
-Expected: all PASS (12 in the new file). Then the full suite: green.
+Expected: all PASS (13 in the new file). Then the full suite: green.
 
 - [ ] **Step 5: Commit**
 
@@ -5050,6 +5334,8 @@ Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>"
 
 `REQUESTED → CANCELLING → VERIFYING → REDUCING → VERIFYING → CLOSED`. Before the first cancel the service hands protection over (`ProtectionOwnershipPort.handover` with the exact order ids it will cancel), and it hands over again before every later cancel batch, with the new ids (R27). Cancels and the reduce are journaled children; nothing new is sent while a child is unknown; the reduce is sized only from a fresh generation; routine progress never trips the breaker. A second full close on the same conid joins the owner (one root, one order); the full join/upgrade/refuse rules are pinned in Task 8.
 
+A conid root journals and honours the pre-upgrade wildcard children of ruling 42 like an account root: Task 4's `_track_pre_sp1_reduces` and `_blocking` run for every scope, so `CLOSED` and every reduce wait while any wildcard child of the account is unsettled, also for a conid the old run may never have touched. A conid root never clears another run's mark early; only the settle does. The last two tests below cover a scoped close of the old reduce's conid and of another conid.
+
 **Files:**
 - Modify: `trader/trading/liquidation_service.py` (`start`, `_tick`; new `_claim_scoped_in_tx`, `_position_for`, `_working_for`, `_cancel_conid_orders`, `_advance_conid`)
 - Test: `tests/test_liquidation_service.py`
@@ -5225,12 +5511,50 @@ def test_start_refuses_rebinding_root_to_another_scope(tmp_path):
     s.service.start(ACCOUNT, "root-2", DEADLINE, scope="conid", conid=2)
     with pytest.raises(ValueError):
         s.service.start(ACCOUNT, "root-2", DEADLINE, scope="conid", conid=1)
+
+
+def test_an_old_reduce_of_a_flat_position_blocks_a_scoped_close_of_that_conid(tmp_path):
+    _legacy_db(tmp_path, (("flat-1", "FAILED_SAFE", 1),))
+    s = _stack(tmp_path, [_snapshot(5, [_position(0.0)]), _snapshot(6, [_position(0.0)])])
+    s.dispatch.complete = False
+    s.service.start(ACCOUNT, "close-1", DEADLINE, scope="conid", conid=1)
+    receipt = s.service.rescan()
+    assert [(c.child_id, c.owner_root_id, c.state) for c in receipt.children] == [
+        ("flat-1-liquidation-reduce-*", "close-1", "UNKNOWN")]
+    assert receipt.state != "CLOSED" and _pre_sp1_open(s.db, "flat-1")
+    s.push(_snapshot(7, [_position(0.0)]))
+    s.dispatch.rows["flat-1-liquidation-reduce-1"] = [_row("Submitted", entity="flat-1-liquidation-reduce-1:exit")]
+    assert "still working" in s.service.rescan().detail
+    s.push(_snapshot(8, [_position(-10.0)]), _snapshot(9, [_position(-10.0)]))
+    s.dispatch.rows["flat-1-liquidation-reduce-1"] = [
+        _row("Filled", filled=10.0, entity="flat-1-liquidation-reduce-1:exit")]
+    s.dispatch.complete = True
+    s.service.rescan()                                       # 8: settled FILLED; the late fill opened a short
+    assert not _pre_sp1_open(s.db, "flat-1")
+    assert s.dispatch.calls == []                            # 8 is not newer than the fill it observed
+    s.service.rescan()                                       # 9: the close reduces the short it now sees
+    assert s.dispatch.calls == [("reduce", 1, "BUY", 10.0, "close-1-reduce-1-1")]
+
+
+def test_the_wildcard_blocks_a_scoped_close_of_another_conid(tmp_path):
+    """Ruling 42: the scoped root on conid 2 never looks at conid 1. The old run's reduce of conid 2
+    is settled, but its reduce of conid 1 is not, so the run is not settled and nothing is reduced."""
+    _legacy_db(tmp_path, (("flat-1", "FAILED_SAFE", 1),))
+    held = [_position(0.0), _position(10.0, conid=2)]
+    s = _stack(tmp_path, [_snapshot(5, held), _snapshot(6, held), _snapshot(7, held)])
+    s.dispatch.complete = False
+    s.dispatch.rows["flat-1-liquidation-reduce-2"] = [_row("Cancelled", entity="flat-1-liquidation-reduce-2:exit")]
+    s.service.start(ACCOUNT, "close-2", DEADLINE, scope="conid", conid=2)
+    s.service.rescan()
+    s.service.rescan()
+    assert s.dispatch.calls == []
+    assert _pre_sp1_open(s.db, "flat-1")
 ```
 
 - [ ] **Step 2: Run them to verify they fail**
 
 Run: `.venv/bin/python -m pytest tests/test_liquidation_service.py -q --timeout=30`
-Expected: 13 failed (`ValueError: unknown liquidation scope 'conid'`), 47 passed.
+Expected: 15 failed (`ValueError: unknown liquidation scope 'conid'`), 51 passed.
 
 - [ ] **Step 3: Implement**
 
@@ -5260,7 +5584,8 @@ Replace `start` and `_tick` with:
         else:
             raise ValueError(f"unknown liquidation scope {scope!r}")
         if outcome in (CLAIMED, "EXISTING"):
-            return self._tick(root)
+            with self._exclusive():
+                return self._tick(root)
         return self._store.receipt(root)
 ```
 
@@ -5370,7 +5695,7 @@ Why this order: `handover` runs before `_send_cancels`, every time, so the saga 
 - [ ] **Step 4: Run the tests**
 
 Run: `.venv/bin/python -m pytest tests/test_liquidation_service.py -q --timeout=30`
-Expected: 60 passed.
+Expected: 66 passed.
 
 - [ ] **Step 5: Commit**
 
@@ -5421,9 +5746,10 @@ def _priced(quantity=10.0, conid=1, price=100.0):
     return _position(quantity, conid=conid, market_price=price)
 
 
-def _leg_row(status="Submitted", total=6.0, filled=0.0, group="p-1-reprotect-1-1", oca_type=2, action="SELL"):
+def _leg_row(status="Submitted", total=6.0, filled=0.0, group="p-1-reprotect-1-1", oca_type=2, action="SELL",
+             entity=None):
     """A re-protect leg's own broker row, with the OCA link the broker reports (Task 18)."""
-    return _row(status, filled=filled, total=total, oca_group=group, oca_type=oca_type, action=action)
+    return _row(status, filled=filled, total=total, oca_group=group, oca_type=oca_type, action=action, entity=entity)
 
 
 def _to_reprotect(tmp_path, *, target=120.0, stop=95.0, held=10.0, q=4.0, extra=()):
@@ -5492,6 +5818,45 @@ def test_partial_close_sends_stop_then_target_and_ends_done(tmp_path):
     assert s.breaker.calls == []
     outcome = s.service.close_resolution("p-1").outcome                  # what was asked, sold and kept
     assert (outcome["requested_quantity"], outcome["filled_quantity"], outcome["remaining_quantity"]) == (4.0, 4.0, 6.0)
+
+
+def _both_legs_working_next(tmp_path, *stop_answers):
+    """Partial close at generation 5 with both legs sent; the stop's row answers come in order."""
+    s, _ = _to_reprotect(tmp_path, extra=(_snapshot(4, [_priced(6.0)]), _snapshot(5, [_priced(6.0)]),
+                                          _snapshot(6, [_priced(6.0)])))
+    s.dispatch.rows["p-1-reprotect-stop-1-1"] = [_leg_row()]
+    s.service.rescan()                                                    # gen 4: stop working -> target
+    s.dispatch.rows["p-1-reprotect-target-1-1"] = [_leg_row()]
+    s.dispatch.sequences["p-1-reprotect-stop-1-1"] = [list(answer) for answer in stop_answers]
+    return s
+
+
+def test_a_stop_cancelled_after_it_was_observed_never_ends_done(tmp_path):
+    """#22: the stop was WORKING when observed, then ingest saw it Cancelled; DONE is not decided from
+    the old child status with the fresh row's OCA link."""
+    s = _both_legs_working_next(tmp_path, [_leg_row()], [_leg_row("Cancelled")])
+    receipt = s.service.rescan()                                          # gen 5
+    assert receipt.state != "DONE" and s.service.close_resolution("p-1") is None
+    stop = next(c for c in receipt.children if c.kind == "reprotect-stop")
+    assert stop.state == "CANCELLED"                                     # observed again, not finished
+    receipt = s.service.rescan()                                          # gen 6: a failed re-protect
+    assert receipt.state != "DONE" and receipt.goal == "zero"
+
+
+def test_a_stop_fill_after_it_was_observed_never_ends_done(tmp_path):
+    """#22: ingest saw 2 of the stop's 6 fill after it was observed; outstanding is 4, not 6."""
+    s = _both_legs_working_next(tmp_path, [_leg_row()], [_leg_row(filled=2.0)])
+    receipt = s.service.rescan()
+    assert receipt.state != "DONE" and s.service.close_resolution("p-1") is None
+    stop = next(c for c in receipt.children if c.kind == "reprotect-stop")
+    assert (stop.filled_quantity, stop.outstanding_quantity) == (2.0, 4.0)
+
+
+def test_a_leg_row_that_changes_while_done_is_decided_is_read_again(tmp_path):
+    """#22: the rows DONE was decided on must still be the rows at the terminal write."""
+    s = _both_legs_working_next(tmp_path, [_leg_row()], [_leg_row()], [_leg_row("Cancelled")])
+    receipt = s.service.rescan()
+    assert receipt.state != "DONE" and s.service.close_resolution("p-1") is None
 
 
 def test_terminal_partial_fill_reprotects_the_actual_remainder(tmp_path):
@@ -5942,11 +6307,11 @@ Note: a partial `start` reads one snapshot to admit the quantity, so these tests
 - [ ] **Step 2: Run them to verify they fail**
 
 Run: `.venv/bin/python -m pytest tests/test_liquidation_service.py -q --timeout=30`
-Expected: 35 failed (`PARTIAL_CLOSE_UNAVAILABLE`, `AttributeError: ... 'upgrade_to_zero'`), 60 passed.
+Expected: 38 failed (`PARTIAL_CLOSE_UNAVAILABLE`, `AttributeError: ... 'upgrade_to_zero'`), 66 passed.
 
 - [ ] **Step 3: Implement**
 
-1. Import: `from trader.trading.order_correlation import liquidation_child_id, liquidation_child_kind, reprotect_oca_group`.
+1. Import: `from trader.trading.order_correlation import (legacy_reduce_prefix, liquidation_child_id, liquidation_child_kind, reprotect_oca_group)`.
 2. Replace `start` and `_claim_scoped_in_tx`, and add `_claim_scoped`, `upgrade_to_zero`, `_upgrade_run_in_tx` and `_admit_partial`:
 
 ```python
@@ -5971,7 +6336,8 @@ Expected: 35 failed (`PARTIAL_CLOSE_UNAVAILABLE`, `AttributeError: ... 'upgrade_
         else:
             raise ValueError(f"unknown liquidation scope {scope!r}")
         if outcome in (CLAIMED, "EXISTING"):
-            return self._tick(root)
+            with self._exclusive():
+                return self._tick(root)
         return self._store.receipt(root)
 
     def _claim_scoped(self, account_id, cause, conid, quantity, deadline, stop_price, target_price):
@@ -6081,7 +6447,7 @@ Expected: 35 failed (`PARTIAL_CLOSE_UNAVAILABLE`, `AttributeError: ... 'upgrade_
     def _on_deadline(self, receipt: LiquidationReceipt) -> LiquidationReceipt:
         """R31 / D10: a partial close whose protection is already cancelled escalates once to a
         full close of the live remainder, unless a child is UNKNOWN; everything else is FAILED_SAFE."""
-        unknown = any(c.state == "UNKNOWN" for c in receipt.children)
+        unknown = any(c.state == "UNKNOWN" for c in self._children_in_force(receipt))
         if (receipt.scope == "conid" and receipt.goal == "partial" and not receipt.escalated and not unknown
                 and receipt.phase in ("cancel", "reduce", "reprotect")):
             label = "REPROTECT_DEADLINE" if receipt.phase == "reprotect" else "PARTIAL_DEADLINE"
@@ -6247,7 +6613,12 @@ Expected: 35 failed (`PARTIAL_CLOSE_UNAVAILABLE`, `AttributeError: ... 'upgrade_
 
     def _advance_reprotect(self, receipt, snapshot, working, position) -> LiquidationReceipt:
         """R13, R26, R30: the legs' own rows decide; a normal exit ends CLOSED; a leg that
-        was refused, rejected, cancelled or lost is a re-protect failure (never sent again)."""
+        was refused, rejected, cancelled or lost is a re-protect failure (never sent again).
+
+        #22: DONE is decided from one read of each leg's row. A row that no
+        longer matches the child is observed again instead of finishing, and
+        the rows are read once more right before the terminal write.
+        """
         generation = int(snapshot.generation_id)
         stop, target = self._working_legs(receipt)
         if any(c.state == "UNKNOWN" for c in receipt.children):
@@ -6281,20 +6652,42 @@ Expected: 35 failed (`PARTIAL_CLOSE_UNAVAILABLE`, `AttributeError: ... 'upgrade_
         if generation <= max(leg.sent_generation or leg.fence_generation for leg in legs):
             return self._wait(receipt, generation, "awaiting a generation newer than the re-protect legs")
         side = _reducing_side(position.quantity)
-        for leg in legs:
-            row = self._leg_row(leg)
+        rows = [self._leg_row(leg) for leg in legs]
+        for leg, row in zip(legs, rows):
             linked = row is not None and getattr(row, "oca_group", None) == stop.oca_group \
                 and getattr(row, "oca_type", None) == 2 and getattr(row, "action", None) == side
             if not linked:
                 return self._escalate_now(
                     receipt, snapshot, f"REPROTECT_FAILED: {leg.child_id} is not a linked protective leg at the broker")
+        for leg, row in zip(legs, rows):
+            if self._leg_changed(leg, row):
+                receipt = self._observe_children(receipt, snapshot, int(self._dispatch.newest_generation()))
+                return self._wait(receipt, generation, f"{leg.child_id} changed since it was observed; observed again")
             if leg.outstanding_quantity != remaining:
                 return self._wait(receipt, generation,
                                   f"{leg.child_id} outstanding {leg.outstanding_quantity} != position {remaining}")
+        if [self._leg_fingerprint(self._leg_row(leg)) for leg in legs] != [self._leg_fingerprint(r) for r in rows]:
+            return self._wait(receipt, generation, "a re-protect leg changed while DONE was decided; reading it again")
         state = self._partial_outcome(receipt)
         detail = ("re-protect legs working in one OCA group for the remaining quantity" if state == "DONE" else
                   "the partial reduce sold nothing; the position is protected again, the close failed")
         return self._finish(receipt, state, generation_id=generation, remaining_quantity=remaining, detail=detail)
+
+    @staticmethod
+    def _leg_changed(leg: ChildRef, row) -> bool:
+        """#22: True when the leg's row no longer says what the WORKING child recorded."""
+        filled = float(getattr(row, "filled_quantity", 0.0) or 0.0)
+        total = float(getattr(row, "total_quantity", 0.0) or 0.0)
+        return (getattr(row, "status", None) not in _BROKER_ACCEPTED or filled != leg.filled_quantity
+                or max(total - filled, 0.0) != leg.outstanding_quantity)
+
+    @staticmethod
+    def _leg_fingerprint(row) -> Optional[tuple]:
+        """Everything DONE reads from a leg's row; it must not change before the terminal write (#22)."""
+        if row is None:
+            return None
+        return tuple(getattr(row, field, None) for field in
+                     ("status", "filled_quantity", "total_quantity", "oca_group", "oca_type", "action", "revision"))
 
     def _partial_outcome(self, receipt) -> str:
         """R25 / D4: protection restored is not the requested reduction. Only a proven fill is DONE."""
@@ -6341,7 +6734,7 @@ Notes: `_escalate` never captures a snapshot; `_escalate_now` continues on the s
 - [ ] **Step 4: Run the tests**
 
 Run: `.venv/bin/python -m pytest tests/test_liquidation_service.py -q --timeout=30`
-Expected: 95 passed.
+Expected: 104 passed.
 
 - [ ] **Step 5: Commit**
 
@@ -6517,12 +6910,29 @@ def test_account_claim_supersede_and_inheritance_commit_together_or_not_at_all(t
     assert (s.registry.get("p-1").state, s.registry.account_owner(ACCOUNT)) == ("ACTIVE", None)
     assert s.store.receipt("p-1").state != "SUPERSEDED" and s.store.receipt("kill-1") is None
     assert s.service.root_for("kill-1") is None
+
+
+def test_account_takeover_waits_for_a_generation_newer_than_the_scoped_roots_fill(tmp_path):
+    """Ruling 43: the scoped close's reduce filled on generation 2 and the cache still says 10.
+    The account flatten that takes over on generation 2 sends nothing until a newer one."""
+    s = _stack(tmp_path, [_snapshot(1, [_priced(10.0)])], protection=_Protection())
+    s.service.start(ACCOUNT, "c-1", DEADLINE, scope="conid", conid=1)
+    s.dispatch.rows["c-1-reduce-1-1"] = [_row("Filled", filled=10.0)]
+    s.push(_snapshot(2, [_priced(10.0)]))
+    s.service.rescan()                                        # gen 2: the fill is observed
+    s.service.start(ACCOUNT, "kill-1", DEADLINE)
+    assert s.store.receipt("c-1").state == "SUPERSEDED"
+    assert [c[0] for c in s.dispatch.calls] == ["reduce"]
+    s.push(_snapshot(3, []), _snapshot(4, []))
+    s.service.rescan()
+    assert s.service.receipt_for("kill-1").state == "FLAT"
+    assert [c[0] for c in s.dispatch.calls] == ["reduce"]
 ```
 
 - [ ] **Step 2: Run them to verify they fail**
 
 Run: `.venv/bin/python -m pytest tests/test_liquidation_service.py -q --timeout=30`
-Expected: 7 failed (the scoped runs are not `SUPERSEDED`, so they keep re-protecting and reducing), 97 passed. `test_later_scoped_close_inherits_the_unknown_child_of_a_failed_safe_close` and `test_account_claim_supersede_and_inheritance_commit_together_or_not_at_all` already pass: inheritance and the one-transaction claim came with Task 4; the tests pin them for the takeover.
+Expected: 7 failed (the scoped runs are not `SUPERSEDED`, so they keep re-protecting and reducing), 107 passed. `test_later_scoped_close_inherits_the_unknown_child_of_a_failed_safe_close`, `test_account_claim_supersede_and_inheritance_commit_together_or_not_at_all` and `test_account_takeover_waits_for_a_generation_newer_than_the_scoped_roots_fill` already pass: inheritance, the one-transaction claim and the fill watermark (ruling 43) came with Task 4; the tests pin them for the takeover.
 
 - [ ] **Step 3: Implement**
 
@@ -6562,7 +6972,7 @@ The supersede runs before `inherit_children_in_tx` in the same transaction, so t
 - [ ] **Step 4: Run the tests**
 
 Run: `.venv/bin/python -m pytest tests/test_liquidation_service.py -q --timeout=30`
-Expected: 104 passed.
+Expected: 114 passed.
 
 - [ ] **Step 5: Commit**
 
@@ -6734,7 +7144,7 @@ def test_a_full_close_during_an_unfinished_done_cleanup_starts_a_new_root(tmp_pa
 - [ ] **Step 2: Run them to verify they fail**
 
 Run: `.venv/bin/python -m pytest tests/test_liquidation_service.py -q --timeout=30`
-Expected: 2 failed — `test_time_exit_during_partial_close_upgrades_goal_and_ends_closed` (the registry says `zero`, the run still says `partial`, so it re-protects) and `test_upgraded_claim_and_run_change_commit_together_or_not_at_all` (nothing changes the run inside the claim, so the injected failure never happens); 112 passed. The other new tests pin rules that Tasks 3–7 already give (atomic claim, durable join, no revival of a superseded close, no join of a finished root).
+Expected: 2 failed — `test_time_exit_during_partial_close_upgrades_goal_and_ends_closed` (the registry says `zero`, the run still says `partial`, so it re-protects) and `test_upgraded_claim_and_run_change_commit_together_or_not_at_all` (nothing changes the run inside the claim, so the injected failure never happens); 122 passed. The other new tests pin rules that Tasks 3–7 already give (atomic claim, durable join, no revival of a superseded close, no join of a finished root).
 
 - [ ] **Step 3: Implement**
 
@@ -6769,7 +7179,7 @@ Import `UPGRADED` from `trader.trading.exit_owner` and replace `_claim_scoped_in
 - [ ] **Step 4: Run the tests**
 
 Run: `.venv/bin/python -m pytest tests/test_liquidation_service.py tests/test_exit_owner.py -q --timeout=30`
-Expected: 129 passed. Then the full suite: green.
+Expected: 139 passed. Then the full suite: green.
 
 - [ ] **Step 5: Commit**
 

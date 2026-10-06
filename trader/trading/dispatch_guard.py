@@ -55,6 +55,22 @@ def _working_order_fingerprint(snapshot) -> tuple:
     )
 
 
+def _unseen_in_flight_notional(evidence, snapshot) -> float:
+    """Notional of in-flight entries the broker snapshot does not show yet.
+
+    Once the broker shows the order group, the snapshot's working orders count
+    it, so it must not be counted twice.
+    """
+    visible_groups = {
+        row.order_group_id for row in snapshot.working_orders
+        if not row.deleted and row.order_group_id
+    }
+    return sum(
+        entry.notional for entry in evidence.in_flight_entries
+        if entry.order_group_id not in visible_groups
+    )
+
+
 class DispatchGuard:
     def __init__(
         self, *, broker, quotes, margin, controls, risk_gate,
@@ -84,6 +100,7 @@ class DispatchGuard:
                 )
             return
         try:
+            in_flight_notional = _unseen_in_flight_notional(evidence, current)
             authority = self._active_authority(current.account_id, evidence)
             decision = self._allocation_policy.revalidate_dispatch(
                 broker=current,
@@ -97,6 +114,7 @@ class DispatchGuard:
                 artifact_digest=evidence.artifact_digest,
                 authority_digest=evidence.authority_digest,
                 effective_gross_ceiling=evidence.effective_gross_ceiling,
+                in_flight_notional=in_flight_notional,
             )
         except Exception as exc:
             raise DispatchGuardError(

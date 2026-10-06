@@ -1460,3 +1460,271 @@ def test_an_old_leg_event_after_a_release_and_a_restart_changes_nothing(tmp_path
         "PROTECTED", before.protection_generation, before.current_groups)
     assert breaker.signals == []
     assert "og:stop-late:Inactive:0.0" in restarted.resume(intent.command_id).seen_event_ids
+
+
+
+
+# --- In-flight entries count toward gross (issue #49) -------------------------
+#
+# Budget: 6% of $100k = $6,000. A "4%" entry is 25 shares at a limit of
+# 160.09 ($4,002). Two of them would be 8%.
+
+OTHER_CONID = 272093
+ENTRY_SHARES = 25
+
+
+def _group_guard(snapshot, *, meet_other_thread=None):
+    """A real DispatchGuard whose broker always returns ``snapshot``.
+
+    ``meet_other_thread`` is a Barrier: the broker read waits for the other
+    handler, which reproduces both threads reading the same empty snapshot.
+    """
+    import threading
+    from trader.promotion.allocation_policy import AllocationPolicy
+    from trader.trading.command_policy import CommandAuthorityPolicy
+    from trader.trading.dispatch_guard import DispatchGuard
+
+    class Broker:
+        def capture(self, account_id):
+            if meet_other_thread is not None:
+                try:
+                    meet_other_thread.wait()
+                except threading.BrokenBarrierError:
+                    pass
+            return snapshot
+
+    class Quotes:
+        def executable_quote(self, conid, *, side):
+            return ExecutableQuote(
+                conid=conid, side="ask", price=160.01, market_timestamp=NOW,
+                feed_type="live", session_state="continuous", bid=159.99, ask=160.01,
+            )
+
+    class Margin:
+        def what_if_margin(self, conid, side, quantity):
+            return {"initMarginAfter": 1000.0, "equityWithLoanAfter": 99_000.0}
+
+    return DispatchGuard(
+        broker=Broker(), quotes=Quotes(), margin=Margin(),
+        controls=SimpleNamespace(require_unpaused=lambda account_id: None),
+        risk_gate=SimpleNamespace(
+            check_leverage=lambda margin, net_liq: SimpleNamespace(approved=True, reason=""),
+        ),
+        policy=CommandAuthorityPolicy(
+            enabled=True, live_enabled=False, live_account_id=None,
+            max_order_notional=25_000.0, max_drift_bps=50.0,
+        ),
+        account_id=ACCOUNT, account_mode="paper",
+        allocation_policy=AllocationPolicy(now=lambda: NOW),
+        allocation_authority_lookup=lambda account, artifact: None,
+    )
+
+
+def _entry(conid, shares=ENTRY_SHARES, signal="s"):
+    return make_intent(
+        conid=conid, requested_quantity=Decimal(shares), signal_id=f"{signal}-{conid}-{shares}",
+    )
+
+
+def _entry_approval(intent, snapshot, *, side="BUY", direction=RiskDirection.INCREASING):
+    from dataclasses import replace as dc_replace
+
+    return dc_replace(
+        make_approval(quantity=float(intent.requested_quantity), price=160.01, side=side),
+        conid=intent.conid, broker=snapshot, risk_direction=direction,
+    )
+
+
+def _start_entry(saga, intent, snapshot, **approval_kwargs):
+    return _start_saga(saga, intent, _entry_approval(intent, snapshot, **approval_kwargs))
+
+
+def _sized_risk(shares=ENTRY_SHARES):
+    return FakeSessionRisk(quantity=Decimal(shares), effective_gross_ceiling=0.06)
+
+
+def _working_entry(order_group_id, conid, shares=ENTRY_SHARES):
+    from trader.data.broker_state import BrokerOrderRow
+
+    return BrokerOrderRow(
+        order_entity_id=f"order-{order_group_id}", account_id=ACCOUNT, conid=conid,
+        symbol="X", order_group_id=order_group_id, leg="entry", is_external=False,
+        action="BUY", order_type="LMT", total_quantity=float(shares), filled_quantity=0.0,
+        avg_fill_price=None, limit_price=160.09, stop_price=None, tif="DAY",
+        status="Submitted", deleted=False, revision=1, source_timestamp=NOW,
+    )
+
+
+def test_two_concurrent_entries_on_different_conids_cannot_both_exceed_the_budget(tmp_path):
+    import threading
+
+    snapshot = _snapshot()
+    guard = _group_guard(snapshot, meet_other_thread=threading.Barrier(2, timeout=1.0))
+    saga, _, _, dispatch, *_ = _build_saga(tmp_path, guard=guard, risk=_sized_risk())
+    intents = [_entry(CONID), _entry(OTHER_CONID)]
+    results: dict[str, Any] = {}
+
+    def handle(intent):
+        results[intent.command_id] = _start_entry(saga, intent, snapshot)
+
+    threads = [threading.Thread(target=handle, args=(intent,)) for intent in intents]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join(timeout=10)
+
+    assert len(dispatch.calls) == 1
+    states = sorted(results.values(), key=lambda state: state.state)
+    assert [state.state for state in states] == ["CLOSED", "SUBMITTING"]
+    assert states[0].error_code == "GROSS_EXPOSURE_IN_FLIGHT"
+
+
+def test_refused_entry_releases_its_reservation(tmp_path):
+    snapshot = _snapshot()
+    saga, _, _, dispatch, *_ = _build_saga(
+        tmp_path, guard=_group_guard(snapshot), risk=_sized_risk(),
+    )
+    dispatch.reject_with("broker said no")
+
+    refused = _start_entry(saga, _entry(CONID), snapshot)
+    assert refused.state == "CLOSED"
+    assert refused.error_code == "BROKER_REJECTED"
+
+    dispatch._reject = None
+    later = _start_entry(saga, _entry(OTHER_CONID), snapshot)
+    assert later.state == "SUBMITTING"
+    assert len(dispatch.calls) == 1
+
+
+def test_cancelled_entry_releases_its_reservation(tmp_path):
+    from trader.automation.protective_order_saga import BrokerOrderEvent
+
+    snapshot = _snapshot()
+    saga, _, _, dispatch, *_ = _build_saga(
+        tmp_path, guard=_group_guard(snapshot), risk=_sized_risk(),
+    )
+    first = _start_entry(saga, _entry(CONID), snapshot)
+    assert first.state == "SUBMITTING"
+    assert _start_entry(saga, _entry(OTHER_CONID), snapshot).error_code == (
+        "GROSS_EXPOSURE_IN_FLIGHT"
+    )
+
+    saga.on_broker_event(BrokerOrderEvent(
+        order_group_id=first.order_group_id, leg="entry", status="Cancelled",
+        filled_quantity=0, total_quantity=ENTRY_SHARES, order_id=5001,
+        event_id="cancel-1", source_timestamp=NOW,
+    ))
+
+    later = _start_entry(saga, _entry(OTHER_CONID, signal="retry"), snapshot)
+    assert later.state == "SUBMITTING"
+    assert len(dispatch.calls) == 2
+
+
+def test_pending_reservation_survives_restart_and_is_reconciled_from_broker(tmp_path):
+    from trader.automation.protective_order_saga import BrokerOrderEvent
+
+    empty = _snapshot()
+    saga, _, _, dispatch, *_ = _build_saga(
+        tmp_path, guard=_group_guard(empty), risk=_sized_risk(),
+    )
+    dispatch.raise_on_submit(TimeoutError("socket closed mid-send"))
+    unknown = _start_entry(saga, _entry(CONID), empty)
+    assert unknown.state == "OUTCOME_UNKNOWN"
+
+    # Restart: a fresh saga on the same journal still counts the unknown entry.
+    restarted, _, _, dispatch2, *_ = _build_saga(
+        tmp_path, guard=_group_guard(empty), risk=_sized_risk(),
+    )
+    refused = _start_entry(restarted, _entry(OTHER_CONID), empty)
+    assert refused.error_code == "GROSS_EXPOSURE_IN_FLIGHT"
+    assert dispatch2.calls == []
+
+    # The broker now shows the order: it is counted once, by the broker.
+    visible = replace_snapshot(empty, working_orders=(
+        _working_entry(unknown.order_group_id, CONID),
+    ))
+    seen, _, _, dispatch3, *_ = _build_saga(
+        tmp_path, guard=_group_guard(visible), risk=_sized_risk(6),
+    )
+    small = _start_entry(seen, _entry(OTHER_CONID, shares=6), visible)
+    assert small.state == "SUBMITTING"  # 4% + 1% fits; double counting would refuse it
+
+    # The broker cancels the unknown entry: its reservation is released.
+    seen.on_broker_event(BrokerOrderEvent(
+        order_group_id=unknown.order_group_id, leg="entry", status="Cancelled",
+        filled_quantity=0, total_quantity=ENTRY_SHARES, order_id=5001,
+        event_id="cancel-unknown", source_timestamp=NOW,
+    ))
+    seen.on_broker_event(BrokerOrderEvent(
+        order_group_id=small.order_group_id, leg="entry", status="Cancelled",
+        filled_quantity=0, total_quantity=6, order_id=5002,
+        event_id="cancel-small", source_timestamp=NOW,
+    ))
+    final, _, _, dispatch4, *_ = _build_saga(
+        tmp_path, guard=_group_guard(empty), risk=_sized_risk(),
+    )
+    assert _start_entry(final, _entry(OTHER_CONID, signal="after"), empty).state == "SUBMITTING"
+    assert len(dispatch4.calls) == 1
+
+
+def replace_snapshot(snapshot, **changes):
+    from dataclasses import replace as dc_replace
+
+    return dc_replace(snapshot, **changes)
+
+
+def test_reduction_is_never_blocked_by_reservations(tmp_path):
+    from trader.data.broker_state import BrokerPositionRow
+
+    empty = _snapshot()
+    saga, _, _, dispatch, *_ = _build_saga(
+        tmp_path, guard=_group_guard(empty), risk=_sized_risk(37),
+    )
+    # 37 shares at 160.09 = 5.9%: the budget is fully reserved.
+    assert _start_entry(saga, _entry(CONID, shares=37), empty).state == "SUBMITTING"
+
+    held = replace_snapshot(empty, positions=(BrokerPositionRow(
+        account_id=ACCOUNT, conid=OTHER_CONID, symbol="X", sec_type="STK",
+        exchange="SMART", currency="USD", quantity=10.0, average_cost=150.0,
+        market_price=160.0, market_value=1600.0, unrealized_pnl=0.0,
+        realized_pnl=0.0, daily_pnl=0.0, deleted=False, revision=1,
+        source_timestamp=NOW,
+    ),))
+    reducer, _, _, dispatch2, *_ = _build_saga(
+        tmp_path, guard=_group_guard(held), risk=_sized_risk(10),
+    )
+
+    def unreadable(account_id, exclude_command_id):
+        raise RuntimeError("journal locked")
+
+    reducer._store.in_flight_entries = unreadable  # a reduction must not need it
+    sell = make_intent(
+        conid=OTHER_CONID, side="SELL", requested_quantity=Decimal(10), signal_id="exit",
+        stop_policy=StopPolicy(stop_price=Decimal("170"), order_type="STP"),
+        target_policy=None,
+    )
+
+    state = _start_entry(
+        reducer, sell, held, side="SELL", direction=RiskDirection.REDUCING,
+    )
+
+    assert state.state == "SUBMITTING"
+    assert len(dispatch2.calls) == 1
+
+
+def test_unreadable_reservations_refuse_the_entry(tmp_path):
+    snapshot = _snapshot()
+    saga, _, _, dispatch, *_ = _build_saga(
+        tmp_path, guard=_group_guard(snapshot), risk=_sized_risk(),
+    )
+
+    def unreadable(account_id, exclude_command_id):
+        raise RuntimeError("journal locked")
+
+    saga._store.in_flight_entries = unreadable
+
+    state = _start_entry(saga, _entry(CONID), snapshot)
+
+    assert state.state == "CLOSED"
+    assert state.error_code == "IN_FLIGHT_STATE_UNAVAILABLE"
+    assert dispatch.calls == []

@@ -32,6 +32,20 @@ class ApprovalContextError(RuntimeError):
 
 
 @dataclass(frozen=True)
+class InFlightEntry:
+    """An automated entry that may be at the broker but is not yet in its snapshot."""
+
+    order_group_id: str
+    conid: int
+    remaining_quantity: float
+    limit_price: float
+
+    @property
+    def notional(self) -> float:
+        return self.remaining_quantity * self.limit_price
+
+
+@dataclass(frozen=True)
 class AllocationDispatchEvidence:
     """Signed allocation context frozen at initial risk approval."""
 
@@ -42,6 +56,9 @@ class AllocationDispatchEvidence:
     # Price of the entry order the saga will send. Gross is re-checked at the
     # higher of this and the fresh quote.
     entry_limit_price: Optional[float] = None
+    # Other entries already committed for this account (read under the saga's
+    # account lock). They count toward gross until the broker snapshot shows them.
+    in_flight_entries: tuple[InFlightEntry, ...] = ()
 
 
 @dataclass(frozen=True)

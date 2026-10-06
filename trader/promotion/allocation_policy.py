@@ -298,8 +298,15 @@ class AllocationPolicy:
         artifact_digest: str,
         authority_digest: Optional[str],
         effective_gross_ceiling: float,
+        in_flight_notional: float = 0.0,
     ) -> AllocationDecision:
-        """Immediate pre-dispatch gross re-check against a fresh broker snapshot."""
+        """Immediate pre-dispatch gross re-check against a fresh broker snapshot.
+
+        ``in_flight_notional`` is entries already committed for the account
+        that the snapshot does not show yet; it counts toward gross.
+        """
+        if not _finite(in_flight_notional) or in_flight_notional < 0:
+            raise ValueError(f"invalid in-flight notional {in_flight_notional!r}")
         reasons: list[str] = []
         if broker.generation_id < approved_broker.generation_id:
             reasons.append("BROKER_GENERATION_STALE")
@@ -339,8 +346,9 @@ class AllocationPolicy:
             )
 
         prices = {conid: float(entry_price)}
-        current_notional, pending_reasons = compute_gross_notional(broker, quote_prices=prices)
+        broker_notional, pending_reasons = compute_gross_notional(broker, quote_prices=prices)
         reasons.extend(pending_reasons)
+        current_notional = broker_notional + in_flight_notional
         current_frac = current_notional / equity
 
         projected_frac: Optional[float] = None
@@ -350,11 +358,15 @@ class AllocationPolicy:
             projected_frac = projected_notional / equity
             if projected_frac > effective + 1e-15:
                 fitted_at_approval = projected_frac <= effective_gross_ceiling + 1e-15
-                reasons.append(
-                    "LIMIT_TIGHTENED_BEFORE_DISPATCH"
-                    if ceiling_tightened and fitted_at_approval
-                    else "GROSS_EXPOSURE"
+                fits_without_in_flight = (
+                    (projected_notional - in_flight_notional) / equity <= effective + 1e-15
                 )
+                if ceiling_tightened and fitted_at_approval:
+                    reasons.append("LIMIT_TIGHTENED_BEFORE_DISPATCH")
+                elif fits_without_in_flight:
+                    reasons.append("GROSS_EXPOSURE_IN_FLIGHT")
+                else:
+                    reasons.append("GROSS_EXPOSURE")
 
         unique = tuple(dict.fromkeys(reasons))
         return AllocationDecision(

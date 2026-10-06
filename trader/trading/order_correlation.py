@@ -36,6 +36,17 @@ _LIQUIDATION_CHILD = re.compile(r"-(cancel|reduce|reprotect-stop|reprotect-targe
 _LEGACY_REDUCE = re.compile(r"-liquidation-reduce-(\d+)$")
 
 
+def legacy_reduce_prefix(run_id: str) -> str:
+    """Prefix of every reduce ref a pre-SP1 run may have sent, whatever the conid."""
+    return f"{run_id}-liquidation-reduce-"
+
+
+def matches_legacy_reduce(order_group_id: Optional[str], prefix: str) -> bool:
+    """True for ``{prefix}{conid}``: the prefix followed by digits only."""
+    group = order_group_id or ""
+    return group.startswith(prefix) and group[len(prefix):].isdigit()
+
+
 def liquidation_child_id(root_id: str, kind: str, conid: int, attempt: int) -> str:
     """Deterministic, colon-free id of one liquidation child order.
 

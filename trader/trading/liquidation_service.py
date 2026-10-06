@@ -30,7 +30,9 @@ from trader.trading.exit_owner import (
     CLAIMED, JOINED_FLATTEN, STATE_ACTIVE, STATE_FAILED_SAFE, STATE_RELEASED, UPGRADED, ExitOwnerRegistry,
     apply_exit_owner_migration,
 )
-from trader.trading.order_correlation import liquidation_child_id, liquidation_child_kind, reprotect_oca_group
+from trader.trading.order_correlation import (
+    legacy_reduce_prefix, liquidation_child_id, liquidation_child_kind, reprotect_oca_group,
+)
 
 log = logging.getLogger(__name__)
 
@@ -69,8 +71,10 @@ def apply_liquidation_migration(migrator: SchemaMigrator) -> None:
     account owner, in phase ``legacy`` (it acts only on a broker generation
     opened after the upgrade); other open runs of that account are SUPERSEDED
     by it. Every old run that did not end FLAT is marked ``pre_sp1_open``: it
-    may have sent a reduce the journal does not know (N2). Exit owners
-    (migration 35) are applied first.
+    may have sent a reduce the journal does not know (N2). Such a run is
+    tracked by one wildcard child (``ref_prefix`` set, ``conid`` NULL), because
+    old runs record no conids (ruling 42). Exit owners (migration 35) are
+    applied first.
     """
     migrator.apply(LIQUIDATION_MIGRATION_VERSION, "p1_liquidation_runs", (
         """CREATE TABLE IF NOT EXISTS liquidation_runs (
@@ -100,7 +104,7 @@ def apply_liquidation_migration(migrator: SchemaMigrator) -> None:
             root_id VARCHAR NOT NULL,
             owner_root_id VARCHAR NOT NULL,
             account_id VARCHAR NOT NULL,
-            conid INTEGER NOT NULL,
+            conid INTEGER,
             kind VARCHAR NOT NULL,
             attempt INTEGER NOT NULL,
             state VARCHAR NOT NULL,
@@ -116,6 +120,7 @@ def apply_liquidation_migration(migrator: SchemaMigrator) -> None:
             observed_generation BIGINT,
             sent_generation BIGINT,
             order_entity_id VARCHAR,
+            ref_prefix VARCHAR,
             updated_at TIMESTAMPTZ NOT NULL
         )""",
         "CREATE INDEX IF NOT EXISTS idx_liquidation_children_owner ON liquidation_children(owner_root_id)",
@@ -200,6 +205,7 @@ class LiquidationDispatchPort(Protocol):
     def place_exit_leg(self, position: Any, *, leg: str, quantity: float, price: float,
                        oca_group: str, child_id: str) -> None: ...
     def find_orders(self, account_id: str, child_id: str) -> list: ...
+    def find_orders_with_prefix(self, account_id: str, prefix: str) -> list: ...
     def get_order(self, order_entity_id: str) -> Optional[Any]: ...
     def enumeration_complete(self) -> bool: ...
     def newest_generation(self) -> int: ...
@@ -248,7 +254,7 @@ class ChildRef:
     root_id: str                  # root that wrote it
     owner_root_id: str            # root that must reconcile it now (R9 inheritance)
     account_id: str
-    conid: int
+    conid: Optional[int]          # None only for a pre-SP1 wildcard child
     kind: str                     # cancel | reduce | reprotect-stop | reprotect-target
     attempt: int
     state: str                    # see CHILD_STATES
@@ -264,6 +270,7 @@ class ChildRef:
     observed_generation: Optional[int] = None   # newest generation (staging included) when last observed
     sent_generation: Optional[int] = None       # newest generation (staging included) right after the send
     order_entity_id: Optional[str] = None       # the broker row of this child's own order
+    ref_prefix: Optional[str] = None            # pre-SP1 wildcard: every ref {prefix}{conid} (ruling 42)
 
     @property
     def fill_bearing(self) -> bool:
@@ -336,7 +343,7 @@ _CHILD_COLUMNS = (
     "child_id", "root_id", "owner_root_id", "account_id", "conid", "kind", "attempt", "state",
     "fence_generation", "side", "quantity", "price", "oca_group", "target_order_entity_id",
     "filled_at_send", "filled_quantity", "outstanding_quantity", "observed_generation",
-    "sent_generation", "order_entity_id",
+    "sent_generation", "order_entity_id", "ref_prefix",
 )
 _JOIN_COLUMNS = ("command_id", "root_id", "account_id", "conid", "outcome", "requested_goal",
                  "requested_quantity")
@@ -359,7 +366,7 @@ def _run_from_row(row) -> LiquidationReceipt:
 
 def _child_from_row(row) -> ChildRef:
     values = dict(zip(_CHILD_COLUMNS, row))
-    values["conid"] = int(values["conid"])
+    values["conid"] = None if values["conid"] is None else int(values["conid"])
     values["attempt"] = int(values["attempt"])
     values["fence_generation"] = int(values["fence_generation"])
     return ChildRef(**values)
@@ -403,14 +410,21 @@ class LiquidationRunStore:
             [getattr(receipt, c) for c in _RUN_COLUMNS[1:]] + [now, receipt.cause_command_id])
 
     def pre_sp1_roots_in_tx(self, conn, account_id: str) -> list[str]:
-        """Runs from before the upgrade whose old reduces are not tracked yet (N2)."""
+        """Runs from before the upgrade whose old reduces are not settled yet (N2, ruling 42)."""
         return [r[0] for r in conn.execute(
             "SELECT cause_command_id FROM liquidation_runs WHERE account_id = ? AND pre_sp1_open "
             "ORDER BY updated_at, cause_command_id", [account_id]).fetchall()]
 
-    def mark_pre_sp1_tracked_in_tx(self, conn, root_ids: list[str]) -> None:
-        for root_id in root_ids:
-            conn.execute("UPDATE liquidation_runs SET pre_sp1_open = FALSE WHERE cause_command_id = ?", [root_id])
+    def clear_pre_sp1_mark_in_tx(self, conn, run_id: str) -> None:
+        """Only in the transaction that settles the run's wildcard child (ruling 42)."""
+        conn.execute("UPDATE liquidation_runs SET pre_sp1_open = FALSE WHERE cause_command_id = ?", [run_id])
+
+    def legacy_reduces_in_tx(self, conn, account_id: str) -> tuple[ChildRef, ...]:
+        """Every wildcard child of the account, whoever owns it (ruling 42)."""
+        rows = conn.execute(
+            f"SELECT {', '.join(_CHILD_COLUMNS)} FROM liquidation_children "
+            "WHERE account_id = ? AND ref_prefix IS NOT NULL ORDER BY child_id", [account_id]).fetchall()
+        return tuple(_child_from_row(r) for r in rows)
 
     def roots_to_advance_in_tx(self, conn) -> list[str]:
         """Roots with unfinished cleanup first, then every non-terminal root."""
@@ -846,7 +860,7 @@ class LiquidationService:
     def _on_deadline(self, receipt: LiquidationReceipt) -> LiquidationReceipt:
         """R31 / D10: a partial close whose protection is already cancelled escalates once to a
         full close of the live remainder, unless a child is UNKNOWN; everything else is FAILED_SAFE."""
-        unknown = any(c.state == "UNKNOWN" for c in receipt.children)
+        unknown = any(c.state == "UNKNOWN" for c in self._children_in_force(receipt))
         if (receipt.scope == "conid" and receipt.goal == "partial" and not receipt.escalated and not unknown
                 and receipt.phase in ("cancel", "reduce", "reprotect")):
             label = "REPROTECT_DEADLINE" if receipt.phase == "reprotect" else "PARTIAL_DEADLINE"
@@ -872,41 +886,33 @@ class LiquidationService:
                 for child in unfenced:
                     self._store.update_child_in_tx(conn, child, self._now())
             self._store.transaction(write)
-        tracked = self._track_pre_sp1_reduces(receipt, snapshot, newest)
+        tracked = self._track_pre_sp1_reduces(receipt, newest)
         if receipt.phase == "legacy":
             return self._adopt_legacy(receipt, newest)
         return self._store.receipt(receipt.cause_command_id) if unfenced or tracked else receipt
 
-    def _track_pre_sp1_reduces(self, receipt, snapshot, newest: int) -> bool:
-        """R29 / N2: a run from before the upgrade may have sent a reduce the journal does not know.
+    def _track_pre_sp1_reduces(self, receipt, newest: int) -> bool:
+        """R29 / N2, ruling 42: a run from before the upgrade may have sent reduces the journal does not know.
 
-        For every run of the account that was open or FAILED_SAFE at the
-        upgrade (the adopted one, the ones it superseded, old FAILED_SAFE
-        ones) and every position the account holds now, the old service's
-        reduce (ref ``{run}-liquidation-reduce-{conid}``) becomes an UNKNOWN
-        child of this root, fenced on ``newest``: its own row, or a complete
-        enumeration opened after that, must settle it before any new reduce.
-        An account root marks those runs tracked; a conid root tracks only its
-        conid and leaves them for the next account root.
+        Old runs record no conids, so each run of the account that is still
+        marked ``pre_sp1_open`` becomes ONE wildcard ``UNKNOWN`` child of this
+        root: it stands for every ref ``{run}-liquidation-reduce-{conid}``,
+        fenced on ``newest``. The snapshot's positions are not used: a
+        missing position is never evidence. The mark is cleared only when the
+        child settles (``_observe_children``), never here.
         """
         def write(conn):
-            old_runs = self._store.pre_sp1_roots_in_tx(conn, receipt.account_id)
             added = False
-            for old in old_runs:
-                for p in snapshot.positions:
-                    if float(p.quantity) == 0.0 or (receipt.conid is not None and int(p.conid) != receipt.conid):
-                        continue
-                    child_id = f"{old}-liquidation-reduce-{int(p.conid)}"
-                    if self._store.child_in_tx(conn, child_id) is not None:
-                        continue
-                    self._store.insert_child_in_tx(conn, ChildRef(
-                        child_id=child_id, root_id=old, owner_root_id=receipt.cause_command_id,
-                        account_id=receipt.account_id, conid=int(p.conid), kind="reduce", attempt=0,
-                        state="UNKNOWN", fence_generation=newest, side=_reducing_side(p.quantity),
-                        quantity=abs(float(p.quantity)), sent_generation=newest), self._now())
-                    added = True
-            if receipt.scope == "account":
-                self._store.mark_pre_sp1_tracked_in_tx(conn, old_runs)
+            for old in self._store.pre_sp1_roots_in_tx(conn, receipt.account_id):
+                prefix = legacy_reduce_prefix(old)
+                child_id = f"{prefix}*"
+                if self._store.child_in_tx(conn, child_id) is not None:
+                    continue
+                self._store.insert_child_in_tx(conn, ChildRef(
+                    child_id=child_id, root_id=old, owner_root_id=receipt.cause_command_id,
+                    account_id=receipt.account_id, conid=None, kind="reduce", attempt=0, state="UNKNOWN",
+                    fence_generation=newest, sent_generation=newest, ref_prefix=prefix), self._now())
+                added = True
             return added
         return self._store.transaction(write)
 
@@ -917,8 +923,13 @@ class LiquidationService:
                          detail="adopted at the upgrade; old reduces are unknown until the broker settles them")
 
     def _observe_children(self, receipt, snapshot, newest: int) -> LiquidationReceipt:
+        """Classify this root's open children and every open wildcard child of its account.
+
+        A wildcard child that settles clears its run's ``pre_sp1_open`` mark
+        in the same transaction (ruling 42).
+        """
         generation = int(snapshot.generation_id)
-        changed = [observed for child in receipt.children if child.state in ("UNKNOWN", "WORKING")
+        changed = [observed for child in self._children_in_force(receipt) if child.state in ("UNKNOWN", "WORKING")
                    for observed in (self._evidence(child, generation, newest),) if observed != child]
         if not changed:
             return receipt
@@ -926,8 +937,16 @@ class LiquidationService:
         def write(conn):
             for child in changed:
                 self._store.update_child_in_tx(conn, child, self._now())
+                if child.ref_prefix is not None and child.state in CHILD_TERMINAL:
+                    self._store.clear_pre_sp1_mark_in_tx(conn, child.root_id)
         self._store.transaction(write)
         return self._store.receipt(receipt.cause_command_id)
+
+    def _children_in_force(self, receipt) -> tuple[ChildRef, ...]:
+        """The root's own children plus every wildcard child of its account, whoever owns it (ruling 42)."""
+        own = {c.child_id for c in receipt.children}
+        legacy = self._store.transaction(lambda conn: self._store.legacy_reduces_in_tx(conn, receipt.account_id))
+        return receipt.children + tuple(c for c in legacy if c.child_id not in own)
 
     def _evidence(self, child: ChildRef, generation: int, newest: int) -> ChildRef:
         """Classify one child from its own broker row (R4, D1, D2).
@@ -936,6 +955,8 @@ class LiquidationService:
         is absence only when a complete enumeration opened after the child's
         send fence shows nothing; otherwise the child stays as it is.
         """
+        if child.ref_prefix is not None:
+            return self._legacy_evidence(child, generation, newest)
         if child.kind == "cancel":
             row = self._dispatch.get_order(child.target_order_entity_id)
             rows = [] if row is None or getattr(row, "deleted", False) else [row]
@@ -965,6 +986,28 @@ class LiquidationService:
         return replace(child, state=state, filled_quantity=filled, outstanding_quantity=outstanding,
                        order_entity_id=entity, observed_generation=newest)
 
+    def _legacy_evidence(self, child: ChildRef, generation: int, newest: int) -> ChildRef:
+        """Ruling 42: a wildcard child settles only on positive evidence for every conid at once.
+
+        Every broker row matching the prefix must be terminal AND a complete
+        enumeration on a generation newer than the fence must hold, even when
+        rows are terminal: another conid's old reduce may still be invisible.
+        A visible working row keeps the child WORKING; it is waited on, never
+        cancelled.
+        """
+        rows = list(self._dispatch.find_orders_with_prefix(child.account_id, child.ref_prefix))
+        statuses = [getattr(r, "status", None) for r in rows]
+        filled = sum(float(getattr(r, "filled_quantity", 0.0) or 0.0) for r in rows)
+        if any(s not in _BROKER_TERMINAL for s in statuses):
+            state = "WORKING" if any(s in _BROKER_ACCEPTED for s in statuses) else "UNKNOWN"
+        elif generation > child.sent_generation and self._dispatch.enumeration_complete():
+            state = "ABSENT" if not rows else ("FILLED" if filled > 0 else "CANCELLED")
+        else:
+            state = "UNKNOWN"
+        if (state, filled) == (child.state, child.filled_quantity):
+            return child
+        return replace(child, state=state, filled_quantity=filled, observed_generation=newest)
+
     @staticmethod
     def _fresh(receipt, generation: int) -> bool:
         """R5: sizing needs a generation newer than every fill this root observed."""
@@ -972,7 +1015,11 @@ class LiquidationService:
                    if c.fill_bearing and c.observed_generation is not None)
 
     def _blocking(self, receipt, generation: int) -> Optional[str]:
-        """R5, D2: a child that is unknown or still working stops every new reduce."""
+        """R5, D2: a child that is unknown or still working stops every new reduce.
+
+        Ruling 42: so does every wildcard child of the account, whoever owns it.
+        """
+        receipt = replace(receipt, children=self._children_in_force(receipt))
         for child in receipt.children:
             if child.state == "UNKNOWN":
                 return f"{child.child_id} outcome unknown"

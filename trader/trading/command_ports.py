@@ -33,6 +33,7 @@ from typing import Any, Callable, Iterable, Optional
 from ib_async import Order
 
 from trader.data.broker_state import BrokerRiskSnapshotError
+from trader.trading.order_correlation import matches_legacy_reduce
 from trader.trading.proposal_command_service import ExecutableQuote
 
 logger = logging.getLogger(__name__)
@@ -392,3 +393,10 @@ def orders_matching_group(rows: Iterable[Any], account_id: str,
     return [r for r in rows
             if getattr(r, "account_id", None) == account_id
             and getattr(r, "order_group_id", None) == order_group_id]
+
+
+def orders_matching_legacy_reduces(rows: Iterable[Any], account_id: str, prefix: str) -> list:
+    """Broker rows for (account, ``{prefix}{conid}``) of any conid: a pre-SP1 run's reduces."""
+    return [r for r in rows
+            if getattr(r, "account_id", None) == account_id
+            and matches_legacy_reduce(getattr(r, "order_group_id", None), prefix)]

@@ -2689,6 +2689,10 @@ class TradingRuntimeOrderDispatch:
             return []
         return orders_matching_group(self._active_order_rows(), account_id, group)
 
+    def find_legacy_reduces(self, account_id: str, prefix: str) -> list:
+        from trader.trading.command_ports import orders_matching_legacy_reduces
+        return orders_matching_legacy_reduces(self._active_order_rows(), account_id, prefix)
+
     def _open_trades(self) -> list:
         ib = getattr(getattr(self._trader, 'client', None), 'ib', None)
         return list(ib.openTrades()) if ib is not None else []

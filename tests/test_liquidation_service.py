@@ -14,6 +14,7 @@ from trader.trading.liquidation_service import (
     ChildRef, DispatchRefused, LiquidationBusy, LiquidationReceipt, LiquidationRunStore, LiquidationService,
     RunStateError, apply_liquidation_migration,
 )
+from trader.trading.order_correlation import matches_legacy_reduce
 
 
 UTC = dt.timezone.utc
@@ -107,6 +108,9 @@ class _Dispatch:
 
     def find_orders(self, account_id, child_id):
         return list(self.rows.get(child_id, []))
+
+    def find_orders_with_prefix(self, account_id, prefix):
+        return [row for ref, rows in self.rows.items() if matches_legacy_reduce(ref, prefix) for row in rows]
 
     def get_order(self, order_entity_id):
         return self.entities.get(order_entity_id)
@@ -327,17 +331,19 @@ def test_migration_36_adds_safe_close_columns_children_and_joins(tmp_path):
     assert {"command_id", "root_id", "outcome", "requested_goal"} <= join_cols
 
 
-def _legacy_db(tmp_path):
-    """A journal as it was before SP1: migration 25 only, with old runs."""
+_LEGACY_RUNS = (("old-flat", "FLAT", 1), ("old-failed", "FAILED_SAFE", 2), ("open-a", "OUTCOME_UNKNOWN", 3),
+                ("open-b", "VERIFYING", 4), ("open-c", "REQUESTED", 5))
+
+
+def _legacy_db(tmp_path, runs=_LEGACY_RUNS):
+    """A journal as it was before SP1: migration 25 only, with old runs (root, state, minute)."""
     db = DuckDBConnection.get_instance(str(tmp_path / "liq.duckdb"))
     migrator = SchemaMigrator(db)
     migrator.apply(25, "p1_liquidation_runs", ("""CREATE TABLE IF NOT EXISTS liquidation_runs (
         cause_command_id VARCHAR PRIMARY KEY, account_id VARCHAR NOT NULL, state VARCHAR NOT NULL,
         deadline TIMESTAMPTZ NOT NULL, generation_id BIGINT, detail VARCHAR NOT NULL,
         updated_at TIMESTAMPTZ NOT NULL)""",))
-    for root, state, minute in (("old-flat", "FLAT", 1), ("old-failed", "FAILED_SAFE", 2),
-                                ("open-a", "OUTCOME_UNKNOWN", 3), ("open-b", "VERIFYING", 4),
-                                ("open-c", "REQUESTED", 5)):
+    for root, state, minute in runs:
         db.execute("INSERT INTO liquidation_runs VALUES (?, ?, ?, ?, 1, 'x', ?)",
                    [root, ACCOUNT, state, DEADLINE, NOW + dt.timedelta(minutes=minute)], fetch="none")
     return db
@@ -363,8 +369,8 @@ def test_an_adopted_run_settles_its_old_reduce_before_any_new_reduce_across_two_
     s.service.rescan()                                      # adopt: old reduce of conid 1 is UNKNOWN
     adopted = s.service.receipt_for("open-a")
     assert {(c.child_id, c.state, c.sent_generation) for c in adopted.children} == {
-        (child, "UNKNOWN", 5) for child in ("open-a-liquidation-reduce-1", "open-b-liquidation-reduce-1",
-                                            "open-c-liquidation-reduce-1", "old-failed-liquidation-reduce-1")}
+        (child, "UNKNOWN", 5) for child in ("open-a-liquidation-reduce-*", "open-b-liquidation-reduce-*",
+                                            "open-c-liquidation-reduce-*", "old-failed-liquidation-reduce-*")}
     s.service.rescan()
     s.restart()
     s.push(_snapshot(6, [_position()]))
@@ -856,8 +862,8 @@ def test_rescan_returns_none_when_only_failed_safe_roots_remain(tmp_path):
 # Round-2 verification fixes (N2, R2-5): every pre-upgrade run's old reduce is tracked
 # ---------------------------------------------------------------------------
 
-_OLD_REDUCES = {"open-a-liquidation-reduce-1", "open-b-liquidation-reduce-1",
-                "open-c-liquidation-reduce-1", "old-failed-liquidation-reduce-1"}
+_OLD_REDUCES = {"open-a-liquidation-reduce-*", "open-b-liquidation-reduce-*",
+                "open-c-liquidation-reduce-*", "old-failed-liquidation-reduce-*"}
 
 
 def test_a_superseded_legacy_runs_invisible_reduce_blocks_the_adopted_root(tmp_path):
@@ -899,11 +905,58 @@ def test_old_failed_safe_runs_reduces_are_tracked_even_with_no_run_open_at_the_u
     db.execute("DELETE FROM liquidation_runs WHERE cause_command_id LIKE 'open-%'", fetch="none")
     s = _stack(tmp_path, [_snapshot(5, [_position()]), _snapshot(6, [_position()]), _snapshot(7, [_position()])])
     receipt = s.service.start(ACCOUNT, "flat-new", DEADLINE)
-    assert [(c.child_id, c.state) for c in receipt.children] == [("old-failed-liquidation-reduce-1", "UNKNOWN")]
+    assert [(c.child_id, c.state) for c in receipt.children] == [("old-failed-liquidation-reduce-*", "UNKNOWN")]
     assert s.dispatch.calls == []
     s.service.rescan()                                       # 6: complete and newer, no row: ABSENT
     s.service.rescan()                                       # 7: newer than that observation: reduce
     assert s.dispatch.calls == [("reduce", 1, "SELL", 10.0, "flat-new-reduce-1-1")]
+
+# ---------------------------------------------------------------------------
+# Round-3 fix (#20, ruling 42): a pre-upgrade run's reduces are one wildcard child
+# ---------------------------------------------------------------------------
+
+def _pre_sp1_open(db, run_id):
+    return db.execute("SELECT pre_sp1_open FROM liquidation_runs WHERE cause_command_id = ?",
+                      [run_id], fetch="one")[0]
+
+
+def test_an_old_reduce_of_a_flat_position_blocks_the_adopted_run_until_it_settles(tmp_path):
+    """Ruling 42: the old reduce of a position already at 0 is not in working_orders yet. The run's
+    wildcard child blocks; its mark stays until a complete, newer enumeration settles it."""
+    _legacy_db(tmp_path, (("flat-1", "VERIFYING", 1),))
+    s = _stack(tmp_path, [_snapshot(5, [_position(0.0)]), _snapshot(6, [_position(0.0)])])
+    s.dispatch.complete = False                              # the old order is not visible yet
+    s.service.rescan()                                       # adopt at 5
+    receipt = s.service.rescan()                             # 6
+    assert [(c.child_id, c.conid, c.state) for c in receipt.children] == [
+        ("flat-1-liquidation-reduce-*", None, "UNKNOWN")]
+    assert receipt.state not in ("FLAT", "CLOSED") and "outcome unknown" in receipt.detail
+    assert _pre_sp1_open(s.db, "flat-1")
+    s.push(_snapshot(7, [_position(0.0)]))
+    s.dispatch.rows["flat-1-liquidation-reduce-1"] = [_row("Submitted", entity="flat-1-liquidation-reduce-1:exit")]
+    assert "still working" in s.service.rescan().detail     # visible and working: waited on, not cancelled
+    assert _pre_sp1_open(s.db, "flat-1")
+    s.push(_snapshot(8, [_position(0.0)]))
+    s.dispatch.rows["flat-1-liquidation-reduce-1"] = [_row("Cancelled", entity="flat-1-liquidation-reduce-1:exit")]
+    s.dispatch.complete = True
+    assert s.service.rescan().state == "FLAT"               # 8: complete and newer than the fence
+    assert s.service.receipt_for("flat-1").children[0].state == "CANCELLED"
+    assert not _pre_sp1_open(s.db, "flat-1")
+    assert s.dispatch.calls == []
+
+
+def test_an_old_reduce_that_stays_invisible_blocks_to_the_deadline(tmp_path):
+    _legacy_db(tmp_path, (("flat-1", "VERIFYING", 1),))
+    s = _stack(tmp_path, [_snapshot(5, [_position(0.0)]), _snapshot(6, [_position(0.0)]),
+                          _snapshot(7, [_position(0.0)])])
+    s.dispatch.complete = False
+    s.service.rescan()
+    s.service.rescan()
+    assert "outcome unknown" in s.service.rescan().detail
+    s.clock["now"] = DEADLINE + dt.timedelta(seconds=1)
+    assert s.service.rescan().state == "FAILED_SAFE"
+    assert s.dispatch.calls == [] and _pre_sp1_open(s.db, "flat-1")
+
 
 # ---------------------------------------------------------------------------
 # Task 5: conid-scoped full close
@@ -1067,6 +1120,46 @@ def test_start_refuses_rebinding_root_to_another_scope(tmp_path):
     s.service.start(ACCOUNT, "root-2", DEADLINE, scope="conid", conid=2)
     with pytest.raises(ValueError):
         s.service.start(ACCOUNT, "root-2", DEADLINE, scope="conid", conid=1)
+
+
+def test_an_old_reduce_of_a_flat_position_blocks_a_scoped_close_of_that_conid(tmp_path):
+    _legacy_db(tmp_path, (("flat-1", "FAILED_SAFE", 1),))
+    s = _stack(tmp_path, [_snapshot(5, [_position(0.0)]), _snapshot(6, [_position(0.0)])])
+    s.dispatch.complete = False
+    s.service.start(ACCOUNT, "close-1", DEADLINE, scope="conid", conid=1)
+    receipt = s.service.rescan()
+    assert [(c.child_id, c.owner_root_id, c.state) for c in receipt.children] == [
+        ("flat-1-liquidation-reduce-*", "close-1", "UNKNOWN")]
+    assert receipt.state != "CLOSED" and _pre_sp1_open(s.db, "flat-1")
+    s.push(_snapshot(7, [_position(0.0)]))
+    s.dispatch.rows["flat-1-liquidation-reduce-1"] = [_row("Submitted", entity="flat-1-liquidation-reduce-1:exit")]
+    assert "still working" in s.service.rescan().detail
+    s.push(_snapshot(8, [_position(-10.0)]), _snapshot(9, [_position(-10.0)]))
+    s.dispatch.rows["flat-1-liquidation-reduce-1"] = [
+        _row("Filled", filled=10.0, entity="flat-1-liquidation-reduce-1:exit")]
+    s.dispatch.complete = True
+    s.service.rescan()                                       # 8: settled FILLED; the late fill opened a short
+    assert not _pre_sp1_open(s.db, "flat-1")
+    assert s.dispatch.calls == []                            # 8 is not newer than the fill it observed
+    s.service.rescan()                                       # 9: the close reduces the short it now sees
+    assert s.dispatch.calls == [("reduce", 1, "BUY", 10.0, "close-1-reduce-1-1")]
+
+
+def test_the_wildcard_blocks_a_scoped_close_of_another_conid(tmp_path):
+    """Ruling 42: the scoped root on conid 2 never looks at conid 1. The old run's reduce of conid 2
+    is settled, but its reduce of conid 1 is not, so the run is not settled and nothing is reduced."""
+    _legacy_db(tmp_path, (("flat-1", "FAILED_SAFE", 1),))
+    held = [_position(0.0), _position(10.0, conid=2)]
+    s = _stack(tmp_path, [_snapshot(5, held), _snapshot(6, held), _snapshot(7, held)])
+    s.dispatch.complete = False
+    s.dispatch.rows["flat-1-liquidation-reduce-2"] = [_row("Cancelled", entity="flat-1-liquidation-reduce-2:exit")]
+    s.service.start(ACCOUNT, "close-2", DEADLINE, scope="conid", conid=2)
+    s.service.rescan()
+    s.service.rescan()
+    assert s.dispatch.calls == []
+    assert _pre_sp1_open(s.db, "flat-1")
+
+
 # ---------------------------------------------------------------------------
 # Task 6: partial close, re-protect, escalation
 # ---------------------------------------------------------------------------

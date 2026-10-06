@@ -230,6 +230,9 @@ class _LiquidationDispatch:
     def find_orders(self, account_id: str, child_id: str) -> list:
         return self._dispatch.find_by_order_ref(account_id, encode_order_ref(child_id))
 
+    def find_orders_with_prefix(self, account_id: str, prefix: str) -> list:
+        return self._dispatch.find_legacy_reduces(account_id, prefix)
+
     def get_order(self, order_entity_id: str):
         return self._orders_view.get_order(order_entity_id)
 

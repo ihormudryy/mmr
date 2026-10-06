@@ -10,8 +10,8 @@ from trader.data.domain_journal import DomainJournal
 from trader.data.schema_migrations import SchemaMigrator
 from trader.trading.broker_ingest import BrokerIngest
 from trader.trading.order_correlation import (
-    classify_leg, decode_order_ref, encode_order_ref, liquidation_child_id, liquidation_child_kind,
-    reprotect_oca_group,
+    classify_leg, decode_order_ref, encode_order_ref, legacy_reduce_prefix, liquidation_child_id,
+    liquidation_child_kind, matches_legacy_reduce, reprotect_oca_group,
 )
 
 UTC_NOW = dt.datetime(2026, 7, 15, 13, 0, tzinfo=dt.timezone.utc)
@@ -208,6 +208,17 @@ def test_a_pre_sp1_liquidation_reduce_ref_is_an_exit():
     """Refs written before SP1 ({root}-liquidation-reduce-{conid}) are exits, not entries."""
     assert liquidation_child_kind("flat-1-liquidation-reduce-265598") == "reduce"
     assert classify_leg("MKT", 0, 9, "flat-1-liquidation-reduce-265598") == "exit"
+
+
+def test_a_legacy_reduce_prefix_matches_every_conid_of_its_run_only():
+    """Ruling 42: {run}-liquidation-reduce-{conid}, any conid; never another run or a new child."""
+    prefix = legacy_reduce_prefix("flat-1")
+    assert matches_legacy_reduce("flat-1-liquidation-reduce-265598", prefix)
+    assert matches_legacy_reduce("flat-1-liquidation-reduce-1", prefix)
+    assert not matches_legacy_reduce("flat-10-liquidation-reduce-1", prefix)
+    assert not matches_legacy_reduce("flat-1-liquidation-reduce-1-2", prefix)
+    assert not matches_legacy_reduce("flat-1-liquidation-reduce-", prefix)
+    assert not matches_legacy_reduce(None, prefix)
 
 
 def test_other_groups_keep_the_parent_rule():

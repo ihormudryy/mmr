@@ -38,6 +38,14 @@ def _clear_duckdb_instances():
     DuckDBConnection._instances.clear()
 
 
+@pytest.fixture(autouse=True)
+def isolated_rpc_keys_dir(tmp_path_factory, monkeypatch):
+    """Point every test at an empty RPC keys dir, never the developer's ~/.config/mmr/keys."""
+    rpc_dir = tmp_path_factory.mktemp("rpc")
+    monkeypatch.setenv("MMR_RPC_KEYS_DIR", str(rpc_dir))
+    return rpc_dir
+
+
 @pytest.fixture(scope='session', autouse=True)
 def _quiet_numba_loggers():
     """Re-assert after any session-early setup_logging() dictConfig."""

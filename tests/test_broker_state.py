@@ -235,11 +235,11 @@ def test_snapshot_adapter_exposes_only_active_broker_rows_with_fenced_identity(e
     }]
 
 
-def _group_order(order_entity_id, group, deleted=False, status="Cancelled"):
+def _group_order(order_entity_id, group, deleted=False, status="Cancelled", conid=265598):
     from trader.data.broker_state import BrokerOrderRow
 
     return BrokerOrderRow(
-        order_entity_id=order_entity_id, account_id="DU123", conid=265598, symbol="AAPL",
+        order_entity_id=order_entity_id, account_id="DU123", conid=conid, symbol="AAPL",
         order_group_id=group, leg="entry", is_external=False, action="BUY", order_type="LMT",
         total_quantity=10.0, filled_quantity=0.0, avg_fill_price=None, limit_price=185.0,
         stop_price=None, tif="DAY", status=status, deleted=deleted, revision=1,
@@ -247,19 +247,32 @@ def _group_order(order_entity_id, group, deleted=False, status="Cancelled"):
     )
 
 
-def _group_fill(order_entity_id):
+def _group_fill(order_entity_id, conid=265598, at=UTC_NOW):
     return BrokerFillRow(
         account_id="DU123", exec_id="0001.xyz", order_entity_id=order_entity_id, perm_id=1,
-        client_order_id=5, session_epoch="s1", conid=265598, side="BUY", quantity=10.0,
+        client_order_id=5, session_epoch="s1", conid=conid, side="BUY", quantity=10.0,
         price=185.0, commission=None, commission_currency=None, realized_pnl=None,
-        fill_time=UTC_NOW, revision=1, source_timestamp=UTC_NOW,
+        fill_time=at, revision=1, source_timestamp=at,
     )
 
 
-def _has_trace(env, group):
+SENT_AT = UTC_NOW - dt.timedelta(minutes=1)
+
+
+def _has_trace(env, group, since=SENT_AT):
     return env.db.transaction(
-        lambda conn: env.store.group_has_broker_trace_in_tx(conn, "DU123", group)
+        lambda conn: env.store.group_has_broker_trace_in_tx(conn, "DU123", group, 265598, since)
     )
+
+
+def _seed(env, *, orders=(), fills=()):
+    def write(conn):
+        for order in orders:
+            env.store.upsert_order_in_tx(conn, order)
+        for fill in fills:
+            env.store.upsert_fill_in_tx(conn, fill)
+
+    env.db.transaction(write)
 
 
 def test_group_trace_is_absent_without_orders_or_executions(env):
@@ -267,24 +280,57 @@ def test_group_trace_is_absent_without_orders_or_executions(env):
 
 
 def test_group_trace_counts_terminal_and_deleted_orders(env):
-    env.db.transaction(lambda conn: env.store.upsert_order_in_tx(
-        conn, _group_order("o1", "og-1", deleted=True)))
+    _seed(env, orders=(_group_order("o1", "og-1", deleted=True),))
 
     assert _has_trace(env, "og-1") is True
     assert _has_trace(env, "og-2") is False
 
 
 def test_group_trace_counts_an_execution_bound_to_the_group(env):
-    def seed(conn):
-        env.store.upsert_order_in_tx(conn, _group_order("o1", "og-1"))
-        env.store.upsert_fill_in_tx(conn, _group_fill("o1"))
-
-    env.db.transaction(seed)
+    _seed(env, orders=(_group_order("o1", "og-1"),), fills=(_group_fill("o1"),))
 
     assert _has_trace(env, "og-1") is True
 
 
 def test_group_trace_is_never_a_false_no_while_an_execution_is_unbound(env):
-    env.db.transaction(lambda conn: env.store.upsert_fill_in_tx(conn, _group_fill(None)))
+    _seed(env, fills=(_group_fill(None),))
+
+    assert _has_trace(env, "og-1") is True
+
+
+def test_group_trace_counts_an_execution_bound_to_an_order_without_a_group(env):
+    # An undecodable or lost order ref: the order has no group, its fill is bound.
+    _seed(env, orders=(_group_order("o1", None),), fills=(_group_fill("o1"),))
+
+    assert _has_trace(env, "og-1") is True
+
+
+def test_group_trace_counts_an_order_without_a_group_on_the_conid_after_the_send(env):
+    _seed(env, orders=(_group_order("o1", None),))
+
+    assert _has_trace(env, "og-1") is True
+    assert _has_trace(env, "og-1", since=UTC_NOW + dt.timedelta(seconds=1)) is False
+
+
+def test_group_trace_rules_out_activity_of_another_group_or_conid(env):
+    _seed(
+        env,
+        orders=(_group_order("o1", "og-2"), _group_order("o2", None, conid=272093)),
+        fills=(_group_fill("o1"), replace(_group_fill("o2", conid=272093), exec_id="0002.xyz")),
+    )
+
+    assert _has_trace(env, "og-1") is False
+
+
+def test_group_trace_ignores_executions_before_the_send(env):
+    _seed(env, fills=(_group_fill(None, at=SENT_AT - dt.timedelta(seconds=1)),))
+
+    assert _has_trace(env, "og-1") is False
+
+
+def test_group_trace_is_never_a_false_no_while_a_generation_is_staging(env):
+    env.db.transaction(lambda conn: env.store.open_generation_in_tx(
+        conn, ("account", "positions", "open_orders"), UTC_NOW,
+    ))
 
     assert _has_trace(env, "og-1") is True

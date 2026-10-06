@@ -1991,7 +1991,7 @@ class FakeOrphanEvidence:
             raise self.enumeration_error
         return BrokerEnumeration(generation_id=self.generation, started_at=self.started_at)
 
-    def order_group_seen(self, account_id, order_group_id):
+    def has_trace_in_tx(self, conn, account_id, order_group_id, conid, since):
         if self.group_error is not None:
             raise self.group_error
         return self.group_seen
@@ -2013,7 +2013,8 @@ def _saga_with_evidence(tmp_path, snapshot, evidence, clock, **overrides):
 
 
 def _orphan_after_crash(tmp_path, *, ambiguous_send=False):
-    """A saga row left SUBMITTING (crash) or OUTCOME_UNKNOWN (lost send), then a restart."""
+    """A row left SUBMITTING (send returned, no broker event) or OUTCOME_UNKNOWN
+    (send raised), then a restart."""
     snapshot = _snapshot()
     evidence, clock = FakeOrphanEvidence(), Clock()
     saga, _, _, dispatch, *_ = _saga_with_evidence(tmp_path, snapshot, evidence, clock)
@@ -2039,7 +2040,7 @@ def _state_of(env, command_id):
     return env.saga._store.load(command_id).state
 
 
-@pytest.mark.parametrize("ambiguous_send", [False, True], ids=["crash-before-send", "send-not-acknowledged"])
+@pytest.mark.parametrize("ambiguous_send", [False, True], ids=["send-returned", "send-not-acknowledged"])
 def test_orphan_row_is_retired_by_a_newer_complete_enumeration_and_a_new_entry_fits(
     tmp_path, ambiguous_send,
 ):
@@ -2161,22 +2162,192 @@ def test_sweep_skips_while_an_entry_send_holds_the_account_lock(tmp_path):
     assert _state_of(env, env.orphan.command_id) == "SUBMITTING"
 
 
-def test_broker_event_for_a_retired_row_trips_the_breaker(tmp_path):
+def _retired(tmp_path):
+    env = _orphan_after_crash(tmp_path)
+    env.evidence.newer_enumeration()
+    env.clock.at = AFTER_SETTLE
+    assert env.saga.retire_orphan_reservations() == (env.orphan.command_id,)
+    return env
+
+
+def _late_entry_event(env, *, status, filled, event_id):
     from trader.automation.protective_order_saga import BrokerOrderEvent
+
+    return BrokerOrderEvent(
+        order_group_id=env.orphan.order_group_id, leg="entry", status=status,
+        filled_quantity=filled, total_quantity=ENTRY_SHARES, order_id=5001,
+        event_id=event_id, source_timestamp=AFTER_SETTLE,
+    )
+
+
+def test_working_event_for_a_retired_row_trips_the_breaker_and_reserves_again(tmp_path):
+    env = _retired(tmp_path)
+
+    env.saga.on_broker_event(_late_entry_event(env, status="Submitted", filled=0, event_id="late-1"))
+
+    assert [s.kind for s in env.saga._breaker.signals] == ["RECONCILIATION_DIVERGENCE"]
+    assert _state_of(env, env.orphan.command_id) == "ENTRY_WORKING"
+    blocked = _start_entry(env.saga, _entry(OTHER_CONID, signal="after"), env.snapshot)
+    assert blocked.error_code == "GROSS_EXPOSURE_IN_FLIGHT"
+
+
+def test_late_fill_on_a_retired_row_is_unprotected_and_flattened(tmp_path):
+    env = _retired(tmp_path)
+
+    state = env.saga.on_broker_event(
+        _late_entry_event(env, status="Filled", filled=ENTRY_SHARES, event_id="late-fill"),
+    )
+
+    assert (state.state, state.error_code) == ("SAFETY_FAILED", "ORPHAN_ORDER_FILLED")
+    assert state.filled_quantity == Decimal(ENTRY_SHARES)
+    assert env.saga._store.load(env.orphan.command_id).state == "SAFETY_FAILED"
+    kinds = [s.kind for s in env.saga._breaker.signals]
+    assert kinds == ["RECONCILIATION_DIVERGENCE", "PROTECTIVE_ORDER_FAILURE"]
+    assert [start[1] for start in env.saga._liquidation.starts] == [env.orphan.command_id]
+    # The filled shares count toward gross until the broker snapshot shows them.
+    blocked = _start_entry(env.saga, _entry(OTHER_CONID, signal="after"), env.snapshot)
+    assert blocked.error_code == "GROSS_EXPOSURE_IN_FLIGHT"
+
+
+def test_fill_that_lands_during_the_sweep_wins_over_the_retirement(tmp_path):
+    env = _orphan_after_crash(tmp_path)
+    env.evidence.newer_enumeration()
+    env.clock.at = AFTER_SETTLE
+    read_enumeration = env.evidence.latest_complete_enumeration
+
+    def fill_arrives_then_read(account_id):
+        env.saga.on_broker_event(
+            _late_entry_event(env, status="Filled", filled=ENTRY_SHARES, event_id="race"),
+        )
+        return read_enumeration(account_id)
+
+    env.evidence.latest_complete_enumeration = fill_arrives_then_read
+
+    assert env.saga.retire_orphan_reservations() == ()
+    assert _state_of(env, env.orphan.command_id) == "SAFETY_FAILED"
+    assert len(env.saga._liquidation.starts) == 1
+
+
+def test_enumeration_that_began_before_the_send_returned_does_not_retire(tmp_path):
+    snapshot = _snapshot()
+    evidence, clock = FakeOrphanEvidence(), Clock()
+
+    class SlowDispatch(FakeBracketDispatch):
+        def submit_bracket(self, **kwargs):
+            clock.at = NOW + dt.timedelta(minutes=2)  # the send takes two minutes
+            return super().submit_bracket(**kwargs)
+
+    saga, *_ = _saga_with_evidence(
+        tmp_path, snapshot, evidence, clock, dispatch=SlowDispatch(),
+    )
+    row = _start_entry(saga, _entry(CONID), snapshot)
+    assert row.send_returned_at == (NOW + dt.timedelta(minutes=2)).isoformat()
+    clock.at = AFTER_SETTLE
+
+    # Began after the send attempt, while the send was still running.
+    evidence.newer_enumeration(started_at=NOW + dt.timedelta(minutes=1))
+    assert saga.retire_orphan_reservations() == ()
+    assert saga._store.load(row.command_id).state == "SUBMITTING"
+
+    evidence.newer_enumeration(started_at=NOW + dt.timedelta(minutes=3))
+    assert saga.retire_orphan_reservations() == (row.command_id,)
+
+
+def test_row_whose_send_never_returned_is_never_retired(tmp_path):
+    from dataclasses import replace as dc_replace
+
+    env = _orphan_after_crash(tmp_path)
+    # The process died inside submit_bracket: only the SUBMITTING row was saved.
+    store = env.saga._store
+    crashed = dc_replace(store.load(env.orphan.command_id), send_returned_at=None)
+    store._db.transaction(lambda conn: store.save_in_tx(conn, crashed, NOW))
+    env.evidence.newer_enumeration()
+    env.clock.at = AFTER_SETTLE
+
+    assert env.saga.retire_orphan_reservations() == ()
+    assert _state_of(env, env.orphan.command_id) == "SUBMITTING"
+
+
+def _real_trace_evidence(env):
+    """Real broker-state trace check on the saga's database; enumeration from the fake."""
+    from trader.data.broker_state import BrokerStateStore
+    from trader.trading.command_ports import BrokerStateOrphanEvidence
+
+    db = env.saga._store._db
+    store = BrokerStateStore(db)
+    store.migrate(SchemaMigrator(db))
+
+    class Evidence(BrokerStateOrphanEvidence):
+        def latest_complete_enumeration(self, account_id):
+            return env.evidence.latest_complete_enumeration(account_id)
+
+    return Evidence(db=db, store=store, snapshots=None), store, db
+
+
+def _broker_order(group, *, conid=CONID, entity="o-late"):
+    from dataclasses import replace as dc_replace
+
+    return dc_replace(
+        _working_entry(group, conid), order_entity_id=entity, source_timestamp=AFTER_SETTLE,
+    )
+
+
+def test_order_written_between_the_trace_read_and_the_retirement_keeps_the_row(tmp_path):
+    env = _orphan_after_crash(tmp_path)
+    env.evidence.newer_enumeration()
+    env.clock.at = AFTER_SETTLE
+    evidence, store, db = _real_trace_evidence(env)
+    env.saga._orphan_evidence = evidence
+    journal = env.saga._journal
+    mutate = journal.mutate
+
+    def order_lands_first(conn, mutation, write, **kwargs):
+        if mutation.payload.get("state") == "NOT_SENT":
+            db.transaction(lambda c: store.upsert_order_in_tx(
+                c, _broker_order(env.orphan.order_group_id),
+            ))
+        return mutate(conn, mutation, write, **kwargs)
+
+    journal.mutate = order_lands_first
+
+    assert env.saga.retire_orphan_reservations() == ()
+    assert _state_of(env, env.orphan.command_id) == "SUBMITTING"
+
+
+def test_execution_bound_to_an_undecodable_order_ref_keeps_the_row(tmp_path):
+    from trader.data.broker_state import BrokerFillRow
 
     env = _orphan_after_crash(tmp_path)
     env.evidence.newer_enumeration()
     env.clock.at = AFTER_SETTLE
-    env.saga.retire_orphan_reservations()
+    evidence, store, db = _real_trace_evidence(env)
+    env.saga._orphan_evidence = evidence
 
-    env.saga.on_broker_event(BrokerOrderEvent(
-        order_group_id=env.orphan.order_group_id, leg="entry", status="Submitted",
-        filled_quantity=0, total_quantity=ENTRY_SHARES, order_id=5001,
-        event_id="late-1", source_timestamp=AFTER_SETTLE,
-    ))
+    def seed(conn):
+        store.upsert_order_in_tx(conn, _broker_order(None))  # orderRef did not decode
+        store.upsert_fill_in_tx(conn, BrokerFillRow(
+            account_id=ACCOUNT, exec_id="0001.late", order_entity_id="o-late", perm_id=1,
+            client_order_id=5001, session_epoch="s1", conid=CONID, side="BUY",
+            quantity=float(ENTRY_SHARES), price=160.0, commission=None,
+            commission_currency=None, realized_pnl=None, fill_time=AFTER_SETTLE,
+            revision=1, source_timestamp=AFTER_SETTLE,
+        ))
 
-    assert [s.kind for s in env.saga._breaker.signals] == ["RECONCILIATION_DIVERGENCE"]
-    assert _state_of(env, env.orphan.command_id) == "NOT_SENT"
+    db.transaction(seed)
+
+    assert env.saga.retire_orphan_reservations() == ()
+    assert _state_of(env, env.orphan.command_id) == "SUBMITTING"
+
+
+def test_activity_of_another_group_does_not_keep_the_row(tmp_path):
+    env = _orphan_after_crash(tmp_path)
+    env.evidence.newer_enumeration()
+    env.clock.at = AFTER_SETTLE
+    evidence, store, db = _real_trace_evidence(env)
+    env.saga._orphan_evidence = evidence
+    db.transaction(lambda conn: store.upsert_order_in_tx(conn, _broker_order("og-other")))
+
+    assert env.saga.retire_orphan_reservations() == (env.orphan.command_id,)
 
 
 def test_entry_is_refused_when_the_send_generation_cannot_be_recorded(tmp_path):

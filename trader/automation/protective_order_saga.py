@@ -349,9 +349,11 @@ class SagaState:
     filled_at: Optional[dt.datetime] = None
     # Broker position quantity of the conid when the entry was sent.
     baseline_position: Optional[Decimal] = None
-    # Broker enumeration generation and time at the send attempt (see retire_orphan_reservations).
+    # Broker enumeration generation and time at the send attempt, and the
+    # time submit_bracket returned or raised (see retire_orphan_reservations).
     send_generation_id: Optional[int] = None
     send_attempted_at: Optional[str] = None
+    send_returned_at: Optional[str] = None
 
     @property
     def current_groups(self) -> tuple[str, ...]:
@@ -399,6 +401,7 @@ class SagaState:
             ),
             "send_generation_id": self.send_generation_id,
             "send_attempted_at": self.send_attempted_at,
+            "send_returned_at": self.send_returned_at,
         }
 
     @classmethod
@@ -450,7 +453,12 @@ class SagaState:
                 if payload.get("send_generation_id") is not None else None
             ),
             send_attempted_at=payload.get("send_attempted_at"),
+            send_returned_at=payload.get("send_returned_at"),
         )
+
+
+class _BrokerTraceFound(Exception):
+    """The broker may hold the order group: the retirement must not commit."""
 
 
 @dataclass(frozen=True)
@@ -466,10 +474,14 @@ class OrphanEvidencePort(Protocol):
         """Newest complete enumeration; raises when none can be read."""
         ...
 
-    def order_group_seen(self, account_id: str, order_group_id: str) -> bool:
-        """True if the broker shows any order or execution for the group.
+    def has_trace_in_tx(
+        self, conn, account_id: str, order_group_id: str, conid: int, since: dt.datetime,
+    ) -> bool:
+        """True if the broker may hold an order or execution of the group.
 
-        Must answer True when it cannot rule one out; raises when unreadable.
+        Runs inside the caller's journal transaction, so broker writes cannot
+        land between this read and the caller's write. Must answer True when
+        it cannot rule one out; raises when unreadable.
         """
         ...
 
@@ -956,16 +968,22 @@ class ProtectiveOrderSaga:
                 plan=plan, intent=intent, account_id=self._account_id,
             )
         except BrokerRejectedError:
+            returned_at = self._now_utc().isoformat()
             return self._after_dispatch(intent.command_id, now, lambda s: replace(
-                s, state="CLOSED", error_code="BROKER_REJECTED"))
+                s, state="CLOSED", error_code="BROKER_REJECTED", send_returned_at=returned_at))
         except Exception:
+            returned_at = self._now_utc().isoformat()
             return self._after_dispatch(intent.command_id, now, lambda s: replace(
-                s, state="OUTCOME_UNKNOWN", error_code="DISPATCH_AMBIGUOUS"))
+                s, state="OUTCOME_UNKNOWN", error_code="DISPATCH_AMBIGUOUS",
+                send_returned_at=returned_at))
 
+        returned_at = self._now_utc().isoformat()
         order_ids = tuple(int(x) for x in (getattr(submitted, "order_ids", None) or ()))
         # Submit returns correlation ids only — broker events advance working.
         return self._after_dispatch(
-            intent.command_id, now, lambda s: replace(s, submitted_order_ids=order_ids), always=True)
+            intent.command_id, now,
+            lambda s: replace(s, submitted_order_ids=order_ids, send_returned_at=returned_at),
+            always=True)
 
     def _after_dispatch(self, command_id: str, now: dt.datetime,
                         change: Callable[[SagaState], SagaState], *, always: bool = False) -> SagaState:
@@ -1011,8 +1029,7 @@ class ProtectiveOrderSaga:
         if state.state == "SAFETY_FAILED" and event.leg == "entry":
             return self._record_entry_after_safety_failure(state, event)
         if state.state == "NOT_SENT":
-            self._report_event_for_retired_row(state, event)
-            return state
+            return self._reopen_retired_row(state, event)
         if state.state in _TERMINAL_SAGA:
             return state
 
@@ -1265,16 +1282,24 @@ class ProtectiveOrderSaga:
     ) -> bool:
         if not self._enumeration_postdates_send(state, enumeration, now):
             return False
+        since = _as_utc(dt.datetime.fromisoformat(state.send_attempted_at))
+
+        def require_no_trace(conn) -> None:
+            if self._orphan_evidence.has_trace_in_tx(
+                conn, state.account_id, state.order_group_id, state.conid, since,
+            ):
+                raise _BrokerTraceFound(state.order_group_id)
+
+        retired = replace(
+            state, state="NOT_SENT", error_code=ORPHAN_NOT_SENT, revision=state.revision + 1,
+        )
         try:
-            if self._orphan_evidence.order_group_seen(state.account_id, state.order_group_id):
-                return False
-            retired = replace(
-                state, state="NOT_SENT", error_code=ORPHAN_NOT_SENT,
-                revision=state.revision + 1,
-            )
             self._persist(
                 retired, now, from_state=state.state, expected_revision=state.revision,
+                check_in_tx=require_no_trace,
             )
+        except _BrokerTraceFound:
+            return False
         except Exception:
             logging.exception("could not retire orphan reservation %s", state.command_id)
             return False
@@ -1289,26 +1314,52 @@ class ProtectiveOrderSaga:
     def _enumeration_postdates_send(
         self, state: SagaState, enumeration: BrokerEnumeration, now: dt.datetime,
     ) -> bool:
-        if state.send_generation_id is None or state.send_attempted_at is None:
+        # Without the returned marker the send may still be running (or the
+        # process died inside it): nothing proves when it could reach IB.
+        if (
+            state.send_generation_id is None
+            or state.send_attempted_at is None
+            or state.send_returned_at is None
+        ):
             return False
-        attempted_at = _as_utc(dt.datetime.fromisoformat(state.send_attempted_at))
+        returned_at = _as_utc(dt.datetime.fromisoformat(state.send_returned_at))
         return (
             enumeration.generation_id > state.send_generation_id
-            and _as_utc(enumeration.started_at) > attempted_at
-            and now - attempted_at >= self._orphan_settle
+            and _as_utc(enumeration.started_at) > returned_at
+            and now - returned_at >= self._orphan_settle
         )
 
-    def _report_event_for_retired_row(self, state: SagaState, event: BrokerOrderEvent) -> None:
+    def _reopen_retired_row(self, state: SagaState, event: BrokerOrderEvent) -> SagaState:
+        """The order of a NOT_SENT row exists after all: reserve it again.
+
+        Any fill is unprotected as far as the saga knows, so it goes to
+        SAFETY_FAILED, which trips the breaker and starts liquidation.
+        """
+        now = self._now_utc()
         logging.critical(
             "broker event %s for saga %s retired as %s: the order exists after all",
             event.event_id, state.command_id, ORPHAN_NOT_SENT,
         )
         self._breaker.record(BreakerSignal(
             kind="RECONCILIATION_DIVERGENCE",
-            occurred_at=self._now_utc(),
+            occurred_at=now,
             detail=f"broker order seen for retired saga {state.command_id}",
             key=state.command_id,
         ))
+        reopened = self._apply_event(
+            replace(state, state="OUTCOME_UNKNOWN", error_code="ORPHAN_ORDER_FOUND"), event,
+        )
+        if reopened.filled_quantity > 0:
+            reopened = replace(reopened, state="SAFETY_FAILED", error_code="ORPHAN_ORDER_FILLED")
+        reopened = replace(
+            reopened,
+            seen_event_ids=state.seen_event_ids + (event.event_id,),
+            revision=state.revision + 1,
+        )
+        self._persist(reopened, now, from_state=state.state, event_id=event.event_id)
+        if reopened.state == "SAFETY_FAILED":
+            self._trip_and_liquidate(reopened, now)
+        return reopened
 
     # -- event application -------------------------------------------------
 
@@ -1423,9 +1474,11 @@ class ProtectiveOrderSaga:
         from_state: Optional[str],
         event_id: Optional[str] = None,
         expected_revision: Optional[int] = None,
+        check_in_tx: Optional[Callable[[Any], None]] = None,
     ) -> None:
         mutation, write, event_key = self._mutation(
-            state, now, from_state=from_state, event_id=event_id, expected_revision=expected_revision,
+            state, now, from_state=from_state, event_id=event_id,
+            expected_revision=expected_revision, check_in_tx=check_in_tx,
         )
         self._journal.mutate(self._journal.connect(), mutation, write, event_id=event_key)
 
@@ -1440,7 +1493,8 @@ class ProtectiveOrderSaga:
         )
 
     def _mutation(self, state: SagaState, now: dt.datetime, *, from_state: Optional[str],
-                  event_id: Optional[str], expected_revision: Optional[int] = None):
+                  event_id: Optional[str], expected_revision: Optional[int] = None,
+                  check_in_tx: Optional[Callable[[Any], None]] = None):
         if state.state not in SAGA_STATES:
             raise ValueError(f"invalid saga state {state.state!r}")
 
@@ -1469,6 +1523,8 @@ class ProtectiveOrderSaga:
         def write(conn, _revision: int) -> None:
             if expected_revision is not None:
                 self._store.require_revision_in_tx(conn, state.command_id, expected_revision)
+            if check_in_tx is not None:
+                check_in_tx(conn)
             self._store.save_in_tx(conn, state, now)
             if event_id is not None:
                 self._store.record_event_in_tx(conn, event_id, state.command_id, now)

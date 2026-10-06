@@ -222,11 +222,11 @@ class BrokerStateOrphanEvidence:
             )
         return BrokerEnumeration(generation_id=int(generation_id), started_at=row[0])
 
-    def order_group_seen(self, account_id: str, order_group_id: str) -> bool:
-        return bool(self._db.transaction(
-            lambda conn: self._store.group_has_broker_trace_in_tx(
-                conn, account_id, order_group_id,
-            )
+    def has_trace_in_tx(
+        self, conn, account_id: str, order_group_id: str, conid: int, since,
+    ) -> bool:
+        return bool(self._store.group_has_broker_trace_in_tx(
+            conn, account_id, order_group_id, conid, since,
         ))
 
 

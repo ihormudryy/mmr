@@ -155,6 +155,18 @@ automation:
   expected_artifact_id: ''
   strategy_name: ''
 
+# AI paper experiment (SP1). Owner-only: no AI principal can change this block.
+# limits_ceiling caps every AI risk policy. Empty = today's paper limits. Only
+# gross_fraction may rise above them (up to 0.15); every value is a fraction.
+ai_paper:
+  enabled: false
+  styles: [intraday_long]            # later: swing_long, intraday_short, swing_short
+  limits_ceiling: {}
+  experiment_kill_drawdown_pct: null # percent, e.g. 20; off by default
+  experiment_kill_basis: start       # start | peak
+  broker_outage_pause_seconds: 300   # pause the experiment after this long without broker data
+  acceptance_probe: false            # paper only; true only on the SP1 acceptance day (Plan 6), then back to false
+
 # Massive.com (formerly Polygon.io)
 massive_api_key: ''
 massive_feed: stocks

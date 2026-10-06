@@ -139,6 +139,11 @@ _BLANKABLE_ENV_KEYS = frozenset({
 })
 
 
+def _default_ai_paper_config():
+    from trader.automation.ai_paper_config import AiPaperConfig
+    return AiPaperConfig()
+
+
 @dataclass
 class MMRConfig:
     ib: IBConfig = field(default_factory=IBConfig)
@@ -151,6 +156,8 @@ class MMRConfig:
     alpaca: AlpacaConfig = field(default_factory=AlpacaConfig)
     typed_rpc: TypedRpcConfig = field(default_factory=TypedRpcConfig)
     automation: AutomationConfig = field(default_factory=AutomationConfig)
+    # Owner-only ai_paper block (Plan 3 R22): read from the file only, never from env.
+    ai_paper: Any = field(default_factory=_default_ai_paper_config)
     root_directory: str = '.'
     config_file: str = '~/.config/mmr/trader.yaml'
     logfile: str = '~/.local/share/mmr/logs/trader.log'
@@ -319,6 +326,9 @@ class MMRConfig:
                 if key not in nested_auto or nested_auto[key] is None:
                     continue
                 setattr(auto, key, str(nested_auto[key]))
+
+        from trader.automation.ai_paper_config import load_ai_paper_config
+        config.ai_paper = load_ai_paper_config(raw.get('ai_paper'), trading_mode=config.trading_mode)
 
         if config.automation.live_enabled:
             raise ValueError(

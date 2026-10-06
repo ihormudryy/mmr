@@ -472,6 +472,8 @@ def main(simulation: bool,
 
     container = Container.create(config)
     trader = container.resolve(Trader, simulation=simulation)
+    # The command stack is built later, in Trader.connect; it reads this.
+    trader.ai_paper_config = container.typed_config().ai_paper
     liquidation_worker = _new_liquidation_worker()
 
     async def graceful_shutdown():

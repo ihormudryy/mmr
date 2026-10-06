@@ -1873,6 +1873,23 @@ def test_account_claim_supersede_and_inheritance_commit_together_or_not_at_all(t
     assert s.service.root_for("kill-1") is None
 
 
+def test_account_takeover_waits_for_a_generation_newer_than_the_scoped_roots_fill(tmp_path):
+    """Ruling 43: the scoped close's reduce filled on generation 2 and the cache still says 10.
+    The account flatten that takes over on generation 2 sends nothing until a newer one."""
+    s = _stack(tmp_path, [_snapshot(1, [_priced(10.0)])], protection=_Protection())
+    s.service.start(ACCOUNT, "c-1", DEADLINE, scope="conid", conid=1)
+    s.dispatch.rows["c-1-reduce-1-1"] = [_row("Filled", filled=10.0)]
+    s.push(_snapshot(2, [_priced(10.0)]))
+    s.service.rescan()                                        # gen 2: the fill is observed
+    s.service.start(ACCOUNT, "kill-1", DEADLINE)
+    assert s.store.receipt("c-1").state == "SUPERSEDED"
+    assert [c[0] for c in s.dispatch.calls] == ["reduce"]
+    s.push(_snapshot(3, []), _snapshot(4, []))
+    s.service.rescan()
+    assert s.service.receipt_for("kill-1").state == "FLAT"
+    assert [c[0] for c in s.dispatch.calls] == ["reduce"]
+
+
 # ---------------------------------------------------------------------------
 # Task 8: scoped claims join, upgrade or refuse
 # ---------------------------------------------------------------------------

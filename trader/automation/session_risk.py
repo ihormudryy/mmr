@@ -30,17 +30,19 @@ from trader.promotion.portfolio_risk_budget import (
     BLOCK_POSITION_COUNT,
     PortfolioRiskBudget,
 )
+from trader.automation.risk_limits import (  # noqa: F401  (aliases: live_rules imports them here)
+    MAX_DAILY_LOSS_FRACTION,
+    MAX_DRAWDOWN_FRACTION,
+    MAX_POSITION_FRACTION,
+    MAX_POSITIONS,
+    MAX_TRADE_RISK_FRACTION,
+    RiskLimits,
+)
 from trader.research.market_context import LIVE_NOTIONAL_TOLERANCE
 from trader.trading.approval_context import ApprovalContext
 from trader.trading.circuit_breaker import BreakerSignal
 
-# Hard trader-owned ceilings — never loosened by request/artifact fields.
-MAX_POSITIONS = 3
-MAX_POSITION_FRACTION = 0.05
 MAX_GROSS_FRACTION = STEADY_MAX_GROSS_FRACTION
-MAX_TRADE_RISK_FRACTION = 0.002  # 0.20%
-MAX_DAILY_LOSS_FRACTION = 0.005  # 0.50%
-MAX_DRAWDOWN_FRACTION = 0.03  # 3%
 
 _PORTFOLIO_REASON_MAP = {
     BLOCK_COMBINED_GROSS: "PORTFOLIO_GROSS",
@@ -67,8 +69,11 @@ class AllocationCeiling:
 class AutomationSessionState:
     high_water_mark: float
     expected_account_id: str
+    limits: RiskLimits
     liquidity: Optional[LiquidityEvidence] = None
     opening_stabilization: dt.timedelta = dt.timedelta(minutes=5)
+    # The ai_paper path freezes start-of-day net liquidation; the old path leaves it None.
+    daily_loss_anchor: Optional[float] = None
 
 
 @dataclass(frozen=True)
@@ -150,6 +155,18 @@ def _liquidity_from_context(
     return None
 
 
+def _daily_loss_breached(broker, equity: float, anchor: Optional[float], limits: RiskLimits,
+                         reasons: list[str]) -> bool:
+    """Old path: loss over current equity. ai_paper: loss over the frozen start-of-day anchor."""
+    loss = max(0.0, -float(broker.daily_pnl))
+    if anchor is None:
+        return loss / equity >= limits.daily_loss_fraction
+    if not _finite(anchor) or anchor <= 0:
+        reasons.append("DAILY_LOSS_ANCHOR_INVALID")
+        return False
+    return loss >= anchor * limits.daily_loss_fraction
+
+
 class SessionRiskController:
     """Evaluate an intent against trader-owned session, liquidity, and risk policy."""
 
@@ -184,6 +201,7 @@ class SessionRiskController:
         authority: AuthoritySource = None,
     ) -> AutomatedRiskDecision:
         now = self._now()
+        limits = session_state.limits
         reasons: list[str] = []
         signals: list[BreakerSignal] = []
 
@@ -226,8 +244,7 @@ class SessionRiskController:
 
         # --- Daily loss / drawdown -----------------------------------------
         if _finite(equity) and equity > 0:
-            daily_loss_frac = max(0.0, -float(broker.daily_pnl)) / equity
-            if daily_loss_frac >= MAX_DAILY_LOSS_FRACTION:
+            if _daily_loss_breached(broker, equity, session_state.daily_loss_anchor, limits, reasons):
                 reasons.append("DAILY_LOSS")
                 signals.append(BreakerSignal(
                     "DAILY_LOSS_BREACH", now,
@@ -237,7 +254,7 @@ class SessionRiskController:
             hwm = float(session_state.high_water_mark)
             if _finite(hwm) and hwm > 0:
                 drawdown = max(0.0, (hwm - equity) / hwm)
-                if drawdown >= MAX_DRAWDOWN_FRACTION:
+                if drawdown >= limits.drawdown_fraction:
                     reasons.append("DRAWDOWN")
                     signals.append(BreakerSignal(
                         "DRAWDOWN_BREACH", now,
@@ -281,7 +298,7 @@ class SessionRiskController:
                 row.conid for row in broker.positions
                 if row.quantity and float(row.quantity) != 0 and not row.deleted
             }
-            if intent.conid not in open_conids and len(open_conids) >= MAX_POSITIONS:
+            if intent.conid not in open_conids and len(open_conids) >= limits.max_positions:
                 reasons.append("MAX_POSITIONS")
 
         # --- Gross exposure via signed allocation policy (P5 Task 2) ---------
@@ -303,6 +320,7 @@ class SessionRiskController:
             artifact=artifact,
             entry_price=entry_price,
             quote_prices={intent.conid: entry_price} if entry_price is not None else None,
+            risk_limits_gross=limits.gross_fraction,
         )
         reasons.extend(alloc_decision.reason_codes)
         effective_gross = alloc_decision.effective_gross_ceiling
@@ -354,6 +372,7 @@ class SessionRiskController:
                     "daily_loss_pct": daily_loss_pct,
                 },
                 authorities=[resolved_authority],
+                limits=limits,
                 portfolio_authority_present=bool(portfolio_authority),
                 strategy_count=strategy_count,
             )
@@ -364,7 +383,7 @@ class SessionRiskController:
             existing_position_value = abs(float(broker.position_value(intent.conid)))
             order_notional = float(qty) * entry_price
             post_position_value = existing_position_value + order_notional
-            if post_position_value / equity > MAX_POSITION_FRACTION:
+            if post_position_value / equity > limits.position_fraction:
                 reasons.append("POSITION_PCT")
 
             # The research evidence priced this notional; a missing one fails closed.
@@ -380,8 +399,8 @@ class SessionRiskController:
             if math.isfinite(stop_distance) and stop_distance > 0:
                 trade_risk = (stop_distance * float(qty)) / equity
                 intent_cap = float(intent.risk_fraction)
-                effective_risk_cap = MAX_TRADE_RISK_FRACTION
-                if 0 < intent_cap < MAX_TRADE_RISK_FRACTION:
+                effective_risk_cap = limits.trade_risk_fraction
+                if 0 < intent_cap < limits.trade_risk_fraction:
                     effective_risk_cap = intent_cap
                 if trade_risk > effective_risk_cap + 1e-15:
                     reasons.append("TRADE_RISK")

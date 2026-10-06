@@ -18,6 +18,7 @@ from trader.automation.calendar_policy import ET
 from trader.automation.artifact_verifier import VerifiedArtifact
 from trader.automation.liquidity_policy import LiquidityEvidence
 from trader.automation.models import ExecutionIntent
+from trader.automation.risk_limits import PAPER_LIMITS
 from trader.automation.session_risk import AllocationCeiling, AutomationSessionState
 from trader.data.store import DateRange
 from trader.objects import BarSize, WhatToShow
@@ -156,7 +157,7 @@ class ProductionAutomationEvidence:
         self._validate_approval(intent, approval, self._now())
         return AutomationSessionState(
             high_water_mark=high_water_mark, expected_account_id=self._account_id,
-            liquidity=liquidity,
+            limits=PAPER_LIMITS, liquidity=liquidity,
         )
 
     def allocation_factory(
@@ -170,7 +171,7 @@ class ProductionAutomationEvidence:
             raise ApprovalContextError("ALLOCATION_INVALID", "artifact authority has expired")
         # Paper ceiling is trader-owned. No request field can raise it, and no
         # signed allocation authority is invented from eligibility evidence.
-        return AllocationCeiling(max_gross_fraction=min(0.06, ceiling))
+        return AllocationCeiling(max_gross_fraction=min(PAPER_LIMITS.gross_fraction, ceiling))
 
     def _liquidity(self, intent: ExecutionIntent, quote: ExecutableQuote, now: dt.datetime) -> LiquidityEvidence:
         depth = _number(quote.ask_size, "DEPTH_INVALID")

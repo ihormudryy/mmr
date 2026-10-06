@@ -21,6 +21,7 @@ from trader.automation.models import (
     TargetPolicy,
     TimeExitPolicy,
 )
+from trader.automation.risk_limits import PAPER_LIMITS
 from trader.automation.strategy_binding import AttestedStrategy
 from trader.automation.session_risk import (
     AllocationCeiling,
@@ -199,6 +200,7 @@ def make_session(**overrides) -> AutomationSessionState:
     base = dict(
         high_water_mark=1_000_000.0,
         expected_account_id=ACCOUNT,
+        limits=PAPER_LIMITS,
         liquidity=make_liquidity(),
         opening_stabilization=dt.timedelta(minutes=5),
     )

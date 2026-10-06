@@ -19,10 +19,6 @@ from trader.promotion.allocation_attestation import (
 
 # Trader-owned hard ceilings — never loosened by request/artifact/signed authority.
 STEADY_MAX_GROSS_FRACTION = float(STAGE_MAX_CEILING[STAGE_STEADY])  # 15%
-MAX_POSITIONS = 3
-MAX_POSITION_FRACTION = 0.05
-MAX_TRADE_RISK_FRACTION = 0.002
-MAX_DAILY_LOSS_FRACTION = 0.005
 
 AuthoritySource = Union[VerifiedAllocationAuthority, AllocationAuthorityRecord, None]
 
@@ -91,6 +87,7 @@ def resolve_effective_gross_ceiling(
     account_id: str,
     artifact_digest: str,
     now: dt.datetime,
+    risk_limits_gross: Optional[float] = None,
 ) -> tuple[float, Tuple[AllocationLimitCandidate, ...], Optional[str], Tuple[str, ...]]:
     """Most-restrictive-wins gross ceiling + audit candidates."""
     reasons: list[str] = []
@@ -98,6 +95,8 @@ def resolve_effective_gross_ceiling(
         AllocationLimitCandidate("trader_steady_cap", STEADY_MAX_GROSS_FRACTION),
         AllocationLimitCandidate("artifact", float(artifact_max_gross)),
     ]
+    if risk_limits_gross is not None:
+        candidates.append(AllocationLimitCandidate("risk_limits", float(risk_limits_gross)))
 
     auth = _authority_fields(authority)
     authority_digest: Optional[str] = None
@@ -214,6 +213,7 @@ class AllocationPolicy:
         entry_price: Optional[float] = None,
         quote_prices: Optional[Mapping[int, float]] = None,
         exclude_working_order_id: Optional[str] = None,
+        risk_limits_gross: Optional[float] = None,
     ) -> AllocationDecision:
         now = self._now()
         is_entry = intent.side == "BUY"
@@ -227,6 +227,7 @@ class AllocationPolicy:
             account_id=broker.account_id,
             artifact_digest=artifact.artifact_id,
             now=now,
+            risk_limits_gross=risk_limits_gross,
         )
         reasons.extend(auth_reasons)
 

@@ -33,6 +33,17 @@ class DispatchPermit:
     warnings: tuple[str, ...] = ()
 
 
+@dataclass(frozen=True)
+class _ApprovedCeilingAuthority:
+    account_id: str
+    account_mode: str
+    artifact_digest: str
+    max_gross_allocation: float
+    authority_digest: Optional[str] = None
+    stage: str = "CANARY"
+    expires_at: dt.datetime = dt.datetime(2099, 1, 1, tzinfo=dt.timezone.utc)
+
+
 def _direction(value: object) -> str:
     return str(getattr(value, "value", value))
 
@@ -61,6 +72,54 @@ class DispatchGuard:
         self._account_mode = account_mode
         self._allocation_policy = allocation_policy
         self._allocation_authority_lookup = allocation_authority_lookup
+
+    def _recheck_allocation(self, approved, current, price: float, automated: bool) -> None:
+        evidence = getattr(approved, "allocation", None)
+        if evidence is None:
+            # Only automated entries carry allocation evidence. Manual paper
+            # proposals have no allocation ceiling and are not re-checked.
+            if automated:
+                raise DispatchGuardError(
+                    "ALLOCATION_EVIDENCE_MISSING", "allocation evidence is required for entries"
+                )
+            return
+        try:
+            authority = self._active_authority(current.account_id, evidence)
+            decision = self._allocation_policy.revalidate_dispatch(
+                broker=current,
+                approved_broker=approved.broker,
+                conid=approved.conid,
+                side=approved.side,
+                quantity=abs(float(approved.quantity)),
+                entry_price=max(price, float(evidence.entry_limit_price or 0.0)),
+                authority=authority,
+                artifact_max_gross=evidence.artifact_max_gross,
+                artifact_digest=evidence.artifact_digest,
+                authority_digest=evidence.authority_digest,
+                effective_gross_ceiling=evidence.effective_gross_ceiling,
+            )
+        except Exception as exc:
+            raise DispatchGuardError(
+                "ALLOCATION_EVIDENCE_UNAVAILABLE", "allocation re-check could not be evaluated"
+            ) from exc
+        if not decision.approved:
+            code = decision.reason_codes[0] if decision.reason_codes else "GROSS_EXPOSURE"
+            raise DispatchGuardError(code, "allocation policy rejected at dispatch")
+
+    def _active_authority(self, account_id: str, evidence):
+        authority = None
+        if self._allocation_authority_lookup is not None:
+            authority = self._allocation_authority_lookup(account_id, evidence.artifact_digest)
+        if authority is None and self._account_mode != "live":
+            # Paper has no signed authority: the trader-owned ceiling frozen at
+            # approval is the baseline. A signed authority found now can only lower it.
+            authority = _ApprovedCeilingAuthority(
+                account_id=account_id,
+                account_mode=self._account_mode,
+                artifact_digest=evidence.artifact_digest,
+                max_gross_allocation=float(evidence.effective_gross_ceiling),
+            )
+        return authority
 
     def revalidate(self, approved, request, now: dt.datetime) -> DispatchPermit:
         if request.account_id != self._account_id:
@@ -221,31 +280,9 @@ class DispatchGuard:
 
         if (
             self._allocation_policy is not None
-            and getattr(approved, "allocation", None) is not None
             and _direction(approved.risk_direction) != "REDUCING"
         ):
-            alloc_evidence = approved.allocation
-            authority = None
-            if self._allocation_authority_lookup is not None and alloc_evidence.authority_digest:
-                authority = self._allocation_authority_lookup(
-                    current.account_id, alloc_evidence.artifact_digest
-                )
-            decision = self._allocation_policy.revalidate_dispatch(
-                broker=current,
-                approved_broker=approved.broker,
-                conid=approved.conid,
-                side=approved.side,
-                quantity=abs(float(approved.quantity)),
-                entry_price=price,
-                authority=authority,
-                artifact_max_gross=alloc_evidence.artifact_max_gross,
-                artifact_digest=alloc_evidence.artifact_digest,
-                authority_digest=alloc_evidence.authority_digest,
-                effective_gross_ceiling=alloc_evidence.effective_gross_ceiling,
-            )
-            if not decision.approved:
-                code = decision.reason_codes[0] if decision.reason_codes else "GROSS_EXPOSURE"
-                raise DispatchGuardError(code, "allocation policy rejected at dispatch")
+            self._recheck_allocation(approved, current, price, automated)
 
         return DispatchPermit(
             generation_id=current.generation_id,

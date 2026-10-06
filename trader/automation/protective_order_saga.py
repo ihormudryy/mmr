@@ -16,6 +16,7 @@ from typing import Any, Callable, Mapping, Optional, Protocol
 from trader.data.schema_migrations import SchemaMigrator
 from trader.domain.events import DomainMutation
 from trader.domain.identity import command_entity_id
+from trader.trading.approval_context import AllocationDispatchEvidence
 from trader.trading.circuit_breaker import BreakerSignal
 from trader.trading.command_coordinator import BrokerRejectedError
 from trader.trading.dispatch_guard import DispatchGuardError
@@ -413,6 +414,20 @@ def _plan_to_json(plan: BracketPlan) -> dict[str, Any]:
     }
 
 
+def _with_allocation_evidence(approval, artifact, decision, entry_limit_price):
+    """Freeze the ceiling the approval was granted under so dispatch can re-check it."""
+    ceiling = getattr(decision, "effective_gross_ceiling", None)
+    if ceiling is None:
+        return approval  # DispatchGuard refuses an entry that has no evidence
+    return replace(approval, allocation=AllocationDispatchEvidence(
+        artifact_digest=artifact.artifact_id,
+        artifact_max_gross=float(artifact.max_gross_allocation),
+        authority_digest=getattr(decision, "authority_digest", None),
+        effective_gross_ceiling=float(ceiling),
+        entry_limit_price=float(entry_limit_price),
+    ))
+
+
 class ProtectiveOrderSaga:
     """Durable protective-entry saga driven by broker events."""
 
@@ -559,7 +574,10 @@ class ProtectiveOrderSaga:
 
         # 2) Re-run P1 DispatchGuard immediately before first IB side effect.
         try:
-            self._dispatch_guard.revalidate(approval, request, now)
+            self._dispatch_guard.revalidate(
+                _with_allocation_evidence(approval, artifact, decision, limit_price),
+                request, now,
+            )
         except DispatchGuardError as ex:
             closed = replace(
                 validated, state="CLOSED", error_code=ex.code, revision=validated.revision + 1,

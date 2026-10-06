@@ -715,6 +715,7 @@ class AllocationAuthorityStore:
         rows: Sequence[Any],
         *,
         resolved_now: dt.datetime,
+        include_suspended: bool = False,
     ) -> Optional[AllocationAuthorityRecord]:
         seen: set[str] = set()
         for row in rows or ():
@@ -732,6 +733,8 @@ class AllocationAuthorityStore:
             if latest.event not in _ACTIVE_AUTHORITY_EVENTS:
                 continue
             if latest.max_gross_allocation <= 0:
+                if include_suspended:
+                    return latest
                 continue
             return latest
         return None
@@ -753,6 +756,24 @@ class AllocationAuthorityStore:
             fetch="all",
         )
         return self._active_from_rows(rows, resolved_now=resolved_now)
+
+    def authority_for_dispatch(
+        self, account_id: str, artifact_digest: str,
+    ) -> Optional[AllocationAuthorityRecord]:
+        """Like ``active_for`` but a suspended (zero-cap) authority is returned.
+
+        Dispatch must treat a suspension as a zero ceiling, not as "no authority".
+        """
+        rows = self.db.execute(
+            f"SELECT {_SELECT_COLUMNS} FROM allocation_authorities "
+            f"WHERE account_id = ? AND artifact_digest = ? "
+            f"ORDER BY entry_id DESC",
+            [account_id, artifact_digest],
+            fetch="all",
+        )
+        return self._active_from_rows(
+            rows, resolved_now=_as_utc(self._now()), include_suspended=True,
+        )
 
     def active_for_account(
         self,

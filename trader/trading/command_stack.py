@@ -699,7 +699,7 @@ def build_command_stack(
         account_id=trader.ib_account, account_mode=account_mode,
         allocation_policy=allocation_policy,
         allocation_authority_lookup=lambda account_id, artifact_digest: (
-            allocation_authority_store.active_for(account_id, artifact_digest)
+            allocation_authority_store.authority_for_dispatch(account_id, artifact_digest)
         ),
     )
 

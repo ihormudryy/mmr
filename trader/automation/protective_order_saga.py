@@ -414,7 +414,7 @@ def _plan_to_json(plan: BracketPlan) -> dict[str, Any]:
     }
 
 
-def _with_allocation_evidence(approval, artifact, decision):
+def _with_allocation_evidence(approval, artifact, decision, entry_limit_price):
     """Freeze the ceiling the approval was granted under so dispatch can re-check it."""
     ceiling = getattr(decision, "effective_gross_ceiling", None)
     if ceiling is None:
@@ -424,6 +424,7 @@ def _with_allocation_evidence(approval, artifact, decision):
         artifact_max_gross=float(artifact.max_gross_allocation),
         authority_digest=getattr(decision, "authority_digest", None),
         effective_gross_ceiling=float(ceiling),
+        entry_limit_price=float(entry_limit_price),
     ))
 
 
@@ -574,7 +575,8 @@ class ProtectiveOrderSaga:
         # 2) Re-run P1 DispatchGuard immediately before first IB side effect.
         try:
             self._dispatch_guard.revalidate(
-                _with_allocation_evidence(approval, artifact, decision), request, now,
+                _with_allocation_evidence(approval, artifact, decision, limit_price),
+                request, now,
             )
         except DispatchGuardError as ex:
             closed = replace(

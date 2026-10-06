@@ -974,3 +974,18 @@ def test_saga_dispatches_entry_when_ceiling_is_unchanged(tmp_path):
 
     assert state.state == "SUBMITTING"
     assert len(dispatch.calls) == 1
+
+
+def test_saga_refuses_entry_that_only_fits_at_the_quote_not_at_the_entry_limit(tmp_path):
+    # 10 x 160.01 = $1,600.10 fits the cap of $1,600.30. The BUY limit sits a few
+    # bps above the ask, so the order the broker would see is above the cap.
+    saga, _, _, dispatch, *_ = _build_saga(
+        tmp_path, guard=_real_guard(None),
+        risk=FakeSessionRisk(effective_gross_ceiling=0.016003),
+    )
+
+    state = _start_saga(saga, make_intent(), make_approval(price=160.01))
+
+    assert state.state == "CLOSED"
+    assert state.error_code == "GROSS_EXPOSURE"
+    assert dispatch.calls == []

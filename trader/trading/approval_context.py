@@ -39,6 +39,9 @@ class AllocationDispatchEvidence:
     artifact_max_gross: float
     authority_digest: Optional[str]
     effective_gross_ceiling: float
+    # Price of the entry order the saga will send. Gross is re-checked at the
+    # higher of this and the fresh quote.
+    entry_limit_price: Optional[float] = None
 
 
 @dataclass(frozen=True)

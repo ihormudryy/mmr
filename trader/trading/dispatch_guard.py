@@ -91,7 +91,7 @@ class DispatchGuard:
                 conid=approved.conid,
                 side=approved.side,
                 quantity=abs(float(approved.quantity)),
-                entry_price=price,
+                entry_price=max(price, float(evidence.entry_limit_price or 0.0)),
                 authority=authority,
                 artifact_max_gross=evidence.artifact_max_gross,
                 artifact_digest=evidence.artifact_digest,

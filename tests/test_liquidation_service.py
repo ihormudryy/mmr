@@ -959,6 +959,46 @@ def test_an_old_reduce_that_stays_invisible_blocks_to_the_deadline(tmp_path):
 
 
 # ---------------------------------------------------------------------------
+# Round-3 fix (#20, ruling 43): a fill fence outlives the root that observed it
+# ---------------------------------------------------------------------------
+
+def test_a_fill_seen_on_the_deadline_tick_fences_the_next_root(tmp_path):
+    """Ruling 43: root-1's reduce sold 6 on the tick its deadline passed; the position cache still says 10.
+    root-2 claimed on that generation sends nothing; a newer generation shows the real remainder."""
+    s = _stack(tmp_path, [_snapshot(1, [_position()])])
+    s.service.start(ACCOUNT, "root-1", DEADLINE)
+    s.dispatch.rows["root-1-reduce-1-1"] = [_row("Cancelled", filled=6.0)]
+    s.push(_snapshot(2, [_position()]))
+    s.clock["now"] = DEADLINE + dt.timedelta(seconds=1)
+    assert s.service.rescan().state == "FAILED_SAFE"         # gen 2: the fill is observed, then the deadline
+    receipt = s.service.start(ACCOUNT, "root-2", s.clock["now"] + dt.timedelta(minutes=5))
+    assert "newer than the last observed fill" in receipt.detail
+    assert s.dispatch.calls == [("reduce", 1, "SELL", 10.0, "root-1-reduce-1-1")]
+    s.push(_snapshot(3, [_position(4.0)]))
+    s.service.rescan()
+    assert s.dispatch.calls[-1] == ("reduce", 1, "SELL", 4.0, "root-2-reduce-1-1")
+
+
+def test_a_settled_legacy_fill_fences_the_next_root_across_a_restart(tmp_path):
+    """Ruling 43: the old run's late reduce filled 10 of 20; the root that settled it dies at its deadline.
+    After a restart the next root waits for a generation newer than that fill."""
+    _legacy_db(tmp_path, (("flat-1", "FAILED_SAFE", 1),))
+    s = _stack(tmp_path, [_snapshot(5, [_position(20.0)])])
+    s.service.start(ACCOUNT, "root-1", DEADLINE)
+    s.dispatch.rows["flat-1-liquidation-reduce-1"] = [_row("Filled", filled=10.0)]
+    s.push(_snapshot(6, [_position(20.0)]))
+    s.clock["now"] = DEADLINE + dt.timedelta(seconds=1)
+    assert s.service.rescan().state == "FAILED_SAFE"
+    assert not _pre_sp1_open(s.db, "flat-1")                 # settled FILLED on generation 6
+    s.restart()
+    receipt = s.service.start(ACCOUNT, "root-2", s.clock["now"] + dt.timedelta(minutes=5))
+    assert "newer than the last observed fill" in receipt.detail and s.dispatch.calls == []
+    s.push(_snapshot(7, [_position(10.0)]))
+    s.service.rescan()
+    assert s.dispatch.calls == [("reduce", 1, "SELL", 10.0, "root-2-reduce-1-1")]
+
+
+# ---------------------------------------------------------------------------
 # Task 5: conid-scoped full close
 # ---------------------------------------------------------------------------
 
@@ -1831,6 +1871,8 @@ def test_account_claim_supersede_and_inheritance_commit_together_or_not_at_all(t
     assert (s.registry.get("p-1").state, s.registry.account_owner(ACCOUNT)) == ("ACTIVE", None)
     assert s.store.receipt("p-1").state != "SUPERSEDED" and s.store.receipt("kill-1") is None
     assert s.service.root_for("kill-1") is None
+
+
 # ---------------------------------------------------------------------------
 # Task 8: scoped claims join, upgrade or refuse
 # ---------------------------------------------------------------------------

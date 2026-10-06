@@ -419,6 +419,19 @@ class LiquidationRunStore:
         """Only in the transaction that settles the run's wildcard child (ruling 42)."""
         conn.execute("UPDATE liquidation_runs SET pre_sp1_open = FALSE WHERE cause_command_id = ?", [run_id])
 
+    def fill_watermark_in_tx(self, conn, account_id: str, conid: Optional[int]) -> Optional[int]:
+        """Newest generation at which any child of the scope was seen fill-bearing (ruling 43).
+
+        Any root, any state. A conid scope also counts wildcard children
+        (conid NULL), which may hold a fill of any conid.
+        """
+        conid_filter = "" if conid is None else " AND (conid = ? OR conid IS NULL)"
+        params: list = [account_id] + ([] if conid is None else [int(conid)])
+        row = conn.execute(
+            "SELECT MAX(observed_generation) FROM liquidation_children WHERE account_id = ? "
+            "AND (state = 'ABSENT' OR filled_quantity > filled_at_send)" + conid_filter, params).fetchone()
+        return None if row[0] is None else int(row[0])
+
     def legacy_reduces_in_tx(self, conn, account_id: str) -> tuple[ChildRef, ...]:
         """Every wildcard child of the account, whoever owns it (ruling 42)."""
         rows = conn.execute(
@@ -1008,11 +1021,15 @@ class LiquidationService:
             return child
         return replace(child, state=state, filled_quantity=filled, observed_generation=newest)
 
-    @staticmethod
-    def _fresh(receipt, generation: int) -> bool:
-        """R5: sizing needs a generation newer than every fill this root observed."""
-        return all(generation > c.observed_generation for c in receipt.children
-                   if c.fill_bearing and c.observed_generation is not None)
+    def _fresh(self, receipt, generation: int) -> bool:
+        """R5, ruling 43: sizing needs a generation newer than every fill observed on the scope.
+
+        The fence is any root's: a fill seen by a root that has since ended,
+        been superseded or been restarted still binds the next root.
+        """
+        watermark = self._store.transaction(
+            lambda conn: self._store.fill_watermark_in_tx(conn, receipt.account_id, receipt.conid))
+        return watermark is None or generation > watermark
 
     def _blocking(self, receipt, generation: int) -> Optional[str]:
         """R5, D2: a child that is unknown or still working stops every new reduce.

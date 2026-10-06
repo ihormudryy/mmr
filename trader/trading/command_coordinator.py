@@ -1770,12 +1770,14 @@ def classify_cancel(order: Optional[BrokerOrderRow]) -> RiskDirection:
 
     [Task 6 addendum §2]: ``order_correlation.classify_leg`` is the ONLY
     producer of ``leg``; its values are ``"entry"`` (no parent), ``"stop"``,
-    ``"take_profit"``, ``f"child-{client_order_id}"``, or ``None``
-    (external / no group). Cancelling an entry removes PENDING exposure
-    (REDUCING). Cancelling a protective leg strips protection from an
-    already-open position (INCREASING). A ``None`` row, a ``None`` leg, or
-    any non-entry leg is treated as protective -- fail safe toward requiring
-    the ceremony, never toward a silent unprotected cancel.
+    ``"take_profit"``, ``"exit"`` (a liquidation reduce),
+    ``f"child-{client_order_id}"``, or ``None`` (external / no group).
+    Cancelling an entry removes PENDING exposure (REDUCING). Cancelling a
+    protective leg strips protection from an already-open position, and
+    cancelling an exit keeps exposure the close was removing (both
+    INCREASING). A ``None`` row, a ``None`` leg, or any non-entry leg is
+    treated as protective -- fail safe toward requiring the ceremony, never
+    toward a silent unprotected cancel.
     """
     if order is not None and order.leg == "entry":
         return RiskDirection.REDUCING

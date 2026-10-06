@@ -553,60 +553,78 @@ def test_broker_ingest_appends_fill_and_commission_evidence(tmp_path):
     assert any(k.startswith("commission:") for k in keys)
 
 
-def test_broker_ingest_forwards_order_events_to_protective_saga(tmp_path):
+def _forwarded_events(tmp_path, *, order_ref, order_type, name, action="SELL", parent_id=0,
+                      observations=1):
+    """Apply order observations through the real ingest; return saga events and stored rows."""
     from trader.automation.attribution import AttributionLedger
-    from trader.automation.protective_order_saga import BrokerOrderEvent
     from trader.data.attribution_store import apply_attribution_migrations
     from trader.trading.broker_ingest import BrokerIngest
     from trader.trading.order_correlation import OrderObservation
 
-    db, migrator, journal = _db(tmp_path, "saga-wire.duckdb")
+    db, migrator, journal = _db(tmp_path, name)
     apply_attribution_migrations(migrator)
     store = BrokerStateStore(db)
     store.migrate(migrator)
-
-    seen: list[BrokerOrderEvent] = []
+    seen = []
 
     class FakeSaga:
-        def on_broker_event(self, event: BrokerOrderEvent):
+        def on_broker_event(self, event):
             seen.append(event)
-            return SimpleNamespace(state="ENTRY_WORKING")
+            return SimpleNamespace(state="PROTECTED")
 
-    ledger = AttributionLedger(
-        journal=journal, db=db, account_id=ACCOUNT, now=lambda: NOW,
-    )
     ingest = BrokerIngest(
-        db=db, journal=journal, store=store,
-        account_id=ACCOUNT, account_mode="paper",
-        attribution_ledger=ledger,
+        db=db, journal=journal, store=store, account_id=ACCOUNT, account_mode="paper",
+        attribution_ledger=AttributionLedger(journal=journal, db=db, account_id=ACCOUNT, now=lambda: NOW),
         protective_order_saga=FakeSaga(),
     )
-
-    obs = OrderObservation(
-        account_id=ACCOUNT,
-        perm_id=42,
-        client_order_id=1,
-        parent_id=0,
-        conid=CONID,
-        symbol="AAPL",
-        action="BUY",
-        order_type="LMT",
-        total_quantity=10.0,
-        filled_quantity=0.0,
-        avg_fill_price=None,
-        limit_price=160.0,
-        stop_price=None,
-        tif="DAY",
-        status="Submitted",
-        order_ref=encode_order_ref(ORDER_GROUP),
-        source_timestamp=NOW,
-    )
     conn = journal.connect()
-    ingest._apply_record(
-        conn, obs,
-        lambda mutation, write: journal.mutate(conn, mutation, write),
-    )
+    for index in range(observations):
+        obs = OrderObservation(
+            account_id=ACCOUNT, perm_id=77, client_order_id=7, parent_id=parent_id, conid=CONID,
+            symbol="AAPL", action=action, order_type=order_type, total_quantity=6.0,
+            filled_quantity=0.0, avg_fill_price=None, limit_price=None, stop_price=95.0, tif="DAY",
+            status="Submitted" if index == 0 else "PreSubmitted", order_ref=order_ref,
+            source_timestamp=NOW + dt.timedelta(seconds=index),
+        )
+        ingest._apply_record(conn, obs, lambda mutation, write: journal.mutate(conn, mutation, write))
+    return seen, store.select_active_orders_in_tx(journal.connect())
+
+
+def test_broker_ingest_forwards_order_events_to_protective_saga(tmp_path):
+    seen, _rows = _forwarded_events(tmp_path, order_ref=encode_order_ref(ORDER_GROUP), order_type="LMT",
+                                    action="BUY", name="saga-wire.duckdb")
     assert len(seen) == 1
     assert seen[0].order_group_id == ORDER_GROUP
     assert seen[0].leg == "entry"
     assert seen[0].status == "Submitted"
+
+
+def test_broker_ingest_classifies_a_reprotect_stop_leg_without_a_parent(tmp_path):
+    """SP1 plan 1 Task 2: a replacement stop has no parent but is a stop, not an entry."""
+    seen, rows = _forwarded_events(tmp_path, order_ref=encode_order_ref("p-1-reprotect-stop-265598-1"),
+                                   order_type="STP", name="reprotect-leg.duckdb")
+    assert [(e.order_group_id, e.leg) for e in seen] == [("p-1-reprotect-stop-265598-1", "stop")]
+    # The correlator mints the entity id from the same leg (order_group_id:leg).
+    assert [(r.order_entity_id, r.leg) for r in rows] == [("p-1-reprotect-stop-265598-1:stop", "stop")]
+
+
+def test_broker_ingest_reclassifies_a_pre_sp1_reduce_stored_as_an_entry(tmp_path):
+    """A reduce row written before SP1 has the sticky leg ``entry``; its next update fixes it."""
+    from trader.data.broker_state import BrokerOrderRow
+
+    name = "legacy-reduce.duckdb"
+    ref = encode_order_ref("flat-1-liquidation-reduce-265598")
+    db, migrator, journal = _db(tmp_path, name)
+    store = BrokerStateStore(db)
+    store.migrate(migrator)
+    legacy = BrokerOrderRow(
+        order_entity_id="flat-1-liquidation-reduce-265598:entry", account_id=ACCOUNT, conid=CONID,
+        symbol="AAPL", order_group_id="flat-1-liquidation-reduce-265598", leg="entry", is_external=False,
+        action="SELL", order_type="MKT", total_quantity=6.0, filled_quantity=0.0, avg_fill_price=None,
+        limit_price=None, stop_price=None, tif="DAY", status="Submitted", deleted=False, revision=1,
+        source_timestamp=NOW)
+    db.transaction(lambda conn: (store.upsert_order_in_tx(conn, legacy),
+                                 store.bind_alias_in_tx(conn, "perm_id", "77", ACCOUNT, "",
+                                                        legacy.order_entity_id, NOW)))
+    _seen, rows = _forwarded_events(tmp_path, order_ref=ref, order_type="MKT", name=name)
+    assert [(r.order_entity_id, r.leg) for r in rows] == [("flat-1-liquidation-reduce-265598:entry", "exit")]

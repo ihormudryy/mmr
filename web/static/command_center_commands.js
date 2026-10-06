@@ -597,7 +597,7 @@ async function ccRejectProposal(proposal) {
  * the landed [M1-R] client store or the real [M1-F2]/[M1-F3] order payload
  * (`trader/data/broker_state.py`'s `BrokerOrderRow.to_payload()`) -- the
  * real field is `leg`, produced ONLY by `order_correlation.classify_leg`
- * with values `"entry" | "stop" | "take_profit" | f"child-{id}" | null`
+ * with values `"entry" | "stop" | "take_profit" | "exit" | f"child-{id}" | null`
  * (mirrored server-side by `classify_cancel`, the real authority this
  * ceremony defers to). This section reads the real store shape instead --
  * `store.view.orders.active`/`.terminal`, `store.view.positions`,

@@ -9,7 +9,10 @@ from trader.data.duckdb_store import DuckDBConnection
 from trader.data.domain_journal import DomainJournal
 from trader.data.schema_migrations import SchemaMigrator
 from trader.trading.broker_ingest import BrokerIngest
-from trader.trading.order_correlation import classify_leg, decode_order_ref, encode_order_ref
+from trader.trading.order_correlation import (
+    classify_leg, decode_order_ref, encode_order_ref, liquidation_child_id, liquidation_child_kind,
+    reprotect_oca_group,
+)
 
 UTC_NOW = dt.datetime(2026, 7, 15, 13, 0, tzinfo=dt.timezone.utc)
 
@@ -193,3 +196,31 @@ def test_failed_order_write_rolls_back_aliases_with_the_journal_event(env, monke
     assert env.db.execute(
         "SELECT COUNT(*) FROM broker_order_aliases", fetch="one"
     ) == (0,)
+
+
+def test_liquidation_children_classify_by_group_not_parent():
+    assert classify_leg("STP", 0, 7, "p-1-reprotect-stop-265598-1") == "stop"
+    assert classify_leg("LMT", 0, 8, "p-1-reprotect-target-265598-1") == "take_profit"
+    assert classify_leg("MKT", 0, 9, "p-1-reduce-265598-2") == "exit"
+
+
+def test_a_pre_sp1_liquidation_reduce_ref_is_an_exit():
+    """Refs written before SP1 ({root}-liquidation-reduce-{conid}) are exits, not entries."""
+    assert liquidation_child_kind("flat-1-liquidation-reduce-265598") == "reduce"
+    assert classify_leg("MKT", 0, 9, "flat-1-liquidation-reduce-265598") == "exit"
+
+
+def test_other_groups_keep_the_parent_rule():
+    assert classify_leg("STP", 0, 7, "og-cmd1") == "entry"
+    assert classify_leg("STP", 5, 7, "og-cmd1") == "stop"
+    assert classify_leg("LMT", 5, 7) == "take_profit"
+
+
+def test_liquidation_child_ids_are_deterministic_and_colon_free():
+    assert liquidation_child_id("root-1", "reprotect-stop", 265598, 1) == "root-1-reprotect-stop-265598-1"
+    assert reprotect_oca_group("root-1", 265598, 2) == "root-1-reprotect-265598-2"
+    assert liquidation_child_kind("root-1-reduce-265598-3") == "reduce"
+    assert liquidation_child_kind("og-root-1") is None
+    for bad in (("root:1", "reduce", 1, 1), ("root-1", "entry", 1, 1), ("root-1", "reduce", 1, 0)):
+        with pytest.raises(ValueError):
+            liquidation_child_id(*bad)

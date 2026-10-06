@@ -30,6 +30,7 @@ from trader.trading.order_correlation import (
     OrderObservation,
     classify_leg,
     decode_order_ref,
+    liquidation_child_kind,
     normalize_open_order,
 )
 
@@ -122,6 +123,19 @@ def _none_if_unset(value: Any) -> Optional[float]:
     if numeric == 0.0 or numeric >= _UNSET_DOUBLE:
         return None
     return numeric
+
+
+def _order_leg(obs: Any, group_id: Optional[str], current: Any) -> Optional[str]:
+    """The leg of an order row. The first classification sticks, except for
+    liquidation children: their group names the leg, so an older row (for
+    example a pre-SP1 reduce stored as ``entry``) is classified again."""
+    if group_id and liquidation_child_kind(group_id) is not None:
+        return classify_leg(obs.order_type, obs.parent_id, obs.client_order_id, group_id)
+    if current is not None and current.leg:
+        return current.leg
+    if group_id:
+        return classify_leg(obs.order_type, obs.parent_id, obs.client_order_id, group_id)
+    return None
 
 
 @dataclass(frozen=True)
@@ -744,15 +758,7 @@ class BrokerIngest:
             conid=obs.conid,
             symbol=obs.symbol,
             order_group_id=group_id or (current.order_group_id if current else None),
-            leg=(
-                current.leg
-                if current and current.leg
-                else (
-                    classify_leg(obs.order_type, obs.parent_id, obs.client_order_id)
-                    if group_id
-                    else None
-                )
-            ),
+            leg=_order_leg(obs, group_id, current),
             is_external=(group_id is None) if current is None else current.is_external,
             action=obs.action,
             order_type=obs.order_type,
@@ -1278,7 +1284,9 @@ class BrokerIngest:
             return
         from trader.automation.protective_order_saga import BrokerOrderEvent
 
-        leg = order.leg or classify_leg(obs.order_type, obs.parent_id, obs.client_order_id)
+        leg = order.leg or classify_leg(
+            obs.order_type, obs.parent_id, obs.client_order_id, order.order_group_id,
+        )
         event = BrokerOrderEvent(
             order_group_id=order.order_group_id,
             leg=leg or "entry",

@@ -1728,3 +1728,140 @@ def test_unreadable_reservations_refuse_the_entry(tmp_path):
     assert state.state == "CLOSED"
     assert state.error_code == "IN_FLIGHT_STATE_UNAVAILABLE"
     assert dispatch.calls == []
+
+
+# --- Reservations are released only by what the broker snapshot proves -------
+#
+# The entry limit is 160.09, so 25 shares reserve $4,002.25 and 5 filled
+# shares reserve $800.45 against the $6,000 budget.
+
+def _working_stop(order_group_id, conid, shares=ENTRY_SHARES):
+    from dataclasses import replace as dc_replace
+
+    return dc_replace(
+        _working_entry(order_group_id, conid, shares),
+        order_entity_id=f"stop-{order_group_id}", leg="stop", action="SELL",
+        order_type="STP", limit_price=None, stop_price=150.0,
+    )
+
+
+def _held(conid, shares, *, stamped):
+    from trader.data.broker_state import BrokerPositionRow
+
+    return BrokerPositionRow(
+        account_id=ACCOUNT, conid=conid, symbol="X", sec_type="STK",
+        exchange="SMART", currency="USD", quantity=float(shares), average_cost=160.0,
+        market_price=160.0, market_value=160.0 * shares, unrealized_pnl=0.0,
+        realized_pnl=0.0, daily_pnl=0.0, deleted=False, revision=1,
+        source_timestamp=stamped,
+    )
+
+
+def _entry_fill(order_group_id, *, status, filled, event_id):
+    from trader.automation.protective_order_saga import BrokerOrderEvent
+
+    return BrokerOrderEvent(
+        order_group_id=order_group_id, leg="entry", status=status,
+        filled_quantity=filled, total_quantity=ENTRY_SHARES, order_id=5001,
+        event_id=event_id, source_timestamp=NOW,
+    )
+
+
+def _try_entry(tmp_path, snapshot, shares, signal):
+    saga, _, _, dispatch, *_ = _build_saga(
+        tmp_path, guard=_group_guard(snapshot), risk=_sized_risk(shares),
+    )
+    return _start_entry(saga, _entry(OTHER_CONID, shares=shares, signal=signal), snapshot)
+
+
+def test_working_stop_of_the_group_does_not_hide_an_unseen_entry(tmp_path):
+    empty = _snapshot()
+    saga, *_ = _build_saga(tmp_path, guard=_group_guard(empty), risk=_sized_risk())
+    first = _start_entry(saga, _entry(CONID), empty)
+    assert first.state == "SUBMITTING"
+
+    # Restart: the broker shows only the SELL stop, not the BUY parent.
+    stop_only = replace_snapshot(empty, working_orders=(
+        _working_stop(first.order_group_id, CONID),
+    ))
+    second = _try_entry(tmp_path, stop_only, ENTRY_SHARES, "after-restart")
+
+    assert second.state == "CLOSED"
+    assert second.error_code == "GROSS_EXPOSURE_IN_FLIGHT"
+
+
+def test_partial_fill_counts_until_the_position_shows_it(tmp_path):
+    from dataclasses import replace as dc_replace
+
+    empty = _snapshot()
+    saga, *_ = _build_saga(tmp_path, guard=_group_guard(empty), risk=_sized_risk())
+    first = _start_entry(saga, _entry(CONID), empty)
+    partial = saga.on_broker_event(
+        _entry_fill(first.order_group_id, status="Submitted", filled=5, event_id="p5"),
+    )
+    assert partial.state == "PARTIALLY_FILLED"
+
+    # The broker counts the 20 unfilled shares; the 5 filled are not in positions yet.
+    lagging = replace_snapshot(empty, working_orders=(dc_replace(
+        _working_entry(first.order_group_id, CONID), filled_quantity=5.0,
+    ),))
+    refused = _try_entry(tmp_path, lagging, 14, "lag")
+    assert refused.error_code == "GROSS_EXPOSURE_IN_FLIGHT"  # 3,201.80 + 800.45 + 2,241.26
+
+    # The position now shows the 5 shares: they are counted once, by the broker.
+    shown = replace_snapshot(
+        lagging, positions=(_held(CONID, 5, stamped=NOW + dt.timedelta(seconds=1)),),
+    )
+    assert _try_entry(tmp_path, shown, 12, "shown").state == "SUBMITTING"
+
+
+def test_cancel_after_partial_fill_keeps_the_filled_shares_reserved(tmp_path):
+    empty = _snapshot()
+    saga, *_ = _build_saga(tmp_path, guard=_group_guard(empty), risk=_sized_risk())
+    first = _start_entry(saga, _entry(CONID), empty)
+    saga.on_broker_event(
+        _entry_fill(first.order_group_id, status="Submitted", filled=5, event_id="p5"),
+    )
+    cancelled = saga.on_broker_event(
+        _entry_fill(first.order_group_id, status="Cancelled", filled=5, event_id="c5"),
+    )
+    assert cancelled.entry_cancelled is True
+
+    # 36 shares ($5,763.24) fit alone but not with the 5 filled shares.
+    assert _try_entry(tmp_path, empty, 36, "big").error_code == "GROSS_EXPOSURE_IN_FLIGHT"
+    # The 20 cancelled shares are released.
+    assert _try_entry(tmp_path, empty, 25, "fits").state == "SUBMITTING"
+
+
+def test_full_fill_counts_until_a_newer_position_or_generation_shows_it(tmp_path):
+    empty = _snapshot()
+    saga, *_, breaker, liquidation, _, _, _ = _build_saga(
+        tmp_path, guard=_group_guard(empty), risk=_sized_risk(),
+    )
+    first = _start_entry(saga, _entry(CONID), empty)
+    filled = saga.on_broker_event(
+        _entry_fill(first.order_group_id, status="Filled", filled=25, event_id="f25"),
+    )
+    assert filled.state == "SAFETY_FAILED"
+    assert filled.filled_at == NOW
+
+    assert _try_entry(tmp_path, empty, 25, "lag").error_code == "GROSS_EXPOSURE_IN_FLIGHT"
+
+    # A position row stamped before the fill does not prove it.
+    stale = replace_snapshot(
+        empty, positions=(_held(CONID, 25, stamped=NOW - dt.timedelta(seconds=1)),),
+    )
+    assert _try_entry(tmp_path, stale, 6, "stale").state == "CLOSED"
+
+    fresh = replace_snapshot(
+        empty, positions=(_held(CONID, 25, stamped=NOW + dt.timedelta(seconds=1)),),
+    )
+    assert _try_entry(tmp_path, fresh, 6, "fresh").state == "SUBMITTING"
+
+    # A complete enumeration that began after the fill shows no position:
+    # the shares are gone, so nothing stays reserved.
+    enumerated = replace_snapshot(
+        empty, generation_id=2, source_cursor=2,
+        generation_started_at=NOW + dt.timedelta(seconds=1),
+    )
+    assert _try_entry(tmp_path, enumerated, 25, "enumerated").state == "SUBMITTING"

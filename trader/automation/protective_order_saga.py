@@ -54,6 +54,9 @@ _TERMINAL_SAGA = frozenset({"CLOSED", "SAFETY_FAILED"})
 # The entry may be at the broker with quantity still unfilled. VALIDATED is
 # not here: it is written before the dispatch guard, so nothing was sent yet.
 _IN_FLIGHT_SAGA = ("SUBMITTING", "OUTCOME_UNKNOWN", "ENTRY_WORKING", "PARTIALLY_FILLED")
+# Sagas that may hold bought shares. EXITING and CLOSED have sold them (or
+# never bought any); VALIDATED never sent anything.
+_MAY_HOLD_SHARES_SAGA = _IN_FLIGHT_SAGA + ("PROTECTED", "SAFETY_FAILED")
 
 _account_entry_locks: dict[str, threading.Lock] = {}
 _account_entry_locks_guard = threading.Lock()
@@ -335,6 +338,8 @@ class SagaState:
     pending_groups: tuple[str, ...] = ()      # re-protect legs of the owning close, not yet released
     pending_protection_lost: bool = False      # a pending leg was rejected or cancelled unasked
     flatten_requested: bool = False            # SAFETY_FAILED seen by this version: the worker flattens
+    # When the saga last saw the entry fill grow (broker ingest clock).
+    filled_at: Optional[dt.datetime] = None
 
     @property
     def current_groups(self) -> tuple[str, ...]:
@@ -376,6 +381,7 @@ class SagaState:
             "pending_groups": list(self.pending_groups),
             "pending_protection_lost": self.pending_protection_lost,
             "flatten_requested": self.flatten_requested,
+            "filled_at": None if self.filled_at is None else self.filled_at.isoformat(),
         }
 
     @classmethod
@@ -414,6 +420,10 @@ class SagaState:
             pending_groups=tuple(payload.get("pending_groups") or ()),
             pending_protection_lost=bool(payload.get("pending_protection_lost", False)),
             flatten_requested=bool(payload.get("flatten_requested", False)),
+            filled_at=(
+                dt.datetime.fromisoformat(payload["filled_at"])
+                if payload.get("filled_at") else None
+            ),
         )
 
 
@@ -518,30 +528,42 @@ class ProtectiveOrderSagaStore:
     def in_flight_entries(
         self, account_id: str, exclude_command_id: str,
     ) -> tuple[InFlightEntry, ...]:
-        """BUY entries of this account whose unfilled part may be at the broker."""
-        placeholders = ", ".join("?" for _ in _IN_FLIGHT_SAGA)
+        """BUY entries of this account whose exposure the broker may not show yet.
+
+        The unfilled part counts until a broker cancel or reject is recorded.
+        The filled part counts while the saga may hold the shares; the
+        dispatch guard drops it once the broker snapshot proves it.
+        """
+        placeholders = ", ".join("?" for _ in _MAY_HOLD_SHARES_SAGA)
         rows = self._db.execute(
-            f"SELECT payload FROM automated_order_sagas WHERE state IN ({placeholders})",
-            list(_IN_FLIGHT_SAGA), fetch="all",
+            "SELECT payload, updated_at FROM automated_order_sagas "
+            f"WHERE state IN ({placeholders})",
+            list(_MAY_HOLD_SHARES_SAGA), fetch="all",
         )
         entries = []
-        for (payload,) in rows or ():
+        for payload, updated_at in rows or ():
             state = SagaState.from_payload(json.loads(payload))
             if (
                 state.account_id != account_id
                 or state.command_id == exclude_command_id
                 or state.side != "BUY"
-                or state.entry_cancelled
             ):
                 continue
-            remaining = state.requested_quantity - state.filled_quantity
-            if remaining <= 0:
+            unfilled = Decimal("0")
+            if state.state in _IN_FLIGHT_SAGA and not state.entry_cancelled:
+                unfilled = max(Decimal("0"), state.requested_quantity - state.filled_quantity)
+            filled = state.filled_quantity
+            if unfilled <= 0 and filled <= 0:
                 continue
             entries.append(InFlightEntry(
                 order_group_id=state.order_group_id,
                 conid=state.conid,
-                remaining_quantity=float(remaining),
+                unfilled_quantity=float(unfilled),
+                filled_quantity=float(filled),
                 limit_price=_entry_limit_price(state),
+                # Rows written before filled_at existed: the last update is
+                # no earlier than the fill.
+                filled_at=state.filled_at or (_as_utc(updated_at) if filled > 0 else None),
             ))
         return tuple(entries)
 
@@ -778,7 +800,7 @@ class ProtectiveOrderSaga:
         """Final gross check and send. Callers hold the account entry lock for entries.
 
         The SUBMITTING row written here is the durable reservation: later
-        checks count it until a broker event closes or fills it.
+        checks count it until the broker snapshot proves its exposure.
         """
         in_flight: tuple[InFlightEntry, ...] = ()
         if not _is_reduction(approval):
@@ -1120,6 +1142,9 @@ class ProtectiveOrderSaga:
                 next_state = replace(next_state, target_working=False)
             if status in _FILLED_STATUSES:
                 next_state = replace(next_state, target_filled=True, target_working=False)
+
+        if next_state.filled_quantity > state.filled_quantity:
+            next_state = replace(next_state, filled_at=_as_utc(event.source_timestamp))
 
         protection_working = self._protection_confirmed(next_state)
         next_state = replace(next_state, protection_working=protection_working)

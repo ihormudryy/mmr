@@ -55,20 +55,45 @@ def _working_order_fingerprint(snapshot) -> tuple:
     )
 
 
-def _unseen_in_flight_notional(evidence, snapshot) -> float:
-    """Notional of in-flight entries the broker snapshot does not show yet.
+def _broker_counted_entry_quantity(entry, snapshot) -> float:
+    """Unfilled shares of this entry that the snapshot's gross already counts.
 
-    Once the broker shows the order group, the snapshot's working orders count
-    it, so it must not be counted twice.
+    Only the BUY entry order itself counts: a working SELL stop of the same
+    group adds nothing to gross. Mirrors ``compute_working_entry_notional``.
     """
-    visible_groups = {
-        row.order_group_id for row in snapshot.working_orders
-        if not row.deleted and row.order_group_id
-    }
     return sum(
-        entry.notional for entry in evidence.in_flight_entries
-        if entry.order_group_id not in visible_groups
+        max(0.0, float(row.total_quantity) - float(row.filled_quantity))
+        for row in snapshot.working_orders
+        if not row.deleted
+        and row.order_group_id == entry.order_group_id
+        and row.leg == "entry"
+        and str(row.action).upper() == "BUY"
     )
+
+
+def _fill_is_in_snapshot(entry, snapshot) -> bool:
+    """True when the snapshot provably includes the entry's filled shares."""
+    filled_at = entry.filled_at
+    if filled_at is None:
+        return False
+    started_at = snapshot.generation_started_at
+    if started_at is not None and started_at > filled_at:
+        return True
+    return any(
+        row.conid == entry.conid and not row.deleted and row.source_timestamp >= filled_at
+        for row in snapshot.positions
+    )
+
+
+def _unseen_in_flight_notional(evidence, snapshot) -> float:
+    """Notional of in-flight entries that the broker snapshot does not count yet."""
+    total = 0.0
+    for entry in evidence.in_flight_entries:
+        unseen = max(0.0, entry.unfilled_quantity - _broker_counted_entry_quantity(entry, snapshot))
+        if entry.filled_quantity > 0 and not _fill_is_in_snapshot(entry, snapshot):
+            unseen += entry.filled_quantity
+        total += unseen * entry.limit_price
+    return total
 
 
 class DispatchGuard:

@@ -33,16 +33,20 @@ class ApprovalContextError(RuntimeError):
 
 @dataclass(frozen=True)
 class InFlightEntry:
-    """An automated entry that may be at the broker but is not yet in its snapshot."""
+    """An automated BUY entry whose exposure the broker snapshot may not show yet.
+
+    ``unfilled_quantity`` may still be working at the broker (zero once a
+    broker cancel or reject is recorded). ``filled_quantity`` was bought;
+    it counts until a position row or a broker enumeration newer than
+    ``filled_at`` proves the snapshot includes it.
+    """
 
     order_group_id: str
     conid: int
-    remaining_quantity: float
+    unfilled_quantity: float
+    filled_quantity: float
     limit_price: float
-
-    @property
-    def notional(self) -> float:
-        return self.remaining_quantity * self.limit_price
+    filled_at: Optional[dt.datetime] = None
 
 
 @dataclass(frozen=True)

@@ -1,5 +1,7 @@
 # AI Paper SP1 — Plan 1: Safe Close — Implementation Plan
 
+> **Superseded by the code.** After review round 5 (2026-10-06) the code on the implementation PR is the source of truth; later review fixes are recorded in commits, not in this plan.
+
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking. **Run the tasks in the "Execution order" below, not in number order.** The tasks appear in this file in execution order.
 
 **Goal:** Make every exit on the paper path go through one broker-verified close service. It hands protection over before it cancels a stop, owns one close per position, re-protects after a partial close with a linked stop/target, journals every child order before it is sent, never sends a reduce while a child order is unknown or still working, and never reports a close that sold nothing as a success.

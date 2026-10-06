@@ -16,7 +16,7 @@
 - One broker dispatch boundary: every order goes through `TradingRuntimeOrderDispatch` → `Trader.place_expressive_order` / the new `Trader.place_exit_oca`. No second IB order path.
 - `CommandReceipt` stays frozen. `ExecutionIntent` is not changed.
 - `OUTCOME_UNKNOWN` is never resubmitted under a fresh id. A child order that was submitted but is not yet visible on a newer broker generation is unknown; no new reduce follows an unknown.
-- The trader journal (`trader.journal_db`) is the source of truth. Every new table is a journal migration with the next free version: **32** exit owners, **33** liquidation run columns, **34** saga columns and saga groups. Versions 30 and 31 are taken.
+- The trader journal (`trader.journal_db`) is the source of truth. Every new table is a journal migration with the next free version: **35** exit owners, **36** liquidation run columns and children, **37** saga columns and saga groups. Versions 30 and 31 are taken, and **32–34 belong to `trader/data/attribution_store.py`**. `SchemaMigrator` records a version once, so reusing a taken number silently skips the new DDL. Free after this plan: 38–39, 46–49, 54+.
 - Command ids and child ids never contain `:` (they become IB `orderRef` values via `encode_order_ref`).
 - Routine progress of a scoped close never trips the breaker. Account-scope breaker behaviour is unchanged.
 - Test-first. Each task begins with a failing test. Run tests with `pytest <path> -q --timeout=30`. The full suite: `pytest tests/ -q --timeout=30 --ignore=tests/test_ibrx_async.py`.
@@ -29,10 +29,56 @@
 Five spec-implied inputs no test list in the spec names. Each has a test pinned to a task below.
 
 1. **Short positions.** A scoped close of a short (`quantity < 0`) must reduce with `BUY`, bound a partial by `|quantity|`, and place the re-protect stop *above* the market price. → Task 6 (`test_partial_close_of_short_reprotects_above_price`), Task 5 (`test_full_close_of_short_reduces_with_buy`).
-2. **Partial quantity edge cases.** `q` that rounds to zero is refused; `q ≥ |position|` becomes a full close; `q` leaving less than one share becomes a full close. → Task 6 (`test_partial_quantity_edge_cases`).
+2. **Partial quantity edge cases.** `q` that rounds to zero is refused; `q ≥ |position|` at `start` is refused (spec 5.1: `0 < q < |position|`); `q` leaving less than one share becomes a full close; a position that shrank to `≤ q` by dispatch time is fully closed (amendment R15). → Task 6 (`test_partial_quantity_edge_cases`).
 3. **Position already gone when the close reduces.** If the stop filled during the cancel race, the close must end `CLOSED` without sending a reduce. → Task 5 (`test_close_ends_closed_without_reduce_when_position_vanished`).
 4. **Root id reuse with a different scope or conid.** Starting an existing root with another `conid` or `scope` must raise, never silently rebind. → Task 4 (`test_start_refuses_rebinding_root_to_another_scope`).
 5. **Restart in the middle of re-protect.** On recovery the service must read the broker by ref before placing anything, so a restart never doubles the OCA pair. → Task 6 (`test_recovery_places_only_missing_reprotect_leg`).
+
+## Design amendments (review round 1)
+
+Two reviews on tickets #16–#29 (2026-10-06) found that the first version of this plan could send a second reduce, lose ownership in a crash, and cancel protection before a lower gate refused the exit. The findings were checked against the code and accepted. The rules below are binding. Every task follows them. Where a task's text disagrees, these rules win.
+
+**Children and evidence**
+
+- **R1. Write-ahead children.** Every child order (cancel, reduce, re-protect stop, re-protect target) is written to the journal **before** the broker call, with its own child id and a submission fence (the broker generation at send time). Child id: `{root}-{kind}-{conid}-{attempt}` (no `:`). The OCA pair journals both leg intents before either leg is sent.
+- **R2. Child states.** `UNKNOWN` (written, outcome not proven), `WORKING`, `FILLED`, `CANCELLED`, `REJECTED`, `ABSENT`, `NOT_SENT`. `NOT_SENT` only for a proven pre-submit refusal (the call raised or returned a typed refusal before the broker boundary was crossed). A timeout or any other exception after the boundary is `UNKNOWN`.
+- **R3. Never resubmit an unknown.** An `UNKNOWN` child is never sent again, under the same id or a new one. Only a `NOT_SENT` attempt may be followed by a new attempt, and that attempt gets a new id (`attempt + 1`). This is spec section 4 ("never resubmitted under a fresh id") applied per child.
+- **R4. Absence needs positive evidence.** A child becomes terminal only when a broker generation newer than its fence shows it `Filled`, `Cancelled`, `ApiCancelled`, `Inactive` or `Rejected`, or when a complete, fenced broker enumeration newer than its fence proves it absent (the same standard `OutcomeReconciler._reconcile_approve` uses). An empty `find_orders` result means `UNKNOWN`. Inherited re-protect legs follow the same rule.
+- **R5. Reduce rule.** No reduce and no OCA placement while any child of the root is `UNKNOWN`, or while a reduce child is `WORKING`. A further reduce needs a position snapshot whose generation is newer than the terminal observation of every earlier reduce child, and it is sized from that snapshot. A deadline with any child still `UNKNOWN` ends `FAILED_SAFE` with no new order.
+
+**Ownership and durability**
+
+- **R6. One transaction.** Exit owner rows, liquidation runs, goals, cursors, `SUPERSEDED` marks and child rows live in the trader journal. Claim plus run creation, goal upgrade plus cursor change, account claim plus supersede plus child inheritance, and every terminal transition each happen in **one** journal transaction. No in-memory receipt is authoritative.
+- **R7. Re-read before dispatch.** Before every broker call the service re-reads the run and its owner from the journal. It dispatches only if the owner is `ACTIVE`, the run is neither terminal nor `SUPERSEDED`, and the goal still matches. `_set` refuses to overwrite `SUPERSEDED` or any terminal state.
+- **R8. Durable cleanup.** A terminal transition sets `cleanup_pending` in the same transaction. Cleanup (saga hand-back or close, owner release) is idempotent, and recovery loads every run with `cleanup_pending` and finishes it. Account `FLAT` closes every saga the flatten owns and releases the account owner.
+- **R9. Inheritance after failure or takeover.** A new owner of a conid or of the account inherits every non-terminal child of any `SUPERSEDED` or `FAILED_SAFE` root on that scope, and obeys R5 for them. `FAILED_SAFE` marks the owner row `FAILED_SAFE` (never "released as flat"); a later claim may start a new root, but that root inherits the old unknown children first.
+- **R10. Account join.** `start(scope="account")` claims before it creates a run. `JOINED_FLATTEN` returns the existing root's receipt and creates nothing. Every account producer (session flatten, `/flatten`, protective failure, later the kill) persists and polls the root it got back, including after a join.
+
+**Broker boundary and threading**
+
+- **R11. One reduce-only path.** A new method on `Trader` at the existing order boundary sends reduce-only orders: full reduce, partial reduce and the exit OCA legs. It checks the account fence, that the side reduces the broker position, and that the quantity is at most the position. It does **not** run the entry gates (`RiskGate` daily loss, open orders, rate, concentration, leverage). There is no caller flag to skip checks. `reduce_position` (account flatten) moves onto it too. This also fixes a bug in today's code: an account flatten after a daily-loss breach can be refused by `RiskGate`. The after-breach regression test belongs to this plan, not to plan 3.
+- **R12. One serialized worker.** Every `LiquidationService` entry point (`start`, `rescan`, `upgrade_to_zero`, `supersede`) runs on one dedicated single-thread worker, never on the IB event loop. The trader_service recovery loop, the session controller loop and the ingest thread (protective failure → `start`) submit to that worker and await it. Dispatch from the worker uses `run_coroutine_threadsafe` onto the main loop, which is then safe. This fixes a second bug in today's code: `rescan()` runs on the loop it waits on (`trader/trader_service.py` `_liquidation_recovery_loop`). Tested with a real asyncio loop, not `asyncio.run` stand-ins.
+- **R13. OCA by identity.** A local `Trade` echo (`PendingSubmit`) is not acceptance. Events are matched by order identity. The target leg is sent only after the stop's state is reconciled: if the stop already filled in part or in full, the target is sized from the live remaining position; if the stop is `Inactive` or `Rejected`, escalate. `DONE` compares the outstanding quantity (`total_quantity − filled_quantity`) of each leg with the remaining position, and checks the same OCA group, the protective side and a working status.
+
+**Protection**
+
+- **R14. Exact hand-over.** `CLOSE_OWNED` stores the exact refs the close will cancel and the protection generation. Only `Cancelled` / `ApiCancelled` for those refs is suppressed. `Inactive`, `Rejected`, or a cancel of any other ref still takes today's incident path. Active legs are tracked apart from historical aliases; an event for a retired leg never changes current protection. Account takeover transfers `CLOSE_OWNED` sagas to the account root.
+
+**Quantities**
+
+- **R15. Partial quantity.** `q = floor(requested)`. `q < 1` → refused `PARTIAL_QUANTITY_INVALID`. `q ≥ |position|` at `start` → refused `QUANTITY_ABOVE_POSITION` (send `CLOSE` instead). `|position| − q < 1` → full close. Right before dispatch the rule is applied again to the live position; if the live position is now `≤ q`, the remainder is fully closed (ruling: protection is already cancelled, so refusing would leave it unprotected; the spec is silent). After a terminal partial fill the close re-protects the **actual** remaining quantity from a fresh snapshot; if it is zero the close ends `CLOSED`.
+
+**Session controller and commands**
+
+- **R16. Cancel entries only.** The session cancel phase cancels only working entry orders with zero fill. It never cancels the protective children of a filled position. A partly filled entry is left to the flatten, which owns its protection.
+- **R17. Joined commands resolve.** A command that joins or upgrades another root records `(command_id, root_id)` in the journal (migration 36). `OutcomeReconciler` gets an `execute_automated_intent` branch: `CLOSED` / `DONE` on the exact root resolves it; `SUPERSEDED` follows to the superseding root; `FAILED_SAFE` or unknown never becomes success. A root that ends before the command records `CLOSE_PENDING` is handled too.
+
+**Tests**
+
+- **R18.** Task 1's red test uses today's constructor (`SessionTimeExitAdapter(dispatch)`) with a fake broker that keeps a working stop, and asserts the behaviour (no working stop after the position is closed). It is not a constructor `TypeError`.
+- **R19.** Task 4's rescan test asserts that the new root advanced and the old root stayed `FAILED_SAFE`. `FLAT` is asserted only after a newer empty snapshot and a terminal reduce child.
+- **R20.** Crash-injection tests restart at every boundary: after a child is journaled and before the broker call; after the broker accepted and before the ack is stored; after a goal upgrade; after a supersede; after a terminal save and before each cleanup step.
+- **R21.** Task 13 calls the real `build_command_stack` with a temporary DuckDB journal, the real registry, run store, saga, coordinator, risk gates and `TradingRuntimeOrderDispatch` over a fake IB client, on a real asyncio loop with the R12 worker. Only broker and market ports are fake. It covers cold start and hot-arm wiring and every integration case listed on #29.
 
 ---
 

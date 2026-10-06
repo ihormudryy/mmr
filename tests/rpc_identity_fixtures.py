@@ -162,7 +162,7 @@ class ServedStack:
         finally:
             sock.close(linger=0)
             ctx.term()
-        server_key = self.identities[server]._private_key_for_tests().public_key()
+        server_key = self.servers[(server, sock_role)].identity.public_key
         unsigned = reply.model_copy(update={"signature": None})
         verify_bytes(server_key, response_signing_bytes(unsigned), reply.signature)
         if reply.server != server:

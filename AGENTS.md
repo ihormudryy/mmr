@@ -14,7 +14,7 @@ Every AI model works on GitHub under its own GitHub App, never under the owner's
 | Model | App | Key name | Permissions |
 |-------|-----|----------|-------------|
 | Claude (Anthropic) | `mmr-claude` | `claude` | issues, PRs: read/write; code: read/write (push branches) |
-| OpenAI (GPT) | `mmr-openai` | `openai` | issues, PRs: read/write; code: read only |
+| OpenAI (GPT, also called "Astra") | `mmr-openai` | `openai` | issues, PRs: read/write; code: read only |
 | Grok (xAI) | `mmr-grok` | `grok` | issues, PRs: read/write; code: read only |
 
 Get a token for your own key name before any `gh` call. A token is valid for 1 hour; get a new one per session or after a 401.
@@ -29,6 +29,9 @@ Claude pushes a branch with its token like this:
 `git push "https://x-access-token:$(~/.config/github-apps/gh-app-token claude)@github.com/ihormudryy/mmr.git" <branch>`
 
 Rules:
+- If you cannot get a token (script missing, error, 401 after a refresh), stop and tell the owner. Never fall back to the owner's own `gh` login for any write.
+- The script and keys exist only on the owner's Mac. If you run anywhere else, you have no token: ask the owner, do not post.
+- The installed `gh` is old (2.22): `gh pr edit` fails. Use REST instead, e.g. `gh api --method PATCH repos/ihormudryy/mmr/pulls/N -f body='...'`.
 - Use only your own key name. Never print, log or commit a token, or anything in `~/.config/github-apps/` (private keys, mode 0600, on the owner's machine only).
 - Apps cannot change the project board (status, priority, iteration) because it belongs to a personal account. Leave board changes to the owner's account.
 - Apps cannot be assigned to issues or requested as reviewers. Post a review or a comment instead.

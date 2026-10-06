@@ -27,7 +27,7 @@ from trader.domain.commands import CommandReceipt
 from trader.domain.events import DomainMutation
 from trader.domain.identity import command_entity_id
 from trader.trading.exit_owner import (
-    CLAIMED, JOINED_FLATTEN, STATE_ACTIVE, STATE_FAILED_SAFE, STATE_RELEASED, ExitOwnerRegistry,
+    CLAIMED, JOINED_FLATTEN, STATE_ACTIVE, STATE_FAILED_SAFE, STATE_RELEASED, UPGRADED, ExitOwnerRegistry,
     apply_exit_owner_migration,
 )
 from trader.trading.order_correlation import liquidation_child_id, liquidation_child_kind, reprotect_oca_group
@@ -774,6 +774,8 @@ class LiquidationService:
                 goal="zero" if admitted is None else "partial", goal_quantity=admitted,
                 stop_price=stop_price, target_price=target_price), now)
             self._store.inherit_children_in_tx(conn, account_id=account_id, conid=conid, to_root_id=cause, now=now)
+        elif claim.outcome == UPGRADED:
+            self._upgrade_run_in_tx(conn, claim.root_id, f"goal upgraded to zero by {cause}")
         return (claim.outcome, claim.root_id)
 
     def upgrade_to_zero(self, root_id: str) -> LiquidationReceipt:

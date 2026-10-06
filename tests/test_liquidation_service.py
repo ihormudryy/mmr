@@ -1738,3 +1738,139 @@ def test_account_claim_supersede_and_inheritance_commit_together_or_not_at_all(t
     assert (s.registry.get("p-1").state, s.registry.account_owner(ACCOUNT)) == ("ACTIVE", None)
     assert s.store.receipt("p-1").state != "SUPERSEDED" and s.store.receipt("kill-1") is None
     assert s.service.root_for("kill-1") is None
+# ---------------------------------------------------------------------------
+# Task 8: scoped claims join, upgrade or refuse
+# ---------------------------------------------------------------------------
+
+from trader.trading.exit_owner import ExitInProgress  # noqa: E402
+
+
+def test_second_full_close_joins_and_returns_the_owners_receipt(tmp_path):
+    """Spec test: a time exit and an AI close on the same conid make one root."""
+    s = _stack(tmp_path, [_snapshot(1, [_position()])], protection=_Protection())
+    s.service.start(ACCOUNT, "exit-1", DEADLINE, scope="conid", conid=1)
+    joined = s.service.start(ACCOUNT, "ai-close-1", DEADLINE, scope="conid", conid=1)
+    assert joined.cause_command_id == "exit-1"
+    assert s.service.receipt_for("ai-close-1") is None
+    assert s.service.root_for("ai-close-1") == "exit-1"
+    assert [c[0] for c in s.dispatch.calls] == ["reduce"]
+
+
+def test_time_exit_during_partial_close_upgrades_goal_and_ends_closed(tmp_path):
+    """Spec test: zero position and no residual exits, not DONE."""
+    protection = _Protection()
+    s = _stack(tmp_path, [_snapshot(1, [_priced(10.0)]), _snapshot(1, [_priced(10.0)]), _snapshot(2, [_priced(6.0)]),
+                          _snapshot(3, [_priced(6.0)]), _snapshot(4, []), _snapshot(5, [])], protection=protection)
+    s.service.start(ACCOUNT, "p-1", DEADLINE, scope="conid", conid=1, quantity=4.0)
+    upgraded = s.service.start(ACCOUNT, "exit-1", DEADLINE, scope="conid", conid=1)
+    assert (upgraded.cause_command_id, upgraded.goal) == ("p-1", "zero")
+    assert s.registry.get("p-1").goal == "zero"
+    s.dispatch.rows["p-1-reduce-1-1"] = [_row("Filled", filled=4.0, total=4.0)]
+    s.service.rescan()
+    s.service.rescan()
+    assert s.dispatch.calls[-1] == ("reduce", 1, "SELL", 6.0, "p-1-reduce-1-2")
+    s.dispatch.rows["p-1-reduce-1-2"] = [_row("Filled", filled=6.0, total=6.0)]
+    s.service.rescan()
+    assert s.service.rescan().state == "CLOSED"
+    assert not any(c[0] == "place_exit_leg" for c in s.dispatch.calls)
+    assert protection.calls[-1] == ("close_after_full", "p-1")
+
+
+def test_partial_against_an_existing_owner_raises_and_records_nothing(tmp_path):
+    s = _stack(tmp_path, [_snapshot(1, [_priced(10.0)])], protection=_Protection())
+    s.service.start(ACCOUNT, "exit-1", DEADLINE, scope="conid", conid=1)
+    with pytest.raises(ExitInProgress):
+        s.service.start(ACCOUNT, "p-2", DEADLINE, scope="conid", conid=1, quantity=3.0)
+    assert s.service.root_for("p-2") is None
+
+
+def test_full_close_during_active_flatten_joins_it_and_leaves_the_superseded_owner_alone(tmp_path):
+    s = _stack(tmp_path, [_snapshot(1, [_priced(10.0)]), _snapshot(1, [_priced(10.0)]), _snapshot(2, [_priced(6.0)])],
+               protection=_Protection())
+    s.service.start(ACCOUNT, "p-1", DEADLINE, scope="conid", conid=1, quantity=4.0)
+    s.service.start(ACCOUNT, "flat-1", DEADLINE)
+    joined = s.service.start(ACCOUNT, "exit-1", DEADLINE, scope="conid", conid=1)
+    assert joined.cause_command_id == "flat-1"
+    p1 = s.service.receipt_for("p-1")
+    assert (p1.state, p1.goal, p1.goal_quantity) == ("SUPERSEDED", "partial", 4.0)
+    assert s.registry.get("p-1").state == "SUPERSEDED"
+
+
+def test_upgrade_never_touches_a_superseded_run(tmp_path):
+    """#24: an upgrade that arrives after the takeover cannot revive the close."""
+    s = _stack(tmp_path, [_snapshot(1, [_priced(10.0)]), _snapshot(1, [_priced(10.0)]), _snapshot(2, [_priced(6.0)])],
+               protection=_Protection())
+    s.service.start(ACCOUNT, "p-1", DEADLINE, scope="conid", conid=1, quantity=4.0)
+    s.service.start(ACCOUNT, "flat-1", DEADLINE)
+    receipt = s.service.upgrade_to_zero("p-1")
+    assert (receipt.state, receipt.goal) == ("SUPERSEDED", "partial")
+
+
+def test_claim_and_run_commit_together_or_not_at_all(tmp_path):
+    """R6 / #24: a failure after the claim insert leaves no owner, no join and no run."""
+    s = _stack(tmp_path, [_snapshot(1, [_position()])], protection=_Protection())
+    real_insert = s.store.insert_run_in_tx
+
+    def broken_insert(conn, receipt, now):
+        raise RuntimeError("disk full")
+    s.store.insert_run_in_tx = broken_insert
+    with pytest.raises(RuntimeError):
+        s.service.start(ACCOUNT, "c-1", DEADLINE, scope="conid", conid=1)
+    assert s.registry.get("c-1") is None
+    assert s.service.root_for("c-1") is None
+    s.store.insert_run_in_tx = real_insert
+    assert s.service.start(ACCOUNT, "c-1", DEADLINE, scope="conid", conid=1).cause_command_id == "c-1"
+
+
+def test_joined_request_retried_after_restart_returns_the_same_root(tmp_path):
+    """#24: a retry of a joined command finds its durable root, not a new one."""
+    s = _stack(tmp_path, [_snapshot(1, [_position()])], protection=_Protection())
+    s.service.start(ACCOUNT, "exit-1", DEADLINE, scope="conid", conid=1)
+    s.service.start(ACCOUNT, "ai-close-1", DEADLINE, scope="conid", conid=1)
+    service = s.restart()
+    again = service.start(ACCOUNT, "ai-close-1", DEADLINE, scope="conid", conid=1)
+    assert again.cause_command_id == "exit-1"
+    with pytest.raises(ValueError):
+        service.start(ACCOUNT, "ai-close-1", DEADLINE, scope="conid", conid=2)
+    assert [c[0] for c in s.dispatch.calls] == ["reduce"]
+
+
+def test_closed_root_releases_the_owner_and_a_later_close_is_a_new_root_after_restart(tmp_path):
+    """#23: after CLOSED and a restart, the next close of the conid starts fresh."""
+    s = _stack(tmp_path, [_snapshot(1, [_position()]), _snapshot(2, []), _snapshot(3, [])], protection=_Protection())
+    s.service.start(ACCOUNT, "c-1", DEADLINE, scope="conid", conid=1)
+    s.dispatch.rows["c-1-reduce-1-1"] = [_row("Filled", filled=10.0)]
+    s.service.rescan()
+    assert s.service.rescan().state == "CLOSED"
+    service = s.restart()
+    s.push(_snapshot(4, [_position(3.0)]))
+    receipt = service.start(ACCOUNT, "c-2", DEADLINE, scope="conid", conid=1)
+    assert receipt.cause_command_id == "c-2"
+    assert s.dispatch.calls[-1] == ("reduce", 1, "SELL", 3.0, "c-2-reduce-1-1")
+
+
+def test_upgraded_claim_and_run_change_commit_together_or_not_at_all(tmp_path):
+    """R6 / R20: a failure after the registry upgrade, inside the claim transaction, undoes it."""
+    s = _stack(tmp_path, [_snapshot(1, [_priced(10.0)], [_stop_order()])], protection=_Protection())
+    s.service.start(ACCOUNT, "p-1", DEADLINE, scope="conid", conid=1, quantity=4.0)
+
+    def broken(conn, root_id, detail):
+        raise _Crash()
+    s.service._upgrade_run_in_tx = broken
+    with pytest.raises(_Crash):
+        s.service.start(ACCOUNT, "exit-1", DEADLINE, scope="conid", conid=1)
+    assert (s.registry.get("p-1").goal, s.store.receipt("p-1").goal) == ("partial", "partial")
+    assert s.service.root_for("exit-1") is None
+
+
+def test_a_full_close_during_an_unfinished_done_cleanup_starts_a_new_root(tmp_path):
+    """R24 / #24: DONE released the owner already, so a later close never joins the finished root."""
+    s, protection = _to_reprotect(tmp_path, target=None, extra=(_snapshot(4, [_priced(6.0)]),))
+    s.dispatch.rows["p-1-reprotect-stop-1-1"] = [_leg_row()]
+    protection.crash_on.add("release_after_partial")
+    with pytest.raises(_Crash):
+        s.service.rescan()                                             # DONE, cleanup cut off
+    receipt = s.service.start(ACCOUNT, "exit-1", DEADLINE, scope="conid", conid=1)
+    assert receipt.cause_command_id == "exit-1"
+    assert (s.service.receipt_for("p-1").state, s.service.receipt_for("p-1").goal) == ("DONE", "partial")
+    assert s.registry.owner_for(ACCOUNT, 1).root_id == "exit-1"

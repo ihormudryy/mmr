@@ -759,8 +759,11 @@ also pass one real IB paper session.
 
 **SP2 — Autonomous loop.**
 
-- Orchestrator model through OpenRouter, run by a deterministic workflow controller
-  with bounded calls, tokens, wall time and concurrency. A `null` dollar budget
+- Orchestrator model through a provider-neutral model client with three backends:
+  OpenRouter, AWS Bedrock and Azure (owner decision, 2026-10-06). The backend and
+  model id are config, not code; a missing or unknown backend fails loudly, with
+  no silent fallback to another provider. The client is run by a deterministic
+  workflow controller with bounded calls, tokens, wall time and concurrency. A `null` dollar budget
   does not mean unbounded retries.
 - Decider interface: Jev first, "follow the signal" baseline logged on every
   opportunity into `simulated_books`.
@@ -791,4 +794,4 @@ checks, the short-sale rule, and short support in the backtester and admission.
 
 - Telegram bot identity and chat id (owner supplies them outside chat).
 - Whether the paper account needs an IB reset before the first `experiment start`.
-- OpenRouter and Jev model ids (SP2; verify the installed SDK first).
+- Model ids per backend (OpenRouter, AWS Bedrock, Azure) and Jev (SP2; verify the installed SDKs first), plus how each backend's credentials are mounted.

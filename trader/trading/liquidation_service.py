@@ -742,8 +742,19 @@ class LiquidationService:
         if claim.outcome == JOINED_FLATTEN:
             return (JOINED_FLATTEN, claim.root_id)
         self._store.insert_run_in_tx(conn, LiquidationReceipt(account_id, cause, "REQUESTED", deadline), now)
+        for root in claim.superseded:
+            self._supersede_run_in_tx(conn, root, by_root_id=cause)
         self._store.inherit_children_in_tx(conn, account_id=account_id, conid=None, to_root_id=cause, now=now)
         return (CLAIMED, cause)
+
+    def _supersede_run_in_tx(self, conn, root_id: str, *, by_root_id: str) -> None:
+        run = self._store.get_run_in_tx(conn, root_id)
+        if run is None or run.state in RESCAN_TERMINAL:
+            return
+        self._store.update_run_in_tx(conn, replace(
+            run, state="SUPERSEDED", superseded_by=by_root_id,
+            detail=f"taken over by account flatten {by_root_id}"), self._now())
+        self._store.drop_planned_in_tx(conn, root_id, self._now())
 
     def _claim_scoped_in_tx(self, conn, account_id, cause, conid, requested, admitted, deadline,
                             stop_price, target_price):

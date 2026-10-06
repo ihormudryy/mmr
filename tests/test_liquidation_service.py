@@ -1078,9 +1078,10 @@ def _priced(quantity=10.0, conid=1, price=100.0):
     return _position(quantity, conid=conid, market_price=price)
 
 
-def _leg_row(status="Submitted", total=6.0, filled=0.0, group="p-1-reprotect-1-1", oca_type=2, action="SELL"):
+def _leg_row(status="Submitted", total=6.0, filled=0.0, group="p-1-reprotect-1-1", oca_type=2, action="SELL",
+             entity=None):
     """A re-protect leg's own broker row, with the OCA link the broker reports (Task 18)."""
-    return _row(status, filled=filled, total=total, oca_group=group, oca_type=oca_type, action=action)
+    return _row(status, filled=filled, total=total, oca_group=group, oca_type=oca_type, action=action, entity=entity)
 
 
 def _to_reprotect(tmp_path, *, target=120.0, stop=95.0, held=10.0, q=4.0, extra=()):
@@ -1592,3 +1593,148 @@ def test_an_inherited_reduce_never_counts_as_this_partials_reduce(tmp_path):
     s.dispatch.rows["c-1-reduce-1-1"] = [_row("Cancelled", filled=0.0)]
     s.service.start(ACCOUNT, "p-2", NOW + dt.timedelta(minutes=5), scope="conid", conid=1, quantity=4.0)
     assert s.dispatch.calls[-1] == ("reduce_partial", 1, "SELL", 4.0, "p-2-reduce-1-1")
+# ---------------------------------------------------------------------------
+# Task 7: account flatten takes over scoped closes
+# ---------------------------------------------------------------------------
+
+def test_kill_during_reprotect_cancels_replacement_exits_and_reaches_flat(tmp_path):
+    """Spec test: kill during REPROTECTING with a working replacement stop."""
+    stop_leg = _order("rs", group="p-1-reprotect-stop-1-1", total=6.0, order_type="STP")
+    s, protection = _to_reprotect(tmp_path, target=None, extra=(
+        _snapshot(4, [_priced(6.0)], [stop_leg]), _snapshot(5, [_priced(6.0)]), _snapshot(6, []), _snapshot(7, [])))
+    s.dispatch.rows["p-1-reprotect-stop-1-1"] = [_leg_row()]
+    receipt = s.service.start(ACCOUNT, "kill-1", DEADLINE)                 # gen 4
+    p1 = s.service.receipt_for("p-1")
+    assert (p1.state, p1.superseded_by) == ("SUPERSEDED", "kill-1")
+    assert s.registry.get("p-1").state == "SUPERSEDED"
+    assert s.registry.account_owner(ACCOUNT).root_id == "kill-1"
+    assert ("handover_account", "kill-1", ("rs",)) in protection.calls
+    assert [c.child_id for c in receipt.children if c.kind == "reprotect-stop"] == ["p-1-reprotect-stop-1-1"]
+    assert s.dispatch.calls[-1] == ("cancel", "rs", "kill-1-cancel-1-1")   # cancelled, not waited on
+    s.dispatch.entities["rs"] = _row("Cancelled", total=6.0)
+    s.dispatch.rows["p-1-reprotect-stop-1-1"] = [_leg_row("Cancelled")]
+    s.service.rescan()                                                     # gen 5: reduce the rest
+    assert s.dispatch.calls[-1] == ("reduce", 1, "SELL", 6.0, "kill-1-reduce-1-1")
+    s.dispatch.rows["kill-1-reduce-1-1"] = [_row("Filled", filled=6.0, total=6.0)]
+    s.service.rescan()
+    assert s.service.receipt_for("kill-1").state == "VERIFYING"
+    assert s.service.rescan().state == "FLAT"                               # gen 7
+    assert s.service.receipt_for("p-1").state == "SUPERSEDED"
+    assert protection.calls[-1] == ("close_after_full", "kill-1")
+    assert s.registry.get("kill-1").state == "RELEASED"
+
+
+def test_flatten_never_reduces_while_an_inherited_reprotect_leg_is_invisible(tmp_path):
+    """#23: a submitted replacement stop that find_orders does not show yet blocks the reduce."""
+    s, _protection = _to_reprotect(tmp_path, target=None, extra=(_snapshot(4, [_priced(6.0)]),))
+    s.dispatch.complete = False                                                       # nothing proves it absent
+    receipt = s.service.start(ACCOUNT, "kill-1", NOW + dt.timedelta(seconds=30))     # gen 4 = leg fence + 1
+    assert "outcome unknown" in receipt.detail
+    assert not any(c[0] == "reduce" for c in s.dispatch.calls)
+    s.clock["now"] = NOW + dt.timedelta(seconds=31)
+    assert s.service.rescan().state == "FAILED_SAFE"
+    assert not any(c[0] == "reduce" for c in s.dispatch.calls)
+
+
+def test_flatten_deadline_with_an_inherited_unknown_reduce_is_failed_safe_not_a_second_order(tmp_path):
+    """Spec test: a submitted child not yet visible blocks the flatten; deadline = FAILED_SAFE."""
+    s = _stack(tmp_path, [_snapshot(1, [_priced(10.0)]), _snapshot(1, [_priced(10.0)]), _snapshot(2, [_priced(10.0)])],
+               protection=_Protection())
+    s.dispatch.complete = False                                         # the partial reduce stays invisible
+    s.service.start(ACCOUNT, "p-1", DEADLINE, scope="conid", conid=1, quantity=4.0)
+    receipt = s.service.start(ACCOUNT, "kill-1", NOW + dt.timedelta(seconds=30))
+    assert [(c.child_id, c.state) for c in receipt.children] == [("p-1-reduce-1-1", "UNKNOWN")]
+    s.clock["now"] = NOW + dt.timedelta(seconds=31)
+    assert s.service.rescan().state == "FAILED_SAFE"
+    assert [c[0] for c in s.dispatch.calls] == ["reduce_partial"]
+
+
+def test_account_flatten_during_partial_close_reconciles_its_children_before_reducing(tmp_path):
+    """Spec test: the partial reduce is still working when the flatten starts."""
+    s = _stack(tmp_path, [_snapshot(1, [_priced(10.0)]), _snapshot(1, [_priced(10.0)]), _snapshot(2, [_priced(8.0)]),
+                          _snapshot(3, [_priced(6.0)]), _snapshot(4, [_priced(6.0)])], protection=_Protection())
+    s.service.start(ACCOUNT, "p-1", DEADLINE, scope="conid", conid=1, quantity=4.0)
+    s.dispatch.rows["p-1-reduce-1-1"] = [_row("Submitted", filled=2.0, total=4.0)]
+    receipt = s.service.start(ACCOUNT, "kill-1", DEADLINE)                     # gen 2: still working
+    assert "still working" in receipt.detail
+    s.dispatch.rows["p-1-reduce-1-1"] = [_row("Filled", filled=4.0, total=4.0)]
+    s.service.rescan()                                                        # gen 3: fill seen
+    s.service.rescan()                                                        # gen 4: fresh
+    assert [c[0] for c in s.dispatch.calls] == ["reduce_partial", "reduce"]
+    assert s.dispatch.calls[-1] == ("reduce", 1, "SELL", 6.0, "kill-1-reduce-1-1")
+
+
+def test_superseded_close_stops_at_once_and_never_reprotects(tmp_path):
+    s = _stack(tmp_path, [_snapshot(1, [_priced(10.0)]), _snapshot(1, [_priced(10.0)]), _snapshot(2, [_priced(6.0)]),
+                          _snapshot(3, [_priced(6.0)])], protection=_Protection())
+    s.service.start(ACCOUNT, "p-1", DEADLINE, scope="conid", conid=1, quantity=4.0)
+    s.dispatch.rows["p-1-reduce-1-1"] = [_row("Filled", filled=4.0, total=4.0)]
+    s.service.start(ACCOUNT, "kill-1", DEADLINE)
+    s.service.rescan()
+    assert not any(c[0] == "place_exit_leg" for c in s.dispatch.calls)
+    assert s.service.receipt_for("p-1").state == "SUPERSEDED"
+
+
+def test_restart_after_supersede_never_dispatches_for_the_superseded_root(tmp_path):
+    """R20: crash after the takeover transaction, before the account hand-over."""
+    protection = _Protection()
+    s = _stack(tmp_path, [_snapshot(1, [_priced(10.0)]), _snapshot(1, [_priced(10.0)]), _snapshot(2, [_priced(6.0)]),
+                          _snapshot(3, [_priced(6.0)]), _snapshot(4, [_priced(6.0)])], protection=protection)
+    s.service.start(ACCOUNT, "p-1", DEADLINE, scope="conid", conid=1, quantity=4.0)
+    s.dispatch.rows["p-1-reduce-1-1"] = [_row("Filled", filled=4.0, total=4.0)]
+    protection.crash_on.add("handover_account")
+    with pytest.raises(_Crash):
+        s.service.start(ACCOUNT, "kill-1", DEADLINE)
+    assert s.store.receipt("p-1").state == "SUPERSEDED"
+    service = s.restart()
+    service.rescan()
+    service.rescan()
+    assert ("handover_account", "kill-1", ()) in protection.calls
+    assert not any(c[0] == "place_exit_leg" for c in s.dispatch.calls)
+    assert s.dispatch.calls[-1] == ("reduce", 1, "SELL", 6.0, "kill-1-reduce-1-1")
+
+
+def test_later_scoped_close_inherits_the_unknown_child_of_a_failed_safe_close(tmp_path):
+    """R9 scoped: the new close of the conid waits for the old unknown reduce."""
+    s = _stack(tmp_path, [_snapshot(1, [_priced(10.0)])], protection=_Protection())
+    s.service.start(ACCOUNT, "c-1", NOW + dt.timedelta(seconds=30), scope="conid", conid=1)
+    s.clock["now"] = NOW + dt.timedelta(seconds=31)
+    assert s.service.rescan().state == "FAILED_SAFE"
+    s.push(_snapshot(2, [_priced(10.0)]))
+    receipt = s.service.start(ACCOUNT, "c-2", NOW + dt.timedelta(minutes=5), scope="conid", conid=1)
+    assert receipt.cause_command_id == "c-2"
+    assert [c.child_id for c in receipt.children] == ["c-1-reduce-1-1"]
+    assert [c[0] for c in s.dispatch.calls] == ["reduce"]
+
+
+def test_a_working_leg_that_appeared_after_the_capture_is_cancelled_and_blocks(tmp_path):
+    """R23 / #21: the snapshot missed the replacement stop; its own row shows it working."""
+    protection = _Protection(stop_price=95.0, target_price=None)
+    s = _stack(tmp_path, [_snapshot(1, [_priced(10.0)]), _snapshot(1, [_priced(10.0)]), _snapshot(2, [_priced(6.0)]),
+                          _snapshot(3, [_priced(6.0)]), _snapshot(4, [_priced(6.0)])], protection=protection)
+    s.service.start(ACCOUNT, "p-1", DEADLINE, scope="conid", conid=1, quantity=4.0)
+    s.dispatch.rows["p-1-reduce-1-1"] = [_row("Filled", filled=4.0, total=4.0)]
+    s.service.rescan()
+    s.service.rescan()                                                  # gen 3: stop leg sent
+    leg = "p-1-reprotect-stop-1-1:stop"
+    s.dispatch.rows["p-1-reprotect-stop-1-1"] = [_leg_row(entity=leg)]
+    receipt = s.service.start(ACCOUNT, "kill-1", DEADLINE)              # gen 4: no working order in the snapshot
+    assert ("handover_account", "kill-1", (leg,)) in protection.calls
+    assert s.dispatch.calls[-1] == ("cancel", leg, "kill-1-cancel-1-1")
+    assert "still working" in receipt.detail
+    assert not any(c[0] == "reduce" for c in s.dispatch.calls)
+
+
+def test_account_claim_supersede_and_inheritance_commit_together_or_not_at_all(tmp_path):
+    """R6 / R20: a failure inside the takeover transaction leaves the scoped close untouched."""
+    s = _stack(tmp_path, [_snapshot(1, [_priced(10.0)], [_stop_order()])], protection=_Protection())
+    s.service.start(ACCOUNT, "p-1", DEADLINE, scope="conid", conid=1, quantity=4.0)
+
+    def broken(conn, **_kwargs):
+        raise _Crash()
+    s.store.inherit_children_in_tx = broken
+    with pytest.raises(_Crash):
+        s.service.start(ACCOUNT, "kill-1", DEADLINE)
+    assert (s.registry.get("p-1").state, s.registry.account_owner(ACCOUNT)) == ("ACTIVE", None)
+    assert s.store.receipt("p-1").state != "SUPERSEDED" and s.store.receipt("kill-1") is None
+    assert s.service.root_for("kill-1") is None

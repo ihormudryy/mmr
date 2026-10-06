@@ -2556,6 +2556,7 @@ class OutcomeReconciler:
         repo: Optional[ProposalRepository] = None,
         orders_view: Optional[OrderStateView] = None,
         now: Callable[[], dt.datetime] = _utcnow,
+        closes: Optional[Any] = None,
     ):
         self._journal = journal
         self._ledger = ledger
@@ -2565,6 +2566,7 @@ class OutcomeReconciler:
         self._repo = repo
         self._orders_view = orders_view
         self._now = now
+        self._closes = closes
         self._plans: dict[str, _ReconcilePlan] = {}
 
     # -- scheduling --------------------------------------------------------
@@ -2691,6 +2693,8 @@ class OutcomeReconciler:
             return self._reconcile_pause(row, now)
         if action in ("enable_strategy", "disable_strategy", "update_strategy_params"):
             return self._reconcile_strategy(row, now)
+        if action in ("execute_automated_intent", "liquidate_account"):
+            return self._reconcile_close(row, now)
         # Unmapped action: cannot positively determine an outcome -> stay
         # OUTCOME_UNKNOWN (fail-safe), never rubber-stamp RESOLVED.
         return False
@@ -2710,6 +2714,36 @@ class OutcomeReconciler:
             self._resolve_never_submitted(row, now)
             return True
         return False
+
+    def _reconcile_close(self, row: LedgerRow, now: dt.datetime) -> bool:
+        """R17 / R33: a command that started or joined a close root resolves from that exact root.
+
+        This reconciler is the only resolver of close commands; the
+        liquidation service only schedules them. SUPERSEDED is followed to
+        the account root that took over. A broker-proven goal (CLOSED / DONE
+        / FLAT, cleanup finished) resolves the command. A decided root that
+        did not meet the goal (FAILED_SAFE, REDUCE_FAILED, DONE for a full
+        close) rejects it with that code and raises an operator alert: the
+        position needs a person, and the reconciliation gate must not stay
+        blocked for ever. An open root, or a command with no close root (a
+        bracket entry), stays OUTCOME_UNKNOWN.
+        """
+        if self._closes is None:
+            return False
+        resolution = self._closes.close_resolution(row.command_id)
+        if resolution is None:
+            return False
+        if resolution.success:
+            self._resolve_command_only(row, dict(resolution.outcome), now)
+            return True
+        self._reject_command_only(row, error_code=resolution.error_code or "CLOSE_FAILED",
+                                  outcome=dict(resolution.outcome), now=now)
+        self._alerts.raise_alert(
+            row.command_id,
+            f"{row.action} ended {resolution.state} on close root {resolution.root_id} "
+            f"({resolution.error_code}); operator check of the position required",
+        )
+        return True
 
     def _reconcile_create(self, row: LedgerRow, now: dt.datetime) -> bool:
         """A wedged ``create_proposal`` never dispatched an order, so the

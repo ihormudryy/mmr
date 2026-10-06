@@ -13,12 +13,12 @@
 ## Global Constraints
 
 - No live authority. Nothing here may run on a live account; `account_mode` checks stay as they are.
-- One broker dispatch boundary: every order goes through `TradingRuntimeOrderDispatch` → `Trader`. Entries use `Trader.place_expressive_order`; every exit (full reduce, partial reduce, re-protect leg) uses the new `Trader.place_reduce_only_order`. There is no second IB order path and no "skip checks" flag.
+- One broker dispatch boundary: every order goes through `TradingRuntimeOrderDispatch` → `Trader`. Entries use `Trader.place_expressive_order`; every exit (full reduce, partial reduce, re-protect leg) uses `Trader.place_reduce_only_order` (added by PR #42, extended by Tasks 14 and 10). There is no second IB order path and no "skip checks" flag.
 - `CommandReceipt` stays frozen. `ExecutionIntent` is not changed.
 - `OUTCOME_UNKNOWN` is never resubmitted under a fresh id. An `UNKNOWN` child order is never sent again (R3).
 - The trader journal (`trader.journal_db`) is the source of truth. No in-memory receipt is authoritative: the service reads runs, children and owners from the journal on every step.
 - Journal migrations: **35** exit owners, **36** liquidation run columns + `liquidation_children` + `liquidation_joins` (and the adoption of open pre-SP1 runs), **37** saga close-ownership columns + `automated_order_saga_groups`, **38** `oca_group`/`oca_type` on `broker_orders`. Versions 30 and 31 are taken, and **32–34 belong to `trader/data/attribution_store.py`**. P3 owns 30–39 (`trader/data/schema_migrations.py`; Task 3 registers 35–38 there), P4 owns 40–49 and P5 50–59. `SchemaMigrator` records a version once, so reusing a taken number silently skips the new DDL. Free in the P3 range after this plan: **39** only.
-- Line numbers in this plan cite master as of `d58c49ce`. An earlier task can shift them; the function or class name next to each number is the anchor.
+- Line numbers in this plan cite master as of `15f9e715` (PR #42 merged). An earlier task can shift them; the function or class name next to each number is the anchor. Where a task edits a file PR #42 changed (`trading_runtime.py`, `trader_service.py`, `liquidation_service.py`, `session_controller.py`), it names functions, not lines.
 - Command ids and child ids never contain `:` (child ids become IB `orderRef` values via `encode_order_ref`).
 - Routine progress of a scoped close never trips the breaker; neither does `REDUCE_FAILED` (its command fails with an operator alert instead). Account-scope breaker behaviour is unchanged (every state except `FLAT` trips).
 - Test-first. Each task begins with a failing test. Run tests with `.venv/bin/python -m pytest <path> -q --timeout=30`. The full suite: `.venv/bin/python -m pytest tests/ -q --timeout=60 --ignore=tests/test_ibrx_async.py`. Every task ends with the full suite green.
@@ -35,8 +35,8 @@ New tasks 14–18 must run before some old ones. Run the tasks in this order (ea
 3. **Task 3** — exit owner registry, migration 35.
 4. **Task 18** — broker evidence: readiness property, newest generation, OCA fields, migration 38 (needs 2).
 5. **Task 4** — data model (frozen interfaces), migration 36, account scope on write-ahead children (needs 2, 3, 18).
-6. **Task 14** — reduce-only order path at the broker boundary (needs 4 for `DispatchRefused`).
-7. **Task 15** — one serialized liquidation worker (needs 4, 14).
+6. **Task 14** — extend master's reduce-only path: the R35 bound, `DispatchRefused` before the boundary, `reduce_partial`, `cancel_on_loop` (needs 4 for `DispatchRefused`).
+7. **Task 15** — share master's liquidation worker with every producer (needs 4, 14).
 8. **Task 5** — scoped full close (needs 4).
 9. **Task 6** — partial close, re-protect, escalation (needs 5).
 10. **Task 7** — account flatten takes over scoped closes (needs 6).
@@ -60,8 +60,8 @@ Spec-implied inputs no test list in the spec names, and the review traces of rou
 5. **Restart in the middle of re-protect.** The restart sends only the planned target, never the stop again. → Task 6 `test_recovery_after_restart_sends_only_the_planned_target`.
 6. **Invisible child / late fill.** No second reduce while a child is not visible yet, or when its fill arrives after the position was captured; absence needs a complete enumeration opened after the send. → Tasks 4, 5, 7, 13.
 7. **Two account producers.** One root, one reduce. → Task 4, Task 13.
-8. **Exits after a loss breach.** The reduce-only path passes while a new entry is refused. → Task 14, Task 13.
-9. **Event loop.** A tick awaited on the trader loop does not deadlock; a blocking call on the loop is refused. → Task 15.
+8. **Exits after a loss breach.** The reduce-only path passes while a new entry is refused. → master's `test_reduce_only_passes_after_daily_loss_breach_while_entry_is_refused` (PR #42), Task 13.
+9. **Event loop.** A tick awaited on the trader loop does not deadlock; a blocking call on the loop is refused. → Task 15 (master's `tests/test_trader_service_loops.py` already pins the ticks on a real loop).
 10. **The generation refresh (new behaviour).** The close asks for a fresh broker sync while it waits (ruling 1). This adds `run_broker_sync` calls during a session; `capture` raises `GENERATION_STAGING` while a sync is staging, so every reader of the broker snapshot can see short "unavailable" windows. Check this against the paper session in plan 6.
 11. **Round 2 traces.** A target fill that cancels its OCA stop ends `CLOSED` (Task 6 `test_target_fill_that_cancels_its_oca_stop_ends_closed_without_a_failure`); a partial reduce that sold nothing ends `REDUCE_FAILED`, never success (Task 6, Task 13); an ingest event racing the worker never loses the close owner (Task 9 race tests); an order found later is handed over before its cancel (Task 4 `test_hand_over_is_updated_before_every_cancel_batch`, Task 9); a run open before the upgrade settles its old reduce before any new one (Task 4 adoption tests).
 
@@ -132,7 +132,7 @@ The rules above were checked against the real code while the tasks were rewritte
 13. **Several sagas on one conid.** If a close owned more than one saga on the conid, `release_after_partial` gives the new legs to the first saga (by command id) and closes the others with `PROTECTION_MERGED`.
 14. **`supersede` is not a separate entry point.** R12 lists `supersede`; here the supersede happens inside the account claim transaction (R6), so there is nothing extra to serialize.
 15. ~~**R21 and SELL intents.** Running `execute_automated_intent` end to end needs a signed research bundle. Task 13 checks the SELL wiring on cold start and hot-arm (the built service holds the facade and the broker port). It drives the joined-command path end to end with `liquidate_account` through the same coordinator and reconciler. The SELL rules themselves are tested in Tasks 12 and 17.~~ Replaced (round 2): Task 13 enables paper automation on cold start, checks the built intent service, and drives a SELL intent end to end through the real coordinator, close, reduce-only path and reconciler; only the research-bundle verifier is a test double (a real signed bundle needs a research database, and the production evidence check refuses fixture provenance).
-16. **Startup recovery runs inside the loop.** `_maybe_start_liquidation_recovery` used to call `rescan()` before `trader.run()`. Orders need a running loop, so the first tick is now the first step of the recovery task. Session recovery keeps its "before readiness" order: `SessionController.restore()` loads the durable deadlines synchronously, and the first `run_due` runs on the worker inside the loop.
+16. ~~**Startup recovery runs inside the loop.** `_maybe_start_liquidation_recovery` used to call `rescan()` before `trader.run()`. Orders need a running loop, so the first tick is now the first step of the recovery task. Session recovery keeps its "before readiness" order: `SessionController.restore()` loads the durable deadlines synchronously, and the first `run_due` runs on the worker inside the loop.~~ Replaced by ruling 36: master (PR #42) runs the first rescan and the session `recover` on the worker inside `run_until_complete`, before `trader.run()`.
 17. **Join rows carry the conid.** A retried command is checked against its first request (account, conid, goal, quantity), so a joined command id cannot be re-used for another conid (#24).
 18. **Intermediate behaviour between Tasks 5 and 6.** Task 5 refuses a partial request with `PARTIAL_CLOSE_UNAVAILABLE`; Task 6 replaces that line. No run is created for the refused request.
 19. **Reduce orders are never cancelled (round 2).** Spec 5.1 step 4 says the flatten cancels every child it identified as working. A working reduce (this root's own, an inherited one, or a pre-SP1 one) only reduces; cancelling it would undo a reduction in flight. So no root cancels a reduce: it blocks every new reduce while it works (R23) and is reconciled like any child.
@@ -147,6 +147,23 @@ The rules above were checked against the real code while the tasks were rewritte
 28. **Entry cancels of the session are not liquidation children.** A cancel is idempotent at the broker; a crash before `cancel_issued` is stored sends it again. They are not journaled as children (Task 16).
 29. **`REDUCE_FAILED` trips no breaker.** The position is protected again and the owner is released; the command fails with an operator alert (Task 17). The breaker stays for unprotected or unknown states (spec 5.1 "breaker signals").
 30. **The saga after a release models the remaining position.** `release_after_partial` sets the requested, filled and protected quantities to the remainder, because today's event rules (`_apply_event`) compare them with the leg fills. The entry's history stays in the domain event journal.
+
+
+### Rulings made while aligning with master (PR #42)
+
+PR #42 (`15f9e715`, "let liquidation exits skip entry gates and stop blocking the trader loop") merged after round 2. It already has `Trader.place_reduce_only_order`, loop-side `reduce_position` / `cancel` with on-loop and stopped-loop refusals, a timed `LiquidationService` lock with `LiquidationBusy`, one liquidation worker thread in `trader_service.py` (stuck-tick watchdog, `_BusyStreak`, startup rescan and session recover on the worker, shutdown during startup), `rescan` that skips `FAILED_SAFE`, and the "never on an RPC surface" guard (`NEVER_EXPOSED_METHODS`). The tasks below now extend that code. Where the plan and the merged code differed, the stricter one was kept. Rulings 31–41 are binding like the others.
+
+31. **The worker serializes; master's lock stays as a second guard (Task 4).** R12 puts every entry point on one worker, so the lock is never contended in production. It is kept anyway for a caller that bypasses the worker (the drill, tests, a future producer): `start` commits its claim, join row and run in one transaction (R6) *before* it waits for the lock, and only `_tick` runs under it; `rescan` holds it for the whole pass. A caller that waits past `lock_timeout_seconds` gets `LiquidationBusy` and the root is not lost: the next `rescan` advances it. `liquidate` on `LiquidationBusy` records `OUTCOME_UNKNOWN` for the root, schedules the reconciler and re-raises (master's behaviour; R33 still holds: the service never resolves the command). `upgrade_to_zero` and the claims are single journal transactions and take no lock (`_tick` calls `upgrade_to_zero`; a nested lock would deadlock).
+32. **Master's lock tests are adapted, not dropped (Task 4).** `test_start_and_rescan_serialize_across_threads`, the busy tests, `test_root_bound_to_one_account_rejects_another_account` and `test_rescan_returns_none_when_only_failed_safe_roots_remain` run on the journal. `test_rescan_skips_failed_safe_root_and_advances_a_busy_registered_root` is dropped (Task 4 `test_failed_safe_root_does_not_block_rescan_of_a_newer_root` plus the busy-start test cover it). Master's FLAT-resolves-the-command assertion is dropped (R33). The saga test `test_busy_liquidation_keeps_protective_failure_root_for_rescan` and the five real-loop tests in `tests/test_trader_service_loops.py` move to the journal store (their old `_ResumeStore` / in-memory `_runs` are gone).
+33. **One pre-boundary error type (Task 14).** `DispatchRefused` (a `RuntimeError`) is raised for every refusal proven before the order leaves: `_dispatch_loop` (`TRADER_LOOP_UNAVAILABLE`, `ON_TRADER_LOOP`, with master's messages, so master's `pytest.raises(RuntimeError, match=...)` tests still pass), the size, side and account checks of `reduce_position` (were `ValueError`), and a `reduce-only refused:` result from the trader (was `BrokerRejectedError`). IB's own rejection after the send stays `BrokerRejectedError`: the order was sent, so the child stays `UNKNOWN` until its row proves `REJECTED` (R2). Three master assertions in `tests/test_order_dispatch_ports.py` change type accordingly.
+34. **R13 is met by master's order tracker (Tasks 14, 10).** `_confirm_reduce_only` waits on `OrderLifecycleTracker.wait_decisive(order_id)`: the status of *this* order id, where `PendingSubmit` is not decisive. The plan's `_place_and_await_status`, `ack_timeout`, `_ACK_STATUSES` and the `EXIT_ORDER_REJECTED:` text are dropped, and so are their stream-script tests. The tracker's `timeout` verdict still returns success: the service never reads the return value as evidence (a sent child is `UNKNOWN` until its own broker row), so the difference is only a log line. The refusal text stays master's `reduce-only refused:` (now the constant `REDUCE_ONLY_REFUSED`).
+35. **Master's signature and checks stay; the plan's are added (Tasks 14, 10).** `place_reduce_only_order(contract, side, quantity, *, broker_quantity, order_ref)` keeps master's account/mode pin, contract check, the cross-check of the caller's broker quantity against ib_async's live `positions()`, the pre-send exception-is-a-refusal rule and the IB verdict mapping. Task 14 adds the connection check and the R35 subtraction of reducing orders already working (`openTrades()`, the sibling of the same OCA group excluded). Task 10 adds `order_type`, `price` and `oca_group` to the same method (one reduce-only path). Duplicates of master's tests (daily-loss breach, wrong side, oversize, unpinned account, live cache, the RPC guard) are not added again.
+36. **One worker, master's loops (Task 15).** Master's `trader_service` worker and loops are kept as they are (`_watched_ticks`, `_BusyStreak`, `stopping()`, startup rescan and `recover` on the worker inside `run_until_complete`). Task 15 only (a) makes that worker the one the command stack builds (`LiquidationWorker` is a `ThreadPoolExecutor` subclass, so `run_in_executor` takes it), so RPC threads, the ingest thread and the ticks share one thread (`_shared_liquidation_worker`); (b) wraps the service in `SerializedLiquidation`, whose `rescan` first starts a flatten for every unhandled protective failure (so master's recovery tick needs no change); (c) gives the saga `nonblocking()` (ruling 8). Ruling 16 is replaced: master already runs the first rescan and the session `recover` on the worker while the loop runs, so `SessionController.restore` is not added, and the "no liquidation service → session deadlines not running" branch is dropped (the session ticks no longer depend on the liquidation facade). Task 11's restart test uses `recover`.
+37. **`cancel_on_loop` is a separate method (Task 14).** Master's `cancel` (coordinator path) keeps matching the open trade off the loop and raising `CancelUnresolved`; three master tests pin that. The liquidation uses `cancel_on_loop`: the perm id read stays on the worker, the match and `cancelOrder` run on the loop, and "no live order" is `DispatchRefused("CANCEL_UNRESOLVED")`.
+38. **A busy session flatten polls its own cause (Task 11).** Master's `_issue_flatten` swallows `LiquidationBusy`. Only a root this call claimed waits for the lock (a join returns at once), so on `LiquidationBusy` the session persists and polls its own cause.
+39. **N1: the entry write after `submit_bracket` reads again (Task 9).** R28 made every saga save revision-checked, but `start` built its post-dispatch write from the `SUBMITTING` copy it held before the call. An ingest event saved meanwhile made it raise `SagaRevisionConflict` with the bracket live. `_after_dispatch` re-reads under `_retrying`: the submitted ids are added on top of the ingest's state, and an error state is written only while the saga is still `SUBMITTING`.
+40. **N2: every pre-upgrade run's old reduce is tracked (Task 4).** Migration 36 marks every old run that did not end `FLAT` (`pre_sp1_open`). On every tick, before the deadline check, a root journals `{run}-liquidation-reduce-{conid}` of each marked run of its account, for each position in its scope, as an `UNKNOWN` child it owns (unless that child already exists). An account root then clears the marks. So the adopted run, the runs it superseded and old `FAILED_SAFE` runs all block a new reduce until their old orders are settled, also when no run was open at the upgrade.
+41. **Global constraint 21:** line numbers now cite master at `15f9e715`; where a task edits a file PR #42 changed, the task names functions, not lines.
 
 
 ## Review round 2
@@ -198,25 +215,26 @@ Round 2 (2026-10-06) checked the round-1 rewrite ticket by ticket (verification 
 | `trader/trading/command_ports.py` (modify) | 18 | `ingest_ready` (the readiness property). |
 | `trader/data/schema_migrations.py` (modify) | 3 | docstring registers 35–38. |
 | `trader/trading/exit_owner.py` (create) | 3 | `ExitOwnerRegistry` with `*_in_tx` claims, migration 35. |
-| `trader/trading/liquidation_service.py` (modify) | 4, 5, 6, 7, 8 | migration 36; frozen data model (`ChildRef`, `LiquidationReceipt`, `JoinRow`, `CloseResolution`, ports, errors); `LiquidationRunStore`; write-ahead children, evidence, account and conid scopes, partial close, re-protect, escalation, takeover, claims, cleanup. |
+| `trader/trading/liquidation_service.py` (modify) | 4, 5, 6, 7, 8 | migration 36 (with the `pre_sp1_open` mark); master's timed lock kept as a second guard; frozen data model (`ChildRef`, `LiquidationReceipt`, `JoinRow`, `CloseResolution`, ports, errors); `LiquidationRunStore`; write-ahead children, evidence, account and conid scopes, partial close, re-protect, escalation, takeover, claims, cleanup. |
 | `trader/trading/liquidation_worker.py` (create) | 15 | `LiquidationWorker`, `SerializedLiquidation` (R12). |
-| `trader/trading/trading_runtime.py` (modify) | 18, 14, 10 | `TradingRuntimeOrderDispatch.enumeration_complete` / `newest_generation`; `Trader.place_reduce_only_order` (R11, R13, R35); `TradingRuntimeOrderDispatch.reduce_position` / `reduce_partial` / `place_exit_leg` / `cancel_on_loop`. |
+| `trader/trading/trading_runtime.py` (modify) | 18, 14, 10 | `TradingRuntimeOrderDispatch.enumeration_complete` / `newest_generation`; master's `Trader.place_reduce_only_order` gets the connection check, the R35 bound and the exit legs; `TradingRuntimeOrderDispatch` refuses with `DispatchRefused`, gains `reduce_partial` / `place_exit_leg` / `cancel_on_loop`. |
 | `trader/trading/command_stack.py` (modify) | 18, 4, 14, 10, 15, 11, 13 | `_LiquidationDispatch` (evidence + reduce-only methods); `_BrokerGenerationRefresh`; composition of registry, store, worker facade, saga, session adapters, intent service, reconciler. |
-| `trader/trader_service.py` (modify) | 15 | recovery and session loops await the worker. |
+| `trader/trader_service.py` (modify) | 15 | master's loops use the liquidation worker the command stack built (`_shared_liquidation_worker`). |
 | `trader/automation/protective_order_saga.py` (modify) | 9 | `CLOSE_OWNED`, exact expected cancels, protection generations, pending replacement legs, revision-checked writes, hand-over / release / close, migration 37. |
-| `trader/automation/session_controller.py` (modify) | 15, 11, 16 | `restore()`; time exit = scoped close; persist and poll the returned flatten root (`FAILED_SAFE` → `INCIDENT`); cancel our entries only; close oversized protection. |
+| `trader/automation/session_controller.py` (modify) | 11, 16 | time exit = scoped close; persist and poll the returned flatten root (a busy start polls its own cause; `FAILED_SAFE` → `INCIDENT`); cancel our entries only; close oversized protection. |
 | `trader/automation/automated_intent_command.py` (modify) | 12 | SELL intents become a proven-reduction close, outside the pause on new exposure. |
 | `trader/trading/command_coordinator.py` (modify) | 2, 17 | `classify_cancel` docstring (`exit`); `OutcomeReconciler` resolves or rejects close commands from their exact root. |
 | `web/command_center/routes_commands.py`, `web/static/command_center*.js` (modify) | 2 | the `exit` leg value and chip. |
 | `scripts/command_plane_drill.py` (modify) | 4 | the liquidation drill uses the journal store and broker evidence. |
 | `tests/test_order_correlation.py`, `tests/automation/test_attribution_ledger.py`, `tests/test_cancel_command.py` (modify) | 2, 9 | child ids, leg classification, ingest forwarding, the `exit` cancel. |
 | `tests/test_close_broker_evidence.py` (create) | 18 | readiness property, newest generation, OCA fields. |
-| `tests/test_production_rpc_security.py` (modify) | 14 | the reduce-only exit is on no RPC surface. |
+| `tests/test_order_dispatch_ports.py`, `tests/test_trading_runtime.py` (modify) | 14 | master's reduce-only tests: refusals are `DispatchRefused`; the trader fake has `isConnected`/`openTrades`. |
+| `tests/test_trader_service_loops.py` (modify) | 4, 14 | master's real-loop tests on the journal store; a refused reduce is `NOT_SENT`. |
 | `tests/test_exit_owner.py` (create) | 3 | registry rules. |
-| `tests/test_liquidation_service.py` (rewrite) | 4–8 | state machine on a real DuckDB journal with fake broker generations, crash injection, a pre-SP1 journal. |
+| `tests/test_liquidation_service.py` (rewrite) | 4–8 | state machine on a real DuckDB journal with fake broker generations, crash injection, a pre-SP1 journal; master's lock tests adapted. |
 | `tests/test_reduce_only_order_path.py` (create) | 14, 10 | the reduce-only boundary and exit legs by order identity. |
-| `tests/test_liquidation_worker.py` (create) | 15 | worker serialization, real asyncio loop, ingest-lock case. |
-| `tests/automation/test_protective_order_saga.py` (modify) | 9, 16 | hand-over, owned events, retired and pending legs, barrier-controlled races, partly filled entry. |
+| `tests/test_liquidation_worker.py` (create) | 15 | the shared worker, real asyncio loop, ingest-lock case. |
+| `tests/automation/test_protective_order_saga.py` (modify) | 4, 9, 16 | master's busy-lock test on the journal store (4); hand-over, owned events, retired and pending legs, barrier-controlled races, the entry write after `submit_bracket`, saga rows from before the upgrade, partly filled entry. |
 | `tests/automation/test_session_controller.py` (modify) | 1, 11, 16 | the time-exit regression, exact-root polling, cancel our entries only, oversized protection. |
 | `tests/automation/test_automated_command_boundary.py` (modify) | 12 | SELL → close. |
 | `tests/test_close_reconciliation.py` (create) | 17 | joined-command resolution. |
@@ -1069,7 +1087,7 @@ Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>"
 
 Review round 2 found three gaps in the broker evidence the close needs (R22, R38):
 
-- `TradingRuntimeOrderDispatch.enumeration_complete()` and `TraderBrokerAuthority.is_ready()` (`trader/trading/command_ports.py`) call `ingest.is_ready()`. `BrokerIngest.is_ready` is a **property** (`@property def is_ready` in `trader/trading/broker_ingest.py`), so both raise `TypeError: 'bool' object is not callable` on the real ingest. `_reconcile_approve` relies on the first one today. Both now read the property through one helper, `ingest_ready` (which also accepts the method form some test doubles use); `_broker_ready` in `command_stack.py` uses it too.
+- `TradingRuntimeOrderDispatch.enumeration_complete()` and `TraderBrokerAuthority.is_ready()` (`trader/trading/command_ports.py`) call `ingest.is_ready()`. `BrokerIngest.is_ready` is a **property** (`@property def is_ready` in `trader/trading/broker_ingest.py`), so both raise `TypeError: 'bool' object is not callable` on the real ingest. `_reconcile_approve` relies on the first one today. Both now read the property through one helper, `ingest_ready` (which also accepts the method form some test doubles use); `_broker_ready` in `command_stack.py` already reads it correctly on master and switches to the helper.
 - The close fences a child order on the newest broker generation **including a staging one**, read right after the broker call (R22). `BrokerStateStore.newest_generation_in_tx` and `TradingRuntimeOrderDispatch.newest_generation()` give that number. A missing store raises: a fence that cannot be read must stop the close, never look like an old generation.
 - `DONE` must check the OCA linkage the broker reports, not the ids the service wrote itself (R13, R38). Order rows get `oca_group` and `oca_type` (journal migration **38**), copied from IB's `Order.ocaGroup` / `Order.ocaType` by `normalize_open_order` and the ingest.
 
@@ -1319,7 +1337,7 @@ This task freezes the data model every later task uses, and rebuilds the account
 - Modify (rewrite): `trader/trading/liquidation_service.py`
 - Modify: `trader/trading/command_stack.py` (`_LiquidationDispatch`, the registry and run store after `apply_liquidation_migration`, the `LiquidationService(` construction, the two session adapters)
 - Modify: `scripts/command_plane_drill.py` (`scn_liquidation`)
-- Test (rewrite): `tests/test_liquidation_service.py`; Test: `tests/test_command_stack.py`
+- Test (rewrite): `tests/test_liquidation_service.py`; Test: `tests/test_command_stack.py`; modify master's `tests/test_trader_service_loops.py` (`_liquidation` builds the journal service) and `tests/automation/test_protective_order_saga.py` (`test_busy_liquidation_keeps_protective_failure_root_for_rescan` builds the journal service)
 
 **Interfaces (frozen — every later task uses exactly these names and types):**
 
@@ -1334,6 +1352,7 @@ OWNER_RELEASED_STATES = SUCCESS_STATES | {"REDUCE_FAILED"}   # every other termi
 CHILD_STATES = {"PLANNED", "UNKNOWN", "WORKING", "FILLED", "CANCELLED", "REJECTED", "ABSENT", "NOT_SENT"}
 CHILD_TERMINAL = {"FILLED", "CANCELLED", "REJECTED", "ABSENT", "NOT_SENT"}
 
+class LiquidationBusy(RuntimeError)      # kept from master (PR #42): the timed lock was held past the timeout
 class DispatchRefused(RuntimeError)      # (code, detail): proven refusal before the broker -> child NOT_SENT
 class LiquidationRefused(ValueError)     # (code, detail): request refused up front, nothing written
 class RunStateError(RuntimeError)        # a terminal or SUPERSEDED run changed, or a goal lowered
@@ -1396,11 +1415,13 @@ class LiquidationRunStore:                # the journal rows; R6 in-transaction 
     children_in_tx / child_in_tx / next_attempt_in_tx / insert_child_in_tx / update_child_in_tx / drop_planned_in_tx
     inherit_children_in_tx(conn, *, account_id, conid, to_root_id, now) -> int  # R9
     record_join_in_tx / join_for_in_tx / joins_resolving_to_in_tx
+    pre_sp1_roots_in_tx(conn, account_id) / mark_pre_sp1_tracked_in_tx(conn, root_ids)   # N2, ruling 40
     receipt(root_id) / root_for(command_id) / close_resolution(command_id)     # own transaction each
 
 class LiquidationService:
     __init__(broker, dispatch, *, store, registry, now, breaker=None, journal=None, ledger=None,
-             schedule_reconcile=None, protection=None, refresh=None, deadline_seconds=300.0)
+             schedule_reconcile=None, protection=None, refresh=None, deadline_seconds=300.0,
+             lock_timeout_seconds=60.0)                                  # master's lock (ruling 31)
     attach_protection(protection) -> None
     liquidate(cmd) -> CommandReceipt                                  # OUTCOME_UNKNOWN, then schedule_reconcile(cmd)
     start(account_id, cause_command_id, deadline, *, scope="account", conid=None, quantity=None,
@@ -1410,7 +1431,7 @@ class LiquidationService:
     upgrade_to_zero(root_id) -> LiquidationReceipt                    # added in Task 6
 ```
 
-Journal tables of migration 36: `liquidation_runs` gains `scope, conid, goal, goal_quantity, phase, opened_generation, stop_price, target_price, remaining_quantity, escalated, superseded_by, cleanup_pending`; new `liquidation_children` (one row per child order, keyed by `child_id`, with `owner_root_id` for inheritance, `sent_generation` and `order_entity_id`); new `liquidation_joins` (one row per command that started or joined a root — R17's `(command_id, root_id)`). Migration 36 also adopts the runs that were open before the upgrade (R29): every old run gets a join row (so a retry of its command id is bound and returns it); the oldest open run of an account becomes its `ACTIVE` account owner in phase `legacy`; other open runs of that account become `SUPERSEDED` by it. On its first tick an adopted run journals, for every position the account holds, the reduce the old service may have sent (its old ref `{root}-liquidation-reduce-{conid}`) as an `UNKNOWN` child fenced on the newest generation. That child is settled like any other (its own row, or a complete enumeration opened after the upgrade) before any new reduce; an invisible one blocks to the deadline. Nothing is invented as `NOT_SENT` or `ABSENT` to make the old run fit the new schema (R2-5).
+Journal tables of migration 36: `liquidation_runs` gains `scope, conid, goal, goal_quantity, phase, opened_generation, stop_price, target_price, remaining_quantity, escalated, superseded_by, cleanup_pending`; new `liquidation_children` (one row per child order, keyed by `child_id`, with `owner_root_id` for inheritance, `sent_generation` and `order_entity_id`); new `liquidation_joins` (one row per command that started or joined a root — R17's `(command_id, root_id)`). Migration 36 also adopts the runs that were open before the upgrade (R29): every old run gets a join row (so a retry of its command id is bound and returns it); the oldest open run of an account becomes its `ACTIVE` account owner in phase `legacy`; other open runs of that account become `SUPERSEDED` by it. Every old run that did not end `FLAT` is marked `pre_sp1_open` (ruling 40, N2). On its first tick a root (the adopted one, or the first one claimed after the upgrade) journals, for every marked run of its account and every position it holds in its scope, the reduce the old service may have sent (old ref `{run}-liquidation-reduce-{conid}`) as an `UNKNOWN` child it owns, fenced on the newest generation; an account root then clears the marks. That child is settled like any other (its own row, or a complete enumeration opened after the upgrade) before any new reduce; an invisible one blocks to the deadline. Nothing is invented as `NOT_SENT` or `ABSENT` to make the old run fit the new schema (R2-5).
 
 Rules this task implements (they also hold for every later scope):
 - **Write-ahead (R1, R7).** `_reserve` re-reads the run and its owner, checks the root may still dispatch (owner `ACTIVE`, run not terminal, owner goal = run goal = the tick's goal), and writes the children as `UNKNOWN` in one transaction. Only then `_send` calls the broker, after one more re-read.
@@ -1420,15 +1441,18 @@ Rules this task implements (they also hold for every later scope):
 - **Cancels (R23, R27, spec 5.1 step 4).** `_cancel_targets` is every working order of the scope in the snapshot, plus every working re-protect leg found by its own row (it may have appeared after the capture). A reduce order is never cancelled (not the root's own, not an inherited one, not a pre-SP1 one): it only reduces, and while it works it blocks. A cancel the root sent covers its target; an inherited cancel does not. Before every cancel batch the protection is handed over again with the new targets (`handover_account`), so the saga expects every cancel.
 - **Claims (R6, R10).** `start(scope="account")` claims, creates the run and records the join row in one transaction; `JOINED_FLATTEN` creates nothing and returns the existing root's receipt.
 - **Terminal + cleanup (R6, R8, R9, R24, ruling 9).** `_finish` writes the terminal state, `cleanup_pending` and the owner's end state (`RELEASED` for `OWNER_RELEASED_STATES`, else `FAILED_SAFE`) in one transaction; `_cleanup` runs the idempotent saga step and recovery re-runs it. `_set` changes only the named fields of the run as the journal has it now; the store refuses to change a terminal run or to lower a goal.
+- **Lock (ruling 31).** The worker (Task 15) is the serialization; master's timed lock stays as a second guard. `start` commits its claim before it waits; only `_tick` runs under the lock, `rescan` holds it for its whole pass; a wait past `lock_timeout_seconds` raises `LiquidationBusy` and the root survives for the next `rescan`. `liquidate` on `LiquidationBusy` records `OUTCOME_UNKNOWN` for the root, schedules it and re-raises.
 - **Commands (R17, R33).** The service never resolves a command. `liquidate` writes `OUTCOME_UNKNOWN` and schedules the command for the reconciler; cleanup schedules every `OUTCOME_UNKNOWN` command that joined the root. A command still in `SUBMITTING` is left to its producer.
 
 - [ ] **Step 1: Write the failing tests**
 
-Replace the whole of `tests/test_liquidation_service.py` with the following. The eight existing tests are kept (one renamed to say what it now checks: `test_flat_requires_newer_generation_and_a_terminal_reduce_child`, R19); they now run on a real temporary DuckDB journal and the fake dispatch answers evidence lookups. The fake's `newest_generation` is the last captured generation plus `staging`: a test sets `staging = 1` to model a broker sync that opened before the send.
+Replace the whole of `tests/test_liquidation_service.py` with the following. Master's first eight tests are kept (one renamed to say what it now checks: `test_flat_requires_newer_generation_and_a_terminal_reduce_child`, R19); they now run on a real temporary DuckDB journal and the fake dispatch answers evidence lookups. Of the seven tests PR #42 added, five are kept on the journal (the section "Kept from master"), `test_rescan_skips_failed_safe_root_and_advances_a_busy_registered_root` is covered by `test_failed_safe_root_does_not_block_rescan_of_a_newer_root` plus the busy-start test, and the FLAT-resolves-the-command part of the busy flatten test is gone (R33, ruling 32). The last section holds the round-2 verification fixes for the upgrade (N2, R2-5). The fake's `newest_generation` is the last captured generation plus `staging`: a test sets `staging = 1` to model a broker sync that opened before the send.
 
 ```python
 import datetime as dt
 import logging
+import threading
+import time
 from types import SimpleNamespace
 
 import pytest
@@ -1438,7 +1462,7 @@ from trader.data.duckdb_store import DuckDBConnection
 from trader.data.schema_migrations import SchemaMigrator
 from trader.trading.exit_owner import ExitOwnerRegistry, apply_exit_owner_migration
 from trader.trading.liquidation_service import (
-    ChildRef, DispatchRefused, LiquidationReceipt, LiquidationRunStore, LiquidationService,
+    ChildRef, DispatchRefused, LiquidationBusy, LiquidationReceipt, LiquidationRunStore, LiquidationService,
     RunStateError, apply_liquidation_migration,
 )
 
@@ -1574,7 +1598,8 @@ class _Crash(BaseException):
 
 class _Stack:
     """A service over a real DuckDB journal; restart() rebuilds it on the same file."""
-    def __init__(self, tmp_path, snapshots, *, protection=None, journal=None, ledger=None, deadline_seconds=300.0):
+    def __init__(self, tmp_path, snapshots, *, protection=None, journal=None, ledger=None, deadline_seconds=300.0,
+                 lock_timeout_seconds=60.0):
         self.db = DuckDBConnection.get_instance(str(tmp_path / "liq.duckdb"))
         migrator = SchemaMigrator(self.db)
         apply_exit_owner_migration(migrator)
@@ -1588,6 +1613,7 @@ class _Stack:
         self.clock = {"now": NOW}
         self.protection, self.journal, self.ledger = protection, journal, ledger
         self.deadline_seconds = deadline_seconds
+        self.lock_timeout_seconds = lock_timeout_seconds
         self.service = self._build()
 
     def _build(self):
@@ -1595,7 +1621,7 @@ class _Stack:
             self.broker, self.dispatch, store=self.store, registry=self.registry,
             now=lambda: self.clock["now"], breaker=self.breaker, journal=self.journal, ledger=self.ledger,
             schedule_reconcile=self.scheduled.append, protection=self.protection,
-            deadline_seconds=self.deadline_seconds)
+            deadline_seconds=self.deadline_seconds, lock_timeout_seconds=self.lock_timeout_seconds)
 
     def restart(self):
         self.store = LiquidationRunStore(self.db)
@@ -1787,8 +1813,9 @@ def test_an_adopted_run_settles_its_old_reduce_before_any_new_reduce_across_two_
     s = _stack(tmp_path, [_snapshot(5, [_position()]), _snapshot(5, [_position()])])
     s.service.rescan()                                      # adopt: old reduce of conid 1 is UNKNOWN
     adopted = s.service.receipt_for("open-a")
-    assert [(c.child_id, c.state, c.sent_generation) for c in adopted.children] == [
-        ("open-a-liquidation-reduce-1", "UNKNOWN", 5)]
+    assert {(c.child_id, c.state, c.sent_generation) for c in adopted.children} == {
+        (child, "UNKNOWN", 5) for child in ("open-a-liquidation-reduce-1", "open-b-liquidation-reduce-1",
+                                            "open-c-liquidation-reduce-1", "old-failed-liquidation-reduce-1")}
     s.service.rescan()
     s.restart()
     s.push(_snapshot(6, [_position()]))
@@ -2172,6 +2199,162 @@ def test_a_flatten_during_unfinished_cleanup_starts_a_new_root(tmp_path):
     assert receipt.cause_command_id == "flat-2"
     assert s.service.root_for("flat-2") == "flat-2"
     assert s.dispatch.calls[-1] == ("reduce", 1, "SELL", 3.0, "flat-2-reduce-1-1")
+
+
+# ---------------------------------------------------------------------------
+# Kept from master (PR #42): the timed lock guards a caller that bypasses the worker
+# ---------------------------------------------------------------------------
+
+class _FirstCaptureBlocks(_Broker):
+    """The first capture waits for ``release``; later captures return at once."""
+    def __init__(self, snapshots):
+        super().__init__(snapshots)
+        self.first_entered, self.release = threading.Event(), threading.Event()
+
+    def capture(self, account_id):
+        if self.calls == 0:
+            self.first_entered.set()
+            assert self.release.wait(5.0)
+        return super().capture(account_id)
+
+
+def _hold_lock(service):
+    """Hold the service lock from another thread until ``release`` is set."""
+    held, release = threading.Event(), threading.Event()
+
+    def hold():
+        with service._lock:
+            held.set()
+            release.wait(5.0)
+    holder = threading.Thread(target=hold)
+    holder.start()
+    assert held.wait(2.0)
+    return holder, release
+
+
+def test_start_and_rescan_serialize_across_threads(tmp_path):
+    s = _stack(tmp_path, [])
+    s.broker = _FirstCaptureBlocks([_snapshot(1, [_position()])])
+    s.dispatch = _Dispatch(s.broker)
+    s.service = s._build()
+    results = {}
+    a = threading.Thread(target=lambda: results.setdefault("a", s.service.start(ACCOUNT, "root-1", DEADLINE)))
+    a.start()
+    assert s.broker.first_entered.wait(2.0)
+    b = threading.Thread(target=lambda: results.setdefault("b", s.service.rescan()))
+    b.start()
+    b.join(0.2)              # without the lock B would size a reduce now, while A is still capturing
+    s.broker.release.set()
+    a.join(2.0)
+    b.join(2.0)
+    assert [c[0] for c in s.dispatch.calls] == ["reduce"]
+    assert results["a"].state == results["b"].state == "VERIFYING"
+
+
+def test_busy_start_commits_its_claim_and_a_later_rescan_advances_it(tmp_path):
+    s = _stack(tmp_path, [_snapshot(1, [_position()])], lock_timeout_seconds=0.05)
+    holder, release = _hold_lock(s.service)
+    try:
+        started = time.monotonic()
+        with pytest.raises(LiquidationBusy):
+            s.service.start(ACCOUNT, "saga-root", DEADLINE)
+        with pytest.raises(LiquidationBusy):
+            s.service.rescan()
+        assert time.monotonic() - started < 1.0
+        assert s.dispatch.calls == []
+    finally:
+        release.set()
+        holder.join(2.0)
+    assert s.registry.account_owner(ACCOUNT).root_id == "saga-root"
+    receipt = s.service.rescan()
+    assert (receipt.cause_command_id, receipt.state) == ("saga-root", "VERIFYING")
+    assert [c[0] for c in s.dispatch.calls] == ["reduce"]
+
+
+def test_busy_flatten_records_the_pending_root_and_surfaces_busy(tmp_path):
+    ledger = _Ledger({"flatten-1": "RECEIVED"})
+    s = _stack(tmp_path, [_snapshot(1, [_position()])], journal=_Journal(), ledger=ledger,
+               lock_timeout_seconds=0.05)
+    holder, release = _hold_lock(s.service)
+    try:
+        with pytest.raises(LiquidationBusy):
+            s.service.liquidate(SimpleNamespace(account_id=ACCOUNT, command_id="flatten-1"))
+    finally:
+        release.set()
+        holder.join(2.0)
+    assert ledger.transitions[0][:3] == ("flatten-1", "RECEIVED", "OUTCOME_UNKNOWN")
+    assert ledger.transitions[0][3]["outcome"]["liquidation_state"] == "REQUESTED"
+    assert s.scheduled == ["flatten-1"]
+    assert s.service.rescan().state == "VERIFYING"
+
+
+def test_root_bound_to_one_account_rejects_another_account(tmp_path):
+    s = _stack(tmp_path, [_snapshot(1, [_position()])])
+    s.service.start(ACCOUNT, "root-1", DEADLINE)
+    with pytest.raises(ValueError):
+        s.service.start("DU999", "root-1", DEADLINE)
+
+
+def test_rescan_returns_none_when_only_failed_safe_roots_remain(tmp_path):
+    s = _stack(tmp_path, [_snapshot(1, [_position()])])
+    s.service.start(ACCOUNT, "old", NOW)                       # deadline already passed: FAILED_SAFE
+    captured = s.broker.calls
+    assert s.service.rescan() is None
+    assert s.broker.calls == captured                          # nothing left to advance: no capture
+
+
+# ---------------------------------------------------------------------------
+# Round-2 verification fixes (N2, R2-5): every pre-upgrade run's old reduce is tracked
+# ---------------------------------------------------------------------------
+
+_OLD_REDUCES = {"open-a-liquidation-reduce-1", "open-b-liquidation-reduce-1",
+                "open-c-liquidation-reduce-1", "old-failed-liquidation-reduce-1"}
+
+
+def test_a_superseded_legacy_runs_invisible_reduce_blocks_the_adopted_root(tmp_path):
+    """N2: before the upgrade two flattens could each send a reduce. The adopted root settles its
+    own old reduce, but the superseded and FAILED_SAFE runs' old reduces still block a new one."""
+    _legacy_db(tmp_path)
+    s = _stack(tmp_path, [_snapshot(5, [_position()]), _snapshot(6, [_position()]), _snapshot(7, [_position()])])
+    s.dispatch.complete = False                              # nothing proves an unseen old reduce absent
+    s.dispatch.rows["open-a-liquidation-reduce-1"] = [_row("Cancelled", entity="open-a-liquidation-reduce-1:exit")]
+    s.service.rescan()                                       # adopt at 5
+    assert {c.child_id for c in s.service.receipt_for("open-a").children} == _OLD_REDUCES
+    s.service.rescan()                                       # 6: open-a's old reduce is CANCELLED
+    s.service.rescan()                                       # 7: the others are still unknown
+    assert s.dispatch.calls == []
+    s.clock["now"] = DEADLINE + dt.timedelta(seconds=1)
+    assert s.service.rescan().state == "FAILED_SAFE"
+    assert s.dispatch.calls == []
+
+
+def test_a_legacy_run_whose_deadline_passed_fails_safe_and_a_new_flatten_inherits_its_old_reduces(tmp_path):
+    """R2-5 gap: a real upgrade finds the old deadline passed. Nothing is sent, the breaker trips,
+    and the next flatten inherits every old reduce as UNKNOWN before it may send its own."""
+    _legacy_db(tmp_path)
+    s = _stack(tmp_path, [_snapshot(5, [_position()])])
+    s.dispatch.complete = False
+    s.clock["now"] = DEADLINE + dt.timedelta(minutes=1)
+    assert s.service.rescan().state == "FAILED_SAFE"
+    assert s.dispatch.calls == [] and s.breaker.calls
+    assert s.registry.get("open-a").state == "FAILED_SAFE"
+    receipt = s.service.start(ACCOUNT, "flat-new", s.clock["now"] + dt.timedelta(minutes=5))
+    assert {(c.child_id, c.owner_root_id, c.state) for c in receipt.children} == {
+        (child, "flat-new", "UNKNOWN") for child in _OLD_REDUCES}
+    assert s.dispatch.calls == []
+
+
+def test_old_failed_safe_runs_reduces_are_tracked_even_with_no_run_open_at_the_upgrade(tmp_path):
+    """N2: only FAILED_SAFE runs survived the upgrade; the first flatten after it still tracks them."""
+    db = _legacy_db(tmp_path)
+    db.execute("DELETE FROM liquidation_runs WHERE cause_command_id LIKE 'open-%'", fetch="none")
+    s = _stack(tmp_path, [_snapshot(5, [_position()]), _snapshot(6, [_position()]), _snapshot(7, [_position()])])
+    receipt = s.service.start(ACCOUNT, "flat-new", DEADLINE)
+    assert [(c.child_id, c.state) for c in receipt.children] == [("old-failed-liquidation-reduce-1", "UNKNOWN")]
+    assert s.dispatch.calls == []
+    s.service.rescan()                                       # 6: complete and newer, no row: ABSENT
+    s.service.rescan()                                       # 7: newer than that observation: reduce
+    assert s.dispatch.calls == [("reduce", 1, "SELL", 10.0, "flat-new-reduce-1-1")]
 ```
 
 Append to `tests/test_command_stack.py`:
@@ -2186,9 +2369,210 @@ def test_enabled_stack_applies_safe_close_migrations(tmp_path):
     assert {35, 36} <= versions
 ```
 
+Master's real-loop tests and the saga's busy-lock test move to the journal service (ruling 32):
+
+```diff
+diff --git a/tests/automation/test_protective_order_saga.py b/tests/automation/test_protective_order_saga.py
+index eed23969..f41a8768 100644
+--- a/tests/automation/test_protective_order_saga.py
++++ b/tests/automation/test_protective_order_saga.py
+@@ -802,7 +802,10 @@ def test_busy_liquidation_keeps_protective_failure_root_for_rescan(tmp_path):
+     import threading
+ 
+     from trader.data.broker_state import BrokerPositionRow, BrokerRiskSnapshot
+-    from trader.trading.liquidation_service import LiquidationBusy, LiquidationService
++    from trader.trading.exit_owner import ExitOwnerRegistry
++    from trader.trading.liquidation_service import (
++        LiquidationBusy, LiquidationRunStore, LiquidationService, apply_liquidation_migration,
++    )
+ 
+     position = BrokerPositionRow(
+         account_id=ACCOUNT, conid=CONID, symbol="AAPL", sec_type="STK", exchange="SMART",
+@@ -816,10 +819,15 @@ def test_busy_liquidation_keeps_protective_failure_root_for_rescan(tmp_path):
+         positions=(position,), working_orders=(),
+     )
+     reduces = []
++    db = DuckDBConnection.get_instance(str(tmp_path / "liquidation.duckdb"))
++    apply_liquidation_migration(SchemaMigrator(db))
+     liquidation = LiquidationService(
+         SimpleNamespace(capture=lambda account_id: snapshot),
+-        SimpleNamespace(reduce=lambda *args: reduces.append(args), cancel=lambda *args: None),
+-        now=lambda: NOW, lock_timeout_seconds=0.05,
++        SimpleNamespace(reduce=lambda *args: reduces.append(args), cancel=lambda *args: None,
++                        find_orders=lambda *args: [], get_order=lambda entity: None,
++                        enumeration_complete=lambda: True, newest_generation=lambda: 1),
++        store=LiquidationRunStore(db), registry=ExitOwnerRegistry(db), now=lambda: NOW,
++        lock_timeout_seconds=0.05,
+     )
+     saga, intent, state, breaker, _, _ = _started(tmp_path, liquidation=liquidation)
+     og = state.order_group_id
+diff --git a/tests/test_trader_service_loops.py b/tests/test_trader_service_loops.py
+index 5fb98a6c..bcc45939 100644
+--- a/tests/test_trader_service_loops.py
++++ b/tests/test_trader_service_loops.py
+@@ -5,9 +5,10 @@ loop, and ``reduce_position`` then waited on that same loop: a timeout, then a
+ late order. The ticks now run on the single liquidation worker thread while
+ the loop stays free to place the order.
+ 
+-Wiring: a real ``LiquidationService`` -> ``command_stack._LiquidationDispatch``
+--> ``TradingRuntimeOrderDispatch`` -> a fake trader whose
+-``place_reduce_only_order`` records which thread ran it and when.
++Wiring: a real ``LiquidationService`` on a DuckDB journal ->
++``command_stack._LiquidationDispatch`` -> ``TradingRuntimeOrderDispatch`` ->
++a fake trader whose ``place_reduce_only_order`` records which thread ran it
++and when. Broker evidence (order rows, generations) is answered by the test.
+ """
+ from __future__ import annotations
+ 
+@@ -25,8 +26,13 @@ import pytest
+ from trader import trader_service
+ from trader.common.reactivex import SuccessFail
+ from trader.data.broker_state import BrokerPositionRow, BrokerRiskSnapshot
++from trader.data.duckdb_store import DuckDBConnection
++from trader.data.schema_migrations import SchemaMigrator
+ from trader.trading.command_stack import _LiquidationDispatch
+-from trader.trading.liquidation_service import LiquidationReceipt, LiquidationService
++from trader.trading.exit_owner import ExitOwnerRegistry
++from trader.trading.liquidation_service import (
++    LiquidationRunStore, LiquidationService, apply_liquidation_migration,
++)
+ from trader.trading.trading_runtime import TradingRuntimeOrderDispatch
+ 
+ UTC = dt.timezone.utc
+@@ -68,23 +74,32 @@ class _FakeTrader:
+         return SuccessFail.success(obj=[])
+ 
+ 
+-class _ResumeStore:
+-    """A durable run left REQUESTED by a previous process."""
+-    def __init__(self, deadline):
+-        self._deadline = deadline
++class _EvidenceDispatch(TradingRuntimeOrderDispatch):
++    """The real order dispatch; the fake trader has no broker store, so the test answers the evidence."""
++    def find_by_order_ref(self, account_id, order_ref):
++        return []
+ 
+-    def load_unresolved(self):
+-        return [LiquidationReceipt(ACCOUNT, "root-1", "REQUESTED", self._deadline)]
++    def enumeration_complete(self):
++        return True
+ 
+-    def save(self, receipt, now):
+-        pass
++    def newest_generation(self):
++        return 1
+ 
+ 
+-def _liquidation(trader, *, resume=True, clock=None):
++def _liquidation(trader, tmp_path, *, resume=True, clock=None):
++    """``resume``: a run a previous process claimed and left REQUESTED."""
+     clock = clock or [FLATTEN_TIME]
+-    dispatch = _LiquidationDispatch(TradingRuntimeOrderDispatch(trader, dispatch_timeout=0.5))
+-    store = _ResumeStore(clock[0] + dt.timedelta(minutes=5)) if resume else None
+-    return LiquidationService(_Broker(), dispatch, now=lambda: clock[0], store=store)
++    db = DuckDBConnection.get_instance(str(tmp_path / "liquidation.duckdb"))
++    apply_liquidation_migration(SchemaMigrator(db))
++    dispatch = _LiquidationDispatch(_EvidenceDispatch(trader, dispatch_timeout=0.5),
++                                    SimpleNamespace(get_order=lambda entity: None))
++    service = LiquidationService(_Broker(), dispatch, store=LiquidationRunStore(db),
++                                 registry=ExitOwnerRegistry(db), now=lambda: clock[0])
++    if resume:
++        deadline = clock[0] + dt.timedelta(minutes=5)
++        LiquidationRunStore(db).transaction(
++            lambda conn: service._claim_account_in_tx(conn, ACCOUNT, "root-1", deadline))
++    return service
+ 
+ 
+ @pytest.fixture
+@@ -108,9 +123,9 @@ def _close_loop(loop):
+ # ---------------------------------------------------------------------------
+ 
+ @pytest.mark.asyncio
+-async def test_liquidation_recovery_tick_on_real_loop_places_exactly_one_order(worker):
++async def test_liquidation_recovery_tick_on_real_loop_places_exactly_one_order(tmp_path, worker):
+     trader = _FakeTrader(asyncio.get_running_loop())
+-    service = _liquidation(trader)
++    service = _liquidation(trader, tmp_path)
+ 
+     started = time.monotonic()
+     receipt = await trader_service._liquidation_recovery_tick(service, worker)
+@@ -161,7 +176,7 @@ def _session_controller(tmp_path: Path, liquidation, clock):
+ async def test_session_controller_tick_flatten_on_real_loop_does_not_block_loop(tmp_path, worker):
+     clock = [FLATTEN_TIME]
+     trader = _FakeTrader(asyncio.get_running_loop(), send_seconds=0.1)
+-    liquidation = _liquidation(trader, resume=False, clock=clock)
++    liquidation = _liquidation(trader, tmp_path, resume=False, clock=clock)
+     controller = _session_controller(tmp_path, liquidation, clock)
+     controller.recover(dt.datetime(2026, 7, 17, 11, 0, tzinfo=ET))
+ 
+@@ -222,11 +237,11 @@ async def test_watched_loop_logs_critical_and_never_stacks_worker_calls(monkeypa
+ # Startup recovery (before trader.run())
+ # ---------------------------------------------------------------------------
+ 
+-def test_startup_liquidation_recovery_dispatches_while_loop_runs(worker):
++def test_startup_liquidation_recovery_dispatches_while_loop_runs(tmp_path, worker):
+     loop = asyncio.new_event_loop()
+     try:
+         trader = _FakeTrader(loop)
+-        service = _liquidation(trader)
++        service = _liquidation(trader, tmp_path)
+         holder = SimpleNamespace(liquidation_service=service)
+ 
+         started = time.monotonic()
+@@ -236,25 +251,24 @@ def test_startup_liquidation_recovery_dispatches_while_loop_runs(worker):
+         assert len(trader.orders) == 1
+         assert trader.orders[0][1] < returned
+         assert returned - started < 0.5
+-        assert service._runs["root-1"].state == "VERIFYING"
++        assert service.receipt_for("root-1").state == "VERIFYING"
+     finally:
+         _close_loop(loop)
+ 
+ 
+-def test_startup_liquidation_recovery_without_trader_loop_sends_nothing_late(worker):
++def test_startup_liquidation_recovery_without_trader_loop_sends_nothing_late(tmp_path, worker):
+     loop = asyncio.new_event_loop()
+     try:
+         trader = _FakeTrader(None)  # e.g. the fake-broker path: _main_loop not set yet
+-        service = _liquidation(trader)
++        service = _liquidation(trader, tmp_path)
+         holder = SimpleNamespace(liquidation_service=service)
+ 
+         started = time.monotonic()
+         trader_service._maybe_start_liquidation_recovery(holder, loop, worker)
+         assert time.monotonic() - started < 0.5
+ 
+-        receipt = service._runs["root-1"]
+-        assert receipt.state == "OUTCOME_UNKNOWN"
+-        assert "not running" in receipt.detail
++        [child] = service.receipt_for("root-1").children
++        assert (child.kind, child.state) == ("reduce", "UNKNOWN")
+         trader._main_loop = loop
+         loop.run_until_complete(asyncio.sleep(0.05))
+         assert trader.orders == []
+@@ -267,7 +281,7 @@ def test_startup_session_recovery_flattens_while_loop_runs(tmp_path, worker, mon
+     loop = asyncio.new_event_loop()
+     try:
+         trader = _FakeTrader(loop)
+-        liquidation = _liquidation(trader, resume=False, clock=clock)
++        liquidation = _liquidation(trader, tmp_path, resume=False, clock=clock)
+         controller = _session_controller(tmp_path, liquidation, clock)
+         monkeypatch.setattr(trader_service, "dt", SimpleNamespace(
+             datetime=_FrozenDatetime, timezone=dt.timezone, timedelta=dt.timedelta))
+@@ -276,7 +290,7 @@ def test_startup_session_recovery_flattens_while_loop_runs(tmp_path, worker, mon
+         trader_service._maybe_start_session_recovery(holder, loop, worker)
+ 
+         assert len(trader.orders) == 1
+-        assert liquidation._runs[controller.flatten_command_id(ACCOUNT, SESSION_DATE)].state == "VERIFYING"
++        assert liquidation.receipt_for(controller.flatten_command_id(ACCOUNT, SESSION_DATE)).state == "VERIFYING"
+     finally:
+         _close_loop(loop)
+ 
+```
+
 - [ ] **Step 2: Run them to verify they fail**
 
-Run: `.venv/bin/python -m pytest tests/test_liquidation_service.py tests/test_command_stack.py -q --timeout=30`
+Run: `.venv/bin/python -m pytest tests/test_liquidation_service.py tests/test_command_stack.py tests/test_trader_service_loops.py tests/automation/test_protective_order_saga.py -q --timeout=30`
 Expected: FAIL at import — `ImportError: cannot import name 'ChildRef' from 'trader.trading.liquidation_service'`.
 
 - [ ] **Step 3: Implement the module**
@@ -2215,6 +2599,8 @@ from __future__ import annotations
 import datetime as dt
 import logging
 import math
+import threading
+from contextlib import contextmanager
 from dataclasses import dataclass, replace
 from typing import Any, Callable, Optional, Protocol
 
@@ -2264,7 +2650,9 @@ def apply_liquidation_migration(migrator: SchemaMigrator) -> None:
     run gets a join row; the oldest open run of an account becomes its ACTIVE
     account owner, in phase ``legacy`` (it acts only on a broker generation
     opened after the upgrade); other open runs of that account are SUPERSEDED
-    by it. Exit owners (migration 35) are applied first.
+    by it. Every old run that did not end FLAT is marked ``pre_sp1_open``: it
+    may have sent a reduce the journal does not know (N2). Exit owners
+    (migration 35) are applied first.
     """
     migrator.apply(LIQUIDATION_MIGRATION_VERSION, "p1_liquidation_runs", (
         """CREATE TABLE IF NOT EXISTS liquidation_runs (
@@ -2287,6 +2675,8 @@ def apply_liquidation_migration(migrator: SchemaMigrator) -> None:
         "ALTER TABLE liquidation_runs ADD COLUMN IF NOT EXISTS escalated BOOLEAN DEFAULT FALSE",
         "ALTER TABLE liquidation_runs ADD COLUMN IF NOT EXISTS superseded_by VARCHAR",
         "ALTER TABLE liquidation_runs ADD COLUMN IF NOT EXISTS cleanup_pending BOOLEAN DEFAULT FALSE",
+        "ALTER TABLE liquidation_runs ADD COLUMN IF NOT EXISTS pre_sp1_open BOOLEAN DEFAULT FALSE",
+        "UPDATE liquidation_runs SET pre_sp1_open = TRUE WHERE state <> 'FLAT'",
         """CREATE TABLE IF NOT EXISTS liquidation_children (
             child_id VARCHAR PRIMARY KEY,
             root_id VARCHAR NOT NULL,
@@ -2343,6 +2733,10 @@ def apply_liquidation_migration(migrator: SchemaMigrator) -> None:
 # ---------------------------------------------------------------------------
 # Errors
 # ---------------------------------------------------------------------------
+
+class LiquidationBusy(RuntimeError):
+    """Another caller held the liquidation lock past the timeout; retry later."""
+
 
 class DispatchRefused(RuntimeError):
     """A proven refusal *before* the broker boundary. The child becomes NOT_SENT."""
@@ -2590,6 +2984,16 @@ class LiquidationRunStore:
             f"UPDATE liquidation_runs SET {assignments}, updated_at = ? WHERE cause_command_id = ?",
             [getattr(receipt, c) for c in _RUN_COLUMNS[1:]] + [now, receipt.cause_command_id])
 
+    def pre_sp1_roots_in_tx(self, conn, account_id: str) -> list[str]:
+        """Runs from before the upgrade whose old reduces are not tracked yet (N2)."""
+        return [r[0] for r in conn.execute(
+            "SELECT cause_command_id FROM liquidation_runs WHERE account_id = ? AND pre_sp1_open "
+            "ORDER BY updated_at, cause_command_id", [account_id]).fetchall()]
+
+    def mark_pre_sp1_tracked_in_tx(self, conn, root_ids: list[str]) -> None:
+        for root_id in root_ids:
+            conn.execute("UPDATE liquidation_runs SET pre_sp1_open = FALSE WHERE cause_command_id = ?", [root_id])
+
     def roots_to_advance_in_tx(self, conn) -> list[str]:
         """Roots with unfinished cleanup first, then every non-terminal root."""
         markers = ", ".join("?" for _ in RESCAN_TERMINAL)
@@ -2735,7 +3139,17 @@ def _targets(orders) -> tuple[CancelTarget, ...]:
 
 
 class LiquidationService:
-    """One state machine for every exit. Call every entry point from one worker thread (R12)."""
+    """One state machine for every exit. Call every entry point from one worker thread (R12).
+
+    The worker is the serialization. The timed lock kept from master is a
+    second guard for a caller that bypasses the worker (the drill, a test, a
+    future producer): ``start`` and ``rescan`` hold it across the broker
+    capture and the dispatch wait, and a caller that waits longer than the
+    timeout gets :class:`LiquidationBusy`. ``start`` commits its claim before
+    it waits, so a busy caller never loses the root: the next ``rescan``
+    advances it. Lock order: ``LiquidationService._lock`` before
+    ``BrokerIngest._apply_lock``.
+    """
 
     def __init__(
         self,
@@ -2752,6 +3166,7 @@ class LiquidationService:
         protection: Optional[ProtectionOwnershipPort] = None,
         refresh: Optional[GenerationRefreshPort] = None,
         deadline_seconds: float = 300.0,
+        lock_timeout_seconds: float = 60.0,
     ):
         self._broker = broker
         self._dispatch = dispatch
@@ -2764,6 +3179,19 @@ class LiquidationService:
         self._protection = protection
         self._refresh = refresh
         self._deadline_seconds = deadline_seconds
+        # Default: twice the 30s order-dispatch timeout.
+        self._lock = threading.Lock()
+        self._lock_timeout_seconds = lock_timeout_seconds
+
+    @contextmanager
+    def _exclusive(self):
+        if not self._lock.acquire(timeout=self._lock_timeout_seconds):
+            raise LiquidationBusy(
+                f"liquidation busy for more than {self._lock_timeout_seconds}s; retry later")
+        try:
+            yield
+        finally:
+            self._lock.release()
 
     def attach_protection(self, protection: ProtectionOwnershipPort) -> None:
         self._protection = protection
@@ -2778,7 +3206,16 @@ class LiquidationService:
         """
         if self._journal is None or self._ledger is None:
             raise RuntimeError("liquidation command authority is not configured")
-        receipt = self.start(cmd.account_id, cmd.command_id, self._now() + dt.timedelta(seconds=self._deadline_seconds))
+        try:
+            receipt = self.start(cmd.account_id, cmd.command_id,
+                                 self._now() + dt.timedelta(seconds=self._deadline_seconds))
+        except LiquidationBusy:
+            # The claim committed before the wait; record the root as pending so the reconciler resolves it.
+            self._record_pending(cmd, self._store.receipt(cmd.command_id))
+            raise
+        return self._record_pending(cmd, receipt)
+
+    def _record_pending(self, cmd, receipt: LiquidationReceipt) -> CommandReceipt:
         outcome = {"liquidation_state": receipt.state, "detail": receipt.detail,
                    "generation_id": receipt.generation_id, "close_root_id": receipt.cause_command_id}
         now = self._now()
@@ -2814,20 +3251,22 @@ class LiquidationService:
         else:
             raise ValueError(f"unknown liquidation scope {scope!r}")
         if outcome in (CLAIMED, "EXISTING"):
-            return self._tick(root)
+            with self._exclusive():
+                return self._tick(root)
         return self._store.receipt(root)
 
     def rescan(self) -> Optional[LiquidationReceipt]:
         """Finish pending cleanups, then advance every root that is not terminal."""
         first: Optional[LiquidationReceipt] = None
-        for root in self._store.transaction(self._store.roots_to_advance_in_tx):
-            try:
-                advanced = self._tick(root)
-            except Exception:  # one bad root must not stop the others
-                log.exception("liquidation root %s failed to advance", root)
-                continue
-            if first is None:
-                first = advanced
+        with self._exclusive():
+            for root in self._store.transaction(self._store.roots_to_advance_in_tx):
+                try:
+                    advanced = self._tick(root)
+                except Exception:  # one bad root must not stop the others
+                    log.exception("liquidation root %s failed to advance", root)
+                    continue
+                if first is None:
+                    first = advanced
         return first
 
     def receipt_for(self, root_id: str) -> Optional[LiquidationReceipt]:
@@ -2914,33 +3353,48 @@ class LiquidationService:
                 for child in unfenced:
                     self._store.update_child_in_tx(conn, child, self._now())
             self._store.transaction(write)
+        tracked = self._track_pre_sp1_reduces(receipt, snapshot, newest)
         if receipt.phase == "legacy":
-            return self._adopt_legacy(receipt, snapshot, newest)
-        return self._store.receipt(receipt.cause_command_id) if unfenced else receipt
+            return self._adopt_legacy(receipt, newest)
+        return self._store.receipt(receipt.cause_command_id) if unfenced or tracked else receipt
 
-    def _adopt_legacy(self, receipt, snapshot, newest: int) -> LiquidationReceipt:
-        """R29: a run opened before the upgrade may have sent a reduce the journal does not know.
+    def _track_pre_sp1_reduces(self, receipt, snapshot, newest: int) -> bool:
+        """R29 / N2: a run from before the upgrade may have sent a reduce the journal does not know.
 
-        For every position the account holds now, the old service's reduce
-        (ref ``{root}-liquidation-reduce-{conid}``) becomes an UNKNOWN child,
-        fenced on ``newest``: its own row, or a complete enumeration opened
-        after the upgrade, must settle it before any new reduce. The run then
-        waits for such a generation.
+        For every run of the account that was open or FAILED_SAFE at the
+        upgrade (the adopted one, the ones it superseded, old FAILED_SAFE
+        ones) and every position the account holds now, the old service's
+        reduce (ref ``{run}-liquidation-reduce-{conid}``) becomes an UNKNOWN
+        child of this root, fenced on ``newest``: its own row, or a complete
+        enumeration opened after that, must settle it before any new reduce.
+        An account root marks those runs tracked; a conid root tracks only its
+        conid and leaves them for the next account root.
         """
-        root = receipt.cause_command_id
-        legacy = [ChildRef(child_id=f"{root}-liquidation-reduce-{int(p.conid)}", root_id=root, owner_root_id=root,
-                           account_id=receipt.account_id, conid=int(p.conid), kind="reduce", attempt=0,
-                           state="UNKNOWN", fence_generation=newest, side=_reducing_side(p.quantity),
-                           quantity=abs(float(p.quantity)), sent_generation=newest)
-                  for p in snapshot.positions if float(p.quantity) != 0.0]
-        known = {c.child_id for c in receipt.children}
-
         def write(conn):
-            for child in legacy:
-                if child.child_id not in known:
-                    self._store.insert_child_in_tx(conn, child, self._now())
-        self._store.transaction(write)
-        return self._set(receipt, receipt.state, phase="", opened_generation=newest,
+            old_runs = self._store.pre_sp1_roots_in_tx(conn, receipt.account_id)
+            added = False
+            for old in old_runs:
+                for p in snapshot.positions:
+                    if float(p.quantity) == 0.0 or (receipt.conid is not None and int(p.conid) != receipt.conid):
+                        continue
+                    child_id = f"{old}-liquidation-reduce-{int(p.conid)}"
+                    if self._store.child_in_tx(conn, child_id) is not None:
+                        continue
+                    self._store.insert_child_in_tx(conn, ChildRef(
+                        child_id=child_id, root_id=old, owner_root_id=receipt.cause_command_id,
+                        account_id=receipt.account_id, conid=int(p.conid), kind="reduce", attempt=0,
+                        state="UNKNOWN", fence_generation=newest, side=_reducing_side(p.quantity),
+                        quantity=abs(float(p.quantity)), sent_generation=newest), self._now())
+                    added = True
+            if receipt.scope == "account":
+                self._store.mark_pre_sp1_tracked_in_tx(conn, old_runs)
+            return added
+        return self._store.transaction(write)
+
+    def _adopt_legacy(self, receipt, newest: int) -> LiquidationReceipt:
+        """R29: the adopted run waits for a broker generation opened after the upgrade."""
+        return self._set(self._store.receipt(receipt.cause_command_id), receipt.state, phase="",
+                         opened_generation=newest,
                          detail="adopted at the upgrade; old reduces are unknown until the broker settles them")
 
     def _observe_children(self, receipt, snapshot, newest: int) -> LiquidationReceipt:
@@ -3359,13 +3813,13 @@ def scn_liquidation(db_path: str) -> dict:
 
 - [ ] **Step 5: Run the tests**
 
-Run: `.venv/bin/python -m pytest tests/test_liquidation_service.py tests/test_command_stack.py tests/integration/test_command_plane_activation.py tests/integration/test_p1_release_gate.py tests/integration/test_p3_release_gate.py -q --timeout=60`
-Expected: all PASS (39 in `test_liquidation_service.py`). Then the full suite: green.
+Run: `.venv/bin/python -m pytest tests/test_liquidation_service.py tests/test_command_stack.py tests/test_trader_service_loops.py tests/automation/test_protective_order_saga.py tests/integration/test_command_plane_activation.py tests/integration/test_p1_release_gate.py tests/integration/test_p3_release_gate.py -q --timeout=60`
+Expected: all PASS (47 in `test_liquidation_service.py`). Then the full suite: green.
 
 - [ ] **Step 6: Commit**
 
 ```bash
-git add trader/trading/liquidation_service.py trader/trading/command_stack.py scripts/command_plane_drill.py tests/test_liquidation_service.py tests/test_command_stack.py
+git add trader/trading/liquidation_service.py trader/trading/command_stack.py scripts/command_plane_drill.py tests/test_liquidation_service.py tests/test_command_stack.py tests/test_trader_service_loops.py tests/automation/test_protective_order_saga.py
 git commit -m "feat: journaled liquidation children and one-transaction account claims
 
 Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>"
@@ -3374,43 +3828,45 @@ Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>"
 ---
 
 
-### Task 14: One reduce-only order path at the broker boundary (R11)
+### Task 14: Extend master's reduce-only path for the close (R11, R13, R34, R35)
 
-> If the separate PR on `fix/liquidation-reduce-only-and-loop` merges first, rebase this task onto it and keep only what that PR does not already do.
+PR #42 (`15f9e715`) already added `Trader.place_reduce_only_order(contract, side, quantity, *, broker_quantity, order_ref)`. It skips the entry gates (trading filter, whatIf, leverage, `RiskGate.evaluate`), keeps the account and mode pin, the contract check, the reducing side and size against the caller's broker quantity and against ib_async's live `positions()`, turns any pre-send exception into a refusal (`reduce-only refused: ...`), and maps IB's verdict for this order id through `OrderLifecycleTracker.wait_decisive` (R13: `PendingSubmit` is not decisive). `TradingRuntimeOrderDispatch.reduce_position` already uses it, `_dispatch_loop` refuses a stopped loop and a call on the loop thread, `_wait_on_loop` cancels a timed-out future, and `NEVER_EXPOSED_METHODS` keeps the method off every RPC surface. Master's tests pin all of that (`tests/test_trading_runtime.py`, `tests/test_order_dispatch_ports.py`, `tests/test_production_rpc_security.py`); this task does not repeat them (rulings 33–35, 37).
 
-Today every liquidation reduce goes through `Trader.place_expressive_order` (`async def place_expressive_order` in `trader/trading/trading_runtime.py`). That method runs the entry gates (the instrument/denylist gate at its start, then `RiskGate.evaluate`: open orders, daily loss, concentration, signal rate; and the leverage check). So an account flatten after a daily-loss breach is refused — after it may already have cancelled protection. This task adds `Trader.place_reduce_only_order`. It checks the account fence and the connection, that the side reduces IB's **live** position, and that the quantity is at most that position minus the reducing orders already working on the contract (R35). It reads `ib.positions()` only: the event-driven portfolio cache is never a fallback, because an empty live list is exactly the "position already gone" case, and a failed read is a refusal. `reduce_position` (account flatten, full close) and the new `reduce_partial` move onto it. It also waits for a broker status of *this* order id (R13): the local `PendingSubmit` echo is not acceptance.
+What the close still needs:
 
-A failure proven before the order leaves (no account, not connected, no live position, a wrong side or size, no running trader loop, a call made on the trader loop itself) is a `REDUCE_ONLY_REFUSED` / `DispatchRefused` refusal, so the close marks the child `NOT_SENT` (R34). Everything after `placeOrder` may have run is an exception, so the child stays `UNKNOWN`. Cancels from the liquidation run through `cancel_on_loop`: the perm id is read from the journal on the worker thread, and only the open-trade match and `cancelOrder` run on the trader loop, so no DuckDB read blocks the IB loop. No caller can reach the method over RPC (a guard test pins it). Exit legs (stop/target) are added in Task 10.
+- **R35 bound.** The trader also refuses when IB is not connected, and subtracts the reducing orders already working on the contract (`openTrades()`, outstanding = total − filled; the sibling of the same OCA group excluded, used by Task 10).
+- **R34 errors.** Every refusal proven before the order leaves is `DispatchRefused`, so the close marks the child `NOT_SENT`: `_dispatch_loop` (`TRADER_LOOP_UNAVAILABLE`, `ON_TRADER_LOOP`, master's messages kept), the size/side/account checks of `reduce_position` (were `ValueError`), and a `reduce-only refused:` result from the trader (was `BrokerRejectedError`). IB's rejection after the send stays `BrokerRejectedError`: the order was sent, the child stays `UNKNOWN` until its row says `REJECTED`.
+- **`reduce_partial`** — a whole-share part strictly inside the position — on the same path, sharing `_reduce_only` with `reduce_position`.
+- **`cancel_on_loop`** for the liquidation: the perm id is read from the journal on the worker thread; the open-trade match and `cancelOrder` run on the trader loop, so no DuckDB read blocks the IB loop; no live order is `DispatchRefused("CANCEL_UNRESOLVED")` (ruling 7). Master's `cancel` (coordinator path) is not changed.
 
 **Files:**
-- Modify: `trader/trading/trading_runtime.py` (`Trader`; `TradingRuntimeOrderDispatch.reduce_position`, new `_run_on_trader_loop`, `reduce_partial`, `cancel_on_loop`)
+- Modify: `trader/trading/trading_runtime.py` (`REDUCE_ONLY_REFUSED`; `Trader.place_reduce_only_order`, `Trader._reduce_only_refusal`, new `Trader._working_reduce_quantity`; `TradingRuntimeOrderDispatch.reduce_position`, `_dispatch_loop`, new `reduce_partial`, `cancel_on_loop`, `_reducing_side`, `_refuse`, `_contract_for`, `_reduce_only`)
 - Modify: `trader/trading/command_stack.py` (`_LiquidationDispatch.cancel`, new `reduce_partial`)
-- Test: `tests/test_reduce_only_order_path.py` (create), `tests/test_production_rpc_security.py`
+- Test: `tests/test_reduce_only_order_path.py` (create); modify `tests/test_order_dispatch_ports.py` (three refusal assertions change type, one new IB-rejection test), `tests/test_trading_runtime.py` (`_reduce_trader` fake gets `isConnected` and `openTrades`), `tests/test_trader_service_loops.py` (a refused reduce is now `NOT_SENT`)
 
 **Interfaces:**
-- Produces on `Trader`:
 
 ```python
-async def place_reduce_only_order(self, contract, action: str, quantity: float, *, order_ref: str,
-                                  ack_timeout: float = 10.0) -> SuccessFail
-    # refusal before IB: SuccessFail.fail(error="REDUCE_ONLY_REFUSED: ...")
-    # after placeOrder: Submitted/PreSubmitted/Filled -> success([trade]);
-    #                   Inactive/Cancelled/ApiCancelled -> fail(error="EXIT_ORDER_REJECTED: <status>");
-    #                   no status for this order id in time -> fail(exception=TimeoutError)
-async def _place_and_await_status(self, contract, order, timeout) -> tuple[str, Trade]
-def _reduce_only_refusal(self, contract, action, quantity, *, oca_group=None) -> Optional[str]
-    # live ib.positions() only; allowed = |held| - reducing orders working on the conid (not in oca_group)
+REDUCE_ONLY_REFUSED = 'reduce-only refused'      # trader/trading/trading_runtime.py; prefix of a refusal, nothing sent
+Trader._reduce_only_refusal(contract, side, quantity, broker_quantity, *, oca_group=None) -> Optional[str]
+Trader._working_reduce_quantity(conid, reducing_side, oca_group) -> float
+TradingRuntimeOrderDispatch.reduce_position(position, side, quantity, order_ref)    # exact size
+TradingRuntimeOrderDispatch.reduce_partial(position, side, quantity, order_ref)     # whole, 0 < q < |position|
+TradingRuntimeOrderDispatch.cancel_on_loop(order_entity_id, order_ref)              # DispatchRefused("CANCEL_UNRESOLVED")
+# DispatchRefused codes: REDUCE_ONLY_REFUSED, TRADER_LOOP_UNAVAILABLE, ON_TRADER_LOOP, CANCEL_UNRESOLVED
+_LiquidationDispatch.cancel -> cancel_on_loop; _LiquidationDispatch.reduce_partial(position, side, quantity, child_id)
 ```
-
-- Produces on `TradingRuntimeOrderDispatch`: `_run_on_trader_loop(coro)` (`DispatchRefused("TRADER_LOOP_UNAVAILABLE")`, `DispatchRefused("ON_TRADER_LOOP")`), `_contract_for(position)`, `_refuse(detail)` (raises `DispatchRefused("REDUCE_ONLY_REFUSED", ...)`), `_reducing_side(position)`, `_reduce_only(position, side, quantity, order_ref, **order)`, `reduce_position(position, side, quantity, order_ref)` (exact size), `reduce_partial(position, side, quantity, order_ref)` (whole, strictly inside the position), `cancel_on_loop(order_entity_id, order_ref)` (no live order → `DispatchRefused("CANCEL_UNRESOLVED", ...)`, ruling 7).
-- Produces on `_LiquidationDispatch`: `cancel` → `cancel_on_loop`; `reduce_partial(position, side, quantity, child_id)`.
-- No caller flag skips checks; `place_expressive_order` is not changed.
 
 - [ ] **Step 1: Write the failing tests**
 
 ```python
 # tests/test_reduce_only_order_path.py
-"""SP1 plan 1 Tasks 14 and 10: the one reduce-only order path at the broker boundary."""
+"""SP1 plan 1 Tasks 14 and 10: what the one reduce-only order path adds to master's (PR #42).
+
+Master already pins the entry gates it skips, the account, side, size and
+live-position checks, and the IB verdict mapping (``tests/test_trading_runtime.py``)
+and the loop rules of ``reduce_position`` (``tests/test_order_dispatch_ports.py``).
+"""
 import asyncio
 import threading
 from types import SimpleNamespace
@@ -3419,36 +3875,38 @@ import pytest
 import reactivex as rx
 from ib_async import Contract
 
-from trader.common.reactivex import SuccessFail
+from trader.trading.command_coordinator import BrokerRejectedError
 from trader.trading.liquidation_service import DispatchRefused
-from trader.trading.risk_gate import RiskGate, RiskLimits
 from trader.trading.trading_runtime import Trader, TradingRuntimeOrderDispatch
 
 ACCOUNT = "DU12345"
 CONID = 265598
 
 
-def _trade(order, status):
-    return SimpleNamespace(order=order, orderStatus=SimpleNamespace(status=status),
-                           contract=SimpleNamespace(conId=CONID))
-
-
 class _FakeExecutioner:
-    """Each placed order emits its local echo, then the statuses the test scripted."""
-    def __init__(self, script=("Submitted",), others=()):
+    """Each placed order gets an id and emits its local echo."""
+    def __init__(self):
         self.placed = []
-        self.script = list(script)
-        self.others = list(others)   # (order_id, status) events of other orders on the contract
         self._next_id = 100
 
     async def subscribe_place_order_direct(self, contract, order):
         self._next_id += 1
         order.orderId = self._next_id
         self.placed.append(order)
-        events = [_trade(order, "PendingSubmit")]
-        events += [_trade(SimpleNamespace(orderId=oid), status) for oid, status in self.others]
-        events += [_trade(order, status) for status in self.script]
-        return rx.from_iterable(events)
+        return rx.from_iterable([SimpleNamespace(order=order, orderStatus=SimpleNamespace(
+            status="PendingSubmit", filled=0.0), contract=SimpleNamespace(conId=CONID))])
+
+
+class _Tracker:
+    """IB's verdict for an order id (``OrderLifecycleTracker.wait_decisive``)."""
+    def __init__(self, verdict="accepted"):
+        self.verdict = verdict
+
+    async def wait_decisive(self, order_id, timeout=10.0):
+        return self.verdict
+
+    def latest_status(self, order_id):
+        return "Inactive" if self.verdict == "rejected" else "Submitted"
 
 
 class _FakeIB:
@@ -3456,18 +3914,19 @@ class _FakeIB:
         self.held = held
         self.connected = True
         self.open_trades = []          # trades working at IB (reducing orders count against the bound)
-        self.positions_error = None
+        self.cancelled = []
 
     def isConnected(self):
         return self.connected
 
     def positions(self, account=None):
-        if self.positions_error is not None:
-            raise self.positions_error
         return [SimpleNamespace(account=ACCOUNT, contract=SimpleNamespace(conId=CONID), position=self.held)]
 
     def openTrades(self):
         return list(self.open_trades)
+
+    def cancelOrder(self, order):
+        self.cancelled.append(order)
 
 
 def _working(action, quantity, *, filled=0.0, oca_group=""):
@@ -3476,17 +3935,13 @@ def _working(action, quantity, *, filled=0.0, oca_group=""):
                            orderStatus=SimpleNamespace(filled=filled))
 
 
-def _trader(*, held=10.0, script=("Submitted",), others=(), daily_pnl=0.0):
+def _trader(*, held=10.0, verdict="accepted"):
     trader = object.__new__(Trader)
     trader.ib_account = ACCOUNT
+    trader.paper_trading = True
     trader.client = SimpleNamespace(ib=_FakeIB(held))
-    trader.executioner = _FakeExecutioner(script, others)
-    trader.risk_gate = RiskGate(RiskLimits(max_daily_loss=1000.0), event_store=SimpleNamespace(count_since=lambda **_k: 0))
-    trader.get_pnl = lambda: [SimpleNamespace(dailyPnL=daily_pnl)]
-    trader.book = SimpleNamespace(get_open_order_count=lambda: 0)
-    trader.check_order_margin = None
-    trader.portfolio = SimpleNamespace(get_positions=lambda: [
-        SimpleNamespace(account=ACCOUNT, contract=SimpleNamespace(conId=CONID), position=10.0)])
+    trader.executioner = _FakeExecutioner()
+    trader.order_tracker = _Tracker(verdict)
     return trader
 
 
@@ -3498,96 +3953,31 @@ def _run(coro):
     return asyncio.run(coro)
 
 
-# -- Task 14: reduce-only market orders ----------------------------------------------------
+# -- Task 14: what the Trader adds -------------------------------------------------------
 
-def test_reduce_after_a_daily_loss_breach_passes_while_a_new_entry_is_refused():
-    """R11: the entry gates refuse a BUY after the breach; the reduce-only path still reduces."""
-    trader = _trader(daily_pnl=-5000.0)
-    async def _no_margin(*_a):
-        raise RuntimeError("skip margin")
-    trader.check_order_margin = _no_margin
-    trader.client.ib.accountValues = lambda: []
-    entry = _run(trader.place_expressive_order(_contract(), "BUY", 5.0, {"order_type": "MARKET"}, algo_name="mmr:og-x"))
-    assert not entry.is_success() and "daily loss" in str(entry.error)
-    exit_ = _run(trader.place_reduce_only_order(_contract(), "SELL", 10.0, order_ref="mmr:c-1-reduce-265598-1"))
-    assert exit_.is_success()
-    order = trader.executioner.placed[-1]
-    assert (order.orderType, order.action, order.totalQuantity, order.orderRef) == ("MKT", "SELL", 10.0, "mmr:c-1-reduce-265598-1")
-    assert (order.account, order.tif, order.transmit) == (ACCOUNT, "DAY", True)
-
-
-@pytest.mark.parametrize("action,quantity,held", [("BUY", 5.0, 10.0), ("SELL", 11.0, 10.0), ("SELL", 0.0, 10.0),
-                                                  ("SELL", 1.0, 0.0), ("SELL", 3.0, -10.0)])
-def test_reduce_only_refuses_wrong_side_oversize_zero_or_no_position(action, quantity, held):
-    trader = _trader(held=held)
-    result = _run(trader.place_reduce_only_order(_contract(), action, quantity, order_ref="mmr:x"))
-    assert not result.is_success() and str(result.error).startswith("REDUCE_ONLY_REFUSED")
-    assert trader.executioner.placed == []
-
-
-def test_reduce_only_refuses_without_a_pinned_account():
+def test_reduce_only_refuses_when_ib_is_not_connected():
+    """D13: no connection is a refusal before anything is sent."""
     trader = _trader()
-    trader.ib_account = ""
-    result = _run(trader.place_reduce_only_order(_contract(), "SELL", 1.0, order_ref="mmr:x"))
-    assert str(result.error).startswith("REDUCE_ONLY_REFUSED")
-
-
-def test_reduce_only_reads_live_ib_positions_never_the_portfolio_cache():
-    """D14: IB reports no position; the stale portfolio cache still says 10. Refused."""
-    trader = _trader(held=0.0)
-    result = _run(trader.place_reduce_only_order(_contract(), "SELL", 10.0, order_ref="mmr:x"))
-    assert str(result.error).startswith("REDUCE_ONLY_REFUSED: no broker position")
-    assert trader.executioner.placed == []
-
-
-@pytest.mark.parametrize("broken", ["positions", "connection"])
-def test_reduce_only_refuses_when_ib_cannot_say_what_is_held(broken):
-    """D13 / D14: no live position, or no connection, is a refusal before anything is sent."""
-    trader = _trader()
-    if broken == "positions":
-        trader.client.ib.positions_error = ConnectionError("socket closed")
-    else:
-        trader.client.ib.connected = False
-    result = _run(trader.place_reduce_only_order(_contract(), "SELL", 10.0, order_ref="mmr:x"))
-    assert str(result.error).startswith("REDUCE_ONLY_REFUSED")
+    trader.client.ib.connected = False
+    result = _run(trader.place_reduce_only_order(_contract(), "SELL", 10.0, broker_quantity=10.0,
+                                                 order_ref="mmr:x"))
+    assert result.exception is None and "IB is not connected" in result.error
     assert trader.executioner.placed == []
 
 
 def test_reduce_only_subtracts_reducing_orders_already_working():
-    """D14: a stop whose cancel has not landed still sells 10; a second SELL 10 would reverse the position."""
+    """D14: a stop whose cancel has not landed still sells 6; a second SELL 10 would reverse the position."""
     trader = _trader(held=10.0)
     trader.client.ib.open_trades = [_working("SELL", 10.0, filled=4.0), _working("BUY", 5.0)]
-    assert str(_run(trader.place_reduce_only_order(_contract(), "SELL", 10.0, order_ref="mmr:x")).error) \
-        .startswith("REDUCE_ONLY_REFUSED: quantity 10 is not within (0, 4]")
-    assert _run(trader.place_reduce_only_order(_contract(), "SELL", 4.0, order_ref="mmr:y")).is_success()
+    refused = _run(trader.place_reduce_only_order(_contract(), "SELL", 10.0, broker_quantity=10.0,
+                                                  order_ref="mmr:x"))
+    assert refused.error.startswith("reduce-only refused: quantity 10 is above 4")
+    assert _run(trader.place_reduce_only_order(_contract(), "SELL", 4.0, broker_quantity=10.0,
+                                               order_ref="mmr:y")).is_success()
+    assert [o.totalQuantity for o in trader.executioner.placed] == [4.0]
 
 
-def test_local_echo_alone_is_not_acceptance_and_times_out():
-    """R13: PendingSubmit is our own echo; with no broker status the result is an exception."""
-    trader = _trader(script=())
-    result = _run(trader.place_reduce_only_order(_contract(), "SELL", 10.0, order_ref="mmr:x", ack_timeout=0.05))
-    assert not result.is_success() and isinstance(result.exception, TimeoutError)
-
-
-def test_status_of_another_order_on_the_contract_is_ignored():
-    trader = _trader(script=(), others=((999, "Submitted"),))
-    result = _run(trader.place_reduce_only_order(_contract(), "SELL", 10.0, order_ref="mmr:x", ack_timeout=0.05))
-    assert isinstance(result.exception, TimeoutError)
-
-
-def test_pending_submit_then_inactive_is_a_rejection():
-    trader = _trader(script=("PendingSubmit", "Inactive"))
-    result = _run(trader.place_reduce_only_order(_contract(), "SELL", 10.0, order_ref="mmr:x"))
-    assert result.error == "EXIT_ORDER_REJECTED: Inactive"
-
-
-def test_place_expressive_order_is_not_used_by_the_reduce_path():
-    trader = _trader()
-    def must_not_run(*_a, **_k):
-        raise AssertionError("entry path used for an exit")
-    trader.place_expressive_order = must_not_run
-    assert _run(trader.place_reduce_only_order(_contract(), "SELL", 4.0, order_ref="mmr:x")).is_success()
-
+# -- Task 14: the dispatch ---------------------------------------------------------------
 
 class _LoopThread:
     def __init__(self):
@@ -3609,13 +3999,17 @@ def loop_thread():
 
 def _position(quantity=10.0):
     return SimpleNamespace(conid=CONID, symbol="AAPL", sec_type="STK", exchange="SMART", currency="USD",
-                           quantity=quantity)
+                           quantity=quantity, account_id=ACCOUNT)
+
+
+def _dispatch(trader, loop_thread):
+    trader._main_loop = loop_thread.loop
+    return TradingRuntimeOrderDispatch(trader, dispatch_timeout=2.0)
 
 
 def test_dispatch_reduce_position_and_partial_use_the_reduce_only_path(loop_thread):
     trader = _trader()
-    trader._main_loop = loop_thread.loop
-    dispatch = TradingRuntimeOrderDispatch(trader, dispatch_timeout=2.0)
+    dispatch = _dispatch(trader, loop_thread)
     dispatch.reduce_position(_position(10.0), "SELL", 10.0, "mmr:a-reduce-265598-1")
     dispatch.reduce_partial(_position(10.0), "SELL", 4.0, "mmr:p-reduce-265598-1")
     assert [(o.orderType, o.totalQuantity, o.orderRef) for o in trader.executioner.placed] == [
@@ -3631,25 +4025,60 @@ def test_dispatch_reduce_position_and_partial_use_the_reduce_only_path(loop_thre
 ])
 def test_dispatch_refuses_before_the_boundary_with_dispatch_refused(loop_thread, call):
     trader = _trader()
-    trader._main_loop = loop_thread.loop
-    with pytest.raises(DispatchRefused):
-        call(TradingRuntimeOrderDispatch(trader, dispatch_timeout=2.0))
+    with pytest.raises(DispatchRefused) as ex:
+        call(_dispatch(trader, loop_thread))
+    assert ex.value.code == "REDUCE_ONLY_REFUSED"
     assert trader.executioner.placed == []
 
 
-def test_dispatch_maps_a_trader_refusal_to_dispatch_refused_and_a_timeout_to_an_exception(loop_thread):
-    trader = _trader(held=3.0)
-    trader._main_loop = loop_thread.loop
-    with pytest.raises(DispatchRefused):            # IB now holds only 3: refused at the trader
-        TradingRuntimeOrderDispatch(trader, dispatch_timeout=2.0).reduce_position(_position(10.0), "SELL", 10.0, "mmr:x")
-    silent = _trader(script=())
-    silent._main_loop = loop_thread.loop
-    async def slow(contract, action, quantity, **kwargs):
-        return await Trader.place_reduce_only_order(silent, contract, action, quantity, ack_timeout=0.05, **kwargs)
-    silent.place_reduce_only_order = slow
-    with pytest.raises(TimeoutError):
-        TradingRuntimeOrderDispatch(silent, dispatch_timeout=2.0).reduce_position(_position(10.0), "SELL", 10.0, "mmr:x")
+def test_a_trader_refusal_is_dispatch_refused_and_an_ib_rejection_is_not(loop_thread):
+    """R2 / R34: a refusal sent nothing (NOT_SENT); an IB rejection was sent (UNKNOWN until its row)."""
+    trader = _trader(held=3.0)                      # IB now holds only 3
+    with pytest.raises(DispatchRefused) as ex:
+        _dispatch(trader, loop_thread).reduce_position(_position(10.0), "SELL", 10.0, "mmr:x")
+    assert ex.value.code == "REDUCE_ONLY_REFUSED" and trader.executioner.placed == []
+    rejected = _trader(verdict="rejected")
+    with pytest.raises(BrokerRejectedError) as ex:
+        _dispatch(rejected, loop_thread).reduce_position(_position(10.0), "SELL", 10.0, "mmr:x")
+    assert not isinstance(ex.value, DispatchRefused) and len(rejected.executioner.placed) == 1
 
+
+def test_dispatch_refusals_without_a_running_loop_or_on_the_loop_carry_their_codes(loop_thread):
+    """D13: both would block or fail before the order leaves, so both are a proven refusal."""
+    trader = _trader()
+    trader._main_loop = None
+    with pytest.raises(DispatchRefused) as ex:
+        TradingRuntimeOrderDispatch(trader, dispatch_timeout=2.0).reduce_position(_position(10.0), "SELL", 10.0, "mmr:x")
+    assert ex.value.code == "TRADER_LOOP_UNAVAILABLE"
+    dispatch = _dispatch(trader, loop_thread)
+
+    async def on_the_loop():
+        dispatch.reduce_position(_position(10.0), "SELL", 10.0, "mmr:x")
+    with pytest.raises(DispatchRefused) as ex:
+        asyncio.run_coroutine_threadsafe(on_the_loop(), loop_thread.loop).result(timeout=5)
+    assert ex.value.code == "ON_TRADER_LOOP"
+    assert trader.executioner.placed == []
+
+
+def test_cancel_on_loop_reads_the_journal_off_the_loop_and_maps_unresolved_to_refused(loop_thread):
+    """The perm id read (DuckDB) runs on the caller's thread; the match and cancelOrder run on the IB loop."""
+    trader = _trader()
+    threads = {}
+    live = SimpleNamespace(permId=77)
+    trader.client.ib.open_trades = [SimpleNamespace(order=live, orderStatus=SimpleNamespace(status="Submitted"))]
+    trader.client.ib.cancelOrder = lambda order: threads.setdefault("cancel", (threading.get_ident(), order))
+    dispatch = _dispatch(trader, loop_thread)
+
+    def perm_id(entity):
+        threads["perm"] = threading.get_ident()
+        return 77 if entity == "og-1:stop" else 99
+    dispatch._perm_id_for_order = perm_id
+    dispatch.cancel_on_loop("og-1:stop", "mmr:c")
+    assert threads["perm"] == threading.get_ident()
+    assert threads["cancel"] == (loop_thread.thread.ident, live)
+    with pytest.raises(DispatchRefused) as ex:
+        dispatch.cancel_on_loop("og-2:stop", "mmr:c")           # perm id 99 has no live order
+    assert ex.value.code == "CANCEL_UNRESOLVED"
 
 
 def test_liquidation_dispatch_encodes_child_ids_and_reads_evidence():
@@ -3676,312 +4105,360 @@ def test_liquidation_dispatch_encodes_child_ids_and_reads_evidence():
         ("reduce_partial", "SELL", 4.0, "mmr:p-1-reduce-265598-1"),
         ("find", ACCOUNT, "mmr:c-1-reduce-265598-1"),
     ]
-
-
-def test_dispatch_refuses_without_a_running_loop_and_on_the_loop_itself(loop_thread):
-    """D13: both would block or fail before the order leaves, so both are a proven refusal."""
-    trader = _trader()
-    trader._main_loop = None
-    with pytest.raises(DispatchRefused) as ex:
-        TradingRuntimeOrderDispatch(trader, dispatch_timeout=2.0).reduce_position(_position(10.0), "SELL", 10.0, "mmr:x")
-    assert ex.value.code == "TRADER_LOOP_UNAVAILABLE"
-    trader._main_loop = loop_thread.loop
-    dispatch = TradingRuntimeOrderDispatch(trader, dispatch_timeout=2.0)
-
-    async def on_the_loop():
-        dispatch.reduce_position(_position(10.0), "SELL", 10.0, "mmr:x")
-    with pytest.raises(DispatchRefused) as ex:
-        asyncio.run_coroutine_threadsafe(on_the_loop(), loop_thread.loop).result(timeout=5)
-    assert ex.value.code == "ON_TRADER_LOOP"
-    assert trader.executioner.placed == []
-
-
-def test_cancel_on_loop_reads_the_journal_off_the_loop_and_maps_unresolved_to_refused(loop_thread):
-    """The perm id read (DuckDB) runs on the caller's thread; only cancelOrder runs on the IB loop."""
-    trader = _trader()
-    trader._main_loop = loop_thread.loop
-    threads = {}
-    live = SimpleNamespace(permId=77)
-    trader.client.ib.open_trades = [SimpleNamespace(order=live, orderStatus=SimpleNamespace(status="Submitted"))]
-    trader.client.ib.cancelOrder = lambda order: threads.setdefault("cancel", (threading.get_ident(), order))
-    dispatch = TradingRuntimeOrderDispatch(trader, dispatch_timeout=2.0)
-
-    def perm_id(entity):
-        threads["perm"] = threading.get_ident()
-        return 77 if entity == "og-1:stop" else 99
-    dispatch._perm_id_for_order = perm_id
-    dispatch.cancel_on_loop("og-1:stop", "mmr:c")
-    assert threads["perm"] == threading.get_ident()
-    assert threads["cancel"] == (loop_thread.thread.ident, live)
-    with pytest.raises(DispatchRefused) as ex:
-        dispatch.cancel_on_loop("og-2:stop", "mmr:c")           # perm id 99 has no live order
-    assert ex.value.code == "CANCEL_UNRESOLVED"
 ```
 
-Append to `tests/test_production_rpc_security.py`:
+Change master's tests:
 
-```python
-def test_the_reduce_only_exit_is_on_no_rpc_surface(production_registry):
-    """SP1 plan 1 Task 14 (R11): ``place_reduce_only_order`` skips the entry gates, so only the
-    close service may reach it; no typed or legacy RPC method exposes it."""
-    for kind in ("command", "query"):
-        assert not production_registry.contains(kind, "place_reduce_only_order")
-    assert not hasattr(TraderServiceApi, "place_reduce_only_order")
-    assert not hasattr(LegacyOfflineTraderServiceApi, "place_reduce_only_order")
+```diff
+diff --git a/tests/test_order_dispatch_ports.py b/tests/test_order_dispatch_ports.py
+index f7b27d1b..d99777c6 100644
+--- a/tests/test_order_dispatch_ports.py
++++ b/tests/test_order_dispatch_ports.py
+@@ -24,6 +24,7 @@ from trader.data.broker_state import BrokerPositionRow
+ from trader.trading.command_coordinator import BrokerRejectedError, CancelAck
+ from trader.trading.command_policy import CommandAuthorityPolicy
+ from trader.trading.command_ports import CancelUnresolved
++from trader.trading.liquidation_service import DispatchRefused
+ from trader.trading.order_correlation import encode_order_ref
+ from trader.trading.trading_runtime import TradingRuntimeOrderDispatch
+ 
+@@ -250,9 +251,9 @@ def test_reduce_position_uses_reduce_only_path_and_keeps_exact_size(running_loop
+     assert dispatch.reduce_position(_position(10.0), "SELL", 10.0, "mmr:og-x") == ["trade"]
+     assert trader.calls == [(1, "AAPL", "SELL", 10.0, 10.0, "mmr:og-x")]
+ 
+-    with pytest.raises(ValueError, match="exactly reduce"):
++    with pytest.raises(DispatchRefused, match="exactly reduce"):
+         dispatch.reduce_position(_position(10.0), "SELL", 5.0, "mmr:og-x")
+-    with pytest.raises(ValueError, match="exactly reduce"):
++    with pytest.raises(DispatchRefused, match="exactly reduce"):
+         dispatch.reduce_position(_position(10.0), "BUY", 10.0, "mmr:og-x")
+     assert dispatch.reduce_position(_position(-4.0), "BUY", 4.0, "mmr:og-y") == ["trade"]
+     assert trader.calls[-1] == (1, "AAPL", "BUY", 4.0, -4.0, "mmr:og-y")
+@@ -263,7 +264,7 @@ def test_reduce_position_refuses_a_position_from_another_account(running_loop):
+     loop, _ = running_loop
+     trader = _ReduceTrader(loop)
+     dispatch = TradingRuntimeOrderDispatch(trader, dispatch_timeout=2.0)
+-    with pytest.raises(ValueError, match="account"):
++    with pytest.raises(DispatchRefused, match="account"):
+         dispatch.reduce_position(_position(10.0, account="DU999"), "SELL", 10.0, "mmr:og-x")
+     assert trader.calls == []
+ 
+@@ -303,14 +304,23 @@ def test_reduce_position_refuses_on_the_trader_loop_thread(running_loop):
+     assert trader.calls == []
+ 
+ 
+-def test_reduce_position_refusal_is_broker_rejected(running_loop):
++def test_reduce_position_refusal_is_dispatch_refused(running_loop):
++    loop, _ = running_loop
++    trader = _ReduceTrader(loop, result=SuccessFail.fail(error="reduce-only refused: x"))
++    dispatch = TradingRuntimeOrderDispatch(trader, dispatch_timeout=2.0)
++    with pytest.raises(DispatchRefused, match="reduce-only refused"):
++        dispatch.reduce_position(_position(), "SELL", 10.0, "mmr:og-x")
++
++
++def test_reduce_position_ib_rejection_is_broker_rejected_not_refused(running_loop):
+     from trader.trading.command_coordinator import BrokerRejectedError
+ 
+     loop, _ = running_loop
+-    trader = _ReduceTrader(loop, result=SuccessFail.fail(error="reduce-only refused: x"))
++    trader = _ReduceTrader(loop, result=SuccessFail.fail(error="Order rejected by IB (entry status=Inactive)"))
+     dispatch = TradingRuntimeOrderDispatch(trader, dispatch_timeout=2.0)
+-    with pytest.raises(BrokerRejectedError, match="reduce-only refused"):
++    with pytest.raises(BrokerRejectedError, match="rejected by IB") as raised:
+         dispatch.reduce_position(_position(), "SELL", 10.0, "mmr:og-x")
++    assert not isinstance(raised.value, DispatchRefused)
+ 
+ 
+ def test_reduce_position_ambiguous_send_is_not_broker_rejected(running_loop):
+diff --git a/tests/test_trader_service_loops.py b/tests/test_trader_service_loops.py
+index bcc45939..42988acf 100644
+--- a/tests/test_trader_service_loops.py
++++ b/tests/test_trader_service_loops.py
+@@ -268,10 +268,13 @@ def test_startup_liquidation_recovery_without_trader_loop_sends_nothing_late(tmp
+         assert time.monotonic() - started < 0.5
+ 
+         [child] = service.receipt_for("root-1").children
+-        assert (child.kind, child.state) == ("reduce", "UNKNOWN")
++        assert (child.kind, child.state) == ("reduce", "NOT_SENT")    # a proven refusal (R34)
+         trader._main_loop = loop
+         loop.run_until_complete(asyncio.sleep(0.05))
+-        assert trader.orders == []
++        loop.run_until_complete(loop.run_in_executor(worker, lambda: None))   # a tick in flight has ended
++        # The refused attempt never leaves late; the recovery loop may send a new attempt (R3).
++        sent = [c for c in service.receipt_for("root-1").children if c.state != "NOT_SENT"]
++        assert len(trader.orders) == len(sent) and all(c.attempt > 1 for c in sent)
+     finally:
+         _close_loop(loop)
+ 
+diff --git a/tests/test_trading_runtime.py b/tests/test_trading_runtime.py
+index 90f48751..83570bf7 100644
+--- a/tests/test_trading_runtime.py
++++ b/tests/test_trading_runtime.py
+@@ -974,6 +974,8 @@ def _reduce_trader(*, live_position=10.0, account='DU12345', paper=True, trade=N
+         account=account, contract=SimpleNamespace(conId=1), position=live_position, avgCost=1.0)]
+     trader.client = SimpleNamespace(ib=SimpleNamespace(
+         positions=lambda acct='': list(positions) if acct == account else [],
++        isConnected=lambda: True,
++        openTrades=lambda: [],
+         cancelOrder=lambda order: cancelled.append(order),
+         accountValues=lambda: [],
+         managedAccounts=lambda: [account],
 ```
 
 - [ ] **Step 2: Run them to verify they fail**
 
-Run: `.venv/bin/python -m pytest tests/test_reduce_only_order_path.py tests/test_production_rpc_security.py -q --timeout=30`
-Expected: 25 failed in the new file (`AttributeError: 'Trader' object has no attribute 'place_reduce_only_order'`; on the dispatch: no `reduce_partial`, `cancel_on_loop`). The RPC guard already passes: it pins that the new method stays off every RPC surface.
+Run: `.venv/bin/python -m pytest tests/test_reduce_only_order_path.py tests/test_order_dispatch_ports.py tests/test_trading_runtime.py tests/test_trader_service_loops.py -q --timeout=30`
+Expected: 16 failed, 107 passed — in the new file the connection, R35, dispatch and adapter tests (`AttributeError: ... 'reduce_partial'` / `'cancel_on_loop'`, `DispatchRefused` not raised); in master's files the three assertions that now expect `DispatchRefused`, the new IB-rejection test and the loop test that now expects `NOT_SENT`
 
-- [ ] **Step 3: Implement on `Trader`**
+- [ ] **Step 3: Implement**
 
-Add before `place_standalone_order`:
-
-```python
-    _ACK_STATUSES = frozenset({'PreSubmitted', 'Submitted', 'Filled'})
-    _DEAD_STATUSES = frozenset({'Inactive', 'Cancelled', 'ApiCancelled'})
-
-    def _reduce_only_refusal(self, contract: Contract, action: str, quantity: float, *,
-                             oca_group: Optional[str] = None) -> Optional[str]:
-        """Why a reduce-only order may not be sent, or None (R11, D13, D14).
-
-        It reads IB's live positions only (never the event-driven portfolio
-        cache: an empty live list is exactly the "position already gone"
-        case) and subtracts the reducing orders already working on the
-        contract, except the siblings of ``oca_group``.
-        """
-        if not self.ib_account:
-            return 'no ib_account is configured'
-        if not self.is_ib_connected():
-            return 'IB is not connected'
-        try:
-            positions = list(self.client.ib.positions(account=self.ib_account))
-            open_trades = list(self.client.ib.openTrades())
-        except Exception as ex:
-            return f'IB positions or open orders are unavailable: {ex}'
-        held = sum(
-            float(p.position) for p in positions
-            if int(p.contract.conId) == int(contract.conId)
-            and (not getattr(p, 'account', None) or p.account == self.ib_account)
-        )
-        if held == 0:
-            return f'no broker position on conid {contract.conId}'
-        reducing = 'SELL' if held > 0 else 'BUY'
-        if action != reducing:
-            return f'{action} does not reduce a position of {held:g}'
-        working = sum(
-            max(float(t.order.totalQuantity) - float(getattr(t.orderStatus, 'filled', 0.0) or 0.0), 0.0)
-            for t in open_trades
-            if int(getattr(t.contract, 'conId', 0) or 0) == int(contract.conId)
-            and t.order.action == reducing
-            and not (oca_group and getattr(t.order, 'ocaGroup', '') == oca_group)
-        )
-        allowed = abs(held) - working
-        if not 0 < float(quantity) <= allowed:
-            return (f'quantity {quantity:g} is not within (0, {allowed:g}]: position {held:g}, '
-                    f'{working:g} already working to reduce it')
-        return None
-
-    async def place_reduce_only_order(
-        self,
-        contract: Contract,
-        action: str,
-        quantity: float,
-        *,
-        order_ref: str,
-        ack_timeout: float = 10.0,
-    ) -> SuccessFail:
-        """The one reduce-only order path (R11): full and partial reduce-only MARKET orders.
-
-        It checks the account fence, the connection, that ``action`` reduces
-        IB's live position on this contract, and that ``quantity`` is at most
-        that position minus the reducing orders already working. It does not
-        run the entry gates (RiskGate daily loss, open orders, rate,
-        concentration, leverage): blocking an exit does not reduce risk.
-        There is no flag to skip checks.
-
-        A refusal before the IB call has the ``REDUCE_ONLY_REFUSED:`` prefix.
-        After ``placeOrder`` the result follows the status of *this* order id
-        (R13): the local PendingSubmit echo is not acceptance; Inactive or a
-        cancel is ``EXIT_ORDER_REJECTED:``; no status in time is an exception.
-        """
-        refusal = self._reduce_only_refusal(contract, action, quantity)
-        if refusal is not None:
-            return SuccessFail.fail(error=f'REDUCE_ONLY_REFUSED: {refusal}')
-        order = MarketOrder(action=action, totalQuantity=float(quantity), account=self.ib_account,
-                            orderRef=order_ref, tif='DAY', outsideRth=False, transmit=True)
-        try:
-            status, trade = await self._place_and_await_status(contract, order, ack_timeout)
-        except Exception as ex:
-            return SuccessFail.fail(exception=ex)
-        if status in self._DEAD_STATUSES:
-            return SuccessFail.fail(error=f'EXIT_ORDER_REJECTED: {status}')
-        return SuccessFail.success(obj=[trade])
-
-    async def _place_and_await_status(self, contract: Contract, order: Order,
-                                      timeout: float) -> Tuple[str, Trade]:
-        """Place one order and wait for a broker status of that exact order id.
-
-        The executioner stream is filtered by contract, not by order. The
-        first emission is our own ``placeOrder`` echo, which fixes the order
-        id; emissions for other orders on the contract are ignored.
-        """
-        done = asyncio.Event()
-        seen: Dict[str, object] = {'order_id': None, 'status': None, 'trade': None, 'error': None}
-
-        def on_next(trade: Trade):
-            order_id = getattr(trade.order, 'orderId', None)
-            if seen['order_id'] is None:
-                seen['order_id'] = order_id
-            if order_id != seen['order_id']:
-                return
-            status = getattr(trade.orderStatus, 'status', None)
-            if status in self._ACK_STATUSES or status in self._DEAD_STATUSES:
-                seen['status'], seen['trade'] = status, trade
-                done.set()
-
-        def on_error(ex):
-            seen['error'] = ex
-            done.set()
-
-        observable = await self.executioner.subscribe_place_order_direct(contract, order)
-        subscription = observable.subscribe(Observer(on_next=on_next, on_error=on_error,
-                                                     on_completed=lambda: None))
-        try:
-            await asyncio.wait_for(done.wait(), timeout)
-        except asyncio.TimeoutError:
-            raise TimeoutError(f'no broker status for order {seen["order_id"]} within {timeout}s')
-        finally:
-            subscription.dispose()
-        if seen['error'] is not None:
-            raise seen['error']
-        return cast(str, seen['status']), cast(Trade, seen['trade'])
+```diff
+diff --git a/trader/trading/command_stack.py b/trader/trading/command_stack.py
+index 12519653..27566665 100644
+--- a/trader/trading/command_stack.py
++++ b/trader/trading/command_stack.py
+@@ -212,11 +212,14 @@ class _LiquidationDispatch:
+         self._orders_view = orders_view
+ 
+     def cancel(self, order, child_id: str) -> None:
+-        self._dispatch.cancel(order.order_entity_id, encode_order_ref(child_id))
++        self._dispatch.cancel_on_loop(order.order_entity_id, encode_order_ref(child_id))
+ 
+     def reduce(self, position, side: str, quantity: float, child_id: str) -> None:
+         self._dispatch.reduce_position(position, side, quantity, encode_order_ref(child_id))
+ 
++    def reduce_partial(self, position, side: str, quantity: float, child_id: str) -> None:
++        self._dispatch.reduce_partial(position, side, quantity, encode_order_ref(child_id))
++
+     def find_orders(self, account_id: str, child_id: str) -> list:
+         return self._dispatch.find_by_order_ref(account_id, encode_order_ref(child_id))
+ 
+diff --git a/trader/trading/trading_runtime.py b/trader/trading/trading_runtime.py
+index c3d03cdb..1b2e1738 100644
+--- a/trader/trading/trading_runtime.py
++++ b/trader/trading/trading_runtime.py
+@@ -65,6 +65,10 @@ class AccountNotPinnedError(Exception):
+     """
+ 
+ 
++# Prefix of a reduce-only refusal: nothing was sent.
++REDUCE_ONLY_REFUSED = 'reduce-only refused'
++
++
+ class Trader():
+     def __init__(self,
+                  ib_server_address: str,
+@@ -1720,7 +1724,7 @@ class Trader():
+             refusal = f'pre-send check failed: {ex}'
+         if refusal:
+             logging.error('reduce-only order refused before send: %s', refusal)
+-            return SuccessFail.fail(error=f'reduce-only refused: {refusal}')
++            return SuccessFail.fail(error=f'{REDUCE_ONLY_REFUSED}: {refusal}')
+ 
+         order = MarketOrder(
+             action=side, totalQuantity=quantity, account=self.ib_account,
+@@ -1734,7 +1738,8 @@ class Trader():
+             return SuccessFail.fail(exception=ex)
+ 
+     def _reduce_only_refusal(
+-        self, contract: Contract, side: str, quantity: float, broker_quantity: float,
++        self, contract: Contract, side: str, quantity: float, broker_quantity: float, *,
++        oca_group: Optional[str] = None,
+     ) -> Optional[str]:
+         import math
+ 
+@@ -1744,6 +1749,8 @@ class Trader():
+         if self.paper_trading != account.startswith('D'):
+             mode = 'paper' if self.paper_trading else 'live'
+             return f'ib_account {account!r} does not match trading mode {mode}'
++        if not self.is_ib_connected():
++            return 'IB is not connected'
+         if int(contract.conId or 0) <= 0 or not contract.symbol:
+             return f'invalid contract (conId={contract.conId!r}, symbol={contract.symbol!r})'
+         try:
+@@ -1763,8 +1770,27 @@ class Trader():
+         if live == 0 or (live > 0) != (broker_quantity > 0) or abs(live) < quantity:
+             return (f'live position cache shows {live} for conId {contract.conId}; '
+                     f'cannot {side} {quantity} against broker position {broker_quantity}')
++        working = self._working_reduce_quantity(int(contract.conId), reducing_side, oca_group)
++        if quantity > abs(live) - working:
++            return (f'quantity {quantity:g} is above {abs(live) - working:g}: live position {live:g}, '
++                    f'{working:g} already working to reduce it')
+         return None
+ 
++    def _working_reduce_quantity(self, conid: int, reducing_side: str, oca_group: Optional[str]) -> float:
++        """Outstanding quantity of open orders that already reduce this position (R35).
++
++        A stop whose cancel has not landed still sells, so a second reduce of
++        the full position could reverse it. The sibling of ``oca_group`` does
++        not count: one OCA pair protects the same shares once.
++        """
++        return sum(
++            max(float(t.order.totalQuantity) - float(getattr(t.orderStatus, 'filled', 0.0) or 0.0), 0.0)
++            for t in self.client.ib.openTrades()
++            if int(getattr(t.contract, 'conId', 0) or 0) == conid
++            and t.order.action == reducing_side
++            and not (oca_group and getattr(t.order, 'ocaGroup', '') == oca_group)
++        )
++
+     def _live_position_quantity(self, conid: int) -> float:
+         """Signed quantity from ib_async's position cache (no IB request)."""
+         return sum(
+@@ -2471,7 +2497,7 @@ class TradingRuntimeOrderDispatch:
+         return CancelAck(order_entity_id=order_entity_id, cancelled=True)
+ 
+     def reduce_position(self, position, side: str, quantity: float, order_ref: str):
+-        """Submit an emergency reduce-only market order.
++        """Reduce-only MARKET order for the whole broker position (account flatten, full close).
+ 
+         This intentionally bypasses proposal semantics and the entry gates
+         (``Trader.place_reduce_only_order``), but not the trader's one
+@@ -2481,57 +2507,115 @@ class TradingRuntimeOrderDispatch:
+ 
+         Must be called off the trader loop (the liquidation worker or an RPC
+         thread). Errors:
+-        - ``ValueError`` / ``RuntimeError`` before scheduling: nothing sent.
+-        - ``BrokerRejectedError``: refused before send, or rejected by IB with
+-          nothing filled.
++        - ``DispatchRefused``: refused before send (size, side, account, no
++          running trader loop, a call on the loop, the trader's reduce-only
++          checks). Nothing was sent (R34).
++        - ``BrokerRejectedError``: rejected by IB with nothing filled.
+         - any other exception, including ``TimeoutError``: the order may have
+           been sent.
+         """
++        if side != self._reducing_side(position) or float(quantity) != abs(float(position.quantity)):
++            self._refuse('liquidation order must exactly reduce the broker position')
++        return self._reduce_only(position, side, quantity, order_ref)
++
++    def reduce_partial(self, position, side: str, quantity: float, order_ref: str):
++        """Reduce-only MARKET order for a whole-share part strictly inside the position."""
++        held = abs(float(position.quantity))
++        if side != self._reducing_side(position):
++            self._refuse('a partial reduce must be on the reducing side of a position')
++        if not float(quantity).is_integer() or not 0 < float(quantity) < held:
++            self._refuse('a partial reduce needs a whole quantity strictly between 0 and the position')
++        return self._reduce_only(position, side, quantity, order_ref)
++
++    def cancel_on_loop(self, order_entity_id: str, order_ref: str):
++        """``cancel`` for the liquidation worker (R34, ruling 7).
++
++        The perm id is read from the journal here, on the calling thread; the
++        open-trade match and ``cancelOrder`` run on the trader loop, so no
++        DuckDB read blocks the IB loop. No live order means nothing was sent:
++        a proven refusal before the boundary.
++        """
++        from trader.trading.command_coordinator import CancelAck
++        from trader.trading.command_ports import CancelUnresolved, resolve_cancel_target
++        from trader.trading.liquidation_service import DispatchRefused
++        perm_id = self._perm_id_for_order(order_entity_id)
++        loop = self._dispatch_loop('cancel')
++
++        async def _cancel():
++            order = resolve_cancel_target(perm_id, self._open_trades())
++            if order is None:
++                raise CancelUnresolved(
++                    f'no live order to cancel for {order_entity_id!r} (perm_id={perm_id})')
++            self._trader.client.ib.cancelOrder(order)
++            return CancelAck(order_entity_id=order_entity_id, cancelled=True)
++        try:
++            return self._wait_on_loop(
++                asyncio.run_coroutine_threadsafe(_cancel(), loop), 'cancel', sent='the cancel')
++        except CancelUnresolved as ex:
++            raise DispatchRefused('CANCEL_UNRESOLVED', str(ex)) from ex
++
++    @staticmethod
++    def _reducing_side(position) -> Optional[str]:
++        held = float(position.quantity)
++        return None if held == 0 else ('SELL' if held > 0 else 'BUY')
++
++    @staticmethod
++    def _refuse(detail: str):
++        from trader.trading.liquidation_service import DispatchRefused
++        raise DispatchRefused('REDUCE_ONLY_REFUSED', detail)
++
++    @staticmethod
++    def _contract_for(position) -> Contract:
++        return Contract(
++            conId=int(position.conid), symbol=position.symbol,
++            secType=getattr(position, 'sec_type', None) or 'STK',
++            exchange=getattr(position, 'exchange', None) or 'SMART',
++            currency=getattr(position, 'currency', None) or 'USD',
++        )
++
++    def _reduce_only(self, position, side: str, quantity: float, order_ref: str, **order):
++        """One reduce-only order on the trader loop; maps the result to the errors above."""
+         from trader.trading.command_coordinator import BrokerRejectedError
+ 
+-        broker_quantity = float(position.quantity)
+-        expected_side = 'SELL' if broker_quantity > 0 else 'BUY'
+-        if broker_quantity == 0 or side != expected_side or float(quantity) != abs(broker_quantity):
+-            raise ValueError('liquidation order must exactly reduce the broker position')
+         position_account = getattr(position, 'account_id', None)
+         if position_account and position_account != getattr(self._trader, 'ib_account', None):
+-            raise ValueError('liquidation position account does not match trader account')
++            self._refuse('liquidation position account does not match trader account')
+         loop = self._dispatch_loop('liquidation')
+-        contract = Contract(
+-            conId=int(position.conid), symbol=position.symbol,
+-            secType=position.sec_type or 'STK', exchange=position.exchange or 'SMART',
+-            currency=position.currency or 'USD',
+-        )
+         future = asyncio.run_coroutine_threadsafe(
+             self._trader.place_reduce_only_order(
+-                contract, side, abs(broker_quantity),
+-                broker_quantity=broker_quantity, order_ref=order_ref,
++                self._contract_for(position), side, float(quantity),
++                broker_quantity=float(position.quantity), order_ref=order_ref, **order,
+             ), loop,
+         )
+         result = self._wait_on_loop(future, 'liquidation dispatch')
+         if result.is_success():
+             return result.obj or []
+         if result.error is not None:
++            if str(result.error).startswith(REDUCE_ONLY_REFUSED):
++                self._refuse(str(result.error))
+             raise BrokerRejectedError(str(result.error))
+         if result.exception is not None:
+             raise result.exception
+         raise RuntimeError('liquidation dispatch failed with no detail; the order may have been sent')
+ 
+     def _dispatch_loop(self, purpose: str) -> asyncio.AbstractEventLoop:
+-        """The trader loop, or RuntimeError before anything is scheduled.
++        """The trader loop, or ``DispatchRefused`` before anything is scheduled.
+ 
+         A stopped loop would run the order late, after the caller gave up; a
+         call from the loop thread would block the loop it waits on.
+         """
++        from trader.trading.liquidation_service import DispatchRefused
+         loop = getattr(self._trader, '_main_loop', None)
+         if loop is None or not loop.is_running():
+-            raise RuntimeError(f'trader event loop is not running; {purpose} refused, nothing sent')
++            raise DispatchRefused(
++                'TRADER_LOOP_UNAVAILABLE', f'trader event loop is not running; {purpose} refused, nothing sent')
+         try:
+             running = asyncio.get_running_loop()
+         except RuntimeError:
+             running = None
+         if running is loop:
+-            raise RuntimeError(
++            raise DispatchRefused(
++                'ON_TRADER_LOOP',
+                 f'{purpose} called on the trader loop thread; refused to avoid a deadlock, nothing sent')
+         return loop
+ 
 ```
 
-(`Tuple`, `cast`, `Dict`, `MarketOrder`, `Observer` are already imported at the top of the file.)
+- [ ] **Step 4: Run the tests**
 
-- [ ] **Step 4: Implement on `TradingRuntimeOrderDispatch` and `_LiquidationDispatch`**
+Run: `.venv/bin/python -m pytest tests/test_reduce_only_order_path.py tests/test_order_dispatch_ports.py tests/test_trading_runtime.py tests/test_trader_service_loops.py tests/test_liquidation_service.py tests/test_production_rpc_security.py tests/test_cancel_command.py -q --timeout=30`
+Expected: all PASS (12 in the new file). Then the full suite: green.
 
-Replace `reduce_position` with:
-
-```python
-    def _run_on_trader_loop(self, coro):
-        """Run ``coro`` on the trader loop from a non-loop thread and wait for it.
-
-        A missing loop, or a call made on the loop itself (it would wait on
-        the loop it blocks), is refused before anything is sent (D13).
-        """
-        from trader.trading.liquidation_service import DispatchRefused
-        loop = getattr(self._trader, '_main_loop', None)
-        if loop is None or not loop.is_running():
-            coro.close()
-            raise DispatchRefused('TRADER_LOOP_UNAVAILABLE', 'trader event loop unavailable for order dispatch')
-        try:
-            running = asyncio.get_running_loop()
-        except RuntimeError:
-            running = None
-        if running is loop:
-            coro.close()
-            raise DispatchRefused('ON_TRADER_LOOP', 'a blocking dispatch on the trader loop would deadlock')
-        return asyncio.run_coroutine_threadsafe(coro, loop).result(timeout=self._dispatch_timeout)
-
-    @staticmethod
-    def _contract_for(position) -> Contract:
-        return Contract(
-            conId=int(position.conid), symbol=position.symbol,
-            secType=getattr(position, 'sec_type', None) or 'STK',
-            exchange=getattr(position, 'exchange', None) or 'SMART',
-            currency=getattr(position, 'currency', None) or 'USD',
-        )
-
-    @staticmethod
-    def _refuse(detail: str):
-        from trader.trading.liquidation_service import DispatchRefused
-        raise DispatchRefused('REDUCE_ONLY_REFUSED', detail)
-
-    def _reducing_side(self, position) -> str:
-        broker_quantity = float(position.quantity)
-        if broker_quantity == 0:
-            self._refuse('no position to reduce')
-        return 'SELL' if broker_quantity > 0 else 'BUY'
-
-    def _reduce_only(self, position, side: str, quantity: float, order_ref: str, **order):
-        result = self._run_on_trader_loop(self._trader.place_reduce_only_order(
-            self._contract_for(position), side, float(quantity), order_ref=order_ref, **order))
-        if result.is_success():
-            return result.obj or []
-        error = str(result.error or '')
-        if error.startswith('REDUCE_ONLY_REFUSED'):
-            self._refuse(error)
-        if result.exception is not None:
-            raise result.exception
-        raise RuntimeError(error or 'reduce-only dispatch failed')
-
-    def reduce_position(self, position, side: str, quantity: float, order_ref: str):
-        """Reduce-only MARKET order for the whole broker position (account flatten, full close)."""
-        if side != self._reducing_side(position) or float(quantity) != abs(float(position.quantity)):
-            self._refuse('a full reduce must exactly match the broker position')
-        return self._reduce_only(position, side, quantity, order_ref)
-
-    def reduce_partial(self, position, side: str, quantity: float, order_ref: str):
-        """Reduce-only MARKET order for a strict whole-share part of the position."""
-        held = abs(float(position.quantity))
-        if side != self._reducing_side(position):
-            self._refuse('a partial reduce must be on the reducing side')
-        if not float(quantity).is_integer() or not 0 < float(quantity) < held:
-            self._refuse('a partial reduce needs a whole quantity strictly between 0 and the position')
-        return self._reduce_only(position, side, quantity, order_ref)
-
-    def cancel_on_loop(self, order_entity_id: str, order_ref: str):
-        """``cancel`` for the liquidation worker.
-
-        The perm id is read from the journal here, on the calling thread; only
-        the open-trade match and ``cancelOrder`` run on the trader loop, so no
-        DuckDB read blocks the IB loop. No live order means nothing was sent:
-        a proven refusal before the boundary (ruling 7).
-        """
-        from trader.trading.command_coordinator import CancelAck
-        from trader.trading.command_ports import CancelUnresolved, resolve_cancel_target
-        from trader.trading.liquidation_service import DispatchRefused
-        perm_id = self._perm_id_for_order(order_entity_id)
-
-        async def _cancel():
-            order = resolve_cancel_target(perm_id, self._open_trades())
-            if order is None:
-                raise CancelUnresolved(f'no live order to cancel for {order_entity_id!r} (perm_id={perm_id})')
-            self._trader.client.ib.cancelOrder(order)
-            return CancelAck(order_entity_id=order_entity_id, cancelled=True)
-        try:
-            return self._run_on_trader_loop(_cancel())
-        except CancelUnresolved as ex:
-            raise DispatchRefused('CANCEL_UNRESOLVED', str(ex)) from ex
-```
-
-In `trader/trading/command_stack.py`, in `_LiquidationDispatch` change `cancel` and add `reduce_partial`:
-
-```python
-    def cancel(self, order, child_id: str) -> None:
-        self._dispatch.cancel_on_loop(order.order_entity_id, encode_order_ref(child_id))
-
-    def reduce(self, position, side: str, quantity: float, child_id: str) -> None:
-        self._dispatch.reduce_position(position, side, quantity, encode_order_ref(child_id))
-
-    def reduce_partial(self, position, side: str, quantity: float, child_id: str) -> None:
-        self._dispatch.reduce_partial(position, side, quantity, encode_order_ref(child_id))
-```
-
-- [ ] **Step 5: Run the tests**
-
-Run: `.venv/bin/python -m pytest tests/test_reduce_only_order_path.py tests/test_order_dispatch_ports.py tests/test_trading_runtime.py tests/test_liquidation_service.py tests/test_production_rpc_security.py tests/test_cancel_command.py -q --timeout=30`
-Expected: all PASS (25 in the new file). Then the full suite: green.
-
-- [ ] **Step 6: Commit**
+- [ ] **Step 5: Commit**
 
 ```bash
-git add trader/trading/trading_runtime.py trader/trading/command_stack.py tests/test_reduce_only_order_path.py tests/test_production_rpc_security.py
-git commit -m "fix: exits use a reduce-only path that skips entry gates
+git add trader/trading/trading_runtime.py trader/trading/command_stack.py tests/test_reduce_only_order_path.py tests/test_order_dispatch_ports.py tests/test_trading_runtime.py tests/test_trader_service_loops.py
+git commit -m "fix: reduce-only exits refuse before the boundary as dispatch refused
 
 Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>"
 ```
@@ -3989,45 +4466,44 @@ Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>"
 ---
 
 
-### Task 15: One serialized liquidation worker (R12)
+### Task 15: Share master's liquidation worker with every producer (R12)
 
-> If the separate PR on `fix/liquidation-reduce-only-and-loop` merges first, rebase this task onto it and keep only what that PR does not already do.
+PR #42 already runs every `LiquidationService` / `SessionController` call that `trader_service` makes on one worker thread (`_new_liquidation_worker`, `_on_worker`): the startup rescan and the session `recover` run there inside `run_until_complete` (so their orders find a running trader loop before `trader.run()`), the periodic ticks run there through `_watched_ticks` (a stuck tick is logged CRITICAL and never stacked; `_BusyStreak` reports a lock held elsewhere), and shutdown during startup is handled (`stopping()`, `_finish_startup_shutdown`). `tests/test_trader_service_loops.py` pins it on a real loop. That code is kept as it is (ruling 36).
 
-Today `_liquidation_recovery_loop` (`trader/trader_service.py:175`) and `_session_controller_loop` (`:208`) call `rescan()` / `run_due()` directly on the IB event loop. Those calls send orders with `run_coroutine_threadsafe(..., _main_loop).result()` — they wait on the loop they are blocking. The protective-failure producer calls `start` from the broker ingest thread while it holds the ingest apply lock (ruling 8). This task puts every `LiquidationService` entry point on one dedicated worker thread behind a facade, and makes each producer use it correctly: coroutines await it, RPC threads block on it, the ingest thread queues without waiting. Between the Task 14 and Task 15 commits the session loop still runs on the IB loop; a liquidation cancel from it is then refused with `DispatchRefused("ON_TRADER_LOOP")` (Task 14), never a deadlock.
+What is still missing is that the *other* producers use the same thread: typed RPC threads (`/flatten` → `liquidate`), the session controller's own calls (they already run on the worker), and the broker ingest thread (protective failure → `start`) which holds the ingest apply lock and so must not wait (ruling 8). This task:
 
-Two more rules (review round 2):
-- The worker's tick starts a flatten for every unhandled protective failure; an error for one saga is logged and the others and the rescan still run (R29).
-- `_maybe_start_session_recovery` needs the worker. If the trader has a session controller but no liquidation service, it logs an error that the session deadlines are not running and starts nothing, instead of failing on every tick.
+- adds `trader/trading/liquidation_worker.py`: `LiquidationWorker` (a single-thread `ThreadPoolExecutor`, so `run_in_executor` takes it; `call` runs inline on the worker, blocks on a plain thread, and refuses on an event loop) and `SerializedLiquidation` (the facade the stack, the trader and the producers hold). Its `rescan` first starts a flatten for every unhandled protective failure (R29; one failing saga does not stop the others), so master's recovery tick, which calls `service.rescan` on the worker, picks them up unchanged;
+- builds the worker and the facade in `build_command_stack`, gives the saga `nonblocking()`, and exposes `trader.liquidation_worker`;
+- makes `trader_service.main` use that worker after `trader.connect()` built the stack (`_shared_liquidation_worker`), so there is one liquidation thread, and makes `_new_liquidation_worker` return a `LiquidationWorker`.
+
+`SessionController.restore` is not added: master's startup already runs `recover` on the worker while the loop runs.
 
 **Files:**
 - Create: `trader/trading/liquidation_worker.py`
-- Modify: `trader/trader_service.py` (`_liquidation_recovery_loop`, `_maybe_start_liquidation_recovery`, `_session_controller_loop`, `_maybe_start_session_recovery`)
-- Modify: `trader/automation/session_controller.py` (`recover` → `restore` + `run_due`)
-- Modify: `trader/trading/command_stack.py` (wrap the service; `CommandStack.liquidation_worker`)
+- Modify: `trader/trader_service.py` (`_new_liquidation_worker`, new `_shared_liquidation_worker`, `main` after `trader.connect()`)
+- Modify: `trader/trading/command_stack.py` (wrap the service; `CommandStack.liquidation_worker`; the saga's `liquidation=`)
 - Test: `tests/test_liquidation_worker.py` (create)
 
 **Interfaces:**
 
 ```python
-class LiquidationWorker:
+class LiquidationWorker(ThreadPoolExecutor):       # max_workers=1
     def __init__(self, name: str = "liquidation-worker")
     def in_worker(self) -> bool
-    def submit(self, fn, *args, **kwargs) -> concurrent.futures.Future
     def call(self, fn, *args, **kwargs)            # waits; inline on the worker; RuntimeError on a running loop
     async def run_async(self, fn, *args, **kwargs)
-    def shutdown(self) -> None
 
 class SerializedLiquidation:                       # what the stack, trader and producers hold
     def __init__(self, service, worker, *, account_id, now, deadline_seconds=300.0)
     worker: LiquidationWorker                      # property
     attach_protection(saga) -> None                # protection port + source of unhandled failures (Task 13)
-    start(...) / rescan() / upgrade_to_zero(root_id) / liquidate(cmd)      # on the worker, waiting
+    start(...) / upgrade_to_zero(root_id) / liquidate(cmd)     # on the worker, waiting
+    rescan() (alias tick()) / async tick_async()   # flatten unhandled SAFETY_FAILED sagas, then rescan
     start_nowait(account_id, cause_command_id, deadline) -> Future
     nonblocking() -> object with start(account_id, cause_command_id, deadline) -> None   # for the saga
-    tick() / async tick_async()                    # flatten unhandled SAFETY_FAILED sagas, then rescan
-    async run_async(fn, *args, **kwargs)           # run another component (session controller) on the worker
+    async run_async(fn, *args, **kwargs)           # run another component on the worker
     receipt_for(root_id) / root_for(command_id) / close_resolution(command_id)          # reads, any thread
-SessionController.restore(now) -> SessionControllerState   # load or open the session; sends nothing
+trader_service._shared_liquidation_worker(trader, fallback) -> LiquidationWorker
 ```
 
 - [ ] **Step 1: Write the failing tests**
@@ -4114,6 +4590,7 @@ def _real_dispatch_trader(loop, held):
     import reactivex as rx
     trader = object.__new__(Trader)
     trader.ib_account = ACCOUNT
+    trader.paper_trading = True
     trader._main_loop = loop
     trader.client = SimpleNamespace(ib=SimpleNamespace(
         positions=lambda account=None: [
@@ -4220,7 +4697,8 @@ def test_tick_starts_a_flatten_for_an_unhandled_safety_failed_saga_once(tmp_path
     assert liquidation.receipt_for("entry-1").scope == "account"
 
 
-def test_trader_service_recovery_loop_ticks_through_the_worker(loop_thread):
+def test_trader_service_recovery_loop_ticks_on_the_shared_worker_inline(loop_thread):
+    """PR #42's recovery loop runs ``rescan`` on its worker; with the shared worker the facade runs inline."""
     from trader import trader_service
 
     ticks = []
@@ -4230,11 +4708,22 @@ def test_trader_service_recovery_loop_ticks_through_the_worker(loop_thread):
     liquidation = SerializedLiquidation(service, worker, account_id=ACCOUNT, now=lambda: NOW)
 
     async def one_tick():
-        task = asyncio.ensure_future(trader_service._liquidation_recovery_loop(liquidation, interval=0.01))
+        task = asyncio.ensure_future(trader_service._liquidation_recovery_loop(liquidation, worker, interval=0.01))
         await asyncio.sleep(0.05)
         task.cancel()
     loop_thread.run(one_tick())
     assert ticks and all(t == ticks[0] for t in ticks) and ticks[0] != loop_thread.thread.ident
+    assert worker.submit(threading.get_ident).result(timeout=5) == ticks[0]
+
+
+def test_trader_service_uses_the_worker_the_command_stack_built():
+    from trader import trader_service
+
+    built, fallback = LiquidationWorker(), LiquidationWorker()
+    assert trader_service._shared_liquidation_worker(SimpleNamespace(liquidation_worker=built), fallback) is built
+    assert fallback._shutdown
+    other = LiquidationWorker()
+    assert trader_service._shared_liquidation_worker(SimpleNamespace(), other) is other
 
 
 def test_tick_keeps_going_when_one_protective_failure_cannot_start(tmp_path):
@@ -4251,36 +4740,6 @@ def test_tick_keeps_going_when_one_protective_failure_cannot_start(tmp_path):
     liquidation.attach_protection(SimpleNamespace(unhandled_failures=lambda account: ["broken", "entry-2"]))
     liquidation.tick()
     assert (starts, rescans) == (["entry-2"], [1])
-
-
-def test_trader_service_session_loop_runs_each_tick_on_the_worker(loop_thread):
-    """R12 / #26: the session deadlines run on the liquidation worker, never on the IB loop."""
-    from trader import trader_service
-
-    ticks = []
-    controller = SimpleNamespace(run_due=lambda now: ticks.append(threading.get_ident()) or SimpleNamespace(
-        state="FLAT", session_date=None, entry_cutoff_reached=True))
-    liquidation = SerializedLiquidation(SimpleNamespace(attach_protection=lambda p: None), LiquidationWorker(),
-                                        account_id=ACCOUNT, now=lambda: NOW)
-
-    async def one_tick():
-        task = asyncio.ensure_future(trader_service._session_controller_loop(controller, liquidation, interval=0.01))
-        await asyncio.sleep(0.05)
-        task.cancel()
-    loop_thread.run(one_tick())
-    assert ticks and all(t == ticks[0] for t in ticks) and ticks[0] != loop_thread.thread.ident
-
-
-def test_session_recovery_without_a_liquidation_service_says_so_and_starts_nothing(caplog):
-    from trader import trader_service
-
-    tasks = []
-    controller = SimpleNamespace(restore=lambda now: pytest.fail("must not restore without the worker"))
-    trader = SimpleNamespace(session_controller=controller, liquidation_service=None)
-    with caplog.at_level("ERROR"):
-        trader_service._maybe_start_session_recovery(trader, SimpleNamespace(create_task=tasks.append))
-    assert tasks == []
-    assert any("NOT running" in r.getMessage() for r in caplog.records)
 ```
 
 - [ ] **Step 2: Run them to verify they fail**
@@ -4296,10 +4755,15 @@ Expected: FAIL — `ModuleNotFoundError: No module named 'trader.trading.liquida
 
 The service sends orders with ``run_coroutine_threadsafe(...).result()`` onto
 the trader loop. That wait is safe only off the loop, so nothing may run the
-service on the loop. Every producer goes through ``SerializedLiquidation``:
+service on the loop. ``trader_service`` already runs its recovery and session
+ticks on a single worker thread (PR #42); this module makes that worker the
+one every producer shares, through ``SerializedLiquidation``:
 
+- trader_service's ticks run on the worker (``run_in_executor``); a call
+  made there runs inline;
 - a thread with no running loop (RPC handler) calls ``start`` and blocks;
-- a coroutine on the trader loop awaits ``tick_async`` / ``run_async``;
+- a coroutine on an event loop awaits ``run_async``; a blocking call there
+  is refused;
 - the broker ingest thread uses ``start_nowait``: it holds the ingest apply
   lock, and the worker's broker snapshot needs that lock, so it must not wait.
 """
@@ -4313,20 +4777,18 @@ from concurrent.futures import Future, ThreadPoolExecutor
 from typing import Any, Callable, Optional
 
 
-class LiquidationWorker:
+class LiquidationWorker(ThreadPoolExecutor):
+    """The single liquidation thread. An executor, so ``loop.run_in_executor`` can use it."""
+
     def __init__(self, name: str = "liquidation-worker"):
         self._thread_id: Optional[int] = None
-        self._executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix=name,
-                                            initializer=self._remember_thread)
+        super().__init__(max_workers=1, thread_name_prefix=name, initializer=self._remember_thread)
 
     def _remember_thread(self) -> None:
         self._thread_id = threading.get_ident()
 
     def in_worker(self) -> bool:
         return threading.get_ident() == self._thread_id
-
-    def submit(self, fn: Callable[..., Any], *args, **kwargs) -> Future:
-        return self._executor.submit(fn, *args, **kwargs)
 
     def call(self, fn: Callable[..., Any], *args, **kwargs) -> Any:
         """Run on the worker and wait. Inline when already on the worker."""
@@ -4340,9 +4802,6 @@ class LiquidationWorker:
 
     async def run_async(self, fn: Callable[..., Any], *args, **kwargs) -> Any:
         return await asyncio.wrap_future(self.submit(fn, *args, **kwargs))
-
-    def shutdown(self) -> None:
-        self._executor.shutdown(wait=True)
 
 
 class SerializedLiquidation:
@@ -4372,7 +4831,17 @@ class SerializedLiquidation:
         return self._worker.call(self._service.start, *args, **kwargs)
 
     def rescan(self):
-        return self._worker.call(self._service.rescan)
+        """Start a flatten for every unhandled protective failure, then rescan every root.
+
+        trader_service's recovery tick calls this on the worker, so the
+        failures are picked up on every tick.
+        """
+        return self._worker.call(self._tick)
+
+    tick = rescan
+
+    async def tick_async(self):
+        return await self._worker.run_async(self._tick)
 
     def upgrade_to_zero(self, root_id: str):
         return self._worker.call(self._service.upgrade_to_zero, root_id)
@@ -4387,13 +4856,6 @@ class SerializedLiquidation:
 
     def nonblocking(self) -> "_NonBlockingStart":
         return _NonBlockingStart(self)
-
-    def tick(self):
-        """Start a flatten for every unhandled protective failure, then rescan every root."""
-        return self._worker.call(self._tick)
-
-    async def tick_async(self):
-        return await self._worker.run_async(self._tick)
 
     async def run_async(self, fn: Callable[..., Any], *args, **kwargs):
         """Run another component (the session controller) on the same worker."""
@@ -4443,191 +4905,140 @@ def _log_failure(future: Future) -> None:
         logging.getLogger(__name__).error("queued liquidation start failed: %s", exc)
 ```
 
-(`tick` uses `unhandled_failures`, which the saga gets in Task 9; until Task 13 attaches the saga, `_saga` is `None` and the tick only rescans.)
+(`rescan` uses `unhandled_failures`, which the saga gets in Task 9; until Task 13 attaches the saga, `_saga` is `None` and the tick only rescans.)
 
-- [ ] **Step 4: Route the loops through the worker**
+- [ ] **Step 4: Share it**
 
-`trader/trader_service.py`:
-
-```python
-async def _liquidation_recovery_loop(service, *, interval: float = 5.0) -> None:
-    """Keep unresolved verified-liquidation roots moving after restart.
-
-    Every transition still requires a newly promoted broker snapshot; a loop
-    tick can never manufacture a flat result.  Errors are contained so an IB
-    outage preserves the durable run for the next tick rather than killing the
-    trader process.
-    """
-    while True:
-        try:
-            # R12: the tick runs on the liquidation worker; this coroutine only awaits it,
-            # so the orders the worker sends onto this loop can run.
-            receipt = await service.tick_async()
-            if receipt is not None and receipt.state != 'FLAT':
-                logging.warning('liquidation %s remains %s: %s', receipt.cause_command_id,
-                                receipt.state, receipt.detail)
-        except Exception as ex:
-            logging.error('liquidation recovery tick failed: {}'.format(ex))
-        await asyncio.sleep(interval)
-
-
-def _maybe_start_liquidation_recovery(trader: Trader, loop: AbstractEventLoop) -> None:
-    """Rescan durable liquidation roots before normal service operation."""
-    service = getattr(trader, 'liquidation_service', None)
-    if service is None:
-        return
-    try:
-        # The first tick (cleanups, then every open root) runs as soon as the loop runs:
-        # its orders need the running loop, so it cannot run before trader.run().
-        loop.create_task(_liquidation_recovery_loop(service))
-    except Exception as ex:
-        logging.error('failed to start liquidation recovery: {}'.format(ex))
-
-
-async def _session_controller_loop(controller, liquidation, *, interval: float = 5.0) -> None:
-    """Tick absolute session deadlines until flat or incident (on the liquidation worker, R12)."""
-    while True:
-        try:
-            now = dt.datetime.now(dt.timezone.utc)
-            state = await liquidation.run_async(controller.run_due, now)
-            if state.state not in ('FLAT', 'INCIDENT', 'CLOSED'):
-                logging.debug(
-                    'session controller %s state=%s cutoff=%s',
-                    state.session_date, state.state, state.entry_cutoff_reached,
-                )
-        except Exception as ex:
-            logging.error('session controller tick failed: {}'.format(ex))
-        await asyncio.sleep(interval)
-
-
-def _maybe_start_session_recovery(trader: Trader, loop: AbstractEventLoop) -> None:
-    """P3 Task 6: resume session deadlines BEFORE semantic readiness / run().
-
-    Session recovery must precede readiness so a restart mid-flatten cannot
-    open a window where automation is 'ready' but deadlines are unenforced.
-    """
-    controller = getattr(trader, 'session_controller', None)
-    if controller is None:
-        return
-    liquidation = getattr(trader, 'liquidation_service', None)
-    if liquidation is None:
-        # The session ticks run on the liquidation worker (R12); without it the
-        # deadlines cannot run safely. Say so loudly instead of failing every tick.
-        logging.error('session controller has no liquidation service; session deadlines are NOT running')
-        return
-    try:
-        now = dt.datetime.now(dt.timezone.utc)
-        # Load durable deadlines now (no orders); the first run_due runs on the worker.
-        state = controller.restore(now)
-        if state.state not in ('FLAT', 'CLOSED'):
-            logging.warning(
-                'resumed session %s in state %s (incident=%s)',
-                state.session_date, state.state, state.incident,
-            )
-        loop.create_task(_session_controller_loop(controller, liquidation))
-    except Exception as ex:
-        logging.error('failed to start session recovery: {}'.format(ex))
+```diff
+diff --git a/trader/trader_service.py b/trader/trader_service.py
+index ef093fbe..2a599cd7 100644
+--- a/trader/trader_service.py
++++ b/trader/trader_service.py
+@@ -5,6 +5,7 @@ from trader.common.logging_helper import LogLevels, set_all_log_level, setup_log
+ from trader.container import Container, default_config_path
+ from trader.data.schema_migrations import SchemaMigrator
+ from trader.trading.liquidation_service import LiquidationBusy
++from trader.trading.liquidation_worker import LiquidationWorker
+ from trader.trading.trading_control import TradingControlStore, apply_trading_control_migration
+ from trader.trading.trading_runtime import Trader
+ 
+@@ -191,8 +192,19 @@ def _new_liquidation_worker() -> concurrent.futures.ThreadPoolExecutor:
+     order wait times out, so process exit can be delayed by at most about the
+     dispatch timeout (30s).
+     """
+-    return concurrent.futures.ThreadPoolExecutor(
+-        max_workers=1, thread_name_prefix='liquidation-worker')
++    return LiquidationWorker()
++
++
++def _shared_liquidation_worker(trader, fallback):
++    """The worker the command stack built (R12), so RPC, ingest and these ticks share one thread.
++
++    ``fallback`` is shut down when the stack has its own worker.
++    """
++    built = getattr(trader, 'liquidation_worker', None)
++    if built is None:
++        return fallback
++    fallback.shutdown(wait=False)
++    return built
+ 
+ 
+ async def _on_worker(worker, fn, *args):
+@@ -491,6 +503,8 @@ def main(simulation: bool,
+         loop.add_signal_handler(signal.SIGTERM, handle_sigint)
+ 
+         trader.connect()
++        # R12: connect() built the command stack and its liquidation worker.
++        liquidation_worker = _shared_liquidation_worker(trader, liquidation_worker)
+ 
+         # [M1-F3] Task 4: the durable per-account pause gate must be seeded
+         # before this service is considered ready -- an exposure-increasing
+diff --git a/trader/trading/command_stack.py b/trader/trading/command_stack.py
+index 27566665..5c988280 100644
+--- a/trader/trading/command_stack.py
++++ b/trader/trading/command_stack.py
+@@ -47,6 +47,7 @@ from trader.trading.circuit_breaker import CircuitBreaker
+ from trader.trading.circuit_breaker import BreakerSignal
+ from trader.trading.exit_owner import ExitOwnerRegistry
+ from trader.trading.liquidation_service import LiquidationService, LiquidationRunStore, apply_liquidation_migration
++from trader.trading.liquidation_worker import LiquidationWorker, SerializedLiquidation
+ from trader.trading.order_correlation import encode_order_ref
+ from trader.trading.semantic_readiness import (
+     SemanticReadiness,
+@@ -418,8 +419,9 @@ class CommandStack:
+     reconciliation_complete: Callable[[str], bool]
+     circuit_breaker: CircuitBreaker
+     semantic_readiness: SemanticReadiness
+-    liquidation_service: LiquidationService
++    liquidation_service: Any  # SerializedLiquidation: every entry point on one worker (R12)
+     session_risk: Any = None  # SessionRiskController when automation stack is active
++    liquidation_worker: Any = None  # LiquidationWorker behind liquidation_service (R12)
+     protective_order_saga: Any = None  # ProtectiveOrderSaga (P3 Task 5)
+     session_controller: Any = None  # SessionController (P3 Task 6)
+     attribution_ledger: Any = None  # AttributionLedger (P3 Task 7)
+@@ -824,12 +826,16 @@ def build_command_stack(
+             now=now(),
+         ),
+     )
+-    liquidation_service = LiquidationService(
+-        broker_snapshot, _LiquidationDispatch(dispatch, orders_view),
+-        store=liquidation_store, registry=exit_owner_registry, now=now,
+-        breaker=_LiquidationBreaker(circuit_breaker, now),
+-        journal=journal, ledger=ledger,
+-        schedule_reconcile=lambda command_id: reconciler.schedule(command_id, now()),
++    liquidation_worker = LiquidationWorker()
++    liquidation_service = SerializedLiquidation(
++        LiquidationService(
++            broker_snapshot, _LiquidationDispatch(dispatch, orders_view),
++            store=liquidation_store, registry=exit_owner_registry, now=now,
++            breaker=_LiquidationBreaker(circuit_breaker, now),
++            journal=journal, ledger=ledger,
++            schedule_reconcile=lambda command_id: reconciler.schedule(command_id, now()),
++        ),
++        liquidation_worker, account_id=trader.ib_account, now=now,
+     )
+     proposal_service = ProposalCommandService(
+         repository=repository,
+@@ -897,7 +903,8 @@ def build_command_stack(
+         dispatch_guard=dispatch_guard,
+         session_risk=session_risk,
+         breaker=circuit_breaker,
+-        liquidation=liquidation_service,
++        # The ingest thread reports protection failures; it must queue the flatten, not wait (R12).
++        liquidation=liquidation_service.nonblocking(),
+         account_id=trader.ib_account,
+         account_mode=account_mode,
+         now=now,
+@@ -1040,6 +1047,7 @@ def build_command_stack(
+         circuit_breaker=circuit_breaker,
+         semantic_readiness=semantic_readiness,
+         liquidation_service=liquidation_service,
++        liquidation_worker=liquidation_worker,
+         session_risk=session_risk,
+         protective_order_saga=protective_order_saga,
+         session_controller=session_controller,
+@@ -1108,6 +1116,7 @@ def build_command_stack(
+     trader.automation_circuit_breaker = circuit_breaker
+     trader.semantic_readiness = semantic_readiness
+     trader.liquidation_service = liquidation_service
++    trader.liquidation_worker = liquidation_worker
+     trader.session_risk = session_risk
+     trader.protective_order_saga = protective_order_saga
+     trader.session_controller = session_controller
 ```
-
-`trader/automation/session_controller.py`: replace the head of `recover` and its last line so the loading part becomes `restore`:
-
-```python
-    def recover(self, now: dt.datetime) -> SessionControllerState:
-        """Load durable state (or open today's session) and catch up deadlines."""
-        self.restore(now)
-        return self.run_due(_as_utc(now))
-
-    def restore(self, now: dt.datetime) -> SessionControllerState:
-        """Load durable state (or open today's session) without sending anything."""
-        now_utc = _as_utc(now)
-        schedule = self._calendar.resolve(now_utc)
-        if schedule is None:
-            session_date = now_utc.astimezone(ET).date()
-            existing = self._store.load(self._account_id, session_date)
-            if existing is not None:
-                self._state = existing
-                return existing
-            state = self._closed_state(session_date)
-            self._persist(state, now_utc)
-            return state
-
-        existing = self._store.load(self._account_id, schedule.session_date)
-        if existing is not None and existing.state == "INCIDENT":
-            # Never self-reset an incident across recover.
-            self._state = existing
-            return existing
-
-        if existing is None:
-            state = self._from_schedule(schedule, state="OPEN")
-        else:
-            # Rebind schedule fields from current calendar; preserve sticky flags.
-            state = SessionControllerState(
-                account_id=self._account_id,
-                session_date=schedule.session_date,
-                calendar_name=schedule.calendar_name,
-                calendar_version=schedule.calendar_version,
-                state=existing.state if existing.state != "CLOSED" else "OPEN",
-                open_utc=schedule.open_utc,
-                close_utc=schedule.close_utc,
-                entry_cutoff_utc=schedule.entry_cutoff_utc,
-                cancel_entries_utc=schedule.cancel_entries_utc,
-                flatten_start_utc=schedule.flatten_start_utc,
-                flat_deadline_utc=schedule.flat_deadline_utc,
-                entry_cutoff_reached=existing.entry_cutoff_reached,
-                flatten_command_id=existing.flatten_command_id,
-                flat_generation=existing.flat_generation,
-                incident=existing.incident,
-                cancel_issued=existing.cancel_issued,
-                flatten_issued=existing.flatten_issued,
-                time_exits=existing.time_exits,
-            )
-        self._state = state
-        self._persist(state, now_utc)
-        return state
-```
-
-(`restore` is the old body of `recover`, unchanged except that it ends with `return state` instead of `return self.run_due(now_utc)`.)
-
-`trader/trading/command_stack.py`:
-
-1. Import `from trader.trading.liquidation_worker import LiquidationWorker, SerializedLiquidation`.
-2. Wrap the service built in Task 4:
-
-```python
-    liquidation_worker = LiquidationWorker()
-    liquidation_service = SerializedLiquidation(
-        LiquidationService(
-            broker_snapshot, _LiquidationDispatch(dispatch, orders_view),
-            store=liquidation_store, registry=exit_owner_registry, now=now,
-            breaker=_LiquidationBreaker(circuit_breaker, now),
-            journal=journal, ledger=ledger,
-            schedule_reconcile=lambda command_id: reconciler.schedule(command_id, now()),
-        ),
-        liquidation_worker, account_id=trader.ib_account, now=now,
-    )
-```
-
-3. In `ProtectiveOrderSaga(` change `liquidation=liquidation_service,` to:
-
-```python
-        # The ingest thread reports protection failures; it must queue the flatten, not wait (R12).
-        liquidation=liquidation_service.nonblocking(),
-```
-
-4. `CommandStack`: change the field to `liquidation_service: Any  # SerializedLiquidation: every entry point on one worker (R12)` and add `liquidation_worker: Any = None`; pass `liquidation_worker=liquidation_worker` in `CommandStack(...)`; add `trader.liquidation_worker = liquidation_worker` next to `trader.liquidation_service = liquidation_service`.
 
 The session controller keeps `liquidation=liquidation_service` (the facade): its `run_due` runs on the worker, where the facade calls the service inline.
 
 - [ ] **Step 5: Run the tests**
 
-Run: `.venv/bin/python -m pytest tests/test_liquidation_worker.py tests/automation/test_session_controller.py tests/test_command_stack.py tests/test_liquidation_service.py -q --timeout=60`
-Expected: all PASS (9 in the new file; `test_trader_service_starts_session_recovery_before_readiness` still passes). Then the full suite: green.
+Run: `.venv/bin/python -m pytest tests/test_liquidation_worker.py tests/test_trader_service_loops.py tests/automation/test_session_controller.py tests/test_command_stack.py tests/test_liquidation_service.py -q --timeout=60`
+Expected: all PASS (8 in the new file; `test_trader_service_starts_session_recovery_before_readiness` still passes). Then the full suite: green.
 
 - [ ] **Step 6: Commit**
 
 ```bash
-git add trader/trading/liquidation_worker.py trader/trader_service.py trader/automation/session_controller.py trader/trading/command_stack.py tests/test_liquidation_worker.py
-git commit -m "fix: run every liquidation entry point on one worker, off the ib loop
+git add trader/trading/liquidation_worker.py trader/trader_service.py trader/trading/command_stack.py tests/test_liquidation_worker.py
+git commit -m "fix: share one liquidation worker between rpc, ingest and the service loops
 
 Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>"
 ```
@@ -4819,7 +5230,7 @@ def test_start_refuses_rebinding_root_to_another_scope(tmp_path):
 - [ ] **Step 2: Run them to verify they fail**
 
 Run: `.venv/bin/python -m pytest tests/test_liquidation_service.py -q --timeout=30`
-Expected: 13 failed (`ValueError: unknown liquidation scope 'conid'`), 39 passed.
+Expected: 13 failed (`ValueError: unknown liquidation scope 'conid'`), 47 passed.
 
 - [ ] **Step 3: Implement**
 
@@ -4959,7 +5370,7 @@ Why this order: `handover` runs before `_send_cancels`, every time, so the saga 
 - [ ] **Step 4: Run the tests**
 
 Run: `.venv/bin/python -m pytest tests/test_liquidation_service.py -q --timeout=30`
-Expected: 52 passed.
+Expected: 60 passed.
 
 - [ ] **Step 5: Commit**
 
@@ -5531,7 +5942,7 @@ Note: a partial `start` reads one snapshot to admit the quantity, so these tests
 - [ ] **Step 2: Run them to verify they fail**
 
 Run: `.venv/bin/python -m pytest tests/test_liquidation_service.py -q --timeout=30`
-Expected: 35 failed (`PARTIAL_CLOSE_UNAVAILABLE`, `AttributeError: ... 'upgrade_to_zero'`), 52 passed.
+Expected: 35 failed (`PARTIAL_CLOSE_UNAVAILABLE`, `AttributeError: ... 'upgrade_to_zero'`), 60 passed.
 
 - [ ] **Step 3: Implement**
 
@@ -5930,7 +6341,7 @@ Notes: `_escalate` never captures a snapshot; `_escalate_now` continues on the s
 - [ ] **Step 4: Run the tests**
 
 Run: `.venv/bin/python -m pytest tests/test_liquidation_service.py -q --timeout=30`
-Expected: 87 passed.
+Expected: 95 passed.
 
 - [ ] **Step 5: Commit**
 
@@ -6111,7 +6522,7 @@ def test_account_claim_supersede_and_inheritance_commit_together_or_not_at_all(t
 - [ ] **Step 2: Run them to verify they fail**
 
 Run: `.venv/bin/python -m pytest tests/test_liquidation_service.py -q --timeout=30`
-Expected: 7 failed (the scoped runs are not `SUPERSEDED`, so they keep re-protecting and reducing), 89 passed. `test_later_scoped_close_inherits_the_unknown_child_of_a_failed_safe_close` and `test_account_claim_supersede_and_inheritance_commit_together_or_not_at_all` already pass: inheritance and the one-transaction claim came with Task 4; the tests pin them for the takeover.
+Expected: 7 failed (the scoped runs are not `SUPERSEDED`, so they keep re-protecting and reducing), 97 passed. `test_later_scoped_close_inherits_the_unknown_child_of_a_failed_safe_close` and `test_account_claim_supersede_and_inheritance_commit_together_or_not_at_all` already pass: inheritance and the one-transaction claim came with Task 4; the tests pin them for the takeover.
 
 - [ ] **Step 3: Implement**
 
@@ -6151,7 +6562,7 @@ The supersede runs before `inherit_children_in_tx` in the same transaction, so t
 - [ ] **Step 4: Run the tests**
 
 Run: `.venv/bin/python -m pytest tests/test_liquidation_service.py -q --timeout=30`
-Expected: 96 passed.
+Expected: 104 passed.
 
 - [ ] **Step 5: Commit**
 
@@ -6323,7 +6734,7 @@ def test_a_full_close_during_an_unfinished_done_cleanup_starts_a_new_root(tmp_pa
 - [ ] **Step 2: Run them to verify they fail**
 
 Run: `.venv/bin/python -m pytest tests/test_liquidation_service.py -q --timeout=30`
-Expected: 2 failed — `test_time_exit_during_partial_close_upgrades_goal_and_ends_closed` (the registry says `zero`, the run still says `partial`, so it re-protects) and `test_upgraded_claim_and_run_change_commit_together_or_not_at_all` (nothing changes the run inside the claim, so the injected failure never happens); 104 passed. The other new tests pin rules that Tasks 3–7 already give (atomic claim, durable join, no revival of a superseded close, no join of a finished root).
+Expected: 2 failed — `test_time_exit_during_partial_close_upgrades_goal_and_ends_closed` (the registry says `zero`, the run still says `partial`, so it re-protects) and `test_upgraded_claim_and_run_change_commit_together_or_not_at_all` (nothing changes the run inside the claim, so the injected failure never happens); 112 passed. The other new tests pin rules that Tasks 3–7 already give (atomic claim, durable join, no revival of a superseded close, no join of a finished root).
 
 - [ ] **Step 3: Implement**
 
@@ -6358,7 +6769,7 @@ Import `UPGRADED` from `trader.trading.exit_owner` and replace `_claim_scoped_in
 - [ ] **Step 4: Run the tests**
 
 Run: `.venv/bin/python -m pytest tests/test_liquidation_service.py tests/test_exit_owner.py -q --timeout=30`
-Expected: 121 passed. Then the full suite: green.
+Expected: 129 passed. Then the full suite: green.
 
 - [ ] **Step 5: Commit**
 
@@ -6769,10 +7180,109 @@ def test_broker_ingest_forwards_the_order_entity_id_to_the_saga(tmp_path):
     assert [e.order_entity_id for e in seen] == [r.order_entity_id for r in rows] == [f"{ORDER_GROUP}:stop"]
 ```
 
+Round-2 verification fixes (ruling 39 and the R2-5 gaps). Append to `tests/automation/test_protective_order_saga.py`:
+
+```python
+def test_an_entry_event_saved_while_submit_bracket_waits_keeps_the_submitted_ids(tmp_path):
+    """Round-2 verification N1: the ingest thread saves the entry's Submitted event while
+    ``submit_bracket`` waits. ``start`` must not then fail its own write with a revision conflict
+    (DISPATCH_AMBIGUOUS, ids lost): it re-reads and adds the ids on top of the ingest's state.
+    (``_race`` pauses a read by order group; ``start`` holds a copy from before the call instead,
+    so the ingest runs inside the dispatch here.)"""
+    import threading
+
+    holder = {}
+
+    class _IngestDuringSubmit(FakeBracketDispatch):
+        def submit_bracket(self, *, plan, intent, account_id):
+            submitted = super().submit_bracket(plan=plan, intent=intent, account_id=account_id)
+            ingest = threading.Thread(target=lambda: holder.setdefault("event", holder["saga"].on_broker_event(
+                _event(plan.order_group_id, leg="entry", status="Submitted"))))
+            ingest.start()
+            ingest.join(timeout=5)
+            return submitted
+
+    saga, *_ = _build_saga(tmp_path, dispatch=_IngestDuringSubmit())
+    holder["saga"] = saga
+    intent = make_intent()
+    state = saga.start(
+        intent=intent, approval=make_approval(), request=FakeCommandRequest(intent.command_id),
+        artifact=SimpleNamespace(artifact_id=intent.artifact_id, allowlist=(str(CONID),),
+                                 max_gross_allocation=0.06, parameters={}),
+        session_state=SimpleNamespace(high_water_mark=100_000.0, expected_account_id=ACCOUNT, liquidity=None),
+        allocation=SimpleNamespace(max_gross_fraction=0.06),
+    )
+    assert holder["event"].state == "ENTRY_WORKING"
+    stored = saga.resume(intent.command_id)
+    assert (state.state, state.error_code) == ("ENTRY_WORKING", None)
+    assert stored.state == "ENTRY_WORKING" and stored.submitted_order_ids == state.submitted_order_ids
+    assert len(stored.submitted_order_ids) == 3
+
+
+def test_saga_rows_from_before_the_upgrade_survive_migration_37(tmp_path):
+    """R2-5 gap: a migration-30 journal with old payloads. Migration 37 backfills the columns; an old
+    PROTECTED saga still takes its broker events and a hand-over; an old SAFETY_FAILED saga asks for
+    no flatten (R29)."""
+    import json
+
+    from trader.automation.protective_order_saga import PROTECTIVE_ORDER_SAGA_MIGRATION_VERSION
+
+    db = DuckDBConnection.get_instance(str(tmp_path / "saga.duckdb"))
+    SchemaMigrator(db).apply(PROTECTIVE_ORDER_SAGA_MIGRATION_VERSION, "before_sp1", (
+        """CREATE TABLE IF NOT EXISTS automated_order_sagas (command_id VARCHAR PRIMARY KEY,
+           order_group_id VARCHAR NOT NULL, state VARCHAR NOT NULL, payload VARCHAR NOT NULL,
+           updated_at TIMESTAMPTZ NOT NULL)""",
+        "CREATE UNIQUE INDEX IF NOT EXISTS idx_automated_order_sagas_group ON automated_order_sagas(order_group_id)",
+        """CREATE TABLE IF NOT EXISTS automated_order_saga_events (event_id VARCHAR PRIMARY KEY,
+           command_id VARCHAR NOT NULL, recorded_at TIMESTAMPTZ NOT NULL)""",
+    ))
+    for command_id, state in (("old-1", "PROTECTED"), ("old-2", "SAFETY_FAILED")):
+        payload = {  # the payload keys of master before SP1
+            "command_id": command_id, "order_group_id": f"og-{command_id}", "order_ref": f"mmr:og-{command_id}",
+            "state": state, "account_id": ACCOUNT, "conid": CONID, "side": "BUY", "requested_quantity": "10",
+            "filled_quantity": "10", "protection_quantity": "10", "protection_working": True,
+            "protection_adjusted": False, "entry_working": False, "stop_working": True, "target_working": True,
+            "stop_filled": False, "target_filled": False, "entry_cancelled": False, "stop_rejected": False,
+            "target_rejected": False, "submitted_order_ids": [1, 2, 3], "seen_event_ids": [], "revision": 5,
+            "error_code": None, "plan_json": None}
+        db.execute("INSERT INTO automated_order_sagas VALUES (?, ?, ?, ?, ?)",
+                   [command_id, f"og-{command_id}", state, json.dumps(payload), NOW], fetch="none")
+
+    saga, *_ = _build_saga(tmp_path)
+    assert db.execute("SELECT account_id, conid FROM automated_order_sagas WHERE command_id = 'old-1'",
+                      fetch="one") == (ACCOUNT, CONID)
+    assert saga.unhandled_failures(ACCOUNT) == []
+    state = saga.on_broker_event(_event("og-old-1", leg="stop", status="Submitted", order_id=2))
+    assert state.state == "PROTECTED"
+    saga.handover(account_id=ACCOUNT, conid=CONID, close_root_id="close-1",
+                  cancels=_cancels("og-old-1", "og-old-1:stop"), generation=7, now=NOW)
+    owned = saga.resume("old-1")
+    assert (owned.state, owned.close_root_id, owned.expected_cancel_ids) == ("CLOSE_OWNED", "close-1",
+                                                                             ("og-old-1:stop",))
+
+
+def test_an_old_leg_event_after_a_release_and_a_restart_changes_nothing(tmp_path):
+    """#25 item 2: after the release the original bracket's legs are retired, also for a new process."""
+    saga, intent, state, breaker, liquidation = _protected(tmp_path)
+    og = state.order_group_id
+    saga.handover(account_id=ACCOUNT, conid=CONID, close_root_id="p-1", cancels=_cancels(og, "og:stop"),
+                  generation=7, now=NOW)
+    saga.release_after_partial(close_root_id="p-1", remaining_quantity=6.0,
+                               stop_group="p-1-reprotect-stop-265598-1", stop_status="Submitted",
+                               target_group=None, target_status=None, now=NOW)
+    before = saga.resume(intent.command_id)
+    restarted, *_rest = _build_saga(tmp_path, breaker=breaker)
+    after = restarted.on_broker_event(_owned_event(og, leg="stop", status="Inactive", entity="og:stop-late"))
+    assert (after.state, after.protection_generation, after.current_groups) == (
+        "PROTECTED", before.protection_generation, before.current_groups)
+    assert breaker.signals == []
+    assert "og:stop-late:Inactive:0.0" in restarted.resume(intent.command_id).seen_event_ids
+```
+
 - [ ] **Step 2: Run them to verify they fail**
 
 Run: `.venv/bin/python -m pytest tests/automation/test_protective_order_saga.py tests/automation/test_attribution_ledger.py -q --timeout=30`
-Expected: 24 failed, 41 passed — `ImportError: cannot import name 'PROTECTIVE_SAGA_OWNERSHIP_MIGRATION_VERSION'`, `TypeError: BrokerOrderEvent.__init__() got an unexpected keyword argument 'order_entity_id'`, `AttributeError: ... 'handover'`. (Checked while writing: with the revision check removed from `save_in_tx`, the three race tests and `test_a_stale_save_is_refused_with_a_revision_conflict` fail; they test the check, not the sequence.)
+Expected: 27 failed, 42 passed — `ImportError: cannot import name 'PROTECTIVE_SAGA_OWNERSHIP_MIGRATION_VERSION'`, `TypeError: BrokerOrderEvent.__init__() got an unexpected keyword argument 'order_entity_id'`, `AttributeError: ... 'handover'`. (Checked while writing: with the revision check removed from `save_in_tx`, the three race tests and `test_a_stale_save_is_refused_with_a_revision_conflict` fail; they test the check, not the sequence.)
 
 - [ ] **Step 3: Implement**
 
@@ -7235,12 +7745,75 @@ Replace `_persist` (it keeps its signature) and add `_persist_all` and `_mutatio
         return mutation, write, event_key
 ```
 
+In `start`, build the writes after `submit_bracket` from a fresh read (ruling 39, N1): the ingest thread may save an event of the bracket while the call waits, and the revision check would then refuse the old copy with the bracket live.
+
+```diff
+diff --git a/trader/automation/protective_order_saga.py b/trader/automation/protective_order_saga.py
+index 04092890..65bb3a9d 100644
+--- a/trader/automation/protective_order_saga.py
++++ b/trader/automation/protective_order_saga.py
+@@ -700,29 +700,34 @@ class ProtectiveOrderSaga:
+                 plan=plan, intent=intent, account_id=self._account_id,
+             )
+         except BrokerRejectedError:
+-            closed = replace(
+-                submitting, state="CLOSED", error_code="BROKER_REJECTED",
+-                revision=submitting.revision + 1,
+-            )
+-            self._persist(closed, now, from_state="SUBMITTING")
+-            return closed
++            return self._after_dispatch(intent.command_id, now, lambda s: replace(
++                s, state="CLOSED", error_code="BROKER_REJECTED"))
+         except Exception:
+-            unknown = replace(
+-                submitting, state="OUTCOME_UNKNOWN", error_code="DISPATCH_AMBIGUOUS",
+-                revision=submitting.revision + 1,
+-            )
+-            self._persist(unknown, now, from_state="SUBMITTING")
+-            return unknown
++            return self._after_dispatch(intent.command_id, now, lambda s: replace(
++                s, state="OUTCOME_UNKNOWN", error_code="DISPATCH_AMBIGUOUS"))
+ 
+         order_ids = tuple(int(x) for x in (getattr(submitted, "order_ids", None) or ()))
+         # Submit returns correlation ids only — broker events advance working.
+-        recorded = replace(
+-            submitting,
+-            submitted_order_ids=order_ids,
+-            revision=submitting.revision + 1,
+-        )
+-        self._persist(recorded, now, from_state="SUBMITTING")
+-        return recorded
++        return self._after_dispatch(
++            intent.command_id, now, lambda s: replace(s, submitted_order_ids=order_ids), always=True)
++
++    def _after_dispatch(self, command_id: str, now: dt.datetime,
++                        change: Callable[[SagaState], SagaState], *, always: bool = False) -> SagaState:
++        """The write after ``submit_bracket``, from a fresh read under the revision check (N1).
++
++        The ingest thread may have saved an event of this bracket while the
++        call waited. A state change is made only while the saga is still
++        SUBMITTING (an event already moved it on, so the broker has the
++        order); ``always`` changes apply on top of whatever the ingest wrote.
++        """
++        def attempt() -> SagaState:
++            current = self._store.load(command_id)
++            if current.state != "SUBMITTING" and not always:
++                return current
++            updated = replace(change(current), revision=current.revision + 1)
++            self._persist(updated, now, from_state=current.state)
++            return updated
++        return self._retrying(attempt)
+ 
+     def resume(self, command_id: str) -> Optional[SagaState]:
+         return self._store.load(command_id)
+```
+
 In `trader/trading/broker_ingest.py` `_notify_protective_saga`, add `order_entity_id=order.order_entity_id,` as the last argument of `BrokerOrderEvent(...)`.
 
 - [ ] **Step 4: Run the tests**
 
 Run: `.venv/bin/python -m pytest tests/automation/test_protective_order_saga.py tests/automation/test_attribution_ledger.py tests/test_broker_ingest.py tests/test_liquidation_service.py -q --timeout=30`
-Expected: all PASS (47 in the saga file), including `test_migration_30_creates_automated_order_sagas_table`.
+Expected: all PASS (51 in the saga file), including `test_migration_30_creates_automated_order_sagas_table`. The N1 test fails without `_after_dispatch` (`SagaRevisionConflict` from `start`); the upgrade and retired-leg tests pin behaviour the other Task 9 changes give.
 
 - [ ] **Step 5: Commit**
 
@@ -7254,21 +7827,21 @@ Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>"
 ---
 
 
-### Task 10: Exit legs by order identity — stop and target of the re-protect pair
+### Task 10: Exit legs on the same reduce-only path — stop and target of the re-protect pair
 
-The re-protect stop and target go through the same reduce-only method as every exit (R11). This task teaches `place_reduce_only_order` STP and LMT legs with a price and an OCA group (`ocaType=2`: a fill of one leg reduces the other to what is left), and the bound of R35 does not count the working sibling of the same OCA group (otherwise the target, sent next to a stop that already covers the remainder, would be refused), and adds `place_exit_leg` on the dispatch and on `_LiquidationDispatch`. The service sends the legs one by one (Task 6), so there is no `place_exit_oca` that places both: each leg follows the status of its own order id (R13). A real IB paper session still has to prove `ocaType=2` (plan 6).
+The re-protect stop and target go through the same reduce-only method as every exit (R11). This task adds `order_type` (`MKT`, `STP`, `LMT`), `price` and `oca_group` to master's `place_reduce_only_order` (ruling 35): `STP`/`LMT` need a positive price, and an OCA group sets `ocaType=2` (a fill of one leg reduces the other to what is left). The R35 bound from Task 14 already leaves out the working sibling of the same OCA group, so the target is not refused next to its own stop. It adds `place_exit_leg` on the dispatch and on `_LiquidationDispatch`. The service sends the legs one by one (Task 6), so there is no `place_exit_oca` that places both: each leg follows IB's verdict for its own order id through master's order tracker (R13, ruling 34). A real IB paper session still has to prove `ocaType=2` (plan 6).
 
 **Files:**
-- Modify: `trader/trading/trading_runtime.py` (`Trader._reduce_only_refusal`, `Trader.place_reduce_only_order`, new `TradingRuntimeOrderDispatch.place_exit_leg`)
+- Modify: `trader/trading/trading_runtime.py` (`Trader.place_reduce_only_order`, `Trader._reduce_only_refusal`, new `Trader._reduce_only_order`, new `TradingRuntimeOrderDispatch.place_exit_leg`)
 - Modify: `trader/trading/command_stack.py` (`_LiquidationDispatch.place_exit_leg`)
 - Test: `tests/test_reduce_only_order_path.py`
 
 **Interfaces:**
 
 ```python
-async def Trader.place_reduce_only_order(self, contract, action, quantity, *, order_ref: str,
+async def Trader.place_reduce_only_order(self, contract, side, quantity, *, broker_quantity, order_ref,
                                          order_type: str = "MKT", price: Optional[float] = None,
-                                         oca_group: Optional[str] = None, ack_timeout: float = 10.0) -> SuccessFail
+                                         oca_group: Optional[str] = None) -> SuccessFail
     # order_type in ("MKT", "STP", "LMT"); STP/LMT need a positive price; oca_group -> ocaType 2
 def TradingRuntimeOrderDispatch.place_exit_leg(self, position, *, leg: str, quantity: float, price: float,
                                                oca_group: str, order_ref: str)    # leg "stop" -> STP, "target" -> LMT
@@ -7284,45 +7857,42 @@ Append to `tests/test_reduce_only_order_path.py`:
 
 def test_exit_legs_carry_price_oca_group_and_reduce_oca_type():
     trader = _trader(held=6.0)
-    _run(trader.place_reduce_only_order(_contract(), "SELL", 6.0, order_ref="mmr:p-1-reprotect-stop-265598-1",
-                                        order_type="STP", price=95.0, oca_group="p-1-reprotect-265598-1"))
-    _run(trader.place_reduce_only_order(_contract(), "SELL", 6.0, order_ref="mmr:p-1-reprotect-target-265598-1",
-                                        order_type="LMT", price=120.0, oca_group="p-1-reprotect-265598-1"))
+    for order_type, price, ref in (("STP", 95.0, "mmr:p-1-reprotect-stop-265598-1"),
+                                   ("LMT", 120.0, "mmr:p-1-reprotect-target-265598-1")):
+        result = _run(trader.place_reduce_only_order(_contract(), "SELL", 6.0, broker_quantity=6.0, order_ref=ref,
+                                                     order_type=order_type, price=price,
+                                                     oca_group="p-1-reprotect-265598-1"))
+        assert result.is_success()
     stop, target = trader.executioner.placed
     assert (stop.orderType, stop.auxPrice, target.orderType, target.lmtPrice) == ("STP", 95.0, "LMT", 120.0)
     for order in (stop, target):
-        assert (order.ocaGroup, order.ocaType, order.transmit, order.parentId) == ("p-1-reprotect-265598-1", 2, True, 0)
+        assert (order.ocaGroup, order.ocaType, order.transmit, order.parentId, order.tif) == (
+            "p-1-reprotect-265598-1", 2, True, 0, "DAY")
 
 
-def test_stop_that_fills_before_its_ack_is_reported_as_filled():
-    trader = _trader(held=6.0, script=("Filled",))
-    result = _run(trader.place_reduce_only_order(_contract(), "SELL", 6.0, order_ref="mmr:s", order_type="STP",
-                                                 price=95.0, oca_group="g"))
-    assert result.is_success() and result.obj[0].orderStatus.status == "Filled"
-
-
-def test_target_that_goes_inactive_after_its_echo_is_rejected():
-    trader = _trader(held=6.0, script=("PendingSubmit", "Inactive"))
-    result = _run(trader.place_reduce_only_order(_contract(), "SELL", 6.0, order_ref="mmr:t", order_type="LMT",
-                                                 price=120.0, oca_group="g"))
-    assert result.error == "EXIT_ORDER_REJECTED: Inactive"
+def test_an_exit_leg_rejected_by_ib_is_not_a_refusal():
+    """R13: IB's verdict for this order id; a rejected leg was sent, so it is not ``reduce-only refused``."""
+    trader = _trader(held=6.0, verdict="rejected")
+    result = _run(trader.place_reduce_only_order(_contract(), "SELL", 6.0, broker_quantity=6.0, order_ref="mmr:t",
+                                                 order_type="LMT", price=120.0, oca_group="g"))
+    assert result.exception is None and result.error.startswith("Order rejected by IB")
+    assert len(trader.executioner.placed) == 1
 
 
 @pytest.mark.parametrize("order_type,price", [("STP", None), ("LMT", 0.0), ("TRAIL", 1.0)])
 def test_exit_leg_without_a_valid_type_or_price_is_refused(order_type, price):
     trader = _trader(held=6.0)
-    result = _run(trader.place_reduce_only_order(_contract(), "SELL", 6.0, order_ref="mmr:x",
+    result = _run(trader.place_reduce_only_order(_contract(), "SELL", 6.0, broker_quantity=6.0, order_ref="mmr:x",
                                                  order_type=order_type, price=price, oca_group="g"))
-    assert str(result.error).startswith("REDUCE_ONLY_REFUSED") and trader.executioner.placed == []
+    assert result.error.startswith("reduce-only refused") and trader.executioner.placed == []
 
 
 def test_dispatch_place_exit_leg_derives_side_and_type(loop_thread):
     trader = _trader(held=-6.0)
-    trader._main_loop = loop_thread.loop
-    dispatch = TradingRuntimeOrderDispatch(trader, dispatch_timeout=2.0)
+    dispatch = _dispatch(trader, loop_thread)
     dispatch.place_exit_leg(_position(-6.0), leg="stop", quantity=6.0, price=105.0, oca_group="g", order_ref="mmr:s")
     order = trader.executioner.placed[-1]
-    assert (order.action, order.orderType, order.auxPrice) == ("BUY", "STP", 105.0)
+    assert (order.action, order.orderType, order.auxPrice, order.ocaGroup) == ("BUY", "STP", 105.0, "g")
     with pytest.raises(DispatchRefused):
         dispatch.place_exit_leg(_position(-6.0), leg="trail", quantity=6.0, price=1.0, oca_group="g", order_ref="mmr:x")
 
@@ -7343,147 +7913,141 @@ def test_target_leg_is_allowed_next_to_its_own_oca_stop_but_not_next_to_another_
     """D14: the working stop of the same OCA pair does not count against the target's bound."""
     trader = _trader(held=6.0)
     trader.client.ib.open_trades = [_working("SELL", 6.0, oca_group="p-1-reprotect-265598-1")]
-    target = _run(trader.place_reduce_only_order(_contract(), "SELL", 6.0, order_ref="mmr:t", order_type="LMT",
-                                                 price=120.0, oca_group="p-1-reprotect-265598-1"))
+    target = _run(trader.place_reduce_only_order(_contract(), "SELL", 6.0, broker_quantity=6.0, order_ref="mmr:t",
+                                                 order_type="LMT", price=120.0, oca_group="p-1-reprotect-265598-1"))
     assert target.is_success()
-    other = _run(trader.place_reduce_only_order(_contract(), "SELL", 6.0, order_ref="mmr:u", order_type="LMT",
-                                                price=120.0, oca_group="another-group"))
-    assert str(other.error).startswith("REDUCE_ONLY_REFUSED")
+    other = _run(trader.place_reduce_only_order(_contract(), "SELL", 6.0, broker_quantity=6.0, order_ref="mmr:u",
+                                                order_type="LMT", price=120.0, oca_group="another-group"))
+    assert other.error.startswith("reduce-only refused")
 ```
 
 - [ ] **Step 2: Run them to verify they fail**
 
 Run: `.venv/bin/python -m pytest tests/test_reduce_only_order_path.py -q --timeout=30`
-Expected: 9 failed (`TypeError: ... unexpected keyword argument 'order_type'`, no `place_exit_leg`), 25 passed.
+Expected: 8 failed, 12 passed (`TypeError: ... unexpected keyword argument 'order_type'`, no `place_exit_leg`)
 
 - [ ] **Step 3: Implement**
 
-In `Trader`, add `_REDUCE_ONLY_TYPES = ('MKT', 'STP', 'LMT')` next to `_ACK_STATUSES` and replace the two methods (`StopOrder` and `LimitOrder` are already imported):
-
-```python
-    def _reduce_only_refusal(self, contract: Contract, action: str, quantity: float, *,
-                             order_type: str = 'MKT', price: Optional[float] = None,
-                             oca_group: Optional[str] = None) -> Optional[str]:
-        """Why a reduce-only order may not be sent, or None (R11, D13, D14).
-
-        It reads IB's live positions only (never the event-driven portfolio
-        cache: an empty live list is exactly the "position already gone"
-        case) and subtracts the reducing orders already working on the
-        contract, except the siblings of ``oca_group``.
-        """
-        if order_type not in self._REDUCE_ONLY_TYPES:
-            return f'order type {order_type!r} is not a reduce-only type'
-        if order_type != 'MKT' and (price is None or not price > 0):
-            return f'{order_type} needs a positive price'
-        if not self.ib_account:
-            return 'no ib_account is configured'
-        if not self.is_ib_connected():
-            return 'IB is not connected'
-        try:
-            positions = list(self.client.ib.positions(account=self.ib_account))
-            open_trades = list(self.client.ib.openTrades())
-        except Exception as ex:
-            return f'IB positions or open orders are unavailable: {ex}'
-        held = sum(
-            float(p.position) for p in positions
-            if int(p.contract.conId) == int(contract.conId)
-            and (not getattr(p, 'account', None) or p.account == self.ib_account)
-        )
-        if held == 0:
-            return f'no broker position on conid {contract.conId}'
-        reducing = 'SELL' if held > 0 else 'BUY'
-        if action != reducing:
-            return f'{action} does not reduce a position of {held:g}'
-        working = sum(
-            max(float(t.order.totalQuantity) - float(getattr(t.orderStatus, 'filled', 0.0) or 0.0), 0.0)
-            for t in open_trades
-            if int(getattr(t.contract, 'conId', 0) or 0) == int(contract.conId)
-            and t.order.action == reducing
-            and not (oca_group and getattr(t.order, 'ocaGroup', '') == oca_group)
-        )
-        allowed = abs(held) - working
-        if not 0 < float(quantity) <= allowed:
-            return (f'quantity {quantity:g} is not within (0, {allowed:g}]: position {held:g}, '
-                    f'{working:g} already working to reduce it')
-        return None
-
-    async def place_reduce_only_order(
-        self,
-        contract: Contract,
-        action: str,
-        quantity: float,
-        *,
-        order_ref: str,
-        order_type: str = 'MKT',
-        price: Optional[float] = None,
-        oca_group: Optional[str] = None,
-        ack_timeout: float = 10.0,
-    ) -> SuccessFail:
-        """The one reduce-only order path (R11): full reduce, partial reduce, exit legs.
-
-        It checks the account fence, the connection, that ``action`` reduces
-        IB's live position on this contract, and that ``quantity`` is at most
-        that position minus the reducing orders already working. It does not
-        run the entry gates (RiskGate daily loss, open orders, rate,
-        concentration, leverage): blocking an exit does not reduce risk.
-        There is no flag to skip checks.
-
-        A refusal before the IB call has the ``REDUCE_ONLY_REFUSED:`` prefix.
-        After ``placeOrder`` the result follows the status of *this* order id
-        (R13): the local PendingSubmit echo is not acceptance; Inactive or a
-        cancel is ``EXIT_ORDER_REJECTED:``; no status in time is an exception.
-        """
-        refusal = self._reduce_only_refusal(contract, action, quantity, order_type=order_type, price=price,
-                                            oca_group=oca_group)
-        if refusal is not None:
-            return SuccessFail.fail(error=f'REDUCE_ONLY_REFUSED: {refusal}')
-        common = dict(action=action, totalQuantity=float(quantity), account=self.ib_account,
-                      orderRef=order_ref, tif='DAY', outsideRth=False, transmit=True)
-        if order_type == 'MKT':
-            order: Order = MarketOrder(**common)
-        elif order_type == 'STP':
-            order = StopOrder(stopPrice=float(price), **common)
-        else:
-            order = LimitOrder(lmtPrice=float(price), **common)
-        if oca_group:
-            order.ocaGroup = oca_group
-            order.ocaType = 2  # a fill reduces the sibling to what is left
-        try:
-            status, trade = await self._place_and_await_status(contract, order, ack_timeout)
-        except Exception as ex:
-            return SuccessFail.fail(exception=ex)
-        if status in self._DEAD_STATUSES:
-            return SuccessFail.fail(error=f'EXIT_ORDER_REJECTED: {status}')
-        return SuccessFail.success(obj=[trade])
-```
-
-In `TradingRuntimeOrderDispatch` add after `reduce_partial`:
-
-```python
-    def place_exit_leg(self, position, *, leg: str, quantity: float, price: float,
-                       oca_group: str, order_ref: str):
-        """One exit-only leg (stop or target) of a re-protect OCA pair."""
-        if leg not in ('stop', 'target'):
-            self._refuse(f'unknown exit leg {leg!r}')
-        side = self._reducing_side(position)
-        return self._reduce_only(position, side, quantity, order_ref,
-                                 order_type='STP' if leg == 'stop' else 'LMT',
-                                 price=float(price), oca_group=oca_group)
-```
-
-In `_LiquidationDispatch` (command_stack) add:
-
-```python
-    def place_exit_leg(self, position, *, leg: str, quantity: float, price: float,
-                       oca_group: str, child_id: str) -> None:
-        self._dispatch.place_exit_leg(position, leg=leg, quantity=quantity, price=price,
-                                      oca_group=oca_group, order_ref=encode_order_ref(child_id))
+```diff
+diff --git a/trader/trading/command_stack.py b/trader/trading/command_stack.py
+index 5c988280..ef799780 100644
+--- a/trader/trading/command_stack.py
++++ b/trader/trading/command_stack.py
+@@ -221,6 +221,11 @@ class _LiquidationDispatch:
+     def reduce_partial(self, position, side: str, quantity: float, child_id: str) -> None:
+         self._dispatch.reduce_partial(position, side, quantity, encode_order_ref(child_id))
+ 
++    def place_exit_leg(self, position, *, leg: str, quantity: float, price: float,
++                       oca_group: str, child_id: str) -> None:
++        self._dispatch.place_exit_leg(position, leg=leg, quantity=quantity, price=price,
++                                      oca_group=oca_group, order_ref=encode_order_ref(child_id))
++
+     def find_orders(self, account_id: str, child_id: str) -> list:
+         return self._dispatch.find_by_order_ref(account_id, encode_order_ref(child_id))
+ 
+diff --git a/trader/trading/trading_runtime.py b/trader/trading/trading_runtime.py
+index 1b2e1738..7ae619bf 100644
+--- a/trader/trading/trading_runtime.py
++++ b/trader/trading/trading_runtime.py
+@@ -1702,8 +1702,16 @@ class Trader():
+         *,
+         broker_quantity: float,
+         order_ref: str,
++        order_type: str = 'MKT',
++        price: Optional[float] = None,
++        oca_group: Optional[str] = None,
+     ) -> SuccessFail:
+-        """Send a MARKET order that can only shrink an existing position.
++        """Send an order that can only shrink an existing position.
++
++        ``order_type`` is ``MKT`` (full or partial reduce), or ``STP`` / ``LMT``
++        with a positive ``price`` for the exit legs of a re-protect pair. An
++        ``oca_group`` links the legs with ``ocaType=2``: a fill of one leg
++        reduces the other to what is left.
+ 
+         The emergency-exit path (liquidation, session flatten). It keeps the
+         boundary checks — account and mode pin, contract, reduce-only side and
+@@ -1719,17 +1727,15 @@ class Trader():
+         - ``fail(exception=...)``: the order may have been sent.
+         """
+         try:
+-            refusal = self._reduce_only_refusal(contract, side, quantity, broker_quantity)
++            refusal = self._reduce_only_refusal(contract, side, quantity, broker_quantity,
++                                                order_type=order_type, price=price, oca_group=oca_group)
+         except Exception as ex:
+             refusal = f'pre-send check failed: {ex}'
+         if refusal:
+             logging.error('reduce-only order refused before send: %s', refusal)
+             return SuccessFail.fail(error=f'{REDUCE_ONLY_REFUSED}: {refusal}')
+ 
+-        order = MarketOrder(
+-            action=side, totalQuantity=quantity, account=self.ib_account,
+-            orderRef=order_ref, tif='DAY', outsideRth=False,
+-        )
++        order = self._reduce_only_order(side, quantity, order_ref, order_type, price, oca_group)
+         try:
+             trade = await self._send_reduce_only(contract, order)
+             return await self._confirm_reduce_only(trade)
+@@ -1737,12 +1743,33 @@ class Trader():
+             logging.error('reduce-only order may have been sent: %s', ex)
+             return SuccessFail.fail(exception=ex)
+ 
++    _REDUCE_ONLY_TYPES = ('MKT', 'STP', 'LMT')
++
++    def _reduce_only_order(self, side: str, quantity: float, order_ref: str, order_type: str,
++                           price: Optional[float], oca_group: Optional[str]) -> Order:
++        common = dict(action=side, totalQuantity=quantity, account=self.ib_account,
++                      orderRef=order_ref, tif='DAY', outsideRth=False)
++        if order_type == 'STP':
++            order: Order = StopOrder(stopPrice=float(price), **common)
++        elif order_type == 'LMT':
++            order = LimitOrder(lmtPrice=float(price), **common)
++        else:
++            order = MarketOrder(**common)
++        if oca_group:
++            order.ocaGroup = oca_group
++            order.ocaType = 2  # a fill reduces the sibling to what is left
++        return order
++
+     def _reduce_only_refusal(
+         self, contract: Contract, side: str, quantity: float, broker_quantity: float, *,
+-        oca_group: Optional[str] = None,
++        order_type: str = 'MKT', price: Optional[float] = None, oca_group: Optional[str] = None,
+     ) -> Optional[str]:
+         import math
+ 
++        if order_type not in self._REDUCE_ONLY_TYPES:
++            return f'order type {order_type!r} is not a reduce-only type'
++        if order_type != 'MKT' and (price is None or not math.isfinite(float(price)) or not float(price) > 0):
++            return f'{order_type} needs a positive price'
+         account = self.ib_account
+         if not account:
+             return 'no ib_account is configured on the trader'
+@@ -2527,6 +2554,18 @@ class TradingRuntimeOrderDispatch:
+             self._refuse('a partial reduce needs a whole quantity strictly between 0 and the position')
+         return self._reduce_only(position, side, quantity, order_ref)
+ 
++    def place_exit_leg(self, position, *, leg: str, quantity: float, price: float,
++                       oca_group: str, order_ref: str):
++        """One exit-only leg (stop or target) of a re-protect OCA pair."""
++        if leg not in ('stop', 'target'):
++            self._refuse(f'unknown exit leg {leg!r}')
++        side = self._reducing_side(position)
++        if side is None:
++            self._refuse('no position to protect')
++        return self._reduce_only(position, side, quantity, order_ref,
++                                 order_type='STP' if leg == 'stop' else 'LMT',
++                                 price=float(price), oca_group=oca_group)
++
+     def cancel_on_loop(self, order_entity_id: str, order_ref: str):
+         """``cancel`` for the liquidation worker (R34, ruling 7).
+ 
 ```
 
 - [ ] **Step 4: Run the tests**
 
-Run: `.venv/bin/python -m pytest tests/test_reduce_only_order_path.py tests/test_trading_runtime.py -q --timeout=30`
-Expected: all PASS (34 in the file).
+Run: `.venv/bin/python -m pytest tests/test_reduce_only_order_path.py tests/test_trading_runtime.py tests/test_order_dispatch_ports.py -q --timeout=30`
+Expected: all PASS (20 in the file).
 
 - [ ] **Step 5: Commit**
 
@@ -7663,7 +8227,7 @@ def test_session_flatten_joining_an_existing_account_flatten_polls_the_returned_
         journal=DomainJournal(db), db=db, calendar=XNYSCalendarPolicy(), broker=FakeBroker(),
         cancel=FakeCancel(), liquidation=liquidation, breaker=FakeBreaker(),
         time_exit=FakeTimeExitDispatch(), account_id=ACCOUNT, now=lambda: _utc(15, 47))
-    restarted.restore(_utc(15, 47))
+    restarted.recover(_utc(15, 47))
     liquidation.mark_flat(generation_id=4, root_id="kill-1")
     state = restarted.run_due(_utc(15, 48))
     assert (state.state, state.flatten_command_id, state.flat_generation) == ("FLAT", "kill-1", 4)
@@ -7706,10 +8270,17 @@ def test_session_flatten_whose_root_ends_failed_safe_is_an_incident_at_once(tmp_
     assert [s.kind for s in breaker.signals] == ["LIQUIDATION_FAILED"]
 ```
 
+In master's `test_missed_flat_deadline_records_incident_when_rescan_finds_no_advanceable_root` the first state may now be `VERIFYING_FLAT` (the session polls the root it got back, not `rescan()`):
+
+```diff
+-    assert state.state == "FLATTENING"
++    assert state.state in ("FLATTENING", "VERIFYING_FLAT")   # Task 11 polls the root it got back
+```
+
 - [ ] **Step 2: Run them to verify they fail**
 
 Run: `.venv/bin/python -m pytest tests/automation/test_session_controller.py -q --timeout=30`
-Expected: 8 failed, 26 passed — the time-exit tests (`TypeError: SessionTimeExitAdapter.__init__() got an unexpected keyword argument 'account_id'`), `test_poll_flat_ignores_another_roots_flat_receipt` (another root's FLAT is accepted), the join test (`flatten_command_id` is the session's own cause), the no-root test (the session silently polls its own cause) and the `FAILED_SAFE` test (it keeps polling).
+Expected: 8 failed, 29 passed — the time-exit tests (`TypeError: SessionTimeExitAdapter.__init__() got an unexpected keyword argument 'account_id'`), `test_poll_flat_ignores_another_roots_flat_receipt` (another root's FLAT is accepted), the join test (`flatten_command_id` is the session's own cause), the no-root test (the session silently polls its own cause) and the `FAILED_SAFE` test (it keeps polling).
 
 - [ ] **Step 3: Implement**
 
@@ -7748,12 +8319,17 @@ class SessionTimeExitAdapter:
             return
 ```
 
-In `_issue_flatten` replace the `start` call and the arguments up to `flatten_issued=True,`:
+In `_issue_flatten` replace master's `try: self._liquidation.start(...) except LiquidationBusy: pass` and the arguments up to `flatten_issued=True,` (ruling 38):
 
 ```python
-        receipt = self._liquidation.start(self._account_id, cause, deadline)
-        # R10: persist and poll the root we got back; it is another root after a join.
-        root = getattr(receipt, "cause_command_id", None)
+        try:
+            receipt = self._liquidation.start(self._account_id, cause, deadline)
+            # R10: persist and poll the root we got back; it is another root after a join.
+            root = getattr(receipt, "cause_command_id", None)
+        except LiquidationBusy:
+            # start() committed its own claim before it waited for the lock (only an own
+            # root waits), so the root is this cause; a later rescan advances it.
+            root = cause
         if not root:
             raise RuntimeError(f"liquidation start for {cause} returned no root to poll")
         state = self._evolve(
@@ -7793,7 +8369,7 @@ In `trader/trading/command_stack.py`, in the `SessionController(` call, the `tim
 - [ ] **Step 4: Run the tests**
 
 Run: `.venv/bin/python -m pytest tests/automation/test_session_controller.py tests/test_command_stack.py -q --timeout=30`
-Expected: all PASS (34 in the file), no xfail left.
+Expected: all PASS (37 in the file), no xfail left.
 
 - [ ] **Step 5: Commit**
 
@@ -9473,16 +10049,17 @@ Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>"
 - The kill line (plan 4) claims the account owner through `start(scope="account")`, as `/flatten` already does (`liquidate_account` in `trader/messaging/production_api.py` → `LiquidationService.liquidate`).
 - Wiring a live caller for `SessionController.on_bar` (SP2).
 - The real IB paper session that proves `ocaType=2`, the generation-refresh load and the reduce-only path against IB (plan 6, acceptance harness, #35). A green fake is not that proof.
-- The old-path regression "after a loss breach a new entry is refused and a safe close is allowed" is **in scope now** (Task 14 unit test, Task 12 for a SELL intent against a breached session risk, Task 13 through the stack). Plan 3 adds the `ai_paper` variant on top.
+- The old-path regression "after a loss breach a new entry is refused and a safe close is allowed" is **in scope now** (master's unit test from PR #42, Task 12 for a SELL intent against a breached session risk, Task 13 through the stack). Plan 3 adds the `ai_paper` variant on top.
 - Gate carried to plan 3 (#31): owner-owned risk ceilings stay hard trader constants (`session_risk` `MAX_DAILY_LOSS_FRACTION`, `MAX_DRAWDOWN_FRACTION`, allocation ceilings); a model policy may only tighten them, and dispatch re-checks a tightened limit. Nothing in this plan changes those constants.
 - Whether IB shrinks the children of a bracket whose parent was partly filled and then cancelled is not proven here; Task 16 closes the conid when they are bigger than the position. Plan 6 (#35) should observe it in the paper session.
 
 ## Self-review notes (done while writing)
 
-- Round 2: every task's code was applied on a scratch worktree of this branch in the execution order above, one commit per task. Each new test was run against the previous task's code (the "Expected" failure counts in Step 2 come from those runs) and after the task (the pass counts). The full suite passed at Task 4 (5264 passed), Task 8 (5368 passed) and on the final state (5460 passed, 23 skipped). Baseline before the plan: 5205 passed, 23 skipped.
+- Alignment with master (PR #42): every task's code was applied again on a scratch worktree of this branch (on `15f9e715`) in the execution order above, one commit per task, with the round-2 verification fixes folded into Tasks 4 and 9. For each task the changed test files were run against the previous task's code and after the task; the Step 2 and Step 4 counts above come from those runs. Baseline on master: 5273 passed, 23 skipped. Final state: 5517 passed, 23 skipped (`.venv/bin/python -m pytest tests/ -q --timeout=30 --ignore=tests/test_ibrx_async.py -p no:cacheprovider`).
+- Round 2: every task's code was applied on a scratch worktree of this branch in the execution order above, one commit per task. Each new test was run against the previous task's code (the "Expected" failure counts in Step 2 come from those runs) and after the task (the pass counts). The full suite passed at Task 4 (5264 passed), Task 8 (5368 passed) and on the final state (5460 passed, 23 skipped). Baseline before the plan: 5205 passed, 23 skipped. Those counts are from before PR #42; the alignment line above has the current ones.
 - The four race tests of Task 9 were also run with the revision check removed from `save_in_tx`: all four fail, so they test the check.
 - Spec 5.1 coverage: problem list (Tasks 1, 2, 14, 15); scope and goal (Tasks 4–6); protection ownership (Task 9); breaker signals (Task 4 `_trips_breaker`, Task 6 escalation, R29); one execution owner, goal upgrade, account owner first, supersede, exact-root polling (Tasks 3, 4, 7, 8, 11); flatten order and the unknown-child rule (Tasks 4, 7, R22, R23); exit-only OCA, recovery, `DONE`/`CLOSED` meaning (Tasks 6, 10, 18, R25, R26, R30; rulings 23, 24); users of the safe close (Tasks 11, 12, 16); SELL must prove a reduction (Task 12). Section 5.5 step 2 (kill = account owner): Task 4 `start(scope="account")`.
 - Spec section 6 "Safe close" list → tests: time exit leaves the stop live (T1/T11 `test_time_exit_leaves_no_live_stop_after_the_position_is_closed`, T13 `test_after_a_loss_breach_a_time_exit_hands_over_cancels_the_stop_and_reduces`); lost acknowledgement (T4 `test_timeout_after_the_boundary_stays_unknown_and_is_never_resent`); partial fill (T6 `test_terminal_partial_fill_reprotects_the_actual_remainder`, T13); cancel rejected (T5 `test_cancel_rejected_by_the_broker_ends_failed_safe_without_reduce`); re-protect failure and missed deadline (T6); partially close one of two protected positions, the other untouched, breaker clear (T13 `test_partial_close_of_one_of_two_positions_reprotects_the_actual_remainder`); unrequested stop cancel (T9); routine progress (T5); time exit + AI close (T8); time exit during partial (T8); flatten during partial (T7); kill during REPROTECTING (T7); invisible child (T4, T5, T7, T13); full close during flatten (T8); old FAILED_SAFE root (T4); exact-root polling (T11, T13); exit OCA cases (T6, T10, T13); production composition (T13).
 - R-rule coverage: R1/R2/R3 (Task 4 `_reserve`, `_send`), R4 and R22 (`_evidence`, Task 18), R5 and R23 (`_blocking`, `_fresh`, `_cancel_targets`), R6 (claims and `_finish` in one transaction; failure-injection tests in Tasks 6, 7, 8), R7 (`_check_dispatchable_in_tx`; Tasks 4, 6), R8 and R24 (`_finish`, `_cleanup`; Tasks 4, 6, 8), R9 (`inherit_children_in_tx`; Tasks 4, 6, 7), R10 (Tasks 4, 11, 13), R11 and R35 (Tasks 14, 10), R12 (Task 15, ruling 8), R13 (Tasks 6, 10, 14, 18), R14 and R27/R28 (Task 9), R15 and R36 (Task 6), R16 and R37 (Task 16), R17 and R33 (Tasks 4, 12, 17, 13), R18 (Task 1), R19 (Task 4), R20 (Tasks 4, 6, 7, 8, 13), R21 (Task 13), R25/R26/R30/R31 (Task 6), R29 (Tasks 4, 9, 15), R32 (Task 12), R34 (Tasks 4, 14), R38 (all).
-- Names used across tasks were checked against the frozen blocks of Tasks 3, 4 and 18: `ChildRef` (with `sent_generation`, `order_entity_id`), `LiquidationReceipt`, `JoinRow`, `CloseResolution` (with `error_code`), `CancelTarget`, `HandoverInfo`, `DispatchRefused`, `LiquidationRefused`, `RunStateError`, `LiquidationRunStore.*_in_tx`, `ExitOwnerRegistry.*_in_tx`, `liquidation_child_id`, `reprotect_oca_group`, `LiquidationDispatchPort.enumeration_complete/newest_generation`, `ProtectionOwnershipPort.expect_reprotect/release_after_partial(…, stop_status, target_status)`, `LiquidationService.start/rescan/receipt_for/root_for/close_resolution/upgrade_to_zero/attach_protection/liquidate`, `SerializedLiquidation`, `LiquidationWorker`, `Trader.place_reduce_only_order`, `TradingRuntimeOrderDispatch.reduce_position/reduce_partial/place_exit_leg/cancel_on_loop/enumeration_complete/newest_generation`, `_LiquidationDispatch(dispatch, orders_view)`, `SessionTimeExitAdapter(liquidation, *, account_id, now, deadline_seconds)`, `SessionController.restore`, `AutomatedIntentCommandService(liquidation=, broker=)`, `OutcomeReconciler(closes=)`, `SagaRevisionConflict`.
+- Names used across tasks were checked against the frozen blocks of Tasks 3, 4 and 18: `ChildRef` (with `sent_generation`, `order_entity_id`), `LiquidationReceipt`, `JoinRow`, `CloseResolution` (with `error_code`), `CancelTarget`, `HandoverInfo`, `DispatchRefused`, `LiquidationRefused`, `RunStateError`, `LiquidationRunStore.*_in_tx`, `ExitOwnerRegistry.*_in_tx`, `liquidation_child_id`, `reprotect_oca_group`, `LiquidationDispatchPort.enumeration_complete/newest_generation`, `ProtectionOwnershipPort.expect_reprotect/release_after_partial(…, stop_status, target_status)`, `LiquidationService.start/rescan/receipt_for/root_for/close_resolution/upgrade_to_zero/attach_protection/liquidate`, `SerializedLiquidation`, `LiquidationWorker`, `Trader.place_reduce_only_order`, `TradingRuntimeOrderDispatch.reduce_position/reduce_partial/place_exit_leg/cancel_on_loop/enumeration_complete/newest_generation`, `_LiquidationDispatch(dispatch, orders_view)`, `SessionTimeExitAdapter(liquidation, *, account_id, now, deadline_seconds)`, `LiquidationBusy`, `REDUCE_ONLY_REFUSED`, `AutomatedIntentCommandService(liquidation=, broker=)`, `OutcomeReconciler(closes=)`, `SagaRevisionConflict`.
 - Review round 2 mapping (every verification item and reviewer comment → task and test, or why it is not fixed): `.superpowers/sdd/2026-10-05-ai-paper-sp1-plan1-safe-close/round2-mapping.md`.

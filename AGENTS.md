@@ -37,6 +37,11 @@ Rules:
 - Apps cannot be assigned to issues or requested as reviewers. Post a review or a comment instead.
 - Sign review comments with the model name as before (for example "Reviewed by openai/gpt-...").
 
+Asking another agent for a review:
+- @-mentions do not reach an App (Apps get no notifications). Use labels instead: `review:openai`, `review:grok` (add `review:claude` if needed) on the PR or issue that needs review, plus one comment that says what to review, the head commit, where to start and what is already known.
+- Each reviewer finds its work with `gh api 'search/issues?q=repo:ihormudryy/mmr+is:open+label:review:<key>'`, posts its review as its own App, then removes its own label.
+- Prefer a PR review with line comments. Put a one-line verdict (ready / not yet) at the top and name the ticket for each finding.
+
 ## Project Overview
 
 MMR (Make Me Rich) is a Python-based algorithmic trading platform for Interactive Brokers. It supports automated strategy execution, interactive CLI trading, historical data collection, real-time market data streaming, and idea scanning across US and international markets.

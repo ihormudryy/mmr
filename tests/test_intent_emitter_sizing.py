@@ -1,6 +1,8 @@
 import datetime as dt
 from decimal import Decimal
 
+import pytest
+
 from trader.automation.artifact_verifier import VerifiedArtifact
 from trader.objects import Action
 from trader.strategy.intent_emitter import IntentEmitter, IntentEmitterContext
@@ -57,3 +59,14 @@ def test_no_notional_and_no_quantity_sends_none():
     emitter.on_signal(strategy_name='trend', signal=_signal(), completed_bar_timestamp=BAR,
                       session_id='s', reference_price=100.0)
     assert client.bodies[0]['requested_quantity'] is None
+
+
+@pytest.mark.parametrize('conid', [265598.9, 1001.0, True, '1001', 0, -1])
+def test_a_signal_conid_that_is_not_an_exact_positive_integer_emits_nothing(conid):
+    """#21 round 7: 265598.9 used to become 265598 before ExecutionIntent and started a close of
+    another instrument. A float, bool, string, zero or negative conid is refused before any RPC."""
+    emitter, client = _emitter()
+    signal = Signal(source_name='trend', action=Action.SELL, probability=0.5, risk=0.5, conid=conid)
+    receipt = emitter.on_signal(strategy_name='trend', signal=signal, completed_bar_timestamp=BAR,
+                                session_id='s', reference_price=100.0)
+    assert receipt is None and client.bodies == []

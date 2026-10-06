@@ -6,6 +6,13 @@ from typing import Literal, Optional
 
 from trader.automation.intent_ids import derive_intent_id, derive_command_id
 
+
+def is_exact_conid(value) -> bool:
+    """A positive integer conId as given. ``265598.9``, ``1.0``, ``True`` and ``"1"`` are not:
+    coercing them can name another instrument (#21)."""
+    return not isinstance(value, bool) and isinstance(value, numbers.Integral) and value > 0
+
+
 @dataclass(frozen=True)
 class EntryPolicy:
     order_type: Literal["LIMIT", "MARKETABLE_LIMIT"]
@@ -62,7 +69,7 @@ class ExecutionIntent:
             raise ValueError("completed_bar_timestamp must be timezone-aware")
         if self.completed_bar_timestamp > self.signal_timestamp:
             raise ValueError("completed_bar_timestamp must be <= signal_timestamp")
-        if isinstance(self.conid, bool) or not isinstance(self.conid, numbers.Integral) or self.conid <= 0:
+        if not is_exact_conid(self.conid):
             raise ValueError(f"conid must be positive and an exact integer, got {self.conid!r}")
         if self.side not in ("BUY", "SELL"):
             raise ValueError("side must be BUY or SELL")

@@ -358,7 +358,7 @@ class TestGatewayLifespanWiring:
     """I-1: the command gateway must be built inside
     `CommandCenter._start_or_degrade` (the SAME degrade-tolerant try/except
     that already builds the bridge + quote plane), never eagerly at
-    `create_app()` time -- a bad/missing service HMAC key must degrade the
+    `create_app()` time -- a bad/missing dashboard RPC key must degrade the
     center to inert, not crash the whole web process (re-breaking the M1-R
     Task-5 ops-probe contract)."""
 
@@ -387,7 +387,7 @@ class TestGatewayLifespanWiring:
     @pytest.mark.asyncio
     async def test_gateway_build_failure_degrades_whole_center_not_abort(self, monkeypatch):
         def _boom():
-            raise RuntimeError("missing/invalid service HMAC key")
+            raise RuntimeError("missing/invalid dashboard RPC key")
 
         # `_start_or_degrade` calls `asyncio.get_running_loop()` (to hand the
         # loop to the bridge/quote-plane factories) -- exercised here from
@@ -428,15 +428,15 @@ class TestGatewayLifespanWiring:
         assert calls == []
 
 
-def test_create_app_survives_commands_enabled_with_missing_hmac_key(monkeypatch):
+def test_create_app_survives_commands_enabled_with_missing_rpc_key(monkeypatch, isolated_rpc_keys_dir):
     """I-1 regression test. `build_command_gateway()` used to run EAGERLY in
     `create_app()` (outside any try/except), so DASHBOARD_COMMANDS_ENABLED=
-    true + a missing/bad service HMAC key raised straight out of
+    true + a missing/bad typed-RPC key raised straight out of
     `create_app()` -- taking the whole web process, including the
     unauthenticated `/healthz`/`/readyz`/`/api/health` probes, down with it.
 
     RED before the fix: `webapp.create_app()` itself raises
-    `ServiceHmacKeyError`. GREEN after: gateway construction lives inside the
+    a key-loading error. GREEN after: gateway construction lives inside the
     degrade-tolerant `CommandCenter._start_or_degrade`, so a bad/missing key
     only degrades the command center -- the app still boots and the probes
     still serve.
@@ -445,9 +445,9 @@ def test_create_app_survives_commands_enabled_with_missing_hmac_key(monkeypatch)
 
     monkeypatch.setattr(webapp, "_COMMAND_FLAGS",
                         CommandFlags(True, False, None, None))
-    monkeypatch.delenv("MMR_SERVICE_HMAC_KEY_FILE", raising=False)
+    assert not list(isolated_rpc_keys_dir.iterdir())  # no dashboard.key anywhere
 
-    app = webapp.create_app()  # must not raise merely from a missing HMAC key
+    app = webapp.create_app()  # must not raise merely from a missing RPC key
     with TestClient(app) as client:  # lifespan startup must not raise either
         assert client.get("/healthz").status_code == 200
         assert client.get("/readyz").status_code == 200

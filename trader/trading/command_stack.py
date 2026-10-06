@@ -114,10 +114,8 @@ class _JournalOrLiveStrategySnapshot:
 
 
 def _strategy_control_credentials_ready(trader: Any) -> bool:
-    """True when enable/disable can be registered (HMAC available)."""
-    if getattr(trader, "typed_authenticator", None) is not None:
-        return True
-    return bool(getattr(trader, "service_hmac_key_file", "") or "")
+    """True when enable/disable can be registered (the trader's RPC identity is loaded)."""
+    return getattr(trader, "rpc_identity", None) is not None
 
 
 class _LazyTypedStrategyControlPort:
@@ -156,23 +154,17 @@ class _LazyTypedStrategyControlPort:
 
 
 def _connect_strategy_control_port(trader: Any):
-    """Typed one-way trader → strategy_service control port, or ``(None, None)``."""
-    from trader.messaging.production_api import TypedStrategyControlPort
-    from trader.messaging.typed_rpc import (
-        HmacServiceAuthenticator,
-        TypedRpcClient,
-        load_service_hmac_key,
-    )
+    """Typed one-way trader → strategy_service control port, or ``(None, None)``.
 
-    authenticator = getattr(trader, "typed_authenticator", None)
-    if authenticator is None:
-        key_file = getattr(trader, "service_hmac_key_file", "") or ""
-        if not key_file:
-            return None, None
-        try:
-            authenticator = HmacServiceAuthenticator(load_service_hmac_key(key_file))
-        except Exception:
-            return None, None
+    Signs as the trader's own identity. No identity means no port; there is
+    no fallback key.
+    """
+    from trader.messaging.production_api import TypedStrategyControlPort
+    from trader.messaging.typed_rpc import TypedRpcClient
+
+    identity = getattr(trader, "rpc_identity", None)
+    if identity is None:
+        return None, None
 
     address = (getattr(trader, "strategy_typed_address", None) or "").strip()
     if not address:
@@ -180,10 +172,10 @@ def _connect_strategy_control_port(trader: Any):
     cmd_port = int(getattr(trader, "strategy_typed_command_port", 42104) or 42104)
     qry_port = int(getattr(trader, "strategy_typed_query_port", 42105) or 42105)
     command_client = TypedRpcClient(
-        "command", authenticator, address=address, port=cmd_port, timeout=30.0,
+        "command", identity, server="strategy", address=address, port=cmd_port, timeout=30.0,
     )
     query_client = TypedRpcClient(
-        "query", authenticator, address=address, port=qry_port, timeout=30.0,
+        "query", identity, server="strategy", address=address, port=qry_port, timeout=30.0,
     )
     command_client.connect()
     query_client.connect()

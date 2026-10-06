@@ -12,6 +12,8 @@ import inspect
 import json
 import threading
 
+from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
+
 import pytest
 from pydantic import ValidationError
 
@@ -20,17 +22,18 @@ from trader.messaging.typed_rpc import (
     DEFAULT_NONCE_TTL_SECONDS,
     MAX_REQUEST_BYTES,
     AuthenticationError,
-    HmacServiceAuthenticator,
     ReplayError,
     ReplayNonceCache,
     RpcProblem,
     TypedRpcRequest,
     TypedRpcResponse,
-    _digest,
+    ServiceIdentity,
     canonical_json,
     decode_request,
-    signing_bytes,
+    rpc_signing_bytes,
 )
+from tests.rpc_identity_fixtures import make_identities
+from trader.messaging.principals import KNOWN_PRINCIPALS
 
 
 class MutableClock:
@@ -43,8 +46,24 @@ class MutableClock:
         return self.t
 
 
-KEY = b"k" * 32
 FIXED_NOW = 1_700_000_000.0
+# One keyset for the module so separately-clocked signers and verifiers agree.
+KEYS = {p: Ed25519PrivateKey.generate() for p in KNOWN_PRINCIPALS}
+
+
+class _Auth:
+    """`cli` signs to the trader query socket; the trader verifies."""
+
+    def __init__(self, now):
+        ids = make_identities(now=now, keys=KEYS)
+        self._client, self._server = ids["cli"], ids["trader"]
+
+    def sign(self, method, request_id, nonce, body):
+        return self._client.sign_request(server="trader", role="query", method=method,
+                                         request_id=request_id, nonce=nonce, body=body)
+
+    def verify(self, request):
+        return self._server.verify_request(request, role="query")
 
 
 # ---------------------------------------------------------------------------
@@ -52,7 +71,7 @@ FIXED_NOW = 1_700_000_000.0
 # ---------------------------------------------------------------------------
 
 def test_signature_binds_method_id_nonce_and_body():
-    auth = HmacServiceAuthenticator(b"k" * 32, now=lambda: 1_700_000_000.0)
+    auth = _Auth(now=lambda: 1_700_000_000.0)
     request = auth.sign("approve_proposal", "req-1", "nonce-1", {"proposal_id": 7})
     auth.verify(request)
     changed = request.model_copy(update={"body": {"proposal_id": 8}})
@@ -61,7 +80,7 @@ def test_signature_binds_method_id_nonce_and_body():
 
 
 def test_nonce_cannot_be_replayed():
-    auth = HmacServiceAuthenticator(b"k" * 32, now=lambda: 1_700_000_000.0)
+    auth = _Auth(now=lambda: 1_700_000_000.0)
     request = auth.sign("get_status", "req-1", "nonce-1", {})
     auth.verify(request)
     with pytest.raises(ReplayError):
@@ -69,7 +88,7 @@ def test_nonce_cannot_be_replayed():
 
 
 # ---------------------------------------------------------------------------
-# canonical_json / signing_bytes determinism
+# canonical_json / rpc_signing_bytes determinism
 # ---------------------------------------------------------------------------
 
 def test_canonical_json_sorts_keys_and_is_compact():
@@ -85,10 +104,10 @@ def test_canonical_json_rejects_non_finite_floats_on_output():
 
 
 def test_signing_bytes_ignores_signature_field():
-    auth = HmacServiceAuthenticator(KEY, now=lambda: FIXED_NOW)
+    auth = _Auth(now=lambda: FIXED_NOW)
     request = auth.sign("get_status", "req-1", "nonce-1", {"a": 1})
     tampered_signature = request.model_copy(update={"signature": "deadbeef"})
-    assert signing_bytes(request) == signing_bytes(tampered_signature)
+    assert rpc_signing_bytes(request) == rpc_signing_bytes(tampered_signature)
 
 
 # ---------------------------------------------------------------------------
@@ -96,7 +115,7 @@ def test_signing_bytes_ignores_signature_field():
 # ---------------------------------------------------------------------------
 
 def test_duplicate_key_in_raw_json_body_is_rejected():
-    auth = HmacServiceAuthenticator(KEY, now=lambda: FIXED_NOW)
+    auth = _Auth(now=lambda: FIXED_NOW)
     request = auth.sign("get_status", "req-1", "nonce-1", {"a": 1})
     raw = canonical_json(request.model_dump())
     # Splice in a second, conflicting top-level "method" key.
@@ -171,7 +190,7 @@ def test_overflow_float_never_reaches_verify_as_bare_valueerror():
     # ValueError from verify()'s canonical_json call. Before the parse_float
     # hook, decode_request returned a request whose body carried float('inf')
     # and auth.verify(request) raised ValueError("Out of range float ...").
-    auth = HmacServiceAuthenticator(KEY, now=lambda: FIXED_NOW)
+    auth = _Auth(now=lambda: FIXED_NOW)
     raw = (
         b'{"method":"get_status","request_id":"req-1","timestamp":1700000000.0,'
         b'"nonce":"nonce-1","body":{"x": 1e999},"signature":"deadbeef"}'
@@ -184,15 +203,15 @@ def test_overflow_float_never_reaches_verify_as_bare_valueerror():
 # Security detail 3 -- constant-time signature comparison
 # ---------------------------------------------------------------------------
 
-def test_verify_uses_constant_time_compare_digest():
-    source = inspect.getsource(HmacServiceAuthenticator.verify)
-    assert "hmac.compare_digest" in source
+def test_verify_uses_ed25519_verification_not_string_comparison():
+    source = inspect.getsource(ServiceIdentity.verify_request)
+    assert "verify_bytes(" in source
     assert "signature ==" not in source
     assert "== request.signature" not in source
 
 
 def test_wrong_signature_same_length_is_rejected():
-    auth = HmacServiceAuthenticator(KEY, now=lambda: FIXED_NOW)
+    auth = _Auth(now=lambda: FIXED_NOW)
     request = auth.sign("get_status", "req-2", "nonce-2", {})
     wrong_same_length = request.model_copy(update={"signature": "0" * len(request.signature)})
     with pytest.raises(AuthenticationError):
@@ -215,45 +234,30 @@ def test_signature_binds_every_signed_field(field, new_value):
     # Guards against a future edit dropping a field from signing_bytes: mutate
     # each signed field on a validly-signed request (leaving the original
     # signature intact) and assert verification fails.
-    auth = HmacServiceAuthenticator(KEY, now=lambda: FIXED_NOW)
+    auth = _Auth(now=lambda: FIXED_NOW)
     request = auth.sign("approve_proposal", "req-orig", "nonce-orig", {"proposal_id": 7})
     tampered = request.model_copy(update={field: new_value})
     with pytest.raises(AuthenticationError):
         auth.verify(tampered)
 
 
-def test_error_messages_do_not_leak_key_or_expected_digest():
-    # Secret hygiene: neither the HMAC key bytes nor the expected digest may
-    # appear in the exception surfaced to an unauthenticated caller (that
-    # would hand an attacker either the secret or an oracle for it).
-    auth = HmacServiceAuthenticator(KEY, now=lambda: FIXED_NOW)
+def test_error_messages_do_not_leak_signatures_or_key_material():
+    auth = _Auth(now=lambda: FIXED_NOW)
     request = auth.sign("get_status", "req-hygiene", "nonce-hygiene", {"a": 1})
-    key_hex = KEY.hex()
-
-    # Signature-mismatch path. verify() internally computes the digest of the
-    # SUBMITTED (forged) request -- that is the exploitable value to guard:
-    # leaking it is a signing oracle (a valid signature for the forged
-    # request). Assert THAT digest is absent, not the original request's.
     forged = request.model_copy(update={"body": {"a": 999}})
-    forged_digest = _digest(KEY, forged)
     with pytest.raises(AuthenticationError) as sig_exc:
         auth.verify(forged)
     sig_text = str(sig_exc.value)
-    assert forged_digest not in sig_text
-    assert key_hex not in sig_text
-    assert KEY.decode() not in sig_text
+    assert request.signature not in sig_text
+    assert "PRIVATE" not in sig_text
 
-    # Clock-skew path (does not even compute the digest, but assert anyway).
     clock = MutableClock(FIXED_NOW)
-    skew_auth = HmacServiceAuthenticator(KEY, now=clock)
+    skew_auth = _Auth(now=clock)
     skew_request = skew_auth.sign("get_status", "req-skew", "nonce-skew", {})
     clock.t = FIXED_NOW + DEFAULT_CLOCK_SKEW_SECONDS + 5
     with pytest.raises(AuthenticationError) as skew_exc:
         skew_auth.verify(skew_request)
-    skew_text = str(skew_exc.value)
-    assert _digest(KEY, skew_request) not in skew_text
-    assert key_hex not in skew_text
-    assert KEY.decode() not in skew_text
+    assert skew_request.signature not in str(skew_exc.value)
 
 
 # ---------------------------------------------------------------------------
@@ -261,7 +265,7 @@ def test_error_messages_do_not_leak_key_or_expected_digest():
 # ---------------------------------------------------------------------------
 
 def test_bad_signature_does_not_burn_the_nonce():
-    auth = HmacServiceAuthenticator(KEY, now=lambda: FIXED_NOW)
+    auth = _Auth(now=lambda: FIXED_NOW)
     request = auth.sign("get_status", "req-3", "nonce-3", {"a": 1})
     forged = request.model_copy(update={"body": {"a": 999}})
     with pytest.raises(AuthenticationError):
@@ -273,7 +277,7 @@ def test_bad_signature_does_not_burn_the_nonce():
 
 def test_bad_skew_does_not_burn_the_nonce():
     clock = MutableClock(FIXED_NOW)
-    auth = HmacServiceAuthenticator(KEY, now=clock)
+    auth = _Auth(now=clock)
     request = auth.sign("get_status", "req-4", "nonce-4", {})
     clock.t = FIXED_NOW + DEFAULT_CLOCK_SKEW_SECONDS + 1  # push past the allowed skew
     with pytest.raises(AuthenticationError):
@@ -288,7 +292,7 @@ def test_bad_skew_does_not_burn_the_nonce():
 
 def test_timestamp_too_old_is_rejected():
     clock = MutableClock(FIXED_NOW)
-    auth = HmacServiceAuthenticator(KEY, now=clock)
+    auth = _Auth(now=clock)
     request = auth.sign("get_status", "req-5", "nonce-5", {})
     clock.t = FIXED_NOW + DEFAULT_CLOCK_SKEW_SECONDS + 1
     with pytest.raises(AuthenticationError):
@@ -300,8 +304,8 @@ def test_timestamp_too_far_in_the_future_is_rejected():
     # genuinely valid signature, but the claimed timestamp itself is outside
     # the verifier's allowed window. Proves both directions are checked, not
     # just "too old".
-    signer = HmacServiceAuthenticator(KEY, now=lambda: FIXED_NOW + DEFAULT_CLOCK_SKEW_SECONDS + 1)
-    verifier = HmacServiceAuthenticator(KEY, now=lambda: FIXED_NOW)
+    signer = _Auth(now=lambda: FIXED_NOW + DEFAULT_CLOCK_SKEW_SECONDS + 1)
+    verifier = _Auth(now=lambda: FIXED_NOW)
     request = signer.sign("get_status", "req-6", "nonce-6", {})
     with pytest.raises(AuthenticationError):
         verifier.verify(request)
@@ -309,7 +313,7 @@ def test_timestamp_too_far_in_the_future_is_rejected():
 
 def test_timestamp_exactly_at_skew_boundary_is_accepted():
     clock = MutableClock(FIXED_NOW)
-    auth = HmacServiceAuthenticator(KEY, now=clock)
+    auth = _Auth(now=clock)
     request = auth.sign("get_status", "req-7", "nonce-7", {})
     clock.t = FIXED_NOW + DEFAULT_CLOCK_SKEW_SECONDS  # exactly on the boundary
     auth.verify(request)  # must not raise
@@ -332,7 +336,7 @@ def test_no_replay_gap_across_the_full_skew_window():
     # nonce must still be remembered, or a valid-looking replay would slip
     # through. Verifies verify() -> claim leaves NO gap.
     clock = MutableClock(0.0)
-    auth = HmacServiceAuthenticator(KEY, now=clock)
+    auth = _Auth(now=clock)
 
     # The request's timestamp is fixed at T. A verifier accepts it for the
     # whole window now in [T-30, T+30]. Worst case for a replay gap: the
@@ -401,7 +405,7 @@ def test_request_at_the_size_limit_is_not_rejected_for_size():
     # A small envelope must clear the size gate cleanly (it may still fail
     # shape/signature checks for other reasons -- this only proves the size
     # check itself isn't over-eager).
-    auth = HmacServiceAuthenticator(KEY, now=lambda: FIXED_NOW)
+    auth = _Auth(now=lambda: FIXED_NOW)
     request = auth.sign("get_status", "req-9", "nonce-9", {"a": 1})
     raw = canonical_json(request.model_dump())
     assert len(raw) < MAX_REQUEST_BYTES
@@ -458,17 +462,11 @@ def test_unknown_field_in_raw_json_is_rejected_via_decode_request():
 
 def test_typed_rpc_response_and_rpc_problem_forbid_extra_fields():
     problem = RpcProblem(code="METHOD_NOT_ALLOWED", message="nope")
-    response = TypedRpcResponse(request_id="req-14", ok=False, problem=problem)
+    response = TypedRpcResponse(request_id="req-14", ok=False, problem=problem,
+                                server="trader", request_digest="d")
     assert response.ok is False
     assert response.problem.code == "METHOD_NOT_ALLOWED"
     with pytest.raises(ValidationError):
         RpcProblem(code="X", message="Y", unexpected="z")
-
-
-# ---------------------------------------------------------------------------
-# HMAC key hardening
-# ---------------------------------------------------------------------------
-
-def test_short_hmac_key_is_rejected():
-    with pytest.raises(ValueError):
-        HmacServiceAuthenticator(b"too-short-key")
+    with pytest.raises(ValidationError):
+        TypedRpcResponse(request_id="r", ok=True, server="trader")

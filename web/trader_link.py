@@ -2,7 +2,7 @@
 
 One ``TraderLink`` == one typed-RPC socket (a role at a ``tcp://host:port``
 endpoint). It owns the plumbing the dashboard's typed clients used to each
-re-implement: endpoint parsing, HMAC-authenticator construction, lazy client
+re-implement: endpoint parsing, dashboard-identity construction, lazy client
 build, reconnect after a transport failure, and serialization under a
 per-socket lock.
 
@@ -18,7 +18,7 @@ Two kinds of caller:
   (``DashboardCommandGateway``, ``ManageRpcClient``).
 - Callers that manage their own reconnect at a higher layer (the event
   bridge's cursor-resnapshot loop) reuse just the construction primitives
-  ``parse_endpoint`` / ``build_authenticator`` / ``connect_client`` below.
+  ``parse_endpoint`` / ``build_identity`` / ``connect_client`` below.
 
 ``TraderLink`` never calls ``connect()`` itself — the ``client_factory`` it is
 given must return a ready-to-use client. ``connect_client`` (the default
@@ -32,18 +32,11 @@ import threading
 from typing import Any, Callable, Mapping, Optional
 from urllib.parse import urlparse
 
-from trader.messaging.typed_rpc import (
-    HmacServiceAuthenticator,
-    TypedRpcClient,
-    load_service_hmac_key,
-)
+from trader.messaging.typed_rpc import ServiceIdentity, TypedRpcClient
 
 logger = logging.getLogger("web.trader_link")
 
-# The default service-HMAC key path when the env var is unset. Matches the
-# value ManageRpcClient used; the command gateway/bridge require the env var to
-# be set explicitly (an empty path makes load_service_hmac_key fail loudly).
-_DEFAULT_HMAC_KEY_PATH = "~/.config/mmr/service_hmac.key"
+DASHBOARD_PRINCIPAL = "dashboard"
 
 
 # ── construction primitives (shared by TraderLink and the event bridge) ──────
@@ -57,37 +50,28 @@ def parse_endpoint(endpoint: str) -> tuple[str, int]:
     return f"tcp://{parsed.hostname}", parsed.port
 
 
-def build_authenticator(
-    env: Mapping[str, str] = os.environ,
-    *,
-    default_key_path: str | None = None,
-) -> HmacServiceAuthenticator:
-    """Build the shared-secret HMAC authenticator the typed clients sign with.
+def build_identity(env: Mapping[str, str] = os.environ) -> ServiceIdentity:
+    """Load the dashboard's Ed25519 identity (own key + trader/strategy public keys).
 
-    Reads the service-HMAC key file from ``MMR_SERVICE_HMAC_KEY_FILE`` and
-    validates it via ``load_service_hmac_key`` (missing path, wrong permission
-    bits, empty, or too-short key all fail loudly) — the dashboard fails closed
-    rather than falling back to an ad-hoc key. ``default_key_path`` is used only
-    when the env var is unset; leave it None to require the env var explicitly
-    (the command/feed path), or pass ``_DEFAULT_HMAC_KEY_PATH`` for the manage
-    path's historical default.
+    The keys directory is ``MMR_RPC_KEYS_DIR`` or ``~/.config/mmr/keys/rpc``.
+    A missing or unsafe key fails loudly; there is no fallback key.
     """
-    key_file = (env.get("MMR_SERVICE_HMAC_KEY_FILE") or (default_key_path or "")).strip()
-    return HmacServiceAuthenticator(load_service_hmac_key(key_file))
+    return ServiceIdentity.load(DASHBOARD_PRINCIPAL, env.get("MMR_RPC_KEYS_DIR") or None)
 
 
 def connect_client(
     role: str,
     endpoint: str,
     *,
-    authenticator: HmacServiceAuthenticator | None = None,
+    server: str = "trader",
+    identity: ServiceIdentity | None = None,
     timeout: float = 10.0,
     env: Mapping[str, str] = os.environ,
 ) -> TypedRpcClient:
-    """Build AND connect a ``TypedRpcClient`` for ``role`` at ``endpoint``."""
+    """Build AND connect a ``TypedRpcClient`` for ``role`` at ``endpoint`` on ``server``."""
     address, port = parse_endpoint(endpoint)
     client = TypedRpcClient(
-        role, authenticator or build_authenticator(env),
+        role, identity or build_identity(env), server=server,
         address=address, port=port, timeout=timeout)
     client.connect()
     return client
@@ -117,7 +101,8 @@ class TraderLink:
         role: str | None = None,
         endpoint: str | None = None,
         *,
-        authenticator: HmacServiceAuthenticator | None = None,
+        server: str = "trader",
+        identity: ServiceIdentity | None = None,
         timeout: float = 10.0,
         env: Mapping[str, str] = os.environ,
         client_factory: Callable[[], TypedRpcClient] | None = None,
@@ -126,7 +111,8 @@ class TraderLink:
             raise ValueError("TraderLink needs either a client_factory or (role, endpoint)")
         self._role = role
         self._endpoint = endpoint
-        self._authenticator = authenticator
+        self._server = server
+        self._identity = identity
         self._timeout = timeout
         self._env = env
         self._client_factory = client_factory or self._default_factory
@@ -135,7 +121,7 @@ class TraderLink:
 
     def _default_factory(self) -> TypedRpcClient:
         return connect_client(
-            self._role, self._endpoint, authenticator=self._authenticator,
+            self._role, self._endpoint, server=self._server, identity=self._identity,
             timeout=self._timeout, env=self._env)
 
     def call(self, method: str, body: dict[str, Any], *,

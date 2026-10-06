@@ -153,14 +153,11 @@ class ProductionPaperHotArmPorts:
     def _ensure_strategy_clients(self) -> tuple[Any, Any]:
         if self._command_client is not None and self._query_client is not None:
             return self._command_client, self._query_client
-        from trader.messaging.typed_rpc import (
-            HmacServiceAuthenticator,
-            TypedRpcClient,
-            load_service_hmac_key,
-        )
+        from trader.messaging.typed_rpc import TypedRpcClient
 
-        key_file = getattr(self._trader, "service_hmac_key_file", "") or ""
-        auth = HmacServiceAuthenticator(load_service_hmac_key(key_file))
+        identity = getattr(self._trader, "rpc_identity", None)
+        if identity is None:
+            raise RuntimeError("trader RPC identity is not loaded; cannot reach the strategy service")
         address = (
             getattr(self._trader, "strategy_typed_address", None)
             or "tcp://127.0.0.1"
@@ -170,10 +167,10 @@ class ProductionPaperHotArmPorts:
         cmd_port = int(getattr(self._trader, "strategy_typed_command_port", 42104))
         qry_port = int(getattr(self._trader, "strategy_typed_query_port", 42105))
         self._command_client = TypedRpcClient(
-            "command", auth, address=address, port=cmd_port, timeout=30.0,
+            "command", identity, server="strategy", address=address, port=cmd_port, timeout=30.0,
         )
         self._query_client = TypedRpcClient(
-            "query", auth, address=address, port=qry_port, timeout=30.0,
+            "query", identity, server="strategy", address=address, port=qry_port, timeout=30.0,
         )
         self._command_client.connect()
         self._query_client.connect()

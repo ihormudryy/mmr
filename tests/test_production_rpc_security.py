@@ -8,7 +8,7 @@ details called out in the outer task instructions:
   "query", since the production registry must never expose them at all)
 - ``validate_rpc_mode`` fails closed for every combination, not just the one
   verbatim case (both "safe" combinations must NOT raise)
-- ``build_production_registry`` type-checks its ``authenticator`` argument
+- ``build_production_registry`` type-checks its ``identity`` argument
 - the production registry actually carries the intended health/read methods
   (a registry with zero legacy methods AND zero real methods would trivially
   pass the negative tests without being useful)
@@ -32,13 +32,14 @@ import time
 from collections import namedtuple
 
 import pytest
+
+from tests.rpc_identity_fixtures import make_identities
 import zmq
 
 from trader.messaging.legacy_offline_api import LegacyOfflineTraderServiceApi
 from trader.messaging.production_api import build_production_registry, validate_rpc_mode
 from trader.messaging.trader_service_api import TraderServiceApi
 from trader.messaging.typed_rpc import (
-    HmacServiceAuthenticator,
     TypedRpcClient,
     TypedRpcRegistry,
     TypedRpcRemoteError,
@@ -47,7 +48,6 @@ from trader.messaging.typed_rpc import (
 from trader.trading.risk_gate import RiskLimits
 
 
-HMAC_KEY = b"k" * 32
 
 BYPASS_METHODS = [
     "place_order_simple",
@@ -104,8 +104,13 @@ class _FakeTrader:
 
 
 @pytest.fixture()
-def authenticator() -> HmacServiceAuthenticator:
-    return HmacServiceAuthenticator(HMAC_KEY, now=lambda: 1_700_000_000.0)
+def identities():
+    return make_identities()
+
+
+@pytest.fixture
+def authenticator(identities):
+    return identities["trader"]
 
 
 @pytest.fixture()
@@ -168,12 +173,14 @@ def test_production_registry_resolve_is_none_for_bypass_methods(method, producti
 
 
 # ---------------------------------------------------------------------------
-# build_production_registry type-checks its authenticator argument
+# build_production_registry type-checks its identity argument
 # ---------------------------------------------------------------------------
 
-def test_build_production_registry_rejects_non_authenticator():
-    with pytest.raises(TypeError, match="HmacServiceAuthenticator"):
-        build_production_registry(_FakeTrader(), authenticator="not-a-real-authenticator")
+def test_build_production_registry_rejects_a_non_trader_identity(identities):
+    with pytest.raises(TypeError, match="trader ServiceIdentity"):
+        build_production_registry(_FakeTrader(), "not-an-identity")
+    with pytest.raises(TypeError, match="trader ServiceIdentity"):
+        build_production_registry(_FakeTrader(), identities["strategy"])
 
 
 # ---------------------------------------------------------------------------
@@ -287,7 +294,7 @@ class TestApiClassSplit:
 # ---------------------------------------------------------------------------
 
 class TestProductionRegistryOverRealTransport:
-    def test_query_client_can_call_get_status_and_command_socket_has_nothing(self, authenticator):
+    def test_query_client_can_call_get_status_and_command_socket_has_nothing(self, authenticator, identities):
         query_port = _free_port()
         command_port = _free_port()
 
@@ -315,9 +322,9 @@ class TestProductionRegistryOverRealTransport:
         assert loop_ready.wait(timeout=5), "typed servers did not start in time"
         time.sleep(0.1)  # let the bind settle
 
-        query_client = TypedRpcClient("query", authenticator, port=query_port, timeout=3)
+        query_client = TypedRpcClient("query", identities["cli"], server="trader", port=query_port, timeout=3)
         query_client.connect()
-        command_client = TypedRpcClient("command", authenticator, port=command_port, timeout=3)
+        command_client = TypedRpcClient("command", identities["cli"], server="trader", port=command_port, timeout=3)
         command_client.connect()
 
         try:

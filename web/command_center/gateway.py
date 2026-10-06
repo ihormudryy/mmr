@@ -25,7 +25,7 @@ from typing import Any, Callable, Mapping
 
 from trader.domain.commands import CommandReceipt
 from trader.messaging.typed_rpc import TypedRpcClient, TypedRpcRemoteError
-from web.trader_link import TraderLink, TraderLinkError, build_authenticator, connect_client
+from web.trader_link import TraderLink, TraderLinkError, build_identity, connect_client
 
 logger = logging.getLogger("web.command_center.gateway")
 
@@ -175,14 +175,12 @@ def build_command_gateway(env: Mapping[str, str] = os.environ) -> DashboardComma
     Mirrors the conventions ``web/command_center/__init__.py`` already
     established for the query/feed clients: a single ``tcp://host:port``
     endpoint string (here ``MMR_TYPED_COMMAND_ENDPOINT``, default
-    ``tcp://127.0.0.1:42102`` -- the trader command socket) and the shared
-    service HMAC key file (``MMR_SERVICE_HMAC_KEY_FILE``) loaded via
-    ``load_service_hmac_key``, which fails loudly (missing path, wrong
-    permission bits, empty, or too-short key) rather than an unchecked raw
-    file read -- consistent with this module's "fail loudly, not silently"
-    posture for anything on the trading-authorization path.
+    ``tcp://127.0.0.1:42102`` -- the trader command socket) and the
+    dashboard's Ed25519 identity (``build_identity``), which fails loudly on a
+    missing or unsafe key -- consistent with this module's "fail loudly, not
+    silently" posture for anything on the trading-authorization path.
 
-    The key file is loaded and validated ONCE, here, not inside the per-
+    The key files are loaded and validated ONCE, here, not inside the per-
     reconnect client factory below -- ``DashboardCommandGateway`` rebuilds its
     client after every timeout/connection-error reset, and re-reading +
     re-validating the key file on every one of those would be both wasteful
@@ -194,10 +192,10 @@ def build_command_gateway(env: Mapping[str, str] = os.environ) -> DashboardComma
     # Load + validate the key file ONCE here (not per reconnect): TraderLink
     # rebuilds the client after every timeout/connection reset, and re-reading
     # a value that can't change mid-process would be wasteful.
-    authenticator = build_authenticator(env)
+    identity = build_identity(env)
 
     def _factory() -> TypedRpcClient:
         return connect_client(
-            "command", endpoint, authenticator=authenticator, timeout=timeout_s)
+            "command", endpoint, server="trader", identity=identity, timeout=timeout_s)
 
     return DashboardCommandGateway(client_factory=_factory, timeout_s=timeout_s)

@@ -26,12 +26,11 @@ from trader.messaging.manage_contracts import (
     ReloadStrategiesRequest,
 )
 from trader.messaging.typed_rpc import (
-    HmacServiceAuthenticator,
+    ServiceIdentity,
     TypedRpcClient,
     TypedRpcRegistry,
     TypedRpcServer,
     _DispatchProblem,
-    load_service_hmac_key,
 )
 from trader.objects import Action, BarSize, WhatToShow
 from trader.data.event_store import EventStore, EventType, TradingEvent
@@ -414,7 +413,7 @@ class StrategyRuntime():
         typed_command_port: int = 42102,
         typed_query_port: int = 42101,
         trader_typed_address: str = '',
-        service_hmac_key_file: str = '',
+        rpc_keys_dir: str = '',
         ib_account: str = '',
         # [P3 Task 2 / Task 9] Artifact verification + one-strategy intent emission
         automation_enabled: bool = False,
@@ -443,11 +442,10 @@ class StrategyRuntime():
         self.zmq_messagebus_server_address = zmq_messagebus_server_address
         self.zmq_messagebus_server_port = zmq_messagebus_server_port
 
-        # [M1-F3] Task 7: typed, HMAC-authenticated command/query sockets --
-        # reuses the SAME typed_bind_address/service_hmac_key_file config
-        # keys the trader's own typed sockets use (shared HMAC secret is
-        # what lets the two sides authenticate each other); only the ports
-        # are new.
+        # [M1-F3] Task 7: typed, Ed25519-authenticated command/query sockets
+        # -- reuses the SAME typed_bind_address config key the trader's own
+        # typed sockets use; only the ports are new. The strategy service
+        # signs as its own principal (`strategy`) with its own key.
         self.typed_bind_address = typed_bind_address
         self.strategy_typed_command_port = strategy_typed_command_port
         self.strategy_typed_query_port = strategy_typed_query_port
@@ -467,7 +465,7 @@ class StrategyRuntime():
         # connecting outbound to it silently targets the wrong host, so the
         # compose file sets TRADER_TYPED_ADDRESS=tcp://trader explicitly.
         self.trader_typed_address = trader_typed_address or typed_bind_address
-        self.service_hmac_key_file = service_hmac_key_file
+        self.rpc_keys_dir = rpc_keys_dir
         # [M1-F3] Task 8: the account SignalProposer reads the pause gate
         # for (get_trading_control has no account_id in its request body --
         # the SERVER derives it from ITS OWN configured account -- but the
@@ -585,26 +583,25 @@ class StrategyRuntime():
             self._revisions = StrategyRevisionStore(DuckDBConnection.get_instance(self.duckdb_path))
             self._revisions.migrate()
 
-            # Typed, HMAC-authenticated command/query sockets (42104/42105 by
+            # Typed, Ed25519-authenticated command/query sockets (42104/42105 by
             # default) -- the strategy-service side of the coordinator's
             # one-way forwarding boundary. Every handler registered here is
             # fully self-contained (apply locally via
             # apply_control_command, which itself commits the receipt +
             # revision bump + outbox row in ONE transaction) and NEVER calls
             # back into the trader while handling a request.
-            hmac_key = load_service_hmac_key(self.service_hmac_key_file)
-            self._typed_authenticator = HmacServiceAuthenticator(hmac_key)
+            self._rpc_identity = ServiceIdentity.load("strategy", self.rpc_keys_dir or None)
             self._typed_command_registry = TypedRpcRegistry()
             self._typed_query_registry = TypedRpcRegistry()
             register_strategy_control_authority(
                 self._typed_command_registry, self._typed_query_registry, self,
             )
             self.typed_command_server = TypedRpcServer(
-                'command', self._typed_command_registry, self._typed_authenticator,
+                'command', self._typed_command_registry, self._rpc_identity,
                 address=self.typed_bind_address, port=self.strategy_typed_command_port,
             )
             self.typed_query_server = TypedRpcServer(
-                'query', self._typed_query_registry, self._typed_authenticator,
+                'query', self._typed_query_registry, self._rpc_identity,
                 address=self.typed_bind_address, port=self.strategy_typed_query_port,
             )
             # Outbound-only client toward the TRADER's own typed command
@@ -614,16 +611,16 @@ class StrategyRuntime():
             # docstring), AND [M1-F3] Task 8's signal→proposal bridge
             # (SignalProposer's create_proposal calls, below).
             self._trader_command_client = TypedRpcClient(
-                'command', self._typed_authenticator,
+                'command', self._rpc_identity, server='trader',
                 address=self.trader_typed_address, port=self.typed_command_port,
             )
             # Outbound-only client toward the TRADER's own typed QUERY
             # socket -- used by SignalProposer to read the pause gate
             # (get_trading_control) and executed bridge entries
-            # (list_proposals). Same host/HMAC secret as the command client
+            # (list_proposals). Same host and identity as the command client
             # above; only the port differs.
             self._trader_query_client = TypedRpcClient(
-                'query', self._typed_authenticator,
+                'query', self._rpc_identity, server='trader',
                 address=self.trader_typed_address, port=self.typed_query_port,
             )
             # Instrument resolution + market-data publication over that same

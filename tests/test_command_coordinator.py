@@ -5,6 +5,8 @@ import datetime as dt
 from types import SimpleNamespace
 
 import pytest
+
+from tests.rpc_identity_fixtures import make_identities
 from pydantic import ValidationError
 
 from trader.data.domain_journal import DomainJournal
@@ -12,7 +14,6 @@ from trader.data.duckdb_store import DuckDBConnection
 from trader.data.proposal_repository import ProposalRepository, apply_proposal_authority_migration
 from trader.data.schema_migrations import SchemaMigrator
 from trader.messaging.production_api import RejectProposalRequest, build_production_registry
-from trader.messaging.typed_rpc import HmacServiceAuthenticator
 from trader.trading.command_coordinator import (
     ApprovalCommandService,
     BrokerRejectedError,
@@ -343,7 +344,7 @@ def authority(tmp_path):
 
 @pytest.fixture
 def production_registry(authority):
-    authenticator = HmacServiceAuthenticator(b"k" * 32, now=lambda: 1_700_000_000.0)
+    authenticator = make_identities()["trader"]
     return build_production_registry(
         _FakeTrader(), authenticator,
         command_coordinator=authority.coordinator,

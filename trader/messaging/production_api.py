@@ -2,7 +2,7 @@
 exposes (G0 Task 4).
 
 Tasks 2/3 built the authenticated typed transport (``TypedRpcRegistry``,
-``TypedRpcServer``, ``HmacServiceAuthenticator``) but nothing had registered
+``TypedRpcServer``, ``ServiceIdentity``) but nothing had registered
 any methods on it yet. Its legacy sibling — the dill/msgpack ``RPCServer``
 in ``clientserver.py`` serving ``trader_service_api.TraderServiceApi`` (and,
 before this task, its direct-order methods) — is a production
@@ -104,7 +104,7 @@ from trader.messaging.strategy_trader_contracts import (
 from trader.messaging.manage_surface import register_manage_surface
 from trader.messaging.trader_service_api import TraderServiceApi
 from trader.messaging.typed_rpc import (
-    HmacServiceAuthenticator,
+    ServiceIdentity,
     TypedRpcClient,
     TypedRpcRegistry,
     TypedRpcRemoteError,
@@ -2066,7 +2066,7 @@ class TypedStrategyControlPort:
 
 def build_production_registry(
     trader,
-    authenticator: HmacServiceAuthenticator,
+    identity: ServiceIdentity,
     *,
     snapshot_service: Optional[DomainSnapshotService] = None,
     feed_service: Optional[DomainFeedService] = None,
@@ -2081,14 +2081,11 @@ def build_production_registry(
 ) -> TypedRpcRegistry:
     """Build the typed-RPC registry a production ``trader_service`` serves.
 
-    ``authenticator`` isn't consulted by the handlers below (the typed
-    transport already authenticates every request before a handler ever
-    runs) — it's required here, and type-checked, so a caller can't
-    accidentally wire this up with something that isn't a real
-    ``HmacServiceAuthenticator`` and only discover it once the first request
-    fails to verify. It also keeps this function's signature stable for
-    ``[M1-F3]``, which will need the authenticator when it adds
-    coordinator-authorized command methods.
+    ``identity`` isn't consulted by the handlers below (the typed transport
+    already authenticates every request before a handler ever runs) — it's
+    required here, and type-checked, so a caller can't wire this up with
+    anything but the trader's own ``ServiceIdentity`` and only discover it
+    once the first request fails to verify.
 
     Registers ``query``-role health/read methods, plus (opt-in, see module
     docstring's "[M1-F1] Task 5 addition") ``snapshot_with_cursor`` on
@@ -2128,9 +2125,9 @@ def build_production_registry(
     ``update_strategy_params`` / ``record_state_acknowledged``). Omitted,
     the default, changes nothing.
     """
-    if not isinstance(authenticator, HmacServiceAuthenticator):
+    if not isinstance(identity, ServiceIdentity) or identity.principal != "trader":
         raise TypeError(
-            f'authenticator must be an HmacServiceAuthenticator, got {type(authenticator).__name__}'
+            f'identity must be the trader ServiceIdentity, got {identity!r}'
         )
 
     # Every production handler may touch DuckDB, IB state, or another service.

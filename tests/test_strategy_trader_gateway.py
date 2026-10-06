@@ -26,8 +26,9 @@ from types import SimpleNamespace
 
 import pytest
 
+from tests.rpc_identity_fixtures import make_identities
+
 from trader.messaging.typed_rpc import (
-    HmacServiceAuthenticator,
     TypedRpcClient,
     TypedRpcRegistry,
     TypedRpcRemoteError,
@@ -46,7 +47,6 @@ from trader.messaging.production_api import (
 from trader.strategy.trader_gateway import StrategyInstrument, StrategyTraderGateway
 
 
-HMAC_KEY = b"k" * 32
 
 
 def _fake_secdef(conId=265598, symbol="AMD"):
@@ -153,9 +153,9 @@ def _free_port() -> int:
 def _serve_query(registry):
     """Serve ``registry`` on a fresh query socket in a background loop and
     yield a connected query-role client."""
-    authenticator = HmacServiceAuthenticator(HMAC_KEY, now=time.time)
+    ids = make_identities(now=time.time)
     port = _free_port()
-    server = TypedRpcServer("query", registry, authenticator, port=port)
+    server = TypedRpcServer("query", registry, ids["trader"], port=port)
 
     ready = threading.Event()
     state = {}
@@ -182,7 +182,7 @@ def _serve_query(registry):
     time.sleep(0.1)  # let the ROUTER finish binding
 
     client = TypedRpcClient(
-        "query", HmacServiceAuthenticator(HMAC_KEY, now=time.time), port=port, timeout=3.0)
+        "query", ids["strategy"], server="trader", port=port, timeout=3.0)
     client.connect()
     try:
         yield client

@@ -1667,13 +1667,13 @@ def create_app(
     # [M1-C] Task 3 -- the router is installed UNCONDITIONALLY so a disabled
     # deployment still answers `/api/commands/*` with a stable 403
     # `COMMANDS_DISABLED` instead of a bare 404; the gateway itself (and its
-    # HMAC-key/typed-socket requirement) is only constructed when commands
+    # RPC-key/typed-socket requirement) is only constructed when commands
     # are enabled, so a paper-only or read-only deployment never pays that
     # startup cost or needs that credential configured at all.
     #
     # [M1-C] Task 3 fix (I-1): the gateway is NOT built here. Building it
     # eagerly at `create_app()` time (outside any try/except) meant a
-    # bad/missing service HMAC key raised straight out of `create_app()` --
+    # bad/missing RPC key raised straight out of `create_app()` --
     # taking the whole ASGI boot, and its always-on `/healthz`/`/readyz`
     # probes, down with it. It is now built inside
     # `CommandCenter._start_or_degrade` (see `web/command_center/__init__.py`),

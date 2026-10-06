@@ -19,7 +19,6 @@ task instructions:
   command call (separate instance + lock, proven by actually timing it)
 - response signing: the server signs every reply and the client refuses an
   unsigned/mis-signed one
-- the service HMAC key file's four production hardening checks
 """
 
 from __future__ import annotations
@@ -36,12 +35,9 @@ from pydantic import BaseModel, ConfigDict, ValidationError
 
 from trader.messaging.typed_rpc import (
     MAX_REQUEST_BYTES,
-    MIN_KEY_BYTES,
     AuthenticationError,
-    HmacServiceAuthenticator,
     ReplayError,
     RpcProblem,
-    ServiceHmacKeyError,
     TypedRpcClient,
     TypedRpcRegistry,
     TypedRpcRemoteError,
@@ -49,11 +45,14 @@ from trader.messaging.typed_rpc import (
     TypedRpcServer,
     VALID_SOCKET_ROLES,
     canonical_json,
-    load_service_hmac_key,
+    request_digest,
 )
+from tests.rpc_identity_fixtures import make_identities
 
 
-HMAC_KEY = b"k" * 32
+def _sign(identity, method, request_id, nonce, body, role="query"):
+    return identity.sign_request(server="trader", role=role, method=method,
+                                 request_id=request_id, nonce=nonce, body=body)
 
 
 def _free_port() -> int:
@@ -131,17 +130,22 @@ def _build_registry() -> TypedRpcRegistry:
 # ---------------------------------------------------------------------------
 
 @pytest.fixture
-def server_authenticator():
-    return HmacServiceAuthenticator(HMAC_KEY, now=time.time)
+def ids():
+    return make_identities(now=time.time)
 
 
 @pytest.fixture
-def client_authenticator():
+def server_authenticator(ids):
+    return ids["trader"]
+
+
+@pytest.fixture
+def client_authenticator(ids):
     # A SEPARATE authenticator instance from the server's, constructed from
     # the same shared secret -- mirrors the real deployment (client and
     # server are different processes) rather than accidentally passing
     # because they share one Python object's state.
-    return HmacServiceAuthenticator(HMAC_KEY, now=time.time)
+    return ids["cli"]
 
 
 @pytest.fixture
@@ -199,7 +203,7 @@ def typed_servers(server_authenticator):
 
 
 def _make_client(role: str, ports: dict, authenticator, timeout: float = 3.0) -> TypedRpcClient:
-    client = TypedRpcClient(role, authenticator, port=ports[role], timeout=timeout)
+    client = TypedRpcClient(role, authenticator, server="trader", port=ports[role], timeout=timeout)
     client.connect()
     return client
 
@@ -356,7 +360,7 @@ def test_replayed_request_is_rejected_over_the_wire(typed_servers, client_authen
     sock = ctx.socket(zmq.DEALER)
     sock.connect(f"tcp://127.0.0.1:{ports['query']}")
 
-    request = client_authenticator.sign("get_status", "replay-req-1", "replay-nonce-1", {})
+    request = _sign(client_authenticator, "get_status", "replay-req-1", "replay-nonce-1", {})
     raw = canonical_json(request.model_dump(mode="json"))
 
     sock.send(raw)
@@ -377,17 +381,18 @@ def test_replayed_request_is_rejected_over_the_wire(typed_servers, client_authen
 # genuinely signed by the server and verifiable by an independent client key
 # ---------------------------------------------------------------------------
 
-def test_wire_format_is_plain_json_and_response_is_signed(typed_servers):
+def test_wire_format_is_plain_json_and_response_is_signed(typed_servers, client_authenticator):
     ports = typed_servers["ports"]
     ctx = zmq.Context()
     sock = ctx.socket(zmq.DEALER)
     sock.connect(f"tcp://127.0.0.1:{ports['query']}")
 
-    auth = HmacServiceAuthenticator(HMAC_KEY, now=time.time)
-    request = auth.sign("get_status", "raw-req-1", "raw-nonce-1", {})
+    auth = client_authenticator
+    request = _sign(auth, "get_status", "raw-req-1", "raw-nonce-1", {})
     # Hand-build the wire bytes exactly as json.dumps would, proving the
     # request side is plain JSON too (no msgpack framing).
-    sock.send(json.dumps(request.model_dump(mode="json")).encode("utf-8"))
+    sent = json.dumps(request.model_dump(mode="json")).encode("utf-8")
+    sock.send(sent)
 
     frames = sock.recv_multipart()
     # json.loads must succeed directly on the raw frame -- this IS the proof
@@ -399,51 +404,51 @@ def test_wire_format_is_plain_json_and_response_is_signed(typed_servers):
 
     response = TypedRpcResponse.model_validate(payload)
     assert response.signature  # server actually signed it
-    auth.verify_response(response)  # must not raise: signed with the same shared key
+    assert response.server == "trader" and response.request_digest == request_digest(sent)
+    auth.verify_response(response, server="trader", request_digest=request_digest(sent))
 
     # Tampering with the body after the fact must invalidate the signature.
     tampered = response.model_copy(update={"body": {"ok": False}})
     with pytest.raises(AuthenticationError):
-        auth.verify_response(tampered)
+        auth.verify_response(tampered, server="trader", request_digest=request_digest(sent))
 
     sock.close(linger=0)
     ctx.term()
 
 
-def test_bad_request_signature_over_the_wire_yields_authentication_error(typed_servers):
+def test_bad_request_signature_over_the_wire_yields_authentication_error(typed_servers, client_authenticator):
     ports = typed_servers["ports"]
     ctx = zmq.Context()
     sock = ctx.socket(zmq.DEALER)
     sock.connect(f"tcp://127.0.0.1:{ports['query']}")
 
-    auth = HmacServiceAuthenticator(HMAC_KEY, now=time.time)
-    request = auth.sign("get_status", "raw-req-2", "raw-nonce-2", {})
+    auth = client_authenticator
+    request = _sign(auth, "get_status", "raw-req-2", "raw-nonce-2", {})
     forged = request.model_copy(update={"signature": "0" * len(request.signature)})
-    sock.send(json.dumps(forged.model_dump(mode="json")).encode("utf-8"))
+    sent = json.dumps(forged.model_dump(mode="json")).encode("utf-8")
+    sock.send(sent)
 
     payload = json.loads(sock.recv_multipart()[-1])
     assert payload["ok"] is False
     assert payload["problem"]["code"] == "AUTHENTICATION_ERROR"
     # Even the error response is properly signed by the server's real key.
     response = TypedRpcResponse.model_validate(payload)
-    auth.verify_response(response)
+    auth.verify_response(response, server="trader", request_digest=request_digest(sent))
 
     sock.close(linger=0)
     ctx.term()
 
 
-def test_client_rejects_a_response_signed_with_the_wrong_key(typed_servers):
+def test_client_rejects_a_response_signed_with_the_wrong_key(typed_servers, client_authenticator):
     ports = typed_servers["ports"]
     right_key_client = TypedRpcClient(
-        "query", HmacServiceAuthenticator(HMAC_KEY, now=time.time),
+        "query", client_authenticator, server="trader",
         port=ports["query"], timeout=2.0,
     )
     right_key_client.connect()
-    # Swap in an authenticator with a DIFFERENT key purely for verify_response
-    # -- simulates a misconfigured/compromised peer whose replies don't carry
-    # a signature this client can trust, even though the request went through
-    # fine (the server used the real key to authenticate + sign).
-    right_key_client.authenticator = HmacServiceAuthenticator(b"x" * 32, now=time.time)
+    # Swap in an identity from a DIFFERENT keyset -- its keyring holds another
+    # trader public key, so the real server's signed reply can't be trusted.
+    right_key_client.identity = make_identities()["cli"]
     with pytest.raises(AuthenticationError):
         right_key_client.call("get_status", {}, dict)
     right_key_client.close()
@@ -453,7 +458,7 @@ def test_client_rejects_a_response_signed_with_the_wrong_key(typed_servers):
 # Non-finite / malformed reply: rejected in-taxonomy AND socket reset
 # ---------------------------------------------------------------------------
 
-def test_non_finite_reply_is_rejected_in_taxonomy_and_socket_is_reset(client_authenticator):
+def test_non_finite_reply_is_rejected_in_taxonomy_and_socket_is_reset(ids, client_authenticator):
     """A forged reply carrying a non-finite number (matching request_id) must
     be rejected via an in-taxonomy AuthenticationError -- NOT a bare
     ValueError from verify_response -> canonical_json -- and the poisoned
@@ -465,7 +470,7 @@ def test_non_finite_reply_is_rejected_in_taxonomy_and_socket_is_reset(client_aut
     poisoned.
     """
     port = _free_port()
-    server_auth = HmacServiceAuthenticator(HMAC_KEY, now=time.time)
+    server_auth = ids["trader"]
     ctx = zmq.Context()
     router = ctx.socket(zmq.ROUTER)
     router.setsockopt(zmq.LINGER, 0)
@@ -491,12 +496,14 @@ def test_non_finite_reply_is_rejected_in_taxonomy_and_socket_is_reset(client_aut
                 # request_id so the client would correlate it as "our" reply.
                 poison = (
                     '{"request_id":"%s","ok":true,"body":{"x":1e999},'
-                    '"problem":null,"signature":"deadbeef"}' % request_id
+                    '"problem":null,"server":"trader","request_digest":"%s",'
+                    '"signature":"deadbeef"}' % (request_id, request_digest(raw))
                 ).encode("utf-8")
                 router.send_multipart([client_id, b"", poison])
             else:
                 resp = server_auth.sign_response(
-                    TypedRpcResponse(request_id=request_id, ok=True, body={"ok": True}))
+                    TypedRpcResponse(request_id=request_id, ok=True, body={"ok": True},
+                                     server="trader", request_digest=request_digest(raw)))
                 router.send_multipart(
                     [client_id, b"", canonical_json(resp.model_dump(mode="json"))])
 
@@ -504,7 +511,7 @@ def test_non_finite_reply_is_rejected_in_taxonomy_and_socket_is_reset(client_aut
     thread.start()
     time.sleep(0.1)
 
-    client = TypedRpcClient("query", client_authenticator, port=port, timeout=2.0)
+    client = TypedRpcClient("query", client_authenticator, server="trader", port=port, timeout=2.0)
     client.connect()
     try:
         with pytest.raises(AuthenticationError):
@@ -556,7 +563,8 @@ class TestTypedSendNeverBlocksForever:
     def _unroutable_client(self, timeout: float) -> TypedRpcClient:
         client = TypedRpcClient(
             'query',
-            HmacServiceAuthenticator(HMAC_KEY, now=time.time),
+            make_identities()["cli"],
+            server='trader',
             port=_free_port(),   # nothing ever binds this port
             timeout=timeout,
         )
@@ -688,69 +696,3 @@ def test_slow_feed_call_does_not_block_concurrent_command_call(feed_client, comm
     # client's lock or socket.
     assert command_elapsed < 0.3
     assert results["feed"] == {"feed": "done"}
-
-
-# ---------------------------------------------------------------------------
-# Service HMAC key file: the four production-hardening checks
-# ---------------------------------------------------------------------------
-
-class TestLoadServiceHmacKey:
-    def test_missing_path_is_rejected(self):
-        with pytest.raises(ServiceHmacKeyError, match="not configured"):
-            load_service_hmac_key("")
-
-    def test_nonexistent_file_is_rejected(self, tmp_path):
-        with pytest.raises(ServiceHmacKeyError, match="not found"):
-            load_service_hmac_key(str(tmp_path / "does-not-exist.key"))
-
-    def test_wrong_permissions_are_rejected(self, tmp_path):
-        key_path = tmp_path / "service_hmac.key"
-        key_path.write_bytes(b"k" * 32)
-        key_path.chmod(0o644)
-        with pytest.raises(ServiceHmacKeyError, match="mode"):
-            load_service_hmac_key(str(key_path))
-
-    def test_empty_file_is_rejected(self, tmp_path):
-        key_path = tmp_path / "service_hmac.key"
-        key_path.write_bytes(b"")
-        key_path.chmod(0o600)
-        with pytest.raises(ServiceHmacKeyError, match="empty"):
-            load_service_hmac_key(str(key_path))
-
-    def test_too_short_key_is_rejected(self, tmp_path):
-        key_path = tmp_path / "service_hmac.key"
-        key_path.write_bytes(b"x" * (MIN_KEY_BYTES - 1))
-        key_path.chmod(0o600)
-        with pytest.raises(ServiceHmacKeyError, match="32"):
-            load_service_hmac_key(str(key_path))
-
-    def test_valid_key_file_loads(self, tmp_path):
-        key_path = tmp_path / "service_hmac.key"
-        key_bytes = b"z" * 40
-        key_path.write_bytes(key_bytes)
-        key_path.chmod(0o600)
-        loaded = load_service_hmac_key(str(key_path))
-        assert loaded == key_bytes
-        # And it's directly usable to construct a real authenticator.
-        HmacServiceAuthenticator(loaded)
-
-    def test_expands_user_home_in_path(self, tmp_path, monkeypatch):
-        key_path = tmp_path / "service_hmac.key"
-        key_bytes = b"w" * 32
-        key_path.write_bytes(key_bytes)
-        key_path.chmod(0o600)
-        monkeypatch.setenv('HOME', str(tmp_path))
-        loaded = load_service_hmac_key('~/service_hmac.key')
-        assert loaded == key_bytes
-
-    def test_does_not_strip_trailing_newline(self, tmp_path):
-        # Deliberately NOT stripped -- see load_service_hmac_key's docstring:
-        # stripping would risk silently truncating real key material that
-        # legitimately ends in 0x0a.
-        key_path = tmp_path / "service_hmac.key"
-        key_bytes = b"y" * 31 + b"\n"  # 32 bytes total, last byte is 0x0a
-        key_path.write_bytes(key_bytes)
-        key_path.chmod(0o600)
-        loaded = load_service_hmac_key(str(key_path))
-        assert loaded == key_bytes
-        assert len(loaded) == 32

@@ -61,7 +61,9 @@ def _make_mmr_with_mock(mock_client) -> MMR:
     mmr._strategy_typed_address = 'tcp://127.0.0.1'
     mmr._strategy_typed_query_port = 42105
     mmr._strategy_typed_command_port = 42104
-    mmr._service_hmac_key_file = None
+    mmr._rpc_principal = 'cli'
+    mmr._rpc_keys_dir = None
+    mmr._rpc_identity = None
     return mmr
 
 

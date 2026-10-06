@@ -76,10 +76,10 @@ zmq_data_rpc_server_port: 42003
 # sockets bind on the private Compose network only -- a later Compose task
 # enforces that they are never host-published (except query/command on
 # host 127.0.0.1, per the plan's loopback-only allowance; feed never is).
-# service_hmac_key_file must point at a real file (mode 0600, non-empty,
-# >= 32 bytes) before production startup -- see
-# trader/messaging/typed_rpc.py:load_service_hmac_key. Left empty here
-# deliberately: there is no safe default secret to ship.
+# Authentication: one Ed25519 key per principal in ~/.config/mmr/keys/rpc/
+# (<principal>.key mode 0600, <principal>.pub), created by `mmr keys init`
+# (Docker: ./docker.sh -k). There is no key setting in this file; the
+# old shared HMAC key is retired.
 # typed_bind_address: the interface the query/command/feed ROUTER sockets
 # BIND to (distinct from host-publishing, which is a Compose concern).
 # Loopback by default -- safe for local/non-Docker. The Compose `trader`
@@ -90,13 +90,12 @@ typed_bind_address: tcp://127.0.0.1
 typed_query_port: 42101
 typed_command_port: 42102
 typed_feed_port: 42103
-service_hmac_key_file: ''
 
 # [M1-F3] Task 7: strategy_service's own typed query/command sockets --
 # the receiving end of the coordinator's one-way strategy-control forwarding
-# (enable_strategy/disable_strategy/update_strategy_params). Bind address and
-# HMAC key are shared with the trader's own typed sockets above (same
-# service_hmac_key_file, same typed_bind_address) -- only the ports differ.
+# (enable_strategy/disable_strategy/update_strategy_params). The bind address
+# is shared with the trader's own typed sockets above; only the ports differ.
+# The strategy service signs as its own principal (keys/rpc/strategy.key).
 strategy_typed_command_port: 42104
 strategy_typed_query_port: 42105
 

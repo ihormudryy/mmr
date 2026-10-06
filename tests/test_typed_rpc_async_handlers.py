@@ -5,16 +5,26 @@ import threading
 
 import pytest
 
+from tests.rpc_identity_fixtures import make_identities
 from trader.messaging.typed_rpc import (
-    HmacServiceAuthenticator,
     TypedRpcRegistry,
     TypedRpcServer,
     canonical_json,
 )
 
 
+class _Ids:
+    """`cli` signs; the trader identity serves."""
+
+    def __init__(self, now=None):
+        ids = make_identities(now=now) if now else make_identities()
+        self.client, self.server = ids["cli"], ids["trader"]
+        self.role = "query"
+
+
 def _raw(auth, method: str, request_id: str):
-    request = auth.sign(method, request_id, f"nonce-{request_id}", {})
+    request = auth.client.sign_request(server="trader", role=auth.role, method=method,
+                                       request_id=request_id, nonce=f"nonce-{request_id}", body={})
     return canonical_json(request.model_dump(mode="json"))
 
 
@@ -42,15 +52,15 @@ def test_registry_rejects_empty_execution_mode_instead_of_using_default():
 @pytest.mark.parametrize("configured", ["0", "-1", "many"])
 def test_server_rejects_invalid_environment_capacity(monkeypatch, configured):
     monkeypatch.setenv("TYPED_RPC_MAX_IN_FLIGHT", configured)
-    auth = HmacServiceAuthenticator(b"k" * 32)
+    auth = _Ids()
 
     with pytest.raises(ValueError, match="positive integer"):
-        TypedRpcServer("query", TypedRpcRegistry(), auth)
+        TypedRpcServer("query", TypedRpcRegistry(), auth.server)
 
 
 @pytest.mark.asyncio
 async def test_thread_handler_does_not_block_second_request():
-    auth = HmacServiceAuthenticator(b"k" * 32, now=lambda: 1_700_000_000.0)
+    auth = _Ids(now=lambda: 1_700_000_000.0)
     started = threading.Event()
     release = threading.Event()
     registry = TypedRpcRegistry()
@@ -62,10 +72,10 @@ async def test_thread_handler_does_not_block_second_request():
 
     registry.register("query", "slow", dict, dict, slow, execution="thread")
     registry.register("query", "quick", dict, dict, lambda _body: {"kind": "quick"})
-    server = TypedRpcServer("query", registry, auth)
+    server = TypedRpcServer("query", registry, auth.server)
     replies = {}
 
-    async def capture(_client_id, request_id, ok, body, problem):
+    async def capture(_client_id, request_id, _digest, ok, body, problem):
         replies[request_id] = (ok, body, problem)
 
     server._reply = capture
@@ -85,7 +95,7 @@ async def test_thread_handler_does_not_block_second_request():
 
 @pytest.mark.asyncio
 async def test_saturated_server_replies_busy_without_invoking_handler():
-    auth = HmacServiceAuthenticator(b"k" * 32, now=lambda: 1_700_000_000.0)
+    auth = _Ids(now=lambda: 1_700_000_000.0)
     started = threading.Event()
     release = threading.Event()
     quick_calls = 0
@@ -103,10 +113,11 @@ async def test_saturated_server_replies_busy_without_invoking_handler():
 
     registry.register("command", "slow", dict, dict, slow)
     registry.register("command", "quick", dict, dict, quick)
-    server = TypedRpcServer("command", registry, auth, max_in_flight=1)
+    auth.role = "command"
+    server = TypedRpcServer("command", registry, auth.server, max_in_flight=1)
     replies = {}
 
-    async def capture(_client_id, request_id, ok, body, problem):
+    async def capture(_client_id, request_id, _digest, ok, body, problem):
         replies[request_id] = (ok, body, problem)
 
     server._reply = capture
@@ -125,7 +136,7 @@ async def test_saturated_server_replies_busy_without_invoking_handler():
 
 @pytest.mark.asyncio
 async def test_aclose_stops_replies_after_bounded_drain():
-    auth = HmacServiceAuthenticator(b"k" * 32, now=lambda: 1_700_000_000.0)
+    auth = _Ids(now=lambda: 1_700_000_000.0)
     started = threading.Event()
     release = threading.Event()
     registry = TypedRpcRegistry(default_execution="thread")
@@ -136,7 +147,8 @@ async def test_aclose_stops_replies_after_bounded_drain():
         return {}
 
     registry.register("command", "slow", dict, dict, slow)
-    server = TypedRpcServer("command", registry, auth)
+    auth.role = "command"
+    server = TypedRpcServer("command", registry, auth.server)
     replies = []
 
     async def capture(*args):
@@ -156,8 +168,8 @@ async def test_aclose_stops_replies_after_bounded_drain():
 
 @pytest.mark.asyncio
 async def test_aclose_waits_for_accept_loop_cancellation():
-    auth = HmacServiceAuthenticator(b"k" * 32)
-    server = TypedRpcServer("query", TypedRpcRegistry(), auth)
+    auth = _Ids()
+    server = TypedRpcServer("query", TypedRpcRegistry(), auth.server)
     accept_task = asyncio.create_task(asyncio.sleep(60))
     server._serve_task = accept_task
 

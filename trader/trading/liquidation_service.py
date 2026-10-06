@@ -68,6 +68,8 @@ _BROKER_TERMINAL = {
 }
 _LEG_KINDS = ("reprotect-stop", "reprotect-target")
 _OPEN_BEFORE_SP1 = "state NOT IN ('FLAT', 'FAILED_SAFE')"
+# Round 10: how long a FLAT / CLOSED root is watched for a late fill of its settled children.
+LATE_FILL_WATCH = dt.timedelta(days=1)
 
 
 def apply_liquidation_migration(migrator: SchemaMigrator) -> None:
@@ -486,6 +488,35 @@ class LiquidationRunStore:
             "AND NOT cleanup_pending ORDER BY updated_at", list(RESCAN_TERMINAL)).fetchall()]
         return cleanup + open_roots
 
+    def open_scopes_in_tx(self, conn) -> list[tuple[str, Optional[int]]]:
+        """(account, conid) of every root that is not finished: open, or terminal with cleanup pending."""
+        markers = ", ".join("?" for _ in RESCAN_TERMINAL)
+        rows = conn.execute(
+            f"SELECT account_id, CASE WHEN scope = 'conid' THEN conid END FROM liquidation_runs "
+            f"WHERE state NOT IN ({markers}) OR cleanup_pending", list(RESCAN_TERMINAL)).fetchall()
+        return [(r[0], None if r[1] is None else int(r[1])) for r in rows]
+
+    def closed_roots_in_tx(self, conn, since: dt.datetime) -> list[LiquidationReceipt]:
+        """FLAT / CLOSED roots that finished since ``since``, with their settled children (round 10)."""
+        rows = conn.execute(
+            f"SELECT {', '.join(_RUN_COLUMNS)} FROM liquidation_runs WHERE state IN ('FLAT', 'CLOSED') "
+            "AND NOT cleanup_pending AND updated_at >= ? ORDER BY updated_at, cause_command_id", [since]).fetchall()
+        markers = ", ".join("?" for _ in _FILL_MAY_GROW)
+        roots = []
+        for run in (_run_from_row(r) for r in rows):
+            children = conn.execute(
+                f"SELECT {', '.join(_CHILD_COLUMNS)} FROM liquidation_children WHERE owner_root_id = ? "
+                f"AND state IN ({markers}) ORDER BY child_id", [run.cause_command_id, *_FILL_MAY_GROW]).fetchall()
+            roots.append(replace(run, children=tuple(_child_from_row(c) for c in children)))
+        return roots
+
+    def late_roots_in_tx(self, conn, root_id: str) -> list[tuple[int, str]]:
+        """(n, state) of every ``{root_id}-late-{n}`` root, oldest first."""
+        prefix = late_root_prefix(root_id)
+        rows = conn.execute("SELECT cause_command_id, state FROM liquidation_runs "
+                            "WHERE starts_with(cause_command_id, ?)", [prefix]).fetchall()
+        return sorted((int(r[0][len(prefix):]), r[1]) for r in rows if r[0][len(prefix):].isdigit())
+
     # -- children ----------------------------------------------------------------
 
     def children_in_tx(self, conn, owner_root_id: str) -> tuple[ChildRef, ...]:
@@ -625,6 +656,11 @@ class LiquidationRunStore:
         return self._db.transaction(read)
 
 
+def late_root_prefix(root_id: str) -> str:
+    """A safety close started by a late fill after ``root_id`` ended is ``{root_id}-late-{n}`` (round 10)."""
+    return f"{root_id}-late-"
+
+
 def _exact_conid(conid) -> int:
     """#21, ruling 51: an exact positive integer conId, or the close is refused before any claim.
 
@@ -642,6 +678,12 @@ def _requested_quantity(quantity) -> Optional[float]:
     if isinstance(quantity, bool) or not isinstance(quantity, numbers.Real) or not math.isfinite(quantity):
         raise LiquidationRefused("PARTIAL_QUANTITY_INVALID", f"quantity must be a finite number, got {quantity!r}")
     return float(quantity)
+
+
+def _covered(open_scopes, child: ChildRef) -> bool:
+    """True when an unfinished root on the child's account reads this child's fills itself."""
+    return any(account == child.account_id and (conid is None or child.conid is None or conid == child.conid)
+               for account, conid in open_scopes)
 
 
 def _reducing_side(quantity: float) -> str:
@@ -790,7 +832,8 @@ class LiquidationService:
             conn, account_id, cause, conid, requested, admitted, deadline, stop_price, target_price))
 
     def rescan(self) -> Optional[LiquidationReceipt]:
-        """Finish pending cleanups, then advance every root that is not terminal."""
+        """Finish pending cleanups, advance every root that is not terminal, then start a
+        new safety close for every late fill after a FLAT / CLOSED root."""
         first: Optional[LiquidationReceipt] = None
         with self._exclusive():
             for root in self._store.transaction(self._store.roots_to_advance_in_tx):
@@ -801,7 +844,60 @@ class LiquidationService:
                     continue
                 if first is None:
                     first = advanced
+            late = self._late_fill_closes()
+        for ended, root_id in late:  # start takes the lock itself
+            try:
+                self._start_late_close(ended, root_id)
+            except Exception:
+                log.exception("liquidation %s: could not start late-fill close %s", ended.cause_command_id, root_id)
         return first
+
+    def _late_fill_closes(self) -> list[tuple[LiquidationReceipt, str]]:
+        """Round 10: a FLAT / CLOSED root is never reopened, but a fill after it must not be ignored.
+
+        Evidence: a settled child of the root (its own order or a leg it
+        inherited) whose broker row or bound executions now report more fill
+        than the journal recorded. A position alone is not evidence: after a
+        close, a new entry is legitimate. Nothing is written here: the new
+        root records the fill through ``_observe_late_fills`` on its first
+        tick, which makes this scan quiet again. A scope that an unfinished
+        root covers is skipped (that root reads the fill itself), and so is
+        an old root whose last late close did not succeed (no second order
+        after an unknown outcome). An unreadable row starts nothing.
+        """
+        since = self._now() - LATE_FILL_WATCH
+        roots, open_scopes = self._store.transaction(
+            lambda conn: (self._store.closed_roots_in_tx(conn, since), self._store.open_scopes_in_tx(conn)))
+        starts = []
+        for root in roots:
+            if not root.children:
+                continue
+            try:
+                grown = [c.child_id for c in root.children if not _covered(open_scopes, c)
+                         for filled in (self._row_fill(c),) if filled is not None and filled > c.filled_quantity]
+            except Exception:
+                log.exception("liquidation %s: late fills unreadable; nothing starts", root.cause_command_id)
+                continue
+            if not grown:
+                continue
+            earlier = self._store.transaction(lambda conn: self._store.late_roots_in_tx(conn, root.cause_command_id))
+            if earlier and earlier[-1][1] not in SUCCESS_STATES:
+                log.error("liquidation %s: late fill on %s, but late close %d ended %s; no new close starts",
+                          root.cause_command_id, grown, earlier[-1][0], earlier[-1][1])
+                continue
+            number = earlier[-1][0] + 1 if earlier else 1
+            log.error("liquidation %s is %s, but %s filled later; starting safety close %d",
+                      root.cause_command_id, root.state, grown, number)
+            starts.append((root, f"{late_root_prefix(root.cause_command_id)}{number}"))
+        return starts
+
+    def _start_late_close(self, ended: LiquidationReceipt, root_id: str) -> None:
+        """A new fenced full close of the ended root's scope, through the exit-owner claim."""
+        deadline = self._now() + dt.timedelta(seconds=self._deadline_seconds)
+        if ended.scope == "account":
+            self.start(ended.account_id, root_id, deadline)
+        else:
+            self.start(ended.account_id, root_id, deadline, scope="conid", conid=ended.conid)
 
     def receipt_for(self, root_id: str) -> Optional[LiquidationReceipt]:
         return self._store.receipt(root_id)

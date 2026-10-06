@@ -658,6 +658,102 @@ def test_a_stop_filled_at_release_next_to_a_live_target_is_a_safety_failure(comp
     assert composed.stack.circuit_breaker.store.get().state == "TRIPPED"
 
 
+def _release_safety_flatten_to_flat(composed):
+    """Round 10 (openai): stop Filled/6, target PendingCancel, broker flat -> SAFETY_FAILED and the
+    flatten; then the target reports Cancelled/0 and the flatten ends FLAT. Returns the target entity."""
+    def stop_closed_the_remainder_target_pending_cancel():
+        composed.sim.set_status(composed.sim.entity_for("p-1-reprotect-stop"), "Filled", filled=6.0)
+        composed.sim.set_status(composed.sim.entity_for("p-1-reprotect-target"), "PendingCancel")
+        composed.sim.held[CONID] = 0.0
+    _partial_close_up_to_done(composed, stop_closed_the_remainder_target_pending_cancel)
+    composed.liquidation.worker.submit(lambda: None).result(timeout=2.0)   # the queued start has run
+    target = composed.sim.entity_for("p-1-reprotect-target")
+    composed.sim.set_status(target, "Cancelled", filled=0.0)
+    for _ in range(6):
+        composed.sim.promote()
+        composed.tick()
+    flatten = composed.liquidation.root_for("entry-1")
+    assert composed.liquidation.receipt_for(flatten).state == "FLAT"
+    assert composed.stack.circuit_breaker.store.get().state == "TRIPPED"
+    return target
+
+
+def _late_roots(composed):
+    return [r[0] for r in composed.trader.journal_db.execute(
+        "SELECT cause_command_id FROM liquidation_runs WHERE cause_command_id LIKE '%-late-%' "
+        "ORDER BY cause_command_id", fetch="all")]
+
+
+def _late_target_fill(composed, target):
+    """The target that reported Cancelled/0 fills 6 after all: the account is short 6."""
+    composed.sim.set_status(target, "Filled", filled=6.0)
+    composed.sim.held[CONID] = -6.0
+
+
+def test_a_late_fill_after_a_flat_flatten_starts_a_new_safety_close(composed):
+    """Round 10 (openai), the exact order: after FLAT a bound fill of the cancelled target makes
+    the account short 6. A new root linked to the flatten (``entry-1-late-1``) buys 6 back through
+    the reduce-only boundary; the old root stays FLAT; the breaker stays tripped."""
+    target = _release_safety_flatten_to_flat(composed)
+    placed = len(composed.sim.placed)
+    _late_target_fill(composed, target)
+    for _ in range(3):
+        composed.sim.promote()
+        composed.tick()
+    assert _late_roots(composed) == ["entry-1-late-1"]
+    assert composed.sim.placed[placed:] == [("entry-1-late-1-reduce-265598-1", "MKT", "BUY", 6.0, None, None)]
+    assert composed.liquidation.receipt_for("entry-1").state == "FLAT"
+    composed.sim.set_status(composed.sim.entity_for("entry-1-late-1-reduce"), "Filled", filled=6.0)
+    composed.sim.held[CONID] = 0.0
+    for _ in range(2):
+        composed.sim.promote()
+        composed.tick()
+    assert composed.liquidation.receipt_for("entry-1-late-1").state == "FLAT"
+    assert len(composed.sim.placed) == placed + 1
+    assert composed.stack.circuit_breaker.store.get().state == "TRIPPED"
+
+
+def test_no_new_close_while_the_account_stays_flat_or_a_new_entry_has_no_late_fill(composed):
+    """No bound late fill, no new root: a flat account stays alone, and a later position that no
+    settled child explains (a new entry) is never closed by this path."""
+    _release_safety_flatten_to_flat(composed)
+    placed = len(composed.sim.placed)
+    for _ in range(3):
+        composed.sim.promote()
+        composed.tick()
+    composed.sim.held[CONID] = 10.0
+    for _ in range(3):
+        composed.sim.promote()
+        composed.tick()
+    assert _late_roots(composed) == []
+    assert len(composed.sim.placed) == placed
+
+
+def test_a_late_fill_seen_on_many_ticks_starts_exactly_one_new_close(composed):
+    target = _release_safety_flatten_to_flat(composed)
+    placed = len(composed.sim.placed)
+    _late_target_fill(composed, target)
+    composed.tick()                                    # seen before the position moved
+    for _ in range(6):
+        composed.sim.promote()
+        composed.tick()
+    assert _late_roots(composed) == ["entry-1-late-1"]
+    assert [p[2:4] for p in composed.sim.placed[placed:]] == [("BUY", 6.0)]
+
+
+def test_a_restart_between_flat_and_the_late_fill_still_starts_the_new_close(tmp_path, composed):
+    target = _release_safety_flatten_to_flat(composed)
+    placed = len(composed.sim.placed)
+    restarted = _restart(composed, tmp_path)
+    _late_target_fill(composed, target)
+    for _ in range(3):
+        composed.sim.promote()
+        restarted.tick()
+    assert _late_roots(restarted) == ["entry-1-late-1"]
+    assert composed.sim.placed[placed:] == [("entry-1-late-1-reduce-265598-1", "MKT", "BUY", 6.0, None, None)]
+    restarted.liquidation.worker.shutdown()
+
+
 def test_a_stop_fill_after_the_final_admission_hold_is_refused_at_the_order_boundary(composed):
     """#22 round 8 (openai): the target's last admission hold read +6 and a stop with 6 outstanding.
     Right after that hold the stop fills 2: IB's order status has it, the position cache and the

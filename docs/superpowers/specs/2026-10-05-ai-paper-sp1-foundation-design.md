@@ -616,8 +616,14 @@ first. On a hit:
 
 **Pause, resume, stop and restarts.**
 
-- Only `mmr experiment resume` (principals `cli` or `dashboard`) clears `KILLED`
-  or `PAUSED`. It arms the AI again. AI principals cannot call it.
+- Only `mmr experiment resume` (principals `cli` or `dashboard`) clears
+  `PAUSED`. It arms the AI again. AI principals cannot call it. `ai_supervisor`
+  may pause.
+- `KILLED` is never resumed (owner, 2026-10-06). Reconcile the kill flatten,
+  `stop` once flat, then `experiment start` a new experiment with a new baseline.
+- A broker-data outage longer than `broker_outage_pause_seconds` (default 300)
+  pauses the experiment durably and alerts. It never flattens from stale broker
+  state; resume needs a fresh reconciliation and an operator.
 - `mmr experiment stop` (principals `cli` or `dashboard` only) moves an `ARMED`,
   `PAUSED` or `KILLED` experiment to `STOPPED` without resuming it.
   - It refuses (`NOT_FLAT`) while a liquidation is running or the broker shows a
@@ -730,7 +736,7 @@ Test-first for every part. Each change starts with a failing test.
   `equity_daily` gets a row after `KILLED` and after `FAILED_SAFE`; arming the one-strategy automation
   refused while an experiment is armed; `KILLED` is stored before the first
   flatten order; "flat" is not reported before the broker confirms it; the kill
-  line survives a restart; both kill bases; AI principals cannot resume.
+  line survives a restart; both kill bases; AI principals cannot resume; resume from `KILLED` is refused.
 
 A green suite is not a paper-session result. Before SP2 starts trading, SP1 must
 also pass one real IB paper session.

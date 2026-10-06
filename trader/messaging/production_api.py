@@ -139,23 +139,31 @@ from trader.trading.trading_control import (
 )
 
 
-def validate_rpc_mode(simulation: bool, unsafe_legacy_rpc: bool) -> None:
-    """Fail closed: refuse ``unsafe_legacy_rpc`` outside offline simulation.
+def validate_rpc_mode(simulation: bool, unsafe_legacy_rpc: bool, *,
+                      paper_trading: bool, ib_account: Optional[str]) -> None:
+    """Fail closed: refuse ``unsafe_legacy_rpc`` outside offline paper simulation.
 
-    This is the single choke point that makes "legacy dill/object RPC in
-    production" structurally impossible: ``Trader.connect()`` calls this
-    unconditionally, before it ever considers starting the legacy
-    ``RPCServer``, so there is no flag combination that reaches
-    ``LegacyOfflineTraderServiceApi`` unless BOTH ``simulation`` and
-    ``unsafe_legacy_rpc`` are explicitly ``True``. ``simulation=True`` alone
-    is not enough (an offline backtest/dry-run shouldn't silently get the
-    dill-capable RPC either) — the caller must opt in explicitly.
+    The single choke point for the legacy dill/msgpack RPC (trader 42001,
+    strategy 42005). ``Trader.connect()`` and ``StrategyRuntime.connect()``
+    call it before any socket is built. Both flags can come from YAML or env,
+    so they do not prove an offline posture on their own: the effective
+    config must also be paper trading on a paper (``D``-prefixed) account,
+    the same rule as ``Trader._fake_broker_enabled``. ``simulation=True``
+    alone never grants the legacy RPC either.
     """
-    if unsafe_legacy_rpc and not simulation:
+    if not unsafe_legacy_rpc:
+        return
+    if not simulation:
         raise ValueError(
             'unsafe_legacy_rpc=True requires simulation=True (offline simulation '
             'only) -- the dill-capable legacy RPC path must never run against a '
-            'live/production trader_service.'
+            'live/production service.'
+        )
+    if not (paper_trading and str(ib_account or '').startswith('D')):
+        raise ValueError(
+            'unsafe_legacy_rpc=True requires paper trading on a paper (D-prefixed) '
+            f'account; got paper_trading={paper_trading}, ib_account={ib_account!r}. '
+            'The legacy RPC has no authentication and must never run on a live account.'
         )
 
 

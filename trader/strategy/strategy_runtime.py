@@ -574,7 +574,8 @@ class StrategyRuntime():
             # flag -- the same gate as the trader's 42001. Production control
             # goes through the typed, signed sockets below.
             from trader.messaging.production_api import validate_rpc_mode  # import cycle at module level
-            validate_rpc_mode(self.simulation, self.unsafe_legacy_rpc)
+            validate_rpc_mode(self.simulation, self.unsafe_legacy_rpc,
+                              paper_trading=self.paper_trading, ib_account=self.ib_account)
             if self.simulation and self.unsafe_legacy_rpc:
                 self.zmq_strategy_rpc_server = RPCServer[bus.StrategyServiceApi](
                     instance=bus.StrategyServiceApi(self),

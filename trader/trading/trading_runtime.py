@@ -466,7 +466,8 @@ class Trader():
             from trader.trading.command_policy import load_and_validate_command_policy
             from trader.trading.command_stack import build_command_stack
 
-            validate_rpc_mode(self.simulation, self.unsafe_legacy_rpc)
+            validate_rpc_mode(self.simulation, self.unsafe_legacy_rpc,
+                              paper_trading=self.paper_trading, ib_account=self.ib_account)
 
             # Typed query/command/feed servers ALWAYS start -- this is the
             # only RPC surface production exposes. The trader's Ed25519

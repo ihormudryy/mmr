@@ -129,7 +129,7 @@ def test_production_registry_has_no_legacy_mutation(method, production_registry)
 
 def test_unsafe_legacy_rpc_requires_simulation():
     with pytest.raises(ValueError, match="offline simulation"):
-        validate_rpc_mode(simulation=False, unsafe_legacy_rpc=True)
+        validate_rpc_mode(simulation=False, unsafe_legacy_rpc=True, paper_trading=True, ib_account="DU1234567")
 
 
 # ---------------------------------------------------------------------------
@@ -139,18 +139,37 @@ def test_unsafe_legacy_rpc_requires_simulation():
 class TestValidateRpcMode:
     def test_unsafe_without_simulation_raises(self):
         with pytest.raises(ValueError, match="offline simulation"):
-            validate_rpc_mode(simulation=False, unsafe_legacy_rpc=True)
+            validate_rpc_mode(simulation=False, unsafe_legacy_rpc=True, paper_trading=True, ib_account="DU1234567")
 
-    def test_unsafe_with_simulation_is_allowed(self):
-        validate_rpc_mode(simulation=True, unsafe_legacy_rpc=True)  # must not raise
+    def test_unsafe_with_simulation_on_a_paper_account_is_allowed(self):
+        validate_rpc_mode(simulation=True, unsafe_legacy_rpc=True,
+                          paper_trading=True, ib_account="DU1234567")  # must not raise
+
+    @pytest.mark.parametrize("paper_trading,ib_account", [
+        (False, "U7654321"), (True, "U7654321"), (False, "DU1234567"), (True, ""), (True, None)])
+    def test_unsafe_with_simulation_but_no_proven_paper_account_raises(self, paper_trading, ib_account):
+        with pytest.raises(ValueError, match="paper"):
+            validate_rpc_mode(simulation=True, unsafe_legacy_rpc=True,
+                              paper_trading=paper_trading, ib_account=ib_account)
+
+    def test_paper_posture_is_mandatory_for_every_caller(self):
+        with pytest.raises(TypeError):
+            validate_rpc_mode(simulation=True, unsafe_legacy_rpc=True)  # type: ignore[call-arg]
+
+    def test_trader_passes_its_paper_posture_to_the_gate(self):
+        import inspect
+
+        from trader.trading.trading_runtime import Trader
+        source = inspect.getsource(Trader.connect)
+        assert "paper_trading=self.paper_trading" in source and "ib_account=self.ib_account" in source
 
     def test_safe_without_simulation_is_allowed(self):
-        validate_rpc_mode(simulation=False, unsafe_legacy_rpc=False)  # must not raise
+        validate_rpc_mode(simulation=False, unsafe_legacy_rpc=False, paper_trading=True, ib_account="DU1234567")  # must not raise
 
     def test_safe_with_simulation_is_allowed(self):
         """simulation=True alone (without the explicit unsafe flag) must NOT
         grant the legacy RPC -- the caller must opt in to BOTH."""
-        validate_rpc_mode(simulation=True, unsafe_legacy_rpc=False)  # must not raise
+        validate_rpc_mode(simulation=True, unsafe_legacy_rpc=False, paper_trading=True, ib_account="DU1234567")  # must not raise
 
 
 # ---------------------------------------------------------------------------

@@ -496,6 +496,14 @@ grants rights.
     next session.
 - At each session start the effective limits become the latest published
   revision, capped by the owner ceiling. A restart is not a session start.
+- **Session start and the first policy** (owner, 2026-10-06). A session starts on
+  the first decision of an XNYS session date, not on a scheduled roll at the
+  open. Its identity is that session date. The equity anchor and the breach
+  latch are persisted before that decision is admitted; a restart never starts a
+  second session for the same date. When a session has no effective policy, the
+  first valid published revision applies at once (capped by the owner ceiling);
+  otherwise "no accepted policy, no entry" would block every first entry. After
+  that, tighter fields apply at once and looser fields wait for the next session.
 - **Daily loss.** At session start the equity anchor (start net liquidation) is
   frozen. The budget is `anchor × effective daily-loss fraction`. A tighter
   fraction lowers it mid-session; a looser one waits for the next session. The

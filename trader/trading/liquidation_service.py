@@ -54,6 +54,8 @@ CHILD_STATES = frozenset({
     "PLANNED", "UNKNOWN", "WORKING", "FILLED", "CANCELLED", "REJECTED", "ABSENT", "NOT_SENT",
 })
 CHILD_TERMINAL = frozenset({"FILLED", "CANCELLED", "REJECTED", "ABSENT", "NOT_SENT"})
+# Terminal children whose broker row may still report a later fill (ruling 50).
+_FILL_MAY_GROW = ("FILLED", "CANCELLED", "REJECTED")
 _BROKER_ACCEPTED = frozenset({"PreSubmitted", "Submitted", "PendingCancel"})
 _BROKER_TERMINAL = {
     "Filled": "FILLED", "Cancelled": "CANCELLED", "ApiCancelled": "CANCELLED",
@@ -70,8 +72,10 @@ def apply_liquidation_migration(migrator: SchemaMigrator) -> None:
     run gets a join row; the oldest open run of an account becomes its ACTIVE
     account owner, in phase ``legacy`` (it acts only on a broker generation
     opened after the upgrade); other open runs of that account are SUPERSEDED
-    by it. Every old run that did not end FLAT is marked ``pre_sp1_open``: it
-    may have sent a reduce the journal does not know (N2). Such a run is
+    by it. Every old run, FLAT included, is marked ``pre_sp1_open``: it may
+    have sent a reduce the journal does not know (N2). An old FLAT was decided
+    from an empty snapshot, which does not prove that an earlier reduce will
+    not arrive late (ruling 49). Such a run is
     tracked by one wildcard child (``ref_prefix`` set, ``conid`` NULL), because
     old runs record no conids (ruling 42). Exit owners (migration 35) are
     applied first.
@@ -98,7 +102,7 @@ def apply_liquidation_migration(migrator: SchemaMigrator) -> None:
         "ALTER TABLE liquidation_runs ADD COLUMN IF NOT EXISTS superseded_by VARCHAR",
         "ALTER TABLE liquidation_runs ADD COLUMN IF NOT EXISTS cleanup_pending BOOLEAN DEFAULT FALSE",
         "ALTER TABLE liquidation_runs ADD COLUMN IF NOT EXISTS pre_sp1_open BOOLEAN DEFAULT FALSE",
-        "UPDATE liquidation_runs SET pre_sp1_open = TRUE WHERE state <> 'FLAT'",
+        "UPDATE liquidation_runs SET pre_sp1_open = TRUE",
         """CREATE TABLE IF NOT EXISTS liquidation_children (
             child_id VARCHAR PRIMARY KEY,
             root_id VARCHAR NOT NULL,
@@ -431,6 +435,19 @@ class LiquidationRunStore:
             "SELECT MAX(observed_generation) FROM liquidation_children WHERE account_id = ? "
             "AND (state = 'ABSENT' OR filled_quantity > filled_at_send)" + conid_filter, params).fetchone()
         return None if row[0] is None else int(row[0])
+
+    def settled_children_in_tx(self, conn, account_id: str, conid: Optional[int]) -> tuple[ChildRef, ...]:
+        """Terminal children of the scope, any root, whose row may still report a later fill (ruling 50).
+
+        A conid scope also reads wildcard children (conid NULL), like the fill watermark.
+        """
+        conid_filter = "" if conid is None else " AND (conid = ? OR conid IS NULL)"
+        params: list = [account_id, *_FILL_MAY_GROW] + ([] if conid is None else [int(conid)])
+        rows = conn.execute(
+            f"SELECT {', '.join(_CHILD_COLUMNS)} FROM liquidation_children WHERE account_id = ? "
+            f"AND state IN ({', '.join('?' for _ in _FILL_MAY_GROW)})" + conid_filter + " ORDER BY child_id",
+            params).fetchall()
+        return tuple(_child_from_row(r) for r in rows)
 
     def legacy_reduces_in_tx(self, conn, account_id: str) -> tuple[ChildRef, ...]:
         """Every wildcard child of the account, whoever owns it (ruling 42)."""
@@ -859,6 +876,7 @@ class LiquidationService:
             return self._snapshot_unavailable(receipt, f"broker evidence unavailable: {exc}")
         receipt = self._fence_unsent(receipt, snapshot, newest)
         receipt = self._observe_children(receipt, snapshot, newest)
+        receipt = self._observe_late_fills(receipt, newest)
         if self._now() >= receipt.deadline:
             # The deadline decides on this tick's evidence: an UNKNOWN child means FAILED_SAFE (R31).
             return self._on_deadline(receipt)
@@ -954,6 +972,41 @@ class LiquidationService:
                     self._store.clear_pre_sp1_mark_in_tx(conn, child.root_id)
         self._store.transaction(write)
         return self._store.receipt(receipt.cause_command_id)
+
+    def _observe_late_fills(self, receipt, newest: int) -> LiquidationReceipt:
+        """#20, ruling 50: a terminal child's row can report a fill later (``Cancelled`` with 0, then a fill).
+
+        Every settled child of the scope, any root, is read again. Only its
+        fill moves, only upwards, with ``observed_generation`` = ``newest``,
+        so the fill watermark makes every root wait for a newer position
+        generation. Its state stays terminal; an empty or ambiguous lookup
+        changes nothing.
+        """
+        settled = self._store.transaction(
+            lambda conn: self._store.settled_children_in_tx(conn, receipt.account_id, receipt.conid))
+        grown = [replace(child, filled_quantity=filled, observed_generation=newest) for child in settled
+                 for filled in (self._row_fill(child),) if filled is not None and filled > child.filled_quantity]
+        if not grown:
+            return receipt
+
+        def write(conn):
+            for child in grown:
+                self._store.update_child_in_tx(conn, child, self._now())
+        self._store.transaction(write)
+        return self._store.receipt(receipt.cause_command_id)
+
+    def _row_fill(self, child: ChildRef) -> Optional[float]:
+        """The fill the broker reports now for a child's own order(s); None when no single row answers."""
+        if child.ref_prefix is not None:
+            rows = list(self._dispatch.find_orders_with_prefix(child.account_id, child.ref_prefix))
+        elif child.kind == "cancel":
+            row = self._dispatch.get_order(child.target_order_entity_id)
+            rows = [] if row is None or getattr(row, "deleted", False) else [row]
+        else:
+            rows = list(self._dispatch.find_orders(child.account_id, child.child_id))
+        if not rows or (child.ref_prefix is None and len(rows) > 1):
+            return None
+        return sum(float(getattr(r, "filled_quantity", 0.0) or 0.0) for r in rows)
 
     def _children_in_force(self, receipt) -> tuple[ChildRef, ...]:
         """The root's own children plus every wildcard child of its account, whoever owns it (ruling 42)."""

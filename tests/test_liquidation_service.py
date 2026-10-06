@@ -374,7 +374,8 @@ def test_an_adopted_run_settles_its_old_reduce_before_any_new_reduce_across_two_
     adopted = s.service.receipt_for("open-a")
     assert {(c.child_id, c.state, c.sent_generation) for c in adopted.children} == {
         (child, "UNKNOWN", 5) for child in ("open-a-liquidation-reduce-*", "open-b-liquidation-reduce-*",
-                                            "open-c-liquidation-reduce-*", "old-failed-liquidation-reduce-*")}
+                                            "open-c-liquidation-reduce-*", "old-failed-liquidation-reduce-*",
+                                            "old-flat-liquidation-reduce-*")}     # ruling 49: FLAT too
     s.service.rescan()
     s.restart()
     s.push(_snapshot(6, [_position()]))
@@ -867,7 +868,8 @@ def test_rescan_returns_none_when_only_failed_safe_roots_remain(tmp_path):
 # ---------------------------------------------------------------------------
 
 _OLD_REDUCES = {"open-a-liquidation-reduce-*", "open-b-liquidation-reduce-*",
-                "open-c-liquidation-reduce-*", "old-failed-liquidation-reduce-*"}
+                "open-c-liquidation-reduce-*", "old-failed-liquidation-reduce-*",
+                "old-flat-liquidation-reduce-*"}        # ruling 49: an old FLAT run is tracked too
 
 
 def test_a_superseded_legacy_runs_invisible_reduce_blocks_the_adopted_root(tmp_path):
@@ -906,7 +908,8 @@ def test_a_legacy_run_whose_deadline_passed_fails_safe_and_a_new_flatten_inherit
 def test_old_failed_safe_runs_reduces_are_tracked_even_with_no_run_open_at_the_upgrade(tmp_path):
     """N2: only FAILED_SAFE runs survived the upgrade; the first flatten after it still tracks them."""
     db = _legacy_db(tmp_path)
-    db.execute("DELETE FROM liquidation_runs WHERE cause_command_id LIKE 'open-%'", fetch="none")
+    db.execute("DELETE FROM liquidation_runs WHERE cause_command_id LIKE 'open-%' OR cause_command_id = 'old-flat'",
+               fetch="none")
     s = _stack(tmp_path, [_snapshot(5, [_position()]), _snapshot(6, [_position()]), _snapshot(7, [_position()])])
     receipt = s.service.start(ACCOUNT, "flat-new", DEADLINE)
     assert [(c.child_id, c.state) for c in receipt.children] == [("old-failed-liquidation-reduce-*", "UNKNOWN")]
@@ -1000,6 +1003,45 @@ def test_a_settled_legacy_fill_fences_the_next_root_across_a_restart(tmp_path):
     s.push(_snapshot(7, [_position(10.0)]))
     s.service.rescan()
     assert s.dispatch.calls == [("reduce", 1, "SELL", 10.0, "root-2-reduce-1-1")]
+
+
+# ---------------------------------------------------------------------------
+# Round-4 fixes (#20): legacy FLAT runs and late fills of terminal children
+# ---------------------------------------------------------------------------
+
+def test_an_old_flat_runs_late_reduce_blocks_a_new_flatten(tmp_path):
+    """Ruling 49: master wrote FLAT from an empty snapshot, which does not prove an earlier reduce will not
+    arrive late. The old FLAT run is tracked: its late reduce blocks every new reduce on the account."""
+    _legacy_db(tmp_path, (("old-flat", "FLAT", 1),))
+    s = _stack(tmp_path, [_snapshot(5, [_position()]), _snapshot(6, [_position()]), _snapshot(7, [_position()])])
+    s.dispatch.complete = False                              # the late reduce is not visible yet
+    receipt = s.service.start(ACCOUNT, "flat-new", DEADLINE)
+    assert [(c.child_id, c.state) for c in receipt.children] == [("old-flat-liquidation-reduce-*", "UNKNOWN")]
+    s.dispatch.rows["old-flat-liquidation-reduce-1"] = [_row("Submitted", entity="old-flat-liquidation-reduce-1:exit")]
+    assert "still working" in s.service.rescan().detail     # visible now: waited on, never cancelled
+    s.service.rescan()
+    assert s.dispatch.calls == []
+
+
+def test_a_cancelled_child_that_reports_a_late_fill_fences_the_next_root(tmp_path):
+    """Ruling 50: the order was reported Cancelled with 0 filled, then the broker reported 4 filled while
+    the position cache still said 10. The next root waits for a newer generation, then sells 6, not 10."""
+    s = _stack(tmp_path, [_snapshot(1, [_position()], [_order()])])
+    s.service.start(ACCOUNT, "root-1", DEADLINE)                                    # gen 1: cancel the order
+    s.dispatch.entities["external-1"] = _row("Cancelled", filled=0.0)
+    s.push(_snapshot(2, [_position()]))
+    s.clock["now"] = DEADLINE + dt.timedelta(seconds=1)
+    assert s.service.rescan().state == "FAILED_SAFE"         # gen 2: cancel CANCELLED with 0, then the deadline
+    s.dispatch.entities["external-1"] = _row("Cancelled", filled=4.0)
+    s.push(_snapshot(3, [_position()]))
+    receipt = s.service.start(ACCOUNT, "root-2", s.clock["now"] + dt.timedelta(minutes=5))
+    assert "newer than the last observed fill" in receipt.detail
+    assert [c[0] for c in s.dispatch.calls] == ["cancel"]    # no reduce sized from the stale 10
+    cancel = next(c for c in s.service.receipt_for("root-1").children if c.kind == "cancel")
+    assert (cancel.state, cancel.filled_quantity, cancel.observed_generation) == ("CANCELLED", 4.0, 3)
+    s.push(_snapshot(4, [_position(6.0)]))
+    s.service.rescan()
+    assert s.dispatch.calls[-1] == ("reduce", 1, "SELL", 6.0, "root-2-reduce-1-1")
 
 
 # ---------------------------------------------------------------------------

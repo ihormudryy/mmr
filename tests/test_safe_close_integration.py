@@ -69,6 +69,7 @@ class _Ingest:
         self.ready = True          # False: a newer generation is staging, the enumeration is not complete
         self.before_hold = None    # an ingest batch applied just before a close holds broker changes
         self.after_hold = None     # an IB update that lands right after a close lets the hold go
+        self.holding = 0           # holds taken and not yet let go
 
     @property
     def is_ready(self):
@@ -81,9 +82,11 @@ class _Ingest:
             self.before_hold()
         if not self.ready:
             raise BrokerChangesBusy("broker generation is staging")
+        self.holding += 1
         try:
             yield
         finally:
+            self.holding -= 1
             if self.after_hold is not None:
                 self.after_hold()
 
@@ -589,6 +592,25 @@ def test_a_stop_filled_at_release_with_the_position_still_open_is_a_safety_failu
     released = composed.saga.resume("entry-1")
     assert released.state == "SAFETY_FAILED" and released.flatten_requested
     assert composed.stack.circuit_breaker.store.get().state == "TRIPPED"
+
+
+def test_a_safety_failure_at_release_queues_the_flatten_without_stalling_the_hold(composed):
+    """#22/#25 round 8 follow-up: the saga trips inside the close's cleanup, which holds the
+    liquidation lock and broker changes. Its start goes through ``nonblocking()``: it is queued on the
+    one liquidation worker and runs after the tick, so nothing waits on the lock while ingest is held.
+    The flatten root exists right after, and SAFETY_FAILED + flatten_requested are durable first,
+    so a crash before the queued start is picked up by the next tick (``unhandled_failures``)."""
+    import time
+
+    def stop_filled_position_open():
+        composed.sim.set_status(composed.sim.entity_for("p-1-reprotect-stop"), "Filled", filled=6.0)
+    started = time.monotonic()
+    _partial_close_up_to_done(composed, stop_filled_position_open)
+    composed.liquidation.worker.submit(lambda: None).result(timeout=2.0)   # the queued start has run
+    assert time.monotonic() - started < 2.0
+    assert composed.trader.broker_ingest.holding == 0
+    assert composed.saga.resume("entry-1").state == "SAFETY_FAILED"
+    assert composed.liquidation.root_for("entry-1") is not None
 
 
 def test_a_stop_filled_at_release_that_closed_the_remainder_is_closed_without_an_alarm(composed):

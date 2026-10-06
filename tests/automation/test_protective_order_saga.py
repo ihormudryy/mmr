@@ -831,7 +831,8 @@ def test_busy_liquidation_keeps_protective_failure_root_for_rescan(tmp_path):
         SimpleNamespace(capture=lambda account_id: snapshot),
         SimpleNamespace(reduce=lambda *args: reduces.append(args), cancel=lambda *args: None,
                         find_orders=lambda *args: [], get_order=lambda entity: None,
-                        enumeration_complete=lambda: True, newest_generation=lambda: 1),
+                        enumeration_complete=lambda: True, newest_generation=lambda: 1,
+                        executed_quantities=lambda *a: {}, unbound_execution_since=lambda *a: False),
         store=LiquidationRunStore(db), registry=ExitOwnerRegistry(db), now=lambda: NOW,
         lock_timeout_seconds=0.05,
     )

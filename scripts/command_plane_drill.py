@@ -610,7 +610,9 @@ def scn_liquidation(db_path: str) -> dict:
     dispatch = SimpleNamespace(cancel=lambda *args: calls.append(("cancel", args)), reduce=reduce,
                                find_orders=lambda _account, child_id: rows.get(child_id, []),
                                get_order=lambda _entity: None, enumeration_complete=lambda: True,
-                               newest_generation=lambda: seen["generation"])
+                               newest_generation=lambda: seen["generation"],
+                               executed_quantities=lambda *_args: {},
+                               unbound_execution_since=lambda *_args: False)
     service = LiquidationService(SimpleNamespace(capture=capture), dispatch, store=LiquidationRunStore(db),
                                  registry=ExitOwnerRegistry(db), now=lambda: NOW)
     first = service.start(ACCOUNT, "drill-liquidation", NOW + dt.timedelta(minutes=1))

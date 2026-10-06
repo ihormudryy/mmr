@@ -165,3 +165,45 @@ def test_broker_changes_cannot_be_held_without_an_ingest():
 
     with pytest.raises(BrokerChangesBusy):
         TradingRuntimeOrderDispatch(SimpleNamespace()).hold_broker_changes()
+
+
+def _fill(exec_id, *, entity=None, conid=265598, quantity=4.0, at=NOW):
+    from trader.data.broker_state import BrokerFillRow
+    return BrokerFillRow(account_id=ACCOUNT, exec_id=exec_id, order_entity_id=entity, perm_id=None,
+                         client_order_id=None, session_epoch="s1", conid=conid, side="SELL", quantity=quantity,
+                         price=100.0, commission=None, commission_currency=None, realized_pnl=None,
+                         fill_time=at, revision=1, source_timestamp=at)
+
+
+def test_executed_quantities_sum_the_executions_bound_to_each_order(env):
+    """#20 round 5: an execution is fill evidence even when the order row did not change."""
+    def write(conn):
+        env.store.upsert_fill_in_tx(conn, _fill("e1", entity="o-1", quantity=3.0))
+        env.store.upsert_fill_in_tx(conn, _fill("e2", entity="o-1", quantity=1.0))
+        env.store.upsert_fill_in_tx(conn, _fill("e3", entity="o-2", quantity=5.0))
+        env.store.upsert_fill_in_tx(conn, _fill("e4", quantity=7.0))
+    env.db.transaction(write)
+    assert env.dispatch.executed_quantities(ACCOUNT, ("o-1", "o-3")) == {"o-1": 4.0}
+    assert env.dispatch.executed_quantities(ACCOUNT, ()) == {}
+
+
+def test_an_unbound_execution_since_the_generation_started_fails_closed(env):
+    """#20 round 5: an execution no order claims blocks sizing on any generation that started
+    before it was recorded; an unknown generation never counts as safe."""
+    before = env.db.transaction(lambda conn: env.store.open_generation_in_tx(
+        conn, ("account",), NOW - dt.timedelta(minutes=1)))
+    after = env.db.transaction(lambda conn: env.store.open_generation_in_tx(
+        conn, ("account",), NOW + dt.timedelta(minutes=1)))
+    env.db.transaction(lambda conn: env.store.upsert_fill_in_tx(conn, _fill("e1")))
+    assert env.dispatch.unbound_execution_since(ACCOUNT, 265598, before) is True
+    assert env.dispatch.unbound_execution_since(ACCOUNT, None, before) is True
+    assert env.dispatch.unbound_execution_since(ACCOUNT, 4815747, before) is False
+    assert env.dispatch.unbound_execution_since(ACCOUNT, 265598, after) is False
+    assert env.dispatch.unbound_execution_since(ACCOUNT, 265598, 999) is True
+
+
+def test_execution_evidence_fails_loudly_without_a_store():
+    with pytest.raises(RuntimeError):
+        TradingRuntimeOrderDispatch(SimpleNamespace()).executed_quantities(ACCOUNT, ("o-1",))
+    with pytest.raises(RuntimeError):
+        TradingRuntimeOrderDispatch(SimpleNamespace()).unbound_execution_since(ACCOUNT, 1, 1)

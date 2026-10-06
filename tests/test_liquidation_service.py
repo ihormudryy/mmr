@@ -97,6 +97,8 @@ class _Dispatch:
         self.before_hold = None                # an ingest batch applied just before the hold is taken
         self.hold_busy = False
         self.holds = 0
+        self.executions: dict[str, float] = {}  # order entity id -> executions bound to it
+        self.unbound = False                    # an execution no order claims, since the generation started
 
     def _record(self, name, call):
         if name in self.refuse:
@@ -128,6 +130,14 @@ class _Dispatch:
 
     def get_order(self, order_entity_id):
         return self.entities.get(order_entity_id)
+
+    def executed_quantities(self, account_id, order_entity_ids):
+        if isinstance(self.executions, Exception):
+            raise self.executions
+        return {e: q for e, q in self.executions.items() if e in order_entity_ids}
+
+    def unbound_execution_since(self, account_id, conid, generation_id):
+        return self.unbound
 
     def enumeration_complete(self):
         return self.complete
@@ -1065,6 +1075,46 @@ def test_a_cancelled_child_that_reports_a_late_fill_fences_the_next_root(tmp_pat
     s.push(_snapshot(4, [_position(6.0)]))
     s.service.rescan()
     assert s.dispatch.calls[-1] == ("reduce", 1, "SELL", 6.0, "root-2-reduce-1-1")
+
+
+def test_an_execution_with_an_unchanged_order_row_fences_the_next_root(tmp_path):
+    """#20 round 5: the row stays ``Cancelled/0``; only an execution bound to the order says 4 filled."""
+    s = _stack(tmp_path, [_snapshot(1, [_position()], [_order()])])
+    s.service.start(ACCOUNT, "root-1", DEADLINE)
+    s.dispatch.entities["external-1"] = _row("Cancelled", filled=0.0, entity="external-1")
+    s.push(_snapshot(2, [_position()]))
+    s.clock["now"] = DEADLINE + dt.timedelta(seconds=1)
+    assert s.service.rescan().state == "FAILED_SAFE"
+    s.dispatch.executions["external-1"] = 4.0
+    s.push(_snapshot(3, [_position()]))
+    receipt = s.service.start(ACCOUNT, "root-2", s.clock["now"] + dt.timedelta(minutes=5))
+    assert "newer than the last observed fill" in receipt.detail
+    assert [c[0] for c in s.dispatch.calls] == ["cancel"]
+    cancel = next(c for c in s.service.receipt_for("root-1").children if c.kind == "cancel")
+    assert (cancel.state, cancel.filled_quantity, cancel.observed_generation) == ("CANCELLED", 4.0, 3)
+
+
+def test_unreadable_execution_evidence_sizes_nothing(tmp_path):
+    """#20 round 5: no answer about executions is never an answer of zero."""
+    s = _stack(tmp_path, [_snapshot(1, [_position()], [_order()]), _snapshot(2, [_position()])])
+    s.service.start(ACCOUNT, "root-1", DEADLINE)
+    s.dispatch.entities["external-1"] = _row("Cancelled", filled=0.0, entity="external-1")
+    s.dispatch.executions = RuntimeError("journal unavailable")
+    receipt = s.service.rescan()
+    assert "execution evidence unavailable" in receipt.detail
+    assert [c[0] for c in s.dispatch.calls] == ["cancel"]
+
+
+def test_an_unbound_execution_blocks_sizing(tmp_path):
+    """#20 round 5: an execution no order claims yet fails closed until a newer sync."""
+    s = _stack(tmp_path, [_snapshot(1, [_position()])])
+    s.dispatch.unbound = True
+    receipt = s.service.start(ACCOUNT, "root-1", DEADLINE)
+    assert "newer than the last observed fill" in receipt.detail and s.dispatch.calls == []
+    s.dispatch.unbound = False
+    s.push(_snapshot(2, [_position()]))
+    s.service.rescan()
+    assert [c[0] for c in s.dispatch.calls] == ["reduce"]
 
 
 # ---------------------------------------------------------------------------

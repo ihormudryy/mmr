@@ -236,6 +236,12 @@ class _LiquidationDispatch:
     def get_order(self, order_entity_id: str):
         return self._orders_view.get_order(order_entity_id)
 
+    def executed_quantities(self, account_id: str, order_entity_ids: tuple) -> dict:
+        return self._dispatch.executed_quantities(account_id, order_entity_ids)
+
+    def unbound_execution_since(self, account_id: str, conid, generation_id: int) -> bool:
+        return self._dispatch.unbound_execution_since(account_id, conid, generation_id)
+
     def enumeration_complete(self) -> bool:
         return self._dispatch.enumeration_complete()
 

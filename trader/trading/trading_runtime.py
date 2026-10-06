@@ -2734,6 +2734,23 @@ class TradingRuntimeOrderDispatch:
         from trader.trading.command_ports import orders_matching_legacy_reduces
         return orders_matching_legacy_reduces(self._active_order_rows(), account_id, prefix)
 
+    def executed_quantities(self, account_id: str, order_entity_ids: tuple) -> dict:
+        """Executions bound to each order (SP1 #20). Raises when the store is not wired: no answer is not zero."""
+        store, journal = self._broker_store()
+        return store.executed_quantity_by_order_in_tx(journal.connect(), account_id, tuple(order_entity_ids))
+
+    def unbound_execution_since(self, account_id: str, conid, generation_id: int) -> bool:
+        """An execution no order claims, recorded since ``generation_id`` started (SP1 #20, fail closed)."""
+        store, journal = self._broker_store()
+        return store.unbound_fill_since_generation_in_tx(journal.connect(), account_id, conid, int(generation_id))
+
+    def _broker_store(self):
+        store = getattr(self._trader, 'broker_state_store', None)
+        journal = getattr(self._trader, 'domain_journal', None)
+        if store is None or journal is None:
+            raise RuntimeError('broker state store unavailable for execution evidence')
+        return store, journal
+
     def _open_trades(self) -> list:
         ib = getattr(getattr(self._trader, 'client', None), 'ib', None)
         return list(ib.openTrades()) if ib is not None else []

@@ -170,11 +170,11 @@ class _BrokerSim:
     def entity_for(self, group_prefix):
         return next(e for e in self.orders if e.startswith(group_prefix))
 
-    def promote(self):
+    def promote(self, started_at=None):
         store, db = self.trader.broker_state_store, self.trader.journal_db
 
         def write(conn):
-            gid = store.open_generation_in_tx(conn, ("account",), _et(11, 0))
+            gid = store.open_generation_in_tx(conn, ("account",), started_at or _et(11, 0))
             store.upsert_account_in_tx(conn, BrokerAccountRow(
                 ACCOUNT, "paper", 100_000.0, None, None, None, None,
                 {"DailyPnL:USD": str(self.daily_pnl)}, 1, _et(11, 0)))
@@ -423,6 +423,80 @@ def test_invisible_child_and_a_late_fill_never_send_a_second_reduce(composed):
     composed.tick()
     assert composed.liquidation.receipt_for("c-1").state == "CLOSED"
     assert len(composed.sim.placed) == 1
+
+
+def _real_ingest(composed):
+    """The production ``BrokerIngest`` on the same journal: only its execDetails path is used here."""
+    from trader.trading.broker_ingest import BrokerIngest
+    return BrokerIngest(db=composed.trader.journal_db, journal=composed.trader.domain_journal,
+                        store=composed.trader.broker_state_store, account_id=ACCOUNT, account_mode="paper",
+                        session_epoch="s1", clock=lambda: composed.clock[0])
+
+
+def _execution(composed, exec_id, perm_id, shares):
+    """IB ``execDetails`` for a SELL of ``shares``; no order-status callback comes with it."""
+    ingest = _real_ingest(composed)
+    ingest.on_exec_details(None, SimpleNamespace(
+        execution=SimpleNamespace(acctNumber=ACCOUNT, execId=exec_id, permId=perm_id, orderId=0, side="SLD",
+                                  shares=shares, price=100.0, time=composed.clock[0]),
+        contract=SimpleNamespace(conId=CONID)))
+    assert ingest.drain_once() == 1
+
+
+def test_an_execution_without_an_order_status_fences_the_next_reduce(composed):
+    """#20 round 5: the order row says ``Cancelled`` with 0 filled; an execution of 4 arrives
+    with no order-status change and the position still lags at 10. No reduce is sized on
+    that generation; the next one sizes from the live 6."""
+    composed.sim.held[CONID] = 10.0
+    composed.sim.promote()
+    composed.liquidation.start(ACCOUNT, "c-1", _et(11, 5), scope="conid", conid=CONID)
+    entity = composed.sim.entity_for("c-1-reduce")
+    composed.sim.set_status(entity, "Cancelled", filled=0.0)
+    composed.sim.promote()
+    _execution(composed, "exec-1", composed.sim.perm[entity], 4.0)
+    composed.tick()
+    assert [p[0] for p in composed.sim.placed] == ["c-1-reduce-265598-1"]
+    composed.sim.held[CONID] = 6.0
+    composed.sim.promote()
+    composed.tick()
+    assert composed.sim.placed[1][0] == "c-1-reduce-265598-2" and composed.sim.placed[1][3] == 6.0
+
+
+def test_a_late_execution_of_a_settled_child_fences_a_later_root(composed):
+    """#20 round 5, the reviewer's trace: root 1 settles its reduce as ``Cancelled/0`` and ends;
+    an execution for that order then arrives alone. A second root must not reduce on the
+    same generation."""
+    composed.sim.held[CONID] = 10.0
+    composed.sim.promote()
+    composed.liquidation.start(ACCOUNT, "c-1", _et(11, 5), scope="conid", conid=CONID)
+    entity = composed.sim.entity_for("c-1-reduce")
+    composed.sim.set_status(entity, "Cancelled", filled=0.0)
+    composed.sim.promote()
+    composed.clock[0] = _et(11, 6)                 # past c-1's deadline: it decides on this evidence
+    composed.tick()
+    assert composed.liquidation.receipt_for("c-1").state == "FAILED_SAFE"
+    _execution(composed, "exec-1", composed.sim.perm[entity], 4.0)
+    composed.liquidation.start(ACCOUNT, "c-2", _et(11, 15), scope="conid", conid=CONID)
+    assert [p[0] for p in composed.sim.placed] == ["c-1-reduce-265598-1"]
+    composed.sim.held[CONID] = 6.0
+    composed.sim.promote()
+    composed.tick()
+    assert composed.sim.placed[-1][0] == "c-2-reduce-265598-1" and composed.sim.placed[-1][3] == 6.0
+
+
+def test_an_execution_no_order_claims_blocks_sizing_until_a_newer_sync(composed):
+    """#20 round 5: an execution with no bound order fails closed. Sizing waits for a broker
+    generation that started after the execution was recorded."""
+    composed.sim.held[CONID] = 10.0
+    composed.sim.promote()
+    composed.clock[0] = _et(11, 1)
+    _execution(composed, "exec-orphan", 777777, 4.0)
+    composed.liquidation.start(ACCOUNT, "c-1", _et(11, 10), scope="conid", conid=CONID)
+    assert composed.sim.placed == []
+    composed.sim.held[CONID] = 6.0
+    composed.sim.promote(started_at=_et(11, 2))
+    composed.tick()
+    assert composed.sim.placed == [("c-1-reduce-265598-1", "MKT", "SELL", 6.0, None, None)]
 
 
 # ---------------------------------------------------------------------------

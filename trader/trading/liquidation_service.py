@@ -220,6 +220,8 @@ class LiquidationDispatchPort(Protocol):
     def find_orders(self, account_id: str, child_id: str) -> list: ...
     def find_orders_with_prefix(self, account_id: str, prefix: str) -> list: ...
     def get_order(self, order_entity_id: str) -> Optional[Any]: ...
+    def executed_quantities(self, account_id: str, order_entity_ids: tuple[str, ...]) -> dict[str, float]: ...
+    def unbound_execution_since(self, account_id: str, conid: Optional[int], generation_id: int) -> bool: ...
     def enumeration_complete(self) -> bool: ...
     def newest_generation(self) -> int: ...
     def hold_broker_changes(self) -> ContextManager[None]:
@@ -903,8 +905,13 @@ class LiquidationService:
                 return self._on_deadline(receipt)
             return self._snapshot_unavailable(receipt, f"broker evidence unavailable: {exc}")
         receipt = self._fence_unsent(receipt, snapshot, newest)
-        receipt = self._observe_children(receipt, snapshot, newest)
-        receipt = self._observe_late_fills(receipt, newest)
+        try:
+            receipt = self._observe_children(receipt, snapshot, newest)
+            receipt = self._observe_late_fills(receipt, newest)
+        except Exception as exc:
+            if self._now() >= receipt.deadline:
+                return self._on_deadline(self._store.receipt(root_id))
+            return self._snapshot_unavailable(receipt, f"execution evidence unavailable: {exc}")
         if self._now() >= receipt.deadline:
             # The deadline decides on this tick's evidence: an UNKNOWN child means FAILED_SAFE (R31).
             return self._on_deadline(receipt)
@@ -1007,8 +1014,9 @@ class LiquidationService:
         Every settled child of the scope, any root, is read again. Only its
         fill moves, only upwards, with ``observed_generation`` = ``newest``,
         so the fill watermark makes every root wait for a newer position
-        generation. Its state stays terminal; an empty or ambiguous lookup
-        changes nothing.
+        generation. Its state stays terminal; an empty lookup changes nothing.
+        The fill counts executions too (round 5): IB can report an execution
+        without changing the order's status.
         """
         settled = self._store.transaction(
             lambda conn: self._store.settled_children_in_tx(conn, receipt.account_id, receipt.conid))
@@ -1024,7 +1032,11 @@ class LiquidationService:
         return self._store.receipt(receipt.cause_command_id)
 
     def _row_fill(self, child: ChildRef) -> Optional[float]:
-        """The fill the broker reports now for a child's own order(s); None when no single row answers."""
+        """The fill the broker reports now for a child's own order(s); None when no row answers.
+
+        Several rows for one ref are summed: the larger fill can only make
+        the next root wait longer (fail closed).
+        """
         if child.ref_prefix is not None:
             rows = list(self._dispatch.find_orders_with_prefix(child.account_id, child.ref_prefix))
         elif child.kind == "cancel":
@@ -1032,9 +1044,14 @@ class LiquidationService:
             rows = [] if row is None or getattr(row, "deleted", False) else [row]
         else:
             rows = list(self._dispatch.find_orders(child.account_id, child.child_id))
-        if not rows or (child.ref_prefix is None and len(rows) > 1):
-            return None
-        return sum(float(getattr(r, "filled_quantity", 0.0) or 0.0) for r in rows)
+        return self._broker_fill(child, rows) if rows else None
+
+    def _broker_fill(self, child: ChildRef, rows) -> float:
+        """#20 round 5: per order, the larger of its row's fill and the executions bound to it."""
+        entities = tuple(e for e in (getattr(r, "order_entity_id", None) for r in rows) if e)
+        executed = self._dispatch.executed_quantities(child.account_id, entities) if entities else {}
+        return sum(max(float(getattr(r, "filled_quantity", 0.0) or 0.0),
+                       executed.get(getattr(r, "order_entity_id", None), 0.0)) for r in rows)
 
     def _children_in_force(self, receipt) -> tuple[ChildRef, ...]:
         """The root's own children plus every wildcard child of its account, whoever owns it (ruling 42)."""
@@ -1064,7 +1081,7 @@ class LiquidationService:
             return child  # an ambiguous correlation proves nothing
         row = rows[0]
         status = getattr(row, "status", None)
-        filled = float(getattr(row, "filled_quantity", 0.0) or 0.0)
+        filled = self._broker_fill(child, [row])
         total = float(getattr(row, "total_quantity", 0.0) or 0.0)
         if status in _BROKER_TERMINAL:
             state = _BROKER_TERMINAL[status]
@@ -1093,7 +1110,7 @@ class LiquidationService:
         """
         rows = list(self._dispatch.find_orders_with_prefix(child.account_id, child.ref_prefix))
         statuses = [getattr(r, "status", None) for r in rows]
-        filled = sum(float(getattr(r, "filled_quantity", 0.0) or 0.0) for r in rows)
+        filled = self._broker_fill(child, rows)
         if any(s not in _BROKER_TERMINAL for s in statuses):
             state = "WORKING" if any(s in _BROKER_ACCEPTED for s in statuses) else "UNKNOWN"
         elif generation > child.sent_generation and self._dispatch.enumeration_complete():
@@ -1108,11 +1125,20 @@ class LiquidationService:
         """R5, ruling 43: sizing needs a generation newer than every fill observed on the scope.
 
         The fence is any root's: a fill seen by a root that has since ended,
-        been superseded or been restarted still binds the next root.
+        been superseded or been restarted still binds the next root. An
+        execution no order claims yet (#20 round 5) is fenced the same way:
+        sizing waits for a generation that started after it was recorded.
+        An unreadable answer is not fresh.
         """
         watermark = self._store.transaction(
             lambda conn: self._store.fill_watermark_in_tx(conn, receipt.account_id, receipt.conid))
-        return watermark is None or generation > watermark
+        if watermark is not None and generation <= watermark:
+            return False
+        try:
+            return not self._dispatch.unbound_execution_since(receipt.account_id, receipt.conid, generation)
+        except Exception:
+            log.exception("liquidation %s cannot read unbound executions", receipt.cause_command_id)
+            return False
 
     def _blocking(self, receipt, generation: int) -> Optional[str]:
         """R5, D2: a child that is unknown or still working stops every new reduce.

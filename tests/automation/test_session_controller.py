@@ -839,6 +839,12 @@ class _SimBroker:
     def get_order(self, order_entity_id):
         return None if self.stop_working else self._stop_row("Cancelled")
 
+    def executed_quantities(self, account_id, order_entity_ids):
+        return {}
+
+    def unbound_execution_since(self, account_id, conid, generation_id):
+        return False
+
     def enumeration_complete(self):
         return True
 

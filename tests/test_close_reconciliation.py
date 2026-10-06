@@ -193,7 +193,8 @@ def _service(env, snapshots, rows):
         reduce=lambda p, s, q, cid: rows.setdefault(cid, [SimpleNamespace(
             status="Filled", filled_quantity=q, total_quantity=q)]),
         find_orders=lambda a, cid: rows.get(cid, []), get_order=lambda e: None,
-        enumeration_complete=lambda: True, newest_generation=lambda: broker.last)
+        enumeration_complete=lambda: True, newest_generation=lambda: broker.last,
+        executed_quantities=lambda *a: {}, unbound_execution_since=lambda *a: False)
     return LiquidationService(broker, dispatch, store=env.store, registry=ExitOwnerRegistry(env.db),
                               now=lambda: NOW, journal=env.journal, ledger=env.ledger,
                               schedule_reconcile=lambda command_id: env.reconciler.schedule(command_id, NOW))

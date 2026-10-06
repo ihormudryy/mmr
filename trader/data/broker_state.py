@@ -556,6 +556,41 @@ class BrokerStateStore:
         ).fetchall()
         return [self._fill_from_row(row) for row in rows]
 
+    def executed_quantity_by_order_in_tx(
+        self, conn: Any, account_id: str, order_entity_ids: tuple[str, ...]
+    ) -> dict[str, float]:
+        """Executions bound to each order, summed (SP1 #20: a fill can arrive without an order status)."""
+        if not order_entity_ids:
+            return {}
+        markers = ", ".join("?" for _ in order_entity_ids)
+        rows = conn.execute(
+            "SELECT order_entity_id, SUM(quantity) FROM broker_fills "
+            f"WHERE account_id = ? AND order_entity_id IN ({markers}) GROUP BY order_entity_id",
+            [account_id, *order_entity_ids],
+        ).fetchall()
+        return {row[0]: float(row[1]) for row in rows}
+
+    def unbound_fill_since_generation_in_tx(
+        self, conn: Any, account_id: str, conid: Optional[int], generation_id: int
+    ) -> bool:
+        """An execution with no bound order, recorded at or after ``generation_id`` started.
+
+        An unknown generation counts as True: the caller must not size against it.
+        """
+        started = conn.execute(
+            "SELECT started_at FROM broker_sync_generations WHERE generation_id = ?", [generation_id]
+        ).fetchone()
+        if started is None:
+            return True
+        conid_filter = "" if conid is None else " AND conid = ?"
+        params: list = [account_id, started[0]] + ([] if conid is None else [int(conid)])
+        row = conn.execute(
+            "SELECT COUNT(*) FROM broker_fills WHERE account_id = ? AND order_entity_id IS NULL "
+            "AND source_timestamp >= ?" + conid_filter,
+            params,
+        ).fetchone()
+        return int(row[0]) > 0
+
     def open_generation_in_tx(
         self, conn: Any, sources: tuple[str, ...], started_at: dt.datetime
     ) -> int:

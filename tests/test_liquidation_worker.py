@@ -50,7 +50,8 @@ class _Broker:
 def _evidence_dispatch(broker, **orders):
     """A dispatch fake: order methods from ``orders``, broker evidence from ``broker``."""
     return SimpleNamespace(find_orders=lambda *a: [], get_order=lambda e: None,
-                           enumeration_complete=lambda: True, newest_generation=lambda: broker.last, **orders)
+                           enumeration_complete=lambda: True, newest_generation=lambda: broker.last,
+                           executed_quantities=lambda *a: {}, unbound_execution_since=lambda *a: False, **orders)
 
 
 class _LoopThread:
@@ -115,6 +116,8 @@ def test_rescan_from_a_coroutine_on_a_real_loop_does_not_deadlock(tmp_path, loop
     dispatch = _LiquidationDispatch(TradingRuntimeOrderDispatch(trader, dispatch_timeout=2.0), view)
     dispatch.find_orders = lambda account, child: []
     dispatch.newest_generation = lambda: broker.last
+    dispatch.executed_quantities = lambda *a: {}
+    dispatch.unbound_execution_since = lambda *a: False
     service = _service(tmp_path, broker, dispatch)
     liquidation = SerializedLiquidation(service, LiquidationWorker(), account_id=ACCOUNT, now=lambda: NOW)
     liquidation.start(ACCOUNT, "flat-1", NOW + dt.timedelta(minutes=5))      # flat at generation 1: no order

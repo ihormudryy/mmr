@@ -85,6 +85,12 @@ class _EvidenceDispatch(TradingRuntimeOrderDispatch):
     def newest_generation(self):
         return 1
 
+    def executed_quantities(self, account_id, order_entity_ids):
+        return {}
+
+    def unbound_execution_since(self, account_id, conid, generation_id):
+        return False
+
 
 def _liquidation(trader, tmp_path, *, resume=True, clock=None):
     """``resume``: a run a previous process claimed and left REQUESTED."""

@@ -81,6 +81,7 @@ class _Dispatch:
         self.broker = broker
         self.calls = []
         self.rows: dict[str, list] = {}       # child id -> broker rows found by its order ref
+        self.sequences: dict[str, list] = {}  # child id -> successive answers; the last one repeats
         self.entities: dict[str, object] = {}  # order entity id -> broker row (cancel targets)
         self.refuse: set[str] = set()          # methods that raise DispatchRefused before the boundary
         self.fail_after_send: set[str] = set() # methods that raise after the order was sent
@@ -107,6 +108,9 @@ class _Dispatch:
         self._record("place_exit_leg", ("place_exit_leg", position.conid, leg, quantity, price, oca_group, child_id))
 
     def find_orders(self, account_id, child_id):
+        answers = self.sequences.get(child_id)
+        if answers:
+            return list(answers.pop(0) if len(answers) > 1 else answers[0])
         return list(self.rows.get(child_id, []))
 
     def find_orders_with_prefix(self, account_id, prefix):
@@ -1283,6 +1287,45 @@ def test_partial_close_sends_stop_then_target_and_ends_done(tmp_path):
     assert s.breaker.calls == []
     outcome = s.service.close_resolution("p-1").outcome                  # what was asked, sold and kept
     assert (outcome["requested_quantity"], outcome["filled_quantity"], outcome["remaining_quantity"]) == (4.0, 4.0, 6.0)
+
+
+def _both_legs_working_next(tmp_path, *stop_answers):
+    """Partial close at generation 5 with both legs sent; the stop's row answers come in order."""
+    s, _ = _to_reprotect(tmp_path, extra=(_snapshot(4, [_priced(6.0)]), _snapshot(5, [_priced(6.0)]),
+                                          _snapshot(6, [_priced(6.0)])))
+    s.dispatch.rows["p-1-reprotect-stop-1-1"] = [_leg_row()]
+    s.service.rescan()                                                    # gen 4: stop working -> target
+    s.dispatch.rows["p-1-reprotect-target-1-1"] = [_leg_row()]
+    s.dispatch.sequences["p-1-reprotect-stop-1-1"] = [list(answer) for answer in stop_answers]
+    return s
+
+
+def test_a_stop_cancelled_after_it_was_observed_never_ends_done(tmp_path):
+    """#22: the stop was WORKING when observed, then ingest saw it Cancelled; DONE is not decided from
+    the old child status with the fresh row's OCA link."""
+    s = _both_legs_working_next(tmp_path, [_leg_row()], [_leg_row("Cancelled")])
+    receipt = s.service.rescan()                                          # gen 5
+    assert receipt.state != "DONE" and s.service.close_resolution("p-1") is None
+    stop = next(c for c in receipt.children if c.kind == "reprotect-stop")
+    assert stop.state == "CANCELLED"                                     # observed again, not finished
+    receipt = s.service.rescan()                                          # gen 6: a failed re-protect
+    assert receipt.state != "DONE" and receipt.goal == "zero"
+
+
+def test_a_stop_fill_after_it_was_observed_never_ends_done(tmp_path):
+    """#22: ingest saw 2 of the stop's 6 fill after it was observed; outstanding is 4, not 6."""
+    s = _both_legs_working_next(tmp_path, [_leg_row()], [_leg_row(filled=2.0)])
+    receipt = s.service.rescan()
+    assert receipt.state != "DONE" and s.service.close_resolution("p-1") is None
+    stop = next(c for c in receipt.children if c.kind == "reprotect-stop")
+    assert (stop.filled_quantity, stop.outstanding_quantity) == (2.0, 4.0)
+
+
+def test_a_leg_row_that_changes_while_done_is_decided_is_read_again(tmp_path):
+    """#22: the rows DONE was decided on must still be the rows at the terminal write."""
+    s = _both_legs_working_next(tmp_path, [_leg_row()], [_leg_row()], [_leg_row("Cancelled")])
+    receipt = s.service.rescan()
+    assert receipt.state != "DONE" and s.service.close_resolution("p-1") is None
 
 
 def test_terminal_partial_fill_reprotects_the_actual_remainder(tmp_path):

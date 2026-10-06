@@ -1438,7 +1438,12 @@ class LiquidationService:
 
     def _advance_reprotect(self, receipt, snapshot, working, position) -> LiquidationReceipt:
         """R13, R26, R30: the legs' own rows decide; a normal exit ends CLOSED; a leg that
-        was refused, rejected, cancelled or lost is a re-protect failure (never sent again)."""
+        was refused, rejected, cancelled or lost is a re-protect failure (never sent again).
+
+        #22: DONE is decided from one read of each leg's row. A row that no
+        longer matches the child is observed again instead of finishing, and
+        the rows are read once more right before the terminal write.
+        """
         generation = int(snapshot.generation_id)
         stop, target = self._working_legs(receipt)
         if any(c.state == "UNKNOWN" for c in receipt.children):
@@ -1472,20 +1477,42 @@ class LiquidationService:
         if generation <= max(leg.sent_generation or leg.fence_generation for leg in legs):
             return self._wait(receipt, generation, "awaiting a generation newer than the re-protect legs")
         side = _reducing_side(position.quantity)
-        for leg in legs:
-            row = self._leg_row(leg)
+        rows = [self._leg_row(leg) for leg in legs]
+        for leg, row in zip(legs, rows):
             linked = row is not None and getattr(row, "oca_group", None) == stop.oca_group \
                 and getattr(row, "oca_type", None) == 2 and getattr(row, "action", None) == side
             if not linked:
                 return self._escalate_now(
                     receipt, snapshot, f"REPROTECT_FAILED: {leg.child_id} is not a linked protective leg at the broker")
+        for leg, row in zip(legs, rows):
+            if self._leg_changed(leg, row):
+                receipt = self._observe_children(receipt, snapshot, int(self._dispatch.newest_generation()))
+                return self._wait(receipt, generation, f"{leg.child_id} changed since it was observed; observed again")
             if leg.outstanding_quantity != remaining:
                 return self._wait(receipt, generation,
                                   f"{leg.child_id} outstanding {leg.outstanding_quantity} != position {remaining}")
+        if [self._leg_fingerprint(self._leg_row(leg)) for leg in legs] != [self._leg_fingerprint(r) for r in rows]:
+            return self._wait(receipt, generation, "a re-protect leg changed while DONE was decided; reading it again")
         state = self._partial_outcome(receipt)
         detail = ("re-protect legs working in one OCA group for the remaining quantity" if state == "DONE" else
                   "the partial reduce sold nothing; the position is protected again, the close failed")
         return self._finish(receipt, state, generation_id=generation, remaining_quantity=remaining, detail=detail)
+
+    @staticmethod
+    def _leg_changed(leg: ChildRef, row) -> bool:
+        """#22: True when the leg's row no longer says what the WORKING child recorded."""
+        filled = float(getattr(row, "filled_quantity", 0.0) or 0.0)
+        total = float(getattr(row, "total_quantity", 0.0) or 0.0)
+        return (getattr(row, "status", None) not in _BROKER_ACCEPTED or filled != leg.filled_quantity
+                or max(total - filled, 0.0) != leg.outstanding_quantity)
+
+    @staticmethod
+    def _leg_fingerprint(row) -> Optional[tuple]:
+        """Everything DONE reads from a leg's row; it must not change before the terminal write (#22)."""
+        if row is None:
+            return None
+        return tuple(getattr(row, field, None) for field in
+                     ("status", "filled_quantity", "total_quantity", "oca_group", "oca_type", "action", "revision"))
 
     def _partial_outcome(self, receipt) -> str:
         """R25 / D4: protection restored is not the requested reduction. Only a proven fill is DONE."""

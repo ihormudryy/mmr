@@ -189,6 +189,7 @@ class FakeArtifactVerifier:
     def __init__(self):
         self.calls: list[dict] = []
         self._error = None
+        self.allowlist = ("265598",)
 
     def fail_with(self, exc):
         self._error = exc
@@ -208,7 +209,7 @@ class FakeArtifactVerifier:
             manifest_digest="manifest-ok",
             dataset_manifest_digest="dataset-ok",
             parameters={},
-            allowlist=("265598",),
+            allowlist=self.allowlist,
             max_gross_allocation=0.06,
             expires_at=now + dt.timedelta(days=30),
             public_key_id="ed25519-test",
@@ -885,6 +886,56 @@ def test_sell_intent_with_an_inexact_conid_is_invalid_before_any_broker_read(tmp
         body=body, source="strategy_service"))
     assert (receipt.state, receipt.error_code) == ("REJECTED", "INTENT_INVALID")
     assert (captures, liquidation.starts, stack.dispatch.calls) == ([], [], [])
+
+
+def _recording_broker(captures, held=10.0):
+    return SimpleNamespace(capture=lambda account_id: captures.append(account_id) or SimpleNamespace(
+        account_id=ACCOUNT, generation_id=1, reducible_quantity=lambda conid: held))
+
+
+def test_sell_intent_for_a_conid_outside_the_artifact_allowlist_is_refused_before_any_broker_read(tmp_path):
+    """#29/#22 round 6: the armed artifact allowlists only 999999; a SELL of the held 265598 must not
+    start a close. Refused before any snapshot, claim or order."""
+    liquidation, captures = _FakeCloseLiquidation(), []
+    verifier = FakeArtifactVerifier()
+    verifier.allowlist = ("999999",)
+    stack = _build_stack(tmp_path, liquidation=liquidation, broker=_recording_broker(captures), verifier=verifier)
+    receipt, intent = _execute_sell(stack, tmp_path, None)
+    assert (receipt.state, receipt.error_code) == ("REJECTED", "CONID_NOT_PERMITTED")
+    assert (captures, liquidation.starts, stack.dispatch.calls) == ([], [], [])
+    assert stack.ledger.get(intent.command_id).state == "REJECTED"
+
+
+@pytest.mark.parametrize("bad", [True, "1", 1.0, 0, -1])
+def test_typed_intent_request_refuses_an_inexact_conid_before_the_handler(tmp_path, bad):
+    """#21 round 6: the typed RPC model is the first parser. It must not turn true, "1" or 1.0 into
+    conid 1 (the intent ids are derived for conid 1, and the artifact allowlists 1 here)."""
+    from trader.messaging.production_api import _execute_automated_intent_rpc_handler
+    from trader.messaging.typed_rpc import _coerce_request_body
+
+    liquidation, captures = _FakeCloseLiquidation(), []
+    verifier = FakeArtifactVerifier()
+    verifier.allowlist = ("1", "265598")
+    stack = _build_stack(tmp_path, liquidation=liquidation, broker=_recording_broker(captures), verifier=verifier)
+    (tmp_path / "bundles" / ARTIFACT_DIGEST.replace(":", "_")).mkdir(parents=True, exist_ok=True)
+    intent = make_intent(side="SELL", conid=1, requested_quantity=None)
+    handler = _execute_automated_intent_rpc_handler(stack.coordinator, ACCOUNT)
+    with pytest.raises(ValidationError):
+        handler(_coerce_request_body(dict(intent_to_wire(intent), conid=bad), ExecuteAutomatedIntentRequest))
+    assert (captures, liquidation.starts) == ([], [])
+
+
+def test_typed_intent_request_accepts_an_exact_conid(tmp_path):
+    liquidation, captures = _FakeCloseLiquidation(), []
+    from trader.messaging.production_api import _execute_automated_intent_rpc_handler
+    from trader.messaging.typed_rpc import _coerce_request_body
+
+    stack = _build_stack(tmp_path, liquidation=liquidation, broker=_recording_broker(captures))
+    (tmp_path / "bundles" / ARTIFACT_DIGEST.replace(":", "_")).mkdir(parents=True, exist_ok=True)
+    intent = make_intent(side="SELL", requested_quantity=None)
+    handler = _execute_automated_intent_rpc_handler(stack.coordinator, ACCOUNT)
+    receipt = handler(_coerce_request_body(intent_to_wire(intent), ExecuteAutomatedIntentRequest))
+    assert receipt["error_code"] == "CLOSE_PENDING" and liquidation.starts[0][3]["conid"] == 265598
 
 
 def test_sell_intent_refused_while_another_close_owns_the_conid(tmp_path):

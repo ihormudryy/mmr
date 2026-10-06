@@ -257,7 +257,7 @@ class AutomatedIntentCommandService:
         # A SELL on the long-only path is an exit, never a bracket (spec 5.1). It adds no
         # exposure, so the pause on new exposure does not stop it (R32).
         if intent.side == "SELL":
-            return self._execute_close(cmd, intent)
+            return self._execute_close(cmd, intent, artifact)
 
         order_group_id = f"og-{cmd.command_id}"
         order_ref = encode_order_ref(order_group_id)
@@ -376,12 +376,14 @@ class AutomatedIntentCommandService:
             )
         self._journal.mutate_batch_work(self._journal.connect(), claim)
 
-    def _execute_close(self, cmd, intent) -> CommandReceipt:
+    def _execute_close(self, cmd, intent, artifact) -> CommandReceipt:
         """Prove the SELL reduces the held long on the account's broker snapshot, then close.
 
-        The proof is a reduction check, not a sizing: the close sizes every
-        reduce from its own fenced generations, and the reduce-only boundary
-        checks IB's live position again (Task 14).
+        The conid must be in the verified artifact's allowlist first (#29 round 6):
+        a strategy may only close what its artifact may trade. The proof is a
+        reduction check, not a sizing: the close sizes every reduce from its
+        own fenced generations, and the reduce-only boundary checks IB's live
+        position again (Task 14).
         """
         from trader.trading.exit_owner import ExitInProgress
         from trader.trading.liquidation_service import LiquidationRefused
@@ -393,6 +395,10 @@ class AutomatedIntentCommandService:
         if cmd.account_id != self._account_id:
             self._transition(cmd, "VALIDATED", "REJECTED", error_code="ACCOUNT_MISMATCH")
             return self._receipt(cmd.command_id, "REJECTED", "ACCOUNT_MISMATCH", False)
+        if str(intent.conid) not in {str(item) for item in artifact.allowlist}:
+            self._transition(cmd, "VALIDATED", "REJECTED", error_code="CONID_NOT_PERMITTED")
+            return self._receipt(cmd.command_id, "REJECTED", "CONID_NOT_PERMITTED", False,
+                                 outcome={"detail": f"conid {intent.conid} is not in the artifact allowlist"})
         self._claim(cmd, require_unpaused=False)
         try:
             snapshot = self._broker.capture(self._account_id)

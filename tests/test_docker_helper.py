@@ -450,3 +450,18 @@ def test_runbook_names_the_isolated_key_check_as_the_cutover_gate():
     text = (REPO_ROOT / "docs/OPERATIONAL_STATE.md").read_text()
     assert "./docker.sh -K" in text
     assert "docker compose --profile test run fullstack-tests" not in text
+
+
+# --- PR #50 round 2: -K never runs together with another action ---
+
+@pytest.mark.parametrize("args", [
+    ("-K", "-d"), ("-d", "-K"), ("-K", "-u"), ("-K", "-b"), ("-K", "-g"), ("-K", "-c"),
+    ("-K", "-f"), ("-K", "-k"), ("-K", "-B"), ("-K", "-r"), ("-K", "-i"), ("-K", "-e"),
+    ("-K", "-l"), ("-K", "-n"), ("-K", "-s"), ("-K", "-a"),
+])
+def test_K_combined_with_any_other_action_refuses_before_any_docker_call(fake_docker: FakeDocker, args):
+    fake_docker.write_keys()
+    result = fake_docker.run(*args)
+    assert result.returncode != 0
+    assert "-K" in result.stdout
+    assert not fake_docker.log_path.exists() or fake_docker.log_path.read_text() == ""

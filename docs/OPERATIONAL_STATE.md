@@ -297,7 +297,9 @@ are separate; each loader refuses the other kind.
       Each container only runs `mmr keys check-mount <service>`: it must see
       exactly its own `.key`, its own `.pub` and its peers' `.pub`, and
       `service_hmac.key` must read empty. No service process starts, no port
-      is published and the running `mmr` stack is not touched. Abort the
+      is published and the running `mmr` stack is not touched. `-K` runs
+      alone: combined with any other option (e.g. `-K -d`) it refuses before
+      any Docker call. Abort the
       cutover on any failure. (The `fullstack-tests` profile is no longer the
       cutover gate: it stops the dashboard and signals trader PID 1.)
    4. `./docker.sh -u`.

@@ -32,7 +32,8 @@ echo_usage() {
     echo "  -k --restore FILE [--identity-file PATH [--delete-identity-file]]"
     echo "      (restore keys/rpc; the age identity is read from stdin by default)"
     echo "  -K (key check: cutover gate; in an isolated compose project, check each"
-    echo "      container sees only its own key pair, its peers' .pub and an empty HMAC file)"
+    echo "      container sees only its own key pair, its peers' .pub and an empty HMAC file;"
+    echo "      runs alone, refused together with any other option)"
     echo
 }
 
@@ -108,6 +109,17 @@ done
 if [[ $b == "n" && $c == "n" && $f == "n" && $u == "n" && $d == "n" && $s == "n" && $a == "n" && $g == "n" && $l == "n" && $e == "n" && $i == "n" && $r == "n" && $n == "n" && $B == "n" && $k == "n" && $K == "n" ]]; then
     echo_usage
     exit 0
+fi
+
+# -K is a non-disruptive pre-cutover gate: it must never share a run with an
+# action that touches the live project (e.g. -d would stop it first).
+if [[ $K == "y" ]]; then
+    for other in $b $c $f $u $d $s $a $g $l $e $i $r $n $B $k; do
+        if [[ $other == "y" ]]; then
+            echo "Error: -K (key check) runs alone; drop the other options and run them separately."
+            exit 1
+        fi
+    done
 fi
 
 if [[ $e == "y" ]]; then

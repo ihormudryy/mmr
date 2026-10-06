@@ -109,3 +109,55 @@ def test_keygen_entry_module_imports_no_service_code():
             "print(bad)")
     out = subprocess.run([sys.executable, "-c", code], capture_output=True, text=True, check=True)
     assert out.stdout.strip() == "[]"
+
+
+# --- PR #50 round 1, finding 3: an interrupted rotation never starts ---
+
+def test_rotation_interrupted_between_the_two_renames_fails_before_serving(tmp_path, monkeypatch):
+    import trader.messaging.rpc_keys as rpc_keys
+
+    init_keys(tmp_path)
+    old_private = (tmp_path / "trader.key").read_bytes()
+    old_public = (tmp_path / "trader.pub").read_bytes()
+    real_replace = os.replace
+    calls = []
+
+    def crash_on_second_rename(src, dst):
+        calls.append(dst)
+        if len(calls) == 2:
+            raise OSError("simulated crash between the two renames")
+        real_replace(src, dst)
+
+    monkeypatch.setattr(rpc_keys.os, "replace", crash_on_second_rename)
+    with pytest.raises(OSError, match="simulated crash"):
+        init_keys(tmp_path, rotate="trader")
+    monkeypatch.setattr(rpc_keys.os, "replace", real_replace)
+
+    assert [os.path.basename(p) for p in calls] == ["trader.pub", "trader.key"]
+    assert (tmp_path / "trader.pub").read_bytes() != old_public
+    assert (tmp_path / "trader.key").read_bytes() == old_private
+    assert not list(tmp_path.glob(".*.tmp"))
+    with pytest.raises(RpcKeyError, match="does not match"):
+        load_identity_material("trader", tmp_path)
+    with pytest.raises(RpcKeyError, match="does not match"):
+        init_keys(tmp_path)
+    assert {r.status for r in init_keys(tmp_path, rotate="trader") if r.principal == "trader"} == {"rotated"}
+    load_identity_material("trader", tmp_path)
+
+
+def test_rotation_writes_both_temp_files_before_the_first_rename(tmp_path, monkeypatch):
+    import trader.messaging.rpc_keys as rpc_keys
+
+    init_keys(tmp_path)
+    real_replace = os.replace
+    temps_at_first_rename = []
+
+    def record(src, dst):
+        if not temps_at_first_rename:
+            temps_at_first_rename.extend(sorted(p.name for p in tmp_path.glob(".*.tmp")))
+        real_replace(src, dst)
+
+    monkeypatch.setattr(rpc_keys.os, "replace", record)
+    init_keys(tmp_path, rotate="cli")
+    assert len(temps_at_first_rename) == 2
+    assert {n.split(".")[1] for n in temps_at_first_rename} == {"cli"}

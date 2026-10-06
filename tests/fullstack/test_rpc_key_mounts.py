@@ -9,7 +9,7 @@ from pathlib import Path
 
 import pytest
 
-from trader.messaging.principals import peers_for
+from trader.messaging.principals import rpc_files_for
 
 docker = pytest.importorskip('docker', reason='docker (docker-py) not installed in this environment')
 
@@ -49,8 +49,7 @@ def _exec(client, service: str, command: list[str]) -> str:
                                                ('data', None)])
 def test_container_lists_only_its_keys(docker_client, service, principal):
     out = _exec(docker_client, service, ['ls', '/home/trader/.config/mmr/keys/rpc'])
-    expected = set() if principal is None else {f'{principal}.key'} | {f'{p}.pub' for p in peers_for(principal)}
-    assert set(out.split()) == expected
+    assert set(out.split()) == rpc_files_for(principal)
 
 
 @pytest.mark.parametrize('service', ['trader', 'strategy', 'dashboard', 'scheduler', 'data'])

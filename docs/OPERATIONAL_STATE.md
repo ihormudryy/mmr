@@ -279,8 +279,10 @@ message with no traceback.
 
 Keys live in `~/.config/mmr/keys/rpc/`: `<principal>.key` (mode 0600) and
 `<principal>.pub` (0644) for `trader`, `strategy`, `cli`, `dashboard`,
-`ai_supervisor`, `ai_research`. Each container mounts only its own private
-key and the public keys it needs (tmpfs overlay + per-file read-only binds).
+`ai_supervisor`, `ai_research`. Each container mounts only its own key pair
+and the public keys it needs (tmpfs overlay + per-file read-only binds). A
+service refuses to start when its own `.pub` is missing or does not match its
+`.key`.
 `./docker.sh -u` refuses to start while any key file the compose file names
 is missing. RPC keys and bundle-signing keys (`keys/verify`, `keys/private`)
 are separate; each loader refuses the other kind.
@@ -300,6 +302,10 @@ are separate; each loader refuses the other kind.
    (a bind mount keeps the old inode until restart). Requests in flight
    during the switch fail with `AUTHENTICATION_ERROR`; clients retry. Then
    check `mmr status`, `/cc`, and `docker compose run --rm cli strategies`.
+   Rotation writes both new files to temp names first, then renames `.pub`
+   and last `.key`. If it is cut off between the two renames, the pair does
+   not match: the service refuses to start and `-k` reports it. Run the same
+   `--rotate` again to repair it.
 2. **Lost private key or lost host:** restore from the encrypted backup
    (below). Without a backup, rotate that principal (all services that trust
    it restart together).

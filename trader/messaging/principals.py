@@ -52,6 +52,14 @@ def peers_for(principal: str) -> frozenset[str]:
     return SERVER_ACCEPTS.get(principal, frozenset()) | CALLS[principal]
 
 
+def rpc_files_for(principal: str | None) -> frozenset[str]:
+    """Key files a service signing as ``principal`` must see: its own pair and its peers' ``.pub``."""
+    if principal is None:
+        return frozenset()
+    return frozenset({f"{principal}.key", f"{principal}.pub"}
+                     | {f"{peer}.pub" for peer in peers_for(principal)})
+
+
 # ---------------------------------------------------------------------------
 # Per-method allow-list, keyed by (socket role, method). A production
 # registry refuses to register a method that has no entry here; an empty

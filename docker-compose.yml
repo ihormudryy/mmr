@@ -91,8 +91,9 @@ x-mmr-common-env: &mmr-common-env
 
 # RPC identity keys (SP1 Plan 2, spec 5.3). Each service mounts the whole
 # ~/.config/mmr, then a tmpfs over keys/rpc hides every host key, then
-# per-file read-only binds put back only that service's own private key and
-# the public keys it needs (trader.messaging.principals.peers_for). No
+# per-file read-only binds put back only that service's own key pair (the
+# own .pub is checked against the .key at startup) and the public keys it
+# needs (trader.messaging.principals.rpc_files_for). No
 # container mounts another principal's private key. Trap: a per-file bind of a
 # host file that does not exist makes Docker create a DIRECTORY in its place,
 # and the service then fails with a confusing error -- `./docker.sh -u`
@@ -187,7 +188,7 @@ services:
     volumes:
       - ${HOME}/.config/mmr:/home/trader/.config/mmr
       # RPC keys: tmpfs hides the host keys/rpc dir; only this principal's
-      # private key and the public keys it needs are bound back in (read-only).
+      # key pair and the public keys it needs are bound back in (read-only).
       - type: tmpfs
         target: /home/trader/.config/mmr/keys/rpc
         tmpfs:
@@ -250,13 +251,14 @@ services:
     volumes:
       - ${HOME}/.config/mmr:/home/trader/.config/mmr
       # RPC keys: tmpfs hides the host keys/rpc dir; only this principal's
-      # private key and the public keys it needs are bound back in (read-only).
+      # key pair and the public keys it needs are bound back in (read-only).
       - type: tmpfs
         target: /home/trader/.config/mmr/keys/rpc
         tmpfs:
           size: 65536
           mode: 0755
       - ${HOME}/.config/mmr/keys/rpc/trader.key:/home/trader/.config/mmr/keys/rpc/trader.key:ro
+      - ${HOME}/.config/mmr/keys/rpc/trader.pub:/home/trader/.config/mmr/keys/rpc/trader.pub:ro
       - ${HOME}/.config/mmr/keys/rpc/ai_research.pub:/home/trader/.config/mmr/keys/rpc/ai_research.pub:ro
       - ${HOME}/.config/mmr/keys/rpc/ai_supervisor.pub:/home/trader/.config/mmr/keys/rpc/ai_supervisor.pub:ro
       - ${HOME}/.config/mmr/keys/rpc/cli.pub:/home/trader/.config/mmr/keys/rpc/cli.pub:ro
@@ -340,13 +342,14 @@ services:
     volumes:
       - ${HOME}/.config/mmr:/home/trader/.config/mmr
       # RPC keys: tmpfs hides the host keys/rpc dir; only this principal's
-      # private key and the public keys it needs are bound back in (read-only).
+      # key pair and the public keys it needs are bound back in (read-only).
       - type: tmpfs
         target: /home/trader/.config/mmr/keys/rpc
         tmpfs:
           size: 65536
           mode: 0755
       - ${HOME}/.config/mmr/keys/rpc/strategy.key:/home/trader/.config/mmr/keys/rpc/strategy.key:ro
+      - ${HOME}/.config/mmr/keys/rpc/strategy.pub:/home/trader/.config/mmr/keys/rpc/strategy.pub:ro
       - ${HOME}/.config/mmr/keys/rpc/cli.pub:/home/trader/.config/mmr/keys/rpc/cli.pub:ro
       - ${HOME}/.config/mmr/keys/rpc/dashboard.pub:/home/trader/.config/mmr/keys/rpc/dashboard.pub:ro
       - ${HOME}/.config/mmr/keys/rpc/trader.pub:/home/trader/.config/mmr/keys/rpc/trader.pub:ro
@@ -458,13 +461,14 @@ services:
     volumes:
       - ${HOME}/.config/mmr:/home/trader/.config/mmr
       # RPC keys: tmpfs hides the host keys/rpc dir; only this principal's
-      # private key and the public keys it needs are bound back in (read-only).
+      # key pair and the public keys it needs are bound back in (read-only).
       - type: tmpfs
         target: /home/trader/.config/mmr/keys/rpc
         tmpfs:
           size: 65536
           mode: 0755
       - ${HOME}/.config/mmr/keys/rpc/dashboard.key:/home/trader/.config/mmr/keys/rpc/dashboard.key:ro
+      - ${HOME}/.config/mmr/keys/rpc/dashboard.pub:/home/trader/.config/mmr/keys/rpc/dashboard.pub:ro
       - ${HOME}/.config/mmr/keys/rpc/strategy.pub:/home/trader/.config/mmr/keys/rpc/strategy.pub:ro
       - ${HOME}/.config/mmr/keys/rpc/trader.pub:/home/trader/.config/mmr/keys/rpc/trader.pub:ro
       # Retired shared HMAC key: unreadable in every container (ruling 14).
@@ -509,7 +513,7 @@ services:
     volumes:
       - ${HOME}/.config/mmr:/home/trader/.config/mmr
       # RPC keys: tmpfs hides the host keys/rpc dir; only this principal's
-      # private key and the public keys it needs are bound back in (read-only).
+      # key pair and the public keys it needs are bound back in (read-only).
       - type: tmpfs
         target: /home/trader/.config/mmr/keys/rpc
         tmpfs:
@@ -555,6 +559,7 @@ services:
           size: 65536
           mode: 0755
       - ${HOME}/.config/mmr/keys/rpc/cli.key:/home/trader/.config/mmr/keys/rpc/cli.key:ro
+      - ${HOME}/.config/mmr/keys/rpc/cli.pub:/home/trader/.config/mmr/keys/rpc/cli.pub:ro
       - ${HOME}/.config/mmr/keys/rpc/strategy.pub:/home/trader/.config/mmr/keys/rpc/strategy.pub:ro
       - ${HOME}/.config/mmr/keys/rpc/trader.pub:/home/trader/.config/mmr/keys/rpc/trader.pub:ro
       - /dev/null:/home/trader/.config/mmr/service_hmac.key:ro

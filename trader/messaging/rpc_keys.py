@@ -147,11 +147,16 @@ def _refuse_shared_or_bundle_keys(keys_dir: Path, raw_by_principal: Mapping[str,
 def load_identity_material(
     principal: str, keys_dir: Optional[Path] = None,
 ) -> tuple[Ed25519PrivateKey, RpcKeyring]:
-    """Load ``principal``'s private key and the public keys of its peers."""
+    """Load ``principal``'s private key and the public keys of its peers.
+
+    The own ``.pub`` must exist and match the private key, so a half-done
+    rotation or a missing mount stops startup instead of serving. It is
+    checked, never added to the keyring: a server does not accept itself.
+    """
     if not is_valid_principal_name(principal):
         raise RpcKeyError(f"unknown principal {principal!r}")
     keys_dir = Path(keys_dir) if keys_dir is not None else default_rpc_keys_dir()
-    private_key = load_rpc_private_key(keys_dir, principal)
+    private_key = _load_matching_pair(keys_dir, principal)
     peer_keys = {peer: load_rpc_public_key(keys_dir, peer) for peer in sorted(peers_for(principal))}
     raw_by_principal = {peer: raw_public_bytes(key) for peer, key in peer_keys.items()}
     raw_by_principal[principal] = raw_public_bytes(private_key.public_key())
@@ -190,8 +195,8 @@ class KeyInitRow:
     key_id: str
 
 
-def _write_new_file(path: Path, data: bytes, mode: int) -> None:
-    """Write ``data`` to a fresh temp file with ``mode``, fsync, then move it onto ``path``."""
+def _stage_file(path: Path, data: bytes, mode: int) -> Path:
+    """Write ``data`` to a fresh fsynced temp file next to ``path`` and return its path."""
     tmp = path.with_name(f".{path.name}.{secrets.token_hex(8)}.tmp")
     fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL, mode)
     try:
@@ -200,11 +205,10 @@ def _write_new_file(path: Path, data: bytes, mode: int) -> None:
             handle.flush()
             os.fsync(handle.fileno())
         os.chmod(tmp, mode)
-        os.replace(tmp, path)
     except BaseException:
-        if tmp.exists():
-            tmp.unlink()
+        tmp.unlink(missing_ok=True)
         raise
+    return tmp
 
 
 def _new_keypair_bytes() -> tuple[bytes, bytes, Ed25519PrivateKey]:
@@ -214,20 +218,43 @@ def _new_keypair_bytes() -> tuple[bytes, bytes, Ed25519PrivateKey]:
 
 
 def _install_keypair(keys_dir: Path, principal: str) -> str:
+    """Write both new files to temp names first, then rename ``.pub`` and ``.key``.
+
+    Two renames cannot be one atomic step. A crash before the first rename
+    leaves the old pair untouched. A crash between them leaves a new ``.pub``
+    with the old ``.key``; every loader then refuses the pair ("does not
+    match") and ``--rotate`` again repairs it. The private key is renamed last
+    so the old secret stays in place until the new public half is on disk.
+    """
     private_pem, public_pem, private_key = _new_keypair_bytes()
-    _write_new_file(keys_dir / f"{principal}{PRIVATE_SUFFIX}", private_pem, PRIVATE_KEY_MODE)
-    _write_new_file(keys_dir / f"{principal}{PUBLIC_SUFFIX}", public_pem, PUBLIC_KEY_MODE)
+    private_path = keys_dir / f"{principal}{PRIVATE_SUFFIX}"
+    public_path = keys_dir / f"{principal}{PUBLIC_SUFFIX}"
+    staged: list[Path] = []
+    try:
+        staged_public = _stage_file(public_path, public_pem, PUBLIC_KEY_MODE)
+        staged.append(staged_public)
+        staged_private = _stage_file(private_path, private_pem, PRIVATE_KEY_MODE)
+        staged.append(staged_private)
+        os.replace(staged_public, public_path)
+        os.replace(staged_private, private_path)
+    finally:
+        for path in staged:
+            path.unlink(missing_ok=True)
     return public_key_id(private_key.public_key())
 
 
-def _existing_pair_key_id(keys_dir: Path, principal: str) -> str:
+def _load_matching_pair(keys_dir: Path, principal: str) -> Ed25519PrivateKey:
     private_key = load_rpc_private_key(keys_dir, principal)
     public_key = load_rpc_public_key(keys_dir, principal)
     if raw_public_bytes(private_key.public_key()) != raw_public_bytes(public_key):
         raise RpcKeyError(
             f"{keys_dir / (principal + PUBLIC_SUFFIX)} does not match "
             f"{keys_dir / (principal + PRIVATE_SUFFIX)}; rotate {principal} to replace both")
-    return public_key_id(public_key)
+    return private_key
+
+
+def _existing_pair_key_id(keys_dir: Path, principal: str) -> str:
+    return public_key_id(_load_matching_pair(keys_dir, principal).public_key())
 
 
 def init_keys(keys_dir: Path, *, rotate: Optional[str] = None) -> list[KeyInitRow]:

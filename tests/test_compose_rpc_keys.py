@@ -5,7 +5,7 @@ from tests.compose_rpc_helpers import (
     COMPOSE_PATH, CONTAINER_RPC_DIR, RETIRED_HMAC_TARGET, ROOT, load_compose, mounts_config_dir,
     visible_rpc_files, volumes,
 )
-from trader.messaging.principals import KNOWN_PRINCIPALS, SERVICE_PRINCIPAL, peers_for
+from trader.messaging.principals import KNOWN_PRINCIPALS, SERVICE_PRINCIPAL, rpc_files_for
 
 
 @pytest.fixture(scope="module")
@@ -14,11 +14,14 @@ def compose():
 
 
 @pytest.mark.parametrize("name,principal", sorted(SERVICE_PRINCIPAL.items()))
-def test_each_service_sees_only_its_own_private_key_and_needed_public_keys(compose, name, principal):
-    files = visible_rpc_files(compose["services"][name])
-    expected = set() if principal is None else (
-        {f"{principal}.key"} | {f"{p}.pub" for p in peers_for(principal)})
-    assert files == expected
+def test_each_service_sees_only_its_own_key_pair_and_needed_public_keys(compose, name, principal):
+    assert visible_rpc_files(compose["services"][name]) == rpc_files_for(principal)
+
+
+@pytest.mark.parametrize("name,principal", sorted(
+    (n, p) for n, p in SERVICE_PRINCIPAL.items() if p is not None))
+def test_each_signing_service_mounts_its_own_public_key(compose, name, principal):
+    assert f"{principal}.pub" in visible_rpc_files(compose["services"][name])
 
 
 def test_every_long_lived_service_is_classified(compose):

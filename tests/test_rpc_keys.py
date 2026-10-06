@@ -126,3 +126,38 @@ def test_error_messages_never_contain_key_bytes(tmp_path):
     with pytest.raises(RpcKeyError) as exc:
         load_rpc_private_key(tmp_path, "cli")
     assert b"PRIVATE KEY" not in str(exc.value).encode() and secret not in str(exc.value).encode()
+
+
+# --- PR #50 round 1, finding 3: the own key pair is checked at startup ---
+
+def test_missing_own_public_key_fails_before_serving(tmp_path):
+    from trader.messaging.typed_rpc import ServiceIdentity
+
+    write_keyset(tmp_path)
+    (tmp_path / "trader.pub").unlink()
+    with pytest.raises(RpcKeyError, match="trader.pub is missing"):
+        load_identity_material("trader", tmp_path)
+    with pytest.raises(RpcKeyError, match="trader.pub is missing"):
+        ServiceIdentity.load("trader", tmp_path)
+
+
+def test_own_public_key_of_another_keypair_fails_before_serving(tmp_path):
+    from cryptography.hazmat.primitives import serialization
+    from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
+
+    from trader.messaging.typed_rpc import ServiceIdentity
+
+    write_keyset(tmp_path)
+    stranger = Ed25519PrivateKey.generate().public_key()
+    (tmp_path / "strategy.pub").write_bytes(stranger.public_bytes(
+        serialization.Encoding.PEM, serialization.PublicFormat.SubjectPublicKeyInfo))
+    with pytest.raises(RpcKeyError, match="does not match"):
+        load_identity_material("strategy", tmp_path)
+    with pytest.raises(RpcKeyError, match="does not match"):
+        ServiceIdentity.load("strategy", tmp_path)
+
+
+def test_own_public_key_is_checked_but_never_trusted_as_a_caller(tmp_path):
+    write_keyset(tmp_path)
+    _private, keyring = load_identity_material("dashboard", tmp_path)
+    assert "dashboard" not in keyring.principals()

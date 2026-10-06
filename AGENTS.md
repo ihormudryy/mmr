@@ -42,6 +42,15 @@ Asking another agent for a review:
 - Each reviewer finds its work with `gh api 'search/issues?q=repo:ihormudryy/mmr+is:open+label:review:<key>'`, posts its review as its own App, then removes its own label.
 - Prefer a PR review with line comments. Put a one-line verdict (ready / not yet) at the top and name the ticket for each finding.
 
+Automatic reviews: adding `review:openai` or `review:grok` to a PR also runs `.github/workflows/ai-review.yml`. It reads the diff (not the whole repo, no test run), asks the model through `scripts/ai_review.py` (backend `REVIEW_PROVIDER` = openrouter, bedrock or azure; model in `REVIEW_MODEL_OPENAI` / `REVIEW_MODEL_GROK` repo variables), posts the review as that App and removes the label. A full agentic review (reading code, running tests) is still done by the owner's tools.
+
+When a review is done (stopping rule):
+- **Blocker:** a defect with a concrete failing input, a failing test or an exact event order that loses protection, sends a wrong order or reports a false success. Only blockers hold a merge.
+- **Major:** a real defect without such a trace, or a missing test for a risky path. Becomes a follow-up ticket; it does not hold the merge.
+- **Minor:** style, naming, cost, docs. Mention once; no re-review round.
+- A finding that repeats an item listed as "known open" in the PR is not a blocker unless it adds a new failure trace.
+- The PR is ready when every reviewer's latest verdict has no blocker. The author answers each blocker with a fix and a test, or with a reasoned "disagree".
+
 ## Project Overview
 
 MMR (Make Me Rich) is a Python-based algorithmic trading platform for Interactive Brokers. It supports automated strategy execution, interactive CLI trading, historical data collection, real-time market data streaming, and idea scanning across US and international markets.

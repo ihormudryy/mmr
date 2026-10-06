@@ -1,0 +1,61 @@
+name: AI review
+
+# Adding the label `review:openai` or `review:grok` to a PR runs that reviewer.
+# The script always comes from master, never from the PR branch, because this job
+# holds the App key and the model provider key.
+
+on:
+  pull_request:
+    types: [labeled]
+  workflow_dispatch:
+    inputs:
+      pr:
+        description: Pull request number
+        required: true
+      reviewer:
+        description: openai or grok
+        required: true
+
+permissions:
+  contents: read
+
+jobs:
+  review:
+    if: >-
+      github.event_name == 'workflow_dispatch' ||
+      github.event.label.name == 'review:openai' ||
+      github.event.label.name == 'review:grok'
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    concurrency:
+      group: ai-review-${{ github.event.pull_request.number || inputs.pr }}-${{ github.event.label.name || inputs.reviewer }}
+      cancel-in-progress: true
+    env:
+      REVIEWER_KEY: ${{ inputs.reviewer || (github.event.label.name == 'review:openai' && 'openai' || 'grok') }}
+      PR_NUMBER: ${{ github.event.pull_request.number || inputs.pr }}
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          ref: master
+
+      - id: app-token
+        uses: actions/create-github-app-token@v2
+        with:
+          app-id: ${{ env.REVIEWER_KEY == 'openai' && vars.MMR_OPENAI_APP_ID || vars.MMR_GROK_APP_ID }}
+          private-key: ${{ env.REVIEWER_KEY == 'openai' && secrets.MMR_OPENAI_APP_KEY || secrets.MMR_GROK_APP_KEY }}
+
+      - if: vars.REVIEW_PROVIDER == 'bedrock'
+        run: pip install boto3
+
+      - run: python scripts/ai_review.py
+        env:
+          GH_TOKEN: ${{ steps.app-token.outputs.token }}
+          REVIEW_PROVIDER: ${{ vars.REVIEW_PROVIDER || 'openrouter' }}
+          REVIEW_MODEL: ${{ env.REVIEWER_KEY == 'openai' && vars.REVIEW_MODEL_OPENAI || vars.REVIEW_MODEL_GROK }}
+          OPENROUTER_API_KEY: ${{ secrets.OPENROUTER_API_KEY }}
+          AZURE_OPENAI_ENDPOINT: ${{ vars.AZURE_OPENAI_ENDPOINT }}
+          AZURE_OPENAI_API_VERSION: ${{ vars.AZURE_OPENAI_API_VERSION }}
+          AZURE_OPENAI_API_KEY: ${{ secrets.AZURE_OPENAI_API_KEY }}
+          AWS_REGION: ${{ vars.AWS_REGION }}
+          AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}

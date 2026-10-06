@@ -493,3 +493,12 @@ def test_hot_arm_and_disarm_use_real_command_stack_and_strategy_binding(tmp_path
     assert stack.automated_intent_service is None
     assert not registry.contains("command", "execute_automated_intent")
     assert trader.automation_enabled is False
+
+
+def test_enabled_stack_applies_safe_close_migrations(tmp_path):
+    from trader.trading.command_stack import build_command_stack
+
+    trader = _trader(tmp_path)
+    build_command_stack(trader, _policy(), now=lambda: NOW)
+    versions = {r[0] for r in trader.journal_db.execute("SELECT version FROM schema_migrations", fetch="all")}
+    assert {35, 36} <= versions

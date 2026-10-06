@@ -808,7 +808,10 @@ def test_busy_liquidation_keeps_protective_failure_root_for_rescan(tmp_path):
     import threading
 
     from trader.data.broker_state import BrokerPositionRow, BrokerRiskSnapshot
-    from trader.trading.liquidation_service import LiquidationBusy, LiquidationService
+    from trader.trading.exit_owner import ExitOwnerRegistry
+    from trader.trading.liquidation_service import (
+        LiquidationBusy, LiquidationRunStore, LiquidationService, apply_liquidation_migration,
+    )
 
     position = BrokerPositionRow(
         account_id=ACCOUNT, conid=CONID, symbol="AAPL", sec_type="STK", exchange="SMART",
@@ -822,10 +825,15 @@ def test_busy_liquidation_keeps_protective_failure_root_for_rescan(tmp_path):
         positions=(position,), working_orders=(),
     )
     reduces = []
+    db = DuckDBConnection.get_instance(str(tmp_path / "liquidation.duckdb"))
+    apply_liquidation_migration(SchemaMigrator(db))
     liquidation = LiquidationService(
         SimpleNamespace(capture=lambda account_id: snapshot),
-        SimpleNamespace(reduce=lambda *args: reduces.append(args), cancel=lambda *args: None),
-        now=lambda: NOW, lock_timeout_seconds=0.05,
+        SimpleNamespace(reduce=lambda *args: reduces.append(args), cancel=lambda *args: None,
+                        find_orders=lambda *args: [], get_order=lambda entity: None,
+                        enumeration_complete=lambda: True, newest_generation=lambda: 1),
+        store=LiquidationRunStore(db), registry=ExitOwnerRegistry(db), now=lambda: NOW,
+        lock_timeout_seconds=0.05,
     )
     saga, intent, state, breaker, _, _ = _started(tmp_path, liquidation=liquidation)
     og = state.order_group_id

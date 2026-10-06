@@ -45,6 +45,7 @@ from trader.trading.risk_producer import RiskProducer
 from trader.trading.dispatch_guard import DispatchGuard
 from trader.trading.circuit_breaker import CircuitBreaker
 from trader.trading.circuit_breaker import BreakerSignal
+from trader.trading.exit_owner import ExitOwnerRegistry
 from trader.trading.liquidation_service import LiquidationService, LiquidationRunStore, apply_liquidation_migration
 from trader.trading.order_correlation import encode_order_ref
 from trader.trading.semantic_readiness import (
@@ -205,15 +206,28 @@ class _UniverseAuthority:
 
 
 class _LiquidationDispatch:
-    """Adapter which keeps emergency flattening on the existing IB boundary."""
-    def __init__(self, dispatch):
+    """Keeps every exit on the one IB boundary; child ids become order refs."""
+    def __init__(self, dispatch, orders_view):
         self._dispatch = dispatch
+        self._orders_view = orders_view
 
-    def cancel(self, order, command_id: str) -> None:
-        self._dispatch.cancel(order.order_entity_id, encode_order_ref(command_id))
+    def cancel(self, order, child_id: str) -> None:
+        self._dispatch.cancel(order.order_entity_id, encode_order_ref(child_id))
 
-    def reduce(self, position, side: str, quantity: float, command_id: str) -> None:
-        self._dispatch.reduce_position(position, side, quantity, encode_order_ref(command_id))
+    def reduce(self, position, side: str, quantity: float, child_id: str) -> None:
+        self._dispatch.reduce_position(position, side, quantity, encode_order_ref(child_id))
+
+    def find_orders(self, account_id: str, child_id: str) -> list:
+        return self._dispatch.find_by_order_ref(account_id, encode_order_ref(child_id))
+
+    def get_order(self, order_entity_id: str):
+        return self._orders_view.get_order(order_entity_id)
+
+    def enumeration_complete(self) -> bool:
+        return self._dispatch.enumeration_complete()
+
+    def newest_generation(self) -> int:
+        return self._dispatch.newest_generation()
 
 
 class _LiquidationBreaker:
@@ -596,7 +610,9 @@ def build_command_stack(
     apply_trading_control_migration(migrator)
     apply_preflight_nonce_migration(migrator)
     apply_circuit_breaker_migration(migrator)
-    apply_liquidation_migration(migrator)
+    apply_liquidation_migration(migrator)          # also applies 35 (exit owners) before 36
+    exit_owner_registry = ExitOwnerRegistry(trader.journal_db)
+    liquidation_store = LiquidationRunStore(trader.journal_db)
     from trader.promotion.evidence_store import apply_evidence_migrations
     from trader.promotion.stage import apply_stage_migration
     from trader.promotion.controller import apply_live_activation_authority_migration
@@ -806,10 +822,11 @@ def build_command_stack(
         ),
     )
     liquidation_service = LiquidationService(
-        broker_snapshot, _LiquidationDispatch(dispatch),
-        breaker=_LiquidationBreaker(circuit_breaker, now), now=now,
-        store=LiquidationRunStore(trader.journal_db),
+        broker_snapshot, _LiquidationDispatch(dispatch, orders_view),
+        store=liquidation_store, registry=exit_owner_registry, now=now,
+        breaker=_LiquidationBreaker(circuit_breaker, now),
         journal=journal, ledger=ledger,
+        schedule_reconcile=lambda command_id: reconciler.schedule(command_id, now()),
     )
     proposal_service = ProposalCommandService(
         repository=repository,
@@ -896,10 +913,10 @@ def build_command_stack(
         db=trader.journal_db,
         calendar=XNYSCalendarPolicy(),
         broker=broker_snapshot,
-        cancel=SessionCancelAdapter(_LiquidationDispatch(dispatch)),
+        cancel=SessionCancelAdapter(_LiquidationDispatch(dispatch, orders_view)),
         liquidation=liquidation_service,
         breaker=circuit_breaker,
-        time_exit=SessionTimeExitAdapter(_LiquidationDispatch(dispatch)),
+        time_exit=SessionTimeExitAdapter(_LiquidationDispatch(dispatch, orders_view)),
         account_id=trader.ib_account,
         now=now,
     )

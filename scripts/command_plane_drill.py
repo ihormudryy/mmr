@@ -584,20 +584,41 @@ def build_scenarios() -> dict[str, Optional[Callable[[str], dict]]]:
 
 # Task 6/7 scenario bodies are added here as those features land; until then the
 # names are declared (above) so the report lists them as pending, not missing.
-def scn_liquidation(_db_path: str) -> dict:
+def scn_liquidation(db_path: str) -> dict:
+    from trader.trading.exit_owner import ExitOwnerRegistry
+    from trader.trading.liquidation_service import LiquidationRunStore, apply_liquidation_migration
+
+    db = DuckDBConnection.get_instance(db_path + ".liquidation")
+    apply_liquidation_migration(SchemaMigrator(db))
     pos = SimpleNamespace(quantity=10.0, conid=CONID)
     snapshots = [
         SimpleNamespace(account_id=ACCOUNT, generation_id=1, positions=(pos,), working_orders=()),
         SimpleNamespace(account_id=ACCOUNT, generation_id=2, positions=(), working_orders=()),
+        SimpleNamespace(account_id=ACCOUNT, generation_id=3, positions=(), working_orders=()),
     ]
-    broker = SimpleNamespace(capture=lambda _account: snapshots.pop(0) if len(snapshots) > 1 else snapshots[0])
-    calls = []
-    dispatch = SimpleNamespace(cancel=lambda *args: calls.append(("cancel", args)),
-                               reduce=lambda *args: calls.append(("reduce", args)))
-    service = LiquidationService(broker, dispatch, now=lambda: NOW)
+    seen = {"generation": 0}
+
+    def capture(_account):
+        snapshot = snapshots.pop(0) if len(snapshots) > 1 else snapshots[0]
+        seen["generation"] = snapshot.generation_id
+        return snapshot
+    calls, rows = [], {}
+
+    def reduce(_position, _side, quantity, child_id):
+        calls.append(("reduce", child_id))
+        rows[child_id] = [SimpleNamespace(status="Filled", filled_quantity=quantity, total_quantity=quantity)]
+    dispatch = SimpleNamespace(cancel=lambda *args: calls.append(("cancel", args)), reduce=reduce,
+                               find_orders=lambda _account, child_id: rows.get(child_id, []),
+                               get_order=lambda _entity: None, enumeration_complete=lambda: True,
+                               newest_generation=lambda: seen["generation"])
+    service = LiquidationService(SimpleNamespace(capture=capture), dispatch, store=LiquidationRunStore(db),
+                                 registry=ExitOwnerRegistry(db), now=lambda: NOW)
     first = service.start(ACCOUNT, "drill-liquidation", NOW + dt.timedelta(minutes=1))
     if first.state == "FLAT" or not calls:
         raise AssertionError("order acknowledgement was treated as broker-flat proof")
+    observed = service.rescan()
+    if observed is None or observed.state == "FLAT":
+        raise AssertionError("the generation that first showed the fill was treated as flat proof")
     terminal = service.rescan()
     if terminal is None or terminal.state != "FLAT":
         raise AssertionError("fresh zero-position broker generation did not resolve liquidation")

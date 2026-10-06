@@ -42,7 +42,7 @@ trader.strategy_service ──► StrategyRuntime (strategy_runtime.py)
                               ├── Typed trader gateway (resolve/publish via 42101)
                               ├── Typed strategy control (42104 command / 42105 query)
                               ├── ZMQ PubSub Subscriber ← tickers
-                              └── Legacy strategy RPC (42005) — optional/compat
+                              └── Legacy strategy RPC (42005) — offline simulation only
 
 trader.data_service ──► DataService (data_service.py)
                           ├── Concurrent history downloads
@@ -63,7 +63,7 @@ scheduler (pycron) ──► cron jobs only (data refresh, backups) — not the 
 
 **Typed Ed25519 RPC (production)** — JSON-safe request/reply on ROUTER sockets (`trader/messaging/typed_rpc.py`). Each principal (`trader`, `strategy`, `cli`, `dashboard`, `ai_supervisor`, `ai_research`) signs with its own Ed25519 key; the request names the principal and its destination (server, role, method), and every response is signed by the server and bound to the request digest. Each registered method has an allow-list entry in `trader/messaging/principals.py` (`TRADER_ACL`, `STRATEGY_ACL`); a caller outside it gets `PERMISSION_DENIED`. Command authority (live approve = `dashboard`, `execute_automated_intent` = `strategy`) comes from the verified principal, never the body. No HMAC mode. Trader query **42101**, command **42102**, feed **42103**; strategy command **42104**, query **42105**. The CLI/SDK and dashboard use this path for portfolio, resolve, propose/approve, strategies list/enable/disable/reload, snapshots, etc. Direct `buy`/`sell`/`cancel`/`set_risk_limits` are **not** registered on the production command surface (BYPASS methods) — use `propose` → `approve` or the dashboard command center; offline simulation can bind legacy dill RPC with `unsafe_legacy_rpc: true` + `--simulation True`.
 
-**Legacy dill RPC** (`trader/messaging/clientserver.py`) — DEALER/ROUTER + msgpack (including dill ExtType). Ports **42001** (trader), **42003** (data), **42005** (strategy). Unbound for trader in split-container production. Still used by data_service and some IB-only tools (scanner, options resolve) when available.
+**Legacy dill RPC** (`trader/messaging/clientserver.py`) — DEALER/ROUTER + msgpack (including dill ExtType). Ports **42001** (trader), **42003** (data), **42005** (strategy). Unbound for trader (42001) and strategy (42005) in split-container production; both need `simulation` + `unsafe_legacy_rpc: true`. Still used by data_service and some IB-only tools (scanner, options resolve) when available.
 
 Additional patterns:
 
@@ -207,7 +207,7 @@ Logs are written to `~/.local/share/mmr/logs/` with per-session timestamps (e.g.
 | 42105 | Typed query (Ed25519) | strategy — list_strategies |
 | 42002 | PubSub | ticker broadcast |
 | 42003 | Legacy RPC | data_service |
-| 42005 | Legacy RPC | strategy (compat) |
+| 42005 | Legacy RPC | strategy — **unbound in production**; offline simulation only |
 | 42006 | MessageBus | strategy signals |
 | 42001 | Legacy dill RPC | trader — **unbound in split production**; offline simulation only |
 

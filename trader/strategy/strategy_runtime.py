@@ -408,6 +408,7 @@ class StrategyRuntime():
         history_duckdb_path: str = '',
         paper_trading: bool = False,
         simulation: bool = False,
+        unsafe_legacy_rpc: bool = False,
         typed_bind_address: str = 'tcp://127.0.0.1',
         strategy_typed_command_port: int = 42104,
         strategy_typed_query_port: int = 42105,
@@ -432,6 +433,7 @@ class StrategyRuntime():
         self.history_duckdb_path = history_duckdb_path or duckdb_path
         self.universe_library = universe_library
         self.simulation: bool = simulation
+        self.unsafe_legacy_rpc: bool = unsafe_legacy_rpc
         self.paper_trading = paper_trading
         self.live_authority_enabled = bool(live_authority_enabled)
         self.zmq_pubsub_server_address = zmq_pubsub_server_address
@@ -503,7 +505,7 @@ class StrategyRuntime():
         self.startup_time: dt.datetime = dt.datetime.now()
         self.last_connect_time: dt.datetime
 
-        self.zmq_strategy_rpc_server: RPCServer[bus.StrategyServiceApi]
+        self.zmq_strategy_rpc_server: Optional[RPCServer[bus.StrategyServiceApi]] = None
         self.zmq_messagebus_client: MessageBusClient
 
         # todo: this is wrong as we'll have a whole bunch of different tickdata libraries for
@@ -567,11 +569,18 @@ class StrategyRuntime():
             self.event_store = EventStore(self.duckdb_path)
             self.last_connect_time = dt.datetime.now()
 
-            self.zmq_strategy_rpc_server = RPCServer[bus.StrategyServiceApi](
-                instance=bus.StrategyServiceApi(self),
-                zmq_rpc_server_address=self.zmq_strategy_rpc_server_address,
-                zmq_rpc_server_port=self.zmq_strategy_rpc_server_port,
-            )
+            # The legacy dill/msgpack strategy RPC has no identity or ACL, so
+            # it exists only in offline simulation with the explicit unsafe
+            # flag -- the same gate as the trader's 42001. Production control
+            # goes through the typed, signed sockets below.
+            from trader.messaging.production_api import validate_rpc_mode  # import cycle at module level
+            validate_rpc_mode(self.simulation, self.unsafe_legacy_rpc)
+            if self.simulation and self.unsafe_legacy_rpc:
+                self.zmq_strategy_rpc_server = RPCServer[bus.StrategyServiceApi](
+                    instance=bus.StrategyServiceApi(self),
+                    zmq_rpc_server_address=self.zmq_strategy_rpc_server_address,
+                    zmq_rpc_server_port=self.zmq_strategy_rpc_server_port,
+                )
 
             self.zmq_messagebus_client = MessageBusClient(
                 zmq_address=self.zmq_messagebus_server_address,
@@ -2496,6 +2505,12 @@ class StrategyRuntime():
                         raise
         logging.debug('finished get_historical_data()')
 
+    async def _serve_control_sockets(self):
+        if self.zmq_strategy_rpc_server is not None:
+            await self.zmq_strategy_rpc_server.serve()
+        await self.typed_command_server.serve()
+        await self.typed_query_server.serve()
+
     async def run(self):
         logging.info('starting strategy_runtime')
         logging.debug('StrategyRuntime.run()')
@@ -2504,9 +2519,7 @@ class StrategyRuntime():
         # we now do it here so the tasks land on the real service loop and
         # actually get a chance to run.
         await self.zmq_messagebus_client.connect()
-        await self.zmq_strategy_rpc_server.serve()
-        await self.typed_command_server.serve()
-        await self.typed_query_server.serve()
+        await self._serve_control_sockets()
         self._trader_command_client.connect()
         self._trader_query_client.connect()
 

@@ -85,7 +85,7 @@ Production Docker runs split services, one per container (`docker-compose.yml`):
 - **scheduler** (pycron): cron jobs only (data refresh, backups). Not a process supervisor.
 - **ib-gateway**: IB Gateway. Host ports `7496` live, `7497` paper; VNC `5901`.
 
-The CLI, SDK and dashboard talk to trader and strategy over **typed RPC** (`trader/messaging/typed_rpc.py`): JSON-safe pydantic messages signed with Ed25519. Each principal (`trader`, `strategy`, `cli`, `dashboard`, `ai_supervisor`, `ai_research`) has its own key pair in `~/.config/mmr/keys/rpc/` (`mmr keys init`; Docker `./docker.sh -k`). Every method has an allow-list entry in `trader/messaging/principals.py`; other callers get `PERMISSION_DENIED`. Command authority comes from the verified principal, never the body. No HMAC mode. The **legacy dill RPC** (`clientserver.py`) can run code on load; trader's port 42001 is unbound in production and only offline simulation turns it on. Research attestations and paper-automation bundles use separate Ed25519 keys; an RPC key is never accepted as a bundle key.
+The CLI, SDK and dashboard talk to trader and strategy over **typed RPC** (`trader/messaging/typed_rpc.py`): JSON-safe pydantic messages signed with Ed25519. Each principal (`trader`, `strategy`, `cli`, `dashboard`, `ai_supervisor`, `ai_research`) has its own key pair in `~/.config/mmr/keys/rpc/` (`mmr keys init`; Docker `./docker.sh -k`). Every method has an allow-list entry in `trader/messaging/principals.py`; other callers get `PERMISSION_DENIED`. Command authority comes from the verified principal, never the body. No HMAC mode. The **legacy dill RPC** (`clientserver.py`) can run code on load; trader's port 42001 and strategy's port 42005 are unbound in production and only offline simulation turns them on. Research attestations and paper-automation bundles use separate Ed25519 keys; an RPC key is never accepted as a bundle key.
 
 | Port  | Protocol | Service / role |
 |-------|----------|----------------|
@@ -96,7 +96,7 @@ The CLI, SDK and dashboard talk to trader and strategy over **typed RPC** (`trad
 | 42105 | Typed query (Ed25519) | strategy: list strategies |
 | 42002 | PubSub | ticker broadcast |
 | 42003 | Legacy RPC | data_service |
-| 42005 | Legacy RPC | strategy (compat) |
+| 42005 | Legacy RPC | strategy: unbound in production; offline simulation only |
 | 42006 | MessageBus | strategy signals |
 | 42001 | Legacy dill RPC | trader: unbound in production; offline simulation only |
 

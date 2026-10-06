@@ -102,7 +102,8 @@ strategy_typed_query_port: 42105
 # Hard gate: the legacy dill/msgpack RPC path (raw Python objects, no
 # per-method allowlist) may only run when simulation=True AND this is also
 # explicitly true -- production always uses the typed query/command/feed
-# transport above. Refused at startup otherwise (G0 Task 4).
+# transport above. Refused at startup otherwise (G0 Task 4). Gates both the
+# trader's 42001 and the strategy service's 42005.
 unsafe_legacy_rpc: false
 
 # Command-authority policy (trader-owned; design C2 in

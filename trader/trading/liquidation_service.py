@@ -1271,7 +1271,7 @@ class LiquidationService:
         stop_row = self._leg_row(stop)
         target_row = None if target is None else self._leg_row(target)
         position = self._position_for(self._broker.capture(receipt.account_id), receipt.conid)
-        problem = self._release_problem(position, (stop, stop_row), (target, target_row))
+        problem = self._release_problem(receipt, position, (stop, stop_row), (target, target_row))
         if problem is not None:
             log.error("liquidation %s release finds broken protection: %s", root, problem)
         self._protection.release_after_partial(
@@ -1283,15 +1283,18 @@ class LiquidationService:
             target_status=None if target is None else self._row_status(target_row),
             now=self._now(), protection_problem=problem)
 
-    def _release_problem(self, position, *legs) -> Optional[str]:
+    def _release_problem(self, receipt, position, *legs) -> Optional[str]:
         """#22/#25 round 7: what breaks a working stop's protection of the held position; None if nothing.
 
-        A stop row that is not healthy is left to the saga's status rules. A
-        healthy stop, and a healthy target, must be linked in the OCA group,
-        reduce the position and have it all outstanding.
+        A filled stop is judged by ``_filled_stop_problem``. Any other stop
+        row that is not healthy is left to the saga's status rules. A healthy
+        stop, and a healthy target, must be linked in the OCA group, reduce
+        the position and have it all outstanding.
         """
-        stop_row = legs[0][1]
-        if self._row_status(stop_row) not in _BROKER_HEALTHY:
+        stop_status = self._row_status(legs[0][1])
+        if stop_status == "Filled":
+            return self._filled_stop_problem(receipt, position, legs)
+        if stop_status not in _BROKER_HEALTHY:
             return None
         if position is None:
             return "the stop works but there is no position"
@@ -1304,6 +1307,24 @@ class LiquidationService:
             outstanding = max(float(getattr(row, "total_quantity", 0.0) or 0.0) - self._broker_fill(leg, [row]), 0.0)
             if outstanding != held:
                 return f"{leg.child_id} outstanding {outstanding} != position {held}"
+        return None
+
+    def _filled_stop_problem(self, receipt, position, legs) -> Optional[str]:
+        """#22/#25 round 8: a filled stop protects nothing, so it is fine only when it closed the remainder.
+
+        Spec 5.1: a zero position closed by an exit is a close, not missing
+        protection. So the release is clean only when the broker shows no
+        position, the legs filled exactly the released quantity since DONE,
+        and no target still works (it could open a new position).
+        """
+        if position is not None:
+            return f"the stop filled but the position {float(position.quantity):g} is still open"
+        exited = sum(self._broker_fill(leg, [row]) - leg.filled_quantity
+                     for leg, row in legs if leg is not None and row is not None)
+        if exited != float(receipt.remaining_quantity):
+            return f"the legs filled {exited:g} since DONE, not the released {float(receipt.remaining_quantity):g}"
+        if any(leg is not None and self._row_status(row) in _BROKER_HEALTHY for leg, row in legs[1:]):
+            return "the stop filled and the position is flat, but the target still works"
         return None
 
     def _schedule_commands(self, root: str) -> None:

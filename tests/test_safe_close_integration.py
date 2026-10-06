@@ -67,6 +67,7 @@ class _Ingest:
         self.sim = sim
         self.syncs = 0
         self.ready = True          # False: a newer generation is staging, the enumeration is not complete
+        self.before_hold = None    # an ingest batch applied just before a close holds broker changes
 
     @property
     def is_ready(self):
@@ -75,6 +76,8 @@ class _Ingest:
     @contextmanager
     def hold_changes(self):
         """Ruling 48: the sim writes only inside a sync, so holding is refusing while one is staging."""
+        if self.before_hold is not None:
+            self.before_hold()
         if not self.ready:
             raise BrokerChangesBusy("broker generation is staging")
         yield
@@ -539,6 +542,60 @@ def test_partial_close_of_one_of_two_positions_reprotects_the_actual_remainder(c
     assert composed.saga.resume("entry-2").state == "PROTECTED"
     assert {f"{other}:stop", f"{other}:take_profit"} <= set(composed.sim.trades)
     assert all(entity.startswith(og) for entity in composed.sim.cancelled)
+    assert composed.stack.circuit_breaker.store.get().state == "CLEAR"
+
+
+def _partial_close_up_to_done(composed, after_done):
+    """Partial close of 4 of 10: reduce filled, stop and target for the live 6 working.
+    ``after_done`` runs as an ingest batch right after DONE commits, before the release hold."""
+    og = composed.protected_entry()
+    composed.sim.promote()
+    composed.liquidation.start(ACCOUNT, "p-1", _et(11, 5), scope="conid", conid=CONID, quantity=4.0)
+    composed.cancel_landed(f"{og}:stop", f"{og}:take_profit")
+    composed.sim.promote()
+    composed.tick()                                                   # reduce 4
+    composed.sim.set_status(composed.sim.entity_for("p-1-reduce"), "Filled", filled=4.0)
+    composed.sim.held[CONID] = 6.0
+    for _ in range(3):                                                # fill seen, stop, target
+        composed.sim.promote()
+        composed.tick()
+    assert composed.sim.placed[-1][:4] == ("p-1-reprotect-target-265598-1", "LMT", "SELL", 6.0)
+    fired = []
+
+    def ingest_after_done():
+        if not fired and composed.liquidation.receipt_for("p-1").state == "DONE":
+            fired.append(1)
+            after_done()
+            composed.sim.promote()
+    composed.trader.broker_ingest.before_hold = ingest_after_done
+    composed.sim.promote()
+    composed.tick()
+    composed.trader.broker_ingest.before_hold = None
+    assert fired and composed.liquidation.receipt_for("p-1").state == "DONE"
+
+
+def test_a_stop_filled_at_release_with_the_position_still_open_is_a_safety_failure(composed):
+    """#22/#25 round 8 (openai): after DONE and before the release hold the stop row turns Filled for 6,
+    but the broker still holds +6. A filled stop protects nothing: the saga is SAFETY_FAILED and the
+    breaker trips, never PROTECTED."""
+    def stop_filled_position_open():
+        composed.sim.set_status(composed.sim.entity_for("p-1-reprotect-stop"), "Filled", filled=6.0)
+    _partial_close_up_to_done(composed, stop_filled_position_open)
+    released = composed.saga.resume("entry-1")
+    assert released.state == "SAFETY_FAILED" and released.flatten_requested
+    assert composed.stack.circuit_breaker.store.get().state == "TRIPPED"
+
+
+def test_a_stop_filled_at_release_that_closed_the_remainder_is_closed_without_an_alarm(composed):
+    """#22/#25 round 8: the stop really sold the released 6, the broker is flat and OCA cancelled the
+    target. Spec 5.1: a zero position closed by an exit is a close. The saga ends CLOSED and the
+    breaker stays clear."""
+    def stop_closed_the_remainder():
+        composed.sim.set_status(composed.sim.entity_for("p-1-reprotect-stop"), "Filled", filled=6.0)
+        composed.sim.set_status(composed.sim.entity_for("p-1-reprotect-target"), "Cancelled")
+        composed.sim.held[CONID] = 0.0
+    _partial_close_up_to_done(composed, stop_closed_the_remainder)
+    assert composed.saga.resume("entry-1").state == "CLOSED"
     assert composed.stack.circuit_breaker.store.get().state == "CLEAR"
 
 

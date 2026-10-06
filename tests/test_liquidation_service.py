@@ -2575,6 +2575,11 @@ _RELEASE_CHANGES = {
         "p-1-reprotect-stop-1-1", [_leg_row(action="BUY")]),
     "stop outstanding below the position": lambda s: s.dispatch.rows.__setitem__(
         "p-1-reprotect-stop-1-1", [_leg_row(total=5.0)]),
+    "stop filled, position still open": lambda s: s.dispatch.rows.__setitem__(
+        "p-1-reprotect-stop-1-1", [_leg_row("Filled", filled=6.0)]),
+    "stop filled less than the flat remainder": lambda s: (
+        s.dispatch.rows.__setitem__("p-1-reprotect-stop-1-1", [_leg_row("Filled", filled=4.0)]),
+        setattr(s.broker, "current", _snapshot(4, []))),
 }
 
 

@@ -931,7 +931,7 @@ def build_command_stack(
         cancel=SessionCancelAdapter(_LiquidationDispatch(dispatch, orders_view)),
         liquidation=liquidation_service,
         breaker=circuit_breaker,
-        time_exit=SessionTimeExitAdapter(_LiquidationDispatch(dispatch, orders_view)),
+        time_exit=SessionTimeExitAdapter(liquidation_service, account_id=trader.ib_account, now=now),
         account_id=trader.ib_account,
         now=now,
     )

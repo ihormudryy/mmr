@@ -124,37 +124,40 @@ class FakeCancel:
 
 
 class FakeLiquidation:
+    """Records starts; ``joined_root`` makes the next account start join that root."""
     def __init__(self):
         self.starts: list[tuple] = []
-        self._receipt: Any = None
+        self.kwargs: list[dict] = []
+        self.receipts: dict[str, Any] = {}
         self.rescans = 0
+        self.joined_root: Optional[str] = None
+        self.other_flat: Any = None
 
-    def start(self, account_id, cause_command_id, deadline):
+    def start(self, account_id, cause_command_id, deadline, **kwargs):
         self.starts.append((account_id, cause_command_id, deadline))
-        self._receipt = SimpleNamespace(
-            account_id=account_id,
-            cause_command_id=cause_command_id,
-            state="REQUESTED",
-            deadline=deadline,
-            generation_id=None,
-            detail="started",
-        )
-        return self._receipt
+        self.kwargs.append(kwargs)
+        root = self.joined_root or cause_command_id
+        self.receipts.setdefault(root, SimpleNamespace(
+            account_id=account_id, cause_command_id=root, state="REQUESTED",
+            deadline=deadline, generation_id=None, detail="started",
+        ))
+        return self.receipts[root]
 
     def rescan(self):
         self.rescans += 1
-        return self._receipt
+        return self.other_flat or next(iter(self.receipts.values()), None)
 
-    def mark_flat(self, generation_id: int = 2):
-        if self._receipt is None:
+    def receipt_for(self, root_id):
+        return self.receipts.get(root_id)
+
+    def mark_flat(self, generation_id: int = 2, root_id: Optional[str] = None):
+        if not self.receipts:
             return
-        self._receipt = SimpleNamespace(
-            account_id=self._receipt.account_id,
-            cause_command_id=self._receipt.cause_command_id,
-            state="FLAT",
-            deadline=self._receipt.deadline,
-            generation_id=generation_id,
-            detail="flat",
+        root = root_id or next(iter(self.receipts))
+        current = self.receipts[root]
+        self.receipts[root] = SimpleNamespace(
+            account_id=current.account_id, cause_command_id=root, state="FLAT",
+            deadline=current.deadline, generation_id=generation_id, detail="flat",
         )
 
 
@@ -441,7 +444,7 @@ def test_missed_flat_deadline_records_incident_when_rescan_finds_no_advanceable_
     controller.recover(clock[0])
     state = controller.run_due(clock[0])
     assert liquidation.starts
-    assert state.state == "FLATTENING"
+    assert state.state in ("FLATTENING", "VERIFYING_FLAT")   # Task 11 polls the root it got back
 
     clock[0] = _utc(15, 55)
     state = controller.run_due(clock[0])
@@ -783,15 +786,144 @@ class _SimBroker:
         return self.generation
 
 
-@pytest.mark.xfail(strict=True, raises=AssertionError,
-                   reason="the time exit reduces without cancelling the stop; fixed in plan 1 task 11")
-def test_time_exit_leaves_no_live_stop_after_the_position_is_closed():
-    """Spec 5.1: a time exit must cancel the protective stop first. Today it only reduces,
-    so a live stop is left on a closed position and can open a short."""
+class _SimProtection:
+    """Saga stand-in that writes its hand-over into the broker's call log, so the order is visible."""
+    def __init__(self, calls):
+        self.calls = calls
+
+    def handover(self, *, account_id, conid, close_root_id, cancels, generation, now):
+        from trader.trading.liquidation_service import HandoverInfo
+        self.calls.append(("handover", tuple(c.order_entity_id for c in cancels)))
+        return HandoverInfo(150.0, None)
+
+    def handover_account(self, **_kwargs):
+        raise AssertionError("a time exit is a conid-scoped close")
+
+    def expect_reprotect(self, **_kwargs):
+        raise AssertionError("a time exit never re-protects")
+
+    def release_after_partial(self, **_kwargs):
+        raise AssertionError("a time exit never re-protects")
+
+    def close_after_full(self, *, close_root_id, now):
+        self.calls.append(("close_after_full", close_root_id))
+
+
+def _real_liquidation(tmp_path, broker, protection=None):
+    from trader.trading.exit_owner import ExitOwnerRegistry
+    from trader.trading.liquidation_service import (
+        LiquidationRunStore, LiquidationService, apply_liquidation_migration,
+    )
+    db = DuckDBConnection.get_instance(str(tmp_path / "liquidation.duckdb"))
+    apply_liquidation_migration(SchemaMigrator(db))
+    return LiquidationService(broker, broker, store=LiquidationRunStore(db), registry=ExitOwnerRegistry(db),
+                              now=lambda: _utc(15, 0), protection=protection)
+
+
+def test_time_exit_leaves_no_live_stop_after_the_position_is_closed(tmp_path):
+    """Spec 5.1: a time exit hands protection over, cancels the stop, then closes from broker truth."""
     from trader.automation.session_controller import SessionTimeExitAdapter
 
     broker = _SimBroker()
-    adapter = SessionTimeExitAdapter(broker)                  # today's constructor
+    service = _real_liquidation(tmp_path, broker, protection=_SimProtection(broker.calls))
+    adapter = SessionTimeExitAdapter(service, account_id=ACCOUNT, now=lambda: _utc(15, 0))
     adapter.request_exit(command_id="exit-1", conid=CONID, quantity=Decimal("10"), side="BUY")
+    for _ in range(4):
+        service.rescan()
+    assert broker.calls == [("handover", ("og-1:stop",)), ("cancel", "og-1:stop"), ("reduce", "SELL", 10.0),
+                            ("close_after_full", "exit-1")]
     assert broker.quantity == 0.0
     assert broker.stop_working is False, "a live stop on a closed position can open a short"
+    assert service.receipt_for("exit-1").state == "CLOSED"
+
+
+def test_time_exit_adapter_starts_a_full_conid_close_without_a_quantity():
+    """#27: a quantity would make a join refusable; the adapter never passes one."""
+    from trader.automation.session_controller import SessionTimeExitAdapter
+
+    liquidation = FakeLiquidation()
+    SessionTimeExitAdapter(liquidation, account_id=ACCOUNT, now=lambda: _utc(15, 0), deadline_seconds=120.0) \
+        .request_exit(command_id="exit-1", conid=CONID, quantity=Decimal("10"), side="BUY")
+    assert liquidation.starts == [(ACCOUNT, "exit-1", _utc(15, 2))]
+    assert liquidation.kwargs == [{"scope": "conid", "conid": CONID}]
+
+
+def test_time_exit_adapter_tolerates_exit_in_progress():
+    from trader.automation.session_controller import SessionTimeExitAdapter
+    from trader.trading.exit_owner import ExitInProgress
+
+    class _Refusing:
+        def start(self, *a, **k):
+            raise ExitInProgress("other-root")
+
+    SessionTimeExitAdapter(_Refusing(), account_id=ACCOUNT, now=lambda: _utc(15, 0)).request_exit(
+        command_id="exit-1", conid=CONID, quantity=Decimal("10"), side="BUY")
+
+
+def test_poll_flat_ignores_another_roots_flat_receipt(tmp_path):
+    controller, broker, _c, liquidation, _br, _t, _j, _db, clock = _build_controller(tmp_path)
+    clock[0] = _utc(15, 46)
+    controller.recover(clock[0])
+    liquidation.other_flat = SimpleNamespace(cause_command_id="someone-else", state="FLAT", generation_id=9)
+    state = controller.run_due(_utc(15, 47))
+    assert state.state in ("FLATTENING", "VERIFYING_FLAT")
+    liquidation.mark_flat(generation_id=3, root_id=state.flatten_command_id)
+    state = controller.run_due(_utc(15, 48))
+    assert (state.state, state.flat_generation) == ("FLAT", 3)
+
+
+def test_session_flatten_joining_an_existing_account_flatten_polls_the_returned_root(tmp_path):
+    """R10 / #27: the session persists the root it got back, also across a restart."""
+    liquidation = FakeLiquidation()
+    liquidation.joined_root = "kill-1"
+    controller, _b, _c, _l, _br, _t, _j, db, clock = _build_controller(tmp_path, liquidation=liquidation)
+    clock[0] = _utc(15, 46)
+    controller.recover(clock[0])
+    state = controller.run_due(clock[0])
+    assert state.flatten_command_id == "kill-1"
+    from trader.automation.session_controller import SessionController
+    restarted = SessionController(
+        journal=DomainJournal(db), db=db, calendar=XNYSCalendarPolicy(), broker=FakeBroker(),
+        cancel=FakeCancel(), liquidation=liquidation, breaker=FakeBreaker(),
+        time_exit=FakeTimeExitDispatch(), account_id=ACCOUNT, now=lambda: _utc(15, 47))
+    restarted.recover(_utc(15, 47))
+    liquidation.mark_flat(generation_id=4, root_id="kill-1")
+    state = restarted.run_due(_utc(15, 48))
+    assert (state.state, state.flatten_command_id, state.flat_generation) == ("FLAT", "kill-1", 4)
+
+
+def test_time_exit_adapter_lets_a_refusal_reach_the_caller():
+    """Fail loudly: only ExitInProgress (never possible without a quantity) is swallowed."""
+    from trader.automation.session_controller import SessionTimeExitAdapter
+    from trader.trading.liquidation_service import LiquidationRefused
+
+    class _Refusing:
+        def start(self, *a, **k):
+            raise LiquidationRefused("NO_POSITION")
+
+    with pytest.raises(LiquidationRefused):
+        SessionTimeExitAdapter(_Refusing(), account_id=ACCOUNT, now=lambda: _utc(15, 0)).request_exit(
+            command_id="exit-1", conid=CONID, quantity=Decimal("10"), side="BUY")
+
+
+def test_session_flatten_without_a_root_to_poll_fails_loudly(tmp_path):
+    """R10: no silent fallback to the session's own cause; the flatten is retried on the next tick."""
+    liquidation = FakeLiquidation()
+    liquidation.start = lambda *a, **k: None
+    controller, _b, _c, _l, _br, _t, _j, _db, clock = _build_controller(tmp_path, liquidation=liquidation)
+    clock[0] = _utc(15, 46)
+    with pytest.raises(RuntimeError, match="no root to poll"):
+        controller.recover(clock[0])
+
+
+def test_session_flatten_whose_root_ends_failed_safe_is_an_incident_at_once(tmp_path):
+    """Ruling: a FAILED_SAFE root (joined or own) is not polled until the flat deadline."""
+    controller, _b, _c, liquidation, breaker, _t, _j, _db, clock = _build_controller(tmp_path)
+    clock[0] = _utc(15, 46)
+    state = controller.recover(clock[0])
+    root = state.flatten_command_id
+    liquidation.receipts[root] = SimpleNamespace(cause_command_id=root, state="FAILED_SAFE", generation_id=5,
+                                                 detail="deadline elapsed")
+    state = controller.run_due(_utc(15, 47))
+    assert state.state == "INCIDENT" and "FAILED_SAFE" in state.incident
+    assert [s.kind for s in breaker.signals] == ["LIQUIDATION_FAILED"]

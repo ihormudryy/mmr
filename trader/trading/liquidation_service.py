@@ -1321,7 +1321,9 @@ class LiquidationService:
         Spec 5.1: a zero position closed by an exit is a close, not missing
         protection. So the release is clean only when the broker shows no
         position, the legs filled exactly the released quantity since DONE,
-        and no target still works (it could open a new position).
+        and the target is broker-proven terminal. A target in any other
+        status, ``PendingCancel`` or a missing row included, can still fill
+        and open a new position (#22/#25 round 9).
         """
         if position is not None:
             return f"the stop filled but the position {float(position.quantity):g} is still open"
@@ -1329,8 +1331,10 @@ class LiquidationService:
                      for leg, row in legs if leg is not None and row is not None)
         if exited != float(receipt.remaining_quantity):
             return f"the legs filled {exited:g} since DONE, not the released {float(receipt.remaining_quantity):g}"
-        if any(leg is not None and self._row_status(row) in _BROKER_HEALTHY for leg, row in legs[1:]):
-            return "the stop filled and the position is flat, but the target still works"
+        live = [self._row_status(row) for leg, row in legs[1:]
+                if leg is not None and self._row_status(row) not in _BROKER_TERMINAL]
+        if live:
+            return f"the stop filled and the position is flat, but the target is {live[0]}, not terminal"
         return None
 
     def _schedule_commands(self, root: str) -> None:

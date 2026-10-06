@@ -626,6 +626,30 @@ def test_a_stop_filled_at_release_that_closed_the_remainder_is_closed_without_an
     assert composed.stack.circuit_breaker.store.get().state == "CLEAR"
 
 
+@pytest.mark.parametrize("target_status", ["PendingCancel", "ApiPending"])
+def test_a_stop_filled_at_release_next_to_a_live_target_is_a_safety_failure(composed, target_status):
+    """#22/#25 round 9 (openai): the stop sold the released 6 and the broker is flat, but the target is
+    not broker-proven terminal. PendingCancel (or any other non-terminal status) can still fill and
+    open a short. The release takes the safety path: SAFETY_FAILED, breaker tripped, flatten queued.
+    A later target fill (-6) never turns the saga CLOSED."""
+    def stop_closed_the_remainder_target_live():
+        composed.sim.set_status(composed.sim.entity_for("p-1-reprotect-stop"), "Filled", filled=6.0)
+        composed.sim.set_status(composed.sim.entity_for("p-1-reprotect-target"), target_status)
+        composed.sim.held[CONID] = 0.0
+    _partial_close_up_to_done(composed, stop_closed_the_remainder_target_live)
+    composed.liquidation.worker.submit(lambda: None).result(timeout=2.0)   # the queued start has run
+    released = composed.saga.resume("entry-1")
+    assert released.state == "SAFETY_FAILED" and released.flatten_requested
+    assert composed.stack.circuit_breaker.store.get().state == "TRIPPED"
+    assert composed.liquidation.root_for("entry-1") is not None
+    composed.sim.set_status(composed.sim.entity_for("p-1-reprotect-target"), "Filled", filled=6.0)
+    composed.sim.held[CONID] = -6.0
+    composed.sim.promote()
+    composed.tick()
+    assert composed.saga.resume("entry-1").state == "SAFETY_FAILED"
+    assert composed.stack.circuit_breaker.store.get().state == "TRIPPED"
+
+
 def test_a_stop_fill_after_the_final_admission_hold_is_refused_at_the_order_boundary(composed):
     """#22 round 8 (openai): the target's last admission hold read +6 and a stop with 6 outstanding.
     Right after that hold the stop fills 2: IB's order status has it, the position cache and the

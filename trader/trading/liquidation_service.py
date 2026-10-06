@@ -9,6 +9,8 @@ broker order path.
 from __future__ import annotations
 
 import datetime as dt
+import threading
+from contextlib import contextmanager
 from dataclasses import dataclass
 from typing import Any, Callable, Optional, Protocol
 
@@ -18,7 +20,8 @@ from trader.domain.events import DomainMutation
 from trader.domain.identity import command_entity_id
 
 
-_NON_FLAT = {"REQUESTED", "CANCELLING_ENTRIES", "REDUCING", "VERIFYING", "OUTCOME_UNKNOWN", "FAILED_SAFE"}
+# Roots that ``_advance`` can still move. FLAT and FAILED_SAFE are terminal.
+_ADVANCEABLE = {"REQUESTED", "CANCELLING_ENTRIES", "REDUCING", "VERIFYING", "OUTCOME_UNKNOWN"}
 LIQUIDATION_MIGRATION_VERSION = 25
 
 
@@ -30,6 +33,10 @@ def apply_liquidation_migration(migrator: SchemaMigrator) -> None:
             generation_id BIGINT, detail VARCHAR NOT NULL, updated_at TIMESTAMPTZ NOT NULL
         )""",
     ))
+
+
+class LiquidationBusy(RuntimeError):
+    """Another caller held the liquidation lock past the timeout; retry later."""
 
 
 class BrokerSnapshotPort(Protocol):
@@ -80,6 +87,20 @@ class LiquidationService:
     reduce order until a later broker generation is observed.  This eliminates
     the dangerous retry-on-timeout/partial-fill pattern.  A caller may invoke
     :meth:`rescan` whenever a promoted broker generation arrives.
+
+    Three drivers call in from different threads: the trader_service
+    liquidation worker (recovery and session ticks), typed-RPC threads
+    (``/flatten``) and the broker-ingest thread (protective saga).  ``start``
+    and ``rescan`` hold ``self._lock`` across the broker capture and the
+    dispatch wait, so two callers never size a reduce from the same snapshot.
+    The lock is taken with a timeout; a caller that waits longer gets
+    :class:`LiquidationBusy`.  ``start`` registers (and persists) the root
+    before it waits, so a busy caller never loses it: the next ``rescan``
+    advances it.
+
+    Lock order: ``LiquidationService._lock`` before ``BrokerIngest._apply_lock``
+    (capture reads broker readiness).  Nothing may call :meth:`start` while
+    holding ``_apply_lock``.
     """
 
     def __init__(
@@ -90,6 +111,7 @@ class LiquidationService:
         breaker: Optional[LiquidationBreakerPort] = None,
         now: Callable[[], dt.datetime], store: Optional[LiquidationRunStore] = None,
         journal=None, ledger=None, deadline_seconds: float = 300.0,
+        lock_timeout_seconds: float = 60.0,
     ):
         self._broker = broker
         self._dispatch = dispatch
@@ -98,12 +120,35 @@ class LiquidationService:
         self._store = store
         self._runs: dict[str, LiquidationReceipt] = {r.cause_command_id: r for r in (store.load_unresolved() if store else ())}
         self._journal, self._ledger, self._deadline_seconds = journal, ledger, deadline_seconds
+        # Default: twice the 30s order-dispatch timeout.
+        self._lock = threading.Lock()
+        self._lock_timeout_seconds = lock_timeout_seconds
+        # Keeps each ``_runs`` write and its store save in the same order.
+        self._runs_lock = threading.Lock()
+
+    @contextmanager
+    def _exclusive(self):
+        if not self._lock.acquire(timeout=self._lock_timeout_seconds):
+            raise LiquidationBusy(
+                f"liquidation busy for more than {self._lock_timeout_seconds}s; retry later")
+        try:
+            yield
+        finally:
+            self._lock.release()
 
     def liquidate(self, cmd) -> CommandReceipt:
         """Coordinator saga entry: acknowledgement is explicitly non-terminal."""
         if self._journal is None or self._ledger is None:
             raise RuntimeError("liquidation command authority is not configured")
-        receipt = self.start(cmd.account_id, cmd.command_id, self._now() + dt.timedelta(seconds=self._deadline_seconds))
+        try:
+            receipt = self.start(cmd.account_id, cmd.command_id, self._now() + dt.timedelta(seconds=self._deadline_seconds))
+        except LiquidationBusy:
+            # The root is registered; record it as pending so FLAT can resolve it.
+            self._record_pending(cmd, self._runs[cmd.command_id])
+            raise
+        return self._record_pending(cmd, receipt)
+
+    def _record_pending(self, cmd, receipt: LiquidationReceipt) -> CommandReceipt:
         outcome = {"liquidation_state": receipt.state, "detail": receipt.detail,
                    "generation_id": receipt.generation_id}
         now = self._now()
@@ -126,30 +171,42 @@ class LiquidationService:
     def start(self, account_id: str, cause_command_id: str, deadline: dt.datetime) -> LiquidationReceipt:
         if not account_id or not cause_command_id:
             raise ValueError("account_id and cause_command_id are required")
-        current = self._runs.get(cause_command_id)
-        if current is not None:
-            if current.account_id != account_id:
-                raise ValueError("cause command id is already bound to another account")
-            return self._advance(current)
-        receipt = LiquidationReceipt(account_id, cause_command_id, "REQUESTED", deadline)
-        self._runs[cause_command_id] = receipt
-        return self._advance(receipt)
+        self._register(account_id, cause_command_id, deadline)
+        with self._exclusive():
+            return self._advance(self._runs[cause_command_id])
+
+    def _register(self, account_id: str, cause_command_id: str, deadline: dt.datetime) -> None:
+        """Record a new root before waiting for the lock, so ``rescan`` can find it."""
+        requested = LiquidationReceipt(account_id, cause_command_id, "REQUESTED", deadline)
+        with self._runs_lock:
+            current = self._runs.setdefault(cause_command_id, requested)
+            if current is requested and self._store is not None:
+                self._store.save(requested, self._now())
+        if current.account_id != account_id:
+            raise ValueError("cause command id is already bound to another account")
 
     def rescan(self) -> Optional[LiquidationReceipt]:
-        """Advance one unresolved root from newly promoted broker evidence."""
-        for receipt in tuple(self._runs.values()):
-            if receipt.state in _NON_FLAT:
-                return self._advance(receipt)
-        return None
+        """Advance the first advanceable root from newly promoted broker evidence.
+
+        Terminal roots (FLAT, FAILED_SAFE) are skipped, so an old FAILED_SAFE
+        root, which is reloaded on every restart, never hides a newer root.
+        Returns None when no root can move.
+        """
+        with self._exclusive():
+            for receipt in tuple(self._runs.values()):
+                if receipt.state in _ADVANCEABLE:
+                    return self._advance(receipt)
+            return None
 
     def _set(self, receipt: LiquidationReceipt, state: str, *, generation_id=None, detail="") -> LiquidationReceipt:
         updated = LiquidationReceipt(
             receipt.account_id, receipt.cause_command_id, state, receipt.deadline,
             receipt.generation_id if generation_id is None else generation_id, detail,
         )
-        self._runs[receipt.cause_command_id] = updated
-        if self._store is not None:
-            self._store.save(updated, self._now())
+        with self._runs_lock:
+            self._runs[receipt.cause_command_id] = updated
+            if self._store is not None:
+                self._store.save(updated, self._now())
         if state == "FLAT":
             self._resolve_root_command(updated)
         if state != "FLAT" and self._breaker is not None:

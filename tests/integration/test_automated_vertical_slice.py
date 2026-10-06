@@ -42,6 +42,7 @@ LEGACY_MUTATIONS = (
     "place_order_simple",
     "place_expressive_order",
     "place_standalone_order",
+    "place_reduce_only_order",
     "cancel_all",
 )
 

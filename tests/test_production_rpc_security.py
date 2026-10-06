@@ -57,6 +57,10 @@ BYPASS_METHODS = [
     "cancel_all",
 ]
 
+# The gate-free liquidation exit lives only on Trader; it must never be
+# exposed on any RPC surface, legacy offline API included.
+NEVER_EXPOSED_METHODS = BYPASS_METHODS + ["place_reduce_only_order"]
+
 _AV = namedtuple("AccountValue", ["account", "tag", "value", "currency"])
 
 
@@ -113,7 +117,7 @@ def production_registry(authenticator) -> TypedRpcRegistry:
 # Step 1 (brief, verbatim)
 # ---------------------------------------------------------------------------
 
-@pytest.mark.parametrize("method", BYPASS_METHODS)
+@pytest.mark.parametrize("method", NEVER_EXPOSED_METHODS)
 def test_production_registry_has_no_legacy_mutation(method, production_registry):
     assert not production_registry.contains("command", method)
 
@@ -148,12 +152,12 @@ class TestValidateRpcMode:
 # The five bypass methods are unreachable on EITHER role, not just "command"
 # ---------------------------------------------------------------------------
 
-@pytest.mark.parametrize("method", BYPASS_METHODS)
+@pytest.mark.parametrize("method", NEVER_EXPOSED_METHODS)
 def test_production_registry_has_no_legacy_mutation_as_query_either(method, production_registry):
     assert not production_registry.contains("query", method)
 
 
-@pytest.mark.parametrize("method", BYPASS_METHODS)
+@pytest.mark.parametrize("method", NEVER_EXPOSED_METHODS)
 def test_production_registry_resolve_is_none_for_bypass_methods(method, production_registry):
     """Belt-and-suspenders on top of .contains(): .resolve() (what the
     server dispatch loop actually calls) must also come back empty for
@@ -238,7 +242,7 @@ class TestProductionRegistryHasRealQueries:
 # ---------------------------------------------------------------------------
 
 class TestApiClassSplit:
-    @pytest.mark.parametrize("method", BYPASS_METHODS)
+    @pytest.mark.parametrize("method", NEVER_EXPOSED_METHODS)
     def test_base_trader_service_api_no_longer_has_bypass_methods(self, method):
         assert not hasattr(TraderServiceApi, method), (
             f"TraderServiceApi.{method} must not exist -- it should live only on "
@@ -250,6 +254,9 @@ class TestApiClassSplit:
         handler = getattr(LegacyOfflineTraderServiceApi, method, None)
         assert handler is not None, f"LegacyOfflineTraderServiceApi.{method} must still exist"
         assert getattr(handler, "_is_rpc_method", False) is True
+
+    def test_reduce_only_exit_is_not_on_the_legacy_offline_api(self):
+        assert not hasattr(LegacyOfflineTraderServiceApi, "place_reduce_only_order")
 
     def test_legacy_offline_api_is_a_trader_service_api_subclass(self):
         """The offline-simulation class still gets every read method (get_status,
@@ -329,7 +336,7 @@ class TestProductionRegistryOverRealTransport:
 
             # And the five bypass methods are unreachable on the command
             # socket too (there's nothing registered there at all).
-            for method in BYPASS_METHODS:
+            for method in NEVER_EXPOSED_METHODS:
                 with pytest.raises(TypedRpcRemoteError) as exc:
                     command_client.call(method, {}, dict)
                 assert exc.value.code == "METHOD_NOT_ALLOWED"

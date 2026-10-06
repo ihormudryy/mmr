@@ -1,13 +1,16 @@
 from asyncio import AbstractEventLoop
+from typing import Callable
 from trader.common.helpers import get_network_ip
 from trader.common.logging_helper import LogLevels, set_all_log_level, setup_logging
 from trader.container import Container, default_config_path
 from trader.data.schema_migrations import SchemaMigrator
+from trader.trading.liquidation_service import LiquidationBusy
 from trader.trading.trading_control import TradingControlStore, apply_trading_control_migration
 from trader.trading.trading_runtime import Trader
 
 import asyncio
 import click
+import concurrent.futures
 import datetime as dt
 import logging as log
 import os
@@ -172,7 +175,105 @@ def _maybe_start_command_reconciliation(trader: Trader, loop: AbstractEventLoop)
         logging.error('failed to start command reconciliation: {}'.format(ex))
 
 
-async def _liquidation_recovery_loop(service, *, interval: float = 5.0) -> None:
+# Bound for one liquidation-worker call: twice LiquidationService's default
+# 60s lock timeout. Past it the loop logs CRITICAL (the worker is wedged).
+_WORKER_STUCK_AFTER_SECONDS = 120.0
+
+
+def _new_liquidation_worker() -> concurrent.futures.ThreadPoolExecutor:
+    """The one thread that runs every LiquidationService / SessionController
+    call trader_service makes (startup recovery and the periodic ticks).
+
+    These calls block while ``reduce_position`` waits for the order to be
+    placed on the trader loop, so they must never run on that loop.
+
+    Shutdown: a call in progress is not interrupted. Once the loop stops, its
+    order wait times out, so process exit can be delayed by at most about the
+    dispatch timeout (30s).
+    """
+    return concurrent.futures.ThreadPoolExecutor(
+        max_workers=1, thread_name_prefix='liquidation-worker')
+
+
+async def _on_worker(worker, fn, *args):
+    """Submit ``fn`` from inside the running loop.
+
+    ``loop.run_in_executor`` called before ``run_until_complete`` would start
+    the worker while the loop is still stopped, and a reduce dispatched in
+    that gap is refused.
+    """
+    return await asyncio.get_running_loop().run_in_executor(worker, fn, *args)
+
+
+async def _watched_ticks(name: str, tick, *, interval: float, stuck_after: float) -> None:
+    """Run ``tick()`` every ``interval`` seconds, one call at a time.
+
+    A tick still running after ``stuck_after`` seconds is logged CRITICAL once
+    and awaited (never cancelled); no new tick starts until it returns.
+
+    Ticks that keep failing with ``LiquidationBusy`` for ``stuck_after``
+    seconds are logged CRITICAL once per busy streak. Each one returns after
+    the lock timeout, so the stuck-tick check above never sees a lock holder
+    wedged outside the worker (for example the broker-ingest thread).
+    """
+    loop = asyncio.get_running_loop()
+    busy = _BusyStreak(name, stuck_after)
+    while True:
+        started = loop.time()
+        call = asyncio.ensure_future(tick())
+        done, _ = await asyncio.wait({call}, timeout=stuck_after)
+        if not done:
+            logging.critical(
+                '%s tick still running after %ss on the liquidation worker; '
+                'no new tick until it returns', name, stuck_after)
+            await asyncio.wait({call})
+        try:
+            call.result()
+            busy.clear()
+        except LiquidationBusy as ex:
+            logging.error('{} tick failed: {}'.format(name, ex))
+            busy.record(tick_started=started, now=loop.time())
+        except Exception as ex:
+            logging.error('{} tick failed: {}'.format(name, ex))
+            busy.clear()
+        await asyncio.sleep(interval)
+
+
+class _BusyStreak:
+    """Consecutive ``LiquidationBusy`` ticks; CRITICAL once when one lasts ``stuck_after``."""
+
+    def __init__(self, name: str, stuck_after: float):
+        self._name = name
+        self._stuck_after = stuck_after
+        self.clear()
+
+    def clear(self) -> None:
+        self._started_at: float | None = None
+        self._reported = False
+
+    def record(self, *, tick_started: float, now: float) -> None:
+        if self._started_at is None:
+            self._started_at = tick_started
+        busy_for = now - self._started_at
+        if not self._reported and busy_for >= self._stuck_after:
+            self._reported = True
+            logging.critical(
+                '%s: liquidation lock busy for %.0fs; another lock holder may be '
+                'wedged and liquidation cannot make progress', self._name, busy_for)
+
+
+async def _liquidation_recovery_tick(service, worker):
+    """One rescan on the liquidation worker; the trader loop stays free."""
+    receipt = await _on_worker(worker, service.rescan)
+    if receipt is not None and receipt.state != 'FLAT':
+        logging.warning('liquidation %s remains %s: %s', receipt.cause_command_id,
+                        receipt.state, receipt.detail)
+    return receipt
+
+
+async def _liquidation_recovery_loop(
+    service, worker, *, interval: float = 5.0, stuck_after: float = _WORKER_STUCK_AFTER_SECONDS,
+) -> None:
     """Keep unresolved verified-liquidation roots moving after restart.
 
     Every transition still requires a newly promoted broker snapshot; a loop
@@ -180,67 +281,102 @@ async def _liquidation_recovery_loop(service, *, interval: float = 5.0) -> None:
     outage preserves the durable run for the next tick rather than killing the
     trader process.
     """
-    while True:
-        try:
-            receipt = service.rescan()
-            if receipt is not None and receipt.state != 'FLAT':
-                logging.warning('liquidation %s remains %s: %s', receipt.cause_command_id,
-                                receipt.state, receipt.detail)
-        except Exception as ex:
-            logging.error('liquidation recovery tick failed: {}'.format(ex))
-        await asyncio.sleep(interval)
+    await _watched_ticks(
+        'liquidation recovery', lambda: _liquidation_recovery_tick(service, worker),
+        interval=interval, stuck_after=stuck_after)
 
 
-def _maybe_start_liquidation_recovery(trader: Trader, loop: AbstractEventLoop) -> None:
-    """Rescan durable liquidation roots before normal service operation."""
+def _never_stopping() -> bool:
+    return False
+
+
+def _maybe_start_liquidation_recovery(
+    trader: Trader, loop: AbstractEventLoop, worker, stopping: Callable[[], bool] = _never_stopping,
+) -> None:
+    """Rescan durable liquidation roots before normal service operation.
+
+    The rescan runs on the liquidation worker while ``loop`` runs, so a reduce
+    it dispatches is placed on the trader loop before ``trader.run()``.
+    The periodic loop starts even when this first rescan fails (for example
+    with ``LiquidationBusy``), so the next tick retries it. It does not start
+    once ``stopping()`` is true: shutdown has stopped the loop and the worker.
+    """
     service = getattr(trader, 'liquidation_service', None)
-    if service is None:
+    if service is None or stopping():
         return
     try:
-        first = service.rescan()
+        first = loop.run_until_complete(_on_worker(worker, service.rescan))
         if first is not None and first.state != 'FLAT':
             logging.warning('resumed liquidation %s in state %s', first.cause_command_id, first.state)
-        loop.create_task(_liquidation_recovery_loop(service))
-    except Exception as ex:
-        logging.error('failed to start liquidation recovery: {}'.format(ex))
+    except (Exception, asyncio.CancelledError) as ex:
+        if not stopping():
+            logging.error('startup liquidation rescan failed; the recovery loop retries: {}'.format(ex))
+    if stopping():
+        logging.info('shutdown during startup liquidation rescan; recovery loop not started')
+        return
+    loop.create_task(_liquidation_recovery_loop(service, worker))
 
 
-async def _session_controller_loop(controller, *, interval: float = 5.0) -> None:
+async def _session_controller_tick(controller, worker, now: dt.datetime):
+    """One ``run_due`` on the liquidation worker; the trader loop stays free."""
+    state = await _on_worker(worker, controller.run_due, now)
+    if state.state not in ('FLAT', 'INCIDENT', 'CLOSED'):
+        logging.debug(
+            'session controller %s state=%s cutoff=%s',
+            state.session_date, state.state, state.entry_cutoff_reached,
+        )
+    return state
+
+
+async def _session_controller_loop(
+    controller, worker, *, interval: float = 5.0, stuck_after: float = _WORKER_STUCK_AFTER_SECONDS,
+) -> None:
     """Tick absolute session deadlines until flat or incident."""
-    while True:
-        try:
-            now = dt.datetime.now(dt.timezone.utc)
-            state = controller.run_due(now)
-            if state.state not in ('FLAT', 'INCIDENT', 'CLOSED'):
-                logging.debug(
-                    'session controller %s state=%s cutoff=%s',
-                    state.session_date, state.state, state.entry_cutoff_reached,
-                )
-        except Exception as ex:
-            logging.error('session controller tick failed: {}'.format(ex))
-        await asyncio.sleep(interval)
+    await _watched_ticks(
+        'session controller',
+        lambda: _session_controller_tick(controller, worker, dt.datetime.now(dt.timezone.utc)),
+        interval=interval, stuck_after=stuck_after)
 
 
-def _maybe_start_session_recovery(trader: Trader, loop: AbstractEventLoop) -> None:
+def _maybe_start_session_recovery(
+    trader: Trader, loop: AbstractEventLoop, worker, stopping: Callable[[], bool] = _never_stopping,
+) -> None:
     """P3 Task 6: resume session deadlines BEFORE semantic readiness / run().
 
     Session recovery must precede readiness so a restart mid-flatten cannot
     open a window where automation is 'ready' but deadlines are unenforced.
+    ``recover()`` runs on the liquidation worker while ``loop`` runs, so a
+    flatten it issues is placed on the trader loop before ``trader.run()``.
+    The session loop does not start once ``stopping()`` is true.
     """
     controller = getattr(trader, 'session_controller', None)
-    if controller is None:
+    if controller is None or stopping():
         return
     try:
         now = dt.datetime.now(dt.timezone.utc)
-        state = controller.recover(now)
+        state = loop.run_until_complete(_on_worker(worker, controller.recover, now))
         if state.state not in ('FLAT', 'CLOSED'):
             logging.warning(
                 'resumed session %s in state %s (incident=%s)',
                 state.session_date, state.state, state.incident,
             )
-        loop.create_task(_session_controller_loop(controller))
-    except Exception as ex:
-        logging.error('failed to start session recovery: {}'.format(ex))
+    except (Exception, asyncio.CancelledError) as ex:
+        if not stopping():
+            logging.error('startup session recovery failed; the session loop retries: {}'.format(ex))
+    if stopping():
+        logging.info('shutdown during startup session recovery; session loop not started')
+        return
+    loop.create_task(_session_controller_loop(controller, worker))
+
+
+def _finish_startup_shutdown(loop: AbstractEventLoop, shutdown: asyncio.Future | None) -> None:
+    """Let a shutdown that began during startup recovery run to its end.
+
+    The startup ``run_until_complete`` can return while ``graceful_shutdown``
+    still waits for its tasks, so run the loop until it is done.
+    """
+    if shutdown is not None and not shutdown.done():
+        loop.run_until_complete(shutdown)
 
 
 def _seed_trading_control(trader: Trader, container: Container) -> TradingControlStore:
@@ -301,6 +437,7 @@ def main(simulation: bool,
 
     container = Container.create(config)
     trader = container.resolve(Trader, simulation=simulation)
+    liquidation_worker = _new_liquidation_worker()
 
     async def graceful_shutdown():
         nonlocal is_stopping
@@ -324,10 +461,17 @@ def main(simulation: bool,
             if still_pending:
                 # Give cancelled tasks a moment to handle CancelledError
                 await asyncio.wait(still_pending, timeout=2)
+        liquidation_worker.shutdown(wait=False, cancel_futures=True)
         loop.stop()
 
+    shutdown: asyncio.Future | None = None
+
     def handle_sigint():
-        asyncio.ensure_future(graceful_shutdown())
+        nonlocal shutdown
+        shutdown = asyncio.ensure_future(graceful_shutdown())
+
+    def stopping() -> bool:
+        return is_stopping
 
     if simulation:
         logging.info('simulation mode: use the backtest CLI command instead')
@@ -360,9 +504,13 @@ def main(simulation: bool,
         # Dormant until the live command authority is wired (see the function's
         # docstring) -- a no-op here today, never a startup regression.
         _maybe_start_command_reconciliation(trader, loop)
-        _maybe_start_liquidation_recovery(trader, loop)
+        _maybe_start_liquidation_recovery(trader, loop, liquidation_worker, stopping)
         # P3 Task 6: session deadline recovery must start before readiness/run.
-        _maybe_start_session_recovery(trader, loop)
+        _maybe_start_session_recovery(trader, loop, liquidation_worker, stopping)
+        if stopping():
+            _finish_startup_shutdown(loop, shutdown)
+            logging.info('shutdown requested during startup recovery; not starting the trader loop')
+            return
 
         ip_address = get_network_ip()
         logging.debug('starting trading_runtime at network address: {}'.format(ip_address))
@@ -373,6 +521,8 @@ def main(simulation: bool,
     except KeyboardInterrupt:
         pass
     except SystemExit:
+        pass
+    except asyncio.CancelledError:
         pass
 
 

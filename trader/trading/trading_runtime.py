@@ -1690,6 +1690,134 @@ class Trader():
             logging.error(f'place_expressive_order error: {ex}')
             return SuccessFail.fail(exception=ex)
 
+    async def place_reduce_only_order(
+        self,
+        contract: Contract,
+        side: str,
+        quantity: float,
+        *,
+        broker_quantity: float,
+        order_ref: str,
+    ) -> SuccessFail:
+        """Send a MARKET order that can only shrink an existing position.
+
+        The emergency-exit path (liquidation, session flatten). It keeps the
+        boundary checks — account and mode pin, contract, reduce-only side and
+        size, the live ib_async position cache, the executioner account fence
+        and the IB reject check — and skips the entry gates: the trading
+        filter, the whatIf probe, the leverage check and ``RiskGate.evaluate``.
+        Those limit new exposure, and a daily-loss breach must not block a
+        flatten.
+
+        Result contract:
+        - ``fail(error=...)``: refused, nothing was sent (or IB rejected it
+          with nothing filled).
+        - ``fail(exception=...)``: the order may have been sent.
+        """
+        try:
+            refusal = self._reduce_only_refusal(contract, side, quantity, broker_quantity)
+        except Exception as ex:
+            refusal = f'pre-send check failed: {ex}'
+        if refusal:
+            logging.error('reduce-only order refused before send: %s', refusal)
+            return SuccessFail.fail(error=f'reduce-only refused: {refusal}')
+
+        order = MarketOrder(
+            action=side, totalQuantity=quantity, account=self.ib_account,
+            orderRef=order_ref, tif='DAY', outsideRth=False,
+        )
+        try:
+            trade = await self._send_reduce_only(contract, order)
+            return await self._confirm_reduce_only(trade)
+        except Exception as ex:
+            logging.error('reduce-only order may have been sent: %s', ex)
+            return SuccessFail.fail(exception=ex)
+
+    def _reduce_only_refusal(
+        self, contract: Contract, side: str, quantity: float, broker_quantity: float,
+    ) -> Optional[str]:
+        import math
+
+        account = self.ib_account
+        if not account:
+            return 'no ib_account is configured on the trader'
+        if self.paper_trading != account.startswith('D'):
+            mode = 'paper' if self.paper_trading else 'live'
+            return f'ib_account {account!r} does not match trading mode {mode}'
+        if int(contract.conId or 0) <= 0 or not contract.symbol:
+            return f'invalid contract (conId={contract.conId!r}, symbol={contract.symbol!r})'
+        try:
+            broker_quantity = float(broker_quantity)
+            quantity = float(quantity)
+        except (TypeError, ValueError):
+            return 'quantity is not a number'
+        if not math.isfinite(broker_quantity) or broker_quantity == 0:
+            return f'broker position {broker_quantity} is not a finite non-zero quantity'
+        reducing_side = 'SELL' if broker_quantity > 0 else 'BUY'
+        if side != reducing_side:
+            return f'{side} would not reduce broker position {broker_quantity}'
+        if not math.isfinite(quantity) or not 0 < quantity <= abs(broker_quantity):
+            return f'quantity {quantity} must be > 0 and <= |{broker_quantity}|'
+
+        live = self._live_position_quantity(int(contract.conId))
+        if live == 0 or (live > 0) != (broker_quantity > 0) or abs(live) < quantity:
+            return (f'live position cache shows {live} for conId {contract.conId}; '
+                    f'cannot {side} {quantity} against broker position {broker_quantity}')
+        return None
+
+    def _live_position_quantity(self, conid: int) -> float:
+        """Signed quantity from ib_async's position cache (no IB request)."""
+        return sum(
+            float(p.position)
+            for p in self.client.ib.positions(self.ib_account)
+            if int(getattr(p.contract, 'conId', 0) or 0) == conid
+        )
+
+    async def _send_reduce_only(self, contract: Contract, order: Order) -> Trade:
+        """Place the order and return the first Trade echo.
+
+        Every refusal the executioner fence could raise was already checked,
+        so any error from here on may come after ``placeOrder`` ran.
+        """
+        sent = asyncio.Event()
+        outcome: Dict[str, object] = {}
+
+        def _on_next(trade: Trade):
+            outcome.setdefault('trade', trade)
+            sent.set()
+
+        def _on_error(ex: Exception):
+            outcome.setdefault('error', ex)
+            sent.set()
+
+        observable = await self.executioner.subscribe_place_order_direct(contract, order)
+        observable.subscribe(Observer(on_next=_on_next, on_error=_on_error, on_completed=lambda: None))
+        await sent.wait()
+        if 'trade' not in outcome:
+            raise RuntimeError(f'reduce-only send failed; the order may have been sent: {outcome["error"]}')
+        return cast(Trade, outcome['trade'])
+
+    async def _confirm_reduce_only(self, trade: Trade) -> SuccessFail:
+        """Map IB's decisive status. Only a rejection with nothing filled is a failure."""
+        tracker = getattr(self, 'order_tracker', None)
+        order_id = int(getattr(trade.order, 'orderId', 0) or 0)
+        if tracker is None or not order_id:
+            return SuccessFail.success(obj=[trade])
+        verdict = await tracker.wait_decisive(order_id, timeout=8.0)
+        if verdict != 'rejected':
+            return SuccessFail.success(obj=[trade])
+        reason = tracker.latest_status(order_id) or 'rejected'
+        filled = float(getattr(getattr(trade, 'orderStatus', None), 'filled', 0) or 0)
+        if filled:
+            raise RuntimeError(
+                f'reduce-only order ended {reason} after filling {filled}; '
+                'part of it may have been executed')
+        try:
+            self.client.ib.cancelOrder(trade.order)
+        except Exception as ex:
+            logging.warning('cancel of rejected reduce-only order failed: %s', ex)
+        return SuccessFail.fail(error=f'Order rejected by IB (entry status={reason})')
+
     async def place_standalone_order(
         self,
         contract: Contract,
@@ -2332,42 +2460,91 @@ class TradingRuntimeOrderDispatch:
             raise CancelUnresolved(
                 f"no live order to cancel for {order_entity_id!r} "
                 f"(perm_id={perm_id}); deferring to reconciliation")
-        self._trader.client.ib.cancelOrder(order)
+        # ib_async is not thread-safe: send the cancel from the trader loop.
+        loop = self._dispatch_loop('cancel')
+
+        async def _cancel_on_loop():
+            self._trader.client.ib.cancelOrder(order)
+
+        self._wait_on_loop(
+            asyncio.run_coroutine_threadsafe(_cancel_on_loop(), loop), 'cancel', sent='the cancel')
         return CancelAck(order_entity_id=order_entity_id, cancelled=True)
 
     def reduce_position(self, position, side: str, quantity: float, order_ref: str):
         """Submit an emergency reduce-only market order.
 
-        This intentionally bypasses proposal semantics, but not the trader's
-        one real-order boundary.  The caller supplies a broker position and
-        this method re-derives side/quantity, rejecting any request which
-        could increase or flip exposure.
+        This intentionally bypasses proposal semantics and the entry gates
+        (``Trader.place_reduce_only_order``), but not the trader's one
+        real-order boundary. The caller supplies a broker position and this
+        method re-derives side/quantity, rejecting any request which could
+        increase or flip exposure.
+
+        Must be called off the trader loop (the liquidation worker or an RPC
+        thread). Errors:
+        - ``ValueError`` / ``RuntimeError`` before scheduling: nothing sent.
+        - ``BrokerRejectedError``: refused before send, or rejected by IB with
+          nothing filled.
+        - any other exception, including ``TimeoutError``: the order may have
+          been sent.
         """
+        from trader.trading.command_coordinator import BrokerRejectedError
+
         broker_quantity = float(position.quantity)
         expected_side = 'SELL' if broker_quantity > 0 else 'BUY'
         if broker_quantity == 0 or side != expected_side or float(quantity) != abs(broker_quantity):
             raise ValueError('liquidation order must exactly reduce the broker position')
-        loop = getattr(self._trader, '_main_loop', None)
-        if loop is None:
-            raise RuntimeError('trader event loop unavailable for liquidation')
+        position_account = getattr(position, 'account_id', None)
+        if position_account and position_account != getattr(self._trader, 'ib_account', None):
+            raise ValueError('liquidation position account does not match trader account')
+        loop = self._dispatch_loop('liquidation')
         contract = Contract(
             conId=int(position.conid), symbol=position.symbol,
             secType=position.sec_type or 'STK', exchange=position.exchange or 'SMART',
             currency=position.currency or 'USD',
         )
         future = asyncio.run_coroutine_threadsafe(
-            self._trader.place_expressive_order(
+            self._trader.place_reduce_only_order(
                 contract, side, abs(broker_quantity),
-                {'order_type': 'MARKET', 'exit_type': 'NONE', 'tif': 'DAY', 'outside_rth': False},
-                algo_name=order_ref,
+                broker_quantity=broker_quantity, order_ref=order_ref,
             ), loop,
         )
-        result = future.result(timeout=self._dispatch_timeout)
+        result = self._wait_on_loop(future, 'liquidation dispatch')
         if result.is_success():
             return result.obj or []
+        if result.error is not None:
+            raise BrokerRejectedError(str(result.error))
         if result.exception is not None:
             raise result.exception
-        raise RuntimeError(str(result.error or 'liquidation dispatch failed'))
+        raise RuntimeError('liquidation dispatch failed with no detail; the order may have been sent')
+
+    def _dispatch_loop(self, purpose: str) -> asyncio.AbstractEventLoop:
+        """The trader loop, or RuntimeError before anything is scheduled.
+
+        A stopped loop would run the order late, after the caller gave up; a
+        call from the loop thread would block the loop it waits on.
+        """
+        loop = getattr(self._trader, '_main_loop', None)
+        if loop is None or not loop.is_running():
+            raise RuntimeError(f'trader event loop is not running; {purpose} refused, nothing sent')
+        try:
+            running = asyncio.get_running_loop()
+        except RuntimeError:
+            running = None
+        if running is loop:
+            raise RuntimeError(
+                f'{purpose} called on the trader loop thread; refused to avoid a deadlock, nothing sent')
+        return loop
+
+    def _wait_on_loop(self, future, purpose: str, *, sent: str = 'the order'):
+        try:
+            return future.result(timeout=self._dispatch_timeout)
+        except TimeoutError:
+            # Cancelling can interrupt a coroutine that already sent it.
+            future.cancel()
+            logging.error('%s timed out after %ss; %s may have been sent',
+                          purpose, self._dispatch_timeout, sent)
+            raise TimeoutError(
+                f'{purpose} timed out after {self._dispatch_timeout}s; {sent} may have been sent')
 
     def _perm_id_for_order(self, order_entity_id: str):
         # Conn-free reverse alias lookup (order_entity_id -> perm_id). Fail-safe:

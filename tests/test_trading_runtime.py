@@ -950,3 +950,247 @@ async def test_strategy_proxies_run_off_loop():
         'loop thread — must offload via asyncio.to_thread (deadlock: '
         'strategy_service calls back into trader_service during these RPCs)'
     )
+
+
+# ---------------------------------------------------------------------------
+# Reduce-only exit path (liquidation): boundary checks kept, entry gates skipped
+# ---------------------------------------------------------------------------
+
+def _reduce_trader(*, live_position=10.0, account='DU12345', paper=True, trade=None,
+                   executioner_error=None):
+    """A Trader stand-in whose executioner records sends.
+
+    ``live_position`` is what the ib_async positions cache reports for conId 1
+    (None = no row for that conId).
+    """
+    from types import SimpleNamespace
+    import reactivex as rx
+
+    trader = _minimal_trader()
+    trader.ib_account = account
+    trader.paper_trading = paper
+    cancelled = []
+    positions = [] if live_position is None else [SimpleNamespace(
+        account=account, contract=SimpleNamespace(conId=1), position=live_position, avgCost=1.0)]
+    trader.client = SimpleNamespace(ib=SimpleNamespace(
+        positions=lambda acct='': list(positions) if acct == account else [],
+        cancelOrder=lambda order: cancelled.append(order),
+        accountValues=lambda: [],
+        managedAccounts=lambda: [account],
+    ))
+    sent = []
+    sent_trade = trade or SimpleNamespace(
+        order=SimpleNamespace(orderId=1001), orderStatus=SimpleNamespace(filled=0.0))
+
+    class _RecordingExecutioner:
+        async def subscribe_place_order_direct(self, contract, order):
+            sent.append((contract, order))
+            if executioner_error is not None:
+                return rx.throw(executioner_error)
+            return rx.from_iterable([sent_trade])
+
+    trader.executioner = _RecordingExecutioner()
+    trader.cancelled_orders = cancelled
+    return trader, sent
+
+
+def _reduce_contract(symbol='AAPL'):
+    from ib_async import Contract
+    return Contract(conId=1, symbol=symbol, secType='STK', exchange='SMART', currency='USD')
+
+
+class _BoomGate:
+    """Any entry-gate call fails the test: the exit path must never touch it."""
+    def check_instrument(self, *a, **kw):
+        raise AssertionError('reduce-only exit called check_instrument')
+
+    def check_leverage(self, *a, **kw):
+        raise AssertionError('reduce-only exit called check_leverage')
+
+    def evaluate(self, *a, **kw):
+        raise AssertionError('reduce-only exit called risk_gate.evaluate')
+
+
+def _boom_margin(*a, **kw):
+    raise AssertionError('reduce-only exit called check_order_margin')
+
+
+@pytest.mark.asyncio
+async def test_reduce_only_passes_after_daily_loss_breach_while_entry_is_refused(risk_gate):
+    from types import SimpleNamespace
+
+    trader, sent = _reduce_trader()
+    trader.risk_gate = risk_gate  # real RiskGate(RiskLimits()), max_daily_loss=1000
+    trader.get_pnl = lambda: [SimpleNamespace(dailyPnL=-1500.0)]
+    trader.book = SimpleNamespace(get_open_order_count=lambda: 0)
+    trader.check_order_margin = MagicMock(side_effect=Exception('no whatIf in tests'))
+
+    entry = await trader.place_expressive_order(
+        _reduce_contract(), 'BUY', 10, {'order_type': 'MARKET', 'exit_type': 'NONE'},
+        algo_name='entry')
+    assert not entry.is_success()
+    assert 'daily loss' in entry.error
+    assert sent == []
+
+    trader.risk_gate = _BoomGate()
+    trader.check_order_margin = _boom_margin
+    result = await trader.place_reduce_only_order(
+        _reduce_contract(), 'SELL', 10.0, broker_quantity=10.0, order_ref='mmr:og-flat')
+
+    assert result.is_success(), result
+    assert len(sent) == 1
+    _, order = sent[0]
+    assert (order.action, order.totalQuantity, order.orderType) == ('SELL', 10.0, 'MKT')
+    assert (order.account, order.orderRef, order.tif) == ('DU12345', 'mmr:og-flat', 'DAY')
+
+
+@pytest.mark.asyncio
+async def test_reduce_only_skips_trading_filter_for_denylisted_symbol(risk_gate):
+    from trader.trading.trading_filter import TradingFilter
+
+    trader, sent = _reduce_trader()
+    risk_gate.trading_filter = TradingFilter(denylist=['AAPL'])
+    trader.risk_gate = risk_gate
+    trader.check_order_margin = MagicMock(side_effect=Exception('no whatIf in tests'))
+
+    entry = await trader.place_expressive_order(
+        _reduce_contract(), 'BUY', 10, {'order_type': 'MARKET', 'exit_type': 'NONE'})
+    assert not entry.is_success() and 'denylist' in entry.error
+
+    result = await trader.place_reduce_only_order(
+        _reduce_contract(), 'SELL', 10.0, broker_quantity=10.0, order_ref='mmr:og-flat')
+    assert result.is_success(), result
+    assert len(sent) == 1
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(('broker_quantity', 'side'), [(10.0, 'BUY'), (-10.0, 'SELL')])
+async def test_reduce_only_refuses_side_that_increases_or_flips_exposure(broker_quantity, side):
+    trader, sent = _reduce_trader(live_position=broker_quantity)
+    result = await trader.place_reduce_only_order(
+        _reduce_contract(), side, 10.0, broker_quantity=broker_quantity, order_ref='r')
+    assert not result.is_success()
+    assert result.exception is None
+    assert 'reduce-only refused' in result.error
+    assert sent == []
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(('quantity', 'broker_quantity'), [
+    (11.0, 10.0), (0.0, 10.0), (-1.0, 10.0), (float('nan'), 10.0), (10.0, 0.0),
+    (10.0, float('inf')),
+])
+async def test_reduce_only_refuses_quantity_above_position_or_non_positive(quantity, broker_quantity):
+    trader, sent = _reduce_trader()
+    result = await trader.place_reduce_only_order(
+        _reduce_contract(), 'SELL', quantity, broker_quantity=broker_quantity, order_ref='r')
+    assert not result.is_success()
+    assert 'reduce-only refused' in result.error
+    assert sent == []
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize('symbol,conid', [('', 1), ('AAPL', 0)])
+async def test_reduce_only_refuses_invalid_contract(symbol, conid):
+    from ib_async import Contract
+    trader, sent = _reduce_trader()
+    result = await trader.place_reduce_only_order(
+        Contract(conId=conid, symbol=symbol, secType='STK'), 'SELL', 10.0,
+        broker_quantity=10.0, order_ref='r')
+    assert not result.is_success()
+    assert 'reduce-only refused' in result.error
+    assert sent == []
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(('account', 'paper'), [('', True), ('U123', True), ('DU123', False)])
+async def test_reduce_only_refuses_unpinned_account_or_mode_mismatch(account, paper):
+    trader, sent = _reduce_trader(account=account, paper=paper)
+    result = await trader.place_reduce_only_order(
+        _reduce_contract(), 'SELL', 10.0, broker_quantity=10.0, order_ref='r')
+    assert not result.is_success()
+    assert result.exception is None
+    assert 'reduce-only refused' in result.error
+    assert sent == []
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize('live_position', [None, 0.0, -10.0, 4.0])
+async def test_reduce_only_refuses_when_live_position_cache_disagrees(live_position):
+    trader, sent = _reduce_trader(live_position=live_position)
+    result = await trader.place_reduce_only_order(
+        _reduce_contract(), 'SELL', 10.0, broker_quantity=10.0, order_ref='r')
+    assert not result.is_success()
+    assert result.exception is None
+    assert 'reduce-only refused' in result.error
+    assert 'live' in result.error
+    assert sent == []
+
+
+@pytest.mark.asyncio
+async def test_reduce_only_crash_in_pre_send_checks_is_a_refusal():
+    trader, sent = _reduce_trader()
+
+    def broken_cache(account=''):
+        raise ConnectionError('positions cache unavailable')
+
+    trader.client.ib.positions = broken_cache
+    result = await trader.place_reduce_only_order(
+        _reduce_contract(), 'SELL', 10.0, broker_quantity=10.0, order_ref='r')
+    assert not result.is_success()
+    assert result.exception is None
+    assert 'reduce-only refused' in result.error
+    assert sent == []
+
+
+@pytest.mark.asyncio
+async def test_reduce_only_observable_error_after_send_is_ambiguous():
+    trader, sent = _reduce_trader(executioner_error=RuntimeError('lost after placeOrder'))
+    result = await trader.place_reduce_only_order(
+        _reduce_contract(), 'SELL', 10.0, broker_quantity=10.0, order_ref='r')
+    assert not result.is_success()
+    assert result.error is None
+    assert isinstance(result.exception, Exception)
+    assert len(sent) == 1
+
+
+class _Tracker:
+    def __init__(self, verdict):
+        self.verdict = verdict
+
+    async def wait_decisive(self, order_id, timeout=10.0):
+        return self.verdict
+
+    def latest_status(self, order_id):
+        return 'Cancelled' if self.verdict == 'rejected' else 'Filled'
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(('verdict', 'filled', 'expected'), [
+    ('rejected', 0.0, 'refused'),
+    ('rejected', 3.0, 'ambiguous'),
+    ('accepted', 0.0, 'success'),
+    ('filled', 10.0, 'success'),
+    ('timeout', 0.0, 'success'),
+])
+async def test_reduce_only_ib_verdict_mapping(verdict, filled, expected):
+    from types import SimpleNamespace
+
+    trade = SimpleNamespace(
+        order=SimpleNamespace(orderId=1001), orderStatus=SimpleNamespace(filled=filled))
+    trader, sent = _reduce_trader(trade=trade)
+    trader.order_tracker = _Tracker(verdict)
+
+    result = await trader.place_reduce_only_order(
+        _reduce_contract(), 'SELL', 10.0, broker_quantity=10.0, order_ref='r')
+
+    assert len(sent) == 1
+    if expected == 'success':
+        assert result.is_success() and result.obj == [trade]
+    elif expected == 'refused':
+        assert not result.is_success() and result.exception is None
+        assert 'Order rejected by IB' in result.error
+        assert trader.cancelled_orders == [trade.order]
+    else:
+        assert not result.is_success() and result.error is None
+        assert 'may have been' in str(result.exception)

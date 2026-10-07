@@ -39,6 +39,9 @@ SP2 is split into slices, each with its own spec, plan and code:
   CLOSE / PARTIAL_CLOSE do not need Jev.
 - Controller: one async service with a durable journal (approach A). No cron
   runs, no external workflow engine.
+- Starting state (option A, 2026-10-07): the **operator** publishes the initial
+  risk policy and registers a `discretionary` deployment over a universe
+  (default `sp500`); self-found ideas trade only inside it.
 
 ## 3. Roles and authority
 
@@ -76,8 +79,11 @@ keep their own credentials. It talks to the trader only, over Plan 2 typed RPC.
 - The **trader grants** a monotonically increasing controller epoch with a lease
   (amendment 6.2). The `ai` service persists the epoch it holds.
 - The current epoch travels in the **authenticated transport envelope**, outside
-  the immutable command body. The trader validates the active epoch atomically
-  with each new command admission and refuses a stale epoch.
+  the immutable command body, and is **part of the signed bytes**
+  (`rpc_signing_bytes`). It is **required** on new-command admission
+  (`submit_ai_paper_decision`): a missing epoch is refused like a stale one. The
+  trader checks the granted epoch in the same transaction as the command claim.
+  Reads and reconciles carry the successor's signed epoch; they may not omit it.
 - A successor reconciles commands created under an older epoch by their
   original id and body under its own epoch. Commands the trader already accepted
   continue independently of the old controller; a takeover never cancels or
@@ -120,7 +126,9 @@ keep their own credentials. It talks to the trader only, over Plan 2 typed RPC.
 
 - Owner setting `ai_paper.model_budget_usd_per_day` (default 2000). Only an
   operator `cli` command or `trader.yaml` changes it; no AI principal can.
-  Lowering applies at once, raising at the next session.
+  The **effective cap is persisted**. Lowering applies at once. Raising applies
+  only at the next 00:00 America/New_York window; a restart never applies it
+  early.
 - Before each call, reserve the **worst-case** cost, atomically across Jev, the
   orchestrator and any research calls. Reservations are persisted and survive
   restarts.
@@ -129,7 +137,8 @@ keep their own credentials. It talks to the trader only, over Plan 2 typed RPC.
 - An unknown outcome keeps its reservation counted; its cost is labelled
   unknown/estimated, never a confirmed charge. A later usage report reconciles
   the reservation without double counting. Missing price information is never
-  treated as free.
+  treated as free: if a price cannot be determined, the call is **refused**
+  and no reservation is written.
 - Other limits: tokens per call, calls per hour, at most **2 calls in flight**,
   and **one decision deadline (default 60 s) spanning orchestrator plus Jev**.
   Hourly and concurrency limits delay or expire work in their own windows; only
@@ -169,8 +178,8 @@ read and mutation rights separate.
    retention, readable by `ai_supervisor` only.
 2. **Controller epoch.** A trader-side epoch/lease table, a grant method for
    `ai_supervisor`, and epoch validation atomic with new-command admission on
-   `submit_ai_paper_decision`. **2b:** an optional `controller_epoch` field in
-   the Plan 2 authenticated request envelope.
+   `submit_ai_paper_decision`. **2b:** a `controller_epoch` field in the Plan 2
+   envelope, covered by the signature, required for new-command admission.
 3. **Cost and simulation ingestion.** `record_ai_cost` and
    `record_simulated_decision`, `ai_supervisor` only. Idempotent ingestion, not
    scoreboard edits: stable record ids, validated experiment and action links,
@@ -192,6 +201,27 @@ read and mutation rights separate.
      duplicate orders.
    The trader must **prove and enforce** the reduction; a stale close racing a
    stop fill must not oversell.
+
+5. **Trader-owned Alpaca discovery read.** A read-only typed method (for
+   example `discover_ai_candidates`) that returns Alpaca movers, most-actives and
+   per-symbol news with source, timestamp, delayed label and coverage. Alpaca
+   credentials stay in the trader/data services, never in `ai`. No implicit
+   fallback to the IB scanner. Rights: `ai_supervisor` read only.
+6. **Discretionary deployment kind.** Self-found ideas trade only inside a
+   `discretionary` deployment that an **operator** registers (`cli` principal
+   only, paper only). It names a universe (default `sp500`, configurable) and is
+   sealed with the universe digest and the operator's attestation instead of
+   backtest evidence; it is labelled `discretionary` everywhere it is shown. All
+   other SP1 deployment and admission checks are unchanged; a discovered conid
+   outside the universe stays refused (`CONID_NOT_IN_DEPLOYMENT`).
+7. **Initial policy.** The operator publishes the initial risk policy with a
+   `cli` command before arming. SP2a/b never publishes or loosens policy on
+   startup or restart (policy generation is SP2d).
+8. **Separate baseline books.** Simulated rows carry a versioned baseline id
+   and an opportunity cohort. Storage, report, readback and display keep one
+   book per baseline; counterfactual books are never summed. An incomplete book
+   is reported as incomplete without hiding complete ones. This amends SP1's
+   scoreboard report, which today sums all simulated rows.
 
 ## 7. Baselines and reporting
 
@@ -237,8 +267,8 @@ close recovery, not new discretionary exits without a working model.
 
 ## 10. Data sources
 
-- Discovery uses Alpaca movers, most-actives and news, plus an optional
-  watchlist. Alpaca discovery data is 15-minute-delayed SIP: every candidate is
+- Discovery uses Alpaca movers, most-actives and news (through amendment 6.5),
+  plus an optional watchlist, limited to the discretionary universe. Alpaca discovery data is 15-minute-delayed SIP: every candidate is
   timestamped and labelled delayed. Fresh broker-side evidence (IB quote) is
   obtained before any ENTER is submitted.
 - A failed or incomplete scan is never presented as complete.
@@ -292,7 +322,7 @@ instead of blocking; exhaustion leaves reconciliation, decided closes and SP1
 exits running.
 
 **Config.** Missing model configuration, unsupported role/backend combinations,
-malformed usage and unavailable pricing.
+malformed usage and unavailable pricing (the call is refused, no reservation).
 
 **Durability.** Container recreation keeps `mmr_ai_data`; outbox delivers after a
 trader outage; lost reporting acknowledgement creates no duplicate cost or
@@ -301,6 +331,22 @@ baseline record.
 **Security.** Adversarial model outputs fed directly into validation cannot
 override ids, evidence, tool permissions or ceilings. Method restrictions are
 exercised through signed typed RPC, including cross-principal calls.
+
+**Initialization.** With SP2c/d disabled and empty stores, initialize through
+signed RPC only (operator publishes the policy and registers the discretionary
+deployment), then run one strategy entry and one self-found entry; an
+unregistered candidate stays refused; a restart neither republishes nor loosens
+policy nor substitutes fixture evidence.
+
+**Discovery route.** Through real signed trader RPC with a fake Alpaca transport
+and an `ai` client without Alpaca credentials: partial coverage is reported, and
+the IB scanner is asserted unused.
+
+**Baseline books.** One experiment with fixed-rule, no-trade and matched-entry
+books reports separate results; an incomplete book does not erase complete ones.
+
+**Signed epoch.** A submit with a missing epoch, or a stale holder's resend with
+an altered unsigned field, is refused.
 
 **Replay.** With outbound network blocked, replay makes **zero** external-adapter
 invocations (asserted, not just "no network"), and missing evidence produces an

@@ -23,5 +23,6 @@ DECISION_MIGRATIONS: tuple[Migration, ...] = (
         CREATE TABLE ai_exit_waits (
             opportunity_id VARCHAR PRIMARY KEY, wait_until TIMESTAMPTZ NOT NULL, reason VARCHAR,
             created_at TIMESTAMPTZ NOT NULL, updated_at TIMESTAMPTZ NOT NULL,
-            alerts INTEGER NOT NULL DEFAULT 0, last_alert_at TIMESTAMPTZ)""",)),
+            alerts INTEGER NOT NULL DEFAULT 0, last_alert_at TIMESTAMPTZ,
+            reopened_for VARCHAR)""",)),
 )

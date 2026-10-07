@@ -196,11 +196,41 @@ async def test_an_exit_signal_for_a_conid_not_held_is_noted(rig):
 
 
 @pytest.mark.asyncio
-async def test_an_exit_signal_still_closes_when_trips_cannot_be_read(tmp_path):
-    rig = await started(tmp_path, FakeReads(get_experiment_trips=trader_down()))
+@pytest.mark.parametrize("trips", [trader_down(), {"experiment_id": "exp-" + "b" * 20, "trips": "x"},
+                                   {"error_code": "EXPERIMENT_NOT_FOUND", "trips": None}])
+async def test_unknown_ownership_never_closes_and_keeps_the_exit_waiting(tmp_path, trips):   # PR #86 4212667433
+    rig = await started(tmp_path, FakeReads(get_experiment_trips=trips))
     sell = SignalOpportunity("sig-" + "3" * 32, 9, "orb", AAPL, "SELL", 0.7, NOW, NOW)
     result = await rig.engine.on_exit_signal(rig.signal(sell))
-    assert [d.action for d in result.decisions] == ["CLOSE"] and result.note == "EXIT_SIGNAL_TRIPS_UNKNOWN"
+    assert (result.decisions, result.note) == ((), "EXIT_WAITING_FOR_TRIPS") and result.wait_until is not None
+
+
+def refused_close(rig, opportunity, code="POSITION_NOT_OWNED"):
+    """A strategy CLOSE of this exit that the trader refused (nothing of ours was held yet)."""
+    close = ProposedDecision(action_key=f"close:{opportunity.conid}", action="CLOSE", conid=opportunity.conid,
+                             side="SELL", decider="strategy", evidence_digest="sha256:" + "e" * 64)
+    submitter = Submitter(store=rig.store, supervisor=None, leadership=None, clock=rig.clock, slots=None,
+                          experiment_state=lambda: None)
+    decision_id = rig.store.transaction(lambda conn: submitter.insert_in_tx(
+        conn, source_kind="exit_signal", source_id=opportunity.opportunity_id, decision=close,
+        expires_at=NOW + dt.timedelta(minutes=5), epoch=1, now=NOW))
+    rig.store.db.execute("UPDATE ai_submissions SET state = 'FINAL', receipt_state = 'REJECTED', error_code = ? "
+                         "WHERE decision_id = ?", [code, decision_id])
+    return decision_id
+
+
+@pytest.mark.asyncio
+async def test_a_retry_after_a_refused_close_gets_a_new_action_key(tmp_path):            # PR #86 4212667433
+    trips = {"experiment_id": EXPERIMENT.experiment_id, "trips": [
+        {"round_trip_id": "rt-1", "conid": AAPL, "symbol": "AAPL", "opened_at": NOW.isoformat(),
+         "opened_quantity": 3.0, "closed_quantity": 0.0, "decision_id": ENTER_ID, "state": "OPEN",
+         "entry_avg_price": 230.0}]}
+    rig = await started(tmp_path, FakeReads(get_experiment_trips=trips))
+    sell = SignalOpportunity("sig-" + "3" * 32, 9, "orb", AAPL, "SELL", 0.7, NOW, NOW)
+    first = refused_close(rig, sell)
+    (retry,) = (await rig.engine.on_exit_signal(rig.signal(sell))).decisions
+    assert retry.action_key == f"close:{AAPL}:r2"                    # the decision id stays stable per attempt
+    assert derive_decision_id(sell.opportunity_id, retry.action_key) != first
 
 
 @pytest.mark.asyncio

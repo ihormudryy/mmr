@@ -32,6 +32,8 @@ WAIT = "WAIT"
 EXIT_WAIT_OVERRUN = dt.timedelta(minutes=10)      # backstop past an exit's own wait_until (PR #86 4211394337)
 EXIT_WAIT_STUCK = "EXIT_WAIT_STUCK"
 EXIT_WAIT_ALERT_EVERY = dt.timedelta(hours=1)
+NOTHING_TO_CLOSE_YET = frozenset({"POSITION_NOT_OWNED", "NOT_A_REDUCTION"})
+EXIT_REOPEN_WAIT = dt.timedelta(hours=1)          # the engine sets the real backstop on its next judgment
 SLOT_POLL_SECONDS = 1.0
 CYCLE_SOURCE = {ENTRY: "entry_cycle", POSITION: "position_cycle"}
 TRADER_AWAY = (RpcNotSent, RpcOutcomeUnknown, RpcRefused)
@@ -201,7 +203,25 @@ class AiController:
             return
         await self._intake.poll()
         await self._intake.expire_stale()
+        await self._reopen_refused_exits()
         await self.dispatch_opportunities()
+
+    async def _reopen_refused_exits(self) -> None:
+        """A strategy CLOSE refused because nothing of ours was held (yet) puts its exit back on the wait path:
+        the engine closes only once shares are proven held, else it ends unheld (PR #86 4212667433)."""
+        codes = sorted(NOTHING_TO_CLOSE_YET)
+        rows = await self._store.aquery(
+            "SELECT s.source_id, s.decision_id, s.error_code FROM ai_submissions s "
+            "JOIN ai_opportunities o ON o.opportunity_id = s.source_id "
+            "WHERE s.source_kind = 'exit_signal' AND s.action = 'CLOSE' AND s.receipt_state = 'REJECTED' "
+            f"AND s.error_code IN ({', '.join('?' for _ in codes)}) AND o.state = 'DECIDED' "
+            "AND NOT EXISTS (SELECT 1 FROM ai_exit_waits w WHERE w.opportunity_id = s.source_id "
+            "AND w.reopened_for = s.decision_id)", codes)
+        for opportunity_id, decision_id, code in rows:
+            logger.warning("exit %s: close %s refused %s; it waits for held shares again", opportunity_id,
+                           decision_id, code)
+            await self._intake.reopen(opportunity_id, decision_id, self._clock.now() + EXIT_REOPEN_WAIT,
+                                      f"EXIT_CLOSE_REFUSED_{code}")
 
     async def dispatch_opportunities(self) -> None:
         now = self._clock.now()

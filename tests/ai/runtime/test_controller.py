@@ -468,6 +468,53 @@ async def test_a_stuck_exit_wait_is_a_loud_incident_and_stays_pending(rig, caplo
     assert (await rig.controller.heartbeat())["exit_waits_stuck"] == 0
 
 
+def close_retry(conid=AAPL, attempt=2):
+    return ProposedDecision(action_key=f"close:{conid}:r{attempt}", action="CLOSE", conid=conid, side="SELL",
+                            decider="strategy", evidence_digest="sha256:" + "d" * 64)
+
+
+@pytest.mark.asyncio
+async def test_a_close_refused_for_nothing_held_reopens_the_exit(rig):                     # PR #86 4212667433
+    sell = rig.trader.signals.add(action="SELL")
+    waiting = EngineResult(note="EXIT_WAITING_FOR_ENTRY", wait_until=rig.clock.now() + dt.timedelta(hours=1))
+    answers = [EngineResult(decisions=(close(),), note="EXIT_SIGNAL"), waiting,
+               EngineResult(decisions=(close_retry(),), note="EXIT_SIGNAL")]
+    rig.engine.results["exit_signal"] = lambda ctx: answers.pop(0)
+    rig.trader.decisions.script.append(("receipt", "REJECTED", "POSITION_NOT_OWNED"))
+    await rig.signals_then_drain()                                  # the speculative CLOSE is refused
+    first = derive_decision_id(sell["source_event_id"], f"close:{AAPL}")
+    assert (await rig.submitter.get(first)).error_code == "POSITION_NOT_OWNED"
+    await rig.signals_then_drain()                                  # reopened: the engine waits for shares
+    assert rig.opportunity(sell) == ("IN_PROGRESS", "EXIT_WAITING_FOR_ENTRY")
+    await rig.signals_then_drain()                                  # held now: one retry with a new action key
+    assert rig.opportunity(sell) == ("DECIDED", "EXIT_SIGNAL")
+    assert [b["decision_id"] for b in rig.sent()] == [first, derive_decision_id(sell["source_event_id"],
+                                                                                f"close:{AAPL}:r2")]
+    await rig.signals_then_drain()
+    assert len(rig.sent()) == 2 and rig.engine.hooks_called() == ["exit_signal"] * 3
+
+
+@pytest.mark.asyncio
+async def test_a_reopened_exit_that_ends_unheld_is_not_reopened_again(rig):
+    sell = rig.trader.signals.add(action="SELL")
+    answers = [EngineResult(decisions=(close(),)), EngineResult(note="ENTRY_UNFILLED")]
+    rig.engine.results["exit_signal"] = lambda ctx: answers.pop(0)
+    rig.trader.decisions.script.append(("receipt", "REJECTED", "NOT_A_REDUCTION"))
+    for _ in range(4):
+        await rig.signals_then_drain()
+    assert rig.opportunity(sell) == ("DECIDED", "ENTRY_UNFILLED") and rig.engine.hooks_called() == ["exit_signal"] * 2
+
+
+@pytest.mark.asyncio
+async def test_a_close_refused_for_another_reason_stays_decided(rig):
+    sell = rig.trader.signals.add(action="SELL")
+    rig.engine.results["exit_signal"] = EngineResult(decisions=(close(),))
+    rig.trader.decisions.script.append(("receipt", "REJECTED", "EXPERIMENT_STOPPED"))
+    await rig.signals_then_drain()
+    await rig.signals_then_drain()
+    assert rig.opportunity(sell)[0] == "DECIDED" and rig.engine.hooks_called() == ["exit_signal"]
+
+
 @pytest.mark.asyncio
 @pytest.mark.parametrize("source", ["entry_signal", "entry_cycle"])
 async def test_only_an_exit_signal_may_wait(source):

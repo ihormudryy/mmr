@@ -428,6 +428,34 @@ async def test_the_backstop_never_drops_a_waiting_exit(stack, caplog):          
     assert (await node.controller.heartbeat())["exit_waits_stuck"] == 0
 
 
+class TripsOutage:
+    """The engine's trader reads, with get_experiment_trips failing ``times`` times before the send."""
+
+    def __init__(self, inner, times):
+        self.inner, self.left = inner, times
+
+    async def call(self, method, body):
+        from trader.ai.rpc_clients import RpcNotSent
+        if method == "get_experiment_trips" and self.left > 0:
+            self.left -= 1
+            raise RpcNotSent("TRADER_UNREACHABLE")
+        return await self.inner.call(method, body)
+
+
+@pytest.mark.asyncio
+async def test_unknown_ownership_never_closes_and_the_exit_waits_for_the_fill(stack):    # PR #86 4212667433
+    world, node, _ = stack
+    node.jev.script(JEV_MARKER, ruling())
+    await accepted_unfilled_buy(world, node)
+    node.engine._reads = TripsOutage(node.engine._reads, times=1)   # one trips-read outage
+    sell = world.strategy_signal(action="SELL")
+    await node.signals()
+    assert node.opportunity(sell) == ("IN_PROGRESS", "EXIT_WAITING_FOR_TRIPS") and close_rows(node) == []
+    await node.signals()                                            # reads recover: the entry is still working
+    assert node.opportunity(sell) == ("IN_PROGRESS", "EXIT_WAITING_FOR_ENTRY") and close_rows(node) == []
+    await fill_and_close_once(world, node, sell)                    # exactly one safe CLOSE of the held shares
+
+
 @pytest.mark.asyncio
 async def test_a_late_fill_after_the_cutoff_is_still_closed_once(stack):                 # PR #86 4211898491 (b)
     world, node, _ = stack

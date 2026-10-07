@@ -238,15 +238,26 @@ class PaperDecisionEngine:
     async def on_exit_signal(self, ctx: SignalContext) -> EngineResult:
         opportunity = ctx.opportunity
         trips = await self._trips(ctx.experiment.experiment_id)
-        held = None if trips is None else frozenset(p.conid for p in owned_positions_from_trips(trips))
-        if held is not None and opportunity.conid not in held:
+        if trips is None:                                  # unknown ownership proves nothing held (PR #86 4212667433)
+            return EngineResult(note="EXIT_WAITING_FOR_TRIPS", wait_until=self._wait_backstop(ctx.now))
+        held = frozenset(p.conid for p in owned_positions_from_trips(trips))
+        if opportunity.conid not in held:
             return await self._exit_before_any_fill(ctx, trips)
+        action_key = await self._close_action_key(opportunity)
         digest = evidence_digest({"v": "exit_signal.v1", "opportunity_id": opportunity.opportunity_id,
                                   "conid": opportunity.conid, "signal_time": opportunity.signal_time.isoformat(),
-                                  "held_known": held is not None})
-        close = ProposedDecision(action_key=f"close:{opportunity.conid}", action="CLOSE", conid=opportunity.conid,
+                                  "action_key": action_key})
+        close = ProposedDecision(action_key=action_key, action="CLOSE", conid=opportunity.conid,
                                  side="SELL", decider="strategy", evidence_digest=digest)
-        return EngineResult(decisions=(close,), note="EXIT_SIGNAL" if held is not None else "EXIT_SIGNAL_TRIPS_UNKNOWN")
+        return EngineResult(decisions=(close,), note="EXIT_SIGNAL")
+
+    async def _close_action_key(self, opportunity: Any) -> str:
+        """``close:<conid>``, then ``close:<conid>:r<n>`` for the n-th attempt after a refused one: every
+        attempt keeps its own stable decision id (Plan 5 Ruling 11)."""
+        earlier = (await self._store.aquery(
+            "SELECT COUNT(*) FROM ai_submissions WHERE source_id = ? AND action = 'CLOSE'",
+            [opportunity.opportunity_id], fetch="one"))[0]
+        return f"close:{opportunity.conid}" if earlier == 0 else f"close:{opportunity.conid}:r{earlier + 1}"
 
     async def _exit_before_any_fill(self, ctx: SignalContext, trips: dict) -> EngineResult:
         """Nothing is held. While any of our entries in this conid may still fill, the exit waits (never a close

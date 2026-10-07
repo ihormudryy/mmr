@@ -179,6 +179,21 @@ class SignalIntake:
                          "WHERE opportunity_id = ?", [reason, now, opportunity_id])
         await self._store.atransaction(work)
 
+    async def reopen(self, opportunity_id: str, refused_decision_id: str, until: dt.datetime, reason: str) -> None:
+        """A decided exit whose CLOSE the trader refused because nothing was held yet waits again (once per
+        refused decision; PR #86 4212667433)."""
+        now = self._clock.now()
+
+        def work(conn: Any) -> None:
+            conn.execute("INSERT INTO ai_exit_waits (opportunity_id, wait_until, reason, created_at, updated_at, "
+                         "reopened_for) VALUES (?, ?, ?, ?, ?, ?) ON CONFLICT (opportunity_id) DO UPDATE "
+                         "SET wait_until = excluded.wait_until, reason = excluded.reason, "
+                         "updated_at = excluded.updated_at, reopened_for = excluded.reopened_for",
+                         [opportunity_id, until, reason, now, now, refused_decision_id])
+            conn.execute("UPDATE ai_opportunities SET state = 'IN_PROGRESS', reason = ?, updated_at = ? "
+                         "WHERE opportunity_id = ?", [reason, now, opportunity_id])
+        await self._store.atransaction(work)
+
     async def waits(self) -> dict[str, tuple[dt.datetime, Optional[dt.datetime]]]:
         """Open exit waits: opportunity id -> (wait_until, last incident alert or None)."""
         rows = await self._store.aquery("SELECT w.opportunity_id, w.wait_until, w.last_alert_at FROM ai_exit_waits w "

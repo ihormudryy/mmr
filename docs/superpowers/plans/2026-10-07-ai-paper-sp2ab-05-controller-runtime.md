@@ -64,7 +64,7 @@ Plan 6 (and any later plan) uses these exact names.
   - `ModelWork` with `.context_key`, `.served_kind`, `.served_id`, `.source_id`, `.experiment_id`, `.gateway: ModelCaller`, `.deadline: DecisionDeadline`, `request_key(role: str, call_seq: int) -> str` (`"<context_key>/<role>/<call_seq>"`, Plan 4 Ruling 10) and `async for_action(action_key) -> ModelWork` (context = the derived decision id, `served_kind = "decision"`, same deadline).
   - `SignalContext(now, experiment, opportunity, work)`, `EntryCycleContext(now, experiment, slot, work)`, `PositionCycleContext(now, experiment, slot, positions, work)`.
   - `ProposedDecision(action_key, action, conid, side, decider, evidence_digest, deployment_digest=None, policy_revision=None, stop_price=None, target_price=None, quantity=None)`.
-  - `SimulatedBaseline(baseline_id, cohort, opportunity_id, decided_at, conid=None, side=None, quantity=None, reference_price=None, stop_price=None, target_price=None, linked_action_key=None, linked_decision_id=None, linked_round_trip_id=None, deployment_digest=None, incomplete_reason=None)`; it enforces Plan 2's shapes (`follow_signal.v1` / `fixed_rule.v1`: `quantity` null and `deployment_digest` set; matched-entry: `quantity` set; with `incomplete_reason`: no side, quantity or prices). `BASELINE_COHORTS` (the index pairs), `TRADER_SIZED_BASELINES = {"follow_signal.v1", "fixed_rule.v1"}`, `INCOMPLETE_REASONS = ("quote_unavailable", "feed_not_accepted", "budget_refused", "model_failed", "sizing_unavailable")`.
+  - `SimulatedBaseline(baseline_id, cohort, opportunity_id, decided_at, conid=None, side=None, quantity=None, reference_price=None, stop_price=None, target_price=None, linked_action_key=None, linked_decision_id=None, linked_round_trip_id=None, deployment_digest=None, incomplete_reason=None)`; it enforces Plan 2's shapes (`follow_signal.v1` / `fixed_rule.v1`: `quantity` null and `deployment_digest` set; matched-entry: `quantity` (the close's requested reduction) and `linked_decision_id` set; with `incomplete_reason`: no side, quantity or prices). `BASELINE_COHORTS` (the index pairs), `TRADER_SIZED_BASELINES = {"follow_signal.v1", "fixed_rule.v1"}`, `INCOMPLETE_REASONS = ("quote_unavailable", "feed_not_accepted", "budget_refused", "model_failed", "sizing_unavailable")`.
   - `EngineResult(decisions=(), baselines=(), note="")`.
   - `class DecisionEngine(Protocol)`: `async on_entry_signal(SignalContext)`, `async on_exit_signal(SignalContext)`, `async on_entry_cycle(EntryCycleContext)`, `async on_position_cycle(PositionCycleContext)`, each `-> EngineResult`.
 - `trader.ai.rpc_clients`: `ReadOnlySupervisor(supervisor).call(method, body)` allows `ENGINE_QUERIES = SUPERVISOR_QUERIES ∪ SUPERVISOR_SLOW_QUERIES − EPOCH_METHODS` only; errors `RpcNotSent`, `MethodNotAllowedLocally`, `RpcOutcomeUnknown`, `RpcRefused`.
@@ -1819,8 +1819,8 @@ class SimulatedBaseline:
         if self.baseline_id in TRADER_SIZED_BASELINES:
             if self.quantity is not None or self.deployment_digest is None:
                 raise ValueError("the trader sizes this baseline: no quantity, and name the deployment")
-        elif self.quantity is None:
-            raise ValueError("the matched-entry baseline carries the real entry quantity")
+        elif self.quantity is None or self.linked_decision_id is None:
+            raise ValueError("the matched-entry baseline carries its close's quantity and its ENTER decision")
 
 
 @dataclass(frozen=True)

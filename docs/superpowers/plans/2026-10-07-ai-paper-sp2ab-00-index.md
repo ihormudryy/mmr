@@ -126,7 +126,8 @@ Typed RPC methods (allow-list in `trader/messaging/principals.py`; read and muta
 - **Matched-entry, bracket-only exit:** the same entry the model closed, held with only its
   original stop and target until the session flatten (15:45 ET on a normal day). One record
   per model CLOSE / PARTIAL_CLOSE: opportunity = the close's decision id, the round trip id
-  as linkage, quantity = the real entry quantity.
+  as linkage, reference = the entry fill, quantity = the shares that close asked to remove
+  (the trader clips it so a trip's records never add up to more than its entry quantity).
 - **No-trade:** zero P&L, one record per self-found opportunity, always complete.
 - **Follow the signal:** the strategy's BUY taken at the reference price with the
   deployment's stop/target policy and SP1 sizing (by the trader), regardless of Jev's ruling.

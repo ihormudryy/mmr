@@ -2483,6 +2483,8 @@ def build_production_registry(
     register_manage_surface(registry, api)
     from trader.messaging.cli_surface import register_cli_surface
     register_cli_surface(registry, api)
+    from trader.messaging.scoreboard_surface import register_scoreboard_surface
+    register_scoreboard_surface(registry, getattr(trader, 'scoreboard_service', None))
 
     if command_stack is not None:
         register_command_authority(

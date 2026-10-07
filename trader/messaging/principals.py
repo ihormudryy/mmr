@@ -121,6 +121,10 @@ TRADER_ACL: Mapping[tuple[str, str], frozenset[str]] = {
     ("command", "resume_experiment"): frozenset({"cli", "dashboard"}),
     ("command", "stop_experiment"): frozenset({"cli", "dashboard"}),
     ("query", "get_experiment"): frozenset({"cli", "dashboard", "ai_supervisor"}),
+    # SP1 scoreboard (Plan 5): reads only. verify is for humans; no principal has a scoreboard write.
+    ("query", "get_scoreboard"): frozenset({"cli", "dashboard", "ai_supervisor"}),
+    ("query", "verify_scoreboard"): frozenset({"cli", "dashboard"}),
+    ("query", "get_experiment_trips"): frozenset({"cli", "dashboard", "ai_supervisor"}),
 }
 
 STRATEGY_ACL: Mapping[tuple[str, str], frozenset[str]] = {

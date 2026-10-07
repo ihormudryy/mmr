@@ -37,9 +37,9 @@ class ScoreboardService:
         return project_round_trips(facts, links_for=self.links.links_for_order_ref,
                                    account_id=experiment.account_id)
 
-    def refresh(self) -> None:
-        """Ruling 13: rebuild round_trips of the latest experiment and book late commissions."""
-        experiment = self.experiments.latest()
+    def refresh(self, experiment_id: Optional[str] = None) -> None:
+        """Ruling 13: rebuild round_trips of the experiment (default: latest) and book late commissions."""
+        experiment = self.resolve(experiment_id)
         if experiment is None:
             return
         projection = self._projection(experiment)
@@ -95,6 +95,26 @@ class ScoreboardService:
             self.store.fetch("simulated_books", {"experiment_id": exp_id}),
             incidents, warnings))
 
+    def trips(self, experiment_id: str) -> dict:
+        """Ruling 19: per-trip identity and quantities from the stored projection, ordered by opened_at."""
+        experiment = self.experiments.get(experiment_id)
+        if experiment is None:
+            return {"experiment_id": experiment_id, "error_code": EXPERIMENT_NOT_FOUND, "generation": None,
+                    "trips": None}
+        rows = self.store.fetch("round_trips", {"experiment_id": experiment_id})
+        return {"experiment_id": experiment_id, "generation": self._broker_generation(),
+                "trips": [_trip_view(row) for row in rows]}
+
+    def _broker_generation(self) -> Optional[int]:
+        """The newest promoted broker generation the projection could have seen; None when unknown."""
+        try:
+            row = self.db.execute("SELECT MAX(generation_id) FROM broker_sync_generations WHERE status = 'promoted'",
+                                  fetch="one")
+        except Exception:
+            logger.exception("broker generation unreadable for the trips read")
+            return None
+        return None if row is None or row[0] is None else int(row[0])
+
     def verify(self, experiment_id: Optional[str] = None) -> dict:
         """Rebuild every derived number from its stored inputs and compare; never writes (ruling 11)."""
         return _verify(self, experiment_id)
@@ -106,6 +126,15 @@ class ScoreboardService:
             spy_provider=self.book.provider(), ai_costs=ai_costs, simulated=simulated, incidents=incidents,
             warnings=warnings, outbox=None if self.outbox is None else self.outbox.counts(),
             calendar=self.calendar)
+
+
+def _trip_view(row: dict) -> dict:
+    return {"round_trip_id": row["round_trip_id"], "conid": int(row["conid"]), "symbol": row["symbol"],
+            "direction": row["direction"], "opened_at": row["opened_at"].isoformat(),
+            "closed_at": None if row["closed_at"] is None else row["closed_at"].isoformat(),
+            "opened_quantity": row["entry_qty"], "closed_quantity": row["exit_qty"],
+            "exec_ids": json.loads(row["exec_ids"]), "net_pnl_usd": row["net_pnl_usd"],
+            "decision_id": row["decision_id"], "strategy_ref": row["strategy_version"], "state": row["status"]}
 
 
 ATTRIBUTION_COLUMNS = ("decision_id", "decider", "strategy_version", "policy_revision", "style", "links_digest")

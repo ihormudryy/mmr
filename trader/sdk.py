@@ -1896,6 +1896,24 @@ class MMR:
         REQUIRES trader_service."""
         return self._typed_query.call('get_experiment', {}, dict)
 
+    # ------------------------------------------------------------------
+    # SP1 scoreboard (Plan 5): reads only. REQUIRES trader_service.
+    # ------------------------------------------------------------------
+
+    def scoreboard(self, experiment_id: Optional[str] = None) -> dict:
+        """``get_scoreboard``: the PAPER report of the latest (or named) experiment."""
+        body = {} if experiment_id is None else {'experiment_id': experiment_id}
+        return self._typed_query.call('get_scoreboard', body, dict)
+
+    def verify_scoreboard(self, experiment_id: Optional[str] = None) -> dict:
+        """``verify_scoreboard``: rebuild every number from stored inputs (humans only)."""
+        body = {} if experiment_id is None else {'experiment_id': experiment_id}
+        return self._typed_query.call('verify_scoreboard', body, dict)
+
+    def experiment_trips(self, experiment_id: str) -> dict:
+        """``get_experiment_trips``: conid, quantities and state of each round trip."""
+        return self._typed_query.call('get_experiment_trips', {'experiment_id': experiment_id}, dict)
+
     def _experiment_command(self, method: str, reason: str, experiment_id: Optional[str]) -> SuccessFail:
         import uuid
         from trader.domain.commands import CommandReceipt

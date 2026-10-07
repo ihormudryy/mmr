@@ -4,6 +4,38 @@ All notable changes to MMR are documented here.
 
 The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and the project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html). Until 1.0, minor versions may contain breaking changes.
 
+## [0.2.0] - 2026-10-07
+
+The foundation for the AI paper bot (SP1). All of it is paper only.
+
+### Breaking
+
+- **Typed RPC uses Ed25519 keys, one per principal** (`trader`, `strategy`, `cli`, `dashboard`, `ai_supervisor`, `ai_research`), instead of the shared HMAC key. Create them before starting: `./docker.sh -k` (Docker) or `mmr keys init` (local); check the mounts with `./docker.sh -K`. Every method has an allow-list; other callers get `PERMISSION_DENIED`. Command authority comes from the verified principal, never the body. `service_hmac.key` is no longer used; retire it after you have verified the new keys. (#50)
+- **Legacy dill RPC** (trader 42001, strategy 42005) binds only in offline simulation with a consistent paper posture (`trading_mode: paper`, a `D` account, the paper port). (#50)
+- **No migration from 0.1.x state.** Start the trader journal database fresh; price history is not affected.
+- `CLAUDE.md` is now `AGENTS.md`.
+
+### Added
+
+- **Safe close**: every paper exit goes through one broker-verified close service. It hands protection over before it cancels a stop, owns one close per position, re-protects the rest after a partial close, journals each child order before sending it and never reports a close that sold nothing as a success. Late fills after a flat close start a new safety close. (#46)
+- **`ai_paper` decision path**: `submit_ai_paper_decision` for `ENTER`, `CLOSE` and `PARTIAL_CLOSE`. Owner risk ceiling plus a published AI risk policy (tighter applies at once, looser next session), sealed deployments, trading filters, margin evidence, an entry cutoff and trader-owned order types (DAY marketable limit, no market orders). (#55)
+- **Experiments and the kill line**: `mmr experiment start|pause|resume|stop|status`. Arming only on a flat paper account, a lock against the one-strategy automation in both directions, and an optional drawdown kill line that flattens the account. (#56)
+- **Paper scoreboard**: realized P&L, round trips, SPY benchmark, a `/cc` dashboard tab and an optional Telegram daily summary. (#57)
+- **Acceptance harness**: a scripted SP1 acceptance run, a shrink probe and the runbook `docs/PAPER_ACCEPTANCE_SP1.md`. (#58)
+- **Design for SP2a+b** (the autonomous loop): `docs/superpowers/specs/2026-10-07-ai-paper-sp2ab-autonomous-loop-design.md`. (#69)
+- CI runs the tests in eight balanced shards and shows a coverage badge in the README. (#66, #67)
+
+### Fixed
+
+- Liquidation exits skip entry gates and no longer block the trader loop. (#42)
+- Tightened allocation limits are re-checked at dispatch. (#48)
+- In-flight automated entries reserve gross exposure; orphan reservations are retired only on broker evidence. (#52, #53)
+- A partial fill reduces the bracket sibling instead of cancelling it. (#61)
+- Automated buy commands are resolved from broker evidence. (#62)
+- Non-finite RPC timestamps are refused at decode. (#63)
+- YAML config is loaded with the safe loader. (#65)
+- The scoreboard page no longer shows raw exception text on a timeout. (#57)
+
 ## [0.1.1] - 2026-10-05
 
 ### Added

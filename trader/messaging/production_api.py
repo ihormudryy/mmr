@@ -764,6 +764,80 @@ class ExecuteAutomatedIntentRequest(BaseModel):
         return _reject_colon_in_command_id(value)
 
 
+# --- SP1 ai_paper (Plan 3 Task 9): strict wire models. The service parses the
+# domain objects again: in-process callers bypass these models. ---------------
+
+_AiPrice = Annotated[float, Field(gt=0, allow_inf_nan=False)]
+_AiCount = Annotated[int, Field(ge=1)]
+_AI_DECISION_ID = re.compile(r"^[A-Za-z0-9_-]{8,64}$")
+
+
+class PublishAiRiskPolicyRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid", strict=True)
+
+    command_id: str
+    limits: dict[str, int | Annotated[float, Field(allow_inf_nan=False)]]
+    reason: str
+
+    @field_validator("command_id")
+    @classmethod
+    def _command_id_has_no_colon(cls, value: str) -> str:
+        return _reject_colon_in_command_id(value)
+
+    @field_validator("limits")
+    @classmethod
+    def _limits_are_risk_limits(cls, value: dict) -> dict:
+        from trader.automation.risk_limits import RiskLimits
+        RiskLimits.from_json(value)  # RiskLimitsError is a ValueError: VALIDATION_ERROR on the wire
+        return value
+
+
+class RegisterAiDeploymentRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid", strict=True)
+
+    deployment: dict
+
+    @field_validator("deployment")
+    @classmethod
+    def _deployment_is_valid(cls, value: dict) -> dict:
+        from trader.automation.ai_deployments import AiDeployment, DeploymentRefused
+        try:
+            AiDeployment.from_json(value)
+        except DeploymentRefused as ex:
+            raise ValueError(str(ex)) from None
+        return value
+
+
+class SubmitAiPaperDecisionRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid", strict=True)
+
+    decision_id: str
+    deployment_digest: Optional[str]
+    decider: str
+    action: Literal["ENTER", "CLOSE", "PARTIAL_CLOSE"]
+    conid: ExactConid
+    side: Literal["BUY", "SELL"]
+    stop_price: Optional[_AiPrice]
+    target_price: Optional[_AiPrice]
+    quantity: Optional[_AiCount]
+    policy_revision: Optional[_AiCount]
+    evidence_digest: str
+    expires_at: str
+
+    @field_validator("decision_id")
+    @classmethod
+    def _decision_id_shape(cls, value: str) -> str:
+        if not _AI_DECISION_ID.match(value):
+            raise ValueError("decision_id must match ^[A-Za-z0-9_-]{8,64}$")
+        return value
+
+
+class GetAiDeploymentRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid", strict=True)
+
+    digest: str
+
+
 class CancelOrderRequest(BaseModel):
     """[M1-F3] Task 6. Cancels one working order by its [M1-F2] entity id.
 
@@ -1192,6 +1266,81 @@ def _execute_automated_intent_rpc_handler(
         return _receipt_to_dict(receipt)
 
     return _handler
+
+
+def _publish_ai_risk_policy_rpc_handler(coordinator: TradingCommandCoordinator, account_id: Optional[str]):
+    def _handler(parsed: PublishAiRiskPolicyRequest, caller: RpcCaller) -> Dict[str, Any]:
+        request = CommandRequest(
+            command_id=parsed.command_id, action="publish_ai_risk_policy", account_id=account_id,
+            target_type="ai_policy", target_id=str(account_id), expected_version=None,
+            body={"limits": dict(parsed.limits), "reason": parsed.reason},
+            source=caller.principal, principal=caller.principal,
+        )
+        return _receipt_to_dict(coordinator.execute(request))
+    return _handler
+
+
+def _register_ai_deployment_rpc_handler(coordinator: TradingCommandCoordinator, account_id: Optional[str]):
+    from trader.automation.ai_deployments import AiDeployment, deployment_digest
+    from trader.automation.ai_paper_actions import REGISTER_ACTION, deployment_command_id
+
+    def _handler(parsed: RegisterAiDeploymentRequest, caller: RpcCaller) -> Dict[str, Any]:
+        # The canonical record (conids sorted) is the body, so a re-registration replays.
+        deployment = AiDeployment.from_json(parsed.deployment)
+        digest = deployment_digest(deployment)
+        request = CommandRequest(
+            command_id=deployment_command_id(digest), action=REGISTER_ACTION, account_id=account_id,
+            target_type="ai_deployment", target_id=digest, expected_version=None,
+            body=deployment.to_json(), source=caller.principal, principal=caller.principal,
+        )
+        return _receipt_to_dict(coordinator.execute(request))
+    return _handler
+
+
+def _submit_ai_paper_decision_rpc_handler(coordinator: TradingCommandCoordinator, account_id: Optional[str]):
+    from trader.automation.ai_paper_decision import AI_PAPER_ACTION, command_id_for
+
+    def _handler(parsed: SubmitAiPaperDecisionRequest, caller: RpcCaller) -> Dict[str, Any]:
+        request = CommandRequest(
+            command_id=command_id_for(parsed.decision_id), action=AI_PAPER_ACTION, account_id=account_id,
+            target_type="conid", target_id=str(parsed.conid), expected_version=None,
+            body=parsed.model_dump(mode="json"), source=caller.principal, principal=caller.principal,
+        )
+        return _receipt_to_dict(coordinator.execute(request))
+    return _handler
+
+
+def _get_ai_deployment_handler(actions):
+    def _handler(parsed: GetAiDeploymentRequest) -> Dict[str, Any]:
+        return actions.deployment_view(parsed.digest)
+    return _handler
+
+
+def register_ai_paper_authority(registry: TypedRpcRegistry, coordinator: TradingCommandCoordinator,
+                                ai_paper, *, account_id: Optional[str]) -> None:
+    """SP1 ai_paper (Plan 3 Task 9): only when ``ai_paper.enabled`` built the services."""
+    from trader.automation.ai_paper_actions import PUBLISH_ACTION, REGISTER_ACTION
+    from trader.automation.ai_paper_decision import AI_PAPER_ACTION
+
+    coordinator.register_action(PUBLISH_ACTION, ai_paper.actions.publish, requires_preflight=False, saga=True)
+    coordinator.register_action(REGISTER_ACTION, ai_paper.actions.register, requires_preflight=False)
+    coordinator.register_action(AI_PAPER_ACTION, ai_paper.decisions.execute, requires_preflight=False, saga=True)
+    registry.register(
+        "command", "publish_ai_risk_policy", PublishAiRiskPolicyRequest, dict,
+        _publish_ai_risk_policy_rpc_handler(coordinator, account_id), with_caller=True,
+    )
+    registry.register(
+        "command", "register_ai_deployment", RegisterAiDeploymentRequest, dict,
+        _register_ai_deployment_rpc_handler(coordinator, account_id), with_caller=True,
+    )
+    registry.register(
+        "command", "submit_ai_paper_decision", SubmitAiPaperDecisionRequest, dict,
+        _submit_ai_paper_decision_rpc_handler(coordinator, account_id), with_caller=True,
+    )
+    registry.register("query", "get_ai_risk_policy", dict, dict, _no_arg_handler(ai_paper.actions.policy_view))
+    registry.register(
+        "query", "get_ai_deployment", GetAiDeploymentRequest, dict, _get_ai_deployment_handler(ai_paper.actions),
+    )
 
 
 def _cancel_order_rpc_handler(coordinator: TradingCommandCoordinator, account_id: Optional[str]):
@@ -2274,6 +2423,10 @@ def build_production_registry(
         # ingest-only handler so strategy announce/drain still works.
         if command_stack.strategy_control_service is None:
             register_strategy_state_ingest(registry, command_stack.journal)
+        ai_paper = getattr(command_stack, "ai_paper", None)
+        if ai_paper is not None:
+            register_ai_paper_authority(registry, command_stack.coordinator, ai_paper,
+                                        account_id=getattr(trader, 'ib_account', None))
     elif command_coordinator is not None and proposal_service is not None and proposal_repository is not None:
         register_command_authority(
             registry, command_coordinator, proposal_service, proposal_repository,

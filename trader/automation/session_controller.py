@@ -351,8 +351,11 @@ class SessionController:
         time_exit: TimeExitPort,
         account_id: str,
         now: Callable[[], dt.datetime],
+        on_entry_cutoff: Optional[Callable[[SessionControllerState, dt.datetime], None]] = None,
     ):
         self._journal = journal
+        # ai_paper (R26): runs on every tick from the entry cutoff until the flatten starts.
+        self._on_entry_cutoff = on_entry_cutoff
         self._calendar = calendar
         self._broker = broker
         self._cancel = cancel
@@ -517,6 +520,11 @@ class SessionController:
                 state=next_state,
             )
             self._persist(state, now_utc)
+        if state.entry_cutoff_reached and not state.flatten_issued and self._on_entry_cutoff is not None:
+            try:
+                self._on_entry_cutoff(state, now_utc)
+            except Exception:
+                logging.getLogger(__name__).exception("entry cutoff hook failed; the 15:35 cancel is the backstop")
 
         # 2) Cancel working entries
         if (
@@ -709,8 +717,10 @@ class SessionController:
         held = {p.conid: float(p.quantity) for p in getattr(snapshot, "positions", ()) or ()
                 if float(p.quantity) != 0.0}
         for conid, quantity in sorted(held.items()):
+            # ai_paper legs (og-aip-*) are re-protected to the position at the entry cutoff, not closed (R26).
             protective = [o for o in getattr(snapshot, "working_orders", ()) or ()
-                          if o.conid == conid and not o.is_external and o.leg in ("stop", "take_profit")]
+                          if o.conid == conid and not o.is_external and o.leg in ("stop", "take_profit")
+                          and not (o.order_group_id or "").startswith("og-aip-")]
             if any(float(o.total_quantity) - float(o.filled_quantity) > abs(quantity) for o in protective):
                 self._time_exit.request_exit(
                     command_id=f"{self.cancel_command_id(self._account_id, state.session_date)}-protect-{conid}",

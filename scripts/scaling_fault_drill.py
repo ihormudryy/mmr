@@ -8,6 +8,7 @@ import sys
 
 from trader.promotion.degradation_monitor import DegradationAction, DegradationMonitor
 from trader.promotion.evidence_store import EvidenceWindow
+from trader.automation.risk_limits import PAPER_LIMITS
 from trader.promotion.portfolio_risk_budget import PortfolioRiskBudget
 
 
@@ -49,6 +50,7 @@ def main(argv: list[str] | None = None) -> int:
         intents=[{"proposed_gross": 0.10, "projected_daily_loss": 0.006}],
         broker_snapshot={"positions": [], "gross_exposure": 0.0, "daily_loss_pct": 0.0},
         authorities=[{"max_gross_allocation": 0.06}],
+        limits=PAPER_LIMITS,
     )
 
     report = {

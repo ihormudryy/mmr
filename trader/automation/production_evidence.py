@@ -18,6 +18,7 @@ from trader.automation.calendar_policy import ET
 from trader.automation.artifact_verifier import VerifiedArtifact
 from trader.automation.liquidity_policy import LiquidityEvidence
 from trader.automation.models import ExecutionIntent
+from trader.automation.risk_limits import PAPER_LIMITS
 from trader.automation.session_risk import AllocationCeiling, AutomationSessionState
 from trader.data.store import DateRange
 from trader.objects import BarSize, WhatToShow
@@ -43,6 +44,97 @@ def _number(value: Any, code: str, *, positive: bool = False) -> float:
     if not math.isfinite(number) or (positive and number <= 0):
         raise ApprovalContextError(code, "required numeric evidence is invalid")
     return number
+
+
+def validate_approval(order: Any, approval: ApprovalContext, *, account_id: str, now: dt.datetime) -> None:
+    """Fail closed unless the approval is fenced paper evidence for ``order`` with a fresh crossable quote.
+
+    ``order`` needs ``conid``, ``side`` and ``requested_quantity``.
+    """
+    if (approval.conid != order.conid or approval.side != order.side
+            or approval.quantity != _number(order.requested_quantity, "QUANTITY_INVALID", positive=True)):
+        raise ApprovalContextError("APPROVAL_MISMATCH", "approval does not match intent")
+    broker = approval.broker
+    if broker.account_id != account_id:
+        raise ApprovalContextError("ACCOUNT_MISMATCH", "broker account does not match")
+    if broker.account_mode != "paper":
+        raise ApprovalContextError("PAPER_ONLY", "broker is not in paper mode")
+    if (type(broker.generation_id) is not int or broker.generation_id <= 0
+            or type(broker.source_cursor) is not int or broker.source_cursor < 0):
+        raise ApprovalContextError("BROKER_FENCE_INVALID", "complete broker fence is required")
+    _number(broker.net_liquidation, "BROKER_EVIDENCE_INVALID", positive=True)
+    _number(broker.daily_pnl, "BROKER_EVIDENCE_INVALID")
+    if order.side == "SELL":
+        held = _number(broker.reducible_quantity(order.conid), "BROKER_EVIDENCE_INVALID")
+        if held < approval.quantity:
+            raise ApprovalContextError("LONG_ONLY", "sell exceeds the fenced long position")
+
+    quote = approval.quote
+    if quote.conid != order.conid or quote.side != order.side:
+        raise ApprovalContextError("QUOTE_MISMATCH", "quote identity does not match intent")
+    if (not isinstance(quote.market_timestamp, dt.datetime)
+            or quote.market_timestamp.utcoffset() is None):
+        raise ApprovalContextError("QUOTE_CLOCK_INVALID", "aware market timestamp is required")
+    age = (now - quote.market_timestamp).total_seconds()
+    if age > MAX_QUOTE_AGE_SECONDS:
+        raise ApprovalContextError("QUOTE_STALE", "executable quote is stale")
+    if age < -MAX_SOURCE_CLOCK_SKEW_SECONDS:
+        raise ApprovalContextError("QUOTE_CLOCK_INVALID", "market clock is in the future")
+    price = _number(quote.price, "QUOTE_INVALID", positive=True)
+    bid = _number(quote.bid, "QUOTE_INVALID", positive=True)
+    ask = _number(quote.ask, "QUOTE_INVALID", positive=True)
+    if ask < bid or price != (ask if order.side == "BUY" else bid):
+        raise ApprovalContextError("QUOTE_INVALID", "crossable side of book is required")
+    if order.side == "BUY" and quote.feed_type != "live":
+        raise ApprovalContextError("FEED_NOT_LIVE", "automated entry requires a live feed")
+    if quote.session_state != "continuous":
+        raise ApprovalContextError("QUOTE_SESSION_INVALID", "continuous trading evidence is required")
+
+
+def liquidity_from_history(history: Any, conid: int, quote: ExecutableQuote, now: dt.datetime) -> LiquidityEvidence:
+    """Liquidity evidence from the twenty latest closed XNYS daily bars and the quote's own depth."""
+    depth = _number(quote.ask_size, "DEPTH_INVALID")
+    if depth < 0:
+        raise ApprovalContextError("DEPTH_INVALID", "observed side depth is invalid")
+    # TickStorage.read combines every bar size. Select its daily library,
+    # then require explicit daily rows (legacy NULL bar sizes are ambiguous).
+    try:
+        calendar = xcals.get_calendar("XNYS")
+        today = now.astimezone(ET).date()
+        sessions = calendar.sessions_in_range(today - dt.timedelta(days=90), today)
+        closed = [day for day in sessions if calendar.session_close(day) < pd.Timestamp(now)][-20:]
+        start = dt.datetime.combine(closed[0].date(), dt.time(), ET)
+        frame = cast("TickStorage", history).get_tickdata(BarSize.Days1).read(
+            contract=conid, date_range=DateRange(start, now),
+        )
+    except Exception:
+        raise ApprovalContextError("HISTORY_UNAVAILABLE", "daily history read failed") from None
+    if (not isinstance(frame, pd.DataFrame) or frame.empty
+            or not {"bar_size", "close", "volume", "what_to_show"}.issubset(frame.columns)
+            or not isinstance(frame.index, pd.DatetimeIndex) or frame.index.tz is None
+            or frame.index.hasnans):
+        raise ApprovalContextError("HISTORY_INVALID", "dated daily trade bars are required")
+    frame = frame.loc[frame.bar_size == "1 day"].copy()
+    frame.index = pd.Index(frame.index.tz_convert(ET).date)
+    expected = [day.date() for day in closed]
+    daily = frame.loc[frame.index.isin(expected)]
+    if len(daily) != 20 or daily.index.has_duplicates or set(daily.index) != set(expected):
+        raise ApprovalContextError("HISTORY_INVALID", "all twenty latest closed sessions are required")
+    if not (daily.what_to_show == int(WhatToShow.TRADES)).all():
+        raise ApprovalContextError("HISTORY_INVALID", "trade volume provenance is required")
+    volumes = [_number(value, "HISTORY_INVALID", positive=True) for value in daily.volume]
+    closes = [_number(value, "HISTORY_INVALID", positive=True) for value in daily.close]
+    dollars = [_number(price * volume, "HISTORY_INVALID", positive=True)
+               for price, volume in zip(closes, volumes)]
+    adv = _number(sum(volumes) / 20, "HISTORY_INVALID", positive=True)
+    return LiquidityEvidence(
+        price=quote.price,
+        median_dollar_volume_20d=_number(statistics.median(dollars), "HISTORY_INVALID", positive=True),
+        adv_shares_20d=adv,
+        spread_bps=(cast(float, quote.ask) - cast(float, quote.bid)) / quote.price * 10_000.0,
+        top_of_book_depth=depth,
+        feed_type=quote.feed_type, session_state=quote.session_state,
+    )
 
 
 class ProductionAutomationEvidence:
@@ -93,44 +185,7 @@ class ProductionAutomationEvidence:
         return replace(approval, risk_direction="REDUCING" if intent.side == "SELL" else "INCREASING")
 
     def _validate_approval(self, intent: ExecutionIntent, approval: ApprovalContext, now: dt.datetime) -> None:
-        if (approval.conid != intent.conid or approval.side != intent.side
-                or approval.quantity != _number(intent.requested_quantity, "QUANTITY_INVALID", positive=True)):
-            raise ApprovalContextError("APPROVAL_MISMATCH", "approval does not match intent")
-        broker = approval.broker
-        if broker.account_id != self._account_id:
-            raise ApprovalContextError("ACCOUNT_MISMATCH", "broker account does not match")
-        if broker.account_mode != "paper":
-            raise ApprovalContextError("PAPER_ONLY", "broker is not in paper mode")
-        if (type(broker.generation_id) is not int or broker.generation_id <= 0
-                or type(broker.source_cursor) is not int or broker.source_cursor < 0):
-            raise ApprovalContextError("BROKER_FENCE_INVALID", "complete broker fence is required")
-        _number(broker.net_liquidation, "BROKER_EVIDENCE_INVALID", positive=True)
-        _number(broker.daily_pnl, "BROKER_EVIDENCE_INVALID")
-        if intent.side == "SELL":
-            held = _number(broker.reducible_quantity(intent.conid), "BROKER_EVIDENCE_INVALID")
-            if held < approval.quantity:
-                raise ApprovalContextError("LONG_ONLY", "sell exceeds the fenced long position")
-
-        quote = approval.quote
-        if quote.conid != intent.conid or quote.side != intent.side:
-            raise ApprovalContextError("QUOTE_MISMATCH", "quote identity does not match intent")
-        if (not isinstance(quote.market_timestamp, dt.datetime)
-                or quote.market_timestamp.utcoffset() is None):
-            raise ApprovalContextError("QUOTE_CLOCK_INVALID", "aware market timestamp is required")
-        age = (now - quote.market_timestamp).total_seconds()
-        if age > MAX_QUOTE_AGE_SECONDS:
-            raise ApprovalContextError("QUOTE_STALE", "executable quote is stale")
-        if age < -MAX_SOURCE_CLOCK_SKEW_SECONDS:
-            raise ApprovalContextError("QUOTE_CLOCK_INVALID", "market clock is in the future")
-        price = _number(quote.price, "QUOTE_INVALID", positive=True)
-        bid = _number(quote.bid, "QUOTE_INVALID", positive=True)
-        ask = _number(quote.ask, "QUOTE_INVALID", positive=True)
-        if ask < bid or price != (ask if intent.side == "BUY" else bid):
-            raise ApprovalContextError("QUOTE_INVALID", "crossable side of book is required")
-        if intent.side == "BUY" and quote.feed_type != "live":
-            raise ApprovalContextError("FEED_NOT_LIVE", "automated entry requires a live feed")
-        if quote.session_state != "continuous":
-            raise ApprovalContextError("QUOTE_SESSION_INVALID", "continuous trading evidence is required")
+        validate_approval(intent, approval, account_id=self._account_id, now=now)
 
     def _check_binding(self, intent: ExecutionIntent) -> None:
         if (self._account_mode != "paper" or intent.account_mode != "paper"
@@ -156,7 +211,7 @@ class ProductionAutomationEvidence:
         self._validate_approval(intent, approval, self._now())
         return AutomationSessionState(
             high_water_mark=high_water_mark, expected_account_id=self._account_id,
-            liquidity=liquidity,
+            limits=PAPER_LIMITS, liquidity=liquidity,
         )
 
     def allocation_factory(
@@ -170,48 +225,7 @@ class ProductionAutomationEvidence:
             raise ApprovalContextError("ALLOCATION_INVALID", "artifact authority has expired")
         # Paper ceiling is trader-owned. No request field can raise it, and no
         # signed allocation authority is invented from eligibility evidence.
-        return AllocationCeiling(max_gross_fraction=min(0.06, ceiling))
+        return AllocationCeiling(max_gross_fraction=min(PAPER_LIMITS.gross_fraction, ceiling))
 
     def _liquidity(self, intent: ExecutionIntent, quote: ExecutableQuote, now: dt.datetime) -> LiquidityEvidence:
-        depth = _number(quote.ask_size, "DEPTH_INVALID")
-        if depth < 0:
-            raise ApprovalContextError("DEPTH_INVALID", "observed side depth is invalid")
-        # TickStorage.read combines every bar size. Select its daily library,
-        # then require explicit daily rows (legacy NULL bar sizes are ambiguous).
-        try:
-            calendar = xcals.get_calendar("XNYS")
-            today = now.astimezone(ET).date()
-            sessions = calendar.sessions_in_range(today - dt.timedelta(days=90), today)
-            closed = [day for day in sessions if calendar.session_close(day) < pd.Timestamp(now)][-20:]
-            start = dt.datetime.combine(closed[0].date(), dt.time(), ET)
-            frame = cast("TickStorage", self._history).get_tickdata(BarSize.Days1).read(
-                contract=intent.conid, date_range=DateRange(start, now),
-            )
-        except Exception:
-            raise ApprovalContextError("HISTORY_UNAVAILABLE", "daily history read failed") from None
-        if (not isinstance(frame, pd.DataFrame) or frame.empty
-                or not {"bar_size", "close", "volume", "what_to_show"}.issubset(frame.columns)
-                or not isinstance(frame.index, pd.DatetimeIndex) or frame.index.tz is None
-                or frame.index.hasnans):
-            raise ApprovalContextError("HISTORY_INVALID", "dated daily trade bars are required")
-        frame = frame.loc[frame.bar_size == "1 day"].copy()
-        frame.index = pd.Index(frame.index.tz_convert(ET).date)
-        expected = [day.date() for day in closed]
-        daily = frame.loc[frame.index.isin(expected)]
-        if len(daily) != 20 or daily.index.has_duplicates or set(daily.index) != set(expected):
-            raise ApprovalContextError("HISTORY_INVALID", "all twenty latest closed sessions are required")
-        if not (daily.what_to_show == int(WhatToShow.TRADES)).all():
-            raise ApprovalContextError("HISTORY_INVALID", "trade volume provenance is required")
-        volumes = [_number(value, "HISTORY_INVALID", positive=True) for value in daily.volume]
-        closes = [_number(value, "HISTORY_INVALID", positive=True) for value in daily.close]
-        dollars = [_number(price * volume, "HISTORY_INVALID", positive=True)
-                   for price, volume in zip(closes, volumes)]
-        adv = _number(sum(volumes) / 20, "HISTORY_INVALID", positive=True)
-        return LiquidityEvidence(
-            price=quote.price,
-            median_dollar_volume_20d=_number(statistics.median(dollars), "HISTORY_INVALID", positive=True),
-            adv_shares_20d=adv,
-            spread_bps=(cast(float, quote.ask) - cast(float, quote.bid)) / quote.price * 10_000.0,
-            top_of_book_depth=depth,
-            feed_type=quote.feed_type, session_state=quote.session_state,
-        )
+        return liquidity_from_history(self._history, intent.conid, quote, now)

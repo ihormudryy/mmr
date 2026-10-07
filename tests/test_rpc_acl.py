@@ -207,3 +207,36 @@ def test_forwarded_call_is_authorized_as_trader_not_on_behalf_of():
         assert seen == [RpcCaller("trader", "dashboard")]
     finally:
         stack.close()
+
+
+def test_ai_principals_get_the_ai_paper_rights_and_no_trading_rights():
+    def rights(principal):
+        return {key for key, allowed in TRADER_ACL.items() if principal in allowed}
+    assert ("command", "register_ai_deployment") in rights("ai_research")
+    assert {("command", "publish_ai_risk_policy"), ("command", "submit_ai_paper_decision")} <= rights("ai_supervisor")
+    for principal in ("ai_supervisor", "ai_research"):     # inclusion/exclusion only: Plan 5 adds scoreboard reads
+        assert not {("command", m) for m in ("approve_proposal", "execute_automated_intent", "liquidate_account",
+                                             "resume_trading", "create_proposal")} & rights(principal)
+    assert ("command", "register_ai_deployment") not in rights("ai_supervisor")
+    assert not {("command", "publish_ai_risk_policy"), ("command", "submit_ai_paper_decision")} & rights("ai_research")
+
+
+AI_PAPER_FAMILY = {                                                    # R23, owner answer 6: exact, method by method
+    ("command", "publish_ai_risk_policy"): {"ai_supervisor"},
+    ("command", "submit_ai_paper_decision"): {"ai_supervisor"},
+    ("command", "register_ai_deployment"): {"ai_research"},
+    ("query", "get_ai_risk_policy"): {"cli", "dashboard", "ai_supervisor"},
+    ("query", "get_ai_deployment"): {"cli", "dashboard", "ai_supervisor", "ai_research"},
+}
+
+
+def test_ai_paper_family_rights_are_exact():
+    assert {key: set(TRADER_ACL[key]) for key in AI_PAPER_FAMILY} == AI_PAPER_FAMILY
+    assert {key for key, allowed in TRADER_ACL.items() if "ai_research" in allowed and key in AI_PAPER_FAMILY} == {
+        ("command", "register_ai_deployment"), ("query", "get_ai_deployment")}
+    assert not [key for key in AI_PAPER_FAMILY if {"strategy", "scheduler", "trader"} & set(TRADER_ACL[key])]
+
+
+def test_the_full_registry_registers_the_ai_paper_family():
+    registered = {(r.socket_role, r.method) for r in build_full_production_registry().registrations()}
+    assert set(AI_PAPER_FAMILY) <= registered

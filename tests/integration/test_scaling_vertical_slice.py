@@ -10,6 +10,7 @@ from trader.promotion.capacity import CapacityMonitor
 from trader.promotion.degradation_monitor import DegradationAction, DegradationMonitor
 from trader.promotion.evidence_store import EvidenceWindow
 from trader.promotion.portfolio_admission import PortfolioAdmissionGate
+from trader.automation.risk_limits import PAPER_LIMITS
 from trader.promotion.portfolio_risk_budget import PortfolioRiskBudget
 from trader.promotion.scaling_gate import ScalingGate
 from trader.promotion.stage import CANARY_PASSED
@@ -122,5 +123,6 @@ def test_portfolio_risk_preserves_daily_loss_ceiling():
         intents=[{"proposed_gross": 0.03, "projected_daily_loss": 0.003}],
         broker_snapshot={"positions": [], "gross_exposure": 0.03, "daily_loss_pct": 0.003},
         authorities=[{"max_gross_allocation": 0.15}],
+        limits=PAPER_LIMITS,
     )
     assert decision.passed is False

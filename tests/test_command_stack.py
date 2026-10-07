@@ -502,3 +502,64 @@ def test_enabled_stack_applies_safe_close_migrations(tmp_path):
     build_command_stack(trader, _policy(), now=lambda: NOW)
     versions = {r[0] for r in trader.journal_db.execute("SELECT version FROM schema_migrations", fetch="all")}
     assert {35, 36} <= versions
+
+
+# --- Plan 3 Task 9: ai_paper composition --------------------------------------
+
+def _ai_stack(tmp_path, *, enabled=True, paper=True):
+    from trader.automation.ai_paper_config import AiPaperConfig
+    from trader.trading.command_stack import build_command_stack
+
+    trader = _trader(tmp_path)
+    if not paper:
+        trader.ib_account, trader.paper_trading = "U111111", False
+    trader.ai_paper_config = AiPaperConfig(enabled=enabled)
+    policy = (_policy() if paper else CommandAuthorityPolicy(
+        enabled=True, live_enabled=True, live_account_id="U111111", max_order_notional=25_000.0))
+    return build_command_stack(trader, policy, now=lambda: NOW), trader
+
+
+def test_ai_paper_on_a_live_account_refuses_to_build(tmp_path):
+    from trader.trading.command_stack import CommandStackConfigurationError
+
+    with pytest.raises(CommandStackConfigurationError) as exc:
+        _ai_stack(tmp_path, paper=False)
+    assert exc.value.code == "AI_PAPER_LIVE_REFUSED"
+
+
+def test_ai_paper_stack_uses_no_experiment_until_plan_four(tmp_path):
+    from trader.automation.ai_paper_experiment import NoExperiment
+
+    stack, trader = _ai_stack(tmp_path)
+    assert isinstance(stack.ai_paper.decisions._experiments, NoExperiment)
+    assert trader.ai_paper_attribution is stack.ai_paper.decision_store
+    assert stack.ai_paper.policy.ceiling == stack.ai_paper.config.limits_ceiling
+
+
+def test_dispatch_guard_routes_current_limits_by_action(tmp_path):
+    from trader.automation.ai_risk_policy import PolicyRefused
+    from trader.automation.risk_limits import PAPER_LIMITS
+
+    stack, _ = _ai_stack(tmp_path)
+    guard = stack.dispatch_guard
+    assert guard._current_limits(SimpleNamespace(action="execute_automated_intent")) == PAPER_LIMITS
+    with pytest.raises(PolicyRefused, match="NO_EFFECTIVE_LIMITS"):      # nothing in force: refused, not defaulted
+        guard._current_limits(SimpleNamespace(action="submit_ai_paper_decision"))
+
+
+def test_dispatch_guard_gets_the_ai_gate_and_strict_margin_for_ai_paper_only(tmp_path):   # R25
+    stack, _ = _ai_stack(tmp_path)
+    assert stack.dispatch_guard._strict_margin_actions == frozenset({"submit_ai_paper_decision"})
+    assert stack.dispatch_guard._ai_entry_gate(SimpleNamespace(action="approve_proposal"), None, None, NOW) is None
+
+
+def test_ai_paper_disabled_keeps_the_old_guard_defaults(tmp_path):
+    stack, _ = _ai_stack(tmp_path, enabled=False)
+    assert stack.ai_paper is None
+    assert stack.dispatch_guard._strict_margin_actions == frozenset()
+
+
+def test_ai_paper_migrations_are_applied(tmp_path):
+    stack, trader = _ai_stack(tmp_path, enabled=False)
+    versions = {row[0] for row in trader.journal_db.execute("SELECT version FROM schema_migrations", fetch="all")}
+    assert {54, 55, 56} <= versions

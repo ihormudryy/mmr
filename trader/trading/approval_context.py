@@ -4,10 +4,13 @@ from __future__ import annotations
 import datetime as dt
 import logging
 from dataclasses import dataclass
-from typing import Callable, Optional, Protocol
+from typing import TYPE_CHECKING, Callable, Optional, Protocol
 
 from trader.data.broker_state import BrokerRiskSnapshot
 from trader.trading.proposal_command_service import ExecutableQuote, QuoteAuthority
+
+if TYPE_CHECKING:
+    from trader.automation.risk_limits import RiskLimits
 
 logger = logging.getLogger(__name__)
 
@@ -68,6 +71,21 @@ class AllocationDispatchEvidence:
 
 
 @dataclass(frozen=True)
+class EntryLimitsEvidence:
+    """ai_paper entry limits frozen at approval, so dispatch can re-check a tighter policy.
+
+    Margin is deliberately absent: it is a pass/fail check, never a sizing bound (R11).
+    """
+
+    limits: "RiskLimits"
+    stop_price: float
+    liquidity_max_shares: float
+    notional_cap: float
+    daily_loss_anchor: float
+    high_water_mark: float
+
+
+@dataclass(frozen=True)
 class ExecutableMarketEvidence:
     """Executable quote and its independent receipt clock."""
 
@@ -98,6 +116,7 @@ class ApprovalContext:
     market: Optional[ExecutableMarketEvidence]
     what_if: Optional[WhatIfEvidence]
     allocation: Optional[AllocationDispatchEvidence] = None
+    entry_limits: Optional[EntryLimitsEvidence] = None
 
     def notional(self, quantity: float) -> float:
         if self.market is None:

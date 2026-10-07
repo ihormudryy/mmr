@@ -19,6 +19,8 @@ import threading
 import time
 from pathlib import Path
 from types import SimpleNamespace
+
+from trader.automation.ai_paper_config import AiPaperConfig
 from zoneinfo import ZoneInfo
 
 import pytest
@@ -521,7 +523,9 @@ def test_main_returns_without_running_trader_when_signalled_during_startup_recov
 
     fake = _StartupTrader()
     monkeypatch.setattr(trader_service, "Container", SimpleNamespace(
-        create=lambda _config: SimpleNamespace(resolve=lambda *_a, **_k: fake)))
+        create=lambda _config: SimpleNamespace(
+            resolve=lambda *_a, **_k: fake,
+            typed_config=lambda: SimpleNamespace(ai_paper=AiPaperConfig()))))
     monkeypatch.setattr(trader_service, "_seed_trading_control", lambda *_a: None)
     monkeypatch.setattr(trader_service, "_maybe_start_command_reconciliation", lambda *_a: None)
 

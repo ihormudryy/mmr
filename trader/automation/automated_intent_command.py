@@ -16,6 +16,8 @@ from decimal import Decimal
 from pathlib import Path
 from typing import Any, Callable, Mapping, Optional, Protocol
 
+from trader.automation.command_steps import CommandSteps
+from trader.automation.reduction_close import start_broker_proven_close
 from trader.automation.models import (
     EntryPolicy,
     ExecutionIntent,
@@ -173,6 +175,8 @@ class AutomatedIntentCommandService:
             Path(configured_bundle_path) if configured_bundle_path is not None else None
         )
         self._bundle_evidence_validator = bundle_evidence_validator
+        self._steps = CommandSteps(ledger=ledger, journal=journal, controls=controls,
+                                   account_id=account_id, now=now)
 
     def execute(self, cmd: CommandRequest) -> CommandReceipt:
         if cmd.principal != STRATEGY_PRINCIPAL:
@@ -344,19 +348,7 @@ class AutomatedIntentCommandService:
         )
 
     def _claim(self, cmd, *, require_unpaused: bool) -> None:
-        """VALIDATED -> SUBMITTING in one journal transaction; an entry also checks the pause."""
-        from trader.trading.command_coordinator import _command_updated_mutation, _noop_write
-
-        def claim(conn, append):
-            if require_unpaused:
-                self._controls.require_unpaused_in_tx(conn, self._account_id)
-            self._ledger.transition_in_tx(conn, cmd.command_id, "VALIDATED", "SUBMITTING")
-            append(
-                _command_updated_mutation(cmd, "SUBMITTING", self._now_utc()),
-                _noop_write,
-                f"command:{cmd.command_id}:submitting",
-            )
-        self._journal.mutate_batch_work(self._journal.connect(), claim)
+        self._steps.claim(cmd, require_unpaused=require_unpaused)
 
     def _execute_close(self, cmd, intent, artifact) -> CommandReceipt:
         """Prove the SELL reduces the held long on the account's broker snapshot, then close.
@@ -367,9 +359,6 @@ class AutomatedIntentCommandService:
         own fenced generations, and the reduce-only boundary checks IB's live
         position again (Task 14).
         """
-        from trader.trading.exit_owner import ExitInProgress
-        from trader.trading.liquidation_service import LiquidationRefused
-
         if self._liquidation is None or self._broker is None:
             # Fail loudly: never fall back to the bracket path, which would add a reverse stop.
             self._transition(cmd, "VALIDATED", "REJECTED", error_code="CLOSE_PATH_UNAVAILABLE")
@@ -382,41 +371,21 @@ class AutomatedIntentCommandService:
             return self._receipt(cmd.command_id, "REJECTED", "CONID_NOT_PERMITTED", False,
                                  outcome={"detail": f"conid {intent.conid} is not in the artifact allowlist"})
         self._claim(cmd, require_unpaused=False)
-        try:
-            snapshot = self._broker.capture(self._account_id)
-            if getattr(snapshot, "account_id", None) != self._account_id:
-                raise RuntimeError("broker snapshot is for another account")
-        except Exception as ex:
-            return self._reject_close(cmd, "BROKER_SNAPSHOT_UNAVAILABLE", {"detail": str(ex)})
-        held = float(snapshot.reducible_quantity(intent.conid))
-        requested = None if intent.requested_quantity is None else float(intent.requested_quantity)
-        if held <= 0 or (requested is not None and requested > held):
-            return self._reject_close(cmd, "NOT_A_REDUCTION", {"held": held, "requested": requested})
-        # A close of the whole position takes the broker quantity at reduce time (ruling 10).
-        quantity = None if requested is None or requested >= held else requested
-        deadline = self._now_utc() + dt.timedelta(seconds=self._close_deadline_seconds)
-        try:
-            receipt = self._liquidation.start(
-                self._account_id, cmd.command_id, deadline, scope="conid", conid=intent.conid, quantity=quantity,
-            )
-        except ExitInProgress as ex:
-            return self._reject_close(cmd, "EXIT_IN_PROGRESS", {"close_root_id": ex.root_id})
-        except LiquidationRefused as ex:
-            return self._reject_close(cmd, ex.code, {"detail": str(ex)})
-        except Exception as ex:
-            self._transition(cmd, "SUBMITTING", "OUTCOME_UNKNOWN", error_code="DISPATCH_AMBIGUOUS")
-            if self._schedule_reconcile is not None:
-                self._schedule_reconcile(cmd.command_id)
-            return self._receipt(cmd.command_id, "OUTCOME_UNKNOWN", "DISPATCH_AMBIGUOUS", False,
-                                 outcome={"detail": str(ex)})
-
-        outcome = {"close_root_id": receipt.cause_command_id, "liquidation_state": receipt.state,
-                   "generation_id": receipt.generation_id, "detail": receipt.detail}
-        self._transition(cmd, "SUBMITTING", "OUTCOME_UNKNOWN", error_code="CLOSE_PENDING", outcome=outcome)
+        close = start_broker_proven_close(
+            liquidation=self._liquidation, broker=self._broker, account_id=self._account_id,
+            command_id=cmd.command_id, conid=intent.conid, side=intent.side,
+            quantity=None if intent.requested_quantity is None else float(intent.requested_quantity),
+            deadline=self._now_utc() + dt.timedelta(seconds=self._close_deadline_seconds))
+        if close.state == "REJECTED":
+            return self._reject_close(cmd, close.error_code, close.outcome)
+        # An ambiguous dispatch keeps its detail on the receipt only, as before the extraction.
+        ledger_outcome = close.outcome if close.error_code == "CLOSE_PENDING" else None
+        self._transition(cmd, "SUBMITTING", "OUTCOME_UNKNOWN", error_code=close.error_code,
+                         outcome=ledger_outcome)
         if self._schedule_reconcile is not None:
             # R17: the reconciler resolves this command from the exact root it started or joined.
             self._schedule_reconcile(cmd.command_id)
-        return self._receipt(cmd.command_id, "OUTCOME_UNKNOWN", "CLOSE_PENDING", False, outcome=outcome)
+        return self._receipt(cmd.command_id, "OUTCOME_UNKNOWN", close.error_code, False, outcome=close.outcome)
 
     def _reject_close(self, cmd, code: str, outcome: dict) -> CommandReceipt:
         self._transition(cmd, "SUBMITTING", "REJECTED", error_code=code)
@@ -492,42 +461,9 @@ class AutomatedIntentCommandService:
         outcome: Optional[dict[str, Any]] = None,
         error_code: Optional[str] = None,
     ) -> None:
-        from trader.trading.command_coordinator import _command_updated_mutation
+        self._steps.transition(cmd, from_state, to_state, outcome=outcome, error_code=error_code)
 
-        now = self._now_utc()
-
-        def _write(conn, _revision: int) -> None:
-            self._ledger.transition_in_tx(
-                conn, cmd.command_id, from_state, to_state,
-                outcome=outcome, error_code=error_code, now=now,
-            )
-
-        self._journal.mutate(
-            self._journal.connect(),
-            _command_updated_mutation(
-                cmd, to_state, now, outcome=outcome, error_code=error_code,
-            ),
-            _write,
-            event_id=f"command:{cmd.command_id}:{to_state.lower()}",
-        )
-
-    @staticmethod
-    def _receipt(
-        command_id: str,
-        state: str,
-        error_code: Optional[str],
-        retryable: bool,
-        *,
-        outcome: Optional[dict[str, Any]] = None,
-    ) -> CommandReceipt:
-        return CommandReceipt(
-            command_id=command_id,
-            correlation_id=command_id,
-            state=state,
-            outcome=outcome,
-            error_code=error_code,
-            retryable=retryable,
-        )
+    _receipt = staticmethod(CommandSteps.receipt)
 
     def _now_utc(self) -> dt.datetime:
         return _as_utc(self._now())

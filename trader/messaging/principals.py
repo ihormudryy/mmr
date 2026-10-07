@@ -107,6 +107,13 @@ TRADER_ACL: Mapping[tuple[str, str], frozenset[str]] = {
     ("command", "activate_live_canary"): frozenset({"cli"}),
     ("command", "activate_allocation"): frozenset({"cli"}),
     **{("command", m): HUMAN for m in _TRADER_HUMAN_COMMANDS},
+    # SP1 ai_paper (Plan 3 R23, owner answer 6): explicit sets per method, never a
+    # group alias; reads and mutations are separate entries.
+    ("command", "publish_ai_risk_policy"): frozenset({"ai_supervisor"}),
+    ("command", "submit_ai_paper_decision"): frozenset({"ai_supervisor"}),
+    ("command", "register_ai_deployment"): frozenset({"ai_research"}),
+    ("query", "get_ai_risk_policy"): frozenset({"cli", "dashboard", "ai_supervisor"}),
+    ("query", "get_ai_deployment"): frozenset({"cli", "dashboard", "ai_supervisor", "ai_research"}),
 }
 
 STRATEGY_ACL: Mapping[tuple[str, str], frozenset[str]] = {

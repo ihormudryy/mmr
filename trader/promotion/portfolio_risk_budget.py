@@ -1,15 +1,17 @@
 """P5 Task 7 — combined account portfolio risk budget.
 
-Evaluates multi-strategy intents against signed authorities while preserving
-the unchanged 0.50% daily-loss ceiling and single-strategy safety limits.
+Evaluates multi-strategy intents against signed authorities. The position
+count and daily-loss ceilings come from the caller's ``RiskLimits``.
 """
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Any, Mapping, Optional, Sequence
+from typing import TYPE_CHECKING, Any, Mapping, Optional, Sequence
+
+if TYPE_CHECKING:
+    from trader.automation.risk_limits import RiskLimits
 
 __all__ = [
-    "ACCOUNT_DAILY_LOSS_LIMIT",
     "BLOCK_COMBINED_GROSS",
     "BLOCK_DAILY_LOSS",
     "BLOCK_MISSING_PORTFOLIO_AUTHORITY",
@@ -17,9 +19,6 @@ __all__ = [
     "PortfolioRiskBudget",
     "PortfolioRiskDecision",
 ]
-
-ACCOUNT_DAILY_LOSS_LIMIT = 0.005
-MAX_POSITION_COUNT = 3
 
 BLOCK_COMBINED_GROSS = "combined_gross_exposure_breach"
 BLOCK_DAILY_LOSS = "combined_daily_loss_breach"
@@ -60,21 +59,13 @@ def _authority_ceiling(authority: Any) -> float:
 class PortfolioRiskBudget:
     """Pure evaluator consumed at coordinator serialization point."""
 
-    def __init__(
-        self,
-        *,
-        daily_loss_limit: float = ACCOUNT_DAILY_LOSS_LIMIT,
-        max_position_count: int = MAX_POSITION_COUNT,
-    ):
-        self._daily_loss_limit = daily_loss_limit
-        self._max_position_count = max_position_count
-
     def evaluate(
         self,
         intents: Sequence[Mapping[str, Any]],
         broker_snapshot: Mapping[str, Any],
         authorities: Sequence[Any],
         *,
+        limits: "RiskLimits",
         portfolio_authority_present: bool = False,
         strategy_count: int = 1,
     ) -> PortfolioRiskDecision:
@@ -82,7 +73,7 @@ class PortfolioRiskBudget:
 
         positions = broker_snapshot.get("positions") or ()
         position_count = len(positions)
-        if position_count > self._max_position_count:
+        if position_count > limits.max_positions:
             blockers.append(BLOCK_POSITION_COUNT)
 
         gross_by_strategy = [abs(_float(i.get("proposed_gross", 0.0))) for i in intents]
@@ -95,7 +86,7 @@ class PortfolioRiskBudget:
 
         daily_loss = abs(_float(broker_snapshot.get("daily_loss_pct", 0.0)))
         projected = daily_loss + sum(abs(_float(i.get("projected_daily_loss", 0.0))) for i in intents)
-        if projected > self._daily_loss_limit:
+        if projected > limits.daily_loss_fraction:
             blockers.append(BLOCK_DAILY_LOSS)
 
         if strategy_count > 1 and not portfolio_authority_present:

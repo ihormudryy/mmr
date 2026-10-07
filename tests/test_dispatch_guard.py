@@ -344,7 +344,7 @@ def test_dispatch_keeps_refusing_a_looser_ceiling_than_approved():
     with pytest.raises(DispatchGuardError) as caught:
         guard.revalidate(approved, _automated_request(), NOW)
 
-    assert caught.value.code == "ALLOCATION_CEILING_TIGHTENED"
+    assert caught.value.code == "ALLOCATION_CEILING_CHANGED"
 
 
 def test_reducing_order_is_not_blocked_after_ceiling_tightens():
@@ -423,3 +423,183 @@ def test_suspended_authority_in_the_store_refuses_the_entry(tmp_path):
 
     with pytest.raises(DispatchGuardError):
         guard.revalidate(approved, _automated_request(), NOW)
+
+
+# --- Plan 3 Task 2: current risk limits at dispatch (on top of #47) ---------
+
+from trader.automation.risk_limits import PAPER_LIMITS  # noqa: E402
+
+
+def _limits_guard(current_limits, **guard_kw):
+    guard = _allocation_guard(authority=None)
+    guard._current_limits = current_limits
+    for name, value in guard_kw.items():
+        setattr(guard, name, value)
+    return guard
+
+
+def test_current_risk_limits_tighten_the_dispatch_ceiling():
+    # 2,100 held + 1,050 new = 3.15% of 100k: fits the approved 6%, not the current 3%.
+    guard = _limits_guard(lambda request: replace(PAPER_LIMITS, gross_fraction=0.03))
+    approved = _with_allocation(_approved(), _evidence(ceiling=0.06))
+
+    with pytest.raises(DispatchGuardError) as caught:
+        guard.revalidate(approved, _automated_request(), NOW)
+
+    assert caught.value.code == "LIMIT_TIGHTENED_BEFORE_DISPATCH"
+
+
+def test_unchanged_limits_still_dispatch():
+    guard = _limits_guard(lambda request: PAPER_LIMITS)
+    approved = _with_allocation(_approved(), _evidence(ceiling=0.06))
+
+    assert guard.revalidate(approved, _automated_request(), NOW).generation_id == 2
+
+
+def test_default_limits_provider_is_the_paper_constant():
+    guard = _allocation_guard(authority=None)
+
+    assert guard._current_limits(_automated_request()) == PAPER_LIMITS
+
+
+def test_looser_current_ceiling_keeps_its_refusal_under_the_new_name():  # R2
+    decision = AllocationPolicy(now=lambda: NOW).revalidate_dispatch(
+        broker=_snapshot(), approved_broker=_snapshot(), conid=CONID, side="BUY",
+        quantity=1.0, entry_price=210.0, authority=None, artifact_max_gross=0.15,
+        artifact_digest=ARTIFACT_ID, authority_digest=None, effective_gross_ceiling=0.06,
+        risk_limits_gross=0.10,
+    )
+
+    assert "ALLOCATION_CEILING_CHANGED" in decision.reason_codes
+    assert "ALLOCATION_CEILING_TIGHTENED" not in decision.reason_codes
+
+
+def test_limits_provider_failure_refuses():
+    def boom(request):
+        raise RuntimeError("store down")
+
+    guard = _limits_guard(boom)
+
+    with pytest.raises(DispatchGuardError) as caught:
+        guard.revalidate(_with_allocation(_approved(), _evidence()), _automated_request(), NOW)
+
+    assert caught.value.code == "LIMITS_UNAVAILABLE"
+
+
+def test_ai_paper_action_gets_the_automated_quote_rules():
+    guard = _guard(quote=_quote(feed="delayed"))
+    request = replace(_automated_request(), action="submit_ai_paper_decision")
+
+    with pytest.raises(DispatchGuardError) as caught:
+        guard.revalidate(_approved(), request, NOW)
+
+    assert caught.value.code == "FEED_NOT_LIVE"
+
+
+def test_automated_entry_actions_name_both_paths():
+    from trader.trading.dispatch_guard import AUTOMATED_ENTRY_ACTIONS
+
+    assert AUTOMATED_ENTRY_ACTIONS == frozenset({"execute_automated_intent", "submit_ai_paper_decision"})
+
+
+# --- Plan 3 Task 6: ai_paper entry limits re-checked at dispatch ------------
+
+from trader.data.broker_state import BrokerRiskSnapshot as _Snapshot  # noqa: E402
+from trader.trading.approval_context import EntryLimitsEvidence  # noqa: E402
+
+
+def _ai_request():
+    return replace(_automated_request(), action="submit_ai_paper_decision",
+                   body={"expires_at": (NOW + dt.timedelta(minutes=5)).isoformat()})
+
+
+def _two_positions():
+    """Two held conids, neither the entry's: the entry needs a third slot."""
+    others = tuple(replace(_position(), conid=conid, market_value=1_000.0) for conid in (998, 999))
+    return replace(_snapshot(), positions=others)
+
+
+def _ai_entry_approval(*, quantity=5.0, snapshot=None, limits=PAPER_LIMITS):
+    evidence = EntryLimitsEvidence(limits=limits, stop_price=200.0, liquidity_max_shares=1e6,
+                                   notional_cap=1e9, daily_loss_anchor=100_000.0, high_water_mark=100_000.0)
+    return replace(_approved(quantity=quantity, snapshot=snapshot), entry_limits=evidence)
+
+
+def _entry_guard(current_limits, snapshot=None):
+    guard = _guard(snapshot=snapshot, margin={"initMarginAfter": 1000.0, "equityWithLoanAfter": 99_000.0})
+    guard._current_limits = current_limits
+    return guard
+
+
+def test_entry_limits_tightened_between_approval_and_dispatch_refuse():
+    guard = _entry_guard(lambda r: replace(PAPER_LIMITS, position_fraction=0.02))   # 2,100 held + 1,050 > 2%
+    with pytest.raises(DispatchGuardError) as caught:
+        guard.revalidate(_ai_entry_approval(), _ai_request(), NOW)
+    assert caught.value.code == "LIMIT_TIGHTENED_BEFORE_DISPATCH"
+
+
+@pytest.mark.parametrize("tight,snapshot,code", [
+    ({"daily_loss_fraction": 0.001}, None, "DAILY_LOSS"),  # -100 on the 100k anchor
+    ({"max_positions": 1}, "two_positions", "LIMIT_TIGHTENED_BEFORE_DISPATCH"),
+    ({"trade_risk_fraction": 0.0001}, None,                # 10 risk / 10.00 stop distance = 1 share
+     "LIMIT_TIGHTENED_BEFORE_DISPATCH")])
+def test_each_tightened_field_is_rechecked(tight, snapshot, code):
+    snap = _two_positions() if snapshot == "two_positions" else None
+    guard = _entry_guard(lambda r: replace(PAPER_LIMITS, **tight), snapshot=snap)
+    with pytest.raises(DispatchGuardError) as caught:
+        guard.revalidate(_ai_entry_approval(snapshot=snap), _ai_request(), NOW)
+    assert caught.value.code == code
+
+
+def test_unchanged_entry_limits_skip_the_recheck(monkeypatch):
+    import trader.automation.ai_paper_sizing as sizing
+    monkeypatch.setattr(sizing, "entry_limit_violations",
+                        lambda *a, **k: pytest.fail("re-checked unchanged limits"))
+    assert _entry_guard(lambda r: PAPER_LIMITS).revalidate(_ai_entry_approval(), _ai_request(), NOW)
+
+
+def test_a_looser_current_policy_never_loosens_the_approved_entry():
+    guard = _entry_guard(lambda r: replace(PAPER_LIMITS, gross_fraction=0.15))
+    assert guard.revalidate(_ai_entry_approval(), _ai_request(), NOW).generation_id == 2
+
+
+def test_entry_limits_provider_failure_refuses():
+    def boom(request):
+        raise RuntimeError("store down")
+    with pytest.raises(DispatchGuardError) as caught:
+        _entry_guard(boom).revalidate(_ai_entry_approval(), _ai_request(), NOW)
+    assert caught.value.code == "LIMITS_UNAVAILABLE"
+
+
+# --- Review #31: loss limits are re-checked at dispatch even when limits did not change ---
+
+def _anchored_approval(*, anchor=1_000_000.0, hwm=100_000.0):
+    evidence = EntryLimitsEvidence(limits=PAPER_LIMITS, stop_price=200.0, liquidity_max_shares=1e6,
+                                   notional_cap=1e9, daily_loss_anchor=anchor, high_water_mark=hwm)
+    return replace(_approved(), entry_limits=evidence)
+
+
+def test_unchanged_limits_still_refuse_a_daily_loss_breached_after_approval():
+    # Approved at -100 on a 1m anchor; the broker now shows -6,000 against the 0.5% / 5,000 cap.
+    breached = replace(_snapshot(), daily_pnl=-6_000.0)
+    guard = _entry_guard(lambda r: PAPER_LIMITS, snapshot=breached)
+    with pytest.raises(DispatchGuardError) as caught:
+        guard.revalidate(_anchored_approval(), _ai_request(), NOW)
+    assert caught.value.code == "DAILY_LOSS"
+
+
+def test_unchanged_limits_still_refuse_a_drawdown_breached_after_approval():
+    # 3% drawdown from a 103,200 high-water mark: the broker NLV is 100,000.
+    guard = _entry_guard(lambda r: PAPER_LIMITS)
+    with pytest.raises(DispatchGuardError) as caught:
+        guard.revalidate(_anchored_approval(anchor=100_000.0, hwm=103_200.0), _ai_request(), NOW)
+    assert caught.value.code == "DRAWDOWN"
+
+
+@pytest.mark.parametrize("field", ["daily_pnl", "net_liquidation"])
+def test_unknown_broker_pnl_refuses_the_entry(field):
+    unknown = replace(_snapshot(), **{field: float("nan")})
+    guard = _entry_guard(lambda r: PAPER_LIMITS, snapshot=unknown)
+    with pytest.raises(DispatchGuardError) as caught:
+        guard.revalidate(_anchored_approval(), _ai_request(), NOW)
+    assert caught.value.code == "LOSS_STATE_UNKNOWN"

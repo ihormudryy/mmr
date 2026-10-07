@@ -48,6 +48,11 @@ def _finite_positive(value: float) -> bool:
 class LiquidityPolicy:
     """Pure evaluator — no I/O. Caller supplies evidence and an injected clock."""
 
+    def max_quantity(self, evidence: LiquidityEvidence) -> float:
+        """The most shares ``evaluate`` can approve on the ADV cap and the top-of-book depth."""
+        depth = math.inf if evidence.sliced_execution_approved else float(evidence.top_of_book_depth)
+        return min(float(evidence.adv_shares_20d) * MAX_ADV_FRACTION, depth)
+
     def evaluate(
         self,
         quantity: Decimal,

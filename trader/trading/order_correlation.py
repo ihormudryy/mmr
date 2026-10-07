@@ -67,6 +67,14 @@ def reprotect_oca_group(root_id: str, conid: int, attempt: int) -> str:
     return f"{root_id}-reprotect-{int(conid)}-{int(attempt)}"
 
 
+def liquidation_child_root(order_group_id: Optional[str]) -> Optional[str]:
+    """The close root that sent this child order, or None for any other group."""
+    match = _LIQUIDATION_CHILD.search(order_group_id or "")
+    if match is None or match.start() == 0:
+        return None
+    return order_group_id[:match.start()]
+
+
 def liquidation_child_kind(order_group_id: Optional[str]) -> Optional[str]:
     group = order_group_id or ""
     match = _LIQUIDATION_CHILD.search(group)

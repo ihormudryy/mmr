@@ -221,7 +221,7 @@ class _Universe:
 
 
 class _Composed:
-    def __init__(self, tmp_path, loop_thread, clock, *, automation=False, sim=None):
+    def __init__(self, tmp_path, loop_thread, clock, *, automation=False, sim=None, ai_paper=False):
         from trader.trading.command_stack import build_command_stack
 
         db = DuckDBConnection.get_instance(str(tmp_path / "journal.duckdb"))
@@ -249,6 +249,9 @@ class _Composed:
         trader.get_pnl = lambda: [SimpleNamespace(dailyPnL=self.sim.daily_pnl)]
         if automation:
             _enable_automation(trader, tmp_path)
+        if ai_paper:
+            from trader.automation.ai_paper_config import AiPaperConfig
+            trader.ai_paper_config = AiPaperConfig(enabled=True)
 
         async def no_margin(*_a):
             raise RuntimeError("what-if is not part of this test")

@@ -147,6 +147,8 @@ class BrokerSim:
         from trader.data.broker_order_events import record_order_event_in_tx
         self.record_order_event_in_tx = record_order_event_in_tx   # what broker ingest appends (Plan 6 Task 2)
         self._notified: dict[str, tuple] = {}
+        self._fills: list = []                           # executions not yet written (broker_fills)
+        self._exec_seq = 0
 
     # -- fake IB client ----------------------------------------------------------------
     def isConnected(self):
@@ -367,7 +369,21 @@ class BrokerSim:
         self.set_status(entity, status, filled=filled)
         sign = 1.0 if row.action == "BUY" else -1.0
         self.held[row.conid] = self.held.get(row.conid, 0.0) + sign * quantity
+        self._record_fill(entity, row, quantity)
         self._oca_after_fill(entity, quantity, status == "Filled")
+
+    def _record_fill(self, entity, row, quantity):
+        """An execution, as execDetails would bring it (the scoreboard projects round trips from these)."""
+        from trader.data.broker_state import BrokerFillRow
+        self._exec_seq += 1
+        bid, ask = self.quotes.get(row.conid, (100.0, 100.0))
+        now = self.now()
+        self._fills.append((entity, getattr(self.ib_trades[entity].order, "orderRef", None), BrokerFillRow(
+            account_id=ACCOUNT, exec_id=f"sim-exec-{self._exec_seq}", order_entity_id=entity,
+            perm_id=self.perm.get(entity), client_order_id=None, session_epoch="", conid=row.conid,
+            side=row.action, quantity=float(quantity), price=ask if row.action == "BUY" else bid,
+            commission=1.0, commission_currency="USD", realized_pnl=None, fill_time=now, revision=1,
+            source_timestamp=now)))
 
     def _oca_after_fill(self, entity, quantity, complete):
         order = self.ib_trades[entity].order
@@ -395,6 +411,7 @@ class BrokerSim:
         store, db = self.trader.broker_state_store, self.trader.journal_db
         staged, self._staged_generation = self._staged_generation, None
         changes, self._changes = self._changes, []
+        fills, self._fills = self._fills, []
         now = self.now()
 
         def write(conn):
@@ -404,15 +421,20 @@ class BrokerSim:
                 ACCOUNT, "paper", self.net_liquidation, None, None, None, None,
                 {"DailyPnL:USD": str(self.daily_pnl)}, 1, now))
             for conid, quantity in self.held.items():
+                price = self.quotes.get(conid, (100.0, 100.0))[0]      # marked at the bid when quoted
                 store.upsert_position_in_tx(conn, BrokerPositionRow(
-                    ACCOUNT, conid, SYMBOLS.get(conid, "AAPL"), "STK", "SMART", "USD", quantity, 90.0, 100.0,
-                    quantity * 100.0, 0.0, 0.0, 0.0, quantity == 0, 1, et(11, 0)))
+                    ACCOUNT, conid, SYMBOLS.get(conid, "AAPL"), "STK", "SMART", "USD", quantity, 90.0, price,
+                    quantity * price, 0.0, 0.0, 0.0, quantity == 0, 1, et(11, 0)))
             for entity, row in self.orders.items():
                 if entity in self.hidden:
                     continue
                 store.upsert_order_in_tx(conn, row)
                 store.bind_alias_in_tx(conn, "perm_id", str(self.perm[entity]), ACCOUNT, "", entity, et(11, 0))
             self._record_events_in_tx(conn, gid, changes, now)
+            for entity, order_ref, fill in fills:
+                if order_ref:
+                    store.bind_alias_in_tx(conn, "order_ref", order_ref, ACCOUNT, "", entity, now)
+                store.upsert_fill_in_tx(conn, fill)
             cursor = conn.execute("SELECT COALESCE(MAX(source_cursor), 0) FROM domain_event_journal").fetchone()[0]
             store.mark_generation_promoted_in_tx(conn, gid, int(cursor), et(11, 0))
             return gid
@@ -687,7 +709,7 @@ class ServedStack:
     def principals_for(self, *methods):
         """Who signed the ledger rows of these commands (the server derives it from the key)."""
         rows = self.trader.journal_db.execute(
-            "SELECT DISTINCT action, principal FROM command_ledger WHERE action IN ({})".format(
+            "SELECT DISTINCT action, source FROM command_ledger WHERE action IN ({})".format(
                 ",".join("?" * len(methods))), list(methods), fetch="all")
         return {row[1] for row in rows}
 

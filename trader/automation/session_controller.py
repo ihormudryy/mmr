@@ -731,16 +731,7 @@ class SessionController:
     ) -> SessionControllerState:
         cause = self.flatten_command_id(self._account_id, state.session_date)
         deadline = state.flat_deadline_utc or (now_utc + dt.timedelta(minutes=10))
-        try:
-            receipt = self._liquidation.start(self._account_id, cause, deadline)
-            # R10: persist and poll the root we got back; it is another root after a join.
-            root = getattr(receipt, "cause_command_id", None)
-        except LiquidationBusy:
-            # start() committed its own claim before it waited for the lock (only an own
-            # root waits), so the root is this cause; a later rescan advances it.
-            root = cause
-        if not root:
-            raise RuntimeError(f"liquidation start for {cause} returned no root to poll")
+        root = self._start_account_flatten(cause, deadline)
         state = self._evolve(
             state,
             state="FLATTENING",
@@ -751,6 +742,27 @@ class SessionController:
         )
         self._persist(state, now_utc)
         return state
+
+    def flatten_account_now(self, cause_command_id: str, deadline: dt.datetime) -> str:
+        """Start (or join) an account flatten now and return the root to poll.
+
+        The experiment kill uses this (SP1 Plan 4 K2). It never changes the
+        session state, so the end-of-day flatten still runs on its schedule.
+        """
+        return self._start_account_flatten(cause_command_id, deadline)
+
+    def _start_account_flatten(self, cause: str, deadline: dt.datetime) -> str:
+        try:
+            receipt = self._liquidation.start(self._account_id, cause, deadline)
+            # R10: persist and poll the root we got back; it is another root after a join.
+            root = getattr(receipt, "cause_command_id", None)
+        except LiquidationBusy:
+            # start() committed its own claim before it waited for the lock (only an own
+            # root waits), so the root is this cause; a later rescan advances it.
+            root = cause
+        if not root:
+            raise RuntimeError(f"liquidation start for {cause} returned no root to poll")
+        return root
 
     def _poll_flat(
         self, state: SessionControllerState, now_utc: dt.datetime,

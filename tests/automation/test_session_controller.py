@@ -1019,3 +1019,36 @@ def test_session_flatten_whose_root_ends_failed_safe_is_an_incident_at_once(tmp_
     state = controller.run_due(_utc(15, 47))
     assert state.state == "INCIDENT" and "FAILED_SAFE" in state.incident
     assert [s.kind for s in breaker.signals] == ["LIQUIDATION_FAILED"]
+
+
+# ---------------------------------------------------------------------------
+# SP1 Plan 4: flatten_account_now (K2)
+# ---------------------------------------------------------------------------
+
+def test_flatten_account_now_starts_an_account_flatten_and_keeps_the_schedule(tmp_path):
+    controller, _b, _c, liquidation, *_rest, clock = _build_controller(tmp_path)
+    clock[0] = _utc(11, 0)
+    controller.recover(clock[0])
+    deadline = clock[0] + dt.timedelta(minutes=5)
+    root = controller.flatten_account_now("experiment-kill-exp-1-1-0", deadline)
+    assert root == "experiment-kill-exp-1-1-0"
+    assert liquidation.starts == [(ACCOUNT, "experiment-kill-exp-1-1-0", deadline)]
+    assert liquidation.kwargs == [{}]                                    # account scope
+    assert controller.run_due(clock[0]).state == "OPEN"                 # schedule untouched (K2)
+    assert controller.entries_allowed(clock[0]) is True
+
+
+def test_flatten_account_now_returns_the_joined_root(tmp_path):
+    controller, _b, _c, liquidation, *_rest, clock = _build_controller(tmp_path)
+    liquidation.joined_root = "session-flatten-abc"
+    assert controller.flatten_account_now("experiment-kill-exp-1-1-0", _utc(11, 5)) == "session-flatten-abc"
+
+
+def test_flatten_account_now_busy_returns_its_own_cause(tmp_path):
+    from trader.trading.liquidation_service import LiquidationBusy
+
+    class Busy(FakeLiquidation):
+        def start(self, *args, **kwargs):
+            raise LiquidationBusy("locked")
+    controller, *_rest = _build_controller(tmp_path, liquidation=Busy())
+    assert controller.flatten_account_now("experiment-kill-exp-1-1-0", _utc(11, 5)) == "experiment-kill-exp-1-1-0"

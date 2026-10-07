@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import asyncio
 import datetime as dt
+import logging
 import os
 import time
 from dataclasses import dataclass
@@ -61,6 +62,8 @@ from trader.trading.trading_control import (
     apply_trading_control_migration,
 )
 
+
+logger = logging.getLogger(__name__)
 
 class CommandStackConfigurationError(RuntimeError):
     """A required production adapter is absent while authority is enabled."""
@@ -484,6 +487,8 @@ class CommandStack:
     paper_hot_arm: Any = None  # ProductionPaperHotArmPorts when paper mode
     strategy_control_service: Any = None  # StrategyControlCommandService when wired
     ai_paper: Any = None  # AiPaperServices when ai_paper.enabled (SP1 Plan 3)
+    experiments: Any = None  # ExperimentServices on paper (SP1 Plan 4, K15)
+    mode_conflict: Optional[str] = None  # "BOTH_MODES_ARMED" (SP1 Plan 4 K17)
 
 
 @dataclass(frozen=True)
@@ -672,6 +677,7 @@ def _build_automated_intent_service(
     margin: Any,
     policy: CommandAuthorityPolicy,
     liquidation: Any = None,
+    entry_block: Optional[Callable[[], Optional[str]]] = None,
 ) -> Optional[Any]:
     """Build ``AutomatedIntentCommandService`` for paper automation only.
 
@@ -741,6 +747,7 @@ def _build_automated_intent_service(
         allocation_factory=evidence.allocation_factory,
         liquidation=liquidation,
         broker=broker,
+        entry_block=entry_block,
     )
 
 
@@ -754,6 +761,62 @@ def _load_position_sizer() -> Any:
     from trader.trading.position_sizing import PositionSizingConfig, PositionSizer
 
     return PositionSizer(PositionSizingConfig.load())
+
+
+@dataclass(frozen=True)
+class _ExperimentParts:
+    """What exists before the stack: the store and the arming lock both directions share."""
+    store: Any
+    arming_lock: Any
+    experiment_lock: Any
+
+
+def _build_experiment_parts(trader: Any, account_mode: str,
+                            now: Callable[[], dt.datetime]) -> Optional[_ExperimentParts]:
+    """K15: experiments exist on every paper stack, ai_paper enabled or not; never on live."""
+    if account_mode != "paper":
+        return None
+    from trader.automation.experiment_service import ArmingLock, ExperimentLock
+    from trader.automation.experiments import ExperimentStore
+
+    store = ExperimentStore(trader.journal_db, trader.ib_account, now)
+    lock = ArmingLock()
+    return _ExperimentParts(store=store, arming_lock=lock, experiment_lock=ExperimentLock(store, lock))
+
+
+def _one_strategy_armed(paper_automation_service: Any) -> Optional[str]:
+    """Armed means any lifecycle but ``disabled`` (configured alone is not armed, K17)."""
+    lifecycle = paper_automation_service.status().lifecycle
+    return None if lifecycle == "disabled" else "ONE_STRATEGY_ARMED"
+
+
+def _detect_mode_conflict(parts: Optional[_ExperimentParts], paper_automation_service: Any, *, journal: Any,
+                          account_id: str, now: Callable[[], dt.datetime]) -> Optional[str]:
+    """K17: both modes armed. The trader still starts; every entry on both paths is refused."""
+    if parts is None:
+        return None
+    record = parts.store.active()
+    if record is None:
+        return None
+    try:
+        armed = _one_strategy_armed(paper_automation_service)
+    except Exception:
+        logger.exception("one-strategy automation state unreadable; treated as armed (fail closed)")
+        armed = "ONE_STRATEGY_STATE_UNREADABLE"
+    if armed is None:
+        return None
+    detail = (f"BOTH_MODES_ARMED: the one-strategy automation is armed and experiment "
+              f"{record.experiment_id} is {record.state}. Every entry is refused; exits keep working. "
+              "Deactivate the one-strategy automation, or stop the experiment once it is flat.")
+    logger.error(detail)
+    try:
+        from trader.automation.kill_monitor import record_incident
+        at = now()
+        record_incident(journal, kind="automation.mode_conflict", account_id=account_id, detail=detail,
+                        event_id=f"automation.mode_conflict:{account_id}:{at.isoformat()}", now=at)
+    except Exception:
+        logger.exception("automation.mode_conflict incident not written")
+    return "BOTH_MODES_ARMED"
 
 
 def build_command_stack(
@@ -824,6 +887,9 @@ def build_command_stack(
     apply_ai_risk_policy_migration(migrator)          # 54
     apply_ai_deployment_migration(migrator)           # 55
     apply_ai_paper_decision_migration(migrator)       # 56
+    from trader.automation.experiments import apply_experiment_migration
+
+    apply_experiment_migration(migrator)              # 70 (SP1 Plan 4)
 
     repository = ProposalRepository(journal)
     ledger = CommandLedger(journal)
@@ -832,6 +898,8 @@ def build_command_stack(
     trader.journal_db.transaction(
         lambda conn: controls.seed_in_tx(conn, [(trader.ib_account, account_mode)], now())
     )
+    experiment_parts = _build_experiment_parts(trader, account_mode, now)
+    mode_conflict_slot: dict[str, Optional[str]] = {"code": None}
     ai_paper_config = _ai_paper_config(trader, account_mode)
     ai_paper_parts = (None if ai_paper_config is None
                       else _build_ai_paper_parts(trader, ai_paper_config, now))
@@ -1193,6 +1261,7 @@ def build_command_stack(
             command_id, now(),
         ),
         liquidation=liquidation_service,
+        entry_block=lambda: mode_conflict_slot["code"],
     )
     ai_paper = _build_ai_paper_services(
         trader, ai_paper_parts, ledger=ledger, journal=journal, controls=controls,
@@ -1221,6 +1290,7 @@ def build_command_stack(
         command_authority_enabled=policy.enabled,
         now=now,
         hot_arm=None,
+        experiment_lock=None if experiment_parts is None else experiment_parts.experiment_lock,
     )
 
     stack = CommandStack(
@@ -1275,6 +1345,7 @@ def build_command_stack(
                 command_id, now(),
             ),
             liquidation=liquidation_service,
+            entry_block=lambda: mode_conflict_slot["code"],
         )
 
     if account_mode == "paper":
@@ -1285,6 +1356,7 @@ def build_command_stack(
             account_mode=account_mode,
             now=now,
             build_intent_service=_build_intent_for_hot_arm,
+            experiment_lock=None if experiment_parts is None else experiment_parts.experiment_lock,
         )
         paper_automation_service._hot_arm = hot_arm
         object.__setattr__(stack, "paper_hot_arm", hot_arm)
@@ -1304,6 +1376,11 @@ def build_command_stack(
                 getattr(trader, "automation_public_key_ring_path", "") or ""
             ),
         )
+
+    mode_conflict = _detect_mode_conflict(
+        experiment_parts, paper_automation_service, journal=journal, account_id=trader.ib_account, now=now)
+    mode_conflict_slot["code"] = mode_conflict
+    object.__setattr__(stack, "mode_conflict", mode_conflict)
 
     trader.command_ledger = ledger
     trader.command_reconciler = reconciler

@@ -122,8 +122,8 @@ def test_scoreboard_rights_are_exact():
         ("query", "get_experiment_trips"): set(READERS)}
 
 
-def test_ai_principals_have_no_write_path_to_scoreboard_tables():
-    for principal in ("ai_supervisor", "ai_research"):
+def test_ai_research_has_no_write_path_to_scoreboard_tables():
+    for principal in ("ai_research",):
         rights = {key for key, allowed in TRADER_ACL.items() if principal in allowed}
         assert not {k for k in rights if k[0] == "command" and any(
             word in k[1] for word in ("scoreboard", "ai_cost", "simulated", "benchmark", "equity"))}

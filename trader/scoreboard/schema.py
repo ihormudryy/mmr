@@ -1,4 +1,4 @@
-"""Journal migrations 60-64: the scoreboard tables (Plan 5 owns 60-69)."""
+"""Journal migrations 60-64: the scoreboard tables (Plan 5 owns 60-69); SP2 Plan 2 adds 95-96."""
 from __future__ import annotations
 
 from typing import Any
@@ -59,16 +59,45 @@ _BENCHMARK = (
         bar_size VARCHAR NOT NULL, fetched_at TIMESTAMPTZ NOT NULL, PRIMARY KEY (version, bar_date))""",
 )
 
-_BOOKS_COSTS = (
-    """CREATE TABLE IF NOT EXISTS simulated_books (
-        book_id VARCHAR PRIMARY KEY, experiment_id VARCHAR NOT NULL,
-        session_date DATE NOT NULL, baseline VARCHAR NOT NULL,
-        label VARCHAR NOT NULL CHECK (label = 'simulated'), pnl_usd DOUBLE, trades INTEGER,
-        created_at TIMESTAMPTZ NOT NULL)""",
+_COSTS = (
     """CREATE TABLE IF NOT EXISTS ai_costs (
-        call_id VARCHAR PRIMARY KEY, experiment_id VARCHAR, provider VARCHAR NOT NULL,
-        model VARCHAR NOT NULL, input_tokens BIGINT, output_tokens BIGINT, cost_usd DOUBLE,
-        called_at TIMESTAMPTZ NOT NULL, served_kind VARCHAR NOT NULL, served_id VARCHAR NOT NULL)""",
+        record_id VARCHAR PRIMARY KEY, experiment_id VARCHAR NOT NULL,
+        role VARCHAR NOT NULL CHECK (role IN ('orchestrator','jev','research')),
+        provider VARCHAR NOT NULL, model VARCHAR NOT NULL, attempt_id VARCHAR NOT NULL,
+        input_tokens BIGINT, output_tokens BIGINT, cost_usd DOUBLE,
+        cost_status VARCHAR NOT NULL CHECK (cost_status IN ('confirmed','estimated','unknown')),
+        called_at TIMESTAMPTZ NOT NULL, served_kind VARCHAR NOT NULL, served_id VARCHAR NOT NULL,
+        decision_id VARCHAR, corrects_record_id VARCHAR, correction_seq INTEGER NOT NULL,
+        body_digest VARCHAR NOT NULL, recorded_at TIMESTAMPTZ NOT NULL,
+        CHECK ((cost_status = 'unknown') = (cost_usd IS NULL)))""",
+)
+
+_SIMULATED = (
+    """CREATE TABLE IF NOT EXISTS simulated_decisions (
+        record_id VARCHAR PRIMARY KEY, experiment_id VARCHAR NOT NULL,
+        baseline_id VARCHAR NOT NULL, cohort VARCHAR NOT NULL, opportunity_id VARCHAR NOT NULL,
+        conid BIGINT, side VARCHAR CHECK (side IS NULL OR side = 'BUY'), quantity BIGINT,
+        quantity_source VARCHAR CHECK (quantity_source IS NULL OR quantity_source IN
+            ('client','trader_sizing','linked_entry')),
+        sizing_json VARCHAR, reference_price DOUBLE, stop_price DOUBLE, target_price DOUBLE,
+        decided_at TIMESTAMPTZ NOT NULL, session_date DATE NOT NULL, linked_decision_id VARCHAR,
+        linked_round_trip_id VARCHAR, deployment_digest VARCHAR, incomplete_reason VARCHAR,
+        body_digest VARCHAR NOT NULL, recorded_at TIMESTAMPTZ NOT NULL)""",
+    "CREATE INDEX IF NOT EXISTS idx_simulated_decisions_book "
+    "ON simulated_decisions(experiment_id, baseline_id, cohort)",
+)
+
+_OUTCOMES = (
+    """CREATE TABLE IF NOT EXISTS simulated_outcomes (
+        record_id VARCHAR PRIMARY KEY, experiment_id VARCHAR NOT NULL,
+        baseline_id VARCHAR NOT NULL, cohort VARCHAR NOT NULL, session_date DATE NOT NULL,
+        status VARCHAR NOT NULL CHECK (status IN ('COMPLETE','INCOMPLETE')), reason VARCHAR,
+        exit_kind VARCHAR NOT NULL CHECK (exit_kind IN ('STOP','TARGET','FLATTEN','NONE')),
+        exit_at TIMESTAMPTZ, exit_price DOUBLE, pnl_usd DOUBLE, trades INTEGER, quantity BIGINT,
+        bar_source VARCHAR NOT NULL, bars_digest VARCHAR, computed_at TIMESTAMPTZ NOT NULL,
+        CHECK ((status = 'COMPLETE') = (pnl_usd IS NOT NULL)))""",
+    "CREATE INDEX IF NOT EXISTS idx_simulated_outcomes_book "
+    "ON simulated_outcomes(experiment_id, baseline_id, cohort)",
 )
 
 _OUTBOX = (
@@ -83,12 +112,14 @@ MIGRATIONS = (
     (60, "scoreboard_core", _CORE),
     (61, "scoreboard_round_trips", _ROUND_TRIPS),
     (62, "scoreboard_benchmark", _BENCHMARK),
-    (63, "scoreboard_books_costs", _BOOKS_COSTS),
+    (63, "scoreboard_costs", _COSTS),
     (64, "scoreboard_outbox", _OUTBOX),
+    (95, "sp2_simulated_decisions", _SIMULATED),
+    (96, "sp2_simulated_outcomes", _OUTCOMES),
 )
 
 
 def apply_scoreboard_migrations(migrator: Any) -> bool:
-    """True when any of 60-64 was newly applied."""
+    """True when any migration of this module was newly applied."""
     applied = [migrator.apply(version, name, statements) for version, name, statements in MIGRATIONS]
     return any(applied)

@@ -33,7 +33,9 @@ const EMPTY_REPORT = {
             sharpe_annualised: null, sharpe_warning: 'SMALL_SAMPLE', unknown_nlv_sessions: 0},
   benchmarks: {spy: {return_pct: null, base_date: '2026-10-05', last_date: null, version: null,
                      provider: 'history_duckdb', label: SPY},
-               vs_spy_pp: null, simulated: {label: 'simulated', status: 'UNAVAILABLE', rows: null, pnl_usd: null},
+               vs_spy_pp: null, books: [],
+               ai_cost: {status: 'NONE', calls: 0, confirmed_usd: 0, estimated_usd: 0, unknown_calls: 0,
+                         corrections: 0, total_usd: null},
                ai_cost_usd: null, ai_calls: null, ai_costs_status: 'UNAVAILABLE', pnl_minus_ai_cost_usd: null},
   trips: trips(), splits: {strategy_version: {}, decider: {}, style: {}},
   sessions: [], warnings: [], incidents: [], outbox: {enabled: false, pending: null, last_sent_at: null},
@@ -95,18 +97,52 @@ test('small-sample warning is shown', () => {
   assert.match(renderScoreboard(FULL_REPORT), /fewer than 60 sessions/);
 });
 
-test('simulated baseline is labelled simulated', () => {
-  const report = {...FULL_REPORT, benchmarks: {...FULL_REPORT.benchmarks,
-    simulated: {label: 'simulated', status: 'AVAILABLE', rows: 2, pnl_usd: 7}}};
-  assert.match(renderScoreboard(report), /simulated/);
-  assert.match(renderScoreboard(report), /\$7\.00/);
+function BOOK(extra = {}) {
+  return {baseline_id: 'follow_signal.v1', cohort: 'strategy_signal', label: 'simulated',
+          pnl_basis: 'gross, no commissions or slippage', status: 'COMPLETE', records: 2, complete: 2,
+          incomplete: 0, pending: 0, trades: 2, pnl_usd: 7, known_pnl_usd: 7, incomplete_reasons: {}, ...extra};
+}
+
+function withBenchmarks(extra) {
+  return {...FULL_REPORT, benchmarks: {...FULL_REPORT.benchmarks, ...extra}};
+}
+
+test('each simulated book is its own row and nothing is summed', () => {
+  const html = renderScoreboard(withBenchmarks({books: [
+    BOOK(), BOOK({baseline_id: 'fixed_rule.v1', cohort: 'self_found', pnl_usd: -3, known_pnl_usd: -3})]}));
+  assert.match(html, /follow_signal\.v1/);
+  assert.match(html, /fixed_rule\.v1/);
+  assert.match(html, /\$7\.00/);
+  assert.match(html, /-\$3\.00/);
+  assert.match(html, /gross, no commissions or slippage/);
+  assert.doesNotMatch(html, /\$4\.00/);
 });
 
-test('unavailable ai cost and simulated book say unavailable, not zero', () => {
-  const html = renderScoreboard(EMPTY_REPORT);
-  assert.match(html, /AI cost[^<]*unavailable/i);
-  assert.doesNotMatch(html, /AI cost[^<]*\$0\.00/);
-  assert.match(html, /Simulated baseline[^<]*unavailable/i);
+test('an incomplete book shows its partial P&L and why, beside a complete one', () => {
+  const html = renderScoreboard(withBenchmarks({books: [
+    BOOK({baseline_id: 'fixed_rule.v1', cohort: 'self_found'}),
+    BOOK({status: 'INCOMPLETE', pnl_usd: null, known_pnl_usd: 10, complete: 1, incomplete: 1,
+          incomplete_reasons: {'alpaca:NO_BARS': 1}})]}));
+  assert.match(html, /data-book-state="INCOMPLETE"/);
+  assert.match(html, /data-book-state="COMPLETE"/);
+  assert.match(html, /alpaca:NO_BARS x1/);
+  assert.match(html, /partial: \$10\.00 from 1 of 2/);
+});
+
+test('an incomplete ai cost is a dash with its status, never zero', () => {
+  const html = renderScoreboard(withBenchmarks({ai_cost: {status: 'INCOMPLETE', calls: 2, confirmed_usd: 1,
+    estimated_usd: 0, unknown_calls: 1, corrections: 0, total_usd: null}}));
+  assert.match(html, /AI cost[^<]*—[^<]*<span class="sb-label">incomplete<\/span>/);
+  assert.match(html, /unknown calls 1/);
+  const empty = renderScoreboard(EMPTY_REPORT);
+  assert.match(empty, /AI cost[^<]*unavailable/i);
+  assert.doesNotMatch(empty, /AI cost[^<]*\$0\.00/);
+  assert.match(empty, /No simulated baseline yet\./);
+});
+
+test('book values are escaped', () => {
+  const html = renderScoreboard(withBenchmarks({books: [BOOK({baseline_id: '<img src=x>'})]}));
+  assert.doesNotMatch(html, /<img/);
 });
 
 test('labels for SPY and drawdown are shown', () => {

@@ -28,6 +28,7 @@ Plan 4 70-79. Plan 4 uses **70** (experiments). SP1 Plan 6 (acceptance) owns
 **80-89**: 80 acceptance marks, 81 broker order events (the status history the
 acceptance shrink proof reads).
 SP2 Plan 1 owns 90–94 and uses **90** (``ai_controller_epochs``).
+SP2 Plan 2 uses 95 (simulated decisions) and 96 (simulated outcomes).
 SP2 Plan 3 owns 100–104 and uses **100** (``discretionary_scope_checks``).
 
 ``SchemaMigrator`` is deliberately storage-agnostic about *which* file it

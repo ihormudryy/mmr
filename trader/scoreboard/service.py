@@ -77,7 +77,7 @@ class ScoreboardService:
         if experiment is None and experiment_id is not None:
             return {"label": "PAPER", "error_code": EXPERIMENT_NOT_FOUND, "experiment_id": experiment_id}
         if experiment is None:
-            return build_report(self._inputs(None, [], [], [], [], [], [], []))
+            return build_report(self._inputs(None, [], [], [], [], [], [], [], []))
         exp_id = experiment.experiment_id
         warnings = [{"code": "FILL_OUTSIDE_SESSION",
                      "detail": f"fill {piece.exec_id} on {piece.session_date} (not an XNYS session) is in the "
@@ -92,7 +92,8 @@ class ScoreboardService:
             self.store.fetch("equity_adjustments", {"experiment_id": exp_id}),
             self.store.fetch("round_trips", {"experiment_id": exp_id}),
             self.store.fetch("ai_costs", {"experiment_id": exp_id}),
-            self.store.fetch("simulated_books", {"experiment_id": exp_id}),
+            self.store.fetch("simulated_decisions", {"experiment_id": exp_id}),
+            self.store.fetch("simulated_outcomes", {"experiment_id": exp_id}),
             incidents, warnings))
 
     def trips(self, experiment_id: str) -> dict:
@@ -119,11 +120,13 @@ class ScoreboardService:
         """Rebuild every derived number from its stored inputs and compare; never writes (ruling 11)."""
         return _verify(self, experiment_id)
 
-    def _inputs(self, experiment, rows, adjustments, trips, ai_costs, simulated, incidents, warnings):
+    def _inputs(self, experiment, rows, adjustments, trips, ai_costs, sim_decisions, sim_outcomes, incidents,
+                warnings):
         return ReportInputs(
             experiment=experiment, rows=rows, adjustments=adjustments, trips=trips,
             spy_closes=self.book.closes(), spy_version=self.book.current_version(),
-            spy_provider=self.book.provider(), ai_costs=ai_costs, simulated=simulated, incidents=incidents,
+            spy_provider=self.book.provider(), ai_costs=ai_costs, sim_decisions=sim_decisions,
+            sim_outcomes=sim_outcomes, incidents=incidents,
             warnings=warnings, outbox=None if self.outbox is None else self.outbox.counts(),
             calendar=self.calendar)
 

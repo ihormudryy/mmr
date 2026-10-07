@@ -47,7 +47,11 @@ def format_daily_summary(report: dict, session_date: dt.date) -> str:
     experiment = report["experiment"]
     account, bench = report["account"], report["benchmarks"]
     spy = bench["spy"]
-    ai_cost = "unavailable" if bench["ai_costs_status"] == "UNAVAILABLE" else _money(bench["ai_cost_usd"])
+    cost = bench["ai_cost"]
+    ai_cost = ("unavailable" if cost["status"] == "NONE" else
+               f"{_money(cost['total_usd'])} ({cost['status'].lower()}; {cost['unknown_calls']} unknown call(s))")
+    books_line = (f"Baselines: {len(bench['books'])} books, "
+                  f"{sum(1 for b in bench['books'] if b['status'] != 'COMPLETE')} not complete")
     lines = [
         f"PAPER — {session['end_state']}",
         f"Session {session['date']}, experiment {experiment['id']} ({experiment['state']})",
@@ -60,6 +64,7 @@ def format_daily_summary(report: dict, session_date: dt.date) -> str:
         + (f"{bench['vs_spy_pp']:+.2f} pp" if _known(bench["vs_spy_pp"]) else "-"),
         f"End-of-day drawdown: {_pct(account['eod_drawdown_pct'])} ({account['eod_drawdown_label']})",
         f"AI cost: {ai_cost}; P&L minus AI cost: {_money(bench['pnl_minus_ai_cost_usd'])}",
+        books_line,
         f"Incidents: {len(report['incidents'])}",
     ]
     lines += [f"- {i['kind']} {i['key']}: {i['detail']}" for i in report["incidents"][:MAX_LISTED_INCIDENTS]]

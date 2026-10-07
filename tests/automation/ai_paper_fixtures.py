@@ -114,3 +114,35 @@ def make_history(path: str):
     for conid in (CONID, OTHER):
         storage.get_tickdata(BarSize.Days1).write(conid, daily_frame())
     return storage
+
+
+SESSION = SimpleNamespace(anchor=1_000_000.0)
+GOOD_MARGIN = {"initMarginAfter": 5_000.0, "equityWithLoanAfter": 995_000.0}
+
+
+class Quotes:
+    def __init__(self, value=None):
+        self.value = quote() if value is None else value
+
+    def executable_quote(self, conid, *, side):
+        return self.value
+
+
+class Margin:
+    def __init__(self, response=GOOD_MARGIN, error=None):
+        self.response, self.error = response, error
+
+    def what_if_margin(self, conid, side, quantity):
+        if self.error is not None:
+            raise self.error
+        return self.response
+
+
+def prepare(parts, **changes):
+    """SP1's own ENTER sizing (``AiPaperEvidence.prepare_entry``) on the ``parts`` fixture."""
+    from trader.automation.ai_paper_evidence import AiPaperEvidence
+    from trader.automation.risk_limits import PAPER_LIMITS
+    args = dict(conid=CONID, stop_price=98.0, requested_quantity=None, limits=PAPER_LIMITS,
+                session=SESSION, notional=1e9, experiment_id="exp1")
+    args.update(changes)
+    return AiPaperEvidence(**parts).prepare_entry(**args)

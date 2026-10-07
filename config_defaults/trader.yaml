@@ -172,6 +172,7 @@ ai_paper:
   experiment_kill_basis: start       # start | peak
   broker_outage_pause_seconds: 300   # pause the experiment after this long without broker data
   acceptance_probe: false            # paper only; true only on the SP1 acceptance day (Plan 6), then back to false
+  model_budget_usd_per_day: 2000   # owner cap for model spend per New York day; only this file changes it (restart the trader)
 
 # Massive.com (formerly Polygon.io)
 massive_api_key: ''

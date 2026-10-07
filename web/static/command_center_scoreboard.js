@@ -59,20 +59,46 @@
     ].join('')}</table>`);
   }
 
+  function aiCostText(cost) {
+    if (!cost || cost.status === 'NONE') return 'unavailable';
+    return `${formatMoney(cost.total_usd)} <span class="sb-label">${escapeHtml(String(cost.status).toLowerCase())}</span>`
+      + ` (confirmed ${formatMoney(cost.confirmed_usd)}, estimated ${formatMoney(cost.estimated_usd)}, `
+      + `unknown calls ${escapeHtml(cost.unknown_calls)}, ${escapeHtml(cost.calls)} calls)`;
+  }
+
   function benchmarks(report) {
     const b = report.benchmarks;
-    const simulated = b.simulated.status === 'UNAVAILABLE' ? 'unavailable'
-      : `${escapeHtml(b.simulated.rows)} rows, P&L ${formatMoney(b.simulated.pnl_usd)}`;
-    const aiCost = b.ai_costs_status === 'UNAVAILABLE' ? 'unavailable'
-      : `${formatMoney(b.ai_cost_usd)} over ${escapeHtml(b.ai_calls)} calls`;
     return section('Benchmarks', `<table class="sb-kv">${[
       row('SPY return', `${formatPct(b.spy.return_pct)} from the ${text(b.spy.base_date)} close <span class="sb-label">${
         escapeHtml(b.spy.label)}</span>`),
       row('vs SPY', known(b.vs_spy_pp) ? `${formatNumber(b.vs_spy_pp, 2)} pp` : DASH),
-      row('Baseline', `Simulated baseline (labelled simulated): ${simulated}`),
-      row('AI', `AI cost: ${aiCost}`),
+      row('AI', `AI cost: ${aiCostText(b.ai_cost)}`),
       row('P&L minus AI cost', formatMoney(b.pnl_minus_ai_cost_usd)),
     ].join('')}</table>`);
+  }
+
+  function bookPnl(book) {
+    if (book.status === 'COMPLETE') return formatMoney(book.pnl_usd);
+    return `${DASH} <span class="sb-label">partial: ${formatMoney(book.known_pnl_usd)} from ${
+      escapeHtml(book.complete)} of ${escapeHtml(book.records)}</span>`;
+  }
+
+  function books(report) {
+    const list = report.benchmarks.books || [];
+    if (!list.length) return section('Simulated baselines', '<p class="dim">No simulated baseline yet.</p>');
+    const basis = `<p class="sb-label">One book per baseline and cohort, never summed; P&amp;L ${
+      escapeHtml(list[0].pnl_basis)}.</p>`;
+    const body = list.map((book) => {
+      const reasons = Object.entries(book.incomplete_reasons || {})
+        .map(([reason, count]) => `${escapeHtml(reason)} x${escapeHtml(count)}`).join(', ');
+      return `<tr data-book-status="${escapeHtml(book.status)}"><td>${escapeHtml(book.baseline_id)}</td>`
+        + `<td>${escapeHtml(book.cohort)}</td><td><span class="sb-label">simulated</span></td>`
+        + `<td><span class="sb-state" data-book-state="${escapeHtml(book.status)}">${escapeHtml(book.status)}</span></td>`
+        + `<td>${escapeHtml(book.records)}</td><td>${bookPnl(book)}</td><td>${reasons || DASH}</td></tr>`;
+    }).join('');
+    return section('Simulated baselines', basis + '<table class="sb-table"><thead><tr><th>Baseline</th>'
+      + '<th>Cohort</th><th>Label</th><th>Status</th><th>Records</th><th>P&amp;L</th><th>Why incomplete</th></tr>'
+      + `</thead><tbody>${body}</tbody></table>`);
   }
 
   function tripRows(t) {
@@ -141,7 +167,7 @@
       escapeHtml(e.started_at)} (base ${text(e.base_currency)}). Kill-line status: see mmr experiment status.</p>`;
     const splits = section('Splits (trips only)', ['strategy_version', 'decider', 'style']
       .map((key) => splitTable(key, report.splits[key])).join(''));
-    return banner(report) + header + account(report) + benchmarks(report)
+    return banner(report) + header + account(report) + benchmarks(report) + books(report)
       + section('Trades', `<table class="sb-kv">${tripRows(report.trips)}</table>`)
       + splits + sessions(report) + notes(report) + telegram(report);
   }

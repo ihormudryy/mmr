@@ -133,7 +133,8 @@ def test_todays_legal_combinations(kill):                  # spec 5.4: 3% with k
     load({"limits_ceiling": {"drawdown_fraction": 0.03}, "experiment_kill_drawdown_pct": kill})
 
 
-@pytest.mark.parametrize("name", ["AI_PAPER_ENABLED", "MMR_AI_PAPER_LIMITS_CEILING"])
+@pytest.mark.parametrize("name", ["AI_PAPER_ENABLED", "MMR_AI_PAPER_LIMITS_CEILING",
+                                  "AI_PAPER_MODEL_BUDGET_USD_PER_DAY"])
 def test_prefixed_environment_override_is_refused(monkeypatch, name):          # R22, owner answer
     monkeypatch.setenv(name, "1")
     with pytest.raises(AiPaperConfigError, match=f"environment override refused: {name}"):
@@ -154,6 +155,18 @@ def test_bare_environment_name_is_ignored_loudly(monkeypatch, caplog, name):
 def test_outage_pause_seconds_is_a_bounded_integer(value):                     # Plan 4 K23
     with pytest.raises(AiPaperConfigError, match="broker_outage_pause_seconds"):
         load({"broker_outage_pause_seconds": value})
+
+
+def test_model_budget_defaults_to_2000():                                        # SP2 Plan 2 Ruling 20
+    assert load(None).model_budget_usd_per_day == 2000.0
+    assert load({"model_budget_usd_per_day": 15}).model_budget_usd_per_day == 15.0
+    assert load({"model_budget_usd_per_day": 0}).model_budget_usd_per_day == 0.0
+
+
+@pytest.mark.parametrize("value", [True, False, "2000", -1, -0.01, float("nan"), float("inf"), None])
+def test_model_budget_refuses_bool_text_negative_and_nan(value):
+    with pytest.raises(AiPaperConfigError, match="model_budget_usd_per_day: must be a finite number >= 0"):
+        load({"model_budget_usd_per_day": value})
 
 
 def test_acceptance_probe_defaults_off_and_loads_true_in_paper():                 # Plan 6 ruling 23

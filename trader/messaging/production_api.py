@@ -2686,6 +2686,11 @@ def build_production_registry(
     register_cli_surface(registry, api)
     from trader.messaging.scoreboard_surface import register_scoreboard_surface
     register_scoreboard_surface(registry, getattr(trader, 'scoreboard_service', None))
+    from trader.messaging.ai_ingest_surface import register_ai_ingest_surface
+    ai_paper_config = getattr(trader, 'ai_paper_config', None)
+    register_ai_ingest_surface(registry, getattr(trader, 'ai_ingest', None),
+                               model_budget=None if ai_paper_config is None
+                               else ai_paper_config.model_budget_usd_per_day)
 
     if command_stack is not None:
         register_command_authority(

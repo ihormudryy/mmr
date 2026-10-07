@@ -11,6 +11,7 @@ from collections import defaultdict
 from dataclasses import dataclass
 from typing import Any, Mapping, Optional, Sequence
 
+from trader.scoreboard.books import build_books, summarize_costs
 from trader.scoreboard.metrics import (EOD_DRAWDOWN_LABEL, SPLIT_KEYS, SPY_LABEL, daily_sharpe, eod_drawdown_pct,
                                        group_trip_metrics, session_returns, trip_metrics)
 from trader.scoreboard.ports import session_date_et
@@ -28,8 +29,9 @@ class ReportInputs:
     spy_closes: Mapping[dt.date, float]
     spy_version: Optional[int]
     spy_provider: str
-    ai_costs: Sequence[Mapping[str, Any]]
-    simulated: Sequence[Mapping[str, Any]]
+    ai_costs: Sequence[Mapping[str, Any]]          # every ai_costs row: originals and corrections
+    sim_decisions: Sequence[Mapping[str, Any]]
+    sim_outcomes: Sequence[Mapping[str, Any]]
     incidents: Sequence[Mapping[str, Any]]
     warnings: Sequence[Mapping[str, Any]]
     outbox: Optional[Mapping[str, Any]]
@@ -55,10 +57,6 @@ def _pct(end: Optional[float], start: Optional[float]) -> Optional[float]:
     if end is None or start is None or start <= 0:
         return None
     return (end / start - 1) * 100
-
-
-def _sum_or_none(values: Sequence[Optional[float]]) -> Optional[float]:
-    return None if any(v is None for v in values) else float(sum(values))
 
 
 def _session_commissions(row: Mapping[str, Any], adjustments: Sequence[Mapping[str, Any]]) -> Optional[float]:
@@ -118,19 +116,13 @@ def _benchmarks(inputs: ReportInputs, account: dict) -> dict:
     spy = _spy(inputs, account["end_date"])
     vs_spy = (None if account["return_pct"] is None or spy["return_pct"] is None
               else account["return_pct"] - spy["return_pct"])
-    if inputs.simulated:
-        simulated = {"label": "simulated", "status": "AVAILABLE", "rows": len(inputs.simulated),
-                     "pnl_usd": _sum_or_none([r["pnl_usd"] for r in inputs.simulated])}
-    else:
-        simulated = {"label": "simulated", "status": "UNAVAILABLE", "rows": None, "pnl_usd": None}
-    if inputs.ai_costs:
-        cost = _sum_or_none([c["cost_usd"] for c in inputs.ai_costs])
-        calls, status = len(inputs.ai_costs), "AVAILABLE"
-    else:
-        cost, calls, status = None, None, "UNAVAILABLE"
+    cost = summarize_costs(inputs.ai_costs)
+    unavailable = cost["status"] == "NONE"
     pnl = account["pnl_usd"]
-    return {"spy": spy, "vs_spy_pp": vs_spy, "simulated": simulated, "ai_cost_usd": cost, "ai_calls": calls,
-            "ai_costs_status": status, "pnl_minus_ai_cost_usd": None if pnl is None or cost is None else pnl - cost}
+    return {"spy": spy, "vs_spy_pp": vs_spy, "books": build_books(inputs.sim_decisions, inputs.sim_outcomes),
+            "ai_cost": cost, "ai_cost_usd": cost["total_usd"], "ai_calls": None if unavailable else cost["calls"],
+            "ai_costs_status": "UNAVAILABLE" if unavailable else "AVAILABLE",
+            "pnl_minus_ai_cost_usd": None if pnl is None or cost["total_usd"] is None else pnl - cost["total_usd"]}
 
 
 def _session_view(row: Mapping[str, Any], adjustments: Sequence[Mapping[str, Any]]) -> dict:

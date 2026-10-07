@@ -1,4 +1,5 @@
 import datetime as dt
+import itertools
 import json
 from dataclasses import replace
 
@@ -29,7 +30,7 @@ def trip(net, **changes):
 
 def empty_inputs(**changes):
     values = dict(experiment=EXP, rows=[], adjustments=[], trips=[], spy_closes={}, spy_version=None,
-                  spy_provider="history_duckdb", ai_costs=[], simulated=[], incidents=[], warnings=[], outbox=None,
+                  spy_provider="history_duckdb", ai_costs=[], sim_decisions=[], sim_outcomes=[], incidents=[], warnings=[], outbox=None,
                   calendar=CAL)
     values.update(changes)
     return ReportInputs(**values)
@@ -51,7 +52,8 @@ def test_report_with_no_sessions_is_all_unknown():
     assert r["trips"]["closed"] == 0 and r["trips"]["win_rate"] is None and r["trips"]["profit_factor"] is None
     assert (r["benchmarks"]["ai_cost_usd"], r["benchmarks"]["ai_calls"], r["benchmarks"]["ai_costs_status"]) == (
         None, None, "UNAVAILABLE")
-    assert r["benchmarks"]["simulated"]["status"] == "UNAVAILABLE" and r["label"] == "PAPER"
+    assert r["benchmarks"]["books"] == [] and r["benchmarks"]["ai_cost"]["status"] == "NONE"
+    assert r["label"] == "PAPER"
     assert r["benchmarks"]["spy"]["return_pct"] is None and r["benchmarks"]["vs_spy_pp"] is None
     assert "proof of live edge" in r["disclaimer"]
 
@@ -127,8 +129,13 @@ def test_row_commissions_include_adjustments_and_stay_unknown_until_complete():
     assert known["sessions"][0]["commissions_usd"] == pytest.approx(1.5)
 
 
+_COST_IDS = itertools.count(1)
+
+
 def _cost(cost):
-    return {"call_id": "c", "cost_usd": cost}
+    return {"record_id": f"c{next(_COST_IDS)}", "cost_usd": cost,
+            "cost_status": "unknown" if cost is None else "confirmed", "corrects_record_id": None,
+            "correction_seq": 0}
 
 
 def test_unknown_ai_cost_makes_pnl_minus_cost_unknown():
@@ -153,9 +160,22 @@ def test_fill_outside_session_is_listed_as_a_warning():
     assert build_report(full_inputs(warnings=[warning]))["warnings"] == [warning]
 
 
-def test_simulated_rows_are_shown_with_the_simulated_label():
-    sim = build_report(full_inputs(simulated=[{"pnl_usd": 3.0}, {"pnl_usd": 4.0}]))["benchmarks"]["simulated"]
-    assert sim == {"label": "simulated", "status": "AVAILABLE", "rows": 2, "pnl_usd": 7.0}
+def test_books_are_listed_separately_with_the_simulated_label():
+    decisions = [{"record_id": "a", "baseline_id": "follow_signal.v1", "cohort": "strategy_signal"},
+                 {"record_id": "b", "baseline_id": "no_trade.v1", "cohort": "self_found"}]
+    outcomes = [{"record_id": "a", "status": "COMPLETE", "pnl_usd": 3.0, "reason": None, "trades": 1},
+                {"record_id": "b", "status": "COMPLETE", "pnl_usd": 0.0, "reason": None, "trades": 0}]
+    b = build_report(full_inputs(sim_decisions=decisions, sim_outcomes=outcomes))["benchmarks"]
+    assert "simulated" not in b
+    assert [(x["baseline_id"], x["label"], x["pnl_usd"]) for x in b["books"]] == [
+        ("follow_signal.v1", "simulated", 3.0), ("no_trade.v1", "simulated", 0.0)]
+
+
+def test_estimated_cost_is_labelled_and_counted_in_pnl_minus_cost():
+    estimated = {**_cost(1.5), "record_id": "e", "cost_status": "estimated"}
+    b = build_report(full_inputs(ai_costs=[_cost(0.5), estimated]))["benchmarks"]
+    assert b["ai_cost"]["status"] == "ESTIMATED" and b["ai_cost_usd"] == pytest.approx(2.0)
+    assert b["pnl_minus_ai_cost_usd"] == pytest.approx(498.0)
 
 
 def test_splits_cover_trip_metrics_by_three_keys():

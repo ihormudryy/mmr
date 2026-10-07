@@ -1,4 +1,5 @@
 """SP1 Plan 5 Task 7: `mmr scoreboard` over a fake SDK."""
+import copy
 import json
 
 import pytest
@@ -17,8 +18,9 @@ REPORT = {
                 "unknown_nlv_sessions": 1},
     "benchmarks": {"spy": {"return_pct": 0.0, "base_date": "2026-10-05", "last_date": None, "version": 1,
                            "provider": "history_duckdb", "label": "SPY price only; dividends excluded"},
-                   "vs_spy_pp": None, "simulated": {"label": "simulated", "status": "UNAVAILABLE", "rows": None,
-                                                    "pnl_usd": None},
+                   "vs_spy_pp": None, "books": [],
+                   "ai_cost": {"status": "NONE", "calls": 0, "confirmed_usd": 0.0, "estimated_usd": 0.0,
+                               "unknown_calls": 0, "corrections": 0, "total_usd": None},
                    "ai_cost_usd": None, "ai_calls": None, "ai_costs_status": "UNAVAILABLE",
                    "pnl_minus_ai_cost_usd": None},
     "trips": {"closed": 0, "open": 0, "unresolved_fee_trips": 0, "net_pnl_usd": 0.0, "net_pnl_complete": True,
@@ -71,6 +73,29 @@ def test_table_output_prints_paper_label_first_and_dash_for_unknown(cli):
     assert "return: -" in out and "AI cost: unavailable" in out and "SPY price only; dividends excluded" in out
     assert "intraday lows may be missed" in out and "fewer than 60 sessions" in out
     assert "nan" not in out.lower() and "None" not in out
+
+
+def book(**changes):
+    values = {"baseline_id": "follow_signal.v1", "cohort": "strategy_signal", "label": "simulated",
+              "pnl_basis": "gross, no commissions or slippage", "status": "COMPLETE", "records": 2, "complete": 2,
+              "incomplete": 0, "pending": 0, "trades": 2, "pnl_usd": 7.0, "known_pnl_usd": 7.0,
+              "incomplete_reasons": {}}
+    values.update(changes)
+    return values
+
+
+def test_table_output_shows_each_book_with_its_status(cli, sdk, monkeypatch):
+    report = copy.deepcopy(REPORT)
+    report["benchmarks"]["books"] = [
+        book(baseline_id="fixed_rule.v1", cohort="self_found", pnl_usd=-3.0, known_pnl_usd=-3.0),
+        book(status="INCOMPLETE", pnl_usd=None, known_pnl_usd=10.0, complete=1, incomplete=1,
+             incomplete_reasons={"alpaca:NO_BARS": 1})]
+    monkeypatch.setattr(sdk, "scoreboard", lambda experiment_id=None: report)
+    out = cli("scoreboard")
+    assert "follow_signal.v1 / strategy_signal (simulated): INCOMPLETE" in out
+    assert "fixed_rule.v1 / self_found (simulated): COMPLETE" in out
+    assert "known so far" in out and "alpaca:NO_BARS x1" in out and "gross, no commissions or slippage" in out
+    assert "None" not in out and "nan" not in out
 
 
 def test_verify_exits_1_on_mismatch_and_0_when_clean(cli, sdk):

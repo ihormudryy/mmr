@@ -42,6 +42,7 @@ EXPOSE 8081
 # spin up the directories required
 RUN mkdir -p /home/trader/.local/share/mmr/data \
     && mkdir -p /home/trader/.local/share/mmr/logs \
+    && mkdir -p /home/trader/.local/share/mmr_ai \
     && mkdir -p /home/trader/.config /home/trader/.tmp /home/trader/.cache /home/trader/.local/bin \
     && chown -R trader:trader /home/trader
 

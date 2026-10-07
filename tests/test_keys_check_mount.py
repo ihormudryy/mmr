@@ -4,7 +4,7 @@ import io
 import pytest
 
 from trader.messaging.keys_cli import main
-from trader.messaging.principals import SERVICE_PRINCIPAL, rpc_files_for
+from trader.messaging.principals import SERVICE_PRINCIPAL, rpc_files_for, service_rpc_files
 
 
 def _container_view(tmp_path, service, *, extra=(), missing=(), hmac=b""):
@@ -16,7 +16,7 @@ def _container_view(tmp_path, service, *, extra=(), missing=(), hmac=b""):
     write_keyset(host)
     rpc = tmp_path / "rpc"
     rpc.mkdir()
-    for name in (rpc_files_for(SERVICE_PRINCIPAL[service]) - set(missing)) | set(extra):
+    for name in (service_rpc_files(service) - set(missing)) | set(extra):
         shutil.copy2(host / name, rpc / name)
     hmac_file = tmp_path / "service_hmac.key"
     if hmac is not None:

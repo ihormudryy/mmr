@@ -165,5 +165,22 @@ STRATEGY_ACL: Mapping[tuple[str, str], frozenset[str]] = {
 # Compose service -> the principal it signs as (None: no key, tmpfs only).
 SERVICE_PRINCIPAL: Mapping[str, str | None] = {
     "trader": "trader", "strategy": "strategy", "dashboard": "dashboard", "cli": "cli",
-    "scheduler": None, "data": None,
+    "scheduler": None, "data": None, "ai": "ai_supervisor",
 }
+
+# A service that signs as more than one principal. SP2 spec 4: the ai service holds the
+# ai_supervisor and ai_research keys (accepted limit: two keys in one process are not isolation).
+SERVICE_EXTRA_PRINCIPALS: Mapping[str, tuple[str, ...]] = {"ai": ("ai_research",)}
+
+
+def service_principals(service: str) -> tuple[str, ...]:
+    own = SERVICE_PRINCIPAL[service]
+    return () if own is None else (own, *SERVICE_EXTRA_PRINCIPALS.get(service, ()))
+
+
+def service_rpc_files(service: str) -> frozenset[str]:
+    """Key files a compose service must see: each own pair and every peer's .pub."""
+    files: frozenset[str] = frozenset()
+    for principal in service_principals(service):
+        files |= rpc_files_for(principal)
+    return files

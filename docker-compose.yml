@@ -560,6 +560,59 @@ services:
       start_period: 15s
 
 
+  # ── ai: the AI paper controller (trader/ai_service.py, SP2 Plan 5) ─────────
+  # Opt-in (profile "ai"): `docker compose --profile ai up -d ai` once the model ids in
+  # ~/.config/mmr/ai.yaml are filled in (./docker.sh -u copies the template there). Holds
+  # model-provider credentials only (spec 4): it does NOT inherit x-mmr-common-env (Alpaca
+  # keys) and does NOT mount ~/.config/mmr (trader.yaml may hold Alpaca keys) -- only ai.yaml.
+  # Two RPC key pairs (ai_supervisor, ai_research) plus trader.pub. Its state, ai.duckdb, lives
+  # on the named volume mmr_ai_data and survives container recreation. No port is bound;
+  # the healthcheck reads the heartbeat file the controller writes every 10 s.
+  ai:
+    <<: *mmr-hardening
+    build: *mmr-build
+    profiles: ["ai"]
+    working_dir: /home/trader/mmr
+    command: ["python", "-m", "trader.ai_service"]
+    depends_on:
+      - trader
+    mem_limit: 1g
+    cpus: 1.0
+    environment:
+      TZ: ${TIME_ZONE:-America/New_York}
+      PYTHONDONTWRITEBYTECODE: "1"
+      TRADER_TYPED_ADDRESS: tcp://trader
+      OPENROUTER_API_KEY: ${OPENROUTER_API_KEY:-}
+      AWS_REGION: ${AWS_REGION:-}
+      AWS_ACCESS_KEY_ID: ${AWS_ACCESS_KEY_ID:-}
+      AWS_SECRET_ACCESS_KEY: ${AWS_SECRET_ACCESS_KEY:-}
+      AWS_SESSION_TOKEN: ${AWS_SESSION_TOKEN:-}
+      AZURE_OPENAI_ENDPOINT: ${AZURE_OPENAI_ENDPOINT:-}
+      AZURE_OPENAI_API_KEY: ${AZURE_OPENAI_API_KEY:-}
+      AZURE_OPENAI_API_VERSION: ${AZURE_OPENAI_API_VERSION:-}
+    volumes:
+      - type: tmpfs
+        target: /home/trader/.config/mmr/keys/rpc
+        tmpfs:
+          size: 65536
+          mode: 0755
+      - ${HOME}/.config/mmr/keys/rpc/ai_supervisor.key:/home/trader/.config/mmr/keys/rpc/ai_supervisor.key:ro
+      - ${HOME}/.config/mmr/keys/rpc/ai_supervisor.pub:/home/trader/.config/mmr/keys/rpc/ai_supervisor.pub:ro
+      - ${HOME}/.config/mmr/keys/rpc/ai_research.key:/home/trader/.config/mmr/keys/rpc/ai_research.key:ro
+      - ${HOME}/.config/mmr/keys/rpc/ai_research.pub:/home/trader/.config/mmr/keys/rpc/ai_research.pub:ro
+      - ${HOME}/.config/mmr/keys/rpc/trader.pub:/home/trader/.config/mmr/keys/rpc/trader.pub:ro
+      - ${HOME}/.config/mmr/ai.yaml:/home/trader/.config/mmr/ai.yaml:ro
+      # The key-mount gate (./docker.sh -K) expects the retired HMAC file as /dev/null.
+      - /dev/null:/home/trader/.config/mmr/service_hmac.key:ro
+      - mmr_ai_data:/home/trader/.local/share/mmr_ai
+      - ${HOME}/.local/share/mmr/logs:/home/trader/.local/share/mmr/logs
+    healthcheck:
+      test: ["CMD", "python3", "-c", "import os,sys,time; p='/tmp/mmr_ai_heartbeat.json'; sys.exit(0 if os.path.exists(p) and time.time() - os.path.getmtime(p) < 120 else 1)"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 120s
+
   # ── cli: one-shot `mmr` CLI client (owner answer 1) ──────────────────────
   # `docker compose run --rm cli strategies` -- for commands that need the
   # private strategy ports (strategies list/enable/disable/reload). Host
@@ -697,3 +750,4 @@ networks:
 
 volumes:
   mmr_db_data:
+  mmr_ai_data:

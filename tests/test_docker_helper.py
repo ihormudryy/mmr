@@ -391,7 +391,7 @@ def test_backup_fallback_uses_compose_project_volume(fake_docker: FakeDocker):
 
 # --- PR #50 round 1, finding 4: isolated, mount-only cutover gate ---
 
-KEYCHECK_SERVICES = {"trader", "strategy", "dashboard", "cli", "scheduler", "data"}
+KEYCHECK_SERVICES = {"trader", "strategy", "dashboard", "cli", "scheduler", "data", "ai"}
 
 
 def _compose_lines(fake_docker: FakeDocker) -> list[list[str]]:

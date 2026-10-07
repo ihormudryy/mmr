@@ -1009,7 +1009,7 @@ keys() {
 # touched. Each container decides pass/fail itself from the shared
 # principals.rpc_files_for formula.
 KEYCHECK_PROJECT="mmr-keycheck"
-KEYCHECK_SERVICES="trader strategy dashboard cli scheduler data"
+KEYCHECK_SERVICES="trader strategy dashboard cli scheduler data ai"
 
 key_check() {
     _require_rpc_keys
@@ -1026,6 +1026,7 @@ key_check() {
     # DB volume is removed by its project-prefixed name, never the live one.
     $COMPOSE "${compose_args[@]}" down --remove-orphans || true
     $RUNTIME volume rm "${KEYCHECK_PROJECT}_mmr_db_data" >/dev/null 2>&1 || true
+    $RUNTIME volume rm "${KEYCHECK_PROJECT}_mmr_ai_data" >/dev/null 2>&1 || true
     if [[ -n "$failed" ]]; then
         echo "Key check FAILED for:$failed. Do not cut over."
         exit 1

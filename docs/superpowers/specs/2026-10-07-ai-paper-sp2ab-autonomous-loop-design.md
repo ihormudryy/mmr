@@ -174,7 +174,7 @@ read and mutation rights separate.
 
 1. **Durable strategy signal record + cursor read.** Today the strategy path
    persists a `TradingEvent` and publishes on the MessageBus
-   (`trader/strategy/strategy_runtime.py:1591`), which is not a delivery
+   (`StrategyRuntime._dispatch_signal` in `trader/strategy/strategy_runtime.py`), which is not a delivery
    contract. Add a durable trader-side signal record with a monotonic cursor and
    retention, readable by `ai_supervisor` only.
 2. **Controller epoch.** A trader-side epoch/lease table, a grant method for

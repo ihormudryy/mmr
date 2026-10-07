@@ -342,3 +342,63 @@ async def test_a_sell_before_the_entry_fills_waits_and_then_closes_once(stack): 
     await node.signals()
     assert not world.served.sim.held.get(world.conid) and len(close_rows(node)) == 1
     assert len([p for p in world.served.sim.placed if p[2] == "SELL" and p[1] == "MKT"]) <= 1
+
+
+async def accepted_unfilled_buy(world, node):
+    """A BUY Jev takes and the trader admits, whose limit the market then leaves: working, unfilled."""
+    buy = world.strategy_signal()
+    await node.signals()
+    decision_id = derive_decision_id(buy, f"enter:{world.conid}")
+    assert (await node.node.submitter.get(decision_id)).state in ("ACCEPTED", "FINAL")
+    world.served.sim.quote(world.conid, 232.0, 232.1)
+    world.advance(1)
+    assert not world.served.sim.held.get(world.conid)
+    return decision_id
+
+
+async def fill_and_close_once(world, node, sell):
+    world.served.sim.quote(world.conid, 229.9, 230.0)              # the working entry fills and is protected
+    world.settle()
+    await node.signals()
+    close_id = derive_decision_id(sell, f"close:{world.conid}")
+    assert node.opportunity(sell) == ("DECIDED", "EXIT_SIGNAL") and [r[0] for r in close_rows(node)] == [close_id]
+    await settle_close(world, node, close_id)
+    await node.signals()
+    assert not world.served.sim.held.get(world.conid) and len(close_rows(node)) == 1
+
+
+@pytest.mark.asyncio
+async def test_an_older_working_entry_holds_the_sell_behind_a_newer_refused_one(stack):   # PR #86 4211895474 (a)
+    world, node, _ = stack
+
+    def republish(_request):                                        # the newer ENTER names a stale policy
+        tighter = dataclasses.replace(PAPER_LIMITS, position_fraction=0.04).to_json()
+        world.served.call("cli", "publish_ai_risk_policy", {"command_id": "cli-pol-000000000003",
+                                                            "limits": tighter, "reason": "tighten"})
+        return ruling()
+    node.jev.script(JEV_MARKER, ruling(), republish)
+    await accepted_unfilled_buy(world, node)
+    world.advance(1)
+    again = world.strategy_signal()                                 # a newer BUY the trader refuses
+    await node.signals()
+    refused = world.receipt(derive_decision_id(again, f"enter:{world.conid}"))
+    assert refused is not None and refused.error_code == "POLICY_REVISION_STALE"
+    assert len(world.entries()) == 1                                # only the older entry is an order
+    sell = world.strategy_signal(action="SELL")
+    await node.signals()
+    assert node.opportunity(sell) == ("IN_PROGRESS", "EXIT_WAITING_FOR_ENTRY") and close_rows(node) == []
+    await fill_and_close_once(world, node, sell)
+
+
+@pytest.mark.asyncio
+async def test_a_late_fill_after_the_cutoff_is_still_closed_once(stack):                 # PR #86 4211898491 (b)
+    world, node, _ = stack
+    node.jev.script(JEV_MARKER, ruling())
+    await accepted_unfilled_buy(world, node)
+    sell = world.strategy_signal(action="SELL")
+    await node.signals()
+    assert node.opportunity(sell) == ("IN_PROGRESS", "EXIT_WAITING_FOR_ENTRY")
+    world.advance((et(15, 36) - world.served.now()).total_seconds())   # past cutoff + 5 min; no cancel proven
+    await node.signals()
+    assert node.opportunity(sell) == ("IN_PROGRESS", "EXIT_WAITING_FOR_ENTRY") and close_rows(node) == []
+    await fill_and_close_once(world, node, sell)

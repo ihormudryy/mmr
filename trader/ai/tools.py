@@ -1,9 +1,11 @@
 """Every trader read of a decision goes through here, so it can be recorded and replayed (spec 11; Plan 6 Ruling 1)."""
 from __future__ import annotations
 
-import importlib.metadata
+import functools
+import hashlib
 import os
-from typing import Any, Mapping
+from pathlib import Path
+from typing import Any, Iterable, Mapping
 
 from trader.ai.replay import RecordingClock
 from trader.ai.rpc_clients import RpcNotSent, RpcOutcomeUnknown, RpcRefused
@@ -21,9 +23,31 @@ class ToolUnavailable(Exception):
         self.tool, self.code = tool, code
 
 
+TRADER_ROOT = Path(__file__).resolve().parents[1]
+# The code a judgment depends on: the ai package and the three trader modules it may import (Plan 6).
+JUDGMENT_SOURCES: tuple[Path, ...] = (
+    TRADER_ROOT / "ai", TRADER_ROOT / "automation" / "ai_discovery_wire.py",
+    TRADER_ROOT / "automation" / "risk_limits.py", TRADER_ROOT / "automation" / "ai_paper_sizing.py")
+
+
+def source_digest(sources: Iterable[Path], *, root: Path) -> str:
+    """sha256 over every judgment source file (sorted relative path and bytes), not a package version."""
+    files = sorted({file for source in sources
+                    for file in (source.rglob("*.py") if source.is_dir() else (source,))})
+    digest = hashlib.sha256()
+    for file in files:
+        digest.update(file.relative_to(root).as_posix().encode("utf-8") + b"\0")
+        digest.update(file.read_bytes() + b"\0")
+    return "src-sha256:" + digest.hexdigest()
+
+
+@functools.lru_cache(maxsize=1)
 def code_version() -> str:
-    """Ruling 18: MMR_CODE_VERSION, else the installed distribution. A missing distribution raises."""
-    return os.environ.get("MMR_CODE_VERSION") or importlib.metadata.version("mmr")
+    """The manifest's code identity (PR #86 thread 4211895936): the content of the judgment source, computed
+    once per process, plus MMR_CONTAINER_DIGEST when the container sets it."""
+    identity = source_digest(JUDGMENT_SOURCES, root=TRADER_ROOT)
+    container = os.environ.get("MMR_CONTAINER_DIGEST")
+    return f"{identity}+{container}" if container else identity
 
 
 def _request_key(unit_key: str, role: str, call_seq: int) -> str:

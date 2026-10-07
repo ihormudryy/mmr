@@ -144,8 +144,9 @@ class AiIngest:
             schedule = self._calendar.resolve(decided_at)
             if schedule is None or not schedule.open_utc <= decided_at < schedule.flatten_start_utc:
                 raise IngestRefused("DECIDED_OUTSIDE_ENTRY_WINDOW", f"{decided_at.isoformat()} is not before the flatten start")
+        incomplete_matched = req.baseline_id == MATCHED_ENTRY and req.incomplete_reason is not None
         linked = None
-        if req.linked_decision_id is not None:
+        if req.linked_decision_id is not None and not incomplete_matched:
             linked = self._decision_link(req.linked_decision_id, experiment, conid=req.conid, must_enter=True)
         now = self._now()
         session_date = session_date_et(decided_at)
@@ -154,6 +155,8 @@ class AiIngest:
                     "body_digest": req.digest(), "recorded_at": now}
         if req.baseline_id == MATCHED_ENTRY and req.incomplete_reason is None:
             decision["linked_round_trip_id"] = self._verified_trip(req, experiment, linked)
+        elif incomplete_matched:
+            decision.update(self._incomplete_matched_links(req, experiment))
         incomplete_reason = req.incomplete_reason
         if incomplete_reason is None and req.baseline_id in TRADER_SIZED and not self._known(req.record_id):
             if linked is not None and linked.entry_quantity is not None:
@@ -222,6 +225,26 @@ class AiIngest:
             raise IngestRefused("MATCHED_ENTRY_TRIP_MISMATCH",
                                 f"{req.linked_decision_id} opened {trip.round_trip_id}, not {req.linked_round_trip_id}")
         return trip.round_trip_id
+
+    def _incomplete_matched_links(self, req: RecordSimulatedDecisionRequest, experiment: Any) -> dict:
+        """An incomplete matched-entry row stays visible but keeps only links the trader proves (PR #86
+        4211898764): an ENTER the trader does not know is omitted together with the trip; a known ENTER gets
+        the trader's own trip, a different supplied trip is refused, a trip not yet projected is omitted."""
+        if req.linked_decision_id is None:
+            return {"linked_decision_id": None, "linked_round_trip_id": None}
+        try:
+            entry = self._decision_link(req.linked_decision_id, experiment, conid=req.conid, must_enter=True)
+        except IngestRefused as refused:
+            if refused.code != "DECISION_LINK_UNKNOWN":
+                raise
+            return {"linked_decision_id": None, "linked_round_trip_id": None}
+        try:
+            trip = self._verified_trip(req, experiment, entry)
+        except IngestRefused as refused:
+            if refused.code != "MATCHED_ENTRY_TRIP_UNKNOWN":
+                raise
+            trip = None
+        return {"linked_decision_id": entry.decision_id, "linked_round_trip_id": trip}
 
     @staticmethod
     def _opportunity_check(conn, req: RecordSimulatedDecisionRequest) -> dict:

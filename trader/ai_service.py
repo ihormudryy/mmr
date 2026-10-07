@@ -31,6 +31,7 @@ from trader.ai.runtime_schema import ALL_MIGRATIONS
 from trader.ai.schedule import SessionSlots
 from trader.ai.signal_intake import SignalIntake
 from trader.ai.store import AiStore
+from trader.ai.tools import code_version
 from trader.ai.submitter import Submitter
 
 logger = logging.getLogger("trader.ai_service")
@@ -74,6 +75,7 @@ async def serve(settings: ServiceSettings, *, engine_factory: Callable[[EngineDe
     environ = os.environ if environ is None else environ
     config = load_ai_config(settings.config_path)
     check_credentials(config, environ)                    # names missing variables only, never values
+    code_version()                                        # the judgment code identity, read once at start
     cfg = config.controller
     Path(config.database_path).expanduser().parent.mkdir(parents=True, exist_ok=True)
     store = AiStore(config.database_path, clock=clock)

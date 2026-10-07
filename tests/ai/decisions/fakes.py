@@ -45,6 +45,7 @@ class FakeReads:
             "get_account_values": {"NetLiquidation": {"value": "100000.0", "currency": "USD"}},
             "get_positions": {"positions": []},
             "get_experiment_trips": {"experiment_id": "exp-" + "b" * 20, "trips": []},
+            "get_broker_order_evidence": {"generation_id": 7, "promoted": True, "orders": []},
         }
         self.replies.update(overrides)
         self.calls: list[tuple[str, dict]] = []

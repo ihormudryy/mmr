@@ -191,6 +191,34 @@ def test_a_model_close_without_a_valid_counterfactual_is_an_incomplete_book_row(
     assert (outcome["status"], outcome["reason"], outcome["pnl_usd"]) == ("INCOMPLETE", "entry_not_comparable", None)
 
 
+def incomplete_matched(**changes):
+    return matched_body(side=None, quantity=None, reference_price=None, stop_price=None, target_price=None,
+                        incomplete_reason="entry_not_comparable", **changes)
+
+
+def test_an_incomplete_matched_record_with_an_unknown_enter_stays_visible_without_the_link(store):   # 4211898764
+    ingest = matched_world(store)
+    assert sim(ingest, incomplete_matched(linked_decision_id="dec-00000099"))["status"] == "INSERTED"
+    (row,) = store.fetch("simulated_decisions", {})
+    assert (row["linked_decision_id"], row["linked_round_trip_id"]) == (None, None)      # nothing unproven kept
+    (outcome,) = store.fetch("simulated_outcomes", {})
+    assert (outcome["status"], outcome["reason"]) == ("INCOMPLETE", "entry_not_comparable")
+
+
+def test_an_incomplete_matched_record_cannot_name_another_trip(store):
+    ingest = matched_world(store)
+    refused = sim(ingest, incomplete_matched(linked_round_trip_id="rt-other"))
+    assert (refused["status"], refused["code"]) == ("REFUSED", "MATCHED_ENTRY_TRIP_MISMATCH")
+    assert store.fetch("simulated_decisions", {}) == []
+
+
+def test_an_incomplete_matched_record_gets_the_verified_trip(store):
+    ingest = matched_world(store)
+    assert sim(ingest, incomplete_matched(linked_round_trip_id=None))["status"] == "INSERTED"
+    (row,) = store.fetch("simulated_decisions", {})
+    assert (row["linked_decision_id"], row["linked_round_trip_id"]) == ("dec-00000001", "rt-1")   # derived
+
+
 def test_two_partial_closes_of_one_trip_are_two_records(store):
     ingest = matched_world(store, close_fact(), close_fact("dec-00000032", action="CLOSE"))
     assert sim(ingest, matched_body())["status"] == "INSERTED"                           # PARTIAL_CLOSE 4

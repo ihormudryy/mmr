@@ -445,14 +445,17 @@ async def test_an_exit_that_waits_for_its_entry_is_kept_past_the_signal_age(rig)
 
 
 @pytest.mark.asyncio
-async def test_an_exit_wait_has_a_hard_end(rig):
+async def test_a_stuck_exit_wait_is_a_loud_incident_not_a_not_held(rig, caplog):      # PR #86 4211895474
     sell = rig.trader.signals.add(action="SELL")
     rig.engine.results["exit_signal"] = EngineResult(note="EXIT_WAITING_FOR_ENTRY",
                                                      wait_until=rig.clock.now() + dt.timedelta(minutes=5))
     await rig.signals_then_drain()
     rig.clock.advance(5 * 60 + EXIT_WAIT_OVERRUN.total_seconds() + 1)
+    caplog.set_level(logging.ERROR, logger="trader.ai.controller")
     await rig.signals_then_drain()
-    assert rig.opportunity(sell) == ("MISSED", "EXIT_WAIT_EXPIRED") and rig.sent() == []
+    assert rig.opportunity(sell) == ("MISSED", "EXIT_WAIT_STUCK") and rig.sent() == []
+    assert "EXIT_WAIT_STUCK" in caplog.text and sell["source_event_id"] in caplog.text
+    assert (await rig.controller.heartbeat())["exit_waits_stuck"] == 1
 
 
 @pytest.mark.asyncio

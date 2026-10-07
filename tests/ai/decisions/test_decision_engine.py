@@ -11,7 +11,7 @@ from tests.ai.decisions.fakes import (
 )
 from tests.ai.decisions.test_discovery_client import candidate, response
 from tests.ai.fakes import FakeClock, load_test_config
-from trader.ai.decision_engine import ENTRY_SETTLE_GRACE, RoleHealth
+from trader.ai.decision_engine import RoleHealth
 from trader.ai.engine import (
     EntryCycleContext, ExperimentView, ModelWork, OwnedPosition, PositionCycleContext, ProposedDecision,
     SignalContext, SignalOpportunity,
@@ -95,7 +95,7 @@ async def rig(tmp_path):
     return await started(tmp_path)
 
 
-def insert_enter(rig, opportunity=SIGNAL):
+def insert_enter(rig, opportunity=SIGNAL, now=NOW):
     """The ENTER the controller persisted for this signal (Plan 5's Submitter), so closes find its bracket."""
     enter = ProposedDecision(action_key=f"enter:{opportunity.conid}", action="ENTER", conid=opportunity.conid,
                              side="BUY", decider="jev", evidence_digest="sha256:" + "f" * 64,
@@ -105,7 +105,7 @@ def insert_enter(rig, opportunity=SIGNAL):
                           experiment_state=lambda: None)
     return rig.store.transaction(lambda conn: submitter.insert_in_tx(
         conn, source_kind="entry_signal", source_id=opportunity.opportunity_id, decision=enter,
-        expires_at=NOW + dt.timedelta(minutes=5), epoch=1, now=NOW))
+        expires_at=now + dt.timedelta(minutes=5), epoch=1, now=now))
 
 
 @pytest.mark.asyncio
@@ -378,14 +378,32 @@ async def test_every_model_step_writes_one_ruling_row(rig):
 # -- PR #86 thread 4211394337: an exit signal that arrives before our accepted entry has filled ------------
 
 SELL = SignalOpportunity("sig-" + "3" * 32, 9, "orb", AAPL, "SELL", 0.7, NOW, NOW)
-SETTLED_BY = dt.datetime(2026, 7, 17, 19, 30, tzinfo=dt.timezone.utc) + ENTRY_SETTLE_GRACE   # 15:30 ET cutoff
+SESSION_CLOSE = dt.datetime(2026, 7, 17, 20, 0, tzinfo=dt.timezone.utc)       # 16:00 ET: every DAY order is done
 
 
-def our_enter(rig, state, receipt_state=None, error_code=None):
-    decision_id = insert_enter(rig)
+def our_enter(rig, state, receipt_state=None, error_code=None, opportunity=SIGNAL, now=NOW):
+    decision_id = insert_enter(rig, opportunity, now)
     rig.store.db.execute("UPDATE ai_submissions SET state = ?, receipt_state = ?, error_code = ? WHERE decision_id = ?",
                          [state, receipt_state, error_code, decision_id])
     return decision_id
+
+
+def entry_row(decision_id, status="Submitted", filled=0.0, deleted=False):
+    """One get_broker_order_evidence row: the entry leg of our ENTER's order group."""
+    return {"order_group_id": f"og-aip-{decision_id}", "leg": "entry", "status": status, "filled_quantity": filled,
+            "remaining_quantity": 9.0 - filled, "deleted": deleted}
+
+
+def broker(*rows):
+    return {"generation_id": 7, "promoted": True, "orders": list(rows)}
+
+
+async def with_broker(tmp_path, evidence):
+    return await started(tmp_path, FakeReads(get_broker_order_evidence=evidence))
+
+
+def at(now, opportunity=SELL, rig=None):
+    return SignalContext(now, EXPERIMENT, opportunity, rig.work(opportunity.opportunity_id))
 
 
 @pytest.mark.asyncio
@@ -395,7 +413,7 @@ async def test_an_exit_signal_waits_while_our_entry_may_still_fill(rig, state, r
     our_enter(rig, state, receipt_state)
     result = await rig.engine.on_exit_signal(rig.signal(SELL))
     assert (result.decisions, result.baselines, result.note) == ((), (), "EXIT_WAITING_FOR_ENTRY")
-    assert result.wait_until == SETTLED_BY                          # bounded by the entry's own cutoff
+    assert result.wait_until == SESSION_CLOSE                       # only the controller's loud backstop uses it
 
 
 @pytest.mark.asyncio
@@ -409,11 +427,66 @@ async def test_an_entry_that_cannot_fill_does_not_hold_the_exit(rig, state, rece
 
 
 @pytest.mark.asyncio
-async def test_the_exit_stops_waiting_once_the_entry_is_settled_unfilled(rig):
-    our_enter(rig, "FINAL", "RESOLVED")
-    later = SignalContext(SETTLED_BY, EXPERIMENT, SELL, rig.work(SELL.opportunity_id))
-    result = await rig.engine.on_exit_signal(later)
+async def test_an_older_working_entry_holds_the_exit_behind_a_newer_refused_one(rig):     # PR #86 4211895474 (a)
+    our_enter(rig, "FINAL", "RESOLVED")                                              # older: admitted, working
+    newer = SignalOpportunity("sig-" + "5" * 32, 11, "orb", AAPL, "BUY", 0.7, NOW, NOW)
+    our_enter(rig, "FINAL", "REJECTED", "ENTRY_ALREADY_WORKING", opportunity=newer,     # newer: refused
+              now=NOW + dt.timedelta(seconds=30))
+    result = await rig.engine.on_exit_signal(rig.signal(SELL))
+    assert (result.decisions, result.note) == ((), "EXIT_WAITING_FOR_ENTRY")
+
+
+@pytest.mark.asyncio
+async def test_the_exit_waits_past_the_cutoff_until_the_broker_proves_the_entry_ended(tmp_path):   # 4211898491 (b)
+    evidence = {"reply": broker()}
+    rig = await with_broker(tmp_path, lambda body: evidence["reply"])
+    enter_id = our_enter(rig, "FINAL", "RESOLVED")
+    late = dt.datetime(2026, 7, 17, 20, 30, tzinfo=dt.timezone.utc)                  # after the close
+    evidence["reply"] = broker(entry_row(enter_id, status="Submitted"))              # cancel issued, not proven
+    assert (await rig.engine.on_exit_signal(at(late, rig=rig))).note == "EXIT_WAITING_FOR_ENTRY"
+    evidence["reply"] = {"capture_error": "GENERATION_STAGING"}                       # unreadable: no proof
+    assert (await rig.engine.on_exit_signal(at(late, rig=rig))).note == "EXIT_WAITING_FOR_ENTRY"
+    evidence["reply"] = broker(entry_row(enter_id, status="Cancelled", filled=2.0))   # a late fill, trips lag
+    assert (await rig.engine.on_exit_signal(at(late, rig=rig))).note == "EXIT_WAITING_FOR_FILL"
+    evidence["reply"] = broker(entry_row(enter_id, status="Cancelled"))               # proven: ended, zero fill
+    result = await rig.engine.on_exit_signal(at(late, rig=rig))
     assert (result.decisions, result.note, result.wait_until) == ((), "ENTRY_UNFILLED", None)
+
+
+@pytest.mark.asyncio
+async def test_a_fill_already_closed_by_its_bracket_ends_the_wait(tmp_path):
+    evidence = {"reply": broker()}
+    trips = {"experiment_id": EXPERIMENT.experiment_id, "trips": []}
+    rig = await started(tmp_path, FakeReads(get_broker_order_evidence=lambda body: evidence["reply"],
+                                            get_experiment_trips=lambda body: trips))
+    enter_id = our_enter(rig, "FINAL", "RESOLVED")
+    evidence["reply"] = broker(entry_row(enter_id, status="Filled", filled=9.0))
+    assert (await rig.engine.on_exit_signal(rig.signal(SELL))).note == "EXIT_WAITING_FOR_FILL"   # trip not yet
+    trips["trips"] = [{"round_trip_id": "rt-1", "conid": AAPL, "symbol": "AAPL", "opened_at": NOW.isoformat(),
+                       "opened_quantity": 9.0, "closed_quantity": 9.0, "decision_id": enter_id, "state": "CLOSED",
+                       "entry_avg_price": 230.0}]
+    result = await rig.engine.on_exit_signal(rig.signal(SELL))
+    assert (result.decisions, result.note, result.wait_until) == ((), "ENTRY_FILLED_AND_CLOSED", None)
+
+
+@pytest.mark.asyncio
+async def test_every_fillable_entry_must_be_proven_ended(tmp_path):
+    evidence = {"reply": broker()}
+    rig = await with_broker(tmp_path, lambda body: evidence["reply"])
+    first = our_enter(rig, "FINAL", "RESOLVED")
+    second = our_enter(rig, "ACCEPTED", "SUBMITTED", now=NOW + dt.timedelta(seconds=30),
+                       opportunity=SignalOpportunity("sig-" + "6" * 32, 12, "orb", AAPL, "BUY", 0.7, NOW, NOW))
+    evidence["reply"] = broker(entry_row(first, status="Cancelled"))
+    assert (await rig.engine.on_exit_signal(rig.signal(SELL))).note == "EXIT_WAITING_FOR_ENTRY"
+    evidence["reply"] = broker(entry_row(first, status="Cancelled"), entry_row(second, status="Inactive"))
+    assert (await rig.engine.on_exit_signal(rig.signal(SELL))).note == "ENTRY_UNFILLED"
+
+
+@pytest.mark.asyncio
+async def test_a_trader_unreachable_for_evidence_keeps_the_exit_waiting(tmp_path):
+    rig = await with_broker(tmp_path, trader_down())
+    our_enter(rig, "FINAL", "RESOLVED")
+    assert (await rig.engine.on_exit_signal(rig.signal(SELL))).note == "EXIT_WAITING_FOR_ENTRY"
 
 
 @pytest.mark.asyncio

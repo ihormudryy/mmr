@@ -38,10 +38,9 @@ from trader.automation.calendar_policy import XNYSCalendarPolicy
 logger = logging.getLogger(__name__)
 CONFIG_REFUSALS = frozenset({"ROLE_UNKNOWN", "PRICE_UNAVAILABLE", "OUTPUT_LIMIT_ABOVE_ROLE"})
 FLATTEN_ET = dt.time(15, 45)
-# SP1 cancels the unfilled rest of an AI entry at the entry cutoff; this covers that cancel landing and the
-# fill reaching the trips read (PR #86 thread 4211394337).
-ENTRY_SETTLE_GRACE = dt.timedelta(minutes=5)
 NEVER_SENT_STATES = frozenset({"ABANDONED", "NOT_ADMITTED", "FAILED"})
+ENTRY_DONE_STATUSES = frozenset({"Filled", "Cancelled", "ApiCancelled", "Inactive"})   # ib_async DoneStates
+WORKING, FILLED, ENDED_UNFILLED = "WORKING", "FILLED", "ENDED_UNFILLED"
 
 
 class RoleHealth:
@@ -238,9 +237,10 @@ class PaperDecisionEngine:
 
     async def on_exit_signal(self, ctx: SignalContext) -> EngineResult:
         opportunity = ctx.opportunity
-        held = await self._held_conids(ctx.experiment.experiment_id)
+        trips = await self._trips(ctx.experiment.experiment_id)
+        held = None if trips is None else frozenset(p.conid for p in owned_positions_from_trips(trips))
         if held is not None and opportunity.conid not in held:
-            return await self._exit_before_any_fill(ctx)
+            return await self._exit_before_any_fill(ctx, trips)
         digest = evidence_digest({"v": "exit_signal.v1", "opportunity_id": opportunity.opportunity_id,
                                   "conid": opportunity.conid, "signal_time": opportunity.signal_time.isoformat(),
                                   "held_known": held is not None})
@@ -248,38 +248,70 @@ class PaperDecisionEngine:
                                  side="SELL", decider="strategy", evidence_digest=digest)
         return EngineResult(decisions=(close,), note="EXIT_SIGNAL" if held is not None else "EXIT_SIGNAL_TRIPS_UNKNOWN")
 
-    async def _exit_before_any_fill(self, ctx: SignalContext) -> EngineResult:
-        """Nothing is held. If our own entry in this conid may still fill, the exit waits for it (never a close
-        for shares not held) until the entry is settled: SP1 cancels its unfilled rest at the entry cutoff."""
-        if not await self._entry_may_fill(ctx.opportunity.conid, ctx.now):
+    async def _exit_before_any_fill(self, ctx: SignalContext, trips: dict) -> EngineResult:
+        """Nothing is held. While any of our entries in this conid may still fill, the exit waits (never a close
+        for shares not held). It ends only on broker proof: every such entry ended with zero fill, or its fill
+        reached a trip (held: closed above; already closed: nothing to do). No clock deadline ends it here; the
+        controller's backstop after ``wait_until`` is a loud incident, never NOT_HELD (PR #86 4211898491)."""
+        conid = ctx.opportunity.conid
+        entries = await self._fillable_entries(conid, ctx.now)
+        if not entries:
             return EngineResult(note="NOT_HELD")
-        schedule = self._calendar.resolve(ctx.now)
-        settled_by = None if schedule is None else schedule.entry_cutoff_utc + ENTRY_SETTLE_GRACE
-        if settled_by is None or ctx.now >= settled_by:
-            return EngineResult(note="ENTRY_UNFILLED")
-        return EngineResult(note="EXIT_WAITING_FOR_ENTRY", wait_until=settled_by)
+        states = await self._entry_states(conid, entries)
+        if states is None or WORKING in states.values():
+            return EngineResult(note="EXIT_WAITING_FOR_ENTRY", wait_until=self._wait_backstop(ctx.now))
+        projected = {trip.get("decision_id") for trip in trips["trips"]}
+        filled = [decision_id for decision_id, state in states.items() if state == FILLED]
+        if any(decision_id not in projected for decision_id in filled):
+            return EngineResult(note="EXIT_WAITING_FOR_FILL", wait_until=self._wait_backstop(ctx.now))
+        return EngineResult(note="ENTRY_FILLED_AND_CLOSED" if filled else "ENTRY_UNFILLED")
 
-    async def _entry_may_fill(self, conid: int, now: dt.datetime) -> bool:
-        """Our latest ENTER of this conid today, unless it provably never reached the broker as an order."""
+    async def _fillable_entries(self, conid: int, now: dt.datetime) -> tuple[str, ...]:
+        """Every ENTER of ours in this conid this session that may have become an order (PR #86 4211895474):
+        a newer refused entry never hides an older working one."""
         schedule = self._calendar.resolve(now)
         since = now - dt.timedelta(days=1) if schedule is None else schedule.open_utc - dt.timedelta(hours=1)
         rows = await self._store.aquery(
-            "SELECT state, receipt_state, error_code, body_json FROM ai_submissions WHERE action = 'ENTER' "
-            "AND created_at >= ? ORDER BY created_at DESC", [since])
-        for state, receipt_state, error_code, body_json in rows:
-            if json.loads(body_json).get("conid") != conid:
+            "SELECT decision_id, state, receipt_state, error_code, body_json FROM ai_submissions "
+            "WHERE action = 'ENTER' AND created_at >= ? ORDER BY created_at", [since])
+        fillable = []
+        for decision_id, state, receipt_state, error_code, body_json in rows:
+            if json.loads(body_json).get("conid") != conid or state in NEVER_SENT_STATES:
                 continue
-            if state in NEVER_SENT_STATES:
-                return False
             if state in ("ACCEPTED", "FINAL") and (receipt_state == "REJECTED" or error_code is not None):
-                return False                               # the trader refused it: no order exists
-            return True                                    # PENDING, SENDING, UNKNOWN or an admitted order
-        return False
+                continue                                   # the trader refused it: no order exists
+            fillable.append(decision_id)                   # PENDING, SENDING, UNKNOWN or an admitted order
+        return tuple(fillable)
 
-    async def _held_conids(self, experiment_id: str) -> Optional[frozenset[int]]:
+    async def _entry_states(self, conid: int, entries: tuple[str, ...]) -> Optional[dict[str, str]]:
+        """Each entry's leg from the trader's fenced broker evidence: WORKING (live, partly filled, or not shown
+        yet), FILLED (terminal with a fill) or ENDED_UNFILLED (terminal with zero fill). None if unreadable."""
+        try:
+            evidence = await self._reads.call("get_broker_order_evidence", {"conid": conid})
+        except (RpcNotSent, RpcOutcomeUnknown, RpcRefused) as exc:
+            logger.warning("broker evidence unreadable for a waiting exit (%s); it keeps waiting", exc.code)
+            return None
+        if not isinstance(evidence, dict) or evidence.get("capture_error") or not isinstance(evidence.get("orders"), list):
+            return None
+        states = {}
+        for decision_id in entries:
+            group = f"og-aip-{decision_id}"
+            legs = [o for o in evidence["orders"] if o.get("order_group_id") == group and o.get("leg") == "entry"]
+            ended = bool(legs) and all(o.get("deleted") or o.get("status") in ENTRY_DONE_STATUSES for o in legs)
+            filled = any(float(o.get("filled_quantity") or 0.0) > 0 for o in legs)
+            states[decision_id] = (FILLED if filled else ENDED_UNFILLED) if ended else WORKING
+        return states
+
+    def _wait_backstop(self, now: dt.datetime) -> dt.datetime:
+        """The session close: every DAY entry order has ended by then. Past it the controller raises an incident."""
+        schedule = self._calendar.resolve(now)
+        return now + dt.timedelta(hours=1) if schedule is None else schedule.close_utc
+
+    async def _trips(self, experiment_id: str) -> Optional[dict]:
         try:
             reply = await self._reads.call("get_experiment_trips", {"experiment_id": experiment_id})
-            return frozenset(position.conid for position in owned_positions_from_trips(reply))
+            owned_positions_from_trips(reply)              # checks the reply's shape
+            return reply
         except (RpcNotSent, RpcOutcomeUnknown, RpcRefused, ValueError) as exc:
             logger.warning("owned positions unreadable for an exit signal (%s); the trader proves ownership", exc)
             return None

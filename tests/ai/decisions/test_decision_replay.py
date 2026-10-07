@@ -68,7 +68,6 @@ async def test_a_changed_config_or_prompt_is_never_complete(tmp_path, monkeypatc
     result = await replay_decision(rig.store, decision_id, config=shorter)
     assert (result.status, result.missing) == (INCOMPLETE, ("config_mismatch",))      # PR #86 4211394935
     monkeypatch.setattr("trader.ai.roles.JEV_SYSTEM", "[JEV_ENTRY_RULING] a changed prompt")   # code, same config
-    monkeypatch.setenv("MMR_CODE_VERSION", recorded_code_version(rig.store, decision_id))
     result = await replay_decision(rig.store, decision_id, config=rig.config)
     assert result.status == INCOMPLETE and result.missing[0].startswith("request_changed:")
 
@@ -96,14 +95,68 @@ async def test_a_changed_config_is_incomplete_even_when_the_verdict_would_match(
     assert same.status == COMPLETE and same.value["outcome"] == "TAKE"
 
 
+@pytest.fixture
+def judgment_code(tmp_path, monkeypatch):
+    """A copy of the judgment source the code identity is computed from (same package version throughout)."""
+    import shutil
+
+    import trader.ai.tools as tools
+    root = tmp_path / "code"
+    copies = []
+    for source in tools.JUDGMENT_SOURCES:
+        target = root / source.relative_to(tools.TRADER_ROOT)
+        if source.is_dir():
+            shutil.copytree(source, target, ignore=shutil.ignore_patterns("__pycache__"))
+        else:
+            target.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copy2(source, target)
+        copies.append(target)
+    monkeypatch.setattr(tools, "JUDGMENT_SOURCES", tuple(copies))
+    monkeypatch.setattr(tools, "TRADER_ROOT", root)
+    tools.code_version.cache_clear()
+    yield root
+    tools.code_version.cache_clear()
+
+
 @pytest.mark.asyncio
-async def test_a_changed_code_version_is_incomplete(tmp_path, no_network, monkeypatch):
+async def test_same_package_version_different_judgment_code_is_a_code_mismatch(tmp_path, no_network, judgment_code):
+    import importlib.metadata
+
+    import trader.ai.tools as tools
+    rig = await started(tmp_path)                                    # PR #86 thread 4211895936
+    rig.jev.script(JEV_MARKER, ruling())
+    await rig.engine.on_entry_signal(rig.signal())
+    recorded = recorded_code_version(rig.store, DECISION_ID)
+    assert recorded.startswith("src-sha256:") and recorded == tools.code_version()
+    version = importlib.metadata.version("mmr")
+    roles = judgment_code / "ai" / "roles.py"
+    roles.write_text(roles.read_text().replace("You are Jev", "You are Jev, strict"))   # judgment code changed
+    tools.code_version.cache_clear()                                 # a new process on the changed code
+    result = await replay_decision(rig.store, DECISION_ID, config=rig.config)
+    assert (result.status, result.missing) == (INCOMPLETE, ("code_mismatch",))
+    assert importlib.metadata.version("mmr") == version              # the package version did not move
+
+
+@pytest.mark.asyncio
+async def test_the_container_digest_is_part_of_the_code_identity(tmp_path, no_network, judgment_code, monkeypatch):
+    import trader.ai.tools as tools
     rig = await started(tmp_path)
     rig.jev.script(JEV_MARKER, ruling())
     await rig.engine.on_entry_signal(rig.signal())
-    monkeypatch.setenv("MMR_CODE_VERSION", recorded_code_version(rig.store, DECISION_ID) + "-changed")
+    monkeypatch.setenv("MMR_CONTAINER_DIGEST", "sha256:" + "c" * 64)
+    tools.code_version.cache_clear()
     result = await replay_decision(rig.store, DECISION_ID, config=rig.config)
     assert (result.status, result.missing) == (INCOMPLETE, ("code_mismatch",))
+
+
+def test_the_code_identity_is_the_source_content(tmp_path):
+    from trader.ai.tools import source_digest
+    (tmp_path / "a").mkdir()
+    (tmp_path / "a" / "x.py").write_text("A = 1\n")
+    first = source_digest((tmp_path / "a",), root=tmp_path)
+    assert first == source_digest((tmp_path / "a",), root=tmp_path)
+    (tmp_path / "a" / "x.py").write_text("A = 2\n")
+    assert source_digest((tmp_path / "a",), root=tmp_path) != first
 
 
 @pytest.mark.asyncio

@@ -3215,7 +3215,7 @@ def _handle_experiment_acceptance(mmr: MMR, args: argparse.Namespace, *, now=Non
             outcome = runner.finish(mmr.acceptance_endpoints(), run_id=args.run_id, report_path=args.report,
                                     signing_key=args.signing_key, now=clock, sleep=pause)
             _print_acceptance_results('finish', outcome)
-            ok = all(r.passed for r in outcome.results)
+            ok = outcome.passed                      # the signed report's verdict, not the end checks alone
         elif action == 'status':
             result = runner.status(args.run_id)
             if _json_mode:

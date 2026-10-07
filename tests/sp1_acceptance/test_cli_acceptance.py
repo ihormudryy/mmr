@@ -157,6 +157,7 @@ def test_run_and_finish_end_to_end_over_the_cli(served_with_keys, cli, signing_k
     finish = _json(out)
     assert all(r["passed"] for r in finish["results"]), finish
     assert finish["passed"] is False                     # synthetic evidence never makes a passing session
+    assert cli.code == 1                                 # ... so finish exits 1 although every end check passed
     report = tmp_path / "acceptance" / run_id / "finish-report.json"
     loaded = json.loads(report.read_text())
     assert (loaded["evidence_source"], loaded["signing_key"], loaded["oca_shrink"]) == (
@@ -195,3 +196,21 @@ def test_status_reads_the_local_journal_only(tmp_path, monkeypatch, capsys):
     args = build_parser().parse_args("experiment acceptance status --run-id acc-20260717-abcdef".split())
     mmr_cli._handle_experiment_acceptance(object(), args)                  # no SDK method is ever called
     assert "[PASS] preflight" in capsys.readouterr().out
+
+
+@pytest.mark.parametrize("report_passed,code", [(False, 1), (True, 0)])
+def test_finish_exit_status_follows_the_signed_report(monkeypatch, capsys, report_passed, code):   # review #35
+    from trader.acceptance import runner
+    from trader.acceptance.scenario import END_CHECKS, StepResult
+    checks = [StepResult(name, True, None, {}) for name in END_CHECKS]       # every end check passed
+    monkeypatch.setattr(runner, "finish", lambda *a, **k: runner.RunOutcome(
+        checks, "finish-report.json", "acc-20260717-abcdef", False, report_passed))
+    sdk = type("Sdk", (), {"acceptance_endpoints": lambda self: None})()
+    args = build_parser().parse_args("experiment acceptance finish --run-id acc-20260717-abcdef "
+                                     "--signing-key k".split())
+    try:
+        mmr_cli._handle_experiment_acceptance(sdk, args)
+        exit_code = 0
+    except SystemExit as exc:
+        exit_code = exc.code
+    assert exit_code == code

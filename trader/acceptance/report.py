@@ -3,7 +3,7 @@
 It follows ``FaultDrillReport`` (scripts/automation_fault_drill.py): canonical
 JSON, an Ed25519 signature over every field but the signature itself, and the
 commit and config digests. ``passed`` is computed, never set by a caller: every
-step and end check passed, the live OCA shrink is ``PROVEN`` on ``ib_paper``
+named step and end check of the phase is present once and passed, the live OCA shrink is ``PROVEN`` on ``ib_paper``
 evidence, and an operator key signed it.
 """
 from __future__ import annotations
@@ -16,6 +16,8 @@ import subprocess
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from typing import Any, Iterable, Optional
+
+from trader.acceptance.scenario import END_CHECKS, RUN_STEPS
 
 REPORT_KIND = "sp1_acceptance"
 REPORT_VERSION = 1
@@ -41,6 +43,16 @@ def config_digest(path: Optional[Path] = None) -> str:
         return "sha256:" + hashlib.sha256(target.read_bytes()).hexdigest()
     except Exception:
         return "unknown"
+
+
+# Every named step and end check of the phase, each exactly once (review #35).
+REQUIRED_CHECKS = {"run": (RUN_STEPS, ()), "finish": (RUN_STEPS, END_CHECKS)}
+
+
+def _complete_and_passed(checks: list[dict], names: tuple[str, ...]) -> bool:
+    seen = [check.get("name") for check in checks]
+    return (sorted(seen) == sorted(names)
+            and all(check.get("passed") is True for check in checks))
 
 
 @dataclass
@@ -75,8 +87,10 @@ class AcceptanceReport:
         self.passed = self.compute_passed()
 
     def compute_passed(self) -> bool:
-        checks = list(self.steps) + list(self.end_checks)
-        return (bool(checks) and all(c.get("passed") is True for c in checks)
+        required = REQUIRED_CHECKS.get(self.phase)
+        return (required is not None
+                and _complete_and_passed(self.steps, required[0])
+                and _complete_and_passed(self.end_checks, required[1])
                 and self.oca_shrink == "PROVEN" and self.evidence_source == "ib_paper"
                 and self.signing_key == "operator" and self.live_restart_recovery == "NOT_PROVEN"
                 and self.deployment_record == "harness_fixture")

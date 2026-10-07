@@ -27,6 +27,8 @@ RUN_STEPS = ("preflight", "register", "publish", "enter_a", "enter_b", "partial_
 END_CHECKS = ("session_flat", "equity_row_flat", "no_positions_or_orders", "round_trips", "oca_shrink",
               "no_incidents")
 WORKING = ("Submitted", "PreSubmitted")
+# Only these prove an order can no longer fill; any other status, unknown ones included, blocks "flat".
+TERMINAL = frozenset({"Filled", "Cancelled", "ApiCancelled", "Inactive"})
 DECISION_TTL = dt.timedelta(minutes=10)
 FINISH_TIMEOUT_SECONDS = 1200.0
 DECIDER = "acceptance_harness"
@@ -611,7 +613,7 @@ class AcceptanceScenario:
         evidence = self.port.evidence(None)
         positions = [r for r in self.port.supervisor("get_positions", {}).get("positions") or []
                      if float(r.get("position") or 0.0)]
-        working = [o for o in evidence.get("orders") or [] if o.get("status") in WORKING]
+        working = [o for o in evidence.get("orders") or [] if _may_still_fill(o)]
         if evidence.get("capture_error") or positions or working:
             raise StepFailure("NOT_FLAT", {"positions": positions, "working_orders": working,
                                            "capture_error": evidence.get("capture_error")})
@@ -644,6 +646,11 @@ class AcceptanceScenario:
         if incidents:
             raise StepFailure("INCIDENTS_RECORDED", {"incidents": incidents})
         return StepResult("no_incidents", True, None, {})
+
+
+def _may_still_fill(order: dict) -> bool:
+    """A row the broker no longer lists as open (deleted) or with a terminal status cannot fill."""
+    return order.get("deleted") is not True and order.get("status") not in TERMINAL
 
 
 def with_run_id(settings: AcceptanceSettings, run_id: str) -> AcceptanceSettings:

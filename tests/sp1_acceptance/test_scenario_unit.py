@@ -15,7 +15,7 @@ from tests.sp1_acceptance.fakes import AAPL, MSFT, NOW
 from trader.acceptance.journal import JournalError, RunJournal
 from trader.acceptance.report import AcceptanceReport, build_report
 from trader.acceptance.resume import validate_resume
-from trader.acceptance.scenario import AcceptanceScenario, decision_id
+from trader.acceptance.scenario import END_CHECKS, RUN_STEPS, AcceptanceScenario, decision_id
 
 ROOT = Path(__file__).resolve().parents[2]
 
@@ -223,9 +223,12 @@ def test_journal_refuses_a_symlink(tmp_path):
         RunJournal(tmp_path / "acc-2")
 
 
+def _passed(*names):
+    return [{"name": name, "passed": True, "code": None, "evidence": {}} for name in names]
+
+
 def _passing_report(**changes):
-    steps = [{"name": "enter_a", "passed": True, "code": None, "evidence": {}}]
-    fields = dict(steps=steps, oca_shrink="PROVEN", evidence_source="ib_paper")
+    fields = dict(steps=_passed(*RUN_STEPS), oca_shrink="PROVEN", evidence_source="ib_paper")
     fields.update(changes)
     return build_report(**fields)
 
@@ -264,6 +267,50 @@ def test_a_report_passes_only_with_a_live_proven_shrink_and_every_step(change):
     report = _passing_report(**change)
     report.sign(AttestationSigner.generate(), key_source="operator")
     assert report.passed is False
+
+
+def _operator_signed(**fields):
+    from trader.research.signing import AttestationSigner
+    report = _passing_report(**fields)
+    report.sign(AttestationSigner.generate(), key_source="operator")
+    return report
+
+
+@pytest.mark.parametrize("fields", [
+    {"phase": "run", "steps": _passed("shrink_proof")},                                  # review #35 probe
+    {"phase": "run", "steps": _passed(*RUN_STEPS[:-1])},                                # settle_s missing
+    {"phase": "run", "steps": _passed(*RUN_STEPS) + _passed("enter_a")},                # a step twice
+    {"phase": "run", "steps": _passed(*RUN_STEPS), "end_checks": _passed(*END_CHECKS)},  # a run has no end checks
+    {"phase": "finish", "steps": _passed(*RUN_STEPS)},                                   # no end checks
+    {"phase": "finish", "steps": _passed(*RUN_STEPS), "end_checks": _passed(*END_CHECKS[:-1])},
+    {"phase": "finish", "steps": _passed(*RUN_STEPS[1:]), "end_checks": _passed(*END_CHECKS)},
+    {"phase": "other", "steps": _passed(*RUN_STEPS), "end_checks": _passed(*END_CHECKS)}])
+def test_an_incomplete_report_never_passes(fields):
+    assert _operator_signed(**fields).passed is False
+
+
+@pytest.mark.parametrize("fields", [
+    {"phase": "run", "steps": _passed(*RUN_STEPS)},
+    {"phase": "finish", "steps": _passed(*reversed(RUN_STEPS)), "end_checks": _passed(*END_CHECKS)}])
+def test_a_complete_report_of_its_phase_passes(fields):
+    assert _operator_signed(**fields).passed is True
+
+
+@pytest.mark.parametrize("status", ["PendingCancel", "PendingSubmit", "ApiPending", "Submitted", "PreSubmitted",
+                                    None, "SomethingNew"])
+def test_a_not_terminal_order_on_a_flat_account_is_not_flat(fake_port, settings, journal, status):   # review #35
+    fake_port.orders.append(fake_port._row(AAPL, "stop", 3, group="og-x", status=status))
+    scenario = AcceptanceScenario(fake_port, settings, journal)
+    result = scenario._guarded("no_positions_or_orders", scenario._check_no_positions_or_orders)
+    assert (result.passed, result.code) == (False, "NOT_FLAT")
+
+
+@pytest.mark.parametrize("status,deleted", [("Filled", False), ("Cancelled", False), ("ApiCancelled", False),
+                                            ("Inactive", False), ("PendingCancel", True)])
+def test_broker_proven_terminal_orders_are_flat(fake_port, settings, journal, status, deleted):
+    fake_port.orders.append({**fake_port._row(AAPL, "stop", 3, group="og-x", status=status), "deleted": deleted})
+    scenario = AcceptanceScenario(fake_port, settings, journal)
+    assert scenario._guarded("no_positions_or_orders", scenario._check_no_positions_or_orders).passed is True
 
 
 def test_a_synthetic_proven_never_marks_the_real_session_accepted():

@@ -114,7 +114,7 @@ async def test_missing_attempt_and_missing_clock_are_incomplete(decided, no_netw
     nothing = ReplaySession(ReplayEvidence.load(world.store, "never-recorded"))
     assert nothing.run(lambda replay: replay.tool_result("quote", {"conid": 1})).status == INCOMPLETE
     assert nothing.evidence.manifest is None and nothing.evidence.attempts == {}
-    assert nothing.run(lambda replay: replay.clock.now()).missing == ("clock_value#1",)
+    assert nothing.run(lambda replay: replay.clock.now()).missing == ("clock_value#1", "manifest")
 
 
 @pytest.mark.asyncio
@@ -151,6 +151,7 @@ async def test_recorded_failures_replay_as_failures_and_unknown_stays_unknown(tm
         await world.gateway.call("jev", request("dec-2/jev/1", "judge"), world.gateway.new_deadline())  # second attempt
     world.jev.respond = None
     live = await world.gateway.call("jev", request("dec-2/jev/1", "judge"), world.gateway.new_deadline())  # third
+    await ReplayRecorder(world.store).record_manifest("dec-2", code_version="v1", config_digest=world.config.digest())
 
     async def replayed(replay: ReplaySession):
         outcomes = []
@@ -185,3 +186,26 @@ async def test_a_tool_result_that_is_not_plain_json_is_refused_when_recorded(sto
     session = ReplaySession(ReplayEvidence.load(store, "dec-3"))
     assert session.tool_result("quote", {"conid": 2}) == {"last": 2.5}
     assert session.tool_result("quote", {"conid": 1}) == {"last": 1.5}
+
+
+@pytest.mark.asyncio
+async def test_a_decision_with_no_recorded_manifest_is_incomplete_never_complete(tmp_path, clock):
+    world = World(tmp_path, clock)
+    await world.start()
+    for decision in ("never-recorded", "no-manifest"):
+        if decision == "no-manifest":
+            await world.gateway.call("jev", request("no-manifest/jev/1", "judge"), world.gateway.new_deadline())
+        session = ReplaySession(ReplayEvidence.load(world.store, decision))
+
+        async def decide(replay: ReplaySession):
+            if decision == "no-manifest":
+                return await replay.gateway.call("jev", request("no-manifest/jev/1", "judge"),
+                                                 replay.gateway.new_deadline())
+            return "nothing was read"
+
+        result = await session.arun(decide)
+        assert (result.status, result.missing, result.value) == (INCOMPLETE, ("manifest",), None)
+        assert session.run(lambda replay: 1).status == INCOMPLETE
+    await ReplayRecorder(world.store).record_manifest("no-manifest", code_version="v1", config_digest="d")
+    complete = await ReplaySession(ReplayEvidence.load(world.store, "no-manifest")).arun(decide)
+    assert complete.status == COMPLETE and complete.missing == ()

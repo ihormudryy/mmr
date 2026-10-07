@@ -310,17 +310,25 @@ class ReplaySession:
         self._tool_cursor[(tool, args_sha)] = ordinal
         return result
 
+    def _result(self, value: Any, missing: tuple[str, ...]) -> ReplayResult:
+        """A decision with no recorded manifest (code and config versions) is never COMPLETE."""
+        if self.evidence.manifest is None:
+            missing = missing + ("manifest",)
+        if missing:
+            return ReplayResult(INCOMPLETE, missing=missing)
+        return ReplayResult(COMPLETE, value)
+
     def run(self, work: Callable[["ReplaySession"], Any]) -> ReplayResult:
         try:
-            return ReplayResult(COMPLETE, work(self))
+            return self._result(work(self), ())
         except ReplayIncomplete as incomplete:
-            return ReplayResult(INCOMPLETE, missing=(incomplete.missing,))
+            return self._result(None, (incomplete.missing,))
 
     async def arun(self, work: Callable[["ReplaySession"], Awaitable[Any]]) -> ReplayResult:
         try:
-            return ReplayResult(COMPLETE, await work(self))
+            return self._result(await work(self), ())
         except ReplayIncomplete as incomplete:
-            return ReplayResult(INCOMPLETE, missing=(incomplete.missing,))
+            return self._result(None, (incomplete.missing,))
 
     def assert_no_external_calls(self) -> None:
         if self.counter.total:

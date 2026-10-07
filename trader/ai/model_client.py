@@ -16,6 +16,7 @@ it; replay does.
 """
 from __future__ import annotations
 import asyncio
+import functools
 import math
 from collections.abc import Mapping
 from dataclasses import dataclass
@@ -330,6 +331,18 @@ class BedrockAdapter:
             raise ValueError("model_id is required")
         self.model_id = model_id
         self._converse = converse
+        self._workers: dict[str, asyncio.Future] = {}
+
+    def pending_work(self, attempt_key: str) -> Optional[asyncio.Future]:
+        """The worker thread of an abandoned call, while it still runs. The gateway keeps the
+        in-flight slot until it ends, so a hung thread still counts toward the limit."""
+        worker = self._workers.get(attempt_key)
+        return worker if worker is not None and not worker.done() else None
+
+    def _forget_worker(self, attempt_key: str, worker: asyncio.Future) -> None:
+        worker.cancelled() or worker.exception()  # mark the outcome as seen: the caller may be gone
+        if self._workers.get(attempt_key) is worker:
+            del self._workers[attempt_key]
 
     def __repr__(self) -> str:
         return f"BedrockAdapter(model_id={self.model_id!r})"
@@ -344,8 +357,12 @@ class BedrockAdapter:
         }
         if system:
             arguments["system"] = system
+        key = request.attempt_key or request.request_key
+        worker = asyncio.get_running_loop().run_in_executor(None, functools.partial(self._converse, **arguments))
+        self._workers[key] = worker
+        worker.add_done_callback(lambda done: self._forget_worker(key, done))
         try:
-            raw = await asyncio.to_thread(self._converse, **arguments)
+            raw = await asyncio.shield(worker)  # a cancelled caller must not hide the running thread
         except Exception as exc:
             raise classify_botocore_error(exc) from None
         return self._parse(raw)

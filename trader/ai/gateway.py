@@ -137,7 +137,17 @@ class ModelGateway:
         try:
             return await self._send_and_settle(client, role_config, price, request, begun, deadline)
         finally:
+            self._release_slot_when_idle(client, begun.attempt.attempt_key)
+
+    def _release_slot_when_idle(self, client: ModelClient, attempt_key: str) -> None:
+        """A call abandoned by timeout or cancel may still have a worker thread (Bedrock). That thread
+        keeps the slot until it really ends, so the in-flight limit counts real concurrency."""
+        pending = getattr(client, "pending_work", None)
+        worker = pending(attempt_key) if pending is not None else None
+        if worker is None:
             self._slots.release()
+        else:
+            worker.add_done_callback(lambda _done: self._slots.release())
 
     def _prepare(self, role: str, request: ModelRequest) -> tuple[RoleConfig, ModelClient, ModelPrice]:
         if role not in ROLE_NAMES:
@@ -166,7 +176,7 @@ class ModelGateway:
             except TimeoutError:
                 raise CallRefused("IN_FLIGHT_LIMIT_DEADLINE", f"at most {self.config.budget.max_in_flight} calls at once") from None
             try:
-                return await self._reserve_and_begin(role, role_config, request, worst_case)
+                return await self._reserve_and_begin_shielded(role, role_config, request, worst_case)
             except HourlyLimitReached as limit:
                 self._slots.release()
                 if limit.retry_after_seconds > deadline.remaining():
@@ -181,6 +191,24 @@ class ModelGateway:
             except BaseException:
                 self._slots.release()
                 raise
+
+    async def _reserve_and_begin_shielded(self, role: str, role_config: RoleConfig, request: ModelRequest,
+                                          worst_case: int) -> _Begun:
+        """The reserve + journal transaction runs in a worker thread and cannot be interrupted. If the
+        caller is cancelled meanwhile, wait for it to commit, then undo it: nothing was sent."""
+        work = asyncio.ensure_future(self._reserve_and_begin(role, role_config, request, worst_case))
+        try:
+            return await asyncio.shield(work)
+        except asyncio.CancelledError:
+            await asyncio.shield(self._undo_unsent(work))
+            raise
+
+    async def _undo_unsent(self, work: "asyncio.Future[_Begun]") -> None:
+        try:
+            begun = await work
+        except Exception:
+            return  # refused or failed before anything was written
+        await self._record_failure(begun, NotSentError("CALLER_CANCELLED_BEFORE_SEND"))
 
     async def _reserve_and_begin(self, role: str, role_config: RoleConfig, request: ModelRequest,
                                  worst_case: int) -> _Begun:

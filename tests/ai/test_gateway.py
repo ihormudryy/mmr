@@ -1,4 +1,6 @@
 import asyncio
+import threading
+import time
 from datetime import datetime, timezone
 import httpx
 import pytest
@@ -6,11 +8,13 @@ import pytest_asyncio
 from tests.ai.fakes import (
     JEV_WORST_CASE_MICROS, ORCHESTRATOR_WORST_CASE_MICROS,
 )
+from tests.ai.fakes import FakeProvider, load_test_config
 from tests.ai.world import World, request
 from trader.ai.budget import next_window_start
 from trader.ai.config import AiConfigError, usd_to_micros_floor
 from trader.ai.gateway import CallFailed, CallRefused, ModelGateway, build_gateway
-from trader.ai.model_client import Usage
+from trader.ai.model_client import BedrockAdapter, Usage
+from trader.ai.store import AiStore
 
 
 SECRET = "sk-test-key-0001"
@@ -292,3 +296,71 @@ async def test_credentials_never_reach_the_database(world):
     for table in tables:
         dump = str(world.rows(f"SELECT * FROM {table}"))
         assert SECRET not in dump and "Bearer" not in dump
+
+
+@pytest.mark.asyncio
+async def test_a_hung_bedrock_thread_keeps_its_gateway_slot_until_it_returns(tmp_path, clock):
+    config = load_test_config(tmp_path, orchestrator_backend="bedrock", call_timeout="0.05")
+    release = threading.Event()
+    lock = threading.Lock()
+    seen = {"running": 0, "max_running": 0, "started": 0}
+
+    def converse(**arguments):
+        with lock:
+            seen["running"] += 1
+            seen["started"] += 1
+            seen["max_running"] = max(seen["max_running"], seen["running"])
+        try:
+            release.wait(15)
+        finally:
+            with lock:
+                seen["running"] -= 1
+        return {"output": {"message": {"role": "assistant", "content": [{"text": "done"}]}},
+                "usage": {"inputTokens": 11, "outputTokens": 3}, "stopReason": "end_turn"}
+
+    gateway = ModelGateway(
+        config=config, store=AiStore(tmp_path / "ai.duckdb", clock=clock), clock=clock,
+        clients={"orchestrator": BedrockAdapter(model_id="vendor/orch-1", converse=converse),
+                 "jev": FakeProvider(clock=clock, model="vendor/jev-1").adapter("vendor/jev-1")})
+    await gateway.start()
+    await gateway.budget.set_cap(usd_to_micros_floor(2000))
+    tasks = [asyncio.create_task(gateway.call("orchestrator", request(f"d/o/{i}"), gateway.new_deadline()))
+             for i in range(5)]
+    try:
+        await asyncio.sleep(0.8)  # the first two calls time out; their threads are still hanging
+        assert (seen["started"], seen["running"]) == (2, 2)
+        assert [t.done() for t in tasks] == [True, True, False, False, False]
+        assert all(isinstance(t.exception(), CallFailed) for t in tasks[:2])
+    finally:
+        release.set()
+    results = await asyncio.gather(*tasks, return_exceptions=True)
+    assert [type(r).__name__ for r in results[:2]] == ["CallFailed", "CallFailed"]
+    assert all(r.response.text == "done" for r in results[2:])
+    assert seen["max_running"] == 2 and seen["started"] == 5
+    follow_up = await gateway.call("orchestrator", request("d/o/9"), gateway.new_deadline())
+    assert follow_up.response.text == "done"  # every slot came back
+
+
+@pytest.mark.asyncio
+async def test_cancelling_before_the_call_is_sent_leaves_nothing_open(world, monkeypatch):
+    real_reserve = world.gateway.budget.reserve_in_tx
+
+    def slow_reserve(*args, **kwargs):
+        time.sleep(0.3)  # the reservation transaction is running in its worker thread
+        return real_reserve(*args, **kwargs)
+
+    monkeypatch.setattr(world.gateway.budget, "reserve_in_tx", slow_reserve)
+    task = asyncio.create_task(world.gateway.call("orchestrator", request(), world.gateway.new_deadline()))
+    await asyncio.sleep(0.1)
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+    assert world.rows("SELECT status, error_code FROM ai_model_attempts") == [("NOT_SENT", "CALLER_CANCELLED_BEFORE_SEND")]
+    assert world.rows("SELECT state, release_reason FROM ai_budget_reservations") == [("RELEASED", "NOT_SENT")]
+    snapshot = await world.gateway.budget.snapshot()
+    assert (snapshot.committed_micros, snapshot.open_reservations, snapshot.unknown_reservations) == (0, 0, 0)
+    assert world.rows("SELECT kind, cost_micros FROM ai_cost_events") == [("NONE", 0)]
+    assert world.orchestrator.requests == []
+    monkeypatch.undo()
+    follow_up = await world.gateway.call("jev", request("d/j/1"), world.gateway.new_deadline())  # the slot was freed
+    assert follow_up.response.text

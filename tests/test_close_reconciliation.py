@@ -165,6 +165,18 @@ def test_bracket_entry_without_a_close_root_is_left_alone(env):
     assert env.reconciler.reconcile_once("buy-1", NOW).resolved is False
 
 
+def test_buy_with_a_close_root_follows_the_root_not_its_entry_orders(env):
+    """A BUY whose protective saga failed into a flatten resolves from that root, not from #60's entry rule."""
+    working_entry = SimpleNamespace(status="Submitted", filled_quantity=0.0, leg="entry")
+    env.reconciler._orders = SimpleNamespace(find_by_order_ref=lambda *a: [working_entry],
+                                             enumeration_complete=lambda: True)
+    _root(env, "buy-2", "VERIFYING", scope="account", goal="account")
+    _join(env, "buy-2", "buy-2", "account", outcome="CLAIMED")
+    _command(env, "buy-2")
+    assert env.reconciler.reconcile_once("buy-2", NOW).resolved is False
+    assert _state(env, "buy-2") == "OUTCOME_UNKNOWN"
+
+
 def test_joined_flatten_command_resolves_from_its_root(env):
     _root(env, "session-flatten-1", "FLAT", scope="account")
     _join(env, "flatten-ui-1", "session-flatten-1", "account", outcome="JOINED_FLATTEN")

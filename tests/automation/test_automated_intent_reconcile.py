@@ -105,6 +105,24 @@ def test_an_unreadable_order_status_stays_unresolved(submitted_buy):
     assert submitted_buy.ledger.get(submitted_buy.command_id).state == "SUBMITTED"
 
 
+def test_a_row_with_an_unknown_status_is_never_rejected(submitted_buy):
+    orders = BrokerOrders([order("BrokerStatusNotParsed"), order("Cancelled", leg="stop")], complete=True)
+    assert not reconcile(submitted_buy, orders).resolved
+    assert submitted_buy.ledger.get(submitted_buy.command_id).state == "SUBMITTED"
+
+
+def test_a_working_exit_leg_does_not_resolve_an_inactive_entry(submitted_buy):
+    orders = BrokerOrders([order("Inactive"), order("Submitted", leg="stop")])
+    assert not reconcile(submitted_buy, orders).resolved
+    assert submitted_buy.ledger.get(submitted_buy.command_id).state == "SUBMITTED"
+
+
+def test_exit_legs_alone_never_resolve_the_buy(submitted_buy):
+    orders = BrokerOrders([order("Submitted", leg="stop"), order("PreSubmitted", leg="take_profit")])
+    assert not reconcile(submitted_buy, orders).resolved
+    assert submitted_buy.ledger.get(submitted_buy.command_id).state == "SUBMITTED"
+
+
 def test_a_resolved_buy_no_longer_blocks_later_checks(submitted_buy):
     assert [r.command_id for r in submitted_buy.ledger.unresolved_for_account(ACCOUNT)] == [submitted_buy.command_id]
     reconcile(submitted_buy, BrokerOrders([order("Submitted")]))

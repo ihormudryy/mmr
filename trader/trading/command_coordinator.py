@@ -1761,6 +1761,9 @@ _ACTIVE_ORDER_STATUSES = frozenset({
 })
 
 
+_KNOWN_TERMINAL_ORDER_STATUSES = frozenset({"Filled", "Cancelled", "ApiCancelled", "Inactive"})
+
+
 def _is_terminal_order(order: BrokerOrderRow) -> bool:
     return order.deleted or order.status not in _ACTIVE_ORDER_STATUSES
 
@@ -2761,35 +2764,40 @@ class OutcomeReconciler:
 
     def _reconcile_automated_entry(self, row: LedgerRow, now: dt.datetime) -> bool:
         """An automated entry dispatches its bracket under ``og-{command_id}``.
-        Resolve from that group's broker rows:
+        Resolve from that group's broker rows, judged by the ENTRY order:
 
-        - any order working or filled -> RESOLVED (the broker has the entry);
-        - every order terminal with nothing filled, on a COMPLETE enumeration
-          -> REJECTED ``BROKER_REJECTED``;
-        - no rows, an unreadable row or an incomplete enumeration -> unresolved.
-        Absence alone never fails the command."""
+        - entry working or filled -> RESOLVED (exit legs alone never resolve it);
+        - entry and every other order in a known terminal status, nothing
+          filled, on a COMPLETE enumeration -> REJECTED ``BROKER_REJECTED``;
+        - no entry row, an unknown or unreadable status, or an incomplete
+          enumeration -> unresolved. Absence alone never fails the command."""
         found = self._orders.find_by_order_ref(
             row.account_id, encode_order_ref(f"og-{row.command_id}"),
         )
-        if not found:
+        entries = [order for order in found if getattr(order, "leg", None) == "entry"]
+        if not entries:
             return False
         statuses = [getattr(order, "status", None) for order in found]
-        if not all(isinstance(status, str) for status in statuses):
+        known = _ACTIVE_ORDER_STATUSES | _KNOWN_TERMINAL_ORDER_STATUSES
+        if not all(status in known for status in statuses):
             return False
         outcome = {
             **(row.outcome or {}),
             "order_group_id": f"og-{row.command_id}",
             "broker_statuses": statuses,
         }
-        has_fill = any(
-            status == "Filled" or (getattr(order, "filled_quantity", 0) or 0) > 0
-            for order, status in zip(found, statuses)
+        entry_accepted = any(
+            order.status in _ACTIVE_ORDER_STATUSES or order.status == "Filled"
+            or (getattr(order, "filled_quantity", 0) or 0) > 0
+            for order in entries
         )
-        is_working = any(status in _ACTIVE_ORDER_STATUSES for status in statuses)
-        if has_fill or is_working:
+        if entry_accepted:
             self._resolve_command_only(row, {**outcome, "broker_acknowledged": True}, now)
             return True
-        if self._orders.enumeration_complete():
+        any_active_or_fill = any(
+            status in _ACTIVE_ORDER_STATUSES or status == "Filled" for status in statuses
+        ) or any((getattr(order, "filled_quantity", 0) or 0) > 0 for order in found)
+        if not any_active_or_fill and self._orders.enumeration_complete():
             self._reject_command_only(
                 row, error_code="BROKER_REJECTED",
                 outcome={**outcome, "broker_acknowledged": False}, now=now,

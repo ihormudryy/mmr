@@ -50,6 +50,7 @@ class EngineDeps:
     reads: ReadOnlySupervisor
     clock: Clock
     recorder: ReplayRecorder
+    store: AiStore
 
 
 def build_engine(deps: EngineDeps) -> DecisionEngine:
@@ -85,7 +86,7 @@ async def serve(settings: ServiceSettings, *, engine_factory: Callable[[EngineDe
         cap_sync = BudgetCapSync(supervisor=clients.supervisor, budget=raw_gateway.budget, clock=clock)
         gateway = CapGatedGateway(raw_gateway, cap_sync)  # no model call without a current owner cap
         engine = engine_factory(EngineDeps(config, gateway, ReadOnlySupervisor(clients.supervisor), clock,
-                                           ReplayRecorder(store)))
+                                           ReplayRecorder(store), store))
         leadership = Leadership(supervisor=clients.supervisor, store=store, clock=clock, holder_id=new_holder_id(),
                                 lease_seconds=cfg.lease_seconds, renew_seconds=cfg.renew_seconds,
                                 held_retry_seconds=cfg.held_retry_seconds)

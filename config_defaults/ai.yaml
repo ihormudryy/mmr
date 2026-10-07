@@ -63,3 +63,26 @@ controller:
   heartbeat_seconds: 10.0
   budget_cap_poll_seconds: 60.0   # how often the owner's cap is read from the trader (trader.yaml)
   heartbeat_path: /tmp/mmr_ai_heartbeat.json
+
+# The decision engine (SP2 Plan 6). Every key is optional; these are the defaults.
+decisions:
+  # The discretionary deployment the operator registered (mmr ai-deployment register-discretionary).
+  # null: no entry cycles (self-found ideas) run.
+  discretionary_deployment_digest: null
+  # One entry per strategy whose BUY signals the bot may follow: its sealed deployment digest
+  # and the bracket around the fresh ask. A BUY of a strategy missing here is not judged.
+  strategies: {}
+  #   orb: {deployment_digest: "sha256:...", stop_fraction: 0.02, target_fraction: 0.04}
+  self_found_bracket: {stop_fraction: 0.02, target_fraction: 0.04}
+  fixed_rule: {version: fixed_rule.v1, stop_fraction: 0.02, target_fraction: 0.04}   # v1 is pinned to these values
+  discovery:
+    movers_top: 10
+    most_actives_top: 10
+    watchlist: []                  # optional owner symbols, e.g. [AAPL, MSFT]
+    news_per_symbol: 2
+    news_symbols_max: 10
+    max_candidates_to_model: 15
+  max_entries_per_cycle: 2
+  quote_max_age_seconds: 15
+  news_chars_per_item: 400
+  role_recheck_seconds: 300        # a role whose provider rejects its model is paused this long

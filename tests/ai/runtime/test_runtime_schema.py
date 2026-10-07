@@ -18,7 +18,7 @@ def test_plan_5_owns_10_to_17():
 def test_migrations_apply_once_and_survive_reopen(tmp_path):
     clock = FakeClock(dt.datetime(2026, 7, 17, 15, 0, tzinfo=dt.timezone.utc))
     store = AiStore(tmp_path / "ai.duckdb", clock=clock)
-    assert store.migrate(ALL_MIGRATIONS)[-8:] == list(range(10, 18))
+    assert [v for v in store.migrate(ALL_MIGRATIONS) if 10 <= v < 20] == list(range(10, 18))
     assert AiStore(tmp_path / "ai.duckdb", clock=clock).migrate(ALL_MIGRATIONS) == []
     names = {row[0] for row in store.db.execute(
         "SELECT table_name FROM information_schema.tables", fetch="all")}

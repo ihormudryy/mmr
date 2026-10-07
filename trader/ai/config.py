@@ -4,9 +4,9 @@ import json
 from dataclasses import dataclass
 from decimal import ROUND_CEILING, ROUND_FLOOR, Decimal
 from pathlib import Path
-from typing import Annotated, Callable, Mapping, Optional
+from typing import Annotated, Callable, Literal, Mapping, Optional
 import yaml
-from pydantic import BaseModel, BeforeValidator, ConfigDict, Field, StrictStr, ValidationError
+from pydantic import BaseModel, BeforeValidator, ConfigDict, Field, StrictStr, StringConstraints, ValidationError
 
 
 SUPPORTED_BACKENDS = ("openrouter", "bedrock", "azure")
@@ -84,6 +84,48 @@ class ControllerConfig(_Section):
     heartbeat_path: StrictStr = "/tmp/mmr_ai_heartbeat.json"
 
 
+_DIGEST = r"^sha256:[0-9a-f]{64}$"
+FIXED_RULE_V1 = (0.02, 0.04)
+DigestText = Annotated[StrictStr, StringConstraints(pattern=_DIGEST)]
+StrategyName = Annotated[StrictStr, StringConstraints(pattern=r"^[A-Za-z][A-Za-z0-9_.-]{0,63}$")]
+WatchlistSymbol = Annotated[StrictStr, StringConstraints(pattern=r"^[A-Z]{1,5}$")]
+
+
+class Bracketing(_Section):
+    stop_fraction: Number = Field(0.02, gt=0, lt=0.2, allow_inf_nan=False)
+    target_fraction: Number = Field(0.04, gt=0, lt=0.5, allow_inf_nan=False)
+
+
+class StrategyBracket(Bracketing):
+    deployment_digest: DigestText
+
+
+class FixedRuleConfig(Bracketing):
+    version: Literal["fixed_rule.v1"] = "fixed_rule.v1"
+
+
+class DiscoverySettings(_Section):
+    movers_top: Whole = Field(10, ge=1, le=50)
+    most_actives_top: Whole = Field(10, ge=1, le=100)
+    watchlist: tuple[WatchlistSymbol, ...] = Field((), max_length=25)
+    news_per_symbol: Whole = Field(2, ge=0, le=10)
+    news_symbols_max: Whole = Field(10, ge=0, le=30)
+    max_candidates_to_model: Whole = Field(15, ge=1, le=30)
+
+
+class DecisionsConfig(_Section):
+    """The decision engine (SP2 Plan 6). No model ids here: those live in roles."""
+    discretionary_deployment_digest: Optional[DigestText] = None
+    strategies: dict[StrategyName, StrategyBracket] = Field(default_factory=dict)
+    self_found_bracket: Bracketing = Field(default_factory=Bracketing)
+    fixed_rule: FixedRuleConfig = Field(default_factory=FixedRuleConfig)
+    discovery: DiscoverySettings = Field(default_factory=DiscoverySettings)
+    max_entries_per_cycle: Whole = Field(2, ge=1, le=5)
+    quote_max_age_seconds: Whole = Field(15, ge=1, le=120)
+    news_chars_per_item: Whole = Field(400, ge=50, le=2000)
+    role_recheck_seconds: Whole = Field(300, ge=30, le=3600)
+
+
 class _PriceRow(_Section):
     input_usd_per_million: Number = Field(ge=0, allow_inf_nan=False)
     output_usd_per_million: Number = Field(ge=0, allow_inf_nan=False)
@@ -95,6 +137,7 @@ class _RawConfig(_Section):
     budget: BudgetConfig = Field(default_factory=BudgetConfig)
     database_path: StrictStr = "~/.local/share/mmr_ai/ai.duckdb"
     controller: ControllerConfig = Field(default_factory=ControllerConfig)
+    decisions: DecisionsConfig = Field(default_factory=DecisionsConfig)
 
 
 @dataclass(frozen=True)
@@ -124,6 +167,7 @@ class AiConfig:
     budget: BudgetConfig
     database_path: str
     controller: ControllerConfig = ControllerConfig()
+    decisions: DecisionsConfig = DecisionsConfig()
 
     def role(self, name: str) -> RoleConfig:
         try:
@@ -141,6 +185,7 @@ class AiConfig:
             },
             "budget": self.budget.model_dump(),
             "controller": self.controller.model_dump(),
+            "decisions": self.decisions.model_dump(mode="json"),
         }
         return hashlib.sha256(json.dumps(body, sort_keys=True).encode()).hexdigest()
 
@@ -197,7 +242,12 @@ def _check(parsed: _RawConfig) -> AiConfig:
     shortest_slot = min(controller.entry_slot_minutes, controller.position_slot_minutes) * 60
     if controller.slot_start_grace_seconds >= shortest_slot:
         raise AiConfigError("CONTROLLER_GRACE_TOO_LONG", "slot_start_grace_seconds must be shorter than a slot")
-    return AiConfig(dict(parsed.roles), PriceBook(rows), parsed.budget, parsed.database_path, controller)
+    fixed = parsed.decisions.fixed_rule
+    if (fixed.stop_fraction, fixed.target_fraction) != FIXED_RULE_V1:
+        raise AiConfigError("FIXED_RULE_VERSION_MISMATCH",
+                            "fixed_rule.v1 is 0.02 / 0.04; other values need a new baseline version")
+    return AiConfig(dict(parsed.roles), PriceBook(rows), parsed.budget, parsed.database_path, controller,
+                    parsed.decisions)
 
 
 def usd_to_micros_floor(usd: float | Decimal) -> int:

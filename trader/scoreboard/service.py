@@ -136,6 +136,7 @@ def _trip_view(row: dict) -> dict:
             "direction": row["direction"], "opened_at": row["opened_at"].isoformat(),
             "closed_at": None if row["closed_at"] is None else row["closed_at"].isoformat(),
             "opened_quantity": row["entry_qty"], "closed_quantity": row["exit_qty"],
+            "entry_avg_price": row["entry_avg"],
             "exec_ids": json.loads(row["exec_ids"]), "net_pnl_usd": row["net_pnl_usd"],
             "decision_id": row["decision_id"], "strategy_ref": row["strategy_version"], "state": row["status"]}
 

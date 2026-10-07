@@ -108,6 +108,16 @@ class OwnedPosition:
     open_quantity: float
     opened_at: dt.datetime
     decision_id: Optional[str]
+    entry_price: Optional[float] = None          # the trip's entry fill average (SP2 Plan 6 Ruling 17)
+    entry_quantity: Optional[float] = None       # the trip's opened quantity
+
+
+def _optional_positive(value: Any, name: str) -> Optional[float]:
+    if value is None:
+        return None
+    if type(value) not in (int, float) or not math.isfinite(value) or value <= 0:
+        raise ValueError(f"{name} must be a positive finite number or null")
+    return float(value)
 
 
 def owned_positions_from_trips(reply: Any) -> tuple[OwnedPosition, ...]:
@@ -121,7 +131,9 @@ def owned_positions_from_trips(reply: Any) -> tuple[OwnedPosition, ...]:
         left = float(trip["opened_quantity"]) - float(trip.get("closed_quantity") or 0.0)
         if left > 0:
             owned.append(OwnedPosition(str(trip["round_trip_id"]), _conid(trip["conid"]), str(trip["symbol"]), left,
-                                       parse_aware(trip["opened_at"], "opened_at"), trip.get("decision_id")))
+                                       parse_aware(trip["opened_at"], "opened_at"), trip.get("decision_id"),
+                                       _optional_positive(trip.get("entry_avg_price"), "entry_avg_price"),
+                                       _optional_positive(trip.get("opened_quantity"), "opened_quantity")))
     return tuple(owned)
 
 

@@ -4,6 +4,7 @@ from __future__ import annotations
 from datetime import datetime
 from typing import Any, Optional
 
+from trader.ai.decision_schema import DECISION_MIGRATIONS
 from trader.ai.schema import FOUNDATION_MIGRATIONS, Migration
 from trader.ai.store import AiStore
 
@@ -70,7 +71,7 @@ RUNTIME_MIGRATIONS: tuple[Migration, ...] = (
             reason VARCHAR, started_at TIMESTAMPTZ NOT NULL, finished_at TIMESTAMPTZ)""",)),
 )
 
-ALL_MIGRATIONS: tuple[Migration, ...] = FOUNDATION_MIGRATIONS + RUNTIME_MIGRATIONS
+ALL_MIGRATIONS: tuple[Migration, ...] = FOUNDATION_MIGRATIONS + RUNTIME_MIGRATIONS + DECISION_MIGRATIONS
 
 
 def cursor_value_in_tx(conn: Any, name: str) -> int:

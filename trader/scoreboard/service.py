@@ -2,13 +2,14 @@
 from __future__ import annotations
 
 import datetime as dt
+import json
 import logging
 from typing import Any, Callable, Optional
 
 from trader.scoreboard.ports import session_date_et
 from trader.scoreboard.report import ReportInputs, build_report
 from trader.scoreboard.round_trips import project_round_trips
-from trader.scoreboard.session_ledger import experiment_fills
+from trader.scoreboard.session_ledger import SessionFacts, experiment_fills
 from trader.scoreboard.store import ScoreboardStore
 
 logger = logging.getLogger(__name__)
@@ -94,6 +95,10 @@ class ScoreboardService:
             self.store.fetch("simulated_books", {"experiment_id": exp_id}),
             incidents, warnings))
 
+    def verify(self, experiment_id: Optional[str] = None) -> dict:
+        """Rebuild every derived number from its stored inputs and compare; never writes (ruling 11)."""
+        return _verify(self, experiment_id)
+
     def _inputs(self, experiment, rows, adjustments, trips, ai_costs, simulated, incidents, warnings):
         return ReportInputs(
             experiment=experiment, rows=rows, adjustments=adjustments, trips=trips,
@@ -101,3 +106,111 @@ class ScoreboardService:
             spy_provider=self.book.provider(), ai_costs=ai_costs, simulated=simulated, incidents=incidents,
             warnings=warnings, outbox=None if self.outbox is None else self.outbox.counts(),
             calendar=self.calendar)
+
+
+ATTRIBUTION_COLUMNS = ("decision_id", "decider", "strategy_version", "policy_revision", "style", "links_digest")
+_IGNORED = frozenset({"experiment_id", "account_id"})
+
+
+def _same(a: Any, b: Any) -> bool:
+    if isinstance(a, float) or isinstance(b, float):
+        return a is not None and b is not None and abs(float(a) - float(b)) <= 1e-6
+    if isinstance(a, dt.datetime) and isinstance(b, dt.datetime):
+        return a.astimezone(dt.timezone.utc) == b.astimezone(dt.timezone.utc)
+    return a == b
+
+
+def _differences(stored: dict, recomputed: dict, columns) -> dict:
+    return {name: {"stored": stored.get(name), "recomputed": recomputed.get(name)}
+            for name in columns if not _same(stored.get(name), recomputed.get(name))}
+
+
+def _jsonable(value: Any) -> Any:
+    if isinstance(value, dict):
+        return {k: _jsonable(v) for k, v in value.items()}
+    if isinstance(value, (dt.datetime, dt.date)):
+        return value.isoformat()
+    return value
+
+
+class _Verifier:
+    """Recomputes from broker_fills and the decision links; never reads a derived row as truth, never writes."""
+
+    def __init__(self, service: "ScoreboardService", experiment: Any):
+        self.service = service
+        self.experiment = experiment
+        self.mismatches: list[dict] = []
+
+    def add(self, check: str, table: str, key: str, **detail: Any) -> None:
+        self.mismatches.append({"check": check, "table": table, "key": key, **_jsonable(detail)})
+
+    def round_trips(self, projection) -> None:
+        store, exp = self.service.store, self.experiment
+        recomputed = {t.round_trip_id: store.prepare("round_trips", t.as_row(exp.experiment_id, exp.account_id))
+                      for t in projection.trips}
+        stored = {r["round_trip_id"]: r for r in store.fetch("round_trips", {"experiment_id": exp.experiment_id})}
+        for trip_id in sorted(set(recomputed) - set(stored)):
+            self.add("ROUND_TRIP_MISSING", "round_trips", trip_id)
+        for trip_id in sorted(set(stored) - set(recomputed)):
+            self.add("ROUND_TRIP_EXTRA", "round_trips", trip_id)
+        for trip_id in sorted(set(stored) & set(recomputed)):
+            columns = [c for c in recomputed[trip_id] if c not in _IGNORED]
+            money = _differences(stored[trip_id], recomputed[trip_id],
+                                 [c for c in columns if c not in ATTRIBUTION_COLUMNS])
+            if money:
+                self.add("ROUND_TRIP_MISMATCH", "round_trips", trip_id, columns=money)
+            links = _differences(stored[trip_id], recomputed[trip_id], ATTRIBUTION_COLUMNS)
+            if links:
+                self.add("ATTRIBUTION_CHANGED", "round_trips", trip_id, columns=links)
+
+    def sessions(self, projection, facts, rows, adjustments) -> None:
+        for row in rows:
+            key = f"{row['experiment_id']}|{row['session_date']}"
+            current = SessionFacts(projection, facts, row["session_date"])
+            recomputed = {"fills_digest": current.fills_digest, "fill_count": current.fill_count,
+                          "trade_count": current.trade_count}
+            if row["realized_pnl_usd"] is not None:
+                recomputed["realized_pnl_usd"] = float(current.realized)
+            changed = _differences(row, recomputed, recomputed)
+            if changed:
+                self.add("SESSION_FILLS_CHANGED", "equity_daily", key, columns=changed)
+            self.commissions(row, key, current.commissions, adjustments)
+
+    def commissions(self, row, key, current, adjustments) -> None:
+        stored = json.loads(row["commission_json"])
+        for exec_id, fee in sorted(current.items()):
+            if exec_id not in stored or fee is None:
+                continue
+            booked = (stored[exec_id] or 0.0) + sum(
+                a["amount_usd"] for a in adjustments
+                if a["session_date"] == row["session_date"] and a["exec_id"] == exec_id)
+            if abs(float(fee) - booked) > 1e-9:
+                self.add("COMMISSION_MISMATCH", "equity_daily", f"{key}|{exec_id}",
+                         stored=booked, recomputed=float(fee))
+
+
+def _verify(service: "ScoreboardService", experiment_id: Optional[str]) -> dict:
+    experiment = service.resolve(experiment_id)
+    if experiment is None and experiment_id is not None:
+        return {"ok": False, "error_code": EXPERIMENT_NOT_FOUND, "experiment_id": experiment_id}
+    mismatches = service.store.verify_seals()
+    checked = {"seals": service.store.seal_count(), "round_trips": 0, "sessions": 0}
+    incidents: list = []
+    if experiment is not None:
+        verifier = _Verifier(service, experiment)
+        facts = experiment_fills(service.db, experiment)
+        projection = project_round_trips(facts, links_for=service.links.links_for_order_ref,
+                                         account_id=experiment.account_id)
+        rows = service.store.fetch("equity_daily", {"experiment_id": experiment.experiment_id})
+        verifier.round_trips(projection)
+        verifier.sessions(projection, facts, rows,
+                          service.store.fetch("equity_adjustments", {"experiment_id": experiment.experiment_id}))
+        mismatches += verifier.mismatches
+        checked.update(round_trips=len(projection.trips), sessions=len(rows))
+        incidents = [_jsonable(i) for i in service.store.incidents() if experiment.experiment_id in i["key"]]
+    scope = "-" if experiment is None else experiment.experiment_id
+    for mismatch in mismatches:
+        # Spec 5.2: a mismatch is an incident. Only the incident table is written, never the books.
+        service.store.record_incident("VERIFY_MISMATCH", f"{scope}:{mismatch['check']}:{mismatch['table']}:"
+                                      f"{mismatch['key']}", json.dumps(mismatch, sort_keys=True, default=str))
+    return {"ok": not mismatches, "checked": checked, "mismatches": mismatches, "incidents": incidents}

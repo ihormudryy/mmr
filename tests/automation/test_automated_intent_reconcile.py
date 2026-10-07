@@ -44,7 +44,7 @@ def submitted_buy(tmp_path):
     receipt = stack.coordinator.execute(CommandRequest(
         command_id=intent.command_id, action="execute_automated_intent", account_id=ACCOUNT,
         target_type="intent", target_id=intent.intent_id, expected_version=None,
-        body=intent_to_request_body(intent), source="strategy_service",
+        body=intent_to_request_body(intent), source="strategy_service", principal="strategy",
     ))
     assert receipt.state == "SUBMITTED"
     stack.command_id = intent.command_id

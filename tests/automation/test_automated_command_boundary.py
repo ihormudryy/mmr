@@ -400,7 +400,7 @@ def test_without_a_saga_the_command_is_refused_and_nothing_is_sent(tmp_path):
         command_id=intent.command_id, action="execute_automated_intent",
         account_id=ACCOUNT, target_type="intent", target_id=intent.intent_id,
         expected_version=None, body=intent_to_request_body(intent),
-        source="strategy_service",
+        source="strategy_service", principal="strategy",
     )
 
     receipt = stack.coordinator.execute(request)

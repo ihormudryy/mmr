@@ -244,7 +244,7 @@ class ModelGateway:
             return await self._fail(begun, error)
         except Exception as error:
             return await self._fail(begun, OutcomeUnknownError("ADAPTER_FAILURE", type(error).__name__))
-        return await self._record_success(price, begun, response)
+        return await self._uninterruptible(self._record_success(price, begun, response))
 
     async def _record_success(self, price: ModelPrice, begun: _Begun, response: ModelResponse) -> GatewayResult:
         now = self.clock.now()
@@ -281,8 +281,22 @@ class ModelGateway:
 
         await self.store.atransaction(work)
 
+    async def _uninterruptible(self, work: Any) -> Any:
+        """Run a settlement to its end even if the caller is cancelled. A response or failure that
+        was seen must always reach the journal and the budget, never stay STARTED / OPEN."""
+        task = asyncio.ensure_future(work)
+        try:
+            return await asyncio.shield(task)
+        except asyncio.CancelledError:
+            while not task.done():
+                try:
+                    await asyncio.shield(task)
+                except (Exception, asyncio.CancelledError):
+                    pass  # cancelled again, or the settlement itself failed: the loop ends when it is done
+            raise
+
     async def _fail(self, begun: _Begun, error: ModelCallError) -> GatewayResult:
-        await self._record_failure(begun, error)
+        await self._uninterruptible(self._record_failure(begun, error))
         raise CallFailed(error.code, outcome=error.outcome, attempt_key=begun.attempt.attempt_key,
                          detail=error.detail)
 

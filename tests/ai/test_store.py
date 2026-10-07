@@ -1,4 +1,5 @@
 import asyncio
+import threading
 import time
 from datetime import datetime, timezone
 import pytest
@@ -67,20 +68,20 @@ def test_other_plans_add_their_own_range_and_bad_versions_are_refused(store):
 
 @pytest.mark.asyncio
 async def test_blocking_work_does_not_block_the_event_loop(store):
-    ticks = []
+    loop_kept_running = threading.Event()
 
     async def ticker():
         for _ in range(5):
             await asyncio.sleep(0.01)
-            ticks.append(time.monotonic())
+        loop_kept_running.set()
 
     def slow(conn):
-        time.sleep(0.15)
+        # Only returns once the event loop has run the ticker. A blocked loop times out here.
+        if not loop_kept_running.wait(10):
+            raise AssertionError("the event loop was blocked by the transaction")
 
-    started = time.monotonic()
     await asyncio.gather(store.atransaction(slow), ticker())
-    assert len(ticks) == 5
-    assert ticks[-1] - started < 0.14  # the loop kept running while the transaction slept
+    assert loop_kept_running.is_set()
 
 
 def test_a_failed_transaction_rolls_back(store):

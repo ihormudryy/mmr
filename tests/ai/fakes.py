@@ -76,6 +76,16 @@ ORCHESTRATOR_WORST_CASE_MICROS = 240_000
 JEV_WORST_CASE_MICROS = 80_000
 
 
+async def wait_until(condition, *, timeout: float = 10.0) -> None:
+    """Wait for a condition, not for a fixed time. Fails loudly instead of hanging."""
+    loop = asyncio.get_running_loop()
+    end = loop.time() + timeout
+    while not condition():
+        if loop.time() > end:
+            raise AssertionError("condition never became true")
+        await asyncio.sleep(0.005)
+
+
 class FakeProvider:
     """A fake OpenRouter server behind a real httpx client and a real OpenRouterAdapter."""
 
@@ -85,12 +95,14 @@ class FakeProvider:
         self.in_flight = 0
         self.max_in_flight = 0
         self.hold: asyncio.Event | None = None
+        self.started = asyncio.Event()  # set when the first request reaches the provider
         self.respond = None  # optional callable(request) -> httpx.Response, or raises
 
     async def __call__(self, request):
         import httpx
 
         self.requests.append(request)
+        self.started.set()
         self.in_flight += 1
         self.max_in_flight = max(self.max_in_flight, self.in_flight)
         try:

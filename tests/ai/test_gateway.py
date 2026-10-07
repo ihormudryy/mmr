@@ -8,7 +8,7 @@ import pytest_asyncio
 from tests.ai.fakes import (
     JEV_WORST_CASE_MICROS, ORCHESTRATOR_WORST_CASE_MICROS,
 )
-from tests.ai.fakes import FakeProvider, load_test_config
+from tests.ai.fakes import FakeProvider, load_test_config, wait_until
 from tests.ai.world import World, request
 from trader.ai.budget import next_window_start
 from trader.ai.config import AiConfigError, usd_to_micros_floor
@@ -87,7 +87,7 @@ async def test_malformed_usage_keeps_the_full_reservation(world):
 async def test_cancelling_a_call_records_unknown_and_keeps_the_reservation(world):
     world.orchestrator.hold = asyncio.Event()
     task = asyncio.create_task(world.gateway.call("orchestrator", request(), world.gateway.new_deadline()))
-    await asyncio.sleep(0.1)
+    await asyncio.wait_for(world.orchestrator.started.wait(), 10)  # the adapter has begun: this is a post-send cancel
     task.cancel()
     with pytest.raises(asyncio.CancelledError):
         await task
@@ -205,8 +205,9 @@ async def test_at_most_two_calls_are_in_flight(world):
     world.orchestrator.hold = asyncio.Event()
     tasks = [asyncio.create_task(world.gateway.call("orchestrator", request(f"d/o/{i}"), world.gateway.new_deadline()))
              for i in range(5)]
-    await asyncio.sleep(0.3)
-    assert world.orchestrator.in_flight == 2
+    await wait_until(lambda: world.orchestrator.in_flight == 2)
+    await asyncio.sleep(0.2)  # grace for a third call to wrongly start; a pass never depends on it
+    assert world.orchestrator.in_flight == 2 and len(world.orchestrator.requests) == 2
     world.orchestrator.hold.set()
     results = await asyncio.gather(*tasks)
     assert len(results) == 5
@@ -327,7 +328,8 @@ async def test_a_hung_bedrock_thread_keeps_its_gateway_slot_until_it_returns(tmp
     tasks = [asyncio.create_task(gateway.call("orchestrator", request(f"d/o/{i}"), gateway.new_deadline()))
              for i in range(5)]
     try:
-        await asyncio.sleep(0.8)  # the first two calls time out; their threads are still hanging
+        await wait_until(lambda: tasks[0].done() and tasks[1].done())  # both timed out; their threads still hang
+        await asyncio.sleep(0.2)  # grace for a third call to wrongly start; a pass never depends on it
         assert (seen["started"], seen["running"]) == (2, 2)
         assert [t.done() for t in tasks] == [True, True, False, False, False]
         assert all(isinstance(t.exception(), CallFailed) for t in tasks[:2])
@@ -344,15 +346,18 @@ async def test_a_hung_bedrock_thread_keeps_its_gateway_slot_until_it_returns(tmp
 @pytest.mark.asyncio
 async def test_cancelling_before_the_call_is_sent_leaves_nothing_open(world, monkeypatch):
     real_reserve = world.gateway.budget.reserve_in_tx
+    inside_transaction, may_continue = threading.Event(), threading.Event()
 
-    def slow_reserve(*args, **kwargs):
-        time.sleep(0.3)  # the reservation transaction is running in its worker thread
+    def held_reserve(*args, **kwargs):
+        inside_transaction.set()  # the reservation transaction is running in its worker thread
+        assert may_continue.wait(10)
         return real_reserve(*args, **kwargs)
 
-    monkeypatch.setattr(world.gateway.budget, "reserve_in_tx", slow_reserve)
+    monkeypatch.setattr(world.gateway.budget, "reserve_in_tx", held_reserve)
     task = asyncio.create_task(world.gateway.call("orchestrator", request(), world.gateway.new_deadline()))
-    await asyncio.sleep(0.1)
+    assert await asyncio.to_thread(inside_transaction.wait, 10)
     task.cancel()
+    may_continue.set()
     with pytest.raises(asyncio.CancelledError):
         await task
     assert world.rows("SELECT status, error_code FROM ai_model_attempts") == [("NOT_SENT", "CALLER_CANCELLED_BEFORE_SEND")]
@@ -361,6 +366,31 @@ async def test_cancelling_before_the_call_is_sent_leaves_nothing_open(world, mon
     assert (snapshot.committed_micros, snapshot.open_reservations, snapshot.unknown_reservations) == (0, 0, 0)
     assert world.rows("SELECT kind, cost_micros FROM ai_cost_events") == [("NONE", 0)]
     assert world.orchestrator.requests == []
+    monkeypatch.undo()
+    follow_up = await world.gateway.call("jev", request("d/j/1"), world.gateway.new_deadline())  # the slot was freed
+    assert follow_up.response.text
+
+
+@pytest.mark.asyncio
+async def test_a_response_that_arrived_is_settled_even_if_the_caller_is_cancelled(world, monkeypatch):
+    task = None
+    real_record_success = world.gateway._record_success
+
+    async def cancelled_as_settlement_starts(price, begun, response):
+        task.cancel()  # the provider answered; the caller is cancelled before settlement is submitted
+        await asyncio.sleep(0)  # an await point where an unshielded caller would receive the cancel
+        return await real_record_success(price, begun, response)
+
+    monkeypatch.setattr(world.gateway, "_record_success", cancelled_as_settlement_starts)
+    task = asyncio.create_task(world.gateway.call("orchestrator", request(), world.gateway.new_deadline()))
+    with pytest.raises(asyncio.CancelledError):
+        await task
+    await wait_until(lambda: world.rows("SELECT status FROM ai_model_attempts") != [("STARTED",)])
+    assert world.rows("SELECT status, input_tokens, output_tokens FROM ai_model_attempts") == [("SUCCEEDED", 1000, 200)]
+    assert world.rows("SELECT state, actual_micros FROM ai_budget_reservations") == [("SETTLED", 6000)]
+    assert world.rows("SELECT kind, cost_micros FROM ai_cost_events") == [("CONFIRMED", 6000)]
+    snapshot = await world.gateway.budget.snapshot()
+    assert (snapshot.committed_micros, snapshot.open_reservations, snapshot.unknown_reservations) == (6000, 0, 0)
     monkeypatch.undo()
     follow_up = await world.gateway.call("jev", request("d/j/1"), world.gateway.new_deadline())  # the slot was freed
     assert follow_up.response.text

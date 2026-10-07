@@ -137,6 +137,10 @@ def _trip_view(row: dict) -> dict:
             "decision_id": row["decision_id"], "strategy_ref": row["strategy_version"], "state": row["status"]}
 
 
+# Checks against sealed or immutable data become incidents. Round trips, their attribution and due commission
+# adjustments are derived state rebuilt every 30 s: a mismatch there fails verify but may only be lag.
+PERSISTED_CHECKS = frozenset({"CHAIN_BROKEN", "ROW_EDITED", "ROW_MISSING", "ROW_UNSEALED", "SESSION_FILLS_CHANGED"})
+
 ATTRIBUTION_COLUMNS = ("decision_id", "decider", "strategy_version", "policy_revision", "style", "links_digest")
 _IGNORED = frozenset({"experiment_id", "account_id"})
 
@@ -236,10 +240,15 @@ def _verify(service: "ScoreboardService", experiment_id: Optional[str]) -> dict:
                           service.store.fetch("equity_adjustments", {"experiment_id": experiment.experiment_id}))
         mismatches += verifier.mismatches
         checked.update(round_trips=len(projection.trips), sessions=len(rows))
-        incidents = [_jsonable(i) for i in service.store.incidents() if experiment.experiment_id in i["key"]]
     scope = "-" if experiment is None else experiment.experiment_id
     for mismatch in mismatches:
-        # Spec 5.2: a mismatch is an incident. Only the incident table is written, never the books.
-        service.store.record_incident("VERIFY_MISMATCH", f"{scope}:{mismatch['check']}:{mismatch['table']}:"
-                                      f"{mismatch['key']}", json.dumps(mismatch, sort_keys=True, default=str))
+        if mismatch["check"] in PERSISTED_CHECKS:
+            # Spec 5.2: a mismatch is an incident. Only the incident table is written, never the books.
+            service.store.record_incident("VERIFY_MISMATCH", f"{scope}:{mismatch['check']}:{mismatch['table']}:"
+                                          f"{mismatch['key']}", json.dumps(mismatch, sort_keys=True, default=str))
+        else:
+            logger.error("scoreboard verify: %s %s %s (derived state; the next refresh rebuilds it)",
+                         mismatch["check"], mismatch["table"], mismatch["key"])
+    if experiment is not None:
+        incidents = [_jsonable(i) for i in service.store.incidents() if experiment.experiment_id in i["key"]]
     return {"ok": not mismatches, "checked": checked, "mismatches": mismatches, "incidents": incidents}

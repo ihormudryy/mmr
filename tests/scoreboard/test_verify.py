@@ -145,7 +145,15 @@ def test_unknown_experiment_is_a_body_error(service):
     assert service.verify("exp-ffffffffffffffffffff")["error_code"] == "EXPERIMENT_NOT_FOUND"
 
 
-def test_a_mismatch_is_recorded_as_an_incident(service, world, db):
+def test_a_mismatch_is_recorded_as_an_incident_and_listed(service, world, db):
     db.execute("UPDATE equity_daily SET end_nlv_usd = end_nlv_usd + 1")
-    service.verify()
+    result = service.verify()
     assert "VERIFY_MISMATCH" in {i["kind"] for i in world.store.incidents()}
+    assert "VERIFY_MISMATCH" in {i["kind"] for i in result["incidents"]}
+
+
+def test_a_stale_projection_fails_verify_but_writes_no_incident(service, world):
+    world.fill("new", "BUY", 1, 100, 1.0, dt.datetime(2026, 10, 8, 17, 0, tzinfo=dt.timezone.utc))
+    result = service.verify()
+    assert result["ok"] is False and "ROUND_TRIP_MISSING" in checks(result)
+    assert "VERIFY_MISMATCH" not in {i["kind"] for i in world.store.incidents()}

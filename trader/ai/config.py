@@ -60,6 +60,30 @@ class BudgetConfig(_Section):
     decision_deadline_seconds: Number = Field(60.0, gt=0, le=600, allow_inf_nan=False)
 
 
+class ControllerConfig(_Section):
+    """The controller runtime (SP2 Plan 5). Defaults follow the index: lease 60 s, renew 20 s, slots 15 min."""
+    trader_query_port: Whole = Field(42101, gt=0, lt=65536)
+    trader_command_port: Whole = Field(42102, gt=0, lt=65536)
+    rpc_timeout_seconds: Number = Field(10.0, gt=0, le=60, allow_inf_nan=False)
+    lease_seconds: Whole = Field(60, ge=10, le=600)
+    renew_seconds: Whole = Field(20, gt=0, le=200)
+    held_retry_seconds: Number = Field(5.0, gt=0, le=60, allow_inf_nan=False)
+    entry_slot_minutes: Whole = Field(15, ge=5, le=60)
+    position_slot_minutes: Whole = Field(15, ge=5, le=60)
+    slot_start_grace_seconds: Whole = Field(120, ge=10, le=600)
+    signal_poll_seconds: Number = Field(5.0, gt=0, le=60, allow_inf_nan=False)
+    signal_page_limit: Whole = Field(100, ge=1, le=500)
+    signal_max_age_seconds: Whole = Field(300, ge=30, le=3600)
+    decision_ttl_seconds: Whole = Field(300, ge=30, le=900)
+    not_found_settle_seconds: Whole = Field(120, ge=60, le=900)
+    reconcile_seconds: Number = Field(10.0, gt=0, le=300, allow_inf_nan=False)
+    outbox_seconds: Number = Field(5.0, gt=0, le=300, allow_inf_nan=False)
+    experiment_poll_seconds: Number = Field(10.0, gt=0, le=300, allow_inf_nan=False)
+    heartbeat_seconds: Number = Field(10.0, gt=0, le=60, allow_inf_nan=False)
+    budget_cap_poll_seconds: Number = Field(60.0, gt=0, le=300, allow_inf_nan=False)
+    heartbeat_path: StrictStr = "/tmp/mmr_ai_heartbeat.json"
+
+
 class _PriceRow(_Section):
     input_usd_per_million: Number = Field(ge=0, allow_inf_nan=False)
     output_usd_per_million: Number = Field(ge=0, allow_inf_nan=False)
@@ -70,6 +94,7 @@ class _RawConfig(_Section):
     pricing: dict[StrictStr, dict[StrictStr, _PriceRow]] = Field(default_factory=dict)
     budget: BudgetConfig = Field(default_factory=BudgetConfig)
     database_path: StrictStr = "~/.local/share/mmr_ai/ai.duckdb"
+    controller: ControllerConfig = Field(default_factory=ControllerConfig)
 
 
 @dataclass(frozen=True)
@@ -98,6 +123,7 @@ class AiConfig:
     prices: PriceBook
     budget: BudgetConfig
     database_path: str
+    controller: ControllerConfig = ControllerConfig()
 
     def role(self, name: str) -> RoleConfig:
         try:
@@ -114,6 +140,7 @@ class AiConfig:
                 for (backend, model), p in sorted(self.prices.rows.items())
             },
             "budget": self.budget.model_dump(),
+            "controller": self.controller.model_dump(),
         }
         return hashlib.sha256(json.dumps(body, sort_keys=True).encode()).hexdigest()
 
@@ -164,7 +191,13 @@ def _check(parsed: _RawConfig) -> AiConfig:
             rows[(backend, model)] = ModelPrice(
                 Decimal(repr(row.input_usd_per_million)), Decimal(repr(row.output_usd_per_million))
             )
-    return AiConfig(dict(parsed.roles), PriceBook(rows), parsed.budget, parsed.database_path)
+    controller = parsed.controller
+    if controller.renew_seconds * 3 > controller.lease_seconds:
+        raise AiConfigError("CONTROLLER_RENEW_TOO_SLOW", "renew_seconds must be at most a third of lease_seconds")
+    shortest_slot = min(controller.entry_slot_minutes, controller.position_slot_minutes) * 60
+    if controller.slot_start_grace_seconds >= shortest_slot:
+        raise AiConfigError("CONTROLLER_GRACE_TOO_LONG", "slot_start_grace_seconds must be shorter than a slot")
+    return AiConfig(dict(parsed.roles), PriceBook(rows), parsed.budget, parsed.database_path, controller)
 
 
 def usd_to_micros_floor(usd: float | Decimal) -> int:

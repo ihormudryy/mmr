@@ -467,7 +467,7 @@ def main(config_file: str, only_list: List[str], except_list: List[str]):
     log.debug('network address: {}'.format(get_network_ip()))
     log.debug('loading config file {}'.format(config_file))
     conf_file = open(config_file, 'r')
-    config = yaml.load(conf_file, Loader=yaml.FullLoader)
+    config = yaml.safe_load(conf_file)
 
     # change the working directory
     root_directory = config['root_directory']

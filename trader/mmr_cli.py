@@ -4242,7 +4242,7 @@ def _handle_strategies_from_config():
         return
 
     with open(config_path, 'r') as f:
-        config = yaml.load(f, Loader=yaml.FullLoader) or {}
+        config = yaml.safe_load(f) or {}
 
     strategies = config.get('strategies', [])
     if not strategies:
@@ -4358,7 +4358,7 @@ def _handle_strategy_deploy(args: argparse.Namespace):
         config = {'strategies': []}
     else:
         with open(config_path, 'r') as f:
-            config = yaml.load(f, Loader=yaml.FullLoader) or {'strategies': []}
+            config = yaml.safe_load(f) or {'strategies': []}
 
     strategies = config.get('strategies', [])
 
@@ -4555,7 +4555,7 @@ def _handle_strategy_undeploy(args: argparse.Namespace):
         return
 
     with open(config_path, 'r') as f:
-        config = yaml.load(f, Loader=yaml.FullLoader) or {'strategies': []}
+        config = yaml.safe_load(f) or {'strategies': []}
 
     strategies = config.get('strategies', [])
     original_count = len(strategies)
@@ -4622,7 +4622,7 @@ def _handle_strategy_backtest(args: argparse.Namespace):
         return
 
     with open(config_path, 'r') as f:
-        config = yaml.load(f, Loader=yaml.FullLoader) or {}
+        config = yaml.safe_load(f) or {}
 
     strategies = config.get('strategies', [])
     found = None

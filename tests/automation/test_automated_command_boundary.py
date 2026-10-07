@@ -1062,3 +1062,14 @@ def test_after_a_session_loss_breach_a_sell_closes_and_a_buy_is_refused(tmp_path
     receipt, _intent = _execute_sell(stack, tmp_path, None)
     assert (receipt.state, receipt.error_code) == ("OUTCOME_UNKNOWN", "CLOSE_PENDING")
     assert saga_calls == ["BUY"] and len(liquidation.starts) == 1
+
+
+def test_sell_intent_closes_even_without_a_saga(tmp_path):
+    """The saga guards new exposure only. A SELL exit does not need it; a BUY does
+    (test_without_a_saga_the_command_is_refused_and_nothing_is_sent)."""
+    liquidation = _FakeCloseLiquidation()
+    stack = _build_stack(tmp_path, liquidation=liquidation, broker=_FakeBrokerSnapshot(10.0), with_saga=False)
+    receipt, intent = _execute_sell(stack, tmp_path, None)
+    assert (receipt.state, receipt.error_code) == ("OUTCOME_UNKNOWN", "CLOSE_PENDING")
+    assert liquidation.starts[0][1] == intent.command_id
+    assert stack.dispatch.calls == []

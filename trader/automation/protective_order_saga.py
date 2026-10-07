@@ -537,7 +537,9 @@ class ProtectiveOrderSagaStore:
 
     def load_live(self, account_id: str, conid: Optional[int] = None) -> list[SagaState]:
         """Every saga that is not terminal: open ones and ones a close owns."""
-        where = "account_id = ? AND state NOT IN ('CLOSED', 'SAFETY_FAILED')"
+        # NOT_SENT is terminal too: a close must not turn it into CLOSE_OWNED,
+        # or a later broker event would no longer reopen it as an orphan.
+        where = "account_id = ? AND state NOT IN ('CLOSED', 'SAFETY_FAILED', 'NOT_SENT')"
         params: list = [account_id]
         if conid is not None:
             where += " AND conid = ?"
@@ -643,7 +645,12 @@ class ProtectiveOrderSagaStore:
 
     def terminal_entries(self, account_id: str) -> tuple[SagaState, ...]:
         """NOT_SENT and CLOSED rows whose exit never filled: the saga thinks
-        they hold at most what they recorded."""
+        they hold at most what they recorded.
+
+        Rows a close owned are left out: the close worked from broker
+        positions, and a release rewrites ``filled_quantity`` to the remainder,
+        so the entry order's fill no longer compares with it.
+        """
         rows = self._db.execute(
             "SELECT payload FROM automated_order_sagas WHERE state IN ('NOT_SENT', 'CLOSED')",
             fetch="all",
@@ -651,7 +658,9 @@ class ProtectiveOrderSagaStore:
         states = (SagaState.from_payload(json.loads(payload)) for (payload,) in rows or ())
         return tuple(
             state for state in states
-            if state.account_id == account_id and not (state.stop_filled or state.target_filled)
+            if state.account_id == account_id
+            and not (state.stop_filled or state.target_filled)
+            and not _close_owned_once(state)
         )
 
     def unconfirmed_sends(self, account_id: str) -> tuple[SagaState, ...]:
@@ -737,6 +746,10 @@ def _entry_fill_grows(state: SagaState, event: BrokerOrderEvent) -> bool:
     if _dec(event.filled_quantity) > state.filled_quantity:
         return True
     return event.status in _FILLED_STATUSES and state.filled_quantity < state.requested_quantity
+
+
+def _close_owned_once(state: SagaState) -> bool:
+    return state.handover_generation is not None or state.protection_generation > 0
 
 
 def _entry_limit_price(state: SagaState) -> float:
@@ -1055,8 +1068,9 @@ class ProtectiveOrderSaga:
             return self._record_entry_after_safety_failure(state, event)
         if state.state == "NOT_SENT":
             return self._reopen_terminal_row(state, event)
-        if state.state == "CLOSED" and _entry_fill_grows(state, event):
-            # A fill is never dropped, even after a zero-fill cancel or reject.
+        if state.state == "CLOSED" and not _close_owned_once(state) and _entry_fill_grows(state, event):
+            # A fill is never dropped, even after a zero-fill cancel or reject. A row a
+            # close owned is left out: its filled_quantity may be a release remainder.
             return self._reopen_terminal_row(state, event)
         if state.state in _TERMINAL_SAGA:
             return state
@@ -1265,6 +1279,7 @@ class ProtectiveOrderSaga:
         )
         self._persist(updated, self._now_utc(), from_state=state.state, event_id=event.event_id)
         return updated
+
     # -- orphan reservations -----------------------------------------------
 
     def retire_orphan_reservations(self) -> tuple[str, ...]:
@@ -1412,7 +1427,10 @@ class ProtectiveOrderSaga:
             replace(state, state="OUTCOME_UNKNOWN", error_code="ORPHAN_ORDER_FOUND"), event,
         )
         if reopened.filled_quantity > 0:
-            reopened = replace(reopened, state="SAFETY_FAILED", error_code="ORPHAN_ORDER_FILLED")
+            reopened = replace(
+                reopened, state="SAFETY_FAILED", error_code="ORPHAN_ORDER_FILLED",
+                flatten_requested=True,
+            )
         reopened = replace(
             reopened,
             seen_event_ids=state.seen_event_ids + (event.event_id,),

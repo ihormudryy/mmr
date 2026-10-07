@@ -68,7 +68,7 @@ _BROKER_TERMINAL = {
 }
 _LEG_KINDS = ("reprotect-stop", "reprotect-target")
 _OPEN_BEFORE_SP1 = "state NOT IN ('FLAT', 'FAILED_SAFE')"
-# Round 10: how long a FLAT / CLOSED root is watched for a late fill of its settled children.
+# Round 10: how long a FLAT / CLOSED / DONE root is watched for a late fill of its settled children.
 LATE_FILL_WATCH = dt.timedelta(days=1)
 
 
@@ -497,9 +497,14 @@ class LiquidationRunStore:
         return [(r[0], None if r[1] is None else int(r[1])) for r in rows]
 
     def closed_roots_in_tx(self, conn, since: dt.datetime) -> list[LiquidationReceipt]:
-        """FLAT / CLOSED roots that finished since ``since``, with their settled children (round 10)."""
+        """FLAT / CLOSED / DONE roots that finished since ``since``, with their settled children (round 10).
+
+        DONE (a partial close) is watched too: it may be the only root that
+        cancelled an entry order, and the saga does not reopen a row a close
+        owned, so a late fill of that entry has no other watcher.
+        """
         rows = conn.execute(
-            f"SELECT {', '.join(_RUN_COLUMNS)} FROM liquidation_runs WHERE state IN ('FLAT', 'CLOSED') "
+            f"SELECT {', '.join(_RUN_COLUMNS)} FROM liquidation_runs WHERE state IN ('FLAT', 'CLOSED', 'DONE') "
             "AND NOT cleanup_pending AND updated_at >= ? ORDER BY updated_at, cause_command_id", [since]).fetchall()
         markers = ", ".join("?" for _ in _FILL_MAY_GROW)
         roots = []
@@ -833,7 +838,7 @@ class LiquidationService:
 
     def rescan(self) -> Optional[LiquidationReceipt]:
         """Finish pending cleanups, advance every root that is not terminal, then start a
-        new safety close for every late fill after a FLAT / CLOSED root."""
+        new safety close for every late fill after a FLAT / CLOSED / DONE root."""
         first: Optional[LiquidationReceipt] = None
         with self._exclusive():
             for root in self._store.transaction(self._store.roots_to_advance_in_tx):
@@ -853,7 +858,7 @@ class LiquidationService:
         return first
 
     def _late_fill_closes(self) -> list[tuple[LiquidationReceipt, str]]:
-        """Round 10: a FLAT / CLOSED root is never reopened, but a fill after it must not be ignored.
+        """Round 10: a FLAT / CLOSED / DONE root is never reopened, but a fill after it must not be ignored.
 
         Evidence: a settled child of the root (its own order or a leg it
         inherited) whose broker row or bound executions now report more fill

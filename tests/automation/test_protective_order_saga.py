@@ -2262,7 +2262,8 @@ def test_row_whose_send_never_returned_is_never_retired(tmp_path):
     env = _orphan_after_crash(tmp_path)
     # The process died inside submit_bracket: only the SUBMITTING row was saved.
     store = env.saga._store
-    crashed = dc_replace(store.load(env.orphan.command_id), send_returned_at=None)
+    saved = store.load(env.orphan.command_id)
+    crashed = dc_replace(saved, send_returned_at=None, revision=saved.revision + 1)
     store._db.transaction(lambda conn: store.save_in_tx(conn, crashed, NOW))
     env.evidence.newer_enumeration()
     env.clock.at = AFTER_SETTLE
@@ -2473,3 +2474,76 @@ def test_promoted_fill_after_a_zero_fill_rejection_of_a_reopened_row_is_flattene
     ingest.promote_generation()
 
     _assert_unprotected_fill_flattened(env, env.saga._store.load(env.orphan.command_id))
+
+
+# --- Orphan reservations with the merged safe close (#46) ---------------------
+
+def _closed_after_a_partial_release(tmp_path, **kw):
+    """A close released 6 of the 10 filled shares, then a second close took the rest.
+    The CLOSED row records filled_quantity 6; the entry order at the broker shows 10."""
+    saga, intent, state, breaker, liquidation = _protected(tmp_path, **kw)
+    og = state.order_group_id
+    saga.handover(account_id=ACCOUNT, conid=CONID, close_root_id="p-1",
+                  cancels=_cancels(og, "og:stop", "og:tp"), generation=7, now=NOW)
+    saga.release_after_partial(close_root_id="p-1", remaining_quantity=6.0,
+                               stop_group="p-1-reprotect-stop-265598-1", stop_status="Submitted",
+                               target_group=None, target_status=None, now=NOW)
+    saga.handover(account_id=ACCOUNT, conid=CONID, close_root_id="p-2", cancels=(), generation=9, now=NOW)
+    saga.close_after_full(close_root_id="p-2", now=NOW)
+    closed = saga.resume(intent.command_id)
+    assert (closed.state, closed.filled_quantity) == ("CLOSED", Decimal("6"))
+    return saga, intent, og, breaker, liquidation
+
+
+def test_a_late_entry_event_on_a_row_a_close_owned_is_not_a_new_fill(tmp_path):
+    """A release rewrites filled_quantity to the remainder; the entry order's
+    cumulative fill must not reopen the closed row as a late fill."""
+    saga, intent, og, breaker, liquidation = _closed_after_a_partial_release(tmp_path)
+
+    later = saga.on_broker_event(_event(og, leg="entry", status="Filled", filled=10.0, total=10.0,
+                                        event_id="late-entry-repeat"))
+    assert later.state == "CLOSED"
+    assert breaker.signals == [] and liquidation.starts == []
+
+
+def test_promotion_scan_skips_a_row_a_close_owned(tmp_path):
+    """The post-promotion scan reads the entry order (10 filled) against the
+    released remainder (6): that is not an unseen fill."""
+    class EntryFilledTen(FakeOrphanEvidence):
+        def entry_orders(self, account_id, order_group_id):
+            return [SimpleNamespace(order_entity_id=f"{order_group_id}:entry", status="Filled",
+                                    filled_quantity=10.0, total_quantity=10.0, source_timestamp=NOW)]
+
+    saga, intent, og, breaker, liquidation = _closed_after_a_partial_release(
+        tmp_path, orphan_evidence=EntryFilledTen())
+
+    assert saga.reconcile_terminal_entries() == ()
+    assert saga.resume(intent.command_id).state == "CLOSED"
+    assert breaker.signals == [] and liquidation.starts == []
+
+
+def test_a_close_never_takes_over_a_not_sent_row(tmp_path):
+    """NOT_SENT is terminal for a close: a later broker event must still reopen
+    the row as an orphan fill, not be bookkeeping of a CLOSE_OWNED saga."""
+    env = _retired(tmp_path)
+    env.saga.handover(account_id=ACCOUNT, conid=CONID, close_root_id="c-1", cancels=(), generation=1,
+                      now=AFTER_SETTLE)
+    assert _state_of(env, env.orphan.command_id) == "NOT_SENT"
+
+    state = env.saga.on_broker_event(
+        _late_entry_event(env, status="Filled", filled=ENTRY_SHARES, event_id="late-fill"),
+    )
+    assert (state.state, state.error_code) == ("SAFETY_FAILED", "ORPHAN_ORDER_FILLED")
+
+
+def test_an_orphan_fill_asks_the_worker_to_flatten(tmp_path):
+    """The liquidation worker restarts a flatten for every SAFETY_FAILED saga
+    with flatten_requested; a reopened orphan fill must be one of them."""
+    env = _retired(tmp_path)
+
+    state = env.saga.on_broker_event(
+        _late_entry_event(env, status="Filled", filled=ENTRY_SHARES, event_id="late-fill"),
+    )
+
+    assert state.flatten_requested is True
+    assert env.saga.unhandled_failures(ACCOUNT) == [env.orphan.command_id]

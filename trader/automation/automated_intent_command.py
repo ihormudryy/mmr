@@ -250,6 +250,12 @@ class AutomatedIntentCommandService:
                 outcome={"detail": source_mismatch},
             )
 
+        # A SELL on the long-only path is an exit, never a bracket (spec 5.1). It adds no
+        # exposure, so neither the pause on new exposure (R32) nor a missing saga stops it.
+        if intent.side == "SELL":
+            self._transition(cmd, "RECEIVED", "VALIDATED")
+            return self._execute_close(cmd, intent, artifact)
+
         if self._protective_saga is None or self._approval_factory is None:
             # Without the saga there is no gross reservation or dispatch guard.
             code = "SAGA_REQUIRED"
@@ -257,11 +263,6 @@ class AutomatedIntentCommandService:
             return self._receipt(cmd.command_id, "REJECTED", code, False)
 
         self._transition(cmd, "RECEIVED", "VALIDATED")
-
-        # A SELL on the long-only path is an exit, never a bracket (spec 5.1). It adds no
-        # exposure, so the pause on new exposure does not stop it (R32).
-        if intent.side == "SELL":
-            return self._execute_close(cmd, intent, artifact)
 
         order_group_id = f"og-{cmd.command_id}"
 

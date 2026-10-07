@@ -537,7 +537,7 @@ class SimMargin:
 class Composed:
     def __init__(self, tmp_path, loop_thread, clock, *, automation=False, sim=None, ai_paper=False,
                  kill_pct=None, acceptance_probe=False, identities=None, telegram=None, market=False,
-                 model_budget_usd_per_day=None):
+                 model_budget_usd_per_day=None, prepare=None):
         from trader.trading.command_stack import build_command_stack
 
         db = DuckDBConnection.get_instance(str(tmp_path / "journal.duckdb"))
@@ -586,6 +586,8 @@ class Composed:
         for patch in patches:
             patch.start()
         try:
+            if prepare is not None:                      # a test seam: the trader just before its stack is built
+                prepare(trader)
             self.stack = build_command_stack(trader, CommandAuthorityPolicy(enabled=True, max_drift_bps=50.0),
                                              now=lambda: clock[0])
         finally:

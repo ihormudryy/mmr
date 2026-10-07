@@ -10,7 +10,7 @@ from typing import Any, Callable
 
 from tests.ai.fakes import config_text
 from tests.sp1_acceptance.test_acceptance_run import entries_placed, market, settings as acceptance_settings
-from tests.sp1_fixtures import served_stack
+from tests.sp1_fixtures import MSFT, OTHER, served_stack
 from trader.acceptance.scenario import deployment_record
 from trader.ai.controller import ExperimentWatch
 from trader.ai.engine import ProposedDecision
@@ -22,6 +22,7 @@ from trader.ai.runtime_schema import ALL_MIGRATIONS
 from trader.ai.schedule import SessionSlots
 from trader.ai.store import AiStore
 from trader.ai.submitter import Submitter
+from trader.automation.ai_policy_file import load_policy_file
 from trader.automation.risk_limits import PAPER_LIMITS
 
 
@@ -76,16 +77,20 @@ class FlakyClient:
 class TraderWorld:
     """Served SP1 trader, ARMED experiment, operator policy (cli) and a registered deployment."""
 
-    def __init__(self, tmp_path, loop_thread, monkeypatch, *, identities=None, model_budget_usd_per_day=None):
-        options = {} if identities is None else {"identities": identities}
+    def __init__(self, tmp_path, loop_thread, monkeypatch, *, identities=None, model_budget_usd_per_day=None,
+                 prepare=None, policy_file=None):
+        options = {"prepare": _with_daily_bars(prepare)}
+        if identities is not None:
+            options["identities"] = identities
         if model_budget_usd_per_day is not None:            # the trader.yaml ai_paper value the trader starts with
             options["model_budget_usd_per_day"] = model_budget_usd_per_day
         self.served = served_stack(tmp_path, loop_thread, monkeypatch, **options)
         market(self.served)
         chosen = acceptance_settings()
         self.conid, self.quantity = chosen.conid_s, chosen.quantity_s
+        limits = PAPER_LIMITS.to_json() if policy_file is None else load_policy_file(policy_file)
         published = self.served.call("cli", "publish_ai_risk_policy", {
-            "command_id": "cli-pol-000000000001", "limits": PAPER_LIMITS.to_json(),
+            "command_id": "cli-pol-000000000001", "limits": limits,
             "reason": "operator initial policy"})
         assert published["state"] == "RESOLVED", published
         self.policy_revision = published["outcome"]["revision"]
@@ -130,18 +135,36 @@ class TraderWorld:
     def decision_row(self, decision_id):
         return self.served.stack.ai_paper.decision_store.row(decision_id)
 
-    def strategy_signal(self) -> str:
-        """The strategy service's side: a BUY into the durable signal record (Plan 1 Task 6)."""
+    def strategy_signal(self, action="BUY", conid=None) -> str:
+        """The strategy service's side: a signal into the durable signal record (Plan 1 Task 6)."""
         from trader.data.duckdb_store import DuckDBConnection
         from trader.data.strategy_signal_record import SignalEntry, StrategySignalRecord
-        entry = SignalEntry.create(strategy_name="orb", conid=self.conid, action="BUY", probability=0.7,
+        entry = SignalEntry.create(strategy_name="orb", conid=conid or self.conid, action=action, probability=0.7,
                                    signal_time=self.served.now())
         StrategySignalRecord(DuckDBConnection.get_instance(self.served.stack.ai_paper.signals_path),
                              now=self.served.now).append(entry)
         return entry.source_event_id
 
+    def hold_other_position(self, value_share_of_equity: float, conid: int = OTHER) -> float:
+        """A filled position the experiment does not own, worth this share of net liquidation (marked at 100)."""
+        quantity = value_share_of_equity * self.served.sim.net_liquidation / 100.0
+        self.served.sim.held[conid] = quantity
+        self.served.sim.promote()
+        return quantity
+
     def close(self):
         self.served.close()
+
+
+def _with_daily_bars(prepare):
+    """Twenty closed daily bars for MSFT too (the scope rule and the baseline sizer read them), then ``prepare``."""
+    def run(trader):
+        from tests.automation.ai_paper_fixtures import daily_frame
+        from trader.objects import BarSize
+        trader.data.get_tickdata(BarSize.Days1).write(MSFT, daily_frame())
+        if prepare is not None:
+            prepare(trader)
+    return run
 
 
 class AiNode:

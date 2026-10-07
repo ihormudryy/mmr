@@ -85,6 +85,9 @@ class ScoreboardStore:
     def db(self) -> Any:
         return self._db
 
+    def now(self) -> dt.datetime:
+        return self._now()
+
     # -- schema --------------------------------------------------------------
 
     def columns(self, table: str) -> dict[str, str]:
@@ -110,29 +113,36 @@ class ScoreboardStore:
     # -- sealed inserts ------------------------------------------------------
 
     def insert_sealed(self, table: str, row: Mapping[str, Any]) -> None:
-        if table not in SEALED_TABLES:
-            raise ValueError(f"{table!r} is not a sealed scoreboard table")
-        prepared = self.prepare(table, row)
-        key_columns = SEALED_TABLES[table]
-        key = row_key(prepared, key_columns)
-        digest = row_digest(prepared)
+        self.insert_sealed_many([(table, row)])
+
+    def insert_sealed_many(self, items: Sequence[tuple[str, Mapping[str, Any]]]) -> None:
+        """Every row and its seal in one transaction: all are written or none."""
+        prepared = []
+        for table, row in items:
+            if table not in SEALED_TABLES:
+                raise ValueError(f"{table!r} is not a sealed scoreboard table")
+            values = self.prepare(table, row)
+            prepared.append((table, values, row_key(values, SEALED_TABLES[table]), row_digest(values)))
         sealed_at = self._now()
 
         def tx(conn):
-            where = " AND ".join(f"{column} = ?" for column in key_columns)
-            if conn.execute(f"SELECT 1 FROM {table} WHERE {where}",
-                            [prepared[c] for c in key_columns]).fetchone() is not None:
-                raise ScoreboardConflict(f"{table} row {key} exists already")
-            names = list(prepared)
-            conn.execute(f"INSERT INTO {table} ({', '.join(names)}) VALUES ({', '.join('?' for _ in names)})",
-                         [prepared[name] for name in names])
             last = conn.execute(
                 "SELECT seal_id, chain FROM scoreboard_seals ORDER BY seal_id DESC LIMIT 1").fetchone()
-            seal_id, prev = (1, GENESIS) if last is None else (int(last[0]) + 1, last[1])
-            conn.execute(
-                "INSERT INTO scoreboard_seals (seal_id, table_name, row_key, row_digest, prev_chain, chain, "
-                "sealed_at) VALUES (?, ?, ?, ?, ?, ?, ?)",
-                [seal_id, table, key, digest, prev, chain_digest(prev, table, key, digest), sealed_at])
+            seal_id, prev = (0, GENESIS) if last is None else (int(last[0]), last[1])
+            for table, values, key, digest in prepared:
+                key_columns = SEALED_TABLES[table]
+                where = " AND ".join(f"{column} = ?" for column in key_columns)
+                if conn.execute(f"SELECT 1 FROM {table} WHERE {where}",
+                                [values[c] for c in key_columns]).fetchone() is not None:
+                    raise ScoreboardConflict(f"{table} row {key} exists already")
+                names = list(values)
+                conn.execute(f"INSERT INTO {table} ({', '.join(names)}) VALUES ({', '.join('?' for _ in names)})",
+                             [values[name] for name in names])
+                seal_id, chain = seal_id + 1, chain_digest(prev, table, key, digest)
+                conn.execute(
+                    "INSERT INTO scoreboard_seals (seal_id, table_name, row_key, row_digest, prev_chain, chain, "
+                    "sealed_at) VALUES (?, ?, ?, ?, ?, ?, ?)", [seal_id, table, key, digest, prev, chain, sealed_at])
+                prev = chain
         self._db.transaction(tx)
 
     # -- the round-trip projection -------------------------------------------

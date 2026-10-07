@@ -44,8 +44,9 @@ trading-authorization bypass, so every check below is deliberate:
 5. Clock skew is checked in both directions (at most 30 seconds); nonce
    entries expire after 60 seconds. Both are injectable via ``now``.
 6. Wire payloads larger than 1 MiB are rejected before JSON parsing.
-7. All envelope models use ``extra="forbid"`` and have no defaults on
-   required fields, so missing or unexpected fields raise.
+7. All envelope models use ``extra="forbid"``. Required fields have no
+   defaults, so a missing or unexpected field raises. The one optional
+   field is ``controller_epoch`` (default null, always signed).
 """
 
 from __future__ import annotations
@@ -70,7 +71,9 @@ from pydantic import BaseModel, ConfigDict, ValidationError, field_validator
 from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
 
 from trader.common.logging_helper import setup_logging
+from trader.automation.controller_epoch import MAX_CONTROLLER_EPOCH, is_epoch_number
 from trader.messaging.principals import (
+    CONTROLLER_PRINCIPAL,
     SERVER_ACCEPTS,
     SERVER_PRINCIPALS,
     is_valid_principal_name,
@@ -101,7 +104,7 @@ DEFAULT_NONCE_TTL_SECONDS = 60.0
 
 # Domain separation: RPC signatures can never be confused with bundle
 # signatures (which sign other bytes) or with each other's direction.
-RPC_REQUEST_CONTEXT = b"mmr.typed-rpc.request.v2\x00"
+RPC_REQUEST_CONTEXT = b"mmr.typed-rpc.request.v3\x00"  # v3: the signed bytes carry controller_epoch
 RPC_RESPONSE_CONTEXT = b"mmr.typed-rpc.response.v2\x00"
 
 
@@ -166,6 +169,18 @@ class TypedRpcRequest(BaseModel):
     role: str
     on_behalf_of: Optional[str]
     signature: str
+    # SP2 spec 5.1: the ai controller's trader-granted epoch. Optional so every
+    # other principal's request keeps its shape; always signed (null when absent).
+    controller_epoch: Optional[int] = None
+
+    @field_validator("controller_epoch", mode="before")
+    @classmethod
+    def _epoch_is_a_json_integer(cls, value: Any) -> Optional[int]:
+        if value is None:
+            return None
+        if not is_epoch_number(value):
+            raise ValueError(f"controller_epoch must be null or a JSON integer in 1..{MAX_CONTROLLER_EPOCH}")
+        return value
 
     @field_validator("timestamp", mode="before")
     @classmethod
@@ -232,12 +247,12 @@ def canonical_json(value: object) -> bytes:
 
 
 def rpc_signing_bytes(request: TypedRpcRequest) -> bytes:
-    """Bytes a request signature covers: caller, destination and payload."""
+    """Bytes a request signature covers: caller, destination, payload and the controller epoch."""
     return RPC_REQUEST_CONTEXT + canonical_json({
         "principal": request.principal, "on_behalf_of": request.on_behalf_of,
         "server": request.server, "role": request.role, "method": request.method,
         "request_id": request.request_id, "timestamp": request.timestamp,
-        "nonce": request.nonce, "body": request.body,
+        "nonce": request.nonce, "body": request.body, "controller_epoch": request.controller_epoch,
     })
 
 
@@ -421,10 +436,14 @@ class ReplayNonceCache:
 
 @dataclass(frozen=True)
 class RpcCaller:
-    """The authenticated caller of one request. ``on_behalf_of`` is log-only."""
+    """The authenticated caller of one request. ``on_behalf_of`` is log-only.
+
+    ``controller_epoch`` is the signed envelope epoch (only ai_supervisor sends one).
+    """
 
     principal: str
     on_behalf_of: Optional[str]
+    controller_epoch: Optional[int] = None
 
 
 class ServiceIdentity:
@@ -499,11 +518,12 @@ class ServiceIdentity:
         nonce: str,
         body: Dict[str, Any],
         on_behalf_of: Optional[str] = None,
+        controller_epoch: Optional[int] = None,
     ) -> TypedRpcRequest:
         unsigned = TypedRpcRequest(
             method=method, request_id=request_id, timestamp=self._now(), nonce=nonce,
             body=body, principal=self._principal, server=server, role=role,
-            on_behalf_of=on_behalf_of, signature="",
+            on_behalf_of=on_behalf_of, signature="", controller_epoch=controller_epoch,
         )
         signature = sign_bytes(self.__private_key, rpc_signing_bytes(unsigned))
         return unsigned.model_copy(update={"signature": signature})
@@ -535,8 +555,10 @@ class ServiceIdentity:
         if request.on_behalf_of is not None and (
                 request.principal != "trader" or not is_valid_principal_name(request.on_behalf_of)):
             raise AuthenticationError("on_behalf_of is only accepted from trader")
+        if request.controller_epoch is not None and request.principal != CONTROLLER_PRINCIPAL:
+            raise AuthenticationError("controller_epoch is only accepted from ai_supervisor")
         self._nonce_cache.claim(request.nonce)
-        return RpcCaller(request.principal, request.on_behalf_of)
+        return RpcCaller(request.principal, request.on_behalf_of, request.controller_epoch)
 
     def sign_response(self, response: TypedRpcResponse) -> TypedRpcResponse:
         if response.server != self._principal:
@@ -1173,6 +1195,7 @@ class TypedRpcClient:
         timeout: Optional[float] = None,
         *,
         on_behalf_of: Optional[str] = None,
+        controller_epoch: Optional[int] = None,
     ) -> Any:
         """Sign, send, and await a reply for ``method``/``body``.
 
@@ -1188,7 +1211,8 @@ class TypedRpcClient:
         nonce = uuid.uuid4().hex
         request = self.identity.sign_request(
             server=self.server, role=self.socket_role, method=method,
-            request_id=request_id, nonce=nonce, body=body, on_behalf_of=on_behalf_of)
+            request_id=request_id, nonce=nonce, body=body, on_behalf_of=on_behalf_of,
+            controller_epoch=controller_epoch)
         payload = canonical_json(request.model_dump(mode="json"))
         digest = request_digest(payload)
 

@@ -121,13 +121,14 @@ class ServedStack:
         return client
 
     def signed(self, caller, server="trader", role="query", method="get_status", body=None, *,
-               claim=None, tamper_body=False, identity=None, on_behalf_of=None):
+               claim=None, tamper_body=False, identity=None, on_behalf_of=None, controller_epoch=None):
         import uuid
 
         signer = identity or self.identities[caller]
         request = signer.sign_request(server=server, role=role, method=method,
                                       request_id=str(uuid.uuid4()), nonce=uuid.uuid4().hex,
-                                      body=dict(body or {}), on_behalf_of=on_behalf_of)
+                                      body=dict(body or {}), on_behalf_of=on_behalf_of,
+                                      controller_epoch=controller_epoch)
         if claim is not None:
             request = request.model_copy(update={"principal": claim})
         if tamper_body:

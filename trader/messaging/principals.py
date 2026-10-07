@@ -19,6 +19,8 @@ CLIENT_PRINCIPALS: frozenset[str] = frozenset({"cli", "ai_supervisor", "ai_resea
 # Reserved names: no key, no allow-list entry. telegram_bridge arrives in SP2;
 # scheduler has no trading RPC rights (owner answer 3).
 RESERVED_PRINCIPALS: frozenset[str] = frozenset({"telegram_bridge", "scheduler"})
+# The one principal that may carry a controller epoch in the envelope (SP2 spec 5.1).
+CONTROLLER_PRINCIPAL = "ai_supervisor"
 
 SERVER_ACCEPTS: Mapping[str, frozenset[str]] = {
     "trader": frozenset({"cli", "dashboard", "strategy", "ai_supervisor", "ai_research"}),

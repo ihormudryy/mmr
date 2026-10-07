@@ -18,6 +18,7 @@ from decimal import Decimal
 from typing import Any, Callable, Literal, Mapping, Optional
 
 from trader.automation.ai_deployments import DISCRETIONARY_KIND, STRATEGY_KIND, DeploymentRefused
+from trader.automation.ai_paper_config import STYLE_NOT_ENABLED
 from trader.automation.ai_paper_evidence import AI_ENTRY_POLICY, AI_PAPER_ACTION  # noqa: F401 (re-exported)
 from trader.automation.ai_paper_sizing import is_pending_entry
 from trader.automation.ai_risk_policy import PolicyRefused
@@ -624,8 +625,8 @@ class AiPaperDecisionService:
                 raise _Refusal("DEPLOYMENT_NOT_DEPLOYABLE")
             if decision.conid not in deployment.conids:
                 raise _Refusal("CONID_NOT_IN_DEPLOYMENT")
-        if deployment.style not in self._config.styles:
-            raise _Refusal("STYLE_NOT_ENABLED")
+        if not self._config.style_enabled(deployment.style):
+            raise _Refusal(STYLE_NOT_ENABLED)
         return deployment
 
     def _start_saga(self, cmd, admission, decision, order, binding, prepared) -> CommandReceipt:

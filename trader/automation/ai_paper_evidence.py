@@ -67,6 +67,13 @@ def _positive(value: Any, code: str) -> float:
     return number
 
 
+def entry_liquidity(history: Any, conid: int, quote: Any, now: dt.datetime, volume: Any = None) -> Any:
+    """A strategy ENTER reads local daily bars; a discretionary one the scope rule's 20-session window."""
+    if volume is None:
+        return liquidity_from_history(history, conid, quote, now)
+    return liquidity_from_sessions(volume, quote)
+
+
 def check_paper_binding(account_mode: str, account_id: Any) -> None:
     """An ai_paper entry needs a paper account (mode ``paper``, a ``DU`` account id)."""
     if account_mode != "paper" or not isinstance(account_id, str) or not account_id.startswith("DU"):
@@ -128,8 +135,7 @@ class AiPaperEvidence:
         if refusal:
             raise _refuse(refusal, "pending entries or position slots are full")
         quote = self._quote(conid)
-        liquidity = (liquidity_from_history(self._history, conid, quote, self._now()) if volume is None
-                     else liquidity_from_sessions(volume, quote))
+        liquidity = entry_liquidity(self._history, conid, quote, self._now(), volume)
         liquidity_max = self._liquidity_policy.max_quantity(liquidity)
         price = self._entry_price(quote)
         if not stop_price < price:

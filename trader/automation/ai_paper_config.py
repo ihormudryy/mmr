@@ -18,6 +18,7 @@ from trader.automation.risk_limits import PAPER_LIMITS, STEADY_LIMITS, RiskLimit
 logger = logging.getLogger(__name__)
 
 SUPPORTED_STYLES = frozenset({"intraday_long"})
+STYLE_NOT_ENABLED = "STYLE_NOT_ENABLED"
 KILL_BASES = ("start", "peak")
 OUTAGE_PAUSE_RANGE = (60, 3600)
 DEFAULT_MODEL_BUDGET_USD_PER_DAY = 2000.0
@@ -45,6 +46,9 @@ class AiPaperConfig:
     # SP2 Plan 2 Ruling 20: the owner's cap on model spend per New York day; served read-only to the ai service.
     model_budget_usd_per_day: float = DEFAULT_MODEL_BUDGET_USD_PER_DAY
     raw_section: Mapping[str, Any] = field(default_factory=lambda: MappingProxyType({}))
+
+    def style_enabled(self, style: str) -> bool:
+        return style in self.styles
 
 
 def load_ai_paper_config(

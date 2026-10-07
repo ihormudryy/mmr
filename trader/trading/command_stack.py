@@ -650,19 +650,21 @@ def _build_ai_paper_services(
         history=getattr(trader, "data", None),
         alpaca_history=lambda: _alpaca_provider(trader, Capability.HISTORY), now=now,
     )
-    decisions.attach_scope(DiscretionaryScopeService(
+    scope = DiscretionaryScopeService(
         contracts=contracts, volumes=volumes, quotes=quotes, accepted_feeds=accepted_feeds,
         filter_refusal=parts.filter_refusal, checks=parts.scope_checks, now=now,
-    ))
+    )
+    decisions.attach_scope(scope)
     actions = AiPaperActions(
         policy=parts.policy, deployments=deployments, broker=broker, config=parts.config,
         account_id=trader.ib_account, account_mode=account_mode, ledger=ledger, journal=journal,
         controls=controls, now=now,
     )
-    # The same quote authority and feed set as AiPaperEvidence: a baseline is sized like a real ENTER.
+    # The same quote authority, feed set and scope service as a real ENTER: a baseline is sized like one.
     baseline_sizer = AiPaperBaselineSizer(
         broker=broker, quotes=quotes, history=getattr(trader, "data", None), policy=parts.policy,
-        deployments=deployments, accepted_feeds=accepted_feeds, entry_filter=parts.entry_filter, now=now)
+        deployments=deployments, accepted_feeds=accepted_feeds, entry_filter=parts.entry_filter, now=now,
+        config=parts.config, scope=scope)
     return AiPaperServices(config=parts.config, policy=parts.policy, deployments=deployments,
                            decisions=decisions, decision_store=decision_store, actions=actions,
                            entry_filter=parts.entry_filter, epochs=epochs, signals=signals,

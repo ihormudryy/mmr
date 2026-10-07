@@ -302,9 +302,6 @@ async def test_one_experiment_reports_separate_books_and_an_incomplete_one_hides
     assert row == (derive_decision_id(position_cycle, f"close:{world.conid}"), aapl_trip(world)["round_trip_id"])
 
 
-@pytest.mark.xfail(strict=True, reason="cross-plan defect: PR #82's AiPaperBaselineSizer sizes strategy deployments "
-                                        "only; the discretionary digest a fixed_rule.v1 names is refused "
-                                        "DEPLOYMENT_KIND_MISMATCH, so every fixed-rule record is sizing_unavailable")
 @pytest.mark.asyncio
 async def test_the_fixed_rule_is_sized_like_a_real_discretionary_enter(stack):              # index ruling, spec 7
     world, node, _ = stack

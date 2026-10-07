@@ -125,7 +125,7 @@ test('killed and failed-safe sessions are visibly different from flat', () => {
 test('report strings are escaped', () => {
   const report = {...FULL_REPORT, warnings: [{code: 'X', detail: '<script>alert(1)</script>'}],
                   experiment: {...FULL_REPORT.experiment, id: '<script>'}};
-  assert.doesNotMatch(renderScoreboard(report), /<script>/);
+  assert.doesNotMatch(renderScoreboard(report), /<script/i);
   assert.equal(escapeHtml('<a href="x">&\''), '&lt;a href=&quot;x&quot;&gt;&amp;&#39;');
 });
 

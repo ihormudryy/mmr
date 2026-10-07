@@ -5,6 +5,7 @@ The dashboard never opens a DuckDB file. Errors are loud: never an empty 200.
 from __future__ import annotations
 
 import asyncio
+import logging
 import re
 from typing import Optional
 
@@ -13,6 +14,7 @@ from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse
 
 QUERY_TIMEOUT_S = 8
+logger = logging.getLogger(__name__)
 _EXPERIMENT_ID = re.compile(r"^exp-[0-9a-f]{20}$")
 
 
@@ -50,8 +52,9 @@ def create_scoreboard_router(cc) -> APIRouter:
         except TypedRpcRemoteError as exc:
             status = 403 if exc.code == "PERMISSION_DENIED" else 502
             return _error(status, exc.code, exc.message)
-        except (TimeoutError, ConnectionError) as exc:
-            return _error(502, "TRADER_TIMEOUT", f"get_scoreboard did not answer: {exc}")
+        except (TimeoutError, ConnectionError):
+            logger.warning("get_scoreboard did not answer", exc_info=True)
+            return _error(502, "TRADER_TIMEOUT", f"get_scoreboard did not answer within {QUERY_TIMEOUT_S} s")
         if isinstance(report, dict) and report.get("error_code"):
             return _error(404, report["error_code"], f"no experiment {experiment_id}")
         return JSONResponse(report)

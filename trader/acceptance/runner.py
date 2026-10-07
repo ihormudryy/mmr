@@ -229,7 +229,7 @@ def run(endpoints: Endpoints, *, run_id: Optional[str], conids: tuple[int, int],
                               order_evidence=_order_evidence(results), now=now())
         path = _write_report(report, signer, Path(report_path).expanduser() if report_path
                              else acceptance_root() / chosen / "run-report.json")
-        return RunOutcome(results, path, chosen, False, outcome.passed)
+        return RunOutcome(results, path, chosen, False, report.passed)     # the signed verdict decides
     finally:
         clients.close()
 

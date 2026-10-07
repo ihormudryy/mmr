@@ -138,3 +138,33 @@ def loop_thread():
     lt = LoopThread()
     yield lt
     lt.stop()
+
+
+def _sdk_reading(orders, positions=()):
+    from types import SimpleNamespace
+    from trader.sdk import MMR
+    replies = {"get_command": {"state": "RESOLVED", "error_code": None},
+               "get_positions": {"positions": list(positions)},
+               "get_broker_order_evidence": {"generation_id": 9, "promoted": True, "orders": orders}}
+    sdk = object.__new__(MMR)
+    sdk._typed_query_client = SimpleNamespace(call=lambda method, body, _t: replies[method])
+    sdk._typed_command_client = object()
+    return sdk
+
+
+@pytest.mark.parametrize("status", ["BrokerStatusNotParsed", None, "PendingCancel", "ApiPending", "Submitted"])
+def test_wait_flat_blocks_on_an_undeleted_order_with_a_non_terminal_status(status):      # review #35
+    from trader.sdk import MMR
+    stop = {"order_entity_id": "og-x:stop", "conid": 265598, "status": status, "deleted": False}
+    state = MMR.wait_flat(_sdk_reading([stop]), "flatten-1", timeout=0.0, sleep=lambda s: None,
+                          clock=lambda: 0.0)
+    assert state["flat"] is False and state["working_orders"] == [stop]
+
+
+@pytest.mark.parametrize("order", [{"status": "Filled", "deleted": False}, {"status": "Cancelled", "deleted": False},
+                                   {"status": "BrokerStatusNotParsed", "deleted": True}])
+def test_wait_flat_accepts_broker_proven_terminal_or_deleted_orders(order):
+    from trader.sdk import MMR
+    state = MMR.wait_flat(_sdk_reading([{"order_entity_id": "og-x:stop", **order}]), "flatten-1", timeout=0.0,
+                          sleep=lambda s: None, clock=lambda: 0.0)
+    assert state["flat"] is True

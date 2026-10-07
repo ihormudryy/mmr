@@ -151,7 +151,8 @@ def test_run_and_finish_end_to_end_over_the_cli(served_with_keys, cli, signing_k
               json_mode=True)
     data = _json(out)
     run_id = data["run_id"]
-    assert data["passed"] is True, data
+    assert all(r["passed"] for r in data["results"]), data
+    assert data["passed"] is False and cli.code == 1     # review #35 r2: synthetic evidence fails the signed run report
     drive_session_to_flat(served_with_keys)
     out = cli(f"experiment acceptance finish --run-id {run_id} --signing-key {signing_key}", json_mode=True)
     finish = _json(out)
@@ -214,3 +215,13 @@ def test_finish_exit_status_follows_the_signed_report(monkeypatch, capsys, repor
     except SystemExit as exc:
         exit_code = exc.code
     assert exit_code == code
+
+
+
+def test_a_passing_scenario_with_a_failing_signed_run_report_exits_nonzero(served_with_keys, cli, signing_key):
+    market(served_with_keys)                                                     # review #35 r2
+    served_with_keys.sim.script_target_fills([1])
+    out = cli(f"experiment acceptance run --place-orders --confirm-account {ACCOUNT} --signing-key {signing_key}")
+    from trader.acceptance.scenario import RUN_STEPS
+    assert all(f"[PASS] {name}\n" in out for name in RUN_STEPS) and "report passed: False" in out
+    assert "B open, protected" not in out and cli.code == 1

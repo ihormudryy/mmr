@@ -23,10 +23,11 @@ import json
 from dataclasses import dataclass
 from typing import Any, Optional
 
+from trader.acceptance.order_status import TERMINAL_STATUSES
+
 WINDOW_SECONDS = 60.0
 POLL_SECONDS = 0.5
 FAIL_GRACE_SECONDS = 5.0
-_TERMINAL = ("Filled", "Cancelled", "ApiCancelled", "Inactive")
 
 
 @dataclass(frozen=True)
@@ -92,7 +93,7 @@ def whole_fill_without_partial(reading: dict, legs: dict, quantity: float) -> bo
     events = target.get("status_events") or []
     partial = any(0 < e["filled_quantity"] < quantity for e in events)
     filled = target.get("status") == "Filled" or any(e["filled_quantity"] >= quantity for e in events)
-    stop_done = stop is None or stop.get("status") in _TERMINAL
+    stop_done = stop is None or stop.get("status") in TERMINAL_STATUSES
     return filled and not partial and stop_done
 
 

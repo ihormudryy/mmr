@@ -1920,7 +1920,7 @@ class MMR:
         return str(self._typed_query.call('get_ib_account', {}, dict).get('account_id') or '')
 
     def flat_state(self, command_id: str) -> dict:
-        """The command and the broker: open positions and working orders on a promoted generation."""
+        """The command and the broker: open positions and orders that may still fill on a promoted generation."""
         from trader.messaging.typed_rpc import TypedRpcRemoteError
         try:
             command = self._typed_query.call('get_command', {'command_id': command_id}, dict)
@@ -1928,9 +1928,9 @@ class MMR:
             command = {'state': None, 'error_code': ex.code}
         positions = [p for p in self._typed_query.call('get_positions', {}, dict).get('positions') or []
                      if float(p.get('position') or 0.0)]
+        from trader.acceptance.order_status import may_still_fill
         evidence = self._typed_query.call('get_broker_order_evidence', {'conid': None}, dict)
-        working = [o for o in evidence.get('orders') or []
-                   if o.get('status') in ('Submitted', 'PreSubmitted', 'PendingSubmit', 'PendingCancel', 'ApiPending')]
+        working = [o for o in evidence.get('orders') or [] if may_still_fill(o)]
         return {'command': command, 'positions': positions, 'working_orders': working,
                 'capture_error': evidence.get('capture_error')}
 

@@ -3292,6 +3292,7 @@ def _print_acceptance_results(phase: str, outcome) -> None:
     for line in print_lines_for(outcome.results):
         console.print(line, markup=False)
     console.print(f'signed report: {outcome.report_path}', markup=False)
+    console.print(f'report passed: {outcome.passed}', markup=False)
 
 
 def _handle_experiment(mmr: MMR, args: argparse.Namespace):

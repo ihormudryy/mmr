@@ -51,7 +51,7 @@ liquidation finite, above zero, at most 5 minutes old, stable within 0.1 % over
 | Step | Command | Pass | Fail → |
 |---|---|---|---|
 | P4.1 dry run | `mmr experiment acceptance run` | prints the planned calls, "dry run", sends nothing | stop |
-| P4.2 run | `mmr experiment acceptance run --place-orders --confirm-account <DU account> --signing-key ~/.config/mmr/keys/acceptance/operator.key --report ~/.local/share/mmr/acceptance/run-report.json` | every step `PASS` including `shrink_proof` (`oca_shrink: PROVEN`) and `settle_s`; ends with "B open, protected; waiting for the session flatten"; note the printed `run_id`. `OCA_SHRINK_UNPROVEN`: the session is **not** acceptance; flatten (A2), stop, try another day; do not retry today. `OCA_SIBLING_NOT_SHRUNK` or `PROBE_OCA_LOST`: abort A4 at once | abort A2 |
+| P4.2 run | `mmr experiment acceptance run --place-orders --confirm-account <DU account> --signing-key ~/.config/mmr/keys/acceptance/operator.key --report ~/.local/share/mmr/acceptance/run-report.json` | every step `PASS` including `shrink_proof` (`oca_shrink: PROVEN`) and `settle_s`; prints `report passed: True` and ends with "B open, protected; waiting for the session flatten" (exit 0 only when the signed report passed); note the printed `run_id`. `OCA_SHRINK_UNPROVEN`: the session is **not** acceptance; flatten (A2), stop, try another day; do not retry today. `OCA_SIBLING_NOT_SHRUNK` or `PROBE_OCA_LOST`: abort A4 at once | abort A2 |
 | P4.3 orders | `mmr --json orders` | only B's protective stop is working | abort A2 |
 
 What P4.2 does, in order: two preflight reads 30 s apart (it refuses

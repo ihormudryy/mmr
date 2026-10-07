@@ -464,6 +464,9 @@ class AutomatedIntentCommandService:
                 cmd.command_id, "OUTCOME_UNKNOWN", "DISPATCH_AMBIGUOUS", False,
                 outcome=outcome,
             )
+        if self._schedule_reconcile is not None:
+            # The reconciler resolves the entry once the broker shows its orders.
+            self._schedule_reconcile(cmd.command_id)
         return self._receipt(cmd.command_id, "SUBMITTED", None, False, outcome=outcome)
 
     @staticmethod

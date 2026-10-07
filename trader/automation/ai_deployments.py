@@ -25,6 +25,9 @@ from trader.research.canonical import canonical_json_bytes
 
 AI_DEPLOYMENT_MIGRATION_VERSION = 55
 STRATEGY_DIGEST_PROVENANCE = "CLAIMED_NOT_VERIFIED"
+OPERATOR_ATTESTED = "OPERATOR_ATTESTED"
+STRATEGY_KIND = "strategy"
+DISCRETIONARY_KIND = "discretionary"
 VERDICTS = ("DEPLOY", "SHADOW", "REJECT")
 MAX_CONIDS = 20
 _DIGEST_DOMAIN = b"mmr.ai-deployment.v1\x00"
@@ -40,7 +43,7 @@ def apply_ai_deployment_migration(migrator: SchemaMigrator) -> bool:
         """CREATE TABLE IF NOT EXISTS ai_deployments (
             digest VARCHAR PRIMARY KEY, record_json VARCHAR NOT NULL, principal VARCHAR NOT NULL,
             command_id VARCHAR NOT NULL, sealed_at TIMESTAMPTZ NOT NULL,
-            strategy_digest_provenance VARCHAR NOT NULL)""",
+            strategy_digest_provenance VARCHAR NOT NULL, kind VARCHAR NOT NULL)""",
     ))
 
 
@@ -163,7 +166,7 @@ def deployment_digest(deployment: AiDeployment) -> str:
 
 
 class AiDeploymentStore:
-    """Insert-only store; there is no update, delete or unseal."""
+    """Insert-only store of both kinds (SP2 Plan 3 ruling 1); there is no update, delete or unseal."""
 
     def __init__(self, db: Any, now: Callable[[], dt.datetime]):
         self._db = db
@@ -172,27 +175,56 @@ class AiDeploymentStore:
     def register(self, deployment: AiDeployment, *, principal: str, command_id: str) -> tuple[str, bool]:
         if not isinstance(deployment, AiDeployment):
             raise DeploymentRefused("DEPLOYMENT_INVALID", "deployment must be AiDeployment")
-        digest = deployment_digest(deployment)
-        record_json = canonical_json_bytes(deployment.to_json()).decode("utf-8")
+        return self._seal(deployment_digest(deployment), deployment.to_json(), STRATEGY_KIND,
+                          STRATEGY_DIGEST_PROVENANCE, principal, command_id)
+
+    def register_discretionary(self, deployment: Any, *, principal: str, command_id: str) -> tuple[str, bool]:
+        from trader.automation.discretionary_deployment import DiscretionaryDeployment, discretionary_digest
+        if not isinstance(deployment, DiscretionaryDeployment):
+            raise DeploymentRefused("DEPLOYMENT_INVALID", "deployment must be DiscretionaryDeployment")
+        return self._seal(discretionary_digest(deployment), deployment.to_json(), DISCRETIONARY_KIND,
+                          OPERATOR_ATTESTED, principal, command_id)
+
+    def _seal(self, digest: str, record: dict, kind: str, provenance: str, principal: str,
+              command_id: str) -> tuple[str, bool]:
+        record_json = canonical_json_bytes(record).decode("utf-8")
         now = self._now()
 
         def write(conn) -> bool:
             if conn.execute("SELECT 1 FROM ai_deployments WHERE digest = ?", [digest]).fetchone():
                 return False
-            conn.execute("INSERT INTO ai_deployments VALUES (?, ?, ?, ?, ?, ?)",
-                         [digest, record_json, principal, command_id, now, STRATEGY_DIGEST_PROVENANCE])
+            conn.execute("INSERT INTO ai_deployments (digest, record_json, principal, command_id, sealed_at, "
+                         "strategy_digest_provenance, kind) VALUES (?, ?, ?, ?, ?, ?, ?)",
+                         [digest, record_json, principal, command_id, now, provenance, kind])
             return True
         return digest, self._db.transaction(write)
 
-    def get_sealed(self, digest: str) -> AiDeployment:
-        row = self._row(digest, "record_json")
+    def get_sealed_any(self, digest: str) -> Any:
+        """A strategy ``AiDeployment`` or a ``DiscretionaryDeployment``; the digest is re-checked on every read."""
+        from trader.automation.discretionary_deployment import DiscretionaryDeployment, discretionary_digest
+        kind, raw = self._row(digest, "kind, record_json")
+        parsers = {STRATEGY_KIND: (AiDeployment.from_json, deployment_digest),
+                   DISCRETIONARY_KIND: (DiscretionaryDeployment.from_json, discretionary_digest)}
+        if kind not in parsers:
+            raise DeploymentRefused("DEPLOYMENT_TAMPERED", f"stored kind {kind!r} is unknown")
+        parse, digest_of = parsers[kind]
         try:
-            deployment = AiDeployment.from_json(json.loads(row[0]))
+            deployment = parse(json.loads(raw))
         except Exception:
             raise DeploymentRefused("DEPLOYMENT_TAMPERED", "stored record does not parse") from None
-        if not hmac.compare_digest(deployment_digest(deployment), digest):
+        if not hmac.compare_digest(digest_of(deployment), digest):
             raise DeploymentRefused("DEPLOYMENT_TAMPERED", "stored record does not match its digest")
         return deployment
+
+    def get_sealed(self, digest: str) -> AiDeployment:
+        """Strategy deployments only: no SP1 caller can mistake a discretionary one for a strategy."""
+        deployment = self.get_sealed_any(digest)
+        if not isinstance(deployment, AiDeployment):
+            raise DeploymentRefused("DEPLOYMENT_KIND_MISMATCH", "this digest names a discretionary deployment")
+        return deployment
+
+    def kind_of(self, digest: str) -> str:
+        return self._row(digest, "kind")[0]
 
     def provenance(self, digest: str) -> str:
         return self._row(digest, "strategy_digest_provenance")[0]

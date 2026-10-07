@@ -63,6 +63,7 @@ class TraderMarket:
         self.details_by_conid = {CONID: details(conid=CONID, symbol="AAPL"), MSFT: details(conid=MSFT, symbol="MSFT")}
         self.requests: list[tuple[str, dict]] = []
         self.scanned: list = []
+        self.extra_prepare: Optional[Callable[[Any], None]] = None       # a test's own trader change
 
     def get(self, url, params=None, headers=None, timeout=None):
         path = url.split(ALPACA_HOST, 1)[-1]
@@ -99,6 +100,8 @@ class TraderMarket:
             pytest.fail("discovery used the IB scanner")
         for name in SCANNER_METHODS:
             setattr(trader.client.ib, name, scanner)
+        if self.extra_prepare is not None:
+            self.extra_prepare(trader)
 
 
 def decisions_block(world, discretionary_digest: str, extra: str = "") -> str:

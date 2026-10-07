@@ -35,8 +35,10 @@ def loop_thread():
     thread.stop()
 
 
-async def build(tmp_path, loop_thread, monkeypatch, *, extra="", **world_options):
-    market = TraderMarket()
+async def build(tmp_path, loop_thread, monkeypatch, *, extra="", market=None, **world_options):
+    # The trader reads trading_filters.yaml from here, never from the developer's ~/.config/mmr.
+    monkeypatch.setattr("trader.trading.trading_filter._default_path", lambda: tmp_path / "trading_filters.yaml")
+    market = market or TraderMarket()
     world = TraderWorld(tmp_path, loop_thread, monkeypatch, prepare=market.prepare, **world_options)
     market.now = world.served.now
     try:

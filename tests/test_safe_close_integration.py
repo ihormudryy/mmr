@@ -12,301 +12,27 @@ from __future__ import annotations
 
 import asyncio
 import datetime as dt
-import threading
-from contextlib import contextmanager
-from dataclasses import replace
 from decimal import Decimal
 from types import SimpleNamespace
 
 import pytest
-import reactivex as rx
 
-from trader.automation.protective_order_saga import BrokerOrderEvent, SagaState
+from tests.sp1_fixtures import (  # moved there in Plan 6 Task 1; the private names stay for these bodies
+    ACCOUNT, CONID, FRIDAY, IB_DONE, OTHER, UTC, BrokerSim, Composed, Ingest, LoopThread, Universe,
+    enable_automation, et, restart,
+)
+from trader.automation.protective_order_saga import SagaState
 from trader.automation.session_controller import SessionController
-from trader.data.broker_state import BrokerAccountRow, BrokerOrderRow, BrokerPositionRow, BrokerStateStore
-from trader.data.domain_journal import DomainJournal
-from trader.data.duckdb_store import DuckDBConnection
-from trader.data.schema_migrations import SchemaMigrator
 from trader.trading.command_coordinator import CommandRequest
-from trader.trading.command_policy import CommandAuthorityPolicy
-from trader.trading.liquidation_service import BrokerChangesBusy
-from trader.trading.order_correlation import classify_leg, decode_order_ref
-from trader.trading.risk_gate import RiskGate, RiskLimits
-from trader.trading.trading_runtime import Trader
 
-UTC = dt.timezone.utc
-ACCOUNT = "DU111111"
-CONID = 265598
-OTHER = 4815747
-FRIDAY = dt.date(2026, 7, 17)
-
-
-def _et(hour, minute):
-    from zoneinfo import ZoneInfo
-    return dt.datetime(FRIDAY.year, FRIDAY.month, FRIDAY.day, hour, minute,
-                       tzinfo=ZoneInfo("America/New_York")).astimezone(UTC)
-
-
-class _LoopThread:
-    def __init__(self):
-        self.loop = asyncio.new_event_loop()
-        self.thread = threading.Thread(target=self.loop.run_forever, daemon=True)
-        self.thread.start()
-
-    def run(self, coro, timeout=10.0):
-        return asyncio.run_coroutine_threadsafe(coro, self.loop).result(timeout=timeout)
-
-    def stop(self):
-        self.loop.call_soon_threadsafe(self.loop.stop)
-        self.thread.join(timeout=2)
-
-
-class _Ingest:
-    """Production shape: ``is_ready`` is a property; a sync request promotes a generation."""
-    def __init__(self, sim):
-        self.sim = sim
-        self.syncs = 0
-        self.ready = True          # False: a newer generation is staging, the enumeration is not complete
-        self.before_hold = None    # an ingest batch applied just before a close holds broker changes
-        self.after_hold = None     # an IB update that lands right after a close lets the hold go
-        self.holding = 0           # holds taken and not yet let go
-
-    @property
-    def is_ready(self):
-        return self.ready
-
-    @contextmanager
-    def hold_changes(self):
-        """Ruling 48: the sim writes only inside a sync, so holding is refusing while one is staging."""
-        if self.before_hold is not None:
-            self.before_hold()
-        if not self.ready:
-            raise BrokerChangesBusy("broker generation is staging")
-        self.holding += 1
-        try:
-            yield
-        finally:
-            self.holding -= 1
-            if self.after_hold is not None:
-                self.after_hold()
-
-    async def run_broker_sync(self, _client):
-        self.syncs += 1
-        if self.sim.auto_refresh:
-            self.sim.promote()
-        return True
-
-
-_IB_DONE = ("Filled", "Cancelled", "ApiCancelled", "Inactive")   # ib_async OrderStatus.DoneStates
-
-
-class _BrokerSim:
-    """IB and the broker enumeration. Orders become visible only when promote() writes them."""
-
-    def __init__(self, trader):
-        self.trader = trader
-        self.held: dict[int, float] = {}
-        self.orders: dict[str, BrokerOrderRow] = {}
-        self.perm: dict[str, int] = {}
-        self.ib_trades: dict[str, SimpleNamespace] = {}   # ib_async keeps terminal trades for the session
-        self.hidden: set[str] = set()
-        self.placed: list[tuple] = []
-        self.cancelled: list[str] = []
-        self.ack = {"MKT": "Submitted", "STP": "PreSubmitted", "LMT": "Submitted"}
-        self.daily_pnl = 0.0
-        self.auto_refresh = False
-        self.generations = 0
-        self._next_perm = 9000
-
-    # -- fake IB client ----------------------------------------------------------------
-    def isConnected(self):
-        return True
-
-    def accountValues(self, account=None):
-        return [SimpleNamespace(tag="NetLiquidation", currency="USD", account=ACCOUNT, value="100000")]
-
-    def managedAccounts(self):
-        return [ACCOUNT]
-
-    def trades(self):
-        return list(self.ib_trades.values())
-
-    def openTrades(self):
-        return [t for t in self.ib_trades.values() if t.orderStatus.status not in _IB_DONE]
-
-    def positions(self, account=None):
-        return [SimpleNamespace(account=ACCOUNT, contract=SimpleNamespace(conId=c), position=q)
-                for c, q in self.held.items() if q]
-
-    def cancelOrder(self, order):
-        entity = next(e for e, t in self.ib_trades.items() if t.order is order)
-        self.cancelled.append(entity)
-
-    # -- fake executioner ------------------------------------------------------------------
-    async def subscribe_place_order_direct(self, contract, order):
-        self._next_perm += 1
-        order.orderId = order.permId = self._next_perm
-        group = decode_order_ref(order.orderRef)
-        leg = classify_leg(order.orderType, 0, order.orderId, group)
-        entity = f"{group}:{leg}"
-        price = {"STP": order.auxPrice, "LMT": order.lmtPrice}.get(order.orderType)
-        self.placed.append((group, order.orderType, order.action, order.totalQuantity, price, order.ocaGroup or None))
-        self.add_order(entity, group, leg, order.action, order.orderType, order.totalQuantity,
-                       conid=int(contract.conId), order=order)
-        echo = SimpleNamespace(order=order, orderStatus=SimpleNamespace(status="PendingSubmit"))
-        ack = SimpleNamespace(order=order, orderStatus=SimpleNamespace(status=self.ack[order.orderType]))
-        return rx.from_iterable([echo, ack])
-
-    # -- broker state ------------------------------------------------------------------------
-    def add_order(self, entity, group, leg, action, order_type, quantity, *, conid=CONID, status="Submitted",
-                  order=None):
-        if order is None:
-            self._next_perm += 1
-            order = SimpleNamespace(permId=self._next_perm, action=action, totalQuantity=float(quantity), ocaGroup="")
-        self.perm[entity] = order.permId
-        self.ib_trades[entity] = SimpleNamespace(order=order, contract=SimpleNamespace(conId=conid),
-                                                 orderStatus=SimpleNamespace(status=status, filled=0.0))
-        self.orders[entity] = BrokerOrderRow(
-            order_entity_id=entity, account_id=ACCOUNT, conid=conid, symbol="AAPL", order_group_id=group,
-            leg=leg, is_external=False, action=action, order_type=order_type, total_quantity=float(quantity),
-            filled_quantity=0.0, avg_fill_price=None, limit_price=None, stop_price=None, tif="DAY",
-            status=status, deleted=False, revision=1, source_timestamp=_et(11, 0),
-            oca_group=getattr(order, "ocaGroup", "") or None,
-            oca_type=getattr(order, "ocaType", 0) or None)
-
-    def set_status(self, entity, status, *, filled=None, total=None):
-        row = self.orders[entity]
-        self.orders[entity] = replace(row, status=status,
-                                      filled_quantity=row.filled_quantity if filled is None else float(filled),
-                                      total_quantity=row.total_quantity if total is None else float(total))
-        trade = self.ib_trades.get(entity)
-        if trade is not None:
-            trade.orderStatus.status = status
-            if filled is not None:
-                trade.orderStatus.filled = float(filled)
-
-    def entity_for(self, group_prefix):
-        return next(e for e in self.orders if e.startswith(group_prefix))
-
-    def promote(self, started_at=None):
-        store, db = self.trader.broker_state_store, self.trader.journal_db
-
-        def write(conn):
-            gid = store.open_generation_in_tx(conn, ("account",), started_at or _et(11, 0))
-            store.upsert_account_in_tx(conn, BrokerAccountRow(
-                ACCOUNT, "paper", 100_000.0, None, None, None, None,
-                {"DailyPnL:USD": str(self.daily_pnl)}, 1, _et(11, 0)))
-            for conid, quantity in self.held.items():
-                store.upsert_position_in_tx(conn, BrokerPositionRow(
-                    ACCOUNT, conid, "AAPL", "STK", "SMART", "USD", quantity, 90.0, 100.0, quantity * 100.0,
-                    0.0, 0.0, 0.0, quantity == 0, 1, _et(11, 0)))
-            for entity, row in self.orders.items():
-                if entity in self.hidden:
-                    continue
-                store.upsert_order_in_tx(conn, row)
-                store.bind_alias_in_tx(conn, "perm_id", str(self.perm[entity]), ACCOUNT, "", entity, _et(11, 0))
-            cursor = conn.execute("SELECT COALESCE(MAX(source_cursor), 0) FROM domain_event_journal").fetchone()[0]
-            store.mark_generation_promoted_in_tx(conn, gid, int(cursor), _et(11, 0))
-            return gid
-        self.generations += 1
-        return db.transaction(write)
-
-
-class _Universe:
-    def resolve_symbol(self, conid, **_kwargs):
-        if conid not in (CONID, OTHER):
-            return []
-        return [SimpleNamespace(conId=conid, symbol="AAPL", secType="STK", exchange="SMART",
-                                primaryExchange="NASDAQ", currency="USD")]
-
-
-class _Composed:
-    def __init__(self, tmp_path, loop_thread, clock, *, automation=False, sim=None, ai_paper=False):
-        from trader.trading.command_stack import build_command_stack
-
-        db = DuckDBConnection.get_instance(str(tmp_path / "journal.duckdb"))
-        migrator = SchemaMigrator(db)
-        journal = DomainJournal(db)
-        journal.migrate(migrator)
-        store = BrokerStateStore(db)
-        store.migrate(migrator)
-        trader = object.__new__(Trader)
-        self.trader, self.clock, self.loop_thread = trader, clock, loop_thread
-        self.sim = sim or _BrokerSim(trader)
-        self.sim.trader = trader
-        trader.journal_db, trader.domain_journal, trader.broker_state_store = db, journal, store
-        trader.broker_ingest = _Ingest(self.sim)
-        trader.risk_gate = RiskGate(RiskLimits(max_daily_loss=1000.0),
-                                    event_store=SimpleNamespace(count_since=lambda **_k: 0))
-        trader.universe_accessor = _Universe()
-        trader.portfolio = SimpleNamespace(get_positions=lambda: [], get_portfolio_items=lambda: [])
-        trader.book = SimpleNamespace(get_open_order_count=lambda: 0)
-        trader.client = SimpleNamespace(ib=self.sim)
-        trader.executioner = self.sim
-        trader.ib_account = ACCOUNT
-        trader.paper_trading = True
-        trader._main_loop = loop_thread.loop
-        trader.get_pnl = lambda: [SimpleNamespace(dailyPnL=self.sim.daily_pnl)]
-        if automation:
-            _enable_automation(trader, tmp_path)
-        if ai_paper:
-            from trader.automation.ai_paper_config import AiPaperConfig
-            trader.ai_paper_config = AiPaperConfig(enabled=True)
-
-        async def no_margin(*_a):
-            raise RuntimeError("what-if is not part of this test")
-        trader.check_order_margin = no_margin
-        self.stack = build_command_stack(trader, CommandAuthorityPolicy(enabled=True, max_drift_bps=50.0),
-                                         now=lambda: clock[0])
-        self.liquidation = self.stack.liquidation_service
-        self.saga = self.stack.protective_order_saga
-
-    def tick(self):
-        """One production recovery tick: a coroutine on the trader loop awaiting the worker."""
-        return self.loop_thread.run(self.liquidation.tick_async())
-
-    def run_session(self, at):
-        self.clock[0] = at
-        return self.loop_thread.run(self.liquidation.run_async(self.stack.session_controller.run_due, at))
-
-    def protected_entry(self, *, quantity=10.0, stop=95.0, target=120.0, command_id="entry-1", conid=CONID):
-        """A durable PROTECTED saga and its working stop and target, as after a filled bracket."""
-        og = f"og-{command_id}"
-        state = SagaState(
-            command_id=command_id, order_group_id=og, order_ref=f"mmr:{og}", state="PROTECTED",
-            account_id=ACCOUNT, conid=conid, side="BUY", requested_quantity=Decimal(str(quantity)),
-            filled_quantity=Decimal(str(quantity)), protection_quantity=Decimal(str(quantity)),
-            protection_working=True, stop_working=True, target_working=True, revision=3,
-            plan_json={"legs": [{"role": "stop", "stop_price": str(stop)},
-                                {"role": "take_profit", "limit_price": str(target)}]})
-        self.saga._persist(state, self.clock[0], from_state=None)
-        self.sim.held[conid] = quantity
-        self.sim.add_order(f"{og}:stop", og, "stop", "SELL", "STP", quantity, conid=conid, status="PreSubmitted")
-        self.sim.add_order(f"{og}:take_profit", og, "take_profit", "SELL", "LMT", quantity, conid=conid)
-        return og
-
-    def saga_event(self, og, leg, entity, status, *, event_id, filled=0.0):
-        return self.saga.on_broker_event(BrokerOrderEvent(og, leg, status, filled, 10.0, 1, event_id,
-                                                          self.clock[0], order_entity_id=entity))
-
-    def cancel_landed(self, *entities):
-        """The broker applied the cancels: rows Cancelled, open trades gone."""
-        for entity in entities:
-            self.sim.set_status(entity, "Cancelled")
-
-
-def _enable_automation(trader, tmp_path):
-    from cryptography.hazmat.primitives.asymmetric import ed25519
-    from trader.research.signing import public_key_pem
-
-    keys = tmp_path / "keys"
-    keys.mkdir(exist_ok=True)
-    (keys / "verify.pem").write_bytes(public_key_pem(ed25519.Ed25519PrivateKey.generate().public_key()))
-    (tmp_path / "artifacts").mkdir(exist_ok=True)
-    trader.automation_enabled, trader.automation_live_enabled = True, False
-    trader.automation_public_key_ring_path = str(keys)
-    trader.automation_artifact_bundle_path = str(tmp_path / "artifacts")
-    trader.automation_expected_artifact_id = "artifact-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+_et = et
+_LoopThread = LoopThread
+_Ingest = Ingest
+_IB_DONE = IB_DONE
+_BrokerSim = BrokerSim
+_Universe = Universe
+_Composed = Composed
+_enable_automation = enable_automation
 
 
 @pytest.fixture
@@ -873,8 +599,7 @@ def test_target_leg_rejected_by_the_broker_escalates_to_a_full_close(composed):
 
 def _restart(composed, tmp_path):
     """Stop the old worker, build a new stack over the same journal and the same broker."""
-    composed.liquidation.worker.shutdown()
-    return _Composed(tmp_path, composed.loop_thread, composed.clock, sim=composed.sim)
+    return restart(composed, tmp_path)
 
 
 def test_crash_between_journal_and_broker_call_restarts_without_a_duplicate(tmp_path, composed):

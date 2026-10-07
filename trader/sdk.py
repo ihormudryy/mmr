@@ -1910,6 +1910,56 @@ class MMR:
         body = {} if experiment_id is None else {'experiment_id': experiment_id}
         return self._typed_query.call('verify_scoreboard', body, dict)
 
+    def flatten(self, reason: str, command_id: Optional[str] = None) -> dict:
+        """``liquidate_account`` (SP1 Plan 6): flatten the whole account. Paper only from the CLI."""
+        import uuid
+        body = {'command_id': command_id or f'flatten-{uuid.uuid4().hex[:16]}', 'reason': reason}
+        return self._typed_command.call('liquidate_account', body, dict)
+
+    def account_id(self) -> str:
+        return str(self._typed_query.call('get_ib_account', {}, dict).get('account_id') or '')
+
+    def flat_state(self, command_id: str) -> dict:
+        """The command and the broker: open positions and orders that may still fill on a promoted generation."""
+        from trader.messaging.typed_rpc import TypedRpcRemoteError
+        try:
+            command = self._typed_query.call('get_command', {'command_id': command_id}, dict)
+        except TypedRpcRemoteError as ex:
+            command = {'state': None, 'error_code': ex.code}
+        positions = [p for p in self._typed_query.call('get_positions', {}, dict).get('positions') or []
+                     if float(p.get('position') or 0.0)]
+        from trader.acceptance.order_status import may_still_fill
+        evidence = self._typed_query.call('get_broker_order_evidence', {'conid': None}, dict)
+        working = [o for o in evidence.get('orders') or [] if may_still_fill(o)]
+        return {'command': command, 'positions': positions, 'working_orders': working,
+                'capture_error': evidence.get('capture_error')}
+
+    def wait_flat(self, command_id: str, timeout: float = 300.0, *, sleep=None, clock=None,
+                  poll: float = 2.0) -> dict:
+        """Poll until the command resolved and the broker shows no position and no working order."""
+        import time as _time
+        sleep, clock = sleep or _time.sleep, clock or _time.monotonic
+        deadline = clock() + timeout
+        while True:
+            state = self.flat_state(command_id)
+            resolved = (state['command'] or {}).get('state') == 'RESOLVED'
+            state['flat'] = (resolved and not state['positions'] and not state['working_orders']
+                             and not state['capture_error'])
+            if state['flat'] or clock() >= deadline:
+                return state
+            sleep(poll)
+
+    def acceptance_preflight(self) -> dict:
+        """``get_acceptance_preflight`` (SP1 Plan 6): one reading of the clean-account gate, signed as cli."""
+        return self._typed_query.call('get_acceptance_preflight', {}, dict)
+
+    def acceptance_endpoints(self) -> 'Endpoints':
+        """Where ``mmr experiment acceptance`` dials the trader and finds the RPC keys (host only)."""
+        from trader.acceptance.runner import Endpoints
+        return Endpoints(address=self._typed_address, query_port=self._typed_query_port,
+                         command_port=self._typed_command_port, keys_dir=self._rpc_keys_dir,
+                         timeout=float(self._timeout))
+
     def experiment_trips(self, experiment_id: str) -> dict:
         """``get_experiment_trips``: conid, quantities and state of each round trip."""
         return self._typed_query.call('get_experiment_trips', {'experiment_id': experiment_id}, dict)

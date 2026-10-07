@@ -24,7 +24,9 @@ P5 controlled scaling owns **50-59** (signed allocation authorities begin at
 migration 50; OVERRIDE event at 52; portfolio risk authority at 53).
 SP1 ``ai_paper`` path (Plan 3) uses **54-56** in the P5 range: 54 risk
 policies and sessions, 55 deployments, 56 decisions; Plan 5 owns 60-69,
-Plan 4 70-79. Plan 4 uses **70** (experiments).
+Plan 4 70-79. Plan 4 uses **70** (experiments). SP1 Plan 6 (acceptance) owns
+**80-89**: 80 acceptance marks, 81 broker order events (the status history the
+acceptance shrink proof reads).
 
 ``SchemaMigrator`` is deliberately storage-agnostic about *which* file it
 targets — it operates on whatever ``DuckDBConnection`` it is constructed

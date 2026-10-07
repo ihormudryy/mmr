@@ -1,7 +1,7 @@
 """Plan 3 Task 10 (R26): AI entries are cancelled at the entry cutoff, an ambiguous cancel is
 reconciled from the broker, and a partial fill keeps protection sized to the fill.
 
-Runs on Plan 1's composed stack (tests/test_safe_close_integration.py) with ai_paper on:
+Runs on Plan 1's composed stack (tests/sp1_fixtures.py) with ai_paper on:
 the real command stack, session controller, liquidation service and protective saga over a
 simulated broker.
 """
@@ -12,7 +12,7 @@ from decimal import Decimal
 
 import pytest
 
-from tests.test_safe_close_integration import ACCOUNT, CONID, _Composed, _et, _LoopThread
+from tests.sp1_fixtures import ACCOUNT, CONID, Composed as _Composed, LoopThread as _LoopThread, et as _et
 from trader.automation.ai_entry_cutoff import cutoff_child_id, is_ai_entry
 from trader.automation.protective_order_saga import SagaState
 
@@ -85,7 +85,7 @@ class ComposedAi(_Composed):
 
     def reprotect_root(self):
         from trader.automation.session_controller import SessionController
-        from tests.test_safe_close_integration import FRIDAY
+        from tests.sp1_fixtures import FRIDAY
         return f"{SessionController.cancel_command_id(ACCOUNT, FRIDAY)}-aip-reprotect-{CONID}"
 
 

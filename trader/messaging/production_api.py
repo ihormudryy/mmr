@@ -2519,6 +2519,8 @@ def build_production_registry(
         if getattr(command_stack, "experiments", None) is not None:
             register_experiment_authority(registry, command_stack,
                                           account_id=getattr(trader, 'ib_account', None))
+            from trader.messaging.acceptance_surface import register_acceptance_surface
+            register_acceptance_surface(registry, trader, command_stack)
     elif command_coordinator is not None and proposal_service is not None and proposal_repository is not None:
         register_command_authority(
             registry, command_coordinator, proposal_service, proposal_repository,

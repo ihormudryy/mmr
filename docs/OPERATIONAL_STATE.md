@@ -379,6 +379,14 @@ are separate; each loader refuses the other kind.
 
 ## Next operator session (paper soak)
 
+**SP1 paper acceptance (Plan 6):** before SP2 trades, run one real IB paper
+session by [`docs/PAPER_ACCEPTANCE_SP1.md`](PAPER_ACCEPTANCE_SP1.md): the
+clean-account gate (`mmr experiment acceptance preflight`), arming, the
+harness run with the live OCA shrink proof, the 15:45 flatten, `finish` and the
+signed report. Owner only; nothing in the repo places those orders. Needs
+`ai_paper.acceptance_probe: true` for the day and an operator signing key
+(`~/.config/mmr/keys/acceptance/operator.key`). Not run yet.
+
 The automation soak below is blocked until the exit fix
 and the split-Docker evidence gap are resolved (see Known blockers). Until then, run strategies with `auto_execute: propose`
 and approve on `/cc`.

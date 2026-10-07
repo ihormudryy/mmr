@@ -24,6 +24,7 @@ from trader.data.broker_state import (
     BrokerPositionRow,
     BrokerStateStore,
 )
+from trader.data.broker_order_events import record_order_event_in_tx
 from trader.domain.events import DomainMutation
 from trader.domain.identity import fill_entity_id, position_entity_id
 from trader.trading.order_correlation import (
@@ -781,7 +782,8 @@ class BrokerIngest:
         emit(mutation, write)
 
     def _apply_order(
-        self, conn: Any, obs: OrderObservation, emit: Callable[[DomainMutation, Callable[[Any, int], None]], Any]
+        self, conn: Any, obs: OrderObservation, emit: Callable[[DomainMutation, Callable[[Any, int], None]], Any],
+        event_generation: Optional[int] = None,
     ) -> tuple[str, Any | None]:
         entity_id = self.correlator.resolve_in_tx(conn, obs)
         current = self.store.get_order_in_tx(conn, entity_id)
@@ -836,6 +838,11 @@ class BrokerIngest:
         def write(write_conn: Any, revision: int) -> None:
             self.correlator.bind_aliases_in_tx(write_conn, entity_id, obs)
             self.store.upsert_order_in_tx(write_conn, replace(merged, revision=revision))
+            # Plan 6 ruling 14: the status history the acceptance shrink proof reads, same transaction.
+            generation = (event_generation if event_generation is not None
+                          else self.store.latest_promoted_generation_in_tx(write_conn))
+            record_order_event_in_tx(write_conn, generation, entity_id, obs.perm_id, obs.client_order_id,
+                                     merged, obs.source_timestamp)
 
         event = emit(mutation, write)
         self._resolve_unbound_fills_in_tx(conn, obs, entity_id, emit)
@@ -1111,7 +1118,8 @@ class BrokerIngest:
                 observed_positions.add((record.account_id, record.conid))
                 self._apply_position(conn, record, append)
             elif isinstance(record, OrderObservation):
-                entity_id, _event = self._apply_order(conn, record, append)
+                entity_id, _event = self._apply_order(conn, record, append,
+                                                      event_generation=generation.generation_id)
                 observed_orders.add(entity_id)
             else:
                 self._apply_record(conn, record, append)

@@ -352,6 +352,8 @@ class Trader():
                 ib_client_id=self.trading_runtime_ib_client_id,
                 ib_account=self.ib_account,
             )
+            # SP1 Plan 6: broker evidence from this trader comes from a real IB session (ib_paper in a report).
+            self.broker_evidence_source = 'ib'
             self.data = TickStorage(self.history_duckdb_path)
             self.universe_accessor = UniverseAccessor(self.duckdb_path, self.universe_library)
             self.clear_portfolio_universe()

@@ -125,6 +125,12 @@ TRADER_ACL: Mapping[tuple[str, str], frozenset[str]] = {
     ("query", "get_scoreboard"): frozenset({"cli", "dashboard", "ai_supervisor"}),
     ("query", "verify_scoreboard"): frozenset({"cli", "dashboard"}),
     ("query", "get_experiment_trips"): frozenset({"cli", "dashboard", "ai_supervisor"}),
+    # SP1 acceptance (Plan 6): reads for the harness and the operator. Explicit sets per method.
+    ("query", "get_acceptance_preflight"): frozenset({"cli", "dashboard", "ai_supervisor"}),
+    ("query", "get_broker_order_evidence"): frozenset({"cli", "dashboard", "ai_supervisor"}),
+    # The live OCA shrink probe (Plan 6 ruling 23): the operator only, never an AI or the dashboard.
+    ("command", "acceptance_mark_start"): frozenset({"cli"}),
+    ("command", "acceptance_shrink_probe"): frozenset({"cli"}),
 }
 
 STRATEGY_ACL: Mapping[tuple[str, str], frozenset[str]] = {

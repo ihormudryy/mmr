@@ -99,6 +99,7 @@ from trader.automation.controller_epoch import (
     MIN_LEASE_SECONDS,
     EpochRefused,
 )
+from trader.automation.scope_evidence import INSTRUMENTS_UNIVERSE as _INSTRUMENTS_UNIVERSE
 from trader.data.proposal_repository import ProposalRepository
 from trader.data.strategy_signal_record import MAX_READ_LIMIT, SignalCursorAhead
 from trader.domain.commands import CommandReceipt
@@ -300,9 +301,6 @@ def _instrument_to_wire(definition: Any) -> Dict[str, Any]:
         "security_type": str(definition.secType),
         "time_zone_id": str(definition.timeZoneId),
     }
-
-
-_INSTRUMENTS_UNIVERSE = '_instruments'
 
 
 def _stub_security_definition(instrument_id: int):

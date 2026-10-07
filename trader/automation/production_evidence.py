@@ -8,7 +8,7 @@ from __future__ import annotations
 import datetime as dt
 import math
 import statistics
-from dataclasses import replace
+from dataclasses import dataclass, replace
 from typing import TYPE_CHECKING, Any, Callable, cast
 
 import exchange_calendars as xcals
@@ -94,24 +94,47 @@ def validate_approval(order: Any, approval: ApprovalContext, *, account_id: str,
         raise ApprovalContextError("QUOTE_SESSION_INVALID", "continuous trading evidence is required")
 
 
-def liquidity_from_history(history: Any, conid: int, quote: ExecutableQuote, now: dt.datetime) -> LiquidityEvidence:
-    """Liquidity evidence from the twenty latest closed XNYS daily bars and the quote's own depth."""
-    depth = _number(quote.ask_size, "DEPTH_INVALID")
-    if depth < 0:
-        raise ApprovalContextError("DEPTH_INVALID", "observed side depth is invalid")
-    # TickStorage.read combines every bar size. Select its daily library,
-    # then require explicit daily rows (legacy NULL bar sizes are ambiguous).
-    try:
-        calendar = xcals.get_calendar("XNYS")
-        today = now.astimezone(ET).date()
-        sessions = calendar.sessions_in_range(today - dt.timedelta(days=90), today)
-        closed = [day for day in sessions if calendar.session_close(day) < pd.Timestamp(now)][-20:]
-        start = dt.datetime.combine(closed[0].date(), dt.time(), ET)
-        frame = cast("TickStorage", history).get_tickdata(BarSize.Days1).read(
-            contract=conid, date_range=DateRange(start, now),
-        )
-    except Exception:
-        raise ApprovalContextError("HISTORY_UNAVAILABLE", "daily history read failed") from None
+VOLUME_SESSIONS = 20
+LOCAL_DAILY_BARS = "local_daily_bars"
+
+
+def latest_closed_sessions(now: dt.datetime, count: int = VOLUME_SESSIONS) -> tuple[dt.date, ...]:
+    """The ``count`` latest XNYS sessions whose close is before ``now``."""
+    calendar = xcals.get_calendar("XNYS")
+    today = now.astimezone(ET).date()
+    sessions = calendar.sessions_in_range(today - dt.timedelta(days=90), today)
+    return tuple(day.date() for day in sessions if calendar.session_close(day) < pd.Timestamp(now))[-count:]
+
+
+@dataclass(frozen=True)
+class TwentySessionVolume:
+    """Closes and volumes of exactly the latest closed sessions, oldest first, and where they came from."""
+    conid: int
+    sessions: tuple[dt.date, ...]
+    closes: tuple[float, ...]
+    volumes: tuple[float, ...]
+    source: str
+
+    @property
+    def median_dollar_volume(self) -> float:
+        return float(statistics.median(c * v for c, v in zip(self.closes, self.volumes)))
+
+    @property
+    def adv_shares(self) -> float:
+        return sum(self.volumes) / len(self.volumes)
+
+    def is_current(self, now: dt.datetime) -> bool:
+        """A new session close makes the window stale."""
+        return self.sessions == latest_closed_sessions(now, len(self.sessions))
+
+    def to_json(self) -> dict:
+        return {"source": self.source, "first_session": self.sessions[0].isoformat(),
+                "last_session": self.sessions[-1].isoformat(), "median_dollar_volume": self.median_dollar_volume}
+
+
+def twenty_sessions_from_frame(frame: Any, conid: int, expected: tuple[dt.date, ...],
+                               source: str) -> TwentySessionVolume:
+    """Exactly the ``expected`` sessions as dated daily TRADES bars with positive closes and volumes."""
     if (not isinstance(frame, pd.DataFrame) or frame.empty
             or not {"bar_size", "close", "volume", "what_to_show"}.issubset(frame.columns)
             or not isinstance(frame.index, pd.DatetimeIndex) or frame.index.tz is None
@@ -119,25 +142,58 @@ def liquidity_from_history(history: Any, conid: int, quote: ExecutableQuote, now
         raise ApprovalContextError("HISTORY_INVALID", "dated daily trade bars are required")
     frame = frame.loc[frame.bar_size == "1 day"].copy()
     frame.index = pd.Index(frame.index.tz_convert(ET).date)
-    expected = [day.date() for day in closed]
-    daily = frame.loc[frame.index.isin(expected)]
-    if len(daily) != 20 or daily.index.has_duplicates or set(daily.index) != set(expected):
+    daily = frame.loc[frame.index.isin(expected)].sort_index()
+    if len(daily) != len(expected) or daily.index.has_duplicates or set(daily.index) != set(expected):
         raise ApprovalContextError("HISTORY_INVALID", "all twenty latest closed sessions are required")
     if not (daily.what_to_show == int(WhatToShow.TRADES)).all():
         raise ApprovalContextError("HISTORY_INVALID", "trade volume provenance is required")
-    volumes = [_number(value, "HISTORY_INVALID", positive=True) for value in daily.volume]
-    closes = [_number(value, "HISTORY_INVALID", positive=True) for value in daily.close]
-    dollars = [_number(price * volume, "HISTORY_INVALID", positive=True)
-               for price, volume in zip(closes, volumes)]
-    adv = _number(sum(volumes) / 20, "HISTORY_INVALID", positive=True)
+    volumes = tuple(_number(value, "HISTORY_INVALID", positive=True) for value in daily.volume)
+    closes = tuple(_number(value, "HISTORY_INVALID", positive=True) for value in daily.close)
+    for price, volume in zip(closes, volumes):
+        _number(price * volume, "HISTORY_INVALID", positive=True)
+    return TwentySessionVolume(conid=conid, sessions=tuple(daily.index), closes=closes, volumes=volumes,
+                               source=source)
+
+
+def local_twenty_sessions(history: Any, conid: int, now: dt.datetime) -> TwentySessionVolume:
+    """The trader's local daily bars (TickStorage, TRADES) for the latest closed sessions."""
+    # TickStorage.read combines every bar size. Select its daily library,
+    # then require explicit daily rows (legacy NULL bar sizes are ambiguous).
+    try:
+        expected = latest_closed_sessions(now)
+        start = dt.datetime.combine(expected[0], dt.time(), ET)
+        frame = cast("TickStorage", history).get_tickdata(BarSize.Days1).read(
+            contract=conid, date_range=DateRange(start, now),
+        )
+    except Exception:
+        raise ApprovalContextError("HISTORY_UNAVAILABLE", "daily history read failed") from None
+    return twenty_sessions_from_frame(frame, conid, expected, LOCAL_DAILY_BARS)
+
+
+def _quote_depth(quote: ExecutableQuote) -> float:
+    depth = _number(quote.ask_size, "DEPTH_INVALID")
+    if depth < 0:
+        raise ApprovalContextError("DEPTH_INVALID", "observed side depth is invalid")
+    return depth
+
+
+def liquidity_from_sessions(volume: TwentySessionVolume, quote: ExecutableQuote) -> LiquidityEvidence:
+    """Liquidity evidence from a 20-session window and the quote's own depth."""
+    depth = _quote_depth(quote)
     return LiquidityEvidence(
         price=quote.price,
-        median_dollar_volume_20d=_number(statistics.median(dollars), "HISTORY_INVALID", positive=True),
-        adv_shares_20d=adv,
+        median_dollar_volume_20d=_number(volume.median_dollar_volume, "HISTORY_INVALID", positive=True),
+        adv_shares_20d=_number(volume.adv_shares, "HISTORY_INVALID", positive=True),
         spread_bps=(cast(float, quote.ask) - cast(float, quote.bid)) / quote.price * 10_000.0,
         top_of_book_depth=depth,
         feed_type=quote.feed_type, session_state=quote.session_state,
     )
+
+
+def liquidity_from_history(history: Any, conid: int, quote: ExecutableQuote, now: dt.datetime) -> LiquidityEvidence:
+    """Liquidity evidence from the twenty latest closed XNYS daily bars and the quote's own depth."""
+    _quote_depth(quote)                      # depth is checked before the history read
+    return liquidity_from_sessions(local_twenty_sessions(history, conid, now), quote)
 
 
 class ProductionAutomationEvidence:

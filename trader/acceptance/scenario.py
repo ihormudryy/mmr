@@ -135,12 +135,11 @@ def build_entry_s(settings: AcceptanceSettings, ask: float, *, ctx: Optional[dic
 
 
 def build_reduction(settings: AcceptanceSettings, step: str, action: str, conid: int, now: dt.datetime, *,
-                    quantity: Optional[int] = None, stop_price: Optional[float] = None,
-                    target_price: Optional[float] = None) -> dict:
-    """Plan 3 R16: a reduction names no deployment and no policy revision."""
+                    quantity: Optional[int] = None) -> dict:
+    """Plan 3 R16: a reduction names no deployment, no policy revision and no prices."""
     return {"decision_id": decision_id(settings.run_id, step), "deployment_digest": None, "decider": DECIDER,
-            "action": action, "conid": conid, "side": "SELL", "stop_price": stop_price,
-            "target_price": target_price, "quantity": quantity, "policy_revision": None,
+            "action": action, "conid": conid, "side": "SELL", "stop_price": None,
+            "target_price": None, "quantity": quantity, "policy_revision": None,
             "evidence_digest": evidence_digest(settings.run_id, step),
             "expires_at": (now + DECISION_TTL).isoformat()}
 
@@ -422,7 +421,9 @@ class AcceptanceScenario:
         return self._wait(check, self.settings.step_timeout, code)
 
     def _step_enter_a(self) -> StepResult:
-        sent = self._enter("enter_a", "e-a", self.settings.conid_a, self.settings.quantity_a)
+        # A target from the start: the partial close re-protects the remainder at the existing stop and
+        # target and cannot add one (SP2 spec 6.4, Plan 3 ruling 14).
+        sent = self._enter("enter_a", "e-a", self.settings.conid_a, self.settings.quantity_a, target=True)
         proof = self._wait_protected(self.settings.conid_a, float(self.settings.quantity_a), "ENTRY_NOT_PROTECTED")
         return StepResult("enter_a", True, None, {**sent, **proof})
 
@@ -442,14 +443,12 @@ class AcceptanceScenario:
     def _step_partial_close_a(self) -> StepResult:
         conid, run = self.settings.conid_a, self.settings.run_id
         remainder = float(self.settings.quantity_a - self.settings.partial_quantity)
-        ask = self.ctx.get("enter_a.ask") or self.ctx.get("enter_a.stop_price", 0.0) / 0.98
         decision = decision_id(run, "pc-a")
         command_id = command_id_for(decision)
         self._accepted(self._send(
             "partial_close_a", "supervisor", "submit_ai_paper_decision",
             lambda: build_reduction(self.settings, "pc-a", "PARTIAL_CLOSE", conid, self._now(),
-                                    quantity=self.settings.partial_quantity,
-                                    stop_price=self.ctx["enter_a.stop_price"], target_price=round(ask * 1.02, 2)),
+                                    quantity=self.settings.partial_quantity),
             command_id))
         seen: dict = {}
 

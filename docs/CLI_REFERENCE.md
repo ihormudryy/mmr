@@ -197,6 +197,9 @@ experiment resume --reason "ok"              # operator; never after a kill
 experiment stop --reason "done"              # operator; once the account is flat (final)
 ai-policy show                               # PAPER AI risk policy: published, effective, queued limits
 ai-policy publish policy.yaml --reason "x"   # operator only; file = {limits: {...}}; --command-id to retry
+ai-deployment register-discretionary --operator owner --statement "paper only"   # operator; the SP2 discretionary deployment
+ai-deployment register-discretionary --operator owner --statement "x" --stock-types ETF --min-price 10   # narrow the rule
+ai-deployment show sha256:...                # a sealed deployment, its kind and provenance
 scoreboard                                   # PAPER scoreboard of the latest experiment ('-' = unknown)
 --json scoreboard --experiment exp-<20 hex>  # the report as JSON: {"data": ..., "title": "Scoreboard (paper)"}
 scoreboard verify                            # rebuild every number from stored inputs; exit 1 on any mismatch
@@ -207,6 +210,30 @@ experiment acceptance finish --run-id acc-... --signing-key KEY   # after 15:55 
 experiment acceptance status --run-id acc-...  # the local run journal only
 experiment acceptance verify-report REPORT --public-key PUB   # signature + fields; exit 1 if bad or ephemeral
 ```
+
+### `ai-deployment` (SP2 discretionary deployment)
+
+Self-found ideas of the AI paper bot trade only under a `discretionary` deployment that the
+operator registers. Its scope is a rule, not a conid list; the trader checks it at admission and
+again at dispatch (`OUT_OF_DISCRETIONARY_SCOPE`, `detail.part` one of `exchange`,
+`instrument_type`, `price`, `dollar_volume`, `liquidity`, `trading_filter`, `evidence_stale`).
+
+`register-discretionary` flags (each may only narrow the default; the trader refuses a wider rule):
+
+| Flag | Default | Meaning |
+|---|---|---|
+| `--operator` (required) | | who attests, `^[A-Za-z0-9_.@-]{1,64}$` |
+| `--statement` (required) | | the attestation text, 1-500 printable characters |
+| `--exchanges` | `ARCA,NASDAQ,NYSE` | primary listings (IB `primaryExchange`) |
+| `--stock-types` | `COMMON,ETF` | IB `stockType`; a blank type never passes |
+| `--min-price` | `5` | the bid must be at least this |
+| `--min-dollar-volume` | `20000000` | 20-session median dollar volume; SP1's $50M floor also applies |
+| `--max-order-share` | `0.01` | order notional at most this share of that median |
+
+Registering the same content again replays one command. `show DIGEST` (`--json` for JSON) prints
+`DISCRETIONARY (operator attested, no backtest evidence)` for this kind and returns
+`{"digest", "kind": "strategy"|"discretionary"|null, "deployment", "strategy_digest_provenance", "error_code"}`;
+a discretionary deployment has provenance `OPERATOR_ATTESTED`.
 
 ## Command Service Requirements
 
@@ -228,6 +255,7 @@ experiment acceptance verify-report REPORT --public-key PUB   # signature + fiel
 - `forex snapshot`, `forex quote` (default IB source; IDEALPRO CASH contract)
 - `experiment status|start|pause|resume|stop` (SP1 experiments; paper only)
 - `ai-policy show|publish` (SP2 operator AI risk policy; paper only; `publish` signs as `cli`)
+- `ai-deployment register-discretionary|show` (SP2 discretionary deployment; paper only; `register-discretionary` signs as `cli`)
 - `experiment acceptance preflight|run|finish` (SP1 acceptance, host only; `run` and `finish` sign with the `ai_supervisor`/`ai_research` keys, plus `cli` with `--place-orders`); `experiment acceptance status|verify-report` are local
 - `flatten --reason TEXT [--wait] [--yes]` (paper only; typed `liquidate_account`, prints `FLAT` only on broker evidence)
 - `scoreboard`, `scoreboard verify` (SP1 scoreboard; reads the journal, not IB, so no IB-upstream check)

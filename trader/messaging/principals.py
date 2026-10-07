@@ -115,12 +115,17 @@ TRADER_ACL: Mapping[tuple[str, str], frozenset[str]] = {
     ("command", "publish_ai_risk_policy"): frozenset({"ai_supervisor", "cli"}),
     ("command", "submit_ai_paper_decision"): frozenset({"ai_supervisor"}),
     ("command", "register_ai_deployment"): frozenset({"ai_research"}),
+    # SP2 Plan 3 (spec 6.6): only the operator registers a discretionary deployment; the bot cannot.
+    ("command", "register_discretionary_deployment"): frozenset({"cli"}),
     ("query", "get_ai_risk_policy"): frozenset({"cli", "dashboard", "ai_supervisor"}),
     ("query", "get_ai_deployment"): frozenset({"cli", "dashboard", "ai_supervisor", "ai_research"}),
     # SP2 Plan 1: the controller epoch (spec 6.2). Explicit sets per method.
     ("command", "grant_ai_controller_epoch"): frozenset({"ai_supervisor"}),
     ("query", "get_ai_paper_decision"): frozenset({"ai_supervisor"}),
     ("query", "read_ai_signals"): frozenset({"ai_supervisor"}),
+    # SP2 Plan 3: the trader-owned discovery read and entry quote (read only; spec 6.5, ruling 18).
+    ("query", "discover_ai_candidates"): frozenset({"ai_supervisor"}),
+    ("query", "get_ai_entry_quote"): frozenset({"ai_supervisor"}),
     # SP1 experiments (Plan 4 K14): explicit sets per method. ai_supervisor may pause (risk-reducing)
     # and read; only operators start, resume and stop.
     ("command", "start_experiment"): frozenset({"cli", "dashboard"}),

@@ -1414,6 +1414,27 @@ def build_parser() -> argparse.ArgumentParser:
     ai_policy_publish_p.add_argument('--command-id', dest='command_id', default=None,
                                      help='Reuse to replay the same publish after a timeout')
 
+    # ai-deployment (SP2 Plan 3, spec 6.6): the operator registers the discretionary deployment
+    ai_deployment_p = sub.add_parser(
+        'ai-deployment', help='PAPER AI deployments: register-discretionary (operator), show',
+        epilog='Examples:\n'
+               '  ai-deployment register-discretionary --operator owner --statement "paper only"\n'
+               '  ai-deployment register-discretionary --operator owner --statement "x" --stock-types ETF\n'
+               '  ai-deployment show sha256:...',
+        formatter_class=fmt)
+    ai_deployment_sub = ai_deployment_p.add_subparsers(dest='ai_deployment_action')
+    register_p = ai_deployment_sub.add_parser(
+        'register-discretionary', help='Register the discretionary deployment (narrow the default rule only)')
+    register_p.add_argument('--operator', required=True)
+    register_p.add_argument('--statement', required=True)
+    register_p.add_argument('--exchanges', default=None, help='Comma list from NYSE,NASDAQ,ARCA')
+    register_p.add_argument('--stock-types', dest='stock_types', default=None, help='Comma list from COMMON,ETF')
+    register_p.add_argument('--min-price', dest='min_price', type=float, default=None)
+    register_p.add_argument('--min-dollar-volume', dest='min_dollar_volume', type=float, default=None)
+    register_p.add_argument('--max-order-share', dest='max_order_share', type=float, default=None)
+    show_p = ai_deployment_sub.add_parser('show', help='A sealed deployment and its kind')
+    show_p.add_argument('digest')
+
     # scoreboard (SP1 Plan 5)
     scoreboard_p = sub.add_parser(
         'scoreboard', help='PAPER scoreboard of the ai_paper experiment (read only)',
@@ -2646,6 +2667,9 @@ def dispatch(mmr: MMR, args: argparse.Namespace) -> bool:
         elif cmd == 'ai-policy':
             _handle_ai_policy(mmr, args)
 
+        elif cmd == 'ai-deployment':
+            _handle_ai_deployment(mmr, args)
+
         elif cmd == 'flatten':
             _handle_flatten(mmr, args)
 
@@ -3330,6 +3354,40 @@ def _handle_ai_policy(mmr: MMR, args: argparse.Namespace):
         print_status(f"ai-policy publish failed: {result.error or result.exception}", success=False)
         sys.exit(1)
     print_json_result(result.obj or {}, title='AI risk policy published')
+
+
+DISCRETIONARY_LABEL = 'DISCRETIONARY (operator attested, no backtest evidence)'
+
+
+def _comma_list(value: Optional[str]) -> Optional[list]:
+    return None if value is None else [part.strip() for part in value.split(',') if part.strip()]
+
+
+def _discretionary_rule_flags(args: argparse.Namespace) -> dict:
+    """Only the parts the operator named; the SDK fills the rest from the spec default."""
+    parts = {'primary_exchanges': _comma_list(args.exchanges), 'stock_types': _comma_list(args.stock_types),
+             'min_price': args.min_price, 'min_median_dollar_volume': args.min_dollar_volume,
+             'max_order_share_of_dollar_volume': args.max_order_share}
+    return {name: value for name, value in parts.items() if value is not None}
+
+
+def _handle_ai_deployment(mmr: MMR, args: argparse.Namespace):
+    action = getattr(args, 'ai_deployment_action', None)
+    if action == 'show':
+        view = mmr.ai_deployment(args.digest)
+        title = DISCRETIONARY_LABEL if view.get('kind') == 'discretionary' else 'AI deployment'
+        print_json_result(view, title=title)
+        return
+    if action != 'register-discretionary':
+        print_status('ai-deployment: choose register-discretionary or show', success=False)
+        sys.exit(1)
+    result = mmr.register_discretionary_deployment(operator=args.operator, statement=args.statement,
+                                                   rule=_discretionary_rule_flags(args) or None)
+    if not result.is_success():
+        print_status(f"ai-deployment register-discretionary failed: {result.error or result.exception}",
+                     success=False)
+        sys.exit(1)
+    print_json_result(result.obj or {}, title=f'Registered: {DISCRETIONARY_LABEL}')
 
 
 def _handle_experiment(mmr: MMR, args: argparse.Namespace):
@@ -12431,6 +12489,7 @@ _LOCAL_ONLY_COMMANDS = {
     'risk-limits', 'rl', 'reconcile', 'diagnose', 'approve', 'listen',
     'ideas', 'scan-ideas',
     'market-hours', 'mh', 'session', 'group', 'research', 'scoreboard', 'flatten', 'ai-policy',
+    'ai-deployment',
 }
 # strategies list/enable/disable/reload hit strategy typed ports; create/deploy
 # etc. are YAML-local. Legacy connect is never needed for strategies/*.

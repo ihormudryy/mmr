@@ -9,6 +9,8 @@ import pytest
 
 from tests.automation.ai_paper_fixtures import ACCOUNT, CONID, NOW, pos, snapshot
 from tests.automation.ai_paper_world import World
+from tests.automation.discretionary_world import discretionary_world
+from tests.test_liquidation_service import _Protection
 from trader.automation.ai_paper_experiment import ExperimentView
 from trader.automation.reduction_close import start_broker_proven_close
 from trader.trading.command_coordinator import CLOSE_RESOLVED_ACTIONS, OutcomeReconciler
@@ -20,7 +22,7 @@ DEADLINE = NOW + dt.timedelta(minutes=5)
 @pytest.fixture
 def world(tmp_path):
     w = World(tmp_path, real_liquidation=True)
-    w.held(CONID, 300.0)
+    w.owned(CONID, 300.0)
     return w
 
 
@@ -76,14 +78,49 @@ def test_partial_larger_than_the_position_is_refused(world, quantity):
 
 
 def test_partial_equal_to_the_position_is_a_full_close(world):
-    receipt = world.submit(partial_body(world, 300, stop_price=97.5))
+    receipt = world.submit(partial_body(world, 300))
     assert world.liquidation.receipt_for(receipt.outcome["close_root_id"]).goal == "zero"
 
 
-def test_partial_close_reaches_the_scoped_partial(world):
-    receipt = world.submit(partial_body(world, 100, stop_price=97.5))
+@pytest.mark.parametrize("prices", [{"stop_price": 97.5}, {"target_price": 120.0}])
+def test_partial_close_with_prices_is_refused(world, prices):          # spec 6.4: no protection edits
+    receipt = world.submit(partial_body(world, 100, **prices))
+    assert (receipt.state, receipt.error_code) == ("REJECTED", "DECISION_INVALID")
+    assert world.liquidation_runs() == set()
+
+
+def test_partial_close_reprotects_at_the_existing_stop_and_target(world):
+    world.liquidation.attach_protection(_Protection(stop_price=95.0, target_price=110.0))
+    receipt = world.submit(partial_body(world, 100))
     run = world.liquidation.receipt_for(receipt.outcome["close_root_id"])
-    assert (run.goal, run.goal_quantity, run.stop_price) == ("partial", 100.0, 97.5)
+    assert (run.goal, run.goal_quantity, run.stop_price, run.target_price) == ("partial", 100.0, 95.0, 110.0)
+
+
+def test_a_position_the_experiment_never_entered_is_not_closed(tmp_path):      # spec 6.4
+    w = World(tmp_path, real_liquidation=True)
+    w.held(CONID, 300.0)                                     # e.g. a manual proposal: no ENTER of this experiment
+    assert w.submit(close_body(w)).error_code == "POSITION_NOT_OWNED"
+    assert w.submit(partial_body(w, decision_id="dec-00000002")).error_code == "POSITION_NOT_OWNED"
+    assert w.liquidation_runs() == set()
+
+
+def test_an_entry_of_another_experiment_does_not_own_the_position(world):
+    world.experiments.view = ExperimentView("exp2", "ARMED")
+    assert world.submit(close_body(world)).error_code == "POSITION_NOT_OWNED"
+
+
+def test_an_entry_that_never_filled_does_not_own_the_position(tmp_path):
+    w = World(tmp_path, real_liquidation=True)
+    assert w.submit(decision_id="dec-owned-01").state == "SUBMITTED"
+    w.broker.show_working_entry("og-aip-dec-owned-01", quantity=499, filled=0.0)
+    w.held(CONID, 300.0)
+    assert w.submit(close_body(w)).error_code == "POSITION_NOT_OWNED"
+
+
+def test_the_decision_row_records_its_experiment(world):
+    assert world.decisions.row("dec-owned-00").experiment_id == "exp1"
+    world.submit(close_body(world))
+    assert world.decisions.row("dec-00000001").experiment_id == "exp1"
 
 
 def test_buy_side_close_of_a_long_is_not_a_reduction(world):
@@ -160,7 +197,8 @@ def test_entry_after_the_close_is_resolved_is_not_blocked(world):
     _finish_root(world, receipt.outcome["close_root_id"], "CLOSED")
     _reconciler(world)[0].reconcile_once(receipt.command_id, NOW)
     world.broker.set(positions=())
-    assert world.submit(decision_id="dec-00000002").state == "SUBMITTED"
+    # The owning ENTER's saga still counts its fill in flight (no exit leg filled), so ask for one share.
+    assert world.submit(decision_id="dec-00000002", quantity=1).state == "SUBMITTED"
 
 
 # --- the shared function on its own (the one-strategy SELL keeps its tests in
@@ -197,3 +235,25 @@ def test_shared_close_passes_prices_only_for_a_partial():
     _close(liquidation, quantity=300.0, stop_price=97.5)
     assert liquidation.calls[0]["quantity"] == 100.0 and liquidation.calls[0]["stop_price"] == 97.5
     assert liquidation.calls[1]["quantity"] is None and "stop_price" not in liquidation.calls[1]
+
+
+# --- SP2 Plan 3 Task 11: spec 6.4 behaviour that already exists, pinned -----------------------------
+
+def test_close_after_the_entry_cutoff_is_admitted(world):              # spec 6.4 / 5.2: after the cutoff
+    world.clock.advance(hours=4, minutes=40)                             # 15:40 ET: after the 15:30 entry cutoff
+    assert world.submit(close_body(world)).error_code == "CLOSE_PENDING"
+
+
+def test_close_joins_the_session_flatten_while_armed(world):            # flatten precedence
+    world.liquidation.start(ACCOUNT, "session-flatten-1", DEADLINE)    # account owner, as the session flatten
+    assert world.submit(close_body(world)).outcome["close_root_id"] == "session-flatten-1"
+    assert world.liquidation_runs() == {"session-flatten-1"}
+
+
+def test_a_reduction_ignores_the_discretionary_scope_rule(tmp_path):    # the rule is for entries only
+    w = discretionary_world(tmp_path, real_liquidation=True)
+    w.owned(CONID, 300.0)
+    w.contracts.fail_with("must not be called")
+    w.quotes.set(bid=1.0, ask=1.01)
+    assert w.submit(close_body(w)).error_code == "CLOSE_PENDING"
+    assert w.contracts.calls == 0

@@ -65,19 +65,24 @@ def test_query_on_a_clean_served_stack(served):
     assert evaluate_preflight(reading, reading, now=served.now()).passed
 
 
-def test_query_reports_an_unresolved_command_and_a_working_order(served):
-    served.sim.held[CONID] = 3.0
-    served.sim.promote()
+def test_query_reports_an_unresolved_command_and_a_working_order(served, tmp_path):
+    from tests.sp1_acceptance.test_acceptance_run import market, scenario
+    market(served)
+    assert scenario(served, tmp_path).run_until("enter_a")[-1].passed    # A is the experiment's own position
+    served.sim.auto_fill(order_types=())                                   # the close stays working
     close = {"decision_id": "dec-close-0001", "deployment_digest": None, "decider": "jev", "action": "CLOSE",
              "conid": CONID, "side": "SELL", "stop_price": None, "target_price": None, "quantity": None,
              "policy_revision": None, "evidence_digest": "sha256:" + "c" * 64,
              "expires_at": (served.now() + dt.timedelta(minutes=5)).isoformat()}
     out = served.call("ai_supervisor", "submit_ai_paper_decision", close)
     assert out["state"] == "OUTCOME_UNKNOWN", out
-    served.sim.promote()
-    reading = served.call("cli", "get_acceptance_preflight", {})
+    for _ in range(10):                                                    # cancel the legs, send the close
+        served.advance_and_promote(2)
+        reading = served.call("cli", "get_acceptance_preflight", {})
+        if reading["working_orders"]:
+            break
     assert "aip-dec-close-0001" in reading["unresolved_commands"]
-    assert [o["conid"] for o in reading["working_orders"]] == [CONID]
+    assert {o["conid"] for o in reading["working_orders"]} == {CONID}
     assert reading["positions"] == [{"conid": CONID, "quantity": 3.0}]
     result = evaluate_preflight(reading, reading, now=served.now())
     assert {"POSITIONS_OPEN", "WORKING_ORDERS", "UNRESOLVED_COMMANDS"} <= set(result.failures)

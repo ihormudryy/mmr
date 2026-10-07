@@ -721,3 +721,76 @@ def test_the_ai_paper_evidence_gets_the_iex_set(tmp_path, alpaca):
 
     assert stack.ai_paper.decisions._evidence._accepted_feeds == IEX_FEEDS
     assert stack.ai_paper.decisions._evidence._quotes is stack.dispatch_guard._quotes
+
+
+def _ib_details(conid=265598, symbol="AAPL", primary="NASDAQ"):
+    from ib_async import Contract, ContractDetails
+    return ContractDetails(contract=Contract(conId=conid, symbol=symbol, secType="STK", currency="USD",
+                                             exchange="SMART", primaryExchange=primary), stockType="COMMON")
+
+
+class _RememberAccessor:
+    def __init__(self, known):
+        self.known, self.inserted = known, []
+
+    def resolve_symbol(self, conid, **_kwargs):
+        return list(self.known.get(conid, []))
+
+    def get(self, name):
+        return SimpleNamespace(security_definitions=[])
+
+    def insert(self, name, definition):
+        self.inserted.append((name, definition.conId))
+
+
+_AAPL_ROW = SimpleNamespace(conId=265598, symbol="AAPL", secType="STK", currency="USD", primaryExchange="NASDAQ")
+
+
+def test_remembering_an_ib_definition_never_duplicates_a_known_conid():      # SP2 Plan 3 ruling 3
+    from trader.trading.command_stack import _remember_instrument
+
+    known = _RememberAccessor({265598: [_AAPL_ROW]})  # e.g. in a user universe: a second definition would make
+    _remember_instrument(SimpleNamespace(universe_accessor=known), _ib_details())   # the AI entry filter refuse it
+    assert known.inserted == []
+    unknown = _RememberAccessor({})
+    _remember_instrument(SimpleNamespace(universe_accessor=unknown), _ib_details())
+    assert unknown.inserted == [("_instruments", 265598)]
+
+
+@pytest.mark.parametrize("fresh", [_ib_details(symbol="MSFT"), _ib_details(primary="NYSE")], ids=["symbol", "listing"])
+def test_a_stored_definition_that_conflicts_with_ib_is_refused(fresh):       # PR #83 thread 4210055756
+    from trader.automation.scope_evidence import IbContractEvidenceSource, ScopeEvidenceUnavailable
+    from trader.trading.command_stack import InstrumentConflict, _remember_instrument
+
+    trader = SimpleNamespace(universe_accessor=_RememberAccessor({265598: [_AAPL_ROW]}))
+    with pytest.raises(InstrumentConflict):
+        _remember_instrument(trader, fresh)
+    source = IbContractEvidenceSource(request_details=lambda contract: [fresh],
+                                      remember=lambda details: _remember_instrument(trader, details),
+                                      now=lambda: NOW)
+    with pytest.raises(ScopeEvidenceUnavailable) as exc:
+        source.by_conid(265598)
+    assert exc.value.reason.startswith("INSTRUMENT_CONFLICT") and trader.universe_accessor.inserted == []
+
+
+def test_the_iex_fallback_takes_its_symbol_from_fresh_ib_details_only(tmp_path, alpaca, monkeypatch):
+    """PR #83 thread 4210055756: the stored row says AAPL, IB says conid 265598 is MSFT."""
+    from trader.trading.command_ports import TraderQuoteAuthority
+    from trader.trading.command_stack import build_command_stack
+    from trader.trading.proposal_command_service import ExecutableQuote
+
+    delayed = ExecutableQuote(conid=265598, side="BUY", price=1.0, market_timestamp=NOW,
+                              feed_type="delayed", session_state="continuous", bid=1.0, ask=1.0)
+    monkeypatch.setattr(TraderQuoteAuthority, "executable_quote", lambda *_, **__: delayed)
+    trader = _fallback_trader(tmp_path)
+    asked = []
+    trader.contract_details_port = lambda contract: asked.append(contract.conId) or [
+        _ib_details(symbol="MSFT"), _ib_details(conid=1, symbol="OTHER")]
+    stack = build_command_stack(trader, _policy(), now=lambda: NOW)
+
+    stack.dispatch_guard._quotes.executable_quote(265598, side="BUY")
+    assert alpaca.requests == [("/v2/stocks/quotes/latest", {"symbols": "MSFT", "feed": "iex"})]
+    assert asked == [265598]
+    trader.contract_details_port = lambda contract: []                   # IB cannot prove the identity
+    stack.dispatch_guard._quotes.executable_quote(265598, side="BUY")
+    assert len(alpaca.requests) == 1                                      # no request on a stored row's word

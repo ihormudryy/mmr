@@ -14,6 +14,7 @@ from trader.data.proposal_repository import (
     ProposalRepository,
     apply_proposal_authority_migration,
 )
+from trader.automation.scope_evidence import InstrumentConflict
 from trader.data.schema_migrations import SchemaMigrator
 from trader.data.circuit_breaker_store import (
     CircuitBreakerStore,
@@ -505,6 +506,18 @@ class AiPaperServices:
     epochs: Any            # ControllerEpochs (SP2 Plan 1)
     signals: Any           # StrategySignalRecord over duckdb_path (SP2 Plan 1)
     signals_path: str
+    scope_contracts: Any = None   # IbContractEvidenceSource (SP2 Plan 3)
+    scope_volumes: Any = None     # DollarVolumeSource (SP2 Plan 3)
+    discovery: Any = None         # AiDiscoveryReader (SP2 Plan 3): discover_ai_candidates
+    entry_quotes: Any = None      # EntryQuoteSource (SP2 Plan 3): get_ai_entry_quote
+
+
+@dataclass(frozen=True)
+class EntryQuoteSource:
+    """The command stack's own quote authority and accepted feeds, served to ``ai_supervisor`` (ruling 18)."""
+    quotes: Any
+    accepted_feeds: frozenset[str]
+    account_mode: str
 
 
 @dataclass(frozen=True)
@@ -513,6 +526,9 @@ class _AiPaperParts:
     config: Any
     policy: Any
     entry_filter: Any
+    deployments: Any = None        # AiDeploymentStore (SP2 Plan 3: the dispatch gate reads kind_of)
+    scope_checks: Any = None       # ScopeCheckStore
+    filter_refusal: Any = None     # trading_filters.yaml on the IB identity, shared with entry_filter
 
 
 def _ai_paper_config(trader: Any, account_mode: str) -> Optional[Any]:
@@ -528,24 +544,34 @@ def _ai_paper_config(trader: Any, account_mode: str) -> Optional[Any]:
 
 
 def _build_ai_paper_parts(trader: Any, config: Any, now: Callable[[], dt.datetime]) -> _AiPaperParts:
-    from trader.automation.ai_paper_filter import AiEntryFilter
+    from trader.automation.ai_deployments import AiDeploymentStore
+    from trader.automation.ai_paper_filter import AiEntryFilter, MtimeCachedFilterLoader
     from trader.automation.ai_risk_policy import AiRiskPolicyService
     from trader.automation.calendar_policy import XNYSCalendarPolicy
+    from trader.automation.discretionary_scope import ScopeCheckStore, trading_filter_refusal
 
     policy = AiRiskPolicyService(
         db=trader.journal_db, account_id=trader.ib_account, ceiling=config.limits_ceiling,
         calendar=XNYSCalendarPolicy(), now=now,
     )
+    load_filter = MtimeCachedFilterLoader()
     return _AiPaperParts(config=config, policy=policy,
-                         entry_filter=AiEntryFilter(universe=trader.universe_accessor))
+                         entry_filter=AiEntryFilter(universe=trader.universe_accessor, load_filter=load_filter),
+                         deployments=AiDeploymentStore(trader.journal_db, now=now),
+                         scope_checks=ScopeCheckStore(trader.journal_db, now=now),
+                         filter_refusal=trading_filter_refusal(load_filter))
 
 
-def _ai_paper_guard_options(parts: Optional[_AiPaperParts]) -> dict:
-    """R25: the AI gate, strict margin and the limits router for submit_ai_paper_decision only."""
+def _ai_paper_guard_options(parts: Optional[_AiPaperParts], accepted_feeds: frozenset[str]) -> dict:
+    """R25: the AI gate, strict margin and the limits router for submit_ai_paper_decision only.
+
+    SP2 Plan 3: the discretionary scope gate runs first, on the command stack's accepted feeds (PR #76).
+    """
     if parts is None:
         return {}
     from trader.automation.ai_paper_decision import AI_PAPER_ACTION
     from trader.automation.ai_paper_evidence import ai_entry_gate
+    from trader.automation.discretionary_scope import compose_entry_gates, discretionary_scope_gate
     from trader.automation.risk_limits import PAPER_LIMITS
 
     def current_limits(request: Any):
@@ -555,7 +581,10 @@ def _ai_paper_guard_options(parts: Optional[_AiPaperParts]) -> dict:
 
     return {
         "current_limits": current_limits,
-        "ai_entry_gate": ai_entry_gate(entry_filter=parts.entry_filter),
+        "ai_entry_gate": compose_entry_gates(
+            discretionary_scope_gate(kind_of=parts.deployments.kind_of, checks=parts.scope_checks,
+                                     filter_refusal=parts.filter_refusal, accepted_feeds=accepted_feeds),
+            ai_entry_gate(entry_filter=parts.entry_filter)),
         "strict_margin_actions": frozenset({AI_PAPER_ACTION}),
     }
 
@@ -578,12 +607,15 @@ def _build_ai_paper_services(
 ) -> Optional[AiPaperServices]:
     if parts is None:
         return None
-    from trader.automation.ai_deployments import AiDeploymentStore
     from trader.automation.ai_paper_actions import AiPaperActions
     from trader.automation.ai_paper_decision import AiPaperDecisionService, AiPaperDecisionStore
     from trader.automation.ai_paper_evidence import AI_ENTRY_POLICY, AiPaperEvidence
     from trader.automation.ai_paper_experiment import NoExperiment
     from trader.automation.controller_epoch import ControllerEpochs
+    from trader.automation.ai_discovery import AiDiscoveryReader, SymbolResolver
+    from trader.automation.discretionary_scope import DiscretionaryScopeService
+    from trader.automation.scope_evidence import DollarVolumeSource, IbContractEvidenceSource
+    from trader.data_providers.capabilities import Capability
     from trader.data.duckdb_store import DuckDBConnection
     from trader.data.strategy_signal_record import StrategySignalRecord
 
@@ -592,7 +624,7 @@ def _build_ai_paper_services(
         raise CommandStackConfigurationError(
             "MISSING_DUCKDB_PATH", "ai_paper needs duckdb_path to serve the strategy signal record")
     signals = StrategySignalRecord(DuckDBConnection.get_instance(signals_path))
-    deployments = AiDeploymentStore(trader.journal_db, now=now)
+    deployments = parts.deployments
     decision_store = AiPaperDecisionStore(journal)
     evidence = AiPaperEvidence(
         broker=broker, quotes=quotes, margin=margin, history=getattr(trader, "data", None),
@@ -608,14 +640,83 @@ def _build_ai_paper_services(
         liquidation=liquidation, broker=broker, config=parts.config, account_id=trader.ib_account,
         now=now, schedule_reconcile=schedule_reconcile, decisions=decision_store, epochs=epochs,
     )
+    contracts = IbContractEvidenceSource(
+        request_details=_contract_details_port(trader),
+        remember=lambda details: _remember_instrument(trader, details), now=now,
+    )
+    volumes = DollarVolumeSource(
+        history=getattr(trader, "data", None),
+        alpaca_history=lambda: _alpaca_provider(trader, Capability.HISTORY), now=now,
+    )
+    decisions.attach_scope(DiscretionaryScopeService(
+        contracts=contracts, volumes=volumes, quotes=quotes, accepted_feeds=accepted_feeds,
+        filter_refusal=parts.filter_refusal, checks=parts.scope_checks, now=now,
+    ))
     actions = AiPaperActions(
         policy=parts.policy, deployments=deployments, broker=broker, config=parts.config,
-        account_id=trader.ib_account, ledger=ledger, journal=journal, controls=controls, now=now,
+        account_id=trader.ib_account, account_mode=account_mode, ledger=ledger, journal=journal,
+        controls=controls, now=now,
     )
     return AiPaperServices(config=parts.config, policy=parts.policy, deployments=deployments,
                            decisions=decisions, decision_store=decision_store, actions=actions,
                            entry_filter=parts.entry_filter, epochs=epochs, signals=signals,
-                           signals_path=signals_path)
+                           signals_path=signals_path, scope_contracts=contracts, scope_volumes=volumes,
+                           discovery=AiDiscoveryReader(
+                               providers=lambda capability: _alpaca_provider(trader, capability),
+                               resolver=SymbolResolver(contracts=contracts, now=now), volumes=volumes,
+                               deployments=deployments, filter_refusal=parts.filter_refusal, now=now),
+                           entry_quotes=EntryQuoteSource(quotes=quotes, accepted_feeds=frozenset(accepted_feeds),
+                                                         account_mode=account_mode))
+
+
+def _contract_details_port(trader: Any) -> Callable[[Any], list]:
+    """IB ``reqContractDetails`` on the trader loop (SP2 Plan 3 ruling 3); ``contract_details_port`` is a test seam."""
+    port = getattr(trader, "contract_details_port", None)
+    if port is not None:
+        return port
+    from trader.automation.scope_evidence import CONTRACT_DETAILS_TIMEOUT_SECONDS
+
+    def request(contract: Any) -> list:
+        return _run_on_trader_loop(trader, trader.client.ib.reqContractDetailsAsync(contract),
+                                   timeout=CONTRACT_DETAILS_TIMEOUT_SECONDS)
+    return request
+
+
+def _remember_instrument(trader: Any, details: Any) -> None:
+    """Keep an IB definition in the trader universe, so quotes and the entry filter resolve its conid.
+
+    A stored definition that disagrees with IB on symbol, type, currency or listing raises
+    ``InstrumentConflict`` (PR #83): an old row must never price or filter another instrument.
+    A conid already held and matching is left alone: a second definition would make the AI entry
+    filter's exact one-row resolve refuse it (INSTRUMENT_UNRESOLVED).
+    """
+    from trader.automation.scope_evidence import INSTRUMENTS_UNIVERSE, contract_identity
+    from trader.data.data_access import SecurityDefinition
+
+    conid = int(details.contract.conId)
+    fresh = contract_identity(details.contract)
+    accessor = trader.universe_accessor
+    stored = accessor.resolve_symbol(conid)
+    conflicting = sorted({contract_identity(row) for row in stored if contract_identity(row) != fresh})
+    if conflicting:
+        raise InstrumentConflict(f"conid {conid}: stored {conflicting} but IB says {fresh}")
+    if stored:
+        return
+    accessor.insert(INSTRUMENTS_UNIVERSE, SecurityDefinition.from_contract_details(details))
+
+
+def _alpaca_provider(trader: Any, capability: Any) -> Any:
+    """The trader's own Alpaca adapter, named explicitly (no registry default, no fallback; ruling 11).
+
+    Blank keys raise ``ProviderNotConfigured``. ``provider_factory`` is a test seam.
+    """
+    factory = getattr(trader, "provider_factory", None)
+    if factory is not None:
+        return factory(capability)
+    from trader.data_providers.registry import ProviderRegistry
+    keys = {"alpaca_api_key_id": getattr(trader, "alpaca_api_key_id", "") or "",
+            "alpaca_api_secret_key": getattr(trader, "alpaca_api_secret_key", "") or ""}
+    return ProviderRegistry.from_config(keys).get(capability, "alpaca")
 
 
 _REQUIRED_TRADER_PORTS = (
@@ -697,7 +798,11 @@ def _build_quote_authority(
     from trader.trading.paper_quote_fallback import AlpacaIexQuoteAuthority, FallbackQuoteAuthority
 
     client = alpaca_client.AlpacaClient(key_id, secret_key, timeout=ALPACA_QUOTE_TIMEOUT_SECS)
-    iex = AlpacaIexQuoteAuthority(client, resolve_security=lambda conid: _resolve_security(trader, conid), now=now)
+    from trader.automation.scope_evidence import ib_contract_for_conid
+
+    # PR #83: the Alpaca symbol comes from IB's own details for the conid, never from a stored row.
+    iex = AlpacaIexQuoteAuthority(
+        client, resolve_security=lambda conid: ib_contract_for_conid(_contract_details_port(trader), conid), now=now)
     logger.info("paper quotes fall back to Alpaca IEX when IB has no live feed")
     return FallbackQuoteAuthority(ib_quotes, iex, account_mode=account_mode), feeds
 
@@ -1078,6 +1183,9 @@ def build_command_stack(
     from trader.automation.controller_epoch import apply_controller_epoch_migration
 
     apply_controller_epoch_migration(migrator)        # 90 (SP2 Plan 1)
+    from trader.automation.discretionary_scope import apply_scope_check_migration
+
+    apply_scope_check_migration(migrator)             # 100 (SP2 Plan 3)
     from trader.automation.experiments import apply_experiment_migration
 
     apply_experiment_migration(migrator)              # 70 (SP1 Plan 4)
@@ -1161,7 +1269,7 @@ def build_command_stack(
         allocation_authority_lookup=lambda account_id, artifact_digest: (
             allocation_authority_store.authority_for_dispatch(account_id, artifact_digest)
         ),
-        **_ai_paper_guard_options(ai_paper_parts),
+        **_ai_paper_guard_options(ai_paper_parts, accepted_feeds),
         experiment_gate=lambda request: experiment_gate_slot["gate"](request),
         accepted_feeds=accepted_feeds,
     )

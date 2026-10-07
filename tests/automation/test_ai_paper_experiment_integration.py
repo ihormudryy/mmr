@@ -92,7 +92,7 @@ def world(tmp_path):
 @pytest.fixture
 def world_with_position(tmp_path):
     w = ExperimentWorld(tmp_path, real_liquidation=True)
-    w.held(CONID, 300.0)
+    w.owned(CONID, 300.0)
     return w
 
 
@@ -121,8 +121,9 @@ def test_enter_refused_until_the_monitor_recovered(tmp_path):
 
 
 def test_enter_refused_with_both_modes_armed_but_a_close_still_works(tmp_path):          # K17
-    w = ExperimentWorld(tmp_path, real_liquidation=True, mode_conflict="BOTH_MODES_ARMED")
-    w.held(CONID, 300.0)
+    w = ExperimentWorld(tmp_path, real_liquidation=True)
+    w.owned(CONID, 300.0)                                        # bought before the second mode was armed
+    w.service._experiments = ExperimentStateReader(w.store, w.monitor, mode_conflict=lambda: "BOTH_MODES_ARMED")
     assert w.submit().error_code == "BOTH_MODES_ARMED"
     assert w.submit(w.close_body(decision_id="dec-00000002")).error_code == "CLOSE_PENDING"
 

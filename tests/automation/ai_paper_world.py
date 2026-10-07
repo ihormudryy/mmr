@@ -5,6 +5,7 @@ DispatchGuard. Only the broker, quotes, margin, history and the order dispatch a
 from __future__ import annotations
 
 import datetime as dt
+import json
 import os
 import threading
 from dataclasses import replace
@@ -27,6 +28,8 @@ from trader.automation.ai_paper_experiment import ExperimentView
 from trader.automation.ai_paper_filter import AiEntryFilter, MtimeCachedFilterLoader
 from trader.automation.ai_risk_policy import AiRiskPolicyService, apply_ai_risk_policy_migration
 from trader.automation.calendar_policy import XNYSCalendarPolicy
+from trader.automation.discretionary_scope import compose_entry_gates
+from trader.automation.liquidity_policy import LiquidityPolicy
 from trader.automation.controller_epoch import ControllerEpochs, apply_controller_epoch_migration
 from trader.automation.protective_order_saga import ProtectiveOrderSaga, apply_protective_order_saga_migration
 from trader.automation.risk_limits import PAPER_LIMITS
@@ -43,6 +46,7 @@ from trader.trading.command_policy import CommandAuthorityPolicy
 from trader.trading.dispatch_guard import DispatchGuard
 from trader.trading.exit_owner import ExitOwnerRegistry, apply_exit_owner_migration
 from trader.trading.liquidation_service import apply_liquidation_migration
+from trader.trading.quote_feeds import LIVE_ONLY_FEEDS
 from trader.trading.trading_control import TradingControlStore, apply_trading_control_migration
 
 GOOD_MARGIN = {"initMarginAfter": 5_000.0, "equityWithLoanAfter": 995_000.0}
@@ -117,10 +121,17 @@ class Quotes:
     def __init__(self, clock):
         self.clock = clock
         self.age = 0.0
+        self.changes: dict = {}
+
+    def set(self, **changes) -> None:
+        """ExecutableQuote fields for every later quote; the price follows the ask."""
+        self.changes.update(changes)
+        if "ask" in changes:
+            self.changes["price"] = changes["ask"]
 
     def executable_quote(self, conid, *, side):
         return replace(quote(conid=conid, age=self.age), side=side,
-                       market_timestamp=self.clock() - dt.timedelta(seconds=self.age))
+                       market_timestamp=self.clock() - dt.timedelta(seconds=self.age), **self.changes)
 
 
 class Margin:
@@ -196,8 +207,11 @@ class FilterFile:
 
 
 class World:
-    def __init__(self, tmp_path: Path, *, real_liquidation: bool = False):
+    def __init__(self, tmp_path: Path, *, real_liquidation: bool = False,
+                 accepted_feeds: frozenset[str] = LIVE_ONLY_FEEDS):
         self.clock = Clock()
+        self.accepted_feeds = accepted_feeds
+        self.scope_gate = None          # discretionary_world sets the discretionary scope gate
         self.db = DuckDBConnection.get_instance(str(tmp_path / "journal.duckdb"))
         migrator = SchemaMigrator(self.db)
         self.journal = DomainJournal(self.db)
@@ -235,7 +249,7 @@ class World:
             broker=self.broker, quotes=self.quotes, margin=self.margin,
             history=make_history(str(tmp_path / "history.duckdb")), journal=self.journal,
             account_id=ACCOUNT, account_mode="paper", now=self.clock, max_drift_bps=50.0,
-            entry_offset_bps=Decimal("10"), entry_filter=self.entry_filter))
+            entry_offset_bps=Decimal("10"), entry_filter=self.entry_filter, accepted_feeds=accepted_feeds))
         self.guard = DispatchGuard(
             broker=self.broker, quotes=self.quotes, margin=self.margin, controls=self.controls,
             risk_gate=self.risk_gate, policy=CommandAuthorityPolicy(
@@ -244,13 +258,14 @@ class World:
             account_id=ACCOUNT, account_mode="paper", allocation_policy=AllocationPolicy(now=self.clock),
             current_limits=lambda request: (self.policy.effective_limits() if request.action == AI_PAPER_ACTION
                                             else PAPER_LIMITS),
-            ai_entry_gate=ai_entry_gate(entry_filter=self.entry_filter),
-            strict_margin_actions=frozenset({AI_PAPER_ACTION}))
+            ai_entry_gate=compose_entry_gates(self._scope_gate, ai_entry_gate(entry_filter=self.entry_filter)),
+            strict_margin_actions=frozenset({AI_PAPER_ACTION}), accepted_feeds=accepted_feeds)
         self.liquidation = (self._real_liquidation() if real_liquidation
                             else SimpleNamespace(start=lambda *a, **k: None))
         self.saga = ProtectiveOrderSaga(
             journal=self.journal, ledger=self.ledger, dispatch=self.dispatch, dispatch_guard=self.guard,
-            session_risk=SessionRiskController(calendar=XNYSCalendarPolicy(), now=self.clock),
+            session_risk=SessionRiskController(calendar=XNYSCalendarPolicy(), now=self.clock,
+                                               liquidity_policy=LiquidityPolicy(accepted_feeds=accepted_feeds)),
             breaker=SimpleNamespace(record=lambda signal: None), liquidation=self.liquidation,
             account_id=ACCOUNT, account_mode="paper", now=self.clock, db=self.db)
         self.scheduled: list[str] = []
@@ -279,6 +294,9 @@ class World:
         return LiquidationService(
             self.broker, self.liquidation_dispatch, store=LiquidationRunStore(self.db), registry=self.exit_owners,
             now=self.clock, breaker=_Breaker(), schedule_reconcile=self.liquidation_scheduled.append)
+
+    def _scope_gate(self, request, approval, quote, now):
+        return None if self.scope_gate is None else self.scope_gate(request, approval, quote, now)
 
     def liquidation_runs(self) -> set[str]:
         return {row[0] for row in self.db.execute("SELECT cause_command_id FROM liquidation_runs", fetch="all")}
@@ -322,3 +340,16 @@ class World:
 
     def held(self, conid=CONID, quantity=300.0):
         self.broker.set(positions=self.broker.snapshot.positions + (pos(conid, quantity),))
+
+    def owned(self, conid=CONID, quantity=300.0, decision_id="dec-owned-00"):
+        """An ENTER of the current experiment whose saga reports a fill, then its broker position."""
+        assert self.submit(decision_id=decision_id, conid=conid).state == "SUBMITTED"
+        command_id = command_id_for(decision_id)
+        (raw,) = self.db.execute("SELECT payload FROM automated_order_sagas WHERE command_id = ?",
+                                 [command_id], fetch="one")
+        payload = {**json.loads(raw), "filled_quantity": str(quantity)}
+        self.db.execute("UPDATE automated_order_sagas SET payload = ? WHERE command_id = ?",
+                        [json.dumps(payload), command_id])
+        self.held(conid, quantity)
+        self.dispatch.plans.clear()
+        self.scheduled.clear()

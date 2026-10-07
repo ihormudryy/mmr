@@ -99,6 +99,7 @@ from trader.automation.controller_epoch import (
     MIN_LEASE_SECONDS,
     EpochRefused,
 )
+from trader.automation.scope_evidence import INSTRUMENTS_UNIVERSE as _INSTRUMENTS_UNIVERSE
 from trader.data.proposal_repository import ProposalRepository
 from trader.data.strategy_signal_record import MAX_READ_LIMIT, SignalCursorAhead
 from trader.domain.commands import CommandReceipt
@@ -300,9 +301,6 @@ def _instrument_to_wire(definition: Any) -> Dict[str, Any]:
         "security_type": str(definition.secType),
         "time_zone_id": str(definition.timeZoneId),
     }
-
-
-_INSTRUMENTS_UNIVERSE = '_instruments'
 
 
 def _stub_security_definition(instrument_id: int):
@@ -811,6 +809,24 @@ class RegisterAiDeploymentRequest(BaseModel):
         from trader.automation.ai_deployments import AiDeployment, DeploymentRefused
         try:
             AiDeployment.from_json(value)
+        except DeploymentRefused as ex:
+            raise ValueError(str(ex)) from None
+        return value
+
+
+class RegisterDiscretionaryDeploymentRequest(BaseModel):
+    """SP2 Plan 3: the operator's discretionary deployment; the rule may only narrow the spec default."""
+    model_config = ConfigDict(extra="forbid", strict=True)
+
+    deployment: dict
+
+    @field_validator("deployment")
+    @classmethod
+    def _deployment_is_valid(cls, value: dict) -> dict:
+        from trader.automation.ai_deployments import DeploymentRefused
+        from trader.automation.discretionary_deployment import DiscretionaryDeployment
+        try:
+            DiscretionaryDeployment.from_json(value)
         except DeploymentRefused as ex:
             raise ValueError(str(ex)) from None
         return value
@@ -1383,6 +1399,23 @@ def _register_ai_deployment_rpc_handler(coordinator: TradingCommandCoordinator, 
     return _handler
 
 
+def _register_discretionary_rpc_handler(coordinator: TradingCommandCoordinator, account_id: Optional[str]):
+    from trader.automation.ai_paper_actions import REGISTER_DISCRETIONARY_ACTION, deployment_command_id
+    from trader.automation.discretionary_deployment import DiscretionaryDeployment, discretionary_digest
+
+    def _handler(parsed: RegisterDiscretionaryDeploymentRequest, caller: RpcCaller) -> Dict[str, Any]:
+        # The canonical record is the body, so a re-registration of the same content replays.
+        deployment = DiscretionaryDeployment.from_json(parsed.deployment)
+        digest = discretionary_digest(deployment)
+        request = CommandRequest(
+            command_id=deployment_command_id(digest), action=REGISTER_DISCRETIONARY_ACTION, account_id=account_id,
+            target_type="ai_deployment", target_id=digest, expected_version=None,
+            body=deployment.to_json(), source=caller.principal, principal=caller.principal,
+        )
+        return _receipt_to_dict(coordinator.execute(request))
+    return _handler
+
+
 def _submit_ai_paper_decision_rpc_handler(coordinator: TradingCommandCoordinator, account_id: Optional[str],
                                           epochs):
     from trader.automation.ai_paper_decision import AI_PAPER_ACTION, command_id_for
@@ -1457,14 +1490,50 @@ def _read_ai_signals_handler(ai_paper):
     return _handler
 
 
+def _discover_ai_candidates_handler(reader):
+    from trader.automation.ai_discovery import DiscoveryRefused
+    from trader.automation.ai_discovery_wire import DiscoverAiCandidatesRequest, DiscoverAiCandidatesResponse
+
+    def _handler(parsed: DiscoverAiCandidatesRequest) -> DiscoverAiCandidatesResponse:
+        try:
+            return reader.read(parsed)
+        except DiscoveryRefused as ex:
+            raise _DispatchProblem(ex.code, ex.message) from None
+    return _handler
+
+
+def _ai_entry_quote_handler(source, now):
+    """Ruling 18: the BUY quote from the command stack's quote authority, labelled with its feed.
+
+    A quote outside the accepted set is still returned, so the ``ai`` side records ``feed_not_accepted``.
+    """
+    from trader.automation.ai_discovery_wire import GetAiEntryQuoteRequest
+
+    def _handler(parsed: GetAiEntryQuoteRequest) -> Dict[str, Any]:
+        try:
+            quote = source.quotes.executable_quote(parsed.conid, side="BUY")
+        except Exception as exc:                     # no quote: never the provider's text
+            logging.warning("entry quote read failed for conid %s: %s", parsed.conid, type(exc).__name__)
+            quote = None
+        body = None if quote is None else {
+            "bid": quote.bid, "ask": quote.ask, "bid_size": quote.bid_size, "ask_size": quote.ask_size,
+            "market_timestamp": quote.market_timestamp.isoformat(), "feed": quote.feed_type,
+            "session_state": quote.session_state}
+        return {"conid": parsed.conid, "read_at": now().isoformat(), "account_mode": source.account_mode,
+                "accepted_feeds": sorted(source.accepted_feeds), "quote": body}
+    return _handler
+
+
 def register_ai_paper_authority(registry: TypedRpcRegistry, coordinator: TradingCommandCoordinator,
                                 ai_paper, *, account_id: Optional[str]) -> None:
     """SP1 ai_paper (Plan 3 Task 9): only when ``ai_paper.enabled`` built the services."""
-    from trader.automation.ai_paper_actions import PUBLISH_ACTION, REGISTER_ACTION
+    from trader.automation.ai_paper_actions import PUBLISH_ACTION, REGISTER_ACTION, REGISTER_DISCRETIONARY_ACTION
     from trader.automation.ai_paper_decision import AI_PAPER_ACTION
 
     coordinator.register_action(PUBLISH_ACTION, ai_paper.actions.publish, requires_preflight=False, saga=True)
     coordinator.register_action(REGISTER_ACTION, ai_paper.actions.register, requires_preflight=False)
+    coordinator.register_action(REGISTER_DISCRETIONARY_ACTION, ai_paper.actions.register_discretionary,
+                                requires_preflight=False)
     coordinator.register_action(AI_PAPER_ACTION, ai_paper.decisions.execute, requires_preflight=False, saga=True)
     registry.register(
         "command", "publish_ai_risk_policy", PublishAiRiskPolicyRequest, dict,
@@ -1473,6 +1542,10 @@ def register_ai_paper_authority(registry: TypedRpcRegistry, coordinator: Trading
     registry.register(
         "command", "register_ai_deployment", RegisterAiDeploymentRequest, dict,
         _register_ai_deployment_rpc_handler(coordinator, account_id), with_caller=True,
+    )
+    registry.register(
+        "command", "register_discretionary_deployment", RegisterDiscretionaryDeploymentRequest, dict,
+        _register_discretionary_rpc_handler(coordinator, account_id), with_caller=True,
     )
     registry.register(
         "command", "submit_ai_paper_decision", SubmitAiPaperDecisionRequest, dict,
@@ -1493,6 +1566,25 @@ def register_ai_paper_authority(registry: TypedRpcRegistry, coordinator: Trading
     registry.register(
         "query", "get_ai_deployment", GetAiDeploymentRequest, dict, _get_ai_deployment_handler(ai_paper.actions),
     )
+    _register_ai_discovery(registry, ai_paper)
+
+
+def _register_ai_discovery(registry: TypedRpcRegistry, ai_paper) -> None:
+    """SP2 Plan 3 rulings 17-18: network reads run on a worker thread, never on the trader loop."""
+    from trader.automation.ai_discovery_wire import (
+        DiscoverAiCandidatesRequest, DiscoverAiCandidatesResponse, GetAiEntryQuoteRequest,
+    )
+    if getattr(ai_paper, "discovery", None) is not None:
+        registry.register(
+            "query", "discover_ai_candidates", DiscoverAiCandidatesRequest, DiscoverAiCandidatesResponse,
+            _discover_ai_candidates_handler(ai_paper.discovery), execution="thread",
+        )
+    if getattr(ai_paper, "entry_quotes", None) is not None:
+        registry.register(
+            "query", "get_ai_entry_quote", GetAiEntryQuoteRequest, dict,
+            _ai_entry_quote_handler(ai_paper.entry_quotes, lambda: dt.datetime.now(dt.timezone.utc)),
+            execution="thread",
+        )
 
 
 EXPERIMENT_ACTIONS = ("start_experiment", "pause_experiment", "resume_experiment", "stop_experiment")

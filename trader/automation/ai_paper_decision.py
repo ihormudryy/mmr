@@ -17,12 +17,14 @@ from dataclasses import dataclass, replace
 from decimal import Decimal
 from typing import Any, Callable, Literal, Mapping, Optional
 
-from trader.automation.ai_deployments import DeploymentRefused
+from trader.automation.ai_deployments import DISCRETIONARY_KIND, STRATEGY_KIND, DeploymentRefused
 from trader.automation.ai_paper_evidence import AI_ENTRY_POLICY, AI_PAPER_ACTION  # noqa: F401 (re-exported)
 from trader.automation.ai_paper_sizing import is_pending_entry
 from trader.automation.ai_risk_policy import PolicyRefused
 from trader.automation.command_steps import CommandSteps
 from trader.automation.controller_epoch import EPOCH_MISSING, EpochRefused
+from trader.automation.discretionary_deployment import DiscretionaryDeployment
+from trader.automation.discretionary_scope import OUT_OF_DISCRETIONARY_SCOPE, AdmissionScope, ScopeRefused
 from trader.automation.models import EntryPolicy, StopPolicy, TargetPolicy
 from trader.automation.reduction_close import CLOSE_PENDING, start_broker_proven_close
 from trader.data.schema_migrations import SchemaMigrator
@@ -61,7 +63,8 @@ def apply_ai_paper_decision_migration(migrator: SchemaMigrator) -> bool:
             deployment_digest VARCHAR, strategy_digest VARCHAR, style VARCHAR,
             policy_revision INTEGER, effective_revision INTEGER, principal VARCHAR,
             controller_epoch BIGINT, body_json VARCHAR NOT NULL, state VARCHAR NOT NULL, error_code VARCHAR,
-            close_root_id VARCHAR, received_at TIMESTAMPTZ NOT NULL, updated_at TIMESTAMPTZ NOT NULL)""",
+            close_root_id VARCHAR, received_at TIMESTAMPTZ NOT NULL, updated_at TIMESTAMPTZ NOT NULL,
+            experiment_id VARCHAR, deployment_kind VARCHAR)""",
         "CREATE INDEX IF NOT EXISTS idx_ai_paper_decisions_root ON ai_paper_decisions(close_root_id)",
     ))
 
@@ -145,7 +148,7 @@ class AiPaperDecision:
             raise DecisionInvalid("expires_at must be an aware datetime")
 
     def _check_shape(self) -> None:
-        """R16: an ENTER carries attribution; a reduction carries none."""
+        """R16: an ENTER carries attribution; a reduction carries none and never moves protection."""
         if self.action == "ENTER":
             if self.deployment_digest is None or self.policy_revision is None or self.stop_price is None:
                 raise DecisionInvalid("ENTER needs deployment_digest, policy_revision and stop_price")
@@ -157,8 +160,12 @@ class AiPaperDecision:
         if self.action == "CLOSE" and (self.stop_price is not None or self.target_price is not None
                                        or self.quantity is not None):
             raise DecisionInvalid("CLOSE takes no quantity, stop_price or target_price")
-        if self.action == "PARTIAL_CLOSE" and self.quantity is None:
-            raise DecisionInvalid("PARTIAL_CLOSE needs a quantity")
+        if self.action == "PARTIAL_CLOSE":
+            if self.quantity is None:
+                raise DecisionInvalid("PARTIAL_CLOSE needs a quantity")
+            if self.stop_price is not None or self.target_price is not None:
+                raise DecisionInvalid("PARTIAL_CLOSE keeps the existing stop and target; "
+                                      "stop_price and target_price must be null")
 
     @classmethod
     def from_body(cls, body: Mapping[str, Any]) -> "AiPaperDecision":
@@ -217,11 +224,12 @@ def entry_order_for(decision: AiPaperDecision, *, command_id: str, quantity: int
         artifact_id=deployment_digest, decision_id=decision.decision_id)
 
 
-def deployment_binding(deployment: Any, *, digest: str, limits: Any, expires_at: dt.datetime) -> DeploymentBinding:
+def deployment_binding(*, digest: str, allowlist: tuple[str, ...], notional: float, limits: Any,
+                       expires_at: dt.datetime) -> DeploymentBinding:
+    """A strategy deployment binds its conids and attested notional; a discretionary one its conid and cap."""
     return DeploymentBinding(
-        artifact_id=digest, allowlist=tuple(str(conid) for conid in deployment.conids),
-        max_gross_allocation=limits.gross_fraction,
-        attested_strategy=_AttestedNotional(deployment.evidence_order_notional), expires_at=expires_at)
+        artifact_id=digest, allowlist=allowlist, max_gross_allocation=limits.gross_fraction,
+        attested_strategy=_AttestedNotional(notional), expires_at=expires_at)
 
 
 # ---------------------------------------------------------------------------
@@ -230,7 +238,8 @@ def deployment_binding(deployment: Any, *, digest: str, limits: Any, expires_at:
 
 _ROW_COLUMNS = ("command_id", "decision_id", "account_id", "conid", "action", "decider", "evidence_digest",
                 "deployment_digest", "strategy_digest", "style", "policy_revision", "effective_revision",
-                "principal", "controller_epoch", "body_json", "state", "error_code", "close_root_id", "received_at", "updated_at")
+                "principal", "controller_epoch", "body_json", "state", "error_code", "close_root_id", "received_at", "updated_at",
+                "experiment_id", "deployment_kind")
 
 
 @dataclass(frozen=True)
@@ -255,6 +264,8 @@ class DecisionRow:
     controller_epoch: Optional[int] = None
     error_code: Optional[str] = None
     close_root_id: Optional[str] = None
+    experiment_id: Optional[str] = None
+    deployment_kind: Optional[str] = None
 
     @classmethod
     def received(cls, cmd: CommandRequest, now: dt.datetime) -> "DecisionRow":
@@ -283,6 +294,7 @@ class DecisionLink:
     effective_revision: Optional[int]
     style: Optional[str]
     digest: Optional[str]
+    deployment_kind: Optional[str] = None
 
 
 class AiPaperDecisionStore:
@@ -344,6 +356,15 @@ class AiPaperDecisionStore:
         return bool(payload.get("entry_working") or payload.get("entry_cancelled")
                     or Decimal(str(payload.get("filled_quantity") or "0")) > 0)
 
+    def experiment_owns_conid_in_tx(self, conn, account_id: str, experiment_id: str, conid: int) -> bool:
+        """Spec 6.4: an ENTER of this experiment on the conid whose protective saga reports a fill."""
+        rows = conn.execute(
+            "SELECT s.payload FROM ai_paper_decisions d "
+            "JOIN automated_order_sagas s ON s.command_id = d.command_id "
+            "WHERE d.account_id = ? AND d.experiment_id = ? AND d.conid = ? AND d.action = 'ENTER'",
+            [account_id, experiment_id, conid]).fetchall()
+        return any(Decimal(str(json.loads(payload).get("filled_quantity") or "0")) > 0 for (payload,) in rows)
+
     def links_for_order_ref(self, order_ref: str) -> tuple[DecisionLink, ...]:
         """R24: the decisions behind a broker order ref, for the scoreboard (Plan 5)."""
         group = decode_order_ref(order_ref)
@@ -357,8 +378,10 @@ class AiPaperDecisionStore:
                 return ()
             where, value = "d.close_root_id = ?", root
         rows = self._journal.connect().execute(
-            "SELECT d.decision_id, d.action, d.decider, d.strategy_digest, p.strategy_digest_provenance, "
-            "d.policy_revision, d.effective_revision, d.style, d.deployment_digest "
+            "SELECT d.decision_id, d.action, d.decider, "
+            "CASE WHEN p.kind = 'discretionary' THEN 'discretionary' ELSE d.strategy_digest END, "
+            "p.strategy_digest_provenance, d.policy_revision, d.effective_revision, d.style, d.deployment_digest, "
+            "p.kind "
             "FROM ai_paper_decisions d LEFT JOIN ai_deployments p ON p.digest = d.deployment_digest "
             f"WHERE {where} AND d.decision_id IS NOT NULL ORDER BY d.received_at", [value]).fetchall()
         return tuple(DecisionLink(*row) for row in rows)
@@ -369,7 +392,7 @@ class AiPaperDecisionStore:
 # ---------------------------------------------------------------------------
 
 class _Refusal(Exception):
-    def __init__(self, code: str, *, retryable: bool = False, detail: Optional[str] = None):
+    def __init__(self, code: str, *, retryable: bool = False, detail: Optional[str | dict] = None):
         super().__init__(code)
         self.code = code
         self.retryable = retryable
@@ -388,7 +411,8 @@ class AiPaperDecisionService:
                  evidence: Any, saga: Any, experiments: Any, exit_owners: Any, liquidation: Any, broker: Any,
                  config: Any, account_id: str, now: Callable[[], dt.datetime], epochs: Any,
                  schedule_reconcile: Optional[Callable[[str], None]] = None,
-                 decisions: Optional[AiPaperDecisionStore] = None, close_deadline_seconds: float = 300.0):
+                 decisions: Optional[AiPaperDecisionStore] = None, close_deadline_seconds: float = 300.0,
+                 scope: Any = None):
         self._ledger = ledger
         self._journal = journal
         self._policy = policy
@@ -405,12 +429,17 @@ class AiPaperDecisionService:
         self._decisions = decisions or AiPaperDecisionStore(journal)
         self._close_deadline_seconds = close_deadline_seconds
         self._epochs = epochs
+        self._scope = scope
         self._steps = CommandSteps(ledger=ledger, journal=journal, controls=controls,
                                    account_id=account_id, now=now)
 
     @property
     def decisions(self) -> AiPaperDecisionStore:
         return self._decisions
+
+    def attach_scope(self, scope: Any) -> None:
+        """The DiscretionaryScopeService; without one a discretionary ENTER fails closed."""
+        self._scope = scope
 
     def execute(self, cmd: CommandRequest) -> CommandReceipt:
         admission = _Admission(DecisionRow.received(cmd, self._steps.now_utc()))
@@ -506,6 +535,7 @@ class AiPaperDecisionService:
 
     def _execute_entry(self, cmd: CommandRequest, decision: AiPaperDecision, admission: _Admission) -> CommandReceipt:
         experiment = self._experiment(allow=("ARMED",))
+        admission.row = replace(admission.row, experiment_id=experiment.experiment_id)
         if getattr(experiment, "entry_block", None):
             # Plan 4 K19, row 4c: KILL_LINE_UNKNOWN, EXPERIMENT_MONITOR_NOT_READY, BOTH_MODES_ARMED.
             raise _Refusal(experiment.entry_block)
@@ -518,19 +548,44 @@ class AiPaperDecisionService:
         deployment = self._deployment(decision, admission)
         if decision.side != "BUY":
             raise _Refusal("SIDE_NOT_ENABLED")
+        scope = self._admit_scope(cmd, decision, deployment)
+        notional = deployment.evidence_order_notional if scope is None else scope.attested_notional
         try:
             prepared = self._evidence.prepare_entry(
                 conid=decision.conid, stop_price=float(decision.stop_price),
                 requested_quantity=decision.quantity, limits=limits, session=session,
-                notional=deployment.evidence_order_notional, experiment_id=experiment.experiment_id)
+                notional=notional, experiment_id=experiment.experiment_id,
+                volume=None if scope is None else scope.evidence.volume,
+                scope_evidence=None if scope is None else scope.evidence)
         except ApprovalContextError as ex:
+            if scope is not None and ex.code == "ORDER_EXCEEDS_ATTESTED_NOTIONAL":
+                detail = self._scope.refuse_size(command_id=cmd.command_id, scope=scope, conid=decision.conid,
+                                                 reason=ex.message)
+                raise _Refusal(OUT_OF_DISCRETIONARY_SCOPE, detail=detail) from None
             raise _Refusal(ex.code, detail=ex.message) from None
         self._claim(cmd, admission, require_unpaused=True)
         order = entry_order_for(decision, command_id=cmd.command_id, quantity=prepared.quantity,
                                 limits=limits, deployment_digest=decision.deployment_digest)
-        binding = deployment_binding(deployment, digest=decision.deployment_digest, limits=limits,
-                                     expires_at=decision.expires_at)
+        allowlist = ((str(decision.conid),) if scope is not None
+                     else tuple(str(conid) for conid in deployment.conids))
+        binding = deployment_binding(digest=decision.deployment_digest, allowlist=allowlist, notional=notional,
+                                     limits=limits, expires_at=decision.expires_at)
         return self._start_saga(cmd, admission, decision, order, binding, prepared)
+
+    def _admit_scope(self, cmd: CommandRequest, decision: AiPaperDecision,
+                     deployment: Any) -> Optional[AdmissionScope]:
+        """SP2 spec 6.6: a discretionary ENTER passes the sealed scope rule on fresh evidence, or fails closed."""
+        if not isinstance(deployment, DiscretionaryDeployment):
+            return None
+        if self._scope is None:
+            raise _Refusal(OUT_OF_DISCRETIONARY_SCOPE, detail={
+                "part": "evidence_stale", "reason": "the scope service is not wired", "phase": "admission",
+                "check_id": None})
+        try:
+            return self._scope.check_admission(command_id=cmd.command_id, digest=decision.deployment_digest,
+                                               deployment=deployment, conid=decision.conid)
+        except ScopeRefused as refused:
+            raise _Refusal(OUT_OF_DISCRETIONARY_SCOPE, detail=refused.detail) from None
 
     def _session(self, snapshot: Any) -> Any:
         try:
@@ -556,14 +611,19 @@ class AiPaperDecisionService:
 
     def _deployment(self, decision: AiPaperDecision, admission: _Admission) -> Any:
         try:
-            deployment = self._deployments.get_sealed(decision.deployment_digest)
+            deployment = self._deployments.get_sealed_any(decision.deployment_digest)
         except DeploymentRefused as ex:
             raise _Refusal(ex.code, detail=ex.message) from None
-        admission.row = replace(admission.row, strategy_digest=deployment.strategy_digest, style=deployment.style)
-        if deployment.decider_verdict != "DEPLOY":
-            raise _Refusal("DEPLOYMENT_NOT_DEPLOYABLE")
-        if decision.conid not in deployment.conids:
-            raise _Refusal("CONID_NOT_IN_DEPLOYMENT")
+        if isinstance(deployment, DiscretionaryDeployment):
+            # SP2 spec 6.6: no conid list; the scope rule is checked in _admit_scope.
+            admission.row = replace(admission.row, style=deployment.style, deployment_kind=DISCRETIONARY_KIND)
+        else:
+            admission.row = replace(admission.row, strategy_digest=deployment.strategy_digest,
+                                    style=deployment.style, deployment_kind=STRATEGY_KIND)
+            if deployment.decider_verdict != "DEPLOY":
+                raise _Refusal("DEPLOYMENT_NOT_DEPLOYABLE")
+            if decision.conid not in deployment.conids:
+                raise _Refusal("CONID_NOT_IN_DEPLOYMENT")
         if deployment.style not in self._config.styles:
             raise _Refusal("STYLE_NOT_ENABLED")
         return deployment
@@ -580,7 +640,7 @@ class AiPaperDecisionService:
         if saga_state.state == "CLOSED" and saga_state.error_code:
             if saga_state.error_code in LATCH_CODES:
                 self._latch(saga_state.error_code, decision)
-            raise _Refusal(saga_state.error_code)
+            raise _Refusal(saga_state.error_code, detail=self._dispatch_detail(cmd, saga_state.error_code))
         if saga_state.state == "OUTCOME_UNKNOWN":
             return self._outcome_unknown(cmd, admission, "DISPATCH_AMBIGUOUS")
         outcome = {
@@ -599,6 +659,14 @@ class AiPaperDecisionService:
             self._schedule_reconcile(cmd.command_id)
         return CommandSteps.receipt(cmd.command_id, "SUBMITTED", None, False, outcome=outcome)
 
+    def _dispatch_detail(self, cmd: CommandRequest, code: str) -> Optional[dict]:
+        """Ruling 9: the saga keeps only the code; the dispatch gate's recorded verdict names the part."""
+        if code != OUT_OF_DISCRETIONARY_SCOPE:
+            return None
+        found = None if self._scope is None else self._scope.checks.detail(cmd.command_id, "dispatch")
+        return found or {"part": "evidence_stale", "reason": "the dispatch check left no record",
+                         "phase": "dispatch", "check_id": None}
+
     def _latch(self, code: str, decision: AiPaperDecision) -> None:
         """R10. A failed latch does not unsafely admit anything: session_risk refuses each entry again."""
         try:
@@ -612,22 +680,21 @@ class AiPaperDecisionService:
                            admission: _Admission) -> CommandReceipt:
         """Spec 5.4: no entry window, budget, loss check, policy or deployment; never paused (R32)."""
         experiment = self._experiment(allow=("ARMED", "PAUSED", "KILLED"))
+        admission.row = replace(admission.row, experiment_id=experiment.experiment_id)
         killed = experiment.state == "KILLED"
         if killed and self._account_owner() is None:
             # R15: join the kill flatten; never claim a new scoped root while it is being set up.
             raise _Refusal("KILL_FLATTEN_PENDING", retryable=True)
         self._check_expiry(decision)
         snapshot = self._capture()
-        self._validate(cmd, admission, decision.conid, snapshot, owner_check=lambda conn: None,
-                       working_entry_blocks=False)
+        self._validate(cmd, admission, decision.conid, snapshot, working_entry_blocks=False,
+                       owner_check=lambda conn: self._not_owned_in_tx(conn, experiment, decision.conid))
         self._claim(cmd, admission, require_unpaused=False)
         partial = decision.action == "PARTIAL_CLOSE" and not killed
         close = start_broker_proven_close(
             liquidation=self._liquidation, broker=self._broker, account_id=self._account_id,
             command_id=cmd.command_id, conid=decision.conid, side=decision.side,
             quantity=float(decision.quantity) if partial else None,
-            stop_price=decision.stop_price if partial else None,
-            target_price=decision.target_price if partial else None,
             deadline=self._steps.now_utc() + dt.timedelta(seconds=self._close_deadline_seconds))
         if close.state == "REJECTED":
             raise _Refusal(close.error_code, detail=json.dumps(close.outcome, default=str))
@@ -635,6 +702,10 @@ class AiPaperDecisionService:
             return self._outcome_unknown(cmd, admission, close.error_code, outcome=close.outcome)
         return self._outcome_unknown(cmd, admission, CLOSE_PENDING, outcome=close.outcome,
                                      close_root_id=close.close_root_id)
+
+    def _not_owned_in_tx(self, conn, experiment: Any, conid: int) -> Optional[str]:
+        owned = self._decisions.experiment_owns_conid_in_tx(conn, self._account_id, experiment.experiment_id, conid)
+        return None if owned else "POSITION_NOT_OWNED"
 
     def _account_owner(self) -> Any:
         try:

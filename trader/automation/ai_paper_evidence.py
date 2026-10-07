@@ -19,7 +19,9 @@ from trader.automation.ai_paper_sizing import (
 )
 from trader.automation.liquidity_policy import LiquidityPolicy
 from trader.automation.models import EntryPolicy
-from trader.automation.production_evidence import liquidity_from_history, validate_approval
+from trader.automation.production_evidence import (
+    liquidity_from_history, liquidity_from_sessions, validate_approval,
+)
 from trader.automation.protective_order_saga import compute_entry_limit
 from trader.automation.risk_limits import RiskLimits
 from trader.automation.session_risk import AllocationCeiling, AutomationSessionState
@@ -98,14 +100,17 @@ class AiPaperEvidence:
         self._liquidity_policy = liquidity_policy or LiquidityPolicy(accepted_feeds=self._accepted_feeds)
 
     def prepare_entry(self, *, conid: int, stop_price: float, requested_quantity: Optional[int],
-                      limits: RiskLimits, session: Any, notional: float, experiment_id: str) -> PreparedEntry:
+                      limits: RiskLimits, session: Any, notional: float, experiment_id: str,
+                      volume: Any = None, scope_evidence: Any = None) -> PreparedEntry:
+        """``volume`` and ``scope_evidence`` come from a discretionary admission (SP2 Plan 3)."""
         self._check_binding()
         snapshot = self._capture()
         refusal = pending_entry_refusal(snapshot, conid, limits)
         if refusal:
             raise _refuse(refusal, "pending entries or position slots are full")
         quote = self._quote(conid)
-        liquidity = liquidity_from_history(self._history, conid, quote, self._now())
+        liquidity = (liquidity_from_history(self._history, conid, quote, self._now()) if volume is None
+                     else liquidity_from_sessions(volume, quote))
         liquidity_max = self._liquidity_policy.max_quantity(liquidity)
         price = self._entry_price(quote)
         if not stop_price < price:
@@ -132,7 +137,8 @@ class AiPaperEvidence:
             notional_cap=notional_cap, daily_loss_anchor=float(session.anchor), high_water_mark=hwm)
         return PreparedEntry(
             quantity=quantity,
-            approval=replace(approval, risk_direction="INCREASING", entry_limits=evidence),
+            approval=replace(approval, risk_direction="INCREASING", entry_limits=evidence,
+                             discretionary_scope=scope_evidence),
             session_state=AutomationSessionState(
                 high_water_mark=hwm, expected_account_id=self._account_id, limits=limits,
                 liquidity=liquidity, daily_loss_anchor=float(session.anchor)),

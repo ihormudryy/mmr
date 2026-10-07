@@ -11,6 +11,7 @@ import datetime as dt
 from typing import Any, Callable, Optional
 
 from trader.automation.ai_deployments import DISCRETIONARY_KIND, AiDeployment, DeploymentRefused
+from trader.automation.ai_paper_config import STYLE_NOT_ENABLED
 from trader.automation.ai_risk_policy import PolicyRefused
 from trader.automation.command_steps import CommandSteps
 from trader.automation.discretionary_deployment import DiscretionaryDeployment
@@ -93,8 +94,8 @@ class AiPaperActions:
             deployment = AiDeployment.from_json(cmd.body)
         except DeploymentRefused as ex:
             raise CommandValidationError(ex.code, ex.message) from None
-        if deployment.style not in self._config.styles:
-            raise CommandValidationError("STYLE_NOT_ENABLED", f"style {deployment.style!r} is not enabled")
+        if not self._config.style_enabled(deployment.style):
+            raise CommandValidationError(STYLE_NOT_ENABLED, f"style {deployment.style!r} is not enabled")
         digest, created = self._deployments.register(deployment, principal=cmd.principal,
                                                      command_id=cmd.command_id)
         return {"digest": digest, "created": created,
@@ -112,8 +113,8 @@ class AiPaperActions:
             deployment = DiscretionaryDeployment.from_json(cmd.body)
         except DeploymentRefused as ex:
             raise CommandValidationError(ex.code, ex.message) from None
-        if deployment.style not in self._config.styles:
-            raise CommandValidationError("STYLE_NOT_ENABLED", f"style {deployment.style!r} is not enabled")
+        if not self._config.style_enabled(deployment.style):
+            raise CommandValidationError(STYLE_NOT_ENABLED, f"style {deployment.style!r} is not enabled")
         digest, created = self._deployments.register_discretionary(deployment, principal=cmd.principal,
                                                                    command_id=cmd.command_id)
         return {"digest": digest, "created": created, "kind": DISCRETIONARY_KIND}

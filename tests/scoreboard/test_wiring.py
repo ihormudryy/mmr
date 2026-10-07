@@ -182,6 +182,7 @@ def test_ingest_reads_enter_sizes_from_the_command_ledger_and_sizes_with_sp1(pro
     assert ingest is stack.scoreboard.ingest
     assert isinstance(ingest._decisions, DecisionStoreFacts) and isinstance(ingest._decisions._ledger, CommandLedger)
     assert isinstance(ingest._sizer, AiPaperBaselineSizer) and ingest._sizer is stack.ai_paper.baseline_sizer
+    assert ingest._sizer._scope is stack.ai_paper.decisions._scope is not None       # issue #85
     from trader.scoreboard.close_fills import JournalCloseFills
     from trader.scoreboard.ports import DecisionStoreCloseLinks
     close_fills = stack.scoreboard.close_fills

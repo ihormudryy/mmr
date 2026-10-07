@@ -247,6 +247,15 @@ class DiscretionaryScopeService:
         return self._checks
 
     def check_admission(self, *, command_id: str, digest: str, deployment: Any, conid: int) -> AdmissionScope:
+        verdict, scope = self.assess(digest=digest, deployment=deployment, conid=conid)
+        detail = self._checks.record(command_id=command_id, phase="admission", deployment_digest=digest,
+                                     conid=conid, verdict=verdict)
+        if scope is None:
+            raise ScopeRefused(detail)
+        return scope
+
+    def assess(self, *, digest: str, deployment: Any, conid: int) -> tuple[ScopeVerdict, Optional[AdmissionScope]]:
+        """The admission check without its record: a baseline is sized on it and writes nothing (Plan 3 R19)."""
         missing: list[str] = []
         # Order matters: the contract read remembers the conid in the universe, which the quote read needs.
         contract = self._fetch(lambda: self._contracts.by_conid(conid), missing)
@@ -256,14 +265,12 @@ class DiscretionaryScopeService:
         rule = deployment.scope_rule
         verdict = evaluate_scope(rule, ScopeInputs(contract, quote, volume, None, self._filter_refusal,
                                                    self._accepted_feeds, tuple(missing)), self._now())
-        detail = self._checks.record(command_id=command_id, phase="admission", deployment_digest=digest,
-                                     conid=conid, verdict=verdict)
         if not verdict.passed:
-            raise ScopeRefused(detail)
+            return verdict, None
         cap = rule.max_order_share_of_dollar_volume * volume.median_dollar_volume
         # Ruling 7: SP1 adds LIVE_NOTIONAL_TOLERANCE to the attested notional; this keeps the bound at the cap.
-        return AdmissionScope(DiscretionaryScopeEvidence(digest, rule, contract, volume),
-                              cap / (1.0 + LIVE_NOTIONAL_TOLERANCE))
+        return verdict, AdmissionScope(DiscretionaryScopeEvidence(digest, rule, contract, volume),
+                                       cap / (1.0 + LIVE_NOTIONAL_TOLERANCE))
 
     def refuse_size(self, *, command_id: str, scope: AdmissionScope, conid: int, reason: str) -> dict:
         verdict = ScopeVerdict("liquidity", reason, {"volume": scope.evidence.volume.to_json()})

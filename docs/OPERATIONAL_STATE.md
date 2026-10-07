@@ -442,7 +442,6 @@ then fails.
 5. Check: the heartbeat file, `mmr scoreboard` (books per baseline, AI cost with status), and `ai_rulings` / `ai_discovery_reads` in `ai.duckdb` for refusals and discovery coverage.
 
 The service never publishes or loosens policy. A role whose provider rejects its model is paused for 5 minutes at a time: Jev down blocks every ENTER, orchestrator down stops discovery and model closes; SP1's stops, targets and the 15:45 flatten are unaffected.
-Known gap (#85): the trader cannot size `fixed_rule.v1` yet (the baseline sizer reads strategy deployments only), so that book stays `sizing_unavailable` until fixed.
 
 The automation soak below is blocked until the exit fix
 and the split-Docker evidence gap are resolved (see Known blockers). Until then, run strategies with `auto_execute: propose`

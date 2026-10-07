@@ -1,4 +1,7 @@
-"""SP2 Plan 2 Ruling 19: a baseline is sized exactly as a real ai_paper ENTER of the same deployment."""
+"""SP2 Plan 2 Ruling 19: a baseline is sized exactly as a real ai_paper ENTER of the same deployment.
+
+Plan 3 Ruling 19: a discretionary deployment is sized as a real discretionary ENTER, on the scope rule (#85).
+"""
 import dataclasses
 import datetime as dt
 from dataclasses import replace
@@ -10,6 +13,8 @@ import pytest
 from tests.automation.ai_paper_fixtures import (
     ACCOUNT, CONID, NOW, FakeUniverse, Quotes, SnapshotSequence, order, pos, prepare, quote, secdef, snapshot,
 )
+from tests.automation.discretionary_world import discretionary_world
+from trader.automation.ai_paper_config import AiPaperConfig
 from trader.automation.ai_paper_filter import AiEntryFilter
 from trader.trading.trading_filter import TradingFilter
 from trader.automation.ai_baseline_sizing import AiPaperBaselineSizer
@@ -25,7 +30,7 @@ DIGEST = "sha256:" + "d" * 64
 
 
 def deployment(**changes):
-    values = dict(decider_verdict="DEPLOY", conids=(CONID,), evidence_order_notional=1e9)
+    values = dict(decider_verdict="DEPLOY", conids=(CONID,), evidence_order_notional=1e9, style="intraday_long")
     values.update(changes)
     return SimpleNamespace(**values)
 
@@ -34,8 +39,8 @@ def sizer(parts, *, limits=PAPER_LIMITS, dep=None, feeds=LIVE_ONLY_FEEDS, policy
     return AiPaperBaselineSizer(
         broker=parts["broker"], quotes=parts["quotes"], history=parts["history"],
         policy=policy or SimpleNamespace(effective_limits=lambda: limits),
-        deployments=SimpleNamespace(get_sealed=lambda digest: dep or deployment()),
-        accepted_feeds=feeds, entry_filter=parts["entry_filter"], now=lambda: NOW)
+        deployments=SimpleNamespace(get_sealed_any=lambda digest: dep or deployment()),
+        accepted_feeds=feeds, entry_filter=parts["entry_filter"], now=lambda: NOW, config=AiPaperConfig(enabled=True))
 
 
 def size(parts, **changes):
@@ -176,3 +181,82 @@ def test_a_non_paper_account_id_cannot_size(parts):
                           reference_price=100.0, stop_price=98.0)
     assert exc.value.code == "PAPER_ONLY"
 
+
+
+# -- discretionary deployments (Plan 3 Ruling 19, issue #85) ----------------------------------------
+
+def world_sizer(world, *, scope="world", history=None):
+    """The world's own broker, quotes, policy, store, filter, config and scope service; by default no local
+    history to read."""
+    world.start_session()                       # a real ENTER opens the session before it sizes
+    return AiPaperBaselineSizer(
+        broker=world.broker, quotes=world.quotes, history=history, policy=world.policy,
+        deployments=world.deployments, accepted_feeds=world.accepted_feeds, entry_filter=world.entry_filter,
+        now=world.clock, scope=world.scope if scope == "world" else scope, config=world.service._config)
+
+
+def size_discretionary(world, *, scope="world"):
+    return world_sizer(world, scope=scope).size(account_id=ACCOUNT, deployment_digest=world.ddigest, conid=CONID,
+                                                reference_price=100.0, stop_price=98.0)
+
+
+def test_a_discretionary_baseline_equals_the_real_discretionary_enter_when_the_scope_cap_binds(tmp_path):
+    world = discretionary_world(tmp_path, rule={"max_order_share_of_dollar_volume": 0.0004})   # $40,000
+    sized = size_discretionary(world)
+    receipt = world.submit(deployment_digest=world.ddigest, stop_price=98.0)
+    assert receipt.state == "SUBMITTED", receipt
+    # floor(40,000 / 100.10) = 399, below the 5 % position bound (499): the scope rule's cap binds.
+    assert sized.quantity == receipt.outcome["quantity"] == 399
+    assert sized.inputs["notional_cap"] == pytest.approx(40_000.0)
+
+
+def test_a_discretionary_baseline_records_nothing(tmp_path):
+    world = discretionary_world(tmp_path)
+    assert size_discretionary(world).quantity >= 1
+    assert world.db.execute("SELECT COUNT(*) FROM discretionary_scope_checks", fetch="one") == (0,)
+
+
+@pytest.mark.parametrize("change,part", [
+    (lambda w: w.contracts.set(CONID, primary_exchange="AMEX"), "exchange"),
+    (lambda w: w.volumes.set(volume=300_000.0), "dollar_volume"),
+    (lambda w: w.filter_file.write(denylist=["AAPL"]), "trading_filter"),
+    (lambda w: w.contracts.fail_with("IB contract details failed: TimeoutError"), "evidence_stale"),
+])
+def test_an_instrument_outside_the_scope_rule_is_never_sized(tmp_path, change, part):
+    world = discretionary_world(tmp_path)
+    change(world)
+    with pytest.raises(SizingUnavailable) as exc:
+        size_discretionary(world)
+    assert (exc.value.code, exc.value.reason, exc.value.inputs["part"]) == (
+        "OUT_OF_DISCRETIONARY_SCOPE", "sizing_unavailable", part)
+    receipt = world.submit(deployment_digest=world.ddigest)              # the real ENTER refuses it too
+    assert (receipt.error_code, receipt.outcome["detail"]["part"]) == ("OUT_OF_DISCRETIONARY_SCOPE", part)
+
+
+def test_without_a_scope_service_a_discretionary_baseline_cannot_size(tmp_path):
+    world = discretionary_world(tmp_path)
+    with pytest.raises(SizingUnavailable) as exc:
+        size_discretionary(world, scope=None)
+    assert (exc.value.code, exc.value.inputs["part"]) == ("OUT_OF_DISCRETIONARY_SCOPE", "evidence_stale")
+
+
+def test_a_strategy_deployment_never_reads_the_scope_rule(tmp_path):
+    world = discretionary_world(tmp_path)
+    sized = world_sizer(world, history=world.evidence.inner._history).size(account_id=ACCOUNT, deployment_digest=world.digest, conid=CONID,
+                        reference_price=100.0, stop_price=98.0)
+    receipt = world.submit(stop_price=98.0)                              # world.digest: the strategy deployment
+    assert sized.quantity == receipt.outcome["quantity"]
+    assert world.contracts.calls == 0 and world.volumes.calls == 0
+
+
+@pytest.mark.parametrize("digest", ["digest", "ddigest"])           # strategy, discretionary
+def test_a_style_the_real_enter_refuses_cannot_size(tmp_path, digest):
+    world = discretionary_world(tmp_path)
+    world.service._config = AiPaperConfig(enabled=True, styles=())      # the deployment's style is not enabled
+    with pytest.raises(SizingUnavailable) as exc:
+        world_sizer(world, history=world.evidence.inner._history).size(
+            account_id=ACCOUNT, deployment_digest=getattr(world, digest), conid=CONID,
+            reference_price=100.0, stop_price=98.0)
+    assert (exc.value.code, exc.value.reason) == ("STYLE_NOT_ENABLED", "sizing_unavailable")
+    assert world.contracts.calls == 0                                    # refused before the scope rule
+    assert world.submit(deployment_digest=getattr(world, digest)).error_code == "STYLE_NOT_ENABLED"

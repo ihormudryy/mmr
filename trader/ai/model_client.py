@@ -264,3 +264,158 @@ class OpenRouterAdapter(_ChatCompletionsAdapter):
             "max_tokens": request.max_output_tokens,
             "temperature": request.temperature,
         }
+
+
+class AzureOpenAIAdapter(_ChatCompletionsAdapter):
+    """`deployment` is the Azure deployment name; it is the configured model id."""
+
+    backend = "azure"
+
+    def __init__(self, *, deployment: str, endpoint: str, api_key: str, api_version: str,
+                 http_client: httpx.AsyncClient):
+        super().__init__(model_id=deployment, api_key=api_key, http_client=http_client)
+        if not endpoint or not api_version:
+            raise ValueError("endpoint and api_version are required")
+        self._endpoint = endpoint.rstrip("/")
+        self._api_version = api_version
+
+    def _url(self) -> str:
+        return f"{self._endpoint}/openai/deployments/{self.model_id}/chat/completions"
+
+    def _params(self) -> dict[str, str]:
+        return {"api-version": self._api_version}
+
+    def _headers(self) -> dict[str, str]:
+        return {"api-key": self._api_key, "Content-Type": "application/json"}
+
+    def _body(self, request: ModelRequest) -> dict[str, Any]:
+        return {
+            "messages": _wire_messages(request),
+            "max_completion_tokens": request.max_output_tokens,
+            "temperature": request.temperature,
+        }
+
+
+_BEDROCK_REJECTED_CODES = frozenset({
+    "ValidationException", "AccessDeniedException", "ResourceNotFoundException",
+    "ThrottlingException", "ServiceQuotaExceededException",
+})
+
+
+def classify_botocore_error(exc: Exception) -> ModelCallError:
+    from botocore import exceptions as bx
+
+    if isinstance(exc, bx.ClientError):
+        code = str(exc.response.get("Error", {}).get("Code", "")) or "ERROR"
+        if code in _BEDROCK_REJECTED_CODES:
+            return ProviderRejectedError(f"BEDROCK_{code}")
+        return OutcomeUnknownError(f"BEDROCK_{code}")
+    not_sent = (bx.NoCredentialsError, bx.PartialCredentialsError, bx.NoRegionError,
+                bx.EndpointConnectionError, bx.ConnectTimeoutError, bx.ParamValidationError)
+    if isinstance(exc, not_sent):
+        return NotSentError("BEDROCK_NOT_SENT", type(exc).__name__)
+    return OutcomeUnknownError("BEDROCK_TRANSPORT", type(exc).__name__)
+
+
+class BedrockAdapter:
+    """AWS Bedrock Converse. `converse` is `boto3.client("bedrock-runtime").converse` or a fake.
+
+    boto3 is synchronous, so the call runs in a worker thread. A call abandoned by a timeout
+    keeps running until the client's own read timeout ends it; its outcome stays unknown."""
+
+    backend = "bedrock"
+
+    def __init__(self, *, model_id: str, converse: Callable[..., Mapping[str, Any]]):
+        if not model_id:
+            raise ValueError("model_id is required")
+        self.model_id = model_id
+        self._converse = converse
+
+    def __repr__(self) -> str:
+        return f"BedrockAdapter(model_id={self.model_id!r})"
+
+    async def complete(self, request: ModelRequest, *, timeout_seconds: float) -> ModelResponse:
+        system = [{"text": m.content} for m in request.messages if m.role == "system"]
+        turns = [{"role": m.role, "content": [{"text": m.content}]} for m in request.messages if m.role != "system"]
+        arguments: dict[str, Any] = {
+            "modelId": self.model_id,
+            "messages": turns,
+            "inferenceConfig": {"maxTokens": request.max_output_tokens, "temperature": request.temperature},
+        }
+        if system:
+            arguments["system"] = system
+        try:
+            raw = await asyncio.to_thread(self._converse, **arguments)
+        except Exception as exc:
+            raise classify_botocore_error(exc) from None
+        return self._parse(raw)
+
+    def _parse(self, raw: object) -> ModelResponse:
+        if not isinstance(raw, Mapping):
+            raise MalformedResponseError("RESPONSE_SHAPE")
+        usage = parse_usage(raw.get("usage"), input_key="inputTokens", output_key="outputTokens")
+        try:
+            blocks = raw["output"]["message"]["content"]
+            text = "".join(block["text"] for block in blocks if "text" in block)
+            stop_reason = raw.get("stopReason") or ""
+            request_id = raw.get("ResponseMetadata", {}).get("RequestId")
+        except (KeyError, TypeError, AttributeError):
+            raise MalformedResponseError("RESPONSE_SHAPE") from None
+        if not text or not isinstance(stop_reason, str):
+            raise MalformedResponseError("RESPONSE_SHAPE")
+        return ModelResponse(
+            text=text, usage=usage, model=self.model_id, backend=self.backend, finish_reason=stop_reason,
+            provider_request_id=request_id if isinstance(request_id, str) else None,
+        )
+
+    async def aclose(self) -> None:
+        return None
+
+
+def default_bedrock_converse(*, region: str, timeout_seconds: float) -> Callable[..., Mapping[str, Any]]:
+    import boto3
+    from botocore.config import Config
+
+    config = Config(connect_timeout=5, read_timeout=timeout_seconds,
+                    retries={"mode": "standard", "max_attempts": 1})
+    return boto3.client("bedrock-runtime", region_name=region, config=config).converse
+
+
+def _required(environ: Mapping[str, str], name: str) -> str:
+    value = environ.get(name)
+    if not value:
+        raise AiConfigError("CREDENTIALS_MISSING", f"missing: {name}")
+    return value
+
+
+def build_model_client(
+    role: RoleConfig,
+    *,
+    environ: Mapping[str, str],
+    http_client: Optional[httpx.AsyncClient] = None,
+    bedrock_converse: Optional[Callable[..., Mapping[str, Any]]] = None,
+) -> ModelClient:
+    if role.backend == "openrouter":
+        return OpenRouterAdapter(
+            model_id=role.model,
+            api_key=_required(environ, "OPENROUTER_API_KEY"),
+            http_client=http_client or httpx.AsyncClient(),
+        )
+    if role.backend == "azure":
+        return AzureOpenAIAdapter(
+            deployment=role.model,
+            endpoint=_required(environ, "AZURE_OPENAI_ENDPOINT"),
+            api_key=_required(environ, "AZURE_OPENAI_API_KEY"),
+            api_version=_required(environ, "AZURE_OPENAI_API_VERSION"),
+            http_client=http_client or httpx.AsyncClient(),
+        )
+    if role.backend == "bedrock":
+        region = environ.get("AWS_REGION") or environ.get("AWS_DEFAULT_REGION")
+        if not region:
+            raise AiConfigError("CREDENTIALS_MISSING", "missing: AWS_REGION")
+        return BedrockAdapter(
+            model_id=role.model,
+            converse=bedrock_converse
+            or default_bedrock_converse(region=region, timeout_seconds=role.call_timeout_seconds),
+        )
+    raise AiConfigError("ROLE_BACKEND_UNSUPPORTED", f"unsupported backend {role.backend!r}")

@@ -174,3 +174,36 @@ def write_correction(store, attempt_key, *, usage, cost_micros, now):
         journal.add_cost_event_in_tx(conn, attempt=journal.get_in_tx(conn, attempt_key), kind="CORRECTION",
                                      cost_micros=cost_micros, usage=usage, now=now)
     store.transaction(work)
+
+
+def signal(cursor, *, action="BUY", conid=AAPL, at=None, strategy="orb"):
+    import hashlib
+    at = at or et(11, 0)
+    return {"cursor": cursor, "source_event_id": "sig-" + hashlib.sha256(f"{strategy}{cursor}".encode()).hexdigest()[:32],
+            "strategy_name": strategy, "conid": conid, "action": action, "probability": 0.6,
+            "signal_time": at.isoformat(), "recorded_at": at.isoformat()}
+
+
+class FakeSignals:
+    """Plan 1's read_ai_signals: a cursor-ordered record with a retention watermark and resets."""
+
+    def __init__(self):
+        self.record, self.watermark, self.calls = [], 0, []
+
+    def add(self, **kwargs):
+        self.record.append(signal(len(self.record) + 1, **kwargs))
+        return self.record[-1]
+
+    async def call(self, method, body, *, epoch=None):
+        from trader.ai.rpc_clients import RpcRefused
+        assert method == "read_ai_signals"
+        self.calls.append((body["after_cursor"], epoch))
+        # The position in the record is the real cursor, so a test may corrupt a signal's "cursor" field.
+        last = len(self.record) if self.record else self.watermark
+        if body["after_cursor"] > last:
+            raise RpcRefused("SIGNAL_CURSOR_AHEAD", "the record was reset")
+        start = max(body["after_cursor"], self.watermark)
+        page = [(position, s) for position, s in enumerate(self.record, 1) if position > start][:body["limit"]]
+        rows = [s for _, s in page]
+        return {"signals": rows, "next_cursor": page[-1][0] if page else start,
+                "oldest_retained_cursor": self.watermark + 1, "gap": body["after_cursor"] < self.watermark}

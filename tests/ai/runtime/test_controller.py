@@ -495,6 +495,26 @@ async def test_a_close_refused_for_nothing_held_reopens_the_exit(rig):          
 
 
 @pytest.mark.asyncio
+async def test_two_refusals_then_an_accepted_close_send_exactly_three_closes(rig):        # PR #86 4212958297
+    sell = rig.trader.signals.add(action="SELL")
+    answers = [EngineResult(decisions=(close(),)), EngineResult(decisions=(close_retry(attempt=2),)),
+               EngineResult(decisions=(close_retry(attempt=3),))]
+    rig.engine.results["exit_signal"] = lambda ctx: answers.pop(0)
+    rig.trader.decisions.script.extend([("receipt", "REJECTED", "POSITION_NOT_OWNED"),
+                                        ("receipt", "REJECTED", "NOT_A_REDUCTION")])
+    await rig.signals_then_drain()                                  # close 1: refused
+    await rig.signals_then_drain()                                  # reopened, close r2: refused
+    rig.build()                                                     # a restart in between (same engine script)
+    await rig.controller.start()
+    for _ in range(4):                                              # reopened once more, r3 accepted, then quiet
+        await rig.signals_then_drain()
+    source = sell["source_event_id"]
+    assert [b["decision_id"] for b in rig.sent()] == [
+        derive_decision_id(source, key) for key in (f"close:{AAPL}", f"close:{AAPL}:r2", f"close:{AAPL}:r3")]
+    assert rig.opportunity(sell)[0] == "DECIDED" and answers == []
+
+
+@pytest.mark.asyncio
 async def test_a_reopened_exit_that_ends_unheld_is_not_reopened_again(rig):
     sell = rig.trader.signals.add(action="SELL")
     answers = [EngineResult(decisions=(close(),)), EngineResult(note="ENTRY_UNFILLED")]

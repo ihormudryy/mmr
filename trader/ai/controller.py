@@ -85,6 +85,11 @@ def validate_result(source_kind: str, result: Any) -> Optional[str]:
     return None
 
 
+def _close_attempt(action_key: str) -> int:
+    suffix = action_key.split(":")[2] if action_key.count(":") == 2 else "r1"
+    return int(suffix[1:]) if suffix.startswith("r") and suffix[1:].isdigit() else 1
+
+
 def _stop_when_renewals_die(task: asyncio.Task, stop: asyncio.Event) -> None:
     """Without renewals the epoch lapses and nothing is sent, while the heartbeat stays fresh.
     Stop the service loudly instead, so it restarts as a new holder."""
@@ -208,7 +213,11 @@ class AiController:
 
     async def _reopen_refused_exits(self) -> None:
         """A strategy CLOSE refused because nothing of ours was held (yet) puts its exit back on the wait path:
-        the engine closes only once shares are proven held, else it ends unheld (PR #86 4212667433)."""
+        the engine closes only once shares are proven held, else it ends unheld (PR #86 4212667433).
+
+        Only the exit's latest attempt can reopen it, and only once (PR #86 4212958297): a refusal that a
+        later attempt superseded, pending, accepted or final, never reopens anything. The attempts are the
+        durable ai_submissions rows; ``reopened_for`` marks the latest refusal already handled."""
         codes = sorted(NOTHING_TO_CLOSE_YET)
         rows = await self._store.aquery(
             "SELECT s.source_id, s.decision_id, s.error_code FROM ai_submissions s "
@@ -218,10 +227,18 @@ class AiController:
             "AND NOT EXISTS (SELECT 1 FROM ai_exit_waits w WHERE w.opportunity_id = s.source_id "
             "AND w.reopened_for = s.decision_id)", codes)
         for opportunity_id, decision_id, code in rows:
+            if decision_id != await self._latest_close_attempt(opportunity_id):
+                continue                                   # superseded by a later attempt of the same exit
             logger.warning("exit %s: close %s refused %s; it waits for held shares again", opportunity_id,
                            decision_id, code)
             await self._intake.reopen(opportunity_id, decision_id, self._clock.now() + EXIT_REOPEN_WAIT,
                                       f"EXIT_CLOSE_REFUSED_{code}")
+
+    async def _latest_close_attempt(self, opportunity_id: str) -> str:
+        """The decision id of the exit's highest attempt: ``close:<conid>`` is 1, ``close:<conid>:r<n>`` is n."""
+        rows = await self._store.aquery("SELECT decision_id, action_key FROM ai_submissions "
+                                        "WHERE source_id = ? AND action = 'CLOSE'", [opportunity_id])
+        return max(rows, key=lambda row: _close_attempt(row[1]))[0]
 
     async def dispatch_opportunities(self) -> None:
         now = self._clock.now()

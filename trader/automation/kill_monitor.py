@@ -29,6 +29,10 @@ logger = logging.getLogger(__name__)
 KILL_MONITOR_PRINCIPAL = "kill_monitor"
 DETECTION_NOTE = "IB account updates, about 3 minutes; paper only"
 ET = ZoneInfo("America/New_York")
+CHECK_CLEAR = "CLEAR"
+CHECK_HIT = "HIT"
+CHECK_UNKNOWN = "UNKNOWN"
+CHECK_NOT_READY = "NOT_READY"
 
 
 class KillAlertPort(Protocol):
@@ -138,6 +142,22 @@ class KillLineMonitor:
         if snapshot is None:
             self._on_unknown(record)
             return
+        self._evaluate(record, snapshot)
+
+    def check_before_arming(self, record: ExperimentRecord, snapshot: Any) -> str:
+        """Resume evaluates the kill line on its own fresh capture before ARMED (review #32).
+
+        A hit writes KILLED and starts the flatten, exactly as a tick would.
+        """
+        if not self._recovered:
+            return CHECK_NOT_READY
+        reason = self._unusable_reason(snapshot)
+        if reason is not None:
+            logger.warning("experiment %s: resume capture unusable (%s)", record.experiment_id, reason)
+            return CHECK_UNKNOWN
+        return self._evaluate(record, snapshot)
+
+    def _evaluate(self, record: ExperimentRecord, snapshot: Any) -> str:
         self._end_unknown_streak()
         peak = self._store.raise_peak(record.experiment_id, snapshot.net_liquidation)
         line = effective_kill_line(record, self._config)
@@ -145,17 +165,19 @@ class KillLineMonitor:
         self._last_good_at = self._now()
         if line is None:
             self._last_evaluation = None
-            return
+            return CHECK_CLEAR
         try:
             evaluation = evaluate_kill_line(line, anchor=record.kill_anchor_net_liquidation, peak=peak,
                                             net_liquidation=snapshot.net_liquidation)
         except KillLineInputError:
             logger.exception("experiment %s: kill line inputs invalid; treated as unknown", record.experiment_id)
             self._last_good_at = None
-            return
+            return CHECK_UNKNOWN
         self._last_evaluation = evaluation
-        if evaluation.hit:
-            self._kill(record, snapshot, evaluation)
+        if not evaluation.hit:
+            return CHECK_CLEAR
+        self._kill(record, snapshot, evaluation)
+        return CHECK_HIT
 
     def entry_block(self, record: ExperimentRecord) -> Optional[str]:
         """K7/K19: why an ENTER is refused now, or None."""
@@ -177,20 +199,22 @@ class KillLineMonitor:
         except Exception as exc:
             self._unknown_reason = str(getattr(exc, "code", None) or type(exc).__name__)
             return None
+        self._unknown_reason = self._unusable_reason(snapshot)
+        return snapshot if self._unknown_reason is None else None
+
+    def _unusable_reason(self, snapshot: Any) -> Optional[str]:
         nlv = getattr(snapshot, "net_liquidation", None)
         generation = getattr(snapshot, "generation_id", None)
         if getattr(snapshot, "account_id", None) != self._account_id:
-            self._unknown_reason = "ACCOUNT_MISMATCH"
-        elif getattr(snapshot, "account_mode", None) != "paper":
-            self._unknown_reason = "ACCOUNT_NOT_PAPER"
-        elif type(nlv) not in (int, float) or not math.isfinite(nlv) or nlv <= 0:
-            self._unknown_reason = "INVALID_NET_LIQUIDATION"
-        elif type(generation) is not int:
-            self._unknown_reason = "INVALID_GENERATION"
-        elif self._last_generation is not None and generation < self._last_generation:
-            self._unknown_reason = "GENERATION_REGRESSION"
-        else:
-            return snapshot
+            return "ACCOUNT_MISMATCH"
+        if getattr(snapshot, "account_mode", None) != "paper":
+            return "ACCOUNT_NOT_PAPER"
+        if type(nlv) not in (int, float) or not math.isfinite(nlv) or nlv <= 0:
+            return "INVALID_NET_LIQUIDATION"
+        if type(generation) is not int:
+            return "INVALID_GENERATION"
+        if self._last_generation is not None and generation < self._last_generation:
+            return "GENERATION_REGRESSION"
         return None
 
     def _on_unknown(self, record: ExperimentRecord) -> None:

@@ -826,6 +826,7 @@ def _build_experiment_services(
         liquidation_roots=lambda: liquidation_store.transaction(liquidation_store.roots_to_advance_in_tx),
         old_path_armed=lambda: _one_strategy_armed(late["paper_automation"]),
         ai_paper_built=lambda: late["ai_paper"] is not None,
+        kill_gate=monitor,
     )
     service = ExperimentService(store=parts.store, ports=ports, lock=parts.arming_lock, config=config,
                                 account_id=trader.ib_account, account_mode=account_mode, now=now)

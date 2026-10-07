@@ -14,6 +14,7 @@ from trader.automation.ai_paper_config import load_ai_paper_config
 from trader.automation.experiment_service import (
     ArmingLock, ArmingPorts, ExperimentService, StartFx, ai_supervisor_identity_problem, start_fx_from_cash,
 )
+from trader.automation.kill_monitor import KillLineMonitor
 from trader.automation.experiments import (
     ExperimentRefused, ExperimentStore, apply_experiment_migration, experiment_id_for,
 )
@@ -90,6 +91,20 @@ class Registry:
         return SimpleNamespace(allowed_principals=self.allowed)
 
 
+class FlattenSession:
+    def __init__(self):
+        self.calls = []
+
+    def flatten_account_now(self, cause, deadline):
+        self.calls.append(cause)
+        return cause
+
+
+class NoLiquidation:
+    def receipt_for(self, root_id):
+        return None
+
+
 class CrashingStore(ExperimentStore):
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
@@ -120,10 +135,17 @@ class World:
         self.exit_owners = ExitOwners()
         self.roots: list = []
         self.cash = {"base_currency": "USD", "currencies": {}}
+        broker = Broker()
+        self.session = FlattenSession()
+        self.monitor = KillLineMonitor(store=self.store, broker=broker, session=self.session,
+                                       liquidation=NoLiquidation(), config=config, account_id=ACCOUNT,
+                                       now=lambda: NOW, reconciliation_safe=lambda: True)
+        self.monitor.recover()
         self.ports = ArmingPorts(
-            broker=Broker(), account_cash=lambda: self.cash, resume_ready=lambda: True,
+            broker=broker, account_cash=lambda: self.cash, resume_ready=lambda: True,
             reconciliation_safe=lambda exclude: True, breaker_clear=lambda: True, exit_owners=self.exit_owners,
-            liquidation_roots=lambda: list(self.roots), old_path_armed=lambda: None, ai_paper_built=lambda: True)
+            liquidation_roots=lambda: list(self.roots), old_path_armed=lambda: None, ai_paper_built=lambda: True,
+            kill_gate=self.monitor)
         self.service = ExperimentService(store=self.store, ports=self.ports, lock=ArmingLock(), config=config,
                                          account_id=ACCOUNT, account_mode=account_mode, now=lambda: NOW)
         self.service.attach_identity_check(lambda: ai_supervisor_identity_problem(self.identity, self.registry))
@@ -423,6 +445,41 @@ def test_resume_after_an_outage_pause_needs_fresh_evidence(outage_paused):      
     view = outage_paused.resume(cmd("resume_experiment", experiment_id=outage_paused.id, reason="r"))
     assert (view["state"], view["pause_cause"]) == ("ARMED", None)
     assert outage_paused.store.active().pause_generation_id is None
+
+
+def test_outage_resume_on_a_breached_fresh_generation_kills_instead_of_arming(outage_paused):   # review #32
+    # Start NLV 100,000, 20% line; the fresh generation after the outage shows 79,000.
+    outage_paused.ports.broker.set(generation_id=outage_paused.pause_generation_id + 1, net_liquidation=79_000.0)
+    with pytest.raises(CommandValidationError, match="EXPERIMENT_KILLED"):
+        outage_paused.resume(cmd("resume_experiment", experiment_id=outage_paused.id, reason="r"))
+    record = outage_paused.store.active()
+    assert (record.state, record.kill_flat_state) == ("KILLED", "PENDING")
+    assert outage_paused.session.calls == [record.kill_root_id]
+
+
+def test_operator_resume_on_a_breached_account_kills_instead_of_arming(paused):
+    paused.ports.broker.set(net_liquidation=79_000.0)
+    with pytest.raises(CommandValidationError, match="EXPERIMENT_KILLED"):
+        paused.resume(cmd("resume_experiment", experiment_id=paused.id, reason="r"))
+    assert paused.store.active().state == "KILLED"
+
+
+@pytest.mark.parametrize("gate,code", [
+    (_raises(RuntimeError("monitor down")), "KILL_LINE_UNKNOWN"),
+    (lambda record, snapshot: "SOMETHING_ELSE", "KILL_LINE_UNKNOWN"),
+    (lambda record, snapshot: "HIT", "KILL_NOT_RECORDED")])     # a hit whose KILLED write was lost
+def test_resume_refuses_when_the_kill_line_cannot_be_proven_clear(paused, gate, code):
+    paused.ports.kill_gate = SimpleNamespace(check_before_arming=gate)
+    with pytest.raises(CommandValidationError, match=code):
+        paused.resume(cmd("resume_experiment", experiment_id=paused.id, reason="r"))
+    assert paused.store.active().state == "PAUSED"
+
+
+def test_resume_refuses_before_the_monitor_recovered(paused):
+    paused.monitor._recovered = False
+    with pytest.raises(CommandValidationError, match="EXPERIMENT_MONITOR_NOT_READY"):
+        paused.resume(cmd("resume_experiment", experiment_id=paused.id, reason="r"))
+    assert paused.store.active().state == "PAUSED"
 
 
 def test_resume_requires_ai_paper_enabled(paused):

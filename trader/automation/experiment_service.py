@@ -90,6 +90,7 @@ class ArmingPorts:
     liquidation_roots: Callable[[], list]           # non-terminal roots
     old_path_armed: Callable[[], Optional[str]]
     ai_paper_built: Callable[[], bool]
+    kill_gate: Any                                  # .check_before_arming(record, snapshot) -> CHECK_*
 
 
 class ExperimentLockPort(Protocol):
@@ -240,7 +241,10 @@ class ExperimentService:
                 return self._view(record)
             self._require_enabled()
             if record.pause_cause == OUTAGE_PAUSE:
-                self._require_fresh_evidence(record, cmd.command_id)
+                snapshot = self._require_fresh_evidence(record, cmd.command_id)
+            else:
+                snapshot = self._capture()
+            self._require_kill_line_clear(record, snapshot)
             resumed = self.store.transition(
                 record.experiment_id, expected=frozenset({"PAUSED"}), to="ARMED", principal=cmd.principal,
                 command_id=cmd.command_id, reason=body["reason"],
@@ -368,7 +372,7 @@ class ExperimentService:
         except Exception as exc:
             raise ExperimentRefused("START_FX_UNAVAILABLE", f"account cash unreadable: {exc}") from exc
 
-    def _require_fresh_evidence(self, record: ExperimentRecord, command_id: Optional[str]) -> None:
+    def _require_fresh_evidence(self, record: ExperimentRecord, command_id: Optional[str]) -> Any:
         """K11: an outage pause resumes only on a capture newer than the pause."""
         if not self._read_bool("TRADER_NOT_READY", self.ports.resume_ready):
             raise ExperimentRefused("TRADER_NOT_READY", "no current, fenced broker evidence")
@@ -379,6 +383,28 @@ class ExperimentService:
             raise ExperimentRefused("RESUME_EVIDENCE_STALE",
                                     f"broker generation {snapshot.generation_id} is not newer than {floor}")
         self._require_reconciled(command_id)
+        return snapshot
+
+    def _require_kill_line_clear(self, record: ExperimentRecord, snapshot: Any) -> None:
+        """Review #32: the capture that resumes is evaluated against the kill line before ARMED."""
+        from trader.automation.kill_monitor import CHECK_CLEAR, CHECK_HIT, CHECK_NOT_READY
+        try:
+            outcome = self.ports.kill_gate.check_before_arming(record, snapshot)
+        except Exception as exc:
+            raise ExperimentRefused("KILL_LINE_UNKNOWN", f"kill line not evaluated: {exc}") from exc
+        if outcome == CHECK_CLEAR:
+            return
+        if outcome == CHECK_NOT_READY:
+            raise ExperimentRefused("EXPERIMENT_MONITOR_NOT_READY", "the kill monitor has not recovered yet")
+        if outcome != CHECK_HIT:
+            raise ExperimentRefused("KILL_LINE_UNKNOWN", "the kill line cannot be evaluated on the fresh capture")
+        current = self.store.active()
+        if current is not None and current.state == "KILLED":
+            raise ExperimentRefused(
+                "EXPERIMENT_KILLED",
+                f"the kill line is breached at net liquidation {snapshot.net_liquidation:.2f}; "
+                "the experiment is KILLED and the account flatten started")
+        raise ExperimentRefused("KILL_NOT_RECORDED", "the kill line is breached but KILLED is not stored yet; retry")
 
     def _target(self, experiment_id: str) -> ExperimentRecord:
         active = self.store.active()

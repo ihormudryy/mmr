@@ -31,6 +31,7 @@ def _write_yaml(tmp_path, pct):
 def served(tmp_path, monkeypatch):
     stack = _served(tmp_path, monkeypatch, _config(20.0))
     _write_yaml(tmp_path, 20.0)
+    stack.stack.experiments.monitor.recover()      # trader_service recovers it before readiness
     yield stack
     stack.close()
 

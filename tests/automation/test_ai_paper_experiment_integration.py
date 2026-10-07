@@ -204,3 +204,36 @@ def test_plan3_views_without_entry_block_still_build():
     assert ExperimentView("exp1", "ARMED").entry_block is None
     with pytest.raises(ValueError):
         ExperimentView("exp1", "ARMED", entry_block="")
+
+
+def _resume_service(world):
+    from trader.automation.experiment_service import ArmingLock, ArmingPorts, ExperimentService
+    ports = ArmingPorts(
+        broker=world.broker, account_cash=lambda: {"base_currency": "USD", "currencies": {}},
+        resume_ready=lambda: True, reconciliation_safe=lambda exclude: True, breaker_clear=lambda: True,
+        exit_owners=SimpleNamespace(account_owner=lambda account_id: None), liquidation_roots=lambda: [],
+        old_path_armed=lambda: None, ai_paper_built=lambda: True, kill_gate=world.monitor)
+    return ExperimentService(store=world.store, ports=ports, lock=ArmingLock(), config=CONFIG,
+                             account_id=ACCOUNT, account_mode="paper", now=world.clock)
+
+
+def test_outage_resume_on_a_breached_generation_kills_and_admits_no_entry(world):   # review #32
+    from trader.trading.command_coordinator import CommandRequest, CommandValidationError
+    world.broker.fail = True                                     # outage: the monitor pauses the experiment
+    world.monitor.tick()
+    world.clock.advance(seconds=CONFIG.broker_outage_pause_seconds + 1)
+    world.monitor.tick()
+    record = world.store.active()
+    assert (record.state, record.pause_cause) == ("PAUSED", "BROKER_DATA_OUTAGE")
+    world.broker.fail = False                                    # fresh generation, 21% below the 1m start
+    world.broker.set(net_liquidation=790_000.0, generation=world.broker.last + 1)
+    resume = CommandRequest(
+        command_id="resume-1", action="resume_experiment", account_id=ACCOUNT, target_type="experiment",
+        target_id=ACCOUNT, expected_version=None, body={"experiment_id": record.experiment_id, "reason": "back"},
+        source="cli", principal="cli")
+    with pytest.raises(CommandValidationError, match="EXPERIMENT_KILLED"):
+        _resume_service(world).resume(resume)
+    assert world.store.active().state == "KILLED"
+    assert world.session.calls == [world.store.active().kill_root_id]
+    assert world.submit().error_code == "EXPERIMENT_NOT_ARMED"
+    assert world.dispatch.plans == []

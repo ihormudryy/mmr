@@ -575,6 +575,18 @@ def build_parser() -> argparse.ArgumentParser:
                           '  cancel-all',
                    formatter_class=fmt)
 
+    # flatten (SP1 Plan 6: the abort path; paper only from the CLI)
+    flatten_p = sub.add_parser(
+        'flatten', help='PAPER: close every position and cancel every order (typed liquidate_account)',
+        epilog='Examples:\n'
+               '  flatten --reason "acceptance abort" --wait\n'
+               '  flatten --reason "pre-acceptance cleanup" --wait --yes',
+        formatter_class=fmt)
+    flatten_p.add_argument('--reason', required=True)
+    flatten_p.add_argument('--wait', action='store_true', default=False,
+                           help='Poll until the broker shows no position and no working order (300 s)')
+    flatten_p.add_argument('--yes', action='store_true', default=False, help='Skip the typed confirmation')
+
     # to-market
     to_market_p = sub.add_parser('to-market', help='Convert an open order to market',
                                  description='Cancel limit order and re-place as market. Preserves stop-loss children.',
@@ -2615,6 +2627,9 @@ def dispatch(mmr: MMR, args: argparse.Namespace) -> bool:
         elif cmd == 'experiment':
             _handle_experiment(mmr, args)
 
+        elif cmd == 'flatten':
+            _handle_flatten(mmr, args)
+
         elif cmd == 'scoreboard':
             _handle_scoreboard(mmr, args)
 
@@ -3107,6 +3122,42 @@ def _experiment_status_lines(status: dict) -> list:
     if status.get('mode_conflict'):
         lines.append(f"  {status['mode_conflict']}: every entry is refused; deactivate one mode")
     return lines
+
+
+def _handle_flatten(mmr: MMR, args: argparse.Namespace, *, sleep=None, clock=None, ask=input) -> None:
+    """The abort path (SP1 Plan 6 ruling 11): FLAT is printed only on broker evidence."""
+    account = mmr.account_id()
+    if not account.startswith('DU'):
+        print_status(f'flatten refused LIVE_REFUSED: {account or "unknown account"} is not a paper account; '
+                     'a live flatten stays on the dashboard with its preflight', success=False)
+        sys.exit(1)
+    if not args.yes:
+        try:
+            typed = ask(f'Type FLATTEN to close every position on {account}: ')
+        except EOFError:
+            typed = ''
+        if typed.strip() != 'FLATTEN':
+            print_status('flatten not confirmed; nothing was sent', success=False)
+            sys.exit(1)
+    receipt = mmr.flatten(args.reason)
+    root = (receipt.get('outcome') or {}).get('close_root_id')
+    command_id = receipt.get('command_id')
+    if receipt.get('state') == 'REJECTED':
+        print_status(f"flatten rejected: {receipt.get('error_code')}", success=False)
+        sys.exit(1)
+    console.print(f'flatten {command_id}: close root {root or "-"} ({receipt.get("state")})', markup=False)
+    if not args.wait:
+        return
+    state = mmr.wait_flat(command_id, sleep=sleep, clock=clock)
+    if _json_mode:
+        print_json_result(state, title='Flatten')
+    if state['flat']:
+        console.print('FLAT', markup=False)
+        return
+    command = state['command'] or {}
+    console.print(f"NOT FLAT: command {command.get('state')} {command.get('error_code') or ''}; "
+                  f"{len(state['positions'])} positions, {len(state['working_orders'])} working orders", markup=False)
+    sys.exit(1)
 
 
 def _add_acceptance_parser(experiment_sub, fmt) -> None:
@@ -12341,7 +12392,7 @@ _LOCAL_ONLY_COMMANDS = {
     'snapshot', 'snap', 'snapshot-batch', 'depth',
     'risk-limits', 'rl', 'reconcile', 'diagnose', 'approve', 'listen',
     'ideas', 'scan-ideas',
-    'market-hours', 'mh', 'session', 'group', 'research', 'scoreboard',
+    'market-hours', 'mh', 'session', 'group', 'research', 'scoreboard', 'flatten',
 }
 # strategies list/enable/disable/reload hit strategy typed ports; create/deploy
 # etc. are YAML-local. Legacy connect is never needed for strategies/*.

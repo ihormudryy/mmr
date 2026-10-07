@@ -1910,6 +1910,45 @@ class MMR:
         body = {} if experiment_id is None else {'experiment_id': experiment_id}
         return self._typed_query.call('verify_scoreboard', body, dict)
 
+    def flatten(self, reason: str, command_id: Optional[str] = None) -> dict:
+        """``liquidate_account`` (SP1 Plan 6): flatten the whole account. Paper only from the CLI."""
+        import uuid
+        body = {'command_id': command_id or f'flatten-{uuid.uuid4().hex[:16]}', 'reason': reason}
+        return self._typed_command.call('liquidate_account', body, dict)
+
+    def account_id(self) -> str:
+        return str(self._typed_query.call('get_ib_account', {}, dict).get('account_id') or '')
+
+    def flat_state(self, command_id: str) -> dict:
+        """The command and the broker: open positions and working orders on a promoted generation."""
+        from trader.messaging.typed_rpc import TypedRpcRemoteError
+        try:
+            command = self._typed_query.call('get_command', {'command_id': command_id}, dict)
+        except TypedRpcRemoteError as ex:
+            command = {'state': None, 'error_code': ex.code}
+        positions = [p for p in self._typed_query.call('get_positions', {}, dict).get('positions') or []
+                     if float(p.get('position') or 0.0)]
+        evidence = self._typed_query.call('get_broker_order_evidence', {'conid': None}, dict)
+        working = [o for o in evidence.get('orders') or []
+                   if o.get('status') in ('Submitted', 'PreSubmitted', 'PendingSubmit', 'PendingCancel', 'ApiPending')]
+        return {'command': command, 'positions': positions, 'working_orders': working,
+                'capture_error': evidence.get('capture_error')}
+
+    def wait_flat(self, command_id: str, timeout: float = 300.0, *, sleep=None, clock=None,
+                  poll: float = 2.0) -> dict:
+        """Poll until the command resolved and the broker shows no position and no working order."""
+        import time as _time
+        sleep, clock = sleep or _time.sleep, clock or _time.monotonic
+        deadline = clock() + timeout
+        while True:
+            state = self.flat_state(command_id)
+            resolved = (state['command'] or {}).get('state') == 'RESOLVED'
+            state['flat'] = (resolved and not state['positions'] and not state['working_orders']
+                             and not state['capture_error'])
+            if state['flat'] or clock() >= deadline:
+                return state
+            sleep(poll)
+
     def acceptance_preflight(self) -> dict:
         """``get_acceptance_preflight`` (SP1 Plan 6): one reading of the clean-account gate, signed as cli."""
         return self._typed_query.call('get_acceptance_preflight', {}, dict)

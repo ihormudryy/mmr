@@ -145,7 +145,7 @@ class AiPaperDecision:
             raise DecisionInvalid("expires_at must be an aware datetime")
 
     def _check_shape(self) -> None:
-        """R16: an ENTER carries attribution; a reduction carries none."""
+        """R16: an ENTER carries attribution; a reduction carries none and never moves protection."""
         if self.action == "ENTER":
             if self.deployment_digest is None or self.policy_revision is None or self.stop_price is None:
                 raise DecisionInvalid("ENTER needs deployment_digest, policy_revision and stop_price")
@@ -157,8 +157,12 @@ class AiPaperDecision:
         if self.action == "CLOSE" and (self.stop_price is not None or self.target_price is not None
                                        or self.quantity is not None):
             raise DecisionInvalid("CLOSE takes no quantity, stop_price or target_price")
-        if self.action == "PARTIAL_CLOSE" and self.quantity is None:
-            raise DecisionInvalid("PARTIAL_CLOSE needs a quantity")
+        if self.action == "PARTIAL_CLOSE":
+            if self.quantity is None:
+                raise DecisionInvalid("PARTIAL_CLOSE needs a quantity")
+            if self.stop_price is not None or self.target_price is not None:
+                raise DecisionInvalid("PARTIAL_CLOSE keeps the existing stop and target; "
+                                      "stop_price and target_price must be null")
 
     @classmethod
     def from_body(cls, body: Mapping[str, Any]) -> "AiPaperDecision":
@@ -626,8 +630,6 @@ class AiPaperDecisionService:
             liquidation=self._liquidation, broker=self._broker, account_id=self._account_id,
             command_id=cmd.command_id, conid=decision.conid, side=decision.side,
             quantity=float(decision.quantity) if partial else None,
-            stop_price=decision.stop_price if partial else None,
-            target_price=decision.target_price if partial else None,
             deadline=self._steps.now_utc() + dt.timedelta(seconds=self._close_deadline_seconds))
         if close.state == "REJECTED":
             raise _Refusal(close.error_code, detail=json.dumps(close.outcome, default=str))

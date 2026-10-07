@@ -132,7 +132,7 @@ def test_unfilled_entry_fails_the_step_without_a_retry(served, tmp_path):       
     served.sim.quote(MSFT, 499.9, 500.0)
     run = scenario(served, tmp_path).run()
     assert (run[-1].name, run[-1].code) == ("enter_a", "ENTRY_NOT_PROTECTED")
-    assert len([p for p in served.sim.placed if p[1] == "LMT" and "aip" in p[0]]) == 1
+    assert len([p for p in served.sim.placed if p[1:3] == ("LMT", "BUY") and "aip" in p[0]]) == 1   # one entry
 
 
 def test_the_report_is_signed_and_lists_every_step(served, tmp_path):

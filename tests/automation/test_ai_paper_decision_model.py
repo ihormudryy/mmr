@@ -63,8 +63,10 @@ def test_per_action_shape(body):                                        # R16
 
 def test_reductions_parse():
     assert AiPaperDecision.from_body(CLOSE).action == "CLOSE"
-    partial = AiPaperDecision.from_body({**CLOSE, "action": "PARTIAL_CLOSE", "quantity": 100, "stop_price": 97.5})
-    assert (partial.quantity, partial.stop_price) == (100, 97.5)
+    partial = AiPaperDecision.from_body({**CLOSE, "action": "PARTIAL_CLOSE", "quantity": 100})
+    assert (partial.quantity, partial.stop_price, partial.target_price) == (100, None, None)
+    with pytest.raises(DecisionInvalid):                       # spec 6.4: a partial never moves protection
+        AiPaperDecision.from_body({**CLOSE, "action": "PARTIAL_CLOSE", "quantity": 100, "stop_price": 97.5})
 
 
 def test_the_constructor_checks_types_too():

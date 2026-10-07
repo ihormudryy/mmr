@@ -61,7 +61,7 @@ def partial_close_to_reprotecting(served, quantity=1):
     """Send PARTIAL_CLOSE A and drive the broker until the re-protect stop is out but the close is not DONE."""
     decision = f"{RUN_ID}-pc-a"
     body = {"decision_id": decision, "deployment_digest": None, "decider": "acceptance_harness",
-            "action": "PARTIAL_CLOSE", "conid": AAPL, "side": "SELL", "stop_price": 225.4, "target_price": 234.6,
+            "action": "PARTIAL_CLOSE", "conid": AAPL, "side": "SELL", "stop_price": None, "target_price": None,
             "quantity": quantity, "policy_revision": None, "evidence_digest": "sha256:" + "e" * 64,
             "expires_at": (served.now() + dt.timedelta(minutes=10)).isoformat()}
     assert served.call("ai_supervisor", "submit_ai_paper_decision", body)["state"] == "OUTCOME_UNKNOWN"

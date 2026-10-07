@@ -57,9 +57,9 @@ liquidation finite, above zero, at most 5 minutes old, stable within 0.1 % over
 What P4.2 does, in order: two preflight reads 30 s apart (it refuses
 `PROBE_NOT_ENABLED` here, before any order, if `ai_paper.acceptance_probe` is
 off); register the catalogue deployment (`ai_research`); publish the paper
-limits (`ai_supervisor`); `ENTER` A (3 shares) and B (1 share) with explicit
-sizes; `PARTIAL_CLOSE` 1 share of A (stop and target re-placed for 2 shares in
-one OCA group); `CLOSE` the rest of A; then P4S below. B stays open. Before each
+limits (`ai_supervisor`); `ENTER` A (3 shares, with a stop and a target) and B (1 share) with explicit
+sizes; `PARTIAL_CLOSE` 1 share of A (the existing stop and target re-placed for
+2 shares in one OCA group; a partial close carries no prices); `CLOSE` the rest of A; then P4S below. B stays open. Before each
 entry the harness reads the live ask and refuses `HARNESS_NOTIONAL_TOO_SMALL`
 when `quantity x ask` is above the 2,000 USD notional. It never raises the
 notional. Every request is written to `~/.local/share/mmr/acceptance/<run_id>/journal.jsonl`

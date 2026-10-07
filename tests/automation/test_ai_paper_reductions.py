@@ -9,6 +9,7 @@ import pytest
 
 from tests.automation.ai_paper_fixtures import ACCOUNT, CONID, NOW, pos, snapshot
 from tests.automation.ai_paper_world import World
+from tests.test_liquidation_service import _Protection
 from trader.automation.ai_paper_experiment import ExperimentView
 from trader.automation.reduction_close import start_broker_proven_close
 from trader.trading.command_coordinator import CLOSE_RESOLVED_ACTIONS, OutcomeReconciler
@@ -76,14 +77,22 @@ def test_partial_larger_than_the_position_is_refused(world, quantity):
 
 
 def test_partial_equal_to_the_position_is_a_full_close(world):
-    receipt = world.submit(partial_body(world, 300, stop_price=97.5))
+    receipt = world.submit(partial_body(world, 300))
     assert world.liquidation.receipt_for(receipt.outcome["close_root_id"]).goal == "zero"
 
 
-def test_partial_close_reaches_the_scoped_partial(world):
-    receipt = world.submit(partial_body(world, 100, stop_price=97.5))
+@pytest.mark.parametrize("prices", [{"stop_price": 97.5}, {"target_price": 120.0}])
+def test_partial_close_with_prices_is_refused(world, prices):          # spec 6.4: no protection edits
+    receipt = world.submit(partial_body(world, 100, **prices))
+    assert (receipt.state, receipt.error_code) == ("REJECTED", "DECISION_INVALID")
+    assert world.liquidation_runs() == set()
+
+
+def test_partial_close_reprotects_at_the_existing_stop_and_target(world):
+    world.liquidation.attach_protection(_Protection(stop_price=95.0, target_price=110.0))
+    receipt = world.submit(partial_body(world, 100))
     run = world.liquidation.receipt_for(receipt.outcome["close_root_id"])
-    assert (run.goal, run.goal_quantity, run.stop_price) == ("partial", 100.0, 97.5)
+    assert (run.goal, run.goal_quantity, run.stop_price, run.target_price) == ("partial", 100.0, 95.0, 110.0)
 
 
 def test_buy_side_close_of_a_long_is_not_a_reduction(world):

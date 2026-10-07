@@ -182,6 +182,17 @@ def test_without_a_live_ib_quote_paper_uses_the_iex_quote(ib):
     assert wrapper.executable_quote(CONID, side="ask").feed_type == "iex_realtime"
 
 
+@pytest.mark.parametrize("feed", ["delayed", "frozen", "live"])
+def test_an_ib_halt_vetoes_the_iex_quote(feed):              # PR #76 thread 4208684073
+    from dataclasses import replace
+
+    halted = replace(ib_quote(feed), session_state="halted")
+    client = FakeAlpaca(body={"quotes": {"AAPL": alpaca_quote()}})
+    wrapper = FallbackQuoteAuthority(FakeIb(halted), iex(client), account_mode="paper")
+    assert wrapper.executable_quote(CONID, side="ask") is halted
+    assert client.calls == []
+
+
 @pytest.mark.parametrize("ib", [None, ib_quote("delayed")])
 def test_without_an_iex_quote_the_ib_answer_is_kept(ib):
     wrapper = FallbackQuoteAuthority(FakeIb(ib), iex(FakeAlpaca(body={"quotes": {}})), account_mode="paper")

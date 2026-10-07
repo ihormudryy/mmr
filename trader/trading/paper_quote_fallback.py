@@ -27,6 +27,7 @@ LATEST_QUOTES_PATH = "/v2/stocks/quotes/latest"
 US_PRIMARY_EXCHANGES = frozenset({"NYSE", "NASDAQ", "ARCA", "AMEX", "BATS", "IEX", "ISLAND"})
 CONTINUOUS = "continuous"
 OUTSIDE_REGULAR_SESSION = "closed"
+HALTED = "halted"
 
 # IB spells a class share with one space ("BRK B"); Alpaca with a dot ("BRK.B").
 _IB_STOCK_SYMBOL = re.compile(r"[A-Z0-9]+( [A-Z0-9]+)?")
@@ -110,7 +111,7 @@ class AlpacaIexQuoteAuthority:
 
 
 class FallbackQuoteAuthority:
-    """IB first; the IEX quote only when IB has no live quote. Paper accounts only."""
+    """IB first; the IEX quote only when IB has no live quote and reports no halt. Paper only."""
 
     def __init__(self, primary: QuoteAuthority, fallback: QuoteAuthority, *, account_mode: str):
         if account_mode != "paper":
@@ -120,7 +121,8 @@ class FallbackQuoteAuthority:
 
     def executable_quote(self, conid: int, *, side: str) -> Optional[ExecutableQuote]:
         quote = self._primary.executable_quote(conid, side=side)
-        if quote is not None and quote.feed_type == LIVE_FEED:
+        if quote is not None and (quote.feed_type == LIVE_FEED or quote.session_state == HALTED):
+            # IEX has no halt flag, so an IB halt (on any feed) must never be replaced.
             return quote
         iex = self._fallback.executable_quote(conid, side=side)
         # Without an IEX quote, keep IB's answer: a delayed reference still serves

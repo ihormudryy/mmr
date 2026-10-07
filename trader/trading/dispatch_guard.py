@@ -7,6 +7,7 @@ from collections import defaultdict
 from dataclasses import dataclass
 from typing import Any, Callable, Optional
 
+from trader.automation.liquidity_policy import MAX_SPREAD_BPS
 from trader.automation.risk_limits import PAPER_LIMITS, RiskLimits
 from trader.data.broker_state import BrokerRiskSnapshotError
 from trader.promotion.allocation_policy import AllocationPolicy
@@ -132,6 +133,26 @@ def _unseen_in_flight_notional(evidence, snapshot) -> float:
             unseen += entry.filled_quantity
         total += unseen * entry.limit_price
     return total
+
+
+def _check_spread_and_depth(approved, quote, price: float) -> None:
+    """The approval's spread and depth limits, re-read on the quote this order is sent against.
+
+    No dispatch path carries a sliced-execution approval, so the crossed side
+    must always show the whole order.
+    """
+    if quote.bid is None or quote.ask is None:
+        raise DispatchGuardError("EXECUTABLE_QUOTE_INVALID", "a two-sided book is required", retryable=True)
+    spread_bps = (float(quote.ask) - float(quote.bid)) / price * 10_000.0
+    if spread_bps > MAX_SPREAD_BPS:
+        raise DispatchGuardError("SPREAD_BPS", "spread exceeds the liquidity limit", retryable=True)
+    crossed_side_size = quote.ask_size if approved.side == "BUY" else quote.bid_size
+    try:
+        depth = float(crossed_side_size)
+    except (TypeError, ValueError):
+        depth = math.nan
+    if not math.isfinite(depth) or depth < abs(float(approved.quantity)):
+        raise DispatchGuardError("DEPTH_EXCEEDED", "top of book does not cover the order", retryable=True)
 
 
 class DispatchGuard:
@@ -360,6 +381,7 @@ class DispatchGuard:
                 raise DispatchGuardError("QUOTE_STALE", "quote is stale", retryable=True)
             if age < -MAX_SOURCE_CLOCK_SKEW_SECONDS:
                 raise DispatchGuardError("SOURCE_CLOCK_SKEW", "quote clock is in the future")
+            _check_spread_and_depth(approved, quote, price)
 
         reference = float(approved.reference_price)
         if not math.isfinite(reference) or reference <= 0:

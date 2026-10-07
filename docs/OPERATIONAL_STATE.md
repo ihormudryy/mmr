@@ -132,6 +132,11 @@ account never calls Alpaca, even with the setting on.
 - **Gap: no halt flag.** Alpaca quotes do not say when a stock is halted.
   `session_state` comes from the XNYS calendar only (continuous inside the
   regular session, else `closed`), so a halt during the session is not seen.
+  When IB itself reports a halt (on any feed, delayed too), the IB quote is kept
+  and the entry is refused; IEX never replaces it.
+- At dispatch, automated and live entries re-check the 15 bps spread and the
+  crossed-side depth (it must cover the whole order) on the final quote
+  (`SPREAD_BPS`, `DEPTH_EXCEEDED`, retryable). Manual paper proposals do not.
 - **Sizes are probably round lots.** An Alpaca forum answer (2022) says bid/ask
   sizes are round lots; not yet checked on a real IEX response. They are used
   unchanged as shares, the safe direction: top-of-book depth may be understated

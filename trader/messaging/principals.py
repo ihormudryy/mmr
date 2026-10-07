@@ -19,6 +19,8 @@ CLIENT_PRINCIPALS: frozenset[str] = frozenset({"cli", "ai_supervisor", "ai_resea
 # Reserved names: no key, no allow-list entry. telegram_bridge arrives in SP2;
 # scheduler has no trading RPC rights (owner answer 3).
 RESERVED_PRINCIPALS: frozenset[str] = frozenset({"telegram_bridge", "scheduler"})
+# The one principal that may carry a controller epoch in the envelope (SP2 spec 5.1).
+CONTROLLER_PRINCIPAL = "ai_supervisor"
 
 SERVER_ACCEPTS: Mapping[str, frozenset[str]] = {
     "trader": frozenset({"cli", "dashboard", "strategy", "ai_supervisor", "ai_research"}),
@@ -109,11 +111,16 @@ TRADER_ACL: Mapping[tuple[str, str], frozenset[str]] = {
     **{("command", m): HUMAN for m in _TRADER_HUMAN_COMMANDS},
     # SP1 ai_paper (Plan 3 R23, owner answer 6): explicit sets per method, never a
     # group alias; reads and mutations are separate entries.
-    ("command", "publish_ai_risk_policy"): frozenset({"ai_supervisor"}),
+    # SP2 Plan 1 (spec 6.7): the operator publishes the initial policy; SP2a/b code never calls it as ai_supervisor.
+    ("command", "publish_ai_risk_policy"): frozenset({"ai_supervisor", "cli"}),
     ("command", "submit_ai_paper_decision"): frozenset({"ai_supervisor"}),
     ("command", "register_ai_deployment"): frozenset({"ai_research"}),
     ("query", "get_ai_risk_policy"): frozenset({"cli", "dashboard", "ai_supervisor"}),
     ("query", "get_ai_deployment"): frozenset({"cli", "dashboard", "ai_supervisor", "ai_research"}),
+    # SP2 Plan 1: the controller epoch (spec 6.2). Explicit sets per method.
+    ("command", "grant_ai_controller_epoch"): frozenset({"ai_supervisor"}),
+    ("query", "get_ai_paper_decision"): frozenset({"ai_supervisor"}),
+    ("query", "read_ai_signals"): frozenset({"ai_supervisor"}),
     # SP1 experiments (Plan 4 K14): explicit sets per method. ai_supervisor may pause (risk-reducing)
     # and read; only operators start, resume and stop.
     ("command", "start_experiment"): frozenset({"cli", "dashboard"}),

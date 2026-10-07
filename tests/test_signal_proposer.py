@@ -309,6 +309,15 @@ class _RecordingProposer:
         return None
 
 
+class _RecordingSignalRecord:
+    def __init__(self):
+        self.entries = []
+
+    def append(self, entry):
+        self.entries.append(entry)
+        return len(self.entries)
+
+
 def _make_runtime(tmp_path, paper_trading=True) -> StrategyRuntime:
     rt = StrategyRuntime.__new__(StrategyRuntime)  # skip __init__
     rt.strategies_directory = str(tmp_path)
@@ -324,6 +333,9 @@ def _make_runtime(tmp_path, paper_trading=True) -> StrategyRuntime:
     rt.event_store = _RecordingEventStore()  # type: ignore
     rt.zmq_messagebus_client = _RecordingBus()  # type: ignore
     rt.signal_proposer = _RecordingProposer()  # type: ignore
+    rt.signal_record = _RecordingSignalRecord()  # type: ignore
+    rt._last_dispatched_bar = {}
+    rt._pending_signals = {}
     return rt
 
 

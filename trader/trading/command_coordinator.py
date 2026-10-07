@@ -477,6 +477,10 @@ class CommandRequest:
     # the ledger: it names the caller, not the command. Internal commands
     # (coordinator children, recovery) leave it ``None``.
     principal: Optional[str] = None
+    # SP2 spec 5.1: the signed envelope epoch of an ai_supervisor command (set by
+    # the RPC handler from RpcCaller, never from the body). Not command identity:
+    # canonical_request_hash leaves it out, so a successor's resend replays.
+    controller_epoch: Optional[int] = None
 
     def __post_init__(self) -> None:
         if ":" in self.command_id:

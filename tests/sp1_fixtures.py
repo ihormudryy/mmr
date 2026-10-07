@@ -559,6 +559,7 @@ class Composed:
         trader.client = SimpleNamespace(ib=self.sim, get_snapshot=self._snapshot)
         trader.executioner = self.sim
         trader.ib_account = ACCOUNT
+        trader.duckdb_path = str(tmp_path / "mmr.duckdb")
         trader.paper_trading = True
         trader._main_loop = loop_thread.loop
         trader.get_pnl = lambda: [SimpleNamespace(dailyPnL=self.sim.daily_pnl)]
@@ -724,7 +725,23 @@ class ServedStack:
 
     def call(self, principal, method, body):
         self.calls.append((principal, method))
-        return self.client(principal, _role_of(method)).call(method, body, dict)
+        epoch = self.controller_epoch() if (principal, method) == ("ai_supervisor", "submit_ai_paper_decision") \
+            else None
+        return self.client(principal, _role_of(method)).call(method, body, dict, controller_epoch=epoch)
+
+    def controller_epoch(self) -> int:
+        """The trader's current controller epoch (SP2 Plan 1); not recorded in ``calls``.
+
+        A test's direct submits act for whichever controller holds the epoch now:
+        the acceptance port of an earlier step, or (before any) this fixture's own
+        grant. Granting a second holder here would be refused while that lease lives.
+        """
+        newest = self.trader.domain_journal.connect().execute(
+            "SELECT max(epoch) FROM ai_controller_epochs").fetchone()[0]
+        if newest is not None:
+            return int(newest)
+        return self.client("ai_supervisor", "command").call("grant_ai_controller_epoch", {
+            "holder_id": "sp1-fixture", "current_epoch": None, "lease_seconds": 60}, dict)["epoch"]
 
     def principals_for(self, *methods):
         """Who signed the ledger rows of these commands (the server derives it from the key)."""

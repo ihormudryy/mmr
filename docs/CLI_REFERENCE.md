@@ -195,6 +195,8 @@ experiment start --reason "first run"        # operator; flat paper account, ai_
 experiment pause --reason "news risk"        # cli, dashboard or ai_supervisor
 experiment resume --reason "ok"              # operator; never after a kill
 experiment stop --reason "done"              # operator; once the account is flat (final)
+ai-policy show                               # PAPER AI risk policy: published, effective, queued limits
+ai-policy publish policy.yaml --reason "x"   # operator only; file = {limits: {...}}; --command-id to retry
 scoreboard                                   # PAPER scoreboard of the latest experiment ('-' = unknown)
 --json scoreboard --experiment exp-<20 hex>  # the report as JSON: {"data": ..., "title": "Scoreboard (paper)"}
 scoreboard verify                            # rebuild every number from stored inputs; exit 1 on any mismatch
@@ -225,6 +227,7 @@ experiment acceptance verify-report REPORT --public-key PUB   # signature + fiel
 - `listen` (publish_instrument + PubSub)
 - `forex snapshot`, `forex quote` (default IB source; IDEALPRO CASH contract)
 - `experiment status|start|pause|resume|stop` (SP1 experiments; paper only)
+- `ai-policy show|publish` (SP2 operator AI risk policy; paper only; `publish` signs as `cli`)
 - `experiment acceptance preflight|run|finish` (SP1 acceptance, host only; `run` and `finish` sign with the `ai_supervisor`/`ai_research` keys, plus `cli` with `--place-orders`); `experiment acceptance status|verify-report` are local
 - `flatten --reason TEXT [--wait] [--yes]` (paper only; typed `liquidate_account`, prints `FLAT` only on broker evidence)
 - `scoreboard`, `scoreboard verify` (SP1 scoreboard; reads the journal, not IB, so no IB-upstream check)

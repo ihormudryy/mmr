@@ -27,6 +27,7 @@ policies and sessions, 55 deployments, 56 decisions; Plan 5 owns 60-69,
 Plan 4 70-79. Plan 4 uses **70** (experiments). SP1 Plan 6 (acceptance) owns
 **80-89**: 80 acceptance marks, 81 broker order events (the status history the
 acceptance shrink proof reads).
+SP2 Plan 1 owns 90–94 and uses **90** (``ai_controller_epochs``).
 
 ``SchemaMigrator`` is deliberately storage-agnostic about *which* file it
 targets — it operates on whatever ``DuckDBConnection`` it is constructed

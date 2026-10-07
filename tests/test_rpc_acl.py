@@ -222,7 +222,7 @@ def test_ai_principals_get_the_ai_paper_rights_and_no_trading_rights():
 
 
 AI_PAPER_FAMILY = {                                                    # R23, owner answer 6: exact, method by method
-    ("command", "publish_ai_risk_policy"): {"ai_supervisor"},
+    ("command", "publish_ai_risk_policy"): {"ai_supervisor", "cli"},
     ("command", "submit_ai_paper_decision"): {"ai_supervisor"},
     ("command", "register_ai_deployment"): {"ai_research"},
     ("query", "get_ai_risk_policy"): {"cli", "dashboard", "ai_supervisor"},

@@ -27,6 +27,7 @@ from trader.automation.ai_paper_experiment import ExperimentView
 from trader.automation.ai_paper_filter import AiEntryFilter, MtimeCachedFilterLoader
 from trader.automation.ai_risk_policy import AiRiskPolicyService, apply_ai_risk_policy_migration
 from trader.automation.calendar_policy import XNYSCalendarPolicy
+from trader.automation.controller_epoch import ControllerEpochs, apply_controller_epoch_migration
 from trader.automation.protective_order_saga import ProtectiveOrderSaga, apply_protective_order_saga_migration
 from trader.automation.risk_limits import PAPER_LIMITS
 from trader.automation.session_risk import SessionRiskController
@@ -204,8 +205,11 @@ class World:
         for apply in (apply_command_ledger_migration, apply_trading_control_migration,
                       apply_protective_order_saga_migration, apply_ai_risk_policy_migration,
                       apply_ai_deployment_migration, apply_ai_paper_decision_migration,
-                      apply_canary_risk_migration, apply_exit_owner_migration, apply_liquidation_migration):
+                      apply_canary_risk_migration, apply_exit_owner_migration, apply_liquidation_migration,
+                      apply_controller_epoch_migration):
             apply(migrator)
+        self.epochs = ControllerEpochs(journal=self.journal, now=self.clock)
+        self.epoch = self.epochs.grant(holder_id="world", current_epoch=None, lease_seconds=60).epoch
         self.controls = TradingControlStore(self.journal)
         self.db.transaction(lambda conn: self.controls.seed_in_tx(conn, [(ACCOUNT, "paper")], NOW))
         self.ledger = CommandLedger(self.journal)
@@ -256,7 +260,7 @@ class World:
             deployments=self.deployments, evidence=self.evidence, saga=self.saga,
             experiments=self.experiments, exit_owners=self.exit_owners, liquidation=self.liquidation,
             broker=self.broker, config=AiPaperConfig(enabled=True), account_id=ACCOUNT, now=self.clock,
-            schedule_reconcile=self.scheduled.append, decisions=self.decisions)
+            schedule_reconcile=self.scheduled.append, decisions=self.decisions, epochs=self.epochs)
 
         class _Nonces:
             def consume_in_tx(self, *args, **kwargs):
@@ -306,7 +310,8 @@ class World:
         return CommandRequest(
             command_id=command_id or command_id_for(body["decision_id"]), action=AI_PAPER_ACTION,
             account_id=ACCOUNT, target_type="conid", target_id=target_id or str(body["conid"]),
-            expected_version=None, body=body, source=principal, principal=principal)
+            expected_version=None, body=body, source=principal, principal=principal,
+            controller_epoch=self.epoch)
 
     def body(self, **changes):
         return enter_body(self.digest, self.clock(), **changes)

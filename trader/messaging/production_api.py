@@ -92,7 +92,15 @@ from typing import TYPE_CHECKING, Annotated, Any, Dict, Literal, Optional
 from ib_async import Contract
 from pydantic import BaseModel, ConfigDict, Field, Strict, field_validator
 
+from trader.automation.controller_epoch import (
+    HOLDER_ID,
+    MAX_CONTROLLER_EPOCH,
+    MAX_LEASE_SECONDS,
+    MIN_LEASE_SECONDS,
+    EpochRefused,
+)
 from trader.data.proposal_repository import ProposalRepository
+from trader.data.strategy_signal_record import MAX_READ_LIMIT, SignalCursorAhead
 from trader.domain.commands import CommandReceipt
 from trader.domain.feed_service import CURSOR_EXPIRED, CursorExpired, DomainFeedService, domain_event_to_wire
 from trader.domain.snapshot_service import SNAPSHOT_NOT_READY, DomainSnapshotService, SnapshotNotReady
@@ -103,7 +111,7 @@ from trader.messaging.strategy_trader_contracts import (
     ResolveInstrumentResponse,
 )
 from trader.messaging.manage_surface import register_manage_surface
-from trader.messaging.principals import TRADER_ACL, is_valid_principal_name
+from trader.messaging.principals import CONTROLLER_PRINCIPAL, TRADER_ACL, is_valid_principal_name
 from trader.messaging.trader_service_api import TraderServiceApi
 from trader.messaging.typed_rpc import (
     ServiceIdentity,
@@ -875,6 +883,41 @@ class SubmitAiPaperDecisionRequest(BaseModel):
         return value
 
 
+class GrantAiControllerEpochRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid", strict=True)
+
+    holder_id: str
+    current_epoch: Optional[Annotated[int, Field(ge=1, le=MAX_CONTROLLER_EPOCH)]]
+    lease_seconds: Annotated[int, Field(ge=MIN_LEASE_SECONDS, le=MAX_LEASE_SECONDS)]
+
+    @field_validator("holder_id")
+    @classmethod
+    def _holder_id_shape(cls, value: str) -> str:
+        if not HOLDER_ID.fullmatch(value):
+            raise ValueError("holder_id must match ^[a-z0-9][a-z0-9_.-]{0,63}$")
+        return value
+
+
+class GetAiPaperDecisionRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid", strict=True)
+
+    decision_id: str
+
+    @field_validator("decision_id")
+    @classmethod
+    def _decision_id_shape(cls, value: str) -> str:
+        if not _AI_DECISION_ID.match(value):
+            raise ValueError("decision_id must match ^[A-Za-z0-9_-]{8,64}$")
+        return value
+
+
+class ReadAiSignalsRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid", strict=True)
+
+    after_cursor: Annotated[int, Field(ge=0)]
+    limit: Annotated[int, Field(ge=1, le=MAX_READ_LIMIT)]
+
+
 class GetAiDeploymentRequest(BaseModel):
     model_config = ConfigDict(extra="forbid", strict=True)
 
@@ -1340,14 +1383,17 @@ def _register_ai_deployment_rpc_handler(coordinator: TradingCommandCoordinator, 
     return _handler
 
 
-def _submit_ai_paper_decision_rpc_handler(coordinator: TradingCommandCoordinator, account_id: Optional[str]):
+def _submit_ai_paper_decision_rpc_handler(coordinator: TradingCommandCoordinator, account_id: Optional[str],
+                                          epochs):
     from trader.automation.ai_paper_decision import AI_PAPER_ACTION, command_id_for
 
     def _handler(parsed: SubmitAiPaperDecisionRequest, caller: RpcCaller) -> Dict[str, Any]:
+        _require_controller_epoch(epochs, caller)
         request = CommandRequest(
             command_id=command_id_for(parsed.decision_id), action=AI_PAPER_ACTION, account_id=account_id,
             target_type="conid", target_id=str(parsed.conid), expected_version=None,
             body=parsed.model_dump(mode="json"), source=caller.principal, principal=caller.principal,
+            controller_epoch=caller.controller_epoch,
         )
         return _receipt_to_dict(coordinator.execute(request))
     return _handler
@@ -1356,6 +1402,58 @@ def _submit_ai_paper_decision_rpc_handler(coordinator: TradingCommandCoordinator
 def _get_ai_deployment_handler(actions):
     def _handler(parsed: GetAiDeploymentRequest) -> Dict[str, Any]:
         return actions.deployment_view(parsed.digest)
+    return _handler
+
+
+def _require_controller_epoch(epochs, caller: RpcCaller) -> None:
+    """Spec 5.1: checked before the coordinator, so a refusal writes no ledger row (Plan 1 Ruling 1a)."""
+    try:
+        epochs.require_current(caller.controller_epoch)
+    except EpochRefused as ex:
+        raise _DispatchProblem(ex.code, ex.message) from None
+
+
+def _grant_ai_controller_epoch_handler(epochs):
+    def _handler(parsed: GrantAiControllerEpochRequest, caller: RpcCaller) -> Dict[str, Any]:
+        if caller.principal != CONTROLLER_PRINCIPAL:      # the allow-list already refuses; defense in depth
+            raise _DispatchProblem("PERMISSION_DENIED", "only ai_supervisor holds a controller epoch")
+        try:
+            grant = epochs.grant(holder_id=parsed.holder_id, current_epoch=parsed.current_epoch,
+                                 lease_seconds=parsed.lease_seconds)
+        except EpochRefused as ex:
+            raise _DispatchProblem(ex.code, ex.message) from None
+        return {"epoch": grant.epoch, "lease_expires_at": grant.lease_expires_at.isoformat()}
+    return _handler
+
+
+def _get_ai_paper_decision_handler(coordinator: TradingCommandCoordinator, ai_paper):
+    from trader.automation.ai_paper_decision import command_id_for
+
+    def _handler(parsed: GetAiPaperDecisionRequest, caller: RpcCaller) -> Dict[str, Any]:
+        _require_controller_epoch(ai_paper.epochs, caller)
+        command_id = command_id_for(parsed.decision_id)
+        receipt = coordinator.get_command(command_id)
+        row = ai_paper.decision_store.row(parsed.decision_id)
+        return {
+            "decision_id": parsed.decision_id, "command_id": command_id, "found": receipt is not None,
+            "receipt": None if receipt is None else _receipt_to_dict(receipt),
+            "decision_state": None if row is None else row.state,
+            "decision_error_code": None if row is None else row.error_code,
+            "close_root_id": None if row is None else row.close_root_id,
+            "controller_epoch": None if row is None else row.controller_epoch,
+        }
+    return _handler
+
+
+def _read_ai_signals_handler(ai_paper):
+    def _handler(parsed: ReadAiSignalsRequest, caller: RpcCaller) -> Dict[str, Any]:
+        _require_controller_epoch(ai_paper.epochs, caller)
+        try:
+            page = ai_paper.signals.read(parsed.after_cursor, parsed.limit)
+        except SignalCursorAhead as ex:
+            raise _DispatchProblem(ex.code, str(ex)) from None
+        return {"signals": [signal.to_json() for signal in page.signals], "next_cursor": page.next_cursor,
+                "oldest_retained_cursor": page.oldest_retained_cursor, "gap": page.gap}
     return _handler
 
 
@@ -1378,7 +1476,18 @@ def register_ai_paper_authority(registry: TypedRpcRegistry, coordinator: Trading
     )
     registry.register(
         "command", "submit_ai_paper_decision", SubmitAiPaperDecisionRequest, dict,
-        _submit_ai_paper_decision_rpc_handler(coordinator, account_id), with_caller=True,
+        _submit_ai_paper_decision_rpc_handler(coordinator, account_id, ai_paper.epochs), with_caller=True,
+    )
+    registry.register(
+        "command", "grant_ai_controller_epoch", GrantAiControllerEpochRequest, dict,
+        _grant_ai_controller_epoch_handler(ai_paper.epochs), with_caller=True,
+    )
+    registry.register(
+        "query", "get_ai_paper_decision", GetAiPaperDecisionRequest, dict,
+        _get_ai_paper_decision_handler(coordinator, ai_paper), with_caller=True,
+    )
+    registry.register(
+        "query", "read_ai_signals", ReadAiSignalsRequest, dict, _read_ai_signals_handler(ai_paper), with_caller=True,
     )
     registry.register("query", "get_ai_risk_policy", dict, dict, _no_arg_handler(ai_paper.actions.policy_view))
     registry.register(

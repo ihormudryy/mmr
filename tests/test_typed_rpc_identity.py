@@ -71,7 +71,8 @@ def test_signature_by_another_principals_key_is_rejected():
 
 @pytest.mark.parametrize("field,value", [("body", {"x": 1}), ("method", "get_positions"),
                                          ("timestamp", NOW + 1), ("nonce", "other"),
-                                         ("request_id", "r2"), ("on_behalf_of", "cli")])
+                                         ("request_id", "r2"), ("on_behalf_of", "cli"),
+                                         ("controller_epoch", 1)])
 def test_tampered_request_is_rejected(field, value):
     ids = make_identities(now=lambda: NOW)
     with pytest.raises(AuthenticationError):

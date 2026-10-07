@@ -425,7 +425,10 @@ clean-account gate (`mmr experiment acceptance preflight`), arming, the
 harness run with the live OCA shrink proof, the 15:45 flatten, `finish` and the
 signed report. Owner only; nothing in the repo places those orders. Needs
 `ai_paper.acceptance_probe: true` for the day and an operator signing key
-(`~/.config/mmr/keys/acceptance/operator.key`). Not run yet.
+(`~/.config/mmr/keys/acceptance/operator.key`). Not run yet. The acceptance
+harness holds its own controller epoch (lease 60 s). Stop the `ai` service
+before an acceptance run, or the harness waits on `CONTROLLER_EPOCH_HELD` and
+then fails.
 
 The automation soak below is blocked until the exit fix
 and the split-Docker evidence gap are resolved (see Known blockers). Until then, run strategies with `auto_execute: propose`

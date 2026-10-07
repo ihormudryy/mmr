@@ -1398,6 +1398,22 @@ def build_parser() -> argparse.ArgumentParser:
         _p.add_argument('--reason', required=True)
     _add_acceptance_parser(experiment_sub, fmt)
 
+    # ai-policy (SP2 Plan 1, spec 6.7): the operator publishes the initial AI risk policy
+    ai_policy_p = sub.add_parser(
+        'ai-policy', help='PAPER AI risk policy: show, publish (operator)',
+        epilog='Examples:\n'
+               '  ai-policy show\n'
+               '  ai-policy publish policy.yaml --reason "initial policy"   # file = {limits: {...}}\n'
+               '  ai-policy publish policy.yaml --reason "x" --command-id cli-pol-1   # retry after a timeout',
+        formatter_class=fmt)
+    ai_policy_sub = ai_policy_p.add_subparsers(dest='ai_policy_action')
+    ai_policy_sub.add_parser('show', help='Published, effective and queued limits')
+    ai_policy_publish_p = ai_policy_sub.add_parser('publish', help='Publish a policy file (operator)')
+    ai_policy_publish_p.add_argument('file', help='YAML file with exactly the key "limits"')
+    ai_policy_publish_p.add_argument('--reason', required=True)
+    ai_policy_publish_p.add_argument('--command-id', dest='command_id', default=None,
+                                     help='Reuse to replay the same publish after a timeout')
+
     # scoreboard (SP1 Plan 5)
     scoreboard_p = sub.add_parser(
         'scoreboard', help='PAPER scoreboard of the ai_paper experiment (read only)',
@@ -2627,6 +2643,9 @@ def dispatch(mmr: MMR, args: argparse.Namespace) -> bool:
         elif cmd == 'experiment':
             _handle_experiment(mmr, args)
 
+        elif cmd == 'ai-policy':
+            _handle_ai_policy(mmr, args)
+
         elif cmd == 'flatten':
             _handle_flatten(mmr, args)
 
@@ -3293,6 +3312,24 @@ def _print_acceptance_results(phase: str, outcome) -> None:
         console.print(line, markup=False)
     console.print(f'signed report: {outcome.report_path}', markup=False)
     console.print(f'report passed: {outcome.passed}', markup=False)
+
+
+def _handle_ai_policy(mmr: MMR, args: argparse.Namespace):
+    from trader.automation.ai_policy_file import PolicyFileError, load_policy_file
+
+    if (getattr(args, 'ai_policy_action', None) or 'show') == 'show':
+        print_json_result(mmr.ai_policy_view(), title='AI risk policy (paper)')
+        return
+    try:
+        limits = load_policy_file(args.file)
+    except PolicyFileError as ex:
+        print_status(f'ai-policy publish: {ex}', success=False)
+        sys.exit(1)
+    result = mmr.ai_policy_publish(limits, args.reason, command_id=args.command_id)
+    if not result.is_success():
+        print_status(f"ai-policy publish failed: {result.error or result.exception}", success=False)
+        sys.exit(1)
+    print_json_result(result.obj or {}, title='AI risk policy published')
 
 
 def _handle_experiment(mmr: MMR, args: argparse.Namespace):
@@ -12393,7 +12430,7 @@ _LOCAL_ONLY_COMMANDS = {
     'snapshot', 'snap', 'snapshot-batch', 'depth',
     'risk-limits', 'rl', 'reconcile', 'diagnose', 'approve', 'listen',
     'ideas', 'scan-ideas',
-    'market-hours', 'mh', 'session', 'group', 'research', 'scoreboard', 'flatten',
+    'market-hours', 'mh', 'session', 'group', 'research', 'scoreboard', 'flatten', 'ai-policy',
 }
 # strategies list/enable/disable/reload hit strategy typed ports; create/deploy
 # etc. are YAML-local. Legacy connect is never needed for strategies/*.

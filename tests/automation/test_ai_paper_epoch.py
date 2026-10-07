@@ -67,7 +67,7 @@ def test_an_admitted_command_survives_a_later_takeover(world):
 
 
 def test_a_reduction_needs_the_current_epoch_too(world):
-    world.held(CONID, 300.0)
+    world.owned(CONID, 300.0)
     takeover(world)
     close = world.body(action="CLOSE", side="SELL", deployment_digest=None, policy_revision=None,
                        stop_price=None, quantity=None)

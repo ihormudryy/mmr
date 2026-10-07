@@ -5,6 +5,7 @@ DispatchGuard. Only the broker, quotes, margin, history and the order dispatch a
 from __future__ import annotations
 
 import datetime as dt
+import json
 import os
 import threading
 from dataclasses import replace
@@ -322,3 +323,16 @@ class World:
 
     def held(self, conid=CONID, quantity=300.0):
         self.broker.set(positions=self.broker.snapshot.positions + (pos(conid, quantity),))
+
+    def owned(self, conid=CONID, quantity=300.0, decision_id="dec-owned-00"):
+        """An ENTER of the current experiment whose saga reports a fill, then its broker position."""
+        assert self.submit(decision_id=decision_id, conid=conid).state == "SUBMITTED"
+        command_id = command_id_for(decision_id)
+        (raw,) = self.db.execute("SELECT payload FROM automated_order_sagas WHERE command_id = ?",
+                                 [command_id], fetch="one")
+        payload = {**json.loads(raw), "filled_quantity": str(quantity)}
+        self.db.execute("UPDATE automated_order_sagas SET payload = ? WHERE command_id = ?",
+                        [json.dumps(payload), command_id])
+        self.held(conid, quantity)
+        self.dispatch.plans.clear()
+        self.scheduled.clear()

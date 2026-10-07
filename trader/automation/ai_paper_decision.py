@@ -61,7 +61,8 @@ def apply_ai_paper_decision_migration(migrator: SchemaMigrator) -> bool:
             deployment_digest VARCHAR, strategy_digest VARCHAR, style VARCHAR,
             policy_revision INTEGER, effective_revision INTEGER, principal VARCHAR,
             controller_epoch BIGINT, body_json VARCHAR NOT NULL, state VARCHAR NOT NULL, error_code VARCHAR,
-            close_root_id VARCHAR, received_at TIMESTAMPTZ NOT NULL, updated_at TIMESTAMPTZ NOT NULL)""",
+            close_root_id VARCHAR, received_at TIMESTAMPTZ NOT NULL, updated_at TIMESTAMPTZ NOT NULL,
+            experiment_id VARCHAR)""",
         "CREATE INDEX IF NOT EXISTS idx_ai_paper_decisions_root ON ai_paper_decisions(close_root_id)",
     ))
 
@@ -234,7 +235,8 @@ def deployment_binding(deployment: Any, *, digest: str, limits: Any, expires_at:
 
 _ROW_COLUMNS = ("command_id", "decision_id", "account_id", "conid", "action", "decider", "evidence_digest",
                 "deployment_digest", "strategy_digest", "style", "policy_revision", "effective_revision",
-                "principal", "controller_epoch", "body_json", "state", "error_code", "close_root_id", "received_at", "updated_at")
+                "principal", "controller_epoch", "body_json", "state", "error_code", "close_root_id", "received_at", "updated_at",
+                "experiment_id")
 
 
 @dataclass(frozen=True)
@@ -259,6 +261,7 @@ class DecisionRow:
     controller_epoch: Optional[int] = None
     error_code: Optional[str] = None
     close_root_id: Optional[str] = None
+    experiment_id: Optional[str] = None
 
     @classmethod
     def received(cls, cmd: CommandRequest, now: dt.datetime) -> "DecisionRow":
@@ -347,6 +350,15 @@ class AiPaperDecisionStore:
             return True
         return bool(payload.get("entry_working") or payload.get("entry_cancelled")
                     or Decimal(str(payload.get("filled_quantity") or "0")) > 0)
+
+    def experiment_owns_conid_in_tx(self, conn, account_id: str, experiment_id: str, conid: int) -> bool:
+        """Spec 6.4: an ENTER of this experiment on the conid whose protective saga reports a fill."""
+        rows = conn.execute(
+            "SELECT s.payload FROM ai_paper_decisions d "
+            "JOIN automated_order_sagas s ON s.command_id = d.command_id "
+            "WHERE d.account_id = ? AND d.experiment_id = ? AND d.conid = ? AND d.action = 'ENTER'",
+            [account_id, experiment_id, conid]).fetchall()
+        return any(Decimal(str(json.loads(payload).get("filled_quantity") or "0")) > 0 for (payload,) in rows)
 
     def links_for_order_ref(self, order_ref: str) -> tuple[DecisionLink, ...]:
         """R24: the decisions behind a broker order ref, for the scoreboard (Plan 5)."""
@@ -510,6 +522,7 @@ class AiPaperDecisionService:
 
     def _execute_entry(self, cmd: CommandRequest, decision: AiPaperDecision, admission: _Admission) -> CommandReceipt:
         experiment = self._experiment(allow=("ARMED",))
+        admission.row = replace(admission.row, experiment_id=experiment.experiment_id)
         if getattr(experiment, "entry_block", None):
             # Plan 4 K19, row 4c: KILL_LINE_UNKNOWN, EXPERIMENT_MONITOR_NOT_READY, BOTH_MODES_ARMED.
             raise _Refusal(experiment.entry_block)
@@ -616,14 +629,15 @@ class AiPaperDecisionService:
                            admission: _Admission) -> CommandReceipt:
         """Spec 5.4: no entry window, budget, loss check, policy or deployment; never paused (R32)."""
         experiment = self._experiment(allow=("ARMED", "PAUSED", "KILLED"))
+        admission.row = replace(admission.row, experiment_id=experiment.experiment_id)
         killed = experiment.state == "KILLED"
         if killed and self._account_owner() is None:
             # R15: join the kill flatten; never claim a new scoped root while it is being set up.
             raise _Refusal("KILL_FLATTEN_PENDING", retryable=True)
         self._check_expiry(decision)
         snapshot = self._capture()
-        self._validate(cmd, admission, decision.conid, snapshot, owner_check=lambda conn: None,
-                       working_entry_blocks=False)
+        self._validate(cmd, admission, decision.conid, snapshot, working_entry_blocks=False,
+                       owner_check=lambda conn: self._not_owned_in_tx(conn, experiment, decision.conid))
         self._claim(cmd, admission, require_unpaused=False)
         partial = decision.action == "PARTIAL_CLOSE" and not killed
         close = start_broker_proven_close(
@@ -637,6 +651,10 @@ class AiPaperDecisionService:
             return self._outcome_unknown(cmd, admission, close.error_code, outcome=close.outcome)
         return self._outcome_unknown(cmd, admission, CLOSE_PENDING, outcome=close.outcome,
                                      close_root_id=close.close_root_id)
+
+    def _not_owned_in_tx(self, conn, experiment: Any, conid: int) -> Optional[str]:
+        owned = self._decisions.experiment_owns_conid_in_tx(conn, self._account_id, experiment.experiment_id, conid)
+        return None if owned else "POSITION_NOT_OWNED"
 
     def _account_owner(self) -> Any:
         try:

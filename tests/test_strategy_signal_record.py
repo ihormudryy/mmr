@@ -125,3 +125,86 @@ def test_dispatch_records_buy_and_sell_but_not_neutral(tmp_path, installed_strat
         ("BUY", 4391, installed_strategy.name), ("SELL", 4391, installed_strategy.name)]
     assert signals[0]["signal_time"] == "2026-10-07T14:30:00+00:00"
     assert len(rt.event_store.events) == 4                                   # trading_events unchanged
+
+
+class FlakyRecord:
+    """A real record whose first append fails, before or after the row is written."""
+
+    def __init__(self, inner, *, fail_after_write):
+        self.inner, self.fail_after_write, self.failures_left = inner, fail_after_write, 1
+
+    def append(self, entry):
+        if self.failures_left and not self.fail_after_write:
+            self.failures_left -= 1
+            raise OSError("duckdb file is locked")
+        cursor = self.inner.append(entry)
+        if self.failures_left:
+            self.failures_left -= 1
+            raise OSError("connection dropped after commit")
+        return cursor
+
+    def read(self, after_cursor, limit):
+        return self.inner.read(after_cursor, limit)
+
+
+def ticking_runtime(tmp_path, clock, strategy, *, fail_after_write):
+    rt = _make_runtime(tmp_path)
+    real = StrategySignalRecord(DuckDBConnection.get_instance(str(tmp_path / "s.duckdb")), now=clock)
+    rt.signal_record = FlakyRecord(real, fail_after_write=fail_after_write)
+    rt.current_frame = _frame(last_time="2026-10-07 14:30")
+    rt._strategy_frame = lambda conId, bar_size: rt.current_frame
+    calls = []
+    real_on_prices = strategy.on_prices
+    strategy.on_prices = lambda frame: calls.append(frame.index[-1]) or real_on_prices(frame)
+    return rt, calls
+
+
+def recorded(rt):
+    return [(s["cursor"], s["signal_time"]) for s in (x.to_json() for x in rt.signal_record.read(0, 10).signals)]
+
+
+def test_a_failed_append_is_retried_before_the_next_bar(tmp_path, installed_strategy, clock):   # PR #78 thread
+    rt, on_prices_calls = ticking_runtime(tmp_path, clock, installed_strategy, fail_after_write=False)
+    rt._on_tick_for_strategy(installed_strategy, 4391)                      # bar 14:30: append fails
+    assert recorded(rt) == [] and rt.zmq_messagebus_client.written == []
+    rt._on_tick_for_strategy(installed_strategy, 4391)                      # same bar: retried, not re-evaluated
+    assert recorded(rt) == [(1, "2026-10-07T14:30:00+00:00")]
+    rt.current_frame = _frame(last_time="2026-10-07 14:31")
+    rt._on_tick_for_strategy(installed_strategy, 4391)
+    assert recorded(rt) == [(1, "2026-10-07T14:30:00+00:00"), (2, "2026-10-07T14:31:00+00:00")]
+    assert len(on_prices_calls) == 2                                         # each bar seen once
+    assert len(rt.event_store.events) == 2 and len(rt.zmq_messagebus_client.written) == 2
+
+
+def test_a_new_bar_waits_behind_a_failed_append(tmp_path, installed_strategy, clock):
+    rt, _ = ticking_runtime(tmp_path, clock, installed_strategy, fail_after_write=False)
+    rt.signal_record.failures_left = 2
+    rt._on_tick_for_strategy(installed_strategy, 4391)                      # 14:30 fails
+    rt.current_frame = _frame(last_time="2026-10-07 14:31")
+    rt._on_tick_for_strategy(installed_strategy, 4391)                      # 14:30 fails again; 14:31 queued
+    assert recorded(rt) == []
+    rt._on_tick_for_strategy(installed_strategy, 4391)
+    assert recorded(rt) == [(1, "2026-10-07T14:30:00+00:00"), (2, "2026-10-07T14:31:00+00:00")]
+    assert len(rt.zmq_messagebus_client.written) == 2
+
+
+def test_an_append_that_wrote_and_then_failed_is_not_duplicated(tmp_path, installed_strategy, clock):
+    rt, _ = ticking_runtime(tmp_path, clock, installed_strategy, fail_after_write=True)
+    rt._on_tick_for_strategy(installed_strategy, 4391)                      # row written, call raised
+    rt._on_tick_for_strategy(installed_strategy, 4391)                      # retry finds the same row
+    rt._on_tick_for_strategy(installed_strategy, 4391)
+    assert recorded(rt) == [(1, "2026-10-07T14:30:00+00:00")]
+    assert len(rt.event_store.events) == 1 and len(rt.zmq_messagebus_client.written) == 1
+
+
+def test_a_failure_after_the_record_is_not_retried(tmp_path, installed_strategy, clock):
+    rt, _ = ticking_runtime(tmp_path, clock, installed_strategy, fail_after_write=False)
+    rt.signal_record.failures_left = 0
+
+    def bus_down(topic, payload):
+        raise ConnectionError("bus down")
+    rt.zmq_messagebus_client.write = bus_down
+    rt._on_tick_for_strategy(installed_strategy, 4391)
+    rt._on_tick_for_strategy(installed_strategy, 4391)
+    assert recorded(rt) == [(1, "2026-10-07T14:30:00+00:00")]
+    assert len(rt.event_store.events) == 1                                   # the signal is not replayed

@@ -150,6 +150,14 @@ class ControlRevisionConflict(Exception):
         )
 
 
+class SignalRecordWriteFailed(Exception):
+    """The durable signal record write failed or its outcome is unknown.
+
+    The signal is kept and retried with the same ``source_event_id``, which the
+    record treats as the same row (SP2 Plan 1, PR #78 review).
+    """
+
+
 class StartupConfigRecoveryError(Exception):
     """[M1-F3] Task 7. Startup recovery could not restore ``prior_config``
     into the live YAML for one or more crashed staged-config revisions.
@@ -539,6 +547,9 @@ class StrategyRuntime():
         # Last completed bar timestamp dispatched per (conId, strategy name), so
         # a strategy sees each bar once (not on every tick).
         self._last_dispatched_bar: Dict[tuple, pd.Timestamp] = {}
+        # Signals whose durable record write failed, per (conId, strategy name),
+        # oldest first. Retried on every tick before any newer signal.
+        self._pending_signals: Dict[tuple, List[tuple]] = {}
         # Config-file change detection. Must exist from construction:
         # reload_strategies (RPC → _reconcile) can fire while run() is still
         # in its initial historical fetch, long before run() stamps the real
@@ -1569,59 +1580,95 @@ class StrategyRuntime():
         # for ALL strategies is then silently dropped and open positions go
         # unmanaged. A single misbehaving strategy must not take down the feed.
         for strategy in self.__get_enabled_strategies(conId):
-            try:
-                # Hand the strategy proper OHLCV bars (historical priming +
-                # resampled live ticks), and only when a NEW completed bar has
-                # formed — so bar-based strategies see each bar once, matching
-                # the backtest, instead of the raw per-tick cumulative-volume
-                # stream re-evaluated on every tick.
-                frame = self._strategy_frame(conId, strategy.bar_size)
-                if frame is None or frame.empty:
-                    continue
-                last_bar = frame.index[-1]
-                dkey = (conId, strategy.name)
-                if self._last_dispatched_bar.get(dkey) == last_bar:
-                    continue
-                self._last_dispatched_bar[dkey] = last_bar
-                # Stamp which instrument this dispatch is for BEFORE calling
-                # on_prices — multi-instrument strategies (pairs) read
-                # ``self.dispatch_conid`` instead of guessing identity from
-                # the shape of the data.
-                strategy._dispatch_conid = conId
-                signal = strategy.on_prices(frame)
-            except Exception as ex:
-                logging.exception(
-                    'strategy %s raised on_prices for conId %s; disabling it and '
-                    'continuing the tick feed', getattr(strategy, 'name', '?'), conId)
-                try:
-                    strategy.state = StrategyState.ERROR
-                except Exception:
-                    pass
-                continue
+            self._on_tick_for_strategy(strategy, conId)
 
-            # Time-based exits (max_hold_bars / close_by_time) are checked on
-            # every new completed bar, signal or not — a VwapReclaim-style
-            # position must flatten at 15:45 even if no fresh signal fires.
-            self._maybe_check_exits(strategy, conId, frame)
-
-            if not signal:
-                continue
+    def _on_tick_for_strategy(self, strategy: Strategy, conId: int) -> None:
+        dkey = (conId, strategy.name)
+        self._retry_pending_signals(dkey)
+        try:
+            # Hand the strategy proper OHLCV bars (historical priming +
+            # resampled live ticks), and only when a NEW completed bar has
+            # formed — so bar-based strategies see each bar once, matching
+            # the backtest, instead of the raw per-tick cumulative-volume
+            # stream re-evaluated on every tick.
+            frame = self._strategy_frame(conId, strategy.bar_size)
+            if frame is None or frame.empty:
+                return
+            last_bar = frame.index[-1]
+            if self._last_dispatched_bar.get(dkey) == last_bar:
+                return
+            self._last_dispatched_bar[dkey] = last_bar
+            # Stamp which instrument this dispatch is for BEFORE calling
+            # on_prices — multi-instrument strategies (pairs) read
+            # ``self.dispatch_conid`` instead of guessing identity from
+            # the shape of the data.
+            strategy._dispatch_conid = conId
+            signal = strategy.on_prices(frame)
+        except Exception:
+            logging.exception(
+                'strategy %s raised on_prices for conId %s; disabling it and '
+                'continuing the tick feed', getattr(strategy, 'name', '?'), conId)
             try:
-                self._dispatch_signal(strategy, signal, conId=conId, frame=frame)
+                strategy.state = StrategyState.ERROR
             except Exception:
-                # A failure persisting/publishing one signal must not kill the
-                # feed or the other strategies either.
-                logging.exception(
-                    'failed to record/publish signal from %s for conId %s',
-                    getattr(strategy, 'name', '?'), conId)
+                pass
+            return
+
+        # Time-based exits (max_hold_bars / close_by_time) are checked on
+        # every new completed bar, signal or not — a VwapReclaim-style
+        # position must flatten at 15:45 even if no fresh signal fires.
+        self._maybe_check_exits(strategy, conId, frame)
+
+        if not signal:
+            return
+        pending = self._pending_signals.get(dkey)
+        if pending:
+            pending.append((strategy, signal, conId, frame))      # keep the record in signal order
+            return
+        if not self._dispatch_once(strategy, signal, conId, frame):
+            self._pending_signals[dkey] = [(strategy, signal, conId, frame)]
+
+    def _retry_pending_signals(self, dkey: tuple) -> None:
+        """Dispatch held signals oldest first; stop at the first record write that fails again."""
+        pending = self._pending_signals.get(dkey)
+        while pending:
+            strategy, signal, conId, frame = pending[0]
+            if not self._dispatch_once(strategy, signal, conId, frame):
+                return
+            pending.pop(0)
+        self._pending_signals.pop(dkey, None)
+
+    def _dispatch_once(self, strategy: Strategy, signal, conId: int, frame: pd.DataFrame) -> bool:
+        """False only when the durable record write failed: the signal must be retried.
+
+        Any later failure (event store, publish) is logged and the signal is not
+        replayed, so it is never published or bridged twice.
+        """
+        try:
+            self._dispatch_signal(strategy, signal, conId=conId, frame=frame)
+        except SignalRecordWriteFailed:
+            logging.exception('signal record write failed for %s conId %s; retrying on the next tick',
+                              getattr(strategy, 'name', '?'), conId)
+            return False
+        except Exception:
+            # A failure persisting/publishing one signal must not kill the
+            # feed or the other strategies either.
+            logging.exception(
+                'failed to record/publish signal from %s for conId %s',
+                getattr(strategy, 'name', '?'), conId)
+        return True
 
     def _record_signal(self, strategy: Strategy, signal, conId: int, frame: pd.DataFrame) -> None:
         """Spec 6.1: BUY/SELL go to the durable record before any publish; a failed write raises."""
         if signal.action not in (Action.BUY, Action.SELL):
             return
-        self.signal_record.append(SignalEntry.create(
+        entry = SignalEntry.create(
             strategy_name=strategy.name, conid=conId, action=str(signal.action),
-            probability=signal.probability, signal_time=completed_bar_time(frame)))
+            probability=signal.probability, signal_time=completed_bar_time(frame))
+        try:
+            self.signal_record.append(entry)
+        except Exception as ex:
+            raise SignalRecordWriteFailed(f'{entry.source_event_id}: {ex}') from ex
 
     def _dispatch_signal(self, strategy: Strategy, signal, conId: int,
                          frame: pd.DataFrame) -> None:

@@ -334,6 +334,8 @@ def _make_runtime(tmp_path, paper_trading=True) -> StrategyRuntime:
     rt.zmq_messagebus_client = _RecordingBus()  # type: ignore
     rt.signal_proposer = _RecordingProposer()  # type: ignore
     rt.signal_record = _RecordingSignalRecord()  # type: ignore
+    rt._last_dispatched_bar = {}
+    rt._pending_signals = {}
     return rt
 
 

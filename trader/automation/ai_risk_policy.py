@@ -36,7 +36,7 @@ def apply_ai_risk_policy_migration(migrator: SchemaMigrator) -> bool:
             anchor_net_liquidation DOUBLE NOT NULL, anchor_generation_id BIGINT NOT NULL,
             ceiling_json VARCHAR NOT NULL, started_at TIMESTAMPTZ NOT NULL,
             latch_code VARCHAR, latch_detail VARCHAR, latched_at TIMESTAMPTZ,
-            cutoff_cancel_state VARCHAR,
+            cutoff_cancel_state VARCHAR, cutoff_cancel_generation BIGINT,
             PRIMARY KEY (account_id, session_date))""",
         """CREATE TABLE IF NOT EXISTS ai_effective_limits (
             account_id VARCHAR NOT NULL, session_date DATE NOT NULL, revision INTEGER NOT NULL,
@@ -72,6 +72,7 @@ class SessionView:
     queued: tuple[str, ...]
     latch_code: Optional[str]
     cutoff_cancel_state: Optional[str] = None
+    cutoff_cancel_generation: Optional[int] = None
 
     @property
     def daily_loss_budget(self) -> Optional[float]:
@@ -87,6 +88,7 @@ class _SessionRow:
     ceiling: RiskLimits
     latch_code: Optional[str]
     cutoff_cancel_state: Optional[str]
+    cutoff_cancel_generation: Optional[int]
 
 
 @dataclass(frozen=True)
@@ -154,8 +156,12 @@ class AiRiskPolicyService:
                 [code, detail, now, self._account_id, session_date])
         self._db.transaction(write)
 
-    def set_cutoff_cancel_state(self, session_date: dt.date, state: str) -> None:
-        """Forward-only: NULL -> ISSUED -> AMBIGUOUS -> DONE, never backwards (R26)."""
+    def set_cutoff_cancel_state(self, session_date: dt.date, state: str, *, generation: int) -> None:
+        """Forward-only: NULL -> ISSUED -> AMBIGUOUS -> DONE, never backwards (R26).
+
+        ``generation`` is the broker generation the decision was read from; the next check
+        waits for a newer one.
+        """
         if state not in CUTOFF_CANCEL_STATES:
             raise ValueError(f"unknown cutoff cancel state {state!r}")
 
@@ -168,8 +174,9 @@ class AiRiskPolicyService:
             if rank[state] < rank[current]:
                 raise ValueError(f"cutoff cancel state cannot move from {current} to {state}")
             conn.execute(
-                "UPDATE ai_paper_sessions SET cutoff_cancel_state = ? WHERE account_id = ? AND session_date = ?",
-                [state, self._account_id, session_date])
+                "UPDATE ai_paper_sessions SET cutoff_cancel_state = ?, cutoff_cancel_generation = ? "
+                "WHERE account_id = ? AND session_date = ?",
+                [state, int(generation), self._account_id, session_date])
         self._db.transaction(write)
 
     # -- reads ---------------------------------------------------------------
@@ -286,16 +293,18 @@ class AiRiskPolicyService:
             effective=None if current is None else current.limits,
             effective_revision=None if current is None else current.revision,
             published_revision=None if current is None else current.published_revision,
-            queued=queued, latch_code=session.latch_code, cutoff_cancel_state=session.cutoff_cancel_state)
+            queued=queued, latch_code=session.latch_code, cutoff_cancel_state=session.cutoff_cancel_state,
+            cutoff_cancel_generation=session.cutoff_cancel_generation)
 
     def _session_in_tx(self, conn, session_date) -> Optional[_SessionRow]:
         row = conn.execute(
-            "SELECT session_date, anchor_net_liquidation, ceiling_json, latch_code, cutoff_cancel_state "
-            "FROM ai_paper_sessions WHERE account_id = ? AND session_date = ?",
+            "SELECT session_date, anchor_net_liquidation, ceiling_json, latch_code, cutoff_cancel_state, "
+            "cutoff_cancel_generation FROM ai_paper_sessions WHERE account_id = ? AND session_date = ?",
             [self._account_id, session_date]).fetchone()
         if row is None:
             return None
-        return _SessionRow(row[0], float(row[1]), _limits(row[2]), row[3], row[4])
+        return _SessionRow(row[0], float(row[1]), _limits(row[2]), row[3], row[4],
+                           None if row[5] is None else int(row[5]))
 
     def _effective_in_tx(self, conn, session_date) -> Optional[_Effective]:
         row = conn.execute(

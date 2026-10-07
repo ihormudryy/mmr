@@ -2608,3 +2608,73 @@ def test_a_release_with_intact_protection_reports_no_problem(tmp_path):
     s.dispatch.rows["p-1-reprotect-stop-1-1"] = [_leg_row()]
     assert s.service.rescan().state == "DONE"
     assert protection.release_problems == [None]
+
+
+# --- Plan 3 Task 10 (R26): the reprotect goal --------------------------------
+
+def _reprotect_stack(tmp_path, *extra):
+    """A 4-share position whose old stop is still sized for 10: re-protect, no reduce."""
+    protection = _Protection(stop_price=95.0, target_price=120.0)
+    stop = _order("stop-old", group="og-aip-d-1", conid=1, leg="stop", total=10.0)
+    s = _stack(tmp_path, [_snapshot(1, [_priced(4.0)], [stop]), _snapshot(1, [_priced(4.0)], [stop]),
+                          _snapshot(2, [_priced(4.0)]), *extra], protection=protection)
+    receipt = s.service.start(ACCOUNT, "r-1", DEADLINE, scope="conid", conid=1, goal="reprotect")
+    return s, protection, receipt
+
+
+def test_reprotect_goal_replaces_oversized_legs_without_a_reduce(tmp_path):
+    s, protection, receipt = _reprotect_stack(tmp_path, _snapshot(3, [_priced(4.0)]), _snapshot(4, [_priced(4.0)]))
+    assert receipt.goal == "reprotect" and [call[0] for call in s.dispatch.calls] == ["cancel"]
+    s.dispatch.entities["stop-old"] = _row("Cancelled")
+    receipt = s.service.rescan()                                          # gen 2: gone -> stop for the 4 held
+    assert (receipt.state, receipt.phase) == ("VERIFYING", "reprotect")
+    assert s.dispatch.calls[-1] == ("place_exit_leg", 1, "stop", 4.0, 95.0, "r-1-reprotect-1-1",
+                                    "r-1-reprotect-stop-1-1")
+    s.dispatch.rows["r-1-reprotect-stop-1-1"] = [_leg_row(total=4.0, group="r-1-reprotect-1-1")]
+    s.service.rescan()                                                    # gen 3: stop works -> target
+    assert s.dispatch.calls[-1][2:5] == ("target", 4.0, 120.0)
+    s.dispatch.rows["r-1-reprotect-target-1-1"] = [_leg_row(total=4.0, group="r-1-reprotect-1-1")]
+    receipt = s.service.rescan()                                          # gen 4: both legs working
+    assert receipt.state == "DONE"
+    assert not [c for c in receipt.children if c.kind == "reduce"]
+    assert not [call for call in s.dispatch.calls if call[0].startswith("reduce")]
+    assert protection.calls[-1][:3] == ("release_after_partial", "r-1", 4.0)
+    assert s.registry.get("r-1").state == "RELEASED" and s.breaker.calls == []
+    assert s.service.close_resolution("r-1").success
+
+
+def test_reprotect_goal_is_refused_without_a_position(tmp_path):
+    s = _stack(tmp_path, [_snapshot(1, [])], protection=_Protection())
+    with pytest.raises(LiquidationRefused) as ex:
+        s.service.start(ACCOUNT, "r-1", DEADLINE, scope="conid", conid=1, goal="reprotect")
+    assert ex.value.code == "NO_POSITION" and s.service.receipt_for("r-1") is None
+
+
+def test_reprotect_never_joins_another_close(tmp_path):
+    s = _stack(tmp_path, [_snapshot(1, [_priced(4.0)])], protection=_Protection())
+    s.service.start(ACCOUNT, "time-exit-1", DEADLINE, scope="conid", conid=1)
+    with pytest.raises(ExitInProgress):
+        s.service.start(ACCOUNT, "r-1", DEADLINE, scope="conid", conid=1, goal="reprotect")
+
+
+def test_a_full_close_upgrades_a_reprotect(tmp_path):
+    s, _, _ = _reprotect_stack(tmp_path)
+    s.service.start(ACCOUNT, "close-1", DEADLINE, scope="conid", conid=1)
+    assert s.service.receipt_for("r-1").goal == "zero"
+    assert s.registry.get("r-1").goal == "zero"
+
+
+def test_a_late_reprotect_escalates_to_a_full_close_and_the_breaker(tmp_path):
+    s, _, _ = _reprotect_stack(tmp_path)
+    s.clock["now"] = DEADLINE + dt.timedelta(seconds=1)
+    receipt = s.service.rescan()
+    assert receipt.goal == "zero" and receipt.escalated
+    assert s.breaker.calls[0][0] == "r-1" and "missed its deadline" in s.breaker.calls[0][1]
+
+
+@pytest.mark.parametrize("kwargs", [{"quantity": 2.0}, {"goal": "shrink"}])
+def test_reprotect_goal_takes_no_quantity_and_goals_are_closed_set(tmp_path, kwargs):
+    s = _stack(tmp_path, [_snapshot(1, [_priced(4.0)])], protection=_Protection())
+    goal = kwargs.pop("goal", "reprotect")
+    with pytest.raises(ValueError):
+        s.service.start(ACCOUNT, "r-1", DEADLINE, scope="conid", conid=1, goal=goal, **kwargs)

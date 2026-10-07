@@ -48,7 +48,11 @@ _SUCCESS_FOR_GOAL = {
     "account": frozenset({"FLAT"}),
     "zero": frozenset({"CLOSED", "FLAT"}),
     "partial": frozenset({"DONE", "CLOSED", "FLAT"}),
+    "reprotect": frozenset({"DONE", "CLOSED", "FLAT"}),
 }
+# A re-protect (R26) owns its conid like a partial close: a full close upgrades it, a partial is refused.
+_OWNER_GOAL = {"reprotect": "partial"}
+GOAL_REPROTECT = "reprotect"
 _FAILURE_CODES = {"FAILED_SAFE": "CLOSE_FAILED_SAFE", "REDUCE_FAILED": "REDUCE_FAILED"}
 
 CHILD_STATES = frozenset({
@@ -798,8 +802,13 @@ class LiquidationService:
 
     def start(self, account_id: str, cause_command_id: str, deadline: dt.datetime, *,
               scope: str = "account", conid: Optional[int] = None, quantity: Optional[float] = None,
-              stop_price: Optional[float] = None, target_price: Optional[float] = None) -> LiquidationReceipt:
-        """Claim, then create or join a root. Returns the receipt of the root the caller must poll."""
+              stop_price: Optional[float] = None, target_price: Optional[float] = None,
+              goal: Optional[str] = None) -> LiquidationReceipt:
+        """Claim, then create or join a root. Returns the receipt of the root the caller must poll.
+
+        ``goal="reprotect"`` (scope conid, no quantity) cancels the conid's working orders and
+        places an exit-only stop (and target) sized to the broker position, with no reduce (R26).
+        """
         if not account_id or not cause_command_id:
             raise ValueError("account_id and cause_command_id are required")
         if ":" in cause_command_id:
@@ -809,9 +818,16 @@ class LiquidationService:
                 raise ValueError("account scope takes no conid or quantity")
             outcome, root = self._store.transaction(
                 lambda conn: self._claim_account_in_tx(conn, account_id, cause_command_id, deadline))
-        elif scope == "conid":
+        elif scope == "conid" and goal == GOAL_REPROTECT:
+            if quantity is not None:
+                raise ValueError("a re-protect takes no quantity: the broker position sizes it")
+            outcome, root = self._claim_reprotect(account_id, cause_command_id, _exact_conid(conid), deadline,
+                                                  stop_price, target_price)
+        elif scope == "conid" and goal is None:
             outcome, root = self._claim_scoped(account_id, cause_command_id, _exact_conid(conid),
                                                _requested_quantity(quantity), deadline, stop_price, target_price)
+        elif scope == "conid":
+            raise ValueError(f"unknown liquidation goal {goal!r}")
         else:
             raise ValueError(f"unknown liquidation scope {scope!r}")
         if outcome in (CLAIMED, "EXISTING"):
@@ -835,6 +851,20 @@ class LiquidationService:
             admitted = self._admit_partial(account_id, conid, requested)
         return self._store.transaction(lambda conn: self._claim_scoped_in_tx(
             conn, account_id, cause, conid, requested, admitted, deadline, stop_price, target_price))
+
+    def _claim_reprotect(self, account_id, cause, conid, deadline, stop_price, target_price):
+        """Never joins: any other owner of the conid or the account already handles its protection."""
+        existing = self._store.transaction(lambda conn: self._existing_in_tx(
+            conn, account_id, cause, conid=conid, goal=GOAL_REPROTECT, quantity=None))
+        if existing is not None:
+            return existing
+        self._store.transaction(lambda conn: self._registry.ensure_partial_allowed_in_tx(conn, account_id, conid))
+        position = self._position_for(self._broker.capture(account_id), conid)
+        if position is None:
+            raise LiquidationRefused("NO_POSITION", f"no position on conid {conid} to re-protect")
+        held = abs(float(position.quantity))
+        return self._store.transaction(lambda conn: self._claim_scoped_in_tx(
+            conn, account_id, cause, conid, None, held, deadline, stop_price, target_price, goal=GOAL_REPROTECT))
 
     def rescan(self) -> Optional[LiquidationReceipt]:
         """Finish pending cleanups, advance every root that is not terminal, then start a
@@ -952,9 +982,10 @@ class LiquidationService:
         self._store.drop_planned_in_tx(conn, root_id, self._now())
 
     def _claim_scoped_in_tx(self, conn, account_id, cause, conid, requested, admitted, deadline,
-                            stop_price, target_price):
+                            stop_price, target_price, goal: Optional[str] = None):
         """The join row keeps the request as it came in; the owner and run get the admitted goal."""
-        goal = "zero" if requested is None else "partial"
+        run_goal = goal or ("zero" if admitted is None else "partial")
+        goal = goal or ("zero" if requested is None else "partial")
         existing = self._existing_in_tx(conn, account_id, cause, conid=conid, goal=goal, quantity=requested)
         if existing is not None:
             return existing
@@ -966,7 +997,7 @@ class LiquidationService:
         if claim.outcome == CLAIMED:
             self._store.insert_run_in_tx(conn, LiquidationReceipt(
                 account_id, cause, "REQUESTED", deadline, scope="conid", conid=conid,
-                goal="zero" if admitted is None else "partial", goal_quantity=admitted,
+                goal=run_goal, goal_quantity=admitted,
                 stop_price=stop_price, target_price=target_price), now)
             self._store.inherit_children_in_tx(conn, account_id=account_id, conid=conid, to_root_id=cause, now=now)
         elif claim.outcome == UPGRADED:
@@ -1048,7 +1079,8 @@ class LiquidationService:
         """R31 / D10: a partial close whose protection is already cancelled escalates once to a
         full close of the live remainder, unless a child is UNKNOWN; everything else is FAILED_SAFE."""
         unknown = any(c.state == "UNKNOWN" for c in self._children_in_force(receipt))
-        if (receipt.scope == "conid" and receipt.goal == "partial" and not receipt.escalated and not unknown
+        if (receipt.scope == "conid" and receipt.goal in ("partial", GOAL_REPROTECT) and not receipt.escalated
+                and not unknown
                 and receipt.phase in ("cancel", "reduce", "reprotect")):
             label = "REPROTECT_DEADLINE" if receipt.phase == "reprotect" else "PARTIAL_DEADLINE"
             self._escalate(receipt, f"{label}: the partial close missed its deadline in phase {receipt.phase}")
@@ -1461,7 +1493,7 @@ class LiquidationService:
             raise _StaleDispatch(f"root {root_id} is no longer open")
         if owner is None or owner.state != STATE_ACTIVE:
             raise _StaleDispatch(f"root {root_id} no longer owns its scope")
-        if run.goal != goal or owner.goal != run.goal:
+        if run.goal != goal or owner.goal != _OWNER_GOAL.get(run.goal, run.goal):
             raise _StaleDispatch(f"root {root_id} goal is {run.goal} (owner {owner.goal}), not {goal}")
 
     def _reserve(self, receipt, build) -> Optional[list]:
@@ -1670,6 +1702,8 @@ class LiquidationService:
                 receipt, "CLOSED", generation=generation,
                 detail="fresh broker generation shows no position and no working orders for conid",
                 still_true=lambda held: self._exposure_since_decision(receipt, held))
+        if receipt.goal == GOAL_REPROTECT:
+            return self._start_reprotect(receipt, snapshot, position)
         if receipt.goal == "partial":
             own = [c for c in receipt.children if c.kind == "reduce" and c.root_id == receipt.cause_command_id]
             if any(c.state in ("FILLED", "CANCELLED", "REJECTED", "ABSENT") for c in own):
@@ -2014,6 +2048,8 @@ class LiquidationService:
 
     def _partial_outcome(self, receipt) -> str:
         """R25 / D4: protection restored is not the requested reduction. Only a proven fill is DONE."""
+        if receipt.goal == GOAL_REPROTECT:
+            return "DONE"  # nothing was to be sold: protection restored is the goal (R26)
         sold = sum(c.filled_quantity for c in receipt.children
                    if c.kind == "reduce" and c.root_id == receipt.cause_command_id and c.state != "ABSENT")
         return "DONE" if sold > 0 else "REDUCE_FAILED"

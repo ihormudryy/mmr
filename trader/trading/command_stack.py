@@ -550,6 +550,16 @@ def _ai_paper_guard_options(parts: Optional[_AiPaperParts]) -> dict:
     }
 
 
+def _build_ai_entry_cutoff(parts: Optional[_AiPaperParts], *, broker: Any, cancel: Any, liquidation: Any,
+                           account_id: str, now: Callable[[], dt.datetime]) -> Optional[Any]:
+    """R26: AI entries are cancelled at the entry cutoff, and a partial fill is re-protected."""
+    if parts is None:
+        return None
+    from trader.automation.ai_entry_cutoff import AiEntryCutoff
+    return AiEntryCutoff(broker=broker, cancel=cancel, liquidation=liquidation, policy=parts.policy,
+                         account_id=account_id, now=now)
+
+
 def _build_ai_paper_services(
     trader: Any, parts: Optional[_AiPaperParts], *, ledger: CommandLedger, journal: Any,
     controls: TradingControlStore, broker: Any, quotes: Any, margin: Any, policy: CommandAuthorityPolicy,
@@ -1088,6 +1098,10 @@ def build_command_stack(
         apply_session_controller_migration,
     )
     apply_session_controller_migration(migrator)
+    ai_entry_cutoff = _build_ai_entry_cutoff(
+        ai_paper_parts, broker=broker_snapshot, cancel=_LiquidationDispatch(dispatch, orders_view),
+        liquidation=liquidation_service, account_id=trader.ib_account, now=now,
+    )
     session_controller = SessionController(
         journal=journal,
         db=trader.journal_db,
@@ -1099,6 +1113,7 @@ def build_command_stack(
         time_exit=SessionTimeExitAdapter(liquidation_service, account_id=trader.ib_account, now=now),
         account_id=trader.ib_account,
         now=now,
+        on_entry_cutoff=None if ai_entry_cutoff is None else ai_entry_cutoff.on_entry_cutoff,
     )
     # P3 Task 7 — authoritative attribution ledger; broker_ingest appends evidence.
     from trader.automation.attribution import AttributionLedger

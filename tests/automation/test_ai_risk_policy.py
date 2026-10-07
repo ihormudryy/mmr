@@ -245,8 +245,8 @@ def test_revisions_are_append_only(db):
 def test_cutoff_cancel_state_only_moves_forward(db):                             # R26 column
     s = svc(db)
     view = s.ensure_session(broker(1_000_000, 0))
-    s.set_cutoff_cancel_state(view.session_date, "ISSUED")
-    s.set_cutoff_cancel_state(view.session_date, "DONE")
+    s.set_cutoff_cancel_state(view.session_date, "ISSUED", generation=7)
+    s.set_cutoff_cancel_state(view.session_date, "DONE", generation=8)
     with pytest.raises(ValueError):
-        s.set_cutoff_cancel_state(view.session_date, "ISSUED")
-    assert s.current().cutoff_cancel_state == "DONE"
+        s.set_cutoff_cancel_state(view.session_date, "ISSUED", generation=9)
+    assert (s.current().cutoff_cancel_state, s.current().cutoff_cancel_generation) == ("DONE", 8)

@@ -136,9 +136,33 @@ def _entries(payload: Any, key: str, numbers: tuple[str, ...]) -> list[dict]:
 def _articles(payload: Any) -> list[dict]:
     if not isinstance(payload, dict) or not isinstance(payload.get("news"), list):
         raise _MalformedPayload("news is missing or not a list")
-    if not all(isinstance(article, dict) for article in payload["news"]):
-        raise _MalformedPayload("a news article is not an object")
+    if not all(_usable_article(article) for article in payload["news"]):
+        raise _MalformedPayload("a news article has no id, headline, source or time with an offset")
     return payload["news"]
+
+
+def _text(value: Any) -> bool:
+    return isinstance(value, str) and bool(value.strip())
+
+
+def _usable_article(article: Any) -> bool:
+    """Alpaca always sends id, headline, source and created_at; url and summary may be empty or absent."""
+    if not isinstance(article, dict):
+        return False
+    article_id = article.get("id")
+    has_id = _text(article_id) or (type(article_id) is int and article_id > 0)
+    optional_text = all(article.get(name) is None or isinstance(article.get(name), str) for name in ("url", "summary"))
+    return (has_id and _text(article.get("headline")) and _text(article.get("source"))
+            and _aware_time(article.get("created_at")) and optional_text)
+
+
+def _aware_time(value: Any) -> bool:
+    if not isinstance(value, str):
+        return False
+    try:
+        return dt.datetime.fromisoformat(value.replace("Z", "+00:00")).utcoffset() is not None
+    except ValueError:
+        return False
 
 
 def _as_of(payload: dict) -> Optional[str]:

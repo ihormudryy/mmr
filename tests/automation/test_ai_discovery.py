@@ -274,3 +274,40 @@ def test_a_malformed_news_reply_is_a_failed_symbol(reader, payload):          # 
     assert by["AAPL"].news_status == "FAILED" and by["AAPL"].news == []
     assert "AAPL" in out.coverage.news.failed_symbols and out.coverage.complete is False
     assert by["SPY"].news_status == "OK"                                      # one symbol's failure stays its own
+
+
+# --- review round 2 (PR #83 thread 4210056050): an unusable article is never a news success ----------
+
+@pytest.mark.parametrize("article", [
+    {},
+    {k: v for k, v in ARTICLE.items() if k != "headline"},
+    {**ARTICLE, "headline": "  "},
+    {**ARTICLE, "created_at": "yesterday"},
+    {**ARTICLE, "created_at": "2026-07-17T14:00:00"},                       # no offset
+    {**ARTICLE, "id": ""}, {**ARTICLE, "id": True},
+    {**ARTICLE, "source": ""},
+    {**ARTICLE, "url": 7}, {**ARTICLE, "summary": ["s"]},
+], ids=["empty", "no-title", "blank-title", "bad-time", "naive-time", "blank-id", "bool-id", "no-source",
+        "url-not-text", "summary-not-text"])
+def test_an_unusable_article_fails_its_symbol(reader, article):
+    r = reader()
+    r.session.news = {"AAPL": {"news": [ARTICLE, article]}}
+    r.session.raw_news = True
+    out = r.read(request(r.digest))
+    by = {c.symbol: c for c in out.candidates}
+    assert by["AAPL"].news_status == "FAILED" and by["AAPL"].news == []
+    assert "AAPL" in out.coverage.news.failed_symbols and out.coverage.complete is False
+
+
+@pytest.mark.parametrize("article", [
+    ARTICLE, {**ARTICLE, "summary": ""}, {k: v for k, v in ARTICLE.items() if k not in ("url", "summary")},
+    {**ARTICLE, "url": None}, {**ARTICLE, "id": "62152341"}, {**ARTICLE, "created_at": "2026-07-17T14:00:00-04:00"},
+], ids=["full", "empty-summary", "no-url-no-summary", "null-url", "text-id", "offset-time"])
+def test_a_usable_article_is_kept(reader, article):
+    r = reader()
+    r.session.news = {"AAPL": {"news": [article]}}
+    r.session.raw_news = True
+    out = r.read(request(r.digest))
+    (item,) = {c.symbol: c for c in out.candidates}["AAPL"].news
+    assert item.title == ARTICLE["headline"] and item.id and item.published and item.source == "alpaca/benzinga"
+    assert out.coverage.news.failed_symbols == []

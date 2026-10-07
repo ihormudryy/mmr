@@ -224,7 +224,7 @@ class MMRConfig:
     @staticmethod
     def from_yaml(path: str) -> 'MMRConfig':
         with open(path, 'r') as f:
-            raw: Dict[str, Any] = yaml.load(f, Loader=yaml.FullLoader) or {}
+            raw: Dict[str, Any] = yaml.safe_load(f) or {}
 
         config = MMRConfig()
         config.config_file = path

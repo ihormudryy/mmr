@@ -117,6 +117,8 @@ class ApprovalContext:
     what_if: Optional[WhatIfEvidence]
     allocation: Optional[AllocationDispatchEvidence] = None
     entry_limits: Optional[EntryLimitsEvidence] = None
+    # SP2 Plan 3: a discretionary entry's admission evidence, re-checked at dispatch.
+    discretionary_scope: Optional[Any] = None
 
     def notional(self, quantity: float) -> float:
         if self.market is None:

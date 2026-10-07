@@ -44,6 +44,7 @@ from trader.trading.command_policy import CommandAuthorityPolicy
 from trader.trading.dispatch_guard import DispatchGuard
 from trader.trading.exit_owner import ExitOwnerRegistry, apply_exit_owner_migration
 from trader.trading.liquidation_service import apply_liquidation_migration
+from trader.trading.quote_feeds import LIVE_ONLY_FEEDS
 from trader.trading.trading_control import TradingControlStore, apply_trading_control_migration
 
 GOOD_MARGIN = {"initMarginAfter": 5_000.0, "equityWithLoanAfter": 995_000.0}
@@ -118,10 +119,17 @@ class Quotes:
     def __init__(self, clock):
         self.clock = clock
         self.age = 0.0
+        self.changes: dict = {}
+
+    def set(self, **changes) -> None:
+        """ExecutableQuote fields for every later quote; the price follows the ask."""
+        self.changes.update(changes)
+        if "ask" in changes:
+            self.changes["price"] = changes["ask"]
 
     def executable_quote(self, conid, *, side):
         return replace(quote(conid=conid, age=self.age), side=side,
-                       market_timestamp=self.clock() - dt.timedelta(seconds=self.age))
+                       market_timestamp=self.clock() - dt.timedelta(seconds=self.age), **self.changes)
 
 
 class Margin:
@@ -197,8 +205,10 @@ class FilterFile:
 
 
 class World:
-    def __init__(self, tmp_path: Path, *, real_liquidation: bool = False):
+    def __init__(self, tmp_path: Path, *, real_liquidation: bool = False,
+                 accepted_feeds: frozenset[str] = LIVE_ONLY_FEEDS):
         self.clock = Clock()
+        self.accepted_feeds = accepted_feeds
         self.db = DuckDBConnection.get_instance(str(tmp_path / "journal.duckdb"))
         migrator = SchemaMigrator(self.db)
         self.journal = DomainJournal(self.db)
@@ -236,7 +246,7 @@ class World:
             broker=self.broker, quotes=self.quotes, margin=self.margin,
             history=make_history(str(tmp_path / "history.duckdb")), journal=self.journal,
             account_id=ACCOUNT, account_mode="paper", now=self.clock, max_drift_bps=50.0,
-            entry_offset_bps=Decimal("10"), entry_filter=self.entry_filter))
+            entry_offset_bps=Decimal("10"), entry_filter=self.entry_filter, accepted_feeds=accepted_feeds))
         self.guard = DispatchGuard(
             broker=self.broker, quotes=self.quotes, margin=self.margin, controls=self.controls,
             risk_gate=self.risk_gate, policy=CommandAuthorityPolicy(
@@ -246,7 +256,7 @@ class World:
             current_limits=lambda request: (self.policy.effective_limits() if request.action == AI_PAPER_ACTION
                                             else PAPER_LIMITS),
             ai_entry_gate=ai_entry_gate(entry_filter=self.entry_filter),
-            strict_margin_actions=frozenset({AI_PAPER_ACTION}))
+            strict_margin_actions=frozenset({AI_PAPER_ACTION}), accepted_feeds=accepted_feeds)
         self.liquidation = (self._real_liquidation() if real_liquidation
                             else SimpleNamespace(start=lambda *a, **k: None))
         self.saga = ProtectiveOrderSaga(

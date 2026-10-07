@@ -15,8 +15,9 @@ from typing import Any, Callable, Mapping, Optional
 
 from trader.automation.liquidity_policy import MIN_MEDIAN_DOLLAR_VOLUME
 from trader.automation.production_evidence import TwentySessionVolume
-from trader.automation.scope_evidence import ContractEvidence
+from trader.automation.scope_evidence import ContractEvidence, ScopeEvidenceUnavailable
 from trader.data.schema_migrations import SchemaMigrator
+from trader.research.market_context import LIVE_NOTIONAL_TOLERANCE
 from trader.trading.dispatch_guard import MAX_QUOTE_AGE_SECONDS, MAX_SOURCE_CLOCK_SKEW_SECONDS
 
 OUT_OF_DISCRETIONARY_SCOPE = "OUT_OF_DISCRETIONARY_SCOPE"
@@ -201,3 +202,77 @@ class ScopeCheckStore:
         if row is None:
             return None
         return {"part": row[0], "reason": row[1], "phase": phase, "check_id": f"{phase}:{command_id}"}
+
+
+# ---------------------------------------------------------------------------
+# Admission (ruling 8): fresh IB details, a fresh quote, the volume window
+# ---------------------------------------------------------------------------
+
+@dataclass(frozen=True)
+class DiscretionaryScopeEvidence:
+    """What admission proved; carried on the approval so dispatch re-checks without an IB or history read."""
+    deployment_digest: str
+    rule: Any
+    contract: ContractEvidence
+    volume: TwentySessionVolume
+
+
+@dataclass(frozen=True)
+class AdmissionScope:
+    evidence: DiscretionaryScopeEvidence
+    attested_notional: float
+
+
+class ScopeRefused(Exception):
+    def __init__(self, detail: dict):
+        super().__init__(OUT_OF_DISCRETIONARY_SCOPE)
+        self.detail = detail
+
+
+class DiscretionaryScopeService:
+    """Ruling 8 at admission: fresh IB contract details, a fresh quote from the quote authority and the volume
+    source. ``quotes`` and ``accepted_feeds`` are the command stack's own (Ruling 4, PR #76)."""
+
+    def __init__(self, *, contracts: Any, volumes: Any, quotes: Any, accepted_feeds: frozenset[str],
+                 filter_refusal: FilterRefusal, checks: ScopeCheckStore, now: Callable[[], dt.datetime]):
+        self._contracts, self._volumes, self._quotes = contracts, volumes, quotes
+        self._accepted_feeds = frozenset(accepted_feeds)
+        self._filter_refusal, self._checks, self._now = filter_refusal, checks, now
+
+    @property
+    def checks(self) -> ScopeCheckStore:
+        return self._checks
+
+    def check_admission(self, *, command_id: str, digest: str, deployment: Any, conid: int) -> AdmissionScope:
+        missing: list[str] = []
+        # Order matters: the contract read remembers the conid in the universe, which the quote read needs.
+        contract = self._fetch(lambda: self._contracts.by_conid(conid), missing)
+        volume = None if contract is None else self._fetch(
+            lambda: self._volumes.twenty_sessions(conid, contract.symbol), missing)
+        quote = self._fetch(lambda: self._quotes.executable_quote(conid, side="BUY"), missing)
+        rule = deployment.scope_rule
+        verdict = evaluate_scope(rule, ScopeInputs(contract, quote, volume, None, self._filter_refusal,
+                                                   self._accepted_feeds, tuple(missing)), self._now())
+        detail = self._checks.record(command_id=command_id, phase="admission", deployment_digest=digest,
+                                     conid=conid, verdict=verdict)
+        if not verdict.passed:
+            raise ScopeRefused(detail)
+        cap = rule.max_order_share_of_dollar_volume * volume.median_dollar_volume
+        # Ruling 7: SP1 adds LIVE_NOTIONAL_TOLERANCE to the attested notional; this keeps the bound at the cap.
+        return AdmissionScope(DiscretionaryScopeEvidence(digest, rule, contract, volume),
+                              cap / (1.0 + LIVE_NOTIONAL_TOLERANCE))
+
+    def refuse_size(self, *, command_id: str, scope: AdmissionScope, conid: int, reason: str) -> dict:
+        verdict = ScopeVerdict("liquidity", reason, {"volume": scope.evidence.volume.to_json()})
+        return self._checks.record(command_id=command_id, phase="sizing",
+                                   deployment_digest=scope.evidence.deployment_digest, conid=conid, verdict=verdict)
+
+    @staticmethod
+    def _fetch(read: Callable[[], Any], missing: list[str]) -> Any:
+        try:
+            return read()
+        except ScopeEvidenceUnavailable as ex:
+            missing.append(ex.reason)
+        except Exception as ex:
+            missing.append(f"evidence read failed: {type(ex).__name__}")
+        return None

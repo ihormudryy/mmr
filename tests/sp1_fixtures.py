@@ -536,7 +536,8 @@ class SimMargin:
 
 class Composed:
     def __init__(self, tmp_path, loop_thread, clock, *, automation=False, sim=None, ai_paper=False,
-                 kill_pct=None, acceptance_probe=False, identities=None, telegram=None, market=False):
+                 kill_pct=None, acceptance_probe=False, identities=None, telegram=None, market=False,
+                 model_budget_usd_per_day=None):
         from trader.trading.command_stack import build_command_stack
 
         db = DuckDBConnection.get_instance(str(tmp_path / "journal.duckdb"))
@@ -573,6 +574,8 @@ class Composed:
                 section["experiment_kill_drawdown_pct"] = kill_pct
             if telegram is not None:
                 section["telegram"] = telegram
+            if model_budget_usd_per_day is not None:      # the owner's cap, as trader.yaml would set it
+                section["model_budget_usd_per_day"] = model_budget_usd_per_day
             trader.ai_paper_config = load_ai_paper_config(section, trading_mode="paper")
         if market:
             patches = self._play_the_market(tmp_path, identities)

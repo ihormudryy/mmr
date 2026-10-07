@@ -565,3 +565,158 @@ def test_ai_paper_migrations_are_applied(tmp_path):
     stack, trader = _ai_stack(tmp_path, enabled=False)
     versions = {row[0] for row in trader.journal_db.execute("SELECT version FROM schema_migrations", fetch="all")}
     assert {54, 55, 56} <= versions
+
+
+# --- Issue #74: paper-only Alpaca IEX quote fallback ---------------------------
+
+IEX_FEEDS = frozenset({"live", "iex_realtime"})
+LIVE_FEEDS = frozenset({"live"})
+
+
+class _RecordingAlpacaClient:
+    """Stands in for AlpacaClient: records construction and every request; no network."""
+
+    built: list = []
+    requests: list = []
+
+    def __init__(self, key_id, secret_key, **kwargs):
+        type(self).built.append((key_id, secret_key, kwargs))
+
+    def get_json(self, path, params):
+        type(self).requests.append((path, dict(params)))
+        return {"quotes": {}}
+
+
+@pytest.fixture
+def alpaca(monkeypatch):
+    import trader.data_providers.alpaca.client as client_module
+
+    _RecordingAlpacaClient.built, _RecordingAlpacaClient.requests = [], []
+    monkeypatch.setattr(client_module, "AlpacaClient", _RecordingAlpacaClient)
+    return _RecordingAlpacaClient
+
+
+def _fallback_trader(tmp_path, *, paper=True, setting="alpaca_iex", key_id="key-id", secret="key-secret"):
+    trader = _trader(tmp_path)
+    if not paper:
+        trader.ib_account, trader.paper_trading = "U111111", False
+    trader.automation_quote_fallback = setting
+    trader.alpaca_api_key_id = key_id
+    trader.alpaca_api_secret_key = secret
+    return trader
+
+
+def _live_policy():
+    return CommandAuthorityPolicy(enabled=True, live_enabled=True, live_account_id="U111111",
+                                  max_order_notional=25_000.0)
+
+
+def _accepted_feeds_of(stack):
+    return {"guard": stack.dispatch_guard._accepted_feeds,
+            "liquidity": stack.session_risk._liquidity._accepted_feeds}
+
+
+def test_paper_with_the_setting_wraps_quotes_and_accepts_the_iex_feed(tmp_path, alpaca):
+    from trader.trading.command_stack import build_command_stack
+    from trader.trading.paper_quote_fallback import FallbackQuoteAuthority
+
+    stack = build_command_stack(_fallback_trader(tmp_path), _policy(), now=lambda: NOW)
+
+    assert isinstance(stack.dispatch_guard._quotes, FallbackQuoteAuthority)
+    assert stack.proposal_service._quotes is stack.dispatch_guard._quotes
+    assert _accepted_feeds_of(stack) == {"guard": IEX_FEEDS, "liquidity": IEX_FEEDS}
+    assert alpaca.built == [("key-id", "key-secret", {"timeout": 3.0})]
+
+
+def test_paper_without_the_setting_keeps_ib_quotes_and_the_live_feed_only(tmp_path, alpaca):
+    from trader.trading.command_ports import TraderQuoteAuthority
+    from trader.trading.command_stack import build_command_stack
+
+    stack = build_command_stack(_fallback_trader(tmp_path, setting=""), _policy(), now=lambda: NOW)
+
+    assert isinstance(stack.dispatch_guard._quotes, TraderQuoteAuthority)
+    assert _accepted_feeds_of(stack) == {"guard": LIVE_FEEDS, "liquidity": LIVE_FEEDS}
+    assert alpaca.built == []
+
+
+def test_a_live_account_never_builds_or_calls_alpaca_even_with_the_setting(tmp_path, alpaca, monkeypatch):
+    from trader.trading.command_ports import TraderQuoteAuthority
+    from trader.trading.command_stack import build_command_stack
+    from trader.trading.proposal_command_service import ExecutableQuote
+
+    delayed = ExecutableQuote(conid=265598, side="ask", price=1.0, market_timestamp=NOW,
+                              feed_type="delayed", session_state="continuous", bid=1.0, ask=1.0)
+    monkeypatch.setattr(TraderQuoteAuthority, "executable_quote", lambda *_, **__: delayed)
+    stack = build_command_stack(_fallback_trader(tmp_path, paper=False), _live_policy(), now=lambda: NOW)
+
+    assert stack.dispatch_guard._quotes.executable_quote(265598, side="ask") is delayed
+    assert isinstance(stack.dispatch_guard._quotes, TraderQuoteAuthority)
+    assert _accepted_feeds_of(stack) == {"guard": LIVE_FEEDS, "liquidity": LIVE_FEEDS}
+    assert alpaca.built == [] and alpaca.requests == []
+
+
+@pytest.mark.parametrize(("key_id", "secret"), [("", "key-secret"), ("key-id", ""), ("  ", "  ")])
+def test_paper_with_the_setting_and_blank_keys_fails_loudly(tmp_path, alpaca, key_id, secret):
+    from trader.trading.command_stack import CommandStackConfigurationError, build_command_stack
+
+    with pytest.raises(CommandStackConfigurationError) as exc:
+        build_command_stack(_fallback_trader(tmp_path, key_id=key_id, secret=secret), _policy(),
+                            now=lambda: NOW)
+    assert exc.value.code == "QUOTE_FALLBACK_KEYS_MISSING"
+    assert "key-id" not in str(exc.value) and "key-secret" not in str(exc.value)
+
+
+@pytest.mark.parametrize("setting", ["alpaca", "ALPACA_IEX", "iex"])
+def test_an_unknown_setting_fails_loudly(tmp_path, alpaca, setting):
+    from trader.trading.command_stack import CommandStackConfigurationError, build_command_stack
+
+    with pytest.raises(CommandStackConfigurationError) as exc:
+        build_command_stack(_fallback_trader(tmp_path, setting=setting), _policy(), now=lambda: NOW)
+    assert exc.value.code == "QUOTE_FALLBACK_INVALID"
+
+
+def test_the_automated_intent_evidence_gets_the_iex_set(tmp_path, alpaca):
+    from trader.trading.command_stack import build_command_stack
+
+    trader = _fallback_trader(tmp_path)
+    trader.automation_enabled = True
+    trader.automation_live_enabled = False
+    trader.automation_strategy_name = "qualified-paper-strategy"
+    trader.automation_public_key_ring_path = _automation_key_ring(tmp_path)
+    trader.automation_artifact_bundle_path = str(tmp_path / "artifacts")
+    trader.automation_expected_artifact_id = "artifact-test-1"
+    (tmp_path / "artifacts").mkdir()
+
+    stack = build_command_stack(trader, _policy(), now=lambda: NOW)
+
+    evidence = stack.automated_intent_service._approval_factory.__self__
+    assert evidence._accepted_feeds == IEX_FEEDS
+    assert evidence._quotes is stack.dispatch_guard._quotes
+
+
+def test_the_hot_armed_automated_intent_evidence_gets_the_iex_set(tmp_path, alpaca):
+    from trader.trading.command_stack import build_command_stack
+
+    trader = _fallback_trader(tmp_path)
+    stack = build_command_stack(trader, _policy(), now=lambda: NOW)
+    stack.paper_hot_arm.attach_registry(build_production_registry(
+        trader, make_identities()["trader"], command_stack=stack))
+    stack.paper_hot_arm.trader_commit(
+        strategy_name="qualified-paper-strategy", artifact_id="artifact-test-1",
+        artifact_bundle_path=str(tmp_path / "bundle"),
+        public_key_ring_path=_automation_key_ring(tmp_path),
+    )
+
+    assert stack.automated_intent_service._approval_factory.__self__._accepted_feeds == IEX_FEEDS
+
+
+def test_the_ai_paper_evidence_gets_the_iex_set(tmp_path, alpaca):
+    from trader.automation.ai_paper_config import AiPaperConfig
+    from trader.trading.command_stack import build_command_stack
+
+    trader = _fallback_trader(tmp_path)
+    trader.ai_paper_config = AiPaperConfig(enabled=True)
+    stack = build_command_stack(trader, _policy(), now=lambda: NOW)
+
+    assert stack.ai_paper.decisions._evidence._accepted_feeds == IEX_FEEDS
+    assert stack.ai_paper.decisions._evidence._quotes is stack.dispatch_guard._quotes

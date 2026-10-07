@@ -66,6 +66,12 @@ def test_sends_auth_headers_and_timeout():
     assert sent['timeout'] == 30
 
 
+def test_a_shorter_timeout_can_be_set():
+    session = FakeSession([FakeResponse(200, {'ok': True})])
+    AlpacaClient('kid', 'secret', session=session, limiter=NoWaitLimiter(), timeout=3.0).get_json('/v2/x', {})
+    assert session.requests[0]['timeout'] == 3.0
+
+
 def test_403_raises_entitlement_error_with_message():
     client, _ = _client(FakeResponse(403, {'message': 'subscription does not permit querying recent SIP data'}))
     with pytest.raises(ProviderEntitlementError, match='recent SIP data'):

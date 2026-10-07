@@ -168,3 +168,26 @@ def test_monotonic_lowering_depth_cannot_approve_after_reject(depth, qty):
     lo = policy.evaluate(quantity, evidence_lo, now=NOW)
     if not hi.approved:
         assert not lo.approved
+
+
+# --- Issue #74: the accepted-feed set is explicit -------------------------------
+
+IEX_FEEDS = frozenset({"live", "iex_realtime"})
+
+
+def test_the_default_policy_refuses_the_iex_feed():
+    decision = LiquidityPolicy().evaluate(Decimal("100"), _evidence(feed_type="iex_realtime"), now=NOW)
+    assert decision.reason_codes == ("FEED_NOT_LIVE",)
+
+
+def test_a_policy_with_the_iex_set_accepts_the_iex_feed():
+    policy = LiquidityPolicy(accepted_feeds=IEX_FEEDS)
+    assert policy.evaluate(Decimal("100"), _evidence(feed_type="iex_realtime"), now=NOW).approved
+
+
+def test_the_iex_set_still_refuses_a_wide_spread_and_a_delayed_feed():
+    policy = LiquidityPolicy(accepted_feeds=IEX_FEEDS)
+    wide = policy.evaluate(Decimal("100"), _evidence(feed_type="iex_realtime", spread_bps=15.01), now=NOW)
+    delayed = policy.evaluate(Decimal("100"), _evidence(feed_type="delayed"), now=NOW)
+    assert wide.reason_codes == ("SPREAD_BPS",)
+    assert delayed.reason_codes == ("FEED_NOT_LIVE",)

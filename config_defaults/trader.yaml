@@ -154,6 +154,11 @@ automation:
   public_key_ring_path: ''
   expected_artifact_id: ''
   strategy_name: ''
+  # Paper only. When IB has no live quote (for example only delayed data, IB
+  # error 354), use Alpaca's free real-time IEX quote, labelled iex_realtime.
+  # Needs ALPACA_API_KEY_ID / ALPACA_API_SECRET_KEY. Empty = off. A live
+  # account ignores it. Any other value stops the trader at startup.
+  # quote_fallback: alpaca_iex
 
 # AI paper experiment (SP1). Owner-only: no AI principal can change this block.
 # limits_ceiling caps every AI risk policy. Empty = today's paper limits. Only

@@ -122,6 +122,7 @@ class Container():
         self.configuration['automation_public_key_ring_path'] = self.mmr_config.automation.public_key_ring_path
         self.configuration['automation_expected_artifact_id'] = self.mmr_config.automation.expected_artifact_id
         self.configuration['automation_strategy_name'] = self.mmr_config.automation.strategy_name
+        self.configuration['automation_quote_fallback'] = self.mmr_config.automation.quote_fallback
         # Live propose bridge (hybrid design R2): strategy_service arms
         # SignalProposer for LIVE only when command_authority is enabled AND
         # live_enabled. Nested command_authority: is read from raw YAML.

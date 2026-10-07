@@ -44,11 +44,12 @@ def _snapshot(*, generation=2, cursor=20, quantity=10.0, mode="paper"):
 
 
 def _quote(*, price=210.0, age=0.0, feed="live", state="continuous",
-           bid=209.5, ask=210.0):
+           bid=209.9, ask=210.0, bid_size=10_000.0, ask_size=10_000.0):
     return ExecutableQuote(
         conid=CONID, side="ask", price=price,
         market_timestamp=NOW - dt.timedelta(seconds=age),
         feed_type=feed, session_state=state, bid=bid, ask=ask,
+        bid_size=bid_size, ask_size=ask_size,
     )
 
 
@@ -603,3 +604,118 @@ def test_unknown_broker_pnl_refuses_the_entry(field):
     with pytest.raises(DispatchGuardError) as caught:
         guard.revalidate(_anchored_approval(), _ai_request(), NOW)
     assert caught.value.code == "LOSS_STATE_UNKNOWN"
+
+
+# --- Issue #74: the accepted-feed set is explicit -------------------------------
+
+IEX_FEEDS = frozenset({"live", "iex_realtime"})
+
+
+def _iex_quote(**changes):
+    return replace(_quote(feed="iex_realtime"), **changes)
+
+
+def _feed_guard(quote, *, mode="paper", feeds=IEX_FEEDS):
+    guard = _guard(mode=mode, quote=quote)
+    return DispatchGuard(
+        broker=guard._broker, quotes=guard._quotes, margin=guard._margin, controls=guard._controls,
+        risk_gate=guard._risk_gate, policy=guard._policy, account_id=ACCOUNT, account_mode=mode,
+        accepted_feeds=feeds,
+    )
+
+
+def test_the_default_guard_refuses_an_iex_quote_for_an_automated_entry():
+    with pytest.raises(DispatchGuardError) as caught:
+        _guard(quote=_iex_quote()).revalidate(_approved(), _automated_request(), NOW)
+    assert caught.value.code == "FEED_NOT_LIVE"
+
+
+def test_a_paper_guard_with_the_iex_set_dispatches_on_an_iex_quote():
+    permit = _feed_guard(_iex_quote()).revalidate(_approved(), _automated_request(), NOW)
+    assert permit.quote_timestamp == NOW
+
+
+@pytest.mark.parametrize(("quote", "code"), [
+    (_iex_quote(market_timestamp=NOW - dt.timedelta(seconds=6)), "QUOTE_STALE"),
+    (_iex_quote(bid=210.5, ask=210.0), "CROSSED_MARKET"),
+    (_iex_quote(session_state="closed"), "SESSION_INCOMPATIBLE"),
+    (_quote(feed="delayed"), "FEED_NOT_LIVE"),
+])
+def test_iex_quotes_meet_the_unchanged_market_checks(quote, code):
+    with pytest.raises(DispatchGuardError) as caught:
+        _feed_guard(quote).revalidate(_approved(), _automated_request(), NOW)
+    assert caught.value.code == code
+
+
+def test_a_live_account_guard_cannot_accept_the_iex_feed():
+    with pytest.raises(ValueError, match="only the live feed"):
+        _feed_guard(_iex_quote(), mode="live")
+
+
+# --- PR #76 review: IB halt veto, and spread and depth on the final quote -------
+
+def _fallback_guard(ib_quote, iex_quote):
+    from trader.trading.paper_quote_fallback import FallbackQuoteAuthority
+
+    guard = _feed_guard(ib_quote)
+    guard._quotes = FallbackQuoteAuthority(_Quotes(ib_quote), _Quotes(iex_quote), account_mode="paper")
+    return guard
+
+
+@pytest.mark.parametrize(("ib_quote", "code"), [
+    (_quote(feed="delayed", state="halted"), "FEED_NOT_LIVE"),
+    (_quote(feed="live", state="halted"), "SESSION_INCOMPATIBLE"),
+])
+def test_an_ib_halt_vetoes_a_fresh_iex_quote_at_dispatch(ib_quote, code):   # thread 4208684073
+    guard = _fallback_guard(ib_quote, _iex_quote())
+    assert guard._quotes.executable_quote(CONID, side="ask").session_state == "halted"
+    with pytest.raises(DispatchGuardError) as caught:
+        guard.revalidate(_approved(), _automated_request(), NOW)
+    assert caught.value.code == code
+
+
+def _wide(quote):
+    return replace(quote, bid=200.0)            # (210 - 200) / 210 = 476 bps; approved at 10 bps
+
+
+def _no_depth(quote):
+    return replace(quote, ask_size=0.0)
+
+
+def _unknown_depth(quote):
+    return replace(quote, ask_size=None)
+
+
+def _approved_at_10_bps(mode="paper"):
+    return _approved(mode=mode, quote=_quote(bid=209.79))
+
+
+@pytest.mark.parametrize(("change", "code"), [
+    (_wide, "SPREAD_BPS"), (_no_depth, "DEPTH_EXCEEDED"), (_unknown_depth, "DEPTH_EXCEEDED"),
+])
+@pytest.mark.parametrize("final", [_quote(), _iex_quote()], ids=["ib_live", "iex"])
+def test_automated_entry_rechecks_spread_and_depth_on_the_final_quote(final, change, code):  # thread 4208690152
+    with pytest.raises(DispatchGuardError) as caught:
+        _feed_guard(change(final)).revalidate(_approved_at_10_bps(), _automated_request(), NOW)
+    assert caught.value.code == code
+    assert caught.value.retryable is True
+
+
+@pytest.mark.parametrize(("change", "code"), [(_wide, "SPREAD_BPS"), (_no_depth, "DEPTH_EXCEEDED")])
+def test_live_entry_rechecks_spread_and_depth_on_the_final_quote(change, code):
+    guard = _guard(mode="live", quote=change(_quote()), margin={"initMarginAfter": 1000.0})
+    with pytest.raises(DispatchGuardError) as caught:
+        guard.revalidate(_approved_at_10_bps(mode="live"), _request(), NOW)
+    assert caught.value.code == code
+
+
+def test_depth_must_cover_the_whole_order():
+    with pytest.raises(DispatchGuardError) as caught:
+        _feed_guard(_quote(ask_size=4.0)).revalidate(_approved(quantity=5.0), _automated_request(), NOW)
+    assert caught.value.code == "DEPTH_EXCEEDED"
+    assert _feed_guard(_quote(ask_size=5.0)).revalidate(_approved(quantity=5.0), _automated_request(), NOW)
+
+
+@pytest.mark.parametrize("change", [_wide, _no_depth, _unknown_depth])
+def test_manual_paper_proposals_keep_todays_quote_rules(change):
+    assert _guard(quote=change(_quote())).revalidate(_approved_at_10_bps(), _request(), NOW)

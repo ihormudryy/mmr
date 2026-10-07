@@ -872,6 +872,7 @@ def _live_quote():
     return ExecutableQuote(
         conid=CONID, side="ask", price=160.01, market_timestamp=NOW,
         feed_type="live", session_state="continuous", bid=159.99, ask=160.01,
+        bid_size=10_000.0, ask_size=10_000.0,
     )
 
 
@@ -1496,6 +1497,7 @@ def _group_guard(snapshot, *, meet_other_thread=None, quote_clock=lambda: NOW):
             return ExecutableQuote(
                 conid=conid, side="ask", price=160.01, market_timestamp=quote_clock(),
                 feed_type="live", session_state="continuous", bid=159.99, ask=160.01,
+                bid_size=10_000.0, ask_size=10_000.0,
             )
 
     class Margin:

@@ -441,9 +441,11 @@ class LiveApproval:
         db.transaction(lambda conn: self.controls.seed_in_tx(conn, [(ACCOUNT_LIVE, "live")], NOW))
 
         ts = NOW - dt.timedelta(seconds=30) if stale_quote else NOW
+        # Live dispatch re-checks spread and depth, so the fake book is two-sided and deep.
         self.quotes = SimpleNamespace(executable_quote=lambda conid, side: ExecutableQuote(
-            conid=conid, side=side, price=210.0 if side == "ask" else 209.5,
-            market_timestamp=ts, feed_type="live", session_state="continuous"))
+            conid=conid, side=side, price=210.0 if side == "ask" else 209.9,
+            market_timestamp=ts, feed_type="live", session_state="continuous",
+            bid=209.9, ask=210.0, bid_size=1_000_000.0, ask_size=1_000_000.0))
         self.broker = SimpleNamespace(capture=lambda account_id: SimpleNamespace(
             account_id=account_id, account_mode="live", generation_id=1, source_cursor=1,
             open_order_count=0, daily_pnl=0.0, net_liquidation=1_000_000.0, working_orders=(),

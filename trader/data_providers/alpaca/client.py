@@ -28,11 +28,13 @@ class AlpacaClient:
         session: Optional[requests.Session] = None,
         limiter: Optional[RateLimiter] = None,
         base_url: str = ALPACA_DATA_URL,
+        timeout: float = REQUEST_TIMEOUT_SECS,
     ):
         self._headers = {'APCA-API-KEY-ID': key_id, 'APCA-API-SECRET-KEY': secret_key}
         self._session = session or requests.Session()
         self._limiter = limiter or ALPACA_LIMITER
         self._base_url = base_url
+        self._timeout = timeout
 
     def get_json(self, path: str, params: Mapping[str, Any]) -> dict:
         response = call_with_retry(
@@ -53,7 +55,7 @@ class AlpacaClient:
                 self._base_url + path,
                 params=dict(params),
                 headers=self._headers,
-                timeout=REQUEST_TIMEOUT_SECS,
+                timeout=self._timeout,
             )
         except requests.RequestException as ex:
             raise ProviderError(f'alpaca {path} unreachable: {type(ex).__name__}') from ex

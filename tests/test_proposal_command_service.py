@@ -299,3 +299,13 @@ def test_atomic_claim_rechecks_expiry_and_journals_the_expired_transition(author
 
     assert outcome[0].result == ApprovalClaim.EXPIRED
     assert outcome[0].record.status == "EXPIRED"
+
+
+def test_a_proposal_on_a_paper_iex_quote_records_the_iex_feed(authority):     # issue #74
+    from dataclasses import replace
+
+    authority.quotes.quote = replace(authority.quotes.quote, feed_type="iex_realtime")
+    record = authority.service.create_proposal(_request(), source="dashboard", correlation_id="cmd-iex")
+
+    assert record.reference_feed_type == "iex_realtime"
+    assert authority.repository.get(record.id).reference_feed_type == "iex_realtime"

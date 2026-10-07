@@ -7,10 +7,12 @@ from collections import defaultdict
 from dataclasses import dataclass
 from typing import Any, Callable, Optional
 
+from trader.automation.liquidity_policy import MAX_SPREAD_BPS
 from trader.automation.risk_limits import PAPER_LIMITS, RiskLimits
 from trader.data.broker_state import BrokerRiskSnapshotError
 from trader.promotion.allocation_policy import AllocationPolicy
 from trader.trading.command_policy import CommandAuthorityPolicy
+from trader.trading.quote_feeds import LIVE_ONLY_FEEDS, require_live_feed_on_live_account
 from trader.trading.trading_control import PauseStateUnavailable, TradingPausedError
 
 
@@ -133,6 +135,26 @@ def _unseen_in_flight_notional(evidence, snapshot) -> float:
     return total
 
 
+def _check_spread_and_depth(approved, quote, price: float) -> None:
+    """The approval's spread and depth limits, re-read on the quote this order is sent against.
+
+    No dispatch path carries a sliced-execution approval, so the crossed side
+    must always show the whole order.
+    """
+    if quote.bid is None or quote.ask is None:
+        raise DispatchGuardError("EXECUTABLE_QUOTE_INVALID", "a two-sided book is required", retryable=True)
+    spread_bps = (float(quote.ask) - float(quote.bid)) / price * 10_000.0
+    if spread_bps > MAX_SPREAD_BPS:
+        raise DispatchGuardError("SPREAD_BPS", "spread exceeds the liquidity limit", retryable=True)
+    crossed_side_size = quote.ask_size if approved.side == "BUY" else quote.bid_size
+    try:
+        depth = float(crossed_side_size)
+    except (TypeError, ValueError):
+        depth = math.nan
+    if not math.isfinite(depth) or depth < abs(float(approved.quantity)):
+        raise DispatchGuardError("DEPTH_EXCEEDED", "top of book does not cover the order", retryable=True)
+
+
 class DispatchGuard:
     def __init__(
         self, *, broker, quotes, margin, controls, risk_gate,
@@ -143,7 +165,9 @@ class DispatchGuard:
         ai_entry_gate: Callable[[Any, Any, Any, dt.datetime], Optional[str]] = lambda *args: None,
         strict_margin_actions: frozenset[str] = frozenset(),
         experiment_gate: Callable[[Any], Optional[str]] = lambda request: None,
+        accepted_feeds: frozenset[str] = LIVE_ONLY_FEEDS,
     ):
+        require_live_feed_on_live_account(account_mode, accepted_feeds)
         self._broker = broker
         self._quotes = quotes
         self._margin = margin
@@ -159,6 +183,7 @@ class DispatchGuard:
         self._strict_margin_actions = frozenset(strict_margin_actions)
         # SP1 Plan 4 K20: an ai_paper entry admitted before a kill is refused here after it.
         self._experiment_gate = experiment_gate
+        self._accepted_feeds = frozenset(accepted_feeds)
 
     def _limits_for(self, request) -> RiskLimits:
         try:
@@ -343,8 +368,8 @@ class DispatchGuard:
         # paper proposal path may still use its documented delayed reference.
         automated = getattr(request, "action", None) in AUTOMATED_ENTRY_ACTIONS
         if self._account_mode == "live" or automated:
-            if quote.feed_type != "live":
-                raise DispatchGuardError("FEED_NOT_LIVE", "live feed required", retryable=True)
+            if quote.feed_type not in self._accepted_feeds:
+                raise DispatchGuardError("FEED_NOT_LIVE", "accepted feed required", retryable=True)
             if quote.session_state != "continuous":
                 raise DispatchGuardError(
                     "SESSION_INCOMPATIBLE", "market is not continuous", retryable=True
@@ -356,6 +381,7 @@ class DispatchGuard:
                 raise DispatchGuardError("QUOTE_STALE", "quote is stale", retryable=True)
             if age < -MAX_SOURCE_CLOCK_SKEW_SECONDS:
                 raise DispatchGuardError("SOURCE_CLOCK_SKEW", "quote clock is in the future")
+            _check_spread_and_depth(approved, quote, price)
 
         reference = float(approved.reference_price)
         if not math.isfinite(reference) or reference <= 0:

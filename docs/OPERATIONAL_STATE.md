@@ -104,6 +104,46 @@ an automated BUY also needs a live quote in continuous trading and the 20 latest
 closed daily TRADES bars for the conid in the local DB, or approval rejects it
 (`FEED_NOT_LIVE`, `QUOTE_SESSION_INVALID`, `HISTORY_INVALID`, ...).
 
+### Paper quotes from Alpaca IEX (issue #74)
+
+The owner's IB paper account gets only delayed quotes (IB error 354), so every
+automated entry is refused `FEED_NOT_LIVE`. On paper you can use Alpaca's free
+real-time IEX quote instead:
+
+```yaml
+# ~/.config/mmr/trader.yaml (then restart trader_service)
+automation:
+  quote_fallback: alpaca_iex
+```
+
+It needs `ALPACA_API_KEY_ID` and `ALPACA_API_SECRET_KEY` (env or `trader.yaml`);
+blank keys or any other value stop the trader at startup. The trader asks IB
+first and uses Alpaca only when the IB quote is missing or not `live`. A live
+account never calls Alpaca, even with the setting on.
+
+- The quote is labelled `iex_realtime`, never `live`. Only paper with the setting
+  accepts it in the dispatch guard, approval evidence and liquidity policy.
+  Proposals record it in `reference_feed_type`.
+- Only US stocks the universe resolves (`STK`, `USD`, US primary exchange) get a
+  quote. `BRK B` is asked as `BRK.B`; any other symbol shape gets no quote.
+- The 5 s freshness, crossed-book, 15 bps spread and regular-session checks are
+  unchanged. IEX is one venue, so expect more `SPREAD_BPS` refusals, and
+  `QUOTE_STALE` on names whose last IEX quote is older than 5 s.
+- **Gap: no halt flag.** Alpaca quotes do not say when a stock is halted.
+  `session_state` comes from the XNYS calendar only (continuous inside the
+  regular session, else `closed`), so a halt during the session is not seen.
+  When IB itself reports a halt (on any feed, delayed too), the IB quote is kept
+  and the entry is refused; IEX never replaces it.
+- At dispatch, automated and live entries re-check the 15 bps spread and the
+  crossed-side depth (it must cover the whole order) on the final quote
+  (`SPREAD_BPS`, `DEPTH_EXCEEDED`, retryable). Manual paper proposals do not.
+- **Sizes are probably round lots.** An Alpaca forum answer (2022) says bid/ask
+  sizes are round lots; not yet checked on a real IEX response. They are used
+  unchanged as shares, the safe direction: top-of-book depth may be understated
+  (up to 100×), so IEX entries size to a few shares or hit `DEPTH_EXCEEDED`.
+  Converting needs the per-stock round-lot size, which Alpaca does not send.
+- The quote source differs from IB's paper fill engine; fills can differ.
+
 ### Current arms
 
 | Strategy | Role | Notes |

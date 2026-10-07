@@ -10,6 +10,7 @@ from __future__ import annotations
 import contextlib
 import datetime as dt
 import json
+import logging
 import threading
 from dataclasses import dataclass, replace
 from decimal import Decimal, ROUND_HALF_UP
@@ -40,6 +41,7 @@ SAGA_STATES = frozenset({
     "OUTCOME_UNKNOWN",
     "SAFETY_FAILED",
     "CLOSE_OWNED",
+    "NOT_SENT",
 })
 
 # A stop that protects a released remainder: accepted and working, or already filled as the exit.
@@ -50,7 +52,11 @@ _WORKING_STATUSES = frozenset({
 _FILLED_STATUSES = frozenset({"Filled"})
 _CANCELLED_STATUSES = frozenset({"Cancelled", "ApiCancelled"})
 _REJECTED_STATUSES = frozenset({"Inactive", "Rejected"})
-_TERMINAL_SAGA = frozenset({"CLOSED", "SAFETY_FAILED"})
+_TERMINAL_SAGA = frozenset({"CLOSED", "SAFETY_FAILED", "NOT_SENT"})
+# A send that may not have reached the broker. Nothing else retires these rows.
+_UNCONFIRMED_SEND_SAGA = ("SUBMITTING", "OUTCOME_UNKNOWN")
+ORPHAN_NOT_SENT = "ORPHAN_NOT_SENT"
+DEFAULT_ORPHAN_SETTLE_SECONDS = 60.0
 # The entry may be at the broker with quantity still unfilled. VALIDATED is
 # not here: it is written before the dispatch guard, so nothing was sent yet.
 _IN_FLIGHT_SAGA = ("SUBMITTING", "OUTCOME_UNKNOWN", "ENTRY_WORKING", "PARTIALLY_FILLED")
@@ -343,6 +349,11 @@ class SagaState:
     filled_at: Optional[dt.datetime] = None
     # Broker position quantity of the conid when the entry was sent.
     baseline_position: Optional[Decimal] = None
+    # Broker enumeration generation and time at the send attempt, and the
+    # time submit_bracket returned or raised (see retire_orphan_reservations).
+    send_generation_id: Optional[int] = None
+    send_attempted_at: Optional[str] = None
+    send_returned_at: Optional[str] = None
 
     @property
     def current_groups(self) -> tuple[str, ...]:
@@ -388,6 +399,9 @@ class SagaState:
             "baseline_position": (
                 None if self.baseline_position is None else str(self.baseline_position)
             ),
+            "send_generation_id": self.send_generation_id,
+            "send_attempted_at": self.send_attempted_at,
+            "send_returned_at": self.send_returned_at,
         }
 
     @classmethod
@@ -434,7 +448,46 @@ class SagaState:
                 _dec(payload["baseline_position"])
                 if payload.get("baseline_position") is not None else None
             ),
+            send_generation_id=(
+                int(payload["send_generation_id"])
+                if payload.get("send_generation_id") is not None else None
+            ),
+            send_attempted_at=payload.get("send_attempted_at"),
+            send_returned_at=payload.get("send_returned_at"),
         )
+
+
+class _BrokerTraceFound(Exception):
+    """The broker may hold the order group: the retirement must not commit."""
+
+
+@dataclass(frozen=True)
+class BrokerEnumeration:
+    """A complete, promoted broker enumeration: its id and when it began."""
+
+    generation_id: int
+    started_at: dt.datetime
+
+
+class OrphanEvidencePort(Protocol):
+    def latest_complete_enumeration(self, account_id: str) -> BrokerEnumeration:
+        """Newest complete enumeration; raises when none can be read."""
+        ...
+
+    def entry_orders(self, account_id: str, order_group_id: str) -> list[Any]:
+        """Broker entry order rows of the group (deleted and terminal included)."""
+        ...
+
+    def has_trace_in_tx(
+        self, conn, account_id: str, order_group_id: str, conid: int, since: dt.datetime,
+    ) -> bool:
+        """True if the broker may hold an order or execution of the group.
+
+        Runs inside the caller's journal transaction, so broker writes cannot
+        land between this read and the caller's write. Must answer True when
+        it cannot rule one out; raises when unreadable.
+        """
+        ...
 
 
 class BracketDispatchPort(Protocol):
@@ -484,7 +537,9 @@ class ProtectiveOrderSagaStore:
 
     def load_live(self, account_id: str, conid: Optional[int] = None) -> list[SagaState]:
         """Every saga that is not terminal: open ones and ones a close owns."""
-        where = "account_id = ? AND state NOT IN ('CLOSED', 'SAFETY_FAILED')"
+        # NOT_SENT is terminal too: a close must not turn it into CLOSE_OWNED,
+        # or a later broker event would no longer reopen it as an orphan.
+        where = "account_id = ? AND state NOT IN ('CLOSED', 'SAFETY_FAILED', 'NOT_SENT')"
         params: list = [account_id]
         if conid is not None:
             where += " AND conid = ?"
@@ -580,6 +635,43 @@ class ProtectiveOrderSagaStore:
             ))
         return tuple(entries)
 
+    def require_revision_in_tx(self, conn, command_id: str, revision: int) -> None:
+        row = conn.execute(
+            "SELECT payload FROM automated_order_sagas WHERE command_id = ?", [command_id],
+        ).fetchone()
+        current = None if row is None else SagaState.from_payload(json.loads(row[0])).revision
+        if current != revision:
+            raise ValueError(f"saga {command_id} changed: revision {current}, expected {revision}")
+
+    def terminal_entries(self, account_id: str) -> tuple[SagaState, ...]:
+        """NOT_SENT and CLOSED rows whose exit never filled: the saga thinks
+        they hold at most what they recorded.
+
+        Rows a close owned are left out: the close worked from broker
+        positions, and a release rewrites ``filled_quantity`` to the remainder,
+        so the entry order's fill no longer compares with it.
+        """
+        rows = self._db.execute(
+            "SELECT payload FROM automated_order_sagas WHERE state IN ('NOT_SENT', 'CLOSED')",
+            fetch="all",
+        )
+        states = (SagaState.from_payload(json.loads(payload)) for (payload,) in rows or ())
+        return tuple(
+            state for state in states
+            if state.account_id == account_id
+            and not (state.stop_filled or state.target_filled)
+            and not _close_owned_once(state)
+        )
+
+    def unconfirmed_sends(self, account_id: str) -> tuple[SagaState, ...]:
+        placeholders = ", ".join("?" for _ in _UNCONFIRMED_SEND_SAGA)
+        rows = self._db.execute(
+            f"SELECT payload FROM automated_order_sagas WHERE state IN ({placeholders})",
+            list(_UNCONFIRMED_SEND_SAGA), fetch="all",
+        )
+        states = (SagaState.from_payload(json.loads(payload)) for (payload,) in rows or ())
+        return tuple(state for state in states if state.account_id == account_id)
+
     def seen_event_in_tx(self, conn, event_id: str) -> bool:
         row = conn.execute(
             "SELECT 1 FROM automated_order_saga_events WHERE event_id = ?", [event_id],
@@ -648,6 +740,18 @@ def _apply_entry_leg(state: SagaState, event: BrokerOrderEvent) -> SagaState:
     return next_state
 
 
+def _entry_fill_grows(state: SagaState, event: BrokerOrderEvent) -> bool:
+    if event.leg != "entry":
+        return False
+    if _dec(event.filled_quantity) > state.filled_quantity:
+        return True
+    return event.status in _FILLED_STATUSES and state.filled_quantity < state.requested_quantity
+
+
+def _close_owned_once(state: SagaState) -> bool:
+    return state.handover_generation is not None or state.protection_generation > 0
+
+
 def _entry_limit_price(state: SagaState) -> float:
     try:
         price = float(state.plan_json["legs"][0]["limit_price"])
@@ -698,6 +802,8 @@ class ProtectiveOrderSaga:
         now: Callable[[], dt.datetime],
         db: Any,
         liquidation_deadline_seconds: float = 300.0,
+        orphan_evidence: Optional[OrphanEvidencePort] = None,
+        orphan_settle_seconds: float = DEFAULT_ORPHAN_SETTLE_SECONDS,
     ):
         self._journal = journal
         self._ledger = ledger
@@ -711,6 +817,8 @@ class ProtectiveOrderSaga:
         self._now = now
         self._store = ProtectiveOrderSagaStore(db)
         self._liquidation_deadline_seconds = liquidation_deadline_seconds
+        self._orphan_evidence = orphan_evidence
+        self._orphan_settle = dt.timedelta(seconds=orphan_settle_seconds)
 
     # -- public API --------------------------------------------------------
 
@@ -871,8 +979,23 @@ class ProtectiveOrderSaga:
             self._persist(closed, now, from_state="VALIDATED")
             return closed
 
+        send_generation_id = None
+        if self._orphan_evidence is not None:
+            try:
+                send_generation_id = self._orphan_evidence.latest_complete_enumeration(
+                    self._account_id,
+                ).generation_id
+            except Exception:
+                closed = replace(
+                    validated, state="CLOSED", error_code="BROKER_GENERATION_UNAVAILABLE",
+                    revision=validated.revision + 1,
+                )
+                self._persist(closed, now, from_state="VALIDATED")
+                return closed
+
         submitting = replace(
             validated, state="SUBMITTING", revision=validated.revision + 1,
+            send_generation_id=send_generation_id, send_attempted_at=now.isoformat(),
             baseline_position=_dec(approval.broker.reducible_quantity(validated.conid)),
         )
         self._persist(submitting, now, from_state="VALIDATED")
@@ -883,16 +1006,22 @@ class ProtectiveOrderSaga:
                 plan=plan, intent=intent, account_id=self._account_id,
             )
         except BrokerRejectedError:
+            returned_at = self._now_utc().isoformat()
             return self._after_dispatch(intent.command_id, now, lambda s: replace(
-                s, state="CLOSED", error_code="BROKER_REJECTED"))
+                s, state="CLOSED", error_code="BROKER_REJECTED", send_returned_at=returned_at))
         except Exception:
+            returned_at = self._now_utc().isoformat()
             return self._after_dispatch(intent.command_id, now, lambda s: replace(
-                s, state="OUTCOME_UNKNOWN", error_code="DISPATCH_AMBIGUOUS"))
+                s, state="OUTCOME_UNKNOWN", error_code="DISPATCH_AMBIGUOUS",
+                send_returned_at=returned_at))
 
+        returned_at = self._now_utc().isoformat()
         order_ids = tuple(int(x) for x in (getattr(submitted, "order_ids", None) or ()))
         # Submit returns correlation ids only — broker events advance working.
         return self._after_dispatch(
-            intent.command_id, now, lambda s: replace(s, submitted_order_ids=order_ids), always=True)
+            intent.command_id, now,
+            lambda s: replace(s, submitted_order_ids=order_ids, send_returned_at=returned_at),
+            always=True)
 
     def _after_dispatch(self, command_id: str, now: dt.datetime,
                         change: Callable[[SagaState], SagaState], *, always: bool = False) -> SagaState:
@@ -937,6 +1066,12 @@ class ProtectiveOrderSaga:
             return state
         if state.state == "SAFETY_FAILED" and event.leg == "entry":
             return self._record_entry_after_safety_failure(state, event)
+        if state.state == "NOT_SENT":
+            return self._reopen_terminal_row(state, event)
+        if state.state == "CLOSED" and not _close_owned_once(state) and _entry_fill_grows(state, event):
+            # A fill is never dropped, even after a zero-fill cancel or reject. A row a
+            # close owned is left out: its filled_quantity may be a release remainder.
+            return self._reopen_terminal_row(state, event)
         if state.state in _TERMINAL_SAGA:
             return state
 
@@ -1145,6 +1280,167 @@ class ProtectiveOrderSaga:
         self._persist(updated, self._now_utc(), from_state=state.state, event_id=event.event_id)
         return updated
 
+    # -- orphan reservations -----------------------------------------------
+
+    def retire_orphan_reservations(self) -> tuple[str, ...]:
+        """Retire SUBMITTING / OUTCOME_UNKNOWN rows the broker proves were never sent.
+
+        Such a row counts toward gross until a broker event moves it. After a
+        crash before the send, or a send that never reached IB, no event comes.
+        A row is retired only when a complete broker enumeration that began
+        after the send attempt, and after the generation recorded at the send,
+        shows no order group and no execution for it. Anything unreadable
+        keeps the row: the reservation fails closed. Returns the retired
+        command ids.
+        """
+        if self._orphan_evidence is None:
+            return ()
+        lock = _account_entry_lock(self._account_id)
+        # Never wait: an entry send holds this lock for up to the dispatch timeout.
+        if not lock.acquire(blocking=False):
+            return ()
+        try:
+            return self._retire_orphans()
+        finally:
+            lock.release()
+
+    def _retire_orphans(self) -> tuple[str, ...]:
+        candidates = self._store.unconfirmed_sends(self._account_id)
+        if not candidates:
+            return ()
+        now = self._now_utc()
+        try:
+            enumeration = self._orphan_evidence.latest_complete_enumeration(self._account_id)
+        except Exception:
+            logging.warning("orphan reservation check skipped: no complete broker enumeration")
+            return ()
+        retired = []
+        for state in candidates:
+            if self._retire_if_orphan(state, enumeration, now):
+                retired.append(state.command_id)
+        return tuple(retired)
+
+    def _retire_if_orphan(
+        self, state: SagaState, enumeration: BrokerEnumeration, now: dt.datetime,
+    ) -> bool:
+        if not self._enumeration_postdates_send(state, enumeration, now):
+            return False
+        since = _as_utc(dt.datetime.fromisoformat(state.send_attempted_at))
+
+        def require_no_trace(conn) -> None:
+            if self._orphan_evidence.has_trace_in_tx(
+                conn, state.account_id, state.order_group_id, state.conid, since,
+            ):
+                raise _BrokerTraceFound(state.order_group_id)
+
+        retired = replace(
+            state, state="NOT_SENT", error_code=ORPHAN_NOT_SENT, revision=state.revision + 1,
+        )
+        try:
+            self._persist(
+                retired, now, from_state=state.state, expected_revision=state.revision,
+                check_in_tx=require_no_trace,
+            )
+        except _BrokerTraceFound:
+            return False
+        except Exception:
+            logging.exception("could not retire orphan reservation %s", state.command_id)
+            return False
+        logging.error(
+            "INCIDENT %s: saga %s (order group %s) was %s with no broker order or "
+            "execution in broker generation %s; reservation released",
+            ORPHAN_NOT_SENT, state.command_id, state.order_group_id, state.state,
+            enumeration.generation_id,
+        )
+        return True
+
+    def _enumeration_postdates_send(
+        self, state: SagaState, enumeration: BrokerEnumeration, now: dt.datetime,
+    ) -> bool:
+        # Without the returned marker the send may still be running (or the
+        # process died inside it): nothing proves when it could reach IB.
+        if (
+            state.send_generation_id is None
+            or state.send_attempted_at is None
+            or state.send_returned_at is None
+        ):
+            return False
+        returned_at = _as_utc(dt.datetime.fromisoformat(state.send_returned_at))
+        return (
+            enumeration.generation_id > state.send_generation_id
+            and _as_utc(enumeration.started_at) > returned_at
+            and now - returned_at >= self._orphan_settle
+        )
+
+    def reconcile_terminal_entries(self) -> tuple[str, ...]:
+        """After a generation promotion: route fills the saga never saw.
+
+        Promotion applies broker orders without saga events. A NOT_SENT or
+        CLOSED row whose broker entry order shows more fill than the row
+        recorded takes the same path as a late fill event. Returns the
+        command ids it reopened.
+        """
+        if self._orphan_evidence is None:
+            return ()
+        reopened = []
+        for state in self._store.terminal_entries(self._account_id):
+            unseen = self._unseen_entry_fill_event(state)
+            if unseen is not None and unseen.event_id not in state.seen_event_ids:
+                self._reopen_terminal_row(state, unseen)
+                reopened.append(state.command_id)
+        return tuple(reopened)
+
+    def _unseen_entry_fill_event(self, state: SagaState) -> Optional[BrokerOrderEvent]:
+        orders = self._orphan_evidence.entry_orders(state.account_id, state.order_group_id)
+        filled = [order for order in orders if _dec(order.filled_quantity) > state.filled_quantity]
+        if not filled:
+            return None
+        order = max(filled, key=lambda row: row.filled_quantity)
+        return BrokerOrderEvent(
+            order_group_id=state.order_group_id, leg="entry", status=order.status,
+            filled_quantity=float(order.filled_quantity),
+            total_quantity=float(order.total_quantity), order_id=0,
+            event_id=(
+                f"promotion:{order.order_entity_id}:{order.status}:{order.filled_quantity}"
+            ),
+            source_timestamp=order.source_timestamp,
+        )
+
+    def _reopen_terminal_row(self, state: SagaState, event: BrokerOrderEvent) -> SagaState:
+        """The broker shows an order of a NOT_SENT or CLOSED row: reserve it again.
+
+        Any fill is unprotected as far as the saga knows, so it goes to
+        SAFETY_FAILED, which trips the breaker and starts liquidation.
+        """
+        now = self._now_utc()
+        logging.critical(
+            "broker event %s for saga %s in %s: the order exists after all",
+            event.event_id, state.command_id, state.state,
+        )
+        self._breaker.record(BreakerSignal(
+            kind="RECONCILIATION_DIVERGENCE",
+            occurred_at=now,
+            detail=f"broker order seen for {state.state} saga {state.command_id}",
+            key=state.command_id,
+        ))
+        reopened = self._apply_event(
+            replace(state, state="OUTCOME_UNKNOWN", error_code="ORPHAN_ORDER_FOUND"), event,
+        )
+        if reopened.filled_quantity > 0:
+            reopened = replace(
+                reopened, state="SAFETY_FAILED", error_code="ORPHAN_ORDER_FILLED",
+                flatten_requested=True,
+            )
+        reopened = replace(
+            reopened,
+            seen_event_ids=state.seen_event_ids + (event.event_id,),
+            revision=state.revision + 1,
+        )
+        self._persist(reopened, now, from_state=state.state, event_id=event.event_id)
+        if reopened.state == "SAFETY_FAILED":
+            self._trip_and_liquidate(reopened, now)
+        return reopened
+
     # -- event application -------------------------------------------------
 
     def _apply_event(self, state: SagaState, event: BrokerOrderEvent) -> SagaState:
@@ -1257,8 +1553,13 @@ class ProtectiveOrderSaga:
         *,
         from_state: Optional[str],
         event_id: Optional[str] = None,
+        expected_revision: Optional[int] = None,
+        check_in_tx: Optional[Callable[[Any], None]] = None,
     ) -> None:
-        mutation, write, event_key = self._mutation(state, now, from_state=from_state, event_id=event_id)
+        mutation, write, event_key = self._mutation(
+            state, now, from_state=from_state, event_id=event_id,
+            expected_revision=expected_revision, check_in_tx=check_in_tx,
+        )
         self._journal.mutate(self._journal.connect(), mutation, write, event_id=event_key)
 
     def _persist_all(self, items: list[tuple[SagaState, Optional[str]]], now: dt.datetime) -> None:
@@ -1272,7 +1573,8 @@ class ProtectiveOrderSaga:
         )
 
     def _mutation(self, state: SagaState, now: dt.datetime, *, from_state: Optional[str],
-                  event_id: Optional[str]):
+                  event_id: Optional[str], expected_revision: Optional[int] = None,
+                  check_in_tx: Optional[Callable[[Any], None]] = None):
         if state.state not in SAGA_STATES:
             raise ValueError(f"invalid saga state {state.state!r}")
 
@@ -1299,6 +1601,10 @@ class ProtectiveOrderSaga:
         )
 
         def write(conn, _revision: int) -> None:
+            if expected_revision is not None:
+                self._store.require_revision_in_tx(conn, state.command_id, expected_revision)
+            if check_in_tx is not None:
+                check_in_tx(conn)
             self._store.save_in_tx(conn, state, now)
             if event_id is not None:
                 self._store.record_event_in_tx(conn, event_id, state.command_id, now)

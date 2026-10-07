@@ -226,8 +226,28 @@ class FakeSchedule:
         self.calls += 1
 
 
-def _build_stack(tmp_path: Path, *, dispatch=None, verifier=None, now=None, liquidation=None, broker=None,
-                 protective_saga=None, approval_factory=None):
+class FakeProtectiveSaga:
+    """Stands in for ProtectiveOrderSaga: sends through the fake dispatch like the real one."""
+
+    def __init__(self, dispatch):
+        self._dispatch = dispatch
+
+    def start(self, *, intent, **_evidence):
+        order_group_id = f"og-{intent.command_id}"
+        try:
+            submitted = self._dispatch.submit(
+                intent=intent, order_group_id=order_group_id,
+                order_ref=encode_order_ref(order_group_id),
+            )
+        except Exception:
+            return SimpleNamespace(state="OUTCOME_UNKNOWN", error_code="DISPATCH_AMBIGUOUS",
+                                   submitted_order_ids=[])
+        return SimpleNamespace(state="SUBMITTING", error_code=None,
+                               submitted_order_ids=list(submitted.order_ids))
+
+
+def _build_stack(tmp_path: Path, *, dispatch=None, verifier=None, now=None, with_saga=True, liquidation=None,
+                 broker=None, protective_saga=None, approval_factory=None):
     from trader.automation.automated_intent_command import AutomatedIntentCommandService
 
     db = DuckDBConnection.get_instance(str(tmp_path / "automation.duckdb"))
@@ -260,8 +280,8 @@ def _build_stack(tmp_path: Path, *, dispatch=None, verifier=None, now=None, liqu
         schedule_reconcile=schedule.schedule,
         liquidation=liquidation,
         broker=broker,
-        protective_saga=protective_saga,
-        approval_factory=approval_factory,
+        protective_saga=protective_saga or (FakeProtectiveSaga(dispatch) if with_saga else None),
+        approval_factory=approval_factory or ((lambda **_kwargs: object()) if with_saga else None),
     )
 
     class _NonceGate:
@@ -366,6 +386,26 @@ def test_non_strategy_principal_is_rejected(tmp_path, source):
 # ---------------------------------------------------------------------------
 # Claim / audit / correlation before dispatch
 # ---------------------------------------------------------------------------
+
+def test_without_a_saga_the_command_is_refused_and_nothing_is_sent(tmp_path):
+    stack = _build_stack(tmp_path, with_saga=False)
+    intent = make_intent()
+    (tmp_path / "bundles").mkdir()
+    (tmp_path / "bundles" / ARTIFACT_DIGEST.replace(":", "_")).mkdir()
+    request = CommandRequest(
+        command_id=intent.command_id, action="execute_automated_intent",
+        account_id=ACCOUNT, target_type="intent", target_id=intent.intent_id,
+        expected_version=None, body=intent_to_request_body(intent),
+        source="strategy_service",
+    )
+
+    receipt = stack.coordinator.execute(request)
+
+    assert (receipt.state, receipt.error_code) == ("REJECTED", "SAGA_REQUIRED")
+    assert stack.ledger.get(intent.command_id).state == "REJECTED"
+    assert stack.dispatch.calls == []
+    assert stack.schedule.calls == 0
+
 
 def test_command_is_claimed_and_audited_before_dispatch(tmp_path):
     stack = _build_stack(tmp_path)
@@ -1022,3 +1062,14 @@ def test_after_a_session_loss_breach_a_sell_closes_and_a_buy_is_refused(tmp_path
     receipt, _intent = _execute_sell(stack, tmp_path, None)
     assert (receipt.state, receipt.error_code) == ("OUTCOME_UNKNOWN", "CLOSE_PENDING")
     assert saga_calls == ["BUY"] and len(liquidation.starts) == 1
+
+
+def test_sell_intent_closes_even_without_a_saga(tmp_path):
+    """The saga guards new exposure only. A SELL exit does not need it; a BUY does
+    (test_without_a_saga_the_command_is_refused_and_nothing_is_sent)."""
+    liquidation = _FakeCloseLiquidation()
+    stack = _build_stack(tmp_path, liquidation=liquidation, broker=_FakeBrokerSnapshot(10.0), with_saga=False)
+    receipt, intent = _execute_sell(stack, tmp_path, None)
+    assert (receipt.state, receipt.error_code) == ("OUTCOME_UNKNOWN", "CLOSE_PENDING")
+    assert liquidation.starts[0][1] == intent.command_id
+    assert stack.dispatch.calls == []

@@ -474,6 +474,53 @@ class BrokerStateStore:
         ).fetchall()
         return [self._order_from_row(row) for row in rows]
 
+    def group_has_broker_trace_in_tx(
+        self, conn: Any, account_id: str, order_group_id: str, conid: int,
+        since: dt.datetime,
+    ) -> bool:
+        """True unless the broker state proves no order or execution of the group exists.
+
+        A trace is any order (even deleted or terminal) or execution of the
+        group, and any order or execution on the account and conid since
+        ``since`` that does not carry a different order group: a lost or
+        undecodable order ref can hide the group. While a broker generation
+        is staging, its rows are not visible here, so that is a trace too.
+        """
+        staging = conn.execute(
+            "SELECT 1 FROM broker_sync_generations WHERE status = 'staging' LIMIT 1"
+        ).fetchone()
+        if staging is not None:
+            return True
+        orders = conn.execute(
+            "SELECT 1 FROM broker_orders WHERE account_id = ? AND (order_group_id = ? "
+            "OR (conid = ? AND source_timestamp >= ? AND order_group_id IS NULL)) LIMIT 1",
+            [account_id, order_group_id, conid, since],
+        ).fetchone()
+        if orders is not None:
+            return True
+        fills = conn.execute(
+            "SELECT 1 FROM broker_fills f "
+            "LEFT JOIN broker_orders o ON o.order_entity_id = f.order_entity_id "
+            "WHERE f.account_id = ? AND (o.order_group_id = ? OR ("
+            "f.conid = ? AND f.source_timestamp >= ? "
+            "AND (o.order_entity_id IS NULL OR o.order_group_id IS NULL))) LIMIT 1",
+            [account_id, order_group_id, conid, since],
+        ).fetchone()
+        return fills is not None
+
+    def select_group_entry_orders_in_tx(
+        self, conn: Any, account_id: str, order_group_id: str
+    ) -> list[BrokerOrderRow]:
+        """Entry orders of the group, including deleted and terminal ones."""
+        rows = conn.execute(
+            "SELECT order_entity_id, account_id, conid, symbol, order_group_id, leg, is_external, action, "
+            "order_type, total_quantity, filled_quantity, avg_fill_price, limit_price, stop_price, tif, "
+            "status, deleted, revision, source_timestamp FROM broker_orders "
+            "WHERE account_id = ? AND order_group_id = ? AND leg = 'entry' ORDER BY order_entity_id",
+            [account_id, order_group_id],
+        ).fetchall()
+        return [self._order_from_row(row) for row in rows]
+
     def select_working_orders_in_tx(self, conn: Any) -> list[BrokerOrderRow]:
         markers = ", ".join("?" for _ in _WORKING_ORDER_STATUSES)
         rows = conn.execute(

@@ -1083,3 +1083,118 @@ def test_generation_refresh_is_rate_limited_and_never_blocks():
         refresh.request_refresh(ACCOUNT)          # no loop: nothing, no error
     finally:
         loop_thread.stop()
+
+
+# ---------------------------------------------------------------------------
+# #46 x #53: a real late entry fill on a saga a close owned
+# ---------------------------------------------------------------------------
+
+def _partially_filled_entry(composed):
+    """A saga whose entry filled 4 of 10 and still works; stop and target protect the 4."""
+    og = "og-entry-1"
+    composed.saga._persist(SagaState(
+        command_id="entry-1", order_group_id=og, order_ref=f"mmr:{og}", state="PARTIALLY_FILLED",
+        account_id=ACCOUNT, conid=CONID, side="BUY", requested_quantity=Decimal("10"),
+        filled_quantity=Decimal("4"), protection_quantity=Decimal("4"), entry_working=True,
+        protection_working=True, stop_working=True, target_working=True, revision=3,
+        plan_json={"legs": [{"role": "entry", "limit_price": "100.0"},
+                            {"role": "stop", "stop_price": "95.0"},
+                            {"role": "take_profit", "limit_price": "120.0"}]}),
+        composed.clock[0], from_state=None)
+    composed.sim.held[CONID] = 4.0
+    composed.sim.add_order(f"{og}:entry", og, "entry", "BUY", "LMT", 10.0)
+    composed.sim.set_status(f"{og}:entry", "Submitted", filled=4.0)
+    composed.sim.add_order(f"{og}:stop", og, "stop", "SELL", "STP", 4.0, status="PreSubmitted")
+    composed.sim.add_order(f"{og}:take_profit", og, "take_profit", "SELL", "LMT", 4.0)
+    composed.sim.promote()
+    return og
+
+
+def test_a_real_late_entry_fill_after_a_close_owned_the_saga_starts_a_new_safety_close(composed):
+    """The saga skips CLOSED rows a close owned (their filled_quantity may be a release
+    remainder), so the late-fill watch of the safety close must catch a real one.
+
+    The entry filled 4 of 10; a full close cancels the entry, stop and target, sells 4 and
+    ends CLOSED. Then the entry order reports Filled 10 after all: the account holds 6 the
+    close never saw. The saga stays CLOSED and raises nothing; the close's watch starts
+    ``c-1-late-1``, which sells the 6."""
+    og = _partially_filled_entry(composed)
+
+    composed.liquidation.start(ACCOUNT, "c-1", _et(11, 5), scope="conid", conid=CONID)
+    assert composed.saga.resume("entry-1").state == "CLOSE_OWNED"
+    assert sorted(composed.sim.cancelled) == [f"{og}:entry", f"{og}:stop", f"{og}:take_profit"]
+    composed.cancel_landed(f"{og}:entry", f"{og}:stop", f"{og}:take_profit")
+    for leg in ("entry", "stop", "take_profit"):
+        composed.saga_event(og, leg, f"{og}:{leg}", "Cancelled", filled=4.0 if leg == "entry" else 0.0,
+                            event_id=f"cancel-{leg}")
+    composed.sim.promote()
+    composed.tick()
+    assert composed.sim.placed == [("c-1-reduce-265598-1", "MKT", "SELL", 4.0, None, None)]
+    composed.sim.set_status(composed.sim.entity_for("c-1-reduce"), "Filled", filled=4.0)
+    composed.sim.held[CONID] = 0.0
+    for _ in range(2):
+        composed.sim.promote()
+        composed.tick()
+    assert composed.liquidation.receipt_for("c-1").state == "CLOSED"
+    assert composed.saga.resume("entry-1").state == "CLOSED"
+    assert composed.stack.circuit_breaker.store.get().state == "CLEAR"
+
+    composed.sim.set_status(f"{og}:entry", "Filled", filled=10.0)       # the cancel lost the race
+    composed.sim.held[CONID] = 6.0
+    late = composed.saga_event(og, "entry", f"{og}:entry", "Filled", filled=10.0, event_id="late-entry-fill")
+    assert late.state == "CLOSED"
+    for _ in range(3):
+        composed.sim.promote()
+        composed.tick()
+    assert _late_roots(composed) == ["c-1-late-1"]
+    assert composed.sim.placed[1:] == [("c-1-late-1-reduce-265598-1", "MKT", "SELL", 6.0, None, None)]
+    assert composed.liquidation.root_for("entry-1") is None             # one close for the 6, not two
+
+
+def test_a_real_late_entry_fill_after_a_partial_then_a_full_close_starts_a_new_safety_close(composed):
+    """As above, but a partial close (p-1) cancels the entry and ends DONE with the remainder
+    re-protected; a full close (p-2) ends CLOSED. Only p-1 cancelled the entry, so p-1 must be
+    watched for the late fill although it ended DONE, not FLAT or CLOSED."""
+    og = _partially_filled_entry(composed)
+    composed.liquidation.start(ACCOUNT, "p-1", _et(11, 5), scope="conid", conid=CONID, quantity=2.0)
+    assert sorted(composed.sim.cancelled) == [f"{og}:entry", f"{og}:stop", f"{og}:take_profit"]
+    composed.cancel_landed(f"{og}:entry", f"{og}:stop", f"{og}:take_profit")
+    for leg in ("entry", "stop", "take_profit"):
+        composed.saga_event(og, leg, f"{og}:{leg}", "Cancelled", filled=4.0 if leg == "entry" else 0.0,
+                            event_id=f"cancel-{leg}")
+    composed.sim.promote()
+    composed.tick()
+    assert composed.sim.placed[-1][:4] == ("p-1-reduce-265598-1", "MKT", "SELL", 2.0)
+    composed.sim.set_status(composed.sim.entity_for("p-1-reduce"), "Filled", filled=2.0)
+    composed.sim.held[CONID] = 2.0
+    for _ in range(4):                                                # fill seen, stop, target, done
+        composed.sim.promote()
+        composed.tick()
+    assert composed.liquidation.receipt_for("p-1").state == "DONE"
+    released = composed.saga.resume("entry-1")
+    assert (released.state, released.filled_quantity) == ("PROTECTED", Decimal("2"))
+
+    composed.liquidation.start(ACCOUNT, "p-2", _et(11, 20), scope="conid", conid=CONID)
+    composed.cancel_landed(*(e for e in composed.sim.orders if e.startswith("p-1-reprotect")))
+    composed.sim.promote()
+    composed.tick()
+    assert composed.sim.placed[-1][:4] == ("p-2-reduce-265598-1", "MKT", "SELL", 2.0)
+    composed.sim.set_status(composed.sim.entity_for("p-2-reduce"), "Filled", filled=2.0)
+    composed.sim.held[CONID] = 0.0
+    for _ in range(2):
+        composed.sim.promote()
+        composed.tick()
+    assert composed.liquidation.receipt_for("p-2").state == "CLOSED"
+    assert composed.saga.resume("entry-1").state == "CLOSED"
+    placed = len(composed.sim.placed)
+
+    composed.sim.set_status(f"{og}:entry", "Filled", filled=10.0)       # the cancel lost the race
+    composed.sim.held[CONID] = 6.0
+    late = composed.saga_event(og, "entry", f"{og}:entry", "Filled", filled=10.0, event_id="late-entry-fill")
+    assert late.state == "CLOSED"
+    for _ in range(3):
+        composed.sim.promote()
+        composed.tick()
+    assert _late_roots(composed) == ["p-1-late-1"]
+    assert composed.sim.placed[placed:] == [("p-1-late-1-reduce-265598-1", "MKT", "SELL", 6.0, None, None)]
+    assert composed.liquidation.root_for("entry-1") is None

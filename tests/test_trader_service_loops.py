@@ -533,3 +533,30 @@ def test_main_returns_without_running_trader_when_signalled_during_startup_recov
     assert fake.shutdowns == 1
     assert fake.run_calls == 0
     assert fake.recover_calls == 0
+
+
+def test_orphan_reservation_sweep_starts_with_an_immediate_tick(worker):
+    loop = asyncio.new_event_loop()
+    try:
+        calls = []
+        saga = SimpleNamespace(retire_orphan_reservations=lambda: calls.append(1) or ())
+        holder = SimpleNamespace(protective_order_saga=saga)
+
+        trader_service._maybe_start_orphan_reservation_sweep(holder, loop, worker)
+        (sweep,) = asyncio.all_tasks(loop)
+        loop.run_until_complete(asyncio.sleep(0.15))
+        sweep.cancel()
+
+        assert calls == [1]
+    finally:
+        _close_loop(loop)
+
+
+def test_no_orphan_reservation_sweep_without_a_saga(worker):
+    loop = asyncio.new_event_loop()
+    try:
+        trader_service._maybe_start_orphan_reservation_sweep(SimpleNamespace(), loop, worker)
+
+        assert asyncio.all_tasks(loop) == set()
+    finally:
+        _close_loop(loop)

@@ -195,6 +195,48 @@ class TraderBrokerRiskSnapshotAuthority:
         return snapshot
 
 
+class BrokerStateOrphanEvidence:
+    """Evidence that a saga's order never reached the broker, read from broker state.
+
+    Completeness comes from the fenced snapshot authority: it refuses when no
+    generation is promoted, a newer one is still staging, or the transport is
+    not ready.
+    """
+
+    def __init__(self, *, db, store, snapshots: TraderBrokerRiskSnapshotAuthority):
+        self._db = db
+        self._store = store
+        self._snapshots = snapshots
+
+    def latest_complete_enumeration(self, account_id: str):
+        from trader.automation.protective_order_saga import BrokerEnumeration
+
+        generation_id = self._snapshots.capture(account_id).generation_id
+        row = self._db.transaction(lambda conn: conn.execute(
+            "SELECT started_at FROM broker_sync_generations WHERE generation_id = ?",
+            [generation_id],
+        ).fetchone())
+        if row is None or row[0] is None:
+            raise BrokerRiskSnapshotError(
+                "INVALID_GENERATION_CURSOR", f"generation {generation_id} has no start time"
+            )
+        return BrokerEnumeration(generation_id=int(generation_id), started_at=row[0])
+
+    def entry_orders(self, account_id: str, order_group_id: str):
+        return self._db.transaction(
+            lambda conn: self._store.select_group_entry_orders_in_tx(
+                conn, account_id, order_group_id,
+            )
+        )
+
+    def has_trace_in_tx(
+        self, conn, account_id: str, order_group_id: str, conid: int, since,
+    ) -> bool:
+        return bool(self._store.group_has_broker_trace_in_tx(
+            conn, account_id, order_group_id, conid, since,
+        ))
+
+
 def _feed_type(ticker) -> str:
     return _MARKET_DATA_TYPE.get(getattr(ticker, "marketDataType", None), "unknown")
 

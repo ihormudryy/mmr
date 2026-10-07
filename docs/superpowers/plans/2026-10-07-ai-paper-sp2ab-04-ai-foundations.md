@@ -17,8 +17,8 @@
 - **Money:** integer micro-USD (`*_micros`). Costs round up, the configured cap rounds down. Never `float` for money inside budget, journal or gateway.
 - **Window:** `America/New_York` calendar date, computed in Python from the injected clock with `zoneinfo`, stored as `VARCHAR`. Never read a date out of a DuckDB timestamp (DuckDB returns `TIMESTAMPTZ` in the process time zone); compare instants only as aware datetimes through `to_utc`.
 - **Plan text and tests.** Subtle code (budget, gateway, journal, replay core, parsers) is given in full. Mechanical code is described exactly. Tests that pin a rule are given in full; the others are listed by name and each asserts what its name says. Every task's "Expected" test count assumes all listed tests are written.
-- **No AI principal changes the cap.** `Budget.set_cap` is called only at startup from `ai.yaml` and by a future operator command. Plan 5 must not route it through any `ai_supervisor` or `ai_research` path (spec 5.4).
-- **Defaults (index):** `max_output_tokens` 4000, `max_input_tokens` 60000, `calls_per_hour` 120, `max_in_flight` 2 (never above 2), `decision_deadline_seconds` 60, daily cap 2000 USD. No default model ids anywhere in code.
+- **No AI principal changes the cap.** The cap is the owner's `ai_paper.model_budget_usd_per_day` in `trader.yaml` (owner, 2026-10-07; spec 5.4). `ai.yaml` has no cap key. `Budget.set_cap` is called only with the value the trader serves (`get_ai_model_budget`, Plan 2; called by Plan 5's controller). No `ai_supervisor` or `ai_research` path writes the cap.
+- **Defaults (index):** `max_output_tokens` 4000, `max_input_tokens` 60000, `calls_per_hour` 120, `max_in_flight` 2 (never above 2), `decision_deadline_seconds` 60. The daily cap's default (2000 USD) lives in `trader.yaml`, not here. No default model ids anywhere in code.
 - **Credentials:** only from the environment of the `ai` container (`OPENROUTER_API_KEY`; `AWS_REGION` plus the standard AWS chain; `AZURE_OPENAI_ENDPOINT`, `AZURE_OPENAI_API_KEY`, `AZURE_OPENAI_API_VERSION`). They never appear in `ai.yaml`, an exception message, a repr, a log line or any `ai.duckdb` column (`test_credentials_never_reach_the_database`, `test_credentials_never_appear_in_errors_or_repr`).
 - **Config:** `yaml.safe_load` only. Unknown keys are errors and error text never echoes a file value. No environment override of the file. Missing, unsupported or incompatible config fails at startup with an `AiConfigError(code, message)`; there is no fallback model, backend or price.
 - **Usage parsing is strict:** token counts must be plain `int` (not `bool`, `float` or text), input at least 1, output at least 0. Anything else is `MalformedUsageError`, which keeps the full reservation. It is never zero cost.
@@ -30,7 +30,7 @@
 
 ## Rulings (spec silent, or the code forces a choice)
 
-1. **Cap source (OWNER TO CONFIRM).** Spec 5.4 names `ai_paper.model_budget_usd_per_day` in `trader.yaml` or an operator `cli` command. The `ai` container does not read `trader.yaml` and Plan 4 has no trader RPC. So Plan 4 reads the cap from `ai.yaml` key `budget.model_budget_usd_per_day` (default 2000) and calls `Budget.set_cap(micros)` at every start. `set_cap` is also the single entry point a later operator path (Plan 5 or SP2e) can call. *If wrong:* the owner edits `ai.yaml` instead of `trader.yaml`; no data or code is lost, only the place of the setting changes.
+1. **Cap source (owner decision, 2026-10-07).** The cap is `ai_paper.model_budget_usd_per_day` in `trader.yaml` (default 2000), as spec 5.4 says. The `ai` container does not read `trader.yaml` and Plan 4 has no trader RPC, so Plan 4 has **no** cap setting at all: `ai.yaml` carries no cap key (an old `budget.model_budget_usd_per_day` is an unknown key and refused), and `ModelGateway.start()` does not set a cap. `Budget.set_cap(micros)` is the single entry point; Plan 5's controller calls it with the trader's value (`get_ai_model_budget`). The persisted rules stay: the first `set_cap` initializes, lowering applies at once, a raise waits until 00:00 America/New_York, and a restart never applies a raise early (`RAISE_KEPT`). Until a cap was ever set, a call is refused `BUDGET_CAP_UNKNOWN` and nothing is reserved or sent. *If wrong:* none; an `ai`-side edit or restart cannot change the cap.
 2. **Windows and reservations.** A reservation belongs to the New York date in which it was made, for life. A call that crosses midnight settles in its own window, and an UNKNOWN reservation stays in its window; it does not carry into the next day. *If wrong:* an unknown call from yesterday would have lowered today's cap; the spec text ("never reset accounting twice or erase a reservation") is met either way.
 3. **Four failure outcomes.** `NOT_SENT` and `REJECTED` (HTTP 4xx except 408; Bedrock `Validation`, `AccessDenied`, `ResourceNotFound`, `Throttling`, `ServiceQuotaExceeded`) release the reservation; `UNKNOWN` (read timeout, 5xx, 408, dropped connection, caller cancel, restart) and `COST_UNKNOWN` (a response arrived but the usage is bad or the body is unusable) keep it at the worst case. *If wrong:* a provider that bills a 4xx would be under-counted by that call's cost.
 4. **Late usage.** `ModelGateway.report_late_usage(attempt_key, usage)` settles an UNKNOWN or COST_UNKNOWN reservation once, at the current `ai.yaml` price, and writes a `CORRECTION` cost event. Who calls it (an operator tool, a provider usage lookup) is Plan 5 or later. *If wrong:* unknown calls stay counted at the worst case until a caller exists; the budget is then too cautious, never too loose.
@@ -57,7 +57,7 @@ Everything Plans 5 and 6 import from this plan. These are pinned by `tests/ai/te
 
 **`trader.ai.clock`:** `Clock` protocol (`now() -> datetime` aware UTC, `monotonic() -> float`, `async sleep(seconds)`), `SystemClock()`.
 
-**`trader.ai.config`:** `load_ai_config(path: str = "~/.config/mmr/ai.yaml") -> AiConfig`; `AiConfig(roles, prices, budget, database_path)` with `.role(name) -> RoleConfig`, `.digest() -> str`; `RoleConfig(backend, model, max_input_tokens, max_output_tokens, call_timeout_seconds)`; `BudgetConfig(model_budget_usd_per_day, calls_per_hour, max_in_flight, decision_deadline_seconds)`; `PriceBook.price_for(backend, model) -> Optional[ModelPrice]`; `ModelPrice.cost_micros(input_tokens, output_tokens) -> int`; `AiConfigError(code, message)`; `check_credentials(config, environ, *, aws_credentials_present=...) -> None`; `usd_to_micros_floor(usd) -> int`; `micros_to_usd_str(micros) -> str`.
+**`trader.ai.config`:** `load_ai_config(path: str = "~/.config/mmr/ai.yaml") -> AiConfig`; `AiConfig(roles, prices, budget, database_path)` with `.role(name) -> RoleConfig`, `.digest() -> str`; `RoleConfig(backend, model, max_input_tokens, max_output_tokens, call_timeout_seconds)`; `BudgetConfig(calls_per_hour, max_in_flight, decision_deadline_seconds)` (no cap: Ruling 1); `PriceBook.price_for(backend, model) -> Optional[ModelPrice]`; `ModelPrice.cost_micros(input_tokens, output_tokens) -> int`; `AiConfigError(code, message)`; `check_credentials(config, environ, *, aws_credentials_present=...) -> None`; `usd_to_micros_floor(usd) -> int`; `micros_to_usd_str(micros) -> str`.
 
 **`trader.ai.model_client`:** `ChatMessage(role, content)`; `ModelRequest(request_key, messages, max_output_tokens, temperature=0.0, attempt_key=None)`; `Usage(input_tokens, output_tokens)`; `ModelResponse(text, usage, model, backend, finish_reason, provider_request_id)`; `ModelClient` protocol; errors `ModelCallError`, `NotSentError`, `ProviderRejectedError`, `OutcomeUnknownError`, `MalformedResponseError`, `MalformedUsageError` (each `.code`, `.detail`, `.outcome`); `OpenRouterAdapter`, `AzureOpenAIAdapter`, `BedrockAdapter`; `build_model_client(role, *, environ, http_client=None, bedrock_converse=None)`; `estimate_input_tokens(messages) -> int`.
 
@@ -67,7 +67,7 @@ Everything Plans 5 and 6 import from this plan. These are pinned by `tests/ai/te
 
 **`trader.ai.budget`:** `Budget(store, clock, *, calls_per_hour)` with `async set_cap(requested_micros) -> str`, `async snapshot() -> BudgetSnapshot(window_date, effective_cap_micros, pending_cap_micros, pending_window_date, committed_micros, open_reservations, unknown_reservations, next_reset_at)`; `window_date(instant) -> str`, `next_window_start(instant) -> datetime`; `BudgetExhausted`, `HourlyLimitReached`, `BudgetConflict`.
 
-**`trader.ai.gateway`:** `ModelGateway(*, config, store, clock, clients, budget=None, journal=None)` with `async start()`, `async recover_after_restart()`, `new_deadline(label: str = "") -> DecisionDeadline`, `async call(role: str, request: ModelRequest, deadline: DecisionDeadline) -> GatewayResult`, `async report_late_usage(attempt_key: str, usage: Usage) -> bool`, and attributes `.budget`, `.journal`; `build_gateway(config, *, store, clock, environ, clients=None) -> ModelGateway`; `DecisionDeadline(clock, seconds, label="")` (`.remaining() -> float`, `.expired`); `GatewayResult(response, attempt_key, cost_micros, reserved_micros, overrun=False, replayed=False)`; `CallRefused(code, detail="", *, retry_at=None)` with codes `ROLE_UNKNOWN | OUTPUT_LIMIT_ABOVE_ROLE | INPUT_TOO_LARGE | PRICE_UNAVAILABLE | DEADLINE_EXPIRED | IN_FLIGHT_LIMIT_DEADLINE | HOURLY_LIMIT_EXCEEDS_DEADLINE | BUDGET_EXHAUSTED | ATTEMPT_UNKNOWN`; `CallFailed(code, *, outcome, attempt_key, detail="")` with `.outcome_unknown`; `ModelCaller` protocol (`new_deadline`, `async call`). Plans 5 and 6 take a `ModelCaller`, so replay swaps in `ReplayGateway`.
+**`trader.ai.gateway`:** `ModelGateway(*, config, store, clock, clients, budget=None, journal=None)` with `async start()`, `async recover_after_restart()`, `new_deadline(label: str = "") -> DecisionDeadline`, `async call(role: str, request: ModelRequest, deadline: DecisionDeadline) -> GatewayResult`, `async report_late_usage(attempt_key: str, usage: Usage) -> bool`, and attributes `.budget`, `.journal`; `build_gateway(config, *, store, clock, environ, clients=None) -> ModelGateway`; `DecisionDeadline(clock, seconds, label="")` (`.remaining() -> float`, `.expired`); `GatewayResult(response, attempt_key, cost_micros, reserved_micros, overrun=False, replayed=False)`; `CallRefused(code, detail="", *, retry_at=None)` with codes `ROLE_UNKNOWN | OUTPUT_LIMIT_ABOVE_ROLE | INPUT_TOO_LARGE | PRICE_UNAVAILABLE | DEADLINE_EXPIRED | IN_FLIGHT_LIMIT_DEADLINE | HOURLY_LIMIT_EXCEEDS_DEADLINE | BUDGET_EXHAUSTED | BUDGET_CAP_UNKNOWN | ATTEMPT_UNKNOWN`; `start()` migrates and recovers only (no cap); `CallFailed(code, *, outcome, attempt_key, detail="")` with `.outcome_unknown`; `ModelCaller` protocol (`new_deadline`, `async call`). Plans 5 and 6 take a `ModelCaller`, so replay swaps in `ReplayGateway`.
 
 **`trader.ai.replay`:** `ReplayRecorder(store)` (`async record_tool_result(decision_key, tool, args, result)`, `async record_clock_values(decision_key, values)`, `async record_manifest(decision_key, *, code_version, config_digest)`); `RecordingClock(inner)` (`.values`); `ReplayEvidence.load(store, decision_key)`; `ReplaySession(evidence, counter=None)` (`.clock`, `.gateway`, `.counter`, `.tool_result(tool, args)`, `.run(work)`, `async .arun(work)`, `.assert_no_external_calls()`); `ReplayResult(status, value, missing)` with `COMPLETE` / `INCOMPLETE`; `ReplayIncomplete(missing)`, `ReplayDiverged`, `ExternalCallInReplay`; `ExternalAdapterCounter` (`.total`, `.count(name)`, `.instrument(name, client)`, `.tripwire(name)`); `ReplayModelClient`, `ReplayGateway`.
 
@@ -161,7 +161,6 @@ class FakeClock:
 
 def config_text(
     *,
-    cap: str = "2000",
     calls_per_hour: int = 120,
     deadline: int = 60,
     max_in_flight: int = 2,
@@ -181,7 +180,6 @@ pricing:
     "vendor/orch-1": {{input_usd_per_million: 3.0, output_usd_per_million: 15.0}}
     "vendor/jev-1": {{input_usd_per_million: 1.0, output_usd_per_million: 5.0}}
 budget:
-  model_budget_usd_per_day: {cap}
   calls_per_hour: {calls_per_hour}
   max_in_flight: {max_in_flight}
   decision_deadline_seconds: {deadline}
@@ -240,7 +238,7 @@ def test_jev_must_use_openrouter(tmp_path):
     assert refused(tmp_path, config_text(jev_backend="azure")).code == "JEV_BACKEND_NOT_OPENROUTER"
 ```
 
-**Also write these tests** (each asserts what its name says; the rules above and the helper functions in the file are all they need): `test_valid_config_loads_with_spec_defaults`, `test_missing_file_is_a_loud_error`, `test_orchestrator_may_use_bedrock_or_azure`, `test_unsupported_backend_is_refused`, `test_blank_model_is_refused_and_names_the_role`, `test_max_in_flight_above_two_is_refused`, `test_unknown_key_is_refused_and_the_value_is_not_echoed`, `test_budget_must_be_a_real_non_negative_number`, `test_integer_cap_is_accepted_as_a_float`, `test_missing_price_is_not_a_load_error_but_the_price_is_absent`, `test_cost_rounds_up_to_whole_micro_usd`, `test_money_helpers`, `test_digest_changes_when_a_price_changes`, `test_credentials_are_checked_by_name_only`, `test_azure_and_bedrock_credentials`.
+**Also write these tests** (each asserts what its name says; the rules above and the helper functions in the file are all they need): `test_valid_config_loads_with_spec_defaults`, `test_missing_file_is_a_loud_error`, `test_orchestrator_may_use_bedrock_or_azure`, `test_unsupported_backend_is_refused`, `test_blank_model_is_refused_and_names_the_role`, `test_max_in_flight_above_two_is_refused`, `test_unknown_key_is_refused_and_the_value_is_not_echoed`, `test_a_cap_in_ai_yaml_is_an_unknown_key` (`budget: {model_budget_usd_per_day: 5000}` → `AI_CONFIG_INVALID` naming the key path, and the number is not echoed), `test_budget_limits_must_be_real_positive_numbers`, `test_missing_price_is_not_a_load_error_but_the_price_is_absent`, `test_cost_rounds_up_to_whole_micro_usd`, `test_money_helpers`, `test_digest_changes_when_a_price_changes`, `test_credentials_are_checked_by_name_only`, `test_azure_and_bedrock_credentials`.
 
 - [ ] **Step 2: Run them and see them fail.**
 ```bash
@@ -348,7 +346,7 @@ class RoleConfig(_Section):
 
 
 class BudgetConfig(_Section):
-    model_budget_usd_per_day: Number = Field(2000.0, ge=0, allow_inf_nan=False)
+    # No cap here: the owner's cap is ai_paper.model_budget_usd_per_day in trader.yaml (Ruling 1).
     calls_per_hour: Whole = Field(120, gt=0)
     max_in_flight: Whole = Field(MAX_IN_FLIGHT_LIMIT, gt=0)
     decision_deadline_seconds: Number = Field(60.0, gt=0, le=600, allow_inf_nan=False)
@@ -502,8 +500,10 @@ pricing:
   # openrouter:
   #   "vendor/model-id": {input_usd_per_million: 3.0, output_usd_per_million: 15.0}
 
+# The daily model cap is not set here. It is ai_paper.model_budget_usd_per_day in
+# trader.yaml (default 2000); the ai service reads it from the trader. A raise
+# applies at the next 00:00 America/New_York, a lower cap at once.
 budget:
-  model_budget_usd_per_day: 2000   # raising applies at the next 00:00 America/New_York
   calls_per_hour: 120
   max_in_flight: 2                 # 2 is the maximum
   decision_deadline_seconds: 60    # one deadline spans orchestrator plus Jev
@@ -2039,8 +2039,11 @@ def request(key="d1/orchestrator/1", text="find ideas", max_output_tokens=500) -
 
 
 class World:
-    def __init__(self, tmp_path, clock, **config):
+    """``start()`` stands in for Plan 5's controller: it starts the gateway, then sets the owner cap."""
+
+    def __init__(self, tmp_path, clock, *, cap_usd: float = 2000.0, **config):
         self.clock = clock
+        self.cap_usd = cap_usd
         self.config = load_test_config(tmp_path, **config)
         self.store = AiStore(tmp_path / "ai.duckdb", clock=clock)
         orchestrator_model = self.config.role("orchestrator").model
@@ -2051,9 +2054,15 @@ class World:
             clients={"orchestrator": self.orchestrator.adapter(orchestrator_model),
                      "jev": self.jev.adapter("vendor/jev-1")})
 
+    async def start(self) -> None:
+        await self.gateway.start()
+        await self.gateway.budget.set_cap(usd_to_micros_floor(self.cap_usd))
+
     def rows(self, sql):
         return self.store.db.execute(sql, fetch="all")
 ```
+
+(`usd_to_micros_floor` is imported from `trader.ai.config`.)
 
 `tests/ai/test_gateway.py`:
 
@@ -2079,14 +2088,25 @@ UTC = timezone.utc
 @pytest_asyncio.fixture
 async def world(tmp_path, clock):
     built = World(tmp_path, clock)
-    await built.gateway.start()
+    await built.start()
     return built
+
+
+@pytest.mark.asyncio
+async def test_a_call_before_any_cap_is_refused_and_sends_nothing(tmp_path, clock):
+    built = World(tmp_path, clock)
+    await built.gateway.start()                                   # no set_cap: the trader was never read
+    with pytest.raises(CallRefused) as caught:
+        await built.gateway.call("orchestrator", request(), built.gateway.new_deadline())
+    assert caught.value.code == "BUDGET_CAP_UNKNOWN"
+    assert built.rows("SELECT count(*) FROM ai_budget_reservations") == [(0,)]
+    assert built.orchestrator.requests == []
 
 
 @pytest.mark.asyncio
 async def test_missing_price_refuses_and_leaves_no_trace(tmp_path, clock):
     built = World(tmp_path, clock, orchestrator_model="vendor/unpriced")
-    await built.gateway.start()
+    await built.start()
     with pytest.raises(CallRefused) as caught:
         await built.gateway.call("orchestrator", request(), built.gateway.new_deadline())
     assert caught.value.code == "PRICE_UNAVAILABLE"
@@ -2098,7 +2118,7 @@ async def test_missing_price_refuses_and_leaves_no_trace(tmp_path, clock):
 @pytest.mark.asyncio
 async def test_timeout_is_unknown_keeps_the_reservation_and_a_late_report_reconciles_once(tmp_path, clock):
     world = World(tmp_path, clock, call_timeout="0.05")
-    await world.gateway.start()
+    await world.start()
     world.orchestrator.hold = asyncio.Event()  # never released: the call times out
     with pytest.raises(CallFailed) as caught:
         await world.gateway.call("orchestrator", request(), world.gateway.new_deadline())
@@ -2141,12 +2161,12 @@ async def test_cancelling_a_call_records_unknown_and_keeps_the_reservation(world
 @pytest.mark.asyncio
 async def test_restart_turns_a_half_finished_call_into_a_counted_unknown(tmp_path, clock):
     first = World(tmp_path, clock)
-    await first.gateway.start()
+    await first.start()
     # simulate a crash after "reserve + journal begin" committed and before the adapter answered
     await first.gateway._reserve_and_begin("orchestrator", first.config.role("orchestrator"), request(),
                                            ORCHESTRATOR_WORST_CASE_MICROS)
     second = World(tmp_path, clock)  # new process, same ai.duckdb
-    await second.gateway.start()
+    await second.start()
     assert second.rows("SELECT status, error_code FROM ai_model_attempts") == [("UNKNOWN", "PROCESS_RESTARTED")]
     snapshot = await second.gateway.budget.snapshot()
     assert (snapshot.unknown_reservations, snapshot.committed_micros) == (1, ORCHESTRATOR_WORST_CASE_MICROS)
@@ -2180,9 +2200,10 @@ from dataclasses import dataclass
 from datetime import datetime
 from typing import Any, Mapping, Optional, Protocol
 
-from trader.ai.budget import Budget, BudgetExhausted, HourlyLimitReached, RELEASE_NOT_SENT, RELEASE_REJECTED
+from trader.ai.budget import (Budget, BudgetExhausted, BudgetNotInitialized, HourlyLimitReached,
+                             RELEASE_NOT_SENT, RELEASE_REJECTED)
 from trader.ai.clock import Clock
-from trader.ai.config import ROLE_NAMES, AiConfig, AiConfigError, ModelPrice, RoleConfig, usd_to_micros_floor
+from trader.ai.config import ROLE_NAMES, AiConfig, AiConfigError, ModelPrice, RoleConfig
 from trader.ai.journal import (
     COST_CONFIRMED, COST_CORRECTION, COST_ESTIMATED_UNKNOWN, COST_NONE, AttemptJournal, AttemptRecord,
 )
@@ -2273,9 +2294,9 @@ class ModelGateway:
     # --- lifecycle -------------------------------------------------------
 
     async def start(self) -> None:
-        """Migrate, apply the configured cap, then turn leftovers of a dead process into UNKNOWN."""
+        """Migrate, then turn leftovers of a dead process into UNKNOWN. The cap is not set here: Plan 5's
+        controller sets it from the trader (Ruling 1); until then every call is BUDGET_CAP_UNKNOWN."""
         await asyncio.to_thread(self.store.migrate)
-        await self.budget.set_cap(usd_to_micros_floor(self.config.budget.model_budget_usd_per_day))
         await self.recover_after_restart()
 
     async def recover_after_restart(self) -> None:
@@ -2340,6 +2361,9 @@ class ModelGateway:
             except BudgetExhausted as exhausted:
                 self._slots.release()
                 raise CallRefused("BUDGET_EXHAUSTED", str(exhausted), retry_at=exhausted.retry_at) from None
+            except BudgetNotInitialized:
+                self._slots.release()
+                raise CallRefused("BUDGET_CAP_UNKNOWN", "no owner cap was set (trader.yaml, Plan 5)") from None
             except BaseException:
                 self._slots.release()
                 raise
@@ -2537,7 +2561,7 @@ async def live_decision(world):
 @pytest_asyncio.fixture
 async def decided(tmp_path, clock):
     world = World(tmp_path, clock)
-    await world.gateway.start()
+    await world.start()
     return world, await live_decision(world)
 
 
@@ -3242,4 +3266,3 @@ Expected: `tests/ai`: 167 passed. Full suite: green. If a test outside `tests/ai
 git add AGENTS.md tests/ai/test_public_api.py tests/ai/test_isolation.py
 git commit -m "test: pin the ai public api and keep the package off the trading runtime" -m "Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>"
 ```
-

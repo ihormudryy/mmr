@@ -12,7 +12,7 @@
 
 ## Global Constraints
 
-- Base: master after SP1 Plans 3–6. Read code at `/private/tmp/sp1-impl6` until then. Code is cited by file and function name.
+- Base: master after SP1 Plans 3–6 **and PR #76** (#74: `trader/trading/quote_feeds.py` with `LIVE_FEED`, `IEX_REALTIME_FEED`, `LIVE_ONLY_FEEDS`, `PAPER_IEX_FEEDS`, `accepted_feeds(account_mode, quote_fallback)`; `FallbackQuoteAuthority`; `_build_quote_authority` returning `(quotes, accepted_feeds)`). Read code at `/private/tmp/sp1-impl6` until then. Code is cited by file and function name.
 - Plans 1 and 3 both edit `trader/automation/ai_paper_decision.py`, `trader/messaging/production_api.py` and `trader/messaging/principals.py`. This plan touches only: `AiPaperDecision._check_shape`, `DecisionRow`, `_ROW_COLUMNS`, the migration-56 CREATE, `AiPaperDecisionStore` (one new method, `links_for_order_ref`), `_Refusal`, `AiPaperDecisionService.__init__` / `attach_scope` / `_deployment` / `_execute_entry` / `_start_saga` / `_execute_reduction`, `deployment_binding`. No test here sends `submit_ai_paper_decision` over RPC, so Plan 1's epoch envelope does not affect them.
 - No legacy data (owner, 2026-10-07): changed SP1 tables edit their CREATE in place (migration 55 `ai_deployments` gains `kind`; migration 56 `ai_paper_decisions` gains `experiment_id`, `deployment_kind`). No ALTER, no backfill. One new table: migration **100** `discretionary_scope_checks`. 101–104 stay unused.
 - Rights: `register_discretionary_deployment` = `{"cli"}`; `discover_ai_candidates` = `{"ai_supervisor"}`. Each handler also checks its principal in-process.
@@ -32,11 +32,11 @@
 1. **Record.** A discretionary deployment is its own dataclass (`DiscretionaryDeployment`: `kind`, `style`, `scope_rule`, `attestation`) with its own digest domain `mmr.ai-discretionary-deployment.v1\x00`, stored in `ai_deployments` with `kind = 'discretionary'` and provenance `OPERATOR_ATTESTED`. Insert-only, like strategy rows. `get_sealed` stays strategy-only (`DEPLOYMENT_KIND_MISMATCH` on a discretionary digest), so no SP1 caller can mistake one for the other; `get_sealed_any` serves both. `AiDeployment.from_json` already demands its exact key set, so `ai_research`'s `register_ai_deployment` cannot register a discretionary body. *Cost if wrong:* none to SP1 rows.
 2. **Narrow-only rule.** The operator may narrow every part but not widen past the spec default: `primary_exchanges ⊆ {NYSE, NASDAQ, ARCA}`, `stock_types ⊆ {COMMON, ETF}`, `min_price ≥ 5`, `min_median_dollar_volume ≥ 20_000_000`, `0 < max_order_share_of_dollar_volume ≤ 0.01`. The 20-session window is fixed. The trading filter always applies. *Cost:* ADRs, REITs, preferreds, ETNs and closed-end funds are out until the owner widens the code sets (owner to confirm).
 3. **Instrument identity proof.** At each admission the trader asks IB `reqContractDetails(Contract(conId=N))` (5 s timeout) and needs exactly one detail whose `contract.conId == N`. Exchange = `contract.primaryExchange` (never `exchange`/`SMART`). Type = `contract.secType == "STK"`, `contract.currency == "USD"` and `ContractDetails.stockType ∈ rule.stock_types`. Warrants (`secType` `WAR`, or `stockType` `WARRANT`), rights (`RIGHT`), units (`UNIT`) and OTC (`primaryExchange` `PINK`/`OTC…`) fail by these allow-lists. A blank `stockType` (stub or CSV universe rows, an old gateway) refuses `instrument_type`; the local universe row is never used as proof. The IB definition is also remembered in the `_instruments` universe, so quotes and the SP1 entry filter can resolve the conid.
-4. **Price part** compares the fresh IB **bid** with `min_price` (the quote has no `last`; the bid is the stricter side). *Cost:* a $5.00 last with a $4.99 bid is refused.
+4. **Price part and quote evidence (owner, #74).** The quote comes from the trader's quote authority (`_build_quote_authority`: IB, wrapped by `FallbackQuoteAuthority` on paper with `automation.quote_fallback: alpaca_iex`) and must carry a feed in the command stack's accepted set (`accepted_feeds(account_mode, quote_fallback)`): `{live, iex_realtime}` on paper with the fallback, `{live}` everywhere else. A feed outside the set (for example `delayed`, or `iex_realtime` without the fallback or on live) is `evidence_stale`, and the reason names the feed and the accepted set. The price part compares the quote's **bid** with `min_price` (the quote has no `last`; the bid is the stricter side). The evidence row records the feed. *Cost:* a $5.00 last with a $4.99 bid is refused; an IEX bid (one venue) can be lower than the national bid, so IEX refuses a little more often near the floor.
 5. **20-session dollar volume (source and freshness).** The 20 latest *closed* XNYS sessions at `now`, each `close × volume`, median. Source: the trader's local daily bars (`TickStorage` `BarSize.Days1`, TRADES), else the trader's Alpaca history adapter (SIP daily bars, split-adjusted), held in memory and cached per `(conid, last closed session)`. Fresh means: the 20 sessions are exactly `latest_closed_sessions(now)`; a new session close makes it stale. Neither source complete → `evidence_stale`. *Cost:* the first entry per symbol per day costs one Alpaca call.
 6. **Effective dollar-volume floor.** SP1's `session_risk` applies `LiquidityPolicy.evaluate` to every entry (`MIN_MEDIAN_DOLLAR_VOLUME = 50_000_000`). "≥ $20M plus SP1's liquidity rule" is a conjunction, so the `dollar_volume` part compares with `max(rule.min_median_dollar_volume, 50_000_000)` and names both in `reason`. The sealed default stays $20M (owner to confirm; the effective floor is $50M until SP1's floor changes).
 7. **Liquidity part.** Order notional ≤ `max_order_share_of_dollar_volume × median` (default 1%). SP1 applies `LIVE_NOTIONAL_TOLERANCE` (5%) to the attested notional in `prepare_entry` and `session_risk`, so the trader passes `cap / 1.05` as the attested notional; the enforced bound is exactly the cap. A requested quantity over it refuses `liquidity` (not `ORDER_EXCEEDS_ATTESTED_NOTIONAL`). SP1's 0.25 % ADV share cap still applies on top.
-8. **Admission vs dispatch.** Admission: fresh IB contract details, fresh IB quote, volume source. Dispatch (inside the saga's entry lock): no IB call and no history read. Price, liquidity and the trading filter use the guard's fresh quote; exchange, type and dollar volume reuse the admission evidence carried on the approval (`ApprovalContext.discretionary_scope`) if it is at most 60 s old and the volume window is still current; otherwise `evidence_stale`. Admission and dispatch run in one `execute` call, so this is seconds. The gate's only I/O is one `kind_of` journal read per AI entry (to fail closed when a discretionary approval lost its evidence) and one check-row write.
+8. **Admission vs dispatch.** Admission: fresh IB contract details, a fresh quote from the quote authority (Ruling 4), volume source. Dispatch (inside the saga's entry lock): no IB call and no history read. Price, liquidity and the trading filter use the guard's fresh quote; exchange, type and dollar volume reuse the admission evidence carried on the approval (`ApprovalContext.discretionary_scope`) if it is at most 60 s old and the volume window is still current; otherwise `evidence_stale`. Admission and dispatch run in one `execute` call, so this is seconds. The gate's only I/O is one `kind_of` journal read per AI entry (to fail closed when a discretionary approval lost its evidence) and one check-row write.
 9. **`detail.part` at dispatch.** The saga keeps only `error_code`. The dispatch gate writes its verdict to `discretionary_scope_checks` (phase `dispatch`) before it returns the code; `_start_saga` reads it back. A missing row still refuses, with `part = evidence_stale` and reason `dispatch check left no record`. Phases: `admission`, `sizing`, `dispatch`; one row per `(command_id, phase)`.
 10. **Fail closed on kind.** A request whose `deployment_digest` is discretionary but whose approval carries no scope evidence is refused at dispatch (`evidence_stale`).
 11. **Discovery sources.** Only Alpaca, named explicitly (no registry default, no fallback): movers and most-actives through new raw methods on `AlpacaMovers` (same client, Alpaca's own `last_updated` kept), news through `AlpacaNews.news(symbol, n)`. Everything is labelled `delayed: true, delay_minutes: 15`. A source that raises `ProviderError` is reported (`failed: true`, `error_code` = exception class name, ERROR log) and the read still returns with `complete: false` (spec 9). Blank keys refuse the whole read (`DISCOVERY_SOURCE_UNAVAILABLE`).
@@ -46,6 +46,8 @@
 15. **6.4 gap: ownership.** A reduction needs an `ENTER` decision row of the *current* experiment on that conid whose protective saga reports `filled_quantity > 0`; otherwise `POSITION_NOT_OWNED`. It applies in every experiment state (a non-owned CLOSE while `KILLED` gains nothing). Ownership is per conid, not per share: with SP1's "the bot owns the paper account alone", a human lot added to an owned conid is closed with it.
 16. **Labels.** `get_ai_deployment` returns `kind`; `DecisionLink` gains `deployment_kind`; a discretionary ENTER's link reports `strategy_version = "discretionary"`, so the scoreboard splits and `mmr` show the word. `mmr ai-deployment show` prints `DISCRETIONARY (operator attested, no backtest evidence)`.
 17. **Discovery runs on a worker thread** (`execution="thread"`): network I/O must not block the trader loop that `ib_async` uses. It exists only when `ai_paper.enabled` built the services.
+18. **Entry quote read for the `ai` service.** A query `get_ai_entry_quote` (`ai_supervisor` only, `execution="thread"`) returns the trader's executable BUY quote for one conid from the **same** quote authority and the **same** accepted-feed set the command stack uses for entries: `{"conid": int, "read_at": iso, "account_mode": str, "accepted_feeds": [str, ...] (sorted), "quote": null | {"bid", "ask", "bid_size", "ask_size", "market_timestamp": iso, "feed": str, "session_state": str}}`. A quote whose feed is outside the set is still returned with its label, so the `ai` side can record `feed_not_accepted` instead of "no quote"; the `ai` side never decides the set (Plan 6 Ruling 3). The trader re-checks everything at admission. *Cost if wrong:* one more quote read per decision; the IB snapshot read (`get_snapshot`) carries no feed set and is not used for entry evidence.
+19. **Baseline sizing for discretionary deployments.** Plan 2's `AiPaperBaselineSizer` sizes strategy deployments only. This plan makes it use `get_sealed_any` and, for a discretionary deployment, the notional bound a discretionary ENTER really gets: `max_order_share_of_dollar_volume × median` (admission passes `cap / 1.05` and `prepare_entry` multiplies by 1.05, Ruling 7), with the median from `DollarVolumeSource.twenty_sessions` (no current window → `SizingUnavailable("VOLUME_UNAVAILABLE")`), and liquidity from `liquidity_from_sessions(volume, quote)` as `prepare_entry` does. The scope rule itself is not re-run for a baseline (the fixed rule picks from candidates that passed the precheck; the follow-signal baseline is never discretionary).
 
 ## Cross-plan additions
 
@@ -96,6 +98,8 @@ class DiscoverAiCandidatesResponse(BaseModel):
 - `discover_ai_candidates` errors: `DISCOVERY_SOURCE_UNAVAILABLE` (Alpaca keys blank), `DEPLOYMENT_KIND_MISMATCH`, `DEPLOYMENT_NOT_SEALED`, `DEPLOYMENT_TAMPERED`. The read can take up to about 40 s on the first cycle of a day: Plan 5's query client for this method uses a 90 s timeout. Plan 6 drops `FAIL` and every candidate whose `conid` is null before any model call.
 - `register_discretionary_deployment` request: `{"deployment": {"kind": "discretionary", "style": "intraday_long", "scope_rule": {"primary_exchanges": [...], "stock_types": [...], "min_price": float, "min_median_dollar_volume": float, "max_order_share_of_dollar_volume": float}, "attestation": {"operator": str, "statement": str, "attested_at": iso-with-offset}}}` → `CommandReceipt` with `outcome = {"digest", "created", "kind": "discretionary"}`. `trader.automation.discretionary_deployment.DEFAULT_SCOPE_RULE` holds the spec default.
 - `get_ai_deployment` response gains `"kind": "strategy" | "discretionary" | None`.
+- `get_ai_entry_quote` (query, `ai_supervisor`): request `{"conid": int}` (strict, `conid > 0`, `type(conid) is int`); reply as Ruling 18. Plan 5 adds it to `SUPERVISOR_QUERIES`; Plan 6 reads its entry evidence from it.
+- `trader.automation.discretionary_scope.quote_problem(quote, now, accepted_feeds) -> Optional[str]`; `ScopeInputs.accepted_feeds: frozenset[str]` (no default: every caller passes the command stack's set).
 - `submit_ai_paper_decision`: an ENTER naming a discretionary digest may fail `OUT_OF_DISCRETIONARY_SCOPE` with `outcome.detail = {"part": ScopePart, "reason": str, "phase": "admission" | "sizing" | "dispatch", "check_id": str | None}`. A `PARTIAL_CLOSE` must carry `stop_price = target_price = null` (else `DECISION_INVALID`). A reduction of a conid the current experiment never filled is `POSITION_NOT_OWNED`.
 - `DecisionLink.deployment_kind: Optional[str] = None` (last field).
 - Compose: the `ai` service must not inherit `x-mmr-common-env` (it carries `ALPACA_API_KEY_ID` / `ALPACA_API_SECRET_KEY`, `docker-compose.yml`).
@@ -105,6 +109,7 @@ class DiscoverAiCandidatesResponse(BaseModel):
 
 1. **A blank `stockType`** (stub universe row, CSV import or an old gateway) must never pass. → Task 6 `test_blank_stock_type_is_instrument_type`, Task 7 `test_each_failed_part_is_refused_with_its_code[blank-type]`.
 2. **The bid falls below the floor between admission and dispatch.** Refused at dispatch with `part = price`, `phase = dispatch`, no order sent. → Task 8 `test_price_falling_below_the_floor_at_dispatch_is_refused_with_its_part`.
+2b. **An IEX quote (owner #74).** Accepted only on paper with `automation.quote_fallback: alpaca_iex`; anywhere else `evidence_stale`, with the feed in the reason and the evidence row; the `ai` side gets the feed and the accepted set from `get_ai_entry_quote`. → Task 6 `test_an_iex_quote_passes_only_with_the_paper_fallback_set`, `test_each_part[...iex...]`; Task 8 `test_an_iex_quote_follows_the_accepted_set`; Task 10 `test_the_entry_quote_carries_its_feed_and_the_accepted_set`.
 3. **Quantity one share over 1 % of the median** (the 5 % tolerance trap). → Task 7 `test_liquidity_boundary_is_exact`.
 4. **Alpaca movers fail while most-actives works.** Coverage shows the failure, `complete` is false, only seen candidates are returned, the IB scanner is untouched. → Task 9 `test_a_failed_source_is_reported_not_hidden`, Task 10 `test_discovery_over_signed_rpc_reports_partial_coverage_and_never_scans`.
 5. **A close of a position the experiment never bought**, and a partial close that tries to move the stop. → Task 2 `test_a_position_the_experiment_never_entered_is_not_closed`, Task 1 `test_partial_close_with_prices_is_refused`.
@@ -139,6 +144,7 @@ class DiscoverAiCandidatesResponse(BaseModel):
 | `trader/automation/ai_paper_evidence.py`, `trader/trading/approval_context.py`, `trader/trading/command_stack.py` | 7, 8, 10 |
 | `trader/automation/ai_discovery_wire.py`, `trader/automation/ai_discovery.py` (new), `trader/data_providers/alpaca/movers.py` | 9 |
 | `trader/trading/trading_runtime.py`, `trader/trader_service.py` (none: the Container fills `Trader`) | 10 |
+| `trader/automation/ai_baseline_sizing.py` (Plan 2's; discretionary sizing) | 10 |
 | `AGENTS.md`, `docs/CLI_REFERENCE.md` | 11 |
 
 ---
@@ -926,9 +932,9 @@ class DollarVolumeSource:
 - Test: `tests/automation/test_discretionary_scope.py`
 
 **Interfaces:**
-- Produces: `OUT_OF_DISCRETIONARY_SCOPE`, `SCOPE_PARTS`, `SCOPE_CHECK_MIGRATION_VERSION = 100`, `apply_scope_check_migration(migrator) -> bool`; `ScopeInputs(contract, quote, volume, order_notional: Optional[float], filter_refusal, missing: tuple[str, ...] = ())`; `ScopeVerdict(part: Optional[str], reason: str, evidence: Mapping)` with `passed`; `static_scope_refusal(rule, contract) -> Optional[tuple[str, str]]`; `effective_dollar_volume_floor(rule) -> float`; `quote_problem(quote, now) -> Optional[str]`; `evaluate_scope(rule, inputs, now) -> ScopeVerdict`; `trading_filter_refusal(load_filter) -> Callable[[ContractEvidence, float], Optional[str]]`; `ScopeCheckStore(db, now)` with `record(*, command_id, phase, deployment_digest, conid, verdict) -> dict` and `detail(command_id, phase) -> Optional[dict]`.
+- Produces: `OUT_OF_DISCRETIONARY_SCOPE`, `SCOPE_PARTS`, `SCOPE_CHECK_MIGRATION_VERSION = 100`, `apply_scope_check_migration(migrator) -> bool`; `ScopeInputs(contract, quote, volume, order_notional: Optional[float], filter_refusal, accepted_feeds: frozenset[str], missing: tuple[str, ...] = ())`; `ScopeVerdict(part: Optional[str], reason: str, evidence: Mapping)` with `passed`; `static_scope_refusal(rule, contract) -> Optional[tuple[str, str]]`; `effective_dollar_volume_floor(rule) -> float`; `quote_problem(quote, now, accepted_feeds) -> Optional[str]`; `evaluate_scope(rule, inputs, now) -> ScopeVerdict`; `trading_filter_refusal(load_filter) -> Callable[[ContractEvidence, float], Optional[str]]`; `ScopeCheckStore(db, now)` with `record(*, command_id, phase, deployment_digest, conid, verdict) -> dict` and `detail(command_id, phase) -> Optional[dict]`.
 
-- [ ] **Step 1: Write the failing tests** (`inputs(**changes)` builds a passing `ScopeInputs`: NASDAQ COMMON contract fetched at `NOW`, `quote()` with bid 99.95, a current 20-session volume of $100M median, `order_notional=50_000.0`, a filter that allows all; `contract(**fields)`, `quote(**fields)` and `volume(median=100e6, sessions_ending_days_ago=0)` are local builders, the last one ending its 20 sessions that many calendar days before `latest_closed_sessions(NOW)[-1]`):
+- [ ] **Step 1: Write the failing tests** (`inputs(**changes)` builds a passing `ScopeInputs`: NASDAQ COMMON contract fetched at `NOW`, `quote()` with bid 99.95 and feed `live`, a current 20-session volume of $100M median, `order_notional=50_000.0`, a filter that allows all, `accepted_feeds=LIVE_ONLY_FEEDS` (`LIVE_ONLY_FEEDS` and `PAPER_IEX_FEEDS` imported from `trader.trading.quote_feeds`); `contract(**fields)`, `quote(**fields)` and `volume(median=100e6, sessions_ending_days_ago=0)` are local builders, the last one ending its 20 sessions that many calendar days before `latest_closed_sessions(NOW)[-1]`):
 
 ```python
 def test_a_good_instrument_passes():
@@ -951,12 +957,23 @@ def test_a_good_instrument_passes():
     ({"contract": None, "missing": ("IB timeout",)}, "evidence_stale"),
     ({"quote": quote(age=6.0)}, "evidence_stale"),
     ({"quote": quote(feed="delayed")}, "evidence_stale"),
+    ({"quote": quote(feed="iex_realtime")}, "evidence_stale"),          # IEX without the paper fallback
+    ({"quote": quote(feed="delayed"), "accepted_feeds": PAPER_IEX_FEEDS}, "evidence_stale"),
     ({"volume": None, "missing": ("no bars",)}, "evidence_stale"),
     ({"volume": volume(sessions_ending_days_ago=3)}, "evidence_stale"),
 ])
 def test_each_part(changes, part):
     verdict = evaluate_scope(DEFAULT_SCOPE_RULE, inputs(**changes), NOW)
     assert (verdict.passed, verdict.part) == (False, part)
+
+
+def test_an_iex_quote_passes_only_with_the_paper_fallback_set():       # owner #74
+    iex = quote(feed="iex_realtime")
+    assert evaluate_scope(DEFAULT_SCOPE_RULE, inputs(quote=iex, accepted_feeds=PAPER_IEX_FEEDS), NOW).passed
+    refused = evaluate_scope(DEFAULT_SCOPE_RULE, inputs(quote=iex, accepted_feeds=LIVE_ONLY_FEEDS), NOW)
+    assert refused.part == "evidence_stale" and "iex_realtime" in refused.reason and "live" in refused.reason
+    assert evaluate_scope(DEFAULT_SCOPE_RULE, inputs(quote=quote(bid=4.99, ask=5.0, feed="iex_realtime"),
+                                                     accepted_feeds=PAPER_IEX_FEEDS), NOW).part == "price"
 
 
 def test_blank_stock_type_is_instrument_type():                       # review focus 1
@@ -1035,16 +1052,19 @@ def static_scope_refusal(rule, contract: ContractEvidence) -> Optional[tuple[str
     return None
 
 
-def quote_problem(quote: Any, now: dt.datetime) -> Optional[str]:
+def quote_problem(quote: Any, now: dt.datetime, accepted_feeds: frozenset[str]) -> Optional[str]:
+    """Ruling 4: the quote authority's quote, with a feed the command stack accepts (owner #74)."""
     if quote is None:
-        return "no executable IB quote"
+        return "no executable quote"
     age = (now - quote.market_timestamp).total_seconds()
     if age > MAX_QUOTE_AGE_SECONDS or age < -MAX_SOURCE_CLOCK_SKEW_SECONDS:
-        return f"IB quote is {age:.1f} s old"
-    if quote.feed_type != "live" or quote.session_state != "continuous":
-        return f"IB quote is {quote.feed_type}/{quote.session_state}, not live continuous trading"
+        return f"{quote.feed_type} quote is {age:.1f} s old"
+    if quote.feed_type not in accepted_feeds:
+        return f"quote feed {quote.feed_type} is not accepted here (accepted: {sorted(accepted_feeds)})"
+    if quote.session_state != "continuous":
+        return f"{quote.feed_type} quote is {quote.session_state}, not continuous trading"
     if not (_finite_positive(quote.bid) and _finite_positive(quote.ask)) or quote.ask < quote.bid:
-        return "IB quote has no valid bid and ask"
+        return f"{quote.feed_type} quote has no valid bid and ask"
     return None
 
 
@@ -1059,11 +1079,11 @@ def evaluate_scope(rule, inputs: ScopeInputs, now: dt.datetime) -> ScopeVerdict:
     static = static_scope_refusal(rule, inputs.contract)
     if static is not None:
         return refuse(*static)
-    problem = quote_problem(inputs.quote, now)
+    problem = quote_problem(inputs.quote, now, inputs.accepted_feeds)
     if problem is not None:
         return refuse("evidence_stale", problem)
     if inputs.quote.bid < rule.min_price:
-        return refuse("price", f"IB bid {inputs.quote.bid} is below {rule.min_price}")
+        return refuse("price", f"{inputs.quote.feed_type} bid {inputs.quote.bid} is below {rule.min_price}")
     volume = inputs.volume
     if volume is None or not volume.is_current(now):
         return refuse("evidence_stale", "; ".join(inputs.missing) or "20-session volume is not the latest window")
@@ -1084,7 +1104,7 @@ def evaluate_scope(rule, inputs: ScopeInputs, now: dt.datetime) -> ScopeVerdict:
     return ScopeVerdict(None, "in scope", evidence)
 ```
 
-`ScopeCheckStore.record` inserts with `ON CONFLICT (command_id, phase) DO NOTHING`, then returns `detail(command_id, phase)`, which reads the row back as `{"part", "reason", "phase", "check_id": f"{phase}:{command_id}"}`; `phase` must be in `PHASES` (`ValueError` otherwise). `_evidence_json` stores the contract fields, bid/ask/quote time, `volume.to_json()` and the order notional. Register `apply_scope_check_migration` next to `apply_ai_paper_decision_migration` in `build_command_stack` (`# 100`).
+`ScopeCheckStore.record` inserts with `ON CONFLICT (command_id, phase) DO NOTHING`, then returns `detail(command_id, phase)`, which reads the row back as `{"part", "reason", "phase", "check_id": f"{phase}:{command_id}"}`; `phase` must be in `PHASES` (`ValueError` otherwise). `_evidence_json` stores the contract fields, bid/ask/quote time, the quote's `feed_type`, the accepted feed set, `volume.to_json()` and the order notional. Register `apply_scope_check_migration` next to `apply_ai_paper_decision_migration` in `build_command_stack` (`# 100`).
 - [ ] **Step 4: Run** the new file → PASS.
 - [ ] **Step 5: Commit** — `feat: evaluate the discretionary scope rule and record every check`.
 
@@ -1181,10 +1201,13 @@ The sized quantity is the `quantity` that `_start_saga` writes into the SUBMITTE
 
 ```python
 class DiscretionaryScopeService:
-    """Ruling 8 at admission: fresh IB contract details, a fresh IB quote and the volume source."""
+    """Ruling 8 at admission: fresh IB contract details, a fresh quote from the quote authority and the volume
+    source. ``quotes`` and ``accepted_feeds`` are the command stack's own (Ruling 4, PR #76)."""
 
-    def __init__(self, *, contracts, volumes, quotes, filter_refusal, checks: ScopeCheckStore, now):
+    def __init__(self, *, contracts, volumes, quotes, accepted_feeds: frozenset[str], filter_refusal,
+                 checks: ScopeCheckStore, now):
         self._contracts, self._volumes, self._quotes = contracts, volumes, quotes
+        self._accepted_feeds = frozenset(accepted_feeds)
         self._filter_refusal, self._checks, self._now = filter_refusal, checks, now
 
     @property
@@ -1199,7 +1222,7 @@ class DiscretionaryScopeService:
         quote = self._fetch(lambda: self._quotes.executable_quote(conid, side="BUY"), missing)
         rule = deployment.scope_rule
         verdict = evaluate_scope(rule, ScopeInputs(contract, quote, volume, None, self._filter_refusal,
-                                                   tuple(missing)), self._now())
+                                                   self._accepted_feeds, tuple(missing)), self._now())
         detail = self._checks.record(command_id=command_id, phase="admission", deployment_digest=digest,
                                      conid=conid, verdict=verdict)
         if not verdict.passed:
@@ -1300,9 +1323,11 @@ In `AiPaperDecisionService`: `scope: Any = None` constructor argument and `attac
     volumes = DollarVolumeSource(history=getattr(trader, "data", None),
                                  alpaca_history=lambda: _alpaca_provider(trader, Capability.HISTORY), now=now)
     decisions.attach_scope(DiscretionaryScopeService(
-        contracts=contracts, volumes=volumes, quotes=quotes, filter_refusal=parts.filter_refusal,
-        checks=parts.scope_checks, now=now))
+        contracts=contracts, volumes=volumes, quotes=quotes, accepted_feeds=accepted_feeds,
+        filter_refusal=parts.filter_refusal, checks=parts.scope_checks, now=now))
 ```
+
+(`quotes` and `accepted_feeds` are the pair `_build_quote_authority` returns, PR #76; the same pair `AiPaperEvidence` gets.)
 
 with `_contract_details_port(trader)` = `getattr(trader, "contract_details_port", None)` (test seam) or `lambda contract: _run_on_trader_loop(trader, trader.client.ib.reqContractDetailsAsync(contract), timeout=CONTRACT_DETAILS_TIMEOUT_SECONDS)`; `_remember_instrument` inserts `SecurityDefinition.from_contract_details(details)` into `INSTRUMENTS_UNIVERSE` when the conid is not there (same logic as `production_api._cache_resolved_instrument`); `_alpaca_provider(trader, capability)` = `getattr(trader, "provider_factory", None)` (test seam) or `ProviderRegistry.from_config({"alpaca_api_key_id": trader.alpaca_api_key_id, "alpaca_api_secret_key": trader.alpaca_api_secret_key}).get(capability, "alpaca")` (Task 10 adds the two `Trader` fields; until then `getattr(trader, name, "")`). `contracts`, `volumes` are kept on `AiPaperServices` (`scope_contracts`, `scope_volumes`, both default `None`) for Task 10.
 - [ ] **Step 4: Run** the new file, `tests/automation/test_ai_paper_decision.py`, `tests/automation/test_ai_paper_evidence.py`, `tests/test_ai_paper_rpc.py`, `tests/test_command_stack.py` → PASS.
@@ -1320,7 +1345,7 @@ with `_contract_details_port(trader)` = `getattr(trader, "contract_details_port"
 - Test: `tests/automation/test_discretionary_dispatch.py`
 
 **Interfaces:**
-- Produces: `compose_entry_gates(*gates) -> gate`; `discretionary_scope_gate(*, kind_of: Callable[[str], str], checks: ScopeCheckStore, filter_refusal) -> Callable[[request, approval, quote, now], Optional[str]]`.
+- Produces: `compose_entry_gates(*gates) -> gate`; `discretionary_scope_gate(*, kind_of: Callable[[str], str], checks: ScopeCheckStore, filter_refusal, accepted_feeds: frozenset[str]) -> Callable[[request, approval, quote, now], Optional[str]]`.
 
 - [ ] **Step 1: Write the failing tests:**
 
@@ -1399,7 +1424,8 @@ def compose_entry_gates(*gates):
     return gate
 
 
-def discretionary_scope_gate(*, kind_of: Callable[[str], str], checks: ScopeCheckStore, filter_refusal):
+def discretionary_scope_gate(*, kind_of: Callable[[str], str], checks: ScopeCheckStore, filter_refusal,
+                             accepted_feeds: frozenset[str]):
     """Ruling 8 at dispatch: price, liquidity and the filter on the guard's fresh quote; the rest from
     the admission evidence on the approval. No IB call and no history read under the entry lock."""
 
@@ -1416,7 +1442,7 @@ def discretionary_scope_gate(*, kind_of: Callable[[str], str], checks: ScopeChec
             verdict = ScopeVerdict("evidence_stale", "the scope evidence names another deployment", {})
         else:
             verdict = evaluate_scope(evidence.rule, _dispatch_inputs(evidence, approval, quote, now,
-                                                                     filter_refusal), now)
+                                                                     filter_refusal, accepted_feeds), now)
         checks.record(command_id=request.command_id, phase="dispatch", deployment_digest=str(digest),
                       conid=int(approval.conid), verdict=verdict)
         return None if verdict.passed else OUT_OF_DISCRETIONARY_SCOPE
@@ -1424,15 +1450,15 @@ def discretionary_scope_gate(*, kind_of: Callable[[str], str], checks: ScopeChec
     return gate
 
 
-def _dispatch_inputs(evidence, approval, quote, now, filter_refusal) -> ScopeInputs:
+def _dispatch_inputs(evidence, approval, quote, now, filter_refusal, accepted_feeds) -> ScopeInputs:
     age = now - evidence.contract.fetched_at
     fresh = dt.timedelta(seconds=-MAX_SOURCE_CLOCK_SKEW_SECONDS) <= age <= DISPATCH_EVIDENCE_MAX_AGE
     notional = None
-    if quote_problem(quote, now) is None:
+    if quote_problem(quote, now, accepted_feeds) is None:
         limit = planned_entry_limit(float(quote.ask), float(quote.bid), AI_ENTRY_POLICY.limit_offset_bps)
         notional = abs(float(approval.quantity)) * limit
     return ScopeInputs(contract=evidence.contract if fresh else None, quote=quote, volume=evidence.volume,
-                       order_notional=notional, filter_refusal=filter_refusal,
+                       order_notional=notional, filter_refusal=filter_refusal, accepted_feeds=accepted_feeds,
                        missing=() if fresh else (f"admission evidence is {age.total_seconds():.0f} s old",))
 ```
 
@@ -1452,7 +1478,9 @@ A raising gate is already `AI_ENTRY_GATE_UNAVAILABLE` in `DispatchGuard._run_ai_
                          "phase": "dispatch", "check_id": None}
 ```
 
-`links_for_order_ref` selects `CASE WHEN p.kind = 'discretionary' THEN 'discretionary' ELSE d.strategy_digest END` as the strategy version and appends `p.kind`. `_ai_paper_guard_options` sets `"ai_entry_gate": compose_entry_gates(discretionary_scope_gate(kind_of=parts.deployments.kind_of, checks=parts.scope_checks, filter_refusal=parts.filter_refusal), ai_entry_gate(entry_filter=parts.entry_filter))`.
+`links_for_order_ref` selects `CASE WHEN p.kind = 'discretionary' THEN 'discretionary' ELSE d.strategy_digest END` as the strategy version and appends `p.kind`. `_ai_paper_guard_options` sets `"ai_entry_gate": compose_entry_gates(discretionary_scope_gate(kind_of=parts.deployments.kind_of, checks=parts.scope_checks, filter_refusal=parts.filter_refusal, accepted_feeds=accepted_feeds), ai_entry_gate(entry_filter=parts.entry_filter))` with the command stack's accepted set (PR #76).
+
+Also add `test_an_iex_quote_follows_the_accepted_set` to the new test file (`discretionary_world(tmp_path, accepted_feeds=...)` passes the set to the scope service, the gate, `AiPaperEvidence` and the dispatch guard, as the command stack does; `world.quotes.set(feed_type="iex_realtime")`): with `PAPER_IEX_FEEDS` the ENTER is `SUBMITTED` and both check rows record `feed_type: iex_realtime`; with `LIVE_ONLY_FEEDS` it is `OUT_OF_DISCRETIONARY_SCOPE` with `detail.part == "evidence_stale"` and `phase == "admission"`, and `world.dispatch.plans == []`.
 - [ ] **Step 4: Run** the new file, `tests/automation/test_discretionary_admission.py`, `tests/automation/test_ai_paper_decision.py`, `tests/scoreboard/`, `tests/test_dispatch_guard.py` → PASS.
 - [ ] **Step 5: Commit** — `feat: re-check the discretionary scope rule at dispatch and label its trips`.
 
@@ -1665,14 +1693,15 @@ class AiDiscoveryReader:
 
 ---
 
-### Task 10: `discover_ai_candidates` over signed RPC; the trader's Alpaca keys
+### Task 10: `discover_ai_candidates` and `get_ai_entry_quote` over signed RPC; the trader's Alpaca keys; discretionary baseline sizing
 
 **Files:**
 - Modify: `trader/trading/trading_runtime.py` (`Trader.__init__(..., alpaca_api_key_id: str = '', alpaca_api_secret_key: str = '')` stored as attributes; the Container fills them from config or `ALPACA_API_KEY_ID` / `ALPACA_API_SECRET_KEY`; shared with Plan 2, same names — skip if Plan 2 landed)
 - Modify: `trader/trading/command_stack.py` (`AiPaperServices.discovery: Any = None`; `_build_ai_paper_services` builds `AiDiscoveryReader` with `providers=lambda capability: _alpaca_provider(trader, capability)`, `SymbolResolver(contracts=contracts, now=now)`, `volumes`, `parts.deployments`, `parts.filter_refusal`)
 - Modify: `trader/messaging/production_api.py` (`_discover_ai_candidates_handler`; `registry.register("query", "discover_ai_candidates", DiscoverAiCandidatesRequest, DiscoverAiCandidatesResponse, handler, execution="thread")` in `register_ai_paper_authority`)
-- Modify: `trader/messaging/principals.py` (`("query", "discover_ai_candidates"): frozenset({"ai_supervisor"})`)
-- Test: `tests/test_ai_discovery_rpc.py` (new), `tests/test_rpc_acl.py`, `tests/test_ai_paper_rpc.py` (`_served` gains `prepare: Callable[[Any], None] = lambda trader: None`, called before `build_command_stack`)
+- Modify: `trader/messaging/principals.py` (`("query", "discover_ai_candidates"): frozenset({"ai_supervisor"})`, `("query", "get_ai_entry_quote"): frozenset({"ai_supervisor"})`)
+- Modify: `trader/automation/ai_discovery_wire.py` (`GetAiEntryQuoteRequest`), `trader/trading/command_stack.py` (`AiPaperServices.entry_quotes: Any = None`, the command stack's `(quotes, accepted_feeds)` pair and `account_mode`), `trader/automation/ai_baseline_sizing.py` (Plan 2: `get_sealed_any` and the discretionary notional, Ruling 19; `AiPaperBaselineSizer(..., volumes=None)`)
+- Test: `tests/test_ai_discovery_rpc.py` (new), `tests/test_ai_entry_quote_rpc.py` (new), `tests/automation/test_ai_baseline_sizing.py` (Plan 2's file), `tests/test_rpc_acl.py`, `tests/test_ai_paper_rpc.py` (`_served` gains `prepare: Callable[[Any], None] = lambda trader: None`, called before `build_command_stack`)
 
 - [ ] **Step 1: Write the failing tests:**
 
@@ -1771,8 +1800,36 @@ def _discover_ai_candidates_handler(reader):
 ```
 
 Register only when `ai_paper.discovery is not None`, with `execution="thread"` (ruling 17). Add the ACL row.
-- [ ] **Step 4: Run** `tests/test_ai_discovery_rpc.py tests/test_ai_paper_rpc.py tests/test_rpc_acl.py tests/test_command_stack.py tests/test_container.py` → PASS.
-- [ ] **Step 5: Commit** — `feat: serve discover_ai_candidates to ai_supervisor over signed rpc`.
+
+`get_ai_entry_quote` (Ruling 18), registered next to it on role `query` with `execution="thread"`, from `AiPaperServices.entry_quotes = (quotes, accepted_feeds, account_mode)`:
+
+```python
+class GetAiEntryQuoteRequest(BaseModel):                     # ai_discovery_wire.py
+    model_config = ConfigDict(extra="forbid", strict=True)
+    conid: int = Field(gt=0)
+
+
+def _ai_entry_quote_handler(quotes, accepted_feeds: frozenset[str], account_mode: str, now):
+    def _handler(parsed: GetAiEntryQuoteRequest) -> dict:
+        try:
+            quote = quotes.executable_quote(parsed.conid, side="BUY")
+        except Exception as exc:                     # no quote: never the provider's text
+            logger.warning("entry quote read failed for conid %s: %s", parsed.conid, type(exc).__name__)
+            quote = None
+        body = None if quote is None else {
+            "bid": quote.bid, "ask": quote.ask, "bid_size": quote.bid_size, "ask_size": quote.ask_size,
+            "market_timestamp": quote.market_timestamp.isoformat(), "feed": quote.feed_type,
+            "session_state": quote.session_state}
+        return {"conid": parsed.conid, "read_at": now().isoformat(), "account_mode": account_mode,
+                "accepted_feeds": sorted(accepted_feeds), "quote": body}
+    return _handler
+```
+
+Tests (`tests/test_ai_entry_quote_rpc.py`, the `_served` stack with a `prepare` that sets the quote fake): `test_the_entry_quote_carries_its_feed_and_the_accepted_set` (paper with `automation_quote_fallback = "alpaca_iex"`: an `iex_realtime` quote comes back labelled, `accepted_feeds == ["iex_realtime", "live"]`), `test_without_the_fallback_only_live_is_accepted` (`accepted_feeds == ["live"]`, a `delayed` IB quote comes back labelled `delayed`), `test_no_quote_is_null_not_an_error`, `test_only_the_supervisor_reads_entry_quotes` (`ai_research`, `cli`, `dashboard`, `strategy` → `PERMISSION_DENIED`), `test_the_entry_quote_request_is_strict` (`conid` 0, `True`, `"1"`, an extra key → `VALIDATION_ERROR`).
+
+Discretionary baseline sizing (Ruling 19): `AiPaperBaselineSizer` takes `volumes` (the `DollarVolumeSource`; `None` keeps Plan 2's behaviour) and its `_notional_cap` becomes `_bounds(digest, conid, quote)` returning `(notional_cap, liquidity_max_shares)`: a strategy deployment as in Plan 2; a `DiscretionaryDeployment` → `notional_cap = rule.max_order_share_of_dollar_volume × volume.median_dollar_volume` and `liquidity_max_shares = LiquidityPolicy.max_quantity(liquidity_from_sessions(volume, quote))`, both as `prepare_entry` computes them for that deployment. `_build_ai_paper_services` passes `volumes`. Tests in `tests/automation/test_ai_baseline_sizing.py`: `test_a_discretionary_baseline_gets_the_discretionary_entry_size` (the sizer and `prepare_entry` with `notional=cap / 1.05, volume=...` agree when the 1 % cap binds), `test_a_discretionary_baseline_without_a_current_window_cannot_size` (`VOLUME_UNAVAILABLE`).
+- [ ] **Step 4: Run** `tests/test_ai_discovery_rpc.py tests/test_ai_entry_quote_rpc.py tests/automation/test_ai_baseline_sizing.py tests/test_ai_paper_rpc.py tests/test_rpc_acl.py tests/test_command_stack.py tests/test_container.py` → PASS.
+- [ ] **Step 5: Commit** — `feat: serve discovery and entry quotes to ai_supervisor and size discretionary baselines`.
 
 ---
 

@@ -30,8 +30,10 @@ Typed RPC methods (allow-list in `trader/messaging/principals.py`; read and muta
 | `publish_ai_risk_policy` | command | `cli` added (operator initial policy); `ai_supervisor` keeps it for SP2d, but SP2a/b code never calls it | 1 |
 | `record_ai_cost` | command | `ai_supervisor` | 2 |
 | `record_simulated_decision` | command | `ai_supervisor` | 2 |
+| `get_ai_model_budget` | query | `ai_supervisor` (read only; no principal writes the cap) | 2 |
 | `register_discretionary_deployment` | command | `cli` | 3 |
 | `discover_ai_candidates` | query | `ai_supervisor` | 3 |
+| `get_ai_entry_quote` | query | `ai_supervisor` | 3 |
 | `submit_ai_paper_decision` | command | `ai_supervisor` (existing; Plan 1 adds the epoch check, Plan 3 the scope rule) | 1, 3 |
 
 - `TypedRpcRequest.controller_epoch: Optional[int] = None`. It is always a key in
@@ -48,6 +50,16 @@ Typed RPC methods (allow-list in `trader/messaging/principals.py`; read and muta
   `gap` is true when signals after `after_cursor` were already removed by retention.
 - Baseline ids (versioned): `follow_signal.v1`, `fixed_rule.v1`, `no_trade.v1`,
   `matched_entry_bracket_exit.v1`. Cohorts: `strategy_signal`, `self_found`, `model_close`.
+- `record_simulated_decision` extra fields (Plan 2 Cross-plan additions): `deployment_digest`,
+  `linked_round_trip_id` (matched-entry only), `incomplete_reason` (one of `quote_unavailable`,
+  `feed_not_accepted`, `budget_refused`, `model_failed`, `sizing_unavailable`). `follow_signal.v1` and
+  `fixed_rule.v1` are sent with `quantity: null`; the trader sizes them.
+- Model budget cap: `get_ai_model_budget` → `{model_budget_usd_per_day: float, source: "trader.yaml"}`
+  (Plan 2). Plan 5 reads it at start and every 60 s and calls Plan 4's `Budget.set_cap`; `ai.yaml`
+  has no cap. A failed read refuses model calls (`BUDGET_CAP_UNKNOWN`) until a read succeeds.
+- Entry quote: `get_ai_entry_quote {conid}` → `{conid, read_at, account_mode, accepted_feeds: [..],
+  quote: null | {bid, ask, bid_size, ask_size, market_timestamp, feed, session_state}}` (Plan 3), from
+  the trader's quote authority and its accepted-feed set. Plan 6 reads entry evidence only from it.
 - Refusal code for the scope rule: `OUT_OF_DISCRETIONARY_SCOPE`, with `detail.part` one of
   `exchange`, `instrument_type`, `price`, `dollar_volume`, `liquidity`, `trading_filter`,
   `evidence_stale`.
@@ -66,16 +78,23 @@ Typed RPC methods (allow-list in `trader/messaging/principals.py`; read and muta
 - Per task: targeted pytest only. Full suite once, in each plan's last task:
   `.venv/bin/python -m pytest tests/ -q --timeout=60 --ignore=tests/test_ibrx_async.py`.
 
-## Owner change after the plans were written (2026-10-07, #74)
+## Owner changes after the plans were written (2026-10-07)
 
-- Executable quote evidence comes from the trader's quote authority, not from IB
-  alone. On a **paper** account with `automation.quote_fallback: alpaca_iex`, a quote
-  may carry feed `iex_realtime` (Alpaca IEX) when IB has no live feed; the dispatch
-  guard, `validate_approval` and `LiquidityPolicy` accept `{live, iex_realtime}` there
-  and only `{live}` everywhere else. Where Plan 3 (Ruling 4, the price part of the
-  scope rule: "fresh IB bid") and Plan 6 (fresh evidence via the IB `get_snapshot`)
-  name IB quotes, use the same quote authority and accepted-feed set instead, and
-  record the feed label in the evidence.
+- **Quotes (#74, PR #76).** Executable quote evidence comes from the trader's quote
+  authority, not from IB alone. On a **paper** account with
+  `automation.quote_fallback: alpaca_iex`, a quote may carry feed `iex_realtime`
+  (Alpaca IEX) when IB has no live feed; the dispatch guard, `validate_approval` and
+  `LiquidityPolicy` accept `{live, iex_realtime}` there and only `{live}` everywhere
+  else (`trader/trading/quote_feeds.py`, `accepted_feeds(account_mode,
+  quote_fallback)`). The plan bodies now follow this: Plan 3 Ruling 4 (the scope
+  rule's price and evidence check uses the quote authority and the accepted set; a
+  feed outside it is `evidence_stale`) and Ruling 18 (`get_ai_entry_quote`); Plan 6
+  Ruling 3 (the feed is checked against the set in the trader's reply and kept in the
+  evidence and its digest). PR #76 is a base dependency of Plans 2, 3 and 6.
+- **Budget cap.** The owner's cap is `ai_paper.model_budget_usd_per_day` in
+  `trader.yaml` (default 2000), as spec 5.4 says; only an operator edit of
+  `trader.yaml` plus a trader restart changes it, no AI principal can. Plan 2 serves it
+  (`get_ai_model_budget`), Plan 4 has no cap setting, Plan 5 applies it (Ruling 19).
 
 ## Rulings (spec section 14 open questions and gaps; the owner may change them)
 
@@ -91,16 +110,23 @@ Typed RPC methods (allow-list in `trader/messaging/principals.py`; read and muta
   `max_output_tokens` × output price.
 - **Bedrock:** add `boto3` as a dependency (Converse API). OpenRouter and Azure use `httpx`.
 - **Who simulates baselines:** the `ai` service sends the hypothetical decision (conid,
-  side, quantity, reference price, stop, target, decided_at). The **trader** computes the
-  simulated outcome at session end from 1-minute bars it can read (local DuckDB, else its
-  Alpaca history provider). Missing bars → the record and its book are `incomplete`. Models
-  never author fills or P&L.
+  side, reference price, stop, target, decided_at, deployment digest; quantity only for
+  the matched-entry baseline). The **trader** sizes the follow-signal and fixed-rule
+  records at ingestion (a linked follow-signal record takes the real ENTER's own size;
+  otherwise SP1's entry sizing on a fresh broker snapshot, Plan 2 Ruling 19) and computes
+  the simulated outcome at session end from 1-minute bars it can read (local DuckDB, else
+  its Alpaca history provider). Missing bars, missing evidence (sent with
+  `incomplete_reason`) or a size that cannot be computed → the record and its book are
+  `incomplete`. Models never author fills or P&L.
 - **Fixed rule (`fixed_rule.v1`):** per entry cycle, among the candidates that passed the
   scope rule, the one with the highest `change_pct` (ties: higher dollar volume, then
   symbol). Stop = reference × 0.98, target = reference × 1.04, quantity from the same SP1
-  risk sizing a real ENTER would get. Values live in `ai.yaml`; changing them bumps the version.
+  risk sizing a real ENTER would get, computed by the trader at ingestion. Values live in
+  `ai.yaml`; changing them bumps the version.
 - **Matched-entry, bracket-only exit:** the same entry the model closed, held with only its
-  original stop and target until the session flatten (15:45 ET on a normal day).
+  original stop and target until the session flatten (15:45 ET on a normal day). One record
+  per model CLOSE / PARTIAL_CLOSE: opportunity = the close's decision id, the round trip id
+  as linkage, quantity = the real entry quantity.
 - **No-trade:** zero P&L, one record per self-found opportunity, always complete.
 - **Follow the signal:** the strategy's BUY taken at the reference price with the
-  deployment's stop/target policy and SP1 sizing, regardless of Jev's ruling.
+  deployment's stop/target policy and SP1 sizing (by the trader), regardless of Jev's ruling.

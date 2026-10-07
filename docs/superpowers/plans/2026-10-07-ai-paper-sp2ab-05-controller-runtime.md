@@ -19,7 +19,7 @@
 - **Leadership:** lease 60 s, renew every 20 s, `holder_id = "ai-" + 12 hex` fresh per process. Local deadline = monotonic time taken before the grant request + lease − 5 s.
 - **Ids:** decision `dec-` + 32 hex; command `aip-<decision_id>`; cost record `cost-` + 40 hex; attempt `att-` + 40 hex; simulated record `sim-` + 40 hex; cycle `cyc-<entry|position>-YYYYMMDD-HHMM` (New York time).
 - **Decision expiry:** `decision_ttl_seconds` default 300, at most 900 (the trader's `MAX_EXPIRY_AHEAD` is 15 min). A send needs at least 5 s left (`SEND_MARGIN`).
-- **No policy, no cap from an AI path:** `publish_ai_risk_policy` is in no client set. The budget cap comes only from `ai.yaml` at start (Plan 4 Ruling 1).
+- **No policy, no cap from an AI path:** `publish_ai_risk_policy` is in no client set. The budget cap is the owner's `ai_paper.model_budget_usd_per_day` in `trader.yaml` (owner, 2026-10-07): the controller reads it with the read-only query `get_ai_model_budget` (Plan 2) and applies it with Plan 4's `Budget.set_cap`. `ai.yaml` has no cap (Plan 4 Ruling 1); no client method writes one. A failed or malformed cap read stops new model calls until a read succeeds (Ruling 19).
 - **Credentials:** the `ai` container gets model-provider env only. No `ALPACA_*`, `IB_*`, `TWS_*`, `MASSIVE_*`, `TWELVEDATA_*` and no `trader.yaml`. Never log a key, a token or a request body field that came from env.
 - **Strict input:** trader replies are checked with `type(x) is int` / ISO-8601-with-offset parsing before use; a malformed reply fails loudly and commits nothing.
 - **DuckDB:** only through `AiStore.transaction` / `atransaction` / `aquery` (Plan 4). No long-lived connection.
@@ -32,12 +32,12 @@
 ## Rulings
 
 1. **Sockets.** `AiRpcClients` holds two `PrincipalClient`s. `supervisor` has three sockets: command, query and a **separate discovery query socket** used only by `discover_ai_candidates` with a 90 s timeout (Plan 3). `TypedRpcClient` holds a lock for a whole call, so a 90 s discovery read on the shared query socket would block `read_ai_signals` and `get_ai_paper_decision`; a own socket keeps spec 5.2's "slow work never blocks receipts or reconciliation". `research` has command and query. *Cost if wrong:* one extra ZMQ socket.
-2. **Method sets and the epoch.** `SUPERVISOR_COMMANDS = {grant_ai_controller_epoch, submit_ai_paper_decision, record_ai_cost, record_simulated_decision}`, `SUPERVISOR_QUERIES = {read_ai_signals, get_ai_paper_decision, get_experiment, get_experiment_trips, get_ai_risk_policy, get_ai_deployment, get_snapshot, get_positions}`, `SUPERVISOR_SLOW_QUERIES = {discover_ai_candidates: 90.0}`, `RESEARCH_COMMANDS = {register_ai_deployment}`, `RESEARCH_QUERIES = {get_ai_deployment}`. A method outside the set raises `MethodNotAllowedLocally` before signing. `EPOCH_METHODS = {submit_ai_paper_decision, read_ai_signals, get_ai_paper_decision}` carry the held epoch; with no held epoch they fail locally (`NOT_LEADER`). Other methods carry no epoch (Plan 2: ingestion needs none; the grant reads its body). *Cost if wrong:* Plan 6 adds a query by one line in the set (the ACL test pins it).
+2. **Method sets and the epoch.** `SUPERVISOR_COMMANDS = {grant_ai_controller_epoch, submit_ai_paper_decision, record_ai_cost, record_simulated_decision}`, `SUPERVISOR_QUERIES = {read_ai_signals, get_ai_paper_decision, get_experiment, get_experiment_trips, get_ai_risk_policy, get_ai_deployment, get_snapshot, get_positions, get_ai_model_budget}`, `SUPERVISOR_SLOW_QUERIES = {discover_ai_candidates: 90.0}`, `RESEARCH_COMMANDS = {register_ai_deployment}`, `RESEARCH_QUERIES = {get_ai_deployment}`. A method outside the set raises `MethodNotAllowedLocally` before signing. `EPOCH_METHODS = {submit_ai_paper_decision, read_ai_signals, get_ai_paper_decision}` carry the held epoch; with no held epoch they fail locally (`NOT_LEADER`). Other methods carry no epoch (Plan 2: ingestion needs none; the grant reads its body). *Cost if wrong:* Plan 6 adds a query by one line in the set (the ACL test pins it).
 3. **What the trader can have seen.** `ConnectionError` from `TypedRpcClient.call` happens only before the send (no socket, or `IMMEDIATE` refused the queue) → `RpcNotSent` (proven not sent). `TimeoutError`, a reply that fails verification, or any other error after the send → `RpcOutcomeUnknown`. `TypedRpcRemoteError` → `RpcRefused` (the trader answered).
 4. **Leadership and restart.** One fresh `holder_id` per process. A restarted process is a new holder and waits up to one lease for the old one to expire (Plan 1 Ruling 3; up to 60 s). The gateway's restart recovery (`ModelGateway.start`, Plan 4 Ruling 11) runs only after the epoch is held. The held epoch is written to `ai_held_epochs` before it is used.
 5. **Losing leadership.** Leadership ends at once on `CONTROLLER_EPOCH_HELD` / `CONTROLLER_EPOCH_UNKNOWN` from a renewal, on `CONTROLLER_EPOCH_STALE` / `_MISSING` from any epoch method (also a `REJECTED` receipt with that code), and when the local deadline passes without a renewal. After a loss the process keeps asking with its last epoch: the trader renews it while its lease lives, otherwise grants the next epoch (Plan 1 Ruling 3). After `CONTROLLER_EPOCH_UNKNOWN` it asks with `null`.
 6. **Slot alignment.** Slots start at `open + k × interval` (k ≥ 0). An entry slot counts only if `opening_stabilization_end ≤ start < entry_cutoff` (09:45 … 15:15 on a normal day with SP1's 5-minute stabilization); its work must end by `min(start + interval, entry_cutoff)`. *Cost if wrong:* slots shift by up to one interval.
-7. **Position cycles.** Same grid and interval (configurable), counted while `opening_stabilization_end ≤ start < flatten_start` (09:45 … 15:30 on a normal day, so one slot after the 15:30 entry cutoff); work ends by `min(start + interval, flatten_start)`. They run while the experiment is `ARMED` or `PAUSED` and `get_experiment_trips` shows an `OPEN` trip with quantity left. `KILLED`: no cycles and no entry signals; exit signals still produce closes and unsent, unexpired closes are still sent (the trader joins them to the kill flatten); unsent `ENTER`s wait and expire. `STOPPED`: nothing new; reconciliation and reporting continue.
+7. **Position cycles.** Same grid and interval (configurable), counted while `opening_stabilization_end ≤ start < flatten_start` (`SessionSchedule.flatten_start_utc`, 15:45 ET on a normal day; with 15-minute slots the last position slot starts at 15:30, one slot after the last entry slot at 15:15, and ends at 15:45); work ends by `min(start + interval, flatten_start)`. They run while the experiment is `ARMED` or `PAUSED` and `get_experiment_trips` shows an `OPEN` trip with quantity left. `KILLED`: no cycles and no entry signals; exit signals still produce closes and unsent, unexpired closes are still sent (the trader joins them to the kill flatten); unsent `ENTER`s wait and expire. `STOPPED`: nothing new; reconciliation and reporting continue.
 8. **Missed slots and bounded work.** A slot may start only within `slot_start_grace_seconds` (default 120) of its start. A later first sight records it `MISSED` (`LATE_START`); it is never run. A slot of a kind whose previous cycle still runs is `MISSED` (`PREVIOUS_CYCLE_RUNNING`). A cycle is cancelled at its slot deadline (`TIMED_OUT`); nothing from it is persisted. After a restart `RUNNING` cycles become `FAILED` (`PROCESS_RESTARTED`), never replayed.
 9. **Signals.** An opportunity is stale when `now − signal_time > signal_max_age_seconds` (default 300) → `MISSED` (`STALE`). `BUY` needs `ARMED`, no entry block and an open entry window, else `MISSED` with the reason. `SELL` is judged in `ARMED`, `PAUSED` and `KILLED`, `MISSED` in `STOPPED`. An unknown experiment (trader away) waits; it is never "no experiment". An opportunity left `IN_PROGRESS` by a crash is judged again if still fresh, else `MISSED`: nothing was persisted for it, because decisions and the opportunity state commit in one transaction. `SIGNAL_CURSOR_AHEAD` (the trader's record was reset) writes a `CURSOR_AHEAD` coverage gap and restarts from cursor 0; redelivered signals are deduplicated by `source_event_id`.
 10. **Submission state machine.** `PENDING` (persisted, not sent) → `SENDING` (written before any byte leaves) → `ACCEPTED` (trader receipt, non-final) / `FINAL` (receipt `RESOLVED` or `REJECTED`) / `UNKNOWN` (possible send) / back to `PENDING` (proven not sent) / `FAILED` (`VALIDATION_ERROR`, `PERMISSION_DENIED`, `METHOD_NOT_ALLOWED`: a bug). Epoch refusals and `AUTHENTICATION_ERROR` / `REPLAY_ERROR` are "refused before any handler" (Plan 1 Ruling 1a: no ledger row) → `PENDING` for a first send, `UNKNOWN` for a resend (an earlier send may have landed). Any other trader error code → `UNKNOWN`. Unsent work is `ABANDONED` on expiry (`EXPIRED_UNSENT`), on a closed entry window for an `ENTER` (`OUTSIDE_ENTRY_WINDOW`) or on a `STOPPED` experiment for a close. `UNKNOWN` is reconciled with `get_ai_paper_decision` under the current epoch: found → receipt saved; not found and `not_found_settle_seconds` (default 120, above the 30 s RPC clock skew) past the last send → resend the same id and the same stored body bytes while unexpired, else `NOT_ADMITTED`. A `REJECTED` receipt with `CONTROLLER_EPOCH_STALE` is final: the decision is lost, never regenerated (Plan 1 Ruling 4). On restart `SENDING` → `UNKNOWN` (`PROCESS_RESTARTED`).
@@ -49,6 +49,7 @@
 16. **Engine seam.** `trader.ai_service.build_engine(deps)` raises `EngineNotInstalled` until Plan 6 replaces its body; `main()` then exits with code 2 and an ERROR line. Tests inject engines through `run_service(..., engine_factory=...)`.
 17. **Compose (owner to confirm the profile).** The `ai` service is in profile `ai` (opt-in: `docker compose --profile ai up -d ai`), because the shipped `ai.yaml` has blank model ids and the service would restart-loop. It does not inherit `x-mmr-common-env` (Alpaca keys) and does not mount `~/.config/mmr` (its `trader.yaml` may hold `alpaca_api_key_id`): it binds only `ai.yaml` read-only, its two key pairs and `trader.pub`. Data: named volume `mmr_ai_data` at `/home/trader/.local/share/mmr_ai` (the parent of Plan 4's default `database_path`). Healthcheck: the heartbeat file in `/tmp` is younger than 120 s; no port is bound or published. The trader address comes from env `TRADER_TYPED_ADDRESS` (the name the other services use), the ports from `ai.yaml`.
 18. **Two keys in one service.** `principals.SERVICE_PRINCIPAL["ai"] = "ai_supervisor"` plus `SERVICE_EXTRA_PRINCIPALS = {"ai": ("ai_research",)}`; `service_principals(service)` and `service_rpc_files(service)` replace direct `rpc_files_for(SERVICE_PRINCIPAL[...])` uses in the key-mount check and its tests. `RESTART_ON_ROTATE` counts every principal a service signs as (`ai_research` → `("ai", "trader")`).
+19. **Owner budget cap (owner, 2026-10-07; spec 5.4).** `BudgetCapSync` reads `get_ai_model_budget` at `start()` and then every `budget_cap_poll_seconds` (default 60), and calls `Budget.set_cap(usd_to_micros_floor(value))` after each good read. The reply must be exactly `{"model_budget_usd_per_day": <int or float, not bool, finite, ≥ 0>, "source": "trader.yaml"}`; anything else is a failed read. Plan 4's `set_cap` keeps the persisted rules: lowering applies at once, a raise waits for 00:00 America/New_York, and an `ai` restart that reads the same raise gets `RAISE_KEPT` (never early). The periodic read means a raise the operator made before midnight is scheduled for that midnight. **Fail closed:** the cap is *ready* only when the latest read succeeded **and** it was made in the current New York window; otherwise the gateway the engine and the controller use (`CapGatedGateway`) refuses every model call with `CallRefused("BUDGET_CAP_UNKNOWN")` before any reservation. Only model calls stop: signal intake, evidence reads, baselines, reconciliation, the outbox and exit-signal closes keep running (spec 5.4: exhaustion blocks new model work only). *Cost if wrong:* up to one poll interval (60 s) without model calls after New York midnight and after every trader outage.
 
 ## Cross-plan additions
 
@@ -63,7 +64,7 @@ Plan 6 (and any later plan) uses these exact names.
   - `ModelWork` with `.context_key`, `.served_kind`, `.served_id`, `.source_id`, `.experiment_id`, `.gateway: ModelCaller`, `.deadline: DecisionDeadline`, `request_key(role: str, call_seq: int) -> str` (`"<context_key>/<role>/<call_seq>"`, Plan 4 Ruling 10) and `async for_action(action_key) -> ModelWork` (context = the derived decision id, `served_kind = "decision"`, same deadline).
   - `SignalContext(now, experiment, opportunity, work)`, `EntryCycleContext(now, experiment, slot, work)`, `PositionCycleContext(now, experiment, slot, positions, work)`.
   - `ProposedDecision(action_key, action, conid, side, decider, evidence_digest, deployment_digest=None, policy_revision=None, stop_price=None, target_price=None, quantity=None)`.
-  - `SimulatedBaseline(baseline_id, cohort, opportunity_id, decided_at, conid=None, side=None, quantity=None, reference_price=None, stop_price=None, target_price=None, linked_action_key=None, linked_decision_id=None)`; `BASELINE_COHORTS` (the index pairs).
+  - `SimulatedBaseline(baseline_id, cohort, opportunity_id, decided_at, conid=None, side=None, quantity=None, reference_price=None, stop_price=None, target_price=None, linked_action_key=None, linked_decision_id=None, linked_round_trip_id=None, deployment_digest=None, incomplete_reason=None)`; it enforces Plan 2's shapes (`follow_signal.v1` / `fixed_rule.v1`: `quantity` null and `deployment_digest` set; matched-entry: `quantity` set; with `incomplete_reason`: no side, quantity or prices). `BASELINE_COHORTS` (the index pairs), `TRADER_SIZED_BASELINES = {"follow_signal.v1", "fixed_rule.v1"}`, `INCOMPLETE_REASONS = ("quote_unavailable", "feed_not_accepted", "budget_refused", "model_failed", "sizing_unavailable")`.
   - `EngineResult(decisions=(), baselines=(), note="")`.
   - `class DecisionEngine(Protocol)`: `async on_entry_signal(SignalContext)`, `async on_exit_signal(SignalContext)`, `async on_entry_cycle(EntryCycleContext)`, `async on_position_cycle(PositionCycleContext)`, each `-> EngineResult`.
 - `trader.ai.rpc_clients`: `ReadOnlySupervisor(supervisor).call(method, body)` allows `ENGINE_QUERIES = SUPERVISOR_QUERIES ∪ SUPERVISOR_SLOW_QUERIES − EPOCH_METHODS` only; errors `RpcNotSent`, `MethodNotAllowedLocally`, `RpcOutcomeUnknown`, `RpcRefused`.
@@ -80,6 +81,7 @@ Plan 6 (and any later plan) uses these exact names.
 3. **A paused controller wakes after a takeover and sends.** The trader refuses its epoch, no ledger row is written, the command stays pending and the successor sends the same id and body. → Task 11 `test_stale_controller_is_refused_by_its_epoch`; Task 6 `test_an_epoch_refusal_keeps_the_command_pending_and_drops_leadership`.
 4. **A crash between signal intake and cursor advance.** No signal is skipped and none is judged twice. → Task 8 `test_crash_between_intake_and_cursor_skips_no_signal`, `test_a_redelivered_signal_is_not_a_new_opportunity`.
 5. **The trader is down, then an acknowledgement is lost.** Costs and baselines arrive once. → Task 7 `test_delivery_survives_a_trader_outage`, `test_a_lost_acknowledgement_never_duplicates`; Task 11 `test_outbox_delivers_after_a_trader_outage_without_duplicates`.
+6. **The owner's cap.** It comes only from the trader (`trader.yaml`); an `ai` restart or an `ai.yaml` edit cannot raise it early; a failed or malformed read stops model calls (not reconciliation, the outbox or closes) until a read succeeds. → Task 9 `test_the_cap_comes_from_the_trader_and_a_raise_waits_for_new_york_midnight`, `test_an_ai_restart_or_ai_config_change_cannot_raise_the_cap_early`, `test_a_failed_cap_read_stops_model_calls_until_a_read_succeeds`, `test_a_closed_cap_gate_keeps_reconciliation_and_the_outbox_running`; Task 11 `test_the_owner_cap_is_read_from_trader_yaml_over_signed_rpc`.
 
 ---
 
@@ -239,6 +241,7 @@ class ControllerConfig(_Section):
     outbox_seconds: Number = Field(5.0, gt=0, le=300, allow_inf_nan=False)
     experiment_poll_seconds: Number = Field(10.0, gt=0, le=300, allow_inf_nan=False)
     heartbeat_seconds: Number = Field(10.0, gt=0, le=60, allow_inf_nan=False)
+    budget_cap_poll_seconds: Number = Field(60.0, gt=0, le=300, allow_inf_nan=False)
     heartbeat_path: StrictStr = "/tmp/mmr_ai_heartbeat.json"
 ```
 
@@ -279,6 +282,7 @@ controller:
   outbox_seconds: 5.0
   experiment_poll_seconds: 10.0
   heartbeat_seconds: 10.0
+  budget_cap_poll_seconds: 60.0   # how often the owner's cap is read from the trader (trader.yaml)
   heartbeat_path: /tmp/mmr_ai_heartbeat.json
 ```
 
@@ -595,7 +599,7 @@ SUPERVISOR_COMMANDS = frozenset({
     "grant_ai_controller_epoch", "submit_ai_paper_decision", "record_ai_cost", "record_simulated_decision"})
 SUPERVISOR_QUERIES = frozenset({
     "read_ai_signals", "get_ai_paper_decision", "get_experiment", "get_experiment_trips", "get_ai_risk_policy",
-    "get_ai_deployment", "get_snapshot", "get_positions"})
+    "get_ai_deployment", "get_snapshot", "get_positions", "get_ai_model_budget"})
 SUPERVISOR_SLOW_QUERIES: Mapping[str, float] = {"discover_ai_candidates": 90.0}
 RESEARCH_COMMANDS = frozenset({"register_ai_deployment"})
 RESEARCH_QUERIES = frozenset({"get_ai_deployment"})
@@ -1416,6 +1420,22 @@ def test_baselines_follow_the_index_pairs_and_take_at_most_one_link():
         SimulatedBaseline("no_trade.v1", "self_found", "has space", now)
 
 
+@pytest.mark.parametrize("fields", [
+    dict(quantity=3),                                              # the trader sizes follow_signal (Plan 2 R19)
+    dict(deployment_digest=None),
+    dict(incomplete_reason="quote_unavailable"),                   # an incomplete record has no prices
+    dict(linked_round_trip_id="rt-1"),                             # matched-entry only
+])
+def test_baselines_take_plan_2_shapes(fields):
+    base = dict(conid=AAPL, side="BUY", reference_price=230.0, stop_price=225.4, target_price=234.6,
+                deployment_digest="sha256:" + "a" * 64)
+    SimulatedBaseline("follow_signal.v1", "strategy_signal", SIG, et(11, 0), **base)          # the valid shape
+    with pytest.raises(ValueError):
+        SimulatedBaseline("follow_signal.v1", "strategy_signal", SIG, et(11, 0), **{**base, **fields})
+    SimulatedBaseline("follow_signal.v1", "strategy_signal", SIG, et(11, 0), conid=AAPL,
+                      incomplete_reason="feed_not_accepted")                                     # incomplete shape
+
+
 @pytest.mark.asyncio
 async def test_model_work_registers_its_context_and_owns_request_keys():
     registered = []
@@ -1552,6 +1572,9 @@ BASELINE_COHORTS: Mapping[str, str] = {
     "follow_signal.v1": "strategy_signal", "fixed_rule.v1": "self_found",
     "no_trade.v1": "self_found", "matched_entry_bracket_exit.v1": "model_close",
 }
+TRADER_SIZED_BASELINES = frozenset({"follow_signal.v1", "fixed_rule.v1"})     # Plan 2 Ruling 19
+INCOMPLETE_REASONS = ("quote_unavailable", "feed_not_accepted", "budget_refused", "model_failed",
+                      "sizing_unavailable")                                       # Plan 2 Ruling 18
 _EXPERIMENT_ID = re.compile(r"^exp-[0-9a-f]{20}$")
 _DECIDER = re.compile(r"^[a-z][a-z0-9_.-]{0,63}$")
 _DIGEST = re.compile(r"^sha256:[0-9a-f]{64}$")
@@ -1746,6 +1769,9 @@ class SimulatedBaseline:
     target_price: Optional[float] = None
     linked_action_key: Optional[str] = None       # a decision of the same result
     linked_decision_id: Optional[str] = None      # an earlier decision (matched-entry baseline)
+    linked_round_trip_id: Optional[str] = None    # matched-entry only: the trip whose close this is (Plan 2 R21)
+    deployment_digest: Optional[str] = None       # the sized baselines name the deployment a real ENTER uses
+    incomplete_reason: Optional[str] = None       # Plan 2 Ruling 18: evidence missing, nothing invented
 
     def __post_init__(self) -> None:
         if BASELINE_COHORTS.get(self.baseline_id) != self.cohort:
@@ -1767,6 +1793,34 @@ class SimulatedBaseline:
         _positive_int(self.quantity, "quantity")
         for name in ("reference_price", "stop_price", "target_price"):
             _price(getattr(self, name), name)
+        self._check_shape()
+
+    def _check_shape(self) -> None:
+        """The same shapes Plan 2's RecordSimulatedDecisionRequest enforces, so a bad record never queues."""
+        trade = (self.side, self.quantity, self.reference_price, self.stop_price, self.target_price)
+        if self.deployment_digest is not None and not _DIGEST.fullmatch(self.deployment_digest):
+            raise ValueError("deployment_digest must be sha256:<64 hex>")
+        if self.linked_round_trip_id is not None and (
+                self.baseline_id != "matched_entry_bracket_exit.v1"
+                or not _OPPORTUNITY_ID.fullmatch(self.linked_round_trip_id)):
+            raise ValueError("linked_round_trip_id is a matched-entry field with the opportunity id shape")
+        if self.baseline_id == "no_trade.v1":
+            if any(v is not None for v in (*trade, self.deployment_digest, self.incomplete_reason)):
+                raise ValueError("no_trade carries no trade, deployment or incomplete reason")
+            return
+        if self.conid is None:
+            raise ValueError("a trading baseline names its conid")
+        if self.incomplete_reason is not None:
+            if self.incomplete_reason not in INCOMPLETE_REASONS or any(v is not None for v in trade):
+                raise ValueError("an incomplete baseline has a known reason and no side, quantity or prices")
+            return
+        if any(v is None for v in trade[:1] + trade[2:]):
+            raise ValueError("a complete trading baseline needs side and all three prices")
+        if self.baseline_id in TRADER_SIZED_BASELINES:
+            if self.quantity is not None or self.deployment_digest is None:
+                raise ValueError("the trader sizes this baseline: no quantity, and name the deployment")
+        elif self.quantity is None:
+            raise ValueError("the matched-entry baseline carries the real entry quantity")
 
 
 @dataclass(frozen=True)
@@ -2619,8 +2673,8 @@ async def test_a_baseline_waits_for_its_linked_decision(rig):
                              evidence_digest="sha256:" + "c" * 64, deployment_digest="sha256:" + "a" * 64,
                              policy_revision=1, stop_price=225.4, target_price=234.6, quantity=3)
     follow = SimulatedBaseline("follow_signal.v1", "strategy_signal", SIG, rig.clock.now(), conid=AAPL, side="BUY",
-                               quantity=3, reference_price=230.0, stop_price=225.4, target_price=234.6,
-                               linked_action_key=f"enter:{AAPL}")
+                               reference_price=230.0, stop_price=225.4, target_price=234.6,
+                               deployment_digest="sha256:" + "a" * 64, linked_action_key=f"enter:{AAPL}")
     decision_id = derive_decision_id(SIG, f"enter:{AAPL}")
     now = rig.clock.now()
 
@@ -2647,8 +2701,8 @@ async def test_a_baseline_of_a_decision_that_never_reached_the_trader_drops_the_
     enter = ProposedDecision(action_key=f"enter:{AAPL}", action="ENTER", conid=AAPL, side="BUY", decider="jev",
                              evidence_digest="sha256:" + "c" * 64, quantity=3, stop_price=225.4)
     follow = SimulatedBaseline("follow_signal.v1", "strategy_signal", SIG, rig.clock.now(), conid=AAPL, side="BUY",
-                               quantity=3, reference_price=230.0, stop_price=225.4, target_price=234.6,
-                               linked_action_key=f"enter:{AAPL}")
+                               reference_price=230.0, stop_price=225.4, target_price=234.6,
+                               deployment_digest="sha256:" + "a" * 64, linked_action_key=f"enter:{AAPL}")
     now = rig.clock.now()
 
     def commit(conn):
@@ -2749,7 +2803,9 @@ def simulated_body(experiment_id: str, baseline: SimulatedBaseline) -> dict:
             "quantity": baseline.quantity, "reference_price": baseline.reference_price,
             "stop_price": baseline.stop_price, "target_price": baseline.target_price,
             "decided_at": baseline.decided_at.astimezone(dt.timezone.utc).isoformat(),
-            "linked_decision_id": baseline.linked_decision_id}
+            "linked_decision_id": baseline.linked_decision_id,
+            "linked_round_trip_id": baseline.linked_round_trip_id,
+            "deployment_digest": baseline.deployment_digest, "incomplete_reason": baseline.incomplete_reason}
 
 
 class ReportingOutbox:
@@ -3229,13 +3285,13 @@ Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>"
 ### Task 9: `AiController`: loops, dispatch, cycles and atomic commit of engine results
 
 **Files:**
-- Create: `trader/ai/controller.py`
+- Create: `trader/ai/controller.py`, `trader/ai/budget_cap.py`
 - Modify (tests): `tests/ai/runtime/fakes.py` (add `EXP_ID`, `FakeTrader`, `open_trip`, `FakeGateway`)
-- Create (tests): `tests/ai/runtime/test_controller.py`
+- Create (tests): `tests/ai/runtime/test_controller.py`, `tests/ai/runtime/test_budget_cap.py`
 
 **Interfaces:**
-- Consumes: Tasks 1–8; Plan 4 `ModelCaller.new_deadline`.
-- Produces: `ExperimentWatch(supervisor)` (`view`, `known`, `async refresh()`, `state() -> Optional[str]`); `validate_result(source_kind, result) -> Optional[str]`; `AiController(*, config, store, clock, supervisor, leadership, watch, submitter, outbox, intake, slots, engine, gateway)` with `async start()`, `async refresh_experiment()`, `async tick_signals()`, `async dispatch_opportunities()`, `async run_due_slots()`, `async record_cycle(slot, state, reason)`, `async run_cycle(slot, positions=())`, `async reconcile_once()`, `async report_once()`, `async heartbeat() -> dict`, `async drain()`, `async run(stop)`.
+- Consumes: Tasks 1–8; Plan 4 `ModelCaller.new_deadline`, `Budget.set_cap`, `Budget.snapshot`, `window_date`, `usd_to_micros_floor`, `CallRefused`; Plan 2 `get_ai_model_budget`.
+- Produces: `BudgetCapSync(*, supervisor, budget, clock)` with `async sync() -> bool`, `ready() -> bool`, `last_error: Optional[str]`; `CapGatedGateway(gateway, cap)` (a `ModelCaller`: `new_deadline` passes through, `call` refuses `BUDGET_CAP_UNKNOWN` while `not cap.ready()`); `ExperimentWatch(supervisor)` (`view`, `known`, `async refresh()`, `state() -> Optional[str]`); `validate_result(source_kind, result) -> Optional[str]`; `AiController(*, config, store, clock, supervisor, leadership, watch, submitter, outbox, intake, slots, engine, gateway, cap_sync=None)` with `async start()`, `async refresh_experiment()`, `async tick_signals()`, `async dispatch_opportunities()`, `async run_due_slots()`, `async record_cycle(slot, state, reason)`, `async run_cycle(slot, positions=())`, `async reconcile_once()`, `async report_once()`, `async heartbeat() -> dict`, `async drain()`, `async run(stop)`.
 
 - [ ] **Step 1: Write the failing tests**
 
@@ -3386,8 +3442,8 @@ async def test_an_entry_signal_submits_one_enter_and_records_its_baseline(rig):
     s = rig.trader.signals.add()
     rig.engine.results["entry_signal"] = lambda ctx: EngineResult(decisions=(enter(),), baselines=(
         SimulatedBaseline("follow_signal.v1", "strategy_signal", ctx.opportunity.opportunity_id, ctx.now,
-                          conid=AAPL, side="BUY", quantity=3, reference_price=230.0, stop_price=225.4,
-                          target_price=234.6, linked_action_key=f"enter:{AAPL}"),))
+                          conid=AAPL, side="BUY", reference_price=230.0, stop_price=225.4, target_price=234.6,
+                          deployment_digest="sha256:" + "a" * 64, linked_action_key=f"enter:{AAPL}"),))
     await rig.signals_then_drain()
     decision_id = derive_decision_id(s["source_event_id"], f"enter:{AAPL}")
     assert [b["decision_id"] for b in rig.sent()] == [decision_id]
@@ -3673,11 +3729,12 @@ def _write_atomically(path: str, text: str) -> None:
 class AiController:
     def __init__(self, *, config: Any, store: Any, clock: Any, supervisor: Any, leadership: Any,
                  watch: ExperimentWatch, submitter: Any, outbox: Any, intake: Any, slots: Any, engine: Any,
-                 gateway: Any):
+                 gateway: Any, cap_sync: Any = None):
         self._config, self._store, self._clock = config, store, clock
         self._supervisor, self._leadership, self._watch = supervisor, leadership, watch
         self._submitter, self._outbox, self._intake = submitter, outbox, intake
         self._slots, self._engine, self._gateway = slots, engine, gateway
+        self._cap_sync = cap_sync                      # BudgetCapSync (Ruling 19); None in unit tests
         self._ttl = dt.timedelta(seconds=config.decision_ttl_seconds)
         self._tasks: set[asyncio.Task] = set()
         self._opportunity_tasks: dict[str, asyncio.Task] = {}
@@ -3702,6 +3759,8 @@ class AiController:
             "UPDATE ai_cycles SET state = 'FAILED', reason = 'PROCESS_RESTARTED', finished_at = ? "
             "WHERE state = 'RUNNING'", [now]))
         await self._watch.refresh()
+        if self._cap_sync is not None:
+            await self._cap_sync.sync()                # a failure is logged; the gateway stays closed (Ruling 19)
 
     async def refresh_experiment(self) -> None:
         await self._watch.refresh()
@@ -3908,7 +3967,8 @@ class AiController:
                   "epoch": self._leadership.current_epoch(),
                   "unsettled_submissions": await self._submitter.unsettled_count(),
                   "outbox": await self._outbox.counts(),
-                  "running_cycles": sorted(kind for kind, task in self._cycle_tasks.items() if not task.done())}
+                  "running_cycles": sorted(kind for kind, task in self._cycle_tasks.items() if not task.done()),
+                  "budget_cap_ready": None if self._cap_sync is None else self._cap_sync.ready()}
         if self._config.heartbeat_path:
             await asyncio.to_thread(_write_atomically, self._config.heartbeat_path, json.dumps(status))
         return status
@@ -3935,6 +3995,9 @@ class AiController:
                                     (cfg.outbox_seconds, self.report_once, "outbox"),
                                     (cfg.heartbeat_seconds, self.heartbeat, "heartbeat")):
             loops.append(asyncio.create_task(self._every(stop, seconds, step, name)))
+        if self._cap_sync is not None:
+            loops.append(asyncio.create_task(self._every(stop, cfg.budget_cap_poll_seconds, self._cap_sync.sync,
+                                                         "budget_cap")))
         try:
             await stop.wait()
         finally:
@@ -3945,16 +4008,147 @@ class AiController:
                 await self.heartbeat()
 ```
 
+**The owner's cap (Ruling 19).** `trader/ai/budget_cap.py`:
+
+```python
+"""The owner's daily model cap, read from the trader (trader.yaml), never from ai.yaml (SP2 Plan 5 Ruling 19)."""
+from __future__ import annotations
+
+import logging
+import math
+from typing import Any, Optional
+
+from trader.ai.budget import window_date
+from trader.ai.config import usd_to_micros_floor
+from trader.ai.gateway import CallRefused
+
+logger = logging.getLogger(__name__)
+CAP_METHOD = "get_ai_model_budget"
+CAP_SOURCE = "trader.yaml"
+
+
+def parse_cap_reply(reply: Any) -> float:
+    if not isinstance(reply, dict) or set(reply) != {"model_budget_usd_per_day", "source"}:
+        raise ValueError("CAP_REPLY_SHAPE")
+    value = reply["model_budget_usd_per_day"]
+    if type(value) not in (int, float) or not math.isfinite(value) or value < 0:
+        raise ValueError("CAP_REPLY_VALUE")
+    if reply["source"] != CAP_SOURCE:
+        raise ValueError("CAP_REPLY_SOURCE")
+    return float(value)
+
+
+class BudgetCapSync:
+    def __init__(self, *, supervisor: Any, budget: Any, clock: Any):
+        self._supervisor, self._budget, self._clock = supervisor, budget, clock
+        self._synced_window: Optional[str] = None
+        self.last_error: Optional[str] = "NOT_READ_YET"
+
+    async def sync(self) -> bool:
+        """One read and one set_cap. Any failure closes the gate until a later read succeeds."""
+        try:
+            value = parse_cap_reply(await self._supervisor.call(CAP_METHOD, {}))
+            outcome = await self._budget.set_cap(usd_to_micros_floor(value))
+        except Exception as exc:              # RpcNotSent, RpcOutcomeUnknown, RpcRefused, a bad reply
+            self._synced_window, self.last_error = None, getattr(exc, "code", None) or str(exc) or type(exc).__name__
+            logger.error("owner budget cap not read (%s): no new model calls until it is", self.last_error)
+            return False
+        self._synced_window, self.last_error = window_date(self._clock.now()), None
+        logger.info("owner budget cap %.2f USD/day applied: %s", value, outcome)
+        return True
+
+    def ready(self) -> bool:
+        return self._synced_window is not None and self._synced_window == window_date(self._clock.now())
+
+
+class CapGatedGateway:
+    """The ModelCaller the engine and the controller use: no model call without a current owner cap."""
+
+    def __init__(self, gateway: Any, cap: BudgetCapSync):
+        self._gateway, self._cap = gateway, cap
+        self.budget, self.journal = gateway.budget, gateway.journal
+
+    def new_deadline(self, label: str = ""):
+        return self._gateway.new_deadline(label)
+
+    async def call(self, role, request, deadline):
+        if not self._cap.ready():
+            raise CallRefused("BUDGET_CAP_UNKNOWN", self._cap.last_error or "the cap is from another window")
+        return await self._gateway.call(role, request, deadline)
+```
+
+`AiController` (code above) reads the cap in `start()`, polls it in `run()` and reports `budget_cap_ready` in the heartbeat.
+
+`tests/ai/runtime/test_budget_cap.py` uses Plan 4's `AiStore`, `Budget`, `FakeClock`, `World`, `request`, `config_text`, `write_config`, `load_ai_config`, `AiConfigError`, and these local helpers: `reply(usd) = {"model_budget_usd_per_day": usd, "source": "trader.yaml"}`; `CapTrader(answer)` whose `async call(method, body)` asserts `method == "get_ai_model_budget"` and returns `answer` (or raises it when it is an exception), with `set(answer)`; `migrated_store(tmp_path, clock)` = an `AiStore` on `tmp_path / "ai.duckdb"` after `migrate(ALL_MIGRATIONS)`; `et` from `fakes` (Friday 2026-07-17):
+
+```python
+USD = 1_000_000
+
+
+@pytest.mark.asyncio
+async def test_the_cap_comes_from_the_trader_and_a_raise_waits_for_new_york_midnight(tmp_path):
+    clock, trader = FakeClock(et(11, 0)), CapTrader(reply(1.0))
+    store = migrated_store(tmp_path, clock)
+    sync = BudgetCapSync(supervisor=trader, budget=Budget(store, clock, calls_per_hour=120), clock=clock)
+    assert await sync.sync() and sync.ready()
+    trader.set(reply(5.0))                                         # the operator edited trader.yaml and restarted it
+    assert await sync.sync()
+    snapshot = await Budget(store, clock, calls_per_hour=120).snapshot()
+    assert (snapshot.effective_cap_micros, snapshot.pending_cap_micros) == (1 * USD, 5 * USD)
+    clock.advance(13 * 3600 + 60)                                 # 00:01 New York, the next day
+    assert not sync.ready()                                        # a new New York window needs a new read
+    assert await sync.sync() and (await Budget(store, clock, calls_per_hour=120).snapshot()).effective_cap_micros == 5 * USD
+
+
+@pytest.mark.asyncio
+async def test_an_ai_restart_or_ai_config_change_cannot_raise_the_cap_early(tmp_path):
+    clock, trader = FakeClock(et(11, 0)), CapTrader(reply(1.0))
+    store = migrated_store(tmp_path, clock)
+    await BudgetCapSync(supervisor=trader, budget=Budget(store, clock, calls_per_hour=120), clock=clock).sync()
+    trader.set(reply(5.0))
+    await BudgetCapSync(supervisor=trader, budget=Budget(store, clock, calls_per_hour=120), clock=clock).sync()
+    # a new ai process on the same ai.duckdb, with an ai.yaml that tries to name a cap
+    with pytest.raises(AiConfigError):
+        load_ai_config(str(write_config(tmp_path, config_text(extra_top_level="model_budget_usd_per_day: 9999"))))
+    restarted = BudgetCapSync(supervisor=trader, budget=Budget(store, clock, calls_per_hour=120), clock=clock)
+    assert await restarted.sync()
+    assert (await Budget(store, clock, calls_per_hour=120).snapshot()).effective_cap_micros == 1 * USD
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("bad", [RpcNotSent("NO_ROUTE"), {"model_budget_usd_per_day": True, "source": "trader.yaml"},
+                                 {"model_budget_usd_per_day": -1, "source": "trader.yaml"},
+                                 {"model_budget_usd_per_day": float("nan"), "source": "trader.yaml"},
+                                 {"model_budget_usd_per_day": 5, "source": "ai.yaml"}, {"x": 1}])
+async def test_a_failed_cap_read_stops_model_calls_until_a_read_succeeds(tmp_path, bad):
+    clock, trader = FakeClock(et(11, 0)), CapTrader(reply(2000.0))
+    world = World(tmp_path, clock)                                 # Plan 4's gateway world
+    await world.gateway.start()
+    sync = BudgetCapSync(supervisor=trader, budget=world.gateway.budget, clock=clock)
+    gated = CapGatedGateway(world.gateway, sync)
+    assert await sync.sync()
+    trader.set(bad)
+    assert await sync.sync() is False and not sync.ready()
+    with pytest.raises(CallRefused) as caught:
+        await gated.call("jev", request("d/jev/1"), gated.new_deadline())
+    assert caught.value.code == "BUDGET_CAP_UNKNOWN"
+    assert world.rows("SELECT count(*) FROM ai_budget_reservations") == [(0,)] and world.jev.requests == []
+    trader.set(reply(2000.0))
+    assert await sync.sync() and (await gated.call("jev", request("d/jev/1"), gated.new_deadline())).response.text
+```
+
+**Also write** `test_a_closed_cap_gate_keeps_reconciliation_and_the_outbox_running` (a controller with a failing `CapTrader`: `reconcile_once` and `report_once` still call the trader; an exit signal's CLOSE is still submitted; a BUY judgment's Jev call is refused `BUDGET_CAP_UNKNOWN` and its follow-signal baseline is still enqueued) in `test_controller.py`.
+
 - [ ] **Step 4: Run**
 
-Run: `.venv/bin/python -m pytest tests/ai/runtime/test_controller.py -q --timeout=60`
+Run: `.venv/bin/python -m pytest tests/ai/runtime/test_controller.py tests/ai/runtime/test_budget_cap.py -q --timeout=60`
 Expected: all pass.
 
 - [ ] **Step 5: Commit**
 
 ```bash
-git add trader/ai/controller.py tests/ai/runtime/fakes.py tests/ai/runtime/test_controller.py
-git commit -m "feat: add the ai controller loops, slot cycles and atomic result commit
+git add trader/ai/controller.py trader/ai/budget_cap.py tests/ai/runtime/fakes.py tests/ai/runtime/test_controller.py tests/ai/runtime/test_budget_cap.py
+git commit -m "feat: add the ai controller loops, slot cycles, atomic result commit and the owner cap read
 
 Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>"
 ```
@@ -4248,7 +4442,7 @@ volumes:
 Holds model-provider credentials only (spec 4) and talks to the trader over
 signed typed RPC as ai_supervisor and ai_research. It never publishes a risk
 policy (spec 6.7) and never changes the budget cap from an AI path (spec 5.4):
-the cap comes from ai.yaml at start (Plan 4 Ruling 1).
+the cap is the owner's trader.yaml value, read with get_ai_model_budget (Ruling 19).
 """
 from __future__ import annotations
 
@@ -4262,6 +4456,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Callable, Mapping, Optional
 
+from trader.ai.budget_cap import BudgetCapSync, CapGatedGateway
 from trader.ai.clock import Clock, SystemClock
 from trader.ai.config import DEFAULT_CONFIG_PATH, AiConfig, AiConfigError, check_credentials, load_ai_config
 from trader.ai.controller import AiController, ExperimentWatch
@@ -4325,7 +4520,9 @@ async def serve(settings: ServiceSettings, *, engine_factory: Callable[[EngineDe
     if wrap_clients is not None:
         clients = wrap_clients(clients)
     try:
-        gateway = build_gateway(config, store=store, clock=clock, environ=environ)
+        raw_gateway = build_gateway(config, store=store, clock=clock, environ=environ)
+        cap_sync = BudgetCapSync(supervisor=clients.supervisor, budget=raw_gateway.budget, clock=clock)
+        gateway = CapGatedGateway(raw_gateway, cap_sync)  # no model call without a current owner cap
         engine = engine_factory(EngineDeps(config, gateway, ReadOnlySupervisor(clients.supervisor), clock,
                                            ReplayRecorder(store)))
         leadership = Leadership(supervisor=clients.supervisor, store=store, clock=clock, holder_id=new_holder_id(),
@@ -4336,7 +4533,7 @@ async def serve(settings: ServiceSettings, *, engine_factory: Callable[[EngineDe
                     leadership.holder_id)
         if await leadership.acquire(stop) is None:
             return
-        await gateway.start()                             # only the leader turns half-finished calls into UNKNOWN
+        await raw_gateway.start()                         # only the leader turns half-finished calls into UNKNOWN
         slots = SessionSlots(entry_minutes=cfg.entry_slot_minutes, position_minutes=cfg.position_slot_minutes,
                              grace_seconds=cfg.slot_start_grace_seconds)
         watch = ExperimentWatch(clients.supervisor)
@@ -4349,7 +4546,7 @@ async def serve(settings: ServiceSettings, *, engine_factory: Callable[[EngineDe
             outbox=ReportingOutbox(store=store, journal=gateway.journal, supervisor=clients.supervisor, clock=clock),
             intake=SignalIntake(store=store, supervisor=clients.supervisor, clock=clock,
                                 page_limit=cfg.signal_page_limit, max_age_seconds=cfg.signal_max_age_seconds),
-            slots=slots, engine=engine, gateway=gateway)
+            slots=slots, engine=engine, gateway=gateway, cap_sync=cap_sync)
         await controller.run(stop)
     finally:
         clients.close()
@@ -4811,7 +5008,28 @@ async def test_the_ai_service_never_publishes_policy_on_start_or_restart(keyed_w
     sources = world.served.trader.journal_db.execute(
         "SELECT source FROM command_ledger WHERE action = ?", [PUBLISH_ACTION], fetch="all")
     assert sources == [("cli",)]                                   # only the operator's initial policy
+
+
+@pytest.mark.asyncio
+async def test_the_owner_cap_is_read_from_trader_yaml_over_signed_rpc(keyed_world, tmp_path):   # Ruling 19
+    world, heartbeat = keyed_world, tmp_path / "hb.json"
+    world.served.trader.ai_paper_config = replace(world.served.trader.ai_paper_config, model_budget_usd_per_day=1500.0)
+    world.reregister_trader_surfaces()             # the query reads the value once at registration, like a restart
+    settings = ServiceSettings(config_path=str(write_service_config(tmp_path, world, heartbeat)),
+                               keys_dir=str(world.keys_dir), trader_address="tcp://127.0.0.1")
+    stop = asyncio.Event()
+    task = asyncio.create_task(serve(settings, engine_factory=lambda deps: ScriptedEngine(), stop=stop,
+                                     clock=TraderClock(world.served, real_sleep=True),
+                                     environ={"OPENROUTER_API_KEY": "test-only-not-a-key"}))
+    await wait_for_heartbeat(heartbeat, lambda status: status.get("budget_cap_ready") is True, task)
+    stop.set()
+    await asyncio.wait_for(task, timeout=15)
+    snapshot = await Budget(AiStore(world.ai_database_path, clock=TraderClock(world.served)),
+                            TraderClock(world.served), calls_per_hour=120).snapshot()
+    assert snapshot.effective_cap_micros == 1_500_000_000
 ```
+
+`TraderWorld.reregister_trader_surfaces()` rebuilds the served trader's typed RPC registries (the same call `served_stack` makes at start), and `TraderWorld.ai_database_path` is the `database_path` that `write_service_config` puts in the ai config; add both to `trader_world.py` if they are missing (`replace` is `dataclasses.replace`; `Budget`, `AiStore` from Plan 4).
 
 - [ ] **Step 2: Run them**
 

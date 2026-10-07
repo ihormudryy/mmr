@@ -2,9 +2,9 @@
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
-**Goal:** Install the real `DecisionEngine` in the `ai` service. Strategy BUYs are judged by Jev; strategy SELLs go to SP1's safe close; entry cycles run trader-owned discovery, the orchestrator proposes ENTERs and Jev judges each one; position cycles let the orchestrator close or partially close owned positions. Every decision is backed by fresh IB evidence, recorded next to its deterministic baselines, and replayable offline.
+**Goal:** Install the real `DecisionEngine` in the `ai` service. Strategy BUYs are judged by Jev; strategy SELLs go to SP1's safe close; entry cycles run trader-owned discovery, the orchestrator proposes ENTERs and Jev judges each one; position cycles let the orchestrator close or partially close owned positions. Every decision is backed by fresh evidence from the trader's quote authority (with its feed label), recorded next to its deterministic baselines (incomplete ones included), and replayable offline.
 
-**Architecture:** Seven new modules in `trader/ai/`. All trader reads go through one `Tools` seam (`trader/ai/tools.py`): `LiveTools` calls the `ReadOnlySupervisor` and records each reply under the current unit key with Plan 4's `ReplayRecorder`; `ReplayTools` serves the recorded replies from a `ReplaySession` and cannot fetch. `evidence.py` turns replies into fresh entry evidence and a code-owned quantity ceiling. `discovery_client.py` filters `discover_ai_candidates` before any model call. `roles.py` holds prompts, strict output schemas and the parsers (Jev TAKE / SKIP / REDUCE, orchestrator ENTER and CLOSE / PARTIAL_CLOSE menus). `baselines.py` builds the four baseline records. `decision_engine.py` is the engine and its flow control; `decision_replay.py` replays one recorded Jev decision. `ai.duckdb` migrations 20–21 record model rulings and discovery coverage. One small trader read change: round trips report their entry price.
+**Architecture:** Seven new modules in `trader/ai/`. All trader reads go through one `Tools` seam (`trader/ai/tools.py`): `LiveTools` calls the `ReadOnlySupervisor` and records each reply under the current unit key with Plan 4's `ReplayRecorder`; `ReplayTools` serves the recorded replies from a `ReplaySession` and cannot fetch. `evidence.py` turns replies into a priced entry (the quote and the bracket), then fresh entry evidence and a code-owned quantity ceiling (Jev's REDUCE bound). `discovery_client.py` filters `discover_ai_candidates` before any model call. `roles.py` holds prompts, strict output schemas and the parsers (Jev TAKE / SKIP / REDUCE, orchestrator ENTER and CLOSE / PARTIAL_CLOSE menus). `baselines.py` builds the four baseline records. `decision_engine.py` is the engine and its flow control; `decision_replay.py` replays one recorded Jev decision. `ai.duckdb` migrations 20–21 record model rulings and discovery coverage. One small trader read change: round trips report their entry price.
 
 **Tech Stack:** Python 3.12, pydantic v2 (`StrictModelOutput`), DuckDB through `AiStore`, `asyncio`, `httpx.MockTransport` behind the real `OpenRouterAdapter` in tests, SP1's served stack (`tests/sp1_fixtures.py`) for acceptance. No new dependencies.
 
@@ -17,7 +17,7 @@
 - **Migrations:** `ai.duckdb` **20** (`ai_rulings`) and **21** (`ai_discovery_reads`); 22–29 stay free. One plain `CREATE` each, no `ALTER`, no backfill.
 - **Code owns** ids, conids, quantity ceilings, stop and target, evidence digests, the policy revision and the deployment digest. Model output only picks from a code-built menu (`C1..Cn`, `P1..Pn`) and gives a verdict, a smaller quantity or a reason.
 - **Fail closed:** a malformed, off-menu or invalid-size model output, a model failure, a missing or stale quote and a refused read are recorded refusals. None of them is ever a TAKE or a close.
-- **Fresh evidence:** the IB quote comes from the existing `get_snapshot` read (`ai_supervisor` is a `MARKET_READER`; SP1's acceptance harness uses the same read). Default maximum quote age 15 s.
+- **Fresh evidence (owner #74):** the quote comes from Plan 3's `get_ai_entry_quote`, which serves the trader's quote authority and the trader's accepted-feed set (`{live}`, or `{live, iex_realtime}` on paper with `automation.quote_fallback: alpaca_iex`). The `ai` side checks the quote's feed against the `accepted_feeds` in that same reply and never decides the set itself. Base dependency: PR #76 (via Plan 3). Default maximum quote age 15 s.
 - **Untrusted text** (news, orchestrator theses shown to Jev) reaches a prompt only through Plan 4's `fence_untrusted`.
 - **Replay** is offline: zero adapter calls and zero trader reads; missing evidence is `INCOMPLETE`.
 - **DuckDB** only through `AiStore.atransaction` / `aquery`. **YAML** only `yaml.safe_load` (Plan 4's loader).
@@ -28,22 +28,22 @@
 
 ## Rulings
 
-1. **One `Tools` seam for every read.** Engine code never calls the supervisor directly inside a judgment. `LiveTools.read(tool, args)` maps the tool to a method (`quote → get_snapshot`, `policy → get_ai_risk_policy`, `deployment → get_ai_deployment`, `account → get_account_values`, `positions → get_positions`, `discovery → discover_ai_candidates`), records the reply (or `{"__tool_error__": code}` on an RPC failure) under the unit key, and raises `ToolUnavailable` on failure. `given(name, value)` records a caller input (the entry source, a role's health) and returns it; in replay it returns the recorded value. *Cost if wrong:* a read outside the seam makes replay incomplete; the replay test catches it.
+1. **One `Tools` seam for every read.** Engine code never calls the supervisor directly inside a judgment. `LiveTools.read(tool, args)` maps the tool to a method (`quote → get_ai_entry_quote`, `policy → get_ai_risk_policy`, `deployment → get_ai_deployment`, `account → get_account_values`, `positions → get_positions`, `discovery → discover_ai_candidates`), records the reply (or `{"__tool_error__": code}` on an RPC failure) under the unit key, and raises `ToolUnavailable` on failure. `given(name, value)` records a caller input (the entry source, a role's health) and returns it; in replay it returns the recorded value. *Cost if wrong:* a read outside the seam makes replay incomplete; the replay test catches it.
 2. **Replay unit = one Jev decision.** Its key is the derived decision id (Plan 5 `ModelWork.for_action`). The unit records the entry source (for a self-found idea this includes the orchestrator's pick and thesis), every read, the role health, the clock values and the manifest. The orchestrator call and the discovery read are recorded under the cycle id for audit. Acceptance replays decisions only.
-3. **Freshness.** A quote is fresh when `instrument_id` matches, `bid > 0`, `ask ≥ bid`, `halted` is null or 0, and its `time` has a UTC offset and is at most `quote_max_age_seconds` old (and no more than 5 s in the future). Otherwise `QUOTE_UNAVAILABLE`, `QUOTE_INVALID`, `QUOTE_HALTED` or `QUOTE_STALE`. The reference price is the ask.
-4. **Quantity ceiling (owner to confirm).** The `ai` side cannot run SP1's sizing exactly. It estimates an upper bound with SP1's own `max_entry_quantity` and the inputs it can read: equity = `NetLiquidation` (`get_account_values`), existing value of the conid = held quantity × ask, gross = Σ |position| × `average_cost` (`get_positions`), the effective limits (`get_ai_risk_policy`), the notional cap (strategy: the deployment's `evidence_order_notional`; discretionary: `max_order_share_of_dollar_volume × median_dollar_volume_20d`), and liquidity (discretionary: `SP1_ADV_FRACTION × median / ask`, pinned equal to SP1's `MAX_ADV_FRACTION`; strategy: no ADV on the `ai` side, so only the notional cap binds). A TAKE sends `quantity: null`, so the trader sizes exactly; a REDUCE sends `1 ≤ q < ceiling`; the trader's own refusal (`QUANTITY_ABOVE_MAXIMUM`, `liquidity`) is final. Both trading baselines use the ceiling as their quantity. `get_account_values` joins Plan 5's `SUPERVISOR_QUERIES` (Plan 5 Ruling 2). *Cost if wrong:* baseline sizes can be larger than the real ENTER when the gross or ADV limit binds; P&L per record is then larger in the baseline book.
+3. **Freshness and the feed.** The `get_ai_entry_quote` reply must name the same `conid` and carry `accepted_feeds` as a non-empty list of strings, else `QUOTE_UNAVAILABLE`; `quote: null` is `QUOTE_UNAVAILABLE`. A quote is fresh when its `feed` is in the reply's `accepted_feeds` (else `QUOTE_FEED_NOT_ACCEPTED`), `session_state == "continuous"` (else `QUOTE_NOT_CONTINUOUS`), `bid > 0`, `ask ≥ bid` (else `QUOTE_INVALID`), and its `market_timestamp` has a UTC offset and is at most `quote_max_age_seconds` old and no more than 5 s in the future (else `QUOTE_STALE`). The reference price is the ask; the feed label is kept in the quote, the evidence, its digest and the ruling row. The trader re-checks all of it at admission (Plan 3 Ruling 4).
+4. **Quantity ceiling (owner to confirm).** The `ai` side cannot run SP1's sizing exactly. It estimates an upper bound with SP1's own `max_entry_quantity` and the inputs it can read: equity = `NetLiquidation` (`get_account_values`), existing value of the conid = held quantity × ask, gross = Σ |position| × `average_cost` (`get_positions`), the effective limits (`get_ai_risk_policy`), the notional cap (strategy: the deployment's `evidence_order_notional`; discretionary: `max_order_share_of_dollar_volume × median_dollar_volume_20d`), and liquidity (discretionary: `SP1_ADV_FRACTION × median / ask`, pinned equal to SP1's `MAX_ADV_FRACTION`; strategy: no ADV on the `ai` side, so only the notional cap binds). A TAKE sends `quantity: null`, so the trader sizes exactly; a REDUCE sends `1 ≤ q < ceiling`; the trader's own refusal (`QUANTITY_ABOVE_MAXIMUM`, `liquidity`) is final. The ceiling is **only** Jev's REDUCE bound and a prompt fact: no baseline uses it. The follow-signal and fixed-rule baselines are sent with `quantity: null` and the trader sizes them with the SP1 sizing a real ENTER of that deployment gets (Plan 2 Ruling 19). `get_account_values` and `get_ai_entry_quote` join Plan 5's `SUPERVISOR_QUERIES` (Plan 5 Ruling 2). *Cost if wrong:* a REDUCE the trader would allow may be refused here when the estimate is low; the TAKE path is unaffected.
 5. **Brackets.** Every ENTER carries a stop and a target (Plan 2 needs `stop < reference < target` on every trading baseline, and the matched-entry baseline copies the ENTER's prices). Strategy signals use `decisions.strategies.<strategy_name>` in `ai.yaml` (`deployment_digest`, `stop_fraction`, `target_fraction`), because `AiDeployment` has no stop/target and the signal names the runtime strategy, not a class. Self-found ENTERs use `decisions.self_found_bracket` (default 0.02 / 0.04). `fixed_rule.v1` uses `decisions.fixed_rule`; the loader refuses any value other than 0.02 / 0.04 for `v1` (`FIXED_RULE_VERSION_MISMATCH`). Prices are rounded to cents; a bracket that does not satisfy `0 < stop < ask < target` is `BRACKET_INVALID`.
 6. **Deployments are checked before any model call.** `get_ai_deployment` must return no `error_code`, the expected `kind`, and for a strategy `decider_verdict == "DEPLOY"` and the conid in `conids`. A failure is a recorded refusal with the trader's code (`DEPLOYMENT_KIND_MISMATCH`, `DEPLOYMENT_NOT_DEPLOYABLE`, `CONID_NOT_IN_DEPLOYMENT`, ...). No budget is spent. A BUY from a strategy missing in `decisions.strategies` is `STRATEGY_NOT_CONFIGURED`; an entry cycle without `decisions.discretionary_deployment_digest` is `DISCRETIONARY_NOT_CONFIGURED`.
 7. **Discovery filter.** Only candidates with `resolution == "RESOLVED"`, a conid and `scope_precheck.status == "PASS"` reach a model. `FAIL` (counted by part), `NOT_CHECKED` and unresolved candidates are dropped and counted. Dropping `NOT_CHECKED` is stricter than Plan 3 asks; *cost:* fewer candidates in the first cycle of a day. At most `max_candidates_to_model` (default 15) are kept, in discovery order. `complete` is recorded as the trader's flag **and** no failed source, no failed news symbol, no failed resolution and no `RESOLUTION_BUDGET` candidate; it is never set to true by the client. A failed read is recorded `FAILED` with its code and the cycle ends.
 8. **Menus, not free fields.** Candidates are shown as `C1..Cn` and positions as `P1..Pn`. A pick of an unknown ref, a repeated ref, more picks than `max_entries_per_cycle` (default 2), a CLOSE with a quantity, a PARTIAL_CLOSE without `1 ≤ q < whole shares held`, or any extra field (for example `stop_price`, `conid`, `quantity` on an entry pick) refuses the **whole** output. PARTIAL_CLOSE has no stop or target field (Plan 3 Ruling 14).
 9. **Jev rules.** `{"verdict": "TAKE"|"SKIP"|"REDUCE", "quantity": int|null, "reason": str}`. TAKE and SKIP carry `quantity: null`. REDUCE needs an integer `1 ≤ q < ceiling`. A missing, equal, larger or non-integer REDUCE quantity is a refusal (`JEV_REDUCE_QUANTITY_MISSING`, `JEV_REDUCE_NOT_SMALLER`, `JEV_REDUCE_QUANTITY_INVALID`), never a TAKE. Every ENTER the engine proposes has `decider = "jev"` and exists only after a parsed TAKE or REDUCE.
 10. **Role health (spec 9).** Plan 4 refuses to start on a missing model id, so the per-role rule of spec 9 applies at call time. A `CallRefused` with `ROLE_UNKNOWN`, `PRICE_UNAVAILABLE` or `OUTPUT_LIMIT_ABOVE_ROLE`, or a `CallFailed` with outcome `REJECTED` (provider 4xx, for example an unknown model id), marks the role down for `role_recheck_seconds` (default 300); a success marks it up. Jev down: every ENTER is refused `JEV_UNHEALTHY` after its evidence is read (baselines are still written) and entry cycles do not call the orchestrator (no ENTER could pass its judge). Orchestrator down: entry cycles skip discovery and position cycles skip (`ORCHESTRATOR_UNHEALTHY`); signal judgments and exit signals are unaffected. Health lives in memory; a restart re-learns it with one call. *Cost if wrong:* a Bedrock throttle (`REJECTED` in Plan 4) pauses that role for 5 minutes.
-11. **Baselines** (index rulings; Plan 2 one-per-opportunity). `follow_signal.v1`: every strategy BUY whose evidence was read, whatever Jev, the budget or the model did; opportunity = the signal's `source_event_id`; linked (`linked_action_key`) only when an ENTER is proposed. `fixed_rule.v1` and `no_trade.v1`: one each per entry cycle that had at least one eligible candidate (opportunity = cycle id), recorded before the orchestrator is asked. Fixed rule = highest `change_pct` among eligible candidates, ties by higher `median_dollar_volume_20d`, then symbol; candidates without `change_pct` are not ranked; its reference is a fresh IB ask read in the cycle. `matched_entry_bracket_exit.v1`: one per model CLOSE / PARTIAL_CLOSE, opportunity = `round_trip_id`, entry time = trip `opened_at`, reference = trip `entry_avg_price`, quantity = trip `opened_quantity`, stop/target = the ENTER body in `ai_submissions`, `linked_decision_id` = the trip's decision. A baseline whose evidence is missing is not invented: the note names why (`FIXED_RULE_QUOTE_STALE`, `MATCHED_ENTRY_UNKNOWN`, ...). No model close → no matched-entry record.
+11. **Baselines** (index rulings; Plan 2 Rulings 18, 19, 21; one record per opportunity). `follow_signal.v1`: every strategy BUY of a configured strategy, whatever Jev, the budget or the model did; opportunity = the signal's `source_event_id`; linked (`linked_action_key`) only when an ENTER is proposed. `fixed_rule.v1` and `no_trade.v1`: one each per entry cycle that had at least one eligible candidate (opportunity = cycle id), recorded before the orchestrator is asked. Fixed rule = highest `change_pct` among eligible candidates, ties by higher `median_dollar_volume_20d`, then symbol; candidates without `change_pct` are not ranked; its reference is the ask of a fresh `get_ai_entry_quote` read in the cycle. Both sized baselines are sent with `quantity: null` and the `deployment_digest` a real ENTER would name (the strategy's, or `decisions.discretionary_deployment_digest`); the trader sizes them (Plan 2 Ruling 19). `matched_entry_bracket_exit.v1`: one record **per model CLOSE / PARTIAL_CLOSE**: opportunity = the close's own decision id (`derive_decision_id(cycle_id, close action_key)`, stable per close), `linked_round_trip_id` = the trip, entry time = trip `opened_at`, reference = trip `entry_avg_price`, quantity = trip `opened_quantity` (the real entry quantity), stop/target = the ENTER body in `ai_submissions`, `linked_decision_id` = the trip's ENTER decision. Two partial closes of one trip are two records. **Missing evidence is sent, not dropped (spec 7):** when the quote read fails the follow-signal or fixed-rule baseline is sent with `incomplete_reason` and no side, quantity or price: `QUOTE_FEED_NOT_ACCEPTED` → `feed_not_accepted`; every other quote failure (`QUOTE_UNAVAILABLE`, `QUOTE_STALE`, `QUOTE_INVALID`, `QUOTE_NOT_CONTINUOUS`, an unreachable trader on the quote read, and `BRACKET_INVALID`, a quote too small for a cent bracket) → `quote_unavailable`. Because evidence is read before the model (Ruling 13) and the sized baselines need no model output, a budget refusal (including `BUDGET_CAP_UNKNOWN`), a model failure or an unhealthy Jev leaves the follow-signal baseline **complete**; so Plan 6 never sends `budget_refused` or `model_failed` (they stay in Plan 2's list for a flow that reads after a model step) and never sends `sizing_unavailable` (the trader writes it). Not an incomplete record, because no counterfactual exists: a strategy missing from `decisions.strategies` (no bracket, `STRATEGY_NOT_CONFIGURED`), a cycle with no eligible candidate, and a model close whose trip has no ENTER decision, entry price or entry body of this experiment (`MATCHED_ENTRY_UNKNOWN`); each is noted. No model close → no matched-entry record.
 12. **Exit signals.** No model. The engine reads `get_experiment_trips`; a SELL for a conid the experiment holds is a `CLOSE` (`decider = "strategy"`). If the trips read fails the CLOSE is still proposed (the trader proves ownership, Plan 3 Ruling 15); a conid not held is `NOT_HELD`.
 13. **Evidence before the model call (spec 5.5 order).** Spec 5.5 lists "budget → fresh evidence → Jev". The engine reads evidence first, because the follow-signal baseline needs a reference price even when the budget refuses (spec 7), and the reads are trader RPCs, not model calls. The budget is still checked before the Jev call (by the gateway). *Cost if wrong:* a few reads for signals the budget then refuses.
 14. **One deadline per opportunity or cycle.** Plan 5's `ModelWork.deadline` covers the orchestrator and every Jev call of that cycle (`for_action` shares it). Jev calls run one after another.
 15. **Rulings are recorded live only.** `ai_rulings` gets one row per model step (`jev`, `entries`, `closes`) with outcome, code, quantity, ceiling and evidence digest. Replay compares against the first `jev` row of its unit and writes nothing.
-16. **Evidence digest** = `"sha256:" + sha256(canonical_json(body))` where the body holds the versioned kind (`entry_evidence.v1`, `exit_signal.v1`, `close.v1`), conid, the quote (bid, ask, time), policy revision, deployment digest, stop, target, ceiling and equity. The trader still revalidates everything itself (spec 5.3).
+16. **Evidence digest** = `"sha256:" + sha256(canonical_json(body))` where the body holds the versioned kind (`entry_evidence.v1`, `exit_signal.v1`, `close.v1`), conid, the quote (bid, ask, time, **feed**), policy revision, deployment digest, stop, target, ceiling and equity. The trader still revalidates everything itself (spec 5.3).
 17. **Interfaces this plan changes.** `EngineDeps` gains `store: AiStore` (last field; `serve()` passes its store). `OwnedPosition` gains `entry_price: Optional[float] = None`, `entry_quantity: Optional[float] = None`, read from the trip's `entry_avg_price` and `opened_quantity`. The trader's `_trip_view` (`trader/scoreboard/service.py`) adds `"entry_avg_price": row["entry_avg"]` (owner to confirm: the plan's one trader-side change). `tests/sp1_fixtures.py::Composed` gains `prepare` (a test seam called just before `build_command_stack`).
 18. **Manifest code version** = env `MMR_CODE_VERSION` if set, else `importlib.metadata.version("mmr")`. A missing distribution raises at engine build (fail loudly).
 19. **A re-judged unit is not replayed.** Plan 5 Ruling 9 judges an `IN_PROGRESS` opportunity again after a crash, under the same decision key, so its evidence holds two passes. `replay_decision` reports such a unit (more than one `given:source` record) as `INCOMPLETE` with `missing = ("rejudged_unit",)` instead of guessing which pass a ruling row belongs to. *Cost:* a crash during a judgment leaves that one decision without replay; it stays fully audited.
@@ -52,7 +52,8 @@
 
 - `trader.ai.config`: `DecisionsConfig` (`AiConfig.decisions`, section `decisions:`) with `discretionary_deployment_digest: Optional[str]`, `strategies: dict[str, StrategyBracket]` (`deployment_digest`, `stop_fraction`, `target_fraction`), `self_found_bracket: Bracketing`, `fixed_rule: FixedRuleConfig` (`version`, `stop_fraction`, `target_fraction`), `discovery: DiscoverySettings` (`movers_top`, `most_actives_top`, `watchlist`, `news_per_symbol`, `news_symbols_max`, `max_candidates_to_model`), `max_entries_per_cycle`, `quote_max_age_seconds`, `news_chars_per_item`, `role_recheck_seconds`.
 - `trader.ai.decision_schema.DECISION_MIGRATIONS` (20, 21); `trader.ai.runtime_schema.ALL_MIGRATIONS = FOUNDATION_MIGRATIONS + RUNTIME_MIGRATIONS + DECISION_MIGRATIONS`.
-- `trader.ai.rpc_clients.SUPERVISOR_QUERIES` gains `get_account_values`.
+- `trader.ai.rpc_clients.SUPERVISOR_QUERIES` gains `get_account_values` and `get_ai_entry_quote` (Plan 3).
+- `trader.ai.evidence`: `Quote(conid, bid, ask, time, feed)`, `PricedEntry`, `price_entry(tools, source, *, quote_max_age_seconds)`, `complete_entry_evidence(tools, source, priced)`; `trader.ai.baselines.incomplete(...)`, `incomplete_reason_for(code)`; `matched_entry(position, entry_body, *, close_decision_id)`.
 - `trader.ai_service.EngineDeps.store`; `build_engine(deps) -> PaperDecisionEngine`.
 - `trader.ai.engine.OwnedPosition.entry_price`, `.entry_quantity`.
 - `get_experiment_trips` trip rows gain `entry_avg_price: Optional[float]`.
@@ -74,10 +75,10 @@
 |---|---|
 | 3 roles; Jev on every ENTER; REDUCE explicit and smaller; backtest judge type | 4, 6 |
 | 5.5 flows: entry signal, exit signal, entry cycle, position cycle | 6, 8 |
-| 7 baselines written when Jev fails or the budget refuses; incomplete never invented | 5, 6, 9 |
+| 7 baselines written when Jev fails or the budget refuses; missing evidence sent as incomplete, never invented | 5, 6, 9 |
 | 8 untrusted input; code-owned fields | 4, 9 |
 | 9 bad Jev / orchestrator config; partial discovery | 3, 6, 8 |
-| 10 fresh IB evidence before an ENTER; scope candidates dropped before a model | 2, 3 |
+| 10 fresh quote-authority evidence (feed checked) before an ENTER; scope candidates dropped before a model | 2, 3 |
 | 11 replay end to end | 7, 9 |
 | 12 Flows, Security, Initialization, Discovery route, Baseline books, Replay | 8, 9 |
 | 12 Flows "crash between intake and cursor" and "expired cursor → gap" | pinned by Plan 5 Task 8 (`test_crash_between_intake_and_cursor_skips_no_signal`, `test_a_retention_gap_is_recorded_not_reconstructed`); the engine plays no part |
@@ -104,10 +105,10 @@
 - Modify: `trader/ai/config.py` (`StrategyBracket`, `Bracketing`, `FixedRuleConfig`, `DiscoverySettings`, `DecisionsConfig`; `_RawConfig.decisions`; `AiConfig.decisions`; `_check`; `digest()`)
 - Modify: `config_defaults/ai.yaml` (a `decisions:` block)
 - Create: `trader/ai/decision_schema.py`
-- Modify: `trader/ai/runtime_schema.py` (`ALL_MIGRATIONS`), `trader/ai/rpc_clients.py` (`SUPERVISOR_QUERIES` + `get_account_values`), `trader/ai_service.py` (`EngineDeps.store`; `serve()` passes `store`)
+- Modify: `trader/ai/runtime_schema.py` (`ALL_MIGRATIONS`), `trader/ai/rpc_clients.py` (`SUPERVISOR_QUERIES` + `get_account_values`, `get_ai_entry_quote`), `trader/ai_service.py` (`EngineDeps.store`; `serve()` passes `store`)
 - Modify: `trader/ai/engine.py` (`OwnedPosition.entry_price`, `.entry_quantity`; `owned_positions_from_trips` reads them), `trader/scoreboard/service.py` (`_trip_view` adds `"entry_avg_price": row["entry_avg"]`)
 - Create (tests): `tests/ai/decisions/__init__.py` (empty), `tests/ai/decisions/test_decision_config.py`
-- Modify (tests): the Plan 5 test that pins `SUPERVISOR_QUERIES` (`tests/ai/runtime/test_rpc_clients.py`) gains `get_account_values`; `tests/scoreboard/test_surface.py` (the trips reply carries `entry_avg_price`) and any test that pins the exact key set of a trip view
+- Modify (tests): the Plan 5 test that pins `SUPERVISOR_QUERIES` (`tests/ai/runtime/test_rpc_clients.py`) gains `get_account_values` and `get_ai_entry_quote`; `tests/scoreboard/test_surface.py` (the trips reply carries `entry_avg_price`) and any test that pins the exact key set of a trip view
 
 **Interfaces:**
 - Consumes: Plan 4 `_Section`, `Whole`, `Number`, `AiConfigError`, `Migration`; Plan 5 `RUNTIME_MIGRATIONS`, `EngineDeps`.
@@ -292,7 +293,7 @@ Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>"
 
 **Interfaces:**
 - Consumes: Plan 4 `ReplayRecorder`, `RecordingClock`, `ReplaySession`, `ReplayIncomplete`; Plan 5 `ReadOnlySupervisor`, `RpcNotSent`, `RpcOutcomeUnknown`, `RpcRefused`, `canonical_json`; SP1 `RiskLimits.from_json`, `max_entry_quantity`, `SizingInputs`.
-- Produces: `TOOL_METHODS`, `TOOL_ERROR_KEY`, `ToolUnavailable(tool, code)`, `LiveTools(*, unit_key, reads, recorder, clock, gateway, deadline)`, `ReplayTools(session, unit_key)`, `code_version()`; `EvidenceRefused(code, detail)`, `Quote`, `fresh_quote(reply, conid, now, max_age_seconds)`, `PolicyFacts.from_reply`, `DeploymentFacts.from_reply(reply, source)`, `AccountFacts.from_replies(account, positions)`, `Bracket.around(ask, stop_fraction, target_fraction)`, `estimate_entry_ceiling(limits, account, *, conid, price, stop, notional_cap, liquidity_max_shares) -> int`, `EntrySource`, `EntryEvidence`, `gather_entry_evidence(tools, source, *, quote_max_age_seconds)`, `evidence_digest(body)`, `SP1_ADV_FRACTION`.
+- Produces: `TOOL_METHODS`, `TOOL_ERROR_KEY`, `ToolUnavailable(tool, code)`, `LiveTools(*, unit_key, reads, recorder, clock, gateway, deadline)`, `ReplayTools(session, unit_key)`, `code_version()`; `EvidenceRefused(code, detail)`, `Quote` (with `feed`), `fresh_quote(reply, conid, now, max_age_seconds)`, `PricedEntry`, `price_entry(tools, source, *, quote_max_age_seconds)`, `complete_entry_evidence(tools, source, priced)`, `PolicyFacts.from_reply`, `DeploymentFacts.from_reply(reply, source)`, `AccountFacts.from_replies(account, positions)`, `Bracket.around(ask, stop_fraction, target_fraction)`, `estimate_entry_ceiling(limits, account, *, conid, price, stop, notional_cap, liquidity_max_shares) -> int`, `EntrySource`, `EntryEvidence`, `gather_entry_evidence(tools, source, *, quote_max_age_seconds)`, `evidence_digest(body)`, `SP1_ADV_FRACTION`.
 
 - [ ] **Step 1: Write the failing tests**
 
@@ -317,9 +318,13 @@ LIMITS = {"max_positions": 3, "position_fraction": 0.05, "gross_fraction": 0.06,
           "daily_loss_fraction": 0.005, "drawdown_fraction": 0.03, "max_pending_entry_orders": 3}
 
 
-def snapshot_reply(conid=AAPL, bid=229.9, ask=230.0, at=NOW, halted=None):
-    return {"snapshot": {"instrument_id": conid, "symbol": "AAPL", "bid": bid, "ask": ask, "halted": halted,
-                         "time": None if at is None else str(at)}}
+def entry_quote_reply(conid=AAPL, bid=229.9, ask=230.0, at=NOW, feed="live", session_state="continuous",
+                      accepted=("live",)):
+    """Plan 3's get_ai_entry_quote reply: the trader's quote and the trader's accepted feeds."""
+    return {"conid": conid, "read_at": NOW.isoformat(), "account_mode": "paper", "accepted_feeds": list(accepted),
+            "quote": {"bid": bid, "ask": ask, "bid_size": 300.0, "ask_size": 300.0,
+                      "market_timestamp": None if at is None else at.isoformat(), "feed": feed,
+                      "session_state": session_state}}
 
 
 class FakeReads:
@@ -327,7 +332,7 @@ class FakeReads:
 
     def __init__(self, **overrides: Any):
         self.replies: dict[str, Any] = {
-            "get_snapshot": lambda body: snapshot_reply(conid=body["instrument_id"]),
+            "get_ai_entry_quote": lambda body: entry_quote_reply(conid=body["conid"]),
             "get_ai_risk_policy": {"latest_published_revision": 1, "effective": LIMITS, "latest_published": LIMITS},
             "get_ai_deployment": lambda body: {
                 "digest": body["digest"], "error_code": None,
@@ -387,17 +392,17 @@ def trader_down(code="TRADER_UNREACHABLE"):
 
 ```python
 # tests/ai/decisions/test_evidence.py
-"""SP2 Plan 6 Task 2: fresh IB evidence, the code-owned ceiling and the read seam (spec 5.3, 10, 11)."""
+"""SP2 Plan 6 Task 2: fresh quote-authority evidence, the code-owned ceiling and the read seam (spec 5.3, 10, 11)."""
 import dataclasses
 import datetime as dt
 
 import pytest
 
-from tests.ai.decisions.fakes import AAPL, LIMITS, NOW, STRATEGY_DIGEST, FakeReads, snapshot_reply, trader_down
+from tests.ai.decisions.fakes import AAPL, LIMITS, NOW, STRATEGY_DIGEST, FakeReads, entry_quote_reply, trader_down
 from tests.ai.fakes import FakeClock
 from trader.ai.evidence import (
-    SP1_ADV_FRACTION, AccountFacts, EntrySource, EvidenceRefused, estimate_entry_ceiling, fresh_quote,
-    gather_entry_evidence,
+    SP1_ADV_FRACTION, AccountFacts, EntrySource, EvidenceRefused, estimate_entry_ceiling, evidence_digest,
+    fresh_quote, gather_entry_evidence,
 )
 from trader.ai.replay import ReplayEvidence, ReplayRecorder, ReplaySession
 from trader.ai.runtime_schema import ALL_MIGRATIONS
@@ -410,15 +415,28 @@ SOURCE = EntrySource(kind="strategy", conid=AAPL, deployment_digest=STRATEGY_DIG
 
 
 @pytest.mark.parametrize("reply,code", [
-    ({"snapshot": None}, "QUOTE_UNAVAILABLE"), (snapshot_reply(conid=1), "QUOTE_UNAVAILABLE"),
-    (snapshot_reply(bid=0.0), "QUOTE_INVALID"), (snapshot_reply(bid=231.0), "QUOTE_INVALID"),
-    (snapshot_reply(halted=1.0), "QUOTE_HALTED"), (snapshot_reply(at=None), "QUOTE_STALE"),
-    (snapshot_reply(at=NOW - dt.timedelta(seconds=16)), "QUOTE_STALE"),
-    ({"snapshot": {**snapshot_reply()["snapshot"], "time": "2026-07-17 15:00:00"}}, "QUOTE_STALE")])
-def test_a_quote_must_be_fresh_and_sane(reply, code):
+    ({**entry_quote_reply(), "quote": None}, "QUOTE_UNAVAILABLE"), (entry_quote_reply(conid=1), "QUOTE_UNAVAILABLE"),
+    ({**entry_quote_reply(), "accepted_feeds": []}, "QUOTE_UNAVAILABLE"),
+    (entry_quote_reply(bid=0.0), "QUOTE_INVALID"), (entry_quote_reply(bid=231.0), "QUOTE_INVALID"),
+    (entry_quote_reply(session_state="halted"), "QUOTE_NOT_CONTINUOUS"), (entry_quote_reply(at=None), "QUOTE_STALE"),
+    (entry_quote_reply(at=NOW - dt.timedelta(seconds=16)), "QUOTE_STALE"),
+    (entry_quote_reply(at=NOW.replace(tzinfo=None)), "QUOTE_STALE"),
+    (entry_quote_reply(feed="delayed"), "QUOTE_FEED_NOT_ACCEPTED"),
+    (entry_quote_reply(feed="iex_realtime"), "QUOTE_FEED_NOT_ACCEPTED"),          # no paper fallback on the trader
+])
+def test_a_quote_must_be_fresh_sane_and_of_an_accepted_feed(reply, code):
     with pytest.raises(EvidenceRefused) as exc:
         fresh_quote(reply, AAPL, NOW, 15)
     assert exc.value.code == code
+
+
+def test_the_trader_decides_the_feed_set_and_the_feed_reaches_the_digest():                # owner #74
+    iex = fresh_quote(entry_quote_reply(feed="iex_realtime", accepted=("iex_realtime", "live")), AAPL, NOW, 15)
+    live = fresh_quote(entry_quote_reply(), AAPL, NOW, 15)
+    assert (iex.feed, live.feed) == ("iex_realtime", "live")
+    body = {"v": "entry_evidence.v1", "conid": AAPL}
+    assert (evidence_digest({**body, "quote": dataclasses.asdict(iex)})
+            != evidence_digest({**body, "quote": dataclasses.asdict(live)}))
 
 
 def test_the_ceiling_is_sp1_sizing_on_what_the_ai_side_can_read():
@@ -445,7 +463,7 @@ async def test_live_reads_are_recorded_and_replay_serves_them_without_fetching(t
     evidence = await gather_entry_evidence(live, SOURCE, quote_max_age_seconds=15)
     await live.finish("cfg-digest")
     assert (evidence.reference_price, evidence.stop_price, evidence.target_price) == (230.0, 225.4, 239.2)
-    assert evidence.policy_revision == 1 and evidence.digest.startswith("sha256:")
+    assert evidence.policy_revision == 1 and evidence.digest.startswith("sha256:") and evidence.quote.feed == "live"
     session = ReplaySession(ReplayEvidence.load(store, "dec-" + "1" * 32))
     replayed = await gather_entry_evidence(ReplayTools(session, "dec-" + "1" * 32), SOURCE, quote_max_age_seconds=15)
     assert replayed == evidence and len(reads.calls) == 5
@@ -467,7 +485,7 @@ async def test_a_failed_read_is_recorded_and_replays_as_the_same_failure(tmp_pat
     assert (live_error.value.code, replay_error.value.code) == ("TRADER_UNREACHABLE", "TRADER_UNREACHABLE")
 ```
 
-**Also write these tests** (each asserts what its name says): `test_no_policy_is_no_accepted_policy` (`latest_published_revision: None` → `NO_ACCEPTED_POLICY`), `test_deployment_checks_run_before_any_model` (each of `error_code`, wrong `kind`, `decider_verdict != DEPLOY`, conid not in `conids` gives its code), `test_a_ceiling_below_one_share_is_refused`, `test_discretionary_notional_and_adv_come_from_the_median` (median 100M, ask 500: notional cap 1,000,000, liquidity `SP1_ADV_FRACTION × 100M / 500` = 500 shares), `test_bracket_must_straddle_the_ask`, `test_net_liquidation_in_another_currency_is_refused` (`ACCOUNT_UNAVAILABLE`).
+**Also write these tests** (each asserts what its name says): `test_no_policy_is_no_accepted_policy` (`latest_published_revision: None` → `NO_ACCEPTED_POLICY`), `test_deployment_checks_run_before_any_model` (each of `error_code`, wrong `kind`, `decider_verdict != DEPLOY`, conid not in `conids` gives its code), `test_a_ceiling_below_one_share_is_refused`, `test_discretionary_notional_and_adv_come_from_the_median` (median 100M, ask 500: notional cap 1,000,000, liquidity `SP1_ADV_FRACTION × 100M / 500` = 500 shares), `test_bracket_must_straddle_the_ask`, `test_net_liquidation_in_another_currency_is_refused` (`ACCOUNT_UNAVAILABLE`), `test_a_priced_entry_survives_a_later_read_failure` (`price_entry` returns the quote and bracket; a failing `get_ai_risk_policy` then fails only `complete_entry_evidence`).
 
 - [ ] **Step 2: Run them and see them fail**
 
@@ -489,7 +507,7 @@ from trader.ai.replay import RecordingClock
 from trader.ai.rpc_clients import RpcNotSent, RpcOutcomeUnknown, RpcRefused
 
 TOOL_METHODS: Mapping[str, str] = {
-    "quote": "get_snapshot", "policy": "get_ai_risk_policy", "deployment": "get_ai_deployment",
+    "quote": "get_ai_entry_quote", "policy": "get_ai_risk_policy", "deployment": "get_ai_deployment",
     "account": "get_account_values", "positions": "get_positions", "discovery": "discover_ai_candidates",
 }
 TOOL_ERROR_KEY = "__tool_error__"
@@ -583,19 +601,29 @@ class Quote:
     bid: float
     ask: float
     time: str
+    feed: str                                     # the trader's label: live or iex_realtime (owner #74)
 
 
 def fresh_quote(reply: Any, conid: int, now: dt.datetime, max_age_seconds: int) -> Quote:
-    snapshot = reply.get("snapshot") if isinstance(reply, dict) else None
-    if not isinstance(snapshot, dict) or snapshot.get("instrument_id") != conid:
-        raise EvidenceRefused("QUOTE_UNAVAILABLE", "no IB snapshot for this conid")
-    bid, ask = snapshot.get("bid"), snapshot.get("ask")
+    """Ruling 3. The accepted feeds come from the trader's own reply; this side never decides them."""
+    if not isinstance(reply, dict) or reply.get("conid") != conid:
+        raise EvidenceRefused("QUOTE_UNAVAILABLE", "no entry quote for this conid")
+    accepted = reply.get("accepted_feeds")
+    if not isinstance(accepted, list) or not accepted or not all(isinstance(f, str) for f in accepted):
+        raise EvidenceRefused("QUOTE_UNAVAILABLE", "the trader named no accepted feed")
+    quote = reply.get("quote")
+    if not isinstance(quote, dict):
+        raise EvidenceRefused("QUOTE_UNAVAILABLE", "the trader has no executable quote")
+    feed = quote.get("feed")
+    if feed not in accepted:
+        raise EvidenceRefused("QUOTE_FEED_NOT_ACCEPTED", f"feed {feed!r} is not in {sorted(accepted)}")
+    if quote.get("session_state") != "continuous":
+        raise EvidenceRefused("QUOTE_NOT_CONTINUOUS", f"session state {quote.get('session_state')!r}")
+    bid, ask = quote.get("bid"), quote.get("ask")
     if not (_positive(bid) and _positive(ask)) or ask < bid:
         raise EvidenceRefused("QUOTE_INVALID", "bid and ask must be positive with ask >= bid")
-    if snapshot.get("halted") not in (None, 0, 0.0):
-        raise EvidenceRefused("QUOTE_HALTED", "the instrument is halted")
     try:
-        stamped = dt.datetime.fromisoformat(snapshot["time"])
+        stamped = dt.datetime.fromisoformat(quote["market_timestamp"])
     except (TypeError, ValueError):
         raise EvidenceRefused("QUOTE_STALE", "the quote has no readable time") from None
     if stamped.utcoffset() is None:
@@ -603,7 +631,7 @@ def fresh_quote(reply: Any, conid: int, now: dt.datetime, max_age_seconds: int) 
     age = (now - stamped).total_seconds()
     if age > max_age_seconds or age < -FUTURE_SKEW_SECONDS:
         raise EvidenceRefused("QUOTE_STALE", f"quote age {age:.1f}s")
-    return Quote(conid, float(bid), float(ask), stamped.astimezone(dt.timezone.utc).isoformat())
+    return Quote(conid, float(bid), float(ask), stamped.astimezone(dt.timezone.utc).isoformat(), feed)
 
 
 def estimate_entry_ceiling(limits: RiskLimits, account: "AccountFacts", *, conid: int, price: float, stop: float,
@@ -632,16 +660,42 @@ class EntryEvidence:
     digest: str
 
 
-async def gather_entry_evidence(tools: Any, source: "EntrySource", *, quote_max_age_seconds: int) -> EntryEvidence:
-    """Reads in a fixed order (replay depends on it). Raises EvidenceRefused or ToolUnavailable."""
+@dataclass(frozen=True)
+class PricedEntry:
+    """What a baseline needs: the fresh quote and the bracket around its ask (no sizing, no model)."""
+    conid: int
+    read_at: dt.datetime
+    quote: Quote
+    stop_price: float
+    target_price: float
+
+    @property
+    def reference_price(self) -> float:
+        return self.quote.ask
+
+
+async def price_entry(tools: Any, source: "EntrySource", *, quote_max_age_seconds: int) -> PricedEntry:
+    """The first read of every entry (replay depends on the order). Raises EvidenceRefused or ToolUnavailable."""
     read_at = tools.clock.now()
-    quote = fresh_quote(await tools.read("quote", {"instrument_id": source.conid}), source.conid, read_at,
+    quote = fresh_quote(await tools.read("quote", {"conid": source.conid}), source.conid, read_at,
                         quote_max_age_seconds)
+    bracket = Bracket.around(quote.ask, source.stop_fraction, source.target_fraction)
+    return PricedEntry(source.conid, read_at, quote, bracket.stop, bracket.target)
+
+
+async def gather_entry_evidence(tools: Any, source: "EntrySource", *, quote_max_age_seconds: int) -> EntryEvidence:
+    priced = await price_entry(tools, source, quote_max_age_seconds=quote_max_age_seconds)
+    return await complete_entry_evidence(tools, source, priced)
+
+
+async def complete_entry_evidence(tools: Any, source: "EntrySource", priced: PricedEntry) -> EntryEvidence:
+    """The reads after the quote, in a fixed order. Raises EvidenceRefused or ToolUnavailable."""
+    read_at, quote = priced.read_at, priced.quote
+    bracket = Bracket(priced.stop_price, priced.target_price)
     policy = PolicyFacts.from_reply(await tools.read("policy", {}))
     deployment = DeploymentFacts.from_reply(await tools.read("deployment", {"digest": source.deployment_digest}),
                                             source)
     account = AccountFacts.from_replies(await tools.read("account", {}), await tools.read("positions", {}))
-    bracket = Bracket.around(quote.ask, source.stop_fraction, source.target_fraction)
     notional_cap, liquidity_shares = deployment.caps(price=quote.ask, median_dollar_volume=source.median_dollar_volume)
     ceiling = estimate_entry_ceiling(policy.limits, account, conid=source.conid, price=quote.ask, stop=bracket.stop,
                                      notional_cap=notional_cap, liquidity_max_shares=liquidity_shares)
@@ -1184,39 +1238,53 @@ Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>"
 - Create (tests): `tests/ai/decisions/test_baselines.py`
 
 **Interfaces:**
-- Consumes: `SimulatedBaseline`, `SignalOpportunity`, `OwnedPosition`; `EntryEvidence`; `EligibleCandidate`.
-- Produces: `follow_signal(opportunity, evidence)`, `no_trade(cycle_id, decided_at)`, `pick_fixed_rule(eligible) -> Optional[EligibleCandidate]`, `fixed_rule(cycle_id, evidence)`, `matched_entry(position, entry_body) -> Optional[SimulatedBaseline]`.
+- Consumes: `SimulatedBaseline`, `SignalOpportunity`, `OwnedPosition`; `PricedEntry`; `EligibleCandidate`.
+- Produces: `follow_signal(opportunity, priced, deployment_digest)`, `no_trade(cycle_id, decided_at)`, `pick_fixed_rule(eligible) -> Optional[EligibleCandidate]`, `fixed_rule(cycle_id, priced, deployment_digest)`, `incomplete(baseline_id, cohort, opportunity_id, decided_at, *, conid, reason, deployment_digest=None)`, `incomplete_reason_for(code) -> str`, `matched_entry(position, entry_body, *, close_decision_id) -> Optional[SimulatedBaseline]`.
 
 - [ ] **Step 1: Write the failing tests**
 
 ```python
 # tests/ai/decisions/test_baselines.py
-"""SP2 Plan 6 Task 5: deterministic baselines; nothing is invented when evidence is missing (spec 7)."""
+"""SP2 Plan 6 Task 5: deterministic baselines; missing evidence is sent incomplete, never invented (spec 7)."""
 import dataclasses
 
 import pytest
 
-from tests.ai.decisions.fakes import AAPL, MSFT, NOW
-from trader.ai.baselines import fixed_rule, follow_signal, matched_entry, no_trade, pick_fixed_rule
+from tests.ai.decisions.fakes import AAPL, MSFT, NOW, STRATEGY_DIGEST
+from trader.ai.baselines import (fixed_rule, follow_signal, incomplete, incomplete_reason_for, matched_entry,
+                                 no_trade, pick_fixed_rule)
 from trader.ai.discovery_client import EligibleCandidate
 from trader.ai.engine import OwnedPosition, SignalOpportunity
-from trader.ai.evidence import EntryEvidence, Quote
+from trader.ai.evidence import PricedEntry, Quote
 
-EVIDENCE = EntryEvidence(AAPL, NOW, Quote(AAPL, 229.9, 230.0, NOW.isoformat()), 1, "sha256:" + "a" * 64, 230.0,
-                         225.4, 239.2, 11, "sha256:" + "c" * 64)
+PRICED = PricedEntry(AAPL, NOW, Quote(AAPL, 229.9, 230.0, NOW.isoformat(), "live"), 225.4, 239.2)
 SIGNAL = SignalOpportunity("sig-" + "1" * 32, 7, "orb", AAPL, "BUY", 0.7, NOW, NOW)
 DEC = "dec-" + "9" * 32
+CLOSE_1, CLOSE_2 = "dec-" + "c" * 32, "dec-" + "e" * 32
 
 
 def candidate(ref, symbol, change, volume, conid=AAPL):
     return EligibleCandidate(ref, symbol, conid, ("gainer",), 100.0, change, 1e6, volume, NOW.isoformat(), ())
 
 
-def test_follow_signal_takes_the_evidence_and_the_signal_id():
-    b = follow_signal(SIGNAL, EVIDENCE)
+def test_follow_signal_takes_the_quote_and_leaves_the_size_to_the_trader():
+    b = follow_signal(SIGNAL, PRICED, STRATEGY_DIGEST)
     assert (b.baseline_id, b.cohort, b.opportunity_id, b.decided_at) == ("follow_signal.v1", "strategy_signal",
                                                                          SIGNAL.opportunity_id, NOW)
-    assert (b.quantity, b.reference_price, b.stop_price, b.target_price) == (11, 230.0, 225.4, 239.2)
+    assert (b.quantity, b.reference_price, b.stop_price, b.target_price) == (None, 230.0, 225.4, 239.2)
+    assert b.deployment_digest == STRATEGY_DIGEST                      # the trader sizes it (Plan 2 Ruling 19)
+
+
+@pytest.mark.parametrize("code,reason", [
+    ("QUOTE_FEED_NOT_ACCEPTED", "feed_not_accepted"), ("QUOTE_STALE", "quote_unavailable"),
+    ("QUOTE_UNAVAILABLE", "quote_unavailable"), ("QUOTE_INVALID", "quote_unavailable"),
+    ("QUOTE_NOT_CONTINUOUS", "quote_unavailable"), ("BRACKET_INVALID", "quote_unavailable"),
+    ("TRADER_UNREACHABLE", "quote_unavailable")])
+def test_a_missing_quote_is_an_incomplete_record_with_no_invented_value(code, reason):
+    b = incomplete("follow_signal.v1", "strategy_signal", SIGNAL.opportunity_id, NOW, conid=AAPL,
+                   reason=incomplete_reason_for(code), deployment_digest=STRATEGY_DIGEST)
+    assert (b.incomplete_reason, b.conid) == (reason, AAPL)
+    assert (b.side, b.quantity, b.reference_price, b.stop_price, b.target_price) == (None,) * 5
 
 
 def test_fixed_rule_ranks_by_change_then_volume_then_symbol():
@@ -1233,9 +1301,20 @@ def test_no_trade_is_the_cycle_and_nothing_else():
 
 def test_matched_entry_records_the_entry_not_the_close():
     position = OwnedPosition("rt-1", AAPL, "AAPL", 4.0, NOW, DEC, 230.05, 10.0)
-    b = matched_entry(position, {"stop_price": 225.4, "target_price": 239.2})
+    b = matched_entry(position, {"stop_price": 225.4, "target_price": 239.2}, close_decision_id=CLOSE_1)
     assert (b.opportunity_id, b.decided_at, b.quantity, b.reference_price, b.linked_decision_id) == (
-        "rt-1", NOW, 10, 230.05, DEC)
+        CLOSE_1, NOW, 10, 230.05, DEC)
+    assert b.linked_round_trip_id == "rt-1"
+
+
+def test_two_partial_closes_of_one_trip_are_two_records():               # PR #75: one record per close
+    position = OwnedPosition("rt-1", AAPL, "AAPL", 6.0, NOW, DEC, 230.05, 10.0)
+    body = {"stop_price": 225.4, "target_price": 239.2}
+    first = matched_entry(position, body, close_decision_id=CLOSE_1)
+    second = matched_entry(dataclasses.replace(position, open_quantity=3.0), body, close_decision_id=CLOSE_2)
+    assert (first.opportunity_id, second.opportunity_id) == (CLOSE_1, CLOSE_2)
+    assert {first.linked_round_trip_id, second.linked_round_trip_id} == {"rt-1"}
+    assert first.quantity == second.quantity == 10                       # the real entry quantity
 
 
 @pytest.mark.parametrize("position,body", [
@@ -1244,7 +1323,7 @@ def test_matched_entry_records_the_entry_not_the_close():
     (OwnedPosition("rt-1", AAPL, "AAPL", 4.0, NOW, DEC, 230.0, 10.0), None),
     (OwnedPosition("rt-1", AAPL, "AAPL", 4.0, NOW, DEC, 230.0, 10.0), {"stop_price": 231.0, "target_price": 239.2})])
 def test_matched_entry_is_not_invented_from_missing_evidence(position, body):
-    assert matched_entry(position, body) is None
+    assert matched_entry(position, body, close_decision_id=CLOSE_1) is None
 ```
 
 - [ ] **Step 2: Run them and see them fail**
@@ -1256,9 +1335,9 @@ Expected: `ModuleNotFoundError: No module named 'trader.ai.baselines'`.
 
 ```python
 # trader/ai/baselines.py
-"""Baseline decisions for the trader to simulate (SP2 spec 7; index baseline rulings; Plan 2 Ruling 9).
+"""Baseline decisions for the trader to simulate (SP2 spec 7; index baseline rulings; Plan 2 Rulings 9, 18, 19, 21).
 
-Deterministic code only. A baseline without its evidence is not written: the caller notes why.
+Deterministic code only. The trader sizes follow-signal and fixed-rule; missing evidence is sent incomplete.
 """
 from __future__ import annotations
 
@@ -1268,18 +1347,22 @@ from typing import Any, Mapping, Optional, Sequence
 
 from trader.ai.discovery_client import EligibleCandidate
 from trader.ai.engine import OwnedPosition, SignalOpportunity, SimulatedBaseline
-from trader.ai.evidence import EntryEvidence
+from trader.ai.evidence import PricedEntry
+
+FEED_NOT_ACCEPTED, QUOTE_UNAVAILABLE = "feed_not_accepted", "quote_unavailable"
 
 
-def _trading(baseline_id: str, cohort: str, opportunity_id: str, evidence: EntryEvidence) -> SimulatedBaseline:
-    return SimulatedBaseline(baseline_id, cohort, opportunity_id, evidence.read_at, conid=evidence.conid, side="BUY",
-                             quantity=evidence.ceiling, reference_price=evidence.reference_price,
-                             stop_price=evidence.stop_price, target_price=evidence.target_price)
+def _sized_by_trader(baseline_id: str, cohort: str, opportunity_id: str, priced: PricedEntry,
+                     deployment_digest: str) -> SimulatedBaseline:
+    return SimulatedBaseline(baseline_id, cohort, opportunity_id, priced.read_at, conid=priced.conid, side="BUY",
+                             reference_price=priced.reference_price, stop_price=priced.stop_price,
+                             target_price=priced.target_price, deployment_digest=deployment_digest)
 
 
-def follow_signal(opportunity: SignalOpportunity, evidence: EntryEvidence) -> SimulatedBaseline:
-    """The strategy's BUY at the fresh ask with the strategy bracket, whatever Jev ruled."""
-    return _trading("follow_signal.v1", "strategy_signal", opportunity.opportunity_id, evidence)
+def follow_signal(opportunity: SignalOpportunity, priced: PricedEntry, deployment_digest: str) -> SimulatedBaseline:
+    """The strategy's BUY at the fresh ask with the strategy bracket, whatever Jev ruled; the trader sizes it."""
+    return _sized_by_trader("follow_signal.v1", "strategy_signal", opportunity.opportunity_id, priced,
+                            deployment_digest)
 
 
 def no_trade(cycle_id: str, decided_at: dt.datetime) -> SimulatedBaseline:
@@ -1294,12 +1377,27 @@ def pick_fixed_rule(eligible: Sequence[EligibleCandidate]) -> Optional[EligibleC
     return min(ranked, key=lambda c: (-c.change_pct, -(c.median_dollar_volume or 0.0), c.symbol))
 
 
-def fixed_rule(cycle_id: str, evidence: EntryEvidence) -> SimulatedBaseline:
-    return _trading("fixed_rule.v1", "self_found", cycle_id, evidence)
+def fixed_rule(cycle_id: str, priced: PricedEntry, deployment_digest: str) -> SimulatedBaseline:
+    return _sized_by_trader("fixed_rule.v1", "self_found", cycle_id, priced, deployment_digest)
 
 
-def matched_entry(position: OwnedPosition, entry_body: Optional[Mapping[str, Any]]) -> Optional[SimulatedBaseline]:
-    """The entry the model closed, held with only its original stop and target (Plan 2: records the entry)."""
+def incomplete_reason_for(code: str) -> str:
+    """Ruling 11: which Plan 2 reason a failed quote read gives."""
+    return FEED_NOT_ACCEPTED if code == "QUOTE_FEED_NOT_ACCEPTED" else QUOTE_UNAVAILABLE
+
+
+def incomplete(baseline_id: str, cohort: str, opportunity_id: str, decided_at: dt.datetime, *, conid: int,
+               reason: str, deployment_digest: Optional[str] = None) -> SimulatedBaseline:
+    """A baseline whose evidence is missing: sent so the book shows the hole, with no side, size or price."""
+    return SimulatedBaseline(baseline_id, cohort, opportunity_id, decided_at, conid=conid,
+                             deployment_digest=deployment_digest, incomplete_reason=reason)
+
+
+def matched_entry(position: OwnedPosition, entry_body: Optional[Mapping[str, Any]], *,
+                  close_decision_id: str) -> Optional[SimulatedBaseline]:
+    """One record per model close: the entry it closed, held with only its original stop and target.
+
+    None when no counterfactual exists (no ENTER decision, entry price or entry body of this experiment)."""
     if entry_body is None or position.decision_id is None or position.entry_price is None:
         return None
     if position.entry_quantity is None or round(position.entry_quantity) < 1:
@@ -1308,10 +1406,11 @@ def matched_entry(position: OwnedPosition, entry_body: Optional[Mapping[str, Any
     if type(stop) is not float or type(target) is not float or not stop < position.entry_price < target:
         return None
     try:
-        return SimulatedBaseline("matched_entry_bracket_exit.v1", "model_close", position.round_trip_id,
+        return SimulatedBaseline("matched_entry_bracket_exit.v1", "model_close", close_decision_id,
                                  position.opened_at, conid=position.conid, side="BUY",
                                  quantity=int(round(position.entry_quantity)), reference_price=float(position.entry_price),
-                                 stop_price=stop, target_price=target, linked_decision_id=position.decision_id)
+                                 stop_price=stop, target_price=target, linked_decision_id=position.decision_id,
+                                 linked_round_trip_id=position.round_trip_id)
     except ValueError:
         return None                                # e.g. a round_trip_id the opportunity pattern refuses
 ```
@@ -1325,7 +1424,7 @@ Expected: all pass.
 
 ```bash
 git add trader/ai/baselines.py tests/ai/decisions/test_baselines.py
-git commit -m "feat: build the four baseline records
+git commit -m "feat: build the four baseline records and their incomplete form
 
 Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>"
 ```
@@ -1420,6 +1519,7 @@ class Rig:
 async def rig(tmp_path):
     created = Rig(tmp_path)
     await created.gateway.start()
+    await created.gateway.budget.set_cap(2000 * 1_000_000)    # Plan 5 sets the owner cap from the trader
     return created
 
 
@@ -1432,7 +1532,8 @@ async def test_a_taken_signal_enters_with_code_owned_fields_and_a_linked_follow_
         f"enter:{AAPL}", "jev", None, STRATEGY_DIGEST)
     assert (enter.stop_price, enter.target_price, enter.policy_revision) == (225.4, 239.2, 1)
     (follow,) = result.baselines
-    assert (follow.baseline_id, follow.linked_action_key, follow.quantity) == ("follow_signal.v1", f"enter:{AAPL}", 21)
+    assert (follow.baseline_id, follow.linked_action_key, follow.quantity) == ("follow_signal.v1", f"enter:{AAPL}", None)
+    assert follow.deployment_digest == STRATEGY_DIGEST and follow.reference_price == 230.0
 
 
 @pytest.mark.asyncio
@@ -1485,7 +1586,25 @@ async def test_an_entry_cycle_judges_each_pick_and_records_its_baselines_first(r
     assert "untrusted" in rig.jev.requests[0].content.decode()          # the orchestrator thesis is fenced for Jev
 ```
 
-**Also write:** `test_an_exit_signal_closes_a_held_conid_without_any_model` (no provider request; `decider == "strategy"`), `test_an_exit_signal_for_a_conid_not_held_is_noted` (`NOT_HELD`), `test_an_exit_signal_still_closes_when_trips_cannot_be_read`, `test_orchestrator_down_skips_discovery_but_signals_continue` (orchestrator 404 once → next entry cycle `ORCHESTRATOR_UNHEALTHY` with no `discover_ai_candidates` call; an entry signal still gets its Jev call), `test_role_health_recovers_after_the_recheck_window`, `test_a_stale_quote_refuses_before_any_model_and_writes_no_baseline`, `test_an_unconfigured_strategy_is_noted_without_reads`, `test_a_failed_discovery_writes_no_cycle_baselines`, `test_a_partial_close_carries_its_quantity_and_a_matched_baseline` (the ENTER body is inserted into `ai_submissions` first), `test_budget_refusal_is_a_recorded_refusal_with_the_follow_baseline` (cap 0 in `ai.yaml` → `MODEL_REFUSED_BUDGET_EXHAUSTED`), `test_every_model_step_writes_one_ruling_row`.
+**Also write:** `test_an_exit_signal_closes_a_held_conid_without_any_model` (no provider request; `decider == "strategy"`), `test_an_exit_signal_for_a_conid_not_held_is_noted` (`NOT_HELD`), `test_an_exit_signal_still_closes_when_trips_cannot_be_read`, `test_orchestrator_down_skips_discovery_but_signals_continue` (orchestrator 404 once → next entry cycle `ORCHESTRATOR_UNHEALTHY` with no `discover_ai_candidates` call; an entry signal still gets its Jev call), `test_role_health_recovers_after_the_recheck_window`, `test_an_unconfigured_strategy_is_noted_without_reads`, `test_a_failed_discovery_writes_no_cycle_baselines`, `test_a_partial_close_carries_its_quantity_and_a_matched_baseline` (the ENTER body is inserted into `ai_submissions` first; the baseline's `opportunity_id == derive_decision_id(cycle_id, f"partial_close:{AAPL}")` and `linked_round_trip_id == "rt-1"`), `test_two_partial_closes_in_two_cycles_give_two_matched_records` (two position slots, each `PARTIAL_CLOSE` of P1: two baselines with different `opportunity_id`, the same `linked_decision_id` and `linked_round_trip_id`), `test_budget_refusal_is_a_recorded_refusal_with_a_complete_follow_baseline` (`await rig.gateway.budget.set_cap(0)` → note `MODEL_REFUSED_BUDGET_EXHAUSTED`, no ENTER, the follow baseline complete with `incomplete_reason is None`), `test_an_unknown_cap_refuses_jev_but_keeps_the_follow_baseline` (a fresh `Rig` whose gateway never got `set_cap` → `MODEL_REFUSED_BUDGET_CAP_UNKNOWN`, the follow baseline complete), `test_a_fixed_rule_quote_failure_sends_an_incomplete_fixed_rule` (the fixed-rule candidate's `get_ai_entry_quote` returns `feed="delayed"` → a `fixed_rule.v1` with `incomplete_reason == "feed_not_accepted"`, `conid == MSFT`, no prices; `no_trade.v1` still complete), `test_every_model_step_writes_one_ruling_row`.
+
+```python
+@pytest.mark.asyncio
+@pytest.mark.parametrize("quote,reason", [
+    (lambda body: entry_quote_reply(conid=body["conid"], at=NOW - dt.timedelta(seconds=60)), "quote_unavailable"),
+    (lambda body: entry_quote_reply(conid=body["conid"], feed="iex_realtime"), "feed_not_accepted"),
+    (trader_down(), "quote_unavailable")])
+async def test_a_missing_quote_refuses_before_any_model_and_sends_an_incomplete_baseline(tmp_path, quote, reason):
+    rig = Rig(tmp_path, reads=FakeReads(get_ai_entry_quote=quote))
+    await rig.gateway.start()
+    await rig.gateway.budget.set_cap(2000 * 1_000_000)
+    result = await rig.engine.on_entry_signal(rig.signal())
+    assert result.decisions == () and rig.jev.requests == []
+    (follow,) = result.baselines
+    assert (follow.baseline_id, follow.incomplete_reason, follow.conid) == ("follow_signal.v1", reason, AAPL)
+    assert (follow.side, follow.quantity, follow.reference_price) == (None, None, None)
+```
+(imports for this test: `datetime as dt`, `entry_quote_reply`, `trader_down` from `tests.ai.decisions.fakes`.)
 
 - [ ] **Step 2: Run them and see them fail**
 
@@ -1530,13 +1649,16 @@ import math
 from dataclasses import dataclass
 from typing import Any, Optional, Union
 
-from trader.ai.baselines import fixed_rule, follow_signal, matched_entry, no_trade, pick_fixed_rule
+from trader.ai.baselines import (fixed_rule, follow_signal, incomplete, incomplete_reason_for, matched_entry,
+                                 no_trade, pick_fixed_rule)
 from trader.ai.discovery_client import DiscoveryClient, DiscoveryRead
 from trader.ai.engine import (
     EngineResult, EntryCycleContext, ModelWork, PositionCycleContext, ProposedDecision, SignalContext,
     owned_positions_from_trips,
 )
-from trader.ai.evidence import EntryEvidence, EntrySource, EvidenceRefused, evidence_digest, gather_entry_evidence
+from trader.ai.evidence import (EntryEvidence, EntrySource, EvidenceRefused, PricedEntry, complete_entry_evidence,
+                                evidence_digest, price_entry)
+from trader.ai.ids import derive_decision_id
 from trader.ai.gateway import CallFailed, CallRefused
 from trader.ai.model_client import REJECTED, ModelRequest
 from trader.ai.roles import (
@@ -1618,6 +1740,7 @@ class Judgment:
     evidence: Optional[EntryEvidence]
     quantity: Optional[int] = None
     detail: str = ""
+    priced: Optional[PricedEntry] = None   # the quote and bracket, kept even when a later read failed
 
     @property
     def enters(self) -> bool:
@@ -1633,20 +1756,25 @@ async def judge_entry(tools: Any, source_json: Optional[dict], settings: JudgeSe
     """One replayable Jev decision: source, evidence, ceiling, prompt, verdict (Rulings 1-4, 9)."""
     source = EntrySource.from_json(await tools.given("source", source_json))
     try:
-        evidence = await gather_entry_evidence(tools, source, quote_max_age_seconds=settings.quote_max_age_seconds)
+        priced = await price_entry(tools, source, quote_max_age_seconds=settings.quote_max_age_seconds)
     except (ToolUnavailable, EvidenceRefused) as exc:
-        return Judgment("REFUSED", exc.code, None)
+        return Judgment("REFUSED", exc.code, None)                   # no quote: the baseline goes incomplete
+    try:
+        evidence = await complete_entry_evidence(tools, source, priced)
+    except (ToolUnavailable, EvidenceRefused) as exc:
+        return Judgment("REFUSED", exc.code, None, priced=priced)
     facts = {**source.facts, "side": "BUY", "reference_ask": evidence.reference_price, "stop": evidence.stop_price,
              "target": evidence.target_price, "quantity_ceiling": evidence.ceiling,
-             "quote_time": evidence.quote.time, "evidence_digest": evidence.digest}
+             "quote_time": evidence.quote.time, "quote_feed": evidence.quote.feed, "evidence_digest": evidence.digest}
     text = await ask_model(tools, "jev", jev_messages(facts, source.untrusted, news_chars=settings.news_chars),
                            settings)
     if isinstance(text, OutputRefusal):
-        return Judgment("REFUSED", text.code, evidence, detail=text.detail)
+        return Judgment("REFUSED", text.code, evidence, detail=text.detail, priced=priced)
     verdict = parse_jev(text, ceiling=evidence.ceiling)
     if isinstance(verdict, OutputRefusal):
-        return Judgment("REFUSED", verdict.code, evidence, detail=verdict.detail)
-    return Judgment(verdict.verdict, f"JEV_{verdict.verdict}", evidence, verdict.quantity, verdict.reason[:300])
+        return Judgment("REFUSED", verdict.code, evidence, detail=verdict.detail, priced=priced)
+    return Judgment(verdict.verdict, f"JEV_{verdict.verdict}", evidence, verdict.quantity, verdict.reason[:300],
+                    priced=priced)
 
 
 def enter_decision(action_key: str, judgment: Judgment) -> ProposedDecision:
@@ -1704,9 +1832,12 @@ class PaperDecisionEngine:
             return EngineResult(note="STRATEGY_NOT_CONFIGURED")
         action_key = f"enter:{opportunity.conid}"
         judgment = await self._judge(ctx.work, action_key, EntrySource.for_signal(opportunity, strategy))
-        if judgment.evidence is None:
-            return EngineResult(note=judgment.code)                 # no fresh evidence: no baseline is invented
-        follow = follow_signal(opportunity, judgment.evidence)
+        if judgment.priced is None:                                 # no usable quote: sent incomplete, never invented
+            return EngineResult(baselines=(incomplete(
+                "follow_signal.v1", "strategy_signal", opportunity.opportunity_id, ctx.now, conid=opportunity.conid,
+                reason=incomplete_reason_for(judgment.code), deployment_digest=strategy.deployment_digest),),
+                note=judgment.code)
+        follow = follow_signal(opportunity, judgment.priced, strategy.deployment_digest)
         if not judgment.enters:
             return EngineResult(baselines=(follow,), note=judgment.code)
         return EngineResult(decisions=(enter_decision(action_key, judgment),),
@@ -1773,15 +1904,16 @@ class PaperDecisionEngine:
         candidate = pick_fixed_rule(read.eligible)
         if candidate is None:
             return None, "FIXED_RULE_NO_CANDIDATE"
-        bracket = self._cfg.fixed_rule
-        source = EntrySource("discretionary", candidate.conid, self._cfg.discretionary_deployment_digest,
-                             bracket.stop_fraction, bracket.target_fraction, candidate.median_dollar_volume, {}, ())
+        bracket, digest = self._cfg.fixed_rule, self._cfg.discretionary_deployment_digest
+        source = EntrySource("discretionary", candidate.conid, digest, bracket.stop_fraction,
+                             bracket.target_fraction, candidate.median_dollar_volume, {}, ())
         try:
-            evidence = await gather_entry_evidence(tools, source,
-                                                   quote_max_age_seconds=self._cfg.quote_max_age_seconds)
+            # The quote and the bracket only: the trader sizes the fixed rule (Plan 2 Ruling 19).
+            priced = await price_entry(tools, source, quote_max_age_seconds=self._cfg.quote_max_age_seconds)
         except (ToolUnavailable, EvidenceRefused) as exc:
-            return None, f"FIXED_RULE_{exc.code}"
-        return fixed_rule(cycle_id, evidence), None
+            return incomplete("fixed_rule.v1", "self_found", cycle_id, tools.clock.now(), conid=candidate.conid,
+                              reason=incomplete_reason_for(exc.code), deployment_digest=digest), f"FIXED_RULE_{exc.code}"
+        return fixed_rule(cycle_id, priced, digest), None
 
     async def _pick_entries(self, tools: LiveTools, read: DiscoveryRead):
         messages = entry_messages(read, max_entries=self._cfg.max_entries_per_cycle,
@@ -1809,8 +1941,11 @@ class PaperDecisionEngine:
             return EngineResult(note=picked.code)
         decisions, baselines, notes = [], [], []
         for chosen in picked:
-            decisions.append(close_decision(chosen))
-            matched = matched_entry(chosen.choice.position, chosen.choice.entry_body)
+            close = close_decision(chosen)
+            decisions.append(close)
+            # One record per close: its opportunity is the close's own decision id (Plan 2 Ruling 21).
+            matched = matched_entry(chosen.choice.position, chosen.choice.entry_body,
+                                    close_decision_id=derive_decision_id(ctx.slot.cycle_id, close.action_key))
             if matched is None:
                 notes.append(f"{chosen.choice.position.symbol}:MATCHED_ENTRY_UNKNOWN")
             else:
@@ -1819,7 +1954,7 @@ class PaperDecisionEngine:
 ```
 
 Not shown, write exactly as described:
-- `_position_menu(tools, positions) -> dict[str, PositionChoice]`: positions sorted by conid, one entry per conid (first wins); for each, `tools.read("quote", {"instrument_id": conid})` (a `ToolUnavailable` leaves bid and ask `None`), ref `P1..Pn`, `whole_shares = floor(open_quantity + 1e-9)`, `entry_body = await self._entry_body(position)`.
+- `_position_menu(tools, positions) -> dict[str, PositionChoice]`: positions sorted by conid, one entry per conid (first wins); for each, `tools.read("quote", {"conid": conid})` (`bid` and `ask` from the reply's `quote`; a `ToolUnavailable` or a null `quote` leaves them `None`), ref `P1..Pn`, `whole_shares = floor(open_quantity + 1e-9)`, `entry_body = await self._entry_body(position)`.
 - `_entry_body(position)`: `None` without a `decision_id`; else `json.loads` of `body_json` from `ai_submissions WHERE decision_id = ? AND action = 'ENTER'` (`store.aquery`, `fetch="one"`), or `None`.
 - `_record_step(unit_key, step, picked)`: `record_ruling(..., step=step, action_key=None, outcome="REFUSED" | "PICKS" | "CLOSES", code=refusal code or f"{len(picked)}_{step.upper()}", detail=refusal detail)`.
 - `_minutes_to_flatten(now)`: whole minutes from `now` to 15:45 New York on the same date, at least 0 (a prompt hint only; SP1's session controller owns the real flatten, early closes included).
@@ -1882,6 +2017,7 @@ from trader.ai.roles import JEV_MARKER
 async def test_replay_reproduces_a_jev_decision_offline(tmp_path, no_network, monkeypatch):    # review focus 5
     rig = Rig(tmp_path)
     await rig.gateway.start()
+    await rig.gateway.budget.set_cap(2000 * 1_000_000)
     rig.jev.script(JEV_MARKER, ruling("REDUCE", 4))
     await rig.engine.on_entry_signal(rig.signal())
     decision_id = derive_decision_id(SIGNAL.opportunity_id, f"enter:{AAPL}")
@@ -1899,6 +2035,7 @@ async def test_replay_reproduces_a_jev_decision_offline(tmp_path, no_network, mo
 async def test_missing_evidence_is_incomplete(tmp_path, no_network):                           # review focus 5
     rig = Rig(tmp_path)
     await rig.gateway.start()
+    await rig.gateway.budget.set_cap(2000 * 1_000_000)
     rig.jev.script(JEV_MARKER, ruling())
     await rig.engine.on_entry_signal(rig.signal())
     decision_id = derive_decision_id(SIGNAL.opportunity_id, f"enter:{AAPL}")
@@ -1975,7 +2112,7 @@ Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>"
 ### Task 8: Flows acceptance on SP1's real stack
 
 **Files:**
-- Modify (tests): `tests/sp1_fixtures.py` (`Composed.__init__(..., prepare=None)`: `if prepare is not None: prepare(trader)` immediately before `self.stack = build_command_stack(...)`), `tests/ai/runtime/trader_world.py` (`TraderWorld.__init__(..., prepare=None, policy_file=None)`: `prepare` goes to `served_stack`; with `policy_file` the published limits come from Plan 1's `load_policy_file(policy_file)`; `strategy_signal(action="BUY", conid=None)` passes `action` and `conid or self.conid` to `SignalEntry.create`; the acceptance strategy deployment lists both AAPL and MSFT)
+- Modify (tests): `tests/sp1_fixtures.py` (`Composed.__init__(..., prepare=None)`: `if prepare is not None: prepare(trader)` immediately before `self.stack = build_command_stack(...)`), `tests/ai/runtime/trader_world.py` (`TraderWorld.__init__(..., prepare=None, policy_file=None)`: `prepare` goes to `served_stack`; with `policy_file` the published limits come from Plan 1's `load_policy_file(policy_file)`; `strategy_signal(action="BUY", conid=None)` passes `action` and `conid or self.conid` to `SignalEntry.create`; `hold_other_position(value_share_of_equity)` gives the simulated broker a filled position in a third conid worth that share of net liquidation, so SP1's 6 % gross limit binds before the 5 % position limit; the served world has an executable quote and 20 closed daily bars for both AAPL and MSFT (the trader's baseline sizer needs both, else `sizing_unavailable`: add a `served.sim.quote(MSFT, bid, ask)` line and MSFT daily bars if they are missing); the acceptance strategy deployment lists both AAPL and MSFT)
 - Create (tests): `tests/ai/decisions/decision_world.py`, `tests/ai/decisions/test_flows_acceptance.py`
 
 **Interfaces:**
@@ -1989,7 +2126,7 @@ Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>"
 - `TraderMarket()`: `now` (a callable, set after `TraderWorld` is built; every use reads it inside a call), `routes` (path suffix → payload or HTTP status), `details_by_conid = {CONID: details(conid=CONID, symbol="AAPL"), MSFT: details(conid=MSFT, symbol="MSFT")}`. `TraderMarket.get(url, params=None, headers=None, timeout=None)` (the market object is the `requests` session the real `AlpacaClient` uses) answers by the longest matching path suffix with `SimpleNamespace(status_code=..., json=lambda: payload, text="", headers={})`. `contracts(contract)` answers `[details_by_conid[contract.conId]]` when `contract.conId` is set, else the rows whose symbol matches. `prepare(trader)` sets `trader.provider_factory = lambda capability: {Capability.MOVERS: AlpacaMovers(client), Capability.NEWS: AlpacaNews(client), Capability.HISTORY: FakeDailyBars(lambda: self.now())}[capability]` with `client = AlpacaClient("k", "s", session=self)`, sets `trader.contract_details_port = self.contracts`, and patches `reqScannerDataAsync`, `reqScannerSubscription`, `reqScannerData` on `trader.client.ib` to `pytest.fail("discovery used the IB scanner")`. `FakeDailyBars(now).get_history(*args, **kwargs)` returns `daily_frame(now())` ($100M median). `MOVERS` and `ACTIVES` take `last_updated` from `self.now()` when served.
 - `decisions_block(world, discretionary_digest)` returns the YAML text: `decisions:` with `discretionary_deployment_digest`, `strategies: {orb: {deployment_digest: <world.digest>, stop_fraction: 0.02, target_fraction: 0.04}}`, `discovery: {movers_top: 5, most_actives_top: 5, news_per_symbol: 1, news_symbols_max: 2}`.
 - `register_discretionary(world) -> str`: `world.served.call("cli", "register_discretionary_deployment", {"deployment": {"kind": "discretionary", "style": "intraday_long", "scope_rule": DEFAULT_SCOPE_RULE.to_json(), "attestation": {"operator": "owner", "statement": "paper discretionary scope", "attested_at": <served now ISO>}}})`, asserts `state == "RESOLVED"` and returns `outcome["digest"]`.
-- `DecisionNode(world, tmp_path, block, *, clock=None)`: `self.node = world.node(clock=clock)` (Plan 5 `AiNode`); `self.config = load_ai_config(str(write_config(config_dir, config_text(extra_top_level=block))))` with `config_dir = tmp_path / "ai-config"` created first; `self.orchestrator, self.jev = ScriptedProvider("vendor/orch-1"), ScriptedProvider("vendor/jev-1")`; `self.gateway = ModelGateway(config=self.config, store=self.node.store, clock=self.node.clock, clients={"orchestrator": self.orchestrator.adapter("vendor/orch-1"), "jev": self.jev.adapter("vendor/jev-1")})`; `self.engine = build_engine(EngineDeps(self.config, self.gateway, ReadOnlySupervisor(self.node.clients.supervisor), self.node.clock, ReplayRecorder(self.node.store), self.node.store))`; `self.controller = AiController(config=self.config.controller, store=self.node.store, clock=self.node.clock, supervisor=self.node.clients.supervisor, leadership=self.node.leadership, watch=self.node.watch, submitter=self.node.submitter, outbox=self.node.outbox, intake=SignalIntake(store=self.node.store, supervisor=self.node.clients.supervisor, clock=self.node.clock), slots=SessionSlots(), engine=self.engine, gateway=self.gateway)`. Methods: `async start()` (`acquire`, `gateway.start()`, `controller.start()`); `async signals()` (`world.served.stack.scoreboard.service.refresh()`, then `tick_signals`, `drain`, `submitter.send_due`); `async slots()` (`world.served.stack.scoreboard.service.refresh()` so trips are current, then `refresh_experiment`, `run_due_slots`, `drain`, `send_due`); `async report()` (`report_once`); `submission(decision_id)`; `opportunity(id) -> (state, reason)`; `cycle(cycle_id) -> (state, reason)`.
+- `DecisionNode(world, tmp_path, block, *, clock=None)`: `self.node = world.node(clock=clock)` (Plan 5 `AiNode`); `self.config = load_ai_config(str(write_config(config_dir, config_text(extra_top_level=block))))` with `config_dir = tmp_path / "ai-config"` created first; `self.orchestrator, self.jev = ScriptedProvider("vendor/orch-1"), ScriptedProvider("vendor/jev-1")`; `self.gateway = ModelGateway(config=self.config, store=self.node.store, clock=self.node.clock, clients={"orchestrator": self.orchestrator.adapter("vendor/orch-1"), "jev": self.jev.adapter("vendor/jev-1")})`; `self.cap_sync = BudgetCapSync(supervisor=self.node.clients.supervisor, budget=self.gateway.budget, clock=self.node.clock)` and `self.gated = CapGatedGateway(self.gateway, self.cap_sync)` (Plan 5 Ruling 19: the owner cap is read from the served trader's `ai_paper.model_budget_usd_per_day`); `self.engine = build_engine(EngineDeps(self.config, self.gated, ReadOnlySupervisor(self.node.clients.supervisor), self.node.clock, ReplayRecorder(self.node.store), self.node.store))`; `self.controller = AiController(config=self.config.controller, store=self.node.store, clock=self.node.clock, supervisor=self.node.clients.supervisor, leadership=self.node.leadership, watch=self.node.watch, submitter=self.node.submitter, outbox=self.node.outbox, intake=SignalIntake(store=self.node.store, supervisor=self.node.clients.supervisor, clock=self.node.clock), slots=SessionSlots(), engine=self.engine, gateway=self.gated, cap_sync=self.cap_sync)`. Methods: `async start()` (`acquire`, `gateway.start()`, `controller.start()`, which reads the cap); `async signals()` (`world.served.stack.scoreboard.service.refresh()`, then `tick_signals`, `drain`, `submitter.send_due`); `async slots()` (`world.served.stack.scoreboard.service.refresh()` so trips are current, then `refresh_experiment`, `run_due_slots`, `drain`, `send_due`); `async report()` (`report_once`); `submission(decision_id)`; `opportunity(id) -> (state, reason)`; `cycle(cycle_id) -> (state, reason)`.
 
 ```python
 # tests/ai/decisions/test_flows_acceptance.py
@@ -2046,6 +2183,27 @@ async def test_an_entry_signal_is_judged_once_even_when_redelivered(stack):
     assert (await node.node.submitter.get(decision_id)).state in ("ACCEPTED", "FINAL")
     world.settle()
     assert len(world.entries()) == 1 and world.protected()
+
+
+@pytest.mark.asyncio
+async def test_follow_signal_baseline_has_the_real_enter_size_on_a_binding_limit(stack):  # Plan 2 Ruling 19
+    world, node, _ = stack
+    world.hold_other_position(value_share_of_equity=0.04)     # another conid: the 6 % gross limit binds first
+    node.jev.script(JEV_MARKER, ruling(), ruling("SKIP"))
+    taken = world.strategy_signal()
+    await node.signals()
+    world.settle()
+    await node.report()                                        # the outbox delivers the linked follow baseline
+    (entry,) = world.entries()
+    row = world.served.trader.journal_db.execute(
+        "SELECT quantity, quantity_source FROM simulated_decisions WHERE opportunity_id = ?", [taken], fetch="one")
+    assert row == (int(entry.quantity), "linked_entry")         # exactly the size SP1 gave the real ENTER
+    skipped = world.strategy_signal(conid=MSFT)                  # Jev skips: the trader sizes it at ingestion
+    await node.signals()
+    await node.report()
+    row = world.served.trader.journal_db.execute(
+        "SELECT quantity, quantity_source FROM simulated_decisions WHERE opportunity_id = ?", [skipped], fetch="one")
+    assert row[1] == "trader_sizing" and row[0] >= 1             # equality with prepare_entry: Plan 2 Task 3
 
 
 @pytest.mark.asyncio
@@ -2200,7 +2358,7 @@ async def test_the_engine_cannot_reach_a_mutation_through_its_reads(stack):
 - `test_out_of_scope_candidates_are_refused_with_their_part` parametrized: precheck parts (`exchange` with `primary="PINK"`, `instrument_type` with `stock_type=""`, `dollar_volume` with a `daily_frame(volume=10_000.0)` history, `trading_filter` with a `trading_filters.yaml` denying MSFT) are dropped by the client with `SCOPE_<part>` counted in `ai_discovery_reads.dropped_json` and **no** orchestrator request; the `price` part: Alpaca shows $6 but the IB bid is $4.90 at admission, so the ENTER the orchestrator and Jev took comes back `OUT_OF_DISCRETIONARY_SCOPE` with `detail.part == "price"` and `phase == "admission"`. (`evidence_stale` at dispatch is pinned by Plan 3 Task 8 `test_price_falling_below_the_floor_at_dispatch_is_refused_with_its_part` and Task 7 `test_each_failed_part_is_refused_with_its_code`; it needs no model.)
 - `test_a_restart_neither_republishes_nor_loosens_policy_nor_reuses_evidence`: run `serve(settings, engine_factory=build_engine, ...)` twice (Plan 5's `write_service_config` plus the `decisions` block; the provider env names a test key), with a strategy BUY judged in each run (the scripted adapters reach the served run by monkeypatching the name `build_model_client` in `trader.ai.gateway`, where `build_gateway` looks it up, to `lambda role, **_: providers[role.model].adapter(role.model)`); after both, `command_ledger` has only the operator's `publish_ai_risk_policy` row, `get_ai_risk_policy` shows the same revision, and each ENTER's `evidence_digest` equals the digest rebuilt from the `quote` tool row recorded under its own decision key (two different quote rows, never one reused).
 - **Discovery route** — `test_discovery_through_signed_rpc_reports_partial_coverage_and_never_scans`: `market.routes` answers the movers path with HTTP 500; `monkeypatch.delenv` every `ALPACA_*` name and assert `not any(k.startswith("ALPACA_") for k in os.environ)` on the `ai` side; one entry cycle with the orchestrator scripted `{"picks": []}`; the `ai_discovery_reads` row is `OK` with `complete == False` and `coverage_json` showing `movers.failed`; the orchestrator prompt contains `"coverage":"PARTIAL"`; the scanner patch never fired.
-- **Baseline books** — `test_one_experiment_reports_separate_books_and_an_incomplete_one_hides_none`: entry cycle at 11:00 (orchestrator picks AAPL `C2`, Jev TAKE; fixed rule takes MSFT, 3.0 %), `world.settle()`; position cycle at 11:15 (orchestrator `CLOSE P1`); the 11:15 entry cycle is scripted `{"picks": []}`; `node.report()` until `ai_outbox` counts show every simulated record `DELIVERED`; then on the served trader `SessionSimulator(store=world.served.stack.scoreboard.service.store, calendar=XNYSCalendarPolicy(), sources=[ByConid({MSFT: minute_bars(session, QUIET, 500.0)})], now=lambda: SessionSimulator.data_ready_at(session) + GRACE).run_due()` (`ByConid` from Plan 2's `tests/scoreboard/test_baseline_books_acceptance.py`; `session` is the served session date), then `scoreboard.service.refresh()`; `get_scoreboard` books: `fixed_rule.v1` `COMPLETE`, `no_trade.v1` `COMPLETE` with `pnl_usd == 0.0`, `matched_entry_bracket_exit.v1` `INCOMPLETE` (no AAPL bars) with `pnl_usd is None`, three separate rows, and `"simulated" not in benchmarks`.
+- **Baseline books** — `test_one_experiment_reports_separate_books_and_an_incomplete_one_hides_none`: entry cycle at 11:00 (orchestrator picks AAPL `C2`, Jev TAKE; fixed rule takes MSFT, 3.0 %), `world.settle()`; position cycle at 11:15 (orchestrator `CLOSE P1`); the 11:15 entry cycle is scripted `{"picks": []}`; `node.report()` until `ai_outbox` counts show every simulated record `DELIVERED`; then on the served trader `SessionSimulator(store=world.served.stack.scoreboard.service.store, calendar=XNYSCalendarPolicy(), sources=[ByConid({MSFT: minute_bars(session, QUIET, 500.0)})], now=lambda: SessionSimulator.data_ready_at(session) + GRACE).run_due()` (`ByConid` from Plan 2's `tests/scoreboard/test_baseline_books_acceptance.py`; `session` is the served session date), then `scoreboard.service.refresh()`; `get_scoreboard` books: `fixed_rule.v1` `COMPLETE`, `no_trade.v1` `COMPLETE` with `pnl_usd == 0.0`, `matched_entry_bracket_exit.v1` `INCOMPLETE` (no AAPL bars) with `pnl_usd is None`, three separate rows, and `"simulated" not in benchmarks`; the trader's `simulated_decisions` row for the fixed rule has `quantity_source == "trader_sizing"` and the matched-entry row has `opportunity_id == derive_decision_id(<11:15 position cycle id>, f"close:{AAPL}")` and `linked_round_trip_id` of the AAPL trip.
 - **Replay** — `test_a_recorded_decision_replays_end_to_end` (review focus 5): after the self-found ENTER of the initialization flow, `replay_decision(node.node.store, decision_id, config=node.config, counter=counter)` with `no_network`, the live adapters instrumented and `ReadOnlySupervisor.call` replaced by `counter.tripwire("trader_read")`: `COMPLETE`, equal to `recorded_judgment`, `counter.total == 0`.
 
 - [ ] **Step 2: Run them**
@@ -2272,6 +2430,6 @@ Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>"
 
 ## Self-review
 
-- **Spec coverage.** 3: Jev on every ENTER (`decider = "jev"` only after a parsed TAKE / REDUCE, Task 6), REDUCE explicit and smaller (4, 6, 8), backtest judge type (4). 5.5: entry signal with follow-signal regardless of Jev (6, 8), exit signal without Jev through the safe close (6, 8), entry cycle discovery → orchestrator → Jev each with fixed-rule and no-trade (6, 8), position cycle with matched-entry (5, 6, 8). 7: baselines written when Jev fails or the budget refuses (6), missing evidence never invented (5, 9). 8: menus, strict schemas, fenced news and theses, code-owned fields (4, 9). 9: bad Jev / orchestrator config (Ruling 10; 6, 8), partial discovery (3, 9). 10: scope candidates dropped before any model (3), fresh IB evidence before an ENTER (2). 11: replay end to end (7, 9). 12: Flows (8, with two items pinned by Plan 5 Task 8), Security (4, 9), Initialization (9), Discovery route (9), Baseline books (9), Replay (7, 9).
+- **Spec coverage.** 3: Jev on every ENTER (`decider = "jev"` only after a parsed TAKE / REDUCE, Task 6), REDUCE explicit and smaller (4, 6, 8), backtest judge type (4). 5.5: entry signal with follow-signal regardless of Jev (6, 8), exit signal without Jev through the safe close (6, 8), entry cycle discovery → orchestrator → Jev each with fixed-rule and no-trade (6, 8), position cycle with matched-entry (5, 6, 8). 7: baselines written when Jev fails or the budget refuses (6), missing evidence sent as an incomplete record, never invented (5, 6, 9), sized by the trader (8, Plan 2). 8: menus, strict schemas, fenced news and theses, code-owned fields (4, 9). 9: bad Jev / orchestrator config (Ruling 10; 6, 8), partial discovery (3, 9). 10: scope candidates dropped before any model (3), fresh quote-authority evidence with an accepted feed before an ENTER (2). 11: replay end to end (7, 9). 12: Flows (8, with two items pinned by Plan 5 Task 8), Security (4, 9), Initialization (9), Discovery route (9), Baseline books (9), Replay (7, 9).
 - **Names.** Plan 3: `DiscoverAiCandidatesResponse` and its fields, `register_discretionary_deployment`, `DEFAULT_SCOPE_RULE`, `OUT_OF_DISCRETIONARY_SCOPE` with `detail.part`, `POSITION_NOT_OWNED`, PARTIAL_CLOSE without prices. Plan 5: `ModelWork.for_action`, `request_key`, the three contexts, `ProposedDecision`, `SimulatedBaseline` (`linked_action_key`, `linked_decision_id`), `EngineResult`, `ReadOnlySupervisor`, `EngineDeps`, `build_engine`, `TraderWorld`, `AiNode`, `TraderClock`, `write_service_config`. Plan 4: `ModelGateway`, `CallRefused` / `CallFailed` codes, `REJECTED`, `ReplayRecorder`, `RecordingClock`, `ReplayEvidence`, `ReplaySession`, `ExternalAdapterCounter`, `StrictModelOutput`, `parse_model_output`, `fence_untrusted`, `FakeProvider`, `config_text`. Plan 2: `follow_signal.v1` opportunity = `source_event_id`, matched-entry records the entry, books report shape. Plan 1: `load_policy_file`, `publish_ai_risk_policy` for `cli`.
-- **Open for the owner.** Ruling 4 (the `ai`-side quantity ceiling and baseline sizes), Ruling 5 (strategy brackets in `ai.yaml`), Ruling 7 (`NOT_CHECKED` candidates dropped), Ruling 10 (5-minute role pause, Bedrock throttling counts), Ruling 17 (`entry_avg_price` added to the trader's trips read), Ruling 13 (evidence read before the budget check, a deliberate order change from spec 5.5).
+- **Open for the owner.** Ruling 4 (the `ai`-side quantity ceiling, now only Jev's REDUCE bound; baseline sizes come from the trader, Plan 2 Ruling 19), Ruling 5 (strategy brackets in `ai.yaml`), Ruling 7 (`NOT_CHECKED` candidates dropped), Ruling 10 (5-minute role pause, Bedrock throttling counts), Ruling 17 (`entry_avg_price` added to the trader's trips read), Ruling 13 (evidence read before the budget check, a deliberate order change from spec 5.5).

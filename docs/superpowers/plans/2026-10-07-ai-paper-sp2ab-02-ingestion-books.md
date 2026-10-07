@@ -2,9 +2,9 @@
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
-**Goal:** Let the `ai` service hand the trader its model costs and its hypothetical baseline decisions through two idempotent, signed commands. The trader then computes each baseline outcome itself from 1-minute bars at session end. The scoreboard shows one separate book per baseline id and cohort, never summed, and every cost with a status label.
+**Goal:** Let the `ai` service hand the trader its model costs and its hypothetical baseline decisions through two idempotent, signed commands. The trader sizes the follow-signal and fixed-rule baselines itself with SP1's entry sizing, records incomplete baselines as incomplete, and computes each baseline outcome itself from 1-minute bars at session end. It also serves the owner's daily model budget cap (`trader.yaml`) as a read-only query. The scoreboard shows one separate book per baseline id and cohort, never summed, and every cost with a status label.
 
-**Architecture:** All code lives in the trader's `trader/scoreboard/` package and its journal DuckDB file. Two direct typed-RPC command handlers (`record_ai_cost`, `record_simulated_decision`, `ai_supervisor` only) validate the experiment and decision links, then write sealed rows through one new store method that compares a body digest inside the write transaction (exact duplicate → `DUPLICATE`, different body → refusal). Corrections are new sealed rows, never edits. A new `SessionSimulator` step on the existing 30 s scoreboard tick reads 1-minute bars (local history DuckDB first, then the trader's Alpaca history provider) and writes one sealed outcome per simulated decision. The report groups decisions and outcomes into books at read time. CLI, Telegram text and the dashboard script render the new shape.
+**Architecture:** All code lives in the trader's `trader/scoreboard/` package and its journal DuckDB file. Two direct typed-RPC command handlers (`record_ai_cost`, `record_simulated_decision`, `ai_supervisor` only) validate the experiment and decision links, size the two sized baselines through a `BaselineSizer` port (SP1's `max_entry_quantity` on a fresh broker snapshot), then write sealed rows through one new store method that compares a body digest inside the write transaction (exact duplicate → `DUPLICATE`, different body → refusal). Corrections are new sealed rows, never edits. A new `SessionSimulator` step on the existing 30 s scoreboard tick reads 1-minute bars (local history DuckDB first, then the trader's Alpaca history provider) and writes one sealed outcome per simulated decision. The report groups decisions and outcomes into books at read time. CLI, Telegram text and the dashboard script render the new shape. One query, `get_ai_model_budget` (`ai_supervisor`), returns `ai_paper.model_budget_usd_per_day`.
 
 **Tech Stack:** Python 3.12, DuckDB (`SchemaMigrator`, `DuckDBConnection.transaction`), pydantic v2 strict wire models, pandas (bars), pytest, Node (the existing dashboard script test). No new dependencies.
 
@@ -14,11 +14,11 @@
 
 - **Base:** master after SP1 Plans 3–6. Code read at `/private/tmp/sp1-impl6`.
 - **Journal migrations:** this plan uses **95** (`simulated_decisions`) and **96** (`simulated_outcomes`), appended to `MIGRATIONS` in `trader/scoreboard/schema.py`. 97–99 stay unused. `ai_costs` is edited in place inside migration 63; `simulated_books` is deleted from migration 63. No ALTER, no backfill, no old-row compatibility (owner: there is no legacy data).
-- **Principals:** `record_ai_cost` and `record_simulated_decision` are `("command", …)` entries for `frozenset({"ai_supervisor"})` only. `cli`, `dashboard`, `ai_research` get `PERMISSION_DENIED`. Reads of the report stay `cli`, `dashboard`, `ai_supervisor`.
+- **Principals:** `record_ai_cost` and `record_simulated_decision` are `("command", …)` entries for `frozenset({"ai_supervisor"})` only. `cli`, `dashboard`, `ai_research` get `PERMISSION_DENIED`. Reads of the report stay `cli`, `dashboard`, `ai_supervisor`. `get_ai_model_budget` is a `("query", …)` entry for `frozenset({"ai_supervisor"})` only; no command of any principal changes the cap (owner, 2026-10-07: only an operator edit of `trader.yaml` plus a trader restart does).
 - **No controller epoch** on these two commands. They record facts; a late or stale controller's facts are still facts. Idempotency rests on stable ids and the body digest, not on leadership.
 - **No command ledger.** Direct handlers, like `record_state_acknowledged`. A refusal is a normal reply body (`status: "REFUSED"`), never a raised error (a raised error becomes a scrubbed `INTERNAL_ERROR`).
 - **Wire models:** `ConfigDict(extra="forbid", strict=True)`. Ids are regex-checked. Times are ISO-8601 text with an offset; naive times are refused. `True` is never an int.
-- **Sealed rows:** `ai_costs`, `simulated_decisions`, `simulated_outcomes` are in `SEALED_TABLES`. They are insert-only and covered by `verify_seals`. Server-time columns (`recorded_at`, `computed_at`) are never part of `body_digest`.
+- **Sealed rows:** `ai_costs`, `simulated_decisions`, `simulated_outcomes` are in `SEALED_TABLES`. They are insert-only and covered by `verify_seals`. Server columns (`recorded_at`, `computed_at`, `session_date`, `quantity_source`, `sizing_json`, and `quantity` when the trader sized it) are never part of `body_digest`: the digest is over the client body only.
 - **DuckDB access:** only through `ScoreboardStore` / `DuckDBConnection.transaction`. Inside a transaction callback never call `db.execute` or `db.transaction` (non-reentrant lock). Warm `store.columns(table)` before opening the transaction.
 - **Bars:** the price-history DuckDB is read only. Nothing in this plan writes, migrates or backfills it.
 - **Never print secrets.** Source errors are stored as a class name and a short code, never as a URL, header or key.
@@ -30,22 +30,26 @@
 ## Rulings (spec silent, or the code forces a choice)
 
 1. **Extend or add tables.** `ai_costs` is rewritten in place (its old shape had no status, role, attempt or correction link). `simulated_books` is **deleted**: its one-row-per-session sum is exactly what spec 6.8 forbids. Two new sealed tables hold the facts: `simulated_decisions` (what the `ai` service sent) and `simulated_outcomes` (what the trader computed). A *book* is the group of rows with one `(experiment_id, baseline_id, cohort)`; the report builds it at read time, so there is no stored total that can go stale. Both new tables carry `baseline_id` and `cohort` and an index on `(experiment_id, baseline_id, cohort)`. *If wrong:* a stored per-book summary would be needed for very large histories; the grouping query is cheap at paper volume.
-2. **Idempotency.** `record_id` is the stable key, chosen by the `ai` service. The trader hashes the client body (`body_digest`, times normalized to UTC) and compares it inside the write transaction. Same id and same digest → `DUPLICATE` (nothing written, no new seal). Same id and a different digest → refused `CONFLICTING_DUPLICATE`. Two more conflicts: a second *original* cost for the same `(experiment_id, attempt_id)`, and a second simulated decision for the same `(experiment_id, baseline_id, opportunity_id)` under a different record id. *If wrong:* Plan 6 must put several records under one opportunity; then the opportunity id must be extended (see Cross-plan additions).
+2. **Idempotency.** `record_id` is the stable key, chosen by the `ai` service. The trader hashes the client body (`body_digest`, times normalized to UTC) and compares it inside the write transaction. Same id and same digest → `DUPLICATE` (nothing written, no new seal). Same id and a different digest → refused `CONFLICTING_DUPLICATE`. Two more conflicts: a second *original* cost for the same `(experiment_id, attempt_id)`, and a second simulated decision for the same `(experiment_id, baseline_id, opportunity_id)` under a different record id. Plan 6 keeps one record per opportunity: a matched-entry record's opportunity is the model close's own decision id, so two partial closes of one round trip are two opportunities (Ruling 21).
 3. **Cost status.** `confirmed` (provider usage seen), `estimated` (computed from tokens and the configured price), `unknown` (outcome not known; `cost_usd` must be null). `unknown` ⇔ null cost, enforced in the wire model and by a table CHECK. A null cost is never 0.
 4. **Corrections.** A correction is a new `record_id` with `corrects_record_id` set. It must point at an *original* (not a correction) of the same experiment, repeat its identity (`role`, `provider`, `model`, `attempt_id`, `called_at`), and may not lower the status rank (`unknown` < `estimated` < `confirmed`). Equal rank with a new number is allowed. The trader assigns `correction_seq` (1, 2, …) inside the transaction; the report uses the highest sequence per original, and the call is counted once. All rows stay. *If wrong:* a provider invoice that lowers a confirmed number later is refused and needs an operator-visible incident; accepted cost of never silently rewriting a confirmed number.
-5. **Link validation.** `experiment_id` must exist. A simulated `decided_at` must lie inside `[started_at, stopped_at]`. A cost `called_at` must be at or after `started_at` but may be **after** `stopped_at`: a model call in flight at the stop still costs money, and spec 7 says costs are never lost. `decision_id` (costs) and `linked_decision_id` (simulated) are optional. When given, the trader must know the decision (`ai_paper_decisions`), for the same account, received at or after the experiment start. A simulated link must also be an `ENTER` on the same conid. An unknown decision is refused `DECISION_LINK_UNKNOWN` with `retryable: true`. A Jev `SKIP` never creates a trader decision, so the `ai` service sends `decision_id` only for decisions it really submitted; other costs use `served_kind` / `served_id`.
+5. **Link validation.** `experiment_id` must exist. A simulated `decided_at` must lie inside `[started_at, stopped_at]`. A cost `called_at` must be at or after `started_at` but may be **after** `stopped_at`: a model call in flight at the stop still costs money, and spec 7 says costs are never lost. `decision_id` (costs) and `linked_decision_id` (simulated) are optional. When given, the trader must know the decision (`ai_paper_decisions`), for the same account, **of the same experiment** (`decision.experiment_id == experiment_id`, the column Plan 3 adds to migration 56; a decision without one is another experiment's), received at or after the experiment start. (Plans 2 and 3 land in parallel: until Plan 3's column exists, `DecisionStoreFacts` reads `getattr(row, "experiment_id", None)`, so every link is refused; nothing sends a link before Plan 6.) A simulated link must also be an `ENTER` on the same conid. An unknown decision is refused `DECISION_LINK_UNKNOWN` with `retryable: true`; a decision of another experiment is refused `DECISION_LINK_OTHER_EXPERIMENT`, not retryable. A Jev `SKIP` never creates a trader decision, so the `ai` service sends `decision_id` only for decisions it really submitted; other costs use `served_kind` / `served_id`.
 6. **Side.** `BUY` only. Spec 13 puts short styles out of scope. A `SELL` is refused by the wire model. *If wrong:* a short style later needs mirrored bracket rules and a new baseline version.
-7. **Quantity** is a whole number of shares (≥ 1). **Prices** are positive finite floats with `stop < reference < target`.
+7. **Quantity** is a whole number of shares (≥ 1). `follow_signal.v1` and `fixed_rule.v1` arrive with `quantity: null` and the trader sizes them (Ruling 19); a client quantity on them is refused by the wire model. `matched_entry_bracket_exit.v1` carries the real entry quantity. **Prices** are positive finite floats with `stop < reference < target`.
 8. **Entry window.** For baselines that trade, `decided_at` must be inside an XNYS session and strictly before that session's flatten start (`SessionSchedule.flatten_start_utc`, 15:45 ET, or 12:45 ET on an early close). `no_trade.v1` only needs to lie inside the experiment window.
 9. **Allowed baselines.** `follow_signal.v1` / `strategy_signal`, `fixed_rule.v1` / `self_found`, `no_trade.v1` / `self_found`, `matched_entry_bracket_exit.v1` / `model_close`. Other ids or pairings are refused. A new baseline version is a one-line change in `BASELINES` (`trader/scoreboard/ingest.py`).
 10. **Bracket semantics (long only).** Entry fills at the reference price at `decided_at`. Only bars that start **after the minute containing `decided_at`** are scanned (no look-ahead). For each bar in order: if `low <= stop`, exit at `min(stop, bar.open)` (a gap through the stop fills at the open) with kind `STOP`; else if `high >= target`, exit at `target` with kind `TARGET`. **If one bar touches both, the stop wins** (conservative). Bars starting at or after the flatten start are not scanned; if nothing hit, exit at the **open of the first bar that starts in `[flatten_start, flatten_start + 10 min)`**, kind `FLATTEN`. The exit time of a `STOP`/`TARGET` is the bar's start. *If wrong:* results shift by about one bar of price; the rule is the same for every baseline, so books stay comparable.
-11. **What counts as missing data.** Alpaca emits no bar for a minute with no trades, so a missing minute alone is not a gap. A record is `INCOMPLETE` when: a used bar is invalid (`BAD_BAR`: non-finite, non-positive, `high < low`, open or close outside the range) or repeated (`DUPLICATE_BAR`); two bars (or the entry and the first bar, or the last bar and the flatten bar) are more than **30 minutes** apart (`BAR_GAP`); there is no flatten bar (`NO_FLATTEN_BAR`); no source returned bars (`NO_BARS`); or no source is configured (`NO_BAR_SOURCE`). *If wrong:* a genuinely quiet stock shows as incomplete instead of complete. That is the safe side.
+11. **What counts as missing data.** Alpaca emits no bar for a minute with no trades, so a missing minute alone is not a gap. A record is `INCOMPLETE` when: a used bar is invalid (`BAD_BAR`: non-finite, non-positive, `high < low`, open or close outside the range) or repeated (`DUPLICATE_BAR`); two bars (or the entry and the first bar, or the last bar and the flatten bar) are more than **30 minutes** apart (`BAR_GAP`); there is no flatten bar (`NO_FLATTEN_BAR`); no source returned bars (`NO_BARS`); or no source is configured (`NO_BAR_SOURCE`). Two more reasons are written at ingestion, not by the simulator: the `ai` service's own `incomplete_reason` (Ruling 18) and `sizing_unavailable` (Ruling 19). *If wrong:* a genuinely quiet stock shows as incomplete instead of complete. That is the safe side.
 12. **P&L is gross.** No commission and no slippage is modeled. The book carries `pnl_basis: "gross, no commissions or slippage"` and the dashboard and CLI print it. Baselines therefore look slightly better than the real book. *If wrong:* a fee model can be added later as a new outcome field; old outcomes keep their basis label.
 13. **When the simulator runs.** A session's bars are ready at **20:16 ET** (the Alpaca provider's own completed-session rule, `SESSION_COMPLETE_ET`). From then each pending record is tried on every tick (at most once per 5 minutes per record). The first source that gives a `COMPLETE` result wins (local DuckDB, then Alpaca). If no source completes, the record keeps being retried until **2 hours** after ready time; then a sealed `INCOMPLETE` outcome with the combined reasons is written. An outcome is final: sealed rows are never edited, so an operator who backfills bars later must accept that this record stays incomplete. *If wrong:* a longer data outage burns records to `INCOMPLETE`; raise `GRACE`.
 14. **`no_trade.v1`.** The decision row and a `COMPLETE` outcome (`pnl_usd = 0.0`, `trades = 0`, `bar_source = "none"`) are written in one transaction at ingestion. It never waits for bars.
 15. **Book status.** `COMPLETE` (every record has a complete outcome), `INCOMPLETE` (at least one incomplete outcome), `PENDING` (no incomplete outcome, but at least one record has no outcome yet). `pnl_usd` is the sum only for a `COMPLETE` book, else `null`. `known_pnl_usd` is the sum over the complete records, labelled partial in every display. A bad book never hides another book.
 16. **Costs in the report.** Keep the SP1 keys (`ai_cost_usd`, `ai_calls`, `ai_costs_status`, `pnl_minus_ai_cost_usd`) with their SP1 meaning: `ai_cost_usd` is `null` while any call is `unknown`. Add `ai_cost` with `status` (`NONE`, `CONFIRMED`, `ESTIMATED`, `INCOMPLETE`), `confirmed_usd`, `estimated_usd`, `unknown_calls`, `corrections`. `pnl_minus_ai_cost_usd` counts estimated cost as cost and is `null` while any call is unknown.
 17. **Alpaca keys on the trader.** `Trader.__init__` gets `alpaca_api_key_id` and `alpaca_api_secret_key` (default `''`). `Container.resolve` fills them from the configuration or the `ALPACA_API_KEY_ID` / `ALPACA_API_SECRET_KEY` env that `docker-compose.yml` already passes. Blank keys → no Alpaca source, one WARNING at start, records end `INCOMPLETE` (`NO_BAR_SOURCE`) if the local DuckDB has no bars. The conid is mapped to a ticker only through `trader.universe_accessor.resolve_symbol(conid, first_only=True)`, and only for `STK` in `USD`. Anything else is `UNSUPPORTED_INSTRUMENT`.
+18. **Incomplete baselines (spec 7).** A baseline whose evidence the `ai` service could not read is still sent, never dropped and never with invented values. `incomplete_reason` is one of `quote_unavailable`, `feed_not_accepted`, `budget_refused`, `model_failed`, `sizing_unavailable` (Plan 6 never sends the last one; the trader writes it, Ruling 19). With a reason set: `no_trade.v1` is refused (it is always complete); `conid` is still required (the opportunity always names its instrument); `side`, `quantity` and the three prices must be null; `deployment_digest` is optional. The trader writes the decision row and a sealed `INCOMPLETE` outcome (`reason` = the wire value, `exit_kind = NONE`, `pnl_usd` and `trades` null, `bar_source = "none"`) in one transaction, so the simulator never picks it up and the book shows it under `incomplete_reasons`. *If wrong:* an incomplete record makes its whole book `INCOMPLETE`; that is the honest label for a book with a hole.
+19. **Baseline sizing at ingestion (index ruling).** `follow_signal.v1` and `fixed_rule.v1` get the quantity a real `ENTER` of that deployment gets at that moment. **Linked** (`linked_decision_id` names an `ENTER` the trader placed, which is when Jev took the signal): the record takes that `ENTER`'s own sized quantity (`DecisionFact.entry_quantity`, the `quantity` of its `SUBMITTED` receipt), `quantity_source = 'linked_entry'`. Sizing again would be wrong here: Plan 5 delivers a linked baseline only after its `ENTER` settled, so the account already holds that entry. If the linked `ENTER` was not placed (refused, no quantity), the record is sized like an unlinked one. **Unlinked** (Jev skipped or was refused, and every fixed-rule record): the trader's `BaselineSizer` runs SP1's `max_entry_quantity(limits, sizing_inputs(...))` on a fresh `broker.capture(account)`, the current effective limits (`AiRiskPolicyService.effective_limits()`), price = the planned entry limit on the fresh quote (`planned_entry_limit(ask, bid, AI_ENTRY_POLICY.limit_offset_bps)`, exactly what `prepare_entry` sizes on; `reference_price` stays the simulated fill), stop = `stop_price`, the notional cap (`deployment.evidence_order_notional × (1 + LIVE_NOTIONAL_TOLERANCE)`, the same cap `prepare_entry` uses) and the liquidity cap (`LiquidityPolicy.max_quantity(liquidity_from_history(history, conid, quote, now))` on the trader's quote authority; a missing quote or a feed outside the accepted set is a sizing failure, as it is for a real `ENTER`). `pending_entry_refusal` or a result below one share also counts: the real `ENTER` would have been refused. Sizing runs before the write transaction (it does I/O); the sized quantity goes into the `quantity` column with `quantity_source = 'trader_sizing'`, the inputs into `sizing_json` (equity, gross, existing value, liquidity cap, notional cap, the limits, the binding bound). These are server columns, outside `body_digest`, so a redelivery is a `DUPLICATE` and keeps the first size. A sizer error, no sizer (no `ai_paper` stack), a refused or below-one-share size, or `decided_at` more than `SIZING_MAX_LAG` (120 s) before ingestion → the record is written with an `INCOMPLETE` outcome, reason `sizing_unavailable`, and the code in `sizing_json`. Plan 2's sizer knows strategy deployments; a discretionary digest is `sizing_unavailable` (`DEPLOYMENT_KIND_MISMATCH`) until Plan 3 extends it (Plan 3 Cross-plan additions). *If wrong:* a delivery after a long trader outage is incomplete instead of sized on a different broker state; that is the safe side.
+20. **Owner model budget cap (owner, 2026-10-07; spec 5.4).** `ai_paper.model_budget_usd_per_day` in `trader.yaml` (default 2000, finite, ≥ 0, a bool or text refused; env overrides are already refused by `_refuse_env_overrides`). It is parsed into `AiPaperConfig.model_budget_usd_per_day` and served by the query `get_ai_model_budget` → `{"model_budget_usd_per_day": float, "source": "trader.yaml"}`. The trader reads `trader.yaml` only at start, so only an operator edit plus a trader restart changes the value; no typed RPC command touches it. The `ai` service applies it with Plan 4's `Budget.set_cap` (Plan 5). *If wrong:* an operator `cli` command (spec 5.4's other path) can be added later as a `cli`-only command; it is not needed for SP2a+b.
+21. **Matched-entry linkage.** `linked_round_trip_id: Optional[str]` (`^[A-Za-z0-9_.:-]{1,128}$`) is allowed only on `matched_entry_bracket_exit.v1` and is stored for audit; the trader does not resolve it. One record per model close: `opportunity_id` is the close's decision id, so two partial closes of one trip are two records with the same `linked_decision_id` and `linked_round_trip_id`.
 
 ## Cross-plan additions
 
@@ -55,14 +59,24 @@ Plan 5 (outbox) and Plan 6 (baselines, acceptance) use these exact names.
 `record_id: str` (`^[A-Za-z0-9_-]{8,96}$`), `experiment_id: str` (`^exp-[0-9a-f]{20}$`), `role: "orchestrator"|"jev"|"research"`, `provider: str`, `model: str` (`^[A-Za-z0-9_./:@+-]{1,128}$`), `attempt_id: str` (same shape as `record_id`), `input_tokens: Optional[int]`, `output_tokens: Optional[int]` (≥ 0), `cost_usd: Optional[float]` (≥ 0, finite), `cost_status: "confirmed"|"estimated"|"unknown"` (`unknown` ⇔ `cost_usd` is null), `called_at: str` (ISO-8601 with offset), `served_kind: "decision"|"cycle"|"signal"|"research"`, `served_id: str` (`^[A-Za-z0-9_.:-]{1,128}$`), `decision_id: Optional[str]` (`^[A-Za-z0-9_-]{8,64}$`), `corrects_record_id: Optional[str]`.
 
 **RPC `record_simulated_decision`** (command, `ai_supervisor`). Request (strict):
-`record_id: str`, `experiment_id: str`, `baseline_id: str`, `cohort: str`, `opportunity_id: str` (`^[A-Za-z0-9_.:-]{1,128}$`), `conid: Optional[int]` (> 0), `side: Optional["BUY"]`, `quantity: Optional[int]` (≥ 1), `reference_price`, `stop_price`, `target_price: Optional[float]` (> 0), `decided_at: str`, `linked_decision_id: Optional[str]`. For every baseline except `no_trade.v1` all of `conid`, `side`, `quantity`, `reference_price`, `stop_price`, `target_price` are required. For `no_trade.v1`, `side`, `quantity` and the three prices must be null; `conid` is optional.
+`record_id: str`, `experiment_id: str`, `baseline_id: str`, `cohort: str`, `opportunity_id: str` (`^[A-Za-z0-9_.:-]{1,128}$`), `conid: Optional[int]` (> 0), `side: Optional["BUY"]`, `quantity: Optional[int]` (≥ 1), `reference_price`, `stop_price`, `target_price: Optional[float]` (> 0), `decided_at: str`, `linked_decision_id: Optional[str]`, `linked_round_trip_id: Optional[str]` (`^[A-Za-z0-9_.:-]{1,128}$`, matched-entry only), `deployment_digest: Optional[str]` (`^sha256:[0-9a-f]{64}$`), `incomplete_reason: Optional["quote_unavailable"|"feed_not_accepted"|"budget_refused"|"model_failed"|"sizing_unavailable"]`. Shapes by baseline (the wire model refuses anything else):
+- `follow_signal.v1`, `fixed_rule.v1`, complete: `conid`, `side`, the three prices and `deployment_digest` required; `quantity` **must be null** (the trader sizes it, Ruling 19).
+- `matched_entry_bracket_exit.v1`, complete: `conid`, `side`, `quantity` (the real entry quantity) and the three prices required.
+- Any trading baseline with `incomplete_reason` set: `conid` required; `side`, `quantity` and the three prices null (Ruling 18).
+- `no_trade.v1`: `side`, `quantity`, the three prices, `deployment_digest`, `linked_round_trip_id` and `incomplete_reason` null; `conid` optional.
 
 **Response of both** (always a dict, never an RPC error for a business refusal):
 `{"status": "INSERTED" | "DUPLICATE" | "REFUSED", "record_id": str, "code": Optional[str], "detail": Optional[str], "retryable": bool}`. `INSERTED` and `DUPLICATE` are both success: the outbox marks the item delivered. A `REFUSED` with `retryable: true` is retried; with `false` it is dead-lettered and shown.
 
-**Refusal codes.** Not retryable: `EXPERIMENT_UNKNOWN`, `CALL_OUTSIDE_EXPERIMENT` (before the start only), `DECIDED_OUTSIDE_EXPERIMENT`, `UNKNOWN_BASELINE`, `COHORT_NOT_ALLOWED`, `DECIDED_OUTSIDE_ENTRY_WINDOW`, `DECISION_LINK_WRONG_ACCOUNT`, `DECISION_LINK_OUTSIDE_EXPERIMENT`, `DECISION_LINK_CONID_MISMATCH`, `DECISION_LINK_NOT_ENTER`, `CORRECTION_OF_CORRECTION`, `CORRECTION_IDENTITY_MISMATCH`, `CORRECTION_DOWNGRADE`, `CONFLICTING_DUPLICATE`. Retryable: `DECISION_LINK_UNKNOWN`, `CORRECTION_TARGET_UNKNOWN`.
+**Refusal codes.** Not retryable: `EXPERIMENT_UNKNOWN`, `CALL_OUTSIDE_EXPERIMENT` (before the start only), `DECIDED_OUTSIDE_EXPERIMENT`, `UNKNOWN_BASELINE`, `COHORT_NOT_ALLOWED`, `DECIDED_OUTSIDE_ENTRY_WINDOW`, `DECISION_LINK_WRONG_ACCOUNT`, `DECISION_LINK_OTHER_EXPERIMENT`, `DECISION_LINK_OUTSIDE_EXPERIMENT`, `DECISION_LINK_CONID_MISMATCH`, `DECISION_LINK_NOT_ENTER`, `CORRECTION_OF_CORRECTION`, `CORRECTION_IDENTITY_MISMATCH`, `CORRECTION_DOWNGRADE`, `CONFLICTING_DUPLICATE`. Retryable: `DECISION_LINK_UNKNOWN`, `CORRECTION_TARGET_UNKNOWN`.
 
-**Plan 6 constraints.** At most one simulated decision per `(experiment_id, baseline_id, opportunity_id)`. `matched_entry_bracket_exit.v1` records the **entry**: `decided_at` is the entry time, `reference_price` the entry fill price, `quantity` the entry quantity, `linked_decision_id` the real `ENTER` decision. `follow_signal.v1`'s `opportunity_id` should come from the signal's `source_event_id`. A `decision_id` on a cost is allowed only for a decision the trader has accepted.
+**Plan 6 constraints.** At most one simulated decision per `(experiment_id, baseline_id, opportunity_id)`. `matched_entry_bracket_exit.v1` is one record **per model CLOSE / PARTIAL_CLOSE**: `opportunity_id` is that close's decision id (stable per close), `linked_round_trip_id` the trip, and the record holds the **entry**: `decided_at` is the entry time, `reference_price` the entry fill price, `quantity` the entry quantity, `linked_decision_id` the real `ENTER` decision of the same experiment. `follow_signal.v1`'s `opportunity_id` should come from the signal's `source_event_id`. `follow_signal.v1` and `fixed_rule.v1` are sent with `quantity: null` and the deployment digest the real `ENTER` would name. A baseline whose evidence is missing is sent with `incomplete_reason`, never dropped. A `decision_id` on a cost is allowed only for a decision the trader has accepted.
+
+**RPC `get_ai_model_budget`** (query, `ai_supervisor`). Request: `{}` (strict, no keys). Reply: `{"model_budget_usd_per_day": float, "source": "trader.yaml"}`. The value is `AiPaperConfig.model_budget_usd_per_day`, read once at trader start (Ruling 20). No principal has a command that changes it.
+
+**Trader config.** `ai_paper.model_budget_usd_per_day` (default `2000`) in `trader/automation/ai_paper_config.py` (`_PARSED_KEYS`, `AiPaperConfig`) and `config_defaults/trader.yaml`.
+
+**Decision facts.** `DecisionFact` carries `experiment_id: Optional[str]` (from the `ai_paper_decisions.experiment_id` column Plan 3 adds); Plan 2 compares it with the experiment's id. It also carries `entry_quantity: Optional[int]`: for an `ENTER` the trader placed, the `quantity` of its `SUBMITTED` receipt outcome (`AiPaperDecisionService` writes `outcome["quantity"] = prepared.quantity`), else `None`.
 
 **Report shape** (`get_scoreboard`; Plan 6 acceptance reads it): `benchmarks.books: list[{baseline_id, cohort, label: "simulated", pnl_basis, status: "COMPLETE"|"INCOMPLETE"|"PENDING", records, complete, incomplete, pending, trades, pnl_usd, known_pnl_usd, incomplete_reasons: {reason: count}}]`, sorted by `(baseline_id, cohort)`; `benchmarks.ai_cost: {status, calls, confirmed_usd, estimated_usd, unknown_calls, corrections, total_usd}`. The SP1 key `benchmarks.simulated` is **removed**.
 
@@ -74,15 +88,17 @@ Plan 5 (outbox) and Plan 6 (baselines, acceptance) use these exact names.
 2. **One bar touches both stop and target.** The stop must win, and a gap through the stop fills at the open. → Task 4 `test_same_bar_stop_and_target_is_a_stop`, `test_gap_through_the_stop_fills_at_the_open`.
 3. **Missing flatten bar, a 30-minute hole, an early-close day.** Each gives an `INCOMPLETE` record and an `INCOMPLETE` book; the other books stay complete. → Task 4 `test_missing_flatten_bar_is_incomplete`, `test_a_thirty_minute_hole_is_incomplete`; Task 5 `test_early_close_uses_the_early_flatten_start`; Task 8 `test_incomplete_book_does_not_hide_complete_books`.
 4. **A cost correction after a confirmed cost.** The total changes once; a downgrade and a correction of a correction are refused; the call count does not grow. → Task 2 `test_correction_replaces_the_cost_once`, `test_correction_cannot_lower_the_status`; Task 6 `test_correction_is_counted_once_and_status_labelled`.
-5. **Principal rights through the real signed server.** `cli`, `dashboard` and `ai_research` are denied both commands; `ai_supervisor` can call them; a conflicting duplicate comes back as `REFUSED`, not as an internal error. → Task 3 `test_only_ai_supervisor_may_ingest`, `test_a_conflict_is_a_refused_reply_not_an_rpc_error`.
+5. **Principal rights through the real signed server.** `cli`, `dashboard` and `ai_research` are denied both commands and the budget query; `ai_supervisor` can call them; a conflicting duplicate comes back as `REFUSED`, not as an internal error; no command changes the cap. → Task 3 `test_only_ai_supervisor_may_ingest`, `test_a_conflict_is_a_refused_reply_not_an_rpc_error`, `test_only_ai_supervisor_reads_the_model_budget_and_nobody_writes_it`.
+6. **A decision of another experiment** on the same account, time and conid is never linked. → Task 2 `test_a_decision_of_another_experiment_is_never_linked`.
+7. **A baseline with missing evidence** is stored with an `INCOMPLETE` outcome and no invented price; a sized baseline gets exactly the quantity a real `ENTER` gets when a risk limit binds; a redelivery keeps the first size. → Task 2 `test_an_incomplete_baseline_is_stored_incomplete_at_once`, `test_sized_baselines_take_the_trader_size_and_keep_it_on_redelivery`, `test_a_sizing_failure_is_an_incomplete_record`, `test_a_linked_follow_baseline_takes_the_real_enter_quantity`; Task 3 `test_baseline_size_equals_the_real_entry_size_when_gross_binds`; Plan 6 Task 8 `test_follow_signal_baseline_has_the_real_enter_size_on_a_binding_limit` (SP1's real stack).
 
 ## File map
 
 | File | Responsibility | Task |
 |---|---|---|
 | `trader/scoreboard/schema.py`, `trader/scoreboard/store.py`, `trader/data/schema_migrations.py` (docstring) | tables, idempotent sealed ingest | 1 |
-| `trader/scoreboard/ingest_models.py`, `trader/scoreboard/ingest.py`, `trader/scoreboard/ports.py` | wire models, validation, `AiIngest`, decision facts port | 2 |
-| `trader/messaging/ai_ingest_surface.py`, `trader/messaging/principals.py`, `trader/messaging/production_api.py`, `trader/scoreboard/wiring.py`, `trader/trading/command_stack.py` | RPC registration, ACL, wiring | 3 |
+| `trader/scoreboard/ingest_models.py`, `trader/scoreboard/ingest.py`, `trader/scoreboard/ports.py` | wire models, validation, `AiIngest`, decision facts and baseline sizer ports | 2 |
+| `trader/messaging/ai_ingest_surface.py`, `trader/messaging/principals.py`, `trader/messaging/production_api.py`, `trader/scoreboard/wiring.py`, `trader/trading/command_stack.py`, `trader/automation/ai_baseline_sizing.py`, `trader/automation/ai_paper_config.py`, `config_defaults/trader.yaml` | RPC registration, ACL, wiring, the SP1 sizing adapter, the budget cap key and query | 3 |
 | `trader/scoreboard/simulator.py` | pure bracket simulation | 4 |
 | `trader/scoreboard/bar_sources.py`, `trader/scoreboard/session_simulator.py`, `trader/trading/trading_runtime.py`, `trader/scoreboard/wiring.py` | bar sources, runner, tick step, Alpaca keys | 5 |
 | `trader/scoreboard/books.py`, `trader/scoreboard/report.py`, `trader/scoreboard/service.py`, `trader/scoreboard/summary_text.py` | books, costs, readback | 6 |
@@ -129,8 +145,10 @@ _SIMULATED = (
         record_id VARCHAR PRIMARY KEY, experiment_id VARCHAR NOT NULL,
         baseline_id VARCHAR NOT NULL, cohort VARCHAR NOT NULL, opportunity_id VARCHAR NOT NULL,
         conid BIGINT, side VARCHAR CHECK (side IS NULL OR side = 'BUY'), quantity BIGINT,
-        reference_price DOUBLE, stop_price DOUBLE, target_price DOUBLE,
+        quantity_source VARCHAR CHECK (quantity_source IS NULL OR quantity_source IN ('client','trader_sizing','linked_entry')),
+        sizing_json VARCHAR, reference_price DOUBLE, stop_price DOUBLE, target_price DOUBLE,
         decided_at TIMESTAMPTZ NOT NULL, session_date DATE NOT NULL, linked_decision_id VARCHAR,
+        linked_round_trip_id VARCHAR, deployment_digest VARCHAR, incomplete_reason VARCHAR,
         body_digest VARCHAR NOT NULL, recorded_at TIMESTAMPTZ NOT NULL)""",
     "CREATE INDEX IF NOT EXISTS idx_simulated_decisions_book "
     "ON simulated_decisions(experiment_id, baseline_id, cohort)",
@@ -341,12 +359,13 @@ Fix the two existing tests: in `test_store.py` replace the raw insert with `db.e
 - Modify test: `tests/scoreboard/test_verify.py`
 
 **Interfaces:**
-- Consumes: `ScoreboardStore.ingest_sealed_many`, `IngestRefused`, `ScoreboardConflict`, an experiment reader (`get(experiment_id)` → object with `experiment_id, account_id, started_at, stopped_at`), `XNYSCalendarPolicy.resolve`.
+- Consumes: `ScoreboardStore.ingest_sealed_many`, `IngestRefused`, `ScoreboardConflict`, an experiment reader (`get(experiment_id)` → object with `experiment_id, account_id, started_at, stopped_at`), `XNYSCalendarPolicy.resolve`, a `BaselineSizer` (Task 3 gives the real one).
 - Produces:
   - `RecordAiCostRequest`, `RecordSimulatedDecisionRequest` (pydantic, fields in Cross-plan additions); `parse_utc(text: str) -> datetime`; `body_digest(payload: Mapping[str, Any]) -> str`.
   - `BASELINES: Mapping[str, str]`; `STATUS_RANK: Mapping[str, int]`.
-  - `class AiIngest(store, experiments, decisions, calendar, now)` with `record_cost(req) -> dict` and `record_simulated(req) -> dict` (response shape in Cross-plan additions).
-  - In `ports.py`: `@dataclass(frozen=True) DecisionFact(decision_id: str, account_id: str, conid: Optional[int], action: Optional[str], received_at: dt.datetime)`; `class DecisionFacts(Protocol): def get(self, decision_id: str) -> Optional[DecisionFact]`; `NullDecisionFacts` (always `None`); `DecisionStoreFacts(decision_store)` adapting `AiPaperDecisionStore.row(decision_id)` (returns `None` when the row is missing or has no `decision_id`).
+  - `class AiIngest(store, experiments, decisions, calendar, now, sizer=None)` with `record_cost(req) -> dict` and `record_simulated(req) -> dict` (response shape in Cross-plan additions). `SIZING_MAX_LAG = timedelta(seconds=120)`.
+  - In `ports.py`: `@dataclass(frozen=True) DecisionFact(decision_id: str, account_id: str, experiment_id: Optional[str], conid: Optional[int], action: Optional[str], received_at: dt.datetime, entry_quantity: Optional[int] = None)`; `class DecisionFacts(Protocol): def get(self, decision_id: str) -> Optional[DecisionFact]`; `NullDecisionFacts` (always `None`); `DecisionStoreFacts(decision_store, ledger=None)` adapting `AiPaperDecisionStore.row(decision_id)` (returns `None` when the row is missing or has no `decision_id`) and, for an `ENTER`, reading `entry_quantity` from the command ledger's receipt outcome of `row.command_id` (`None` without a ledger, a receipt or an int `quantity`).
+  - In `ports.py`: `@dataclass(frozen=True) SizedBaseline(quantity: int, inputs: Mapping[str, Any])`; `class SizingUnavailable(Exception)` with `.code` and `.inputs`; `class BaselineSizer(Protocol): def size(self, *, account_id: str, deployment_digest: str, conid: int, reference_price: float, stop_price: float) -> SizedBaseline` (raises `SizingUnavailable`).
 
 `ingest_models.py` holds the two strict models (`ConfigDict(extra="forbid", strict=True)`, fields and regexes exactly as in Cross-plan additions), `parse_utc`, and `body_digest`. Every id field gets a `field_validator` that applies its regex; both `called_at` / `decided_at` validators call `parse_utc` (naive → `ValueError`). The load-bearing parts, in full:
 
@@ -358,9 +377,13 @@ def parse_utc(text: str) -> dt.datetime:
     return moment.astimezone(dt.timezone.utc)
 
 
+def canonical_json(payload: Mapping[str, Any]) -> str:
+    return json.dumps(payload, sort_keys=True, separators=(",", ":"))
+
+
 def body_digest(payload: Mapping[str, Any]) -> str:
     """Over client fields only, with times normalized to UTC, so a retry spelled differently still matches."""
-    return hashlib.sha256(json.dumps(payload, sort_keys=True, separators=(",", ":")).encode()).hexdigest()
+    return hashlib.sha256(canonical_json(payload).encode()).hexdigest()
 
 
 class _Base(BaseModel):
@@ -393,18 +416,39 @@ def digest(self) -> str:
 ```python
 # RecordSimulatedDecisionRequest
 _Price = Annotated[float, Field(gt=0, allow_inf_nan=False)]    # quantity: Annotated[int, Field(ge=1, le=10_000_000)]
+IncompleteReason = Literal["quote_unavailable", "feed_not_accepted", "budget_refused", "model_failed",
+                           "sizing_unavailable"]
+TRADER_SIZED = frozenset({"follow_signal.v1", "fixed_rule.v1"})        # Ruling 19
+# fields: ..., linked_round_trip_id: Optional[str], deployment_digest: Optional[str],
+#         incomplete_reason: Optional[IncompleteReason]
 
 @model_validator(mode="after")
 def _shape_by_baseline(self):
-    trade = (self.conid, self.side, self.quantity, self.reference_price, self.stop_price, self.target_price)
+    prices = (self.reference_price, self.stop_price, self.target_price)
+    if self.linked_round_trip_id is not None and self.baseline_id != "matched_entry_bracket_exit.v1":
+        raise ValueError("linked_round_trip_id belongs to the matched-entry baseline only")
     if self.baseline_id == "no_trade.v1":
-        if any(v is not None for v in trade[1:]):
-            raise ValueError("a no_trade record carries no side, quantity or prices")
+        extra = (self.side, self.quantity, *prices, self.deployment_digest, self.incomplete_reason)
+        if any(v is not None for v in extra):
+            raise ValueError("a no_trade record carries no side, quantity, prices, deployment or incomplete reason")
         return self
-    if any(v is None for v in trade):
-        raise ValueError("a trading baseline needs conid, side, quantity and all three prices")
+    if self.conid is None:
+        raise ValueError("a trading baseline always names its conid")
+    if self.incomplete_reason is not None:
+        if any(v is not None for v in (self.side, self.quantity, *prices)):
+            raise ValueError("an incomplete baseline carries no side, quantity or prices (never invented)")
+        return self
+    if self.side is None or any(v is None for v in prices):
+        raise ValueError("a complete trading baseline needs side and all three prices")
     if not self.stop_price < self.reference_price < self.target_price:
         raise ValueError("stop_price < reference_price < target_price is required for a BUY")
+    if self.baseline_id in TRADER_SIZED:
+        if self.quantity is not None:
+            raise ValueError("the trader sizes this baseline: quantity must be null")
+        if self.deployment_digest is None:
+            raise ValueError("a sized baseline names the deployment a real ENTER would use")
+    elif self.quantity is None:
+        raise ValueError("the matched-entry baseline carries the real entry quantity")
     return self
 
 def digest(self) -> str:
@@ -423,8 +467,9 @@ import datetime as dt
 import logging
 from typing import Any, Callable, Optional
 
-from trader.scoreboard.ingest_models import RecordAiCostRequest, RecordSimulatedDecisionRequest, parse_utc
-from trader.scoreboard.ports import session_date_et
+from trader.scoreboard.ingest_models import (TRADER_SIZED, RecordAiCostRequest, RecordSimulatedDecisionRequest,
+                                             canonical_json, parse_utc)
+from trader.scoreboard.ports import SizingUnavailable, session_date_et
 from trader.scoreboard.store import IngestRefused, ScoreboardConflict, ScoreboardStore
 
 logger = logging.getLogger(__name__)
@@ -438,6 +483,8 @@ BASELINES = {
 STATUS_RANK = {"unknown": 0, "estimated": 1, "confirmed": 2}
 NO_TRADE = "no_trade.v1"
 BAR_SOURCE_NONE = "none"
+SIZING_UNAVAILABLE = "sizing_unavailable"
+SIZING_MAX_LAG = dt.timedelta(seconds=120)
 
 
 def _reply(status: str, record_id: str, code: Optional[str] = None, detail: Optional[str] = None,
@@ -447,12 +494,13 @@ def _reply(status: str, record_id: str, code: Optional[str] = None, detail: Opti
 
 class AiIngest:
     def __init__(self, *, store: ScoreboardStore, experiments: Any, decisions: Any, calendar: Any,
-                 now: Callable[[], dt.datetime]):
+                 now: Callable[[], dt.datetime], sizer: Any = None):
         self._store = store
         self._experiments = experiments
         self._decisions = decisions
         self._calendar = calendar
         self._now = now
+        self._sizer = sizer          # BaselineSizer; None (no ai_paper stack) sizes nothing: sizing_unavailable
 
     # -- the two commands ----------------------------------------------------
 
@@ -486,18 +534,22 @@ class AiIngest:
         if moment < experiment.started_at or too_late:
             raise IngestRefused(code, f"{moment.isoformat()} is outside experiment {experiment.experiment_id}")
 
-    def _decision_link(self, decision_id: str, experiment: Any, *, conid: Optional[int], must_enter: bool) -> None:
+    def _decision_link(self, decision_id: str, experiment: Any, *, conid: Optional[int], must_enter: bool) -> Any:
         fact = self._decisions.get(decision_id)
         if fact is None:
             raise IngestRefused("DECISION_LINK_UNKNOWN", f"the trader has no decision {decision_id}", retryable=True)
         if fact.account_id != experiment.account_id:
             raise IngestRefused("DECISION_LINK_WRONG_ACCOUNT", f"decision {decision_id} is of another account")
+        if fact.experiment_id != experiment.experiment_id:
+            raise IngestRefused("DECISION_LINK_OTHER_EXPERIMENT",
+                                f"decision {decision_id} belongs to experiment {fact.experiment_id}")
         if fact.received_at < experiment.started_at:
             raise IngestRefused("DECISION_LINK_OUTSIDE_EXPERIMENT", f"decision {decision_id} predates the experiment")
         if must_enter and fact.action != "ENTER":
             raise IngestRefused("DECISION_LINK_NOT_ENTER", f"decision {decision_id} is a {fact.action}")
         if conid is not None and fact.conid != conid:
             raise IngestRefused("DECISION_LINK_CONID_MISMATCH", f"decision {decision_id} is on conid {fact.conid}")
+        return fact
 
     # -- costs -------------------------------------------------------------------
 
@@ -553,20 +605,62 @@ class AiIngest:
             schedule = self._calendar.resolve(decided_at)
             if schedule is None or not schedule.open_utc <= decided_at < schedule.flatten_start_utc:
                 raise IngestRefused("DECIDED_OUTSIDE_ENTRY_WINDOW", f"{decided_at.isoformat()} is not before the flatten start")
+        linked = None
         if req.linked_decision_id is not None:
-            self._decision_link(req.linked_decision_id, experiment, conid=req.conid, must_enter=True)
+            linked = self._decision_link(req.linked_decision_id, experiment, conid=req.conid, must_enter=True)
         now = self._now()
         session_date = session_date_et(decided_at)
         decision = {**req.model_dump(), "decided_at": decided_at, "session_date": session_date,
+                    "quantity_source": None if req.quantity is None else "client", "sizing_json": None,
                     "body_digest": req.digest(), "recorded_at": now}
+        incomplete_reason = req.incomplete_reason
+        if incomplete_reason is None and req.baseline_id in TRADER_SIZED and not self._known(req.record_id):
+            if linked is not None and linked.entry_quantity is not None:
+                # Jev took it: the real ENTER's own size (re-sizing would count that entry against itself).
+                decision.update({"quantity": linked.entry_quantity, "quantity_source": "linked_entry",
+                                 "sizing_json": canonical_json({"code": "LINKED_ENTER",
+                                                                "decision_id": linked.decision_id})})
+            else:
+                # I/O outside the write transaction (the database lock is not reentrant); a redelivery skips it.
+                sized, incomplete_reason = self._size(req, experiment, decided_at, now)
+                decision.update(sized)
         items = [("simulated_decisions", decision)]
         if req.baseline_id == NO_TRADE:
-            items.append(("simulated_outcomes", {
-                "record_id": req.record_id, "experiment_id": req.experiment_id, "baseline_id": req.baseline_id,
-                "cohort": req.cohort, "session_date": session_date, "status": "COMPLETE", "reason": None,
-                "exit_kind": "NONE", "exit_at": None, "exit_price": None, "pnl_usd": 0.0, "trades": 0,
-                "bar_source": BAR_SOURCE_NONE, "bars_digest": None, "computed_at": now}))
+            items.append(self._outcome(req, session_date, now, status="COMPLETE", reason=None, pnl_usd=0.0, trades=0))
+        elif incomplete_reason is not None:
+            items.append(self._outcome(req, session_date, now, status="INCOMPLETE", reason=incomplete_reason,
+                                       pnl_usd=None, trades=None))
         return self._store.ingest_sealed_many(items, extend=lambda conn: self._opportunity_check(conn, req))
+
+    def _known(self, record_id: str) -> bool:
+        return bool(self._store.fetch("simulated_decisions", {"record_id": record_id}))
+
+    def _size(self, req, experiment, decided_at, now) -> tuple[dict, Optional[str]]:
+        """Ruling 19: the size a real ENTER of this deployment gets now, or sizing_unavailable with the code."""
+        try:
+            if now - decided_at > SIZING_MAX_LAG:
+                raise SizingUnavailable("SIZING_TOO_LATE", {"lag_seconds": (now - decided_at).total_seconds()})
+            if self._sizer is None:
+                raise SizingUnavailable("NO_SIZER", {})
+            sized = self._sizer.size(account_id=experiment.account_id, deployment_digest=req.deployment_digest,
+                                     conid=req.conid, reference_price=req.reference_price,
+                                     stop_price=req.stop_price)
+        except SizingUnavailable as failure:
+            logger.warning("baseline %s not sized: %s", req.record_id, failure.code)
+            return {"sizing_json": canonical_json({"code": failure.code, **failure.inputs})}, SIZING_UNAVAILABLE
+        except Exception as exc:                  # provider text may carry details: keep the class name only
+            logger.error("baseline %s sizer failed: %s", req.record_id, type(exc).__name__)
+            return {"sizing_json": canonical_json({"code": f"SIZER_{type(exc).__name__}"})}, SIZING_UNAVAILABLE
+        return {"quantity": sized.quantity, "quantity_source": "trader_sizing",
+                "sizing_json": canonical_json(dict(sized.inputs))}, None
+
+    @staticmethod
+    def _outcome(req, session_date, now, *, status, reason, pnl_usd, trades) -> tuple[str, dict]:
+        return ("simulated_outcomes", {
+            "record_id": req.record_id, "experiment_id": req.experiment_id, "baseline_id": req.baseline_id,
+            "cohort": req.cohort, "session_date": session_date, "status": status, "reason": reason,
+            "exit_kind": "NONE", "exit_at": None, "exit_price": None, "pnl_usd": pnl_usd, "trades": trades,
+            "bar_source": BAR_SOURCE_NONE, "bars_digest": None, "computed_at": now})
 
     @staticmethod
     def _opportunity_check(conn, req: RecordSimulatedDecisionRequest) -> dict:
@@ -590,11 +684,26 @@ from tests.scoreboard.common import ACCOUNT, EXP_ID, NOW
 from trader.automation.calendar_policy import XNYSCalendarPolicy
 from trader.scoreboard.ingest import AiIngest
 from trader.scoreboard.ingest_models import RecordAiCostRequest, RecordSimulatedDecisionRequest
-from trader.scoreboard.ports import DecisionFact
+from trader.scoreboard.ports import DecisionFact, SizedBaseline, SizingUnavailable
 
 UTC = dt.timezone.utc
 STARTED = dt.datetime(2026, 10, 5, 13, 30, tzinfo=UTC)
 DECIDED = "2026-10-06T14:30:00+00:00"          # 10:30 ET, Tuesday; flatten start is 19:45 UTC
+INGESTED_AT = dt.datetime(2026, 10, 6, 14, 30, 30, tzinfo=UTC)   # 30 s after DECIDED: inside SIZING_MAX_LAG
+DEPLOYMENT = "sha256:" + "d" * 64
+
+
+class FakeSizer:
+    """Stands in for SP1 sizing: a fixed size, or a SizingUnavailable code."""
+
+    def __init__(self, quantity=10, refuse=None):
+        self.quantity, self.refuse, self.calls = quantity, refuse, []
+
+    def size(self, **kwargs):
+        self.calls.append(kwargs)
+        if self.refuse:
+            raise SizingUnavailable(self.refuse, {"binding": "none"})
+        return SizedBaseline(self.quantity, {"binding": "gross_fraction", "max_quantity": self.quantity})
 
 
 class FakeExperiments:
@@ -615,15 +724,15 @@ class FakeDecisions:
 
 
 def enter_fact(decision_id="dec-00000001", conid=265598, **changes):
-    values = dict(decision_id=decision_id, account_id=ACCOUNT, conid=conid, action="ENTER",
+    values = dict(decision_id=decision_id, account_id=ACCOUNT, experiment_id=EXP_ID, conid=conid, action="ENTER",
                   received_at=STARTED + dt.timedelta(days=1))
     values.update(changes)
     return DecisionFact(**values)
 
 
-def make_ingest(store, *, experiments=None, decisions=None):
+def make_ingest(store, *, experiments=None, decisions=None, sizer=None, now=INGESTED_AT):
     return AiIngest(store=store, experiments=experiments or FakeExperiments(), decisions=decisions or FakeDecisions(),
-                    calendar=XNYSCalendarPolicy(), now=lambda: NOW)
+                    calendar=XNYSCalendarPolicy(), now=lambda: now, sizer=sizer or FakeSizer())
 
 
 def cost_body(**changes):
@@ -635,17 +744,32 @@ def cost_body(**changes):
 
 
 def sim_body(**changes):
+    """follow_signal.v1: the trader sizes it, so quantity is null and the deployment is named."""
     body = dict(record_id="sim-0000001", experiment_id=EXP_ID, baseline_id="follow_signal.v1",
-                cohort="strategy_signal", opportunity_id="sig-1", conid=265598, side="BUY", quantity=10,
-                reference_price=100.0, stop_price=98.0, target_price=104.0, decided_at=DECIDED)
+                cohort="strategy_signal", opportunity_id="sig-1", conid=265598, side="BUY", quantity=None,
+                reference_price=100.0, stop_price=98.0, target_price=104.0, decided_at=DECIDED,
+                deployment_digest=DEPLOYMENT)
     body.update(changes)
     return body
+
+
+def matched_body(**changes):
+    """One record per model close: the opportunity is the close's decision id; the record holds the entry."""
+    return sim_body(**{**dict(record_id="sim-0000020", baseline_id="matched_entry_bracket_exit.v1",
+                              cohort="model_close", opportunity_id="dec-00000031", quantity=10,
+                              deployment_digest=None, linked_decision_id="dec-00000001",
+                              linked_round_trip_id="rt-1"), **changes})
+
+
+def incomplete_body(reason="quote_unavailable", **changes):
+    return sim_body(**{**dict(record_id="sim-0000030", opportunity_id="sig-30", side=None, reference_price=None,
+                              stop_price=None, target_price=None, incomplete_reason=reason), **changes})
 
 
 def no_trade_body(**changes):
     return sim_body(**{**dict(record_id="sim-0000009", baseline_id="no_trade.v1", cohort="self_found",
                               opportunity_id="opp-9", side=None, quantity=None, reference_price=None,
-                              stop_price=None, target_price=None), **changes})
+                              stop_price=None, target_price=None, deployment_digest=None), **changes})
 
 
 def cost(ingest, **changes):
@@ -665,8 +789,9 @@ import pydantic
 import pytest
 
 from tests.scoreboard.common import EXP_ID
-from tests.scoreboard.ingest_world import (DECIDED, STARTED, FakeDecisions, FakeExperiments, cost, cost_body,
-                                           enter_fact, make_ingest, no_trade_body, sim, sim_body)
+from tests.scoreboard.ingest_world import (DECIDED, INGESTED_AT, STARTED, FakeDecisions, FakeExperiments, FakeSizer,
+                                           cost, cost_body, enter_fact, incomplete_body, make_ingest, matched_body,
+                                           no_trade_body, sim, sim_body)
 from trader.scoreboard.ingest_models import RecordAiCostRequest, RecordSimulatedDecisionRequest
 
 
@@ -776,7 +901,100 @@ def test_a_simulated_decision_is_inserted_with_its_session_date(ingest, store):
 def test_simulated_redelivery_is_a_duplicate_and_a_changed_body_is_a_conflict(ingest):
     sim(ingest)
     assert sim(ingest)["status"] == "DUPLICATE"
-    assert codes(sim(ingest, quantity=11)) == ("REFUSED", "CONFLICTING_DUPLICATE")
+    assert codes(sim(ingest, reference_price=100.5)) == ("REFUSED", "CONFLICTING_DUPLICATE")
+
+
+def test_sized_baselines_take_the_trader_size_and_keep_it_on_redelivery(store):
+    sizer = FakeSizer(quantity=7)
+    ingest = make_ingest(store, sizer=sizer)
+    assert sim(ingest)["status"] == "INSERTED"
+    row = store.fetch("simulated_decisions", {})[0]
+    assert (row["quantity"], row["quantity_source"]) == (7, "trader_sizing")
+    assert '"binding":"gross_fraction"' in row["sizing_json"]
+    assert sizer.calls == [dict(account_id=ACCOUNT, deployment_digest=DEPLOYMENT, conid=265598,
+                                reference_price=100.0, stop_price=98.0)]
+    sizer.quantity = 9                                                    # the broker moved
+    assert sim(ingest)["status"] == "DUPLICATE" and len(sizer.calls) == 1   # no re-sizing, first size kept
+    assert store.fetch("simulated_decisions", {})[0]["quantity"] == 7
+
+
+@pytest.mark.parametrize("make,code", [
+    (lambda store: make_ingest(store, sizer=FakeSizer(refuse="QUANTITY_BELOW_ONE_SHARE")), "QUANTITY_BELOW_ONE_SHARE"),
+    (lambda store: make_ingest(store, now=INGESTED_AT + dt.timedelta(minutes=5)), "SIZING_TOO_LATE"),
+])
+def test_a_sizing_failure_is_an_incomplete_record(store, make, code):
+    assert sim(make(store))["status"] == "INSERTED"
+    row = store.fetch("simulated_decisions", {})[0]
+    outcome = store.fetch("simulated_outcomes", {})[0]
+    assert row["quantity"] is None and code in row["sizing_json"]
+    assert (outcome["status"], outcome["reason"], outcome["pnl_usd"]) == ("INCOMPLETE", "sizing_unavailable", None)
+
+
+def test_no_sizer_is_sizing_unavailable(store):
+    ingest = AiIngest(store=store, experiments=FakeExperiments(), decisions=FakeDecisions(),
+                      calendar=XNYSCalendarPolicy(), now=lambda: INGESTED_AT, sizer=None)
+    sim(ingest)
+    assert store.fetch("simulated_outcomes", {})[0]["reason"] == "sizing_unavailable"
+
+
+def test_a_linked_follow_baseline_takes_the_real_enter_quantity(store):
+    sizer = FakeSizer(quantity=99)
+    ingest = make_ingest(store, decisions=FakeDecisions(enter_fact(entry_quantity=6)), sizer=sizer)
+    assert sim(ingest, linked_decision_id="dec-00000001")["status"] == "INSERTED"
+    row = store.fetch("simulated_decisions", {})[0]
+    assert (row["quantity"], row["quantity_source"], sizer.calls) == (6, "linked_entry", [])
+
+
+def test_a_linked_enter_that_was_never_placed_is_sized_like_an_unlinked_one(store):
+    ingest = make_ingest(store, decisions=FakeDecisions(enter_fact(entry_quantity=None)), sizer=FakeSizer(quantity=5))
+    sim(ingest, linked_decision_id="dec-00000001")
+    assert store.fetch("simulated_decisions", {})[0]["quantity_source"] == "trader_sizing"
+
+
+def test_the_matched_entry_keeps_its_own_quantity_and_is_not_sized(store):
+    sizer = FakeSizer(quantity=99)
+    ingest = make_ingest(store, decisions=FakeDecisions(enter_fact()), sizer=sizer)
+    assert sim(ingest, matched_body())["status"] == "INSERTED"
+    row = store.fetch("simulated_decisions", {})[0]
+    assert (row["quantity"], row["quantity_source"], sizer.calls) == (10, "client", [])
+
+
+def test_two_partial_closes_of_one_trip_are_two_records(store):
+    ingest = make_ingest(store, decisions=FakeDecisions(enter_fact()))
+    assert sim(ingest, matched_body())["status"] == "INSERTED"
+    assert sim(ingest, matched_body(record_id="sim-0000021", opportunity_id="dec-00000032"))["status"] == "INSERTED"
+    rows = store.fetch("simulated_decisions", {"baseline_id": "matched_entry_bracket_exit.v1"})
+    assert {(r["opportunity_id"], r["linked_decision_id"], r["linked_round_trip_id"]) for r in rows} == {
+        ("dec-00000031", "dec-00000001", "rt-1"), ("dec-00000032", "dec-00000001", "rt-1")}
+
+
+@pytest.mark.parametrize("reason", ["quote_unavailable", "feed_not_accepted", "budget_refused", "model_failed"])
+def test_an_incomplete_baseline_is_stored_incomplete_at_once(ingest, store, reason):
+    sizer_calls_before = len(ingest._sizer.calls)
+    assert sim(ingest, incomplete_body(reason))["status"] == "INSERTED"
+    row = store.fetch("simulated_decisions", {})[0]
+    outcome = store.fetch("simulated_outcomes", {})[0]
+    assert (row["incomplete_reason"], row["quantity"], row["reference_price"]) == (reason, None, None)
+    assert (outcome["status"], outcome["reason"], outcome["exit_kind"], outcome["pnl_usd"], outcome["bar_source"]) == (
+        "INCOMPLETE", reason, "NONE", None, "none")
+    assert len(ingest._sizer.calls) == sizer_calls_before                 # nothing to size
+    assert sim(ingest, incomplete_body(reason))["status"] == "DUPLICATE" and store.seal_count() == 2
+
+
+@pytest.mark.parametrize("body", [
+    incomplete_body(reference_price=100.0),                     # an incomplete record never carries a price
+    incomplete_body(side="BUY"),
+    incomplete_body(conid=None),                                # the instrument is always known
+    no_trade_body(incomplete_reason="quote_unavailable"),       # no_trade is always complete
+    sim_body(quantity=10),                                      # the trader sizes follow_signal
+    sim_body(baseline_id="fixed_rule.v1", cohort="self_found", deployment_digest=None),
+    matched_body(quantity=None),                                # the matched entry keeps the real entry size
+    sim_body(linked_round_trip_id="rt-1"),                      # trip linkage is matched-entry only
+    sim_body(incomplete_reason="stale_vibes"),
+])
+def test_shapes_by_baseline_are_enforced_by_the_wire_model(body):
+    with pytest.raises(pydantic.ValidationError):
+        RecordSimulatedDecisionRequest.model_validate(body)
 
 
 def test_one_decision_per_opportunity_and_baseline(ingest):
@@ -787,7 +1005,7 @@ def test_one_decision_per_opportunity_and_baseline(ingest):
 
 @pytest.mark.parametrize("changes", [
     dict(side="SELL"), dict(quantity=0), dict(stop_price=101.0), dict(target_price=99.0), dict(conid=None),
-    dict(reference_price=float("inf")), dict(decided_at="2026-10-06T14:30:00")])
+    dict(reference_price=float("inf")), dict(decided_at="2026-10-06T14:30:00"), dict(deployment_digest="sha256:x")])
 def test_bad_simulated_bodies_never_reach_the_store(changes):
     with pytest.raises(pydantic.ValidationError):
         RecordSimulatedDecisionRequest.model_validate({**sim_body(), **changes})
@@ -812,6 +1030,16 @@ def test_linked_decision_must_be_an_enter_on_the_same_conid(store):
                      linked_decision_id="dec-00000002")) == ("REFUSED", "DECISION_LINK_NOT_ENTER")
     assert codes(sim(ingest, record_id="sim-0000003", opportunity_id="sig-3", conid=4815747,
                      linked_decision_id="dec-00000001")) == ("REFUSED", "DECISION_LINK_CONID_MISMATCH")
+
+
+def test_a_decision_of_another_experiment_is_never_linked(store):          # review focus 6
+    other = enter_fact("dec-00000005", experiment_id="exp-ffffffffffffffffffff")   # same account, time and conid
+    ingest = make_ingest(store, decisions=FakeDecisions(other))
+    reply = sim(ingest, linked_decision_id="dec-00000005")
+    assert codes(reply) == ("REFUSED", "DECISION_LINK_OTHER_EXPERIMENT") and reply["retryable"] is False
+    reply = cost(ingest, decision_id="dec-00000005")
+    assert codes(reply) == ("REFUSED", "DECISION_LINK_OTHER_EXPERIMENT") and reply["retryable"] is False
+    assert store.fetch("simulated_decisions", {}) == [] and store.fetch("ai_costs", {}) == []
 
 
 def test_no_trade_is_complete_with_zero_pnl_at_once(ingest, store):
@@ -855,9 +1083,11 @@ Add to `ports.py`:
 class DecisionFact:
     decision_id: str
     account_id: str
+    experiment_id: Optional[str]
     conid: Optional[int]
     action: Optional[str]
     received_at: dt.datetime
+    entry_quantity: Optional[int] = None       # the size SP1 gave a placed ENTER (its SUBMITTED receipt)
 
 
 class DecisionFacts(Protocol):
@@ -874,31 +1104,62 @@ class NullDecisionFacts:
 class DecisionStoreFacts:
     """Adapter over ``AiPaperDecisionStore.row``; a row without a decision id is not a decision."""
 
-    def __init__(self, decision_store: Any):
-        self._store = decision_store
+    def __init__(self, decision_store: Any, ledger: Any = None):
+        self._store, self._ledger = decision_store, ledger
 
     def get(self, decision_id: str) -> Optional[DecisionFact]:
         row = self._store.row(decision_id)
         if row is None or row.decision_id is None:
             return None
-        return DecisionFact(row.decision_id, row.account_id, row.conid, row.action, row.received_at)
+        # Plan 3 adds experiment_id to migration 56; before it lands every link is "another experiment".
+        return DecisionFact(row.decision_id, row.account_id, getattr(row, "experiment_id", None), row.conid,
+                            row.action, row.received_at, self._entry_quantity(row))
+
+    def _entry_quantity(self, row: Any) -> Optional[int]:
+        if row.action != "ENTER" or self._ledger is None:
+            return None
+        receipt = self._ledger.get(row.command_id)               # the SP1 command ledger record
+        quantity = (getattr(receipt, "outcome", None) or {}).get("quantity") if receipt is not None else None
+        return quantity if type(quantity) is int and quantity >= 1 else None
+
+
+@dataclass(frozen=True)
+class SizedBaseline:
+    quantity: int
+    inputs: Mapping[str, Any]          # what bound the size; stored as sizing_json
+
+
+class SizingUnavailable(Exception):
+    """The trader cannot size this baseline as it would size a real ENTER (Ruling 19)."""
+
+    def __init__(self, code: str, inputs: Mapping[str, Any]):
+        super().__init__(code)
+        self.code, self.inputs = code, dict(inputs)
+
+
+class BaselineSizer(Protocol):
+    def size(self, *, account_id: str, deployment_digest: str, conid: int, reference_price: float,
+             stop_price: float) -> SizedBaseline: ...
 ```
 
-and in `tests/scoreboard/test_ports.py`:
+and in `tests/scoreboard/test_ports.py` (plus `test_a_placed_enter_reports_its_sized_quantity`: a fake ledger whose `get("aip-dec-00000001")` has `outcome={"quantity": 7}` gives `entry_quantity == 7`; a CLOSE row, a missing receipt or `quantity: True` give `None`):
 
 ```python
 def test_decision_store_facts_maps_a_row_and_hides_a_missing_one():
     from types import SimpleNamespace
     from trader.scoreboard.ports import DecisionStoreFacts
-    row = SimpleNamespace(decision_id="dec-00000001", account_id="DU1", conid=265598, action="ENTER",
-                          received_at=NOW)
+    row = SimpleNamespace(decision_id="dec-00000001", account_id="DU1", experiment_id=EXP_ID, conid=265598,
+                          action="ENTER", received_at=NOW)
     facts = DecisionStoreFacts(SimpleNamespace(row=lambda decision_id: row if decision_id == "dec-00000001"
                                                else SimpleNamespace(decision_id=None) if decision_id == "bare"
                                                else None))
     assert facts.get("dec-00000001").conid == 265598 and facts.get("dec-00000001").action == "ENTER"
+    assert facts.get("dec-00000001").experiment_id == EXP_ID
     assert facts.get("dec-99999999") is None and facts.get("bare") is None
 ```
-(import `NOW` from `tests.scoreboard.common`.)
+(import `EXP_ID` and `NOW` from `tests.scoreboard.common`.)
+
+Imports for the new tests: `ACCOUNT` from `tests.scoreboard.common`, `DEPLOYMENT` from `tests.scoreboard.ingest_world`, `AiIngest` from `trader.scoreboard.ingest`, `XNYSCalendarPolicy` from `trader.automation.calendar_policy`.
 
 - [ ] **Step 2: Run, expect failure** `.venv/bin/python -m pytest tests/scoreboard/test_ingest.py -q --timeout=30` (import errors).
 - [ ] **Step 3: Implement** the files above.
@@ -910,13 +1171,15 @@ def test_decision_store_facts_maps_a_row_and_hides_a_missing_one():
 ### Task 3: RPC surface, ACL and wiring
 
 **Files:**
-- Create: `trader/messaging/ai_ingest_surface.py`
-- Modify: `trader/messaging/principals.py`, `trader/messaging/production_api.py`, `trader/scoreboard/wiring.py`, `trader/trading/command_stack.py`, `trader/messaging/scoreboard_surface.py` (docstring only), `tests/scoreboard/test_surface.py`
-- Test: `tests/scoreboard/test_ingest_surface.py`
+- Create: `trader/messaging/ai_ingest_surface.py`, `trader/automation/ai_baseline_sizing.py`
+- Modify: `trader/messaging/principals.py`, `trader/messaging/production_api.py`, `trader/scoreboard/wiring.py`, `trader/trading/command_stack.py`, `trader/messaging/scoreboard_surface.py` (docstring only), `tests/scoreboard/test_surface.py`, `trader/automation/ai_paper_config.py`, `config_defaults/trader.yaml`, `tests/automation/test_ai_paper_config.py`
+- Test: `tests/scoreboard/test_ingest_surface.py`, `tests/automation/test_ai_baseline_sizing.py`
+
+**Base dependency:** PR #76 (#74, `trader/trading/quote_feeds.py`, `_build_quote_authority` returning `(quotes, accepted_feeds)`) is merged first; the sizer takes its accepted-feed set.
 
 **Interfaces:**
-- Consumes: `AiIngest`, `TypedRpcRegistry.register`.
-- Produces: `register_ai_ingest_surface(registry, ingest) -> None` (registers both commands on role `"command"`; `None` registers nothing); `ScoreboardServices.ingest: AiIngest`; `trader.ai_ingest`.
+- Consumes: `AiIngest`, `TypedRpcRegistry.register`; SP1 `max_entry_quantity`, `sizing_inputs`, `pending_entry_refusal`, `liquidity_from_history`, `LiquidityPolicy.max_quantity`, `planned_entry_limit`, `AI_ENTRY_POLICY`, `LIVE_NOTIONAL_TOLERANCE`, `AiRiskPolicyService.effective_limits`, `AiDeploymentStore.get_sealed`.
+- Produces: `register_ai_ingest_surface(registry, ingest, *, model_budget=None) -> None` (both commands on role `"command"`, `get_ai_model_budget` on role `"query"` when `model_budget` is given; `ingest=None` registers no command); `GetAiModelBudgetRequest` (strict, no fields); `ScoreboardServices.ingest: AiIngest`; `trader.ai_ingest`; `AiPaperConfig.model_budget_usd_per_day: float = 2000.0`; `AiPaperBaselineSizer(*, broker, quotes, history, policy, deployments, accepted_feeds, now, liquidity_policy=None)` implementing `BaselineSizer`; `AiPaperServices.baseline_sizer`; `build_scoreboard(..., sizer=None, command_ledger=None)`.
 
 ```python
 """Cost and simulation ingestion over typed RPC (SP2 Plan 2). ai_supervisor only; facts, not edits."""
@@ -927,8 +1190,17 @@ from typing import Any
 from trader.scoreboard.ingest_models import RecordAiCostRequest, RecordSimulatedDecisionRequest
 
 
-def register_ai_ingest_surface(registry: Any, ingest: Any) -> None:
-    """``ingest`` is the trader's ``AiIngest``; None (no scoreboard) registers nothing."""
+class GetAiModelBudgetRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid", strict=True)
+
+
+def register_ai_ingest_surface(registry: Any, ingest: Any, *, model_budget: Optional[float] = None) -> None:
+    """``ingest`` is the trader's ``AiIngest`` (None: no scoreboard, no command). ``model_budget`` is
+    ``ai_paper.model_budget_usd_per_day`` from trader.yaml, read once at start (Ruling 20); None: no query."""
+    if model_budget is not None:
+        reply = {"model_budget_usd_per_day": float(model_budget), "source": "trader.yaml"}
+        registry.register("query", "get_ai_model_budget", GetAiModelBudgetRequest, dict,
+                          lambda _request: dict(reply), execution="thread")
     if ingest is None:
         return
     registry.register("command", "record_ai_cost", RecordAiCostRequest, dict, ingest.record_cost,
@@ -936,6 +1208,92 @@ def register_ai_ingest_surface(registry: Any, ingest: Any) -> None:
     registry.register("command", "record_simulated_decision", RecordSimulatedDecisionRequest, dict,
                       ingest.record_simulated, execution="thread")
 ```
+
+`trader/automation/ai_paper_config.py`: `_PARSED_KEYS` gains `"model_budget_usd_per_day"`; `AiPaperConfig.model_budget_usd_per_day: float = 2000.0`; `_parse_budget(raw)` accepts an `int` or `float` (never `bool`), finite and `>= 0`, else `AiPaperConfigError("ai_paper.model_budget_usd_per_day: must be a finite number >= 0")`. `config_defaults/trader.yaml`, inside `ai_paper:`: `model_budget_usd_per_day: 2000   # owner cap for model spend per New York day; only this file changes it (restart the trader)`. Tests in `tests/automation/test_ai_paper_config.py`: `test_model_budget_defaults_to_2000`, `test_model_budget_refuses_bool_text_negative_and_nan` (parametrized), and the existing env-override test gains `AI_PAPER_MODEL_BUDGET_USD_PER_DAY` (refused like every `AI_PAPER*` variable).
+
+`trader/automation/ai_baseline_sizing.py` (full code; read only: no order, no high-water-mark write, no approval capture):
+
+```python
+"""Size a baseline exactly as a real ai_paper ENTER of the same deployment is sized now (SP2 Plan 2 Ruling 19)."""
+from __future__ import annotations
+
+import datetime as dt
+import math
+from typing import Any, Callable, Optional
+
+from trader.automation.ai_paper_evidence import AI_ENTRY_POLICY, planned_entry_limit
+from trader.automation.ai_paper_sizing import max_entry_quantity, pending_entry_refusal, sizing_inputs
+from trader.automation.liquidity_policy import LiquidityPolicy
+from trader.automation.production_evidence import liquidity_from_history
+from trader.research.market_context import LIVE_NOTIONAL_TOLERANCE
+from trader.scoreboard.ports import SizedBaseline, SizingUnavailable
+
+
+class AiPaperBaselineSizer:
+    def __init__(self, *, broker: Any, quotes: Any, history: Any, policy: Any, deployments: Any,
+                 accepted_feeds: frozenset[str], now: Callable[[], dt.datetime],
+                 liquidity_policy: Optional[LiquidityPolicy] = None):
+        self._broker, self._quotes, self._history = broker, quotes, history
+        self._policy, self._deployments, self._now = policy, deployments, now
+        self._feeds = frozenset(accepted_feeds)
+        self._liquidity_policy = liquidity_policy or LiquidityPolicy(accepted_feeds=self._feeds)
+
+    def size(self, *, account_id: str, deployment_digest: str, conid: int, reference_price: float,
+             stop_price: float) -> SizedBaseline:
+        limits = self._step("NO_EFFECTIVE_LIMITS", self._policy.effective_limits)
+        notional_cap = self._notional_cap(deployment_digest, conid)
+        snapshot = self._step("EVIDENCE_UNAVAILABLE", lambda: self._broker.capture(account_id))
+        if snapshot.account_id != account_id:
+            raise SizingUnavailable("ACCOUNT_MISMATCH", {})
+        refusal = pending_entry_refusal(snapshot, conid, limits)
+        if refusal:
+            raise SizingUnavailable(refusal, {})
+        quote = self._step("QUOTE_UNAVAILABLE", lambda: self._quotes.executable_quote(conid, side="BUY"))
+        if quote is None:
+            raise SizingUnavailable("QUOTE_UNAVAILABLE", {})
+        if quote.feed_type not in self._feeds:
+            raise SizingUnavailable("QUOTE_FEED_NOT_ACCEPTED", {"feed": quote.feed_type, "accepted": sorted(self._feeds)})
+        # The same price prepare_entry sizes on: the marketable limit through the fresh ask.
+        price = planned_entry_limit(float(quote.ask), float(quote.bid), AI_ENTRY_POLICY.limit_offset_bps)
+        if not stop_price < price:
+            raise SizingUnavailable("STOP_INVALID", {"price": price, "stop": stop_price})
+        liquidity = self._step("LIQUIDITY_UNAVAILABLE",
+                               lambda: liquidity_from_history(self._history, conid, quote, self._now()))
+        inputs = sizing_inputs(snapshot, conid=conid, price=price, stop_price=stop_price,
+                               liquidity_max_shares=self._liquidity_policy.max_quantity(liquidity),
+                               notional_cap=notional_cap)
+        quantity = max_entry_quantity(limits, inputs)
+        record = {"limits": limits.to_json(), "price": price, "reference_price": reference_price, "feed": quote.feed_type,
+                  "equity": inputs.equity, "existing_position_value": inputs.existing_position_value,
+                  "current_gross_notional": inputs.current_gross_notional if math.isfinite(inputs.current_gross_notional) else None,
+                  "liquidity_max_shares": inputs.liquidity_max_shares, "notional_cap": notional_cap,
+                  "max_quantity": quantity}
+        if quantity < 1:
+            raise SizingUnavailable("QUANTITY_BELOW_ONE_SHARE", record)
+        return SizedBaseline(quantity, record)
+
+    def _notional_cap(self, digest: str, conid: int) -> float:
+        deployment = self._step("DEPLOYMENT_UNAVAILABLE", lambda: self._deployments.get_sealed(digest))
+        if deployment.decider_verdict != "DEPLOY":
+            raise SizingUnavailable("DEPLOYMENT_NOT_DEPLOYABLE", {})
+        if conid not in deployment.conids:
+            raise SizingUnavailable("CONID_NOT_IN_DEPLOYMENT", {})
+        return float(deployment.evidence_order_notional) * (1.0 + LIVE_NOTIONAL_TOLERANCE)
+
+    @staticmethod
+    def _step(code: str, read: Callable[[], Any]) -> Any:
+        try:
+            return read()
+        except SizingUnavailable:
+            raise
+        except Exception as exc:           # a refusal code or the class name, never provider text
+            raise SizingUnavailable(getattr(exc, "code", None) or code, {"error": type(exc).__name__}) from None
+```
+
+`get_sealed` on a discretionary digest raises `DeploymentRefused("DEPLOYMENT_KIND_MISMATCH")` (Plan 3 Ruling 1), which `_step` turns into `SizingUnavailable("DEPLOYMENT_KIND_MISMATCH")`. Plan 3 replaces `_notional_cap` for discretionary deployments.
+
+Wiring: `AiPaperServices` gains `baseline_sizer: Any = None`; `_build_ai_paper_services` builds `AiPaperBaselineSizer(broker=broker, quotes=quotes, history=getattr(trader, "data", None), policy=parts.policy, deployments=deployments, accepted_feeds=accepted_feeds, now=now)` (the same quote authority and feed set as `AiPaperEvidence`). `_build_scoreboard` passes `sizer=None if ai_paper is None else ai_paper.baseline_sizer` and `command_ledger=ledger` (the `CommandLedger` the ai_paper services already use) to `build_scoreboard`, which passes the sizer to `AiIngest` and the ledger to `DecisionStoreFacts`.
+
 
 `principals.py`: replace the comment `# SP1 scoreboard (Plan 5): reads only. verify is for humans; no principal has a scoreboard write.` with `# SP1 scoreboard (Plan 5): reads. verify is for humans. SP2 Plan 2 adds the two ingestion commands below (ai_supervisor only).` and add
 
@@ -945,16 +1303,21 @@ def register_ai_ingest_surface(registry: Any, ingest: Any) -> None:
 ```
 `scoreboard_surface.py` docstring: "Scoreboard reads over typed RPC (SP1 Plan 5 Task 7). Reads only; the ingestion commands are in ai_ingest_surface."
 
+`principals.py` also gains `("query", "get_ai_model_budget"): frozenset({"ai_supervisor"})` (comment: `# SP2 Plan 2: the owner's model cap from trader.yaml; read only, no principal writes it`).
+
 `production_api.py`, right after `register_scoreboard_surface(registry, getattr(trader, 'scoreboard_service', None))`:
 
 ```python
     from trader.messaging.ai_ingest_surface import register_ai_ingest_surface
-    register_ai_ingest_surface(registry, getattr(trader, 'ai_ingest', None))
+    ai_paper_config = getattr(trader, 'ai_paper_config', None)
+    register_ai_ingest_surface(registry, getattr(trader, 'ai_ingest', None),
+                               model_budget=None if ai_paper_config is None
+                               else ai_paper_config.model_budget_usd_per_day)
 ```
 `wiring.py` (`build_scoreboard`): after `service` is built add
 ```python
     ingest = AiIngest(store=store, experiments=reader, decisions=(NullDecisionFacts() if decision_store is None
-                      else DecisionStoreFacts(decision_store)), calendar=calendar, now=now)
+                      else DecisionStoreFacts(decision_store, ledger)), calendar=calendar, now=now, sizer=sizer)
 ```
 and add `ingest: Any = None` to `ScoreboardServices` (set it in the constructor call). `command_stack.py`, next to `trader.scoreboard_service = scoreboard.service`: `trader.ai_ingest = scoreboard.ingest`.
 
@@ -974,11 +1337,24 @@ METHODS = {"record_ai_cost": cost_body, "record_simulated_decision": sim_body}
 
 @pytest.fixture
 def served(store):
-    registry = TypedRpcRegistry(acl=TRADER_ACL, default_execution="thread")
-    register_ai_ingest_surface(registry, make_ingest(store, decisions=FakeDecisions(enter_fact())))
-    stack = ServedStack({("trader", "command"): registry}, make_identities())
+    command = TypedRpcRegistry(acl=TRADER_ACL, default_execution="thread")
+    register_ai_ingest_surface(command, make_ingest(store, decisions=FakeDecisions(enter_fact())))
+    query = TypedRpcRegistry(acl=TRADER_ACL, default_execution="thread")
+    register_ai_ingest_surface(query, None, model_budget=1500.0)
+    stack = ServedStack({("trader", "command"): command, ("trader", "query"): query}, make_identities())
     yield stack
     stack.close()
+
+
+def test_only_ai_supervisor_reads_the_model_budget_and_nobody_writes_it(served):     # review focus 5
+    reply = served.client("ai_supervisor", role="query").call("get_ai_model_budget", {}, dict)
+    assert reply == {"model_budget_usd_per_day": 1500.0, "source": "trader.yaml"}
+    for principal in ("cli", "dashboard", "ai_research"):
+        with pytest.raises(TypedRpcRemoteError) as exc:
+            served.client(principal, role="query").call("get_ai_model_budget", {}, dict)
+        assert exc.value.code == "PERMISSION_DENIED"
+    assert TRADER_ACL[("query", "get_ai_model_budget")] == {"ai_supervisor"}
+    assert not [key for key in TRADER_ACL if key[0] == "command" and "budget" in key[1]]
 
 
 def test_only_ai_supervisor_may_ingest(served):
@@ -1015,8 +1391,65 @@ def test_ingestion_rights_are_exact_and_the_ai_has_no_other_scoreboard_write():
 def test_the_full_production_registry_registers_both_commands():
     from tests.rpc_identity_fixtures import build_full_production_registry
     registered = {(r.socket_role, r.method) for r in build_full_production_registry().registrations()}
-    assert {("command", "record_ai_cost"), ("command", "record_simulated_decision")} <= registered
+    assert {("command", "record_ai_cost"), ("command", "record_simulated_decision"),
+            ("query", "get_ai_model_budget")} <= registered
 ```
+
+`tests/automation/test_ai_baseline_sizing.py` reuses SP1's fixtures (`tests.automation.ai_paper_fixtures`: `snapshot`, `pos`, `quote`, `make_history`, `SnapshotSequence`, `CONID`, `ACCOUNT`, `NOW`) and the `Quotes`, `Margin`, `parts` and `prepare` helpers of `tests/automation/test_ai_paper_evidence.py`. Move `Quotes`, `Margin` and `prepare` into `ai_paper_fixtures.py` and the `parts` fixture into `tests/automation/conftest.py` (create it if missing), so both files share them; `test_ai_paper_evidence.py` then imports them:
+
+```python
+from types import SimpleNamespace
+
+import pytest
+
+from tests.automation.ai_paper_fixtures import ACCOUNT, CONID, NOW, SnapshotSequence, pos, prepare, snapshot
+from trader.automation.ai_baseline_sizing import AiPaperBaselineSizer
+from trader.automation.risk_limits import PAPER_LIMITS
+from trader.scoreboard.ports import SizingUnavailable
+from trader.trading.quote_feeds import LIVE_ONLY_FEEDS
+
+DIGEST = "sha256:" + "d" * 64
+
+
+def deployment(**changes):
+    values = dict(decider_verdict="DEPLOY", conids=(CONID,), evidence_order_notional=1e9)
+    values.update(changes)
+    return SimpleNamespace(**values)
+
+
+def sizer(parts, *, limits=PAPER_LIMITS, dep=None):
+    return AiPaperBaselineSizer(
+        broker=parts["broker"], quotes=parts["quotes"], history=parts["history"],
+        policy=SimpleNamespace(effective_limits=lambda: limits),
+        deployments=SimpleNamespace(get_sealed=lambda digest: dep or deployment()),
+        accepted_feeds=LIVE_ONLY_FEEDS, now=lambda: NOW)
+
+
+def test_baseline_size_equals_the_real_entry_size_when_gross_binds(parts):          # review focus 7
+    # 30,000 held in another conid on 1,000,000 equity: the 6 % gross bound leaves (60,000 - 30,000) / 100.10
+    # = 299 shares, below the 5 % position bound (499). SP1's prepare_entry and the sizer must agree on 299.
+    held = [pos(conid=CONID + 1, quantity=300.0)]
+    parts["broker"] = SnapshotSequence(snapshot(positions=held))
+    real = prepare(parts, notional=1e9).quantity                  # SP1's own ENTER sizing (prepare_entry)
+    parts["broker"] = SnapshotSequence(snapshot(positions=held))
+    sized = sizer(parts).size(account_id=ACCOUNT, deployment_digest=DIGEST, conid=CONID,
+                              reference_price=100.0, stop_price=98.0)
+    assert sized.quantity == real == 299
+    assert sized.inputs["max_quantity"] == real and sized.inputs["feed"] == "live"
+
+
+@pytest.mark.parametrize("change,code", [
+    (dict(dep=deployment(decider_verdict="SHADOW")), "DEPLOYMENT_NOT_DEPLOYABLE"),
+    (dict(dep=deployment(conids=(1,))), "CONID_NOT_IN_DEPLOYMENT"),
+])
+def test_a_deployment_a_real_enter_could_not_use_cannot_size(parts, change, code):
+    with pytest.raises(SizingUnavailable) as exc:
+        sizer(parts, **change).size(account_id=ACCOUNT, deployment_digest=DIGEST, conid=CONID,
+                                    reference_price=100.0, stop_price=98.0)
+    assert exc.value.code == code
+```
+
+**Also write these tests** (each asserts what its name says): `test_no_quote_or_a_feed_outside_the_accepted_set_cannot_size` (`Quotes(None)` → `QUOTE_UNAVAILABLE`; a `quote(feed_type="iex_realtime")` with `LIVE_ONLY_FEEDS` → `QUOTE_FEED_NOT_ACCEPTED`; the same quote with `PAPER_IEX_FEEDS` sizes), `test_full_pending_slots_cannot_size` (`MAX_PENDING_ENTRIES`), `test_limits_leaving_less_than_one_share_cannot_size` (`QUANTITY_BELOW_ONE_SHARE` with the inputs recorded), `test_no_effective_limits_cannot_size` (`effective_limits` raising `PolicyRefused("NO_EFFECTIVE_LIMITS")`), `test_the_sizer_writes_nothing` (journal row count and high-water mark unchanged, no `capture_approval_context` call).
 
 `ServedStack.client(caller, server="trader", role="query", ...)` takes the socket role as the keyword `role`. Replace `test_ai_principals_have_no_write_path_to_scoreboard_tables` in `test_surface.py` with the same test for `ai_research` only (`for principal in ("ai_research",)`); the exact `ai_supervisor` set is asserted in `test_ingestion_rights_are_exact_and_the_ai_has_no_other_scoreboard_write`.
 
@@ -1024,8 +1457,8 @@ def test_the_full_production_registry_registers_both_commands():
 
 - [ ] **Step 2: Run, expect failure** `.venv/bin/python -m pytest tests/scoreboard/test_ingest_surface.py -q --timeout=30`.
 - [ ] **Step 3: Implement** the edits above.
-- [ ] **Step 4: Run** `.venv/bin/python -m pytest tests/scoreboard/test_ingest_surface.py tests/scoreboard/test_surface.py tests/scoreboard/test_wiring.py -q --timeout=30` → pass.
-- [ ] **Step 5: Commit** `feat: add ai_supervisor-only cost and simulated decision commands`.
+- [ ] **Step 4: Run** `.venv/bin/python -m pytest tests/scoreboard/test_ingest_surface.py tests/scoreboard/test_surface.py tests/scoreboard/test_wiring.py tests/automation/test_ai_baseline_sizing.py tests/automation/test_ai_paper_evidence.py tests/automation/test_ai_paper_config.py -q --timeout=30` → pass.
+- [ ] **Step 5: Commit** `feat: add ai_supervisor-only ingestion commands, baseline sizing and the model budget read`.
 
 ---
 
@@ -2088,6 +2521,16 @@ def test_incomplete_book_does_not_hide_complete_books(scoreboard, world, world_i
     assert books[("no_trade.v1", "self_found")]["status"] == "COMPLETE"
 
 
+def test_an_incomplete_baseline_is_counted_not_hidden(scoreboard, world, world_ingest):
+    from tests.scoreboard.ingest_world import incomplete_body
+    seed_three_books(world_ingest)
+    sim(world_ingest, incomplete_body("quote_unavailable"))                 # a follow_signal without a quote
+    run(world, [FakeSource("alpaca", minute_bars(SESSION, QUIET, 101.0))], dt.timedelta(minutes=1))
+    follow = books_of(scoreboard)[("follow_signal.v1", "strategy_signal")]
+    assert (follow["status"], follow["records"], follow["complete"], follow["incomplete"]) == ("INCOMPLETE", 2, 1, 1)
+    assert follow["incomplete_reasons"] == {"quote_unavailable": 1} and follow["known_pnl_usd"] == 10.0
+
+
 def test_nothing_in_the_report_adds_books_together(scoreboard, world, world_ingest):
     seed_three_books(world_ingest)
     run(world, [FakeSource("alpaca", minute_bars(SESSION, QUIET, 101.0))], dt.timedelta(minutes=1))
@@ -2148,5 +2591,6 @@ The cost test in this file needs `cost(...)` calls whose corrected records repea
 ## Self-review
 
 - Spec 6.3, 6.8, 7 are covered by Tasks 1–3 (ingestion), 4–5 (simulator), 6–7 (books and cost labels in report, readback, CLI, dashboard). The owner update (no legacy data, in-place edits, plain CREATEs) is applied in Task 1.
-- Names are the same in every task and in Cross-plan additions: `record_id`, `body_digest`, `correction_seq`, `AiIngest`, `IngestRefused`, `ingest_sealed_many`, `SessionSimulator`.
+- Names are the same in every task and in Cross-plan additions: `record_id`, `body_digest`, `correction_seq`, `AiIngest`, `IngestRefused`, `ingest_sealed_many`, `SessionSimulator`, `incomplete_reason`, `linked_round_trip_id`, `deployment_digest`, `BaselineSizer`, `get_ai_model_budget`.
+- PR #75 review answers: the decision link checks the experiment (Ruling 5), incomplete baselines are stored incomplete (Ruling 18), the two sized baselines take the trader's SP1 size (Ruling 19), the owner cap is served from `trader.yaml` (Ruling 20), matched-entry is one record per close (Ruling 21).
 - Each Review Focus line names a test that exists in Tasks 1–8.

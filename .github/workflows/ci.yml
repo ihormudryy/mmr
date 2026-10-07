@@ -33,7 +33,84 @@ jobs:
       - run: uv python install 3.12.13
       - run: uv sync --python 3.12.13 --frozen --extra test
       - run: uv run --frozen python -c 'import platform; assert platform.python_version() == "3.12.13"'
-      - run: uv run --frozen pytest $(uv run --frozen python scripts/ci_test_shard.py ${{ matrix.shard }} 8) --timeout=30 --timeout-method=thread -q
+      - name: Run tests
+        if: github.event_name != 'push'
+        run: uv run --frozen pytest $(uv run --frozen python scripts/ci_test_shard.py ${{ matrix.shard }} 8) --timeout=30 --timeout-method=thread -q
+      - name: Run tests with coverage (master only)
+        if: github.event_name == 'push'
+        env:
+          COVERAGE_FILE: .coverage.shard${{ matrix.shard }}
+        run: uv run --frozen pytest $(uv run --frozen python scripts/ci_test_shard.py ${{ matrix.shard }} 8) --cov --cov-report= --timeout=30 --timeout-method=thread -q
+      - name: Upload coverage data
+        if: github.event_name == 'push' && !cancelled()
+        uses: actions/upload-artifact@v4
+        with:
+          name: coverage-${{ matrix.shard }}
+          path: .coverage.shard${{ matrix.shard }}*
+          include-hidden-files: true
+          if-no-files-found: error
+
+  coverage:
+    # Master only. Merges the shard data and publishes a shields.io endpoint
+    # file on the orphan `badges` branch, which the README badge reads.
+    name: Coverage badge
+    runs-on: ubuntu-latest
+    needs: test-shard
+    if: github.event_name == 'push'
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v7
+      - uses: astral-sh/setup-uv@v7
+        with:
+          enable-cache: true
+      - run: uv python install 3.12.13
+      - run: uv sync --python 3.12.13 --frozen --extra test
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: coverage-*
+          path: coverage-data
+          merge-multiple: true
+      - name: Combine and report
+        run: |
+          uv run --frozen coverage combine coverage-data/
+          uv run --frozen coverage report
+          total=$(uv run --frozen coverage report --format=total)
+          echo "TOTAL=$total" >> "$GITHUB_ENV"
+      - name: Write badge file
+        run: |
+          mkdir -p badge-out
+          python3 - <<'PY'
+          import json, os
+          pct = int(os.environ["TOTAL"])
+          color = "red" if pct < 50 else "yellow" if pct < 70 else "green"
+          badge = {"schemaVersion": 1, "label": "coverage", "message": f"{pct}%", "color": color}
+          with open("badge-out/coverage.json", "w") as f:
+              json.dump(badge, f)
+          PY
+          cat badge-out/coverage.json
+      - name: Publish to the badges branch
+        run: |
+          set -euo pipefail
+          repo_url="https://x-access-token:${{ github.token }}@github.com/${{ github.repository }}.git"
+          rm -rf badges-checkout
+          if git ls-remote --exit-code --heads "$repo_url" badges >/dev/null 2>&1; then
+            git clone --depth 1 --branch badges "$repo_url" badges-checkout
+          else
+            git init -b badges badges-checkout
+            git -C badges-checkout remote add origin "$repo_url"
+          fi
+          cp badge-out/coverage.json badges-checkout/coverage.json
+          cd badges-checkout
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add coverage.json
+          if git diff --cached --quiet; then
+            echo "Badge unchanged."
+            exit 0
+          fi
+          git commit -m "chore: update coverage badge to ${TOTAL}%"
+          git push origin badges
 
   test:
     # Keeps the old check name, so one green "Test suite" still means every shard passed.

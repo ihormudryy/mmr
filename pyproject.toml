@@ -85,6 +85,7 @@ test = [
     "pytest-mock>=3.16.0",
     "pytest-timeout>=2.3",
     "hypothesis>=6.168.3",
+    "pytest-cov>=6.0",
 ]
 streaming = [
     "websocket-client>=1.9.2",
@@ -137,6 +138,15 @@ markers = [
 # which is what made CI jobs hang until the runner killed them (~4:30).
 timeout = 30
 timeout_method = "thread"
+
+[tool.coverage.run]
+source = ["trader", "web", "pycron"]
+branch = false
+parallel = true
+omit = ["*/tests/*", "*/__pycache__/*"]
+
+[tool.coverage.report]
+skip_empty = true
 
 [tool.isort]
 multi_line_output = 3

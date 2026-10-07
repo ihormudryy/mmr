@@ -10,6 +10,7 @@
 
 <p align="center">
   <a href="https://github.com/ihormudryy/mmr/actions/workflows/ci.yml"><img src="https://github.com/ihormudryy/mmr/actions/workflows/ci.yml/badge.svg?branch=master" alt="CI"></a>
+  <a href="https://github.com/ihormudryy/mmr/actions/workflows/ci.yml"><img src="https://img.shields.io/endpoint?url=https://raw.githubusercontent.com/ihormudryy/mmr/badges/coverage.json" alt="Coverage"></a>
   <a href="https://github.com/ihormudryy/mmr/releases"><img src="https://img.shields.io/github/v/release/ihormudryy/mmr?include_prereleases&sort=semver" alt="Release"></a>
   <img src="https://img.shields.io/badge/python-3.12-blue" alt="Python 3.12">
   <a href="LICENSE.md"><img src="https://img.shields.io/badge/license-Apache%202.0%20%2B%20Commons%20Clause-lightgrey" alt="License"></a>

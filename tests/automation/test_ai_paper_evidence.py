@@ -2,63 +2,20 @@
 from __future__ import annotations
 
 import dataclasses
-from decimal import Decimal
 from types import SimpleNamespace
 
 import pytest
 
 from tests.automation.ai_paper_fixtures import (
-    ACCOUNT, CONID, NOW, FakeUniverse, SnapshotSequence, make_history, make_journal, order, pos, quote,
-    secdef, snapshot,
+    ACCOUNT, CONID, GOOD_MARGIN, SESSION, FakeUniverse, Margin, Quotes, SnapshotSequence, order, pos, prepare,
+    quote, secdef, snapshot,
 )
-from trader.automation.ai_paper_evidence import AiPaperEvidence
 from trader.automation.ai_paper_filter import AiEntryFilter
 from trader.automation.ai_paper_sizing import max_entry_quantity, sizing_inputs
 from trader.automation.risk_limits import PAPER_LIMITS
 from trader.promotion.canary_risk import CanaryRiskStore
 from trader.trading.approval_context import ApprovalContextError, EntryLimitsEvidence
 from trader.trading.trading_filter import TradingFilter, TradingFilterError
-
-SESSION = SimpleNamespace(anchor=1_000_000.0)
-GOOD_MARGIN = {"initMarginAfter": 5_000.0, "equityWithLoanAfter": 995_000.0}
-
-
-class Quotes:
-    def __init__(self, value=None):
-        self.value = quote() if value is None else value
-
-    def executable_quote(self, conid, *, side):
-        return self.value
-
-
-class Margin:
-    def __init__(self, response=GOOD_MARGIN, error=None):
-        self.response, self.error = response, error
-
-    def what_if_margin(self, conid, side, quantity):
-        if self.error is not None:
-            raise self.error
-        return self.response
-
-
-@pytest.fixture
-def parts(tmp_path):
-    return dict(
-        broker=SnapshotSequence(snapshot()), quotes=Quotes(), margin=Margin(),
-        history=make_history(str(tmp_path / "history.duckdb")),
-        journal=make_journal(str(tmp_path / "journal.duckdb")),
-        account_id=ACCOUNT, account_mode="paper", now=lambda: NOW, max_drift_bps=50.0,
-        entry_offset_bps=Decimal("10"),
-        entry_filter=AiEntryFilter(universe=FakeUniverse({CONID: secdef()}), load_filter=TradingFilter),
-    )
-
-
-def prepare(parts, **changes):
-    args = dict(conid=CONID, stop_price=98.0, requested_quantity=None, limits=PAPER_LIMITS,
-                session=SESSION, notional=1e9, experiment_id="exp1")
-    args.update(changes)
-    return AiPaperEvidence(**parts).prepare_entry(**args)
-
 
 def test_factory_captures_snapshot_quote_margin_hwm_and_liquidity(parts):
     prepared = prepare(parts)

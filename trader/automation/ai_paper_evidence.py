@@ -67,6 +67,25 @@ def _positive(value: Any, code: str) -> float:
     return number
 
 
+def check_paper_binding(account_mode: str, account_id: Any) -> None:
+    """An ai_paper entry needs a paper account (mode ``paper``, a ``DU`` account id)."""
+    if account_mode != "paper" or not isinstance(account_id, str) or not account_id.startswith("DU"):
+        raise _refuse("PAPER_ONLY", "ai_paper requires a paper account")
+
+
+def validate_entry_snapshot(snapshot: Any, account_id: str) -> Any:
+    """The broker capture an ai_paper entry may size on: this paper account, a complete fence, a positive NLV."""
+    if snapshot.account_id != account_id:
+        raise _refuse("ACCOUNT_MISMATCH", "broker account does not match")
+    if snapshot.account_mode != "paper":
+        raise _refuse("PAPER_ONLY", "broker is not in paper mode")
+    if (type(snapshot.generation_id) is not int or snapshot.generation_id <= 0
+            or type(snapshot.source_cursor) is not int or snapshot.source_cursor < 0):
+        raise _refuse("BROKER_FENCE_INVALID", "complete broker fence is required")
+    _positive(snapshot.net_liquidation, "BROKER_EVIDENCE_INVALID")
+    return snapshot
+
+
 def check_margin(approval: ApprovalContext) -> None:
     """R11: an ai_paper entry needs a valid what-if; a missing or invalid one refuses."""
     if approval.what_if is None:
@@ -153,9 +172,7 @@ class AiPaperEvidence:
                           accepted_feeds=self._accepted_feeds)
 
     def _check_binding(self) -> None:
-        if (self._account_mode != "paper" or not isinstance(self._account_id, str)
-                or not self._account_id.startswith("DU")):
-            raise _refuse("PAPER_ONLY", "ai_paper requires a paper account")
+        check_paper_binding(self._account_mode, self._account_id)
 
     def _capture(self) -> Any:
         try:
@@ -163,15 +180,7 @@ class AiPaperEvidence:
         except Exception:
             # Provider text is opaque and may carry credentials.
             raise _refuse("EVIDENCE_UNAVAILABLE", "broker snapshot capture failed") from None
-        if snapshot.account_id != self._account_id:
-            raise _refuse("ACCOUNT_MISMATCH", "broker account does not match")
-        if snapshot.account_mode != "paper":
-            raise _refuse("PAPER_ONLY", "broker is not in paper mode")
-        if (type(snapshot.generation_id) is not int or snapshot.generation_id <= 0
-                or type(snapshot.source_cursor) is not int or snapshot.source_cursor < 0):
-            raise _refuse("BROKER_FENCE_INVALID", "complete broker fence is required")
-        _positive(snapshot.net_liquidation, "BROKER_EVIDENCE_INVALID")
-        return snapshot
+        return validate_entry_snapshot(snapshot, self._account_id)
 
     def _quote(self, conid: int) -> Any:
         try:

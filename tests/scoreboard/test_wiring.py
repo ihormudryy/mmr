@@ -173,13 +173,31 @@ def test_kill_alert_without_telegram_is_logged_no_outbox(prod_stack):
     assert stack.experiments.monitor._alerts is None and stack.experiments.monitor._session_end is not None
 
 
+def test_ingest_reads_enter_sizes_from_the_command_ledger_and_sizes_with_sp1(prod_stack):    # SP2 Plan 2
+    from trader.automation.ai_baseline_sizing import AiPaperBaselineSizer
+    from trader.scoreboard.ports import DecisionStoreFacts
+    from trader.trading.command_coordinator import CommandLedger
+    trader, stack = prod_stack
+    ingest = trader.ai_ingest
+    assert ingest is stack.scoreboard.ingest
+    assert isinstance(ingest._decisions, DecisionStoreFacts) and isinstance(ingest._decisions._ledger, CommandLedger)
+    assert isinstance(ingest._sizer, AiPaperBaselineSizer) and ingest._sizer is stack.ai_paper.baseline_sizer
+    from trader.scoreboard.close_fills import JournalCloseFills
+    from trader.scoreboard.ports import DecisionStoreCloseLinks
+    close_fills = stack.scoreboard.close_fills
+    assert isinstance(close_fills, JournalCloseFills) and isinstance(close_fills._links, DecisionStoreCloseLinks)
+    assert close_fills._executions == stack.scoreboard.ledger.trip_executions
+    assert stack.scoreboard.simulator._close_fills is close_fills
+
+
 def test_scoreboard_tables_live_in_the_journal_db_not_the_research_db(prod_stack):
     trader, _stack = prod_stack
     tables = {r[0] for r in trader.journal_db.execute(
         "SELECT table_name FROM information_schema.tables", fetch="all")}
-    assert {"equity_daily", "round_trips", "benchmark_prices", "ai_costs", "simulated_books", "telegram_outbox",
+    assert {"equity_daily", "round_trips", "benchmark_prices", "ai_costs", "simulated_decisions", "simulated_outcomes",
+            "telegram_outbox",
             "scoreboard_seals", "scoreboard_incidents"} <= tables
-    assert {60, 61, 62, 63, 64} <= {r[0] for r in trader.journal_db.execute(
+    assert {60, 61, 62, 63, 64, 95, 96} <= {r[0] for r in trader.journal_db.execute(
         "SELECT version FROM schema_migrations", fetch="all")}
 
 
@@ -193,3 +211,15 @@ def test_a_sender_failure_never_blocks_the_tick_or_the_session_controller(telegr
     stack.scoreboard.tick()
     stack.session_controller._notify_terminal(_flat_state())
     assert "telegram drain failed" in caplog.text and len(_rows(trader, "equity_daily")) == 1
+
+
+def test_the_tick_runs_the_simulator_and_survives_its_failure(prod_stack, caplog):
+    _trader_, stack = prod_stack
+    calls = []
+
+    def boom():
+        calls.append("simulate")
+        raise RuntimeError("bars down")
+    stack.scoreboard.simulator.run_due = boom
+    stack.scoreboard.tick()                       # must not raise
+    assert calls == ["simulate"] and "scoreboard simulation failed" in caplog.text

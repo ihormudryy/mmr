@@ -1,4 +1,5 @@
-"""Scoreboard reads over typed RPC (SP1 Plan 5 Task 7). Reads only; no AI principal can write."""
+"""Scoreboard reads over typed RPC (SP1 Plan 5 Task 7). Reads only; the ingestion commands are in
+ai_ingest_surface."""
 from __future__ import annotations
 
 import re

@@ -133,10 +133,14 @@ TRADER_ACL: Mapping[tuple[str, str], frozenset[str]] = {
     ("command", "resume_experiment"): frozenset({"cli", "dashboard"}),
     ("command", "stop_experiment"): frozenset({"cli", "dashboard"}),
     ("query", "get_experiment"): frozenset({"cli", "dashboard", "ai_supervisor"}),
-    # SP1 scoreboard (Plan 5): reads only. verify is for humans; no principal has a scoreboard write.
+    # SP1 scoreboard (Plan 5): reads. verify is for humans. SP2 Plan 2 adds the two ingestion commands below (ai_supervisor only).
     ("query", "get_scoreboard"): frozenset({"cli", "dashboard", "ai_supervisor"}),
     ("query", "verify_scoreboard"): frozenset({"cli", "dashboard"}),
     ("query", "get_experiment_trips"): frozenset({"cli", "dashboard", "ai_supervisor"}),
+    ("command", "record_ai_cost"): frozenset({"ai_supervisor"}),
+    ("command", "record_simulated_decision"): frozenset({"ai_supervisor"}),
+    # SP2 Plan 2: the owner's model cap from trader.yaml; read only, no principal writes it
+    ("query", "get_ai_model_budget"): frozenset({"ai_supervisor"}),
     # SP1 acceptance (Plan 6): reads for the harness and the operator. Explicit sets per method.
     ("query", "get_acceptance_preflight"): frozenset({"cli", "dashboard", "ai_supervisor"}),
     ("query", "get_broker_order_evidence"): frozenset({"cli", "dashboard", "ai_supervisor"}),

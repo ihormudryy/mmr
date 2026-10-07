@@ -20,7 +20,8 @@ def report(end_state="FLAT", **account):
                     "sessions": 1, **account},
         "benchmarks": {"spy": {"return_pct": None, "label": "SPY price only; dividends excluded"},
                        "vs_spy_pp": None, "ai_costs_status": "UNAVAILABLE", "ai_cost_usd": None,
-                       "pnl_minus_ai_cost_usd": None},
+                       "pnl_minus_ai_cost_usd": None,
+                       "ai_cost": {"status": "NONE", "total_usd": None, "unknown_calls": 0}, "books": []},
         "trips": {"closed": 0, "open": 0},
         "sessions": [{"date": D.isoformat(), "end_state": end_state, "return_pct": None, "end_nlv_usd": None,
                       "realized_pnl_usd": 0.0, "commissions_usd": None, "trade_count": 0, "open_positions": None}],
@@ -33,6 +34,15 @@ def test_summary_has_paper_label_end_state_and_unknowns_as_dash():
     assert "PAPER" in text and "return -" in text and "fees -" in text
     assert "None" not in text and "nan" not in text.lower() and "proof of live edge" in text
     assert "realized $0.00" in text
+
+
+def test_summary_labels_estimated_cost_and_counts_incomplete_books():
+    data = report()
+    data["benchmarks"]["ai_costs_status"] = "AVAILABLE"
+    data["benchmarks"]["ai_cost"] = {"status": "ESTIMATED", "total_usd": 2.0, "unknown_calls": 0}
+    data["benchmarks"]["books"] = [{"status": "COMPLETE"}, {"status": "INCOMPLETE"}]
+    text = format_daily_summary(data, D)
+    assert "$2.00 (estimated; 0 unknown call(s))" in text and "Baselines: 2 books, 1 not complete" in text
 
 
 @pytest.mark.parametrize("state", ["FLAT", "KILLED", "FAILED_SAFE"])

@@ -9,7 +9,7 @@ import datetime as dt
 import decimal
 import logging
 import math
-from typing import Any, Callable, Mapping, Sequence
+from typing import Any, Callable, Mapping, Optional, Sequence
 
 from trader.scoreboard.seal import GENESIS, chain_digest, row_digest
 
@@ -20,8 +20,9 @@ SEALED_TABLES: dict[str, tuple[str, ...]] = {
     "equity_adjustments": ("adjustment_id",),
     "benchmark_versions": ("version",),
     "benchmark_prices": ("version", "bar_date"),
-    "ai_costs": ("call_id",),
-    "simulated_books": ("book_id",),
+    "ai_costs": ("record_id",),
+    "simulated_decisions": ("record_id",),
+    "simulated_outcomes": ("record_id",),
 }
 WORKING_TABLES: dict[str, tuple[str, ...]] = {
     "round_trips": ("opened_at", "round_trip_id"),
@@ -35,6 +36,14 @@ _ORDER = {**SEALED_TABLES, **WORKING_TABLES}
 
 class ScoreboardConflict(Exception):
     """A sealed row with this key exists already; sealed rows are never replaced."""
+
+
+class IngestRefused(Exception):
+    """An ingestion command was understood but refused; ``code`` is the stable reason."""
+
+    def __init__(self, code: str, detail: str, *, retryable: bool = False):
+        super().__init__(f"{code}: {detail}")
+        self.code, self.detail, self.retryable = code, detail, retryable
 
 
 def row_key(row: Mapping[str, Any], key_columns: Sequence[str]) -> str:
@@ -117,33 +126,68 @@ class ScoreboardStore:
 
     def insert_sealed_many(self, items: Sequence[tuple[str, Mapping[str, Any]]]) -> None:
         """Every row and its seal in one transaction: all are written or none."""
+        prepared = self._prepare_items(items)
+        sealed_at = self._now()
+        self._db.transaction(lambda conn: self._insert_prepared_in_tx(conn, prepared, sealed_at))
+
+    def ingest_sealed_many(self, items: Sequence[tuple[str, Mapping[str, Any]]], *,
+                           extend: Optional[Callable[[Any], Mapping[str, Any]]] = None) -> str:
+        """Insert-or-recognise: the first item is the primary row and carries ``body_digest``.
+
+        Inside one transaction: a row with the same key and the same digest is a DUPLICATE (nothing is
+        written); the same key with another digest raises ``ScoreboardConflict``. Otherwise ``extend`` may
+        check other rows and add columns, then every row and its seal are written together.
+        """
+        table, row = items[0]
+        if table not in SEALED_TABLES:
+            raise ValueError(f"{table!r} is not a sealed scoreboard table")
+        key_columns = SEALED_TABLES[table]
+        for name, _row in items:
+            self.columns(name)      # warm the cache: inside the transaction the database lock is held
+        sealed_at = self._now()
+        where = " AND ".join(f"{column} = ?" for column in key_columns)
+
+        def tx(conn):
+            found = conn.execute(f"SELECT body_digest FROM {table} WHERE {where}",
+                                 [row[c] for c in key_columns]).fetchone()
+            if found is not None:
+                if found[0] == row["body_digest"]:
+                    return "DUPLICATE"
+                raise ScoreboardConflict(f"{table} row {row_key(row, key_columns)} exists with a different body")
+            extra = {} if extend is None else dict(extend(conn))
+            prepared = self._prepare_items([(table, {**row, **extra}), *items[1:]])
+            self._insert_prepared_in_tx(conn, prepared, sealed_at)
+            return "INSERTED"
+        return self._db.transaction(tx)
+
+    def _prepare_items(self, items: Sequence[tuple[str, Mapping[str, Any]]]) -> list[tuple]:
         prepared = []
         for table, row in items:
             if table not in SEALED_TABLES:
                 raise ValueError(f"{table!r} is not a sealed scoreboard table")
             values = self.prepare(table, row)
             prepared.append((table, values, row_key(values, SEALED_TABLES[table]), row_digest(values)))
-        sealed_at = self._now()
+        return prepared
 
-        def tx(conn):
-            last = conn.execute(
-                "SELECT seal_id, chain FROM scoreboard_seals ORDER BY seal_id DESC LIMIT 1").fetchone()
-            seal_id, prev = (0, GENESIS) if last is None else (int(last[0]), last[1])
-            for table, values, key, digest in prepared:
-                key_columns = SEALED_TABLES[table]
-                where = " AND ".join(f"{column} = ?" for column in key_columns)
-                if conn.execute(f"SELECT 1 FROM {table} WHERE {where}",
-                                [values[c] for c in key_columns]).fetchone() is not None:
-                    raise ScoreboardConflict(f"{table} row {key} exists already")
-                names = list(values)
-                conn.execute(f"INSERT INTO {table} ({', '.join(names)}) VALUES ({', '.join('?' for _ in names)})",
-                             [values[name] for name in names])
-                seal_id, chain = seal_id + 1, chain_digest(prev, table, key, digest)
-                conn.execute(
-                    "INSERT INTO scoreboard_seals (seal_id, table_name, row_key, row_digest, prev_chain, chain, "
-                    "sealed_at) VALUES (?, ?, ?, ?, ?, ?, ?)", [seal_id, table, key, digest, prev, chain, sealed_at])
-                prev = chain
-        self._db.transaction(tx)
+    @staticmethod
+    def _insert_prepared_in_tx(conn: Any, prepared: Sequence[tuple], sealed_at: dt.datetime) -> None:
+        last = conn.execute(
+            "SELECT seal_id, chain FROM scoreboard_seals ORDER BY seal_id DESC LIMIT 1").fetchone()
+        seal_id, prev = (0, GENESIS) if last is None else (int(last[0]), last[1])
+        for table, values, key, digest in prepared:
+            key_columns = SEALED_TABLES[table]
+            where = " AND ".join(f"{column} = ?" for column in key_columns)
+            if conn.execute(f"SELECT 1 FROM {table} WHERE {where}",
+                            [values[c] for c in key_columns]).fetchone() is not None:
+                raise ScoreboardConflict(f"{table} row {key} exists already")
+            names = list(values)
+            conn.execute(f"INSERT INTO {table} ({', '.join(names)}) VALUES ({', '.join('?' for _ in names)})",
+                         [values[name] for name in names])
+            seal_id, chain = seal_id + 1, chain_digest(prev, table, key, digest)
+            conn.execute(
+                "INSERT INTO scoreboard_seals (seal_id, table_name, row_key, row_digest, prev_chain, chain, "
+                "sealed_at) VALUES (?, ?, ?, ?, ?, ?, ?)", [seal_id, table, key, digest, prev, chain, sealed_at])
+            prev = chain
 
     # -- the round-trip projection -------------------------------------------
 

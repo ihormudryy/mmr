@@ -3442,12 +3442,22 @@ def _scoreboard_lines(report: dict) -> list:
     spy = bench['spy']
     lines.append(f"SPY return: {_dash(spy['return_pct'], '{:.2f}', '%')} from the {spy['base_date'] or '-'} close "
                  f"({spy['label']})   vs SPY: {_dash(bench['vs_spy_pp'], '{:+.2f}', ' pp')}")
-    simulated = bench['simulated']
-    lines.append('simulated baseline (simulated): ' + (
-        'unavailable' if simulated['status'] == 'UNAVAILABLE'
-        else f"{simulated['rows']} rows, P&L {_dash(simulated['pnl_usd'], '${:,.2f}')}"))
-    ai_cost = ('unavailable' if bench['ai_costs_status'] == 'UNAVAILABLE'
-               else f"{_dash(bench['ai_cost_usd'], '${:,.2f}')} over {bench['ai_calls']} calls")
+    books = bench['books']
+    lines.append('simulated baselines (one book each, never summed; '
+                 + (books[0]['pnl_basis'] if books else 'none yet') + ')')
+    for book in books:
+        detail = (f"P&L {_dash(book['pnl_usd'], '${:,.2f}')}" if book['status'] == 'COMPLETE' else
+                  f"P&L - (known so far {_dash(book['known_pnl_usd'], '${:,.2f}')} from {book['complete']} of "
+                  f"{book['records']} records)")
+        reasons = ''.join(f"; {reason} x{count}" for reason, count in book['incomplete_reasons'].items())
+        lines.append(f"  {book['baseline_id']} / {book['cohort']} (simulated): {book['status']}, "
+                     f"{book['records']} records, {detail}{reasons}")
+    cost = bench['ai_cost']
+    ai_cost = ('unavailable' if cost['status'] == 'NONE' else
+               f"{_dash(cost['total_usd'], '${:,.2f}')} {cost['status'].lower()} "
+               f"(confirmed {_dash(cost['confirmed_usd'], '${:,.2f}')}, estimated "
+               f"{_dash(cost['estimated_usd'], '${:,.2f}')}, unknown calls {cost['unknown_calls']}, "
+               f"{cost['calls']} calls)")
     lines.append(f"AI cost: {ai_cost}   P&L minus AI cost: {_dash(bench['pnl_minus_ai_cost_usd'], '${:,.2f}')}")
     lines.append(f"trips: {trips['closed']} closed, {trips['open']} open, win rate "
                  f"{_dash(trips['win_rate'], '{:.0%}')}, profit factor {_dash(trips['profit_factor'], '{:.2f}')}, "

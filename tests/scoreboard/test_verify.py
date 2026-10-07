@@ -4,9 +4,9 @@ import pytest
 
 from tests.scoreboard.common import ACCOUNT, NOW
 from tests.scoreboard.fills import set_commission
+from tests.scoreboard.ingest_world import cost, make_ingest, sim
 from tests.scoreboard.ledger_world import CAL, D, D_NEXT, END, END2
 from trader.scoreboard.benchmark import BenchmarkBook
-from trader.scoreboard.inputs import record_ai_cost, record_simulated_row
 from trader.scoreboard.ports import AttributionLinks, SessionEnd
 from trader.scoreboard.service import ScoreboardService
 
@@ -68,15 +68,16 @@ def test_edited_equity_row_is_detected(service, db):
     ("equity_adjustments", "UPDATE equity_adjustments SET amount_usd = amount_usd + 1"),
     ("benchmark_prices", "UPDATE benchmark_prices SET close = close + 1"),
     ("ai_costs", "UPDATE ai_costs SET cost_usd = 9"),
-    ("simulated_books", "UPDATE simulated_books SET pnl_usd = 9"),
+    ("simulated_decisions", "UPDATE simulated_decisions SET quantity = 99"),
+    ("simulated_outcomes", "UPDATE simulated_outcomes SET pnl_usd = 9"),
 ])
 def test_edited_adjustment_benchmark_ai_cost_and_simulated_rows_are_detected(service, world, db, table, sql):
+    from tests.scoreboard.ingest_world import no_trade_body
     set_commission(db, ACCOUNT, "e2", 1.30)
     service.refresh()
-    record_ai_cost(world.store, call_id="c1", provider="p", model="m", input_tokens=1, output_tokens=1,
-                   cost_usd=0.1, called_at=NOW, served_kind="job", served_id="j")
-    record_simulated_row(world.store, book_id="b1", experiment_id=world.experiments.record.experiment_id,
-                         session_date=D, baseline="b", pnl_usd=1.0, trades=1)
+    ingest = make_ingest(world.store)
+    cost(ingest)
+    sim(ingest, no_trade_body())
     assert service.verify()["ok"] is True
     db.execute(sql)
     result = service.verify()

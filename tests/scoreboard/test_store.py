@@ -23,7 +23,7 @@ def _three_days(store):
 def test_migrations_are_idempotent_and_in_range(migrator):
     assert apply_scoreboard_migrations(migrator) is True
     assert apply_scoreboard_migrations(migrator) is False
-    assert {v for v in migrator.applied_versions() if v >= 60} == {60, 61, 62, 63, 64}
+    assert {v for v in migrator.applied_versions() if v >= 60} == {60, 61, 62, 63, 64, 95, 96}
 
 
 def test_sealed_insert_roundtrips_nulls_as_null(store):
@@ -79,7 +79,9 @@ def test_tampering_is_detected(store, db, sql, check):
 
 
 def test_row_without_a_seal_is_detected(store, db):
-    db.execute("INSERT INTO ai_costs VALUES ('c1', NULL, 'p', 'm', 1, 1, 0.1, now(), 'job', 'j1')")
+    db.execute("INSERT INTO ai_costs (record_id, experiment_id, role, provider, model, attempt_id, cost_usd, "
+               "cost_status, called_at, served_kind, served_id, correction_seq, body_digest, recorded_at) VALUES "
+               "('c1', 'e', 'jev', 'p', 'm', 'a1', 0.1, 'confirmed', now(), 'cycle', 'j1', 0, 'x', now())")
     assert "ROW_UNSEALED" in {m["check"] for m in store.verify_seals()}
 
 

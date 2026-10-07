@@ -20,10 +20,11 @@ logger = logging.getLogger(__name__)
 SUPPORTED_STYLES = frozenset({"intraday_long"})
 KILL_BASES = ("start", "peak")
 OUTAGE_PAUSE_RANGE = (60, 3600)
+DEFAULT_MODEL_BUDGET_USD_PER_DAY = 2000.0
 _REFUSED_ENV_PREFIXES = ("AI_PAPER", "MMR_AI_PAPER")
 _PARSED_KEYS = (
     "enabled", "styles", "limits_ceiling", "experiment_kill_drawdown_pct", "experiment_kill_basis",
-    "broker_outage_pause_seconds", "acceptance_probe",
+    "broker_outage_pause_seconds", "acceptance_probe", "model_budget_usd_per_day",
 )
 _RAW_ONLY_KEYS = ("telegram",)  # parsed by Plan 5
 
@@ -41,6 +42,8 @@ class AiPaperConfig:
     experiment_kill_basis: Literal["start", "peak"] = "start"
     broker_outage_pause_seconds: int = 300
     acceptance_probe: bool = False
+    # SP2 Plan 2 Ruling 20: the owner's cap on model spend per New York day; served read-only to the ai service.
+    model_budget_usd_per_day: float = DEFAULT_MODEL_BUDGET_USD_PER_DAY
     raw_section: Mapping[str, Any] = field(default_factory=lambda: MappingProxyType({}))
 
 
@@ -73,6 +76,7 @@ def load_ai_paper_config(
         experiment_kill_basis=_parse_kill_basis(raw.get("experiment_kill_basis", "start")),
         broker_outage_pause_seconds=_parse_outage_pause(raw),
         acceptance_probe=acceptance_probe,
+        model_budget_usd_per_day=_parse_budget(raw.get("model_budget_usd_per_day", DEFAULT_MODEL_BUDGET_USD_PER_DAY)),
         raw_section=MappingProxyType(copy.deepcopy(dict(raw))),
     )
 
@@ -158,6 +162,12 @@ def _parse_outage_pause(raw: Mapping[str, Any]) -> int:
         raise AiPaperConfigError(
             f"ai_paper.broker_outage_pause_seconds must be an integer from {low} to {high}")
     return value
+
+
+def _parse_budget(value: object) -> float:
+    if type(value) not in (int, float) or not math.isfinite(value) or value < 0:
+        raise AiPaperConfigError("ai_paper.model_budget_usd_per_day: must be a finite number >= 0")
+    return float(value)
 
 
 def _check_drawdown_guard(ceiling: RiskLimits, kill_pct: Optional[float]) -> None:

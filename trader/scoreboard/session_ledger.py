@@ -145,6 +145,23 @@ class SessionLedger:
         rows = self.store.fetch("equity_daily", {"experiment_id": experiment_id, "session_date": session_date})
         return rows[0] if rows else None
 
+    def trip_executions(self, round_trip_id: str) -> Optional[list[FillFact]]:
+        """The broker executions of one stored round trip (SP2 Plan 2 Ruling 21), in fill order.
+
+        None when the trip, its experiment or one of its executions cannot be read: never a partial list.
+        """
+        rows = self.db.execute("SELECT experiment_id, exec_ids FROM round_trips WHERE round_trip_id = ?",
+                               [round_trip_id], fetch="all")
+        if len(rows) != 1:
+            return None
+        experiment_id, exec_ids_json = rows[0]
+        experiment = self.experiments.get(experiment_id)
+        if experiment is None:
+            return None
+        wanted = set(json.loads(exec_ids_json))
+        found = [fact for fact in experiment_fills(self.db, experiment) if fact.exec_id in wanted]
+        return found if {fact.exec_id for fact in found} == wanted else None
+
     # -- row building --------------------------------------------------------
 
     def _session_facts(self, experiment: Any, session_date: dt.date) -> SessionFacts:

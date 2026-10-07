@@ -72,8 +72,17 @@ def validate_approval(order: Any, approval: ApprovalContext, *, account_id: str,
         if held < approval.quantity:
             raise ApprovalContextError("LONG_ONLY", "sell exceeds the fenced long position")
 
-    quote = approval.quote
-    if quote.conid != order.conid or quote.side != order.side:
+    validate_entry_quote(approval.quote, conid=order.conid, side=order.side, now=now,
+                         accepted_feeds=accepted_feeds)
+
+
+def validate_entry_quote(quote: Any, *, conid: int, side: str, now: dt.datetime,
+                         accepted_feeds: frozenset[str] = LIVE_ONLY_FEEDS) -> None:
+    """The quote half of ``validate_approval``: a fresh, crossable, continuous quote from an accepted feed.
+
+    The baseline sizer calls it too, so a baseline is never sized on a quote a real entry would refuse.
+    """
+    if quote.conid != conid or quote.side != side:
         raise ApprovalContextError("QUOTE_MISMATCH", "quote identity does not match intent")
     if (not isinstance(quote.market_timestamp, dt.datetime)
             or quote.market_timestamp.utcoffset() is None):
@@ -86,9 +95,9 @@ def validate_approval(order: Any, approval: ApprovalContext, *, account_id: str,
     price = _number(quote.price, "QUOTE_INVALID", positive=True)
     bid = _number(quote.bid, "QUOTE_INVALID", positive=True)
     ask = _number(quote.ask, "QUOTE_INVALID", positive=True)
-    if ask < bid or price != (ask if order.side == "BUY" else bid):
+    if ask < bid or price != (ask if side == "BUY" else bid):
         raise ApprovalContextError("QUOTE_INVALID", "crossable side of book is required")
-    if order.side == "BUY" and quote.feed_type not in accepted_feeds:
+    if side == "BUY" and quote.feed_type not in accepted_feeds:
         raise ApprovalContextError("FEED_NOT_LIVE", "automated entry requires an accepted feed")
     if quote.session_state != "continuous":
         raise ApprovalContextError("QUOTE_SESSION_INVALID", "continuous trading evidence is required")

@@ -1251,3 +1251,18 @@ async def test_reduce_only_ib_verdict_mapping(verdict, filled, expected):
     else:
         assert not result.is_success() and result.error is None
         assert 'may have been' in str(result.exception)
+
+
+_ALPACA_KWARGS = dict(
+    ib_server_address='127.0.0.1', ib_server_port=7497, trading_runtime_ib_client_id=5, ib_account='DU12345',
+    duckdb_path='/tmp/mmr.duckdb', universe_library='Universes', zmq_pubsub_server_address='tcp://127.0.0.1',
+    zmq_pubsub_server_port=42002, zmq_rpc_server_address='tcp://127.0.0.1', zmq_rpc_server_port=42001,
+    zmq_strategy_rpc_server_address='tcp://127.0.0.1', zmq_strategy_rpc_server_port=42005,
+    zmq_messagebus_server_address='tcp://127.0.0.1', zmq_messagebus_server_port=42006)
+
+
+def test_trader_keeps_the_alpaca_keys_for_baseline_simulation():
+    blank = Trader(**_ALPACA_KWARGS)
+    assert (blank.alpaca_api_key_id, blank.alpaca_api_secret_key) == ('', '')
+    trader = Trader(**_ALPACA_KWARGS, alpaca_api_key_id='id', alpaca_api_secret_key='s')
+    assert (trader.alpaca_api_key_id, trader.alpaca_api_secret_key) == ('id', 's')

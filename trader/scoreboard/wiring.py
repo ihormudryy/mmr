@@ -9,14 +9,19 @@ from __future__ import annotations
 import datetime as dt
 import logging
 from dataclasses import dataclass
-from typing import Any, Callable, Optional
+from typing import Any, Callable, Optional, Sequence
 
+from trader.scoreboard.bar_sources import default_bar_sources
 from trader.scoreboard.benchmark import BenchmarkBook, BenchmarkSourceError, read_spy_closes
+from trader.scoreboard.close_fills import JournalCloseFills
 from trader.scoreboard.fx import IbFxEvidence
-from trader.scoreboard.ports import DecisionStoreAttribution, NullAttributionLookup, NullExperimentReader
+from trader.scoreboard.ingest import AiIngest
+from trader.scoreboard.ports import (DecisionStoreAttribution, DecisionStoreCloseLinks, DecisionStoreFacts,
+                                     NullAttributionLookup, NullCloseFills, NullDecisionFacts, NullExperimentReader)
 from trader.scoreboard.schema import apply_scoreboard_migrations
 from trader.scoreboard.service import ScoreboardService
 from trader.scoreboard.session_ledger import SessionLedger
+from trader.scoreboard.session_simulator import SessionSimulator
 from trader.scoreboard.store import ScoreboardStore
 from trader.scoreboard.summary_text import DailySummaryProducer
 from trader.scoreboard.telegram_sender import build_telegram
@@ -36,6 +41,9 @@ class ScoreboardServices:
     outbox: Any = None          # TelegramOutbox when ai_paper.telegram.enabled
     sender: Any = None          # TelegramSender when enabled
     producer: Any = None        # DailySummaryProducer when enabled
+    ingest: Any = None          # AiIngest: record_ai_cost / record_simulated_decision (SP2 Plan 2)
+    simulator: Any = None       # SessionSimulator: baseline outcomes from 1-minute bars (SP2 Plan 2)
+    close_fills: Any = None     # CloseFills the simulator proves matched-entry shares with (Ruling 21)
 
     def recover(self, now: Optional[dt.datetime] = None) -> list[str]:
         """Startup: rows for past sessions without one (ruling 6), then a lost summary (if Telegram is on)."""
@@ -51,6 +59,8 @@ class ScoreboardServices:
         self._step("refresh", self.service.refresh)
         self._step("benchmark refresh", self._benchmark)
         self._step("summary catch-up", self._catch_up)
+        if self.simulator is not None:
+            self._step("simulation", self.simulator.run_due)
         if self.sender is not None:
             self._step("telegram drain", self.sender.drain)
 
@@ -92,8 +102,13 @@ def _telegram_section(trader: Any) -> Optional[dict]:
 
 
 def build_scoreboard(trader: Any, *, migrator: Any, broker: Any, experiments: Any, decision_store: Any,
-                     calendar: Any, cash: Callable[[], dict], now: Callable[[], dt.datetime]) -> ScoreboardServices:
-    """Raises TelegramConfigError when ai_paper.telegram is enabled but invalid (startup stops, ruling 17)."""
+                     calendar: Any, cash: Callable[[], dict], now: Callable[[], dt.datetime],
+                     sizer: Any = None, command_ledger: Any = None,
+                     bar_sources: Optional[Sequence[Any]] = None) -> ScoreboardServices:
+    """Raises TelegramConfigError when ai_paper.telegram is enabled but invalid (startup stops, ruling 17).
+
+    ``command_ledger`` is the SP1 ``CommandLedger``: a placed ENTER's size is read from its receipt.
+    """
     apply_scoreboard_migrations(migrator)
     db = trader.journal_db
     store = ScoreboardStore(db, now=now)
@@ -105,10 +120,18 @@ def build_scoreboard(trader: Any, *, migrator: Any, broker: Any, experiments: An
     outbox, sender = build_telegram(_telegram_section(trader), db, now)
     service = ScoreboardService(store=store, db=db, experiments=reader, ledger=ledger, book=book, links=links,
                                 calendar=calendar, now=now, outbox=outbox)
+    decisions = NullDecisionFacts() if decision_store is None else DecisionStoreFacts(decision_store, command_ledger)
+    ingest = AiIngest(store=store, experiments=reader, decisions=decisions, calendar=calendar, now=now, sizer=sizer)
+    close_fills = NullCloseFills() if decision_store is None else JournalCloseFills(
+        store, DecisionStoreCloseLinks(decision_store), decisions, ledger.trip_executions)
+    simulator = SessionSimulator(store=store, calendar=calendar,
+                                 sources=default_bar_sources(trader) if bar_sources is None else bar_sources,
+                                 now=now, close_fills=close_fills)
     producer = None
     if outbox is not None:
         producer = DailySummaryProducer(service, outbox, now=now)
         ledger.on_row_written = producer.on_session_row
     logger.warning("scoreboard ready; telegram summaries %s", "ON" if sender is not None else "off")
     return ScoreboardServices(store=store, ledger=ledger, book=book, service=service, broker=broker,
-                              account_id=trader.ib_account, now=now, outbox=outbox, sender=sender, producer=producer)
+                              account_id=trader.ib_account, now=now, outbox=outbox, sender=sender, producer=producer,
+                              ingest=ingest, simulator=simulator, close_fills=close_fills)

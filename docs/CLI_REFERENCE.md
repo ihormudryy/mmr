@@ -203,6 +203,10 @@ ai-deployment show sha256:...                # a sealed deployment, its kind and
 scoreboard                                   # PAPER scoreboard of the latest experiment ('-' = unknown)
 --json scoreboard --experiment exp-<20 hex>  # the report as JSON: {"data": ..., "title": "Scoreboard (paper)"}
 scoreboard verify                            # rebuild every number from stored inputs; exit 1 on any mismatch
+# The table lists one "simulated baselines" line per book (baseline / cohort, status COMPLETE, INCOMPLETE or
+# PENDING, records, P&L or "known so far ... from N of M records", and the incomplete reasons). Books are never
+# summed; P&L is gross (no commissions or slippage). "AI cost" shows the total with its status label
+# (confirmed, estimated, incomplete), the confirmed and estimated parts and the unknown calls; unavailable when none.
 experiment acceptance preflight              # SP1 clean-account gate: PASS, or STOP + reasons (exit 1)
 experiment acceptance run                    # dry run: reads the gate, prints the planned calls, sends nothing
 experiment acceptance run --place-orders --confirm-account DU123 --signing-key KEY   # the owner's paper session only

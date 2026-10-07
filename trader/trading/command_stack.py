@@ -510,6 +510,7 @@ class AiPaperServices:
     scope_volumes: Any = None     # DollarVolumeSource (SP2 Plan 3)
     discovery: Any = None         # AiDiscoveryReader (SP2 Plan 3): discover_ai_candidates
     entry_quotes: Any = None      # EntryQuoteSource (SP2 Plan 3): get_ai_entry_quote
+    baseline_sizer: Any = None   # AiPaperBaselineSizer (SP2 Plan 2 Ruling 19)
 
 
 @dataclass(frozen=True)
@@ -607,6 +608,7 @@ def _build_ai_paper_services(
 ) -> Optional[AiPaperServices]:
     if parts is None:
         return None
+    from trader.automation.ai_baseline_sizing import AiPaperBaselineSizer
     from trader.automation.ai_paper_actions import AiPaperActions
     from trader.automation.ai_paper_decision import AiPaperDecisionService, AiPaperDecisionStore
     from trader.automation.ai_paper_evidence import AI_ENTRY_POLICY, AiPaperEvidence
@@ -657,6 +659,10 @@ def _build_ai_paper_services(
         account_id=trader.ib_account, account_mode=account_mode, ledger=ledger, journal=journal,
         controls=controls, now=now,
     )
+    # The same quote authority and feed set as AiPaperEvidence: a baseline is sized like a real ENTER.
+    baseline_sizer = AiPaperBaselineSizer(
+        broker=broker, quotes=quotes, history=getattr(trader, "data", None), policy=parts.policy,
+        deployments=deployments, accepted_feeds=accepted_feeds, entry_filter=parts.entry_filter, now=now)
     return AiPaperServices(config=parts.config, policy=parts.policy, deployments=deployments,
                            decisions=decisions, decision_store=decision_store, actions=actions,
                            entry_filter=parts.entry_filter, epochs=epochs, signals=signals,
@@ -666,7 +672,8 @@ def _build_ai_paper_services(
                                resolver=SymbolResolver(contracts=contracts, now=now), volumes=volumes,
                                deployments=deployments, filter_refusal=parts.filter_refusal, now=now),
                            entry_quotes=EntryQuoteSource(quotes=quotes, accepted_feeds=frozenset(accepted_feeds),
-                                                         account_mode=account_mode))
+                                                         account_mode=account_mode),
+                           baseline_sizer=baseline_sizer)
 
 
 def _contract_details_port(trader: Any) -> Callable[[Any], list]:
@@ -1005,7 +1012,7 @@ def _scoreboard_terminal(slot: dict, state: Any) -> None:
 
 
 def _build_scoreboard(trader: Any, migrator: Any, broker: Any, experiments: Optional[ExperimentServices],
-                      ai_paper: Any, now: Callable[[], dt.datetime]) -> Any:
+                      ai_paper: Any, now: Callable[[], dt.datetime], command_ledger: Any = None) -> Any:
     """SP1 Plan 5. An enabled but invalid ai_paper.telegram section raises here: startup stops (ruling 17)."""
     from trader.automation.calendar_policy import XNYSCalendarPolicy
     from trader.messaging.trader_service_api import TraderServiceApi
@@ -1016,7 +1023,8 @@ def _build_scoreboard(trader: Any, migrator: Any, broker: Any, experiments: Opti
         experiments=None if experiments is None else experiments.store,
         decision_store=None if ai_paper is None else ai_paper.decision_store,
         calendar=XNYSCalendarPolicy(),
-        cash=lambda: TraderServiceApi(trader).get_account_cash_by_currency(), now=now)
+        cash=lambda: TraderServiceApi(trader).get_account_cash_by_currency(), now=now,
+        sizer=None if ai_paper is None else ai_paper.baseline_sizer, command_ledger=command_ledger)
     if experiments is not None:
         # Plan 4 K18: kill_started alerts go to the outbox (None while Telegram is off: logged NO_OUTBOX),
         # the KILLED session end to the ledger.
@@ -1596,7 +1604,8 @@ def build_command_stack(
         experiments=None if experiments is None else experiments.reader,
     )
     late["ai_paper"] = ai_paper
-    scoreboard = _build_scoreboard(trader, migrator, broker_snapshot, experiments, ai_paper, now)
+    scoreboard = _build_scoreboard(trader, migrator, broker_snapshot, experiments, ai_paper, now,
+                                   command_ledger=ledger)
     scoreboard_slot["ledger"] = scoreboard.ledger
     from trader.automation.paper_activation import PaperAutomationActivationService
     from trader.automation.paper_hot_arm import ProductionPaperHotArmPorts
@@ -1732,6 +1741,7 @@ def build_command_stack(
         trader.ai_paper_attribution = ai_paper.decision_store  # Plan 5 reads links_for_order_ref here
     trader.scoreboard = scoreboard
     trader.scoreboard_service = scoreboard.service              # get_scoreboard / verify_scoreboard
+    trader.ai_ingest = scoreboard.ingest                          # record_ai_cost / record_simulated_decision
     trader.session_ledger = scoreboard.ledger
     trader.telegram_outbox = scoreboard.outbox
     if experiments is not None:

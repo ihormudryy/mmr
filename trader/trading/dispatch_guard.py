@@ -201,14 +201,23 @@ class DispatchGuard:
             raise DispatchGuardError(code, "allocation policy rejected at dispatch")
 
     def _recheck_entry_limits(self, approved, request, current, price: float) -> None:
-        """An ai_paper entry is re-checked only when a field got tighter since approval."""
+        """An ai_paper entry always re-checks loss and drawdown on the current broker P&L.
+
+        Sizing and slot limits are re-checked only when a field got tighter since approval.
+        """
         evidence = getattr(approved, "entry_limits", None)
         if evidence is None:
             return
         tight = evidence.limits.tighter(self._limits_for(request))
+        from trader.automation.ai_paper_sizing import entry_limit_violations, loss_limit_breaches
+        try:
+            loss_breaches = loss_limit_breaches(tight, broker=current, evidence=evidence)
+        except Exception as exc:
+            raise DispatchGuardError("LIMITS_UNAVAILABLE", "loss limits re-check failed") from exc
+        if loss_breaches:
+            raise DispatchGuardError(loss_breaches[0], "loss limit breached at dispatch")
         if tight == evidence.limits:
             return
-        from trader.automation.ai_paper_sizing import entry_limit_violations
         try:
             violations = entry_limit_violations(
                 tight, broker=current, conid=approved.conid, quantity=abs(float(approved.quantity)),

@@ -248,6 +248,13 @@ def test_policy_tightened_between_approval_and_dispatch_refuses(world):        #
     assert world.submit().error_code == "LIMIT_TIGHTENED_BEFORE_DISPATCH"
 
 
+def test_loss_breached_after_approval_refuses_with_unchanged_policy(world):    # review #31
+    world.start_session()
+    world.on_before_guard(lambda: world.broker.set(daily_pnl=-6_000.0))        # anchor 1,000,000: budget 5,000
+    receipt = world.submit()
+    assert (receipt.error_code, world.dispatch.plans) == ("DAILY_LOSS", [])
+
+
 def test_attribution_links_for_the_entry_order_ref(world):
     world.submit()
     (link,) = world.decisions.links_for_order_ref("mmr:og-aip-dec-00000001")

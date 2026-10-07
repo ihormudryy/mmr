@@ -15,6 +15,7 @@ from trader.promotion.allocation_policy import compute_gross_notional
 # leg, an external order) counts as a pending entry, so the limit cannot be dodged.
 PROTECTIVE_LEGS = frozenset({"stop", "take_profit", "exit"})
 LIMIT_TIGHTENED = "LIMIT_TIGHTENED_BEFORE_DISPATCH"
+LOSS_STATE_UNKNOWN = "LOSS_STATE_UNKNOWN"
 _FLOOR_TOLERANCE = 1e-9
 
 
@@ -84,13 +85,24 @@ def entry_limit_violations(limits: RiskLimits, *, broker: Any, conid: int, quant
     inputs = sizing_inputs(broker, conid=conid, price=price, stop_price=evidence.stop_price,
                            liquidity_max_shares=evidence.liquidity_max_shares,
                            notional_cap=evidence.notional_cap)
-    equity = inputs.equity
-    hwm = float(evidence.high_water_mark)
-    loss = max(0.0, -float(broker.daily_pnl))
     breaches = (
         quantity > max_entry_quantity(limits, inputs),
         pending_entry_refusal(broker, conid, limits) is not None,
-        loss >= float(evidence.daily_loss_anchor) * limits.daily_loss_fraction,
-        hwm > 0 and (hwm - equity) / hwm >= limits.drawdown_fraction,
+        bool(loss_limit_breaches(limits, broker=broker, evidence=evidence)),
     )
     return (LIMIT_TIGHTENED,) if any(breaches) else ()
+
+
+def loss_limit_breaches(limits: RiskLimits, *, broker: Any, evidence: Any) -> tuple[str, ...]:
+    """DAILY_LOSS / DRAWDOWN on the current broker P&L; LOSS_STATE_UNKNOWN when it cannot be read."""
+    values = (float(broker.daily_pnl), float(broker.net_liquidation),
+              float(evidence.daily_loss_anchor), float(evidence.high_water_mark))
+    if not all(math.isfinite(value) for value in values):
+        return (LOSS_STATE_UNKNOWN,)
+    daily_pnl, equity, anchor, hwm = values
+    breaches = []
+    if max(0.0, -daily_pnl) >= anchor * limits.daily_loss_fraction:
+        breaches.append("DAILY_LOSS")
+    if hwm > 0 and (hwm - equity) / hwm >= limits.drawdown_fraction:
+        breaches.append("DRAWDOWN")
+    return tuple(breaches)

@@ -148,6 +148,7 @@
     if (!raw || raw === 'trading') return 'trading';
     if (raw === 'scaling') return 'scaling';
     if (raw === 'research') return 'research';
+    if (raw === 'scoreboard') return 'scoreboard';
     if (raw === 'guide' || raw === 'help') return 'guide';
     if (raw === 'manage' || raw === 'setup' || raw === 'setup-strategies'
         || raw === 'strategies') return 'deploy';

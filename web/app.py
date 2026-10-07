@@ -65,6 +65,7 @@ from web.command_center.routes_commands import (
 from web.command_center.routes_read import create_read_router
 from web.command_center.research import ResearchService, build_research_service
 from web.command_center.routes_research import create_research_router
+from web.command_center.routes_scoreboard import create_scoreboard_router
 from web.command_center.session import (
     SESSION_COOKIE,
     CredentialConfigError,
@@ -1731,6 +1732,7 @@ def create_app(
         empty_manage_context=_empty_manage_context,
     ))
     application.include_router(create_research_router(center, research))
+    application.include_router(create_scoreboard_router(center))
     # NEW route only: `/api/cc-health`. Never touches the G0 `/healthz` /
     # `/readyz` / `/api/health` routes registered by `_register_legacy_routes`
     # below -- see the M1-R Task 7 addendum for why those must stay as-is.

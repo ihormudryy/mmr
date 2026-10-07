@@ -1,0 +1,25 @@
+<style>
+  #dash-scoreboard { padding: var(--space-5, 20px) var(--space-6, 24px) var(--space-6, 24px); }
+  #dash-scoreboard .sb-banner { border: 2px solid var(--warn); padding: 8px 12px; margin-bottom: 12px; }
+  #dash-scoreboard .sb-banner strong { color: var(--warn); letter-spacing: .08em; margin-right: 8px; }
+  #dash-scoreboard .sb-section { margin: 16px 0; }
+  #dash-scoreboard .sb-kv th { text-align: left; font-weight: 500; color: var(--dim); padding-right: 16px; }
+  #dash-scoreboard .sb-table { border-collapse: collapse; margin: 8px 0; }
+  #dash-scoreboard .sb-table th, #dash-scoreboard .sb-table td {
+    border-bottom: 1px solid var(--border-soft); padding: 4px 10px; text-align: right; }
+  #dash-scoreboard .sb-table td:first-child, #dash-scoreboard .sb-table th:first-child { text-align: left; }
+  #dash-scoreboard .sb-label { color: var(--dim); font-size: .9em; }
+  #dash-scoreboard .sb-warn { color: var(--warn); }
+  #dash-scoreboard .sb-error, #dash-scoreboard .sb-incident { color: var(--neg); }
+  #dash-scoreboard .sb-state { padding: 1px 6px; border: 1px solid var(--border); }
+  #dash-scoreboard .sb-state[data-end-state="FLAT"] { color: var(--pos); }
+  #dash-scoreboard .sb-state[data-end-state="KILLED"] { color: #fff; background: var(--neg); border-color: var(--neg); }
+  #dash-scoreboard .sb-state[data-end-state="FAILED_SAFE"] { color: var(--neg); border-color: var(--neg); }
+  #dash-scoreboard .sb-state[data-end-state="UNKNOWN"] { color: var(--warn); border-style: dashed; }
+  #dash-scoreboard .sb-stale { opacity: .55; }
+</style>
+<div id="scoreboard-root" aria-live="polite">
+  <div class="sb-banner" role="note"><strong>PAPER</strong>
+    <span>Paper trading. Nothing here is proof of live edge.</span></div>
+  <p class="dim">Loading the scoreboard…</p>
+</div>

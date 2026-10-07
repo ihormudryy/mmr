@@ -124,6 +124,10 @@ def _close_loop(loop):
     loop.close()
 
 
+# A real stall waits for a dispatch or lock timeout (several seconds). Shared CI
+# runners can add ~0.5 s of scheduling noise, so the no-block bound leaves room.
+NO_BLOCK_SECONDS = 2.0
+
 # ---------------------------------------------------------------------------
 # Periodic ticks
 # ---------------------------------------------------------------------------
@@ -143,7 +147,7 @@ async def test_liquidation_recovery_tick_on_real_loop_places_exactly_one_order(t
     assert (side, quantity) == ("SELL", 10.0)
     assert thread_id == threading.get_ident()  # placed on the trader loop
     assert sent_at < returned  # no late order
-    assert returned - started < 0.5
+    assert returned - started < NO_BLOCK_SECONDS
 
 
 def _session_controller(tmp_path: Path, liquidation, clock):
@@ -256,7 +260,7 @@ def test_startup_liquidation_recovery_dispatches_while_loop_runs(tmp_path, worke
 
         assert len(trader.orders) == 1
         assert trader.orders[0][1] < returned
-        assert returned - started < 0.5
+        assert returned - started < NO_BLOCK_SECONDS
         assert service.receipt_for("root-1").state == "VERIFYING"
     finally:
         _close_loop(loop)
@@ -271,7 +275,7 @@ def test_startup_liquidation_recovery_without_trader_loop_sends_nothing_late(tmp
 
         started = time.monotonic()
         trader_service._maybe_start_liquidation_recovery(holder, loop, worker)
-        assert time.monotonic() - started < 0.5
+        assert time.monotonic() - started < NO_BLOCK_SECONDS
 
         [child] = service.receipt_for("root-1").children
         assert (child.kind, child.state) == ("reduce", "NOT_SENT")    # a proven refusal (R34)

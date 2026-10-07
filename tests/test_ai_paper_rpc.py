@@ -5,6 +5,7 @@ the fenced snapshot, quotes, the what-if and the order dispatch.
 """
 from __future__ import annotations
 
+import copy
 import datetime as dt
 from dataclasses import replace
 from types import SimpleNamespace
@@ -18,11 +19,12 @@ from tests.test_command_stack import _trader
 from trader.automation.ai_paper_config import AiPaperConfig
 from trader.automation.ai_paper_decision import AI_PAPER_ACTION
 from trader.automation.ai_paper_experiment import ExperimentStateReader
+from trader.automation.discretionary_deployment import DEFAULT_SCOPE_RULE
 from trader.automation.risk_limits import PAPER_LIMITS
 from trader.messaging.principals import TRADER_ACL
 from trader.messaging.production_api import build_production_registry
 from trader.messaging.typed_rpc import TypedRpcRemoteError
-from trader.trading.command_coordinator import CommandRequest
+from trader.trading.command_coordinator import CommandRequest, CommandValidationError
 from trader.trading.command_policy import CommandAuthorityPolicy
 
 ACCOUNT = "DU111111"
@@ -294,3 +296,71 @@ def test_disabled_ai_paper_registers_nothing(served_disabled):
 def test_no_method_writes_the_owner_ceiling():
     methods = {method for _, method in TRADER_ACL}
     assert not [method for method in methods if "ceiling" in method]
+
+
+# --- SP2 Plan 3 Task 4: the operator's discretionary deployment ------------------------------------
+
+def discretionary_body(**rule):
+    return {"kind": "discretionary", "style": "intraday_long", "scope_rule": {**DEFAULT_SCOPE_RULE.to_json(), **rule},
+            "attestation": {"operator": "owner", "statement": "paper only; rule as sealed",
+                            "attested_at": "2026-07-17T10:00:00-04:00"}}
+
+
+def register_discretionary(served, **rule):
+    return command(served, "cli").call("register_discretionary_deployment",
+                                       {"deployment": discretionary_body(**rule)}, dict)
+
+
+def replace_account_mode(actions, mode):
+    clone = copy.copy(actions)
+    clone._account_mode = mode
+    return clone
+
+
+def test_operator_registers_and_everyone_reads_the_discretionary_label(served):
+    receipt = register_discretionary(served)
+    assert receipt["state"] == "RESOLVED" and receipt["outcome"]["kind"] == "discretionary"
+    view = query(served, "ai_supervisor").call("get_ai_deployment", {"digest": receipt["outcome"]["digest"]}, dict)
+    assert (view["kind"], view["strategy_digest_provenance"]) == ("discretionary", "OPERATOR_ATTESTED")
+    assert view["deployment"]["scope_rule"] == DEFAULT_SCOPE_RULE.to_json()
+    assert query(served, "ai_research").call("get_ai_deployment", {"digest": register(served)}, dict)["kind"] == "strategy"
+
+
+def test_registering_twice_replays_one_command(served):
+    first, again = register_discretionary(served), register_discretionary(served)
+    assert again["command_id"] == first["command_id"] and again["outcome"] == first["outcome"]
+
+
+@pytest.mark.parametrize("principal", ["ai_supervisor", "ai_research", "dashboard", "strategy"])
+def test_only_the_cli_registers_a_discretionary_deployment(served, principal):
+    with pytest.raises(TypedRpcRemoteError) as exc:
+        command(served, principal).call("register_discretionary_deployment",
+                                        {"deployment": discretionary_body()}, dict)
+    assert exc.value.code == "PERMISSION_DENIED"
+
+
+def test_the_service_refuses_a_bypass_of_the_allow_list(served):
+    receipt = served.coordinator.execute(CommandRequest(
+        command_id="bypass-d", action="register_discretionary_deployment", account_id=ACCOUNT,
+        target_type="ai_deployment", target_id="x", expected_version=None, body=discretionary_body(),
+        source="ai_research", principal="ai_research"))
+    assert receipt.error_code == "PRINCIPAL_FORBIDDEN"
+
+
+@pytest.mark.parametrize("method,principal", [("register_discretionary_deployment", "cli"),
+                                              ("register_ai_deployment", "ai_research")])
+def test_a_wider_or_foreign_body_is_refused_on_the_wire(served, method, principal):
+    body = discretionary_body(stock_types=["COMMON", "WARRANT"])
+    with pytest.raises(TypedRpcRemoteError) as exc:
+        command(served, principal).call(method, {"deployment": body}, dict)
+    assert exc.value.code == "VALIDATION_ERROR"
+
+
+def test_a_live_account_never_registers(served):
+    actions = replace_account_mode(served.stack.ai_paper.actions, "live")
+    request = CommandRequest(command_id="d-live", action="register_discretionary_deployment", account_id=ACCOUNT,
+                             target_type="ai_deployment", target_id="x", expected_version=None,
+                             body=discretionary_body(), source="cli", principal="cli")
+    with pytest.raises(CommandValidationError) as exc:
+        actions.register_discretionary(request)
+    assert exc.value.code == "ACCOUNT_NOT_PAPER"

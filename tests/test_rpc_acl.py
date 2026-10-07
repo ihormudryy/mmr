@@ -225,6 +225,7 @@ AI_PAPER_FAMILY = {                                                    # R23, ow
     ("command", "publish_ai_risk_policy"): {"ai_supervisor", "cli"},
     ("command", "submit_ai_paper_decision"): {"ai_supervisor"},
     ("command", "register_ai_deployment"): {"ai_research"},
+    ("command", "register_discretionary_deployment"): {"cli"},          # SP2 Plan 3: the operator only
     ("query", "get_ai_risk_policy"): {"cli", "dashboard", "ai_supervisor"},
     ("query", "get_ai_deployment"): {"cli", "dashboard", "ai_supervisor", "ai_research"},
 }

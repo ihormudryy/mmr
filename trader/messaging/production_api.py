@@ -816,6 +816,24 @@ class RegisterAiDeploymentRequest(BaseModel):
         return value
 
 
+class RegisterDiscretionaryDeploymentRequest(BaseModel):
+    """SP2 Plan 3: the operator's discretionary deployment; the rule may only narrow the spec default."""
+    model_config = ConfigDict(extra="forbid", strict=True)
+
+    deployment: dict
+
+    @field_validator("deployment")
+    @classmethod
+    def _deployment_is_valid(cls, value: dict) -> dict:
+        from trader.automation.ai_deployments import DeploymentRefused
+        from trader.automation.discretionary_deployment import DiscretionaryDeployment
+        try:
+            DiscretionaryDeployment.from_json(value)
+        except DeploymentRefused as ex:
+            raise ValueError(str(ex)) from None
+        return value
+
+
 # --- SP1 experiments (Plan 4 Task 7): strict wire models. The service checks the body again. ---
 
 _EXPERIMENT_ID = re.compile(r"^exp-[0-9a-f]{20}$")
@@ -1383,6 +1401,23 @@ def _register_ai_deployment_rpc_handler(coordinator: TradingCommandCoordinator, 
     return _handler
 
 
+def _register_discretionary_rpc_handler(coordinator: TradingCommandCoordinator, account_id: Optional[str]):
+    from trader.automation.ai_paper_actions import REGISTER_DISCRETIONARY_ACTION, deployment_command_id
+    from trader.automation.discretionary_deployment import DiscretionaryDeployment, discretionary_digest
+
+    def _handler(parsed: RegisterDiscretionaryDeploymentRequest, caller: RpcCaller) -> Dict[str, Any]:
+        # The canonical record is the body, so a re-registration of the same content replays.
+        deployment = DiscretionaryDeployment.from_json(parsed.deployment)
+        digest = discretionary_digest(deployment)
+        request = CommandRequest(
+            command_id=deployment_command_id(digest), action=REGISTER_DISCRETIONARY_ACTION, account_id=account_id,
+            target_type="ai_deployment", target_id=digest, expected_version=None,
+            body=deployment.to_json(), source=caller.principal, principal=caller.principal,
+        )
+        return _receipt_to_dict(coordinator.execute(request))
+    return _handler
+
+
 def _submit_ai_paper_decision_rpc_handler(coordinator: TradingCommandCoordinator, account_id: Optional[str],
                                           epochs):
     from trader.automation.ai_paper_decision import AI_PAPER_ACTION, command_id_for
@@ -1460,11 +1495,13 @@ def _read_ai_signals_handler(ai_paper):
 def register_ai_paper_authority(registry: TypedRpcRegistry, coordinator: TradingCommandCoordinator,
                                 ai_paper, *, account_id: Optional[str]) -> None:
     """SP1 ai_paper (Plan 3 Task 9): only when ``ai_paper.enabled`` built the services."""
-    from trader.automation.ai_paper_actions import PUBLISH_ACTION, REGISTER_ACTION
+    from trader.automation.ai_paper_actions import PUBLISH_ACTION, REGISTER_ACTION, REGISTER_DISCRETIONARY_ACTION
     from trader.automation.ai_paper_decision import AI_PAPER_ACTION
 
     coordinator.register_action(PUBLISH_ACTION, ai_paper.actions.publish, requires_preflight=False, saga=True)
     coordinator.register_action(REGISTER_ACTION, ai_paper.actions.register, requires_preflight=False)
+    coordinator.register_action(REGISTER_DISCRETIONARY_ACTION, ai_paper.actions.register_discretionary,
+                                requires_preflight=False)
     coordinator.register_action(AI_PAPER_ACTION, ai_paper.decisions.execute, requires_preflight=False, saga=True)
     registry.register(
         "command", "publish_ai_risk_policy", PublishAiRiskPolicyRequest, dict,
@@ -1473,6 +1510,10 @@ def register_ai_paper_authority(registry: TypedRpcRegistry, coordinator: Trading
     registry.register(
         "command", "register_ai_deployment", RegisterAiDeploymentRequest, dict,
         _register_ai_deployment_rpc_handler(coordinator, account_id), with_caller=True,
+    )
+    registry.register(
+        "command", "register_discretionary_deployment", RegisterDiscretionaryDeploymentRequest, dict,
+        _register_discretionary_rpc_handler(coordinator, account_id), with_caller=True,
     )
     registry.register(
         "command", "submit_ai_paper_decision", SubmitAiPaperDecisionRequest, dict,

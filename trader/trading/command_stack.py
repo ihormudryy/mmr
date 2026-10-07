@@ -610,7 +610,8 @@ def _build_ai_paper_services(
     )
     actions = AiPaperActions(
         policy=parts.policy, deployments=deployments, broker=broker, config=parts.config,
-        account_id=trader.ib_account, ledger=ledger, journal=journal, controls=controls, now=now,
+        account_id=trader.ib_account, account_mode=account_mode, ledger=ledger, journal=journal,
+        controls=controls, now=now,
     )
     return AiPaperServices(config=parts.config, policy=parts.policy, deployments=deployments,
                            decisions=decisions, decision_store=decision_store, actions=actions,

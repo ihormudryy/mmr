@@ -2015,6 +2015,37 @@ class MMR:
         detail = f'{receipt.error_code or receipt.state}' + (f': {message}' if message else '')
         return SuccessFail.fail(error=f'publish_ai_risk_policy rejected: {detail}')
 
+    def register_discretionary_deployment(self, *, operator: str, statement: str, rule: Optional[dict] = None,
+                                          style: str = 'intraday_long') -> SuccessFail:
+        """Register the PAPER discretionary deployment as the operator (SP2 spec 6.6).
+
+        ``rule`` narrows parts of the spec default rule; the trader refuses anything wider.
+        """
+        import datetime as _dt
+        from trader.automation.discretionary_deployment import DEFAULT_SCOPE_RULE
+        from trader.domain.commands import CommandReceipt
+        from trader.messaging.typed_rpc import TypedRpcRemoteError
+
+        deployment = {
+            'kind': 'discretionary', 'style': style, 'scope_rule': {**DEFAULT_SCOPE_RULE.to_json(), **(rule or {})},
+            'attestation': {'operator': operator, 'statement': statement,
+                            'attested_at': _dt.datetime.now().astimezone().isoformat(timespec='seconds')},
+        }
+        method = 'register_discretionary_deployment'
+        try:
+            receipt = self._typed_command.call(method, {'deployment': deployment}, CommandReceipt)
+        except TypedRpcRemoteError as ex:
+            return SuccessFail.fail(error=f'{method} rejected: {ex.code}: {ex.message}', exception=ex)
+        except (TimeoutError, ConnectionError) as ex:
+            return SuccessFail.fail(error=f'{method} did not complete: {ex}', exception=ex)
+        if receipt.state == 'RESOLVED':
+            return SuccessFail.success(obj=receipt.outcome)
+        return SuccessFail.fail(error=f'{method} rejected: {receipt.error_code or receipt.state}')
+
+    def ai_deployment(self, digest: str) -> dict:
+        """``get_ai_deployment``: the sealed record, its ``kind`` and its provenance."""
+        return self._typed_query.call('get_ai_deployment', {'digest': digest}, dict)
+
     def ai_policy_view(self) -> dict:
         """The PAPER AI risk policy: published, effective and queued limits."""
         return self._typed_query.call('get_ai_risk_policy', {}, dict)

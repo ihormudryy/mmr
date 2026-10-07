@@ -1,7 +1,8 @@
 """Coordinator actions and reads of the ai_paper family besides the decision (Plan 3 Task 9).
 
-``publish_ai_risk_policy`` (ai_supervisor, cli) and ``register_ai_deployment``
-(ai_research), plus the two reads. Each action checks its principal itself,
+``publish_ai_risk_policy`` (ai_supervisor, cli), ``register_ai_deployment``
+(ai_research) and ``register_discretionary_deployment`` (cli, paper only; SP2
+Plan 3), plus the two reads. Each action checks its principal itself,
 so a caller that bypasses the RPC allow-list is still refused.
 """
 from __future__ import annotations
@@ -9,19 +10,22 @@ from __future__ import annotations
 import datetime as dt
 from typing import Any, Callable, Optional
 
-from trader.automation.ai_deployments import AiDeployment, DeploymentRefused
+from trader.automation.ai_deployments import DISCRETIONARY_KIND, AiDeployment, DeploymentRefused
 from trader.automation.ai_risk_policy import PolicyRefused
 from trader.automation.command_steps import CommandSteps
+from trader.automation.discretionary_deployment import DiscretionaryDeployment
 from trader.automation.risk_limits import RiskLimits, RiskLimitsError
 from trader.domain.commands import CommandReceipt
 from trader.trading.command_coordinator import CommandRequest, CommandValidationError
 
 AI_SUPERVISOR = "ai_supervisor"
 AI_RESEARCH = "ai_research"
+OPERATOR = "cli"
 # SP2 spec 6.7: the operator publishes the initial policy; ai_supervisor keeps the right for SP2d.
 POLICY_PUBLISHERS = frozenset({AI_SUPERVISOR, "cli"})
 PUBLISH_ACTION = "publish_ai_risk_policy"
 REGISTER_ACTION = "register_ai_deployment"
+REGISTER_DISCRETIONARY_ACTION = "register_discretionary_deployment"
 DEPLOYMENT_COMMAND_PREFIX = "aidep-"
 
 
@@ -36,12 +40,13 @@ def _limits_view(limits: Optional[RiskLimits]) -> Optional[dict]:
 
 class AiPaperActions:
     def __init__(self, *, policy: Any, deployments: Any, broker: Any, config: Any, account_id: str,
-                 ledger: Any, journal: Any, controls: Any, now: Callable[[], dt.datetime]):
+                 account_mode: str, ledger: Any, journal: Any, controls: Any, now: Callable[[], dt.datetime]):
         self._policy = policy
         self._deployments = deployments
         self._broker = broker
         self._config = config
         self._account_id = account_id
+        self._account_mode = account_mode
         self._steps = CommandSteps(ledger=ledger, journal=journal, controls=controls,
                                    account_id=account_id, now=now)
 
@@ -95,6 +100,24 @@ class AiPaperActions:
         return {"digest": digest, "created": created,
                 "strategy_digest_provenance": self._deployments.provenance(digest)}
 
+    # -- register_discretionary_deployment (single step; SP2 spec 6.6) ----------
+
+    def register_discretionary(self, cmd: CommandRequest) -> dict:
+        if cmd.principal != OPERATOR:
+            raise CommandValidationError("PRINCIPAL_FORBIDDEN",
+                                         "only the cli operator registers a discretionary deployment")
+        if self._account_mode != "paper" or not str(self._account_id).startswith("DU"):
+            raise CommandValidationError("ACCOUNT_NOT_PAPER", "discretionary deployments are paper only")
+        try:
+            deployment = DiscretionaryDeployment.from_json(cmd.body)
+        except DeploymentRefused as ex:
+            raise CommandValidationError(ex.code, ex.message) from None
+        if deployment.style not in self._config.styles:
+            raise CommandValidationError("STYLE_NOT_ENABLED", f"style {deployment.style!r} is not enabled")
+        digest, created = self._deployments.register_discretionary(deployment, principal=cmd.principal,
+                                                                   command_id=cmd.command_id)
+        return {"digest": digest, "created": created, "kind": DISCRETIONARY_KIND}
+
     # -- reads -------------------------------------------------------------------
 
     def policy_view(self) -> dict:
@@ -117,11 +140,11 @@ class AiPaperActions:
 
     def deployment_view(self, digest: str) -> dict:
         try:
-            deployment = self._deployments.get_sealed(digest)
+            deployment = self._deployments.get_sealed_any(digest)
         except DeploymentRefused as ex:
-            return {"digest": digest, "deployment": None, "strategy_digest_provenance": None,
+            return {"digest": digest, "kind": None, "deployment": None, "strategy_digest_provenance": None,
                     "error_code": ex.code}
-        return {"digest": digest, "deployment": deployment.to_json(),
+        return {"digest": digest, "kind": self._deployments.kind_of(digest), "deployment": deployment.to_json(),
                 "strategy_digest_provenance": self._deployments.provenance(digest), "error_code": None}
 
 

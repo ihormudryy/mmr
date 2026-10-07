@@ -21,6 +21,7 @@ from tests.sp1_fixtures import (  # moved there in Plan 6 Task 1; the private na
     ACCOUNT, CONID, FRIDAY, IB_DONE, OTHER, UTC, BrokerSim, Composed, Ingest, LoopThread, Universe,
     enable_automation, et, restart,
 )
+from trader.automation.protective_order_saga import SagaState
 from trader.automation.session_controller import SessionController
 from trader.trading.command_coordinator import CommandRequest
 

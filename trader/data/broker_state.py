@@ -283,6 +283,9 @@ class BrokerRiskSnapshot:
     daily_pnl: float
     positions: tuple[BrokerPositionRow, ...]
     working_orders: tuple[BrokerOrderRow, ...]
+    # When the promoted generation's enumeration began: broker activity
+    # recorded before this time is reflected in the snapshot.
+    generation_started_at: Optional[dt.datetime] = None
 
     def reducible_quantity(self, conid: int) -> float:
         return sum(row.quantity for row in self.positions if row.conid == conid)
@@ -686,7 +689,7 @@ class BrokerStateStore:
         journal ``source_cursor`` visible in this same DuckDB snapshot.
         """
         promoted = conn.execute(
-            "SELECT generation_id, promoted_cursor, completed_at "
+            "SELECT generation_id, promoted_cursor, completed_at, started_at "
             "FROM broker_sync_generations WHERE status = 'promoted' "
             "ORDER BY generation_id DESC LIMIT 1"
         ).fetchone()
@@ -694,7 +697,7 @@ class BrokerStateStore:
             raise BrokerRiskSnapshotError(
                 "NO_PROMOTED_GENERATION", "no complete broker generation is available"
             )
-        generation_id, promoted_cursor, promoted_at = promoted
+        generation_id, promoted_cursor, promoted_at, started_at = promoted
         if promoted_cursor is None or int(promoted_cursor) < 0 or promoted_at is None:
             raise BrokerRiskSnapshotError(
                 "INVALID_GENERATION_CURSOR", "promoted generation has invalid provenance"
@@ -809,6 +812,7 @@ class BrokerStateStore:
             daily_pnl=daily_pnl,
             positions=positions,
             working_orders=working_orders,
+            generation_started_at=started_at,
         )
 
 

@@ -134,6 +134,7 @@ def test_latest_snapshot_is_one_transactional_generation(env):
     assert snapshot.generation_id == second
     assert snapshot.source_cursor == 0
     assert snapshot.promoted_at == T2
+    assert snapshot.generation_started_at == T2
     assert snapshot.net_liquidation == 110_000
     assert snapshot.daily_pnl == 75
     assert snapshot.reducible_quantity(CONID) == 12

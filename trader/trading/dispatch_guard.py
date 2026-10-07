@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import datetime as dt
 import math
+from collections import defaultdict
 from dataclasses import dataclass
 from typing import Any, Optional
 
@@ -55,6 +56,79 @@ def _working_order_fingerprint(snapshot) -> tuple:
     )
 
 
+def _broker_counted_entry_quantity(entry, snapshot) -> float:
+    """Unfilled shares of this entry that the snapshot's gross already counts.
+
+    Only the BUY entry order itself counts: a working SELL stop of the same
+    group adds nothing to gross. Mirrors ``compute_working_entry_notional``.
+    """
+    return sum(
+        max(0.0, float(row.total_quantity) - float(row.filled_quantity))
+        for row in snapshot.working_orders
+        if not row.deleted
+        and row.order_group_id == entry.order_group_id
+        and row.leg == "entry"
+        and str(row.action).upper() == "BUY"
+    )
+
+
+def _enumerated_after_fill(entry, snapshot) -> bool:
+    started_at = snapshot.generation_started_at
+    return (
+        started_at is not None and entry.filled_at is not None and started_at > entry.filled_at
+    )
+
+
+def _fills_in_snapshot(entries, snapshot) -> set[str]:
+    """Order groups whose filled shares the snapshot provably counts.
+
+    A full enumeration that began after the fill counts whatever happened to
+    the shares. Otherwise the position quantity must have grown by the fill
+    from the quantity at send time. Each share of growth proves one fill
+    only: entries on one conid claim it in order of their baseline, and a
+    share already claimed is assumed not to be in a later baseline. That can
+    over-reserve, never under-reserve. A timestamp alone proves nothing: a
+    PnL-only update refreshes the position row without a new quantity.
+    """
+    proven: set[str] = set()
+    claimed: dict[int, float] = defaultdict(float)
+    filled = [entry for entry in entries if entry.filled_quantity > 0]
+    for entry in filled:
+        if _enumerated_after_fill(entry, snapshot):
+            proven.add(entry.order_group_id)
+            claimed[entry.conid] += entry.filled_quantity
+    by_baseline = sorted(
+        (
+            entry for entry in filled
+            if entry.order_group_id not in proven and entry.baseline_position is not None
+        ),
+        key=lambda entry: entry.baseline_position,
+    )
+    for entry in by_baseline:
+        growth = (
+            snapshot.reducible_quantity(entry.conid)
+            - entry.baseline_position
+            - claimed[entry.conid]
+        )
+        if growth >= entry.filled_quantity:
+            proven.add(entry.order_group_id)
+            claimed[entry.conid] += entry.filled_quantity
+    return proven
+
+
+def _unseen_in_flight_notional(evidence, snapshot) -> float:
+    """Notional of in-flight entries that the broker snapshot does not count yet."""
+    entries = evidence.in_flight_entries
+    proven_fills = _fills_in_snapshot(entries, snapshot)
+    total = 0.0
+    for entry in entries:
+        unseen = max(0.0, entry.unfilled_quantity - _broker_counted_entry_quantity(entry, snapshot))
+        if entry.order_group_id not in proven_fills:
+            unseen += entry.filled_quantity
+        total += unseen * entry.limit_price
+    return total
+
+
 class DispatchGuard:
     def __init__(
         self, *, broker, quotes, margin, controls, risk_gate,
@@ -84,6 +158,7 @@ class DispatchGuard:
                 )
             return
         try:
+            in_flight_notional = _unseen_in_flight_notional(evidence, current)
             authority = self._active_authority(current.account_id, evidence)
             decision = self._allocation_policy.revalidate_dispatch(
                 broker=current,
@@ -97,6 +172,7 @@ class DispatchGuard:
                 artifact_digest=evidence.artifact_digest,
                 authority_digest=evidence.authority_digest,
                 effective_gross_ceiling=evidence.effective_gross_ceiling,
+                in_flight_notional=in_flight_notional,
             )
         except Exception as exc:
             raise DispatchGuardError(

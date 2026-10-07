@@ -7,8 +7,10 @@ verified liquidation.
 """
 from __future__ import annotations
 
+import contextlib
 import datetime as dt
 import json
+import threading
 from dataclasses import dataclass, replace
 from decimal import Decimal, ROUND_HALF_UP
 from typing import Any, Callable, Mapping, Optional, Protocol
@@ -16,7 +18,7 @@ from typing import Any, Callable, Mapping, Optional, Protocol
 from trader.data.schema_migrations import SchemaMigrator
 from trader.domain.events import DomainMutation
 from trader.domain.identity import command_entity_id
-from trader.trading.approval_context import AllocationDispatchEvidence
+from trader.trading.approval_context import AllocationDispatchEvidence, InFlightEntry
 from trader.trading.circuit_breaker import BreakerSignal
 from trader.trading.command_coordinator import BrokerRejectedError
 from trader.trading.dispatch_guard import DispatchGuardError
@@ -49,6 +51,22 @@ _FILLED_STATUSES = frozenset({"Filled"})
 _CANCELLED_STATUSES = frozenset({"Cancelled", "ApiCancelled"})
 _REJECTED_STATUSES = frozenset({"Inactive", "Rejected"})
 _TERMINAL_SAGA = frozenset({"CLOSED", "SAFETY_FAILED"})
+# The entry may be at the broker with quantity still unfilled. VALIDATED is
+# not here: it is written before the dispatch guard, so nothing was sent yet.
+_IN_FLIGHT_SAGA = ("SUBMITTING", "OUTCOME_UNKNOWN", "ENTRY_WORKING", "PARTIALLY_FILLED")
+# Sagas whose entry order may still be working. SAFETY_FAILED keeps recording
+# entry events (see _record_entry_after_safety_failure); CLOSE_OWNED records
+# them too until the close's expected cancel of the entry arrives.
+_MAY_WORK_ENTRY_SAGA = _IN_FLIGHT_SAGA + ("SAFETY_FAILED", "CLOSE_OWNED")
+
+_account_entry_locks: dict[str, threading.Lock] = {}
+_account_entry_locks_guard = threading.Lock()
+
+
+def _account_entry_lock(account_id: str) -> threading.Lock:
+    """One lock per account: the final gross check and the send run under it."""
+    with _account_entry_locks_guard:
+        return _account_entry_locks.setdefault(account_id, threading.Lock())
 
 _PRICE_QUANT = Decimal("0.01")
 
@@ -321,6 +339,10 @@ class SagaState:
     pending_groups: tuple[str, ...] = ()      # re-protect legs of the owning close, not yet released
     pending_protection_lost: bool = False      # a pending leg was rejected or cancelled unasked
     flatten_requested: bool = False            # SAFETY_FAILED seen by this version: the worker flattens
+    # When the saga last saw the entry fill grow (broker ingest clock).
+    filled_at: Optional[dt.datetime] = None
+    # Broker position quantity of the conid when the entry was sent.
+    baseline_position: Optional[Decimal] = None
 
     @property
     def current_groups(self) -> tuple[str, ...]:
@@ -362,6 +384,10 @@ class SagaState:
             "pending_groups": list(self.pending_groups),
             "pending_protection_lost": self.pending_protection_lost,
             "flatten_requested": self.flatten_requested,
+            "filled_at": None if self.filled_at is None else self.filled_at.isoformat(),
+            "baseline_position": (
+                None if self.baseline_position is None else str(self.baseline_position)
+            ),
         }
 
     @classmethod
@@ -400,6 +426,14 @@ class SagaState:
             pending_groups=tuple(payload.get("pending_groups") or ()),
             pending_protection_lost=bool(payload.get("pending_protection_lost", False)),
             flatten_requested=bool(payload.get("flatten_requested", False)),
+            filled_at=(
+                dt.datetime.fromisoformat(payload["filled_at"])
+                if payload.get("filled_at") else None
+            ),
+            baseline_position=(
+                _dec(payload["baseline_position"])
+                if payload.get("baseline_position") is not None else None
+            ),
         )
 
 
@@ -501,6 +535,51 @@ class ProtectiveOrderSagaStore:
                 [group, state.command_id, generation],
             )
 
+    def in_flight_entries(
+        self, account_id: str, exclude_command_id: str,
+    ) -> tuple[InFlightEntry, ...]:
+        """BUY entries of this account whose exposure the broker may not show yet.
+
+        The unfilled part counts until a broker cancel or reject of the entry
+        is recorded. The filled part counts in every state until an exit leg
+        fills; the dispatch guard drops it once the broker snapshot proves it.
+        """
+        rows = self._db.execute(
+            "SELECT payload, updated_at FROM automated_order_sagas WHERE state <> 'VALIDATED'",
+            fetch="all",
+        )
+        entries = []
+        for payload, updated_at in rows or ():
+            state = SagaState.from_payload(json.loads(payload))
+            if (
+                state.account_id != account_id
+                or state.command_id == exclude_command_id
+                or state.side != "BUY"
+            ):
+                continue
+            unfilled = Decimal("0")
+            if state.state in _MAY_WORK_ENTRY_SAGA and not state.entry_cancelled:
+                unfilled = max(Decimal("0"), state.requested_quantity - state.filled_quantity)
+            filled = Decimal("0")
+            if not (state.stop_filled or state.target_filled):
+                filled = state.filled_quantity
+            if unfilled <= 0 and filled <= 0:
+                continue
+            entries.append(InFlightEntry(
+                order_group_id=state.order_group_id,
+                conid=state.conid,
+                unfilled_quantity=float(unfilled),
+                filled_quantity=float(filled),
+                limit_price=_entry_limit_price(state),
+                # Rows written before filled_at existed: the last update is
+                # no earlier than the fill.
+                filled_at=state.filled_at or (_as_utc(updated_at) if filled > 0 else None),
+                baseline_position=(
+                    None if state.baseline_position is None else float(state.baseline_position)
+                ),
+            ))
+        return tuple(entries)
+
     def seen_event_in_tx(self, conn, event_id: str) -> bool:
         row = conn.execute(
             "SELECT 1 FROM automated_order_saga_events WHERE event_id = ?", [event_id],
@@ -540,7 +619,53 @@ def _plan_to_json(plan: BracketPlan) -> dict[str, Any]:
     }
 
 
-def _with_allocation_evidence(approval, artifact, decision, entry_limit_price):
+def _apply_entry_leg(state: SagaState, event: BrokerOrderEvent) -> SagaState:
+    """Record an entry order event on the saga fields; never changes ``state.state``.
+
+    A cancel or reject ends the unfilled part (``entry_cancelled``).
+    """
+    status = event.status
+    filled = _dec(event.filled_quantity)
+    next_state = state
+    if status in _WORKING_STATUSES:
+        next_state = replace(next_state, entry_working=True)
+    if status in _CANCELLED_STATUSES or status in _REJECTED_STATUSES:
+        next_state = replace(next_state, entry_cancelled=True, entry_working=False)
+    if filled > next_state.filled_quantity:
+        next_state = replace(
+            next_state,
+            filled_quantity=filled,
+            protection_quantity=filled,
+            protection_adjusted=filled < next_state.requested_quantity,
+        )
+    if status in _FILLED_STATUSES:
+        qty = max(filled, next_state.filled_quantity, next_state.requested_quantity)
+        next_state = replace(
+            next_state, filled_quantity=qty, protection_quantity=qty, entry_working=False,
+        )
+    if next_state.filled_quantity > state.filled_quantity:
+        next_state = replace(next_state, filled_at=_as_utc(event.source_timestamp))
+    return next_state
+
+
+def _entry_limit_price(state: SagaState) -> float:
+    try:
+        price = float(state.plan_json["legs"][0]["limit_price"])
+    except (KeyError, IndexError, TypeError, ValueError) as exc:
+        raise ValueError(f"saga {state.command_id} has no entry limit price") from exc
+    if not price > 0:
+        raise ValueError(f"saga {state.command_id} has an invalid entry limit price")
+    return price
+
+
+def _is_reduction(approval) -> bool:
+    direction = getattr(approval, "risk_direction", None)
+    return str(getattr(direction, "value", direction)) == "REDUCING"
+
+
+def _with_allocation_evidence(
+    approval, artifact, decision, entry_limit_price, in_flight_entries=(),
+):
     """Freeze the ceiling the approval was granted under so dispatch can re-check it."""
     ceiling = getattr(decision, "effective_gross_ceiling", None)
     if ceiling is None:
@@ -551,6 +676,7 @@ def _with_allocation_evidence(approval, artifact, decision, entry_limit_price):
         authority_digest=getattr(decision, "authority_digest", None),
         effective_gross_ceiling=float(ceiling),
         entry_limit_price=float(entry_limit_price),
+        in_flight_entries=tuple(in_flight_entries),
     ))
 
 
@@ -698,10 +824,44 @@ class ProtectiveOrderSaga:
         )
         self._persist(validated, now, from_state=None)
 
+        # A reduction never waits for, or depends on, in-flight entries.
+        lock = (
+            contextlib.nullcontext() if _is_reduction(approval)
+            else _account_entry_lock(self._account_id)
+        )
+        with lock:
+            return self._guard_and_submit(
+                validated, plan, intent, approval, request, artifact, decision,
+                limit_price, now,
+            )
+
+    def _guard_and_submit(
+        self, validated, plan, intent, approval, request, artifact, decision,
+        limit_price, now,
+    ) -> SagaState:
+        """Final gross check and send. Callers hold the account entry lock for entries.
+
+        The SUBMITTING row written here is the durable reservation: later
+        checks count it until the broker snapshot proves its exposure.
+        """
+        in_flight: tuple[InFlightEntry, ...] = ()
+        if not _is_reduction(approval):
+            try:
+                in_flight = self._store.in_flight_entries(
+                    self._account_id, exclude_command_id=validated.command_id,
+                )
+            except Exception:
+                closed = replace(
+                    validated, state="CLOSED", error_code="IN_FLIGHT_STATE_UNAVAILABLE",
+                    revision=validated.revision + 1,
+                )
+                self._persist(closed, now, from_state="VALIDATED")
+                return closed
+
         # 2) Re-run P1 DispatchGuard immediately before first IB side effect.
         try:
             self._dispatch_guard.revalidate(
-                _with_allocation_evidence(approval, artifact, decision, limit_price),
+                _with_allocation_evidence(approval, artifact, decision, limit_price, in_flight),
                 request, now,
             )
         except DispatchGuardError as ex:
@@ -711,7 +871,10 @@ class ProtectiveOrderSaga:
             self._persist(closed, now, from_state="VALIDATED")
             return closed
 
-        submitting = replace(validated, state="SUBMITTING", revision=validated.revision + 1)
+        submitting = replace(
+            validated, state="SUBMITTING", revision=validated.revision + 1,
+            baseline_position=_dec(approval.broker.reducible_quantity(validated.conid)),
+        )
         self._persist(submitting, now, from_state="VALIDATED")
 
         # 3) Irreversible boundary — submit via existing bracket path.
@@ -772,6 +935,8 @@ class ProtectiveOrderSaga:
         state, group_generation = found
         if event.event_id in state.seen_event_ids:
             return state
+        if state.state == "SAFETY_FAILED" and event.leg == "entry":
+            return self._record_entry_after_safety_failure(state, event)
         if state.state in _TERMINAL_SAGA:
             return state
 
@@ -839,7 +1004,8 @@ class ProtectiveOrderSaga:
         working = event.status in _WORKING_STATUSES
         filled = event.status in _FILLED_STATUSES
         if event.leg == "entry":
-            return replace(state, entry_working=working)
+            # Fills and the cancel of the entry keep the gross reservation true.
+            return _apply_entry_leg(state, event)
         if event.leg == "stop":
             return replace(state, stop_working=working, stop_filled=state.stop_filled or filled)
         if event.leg == "take_profit":
@@ -966,6 +1132,19 @@ class ProtectiveOrderSaga:
         """
         return [s.command_id for s in self._store.load_flatten_requested(account_id)]
 
+    def _record_entry_after_safety_failure(
+        self, state: SagaState, event: BrokerOrderEvent,
+    ) -> SagaState:
+        """Keep the reservation true after SAFETY_FAILED: a later fill or cancel
+        of the entry changes what the account may hold. Liquidation already runs."""
+        updated = replace(
+            _apply_entry_leg(state, event),
+            seen_event_ids=state.seen_event_ids + (event.event_id,),
+            revision=state.revision + 1,
+        )
+        self._persist(updated, self._now_utc(), from_state=state.state, event_id=event.event_id)
+        return updated
+
     # -- event application -------------------------------------------------
 
     def _apply_event(self, state: SagaState, event: BrokerOrderEvent) -> SagaState:
@@ -974,30 +1153,10 @@ class ProtectiveOrderSaga:
         next_state = state
 
         if event.leg == "entry":
-            if status in _WORKING_STATUSES:
-                next_state = replace(next_state, entry_working=True)
-            if status in _CANCELLED_STATUSES:
-                next_state = replace(next_state, entry_cancelled=True, entry_working=False)
+            next_state = _apply_entry_leg(next_state, event)
             if status in _REJECTED_STATUSES:
-                return replace(
-                    next_state, state="CLOSED", error_code="PARENT_REJECTED",
-                    entry_working=False,
-                )
-            if filled > 0:
-                next_state = replace(
-                    next_state,
-                    filled_quantity=filled,
-                    protection_quantity=filled,
-                    protection_adjusted=filled < next_state.requested_quantity,
-                )
-            if status in _FILLED_STATUSES:
-                qty = max(filled, next_state.filled_quantity, next_state.requested_quantity)
-                next_state = replace(
-                    next_state,
-                    filled_quantity=qty,
-                    protection_quantity=qty,
-                    entry_working=False,
-                )
+                # The fill is recorded first: those shares stay reserved.
+                return replace(next_state, state="CLOSED", error_code="PARENT_REJECTED")
 
         elif event.leg == "stop":
             if status in _WORKING_STATUSES:

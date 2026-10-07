@@ -40,8 +40,9 @@ SP2 is split into slices, each with its own spec, plan and code:
 - Controller: one async service with a durable journal (approach A). No cron
   runs, no external workflow engine.
 - Starting state (option A, 2026-10-07): the **operator** publishes the initial
-  risk policy and registers a `discretionary` deployment over a universe
-  (default `sp500`); self-found ideas trade only inside it.
+  risk policy and registers one `discretionary` deployment. Its scope is a
+  **rule checked by the trader**, not a fixed list of conids (owner,
+  2026-10-07): any instrument that passes the rule may be traded.
 
 ## 3. Roles and authority
 
@@ -207,13 +208,24 @@ read and mutation rights separate.
    per-symbol news with source, timestamp, delayed label and coverage. Alpaca
    credentials stay in the trader/data services, never in `ai`. No implicit
    fallback to the IB scanner. Rights: `ai_supervisor` read only.
-6. **Discretionary deployment kind.** Self-found ideas trade only inside a
+6. **Discretionary deployment kind.** Self-found ideas trade only under a
    `discretionary` deployment that an **operator** registers (`cli` principal
-   only, paper only). It names a universe (default `sp500`, configurable) and is
-   sealed with the universe digest and the operator's attestation instead of
-   backtest evidence; it is labelled `discretionary` everywhere it is shown. All
-   other SP1 deployment and admission checks are unchanged; a discovered conid
-   outside the universe stays refused (`CONID_NOT_IN_DEPLOYMENT`).
+   only, paper only). Its scope is a **rule**, not a conid list; the rule
+   parameters are sealed into the deployment together with the operator's
+   attestation instead of backtest evidence, and it is labelled `discretionary`
+   everywhere it is shown. The bot cannot register or widen it. Default rule,
+   every part configurable by the operator:
+   - US stocks and ETFs with a primary listing on NYSE, NASDAQ or NYSE Arca;
+     no warrants, rights, units or OTC instruments;
+   - last price at least $5;
+   - 20-session median dollar volume at least $20M, plus SP1's existing
+     liquidity rule (order notional ≤ 1% of that volume);
+   - `trading_filters.yaml` applies (exact symbol, exchange and type).
+   The trader checks the rule at admission **and** at dispatch with fresh broker
+   evidence. An instrument that fails any part, or whose evidence cannot be
+   verified fresh, is refused with a specific code (`OUT_OF_DISCRETIONARY_SCOPE`
+   plus the failed part). All other SP1 deployment and admission checks are
+   unchanged.
 7. **Initial policy.** The operator publishes the initial risk policy with a
    `cli` command before arming. SP2a/b never publishes or loosens policy on
    startup or restart (policy generation is SP2d).
@@ -268,7 +280,8 @@ close recovery, not new discretionary exits without a working model.
 ## 10. Data sources
 
 - Discovery uses Alpaca movers, most-actives and news (through amendment 6.5),
-  plus an optional watchlist, limited to the discretionary universe. Alpaca discovery data is 15-minute-delayed SIP: every candidate is
+  plus an optional watchlist. Candidates outside the discretionary scope rule
+  are dropped before any model call (the trader re-checks at admission). Alpaca discovery data is 15-minute-delayed SIP: every candidate is
   timestamped and labelled delayed. Fresh broker-side evidence (IB quote) is
   obtained before any ENTER is submitted.
 - A failed or incomplete scan is never presented as complete.
@@ -334,8 +347,9 @@ exercised through signed typed RPC, including cross-principal calls.
 
 **Initialization.** With SP2c/d disabled and empty stores, initialize through
 signed RPC only (operator publishes the policy and registers the discretionary
-deployment), then run one strategy entry and one self-found entry; an
-unregistered candidate stays refused; a restart neither republishes nor loosens
+deployment), then run one strategy entry and one self-found entry; a candidate that fails
+any part of the scope rule (price, volume, exchange, type, filter) or whose
+evidence is stale is refused with its specific code; a restart neither republishes nor loosens
 policy nor substitutes fixture evidence.
 
 **Discovery route.** Through real signed trader RPC with a fake Alpaca transport

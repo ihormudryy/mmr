@@ -90,9 +90,13 @@ class Projection:
 
 
 def fills_digest(fills: Sequence[FillFact]) -> str:
-    """Over the immutable fill fields; the commission is left out (it may arrive late, ruling 10)."""
-    items = sorted((f.exec_id, f.side, str(f.quantity), str(f.price),
-                    f.fill_time.astimezone(dt.timezone.utc).isoformat()) for f in fills)
+    """Over every immutable field that places a fill in a trip: instrument, side, size, price, time, order ref.
+
+    The commission is left out: it may arrive late and is booked as an adjustment (ruling 10);
+    verify checks it against ``commission_json`` plus the adjustments instead.
+    """
+    items = sorted((f.exec_id, f.conid, f.side, str(f.quantity), str(f.price),
+                    f.fill_time.astimezone(dt.timezone.utc).isoformat(), f.order_ref) for f in fills)
     return hashlib.sha256(json.dumps(items, separators=(",", ":")).encode()).hexdigest()
 
 

@@ -100,6 +100,17 @@ def test_edited_fill_price_is_detected_through_the_fills_digest(service, db):
     assert "SESSION_FILLS_CHANGED" in checks(service.verify())
 
 
+@pytest.mark.parametrize("sql", [
+    "UPDATE broker_fills SET conid = 272093 WHERE exec_id IN ('e1', 'e2')",       # review #33: a whole trip
+    "UPDATE broker_order_aliases SET alias_value = 'mmr:og-other' WHERE alias_value = 'mmr:og-aip-1'"])
+def test_changed_fill_identity_after_sealing_fails_verify_with_an_incident(service, db, sql):
+    db.execute(sql)
+    service.refresh()                                   # derived trips follow the changed fill
+    result = service.verify()
+    assert result["ok"] is False and "SESSION_FILLS_CHANGED" in checks(result)
+    assert any("SESSION_FILLS_CHANGED" in incident["key"] for incident in result["incidents"])
+
+
 def test_edited_commission_without_an_adjustment_is_detected(service, db):
     set_commission(db, ACCOUNT, "e1", 5.0)
     assert "COMMISSION_MISMATCH" in checks(service.verify())

@@ -28,6 +28,7 @@ from trader.research.market_context import LIVE_NOTIONAL_TOLERANCE
 from trader.trading.approval_context import (
     ApprovalContext, ApprovalContextError, EntryLimitsEvidence, capture_approval_context,
 )
+from trader.trading.quote_feeds import LIVE_ONLY_FEEDS
 
 AI_PAPER_ACTION = "submit_ai_paper_decision"
 # R18: the trader owns the order type. A DAY marketable limit at most 10 bps through the ask.
@@ -80,7 +81,8 @@ class AiPaperEvidence:
     def __init__(self, *, broker: Any, quotes: Any, margin: Any, history: Any, journal: Any,
                  account_id: str, account_mode: str, now: Callable[[], dt.datetime], max_drift_bps: float,
                  entry_offset_bps: Decimal, entry_filter: AiEntryFilter,
-                 liquidity_policy: Optional[LiquidityPolicy] = None):
+                 liquidity_policy: Optional[LiquidityPolicy] = None,
+                 accepted_feeds: frozenset[str] = LIVE_ONLY_FEEDS):
         self._broker = broker
         self._quotes = quotes
         self._margin = margin
@@ -92,7 +94,8 @@ class AiPaperEvidence:
         self._max_drift_bps = max_drift_bps
         self._offset_bps = entry_offset_bps
         self._filter = entry_filter
-        self._liquidity_policy = liquidity_policy or LiquidityPolicy()
+        self._accepted_feeds = frozenset(accepted_feeds)
+        self._liquidity_policy = liquidity_policy or LiquidityPolicy(accepted_feeds=self._accepted_feeds)
 
     def prepare_entry(self, *, conid: int, stop_price: float, requested_quantity: Optional[int],
                       limits: RiskLimits, session: Any, notional: float, experiment_id: str) -> PreparedEntry:
@@ -117,12 +120,12 @@ class AiPaperEvidence:
 
         approval = self._capture_approval(conid, quantity)
         order = SimpleNamespace(conid=conid, side="BUY", requested_quantity=quantity)
-        validate_approval(order, approval, account_id=self._account_id, now=self._now())
+        self._validate(order, approval)
         self._recheck_on_approval(approval, conid, quantity, stop_price, limits, liquidity_max, notional_cap)
         check_margin(approval)
         hwm = self._update_high_water_mark(experiment_id, approval)
         # Persistence and history I/O can use up the quote's freshness window.
-        validate_approval(order, approval, account_id=self._account_id, now=self._now())
+        self._validate(order, approval)
 
         evidence = EntryLimitsEvidence(
             limits=limits, stop_price=float(stop_price), liquidity_max_shares=liquidity_max,
@@ -138,6 +141,10 @@ class AiPaperEvidence:
         )
 
     # -- steps ---------------------------------------------------------------
+
+    def _validate(self, order: Any, approval: ApprovalContext) -> None:
+        validate_approval(order, approval, account_id=self._account_id, now=self._now(),
+                          accepted_feeds=self._accepted_feeds)
 
     def _check_binding(self) -> None:
         if (self._account_mode != "paper" or not isinstance(self._account_id, str)

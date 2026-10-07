@@ -603,3 +603,49 @@ def test_unknown_broker_pnl_refuses_the_entry(field):
     with pytest.raises(DispatchGuardError) as caught:
         guard.revalidate(_anchored_approval(), _ai_request(), NOW)
     assert caught.value.code == "LOSS_STATE_UNKNOWN"
+
+
+# --- Issue #74: the accepted-feed set is explicit -------------------------------
+
+IEX_FEEDS = frozenset({"live", "iex_realtime"})
+
+
+def _iex_quote(**changes):
+    return replace(_quote(feed="iex_realtime"), **changes)
+
+
+def _feed_guard(quote, *, mode="paper", feeds=IEX_FEEDS):
+    guard = _guard(mode=mode, quote=quote)
+    return DispatchGuard(
+        broker=guard._broker, quotes=guard._quotes, margin=guard._margin, controls=guard._controls,
+        risk_gate=guard._risk_gate, policy=guard._policy, account_id=ACCOUNT, account_mode=mode,
+        accepted_feeds=feeds,
+    )
+
+
+def test_the_default_guard_refuses_an_iex_quote_for_an_automated_entry():
+    with pytest.raises(DispatchGuardError) as caught:
+        _guard(quote=_iex_quote()).revalidate(_approved(), _automated_request(), NOW)
+    assert caught.value.code == "FEED_NOT_LIVE"
+
+
+def test_a_paper_guard_with_the_iex_set_dispatches_on_an_iex_quote():
+    permit = _feed_guard(_iex_quote()).revalidate(_approved(), _automated_request(), NOW)
+    assert permit.quote_timestamp == NOW
+
+
+@pytest.mark.parametrize(("quote", "code"), [
+    (_iex_quote(market_timestamp=NOW - dt.timedelta(seconds=6)), "QUOTE_STALE"),
+    (_iex_quote(bid=210.5, ask=210.0), "CROSSED_MARKET"),
+    (_iex_quote(session_state="closed"), "SESSION_INCOMPATIBLE"),
+    (_quote(feed="delayed"), "FEED_NOT_LIVE"),
+])
+def test_iex_quotes_meet_the_unchanged_market_checks(quote, code):
+    with pytest.raises(DispatchGuardError) as caught:
+        _feed_guard(quote).revalidate(_approved(), _automated_request(), NOW)
+    assert caught.value.code == code
+
+
+def test_a_live_account_guard_cannot_accept_the_iex_feed():
+    with pytest.raises(ValueError, match="only the live feed"):
+        _feed_guard(_iex_quote(), mode="live")

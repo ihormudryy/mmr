@@ -99,6 +99,9 @@ class AutomationConfig:
     # Exact one-strategy name allowed to emit automated intents when enabled.
     # Empty (default) means no strategy may emit — fail closed.
     strategy_name: str = ''
+    # Paper only: 'alpaca_iex' uses Alpaca's real-time IEX quote when IB has no
+    # live feed. Empty (default) = off. Any other value is refused at load.
+    quote_fallback: str = ''
 
 
 @dataclass
@@ -234,6 +237,7 @@ class MMRConfig:
             'automation_public_key_ring_path': ('automation', 'public_key_ring_path'),
             'automation_expected_artifact_id': ('automation', 'expected_artifact_id'),
             'automation_strategy_name': ('automation', 'strategy_name'),
+            'automation_quote_fallback': ('automation', 'quote_fallback'),
             # Top-level
             'root_directory': ('root_directory',),
             'config_file': ('config_file',),
@@ -305,7 +309,7 @@ class MMRConfig:
             bool_keys = ('enabled', 'live_enabled')
             str_keys = (
                 'artifact_bundle_path', 'public_key_ring_path',
-                'expected_artifact_id', 'strategy_name',
+                'expected_artifact_id', 'strategy_name', 'quote_fallback',
             )
             for key in bool_keys:
                 flat = f'automation_{key}'
@@ -329,6 +333,9 @@ class MMRConfig:
 
         from trader.automation.ai_paper_config import load_ai_paper_config
         config.ai_paper = load_ai_paper_config(raw.get('ai_paper'), trading_mode=config.trading_mode)
+
+        from trader.trading.quote_feeds import parse_quote_fallback
+        parse_quote_fallback(config.automation.quote_fallback)
 
         if config.automation.live_enabled:
             raise ValueError(

@@ -571,7 +571,7 @@ def _build_ai_paper_services(
     trader: Any, parts: Optional[_AiPaperParts], *, ledger: CommandLedger, journal: Any,
     controls: TradingControlStore, broker: Any, quotes: Any, margin: Any, policy: CommandAuthorityPolicy,
     saga: Any, liquidation: Any, exit_owners: Any, account_mode: str, now: Callable[[], dt.datetime],
-    schedule_reconcile: Callable[[str], None], experiments: Any = None,
+    schedule_reconcile: Callable[[str], None], accepted_feeds: frozenset[str], experiments: Any = None,
 ) -> Optional[AiPaperServices]:
     if parts is None:
         return None
@@ -587,7 +587,7 @@ def _build_ai_paper_services(
         broker=broker, quotes=quotes, margin=margin, history=getattr(trader, "data", None),
         journal=journal, account_id=trader.ib_account, account_mode=account_mode, now=now,
         max_drift_bps=policy.max_drift_bps, entry_offset_bps=AI_ENTRY_POLICY.limit_offset_bps,
-        entry_filter=parts.entry_filter,
+        entry_filter=parts.entry_filter, accepted_feeds=accepted_feeds,
     )
     decisions = AiPaperDecisionService(
         ledger=ledger, journal=journal, controls=controls, policy=parts.policy, deployments=deployments,
@@ -650,6 +650,45 @@ def _resolve_contract(trader: Any, conid: int):
     return None if security is None else Universe.to_contract(security)
 
 
+ALPACA_QUOTE_TIMEOUT_SECS = 3.0
+
+
+def _build_quote_authority(
+    trader: Any, ib_quotes: Any, *, account_mode: str, now: Callable[[], dt.datetime],
+) -> tuple[Any, frozenset[str]]:
+    """IB quotes, wrapped with the Alpaca IEX fallback only on paper with ``automation.quote_fallback``.
+
+    Returns the quote authority and the feeds every entry check accepts. A live
+    account never builds an Alpaca client, whatever the setting says.
+    """
+    from trader.trading.quote_feeds import QUOTE_FALLBACK_OFF, accepted_feeds, parse_quote_fallback
+
+    try:
+        setting = parse_quote_fallback(getattr(trader, "automation_quote_fallback", "") or "")
+    except ValueError as exc:
+        raise CommandStackConfigurationError("QUOTE_FALLBACK_INVALID", str(exc)) from None
+    feeds = accepted_feeds(account_mode, setting)
+    if setting == QUOTE_FALLBACK_OFF:
+        return ib_quotes, feeds
+    if account_mode != "paper":
+        logger.warning("automation.quote_fallback=%s is ignored: the account is %s", setting, account_mode)
+        return ib_quotes, feeds
+    key_id = (getattr(trader, "alpaca_api_key_id", "") or "").strip()
+    secret_key = (getattr(trader, "alpaca_api_secret_key", "") or "").strip()
+    if not key_id or not secret_key:
+        raise CommandStackConfigurationError(
+            "QUOTE_FALLBACK_KEYS_MISSING",
+            f"automation.quote_fallback={setting} needs ALPACA_API_KEY_ID and ALPACA_API_SECRET_KEY",
+        )
+    from trader.data_providers.alpaca import client as alpaca_client
+    from trader.trading.paper_quote_fallback import AlpacaIexQuoteAuthority, FallbackQuoteAuthority
+
+    client = alpaca_client.AlpacaClient(key_id, secret_key, timeout=ALPACA_QUOTE_TIMEOUT_SECS)
+    iex = AlpacaIexQuoteAuthority(client, resolve_security=lambda conid: _resolve_security(trader, conid), now=now)
+    logger.info("paper quotes fall back to Alpaca IEX when IB has no live feed")
+    return FallbackQuoteAuthority(ib_quotes, iex, account_mode=account_mode), feeds
+
+
 def _broker_ready(trader: Any) -> bool:
     if not trader.is_ib_connected():
         return False
@@ -679,6 +718,7 @@ def _build_automated_intent_service(
     quotes: Any,
     margin: Any,
     policy: CommandAuthorityPolicy,
+    accepted_feeds: frozenset[str],
     liquidation: Any = None,
     entry_block: Optional[Callable[[], Optional[str]]] = None,
 ) -> Optional[Any]:
@@ -726,7 +766,7 @@ def _build_automated_intent_service(
         history=getattr(trader, "data", None), journal=journal,
         account_id=account_id, account_mode=account_mode,
         strategy_id=getattr(trader, "automation_strategy_name", None),
-        max_drift_bps=policy.max_drift_bps, now=now,
+        max_drift_bps=policy.max_drift_bps, now=now, accepted_feeds=accepted_feeds,
     )
 
     return AutomatedIntentCommandService(
@@ -1048,8 +1088,10 @@ def build_command_stack(
     positions = TraderPositionAuthority(trader)
     run_coro = lambda coro: _run_on_trader_loop(trader, coro)
     resolve_contract = lambda conid: _resolve_contract(trader, conid)
-    quotes = TraderQuoteAuthority(
-        trader, run_coro=run_coro, resolve_contract=resolve_contract, delayed=False,
+    quotes, accepted_feeds = _build_quote_authority(
+        trader,
+        TraderQuoteAuthority(trader, run_coro=run_coro, resolve_contract=resolve_contract, delayed=False),
+        account_mode=account_mode, now=now,
     )
     broker_snapshot = TraderBrokerRiskSnapshotAuthority(
         db=trader.journal_db,
@@ -1105,6 +1147,7 @@ def build_command_stack(
         ),
         **_ai_paper_guard_options(ai_paper_parts),
         experiment_gate=lambda request: experiment_gate_slot["gate"](request),
+        accepted_feeds=accepted_feeds,
     )
 
     def compute_risk_projection():
@@ -1265,10 +1308,12 @@ def build_command_stack(
     )
     # P3 Task 4 — trader-owned session/liquidity risk (evaluate-only; saga uses it in Task 5).
     from trader.automation.calendar_policy import XNYSCalendarPolicy
+    from trader.automation.liquidity_policy import LiquidityPolicy
     from trader.automation.session_risk import SessionRiskController
 
     session_risk = SessionRiskController(
         calendar=XNYSCalendarPolicy(),
+        liquidity_policy=LiquidityPolicy(accepted_feeds=accepted_feeds),
         breaker=circuit_breaker,
         allocation_policy=allocation_policy,
         portfolio_authority_present=lambda account_id: (
@@ -1401,6 +1446,7 @@ def build_command_stack(
     automated_intent_service = _build_automated_intent_service(
         trader,
         broker=broker_snapshot, quotes=quotes, margin=margin, policy=policy,
+        accepted_feeds=accepted_feeds,
         ledger=ledger,
         audit=CommandAudit(journal),
         journal=journal,
@@ -1422,6 +1468,7 @@ def build_command_stack(
         saga=protective_order_saga, liquidation=liquidation_service, exit_owners=exit_owner_registry,
         account_mode=account_mode, now=now,
         schedule_reconcile=lambda command_id: reconciler.schedule(command_id, now()),
+        accepted_feeds=accepted_feeds,
         experiments=None if experiments is None else experiments.reader,
     )
     late["ai_paper"] = ai_paper
@@ -1493,6 +1540,7 @@ def build_command_stack(
         return _build_automated_intent_service(
             trader_obj,
             broker=broker_snapshot, quotes=quotes, margin=margin, policy=policy,
+            accepted_feeds=accepted_feeds,
             ledger=ledger,
             audit=CommandAudit(journal),
             journal=journal,

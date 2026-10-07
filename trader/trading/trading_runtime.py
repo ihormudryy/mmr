@@ -114,7 +114,10 @@ class Trader():
                  automation_artifact_bundle_path: str = '',
                  automation_public_key_ring_path: str = '',
                  automation_expected_artifact_id: str = '',
-                 automation_strategy_name: str = ''):
+                 automation_strategy_name: str = '',
+                 automation_quote_fallback: str = '',
+                 alpaca_api_key_id: str = '',
+                 alpaca_api_secret_key: str = ''):
         self.ib_server_address = ib_server_address
         self.ib_server_port = ib_server_port
         self.trading_runtime_ib_client_id = trading_runtime_ib_client_id
@@ -140,6 +143,10 @@ class Trader():
         self.automation_public_key_ring_path = automation_public_key_ring_path or ''
         self.automation_expected_artifact_id = automation_expected_artifact_id or ''
         self.automation_strategy_name = automation_strategy_name or ''
+        # build_command_stack validates the fallback and needs the keys only when it is on.
+        self.automation_quote_fallback = automation_quote_fallback or ''
+        self.alpaca_api_key_id = alpaca_api_key_id or ''
+        self.alpaca_api_secret_key = alpaca_api_secret_key or ''
         # When True, `place_order_simple` (the direct buy/sell RPC path) is
         # rejected unless the caller explicitly sets `skip_risk_gate=True`
         # (close-all / liquidation). All actionable new trades must come

@@ -11,6 +11,7 @@ from trader.automation.risk_limits import PAPER_LIMITS, RiskLimits
 from trader.data.broker_state import BrokerRiskSnapshotError
 from trader.promotion.allocation_policy import AllocationPolicy
 from trader.trading.command_policy import CommandAuthorityPolicy
+from trader.trading.quote_feeds import LIVE_ONLY_FEEDS, require_live_feed_on_live_account
 from trader.trading.trading_control import PauseStateUnavailable, TradingPausedError
 
 
@@ -143,7 +144,9 @@ class DispatchGuard:
         ai_entry_gate: Callable[[Any, Any, Any, dt.datetime], Optional[str]] = lambda *args: None,
         strict_margin_actions: frozenset[str] = frozenset(),
         experiment_gate: Callable[[Any], Optional[str]] = lambda request: None,
+        accepted_feeds: frozenset[str] = LIVE_ONLY_FEEDS,
     ):
+        require_live_feed_on_live_account(account_mode, accepted_feeds)
         self._broker = broker
         self._quotes = quotes
         self._margin = margin
@@ -159,6 +162,7 @@ class DispatchGuard:
         self._strict_margin_actions = frozenset(strict_margin_actions)
         # SP1 Plan 4 K20: an ai_paper entry admitted before a kill is refused here after it.
         self._experiment_gate = experiment_gate
+        self._accepted_feeds = frozenset(accepted_feeds)
 
     def _limits_for(self, request) -> RiskLimits:
         try:
@@ -343,8 +347,8 @@ class DispatchGuard:
         # paper proposal path may still use its documented delayed reference.
         automated = getattr(request, "action", None) in AUTOMATED_ENTRY_ACTIONS
         if self._account_mode == "live" or automated:
-            if quote.feed_type != "live":
-                raise DispatchGuardError("FEED_NOT_LIVE", "live feed required", retryable=True)
+            if quote.feed_type not in self._accepted_feeds:
+                raise DispatchGuardError("FEED_NOT_LIVE", "accepted feed required", retryable=True)
             if quote.session_state != "continuous":
                 raise DispatchGuardError(
                     "SESSION_INCOMPATIBLE", "market is not continuous", retryable=True

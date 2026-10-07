@@ -30,6 +30,7 @@ from trader.trading.approval_context import (
 )
 from trader.trading.dispatch_guard import MAX_QUOTE_AGE_SECONDS, MAX_SOURCE_CLOCK_SKEW_SECONDS
 from trader.trading.proposal_command_service import ExecutableQuote, QuoteAuthority
+from trader.trading.quote_feeds import LIVE_ONLY_FEEDS
 
 if TYPE_CHECKING:
     from trader.data.data_access import TickStorage
@@ -46,10 +47,12 @@ def _number(value: Any, code: str, *, positive: bool = False) -> float:
     return number
 
 
-def validate_approval(order: Any, approval: ApprovalContext, *, account_id: str, now: dt.datetime) -> None:
+def validate_approval(order: Any, approval: ApprovalContext, *, account_id: str, now: dt.datetime,
+                      accepted_feeds: frozenset[str] = LIVE_ONLY_FEEDS) -> None:
     """Fail closed unless the approval is fenced paper evidence for ``order`` with a fresh crossable quote.
 
-    ``order`` needs ``conid``, ``side`` and ``requested_quantity``.
+    ``order`` needs ``conid``, ``side`` and ``requested_quantity``. An entry's
+    quote must come from one of ``accepted_feeds``.
     """
     if (approval.conid != order.conid or approval.side != order.side
             or approval.quantity != _number(order.requested_quantity, "QUANTITY_INVALID", positive=True)):
@@ -85,8 +88,8 @@ def validate_approval(order: Any, approval: ApprovalContext, *, account_id: str,
     ask = _number(quote.ask, "QUOTE_INVALID", positive=True)
     if ask < bid or price != (ask if order.side == "BUY" else bid):
         raise ApprovalContextError("QUOTE_INVALID", "crossable side of book is required")
-    if order.side == "BUY" and quote.feed_type != "live":
-        raise ApprovalContextError("FEED_NOT_LIVE", "automated entry requires a live feed")
+    if order.side == "BUY" and quote.feed_type not in accepted_feeds:
+        raise ApprovalContextError("FEED_NOT_LIVE", "automated entry requires an accepted feed")
     if quote.session_state != "continuous":
         raise ApprovalContextError("QUOTE_SESSION_INVALID", "continuous trading evidence is required")
 
@@ -153,6 +156,7 @@ class ProductionAutomationEvidence:
         journal: DomainJournal, account_id: str, account_mode: str,
         strategy_id: str | None, max_drift_bps: float,
         now: Callable[[], dt.datetime],
+        accepted_feeds: frozenset[str] = LIVE_ONLY_FEEDS,
     ) -> None:
         self._broker = broker
         self._quotes = quotes
@@ -164,6 +168,7 @@ class ProductionAutomationEvidence:
         self._strategy_id = strategy_id
         self._max_drift_bps = max_drift_bps
         self._now = now
+        self._accepted_feeds = frozenset(accepted_feeds)
 
     def approval_factory(self, *, intent: ExecutionIntent, command: Any) -> ApprovalContext:
         self._check_binding(intent)
@@ -185,7 +190,8 @@ class ProductionAutomationEvidence:
         return replace(approval, risk_direction="REDUCING" if intent.side == "SELL" else "INCREASING")
 
     def _validate_approval(self, intent: ExecutionIntent, approval: ApprovalContext, now: dt.datetime) -> None:
-        validate_approval(intent, approval, account_id=self._account_id, now=now)
+        validate_approval(intent, approval, account_id=self._account_id, now=now,
+                          accepted_feeds=self._accepted_feeds)
 
     def _check_binding(self, intent: ExecutionIntent) -> None:
         if (self._account_mode != "paper" or intent.account_mode != "paper"

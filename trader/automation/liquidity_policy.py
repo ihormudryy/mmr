@@ -8,13 +8,13 @@ from decimal import Decimal
 from typing import Tuple
 
 from trader.trading.circuit_breaker import BreakerSignal
+from trader.trading.quote_feeds import LIVE_ONLY_FEEDS
 
 # Hard floors / ceilings from the trading-income foundation design §9.2
 MIN_PRICE = 5.0
 MIN_MEDIAN_DOLLAR_VOLUME = 50_000_000.0
 MAX_SPREAD_BPS = 15.0
 MAX_ADV_FRACTION = 0.0025  # 0.25% of 20-day ADV
-PERMITTED_FEEDS = frozenset({"live"})
 
 
 @dataclass(frozen=True)
@@ -47,6 +47,9 @@ def _finite_positive(value: float) -> bool:
 
 class LiquidityPolicy:
     """Pure evaluator — no I/O. Caller supplies evidence and an injected clock."""
+
+    def __init__(self, accepted_feeds: frozenset[str] = LIVE_ONLY_FEEDS):
+        self._accepted_feeds = frozenset(accepted_feeds)
 
     def max_quantity(self, evidence: LiquidityEvidence) -> float:
         """The most shares ``evaluate`` can approve on the ADV cap and the top-of-book depth."""
@@ -97,7 +100,7 @@ class LiquidityPolicy:
         if qty > adv_cap:
             reasons.append("ADV_CAP")
 
-        if evidence.feed_type not in PERMITTED_FEEDS:
+        if evidence.feed_type not in self._accepted_feeds:
             reasons.append("FEED_NOT_LIVE")
             signals.append(BreakerSignal("QUOTE_FAILURE", now, detail=evidence.feed_type))
 

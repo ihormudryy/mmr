@@ -197,3 +197,19 @@ def test_margin_is_never_reported_as_a_sizing_bound(parts):                     
 def test_a_stop_at_or_above_the_entry_price_is_invalid(parts, stop):
     with pytest.raises(ApprovalContextError, match="STOP_INVALID"):
         prepare(parts, stop_price=stop)
+
+
+# --- Issue #74: paper IEX quotes need the explicit accepted-feed set ------------
+
+def test_an_iex_entry_quote_is_refused_by_default(parts):
+    parts["quotes"] = Quotes(quote(feed="iex_realtime"))
+    with pytest.raises(ApprovalContextError) as exc:
+        prepare(parts)
+    assert exc.value.code == "FEED_NOT_LIVE"
+
+
+def test_an_approved_iex_entry_records_the_iex_feed(parts):
+    parts["quotes"] = Quotes(quote(feed="iex_realtime"))
+    prepared = prepare(dict(parts, accepted_feeds=frozenset({"live", "iex_realtime"})))
+    assert prepared.approval.market.quote.feed_type == "iex_realtime"
+    assert prepared.session_state.liquidity.feed_type == "iex_realtime"

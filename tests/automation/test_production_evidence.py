@@ -469,3 +469,47 @@ def test_real_typed_evidence_satisfies_session_risk_controller(history, journal)
     decision = SessionRiskController(now=lambda: NOW).evaluate(buy, bundle, approved, state, allocation)
     assert decision.approved, decision.reason_codes
     assert decision.approved_quantity == Decimal("7")
+
+
+# --- Issue #74: paper IEX quotes need the explicit accepted-feed set ------------
+
+IEX_FEEDS = frozenset({"live", "iex_realtime"})
+
+
+def test_the_default_evidence_refuses_an_iex_entry_quote():
+    ports = Ports()
+    ports.quote = quote(feed_type="iex_realtime")
+    with pytest.raises(ApprovalContextError, match="FEED_NOT_LIVE"):
+        adapter(ports).approval_factory(intent=intent(), command=SimpleNamespace())
+
+
+@pytest.mark.parametrize("changes,code", [
+    ({"market_timestamp": NOW - dt.timedelta(seconds=6)}, "QUOTE_STALE"),
+    ({"bid": 100.10}, "QUOTE_INVALID"),                    # crossed: bid above ask
+    ({"session_state": "closed"}, "QUOTE_SESSION_INVALID"),
+    ({"feed_type": "delayed"}, "FEED_NOT_LIVE"),
+])
+def test_iex_entry_quotes_meet_the_unchanged_checks(changes, code):
+    ports = Ports()
+    ports.quote = quote(**{"feed_type": "iex_realtime", **changes})
+    with pytest.raises(ApprovalContextError, match=code):
+        adapter(ports, accepted_feeds=IEX_FEEDS).approval_factory(intent=intent(), command=SimpleNamespace())
+
+
+def test_an_approved_paper_iex_entry_records_the_iex_feed(history, journal):
+    from trader.automation.liquidity_policy import LiquidityPolicy
+    from trader.automation.session_risk import SessionRiskController
+    ports = Ports()
+    ports.quote = quote(feed_type="iex_realtime")
+    evidence = adapter(ports, journal=journal, history=history, accepted_feeds=IEX_FEEDS)
+    buy, bundle, command = intent(), artifact(), SimpleNamespace()
+    approved = evidence.approval_factory(intent=buy, command=command)
+    state = evidence.session_state_factory(intent=buy, command=command, approval=approved)
+    allocation = evidence.allocation_factory(intent=buy, artifact=bundle, command=command)
+
+    assert approved.market.quote.feed_type == "iex_realtime"
+    assert state.liquidity.feed_type == "iex_realtime"
+    accepting = SessionRiskController(liquidity_policy=LiquidityPolicy(accepted_feeds=IEX_FEEDS), now=lambda: NOW)
+    assert accepting.evaluate(buy, bundle, approved, state, allocation).approved
+    refusing = SessionRiskController(now=lambda: NOW).evaluate(buy, bundle, approved, state, allocation)
+    assert "FEED_NOT_LIVE" in refusing.reason_codes

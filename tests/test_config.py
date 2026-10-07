@@ -210,6 +210,31 @@ class TestMMRConfig:
         with pytest.raises(ValueError, match="automation.live_enabled"):
             MMRConfig.from_yaml(str(cfg))
 
+    def test_quote_fallback_is_off_by_default(self, tmp_path):
+        cfg = tmp_path / "cfg.yaml"
+        cfg.write_text("automation:\n  enabled: false\n")
+        assert MMRConfig.from_yaml(str(cfg)).automation.quote_fallback == ''
+
+    @pytest.mark.parametrize("value", ["alpaca_iex", "''"])
+    def test_quote_fallback_known_values_load(self, tmp_path, value):
+        cfg = tmp_path / "cfg.yaml"
+        cfg.write_text(f"automation:\n  quote_fallback: {value}\n")
+        assert MMRConfig.from_yaml(str(cfg)).automation.quote_fallback == value.strip("'")
+
+    @pytest.mark.parametrize("value", ["alpaca", "ALPACA_IEX", "' alpaca_iex'", "true", "iex"])
+    def test_quote_fallback_unknown_value_fails_loudly(self, tmp_path, value):
+        cfg = tmp_path / "cfg.yaml"
+        cfg.write_text(f"automation:\n  quote_fallback: {value}\n")
+        with pytest.raises(ValueError, match="automation.quote_fallback"):
+            MMRConfig.from_yaml(str(cfg))
+
+    def test_quote_fallback_flat_env_key_is_validated_too(self, tmp_path, monkeypatch):
+        cfg = tmp_path / "cfg.yaml"
+        cfg.write_text("automation:\n  quote_fallback: alpaca_iex\n")
+        monkeypatch.setenv('AUTOMATION_QUOTE_FALLBACK', 'polygon')
+        with pytest.raises(ValueError, match="automation.quote_fallback"):
+            MMRConfig.from_yaml(str(cfg))
+
 
 class TestEmptyEnvProviderKeys:
     """docker-compose passes `KEY: ${KEY:-}`, so an unset host var arrives as ''."""

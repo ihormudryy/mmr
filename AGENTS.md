@@ -115,6 +115,7 @@ Top-level directories:
   - `auto_execute: propose` turns signals into PENDING proposals; `auto_execute: true` (full auto) is refused at load.
   - On paper an LLM may approve after its own evaluation. On live, a human must approve (`LLM_LIVE_APPROVE_FORBIDDEN`).
   - `automation.live_enabled` stays `false`. Automated paper entries need a signed, bound research bundle (see [docs/PAPER_AUTOMATION_SETUP.md](docs/PAPER_AUTOMATION_SETUP.md)).
+  - Self-found ideas trade only under an operator `discretionary` deployment (`mmr ai-deployment register-discretionary`, `cli` only, paper only). The trader checks its scope rule (primary listing, stock/ETF type from IB `stockType`, bid ≥ floor, 20-session median dollar volume, ≤ 1 % of it per order, `trading_filters.yaml`) at admission and at dispatch; a miss is `OUT_OF_DISCRETIONARY_SCOPE` with the failed part. A model `CLOSE` / `PARTIAL_CLOSE` reduces only a position the current experiment bought (`POSITION_NOT_OWNED`), and a partial close keeps the existing stop and target.
   - `automation.quote_fallback: alpaca_iex` (paper only) uses Alpaca IEX quotes, labelled `iex_realtime`, when IB has no live feed. Never label them `live`; a live account never calls Alpaca. See [docs/OPERATIONAL_STATE.md](docs/OPERATIONAL_STATE.md).
 - **Never print secrets.** No tokens, API keys, `.env` values, RPC private keys or signing keys in logs, output, commits or PR text.
 - **YAML:** load untrusted YAML with `yaml.safe_load`. No `!!python/object` tags.

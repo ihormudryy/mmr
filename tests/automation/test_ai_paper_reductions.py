@@ -9,6 +9,7 @@ import pytest
 
 from tests.automation.ai_paper_fixtures import ACCOUNT, CONID, NOW, pos, snapshot
 from tests.automation.ai_paper_world import World
+from tests.automation.discretionary_world import discretionary_world
 from tests.test_liquidation_service import _Protection
 from trader.automation.ai_paper_experiment import ExperimentView
 from trader.automation.reduction_close import start_broker_proven_close
@@ -234,3 +235,25 @@ def test_shared_close_passes_prices_only_for_a_partial():
     _close(liquidation, quantity=300.0, stop_price=97.5)
     assert liquidation.calls[0]["quantity"] == 100.0 and liquidation.calls[0]["stop_price"] == 97.5
     assert liquidation.calls[1]["quantity"] is None and "stop_price" not in liquidation.calls[1]
+
+
+# --- SP2 Plan 3 Task 11: spec 6.4 behaviour that already exists, pinned -----------------------------
+
+def test_close_after_the_entry_cutoff_is_admitted(world):              # spec 6.4 / 5.2: after the cutoff
+    world.clock.advance(hours=4, minutes=40)                             # 15:40 ET: after the 15:30 entry cutoff
+    assert world.submit(close_body(world)).error_code == "CLOSE_PENDING"
+
+
+def test_close_joins_the_session_flatten_while_armed(world):            # flatten precedence
+    world.liquidation.start(ACCOUNT, "session-flatten-1", DEADLINE)    # account owner, as the session flatten
+    assert world.submit(close_body(world)).outcome["close_root_id"] == "session-flatten-1"
+    assert world.liquidation_runs() == {"session-flatten-1"}
+
+
+def test_a_reduction_ignores_the_discretionary_scope_rule(tmp_path):    # the rule is for entries only
+    w = discretionary_world(tmp_path, real_liquidation=True)
+    w.owned(CONID, 300.0)
+    w.contracts.fail_with("must not be called")
+    w.quotes.set(bid=1.0, ask=1.01)
+    assert w.submit(close_body(w)).error_code == "CLOSE_PENDING"
+    assert w.contracts.calls == 0

@@ -176,11 +176,11 @@ Yahoo Finance is not used.
 
 ## Claude Code Integration
 
-MMR is designed to be operated by [Claude Code](https://docs.anthropic.com/en/docs/claude-code) as an autonomous trading agent. The `AGENTS.md` file provides Claude with complete platform context — architecture, all 80+ CLI commands, the propose/approve pipeline, risk management, and the LLM trading loop workflow. Claude interacts with MMR entirely through the `mmr` CLI with `--json` output via Bash.
+MMR is designed to be operated by [Claude Code](https://docs.anthropic.com/en/docs/claude-code) as an autonomous trading agent. The `AGENTS.md` file gives Claude the core rules (design principles, safety rules, build and test commands) and points to the reference docs: [`docs/CLI_REFERENCE.md`](docs/CLI_REFERENCE.md) (all CLI commands), [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) and [`docs/AGENT_WORKFLOW.md`](docs/AGENT_WORKFLOW.md) (the LLM trading loop). Claude interacts with MMR entirely through the `mmr` CLI with `--json` output via Bash.
 
 ### How It Works
 
-Claude Code reads `CLAUDE.md` on startup, which imports `AGENTS.md`, giving it full knowledge of the platform. It operates MMR by running CLI commands:
+Claude Code reads `CLAUDE.md` on startup, which imports `AGENTS.md`; the reference docs it links give the full detail. It operates MMR by running CLI commands:
 
 ```bash
 # Claude runs these via Bash tool
@@ -558,7 +558,7 @@ mmr/
 ├── strategies/                    # User strategy implementations
 ├── config_defaults/               # Bundled defaults (copied to ~/.config/mmr/ on first run)
 ├── skills/                        # Claude skills (mmr, mmr-loop, news)
-├── AGENTS.md                      # Agent context (architecture, commands, workflows)
+├── AGENTS.md                      # Agent rules; detail in docs/
 ├── CLAUDE.md                      # Claude Code entry point; imports AGENTS.md
 ├── tests/                         # pytest suite (no IB required)
 ├── docker-compose.yml             # Split: ib-gateway, trader, strategy, data, dashboard, scheduler

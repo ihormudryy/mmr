@@ -1,0 +1,227 @@
+# MMR architecture reference
+
+Detail moved out of `AGENTS.md`. The short rules an agent must follow stay in `AGENTS.md`.
+
+## Data provider selection
+
+**Free providers first, IB fallback**:
+
+- **Default sources.** Alpaca (free Basic plan) is the default for US history (SIP feed, split-adjusted), `movers` and `news`.
+- **Options data.** `options expirations|chain|snapshot|implied` default to Alpaca's free **indicative** feed: not the OPRA NBBO, greeks/IV only on liquid contracts, every row labelled `feed`. `--source massive` = OPRA (needs a Massive options plan). Orders (`options buy|sell`) stay on IB.
+- **Quotes.** Alpaca can serve REST quotes (IEX feed) for `snapshot` / `snapshot-batch`. Default: `data_providers.quotes`, else `MMR_DEFAULT_DATA_SOURCE` if it names a quote source, else a YAML `default_data_source` of `twelvedata` or `ib`, else IB. The template's `default_data_source: alpaca` is a history setting and does not switch snapshots; opt in with `data_providers.quotes: alpaca`. REST sources cover US listings only, so `--exchange` / `--currency` need IB.
+- **Forex and index movers.**
+  - *Defaults.* `forex snapshot` / `forex quote` use IB (change it only with `data_providers.forex`; a value that is not a forex source fails loudly with `CapabilityNotSupported`). `forex convert` and `forex snapshot-all` use free ECB daily reference rates from Frankfurter (`/v2` with `providers=ECB`, no key). `forex movers` uses `computed_fx`: 10 majors/crosses ranked by the ECB day-over-day change. `movers --market indices` uses `etf_proxy`: SPY, QQQ, DIA, IWM and the 11 sector SPDRs, ranked from Alpaca IEX prices. `data_providers.movers: massive` keeps Massive for index and forex movers too; `movers_indices` / `movers_forex` win over it.
+  - *Opt-in.* Massive is opt-in with `--source massive` for every command above (`--source massive` gives real indices). TwelveData is opt-in only for `forex snapshot` / `forex quote` / `forex convert`.
+  - *Labels.* ECB values are one rate per business day, not live: each carries its ECB date (`as_of`) and a note, and the forex tables say "ECB daily, not live" in the title. Values are rounded to 10 significant digits; forex tables and index movers show 5 decimals. ETF rows are labelled `(ETF proxy)` with volume left blank (IEX volume is a few percent of the market).
+  - *Strict input.* Pairs must be `EURUSD`, `EUR/USD` or `C:EURUSD`; `EUR` alone is an error. Amounts must be finite and > 0. A currency the ECB does not publish (e.g. COP) is an error.
+  - *Caveats.* `data_providers.forex: ib` breaks `forex convert` and `forex snapshot-all` (they need frankfurter, massive or twelvedata). Massive may return no bid/ask; not checked live (the Massive key is not entitled to forex; gated test: `tests/data_providers/test_live_massive_forex.py`). The IB IDEALPRO forex path has mocked tests only.
+- **Opt-in sources.** Massive.com (Polygon.io) and TwelveData stay available with `--source massive|twelvedata`.
+- **Inheritance.** Only history inherits `default_data_source`. `movers`, `news`, `ideas`, options, REST quotes and the forex commands never do (the registry's REST-quotes default is Alpaca; the CLI snapshot rule above decides what `snapshot` uses). Change their default with `data_providers.movers` / `data_providers.news` / `data_providers.ideas` / `data_providers.options` (forex: `data_providers.forex` / `movers_forex`; index movers: `movers_indices`; both movers fall back to `data_providers.movers` when that source serves them).
+- **Ideas.** Bare `ideas` defaults to Alpaca (it does **not** inherit `default_data_source`). Opt in to `--source massive|twelvedata`, or set `data_providers.ideas`. The Massive → TwelveData entitlement fallback runs only when the resolved source is Massive.
+- **International markets** (ASX, TSE, SEHK, etc.) use IB. Don't use Yahoo Finance.
+
+**No sentiment analysis on IB path**: IB's news API doesn't provide sentiment scoring. On the Massive path, sentiment comes from Polygon's insights. On the IB path, we only show the headline — no fake or estimated sentiment.
+
+## Services
+
+Production Docker runs **split services** (not one monolithic process). The CLI and dashboard talk to trader/strategy over **typed HMAC RPC**; legacy dill RPC on 42001 is unbound unless offline simulation explicitly enables it.
+
+```
+trader.trader_service ──► Trader (trading_runtime.py)
+                           ├── IBAIORx (ibreactive.py) ──► IB Gateway (ib_async)
+                           ├── TradeExecutioner, BookSubject, Portfolio
+                           ├── Typed RPC query/command (42101 / 42102)  ← production CLI/dashboard
+                           ├── Typed feed (42103, internal)
+                           ├── ZMQ PubSub Publisher (42002)
+                           ├── ZMQ MessageBus (42006)
+                           └── Legacy dill RPC (42001) — offline simulation only
+
+trader.strategy_service ──► StrategyRuntime (strategy_runtime.py)
+                              ├── Loads strategies from strategy_runtime.yaml
+                              ├── Reconciliation loop (30s)
+                              ├── Typed trader gateway (resolve/publish via 42101)
+                              ├── Typed strategy control (42104 command / 42105 query)
+                              ├── ZMQ PubSub Subscriber ← tickers
+                              └── Legacy strategy RPC (42005) — optional/compat
+
+trader.data_service ──► DataService (data_service.py)
+                          ├── Concurrent history downloads
+                          ├── REST history via ProviderRegistry (trader/data_providers/): AlpacaHistoryProvider (default), MassiveHistoryWorker, TwelveDataHistoryWorker
+                          ├── IBHistoryWorker (IB history, separate contract-based path)
+                          └── ZMQ RPC Server (42003)
+
+web/app.py (dashboard) ──► typed query/command + strategy typed ports
+trader.mmr_cli / sdk.py ──► typed RPC (reads + propose/approve); legacy only for offline direct orders
+scheduler (pycron) ──► cron jobs only (data refresh, backups) — not the process supervisor for split services
+```
+
+## Key patterns
+
+**Dependency injection**: `Container.resolve(Type)` introspects `__init__` parameter names, matches them against env vars (uppercased) then config YAML values, and constructs the instance. Constructor param names must match config keys. Missing required params raise `ContainerResolutionError` naming the param (not a cryptic `TypeError`). Env vars are coerced to the annotated type (`int`/`float`/`bool`); malformed values raise with the offending var + value. Singleton init and the type-instance cache are thread-safe, and circular dependencies during `resolve()` are detected and raised as `ContainerResolutionError`. YAML config is loaded with `yaml.safe_load` — `!!python/object` tags are refused.
+
+**Messaging (pyzmq)**: Inter-process communication uses ZeroMQ (not HTTP) for latency and pub/sub. Two layers:
+
+**Typed HMAC RPC (production)** — JSON-safe request/reply on ROUTER sockets with HMAC service authentication (`trader/messaging/typed_rpc.py`). Trader query **42101**, command **42102**, feed **42103**; strategy command **42104**, query **42105**. The CLI/SDK and dashboard use this path for portfolio, resolve, propose/approve, strategies list/enable/disable/reload, snapshots, etc. Direct `buy`/`sell`/`cancel`/`set_risk_limits` are **not** registered on the production command surface (BYPASS methods) — use `propose` → `approve` or the dashboard command center; offline simulation can bind legacy dill RPC with `unsafe_legacy_rpc: true` + `--simulation True`.
+
+**Legacy dill RPC** (`trader/messaging/clientserver.py`) — DEALER/ROUTER + msgpack (including dill ExtType). Ports **42001** (trader), **42003** (data), **42005** (strategy). Unbound for trader in split-container production. Still used by data_service and some IB-only tools (scanner, options resolve) when available.
+
+Additional patterns:
+
+- **PubSub** (port 42002): ZMQ PUB/SUB for live ticker broadcast. `MultithreadedTopicPubSub` runs PUB on a dedicated thread.
+- **MessageBus** (port 42006): DEALER/ROUTER with per-client topic routing for strategy signals.
+
+**Serialization**: Legacy ZMQ messages use msgpack with ExtType handlers for datetime/date/time/timedelta, pandas DataFrames (PyArrow IPC), and a dill fallback for arbitrary objects. Because `dill.loads` can execute code, set `MMR_DILL_STRICT=1` to refuse `EXT_OBJECT`, or `set_dill_whitelist([...])`. Typed RPC uses JSON-safe pydantic models — no dill on the production surface.
+
+**Storage (DuckDB)**: `trader/data/duckdb_store.py` wraps every query in a short-lived connection held under a per-database lock (`execute_atomic` opens, runs, closes atomically; `execute(query, params, fetch='all'|'one'|'df'|'none')` is the common-case wrapper). This lets multiple services share the same database file without leaking connections or tearing rows across concurrent writers. Two tables: `tick_data` (time-series OHLCV) and `object_store` (dill-serialized blobs). The OHLCV `write()` upsert filters its DELETE by `bar_size` as well as `symbol + date range` — without that filter a wide 1-min write (potentially expanded by `write_resolve_overlap` merging in years of pre-existing rows) would clobber every daily bar for the same conid in that range. The DuckDB live file lives in a named volume (`mmr_db_data`) rather than a host bind mount — on macOS Docker Desktop, VirtioFS has quirky mmap/fsync semantics for write-heavy single-file DBs. Use `./docker.sh -B [name]` to snapshot DB files out to the host bind-mount backup dir.
+
+**Event store**: `trader/data/event_store.py` records trading events (signals, orders, fills, rejections) in DuckDB for audit trail and risk gate lookback. All writes and queries use the atomic `DuckDBConnection.execute`/`execute_atomic` APIs — earlier versions leaked connections on the hot path.
+
+**Risk gate**: `trader/trading/risk_gate.py` enforces pre-trade risk limits (max position size, daily loss, open orders, signal rate) by querying the event store.
+
+**Position sizing**: `trader/trading/position_sizing.py` computes position sizes based on confidence, risk level, ATR volatility, portfolio state, and liquidity (ADV, spread). The sizing pipeline is: `base_position × risk_multiplier × confidence_scale × volatility_adjustment`. Volatile stocks (high ATR%) automatically get smaller positions; stable stocks get larger ones. Configured via `config_defaults/position_sizing.yaml`. Used automatically by `propose` when no quantity/amount is specified.
+
+**Position groups**: `trader/data/position_groups.py` stores named groups with allocation budgets in DuckDB (e.g. "mining" at 20% max). The `propose` command accepts `--group` to tag trades and auto-register membership. The portfolio risk analyzer checks group allocations against budgets.
+
+**Portfolio risk**: `trader/trading/portfolio_risk.py` analyzes concentration (HHI), position weights, group budget compliance, and return correlation clusters. It reports both gross and signed exposure (`gross_exposure_pct`, `net_exposure_pct`, `long_exposure_pct`, `short_exposure_pct`) so hedged books aren't mis-flagged as concentrated. HHI is computed on gross weights (risk-exposure view); concentration warnings fire on gross (>10% warning, >15% critical), but correlation-cluster warnings fire on *signed* combined weight — a correlated long/short pair nets near zero and is correctly treated as hedged, not clustered. The plain-English summary explicitly notes "hedged" when gross and |net| diverge.
+
+**Trading filter**: `trader/trading/trading_filter.py` enforces symbol/exchange denylist/allowlist rules. Checked by the executioner and risk gate before any order placement.
+
+**Portfolio resizing**: `trader/sdk.py` provides `compute_resize_deltas()` (pure function) and `compute_resize_plan()`/`execute_resize_plan()` (SDK methods) for proportionally scaling all positions to fit within a target portfolio value. The resize workflow: (1) compute scale factor from max/min bounds, (2) find associated protective orders (stops, trailing stops, take-profits) for each position, (3) cancel protective orders, (4) place market orders for position deltas, (5) re-create protective orders at new quantities preserving original prices. Exposed via `resize-positions` CLI command. The `place_standalone_order()` RPC method on `trading_runtime.py` supports placing standalone STP/TRAIL/LMT orders for existing positions (used to re-create protectives after resizing).
+
+**Strategy reconciliation**: The strategy_service runs a reconciliation loop every 30 seconds (`strategy_runtime.py:_reconcile()`). It re-reads the portfolio universe from DuckDB and re-subscribes strategies to any new instruments (idempotent — `subscribe()` skips already-subscribed conIds). It also checks the YAML config file's modification time and loads any newly added strategies. This means: (1) an empty portfolio at startup automatically picks up positions as they're added via trades, (2) new strategies deployed to the YAML are loaded without restarting the service, (3) the `reload_strategies` RPC method triggers immediate reconciliation without waiting for the 30-second cycle. Note: modifying an existing strategy's config (changing conIds or bar_size) still requires a service restart. If the YAML is mid-write when reconcile reads it, the parse error is caught and the mtime is *not* advanced, so the reload retries on the next tick instead of silently leaving zombie strategies loaded. Strategy modules are loaded with `yaml.safe_load` (no Python-object tags) and path-sandboxed to `strategies_directory` (absolute paths or `../` traversal are rejected). Each strategy gets a unique `sys.modules` key derived from its `name` so two strategies that share a filename don't clobber each other and a reload actually re-imports the new source.
+
+**IB upstream connectivity detection**: The trader_service tracks IB Gateway's upstream connection to IBKR servers via IB error codes (1100/2103/2105/2157 = lost, 1102/2104/2106/2158 = restored). The `get_status()` RPC exposes `ib_upstream_connected` and `ib_upstream_error`. The CLI checks this before any IB-dependent command (portfolio, orders, buy/sell, snapshot, etc.) and shows a clear error with VNC/restart instructions instead of silently timing out. The `status` command also shows upstream connectivity and a warning when it's down.
+
+**Reactive streams (RxPY)**: `IBAIORx` converts IB events into RxPY Subjects/Observables. Strategies receive accumulated DataFrames via reactive pipelines.
+
+**Proposal state machine**: `trader/data/proposal_store.py` enforces valid status transitions: `PENDING → APPROVED | REJECTED | EXPIRED | FAILED`, `APPROVED → EXECUTED | FAILED | REJECTED`, and terminal states (`EXECUTED`, `REJECTED`, `EXPIRED`, `FAILED`) are immutable. Illegal transitions raise `InvalidProposalTransition`. This prevents double-approvals, re-executions, and resurrected proposals. `update_metadata` is also atomic (the read-merge-write runs under a single connection), so concurrent metadata updates can't lose each other.
+
+**Bracket order transactionality**: `trading_runtime.place_expressive_order` treats a `BRACKET` exit as all-or-nothing. Entry is staged with `transmit=False`, then TP, then SL (which transmits the whole group). If the TP leg fails, the staged entry is cancelled and `SuccessFail.fail` returned. If the SL leg fails, both entry and TP are cancelled. Because the bracket isn't transmitted to the market until the SL is placed, a failure at any earlier leg leaves no live orders behind.
+
+**Backtester fill policy**: `trader/simulation/backtester.py` defaults to `fill_policy='next_open'` — a signal emitted while observing bar `t` fills at bar `t+1`'s open. This eliminates lookahead bias: the strategy can see bar `t`'s close (public info at that moment) but can't fill at that same close. `fill_policy='same_close'` preserves the legacy (biased) behaviour and exists only for regression tests that pre-date the fix.
+
+**Backtester execution costs**: `trader/simulation/execution_costs.py`. CLI backtests (`backtest`, `bt-sweep`, `sweep run`, `research trial run`) default to `--cost-model realistic`: each conid's primary exchange (from the local universe DB) maps to a venue in `~/.config/mmr/execution_costs.yaml` with the broker commission schedule (IBKR Fixed: US $0.005/share, $1 minimum, 1% cap; ASX 0.08%, A$6 minimum) and a price-banded tick table. A fill pays half of `spread_ticks` ticks (floored at `min_half_spread_bps`) plus square-root impact computed from the signal bar, not the fill bar (its range and volume are unknown at the open). A conid that is not in a local universe, or whose exchange has no venue, fails the backtest with `ExecutionCostError`. `--cost-model legacy` keeps the old flat 1 bp + $0.005/share. `RealisticCosts.scaled(m)` multiplies spread, impact and commission, which is what research cost stress (`validation.run_window` / `cost_stress`) uses. Each stored run records `cost_model`. Library callers that build `BacktestConfig` without `cost_model` still get the legacy flat costs. At small order sizes the commission minimum dominates: $1 on a $1,900 order is 5.3 bps per side.
+
+**Research evaluation (paper evidence)**: `mmr research evaluate <spec.yaml>` (`trader/research/evaluation.py`) loads and qualifies the bars (a conid without bars or a failed required quality finding stops the run), seals a dataset manifest, and creates a content-addressed experiment family. The family identity is: the strategy file's content hash, the last commit that touched that file (it must be committed and clean), the dependency lock hash (`uv.lock`, else `requirements.txt`, else `pyproject.toml`), the dataset manifest digest, the params and neighbourhood, the cost model (realistic, the hash of the parsed `execution_costs.yaml` so comments and layout do not count, order notional, account equity, max gross allocation) and the walk-forward protocol (calendar, bar size, conids, period, folds, embargo, holdout). The spec must name a strategy inside `strategies/`, at least 8 distinct conids on one XNYS market, and a bar size of 15 minutes or shorter. It then runs walk-forward backtests through `evaluation_jobs` with `RealisticCosts`, a fixed order notional and `PaperAutomationRules` (`trader/simulation/live_rules.py`: live entry window, position/gross/count caps, daily-loss and drawdown halts, and a flatten 15 minutes before the close, which is 15:45 ET on a normal day; constants imported from `session_risk`/`calendar_policy`). The main point runs at 1x/1.5x/2x costs, neighbours at 1x. Every paper-v1 rule except the holdout-stage ones (`holdout_drawdown_within_canary`, `deterministic_replay`, `holdout_opened_once`, `benchmark_relative_drawdown`) must pass before the artifact is sealed and the holdout opened (once, and run twice to check determinism). A failed holdout retires the artifact: the run reports stage `holdout_failed`, state `RETIRED`, records no eligibility decision, and `research attest bundle` refuses it. The selection count for the deflated Sharpe is every finished trial (succeeded or failed) of every family with the same strategy file + class (`ExperimentRegistry.strategy_trials`), including backtests imported with `research import-legacy`. Each run writes a `research_evaluations` row, a report (`evaluation_<name>_<time>_<id>.md` and `.json`, which also records `MMR_CONTAINER_DIGEST`; the container is not part of the family id) under `~/.local/share/mmr/reports/`, and a summary JSON (with a one-line `summary`) per strategy file + class under `~/.local/share/mmr/artifacts/evaluations/` (Activate reads that file because trader_service must never open the research DB). `research attest bundle` signs (90-day lifetime) and exports to `artifacts/sha256_<manifest digest>/`; it refuses to re-export a stored attestation that has expired or was signed by a different key (renewal means a new evaluation over a newer period). Phase B computes the remaining evidence from SPY daily bars (conid 756733; `trader/research/market_context.py`): per-session regime labels (200-session trend, 20-session volatility, frozen taxonomy), a vol-matched SPY benchmark over the holdout, and a liquidity envelope (order notional ≤ 1% of the lowest prior-close 20-session median dollar volume). SPY bars are a required input (the error names the `mmr data download SPY` command), are sealed into the dataset manifest, and the regime/liquidity definitions are part of the family identity. "Holdout opened once" is keyed on (strategy file, class, overlapping window) — a code or lock-file change no longer buys a second look at the same dates. Live dispatch refuses an automated entry more than 5% above the attested order notional (`ORDER_EXCEEDS_ATTESTED_NOTIONAL`). Protective stops and the stop-distance trade-risk cap are not simulated (listed in every report).
+
+**Bundle binding**: `trader/automation/strategy_binding.py::check_strategy_binding` compares a bundle's family/attestation with the strategy entry (file hash, class, params, conids, bar size). Params compare exactly in both directions, lower-case keys included (`self.params.get` strategies read them); only the `artifact_bundle_path` transport key is ignored. It runs at strategy load, at arm, and in Activate. Activate (`paper_activation` → `bundle_finder.find_eligible_bundle`) never creates evidence or keys: it reads every `~/.local/share/mmr/artifacts/sha256_*` bundle, keeps those that verify in paper mode against `~/.config/mmr/keys/verify/*.pem`, pass `paper_materials.require_qualified_research_evidence` (no bootstrap/offline-fixture provenance, a complete passing `paper-v1` decision) and bind, arms the newest by expiry, and otherwise refuses with `NO_ELIGIBLE_BUNDLE` (quoting the latest evaluation summary and each bundle's reason). Hot-arm re-runs that search before its idempotent shortcuts, and refuses `AUTOMATION_ALREADY_BOUND` if the result differs from what is armed. `load_strategy` reads the module once, hashes those bytes and executes the same bytes; at load and at arm the binding compares that loaded digest (not the file on disk now) with the attested one, so code loaded before the file changed is refused ("loaded code ... differs from the attested file; reload the strategy"). Activate, which has no loaded code, hashes the file. Every intent carries the loaded digest as `strategy_source_digest`, and order dispatch rejects one that differs from the attested digest (`STRATEGY_SOURCE_MISMATCH`). A reload of the armed strategy (e.g. a `/cc` params edit) that drops `artifact_bundle_path` or no longer binds disarms the strategy runtime (`automation_disarm_reason`, logged at ERROR); Activate again to re-arm. The trader's `AutomatedIntentCommandService` requires the armed `expected_artifact_id` and rejects an intent naming any other artifact (`ARTIFACT_NOT_ARMED`) before verification or dispatch. It verifies the configured bundle directory (never one chosen by the wire digest), runs `require_qualified_research_evidence` after signature verification, rejects a wire digest that is not that bundle's manifest digest (`BUNDLE_DIGEST_MISMATCH`), and takes broker, quote, margin, liquidity and allocation evidence from `trader/automation/production_evidence.py`. Bundle verify refuses an `artifact.json` that is `RETIRED` or whose holdout did not pass. The intent emitter sizes a BUY without a quantity from the attested order notional (whole shares). A SELL without a quantity is still refused at approval (`QUANTITY_REQUIRED` in `production_evidence`), although `session_risk` would size it to the held position; see Known blockers in `docs/OPERATIONAL_STATE.md`.
+
+**Backtest parameter overrides**: `Backtester.apply_param_overrides(instance, params)` is called after `install(context)` and supports both tunable idioms — upper-case class attributes (`EMA_PERIOD = 20`, read as `self.EMA_PERIOD`) get shadowed via `setattr` on the instance so parallel sweeps don't collide on each other. Lower-case keys land in `instance._context.params` to serve the legacy `self.params.get('key', default)` pattern. Typos on upper-case keys raise `ValueError` listing known tunables; lower-case keys are free-form because `self.params.get(...)` is. `_coerce_param` converts CLI strings (e.g. `"15"`) to the class attr's current type; `_coerce_loose` best-effort-coerces dict-bound values. Effective overrides round-trip to `BacktestResult.applied_params` and on to `BacktestRecord.params` for later reproducibility via `backtests show`.
+
+**Statistical-confidence tests** (`trader/simulation/backtest_stats.py`): On-demand computation from persisted `trades_json` + `equity_curve_json` (persisted by default; opt out with `--no-save-trades`). Five tests answer "is this edge real?" beyond what Sharpe/PF can: (1) **Probabilistic Sharpe Ratio** (López de Prado 2012) — probability that the true Sharpe > 0 given sample size, skew, kurtosis; (2) **t-test** on mean per-trade P&L == 0; (3) **Bootstrap 95% CI** on mean P&L and annualised Sharpe; (4) **P&L skew + excess kurtosis** catching the "negative skew + fat tails = blow-up risk" signature Sharpe misses; (5) **Longest losing streak vs Monte Carlo** — compares actual to 95th-percentile random-reorder streaks, detects loss clustering. All five fail gracefully to `None` below their minimum sample (PSR needs n ≥ 3, bootstrap needs n ≥ 10, MC streak needs n ≥ 5). Surfaced via `backtests show` and `backtests confidence` — the latter is a bulk helper that strips raw trades/equity JSON (multi-MB per run) and returns just the confidence block.
+
+**Nightly sweep pipeline** (`trader/mmr_cli.py` + `trader/data/backtest_store.py`): Declarative YAML manifests (`sweeps: [{name, strategy, class, symbols|conids|universe, param_grid, days, bar_size, concurrency, note}]`) become concrete per-(symbol, param) jobs via `_expand_sweep_jobs`. A parent `sweeps` table row is created up front with `status='running'`, every child `backtest_runs` row is stamped with `sweep_id`, and the sweep is finalised to `completed`/`failed`/`cancelled` with a markdown digest path. Concurrency auto-tunes to `cpu_count - 1` (cap 16) unless overridden; children are launched via `asyncio.create_subprocess_exec` with a per-semaphore gate so the same machine-level parallelism that `backtest_batch` uses applies here too. The SIGINT handler lets in-flight subprocesses finish rather than killing them, so a 90%-complete sweep still persists 90% of its runs. Freshness guard (`_freshness_check`) refuses to run if any conid lacks a daily bar from the last 3 trading days; `--skip-freshness` overrides. `_write_sweep_digest` produces `~/.local/share/mmr/reports/sweep_<id>_<name>_<ts>.md` with strong-candidates / all-runs / failures tables plus pointers into `backtests list --sweep <id>` and `backtests confidence`. Digest-write failures never take down a sweep — they return an empty path and log a warning.
+
+**Composite quality score** (`_bt_composite_score` in `mmr_cli.py`): Ranks backtest runs by a weighted blend of sortino, profit_factor, expectancy_bps, return, and drawdown, each clipped to a sensible band, multiplied by a reliability factor that penalises low trade counts (< 10 → ×0.2, < 30 → ×0.6, < 100 → ×0.9). Used as the default sort for `backtests list` and the leaderboard sort in `sweep show`. Not a decision metric — use the statistical-confidence block for deploy/reject — just an ordering heuristic so strong runs float to the top.
+
+**Subprocess concurrency + DuckDB**: The `mmr-skill` helper's `_CLI_SLOTS = asyncio.Semaphore(16)` caps concurrent CLI subprocess launches without serialising them (the previous `_CLI_LOCK` made `backtest_batch(concurrency=6)` a no-op). DuckDB has file-level locking across processes; `DuckDBConnection.execute_atomic` retries on `IOException` with exponential backoff + jitter up to **32 attempts (~45s total)** so a burst of 15+ concurrent backtest-end writes don't get starved (the prior 8-attempt budget was too tight and caused silent persist failures). This is what makes `sweep run` and `backtest_batch` actually peg CPU instead of bottlenecking at 10%. The sweep parent also checks for `run_id=None` in each child's JSON response and reports `persist_failed` distinctly, so a silently-dropped persist isn't counted as success. Child persist failures additionally always log to stderr (not just rich console), so the digest captures the traceback even in `--json` runs. Sweep manifests pass strategy paths relative to the project root; `_resolve_strategy_path` resolves them to absolute before subprocess launch (subprocess CWD is `/home/trader`, not the mmr install root, so a raw relative path resolves to a non-existent file).
+
+**PnL subscription race**: `__subscribe_pnl` registers `(account, conId)` under `_pnl_subscriptions_lock` using first-claim-wins semantics. If the actual `subscribe_single_pnl` call fails, the registry entry is backed out so a retry can re-attempt. Portfolio updates fired from IB-eventkit threads are routed onto the main loop via `run_coroutine_threadsafe` (the main loop is captured in `connected_event`), so disk I/O during a universe update doesn't block the IB callback thread.
+
+**Data refresh loop** (`trader/mmr_cli.py:_handle_data_refresh` + `config_defaults/data_refresh.yaml`): Declarative jobs `{universe, source?, bar_size, days, force?}` keep universes' OHLCV current in the local DuckDB. Pycron owns the schedule (`data_refresh_us` and `data_refresh_asx` cron entries in `pycron.yaml`); the YAML owns *what* to fetch. Source auto-detects from the universe's dominant exchange when omitted (US → alpaca; else IB). A US job without Alpaca keys fails loudly (names `ALPACA_API_KEY_ID`); there is no silent fallback. Incremental by default — only missing date ranges are fetched — so a daily cron run costs ~seconds for fresh windows. `mmr data status` shows per-(job, bar_size) coverage and stale-days, color-coded; `mmr data refresh JOB [JOB ...]` runs jobs ad-hoc. Failures in one job are isolated (per-job result, batch keeps going) and don't take down the cron entry.
+
+## Docker Setup
+
+Split-compose topology (`docker-compose.yml`) — each process is its own container (`read_only: true`, baked image):
+
+- **ib-gateway**: `ghcr.io/gnzsnz/ib-gateway:latest` — IB Gateway. Credentials in `.env`. `scripts/ib-gateway-run.sh` patches upstream `inst_jre.cfg`.
+- **trader**: `python -m trader.trader_service` — typed ports 42101/42102 published to host loopback; owns DuckDB volume.
+- **strategy**: `python -m trader.strategy_service` — typed control 42104/42105; dials trader typed + PubSub.
+- **data**: `python -m trader.data_service` — history downloads (42003).
+- **dashboard**: FastAPI web UI + command center (host port published).
+- **scheduler**: pycron for one-shot cron only (data refresh, backups) — not a multi-service supervisor.
+
+Do **not** run `start_mmr.sh` inside split containers (it collides on ports/client ids). Local non-Docker uses `./start_mmr.sh` (hybrid: IB Gateway in a container, services on the host). Code changes require `./docker.sh -b -u` (sync `-s` is retired — images are immutable).
+
+IB Gateway API ports map to host `7496` (live) / `7497` (paper); VNC at `5901`.
+
+Storage layout (host paths):
+- `~/.local/share/mmr/logs/` — bind mount
+- `~/.local/share/mmr/tws_settings/` — IB session state
+- `~/.local/share/mmr/backups/` — `docker.sh -B` / `mmr data backup`
+- `~/.local/share/mmr/artifacts/` — signed paper-automation bundles (`sha256_<digest>/`) and evaluation summaries (`evaluations/`); rw in trader, ro in strategy
+- DuckDB (`mmr.duckdb`, `mmr_history.duckdb`) in named volume **`mmr_db_data`**
+
+## Contract Resolution
+
+CLI/SDK `resolve()` uses typed `discover_instrument` / `resolve_instrument` (42101) — not legacy dill. Server-side, `resolve_symbol()` in `trading_runtime.py` remains a **local DB lookup** (no fuzzy matching). Integer conIds must never be coerced to ticker strings (`4391` ≠ TSEJ `"4391"`). IB discovery with exchange hints goes through `resolve_contract` / typed discover. Forex (`sec_type='CASH'`) uses IDEALPRO.
+
+## Configuration
+
+User configs live in `~/.config/mmr/`. On first run, bundled defaults from `config_defaults/` are copied there automatically (`container.ensure_config_dir()`). The `TRADER_CONFIG` env var overrides the config file path.
+
+**`~/.config/mmr/trader.yaml`**: IB connection (address, port, client IDs, account), DuckDB path, ZMQ port assignments. Env vars override config values (uppercased param name). Two CLI-only knobs the Container doesn't otherwise know about:
+- `default_data_source` (default `alpaca`) — default `--source` for history download, watch, financials where that choice is valid (watch and financials read it through `_src_default`). `snapshot` / `snapshot-batch` are special: Default: `data_providers.quotes`, else `MMR_DEFAULT_DATA_SOURCE` if it names a quote source, else a YAML `default_data_source` of `twelvedata` or `ib`, else IB. The template's `default_data_source: alpaca` is a history setting and does not switch snapshots; opt in with `data_providers.quotes: alpaca`. REST sources cover US listings only; `--exchange` / `--currency` need IB. For `data download` the order is: explicit `data_providers.history` → `MMR_DEFAULT_DATA_SOURCE` / `default_data_source` (`ib` is honoured) → registry default `alpaca`. **`movers` and `news` never inherit it** (set `data_providers.movers` / `data_providers.news` instead; defaults `alpaca`). **Forex commands never inherit it either** (including `MMR_DEFAULT_DATA_SOURCE`): `forex snapshot`/`quote` default to IB, the rest to Frankfurter / `computed_fx`; override with `data_providers.forex` / `data_providers.movers_forex`, and `data_providers.movers_indices` for index movers (`data_providers.movers: massive` also moves both movers to Massive). A configured `data_providers.forex` that is not a forex source fails loudly (`CapabilityNotSupported`); `ib` there breaks `forex convert` and `forex snapshot-all`. **`ideas` never inherits it either** (default `alpaca`; set `data_providers.ideas` or use `--source`). Override the global default per-shell with `MMR_DEFAULT_DATA_SOURCE`.
+  - **Output changes (phase 3a):** news items use `summary` (was `teaser` / `description`); Benzinga `tags` are no longer in `news_detail`; batch snapshot rows (REST sources) gain `feed` and `error`.
+  - **Output changes (phase 6):** forex `--source massive|twelvedata` results now use the shared keys (`pair`, `as_of`, `source`, `note`; TwelveData market state is in `note`); `forex quote --source massive|twelvedata` returns the same dict as `forex snapshot`; `forex snapshot-all` takes `--base` plus quote currencies; pairs must be exact (`EURUSD`, `EUR/USD`, `C:EURUSD`) — `EUR` alone is an error; missing numbers in every `--json` dict command (forex, and also `snapshot --source alpaca` and other dict output) are `null`, never bare `NaN` (which is not valid JSON); tables show `-`. Users who relied on `default_data_source: twelvedata` for forex must set `data_providers: {forex: twelvedata}`.
+  - **Stock `movers` returns fewer rows than `--num`** after filtering (on 2026-10-02, 16 of Alpaca's 50 top gainers survived). `movers --detail` on Alpaca shows names and headlines but no ratios, market cap or description until phase 4 (`--source massive` keeps them).
+  - Alpaca movers intraday check (weekday, `last_updated` age < 30 min) is not yet confirmed; see `docs/OPERATIONAL_STATE.md`.
+- `equity_decimation` (default `daily`) — how aggressively backtest persist downsamples `equity_curve_json`. `daily` ≈ 17 KB/run vs ~9.9 MB raw 1-min; statistically lossless for PSR/Sharpe-CI. Override with `MMR_EQUITY_DECIMATION`.
+
+**`~/.config/mmr/pycron.yaml`**: Cron jobs only (backups, data refresh). Hosts `data_refresh_us` / `data_refresh_asx` cron entries that drive the data-refresh loop (see "Data refresh loop" under Key patterns).
+
+**Alpaca keys** (`alpaca_api_key_id`, `alpaca_api_secret_key` in `trader.yaml`; env `ALPACA_API_KEY_ID` / `ALPACA_API_SECRET_KEY`). Non-empty env vars override flat YAML keys, same as Massive; empty env values (docker compose passes unset keys as `""`) are ignored for the four provider API keys. Alpaca history: SIP feed, `adjustment=split` (matches TwelveData `splits` and Massive `adjusted`), 1-min back to 2016 incl. pre/post market, no seconds bars. Only completed NYSE sessions are returned (after 20:16 ET: post-market ends 20:00 plus the 15-min SIP delay). Free Basic plan with a paper account — no paid plan needed. Providers live in `trader/data_providers/` (`ProviderRegistry.from_config/get/default_source/sources_for`); `data_service.pull_history(source, …)` serves them (`pull_massive` / `pull_twelvedata` are aliases) and builds a fresh provider per download task. `mmr history alpaca --symbol/--universe` downloads via the data service. Live checks: `MMR_LIVE_TESTS=1` + keys, `pytest -m live`.
+
+**Options data (phase 5).** Expirations must be `YYYY-MM-DD` or relative (`3m`, `90d`); anything else is rejected before any provider or IB call. Output changes:
+- Chain and snapshot rows share one shape (`OPTION_FIELDS`: the old columns plus `underlying, quote_time, last_time, provider, feed`). Titles and JSON say `feed: indicative` (Alpaca) or `opra` (Massive).
+- `ticker` is the bare OCC symbol for every source (Massive used to give `O:AAPL...`). `options snapshot` accepts both spellings.
+- Missing numbers are NaN: `—` in tables, `null` in JSON (they were `0.0` on Massive). Alpaca lists contracts that have no quote as rows with blank numbers. Alpaca `volume` is the daily-bar volume only for the quote's own session (older bar: 0; newer bar, no bar or no quote: blank); `open_interest` comes from the contracts API; `break_even` is blank. Alpaca `underlying_price` is the IEX last trade (one stock snapshot per call), not SIP; it also centres `options implied`.
+- `options snapshot` returns the row shape; `iv` is a number in percent (was the string `implied_volatility: "35.00%"`).
+- `options implied` reports `strikes_used` / `strikes_excluded`. It needs at least 8 call strikes with a real IV. It refuses a same-day or past expiration. It uses T = calendar days / 365 (was / 255, so distributions are narrower than before). The curve covers the quoted strike range only (it used to start at strike 1.0), so it no longer sums to 1.
+- The skill helper `implied_move` returns method `atm_straddle` with `provider` / `feed`. Confidence is `high` only on the OPRA feed, `medium` otherwise. In `auto` mode it falls back to realized vol and says why in `fallback_reason` (empty chain, NOT_AUTHORIZED, no spot price, no strike with a call and a put price, timeout or crash). Other CLI errors, such as missing keys or a rate limit, come back in `error`. The `options_*` helpers take `source=`.
+- An empty chain or expiry list prints a message naming the underlying and provider. An unknown underlying is a loud provider error. `--source massive` without an options plan prints the NOT_AUTHORIZED message and names `--source alpaca`.
+- Not yet verified live: Massive options (the key in use is not entitled). The `O:`-prefixed single-contract lookup and Massive response shapes are tested with fakes only.
+- Dashboard options routes still use Massive (phase 9). Its implied view shows a generic "provider request failed" (502) for too-few-strikes or same-day errors.
+
+**Known quirk (left as is):** `TwelveDataHistoryWorker` returns nothing for intraday bars when start == end, so `data download --source twelvedata` can skip single-day gaps.
+
+**`~/.config/mmr/data_refresh.yaml`**: Declarative refresh jobs that keep universes' OHLCV current in the local DuckDB. Each job is `{universe, source, bar_size, days, force?}`. Pycron owns the *when* (`data_refresh_*` entries in `pycron.yaml`), this file owns the *what*. Source auto-detects from the universe's dominant exchange (US → alpaca, else IB) when omitted. Commands: `mmr data refresh <job> [<job> ...]` runs jobs ad-hoc, `mmr data refresh --all` runs everything, `mmr data status` shows per-(job, bar_size) freshness with stale-day coloring. Refresh is incremental by default (only missing date ranges fetched, so daily crons are cheap); set `force: true` to refetch the full window.
+
+**`~/.config/mmr/strategy_runtime.yaml`**: Strategy name, Python module path, class name, bar_size, conids/universe, historical_days_prior.
+
+**`~/.config/mmr/logging.yaml`**: Python logging config (Rich console handler + rotating file handlers).
+
+**`.env`** (gitignored): IB Gateway credentials (`TWS_USERID`, `TWS_PASSWORD`, `TRADING_MODE`, `IB_ACCOUNT`). Typed RPC service authentication in split Docker uses `~/.config/mmr/service_hmac.key` (mode `0600`), exposed via `MMR_SERVICE_HMAC_KEY_FILE`.
+
+## Logging
+
+Logs are written to `~/.local/share/mmr/logs/` with per-session timestamps (e.g. `trader_service_2026-02-19_18-38-06.log`). The directory is created automatically. Console output uses Rich for colored log levels and timestamps. Configured in `~/.config/mmr/logging.yaml`.
+
+## Key ZMQ / typed ports
+
+| Port  | Protocol | Service / role |
+|-------|----------|----------------|
+| 42101 | Typed query (HMAC) | trader — production CLI/dashboard reads |
+| 42102 | Typed command (HMAC) | trader — propose/approve, cancels via command center |
+| 42103 | Typed feed (HMAC) | trader — internal (not host-published) |
+| 42104 | Typed command (HMAC) | strategy — enable/disable/reload |
+| 42105 | Typed query (HMAC) | strategy — list_strategies |
+| 42002 | PubSub | ticker broadcast |
+| 42003 | Legacy RPC | data_service |
+| 42005 | Legacy RPC | strategy (compat) |
+| 42006 | MessageBus | strategy signals |
+| 42001 | Legacy dill RPC | trader — **unbound in split production**; offline simulation only |
+
+## Tests that pin behaviour
+
+`test_ibrx_async.py` is excluded because it spins up long-lived asyncio tasks that interact with a mocked ib_async event loop; it works in isolation but flakes in the full suite. Prefer the live pytest summary over any count in this file.
+
+Fixtures include edge-case OHLCV shapes (`ohlcv_with_gaps`, `ohlcv_high_volatility`, `ohlcv_zero_volume`, `ohlcv_halted`) in addition to the clean `sample_ohlcv`. Use the edge-case ones when testing indicator computation, position sizing, or backtesting against realistic-ugly data.
+
+Key behaviour-focused test files:
+
+- `test_clientserver_rpc.py` — RPC error-type preservation, dill whitelist/strict-mode policy, in-process round-trip with a threaded server
+- `test_trading_runtime.py` — PnL subscription lock, off-loop portfolio routing, bracket-order rollback
+- `test_executioner.py` — trading filter + risk gate rejection paths, `skip_risk_gate` bypass, IB account mismatch
+- `test_strategy_runtime_reconcile.py` — load-strategy sandbox (absolute-path + traversal rejection, `sys.modules` collision), config-reload resilience (`yaml.safe_load`, partial-write mtime handling)
+- `test_propose_approve_integration.py` — end-to-end propose → approve → execute, failure-path transitions to `FAILED`, state-machine enforcement
+- `test_backtester.py::test_no_lookahead_fill_at_next_bar_open` — hand-crafted bars that prove `next_open` fills come from bar t+1's open
+- `test_backtest_stats.py` — PSR monotonicity, bootstrap CI tightness with sample size, MC streak expectations, graceful degradation below minimum samples
+- `test_backtest_params.py` — type coercion across int/float/bool, class-attr shadowing vs class mutation, upper-case typo rejection, lower-case params-dict idiom
+- `test_backtest_highlighting.py` — composite-score ranking + per-metric classifier thresholds
+- `test_sweep.py` — sweep lifecycle (create / finalize / get / list), manifest validation (missing fields, scalar-instead-of-list, mutually-exclusive symbol sources), digest-markdown shape, crash-safe digest writing
+- `test_portfolio_risk.py::TestSignedExposure` — hedged vs stacked correlation clusters, long/short exposure breakdown
+- `test_duckdb_store.py::TestConcurrentAccess` — multi-thread write serialization
+- `test_container.py::TestContainerHardening` — missing-param diagnostics, env-var coercion, YAML safety
+- `test_production_rpc_security.py` / `test_sdk.py` — typed HMAC surface, CLI routing away from unbound 42001
+- `test_web_dashboard.py` — command center + deploy routes

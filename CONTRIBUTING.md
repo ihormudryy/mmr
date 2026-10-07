@@ -22,7 +22,7 @@ uv sync --python 3.12.13 --frozen --extra test
 
 You do not need an Interactive Brokers account to run the tests. To run the full stack, see [Getting Started](README.md#getting-started) and use a **paper** account.
 
-[AGENTS.md](AGENTS.md) is the detailed architecture guide (services, ports, storage, CLI). Read the parts that touch your change.
+[AGENTS.md](AGENTS.md) has the core rules for agents and contributors. The detailed guides are [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) (services, ports, storage) and [docs/CLI_REFERENCE.md](docs/CLI_REFERENCE.md) (CLI). Read the parts that touch your change.
 
 ## Running the tests
 

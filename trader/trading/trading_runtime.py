@@ -102,6 +102,9 @@ class Trader():
                  typed_feed_port: int = 42103,
                  rpc_keys_dir: str = '',
                  unsafe_legacy_rpc: bool = False,
+                 trading_mode: str = 'live',
+                 ib_paper_port: int = 0,
+                 ib_live_port: int = 0,
                  command_authority: Optional[dict] = None,
                  strategy_typed_command_port: int = 42104,
                  strategy_typed_query_port: int = 42105,
@@ -125,6 +128,9 @@ class Trader():
         self.universe_library = universe_library
         self.simulation: bool = simulation
         self.paper_trading = paper_trading
+        self.trading_mode = trading_mode
+        self.ib_paper_port = ib_paper_port
+        self.ib_live_port = ib_live_port
         self.strategy_typed_command_port = int(strategy_typed_command_port)
         self.strategy_typed_query_port = int(strategy_typed_query_port)
         self.strategy_typed_address = strategy_typed_address or ''
@@ -291,6 +297,13 @@ class Trader():
                 f'paper account. Managed accounts: {managed}. Check your config.'
             )
         return self.ib_account
+
+    def broker_posture(self):
+        from trader.messaging.production_api import BrokerPosture
+        return BrokerPosture(
+            trading_mode=self.trading_mode, paper_trading=self.paper_trading,
+            ib_account=self.ib_account, ib_server_port=self.ib_server_port,
+            ib_paper_port=self.ib_paper_port, ib_live_port=self.ib_live_port)
 
     def _fake_broker_enabled(self) -> bool:
         """Whether ``MMR_FAKE_BROKER=1`` activates the stub broker (G0 Task 6).
@@ -466,8 +479,7 @@ class Trader():
             from trader.trading.command_policy import load_and_validate_command_policy
             from trader.trading.command_stack import build_command_stack
 
-            validate_rpc_mode(self.simulation, self.unsafe_legacy_rpc,
-                              paper_trading=self.paper_trading, ib_account=self.ib_account)
+            validate_rpc_mode(self.simulation, self.unsafe_legacy_rpc, posture=self.broker_posture())
 
             # Typed query/command/feed servers ALWAYS start -- this is the
             # only RPC surface production exposes. The trader's Ed25519

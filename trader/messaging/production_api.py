@@ -85,7 +85,7 @@ import datetime as dt
 import logging
 import os
 import re
-from dataclasses import asdict
+from dataclasses import asdict, dataclass
 from decimal import Decimal
 from typing import TYPE_CHECKING, Annotated, Any, Dict, Literal, Optional
 
@@ -139,17 +139,43 @@ from trader.trading.trading_control import (
 )
 
 
-def validate_rpc_mode(simulation: bool, unsafe_legacy_rpc: bool, *,
-                      paper_trading: bool, ib_account: Optional[str]) -> None:
+@dataclass(frozen=True)
+class BrokerPosture:
+    """The effective broker settings a service actually connects with."""
+
+    trading_mode: str
+    paper_trading: bool
+    ib_account: Optional[str]
+    ib_server_port: int
+    ib_paper_port: int
+    ib_live_port: int
+
+    def paper_conflicts(self) -> list[str]:
+        """Every value that does not agree with an offline paper posture (empty: all agree)."""
+        conflicts = []
+        if self.trading_mode != 'paper':
+            conflicts.append(f'trading_mode={self.trading_mode!r}')
+        if not self.paper_trading:
+            conflicts.append(f'paper_trading={self.paper_trading}')
+        if not str(self.ib_account or '').startswith('D'):
+            conflicts.append(f'ib_account={self.ib_account!r}')
+        if self.ib_paper_port == self.ib_live_port:
+            conflicts.append(f'ib_paper_port={self.ib_paper_port} equals ib_live_port')
+        if self.ib_server_port != self.ib_paper_port:
+            conflicts.append(f'ib_server_port={self.ib_server_port} (paper port is {self.ib_paper_port})')
+        return conflicts
+
+
+def validate_rpc_mode(simulation: bool, unsafe_legacy_rpc: bool, *, posture: BrokerPosture) -> None:
     """Fail closed: refuse ``unsafe_legacy_rpc`` outside offline paper simulation.
 
     The single choke point for the legacy dill/msgpack RPC (trader 42001,
     strategy 42005). ``Trader.connect()`` and ``StrategyRuntime.connect()``
-    call it before any socket is built. Both flags can come from YAML or env,
-    so they do not prove an offline posture on their own: the effective
-    config must also be paper trading on a paper (``D``-prefixed) account,
-    the same rule as ``Trader._fake_broker_enabled``. ``simulation=True``
-    alone never grants the legacy RPC either.
+    call it before any socket is built. Every flag can come from YAML, env or
+    the CLI, so none of them proves an offline posture alone: trading mode,
+    paper flag, ``D`` account and the IB port the service really connects to
+    must all say paper. A disagreement is itself a config bug and is refused.
+    ``simulation=True`` alone never grants the legacy RPC either.
     """
     if not unsafe_legacy_rpc:
         return
@@ -159,11 +185,13 @@ def validate_rpc_mode(simulation: bool, unsafe_legacy_rpc: bool, *,
             'only) -- the dill-capable legacy RPC path must never run against a '
             'live/production service.'
         )
-    if not (paper_trading and str(ib_account or '').startswith('D')):
+    conflicts = posture.paper_conflicts()
+    if conflicts:
         raise ValueError(
-            'unsafe_legacy_rpc=True requires paper trading on a paper (D-prefixed) '
-            f'account; got paper_trading={paper_trading}, ib_account={ib_account!r}. '
-            'The legacy RPC has no authentication and must never run on a live account.'
+            'unsafe_legacy_rpc=True requires a consistent paper broker posture '
+            '(trading_mode paper, paper_trading, a D-prefixed account and the paper IB port); '
+            f'these disagree: {", ".join(conflicts)}. The legacy RPC has no authentication '
+            'and must never run where it could reach a live account.'
         )
 
 

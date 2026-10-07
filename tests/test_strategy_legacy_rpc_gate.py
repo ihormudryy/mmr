@@ -21,11 +21,11 @@ CONTROL_METHODS = ("enable_strategy", "disable_strategy", "update_strategy_param
 
 
 def _runtime(tmp_path, *, simulation=False, unsafe_legacy_rpc=False,
-             paper_trading=True, ib_account="DU1234567"):
+             paper_trading=True, ib_account="DU1234567", trading_mode="paper", ib_server_port=7497):
     keys_dir = tmp_path / "rpc"
     write_keyset(keys_dir)
     return StrategyRuntime(
-        ib_server_address="127.0.0.1", ib_server_port=4002,
+        ib_server_address="127.0.0.1", ib_server_port=ib_server_port,
         strategy_runtime_ib_client_id=99,
         duckdb_path=str(tmp_path / "x.duckdb"),
         universe_library="u",
@@ -45,6 +45,9 @@ def _runtime(tmp_path, *, simulation=False, unsafe_legacy_rpc=False,
         unsafe_legacy_rpc=unsafe_legacy_rpc,
         paper_trading=paper_trading,
         ib_account=ib_account,
+        trading_mode=trading_mode,
+        ib_paper_port=7497,
+        ib_live_port=7496,
     )
 
 
@@ -167,6 +170,8 @@ def _write_effective_config(tmp_path, *, trading_mode, yaml_flags):
         "ib_server_address: 127.0.0.1",
         "ib_paper_account: DU1234567",
         "ib_live_account: U7654321",
+        "ib_paper_port: 7497",
+        "ib_live_port: 7496",
         "strategy_runtime_ib_client_id: 7",
         "zmq_rpc_server_address: tcp://127.0.0.1", f"zmq_rpc_server_port: {free_port()}",
         "zmq_pubsub_server_address: tcp://127.0.0.1", f"zmq_pubsub_server_port: {free_port()}",
@@ -195,7 +200,8 @@ def _resolve_from_config(config_path):
 @pytest.fixture
 def clean_env(monkeypatch):
     for name in ("SIMULATION", "UNSAFE_LEGACY_RPC", "PAPER_TRADING", "IB_ACCOUNT",
-                 "TRADING_MODE", "TRADER_CONFIG"):
+                 "TRADING_MODE", "TRADER_CONFIG", "IB_SERVER_PORT", "IB_PAPER_PORT",
+                 "IB_LIVE_PORT"):
         monkeypatch.delenv(name, raising=False)
     return monkeypatch
 
@@ -241,6 +247,52 @@ def test_config_forced_flags_on_a_paper_account_still_allow_offline_compat(tmp_p
 def test_legacy_server_needs_a_proven_paper_account(tmp_path, paper_trading, ib_account):
     runtime = _runtime(tmp_path, simulation=True, unsafe_legacy_rpc=True,
                        paper_trading=paper_trading, ib_account=ib_account)
+    with pytest.raises(TraderConnectionException):
+        runtime.connect()
+    assert runtime.zmq_strategy_rpc_server is None
+
+
+# --- PR #50 round 3: the effective broker mode, port and account must all agree ---
+
+def test_env_paper_flag_and_paper_account_over_a_live_yaml_refuse_on_the_live_port(tmp_path, clean_env):
+    """The exact reproduction: YAML live + flags, env PAPER_TRADING + a DU account."""
+    clean_env.setenv("PAPER_TRADING", "true")
+    clean_env.setenv("IB_ACCOUNT", "DU1234567")
+    runtime = _resolve_from_config(_write_effective_config(
+        tmp_path, trading_mode="live", yaml_flags=["simulation: true", "unsafe_legacy_rpc: true"]))
+    assert runtime.paper_trading is True and runtime.ib_account == "DU1234567"
+    assert runtime.ib_server_port == 7496 and runtime.trading_mode == "live"
+
+    with pytest.raises(TraderConnectionException) as raised:
+        runtime.connect()
+    assert "ib_server_port=7496" in str(raised.value.args)
+    assert runtime.zmq_strategy_rpc_server is None
+    assert getattr(runtime, "typed_command_server", None) is None
+
+
+def test_paper_mode_on_the_live_port_refuses(tmp_path, clean_env):
+    clean_env.setenv("IB_SERVER_PORT", "7496")
+    runtime = _resolve_from_config(_write_effective_config(
+        tmp_path, trading_mode="paper", yaml_flags=["simulation: true", "unsafe_legacy_rpc: true"]))
+    assert runtime.trading_mode == "paper" and runtime.ib_server_port == 7496
+    with pytest.raises(TraderConnectionException):
+        runtime.connect()
+    assert runtime.zmq_strategy_rpc_server is None
+
+
+def test_fully_consistent_paper_config_keeps_the_offline_compat_server(tmp_path, clean_env):
+    runtime = _resolve_from_config(_write_effective_config(
+        tmp_path, trading_mode="paper", yaml_flags=["simulation: true", "unsafe_legacy_rpc: true"]))
+    assert (runtime.trading_mode, runtime.paper_trading, runtime.ib_account, runtime.ib_server_port) == (
+        "paper", True, "DU1234567", 7497)
+    runtime.connect()
+    assert runtime.zmq_strategy_rpc_server is not None
+
+
+@pytest.mark.parametrize("trading_mode,ib_server_port", [("live", 7497), ("paper", 7496)])
+def test_direct_construction_with_a_conflicting_posture_refuses(tmp_path, trading_mode, ib_server_port):
+    runtime = _runtime(tmp_path, simulation=True, unsafe_legacy_rpc=True,
+                       trading_mode=trading_mode, ib_server_port=ib_server_port)
     with pytest.raises(TraderConnectionException):
         runtime.connect()
     assert runtime.zmq_strategy_rpc_server is None

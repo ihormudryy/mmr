@@ -109,7 +109,7 @@ Top-level directories:
 ## Safety rules (never break)
 
 - **Propose, then approve.** Trades go `propose` → review → `approve` (or the dashboard command center), through the proposal state machine and the risk gate. Do not add a direct order path to the production command surface.
-- **Direct `buy` / `sell` / `cancel` are offline only.** They need the legacy RPC (`unsafe_legacy_rpc: true` plus `--simulation True`) and paper trading on a `D`-prefixed account. In production they fail with a clear error.
+- **Direct `buy` / `sell` / `cancel` are offline only.** They need the legacy RPC (`unsafe_legacy_rpc: true` plus `--simulation True`) and a consistent paper posture (`trading_mode: paper`, a `D`-prefixed account and the IB paper port); any disagreement is refused. In production they fail with a clear error.
 - **Protective orders are all or nothing.** A `BRACKET` is staged untransmitted; if the take-profit or stop leg fails, the staged legs are cancelled, so no unprotected entry is left. Keep this property in any order change.
 - **Paper vs live.**
   - `auto_execute: propose` turns signals into PENDING proposals; `auto_execute: true` (full auto) is refused at load.

@@ -409,6 +409,9 @@ class StrategyRuntime():
         paper_trading: bool = False,
         simulation: bool = False,
         unsafe_legacy_rpc: bool = False,
+        trading_mode: str = 'live',
+        ib_paper_port: int = 0,
+        ib_live_port: int = 0,
         typed_bind_address: str = 'tcp://127.0.0.1',
         strategy_typed_command_port: int = 42104,
         strategy_typed_query_port: int = 42105,
@@ -434,6 +437,9 @@ class StrategyRuntime():
         self.universe_library = universe_library
         self.simulation: bool = simulation
         self.unsafe_legacy_rpc: bool = unsafe_legacy_rpc
+        self.trading_mode = trading_mode
+        self.ib_paper_port = ib_paper_port
+        self.ib_live_port = ib_live_port
         self.paper_trading = paper_trading
         self.live_authority_enabled = bool(live_authority_enabled)
         self.zmq_pubsub_server_address = zmq_pubsub_server_address
@@ -573,9 +579,12 @@ class StrategyRuntime():
             # it exists only in offline simulation with the explicit unsafe
             # flag -- the same gate as the trader's 42001. Production control
             # goes through the typed, signed sockets below.
-            from trader.messaging.production_api import validate_rpc_mode  # import cycle at module level
-            validate_rpc_mode(self.simulation, self.unsafe_legacy_rpc,
-                              paper_trading=self.paper_trading, ib_account=self.ib_account)
+            from trader.messaging.production_api import (  # import cycle at module level
+                BrokerPosture, validate_rpc_mode)
+            validate_rpc_mode(self.simulation, self.unsafe_legacy_rpc, posture=BrokerPosture(
+                trading_mode=self.trading_mode, paper_trading=self.paper_trading,
+                ib_account=self.ib_account, ib_server_port=self.ib_server_port,
+                ib_paper_port=self.ib_paper_port, ib_live_port=self.ib_live_port))
             if self.simulation and self.unsafe_legacy_rpc:
                 self.zmq_strategy_rpc_server = RPCServer[bus.StrategyServiceApi](
                     instance=bus.StrategyServiceApi(self),

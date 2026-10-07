@@ -37,7 +37,9 @@ from tests.rpc_identity_fixtures import ALLOW_ALL, make_identities
 import zmq
 
 from trader.messaging.legacy_offline_api import LegacyOfflineTraderServiceApi
-from trader.messaging.production_api import build_production_registry, validate_rpc_mode
+import dataclasses
+
+from trader.messaging.production_api import BrokerPosture, build_production_registry, validate_rpc_mode
 from trader.messaging.trader_service_api import TraderServiceApi
 from trader.messaging.typed_rpc import (
     TypedRpcClient,
@@ -127,9 +129,13 @@ def test_production_registry_has_no_legacy_mutation(method, production_registry)
     assert not production_registry.contains("command", method)
 
 
+PAPER = BrokerPosture(trading_mode="paper", paper_trading=True, ib_account="DU1234567",
+                      ib_server_port=7497, ib_paper_port=7497, ib_live_port=7496)
+
+
 def test_unsafe_legacy_rpc_requires_simulation():
     with pytest.raises(ValueError, match="offline simulation"):
-        validate_rpc_mode(simulation=False, unsafe_legacy_rpc=True, paper_trading=True, ib_account="DU1234567")
+        validate_rpc_mode(simulation=False, unsafe_legacy_rpc=True, posture=PAPER)
 
 
 # ---------------------------------------------------------------------------
@@ -139,37 +145,62 @@ def test_unsafe_legacy_rpc_requires_simulation():
 class TestValidateRpcMode:
     def test_unsafe_without_simulation_raises(self):
         with pytest.raises(ValueError, match="offline simulation"):
-            validate_rpc_mode(simulation=False, unsafe_legacy_rpc=True, paper_trading=True, ib_account="DU1234567")
+            validate_rpc_mode(simulation=False, unsafe_legacy_rpc=True, posture=PAPER)
 
-    def test_unsafe_with_simulation_on_a_paper_account_is_allowed(self):
-        validate_rpc_mode(simulation=True, unsafe_legacy_rpc=True,
-                          paper_trading=True, ib_account="DU1234567")  # must not raise
+    def test_unsafe_with_simulation_on_a_consistent_paper_posture_is_allowed(self):
+        validate_rpc_mode(simulation=True, unsafe_legacy_rpc=True, posture=PAPER)  # must not raise
 
-    @pytest.mark.parametrize("paper_trading,ib_account", [
-        (False, "U7654321"), (True, "U7654321"), (False, "DU1234567"), (True, ""), (True, None)])
-    def test_unsafe_with_simulation_but_no_proven_paper_account_raises(self, paper_trading, ib_account):
+    @pytest.mark.parametrize("change", [
+        {"trading_mode": "live"},
+        {"paper_trading": False},
+        {"ib_account": "U7654321"},
+        {"ib_account": ""},
+        {"ib_account": None},
+        {"ib_server_port": 7496},
+        {"ib_paper_port": 7496},
+        {"ib_paper_port": 7496, "ib_live_port": 7496, "ib_server_port": 7496},
+        # PR #50 round 3 reproduction: env PAPER_TRADING + DU account over a live YAML.
+        {"trading_mode": "live", "ib_server_port": 7496},
+    ], ids=lambda c: ",".join(f"{k}={v}" for k, v in c.items()))
+    def test_any_disagreement_in_the_broker_posture_raises(self, change):
         with pytest.raises(ValueError, match="paper"):
             validate_rpc_mode(simulation=True, unsafe_legacy_rpc=True,
-                              paper_trading=paper_trading, ib_account=ib_account)
+                              posture=dataclasses.replace(PAPER, **change))
+
+    def test_error_names_every_conflicting_value(self):
+        posture = dataclasses.replace(PAPER, trading_mode="live", ib_server_port=7496)
+        with pytest.raises(ValueError) as raised:
+            validate_rpc_mode(simulation=True, unsafe_legacy_rpc=True, posture=posture)
+        assert "trading_mode='live'" in str(raised.value) and "ib_server_port=7496" in str(raised.value)
 
     def test_paper_posture_is_mandatory_for_every_caller(self):
         with pytest.raises(TypeError):
             validate_rpc_mode(simulation=True, unsafe_legacy_rpc=True)  # type: ignore[call-arg]
 
-    def test_trader_passes_its_paper_posture_to_the_gate(self):
+    def test_trader_passes_its_effective_broker_posture_to_the_gate(self):
         import inspect
 
         from trader.trading.trading_runtime import Trader
-        source = inspect.getsource(Trader.connect)
-        assert "paper_trading=self.paper_trading" in source and "ib_account=self.ib_account" in source
+        assert "posture=self.broker_posture()" in inspect.getsource(Trader.connect)
+
+    def test_trader_posture_is_the_ib_connection_it_uses(self, tmp_path):
+        from trader.trading.trading_runtime import Trader
+        trader = Trader.__new__(Trader)
+        trader.trading_mode, trader.paper_trading, trader.ib_account = "paper", True, "DU1"
+        trader.ib_server_port, trader.ib_paper_port, trader.ib_live_port = 7496, 7497, 7496
+        posture = trader.broker_posture()
+        assert posture.ib_server_port == 7496
+        with pytest.raises(ValueError, match="paper"):
+            validate_rpc_mode(simulation=True, unsafe_legacy_rpc=True, posture=posture)
 
     def test_safe_without_simulation_is_allowed(self):
-        validate_rpc_mode(simulation=False, unsafe_legacy_rpc=False, paper_trading=True, ib_account="DU1234567")  # must not raise
+        validate_rpc_mode(simulation=False, unsafe_legacy_rpc=False,
+                          posture=dataclasses.replace(PAPER, trading_mode="live"))  # must not raise
 
     def test_safe_with_simulation_is_allowed(self):
         """simulation=True alone (without the explicit unsafe flag) must NOT
         grant the legacy RPC -- the caller must opt in to BOTH."""
-        validate_rpc_mode(simulation=True, unsafe_legacy_rpc=False, paper_trading=True, ib_account="DU1234567")  # must not raise
+        validate_rpc_mode(simulation=True, unsafe_legacy_rpc=False, posture=PAPER)  # must not raise
 
 
 # ---------------------------------------------------------------------------

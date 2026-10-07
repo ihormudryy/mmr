@@ -106,6 +106,8 @@ class Container():
         # Container.resolve() picks them up (it reads from self.configuration).
         self.configuration['ib_account'] = self.mmr_config.ib.account
         self.configuration['ib_server_port'] = self.mmr_config.ib.server_port
+        self.configuration['ib_paper_port'] = self.mmr_config.ib.paper_port
+        self.configuration['ib_live_port'] = self.mmr_config.ib.live_port
         self.configuration['paper_trading'] = self.mmr_config.paper_trading
         self.configuration['trading_mode'] = self.mmr_config.trading_mode
         self.configuration['massive_api_key'] = self.mmr_config.massive.api_key

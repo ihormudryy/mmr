@@ -1490,6 +1490,40 @@ def _read_ai_signals_handler(ai_paper):
     return _handler
 
 
+def _discover_ai_candidates_handler(reader):
+    from trader.automation.ai_discovery import DiscoveryRefused
+    from trader.automation.ai_discovery_wire import DiscoverAiCandidatesRequest, DiscoverAiCandidatesResponse
+
+    def _handler(parsed: DiscoverAiCandidatesRequest) -> DiscoverAiCandidatesResponse:
+        try:
+            return reader.read(parsed)
+        except DiscoveryRefused as ex:
+            raise _DispatchProblem(ex.code, ex.message) from None
+    return _handler
+
+
+def _ai_entry_quote_handler(source, now):
+    """Ruling 18: the BUY quote from the command stack's quote authority, labelled with its feed.
+
+    A quote outside the accepted set is still returned, so the ``ai`` side records ``feed_not_accepted``.
+    """
+    from trader.automation.ai_discovery_wire import GetAiEntryQuoteRequest
+
+    def _handler(parsed: GetAiEntryQuoteRequest) -> Dict[str, Any]:
+        try:
+            quote = source.quotes.executable_quote(parsed.conid, side="BUY")
+        except Exception as exc:                     # no quote: never the provider's text
+            logging.warning("entry quote read failed for conid %s: %s", parsed.conid, type(exc).__name__)
+            quote = None
+        body = None if quote is None else {
+            "bid": quote.bid, "ask": quote.ask, "bid_size": quote.bid_size, "ask_size": quote.ask_size,
+            "market_timestamp": quote.market_timestamp.isoformat(), "feed": quote.feed_type,
+            "session_state": quote.session_state}
+        return {"conid": parsed.conid, "read_at": now().isoformat(), "account_mode": source.account_mode,
+                "accepted_feeds": sorted(source.accepted_feeds), "quote": body}
+    return _handler
+
+
 def register_ai_paper_authority(registry: TypedRpcRegistry, coordinator: TradingCommandCoordinator,
                                 ai_paper, *, account_id: Optional[str]) -> None:
     """SP1 ai_paper (Plan 3 Task 9): only when ``ai_paper.enabled`` built the services."""
@@ -1532,6 +1566,25 @@ def register_ai_paper_authority(registry: TypedRpcRegistry, coordinator: Trading
     registry.register(
         "query", "get_ai_deployment", GetAiDeploymentRequest, dict, _get_ai_deployment_handler(ai_paper.actions),
     )
+    _register_ai_discovery(registry, ai_paper)
+
+
+def _register_ai_discovery(registry: TypedRpcRegistry, ai_paper) -> None:
+    """SP2 Plan 3 rulings 17-18: network reads run on a worker thread, never on the trader loop."""
+    from trader.automation.ai_discovery_wire import (
+        DiscoverAiCandidatesRequest, DiscoverAiCandidatesResponse, GetAiEntryQuoteRequest,
+    )
+    if getattr(ai_paper, "discovery", None) is not None:
+        registry.register(
+            "query", "discover_ai_candidates", DiscoverAiCandidatesRequest, DiscoverAiCandidatesResponse,
+            _discover_ai_candidates_handler(ai_paper.discovery), execution="thread",
+        )
+    if getattr(ai_paper, "entry_quotes", None) is not None:
+        registry.register(
+            "query", "get_ai_entry_quote", GetAiEntryQuoteRequest, dict,
+            _ai_entry_quote_handler(ai_paper.entry_quotes, lambda: dt.datetime.now(dt.timezone.utc)),
+            execution="thread",
+        )
 
 
 EXPERIMENT_ACTIONS = ("start_experiment", "pause_experiment", "resume_experiment", "stop_experiment")

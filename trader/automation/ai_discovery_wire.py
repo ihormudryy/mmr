@@ -116,3 +116,10 @@ class DiscoverAiCandidatesResponse(BaseModel):
     deployment_digest: str
     coverage: DiscoveryCoverage
     candidates: list[DiscoveryCandidate]
+
+
+class GetAiEntryQuoteRequest(BaseModel):
+    """``get_ai_entry_quote`` (Plan 3 ruling 18): one conid, a JSON integer > 0."""
+    model_config = _STRICT
+
+    conid: Annotated[int, Field(gt=0)]

@@ -507,6 +507,16 @@ class AiPaperServices:
     signals_path: str
     scope_contracts: Any = None   # IbContractEvidenceSource (SP2 Plan 3)
     scope_volumes: Any = None     # DollarVolumeSource (SP2 Plan 3)
+    discovery: Any = None         # AiDiscoveryReader (SP2 Plan 3): discover_ai_candidates
+    entry_quotes: Any = None      # EntryQuoteSource (SP2 Plan 3): get_ai_entry_quote
+
+
+@dataclass(frozen=True)
+class EntryQuoteSource:
+    """The command stack's own quote authority and accepted feeds, served to ``ai_supervisor`` (ruling 18)."""
+    quotes: Any
+    accepted_feeds: frozenset[str]
+    account_mode: str
 
 
 @dataclass(frozen=True)
@@ -601,6 +611,7 @@ def _build_ai_paper_services(
     from trader.automation.ai_paper_evidence import AI_ENTRY_POLICY, AiPaperEvidence
     from trader.automation.ai_paper_experiment import NoExperiment
     from trader.automation.controller_epoch import ControllerEpochs
+    from trader.automation.ai_discovery import AiDiscoveryReader, SymbolResolver
     from trader.automation.discretionary_scope import DiscretionaryScopeService
     from trader.automation.scope_evidence import DollarVolumeSource, IbContractEvidenceSource
     from trader.data_providers.capabilities import Capability
@@ -648,7 +659,13 @@ def _build_ai_paper_services(
     return AiPaperServices(config=parts.config, policy=parts.policy, deployments=deployments,
                            decisions=decisions, decision_store=decision_store, actions=actions,
                            entry_filter=parts.entry_filter, epochs=epochs, signals=signals,
-                           signals_path=signals_path, scope_contracts=contracts, scope_volumes=volumes)
+                           signals_path=signals_path, scope_contracts=contracts, scope_volumes=volumes,
+                           discovery=AiDiscoveryReader(
+                               providers=lambda capability: _alpaca_provider(trader, capability),
+                               resolver=SymbolResolver(contracts=contracts, now=now), volumes=volumes,
+                               deployments=deployments, filter_refusal=parts.filter_refusal, now=now),
+                           entry_quotes=EntryQuoteSource(quotes=quotes, accepted_feeds=frozenset(accepted_feeds),
+                                                         account_mode=account_mode))
 
 
 def _contract_details_port(trader: Any) -> Callable[[Any], list]:

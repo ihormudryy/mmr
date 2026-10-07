@@ -1887,6 +1887,56 @@ class MMR:
             return SuccessFail.success(obj=receipt.outcome)
         return SuccessFail.fail(error=f'allocation suspension rejected: {receipt.error_code or receipt.state}')
 
+    # ------------------------------------------------------------------
+    # SP1 ai_paper experiments (Plan 4)
+    # ------------------------------------------------------------------
+
+    def experiment_status(self) -> dict:
+        """``get_experiment``: the newest experiment, its entry block and both kill lines.
+        REQUIRES trader_service."""
+        return self._typed_query.call('get_experiment', {}, dict)
+
+    def _experiment_command(self, method: str, reason: str, experiment_id: Optional[str]) -> SuccessFail:
+        import uuid
+        from trader.domain.commands import CommandReceipt
+        from trader.messaging.typed_rpc import TypedRpcRemoteError
+
+        body = {'command_id': f'sdk-{uuid.uuid4()}', 'reason': reason}
+        if method != 'start_experiment':
+            if not experiment_id:
+                experiment = (self.experiment_status() or {}).get('experiment') or {}
+                experiment_id = experiment.get('experiment_id')
+                if not experiment_id:
+                    return SuccessFail.fail(error=f'{method}: there is no experiment')
+            body['experiment_id'] = experiment_id
+        try:
+            receipt = self._typed_command.call(method, body, CommandReceipt)
+        except TypedRpcRemoteError as ex:
+            return SuccessFail.fail(error=f'{method} rejected: {ex.code}: {ex.message}', exception=ex)
+        except (TimeoutError, ConnectionError) as ex:
+            return SuccessFail.fail(error=f'{method} did not complete: {ex}. Check status before retrying.',
+                                    exception=ex)
+        if receipt.state == 'RESOLVED':
+            return SuccessFail.success(obj=receipt.outcome)
+        message = (receipt.outcome or {}).get('message') if isinstance(receipt.outcome, dict) else None
+        detail = f'{receipt.error_code or receipt.state}' + (f': {message}' if message else '')
+        return SuccessFail.fail(error=f'{method} rejected: {detail}')
+
+    def experiment_start(self, reason: str) -> SuccessFail:
+        """Arm a new paper experiment (operators only; the account must be flat)."""
+        return self._experiment_command('start_experiment', reason, None)
+
+    def experiment_pause(self, reason: str, experiment_id: Optional[str] = None) -> SuccessFail:
+        return self._experiment_command('pause_experiment', reason, experiment_id)
+
+    def experiment_resume(self, reason: str, experiment_id: Optional[str] = None) -> SuccessFail:
+        """Resume a PAUSED experiment. A KILLED experiment is never resumed."""
+        return self._experiment_command('resume_experiment', reason, experiment_id)
+
+    def experiment_stop(self, reason: str, experiment_id: Optional[str] = None) -> SuccessFail:
+        """Stop the experiment once the account is flat. Final."""
+        return self._experiment_command('stop_experiment', reason, experiment_id)
+
     def deactivate_live_canary(self, strategy_id: str, reason: str) -> SuccessFail:
         """Suspend an ACTIVE canary authority via ``deactivate_live_canary``.
         REQUIRES trader_service. Risk-reducing: no preflight nonce needed,

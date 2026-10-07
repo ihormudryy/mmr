@@ -125,6 +125,9 @@ class KillLineMonitor:
         self._recovered = True
 
     def tick(self) -> None:
+        if not self._recovered:          # a failed startup recovery is retried here
+            self.recover()
+            return
         record = self._store.active()
         if record is None:
             return

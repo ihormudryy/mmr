@@ -510,6 +510,9 @@ class Trader():
                 hot_arm = getattr(command_stack, "paper_hot_arm", None)
                 if hot_arm is not None and hasattr(hot_arm, "attach_registry"):
                     hot_arm.attach_registry(production_registry)
+                from trader.automation.experiment_service import attach_production_identity
+                attach_production_identity(getattr(command_stack, "experiments", None),
+                                           self.rpc_identity, production_registry)
             if command_stack is None:
                 register_strategy_state_ingest(production_registry, self.domain_journal)
             self.typed_query_server = TypedRpcServer(

@@ -122,7 +122,7 @@ class World:
         self.cash = {"base_currency": "USD", "currencies": {}}
         self.ports = ArmingPorts(
             broker=Broker(), account_cash=lambda: self.cash, resume_ready=lambda: True,
-            reconciliation_safe=lambda: True, breaker_clear=lambda: True, exit_owners=self.exit_owners,
+            reconciliation_safe=lambda exclude: True, breaker_clear=lambda: True, exit_owners=self.exit_owners,
             liquidation_roots=lambda: list(self.roots), old_path_armed=lambda: None, ai_paper_built=lambda: True)
         self.service = ExperimentService(store=self.store, ports=self.ports, lock=ArmingLock(), config=config,
                                          account_id=ACCOUNT, account_mode=account_mode, now=lambda: NOW)
@@ -169,7 +169,7 @@ def _apply_setup(world, setup):
         "one_strategy_armed": lambda: setattr(ports, "old_path_armed", lambda: "ONE_STRATEGY_ARMED"),
         "broker_not_ready": lambda: setattr(ports, "resume_ready", lambda: False),
         "breaker_tripped": lambda: setattr(ports, "breaker_clear", lambda: False),
-        "unresolved_command": lambda: setattr(ports, "reconciliation_safe", lambda: False),
+        "unresolved_command": lambda: setattr(ports, "reconciliation_safe", lambda exclude: False),
         "capture_staging": lambda: setattr(broker, "fail", BrokerRiskSnapshotError("GENERATION_STAGING", "x")),
         "capture_no_generation": lambda: setattr(broker, "fail",
                                                  BrokerRiskSnapshotError("NO_PROMOTED_GENERATION", "x")),
@@ -412,10 +412,10 @@ def test_resume_after_an_outage_pause_needs_fresh_evidence(outage_paused):      
     with pytest.raises(CommandValidationError, match="RESUME_EVIDENCE_STALE"):
         outage_paused.resume(cmd("resume_experiment", experiment_id=outage_paused.id, reason="r"))
     outage_paused.ports.broker.set(generation_id=outage_paused.pause_generation_id + 1)
-    outage_paused.ports.reconciliation_safe = lambda: False
+    outage_paused.ports.reconciliation_safe = lambda exclude: False
     with pytest.raises(CommandValidationError, match="RECONCILIATION_INCOMPLETE"):
         outage_paused.resume(cmd("resume_experiment", experiment_id=outage_paused.id, reason="r"))
-    outage_paused.ports.reconciliation_safe = lambda: True
+    outage_paused.ports.reconciliation_safe = lambda exclude: True
     outage_paused.ports.resume_ready = lambda: False
     with pytest.raises(CommandValidationError, match="TRADER_NOT_READY"):
         outage_paused.resume(cmd("resume_experiment", experiment_id=outage_paused.id, reason="r"))
@@ -497,3 +497,10 @@ def test_start_body_is_strict(svc, body):
     with pytest.raises(CommandValidationError, match="EXPERIMENT_REQUEST_INVALID"):
         svc.start(replace(cmd("start_experiment", reason="go"), body=body))
     assert svc.store.latest() is None
+
+
+def test_reconciliation_excludes_the_command_being_executed(svc):
+    seen = []
+    svc.ports.reconciliation_safe = lambda exclude: seen.append(exclude) or True
+    svc.start(cmd("start_experiment", command_id="s9", reason="go"))
+    assert seen == ["s9"]

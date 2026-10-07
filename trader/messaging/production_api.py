@@ -808,6 +808,49 @@ class RegisterAiDeploymentRequest(BaseModel):
         return value
 
 
+# --- SP1 experiments (Plan 4 Task 7): strict wire models. The service checks the body again. ---
+
+_EXPERIMENT_ID = re.compile(r"^exp-[0-9a-f]{20}$")
+_ExperimentReason = Annotated[str, Field(min_length=1, max_length=200)]
+
+
+class StartExperimentRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid", strict=True)
+
+    command_id: str
+    reason: _ExperimentReason
+
+    @field_validator("command_id")
+    @classmethod
+    def _command_id_has_no_colon(cls, value: str) -> str:
+        return _reject_colon_in_command_id(value)
+
+
+class ExperimentCommandRequest(BaseModel):
+    """pause_experiment / resume_experiment / stop_experiment."""
+    model_config = ConfigDict(extra="forbid", strict=True)
+
+    command_id: str
+    experiment_id: str
+    reason: _ExperimentReason
+
+    @field_validator("command_id")
+    @classmethod
+    def _command_id_has_no_colon(cls, value: str) -> str:
+        return _reject_colon_in_command_id(value)
+
+    @field_validator("experiment_id")
+    @classmethod
+    def _experiment_id_shape(cls, value: str) -> str:
+        if not _EXPERIMENT_ID.fullmatch(value):
+            raise ValueError("experiment_id must match exp-<20 hex>")
+        return value
+
+
+class GetExperimentRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid", strict=True)
+
+
 class SubmitAiPaperDecisionRequest(BaseModel):
     model_config = ConfigDict(extra="forbid", strict=True)
 
@@ -1341,6 +1384,50 @@ def register_ai_paper_authority(registry: TypedRpcRegistry, coordinator: Trading
     registry.register(
         "query", "get_ai_deployment", GetAiDeploymentRequest, dict, _get_ai_deployment_handler(ai_paper.actions),
     )
+
+
+EXPERIMENT_ACTIONS = ("start_experiment", "pause_experiment", "resume_experiment", "stop_experiment")
+
+
+def _experiment_command_rpc_handler(coordinator: TradingCommandCoordinator, account_id: Optional[str],
+                                    action: str):
+    def _handler(parsed, caller: RpcCaller) -> Dict[str, Any]:
+        body = {"reason": parsed.reason}
+        target_id = str(account_id)
+        if action != "start_experiment":
+            body["experiment_id"] = parsed.experiment_id
+            target_id = parsed.experiment_id
+        request = CommandRequest(
+            command_id=parsed.command_id, action=action, account_id=account_id, target_type="experiment",
+            target_id=target_id, expected_version=None, body=body,
+            source=caller.principal, principal=caller.principal,
+        )
+        return _receipt_to_dict(coordinator.execute(request))
+    return _handler
+
+
+def register_experiment_authority(registry: TypedRpcRegistry, command_stack: Any, *,
+                                  account_id: Optional[str]) -> None:
+    """SP1 Plan 4: on every paper command stack (K15). start/resume/stop are operator-only (K14)."""
+    from trader.automation.experiment_service import experiment_status
+
+    experiments = command_stack.experiments
+    coordinator = command_stack.coordinator
+    service = experiments.service
+    for action, fn in zip(EXPERIMENT_ACTIONS, (service.start, service.pause, service.resume, service.stop)):
+        coordinator.register_action(action, fn, requires_preflight=False)
+    registry.register("command", "start_experiment", StartExperimentRequest, dict,
+                      _experiment_command_rpc_handler(coordinator, account_id, "start_experiment"),
+                      with_caller=True)
+    for action in EXPERIMENT_ACTIONS[1:]:
+        registry.register("command", action, ExperimentCommandRequest, dict,
+                          _experiment_command_rpc_handler(coordinator, account_id, action), with_caller=True)
+
+    def _status(_parsed: GetExperimentRequest) -> Dict[str, Any]:
+        return experiment_status(experiments, account_mode=command_stack.account_mode,
+                                 mode_conflict=getattr(command_stack, "mode_conflict", None),
+                                 config_path=experiments.config_path)
+    registry.register("query", "get_experiment", GetExperimentRequest, dict, _status)
 
 
 def _cancel_order_rpc_handler(coordinator: TradingCommandCoordinator, account_id: Optional[str]):
@@ -2427,6 +2514,9 @@ def build_production_registry(
         if ai_paper is not None:
             register_ai_paper_authority(registry, command_stack.coordinator, ai_paper,
                                         account_id=getattr(trader, 'ib_account', None))
+        if getattr(command_stack, "experiments", None) is not None:
+            register_experiment_authority(registry, command_stack,
+                                          account_id=getattr(trader, 'ib_account', None))
     elif command_coordinator is not None and proposal_service is not None and proposal_repository is not None:
         register_command_authority(
             registry, command_coordinator, proposal_service, proposal_repository,

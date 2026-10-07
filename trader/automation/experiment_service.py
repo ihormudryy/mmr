@@ -83,7 +83,8 @@ class ArmingPorts:
     broker: Any                                     # .capture(account_id) -> BrokerRiskSnapshot
     account_cash: Callable[[], Mapping]
     resume_ready: Callable[[], bool]
-    reconciliation_safe: Callable[[], bool]
+    # No unresolved command other than the one being executed (its own ledger row is RECEIVED).
+    reconciliation_safe: Callable[[Optional[str]], bool]
     breaker_clear: Callable[[], bool]
     exit_owners: Any                                # .account_owner(account_id)
     liquidation_roots: Callable[[], list]           # non-terminal roots
@@ -203,7 +204,7 @@ class ExperimentService:
             self._require_identity()
             self._require_old_path_disarmed()
             self._require_no_active()
-            self._require_ready()
+            self._require_ready(cmd.command_id)
             snapshot = self._capture()
             self._require_flat(snapshot)
             fx = start_fx_from_cash(self._read_cash())
@@ -239,7 +240,7 @@ class ExperimentService:
                 return self._view(record)
             self._require_enabled()
             if record.pause_cause == OUTAGE_PAUSE:
-                self._require_fresh_evidence(record)
+                self._require_fresh_evidence(record, cmd.command_id)
             resumed = self.store.transition(
                 record.experiment_id, expected=frozenset({"PAUSED"}), to="ARMED", principal=cmd.principal,
                 command_id=cmd.command_id, reason=body["reason"],
@@ -319,15 +320,15 @@ class ExperimentService:
         if active is not None:
             raise ExperimentRefused("EXPERIMENT_ACTIVE", f"experiment {active.experiment_id} is {active.state}")
 
-    def _require_ready(self) -> None:
+    def _require_ready(self, command_id: Optional[str]) -> None:
         if not self._read_bool("TRADER_NOT_READY", self.ports.resume_ready):
             raise ExperimentRefused("TRADER_NOT_READY", "no current, fenced broker evidence")
         if not self._read_bool("BREAKER_TRIPPED", self.ports.breaker_clear):
             raise ExperimentRefused("BREAKER_TRIPPED", "the circuit breaker is not clear")
-        self._require_reconciled()
+        self._require_reconciled(command_id)
 
-    def _require_reconciled(self) -> None:
-        if not self._read_bool("RECONCILIATION_INCOMPLETE", self.ports.reconciliation_safe):
+    def _require_reconciled(self, command_id: Optional[str]) -> None:
+        if not self._read_bool("RECONCILIATION_INCOMPLETE", lambda: self.ports.reconciliation_safe(command_id)):
             raise ExperimentRefused("RECONCILIATION_INCOMPLETE", "a command is still unresolved")
 
     def _capture(self) -> Any:
@@ -367,7 +368,7 @@ class ExperimentService:
         except Exception as exc:
             raise ExperimentRefused("START_FX_UNAVAILABLE", f"account cash unreadable: {exc}") from exc
 
-    def _require_fresh_evidence(self, record: ExperimentRecord) -> None:
+    def _require_fresh_evidence(self, record: ExperimentRecord, command_id: Optional[str]) -> None:
         """K11: an outage pause resumes only on a capture newer than the pause."""
         if not self._read_bool("TRADER_NOT_READY", self.ports.resume_ready):
             raise ExperimentRefused("TRADER_NOT_READY", "no current, fenced broker evidence")
@@ -377,7 +378,7 @@ class ExperimentService:
         if snapshot.generation_id <= floor:
             raise ExperimentRefused("RESUME_EVIDENCE_STALE",
                                     f"broker generation {snapshot.generation_id} is not newer than {floor}")
-        self._require_reconciled()
+        self._require_reconciled(command_id)
 
     def _target(self, experiment_id: str) -> ExperimentRecord:
         active = self.store.active()
@@ -401,3 +402,74 @@ class ExperimentService:
             styles=tuple(self._config.styles), kill_drawdown_pct=self._config.experiment_kill_drawdown_pct,
             kill_basis=self._config.experiment_kill_basis, revision=1, peak_net_liquidation=nlv,
             kill_anchor_net_liquidation=nlv)
+
+
+# -- the get_experiment read (K1, K9) -----------------------------------------
+
+def _line_json(line: Any) -> Optional[dict]:
+    return None if line is None else line.to_json()
+
+
+def configured_kill_line(record: Optional[ExperimentRecord], config_path: Any, account_mode: str) -> Any:
+    """K9: the ai_paper block re-read from the trader's own config file now. Never applied."""
+    import yaml
+    from pathlib import Path
+
+    from trader.automation.ai_paper_config import load_ai_paper_config
+    try:
+        path = Path(config_path)
+        raw = yaml.safe_load(path.read_text()) if path.exists() else {}
+        if raw is not None and not isinstance(raw, dict):
+            raise ValueError("trader.yaml is not a mapping")
+        configured = load_ai_paper_config((raw or {}).get("ai_paper"), trading_mode=account_mode)
+    except Exception:
+        logger.warning("the configured kill line could not be read from %s", config_path, exc_info=True)
+        return "UNREADABLE"
+    return _line_json(_line_for(record, configured))
+
+
+def _line_for(record: Optional[ExperimentRecord], config: Any) -> Any:
+    from trader.automation.kill_line import KillLine
+    if record is not None:
+        return effective_kill_line(record, config)
+    pct = getattr(config, "experiment_kill_drawdown_pct", None)
+    return None if pct is None else KillLine(float(pct), config.experiment_kill_basis)
+
+
+def experiment_status(experiments: Any, *, account_mode: str, mode_conflict: Optional[str],
+                      config_path: Any) -> dict:
+    """The newest experiment of the account, its entry block, the last evaluation and both kill lines."""
+    from trader.automation.kill_monitor import DETECTION_NOTE
+
+    service, monitor, store = experiments.service, experiments.monitor, experiments.store
+    record = store.latest()
+    active = _line_json(_line_for(record, service.config))
+    configured = configured_kill_line(record, config_path, account_mode)
+    block = None
+    if record is not None:
+        block = mode_conflict or monitor.entry_block(record)
+    view = None
+    transitions: list = []
+    if record is not None:
+        view = record_view(record, service.config)
+        view.update({"kill_round": record.kill_round, "kill_flatten_root": record.kill_flatten_root,
+                     "kill_alert_state": record.kill_alert_state,
+                     "kill_observed_drawdown_pct": record.kill_observed_drawdown_pct,
+                     "stopped_at": _iso(record.stopped_at)})
+        transitions = [{**t, "at": _iso(t["at"])} for t in store.transitions(record.experiment_id)]
+    return {
+        "experiment": view,
+        "entry_block": block,
+        "last_evaluation": monitor.last_evaluation_view(),
+        "kill_line": {"active": active, "configured": configured,
+                      "pending_restart": configured != "UNREADABLE" and configured != active,
+                      "detection": DETECTION_NOTE},
+        "mode_conflict": mode_conflict,
+        "transitions": transitions,
+    }
+
+
+def attach_production_identity(experiments: Any, identity: Any, registry: Any) -> None:
+    """K22: trading_runtime calls this once the served registry exists."""
+    if experiments is not None:
+        experiments.service.attach_identity_check(lambda: ai_supervisor_identity_problem(identity, registry))

@@ -381,6 +381,38 @@ def _maybe_start_session_recovery(
     loop.create_task(_session_controller_loop(controller, worker))
 
 
+async def _experiment_monitor_loop(
+    monitor, worker, *, interval: float = 5.0, stuck_after: float = _WORKER_STUCK_AFTER_SECONDS,
+) -> None:
+    """SP1 Plan 4: the kill line on every fenced capture, on the liquidation worker (K1)."""
+    await _watched_ticks(
+        'experiment monitor', lambda: _on_worker(worker, monitor.tick),
+        interval=interval, stuck_after=stuck_after)
+
+
+def _maybe_start_experiment_monitor(
+    trader: Trader, loop: AbstractEventLoop, worker, stopping: Callable[[], bool] = _never_stopping,
+) -> None:
+    """SP1 Plan 4 K5: resume a kill in progress BEFORE readiness, after session recovery.
+
+    Until ``recover()`` has run, every ai_paper entry is refused
+    ``EXPERIMENT_MONITOR_NOT_READY``. The loop starts even when recovery
+    fails, so the next tick retries; it does not start once ``stopping()`` is true.
+    """
+    monitor = getattr(trader, 'kill_line_monitor', None)
+    if monitor is None or stopping():
+        return
+    try:
+        loop.run_until_complete(_on_worker(worker, monitor.recover))
+    except (Exception, asyncio.CancelledError) as ex:
+        if not stopping():
+            logging.error('startup experiment monitor recovery failed; the monitor loop retries: {}'.format(ex))
+    if stopping():
+        logging.info('shutdown during startup experiment monitor recovery; monitor loop not started')
+        return
+    loop.create_task(_experiment_monitor_loop(monitor, worker))
+
+
 async def _orphan_reservation_tick(saga, worker):
     """One orphan sweep on the worker; reads broker state only, never sends."""
     return await _on_worker(worker, saga.retire_orphan_reservations)
@@ -546,6 +578,8 @@ def main(simulation: bool,
         _maybe_start_liquidation_recovery(trader, loop, liquidation_worker, stopping)
         # P3 Task 6: session deadline recovery must start before readiness/run.
         _maybe_start_session_recovery(trader, loop, liquidation_worker, stopping)
+        # SP1 Plan 4: the kill monitor recovers after session recovery, before readiness.
+        _maybe_start_experiment_monitor(trader, loop, liquidation_worker, stopping)
         _maybe_start_orphan_reservation_sweep(trader, loop, liquidation_worker, stopping)
         if stopping():
             _finish_startup_shutdown(loop, shutdown)

@@ -17,7 +17,7 @@ from tests.rpc_identity_fixtures import ServedStack, make_identities
 from tests.test_command_stack import _trader
 from trader.automation.ai_paper_config import AiPaperConfig
 from trader.automation.ai_paper_decision import AI_PAPER_ACTION
-from trader.automation.ai_paper_experiment import ExperimentView, NoExperiment
+from trader.automation.ai_paper_experiment import ExperimentStateReader
 from trader.automation.risk_limits import PAPER_LIMITS
 from trader.messaging.principals import TRADER_ACL
 from trader.messaging.production_api import build_production_registry
@@ -82,11 +82,6 @@ class FakeOrphanEvidence:
         return BrokerEnumeration(generation_id=5, started_at=NOW)
 
 
-class Armed:
-    def current(self, account_id):
-        return ExperimentView("exp1", "ARMED")
-
-
 def _served(tmp_path, monkeypatch, config):
     import trader.trading.command_stack as command_stack
     import trader.trading.trading_runtime as trading_runtime
@@ -97,6 +92,9 @@ def _served(tmp_path, monkeypatch, config):
     monkeypatch.setattr(command_stack, "TraderBrokerAuthority", FakeMargin)
     monkeypatch.setattr(command_stack, "BrokerStateOrphanEvidence", FakeOrphanEvidence)
     monkeypatch.setattr(trading_runtime, "TradingRuntimeOrderDispatch", lambda *a, **k: orders)
+    yaml_path = tmp_path / "trader.yaml"          # paper automation status() reads it: never the developer's
+    yaml_path.write_text("{}\n")
+    monkeypatch.setenv("TRADER_CONFIG", str(yaml_path))
     trader = _trader(tmp_path)
     trader.ai_paper_config = config
     trader.data = make_history(str(tmp_path / "history.duckdb"))
@@ -104,6 +102,8 @@ def _served(tmp_path, monkeypatch, config):
                                               now=lambda: NOW)
     ids = make_identities()
     registry = build_production_registry(trader, ids["trader"], command_stack=stack)
+    from trader.automation.experiment_service import attach_production_identity
+    attach_production_identity(stack.experiments, ids["trader"], registry)
     served = ServedStack({("trader", "command"): registry, ("trader", "query"): registry}, ids)
     served.stack, served.broker, served.orders, served.coordinator = stack, broker, orders, stack.coordinator
     return served
@@ -234,18 +234,20 @@ def test_policy_above_the_owner_ceiling_is_refused(served):
     assert (out["state"], out["error_code"]) == ("REJECTED", "POLICY_ABOVE_CEILING")
 
 
-def test_every_decision_is_refused_until_plan_four(served):
+def test_every_decision_is_refused_without_an_experiment(served):
     publish(served)
     digest = register(served)
     out = command(served, "ai_supervisor").call("submit_ai_paper_decision", enter_body(digest), dict)
     assert (out["state"], out["error_code"]) == ("REJECTED", "NO_EXPERIMENT")
-    assert isinstance(served.stack.ai_paper.decisions._experiments, NoExperiment)
+    assert isinstance(served.stack.ai_paper.decisions._experiments, ExperimentStateReader)
 
 
 def test_end_to_end_enter_through_the_stack(served):
     publish(served)
     digest = register(served)
-    served.stack.ai_paper.decisions._experiments = Armed()
+    started = command(served, "cli").call("start_experiment", {"command_id": "start-1", "reason": "go"}, dict)
+    assert started["outcome"]["state"] == "ARMED", started
+    served.stack.experiments.monitor.recover()                       # trader_service does this before readiness
     out = command(served, "ai_supervisor").call("submit_ai_paper_decision", enter_body(digest), dict)
     assert out["state"] == "SUBMITTED", out
     ((group, proposal),) = served.orders.plans

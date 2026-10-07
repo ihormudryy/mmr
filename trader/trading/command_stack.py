@@ -792,12 +792,14 @@ class ExperimentServices:
     monitor: Any     # KillLineMonitor
     reader: Any      # ExperimentStateReader (Plan 3's ExperimentStatePort)
     lock: Any        # ArmingLock shared with the one-strategy activation
+    config_path: Any = None  # trader.yaml, re-read only to show a pending kill-line edit (K9)
 
 
 def _build_experiment_services(
     trader: Any, parts: Optional[_ExperimentParts], *, journal: Any, broker: Any, liquidation: Any,
     liquidation_store: Any, exit_owners: Any, session_controller: Any, breaker_store: Any,
-    resume_ready: Callable[[], bool], reconciliation_safe: Callable[[], bool], late: dict,
+    resume_ready: Callable[[], bool], reconciliation_safe: Callable[[], bool],
+    reconciliation_complete: Callable[[str], bool], late: dict,
     mode_conflict: Callable[[], Optional[str]], account_mode: str, now: Callable[[], dt.datetime],
 ) -> Optional[ExperimentServices]:
     """K15: built on every paper stack, also with ``ai_paper.enabled: false``."""
@@ -817,7 +819,8 @@ def _build_experiment_services(
         broker=broker,
         account_cash=TraderServiceApi(trader).get_account_cash_by_currency,
         resume_ready=resume_ready,
-        reconciliation_safe=reconciliation_safe,
+        reconciliation_safe=lambda exclude: (reconciliation_safe() if exclude is None
+                                             else reconciliation_complete(exclude)),
         breaker_clear=lambda: breaker_store.get().state == "CLEAR",
         exit_owners=exit_owners,
         liquidation_roots=lambda: liquidation_store.transaction(liquidation_store.roots_to_advance_in_tx),
@@ -828,7 +831,11 @@ def _build_experiment_services(
                                 account_id=trader.ib_account, account_mode=account_mode, now=now)
     reader = ExperimentStateReader(parts.store, monitor, mode_conflict=mode_conflict)
     return ExperimentServices(store=parts.store, service=service, monitor=monitor, reader=reader,
-                              lock=parts.arming_lock)
+                              lock=parts.arming_lock, config_path=_trader_yaml_path())
+
+
+def _trader_yaml_path() -> Path:
+    return Path(os.environ.get("TRADER_CONFIG", "~/.config/mmr/trader.yaml")).expanduser()
 
 
 def _experiment_gate(reader: Any, account_id: str) -> Callable[[Any], Optional[str]]:
@@ -1271,7 +1278,7 @@ def build_command_stack(
         trader, experiment_parts, journal=journal, broker=broker_snapshot, liquidation=liquidation_service,
         liquidation_store=liquidation_store, exit_owners=exit_owner_registry, session_controller=session_controller,
         breaker_store=breaker_store, resume_ready=resume_ready, reconciliation_safe=reconciliation_safe,
-        late=late, mode_conflict=lambda: mode_conflict_slot["code"], account_mode=account_mode, now=now)
+        reconciliation_complete=reconciliation_complete, late=late, mode_conflict=lambda: mode_conflict_slot["code"], account_mode=account_mode, now=now)
     if experiments is not None:
         experiment_gate_slot["gate"] = _experiment_gate(experiments.reader, trader.ib_account)
     # P3 Task 7 — authoritative attribution ledger; broker_ingest appends evidence.
@@ -1366,9 +1373,7 @@ def build_command_stack(
     from trader.automation.paper_activation import PaperAutomationActivationService
     from trader.automation.paper_hot_arm import ProductionPaperHotArmPorts
 
-    trader_yaml_path = Path(
-        os.environ.get("TRADER_CONFIG", "~/.config/mmr/trader.yaml")
-    ).expanduser()
+    trader_yaml_path = _trader_yaml_path()
     strategy_yaml_path = Path(
         getattr(trader, "strategy_config_file", None)
         or "~/.config/mmr/strategy_runtime.yaml"

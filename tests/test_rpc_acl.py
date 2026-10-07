@@ -240,3 +240,18 @@ def test_ai_paper_family_rights_are_exact():
 def test_the_full_registry_registers_the_ai_paper_family():
     registered = {(r.socket_role, r.method) for r in build_full_production_registry().registrations()}
     assert set(AI_PAPER_FAMILY) <= registered
+
+
+def test_experiment_rights():                                            # SP1 Plan 4 K14
+    from trader.messaging.principals import TRADER_ACL
+
+    def rights(principal):
+        return {key for key, allowed in TRADER_ACL.items() if principal in allowed}
+    for principal in ("cli", "dashboard"):
+        assert {("command", f"{a}_experiment") for a in ("start", "pause", "resume", "stop")} <= rights(principal)
+        assert ("query", "get_experiment") in rights(principal)
+    assert {("command", "pause_experiment"), ("query", "get_experiment")} <= rights("ai_supervisor")
+    assert not {("command", "start_experiment"), ("command", "resume_experiment"),
+                ("command", "stop_experiment")} & rights("ai_supervisor")
+    assert not {k for k in rights("ai_research") if "experiment" in k[1]}
+    assert not {k for k in rights("strategy") if "experiment" in k[1]}

@@ -203,6 +203,9 @@ class BrokerSim:
         self.placed.append((group, order.orderType, order.action, order.totalQuantity, price, order.ocaGroup or None))
         self.add_order(entity, group, leg, order.action, order.orderType, order.totalQuantity,
                        conid=int(contract.conId), order=order)
+        if getattr(self, "_hide_next", False):
+            self._hide_next = False
+            self.hidden.add(entity)
         echo = SimpleNamespace(order=order, orderStatus=SimpleNamespace(status="PendingSubmit"))
         ack = SimpleNamespace(order=order, orderStatus=SimpleNamespace(status=self.ack[order.orderType]))
         return rx.from_iterable([echo, ack])
@@ -255,7 +258,7 @@ class BrokerSim:
         self._fill_after_cancel[entity] = float(quantity)
 
     def pending_cancel(self, entity, *, lands=True):
-        """PendingCancel at the next promote(); Cancelled one promote later, or never."""
+        """Once a cancel is sent: PendingCancel at the next promote(); Cancelled one promote later, or never."""
         self._pending_cancel[entity] = lands
 
     def hide(self, entity):
@@ -293,6 +296,10 @@ class BrokerSim:
     def modify_clears_oca(self):
         self._modify_clears_oca = True
 
+    def hide_next_child(self):
+        """The next order placed stays invisible to every generation (a submitted child IB has not shown)."""
+        self._hide_next = True
+
     def never_close(self, conid):
         """Market orders on ``conid`` are acknowledged and never fill."""
         self._never_close.add(int(conid))
@@ -310,6 +317,8 @@ class BrokerSim:
             row = self.orders.get(entity)
             if row is None or row.status in IB_DONE:
                 self._pending_cancel.pop(entity)
+            elif entity not in self.cancelled:
+                continue                                 # nothing asked IB to cancel it yet
             elif row.status != "PendingCancel":
                 self.set_status(entity, "PendingCancel")
             elif lands:
@@ -721,9 +730,10 @@ class ServedStack:
         self.clock[0] = self.clock[0] + dt.timedelta(seconds=seconds, minutes=minutes)
 
     def tick(self):
-        """One liquidation tick, then the reconciler (resolves commands from their close roots)."""
+        """One liquidation tick, the reconciler (resolves commands from their close roots), the kill monitor."""
         self.composed.tick()
         self.stack.reconciler.run_due(self.clock[0])
+        self.stack.experiments.monitor.tick()
 
     def advance_and_promote(self, seconds):
         """The acceptance port's ``sleep``: time passes, the broker moves, the trader catches up."""

@@ -588,6 +588,9 @@ class AiPaperDecisionService:
             self._move(cmd, admission, "SUBMITTED", outcome=outcome)
         except Exception:
             return self._outcome_unknown(cmd, admission, "DISPATCH_AMBIGUOUS", outcome=outcome)
+        if self._schedule_reconcile is not None:
+            # The reconciler resolves the entry once the broker shows its orders (Plan 6 finding).
+            self._schedule_reconcile(cmd.command_id)
         return CommandSteps.receipt(cmd.command_id, "SUBMITTED", None, False, outcome=outcome)
 
     def _latch(self, code: str, decision: AiPaperDecision) -> None:

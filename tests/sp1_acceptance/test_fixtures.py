@@ -22,6 +22,9 @@ def test_served_stack_answers_signed_reads_and_writes(served):
 def test_pending_cancel_that_never_lands_stays_pending_across_generations(composed_sim):
     composed_sim.add_order("og-x:stop", "og-x", "stop", "SELL", "STP", 3)
     composed_sim.pending_cancel("og-x:stop", lands=False)
+    composed_sim.promote()
+    assert composed_sim.orders["og-x:stop"].status == "Submitted"      # no cancel was sent yet
+    composed_sim.cancelOrder(composed_sim.ib_trades["og-x:stop"].order)
     for _ in range(3):
         composed_sim.promote()
     assert composed_sim.orders["og-x:stop"].status == "PendingCancel"
@@ -30,6 +33,7 @@ def test_pending_cancel_that_never_lands_stays_pending_across_generations(compos
 def test_pending_cancel_that_lands_is_cancelled_one_promote_later(composed_sim):
     composed_sim.add_order("og-x:stop", "og-x", "stop", "SELL", "STP", 3)
     composed_sim.pending_cancel("og-x:stop")
+    composed_sim.cancelOrder(composed_sim.ib_trades["og-x:stop"].order)
     composed_sim.promote()
     assert composed_sim.orders["og-x:stop"].status == "PendingCancel"
     composed_sim.promote()

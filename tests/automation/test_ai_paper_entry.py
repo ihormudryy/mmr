@@ -268,3 +268,42 @@ def test_no_links_for_foreign_order_refs(world):
     world.submit()
     assert world.decisions.links_for_order_ref("mmr:og-other") == ()
     assert world.decisions.links_for_order_ref("not-ours") == ()
+
+
+# --- SP1 Plan 6 (found by the acceptance harness): an ENTER must not stay SUBMITTED for ever.
+# A SUBMITTED command keeps reconciliation_safe() false, so experiment stop refused
+# RECONCILIATION_INCOMPLETE and the kill flatten was never proven FLAT after any AI entry.
+
+def _entry_reconciler(world, found):
+    from types import SimpleNamespace
+    from trader.trading.command_coordinator import OutcomeReconciler
+    refs, alerts = [], []
+
+    def find_by_order_ref(account_id, order_ref):
+        refs.append((account_id, order_ref))
+        return list(found)
+    orders = SimpleNamespace(find_by_order_ref=find_by_order_ref, enumeration_complete=lambda: True)
+    reconciler = OutcomeReconciler(
+        journal=world.journal, ledger=world.ledger, orders=orders, strategy=SimpleNamespace(),
+        alerts=SimpleNamespace(raise_alert=lambda *a: alerts.append(a)), now=world.clock, closes=None)
+    return reconciler, refs
+
+
+def test_a_submitted_entry_is_scheduled_and_resolved_once_the_broker_shows_its_orders(world):
+    from types import SimpleNamespace
+    receipt = world.submit()
+    assert receipt.state == "SUBMITTED" and world.scheduled == [receipt.command_id]
+    reconciler, refs = _entry_reconciler(world, [SimpleNamespace(order_ids=[11, 12])])
+    assert reconciler.reconcile_once(receipt.command_id, NOW).resolved
+    row = world.ledger.get(receipt.command_id)
+    assert row.state == "RESOLVED" and row.outcome["order_group_id"] == "og-aip-dec-00000001"
+    assert row.outcome["broker_acknowledged"] is True and row.outcome["quantity"] == 499
+    assert refs == [(ACCOUNT, "mmr:og-aip-dec-00000001")]
+    assert world.ledger.unresolved_for_account(ACCOUNT) == []
+
+
+def test_an_entry_the_broker_has_not_shown_stays_submitted(world):
+    receipt = world.submit()
+    reconciler, _ = _entry_reconciler(world, [])
+    assert not reconciler.reconcile_once(receipt.command_id, NOW).resolved
+    assert world.ledger.get(receipt.command_id).state == "SUBMITTED"         # never rejected by absence alone

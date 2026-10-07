@@ -682,16 +682,18 @@ def _contract_details_port(trader: Any) -> Callable[[Any], list]:
 
 
 def _remember_instrument(trader: Any, details: Any) -> None:
-    """Keep an IB definition in the trader universe, so quotes and the entry filter resolve its conid."""
+    """Keep an IB definition in the trader universe, so quotes and the entry filter resolve its conid.
+
+    A conid any universe already holds is left alone: a second definition would make the AI entry
+    filter's exact one-row resolve refuse it (INSTRUMENT_UNRESOLVED).
+    """
     from trader.automation.scope_evidence import INSTRUMENTS_UNIVERSE
     from trader.data.data_access import SecurityDefinition
 
-    definition = SecurityDefinition.from_contract_details(details)
     accessor = trader.universe_accessor
-    universe = accessor.get(INSTRUMENTS_UNIVERSE)
-    if any(int(d.conId) == int(definition.conId) for d in universe.security_definitions):
+    if accessor.resolve_symbol(int(details.contract.conId)):
         return
-    accessor.insert(INSTRUMENTS_UNIVERSE, definition)
+    accessor.insert(INSTRUMENTS_UNIVERSE, SecurityDefinition.from_contract_details(details))
 
 
 def _alpaca_provider(trader: Any, capability: Any) -> Any:

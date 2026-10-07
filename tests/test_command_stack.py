@@ -721,3 +721,31 @@ def test_the_ai_paper_evidence_gets_the_iex_set(tmp_path, alpaca):
 
     assert stack.ai_paper.decisions._evidence._accepted_feeds == IEX_FEEDS
     assert stack.ai_paper.decisions._evidence._quotes is stack.dispatch_guard._quotes
+
+
+def test_remembering_an_ib_definition_never_duplicates_a_known_conid():      # SP2 Plan 3 ruling 3
+    from ib_async import Contract, ContractDetails
+
+    from trader.trading.command_stack import _remember_instrument
+
+    class Accessor:
+        def __init__(self, known):
+            self.known, self.inserted = known, []
+
+        def resolve_symbol(self, conid, **_kwargs):
+            return [SimpleNamespace(conId=conid)] if conid in self.known else []
+
+        def get(self, name):
+            return SimpleNamespace(security_definitions=[])
+
+        def insert(self, name, definition):
+            self.inserted.append((name, definition.conId))
+
+    row = ContractDetails(contract=Contract(conId=265598, symbol="AAPL", secType="STK", currency="USD",
+                                            exchange="SMART", primaryExchange="NASDAQ"), stockType="COMMON")
+    known = Accessor({265598})                       # e.g. in a user universe: a second definition would make
+    _remember_instrument(SimpleNamespace(universe_accessor=known), row)      # the AI entry filter refuse it
+    assert known.inserted == []
+    unknown = Accessor(set())
+    _remember_instrument(SimpleNamespace(universe_accessor=unknown), row)
+    assert unknown.inserted == [("_instruments", 265598)]

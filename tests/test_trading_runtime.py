@@ -340,6 +340,61 @@ async def test_bracket_rolls_back_when_tp_fails(monkeypatch):
     )
 
 
+@pytest.mark.asyncio
+async def test_bracket_exits_in_an_oca_group_reduce_the_sibling_on_a_partial_fill():
+    """A bracket's stop and target in one OCA group use ocaType=2.
+
+    Type 1 cancels the sibling on a partial fill and leaves the rest of the position
+    without a stop; type 2 reduces the sibling to what is left (as the re-protect legs do)."""
+    import reactivex as rx
+    from trader.trading.proposal import ExecutionSpec
+    from trader.trading.risk_gate import RiskGateResult
+
+    trader = _minimal_trader()
+    placed = []
+
+    class _Client:
+        class ib:
+            @staticmethod
+            def cancelOrder(order):
+                pass
+
+            @staticmethod
+            def accountValues():
+                return []
+
+    class _Executioner:
+        async def subscribe_place_order_direct(self, contract, order):
+            order.orderId = len(placed) + 1
+            placed.append(order)
+            return rx.from_iterable([MagicMock(order=order)])
+
+    class _ApproveAll:
+        def check_instrument(self, **kw):
+            return RiskGateResult(approved=True)
+
+        def check_leverage(self, *a, **kw):
+            return RiskGateResult(approved=True)
+
+        def evaluate(self, *a, **kw):
+            return RiskGateResult(approved=True)
+
+    trader.client, trader.executioner, trader.risk_gate = _Client(), _Executioner(), _ApproveAll()
+    trader.check_order_margin = MagicMock(side_effect=Exception('skip margin'))
+    trader.book = MagicMock(get_open_order_count=MagicMock(return_value=0))
+    spec = ExecutionSpec(order_type='LIMIT', limit_price=100.0, exit_type='BRACKET', take_profit_price=110.0,
+                         stop_loss_price=90.0).to_dict()
+    spec['oca_group'] = 'oca-bracket-1'
+    contract = MagicMock(symbol='TEST', exchange='', secType='STK')
+    result = await trader.place_expressive_order(contract=contract, action='BUY', quantity=3,
+                                                 execution_spec=spec, algo_name='bracket-test')
+    assert result.is_success(), result
+    entry, take_profit, stop = placed
+    assert (take_profit.ocaGroup, take_profit.ocaType) == ('oca-bracket-1', 2)
+    assert (stop.ocaGroup, stop.ocaType) == ('oca-bracket-1', 2)
+    assert getattr(entry, 'ocaType', 0) == 0
+
+
 # ---------------------------------------------------------------------------
 # status() TTL cache — hot RPC path, polled several times/second by
 # strategy_service + risk_gate + CLI. Repeated walks of IB state starve

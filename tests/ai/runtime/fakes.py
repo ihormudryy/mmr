@@ -62,3 +62,55 @@ class EpochTrader:
         except EpochRefused as exc:
             raise RpcRefused(exc.code, exc.message) from None
         return {"epoch": grant.epoch, "lease_expires_at": grant.lease_expires_at.isoformat()}
+
+
+class FakeLeadership:
+    holder_id = "ai-fake00000000"
+
+    def __init__(self, epoch=1):
+        self.epoch, self.last_epoch, self.lost = epoch, epoch, []
+
+    def current_epoch(self):
+        return self.epoch
+
+    async def on_stale(self, code):
+        self.lost.append(code)
+        self.epoch = None
+
+
+def receipt(decision_id, state="SUBMITTED", error_code=None):
+    return {"command_id": f"aip-{decision_id}", "correlation_id": f"aip-{decision_id}", "state": state,
+            "outcome": None, "error_code": error_code, "retryable": False}
+
+
+class ScriptedTrader:
+    """submit_ai_paper_decision and get_ai_paper_decision. Each submit takes the next scripted step:
+    "accept", "accept_lose_reply", ("receipt", state, code) or an exception to raise before anything lands."""
+
+    def __init__(self):
+        self.ledger, self.sent, self.reads, self.script = {}, [], [], []
+        self.on_submit = None
+
+    async def call(self, method, body, *, epoch=None):
+        import json
+        from trader.ai.rpc_clients import RpcOutcomeUnknown
+        if method == "get_ai_paper_decision":
+            self.reads.append((body["decision_id"], epoch))
+            found = self.ledger.get(body["decision_id"])
+            return {"decision_id": body["decision_id"], "command_id": f"aip-{body['decision_id']}",
+                    "found": found is not None, "receipt": found, "decision_state": None,
+                    "decision_error_code": None, "close_root_id": None, "controller_epoch": epoch}
+        assert method == "submit_ai_paper_decision", method
+        self.sent.append((json.dumps(body, sort_keys=True), epoch))
+        if self.on_submit is not None:
+            self.on_submit(body)
+        step = self.script.pop(0) if self.script else "accept"
+        if isinstance(step, Exception):
+            raise step
+        if isinstance(step, tuple):
+            self.ledger[body["decision_id"]] = receipt(body["decision_id"], step[1], step[2])
+            return self.ledger[body["decision_id"]]
+        self.ledger.setdefault(body["decision_id"], receipt(body["decision_id"]))
+        if step == "accept_lose_reply":
+            raise RpcOutcomeUnknown("REPLY_TIMEOUT")
+        return self.ledger[body["decision_id"]]

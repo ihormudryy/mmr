@@ -897,6 +897,19 @@ class GrantAiControllerEpochRequest(BaseModel):
         return value
 
 
+class GetAiPaperDecisionRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid", strict=True)
+
+    decision_id: str
+
+    @field_validator("decision_id")
+    @classmethod
+    def _decision_id_shape(cls, value: str) -> str:
+        if not _AI_DECISION_ID.match(value):
+            raise ValueError("decision_id must match ^[A-Za-z0-9_-]{8,64}$")
+        return value
+
+
 class GetAiDeploymentRequest(BaseModel):
     model_config = ConfigDict(extra="forbid", strict=True)
 
@@ -1405,6 +1418,25 @@ def _grant_ai_controller_epoch_handler(epochs):
     return _handler
 
 
+def _get_ai_paper_decision_handler(coordinator: TradingCommandCoordinator, ai_paper):
+    from trader.automation.ai_paper_decision import command_id_for
+
+    def _handler(parsed: GetAiPaperDecisionRequest, caller: RpcCaller) -> Dict[str, Any]:
+        _require_controller_epoch(ai_paper.epochs, caller)
+        command_id = command_id_for(parsed.decision_id)
+        receipt = coordinator.get_command(command_id)
+        row = ai_paper.decision_store.row(parsed.decision_id)
+        return {
+            "decision_id": parsed.decision_id, "command_id": command_id, "found": receipt is not None,
+            "receipt": None if receipt is None else _receipt_to_dict(receipt),
+            "decision_state": None if row is None else row.state,
+            "decision_error_code": None if row is None else row.error_code,
+            "close_root_id": None if row is None else row.close_root_id,
+            "controller_epoch": None if row is None else row.controller_epoch,
+        }
+    return _handler
+
+
 def register_ai_paper_authority(registry: TypedRpcRegistry, coordinator: TradingCommandCoordinator,
                                 ai_paper, *, account_id: Optional[str]) -> None:
     """SP1 ai_paper (Plan 3 Task 9): only when ``ai_paper.enabled`` built the services."""
@@ -1429,6 +1461,10 @@ def register_ai_paper_authority(registry: TypedRpcRegistry, coordinator: Trading
     registry.register(
         "command", "grant_ai_controller_epoch", GrantAiControllerEpochRequest, dict,
         _grant_ai_controller_epoch_handler(ai_paper.epochs), with_caller=True,
+    )
+    registry.register(
+        "query", "get_ai_paper_decision", GetAiPaperDecisionRequest, dict,
+        _get_ai_paper_decision_handler(coordinator, ai_paper), with_caller=True,
     )
     registry.register("query", "get_ai_risk_policy", dict, dict, _no_arg_handler(ai_paper.actions.policy_view))
     registry.register(

@@ -95,3 +95,44 @@ def test_stale_holder_resend_is_refused_and_successor_replays(served, clock):   
 def test_epoch_from_cli_on_submit_is_an_authentication_error(served):
     assert code_of(command(served, "cli").call, "submit_ai_paper_decision", enter_body(), dict,
                    controller_epoch=1) == "AUTHENTICATION_ERROR"
+
+
+def read_decision(served, decision_id, epoch, principal="ai_supervisor"):
+    return query(served, principal).call("get_ai_paper_decision", {"decision_id": decision_id}, dict,
+                                         controller_epoch=epoch)
+
+
+def test_reconcile_read_returns_receipt_and_decision_row(served):
+    body = enter_body(armed(served))
+    epoch = grant(served)["epoch"]
+    first = submit(served, body, epoch)
+    view = read_decision(served, "dec-00000001", epoch)
+    assert view["found"] is True and view["receipt"]["state"] == first["state"] == "SUBMITTED"
+    assert view["receipt"]["command_id"] == first["command_id"]
+    assert (view["command_id"], view["decision_state"], view["controller_epoch"]) == \
+        ("aip-dec-00000001", "SUBMITTED", epoch)
+    unknown = read_decision(served, "dec-99999999", epoch)
+    assert (unknown["found"], unknown["receipt"], unknown["decision_state"]) == (False, None, None)
+
+
+def test_reconcile_read_needs_the_current_epoch(served, clock):
+    epoch = grant(served)["epoch"]
+    assert code_of(read_decision, served, "dec-00000001", None) == "CONTROLLER_EPOCH_MISSING"
+    clock.advance(61)
+    grant(served, holder="ctl-b")
+    assert code_of(read_decision, served, "dec-00000001", epoch) == "CONTROLLER_EPOCH_STALE"
+
+
+@pytest.mark.parametrize("principal", ["cli", "dashboard", "ai_research"])
+def test_reconcile_read_is_supervisor_only(served, principal):
+    with pytest.raises(TypedRpcRemoteError) as exc:
+        query(served, principal).call("get_ai_paper_decision", {"decision_id": "dec-00000001"}, dict)
+    assert exc.value.code == "PERMISSION_DENIED"
+
+
+@pytest.mark.parametrize("body", [{"decision_id": "dec:0001"}, {"decision_id": 7}, {}, {"decision_id": "d" * 8,
+                                                                                          "x": 1}])
+def test_reconcile_read_wire_is_strict(served, body):
+    with pytest.raises(TypedRpcRemoteError) as exc:
+        query(served, "ai_supervisor").call("get_ai_paper_decision", body, dict, controller_epoch=1)
+    assert exc.value.code == "VALIDATION_ERROR"

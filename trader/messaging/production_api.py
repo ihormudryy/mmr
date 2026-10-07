@@ -92,6 +92,13 @@ from typing import TYPE_CHECKING, Annotated, Any, Dict, Literal, Optional
 from ib_async import Contract
 from pydantic import BaseModel, ConfigDict, Field, Strict, field_validator
 
+from trader.automation.controller_epoch import (
+    HOLDER_ID,
+    MAX_CONTROLLER_EPOCH,
+    MAX_LEASE_SECONDS,
+    MIN_LEASE_SECONDS,
+    EpochRefused,
+)
 from trader.data.proposal_repository import ProposalRepository
 from trader.domain.commands import CommandReceipt
 from trader.domain.feed_service import CURSOR_EXPIRED, CursorExpired, DomainFeedService, domain_event_to_wire
@@ -103,7 +110,7 @@ from trader.messaging.strategy_trader_contracts import (
     ResolveInstrumentResponse,
 )
 from trader.messaging.manage_surface import register_manage_surface
-from trader.messaging.principals import TRADER_ACL, is_valid_principal_name
+from trader.messaging.principals import CONTROLLER_PRINCIPAL, TRADER_ACL, is_valid_principal_name
 from trader.messaging.trader_service_api import TraderServiceApi
 from trader.messaging.typed_rpc import (
     ServiceIdentity,
@@ -875,6 +882,21 @@ class SubmitAiPaperDecisionRequest(BaseModel):
         return value
 
 
+class GrantAiControllerEpochRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid", strict=True)
+
+    holder_id: str
+    current_epoch: Optional[Annotated[int, Field(ge=1, le=MAX_CONTROLLER_EPOCH)]]
+    lease_seconds: Annotated[int, Field(ge=MIN_LEASE_SECONDS, le=MAX_LEASE_SECONDS)]
+
+    @field_validator("holder_id")
+    @classmethod
+    def _holder_id_shape(cls, value: str) -> str:
+        if not HOLDER_ID.fullmatch(value):
+            raise ValueError("holder_id must match ^[a-z0-9][a-z0-9_.-]{0,63}$")
+        return value
+
+
 class GetAiDeploymentRequest(BaseModel):
     model_config = ConfigDict(extra="forbid", strict=True)
 
@@ -1359,6 +1381,27 @@ def _get_ai_deployment_handler(actions):
     return _handler
 
 
+def _require_controller_epoch(epochs, caller: RpcCaller) -> None:
+    """Spec 5.1: checked before the coordinator, so a refusal writes no ledger row (Plan 1 Ruling 1a)."""
+    try:
+        epochs.require_current(caller.controller_epoch)
+    except EpochRefused as ex:
+        raise _DispatchProblem(ex.code, ex.message) from None
+
+
+def _grant_ai_controller_epoch_handler(epochs):
+    def _handler(parsed: GrantAiControllerEpochRequest, caller: RpcCaller) -> Dict[str, Any]:
+        if caller.principal != CONTROLLER_PRINCIPAL:      # the allow-list already refuses; defense in depth
+            raise _DispatchProblem("PERMISSION_DENIED", "only ai_supervisor holds a controller epoch")
+        try:
+            grant = epochs.grant(holder_id=parsed.holder_id, current_epoch=parsed.current_epoch,
+                                 lease_seconds=parsed.lease_seconds)
+        except EpochRefused as ex:
+            raise _DispatchProblem(ex.code, ex.message) from None
+        return {"epoch": grant.epoch, "lease_expires_at": grant.lease_expires_at.isoformat()}
+    return _handler
+
+
 def register_ai_paper_authority(registry: TypedRpcRegistry, coordinator: TradingCommandCoordinator,
                                 ai_paper, *, account_id: Optional[str]) -> None:
     """SP1 ai_paper (Plan 3 Task 9): only when ``ai_paper.enabled`` built the services."""
@@ -1379,6 +1422,10 @@ def register_ai_paper_authority(registry: TypedRpcRegistry, coordinator: Trading
     registry.register(
         "command", "submit_ai_paper_decision", SubmitAiPaperDecisionRequest, dict,
         _submit_ai_paper_decision_rpc_handler(coordinator, account_id), with_caller=True,
+    )
+    registry.register(
+        "command", "grant_ai_controller_epoch", GrantAiControllerEpochRequest, dict,
+        _grant_ai_controller_epoch_handler(ai_paper.epochs), with_caller=True,
     )
     registry.register("query", "get_ai_risk_policy", dict, dict, _no_arg_handler(ai_paper.actions.policy_view))
     registry.register(

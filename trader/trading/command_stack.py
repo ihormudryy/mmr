@@ -502,6 +502,7 @@ class AiPaperServices:
     decision_store: Any    # AiPaperDecisionStore (Plan 5 reads links_for_order_ref)
     actions: Any           # AiPaperActions: publish, register and the two reads
     entry_filter: Any
+    epochs: Any            # ControllerEpochs (SP2 Plan 1)
 
 
 @dataclass(frozen=True)
@@ -580,6 +581,7 @@ def _build_ai_paper_services(
     from trader.automation.ai_paper_decision import AiPaperDecisionService, AiPaperDecisionStore
     from trader.automation.ai_paper_evidence import AI_ENTRY_POLICY, AiPaperEvidence
     from trader.automation.ai_paper_experiment import NoExperiment
+    from trader.automation.controller_epoch import ControllerEpochs
 
     deployments = AiDeploymentStore(trader.journal_db, now=now)
     decision_store = AiPaperDecisionStore(journal)
@@ -589,6 +591,7 @@ def _build_ai_paper_services(
         max_drift_bps=policy.max_drift_bps, entry_offset_bps=AI_ENTRY_POLICY.limit_offset_bps,
         entry_filter=parts.entry_filter,
     )
+    epochs = ControllerEpochs(journal=journal, now=now)
     decisions = AiPaperDecisionService(
         ledger=ledger, journal=journal, controls=controls, policy=parts.policy, deployments=deployments,
         evidence=evidence, saga=saga, experiments=experiments if experiments is not None else NoExperiment(),
@@ -602,7 +605,7 @@ def _build_ai_paper_services(
     )
     return AiPaperServices(config=parts.config, policy=parts.policy, deployments=deployments,
                            decisions=decisions, decision_store=decision_store, actions=actions,
-                           entry_filter=parts.entry_filter)
+                           entry_filter=parts.entry_filter, epochs=epochs)
 
 
 _REQUIRED_TRADER_PORTS = (
@@ -1022,6 +1025,9 @@ def build_command_stack(
     apply_ai_risk_policy_migration(migrator)          # 54
     apply_ai_deployment_migration(migrator)           # 55
     apply_ai_paper_decision_migration(migrator)       # 56
+    from trader.automation.controller_epoch import apply_controller_epoch_migration
+
+    apply_controller_epoch_migration(migrator)        # 90 (SP2 Plan 1)
     from trader.automation.experiments import apply_experiment_migration
 
     apply_experiment_migration(migrator)              # 70 (SP1 Plan 4)

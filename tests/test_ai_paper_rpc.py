@@ -82,7 +82,7 @@ class FakeOrphanEvidence:
         return BrokerEnumeration(generation_id=5, started_at=NOW)
 
 
-def _served(tmp_path, monkeypatch, config):
+def _served(tmp_path, monkeypatch, config, now=lambda: NOW):
     import trader.trading.command_stack as command_stack
     import trader.trading.trading_runtime as trading_runtime
 
@@ -99,7 +99,7 @@ def _served(tmp_path, monkeypatch, config):
     trader.ai_paper_config = config
     trader.data = make_history(str(tmp_path / "history.duckdb"))
     stack = command_stack.build_command_stack(trader, CommandAuthorityPolicy(enabled=True, max_drift_bps=50.0),
-                                              now=lambda: NOW)
+                                              now=now)
     ids = make_identities()
     registry = build_production_registry(trader, ids["trader"], command_stack=stack)
     from trader.automation.experiment_service import attach_production_identity

@@ -119,6 +119,7 @@ def acceptance_preflight(trader: Any, command_stack: Any) -> Dict[str, Any]:
         "exit_owner": None if owner is None else str(getattr(owner, "root_id", owner)),
         "breaker_tripped": breaker != "CLEAR",
         "experiment_state": None if record is None else record.state,
+        "acceptance_probe": getattr(getattr(trader, "ai_paper_config", None), "acceptance_probe", False) is True,
     }
 
 

@@ -61,6 +61,7 @@ def test_query_on_a_clean_served_stack(served):
     assert (reading["account_id"], reading["account_mode"], reading["base_currency"]) == ("DU111111", "paper", "USD")
     assert reading["positions"] == [] and reading["working_orders"] == [] and reading["unresolved_commands"] == []
     assert reading["breaker_tripped"] is False and reading["experiment_state"] == "ARMED"
+    assert reading["acceptance_probe"] is True                    # the served fixture turns it on
     assert evaluate_preflight(reading, reading, now=served.now()).passed
 
 

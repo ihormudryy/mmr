@@ -277,3 +277,10 @@ def test_acceptance_package_never_imports_a_store():
         names = {a.name for n in ast.walk(tree) if isinstance(n, ast.Import) for a in n.names} | \
                 {n.module or "" for n in ast.walk(tree) if isinstance(n, ast.ImportFrom)}
         assert not [m for m in names if m.startswith(banned)], path
+
+
+def test_a_run_refuses_before_any_write_when_the_probe_is_off(fake_port, settings, journal):
+    real = fake_port._get_acceptance_preflight
+    fake_port._get_acceptance_preflight = lambda body: {**real(body), "acceptance_probe": False}
+    results = AcceptanceScenario(fake_port, settings, journal).run()
+    assert (results[-1].name, results[-1].code) == ("preflight", "PROBE_NOT_ENABLED") and not fake_port.writes()

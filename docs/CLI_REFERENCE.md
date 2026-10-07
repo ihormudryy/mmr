@@ -43,6 +43,7 @@ buy AMD --market --amount 100.0            # offline-simulation legacy only in s
 sell AMD --market --quantity 10            # prefer: propose → approve
 cancel 123
 cancel-all                   # Cancel all orders
+flatten --reason "abort" --wait              # PAPER: typed liquidate_account; FLAT only on broker evidence (asks "Type FLATTEN" unless --yes)
 close 1                      # Close position by row number
 strategies                   # List strategies
 strategies enable my_strat   # Enable a strategy
@@ -197,6 +198,12 @@ experiment stop --reason "done"              # operator; once the account is fla
 scoreboard                                   # PAPER scoreboard of the latest experiment ('-' = unknown)
 --json scoreboard --experiment exp-<20 hex>  # the report as JSON: {"data": ..., "title": "Scoreboard (paper)"}
 scoreboard verify                            # rebuild every number from stored inputs; exit 1 on any mismatch
+experiment acceptance preflight              # SP1 clean-account gate: PASS, or STOP + reasons (exit 1)
+experiment acceptance run                    # dry run: reads the gate, prints the planned calls, sends nothing
+experiment acceptance run --place-orders --confirm-account DU123 --signing-key KEY   # the owner's paper session only
+experiment acceptance finish --run-id acc-... --signing-key KEY   # after 15:55 ET: end checks + signed report
+experiment acceptance status --run-id acc-...  # the local run journal only
+experiment acceptance verify-report REPORT --public-key PUB   # signature + fields; exit 1 if bad or ephemeral
 ```
 
 ## Command Service Requirements
@@ -218,6 +225,8 @@ scoreboard verify                            # rebuild every number from stored 
 - `listen` (publish_instrument + PubSub)
 - `forex snapshot`, `forex quote` (default IB source; IDEALPRO CASH contract)
 - `experiment status|start|pause|resume|stop` (SP1 experiments; paper only)
+- `experiment acceptance preflight|run|finish` (SP1 acceptance, host only; `run` and `finish` sign with the `ai_supervisor`/`ai_research` keys, plus `cli` with `--place-orders`); `experiment acceptance status|verify-report` are local
+- `flatten --reason TEXT [--wait] [--yes]` (paper only; typed `liquidate_account`, prints `FLAT` only on broker evidence)
 - `scoreboard`, `scoreboard verify` (SP1 scoreboard; reads the journal, not IB, so no IB-upstream check)
 
 **Requires strategy typed RPC (42104/42105)**:

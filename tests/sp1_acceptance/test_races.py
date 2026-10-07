@@ -151,7 +151,7 @@ def served_with_kill(tmp_path, loop_thread, monkeypatch):
     """The same stack with a 20 % kill line and Telegram on through a fake transport."""
     from tests.scoreboard.telegram_fakes import FakePost, token_file
     telegram = {"enabled": True, "chat_id": 5, "token_secret_file": str(token_file(tmp_path))}
-    stack = served_stack(tmp_path, loop_thread, monkeypatch, kill_pct=20.0, telegram=telegram)
+    stack = served_stack(tmp_path, loop_thread, monkeypatch, kill_pct=20.0, telegram=telegram, acceptance_probe=True)
     stack.stack.scoreboard.sender._post = FakePost()
     yield stack
     stack.close()

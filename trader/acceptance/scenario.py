@@ -367,6 +367,8 @@ class AcceptanceScenario:
             raise StepFailure(verdict.failures[0], evidence)
         if self.settings.account_id and second.get("account_id") != self.settings.account_id:
             raise StepFailure("ACCOUNT_MISMATCH", evidence)          # a dry run names no account
+        if getattr(self.port, "has_operator", True) and second.get("acceptance_probe") is False:
+            raise StepFailure("PROBE_NOT_ENABLED", evidence)        # the S proof would be refused after S entered
         view = self.port.supervisor("get_experiment", {})
         experiment = view.get("experiment") or {}
         if experiment.get("state") != "ARMED":

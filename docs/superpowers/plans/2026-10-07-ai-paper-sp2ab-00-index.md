@@ -66,6 +66,17 @@ Typed RPC methods (allow-list in `trader/messaging/principals.py`; read and muta
 - Per task: targeted pytest only. Full suite once, in each plan's last task:
   `.venv/bin/python -m pytest tests/ -q --timeout=60 --ignore=tests/test_ibrx_async.py`.
 
+## Owner change after the plans were written (2026-10-07, #74)
+
+- Executable quote evidence comes from the trader's quote authority, not from IB
+  alone. On a **paper** account with `automation.quote_fallback: alpaca_iex`, a quote
+  may carry feed `iex_realtime` (Alpaca IEX) when IB has no live feed; the dispatch
+  guard, `validate_approval` and `LiquidityPolicy` accept `{live, iex_realtime}` there
+  and only `{live}` everywhere else. Where Plan 3 (Ruling 4, the price part of the
+  scope rule: "fresh IB bid") and Plan 6 (fresh evidence via the IB `get_snapshot`)
+  name IB quotes, use the same quote authority and accepted-feed set instead, and
+  record the feed label in the evidence.
+
 ## Rulings (spec section 14 open questions and gaps; the owner may change them)
 
 - **Model ids:** no defaults in code. `config_defaults/ai.yaml` names example ids in

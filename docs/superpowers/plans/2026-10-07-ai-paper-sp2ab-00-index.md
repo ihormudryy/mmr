@@ -1,0 +1,95 @@
+# AI Paper Bot SP2a + SP2b: Plan Index
+
+**Spec:** `docs/superpowers/specs/2026-10-07-ai-paper-sp2ab-autonomous-loop-design.md`
+(approved by the owner and by both reviewers, PR #69). Ticket #36.
+
+**Base:** master after SP1 Plans 3–6 (#55–#58) are merged. Until then, read the code
+at `/private/tmp/sp1-impl6` (master + Plans 3–6).
+
+## Plans and order
+
+| # | Plan | Spec | Depends on |
+|---|------|------|------------|
+| 1 | Trader: controller epoch, signal record, operator initial policy | 5.1, 6.1, 6.2, 6.2b, 6.7 | SP1 |
+| 2 | Trader: cost and simulation ingestion, separate baseline books, simulator | 6.3, 6.8, 7 | SP1 |
+| 3 | Trader: discretionary scope rule, discovery read, model-driven closes | 6.4, 6.5, 6.6, 10 | SP1 |
+| 4 | `ai` foundations: config, model client + adapters, store, journal, budget, gateway, replay primitives | 4, 5.4, 8, 11 | — |
+| 5 | `ai` controller runtime: RPC clients, leadership, schedule, submitter, outbox, signal intake, service, container | 4, 5.1–5.3, 9 | 1, 2, 4 |
+| 6 | `ai` decisions: discovery client, orchestrator + Jev, parsers, baselines, flows, acceptance | 5.5, 7, 8, 12 | 3, 5 |
+
+Plans 1–4 can be implemented in parallel. Each plan is one PR.
+
+## Shared interfaces (all plans use these exact names)
+
+Typed RPC methods (allow-list in `trader/messaging/principals.py`; read and mutation rights separate):
+
+| Method | Kind | Principals | Plan |
+|---|---|---|---|
+| `grant_ai_controller_epoch` | command | `ai_supervisor` | 1 |
+| `read_ai_signals` | query | `ai_supervisor` | 1 |
+| `publish_ai_risk_policy` | command | `cli` added (operator initial policy); `ai_supervisor` keeps it for SP2d, but SP2a/b code never calls it | 1 |
+| `record_ai_cost` | command | `ai_supervisor` | 2 |
+| `record_simulated_decision` | command | `ai_supervisor` | 2 |
+| `register_discretionary_deployment` | command | `cli` | 3 |
+| `discover_ai_candidates` | query | `ai_supervisor` | 3 |
+| `submit_ai_paper_decision` | command | `ai_supervisor` (existing; Plan 1 adds the epoch check, Plan 3 the scope rule) | 1, 3 |
+
+- `TypedRpcRequest.controller_epoch: Optional[int] = None`. It is always a key in
+  `rpc_signing_bytes` (`null` when absent). `submit_ai_paper_decision` refuses a missing
+  epoch (`CONTROLLER_EPOCH_MISSING`) or a not-current one (`CONTROLLER_EPOCH_STALE`),
+  checked in the same transaction as the command claim. Reconcile reads used by the
+  controller also require it.
+- Epoch grant: `{holder_id: str, current_epoch: Optional[int], lease_seconds: int}` →
+  `{epoch: int, lease_expires_at: iso}`. Same holder + current epoch + live lease → renew
+  (same epoch). No live lease → new epoch = previous + 1. Another holder's live lease →
+  refused `CONTROLLER_EPOCH_HELD`. Default lease 60 s, renew every 20 s.
+- Signal read: `{after_cursor: int, limit: int (1..500)}` →
+  `{signals: [{cursor, source_event_id, strategy_name, conid, action: "BUY"|"SELL", probability, signal_time, recorded_at}], next_cursor, oldest_retained_cursor, gap: bool}`.
+  `gap` is true when signals after `after_cursor` were already removed by retention.
+- Baseline ids (versioned): `follow_signal.v1`, `fixed_rule.v1`, `no_trade.v1`,
+  `matched_entry_bracket_exit.v1`. Cohorts: `strategy_signal`, `self_found`, `model_close`.
+- Refusal code for the scope rule: `OUT_OF_DISCRETIONARY_SCOPE`, with `detail.part` one of
+  `exchange`, `instrument_type`, `price`, `dollar_volume`, `liquidity`, `trading_filter`,
+  `evidence_stale`.
+- The `ai` package lives in `trader/ai/`; the service entry point is `trader/ai_service.py`;
+  its database is `ai.duckdb` on the named volume `mmr_ai_data`.
+
+## Migrations and tests
+
+- **No legacy data (owner, 2026-10-07):** the trader journal and `ai.duckdb` start from
+  scratch. No ALTER, backfill or old-row compatibility steps. A change to an SP1 table
+  edits that table's CREATE statement in place; a new table is one plain CREATE in the
+  module's existing migration style. Price history in `mmr_db_data` is not touched.
+- Trader journal migration numbers (version slots for new tables only): Plan 1 holds 90–94, Plan 2 95–99, Plan 3 100–104
+  (SP1 uses 35–38, 54–56, 60–64, 70, 80–81). `ai.duckdb` has its own sequence starting at 1
+  (Plan 4 holds 1–9, Plan 5 10–19, Plan 6 20–29).
+- Per task: targeted pytest only. Full suite once, in each plan's last task:
+  `.venv/bin/python -m pytest tests/ -q --timeout=60 --ignore=tests/test_ibrx_async.py`.
+
+## Rulings (spec section 14 open questions and gaps; the owner may change them)
+
+- **Model ids:** no defaults in code. `config_defaults/ai.yaml` names example ids in
+  comments only; a missing id fails loudly at startup. Credentials reach only the `ai`
+  container, by env: `OPENROUTER_API_KEY`; Bedrock through the standard AWS chain
+  (`AWS_REGION`, `AWS_ACCESS_KEY_ID`/`AWS_SECRET_ACCESS_KEY` or a profile);
+  `AZURE_OPENAI_ENDPOINT` + `AZURE_OPENAI_API_KEY` + `AZURE_OPENAI_API_VERSION`.
+- **Token and rate defaults:** `max_output_tokens: 4000`, `max_input_tokens: 60000` per
+  call, `calls_per_hour: 120`, `max_in_flight: 2`, `decision_deadline_seconds: 60`.
+- **Prices:** per-model USD per million input/output tokens in `ai.yaml`. A model with no
+  price is refused (no reservation). Worst case = `max_input_tokens` × input price +
+  `max_output_tokens` × output price.
+- **Bedrock:** add `boto3` as a dependency (Converse API). OpenRouter and Azure use `httpx`.
+- **Who simulates baselines:** the `ai` service sends the hypothetical decision (conid,
+  side, quantity, reference price, stop, target, decided_at). The **trader** computes the
+  simulated outcome at session end from 1-minute bars it can read (local DuckDB, else its
+  Alpaca history provider). Missing bars → the record and its book are `incomplete`. Models
+  never author fills or P&L.
+- **Fixed rule (`fixed_rule.v1`):** per entry cycle, among the candidates that passed the
+  scope rule, the one with the highest `change_pct` (ties: higher dollar volume, then
+  symbol). Stop = reference × 0.98, target = reference × 1.04, quantity from the same SP1
+  risk sizing a real ENTER would get. Values live in `ai.yaml`; changing them bumps the version.
+- **Matched-entry, bracket-only exit:** the same entry the model closed, held with only its
+  original stop and target until the session flatten (15:45 ET on a normal day).
+- **No-trade:** zero P&L, one record per self-found opportunity, always complete.
+- **Follow the signal:** the strategy's BUY taken at the reference price with the
+  deployment's stop/target policy and SP1 sizing, regardless of Jev's ruling.

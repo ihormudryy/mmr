@@ -51,8 +51,9 @@ Typed RPC methods (allow-list in `trader/messaging/principals.py`; read and muta
 - Baseline ids (versioned): `follow_signal.v1`, `fixed_rule.v1`, `no_trade.v1`,
   `matched_entry_bracket_exit.v1`. Cohorts: `strategy_signal`, `self_found`, `model_close`.
 - `record_simulated_decision` extra fields (Plan 2 Cross-plan additions): `deployment_digest`,
-  `linked_round_trip_id` (matched-entry only), `incomplete_reason` (one of `quote_unavailable`,
-  `feed_not_accepted`, `budget_refused`, `model_failed`, `sizing_unavailable`). `follow_signal.v1` and
+  `linked_round_trip_id` (matched-entry only; the trader derives the trip and refuses a different one),
+  `incomplete_reason` (one of `quote_unavailable`, `feed_not_accepted`, `quote_not_executable`,
+  `ranking_unavailable`, `budget_refused`, `model_failed`, `sizing_unavailable`). `follow_signal.v1` and
   `fixed_rule.v1` are sent with `quantity: null`; the trader sizes them.
 - Model budget cap: `get_ai_model_budget` → `{model_budget_usd_per_day: float, source: "trader.yaml"}`
   (Plan 2). Plan 5 reads it at start and every 60 s and calls Plan 4's `Budget.set_cap`; `ai.yaml`
@@ -126,8 +127,12 @@ Typed RPC methods (allow-list in `trader/messaging/principals.py`; read and muta
 - **Matched-entry, bracket-only exit:** the same entry the model closed, held with only its
   original stop and target until the session flatten (15:45 ET on a normal day). One record
   per model CLOSE / PARTIAL_CLOSE: opportunity = the close's decision id, the round trip id
-  as linkage, reference = the entry fill, quantity = the shares that close asked to remove
-  (the trader clips it so a trip's records never add up to more than its entry quantity).
-- **No-trade:** zero P&L, one record per self-found opportunity, always complete.
+  as linkage (derived and checked by the trader), reference = the entry fill, quantity = the
+  shares that close asked to remove; the trader simulates only the shares the close is
+  broker-proven to have removed, clipped per trip to the proven entry fill, and marks an
+  unproven fill `incomplete` (`close_fill_unproven`).
+- **No-trade:** zero P&L, one record per entry cycle whose discovery read succeeded (also with
+  zero eligible candidates), always complete. A cycle with eligible candidates of which none has
+  a `change_pct` sends an incomplete `fixed_rule.v1` (`ranking_unavailable`).
 - **Follow the signal:** the strategy's BUY taken at the reference price with the
   deployment's stop/target policy and SP1 sizing (by the trader), regardless of Jev's ruling.

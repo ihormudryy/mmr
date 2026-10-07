@@ -38,7 +38,7 @@
 8. **Menus, not free fields.** Candidates are shown as `C1..Cn` and positions as `P1..Pn`. A pick of an unknown ref, a repeated ref, more picks than `max_entries_per_cycle` (default 2), a CLOSE with a quantity, a PARTIAL_CLOSE without `1 ≤ q < whole shares held`, or any extra field (for example `stop_price`, `conid`, `quantity` on an entry pick) refuses the **whole** output. PARTIAL_CLOSE has no stop or target field (Plan 3 Ruling 14).
 9. **Jev rules.** `{"verdict": "TAKE"|"SKIP"|"REDUCE", "quantity": int|null, "reason": str}`. TAKE and SKIP carry `quantity: null`. REDUCE needs an integer `1 ≤ q < ceiling`. A missing, equal, larger or non-integer REDUCE quantity is a refusal (`JEV_REDUCE_QUANTITY_MISSING`, `JEV_REDUCE_NOT_SMALLER`, `JEV_REDUCE_QUANTITY_INVALID`), never a TAKE. Every ENTER the engine proposes has `decider = "jev"` and exists only after a parsed TAKE or REDUCE.
 10. **Role health (spec 9).** Plan 4 refuses to start on a missing model id, so the per-role rule of spec 9 applies at call time. A `CallRefused` with `ROLE_UNKNOWN`, `PRICE_UNAVAILABLE` or `OUTPUT_LIMIT_ABOVE_ROLE`, or a `CallFailed` with outcome `REJECTED` (provider 4xx, for example an unknown model id), marks the role down for `role_recheck_seconds` (default 300); a success marks it up. Jev down: every ENTER is refused `JEV_UNHEALTHY` after its evidence is read (baselines are still written) and entry cycles do not call the orchestrator (no ENTER could pass its judge). Orchestrator down: entry cycles skip discovery and position cycles skip (`ORCHESTRATOR_UNHEALTHY`); signal judgments and exit signals are unaffected. This is deliberate, not a spec 7 gap: spec 9 says a bad orchestrator configuration means no discovery, so such a cycle has no candidates and no opportunity to compare, and no fixed-rule or no-trade record is owed. Health lives in memory; a restart re-learns it with one call. *Cost if wrong:* a Bedrock throttle (`REJECTED` in Plan 4) pauses that role for 5 minutes.
-11. **Baselines** (index rulings; Plan 2 Rulings 18, 19, 21; one record per opportunity). `follow_signal.v1`: every strategy BUY of a configured strategy, whatever Jev, the budget or the model did; opportunity = the signal's `source_event_id`; linked (`linked_action_key`) only when an ENTER is proposed. `fixed_rule.v1` and `no_trade.v1`: one each per entry cycle that had at least one eligible candidate (opportunity = cycle id), recorded before the orchestrator is asked. Fixed rule = highest `change_pct` among eligible candidates, ties by higher `median_dollar_volume_20d`, then symbol; candidates without `change_pct` are not ranked; its reference is the ask of a fresh `get_ai_entry_quote` read in the cycle. Both sized baselines are sent with `quantity: null` and the `deployment_digest` a real ENTER would name (the strategy's, or `decisions.discretionary_deployment_digest`); the trader sizes them (Plan 2 Ruling 19). `matched_entry_bracket_exit.v1`: one record **per model CLOSE / PARTIAL_CLOSE**: opportunity = the close's own decision id (`derive_decision_id(cycle_id, close action_key)`, stable per close), `linked_round_trip_id` = the trip, entry time = trip `opened_at`, reference = trip `entry_avg_price` (the entry fill), quantity = the shares **that close asked to remove** (a `PARTIAL_CLOSE`'s quantity; for a `CLOSE` the menu's `whole_shares` open at that cycle), stop/target = the ENTER body in `ai_submissions`, `linked_decision_id` = the trip's ENTER decision. Requested, not filled: the record is committed with the close before any fill exists and is never edited (Plan 2 Ruling 21). Two partial closes of one trip are two records whose quantities add up to the shares the model closed, at most the entry quantity; the trader clips a record that would pass the entry quantity (a close refused and asked again) and refuses one with nothing left (`MATCHED_ENTRY_ALREADY_COVERED`). **Missing evidence is sent, not dropped (spec 7):** when the quote read fails the follow-signal or fixed-rule baseline is sent with `incomplete_reason` and no side, quantity or price: `QUOTE_FEED_NOT_ACCEPTED` → `feed_not_accepted`; every other quote failure (`QUOTE_UNAVAILABLE`, `QUOTE_STALE`, `QUOTE_INVALID`, `QUOTE_NOT_CONTINUOUS`, an unreachable trader on the quote read, and `BRACKET_INVALID`, a quote too small for a cent bracket) → `quote_unavailable`. Because evidence is read before the model (Ruling 13) and the sized baselines need no model output, a budget refusal (including `BUDGET_CAP_UNKNOWN`), a model failure or an unhealthy Jev leaves the follow-signal baseline **complete**; so Plan 6 never sends `budget_refused` or `model_failed` (they stay in Plan 2's list for a flow that reads after a model step) and never sends `sizing_unavailable` (the trader writes it). Not an incomplete record, because no counterfactual exists: a strategy missing from `decisions.strategies` (no bracket, `STRATEGY_NOT_CONFIGURED`), a cycle with no eligible candidate, and a model close whose trip has no ENTER decision, entry price or entry body of this experiment (`MATCHED_ENTRY_UNKNOWN`); each is noted. No model close → no matched-entry record.
+11. **Baselines** (index rulings; Plan 2 Rulings 18, 19, 21; one record per opportunity). `follow_signal.v1`: every strategy BUY of a configured strategy, whatever Jev, the budget or the model did; opportunity = the signal's `source_event_id`; linked (`linked_action_key`) only when an ENTER is proposed. `no_trade.v1`: one per entry cycle whose discovery read succeeded, also with zero eligible candidates (opportunity = cycle id); `fixed_rule.v1`: one per entry cycle with at least one eligible candidate; both recorded before the orchestrator is asked. Fixed rule = highest `change_pct` among eligible candidates, ties by higher `median_dollar_volume_20d`, then symbol; candidates without `change_pct` are not ranked; eligible candidates of which none has a `change_pct` give an incomplete `fixed_rule.v1` with `incomplete_reason = "ranking_unavailable"` and no conid (never nothing); its reference is the ask of a fresh `get_ai_entry_quote` read in the cycle. Both sized baselines are sent with `quantity: null` and the `deployment_digest` a real ENTER would name (the strategy's, or `decisions.discretionary_deployment_digest`); the trader sizes them (Plan 2 Ruling 19). `matched_entry_bracket_exit.v1`: one record **per model CLOSE / PARTIAL_CLOSE**: opportunity = the close's own decision id (`derive_decision_id(cycle_id, close action_key)`, stable per close), `linked_round_trip_id` = the trip, entry time = trip `opened_at`, reference = trip `entry_avg_price` (the entry fill), quantity = the shares **that close asked to remove** (a `PARTIAL_CLOSE`'s quantity; for a `CLOSE` the menu's `whole_shares` open at that cycle), stop/target = the ENTER body in `ai_submissions`, `linked_decision_id` = the trip's ENTER decision. Requested, not filled: the record is committed with the close before any fill exists and is never edited (Plan 2 Ruling 21). Two partial closes of one trip are two records. The `ai` side's quantity is only the request: the trader derives the trip from the ENTER and the close itself (a different `linked_round_trip_id` is refused `MATCHED_ENTRY_TRIP_MISMATCH`) and at session end simulates `min(requested, shares the close is broker-proven to have removed)`, clipped per trip to the proven entry fill; an unproven close fill is `INCOMPLETE` (`close_fill_unproven`) (Plan 2 Ruling 21). **Missing evidence is sent, not dropped (spec 7):** when the quote read fails the follow-signal or fixed-rule baseline is sent with `incomplete_reason` and no side, quantity or price: `QUOTE_FEED_NOT_ACCEPTED` → `feed_not_accepted`; a quote that exists but cannot be traded on (`QUOTE_STALE`, `QUOTE_INVALID`, `QUOTE_NOT_CONTINUOUS`, and `BRACKET_INVALID`, a quote too small for a cent bracket) → `quote_not_executable`; no quote (`QUOTE_UNAVAILABLE`, an unreachable trader on the quote read) → `quote_unavailable`. Because evidence is read before the model (Ruling 13) and the sized baselines need no model output, a budget refusal (including `BUDGET_CAP_UNKNOWN`), a model failure or an unhealthy Jev leaves the follow-signal baseline **complete**; so Plan 6 never sends `budget_refused` or `model_failed` (they stay in Plan 2's list for a flow that reads after a model step) and never sends `sizing_unavailable` (the trader writes it). Not an incomplete record, because no counterfactual exists: a strategy missing from `decisions.strategies` (no bracket, `STRATEGY_NOT_CONFIGURED`), a fixed rule in a cycle with no eligible candidate (the cycle still has its `no_trade.v1`), and a model close whose trip has no ENTER decision, entry price or entry body of this experiment (`MATCHED_ENTRY_UNKNOWN`); each is noted. No model close → no matched-entry record.
 12. **Exit signals.** No model. The engine reads `get_experiment_trips`; a SELL for a conid the experiment holds is a `CLOSE` (`decider = "strategy"`). If the trips read fails the CLOSE is still proposed (the trader proves ownership, Plan 3 Ruling 15); a conid not held is `NOT_HELD`.
 13. **Evidence before the model call (spec 5.5 order).** Spec 5.5 lists "budget → fresh evidence → Jev". The engine reads evidence first, because the follow-signal baseline needs a reference price even when the budget refuses (spec 7), and the reads are trader RPCs, not model calls. The budget is still checked before the Jev call (by the gateway). *Cost if wrong:* a few reads for signals the budget then refuses.
 14. **One deadline per opportunity or cycle.** Plan 5's `ModelWork.deadline` covers the orchestrator and every Jev call of that cycle (`for_action` shares it). Jev calls run one after another.
@@ -1276,9 +1276,9 @@ def test_follow_signal_takes_the_quote_and_leaves_the_size_to_the_trader():
 
 
 @pytest.mark.parametrize("code,reason", [
-    ("QUOTE_FEED_NOT_ACCEPTED", "feed_not_accepted"), ("QUOTE_STALE", "quote_unavailable"),
-    ("QUOTE_UNAVAILABLE", "quote_unavailable"), ("QUOTE_INVALID", "quote_unavailable"),
-    ("QUOTE_NOT_CONTINUOUS", "quote_unavailable"), ("BRACKET_INVALID", "quote_unavailable"),
+    ("QUOTE_FEED_NOT_ACCEPTED", "feed_not_accepted"), ("QUOTE_STALE", "quote_not_executable"),
+    ("QUOTE_UNAVAILABLE", "quote_unavailable"), ("QUOTE_INVALID", "quote_not_executable"),
+    ("QUOTE_NOT_CONTINUOUS", "quote_not_executable"), ("BRACKET_INVALID", "quote_not_executable"),
     ("TRADER_UNREACHABLE", "quote_unavailable")])
 def test_a_missing_quote_is_an_incomplete_record_with_no_invented_value(code, reason):
     b = incomplete("follow_signal.v1", "strategy_signal", SIGNAL.opportunity_id, NOW, conid=AAPL,
@@ -1308,7 +1308,14 @@ def test_matched_entry_records_the_entry_price_for_the_closed_shares():
     assert b.linked_round_trip_id == "rt-1"
 
 
-def test_two_partial_closes_of_one_trip_are_two_records_that_sum_to_the_entry():   # PR #75
+def test_an_unrankable_fixed_rule_is_incomplete_without_a_conid():           # second PR #75 review
+    b = incomplete("fixed_rule.v1", "self_found", "cyc-entry-20260717-1100", NOW, conid=None,
+                   reason="ranking_unavailable", deployment_digest=STRATEGY_DIGEST)
+    assert (b.incomplete_reason, b.conid, b.reference_price, b.quantity) == ("ranking_unavailable", None, None, None)
+    assert pick_fixed_rule((candidate("C1", "X", None, 1e9), candidate("C2", "Y", None, 2e9))) is None
+
+
+def test_two_partial_closes_of_one_trip_are_two_records_with_their_requests():   # PR #75
     position = OwnedPosition("rt-1", AAPL, "AAPL", 10.0, NOW, DEC, 230.05, 10.0)
     body = {"stop_price": 225.4, "target_price": 239.2}
     first = matched_entry(position, body, close_decision_id=CLOSE_1, closed_quantity=4)          # PARTIAL_CLOSE 4
@@ -1316,7 +1323,7 @@ def test_two_partial_closes_of_one_trip_are_two_records_that_sum_to_the_entry():
                            closed_quantity=6)                                                     # CLOSE the rest
     assert (first.opportunity_id, second.opportunity_id) == (CLOSE_1, CLOSE_2)
     assert {first.linked_round_trip_id, second.linked_round_trip_id} == {"rt-1"}
-    assert first.quantity + second.quantity == position.entry_quantity == 10                     # counted once
+    assert (first.quantity, second.quantity) == (4, 6)          # requests; the trader proves the real shares
 
 
 def test_a_close_of_less_than_one_share_has_no_record():
@@ -1358,6 +1365,8 @@ from trader.ai.engine import OwnedPosition, SignalOpportunity, SimulatedBaseline
 from trader.ai.evidence import PricedEntry
 
 FEED_NOT_ACCEPTED, QUOTE_UNAVAILABLE = "feed_not_accepted", "quote_unavailable"
+QUOTE_NOT_EXECUTABLE, RANKING_UNAVAILABLE = "quote_not_executable", "ranking_unavailable"
+NOT_EXECUTABLE_CODES = frozenset({"QUOTE_STALE", "QUOTE_INVALID", "QUOTE_NOT_CONTINUOUS", "BRACKET_INVALID"})
 
 
 def _sized_by_trader(baseline_id: str, cohort: str, opportunity_id: str, priced: PricedEntry,
@@ -1391,10 +1400,12 @@ def fixed_rule(cycle_id: str, priced: PricedEntry, deployment_digest: str) -> Si
 
 def incomplete_reason_for(code: str) -> str:
     """Ruling 11: which Plan 2 reason a failed quote read gives."""
-    return FEED_NOT_ACCEPTED if code == "QUOTE_FEED_NOT_ACCEPTED" else QUOTE_UNAVAILABLE
+    if code == "QUOTE_FEED_NOT_ACCEPTED":
+        return FEED_NOT_ACCEPTED
+    return QUOTE_NOT_EXECUTABLE if code in NOT_EXECUTABLE_CODES else QUOTE_UNAVAILABLE
 
 
-def incomplete(baseline_id: str, cohort: str, opportunity_id: str, decided_at: dt.datetime, *, conid: int,
+def incomplete(baseline_id: str, cohort: str, opportunity_id: str, decided_at: dt.datetime, *, conid: Optional[int],
                reason: str, deployment_digest: Optional[str] = None) -> SimulatedBaseline:
     """A baseline whose evidence is missing: sent so the book shows the hole, with no side, size or price."""
     return SimulatedBaseline(baseline_id, cohort, opportunity_id, decided_at, conid=conid,
@@ -1595,12 +1606,12 @@ async def test_an_entry_cycle_judges_each_pick_and_records_its_baselines_first(r
     assert "untrusted" in rig.jev.requests[0].content.decode()          # the orchestrator thesis is fenced for Jev
 ```
 
-**Also write:** `test_an_exit_signal_closes_a_held_conid_without_any_model` (no provider request; `decider == "strategy"`), `test_an_exit_signal_for_a_conid_not_held_is_noted` (`NOT_HELD`), `test_an_exit_signal_still_closes_when_trips_cannot_be_read`, `test_orchestrator_down_skips_discovery_but_signals_continue` (orchestrator 404 once → next entry cycle `ORCHESTRATOR_UNHEALTHY` with no `discover_ai_candidates` call; an entry signal still gets its Jev call), `test_role_health_recovers_after_the_recheck_window`, `test_an_unconfigured_strategy_is_noted_without_reads`, `test_a_failed_discovery_writes_no_cycle_baselines`, `test_a_partial_close_carries_its_quantity_and_a_matched_baseline` (the ENTER body is inserted into `ai_submissions` first; the baseline's `opportunity_id == derive_decision_id(cycle_id, f"partial_close:{AAPL}")` and `linked_round_trip_id == "rt-1"`), `test_two_partial_closes_in_two_cycles_give_two_matched_records` (entry 10 shares; slot 1 `PARTIAL_CLOSE` 4 of P1, then the position shows 6 open and slot 2 `CLOSE`s P1: two baselines with different `opportunity_id`, the same `linked_decision_id` and `linked_round_trip_id`, quantities 4 and 6 that sum to the entry's 10), `test_budget_refusal_is_a_recorded_refusal_with_a_complete_follow_baseline` (`await rig.gateway.budget.set_cap(0)` → note `MODEL_REFUSED_BUDGET_EXHAUSTED`, no ENTER, the follow baseline complete with `incomplete_reason is None`), `test_an_unknown_cap_refuses_jev_but_keeps_the_follow_baseline` (a fresh `Rig` whose gateway never got `set_cap` → `MODEL_REFUSED_BUDGET_CAP_UNKNOWN`, the follow baseline complete), `test_a_fixed_rule_quote_failure_sends_an_incomplete_fixed_rule` (the fixed-rule candidate's `get_ai_entry_quote` returns `feed="delayed"` → a `fixed_rule.v1` with `incomplete_reason == "feed_not_accepted"`, `conid == MSFT`, no prices; `no_trade.v1` still complete), `test_every_model_step_writes_one_ruling_row`.
+**Also write:** `test_an_exit_signal_closes_a_held_conid_without_any_model` (no provider request; `decider == "strategy"`), `test_an_exit_signal_for_a_conid_not_held_is_noted` (`NOT_HELD`), `test_an_exit_signal_still_closes_when_trips_cannot_be_read`, `test_orchestrator_down_skips_discovery_but_signals_continue` (orchestrator 404 once → next entry cycle `ORCHESTRATOR_UNHEALTHY` with no `discover_ai_candidates` call; an entry signal still gets its Jev call), `test_role_health_recovers_after_the_recheck_window`, `test_an_unconfigured_strategy_is_noted_without_reads`, `test_a_failed_discovery_writes_no_cycle_baselines` (a failed read is no cycle opportunity: nothing was seen), `test_a_partial_close_carries_its_quantity_and_a_matched_baseline` (the ENTER body is inserted into `ai_submissions` first; the baseline's `opportunity_id == derive_decision_id(cycle_id, f"partial_close:{AAPL}")` and `linked_round_trip_id == "rt-1"`), `test_two_partial_closes_in_two_cycles_give_two_matched_records` (entry 10 shares; slot 1 `PARTIAL_CLOSE` 4 of P1, then the position shows 6 open and slot 2 `CLOSE`s P1: two baselines with different `opportunity_id`, the same `linked_decision_id` and `linked_round_trip_id`, quantities 4 and 6 that sum to the entry's 10), `test_budget_refusal_is_a_recorded_refusal_with_a_complete_follow_baseline` (`await rig.gateway.budget.set_cap(0)` → note `MODEL_REFUSED_BUDGET_EXHAUSTED`, no ENTER, the follow baseline complete with `incomplete_reason is None`), `test_an_unknown_cap_refuses_jev_but_keeps_the_follow_baseline` (a fresh `Rig` whose gateway never got `set_cap` → `MODEL_REFUSED_BUDGET_CAP_UNKNOWN`, the follow baseline complete), `test_an_unrankable_cycle_sends_an_incomplete_fixed_rule` (every eligible candidate has `change_pct: None` → a `fixed_rule.v1` with `incomplete_reason == "ranking_unavailable"`, `conid is None`, no prices, plus a complete `no_trade.v1`), `test_a_cycle_with_no_eligible_candidate_still_records_no_trade` (only `FAIL` candidates → note `NO_ELIGIBLE_CANDIDATES`, baselines exactly one `no_trade.v1`, no orchestrator request), `test_a_fixed_rule_quote_failure_sends_an_incomplete_fixed_rule` (the fixed-rule candidate's `get_ai_entry_quote` returns `feed="delayed"` → a `fixed_rule.v1` with `incomplete_reason == "feed_not_accepted"`, `conid == MSFT`, no prices; `no_trade.v1` still complete), `test_every_model_step_writes_one_ruling_row`.
 
 ```python
 @pytest.mark.asyncio
 @pytest.mark.parametrize("quote,reason", [
-    (lambda body: entry_quote_reply(conid=body["conid"], at=NOW - dt.timedelta(seconds=60)), "quote_unavailable"),
+    (lambda body: entry_quote_reply(conid=body["conid"], at=NOW - dt.timedelta(seconds=60)), "quote_not_executable"),
     (lambda body: entry_quote_reply(conid=body["conid"], feed="iex_realtime"), "feed_not_accepted"),
     (trader_down(), "quote_unavailable")])
 async def test_a_missing_quote_refuses_before_any_model_and_sends_an_incomplete_baseline(tmp_path, quote, reason):
@@ -1658,8 +1669,8 @@ import math
 from dataclasses import dataclass
 from typing import Any, Optional, Union
 
-from trader.ai.baselines import (fixed_rule, follow_signal, incomplete, incomplete_reason_for, matched_entry,
-                                 no_trade, pick_fixed_rule)
+from trader.ai.baselines import (RANKING_UNAVAILABLE, fixed_rule, follow_signal, incomplete, incomplete_reason_for,
+                                 matched_entry, no_trade, pick_fixed_rule)
 from trader.ai.discovery_client import DiscoveryClient, DiscoveryRead
 from trader.ai.engine import (
     EngineResult, EntryCycleContext, ModelWork, PositionCycleContext, ProposedDecision, SignalContext,
@@ -1884,9 +1895,9 @@ class PaperDecisionEngine:
             read = await self._discovery.read(tools, cycle_id)
             if not read.ok:
                 return EngineResult(note=read.error_code)
+            baselines.append(no_trade(cycle_id, ctx.now))            # every cycle with a good discovery read
             if not read.eligible:
-                return EngineResult(note="NO_ELIGIBLE_CANDIDATES")
-            baselines.append(no_trade(cycle_id, ctx.now))
+                return EngineResult(baselines=tuple(baselines), note="NO_ELIGIBLE_CANDIDATES")
             fixed, code = await self._fixed_rule(tools, read, cycle_id)
             baselines.extend([fixed] if fixed is not None else [])
             notes.extend([code] if code is not None else [])
@@ -1911,9 +1922,10 @@ class PaperDecisionEngine:
 
     async def _fixed_rule(self, tools: LiveTools, read: DiscoveryRead, cycle_id: str):
         candidate = pick_fixed_rule(read.eligible)
-        if candidate is None:
-            return None, "FIXED_RULE_NO_CANDIDATE"
         bracket, digest = self._cfg.fixed_rule, self._cfg.discretionary_deployment_digest
+        if candidate is None:                     # eligible, but none has a change_pct: nothing to rank
+            return incomplete("fixed_rule.v1", "self_found", cycle_id, tools.clock.now(), conid=None,
+                              reason=RANKING_UNAVAILABLE, deployment_digest=digest), "FIXED_RULE_RANKING_UNAVAILABLE"
         source = EntrySource("discretionary", candidate.conid, digest, bracket.stop_fraction,
                              bracket.target_fraction, candidate.median_dollar_volume, {}, ())
         try:

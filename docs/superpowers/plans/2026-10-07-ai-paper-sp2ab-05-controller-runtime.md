@@ -43,7 +43,7 @@
 10. **Submission state machine.** `PENDING` (persisted, not sent) → `SENDING` (written before any byte leaves) → `ACCEPTED` (trader receipt, non-final) / `FINAL` (receipt `RESOLVED` or `REJECTED`) / `UNKNOWN` (possible send) / back to `PENDING` (proven not sent) / `FAILED` (`VALIDATION_ERROR`, `PERMISSION_DENIED`, `METHOD_NOT_ALLOWED`: a bug). Epoch refusals and `AUTHENTICATION_ERROR` / `REPLAY_ERROR` are "refused before any handler" (Plan 1 Ruling 1a: no ledger row) → `PENDING` for a first send, `UNKNOWN` for a resend (an earlier send may have landed). Any other trader error code → `UNKNOWN`. Unsent work is `ABANDONED` on expiry (`EXPIRED_UNSENT`), on a closed entry window for an `ENTER` (`OUTSIDE_ENTRY_WINDOW`) or on a `STOPPED` experiment for a close. `UNKNOWN` is reconciled with `get_ai_paper_decision` under the current epoch: found → receipt saved; not found and `not_found_settle_seconds` (default 120, above the 30 s RPC clock skew) past the last send → resend the same id and the same stored body bytes while unexpired, else `NOT_ADMITTED`. A `REJECTED` receipt with `CONTROLLER_EPOCH_STALE` is final: the decision is lost, never regenerated (Plan 1 Ruling 4). On restart `SENDING` → `UNKNOWN` (`PROCESS_RESTARTED`).
 11. **Ids and expiry are code-owned.** `decision_id = "dec-" + sha256(source_id + "|" + action_key)[:32]`; `source_id` is the signal's `source_event_id` or the cycle id; `action_key` (`^[a-z][a-z_]{0,15}:[0-9]{1,12}(:[a-z0-9_]{1,24})?$`, e.g. `enter:265598`) comes from the engine. `expires_at = decided_at + decision_ttl_seconds`. The engine never sets either.
 12. **Cost mapping (coordinator ruling, binding).** Plan 2's ids allow only `[A-Za-z0-9_-]{8,96}`, but Plan 4's `event_id` (`<attempt_key>:<kind>`) and `attempt_key` (`<decision_id>/<role>/<seq>#<n>`) contain `/`, `#`, `:`. So `record_id = "cost-" + sha256(event_id).hexdigest()[:40]` and `attempt_id = "att-" + sha256(attempt_key).hexdigest()[:40]`; the outbox row keeps the original `event_id` (`source_ref`) and `attempt_key` next to it for traceability. Status: `CONFIRMED` → `confirmed` with the actual cost; `ESTIMATED_UNKNOWN` → `estimated` with the reserved worst-case cost (never `confirmed`); `NONE` → `confirmed`, `0.0` (a proven not-sent or rejected call costs nothing, and spec 7 wants failed attempts reported); `CORRECTION` → `confirmed`, a new record whose `corrects_record_id` is the mapped id of the attempt's `ESTIMATED_UNKNOWN` record. Money: `cost_usd = cost_micros / 1_000_000` through `Decimal` (Plan 4 money is integer micro-USD; pinned by a test). A `REFUSED` reply (for example `CORRECTION_TARGET_UNKNOWN`, `CONFLICTING_DUPLICATE`) follows Plan 2's `retryable` flag (Ruling 14). `called_at` = the attempt's `started_at` (same for original and correction, as Plan 2 Ruling 4 requires). `experiment_id`, `served_kind`, `served_id` come from `ai_call_contexts`, keyed by the part of `request_key` before the first `/`. `decision_id` is always `null`: a Jev `SKIP` never creates a trader decision and a link to an unknown decision would retry forever (Plan 2 Ruling 5); `served_kind = "decision"` with `served_id = decision_id` carries the link. *Cost if wrong:* the report joins costs to decisions by `served_id`.
-13. **Baselines.** `record_id = simulated_record_id(experiment_id, baseline_id, opportunity_id)`. A baseline linked to a decision of the same result waits (`WAITING`) until that submission is settled; then `linked_decision_id` is the decision id if the trader has a row (`ACCEPTED`, `FINAL`), else `null` (`ABANDONED`, `NOT_ADMITTED`, `FAILED`). The body changes only before the first delivery.
+13. **Baselines.** `record_id = simulated_record_id(experiment_id, baseline_id, opportunity_id)`. A baseline linked to a decision of the same result waits (`WAITING`) until that submission is settled; then `linked_decision_id` is the decision id if the trader has a row (`ACCEPTED`, `FINAL`), else `null` (`ABANDONED`, `NOT_ADMITTED`, `FAILED`). A matched-entry baseline waits on its **own close** (its `opportunity_id` is that close's decision id) and keeps its ENTER link: once the close reached the trader it goes out unchanged, so the trader can prove the trip and the shares (Plan 2 Ruling 21); a close that never reached the trader is no model close, so the record becomes `DROPPED` (logged, counted in the heartbeat; Plan 6 Ruling 11: no model close → no matched-entry record). The body changes only before the first delivery.
 14. **Outbox order and dead letters.** Delivery follows `created_seq`. The first transport failure ends the pass (trader away; keep order). `INSERTED` / `DUPLICATE` → `DELIVERED`. `REFUSED` with `retryable: true` and other trader error codes → retry with backoff `min(5 × 2^attempts, 300)` s. `REFUSED` with `retryable: false`, `VALIDATION_ERROR`, `PERMISSION_DENIED`, `METHOD_NOT_ALLOWED` → `DEAD` (ERROR log, counted in the heartbeat). A cost event without its context → `DEAD` (`CONTEXT_MISSING`).
 15. **Engine contract.** Hooks return an `EngineResult`; they must not raise for model failures (Plan 6 turns those into a result with baselines and a note). A raise is a bug → the opportunity or cycle is `FAILED` (`ENGINE_ERROR`). A result whose action does not fit its source (an `ENTER` from a position cycle or exit signal, a close from an entry signal or cycle), a repeated `action_key` or a baseline link to an unknown `action_key` is refused whole (`FAILED`, nothing persisted).
 16. **Engine seam.** `trader.ai_service.build_engine(deps)` raises `EngineNotInstalled` until Plan 6 replaces its body; `main()` then exits with code 2 and an ERROR line. Tests inject engines through `run_service(..., engine_factory=...)`.
@@ -64,7 +64,7 @@ Plan 6 (and any later plan) uses these exact names.
   - `ModelWork` with `.context_key`, `.served_kind`, `.served_id`, `.source_id`, `.experiment_id`, `.gateway: ModelCaller`, `.deadline: DecisionDeadline`, `request_key(role: str, call_seq: int) -> str` (`"<context_key>/<role>/<call_seq>"`, Plan 4 Ruling 10) and `async for_action(action_key) -> ModelWork` (context = the derived decision id, `served_kind = "decision"`, same deadline).
   - `SignalContext(now, experiment, opportunity, work)`, `EntryCycleContext(now, experiment, slot, work)`, `PositionCycleContext(now, experiment, slot, positions, work)`.
   - `ProposedDecision(action_key, action, conid, side, decider, evidence_digest, deployment_digest=None, policy_revision=None, stop_price=None, target_price=None, quantity=None)`.
-  - `SimulatedBaseline(baseline_id, cohort, opportunity_id, decided_at, conid=None, side=None, quantity=None, reference_price=None, stop_price=None, target_price=None, linked_action_key=None, linked_decision_id=None, linked_round_trip_id=None, deployment_digest=None, incomplete_reason=None)`; it enforces Plan 2's shapes (`follow_signal.v1` / `fixed_rule.v1`: `quantity` null and `deployment_digest` set; matched-entry: `quantity` (the close's requested reduction) and `linked_decision_id` set; with `incomplete_reason`: no side, quantity or prices). `BASELINE_COHORTS` (the index pairs), `TRADER_SIZED_BASELINES = {"follow_signal.v1", "fixed_rule.v1"}`, `INCOMPLETE_REASONS = ("quote_unavailable", "feed_not_accepted", "budget_refused", "model_failed", "sizing_unavailable")`.
+  - `SimulatedBaseline(baseline_id, cohort, opportunity_id, decided_at, conid=None, side=None, quantity=None, reference_price=None, stop_price=None, target_price=None, linked_action_key=None, linked_decision_id=None, linked_round_trip_id=None, deployment_digest=None, incomplete_reason=None)`; it enforces Plan 2's shapes (`follow_signal.v1` / `fixed_rule.v1`: `quantity` null and `deployment_digest` set; matched-entry: `quantity` (the close's requested reduction) and `linked_decision_id` set; with `incomplete_reason`: no side, quantity or prices). `BASELINE_COHORTS` (the index pairs), `TRADER_SIZED_BASELINES = {"follow_signal.v1", "fixed_rule.v1"}`, `INCOMPLETE_REASONS = ("quote_unavailable", "feed_not_accepted", "quote_not_executable", "ranking_unavailable", "budget_refused", "model_failed", "sizing_unavailable")` (`ranking_unavailable` is `fixed_rule.v1` only and the one reason that allows a null conid).
   - `EngineResult(decisions=(), baselines=(), note="")`.
   - `class DecisionEngine(Protocol)`: `async on_entry_signal(SignalContext)`, `async on_exit_signal(SignalContext)`, `async on_entry_cycle(EntryCycleContext)`, `async on_position_cycle(PositionCycleContext)`, each `-> EngineResult`.
 - `trader.ai.rpc_clients`: `ReadOnlySupervisor(supervisor).call(method, body)` allows `ENGINE_QUERIES = SUPERVISOR_QUERIES ∪ SUPERVISOR_SLOW_QUERIES − EPOCH_METHODS` only; errors `RpcNotSent`, `MethodNotAllowedLocally`, `RpcOutcomeUnknown`, `RpcRefused`.
@@ -324,7 +324,7 @@ RUNTIME_MIGRATIONS: tuple[Migration, ...] = (
             record_id VARCHAR PRIMARY KEY,
             kind VARCHAR NOT NULL CHECK (kind IN ('cost', 'simulated')),
             source_ref VARCHAR NOT NULL, attempt_key VARCHAR, body_json VARCHAR NOT NULL,
-            state VARCHAR NOT NULL CHECK (state IN ('WAITING', 'PENDING', 'DELIVERED', 'DEAD')),
+            state VARCHAR NOT NULL CHECK (state IN ('WAITING', 'PENDING', 'DELIVERED', 'DEAD', 'DROPPED')),
             wait_for_decision_id VARCHAR, attempts INTEGER NOT NULL, next_try_at TIMESTAMPTZ NOT NULL,
             last_code VARCHAR, delivered_status VARCHAR,
             created_seq BIGINT NOT NULL DEFAULT nextval('ai_outbox_seq'),
@@ -1573,8 +1573,9 @@ BASELINE_COHORTS: Mapping[str, str] = {
     "no_trade.v1": "self_found", "matched_entry_bracket_exit.v1": "model_close",
 }
 TRADER_SIZED_BASELINES = frozenset({"follow_signal.v1", "fixed_rule.v1"})     # Plan 2 Ruling 19
-INCOMPLETE_REASONS = ("quote_unavailable", "feed_not_accepted", "budget_refused", "model_failed",
-                      "sizing_unavailable")                                       # Plan 2 Ruling 18
+MATCHED_ENTRY_BASELINE = "matched_entry_bracket_exit.v1"
+INCOMPLETE_REASONS = ("quote_unavailable", "feed_not_accepted", "quote_not_executable", "ranking_unavailable",
+                      "budget_refused", "model_failed", "sizing_unavailable")     # Plan 2 Ruling 18
 _EXPERIMENT_ID = re.compile(r"^exp-[0-9a-f]{20}$")
 _DECIDER = re.compile(r"^[a-z][a-z0-9_.-]{0,63}$")
 _DIGEST = re.compile(r"^sha256:[0-9a-f]{64}$")
@@ -1808,8 +1809,11 @@ class SimulatedBaseline:
             if any(v is not None for v in (*trade, self.deployment_digest, self.incomplete_reason)):
                 raise ValueError("no_trade carries no trade, deployment or incomplete reason")
             return
-        if self.conid is None:
-            raise ValueError("a trading baseline names its conid")
+        unranked = self.incomplete_reason == "ranking_unavailable"
+        if unranked and self.baseline_id != "fixed_rule.v1":
+            raise ValueError("ranking_unavailable belongs to the fixed rule only")
+        if self.conid is None and not unranked:
+            raise ValueError("a trading baseline names its conid (unless nothing could be ranked)")
         if self.incomplete_reason is not None:
             if self.incomplete_reason not in INCOMPLETE_REASONS or any(v is not None for v in trade):
                 raise ValueError("an incomplete baseline has a known reason and no side, quantity or prices")
@@ -2718,6 +2722,8 @@ async def test_a_baseline_of_a_decision_that_never_reached_the_trader_drops_the_
     assert list(rig.ingest.rows.values())[0]["linked_decision_id"] is None
 ```
 
+**Also write** `test_a_matched_entry_waits_for_its_own_close` (a position-cycle result with a `PARTIAL_CLOSE` and its matched-entry baseline, `opportunity_id` = the close's decision id, `linked_decision_id` = an older ENTER: the record stays `WAITING` until the close is `ACCEPTED`, then goes out with its ENTER link unchanged) and `test_a_matched_entry_whose_close_never_reached_the_trader_is_dropped` (the close expires unsent → `ABANDONED`; the record becomes `DROPPED`, nothing is sent, `counts()["dropped"] == 1`).
+
 - [ ] **Step 2: Run them and see them fail**
 
 Run: `.venv/bin/python -m pytest tests/ai/runtime/test_outbox.py -q --timeout=60`
@@ -2742,7 +2748,7 @@ from dataclasses import dataclass
 from decimal import Decimal
 from typing import Any, Optional
 
-from trader.ai.engine import SimulatedBaseline
+from trader.ai.engine import MATCHED_ENTRY_BASELINE, SimulatedBaseline
 from trader.ai.ids import attempt_ref, canonical_json, cost_record_id, simulated_record_id
 from trader.ai.journal import COST_CONFIRMED, COST_CORRECTION, COST_ESTIMATED_UNKNOWN, COST_NONE
 from trader.ai.rpc_clients import RpcNotSent, RpcOutcomeUnknown, RpcRefused
@@ -2867,13 +2873,18 @@ class ReportingOutbox:
                 "LEFT JOIN ai_submissions s ON s.decision_id = o.wait_for_decision_id "
                 "WHERE o.state = 'WAITING'").fetchall()
             for record_id, body_json, decision_id, submission_state in rows:
+                body = json.loads(body_json)
+                own_close = body["baseline_id"] == MATCHED_ENTRY_BASELINE      # waits on its close, keeps its ENTER
                 if submission_state in ADMITTED_SUBMISSIONS:
-                    link = decision_id
+                    link = body["linked_decision_id"] if own_close else decision_id
                 elif submission_state is None or submission_state in NEVER_ADMITTED_SUBMISSIONS:
+                    if own_close:
+                        logger.info("matched-entry %s dropped: its close never reached the trader", record_id)
+                        conn.execute("UPDATE ai_outbox SET state = 'DROPPED' WHERE record_id = ?", [record_id])
+                        continue
                     link = None
                 else:
                     continue
-                body = json.loads(body_json)
                 body["linked_decision_id"] = link
                 conn.execute("UPDATE ai_outbox SET body_json = ?, state = 'PENDING' WHERE record_id = ?",
                              [canonical_json(body), record_id])
@@ -2911,6 +2922,7 @@ class ReportingOutbox:
         rows = await self._store.aquery("SELECT state, COUNT(*) FROM ai_outbox GROUP BY state")
         found = {state: int(count) for state, count in rows}
         return {"waiting": found.get("WAITING", 0), "pending": found.get("PENDING", 0),
+                "dropped": found.get("DROPPED", 0),
                 "delivered": found.get("DELIVERED", 0), "dead": found.get("DEAD", 0)}
 
     async def _retry(self, record_id: str, attempts: int, code: str) -> None:
@@ -3664,8 +3676,8 @@ from pathlib import Path
 from typing import Any, Awaitable, Callable, Optional
 
 from trader.ai.engine import (
-    ALLOWED_ACTIONS, EngineResult, EntryCycleContext, ExperimentView, ModelWork, PositionCycleContext,
-    SignalContext, SignalOpportunity, owned_positions_from_trips,
+    ALLOWED_ACTIONS, MATCHED_ENTRY_BASELINE, EngineResult, EntryCycleContext, ExperimentView, ModelWork,
+    PositionCycleContext, SignalContext, SignalOpportunity, owned_positions_from_trips,
 )
 from trader.ai.ids import derive_decision_id
 from trader.ai.outbox import register_context_in_tx
@@ -3796,8 +3808,11 @@ class AiController:
                 self._submitter.insert_in_tx(conn, source_kind=source_kind, source_id=source_id, decision=decision,
                                              expires_at=expires_at, epoch=epoch, now=now)
             for baseline in result.baselines:
-                wait_for = (None if baseline.linked_action_key is None
-                            else derive_decision_id(source_id, baseline.linked_action_key))
+                if baseline.baseline_id == MATCHED_ENTRY_BASELINE:
+                    wait_for = baseline.opportunity_id          # its own close (Ruling 13)
+                else:
+                    wait_for = (None if baseline.linked_action_key is None
+                                else derive_decision_id(source_id, baseline.linked_action_key))
                 self._outbox.enqueue_simulated_in_tx(conn, experiment_id=experiment.experiment_id,
                                                      baseline=baseline, wait_for_decision_id=wait_for, now=now)
             finish(conn, True, result.note or None)

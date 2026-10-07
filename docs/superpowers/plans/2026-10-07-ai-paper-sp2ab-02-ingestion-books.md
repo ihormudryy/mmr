@@ -39,17 +39,20 @@
 8. **Entry window.** For baselines that trade, `decided_at` must be inside an XNYS session and strictly before that session's flatten start (`SessionSchedule.flatten_start_utc`, 15:45 ET, or 12:45 ET on an early close). `no_trade.v1` only needs to lie inside the experiment window.
 9. **Allowed baselines.** `follow_signal.v1` / `strategy_signal`, `fixed_rule.v1` / `self_found`, `no_trade.v1` / `self_found`, `matched_entry_bracket_exit.v1` / `model_close`. Other ids or pairings are refused. A new baseline version is a one-line change in `BASELINES` (`trader/scoreboard/ingest.py`).
 10. **Bracket semantics (long only).** Entry fills at the reference price at `decided_at`. Only bars that start **after the minute containing `decided_at`** are scanned (no look-ahead). For each bar in order: if `low <= stop`, exit at `min(stop, bar.open)` (a gap through the stop fills at the open) with kind `STOP`; else if `high >= target`, exit at `target` with kind `TARGET`. **If one bar touches both, the stop wins** (conservative). Bars starting at or after the flatten start are not scanned; if nothing hit, exit at the **open of the first bar that starts in `[flatten_start, flatten_start + 10 min)`**, kind `FLATTEN`. The exit time of a `STOP`/`TARGET` is the bar's start. *If wrong:* results shift by about one bar of price; the rule is the same for every baseline, so books stay comparable.
-11. **What counts as missing data.** Alpaca emits no bar for a minute with no trades, so a missing minute alone is not a gap. A record is `INCOMPLETE` when: a used bar is invalid (`BAD_BAR`: non-finite, non-positive, `high < low`, open or close outside the range) or repeated (`DUPLICATE_BAR`); two bars (or the entry and the first bar, or the last bar and the flatten bar) are more than **30 minutes** apart (`BAR_GAP`); there is no flatten bar (`NO_FLATTEN_BAR`); no source returned bars (`NO_BARS`); or no source is configured (`NO_BAR_SOURCE`). Two more reasons are written at ingestion, not by the simulator: the `ai` service's own `incomplete_reason` (Ruling 18) and `sizing_unavailable` (Ruling 19). *If wrong:* a genuinely quiet stock shows as incomplete instead of complete. That is the safe side.
+11. **What counts as missing data.** Alpaca emits no bar for a minute with no trades, so a missing minute alone is not a gap. A record is `INCOMPLETE` when: a used bar is invalid (`BAD_BAR`: non-finite, non-positive, `high < low`, open or close outside the range) or repeated (`DUPLICATE_BAR`); two bars (or the entry and the first bar, or the last bar and the flatten bar) are more than **30 minutes** apart (`BAR_GAP`); there is no flatten bar (`NO_FLATTEN_BAR`); no source returned bars (`NO_BARS`); or no source is configured (`NO_BAR_SOURCE`). Two more reasons are written at ingestion, not by the simulator: the `ai` service's own `incomplete_reason` (Ruling 18) and the trader's sizing reasons (`sizing_unavailable`, `quote_unavailable`, `quote_not_executable`, Ruling 19). The simulator also writes `close_fill_unproven` for a matched-entry record whose close fill cannot be proven (Ruling 21). *If wrong:* a genuinely quiet stock shows as incomplete instead of complete. That is the safe side.
 12. **P&L is gross.** No commission and no slippage is modeled. The book carries `pnl_basis: "gross, no commissions or slippage"` and the dashboard and CLI print it. Baselines therefore look slightly better than the real book. *If wrong:* a fee model can be added later as a new outcome field; old outcomes keep their basis label.
 13. **When the simulator runs.** A session's bars are ready at **20:16 ET** (the Alpaca provider's own completed-session rule, `SESSION_COMPLETE_ET`). From then each pending record is tried on every tick (at most once per 5 minutes per record). The first source that gives a `COMPLETE` result wins (local DuckDB, then Alpaca). If no source completes, the record keeps being retried until **2 hours** after ready time; then a sealed `INCOMPLETE` outcome with the combined reasons is written. An outcome is final: sealed rows are never edited, so an operator who backfills bars later must accept that this record stays incomplete. *If wrong:* a longer data outage burns records to `INCOMPLETE`; raise `GRACE`.
 14. **`no_trade.v1`.** The decision row and a `COMPLETE` outcome (`pnl_usd = 0.0`, `trades = 0`, `bar_source = "none"`) are written in one transaction at ingestion. It never waits for bars.
-15. **Book status.** `COMPLETE` (every record has a complete outcome), `INCOMPLETE` (at least one incomplete outcome), `PENDING` (no incomplete outcome, but at least one record has no outcome yet). `pnl_usd` is the sum only for a `COMPLETE` book, else `null`. `known_pnl_usd` is the sum over the complete records, labelled partial in every display. A bad book never hides another book. A matched-entry book does not count an entry twice: the records of one trip carry only the shares each close removed and their sum never exceeds the entry quantity (Ruling 21).
+15. **Book status.** `COMPLETE` (every record has a complete outcome), `INCOMPLETE` (at least one incomplete outcome), `PENDING` (no incomplete outcome, but at least one record has no outcome yet). `pnl_usd` is the sum only for a `COMPLETE` book, else `null`. `known_pnl_usd` is the sum over the complete records, labelled partial in every display. A bad book never hides another book. A matched-entry book does not count an entry twice: each record simulates only the shares its close is proven to have removed, and a trip's records are clipped to its proven entry fill (Ruling 21).
 16. **Costs in the report.** Keep the SP1 keys (`ai_cost_usd`, `ai_calls`, `ai_costs_status`, `pnl_minus_ai_cost_usd`) with their SP1 meaning: `ai_cost_usd` is `null` while any call is `unknown`. Add `ai_cost` with `status` (`NONE`, `CONFIRMED`, `ESTIMATED`, `INCOMPLETE`), `confirmed_usd`, `estimated_usd`, `unknown_calls`, `corrections`. `pnl_minus_ai_cost_usd` counts estimated cost as cost and is `null` while any call is unknown.
 17. **Alpaca keys on the trader.** `Trader.__init__` gets `alpaca_api_key_id` and `alpaca_api_secret_key` (default `''`). `Container.resolve` fills them from the configuration or the `ALPACA_API_KEY_ID` / `ALPACA_API_SECRET_KEY` env that `docker-compose.yml` already passes. Blank keys → no Alpaca source, one WARNING at start, records end `INCOMPLETE` (`NO_BAR_SOURCE`) if the local DuckDB has no bars. The conid is mapped to a ticker only through `trader.universe_accessor.resolve_symbol(conid, first_only=True)`, and only for `STK` in `USD`. Anything else is `UNSUPPORTED_INSTRUMENT`.
-18. **Incomplete baselines (spec 7).** A baseline whose evidence the `ai` service could not read is still sent, never dropped and never with invented values. `incomplete_reason` is one of `quote_unavailable`, `feed_not_accepted`, `budget_refused`, `model_failed`, `sizing_unavailable` (Plan 6 never sends the last one; the trader writes it, Ruling 19). With a reason set: `no_trade.v1` is refused (it is always complete); `conid` is still required (the opportunity always names its instrument); `side`, `quantity` and the three prices must be null; `deployment_digest` is optional. The trader writes the decision row and a sealed `INCOMPLETE` outcome (`reason` = the wire value, `exit_kind = NONE`, `pnl_usd` and `trades` null, `bar_source = "none"`) in one transaction, so the simulator never picks it up and the book shows it under `incomplete_reasons`. *If wrong:* an incomplete record makes its whole book `INCOMPLETE`; that is the honest label for a book with a hole.
-19. **Baseline sizing at ingestion (index ruling).** `follow_signal.v1` and `fixed_rule.v1` get the quantity a real `ENTER` of that deployment gets at that moment. **Linked** (`linked_decision_id` names an `ENTER` the trader placed, which is when Jev took the signal): the record takes that `ENTER`'s own sized quantity (`DecisionFact.entry_quantity`, the `quantity` of its `SUBMITTED` receipt), `quantity_source = 'linked_entry'`. Sizing again would be wrong here: Plan 5 delivers a linked baseline only after its `ENTER` settled, so the account already holds that entry. If the linked `ENTER` was not placed (refused, no quantity), the record is sized like an unlinked one. **Unlinked** (Jev skipped or was refused, and every fixed-rule record): the trader's `BaselineSizer` runs SP1's `max_entry_quantity(limits, sizing_inputs(...))` on a fresh `broker.capture(account)`, the current effective limits (`AiRiskPolicyService.effective_limits()`), price = the planned entry limit on the fresh quote (`planned_entry_limit(ask, bid, AI_ENTRY_POLICY.limit_offset_bps)`, exactly what `prepare_entry` sizes on; `reference_price` stays the simulated fill), stop = `stop_price`, the notional cap (`deployment.evidence_order_notional × (1 + LIVE_NOTIONAL_TOLERANCE)`, the same cap `prepare_entry` uses) and the liquidity cap (`LiquidityPolicy.max_quantity(liquidity_from_history(history, conid, quote, now))` on the trader's quote authority; a missing quote or a feed outside the accepted set is a sizing failure, as it is for a real `ENTER`). `pending_entry_refusal` or a result below one share also counts: the real `ENTER` would have been refused. Sizing runs before the write transaction (it does I/O); the sized quantity goes into the `quantity` column with `quantity_source = 'trader_sizing'`, the inputs into `sizing_json` (equity, gross, existing value, liquidity cap, notional cap, the limits, the binding bound). These are server columns, outside `body_digest`, so a redelivery is a `DUPLICATE` and keeps the first size. A sizer error, no sizer (no `ai_paper` stack), a refused or below-one-share size, or `decided_at` more than `SIZING_MAX_LAG` (120 s) before ingestion → the record is written with an `INCOMPLETE` outcome, reason `sizing_unavailable`, and the code in `sizing_json`. Plan 2's sizer knows strategy deployments; a discretionary digest is `sizing_unavailable` (`DEPLOYMENT_KIND_MISMATCH`) until Plan 3 extends it (Plan 3 Cross-plan additions). *If wrong:* a delivery after a long trader outage is incomplete instead of sized on a different broker state; that is the safe side.
+18. **Incomplete baselines (spec 7).** A baseline whose evidence the `ai` service could not read is still sent, never dropped and never with invented values. `incomplete_reason` is one of `quote_unavailable`, `feed_not_accepted`, `quote_not_executable`, `ranking_unavailable`, `budget_refused`, `model_failed`, `sizing_unavailable` (Plan 6 never sends the last one; the trader writes it, and also writes `quote_unavailable` / `quote_not_executable` when its own sizing quote fails, Ruling 19). With a reason set: `no_trade.v1` is refused (it is always complete); `conid` is required, except with `ranking_unavailable` (a fixed-rule cycle with eligible candidates of which none has a `change_pct`: there is no pick, so no instrument); `side`, `quantity` and the three prices must be null; `deployment_digest` is optional. The trader writes the decision row and a sealed `INCOMPLETE` outcome (`reason` = the wire value, `exit_kind = NONE`, `pnl_usd` and `trades` null, `bar_source = "none"`) in one transaction, so the simulator never picks it up and the book shows it under `incomplete_reasons`. *If wrong:* an incomplete record makes its whole book `INCOMPLETE`; that is the honest label for a book with a hole.
+19. **Baseline sizing at ingestion (index ruling).** `follow_signal.v1` and `fixed_rule.v1` get the quantity a real `ENTER` of that deployment gets at that moment. **Linked** (`linked_decision_id` names an `ENTER` the trader placed, which is when Jev took the signal): the record takes that `ENTER`'s own sized quantity (`DecisionFact.entry_quantity`, the `quantity` of its `SUBMITTED` receipt), `quantity_source = 'linked_entry'`. Sizing again would be wrong here: Plan 5 delivers a linked baseline only after its `ENTER` settled, so the account already holds that entry. If the linked `ENTER` was not placed (refused, no quantity), the record is sized like an unlinked one. **Unlinked** (Jev skipped or was refused, and every fixed-rule record): the trader's `BaselineSizer` runs SP1's `max_entry_quantity(limits, sizing_inputs(...))` on a fresh `broker.capture(account)`, the current effective limits (`AiRiskPolicyService.effective_limits()`), price = the planned entry limit on the fresh quote (`planned_entry_limit(ask, bid, AI_ENTRY_POLICY.limit_offset_bps)`, exactly what `prepare_entry` sizes on; `reference_price` stays the simulated fill), stop = `stop_price`, the notional cap (`deployment.evidence_order_notional × (1 + LIVE_NOTIONAL_TOLERANCE)`, the same cap `prepare_entry` uses) and the liquidity cap (`LiquidityPolicy.max_quantity(liquidity_from_history(history, conid, quote, now))` on the trader's quote authority). **Before sizing, the quote passes exactly the real ENTER's quote checks** (second PR #75 review): `validate_entry_quote(quote, conid=, side="BUY", now=, accepted_feeds=)`, the quote half of SP1's `validate_approval` extracted into one function that both call (identity, aware timestamp, age ≤ `MAX_QUOTE_AGE_SECONDS`, clock skew, positive bid/ask/price with `ask ≥ bid` and `price == ask`, feed in the accepted set, `session_state == "continuous"`), plus `LiquidityPolicy`'s spread rule (`spread_bps ≤ MAX_SPREAD_BPS`). No quote → INCOMPLETE `quote_unavailable`; a quote that fails any check → INCOMPLETE `quote_not_executable` (the code, for example `QUOTE_STALE` or `SPREAD_BPS`, in `sizing_json`). A real ENTER would refuse on that evidence, so the baseline is never COMPLETE on it. `pending_entry_refusal` or a result below one share also counts: the real `ENTER` would have been refused. Sizing runs before the write transaction (it does I/O); the sized quantity goes into the `quantity` column with `quantity_source = 'trader_sizing'`, the inputs into `sizing_json` (equity, gross, existing value, liquidity cap, notional cap, the limits, the binding bound). These are server columns, outside `body_digest`, so a redelivery is a `DUPLICATE` and keeps the first size. A sizer error, no sizer (no `ai_paper` stack), a refused or below-one-share size, or `decided_at` more than `SIZING_MAX_LAG` (120 s) before ingestion → the record is written with an `INCOMPLETE` outcome, reason `sizing_unavailable` (or the quote reason above), and the code in `sizing_json`. Plan 2's sizer knows strategy deployments; a discretionary digest is `sizing_unavailable` (`DEPLOYMENT_KIND_MISMATCH`) until Plan 3 extends it (Plan 3 Cross-plan additions). *If wrong:* a delivery after a long trader outage is incomplete instead of sized on a different broker state; that is the safe side.
 20. **Owner model budget cap (owner, 2026-10-07; spec 5.4).** `ai_paper.model_budget_usd_per_day` in `trader.yaml` (default 2000, finite, ≥ 0, a bool or text refused; env overrides are already refused by `_refuse_env_overrides`). It is parsed into `AiPaperConfig.model_budget_usd_per_day` and served by the query `get_ai_model_budget` → `{"model_budget_usd_per_day": float, "source": "trader.yaml"}`. The trader reads `trader.yaml` only at start, so only an operator edit plus a trader restart changes the value; no typed RPC command touches it. The `ai` service applies it with Plan 4's `Budget.set_cap` (Plan 5). *If wrong:* an operator `cli` command (spec 5.4's other path) can be added later as a `cli`-only command; it is not needed for SP2a+b.
-21. **Matched-entry: one record per close, sized by the close (coordinator ruling on PR #75).** `linked_round_trip_id: Optional[str]` (`^[A-Za-z0-9_.:-]{1,128}$`) is allowed only on `matched_entry_bracket_exit.v1` and is stored for audit; the trader does not resolve it. One record per model close: `opportunity_id` is the close's decision id, so two partial closes of one trip are two records with the same `linked_decision_id` (required on this baseline) and `linked_round_trip_id`. `reference_price` stays the entry fill and `decided_at` the entry time, but `quantity` is the **requested** reduction of that close: a `PARTIAL_CLOSE`'s quantity, or for a `CLOSE` the whole shares still open when the model chose it. *Requested, not filled:* the record is committed with the close decision before any fill exists and its body cannot change after the first delivery (Plan 5 Ruling 13), and a stop or target can fill the same shares first, so "filled by the close" is not knowable at decision time. Requested quantities alone could overrun when a close is refused and the next cycle asks for the same shares again, so the trader keeps the invariant inside the write transaction: `remaining = linked ENTER's entry_quantity − SUM(quantity)` of this experiment's matched records with the same `linked_round_trip_id`; the stored `quantity` is `min(requested, remaining)` (`quantity_source = 'clipped_to_entry'` when clipped, `sizing_json` names both numbers); `remaining < 1` → refused `MATCHED_ENTRY_ALREADY_COVERED`; an ENTER with no known `entry_quantity` → refused `MATCHED_ENTRY_SIZE_UNKNOWN` (both not retryable, dead-lettered and shown by Plan 5). So a trip's records add up to at most its entry quantity, and to exactly that when the model's closes took the whole trip; shares a stop, target, strategy SELL or the flatten removed have no model close and no record.
+21. **Matched-entry: one record per close; the trader proves the trip and the shares (coordinator rulings on PR #75, rounds 1 and 2).** One record per model close: `opportunity_id` is the close's decision id, `linked_decision_id` (required) is the trip's ENTER. The caller is never trusted for the trip or the share count:
+   - **At ingestion** the trader derives the trip itself. The close decision (`opportunity_id`) must be a trader decision (`DecisionFacts`; unknown → `DECISION_LINK_UNKNOWN`, retryable) with action `CLOSE` or `PARTIAL_CLOSE`, of the same experiment and conid as the ENTER, received after the trip opened (else `MATCHED_CLOSE_INVALID`). The trip is the round trip of this experiment opened by the linked ENTER (`TripFacts.opened_by(experiment_id, entry_decision_id)` over `round_trips.decision_id`; not there yet → `MATCHED_ENTRY_TRIP_UNKNOWN`, retryable: the scoreboard refreshes every 30 s). A supplied `linked_round_trip_id` that differs → `MATCHED_ENTRY_TRIP_MISMATCH` (not retryable); a missing one is filled with the derived id. The record stores the close's **requested** quantity (a `PARTIAL_CLOSE`'s quantity, or for a `CLOSE` the whole shares open when the model chose it): that is all the `ai` side knows when it commits the record with the close.
+   - **At session-end simulation** the trader simulates `min(requested, shares the close is broker-proven to have removed)`. `CloseFills.removed(round_trip_id, close_decision_id)` returns `PROVEN(n)` (n = the trip's SELL executions whose order ref resolves through `links_for_order_ref` to that close decision; `0` for a close that ended `REJECTED` with no execution) or `UNPROVEN` (the close is not final, its outcome is unknown, or a SELL execution of the trip cannot be attributed). Then the per-trip sum is clipped to the trip's proven entry fill (`round_trips.entry_qty`): records are taken in close order and each gets at most what the earlier ones left. `UNPROVEN` after the grace period, or a record the clip leaves with nothing although its close proved shares (contradictory facts) → INCOMPLETE, reason `close_fill_unproven`. A close proven to have removed 0 shares → COMPLETE, `pnl_usd = 0.0`, `trades = 0`, reason `CLOSE_REMOVED_NO_SHARES`. The outcome stores the simulated quantity (`simulated_outcomes.quantity`).
+   - So a trip's records add up to at most its proven entry fill, and to the shares the model's closes really removed; shares a stop, target, strategy SELL or the flatten removed have no model close and no record. `reference_price` stays the entry fill and `decided_at` the entry time.
 
 ## Cross-plan additions
 
@@ -59,18 +62,18 @@ Plan 5 (outbox) and Plan 6 (baselines, acceptance) use these exact names.
 `record_id: str` (`^[A-Za-z0-9_-]{8,96}$`), `experiment_id: str` (`^exp-[0-9a-f]{20}$`), `role: "orchestrator"|"jev"|"research"`, `provider: str`, `model: str` (`^[A-Za-z0-9_./:@+-]{1,128}$`), `attempt_id: str` (same shape as `record_id`), `input_tokens: Optional[int]`, `output_tokens: Optional[int]` (≥ 0), `cost_usd: Optional[float]` (≥ 0, finite), `cost_status: "confirmed"|"estimated"|"unknown"` (`unknown` ⇔ `cost_usd` is null), `called_at: str` (ISO-8601 with offset), `served_kind: "decision"|"cycle"|"signal"|"research"`, `served_id: str` (`^[A-Za-z0-9_.:-]{1,128}$`), `decision_id: Optional[str]` (`^[A-Za-z0-9_-]{8,64}$`), `corrects_record_id: Optional[str]`.
 
 **RPC `record_simulated_decision`** (command, `ai_supervisor`). Request (strict):
-`record_id: str`, `experiment_id: str`, `baseline_id: str`, `cohort: str`, `opportunity_id: str` (`^[A-Za-z0-9_.:-]{1,128}$`), `conid: Optional[int]` (> 0), `side: Optional["BUY"]`, `quantity: Optional[int]` (≥ 1), `reference_price`, `stop_price`, `target_price: Optional[float]` (> 0), `decided_at: str`, `linked_decision_id: Optional[str]`, `linked_round_trip_id: Optional[str]` (`^[A-Za-z0-9_.:-]{1,128}$`, matched-entry only), `deployment_digest: Optional[str]` (`^sha256:[0-9a-f]{64}$`), `incomplete_reason: Optional["quote_unavailable"|"feed_not_accepted"|"budget_refused"|"model_failed"|"sizing_unavailable"]`. Shapes by baseline (the wire model refuses anything else):
+`record_id: str`, `experiment_id: str`, `baseline_id: str`, `cohort: str`, `opportunity_id: str` (`^[A-Za-z0-9_.:-]{1,128}$`), `conid: Optional[int]` (> 0), `side: Optional["BUY"]`, `quantity: Optional[int]` (≥ 1), `reference_price`, `stop_price`, `target_price: Optional[float]` (> 0), `decided_at: str`, `linked_decision_id: Optional[str]`, `linked_round_trip_id: Optional[str]` (`^[A-Za-z0-9_.:-]{1,128}$`, matched-entry only), `deployment_digest: Optional[str]` (`^sha256:[0-9a-f]{64}$`), `incomplete_reason: Optional["quote_unavailable"|"feed_not_accepted"|"quote_not_executable"|"ranking_unavailable"|"budget_refused"|"model_failed"|"sizing_unavailable"]`. Shapes by baseline (the wire model refuses anything else):
 - `follow_signal.v1`, `fixed_rule.v1`, complete: `conid`, `side`, the three prices and `deployment_digest` required; `quantity` **must be null** (the trader sizes it, Ruling 19).
-- `matched_entry_bracket_exit.v1`, complete: `conid`, `side`, `quantity` (the shares the close asked to remove, Ruling 21), `linked_decision_id` and the three prices required.
-- Any trading baseline with `incomplete_reason` set: `conid` required; `side`, `quantity` and the three prices null (Ruling 18).
+- `matched_entry_bracket_exit.v1`, complete: `conid`, `side`, `quantity` (the shares the close asked to remove; the trader proves what it really removed, Ruling 21), `linked_decision_id` and the three prices required; `linked_round_trip_id` optional (the trader derives it and refuses a different one).
+- Any trading baseline with `incomplete_reason` set: `conid` required (null only with `ranking_unavailable`, which is `fixed_rule.v1` only); `side`, `quantity` and the three prices null (Ruling 18).
 - `no_trade.v1`: `side`, `quantity`, the three prices, `deployment_digest`, `linked_round_trip_id` and `incomplete_reason` null; `conid` optional.
 
 **Response of both** (always a dict, never an RPC error for a business refusal):
 `{"status": "INSERTED" | "DUPLICATE" | "REFUSED", "record_id": str, "code": Optional[str], "detail": Optional[str], "retryable": bool}`. `INSERTED` and `DUPLICATE` are both success: the outbox marks the item delivered. A `REFUSED` with `retryable: true` is retried; with `false` it is dead-lettered and shown.
 
-**Refusal codes.** Not retryable: `EXPERIMENT_UNKNOWN`, `CALL_OUTSIDE_EXPERIMENT` (before the start only), `DECIDED_OUTSIDE_EXPERIMENT`, `UNKNOWN_BASELINE`, `COHORT_NOT_ALLOWED`, `DECIDED_OUTSIDE_ENTRY_WINDOW`, `DECISION_LINK_WRONG_ACCOUNT`, `DECISION_LINK_OTHER_EXPERIMENT`, `DECISION_LINK_OUTSIDE_EXPERIMENT`, `DECISION_LINK_CONID_MISMATCH`, `DECISION_LINK_NOT_ENTER`, `MATCHED_ENTRY_ALREADY_COVERED`, `MATCHED_ENTRY_SIZE_UNKNOWN`, `CORRECTION_OF_CORRECTION`, `CORRECTION_IDENTITY_MISMATCH`, `CORRECTION_DOWNGRADE`, `CONFLICTING_DUPLICATE`. Retryable: `DECISION_LINK_UNKNOWN`, `CORRECTION_TARGET_UNKNOWN`.
+**Refusal codes.** Not retryable: `EXPERIMENT_UNKNOWN`, `CALL_OUTSIDE_EXPERIMENT` (before the start only), `DECIDED_OUTSIDE_EXPERIMENT`, `UNKNOWN_BASELINE`, `COHORT_NOT_ALLOWED`, `DECIDED_OUTSIDE_ENTRY_WINDOW`, `DECISION_LINK_WRONG_ACCOUNT`, `DECISION_LINK_OTHER_EXPERIMENT`, `DECISION_LINK_OUTSIDE_EXPERIMENT`, `DECISION_LINK_CONID_MISMATCH`, `DECISION_LINK_NOT_ENTER`, `MATCHED_CLOSE_INVALID`, `MATCHED_ENTRY_TRIP_MISMATCH`, `CORRECTION_OF_CORRECTION`, `CORRECTION_IDENTITY_MISMATCH`, `CORRECTION_DOWNGRADE`, `CONFLICTING_DUPLICATE`. Retryable: `DECISION_LINK_UNKNOWN`, `MATCHED_ENTRY_TRIP_UNKNOWN`, `CORRECTION_TARGET_UNKNOWN`.
 
-**Plan 6 constraints.** At most one simulated decision per `(experiment_id, baseline_id, opportunity_id)`. `matched_entry_bracket_exit.v1` is one record **per model CLOSE / PARTIAL_CLOSE**: `opportunity_id` is that close's decision id (stable per close), `linked_round_trip_id` the trip, and the record holds the **entry** for the shares that close removed: `decided_at` is the entry time, `reference_price` the entry fill price, `quantity` the close's requested reduction (`PARTIAL_CLOSE` quantity, or the whole shares open for a `CLOSE`; the trader clips it so a trip's records never exceed the entry quantity, Ruling 21), `linked_decision_id` the real `ENTER` decision of the same experiment. `follow_signal.v1`'s `opportunity_id` should come from the signal's `source_event_id`. `follow_signal.v1` and `fixed_rule.v1` are sent with `quantity: null` and the deployment digest the real `ENTER` would name. A baseline whose evidence is missing is sent with `incomplete_reason`, never dropped. A `decision_id` on a cost is allowed only for a decision the trader has accepted.
+**Plan 6 constraints.** At most one simulated decision per `(experiment_id, baseline_id, opportunity_id)`. `matched_entry_bracket_exit.v1` is one record **per model CLOSE / PARTIAL_CLOSE**: `opportunity_id` is that close's decision id (stable per close), `linked_round_trip_id` the trip, and the record holds the **entry** for the shares that close removed: `decided_at` is the entry time, `reference_price` the entry fill price, `quantity` the close's requested reduction (`PARTIAL_CLOSE` quantity, or the whole shares open for a `CLOSE`; the trader simulates only the shares the close is proven to have removed, clipped per trip to the proven entry fill, Ruling 21), `linked_decision_id` the real `ENTER` decision of the same experiment. `follow_signal.v1`'s `opportunity_id` should come from the signal's `source_event_id`. `follow_signal.v1` and `fixed_rule.v1` are sent with `quantity: null` and the deployment digest the real `ENTER` would name. A baseline whose evidence is missing is sent with `incomplete_reason`, never dropped. A `decision_id` on a cost is allowed only for a decision the trader has accepted.
 
 **RPC `get_ai_model_budget`** (query, `ai_supervisor`). Request: `{}` (strict, no keys). Reply: `{"model_budget_usd_per_day": float, "source": "trader.yaml"}`. The value is `AiPaperConfig.model_budget_usd_per_day`, read once at trader start (Ruling 20). No principal has a command that changes it.
 
@@ -90,7 +93,7 @@ Plan 5 (outbox) and Plan 6 (baselines, acceptance) use these exact names.
 4. **A cost correction after a confirmed cost.** The total changes once; a downgrade and a correction of a correction are refused; the call count does not grow. → Task 2 `test_correction_replaces_the_cost_once`, `test_correction_cannot_lower_the_status`; Task 6 `test_correction_is_counted_once_and_status_labelled`.
 5. **Principal rights through the real signed server.** `cli`, `dashboard` and `ai_research` are denied both commands and the budget query; `ai_supervisor` can call them; a conflicting duplicate comes back as `REFUSED`, not as an internal error; no command changes the cap. → Task 3 `test_only_ai_supervisor_may_ingest`, `test_a_conflict_is_a_refused_reply_not_an_rpc_error`, `test_only_ai_supervisor_reads_the_model_budget_and_nobody_writes_it`.
 6. **A decision of another experiment** on the same account, time and conid is never linked. → Task 2 `test_a_decision_of_another_experiment_is_never_linked`.
-7. **A baseline with missing evidence** is stored with an `INCOMPLETE` outcome and no invented price; a sized baseline gets exactly the quantity a real `ENTER` gets when a risk limit binds; a redelivery keeps the first size. → Task 2 `test_an_incomplete_baseline_is_stored_incomplete_at_once`, `test_sized_baselines_take_the_trader_size_and_keep_it_on_redelivery`, `test_a_sizing_failure_is_an_incomplete_record`, `test_a_linked_follow_baseline_takes_the_real_enter_quantity`, `test_matched_records_never_add_up_to_more_than_the_entry`; Task 3 `test_baseline_size_equals_the_real_entry_size_when_gross_binds`; Plan 6 Task 8 `test_follow_signal_baseline_has_the_real_enter_size_on_a_binding_limit` (SP1's real stack).
+7. **A baseline with missing evidence** is stored with an `INCOMPLETE` outcome and no invented price; a sized baseline gets exactly the quantity a real `ENTER` gets when a risk limit binds; a redelivery keeps the first size. → Task 2 `test_an_incomplete_baseline_is_stored_incomplete_at_once`, `test_sized_baselines_take_the_trader_size_and_keep_it_on_redelivery`, `test_a_sizing_failure_is_an_incomplete_record`, `test_a_linked_follow_baseline_takes_the_real_enter_quantity`, `test_a_sizer_quote_failure_is_incomplete_not_complete`, `test_an_unrankable_fixed_rule_cycle_is_stored_incomplete`, `test_the_trip_comes_from_the_trader_not_the_caller`; Task 3 `test_a_quote_a_real_enter_would_refuse_cannot_size`; Task 5 `test_matched_records_simulate_only_proven_close_shares`, `test_two_records_for_one_entry_never_both_count_the_whole_entry`; Task 3 `test_baseline_size_equals_the_real_entry_size_when_gross_binds`; Plan 6 Task 8 `test_follow_signal_baseline_has_the_real_enter_size_on_a_binding_limit` (SP1's real stack).
 
 ## File map
 
@@ -100,7 +103,7 @@ Plan 5 (outbox) and Plan 6 (baselines, acceptance) use these exact names.
 | `trader/scoreboard/ingest_models.py`, `trader/scoreboard/ingest.py`, `trader/scoreboard/ports.py` | wire models, validation, `AiIngest`, decision facts and baseline sizer ports | 2 |
 | `trader/messaging/ai_ingest_surface.py`, `trader/messaging/principals.py`, `trader/messaging/production_api.py`, `trader/scoreboard/wiring.py`, `trader/trading/command_stack.py`, `trader/automation/ai_baseline_sizing.py`, `trader/automation/ai_paper_config.py`, `config_defaults/trader.yaml` | RPC registration, ACL, wiring, the SP1 sizing adapter, the budget cap key and query | 3 |
 | `trader/scoreboard/simulator.py` | pure bracket simulation | 4 |
-| `trader/scoreboard/bar_sources.py`, `trader/scoreboard/session_simulator.py`, `trader/trading/trading_runtime.py`, `trader/scoreboard/wiring.py` | bar sources, runner, tick step, Alpaca keys | 5 |
+| `trader/scoreboard/bar_sources.py`, `trader/scoreboard/session_simulator.py`, `trader/scoreboard/close_fills.py`, `trader/trading/trading_runtime.py`, `trader/scoreboard/wiring.py` | bar sources, runner (matched-entry proven shares), tick step, Alpaca keys | 5 |
 | `trader/scoreboard/books.py`, `trader/scoreboard/report.py`, `trader/scoreboard/service.py`, `trader/scoreboard/summary_text.py` | books, costs, readback | 6 |
 | `trader/mmr_cli.py`, `web/static/command_center_scoreboard.js` and `.test.js`, docs | CLI and dashboard display | 7 |
 | tests, full suite | acceptance and suite | 8 |
@@ -146,7 +149,7 @@ _SIMULATED = (
         baseline_id VARCHAR NOT NULL, cohort VARCHAR NOT NULL, opportunity_id VARCHAR NOT NULL,
         conid BIGINT, side VARCHAR CHECK (side IS NULL OR side = 'BUY'), quantity BIGINT,
         quantity_source VARCHAR CHECK (quantity_source IS NULL OR quantity_source IN
-            ('client','trader_sizing','linked_entry','clipped_to_entry')),
+            ('client','trader_sizing','linked_entry')),
         sizing_json VARCHAR, reference_price DOUBLE, stop_price DOUBLE, target_price DOUBLE,
         decided_at TIMESTAMPTZ NOT NULL, session_date DATE NOT NULL, linked_decision_id VARCHAR,
         linked_round_trip_id VARCHAR, deployment_digest VARCHAR, incomplete_reason VARCHAR,
@@ -161,7 +164,7 @@ _OUTCOMES = (
         baseline_id VARCHAR NOT NULL, cohort VARCHAR NOT NULL, session_date DATE NOT NULL,
         status VARCHAR NOT NULL CHECK (status IN ('COMPLETE','INCOMPLETE')), reason VARCHAR,
         exit_kind VARCHAR NOT NULL CHECK (exit_kind IN ('STOP','TARGET','FLATTEN','NONE')),
-        exit_at TIMESTAMPTZ, exit_price DOUBLE, pnl_usd DOUBLE, trades INTEGER,
+        exit_at TIMESTAMPTZ, exit_price DOUBLE, pnl_usd DOUBLE, trades INTEGER, quantity BIGINT,
         bar_source VARCHAR NOT NULL, bars_digest VARCHAR, computed_at TIMESTAMPTZ NOT NULL,
         CHECK ((status = 'COMPLETE') = (pnl_usd IS NOT NULL)))""",
     "CREATE INDEX IF NOT EXISTS idx_simulated_outcomes_book "
@@ -365,7 +368,7 @@ Fix the two existing tests: in `test_store.py` replace the raw insert with `db.e
   - `RecordAiCostRequest`, `RecordSimulatedDecisionRequest` (pydantic, fields in Cross-plan additions); `parse_utc(text: str) -> datetime`; `body_digest(payload: Mapping[str, Any]) -> str`.
   - `BASELINES: Mapping[str, str]`; `STATUS_RANK: Mapping[str, int]`.
   - `class AiIngest(store, experiments, decisions, calendar, now, sizer=None)` with `record_cost(req) -> dict` and `record_simulated(req) -> dict` (response shape in Cross-plan additions). `SIZING_MAX_LAG = timedelta(seconds=120)`.
-  - In `ports.py`: `@dataclass(frozen=True) DecisionFact(decision_id: str, account_id: str, experiment_id: Optional[str], conid: Optional[int], action: Optional[str], received_at: dt.datetime, entry_quantity: Optional[int] = None)`; `class DecisionFacts(Protocol): def get(self, decision_id: str) -> Optional[DecisionFact]`; `NullDecisionFacts` (always `None`); `DecisionStoreFacts(decision_store, ledger=None)` adapting `AiPaperDecisionStore.row(decision_id)` (returns `None` when the row is missing or has no `decision_id`) and, for an `ENTER`, reading `entry_quantity` from the command ledger's receipt outcome of `row.command_id` (`None` without a ledger, a receipt or an int `quantity`).
+  - In `ports.py`: `@dataclass(frozen=True) DecisionFact(decision_id: str, account_id: str, experiment_id: Optional[str], conid: Optional[int], action: Optional[str], received_at: dt.datetime, entry_quantity: Optional[int] = None, state: Optional[str] = None)`; `TripFact`, `TripFacts` (`opened_by`, `by_id`), `StoreTripFacts(store)`, `CloseFill(proven, shares)`, `CloseFills`, `NullCloseFills` (Ruling 21); `class DecisionFacts(Protocol): def get(self, decision_id: str) -> Optional[DecisionFact]`; `NullDecisionFacts` (always `None`); `DecisionStoreFacts(decision_store, ledger=None)` adapting `AiPaperDecisionStore.row(decision_id)` (returns `None` when the row is missing or has no `decision_id`) and, for an `ENTER`, reading `entry_quantity` from the command ledger's receipt outcome of `row.command_id` (`None` without a ledger, a receipt or an int `quantity`).
   - In `ports.py`: `@dataclass(frozen=True) SizedBaseline(quantity: int, inputs: Mapping[str, Any])`; `class SizingUnavailable(Exception)` with `.code` and `.inputs`; `class BaselineSizer(Protocol): def size(self, *, account_id: str, deployment_digest: str, conid: int, reference_price: float, stop_price: float) -> SizedBaseline` (raises `SizingUnavailable`).
 
 `ingest_models.py` holds the two strict models (`ConfigDict(extra="forbid", strict=True)`, fields and regexes exactly as in Cross-plan additions), `parse_utc`, and `body_digest`. Every id field gets a `field_validator` that applies its regex; both `called_at` / `decided_at` validators call `parse_utc` (naive → `ValueError`). The load-bearing parts, in full:
@@ -417,8 +420,8 @@ def digest(self) -> str:
 ```python
 # RecordSimulatedDecisionRequest
 _Price = Annotated[float, Field(gt=0, allow_inf_nan=False)]    # quantity: Annotated[int, Field(ge=1, le=10_000_000)]
-IncompleteReason = Literal["quote_unavailable", "feed_not_accepted", "budget_refused", "model_failed",
-                           "sizing_unavailable"]
+IncompleteReason = Literal["quote_unavailable", "feed_not_accepted", "quote_not_executable", "ranking_unavailable",
+                           "budget_refused", "model_failed", "sizing_unavailable"]
 TRADER_SIZED = frozenset({"follow_signal.v1", "fixed_rule.v1"})        # Ruling 19
 # fields: ..., linked_round_trip_id: Optional[str], deployment_digest: Optional[str],
 #         incomplete_reason: Optional[IncompleteReason]
@@ -433,8 +436,11 @@ def _shape_by_baseline(self):
         if any(v is not None for v in extra):
             raise ValueError("a no_trade record carries no side, quantity, prices, deployment or incomplete reason")
         return self
-    if self.conid is None:
-        raise ValueError("a trading baseline always names its conid")
+    unranked = self.incomplete_reason == "ranking_unavailable"
+    if unranked and self.baseline_id != "fixed_rule.v1":
+        raise ValueError("ranking_unavailable belongs to the fixed rule only")
+    if self.conid is None and not unranked:
+        raise ValueError("a trading baseline names its conid (unless nothing could be ranked)")
     if self.incomplete_reason is not None:
         if any(v is not None for v in (self.side, self.quantity, *prices)):
             raise ValueError("an incomplete baseline carries no side, quantity or prices (never invented)")
@@ -470,7 +476,7 @@ from typing import Any, Callable, Optional
 
 from trader.scoreboard.ingest_models import (TRADER_SIZED, RecordAiCostRequest, RecordSimulatedDecisionRequest,
                                              canonical_json, parse_utc)
-from trader.scoreboard.ports import SizingUnavailable, session_date_et
+from trader.scoreboard.ports import SizingUnavailable, StoreTripFacts, session_date_et
 from trader.scoreboard.store import IngestRefused, ScoreboardConflict, ScoreboardStore
 
 logger = logging.getLogger(__name__)
@@ -496,13 +502,14 @@ def _reply(status: str, record_id: str, code: Optional[str] = None, detail: Opti
 
 class AiIngest:
     def __init__(self, *, store: ScoreboardStore, experiments: Any, decisions: Any, calendar: Any,
-                 now: Callable[[], dt.datetime], sizer: Any = None):
+                 now: Callable[[], dt.datetime], sizer: Any = None, trips: Any = None):
         self._store = store
         self._experiments = experiments
         self._decisions = decisions
         self._calendar = calendar
         self._now = now
         self._sizer = sizer          # BaselineSizer; None (no ai_paper stack) sizes nothing: sizing_unavailable
+        self._trips = trips or StoreTripFacts(store)   # round_trips of this journal (Ruling 21)
 
     # -- the two commands ----------------------------------------------------
 
@@ -615,6 +622,8 @@ class AiIngest:
         decision = {**req.model_dump(), "decided_at": decided_at, "session_date": session_date,
                     "quantity_source": None if req.quantity is None else "client", "sizing_json": None,
                     "body_digest": req.digest(), "recorded_at": now}
+        if req.baseline_id == MATCHED_ENTRY and req.incomplete_reason is None:
+            decision["linked_round_trip_id"] = self._verified_trip(req, experiment, linked)
         incomplete_reason = req.incomplete_reason
         if incomplete_reason is None and req.baseline_id in TRADER_SIZED and not self._known(req.record_id):
             if linked is not None and linked.entry_quantity is not None:
@@ -632,7 +641,7 @@ class AiIngest:
         elif incomplete_reason is not None:
             items.append(self._outcome(req, session_date, now, status="INCOMPLETE", reason=incomplete_reason,
                                        pnl_usd=None, trades=None))
-        return self._store.ingest_sealed_many(items, extend=lambda conn: self._opportunity_check(conn, req, linked))
+        return self._store.ingest_sealed_many(items, extend=lambda conn: self._opportunity_check(conn, req))
 
     def _known(self, record_id: str) -> bool:
         return bool(self._store.fetch("simulated_decisions", {"record_id": record_id}))
@@ -649,7 +658,7 @@ class AiIngest:
                                      stop_price=req.stop_price)
         except SizingUnavailable as failure:
             logger.warning("baseline %s not sized: %s", req.record_id, failure.code)
-            return {"sizing_json": canonical_json({"code": failure.code, **failure.inputs})}, SIZING_UNAVAILABLE
+            return {"sizing_json": canonical_json({"code": failure.code, **failure.inputs})}, failure.reason
         except Exception as exc:                  # provider text may carry details: keep the class name only
             logger.error("baseline %s sizer failed: %s", req.record_id, type(exc).__name__)
             return {"sizing_json": canonical_json({"code": f"SIZER_{type(exc).__name__}"})}, SIZING_UNAVAILABLE
@@ -664,35 +673,31 @@ class AiIngest:
             "exit_kind": "NONE", "exit_at": None, "exit_price": None, "pnl_usd": pnl_usd, "trades": trades,
             "bar_source": BAR_SOURCE_NONE, "bars_digest": None, "computed_at": now})
 
+    def _verified_trip(self, req: RecordSimulatedDecisionRequest, experiment: Any, entry: Any) -> str:
+        """Ruling 21: the trip comes from the trader's own facts (the ENTER and the close), never the caller."""
+        close = self._decisions.get(req.opportunity_id)
+        if close is None:
+            raise IngestRefused("DECISION_LINK_UNKNOWN", f"the trader has no close {req.opportunity_id}", retryable=True)
+        trip = self._trips.opened_by(experiment.experiment_id, entry.decision_id)
+        if trip is None:
+            raise IngestRefused("MATCHED_ENTRY_TRIP_UNKNOWN", f"no round trip opened by {entry.decision_id} yet",
+                                retryable=True)
+        if (close.action not in ("CLOSE", "PARTIAL_CLOSE") or close.experiment_id != experiment.experiment_id
+                or close.conid != entry.conid or close.received_at < trip.opened_at):
+            raise IngestRefused("MATCHED_CLOSE_INVALID", f"{req.opportunity_id} is not a close of trip {trip.round_trip_id}")
+        if req.linked_round_trip_id is not None and req.linked_round_trip_id != trip.round_trip_id:
+            raise IngestRefused("MATCHED_ENTRY_TRIP_MISMATCH",
+                                f"{req.linked_decision_id} opened {trip.round_trip_id}, not {req.linked_round_trip_id}")
+        return trip.round_trip_id
+
     @staticmethod
-    def _opportunity_check(conn, req: RecordSimulatedDecisionRequest, linked: Any) -> dict:
+    def _opportunity_check(conn, req: RecordSimulatedDecisionRequest) -> dict:
         clash = conn.execute(
             "SELECT record_id FROM simulated_decisions WHERE experiment_id = ? AND baseline_id = ? "
             "AND opportunity_id = ?", [req.experiment_id, req.baseline_id, req.opportunity_id]).fetchone()
         if clash is not None:
             raise ScoreboardConflict(f"opportunity {req.opportunity_id} is already recorded as {clash[0]}")
-        if req.baseline_id != MATCHED_ENTRY or req.incomplete_reason is not None:
-            return {}
-        return AiIngest._clip_to_entry(conn, req, linked)
-
-    @staticmethod
-    def _clip_to_entry(conn, req: RecordSimulatedDecisionRequest, linked: Any) -> dict:
-        """Ruling 21: a trip's matched records never add up to more than its entry quantity."""
-        if linked is None or linked.entry_quantity is None:
-            raise IngestRefused("MATCHED_ENTRY_SIZE_UNKNOWN", f"no entry quantity for {req.linked_decision_id}")
-        (counted,) = conn.execute(
-            "SELECT COALESCE(SUM(quantity), 0) FROM simulated_decisions WHERE experiment_id = ? AND baseline_id = ? "
-            "AND linked_round_trip_id IS NOT DISTINCT FROM ? AND linked_decision_id = ?",
-            [req.experiment_id, MATCHED_ENTRY, req.linked_round_trip_id, req.linked_decision_id]).fetchone()
-        remaining = linked.entry_quantity - int(counted)
-        if remaining < 1:
-            raise IngestRefused("MATCHED_ENTRY_ALREADY_COVERED",
-                                f"the {linked.entry_quantity} entry shares of {req.linked_decision_id} are counted")
-        if req.quantity <= remaining:
-            return {}
-        return {"quantity": remaining, "quantity_source": "clipped_to_entry",
-                "sizing_json": canonical_json({"code": "CLIPPED_TO_ENTRY", "requested": req.quantity,
-                                               "remaining": remaining})}
+        return {}
 ```
 
 `ingest_models` is a leaf; `ingest.py` imports `session_date_et` from ports (exists).
@@ -707,7 +712,7 @@ from tests.scoreboard.common import ACCOUNT, EXP_ID, NOW
 from trader.automation.calendar_policy import XNYSCalendarPolicy
 from trader.scoreboard.ingest import AiIngest
 from trader.scoreboard.ingest_models import RecordAiCostRequest, RecordSimulatedDecisionRequest
-from trader.scoreboard.ports import DecisionFact, SizedBaseline, SizingUnavailable
+from trader.scoreboard.ports import DecisionFact, SizedBaseline, SizingUnavailable, TripFact
 
 UTC = dt.timezone.utc
 STARTED = dt.datetime(2026, 10, 5, 13, 30, tzinfo=UTC)
@@ -719,13 +724,13 @@ DEPLOYMENT = "sha256:" + "d" * 64
 class FakeSizer:
     """Stands in for SP1 sizing: a fixed size, or a SizingUnavailable code."""
 
-    def __init__(self, quantity=10, refuse=None):
-        self.quantity, self.refuse, self.calls = quantity, refuse, []
+    def __init__(self, quantity=10, refuse=None, reason="sizing_unavailable"):
+        self.quantity, self.refuse, self.reason, self.calls = quantity, refuse, reason, []
 
     def size(self, **kwargs):
         self.calls.append(kwargs)
         if self.refuse:
-            raise SizingUnavailable(self.refuse, {"binding": "none"})
+            raise SizingUnavailable(self.refuse, {"binding": "none"}, reason=self.reason)
         return SizedBaseline(self.quantity, {"binding": "gross_fraction", "max_quantity": self.quantity})
 
 
@@ -753,9 +758,31 @@ def enter_fact(decision_id="dec-00000001", conid=265598, **changes):
     return DecisionFact(**values)
 
 
-def make_ingest(store, *, experiments=None, decisions=None, sizer=None, now=INGESTED_AT):
+class FakeTrips:
+    """round_trips as the trader sees them: entry decision id -> TripFact."""
+
+    def __init__(self, **by_entry):
+        self.by_entry = {"dec-00000001": TripFact("rt-1", 265598, STARTED + dt.timedelta(days=1), 10.0), **by_entry}
+
+    def opened_by(self, experiment_id, entry_decision_id):
+        return self.by_entry.get(entry_decision_id) if experiment_id == EXP_ID else None
+
+    def by_id(self, experiment_id, round_trip_id):
+        found = [t for t in self.by_entry.values() if t is not None and t.round_trip_id == round_trip_id]
+        return found[0] if experiment_id == EXP_ID and found else None
+
+
+def close_fact(decision_id="dec-00000031", action="PARTIAL_CLOSE", **changes):
+    values = dict(decision_id=decision_id, account_id=ACCOUNT, experiment_id=EXP_ID, conid=265598, action=action,
+                  received_at=STARTED + dt.timedelta(days=1, hours=1))
+    values.update(changes)
+    return DecisionFact(**values)
+
+
+def make_ingest(store, *, experiments=None, decisions=None, sizer=None, now=INGESTED_AT, trips=None):
     return AiIngest(store=store, experiments=experiments or FakeExperiments(), decisions=decisions or FakeDecisions(),
-                    calendar=XNYSCalendarPolicy(), now=lambda: now, sizer=sizer or FakeSizer())
+                    calendar=XNYSCalendarPolicy(), now=lambda: now, sizer=sizer or FakeSizer(),
+                    trips=trips or FakeTrips())
 
 
 def cost_body(**changes):
@@ -974,41 +1001,64 @@ def test_a_linked_enter_that_was_never_placed_is_sized_like_an_unlinked_one(stor
     assert store.fetch("simulated_decisions", {})[0]["quantity_source"] == "trader_sizing"
 
 
-def test_the_matched_entry_keeps_its_close_quantity_and_is_not_sized(store):
+def matched_world(store, *closes, trips=None):
+    return make_ingest(store, decisions=FakeDecisions(enter_fact(), *(closes or (close_fact(),))), trips=trips)
+
+
+def test_the_matched_entry_stores_its_requested_quantity_and_is_not_sized(store):
     sizer = FakeSizer(quantity=99)
-    ingest = make_ingest(store, decisions=FakeDecisions(enter_fact()), sizer=sizer)
+    ingest = make_ingest(store, decisions=FakeDecisions(enter_fact(), close_fact()), sizer=sizer)
     assert sim(ingest, matched_body())["status"] == "INSERTED"
     row = store.fetch("simulated_decisions", {})[0]
-    assert (row["quantity"], row["quantity_source"], sizer.calls) == (4, "client", [])
+    assert (row["quantity"], row["quantity_source"], row["linked_round_trip_id"], sizer.calls) == (
+        4, "client", "rt-1", [])
 
 
-def test_two_partial_closes_of_one_trip_are_two_records_that_sum_to_the_entry(store):
-    ingest = make_ingest(store, decisions=FakeDecisions(enter_fact()))                  # entry_quantity 10
+def test_two_partial_closes_of_one_trip_are_two_records(store):
+    ingest = matched_world(store, close_fact(), close_fact("dec-00000032", action="CLOSE"))
     assert sim(ingest, matched_body())["status"] == "INSERTED"                           # PARTIAL_CLOSE 4
     assert sim(ingest, matched_body(record_id="sim-0000021", opportunity_id="dec-00000032",
                                     quantity=6))["status"] == "INSERTED"                 # CLOSE of the other 6
     rows = store.fetch("simulated_decisions", {"baseline_id": "matched_entry_bracket_exit.v1"})
-    assert {(r["opportunity_id"], r["quantity"], r["linked_decision_id"], r["linked_round_trip_id"]) for r in rows} == {
-        ("dec-00000031", 4, "dec-00000001", "rt-1"), ("dec-00000032", 6, "dec-00000001", "rt-1")}
-    assert sum(r["quantity"] for r in rows) == 10                                        # the entry, counted once
+    assert {(r["opportunity_id"], r["quantity"], r["linked_round_trip_id"]) for r in rows} == {
+        ("dec-00000031", 4, "rt-1"), ("dec-00000032", 6, "rt-1")}
 
 
-def test_matched_records_never_add_up_to_more_than_the_entry(store):
-    ingest = make_ingest(store, decisions=FakeDecisions(enter_fact()))                  # entry_quantity 10
-    sim(ingest, matched_body(quantity=7))
-    clipped = sim(ingest, matched_body(record_id="sim-0000021", opportunity_id="dec-00000032", quantity=7))
-    assert clipped["status"] == "INSERTED"                                               # a refused close re-asked
-    row = store.fetch("simulated_decisions", {"record_id": "sim-0000021"})[0]
-    assert (row["quantity"], row["quantity_source"]) == (3, "clipped_to_entry")
-    reply = sim(ingest, matched_body(record_id="sim-0000022", opportunity_id="dec-00000033", quantity=1))
-    assert (reply["status"], reply["code"], reply["retryable"]) == ("REFUSED", "MATCHED_ENTRY_ALREADY_COVERED", False)
-    unknown = make_ingest(store, decisions=FakeDecisions(enter_fact("dec-00000009", entry_quantity=None)))
-    reply = sim(unknown, matched_body(record_id="sim-0000023", opportunity_id="dec-00000034",
-                                      linked_decision_id="dec-00000009", linked_round_trip_id="rt-9"))
-    assert reply["code"] == "MATCHED_ENTRY_SIZE_UNKNOWN"
+def test_the_trip_comes_from_the_trader_not_the_caller(store):                   # second PR #75 review
+    ingest = matched_world(store, close_fact(), close_fact("dec-00000032", action="CLOSE"))
+    changed = sim(ingest, matched_body(linked_round_trip_id="rt-other"))
+    assert (changed["status"], changed["code"], changed["retryable"]) == ("REFUSED", "MATCHED_ENTRY_TRIP_MISMATCH", False)
+    assert sim(ingest, matched_body(linked_round_trip_id=None))["status"] == "INSERTED"
+    assert store.fetch("simulated_decisions", {})[0]["linked_round_trip_id"] == "rt-1"     # derived, not supplied
 
 
-@pytest.mark.parametrize("reason", ["quote_unavailable", "feed_not_accepted", "budget_refused", "model_failed"])
+@pytest.mark.parametrize("close,code,retryable", [
+    (None, "DECISION_LINK_UNKNOWN", True),
+    (close_fact(action="ENTER"), "MATCHED_CLOSE_INVALID", False),
+    (close_fact(experiment_id="exp-ffffffffffffffffffff"), "MATCHED_CLOSE_INVALID", False),
+    (close_fact(conid=4815747), "MATCHED_CLOSE_INVALID", False),
+    (close_fact(received_at=STARTED), "MATCHED_CLOSE_INVALID", False),            # before the trip opened
+])
+def test_the_close_must_be_a_close_of_that_trip(store, close, code, retryable):
+    facts = FakeDecisions(enter_fact(), *([close] if close is not None else []))
+    reply = sim(make_ingest(store, decisions=facts), matched_body())
+    assert (reply["code"], reply["retryable"]) == (code, retryable)
+
+
+def test_a_trip_the_scoreboard_has_not_built_yet_is_retried(store):
+    reply = sim(matched_world(store, trips=FakeTrips(**{"dec-00000001": None})), matched_body())
+    assert (reply["code"], reply["retryable"]) == ("MATCHED_ENTRY_TRIP_UNKNOWN", True)
+
+
+def test_a_sizer_quote_failure_is_incomplete_not_complete(store):               # second PR #75 review
+    ingest = make_ingest(store, sizer=FakeSizer(refuse="QUOTE_STALE", reason="quote_not_executable"))
+    sim(ingest)
+    outcome = store.fetch("simulated_outcomes", {})[0]
+    assert (outcome["status"], outcome["reason"]) == ("INCOMPLETE", "quote_not_executable")
+
+
+@pytest.mark.parametrize("reason", ["quote_unavailable", "feed_not_accepted", "quote_not_executable", "budget_refused",
+                                    "model_failed"])
 def test_an_incomplete_baseline_is_stored_incomplete_at_once(ingest, store, reason):
     sizer_calls_before = len(ingest._sizer.calls)
     assert sim(ingest, incomplete_body(reason))["status"] == "INSERTED"
@@ -1024,7 +1074,7 @@ def test_an_incomplete_baseline_is_stored_incomplete_at_once(ingest, store, reas
 @pytest.mark.parametrize("body", [
     incomplete_body(reference_price=100.0),                     # an incomplete record never carries a price
     incomplete_body(side="BUY"),
-    incomplete_body(conid=None),                                # the instrument is always known
+    incomplete_body(conid=None),                                # the instrument is known unless nothing ranked
     no_trade_body(incomplete_reason="quote_unavailable"),       # no_trade is always complete
     sim_body(quantity=10),                                      # the trader sizes follow_signal
     sim_body(baseline_id="fixed_rule.v1", cohort="self_found", deployment_digest=None),
@@ -1032,6 +1082,7 @@ def test_an_incomplete_baseline_is_stored_incomplete_at_once(ingest, store, reas
     matched_body(linked_decision_id=None),                      # ... and its ENTER decision
     sim_body(linked_round_trip_id="rt-1"),                      # trip linkage is matched-entry only
     sim_body(incomplete_reason="stale_vibes"),
+    incomplete_body("ranking_unavailable", conid=None),         # ranking_unavailable is fixed_rule only
 ])
 def test_shapes_by_baseline_are_enforced_by_the_wire_model(body):
     with pytest.raises(pydantic.ValidationError):
@@ -1071,6 +1122,14 @@ def test_linked_decision_must_be_an_enter_on_the_same_conid(store):
                      linked_decision_id="dec-00000002")) == ("REFUSED", "DECISION_LINK_NOT_ENTER")
     assert codes(sim(ingest, record_id="sim-0000003", opportunity_id="sig-3", conid=4815747,
                      linked_decision_id="dec-00000001")) == ("REFUSED", "DECISION_LINK_CONID_MISMATCH")
+
+
+def test_an_unrankable_fixed_rule_cycle_is_stored_incomplete(ingest, store):   # second PR #75 review
+    body = incomplete_body("ranking_unavailable", record_id="sim-0000040", baseline_id="fixed_rule.v1",
+                           cohort="self_found", opportunity_id="cyc-entry-20261006-1030", conid=None)
+    assert sim(ingest, body)["status"] == "INSERTED"
+    outcome = store.fetch("simulated_outcomes", {})[0]
+    assert (outcome["status"], outcome["reason"]) == ("INCOMPLETE", "ranking_unavailable")
 
 
 def test_a_decision_of_another_experiment_is_never_linked(store):          # review focus 6
@@ -1129,6 +1188,7 @@ class DecisionFact:
     action: Optional[str]
     received_at: dt.datetime
     entry_quantity: Optional[int] = None       # the size SP1 gave a placed ENTER (its SUBMITTED receipt)
+    state: Optional[str] = None                # the decision row state (CloseFills needs a final close)
 
 
 class DecisionFacts(Protocol):
@@ -1154,7 +1214,7 @@ class DecisionStoreFacts:
             return None
         # Plan 3 adds experiment_id to migration 56; before it lands every link is "another experiment".
         return DecisionFact(row.decision_id, row.account_id, getattr(row, "experiment_id", None), row.conid,
-                            row.action, row.received_at, self._entry_quantity(row))
+                            row.action, row.received_at, self._entry_quantity(row), row.state)
 
     def _entry_quantity(self, row: Any) -> Optional[int]:
         if row.action != "ENTER" or self._ledger is None:
@@ -1171,17 +1231,70 @@ class SizedBaseline:
 
 
 class SizingUnavailable(Exception):
-    """The trader cannot size this baseline as it would size a real ENTER (Ruling 19)."""
+    """The trader cannot size this baseline as it would size a real ENTER (Ruling 19). ``reason`` is the
+    outcome's incomplete reason: sizing_unavailable, or quote_unavailable / quote_not_executable."""
 
-    def __init__(self, code: str, inputs: Mapping[str, Any]):
+    def __init__(self, code: str, inputs: Mapping[str, Any], *, reason: str = "sizing_unavailable"):
         super().__init__(code)
-        self.code, self.inputs = code, dict(inputs)
+        self.code, self.inputs, self.reason = code, dict(inputs), reason
 
 
 class BaselineSizer(Protocol):
     def size(self, *, account_id: str, deployment_digest: str, conid: int, reference_price: float,
              stop_price: float) -> SizedBaseline: ...
+
+
+@dataclass(frozen=True)
+class TripFact:
+    round_trip_id: str
+    conid: int
+    opened_at: dt.datetime
+    entry_qty: float                   # the broker-proven entry fill (round_trips.entry_qty)
+
+
+class TripFacts(Protocol):
+    def opened_by(self, experiment_id: str, entry_decision_id: str) -> Optional[TripFact]: ...
+
+    def by_id(self, experiment_id: str, round_trip_id: str) -> Optional[TripFact]: ...
+
+
+class StoreTripFacts:
+    """Ruling 21: the trip an ENTER opened, from this journal's round_trips; one row or None."""
+
+    def __init__(self, store: Any):
+        self._store = store
+
+    def opened_by(self, experiment_id: str, entry_decision_id: str) -> Optional[TripFact]:
+        rows = self._store.fetch("round_trips", {"experiment_id": experiment_id, "decision_id": entry_decision_id})
+        if len(rows) != 1:
+            return None
+        return self._fact(rows[0])
+
+    def by_id(self, experiment_id: str, round_trip_id: str) -> Optional[TripFact]:
+        rows = self._store.fetch("round_trips", {"experiment_id": experiment_id, "round_trip_id": round_trip_id})
+        return self._fact(rows[0]) if len(rows) == 1 else None
+
+    @staticmethod
+    def _fact(row: Mapping[str, Any]) -> TripFact:
+        return TripFact(row["round_trip_id"], int(row["conid"]), row["opened_at"], float(row["entry_qty"]))
+
+
+@dataclass(frozen=True)
+class CloseFill:
+    proven: bool
+    shares: Optional[int]              # broker-proven shares the close removed; None when not proven
+
+
+class CloseFills(Protocol):
+    def removed(self, round_trip_id: str, close_decision_id: str) -> CloseFill: ...
+
+
+class NullCloseFills:
+    def removed(self, round_trip_id: str, close_decision_id: str) -> CloseFill:
+        return CloseFill(False, None)
 ```
+
+`JournalCloseFills(store, attribution, decisions)` implements `CloseFills` (in `trader/scoreboard/close_fills.py`, Task 5): it reads the trip's `exec_ids` and their executions through the same execution source `SessionLedger` builds round trips from, resolves each SELL execution's order ref with `attribution.links_for_order_ref` (SP1 resolves a liquidation child ref to its `close_root_id`, so a close decision's own orders map to it), and sums the shares attributed to `close_decision_id`. It returns `CloseFill(True, n)` when the close decision is final (`RESOLVED` or `REJECTED`; a `REJECTED` close with no execution is `CloseFill(True, 0)`) and every SELL execution of the trip is attributed; otherwise `CloseFill(False, None)` (the close is not final, its outcome is unknown, or an execution cannot be attributed). `NullCloseFills` (no ai_paper stack) always returns `CloseFill(False, None)`.
 
 and in `tests/scoreboard/test_ports.py` (plus `test_a_placed_enter_reports_its_sized_quantity`: a fake ledger whose `get("aip-dec-00000001")` has `outcome={"quantity": 7}` gives `entry_quantity == 7`; a CLOSE row, a missing receipt or `quantity: True` give `None`):
 
@@ -1264,10 +1377,13 @@ from typing import Any, Callable, Optional
 
 from trader.automation.ai_paper_evidence import AI_ENTRY_POLICY, planned_entry_limit
 from trader.automation.ai_paper_sizing import max_entry_quantity, pending_entry_refusal, sizing_inputs
-from trader.automation.liquidity_policy import LiquidityPolicy
-from trader.automation.production_evidence import liquidity_from_history
+from trader.automation.liquidity_policy import MAX_SPREAD_BPS, LiquidityPolicy
+from trader.automation.production_evidence import liquidity_from_history, validate_entry_quote
 from trader.research.market_context import LIVE_NOTIONAL_TOLERANCE
 from trader.scoreboard.ports import SizedBaseline, SizingUnavailable
+from trader.trading.approval_context import ApprovalContextError
+
+QUOTE_UNAVAILABLE, QUOTE_NOT_EXECUTABLE = "quote_unavailable", "quote_not_executable"
 
 
 class AiPaperBaselineSizer:
@@ -1289,11 +1405,7 @@ class AiPaperBaselineSizer:
         refusal = pending_entry_refusal(snapshot, conid, limits)
         if refusal:
             raise SizingUnavailable(refusal, {})
-        quote = self._step("QUOTE_UNAVAILABLE", lambda: self._quotes.executable_quote(conid, side="BUY"))
-        if quote is None:
-            raise SizingUnavailable("QUOTE_UNAVAILABLE", {})
-        if quote.feed_type not in self._feeds:
-            raise SizingUnavailable("QUOTE_FEED_NOT_ACCEPTED", {"feed": quote.feed_type, "accepted": sorted(self._feeds)})
+        quote = self._quote(conid)
         # The same price prepare_entry sizes on: the marketable limit through the fresh ask.
         price = planned_entry_limit(float(quote.ask), float(quote.bid), AI_ENTRY_POLICY.limit_offset_bps)
         if not stop_price < price:
@@ -1313,6 +1425,24 @@ class AiPaperBaselineSizer:
             raise SizingUnavailable("QUANTITY_BELOW_ONE_SHARE", record)
         return SizedBaseline(quantity, record)
 
+    def _quote(self, conid: int) -> Any:
+        """Exactly the real ENTER's quote checks (second PR #75 review): never size on a quote it would refuse."""
+        try:
+            quote = self._quotes.executable_quote(conid, side="BUY")
+        except Exception as exc:
+            raise SizingUnavailable("QUOTE_UNAVAILABLE", {"error": type(exc).__name__}, reason=QUOTE_UNAVAILABLE) from None
+        if quote is None:
+            raise SizingUnavailable("QUOTE_UNAVAILABLE", {}, reason=QUOTE_UNAVAILABLE)
+        try:
+            validate_entry_quote(quote, conid=conid, side="BUY", now=self._now(), accepted_feeds=self._feeds)
+        except ApprovalContextError as refused:
+            raise SizingUnavailable(refused.code, {"feed": quote.feed_type, "session": quote.session_state},
+                                    reason=QUOTE_NOT_EXECUTABLE) from None
+        spread_bps = (float(quote.ask) - float(quote.bid)) / float(quote.price) * 10_000.0
+        if spread_bps > MAX_SPREAD_BPS:
+            raise SizingUnavailable("SPREAD_BPS", {"spread_bps": spread_bps}, reason=QUOTE_NOT_EXECUTABLE)
+        return quote
+
     def _notional_cap(self, digest: str, conid: int) -> float:
         deployment = self._step("DEPLOYMENT_UNAVAILABLE", lambda: self._deployments.get_sealed(digest))
         if deployment.decider_verdict != "DEPLOY":
@@ -1330,6 +1460,8 @@ class AiPaperBaselineSizer:
         except Exception as exc:           # a refusal code or the class name, never provider text
             raise SizingUnavailable(getattr(exc, "code", None) or code, {"error": type(exc).__name__}) from None
 ```
+
+`validate_entry_quote(quote, *, conid, side, now, accepted_feeds)` is the quote half of `validate_approval` (`trader/automation/production_evidence.py`, with PR #76's `accepted_feeds`) moved into its own function with the same codes (`QUOTE_MISMATCH`, `QUOTE_CLOCK_INVALID`, `QUOTE_STALE`, `QUOTE_INVALID`, `FEED_NOT_LIVE`, `QUOTE_SESSION_INVALID`); `validate_approval` calls it, so a real ENTER and a baseline apply the same checks. The existing `validate_approval` tests stay green unchanged.
 
 `get_sealed` on a discretionary digest raises `DeploymentRefused("DEPLOYMENT_KIND_MISMATCH")` (Plan 3 Ruling 1), which `_step` turns into `SizingUnavailable("DEPLOYMENT_KIND_MISMATCH")`. Plan 3 replaces `_notional_cap` for discretionary deployments.
 
@@ -1490,7 +1622,28 @@ def test_a_deployment_a_real_enter_could_not_use_cannot_size(parts, change, code
     assert exc.value.code == code
 ```
 
-**Also write these tests** (each asserts what its name says): `test_no_quote_or_a_feed_outside_the_accepted_set_cannot_size` (`Quotes(None)` → `QUOTE_UNAVAILABLE`; a `quote(feed_type="iex_realtime")` with `LIVE_ONLY_FEEDS` → `QUOTE_FEED_NOT_ACCEPTED`; the same quote with `PAPER_IEX_FEEDS` sizes), `test_full_pending_slots_cannot_size` (`MAX_PENDING_ENTRIES`), `test_limits_leaving_less_than_one_share_cannot_size` (`QUANTITY_BELOW_ONE_SHARE` with the inputs recorded), `test_no_effective_limits_cannot_size` (`effective_limits` raising `PolicyRefused("NO_EFFECTIVE_LIMITS")`), `test_the_sizer_writes_nothing` (journal row count and high-water mark unchanged, no `capture_approval_context` call).
+```python
+@pytest.mark.parametrize("bad,code", [
+    (dict(market_timestamp=NOW - dt.timedelta(seconds=60)), "QUOTE_STALE"),     # an allowed live feed, but stale
+    (dict(session_state="halted"), "QUOTE_SESSION_INVALID"),
+    (dict(session_state="closed"), "QUOTE_SESSION_INVALID"),
+    (dict(bid=100.5, ask=100.0), "QUOTE_INVALID"),                               # not crossable
+    (dict(bid=99.0, ask=100.0, price=100.0), "SPREAD_BPS"),                       # 100 bps > MAX_SPREAD_BPS
+    (dict(feed_type="iex_realtime"), "FEED_NOT_LIVE"),                           # not in LIVE_ONLY_FEEDS
+])
+def test_a_quote_a_real_enter_would_refuse_cannot_size(parts, bad, code):        # second PR #75 review
+    parts["quotes"] = Quotes(dataclasses.replace(quote(), **bad))
+    with pytest.raises(SizingUnavailable) as exc:
+        sizer(parts).size(account_id=ACCOUNT, deployment_digest=DIGEST, conid=CONID,
+                          reference_price=100.0, stop_price=98.0)
+    assert (exc.value.code, exc.value.reason) == (code, "quote_not_executable")
+    with pytest.raises(ApprovalContextError):                                    # SP1 refuses the same evidence
+        prepare(parts) if code != "SPREAD_BPS" else _spread_refused(parts)
+```
+
+(`_spread_refused(parts)` asserts SP1's `LiquidityPolicy().evaluate(...)` returns `SPREAD_BPS` for the same quote and raises `ApprovalContextError("SPREAD_BPS", ...)` so the `with` block reads alike; imports `dataclasses`, `datetime as dt`, `quote`, `Quotes`, `ApprovalContextError`.)
+
+**Also write these tests** (each asserts what its name says): `test_no_quote_cannot_size` (`Quotes(None)` → `QUOTE_UNAVAILABLE`, reason `quote_unavailable`), `test_an_iex_quote_sizes_only_with_the_paper_fallback_set` (a `quote(feed_type="iex_realtime")` with `PAPER_IEX_FEEDS` sizes), `test_full_pending_slots_cannot_size` (`MAX_PENDING_ENTRIES`), `test_limits_leaving_less_than_one_share_cannot_size` (`QUANTITY_BELOW_ONE_SHARE` with the inputs recorded), `test_no_effective_limits_cannot_size` (`effective_limits` raising `PolicyRefused("NO_EFFECTIVE_LIMITS")`), `test_the_sizer_writes_nothing` (journal row count and high-water mark unchanged, no `capture_approval_context` call).
 
 `ServedStack.client(caller, server="trader", role="query", ...)` takes the socket role as the keyword `role`. Replace `test_ai_principals_have_no_write_path_to_scoreboard_tables` in `test_surface.py` with the same test for `ai_research` only (`for principal in ("ai_research",)`); the exact `ai_supervisor` set is asserted in `test_ingestion_rights_are_exact_and_the_ai_has_no_other_scoreboard_write`.
 
@@ -1736,7 +1889,7 @@ def test_the_result_does_not_depend_on_input_order():
 ### Task 5: Bar sources, the session runner and the Alpaca keys
 
 **Files:**
-- Create: `trader/scoreboard/bar_sources.py`, `trader/scoreboard/session_simulator.py`
+- Create: `trader/scoreboard/bar_sources.py`, `trader/scoreboard/session_simulator.py`, `trader/scoreboard/close_fills.py` (`JournalCloseFills`, Ruling 21)
 - Modify: `trader/scoreboard/wiring.py`, `trader/trading/trading_runtime.py`, `tests/scoreboard/test_wiring.py`, `tests/test_trading_runtime.py`
 - Test: `tests/scoreboard/test_bar_sources.py`, `tests/scoreboard/test_session_simulator.py`
 
@@ -1860,6 +2013,7 @@ from zoneinfo import ZoneInfo
 
 from trader.scoreboard.bar_sources import BarSource, BarSourceError
 from trader.scoreboard.simulator import FLATTEN_BAR_WINDOW, MINUTE, SimInput, SimResult, simulate_long_bracket
+from trader.scoreboard.ports import NullCloseFills, StoreTripFacts
 from trader.scoreboard.store import ScoreboardConflict, ScoreboardStore
 
 logger = logging.getLogger(__name__)
@@ -1869,16 +2023,22 @@ GRACE = dt.timedelta(hours=2)
 RETRY_AFTER = dt.timedelta(minutes=5)
 PENDING_SQL = (
     "SELECT d.record_id, d.experiment_id, d.baseline_id, d.cohort, d.session_date, d.conid, d.quantity, "
-    "d.reference_price, d.stop_price, d.target_price, d.decided_at FROM simulated_decisions d "
+    "d.reference_price, d.stop_price, d.target_price, d.decided_at, d.opportunity_id, d.linked_round_trip_id, "
+    "d.recorded_at FROM simulated_decisions d "
     "LEFT JOIN simulated_outcomes o ON o.record_id = d.record_id WHERE o.record_id IS NULL "
-    "ORDER BY d.session_date, d.decided_at, d.record_id")
+    "ORDER BY d.session_date, d.decided_at, d.recorded_at, d.record_id")
+MATCHED_ENTRY = "matched_entry_bracket_exit.v1"
+NO_SHARES = SimResult("COMPLETE", "CLOSE_REMOVED_NO_SHARES", "NONE", None, None, 0.0, 0, None)
+UNPROVEN = SimResult("INCOMPLETE", "close_fill_unproven", "NONE", None, None, None, None, None)
 
 
 class SessionSimulator:
     def __init__(self, *, store: ScoreboardStore, calendar: Any, sources: Sequence[BarSource],
                  now: Callable[[], dt.datetime], grace: dt.timedelta = GRACE,
-                 retry_after: dt.timedelta = RETRY_AFTER):
+                 retry_after: dt.timedelta = RETRY_AFTER, close_fills: Any = None, trips: Any = None):
         self._store, self._calendar, self._sources, self._now = store, calendar, list(sources), now
+        self._close_fills = close_fills or NullCloseFills()     # Ruling 21: proven shares per model close
+        self._trips = trips or StoreTripFacts(store)
         self._grace, self._retry_after = grace, retry_after
         self._last_try: dict[str, dt.datetime] = {}
 
@@ -1892,7 +2052,8 @@ class SessionSimulator:
         cache: dict[tuple[str, int, dt.date], list] = {}
         for record in self._store.db.execute(PENDING_SQL, fetch="all"):
             row = dict(zip(("record_id", "experiment_id", "baseline_id", "cohort", "session_date", "conid",
-                            "quantity", "reference_price", "stop_price", "target_price", "decided_at"), record))
+                            "quantity", "reference_price", "stop_price", "target_price", "decided_at",
+                            "opportunity_id", "linked_round_trip_id", "recorded_at"), record))
             ready = self.data_ready_at(row["session_date"])
             if now < ready:
                 continue
@@ -1900,11 +2061,43 @@ class SessionSimulator:
             if tried is not None and now - tried < self._retry_after:
                 continue
             self._last_try[row["record_id"]] = now
+            if row["baseline_id"] == MATCHED_ENTRY:
+                verdict = self._matched_quantity(row)
+                if verdict is None:            # an earlier close of the trip is still open: keep the order
+                    continue
+                if isinstance(verdict, SimResult):
+                    if verdict is UNPROVEN and now < ready + self._grace:
+                        continue               # the close's fills may still be attributed
+                    written += self._write(row, verdict, "none", now)
+                    continue
+                row["quantity"] = verdict
             result, source = self._simulate(row, cache)
             if result.status == "INCOMPLETE" and now < ready + self._grace:
                 continue                       # data may still arrive; the next attempt is allowed
             written += self._write(row, result, source, now)
         return written
+
+    def _matched_quantity(self, row: dict) -> Any:
+        """Ruling 21: min(requested, shares the close is proven to have removed), clipped per trip to the proven
+        entry fill. Returns the quantity, a final SimResult (UNPROVEN or NO_SHARES), or None to wait."""
+        trip_id = row["linked_round_trip_id"]
+        earlier = self._store.db.execute(
+            "SELECT d.record_id, o.status, o.quantity FROM simulated_decisions d LEFT JOIN simulated_outcomes o "
+            "ON o.record_id = d.record_id WHERE d.experiment_id = ? AND d.baseline_id = ? "
+            "AND d.linked_round_trip_id = ? AND (d.recorded_at < ? OR (d.recorded_at = ? AND d.record_id < ?))",
+            [row["experiment_id"], MATCHED_ENTRY, trip_id, row["recorded_at"], row["recorded_at"], row["record_id"]],
+            fetch="all")
+        if any(status is None for _, status, _ in earlier):
+            return None
+        trip = self._trips.by_id(row["experiment_id"], trip_id)
+        fill = self._close_fills.removed(trip_id, row["opportunity_id"])
+        if trip is None or not fill.proven:
+            return UNPROVEN
+        if fill.shares == 0:
+            return NO_SHARES
+        counted = sum(int(quantity or 0) for _, status, quantity in earlier if status == "COMPLETE")
+        quantity = min(int(row["quantity"]), int(fill.shares), int(trip.entry_qty) - counted)
+        return quantity if quantity >= 1 else UNPROVEN    # proven shares but nothing left: contradictory facts
 
     def _simulate(self, row: dict, cache: dict) -> tuple[SimResult, str]:
         schedule = self._calendar.resolve(dt.datetime.combine(row["session_date"], dt.time(12), tzinfo=ET))
@@ -1939,6 +2132,7 @@ class SessionSimulator:
             "cohort": row["cohort"], "session_date": row["session_date"], "status": result.status,
             "reason": result.reason, "exit_kind": result.exit_kind, "exit_at": result.exit_at,
             "exit_price": result.exit_price, "pnl_usd": result.pnl_usd, "trades": result.trades,
+            "quantity": int(row["quantity"]) if result.status == "COMPLETE" and result.trades else None,
             "bar_source": source, "bars_digest": result.bars_digest, "computed_at": now}
         try:
             self._store.insert_sealed("simulated_outcomes", outcome)
@@ -1950,7 +2144,7 @@ class SessionSimulator:
         return 1
 ```
 
-`wiring.py`: `build_scoreboard(..., bar_sources: Optional[Sequence[Any]] = None)`; builds `SessionSimulator(store=store, calendar=calendar, sources=default_bar_sources(trader) if bar_sources is None else bar_sources, now=now)`; `ScoreboardServices` gets `simulator: Any = None` and `tick()` calls `self._step("simulation", self.simulator.run_due)` when set. (`command_stack._build_scoreboard` needs no change: the default builds the sources from the trader.)
+`TripFacts` gains `by_id(experiment_id, round_trip_id) -> Optional[TripFact]` (same `round_trips` read). `wiring.py`: `build_scoreboard(..., bar_sources: Optional[Sequence[Any]] = None)`; builds `SessionSimulator(store=store, calendar=calendar, sources=default_bar_sources(trader) if bar_sources is None else bar_sources, now=now, close_fills=NullCloseFills() if decision_store is None else JournalCloseFills(store, links, decision_facts))` (`links` is the `DecisionStoreAttribution` the ledger already uses); `ScoreboardServices` gets `simulator: Any = None` and `tick()` calls `self._step("simulation", self.simulator.run_due)` when set. (`command_stack._build_scoreboard` needs no change: the default builds the sources from the trader.)
 
 `trading_runtime.py` `Trader.__init__`: add parameters `alpaca_api_key_id: str = ''`, `alpaca_api_secret_key: str = ''` after `automation_strategy_name` and set `self.alpaca_api_key_id = alpaca_api_key_id or ''` (same for the secret). Never log them.
 
@@ -2209,6 +2403,44 @@ def test_trader_keeps_the_alpaca_keys_for_baseline_simulation():
     trader = Trader(**_ALPACA_KWARGS, alpaca_api_key_id='id', alpaca_api_secret_key='s')
     assert (trader.alpaca_api_key_id, trader.alpaca_api_secret_key) == ('id', 's')
 ```
+
+Matched-entry tests in `tests/scoreboard/test_session_simulator.py` (a `FakeCloseFills({close_decision_id: CloseFill(...)})`; records ingested through `make_ingest` from Task 2 with `FakeTrips`; bars `minute_bars(SESSION, QUIET, 101.0)` so each simulated share earns $1):
+
+```python
+def test_matched_records_simulate_only_proven_close_shares(store):            # second PR #75 review
+    seed_matched(store, ("dec-00000031", 5))                                    # PARTIAL_CLOSE asked for 5
+    run(store, FakeCloseFills({"dec-00000031": CloseFill(True, 3)}))            # the broker shows 3 removed
+    outcome = store.fetch("simulated_outcomes", {})[0]
+    assert (outcome["status"], outcome["quantity"], outcome["pnl_usd"]) == ("COMPLETE", 3, 3.0)
+
+
+def test_an_unproven_close_fill_is_incomplete_after_the_grace(store):
+    seed_matched(store, ("dec-00000031", 5))
+    run(store, FakeCloseFills({"dec-00000031": CloseFill(False, None)}), extra=dt.timedelta(minutes=1))
+    assert store.fetch("simulated_outcomes", {}) == []                          # inside the grace: wait
+    run(store, FakeCloseFills({"dec-00000031": CloseFill(False, None)}), extra=GRACE)
+    outcome = store.fetch("simulated_outcomes", {})[0]
+    assert (outcome["status"], outcome["reason"]) == ("INCOMPLETE", "close_fill_unproven")
+
+
+def test_two_records_for_one_entry_never_both_count_the_whole_entry(store):
+    # One 10-share ENTER; a refused CLOSE asked for 10, then a real CLOSE asked for 10 again. The second record
+    # was sent with a changed trip id (refused) and then with none (the trader derived rt-1).
+    seed_matched(store, ("dec-00000031", 10), ("dec-00000032", 10), wrong_trip_first=True)
+    run(store, FakeCloseFills({"dec-00000031": CloseFill(True, 0), "dec-00000032": CloseFill(True, 10)}))
+    by_close = {r["record_id"]: r for r in store.fetch("simulated_outcomes", {})}
+    quantities = [o["quantity"] or 0 for o in by_close.values()]
+    assert sorted(quantities) == [0, 10] and sum(quantities) == 10              # the entry, counted once
+    assert {o["reason"] for o in by_close.values()} >= {"CLOSE_REMOVED_NO_SHARES"}
+
+
+def test_the_per_trip_sum_is_clipped_to_the_proven_entry_fill(store):
+    seed_matched(store, ("dec-00000031", 6), ("dec-00000032", 6), entry_qty=8.0)   # the ENTER filled only 8
+    run(store, FakeCloseFills({"dec-00000031": CloseFill(True, 6), "dec-00000032": CloseFill(True, 6)}))
+    assert sorted(o["quantity"] for o in store.fetch("simulated_outcomes", {})) == [2, 6]
+```
+
+`seed_matched(store, *closes, entry_qty=10.0, wrong_trip_first=False)` ingests one `matched_body` per `(close_decision_id, requested)` with `FakeTrips(**{"dec-00000001": TripFact("rt-1", 265598, ..., entry_qty)})`, `FakeDecisions(enter_fact(), *close facts)`; with `wrong_trip_first` the second record is first sent with `linked_round_trip_id="rt-9"` and must come back `MATCHED_ENTRY_TRIP_MISMATCH`, then with `None`. `run(store, close_fills, extra=dt.timedelta(minutes=1))` runs one `SessionSimulator(..., close_fills=close_fills, trips=<the same FakeTrips with by_id>)` at `data_ready_at(SESSION) + extra`.
 
 - [ ] **Step 2: Run, expect failure** `.venv/bin/python -m pytest tests/scoreboard/test_session_simulator.py tests/scoreboard/test_bar_sources.py -q --timeout=30`.
 - [ ] **Step 3: Implement** the files and edits above.

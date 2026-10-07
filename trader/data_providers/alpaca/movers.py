@@ -7,6 +7,7 @@ from trader.data_providers.capabilities import sort_movers
 from trader.data_providers.errors import CapabilityNotSupported
 
 MAX_TOP = 50
+MAX_MOST_ACTIVES = 100
 _OTHER_SOURCES_BY_MARKET = {'indices': ['etf_proxy', 'massive']}
 
 
@@ -15,6 +16,15 @@ class AlpacaMovers:
 
     def __init__(self, client):
         self._client = client
+
+    def screener(self, top: int) -> dict:
+        """The raw stocks movers payload: ``gainers``, ``losers`` and Alpaca's ``last_updated``."""
+        return self._client.get_json('/v1beta1/screener/stocks/movers', {'top': min(int(top), MAX_TOP)})
+
+    def most_actives(self, top: int) -> dict:
+        """The raw most-actives payload by volume: ``most_actives`` and ``last_updated``."""
+        return self._client.get_json('/v1beta1/screener/stocks/most-actives',
+                                     {'by': 'volume', 'top': min(int(top), MAX_MOST_ACTIVES)})
 
     def movers(self, market: str, direction: str) -> pd.DataFrame:
         if market not in self.markets:

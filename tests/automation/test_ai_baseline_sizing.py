@@ -3,6 +3,7 @@
 Plan 3 Ruling 19: a discretionary deployment is sized as a real discretionary ENTER, on the scope rule (#85).
 """
 import dataclasses
+import json
 import datetime as dt
 from dataclasses import replace
 from decimal import Decimal
@@ -260,3 +261,47 @@ def test_a_style_the_real_enter_refuses_cannot_size(tmp_path, digest):
     assert (exc.value.code, exc.value.reason) == ("STYLE_NOT_ENABLED", "sizing_unavailable")
     assert world.contracts.calls == 0                                    # refused before the scope rule
     assert world.submit(deployment_digest=getattr(world, digest)).error_code == "STYLE_NOT_ENABLED"
+
+
+def _quote_falls_on_capture(world):
+    """$5.10 until the broker is read, then $4.90: below the scope rule's $5 price floor (PR #87 review)."""
+    world.quotes.set(bid=5.095, ask=5.10)
+    read = world.broker.capture
+
+    def capture(account_id):
+        snapshot_ = read(account_id)
+        world.quotes.set(bid=4.895, ask=4.90)
+        return snapshot_
+    world.broker.capture = capture
+
+
+def test_a_baseline_is_sized_only_on_the_quote_the_scope_rule_checked(tmp_path):     # PR #87 thread 4211628563
+    from tests.scoreboard.ingest_world import FakeExperiments, make_ingest, sim, sim_body
+    from trader.data.duckdb_store import DuckDBConnection
+    from trader.data.schema_migrations import SchemaMigrator
+    from trader.scoreboard.schema import apply_scoreboard_migrations
+    from trader.scoreboard.store import ScoreboardStore
+
+    world = discretionary_world(tmp_path)
+    sizer_ = world_sizer(world)
+    _quote_falls_on_capture(world)
+    scoreboard = DuckDBConnection(str(tmp_path / "scoreboard.duckdb"))
+    apply_scoreboard_migrations(SchemaMigrator(scoreboard))
+    store = ScoreboardStore(scoreboard, now=world.clock)
+    experiments = FakeExperiments()
+    experiments.record.account_id = ACCOUNT
+    ingest = make_ingest(store, experiments=experiments, sizer=sizer_)
+    body = sim_body(baseline_id="fixed_rule.v1", cohort="self_found", opportunity_id="opp-1",
+                    deployment_digest=world.ddigest, conid=CONID, reference_price=5.10, stop_price=4.70,
+                    target_price=5.50)
+    assert sim(ingest, body)["status"] == "INSERTED"
+    (row,) = store.fetch("simulated_decisions", {})
+    (outcome,) = store.fetch("simulated_outcomes", {})
+    assert (row["quantity"], row["quantity_source"]) == (None, None)
+    sizing = json.loads(row["sizing_json"])
+    assert (sizing["code"], sizing["part"]) == ("OUT_OF_DISCRETIONARY_SCOPE", "price")
+    assert (outcome["status"], outcome["reason"]) == ("INCOMPLETE", "sizing_unavailable")
+    _quote_falls_on_capture(world)                                       # the real ENTER on the same sequence
+    receipt = world.submit(deployment_digest=world.ddigest, stop_price=4.70)
+    assert (receipt.state, receipt.error_code, receipt.outcome["detail"]["part"]) == (
+        "REJECTED", "OUT_OF_DISCRETIONARY_SCOPE", "price")

@@ -28,9 +28,10 @@ QUOTE_UNAVAILABLE, QUOTE_NOT_EXECUTABLE = "quote_unavailable", "quote_not_execut
 
 @dataclass(frozen=True)
 class _DeploymentBound:
-    """What the deployment adds to a real ENTER's sizing. ``volume`` is the scope rule's 20-session window;
-    a strategy deployment has none and reads local daily bars."""
+    """What the deployment adds to a real ENTER's sizing, and the one quote the baseline is sized on.
+    ``volume`` is the scope rule's 20-session window; a strategy deployment has none and reads local bars."""
     attested_notional: float
+    quote: Any
     volume: Optional[TwentySessionVolume] = None
 
 
@@ -51,14 +52,16 @@ class AiPaperBaselineSizer:
         # The real ENTER's evidence checks first (review 4210055360): paper only, a valid broker fence.
         self._step("PAPER_ONLY", lambda: check_paper_binding("paper", account_id))
         limits = self._step("NO_EFFECTIVE_LIMITS", self._policy.effective_limits)
-        bound = self._deployment_bound(deployment_digest, conid)
-        notional_cap = bound.attested_notional * (1.0 + LIVE_NOTIONAL_TOLERANCE)
+        deployment = self._deployment(deployment_digest, conid)
         snapshot = self._step("EVIDENCE_UNAVAILABLE", lambda: self._broker.capture(account_id))
         snapshot = self._step("BROKER_EVIDENCE_INVALID", lambda: validate_entry_snapshot(snapshot, account_id))
         refusal = pending_entry_refusal(snapshot, conid, limits)
         if refusal:
             raise SizingUnavailable(refusal, {})
-        quote = self._quote(conid)
+        # One quote read, where prepare_entry reads it; the scope rule, the quote checks and the size all use it.
+        bound = self._bound(deployment_digest, deployment, conid)
+        notional_cap = bound.attested_notional * (1.0 + LIVE_NOTIONAL_TOLERANCE)
+        quote = self._checked_quote(conid, bound.quote)
         # The same price prepare_entry sizes on: the marketable limit through the fresh ask.
         price = planned_entry_limit(float(quote.ask), float(quote.bid), AI_ENTRY_POLICY.limit_offset_bps)
         if not stop_price < price:
@@ -79,12 +82,14 @@ class AiPaperBaselineSizer:
             raise SizingUnavailable("QUANTITY_BELOW_ONE_SHARE", record)
         return SizedBaseline(quantity, record)
 
-    def _quote(self, conid: int) -> Any:
-        """Exactly the real ENTER's quote checks (second PR #75 review): never size on a quote it would refuse."""
+    def _read_quote(self, conid: int) -> Any:
         try:
-            quote = self._quotes.executable_quote(conid, side="BUY")
+            return self._quotes.executable_quote(conid, side="BUY")
         except Exception as exc:
             raise SizingUnavailable("QUOTE_UNAVAILABLE", {"error": type(exc).__name__}, reason=QUOTE_UNAVAILABLE) from None
+
+    def _checked_quote(self, conid: int, quote: Any) -> Any:
+        """Exactly the real ENTER's quote checks (second PR #75 review): never size on a quote it would refuse."""
         if quote is None:
             raise SizingUnavailable("QUOTE_UNAVAILABLE", {}, reason=QUOTE_UNAVAILABLE)
         try:
@@ -103,31 +108,36 @@ class AiPaperBaselineSizer:
         if refusal:
             raise SizingUnavailable(refusal, {"price": price})
 
-    def _deployment_bound(self, digest: str, conid: int) -> _DeploymentBound:
+    def _deployment(self, digest: str, conid: int) -> Any:
+        """The real ENTER's deployment checks: a strategy one's verdict and conids, then either kind's style."""
         deployment = self._step("DEPLOYMENT_UNAVAILABLE", lambda: self._deployments.get_sealed_any(digest))
-        discretionary = isinstance(deployment, DiscretionaryDeployment)
-        if not discretionary:
+        if not isinstance(deployment, DiscretionaryDeployment):
             if deployment.decider_verdict != "DEPLOY":
                 raise SizingUnavailable("DEPLOYMENT_NOT_DEPLOYABLE", {})
             if conid not in deployment.conids:
                 raise SizingUnavailable("CONID_NOT_IN_DEPLOYMENT", {})
-        # The real ENTER's order: the deployment's own checks, then its style, then the scope rule.
         if not self._config.style_enabled(deployment.style):
             raise SizingUnavailable(STYLE_NOT_ENABLED, {"style": deployment.style})
-        if discretionary:
+        return deployment
+
+    def _bound(self, digest: str, deployment: Any, conid: int) -> _DeploymentBound:
+        if isinstance(deployment, DiscretionaryDeployment):
             return self._scope_bound(digest, deployment, conid)
-        return _DeploymentBound(float(deployment.evidence_order_notional))
+        return _DeploymentBound(float(deployment.evidence_order_notional), self._read_quote(conid))
 
     def _scope_bound(self, digest: str, deployment: DiscretionaryDeployment, conid: int) -> _DeploymentBound:
-        """The real discretionary ENTER's admission check, without its record: out of scope is never sized."""
+        """The real discretionary ENTER's scope check, without its record: out of scope is never sized. Its quote
+        is read after the IB contract details, as at admission, and is the one quote the baseline is sized on."""
         if self._scope is None:
             raise SizingUnavailable(OUT_OF_DISCRETIONARY_SCOPE,
                                     {"part": "evidence_stale", "reason": "the scope service is not wired"})
-        verdict, scope = self._step(OUT_OF_DISCRETIONARY_SCOPE, lambda: self._scope.assess(
+        assessment = self._step(OUT_OF_DISCRETIONARY_SCOPE, lambda: self._scope.assess(
             digest=digest, deployment=deployment, conid=conid))
-        if scope is None:
-            raise SizingUnavailable(OUT_OF_DISCRETIONARY_SCOPE, {"part": verdict.part, "reason": verdict.reason})
-        return _DeploymentBound(scope.attested_notional, scope.evidence.volume)
+        admission = assessment.admission
+        if admission is None:
+            raise SizingUnavailable(OUT_OF_DISCRETIONARY_SCOPE,
+                                    {"part": assessment.verdict.part, "reason": assessment.verdict.reason})
+        return _DeploymentBound(admission.attested_notional, assessment.quote, admission.evidence.volume)
 
     @staticmethod
     def _step(code: str, read: Callable[[], Any]) -> Any:

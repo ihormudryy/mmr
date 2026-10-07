@@ -226,6 +226,14 @@ class AdmissionScope:
     attested_notional: float
 
 
+@dataclass(frozen=True)
+class ScopeAssessment:
+    """One admission check: its verdict, the admission when it passed, and the quote it was checked on."""
+    verdict: ScopeVerdict
+    admission: Optional[AdmissionScope]
+    quote: Any
+
+
 class ScopeRefused(Exception):
     def __init__(self, detail: dict):
         super().__init__(OUT_OF_DISCRETIONARY_SCOPE)
@@ -247,15 +255,15 @@ class DiscretionaryScopeService:
         return self._checks
 
     def check_admission(self, *, command_id: str, digest: str, deployment: Any, conid: int) -> AdmissionScope:
-        verdict, scope = self.assess(digest=digest, deployment=deployment, conid=conid)
+        assessment = self.assess(digest=digest, deployment=deployment, conid=conid)
         detail = self._checks.record(command_id=command_id, phase="admission", deployment_digest=digest,
-                                     conid=conid, verdict=verdict)
-        if scope is None:
+                                     conid=conid, verdict=assessment.verdict)
+        if assessment.admission is None:
             raise ScopeRefused(detail)
-        return scope
+        return assessment.admission
 
-    def assess(self, *, digest: str, deployment: Any, conid: int) -> tuple[ScopeVerdict, Optional[AdmissionScope]]:
-        """The admission check without its record: a baseline is sized on it and writes nothing (Plan 3 R19)."""
+    def assess(self, *, digest: str, deployment: Any, conid: int) -> ScopeAssessment:
+        """The admission check without its record: a baseline is sized on it, and on its quote (Plan 3 R19)."""
         missing: list[str] = []
         # Order matters: the contract read remembers the conid in the universe, which the quote read needs.
         contract = self._fetch(lambda: self._contracts.by_conid(conid), missing)
@@ -266,11 +274,12 @@ class DiscretionaryScopeService:
         verdict = evaluate_scope(rule, ScopeInputs(contract, quote, volume, None, self._filter_refusal,
                                                    self._accepted_feeds, tuple(missing)), self._now())
         if not verdict.passed:
-            return verdict, None
+            return ScopeAssessment(verdict, None, quote)
         cap = rule.max_order_share_of_dollar_volume * volume.median_dollar_volume
         # Ruling 7: SP1 adds LIVE_NOTIONAL_TOLERANCE to the attested notional; this keeps the bound at the cap.
-        return verdict, AdmissionScope(DiscretionaryScopeEvidence(digest, rule, contract, volume),
-                                       cap / (1.0 + LIVE_NOTIONAL_TOLERANCE))
+        admission = AdmissionScope(DiscretionaryScopeEvidence(digest, rule, contract, volume),
+                                   cap / (1.0 + LIVE_NOTIONAL_TOLERANCE))
+        return ScopeAssessment(verdict, admission, quote)
 
     def refuse_size(self, *, command_id: str, scope: AdmissionScope, conid: int, reason: str) -> dict:
         verdict = ScopeVerdict("liquidity", reason, {"volume": scope.evidence.volume.to_json()})

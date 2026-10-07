@@ -16,6 +16,7 @@ from dataclasses import dataclass, replace
 from decimal import Decimal, ROUND_HALF_UP
 from typing import Any, Callable, Mapping, Optional, Protocol
 
+from trader.automation.entry_views import EntryAuthorityView, EntryOrderView
 from trader.data.schema_migrations import SchemaMigrator
 from trader.domain.events import DomainMutation
 from trader.domain.identity import command_entity_id
@@ -825,10 +826,10 @@ class ProtectiveOrderSaga:
     def start(
         self,
         *,
-        intent,
+        intent: EntryOrderView,
         approval,
         request,
-        artifact,
+        artifact: EntryAuthorityView,
         session_state,
         allocation,
     ) -> SagaState:

@@ -191,3 +191,9 @@ def test_margin_is_never_reported_as_a_sizing_bound(parts):                     
     prepared = prepare(parts)
     assert prepared.margin_checked is True
     assert not [f.name for f in dataclasses.fields(EntryLimitsEvidence) if "margin" in f.name]
+
+
+@pytest.mark.parametrize("stop", [100.10, 101.0])
+def test_a_stop_at_or_above_the_entry_price_is_invalid(parts, stop):
+    with pytest.raises(ApprovalContextError, match="STOP_INVALID"):
+        prepare(parts, stop_price=stop)

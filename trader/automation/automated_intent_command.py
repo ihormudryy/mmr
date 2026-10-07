@@ -16,6 +16,7 @@ from decimal import Decimal
 from pathlib import Path
 from typing import Any, Callable, Mapping, Optional, Protocol
 
+from trader.automation.command_steps import CommandSteps
 from trader.automation.models import (
     EntryPolicy,
     ExecutionIntent,
@@ -173,6 +174,8 @@ class AutomatedIntentCommandService:
             Path(configured_bundle_path) if configured_bundle_path is not None else None
         )
         self._bundle_evidence_validator = bundle_evidence_validator
+        self._steps = CommandSteps(ledger=ledger, journal=journal, controls=controls,
+                                   account_id=account_id, now=now)
 
     def execute(self, cmd: CommandRequest) -> CommandReceipt:
         if cmd.principal != STRATEGY_PRINCIPAL:
@@ -344,19 +347,7 @@ class AutomatedIntentCommandService:
         )
 
     def _claim(self, cmd, *, require_unpaused: bool) -> None:
-        """VALIDATED -> SUBMITTING in one journal transaction; an entry also checks the pause."""
-        from trader.trading.command_coordinator import _command_updated_mutation, _noop_write
-
-        def claim(conn, append):
-            if require_unpaused:
-                self._controls.require_unpaused_in_tx(conn, self._account_id)
-            self._ledger.transition_in_tx(conn, cmd.command_id, "VALIDATED", "SUBMITTING")
-            append(
-                _command_updated_mutation(cmd, "SUBMITTING", self._now_utc()),
-                _noop_write,
-                f"command:{cmd.command_id}:submitting",
-            )
-        self._journal.mutate_batch_work(self._journal.connect(), claim)
+        self._steps.claim(cmd, require_unpaused=require_unpaused)
 
     def _execute_close(self, cmd, intent, artifact) -> CommandReceipt:
         """Prove the SELL reduces the held long on the account's broker snapshot, then close.
@@ -492,42 +483,9 @@ class AutomatedIntentCommandService:
         outcome: Optional[dict[str, Any]] = None,
         error_code: Optional[str] = None,
     ) -> None:
-        from trader.trading.command_coordinator import _command_updated_mutation
+        self._steps.transition(cmd, from_state, to_state, outcome=outcome, error_code=error_code)
 
-        now = self._now_utc()
-
-        def _write(conn, _revision: int) -> None:
-            self._ledger.transition_in_tx(
-                conn, cmd.command_id, from_state, to_state,
-                outcome=outcome, error_code=error_code, now=now,
-            )
-
-        self._journal.mutate(
-            self._journal.connect(),
-            _command_updated_mutation(
-                cmd, to_state, now, outcome=outcome, error_code=error_code,
-            ),
-            _write,
-            event_id=f"command:{cmd.command_id}:{to_state.lower()}",
-        )
-
-    @staticmethod
-    def _receipt(
-        command_id: str,
-        state: str,
-        error_code: Optional[str],
-        retryable: bool,
-        *,
-        outcome: Optional[dict[str, Any]] = None,
-    ) -> CommandReceipt:
-        return CommandReceipt(
-            command_id=command_id,
-            correlation_id=command_id,
-            state=state,
-            outcome=outcome,
-            error_code=error_code,
-            retryable=retryable,
-        )
+    _receipt = staticmethod(CommandSteps.receipt)
 
     def _now_utc(self) -> dt.datetime:
         return _as_utc(self._now())

@@ -11,13 +11,12 @@ from dataclasses import dataclass
 from decimal import Decimal
 from typing import Any, Callable, Optional, Protocol, Tuple
 
-from trader.automation.artifact_verifier import VerifiedArtifact
 from trader.automation.calendar_policy import SessionSchedule, XNYSCalendarPolicy
 from trader.automation.liquidity_policy import (
     LiquidityEvidence,
     LiquidityPolicy,
 )
-from trader.automation.models import ExecutionIntent
+from trader.automation.entry_views import EntryAuthorityView, EntryOrderView
 from trader.promotion.allocation_policy import (
     AllocationPolicy,
     AuthoritySource,
@@ -193,8 +192,8 @@ class SessionRiskController:
 
     def evaluate(
         self,
-        intent: ExecutionIntent,
-        artifact: VerifiedArtifact,
+        intent: EntryOrderView,
+        artifact: EntryAuthorityView,
         approval_context: ApprovalContext,
         session_state: AutomationSessionState,
         allocation: AllocationCeiling,

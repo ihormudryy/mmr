@@ -105,6 +105,9 @@ class AiPaperEvidence:
         liquidity = liquidity_from_history(self._history, conid, quote, self._now())
         liquidity_max = self._liquidity_policy.max_quantity(liquidity)
         price = self._entry_price(quote)
+        if not stop_price < price:
+            # Otherwise the sizing would only say "less than one share".
+            raise _refuse("STOP_INVALID", "the stop must be below the entry price")
         self._check_filter(conid, price)
         notional_cap = _positive(notional, "NOTIONAL_INVALID") * (1.0 + LIVE_NOTIONAL_TOLERANCE)
         sized = max_entry_quantity(limits, sizing_inputs(

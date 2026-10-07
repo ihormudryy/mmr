@@ -14,9 +14,10 @@ from dataclasses import dataclass
 from datetime import datetime
 from typing import Any, Mapping, Optional, Protocol
 
-from trader.ai.budget import Budget, BudgetExhausted, HourlyLimitReached, RELEASE_NOT_SENT, RELEASE_REJECTED
+from trader.ai.budget import (Budget, BudgetExhausted, BudgetNotInitialized, HourlyLimitReached,
+                             RELEASE_NOT_SENT, RELEASE_REJECTED)
 from trader.ai.clock import Clock
-from trader.ai.config import ROLE_NAMES, AiConfig, AiConfigError, ModelPrice, RoleConfig, usd_to_micros_floor
+from trader.ai.config import ROLE_NAMES, AiConfig, AiConfigError, ModelPrice, RoleConfig
 from trader.ai.journal import (
     COST_CONFIRMED, COST_CORRECTION, COST_ESTIMATED_UNKNOWN, COST_NONE, AttemptJournal, AttemptRecord,
 )
@@ -107,9 +108,9 @@ class ModelGateway:
     # --- lifecycle -------------------------------------------------------
 
     async def start(self) -> None:
-        """Migrate, apply the configured cap, then turn leftovers of a dead process into UNKNOWN."""
+        """Migrate, then turn leftovers of a dead process into UNKNOWN. The cap is not set here: Plan 5's
+        controller sets it from the trader; until then every call is BUDGET_CAP_UNKNOWN."""
         await asyncio.to_thread(self.store.migrate)
-        await self.budget.set_cap(usd_to_micros_floor(self.config.budget.model_budget_usd_per_day))
         await self.recover_after_restart()
 
     async def recover_after_restart(self) -> None:
@@ -174,6 +175,9 @@ class ModelGateway:
             except BudgetExhausted as exhausted:
                 self._slots.release()
                 raise CallRefused("BUDGET_EXHAUSTED", str(exhausted), retry_at=exhausted.retry_at) from None
+            except BudgetNotInitialized:
+                self._slots.release()
+                raise CallRefused("BUDGET_CAP_UNKNOWN", "no owner cap was set (trader.yaml, Plan 5)") from None
             except BaseException:
                 self._slots.release()
                 raise

@@ -32,7 +32,6 @@ class FakeClock:
 
 def config_text(
     *,
-    cap: str = "2000",
     calls_per_hour: int = 120,
     deadline: int = 60,
     max_in_flight: int = 2,
@@ -52,7 +51,6 @@ pricing:
     "vendor/orch-1": {{input_usd_per_million: 3.0, output_usd_per_million: 15.0}}
     "vendor/jev-1": {{input_usd_per_million: 1.0, output_usd_per_million: 5.0}}
 budget:
-  model_budget_usd_per_day: {cap}
   calls_per_hour: {calls_per_hour}
   max_in_flight: {max_in_flight}
   decision_deadline_seconds: {deadline}

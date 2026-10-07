@@ -54,7 +54,7 @@ class RoleConfig(_Section):
 
 
 class BudgetConfig(_Section):
-    model_budget_usd_per_day: Number = Field(2000.0, ge=0, allow_inf_nan=False)
+    # No cap here: the owner's cap is ai_paper.model_budget_usd_per_day in trader.yaml.
     calls_per_hour: Whole = Field(120, gt=0)
     max_in_flight: Whole = Field(MAX_IN_FLIGHT_LIMIT, gt=0)
     decision_deadline_seconds: Number = Field(60.0, gt=0, le=600, allow_inf_nan=False)

@@ -37,7 +37,7 @@ def test_valid_config_loads_with_spec_defaults(tmp_path):
     assert orchestrator.backend == "openrouter" and orchestrator.model == "vendor/orch-1"
     assert orchestrator.max_input_tokens == 60000
     assert orchestrator.max_output_tokens == 4000
-    assert config.budget.model_budget_usd_per_day == 2000.0
+    assert not hasattr(config.budget, "model_budget_usd_per_day")
     assert config.budget.calls_per_hour == 120
     assert config.budget.max_in_flight == 2
     assert config.budget.decision_deadline_seconds == 60.0
@@ -77,14 +77,25 @@ def test_unknown_key_is_refused_and_the_value_is_not_echoed(tmp_path):
     assert "surprise" in error.message
 
 
-@pytest.mark.parametrize("cap", ["-1", "'5'", ".nan", ".inf", "true", "null"])
-def test_budget_must_be_a_real_non_negative_number(tmp_path, cap):
-    assert refused(tmp_path, config_text(cap=cap)).code == "AI_CONFIG_INVALID"
+def test_a_cap_in_ai_yaml_is_an_unknown_key(tmp_path):
+    text = config_text().replace("budget:\n", "budget:\n  model_budget_usd_per_day: 5000\n")
+    error = refused(tmp_path, text)
+    assert error.code == "AI_CONFIG_INVALID"
+    assert "budget.model_budget_usd_per_day" in error.message
+    assert "5000" not in str(error)
 
 
-def test_integer_cap_is_accepted_as_a_float(tmp_path):
-    config = load_test_config(tmp_path, cap="2000")
-    assert isinstance(config.budget.model_budget_usd_per_day, float)
+@pytest.mark.parametrize("key,value", [("calls_per_hour", "0"), ("calls_per_hour", "1.5"), ("calls_per_hour", "'5'"),
+                                       ("max_in_flight", "true"), ("decision_deadline_seconds", ".nan"),
+                                       ("decision_deadline_seconds", ".inf"), ("decision_deadline_seconds", "-1"),
+                                       ("decision_deadline_seconds", "'60'"), ("decision_deadline_seconds", "null")])
+def test_budget_limits_must_be_real_positive_numbers(tmp_path, key, value):
+    text = config_text().replace("budget:\n", f"budget:\n  {key}: {value}\n", 1)
+    # the later duplicate line in the fixture would win in YAML, so drop it
+    lines = text.splitlines()
+    first = next(i for i, line in enumerate(lines) if line.startswith(f"  {key}:"))
+    lines = [line for i, line in enumerate(lines) if i == first or not line.startswith(f"  {key}:")]
+    assert refused(tmp_path, "\n".join(lines)).code == "AI_CONFIG_INVALID"
 
 
 def test_missing_price_is_not_a_load_error_but_the_price_is_absent(tmp_path):

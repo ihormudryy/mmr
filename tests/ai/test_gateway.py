@@ -8,7 +8,7 @@ from tests.ai.fakes import (
 )
 from tests.ai.world import World, request
 from trader.ai.budget import next_window_start
-from trader.ai.config import AiConfigError
+from trader.ai.config import AiConfigError, usd_to_micros_floor
 from trader.ai.gateway import CallFailed, CallRefused, ModelGateway, build_gateway
 from trader.ai.model_client import Usage
 
@@ -20,14 +20,28 @@ UTC = timezone.utc
 @pytest_asyncio.fixture
 async def world(tmp_path, clock):
     built = World(tmp_path, clock)
-    await built.gateway.start()
+    await built.start()
     return built
+
+
+@pytest.mark.asyncio
+async def test_a_call_before_any_cap_is_refused_and_sends_nothing(tmp_path, clock):
+    built = World(tmp_path, clock)
+    await built.gateway.start()  # no set_cap: the trader was never read
+    with pytest.raises(CallRefused) as caught:
+        await built.gateway.call("orchestrator", request(), built.gateway.new_deadline())
+    assert caught.value.code == "BUDGET_CAP_UNKNOWN"
+    assert built.rows("SELECT count(*) FROM ai_budget_reservations") == [(0,)]
+    assert built.rows("SELECT count(*) FROM ai_model_attempts") == [(0,)]
+    assert built.orchestrator.requests == []
+    await built.gateway.budget.set_cap(usd_to_micros_floor(2000))  # the slot was not leaked
+    assert (await built.gateway.call("orchestrator", request(), built.gateway.new_deadline())).response.text
 
 
 @pytest.mark.asyncio
 async def test_missing_price_refuses_and_leaves_no_trace(tmp_path, clock):
     built = World(tmp_path, clock, orchestrator_model="vendor/unpriced")
-    await built.gateway.start()
+    await built.start()
     with pytest.raises(CallRefused) as caught:
         await built.gateway.call("orchestrator", request(), built.gateway.new_deadline())
     assert caught.value.code == "PRICE_UNAVAILABLE"
@@ -39,7 +53,7 @@ async def test_missing_price_refuses_and_leaves_no_trace(tmp_path, clock):
 @pytest.mark.asyncio
 async def test_timeout_is_unknown_keeps_the_reservation_and_a_late_report_reconciles_once(tmp_path, clock):
     world = World(tmp_path, clock, call_timeout="0.05")
-    await world.gateway.start()
+    await world.start()
     world.orchestrator.hold = asyncio.Event()  # never released: the call times out
     with pytest.raises(CallFailed) as caught:
         await world.gateway.call("orchestrator", request(), world.gateway.new_deadline())
@@ -82,12 +96,12 @@ async def test_cancelling_a_call_records_unknown_and_keeps_the_reservation(world
 @pytest.mark.asyncio
 async def test_restart_turns_a_half_finished_call_into_a_counted_unknown(tmp_path, clock):
     first = World(tmp_path, clock)
-    await first.gateway.start()
+    await first.start()
     # simulate a crash after "reserve + journal begin" committed and before the adapter answered
     await first.gateway._reserve_and_begin("orchestrator", first.config.role("orchestrator"), request(),
                                            ORCHESTRATOR_WORST_CASE_MICROS)
     second = World(tmp_path, clock)  # new process, same ai.duckdb
-    await second.gateway.start()
+    await second.start()
     assert second.rows("SELECT status, error_code FROM ai_model_attempts") == [("UNKNOWN", "PROCESS_RESTARTED")]
     snapshot = await second.gateway.budget.snapshot()
     assert (snapshot.unknown_reservations, snapshot.committed_micros) == (1, ORCHESTRATOR_WORST_CASE_MICROS)
@@ -126,6 +140,7 @@ async def test_attempt_key_reaches_the_adapter_request_log_but_not_the_wire(tmp_
     spied = ModelGateway(config=world.config, store=world.store, clock=clock,
                          clients={"orchestrator": Spy(), "jev": world.gateway._clients["jev"]})
     await spied.start()
+    await spied.budget.set_cap(usd_to_micros_floor(2000))
     await spied.call("orchestrator", request(), spied.new_deadline())
     assert seen == [("d1/orchestrator/1", "d1/orchestrator/1#1")]
     wire = world.orchestrator.requests[0].read()
@@ -149,8 +164,8 @@ async def test_request_limits_are_enforced_before_any_reservation(world):
 
 @pytest.mark.asyncio
 async def test_daily_cap_blocks_with_the_reset_time_and_sends_nothing(tmp_path, clock):
-    world = World(tmp_path, clock, cap="0.1")  # 100_000 micro-USD, below the 240_000 worst case
-    await world.gateway.start()
+    world = World(tmp_path, clock, cap_usd=0.1)  # 100_000 micro-USD, below the 240_000 worst case
+    await world.start()
     with pytest.raises(CallRefused) as caught:
         await world.gateway.call("orchestrator", request(), world.gateway.new_deadline())
     assert caught.value.code == "BUDGET_EXHAUSTED"
@@ -198,7 +213,7 @@ async def test_at_most_two_calls_are_in_flight(world):
 @pytest.mark.asyncio
 async def test_one_deadline_spans_orchestrator_and_jev(tmp_path, clock):
     world = World(tmp_path, clock, deadline=10, call_timeout="5")
-    await world.gateway.start()
+    await world.start()
     world.orchestrator.advance_seconds = 6
     world.jev.advance_seconds = 6
     deadline = world.gateway.new_deadline("decision-1")
@@ -216,7 +231,7 @@ async def test_one_deadline_spans_orchestrator_and_jev(tmp_path, clock):
 @pytest.mark.asyncio
 async def test_hourly_limit_delays_inside_the_deadline_and_refuses_beyond_it(tmp_path, clock):
     world = World(tmp_path, clock, calls_per_hour=2, deadline=600)
-    await world.gateway.start()
+    await world.start()
     started = clock.now()
     await world.gateway.call("jev", request("d/j/1"), world.gateway.new_deadline())
     clock.advance(3100)

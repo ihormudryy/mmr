@@ -30,8 +30,10 @@ pricing:
   # openrouter:
   #   "vendor/model-id": {input_usd_per_million: 3.0, output_usd_per_million: 15.0}
 
+# The daily model cap is not set here. It is ai_paper.model_budget_usd_per_day in
+# trader.yaml (default 2000); the ai service reads it from the trader. A raise
+# applies at the next 00:00 America/New_York, a lower cap at once.
 budget:
-  model_budget_usd_per_day: 2000   # raising applies at the next 00:00 America/New_York
   calls_per_hour: 120
   max_in_flight: 2                 # 2 is the maximum
   decision_deadline_seconds: 60    # one deadline spans orchestrator plus Jev

@@ -31,7 +31,7 @@ async def live_decision(world):
 @pytest_asyncio.fixture
 async def decided(tmp_path, clock):
     world = World(tmp_path, clock)
-    await world.gateway.start()
+    await world.start()
     return world, await live_decision(world)
 
 
@@ -142,7 +142,7 @@ async def test_a_changed_prompt_is_a_divergence_not_a_silent_answer(decided, no_
 @pytest.mark.asyncio
 async def test_recorded_failures_replay_as_failures_and_unknown_stays_unknown(tmp_path, clock):
     world = World(tmp_path, clock)
-    await world.gateway.start()
+    await world.start()
     world.jev.respond = lambda r: httpx.Response(500, text="upstream down")
     with pytest.raises(CallFailed):
         await world.gateway.call("jev", request("dec-2/jev/1", "judge"), world.gateway.new_deadline())

@@ -225,13 +225,10 @@ class _InProcessTypedClient:
     """Drives the REAL production registry in-process (no ZMQ/HMAC): resolves
     `(role, method)`, validates the body against the registered
     `request_model`, invokes the handler, and returns the raw result.
-    `response_model` is honoured the same way `TypedRpcClient.call` treats
-    it (`dict` -> raw dict; otherwise construct `response_model(**result)`)
-    -- since the handlers here return plain dicts shaped exactly like
-    `CommandReceipt`'s fields (`_receipt_to_dict`), reconstructing via
-    keyword arguments works without needing a `.model_validate` classmethod
-    (the documented `CommandReceipt`/`model_validate` wire gap is a property
-    of the REAL `TypedRpcClient`, not of this in-process test double)."""
+    `response_model` is honoured the way `TypedRpcClient.call` treats it
+    (`dict` -> raw dict; a dataclass such as `CommandReceipt` is built from
+    the dict's fields). The real client is covered over a signed socket in
+    `tests/test_typed_rpc_dataclass_receipt.py`."""
 
     def __init__(self, registry: TypedRpcRegistry, role: str, principal: str = "cli"):
         self._registry = registry

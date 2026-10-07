@@ -52,6 +52,7 @@ trading-authorization bypass, so every check below is deliberate:
 from __future__ import annotations
 
 import asyncio
+import dataclasses
 import hashlib
 import hmac
 import inspect
@@ -127,6 +128,10 @@ class AuthenticationError(TypedRpcError):
 
 class ReplayError(TypedRpcError):
     """Raised when a request's nonce has already been claimed (replay attempt)."""
+
+
+class MalformedReplyError(TypedRpcError):
+    """Raised when a verified reply does not have the shape the caller asked for."""
 
 
 class TypedRpcRemoteError(TypedRpcError):
@@ -772,6 +777,22 @@ def _coerce_request_body(body: Dict[str, Any], request_model: Any) -> Any:
     return request_model.model_validate(body)
 
 
+def _build_dataclass_reply(method: str, body: Any, response_type: Any) -> Any:
+    """Build a stdlib-dataclass reply; the keys must equal the field names exactly."""
+    expected = {field.name for field in dataclasses.fields(response_type)}
+    if not isinstance(body, dict):
+        raise MalformedReplyError(
+            f"typed RPC {method!r}: reply for {response_type.__name__} must be an object, "
+            f"got {type(body).__name__}")
+    missing = sorted(expected - body.keys())
+    unexpected = sorted(body.keys() - expected)
+    if missing or unexpected:
+        raise MalformedReplyError(
+            f"typed RPC {method!r}: reply does not match {response_type.__name__}: "
+            f"missing fields {missing}, unexpected fields {unexpected}")
+    return response_type(**body)
+
+
 def _coerce_response_value(value: Any, response_model: Any) -> Dict[str, Any]:
     """Validate a handler's return value against its registered response model.
 
@@ -1205,6 +1226,8 @@ class TypedRpcClient:
         the server replied ``ok=False`` (e.g. ``METHOD_NOT_ALLOWED``,
         ``VALIDATION_ERROR``). On success, returns the body parsed against
         ``response_model`` (or the raw dict if ``response_model is dict``).
+        A stdlib dataclass ``response_model`` is built strictly: the reply
+        must carry exactly its fields, else ``MalformedReplyError``.
         """
         deadline_s = timeout if timeout is not None else self.timeout
         request_id = str(uuid.uuid4())
@@ -1298,6 +1321,8 @@ class TypedRpcClient:
         body_data = reply.body or {}
         if response_model is dict:
             return body_data
+        if isinstance(response_model, type) and dataclasses.is_dataclass(response_model):
+            return _build_dataclass_reply(method, body_data, response_model)
         return response_model.model_validate(body_data)
 
     def close(self) -> None:

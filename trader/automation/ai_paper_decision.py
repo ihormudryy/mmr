@@ -22,6 +22,7 @@ from trader.automation.ai_paper_evidence import AI_ENTRY_POLICY, AI_PAPER_ACTION
 from trader.automation.ai_paper_sizing import is_pending_entry
 from trader.automation.ai_risk_policy import PolicyRefused
 from trader.automation.command_steps import CommandSteps
+from trader.automation.controller_epoch import EPOCH_MISSING, EpochRefused
 from trader.automation.models import EntryPolicy, StopPolicy, TargetPolicy
 from trader.automation.reduction_close import CLOSE_PENDING, start_broker_proven_close
 from trader.data.schema_migrations import SchemaMigrator
@@ -59,7 +60,7 @@ def apply_ai_paper_decision_migration(migrator: SchemaMigrator) -> bool:
             conid BIGINT, action VARCHAR, decider VARCHAR, evidence_digest VARCHAR,
             deployment_digest VARCHAR, strategy_digest VARCHAR, style VARCHAR,
             policy_revision INTEGER, effective_revision INTEGER, principal VARCHAR,
-            body_json VARCHAR NOT NULL, state VARCHAR NOT NULL, error_code VARCHAR,
+            controller_epoch BIGINT, body_json VARCHAR NOT NULL, state VARCHAR NOT NULL, error_code VARCHAR,
             close_root_id VARCHAR, received_at TIMESTAMPTZ NOT NULL, updated_at TIMESTAMPTZ NOT NULL)""",
         "CREATE INDEX IF NOT EXISTS idx_ai_paper_decisions_root ON ai_paper_decisions(close_root_id)",
     ))
@@ -229,7 +230,7 @@ def deployment_binding(deployment: Any, *, digest: str, limits: Any, expires_at:
 
 _ROW_COLUMNS = ("command_id", "decision_id", "account_id", "conid", "action", "decider", "evidence_digest",
                 "deployment_digest", "strategy_digest", "style", "policy_revision", "effective_revision",
-                "principal", "body_json", "state", "error_code", "close_root_id", "received_at", "updated_at")
+                "principal", "controller_epoch", "body_json", "state", "error_code", "close_root_id", "received_at", "updated_at")
 
 
 @dataclass(frozen=True)
@@ -251,6 +252,7 @@ class DecisionRow:
     policy_revision: Optional[int] = None
     effective_revision: Optional[int] = None
     principal: Optional[str] = None
+    controller_epoch: Optional[int] = None
     error_code: Optional[str] = None
     close_root_id: Optional[str] = None
 
@@ -261,7 +263,8 @@ class DecisionRow:
         except Exception:
             body_json = json.dumps({"unserializable": repr(cmd.body)[:2000]})
         return cls(command_id=cmd.command_id, account_id=str(cmd.account_id), body_json=body_json,
-                   state="RECEIVED", received_at=now, updated_at=now, principal=cmd.principal)
+                   state="RECEIVED", received_at=now, updated_at=now, principal=cmd.principal,
+                   controller_epoch=cmd.controller_epoch)
 
     def with_decision(self, decision: AiPaperDecision) -> "DecisionRow":
         return replace(self, decision_id=decision.decision_id, conid=decision.conid, action=decision.action,
@@ -383,7 +386,7 @@ class _Admission:
 class AiPaperDecisionService:
     def __init__(self, *, ledger: Any, journal: Any, controls: Any, policy: Any, deployments: Any,
                  evidence: Any, saga: Any, experiments: Any, exit_owners: Any, liquidation: Any, broker: Any,
-                 config: Any, account_id: str, now: Callable[[], dt.datetime],
+                 config: Any, account_id: str, now: Callable[[], dt.datetime], epochs: Any,
                  schedule_reconcile: Optional[Callable[[str], None]] = None,
                  decisions: Optional[AiPaperDecisionStore] = None, close_deadline_seconds: float = 300.0):
         self._ledger = ledger
@@ -401,6 +404,7 @@ class AiPaperDecisionService:
         self._schedule_reconcile = schedule_reconcile
         self._decisions = decisions or AiPaperDecisionStore(journal)
         self._close_deadline_seconds = close_deadline_seconds
+        self._epochs = epochs
         self._steps = CommandSteps(ledger=ledger, journal=journal, controls=controls,
                                    account_id=account_id, now=now)
 
@@ -431,6 +435,8 @@ class AiPaperDecisionService:
         if (cmd.command_id != command_id_for(decision.decision_id) or cmd.target_type != "conid"
                 or cmd.target_id != str(decision.conid)):
             raise _Refusal("DECISION_INVALID", detail="command id or target does not match the decision")
+        if cmd.controller_epoch is None:
+            raise _Refusal(EPOCH_MISSING)
         if cmd.account_id != self._account_id:
             raise _Refusal("ACCOUNT_MISMATCH")
         return decision
@@ -651,9 +657,16 @@ class AiPaperDecisionService:
         admission.state = to_state
 
     def _claim(self, cmd, admission, *, require_unpaused: bool) -> None:
+        """VALIDATED -> SUBMITTING. The epoch is read in the same transaction (spec 5.1, Plan 1 Ruling 1b)."""
+        write_row = self._row_writer(admission, "SUBMITTING")
+
+        def fenced_claim_writes(conn) -> None:
+            self._epochs.require_current_in_tx(conn, cmd.controller_epoch)
+            write_row(conn)
         try:
-            self._steps.claim(cmd, require_unpaused=require_unpaused,
-                              extra=self._row_writer(admission, "SUBMITTING"))
+            self._steps.claim(cmd, require_unpaused=require_unpaused, extra=fenced_claim_writes)
+        except EpochRefused as ex:
+            raise _Refusal(ex.code, detail=ex.message) from None          # not retryable: a successor holds it
         except Exception as ex:
             raise _Refusal(str(getattr(ex, "code", None) or "TRADING_PAUSED"), retryable=True) from None
         admission.state = "SUBMITTING"

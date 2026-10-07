@@ -597,7 +597,7 @@ def _build_ai_paper_services(
         evidence=evidence, saga=saga, experiments=experiments if experiments is not None else NoExperiment(),
         exit_owners=exit_owners,
         liquidation=liquidation, broker=broker, config=parts.config, account_id=trader.ib_account,
-        now=now, schedule_reconcile=schedule_reconcile, decisions=decision_store,
+        now=now, schedule_reconcile=schedule_reconcile, decisions=decision_store, epochs=epochs,
     )
     actions = AiPaperActions(
         policy=parts.policy, deployments=deployments, broker=broker, config=parts.config,

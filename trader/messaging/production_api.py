@@ -1362,14 +1362,17 @@ def _register_ai_deployment_rpc_handler(coordinator: TradingCommandCoordinator, 
     return _handler
 
 
-def _submit_ai_paper_decision_rpc_handler(coordinator: TradingCommandCoordinator, account_id: Optional[str]):
+def _submit_ai_paper_decision_rpc_handler(coordinator: TradingCommandCoordinator, account_id: Optional[str],
+                                          epochs):
     from trader.automation.ai_paper_decision import AI_PAPER_ACTION, command_id_for
 
     def _handler(parsed: SubmitAiPaperDecisionRequest, caller: RpcCaller) -> Dict[str, Any]:
+        _require_controller_epoch(epochs, caller)
         request = CommandRequest(
             command_id=command_id_for(parsed.decision_id), action=AI_PAPER_ACTION, account_id=account_id,
             target_type="conid", target_id=str(parsed.conid), expected_version=None,
             body=parsed.model_dump(mode="json"), source=caller.principal, principal=caller.principal,
+            controller_epoch=caller.controller_epoch,
         )
         return _receipt_to_dict(coordinator.execute(request))
     return _handler
@@ -1421,7 +1424,7 @@ def register_ai_paper_authority(registry: TypedRpcRegistry, coordinator: Trading
     )
     registry.register(
         "command", "submit_ai_paper_decision", SubmitAiPaperDecisionRequest, dict,
-        _submit_ai_paper_decision_rpc_handler(coordinator, account_id), with_caller=True,
+        _submit_ai_paper_decision_rpc_handler(coordinator, account_id, ai_paper.epochs), with_caller=True,
     )
     registry.register(
         "command", "grant_ai_controller_epoch", GrantAiControllerEpochRequest, dict,

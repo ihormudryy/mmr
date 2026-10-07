@@ -7,7 +7,7 @@ import pytest
 
 from tests.automation.ai_paper_fixtures import NOW
 from tests.automation.test_controller_epoch import Clock
-from tests.test_ai_paper_rpc import _served, command, query
+from tests.test_ai_paper_rpc import _served, command, enter_body, publish, query, register
 from trader.automation.ai_paper_config import AiPaperConfig
 from trader.messaging.typed_rpc import TypedRpcRemoteError
 
@@ -59,3 +59,39 @@ def test_only_the_supervisor_may_grant(served, principal):
 def test_grant_wire_is_strict(served, body):
     assert code_of(command(served, "ai_supervisor").call, "grant_ai_controller_epoch", body, dict) == \
         "VALIDATION_ERROR"
+
+
+def armed(served):
+    publish(served)
+    digest = register(served)
+    started = command(served, "cli").call("start_experiment", {"command_id": "start-1", "reason": "go"}, dict)
+    assert started["outcome"]["state"] == "ARMED", started
+    served.stack.experiments.monitor.recover()
+    return digest
+
+
+def submit(served, body, epoch):
+    return command(served, "ai_supervisor").call("submit_ai_paper_decision", body, dict, controller_epoch=epoch)
+
+
+def test_missing_epoch_is_refused_without_a_ledger_row(served):
+    body = enter_body(armed(served))
+    assert code_of(submit, served, body, None) == "CONTROLLER_EPOCH_MISSING"
+    assert served.coordinator.get_command("aip-dec-00000001") is None
+
+
+def test_stale_holder_resend_is_refused_and_successor_replays(served, clock):       # Review Focus 1
+    body = enter_body(armed(served))
+    first = submit(served, body, grant(served)["epoch"])
+    assert first["state"] == "SUBMITTED", first
+    clock.advance(61)
+    successor = grant(served, holder="ctl-b")["epoch"]
+    assert code_of(submit, served, body, 1) == "CONTROLLER_EPOCH_STALE"
+    replay = submit(served, body, successor)                                         # replay, not a new command
+    assert (replay["state"], replay["command_id"]) == ("SUBMITTED", first["command_id"])
+    assert len(served.orders.plans) == 1
+
+
+def test_epoch_from_cli_on_submit_is_an_authentication_error(served):
+    assert code_of(command(served, "cli").call, "submit_ai_paper_decision", enter_body(), dict,
+                   controller_epoch=1) == "AUTHENTICATION_ERROR"

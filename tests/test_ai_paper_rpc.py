@@ -131,6 +131,11 @@ def query(served, principal):
     return served.client(principal, "trader", "query")
 
 
+def granted_epoch(served):
+    return command(served, "ai_supervisor").call("grant_ai_controller_epoch", {
+        "holder_id": "ctl-a", "current_epoch": None, "lease_seconds": 60}, dict)["epoch"]
+
+
 def publish(served, command_id="pol-1", limits=PAPER_LIMITS):
     return command(served, "ai_supervisor").call(
         "publish_ai_risk_policy", {"command_id": command_id, "limits": limits.to_json(), "reason": "start"}, dict)
@@ -237,7 +242,8 @@ def test_policy_above_the_owner_ceiling_is_refused(served):
 def test_every_decision_is_refused_without_an_experiment(served):
     publish(served)
     digest = register(served)
-    out = command(served, "ai_supervisor").call("submit_ai_paper_decision", enter_body(digest), dict)
+    out = command(served, "ai_supervisor").call("submit_ai_paper_decision", enter_body(digest), dict,
+                                                controller_epoch=granted_epoch(served))
     assert (out["state"], out["error_code"]) == ("REJECTED", "NO_EXPERIMENT")
     assert isinstance(served.stack.ai_paper.decisions._experiments, ExperimentStateReader)
 
@@ -248,7 +254,8 @@ def test_end_to_end_enter_through_the_stack(served):
     started = command(served, "cli").call("start_experiment", {"command_id": "start-1", "reason": "go"}, dict)
     assert started["outcome"]["state"] == "ARMED", started
     served.stack.experiments.monitor.recover()                       # trader_service does this before readiness
-    out = command(served, "ai_supervisor").call("submit_ai_paper_decision", enter_body(digest), dict)
+    out = command(served, "ai_supervisor").call("submit_ai_paper_decision", enter_body(digest), dict,
+                                                controller_epoch=granted_epoch(served))
     assert out["state"] == "SUBMITTED", out
     ((group, proposal),) = served.orders.plans
     assert group == "og-aip-dec-00000001" and proposal.quantity == 499.0

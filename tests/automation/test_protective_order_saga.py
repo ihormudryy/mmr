@@ -1462,8 +1462,6 @@ def test_an_old_leg_event_after_a_release_and_a_restart_changes_nothing(tmp_path
     assert "og:stop-late:Inactive:0.0" in restarted.resume(intent.command_id).seen_event_ids
 
 
-
-
 # --- In-flight entries count toward gross (issue #49) -------------------------
 #
 # Budget: 6% of $100k = $6,000. A "4%" entry is 25 shares at a limit of
@@ -1929,6 +1927,36 @@ def test_safety_failed_entry_keeps_its_unfilled_part_until_cancelled(tmp_path):
         _entry_fill(group, status="Cancelled", filled=12, event_id="c12"),
     )
     assert cancelled.entry_cancelled is True
+
+    # Only the 12 filled shares stay reserved: 4,002.25 + 1,921.08 fits.
+    assert _try_entry(tmp_path, empty, 25, "b").state == "SUBMITTING"
+
+
+# --- With the merged safe close (#46): a close owns the saga ---
+
+def test_a_close_owned_entry_stays_reserved_and_records_its_fills_and_cancel(tmp_path):
+    """While a close owns the saga the entry order can still fill until its
+    cancel lands: the unfilled part stays reserved and fills are recorded."""
+    from dataclasses import replace as dc_replace
+
+    empty = _snapshot()
+    saga, *_ = _build_saga(tmp_path, guard=_group_guard(empty), risk=_sized_risk())
+    first = _start_entry(saga, _entry(CONID), empty)
+    group = first.order_group_id
+    saga.on_broker_event(_entry_fill(group, status="Submitted", filled=5, event_id="p5"))
+    saga.handover(account_id=ACCOUNT, conid=CONID, close_root_id="close-1",
+                  cancels=_cancels(group, f"{group}:entry"), generation=7, now=NOW)
+    assert saga.resume(first.command_id).state == "CLOSE_OWNED"
+
+    # 20 unfilled + 5 filled are reserved: a second 25-share entry does not fit.
+    assert _try_entry(tmp_path, empty, 25, "a").error_code == "GROSS_EXPOSURE_IN_FLIGHT"
+
+    grown = saga.on_broker_event(dc_replace(
+        _entry_fill(group, status="Submitted", filled=12, event_id="p12"), order_entity_id=f"{group}:entry"))
+    assert (grown.state, grown.filled_quantity) == ("CLOSE_OWNED", Decimal(12))
+    cancelled = saga.on_broker_event(dc_replace(
+        _entry_fill(group, status="Cancelled", filled=12, event_id="c12"), order_entity_id=f"{group}:entry"))
+    assert (cancelled.state, cancelled.entry_cancelled) == ("CLOSE_OWNED", True)
 
     # Only the 12 filled shares stay reserved: 4,002.25 + 1,921.08 fits.
     assert _try_entry(tmp_path, empty, 25, "b").state == "SUBMITTING"

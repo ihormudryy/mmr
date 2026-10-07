@@ -55,8 +55,9 @@ _TERMINAL_SAGA = frozenset({"CLOSED", "SAFETY_FAILED"})
 # not here: it is written before the dispatch guard, so nothing was sent yet.
 _IN_FLIGHT_SAGA = ("SUBMITTING", "OUTCOME_UNKNOWN", "ENTRY_WORKING", "PARTIALLY_FILLED")
 # Sagas whose entry order may still be working. SAFETY_FAILED keeps recording
-# entry events (see _record_entry_after_safety_failure).
-_MAY_WORK_ENTRY_SAGA = _IN_FLIGHT_SAGA + ("SAFETY_FAILED",)
+# entry events (see _record_entry_after_safety_failure); CLOSE_OWNED records
+# them too until the close's expected cancel of the entry arrives.
+_MAY_WORK_ENTRY_SAGA = _IN_FLIGHT_SAGA + ("SAFETY_FAILED", "CLOSE_OWNED")
 
 _account_entry_locks: dict[str, threading.Lock] = {}
 _account_entry_locks_guard = threading.Lock()
@@ -1003,7 +1004,8 @@ class ProtectiveOrderSaga:
         working = event.status in _WORKING_STATUSES
         filled = event.status in _FILLED_STATUSES
         if event.leg == "entry":
-            return replace(state, entry_working=working)
+            # Fills and the cancel of the entry keep the gross reservation true.
+            return _apply_entry_leg(state, event)
         if event.leg == "stop":
             return replace(state, stop_working=working, stop_filled=state.stop_filled or filled)
         if event.leg == "take_profit":

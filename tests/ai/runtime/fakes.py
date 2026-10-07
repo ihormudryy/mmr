@@ -114,3 +114,63 @@ class ScriptedTrader:
         if step == "accept_lose_reply":
             raise RpcOutcomeUnknown("REPLY_TIMEOUT")
         return self.ledger[body["decision_id"]]
+
+
+class FakeIngest:
+    """Plan 2's ingestion semantics in memory. Script steps: "down", "lose_ack", ("refuse", code, retryable)."""
+
+    def __init__(self):
+        self.rows, self.script, self.calls = {}, [], []
+
+    async def call(self, method, body, *, epoch=None):
+        from trader.ai.rpc_clients import RpcNotSent, RpcOutcomeUnknown
+        self.calls.append((method, body["record_id"]))
+        step = self.script.pop(0) if self.script else "ok"
+        if step == "down":
+            raise RpcNotSent("TRADER_UNREACHABLE")
+        if isinstance(step, tuple):
+            return {"status": "REFUSED", "record_id": body["record_id"], "code": step[1], "detail": None,
+                    "retryable": step[2]}
+        known = self.rows.get(body["record_id"])
+        if known is not None and known != body:
+            return {"status": "REFUSED", "record_id": body["record_id"], "code": "CONFLICTING_DUPLICATE",
+                    "detail": None, "retryable": False}
+        status = "DUPLICATE" if known is not None else "INSERTED"
+        self.rows[body["record_id"]] = body
+        if step == "lose_ack":
+            raise RpcOutcomeUnknown("REPLY_TIMEOUT")
+        return {"status": status, "record_id": body["record_id"], "code": None, "detail": None, "retryable": False}
+
+
+def write_cost_event(store, *, request_key, kind, cost_micros, now, usage=None):
+    """One Plan 4 attempt and its cost event, as the gateway writes them; returns the attempt key."""
+    from trader.ai.journal import AttemptJournal
+    from trader.ai.model_client import ChatMessage, ModelRequest, ModelResponse
+    journal = AttemptJournal(store)
+
+    def work(conn):
+        attempt = journal.begin_in_tx(
+            conn, request=ModelRequest(request_key=request_key, messages=(ChatMessage("user", "hi"),),
+                                       max_output_tokens=10),
+            role="jev", backend="openrouter", model="vendor/jev-1", reservation_id=f"res-{request_key}", now=now)
+        if kind == "CONFIRMED":
+            journal.finish_success_in_tx(conn, attempt.attempt_key,
+                                         ModelResponse("ok", usage, "vendor/jev-1", "openrouter", "stop", "g-1"), now)
+        else:
+            journal.finish_failure_in_tx(conn, attempt.attempt_key,
+                                         outcome="NOT_SENT" if kind == "NONE" else "UNKNOWN",
+                                         error_code="TEST", error_detail="", now=now)
+        journal.add_cost_event_in_tx(conn, attempt=attempt, kind=kind, cost_micros=cost_micros, usage=usage, now=now)
+        return attempt.attempt_key
+    return store.transaction(work)
+
+
+def write_correction(store, attempt_key, *, usage, cost_micros, now):
+    from trader.ai.journal import AttemptJournal
+    journal = AttemptJournal(store)
+
+    def work(conn):
+        journal.reconcile_late_usage_in_tx(conn, attempt_key, usage, now)
+        journal.add_cost_event_in_tx(conn, attempt=journal.get_in_tx(conn, attempt_key), kind="CORRECTION",
+                                     cost_micros=cost_micros, usage=usage, now=now)
+    store.transaction(work)

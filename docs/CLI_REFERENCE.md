@@ -194,6 +194,9 @@ experiment start --reason "first run"        # operator; flat paper account, ai_
 experiment pause --reason "news risk"        # cli, dashboard or ai_supervisor
 experiment resume --reason "ok"              # operator; never after a kill
 experiment stop --reason "done"              # operator; once the account is flat (final)
+scoreboard                                   # PAPER scoreboard of the latest experiment ('-' = unknown)
+--json scoreboard --experiment exp-<20 hex>  # the report as JSON: {"data": ..., "title": "Scoreboard (paper)"}
+scoreboard verify                            # rebuild every number from stored inputs; exit 1 on any mismatch
 ```
 
 ## Command Service Requirements
@@ -215,6 +218,7 @@ experiment stop --reason "done"              # operator; once the account is fla
 - `listen` (publish_instrument + PubSub)
 - `forex snapshot`, `forex quote` (default IB source; IDEALPRO CASH contract)
 - `experiment status|start|pause|resume|stop` (SP1 experiments; paper only)
+- `scoreboard`, `scoreboard verify` (SP1 scoreboard; reads the journal, not IB, so no IB-upstream check)
 
 **Requires strategy typed RPC (42104/42105)**:
 - `strategies` list, `strategies enable|disable|reload`

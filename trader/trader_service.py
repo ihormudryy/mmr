@@ -413,6 +413,35 @@ def _maybe_start_experiment_monitor(
     loop.create_task(_experiment_monitor_loop(monitor, worker))
 
 
+async def _scoreboard_loop(
+    scoreboard, *, interval: float = 30.0, stuck_after: float = _WORKER_STUCK_AFTER_SECONDS,
+) -> None:
+    """SP1 Plan 5: peaks, projection, late commissions, SPY closes and Telegram, on its own thread.
+
+    Not on the liquidation worker: a slow history read or a 10 s Telegram call must never delay a flatten.
+    Every write is idempotent, so a session end recorded by the worker at the same time is safe.
+    """
+    await _watched_ticks('scoreboard', lambda: asyncio.to_thread(scoreboard.tick),
+                         interval=interval, stuck_after=stuck_after)
+
+
+def _maybe_start_scoreboard(
+    trader: Trader, loop: AbstractEventLoop, stopping: Callable[[], bool] = _never_stopping,
+) -> None:
+    """SP1 Plan 5: write rows for sessions that ended while the trader was down, then start the loop."""
+    scoreboard = getattr(trader, 'scoreboard', None)
+    if scoreboard is None or stopping():
+        return
+    try:
+        loop.run_until_complete(asyncio.to_thread(scoreboard.recover))
+    except (Exception, asyncio.CancelledError) as ex:
+        if not stopping():
+            logging.error('startup scoreboard recovery failed; the loop keeps writing new rows: {}'.format(ex))
+    if stopping():
+        return
+    loop.create_task(_scoreboard_loop(scoreboard))
+
+
 async def _orphan_reservation_tick(saga, worker):
     """One orphan sweep on the worker; reads broker state only, never sends."""
     return await _on_worker(worker, saga.retire_orphan_reservations)
@@ -580,6 +609,8 @@ def main(simulation: bool,
         _maybe_start_session_recovery(trader, loop, liquidation_worker, stopping)
         # SP1 Plan 4: the kill monitor recovers after session recovery, before readiness.
         _maybe_start_experiment_monitor(trader, loop, liquidation_worker, stopping)
+        # SP1 Plan 5: after session and kill recovery, so their terminal rows are visible to it.
+        _maybe_start_scoreboard(trader, loop, stopping)
         _maybe_start_orphan_reservation_sweep(trader, loop, liquidation_worker, stopping)
         if stopping():
             _finish_startup_shutdown(loop, shutdown)

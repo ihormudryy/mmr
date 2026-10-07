@@ -9,6 +9,8 @@ from tests.automation.ai_paper_fixtures import NOW
 from tests.automation.test_controller_epoch import Clock
 from tests.test_ai_paper_rpc import _served, command, enter_body, publish, query, register
 from trader.automation.ai_paper_config import AiPaperConfig
+from trader.data.duckdb_store import DuckDBConnection
+from trader.data.strategy_signal_record import SignalEntry, StrategySignalRecord
 from trader.messaging.typed_rpc import TypedRpcRemoteError
 
 
@@ -135,4 +137,58 @@ def test_reconcile_read_is_supervisor_only(served, principal):
 def test_reconcile_read_wire_is_strict(served, body):
     with pytest.raises(TypedRpcRemoteError) as exc:
         query(served, "ai_supervisor").call("get_ai_paper_decision", body, dict, controller_epoch=1)
+    assert exc.value.code == "VALIDATION_ERROR"
+
+
+def strategy_writes(served, minutes, *, now=NOW):
+    """The strategy service's side: its own record object on the same file."""
+    record = StrategySignalRecord(DuckDBConnection.get_instance(served.stack.ai_paper.signals_path),
+                                  now=lambda: now)
+    for minute in minutes:
+        record.append(SignalEntry.create(strategy_name="orb", conid=265598, action="BUY", probability=0.6,
+                                         signal_time=NOW + dt.timedelta(minutes=minute)))
+
+
+def read_signals(served, after, limit, epoch, principal="ai_supervisor"):
+    return query(served, principal).call("read_ai_signals", {"after_cursor": after, "limit": limit}, dict,
+                                         controller_epoch=epoch)
+
+
+def test_signals_page_through_rpc(served):
+    epoch = grant(served)["epoch"]
+    strategy_writes(served, range(3))
+    page = read_signals(served, 0, 2, epoch)
+    assert [s["cursor"] for s in page["signals"]] == [1, 2]
+    assert (page["next_cursor"], page["oldest_retained_cursor"], page["gap"]) == (2, 1, False)
+    assert page["signals"][0]["action"] == "BUY" and page["signals"][0]["conid"] == 265598
+
+
+def test_signal_gap_and_reset_are_reported(served):
+    epoch = grant(served)["epoch"]
+    strategy_writes(served, range(2))
+    strategy_writes(served, [9_999], now=NOW + dt.timedelta(days=8))
+    assert read_signals(served, 0, 10, epoch)["gap"] is True
+    assert code_of(read_signals, served, 50, 10, epoch) == "SIGNAL_CURSOR_AHEAD"
+
+
+def test_signal_read_needs_the_current_epoch(served, clock):
+    epoch = grant(served)["epoch"]
+    assert code_of(read_signals, served, 0, 10, None) == "CONTROLLER_EPOCH_MISSING"
+    clock.advance(61)
+    grant(served, holder="ctl-b")
+    assert code_of(read_signals, served, 0, 10, epoch) == "CONTROLLER_EPOCH_STALE"
+
+
+@pytest.mark.parametrize("principal", ["cli", "dashboard", "ai_research", "strategy"])
+def test_signal_read_is_supervisor_only(served, principal):
+    with pytest.raises(TypedRpcRemoteError) as exc:
+        query(served, principal).call("read_ai_signals", {"after_cursor": 0, "limit": 1}, dict)
+    assert exc.value.code == "PERMISSION_DENIED"
+
+
+@pytest.mark.parametrize("body", [{"after_cursor": 0, "limit": 501}, {"after_cursor": True, "limit": 1},
+                                  {"after_cursor": 0, "limit": 1, "x": 1}])
+def test_signal_read_wire_is_strict(served, body):
+    with pytest.raises(TypedRpcRemoteError) as exc:
+        query(served, "ai_supervisor").call("read_ai_signals", body, dict, controller_epoch=1)
     assert exc.value.code == "VALIDATION_ERROR"

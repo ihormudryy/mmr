@@ -119,6 +119,7 @@ TRADER_ACL: Mapping[tuple[str, str], frozenset[str]] = {
     # SP2 Plan 1: the controller epoch (spec 6.2). Explicit sets per method.
     ("command", "grant_ai_controller_epoch"): frozenset({"ai_supervisor"}),
     ("query", "get_ai_paper_decision"): frozenset({"ai_supervisor"}),
+    ("query", "read_ai_signals"): frozenset({"ai_supervisor"}),
     # SP1 experiments (Plan 4 K14): explicit sets per method. ai_supervisor may pause (risk-reducing)
     # and read; only operators start, resume and stop.
     ("command", "start_experiment"): frozenset({"cli", "dashboard"}),

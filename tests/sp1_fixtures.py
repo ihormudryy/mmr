@@ -559,6 +559,7 @@ class Composed:
         trader.client = SimpleNamespace(ib=self.sim, get_snapshot=self._snapshot)
         trader.executioner = self.sim
         trader.ib_account = ACCOUNT
+        trader.duckdb_path = str(tmp_path / "mmr.duckdb")
         trader.paper_trading = True
         trader._main_loop = loop_thread.loop
         trader.get_pnl = lambda: [SimpleNamespace(dailyPnL=self.sim.daily_pnl)]

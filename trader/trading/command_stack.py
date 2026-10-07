@@ -503,6 +503,8 @@ class AiPaperServices:
     actions: Any           # AiPaperActions: publish, register and the two reads
     entry_filter: Any
     epochs: Any            # ControllerEpochs (SP2 Plan 1)
+    signals: Any           # StrategySignalRecord over duckdb_path (SP2 Plan 1)
+    signals_path: str
 
 
 @dataclass(frozen=True)
@@ -582,7 +584,14 @@ def _build_ai_paper_services(
     from trader.automation.ai_paper_evidence import AI_ENTRY_POLICY, AiPaperEvidence
     from trader.automation.ai_paper_experiment import NoExperiment
     from trader.automation.controller_epoch import ControllerEpochs
+    from trader.data.duckdb_store import DuckDBConnection
+    from trader.data.strategy_signal_record import StrategySignalRecord
 
+    signals_path = getattr(trader, "duckdb_path", None)
+    if not signals_path:
+        raise CommandStackConfigurationError(
+            "MISSING_DUCKDB_PATH", "ai_paper needs duckdb_path to serve the strategy signal record")
+    signals = StrategySignalRecord(DuckDBConnection.get_instance(signals_path))
     deployments = AiDeploymentStore(trader.journal_db, now=now)
     decision_store = AiPaperDecisionStore(journal)
     evidence = AiPaperEvidence(
@@ -605,7 +614,8 @@ def _build_ai_paper_services(
     )
     return AiPaperServices(config=parts.config, policy=parts.policy, deployments=deployments,
                            decisions=decisions, decision_store=decision_store, actions=actions,
-                           entry_filter=parts.entry_filter, epochs=epochs)
+                           entry_filter=parts.entry_filter, epochs=epochs, signals=signals,
+                           signals_path=signals_path)
 
 
 _REQUIRED_TRADER_PORTS = (

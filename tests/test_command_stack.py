@@ -94,6 +94,7 @@ def _trader(tmp_path):
         book=_Book(),
         client=_Client(),
         ib_account="DU111111",
+        duckdb_path=str(tmp_path / "mmr.duckdb"),
         paper_trading=True,
         _main_loop=None,
         get_pnl=lambda: [],

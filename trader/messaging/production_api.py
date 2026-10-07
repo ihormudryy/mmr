@@ -100,6 +100,7 @@ from trader.automation.controller_epoch import (
     EpochRefused,
 )
 from trader.data.proposal_repository import ProposalRepository
+from trader.data.strategy_signal_record import MAX_READ_LIMIT, SignalCursorAhead
 from trader.domain.commands import CommandReceipt
 from trader.domain.feed_service import CURSOR_EXPIRED, CursorExpired, DomainFeedService, domain_event_to_wire
 from trader.domain.snapshot_service import SNAPSHOT_NOT_READY, DomainSnapshotService, SnapshotNotReady
@@ -910,6 +911,13 @@ class GetAiPaperDecisionRequest(BaseModel):
         return value
 
 
+class ReadAiSignalsRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid", strict=True)
+
+    after_cursor: Annotated[int, Field(ge=0)]
+    limit: Annotated[int, Field(ge=1, le=MAX_READ_LIMIT)]
+
+
 class GetAiDeploymentRequest(BaseModel):
     model_config = ConfigDict(extra="forbid", strict=True)
 
@@ -1437,6 +1445,18 @@ def _get_ai_paper_decision_handler(coordinator: TradingCommandCoordinator, ai_pa
     return _handler
 
 
+def _read_ai_signals_handler(ai_paper):
+    def _handler(parsed: ReadAiSignalsRequest, caller: RpcCaller) -> Dict[str, Any]:
+        _require_controller_epoch(ai_paper.epochs, caller)
+        try:
+            page = ai_paper.signals.read(parsed.after_cursor, parsed.limit)
+        except SignalCursorAhead as ex:
+            raise _DispatchProblem(ex.code, str(ex)) from None
+        return {"signals": [signal.to_json() for signal in page.signals], "next_cursor": page.next_cursor,
+                "oldest_retained_cursor": page.oldest_retained_cursor, "gap": page.gap}
+    return _handler
+
+
 def register_ai_paper_authority(registry: TypedRpcRegistry, coordinator: TradingCommandCoordinator,
                                 ai_paper, *, account_id: Optional[str]) -> None:
     """SP1 ai_paper (Plan 3 Task 9): only when ``ai_paper.enabled`` built the services."""
@@ -1465,6 +1485,9 @@ def register_ai_paper_authority(registry: TypedRpcRegistry, coordinator: Trading
     registry.register(
         "query", "get_ai_paper_decision", GetAiPaperDecisionRequest, dict,
         _get_ai_paper_decision_handler(coordinator, ai_paper), with_caller=True,
+    )
+    registry.register(
+        "query", "read_ai_signals", ReadAiSignalsRequest, dict, _read_ai_signals_handler(ai_paper), with_caller=True,
     )
     registry.register("query", "get_ai_risk_policy", dict, dict, _no_arg_handler(ai_paper.actions.policy_view))
     registry.register(

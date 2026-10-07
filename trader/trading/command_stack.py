@@ -1079,6 +1079,9 @@ def build_command_stack(
     from trader.automation.controller_epoch import apply_controller_epoch_migration
 
     apply_controller_epoch_migration(migrator)        # 90 (SP2 Plan 1)
+    from trader.automation.discretionary_scope import apply_scope_check_migration
+
+    apply_scope_check_migration(migrator)             # 100 (SP2 Plan 3)
     from trader.automation.experiments import apply_experiment_migration
 
     apply_experiment_migration(migrator)              # 70 (SP1 Plan 4)

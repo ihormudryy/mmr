@@ -1806,6 +1806,7 @@
     <button type="button" class="dash-tab" data-dash-tab="watchlists">Portfolios
       <span class="chip">{{ watchlists|length|default(0) }}</span></button>
     <button type="button" class="dash-tab" data-dash-tab="research">Research</button>
+    <button type="button" class="dash-tab" data-dash-tab="scoreboard">Scoreboard</button>
     <button type="button" class="dash-tab" data-dash-tab="guide">Guide</button>
     <span id="last-event-time" title="Latest authoritative event time">
       last event: <span class="v">—</span></span>
@@ -2158,6 +2159,9 @@
   <div id="dash-research" class="dash-pane" aria-label="Research">
     {% include "_research_tab.html" %}
   </div>
+  <div id="dash-scoreboard" class="dash-pane" aria-label="Scoreboard (paper)">
+    {% include "_scoreboard_tab.html" %}
+  </div>
   <div id="drawer" role="dialog" aria-modal="true" aria-label="Detail" hidden>
     <div id="drawer-box">
       <button id="drawer-close" aria-label="Close detail">×</button>
@@ -2332,6 +2336,7 @@
   <script src="/static/command_center_commands.js" defer></script>
   <script src="/static/command_center.js" defer></script>
   <script src="/static/command_center_research.js" defer></script>
+  <script src="/static/command_center_scoreboard.js" defer></script>
   <script src="/static/dash_admin.js" defer></script>
 </body>
 </html>

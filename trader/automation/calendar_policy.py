@@ -68,6 +68,24 @@ class XNYSCalendarPolicy:
     def calendar_version(self) -> str:
         return xcals.__version__
 
+    def is_session(self, day: dt.date) -> bool:
+        return bool(self._calendar.is_session(pd.Timestamp(day)))
+
+    def sessions_in_range(self, start: dt.date, end: dt.date) -> list[dt.date]:
+        """XNYS session dates in ``[start, end]``; empty when ``end`` is before ``start``."""
+        if end < start:
+            return []
+        return [ts.date() for ts in self._calendar.sessions_in_range(pd.Timestamp(start), pd.Timestamp(end))]
+
+    def sessions_between(self, start: dt.date, end: dt.date) -> int:
+        """How many sessions lie strictly between ``start`` and ``end``."""
+        return len([day for day in self.sessions_in_range(start, end) if start < day < end])
+
+    def previous_session(self, day: dt.date) -> dt.date:
+        """The last XNYS session strictly before ``day`` (also across weekends and holidays)."""
+        return self._calendar.date_to_session(pd.Timestamp(day - dt.timedelta(days=1)),
+                                              direction="previous").date()
+
     def resolve(
         self,
         now: dt.datetime,

@@ -1385,6 +1385,18 @@ def build_parser() -> argparse.ArgumentParser:
                         help='Defaults to the active experiment; the server checks it')
         _p.add_argument('--reason', required=True)
 
+    # scoreboard (SP1 Plan 5)
+    scoreboard_p = sub.add_parser(
+        'scoreboard', help='PAPER scoreboard of the ai_paper experiment (read only)',
+        epilog='Examples:\n'
+               '  scoreboard\n'
+               '  --json scoreboard --experiment exp-0123456789abcdef0123\n'
+               '  scoreboard verify          # exit code 1 on any mismatch',
+        formatter_class=fmt)
+    scoreboard_p.add_argument('scoreboard_action', nargs='?', choices=['verify'], default=None)
+    scoreboard_p.add_argument('--experiment', dest='experiment_id', default=None,
+                              help='Defaults to the latest experiment')
+
     # reject
     reject_p = sub.add_parser('reject', help='Reject a trade proposal',
                                epilog='Examples:\n'
@@ -2602,6 +2614,9 @@ def dispatch(mmr: MMR, args: argparse.Namespace) -> bool:
         elif cmd == 'experiment':
             _handle_experiment(mmr, args)
 
+        elif cmd == 'scoreboard':
+            _handle_scoreboard(mmr, args)
+
         elif cmd == 'activate-canary':
             _handle_activate_canary(mmr, args)
 
@@ -3112,6 +3127,89 @@ def _handle_experiment(mmr: MMR, args: argparse.Namespace):
     else:
         error = str(result.error or result.exception or 'Unknown error')
         print_status(f'experiment {action} failed: {error}', success=False)
+
+
+def _dash(value, fmt='{:,.2f}', suffix=''):
+    """Unknown is '-', never 0."""
+    if value is None:
+        return '-'
+    return fmt.format(value) + suffix
+
+
+def _scoreboard_lines(report: dict) -> list:
+    account, bench, trips = report['account'], report['benchmarks'], report['trips']
+    experiment = report.get('experiment')
+    lines = [f"{report['label']} - {report['disclaimer']}"]
+    if experiment is None:
+        return lines + ['No experiment yet.']
+    lines.append(f"experiment {experiment['id']} {experiment['state']} since {experiment['started_at']} "
+                 f"(base {experiment['base_currency']})")
+    lines.append(f"sessions: {account['sessions']} (unknown net liquidation: {account['unknown_nlv_sessions']})")
+    lines.append(f"return: {_dash(account['return_pct'], '{:.2f}', '%')}   "
+                 f"P&L: {_dash(account['pnl_usd'], '${:,.2f}')}   as of {account['end_date'] or '-'}")
+    lines.append(f"end-of-day drawdown: {_dash(account['eod_drawdown_pct'], '{:.2f}', '%')} "
+                 f"({account['eod_drawdown_label']})")
+    sharpe = (f"Sharpe daily: {_dash(account['sharpe_daily'], '{:.3f}')}   "
+              f"annualised: {_dash(account['sharpe_annualised'], '{:.3f}')}")
+    if account['sharpe_warning'] == 'SMALL_SAMPLE':
+        sharpe += '   (small sample: fewer than 60 sessions)'
+    lines.append(sharpe)
+    spy = bench['spy']
+    lines.append(f"SPY return: {_dash(spy['return_pct'], '{:.2f}', '%')} from the {spy['base_date'] or '-'} close "
+                 f"({spy['label']})   vs SPY: {_dash(bench['vs_spy_pp'], '{:+.2f}', ' pp')}")
+    simulated = bench['simulated']
+    lines.append('simulated baseline (simulated): ' + (
+        'unavailable' if simulated['status'] == 'UNAVAILABLE'
+        else f"{simulated['rows']} rows, P&L {_dash(simulated['pnl_usd'], '${:,.2f}')}"))
+    ai_cost = ('unavailable' if bench['ai_costs_status'] == 'UNAVAILABLE'
+               else f"{_dash(bench['ai_cost_usd'], '${:,.2f}')} over {bench['ai_calls']} calls")
+    lines.append(f"AI cost: {ai_cost}   P&L minus AI cost: {_dash(bench['pnl_minus_ai_cost_usd'], '${:,.2f}')}")
+    lines.append(f"trips: {trips['closed']} closed, {trips['open']} open, win rate "
+                 f"{_dash(trips['win_rate'], '{:.0%}')}, profit factor {_dash(trips['profit_factor'], '{:.2f}')}, "
+                 f"fees {_dash(trips['fees_usd'], '${:,.2f}')}, turnover {_dash(trips['turnover'], '{:.2f}')}x, "
+                 f"unresolved fees {trips['unresolved_fee_trips']}")
+    for row in report['sessions']:
+        lines.append(f"  {row['date']} {row['end_state']:<11} return {_dash(row['return_pct'], '{:.2f}', '%')} "
+                     f"realized {_dash(row['realized_pnl_usd'], '${:,.2f}')} "
+                     f"fees {_dash(row['commissions_usd'], '${:,.2f}')} trades {row['trade_count']} "
+                     f"open {_dash(row['open_positions'], '{}')}")
+    for warning in report['warnings']:
+        lines.append(f"warning {warning['code']}: {warning['detail']}")
+    for incident in report['incidents']:
+        lines.append(f"incident {incident['kind']} {incident['key']}: {incident['detail']}")
+    outbox = report.get('outbox') or {}
+    lines.append('telegram: ' + ('disabled' if not outbox.get('enabled') else
+                                 f"{outbox['pending']} pending, last sent {outbox['last_sent_at'] or '-'}"))
+    return lines
+
+
+def _handle_scoreboard(mmr: MMR, args: argparse.Namespace):
+    if getattr(args, 'scoreboard_action', None) == 'verify':
+        result = mmr.verify_scoreboard(args.experiment_id)
+        if _json_mode:
+            print_json_result(result, title='Scoreboard verify (paper)')
+        elif result.get('error_code'):
+            print_status(f"scoreboard verify: {result['error_code']}", success=False)
+        elif result['ok']:
+            checked = result['checked']
+            print_status(f"scoreboard verify OK: {checked['seals']} seals, {checked['round_trips']} round trips, "
+                         f"{checked['sessions']} sessions")
+        else:
+            for mismatch in result['mismatches']:
+                console.print(f"MISMATCH {mismatch['check']} {mismatch['table']} {mismatch['key']}",
+                              markup=False, highlight=False, soft_wrap=True)
+        if not result.get('ok'):
+            sys.exit(1)
+        return
+    report = mmr.scoreboard(args.experiment_id)
+    if _json_mode:
+        print_json_result(report, title='Scoreboard (paper)')
+        return
+    if report.get('error_code'):
+        print_status(f"scoreboard: {report['error_code']}", success=False)
+        return
+    for line in _scoreboard_lines(report):
+        console.print(line, markup=False, highlight=False, soft_wrap=True)
 
 
 def _handle_activate_canary(mmr: MMR, args: argparse.Namespace):
@@ -12105,7 +12203,7 @@ _LOCAL_ONLY_COMMANDS = {
     'snapshot', 'snap', 'snapshot-batch', 'depth',
     'risk-limits', 'rl', 'reconcile', 'diagnose', 'approve', 'listen',
     'ideas', 'scan-ideas',
-    'market-hours', 'mh', 'session', 'group', 'research',
+    'market-hours', 'mh', 'session', 'group', 'research', 'scoreboard',
 }
 # strategies list/enable/disable/reload hit strategy typed ports; create/deploy
 # etc. are YAML-local. Legacy connect is never needed for strategies/*.

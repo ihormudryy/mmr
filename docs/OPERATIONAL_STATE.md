@@ -348,6 +348,33 @@ are separate; each loader refuses the other kind.
    key is missing; all services run as one user there, so keys are not
    isolated from each other.
 
+## Scoreboard and Telegram summary (SP1 Plan 5)
+
+- `mmr scoreboard` / `mmr --json scoreboard` / `mmr scoreboard verify` need
+  trader_service (typed RPC). The `/cc` Scoreboard tab reads the same report.
+- Telegram is **off** by default. While `ai_paper.telegram.enabled` is false
+  nothing is sent and no outbox row is written, so enabling it later does not
+  send a backlog (at most the latest session's summary).
+- **Owner-only setup** (never in chat, never in a file in the repo):
+  1. Create a bot with @BotFather and note its token; find the chat id of the
+     chat that should receive the summaries.
+  2. `mkdir -p ~/.config/mmr/secrets && chmod 700 ~/.config/mmr/secrets`, write
+     the token to `~/.config/mmr/secrets/telegram.token`, `chmod 600` it.
+  3. In `~/.config/mmr/trader.yaml`:
+     `ai_paper: {telegram: {enabled: true, chat_id: <id>, token_secret_file: ~/.config/mmr/secrets/telegram.token}}`.
+  4. Restart trader_service. With `enabled: true` and a missing, empty,
+     symlinked or group/world-readable token file, a bad chat id or an unknown
+     key, the trader **stops at start** with a `TelegramConfigError`.
+- Only the trader container mounts `~/.config/mmr/secrets` (read-only); every
+  other service hides it behind a tmpfs. Not checked live: whether a 0600 token
+  file bind-mounted from the macOS host is readable by the container user.
+- Delivery is **at-least-once**: a crash between send and mark-sent repeats one
+  message; every message ends with `event <id>`, so a repeat is recognisable.
+  A Telegram outage only delays messages (30 s backoff doubling to 1 h).
+- One summary per session end in `FLAT`, `KILLED` or `FAILED_SAFE`; an
+  `UNKNOWN` row (the trader was down at the end) sends none and shows as a
+  `SESSION_MISSING` incident on the scoreboard.
+
 ---
 
 ## Next operator session (paper soak)

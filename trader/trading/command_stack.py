@@ -489,6 +489,7 @@ class CommandStack:
     ai_paper: Any = None  # AiPaperServices when ai_paper.enabled (SP1 Plan 3)
     experiments: Any = None  # ExperimentServices on paper (SP1 Plan 4, K15)
     mode_conflict: Optional[str] = None  # "BOTH_MODES_ARMED" (SP1 Plan 4 K17)
+    scoreboard: Any = None  # ScoreboardServices (SP1 Plan 5): equity_daily, verify, Telegram outbox
 
 
 @dataclass(frozen=True)
@@ -833,6 +834,35 @@ def _build_experiment_services(
     reader = ExperimentStateReader(parts.store, monitor, mode_conflict=mode_conflict)
     return ExperimentServices(store=parts.store, service=service, monitor=monitor, reader=reader,
                               lock=parts.arming_lock, config_path=_trader_yaml_path())
+
+
+def _scoreboard_terminal(slot: dict, state: Any) -> None:
+    ledger = slot["ledger"]
+    if ledger is None:
+        logger.error("session %s ended %s before the scoreboard was built; ledger.recover writes its row",
+                     state.session_date, state.state)
+        return
+    ledger.on_controller_terminal(state)
+
+
+def _build_scoreboard(trader: Any, migrator: Any, broker: Any, experiments: Optional[ExperimentServices],
+                      ai_paper: Any, now: Callable[[], dt.datetime]) -> Any:
+    """SP1 Plan 5. An enabled but invalid ai_paper.telegram section raises here: startup stops (ruling 17)."""
+    from trader.automation.calendar_policy import XNYSCalendarPolicy
+    from trader.messaging.trader_service_api import TraderServiceApi
+    from trader.scoreboard.wiring import build_scoreboard
+
+    scoreboard = build_scoreboard(
+        trader, migrator=migrator, broker=broker,
+        experiments=None if experiments is None else experiments.store,
+        decision_store=None if ai_paper is None else ai_paper.decision_store,
+        calendar=XNYSCalendarPolicy(),
+        cash=lambda: TraderServiceApi(trader).get_account_cash_by_currency(), now=now)
+    if experiments is not None:
+        # Plan 4 K18: kill_started alerts go to the outbox (None while Telegram is off: logged NO_OUTBOX),
+        # the KILLED session end to the ledger.
+        experiments.monitor.attach_notices(alerts=scoreboard.outbox, session_end=scoreboard.ledger)
+    return scoreboard
 
 
 def _trader_yaml_path() -> Path:
@@ -1262,6 +1292,9 @@ def build_command_stack(
         ai_paper_parts, broker=broker_snapshot, cancel=_LiquidationDispatch(dispatch, orders_view),
         liquidation=liquidation_service, account_id=trader.ib_account, now=now,
     )
+    # SP1 Plan 5: the ledger is built after the experiment and ai_paper services; the slot is set below,
+    # before any session tick can run.
+    scoreboard_slot: dict[str, Any] = {"ledger": None}
     session_controller = SessionController(
         journal=journal,
         db=trader.journal_db,
@@ -1274,6 +1307,7 @@ def build_command_stack(
         account_id=trader.ib_account,
         now=now,
         on_entry_cutoff=None if ai_entry_cutoff is None else ai_entry_cutoff.on_entry_cutoff,
+        on_terminal=lambda state: _scoreboard_terminal(scoreboard_slot, state),
     )
     experiments = _build_experiment_services(
         trader, experiment_parts, journal=journal, broker=broker_snapshot, liquidation=liquidation_service,
@@ -1371,6 +1405,8 @@ def build_command_stack(
         experiments=None if experiments is None else experiments.reader,
     )
     late["ai_paper"] = ai_paper
+    scoreboard = _build_scoreboard(trader, migrator, broker_snapshot, experiments, ai_paper, now)
+    scoreboard_slot["ledger"] = scoreboard.ledger
     from trader.automation.paper_activation import PaperAutomationActivationService
     from trader.automation.paper_hot_arm import ProductionPaperHotArmPorts
 
@@ -1427,6 +1463,7 @@ def build_command_stack(
         strategy_control_service=strategy_control_service,
         ai_paper=ai_paper,
         experiments=experiments,
+        scoreboard=scoreboard,
     )
 
     def _build_intent_for_hot_arm(trader_obj: Any):
@@ -1498,6 +1535,10 @@ def build_command_stack(
     trader.attribution_ledger = attribution_ledger
     if ai_paper is not None:
         trader.ai_paper_attribution = ai_paper.decision_store  # Plan 5 reads links_for_order_ref here
+    trader.scoreboard = scoreboard
+    trader.scoreboard_service = scoreboard.service              # get_scoreboard / verify_scoreboard
+    trader.session_ledger = scoreboard.ledger
+    trader.telegram_outbox = scoreboard.outbox
     if experiments is not None:
         trader.experiment_store = experiments.store            # Plan 5's A1 reader
         trader.kill_line_monitor = experiments.monitor

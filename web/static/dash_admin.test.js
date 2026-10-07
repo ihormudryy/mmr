@@ -107,4 +107,36 @@ assert.equal(panes[0].classList.contains('active'), false);
   assert.equal(ctx.location.href.includes('flash='), false);
 }
 
-console.log('dash_admin.test.js: 2 tests passed');
+{
+  // SP1 Plan 5: the hash #scoreboard activates dash-scoreboard.
+  const source2 = source;
+  const ctx = (function () {
+    const tabs = ['trading', 'scoreboard'].map((name) => element({dashTab: name}));
+    const panes = ['trading', 'scoreboard'].map((name) => element({id: `dash-${name}`}));
+    const byId = new Map(panes.map((pane) => [pane.id, pane]));
+    const location = {hash: '#scoreboard', href: 'http://localhost/cc#scoreboard', reload() {}};
+    const document = {
+      getElementById(id) { return byId.get(id) || null; },
+      querySelector() { return null; },
+      querySelectorAll(selector) {
+        if (selector === '.dash-tab') return tabs;
+        if (selector === '.dash-pane') return panes;
+        return [];
+      },
+      addEventListener() {},
+    };
+    const window = {innerHeight: 800, innerWidth: 1200, addEventListener() {}, confirm() { return true; },
+                    alert() {}, location};
+    const history = {replaceState(_s, _t, next) { location.hash = String(next || ''); }};
+    const context = vm.createContext({console, document, history, location, setInterval() { return 1; },
+                                      window, URL});
+    window.window = window;
+    vm.runInContext(source2, context, {filename: 'dash_admin.js'});
+    return {tabs, panes, location};
+  })();
+  assert.equal(ctx.location.hash, '#scoreboard');
+  assert.equal(ctx.tabs[1].classList.contains('active'), true);
+  assert.equal(ctx.panes[1].classList.contains('active'), true);
+}
+
+console.log('dash_admin.test.js: 3 tests passed');

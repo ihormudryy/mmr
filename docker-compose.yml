@@ -196,6 +196,12 @@ services:
           mode: 0755
       # Retired shared HMAC key: unreadable in every container (ruling 14).
       - /dev/null:/home/trader/.config/mmr/service_hmac.key:ro
+      # Telegram secrets: hidden here; only the trader mounts them (SP1 Plan 5).
+      - type: tmpfs
+        target: /home/trader/.config/mmr/secrets
+        tmpfs:
+          size: 4096
+          mode: 0700
       - mmr_db_data:/home/trader/.local/share/mmr/data
       - ${HOME}/.local/share/mmr/logs:/home/trader/.local/share/mmr/logs
     healthcheck:
@@ -266,6 +272,10 @@ services:
       - ${HOME}/.config/mmr/keys/rpc/strategy.pub:/home/trader/.config/mmr/keys/rpc/strategy.pub:ro
       # Retired shared HMAC key: unreadable in every container (ruling 14).
       - /dev/null:/home/trader/.config/mmr/service_hmac.key:ro
+      # Telegram bot token (SP1 Plan 5): only the trader sees ~/.config/mmr/secrets, read-only.
+      # A directory mount on purpose: a missing single-file bind makes Docker create a
+      # directory in its place; a missing directory is just empty (Telegram stays off).
+      - ${HOME}/.config/mmr/secrets:/home/trader/.config/mmr/secrets:ro
       - mmr_db_data:/home/trader/.local/share/mmr/data
       - ${HOME}/.local/share/mmr/logs:/home/trader/.local/share/mmr/logs
       # Paper-automation Activate (dashboard hot-arm) reads the bundles that
@@ -355,6 +365,12 @@ services:
       - ${HOME}/.config/mmr/keys/rpc/trader.pub:/home/trader/.config/mmr/keys/rpc/trader.pub:ro
       # Retired shared HMAC key: unreadable in every container (ruling 14).
       - /dev/null:/home/trader/.config/mmr/service_hmac.key:ro
+      # Telegram secrets: hidden here; only the trader mounts them (SP1 Plan 5).
+      - type: tmpfs
+        target: /home/trader/.config/mmr/secrets
+        tmpfs:
+          size: 4096
+          mode: 0700
       - mmr_db_data:/home/trader/.local/share/mmr/data
       - ${HOME}/.local/share/mmr/logs:/home/trader/.local/share/mmr/logs
       # P3 Task 9: same read-only artifact tree the trader verifies again at
@@ -473,6 +489,12 @@ services:
       - ${HOME}/.config/mmr/keys/rpc/trader.pub:/home/trader/.config/mmr/keys/rpc/trader.pub:ro
       # Retired shared HMAC key: unreadable in every container (ruling 14).
       - /dev/null:/home/trader/.config/mmr/service_hmac.key:ro
+      # Telegram secrets: hidden here; only the trader mounts them (SP1 Plan 5).
+      - type: tmpfs
+        target: /home/trader/.config/mmr/secrets
+        tmpfs:
+          size: 4096
+          mode: 0700
       - ${HOME}/.local/share/mmr/logs:/home/trader/.local/share/mmr/logs
     healthcheck:
       test: ["CMD", "curl", "-f", "http://127.0.0.1:7424/healthz"]
@@ -521,6 +543,12 @@ services:
           mode: 0755
       # Retired shared HMAC key: unreadable in every container (ruling 14).
       - /dev/null:/home/trader/.config/mmr/service_hmac.key:ro
+      # Telegram secrets: hidden here; only the trader mounts them (SP1 Plan 5).
+      - type: tmpfs
+        target: /home/trader/.config/mmr/secrets
+        tmpfs:
+          size: 4096
+          mode: 0700
       - mmr_db_data:/home/trader/.local/share/mmr/data
       - ${HOME}/.local/share/mmr/backups:/home/trader/.local/share/mmr/backups
       - ${HOME}/.local/share/mmr/logs:/home/trader/.local/share/mmr/logs
@@ -563,6 +591,12 @@ services:
       - ${HOME}/.config/mmr/keys/rpc/strategy.pub:/home/trader/.config/mmr/keys/rpc/strategy.pub:ro
       - ${HOME}/.config/mmr/keys/rpc/trader.pub:/home/trader/.config/mmr/keys/rpc/trader.pub:ro
       - /dev/null:/home/trader/.config/mmr/service_hmac.key:ro
+      # Telegram secrets: hidden here; only the trader mounts them (SP1 Plan 5).
+      - type: tmpfs
+        target: /home/trader/.config/mmr/secrets
+        tmpfs:
+          size: 4096
+          mode: 0700
       - ${HOME}/.local/share/mmr/logs:/home/trader/.local/share/mmr/logs
 
   # ── keygen: one-shot RPC key management (owner answer 2) ─────────────────

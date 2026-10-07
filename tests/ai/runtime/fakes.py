@@ -207,3 +207,52 @@ class FakeSignals:
         rows = [s for _, s in page]
         return {"signals": rows, "next_cursor": page[-1][0] if page else start,
                 "oldest_retained_cursor": self.watermark + 1, "gap": body["after_cursor"] < self.watermark}
+
+
+EXP_ID = "exp-" + "b" * 20
+
+
+def open_trip(conid=AAPL, quantity=3.0, decision_id="dec-" + "9" * 32):
+    return {"round_trip_id": f"rt-{conid}", "conid": conid, "symbol": "AAPL", "direction": "LONG",
+            "opened_at": et(10, 0).isoformat(), "closed_at": None, "opened_quantity": quantity,
+            "closed_quantity": None, "exec_ids": [], "net_pnl_usd": None, "decision_id": decision_id,
+            "strategy_ref": "orb", "state": "OPEN"}
+
+
+class FakeTrader:
+    """One trader for the controller tests: experiment view, trips, signals, decisions and ingestion."""
+
+    def __init__(self):
+        self.signals, self.decisions, self.ingest = FakeSignals(), ScriptedTrader(), FakeIngest()
+        self.state, self.entry_block, self.trips, self.experiment_down = "ARMED", None, [], False
+
+    async def call(self, method, body, *, epoch=None):
+        from trader.ai.rpc_clients import RpcNotSent
+        if method == "get_experiment":
+            if self.experiment_down:
+                raise RpcNotSent("TRADER_UNREACHABLE")
+            if self.state is None:
+                return {"experiment": None, "entry_block": None}
+            return {"experiment": {"experiment_id": EXP_ID, "state": self.state, "started_at": et(9, 31).isoformat()},
+                    "entry_block": self.entry_block}
+        if method == "get_experiment_trips":
+            return {"experiment_id": body["experiment_id"], "generation": 1, "trips": list(self.trips)}
+        if method == "read_ai_signals":
+            return await self.signals.call(method, body, epoch=epoch)
+        if method in ("record_ai_cost", "record_simulated_decision"):
+            return await self.ingest.call(method, body, epoch=epoch)
+        return await self.decisions.call(method, body, epoch=epoch)
+
+
+class FakeGateway:
+    """Only deadlines: the scripted engine never calls a model."""
+
+    def __init__(self, clock):
+        self.clock = clock
+
+    def new_deadline(self, label=""):
+        from trader.ai.gateway import DecisionDeadline
+        return DecisionDeadline(self.clock, 60, label)
+
+    async def call(self, role, request, deadline):
+        raise AssertionError("no model call in the Plan 5 tests")

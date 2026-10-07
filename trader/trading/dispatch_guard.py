@@ -140,6 +140,8 @@ class DispatchGuard:
         allocation_policy: Any = None,
         allocation_authority_lookup: Any = None,
         current_limits: Callable[[Any], RiskLimits] = lambda request: PAPER_LIMITS,
+        ai_entry_gate: Callable[[Any, Any, Any, dt.datetime], Optional[str]] = lambda *args: None,
+        strict_margin_actions: frozenset[str] = frozenset(),
     ):
         self._broker = broker
         self._quotes = quotes
@@ -152,6 +154,8 @@ class DispatchGuard:
         self._allocation_policy = allocation_policy
         self._allocation_authority_lookup = allocation_authority_lookup
         self._current_limits = current_limits
+        self._ai_entry_gate = ai_entry_gate
+        self._strict_margin_actions = frozenset(strict_margin_actions)
 
     def _limits_for(self, request) -> RiskLimits:
         try:
@@ -195,6 +199,32 @@ class DispatchGuard:
         if not decision.approved:
             code = decision.reason_codes[0] if decision.reason_codes else "GROSS_EXPOSURE"
             raise DispatchGuardError(code, "allocation policy rejected at dispatch")
+
+    def _recheck_entry_limits(self, approved, request, current, price: float) -> None:
+        """An ai_paper entry is re-checked only when a field got tighter since approval."""
+        evidence = getattr(approved, "entry_limits", None)
+        if evidence is None:
+            return
+        tight = evidence.limits.tighter(self._limits_for(request))
+        if tight == evidence.limits:
+            return
+        from trader.automation.ai_paper_sizing import entry_limit_violations
+        try:
+            violations = entry_limit_violations(
+                tight, broker=current, conid=approved.conid, quantity=abs(float(approved.quantity)),
+                price=price, evidence=evidence)
+        except Exception as exc:
+            raise DispatchGuardError("LIMITS_UNAVAILABLE", "entry limits re-check failed") from exc
+        if violations:
+            raise DispatchGuardError(violations[0], "limits tightened after approval")
+
+    def _run_ai_entry_gate(self, request, approved, quote, now: dt.datetime) -> None:
+        try:
+            code = self._ai_entry_gate(request, approved, quote, now)
+        except Exception as exc:
+            raise DispatchGuardError("AI_ENTRY_GATE_UNAVAILABLE", "ai entry gate failed") from exc
+        if code:
+            raise DispatchGuardError(code, "ai_paper entry refused at dispatch")
 
     def _active_authority(self, account_id: str, evidence):
         authority = None
@@ -334,6 +364,8 @@ class DispatchGuard:
             raise DispatchGuardError("TRADING_PAUSED", "new exposure is paused", retryable=True) from exc
 
         warnings: tuple[str, ...] = ()
+        # An ai_paper entry refuses a missing or invalid what-if; the old paper path only warns (R11).
+        strict_margin = getattr(request, "action", None) in self._strict_margin_actions
         try:
             margin = self._margin.what_if_margin(
                 approved.conid, approved.side, approved.quantity
@@ -343,6 +375,10 @@ class DispatchGuard:
         if self._account_mode == "live" and margin is None:
             raise DispatchGuardError(
                 "WHAT_IF_UNAVAILABLE", "live margin what-if is required", retryable=True
+            )
+        if strict_margin and margin is None:
+            raise DispatchGuardError(
+                "MARGIN_UNAVAILABLE", "margin what-if is required", retryable=True
             )
         if margin is not None:
             try:
@@ -360,6 +396,8 @@ class DispatchGuard:
                     raise DispatchGuardError(
                         "WHAT_IF_INVALID", "live margin what-if is invalid"
                     )
+                if strict_margin:
+                    raise DispatchGuardError("MARGIN_INVALID", "margin what-if is invalid")
                 margin = None
         if self._account_mode != "live" and margin is None:
             warnings = ("WHAT_IF_UNAVAILABLE_PAPER",)
@@ -373,6 +411,9 @@ class DispatchGuard:
             and _direction(approved.risk_direction) != "REDUCING"
         ):
             self._recheck_allocation(approved, request, current, price, automated)
+        # Reductions returned above, so both run for every entry.
+        self._recheck_entry_limits(approved, request, current, price)
+        self._run_ai_entry_gate(request, approved, quote, now)
 
         return DispatchPermit(
             generation_id=current.generation_id,

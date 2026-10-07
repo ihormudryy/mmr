@@ -500,3 +500,71 @@ def test_automated_entry_actions_name_both_paths():
     from trader.trading.dispatch_guard import AUTOMATED_ENTRY_ACTIONS
 
     assert AUTOMATED_ENTRY_ACTIONS == frozenset({"execute_automated_intent", "submit_ai_paper_decision"})
+
+
+# --- Plan 3 Task 6: ai_paper entry limits re-checked at dispatch ------------
+
+from trader.data.broker_state import BrokerRiskSnapshot as _Snapshot  # noqa: E402
+from trader.trading.approval_context import EntryLimitsEvidence  # noqa: E402
+
+
+def _ai_request():
+    return replace(_automated_request(), action="submit_ai_paper_decision",
+                   body={"expires_at": (NOW + dt.timedelta(minutes=5)).isoformat()})
+
+
+def _two_positions():
+    """Two held conids, neither the entry's: the entry needs a third slot."""
+    others = tuple(replace(_position(), conid=conid, market_value=1_000.0) for conid in (998, 999))
+    return replace(_snapshot(), positions=others)
+
+
+def _ai_entry_approval(*, quantity=5.0, snapshot=None, limits=PAPER_LIMITS):
+    evidence = EntryLimitsEvidence(limits=limits, stop_price=200.0, liquidity_max_shares=1e6,
+                                   notional_cap=1e9, daily_loss_anchor=100_000.0, high_water_mark=100_000.0)
+    return replace(_approved(quantity=quantity, snapshot=snapshot), entry_limits=evidence)
+
+
+def _entry_guard(current_limits, snapshot=None):
+    guard = _guard(snapshot=snapshot, margin={"initMarginAfter": 1000.0, "equityWithLoanAfter": 99_000.0})
+    guard._current_limits = current_limits
+    return guard
+
+
+def test_entry_limits_tightened_between_approval_and_dispatch_refuse():
+    guard = _entry_guard(lambda r: replace(PAPER_LIMITS, position_fraction=0.02))   # 2,100 held + 1,050 > 2%
+    with pytest.raises(DispatchGuardError) as caught:
+        guard.revalidate(_ai_entry_approval(), _ai_request(), NOW)
+    assert caught.value.code == "LIMIT_TIGHTENED_BEFORE_DISPATCH"
+
+
+@pytest.mark.parametrize("tight,snapshot", [
+    ({"daily_loss_fraction": 0.001}, None),               # -100 on the 100k anchor
+    ({"max_positions": 1}, "two_positions"),
+    ({"trade_risk_fraction": 0.0001}, None)])             # 10 risk / 10.00 stop distance = 1 share
+def test_each_tightened_field_is_rechecked(tight, snapshot):
+    snap = _two_positions() if snapshot == "two_positions" else None
+    guard = _entry_guard(lambda r: replace(PAPER_LIMITS, **tight), snapshot=snap)
+    with pytest.raises(DispatchGuardError) as caught:
+        guard.revalidate(_ai_entry_approval(snapshot=snap), _ai_request(), NOW)
+    assert caught.value.code == "LIMIT_TIGHTENED_BEFORE_DISPATCH"
+
+
+def test_unchanged_entry_limits_skip_the_recheck(monkeypatch):
+    import trader.automation.ai_paper_sizing as sizing
+    monkeypatch.setattr(sizing, "entry_limit_violations",
+                        lambda *a, **k: pytest.fail("re-checked unchanged limits"))
+    assert _entry_guard(lambda r: PAPER_LIMITS).revalidate(_ai_entry_approval(), _ai_request(), NOW)
+
+
+def test_a_looser_current_policy_never_loosens_the_approved_entry():
+    guard = _entry_guard(lambda r: replace(PAPER_LIMITS, gross_fraction=0.15))
+    assert guard.revalidate(_ai_entry_approval(), _ai_request(), NOW).generation_id == 2
+
+
+def test_entry_limits_provider_failure_refuses():
+    def boom(request):
+        raise RuntimeError("store down")
+    with pytest.raises(DispatchGuardError) as caught:
+        _entry_guard(boom).revalidate(_ai_entry_approval(), _ai_request(), NOW)
+    assert caught.value.code == "LIMITS_UNAVAILABLE"

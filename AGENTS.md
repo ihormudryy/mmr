@@ -101,7 +101,7 @@ The CLI, SDK and dashboard talk to trader and strategy over **typed RPC** (`trad
 | 42001 | Legacy dill RPC | trader: unbound in production; offline simulation only |
 
 Top-level directories:
-- `trader/`: core library and service entry points (`mmr_cli.py`, `sdk.py`, `trading/`, `messaging/`, `data/`, `simulation/`, `research/`, `automation/`, `data_providers/`).
+- `trader/`: core library and service entry points (`mmr_cli.py`, `sdk.py`, `trading/`, `messaging/`, `data/`, `simulation/`, `research/`, `automation/`, `data_providers/`, `ai/`: model plumbing for the AI paper bot (config, model adapters, budget, journal, replay), no trader RPC, its database is `ai.duckdb`).
 - `strategies/`: strategy files. `research/`: specs for `mmr research evaluate`.
 - `web/`: dashboard. `config_defaults/`: config templates (copied to `~/.config/mmr/` on first run only; editing them does not change a running system).
 - `scripts/`: operational scripts, release gates, drills. `skills/`: Claude skills. `tests/`: pytest suite. `docs/`: reference docs.

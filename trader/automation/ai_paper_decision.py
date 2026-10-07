@@ -500,6 +500,9 @@ class AiPaperDecisionService:
 
     def _execute_entry(self, cmd: CommandRequest, decision: AiPaperDecision, admission: _Admission) -> CommandReceipt:
         experiment = self._experiment(allow=("ARMED",))
+        if getattr(experiment, "entry_block", None):
+            # Plan 4 K19, row 4c: KILL_LINE_UNKNOWN, EXPERIMENT_MONITOR_NOT_READY, BOTH_MODES_ARMED.
+            raise _Refusal(experiment.entry_block)
         self._check_expiry(decision)
         snapshot = self._capture()
         self._validate(cmd, admission, decision.conid, snapshot,

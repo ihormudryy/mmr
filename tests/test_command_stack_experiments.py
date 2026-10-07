@@ -128,3 +128,97 @@ def test_activation_service_gets_the_experiment_lock(tmp_path):
     stack = build_command_stack(trader, _policy(), now=lambda: NOW)
     assert stack.paper_automation_service._experiment_lock.blocking_state() == "ARMED"
     assert stack.paper_hot_arm._experiment_lock is stack.paper_automation_service._experiment_lock
+
+
+# -- Task 6: composition -------------------------------------------------------
+
+def _ai_trader(tmp_path, *, enabled=True, kill_pct=20.0):
+    from trader.automation.ai_paper_config import load_ai_paper_config
+    trader = _trader(tmp_path)
+    raw = {"enabled": enabled} if kill_pct is None else {"enabled": enabled, "experiment_kill_drawdown_pct": kill_pct}
+    trader.ai_paper_config = load_ai_paper_config(raw, trading_mode="paper")
+    return trader
+
+
+def _start(stack, principal="cli", command_id="s1"):
+    from trader.trading.command_coordinator import CommandRequest
+    return stack.experiments.service.start(CommandRequest(
+        command_id=command_id, action="start_experiment", account_id=ACCOUNT, target_type="experiment",
+        target_id=ACCOUNT, expected_version=None, body={"reason": "go"}, source=principal, principal=principal))
+
+
+def test_experiments_exist_with_ai_paper_disabled(tmp_path):              # K15
+    from trader.trading.command_coordinator import CommandValidationError
+    from trader.trading.command_stack import build_command_stack
+    stack = build_command_stack(_trader(tmp_path), _policy(), now=lambda: NOW)
+    assert stack.ai_paper is None and stack.experiments is not None
+    stack.experiments.service.attach_identity_check(lambda: None)
+    with pytest.raises(CommandValidationError) as exc:
+        _start(stack)
+    assert exc.value.code == "AI_PAPER_DISABLED"
+
+
+def test_ai_paper_built_is_late_bound(tmp_path):
+    from trader.trading.command_stack import build_command_stack
+    stack = build_command_stack(_ai_trader(tmp_path), _policy(), now=lambda: NOW)
+    assert stack.ai_paper is not None and stack.experiments.service.ports.ai_paper_built() is True
+
+
+def test_dispatch_guard_gets_the_experiment_gate(tmp_path):
+    from types import SimpleNamespace
+    from trader.trading.command_stack import build_command_stack
+    stack = build_command_stack(_ai_trader(tmp_path), _policy(), now=lambda: NOW)
+    gate = stack.dispatch_guard._experiment_gate
+    assert gate(SimpleNamespace(action="submit_ai_paper_decision")) == "NO_EXPERIMENT"
+    assert gate(SimpleNamespace(action="approve_proposal")) is None
+
+
+def test_live_dispatch_guard_gate_is_a_no_op(tmp_path):
+    from types import SimpleNamespace
+    from trader.trading.command_policy import CommandAuthorityPolicy
+    from trader.trading.command_stack import build_command_stack
+    trader = _trader(tmp_path)
+    trader.ib_account, trader.paper_trading = "U111111", False
+    stack = build_command_stack(trader, CommandAuthorityPolicy(
+        enabled=True, live_enabled=True, live_account_id="U111111", max_order_notional=25_000.0),
+        now=lambda: NOW)
+    assert stack.dispatch_guard._experiment_gate(SimpleNamespace(action="submit_ai_paper_decision")) is None
+
+
+def test_experiment_start_refused_while_one_strategy_is_armed(tmp_path):
+    from trader.trading.command_coordinator import CommandValidationError
+    from trader.trading.command_stack import build_command_stack
+    trader = _ai_trader(tmp_path)
+    _arm_old_path(trader, tmp_path)
+    stack = build_command_stack(trader, _policy(), now=lambda: NOW)
+    stack.experiments.service.attach_identity_check(lambda: None)
+    with pytest.raises(CommandValidationError) as exc:
+        _start(stack)
+    assert exc.value.code == "ONE_STRATEGY_ARMED"
+
+
+def test_ai_enter_is_refused_with_both_modes_armed(tmp_path):                   # K17, AI side
+    from trader.trading.command_stack import build_command_stack
+    trader = _ai_trader(tmp_path)
+    _with_experiment(trader, "ARMED")
+    _arm_old_path(trader, tmp_path)
+    stack = build_command_stack(trader, _policy(), now=lambda: NOW)
+    view = stack.experiments.reader.current(ACCOUNT)
+    assert stack.mode_conflict == "BOTH_MODES_ARMED" and view.entry_block == "BOTH_MODES_ARMED"
+
+
+def test_startup_logs_the_active_kill_line(tmp_path, caplog):                  # K9
+    from trader.trading.command_stack import build_command_stack
+    trader = _ai_trader(tmp_path, kill_pct=15.0)
+    _with_experiment(trader, "ARMED")                     # frozen 20%, loaded 15%: 15% applies
+    with caplog.at_level(logging.WARNING):
+        build_command_stack(trader, _policy(), now=lambda: NOW)
+    assert any("experiment kill line active: 15.0% (start)" in r.getMessage() for r in caplog.records)
+
+
+def test_trader_exposes_the_store_for_plan5(tmp_path):
+    from trader.trading.command_stack import build_command_stack
+    trader = _trader(tmp_path)
+    stack = build_command_stack(trader, _policy(), now=lambda: NOW)
+    assert trader.experiment_store is stack.experiments.store
+    assert trader.kill_line_monitor is stack.experiments.monitor

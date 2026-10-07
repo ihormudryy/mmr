@@ -2693,7 +2693,9 @@ class OutcomeReconciler:
             return self._reconcile_pause(row, now)
         if action in ("enable_strategy", "disable_strategy", "update_strategy_params"):
             return self._reconcile_strategy(row, now)
-        if action in ("execute_automated_intent", "liquidate_account"):
+        if action == "execute_automated_intent":
+            return self._reconcile_automated_intent(row, now)
+        if action == "liquidate_account":
             return self._reconcile_close(row, now)
         # Unmapped action: cannot positively determine an outcome -> stay
         # OUTCOME_UNKNOWN (fail-safe), never rubber-stamp RESOLVED.
@@ -2725,8 +2727,9 @@ class OutcomeReconciler:
         did not meet the goal (FAILED_SAFE, REDUCE_FAILED, DONE for a full
         close) rejects it with that code and raises an operator alert: the
         position needs a person, and the reconciliation gate must not stay
-        blocked for ever. An open root, or a command with no close root (a
-        bracket entry), stays OUTCOME_UNKNOWN.
+        blocked for ever. An open root, or a command with no close root,
+        stays OUTCOME_UNKNOWN here (automated bracket entries are judged by
+        ``_reconcile_automated_entry`` instead).
         """
         if self._closes is None:
             return False
@@ -2744,6 +2747,55 @@ class OutcomeReconciler:
             f"({resolution.error_code}); operator check of the position required",
         )
         return True
+
+    def _reconcile_automated_intent(self, row: LedgerRow, now: dt.datetime) -> bool:
+        """A command that started or joined a close root (a SELL exit, or a BUY
+        whose protective saga failed into a flatten) resolves only from that
+        root. Any other automated command is a bracket entry."""
+        if self._has_close_root(row.command_id):
+            return self._reconcile_close(row, now)
+        return self._reconcile_automated_entry(row, now)
+
+    def _has_close_root(self, command_id: str) -> bool:
+        return self._closes is not None and self._closes.root_for(command_id) is not None
+
+    def _reconcile_automated_entry(self, row: LedgerRow, now: dt.datetime) -> bool:
+        """An automated entry dispatches its bracket under ``og-{command_id}``.
+        Resolve from that group's broker rows:
+
+        - any order working or filled -> RESOLVED (the broker has the entry);
+        - every order terminal with nothing filled, on a COMPLETE enumeration
+          -> REJECTED ``BROKER_REJECTED``;
+        - no rows, an unreadable row or an incomplete enumeration -> unresolved.
+        Absence alone never fails the command."""
+        found = self._orders.find_by_order_ref(
+            row.account_id, encode_order_ref(f"og-{row.command_id}"),
+        )
+        if not found:
+            return False
+        statuses = [getattr(order, "status", None) for order in found]
+        if not all(isinstance(status, str) for status in statuses):
+            return False
+        outcome = {
+            **(row.outcome or {}),
+            "order_group_id": f"og-{row.command_id}",
+            "broker_statuses": statuses,
+        }
+        has_fill = any(
+            status == "Filled" or (getattr(order, "filled_quantity", 0) or 0) > 0
+            for order, status in zip(found, statuses)
+        )
+        is_working = any(status in _ACTIVE_ORDER_STATUSES for status in statuses)
+        if has_fill or is_working:
+            self._resolve_command_only(row, {**outcome, "broker_acknowledged": True}, now)
+            return True
+        if self._orders.enumeration_complete():
+            self._reject_command_only(
+                row, error_code="BROKER_REJECTED",
+                outcome={**outcome, "broker_acknowledged": False}, now=now,
+            )
+            return True
+        return False
 
     def _reconcile_create(self, row: LedgerRow, now: dt.datetime) -> bool:
         """A wedged ``create_proposal`` never dispatched an order, so the

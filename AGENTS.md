@@ -120,6 +120,13 @@ Top-level directories:
 - **DuckDB:** access the database only through `DuckDBConnection.execute` / `execute_atomic` (short-lived connection under a lock). Never hold a long-lived connection; several services share the file.
 - **Dill:** keep dill off the production surface. `MMR_DILL_STRICT=1` refuses arbitrary objects.
 
+## AI paper mode (SP1)
+
+Full detail: `docs/ARCHITECTURE.md` (`ai_paper` path and the paragraphs after it).
+
+- **`ai_paper` path.** Paper only: a live account refuses the stack (`AI_PAPER_LIVE_REFUSED`). Typed commands `publish_ai_risk_policy` and `submit_ai_paper_decision` (`ai_supervisor`) and `register_ai_deployment` (`ai_research`), each with its own allow-list entry. The owner ceiling is `ai_paper.limits_ceiling` in `trader.yaml`, read only from the file (an `AI_PAPER*` env var fails load); no RPC method writes it. Entries go through the protective saga, `session_risk` and `DispatchGuard`; closes through the broker-proven safe close. Every refusal has its own code.
+- No `ai_paper` entry may be enabled before #49 (gross reservations) is merged and verified. SP2 follow-up: the AI strategy runner must hash the file it loads and refuse a mismatch with the deployment's `strategy_digest`.
+
 ## Build, run and test
 
 ```bash

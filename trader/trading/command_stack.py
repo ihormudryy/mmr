@@ -483,6 +483,108 @@ class CommandStack:
     paper_automation_service: Any = None  # Paper activation authority (Phase 1+2)
     paper_hot_arm: Any = None  # ProductionPaperHotArmPorts when paper mode
     strategy_control_service: Any = None  # StrategyControlCommandService when wired
+    ai_paper: Any = None  # AiPaperServices when ai_paper.enabled (SP1 Plan 3)
+
+
+@dataclass(frozen=True)
+class AiPaperServices:
+    config: Any
+    policy: Any            # AiRiskPolicyService
+    deployments: Any       # AiDeploymentStore
+    decisions: Any         # AiPaperDecisionService
+    decision_store: Any    # AiPaperDecisionStore (Plan 5 reads links_for_order_ref)
+    actions: Any           # AiPaperActions: publish, register and the two reads
+    entry_filter: Any
+
+
+@dataclass(frozen=True)
+class _AiPaperParts:
+    """What the dispatch guard needs before the saga exists."""
+    config: Any
+    policy: Any
+    entry_filter: Any
+
+
+def _ai_paper_config(trader: Any, account_mode: str) -> Optional[Any]:
+    """The enabled ai_paper config, or None. A live account refuses to build (spec 5.4)."""
+    config = getattr(trader, "ai_paper_config", None)
+    if config is None or not config.enabled:
+        return None
+    if account_mode != "paper":
+        raise CommandStackConfigurationError(
+            "AI_PAPER_LIVE_REFUSED", "ai_paper.enabled is refused on a live account",
+        )
+    return config
+
+
+def _build_ai_paper_parts(trader: Any, config: Any, now: Callable[[], dt.datetime]) -> _AiPaperParts:
+    from trader.automation.ai_paper_filter import AiEntryFilter
+    from trader.automation.ai_risk_policy import AiRiskPolicyService
+    from trader.automation.calendar_policy import XNYSCalendarPolicy
+
+    policy = AiRiskPolicyService(
+        db=trader.journal_db, account_id=trader.ib_account, ceiling=config.limits_ceiling,
+        calendar=XNYSCalendarPolicy(), now=now,
+    )
+    return _AiPaperParts(config=config, policy=policy,
+                         entry_filter=AiEntryFilter(universe=trader.universe_accessor))
+
+
+def _ai_paper_guard_options(parts: Optional[_AiPaperParts]) -> dict:
+    """R25: the AI gate, strict margin and the limits router for submit_ai_paper_decision only."""
+    if parts is None:
+        return {}
+    from trader.automation.ai_paper_decision import AI_PAPER_ACTION
+    from trader.automation.ai_paper_evidence import ai_entry_gate
+    from trader.automation.risk_limits import PAPER_LIMITS
+
+    def current_limits(request: Any):
+        if getattr(request, "action", None) == AI_PAPER_ACTION:
+            return parts.policy.effective_limits()
+        return PAPER_LIMITS
+
+    return {
+        "current_limits": current_limits,
+        "ai_entry_gate": ai_entry_gate(entry_filter=parts.entry_filter),
+        "strict_margin_actions": frozenset({AI_PAPER_ACTION}),
+    }
+
+
+def _build_ai_paper_services(
+    trader: Any, parts: Optional[_AiPaperParts], *, ledger: CommandLedger, journal: Any,
+    controls: TradingControlStore, broker: Any, quotes: Any, margin: Any, policy: CommandAuthorityPolicy,
+    saga: Any, liquidation: Any, exit_owners: Any, account_mode: str, now: Callable[[], dt.datetime],
+    schedule_reconcile: Callable[[str], None],
+) -> Optional[AiPaperServices]:
+    if parts is None:
+        return None
+    from trader.automation.ai_deployments import AiDeploymentStore
+    from trader.automation.ai_paper_actions import AiPaperActions
+    from trader.automation.ai_paper_decision import AiPaperDecisionService, AiPaperDecisionStore
+    from trader.automation.ai_paper_evidence import AI_ENTRY_POLICY, AiPaperEvidence
+    from trader.automation.ai_paper_experiment import NoExperiment
+
+    deployments = AiDeploymentStore(trader.journal_db, now=now)
+    decision_store = AiPaperDecisionStore(journal)
+    evidence = AiPaperEvidence(
+        broker=broker, quotes=quotes, margin=margin, history=getattr(trader, "data", None),
+        journal=journal, account_id=trader.ib_account, account_mode=account_mode, now=now,
+        max_drift_bps=policy.max_drift_bps, entry_offset_bps=AI_ENTRY_POLICY.limit_offset_bps,
+        entry_filter=parts.entry_filter,
+    )
+    decisions = AiPaperDecisionService(
+        ledger=ledger, journal=journal, controls=controls, policy=parts.policy, deployments=deployments,
+        evidence=evidence, saga=saga, experiments=NoExperiment(), exit_owners=exit_owners,
+        liquidation=liquidation, broker=broker, config=parts.config, account_id=trader.ib_account,
+        now=now, schedule_reconcile=schedule_reconcile, decisions=decision_store,
+    )
+    actions = AiPaperActions(
+        policy=parts.policy, deployments=deployments, broker=broker, config=parts.config,
+        account_id=trader.ib_account, ledger=ledger, journal=journal, controls=controls, now=now,
+    )
+    return AiPaperServices(config=parts.config, policy=parts.policy, deployments=deployments,
+                           decisions=decisions, decision_store=decision_store, actions=actions,
+                           entry_filter=parts.entry_filter)
 
 
 _REQUIRED_TRADER_PORTS = (
@@ -705,6 +807,13 @@ def build_command_stack(
         apply_protective_order_saga_migration,
     )
     apply_protective_order_saga_migration(migrator)
+    from trader.automation.ai_deployments import apply_ai_deployment_migration
+    from trader.automation.ai_paper_decision import apply_ai_paper_decision_migration
+    from trader.automation.ai_risk_policy import apply_ai_risk_policy_migration
+
+    apply_ai_risk_policy_migration(migrator)          # 54
+    apply_ai_deployment_migration(migrator)           # 55
+    apply_ai_paper_decision_migration(migrator)       # 56
 
     repository = ProposalRepository(journal)
     ledger = CommandLedger(journal)
@@ -713,6 +822,9 @@ def build_command_stack(
     trader.journal_db.transaction(
         lambda conn: controls.seed_in_tx(conn, [(trader.ib_account, account_mode)], now())
     )
+    ai_paper_config = _ai_paper_config(trader, account_mode)
+    ai_paper_parts = (None if ai_paper_config is None
+                      else _build_ai_paper_parts(trader, ai_paper_config, now))
     nonces = PreflightNonceGate(journal, now=now)
     positions = TraderPositionAuthority(trader)
     run_coro = lambda coro: _run_on_trader_loop(trader, coro)
@@ -772,6 +884,7 @@ def build_command_stack(
         allocation_authority_lookup=lambda account_id, artifact_digest: (
             allocation_authority_store.authority_for_dispatch(account_id, artifact_digest)
         ),
+        **_ai_paper_guard_options(ai_paper_parts),
     )
 
     def compute_risk_projection():
@@ -1066,6 +1179,13 @@ def build_command_stack(
         ),
         liquidation=liquidation_service,
     )
+    ai_paper = _build_ai_paper_services(
+        trader, ai_paper_parts, ledger=ledger, journal=journal, controls=controls,
+        broker=broker_snapshot, quotes=quotes, margin=margin, policy=policy,
+        saga=protective_order_saga, liquidation=liquidation_service, exit_owners=exit_owner_registry,
+        account_mode=account_mode, now=now,
+        schedule_reconcile=lambda command_id: reconciler.schedule(command_id, now()),
+    )
     from trader.automation.paper_activation import PaperAutomationActivationService
     from trader.automation.paper_hot_arm import ProductionPaperHotArmPorts
 
@@ -1120,6 +1240,7 @@ def build_command_stack(
         automated_intent_service=automated_intent_service,
         paper_automation_service=paper_automation_service,
         strategy_control_service=strategy_control_service,
+        ai_paper=ai_paper,
     )
 
     def _build_intent_for_hot_arm(trader_obj: Any):
@@ -1182,4 +1303,6 @@ def build_command_stack(
     trader.protective_order_saga = protective_order_saga
     trader.session_controller = session_controller
     trader.attribution_ledger = attribution_ledger
+    if ai_paper is not None:
+        trader.ai_paper_attribution = ai_paper.decision_store  # Plan 5 reads links_for_order_ref here
     return stack

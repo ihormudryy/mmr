@@ -24,3 +24,13 @@ def store(db, migrator):
 
 
 from tests.scoreboard.ledger_world import ledger, world  # noqa: E402,F401 - shared fixtures
+
+
+@pytest.fixture
+def scoreboard(world):  # noqa: F811 - the shared fixture
+    from tests.scoreboard.ledger_world import CAL
+    from trader.scoreboard.benchmark import BenchmarkBook
+    from trader.scoreboard.service import ScoreboardService
+    book = BenchmarkBook(world.store, lambda start, end: {}, CAL, now=lambda: world.clock[0])
+    return ScoreboardService(store=world.store, db=world.db, experiments=world.experiments, ledger=world.ledger(),
+                             book=book, links=world.links, calendar=CAL, now=lambda: world.clock[0])

@@ -40,6 +40,13 @@ def _multiply(value: Optional[float], rate: Optional[float]) -> Optional[float]:
     return None if value is None or rate is None else value * rate
 
 
+def experiment_fills(db: Any, experiment: Any) -> list[FillFact]:
+    """The account's fills from the experiment start up to its stop (if stopped)."""
+    facts = load_fill_facts(db, experiment.account_id, experiment.started_at)
+    stopped_at = getattr(experiment, "stopped_at", None)
+    return facts if stopped_at is None else [f for f in facts if f.fill_time <= stopped_at]
+
+
 class SessionFacts:
     """What the fills say about one session: facts, stored even when the money is unknown."""
 
@@ -141,7 +148,7 @@ class SessionLedger:
     # -- row building --------------------------------------------------------
 
     def _session_facts(self, experiment: Any, session_date: dt.date) -> SessionFacts:
-        facts = load_fill_facts(self.db, experiment.account_id, experiment.started_at)
+        facts = experiment_fills(self.db, experiment)
         projection = project_round_trips(facts, links_for=self.links.links_for_order_ref,
                                          account_id=experiment.account_id)
         return SessionFacts(projection, facts, session_date)
@@ -279,7 +286,7 @@ class SessionLedger:
         rows = self.store.fetch("equity_daily", {"experiment_id": experiment.experiment_id})
         if not rows:
             return 0
-        facts = load_fill_facts(self.db, experiment.account_id, experiment.started_at)
+        facts = experiment_fills(self.db, experiment)
         projection = project_round_trips(facts, links_for=lambda ref: None, account_id=experiment.account_id)
         adjustments = self.store.fetch("equity_adjustments", {"experiment_id": experiment.experiment_id})
         written = 0

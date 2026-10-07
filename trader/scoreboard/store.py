@@ -135,6 +135,22 @@ class ScoreboardStore:
                 [seal_id, table, key, digest, prev, chain_digest(prev, table, key, digest), sealed_at])
         self._db.transaction(tx)
 
+    # -- the round-trip projection -------------------------------------------
+
+    def replace_round_trips(self, experiment_id: str, rows: Sequence[Mapping[str, Any]]) -> None:
+        """The projection is derived: one transaction swaps every row of the experiment."""
+        prepared = [self.prepare("round_trips", row) for row in rows]
+        if any(row["experiment_id"] != experiment_id for row in prepared):
+            raise ValueError("every round trip must belong to the experiment being replaced")
+        names = list(self.columns("round_trips"))
+        insert = f"INSERT INTO round_trips ({', '.join(names)}) VALUES ({', '.join('?' for _ in names)})"
+
+        def tx(conn):
+            conn.execute("DELETE FROM round_trips WHERE experiment_id = ?", [experiment_id])
+            for row in prepared:
+                conn.execute(insert, [row[name] for name in names])
+        self._db.transaction(tx)
+
     # -- reads ---------------------------------------------------------------
 
     def fetch(self, table: str, where: Mapping[str, Any]) -> list[dict]:

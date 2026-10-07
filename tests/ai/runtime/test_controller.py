@@ -13,7 +13,7 @@ from tests.ai.runtime.scripted_engine import ScriptedEngine
 from tests.ai.world import World, request
 from trader.ai.budget_cap import BudgetCapSync, CapGatedGateway
 from trader.ai.config import ControllerConfig
-from trader.ai.controller import AiController, ExperimentWatch
+from trader.ai.controller import EXIT_WAIT_OVERRUN, AiController, ExperimentWatch
 from trader.ai.engine import EngineResult, ProposedDecision, SimulatedBaseline
 from trader.ai.gateway import CallRefused
 from trader.ai.ids import derive_decision_id
@@ -425,6 +425,44 @@ async def test_the_deadline_is_checked_again_right_before_the_persist(rig, monke
     await rig.slots_then_drain()
     assert ("cyc-entry-20260717-1100", "TIMED_OUT", "SLOT_DEADLINE") in rig.cycles()
     assert rig.sent() == [] and submissions(rig) == 0
+
+
+@pytest.mark.asyncio
+async def test_an_exit_that_waits_for_its_entry_is_kept_past_the_signal_age(rig):   # PR #86 thread 4211394337
+    sell = rig.trader.signals.add(action="SELL")
+    until = rig.clock.now() + dt.timedelta(hours=1)
+    answers = [EngineResult(note="EXIT_WAITING_FOR_ENTRY", wait_until=until)] * 2 + [EngineResult(decisions=(close(),))]
+    rig.engine.results["exit_signal"] = lambda ctx: answers.pop(0)
+    await rig.signals_then_drain()
+    assert rig.opportunity(sell) == ("IN_PROGRESS", "EXIT_WAITING_FOR_ENTRY") and rig.sent() == []
+    rig.clock.advance(400)                                          # older than signal_max_age_seconds (300)
+    await rig.signals_then_drain()
+    assert rig.opportunity(sell) == ("IN_PROGRESS", "EXIT_WAITING_FOR_ENTRY") and rig.sent() == []
+    await rig.signals_then_drain()                                  # the entry filled: the engine closes now
+    assert rig.opportunity(sell)[0] == "DECIDED" and [b["action"] for b in rig.sent()] == ["CLOSE"]
+    await rig.signals_then_drain()
+    assert rig.engine.hooks_called() == ["exit_signal"] * 3 and len(rig.sent()) == 1
+
+
+@pytest.mark.asyncio
+async def test_an_exit_wait_has_a_hard_end(rig):
+    sell = rig.trader.signals.add(action="SELL")
+    rig.engine.results["exit_signal"] = EngineResult(note="EXIT_WAITING_FOR_ENTRY",
+                                                     wait_until=rig.clock.now() + dt.timedelta(minutes=5))
+    await rig.signals_then_drain()
+    rig.clock.advance(5 * 60 + EXIT_WAIT_OVERRUN.total_seconds() + 1)
+    await rig.signals_then_drain()
+    assert rig.opportunity(sell) == ("MISSED", "EXIT_WAIT_EXPIRED") and rig.sent() == []
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("source", ["entry_signal", "entry_cycle"])
+async def test_only_an_exit_signal_may_wait(source):
+    from trader.ai.controller import validate_result
+    waiting = EngineResult(wait_until=et(12, 0))
+    assert validate_result(source, waiting) == "WAIT_NOT_ALLOWED_HERE"
+    assert validate_result("exit_signal", EngineResult(decisions=(close(),), wait_until=et(12, 0))) == \
+        "WAIT_NOT_ALLOWED_HERE"
 
 
 def cycle_states(rig):

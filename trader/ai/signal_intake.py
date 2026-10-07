@@ -166,6 +166,24 @@ class SignalIntake:
             "UPDATE ai_opportunities SET state = ?, reason = ?, updated_at = ? WHERE opportunity_id = ?",
             [state, reason, now, opportunity_id]))
 
+    async def wait(self, opportunity_id: str, until: dt.datetime, reason: str) -> None:
+        """Not decidable yet: stays IN_PROGRESS and is judged again until ``until`` (an exit waiting for its entry)."""
+        now = self._clock.now()
+
+        def work(conn: Any) -> None:
+            conn.execute("INSERT INTO ai_exit_waits VALUES (?, ?, ?, ?, ?) ON CONFLICT (opportunity_id) DO UPDATE "
+                         "SET wait_until = excluded.wait_until, reason = excluded.reason, "
+                         "updated_at = excluded.updated_at", [opportunity_id, until, reason, now, now])
+            conn.execute("UPDATE ai_opportunities SET state = 'IN_PROGRESS', reason = ?, updated_at = ? "
+                         "WHERE opportunity_id = ?", [reason, now, opportunity_id])
+        await self._store.atransaction(work)
+
+    async def waits(self) -> dict[str, dt.datetime]:
+        rows = await self._store.aquery("SELECT w.opportunity_id, w.wait_until FROM ai_exit_waits w JOIN "
+                                        "ai_opportunities o ON o.opportunity_id = w.opportunity_id "
+                                        "WHERE o.state IN ('NEW', 'IN_PROGRESS')")
+        return {row[0]: to_utc(row[1]) for row in rows}
+
     def finish_in_tx(self, conn: Any, opportunity_id: str, ok: bool, reason: Any) -> None:
         conn.execute("UPDATE ai_opportunities SET state = ?, reason = ?, updated_at = ? WHERE opportunity_id = ?",
                      ["DECIDED" if ok else "FAILED", reason, self._clock.now(), opportunity_id])

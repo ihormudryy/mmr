@@ -11,7 +11,7 @@ from tests.ai.decisions.fakes import (
 )
 from tests.ai.decisions.test_discovery_client import candidate, response
 from tests.ai.fakes import FakeClock, load_test_config
-from trader.ai.decision_engine import RoleHealth
+from trader.ai.decision_engine import ENTRY_SETTLE_GRACE, RoleHealth
 from trader.ai.engine import (
     EntryCycleContext, ExperimentView, ModelWork, OwnedPosition, PositionCycleContext, ProposedDecision,
     SignalContext, SignalOpportunity,
@@ -373,3 +373,140 @@ async def test_every_model_step_writes_one_ruling_row(rig):
         ("closes", "REFUSED", "OUTPUT_NO_JSON")]
     assert rows[0][0] == ENTER_ID and rows[1][0] == cycle.slot.cycle_id
     assert rows[2][0] == derive_decision_id(cycle.slot.cycle_id, f"enter:{MSFT}")
+
+
+# -- PR #86 thread 4211394337: an exit signal that arrives before our accepted entry has filled ------------
+
+SELL = SignalOpportunity("sig-" + "3" * 32, 9, "orb", AAPL, "SELL", 0.7, NOW, NOW)
+SETTLED_BY = dt.datetime(2026, 7, 17, 19, 30, tzinfo=dt.timezone.utc) + ENTRY_SETTLE_GRACE   # 15:30 ET cutoff
+
+
+def our_enter(rig, state, receipt_state=None, error_code=None):
+    decision_id = insert_enter(rig)
+    rig.store.db.execute("UPDATE ai_submissions SET state = ?, receipt_state = ?, error_code = ? WHERE decision_id = ?",
+                         [state, receipt_state, error_code, decision_id])
+    return decision_id
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("state,receipt_state", [("PENDING", None), ("UNKNOWN", None), ("ACCEPTED", "SUBMITTED"),
+                                                 ("FINAL", "RESOLVED")])
+async def test_an_exit_signal_waits_while_our_entry_may_still_fill(rig, state, receipt_state):
+    our_enter(rig, state, receipt_state)
+    result = await rig.engine.on_exit_signal(rig.signal(SELL))
+    assert (result.decisions, result.baselines, result.note) == ((), (), "EXIT_WAITING_FOR_ENTRY")
+    assert result.wait_until == SETTLED_BY                          # bounded by the entry's own cutoff
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("state,receipt_state,error_code", [
+    ("ABANDONED", None, "EXPIRED_UNSENT"), ("NOT_ADMITTED", None, "NOT_FOUND_AFTER_EXPIRY"),
+    ("FAILED", None, "VALIDATION_ERROR"), ("FINAL", "REJECTED", "STOP_INVALID"), ("ACCEPTED", "SUBMITTED", "X")])
+async def test_an_entry_that_cannot_fill_does_not_hold_the_exit(rig, state, receipt_state, error_code):
+    our_enter(rig, state, receipt_state, error_code)
+    result = await rig.engine.on_exit_signal(rig.signal(SELL))
+    assert (result.decisions, result.note, result.wait_until) == ((), "NOT_HELD", None)
+
+
+@pytest.mark.asyncio
+async def test_the_exit_stops_waiting_once_the_entry_is_settled_unfilled(rig):
+    our_enter(rig, "FINAL", "RESOLVED")
+    later = SignalContext(SETTLED_BY, EXPERIMENT, SELL, rig.work(SELL.opportunity_id))
+    result = await rig.engine.on_exit_signal(later)
+    assert (result.decisions, result.note, result.wait_until) == ((), "ENTRY_UNFILLED", None)
+
+
+@pytest.mark.asyncio
+async def test_an_entry_in_another_conid_does_not_hold_the_exit(rig):
+    our_enter(rig, "ACCEPTED", "SUBMITTED")
+    msft_sell = SignalOpportunity("sig-" + "4" * 32, 10, "orb", MSFT, "SELL", 0.7, NOW, NOW)
+    result = await rig.engine.on_exit_signal(rig.signal(msft_sell))
+    assert (result.decisions, result.note) == ((), "NOT_HELD")
+
+
+@pytest.mark.asyncio
+async def test_a_held_conid_closes_even_with_an_entry_in_flight(tmp_path):
+    trips = {"experiment_id": EXPERIMENT.experiment_id, "trips": [
+        {"round_trip_id": "rt-1", "conid": AAPL, "symbol": "AAPL", "opened_at": NOW.isoformat(),
+         "opened_quantity": 4.0, "closed_quantity": 0.0, "decision_id": ENTER_ID, "state": "OPEN",
+         "entry_avg_price": 230.0}]}
+    rig = await started(tmp_path, FakeReads(get_experiment_trips=trips))
+    our_enter(rig, "ACCEPTED", "SUBMITTED")                          # partly filled: 4 shares are held
+    (close,) = (await rig.engine.on_exit_signal(rig.signal(SELL))).decisions
+    assert (close.action, close.decider) == ("CLOSE", "strategy")
+
+
+@pytest.mark.asyncio
+async def test_a_close_whose_fill_left_the_bracket_still_gets_an_incomplete_matched_record(rig):   # 4211394769
+    enter_id = insert_enter(rig)                                    # bracket 225.4 / 239.2 around the 230 ask
+    position = OwnedPosition("rt-1", AAPL, "AAPL", 10.0, NOW, enter_id, 240.0, 10.0)   # filled at 240
+    rig.orchestrator.script(CLOSE_MARKER, closes(("P1", "CLOSE", None, "fade")))
+    ctx = rig.position_cycle((position,))
+    result = await rig.engine.on_position_cycle(ctx)
+    (close,) = result.decisions
+    (matched,) = result.baselines
+    assert (matched.baseline_id, matched.opportunity_id, matched.incomplete_reason) == (
+        "matched_entry_bracket_exit.v1", derive_decision_id(ctx.slot.cycle_id, close.action_key), "entry_not_comparable")
+    assert (matched.linked_decision_id, matched.linked_round_trip_id, matched.reference_price) == (enter_id, "rt-1", None)
+    assert result.note == "AAPL:MATCHED_ENTRY_INCOMPLETE"
+
+
+# -- PR #86 thread 4211394562: owed cycle baselines do not depend on the orchestrator finishing ------------
+
+def controller_for(rig, tmp_path):
+    """Plan 5's real controller around the real engine; the trader side of the controller is a fake."""
+    import asyncio  # noqa: F401  (the controller runs on this loop)
+
+    from tests.ai.runtime.fakes import FakeLeadership, FakeTrader
+    from trader.ai.config import ControllerConfig
+    from trader.ai.controller import AiController, ExperimentWatch
+    from trader.ai.journal import AttemptJournal
+    from trader.ai.outbox import ReportingOutbox
+    from trader.ai.signal_intake import SignalIntake
+    trader, leadership, slots = FakeTrader(), FakeLeadership(1), SessionSlots()
+    watch = ExperimentWatch(trader)
+    submitter = Submitter(store=rig.store, supervisor=trader, leadership=leadership, clock=rig.clock, slots=slots,
+                          experiment_state=watch.state)
+    return AiController(
+        config=ControllerConfig(heartbeat_path=str(tmp_path / "hb.json")), store=rig.store, clock=rig.clock,
+        supervisor=trader, leadership=leadership, watch=watch, submitter=submitter,
+        outbox=ReportingOutbox(store=rig.store, journal=AttemptJournal(rig.store), supervisor=trader, clock=rig.clock),
+        intake=SignalIntake(store=rig.store, supervisor=trader, clock=rig.clock), slots=slots, engine=rig.engine,
+        gateway=rig.gateway)
+
+
+@pytest.mark.asyncio
+async def test_owed_cycle_baselines_survive_a_cycle_cut_at_its_deadline(rig, tmp_path):
+    import asyncio
+
+    from tests.ai.runtime.fakes import FRIDAY, et
+    from trader.ai.schedule import Slot
+    controller = controller_for(rig, tmp_path)
+    await controller.start()
+    rig.orchestrator.hold = asyncio.Event()                         # the orchestrator never answers
+    rig.orchestrator.script(ENTRY_MARKER, json.dumps({"picks": []}))
+    slot = Slot("entry", FRIDAY, et(11, 0), rig.clock.now() + dt.timedelta(seconds=1))
+    await controller.record_cycle(slot, "RUNNING", None)
+    await controller.run_cycle(slot)
+    assert rig.store.db.execute("SELECT state, reason FROM ai_cycles", fetch="all") == [("TIMED_OUT", "SLOT_DEADLINE")]
+    assert rig.store.db.execute("SELECT status FROM ai_discovery_reads", fetch="one") == ("OK",)
+    owed = rig.store.db.execute("SELECT source_ref, state FROM ai_outbox WHERE kind = 'simulated' ORDER BY source_ref",
+                                fetch="all")
+    assert owed == [(f"fixed_rule.v1|{slot.cycle_id}", "PENDING"), (f"no_trade.v1|{slot.cycle_id}", "PENDING")]
+    fixed = json.loads(rig.store.db.execute("SELECT body_json FROM ai_outbox WHERE source_ref LIKE 'fixed%'",
+                                            fetch="one")[0])
+    assert (fixed["conid"], fixed["reference_price"], fixed["incomplete_reason"]) == (MSFT, 230.0, None)
+
+
+@pytest.mark.asyncio
+async def test_a_finished_cycle_does_not_queue_its_baselines_twice(rig, tmp_path):
+    from tests.ai.runtime.fakes import FRIDAY, et
+    from trader.ai.schedule import Slot
+    controller = controller_for(rig, tmp_path)
+    await controller.start()
+    rig.orchestrator.script(ENTRY_MARKER, json.dumps({"picks": []}))
+    slot = Slot("entry", FRIDAY, et(11, 0), rig.clock.now() + dt.timedelta(minutes=15))
+    await controller.record_cycle(slot, "RUNNING", None)
+    await controller.run_cycle(slot)
+    assert rig.store.db.execute("SELECT state FROM ai_cycles", fetch="one") == ("DONE",)
+    assert rig.store.db.execute("SELECT COUNT(*) FROM ai_outbox WHERE kind = 'simulated'", fetch="one") == (2,)

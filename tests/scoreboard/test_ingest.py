@@ -181,6 +181,16 @@ def test_the_matched_entry_stores_its_requested_quantity_and_is_not_sized(store)
         4, "client", "rt-1", [])
 
 
+@pytest.mark.parametrize("linked", ["dec-00000001", None])
+def test_a_model_close_without_a_valid_counterfactual_is_an_incomplete_book_row(store, linked):  # PR #86 4211394769
+    ingest = matched_world(store)
+    body = matched_body(side=None, quantity=None, reference_price=None, stop_price=None, target_price=None,
+                        linked_decision_id=linked, incomplete_reason="entry_not_comparable")
+    assert sim(ingest, body)["status"] == "INSERTED"
+    (outcome,) = store.fetch("simulated_outcomes", {})
+    assert (outcome["status"], outcome["reason"], outcome["pnl_usd"]) == ("INCOMPLETE", "entry_not_comparable", None)
+
+
 def test_two_partial_closes_of_one_trip_are_two_records(store):
     ingest = matched_world(store, close_fact(), close_fact("dec-00000032", action="CLOSE"))
     assert sim(ingest, matched_body())["status"] == "INSERTED"                           # PARTIAL_CLOSE 4

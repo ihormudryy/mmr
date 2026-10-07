@@ -309,3 +309,36 @@ async def test_the_position_closing_during_the_model_call_is_refused_by_the_trad
     close_id = derive_decision_id(position_cycle, f"close:{world.conid}")
     assert world.receipt(close_id).error_code == "NOT_A_REDUCTION"
     assert [p for p in world.served.sim.placed if p[2] == "SELL"] == sells_before     # no second sell order
+
+
+def close_rows(node):
+    return node.node.store.db.execute("SELECT decision_id, state FROM ai_submissions WHERE action = 'CLOSE'",
+                                      fetch="all")
+
+
+@pytest.mark.asyncio
+async def test_a_sell_before_the_entry_fills_waits_and_then_closes_once(stack):          # PR #86 thread 4211394337
+    world, node, _ = stack
+    node.jev.script(JEV_MARKER, ruling())
+    buy = world.strategy_signal()
+    await node.signals()
+    assert (await node.node.submitter.get(derive_decision_id(buy, f"enter:{world.conid}"))).state in (
+        "ACCEPTED", "FINAL")
+    world.served.sim.quote(world.conid, 232.0, 232.1)              # the entry's limit is no longer marketable
+    world.advance(1)
+    assert not world.served.sim.held.get(world.conid)              # accepted, working, unfilled
+    sell = world.strategy_signal(action="SELL")
+    await node.signals()
+    assert node.opportunity(sell) == ("IN_PROGRESS", "EXIT_WAITING_FOR_ENTRY") and close_rows(node) == []
+    world.advance(400)                                              # older than the signal age limit: still kept
+    await node.signals()
+    assert node.opportunity(sell) == ("IN_PROGRESS", "EXIT_WAITING_FOR_ENTRY") and close_rows(node) == []
+    world.served.sim.quote(world.conid, 229.9, 230.0)              # the entry fills and is protected
+    world.settle()
+    await node.signals()                                            # the trip is held now: the exit closes it
+    close_id = derive_decision_id(sell, f"close:{world.conid}")
+    assert node.opportunity(sell) == ("DECIDED", "EXIT_SIGNAL") and [r[0] for r in close_rows(node)] == [close_id]
+    await settle_close(world, node, close_id)
+    await node.signals()
+    assert not world.served.sim.held.get(world.conid) and len(close_rows(node)) == 1
+    assert len([p for p in world.served.sim.placed if p[2] == "SELL" and p[1] == "MKT"]) <= 1

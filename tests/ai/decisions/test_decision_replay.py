@@ -52,7 +52,7 @@ async def test_a_rejudged_unit_is_reported_incomplete(tmp_path):
 
 
 @pytest.mark.asyncio
-async def test_a_changed_prompt_is_a_divergence(tmp_path):
+async def test_a_changed_config_or_prompt_is_never_complete(tmp_path, monkeypatch):
     rig = await started(tmp_path)
     thesis = "a long thesis that the shorter news limit of the replay config will cut " * 2
     rig.orchestrator.script(ENTRY_MARKER, json.dumps({"picks": [{"candidate": "C1", "thesis": thesis}]}))
@@ -66,7 +66,44 @@ async def test_a_changed_prompt_is_a_divergence(tmp_path):
     other_dir.mkdir()
     shorter = load_test_config(other_dir, extra_top_level=BLOCK + "  news_chars_per_item: 50\n")
     result = await replay_decision(rig.store, decision_id, config=shorter)
+    assert (result.status, result.missing) == (INCOMPLETE, ("config_mismatch",))      # PR #86 4211394935
+    monkeypatch.setattr("trader.ai.roles.JEV_SYSTEM", "[JEV_ENTRY_RULING] a changed prompt")   # code, same config
+    monkeypatch.setenv("MMR_CODE_VERSION", recorded_code_version(rig.store, decision_id))
+    result = await replay_decision(rig.store, decision_id, config=rig.config)
     assert result.status == INCOMPLETE and result.missing[0].startswith("request_changed:")
+
+
+def recorded_code_version(store, decision_id):
+    row = store.db.execute("SELECT payload_json FROM ai_replay_evidence WHERE decision_key = ? AND kind = 'manifest'",
+                           [decision_id], fetch="one")
+    return json.loads(row[0])["code_version"]
+
+
+@pytest.mark.asyncio
+async def test_a_changed_config_is_incomplete_even_when_the_verdict_would_match(tmp_path, no_network, monkeypatch):
+    rig = await started(tmp_path)                                    # PR #86 thread 4211394935
+    rig.jev.script(JEV_MARKER, ruling())
+    await rig.engine.on_entry_signal(rig.signal())
+    counter = ExternalAdapterCounter()
+    monkeypatch.setattr(type(rig.reads), "call", counter.tripwire("trader_read"))
+    other_dir = tmp_path / "other"
+    other_dir.mkdir()
+    tighter = load_test_config(other_dir, extra_top_level=BLOCK + "  quote_max_age_seconds: 1\n")
+    result = await replay_decision(rig.store, DECISION_ID, config=tighter, counter=counter)
+    assert (result.status, result.missing, result.value) == (INCOMPLETE, ("config_mismatch",), None)
+    assert counter.total == 0 and len(rig.jev.requests) == 1
+    same = await replay_decision(rig.store, DECISION_ID, config=rig.config, counter=counter)
+    assert same.status == COMPLETE and same.value["outcome"] == "TAKE"
+
+
+@pytest.mark.asyncio
+async def test_a_changed_code_version_is_incomplete(tmp_path, no_network, monkeypatch):
+    rig = await started(tmp_path)
+    rig.jev.script(JEV_MARKER, ruling())
+    await rig.engine.on_entry_signal(rig.signal())
+    monkeypatch.setenv("MMR_CODE_VERSION", recorded_code_version(rig.store, DECISION_ID) + "-changed")
+    result = await replay_decision(rig.store, DECISION_ID, config=rig.config)
+    assert (result.status, result.missing) == (INCOMPLETE, ("code_mismatch",))
 
 
 @pytest.mark.asyncio

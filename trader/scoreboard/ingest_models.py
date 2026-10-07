@@ -28,8 +28,10 @@ _Usd = Annotated[float, Field(ge=0, allow_inf_nan=False)]
 _Price = Annotated[float, Field(gt=0, allow_inf_nan=False)]
 _Quantity = Annotated[int, Field(ge=1, le=10_000_000)]
 _Conid = Annotated[int, Field(gt=0)]
+# entry_not_comparable: a model close whose entry cannot carry its matched-entry counterfactual (no ENTER, entry
+# price or bracket of this experiment, or an entry fill outside that bracket); SP2 Plan 6, PR #86.
 IncompleteReason = Literal["quote_unavailable", "feed_not_accepted", "quote_not_executable", "ranking_unavailable",
-                           "budget_refused", "model_failed", "sizing_unavailable"]
+                           "budget_refused", "model_failed", "sizing_unavailable", "entry_not_comparable"]
 
 
 def parse_utc(text: str) -> dt.datetime:

@@ -33,10 +33,15 @@ from trader.ai.rpc_clients import RpcNotSent, RpcOutcomeUnknown, RpcRefused
 from trader.ai.schedule import ET
 from trader.ai.tools import LiveTools, ToolUnavailable
 from trader.ai.untrusted import OutputRefusal
+from trader.automation.calendar_policy import XNYSCalendarPolicy
 
 logger = logging.getLogger(__name__)
 CONFIG_REFUSALS = frozenset({"ROLE_UNKNOWN", "PRICE_UNAVAILABLE", "OUTPUT_LIMIT_ABOVE_ROLE"})
 FLATTEN_ET = dt.time(15, 45)
+# SP1 cancels the unfilled rest of an AI entry at the entry cutoff; this covers that cancel landing and the
+# fill reaching the trips read (PR #86 thread 4211394337).
+ENTRY_SETTLE_GRACE = dt.timedelta(minutes=5)
+NEVER_SENT_STATES = frozenset({"ABANDONED", "NOT_ADMITTED", "FAILED"})
 
 
 class RoleHealth:
@@ -188,6 +193,7 @@ class PaperDecisionEngine:
         self._config, self._cfg = config, config.decisions
         self._reads, self._recorder, self._store, self._clock = reads, recorder, store, clock
         self._health = RoleHealth(clock, self._cfg.role_recheck_seconds)
+        self._calendar = XNYSCalendarPolicy()
         self._settings = JudgeSettings.from_config(config, self._health)
         digest = self._cfg.discretionary_deployment_digest
         self._discovery = None if digest is None else DiscoveryClient(
@@ -234,13 +240,41 @@ class PaperDecisionEngine:
         opportunity = ctx.opportunity
         held = await self._held_conids(ctx.experiment.experiment_id)
         if held is not None and opportunity.conid not in held:
-            return EngineResult(note="NOT_HELD")
+            return await self._exit_before_any_fill(ctx)
         digest = evidence_digest({"v": "exit_signal.v1", "opportunity_id": opportunity.opportunity_id,
                                   "conid": opportunity.conid, "signal_time": opportunity.signal_time.isoformat(),
                                   "held_known": held is not None})
         close = ProposedDecision(action_key=f"close:{opportunity.conid}", action="CLOSE", conid=opportunity.conid,
                                  side="SELL", decider="strategy", evidence_digest=digest)
         return EngineResult(decisions=(close,), note="EXIT_SIGNAL" if held is not None else "EXIT_SIGNAL_TRIPS_UNKNOWN")
+
+    async def _exit_before_any_fill(self, ctx: SignalContext) -> EngineResult:
+        """Nothing is held. If our own entry in this conid may still fill, the exit waits for it (never a close
+        for shares not held) until the entry is settled: SP1 cancels its unfilled rest at the entry cutoff."""
+        if not await self._entry_may_fill(ctx.opportunity.conid, ctx.now):
+            return EngineResult(note="NOT_HELD")
+        schedule = self._calendar.resolve(ctx.now)
+        settled_by = None if schedule is None else schedule.entry_cutoff_utc + ENTRY_SETTLE_GRACE
+        if settled_by is None or ctx.now >= settled_by:
+            return EngineResult(note="ENTRY_UNFILLED")
+        return EngineResult(note="EXIT_WAITING_FOR_ENTRY", wait_until=settled_by)
+
+    async def _entry_may_fill(self, conid: int, now: dt.datetime) -> bool:
+        """Our latest ENTER of this conid today, unless it provably never reached the broker as an order."""
+        schedule = self._calendar.resolve(now)
+        since = now - dt.timedelta(days=1) if schedule is None else schedule.open_utc - dt.timedelta(hours=1)
+        rows = await self._store.aquery(
+            "SELECT state, receipt_state, error_code, body_json FROM ai_submissions WHERE action = 'ENTER' "
+            "AND created_at >= ? ORDER BY created_at DESC", [since])
+        for state, receipt_state, error_code, body_json in rows:
+            if json.loads(body_json).get("conid") != conid:
+                continue
+            if state in NEVER_SENT_STATES:
+                return False
+            if state in ("ACCEPTED", "FINAL") and (receipt_state == "REJECTED" or error_code is not None):
+                return False                               # the trader refused it: no order exists
+            return True                                    # PENDING, SENDING, UNKNOWN or an admitted order
+        return False
 
     async def _held_conids(self, experiment_id: str) -> Optional[frozenset[int]]:
         try:
@@ -263,10 +297,12 @@ class PaperDecisionEngine:
             if not read.ok:
                 return EngineResult(note=read.error_code)
             baselines.append(no_trade(cycle_id, ctx.now))            # every cycle with a good discovery read
+            await ctx.work.record_baselines(tuple(baselines))        # owed now, whatever the models do later
             if not read.eligible:
                 return EngineResult(baselines=tuple(baselines), note="NO_ELIGIBLE_CANDIDATES")
             fixed, code = await self._fixed_rule(tools, read, cycle_id)
             baselines.append(fixed)
+            await ctx.work.record_baselines((fixed,))
             notes.extend([code] if code is not None else [])
             if not self._health.healthy("jev"):
                 notes.append("JEV_UNHEALTHY")                         # no ENTER could pass its judge
@@ -336,10 +372,9 @@ class PaperDecisionEngine:
             matched = matched_entry(chosen.choice.position, chosen.choice.entry_body,
                                     close_decision_id=derive_decision_id(ctx.slot.cycle_id, close.action_key),
                                     closed_quantity=closed)
-            if matched is None:
-                notes.append(f"{chosen.choice.position.symbol}:MATCHED_ENTRY_UNKNOWN")
-            else:
-                baselines.append(matched)
+            baselines.append(matched)                      # every model close is visible in its book
+            if matched.incomplete_reason is not None:
+                notes.append(f"{chosen.choice.position.symbol}:MATCHED_ENTRY_INCOMPLETE")
         return EngineResult(tuple(decisions), tuple(baselines), note=",".join(notes) or ("CLOSES" if decisions else "HOLD"))
 
     async def _position_menu(self, tools: LiveTools, positions: tuple[OwnedPosition, ...]) -> dict[str, PositionChoice]:

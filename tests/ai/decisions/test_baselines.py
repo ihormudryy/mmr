@@ -85,16 +85,32 @@ def test_two_partial_closes_of_one_trip_are_two_records_with_their_requests():  
     assert (first.quantity, second.quantity) == (4, 6)          # requests; the trader proves the real shares
 
 
-def test_a_close_of_less_than_one_share_has_no_record():
+def test_a_close_of_less_than_one_share_is_an_incomplete_record():
     position = OwnedPosition("rt-1", AAPL, "AAPL", 0.5, NOW, DEC, 230.05, 10.0)
-    assert matched_entry(position, {"stop_price": 225.4, "target_price": 239.2}, close_decision_id=CLOSE_1,
-                         closed_quantity=0) is None
+    b = matched_entry(position, {"stop_price": 225.4, "target_price": 239.2}, close_decision_id=CLOSE_1,
+                      closed_quantity=0)
+    assert (b.incomplete_reason, b.quantity, b.reference_price) == ("entry_not_comparable", None, None)
 
 
-@pytest.mark.parametrize("position,body", [
-    (OwnedPosition("rt-1", AAPL, "AAPL", 4.0, NOW, DEC, None, 10.0), {"stop_price": 225.4, "target_price": 239.2}),
-    (OwnedPosition("rt-1", AAPL, "AAPL", 4.0, NOW, None, 230.0, 10.0), {"stop_price": 225.4, "target_price": 239.2}),
-    (OwnedPosition("rt-1", AAPL, "AAPL", 4.0, NOW, DEC, 230.0, 10.0), None),
-    (OwnedPosition("rt-1", AAPL, "AAPL", 4.0, NOW, DEC, 230.0, 10.0), {"stop_price": 231.0, "target_price": 239.2})])
-def test_matched_entry_is_not_invented_from_missing_evidence(position, body):
-    assert matched_entry(position, body, close_decision_id=CLOSE_1, closed_quantity=4) is None
+@pytest.mark.parametrize("position,body,linked", [
+    (OwnedPosition("rt-1", AAPL, "AAPL", 4.0, NOW, DEC, None, 10.0), {"stop_price": 225.4, "target_price": 239.2},
+     DEC),
+    (OwnedPosition("rt-1", AAPL, "AAPL", 4.0, NOW, None, 230.0, 10.0), {"stop_price": 225.4, "target_price": 239.2},
+     None),
+    (OwnedPosition("rt-1", AAPL, "AAPL", 4.0, NOW, DEC, 230.0, 10.0), None, DEC),
+    (OwnedPosition("rt-1", AAPL, "AAPL", 4.0, NOW, DEC, 230.0, 10.0), {"stop_price": 231.0, "target_price": 239.2},
+     DEC),
+    (OwnedPosition("rt-1", AAPL, "AAPL", 4.0, NOW, DEC, 240.0, 10.0), {"stop_price": 225.4, "target_price": 239.2},
+     DEC)])                                                  # PR #86 4211394769: the fill left the bracket
+def test_a_model_close_always_has_a_record_and_an_invalid_one_is_incomplete(position, body, linked):
+    b = matched_entry(position, body, close_decision_id=CLOSE_1, closed_quantity=4)
+    assert (b.baseline_id, b.opportunity_id, b.incomplete_reason) == (
+        "matched_entry_bracket_exit.v1", CLOSE_1, "entry_not_comparable")
+    assert (b.side, b.quantity, b.reference_price, b.stop_price, b.target_price) == (None,) * 5
+    assert (b.conid, b.linked_decision_id, b.linked_round_trip_id) == (AAPL, linked, "rt-1")
+
+
+def test_a_trip_id_the_record_cannot_carry_is_left_to_the_trader():
+    position = OwnedPosition("rt 1/bad", AAPL, "AAPL", 4.0, NOW, DEC, 240.0, 10.0)
+    b = matched_entry(position, None, close_decision_id=CLOSE_1, closed_quantity=4)
+    assert (b.incomplete_reason, b.linked_round_trip_id) == ("entry_not_comparable", None)

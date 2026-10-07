@@ -6,7 +6,7 @@ from typing import Any, Optional
 
 from trader.ai.decision_engine import JudgeSettings, judge_entry
 from trader.ai.replay import INCOMPLETE, ExternalAdapterCounter, ReplayEvidence, ReplayResult, ReplaySession
-from trader.ai.tools import ReplayTools
+from trader.ai.tools import ReplayTools, code_version
 
 
 async def replay_decision(store: Any, decision_id: str, *, config: Any,
@@ -16,6 +16,9 @@ async def replay_decision(store: Any, decision_id: str, *, config: Any,
     if passes > 1:
         return ReplayResult(INCOMPLETE, missing=("rejudged_unit",))           # Ruling 19
     evidence = await asyncio.to_thread(ReplayEvidence.load, store, decision_id)
+    mismatch = manifest_mismatch(evidence.manifest, config)
+    if mismatch:
+        return ReplayResult(INCOMPLETE, missing=mismatch)                   # PR #86 thread 4211394935
     session = ReplaySession(evidence, counter or ExternalAdapterCounter())
     settings = JudgeSettings.from_config(config, health=None)
 
@@ -25,6 +28,19 @@ async def replay_decision(store: Any, decision_id: str, *, config: Any,
     result = await session.arun(work)
     session.assert_no_external_calls()
     return result
+
+
+def manifest_mismatch(manifest: Optional[dict], config: Any) -> tuple[str, ...]:
+    """A replay reproduces a decision only under the config and code it was made with. A missing manifest is
+    left to the session, which reports it as missing."""
+    if manifest is None:
+        return ()
+    mismatch = ()
+    if manifest.get("config_digest") != config.digest():
+        mismatch += ("config_mismatch",)
+    if manifest.get("code_version") != code_version():
+        mismatch += ("code_mismatch",)
+    return mismatch
 
 
 def recorded_judgment(store: Any, decision_id: str) -> Optional[dict]:

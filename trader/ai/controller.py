@@ -29,6 +29,7 @@ from trader.ai.store import to_utc
 logger = logging.getLogger(__name__)
 
 WAIT = "WAIT"
+EXIT_WAIT_OVERRUN = dt.timedelta(minutes=10)      # backstop past an exit's own wait_until (PR #86 4211394337)
 SLOT_POLL_SECONDS = 1.0
 CYCLE_SOURCE = {ENTRY: "entry_cycle", POSITION: "position_cycle"}
 TRADER_AWAY = (RpcNotSent, RpcOutcomeUnknown, RpcRefused)
@@ -75,6 +76,8 @@ def validate_result(source_kind: str, result: Any) -> Optional[str]:
         return "ACTION_NOT_ALLOWED_HERE"
     if any(b.linked_action_key is not None and b.linked_action_key not in keys for b in result.baselines):
         return "BASELINE_LINK_UNKNOWN"
+    if result.wait_until is not None and (source_kind != "exit_signal" or result.decisions or result.baselines):
+        return "WAIT_NOT_ALLOWED_HERE"
     return None
 
 
@@ -141,10 +144,21 @@ class AiController:
             await self._store.atransaction(lambda conn: register_context_in_tx(
                 conn, context_key=context_key, experiment_id=experiment.experiment_id, served_kind=kind,
                 served_id=served_id, now=now))
+        async def record_baselines(baselines: tuple) -> None:
+            if any(b.linked_action_key is not None or b.baseline_id == MATCHED_ENTRY_BASELINE for b in baselines):
+                raise ValueError("only unlinked baselines are recorded ahead of their result")
+            now = self._clock.now()
+
+            def work(conn: Any) -> None:
+                for baseline in baselines:
+                    self._outbox.enqueue_simulated_in_tx(conn, experiment_id=experiment.experiment_id,
+                                                         baseline=baseline, wait_for_decision_id=None, now=now)
+            await self._store.atransaction(work)
         await register(source_id, served_kind, source_id)
         return ModelWork(context_key=source_id, served_kind=served_kind, served_id=source_id, source_id=source_id,
                          experiment_id=experiment.experiment_id, gateway=self._gateway,
-                         deadline=self._gateway.new_deadline(source_id), register=register)
+                         deadline=self._gateway.new_deadline(source_id), register=register,
+                         record_baselines=record_baselines)
 
     async def _commit(self, source_kind: str, source_id: str, experiment: ExperimentView, result: Any,
                       finish: Callable[[Any, bool, Optional[str]], None],
@@ -189,10 +203,11 @@ class AiController:
 
     async def dispatch_opportunities(self) -> None:
         now = self._clock.now()
+        waits = await self._intake.waits()
         for opportunity, _state in await self._intake.open_opportunities():
             if opportunity.opportunity_id in self._opportunity_tasks:
                 continue
-            verdict = self._signal_verdict(opportunity, now)
+            verdict = self._signal_verdict(opportunity, now, waits.get(opportunity.opportunity_id))
             if verdict == WAIT:
                 continue
             if verdict is not None:
@@ -203,8 +218,12 @@ class AiController:
             self._opportunity_tasks[opportunity.opportunity_id] = task
             task.add_done_callback(lambda _t, key=opportunity.opportunity_id: self._opportunity_tasks.pop(key, None))
 
-    def _signal_verdict(self, opportunity: SignalOpportunity, now: dt.datetime) -> Optional[str]:
-        if not self._intake.is_fresh(opportunity, now):
+    def _signal_verdict(self, opportunity: SignalOpportunity, now: dt.datetime,
+                        waiting_until: Optional[dt.datetime] = None) -> Optional[str]:
+        if waiting_until is not None:                      # the engine bounds an exit's wait; this is the backstop
+            if now > waiting_until + EXIT_WAIT_OVERRUN:
+                return "EXIT_WAIT_EXPIRED"
+        elif not self._intake.is_fresh(opportunity, now):
             return "STALE"
         if self._leadership.current_epoch() is None or not self._watch.known:
             return WAIT
@@ -231,6 +250,10 @@ class AiController:
         try:
             work = await self._open_work(opportunity.opportunity_id, "signal", experiment)
             result = await hook(SignalContext(self._clock.now(), experiment, opportunity, work))
+            if not buy and isinstance(result, EngineResult) and result.wait_until is not None \
+                    and validate_result("exit_signal", result) is None:
+                await self._intake.wait(opportunity.opportunity_id, result.wait_until, result.note or "EXIT_WAITING")
+                return                                     # judged again on the next tick, never lost
             await self._commit("entry_signal" if buy else "exit_signal", opportunity.opportunity_id, experiment,
                                result, finish)
         except asyncio.CancelledError:

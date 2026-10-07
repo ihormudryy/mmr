@@ -1,4 +1,4 @@
-"""ai.duckdb tables of the decision engine (SP2 Plan 6, migrations 20-21; 22-29 stay free). Plain CREATE only."""
+"""ai.duckdb tables of the decision engine (SP2 Plan 6, migrations 20-22; 23-29 stay free). Plain CREATE only."""
 from __future__ import annotations
 
 from trader.ai.schema import Migration
@@ -18,4 +18,9 @@ DECISION_MIGRATIONS: tuple[Migration, ...] = (
             error_code VARCHAR, read_at VARCHAR, complete BOOLEAN NOT NULL, coverage_json VARCHAR,
             seen INTEGER NOT NULL, eligible INTEGER NOT NULL, dropped_json VARCHAR NOT NULL,
             recorded_at TIMESTAMPTZ NOT NULL)""",)),
+    # An exit signal that waits for our accepted, not yet filled entry (PR #86 thread 4211394337).
+    Migration(22, "ai_exit_waits", ("""
+        CREATE TABLE ai_exit_waits (
+            opportunity_id VARCHAR PRIMARY KEY, wait_until TIMESTAMPTZ NOT NULL, reason VARCHAR,
+            created_at TIMESTAMPTZ NOT NULL, updated_at TIMESTAMPTZ NOT NULL)""",)),
 )

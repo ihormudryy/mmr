@@ -30,12 +30,14 @@ BASELINE_COHORTS: Mapping[str, str] = {
 TRADER_SIZED_BASELINES = frozenset({"follow_signal.v1", "fixed_rule.v1"})     # Plan 2 Ruling 19
 MATCHED_ENTRY_BASELINE = "matched_entry_bracket_exit.v1"
 INCOMPLETE_REASONS = ("quote_unavailable", "feed_not_accepted", "quote_not_executable", "ranking_unavailable",
-                      "budget_refused", "model_failed", "sizing_unavailable")     # Plan 2 Ruling 18
+                      "budget_refused", "model_failed", "sizing_unavailable",     # Plan 2 Ruling 18
+                      "entry_not_comparable")                                     # PR #86 thread 4211394769
 _EXPERIMENT_ID = re.compile(r"^exp-[0-9a-f]{20}$")
 _DECIDER = re.compile(r"^[a-z][a-z0-9_.-]{0,63}$")
 _DIGEST = re.compile(r"^sha256:[0-9a-f]{64}$")
 _OPPORTUNITY_ID = re.compile(r"^[A-Za-z0-9_.:-]{1,128}$")
 _DECISION_ID = re.compile(r"^[A-Za-z0-9_-]{8,64}$")
+DECISION_ID_SHAPE, OPPORTUNITY_ID_SHAPE = _DECISION_ID, _OPPORTUNITY_ID     # the record checks, for baselines.py
 
 
 def parse_aware(text: Any, name: str) -> dt.datetime:
@@ -141,11 +143,19 @@ class ModelWork:
     """Identity and deadline of one piece of model work. The engine builds request keys only through it."""
 
     def __init__(self, *, context_key: str, served_kind: str, served_id: str, source_id: str, experiment_id: str,
-                 gateway: Any, deadline: Any, register: Callable[[str, str, str], Awaitable[None]]):
+                 gateway: Any, deadline: Any, register: Callable[[str, str, str], Awaitable[None]],
+                 record_baselines: Optional[Callable[[tuple], Awaitable[None]]] = None):
         self.context_key, self.served_kind, self.served_id = context_key, served_kind, served_id
         self.source_id, self.experiment_id = source_id, experiment_id
         self.gateway, self.deadline = gateway, deadline
         self._register = register
+        self._record_baselines = record_baselines
+
+    async def record_baselines(self, baselines: tuple) -> None:
+        """Persist owed, unlinked baselines now, in their own transaction: they survive a cycle that is cut
+        at its deadline (PR #86 thread 4211394562). Recording again with the result is a no-op."""
+        if self._record_baselines is not None and baselines:
+            await self._record_baselines(tuple(baselines))
 
     def request_key(self, role: str, call_seq: int) -> str:
         if role not in ROLE_NAMES or type(call_seq) is not int or call_seq < 1:
@@ -158,7 +168,7 @@ class ModelWork:
         await self._register(decision_id, "decision", decision_id)
         return ModelWork(context_key=decision_id, served_kind="decision", served_id=decision_id,
                          source_id=self.source_id, experiment_id=self.experiment_id, gateway=self.gateway,
-                         deadline=self.deadline, register=self._register)
+                         deadline=self.deadline, register=self._register, record_baselines=self._record_baselines)
 
 
 @dataclass(frozen=True)
@@ -299,6 +309,8 @@ class EngineResult:
     decisions: tuple[ProposedDecision, ...] = ()
     baselines: tuple[SimulatedBaseline, ...] = ()
     note: str = ""                    # short audit text, e.g. "JEV_SKIP"; stored with the opportunity or cycle
+    # An exit signal not decidable yet (our accepted entry has not filled): ask again until this time.
+    wait_until: Optional[dt.datetime] = None
 
 
 class DecisionEngine(Protocol):

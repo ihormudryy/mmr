@@ -17,7 +17,9 @@ from __future__ import annotations
 import datetime as dt
 import logging
 import math
-from typing import Any, Callable, Optional
+from dataclasses import dataclass
+from typing import Any, Callable, Optional, Protocol
+from zoneinfo import ZoneInfo
 
 from trader.automation.experiments import ExperimentRecord, ExperimentRefused, ExperimentStore
 from trader.automation.kill_line import KillEvaluation, KillLineInputError, effective_kill_line, evaluate_kill_line
@@ -26,6 +28,24 @@ logger = logging.getLogger(__name__)
 
 KILL_MONITOR_PRINCIPAL = "kill_monitor"
 DETECTION_NOTE = "IB account updates, about 3 minutes; paper only"
+ET = ZoneInfo("America/New_York")
+
+
+class KillAlertPort(Protocol):
+    def enqueue(self, event_id: str, kind: str, text: str) -> bool: ...
+
+
+class SessionEndPort(Protocol):
+    def record_session_end(self, end: Any) -> Any: ...
+
+
+@dataclass(frozen=True)
+class KillSessionEnd:
+    """Field names of Plan 5's ``SessionEnd``."""
+    account_id: str
+    session_date: dt.date
+    state: str
+    ended_at: dt.datetime
 
 
 def kill_root_id(experiment_id: str, kill_seq: int, kill_round: int) -> str:
@@ -50,7 +70,9 @@ def record_incident(journal: Any, *, kind: str, account_id: str, detail: str, ev
 class KillLineMonitor:
     def __init__(self, *, store: ExperimentStore, broker: Any, session: Any, liquidation: Any, config: Any,
                  account_id: str, now: Callable[[], dt.datetime], journal: Any = None,
-                 stale_after_seconds: float = 30.0, flatten_seconds: float = 300.0):
+                 stale_after_seconds: float = 30.0, flatten_seconds: float = 300.0,
+                 reconciliation_safe: Callable[[], bool] = lambda: False):
+        self._reconciliation_check = reconciliation_safe
         self._store = store
         self._broker = broker
         self._session = session
@@ -252,8 +274,12 @@ class KillLineMonitor:
                          "kill_generation_id": snapshot.generation_id, "kill_flat_state": "PENDING",
                          "kill_alert_state": "PENDING", "kill_session_end_state": "PENDING"})
         except ExperimentRefused as exc:
-            # A concurrent pause or stop won the compare-and-set; the next tick decides again.
+            # A concurrent stop won the compare-and-set; the next tick decides again.
             logger.warning("experiment %s: kill not written (%s); retried next tick", record.experiment_id, exc.code)
+            return
+        except Exception:
+            # No order is sent unless KILLED is durable (spec 5.5 step 1).
+            logger.exception("experiment %s: kill not written; no flatten, retried next tick", record.experiment_id)
             return
         logger.critical("experiment %s KILLED: drawdown %.2f%% from %.2f (net liquidation %.2f)",
                         killed.experiment_id, evaluation.drawdown_pct, evaluation.reference,
@@ -261,8 +287,113 @@ class KillLineMonitor:
         self._drive_kill(killed)
 
     def _drive_kill(self, record: ExperimentRecord) -> None:
-        if record.kill_flatten_root is None:
+        """Every tick while KILLED. Each step is independent: a failure is logged and retried next tick."""
+        for step in (self._ensure_flatten, self._ensure_alert, self._prove_flat, self._check_late_exposure,
+                     self._ensure_session_end):
+            try:
+                record = step(record)
+            except ExperimentRefused as exc:
+                if exc.code == "EXPERIMENT_STATE_CHANGED":    # stopped meanwhile: the tick ends
+                    return
+                logger.exception("experiment %s: kill step %s refused", record.experiment_id, step.__name__)
+            except Exception:
+                logger.exception("experiment %s: kill step %s failed; retried next tick",
+                                 record.experiment_id, step.__name__)
+
+    def _progress(self, record: ExperimentRecord, **changes: Any) -> ExperimentRecord:
+        return self._store.update_kill_progress(record.experiment_id, expected_state="KILLED", changes=changes)
+
+    def _ensure_flatten(self, record: ExperimentRecord) -> ExperimentRecord:
+        """Step 1 (K3, K5): start or join the account flatten once per round and keep the root to poll."""
+        if record.kill_flatten_root is not None:
+            return record
+        if self._liquidation.receipt_for(record.kill_root_id) is not None:
+            root = record.kill_root_id                    # start committed before a crash: adopt it
+        else:
             deadline = self._now() + dt.timedelta(seconds=self._flatten_seconds)
             root = self._session.flatten_account_now(record.kill_root_id, deadline)
-            self._store.update_kill_progress(record.experiment_id, expected_state="KILLED",
-                                             changes={"kill_flatten_root": root})
+        if root != record.kill_root_id:
+            logger.warning("experiment %s: kill flatten joined account root %s", record.experiment_id, root)
+        return self._progress(record, kill_flatten_root=root)
+
+    def _ensure_alert(self, record: ExperimentRecord) -> ExperimentRecord:
+        """Step 2 (K18): one kill_started alert; an outbox failure never blocks the flatten."""
+        if record.kill_alert_state != "PENDING":
+            return record
+        state = self._send_alert(kill_alert_event_id(record), "kill_started", kill_alert_text(record))
+        return record if state is None else self._progress(record, kill_alert_state=state)
+
+    def _prove_flat(self, record: ExperimentRecord) -> ExperimentRecord:
+        """Step 3 (spec 5.5 step 4, K6): FLAT only on a fenced capture as new as the root's proof."""
+        if record.kill_flat_state != "PENDING" or record.kill_flatten_root is None:
+            return record
+        receipt = self._liquidation.receipt_for(record.kill_flatten_root)
+        if receipt is None:
+            return record
+        if receipt.state == "SUPERSEDED" and receipt.superseded_by:
+            return self._progress(record, kill_flatten_root=receipt.superseded_by)
+        if receipt.state in ("FAILED_SAFE", "REDUCE_FAILED"):
+            logger.critical("experiment %s: kill flatten %s ended %s; no new round starts on its own",
+                            record.experiment_id, record.kill_flatten_root, receipt.state)
+            return self._progress(record, kill_flat_state="FAILED_SAFE", kill_flat_at=self._now())
+        if receipt.state not in ("FLAT", "CLOSED", "DONE"):
+            return record
+        snapshot = self._broker.capture(self._account_id)
+        proof = receipt.generation_id if receipt.generation_id is not None else 0
+        if snapshot.generation_id < proof or _exposure(snapshot) or not self._reconciliation_safe():
+            return record
+        logger.warning("experiment %s: kill flatten proven FLAT on generation %d",
+                       record.experiment_id, snapshot.generation_id)
+        return self._progress(record, kill_flat_state="FLAT", kill_flat_generation=snapshot.generation_id,
+                              kill_flat_at=self._now())
+
+    def _check_late_exposure(self, record: ExperimentRecord) -> ExperimentRecord:
+        """Step 4 (K6): exposure after FLAT starts a new round. A round joins Plan 1's late-fill
+        close when that one owns the account already (JOINED_FLATTEN), so no second root is made."""
+        if record.kill_flat_state != "FLAT":
+            return record
+        if not _exposure(self._broker.capture(self._account_id)):
+            return record
+        next_round = record.kill_round + 1
+        logger.critical("experiment %s: exposure after the kill flatten was FLAT; starting round %d",
+                        record.experiment_id, next_round)
+        return self._progress(record, kill_round=next_round,
+                              kill_root_id=kill_root_id(record.experiment_id, record.kill_seq, next_round),
+                              kill_flatten_root=None, kill_flat_state="PENDING", kill_flat_generation=None,
+                              kill_flat_at=None)
+
+    def _ensure_session_end(self, record: ExperimentRecord) -> ExperimentRecord:
+        """Step 5 (K18): one session-end notice with state KILLED once the flatten ended."""
+        if record.kill_flat_state not in ("FLAT", "FAILED_SAFE") or record.kill_session_end_state != "PENDING":
+            return record
+        if self._session_end is None:
+            return self._progress(record, kill_session_end_state="NO_SINK")
+        self._session_end.record_session_end(KillSessionEnd(
+            account_id=self._account_id, session_date=record.killed_at.astimezone(ET).date(), state="KILLED",
+            ended_at=record.kill_flat_at))
+        return self._progress(record, kill_session_end_state="RECORDED")
+
+    def _reconciliation_safe(self) -> bool:
+        try:
+            return self._reconciliation_check() is True
+        except Exception:
+            logger.exception("reconciliation state unreadable; the kill flatten is not reported flat")
+            return False
+
+
+def _exposure(snapshot: Any) -> bool:
+    return any(p.quantity != 0 for p in snapshot.positions) or bool(snapshot.working_orders)
+
+
+def kill_alert_event_id(record: ExperimentRecord) -> str:
+    return f"kill_started:{record.experiment_id}:{record.kill_seq}"
+
+
+def kill_alert_text(r: ExperimentRecord) -> str:
+    killed_at = r.killed_at.astimezone(dt.timezone.utc) if r.killed_at is not None else None
+    when = "unknown time" if killed_at is None else f"{killed_at:%Y-%m-%d %H:%M} UTC"
+    return (f"PAPER experiment {r.experiment_id} KILLED at {when}: "
+            f"drawdown {r.kill_observed_drawdown_pct:.2f}% vs kill line {r.kill_drawdown_pct}% "
+            f"({r.kill_basis} basis), net liquidation {r.kill_net_liquidation:,.2f} {r.base_currency}. "
+            "Account flatten started. A killed experiment is never resumed: once flat, run mmr reconcile, "
+            "mmr experiment stop, then mmr experiment start for a new run.")

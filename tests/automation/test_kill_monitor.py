@@ -75,6 +75,14 @@ class Session:
         return cause
 
 
+class Liquidation:
+    def __init__(self):
+        self.receipts = {}
+
+    def receipt_for(self, root_id):
+        return self.receipts.get(root_id)
+
+
 class Outbox:
     def __init__(self):
         self.calls = []
@@ -107,8 +115,9 @@ class World:
 
     def _build(self, recover):
         self.session = Session(self.store)
+        self.liquidation = Liquidation()
         self.monitor = KillLineMonitor(store=self.store, broker=self.broker, session=self.session,
-                                       liquidation=None, config=self.config, account_id=ACCOUNT, now=self.clock,
+                                       liquidation=self.liquidation, config=self.config, account_id=ACCOUNT, now=self.clock,
                                        journal=self.journal)
         self.monitor.attach_notices(alerts=self.outbox)
         if recover:

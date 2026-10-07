@@ -41,6 +41,7 @@ from trader.trading.command_coordinator import (
 from trader.trading.command_policy import CommandAuthorityPolicy
 from trader.trading.dispatch_guard import DispatchGuard
 from trader.trading.exit_owner import ExitOwnerRegistry, apply_exit_owner_migration
+from trader.trading.liquidation_service import apply_liquidation_migration
 from trader.trading.trading_control import TradingControlStore, apply_trading_control_migration
 
 GOOD_MARGIN = {"initMarginAfter": 5_000.0, "equityWithLoanAfter": 995_000.0}
@@ -79,6 +80,11 @@ class Broker:
         self.snapshot = snapshot()
         self.fail = False
         self.lock = threading.Lock()
+        self.held = False          # read by the liquidation test dispatch
+
+    @property
+    def last(self) -> int:
+        return self.snapshot.generation_id
 
     def capture(self, account_id):
         if self.fail:
@@ -189,7 +195,7 @@ class FilterFile:
 
 
 class World:
-    def __init__(self, tmp_path: Path, *, liquidation=None):
+    def __init__(self, tmp_path: Path, *, real_liquidation: bool = False):
         self.clock = Clock()
         self.db = DuckDBConnection.get_instance(str(tmp_path / "journal.duckdb"))
         migrator = SchemaMigrator(self.db)
@@ -198,7 +204,7 @@ class World:
         for apply in (apply_command_ledger_migration, apply_trading_control_migration,
                       apply_protective_order_saga_migration, apply_ai_risk_policy_migration,
                       apply_ai_deployment_migration, apply_ai_paper_decision_migration,
-                      apply_canary_risk_migration, apply_exit_owner_migration):
+                      apply_canary_risk_migration, apply_exit_owner_migration, apply_liquidation_migration):
             apply(migrator)
         self.controls = TradingControlStore(self.journal)
         self.db.transaction(lambda conn: self.controls.seed_in_tx(conn, [(ACCOUNT, "paper")], NOW))
@@ -215,12 +221,12 @@ class World:
         self.entry_filter = AiEntryFilter(
             universe=FakeUniverse({CONID: secdef("AAPL", "NASDAQ"), OTHER: secdef("MSFT", "NASDAQ", conid=OTHER)}),
             load_filter=counted_loader)
+        self.exit_owners = ExitOwnerRegistry(self.db)
         self.policy = self._policy()
         self.deployments = AiDeploymentStore(self.db, now=self.clock)
         self.digest, _ = self.deployments.register(AiDeployment.from_json(GOOD), principal="ai_research",
                                                    command_id="dep-1")
         self.policy_publish(PAPER_LIMITS)
-        self.exit_owners = ExitOwnerRegistry(self.db)
         self.evidence = FailingEvidence(AiPaperEvidence(
             broker=self.broker, quotes=self.quotes, margin=self.margin,
             history=make_history(str(tmp_path / "history.duckdb")), journal=self.journal,
@@ -236,7 +242,8 @@ class World:
                                             else PAPER_LIMITS),
             ai_entry_gate=ai_entry_gate(entry_filter=self.entry_filter),
             strict_margin_actions=frozenset({AI_PAPER_ACTION}))
-        self.liquidation = liquidation or SimpleNamespace(start=lambda *a, **k: None)
+        self.liquidation = (self._real_liquidation() if real_liquidation
+                            else SimpleNamespace(start=lambda *a, **k: None))
         self.saga = ProtectiveOrderSaga(
             journal=self.journal, ledger=self.ledger, dispatch=self.dispatch, dispatch_guard=self.guard,
             session_risk=SessionRiskController(calendar=XNYSCalendarPolicy(), now=self.clock),
@@ -259,6 +266,18 @@ class World:
             now=self.clock)
         self.coordinator.register_action(AI_PAPER_ACTION, self.service.execute, requires_preflight=False,
                                          saga=True)
+
+    def _real_liquidation(self):
+        from tests.test_liquidation_service import _Breaker, _Dispatch
+        from trader.trading.liquidation_service import LiquidationRunStore, LiquidationService
+        self.liquidation_dispatch = _Dispatch(self.broker)
+        self.liquidation_scheduled: list[str] = []
+        return LiquidationService(
+            self.broker, self.liquidation_dispatch, store=LiquidationRunStore(self.db), registry=self.exit_owners,
+            now=self.clock, breaker=_Breaker(), schedule_reconcile=self.liquidation_scheduled.append)
+
+    def liquidation_runs(self) -> set[str]:
+        return {row[0] for row in self.db.execute("SELECT cause_command_id FROM liquidation_runs", fetch="all")}
 
     def _policy(self, ceiling=PAPER_LIMITS):
         return AiRiskPolicyService(db=self.db, account_id=ACCOUNT, ceiling=ceiling,

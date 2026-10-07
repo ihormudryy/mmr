@@ -17,6 +17,7 @@ from pathlib import Path
 from typing import Any, Callable, Mapping, Optional, Protocol
 
 from trader.automation.command_steps import CommandSteps
+from trader.automation.reduction_close import start_broker_proven_close
 from trader.automation.models import (
     EntryPolicy,
     ExecutionIntent,
@@ -358,9 +359,6 @@ class AutomatedIntentCommandService:
         own fenced generations, and the reduce-only boundary checks IB's live
         position again (Task 14).
         """
-        from trader.trading.exit_owner import ExitInProgress
-        from trader.trading.liquidation_service import LiquidationRefused
-
         if self._liquidation is None or self._broker is None:
             # Fail loudly: never fall back to the bracket path, which would add a reverse stop.
             self._transition(cmd, "VALIDATED", "REJECTED", error_code="CLOSE_PATH_UNAVAILABLE")
@@ -373,41 +371,21 @@ class AutomatedIntentCommandService:
             return self._receipt(cmd.command_id, "REJECTED", "CONID_NOT_PERMITTED", False,
                                  outcome={"detail": f"conid {intent.conid} is not in the artifact allowlist"})
         self._claim(cmd, require_unpaused=False)
-        try:
-            snapshot = self._broker.capture(self._account_id)
-            if getattr(snapshot, "account_id", None) != self._account_id:
-                raise RuntimeError("broker snapshot is for another account")
-        except Exception as ex:
-            return self._reject_close(cmd, "BROKER_SNAPSHOT_UNAVAILABLE", {"detail": str(ex)})
-        held = float(snapshot.reducible_quantity(intent.conid))
-        requested = None if intent.requested_quantity is None else float(intent.requested_quantity)
-        if held <= 0 or (requested is not None and requested > held):
-            return self._reject_close(cmd, "NOT_A_REDUCTION", {"held": held, "requested": requested})
-        # A close of the whole position takes the broker quantity at reduce time (ruling 10).
-        quantity = None if requested is None or requested >= held else requested
-        deadline = self._now_utc() + dt.timedelta(seconds=self._close_deadline_seconds)
-        try:
-            receipt = self._liquidation.start(
-                self._account_id, cmd.command_id, deadline, scope="conid", conid=intent.conid, quantity=quantity,
-            )
-        except ExitInProgress as ex:
-            return self._reject_close(cmd, "EXIT_IN_PROGRESS", {"close_root_id": ex.root_id})
-        except LiquidationRefused as ex:
-            return self._reject_close(cmd, ex.code, {"detail": str(ex)})
-        except Exception as ex:
-            self._transition(cmd, "SUBMITTING", "OUTCOME_UNKNOWN", error_code="DISPATCH_AMBIGUOUS")
-            if self._schedule_reconcile is not None:
-                self._schedule_reconcile(cmd.command_id)
-            return self._receipt(cmd.command_id, "OUTCOME_UNKNOWN", "DISPATCH_AMBIGUOUS", False,
-                                 outcome={"detail": str(ex)})
-
-        outcome = {"close_root_id": receipt.cause_command_id, "liquidation_state": receipt.state,
-                   "generation_id": receipt.generation_id, "detail": receipt.detail}
-        self._transition(cmd, "SUBMITTING", "OUTCOME_UNKNOWN", error_code="CLOSE_PENDING", outcome=outcome)
+        close = start_broker_proven_close(
+            liquidation=self._liquidation, broker=self._broker, account_id=self._account_id,
+            command_id=cmd.command_id, conid=intent.conid, side=intent.side,
+            quantity=None if intent.requested_quantity is None else float(intent.requested_quantity),
+            deadline=self._now_utc() + dt.timedelta(seconds=self._close_deadline_seconds))
+        if close.state == "REJECTED":
+            return self._reject_close(cmd, close.error_code, close.outcome)
+        # An ambiguous dispatch keeps its detail on the receipt only, as before the extraction.
+        ledger_outcome = close.outcome if close.error_code == "CLOSE_PENDING" else None
+        self._transition(cmd, "SUBMITTING", "OUTCOME_UNKNOWN", error_code=close.error_code,
+                         outcome=ledger_outcome)
         if self._schedule_reconcile is not None:
             # R17: the reconciler resolves this command from the exact root it started or joined.
             self._schedule_reconcile(cmd.command_id)
-        return self._receipt(cmd.command_id, "OUTCOME_UNKNOWN", "CLOSE_PENDING", False, outcome=outcome)
+        return self._receipt(cmd.command_id, "OUTCOME_UNKNOWN", close.error_code, False, outcome=close.outcome)
 
     def _reject_close(self, cmd, code: str, outcome: dict) -> CommandReceipt:
         self._transition(cmd, "SUBMITTING", "REJECTED", error_code=code)

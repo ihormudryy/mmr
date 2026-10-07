@@ -23,6 +23,7 @@ from trader.automation.ai_paper_sizing import is_pending_entry
 from trader.automation.ai_risk_policy import PolicyRefused
 from trader.automation.command_steps import CommandSteps
 from trader.automation.models import EntryPolicy, StopPolicy, TargetPolicy
+from trader.automation.reduction_close import CLOSE_PENDING, start_broker_proven_close
 from trader.data.schema_migrations import SchemaMigrator
 from trader.domain.commands import CommandReceipt
 from trader.trading.approval_context import ApprovalContextError
@@ -305,8 +306,12 @@ class AiPaperDecisionStore:
         return self.row_by_command(command_id_for(decision_id))
 
     def blocking_decision_on_conid_in_tx(self, conn, account_id: str, conid: int, *,
-                                         exclude_command_id: str, broker: Any) -> Optional[str]:
-        """R13: OUTCOME_UNKNOWN_PENDING or ENTRY_ALREADY_WORKING for another ai_paper command on the conid."""
+                                         exclude_command_id: str, broker: Any,
+                                         working_entry_blocks: bool = True) -> Optional[str]:
+        """R13: OUTCOME_UNKNOWN_PENDING or ENTRY_ALREADY_WORKING for another ai_paper command on the conid.
+
+        A reduction passes ``working_entry_blocks=False``: the close cancels a working entry itself.
+        """
         markers = ", ".join("?" for _ in _BLOCKING_STATES)
         rows = conn.execute(
             f"SELECT command_id, state FROM command_ledger WHERE action = ? AND account_id = ? "
@@ -321,7 +326,7 @@ class AiPaperDecisionStore:
             if not orders and not self._saga_acknowledged_in_tx(conn, command_id):
                 return "OUTCOME_UNKNOWN_PENDING"
             working_entry |= any(o.leg == "entry" and is_pending_entry(o) for o in orders)
-        return "ENTRY_ALREADY_WORKING" if working_entry else None
+        return "ENTRY_ALREADY_WORKING" if working_entry and working_entry_blocks else None
 
     @staticmethod
     def _saga_acknowledged_in_tx(conn, command_id: str) -> bool:
@@ -460,7 +465,7 @@ class AiPaperDecisionService:
         return snapshot
 
     def _validate(self, cmd: CommandRequest, admission: _Admission, conid: int, snapshot: Any,
-                  *, owner_check: Callable[[Any], Optional[str]]) -> None:
+                  *, owner_check: Callable[[Any], Optional[str]], working_entry_blocks: bool = True) -> None:
         """Step 6: the blocking check and RECEIVED -> VALIDATED in one serialized journal transaction."""
         from trader.trading.command_coordinator import _command_updated_mutation, _noop_write
         now = self._steps.now_utc()
@@ -469,6 +474,7 @@ class AiPaperDecisionService:
         def work(conn, append):
             code = self._decisions.blocking_decision_on_conid_in_tx(
                 conn, self._account_id, conid, exclude_command_id=cmd.command_id, broker=snapshot,
+                working_entry_blocks=working_entry_blocks,
             ) or owner_check(conn)
             to_state = "REJECTED" if code else "VALIDATED"
             self._ledger.transition_in_tx(conn, cmd.command_id, "RECEIVED", to_state, error_code=code, now=now)
@@ -592,7 +598,37 @@ class AiPaperDecisionService:
 
     def _execute_reduction(self, cmd: CommandRequest, decision: AiPaperDecision,
                            admission: _Admission) -> CommandReceipt:
-        raise _Refusal("REDUCTION_NOT_AVAILABLE")
+        """Spec 5.4: no entry window, budget, loss check, policy or deployment; never paused (R32)."""
+        experiment = self._experiment(allow=("ARMED", "PAUSED", "KILLED"))
+        killed = experiment.state == "KILLED"
+        if killed and self._account_owner() is None:
+            # R15: join the kill flatten; never claim a new scoped root while it is being set up.
+            raise _Refusal("KILL_FLATTEN_PENDING", retryable=True)
+        self._check_expiry(decision)
+        snapshot = self._capture()
+        self._validate(cmd, admission, decision.conid, snapshot, owner_check=lambda conn: None,
+                       working_entry_blocks=False)
+        self._claim(cmd, admission, require_unpaused=False)
+        partial = decision.action == "PARTIAL_CLOSE" and not killed
+        close = start_broker_proven_close(
+            liquidation=self._liquidation, broker=self._broker, account_id=self._account_id,
+            command_id=cmd.command_id, conid=decision.conid, side=decision.side,
+            quantity=float(decision.quantity) if partial else None,
+            stop_price=decision.stop_price if partial else None,
+            target_price=decision.target_price if partial else None,
+            deadline=self._steps.now_utc() + dt.timedelta(seconds=self._close_deadline_seconds))
+        if close.state == "REJECTED":
+            raise _Refusal(close.error_code, detail=json.dumps(close.outcome, default=str))
+        if close.error_code != CLOSE_PENDING:
+            return self._outcome_unknown(cmd, admission, close.error_code, outcome=close.outcome)
+        return self._outcome_unknown(cmd, admission, CLOSE_PENDING, outcome=close.outcome,
+                                     close_root_id=close.close_root_id)
+
+    def _account_owner(self) -> Any:
+        try:
+            return self._exit_owners.account_owner(self._account_id)
+        except Exception:
+            raise _Refusal("EXIT_OWNER_UNAVAILABLE", retryable=True) from None
 
     # -- ledger + decision row -------------------------------------------------
 

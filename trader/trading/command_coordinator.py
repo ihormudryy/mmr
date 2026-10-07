@@ -2521,6 +2521,11 @@ class _ReconcilePlan:
     alerted: bool = False
 
 
+# Commands that start or join a close root and resolve from it (R17). The ai_paper action
+# name is spelled out: importing it from trader.automation would be a cycle.
+CLOSE_RESOLVED_ACTIONS = frozenset({"execute_automated_intent", "liquidate_account", "submit_ai_paper_decision"})
+
+
 class OutcomeReconciler:
     """Resolves ``SUBMITTING``/``OUTCOME_UNKNOWN`` commands against authority.
 
@@ -2702,7 +2707,7 @@ class OutcomeReconciler:
             return self._reconcile_strategy(row, now)
         if action == "execute_automated_intent":
             return self._reconcile_automated_intent(row, now)
-        if action == "liquidate_account":
+        if action in CLOSE_RESOLVED_ACTIONS:
             return self._reconcile_close(row, now)
         # Unmapped action: cannot positively determine an outcome -> stay
         # OUTCOME_UNKNOWN (fail-safe), never rubber-stamp RESOLVED.

@@ -27,3 +27,22 @@ def served(tmp_path, loop_thread, monkeypatch):
     stack = served_stack(tmp_path, loop_thread, monkeypatch, acceptance_probe=True)
     yield stack
     stack.close()
+
+
+@pytest.fixture
+def fake_port():
+    from tests.sp1_acceptance.fakes import FakePort
+    return FakePort()
+
+
+@pytest.fixture
+def settings():
+    from trader.acceptance.scenario import AcceptanceSettings
+    return AcceptanceSettings(run_id="acc-20260717-abcdef", account_id="DU111111",
+                              strategy_bytes=b"class OpeningRangeBreakout: pass\n")
+
+
+@pytest.fixture
+def journal(tmp_path, settings):
+    from trader.acceptance.journal import RunJournal
+    return RunJournal(tmp_path / settings.run_id)

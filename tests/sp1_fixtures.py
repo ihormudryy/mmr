@@ -144,6 +144,8 @@ class BrokerSim:
         self._modify_clears_oca = False
         self._never_close: set[int] = set()
         self._changes: list[tuple] = []                  # (entity, row) per change, in arrival order
+        from trader.data.broker_order_events import record_order_event_in_tx
+        self.record_order_event_in_tx = record_order_event_in_tx   # what broker ingest appends (Plan 6 Task 2)
         self._notified: dict[str, tuple] = {}
 
     # -- fake IB client ----------------------------------------------------------------
@@ -422,10 +424,8 @@ class BrokerSim:
         return gid
 
     def _record_events_in_tx(self, conn, gid, changes, now):
-        """The ingest's broker order event history (Task 2); a no-op until that table exists."""
-        record = getattr(self, "record_order_event_in_tx", None)
-        if record is None:
-            return
+        """The ingest's broker order event history (Plan 6 ruling 14): one row per change, in order."""
+        record = self.record_order_event_in_tx
         last = {}
         for entity, row in changes:
             if entity in self.hidden or last.get(entity) == self._state_of(row):

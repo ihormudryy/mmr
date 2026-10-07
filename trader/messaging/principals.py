@@ -125,6 +125,9 @@ TRADER_ACL: Mapping[tuple[str, str], frozenset[str]] = {
     ("query", "get_scoreboard"): frozenset({"cli", "dashboard", "ai_supervisor"}),
     ("query", "verify_scoreboard"): frozenset({"cli", "dashboard"}),
     ("query", "get_experiment_trips"): frozenset({"cli", "dashboard", "ai_supervisor"}),
+    # SP1 acceptance (Plan 6): reads for the harness and the operator. Explicit sets per method.
+    ("query", "get_acceptance_preflight"): frozenset({"cli", "dashboard", "ai_supervisor"}),
+    ("query", "get_broker_order_evidence"): frozenset({"cli", "dashboard", "ai_supervisor"}),
 }
 
 STRATEGY_ACL: Mapping[tuple[str, str], frozenset[str]] = {

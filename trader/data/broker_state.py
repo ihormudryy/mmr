@@ -343,6 +343,8 @@ class BrokerStateStore:
             "ALTER TABLE broker_orders ADD COLUMN IF NOT EXISTS oca_group VARCHAR",
             "ALTER TABLE broker_orders ADD COLUMN IF NOT EXISTS oca_type INTEGER",
         ))
+        from trader.data.broker_order_events import apply_migration_81_broker_order_events
+        apply_migration_81_broker_order_events(migrator)
 
     @staticmethod
     def _upsert(conn: Any, table: str, key: dict[str, Any], values: dict[str, Any]) -> None:

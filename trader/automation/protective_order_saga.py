@@ -731,6 +731,14 @@ def _apply_entry_leg(state: SagaState, event: BrokerOrderEvent) -> SagaState:
     return next_state
 
 
+def _entry_fill_grows(state: SagaState, event: BrokerOrderEvent) -> bool:
+    if event.leg != "entry":
+        return False
+    if _dec(event.filled_quantity) > state.filled_quantity:
+        return True
+    return event.status in _FILLED_STATUSES and state.filled_quantity < state.requested_quantity
+
+
 def _entry_limit_price(state: SagaState) -> float:
     try:
         price = float(state.plan_json["legs"][0]["limit_price"])
@@ -1046,6 +1054,9 @@ class ProtectiveOrderSaga:
         if state.state == "SAFETY_FAILED" and event.leg == "entry":
             return self._record_entry_after_safety_failure(state, event)
         if state.state == "NOT_SENT":
+            return self._reopen_terminal_row(state, event)
+        if state.state == "CLOSED" and _entry_fill_grows(state, event):
+            # A fill is never dropped, even after a zero-fill cancel or reject.
             return self._reopen_terminal_row(state, event)
         if state.state in _TERMINAL_SAGA:
             return state

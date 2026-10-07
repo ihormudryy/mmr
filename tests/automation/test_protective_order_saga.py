@@ -2422,3 +2422,54 @@ def test_fill_seen_only_through_a_generation_promotion_is_flattened(tmp_path):
     assert [start[1] for start in env.saga._liquidation.starts] == [env.orphan.command_id]
     # A second promotion with the same evidence does not trip again.
     assert env.saga.reconcile_terminal_entries() == ()
+
+
+def _close_reopened_row_without_fill(env):
+    env.saga.on_broker_event(_late_entry_event(env, status="Submitted", filled=0, event_id="s0"))
+    closed = env.saga.on_broker_event(
+        _late_entry_event(env, status="Inactive", filled=0, event_id="i0"),
+    )
+    assert (closed.state, closed.filled_quantity) == ("CLOSED", Decimal(0))
+    return closed
+
+
+def _assert_unprotected_fill_flattened(env, state):
+    assert (state.state, state.error_code) == ("SAFETY_FAILED", "ORPHAN_ORDER_FILLED")
+    assert state.filled_quantity == Decimal(ENTRY_SHARES)
+    assert "PROTECTIVE_ORDER_FAILURE" in [s.kind for s in env.saga._breaker.signals]
+    assert [start[1] for start in env.saga._liquidation.starts] == [env.orphan.command_id]
+    blocked = _start_entry(env.saga, _entry(OTHER_CONID, signal="after"), env.snapshot)
+    assert blocked.error_code == "GROSS_EXPOSURE_IN_FLIGHT"
+
+
+def test_fill_after_a_zero_fill_rejection_of_a_reopened_row_is_flattened(tmp_path):
+    env = _retired(tmp_path)
+    _close_reopened_row_without_fill(env)
+
+    state = env.saga.on_broker_event(
+        _late_entry_event(env, status="Filled", filled=ENTRY_SHARES, event_id="f25"),
+    )
+
+    _assert_unprotected_fill_flattened(env, state)
+
+
+def test_promoted_fill_after_a_zero_fill_rejection_of_a_reopened_row_is_flattened(tmp_path):
+    from trader.trading.broker_ingest import BROKER_SYNC_SOURCES, BrokerIngest
+
+    env = _retired(tmp_path)
+    _close_reopened_row_without_fill(env)
+    evidence, store, db = _real_trace_evidence(env)
+    env.saga._orphan_evidence = evidence
+    ingest = BrokerIngest(
+        db, env.saga._journal, store, ACCOUNT, "paper", session_epoch="s2",
+        clock=lambda: AFTER_SETTLE, protective_order_saga=env.saga,
+    )
+
+    ingest.begin_generation()
+    ingest.on_open_order(_open_order(env.orphan.order_group_id, status="Filled", filled=25))
+    ingest.drain_once()
+    for source in BROKER_SYNC_SOURCES:
+        ingest.mark_source_complete(source)
+    ingest.promote_generation()
+
+    _assert_unprotected_fill_flattened(env, env.saga._store.load(env.orphan.command_id))

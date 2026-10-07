@@ -72,7 +72,8 @@ def test_rotate_unknown_principal_is_refused(tmp_path):
 def test_restart_list_follows_the_peers():
     assert RESTART_ON_ROTATE["strategy"] == ("dashboard", "strategy", "trader")
     assert RESTART_ON_ROTATE["cli"] == ("strategy", "trader")
-    assert RESTART_ON_ROTATE["ai_research"] == ("trader",)
+    assert RESTART_ON_ROTATE["ai_research"] == ("ai", "trader")
+    assert RESTART_ON_ROTATE["ai_supervisor"] == ("ai", "trader")
 
 
 def test_cli_refuses_inside_an_ordinary_container(monkeypatch, tmp_path, capsys):

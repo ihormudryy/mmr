@@ -1486,7 +1486,8 @@ def _read_ai_signals_handler(ai_paper):
         except SignalCursorAhead as ex:
             raise _DispatchProblem(ex.code, str(ex)) from None
         return {"signals": [signal.to_json() for signal in page.signals], "next_cursor": page.next_cursor,
-                "oldest_retained_cursor": page.oldest_retained_cursor, "gap": page.gap}
+                "oldest_retained_cursor": page.oldest_retained_cursor, "gap": page.gap,
+                "record_generation": page.record_generation}
     return _handler
 
 

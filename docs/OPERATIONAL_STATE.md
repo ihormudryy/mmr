@@ -430,6 +430,8 @@ harness holds its own controller epoch (lease 60 s). Stop the `ai` service
 before an acceptance run, or the harness waits on `CONTROLLER_EPOCH_HELD` and
 then fails.
 
+- AI paper controller (SP2): `./docker.sh -u` copies `ai.yaml` to `~/.config/mmr/` once; fill in the model ids and prices, then `docker compose --profile ai up -d ai`. Stop it with `docker compose --profile ai stop ai` (always before the SP1 acceptance run). Its health is the heartbeat file `/tmp/mmr_ai_heartbeat.json` inside the container. Its data volume `mmr_ai_data` is kept by `./docker.sh -d`; only `./docker.sh -c` removes volumes. It does not start until SP2 Plan 6 installs the decision engine (it exits with code 2 before that). Schema rule (no legacy data): `ai.duckdb` tables are edited in place, never upgraded; if a pre-release build ever created `ai.duckdb`, delete the `mmr_ai_data` volume (`docker volume rm mmr_ai_data`) before starting a newer one.
+
 The automation soak below is blocked until the exit fix
 and the split-Docker evidence gap are resolved (see Known blockers). Until then, run strategies with `auto_execute: propose`
 and approve on `/cc`.

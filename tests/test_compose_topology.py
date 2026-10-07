@@ -14,7 +14,7 @@ import yaml
 REPO_ROOT = Path(__file__).resolve().parent.parent
 
 LONG_LIVED_JOB_NAMES = {"data_service", "trader_service", "strategy_service", "web_dashboard"}
-PROCESS_SERVICES = ("data", "trader", "strategy", "dashboard", "scheduler")
+PROCESS_SERVICES = ("data", "trader", "strategy", "dashboard", "scheduler", "ai")
 
 
 def _load_yaml(relative_path: str) -> dict:
@@ -66,6 +66,7 @@ def test_compose_services_use_one_built_image_with_per_service_command():
         "strategy": ["python", "-m", "trader.strategy_service"],
         "dashboard": ["python", "-m", "web.app"],
         "scheduler": ["python", "-m", "pycron.pycron", "--config", "/home/trader/.config/mmr/pycron.yaml"],
+        "ai": ["python", "-m", "trader.ai_service"],
     }
     for name, command in expected_commands.items():
         service = compose["services"][name]

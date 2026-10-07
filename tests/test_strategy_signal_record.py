@@ -10,7 +10,7 @@ from tests.automation.test_controller_epoch import Clock
 from tests.test_signal_proposer import _frame, _make_runtime
 from trader.data.duckdb_store import DuckDBConnection
 from trader.data.strategy_signal_record import (
-    SOURCE_EVENT_ID, SignalCursorAhead, SignalEntry, StrategySignalRecord,
+    RECORD_GENERATION, SOURCE_EVENT_ID, SignalCursorAhead, SignalEntry, StrategySignalRecord,
 )
 from trader.objects import Action
 from trader.trading.strategy import Signal
@@ -208,3 +208,24 @@ def test_a_failure_after_the_record_is_not_retried(tmp_path, installed_strategy,
     rt._on_tick_for_strategy(installed_strategy, 4391)
     assert recorded(rt) == [(1, "2026-10-07T14:30:00+00:00")]
     assert len(rt.event_store.events) == 1                                   # the signal is not replayed
+
+
+def test_each_record_has_a_durable_generation(tmp_path, clock):              # PR #84 thread 4210304622
+    path = str(tmp_path / "gen.duckdb")
+    first = StrategySignalRecord(DuckDBConnection.get_instance(path), now=clock)
+    generation = first.read(after_cursor=0, limit=1).record_generation
+    assert RECORD_GENERATION.fullmatch(generation)
+    first.append(entry(0))
+    reopened = StrategySignalRecord(DuckDBConnection.get_instance(path), now=clock)
+    assert reopened.read(after_cursor=0, limit=1).record_generation == generation      # a restart keeps it
+
+
+def test_a_replaced_record_with_the_same_high_water_has_a_new_generation(tmp_path, clock):
+    old = StrategySignalRecord(DuckDBConnection.get_instance(str(tmp_path / "old.duckdb")), now=clock)
+    new = StrategySignalRecord(DuckDBConnection.get_instance(str(tmp_path / "new.duckdb")), now=clock)
+    for record, strategy in ((old, "orb"), (new, "momentum")):
+        for minute in range(5):
+            record.append(entry(minute, strategy=strategy))
+    old_page, new_page = old.read(after_cursor=5, limit=10), new.read(after_cursor=5, limit=10)
+    assert (old_page.next_cursor, new_page.next_cursor) == (5, 5)              # equal high water
+    assert old_page.record_generation != new_page.record_generation

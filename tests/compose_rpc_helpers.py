@@ -34,7 +34,8 @@ def volumes(service: dict) -> list[dict]:
 
 
 def mounts_config_dir(service: dict) -> bool:
-    return any(v["target"] == CONTAINER_CONFIG for v in volumes(service))
+    """True if the host's ~/.config/mmr is mounted; a tmpfs mask over it (the ai service) exposes nothing."""
+    return any(v["target"] == CONTAINER_CONFIG and v["type"] != "tmpfs" for v in volumes(service))
 
 
 def visible_rpc_files(service: dict) -> set[str] | None:

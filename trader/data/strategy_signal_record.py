@@ -6,6 +6,9 @@ The strategy service writes one row per BUY/SELL signal into ``duckdb_path``
 transaction as the insert, so a rolled-back write leaves no hole. Retention
 deletes a prefix of cursors and raises ``retention_watermark`` in the same
 transaction; ``gap`` is computed from that watermark only (Plan 1 Ruling 10).
+Each record has a random ``record_generation``, created with the record and never
+changed, so a reader can tell a replaced record from the same one even when both
+reached the same cursor (SP2 Plan 5 review, PR #84).
 """
 from __future__ import annotations
 
@@ -14,6 +17,7 @@ import hashlib
 import math
 import numbers
 import re
+import uuid
 from dataclasses import dataclass
 from typing import Any, Callable, Optional
 
@@ -22,6 +26,7 @@ MAX_RETENTION_DAYS = 365
 MAX_READ_LIMIT = 500
 SIGNAL_ACTIONS = ("BUY", "SELL")
 SOURCE_EVENT_ID = re.compile(r"^sig-[0-9a-f]{32}$")
+RECORD_GENERATION = re.compile(r"^gen-[0-9a-f]{32}$")
 
 _CREATE = (
     """CREATE TABLE IF NOT EXISTS strategy_signal_record (
@@ -32,6 +37,8 @@ _CREATE = (
         last_cursor BIGINT NOT NULL, retention_watermark BIGINT NOT NULL)""",
     """INSERT INTO strategy_signal_record_state SELECT 0, 0
         WHERE NOT EXISTS (SELECT 1 FROM strategy_signal_record_state)""",
+    # Its own table, so a record created before it existed gains one without an ALTER.
+    """CREATE TABLE IF NOT EXISTS strategy_signal_record_generation (record_generation VARCHAR NOT NULL)""",
 )
 _COLUMNS = "cursor, source_event_id, strategy_name, conid, action, probability, signal_time, recorded_at"
 
@@ -115,6 +122,7 @@ class SignalPage:
     next_cursor: int
     oldest_retained_cursor: int
     gap: bool
+    record_generation: str
 
 
 class StrategySignalRecord:
@@ -131,6 +139,8 @@ class StrategySignalRecord:
     def _create_in_tx(conn: Any) -> None:
         for statement in _CREATE:
             conn.execute(statement)
+        if conn.execute("SELECT 1 FROM strategy_signal_record_generation").fetchone() is None:
+            conn.execute("INSERT INTO strategy_signal_record_generation VALUES (?)", [f"gen-{uuid.uuid4().hex}"])
 
     def append(self, entry: SignalEntry) -> int:
         return self._db.transaction(lambda conn: self.append_in_tx(conn, entry))
@@ -182,5 +192,6 @@ class StrategySignalRecord:
                            _as_utc(row[7]))
             for row in rows)
         next_cursor = signals[-1].cursor if signals else max(after_cursor, watermark)
+        (generation,) = conn.execute("SELECT record_generation FROM strategy_signal_record_generation").fetchone()
         return SignalPage(signals, next_cursor, int(oldest) if oldest is not None else watermark + 1,
-                          after_cursor < watermark)
+                          after_cursor < watermark, generation)

@@ -5,7 +5,9 @@ from tests.compose_rpc_helpers import (
     COMPOSE_PATH, CONTAINER_RPC_DIR, RETIRED_HMAC_TARGET, ROOT, load_compose, mounts_config_dir,
     visible_rpc_files, volumes,
 )
-from trader.messaging.principals import KNOWN_PRINCIPALS, SERVICE_PRINCIPAL, rpc_files_for
+from trader.messaging.principals import (
+    KNOWN_PRINCIPALS, SERVICE_PRINCIPAL, rpc_files_for, service_principals, service_rpc_files,
+)
 
 
 @pytest.fixture(scope="module")
@@ -15,7 +17,7 @@ def compose():
 
 @pytest.mark.parametrize("name,principal", sorted(SERVICE_PRINCIPAL.items()))
 def test_each_service_sees_only_its_own_key_pair_and_needed_public_keys(compose, name, principal):
-    assert visible_rpc_files(compose["services"][name]) == rpc_files_for(principal)
+    assert visible_rpc_files(compose["services"][name]) == service_rpc_files(name)
 
 
 @pytest.mark.parametrize("name,principal", sorted(
@@ -37,8 +39,8 @@ def test_no_service_mounts_another_principals_private_key(compose):
             continue
         files = visible_rpc_files(svc)
         assert files is not None, f"{name} sees the whole keys/rpc directory"
-        own = SERVICE_PRINCIPAL.get(name)
-        assert {f for f in files if f.endswith(".key")} <= ({f"{own}.key"} if own else set()), name
+        allowed = {f"{p}.key" for p in service_principals(name)} if name in SERVICE_PRINCIPAL else set()
+        assert {f for f in files if f.endswith(".key")} <= allowed, name
 
 
 def test_every_key_bind_is_read_only_and_from_the_host_keys_dir(compose):

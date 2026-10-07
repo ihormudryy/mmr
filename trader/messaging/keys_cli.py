@@ -14,7 +14,7 @@ import sys
 from pathlib import Path
 from typing import Callable, Optional, TextIO
 
-from trader.messaging.principals import SERVICE_PRINCIPAL, rpc_files_for
+from trader.messaging.principals import SERVICE_PRINCIPAL, service_principals, service_rpc_files
 from trader.messaging.rpc_keys import (
     RESTART_ON_ROTATE,
     RpcKeyError,
@@ -99,13 +99,13 @@ def _identity_problem(principal: str | None, keys_dir: Path) -> list[str]:
 
 
 def _mount_problems(service: str, keys_dir: Path, hmac_file: Path) -> list[str]:
-    principal = SERVICE_PRINCIPAL[service]
-    expected = rpc_files_for(principal)
+    expected = service_rpc_files(service)
     seen = frozenset(os.listdir(keys_dir)) if keys_dir.is_dir() else frozenset()
     problems = [f"unexpected {name}" for name in sorted(seen - expected)]
     problems += [f"missing {name}" for name in sorted(expected - seen)]
     if not problems:
-        problems += _identity_problem(principal, keys_dir)
+        for principal in service_principals(service):
+            problems += _identity_problem(principal, keys_dir)
     if not hmac_file.exists():
         problems.append(f"{hmac_file} is not mounted (expected /dev/null)")
     elif hmac_file.read_bytes():

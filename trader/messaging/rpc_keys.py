@@ -168,18 +168,19 @@ def load_identity_material(
 # Key generation and rotation (`mmr keys init`)
 # ---------------------------------------------------------------------------
 
-# Long-lived compose services and the principal each signs as. A rotated
+# Long-lived compose services and the principals each signs as. A rotated
 # principal's key lives in its own service and in every service that has it
 # as a peer; all of them must restart together (owner answer 7).
-_LONG_LIVED_SERVICE_PRINCIPAL: Mapping[str, str] = {
-    "trader": "trader", "strategy": "strategy", "dashboard": "dashboard",
+_LONG_LIVED_SERVICE_PRINCIPALS: Mapping[str, tuple[str, ...]] = {
+    "trader": ("trader",), "strategy": ("strategy",), "dashboard": ("dashboard",),
+    "ai": ("ai_supervisor", "ai_research"),
 }
 
 
 def _services_holding(principal: str) -> tuple[str, ...]:
     return tuple(sorted(
-        service for service, own in _LONG_LIVED_SERVICE_PRINCIPAL.items()
-        if own == principal or principal in peers_for(own)
+        service for service, owns in _LONG_LIVED_SERVICE_PRINCIPALS.items()
+        if principal in owns or any(principal in peers_for(own) for own in owns)
     ))
 
 

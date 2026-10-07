@@ -39,3 +39,27 @@ budget:
   decision_deadline_seconds: 60    # one deadline spans orchestrator plus Jev
 
 database_path: ~/.local/share/mmr_ai/ai.duckdb
+
+# The controller runtime (SP2 Plan 5). Every key is optional; these are the defaults.
+# The trader host comes from the TRADER_TYPED_ADDRESS environment variable (tcp://trader in Docker).
+controller:
+  trader_query_port: 42101
+  trader_command_port: 42102
+  rpc_timeout_seconds: 10.0
+  lease_seconds: 60
+  renew_seconds: 20
+  held_retry_seconds: 5.0
+  entry_slot_minutes: 15
+  position_slot_minutes: 15
+  slot_start_grace_seconds: 120
+  signal_poll_seconds: 5.0
+  signal_page_limit: 100
+  signal_max_age_seconds: 300
+  decision_ttl_seconds: 300
+  not_found_settle_seconds: 120
+  reconcile_seconds: 10.0
+  outbox_seconds: 5.0
+  experiment_poll_seconds: 10.0
+  heartbeat_seconds: 10.0
+  budget_cap_poll_seconds: 60.0   # how often the owner's cap is read from the trader (trader.yaml)
+  heartbeat_path: /tmp/mmr_ai_heartbeat.json

@@ -7,6 +7,11 @@
 # There are no default model ids. An empty `model` stops the service at startup.
 # The owner picks them. Example ids (not defaults): "anthropic/claude-sonnet-4.5" on
 # openrouter, an inference-profile id on bedrock, a deployment name on azure.
+# Model ids per role. Fill them in before starting the ai service; a blank id stops it at start.
+# Jev runs on openrouter only. Examples (check the provider's current list, they change):
+#   jev:          {backend: openrouter, model: "anthropic/claude-sonnet-4.5"}
+#   orchestrator: {backend: openrouter, model: "openai/gpt-5"}   # or bedrock / azure (deployment name)
+# Every model needs a price under pricing:, or its calls are refused (no reservation, no call).
 roles:
   orchestrator:
     backend: openrouter        # openrouter | bedrock | azure

@@ -143,3 +143,26 @@ def test_injected_calendar_is_used():
     if expected_close.tzinfo is None:
         expected_close = expected_close.replace(tzinfo=UTC)
     assert schedule.close_utc == expected_close.astimezone(UTC)
+
+
+# --- SP1 Plan 5: session ranges for the scoreboard ------------------------------------------
+
+def test_sessions_in_range_skips_the_thanksgiving_holiday_and_the_weekend():
+    policy = XNYSCalendarPolicy()
+    assert policy.sessions_in_range(dt.date(2026, 11, 24), dt.date(2026, 11, 30)) == [
+        dt.date(2026, 11, 24), dt.date(2026, 11, 25), dt.date(2026, 11, 27), dt.date(2026, 11, 30)]
+    assert policy.sessions_in_range(dt.date(2026, 11, 28), dt.date(2026, 11, 29)) == []
+
+
+def test_sessions_between_is_strict_on_both_ends():
+    policy = XNYSCalendarPolicy()
+    assert policy.sessions_between(dt.date(2026, 11, 24), dt.date(2026, 11, 30)) == 2   # 25th, 27th
+    assert policy.sessions_between(dt.date(2026, 11, 25), dt.date(2026, 11, 27)) == 0
+
+
+def test_previous_session_is_strictly_before_also_across_a_holiday_and_a_weekend():
+    policy = XNYSCalendarPolicy()
+    assert policy.previous_session(dt.date(2026, 11, 27)) == dt.date(2026, 11, 25)   # Thanksgiving
+    assert policy.previous_session(dt.date(2026, 10, 12)) == dt.date(2026, 10, 9)    # Monday -> Friday
+    assert policy.previous_session(dt.date(2026, 10, 11)) == dt.date(2026, 10, 9)    # a Sunday
+    assert policy.is_session(dt.date(2026, 11, 26)) is False and policy.is_session(dt.date(2026, 11, 27)) is True

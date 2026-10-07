@@ -2,7 +2,7 @@ import datetime as dt
 
 import pytest
 
-from tests.scoreboard.conftest import EXP_ID, equity_row
+from tests.scoreboard.common import EXP_ID, equity_row
 from trader.scoreboard.ports import session_date_et
 from trader.scoreboard.schema import apply_scoreboard_migrations
 from trader.scoreboard.seal import row_digest

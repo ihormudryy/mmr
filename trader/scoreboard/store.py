@@ -9,7 +9,7 @@ import datetime as dt
 import decimal
 import logging
 import math
-from typing import Any, Callable, Mapping, Optional, Sequence
+from typing import Any, Callable, Mapping, Sequence
 
 from trader.scoreboard.seal import GENESIS, chain_digest, row_digest
 

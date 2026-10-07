@@ -1052,3 +1052,58 @@ def test_flatten_account_now_busy_returns_its_own_cause(tmp_path):
             raise LiquidationBusy("locked")
     controller, *_rest = _build_controller(tmp_path, liquidation=Busy())
     assert controller.flatten_account_now("experiment-kill-exp-1-1-0", _utc(11, 5)) == "experiment-kill-exp-1-1-0"
+
+
+# ---------------------------------------------------------------------------
+# SP1 Plan 5: the terminal listener (equity_daily at every session end)
+# ---------------------------------------------------------------------------
+
+def _drive_to_flat(tmp_path, **overrides):
+    broker = FakeBroker([_snapshot(1, positions=[_position()]), _snapshot(2, positions=())])
+    controller, _b, _c, liq, _br, _t, _j, _db, clock = _build_controller(tmp_path, broker=broker, **overrides)
+    clock[0] = _utc(15, 45)
+    controller.recover(clock[0])
+    controller.run_due(clock[0])
+    liq.mark_flat(generation_id=2)
+    broker.push(_snapshot(2, positions=(), working=()))
+    clock[0] = _utc(15, 50)
+    state = controller.run_due(clock[0])
+    clock[0] = _utc(15, 51)
+    controller.run_due(clock[0])                      # a later tick persists FLAT again
+    return controller, state
+
+
+def test_flat_calls_the_terminal_listener_once_with_the_state(tmp_path):
+    seen = []
+    _controller, state = _drive_to_flat(tmp_path, on_terminal=seen.append)
+    assert state.state == "FLAT" and [s.state for s in seen] == ["FLAT"]
+
+
+def test_missed_flat_calls_the_listener_with_incident(tmp_path):
+    seen = []
+    broker = FakeBroker([_snapshot(1, positions=[_position()])])
+    controller, _b, _c, _l, _br, _t, _j, _db, clock = _build_controller(
+        tmp_path, broker=broker, on_terminal=seen.append)
+    clock[0] = _utc(15, 45)
+    controller.recover(clock[0])
+    controller.run_due(clock[0])
+    clock[0] = _utc(15, 55)
+    controller.run_due(clock[0])
+    clock[0] = _utc(15, 56)
+    controller.run_due(clock[0])
+    assert [s.state for s in seen] == ["INCIDENT"]
+
+
+def test_a_raising_listener_never_stops_the_controller(tmp_path, caplog):
+    def boom(_state):
+        raise RuntimeError("ledger down")
+    controller, state = _drive_to_flat(tmp_path, on_terminal=boom)
+    assert state.state == "FLAT" and "ledger down" in caplog.text
+
+
+def test_listener_is_not_called_for_non_terminal_states(tmp_path):
+    seen = []
+    controller, _b, _c, _l, _br, _t, _j, _db, clock = _build_controller(tmp_path, on_terminal=seen.append)
+    controller.recover(clock[0])
+    controller.run_due(clock[0])
+    assert seen == []

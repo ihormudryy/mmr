@@ -2,7 +2,7 @@ import datetime as dt
 
 import pytest
 
-from tests.scoreboard.conftest import ACCOUNT
+from tests.scoreboard.common import ACCOUNT
 from tests.scoreboard.fills import T0, T1, T2, UTC, broker_store, fill, put_fill
 from trader.scoreboard.ports import AttributionLinks
 from trader.scoreboard.round_trips import Projection, ProjectionError, load_fill_facts, project_round_trips

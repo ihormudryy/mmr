@@ -352,8 +352,11 @@ class SessionController:
         account_id: str,
         now: Callable[[], dt.datetime],
         on_entry_cutoff: Optional[Callable[[SessionControllerState, dt.datetime], None]] = None,
+        on_terminal: Optional[Callable[[SessionControllerState], None]] = None,
     ):
         self._journal = journal
+        # SP1 Plan 5: the scoreboard writes equity_daily when a session reaches FLAT or INCIDENT.
+        self._on_terminal = on_terminal
         # ai_paper (R26): runs on every tick from the entry cutoff until the flatten starts.
         self._on_entry_cutoff = on_entry_cutoff
         self._calendar = calendar
@@ -826,9 +829,22 @@ class SessionController:
         self._persist(state, now_utc)
         return state
 
+    def _notify_terminal(self, state: SessionControllerState) -> None:
+        """Once per transition into FLAT or INCIDENT; a failing listener never stops the controller."""
+        if self._on_terminal is None:
+            return
+        try:
+            self._on_terminal(state)
+        except Exception:
+            logging.getLogger(__name__).exception("session %s: terminal listener failed for %s", state.session_date, state.state)
+
     def _persist(self, state: SessionControllerState, now_utc: dt.datetime) -> None:
+        previous = self._state
         self._state = state
         self._store.save(state, now_utc)
+        if state.state in _TERMINAL and (previous is None or previous.state != state.state
+                                         or previous.session_date != state.session_date):
+            self._notify_terminal(state)
         if self._journal is None:
             return
         try:

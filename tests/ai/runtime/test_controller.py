@@ -13,7 +13,7 @@ from tests.ai.runtime.scripted_engine import ScriptedEngine
 from tests.ai.world import World, request
 from trader.ai.budget_cap import BudgetCapSync, CapGatedGateway
 from trader.ai.config import ControllerConfig
-from trader.ai.controller import EXIT_WAIT_OVERRUN, AiController, ExperimentWatch
+from trader.ai.controller import EXIT_WAIT_ALERT_EVERY, EXIT_WAIT_OVERRUN, AiController, ExperimentWatch
 from trader.ai.engine import EngineResult, ProposedDecision, SimulatedBaseline
 from trader.ai.gateway import CallRefused
 from trader.ai.ids import derive_decision_id
@@ -445,7 +445,7 @@ async def test_an_exit_that_waits_for_its_entry_is_kept_past_the_signal_age(rig)
 
 
 @pytest.mark.asyncio
-async def test_a_stuck_exit_wait_is_a_loud_incident_not_a_not_held(rig, caplog):      # PR #86 4211895474
+async def test_a_stuck_exit_wait_is_a_loud_incident_and_stays_pending(rig, caplog):  # PR #86 4212341131
     sell = rig.trader.signals.add(action="SELL")
     rig.engine.results["exit_signal"] = EngineResult(note="EXIT_WAITING_FOR_ENTRY",
                                                      wait_until=rig.clock.now() + dt.timedelta(minutes=5))
@@ -453,9 +453,19 @@ async def test_a_stuck_exit_wait_is_a_loud_incident_not_a_not_held(rig, caplog):
     rig.clock.advance(5 * 60 + EXIT_WAIT_OVERRUN.total_seconds() + 1)
     caplog.set_level(logging.ERROR, logger="trader.ai.controller")
     await rig.signals_then_drain()
-    assert rig.opportunity(sell) == ("MISSED", "EXIT_WAIT_STUCK") and rig.sent() == []
-    assert "EXIT_WAIT_STUCK" in caplog.text and sell["source_event_id"] in caplog.text
+    await rig.signals_then_drain()
+    # PR #86 4212341131: the backstop only escalates; the exit stays pending and is judged again.
+    assert rig.opportunity(sell) == ("IN_PROGRESS", "EXIT_WAITING_FOR_ENTRY") and rig.sent() == []
+    assert caplog.text.count("EXIT_WAIT_STUCK") == 1 and sell["source_event_id"] in caplog.text
     assert (await rig.controller.heartbeat())["exit_waits_stuck"] == 1
+    rig.clock.advance(EXIT_WAIT_ALERT_EVERY.total_seconds())
+    await rig.signals_then_drain()
+    assert caplog.text.count("EXIT_WAIT_STUCK") == 2                 # at most once per hour
+    assert rig.store.db.execute("SELECT alerts FROM ai_exit_waits", fetch="one") == (2,)
+    rig.engine.results["exit_signal"] = EngineResult(decisions=(close(),))      # the entry filled after all
+    await rig.signals_then_drain()
+    assert rig.opportunity(sell)[0] == "DECIDED" and [b["action"] for b in rig.sent()] == ["CLOSE"]
+    assert (await rig.controller.heartbeat())["exit_waits_stuck"] == 0
 
 
 @pytest.mark.asyncio

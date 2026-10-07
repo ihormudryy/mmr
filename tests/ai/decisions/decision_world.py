@@ -125,7 +125,7 @@ class DecisionNode:
     """One ai process: the real controller and engine on a Plan 5 AiNode, driven step by step."""
 
     def __init__(self, world, tmp_path, block: str, *, clock=None, node=None):
-        self.world = world
+        self.world, self.tmp_path, self.block = world, tmp_path, block
         self.node = node or world.node(clock=clock)
         config_dir = tmp_path / "ai-config"
         config_dir.mkdir(exist_ok=True)
@@ -150,6 +150,12 @@ class DecisionNode:
         await self.node.leadership.acquire()
         await self.gateway.start()
         await self.controller.start()                      # reads the owner cap from the served trader
+
+    async def restart(self) -> "DecisionNode":
+        """A new ai process on the same ai.duckdb (the old one is gone; its lease has run out)."""
+        again = DecisionNode(self.world, self.tmp_path, self.block)
+        await again.start()
+        return again
 
     async def _hold_the_lease(self) -> None:
         """A test jumps trader time; the running service renews every 20 s, so renew (or re-take) it here."""

@@ -31,6 +31,7 @@ logger = logging.getLogger(__name__)
 WAIT = "WAIT"
 EXIT_WAIT_OVERRUN = dt.timedelta(minutes=10)      # backstop past an exit's own wait_until (PR #86 4211394337)
 EXIT_WAIT_STUCK = "EXIT_WAIT_STUCK"
+EXIT_WAIT_ALERT_EVERY = dt.timedelta(hours=1)
 SLOT_POLL_SECONDS = 1.0
 CYCLE_SOURCE = {ENTRY: "entry_cycle", POSITION: "position_cycle"}
 TRADER_AWAY = (RpcNotSent, RpcOutcomeUnknown, RpcRefused)
@@ -208,14 +209,13 @@ class AiController:
         for opportunity, _state in await self._intake.open_opportunities():
             if opportunity.opportunity_id in self._opportunity_tasks:
                 continue
-            verdict = self._signal_verdict(opportunity, now, waits.get(opportunity.opportunity_id))
+            wait = waits.get(opportunity.opportunity_id)
+            if wait is not None:
+                await self._escalate_if_stuck(opportunity.opportunity_id, *wait, now)
+            verdict = self._signal_verdict(opportunity, now, None if wait is None else wait[0])
             if verdict == WAIT:
                 continue
             if verdict is not None:
-                if verdict == EXIT_WAIT_STUCK:              # an incident, never a NOT_HELD (PR #86 4211895474)
-                    logger.error("%s: exit signal %s still waits for its entry past %s; the strategy exit is "
-                                 "not applied, check the broker and the trader", EXIT_WAIT_STUCK,
-                                 opportunity.opportunity_id, waits[opportunity.opportunity_id].isoformat())
                 await self._intake.mark(opportunity.opportunity_id, "MISSED", verdict)
                 continue
             await self._intake.mark(opportunity.opportunity_id, "IN_PROGRESS", None)
@@ -223,12 +223,22 @@ class AiController:
             self._opportunity_tasks[opportunity.opportunity_id] = task
             task.add_done_callback(lambda _t, key=opportunity.opportunity_id: self._opportunity_tasks.pop(key, None))
 
+    async def _escalate_if_stuck(self, opportunity_id: str, wait_until: dt.datetime,
+                                 last_alert: Optional[dt.datetime], now: dt.datetime) -> None:
+        """Past its backstop a waiting exit is an incident: one ERROR per hour, counted in the heartbeat. It
+        stays pending until the broker proves its entry ended or filled (PR #86 4212341131)."""
+        if now <= wait_until + EXIT_WAIT_OVERRUN:
+            return
+        if last_alert is not None and now - last_alert < EXIT_WAIT_ALERT_EVERY:
+            return
+        logger.error("%s: exit signal %s still waits for its entry (backstop %s passed); it stays pending until "
+                     "the broker proves the entry ended or filled. Check the broker and the trader.",
+                     EXIT_WAIT_STUCK, opportunity_id, wait_until.isoformat())
+        await self._intake.record_wait_alert(opportunity_id)
+
     def _signal_verdict(self, opportunity: SignalOpportunity, now: dt.datetime,
                         waiting_until: Optional[dt.datetime] = None) -> Optional[str]:
-        if waiting_until is not None:                      # the engine bounds an exit's wait; this is the backstop
-            if now > waiting_until + EXIT_WAIT_OVERRUN:
-                return EXIT_WAIT_STUCK
-        elif not self._intake.is_fresh(opportunity, now):
+        if waiting_until is None and not self._intake.is_fresh(opportunity, now):
             return "STALE"
         if self._leadership.current_epoch() is None or not self._watch.known:
             return WAIT
@@ -391,8 +401,8 @@ class AiController:
                   "outbox": await self._outbox.counts(),
                   "running_cycles": sorted(kind for kind, task in self._cycle_tasks.items() if not task.done()),
                   "budget_cap_ready": None if self._cap_sync is None else self._cap_sync.ready(),
-                  "exit_waits_stuck": (await self._store.aquery(
-                      "SELECT COUNT(*) FROM ai_opportunities WHERE reason = ?", [EXIT_WAIT_STUCK], fetch="one"))[0]}
+                  "exit_waits_stuck": sum(1 for until, _alert in (await self._intake.waits()).values()
+                                          if self._clock.now() > until + EXIT_WAIT_OVERRUN)}
         if self._config.heartbeat_path:
             await asyncio.to_thread(_write_atomically, self._config.heartbeat_path, json.dumps(status))
         return status

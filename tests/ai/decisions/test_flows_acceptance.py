@@ -391,6 +391,44 @@ async def test_an_older_working_entry_holds_the_sell_behind_a_newer_refused_one(
 
 
 @pytest.mark.asyncio
+async def test_the_backstop_never_drops_a_waiting_exit(stack, caplog):                   # PR #86 4212341131
+    import logging
+    world, node, _ = stack
+    sim = world.served.sim
+    node.jev.script(JEV_MARKER, ruling())
+    entry = f"og-aip-{await accepted_unfilled_buy(world, node)}:entry"
+    sell = world.strategy_signal(action="SELL")
+    await node.signals()
+    assert node.opportunity(sell) == ("IN_PROGRESS", "EXIT_WAITING_FOR_ENTRY")
+    sim.pending_cancel(entry, lands=False)                          # the cutoff cancel is issued, never lands
+    world.advance((et(15, 30) - world.served.now()).total_seconds())
+    world.served.run_session(et(15, 30))
+    world.advance(1)
+    world.advance(1)
+    assert sim.orders[entry].status == "PendingCancel"
+    world.advance((et(16, 12) - world.served.now()).total_seconds())   # past the close + 10 min backstop
+    node = await node.restart()                                     # and a new ai process in the middle
+    caplog.set_level(logging.ERROR, logger="trader.ai.controller")
+    await node.signals()
+    await node.signals()
+    assert node.opportunity(sell) == ("IN_PROGRESS", "EXIT_WAITING_FOR_ENTRY") and close_rows(node) == []
+    assert caplog.text.count("EXIT_WAIT_STUCK") == 1                 # one incident, not one per tick
+    assert (await node.controller.heartbeat())["exit_waits_stuck"] == 1
+    sim._fill(entry, 3.0)                                           # the entry fills 3 shares after all
+    world.advance(1)
+    assert sim.held.get(world.conid) == 3.0
+    await node.signals()
+    close_id = derive_decision_id(sell, f"close:{world.conid}")
+    assert node.opportunity(sell) == ("DECIDED", "EXIT_SIGNAL") and [r[0] for r in close_rows(node)] == [close_id]
+    assert (await node.node.submitter.get(close_id)).state in ("ACCEPTED", "FINAL")   # SP1's safe close owns it
+    sim.pending_cancel(entry, lands=True)                           # the broker finally lands the entry cancel
+    await settle_close(world, node, close_id)
+    await node.signals()
+    assert not sim.held.get(world.conid) and len(close_rows(node)) == 1
+    assert (await node.controller.heartbeat())["exit_waits_stuck"] == 0
+
+
+@pytest.mark.asyncio
 async def test_a_late_fill_after_the_cutoff_is_still_closed_once(stack):                 # PR #86 4211898491 (b)
     world, node, _ = stack
     node.jev.script(JEV_MARKER, ruling())

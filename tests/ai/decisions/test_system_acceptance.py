@@ -3,6 +3,7 @@
 The real engine, controller and adapters (scripted providers) against SP1's served trader over signed RPC.
 """
 import json
+from types import SimpleNamespace
 import os
 
 import pytest
@@ -12,7 +13,7 @@ from tests.ai.decisions.test_flows_acceptance import (  # noqa: F401 (fixtures)
     build, closes, enter_and_settle, loop_thread, picks, ruling, settle_close, stack,
 )
 from tests.automation.ai_paper_fixtures import daily_frame
-from tests.sp1_fixtures import MSFT
+from tests.sp1_fixtures import MSFT, Universe
 from trader.ai.decision_replay import recorded_judgment, replay_decision
 from trader.ai.ids import derive_decision_id
 from trader.ai.replay import COMPLETE, ExternalAdapterCounter
@@ -121,6 +122,13 @@ def _low_volume(trader):
     trader.data.get_tickdata(BarSize.Days1).write(MSFT, daily_frame(volume=10_000.0))
 
 
+def _listed_on_pink(resolve_symbol):
+    def resolve(self, conid, **kwargs):
+        rows = resolve_symbol(self, conid, **kwargs)
+        return [SimpleNamespace(**{**vars(row), "primaryExchange": "PINK"}) for row in rows] if conid == MSFT else rows
+    return resolve
+
+
 @pytest.mark.asyncio
 @pytest.mark.parametrize("part", ["exchange", "instrument_type", "dollar_volume", "trading_filter"])
 async def test_out_of_scope_candidates_are_dropped_before_any_model(tmp_path, loop_thread, monkeypatch, part):
@@ -128,6 +136,8 @@ async def test_out_of_scope_candidates_are_dropped_before_any_model(tmp_path, lo
     market.movers = [market.movers[0]]                                       # MSFT only
     if part == "exchange":
         market.details_by_conid[MSFT] = details(conid=MSFT, symbol="MSFT", primary="PINK")
+        # The stored row agrees with IB, so the exchange rule (not INSTRUMENT_CONFLICT) refuses it.
+        monkeypatch.setattr(Universe, "resolve_symbol", _listed_on_pink(Universe.resolve_symbol))
     elif part == "instrument_type":
         market.details_by_conid[MSFT] = details(conid=MSFT, symbol="MSFT", stock_type="")
     elif part == "dollar_volume":

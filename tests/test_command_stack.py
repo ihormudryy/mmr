@@ -527,11 +527,13 @@ def test_ai_paper_on_a_live_account_refuses_to_build(tmp_path):
     assert exc.value.code == "AI_PAPER_LIVE_REFUSED"
 
 
-def test_ai_paper_stack_uses_no_experiment_until_plan_four(tmp_path):
-    from trader.automation.ai_paper_experiment import NoExperiment
+def test_ai_paper_stack_reads_real_experiments(tmp_path):          # SP1 Plan 4 Task 6
+    from trader.automation.ai_paper_experiment import ExperimentStateReader
 
     stack, trader = _ai_stack(tmp_path)
-    assert isinstance(stack.ai_paper.decisions._experiments, NoExperiment)
+    assert isinstance(stack.ai_paper.decisions._experiments, ExperimentStateReader)
+    assert stack.experiments.reader is stack.ai_paper.decisions._experiments
+    assert trader.experiment_store is stack.experiments.store
     assert trader.ai_paper_attribution is stack.ai_paper.decision_store
     assert stack.ai_paper.policy.ceiling == stack.ai_paper.config.limits_ceiling
 

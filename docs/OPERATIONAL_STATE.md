@@ -80,6 +80,13 @@ Armed paper automation cannot exit safely yet, and the evidence step has a gap i
     cancel it. A full close could later re-open a long or leave the paper account
     short. The fix needs a plain close order that cancels the entry's protective
     stop, and a quantity for an unsized SELL from the fenced position.
+- **Live blocker: the experiment kill line reads IB account updates (about 3
+  minutes).** `trader/automation/kill_monitor.py` evaluates every fenced broker
+  capture every 5 s, but `NetLiquidation` arrives with IB's account-update
+  cadence, so a kill can be detected about 3 minutes late. Accepted for paper
+  only (SP1 Plan 4 K1). A faster, verified detector is required before any live
+  use. Check the active line and its pending edit with `mmr experiment status`;
+  a `trader.yaml` edit applies only after a trader_service restart.
 - **`research evaluate` does not run in split Docker yet.** The bars and the
   research DB live in the `mmr_db_data` volume, but the read-only trader
   container does not mount `~/.local/share/mmr/reports`, where the command writes

@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import asyncio
 import datetime as dt
+import logging
 import os
 import time
 from dataclasses import dataclass
@@ -61,6 +62,8 @@ from trader.trading.trading_control import (
     apply_trading_control_migration,
 )
 
+
+logger = logging.getLogger(__name__)
 
 class CommandStackConfigurationError(RuntimeError):
     """A required production adapter is absent while authority is enabled."""
@@ -484,6 +487,8 @@ class CommandStack:
     paper_hot_arm: Any = None  # ProductionPaperHotArmPorts when paper mode
     strategy_control_service: Any = None  # StrategyControlCommandService when wired
     ai_paper: Any = None  # AiPaperServices when ai_paper.enabled (SP1 Plan 3)
+    experiments: Any = None  # ExperimentServices on paper (SP1 Plan 4, K15)
+    mode_conflict: Optional[str] = None  # "BOTH_MODES_ARMED" (SP1 Plan 4 K17)
 
 
 @dataclass(frozen=True)
@@ -564,7 +569,7 @@ def _build_ai_paper_services(
     trader: Any, parts: Optional[_AiPaperParts], *, ledger: CommandLedger, journal: Any,
     controls: TradingControlStore, broker: Any, quotes: Any, margin: Any, policy: CommandAuthorityPolicy,
     saga: Any, liquidation: Any, exit_owners: Any, account_mode: str, now: Callable[[], dt.datetime],
-    schedule_reconcile: Callable[[str], None],
+    schedule_reconcile: Callable[[str], None], experiments: Any = None,
 ) -> Optional[AiPaperServices]:
     if parts is None:
         return None
@@ -584,7 +589,8 @@ def _build_ai_paper_services(
     )
     decisions = AiPaperDecisionService(
         ledger=ledger, journal=journal, controls=controls, policy=parts.policy, deployments=deployments,
-        evidence=evidence, saga=saga, experiments=NoExperiment(), exit_owners=exit_owners,
+        evidence=evidence, saga=saga, experiments=experiments if experiments is not None else NoExperiment(),
+        exit_owners=exit_owners,
         liquidation=liquidation, broker=broker, config=parts.config, account_id=trader.ib_account,
         now=now, schedule_reconcile=schedule_reconcile, decisions=decision_store,
     )
@@ -672,6 +678,7 @@ def _build_automated_intent_service(
     margin: Any,
     policy: CommandAuthorityPolicy,
     liquidation: Any = None,
+    entry_block: Optional[Callable[[], Optional[str]]] = None,
 ) -> Optional[Any]:
     """Build ``AutomatedIntentCommandService`` for paper automation only.
 
@@ -741,6 +748,7 @@ def _build_automated_intent_service(
         allocation_factory=evidence.allocation_factory,
         liquidation=liquidation,
         broker=broker,
+        entry_block=entry_block,
     )
 
 
@@ -754,6 +762,149 @@ def _load_position_sizer() -> Any:
     from trader.trading.position_sizing import PositionSizingConfig, PositionSizer
 
     return PositionSizer(PositionSizingConfig.load())
+
+
+@dataclass(frozen=True)
+class _ExperimentParts:
+    """What exists before the stack: the store and the arming lock both directions share."""
+    store: Any
+    arming_lock: Any
+    experiment_lock: Any
+
+
+def _build_experiment_parts(trader: Any, account_mode: str,
+                            now: Callable[[], dt.datetime]) -> Optional[_ExperimentParts]:
+    """K15: experiments exist on every paper stack, ai_paper enabled or not; never on live."""
+    if account_mode != "paper":
+        return None
+    from trader.automation.experiment_service import ArmingLock, ExperimentLock
+    from trader.automation.experiments import ExperimentStore
+
+    store = ExperimentStore(trader.journal_db, trader.ib_account, now)
+    lock = ArmingLock()
+    return _ExperimentParts(store=store, arming_lock=lock, experiment_lock=ExperimentLock(store, lock))
+
+
+@dataclass(frozen=True)
+class ExperimentServices:
+    store: Any       # ExperimentStore
+    service: Any     # ExperimentService: start / pause / resume / stop
+    monitor: Any     # KillLineMonitor
+    reader: Any      # ExperimentStateReader (Plan 3's ExperimentStatePort)
+    lock: Any        # ArmingLock shared with the one-strategy activation
+    config_path: Any = None  # trader.yaml, re-read only to show a pending kill-line edit (K9)
+
+
+def _build_experiment_services(
+    trader: Any, parts: Optional[_ExperimentParts], *, journal: Any, broker: Any, liquidation: Any,
+    liquidation_store: Any, exit_owners: Any, session_controller: Any, breaker_store: Any,
+    resume_ready: Callable[[], bool], reconciliation_safe: Callable[[], bool],
+    reconciliation_complete: Callable[[str], bool], late: dict,
+    mode_conflict: Callable[[], Optional[str]], account_mode: str, now: Callable[[], dt.datetime],
+) -> Optional[ExperimentServices]:
+    """K15: built on every paper stack, also with ``ai_paper.enabled: false``."""
+    if parts is None:
+        return None
+    from trader.automation.ai_paper_config import AiPaperConfig
+    from trader.automation.ai_paper_experiment import ExperimentStateReader
+    from trader.automation.experiment_service import ArmingPorts, ExperimentService
+    from trader.automation.kill_monitor import KillLineMonitor
+    from trader.messaging.trader_service_api import TraderServiceApi
+
+    config = getattr(trader, "ai_paper_config", None) or AiPaperConfig()
+    monitor = KillLineMonitor(
+        store=parts.store, broker=broker, session=session_controller, liquidation=liquidation, config=config,
+        account_id=trader.ib_account, now=now, journal=journal, reconciliation_safe=reconciliation_safe)
+    ports = ArmingPorts(
+        broker=broker,
+        account_cash=TraderServiceApi(trader).get_account_cash_by_currency,
+        resume_ready=resume_ready,
+        reconciliation_safe=lambda exclude: (reconciliation_safe() if exclude is None
+                                             else reconciliation_complete(exclude)),
+        breaker_clear=lambda: breaker_store.get().state == "CLEAR",
+        exit_owners=exit_owners,
+        liquidation_roots=lambda: liquidation_store.transaction(liquidation_store.roots_to_advance_in_tx),
+        old_path_armed=lambda: _one_strategy_armed(late["paper_automation"]),
+        ai_paper_built=lambda: late["ai_paper"] is not None,
+        kill_gate=monitor,
+    )
+    service = ExperimentService(store=parts.store, ports=ports, lock=parts.arming_lock, config=config,
+                                account_id=trader.ib_account, account_mode=account_mode, now=now)
+    reader = ExperimentStateReader(parts.store, monitor, mode_conflict=mode_conflict)
+    return ExperimentServices(store=parts.store, service=service, monitor=monitor, reader=reader,
+                              lock=parts.arming_lock, config_path=_trader_yaml_path())
+
+
+def _trader_yaml_path() -> Path:
+    return Path(os.environ.get("TRADER_CONFIG", "~/.config/mmr/trader.yaml")).expanduser()
+
+
+def _experiment_gate(reader: Any, account_id: str) -> Callable[[Any], Optional[str]]:
+    """K20: only ai_paper entries reach the gate; the one-strategy path is untouched."""
+    from trader.automation.ai_paper_decision import AI_PAPER_ACTION
+    from trader.automation.ai_paper_experiment import experiment_entry_refusal
+
+    def gate(request: Any) -> Optional[str]:
+        if getattr(request, "action", None) != AI_PAPER_ACTION:
+            return None
+        return experiment_entry_refusal(reader, account_id)
+    return gate
+
+
+def _log_active_kill_line(experiments: ExperimentServices) -> None:
+    """K9: the kill line the running process enforces; an edit to trader.yaml waits for a restart."""
+    from trader.automation.kill_line import effective_kill_line
+    try:
+        record = experiments.store.active()
+    except Exception:
+        logger.exception("experiment state unreadable at startup")
+        return
+    if record is None:
+        return
+    line = effective_kill_line(record, experiments.service.config)
+    if line is None:
+        logger.warning("experiment %s: no kill line is active", record.experiment_id)
+    else:
+        logger.warning("experiment kill line active: %s%% (%s)", line.pct, line.basis)
+    configured_basis = getattr(experiments.service.config, "experiment_kill_basis", record.kill_basis)
+    if configured_basis != record.kill_basis:
+        logger.warning("experiment %s keeps its frozen kill basis %s; the configured basis %s applies to "
+                       "the next experiment", record.experiment_id, record.kill_basis, configured_basis)
+
+
+def _one_strategy_armed(paper_automation_service: Any) -> Optional[str]:
+    """Armed means any lifecycle but ``disabled`` (configured alone is not armed, K17)."""
+    lifecycle = paper_automation_service.status().lifecycle
+    return None if lifecycle == "disabled" else "ONE_STRATEGY_ARMED"
+
+
+def _detect_mode_conflict(parts: Optional[_ExperimentParts], paper_automation_service: Any, *, journal: Any,
+                          account_id: str, now: Callable[[], dt.datetime]) -> Optional[str]:
+    """K17: both modes armed. The trader still starts; every entry on both paths is refused."""
+    if parts is None:
+        return None
+    record = parts.store.active()
+    if record is None:
+        return None
+    try:
+        armed = _one_strategy_armed(paper_automation_service)
+    except Exception:
+        logger.exception("one-strategy automation state unreadable; treated as armed (fail closed)")
+        armed = "ONE_STRATEGY_STATE_UNREADABLE"
+    if armed is None:
+        return None
+    detail = (f"BOTH_MODES_ARMED: the one-strategy automation is armed and experiment "
+              f"{record.experiment_id} is {record.state}. Every entry is refused; exits keep working. "
+              "Deactivate the one-strategy automation, or stop the experiment once it is flat.")
+    logger.error(detail)
+    try:
+        from trader.automation.kill_monitor import record_incident
+        at = now()
+        record_incident(journal, kind="automation.mode_conflict", account_id=account_id, detail=detail,
+                        event_id=f"automation.mode_conflict:{account_id}:{at.isoformat()}", now=at)
+    except Exception:
+        logger.exception("automation.mode_conflict incident not written")
+    return "BOTH_MODES_ARMED"
 
 
 def build_command_stack(
@@ -824,6 +975,9 @@ def build_command_stack(
     apply_ai_risk_policy_migration(migrator)          # 54
     apply_ai_deployment_migration(migrator)           # 55
     apply_ai_paper_decision_migration(migrator)       # 56
+    from trader.automation.experiments import apply_experiment_migration
+
+    apply_experiment_migration(migrator)              # 70 (SP1 Plan 4)
 
     repository = ProposalRepository(journal)
     ledger = CommandLedger(journal)
@@ -832,6 +986,11 @@ def build_command_stack(
     trader.journal_db.transaction(
         lambda conn: controls.seed_in_tx(conn, [(trader.ib_account, account_mode)], now())
     )
+    experiment_parts = _build_experiment_parts(trader, account_mode, now)
+    mode_conflict_slot: dict[str, Optional[str]] = {"code": None}
+    # Late-bound: the gate needs the kill monitor, which needs the session controller built below.
+    experiment_gate_slot: dict[str, Callable[[Any], Optional[str]]] = {"gate": lambda request: None}
+    late: dict[str, Any] = {"paper_automation": None, "ai_paper": None}
     ai_paper_config = _ai_paper_config(trader, account_mode)
     ai_paper_parts = (None if ai_paper_config is None
                       else _build_ai_paper_parts(trader, ai_paper_config, now))
@@ -895,6 +1054,7 @@ def build_command_stack(
             allocation_authority_store.authority_for_dispatch(account_id, artifact_digest)
         ),
         **_ai_paper_guard_options(ai_paper_parts),
+        experiment_gate=lambda request: experiment_gate_slot["gate"](request),
     )
 
     def compute_risk_projection():
@@ -1115,6 +1275,13 @@ def build_command_stack(
         now=now,
         on_entry_cutoff=None if ai_entry_cutoff is None else ai_entry_cutoff.on_entry_cutoff,
     )
+    experiments = _build_experiment_services(
+        trader, experiment_parts, journal=journal, broker=broker_snapshot, liquidation=liquidation_service,
+        liquidation_store=liquidation_store, exit_owners=exit_owner_registry, session_controller=session_controller,
+        breaker_store=breaker_store, resume_ready=resume_ready, reconciliation_safe=reconciliation_safe,
+        reconciliation_complete=reconciliation_complete, late=late, mode_conflict=lambda: mode_conflict_slot["code"], account_mode=account_mode, now=now)
+    if experiments is not None:
+        experiment_gate_slot["gate"] = _experiment_gate(experiments.reader, trader.ib_account)
     # P3 Task 7 — authoritative attribution ledger; broker_ingest appends evidence.
     from trader.automation.attribution import AttributionLedger
     from trader.data.attribution_store import apply_attribution_migrations
@@ -1193,6 +1360,7 @@ def build_command_stack(
             command_id, now(),
         ),
         liquidation=liquidation_service,
+        entry_block=lambda: mode_conflict_slot["code"],
     )
     ai_paper = _build_ai_paper_services(
         trader, ai_paper_parts, ledger=ledger, journal=journal, controls=controls,
@@ -1200,13 +1368,13 @@ def build_command_stack(
         saga=protective_order_saga, liquidation=liquidation_service, exit_owners=exit_owner_registry,
         account_mode=account_mode, now=now,
         schedule_reconcile=lambda command_id: reconciler.schedule(command_id, now()),
+        experiments=None if experiments is None else experiments.reader,
     )
+    late["ai_paper"] = ai_paper
     from trader.automation.paper_activation import PaperAutomationActivationService
     from trader.automation.paper_hot_arm import ProductionPaperHotArmPorts
 
-    trader_yaml_path = Path(
-        os.environ.get("TRADER_CONFIG", "~/.config/mmr/trader.yaml")
-    ).expanduser()
+    trader_yaml_path = _trader_yaml_path()
     strategy_yaml_path = Path(
         getattr(trader, "strategy_config_file", None)
         or "~/.config/mmr/strategy_runtime.yaml"
@@ -1221,8 +1389,10 @@ def build_command_stack(
         command_authority_enabled=policy.enabled,
         now=now,
         hot_arm=None,
+        experiment_lock=None if experiment_parts is None else experiment_parts.experiment_lock,
     )
 
+    late["paper_automation"] = paper_automation_service
     stack = CommandStack(
         journal=journal,
         repository=repository,
@@ -1256,6 +1426,7 @@ def build_command_stack(
         paper_automation_service=paper_automation_service,
         strategy_control_service=strategy_control_service,
         ai_paper=ai_paper,
+        experiments=experiments,
     )
 
     def _build_intent_for_hot_arm(trader_obj: Any):
@@ -1275,6 +1446,7 @@ def build_command_stack(
                 command_id, now(),
             ),
             liquidation=liquidation_service,
+            entry_block=lambda: mode_conflict_slot["code"],
         )
 
     if account_mode == "paper":
@@ -1285,6 +1457,7 @@ def build_command_stack(
             account_mode=account_mode,
             now=now,
             build_intent_service=_build_intent_for_hot_arm,
+            experiment_lock=None if experiment_parts is None else experiment_parts.experiment_lock,
         )
         paper_automation_service._hot_arm = hot_arm
         object.__setattr__(stack, "paper_hot_arm", hot_arm)
@@ -1305,6 +1478,11 @@ def build_command_stack(
             ),
         )
 
+    mode_conflict = _detect_mode_conflict(
+        experiment_parts, paper_automation_service, journal=journal, account_id=trader.ib_account, now=now)
+    mode_conflict_slot["code"] = mode_conflict
+    object.__setattr__(stack, "mode_conflict", mode_conflict)
+
     trader.command_ledger = ledger
     trader.command_reconciler = reconciler
     trader.command_stack = stack
@@ -1320,4 +1498,8 @@ def build_command_stack(
     trader.attribution_ledger = attribution_ledger
     if ai_paper is not None:
         trader.ai_paper_attribution = ai_paper.decision_store  # Plan 5 reads links_for_order_ref here
+    if experiments is not None:
+        trader.experiment_store = experiments.store            # Plan 5's A1 reader
+        trader.kill_line_monitor = experiments.monitor
+        _log_active_kill_line(experiments)
     return stack

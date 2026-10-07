@@ -6,7 +6,7 @@ import logging
 import os
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Callable
+from typing import Any, Callable
 
 import yaml
 
@@ -112,6 +112,20 @@ def _redacted_strategy_params_diff(before: dict, after: dict) -> dict:
     }
 
 
+def refuse_while_experiment(experiment_lock: Any) -> None:
+    """Spec 5.5: one-strategy arming is refused while an experiment is ARMED, PAUSED or KILLED."""
+    if experiment_lock is None:
+        return
+    try:
+        state = experiment_lock.blocking_state()
+    except Exception as exc:
+        raise PaperAutomationActivationError(
+            "EXPERIMENT_STATE_UNREADABLE", f"the ai_paper experiment state is unreadable: {exc}") from exc
+    if state is not None:
+        raise PaperAutomationActivationError(
+            "EXPERIMENT_ACTIVE", f"an ai_paper experiment is {state}; stop it first")
+
+
 class PaperAutomationActivationService:
     """Activate/deactivate paper automation (YAML + optional hot-arm ports)."""
 
@@ -127,6 +141,7 @@ class PaperAutomationActivationService:
         hot_arm: PaperHotArmPorts | None = None,
         *,
         fail_after: str | None = None,
+        experiment_lock: Any = None,
     ) -> None:
         self._trader_yaml_path = Path(trader_yaml_path).expanduser()
         self._strategy_yaml_path = Path(strategy_yaml_path).expanduser()
@@ -137,6 +152,8 @@ class PaperAutomationActivationService:
         self._now = now
         self._hot_arm = hot_arm
         self._fail_after = fail_after
+        # SP1 Plan 4: an ai_paper experiment that is not STOPPED blocks arming (spec 5.5).
+        self._experiment_lock = experiment_lock
         self._last_activated_at: str | None = None
         self._last_error: str | None = None
         self._phase: str | None = None
@@ -249,6 +266,17 @@ class PaperAutomationActivationService:
 
     def activate(self, *, strategy_name: str, reason: str) -> dict:
         del reason
+        if self._experiment_lock is None:
+            return self._activate(strategy_name)
+        from trader.automation.experiments import ExperimentRefused
+        try:
+            with self._experiment_lock.hold():
+                refuse_while_experiment(self._experiment_lock)
+                return self._activate(strategy_name)
+        except ExperimentRefused as exc:
+            raise PaperAutomationActivationError(exc.code, exc.message) from exc
+
+    def _activate(self, strategy_name: str) -> dict:
         if self._hot_arm is not None:
             return self._activate_hot_arm(strategy_name=strategy_name)
         return self._activate_restart_required(strategy_name=strategy_name)

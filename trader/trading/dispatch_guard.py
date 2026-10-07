@@ -142,6 +142,7 @@ class DispatchGuard:
         current_limits: Callable[[Any], RiskLimits] = lambda request: PAPER_LIMITS,
         ai_entry_gate: Callable[[Any, Any, Any, dt.datetime], Optional[str]] = lambda *args: None,
         strict_margin_actions: frozenset[str] = frozenset(),
+        experiment_gate: Callable[[Any], Optional[str]] = lambda request: None,
     ):
         self._broker = broker
         self._quotes = quotes
@@ -156,6 +157,8 @@ class DispatchGuard:
         self._current_limits = current_limits
         self._ai_entry_gate = ai_entry_gate
         self._strict_margin_actions = frozenset(strict_margin_actions)
+        # SP1 Plan 4 K20: an ai_paper entry admitted before a kill is refused here after it.
+        self._experiment_gate = experiment_gate
 
     def _limits_for(self, request) -> RiskLimits:
         try:
@@ -253,6 +256,14 @@ class DispatchGuard:
     def revalidate(self, approved, request, now: dt.datetime) -> DispatchPermit:
         if request.account_id != self._account_id:
             raise DispatchGuardError("ACCOUNT_MISMATCH", "command account is not pinned account")
+        try:
+            experiment_code = self._experiment_gate(request)
+        except Exception as exc:
+            raise DispatchGuardError(
+                "EXPERIMENT_STATE_UNAVAILABLE", "the experiment state is unreadable", retryable=True
+            ) from exc
+        if experiment_code:
+            raise DispatchGuardError(experiment_code, "the experiment does not allow new exposure")
         try:
             current = self._broker.capture(self._account_id)
         except BrokerRiskSnapshotError as exc:

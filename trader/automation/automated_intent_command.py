@@ -149,7 +149,10 @@ class AutomatedIntentCommandService:
         liquidation: Optional[Any] = None,
         broker: Optional[Any] = None,
         close_deadline_seconds: float = 300.0,
+        entry_block: Optional[Callable[[], Optional[str]]] = None,
     ):
+        # SP1 Plan 4 K17: BOTH_MODES_ARMED refuses every BUY; SELL closes keep working.
+        self._entry_block = entry_block
         self._ledger = ledger
         self._audit = audit
         self._journal = journal
@@ -259,6 +262,11 @@ class AutomatedIntentCommandService:
             self._transition(cmd, "RECEIVED", "VALIDATED")
             return self._execute_close(cmd, intent, artifact)
 
+        block = self._entry_refusal()
+        if block is not None:
+            self._transition(cmd, "RECEIVED", "REJECTED", error_code=block)
+            return self._receipt(cmd.command_id, "REJECTED", block, False)
+
         if self._protective_saga is None or self._approval_factory is None:
             # Without the saga there is no gross reservation or dispatch guard.
             code = "SAGA_REQUIRED"
@@ -281,6 +289,14 @@ class AutomatedIntentCommandService:
         return self._execute_via_saga(
             cmd, intent, artifact, order_group_id, bundle_digest,
         )
+
+    def _entry_refusal(self) -> Optional[str]:
+        if self._entry_block is None:
+            return None
+        try:
+            return self._entry_block()
+        except Exception:
+            return "ENTRY_BLOCK_UNAVAILABLE"
 
     def _execute_via_saga(
         self, cmd, intent, artifact, order_group_id, bundle_digest,

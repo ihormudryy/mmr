@@ -309,3 +309,8 @@ def test_decode_refuses_bad_timestamp_before_any_signature_work(literal):
     ids = make_identities()
     with pytest.raises(AuthenticationError, match="timestamp"):
         decode_request(_signed_request_with_timestamp(ids, literal))
+
+
+def test_accepts_reports_keyring_membership():
+    ids = make_identities()
+    assert ids["trader"].accepts("ai_supervisor") and not ids["strategy"].accepts("ai_supervisor")

@@ -480,6 +480,10 @@ class ServiceIdentity:
     def trusted_principals(self) -> frozenset:
         return self._keyring.principals()
 
+    def accepts(self, principal: str) -> bool:
+        """Whether this identity's keyring holds ``principal``'s public key."""
+        return principal in self._keyring.principals()
+
     def __repr__(self) -> str:
         return f"<ServiceIdentity principal={self._principal} key_id={self._key_id}>"
 

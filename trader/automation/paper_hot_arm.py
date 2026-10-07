@@ -134,7 +134,9 @@ class ProductionPaperHotArmPorts:
         account_mode: str,
         now: Callable[[], dt.datetime],
         build_intent_service: Callable[..., Any],
+        experiment_lock: Any = None,
     ) -> None:
+        self._experiment_lock = experiment_lock
         self._trader = trader
         self._stack = stack
         self._account_id = account_id
@@ -189,6 +191,8 @@ class ProductionPaperHotArmPorts:
             _execute_automated_intent_rpc_handler,
         )
 
+        from trader.automation.paper_activation import refuse_while_experiment
+        refuse_while_experiment(self._experiment_lock)
         if self._registry is None:
             raise RuntimeError("typed registry not attached for paper hot-arm")
 

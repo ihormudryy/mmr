@@ -189,6 +189,11 @@ forex snapshot-all JPY GBP --base EUR        # Chosen currencies vs EUR
 forex movers                                 # 10 FX majors/crosses ranked by ECB day-over-day change (computed_fx)
 forex movers --losers --source massive       # Massive forex movers (paid)
 forex convert EUR USD 1000                   # ECB daily rate (Frankfurter); --source massive|twelvedata
+experiment status                            # PAPER ai_paper experiment: state, active + pending kill line, entry block
+experiment start --reason "first run"        # operator; flat paper account, ai_paper.enabled
+experiment pause --reason "news risk"        # cli, dashboard or ai_supervisor
+experiment resume --reason "ok"              # operator; never after a kill
+experiment stop --reason "done"              # operator; once the account is flat (final)
 ```
 
 ## Command Service Requirements
@@ -209,6 +214,7 @@ forex convert EUR USD 1000                   # ECB daily rate (Frankfurter); --s
 - `approve`, `portfolio-risk` / `psnap` / `pdiff`, `reconcile`, `diagnose`
 - `listen` (publish_instrument + PubSub)
 - `forex snapshot`, `forex quote` (default IB source; IDEALPRO CASH contract)
+- `experiment status|start|pause|resume|stop` (SP1 experiments; paper only)
 
 **Requires strategy typed RPC (42104/42105)**:
 - `strategies` list, `strategies enable|disable|reload`

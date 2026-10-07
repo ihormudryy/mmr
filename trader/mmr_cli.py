@@ -1364,6 +1364,27 @@ def build_parser() -> argparse.ArgumentParser:
                             help='Exact proposal revision being approved (CAS guard against a stale review); '
                                  'defaults to the proposal\'s current revision when omitted')
 
+    # experiment (SP1 ai_paper)
+    experiment_p = sub.add_parser(
+        'experiment', help='PAPER ai_paper experiment: start, pause, resume, stop, status',
+        epilog='Examples:\n'
+               '  experiment status\n'
+               '  experiment start --reason "first paper run"   # needs a flat paper account\n'
+               '  experiment pause --reason "news risk"\n'
+               '  experiment resume --reason "ok"                # never after a kill\n'
+               '  experiment stop --reason "done"                # once the account is flat',
+        formatter_class=fmt)
+    experiment_sub = experiment_p.add_subparsers(dest='experiment_action')
+    experiment_sub.add_parser('status', help='Experiment state, kill line and entry block')
+    experiment_start_p = experiment_sub.add_parser('start', help='Arm a new experiment (operator)')
+    experiment_start_p.add_argument('--reason', required=True)
+    for _action, _help in (('pause', 'Pause new entries'), ('resume', 'Resume a paused experiment'),
+                           ('stop', 'Stop the experiment once flat (final)')):
+        _p = experiment_sub.add_parser(_action, help=_help)
+        _p.add_argument('--experiment-id', dest='experiment_id', default=None,
+                        help='Defaults to the active experiment; the server checks it')
+        _p.add_argument('--reason', required=True)
+
     # reject
     reject_p = sub.add_parser('reject', help='Reject a trade proposal',
                                epilog='Examples:\n'
@@ -2578,6 +2599,9 @@ def dispatch(mmr: MMR, args: argparse.Namespace) -> bool:
         elif cmd == 'reject':
             _handle_reject(mmr, args)
 
+        elif cmd == 'experiment':
+            _handle_experiment(mmr, args)
+
         elif cmd == 'activate-canary':
             _handle_activate_canary(mmr, args)
 
@@ -3026,6 +3050,68 @@ def _handle_reject(mmr: MMR, args: argparse.Namespace):
         print_status(f'Proposal #{args.proposal_id} rejected')
     else:
         print_status(f'Reject failed: proposal #{args.proposal_id} not found or not PENDING', success=False)
+
+
+def _experiment_status_lines(status: dict) -> list:
+    """Plain text for ``experiment status`` (K1, K9): both kill lines and the detection delay."""
+    experiment = status.get('experiment')
+    line = status.get('kill_line') or {}
+    lines = []
+    if experiment is None:
+        lines.append('PAPER: no experiment')
+    else:
+        lines.append(f"PAPER experiment {experiment['experiment_id']}: {experiment['state']}")
+        lines.append(f"  started {experiment['started_at']} at net liquidation "
+                     f"{experiment['start_net_liquidation']:,.2f} {experiment['base_currency']}")
+        if experiment['state'] == 'KILLED':
+            flat = experiment.get('kill_flat_state')
+            if flat == 'FLAT':
+                lines.append('  kill flatten FLAT on broker evidence: run mmr reconcile, then experiment stop')
+            elif flat == 'FAILED_SAFE':
+                lines.append('  kill flatten FAILED_SAFE: the breaker is tripped; check the account by hand')
+            else:
+                lines.append('  flatten pending: not flat on broker evidence yet')
+        if experiment.get('pause_cause'):
+            lines.append(f"  paused by {experiment['pause_cause']}: resume needs fresh broker evidence")
+    active = line.get('active')
+    if active:
+        lines.append(f"  active kill line {active['pct']}% ({active['basis']} basis)")
+    else:
+        lines.append('  no active kill line')
+    configured = line.get('configured')
+    if configured == 'UNREADABLE':
+        lines.append('  configured kill line in trader.yaml is UNREADABLE')
+    elif line.get('pending_restart'):
+        edited = 'removed' if configured is None else f"{configured['pct']}%"
+        lines.append(f'  edited kill line {edited} is NOT active until trader_service restarts')
+    if line.get('detection'):
+        lines.append(f"  kill detection: {line['detection']}")
+    if status.get('entry_block'):
+        lines.append(f"  entries refused: {status['entry_block']}")
+    if status.get('mode_conflict'):
+        lines.append(f"  {status['mode_conflict']}: every entry is refused; deactivate one mode")
+    return lines
+
+
+def _handle_experiment(mmr: MMR, args: argparse.Namespace):
+    action = getattr(args, 'experiment_action', None) or 'status'
+    if action == 'status':
+        status = mmr.experiment_status()
+        if _json_mode:
+            print_json_result(status, title='Experiment')
+            return
+        for text in _experiment_status_lines(status):
+            console.print(text)
+        return
+    if action == 'start':
+        result = mmr.experiment_start(args.reason)
+    else:
+        result = getattr(mmr, f'experiment_{action}')(args.reason, experiment_id=args.experiment_id)
+    if result.is_success():
+        print_json_result(result.obj or {}, title=f'Experiment {action}')
+    else:
+        error = str(result.error or result.exception or 'Unknown error')
+        print_status(f'experiment {action} failed: {error}', success=False)
 
 
 def _handle_activate_canary(mmr: MMR, args: argparse.Namespace):

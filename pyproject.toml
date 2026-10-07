@@ -1,6 +1,6 @@
 [project]
 name = "mmr"
-version = "0.1.1"
+version = "0.2.0"
 description = "LLM-native algorithmic trading platform for Interactive Brokers"
 readme = "README.md"
 requires-python = ">=3.12"

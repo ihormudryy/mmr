@@ -51,7 +51,7 @@
 20. **Owner model budget cap (owner, 2026-10-07; spec 5.4).** `ai_paper.model_budget_usd_per_day` in `trader.yaml` (default 2000, finite, ≥ 0, a bool or text refused; env overrides are already refused by `_refuse_env_overrides`). It is parsed into `AiPaperConfig.model_budget_usd_per_day` and served by the query `get_ai_model_budget` → `{"model_budget_usd_per_day": float, "source": "trader.yaml"}`. The trader reads `trader.yaml` only at start, so only an operator edit plus a trader restart changes the value; no typed RPC command touches it. The `ai` service applies it with Plan 4's `Budget.set_cap` (Plan 5). *If wrong:* an operator `cli` command (spec 5.4's other path) can be added later as a `cli`-only command; it is not needed for SP2a+b.
 21. **Matched-entry: one record per close; the trader proves the trip and the shares (coordinator rulings on PR #75, rounds 1 and 2).** One record per model close: `opportunity_id` is the close's decision id, `linked_decision_id` (required) is the trip's ENTER. The caller is never trusted for the trip or the share count:
    - **At ingestion** the trader derives the trip itself. The close decision (`opportunity_id`) must be a trader decision (`DecisionFacts`; unknown → `DECISION_LINK_UNKNOWN`, retryable) with action `CLOSE` or `PARTIAL_CLOSE`, of the same experiment and conid as the ENTER, received after the trip opened (else `MATCHED_CLOSE_INVALID`). The trip is the round trip of this experiment opened by the linked ENTER (`TripFacts.opened_by(experiment_id, entry_decision_id)` over `round_trips.decision_id`; not there yet → `MATCHED_ENTRY_TRIP_UNKNOWN`, retryable: the scoreboard refreshes every 30 s). A supplied `linked_round_trip_id` that differs → `MATCHED_ENTRY_TRIP_MISMATCH` (not retryable); a missing one is filled with the derived id. The record stores the close's **requested** quantity (a `PARTIAL_CLOSE`'s quantity, or for a `CLOSE` the whole shares open when the model chose it): that is all the `ai` side knows when it commits the record with the close.
-   - **At session-end simulation** the trader simulates `min(requested, shares the close is broker-proven to have removed)`. `CloseFills.removed(round_trip_id, close_decision_id)` returns `PROVEN(n)` (n = the trip's SELL executions whose order ref resolves through `links_for_order_ref` to that close decision; `0` for a close that ended `REJECTED` with no execution) or `UNPROVEN` (the close is not final, its outcome is unknown, or a SELL execution of the trip cannot be attributed). Then the per-trip sum is clipped to the trip's proven entry fill (`round_trips.entry_qty`): records are taken in close order and each gets at most what the earlier ones left. `UNPROVEN` after the grace period, or a record the clip leaves with nothing although its close proved shares (contradictory facts) → INCOMPLETE, reason `close_fill_unproven`. A close proven to have removed 0 shares → COMPLETE, `pnl_usd = 0.0`, `trades = 0`, reason `CLOSE_REMOVED_NO_SHARES`. The outcome stores the simulated quantity (`simulated_outcomes.quantity`).
+   - **At session-end simulation** the trader simulates `min(requested, shares the close is broker-proven to have removed)`. `CloseFills.removed(round_trip_id, close_decision_id)` returns `PROVEN(n)` (n = the trip's SELL executions whose order ref is a **reduce** child of that close decision's own close root, found through the close-aware lookup `DecisionStoreCloseLinks`, not the ENTER-only `DecisionStoreAttribution`; `0` for a close that ended `REJECTED` with no execution) or `UNPROVEN` (the close is not final, its outcome is unknown, or a SELL execution of the trip cannot be attributed). Then the per-trip sum is clipped to the trip's proven entry fill (`round_trips.entry_qty`): records are taken in close order and each gets at most what the earlier ones left. `UNPROVEN` after the grace period, or a record the clip leaves with nothing although its close proved shares (contradictory facts) → INCOMPLETE, reason `close_fill_unproven`. A close proven to have removed 0 shares → COMPLETE, `pnl_usd = 0.0`, `trades = 0`, reason `CLOSE_REMOVED_NO_SHARES`. The outcome stores the simulated quantity (`simulated_outcomes.quantity`).
    - So a trip's records add up to at most its proven entry fill, and to the shares the model's closes really removed; shares a stop, target, strategy SELL or the flatten removed have no model close and no record. `reference_price` stays the entry fill and `decided_at` the entry time.
 
 ## Cross-plan additions
@@ -368,7 +368,7 @@ Fix the two existing tests: in `test_store.py` replace the raw insert with `db.e
   - `RecordAiCostRequest`, `RecordSimulatedDecisionRequest` (pydantic, fields in Cross-plan additions); `parse_utc(text: str) -> datetime`; `body_digest(payload: Mapping[str, Any]) -> str`.
   - `BASELINES: Mapping[str, str]`; `STATUS_RANK: Mapping[str, int]`.
   - `class AiIngest(store, experiments, decisions, calendar, now, sizer=None)` with `record_cost(req) -> dict` and `record_simulated(req) -> dict` (response shape in Cross-plan additions). `SIZING_MAX_LAG = timedelta(seconds=120)`.
-  - In `ports.py`: `@dataclass(frozen=True) DecisionFact(decision_id: str, account_id: str, experiment_id: Optional[str], conid: Optional[int], action: Optional[str], received_at: dt.datetime, entry_quantity: Optional[int] = None, state: Optional[str] = None)`; `TripFact`, `TripFacts` (`opened_by`, `by_id`), `StoreTripFacts(store)`, `CloseFill(proven, shares)`, `CloseFills`, `NullCloseFills` (Ruling 21); `class DecisionFacts(Protocol): def get(self, decision_id: str) -> Optional[DecisionFact]`; `NullDecisionFacts` (always `None`); `DecisionStoreFacts(decision_store, ledger=None)` adapting `AiPaperDecisionStore.row(decision_id)` (returns `None` when the row is missing or has no `decision_id`) and, for an `ENTER`, reading `entry_quantity` from the command ledger's receipt outcome of `row.command_id` (`None` without a ledger, a receipt or an int `quantity`).
+  - In `ports.py`: `@dataclass(frozen=True) DecisionFact(decision_id: str, account_id: str, experiment_id: Optional[str], conid: Optional[int], action: Optional[str], received_at: dt.datetime, entry_quantity: Optional[int] = None, state: Optional[str] = None)`; `TripFact`, `TripFacts` (`opened_by`, `by_id`), `StoreTripFacts(store)`, `CloseFill(proven, shares)`, `CloseFills`, `NullCloseFills`, `DecisionStoreCloseLinks(decision_store)` with `close_decision_for_order_ref(ref)` (Ruling 21); `class DecisionFacts(Protocol): def get(self, decision_id: str) -> Optional[DecisionFact]`; `NullDecisionFacts` (always `None`); `DecisionStoreFacts(decision_store, ledger=None)` adapting `AiPaperDecisionStore.row(decision_id)` (returns `None` when the row is missing or has no `decision_id`) and, for an `ENTER`, reading `entry_quantity` from the command ledger's receipt outcome of `row.command_id` (`None` without a ledger, a receipt or an int `quantity`).
   - In `ports.py`: `@dataclass(frozen=True) SizedBaseline(quantity: int, inputs: Mapping[str, Any])`; `class SizingUnavailable(Exception)` with `.code` and `.inputs`; `class BaselineSizer(Protocol): def size(self, *, account_id: str, deployment_digest: str, conid: int, reference_price: float, stop_price: float) -> SizedBaseline` (raises `SizingUnavailable`).
 
 `ingest_models.py` holds the two strict models (`ConfigDict(extra="forbid", strict=True)`, fields and regexes exactly as in Cross-plan additions), `parse_utc`, and `body_digest`. Every id field gets a `field_validator` that applies its regex; both `called_at` / `decided_at` validators call `parse_utc` (naive → `ValueError`). The load-bearing parts, in full:
@@ -1294,7 +1294,27 @@ class NullCloseFills:
         return CloseFill(False, None)
 ```
 
-`JournalCloseFills(store, attribution, decisions)` implements `CloseFills` (in `trader/scoreboard/close_fills.py`, Task 5): it reads the trip's `exec_ids` and their executions through the same execution source `SessionLedger` builds round trips from, resolves each SELL execution's order ref with `attribution.links_for_order_ref` (SP1 resolves a liquidation child ref to its `close_root_id`, so a close decision's own orders map to it), and sums the shares attributed to `close_decision_id`. It returns `CloseFill(True, n)` when the close decision is final (`RESOLVED` or `REJECTED`; a `REJECTED` close with no execution is `CloseFill(True, 0)`) and every SELL execution of the trip is attributed; otherwise `CloseFill(False, None)` (the close is not final, its outcome is unknown, or an execution cannot be attributed). `NullCloseFills` (no ai_paper stack) always returns `CloseFill(False, None)`.
+**Close links (third PR #75 review).** `DecisionStoreAttribution` stays ENTER-only and unchanged: it gives a trip its attribution. Model closes get their own lookup, `DecisionStoreCloseLinks(decision_store)` in `ports.py`, with one method `close_decision_for_order_ref(ref) -> Optional[str]`. How a model close maps to orders on master: `start_broker_proven_close` (`trader/automation/reduction_close.py`) stores the liquidation root as the decision row's `close_root_id` (`receipt.cause_command_id`); the liquidation service sends child orders whose order group is `liquidation_child_id(root, kind, conid, attempt)` = `{root}-{kind}-{conid}-{attempt}` (`trader/trading/order_correlation.py`), with kind `reduce` (the SELL that removes shares), `cancel`, `reprotect-stop` or `reprotect-target`; `AiPaperDecisionStore.links_for_order_ref` already returns every decision whose `close_root_id` is that root. The method therefore:
+
+```python
+class DecisionStoreCloseLinks:
+    """Ruling 21: the model close a reduce order belongs to. Only reduce children remove shares for the close;
+    a re-protect stop or target that fills later is a protective exit, and a cancel removes nothing."""
+
+    def __init__(self, decision_store: Any):
+        self._store = decision_store
+
+    def close_decision_for_order_ref(self, ref: str) -> Optional[str]:
+        group = decode_order_ref(ref)
+        if group is None or liquidation_child_kind(group) != "reduce" or liquidation_child_root(group) is None:
+            return None
+        closes = [link for link in self._store.links_for_order_ref(ref) if link.action in REDUCTIONS]
+        # A refused close may carry another owner's root (EXIT_IN_PROGRESS): it never owns that root's orders.
+        owners = [link for link in closes if self._store.row(link.decision_id).state != "REJECTED"]
+        return owners[0].decision_id if len(owners) == 1 else None
+```
+
+`JournalCloseFills(store, close_links, decisions, executions)` implements `CloseFills` (in `trader/scoreboard/close_fills.py`, Task 5). `executions(round_trip_id)` gives the trip's broker executions (its `exec_ids`, read through the same execution source `SessionLedger` builds round trips from, each with `side`, `shares` and `order_ref`). It sums the SELL shares whose `close_links.close_decision_for_order_ref(order_ref) == close_decision_id`. It returns `CloseFill(True, n)` when the close decision is final (`DecisionFact.state` is `RESOLVED` or `REJECTED`; a `REJECTED` close with no execution is `CloseFill(True, 0)`) and every SELL execution of the trip resolves either to a close decision or to a known non-close origin (the ENTER saga's own stop or target, `og-aip-...`, or a re-protect child of a close root); otherwise `CloseFill(False, None)` (the close is not final, its outcome is unknown, or a SELL execution has an order ref nobody owns). `NullCloseFills` (no ai_paper stack) always returns `CloseFill(False, None)`.
 
 and in `tests/scoreboard/test_ports.py` (plus `test_a_placed_enter_reports_its_sized_quantity`: a fake ledger whose `get("aip-dec-00000001")` has `outcome={"quantity": 7}` gives `entry_quantity == 7`; a CLOSE row, a missing receipt or `quantity: True` give `None`):
 
@@ -1890,6 +1910,8 @@ def test_the_result_does_not_depend_on_input_order():
 
 **Files:**
 - Create: `trader/scoreboard/bar_sources.py`, `trader/scoreboard/session_simulator.py`, `trader/scoreboard/close_fills.py` (`JournalCloseFills`, Ruling 21)
+- Modify: `trader/scoreboard/ports.py` (`DecisionStoreCloseLinks`; `DecisionStoreAttribution` unchanged), `trader/scoreboard/session_ledger.py` (`SessionLedger.trip_executions`)
+- Test: `tests/scoreboard/test_close_links.py`
 - Modify: `trader/scoreboard/wiring.py`, `trader/trading/trading_runtime.py`, `tests/scoreboard/test_wiring.py`, `tests/test_trading_runtime.py`
 - Test: `tests/scoreboard/test_bar_sources.py`, `tests/scoreboard/test_session_simulator.py`
 
@@ -2144,7 +2166,7 @@ class SessionSimulator:
         return 1
 ```
 
-`TripFacts` gains `by_id(experiment_id, round_trip_id) -> Optional[TripFact]` (same `round_trips` read). `wiring.py`: `build_scoreboard(..., bar_sources: Optional[Sequence[Any]] = None)`; builds `SessionSimulator(store=store, calendar=calendar, sources=default_bar_sources(trader) if bar_sources is None else bar_sources, now=now, close_fills=NullCloseFills() if decision_store is None else JournalCloseFills(store, links, decision_facts))` (`links` is the `DecisionStoreAttribution` the ledger already uses); `ScoreboardServices` gets `simulator: Any = None` and `tick()` calls `self._step("simulation", self.simulator.run_due)` when set. (`command_stack._build_scoreboard` needs no change: the default builds the sources from the trader.)
+`TripFacts` gains `by_id(experiment_id, round_trip_id) -> Optional[TripFact]` (same `round_trips` read). `wiring.py`: `build_scoreboard(..., bar_sources: Optional[Sequence[Any]] = None)`; builds `SessionSimulator(store=store, calendar=calendar, sources=default_bar_sources(trader) if bar_sources is None else bar_sources, now=now, close_fills=close_fills)` with `close_fills = NullCloseFills() if decision_store is None else JournalCloseFills(store, DecisionStoreCloseLinks(decision_store), decision_facts, ledger.trip_executions)` (`ledger.trip_executions(round_trip_id)` is a new read on `SessionLedger` over the executions it already loads; the ENTER-only `DecisionStoreAttribution` is not touched); `ScoreboardServices` gains `close_fills: Any = None` so tests reach the production object; `ScoreboardServices` gets `simulator: Any = None` and `tick()` calls `self._step("simulation", self.simulator.run_due)` when set. (`command_stack._build_scoreboard` needs no change: the default builds the sources from the trader.)
 
 `trading_runtime.py` `Trader.__init__`: add parameters `alpaca_api_key_id: str = ''`, `alpaca_api_secret_key: str = ''` after `automation_strategy_name` and set `self.alpaca_api_key_id = alpaca_api_key_id or ''` (same for the secret). Never log them.
 
@@ -2440,11 +2462,33 @@ def test_the_per_trip_sum_is_clipped_to_the_proven_entry_fill(store):
     assert sorted(o["quantity"] for o in store.fetch("simulated_outcomes", {})) == [2, 6]
 ```
 
+Close-link tests against SP1's real `AiPaperDecisionStore` (`tests/scoreboard/test_close_links.py`; rows written with the store's own `upsert_in_tx`: an ENTER `dec-e` with command `aip-dec-e`, a `PARTIAL_CLOSE` `dec-c` with `close_root_id = "root-1"`, and a `REJECTED` close `dec-x` carrying the same root, as `EXIT_IN_PROGRESS` writes it):
+
+```python
+def test_a_reduce_child_resolves_to_its_close_and_nothing_else_does(decision_store):
+    links = DecisionStoreCloseLinks(decision_store)
+    reduce_ref = encode_order_ref(liquidation_child_id("root-1", "reduce", 265598, 1))
+    assert links.close_decision_for_order_ref(reduce_ref) == "dec-c"             # the REJECTED dec-x owns nothing
+    for kind in ("reprotect-stop", "reprotect-target", "cancel"):
+        ref = encode_order_ref(liquidation_child_id("root-1", kind, 265598, 1))
+        assert links.close_decision_for_order_ref(ref) is None
+    assert links.close_decision_for_order_ref(encode_order_ref("og-aip-dec-e")) is None
+
+
+def test_the_enter_only_attribution_is_unchanged(decision_store):
+    attribution = DecisionStoreAttribution(decision_store)
+    assert attribution.links_for_order_ref(encode_order_ref("og-aip-dec-e")).decision_id == "dec-e"
+    reduce_ref = encode_order_ref(liquidation_child_id("root-1", "reduce", 265598, 1))
+    assert attribution.links_for_order_ref(reduce_ref) is None                   # close links only: still None
+```
+
+(`encode_order_ref`, `liquidation_child_id` from `trader/trading/order_correlation.py`.) The production-wiring proof, an attributed SELL of a real model close on SP1's stack, is Plan 6 Task 9 `test_a_model_close_is_proven_through_the_production_close_links`.
+
 `seed_matched(store, *closes, entry_qty=10.0, wrong_trip_first=False)` ingests one `matched_body` per `(close_decision_id, requested)` with `FakeTrips(**{"dec-00000001": TripFact("rt-1", 265598, ..., entry_qty)})`, `FakeDecisions(enter_fact(), *close facts)`; with `wrong_trip_first` the second record is first sent with `linked_round_trip_id="rt-9"` and must come back `MATCHED_ENTRY_TRIP_MISMATCH`, then with `None`. `run(store, close_fills, extra=dt.timedelta(minutes=1))` runs one `SessionSimulator(..., close_fills=close_fills, trips=<the same FakeTrips with by_id>)` at `data_ready_at(SESSION) + extra`.
 
 - [ ] **Step 2: Run, expect failure** `.venv/bin/python -m pytest tests/scoreboard/test_session_simulator.py tests/scoreboard/test_bar_sources.py -q --timeout=30`.
 - [ ] **Step 3: Implement** the files and edits above.
-- [ ] **Step 4: Run** `.venv/bin/python -m pytest tests/scoreboard/test_session_simulator.py tests/scoreboard/test_bar_sources.py tests/scoreboard/test_simulator.py tests/scoreboard/test_wiring.py tests/test_trading_runtime.py -q --timeout=30` → pass.
+- [ ] **Step 4: Run** `.venv/bin/python -m pytest tests/scoreboard/test_session_simulator.py tests/scoreboard/test_close_links.py tests/scoreboard/test_bar_sources.py tests/scoreboard/test_simulator.py tests/scoreboard/test_wiring.py tests/test_trading_runtime.py -q --timeout=30` → pass.
 - [ ] **Step 5: Commit** `feat: simulate baseline outcomes from 1-minute bars at session end`.
 
 ---

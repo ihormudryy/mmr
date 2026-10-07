@@ -880,7 +880,7 @@ def _execute_sell(stack, tmp_path, requested):
     return stack.coordinator.execute(CommandRequest(
         command_id=intent.command_id, action="execute_automated_intent", account_id=ACCOUNT,
         target_type="intent", target_id=intent.intent_id, expected_version=None,
-        body=intent_to_request_body(intent), source="strategy_service",
+        body=intent_to_request_body(intent), source="strategy_service", principal="strategy",
     )), intent
 
 
@@ -928,7 +928,7 @@ def test_sell_intent_with_an_inexact_conid_is_invalid_before_any_broker_read(tmp
     receipt = stack.coordinator.execute(CommandRequest(
         command_id=intent.command_id, action="execute_automated_intent", account_id=ACCOUNT,
         target_type="intent", target_id=intent.intent_id, expected_version=None,
-        body=body, source="strategy_service"))
+        body=body, source="strategy_service", principal="strategy"))
     assert (receipt.state, receipt.error_code) == ("REJECTED", "INTENT_INVALID")
     assert (captures, liquidation.starts, stack.dispatch.calls) == ([], [], [])
 
@@ -979,7 +979,8 @@ def test_typed_intent_request_accepts_an_exact_conid(tmp_path):
     (tmp_path / "bundles" / ARTIFACT_DIGEST.replace(":", "_")).mkdir(parents=True, exist_ok=True)
     intent = make_intent(side="SELL", requested_quantity=None)
     handler = _execute_automated_intent_rpc_handler(stack.coordinator, ACCOUNT)
-    receipt = handler(_coerce_request_body(intent_to_wire(intent), ExecuteAutomatedIntentRequest))
+    receipt = handler(_coerce_request_body(intent_to_wire(intent), ExecuteAutomatedIntentRequest),
+                      RpcCaller("strategy", None))
     assert receipt["error_code"] == "CLOSE_PENDING" and liquidation.starts[0][3]["conid"] == 265598
 
 
@@ -1014,7 +1015,7 @@ def test_buy_intent_path_is_unchanged_with_close_configured(tmp_path):
     receipt = stack.coordinator.execute(CommandRequest(
         command_id=intent.command_id, action="execute_automated_intent", account_id=ACCOUNT,
         target_type="intent", target_id=intent.intent_id, expected_version=None,
-        body=intent_to_request_body(intent), source="strategy_service",
+        body=intent_to_request_body(intent), source="strategy_service", principal="strategy",
     ))
     assert receipt.state in ("SUBMITTED", "RESOLVED")
     assert len(stack.dispatch.calls) == 1 and liquidation.starts == []
@@ -1026,7 +1027,7 @@ def _execute_buy(stack, tmp_path):
     return stack.coordinator.execute(CommandRequest(
         command_id=intent.command_id, action="execute_automated_intent", account_id=ACCOUNT,
         target_type="intent", target_id=intent.intent_id, expected_version=None,
-        body=intent_to_request_body(intent), source="strategy_service",
+        body=intent_to_request_body(intent), source="strategy_service", principal="strategy",
     ))
 
 

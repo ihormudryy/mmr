@@ -11,7 +11,7 @@ MODULES = ("trader.ai.ids", "trader.ai.runtime_schema", "trader.ai.rpc_clients",
            "trader.ai.signal_intake", "trader.ai.controller", "trader.ai_service",
            # SP2 Plan 6
            "trader.ai.decision_schema", "trader.ai.tools", "trader.ai.evidence", "trader.ai.discovery_client",
-           "trader.ai.roles", "trader.ai.baselines", "trader.ai.decision_engine")
+           "trader.ai.roles", "trader.ai.baselines", "trader.ai.decision_engine", "trader.ai.decision_replay")
 
 
 def test_the_runtime_stays_clear_of_the_trading_runtime():

@@ -31,6 +31,10 @@ JSON output always follows the structure `{"data": ..., "title": ...}` for data 
 
 ```
 status                       # Service connectivity check
+keys init                    # Create missing RPC keypairs (never overwrites); Docker: ./docker.sh -k
+keys init --rotate dashboard # Replace one principal's keypair; prints the services to restart together
+keys backup --recipient FILE # age-encrypted tar of keys/rpc (Docker: ./docker.sh -k --backup)
+keys restore FILE --identity-stdin  # Restore into an empty keys/rpc
 resolve AMD                  # Resolve symbol to conId/universe
 resolve EURUSD --sectype CASH # Resolve forex pair via IB (IDEALPRO)
 portfolio                    # Current portfolio

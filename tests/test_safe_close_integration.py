@@ -980,10 +980,10 @@ def _register_production_actions(composed):
     from trader.messaging.production_api import build_production_registry
     from trader.domain.feed_service import DomainFeedService
     from trader.domain.snapshot_service import DomainSnapshotService
-    from trader.messaging.typed_rpc import HmacServiceAuthenticator
+    from tests.rpc_identity_fixtures import make_identities
 
     build_production_registry(
-        composed.trader, HmacServiceAuthenticator(b"k" * 32, now=lambda: 1_700_000_000.0),
+        composed.trader, make_identities(now=lambda: 1_700_000_000.0)["trader"],
         snapshot_service=DomainSnapshotService(composed.trader.domain_journal),
         feed_service=DomainFeedService(composed.trader.domain_journal), command_stack=composed.stack)
 
@@ -1001,7 +1001,7 @@ def _sell(automated, *, requested=None):
     receipt = automated.stack.coordinator.execute(CommandRequest(
         command_id=intent.command_id, action="execute_automated_intent", account_id=ACCOUNT,
         target_type="intent", target_id=intent.intent_id, expected_version=None,
-        body=intent_to_request_body(intent, bundle_digest="sha256:manifest-ok"), source="strategy_service"))
+        body=intent_to_request_body(intent, bundle_digest="sha256:manifest-ok"), source="strategy_service", principal="strategy"))
     return receipt, intent
 
 

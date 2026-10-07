@@ -39,6 +39,13 @@ from cryptography.hazmat.primitives.asymmetric.ed25519 import (
     Ed25519PublicKey,
 )
 
+from trader.research.key_purpose import (
+    KeyPurposeError,
+    default_rpc_keys_dir,
+    raw_public_bytes,
+    rpc_identity_raw,
+)
+
 __all__ = [
     "InsecureKeyFile",
     "InvalidKeyType",
@@ -114,6 +121,7 @@ def load_signing_key(path: str) -> Ed25519PrivateKey:
     if not isinstance(key, Ed25519PrivateKey):
         raise InvalidKeyType(
             f"key at {path!r} is {type(key).__name__}, not an Ed25519 private key")
+    _refuse_rpc_identity_key(key.public_key(), path)
     return key
 
 
@@ -132,7 +140,19 @@ def load_verify_key(path: str) -> Ed25519PublicKey:
     if not isinstance(key, Ed25519PublicKey):
         raise InvalidKeyType(
             f"key at {path!r} is {type(key).__name__}, not an Ed25519 public key")
+    _refuse_rpc_identity_key(key, path)
     return key
+
+
+def _refuse_rpc_identity_key(public_key: Ed25519PublicKey, path: str) -> None:
+    """Bundle keys and RPC identity keys are separate (spec 5.3)."""
+    try:
+        rpc_keys = rpc_identity_raw(default_rpc_keys_dir())
+    except KeyPurposeError as exc:
+        raise MalformedKey(str(exc)) from exc
+    if raw_public_bytes(public_key) in rpc_keys:
+        raise InvalidKeyType(
+            f"key at {path!r} is an RPC identity key; bundle keys and RPC keys are separate")
 
 
 # --------------------------------------------------------------------------- #

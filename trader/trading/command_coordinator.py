@@ -471,6 +471,12 @@ class CommandRequest:
     # a nonce to the issuing session's fingerprint and re-checks it here at
     # consume, so a nonce can't be replayed from a different session.
     session_fingerprint: Optional[str] = None
+    # The authenticated RPC principal that submitted the command (set by the
+    # RPC handler from the verified key, never from the body). Authorization
+    # reads this, not ``source``. Excluded from ``canonical_request_hash`` and
+    # the ledger: it names the caller, not the command. Internal commands
+    # (coordinator children, recovery) leave it ``None``.
+    principal: Optional[str] = None
 
     def __post_init__(self) -> None:
         if ":" in self.command_id:
@@ -1269,10 +1275,11 @@ def _assert_proposal_revision(expected: int) -> Callable[[duckdb.DuckDBPyConnect
     return _write
 
 
-# Non-human approve actors. On live these are refused
-# (``LLM_LIVE_APPROVE_FORBIDDEN``); on paper they may approve after evaluation.
-# ``dashboard`` remains the human Command Center path (live + preflight).
-NON_HUMAN_APPROVE_SOURCES = frozenset({"sdk", "cli", "llm"})
+# On live only the dashboard principal (the human Command Center path, with
+# preflight) may approve; every other principal, and a command with no
+# principal, is refused (``LLM_LIVE_APPROVE_FORBIDDEN``). Paper allows any
+# principal the RPC allow-list lets call ``approve_proposal``.
+LIVE_APPROVE_PRINCIPAL = "dashboard"
 
 
 class ApprovalCommandService:
@@ -1298,8 +1305,8 @@ class ApprovalCommandService:
     ``FAILED``; an ambiguous dispatch (timeout/disconnect) leaves it
     ``APPROVED`` for the Task-9 reconciler and NEVER auto-retries.
 
-    Live + ``source`` in ``NON_HUMAN_APPROVE_SOURCES`` is refused before
-    dispatch (``LLM_LIVE_APPROVE_FORBIDDEN``). Paper allows those sources.
+    Live + a principal other than ``LIVE_APPROVE_PRINCIPAL`` is refused
+    before dispatch (``LLM_LIVE_APPROVE_FORBIDDEN``). Paper does not check it.
     """
 
     def __init__(
@@ -1562,13 +1569,10 @@ class ApprovalCommandService:
             return reject("WRONG_ACCOUNT", False)
         if self._account_mode == "live" and not record.live_approval_eligible:
             return reject("LIVE_INELIGIBLE", False)
-        # Paper LLM/SDK may approve after evaluation; live requires a human
-        # dashboard path (preflight + source=dashboard). See
-        # docs/superpowers/specs/2026-07-23-paper-llm-approve-live-human-design.md.
-        if (
-            self._account_mode == "live"
-            and (cmd.source or "").strip().lower() in NON_HUMAN_APPROVE_SOURCES
-        ):
+        # Paper LLM/SDK may approve after evaluation; live requires the human
+        # dashboard path (preflight + the authenticated dashboard principal).
+        # See docs/superpowers/specs/2026-07-23-paper-llm-approve-live-human-design.md.
+        if self._account_mode == "live" and cmd.principal != LIVE_APPROVE_PRINCIPAL:
             return reject("LLM_LIVE_APPROVE_FORBIDDEN", False)
         inflight = [
             r for r in self._ledger.unresolved_for_target("proposal", str(record.id))

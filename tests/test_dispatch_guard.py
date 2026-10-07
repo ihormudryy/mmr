@@ -109,7 +109,7 @@ def _request():
         command_id="cmd-1", action="approve_proposal", account_id=ACCOUNT,
         target_type="proposal", target_id="1", expected_version=1,
         body={"proposal_id": 1},
-        source="dashboard",
+        source="dashboard", principal="dashboard",
     )
 
 

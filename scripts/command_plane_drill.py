@@ -67,6 +67,7 @@ from trader.data.proposal_repository import (
 from trader.data.schema_migrations import SchemaMigrator
 from trader.messaging.production_api import register_command_authority
 from trader.messaging.typed_rpc import TypedRpcRegistry
+from trader.messaging.principals import TRADER_ACL
 from trader.trading.command_coordinator import (
     ApprovalCommandService,
     CommandAudit,
@@ -257,7 +258,7 @@ class DrillStack:
         self.coordinator = TradingCommandCoordinator(
             journal=journal, ledger=self.ledger, audit=CommandAudit(journal),
             nonces=FakeNonceGate(), now=self._now, reconciler=self.reconciler)
-        self.registry = TypedRpcRegistry()
+        self.registry = TypedRpcRegistry(acl=TRADER_ACL)
         register_command_authority(
             self.registry, self.coordinator, self.proposal_service, self.repo,
             account_id=ACCOUNT, account_mode="paper", controls=self.controls,
@@ -287,7 +288,7 @@ def approve_request(command_id, proposal_id, expected_version) -> CommandRequest
     return CommandRequest(
         command_id=command_id, action="approve_proposal", account_id=ACCOUNT,
         target_type="proposal", target_id=str(proposal_id), expected_version=expected_version,
-        body={"proposal_id": proposal_id}, source="dashboard",
+        body={"proposal_id": proposal_id}, source="dashboard", principal="dashboard",
         preflight_nonce=f"nonce-{command_id}")
 
 
@@ -504,7 +505,7 @@ class LiveApproval:
         return self.coordinator.execute(CommandRequest(
             command_id=command_id, action="approve_proposal", account_id=ACCOUNT_LIVE,
             target_type="proposal", target_id=str(record.id), expected_version=record.revision,
-            body={"proposal_id": record.id}, source="dashboard",
+            body={"proposal_id": record.id}, source="dashboard", principal="dashboard",
             preflight_nonce=f"nonce-{command_id}"))
 
 

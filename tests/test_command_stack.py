@@ -5,6 +5,8 @@ from types import SimpleNamespace
 
 import pytest
 
+from tests.rpc_identity_fixtures import make_identities
+
 from trader.data.broker_state import BrokerStateStore
 from trader.data.domain_journal import DomainJournal
 from trader.data.duckdb_store import DuckDBConnection
@@ -12,7 +14,6 @@ from trader.data.schema_migrations import SchemaMigrator
 from trader.domain.feed_service import DomainFeedService
 from trader.domain.snapshot_service import DomainSnapshotService
 from trader.messaging.production_api import build_production_registry
-from trader.messaging.typed_rpc import HmacServiceAuthenticator
 from trader.trading.command_policy import CommandAuthorityPolicy
 
 
@@ -170,7 +171,7 @@ def test_one_registry_contains_reads_feed_ingest_and_landed_commands(tmp_path):
     feed = DomainFeedService(trader.domain_journal)
     registry = build_production_registry(
         trader,
-        HmacServiceAuthenticator(b"k" * 32, now=lambda: 1_700_000_000.0),
+        make_identities()["trader"],
         snapshot_service=snapshot,
         feed_service=feed,
         command_stack=stack,
@@ -191,19 +192,18 @@ def test_one_registry_contains_reads_feed_ingest_and_landed_commands(tmp_path):
     }
     for role, method in expected:
         assert registry.contains(role, method), (role, method)
-    # Without HMAC/typed strategy clients on the stub trader, strategy-control
-    # stays unregistered (dormant). Production boots with typed_authenticator.
+    # Without an RPC identity on the stub trader, strategy-control stays
+    # unregistered (dormant). Production boots with rpc_identity loaded.
     assert stack.strategy_control_service is None
     assert not registry.contains("command", "disable_strategy")
 
 
-def test_strategy_control_registers_enable_disable_when_authenticator_present(tmp_path):
+def test_strategy_control_registers_enable_disable_when_identity_present(tmp_path):
     """Regression: METHOD_NOT_ALLOWED on Disable from the Strategies panel."""
     from trader.trading.command_stack import build_command_stack
 
     trader = _trader(tmp_path)
-    trader.typed_authenticator = HmacServiceAuthenticator(
-        b"k" * 32, now=lambda: 1_700_000_000.0)
+    trader.rpc_identity = make_identities()["trader"]
     trader.strategy_typed_address = "tcp://127.0.0.1"
     trader.strategy_typed_command_port = 42104
     trader.strategy_typed_query_port = 42105
@@ -213,7 +213,7 @@ def test_strategy_control_registers_enable_disable_when_authenticator_present(tm
 
     registry = build_production_registry(
         trader,
-        trader.typed_authenticator,
+        trader.rpc_identity,
         command_stack=stack,
     )
     for method in ("enable_strategy", "disable_strategy", "update_strategy_params",
@@ -248,7 +248,7 @@ def test_enabled_stack_wires_paper_automation_service_and_preflight_policy(
 
     registry = build_production_registry(
         trader,
-        HmacServiceAuthenticator(b"k" * 32, now=lambda: 1_700_000_000.0),
+        make_identities()["trader"],
         command_stack=stack,
     )
     assert registry.contains("command", "activate_paper_automation")
@@ -355,7 +355,7 @@ def test_paper_automation_registers_execute_automated_intent(tmp_path):
 
     registry = build_production_registry(
         trader,
-        HmacServiceAuthenticator(b"k" * 32, now=lambda: 1_700_000_000.0),
+        make_identities()["trader"],
         snapshot_service=DomainSnapshotService(trader.domain_journal),
         feed_service=DomainFeedService(trader.domain_journal),
         command_stack=stack,
@@ -371,7 +371,7 @@ def test_automation_disabled_does_not_register_automated_intent(tmp_path):
     stack = build_command_stack(trader, _policy(), now=lambda: NOW)
     registry = build_production_registry(
         trader,
-        HmacServiceAuthenticator(b"k" * 32, now=lambda: 1_700_000_000.0),
+        make_identities()["trader"],
         snapshot_service=DomainSnapshotService(trader.domain_journal),
         feed_service=DomainFeedService(trader.domain_journal),
         command_stack=stack,
@@ -473,7 +473,7 @@ def test_hot_arm_and_disarm_use_real_command_stack_and_strategy_binding(tmp_path
     stack = build_command_stack(trader, _policy(), now=lambda: NOW)
     assert stack is not None
     registry = build_production_registry(
-        trader, HmacServiceAuthenticator(b"k" * 32), command_stack=stack,
+        trader, make_identities()["trader"], command_stack=stack,
     )
     ports = stack.paper_hot_arm
     ports.attach_registry(registry)

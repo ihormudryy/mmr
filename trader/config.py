@@ -1,6 +1,7 @@
 from dataclasses import dataclass, field, fields
 from typing import Any, Dict, Optional
 
+import logging
 import os
 import yaml
 
@@ -105,16 +106,30 @@ class TypedRpcConfig:
     """Authenticated query/command/feed transport (G0 Task 3).
 
     Ports are frozen by the command-center plan index -- see
-    ``trader/messaging/typed_rpc.py`` for the transport itself and
-    ``load_service_hmac_key`` for why ``service_hmac_key_file`` has no
-    usable default: production startup must fail loudly rather than fall
-    back to an unset/empty key.
+    ``trader/messaging/typed_rpc.py`` for the transport itself. Identity
+    keys live in ``~/.config/mmr/keys/rpc`` (``mmr keys init``), not here.
     """
     address: str = 'tcp://127.0.0.1'
     query_port: int = 42101
     command_port: int = 42102
     feed_port: int = 42103
-    service_hmac_key_file: str = ''
+
+
+RETIRED_HMAC_YAML_KEY = 'service_hmac_key_file'
+RETIRED_HMAC_ENV_VAR = 'MMR_SERVICE_HMAC_KEY_FILE'
+
+
+def warn_if_retired_hmac_config(raw: Dict[str, Any], env=os.environ) -> None:
+    """Log one WARNING for leftover HMAC settings; they are ignored, never read."""
+    leftovers = []
+    if raw.get(RETIRED_HMAC_YAML_KEY):
+        leftovers.append(f'{RETIRED_HMAC_YAML_KEY} in trader.yaml')
+    if env.get(RETIRED_HMAC_ENV_VAR):
+        leftovers.append(f'the {RETIRED_HMAC_ENV_VAR} env var')
+    if leftovers:
+        logging.getLogger(__name__).warning(
+            '%s: retired by the Ed25519 cutover; ignored. Remove it and delete '
+            'service_hmac.key once the cutover is verified.', ' and '.join(leftovers))
 
 
 # docker-compose passes these as `KEY: ${KEY:-}`, so an unset host variable
@@ -205,7 +220,6 @@ class MMRConfig:
             'typed_query_port': ('typed_rpc', 'query_port'),
             'typed_command_port': ('typed_rpc', 'command_port'),
             'typed_feed_port': ('typed_rpc', 'feed_port'),
-            'service_hmac_key_file': ('typed_rpc', 'service_hmac_key_file'),
             # Automation
             'automation_enabled': ('automation', 'enabled'),
             'automation_live_enabled': ('automation', 'live_enabled'),
@@ -226,6 +240,7 @@ class MMRConfig:
         with open(path, 'r') as f:
             raw: Dict[str, Any] = yaml.safe_load(f) or {}
 
+        warn_if_retired_hmac_config(raw)
         config = MMRConfig()
         config.config_file = path
 

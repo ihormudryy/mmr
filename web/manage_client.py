@@ -1,6 +1,6 @@
 """Typed-RPC client for /manage (universes + strategy deploy helpers).
 
-Uses the same HMAC-authenticated typed transport as the command center, but
+Uses the same Ed25519-authenticated typed transport as the command center, but
 targets trader query/command and strategy query/command endpoints directly
 so the dashboard never opens legacy dill RPC or a local DuckDB file.
 """
@@ -18,7 +18,7 @@ from trader.messaging.typed_rpc import (
 from web.trader_link import (
     TraderLink,
     TraderLinkError,
-    build_authenticator,
+    build_identity,
     parse_endpoint,
 )
 
@@ -28,7 +28,6 @@ _DEFAULT_TRADER_QUERY = 'tcp://127.0.0.1:42101'
 _DEFAULT_TRADER_COMMAND = 'tcp://127.0.0.1:42102'
 _DEFAULT_STRATEGY_QUERY = 'tcp://127.0.0.1:42105'
 _DEFAULT_STRATEGY_COMMAND = 'tcp://127.0.0.1:42104'
-_DEFAULT_HMAC_KEY_PATH = '~/.config/mmr/service_hmac.key'
 
 
 class ManageRpcClient:
@@ -47,17 +46,20 @@ class ManageRpcClient:
                  timeout_s: float = 15.0, env: os._Environ = os.environ):
         self._timeout_s = timeout_s
         self._env = env
-        self._client_factory = client_factory or self._default_client_factory
+        self._custom_client_factory = client_factory
+        self._identity = None
         self._links: dict[str, TraderLink | None] = {
             'trader_query': None, 'trader_command': None,
             'strategy_query': None, 'strategy_command': None,
         }
         self._lock = threading.Lock()
 
-    def _default_client_factory(self, role: str, endpoint: str) -> TypedRpcClient:
+    def _default_client_factory(self, role: str, endpoint: str, server: str) -> TypedRpcClient:
         address, port = parse_endpoint(endpoint)
+        if self._identity is None:
+            self._identity = build_identity(self._env)
         return TypedRpcClient(
-            role, build_authenticator(self._env, default_key_path=_DEFAULT_HMAC_KEY_PATH),
+            role, self._identity, server=server,
             address=address, port=port, timeout=self._timeout_s)
 
     def _endpoint(self, var: str, default: str) -> str:
@@ -72,12 +74,15 @@ class ManageRpcClient:
         'discover_instrument',
     })
 
-    def _link_factory(self, role: str, endpoint: str) -> Callable[[], TypedRpcClient]:
+    def _link_factory(self, role: str, endpoint: str, server: str) -> Callable[[], TypedRpcClient]:
         # TraderLink does not connect; the manage contract is "code connects,
         # not the injected factory" (its tests assert connect() is called), so
         # wrap the (role, endpoint) factory to build AND connect.
         def _build() -> TypedRpcClient:
-            client = self._client_factory(role, endpoint)
+            if self._custom_client_factory is not None:
+                client = self._custom_client_factory(role, endpoint)
+            else:
+                client = self._default_client_factory(role, endpoint, server)
             client.connect()
             return client
         return _build
@@ -93,7 +98,7 @@ class ManageRpcClient:
             link = self._links[bucket]
             if link is None:
                 link = TraderLink(role, endpoint,
-                                  client_factory=self._link_factory(role, endpoint),
+                                  client_factory=self._link_factory(role, endpoint, bucket.split('_')[0]),
                                   timeout=self._timeout_s)
                 self._links[bucket] = link
         try:

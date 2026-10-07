@@ -11,9 +11,13 @@ from __future__ import annotations
 from dataclasses import dataclass
 import os
 from pathlib import Path
+import shlex
+import stat
 import subprocess
 
 import pytest
+
+from tests.rpc_identity_fixtures import write_keyset
 
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
@@ -46,6 +50,7 @@ class DockerHelperResult:
         return self.home / ".config/mmr/service_hmac.key"
 
 
+
 class FakeDocker:
     def __init__(self, tmp_path: Path):
         self.home = tmp_path / "home"
@@ -64,6 +69,11 @@ if [ \"$1\" = \"info\" ]; then
   exit 0
 fi
 if [ \"$1\" = \"compose\" ]; then
+  if [ -n \"${MMR_FAKE_KEYCHECK_FAIL:-}\" ]; then
+    case \" $* \" in
+      *\" check-mount ${MMR_FAKE_KEYCHECK_FAIL} \"*|*\" check-mount ${MMR_FAKE_KEYCHECK_FAIL}\") exit 1 ;;
+    esac
+  fi
   case \" $* \" in
     *\" ps -q scheduler \"*)
       if [ \"${MMR_FAKE_SCHEDULER:-}\" = \"1\" ]; then
@@ -90,7 +100,25 @@ exit 0
         )
         fake_docker.chmod(0o755)
 
-    def run(self, *args: str, env: dict[str, str] | None = None) -> DockerHelperResult:
+    @property
+    def compose_calls(self) -> list[list[str]]:
+        """Arguments after ``compose -f <file>`` for each compose invocation."""
+        calls = []
+        for line in (self.log_path.read_text() if self.log_path.exists() else '').splitlines():
+            words = shlex.split(line)
+            if words[:2] == ["compose", "-f"]:
+                calls.append(words[3:])
+        return calls
+
+    @property
+    def rpc_dir(self) -> Path:
+        return self.home / ".config/mmr/keys/rpc"
+
+    def write_keys(self) -> None:
+        write_keyset(self.rpc_dir)
+
+    def run(self, *args: str, env: dict[str, str] | None = None,
+            stdin: str = "") -> DockerHelperResult:
         process_env = os.environ.copy()
         process_env.update(
             {
@@ -107,7 +135,7 @@ exit 0
             cwd=REPO_ROOT,
             env=process_env,
             text=True,
-            input="",
+            input=stdin,
             capture_output=True,
             check=False,
         )
@@ -176,18 +204,18 @@ def test_sync_fails_loudly_for_read_only_images(fake_docker: FakeDocker):
     assert "read-only images" in result.stdout
 
 
-def test_up_bootstraps_a_portable_hmac_key(fake_docker: FakeDocker):
+def test_up_starts_the_stack_when_every_rpc_key_exists(fake_docker: FakeDocker):
+    fake_docker.write_keys()
     result = fake_docker.run("-u")
 
     assert result.returncode == 0, result.stdout
     assert result.config.exists()
-    assert "service_hmac_key_file: ~/.config/mmr/service_hmac.key" in result.config.read_text()
-    assert result.key.stat().st_mode & 0o777 == 0o600
     assert "compose -f" in result.log
     assert "up -d" in result.log
 
 
 def test_up_is_idempotent_when_default_configs_already_exist(fake_docker: FakeDocker):
+    fake_docker.write_keys()
     first = fake_docker.run("-u")
     second = fake_docker.run("-u")
 
@@ -196,17 +224,148 @@ def test_up_is_idempotent_when_default_configs_already_exist(fake_docker: FakeDo
     assert second.log.count("up -d") == 2
 
 
-def test_up_provisions_hmac_key_for_existing_legacy_trader_config(fake_docker: FakeDocker):
-    config_dir = fake_docker.home / ".config/mmr"
-    config_dir.mkdir(parents=True)
-    (config_dir / "trader.yaml").write_text("ib_server_address: 127.0.0.1\n")
+def test_up_refuses_when_an_rpc_key_is_missing(fake_docker: FakeDocker):
+    fake_docker.write_keys()
+    (fake_docker.rpc_dir / "strategy.pub").unlink()
+    result = fake_docker.run("-u")
 
+    assert result.returncode != 0
+    assert "mmr keys init" in result.stdout and "strategy.pub" in result.stdout
+    assert not fake_docker.compose_calls
+
+
+def test_up_refuses_a_directory_in_place_of_a_key(fake_docker: FakeDocker):
+    fake_docker.write_keys()
+    (fake_docker.rpc_dir / "cli.key").unlink()
+    (fake_docker.rpc_dir / "cli.key").mkdir()
+    result = fake_docker.run("-u")
+
+    assert result.returncode != 0 and "cli.key" in result.stdout
+    assert not fake_docker.compose_calls
+
+
+def test_up_never_deletes_an_existing_hmac_key_and_reminds_the_operator(fake_docker: FakeDocker):
+    fake_docker.write_keys()
+    key = fake_docker.home / ".config/mmr/service_hmac.key"
+    key.write_text("old")
     result = fake_docker.run("-u")
 
     assert result.returncode == 0, result.stdout
-    assert "service_hmac_key_file: ~/.config/mmr/service_hmac.key" in result.config.read_text()
-    assert result.key.exists()
-    assert "up -d" in result.log
+    assert key.read_text() == "old"
+    assert "delete it when the cutover is verified" in result.stdout
+    helper = (REPO_ROOT / "docker.sh").read_text()
+    for function in ("_require_rpc_keys", "_retire_hmac_config"):
+        body = helper.split(f"{function}() {{")[1].split("\n}")[0]
+        assert "rm " not in body, function
+
+
+def test_up_no_longer_provisions_an_hmac_key_and_strips_the_yaml_line(fake_docker: FakeDocker):
+    fake_docker.write_keys()
+    config_dir = fake_docker.home / ".config/mmr"
+    (config_dir / "trader.yaml").write_text(
+        "ib_server_address: 127.0.0.1\nservice_hmac_key_file: ~/.config/mmr/service_hmac.key\n")
+    result = fake_docker.run("-u")
+
+    assert result.returncode == 0, result.stdout
+    assert not result.key.exists()
+    assert "service_hmac_key_file" not in result.config.read_text()
+    assert "ib_server_address" in result.config.read_text()
+    assert (config_dir / "trader.yaml.bak").exists()
+
+
+def test_k_runs_keygen_in_the_one_shot_container_as_the_host_user(fake_docker: FakeDocker):
+    result = fake_docker.run("-k")
+
+    assert result.returncode == 0, result.stdout
+    call = fake_docker.compose_calls[-1]
+    assert call[:3] == ["run", "--rm", "--no-deps"] and "keygen" in call and call[-1] == "init"
+    assert f"{os.getuid()}:{os.getgid()}" in call
+    assert stat.S_IMODE(os.lstat(fake_docker.rpc_dir).st_mode) == 0o700
+
+
+def test_k_rotate_passes_the_principal(fake_docker: FakeDocker):
+    fake_docker.write_keys()
+    result = fake_docker.run("-k", "--rotate", "dashboard")
+
+    assert result.returncode == 0, result.stdout
+    assert fake_docker.compose_calls[-1][-3:] == ["init", "--rotate", "dashboard"]
+
+
+@pytest.mark.parametrize("principal", ["../x", "scheduler", "telegram_bridge", "CLI"])
+def test_k_rejects_an_unknown_principal_before_any_docker_call(fake_docker: FakeDocker, principal):
+    result = fake_docker.run("-k", "--rotate", principal)
+    assert result.returncode != 0
+    assert not fake_docker.compose_calls
+
+
+def test_k_fails_when_keygen_leaves_a_loose_mode(fake_docker: FakeDocker):
+    fake_docker.write_keys()
+    os.chmod(fake_docker.rpc_dir / "cli.key", 0o644)
+    result = fake_docker.run("-k")
+    assert result.returncode != 0 and "cli.key" in result.stdout
+
+
+def test_k_backup_runs_in_keygen_with_only_the_recipient_and_a_private_backup_dir(fake_docker: FakeDocker):
+    fake_docker.write_keys()
+    (fake_docker.home / ".config/mmr/keys/rpc_backup_recipient.txt").write_text("age1xyz")
+    result = fake_docker.run("-k", "--backup")
+
+    assert result.returncode == 0, result.stdout
+    call = " ".join(fake_docker.compose_calls[-1])
+    assert "keygen backup" in call and "identity" not in call
+    assert "/recipient.txt:ro" in call
+    backup_dir = fake_docker.home / ".local/share/mmr/backups/rpc_keys"
+    assert stat.S_IMODE(os.lstat(backup_dir).st_mode) == 0o700
+
+
+def test_k_backup_without_a_recipient_fails_with_instructions(fake_docker: FakeDocker):
+    result = fake_docker.run("-k", "--backup")
+    assert result.returncode != 0 and "age" in result.stdout
+    assert not fake_docker.compose_calls
+
+
+def test_k_restore_streams_the_identity_from_stdin_and_never_writes_it(fake_docker: FakeDocker, tmp_path):
+    archive = tmp_path / "rpc_keys.tar.age"
+    archive.write_bytes(b"ciphertext")
+    result = fake_docker.run("-k", "--restore", str(archive), stdin="AGE-SECRET-KEY-TEST\n")
+
+    assert result.returncode == 0, result.stdout
+    assert "AGE-SECRET-KEY-TEST" not in result.stdout + result.completed.stderr
+    call = fake_docker.compose_calls[-1]
+    assert "AGE-SECRET-KEY-TEST" not in " ".join(call)
+    assert "-T" in call and call[-1] == "--identity-stdin"
+    assert not [p for p in tmp_path.rglob("*") if p.is_file() and b"AGE-SECRET" in p.read_bytes()
+                and p != fake_docker.log_path]
+
+
+def test_k_restore_with_an_identity_file_deletes_it_only_when_asked(fake_docker: FakeDocker, tmp_path):
+    archive = tmp_path / "rpc_keys.tar.age"
+    archive.write_bytes(b"ciphertext")
+    identity = tmp_path / "identity.txt"
+    identity.write_text("AGE-SECRET-KEY-TEST")
+    assert fake_docker.run("-k", "--restore", str(archive), "--identity-file", str(identity)).returncode == 0
+    assert identity.exists()
+    assert fake_docker.run("-k", "--restore", str(archive), "--identity-file", str(identity),
+                           "--delete-identity-file").returncode == 0
+    assert not identity.exists()
+
+
+def test_db_backup_helper_excludes_the_rpc_key_directory(tmp_path):
+    from trader.data.db_backup import run_backup
+
+    data_dir = tmp_path / "data"
+    data_dir.mkdir()
+    (data_dir / "mmr.duckdb").write_bytes(b"db")
+    backup_dir = tmp_path / "backups"
+    rpc_backups = backup_dir / "rpc_keys"
+    rpc_backups.mkdir(parents=True)
+    (rpc_backups / "rpc_keys_20261006T000000Z.tar.age").write_bytes(b"x")
+    write_keyset(tmp_path / "config/keys/rpc")
+
+    for _ in range(3):
+        run_backup(data_dir, backup_dir, keep=1)
+    assert not list(backup_dir.rglob("*.key")) and not list(backup_dir.rglob("*.pub"))
+    assert (rpc_backups / "rpc_keys_20261006T000000Z.tar.age").exists()
 
 
 def test_backup_uses_scheduler_when_running(fake_docker: FakeDocker):
@@ -228,3 +387,81 @@ def test_backup_fallback_uses_compose_project_volume(fake_docker: FakeDocker):
     assert "-v mmr_mmr_db_data:/src:ro" in result.log
     # Must not target the stale unprefixed sibling volume.
     assert "-v mmr_db_data:/src:ro" not in result.log
+
+
+# --- PR #50 round 1, finding 4: isolated, mount-only cutover gate ---
+
+KEYCHECK_SERVICES = {"trader", "strategy", "dashboard", "cli", "scheduler", "data"}
+
+
+def _compose_lines(fake_docker: FakeDocker) -> list[list[str]]:
+    log = fake_docker.log_path.read_text() if fake_docker.log_path.exists() else ""
+    return [shlex.split(line) for line in log.splitlines() if line.startswith("compose ")]
+
+
+def test_keycheck_covers_every_classified_service():
+    from trader.messaging.principals import SERVICE_PRINCIPAL
+    assert KEYCHECK_SERVICES == set(SERVICE_PRINCIPAL)
+
+
+def test_K_runs_the_mount_check_in_an_isolated_project_with_the_test_override(fake_docker: FakeDocker):
+    fake_docker.write_keys()
+    result = fake_docker.run("-K")
+
+    assert result.returncode == 0, result.stdout + result.completed.stderr
+    calls = _compose_lines(fake_docker)
+    assert calls
+    prefix = ["compose", "-p", "mmr-keycheck",
+              "-f", str(REPO_ROOT / "docker-compose.yml"),
+              "-f", str(REPO_ROOT / "docker-compose.test.override.yml")]
+    for call in calls:
+        assert call[:7] == prefix, call
+        assert "up" not in call and "--profile" not in call and "fullstack-tests" not in call
+        assert "-v" not in call and "--volumes" not in call
+    runs = [c[7:] for c in calls if c[7] == "run"]
+    checked = set()
+    for run in runs:
+        assert run[:6] == ["run", "--rm", "--no-deps", "-T", "--entrypoint", "python"], run
+        service = run[6]
+        assert run[7:] == ["-m", "trader.messaging.keys_cli", "check-mount", service]
+        checked.add(service)
+    assert checked == KEYCHECK_SERVICES
+    assert calls[-1][7:] == ["down", "--remove-orphans"]
+    assert "mmr-keycheck" in result.stdout and "passed" in result.stdout
+
+
+def test_K_with_a_missing_key_makes_no_compose_call(fake_docker: FakeDocker):
+    fake_docker.write_keys()
+    (fake_docker.rpc_dir / "trader.pub").unlink()
+    result = fake_docker.run("-K")
+    assert result.returncode != 0 and "trader.pub" in result.stdout
+    assert not _compose_lines(fake_docker)
+
+
+def test_K_fails_and_names_the_service_whose_mounts_are_wrong(fake_docker: FakeDocker):
+    fake_docker.write_keys()
+    result = fake_docker.run("-K", env={"MMR_FAKE_KEYCHECK_FAIL": "strategy"})
+    assert result.returncode != 0
+    assert "strategy" in result.stdout
+    assert _compose_lines(fake_docker)[-1][7:] == ["down", "--remove-orphans"]
+
+
+def test_runbook_names_the_isolated_key_check_as_the_cutover_gate():
+    text = (REPO_ROOT / "docs/OPERATIONAL_STATE.md").read_text()
+    assert "./docker.sh -K" in text
+    assert "docker compose --profile test run fullstack-tests" not in text
+
+
+# --- PR #50 round 2: -K never runs together with another action ---
+
+@pytest.mark.parametrize("args", [
+    ("-K", "-d"), ("-d", "-K"), ("-K", "-u"), ("-K", "-b"), ("-K", "-g"), ("-K", "-c"),
+    ("-K", "-f"), ("-K", "-k"), ("-K", "-B"), ("-K", "-r"), ("-K", "-i"), ("-K", "-e"),
+    ("-K", "-l"), ("-K", "-n"), ("-K", "-s"), ("-K", "-a"),
+])
+def test_K_combined_with_any_other_action_refuses_before_any_docker_call(fake_docker: FakeDocker, args):
+    fake_docker.write_keys()
+    result = fake_docker.run(*args)
+    assert result.returncode != 0
+    assert "-K" in result.stdout
+    assert not fake_docker.log_path.exists() or fake_docker.log_path.read_text() == ""

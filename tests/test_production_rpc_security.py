@@ -8,7 +8,7 @@ details called out in the outer task instructions:
   "query", since the production registry must never expose them at all)
 - ``validate_rpc_mode`` fails closed for every combination, not just the one
   verbatim case (both "safe" combinations must NOT raise)
-- ``build_production_registry`` type-checks its ``authenticator`` argument
+- ``build_production_registry`` type-checks its ``identity`` argument
 - the production registry actually carries the intended health/read methods
   (a registry with zero legacy methods AND zero real methods would trivially
   pass the negative tests without being useful)
@@ -32,13 +32,16 @@ import time
 from collections import namedtuple
 
 import pytest
+
+from tests.rpc_identity_fixtures import ALLOW_ALL, make_identities
 import zmq
 
 from trader.messaging.legacy_offline_api import LegacyOfflineTraderServiceApi
-from trader.messaging.production_api import build_production_registry, validate_rpc_mode
+import dataclasses
+
+from trader.messaging.production_api import BrokerPosture, build_production_registry, validate_rpc_mode
 from trader.messaging.trader_service_api import TraderServiceApi
 from trader.messaging.typed_rpc import (
-    HmacServiceAuthenticator,
     TypedRpcClient,
     TypedRpcRegistry,
     TypedRpcRemoteError,
@@ -47,7 +50,6 @@ from trader.messaging.typed_rpc import (
 from trader.trading.risk_gate import RiskLimits
 
 
-HMAC_KEY = b"k" * 32
 
 BYPASS_METHODS = [
     "place_order_simple",
@@ -104,8 +106,13 @@ class _FakeTrader:
 
 
 @pytest.fixture()
-def authenticator() -> HmacServiceAuthenticator:
-    return HmacServiceAuthenticator(HMAC_KEY, now=lambda: 1_700_000_000.0)
+def identities():
+    return make_identities()
+
+
+@pytest.fixture
+def authenticator(identities):
+    return identities["trader"]
 
 
 @pytest.fixture()
@@ -122,9 +129,13 @@ def test_production_registry_has_no_legacy_mutation(method, production_registry)
     assert not production_registry.contains("command", method)
 
 
+PAPER = BrokerPosture(trading_mode="paper", paper_trading=True, ib_account="DU1234567",
+                      ib_server_port=7497, ib_paper_port=7497, ib_live_port=7496)
+
+
 def test_unsafe_legacy_rpc_requires_simulation():
     with pytest.raises(ValueError, match="offline simulation"):
-        validate_rpc_mode(simulation=False, unsafe_legacy_rpc=True)
+        validate_rpc_mode(simulation=False, unsafe_legacy_rpc=True, posture=PAPER)
 
 
 # ---------------------------------------------------------------------------
@@ -134,18 +145,62 @@ def test_unsafe_legacy_rpc_requires_simulation():
 class TestValidateRpcMode:
     def test_unsafe_without_simulation_raises(self):
         with pytest.raises(ValueError, match="offline simulation"):
-            validate_rpc_mode(simulation=False, unsafe_legacy_rpc=True)
+            validate_rpc_mode(simulation=False, unsafe_legacy_rpc=True, posture=PAPER)
 
-    def test_unsafe_with_simulation_is_allowed(self):
-        validate_rpc_mode(simulation=True, unsafe_legacy_rpc=True)  # must not raise
+    def test_unsafe_with_simulation_on_a_consistent_paper_posture_is_allowed(self):
+        validate_rpc_mode(simulation=True, unsafe_legacy_rpc=True, posture=PAPER)  # must not raise
+
+    @pytest.mark.parametrize("change", [
+        {"trading_mode": "live"},
+        {"paper_trading": False},
+        {"ib_account": "U7654321"},
+        {"ib_account": ""},
+        {"ib_account": None},
+        {"ib_server_port": 7496},
+        {"ib_paper_port": 7496},
+        {"ib_paper_port": 7496, "ib_live_port": 7496, "ib_server_port": 7496},
+        # PR #50 round 3 reproduction: env PAPER_TRADING + DU account over a live YAML.
+        {"trading_mode": "live", "ib_server_port": 7496},
+    ], ids=lambda c: ",".join(f"{k}={v}" for k, v in c.items()))
+    def test_any_disagreement_in_the_broker_posture_raises(self, change):
+        with pytest.raises(ValueError, match="paper"):
+            validate_rpc_mode(simulation=True, unsafe_legacy_rpc=True,
+                              posture=dataclasses.replace(PAPER, **change))
+
+    def test_error_names_every_conflicting_value(self):
+        posture = dataclasses.replace(PAPER, trading_mode="live", ib_server_port=7496)
+        with pytest.raises(ValueError) as raised:
+            validate_rpc_mode(simulation=True, unsafe_legacy_rpc=True, posture=posture)
+        assert "trading_mode='live'" in str(raised.value) and "ib_server_port=7496" in str(raised.value)
+
+    def test_paper_posture_is_mandatory_for_every_caller(self):
+        with pytest.raises(TypeError):
+            validate_rpc_mode(simulation=True, unsafe_legacy_rpc=True)  # type: ignore[call-arg]
+
+    def test_trader_passes_its_effective_broker_posture_to_the_gate(self):
+        import inspect
+
+        from trader.trading.trading_runtime import Trader
+        assert "posture=self.broker_posture()" in inspect.getsource(Trader.connect)
+
+    def test_trader_posture_is_the_ib_connection_it_uses(self, tmp_path):
+        from trader.trading.trading_runtime import Trader
+        trader = Trader.__new__(Trader)
+        trader.trading_mode, trader.paper_trading, trader.ib_account = "paper", True, "DU1"
+        trader.ib_server_port, trader.ib_paper_port, trader.ib_live_port = 7496, 7497, 7496
+        posture = trader.broker_posture()
+        assert posture.ib_server_port == 7496
+        with pytest.raises(ValueError, match="paper"):
+            validate_rpc_mode(simulation=True, unsafe_legacy_rpc=True, posture=posture)
 
     def test_safe_without_simulation_is_allowed(self):
-        validate_rpc_mode(simulation=False, unsafe_legacy_rpc=False)  # must not raise
+        validate_rpc_mode(simulation=False, unsafe_legacy_rpc=False,
+                          posture=dataclasses.replace(PAPER, trading_mode="live"))  # must not raise
 
     def test_safe_with_simulation_is_allowed(self):
         """simulation=True alone (without the explicit unsafe flag) must NOT
         grant the legacy RPC -- the caller must opt in to BOTH."""
-        validate_rpc_mode(simulation=True, unsafe_legacy_rpc=False)  # must not raise
+        validate_rpc_mode(simulation=True, unsafe_legacy_rpc=False, posture=PAPER)  # must not raise
 
 
 # ---------------------------------------------------------------------------
@@ -168,12 +223,14 @@ def test_production_registry_resolve_is_none_for_bypass_methods(method, producti
 
 
 # ---------------------------------------------------------------------------
-# build_production_registry type-checks its authenticator argument
+# build_production_registry type-checks its identity argument
 # ---------------------------------------------------------------------------
 
-def test_build_production_registry_rejects_non_authenticator():
-    with pytest.raises(TypeError, match="HmacServiceAuthenticator"):
-        build_production_registry(_FakeTrader(), authenticator="not-a-real-authenticator")
+def test_build_production_registry_rejects_a_non_trader_identity(identities):
+    with pytest.raises(TypeError, match="trader ServiceIdentity"):
+        build_production_registry(_FakeTrader(), "not-an-identity")
+    with pytest.raises(TypeError, match="trader ServiceIdentity"):
+        build_production_registry(_FakeTrader(), identities["strategy"])
 
 
 # ---------------------------------------------------------------------------
@@ -287,12 +344,12 @@ class TestApiClassSplit:
 # ---------------------------------------------------------------------------
 
 class TestProductionRegistryOverRealTransport:
-    def test_query_client_can_call_get_status_and_command_socket_has_nothing(self, authenticator):
+    def test_query_client_can_call_get_status_and_command_socket_has_nothing(self, authenticator, identities):
         query_port = _free_port()
         command_port = _free_port()
 
         registry = build_production_registry(_FakeTrader(), authenticator)
-        empty_command_registry = TypedRpcRegistry()  # mirrors connect(): [M1-F3] fills this in later
+        empty_command_registry = TypedRpcRegistry(acl=ALLOW_ALL)  # mirrors connect(): [M1-F3] fills this in later
 
         query_server = TypedRpcServer("query", registry, authenticator, port=query_port)
         command_server = TypedRpcServer("command", empty_command_registry, authenticator, port=command_port)
@@ -315,9 +372,9 @@ class TestProductionRegistryOverRealTransport:
         assert loop_ready.wait(timeout=5), "typed servers did not start in time"
         time.sleep(0.1)  # let the bind settle
 
-        query_client = TypedRpcClient("query", authenticator, port=query_port, timeout=3)
+        query_client = TypedRpcClient("query", identities["cli"], server="trader", port=query_port, timeout=3)
         query_client.connect()
-        command_client = TypedRpcClient("command", authenticator, port=command_port, timeout=3)
+        command_client = TypedRpcClient("command", identities["cli"], server="trader", port=command_port, timeout=3)
         command_client.connect()
 
         try:

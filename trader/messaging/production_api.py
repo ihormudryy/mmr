@@ -2,7 +2,7 @@
 exposes (G0 Task 4).
 
 Tasks 2/3 built the authenticated typed transport (``TypedRpcRegistry``,
-``TypedRpcServer``, ``HmacServiceAuthenticator``) but nothing had registered
+``TypedRpcServer``, ``ServiceIdentity``) but nothing had registered
 any methods on it yet. Its legacy sibling — the dill/msgpack ``RPCServer``
 in ``clientserver.py`` serving ``trader_service_api.TraderServiceApi`` (and,
 before this task, its direct-order methods) — is a production
@@ -84,7 +84,8 @@ import dataclasses
 import datetime as dt
 import logging
 import os
-from dataclasses import asdict
+import re
+from dataclasses import asdict, dataclass
 from decimal import Decimal
 from typing import TYPE_CHECKING, Annotated, Any, Dict, Literal, Optional
 
@@ -102,9 +103,11 @@ from trader.messaging.strategy_trader_contracts import (
     ResolveInstrumentResponse,
 )
 from trader.messaging.manage_surface import register_manage_surface
+from trader.messaging.principals import TRADER_ACL, is_valid_principal_name
 from trader.messaging.trader_service_api import TraderServiceApi
 from trader.messaging.typed_rpc import (
-    HmacServiceAuthenticator,
+    ServiceIdentity,
+    RpcCaller,
     TypedRpcClient,
     TypedRpcRegistry,
     TypedRpcRemoteError,
@@ -136,23 +139,59 @@ from trader.trading.trading_control import (
 )
 
 
-def validate_rpc_mode(simulation: bool, unsafe_legacy_rpc: bool) -> None:
-    """Fail closed: refuse ``unsafe_legacy_rpc`` outside offline simulation.
+@dataclass(frozen=True)
+class BrokerPosture:
+    """The effective broker settings a service actually connects with."""
 
-    This is the single choke point that makes "legacy dill/object RPC in
-    production" structurally impossible: ``Trader.connect()`` calls this
-    unconditionally, before it ever considers starting the legacy
-    ``RPCServer``, so there is no flag combination that reaches
-    ``LegacyOfflineTraderServiceApi`` unless BOTH ``simulation`` and
-    ``unsafe_legacy_rpc`` are explicitly ``True``. ``simulation=True`` alone
-    is not enough (an offline backtest/dry-run shouldn't silently get the
-    dill-capable RPC either) — the caller must opt in explicitly.
+    trading_mode: str
+    paper_trading: bool
+    ib_account: Optional[str]
+    ib_server_port: int
+    ib_paper_port: int
+    ib_live_port: int
+
+    def paper_conflicts(self) -> list[str]:
+        """Every value that does not agree with an offline paper posture (empty: all agree)."""
+        conflicts = []
+        if self.trading_mode != 'paper':
+            conflicts.append(f'trading_mode={self.trading_mode!r}')
+        if not self.paper_trading:
+            conflicts.append(f'paper_trading={self.paper_trading}')
+        if not str(self.ib_account or '').startswith('D'):
+            conflicts.append(f'ib_account={self.ib_account!r}')
+        if self.ib_paper_port == self.ib_live_port:
+            conflicts.append(f'ib_paper_port={self.ib_paper_port} equals ib_live_port')
+        if self.ib_server_port != self.ib_paper_port:
+            conflicts.append(f'ib_server_port={self.ib_server_port} (paper port is {self.ib_paper_port})')
+        return conflicts
+
+
+def validate_rpc_mode(simulation: bool, unsafe_legacy_rpc: bool, *, posture: BrokerPosture) -> None:
+    """Fail closed: refuse ``unsafe_legacy_rpc`` outside offline paper simulation.
+
+    The single choke point for the legacy dill/msgpack RPC (trader 42001,
+    strategy 42005). ``Trader.connect()`` and ``StrategyRuntime.connect()``
+    call it before any socket is built. Every flag can come from YAML, env or
+    the CLI, so none of them proves an offline posture alone: trading mode,
+    paper flag, ``D`` account and the IB port the service really connects to
+    must all say paper. A disagreement is itself a config bug and is refused.
+    ``simulation=True`` alone never grants the legacy RPC either.
     """
-    if unsafe_legacy_rpc and not simulation:
+    if not unsafe_legacy_rpc:
+        return
+    if not simulation:
         raise ValueError(
             'unsafe_legacy_rpc=True requires simulation=True (offline simulation '
             'only) -- the dill-capable legacy RPC path must never run against a '
-            'live/production trader_service.'
+            'live/production service.'
+        )
+    conflicts = posture.paper_conflicts()
+    if conflicts:
+        raise ValueError(
+            'unsafe_legacy_rpc=True requires a consistent paper broker posture '
+            '(trading_mode paper, paper_trading, a D-prefixed account and the paper IB port); '
+            f'these disagree: {", ".join(conflicts)}. The legacy RPC has no authentication '
+            'and must never run where it could reach a live account.'
         )
 
 
@@ -515,8 +554,9 @@ class CreateProposalRequest(BaseModel):
     max_price_drift_bps: Optional[float] = None
     preflight_nonce: Optional[str] = None
     # Signal→proposal bridge fields (trader/strategy/signal_proposer.py).
-    # ``source`` attributes the proposal to its origin ("strategy:<name>");
-    # empty means the dashboard. The time-based exit trio round-trips onto
+    # ``source`` is an attribution LABEL only ("strategy:<name>" from the
+    # strategy principal); it is checked against the authenticated principal
+    # by ``attribution_label`` and empty becomes the principal's name. The time-based exit trio round-trips onto
     # the proposal record's metadata so ``check_exits`` can recover an
     # executed entry's exit rules via ``list_proposals``. Before these were
     # declared, extra="forbid" REJECTED every bridge proposal at the wire —
@@ -637,10 +677,10 @@ class ApproveProposalRequest(BaseModel):
     The account is the coordinator's own configured account, never
     request-supplied (there is no ``account_id`` field).
 
-    ``source`` identifies the actor (``dashboard`` / ``sdk`` / ``cli`` /
-    ``llm``). On live, non-dashboard sources are refused
+    The actor is the authenticated RPC principal, never a body field. On
+    live, any principal other than ``dashboard`` is refused
     (``LLM_LIVE_APPROVE_FORBIDDEN``); on paper the LLM/SDK may approve after
-    evaluation. Default ``dashboard`` preserves the web gateway contract.
+    evaluation.
     """
 
     model_config = ConfigDict(extra="forbid")
@@ -650,7 +690,6 @@ class ApproveProposalRequest(BaseModel):
     expected_version: int
     preflight_nonce: Optional[str] = None
     session_fingerprint: Optional[str] = None
-    source: str = "dashboard"
 
     @field_validator("command_id")
     @classmethod
@@ -1058,17 +1097,36 @@ def _reject_proposal_action(proposal_service: ProposalCommandService):
     return _action
 
 
+_STRATEGY_LABEL = re.compile(r"strategy:[A-Za-z0-9_.-]+")
+
+
+def attribution_label(principal: str, label: str) -> str:
+    """Check a body attribution label against the authenticated principal.
+
+    The strategy principal must label proposals ``strategy:<name>`` (what
+    ``check_exits`` filters on); nobody else may use a ``strategy:`` label.
+    An empty label becomes the principal's name.
+    """
+    label = (label or "").strip()
+    if principal == "strategy":
+        if not _STRATEGY_LABEL.fullmatch(label):
+            raise _DispatchProblem(
+                "PERMISSION_DENIED", "strategy proposals must be labelled strategy:<name>")
+        return label
+    if label.startswith("strategy:"):
+        raise _DispatchProblem(
+            "PERMISSION_DENIED", "only the strategy principal may use a strategy: label")
+    return label or principal
+
+
 def _create_proposal_rpc_handler(coordinator: TradingCommandCoordinator, account_id: Optional[str]):
-    def _handler(parsed: CreateProposalRequest) -> Dict[str, Any]:
-        payload = parsed.model_dump(exclude={"command_id", "preflight_nonce"})
-        # Attribute the command to its declared origin (the signal→proposal
-        # bridge sends "strategy:<name>") so the proposal record's source —
-        # which check_exits filters on — survives the round trip. Absent or
-        # empty means the dashboard, the previous hard-coded value.
+    def _handler(parsed: CreateProposalRequest, caller: RpcCaller) -> Dict[str, Any]:
+        label = attribution_label(caller.principal, parsed.source)
+        payload = {**parsed.model_dump(exclude={"command_id", "preflight_nonce"}), "source": label}
         request = CommandRequest(
             command_id=parsed.command_id, action="create_proposal", account_id=account_id,
             target_type="proposal", target_id="", expected_version=None,
-            body=payload, source=parsed.source or "dashboard",
+            body=payload, source=label, principal=caller.principal,
             preflight_nonce=parsed.preflight_nonce,
         )
         receipt = coordinator.execute(request)
@@ -1096,13 +1154,13 @@ def _approve_proposal_rpc_handler(coordinator: TradingCommandCoordinator, accoun
     so ``unresolved_for_target`` can enforce the one-live-command-per-proposal
     rule (``COMMAND_IN_FLIGHT``); ``expected_version`` rides the envelope so
     the atomic claim can reject a stale approval race-safely."""
-    def _handler(parsed: ApproveProposalRequest) -> Dict[str, Any]:
+    def _handler(parsed: ApproveProposalRequest, caller: RpcCaller) -> Dict[str, Any]:
         request = CommandRequest(
             command_id=parsed.command_id, action="approve_proposal", account_id=account_id,
             target_type="proposal", target_id=str(parsed.proposal_id),
             expected_version=parsed.expected_version,
             body={"proposal_id": parsed.proposal_id},
-            source=(parsed.source or "dashboard").strip() or "dashboard",
+            source=caller.principal, principal=caller.principal,
             preflight_nonce=parsed.preflight_nonce,
             session_fingerprint=parsed.session_fingerprint,
         )
@@ -1114,9 +1172,9 @@ def _approve_proposal_rpc_handler(coordinator: TradingCommandCoordinator, accoun
 def _execute_automated_intent_rpc_handler(
     coordinator: TradingCommandCoordinator, account_id: Optional[str],
 ):
-    """[P3 Task 3] Strategy-service principal only — never ``source=dashboard``."""
+    """[P3 Task 3] Strategy principal only; source and principal come from the key."""
 
-    def _handler(parsed: ExecuteAutomatedIntentRequest) -> Dict[str, Any]:
+    def _handler(parsed: ExecuteAutomatedIntentRequest, caller: RpcCaller) -> Dict[str, Any]:
         # JSON mode keeps ledger/audit persistence free of datetime objects.
         body = parsed.model_dump(mode="json")
         request = CommandRequest(
@@ -1127,7 +1185,8 @@ def _execute_automated_intent_rpc_handler(
             target_id=parsed.intent_id,
             expected_version=None,
             body=body,
-            source="strategy_service",
+            source=caller.principal,
+            principal=caller.principal,
         )
         receipt = coordinator.execute(request)
         return _receipt_to_dict(receipt)
@@ -1183,7 +1242,7 @@ def _strategy_control_rpc_handler(
     ``expected_control_revision``, ``target_type="strategy"``) and drives it
     through the coordinator, which dispatches to
     ``StrategyControlCommandService``'s forwarding saga."""
-    def _handler(parsed) -> Dict[str, Any]:
+    def _handler(parsed, caller: RpcCaller) -> Dict[str, Any]:
         body: Dict[str, Any] = {"strategy_name": parsed.strategy_name}
         if action == "update_strategy_params":
             body["params"] = parsed.params
@@ -1191,7 +1250,7 @@ def _strategy_control_rpc_handler(
             command_id=parsed.command_id, action=action, account_id=account_id,
             target_type="strategy", target_id=parsed.strategy_name,
             expected_version=parsed.expected_control_revision,
-            body=body, source="dashboard",
+            body=body, source="dashboard", principal=caller.principal,
         )
         receipt = coordinator.execute(request)
         return _receipt_to_dict(receipt)
@@ -1827,7 +1886,7 @@ def register_command_authority(
 
     registry.register(
         "command", "create_proposal", CreateProposalRequest, dict,
-        _create_proposal_rpc_handler(coordinator, account_id),
+        _create_proposal_rpc_handler(coordinator, account_id), with_caller=True,
     )
     registry.register(
         "command", "reject_proposal", RejectProposalRequest, dict,
@@ -1894,7 +1953,7 @@ def register_command_authority(
         )
         registry.register(
             "command", "approve_proposal", ApproveProposalRequest, dict,
-            _approve_proposal_rpc_handler(coordinator, account_id),
+            _approve_proposal_rpc_handler(coordinator, account_id), with_caller=True,
         )
 
     if cancel_service is not None:
@@ -1929,14 +1988,17 @@ def register_command_authority(
         registry.register(
             "command", "enable_strategy", EnableStrategyRequest, dict,
             _strategy_control_rpc_handler(coordinator, account_id, "enable_strategy"),
+            with_caller=True,
         )
         registry.register(
             "command", "disable_strategy", DisableStrategyRequest, dict,
             _strategy_control_rpc_handler(coordinator, account_id, "disable_strategy"),
+            with_caller=True,
         )
         registry.register(
             "command", "update_strategy_params", UpdateStrategyParamsRequest, dict,
             _strategy_control_rpc_handler(coordinator, account_id, "update_strategy_params"),
+            with_caller=True,
         )
         registry.register(
             "command", "record_state_acknowledged", RecordStateAcknowledgedRequest, dict,
@@ -2007,7 +2069,7 @@ def register_command_authority(
         )
         registry.register(
             "command", "execute_automated_intent", ExecuteAutomatedIntentRequest, dict,
-            _execute_automated_intent_rpc_handler(coordinator, account_id),
+            _execute_automated_intent_rpc_handler(coordinator, account_id), with_caller=True,
         )
 
 
@@ -2020,6 +2082,16 @@ def _dict_to_strategy_receipt(data: Dict[str, Any]) -> StrategyCommandReceipt:
         observable_state=data.get("observable_state"),
         observable_payload=data.get("observable_payload"),
     )
+
+
+def _forwarded_on_behalf_of(request: CommandRequest) -> Optional[str]:
+    """The authenticated original caller, for the strategy service's log only.
+
+    A ``source`` label such as ``dashboard`` or ``operator`` is never
+    forwarded; only the verified ``principal`` is.
+    """
+    principal = getattr(request, "principal", None)
+    return principal if is_valid_principal_name(principal) else None
 
 
 class TypedStrategyControlPort:
@@ -2049,7 +2121,9 @@ class TypedStrategyControlPort:
         }
         if request.action == "update_strategy_params":
             body["params"] = request.body.get("params") or {}
-        response = self._command_client.call(request.action, body, dict)
+        # Signed as `trader`; the original caller rides along for the log only.
+        response = self._command_client.call(
+            request.action, body, dict, on_behalf_of=_forwarded_on_behalf_of(request))
         return _dict_to_strategy_receipt(response)
 
     def get_receipt(self, command_id: str) -> Optional[StrategyCommandReceipt]:
@@ -2066,7 +2140,7 @@ class TypedStrategyControlPort:
 
 def build_production_registry(
     trader,
-    authenticator: HmacServiceAuthenticator,
+    identity: ServiceIdentity,
     *,
     snapshot_service: Optional[DomainSnapshotService] = None,
     feed_service: Optional[DomainFeedService] = None,
@@ -2081,14 +2155,11 @@ def build_production_registry(
 ) -> TypedRpcRegistry:
     """Build the typed-RPC registry a production ``trader_service`` serves.
 
-    ``authenticator`` isn't consulted by the handlers below (the typed
-    transport already authenticates every request before a handler ever
-    runs) — it's required here, and type-checked, so a caller can't
-    accidentally wire this up with something that isn't a real
-    ``HmacServiceAuthenticator`` and only discover it once the first request
-    fails to verify. It also keeps this function's signature stable for
-    ``[M1-F3]``, which will need the authenticator when it adds
-    coordinator-authorized command methods.
+    ``identity`` isn't consulted by the handlers below (the typed transport
+    already authenticates every request before a handler ever runs) — it's
+    required here, and type-checked, so a caller can't wire this up with
+    anything but the trader's own ``ServiceIdentity`` and only discover it
+    once the first request fails to verify.
 
     Registers ``query``-role health/read methods, plus (opt-in, see module
     docstring's "[M1-F1] Task 5 addition") ``snapshot_with_cursor`` on
@@ -2128,15 +2199,15 @@ def build_production_registry(
     ``update_strategy_params`` / ``record_state_acknowledged``). Omitted,
     the default, changes nothing.
     """
-    if not isinstance(authenticator, HmacServiceAuthenticator):
+    if not isinstance(identity, ServiceIdentity) or identity.principal != "trader":
         raise TypeError(
-            f'authenticator must be an HmacServiceAuthenticator, got {type(authenticator).__name__}'
+            f'identity must be the trader ServiceIdentity, got {identity!r}'
         )
 
     # Every production handler may touch DuckDB, IB state, or another service.
     # Keep that work off the ROUTER event loop by default; isolated registries
     # elsewhere retain TypedRpcRegistry's inline default.
-    registry = TypedRpcRegistry(default_execution="thread")
+    registry = TypedRpcRegistry(acl=TRADER_ACL, default_execution="thread")
     api = TraderServiceApi(trader)
 
     # Health: service connectivity (IB, storage, upstream) — the same dict

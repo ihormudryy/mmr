@@ -108,7 +108,6 @@ class TestMMRConfig:
         assert config.typed_rpc.query_port == 42101
         assert config.typed_rpc.command_port == 42102
         assert config.typed_rpc.feed_port == 42103
-        assert config.typed_rpc.service_hmac_key_file == ''
         # Safe loopback default -- Compose's `trader` overrides to 0.0.0.0.
         assert config.typed_rpc.address == 'tcp://127.0.0.1'
         assert config.unsafe_legacy_rpc is False
@@ -120,14 +119,12 @@ class TestMMRConfig:
             "typed_query_port: 51101\n"
             "typed_command_port: 51102\n"
             "typed_feed_port: 51103\n"
-            "service_hmac_key_file: /run/secrets/service_hmac.key\n"
         )
         config = MMRConfig.from_yaml(str(cfg))
         assert config.typed_rpc.address == 'tcp://0.0.0.0'
         assert config.typed_rpc.query_port == 51101
         assert config.typed_rpc.command_port == 51102
         assert config.typed_rpc.feed_port == 51103
-        assert config.typed_rpc.service_hmac_key_file == '/run/secrets/service_hmac.key'
 
     def test_typed_bind_address_env_override(self, test_config_file, monkeypatch):
         # G0 Task 5: the Compose `trader` service sets TYPED_BIND_ADDRESS so
@@ -256,3 +253,38 @@ class TestEmptyEnvProviderKeys:
         config = MMRConfig.from_yaml(str(cfg))
         assert config.alpaca.api_key_id == 'env-id'
         assert config.alpaca.secret_key == 'env-secret'
+
+
+class TestRetiredHmacConfig:
+    def test_retired_service_hmac_key_file_is_ignored_with_a_warning(self, tmp_path, caplog, monkeypatch):
+        import logging
+        from trader.config import MMRConfig
+        monkeypatch.delenv("MMR_SERVICE_HMAC_KEY_FILE", raising=False)
+        cfg = tmp_path / "cfg.yaml"
+        cfg.write_text("service_hmac_key_file: /run/secrets/service_hmac.key\n")
+        with caplog.at_level(logging.WARNING, logger="trader.config"):
+            config = MMRConfig.from_yaml(str(cfg))
+        assert not hasattr(config.typed_rpc, "service_hmac_key_file")
+        warnings = [r for r in caplog.records if "retired" in r.getMessage()]
+        assert len(warnings) == 1 and "service_hmac_key_file" in warnings[0].getMessage()
+
+    def test_retired_hmac_env_var_is_ignored_with_a_warning(self, tmp_path, caplog, monkeypatch):
+        import logging
+        from trader.config import MMRConfig
+        monkeypatch.setenv("MMR_SERVICE_HMAC_KEY_FILE", "/x/service_hmac.key")
+        cfg = tmp_path / "cfg.yaml"
+        cfg.write_text("typed_query_port: 42101\n")
+        with caplog.at_level(logging.WARNING, logger="trader.config"):
+            MMRConfig.from_yaml(str(cfg))
+        assert any("MMR_SERVICE_HMAC_KEY_FILE" in r.getMessage() and "retired" in r.getMessage()
+                   for r in caplog.records)
+
+    def test_no_warning_without_leftovers(self, tmp_path, caplog, monkeypatch):
+        import logging
+        from trader.config import MMRConfig
+        monkeypatch.delenv("MMR_SERVICE_HMAC_KEY_FILE", raising=False)
+        cfg = tmp_path / "cfg.yaml"
+        cfg.write_text("typed_query_port: 42101\n")
+        with caplog.at_level(logging.WARNING, logger="trader.config"):
+            MMRConfig.from_yaml(str(cfg))
+        assert not [r for r in caplog.records if "retired" in r.getMessage()]

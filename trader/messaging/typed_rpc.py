@@ -1,92 +1,51 @@
-"""Canonical JSON authentication primitives for the typed RPC boundary (G0 Task 2).
+"""Typed RPC boundary: canonical JSON, Ed25519 service identities, transport.
 
-This module is the cryptographic core later typed-RPC tasks build on:
-
-- ``canonical_json`` / ``signing_bytes`` / ``_digest`` produce a deterministic
-  byte string for a request so the same logical request always hashes the
-  same way regardless of dict insertion order or client implementation.
-- ``HmacServiceAuthenticator`` signs and verifies ``TypedRpcRequest`` envelopes
-  with HMAC-SHA256, covering method, request id, timestamp, nonce, and body.
+- ``canonical_json`` / ``rpc_signing_bytes`` / ``response_signing_bytes`` give
+  a deterministic, domain-separated byte string for a request or response.
+- ``ServiceIdentity`` holds one principal's Ed25519 private key and the
+  keyring of its peers' public keys (``trader.messaging.rpc_keys``). It signs
+  requests (principal, destination server + role + method, payload) and
+  verifies them, and the servers sign their responses, which name the
+  request id and a digest of the raw request bytes. There is no HMAC mode
+  (spec 5.3, hard cutover).
 - ``ReplayNonceCache`` gives verified requests a short-lived, thread-safe
   "already used" registry so a captured-and-resent request is rejected.
-- ``decode_request`` is the strict, security-hardened JSON parse boundary for
-  *untrusted* wire bytes: it rejects duplicate object keys, non-finite
-  numeric literals (``NaN``/``Infinity``/``-Infinity``), oversized payloads,
-  and anything that doesn't shape-match ``TypedRpcRequest`` exactly (no
-  missing fields, no unknown fields).
+- ``decode_request`` is the strict JSON parse boundary for *untrusted* wire
+  bytes: it rejects duplicate object keys, non-finite numbers, oversized
+  payloads, and anything that doesn't shape-match ``TypedRpcRequest``
+  exactly. A legacy HMAC envelope (no ``principal``/``server``/``role``)
+  fails here, before any handler or nonce claim.
+- ``TypedRpcRegistry`` (the per-role method registry), ``TypedRpcServer``
+  (raw-JSON ROUTER socket) and ``TypedRpcClient`` (raw-JSON DEALER socket).
 
-Task 3 adds the dedicated typed ZeroMQ transport on top of these primitives:
-``TypedRpcRegistry`` (the per-role method allowlist), ``TypedRpcServer``
-(raw-JSON ROUTER socket), and ``TypedRpcClient`` (raw-JSON DEALER socket).
-See "Response signing" below for the one load-bearing design decision Task 3
-had to make explicitly rather than inherit silently from Task 2.
-
-Response signing (Task 3 decision, carried forward from Task 2's review):
-Task 2 left ``TypedRpcResponse``/``RpcProblem`` unsigned. Task 3 signs them.
-Requests are HMAC-signed because a client's AUTHORIZATION must be proven
-before a handler runs; responses carry no such authorization decision, so at
-first glance the threat model (these sockets bind on the private Compose
-network only, never host-published — see ``config_defaults/trader.yaml``)
-might seem to make response signing unnecessary: forging a reply requires an
-attacker already inside the private Docker network. But "private network"
-does not mean "single tenant" — the whole point of the private network is
-that several of *our own* containers (dashboard, coordinator, strategy,
-trader) share it, and a defense-in-depth posture assumes any one of them
-could be compromised without that compromise silently escalating into
-"can impersonate trader_service's replies to everyone else on the network".
-An attacker who popped the dashboard container, for instance, could otherwise
-inject a forged ``{"ok": true, "body": {...}}`` for a command it never
-issued, or spoof an ``EXECUTED`` result for a proposal that actually failed.
-Signing responses with the same already-built ``HmacServiceAuthenticator``
-closes that gap for the cost of one extra HMAC computation per response —
-not a large lift given the authenticator already exists — so ``sign_response``
-/ ``verify_response`` below are the chosen, documented posture (option (a)
-from the task brief), not option (b) ("trust the private transport").
-Unlike request signing, response signing does NOT need its own nonce/replay
-window: the client already discards any reply whose ``request_id`` doesn't
-match the call currently in flight (a transport-hygiene rule enforced by
-``TypedRpcClient.call`` independently of authentication), and ``request_id``
-is a fresh client-generated UUID per call, so a stale-but-validly-signed
-response for a *different* call can never be mistaken for the current one.
+Response signing: every reply is signed with the server's own private key
+and carries ``server`` and ``request_digest`` (sha256 of the raw request
+bytes). A client verifies it with the public key of the server it dialled
+(never one the reply names) and accepts only the reply to its own request,
+so a compromised container on the private network cannot forge or replay a
+server's answer. A reply to a request the server could not decode carries
+empty ``request_id``/``request_digest`` and is never accepted as anyone's.
 
 Security notes (see also AGENTS.md's "Design Principles"): a flaw here is a
 trading-authorization bypass, so every check below is deliberate:
 
-1. Duplicate JSON keys are rejected at parse time via ``object_pairs_hook`` --
-   ``json.loads`` silently keeps the *last* value for a repeated key, which
-   would let an attacker smuggle a second, differently-interpreted value
-   past naive validation.
-2. Non-finite numbers are rejected at parse time. Two paths produce them:
-   the literal tokens ``NaN``/``Infinity``/``-Infinity`` (rejected via
-   ``parse_constant``) AND ordinary numeric literals that *overflow* to
-   ``inf`` (e.g. ``1e999`` -> ``float('inf')``), which the default
-   ``parse_float`` (plain ``float``) silently accepts and which never reach
-   ``parse_constant`` -- rejected via a ``parse_float`` hook that checks
-   ``math.isfinite``. Python's ``json`` module accepts all of these on
-   *input* by default even though ``canonical_json`` refuses to *emit* them
-   (``allow_nan=False``), so the input side needs its own guard. If an
-   overflowing literal slipped through, ``verify()``'s call into
-   ``canonical_json`` would raise a bare ``ValueError`` ("Out of range float
-   ...") *outside* the AuthenticationError/ReplayError taxonomy -- an
-   unauthenticated-path exception (DoS / trace-leak surface once a transport
-   wraps handlers).
-3. Signature comparison uses ``hmac.compare_digest`` (constant-time), never
-   ``==``, to resist timing attacks.
-4. ``verify()`` claims the nonce dead last: skew check, then signature
-   check, then (only on success) the atomic nonce claim. A forged or
-   tampered request that fails skew/signature never burns a nonce, so it
-   can't be used to evict or exhaust legitimate replay-protection state.
-5. Clock skew is checked in both directions (too old and too far in the
-   future) and is at most 30 seconds; nonce entries expire after 60 seconds.
-   Both are injectable via the ``now`` callable for deterministic tests.
-6. Wire payloads larger than 1 MiB are rejected before JSON parsing is
-   attempted at all. The limit is envelope-level (the whole raw request,
-   not just the ``body`` sub-field), so the effective body ceiling is 1 MiB
-   minus envelope overhead -- the intended, stricter-and-safe choice, since
-   the actual DoS vector is the size of the bytes handed to ``json.loads``.
+1. Duplicate JSON keys are rejected at parse time via ``object_pairs_hook``.
+2. Non-finite numbers are rejected at parse time, both the literal tokens
+   ``NaN``/``Infinity`` (``parse_constant``) and literals that overflow to
+   ``inf`` such as ``1e999`` (``parse_float``), so ``canonical_json``
+   (``allow_nan=False``) never raises a bare ``ValueError`` on the
+   unauthenticated path.
+3. Signatures are Ed25519 verifications against a key chosen from the
+   keyring loaded at startup; no secret is compared and a request can never
+   supply or point to a key.
+4. ``verify_request`` claims the nonce dead last: skew, principal, signature,
+   destination and ``on_behalf_of`` checks first, so a forged, tampered or
+   misdirected request never burns a nonce.
+5. Clock skew is checked in both directions (at most 30 seconds); nonce
+   entries expire after 60 seconds. Both are injectable via ``now``.
+6. Wire payloads larger than 1 MiB are rejected before JSON parsing.
 7. All envelope models use ``extra="forbid"`` and have no defaults on
-   required fields, so missing or unexpected fields raise instead of being
-   silently ignored or null-filled.
+   required fields, so missing or unexpected fields raise.
 """
 
 from __future__ import annotations
@@ -98,18 +57,26 @@ import inspect
 import json
 import math
 import os
-import stat
 import threading
 import time
 import uuid
 from dataclasses import dataclass
-from typing import Any, Callable, Dict, FrozenSet, Literal, Optional
+from typing import Any, Callable, Dict, FrozenSet, Iterator, Literal, Mapping, Optional
 
 import zmq
 import zmq.asyncio
 from pydantic import BaseModel, ConfigDict, ValidationError
 
+from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
+
 from trader.common.logging_helper import setup_logging
+from trader.messaging.principals import (
+    SERVER_ACCEPTS,
+    SERVER_PRINCIPALS,
+    is_valid_principal_name,
+)
+from trader.messaging.rpc_keys import RpcKeyError, RpcKeyring, load_identity_material
+from trader.research.signing import BadSignature, public_key_id, sign_bytes, verify_bytes
 
 logging = setup_logging(module_name='trader.messaging.typed_rpc')
 
@@ -131,9 +98,10 @@ DEFAULT_CLOCK_SKEW_SECONDS = 30.0
 # forgotten while its request could still plausibly be re-verified.
 DEFAULT_NONCE_TTL_SECONDS = 60.0
 
-# Minimum HMAC key length, in bytes (256 bits) -- matches the SHA-256 output
-# size used for the digest itself.
-MIN_KEY_BYTES = 32
+# Domain separation: RPC signatures can never be confused with bundle
+# signatures (which sign other bytes) or with each other's direction.
+RPC_REQUEST_CONTEXT = b"mmr.typed-rpc.request.v2\x00"
+RPC_RESPONSE_CONTEXT = b"mmr.typed-rpc.response.v2\x00"
 
 
 # ---------------------------------------------------------------------------
@@ -155,18 +123,6 @@ class AuthenticationError(TypedRpcError):
 
 class ReplayError(TypedRpcError):
     """Raised when a request's nonce has already been claimed (replay attempt)."""
-
-
-class ServiceHmacKeyError(TypedRpcError):
-    """Raised when the service HMAC key file fails a production hardening check.
-
-    Covers all four ways ``load_service_hmac_key`` can refuse to start: the
-    path is unset/missing, the file's permission bits allow group/other
-    access, the file is empty, or the key material is shorter than
-    ``MIN_KEY_BYTES``. Deliberately a distinct type from
-    ``AuthenticationError`` -- this is a *startup configuration* failure
-    (fail loudly before binding any socket), not a per-request auth failure.
-    """
 
 
 class TypedRpcRemoteError(TypedRpcError):
@@ -204,6 +160,10 @@ class TypedRpcRequest(BaseModel):
     timestamp: float
     nonce: str
     body: Dict[str, Any]
+    principal: str
+    server: str
+    role: str
+    on_behalf_of: Optional[str]
     signature: str
 
 
@@ -215,13 +175,10 @@ class TypedRpcResponse(BaseModel):
     and vice versa. Task 3's transport layer enforces that pairing at the
     point it constructs responses.
 
-    ``signature`` is Task 3's addition (see the module docstring's "Response
-    signing" section for why): it is optional at the model level only so a
-    response can be constructed unsigned and then signed via
-    ``HmacServiceAuthenticator.sign_response`` in a second step (mirroring how
-    ``TypedRpcRequest.signature`` starts as ``""`` in ``sign()``) -- every
-    response that actually goes out over ``TypedRpcServer`` carries a real
-    signature, and ``TypedRpcClient`` refuses to trust one that doesn't.
+    ``signature`` is optional at the model level only so a response can be
+    built unsigned and then signed via ``ServiceIdentity.sign_response`` --
+    every response ``TypedRpcServer`` sends is signed, and
+    ``TypedRpcClient`` refuses one that isn't.
     """
 
     model_config = ConfigDict(extra="forbid")
@@ -230,6 +187,8 @@ class TypedRpcResponse(BaseModel):
     ok: bool
     body: Optional[Dict[str, Any]] = None
     problem: Optional["RpcProblem"] = None
+    server: str
+    request_digest: str
     signature: Optional[str] = None
 
 
@@ -260,37 +219,28 @@ def canonical_json(value: object) -> bytes:
     ).encode("utf-8")
 
 
-def signing_bytes(request: TypedRpcRequest) -> bytes:
-    return canonical_json({
-        "method": request.method,
-        "request_id": request.request_id,
-        "timestamp": request.timestamp,
-        "nonce": request.nonce,
-        "body": request.body,
+def rpc_signing_bytes(request: TypedRpcRequest) -> bytes:
+    """Bytes a request signature covers: caller, destination and payload."""
+    return RPC_REQUEST_CONTEXT + canonical_json({
+        "principal": request.principal, "on_behalf_of": request.on_behalf_of,
+        "server": request.server, "role": request.role, "method": request.method,
+        "request_id": request.request_id, "timestamp": request.timestamp,
+        "nonce": request.nonce, "body": request.body,
     })
 
 
-def _digest(key: bytes, request: TypedRpcRequest) -> str:
-    return hmac.new(key, signing_bytes(request), hashlib.sha256).hexdigest()
-
-
 def response_signing_bytes(response: TypedRpcResponse) -> bytes:
-    """Canonical bytes covered by a response signature (see module docstring).
-
-    Deliberately excludes ``signature`` itself (obviously) and needs no
-    timestamp/nonce -- see "Response signing" above for why request-id
-    correlation on the client is sufficient without a replay window here.
-    """
-    return canonical_json({
-        "request_id": response.request_id,
-        "ok": response.ok,
-        "body": response.body,
+    """Bytes a response signature covers, including the request it answers."""
+    return RPC_RESPONSE_CONTEXT + canonical_json({
+        "server": response.server, "request_id": response.request_id,
+        "request_digest": response.request_digest, "ok": response.ok, "body": response.body,
         "problem": response.problem.model_dump(mode="json") if response.problem is not None else None,
     })
 
 
-def _response_digest(key: bytes, response: TypedRpcResponse) -> str:
-    return hmac.new(key, response_signing_bytes(response), hashlib.sha256).hexdigest()
+def request_digest(raw: bytes) -> str:
+    """sha256 of the raw request wire bytes; binds a response to one request."""
+    return hashlib.sha256(raw).hexdigest()
 
 
 # ---------------------------------------------------------------------------
@@ -387,7 +337,7 @@ def decode_request(raw: bytes | str) -> TypedRpcRequest:
     size ceiling, strict JSON (no duplicate keys, no non-finite numbers),
     and the exact envelope shape (no missing or unknown fields). It does
     NOT check signature, clock skew, or replay -- call
-    ``HmacServiceAuthenticator.verify()`` on the result for that.
+    ``ServiceIdentity.verify_request()`` on the result for that.
     """
     parsed = _strict_json_loads(raw)
     try:
@@ -454,162 +404,149 @@ class ReplayNonceCache:
 
 
 # ---------------------------------------------------------------------------
-# Authenticator
+# Service identity (Ed25519)
 # ---------------------------------------------------------------------------
 
-class HmacServiceAuthenticator:
-    """Signs and verifies ``TypedRpcRequest`` envelopes with HMAC-SHA256."""
+@dataclass(frozen=True)
+class RpcCaller:
+    """The authenticated caller of one request. ``on_behalf_of`` is log-only."""
+
+    principal: str
+    on_behalf_of: Optional[str]
+
+
+class ServiceIdentity:
+    """One principal's private key plus the keyring of its peers' public keys.
+
+    The private key is held in a name-mangled attribute and never exposed;
+    ``repr`` shows only the principal and the key id.
+    """
 
     def __init__(
         self,
-        key: bytes,
+        principal: str,
+        private_key: Ed25519PrivateKey,
+        keyring: RpcKeyring,
+        *,
         now: Callable[[], float] = time.time,
         clock_skew_seconds: float = DEFAULT_CLOCK_SKEW_SECONDS,
         nonce_cache: Optional[ReplayNonceCache] = None,
     ):
-        if not isinstance(key, (bytes, bytearray)) or len(key) < MIN_KEY_BYTES:
-            raise ValueError(f"HMAC key must be at least {MIN_KEY_BYTES} bytes")
-        self._key = bytes(key)
+        if not is_valid_principal_name(principal):
+            raise ValueError(f"unknown principal {principal!r}")
+        if not isinstance(private_key, Ed25519PrivateKey):
+            raise TypeError("ServiceIdentity requires an Ed25519 private key")
+        if not isinstance(keyring, RpcKeyring):
+            raise TypeError("ServiceIdentity requires an RpcKeyring")
+        self._principal = principal
+        self.__private_key = private_key
+        self._key_id = public_key_id(private_key.public_key())
+        self._keyring = keyring
         self._now = now
         self._clock_skew_seconds = clock_skew_seconds
-        self._nonce_cache = (
-            nonce_cache if nonce_cache is not None else ReplayNonceCache(now=now)
-        )
+        self._nonce_cache = nonce_cache if nonce_cache is not None else ReplayNonceCache(now=now)
 
-    def sign(self, method: str, request_id: str, nonce: str, body: Dict[str, Any]) -> TypedRpcRequest:
-        """Build and sign a request envelope for ``method``/``body`` right now."""
+    @classmethod
+    def load(cls, principal: str, keys_dir=None, *, now: Callable[[], float] = time.time) -> "ServiceIdentity":
+        """Load ``principal``'s key and its peers' public keys from disk (startup only)."""
+        private_key, keyring = load_identity_material(principal, keys_dir)
+        return cls(principal, private_key, keyring, now=now)
+
+    @property
+    def principal(self) -> str:
+        return self._principal
+
+    @property
+    def key_id(self) -> str:
+        return self._key_id
+
+    @property
+    def public_key(self):
+        """This identity's own public key (not secret)."""
+        return self.__private_key.public_key()
+
+    def trusted_principals(self) -> frozenset:
+        return self._keyring.principals()
+
+    def __repr__(self) -> str:
+        return f"<ServiceIdentity principal={self._principal} key_id={self._key_id}>"
+
+    __str__ = __repr__
+
+    def sign_request(
+        self,
+        *,
+        server: str,
+        role: str,
+        method: str,
+        request_id: str,
+        nonce: str,
+        body: Dict[str, Any],
+        on_behalf_of: Optional[str] = None,
+    ) -> TypedRpcRequest:
         unsigned = TypedRpcRequest(
-            method=method,
-            request_id=request_id,
-            timestamp=self._now(),
-            nonce=nonce,
-            body=body,
-            signature="",
+            method=method, request_id=request_id, timestamp=self._now(), nonce=nonce,
+            body=body, principal=self._principal, server=server, role=role,
+            on_behalf_of=on_behalf_of, signature="",
         )
-        signature = _digest(self._key, unsigned)
+        signature = sign_bytes(self.__private_key, rpc_signing_bytes(unsigned))
         return unsigned.model_copy(update={"signature": signature})
 
-    def verify(self, request: TypedRpcRequest) -> None:
-        """Verify ``request``: clock skew, then signature, then claim the nonce.
+    def verify_request(self, request: TypedRpcRequest, *, role: str) -> RpcCaller:
+        """Verify ``request``; return the authenticated caller.
 
-        Order matters (see module docstring, point 4): the nonce is only
-        claimed after both the skew and signature checks succeed, so a
-        forged or tampered request never consumes replay-protection state.
+        Order is load-bearing: skew, principal, signature, destination,
+        ``on_behalf_of``, then (only on success) the nonce claim. No
+        filesystem access: the key comes from the startup keyring.
         """
         now = self._now()
         if abs(now - request.timestamp) > self._clock_skew_seconds:
             raise AuthenticationError(
-                f"timestamp {request.timestamp!r} outside the "
-                f"{self._clock_skew_seconds}s allowed clock skew (now={now!r})"
-            )
-
-        expected = _digest(self._key, request)
-        if not hmac.compare_digest(expected, request.signature):
-            raise AuthenticationError("signature mismatch")
-
+                f"timestamp outside the {self._clock_skew_seconds}s allowed clock skew")
+        accepted = SERVER_ACCEPTS.get(self._principal, frozenset())
+        if not is_valid_principal_name(request.principal) or request.principal not in accepted:
+            raise AuthenticationError("unknown principal")
+        try:
+            public_key = self._keyring.get(request.principal)
+        except RpcKeyError as exc:
+            raise AuthenticationError("unknown principal") from exc
+        try:
+            verify_bytes(public_key, rpc_signing_bytes(request), request.signature)
+        except BadSignature as exc:
+            raise AuthenticationError("signature mismatch") from exc
+        if request.server != self._principal or request.role != role:
+            raise AuthenticationError("wrong destination")
+        if request.on_behalf_of is not None and (
+                request.principal != "trader" or not is_valid_principal_name(request.on_behalf_of)):
+            raise AuthenticationError("on_behalf_of is only accepted from trader")
         self._nonce_cache.claim(request.nonce)
+        return RpcCaller(request.principal, request.on_behalf_of)
 
     def sign_response(self, response: TypedRpcResponse) -> TypedRpcResponse:
-        """Sign ``response`` (see module docstring "Response signing").
-
-        Any existing ``signature`` is ignored/overwritten -- the digest is
-        always computed over the unsigned fields, never over a prior
-        signature, so re-signing is idempotent regardless of input state.
-        """
+        if response.server != self._principal:
+            raise ValueError(
+                f"{self._principal} cannot sign a response naming server {response.server!r}")
         unsigned = response.model_copy(update={"signature": None})
-        signature = _response_digest(self._key, unsigned)
+        signature = sign_bytes(self.__private_key, response_signing_bytes(unsigned))
         return unsigned.model_copy(update={"signature": signature})
 
-    def verify_response(self, response: TypedRpcResponse) -> None:
-        """Verify a server-signed response. Raises ``AuthenticationError`` on failure.
-
-        Constant-time comparison (``hmac.compare_digest``), matching
-        ``verify()``'s handling of request signatures -- the same timing-attack
-        rationale applies to the reverse direction.
-        """
+    def verify_response(self, response: TypedRpcResponse, *, server: str, request_digest: str) -> None:
+        """Verify a reply with the key of the server this client dialled."""
         if not response.signature:
             raise AuthenticationError("response is missing its signature")
+        if response.server != server:
+            raise AuthenticationError("response names the wrong server")
+        try:
+            public_key = self._keyring.get(server)
+        except RpcKeyError as exc:
+            raise AuthenticationError(f"no trusted key for server {server!r}") from exc
         unsigned = response.model_copy(update={"signature": None})
-        expected = _response_digest(self._key, unsigned)
-        if not hmac.compare_digest(expected, response.signature):
-            raise AuthenticationError("response signature mismatch")
-
-
-# ---------------------------------------------------------------------------
-# Service HMAC key file loading (production startup hardening)
-# ---------------------------------------------------------------------------
-
-# Required permission bits for the service HMAC key file: owner read/write
-# only. Anything looser (group or other access) means the trading-
-# authorization secret is readable by other local users/processes -- on a
-# shared host or a container image with a misconfigured volume mount, that's
-# a lateral-movement path straight to "can sign requests as trader_service".
-REQUIRED_KEY_FILE_MODE = 0o600
-
-
-def load_service_hmac_key(path: str) -> bytes:
-    """Load and validate the service HMAC key file for production startup.
-
-    Production startup MUST fail -- not silently fall back to an ad-hoc or
-    empty key -- if the key file:
-
-    1. is unset or doesn't exist (``path`` is falsy, or no file at ``path``);
-    2. is not permission-restricted to the owner only (mode must be exactly
-       ``0o600``; group/other read is refused even if it's also owner-only
-       writable, and so is a too-permissive write bit);
-    3. is empty; or
-    4. contains fewer than ``MIN_KEY_BYTES`` (32) bytes.
-
-    The raw file bytes ARE the key material -- no hex/base64 decoding, and
-    deliberately NO newline-stripping. A "helpful" strip of a trailing
-    ``\\n`` would silently truncate a key whose 33rd (or Nth) byte is
-    genuinely a ``0x0a`` in the actual output of ``openssl rand`` (~1/256
-    chance per key), which is exactly the kind of "close enough" data
-    massaging this codebase's design principles forbid for trading-adjacent
-    secrets (see AGENTS.md, "Precision over convenience"). Generate a
-    compliant key with e.g.::
-
-        openssl rand 32 > /path/to/service_hmac.key
-        chmod 600 /path/to/service_hmac.key
-
-    (``openssl rand -hex 32`` also works -- it produces a 64-byte ASCII file
-    with no trailing newline, comfortably above the 32-byte floor -- but do
-    not pipe through a text editor or ``echo``, both of which like to append
-    a trailing newline.)
-
-    Raises ``ServiceHmacKeyError`` (a ``TypedRpcError``) for all four cases,
-    never a bare ``OSError``/``ValueError``, so callers can catch one type.
-    """
-    if not path:
-        raise ServiceHmacKeyError(
-            "service_hmac_key_file is not configured (empty path) -- "
-            "production startup requires a real key file"
-        )
-    # trader.yaml ships '~/.config/mmr/...' — expand before existence checks
-    # so in-container `mmr resolve` finds the same key the trader service does.
-    path = os.path.expanduser(path)
-    if not os.path.isfile(path):
-        raise ServiceHmacKeyError(f"service HMAC key file not found: {path!r}")
-
-    mode = stat.S_IMODE(os.stat(path).st_mode)
-    if mode != REQUIRED_KEY_FILE_MODE:
-        raise ServiceHmacKeyError(
-            f"service HMAC key file {path!r} has mode {oct(mode)}; expected "
-            f"{oct(REQUIRED_KEY_FILE_MODE)} (owner read/write only) -- run "
-            f"`chmod 600 {path}`"
-        )
-
-    with open(path, "rb") as key_file:
-        key = key_file.read()
-
-    if len(key) == 0:
-        raise ServiceHmacKeyError(f"service HMAC key file {path!r} is empty")
-    if len(key) < MIN_KEY_BYTES:
-        raise ServiceHmacKeyError(
-            f"service HMAC key file {path!r} contains {len(key)} byte(s); "
-            f"at least {MIN_KEY_BYTES} are required"
-        )
-    return key
+        try:
+            verify_bytes(public_key, response_signing_bytes(unsigned), response.signature)
+        except BadSignature as exc:
+            raise AuthenticationError("response signature mismatch") from exc
+        if not hmac.compare_digest(response.request_digest, request_digest):
+            raise AuthenticationError("response request digest mismatch")
 
 
 # ---------------------------------------------------------------------------
@@ -651,8 +588,10 @@ class TypedRpcRegistration:
     method: str
     request_model: Any
     response_model: Any
-    handler: Callable[[Any], Any]
+    handler: Callable[..., Any]
     execution: Literal["inline", "thread"]
+    allowed_principals: FrozenSet[str] = frozenset()
+    with_caller: bool = False
 
 
 class TypedRpcRegistry:
@@ -664,10 +603,18 @@ class TypedRpcRegistry:
     happens to match something registered elsewhere.
     """
 
-    def __init__(self, *, default_execution: Literal["inline", "thread"] = "inline") -> None:
+    def __init__(
+        self,
+        *,
+        acl: Optional[Mapping[tuple, FrozenSet[str]]] = None,
+        default_execution: Literal["inline", "thread"] = "inline",
+    ) -> None:
         if default_execution not in ("inline", "thread"):
             raise ValueError("default_execution must be 'inline' or 'thread'")
         self.default_execution = default_execution
+        # With an acl every registration must have an entry (no silent dead
+        # method); without one (tests) every method denies everyone.
+        self._acl = acl
         self._by_role_method: Dict[tuple, TypedRpcRegistration] = {}
         self._method_role: Dict[str, str] = {}
 
@@ -677,9 +624,10 @@ class TypedRpcRegistry:
         method: str,
         request_model: Any,
         response_model: Any,
-        handler: Callable[[Any], Any],
+        handler: Callable[..., Any],
         *,
         execution: Optional[Literal["inline", "thread"]] = None,
+        with_caller: bool = False,
     ) -> None:
         if socket_role not in VALID_SOCKET_ROLES:
             raise ValueError(
@@ -698,6 +646,14 @@ class TypedRpcRegistry:
             )
         if (socket_role, method) in self._by_role_method:
             raise ValueError(f"method {method!r} is already registered on role {socket_role!r}")
+        if self._acl is None:
+            allowed: FrozenSet[str] = frozenset()
+        elif (socket_role, method) in self._acl:
+            allowed = frozenset(self._acl[(socket_role, method)])
+        else:
+            raise ValueError(
+                f"({socket_role!r}, {method!r}) has no allow-list entry in "
+                "trader.messaging.principals; add one before registering it")
 
         self._method_role[method] = socket_role
         self._by_role_method[(socket_role, method)] = TypedRpcRegistration(
@@ -707,6 +663,8 @@ class TypedRpcRegistry:
             response_model=response_model,
             handler=handler,
             execution=selected_execution,
+            allowed_principals=allowed,
+            with_caller=with_caller,
         )
 
     def unregister(self, socket_role: str, method: str) -> bool:
@@ -737,6 +695,9 @@ class TypedRpcRegistry:
 
     def contains(self, socket_role: str, method: str) -> bool:
         return (socket_role, method) in self._by_role_method
+
+    def registrations(self) -> Iterator[TypedRpcRegistration]:
+        return iter(list(self._by_role_method.values()))
 
 
 # ---------------------------------------------------------------------------
@@ -815,7 +776,7 @@ class TypedRpcServer:
         self,
         socket_role: str,
         registry: TypedRpcRegistry,
-        authenticator: HmacServiceAuthenticator,
+        identity: ServiceIdentity,
         address: str = "tcp://127.0.0.1",
         port: int = 0,
         max_in_flight: Optional[int] = None,
@@ -824,9 +785,11 @@ class TypedRpcServer:
             raise ValueError(
                 f"socket_role must be one of {sorted(VALID_SOCKET_ROLES)}, got {socket_role!r}"
             )
+        if not isinstance(identity, ServiceIdentity) or identity.principal not in SERVER_PRINCIPALS:
+            raise ValueError("a typed RPC server needs a server identity (trader or strategy)")
         self.socket_role = socket_role
         self.registry = registry
-        self.authenticator = authenticator
+        self.identity = identity
         self.address = f"{address}:{port}"
         configured_max = (
             os.getenv("TYPED_RPC_MAX_IN_FLIGHT", "32")
@@ -900,10 +863,11 @@ class TypedRpcServer:
     async def _handle_request(self, client_id: bytes, raw: bytes) -> None:
         if self._closing:
             return
+        digest = request_digest(bytes(raw))
         try:
             request = decode_request(raw)
         except AuthenticationError as exc:
-            await self._reply(client_id, "", False, None, RpcProblem(
+            await self._reply(client_id, "", "", False, None, RpcProblem(
                 code="AUTHENTICATION_ERROR", message=str(exc)))
             return
         except Exception:  # pragma: no cover - decode_request's own contract is narrow
@@ -912,7 +876,7 @@ class TypedRpcServer:
             # internal exception text from a production security transport
             # hands an attacker free reconnaissance / stack detail.
             logging.exception(f"TypedRpcServer[{self.socket_role}] unexpected decode failure")
-            await self._reply(client_id, "", False, None, RpcProblem(
+            await self._reply(client_id, "", "", False, None, RpcProblem(
                 code="INTERNAL_ERROR", message="internal error"))
             return
 
@@ -924,7 +888,10 @@ class TypedRpcServer:
             # Order matters: authenticate BEFORE any allowlist/schema work,
             # so an unauthenticated caller learns nothing about which methods
             # exist or what shape they expect.
-            self.authenticator.verify(request)
+            caller = self.identity.verify_request(request, role=self.socket_role)
+            logging.debug(
+                "typed rpc dispatch principal=%s on_behalf_of=%s method=%s request_id=%s",
+                caller.principal, caller.on_behalf_of, request.method, request.request_id)
 
             registration = self.registry.resolve(self.socket_role, request.method)
             if registration is None:
@@ -933,6 +900,13 @@ class TypedRpcServer:
                     f"method {request.method!r} is not registered on the "
                     f"{self.socket_role!r} socket",
                 )
+            if caller.principal not in registration.allowed_principals:
+                logging.warning(
+                    "typed rpc PERMISSION_DENIED principal=%s method=%s request_id=%s",
+                    caller.principal, request.method, request.request_id)
+                raise _DispatchProblem(
+                    "PERMISSION_DENIED",
+                    f"principal {caller.principal!r} may not call {request.method!r}")
 
             try:
                 parsed_body = _coerce_request_body(request.body, registration.request_model)
@@ -944,16 +918,21 @@ class TypedRpcServer:
                     "SERVER_BUSY", "server command capacity is temporarily exhausted")
             self._active_handlers += 1
             try:
+                handler_args = (parsed_body, caller) if registration.with_caller else (parsed_body,)
                 if registration.execution == "thread":
-                    result = await asyncio.to_thread(registration.handler, parsed_body)
+                    result = await asyncio.to_thread(registration.handler, *handler_args)
                 else:
-                    result = registration.handler(parsed_body)
+                    result = registration.handler(*handler_args)
                 if inspect.isawaitable(result):
                     result = await result
 
                 try:
                     body = _coerce_response_value(result, registration.response_model)
-                except (ValidationError, TypeError) as exc:
+                    # The reply is signed over canonical JSON; a value that
+                    # cannot be encoded must fail here, in-taxonomy, not
+                    # later in _reply where the client would only time out.
+                    canonical_json(body)
+                except (ValidationError, TypeError, ValueError) as exc:
                     raise _DispatchProblem(
                         "VALIDATION_ERROR", f"handler returned an invalid response: {exc}") from exc
             finally:
@@ -978,12 +957,13 @@ class TypedRpcServer:
             problem = RpcProblem(code="INTERNAL_ERROR", message="internal error")
 
         if not self._closing:
-            await self._reply(client_id, request_id, ok, body if ok else None, problem)
+            await self._reply(client_id, request_id, digest, ok, body if ok else None, problem)
 
     async def _reply(
         self,
         client_id: bytes,
         request_id: str,
+        digest: str,
         ok: bool,
         body: Optional[Dict[str, Any]],
         problem: Optional[RpcProblem],
@@ -995,8 +975,10 @@ class TypedRpcServer:
         # that race.
         if self._closing:
             return
-        response = TypedRpcResponse(request_id=request_id, ok=ok, body=body, problem=problem)
-        signed = self.authenticator.sign_response(response)
+        response = TypedRpcResponse(
+            request_id=request_id, ok=ok, body=body, problem=problem,
+            server=self.identity.principal, request_digest=digest)
+        signed = self.identity.sign_response(response)
         try:
             payload = canonical_json(signed.model_dump(mode="json"))
             await self.socket.send_multipart([client_id, b"", payload])
@@ -1082,7 +1064,9 @@ class TypedRpcClient:
     def __init__(
         self,
         socket_role: str,
-        authenticator: HmacServiceAuthenticator,
+        identity: ServiceIdentity,
+        *,
+        server: str,
         address: str = "tcp://127.0.0.1",
         port: int = 0,
         timeout: float = 10.0,
@@ -1091,8 +1075,13 @@ class TypedRpcClient:
             raise ValueError(
                 f"socket_role must be one of {sorted(VALID_SOCKET_ROLES)}, got {socket_role!r}"
             )
+        if server not in SERVER_PRINCIPALS:
+            raise ValueError(f"server must be one of {sorted(SERVER_PRINCIPALS)}, got {server!r}")
+        if not isinstance(identity, ServiceIdentity):
+            raise TypeError("TypedRpcClient requires a ServiceIdentity")
         self.socket_role = socket_role
-        self.authenticator = authenticator
+        self.identity = identity
+        self.server = server
         self.address = f"{address}:{port}"
         self.timeout = timeout
         self.ctx = zmq.Context()
@@ -1166,6 +1155,8 @@ class TypedRpcClient:
         body: Dict[str, Any],
         response_model: Any,
         timeout: Optional[float] = None,
+        *,
+        on_behalf_of: Optional[str] = None,
     ) -> Any:
         """Sign, send, and await a reply for ``method``/``body``.
 
@@ -1179,8 +1170,11 @@ class TypedRpcClient:
         deadline_s = timeout if timeout is not None else self.timeout
         request_id = str(uuid.uuid4())
         nonce = uuid.uuid4().hex
-        request = self.authenticator.sign(method, request_id, nonce, body)
+        request = self.identity.sign_request(
+            server=self.server, role=self.socket_role, method=method,
+            request_id=request_id, nonce=nonce, body=body, on_behalf_of=on_behalf_of)
         payload = canonical_json(request.model_dump(mode="json"))
+        digest = request_digest(payload)
 
         with self._lock:
             socket = self._require_socket()
@@ -1244,7 +1238,7 @@ class TypedRpcClient:
                     f"typed RPC call to {method!r} timed out after {deadline_ms:.0f}ms")
 
             try:
-                self.authenticator.verify_response(reply)
+                self.identity.verify_response(reply, server=self.server, request_digest=digest)
             except Exception:
                 # A reply that doesn't verify cannot be trusted AT ALL -- not
                 # even its problem code -- so reset the connection rather

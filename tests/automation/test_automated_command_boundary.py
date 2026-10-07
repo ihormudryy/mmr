@@ -2,7 +2,7 @@
 
 Boundary contract (plan §Task 3):
 * ``execute_automated_intent`` is a coordinator saga action, not a second order path.
-* Only the ``strategy_service`` principal may call it; dashboard/browser/CLI are refused.
+* Only the ``strategy`` principal may call it; dashboard/browser/CLI are refused.
 * The typed request carries the full intent + artifact bundle digest; account_id is
   server-derived (never on the wire).
 * Duplicate delivery (in-flight / after reject / after submit / after OUTCOME_UNKNOWN /
@@ -19,6 +19,9 @@ from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
+
+from trader.messaging.principals import TRADER_ACL
+from trader.messaging.typed_rpc import RpcCaller
 from pydantic import ValidationError
 
 from trader.automation.intent_ids import derive_command_id, derive_intent_id
@@ -355,7 +358,7 @@ def test_strategy_service_principal_is_accepted(tmp_path):
         target_id=intent.intent_id,
         expected_version=None,
         body=intent_to_request_body(intent),
-        source="strategy_service",
+        source="strategy", principal="strategy",
     )
     receipt = stack.coordinator.execute(request)
     assert receipt.state in ("SUBMITTED", "RESOLVED")
@@ -363,8 +366,8 @@ def test_strategy_service_principal_is_accepted(tmp_path):
     assert len(stack.dispatch.calls) == 1
 
 
-@pytest.mark.parametrize("source", ["dashboard", "browser", "cli", "mmr_cli", "unknown"])
-def test_non_strategy_principal_is_rejected(tmp_path, source):
+@pytest.mark.parametrize("principal", ["dashboard", "cli", "ai_supervisor", "trader", None])
+def test_non_strategy_principal_is_rejected(tmp_path, principal):
     stack = _build_stack(tmp_path)
     intent = make_intent()
     request = CommandRequest(
@@ -375,7 +378,8 @@ def test_non_strategy_principal_is_rejected(tmp_path, source):
         target_id=intent.intent_id,
         expected_version=None,
         body=intent_to_request_body(intent),
-        source=source,
+        source="strategy",  # a label alone grants nothing
+        principal=principal,
     )
     receipt = stack.coordinator.execute(request)
     assert receipt.state == "REJECTED"
@@ -396,7 +400,7 @@ def test_without_a_saga_the_command_is_refused_and_nothing_is_sent(tmp_path):
         command_id=intent.command_id, action="execute_automated_intent",
         account_id=ACCOUNT, target_type="intent", target_id=intent.intent_id,
         expected_version=None, body=intent_to_request_body(intent),
-        source="strategy_service",
+        source="strategy_service", principal="strategy",
     )
 
     receipt = stack.coordinator.execute(request)
@@ -421,7 +425,7 @@ def test_command_is_claimed_and_audited_before_dispatch(tmp_path):
         target_id=intent.intent_id,
         expected_version=None,
         body=intent_to_request_body(intent),
-        source="strategy_service",
+        source="strategy", principal="strategy",
     )
     receipt = stack.coordinator.execute(request)
     row = stack.ledger.get(intent.command_id)
@@ -465,7 +469,7 @@ def test_exact_replay_returns_recorded_receipt_without_redispatch(tmp_path):
         target_id=intent.intent_id,
         expected_version=None,
         body=intent_to_request_body(intent),
-        source="strategy_service",
+        source="strategy", principal="strategy",
     )
     first = stack.coordinator.execute(request)
     second = stack.coordinator.execute(request)
@@ -487,7 +491,7 @@ def test_changed_payload_conflicts(tmp_path):
         target_id=intent.intent_id,
         expected_version=None,
         body=intent_to_request_body(intent),
-        source="strategy_service",
+        source="strategy", principal="strategy",
     )
     stack.coordinator.execute(request)
 
@@ -499,7 +503,7 @@ def test_changed_payload_conflicts(tmp_path):
         target_id=intent.intent_id,
         expected_version=None,
         body=intent_to_request_body(intent, bundle_digest="sha256:other"),
-        source="strategy_service",
+        source="strategy", principal="strategy",
     )
     receipt = stack.coordinator.execute(conflicted)
     assert receipt.state == "REJECTED"
@@ -545,7 +549,7 @@ def test_duplicate_delivery_never_dispatches_twice(tmp_path, phase):
         target_id=intent.intent_id,
         expected_version=None,
         body=intent_to_request_body(intent),
-        source="strategy_service",
+        source="strategy", principal="strategy",
     )
     first_receipt = stack.coordinator.execute(request)
     if phase == "outcome_unknown":
@@ -574,7 +578,7 @@ def test_rpc_registers_execute_automated_intent_for_strategy_principal(tmp_path)
     stack = _build_stack(tmp_path)
     (tmp_path / "bundles").mkdir()
     (tmp_path / "bundles" / ARTIFACT_DIGEST.replace(":", "_")).mkdir()
-    registry = TypedRpcRegistry()
+    registry = TypedRpcRegistry(acl=TRADER_ACL)
     register_command_authority(
         registry,
         stack.coordinator,
@@ -590,7 +594,8 @@ def test_rpc_registers_execute_automated_intent_for_strategy_principal(tmp_path)
 
     intent = make_intent()
     parsed = ExecuteAutomatedIntentRequest.model_validate(intent_to_wire(intent))
-    receipt = registration.handler(parsed)
+    assert registration.allowed_principals == frozenset({"strategy"})
+    receipt = registration.handler(parsed, RpcCaller("strategy", None))
     assert receipt["state"] in ("SUBMITTED", "RESOLVED")
     assert stack.dispatch.calls[0]["intent_id"] == intent.intent_id
 
@@ -617,7 +622,7 @@ def test_evidence_read_failure_is_rejected_without_reconciliation(tmp_path, stag
         command_id=intent.command_id, action="execute_automated_intent",
         account_id=ACCOUNT, target_type="intent", target_id=intent.intent_id,
         expected_version=None, body=intent_to_request_body(intent),
-        source="strategy_service",
+        source="strategy", principal="strategy",
     )
 
     receipt = stack.coordinator.execute(request)
@@ -653,7 +658,7 @@ def test_session_evidence_uses_the_same_approval_snapshot(tmp_path):
         command_id=intent.command_id, action="execute_automated_intent",
         account_id=ACCOUNT, target_type="intent", target_id=intent.intent_id,
         expected_version=None, body=intent_to_request_body(intent),
-        source="strategy_service",
+        source="strategy", principal="strategy",
     )
 
     receipt = stack.coordinator.execute(request)
@@ -673,7 +678,7 @@ def test_configured_bundle_path_is_not_derived_from_wire_manifest_digest(tmp_pat
         account_id=ACCOUNT, target_type="intent", target_id=intent.intent_id,
         expected_version=None,
         body=intent_to_request_body(intent, bundle_digest="sha256:manifest-ok"),
-        source="strategy_service",
+        source="strategy", principal="strategy",
     )
 
     receipt = stack.coordinator.execute(request)
@@ -701,7 +706,7 @@ def test_configured_artifact_binding_cannot_be_changed_by_intent(
         account_id=ACCOUNT, target_type="intent", target_id=intent.intent_id,
         expected_version=None,
         body=intent_to_request_body(intent, bundle_digest=bundle_digest),
-        source="strategy_service",
+        source="strategy", principal="strategy",
     )
 
     receipt = stack.coordinator.execute(request)
@@ -728,7 +733,7 @@ def test_production_bundle_provenance_is_checked_after_signature_verification(tm
         command_id=intent.command_id, action="execute_automated_intent",
         account_id=ACCOUNT, target_type="intent", target_id=intent.intent_id,
         expected_version=None, body=intent_to_request_body(intent),
-        source="strategy_service",
+        source="strategy", principal="strategy",
     )
     receipt = stack.coordinator.execute(request)
 
@@ -772,7 +777,7 @@ def _execute_with_body(stack, tmp_path, body):
     return stack.coordinator.execute(CommandRequest(
         command_id=intent.command_id, action='execute_automated_intent', account_id=ACCOUNT,
         target_type='intent', target_id=intent.intent_id, expected_version=None,
-        body=body, source='strategy_service'))
+        body=body, source='strategy', principal='strategy'))
 
 
 @pytest.mark.parametrize('sent, expected_error', [
@@ -790,7 +795,7 @@ def test_intent_source_digest_must_match_the_attested_file(tmp_path, sent, expec
     receipt = stack.coordinator.execute(CommandRequest(
         command_id=intent.command_id, action='execute_automated_intent', account_id=ACCOUNT,
         target_type='intent', target_id=intent.intent_id, expected_version=None,
-        body=body, source='strategy_service'))
+        body=body, source='strategy', principal='strategy'))
     assert receipt.error_code == expected_error
 
 
@@ -824,7 +829,7 @@ def test_an_intent_naming_an_artifact_that_is_not_armed_is_rejected(tmp_path):
     receipt = stack.coordinator.execute(CommandRequest(
         command_id=other.command_id, action="execute_automated_intent", account_id=ACCOUNT,
         target_type="intent", target_id=other.intent_id, expected_version=None,
-        body=intent_to_request_body(other), source="strategy_service"))
+        body=intent_to_request_body(other), source="strategy", principal="strategy"))
 
     assert (receipt.state, receipt.error_code) == ("REJECTED", "ARTIFACT_NOT_ARMED")
     assert stack.verifier.calls == []
@@ -875,7 +880,7 @@ def _execute_sell(stack, tmp_path, requested):
     return stack.coordinator.execute(CommandRequest(
         command_id=intent.command_id, action="execute_automated_intent", account_id=ACCOUNT,
         target_type="intent", target_id=intent.intent_id, expected_version=None,
-        body=intent_to_request_body(intent), source="strategy_service",
+        body=intent_to_request_body(intent), source="strategy_service", principal="strategy",
     )), intent
 
 
@@ -923,7 +928,7 @@ def test_sell_intent_with_an_inexact_conid_is_invalid_before_any_broker_read(tmp
     receipt = stack.coordinator.execute(CommandRequest(
         command_id=intent.command_id, action="execute_automated_intent", account_id=ACCOUNT,
         target_type="intent", target_id=intent.intent_id, expected_version=None,
-        body=body, source="strategy_service"))
+        body=body, source="strategy_service", principal="strategy"))
     assert (receipt.state, receipt.error_code) == ("REJECTED", "INTENT_INVALID")
     assert (captures, liquidation.starts, stack.dispatch.calls) == ([], [], [])
 
@@ -974,7 +979,8 @@ def test_typed_intent_request_accepts_an_exact_conid(tmp_path):
     (tmp_path / "bundles" / ARTIFACT_DIGEST.replace(":", "_")).mkdir(parents=True, exist_ok=True)
     intent = make_intent(side="SELL", requested_quantity=None)
     handler = _execute_automated_intent_rpc_handler(stack.coordinator, ACCOUNT)
-    receipt = handler(_coerce_request_body(intent_to_wire(intent), ExecuteAutomatedIntentRequest))
+    receipt = handler(_coerce_request_body(intent_to_wire(intent), ExecuteAutomatedIntentRequest),
+                      RpcCaller("strategy", None))
     assert receipt["error_code"] == "CLOSE_PENDING" and liquidation.starts[0][3]["conid"] == 265598
 
 
@@ -1009,7 +1015,7 @@ def test_buy_intent_path_is_unchanged_with_close_configured(tmp_path):
     receipt = stack.coordinator.execute(CommandRequest(
         command_id=intent.command_id, action="execute_automated_intent", account_id=ACCOUNT,
         target_type="intent", target_id=intent.intent_id, expected_version=None,
-        body=intent_to_request_body(intent), source="strategy_service",
+        body=intent_to_request_body(intent), source="strategy_service", principal="strategy",
     ))
     assert receipt.state in ("SUBMITTED", "RESOLVED")
     assert len(stack.dispatch.calls) == 1 and liquidation.starts == []
@@ -1021,7 +1027,7 @@ def _execute_buy(stack, tmp_path):
     return stack.coordinator.execute(CommandRequest(
         command_id=intent.command_id, action="execute_automated_intent", account_id=ACCOUNT,
         target_type="intent", target_id=intent.intent_id, expected_version=None,
-        body=intent_to_request_body(intent), source="strategy_service",
+        body=intent_to_request_body(intent), source="strategy_service", principal="strategy",
     ))
 
 

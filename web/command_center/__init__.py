@@ -86,10 +86,10 @@ def _default_command_gateway(env=os.environ):
 
     Mirrors ``_default_query_client``/``_default_feed_client`` above: a lazy
     import (so `web.command_center.gateway` -- and the `trader.messaging.
-    typed_rpc` service-HMAC-key loading it does at call time -- is only ever
+    typed_rpc` RPC-key loading it does at call time -- is only ever
     touched from inside `CommandCenter._start_or_degrade`'s try/except, never
     at module import or `create_app()` time). [M1-C] Task 3 fix (I-1): a
-    missing/invalid `MMR_SERVICE_HMAC_KEY_FILE` raises here, which
+    missing/invalid dashboard RPC key (`keys/rpc/dashboard.key`) raises here, which
     `_start_or_degrade` catches like any other startup failure -- it
     DEGRADES the command center to inert rather than crashing `create_app()`
     and taking the always-on `/healthz`/`/readyz` ops probes down with it.
@@ -123,7 +123,7 @@ class CommandCenter:
         # `_start_or_degrade`, inside the SAME degrade-tolerant try/except
         # that brings up the bridge + quote plane below -- never eagerly at
         # `create_app()` time (that used to raise past this constructor
-        # entirely on a bad/missing service HMAC key, taking the whole ASGI
+        # entirely on a bad/missing RPC key, taking the whole ASGI
         # boot -- and its always-on `/healthz`/`/readyz` probes -- down with
         # it). `commands_enabled` mirrors `CommandFlags.commands_enabled`
         # (web/app.py, [M1-C] Task 3): a disabled deployment never attempts
@@ -210,7 +210,7 @@ class CommandCenter:
             if self._commands_enabled:
                 # [M1-C] Task 3 fix (I-1): built HERE (same try as bridge/
                 # quote-plane), not eagerly in `create_app()` -- a bad/missing
-                # service HMAC key (or any other gateway-factory failure) is
+                # dashboard RPC key (or any other gateway-factory failure) is
                 # caught by the `except` below and DEGRADES the whole center
                 # to inert, exactly like a dill-strict or credentials failure
                 # would; it never aborts ASGI startup.

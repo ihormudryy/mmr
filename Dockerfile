@@ -26,6 +26,8 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     git wget vim dpkg build-essential \
     curl locales-all sudo unzip tmux \
     iproute2 net-tools rsync iputils-ping lnav jq \
+    # age: encrypted RPC key backups (`./docker.sh -k --backup`, SP1 Plan 2)
+    age \
     # required for native Python packages that compile C extensions
     libssl-dev libffi-dev \
     && rm -rf /var/lib/apt/lists/*

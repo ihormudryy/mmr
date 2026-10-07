@@ -95,7 +95,7 @@ def test_compose_services_are_hardened():
 
 def test_dashboard_has_no_database_volume():
     compose = _load_yaml("docker-compose.yml")
-    dashboard_volumes = " ".join(compose["services"]["dashboard"].get("volumes", []))
+    dashboard_volumes = " ".join(map(str, compose["services"]["dashboard"].get("volumes", [])))
     assert "mmr_db_data" not in dashboard_volumes
 
 
@@ -106,14 +106,14 @@ def test_trader_and_strategy_and_data_have_database_access():
     trader/strategy/strategy_runtime.py), so they need it too."""
     compose = _load_yaml("docker-compose.yml")
     for name in ("trader", "data", "strategy"):
-        volumes = " ".join(compose["services"][name].get("volumes", []))
+        volumes = " ".join(map(str, compose["services"][name].get("volumes", [])))
         assert "mmr_db_data" in volumes
 
 
 def test_scheduler_has_backup_and_config_paths():
     compose = _load_yaml("docker-compose.yml")
     scheduler = compose["services"]["scheduler"]
-    volumes = " ".join(scheduler.get("volumes", []))
+    volumes = " ".join(map(str, scheduler.get("volumes", [])))
     assert ".config/mmr" in volumes
     assert "backups" in volumes
 

@@ -227,7 +227,7 @@ def _approve_request(command_id, proposal_id, expected_version):
     return CommandRequest(
         command_id=command_id, action="approve_proposal", account_id=ACCOUNT,
         target_type="proposal", target_id=str(proposal_id), expected_version=expected_version,
-        body={"proposal_id": proposal_id}, source="dashboard",
+        body={"proposal_id": proposal_id}, source="dashboard", principal="dashboard",
         preflight_nonce=f"nonce-{command_id}")
 
 

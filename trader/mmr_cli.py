@@ -19,6 +19,8 @@ from rich.table import Table
 from rich.text import Text
 from rich.markup import escape
 from trader.sdk import MMR
+from trader.messaging.keys_cli import add_keys_parser, run_keys_command
+from trader.messaging.keys_cli import running_in_container as _container_probe
 from typing import Any, Dict, List, Optional
 
 import argparse
@@ -1737,6 +1739,9 @@ def build_parser() -> argparse.ArgumentParser:
     bts_sub.add_parser('help', aliases=['metrics'],
                         help='Explain every metric in the backtest report')
 
+    # keys — RPC identity keys (SP1 Plan 2). Handled before any service setup.
+    add_keys_parser(sub)
+
     # research — offline experiment registry (P2). Records the WHOLE search
     # (every trial in the selection denominator) and write-once holdouts in a
     # SEPARATE research DuckDB. No trader/strategy service is ever involved.
@@ -2048,6 +2053,14 @@ def build_parser() -> argparse.ArgumentParser:
 # ------------------------------------------------------------------
 # Command dispatch
 # ------------------------------------------------------------------
+
+def _running_in_container() -> bool:
+    return _container_probe()
+
+
+def _handle_keys(args: argparse.Namespace) -> int:
+    return run_keys_command(args, in_container=_running_in_container())
+
 
 def dispatch(mmr: MMR, args: argparse.Namespace) -> bool:
     """Execute a parsed command.  Returns True to continue the REPL, False to exit."""
@@ -2614,6 +2627,9 @@ def dispatch(mmr: MMR, args: argparse.Namespace) -> bool:
 
         elif cmd == 'research':
             _handle_research(args)
+
+        elif cmd == 'keys':
+            _handle_keys(args)
 
         else:
             console.print(f'[yellow]Unknown command: {cmd}[/yellow]')
@@ -12025,6 +12041,8 @@ def main():
             return
 
         cmd = getattr(args, 'command', None)
+        if cmd == 'keys':
+            sys.exit(_handle_keys(args))
         is_local = cmd in _LOCAL_ONLY_COMMANDS
         if cmd in ('strategies', 'strat'):
             strat_action = getattr(args, 'strat_action', None)

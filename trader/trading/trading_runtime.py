@@ -100,8 +100,11 @@ class Trader():
                  typed_query_port: int = 42101,
                  typed_command_port: int = 42102,
                  typed_feed_port: int = 42103,
-                 service_hmac_key_file: str = '',
+                 rpc_keys_dir: str = '',
                  unsafe_legacy_rpc: bool = False,
+                 trading_mode: str = 'live',
+                 ib_paper_port: int = 0,
+                 ib_live_port: int = 0,
                  command_authority: Optional[dict] = None,
                  strategy_typed_command_port: int = 42104,
                  strategy_typed_query_port: int = 42105,
@@ -125,6 +128,9 @@ class Trader():
         self.universe_library = universe_library
         self.simulation: bool = simulation
         self.paper_trading = paper_trading
+        self.trading_mode = trading_mode
+        self.ib_paper_port = ib_paper_port
+        self.ib_live_port = ib_live_port
         self.strategy_typed_command_port = int(strategy_typed_command_port)
         self.strategy_typed_query_port = int(strategy_typed_query_port)
         self.strategy_typed_address = strategy_typed_address or ''
@@ -156,7 +162,7 @@ class Trader():
         self.typed_query_port = typed_query_port
         self.typed_command_port = typed_command_port
         self.typed_feed_port = typed_feed_port
-        self.service_hmac_key_file = service_hmac_key_file
+        self.rpc_keys_dir = rpc_keys_dir
         self.unsafe_legacy_rpc: bool = unsafe_legacy_rpc
         self.command_authority = dict(command_authority or {})
         self.zmq_pubsub_server_address = zmq_pubsub_server_address
@@ -212,7 +218,7 @@ class Trader():
         self.typed_query_server: 'TypedRpcServer'
         self.typed_command_server: 'TypedRpcServer'
         self.typed_feed_server: 'TypedRpcServer'
-        self.typed_authenticator: 'HmacServiceAuthenticator'
+        self.rpc_identity: Optional['ServiceIdentity'] = None
         self.zmq_pubsub_server: MultithreadedTopicPubSub
         self.zmq_pubsub_contracts: Dict[int, Observable[IBAIORxError]] = {}
         self.zmq_pubsub_contract_filters: Dict[int, bool] = {}
@@ -291,6 +297,13 @@ class Trader():
                 f'paper account. Managed accounts: {managed}. Check your config.'
             )
         return self.ib_account
+
+    def broker_posture(self):
+        from trader.messaging.production_api import BrokerPosture
+        return BrokerPosture(
+            trading_mode=self.trading_mode, paper_trading=self.paper_trading,
+            ib_account=self.ib_account, ib_server_port=self.ib_server_port,
+            ib_paper_port=self.ib_paper_port, ib_live_port=self.ib_live_port)
 
     def _fake_broker_enabled(self) -> bool:
         """Whether ``MMR_FAKE_BROKER=1`` activates the stub broker (G0 Task 6).
@@ -462,24 +475,19 @@ class Trader():
                 register_strategy_state_ingest,
                 validate_rpc_mode,
             )
-            from trader.messaging.typed_rpc import (
-                HmacServiceAuthenticator,
-                TypedRpcServer,
-                load_service_hmac_key,
-            )
+            from trader.messaging.typed_rpc import ServiceIdentity, TypedRpcServer
             from trader.trading.command_policy import load_and_validate_command_policy
             from trader.trading.command_stack import build_command_stack
 
-            validate_rpc_mode(self.simulation, self.unsafe_legacy_rpc)
+            validate_rpc_mode(self.simulation, self.unsafe_legacy_rpc, posture=self.broker_posture())
 
             # Typed query/command/feed servers ALWAYS start -- this is the
-            # only RPC surface production exposes. The service HMAC key is
-            # loaded (and hardness-checked -- absent/wrong-mode/empty/<32B
-            # all fail loudly) unconditionally, offline simulation included:
-            # there is no "test mode" bypass for the typed transport's
-            # authentication.
-            hmac_key = load_service_hmac_key(self.service_hmac_key_file)
-            self.typed_authenticator = HmacServiceAuthenticator(hmac_key)
+            # only RPC surface production exposes. The trader's Ed25519
+            # identity (own key + peers' public keys) is loaded strictly and
+            # unconditionally, offline simulation included: there is no
+            # "test mode" bypass and no HMAC fallback. One identity (one
+            # nonce cache) serves all three servers.
+            self.rpc_identity = ServiceIdentity.load("trader", self.rpc_keys_dir or None)
 
             self.command_authority_policy = load_and_validate_command_policy(
                 self.command_authority,
@@ -493,7 +501,7 @@ class Trader():
             )
             production_registry = build_production_registry(
                 self,
-                self.typed_authenticator,
+                self.rpc_identity,
                 snapshot_service=self.snapshot_service,
                 feed_service=self.feed_service,
                 command_stack=command_stack,
@@ -505,7 +513,7 @@ class Trader():
             if command_stack is None:
                 register_strategy_state_ingest(production_registry, self.domain_journal)
             self.typed_query_server = TypedRpcServer(
-                'query', production_registry, self.typed_authenticator,
+                'query', production_registry, self.rpc_identity,
                 address=self.typed_bind_address,
                 port=self.typed_query_port,
             )
@@ -524,12 +532,12 @@ class Trader():
             # with authority enabled the fail-closed command stack registers
             # the production-ready command surface as well.
             self.typed_command_server = TypedRpcServer(
-                'command', production_registry, self.typed_authenticator,
+                'command', production_registry, self.rpc_identity,
                 address=self.typed_bind_address,
                 port=self.typed_command_port,
             )
             self.typed_feed_server = TypedRpcServer(
-                'feed', production_registry, self.typed_authenticator,
+                'feed', production_registry, self.rpc_identity,
                 address=self.typed_bind_address,
                 port=self.typed_feed_port,
             )
@@ -594,10 +602,9 @@ class Trader():
             raise
         except Exception as ex:
             # NOTE: ValueError from validate_rpc_mode() (unsafe_legacy_rpc
-            # requested outside offline simulation) and
-            # trader.messaging.typed_rpc.ServiceHmacKeyError from
-            # load_service_hmac_key (HMAC key file absent, not mode 0600,
-            # empty, or <32 bytes) both fall through to here rather than
+            # requested outside offline simulation) and RpcKeyError from
+            # ServiceIdentity.load (a missing, symlinked, wrong-mode or
+            # malformed RPC key) both fall through to here rather than
             # getting a dedicated except clause: either way connect() still
             # fails loudly (raised as TraderConnectionException, never
             # silently swallowed, never started with a missing/weak key or

@@ -667,7 +667,7 @@ class TestTraderSideRegistration:
             snapshot=FakeStrategySnapshot(["smi_crossover"]), reconciler=FakeReconciler(),
         )
         registry = build_production_registry(
-            _FakeTrader(), _hmac_authenticator(),
+            _FakeTrader(), _trader_identity(),
             command_coordinator=coordinator, proposal_service=_StubProposalService(),
             proposal_repository=repo, strategy_control_service=strategy_service,
         )
@@ -692,9 +692,9 @@ class TestTraderSideRegistration:
         assert "preflight_nonce" not in fields
 
 
-def _hmac_authenticator():
-    from trader.messaging.typed_rpc import HmacServiceAuthenticator
-    return HmacServiceAuthenticator(b"k" * 32, now=lambda: 1_700_000_000.0)
+def _trader_identity():
+    from tests.rpc_identity_fixtures import make_identities
+    return make_identities()["trader"]
 
 
 class TestStrategyServiceSideRegistration:

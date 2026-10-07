@@ -208,7 +208,7 @@ class MMR:
         self._data_rpc_port = cfg.get('zmq_data_rpc_server_port', 42003)
         self._timeout = timeout
 
-        # [M1-F3] Task 8: typed, HMAC-authenticated query/command sockets --
+        # [M1-F3] Task 8: typed, Ed25519-authenticated query/command sockets --
         # propose / resolve / approve / manage go here. Legacy dill RPC
         # (42001) is NOT bound in the split-container topology, so clients
         # must dial the typed query/command ports (42101/42102). Address
@@ -218,10 +218,13 @@ class MMR:
         self._typed_address = self._resolve_typed_client_address(cfg)
         self._typed_query_port = cfg.get('typed_query_port', 42101)
         self._typed_command_port = cfg.get('typed_command_port', 42102)
-        self._service_hmac_key_file = (
-            (os.getenv('MMR_SERVICE_HMAC_KEY_FILE') or '').strip()
-            or cfg.get('service_hmac_key_file', '')
-        )
+        # The SDK signs as `cli` unless MMR_RPC_PRINCIPAL picks another client
+        # principal (ai_supervisor / ai_research). Server and dashboard
+        # identities are refused here. The key is loaded lazily, on the first
+        # typed call, so commands that need no service need no key.
+        self._rpc_principal = self._client_principal_from_env()
+        self._rpc_keys_dir = (cfg.get('rpc_keys_dir') or '').strip() or None
+        self._rpc_identity: Optional['ServiceIdentity'] = None
         self._typed_query_client: Optional['TypedRpcClient'] = None
         self._typed_command_client: Optional['TypedRpcClient'] = None
         # Strategy-service typed ports (list/enable/disable/reload). Defaults
@@ -283,23 +286,38 @@ class MMR:
             raise ConnectionError("Not connected to data_service.")
         return self._data_client
 
+    @staticmethod
+    def _client_principal_from_env() -> str:
+        from trader.messaging.principals import CLIENT_PRINCIPALS
+        principal = (os.getenv('MMR_RPC_PRINCIPAL') or '').strip() or 'cli'
+        if principal not in CLIENT_PRINCIPALS:
+            raise ValueError(
+                f'MMR_RPC_PRINCIPAL={principal!r} is not a client principal; '
+                f'use one of {sorted(CLIENT_PRINCIPALS)}')
+        return principal
+
+    def _load_rpc_identity(self) -> 'ServiceIdentity':
+        if self._rpc_identity is None:
+            from trader.messaging.typed_rpc import ServiceIdentity
+            self._rpc_identity = ServiceIdentity.load(self._rpc_principal, self._rpc_keys_dir)
+        return self._rpc_identity
+
     def _ensure_typed_clients(self) -> None:
         """Lazily build+connect the typed query/command clients toward
         trader_service's command-authority coordinator. Called only by
-        `_typed_query`/`_typed_command` (i.e. only when a proposal command
-        is actually attempted) so unrelated commands never require a
-        configured `service_hmac_key_file`."""
+        `_typed_query`/`_typed_command` (i.e. only when a typed command
+        is actually attempted) so unrelated commands never need an RPC key."""
         if self._typed_query_client is not None and self._typed_command_client is not None:
             return
-        from trader.messaging.typed_rpc import HmacServiceAuthenticator, TypedRpcClient, load_service_hmac_key
-        authenticator = HmacServiceAuthenticator(load_service_hmac_key(self._service_hmac_key_file))
+        from trader.messaging.typed_rpc import TypedRpcClient
+        identity = self._load_rpc_identity()
         query_client = TypedRpcClient(
-            'query', authenticator, address=self._typed_address,
+            'query', identity, server='trader', address=self._typed_address,
             port=self._typed_query_port, timeout=self._timeout,
         )
         query_client.connect()
         command_client = TypedRpcClient(
-            'command', authenticator, address=self._typed_address,
+            'command', identity, server='trader', address=self._typed_address,
             port=self._typed_command_port, timeout=self._timeout,
         )
         command_client.connect()
@@ -309,15 +327,15 @@ class MMR:
     def _ensure_strategy_typed_clients(self) -> None:
         if self._strategy_typed_query_client is not None and self._strategy_typed_command_client is not None:
             return
-        from trader.messaging.typed_rpc import HmacServiceAuthenticator, TypedRpcClient, load_service_hmac_key
-        authenticator = HmacServiceAuthenticator(load_service_hmac_key(self._service_hmac_key_file))
+        from trader.messaging.typed_rpc import TypedRpcClient
+        identity = self._load_rpc_identity()
         query_client = TypedRpcClient(
-            'query', authenticator, address=self._strategy_typed_address,
+            'query', identity, server='strategy', address=self._strategy_typed_address,
             port=self._strategy_typed_query_port, timeout=self._timeout,
         )
         query_client.connect()
         command_client = TypedRpcClient(
-            'command', authenticator, address=self._strategy_typed_address,
+            'command', identity, server='strategy', address=self._strategy_typed_address,
             port=self._strategy_typed_command_port, timeout=self._timeout,
         )
         command_client.connect()
@@ -1713,7 +1731,7 @@ class MMR:
             receipt = self._typed_command.call(
                 'approve_proposal',
                 {'command_id': f'sdk-{uuid.uuid4()}', 'proposal_id': proposal_id,
-                 'expected_version': expected_version, 'source': 'sdk'},
+                 'expected_version': expected_version},
                 CommandReceipt,
             )
         except (TimeoutError, ConnectionError) as ex:

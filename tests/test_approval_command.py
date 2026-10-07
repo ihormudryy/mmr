@@ -26,7 +26,8 @@ from trader.messaging.production_api import (
     ApproveProposalRequest,
     register_command_authority,
 )
-from trader.messaging.typed_rpc import TypedRpcRegistry
+from tests.rpc_identity_fixtures import ALLOW_ALL
+from trader.messaging.typed_rpc import RpcCaller, TypedRpcRegistry
 from trader.trading.command_coordinator import (
     ApprovalCommandService,
     BrokerRejectedError,
@@ -256,13 +257,13 @@ def _build_approval(tmp_path, *, account_mode, account_id):
         )
         return written[0]
 
-    def execute_approve(record, command_id, expected_version=None, source="dashboard"):
+    def execute_approve(record, command_id, expected_version=None, principal="dashboard"):
         ev = record.revision if expected_version is None else expected_version
         request = CommandRequest(
             command_id=command_id, action="approve_proposal", account_id=account_id,
             target_type="proposal", target_id=str(record.id), expected_version=ev,
-            body={"proposal_id": record.id}, source=source,
-            preflight_nonce=f"nonce-{command_id}",
+            body={"proposal_id": record.id}, source=principal or "internal",
+            principal=principal, preflight_nonce=f"nonce-{command_id}",
         )
         return coordinator.execute(request)
 
@@ -360,21 +361,21 @@ def test_live_ineligible_row_cannot_be_approved_live(approval_live):
     assert approval_live.execute_approve(record, "c1").error_code == "LIVE_INELIGIBLE"
 
 
-def test_paper_sdk_source_may_approve(approval):
-    """Paper: LLM/SDK evaluate-then-approve is allowed (source=sdk)."""
+def test_paper_cli_principal_may_approve(approval):
+    """Paper: LLM/SDK evaluate-then-approve is allowed (principal=cli)."""
     record = approval.pending(conid=265598, action="BUY")
-    receipt = approval.execute_approve(record, "cmd-sdk-paper", source="sdk")
+    receipt = approval.execute_approve(record, "cmd-sdk-paper", principal="cli")
     assert receipt.state == "SUBMITTED"
     assert approval.repo.get(record.id).status == "EXECUTED"
 
 
-def test_live_sdk_source_refused(approval_live):
-    """Live: non-human approve actors are refused before dispatch."""
+def test_live_non_dashboard_principal_refused(approval_live):
+    """Live: every principal but dashboard, and no principal, is refused before dispatch."""
     record = approval_live.pending(conid=265598, action="BUY")
     approval_live.quotes.set(265598, ask=210.0, feed_type="live", age_seconds=0.5)
-    for source in ("sdk", "cli", "llm"):
+    for principal in ("cli", "ai_supervisor", "strategy", None):
         receipt = approval_live.execute_approve(
-            record, f"cmd-{source}", source=source,
+            record, f"cmd-{principal}", principal=principal,
         )
         assert receipt.state == "REJECTED"
         assert receipt.error_code == "LLM_LIVE_APPROVE_FORBIDDEN"
@@ -391,7 +392,7 @@ def test_live_dashboard_source_still_approves(approval_live):
     )
     record = approval_live.pending(conid=265598, action="BUY")
     approval_live.quotes.set(265598, ask=210.0, feed_type="live", age_seconds=0.5)
-    receipt = approval_live.execute_approve(record, "cmd-dash", source="dashboard")
+    receipt = approval_live.execute_approve(record, "cmd-dash", principal="dashboard")
     assert receipt.state == "SUBMITTED"
     assert approval_live.repo.get(record.id).status == "EXECUTED"
 
@@ -642,7 +643,7 @@ def _minimal_proposal_service(approval):
 
 
 def test_approve_proposal_rpc_surface_registers_and_drives_a_real_approve(approval):
-    registry = TypedRpcRegistry()
+    registry = TypedRpcRegistry(acl=ALLOW_ALL)
     register_command_authority(
         registry, approval.coordinator, _minimal_proposal_service(approval), approval.repo,
         account_id="DU111111", account_mode="paper", controls=approval.controls,
@@ -660,14 +661,14 @@ def test_approve_proposal_rpc_surface_registers_and_drives_a_real_approve(approv
         command_id="cmd-rpc", proposal_id=record.id, expected_version=record.revision,
         preflight_nonce="nonce-cmd-rpc",
     )
-    result = registration.handler(parsed)
+    result = registration.handler(parsed, RpcCaller("dashboard", None))
     assert result["state"] == "SUBMITTED"
     assert result["command_id"] == "cmd-rpc"
     assert approval.repo.get(record.id).status == "EXECUTED"
 
 
-def test_approve_proposal_rpc_stamps_sdk_source_and_allows_paper(approval):
-    registry = TypedRpcRegistry()
+def test_approve_proposal_rpc_stamps_the_cli_principal_and_allows_paper(approval):
+    registry = TypedRpcRegistry(acl=ALLOW_ALL)
     register_command_authority(
         registry, approval.coordinator, _minimal_proposal_service(approval), approval.repo,
         account_id="DU111111", account_mode="paper", controls=approval.controls,
@@ -678,14 +679,15 @@ def test_approve_proposal_rpc_stamps_sdk_source_and_allows_paper(approval):
     registration = registry.resolve("command", "approve_proposal")
     parsed = ApproveProposalRequest(
         command_id="cmd-rpc-sdk", proposal_id=record.id,
-        expected_version=record.revision, source="sdk",
+        expected_version=record.revision,
     )
-    result = registration.handler(parsed)
+    result = registration.handler(parsed, RpcCaller("cli", None))
     assert result["state"] == "SUBMITTED"
+    assert approval.ledger.get("cmd-rpc-sdk") is not None
 
 
-def test_approve_proposal_rpc_live_refuses_sdk_source(approval_live):
-    registry = TypedRpcRegistry()
+def test_approve_proposal_rpc_live_refuses_the_cli_principal(approval_live):
+    registry = TypedRpcRegistry(acl=ALLOW_ALL)
     register_command_authority(
         registry, approval_live.coordinator,
         ProposalCommandService(
@@ -705,10 +707,10 @@ def test_approve_proposal_rpc_live_refuses_sdk_source(approval_live):
     registration = registry.resolve("command", "approve_proposal")
     parsed = ApproveProposalRequest(
         command_id="cmd-rpc-live-sdk", proposal_id=record.id,
-        expected_version=record.revision, source="sdk",
+        expected_version=record.revision,
         preflight_nonce="nonce-cmd-rpc-live-sdk",
     )
-    result = registration.handler(parsed)
+    result = registration.handler(parsed, RpcCaller("cli", None))
     assert result["state"] == "REJECTED"
     assert result["error_code"] == "LLM_LIVE_APPROVE_FORBIDDEN"
 
@@ -815,3 +817,16 @@ def test_validation_order_matches_spec(approval):
                                        expected_version=record.revision + 5)
     assert receipt.error_code == "REVISION_MISMATCH"
     assert approval.orders.submissions == []
+
+
+def test_live_approval_with_no_principal_is_refused(approval_live):
+    approval_live.controls.set("U1234567", False, 1, "resume-1", "test unpause", NOW)
+    record = approval_live.pending(conid=265598, action="BUY")
+    approval_live.quotes.set(265598, ask=210.0, feed_type="live", age_seconds=0.5)
+    request = CommandRequest(
+        command_id="cmd-none", action="approve_proposal", account_id="U1234567",
+        target_type="proposal", target_id=str(record.id), expected_version=record.revision,
+        body={"proposal_id": record.id}, source="dashboard", preflight_nonce="nonce-cmd-none",
+    )
+    receipt = approval_live.coordinator.execute(request)
+    assert receipt.error_code == "LLM_LIVE_APPROVE_FORBIDDEN"

@@ -34,6 +34,8 @@ from concurrent.futures import ThreadPoolExecutor
 
 import pytest
 
+from tests.rpc_identity_fixtures import make_identities
+
 from trader.data.domain_journal import RETENTION_FLOOR, DomainJournal
 from trader.data.duckdb_store import DuckDBConnection
 from trader.data.schema_migrations import SchemaMigrator
@@ -41,11 +43,9 @@ from trader.domain.events import DomainMutation
 from trader.domain.feed_service import CursorExpired, DomainFeedService
 from trader.domain.snapshot_service import DomainSnapshotService, SnapshotNotReady
 from trader.messaging.production_api import build_production_registry
-from trader.messaging.typed_rpc import HmacServiceAuthenticator
 
 UTC_NOW = dt.datetime(2026, 7, 16, 12, 0, tzinfo=dt.timezone.utc)
 
-HMAC_KEY = b"k" * 32
 
 
 class _Writer:
@@ -413,7 +413,7 @@ def test_clamp_helper_bounds():
 
 @pytest.fixture
 def authenticator():
-    return HmacServiceAuthenticator(HMAC_KEY, now=lambda: 1_700_000_000.0)
+    return make_identities()["trader"]
 
 
 @pytest.fixture

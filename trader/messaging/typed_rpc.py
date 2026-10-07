@@ -65,7 +65,7 @@ from typing import Any, Callable, Dict, FrozenSet, Iterator, Literal, Mapping, O
 
 import zmq
 import zmq.asyncio
-from pydantic import BaseModel, ConfigDict, ValidationError
+from pydantic import BaseModel, ConfigDict, ValidationError, field_validator
 
 from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
 
@@ -88,6 +88,7 @@ logging = setup_logging(module_name='trader.messaging.typed_rpc')
 # Hard ceiling on raw wire bytes accepted for a single request, checked
 # before any JSON parsing is attempted.
 MAX_REQUEST_BYTES = 1024 * 1024  # 1 MiB
+MAX_REQUEST_TIMESTAMP = 4_102_444_800.0  # 2100-01-01 UTC; anything later is not a clock reading
 
 # Maximum allowed difference (in seconds, either direction) between a
 # request's claimed timestamp and the verifier's clock.
@@ -165,6 +166,17 @@ class TypedRpcRequest(BaseModel):
     role: str
     on_behalf_of: Optional[str]
     signature: str
+
+    @field_validator("timestamp", mode="before")
+    @classmethod
+    def _timestamp_is_a_plausible_epoch_number(cls, value: Any) -> float:
+        # Pydantic's lax float would turn true / "1" into 1.0, and NaN or a
+        # huge value would reach the skew arithmetic. Refuse all of them here.
+        if isinstance(value, bool) or not isinstance(value, (int, float)):
+            raise ValueError("timestamp must be a JSON number")
+        if not math.isfinite(value) or not 0 <= value <= MAX_REQUEST_TIMESTAMP:
+            raise ValueError("timestamp must be a finite epoch time between 0 and year 2100")
+        return float(value)
 
 
 class TypedRpcResponse(BaseModel):

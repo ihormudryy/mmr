@@ -1,5 +1,6 @@
 import builtins
 import os
+import re
 import time
 from uuid import uuid4
 
@@ -278,3 +279,33 @@ def test_handler_returning_a_non_json_value_fails_loudly_not_silently():
         assert served.raw_code(served.signed("cli", "trader", "query", "bad")) == "VALIDATION_ERROR"
     finally:
         served.close()
+
+
+# --------------------------------------------------------------------------- bad timestamps
+
+def _signed_request_with_timestamp(ids, literal):
+    """Wire bytes of a signed request whose timestamp is replaced by a raw JSON literal."""
+    wire = canonical_json(_req(ids).model_dump(mode="json")).decode()
+    return re.sub(r'"timestamp":[^,}]+', lambda _m: '"timestamp":' + literal, wire).encode()
+
+
+@pytest.mark.parametrize("literal", ["NaN", "Infinity", "-Infinity", "true", '"1"', "null", "-1", "1e30"])
+def test_server_refuses_bad_timestamp_cleanly_before_authentication(stack, caplog, literal):
+    raw = _signed_request_with_timestamp(stack.identities, literal)
+    with caplog.at_level("ERROR"):
+        reply = stack.send_raw(raw, to="trader", role="query")
+    assert not reply.ok
+    assert reply.problem.code == "AUTHENTICATION_ERROR"
+    assert stack.calls["n"] == 0
+    assert not [r for r in caplog.records if r.levelname == "ERROR"]
+
+
+def test_server_still_accepts_a_valid_timestamp(stack):
+    assert stack.client("cli").call("get_status", {}, dict) == {"ok": 1}
+
+
+@pytest.mark.parametrize("literal", ["true", '"1"', "null", "-1", "1e30"])
+def test_decode_refuses_bad_timestamp_before_any_signature_work(literal):
+    ids = make_identities()
+    with pytest.raises(AuthenticationError, match="timestamp"):
+        decode_request(_signed_request_with_timestamp(ids, literal))

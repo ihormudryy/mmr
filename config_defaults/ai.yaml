@@ -1,0 +1,41 @@
+# AI paper bot (SP2a/b): models, prices and limits. Read only by the `ai` container.
+# Credentials are NOT here. They come from the environment of the `ai` container:
+#   openrouter: OPENROUTER_API_KEY
+#   bedrock:    AWS_REGION + the standard AWS chain (keys or AWS_PROFILE)
+#   azure:      AZURE_OPENAI_ENDPOINT, AZURE_OPENAI_API_KEY, AZURE_OPENAI_API_VERSION
+#
+# There are no default model ids. An empty `model` stops the service at startup.
+# The owner picks them. Example ids (not defaults): "anthropic/claude-sonnet-4.5" on
+# openrouter, an inference-profile id on bedrock, a deployment name on azure.
+roles:
+  orchestrator:
+    backend: openrouter        # openrouter | bedrock | azure
+    model: ""
+    max_input_tokens: 60000
+    max_output_tokens: 4000
+    call_timeout_seconds: 45
+  jev:
+    backend: openrouter        # Jev must stay on openrouter
+    model: ""
+    max_input_tokens: 60000
+    max_output_tokens: 4000
+    call_timeout_seconds: 45
+
+# USD per million tokens, per backend and model id. A model with no row here is
+# refused at call time (nothing is reserved).
+pricing:
+  openrouter: {}
+  bedrock: {}
+  azure: {}
+  # openrouter:
+  #   "vendor/model-id": {input_usd_per_million: 3.0, output_usd_per_million: 15.0}
+
+# The daily model cap is not set here. It is ai_paper.model_budget_usd_per_day in
+# trader.yaml (default 2000); the ai service reads it from the trader. A raise
+# applies at the next 00:00 America/New_York, a lower cap at once.
+budget:
+  calls_per_hour: 120
+  max_in_flight: 2                 # 2 is the maximum
+  decision_deadline_seconds: 60    # one deadline spans orchestrator plus Jev
+
+database_path: ~/.local/share/mmr_ai/ai.duckdb

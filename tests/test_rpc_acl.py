@@ -255,3 +255,10 @@ def test_experiment_rights():                                            # SP1 P
                 ("command", "stop_experiment")} & rights("ai_supervisor")
     assert not {k for k in rights("ai_research") if "experiment" in k[1]}
     assert not {k for k in rights("strategy") if "experiment" in k[1]}
+
+
+def test_acceptance_rights_are_exact():                                   # SP1 Plan 6 rulings 14 and 23
+    for method in ("get_acceptance_preflight", "get_broker_order_evidence"):
+        assert TRADER_ACL[("query", method)] == frozenset({"cli", "dashboard", "ai_supervisor"})
+    for method in ("acceptance_mark_start", "acceptance_shrink_probe"):
+        assert TRADER_ACL[("command", method)] == frozenset({"cli"})      # never an AI, never the dashboard

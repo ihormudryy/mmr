@@ -41,8 +41,12 @@ def continue_step(served, tmp_path, step, **changes):
 
 
 def full_run(served, tmp_path):
-    """The run phase up to S protected (the probe needs Task 7's commands)."""
-    return run_until(served, tmp_path, "enter_s")
+    """The whole run phase: S proven and settled, B left open for the session flatten."""
+    market(served)
+    served.sim.script_target_fills([1])
+    results = scenario(served, tmp_path).run()
+    assert all(r.passed for r in results), results
+    return results
 
 
 def stop_of(served, name):
@@ -105,7 +109,7 @@ def test_staging_generation_mid_flatten_waits_and_then_proves_flat(served, tmp_p
     state = drive_session_to_flat(served)
     assert state.state == "FLAT"
     end = scenario(served, tmp_path).finish()
-    assert [r.name for r in end if not r.passed] == ["oca_shrink"]             # NOT_RUN until Task 7's probe
+    assert all(r.passed for r in end), end
     assert_no_duplicate_order_refs(served)
 
 

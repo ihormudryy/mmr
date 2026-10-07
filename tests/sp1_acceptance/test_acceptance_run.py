@@ -64,7 +64,7 @@ def entries_placed(served):
 
 
 def test_the_spec_scenario_runs_to_s_protected(served, tmp_path):
-    """Steps 1-7 and S's linked entry; the mark and the probe arrive with Task 7."""
+    """Steps 1-7 and S's linked entry, checked on their own before the probe."""
     market(served)
     run = scenario(served, tmp_path).run_until("enter_s")
     assert all(r.passed for r in run), run
@@ -153,7 +153,7 @@ def test_the_report_is_signed_and_lists_every_step(served, tmp_path):
 
 
 def test_the_session_flatten_and_finish_prove_flat_on_broker_evidence(served, tmp_path):
-    """B (and S, until Task 7 settles it) is closed by the 15:45 flatten; finish checks the end state."""
+    """Stopped before the probe: the 15:45 flatten closes B and S; finish passes all but oca_shrink."""
     market(served)
     run = scenario(served, tmp_path).run_until("enter_s")
     assert all(r.passed for r in run), run
@@ -166,4 +166,22 @@ def test_the_session_flatten_and_finish_prove_flat_on_broker_evidence(served, tm
     assert (end["oca_shrink"].passed, end["oca_shrink"].code) == (False, "OCA_SHRINK_NOT_RUN")
     trips = end["round_trips"].evidence["trips"]
     assert [(t["conid"], t["closed_quantity"]) for t in trips if t["conid"] == AAPL] == [(AAPL, 3.0), (AAPL, 3.0)]
+    assert served.call("cli", "verify_scoreboard", {})["ok"] is True
+
+
+def test_the_spec_scenario_passes_end_to_end(served, tmp_path):
+    market(served)
+    served.sim.script_target_fills([1])                                      # S: one share fills, then nothing
+    run = scenario(served, tmp_path).run()
+    assert all(r.passed for r in run), run
+    assert [r.name for r in run][-3:] == ["enter_s", "shrink_proof", "settle_s"]
+    assert run[-2].evidence["oca_shrink"] == "PROVEN" and run[-1].evidence["settled_by"] == "close"
+    assert served.principals_for("acceptance_mark_start", "acceptance_shrink_probe") == {"cli"}
+    assert {c: q for c, q in served.sim.held.items() if q} == {MSFT: 1.0}   # B left for the session flatten
+    state = drive_session_to_flat(served)
+    assert state.state == "FLAT"
+    end = scenario(served, tmp_path).finish()
+    assert all(r.passed for r in end), end
+    report = served.call("ai_supervisor", "get_scoreboard", {})
+    assert report["sessions"][-1]["end_state"] == "FLAT" and report["sessions"][-1]["open_positions"] == 0
     assert served.call("cli", "verify_scoreboard", {})["ok"] is True

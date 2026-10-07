@@ -20,6 +20,11 @@ from trader.sdk import MMR
 ACCOUNT = "DU111111"
 
 
+def _json(out):
+    """The --json result is the last JSON object printed (log lines may come first)."""
+    return json.loads(out[out.rindex('{"data"'):])["data"]
+
+
 @pytest.fixture
 def rpc_keys_dir(tmp_path):
     return tmp_path / "keys" / "rpc"
@@ -137,6 +142,27 @@ def test_a_resume_of_an_unknown_run_is_refused(served_with_keys, cli, signing_ke
     out = cli(f"experiment acceptance run --run-id acc-20260717-ffffff --place-orders --confirm-account {ACCOUNT} "
               f"--signing-key {signing_key}")
     assert "RUN_NOT_FOUND" in out and served_with_keys.command_count() == 0
+
+
+def test_run_and_finish_end_to_end_over_the_cli(served_with_keys, cli, signing_key, tmp_path):
+    market(served_with_keys)
+    served_with_keys.sim.script_target_fills([1])
+    out = cli(f"experiment acceptance run --place-orders --confirm-account {ACCOUNT} --signing-key {signing_key}",
+              json_mode=True)
+    data = _json(out)
+    run_id = data["run_id"]
+    assert data["passed"] is True, data
+    drive_session_to_flat(served_with_keys)
+    out = cli(f"experiment acceptance finish --run-id {run_id} --signing-key {signing_key}", json_mode=True)
+    finish = _json(out)
+    assert all(r["passed"] for r in finish["results"]), finish
+    assert finish["passed"] is False                     # synthetic evidence never makes a passing session
+    report = tmp_path / "acceptance" / run_id / "finish-report.json"
+    loaded = json.loads(report.read_text())
+    assert (loaded["evidence_source"], loaded["signing_key"], loaded["oca_shrink"]) == (
+        "synthetic", "operator", "PROVEN")
+    status = cli(f"experiment acceptance status --run-id {run_id}")
+    assert "[PASS] settle_s" in status and "[PASS] session_flat" in status
 
 
 def test_a_real_report_signed_with_an_ephemeral_key_does_not_verify_as_the_operator(tmp_path, cli, signing_key):

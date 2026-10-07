@@ -189,8 +189,19 @@ class BrokerSim:
         if self._modify_clears_oca:
             order.ocaGroup, order.ocaType = "", 0
         self.orders[entity] = replace(row, oca_group=oca_group, oca_type=oca_type)
-        self._changed(entity)
+        self._apply_live(entity)
         return trade
+
+    def _apply_live(self, entity):
+        """IB echoes a modify at once (openOrder/orderStatus); ingest applies it without a new generation."""
+        store, db = self.trader.broker_state_store, self.trader.journal_db
+        row, now = self.orders[entity], self.now()
+
+        def write(conn):
+            store.upsert_order_in_tx(conn, row)
+            self.record_order_event_in_tx(conn, store.latest_promoted_generation_in_tx(conn), entity,
+                                          self.perm.get(entity), self.ib_trades[entity].order.orderId, row, now)
+        db.transaction(write)
 
     # -- fake executioner ------------------------------------------------------------------
     async def subscribe_place_order_direct(self, contract, order):

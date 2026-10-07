@@ -11,7 +11,9 @@ from __future__ import annotations
 import logging
 from typing import Any, Dict, Optional
 
-from pydantic import BaseModel, ConfigDict
+import re
+
+from pydantic import BaseModel, ConfigDict, Field, field_validator
 
 logger = logging.getLogger(__name__)
 
@@ -26,20 +28,54 @@ class GetBrokerOrderEvidenceRequest(BaseModel):
     conid: Optional[int] = None
 
 
+_EXPERIMENT_ID = re.compile(r"^exp-[0-9a-f]{20}$")
+_RUN_ID = re.compile(r"^acc-[0-9]{8}-[0-9a-f]{6}$")
+_COMMAND_ID = re.compile(r"^[A-Za-z0-9_-]{8,80}$")
+
+
+class AcceptanceMarkStartRequest(BaseModel):
+    """acceptance_mark_start (ruling 23): the four fields of the durable mark."""
+    model_config = ConfigDict(extra="forbid", strict=True)
+
+    command_id: str
+    experiment_id: str
+    run_id: str
+    conid: int = Field(gt=0)
+    decision_id: str
+
+    @field_validator("command_id", "decision_id")
+    @classmethod
+    def _id_shape(cls, value: str) -> str:
+        if not _COMMAND_ID.fullmatch(value):
+            raise ValueError("ids are 8-80 characters of letters, digits, '-' and '_'")
+        return value
+
+    @field_validator("experiment_id")
+    @classmethod
+    def _experiment_shape(cls, value: str) -> str:
+        if not _EXPERIMENT_ID.fullmatch(value):
+            raise ValueError("experiment_id must match exp-<20 hex>")
+        return value
+
+    @field_validator("run_id")
+    @classmethod
+    def _run_shape(cls, value: str) -> str:
+        if not _RUN_ID.fullmatch(value):
+            raise ValueError("run_id must match acc-YYYYMMDD-<6 hex>")
+        return value
+
+
+class AcceptanceShrinkProbeRequest(AcceptanceMarkStartRequest):
+    display_size: int
+
+
 def _code(exc: Exception) -> str:
     return str(getattr(exc, "code", None) or type(exc).__name__)
 
 
-def evidence_source(trader: Any) -> str:
-    """``ib`` only when trader_service set it after connecting to a real IB; a composed test stack never does."""
-    return "ib" if getattr(trader, "broker_evidence_source", None) == "ib" else "synthetic"
-
-
 def broker_order_evidence(trader: Any, conid: Optional[int]) -> Dict[str, Any]:
-    from trader.data.broker_order_events import broker_order_evidence_in_tx
-    store, account_id = trader.broker_state_store, trader.ib_account
-    return trader.journal_db.transaction(
-        lambda conn: broker_order_evidence_in_tx(conn, store, account_id, conid, source=evidence_source(trader)))
+    from trader.trading.acceptance_probe import read_broker_order_evidence
+    return read_broker_order_evidence(trader, conid)
 
 
 def acceptance_preflight(trader: Any, command_stack: Any) -> Dict[str, Any]:
@@ -101,3 +137,32 @@ def register_acceptance_surface(registry: Any, trader: Any, command_stack: Any) 
                       get_acceptance_preflight)
     registry.register("query", "get_broker_order_evidence", GetBrokerOrderEvidenceRequest, dict,
                       get_broker_order_evidence)
+    probe = getattr(command_stack, "acceptance_probe", None)
+    if probe is not None:
+        _register_probe_commands(registry, command_stack.coordinator, probe, getattr(trader, "ib_account", None))
+
+
+def _register_probe_commands(registry: Any, coordinator: Any, probe: Any, account_id: Optional[str]) -> None:
+    """Ruling 23: operator-only commands through the coordinator (ledger, idempotency, receipts)."""
+    from trader.trading.acceptance_probe import MARK_ACTION, PROBE_ACTION
+
+    coordinator.register_action(MARK_ACTION, probe.mark_start, requires_preflight=False)
+    coordinator.register_action(PROBE_ACTION, probe.probe, requires_preflight=False)
+
+    def handler(action: str):
+        def _handle(parsed: AcceptanceMarkStartRequest, caller: Any) -> Dict[str, Any]:
+            from trader.messaging.production_api import _receipt_to_dict
+            from trader.trading.command_coordinator import CommandRequest
+            body = parsed.model_dump()
+            command_id = body.pop("command_id")
+            request = CommandRequest(
+                command_id=command_id, action=action, account_id=account_id, target_type="experiment",
+                target_id=parsed.experiment_id, expected_version=None, body=body,
+                source=caller.principal, principal=caller.principal)
+            return _receipt_to_dict(coordinator.execute(request))
+        return _handle
+
+    registry.register("command", MARK_ACTION, AcceptanceMarkStartRequest, dict, handler(MARK_ACTION),
+                      with_caller=True)
+    registry.register("command", PROBE_ACTION, AcceptanceShrinkProbeRequest, dict, handler(PROBE_ACTION),
+                      with_caller=True)

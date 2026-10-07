@@ -490,6 +490,7 @@ class CommandStack:
     experiments: Any = None  # ExperimentServices on paper (SP1 Plan 4, K15)
     mode_conflict: Optional[str] = None  # "BOTH_MODES_ARMED" (SP1 Plan 4 K17)
     scoreboard: Any = None  # ScoreboardServices (SP1 Plan 5): equity_daily, verify, Telegram outbox
+    acceptance_probe: Any = None  # AcceptanceProbeService on paper stacks (SP1 Plan 6, off unless configured)
 
 
 @dataclass(frozen=True)
@@ -865,6 +866,22 @@ def _build_scoreboard(trader: Any, migrator: Any, broker: Any, experiments: Opti
     return scoreboard
 
 
+def _build_acceptance_probe(trader: Any, experiments: Optional[ExperimentServices], *, account_mode: str,
+                            broker: Any, quotes: Any, saga: Any, now: Callable[[], dt.datetime]) -> Any:
+    """SP1 Plan 6: the operator's OCA shrink probe. Built with the experiments; refused unless configured."""
+    if experiments is None:
+        return None
+    from trader.automation.ai_paper_config import AiPaperConfig
+    from trader.trading.acceptance_probe import (
+        AcceptanceMarkStore, AcceptanceProbeService, read_broker_order_evidence,
+    )
+    return AcceptanceProbeService(
+        trader=trader, marks=AcceptanceMarkStore(trader.journal_db), experiments=experiments.store,
+        config=getattr(trader, "ai_paper_config", None) or AiPaperConfig(), account_id=trader.ib_account,
+        account_mode=account_mode, broker=broker, quotes=quotes, saga=saga,
+        evidence=lambda conid: read_broker_order_evidence(trader, conid), now=now)
+
+
 def _trader_yaml_path() -> Path:
     return Path(os.environ.get("TRADER_CONFIG", "~/.config/mmr/trader.yaml")).expanduser()
 
@@ -1008,6 +1025,9 @@ def build_command_stack(
     from trader.automation.experiments import apply_experiment_migration
 
     apply_experiment_migration(migrator)              # 70 (SP1 Plan 4)
+    from trader.trading.acceptance_probe import apply_migration_80_acceptance_marks
+
+    apply_migration_80_acceptance_marks(migrator)     # 80 (SP1 Plan 6); 81 comes with the broker tables
 
     repository = ProposalRepository(journal)
     ledger = CommandLedger(journal)
@@ -1464,6 +1484,9 @@ def build_command_stack(
         ai_paper=ai_paper,
         experiments=experiments,
         scoreboard=scoreboard,
+        acceptance_probe=_build_acceptance_probe(trader, experiments, account_mode=account_mode,
+                                                 broker=broker_snapshot, quotes=quotes,
+                                                 saga=protective_order_saga, now=now),
     )
 
     def _build_intent_for_hot_arm(trader_obj: Any):

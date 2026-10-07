@@ -395,3 +395,85 @@ async def test_a_dead_renewal_loop_stops_the_service_loudly(rig, tmp_path, caplo
     stop = asyncio.Event()
     await asyncio.wait_for(controller.run(stop), timeout=10)        # without the fix it never returns
     assert stop.is_set() and "PERMISSION_DENIED" in caplog.text
+
+
+def submissions(rig):
+    return rig.store.db.execute("SELECT count(*) FROM ai_submissions", fetch="one")[0]
+
+
+@pytest.mark.asyncio
+async def test_a_hook_that_returns_after_the_slot_deadline_persists_nothing(rig):   # PR #84 thread 4210304317
+    def late(ctx):
+        rig.clock.advance(16 * 60)                                  # the answer arrives at 11:16:30, after 11:15
+        return EngineResult(decisions=(enter(),))
+    rig.engine.results["entry_cycle"] = late
+    await rig.slots_then_drain()
+    assert ("cyc-entry-20260717-1100", "TIMED_OUT", "SLOT_DEADLINE") in rig.cycles()
+    assert rig.sent() == [] and submissions(rig) == 0
+
+
+@pytest.mark.asyncio
+async def test_the_deadline_is_checked_again_right_before_the_persist(rig, monkeypatch):
+    import trader.ai.controller as controller_module
+    real = controller_module.validate_result
+
+    def slow_check(source_kind, result):
+        rig.clock.advance(16 * 60)                                  # time passes between the result and the commit
+        return real(source_kind, result)
+    monkeypatch.setattr(controller_module, "validate_result", slow_check)
+    rig.engine.results["entry_cycle"] = EngineResult(decisions=(enter(),))
+    await rig.slots_then_drain()
+    assert ("cyc-entry-20260717-1100", "TIMED_OUT", "SLOT_DEADLINE") in rig.cycles()
+    assert rig.sent() == [] and submissions(rig) == 0
+
+
+def cycle_states(rig):
+    return {cycle: (state, reason) for cycle, state, reason in rig.cycles()}
+
+
+def entry_cycles_run(rig):
+    return [ctx.slot.cycle_id for hook, ctx in rig.engine.calls if hook == "entry_cycle"]
+
+
+@pytest.mark.asyncio
+async def test_a_multi_slot_jump_journals_every_elapsed_slot_as_missed(rig):        # PR #84 thread 4210304802
+    await rig.slots_then_drain()                                    # 11:00 runs
+    rig.clock.advance(46 * 60)                                      # 11:46:30: 11:15 and 11:30 were never seen
+    await rig.slots_then_drain()
+    states = cycle_states(rig)
+    for hhmm in ("1115", "1130"):
+        assert states[f"cyc-entry-20260717-{hhmm}"] == ("MISSED", "LATE_START")
+        assert states[f"cyc-position-20260717-{hhmm}"] == ("MISSED", "LATE_START")
+    assert entry_cycles_run(rig) == ["cyc-entry-20260717-1100", "cyc-entry-20260717-1145"]   # never replayed
+
+
+@pytest.mark.asyncio
+async def test_a_restart_journals_the_slots_it_slept_through(rig):
+    await rig.slots_then_drain()
+    rig.clock.advance(46 * 60)
+    rig.build()                                                     # a new process on the same ai.duckdb
+    await rig.controller.start()
+    await rig.slots_then_drain()
+    assert cycle_states(rig)["cyc-entry-20260717-1130"] == ("MISSED", "LATE_START")
+    assert entry_cycles_run(rig) == ["cyc-entry-20260717-1100", "cyc-entry-20260717-1145"]
+
+
+@pytest.mark.asyncio
+async def test_a_restart_on_the_next_day_journals_yesterdays_last_slots(tmp_path):
+    rig = await rig_at(tmp_path, et(15, 16, day=FRIDAY - dt.timedelta(days=1)))    # Thursday 15:16
+    await rig.slots_then_drain()
+    assert cycle_states(rig)["cyc-entry-20260716-1515"] == ("DONE", None)
+    rig.clock.advance((dt.timedelta(hours=18, minutes=30)).total_seconds())        # Friday 09:46
+    rig.build()
+    await rig.controller.start()
+    await rig.slots_then_drain()
+    states = cycle_states(rig)
+    assert states["cyc-position-20260716-1530"] == ("MISSED", "LATE_START")
+    assert "cyc-entry-20260716-1530" not in states                  # 15:15 was the last entry slot
+    assert entry_cycles_run(rig) == ["cyc-entry-20260716-1515", "cyc-entry-20260717-0945"]
+
+
+@pytest.mark.asyncio
+async def test_the_first_start_does_not_invent_slots_from_before_the_service_ran(rig):
+    await rig.slots_then_drain()
+    assert sorted(cycle_states(rig)) == ["cyc-entry-20260717-1100", "cyc-position-20260717-1100"]

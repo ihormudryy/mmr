@@ -5,8 +5,8 @@ import json
 import pytest
 
 from tests.ai.fakes import FakeClock
-from tests.ai.runtime.fakes import AAPL, FakeIngest, FakeLeadership, ScriptedTrader, et, write_correction, \
-    write_cost_event
+from tests.ai.runtime.fakes import AAPL, FakeIngest, FakeLeadership, ScriptedTrader, et, receipt, \
+    write_correction, write_cost_event
 from trader.ai.engine import ProposedDecision, SimulatedBaseline
 from trader.ai.ids import attempt_ref, cost_record_id, derive_decision_id
 from trader.ai.journal import AttemptJournal
@@ -227,9 +227,9 @@ async def plan_partial_close_with_matched_entry(rig, submitter, ttl_seconds):
 
 
 @pytest.mark.asyncio
-async def test_a_matched_entry_waits_for_its_own_close(rig):
-    leadership = FakeLeadership(1)
-    submitter = Submitter(store=rig.store, supervisor=ScriptedTrader(), leadership=leadership, clock=rig.clock,
+async def test_a_matched_entry_waits_for_its_own_close_to_resolve(rig):
+    leadership, trader = FakeLeadership(1), ScriptedTrader()
+    submitter = Submitter(store=rig.store, supervisor=trader, leadership=leadership, clock=rig.clock,
                           slots=SessionSlots(), experiment_state=lambda: "ARMED")
     close_id = await plan_partial_close_with_matched_entry(rig, submitter, ttl_seconds=300)
     await rig.outbox.deliver_due()
@@ -237,9 +237,53 @@ async def test_a_matched_entry_waits_for_its_own_close(rig):
     await submitter.send_due()                                       # the close reaches the trader
     assert (await submitter.get(close_id)).state == "ACCEPTED"
     await rig.outbox.deliver_due()
+    assert rig.ingest.calls == [] and rig.rows()[0][1] == "WAITING"  # SUBMITTED may still become REJECTED
+    trader.ledger[close_id] = receipt(close_id, "RESOLVED")
+    await submitter.reconcile_once()
+    assert (await submitter.get(close_id)).state == "FINAL"
+    await rig.outbox.deliver_due()
     body = rig.ingest.rows[rig.rows()[0][0]]
     assert (body["opportunity_id"], body["linked_decision_id"], body["quantity"]) == (close_id, OLD_ENTER, 1)
     RecordSimulatedDecisionRequest.model_validate(body)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("refusal", ["POSITION_NOT_OWNED", "VALIDATION_ERROR"])
+async def test_a_matched_entry_of_a_rejected_close_is_dropped(rig, refusal):          # PR #84 thread 4210304478
+    trader = ScriptedTrader()
+    trader.script = [("receipt", "REJECTED", refusal)]
+    submitter = Submitter(store=rig.store, supervisor=trader, leadership=FakeLeadership(1), clock=rig.clock,
+                          slots=SessionSlots(), experiment_state=lambda: "ARMED")
+    close_id = await plan_partial_close_with_matched_entry(rig, submitter, ttl_seconds=300)
+    await submitter.send_due()
+    assert (await submitter.get(close_id)).state == "FINAL"
+    await rig.outbox.deliver_due()
+    assert rig.ingest.calls == [] and rig.rows()[0][1] == "DROPPED"
+    assert (await rig.outbox.counts())["dropped"] == 1
+
+
+@pytest.mark.asyncio
+async def test_a_follow_signal_of_a_rejected_enter_carries_no_link(rig):
+    trader = ScriptedTrader()
+    trader.script = [("receipt", "REJECTED", "OUT_OF_DISCRETIONARY_SCOPE")]
+    submitter = Submitter(store=rig.store, supervisor=trader, leadership=FakeLeadership(1), clock=rig.clock,
+                          slots=SessionSlots(), experiment_state=lambda: "ARMED")
+    enter = ProposedDecision(action_key=f"enter:{AAPL}", action="ENTER", conid=AAPL, side="BUY", decider="jev",
+                             evidence_digest="sha256:" + "c" * 64, quantity=3, stop_price=225.4)
+    follow = SimulatedBaseline("follow_signal.v1", "strategy_signal", SIG, rig.clock.now(), conid=AAPL, side="BUY",
+                               reference_price=230.0, stop_price=225.4, target_price=234.6,
+                               deployment_digest="sha256:" + "a" * 64, linked_action_key=f"enter:{AAPL}")
+    now = rig.clock.now()
+
+    def commit(conn):
+        submitter.insert_in_tx(conn, source_kind="entry_signal", source_id=SIG, decision=enter,
+                               expires_at=now + dt.timedelta(seconds=300), epoch=1, now=now)
+        rig.outbox.enqueue_simulated_in_tx(conn, experiment_id=EXP, baseline=follow,
+                                           wait_for_decision_id=derive_decision_id(SIG, f"enter:{AAPL}"), now=now)
+    await rig.store.atransaction(commit)
+    await submitter.send_due()
+    await rig.outbox.deliver_due()
+    assert list(rig.ingest.rows.values())[0]["linked_decision_id"] is None
 
 
 @pytest.mark.asyncio
@@ -255,3 +299,33 @@ async def test_a_matched_entry_whose_close_never_reached_the_trader_is_dropped(r
     await rig.outbox.deliver_due()
     assert rig.ingest.calls == [] and rig.rows()[0][1] == "DROPPED"
     assert (await rig.outbox.counts())["dropped"] == 1
+
+
+@pytest.mark.asyncio
+async def test_a_correction_waits_until_its_estimate_is_delivered(rig):                # PR #84 thread 4210304972
+    attempt_key = rig.event("ESTIMATED_UNKNOWN")
+    await rig.outbox.pump_costs()
+    rig.ingest.script = ["down"]
+    await rig.outbox.deliver_due()                                   # the estimate goes into a 5 s backoff
+    write_correction(rig.store, attempt_key, usage=Usage(900, 100), cost_micros=1_400, now=rig.clock.now())
+    await rig.outbox.pump_costs()
+    estimate_id, correction_id = (row[0] for row in rig.rows())
+    await rig.outbox.deliver_due()                                   # the estimate is not due yet
+    assert [record for _, record in rig.ingest.calls] == [estimate_id]   # the correction was not tried
+    rig.clock.advance(5)
+    assert await rig.outbox.deliver_due() == 2
+    assert [record for _, record in rig.ingest.calls] == [estimate_id, estimate_id, correction_id]
+    assert [row[3] for row in rig.rows()] == ["TRADER_UNREACHABLE", None]   # never CORRECTION_TARGET_UNKNOWN
+
+
+@pytest.mark.asyncio
+async def test_a_correction_of_a_dead_estimate_is_dead_too(rig):
+    attempt_key = rig.event("ESTIMATED_UNKNOWN")
+    await rig.outbox.pump_costs()
+    rig.ingest.script = [("refuse", "EXPERIMENT_UNKNOWN", False)]
+    await rig.outbox.deliver_due()
+    write_correction(rig.store, attempt_key, usage=Usage(900, 100), cost_micros=1_400, now=rig.clock.now())
+    await rig.outbox.pump_costs()
+    await rig.outbox.deliver_due()
+    assert [(row[1], row[3]) for row in rig.rows()] == [("DEAD", "EXPERIMENT_UNKNOWN"), ("DEAD", "CORRECTED_RECORD_DEAD")]
+    assert len(rig.ingest.calls) == 1

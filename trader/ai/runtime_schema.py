@@ -2,7 +2,7 @@
 from __future__ import annotations
 
 from datetime import datetime
-from typing import Any
+from typing import Any, Optional
 
 from trader.ai.schema import FOUNDATION_MIGRATIONS, Migration
 from trader.ai.store import AiStore
@@ -41,7 +41,8 @@ RUNTIME_MIGRATIONS: tuple[Migration, ...] = (
             created_at TIMESTAMPTZ NOT NULL, delivered_at TIMESTAMPTZ)""")),
     Migration(13, "ai_cursors", ("""
         CREATE TABLE ai_cursors (
-            name VARCHAR PRIMARY KEY, value BIGINT NOT NULL, updated_at TIMESTAMPTZ NOT NULL)""",)),
+            name VARCHAR PRIMARY KEY, value BIGINT NOT NULL, updated_at TIMESTAMPTZ NOT NULL,
+            generation VARCHAR)""",)),
     Migration(14, "ai_opportunities", ("""
         CREATE TABLE ai_opportunities (
             opportunity_id VARCHAR PRIMARY KEY, signal_cursor BIGINT NOT NULL, strategy_name VARCHAR NOT NULL,
@@ -52,7 +53,7 @@ RUNTIME_MIGRATIONS: tuple[Migration, ...] = (
     Migration(15, "ai_coverage_gaps", ("""
         CREATE TABLE ai_coverage_gaps (
             gap_id VARCHAR PRIMARY KEY,
-            kind VARCHAR NOT NULL CHECK (kind IN ('RETENTION', 'CURSOR_AHEAD')),
+            kind VARCHAR NOT NULL CHECK (kind IN ('RETENTION', 'CURSOR_AHEAD', 'GENERATION_CHANGED')),
             after_cursor BIGINT NOT NULL, resumed_cursor BIGINT NOT NULL,
             detected_at TIMESTAMPTZ NOT NULL)""",)),
     Migration(16, "ai_call_contexts", ("""
@@ -77,11 +78,18 @@ def cursor_value_in_tx(conn: Any, name: str) -> int:
     return 0 if row is None else int(row[0])
 
 
-def set_cursor_in_tx(conn: Any, name: str, value: int, now: datetime) -> None:
+def cursor_generation_in_tx(conn: Any, name: str) -> Optional[str]:
+    """The source generation the cursor belongs to (the trader's signal record), or None if not known yet."""
+    row = conn.execute("SELECT generation FROM ai_cursors WHERE name = ?", [name]).fetchone()
+    return None if row is None else row[0]
+
+
+def set_cursor_in_tx(conn: Any, name: str, value: int, now: datetime, generation: Optional[str] = None) -> None:
     if type(value) is not int or value < 0:
         raise ValueError(f"cursor {name} must be a non-negative integer")
-    conn.execute("INSERT INTO ai_cursors VALUES (?, ?, ?) ON CONFLICT (name) DO UPDATE "
-                 "SET value = excluded.value, updated_at = excluded.updated_at", [name, value, now])
+    conn.execute("INSERT INTO ai_cursors VALUES (?, ?, ?, ?) ON CONFLICT (name) DO UPDATE "
+                 "SET value = excluded.value, updated_at = excluded.updated_at, generation = excluded.generation",
+                 [name, value, now, generation])
 
 
 async def read_cursor(store: AiStore, name: str) -> int:

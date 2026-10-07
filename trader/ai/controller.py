@@ -24,6 +24,7 @@ from trader.ai.ids import derive_decision_id
 from trader.ai.outbox import register_context_in_tx
 from trader.ai.rpc_clients import RpcNotSent, RpcOutcomeUnknown, RpcRefused
 from trader.ai.schedule import ENTRY, POSITION, Slot
+from trader.ai.store import to_utc
 
 logger = logging.getLogger(__name__)
 
@@ -31,6 +32,10 @@ WAIT = "WAIT"
 SLOT_POLL_SECONDS = 1.0
 CYCLE_SOURCE = {ENTRY: "entry_cycle", POSITION: "position_cycle"}
 TRADER_AWAY = (RpcNotSent, RpcOutcomeUnknown, RpcRefused)
+
+
+class SlotDeadlinePassed(Exception):
+    """A cycle's result arrived or was about to persist after its slot deadline: nothing is persisted."""
 
 
 class ExperimentWatch:
@@ -142,8 +147,10 @@ class AiController:
                          deadline=self._gateway.new_deadline(source_id), register=register)
 
     async def _commit(self, source_kind: str, source_id: str, experiment: ExperimentView, result: Any,
-                      finish: Callable[[Any, bool, Optional[str]], None]) -> None:
-        """Decisions, baselines and the opportunity or cycle state in one transaction."""
+                      finish: Callable[[Any, bool, Optional[str]], None],
+                      deadline: Optional[dt.datetime] = None) -> None:
+        """Decisions, baselines and the opportunity or cycle state in one transaction. With a slot
+        ``deadline``, the transaction persists nothing once it has passed (Ruling 8)."""
         problem = validate_result(source_kind, result)
         if problem is not None:
             logger.error("engine result for %s refused: %s", source_id, problem)
@@ -156,6 +163,8 @@ class AiController:
         expires_at = now + self._ttl
 
         def work(conn: Any) -> None:
+            if deadline is not None and self._clock.now() >= deadline:
+                raise SlotDeadlinePassed(source_id)
             for decision in result.decisions:
                 self._submitter.insert_in_tx(conn, source_kind=source_kind, source_id=source_id, decision=decision,
                                              expires_at=expires_at, epoch=epoch, now=now)
@@ -237,6 +246,7 @@ class AiController:
         now = self._clock.now()
         for kind in (POSITION, ENTRY):
             slot = self._slots.latest(kind, now)
+            await self._journal_elapsed_slots(kind, slot, now)
             if slot is None or await self._cycle_recorded(slot.cycle_id):
                 continue
             if not self._slots.is_due(slot, now):
@@ -256,6 +266,20 @@ class AiController:
                 continue
             await self.record_cycle(slot, "RUNNING", None)
             self._cycle_tasks[kind] = self._spawn(self.run_cycle(slot, positions))
+
+    async def _journal_elapsed_slots(self, kind: str, latest: Optional[Slot], now: dt.datetime) -> None:
+        """Slots that started after the newest journaled one and before ``latest`` were never seen
+        (a time jump or a restart): journal each as MISSED, never run them (Ruling 8, PR #84 thread 4210304802).
+        A first start has nothing journaled and invents no slots from before the service ran."""
+        row = await self._store.aquery("SELECT max(slot_start) FROM ai_cycles WHERE kind = ?", [kind], fetch="one")
+        if row is None or row[0] is None:
+            return
+        newest = to_utc(row[0])
+        if latest is not None and newest >= latest.start:
+            return
+        for slot in self._slots.elapsed(kind, newest, now):
+            if latest is None or slot.start < latest.start:
+                await self.record_cycle(slot, "MISSED", "LATE_START")
 
     async def _cycle_gate(self, kind: str) -> tuple[Optional[str], tuple]:
         experiment = self._watch.view
@@ -307,8 +331,11 @@ class AiController:
                 pending = self._engine.on_position_cycle(PositionCycleContext(now, experiment, slot, positions, work))
             budget = max((slot.deadline - now).total_seconds(), 0.0)
             result = await asyncio.wait_for(pending, timeout=budget)       # bounded work per slot (spec 5.2)
-            await self._commit(CYCLE_SOURCE[slot.kind], slot.cycle_id, experiment, result, finish)
-        except TimeoutError:
+            if self._clock.now() >= slot.deadline:                            # the answer came too late
+                raise SlotDeadlinePassed(slot.cycle_id)
+            await self._commit(CYCLE_SOURCE[slot.kind], slot.cycle_id, experiment, result, finish,
+                               deadline=slot.deadline)
+        except (TimeoutError, SlotDeadlinePassed):
             await finish_now("TIMED_OUT", "SLOT_DEADLINE")
             return
         except asyncio.CancelledError:

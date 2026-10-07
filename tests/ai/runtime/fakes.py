@@ -131,6 +131,10 @@ class FakeIngest:
         if isinstance(step, tuple):
             return {"status": "REFUSED", "record_id": body["record_id"], "code": step[1], "detail": None,
                     "retryable": step[2]}
+        target = body.get("corrects_record_id")
+        if target is not None and target not in self.rows:                  # Plan 2: the estimate must exist
+            return {"status": "REFUSED", "record_id": body["record_id"], "code": "CORRECTION_TARGET_UNKNOWN",
+                    "detail": None, "retryable": True}
         known = self.rows.get(body["record_id"])
         if known is not None and known != body:
             return {"status": "REFUSED", "record_id": body["record_id"], "code": "CONFLICTING_DUPLICATE",
@@ -189,10 +193,15 @@ class FakeSignals:
 
     def __init__(self):
         self.record, self.watermark, self.calls = [], 0, []
+        self.generation = "gen-" + "a" * 32
 
     def add(self, **kwargs):
         self.record.append(signal(len(self.record) + 1, **kwargs))
         return self.record[-1]
+
+    def replace_record(self, generation):
+        """The trader's record was recreated: new generation, cursors start again at 1."""
+        self.record, self.watermark, self.generation = [], 0, generation
 
     async def call(self, method, body, *, epoch=None):
         from trader.ai.rpc_clients import RpcRefused
@@ -206,7 +215,8 @@ class FakeSignals:
         page = [(position, s) for position, s in enumerate(self.record, 1) if position > start][:body["limit"]]
         rows = [s for _, s in page]
         return {"signals": rows, "next_cursor": page[-1][0] if page else start,
-                "oldest_retained_cursor": self.watermark + 1, "gap": body["after_cursor"] < self.watermark}
+                "oldest_retained_cursor": self.watermark + 1, "gap": body["after_cursor"] < self.watermark,
+                "record_generation": self.generation}
 
 
 EXP_ID = "exp-" + "b" * 20

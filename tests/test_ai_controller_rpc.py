@@ -10,7 +10,7 @@ from tests.automation.test_controller_epoch import Clock
 from tests.test_ai_paper_rpc import _served, command, enter_body, publish, query, register
 from trader.automation.ai_paper_config import AiPaperConfig
 from trader.data.duckdb_store import DuckDBConnection
-from trader.data.strategy_signal_record import SignalEntry, StrategySignalRecord
+from trader.data.strategy_signal_record import RECORD_GENERATION, SignalEntry, StrategySignalRecord
 from trader.messaging.typed_rpc import TypedRpcRemoteError
 
 
@@ -160,6 +160,8 @@ def test_signals_page_through_rpc(served):
     page = read_signals(served, 0, 2, epoch)
     assert [s["cursor"] for s in page["signals"]] == [1, 2]
     assert (page["next_cursor"], page["oldest_retained_cursor"], page["gap"]) == (2, 1, False)
+    assert RECORD_GENERATION.fullmatch(page["record_generation"])           # PR #84 thread 4210304622
+    assert read_signals(served, 2, 2, epoch)["record_generation"] == page["record_generation"]
     assert page["signals"][0]["action"] == "BUY" and page["signals"][0]["conid"] == 265598
 
 

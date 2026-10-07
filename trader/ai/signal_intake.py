@@ -15,13 +15,14 @@ from typing import Any
 
 from trader.ai.engine import SignalOpportunity, parse_aware
 from trader.ai.rpc_clients import RpcRefused
-from trader.ai.runtime_schema import cursor_value_in_tx, set_cursor_in_tx
+from trader.ai.runtime_schema import cursor_generation_in_tx, cursor_value_in_tx, set_cursor_in_tx
 from trader.ai.store import to_utc
 
 logger = logging.getLogger(__name__)
 
 SIGNAL_CURSOR = "signals"
 SOURCE_EVENT_ID = re.compile(r"^sig-[0-9a-f]{32}$")
+RECORD_GENERATION = re.compile(r"^gen-[0-9a-f]{32}$")
 _COLUMNS = ("opportunity_id, signal_cursor, strategy_name, conid, action, probability, signal_time, recorded_at, "
             "state")
 
@@ -76,7 +77,8 @@ class SignalIntake:
 
     async def poll(self) -> list[str]:
         """One page from the trader. Returns the ids of new opportunities, in cursor order."""
-        cursor = await self._store.atransaction(lambda conn: cursor_value_in_tx(conn, SIGNAL_CURSOR))
+        cursor, known_generation = await self._store.atransaction(lambda conn: (
+            cursor_value_in_tx(conn, SIGNAL_CURSOR), cursor_generation_in_tx(conn, SIGNAL_CURSOR)))
         try:
             page = await self._supervisor.call("read_ai_signals", {"after_cursor": cursor, "limit": self._limit})
         except RpcRefused as exc:
@@ -91,6 +93,12 @@ class SignalIntake:
         oldest = _nonnegative_int(page.get("oldest_retained_cursor"), "oldest_retained_cursor")
         if next_cursor < cursor:
             raise SignalIntakeError("PAGE_MALFORMED", "next_cursor moved backwards")
+        generation = page.get("record_generation")
+        if not isinstance(generation, str) or not RECORD_GENERATION.fullmatch(generation):
+            raise SignalIntakeError("PAGE_MALFORMED", "record_generation must look like gen-<32 hex>")
+        if known_generation is not None and generation != known_generation:
+            await self._record_replacement(cursor, generation)
+            return []
         now = self._clock.now()
 
         def work(conn: Any) -> list[str]:
@@ -106,13 +114,25 @@ class SignalIntake:
                              [s.opportunity_id, s.signal_cursor, s.strategy_name, s.conid, s.action, s.probability,
                               s.signal_time, s.recorded_at, now, now])
                 new.append(s.opportunity_id)
-            set_cursor_in_tx(conn, SIGNAL_CURSOR, next_cursor, now)
+            set_cursor_in_tx(conn, SIGNAL_CURSOR, next_cursor, now, generation)
             return new
         new = await self._store.atransaction(work)
         if page["gap"]:
             logger.warning("signal coverage gap: signals after cursor %s and before %s were removed by retention",
                            cursor, oldest)
         return new
+
+    async def _record_replacement(self, cursor: int, generation: str) -> None:
+        """Another record answers, even at the same cursor (PR #84 thread 4210304622): what the old one held
+        after ``cursor`` is unknown. Write the gap and read the new record from its beginning."""
+        now = self._clock.now()
+        logger.error("the trader's signal record was replaced (cursor %s); restarting from 0", cursor)
+
+        def work(conn: Any) -> None:
+            conn.execute("INSERT INTO ai_coverage_gaps VALUES (?, 'GENERATION_CHANGED', ?, 0, ?) "
+                         "ON CONFLICT (gap_id) DO NOTHING", [f"gap-g-{cursor}-{generation}", cursor, now])
+            set_cursor_in_tx(conn, SIGNAL_CURSOR, 0, now, generation)
+        await self._store.atransaction(work)
 
     async def _record_reset(self, cursor: int) -> None:
         now = self._clock.now()

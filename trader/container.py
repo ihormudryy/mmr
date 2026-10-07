@@ -46,9 +46,12 @@ def ensure_config_dir() -> Path:
     config lives in ``~/.config/mmr/`` and is the sole source of truth
     for running services (bind-mounted into the container).
 
-    Returns the path to ~/.config/mmr.
+    Returns the path to ~/.config/mmr. With ``MMR_CONFIG_DEFAULTS=off`` nothing is
+    copied: the ``ai`` container masks the directory and must not get a trader.yaml.
     """
     MMR_CONFIG_DIR.mkdir(parents=True, exist_ok=True)
+    if os.environ.get("MMR_CONFIG_DEFAULTS") == "off":
+        return MMR_CONFIG_DIR
     bundled = _bundled_configs_dir()
     if bundled.exists():
         for src in bundled.glob('*.yaml'):

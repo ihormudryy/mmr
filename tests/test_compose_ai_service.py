@@ -7,7 +7,8 @@ import yaml
 from tests.compose_rpc_helpers import CONTAINER_CONFIG, ROOT, load_compose, visible_rpc_files, volumes
 from trader.messaging.principals import service_rpc_files
 
-ALLOWED_ENV = {"TZ", "PYTHONDONTWRITEBYTECODE", "TRADER_TYPED_ADDRESS", "OPENROUTER_API_KEY", "AWS_REGION",
+ALLOWED_ENV = {"TZ", "PYTHONDONTWRITEBYTECODE", "TRADER_TYPED_ADDRESS", "MMR_CONFIG_DEFAULTS",
+               "OPENROUTER_API_KEY", "AWS_REGION",
                "AWS_ACCESS_KEY_ID", "AWS_SECRET_ACCESS_KEY", "AWS_SESSION_TOKEN", "AZURE_OPENAI_ENDPOINT",
                "AZURE_OPENAI_API_KEY", "AZURE_OPENAI_API_VERSION"}
 FORBIDDEN_PREFIXES = ("ALPACA_", "IB_", "TWS_", "MASSIVE_", "TWELVEDATA_", "DASHBOARD_", "TELEGRAM")
@@ -35,12 +36,43 @@ def test_ai_sees_its_two_key_pairs_and_the_trader_public_key_only(ai):
         "ai_supervisor.key", "ai_supervisor.pub", "ai_research.key", "ai_research.pub", "trader.pub"}
 
 
-def test_ai_reads_only_ai_yaml_from_the_config_dir(ai):
+def visible_config_files(service) -> set[str]:
+    """Paths under ~/.config/mmr a container can read, from its mounts alone (PR #84 thread 4210307354).
+
+    The image bakes config_defaults/*.yaml (trader.yaml among them) into that directory, so it must be masked
+    by a tmpfs; then only the binds mounted inside it are visible.
+    """
+    vols = volumes(service)
+    masked = any(v["type"] == "tmpfs" and v["target"] == CONTAINER_CONFIG for v in vols)
+    assert masked, "the baked ~/.config/mmr (trader.yaml) would be visible"
+    return {v["target"][len(CONTAINER_CONFIG) + 1:] for v in vols
+            if v["type"] == "bind" and v["target"].startswith(CONTAINER_CONFIG + "/")}
+
+
+def test_ai_sees_only_ai_yaml_its_keys_and_the_hmac_mask_under_the_config_dir(ai):
+    assert visible_config_files(ai) == {
+        "ai.yaml", "service_hmac.key", *(f"keys/rpc/{name}" for name in service_rpc_files("ai"))}
     mounted = {v["target"]: v for v in volumes(ai)}
-    assert CONTAINER_CONFIG not in mounted                   # trader.yaml may hold alpaca_api_key_id
     ai_yaml = mounted[f"{CONTAINER_CONFIG}/ai.yaml"]
     assert ai_yaml["read_only"] and ai_yaml["source"] == "${HOME}/.config/mmr/ai.yaml"
     assert not [v for v in volumes(ai) if "secrets" in v["source"] or v["source"] == "mmr_db_data"]
+    assert not [v for v in volumes(ai) if v["type"] == "bind" and v["source"] == "${HOME}/.config/mmr"]
+
+
+def test_ai_never_copies_the_config_templates_into_the_mask(ai):
+    assert ai["environment"]["MMR_CONFIG_DEFAULTS"] == "off"
+
+
+def test_the_config_defaults_switch_copies_nothing(tmp_path, monkeypatch):
+    import trader.container as container
+    target = tmp_path / "config"
+    target.mkdir()
+    monkeypatch.setattr(container, "MMR_CONFIG_DIR", target)
+    monkeypatch.setenv("MMR_CONFIG_DEFAULTS", "off")
+    assert container.ensure_config_dir() == target and list(target.iterdir()) == []
+    monkeypatch.delenv("MMR_CONFIG_DEFAULTS")
+    container.ensure_config_dir()
+    assert (target / "trader.yaml").exists()                           # the default for every other process
 
 
 def test_ai_data_is_a_named_volume_that_survives_recreation(ai):

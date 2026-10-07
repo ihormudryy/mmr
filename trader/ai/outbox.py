@@ -27,8 +27,8 @@ COST_STATUS = {COST_CONFIRMED: "confirmed", COST_ESTIMATED_UNKNOWN: "estimated",
 METHOD_BY_KIND = {"cost": "record_ai_cost", "simulated": "record_simulated_decision"}
 DELIVERED = frozenset({"INSERTED", "DUPLICATE"})
 DEAD_CODES = frozenset({"VALIDATION_ERROR", "PERMISSION_DENIED", "METHOD_NOT_ALLOWED"})
-ADMITTED_SUBMISSIONS = ("ACCEPTED", "FINAL")
 NEVER_ADMITTED_SUBMISSIONS = ("ABANDONED", "NOT_ADMITTED", "FAILED")
+WAIT, DROP, LINK, UNLINKED = "WAIT", "DROP", "LINK", "UNLINKED"
 MAX_BACKOFF_SECONDS = 300
 
 
@@ -77,6 +77,24 @@ def simulated_body(experiment_id: str, baseline: SimulatedBaseline) -> dict:
             "linked_decision_id": baseline.linked_decision_id,
             "linked_round_trip_id": baseline.linked_round_trip_id,
             "deployment_digest": baseline.deployment_digest, "incomplete_reason": baseline.incomplete_reason}
+
+
+def _release_verdict(own_close: bool, submission_state: Optional[str], receipt_state: Optional[str]) -> str:
+    """When a waiting baseline may go out, and with or without its link.
+
+    A matched-entry record needs a model close the trader carried out, so it waits for a RESOLVED close
+    (a SUBMITTED command can still end REJECTED) and is dropped for a rejected or never-sent close. Other
+    baselines link to their decision while the trader holds it, and go out unlinked when it was refused.
+    """
+    never_admitted = (submission_state is None or submission_state in NEVER_ADMITTED_SUBMISSIONS
+                      or (submission_state == "FINAL" and receipt_state != "RESOLVED"))
+    if own_close:
+        if never_admitted:
+            return DROP
+        return LINK if submission_state == "FINAL" else WAIT
+    if never_admitted:
+        return UNLINKED
+    return LINK if submission_state in ("ACCEPTED", "FINAL") else WAIT
 
 
 class ReportingOutbox:
@@ -131,26 +149,24 @@ class ReportingOutbox:
         return body["record_id"]
 
     async def release_waiting(self) -> None:
-        """A linked baseline goes out once its decision is settled: linked if the trader has it, else null."""
+        """A linked baseline goes out once its decision is settled (Ruling 13, PR #84 thread 4210304478)."""
         def work(conn: Any) -> None:
             rows = conn.execute(
-                "SELECT o.record_id, o.body_json, o.wait_for_decision_id, s.state FROM ai_outbox o "
+                "SELECT o.record_id, o.body_json, o.wait_for_decision_id, s.state, s.receipt_state FROM ai_outbox o "
                 "LEFT JOIN ai_submissions s ON s.decision_id = o.wait_for_decision_id "
                 "WHERE o.state = 'WAITING'").fetchall()
-            for record_id, body_json, decision_id, submission_state in rows:
+            for record_id, body_json, decision_id, submission_state, receipt_state in rows:
                 body = json.loads(body_json)
                 own_close = body["baseline_id"] == MATCHED_ENTRY_BASELINE      # waits on its close, keeps its ENTER
-                if submission_state in ADMITTED_SUBMISSIONS:
-                    link = body["linked_decision_id"] if own_close else decision_id
-                elif submission_state is None or submission_state in NEVER_ADMITTED_SUBMISSIONS:
-                    if own_close:
-                        logger.info("matched-entry %s dropped: its close never reached the trader", record_id)
-                        conn.execute("UPDATE ai_outbox SET state = 'DROPPED' WHERE record_id = ?", [record_id])
-                        continue
-                    link = None
-                else:
+                verdict = _release_verdict(own_close, submission_state, receipt_state)
+                if verdict == WAIT:
                     continue
-                body["linked_decision_id"] = link
+                if verdict == DROP:
+                    logger.info("matched-entry %s dropped: its close was never admitted by the trader", record_id)
+                    conn.execute("UPDATE ai_outbox SET state = 'DROPPED' WHERE record_id = ?", [record_id])
+                    continue
+                if not own_close:
+                    body["linked_decision_id"] = decision_id if verdict == LINK else None
                 conn.execute("UPDATE ai_outbox SET body_json = ?, state = 'PENDING' WHERE record_id = ?",
                              [canonical_json(body), record_id])
         await self._store.atransaction(work)
@@ -163,8 +179,11 @@ class ReportingOutbox:
             "ORDER BY created_seq LIMIT ?", [self._clock.now(), limit])
         delivered = 0
         for record_id, kind, body_json, attempts in rows:
+            body = json.loads(body_json)
+            if not await self._predecessor_delivered(record_id, body.get("corrects_record_id")):
+                continue
             try:
-                reply = await self._supervisor.call(METHOD_BY_KIND[kind], json.loads(body_json))
+                reply = await self._supervisor.call(METHOD_BY_KIND[kind], body)
             except (RpcNotSent, RpcOutcomeUnknown) as exc:
                 await self._retry(record_id, attempts, exc.code)
                 break                                  # the trader is away: keep the order, try later
@@ -182,6 +201,17 @@ class ReportingOutbox:
             else:
                 await self._dead(record_id, (reply or {}).get("code") or "REPLY_MALFORMED")
         return delivered
+
+    async def _predecessor_delivered(self, record_id: str, corrected_id: Optional[str]) -> bool:
+        """A correction goes out only after the estimate it corrects was delivered (PR #84 thread 4210304972)."""
+        if corrected_id is None:
+            return True
+        row = await self._store.aquery("SELECT state FROM ai_outbox WHERE record_id = ?", [corrected_id],
+                                       fetch="one")
+        if row is not None and row[0] == "DEAD":
+            await self._dead(record_id, "CORRECTED_RECORD_DEAD")
+            return False
+        return row is None or row[0] == "DELIVERED"   # no local estimate: the trader decides
 
     async def counts(self) -> dict:
         rows = await self._store.aquery("SELECT state, COUNT(*) FROM ai_outbox GROUP BY state")

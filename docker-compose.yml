@@ -565,6 +565,8 @@ services:
   # ~/.config/mmr/ai.yaml are filled in (./docker.sh -u copies the template there). Holds
   # model-provider credentials only (spec 4): it does NOT inherit x-mmr-common-env (Alpaca
   # keys) and does NOT mount ~/.config/mmr (trader.yaml may hold Alpaca keys) -- only ai.yaml.
+  # A tmpfs masks the image's baked ~/.config/mmr (config_defaults, trader.yaml among them), and
+  # MMR_CONFIG_DEFAULTS=off stops the logging setup from copying the templates back into it.
   # Two RPC key pairs (ai_supervisor, ai_research) plus trader.pub. Its state, ai.duckdb, lives
   # on the named volume mmr_ai_data and survives container recreation. No port is bound;
   # the healthcheck reads the heartbeat file the controller writes every 10 s.
@@ -581,6 +583,7 @@ services:
     environment:
       TZ: ${TIME_ZONE:-America/New_York}
       PYTHONDONTWRITEBYTECODE: "1"
+      MMR_CONFIG_DEFAULTS: "off"
       TRADER_TYPED_ADDRESS: tcp://trader
       OPENROUTER_API_KEY: ${OPENROUTER_API_KEY:-}
       AWS_REGION: ${AWS_REGION:-}
@@ -591,6 +594,11 @@ services:
       AZURE_OPENAI_API_KEY: ${AZURE_OPENAI_API_KEY:-}
       AZURE_OPENAI_API_VERSION: ${AZURE_OPENAI_API_VERSION:-}
     volumes:
+      - type: tmpfs
+        target: /home/trader/.config/mmr
+        tmpfs:
+          size: 65536
+          mode: 0755
       - type: tmpfs
         target: /home/trader/.config/mmr/keys/rpc
         tmpfs:

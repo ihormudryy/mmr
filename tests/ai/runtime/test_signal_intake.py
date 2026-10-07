@@ -107,3 +107,38 @@ async def test_the_read_carries_the_held_epoch_from_the_client(rig):
     rig.signals.add()
     await rig.intake.poll()
     assert rig.signals.calls == [(0, None)]          # the epoch is attached by PrincipalClient, not by the intake
+
+
+@pytest.mark.asyncio
+async def test_a_replaced_record_at_the_same_high_water_is_a_coverage_gap(rig):        # PR #84 thread 4210304622
+    rig.intake = SignalIntake(store=rig.store, supervisor=rig.signals, clock=rig.clock, page_limit=10)
+    old = [rig.signals.add() for _ in range(5)]
+    assert await rig.intake.poll() == [s["source_event_id"] for s in old]
+    rig.signals.replace_record("gen-" + "b" * 32)
+    new = [rig.signals.add(strategy="momentum") for _ in range(5)]                # cursor 5 again
+    assert await rig.intake.poll() == []                                          # nothing claimed from this read
+    assert rig.gaps() == [("GENERATION_CHANGED", 5, 0)] and await read_cursor(rig.store, "signals") == 0
+    assert await rig.intake.poll() == [s["source_event_id"] for s in new]         # from the new record's start
+    assert await rig.intake.poll() == [] and len(rig.gaps()) == 1
+
+
+@pytest.mark.asyncio
+async def test_the_first_read_adopts_the_generation_and_a_reset_forgets_it(rig):
+    rig.signals.add()
+    await rig.intake.poll()
+    assert rig.gaps() == []
+    await rig.store.atransaction(lambda conn: set_cursor_in_tx(conn, "signals", 40, rig.clock.now()))
+    rig.signals.generation = "gen-" + "c" * 32                                  # a reset record answers AHEAD first
+    assert await rig.intake.poll() == []
+    assert await rig.intake.poll() == []                                          # the same signal: deduplicated
+    assert [g[0] for g in rig.gaps()] == ["CURSOR_AHEAD"]                         # one gap, not two
+    assert await read_cursor(rig.store, "signals") == 1
+
+
+@pytest.mark.asyncio
+async def test_a_page_without_a_valid_generation_fails_loudly(rig):
+    rig.signals.add()
+    rig.signals.generation = "not-a-generation"
+    with pytest.raises(SignalIntakeError):
+        await rig.intake.poll()
+    assert rig.opportunities() == [] and await read_cursor(rig.store, "signals") == 0

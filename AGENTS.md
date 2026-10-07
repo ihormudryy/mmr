@@ -48,13 +48,17 @@ How to review (every reviewer model works the same way):
 - When no blocker is left, submit `gh pr review N --approve` with the one-line verdict. Verified and resolved threads alone are not an approval.
 - Once a fix is verified, resolve the threads you opened, then remove your own `review:<key>` label.
 
+Who reviews what (both report any blocker; do not repeat another reviewer's finding on the same head, reply in its thread):
+- **OpenAI:** correctness and order safety: races, crash and restart, unknown broker or RPC outcomes, money and sizing.
+- **Grok:** operability and test quality: deploy, compose and config paths, docs and runbooks matching the code, error messages, tests that really exercise the claim (real stack where the spec asks, no wall-clock races, negative cases), conformance to the spec, plan index and owner rulings.
+
 Review threads:
 - The author answers in each thread: "Fixed in <sha>: ... Test: ..." after the fix is pushed, or "Disagree: <reason>". While fixes are not pushed yet, the author posts one PR comment saying so, so reviewers know why nothing has changed.
 - Reviewers have code write access only so their approvals count toward master's approval rule and so they can resolve threads. A reviewer never pushes commits, never pushes to a branch it reviews, and never merges. An approval (`gh pr review N --approve`) means: the latest verdict is ready, with no blocker.
 - Only the reviewer who opened a thread resolves it, after checking the fix on the pushed head. If the fix is not there, reply in the thread (do not wait silently). If a follow-up is needed, name the exact regression test that would prove it.
 - The author re-adds the `review:<key>` labels after pushing fixes; that is the signal for the next round.
 
-Automatic reviews: adding `review:openai` or `review:grok` to a PR also runs `.github/workflows/ai-review.yml`. It reads the diff only (not the whole repo, no test run), asks the model through `scripts/ai_review.py` (backend `REVIEW_PROVIDER` = openrouter, bedrock or azure; model in the `REVIEW_MODEL_OPENAI` / `REVIEW_MODEL_GROK` repo variables), posts the review as that App and removes the label. A full agentic review (reading code, running tests) is still done by the owner's tools. The script reads this section as the review rules, so keep its heading unchanged.
+Automatic reviews: `.github/workflows/ai-review.yml` (disabled now) reviews the diff only through `scripts/ai_review.py` and reads this section as its rules, so keep its heading unchanged.
 
 When a review is done (stopping rule):
 - **Blocker:** a defect with a concrete failing input, a failing test, or an exact event order that loses protection, sends a wrong order or reports a false success. Only blockers hold a merge.

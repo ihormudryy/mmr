@@ -203,6 +203,25 @@ class EntrySource:
     facts: Mapping[str, Any]
     untrusted: tuple[tuple[str, str], ...]
 
+    @classmethod
+    def for_signal(cls, opportunity: Any, strategy: Any) -> "EntrySource":
+        facts = {"source": "strategy_signal", "strategy": opportunity.strategy_name, "conid": opportunity.conid,
+                 "probability": opportunity.probability, "signal_time": opportunity.signal_time.isoformat()}
+        return cls("strategy", opportunity.conid, strategy.deployment_digest, strategy.stop_fraction,
+                   strategy.target_fraction, None, facts, ())
+
+    @classmethod
+    def for_candidate(cls, chosen: Any, decisions: Any, cycle_id: str) -> "EntrySource":
+        """A self-found idea: the orchestrator's thesis and the news reach Jev as untrusted text only."""
+        c = chosen.candidate
+        facts = {"source": "self_found", "cycle_id": cycle_id, "symbol": c.symbol, "conid": c.conid,
+                 "origins": list(c.origins), "change_pct": c.change_pct, "delayed_price": c.price}
+        untrusted = (("orchestrator_thesis", chosen.thesis),) + tuple(
+            ("news", f"{line.published} {line.source}: {line.title}. {line.summary}") for line in c.news)
+        bracket = decisions.self_found_bracket
+        return cls("discretionary", c.conid, decisions.discretionary_deployment_digest, bracket.stop_fraction,
+                   bracket.target_fraction, c.median_dollar_volume, facts, untrusted)
+
     def to_json(self) -> dict:
         return {"kind": self.kind, "conid": self.conid, "deployment_digest": self.deployment_digest,
                 "stop_fraction": self.stop_fraction, "target_fraction": self.target_fraction,

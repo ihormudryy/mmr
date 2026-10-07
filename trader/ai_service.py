@@ -54,8 +54,10 @@ class EngineDeps:
 
 
 def build_engine(deps: EngineDeps) -> DecisionEngine:
-    """Plan 6 installs the real engine here (Ruling 16). Until then the service refuses to start."""
-    raise EngineNotInstalled("no decision engine is installed (SP2 Plan 6); the ai service will not start")
+    """SP2 Plan 6: the paper decision engine (Ruling 16 of Plan 5 is now fulfilled)."""
+    from trader.ai.decision_engine import PaperDecisionEngine
+    return PaperDecisionEngine(config=deps.config, reads=deps.reads, recorder=deps.recorder, store=deps.store,
+                               clock=deps.clock)
 
 
 @dataclass(frozen=True)

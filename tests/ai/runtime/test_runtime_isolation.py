@@ -8,7 +8,10 @@ FORBIDDEN = ("ib_async", "trader.trading", "trader.trader_service", "trader.data
              "trader.strategy", "alpaca")
 MODULES = ("trader.ai.ids", "trader.ai.runtime_schema", "trader.ai.rpc_clients", "trader.ai.leadership",
            "trader.ai.schedule", "trader.ai.engine", "trader.ai.submitter", "trader.ai.outbox",
-           "trader.ai.signal_intake", "trader.ai.controller", "trader.ai_service")
+           "trader.ai.signal_intake", "trader.ai.controller", "trader.ai_service",
+           # SP2 Plan 6
+           "trader.ai.decision_schema", "trader.ai.tools", "trader.ai.evidence", "trader.ai.discovery_client",
+           "trader.ai.roles", "trader.ai.baselines", "trader.ai.decision_engine")
 
 
 def test_the_runtime_stays_clear_of_the_trading_runtime():

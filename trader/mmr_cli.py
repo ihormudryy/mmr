@@ -1384,6 +1384,7 @@ def build_parser() -> argparse.ArgumentParser:
         _p.add_argument('--experiment-id', dest='experiment_id', default=None,
                         help='Defaults to the active experiment; the server checks it')
         _p.add_argument('--reason', required=True)
+    _add_acceptance_parser(experiment_sub, fmt)
 
     # scoreboard (SP1 Plan 5)
     scoreboard_p = sub.add_parser(
@@ -3108,8 +3109,145 @@ def _experiment_status_lines(status: dict) -> list:
     return lines
 
 
+def _add_acceptance_parser(experiment_sub, fmt) -> None:
+    """``experiment acceptance`` (SP1 Plan 6): the operator's paper acceptance harness, host only."""
+    acc_p = experiment_sub.add_parser(
+        'acceptance', help='SP1 paper acceptance harness (host only; see docs/PAPER_ACCEPTANCE_SP1.md)',
+        epilog='Examples:\n'
+               '  experiment acceptance preflight\n'
+               '  experiment acceptance run                       # dry run: prints the plan, sends nothing\n'
+               '  experiment acceptance run --place-orders --confirm-account DU1234567 '
+               '--signing-key ~/.config/mmr/keys/acceptance/operator.key\n'
+               '  experiment acceptance finish --run-id acc-20261007-abcdef --signing-key KEY\n'
+               '  experiment acceptance status --run-id acc-20261007-abcdef\n'
+               '  experiment acceptance verify-report REPORT.json --public-key PUB.pem',
+        formatter_class=fmt)
+    acc_sub = acc_p.add_subparsers(dest='acceptance_action')
+    acc_sub.add_parser('preflight', help='The clean-account gate: PASS or STOP with the reasons (exit 1)')
+    run_p = acc_sub.add_parser('run', help='Steps 1-7 and the live OCA shrink proof (orders only with '
+                                           '--place-orders)')
+    run_p.add_argument('--run-id', dest='run_id', default=None, help='Resume this run (replays stored bodies)')
+    run_p.add_argument('--conids', nargs=2, type=int, default=[265598, 272093], metavar=('A', 'B'))
+    run_p.add_argument('--quantity-a', dest='quantity_a', type=int, default=3)
+    run_p.add_argument('--quantity-b', dest='quantity_b', type=int, default=1)
+    run_p.add_argument('--notional', type=float, default=2000.0, help='USD per entry; never raised')
+    run_p.add_argument('--place-orders', dest='place_orders', action='store_true', default=False)
+    run_p.add_argument('--confirm-account', dest='confirm_account', default=None)
+    run_p.add_argument('--report', default=None, help='Where to write the signed report')
+    run_p.add_argument('--signing-key', dest='signing_key', default=None, help='Operator Ed25519 key (PEM)')
+    finish_p = acc_sub.add_parser('finish', help='After 15:55 ET: end checks on broker evidence')
+    finish_p.add_argument('--run-id', dest='run_id', required=True)
+    finish_p.add_argument('--report', default=None)
+    finish_p.add_argument('--signing-key', dest='signing_key', default=None, help='Operator Ed25519 key (PEM)')
+    status_p = acc_sub.add_parser('status', help='The local run journal (no service, no key)')
+    status_p.add_argument('--run-id', dest='run_id', required=True)
+    verify_p = acc_sub.add_parser('verify-report', help='Check a report signature offline')
+    verify_p.add_argument('path')
+    verify_p.add_argument('--public-key', dest='public_key', required=True)
+
+
+def _handle_experiment_acceptance(mmr: MMR, args: argparse.Namespace, *, now=None, sleep=None) -> None:
+    """Exit code 0 only when the asked-for check passed; every refusal names its code."""
+    import datetime as _dt
+    import time as _time
+    from trader.acceptance import runner
+
+    action = getattr(args, 'acceptance_action', None) or 'preflight'
+    clock = now or (lambda: _dt.datetime.now(_dt.timezone.utc))
+    pause = sleep or _time.sleep
+    try:
+        if action == 'preflight':
+            ok = _acceptance_preflight(mmr, runner, clock, pause)
+        elif action == 'run':
+            ok = _acceptance_run(mmr, args, runner, clock, pause)
+        elif action == 'finish':
+            outcome = runner.finish(mmr.acceptance_endpoints(), run_id=args.run_id, report_path=args.report,
+                                    signing_key=args.signing_key, now=clock, sleep=pause)
+            _print_acceptance_results('finish', outcome)
+            ok = all(r.passed for r in outcome.results)
+        elif action == 'status':
+            result = runner.status(args.run_id)
+            if _json_mode:
+                print_json_result(result, title='Acceptance run (local journal)')
+            else:
+                for step in result['steps'] + result['end_checks']:
+                    mark = 'PASS' if step['passed'] else 'FAIL'
+                    console.print(f"[{mark}] {step['name']}" + (f": {step['code']}" if step['code'] else ''),
+                                  markup=False)
+            ok = True
+        else:
+            result = runner.verify_report(args.path, args.public_key)
+            if _json_mode:
+                print_json_result(result, title='Acceptance report')
+            else:
+                console.print('signature OK' if result['signature_ok'] else 'signature BAD', markup=False)
+                for key in ('signing_key', 'evidence_source', 'deployment_record', 'live_restart_recovery',
+                            'oca_shrink', 'passed'):
+                    console.print(f'{key}: {result[key]}', markup=False)
+            ok = result['valid']
+    except runner.AcceptanceRefused as refused:
+        print_status(f'acceptance refused {refused}', success=False)
+        sys.exit(1)
+    if not ok:
+        sys.exit(1)
+
+
+def _acceptance_preflight(mmr: MMR, runner, clock, pause) -> bool:
+    result = runner.preflight(lambda method, body: mmr.acceptance_preflight(), now=clock, sleep=pause)
+    if _json_mode:
+        print_json_result(result, title='Acceptance preflight')
+    elif result['passed']:
+        console.print('PASS', markup=False)
+    else:
+        console.print('STOP', markup=False)
+        for code in result['failures']:
+            console.print(f'  {code}', markup=False)
+    return result['passed']
+
+
+def _acceptance_run(mmr: MMR, args, runner, clock, pause) -> bool:
+    outcome = runner.run(
+        mmr.acceptance_endpoints(), run_id=args.run_id, conids=tuple(args.conids), quantity_a=args.quantity_a,
+        quantity_b=args.quantity_b, notional=args.notional, place_orders=args.place_orders,
+        confirm_account=args.confirm_account, report_path=args.report, signing_key=args.signing_key,
+        now=clock, sleep=pause)
+    if outcome.dry_run:
+        preflight = outcome.results[0]
+        if _json_mode:
+            print_json_result({'dry_run': True, 'preflight': {'passed': preflight.passed, 'code': preflight.code},
+                               'planned_calls': outcome.results[-1].evidence.get('planned_calls')},
+                              title='Acceptance dry run')
+        else:
+            console.print('dry run: nothing was sent', markup=False)
+            console.print(f"preflight: {'PASS' if preflight.passed else 'STOP ' + str(preflight.code)}",
+                          markup=False)
+            for principal, method in outcome.results[-1].evidence.get('planned_calls') or []:
+                console.print(f'  {principal}: {method}', markup=False)
+        return preflight.passed
+    _print_acceptance_results('run', outcome)
+    if outcome.passed and not _json_mode:
+        console.print('B open, protected; waiting for the session flatten', markup=False)
+    return outcome.passed
+
+
+def _print_acceptance_results(phase: str, outcome) -> None:
+    from trader.acceptance.runner import print_lines_for
+    if _json_mode:
+        print_json_result({'run_id': outcome.run_id, 'report': str(outcome.report_path), 'passed': outcome.passed,
+                           'results': [{'name': r.name, 'passed': r.passed, 'code': r.code}
+                                       for r in outcome.results]}, title=f'Acceptance {phase}')
+        return
+    console.print(f'run_id: {outcome.run_id}', markup=False)
+    for line in print_lines_for(outcome.results):
+        console.print(line, markup=False)
+    console.print(f'signed report: {outcome.report_path}', markup=False)
+
+
 def _handle_experiment(mmr: MMR, args: argparse.Namespace):
     action = getattr(args, 'experiment_action', None) or 'status'
+    if action == 'acceptance':
+        _handle_experiment_acceptance(mmr, args)
+        return
     if action == 'status':
         status = mmr.experiment_status()
         if _json_mode:
@@ -12228,6 +12366,8 @@ def main():
         if cmd == 'keys':
             sys.exit(_handle_keys(args))
         is_local = cmd in _LOCAL_ONLY_COMMANDS
+        if cmd == 'experiment' and getattr(args, 'experiment_action', None) == 'acceptance':
+            is_local = True          # typed RPC with its own keys, or the local journal: no legacy connect
         if cmd in ('strategies', 'strat'):
             strat_action = getattr(args, 'strat_action', None)
             if strat_action in _LOCAL_ONLY_STRAT_ACTIONS:

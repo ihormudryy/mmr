@@ -365,8 +365,8 @@ class AcceptanceScenario:
         evidence = {"first": first, "second": second, "failures": list(verdict.failures)}
         if not verdict.passed:
             raise StepFailure(verdict.failures[0], evidence)
-        if second.get("account_id") != self.settings.account_id:
-            raise StepFailure("ACCOUNT_MISMATCH", evidence)
+        if self.settings.account_id and second.get("account_id") != self.settings.account_id:
+            raise StepFailure("ACCOUNT_MISMATCH", evidence)          # a dry run names no account
         view = self.port.supervisor("get_experiment", {})
         experiment = view.get("experiment") or {}
         if experiment.get("state") != "ARMED":

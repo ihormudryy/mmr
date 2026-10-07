@@ -1910,6 +1910,17 @@ class MMR:
         body = {} if experiment_id is None else {'experiment_id': experiment_id}
         return self._typed_query.call('verify_scoreboard', body, dict)
 
+    def acceptance_preflight(self) -> dict:
+        """``get_acceptance_preflight`` (SP1 Plan 6): one reading of the clean-account gate, signed as cli."""
+        return self._typed_query.call('get_acceptance_preflight', {}, dict)
+
+    def acceptance_endpoints(self) -> 'Endpoints':
+        """Where ``mmr experiment acceptance`` dials the trader and finds the RPC keys (host only)."""
+        from trader.acceptance.runner import Endpoints
+        return Endpoints(address=self._typed_address, query_port=self._typed_query_port,
+                         command_port=self._typed_command_port, keys_dir=self._rpc_keys_dir,
+                         timeout=float(self._timeout))
+
     def experiment_trips(self, experiment_id: str) -> dict:
         """``get_experiment_trips``: conid, quantities and state of each round trip."""
         return self._typed_query.call('get_experiment_trips', {'experiment_id': experiment_id}, dict)

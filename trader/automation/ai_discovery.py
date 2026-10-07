@@ -26,6 +26,7 @@ from trader.automation.calendar_policy import ET
 from trader.automation.discretionary_deployment import DiscretionaryDeployment
 from trader.automation.discretionary_scope import effective_dollar_volume_floor, static_scope_refusal
 from trader.automation.scope_evidence import ScopeEvidenceUnavailable, SymbolResolution
+from trader.data_providers.alpaca.news import news_items
 from trader.data_providers.capabilities import Capability
 from trader.data_providers.errors import ProviderError, ProviderNotConfigured
 
@@ -113,19 +114,31 @@ class _Row:
     as_of: Optional[str] = None
 
 
-def _number(value: Any) -> Optional[float]:
-    if isinstance(value, bool) or not isinstance(value, (int, float)) or not math.isfinite(value):
-        return None
-    return float(value)
+def _is_number(value: Any) -> bool:
+    return isinstance(value, (int, float)) and not isinstance(value, bool) and math.isfinite(value)
 
 
-def _entries(payload: Any, key: str) -> list[dict]:
+def _entries(payload: Any, key: str, numbers: tuple[str, ...]) -> list[dict]:
+    """Every row of ``payload[key]``, or ``_MalformedPayload``: a missing list or a bad row is never dropped
+    silently, because that would shrink the candidate universe while reporting the source as complete."""
     if not isinstance(payload, dict):
         raise _MalformedPayload("the reply is not an object")
-    entries = payload.get(key) or []
-    if not isinstance(entries, list) or not all(isinstance(e, dict) for e in entries):
-        raise _MalformedPayload(f"{key} is not a list of objects")
-    return [e for e in entries if isinstance(e.get("symbol"), str) and e["symbol"].strip()]
+    entries = payload.get(key)
+    if not isinstance(entries, list):
+        raise _MalformedPayload(f"{key} is missing or not a list")
+    for entry in entries:
+        if (not isinstance(entry, dict) or not isinstance(entry.get("symbol"), str) or not entry["symbol"].strip()
+                or not all(_is_number(entry.get(name)) for name in numbers)):
+            raise _MalformedPayload(f"a {key} row has no symbol or a field of {list(numbers)} is not a number")
+    return entries
+
+
+def _articles(payload: Any) -> list[dict]:
+    if not isinstance(payload, dict) or not isinstance(payload.get("news"), list):
+        raise _MalformedPayload("news is missing or not a list")
+    if not all(isinstance(article, dict) for article in payload["news"]):
+        raise _MalformedPayload("a news article is not an object")
+    return payload["news"]
 
 
 def _as_of(payload: dict) -> Optional[str]:
@@ -165,7 +178,10 @@ class AiDiscoveryReader:
         news = self._news(candidates, request)
         resolution = _resolution_coverage(resolutions.values())
         budget_hit = any(r.status == "RESOLUTION_BUDGET" for r in resolutions.values())
-        complete = not (movers.failed or actives.failed or news.failed_symbols or resolution.failed or budget_hit)
+        volume_unchecked = any(c["scope_precheck"]["status"] == "NOT_CHECKED"
+                               and c["scope_precheck"]["part"] == "dollar_volume" for c in candidates)
+        complete = not (movers.failed or actives.failed or news.failed_symbols or resolution.failed or budget_hit
+                        or volume_unchecked)
         return DiscoverAiCandidatesResponse(
             read_at=self._now().isoformat(), source="alpaca", delayed=True, delay_minutes=DELAY_MINUTES,
             deployment_digest=request.deployment_digest,
@@ -214,20 +230,21 @@ class AiDiscoveryReader:
         return row
 
     def _add_movers(self, rows: dict[str, _Row], payload: Any) -> int:
+        numbers = ("price", "percent_change")
         added = [(origin, entry) for key, origin in (("gainers", "gainer"), ("losers", "loser"))
-                 for entry in _entries(payload, key)]
+                 for entry in _entries(payload, key, numbers)]
         for origin, entry in added:
             row = self._row(rows, entry["symbol"], origin)
-            row.price = row.price if row.price is not None else _number(entry.get("price"))
-            row.change_pct = row.change_pct if row.change_pct is not None else _number(entry.get("percent_change"))
+            row.price = row.price if row.price is not None else float(entry["price"])
+            row.change_pct = row.change_pct if row.change_pct is not None else float(entry["percent_change"])
             row.as_of = row.as_of or _as_of(payload)
         return len(added)
 
     def _add_actives(self, rows: dict[str, _Row], payload: Any) -> int:
-        added = _entries(payload, "most_actives")
+        added = _entries(payload, "most_actives", ("volume",))
         for entry in added:
             row = self._row(rows, entry["symbol"], "most_active")
-            row.volume = row.volume if row.volume is not None else _number(entry.get("volume"))
+            row.volume = row.volume if row.volume is not None else float(entry["volume"])
             row.as_of = row.as_of or _as_of(payload)
         return len(added)
 
@@ -288,13 +305,14 @@ class AiDiscoveryReader:
         failed: list[str] = []
         for candidate in chosen:
             try:
-                articles = provider.news(candidate["symbol"], request.news_per_symbol)
-                candidate["news"] = [_news_item(a) for a in articles[:request.news_per_symbol]]
+                articles = _articles(provider.news_payload(candidate["symbol"], request.news_per_symbol))
+                items = news_items(articles, request.news_per_symbol)
+                candidate["news"] = [_news_item(item) for item in items]
                 candidate["news_status"] = "OK"
-            except ProviderError as ex:
+            except Exception as ex:      # noqa: BLE001 - one symbol's bad reply is its own failure, never the read's
                 logger.error("discover_ai_candidates: news for %s failed: %s", candidate["symbol"],
                              type(ex).__name__)
-                candidate["news_status"] = "FAILED"
+                candidate["news"], candidate["news_status"] = [], "FAILED"
                 failed.append(candidate["symbol"])
         return NewsCoverage(requested_symbols=len(chosen), returned_symbols=len(chosen) - len(failed),
                             failed_symbols=failed)

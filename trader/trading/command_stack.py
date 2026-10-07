@@ -14,6 +14,7 @@ from trader.data.proposal_repository import (
     ProposalRepository,
     apply_proposal_authority_migration,
 )
+from trader.automation.scope_evidence import InstrumentConflict
 from trader.data.schema_migrations import SchemaMigrator
 from trader.data.circuit_breaker_store import (
     CircuitBreakerStore,
@@ -684,14 +685,22 @@ def _contract_details_port(trader: Any) -> Callable[[Any], list]:
 def _remember_instrument(trader: Any, details: Any) -> None:
     """Keep an IB definition in the trader universe, so quotes and the entry filter resolve its conid.
 
-    A conid any universe already holds is left alone: a second definition would make the AI entry
+    A stored definition that disagrees with IB on symbol, type, currency or listing raises
+    ``InstrumentConflict`` (PR #83): an old row must never price or filter another instrument.
+    A conid already held and matching is left alone: a second definition would make the AI entry
     filter's exact one-row resolve refuse it (INSTRUMENT_UNRESOLVED).
     """
-    from trader.automation.scope_evidence import INSTRUMENTS_UNIVERSE
+    from trader.automation.scope_evidence import INSTRUMENTS_UNIVERSE, contract_identity
     from trader.data.data_access import SecurityDefinition
 
+    conid = int(details.contract.conId)
+    fresh = contract_identity(details.contract)
     accessor = trader.universe_accessor
-    if accessor.resolve_symbol(int(details.contract.conId)):
+    stored = accessor.resolve_symbol(conid)
+    conflicting = sorted({contract_identity(row) for row in stored if contract_identity(row) != fresh})
+    if conflicting:
+        raise InstrumentConflict(f"conid {conid}: stored {conflicting} but IB says {fresh}")
+    if stored:
         return
     accessor.insert(INSTRUMENTS_UNIVERSE, SecurityDefinition.from_contract_details(details))
 
@@ -789,7 +798,11 @@ def _build_quote_authority(
     from trader.trading.paper_quote_fallback import AlpacaIexQuoteAuthority, FallbackQuoteAuthority
 
     client = alpaca_client.AlpacaClient(key_id, secret_key, timeout=ALPACA_QUOTE_TIMEOUT_SECS)
-    iex = AlpacaIexQuoteAuthority(client, resolve_security=lambda conid: _resolve_security(trader, conid), now=now)
+    from trader.automation.scope_evidence import ib_contract_for_conid
+
+    # PR #83: the Alpaca symbol comes from IB's own details for the conid, never from a stored row.
+    iex = AlpacaIexQuoteAuthority(
+        client, resolve_security=lambda conid: ib_contract_for_conid(_contract_details_port(trader), conid), now=now)
     logger.info("paper quotes fall back to Alpaca IEX when IB has no live feed")
     return FallbackQuoteAuthority(ib_quotes, iex, account_mode=account_mode), feeds
 

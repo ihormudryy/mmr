@@ -210,3 +210,67 @@ def test_volume_fetches_are_bounded_per_read(reader):
     by = {c.symbol: c for c in r.read(request(r.digest)).candidates}
     assert (by["AAPL"].scope_precheck.status, by["AAPL"].scope_precheck.part) == ("NOT_CHECKED", "dollar_volume")
     assert r.alpaca_history.calls == 0
+
+
+# --- review round 1 (PR #83): malformed sources and skipped checks are never "complete" ---------------
+
+@pytest.mark.parametrize("movers", [
+    {k: v for k, v in MOVERS.items() if k != "losers"},                                     # a list is missing
+    {**MOVERS, "losers": [{"symbol": "PINKY", "price": "7", "change": -1, "percent_change": -12.5}]},
+    {**MOVERS, "gainers": [{"price": 101.0, "change": 2.0, "percent_change": 2.0}]},          # no symbol
+    {**MOVERS, "gainers": [["AAPL", 101.0]]},
+    {**MOVERS, "losers": None},
+], ids=["no-losers", "text-price", "no-symbol", "row-not-object", "losers-null"])
+def test_a_malformed_movers_reply_is_a_failed_source(reader, movers):        # thread 4210055901
+    r = reader(movers=movers)
+    out = r.read(request(r.digest))
+    assert (out.coverage.movers.failed, out.coverage.movers.error_code) == (True, "MALFORMED_PAYLOAD")
+    assert out.coverage.movers.returned == 0 and out.coverage.complete is False
+    assert {c.symbol for c in out.candidates} == {"SPY", "AAPL", "MSFT"}      # only what was really seen
+
+
+@pytest.mark.parametrize("actives", [
+    {"last_updated": "2026-07-17T14:58:00Z"},
+    {"most_actives": [{"symbol": "SPY", "volume": None, "trade_count": 1}]},
+], ids=["no-list", "no-volume"])
+def test_a_malformed_most_actives_reply_is_a_failed_source(reader, actives):  # thread 4210055901
+    r = reader(actives=actives)
+    out = r.read(request(r.digest))
+    assert (out.coverage.most_actives.failed, out.coverage.most_actives.error_code) == (True, "MALFORMED_PAYLOAD")
+    assert out.coverage.complete is False
+
+
+def test_an_unchecked_volume_makes_the_read_incomplete(reader):              # thread 4210056050
+    r = reader()
+    r._volume_budget = 0
+    out = r.read(request(r.digest))
+    assert any(c.scope_precheck.status == "NOT_CHECKED" and c.scope_precheck.part == "dollar_volume"
+               for c in out.candidates)
+    assert out.coverage.complete is False
+
+
+def test_an_unavailable_volume_makes_the_read_incomplete(reader):            # thread 4210056050
+    r = reader()
+    r.alpaca_history.build = lambda: None                                    # SPY has no local bars
+    by = {c.symbol: c for c in r.read(request(r.digest)).candidates}
+    assert (by["SPY"].scope_precheck.status, by["SPY"].scope_precheck.part) == ("NOT_CHECKED", "dollar_volume")
+    assert r.read(request(r.digest)).coverage.complete is False
+
+
+def test_a_full_read_with_every_check_done_is_complete(reader):
+    r = reader(movers={**MOVERS, "gainers": MOVERS["gainers"][:1], "losers": []})
+    out = r.read(request(r.digest, watchlist=[]))
+    assert out.coverage.complete is True, out.coverage
+
+
+@pytest.mark.parametrize("payload", [{}, {"news": {"id": 1}}, {"news": ["text"]}, {"news": None}],
+                         ids=["no-news-key", "news-object", "article-not-object", "news-null"])
+def test_a_malformed_news_reply_is_a_failed_symbol(reader, payload):          # thread 4210056050
+    r = reader()
+    r.session.news = {"AAPL": payload}
+    r.session.raw_news = True
+    out = r.read(request(r.digest))
+    by = {c.symbol: c for c in out.candidates}
+    assert by["AAPL"].news_status == "FAILED" and by["AAPL"].news == []
+    assert "AAPL" in out.coverage.news.failed_symbols and out.coverage.complete is False
+    assert by["SPY"].news_status == "OK"                                      # one symbol's failure stays its own

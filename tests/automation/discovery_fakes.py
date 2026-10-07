@@ -41,6 +41,7 @@ class FakeSession:
     def __init__(self, routes: dict, news: Optional[dict] = None):
         self.routes = routes
         self.news = news or {}
+        self.raw_news = False           # True: a news route is the whole reply body, not the article list
         self.requests: list[tuple[str, dict]] = []
 
     def get(self, url, params=None, headers=None, timeout=None):
@@ -48,8 +49,9 @@ class FakeSession:
         params = dict(params or {})
         self.requests.append((path, params))
         if path == NEWS_PATH and "symbols" in params:
+            raw = self.raw_news and params["symbols"] in self.news
             route = self.news.get(params["symbols"], [])
-            route = route if isinstance(route, int) else {"news": route}
+            route = route if isinstance(route, int) or raw else {"news": route}
         else:
             route = self.routes.get(path, 404)
         return FakeResponse(route, {"message": "fake"}) if isinstance(route, int) else FakeResponse(200, route)

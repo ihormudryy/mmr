@@ -34,6 +34,24 @@ class ScopeEvidenceUnavailable(Exception):
         self.reason = reason
 
 
+class InstrumentConflict(Exception):
+    """A stored definition of a conid disagrees with IB's own details: neither is used."""
+
+
+IDENTITY_FIELDS = ("symbol", "secType", "currency", "primaryExchange")
+
+
+def contract_identity(contract: Any) -> tuple[str, ...]:
+    return tuple(str(getattr(contract, name, "") or "") for name in IDENTITY_FIELDS)
+
+
+def ib_contract_for_conid(request_details: Callable[[Any], list], conid: int) -> Optional[Any]:
+    """IB's own contract for exactly this conid, or None: the only source of an instrument's identity."""
+    from ib_async import Contract
+    rows = _matching_rows(list(request_details(Contract(conId=conid)) or []), lambda c: c.conId == conid)
+    return rows[0].contract if len(rows) == 1 else None
+
+
 @dataclass(frozen=True)
 class ContractEvidence:
     conid: int
@@ -99,6 +117,9 @@ class IbContractEvidenceSource:
     def _evidence(self, details: Any) -> ContractEvidence:
         try:
             self._remember(details)
+        except InstrumentConflict as ex:
+            logger.error("INSTRUMENT_CONFLICT: %s", ex)
+            raise ScopeEvidenceUnavailable(f"INSTRUMENT_CONFLICT: {ex}") from None
         except Exception as ex:
             logger.warning("could not remember conid %s in %s: %s", details.contract.conId, INSTRUMENTS_UNIVERSE,
                            type(ex).__name__)

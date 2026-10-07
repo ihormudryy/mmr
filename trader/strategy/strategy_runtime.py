@@ -35,6 +35,12 @@ from trader.messaging.typed_rpc import (
 )
 from trader.objects import Action, BarSize, WhatToShow
 from trader.data.event_store import EventStore, EventType, TradingEvent
+from trader.data.strategy_signal_record import (
+    DEFAULT_RETENTION_DAYS,
+    SignalEntry,
+    StrategySignalRecord,
+    completed_bar_time,
+)
 from trader.strategy.signal_proposer import SignalProposer
 from trader.strategy.strategy_revisions import StrategyCommandReceipt, StrategyRevisionStore
 from trader.strategy.trader_gateway import StrategyTraderGateway
@@ -428,8 +434,10 @@ class StrategyRuntime():
         automation_expected_artifact_id: str = '',
         automation_strategy_name: str = '',
         live_authority_enabled: bool = False,
+        strategy_signal_record_retention_days: int = DEFAULT_RETENTION_DAYS,
     ):
         self.ib_server_address = ib_server_address
+        self.strategy_signal_record_retention_days = strategy_signal_record_retention_days
         self.ib_server_port = ib_server_port
         self.strategy_runtime_ib_client_id: int = strategy_runtime_ib_client_id
         self.duckdb_path = duckdb_path
@@ -573,6 +581,8 @@ class StrategyRuntime():
             self.storage = TickStorage(self.history_duckdb_path)
             self.universe_accessor = UniverseAccessor(self.duckdb_path, self.universe_library)
             self.event_store = EventStore(self.duckdb_path)
+            self.signal_record = StrategySignalRecord(
+                self.event_store.db, retention_days=self.strategy_signal_record_retention_days)
             self.last_connect_time = dt.datetime.now()
 
             # The legacy dill/msgpack strategy RPC has no identity or ACL, so
@@ -1605,6 +1615,14 @@ class StrategyRuntime():
                     'failed to record/publish signal from %s for conId %s',
                     getattr(strategy, 'name', '?'), conId)
 
+    def _record_signal(self, strategy: Strategy, signal, conId: int, frame: pd.DataFrame) -> None:
+        """Spec 6.1: BUY/SELL go to the durable record before any publish; a failed write raises."""
+        if signal.action not in (Action.BUY, Action.SELL):
+            return
+        self.signal_record.append(SignalEntry.create(
+            strategy_name=strategy.name, conid=conId, action=str(signal.action),
+            probability=signal.probability, signal_time=completed_bar_time(frame)))
+
     def _dispatch_signal(self, strategy: Strategy, signal, conId: int,
                          frame: pd.DataFrame) -> None:
         """Record, publish, and (in propose mode) bridge one signal."""
@@ -1619,7 +1637,7 @@ class StrategyRuntime():
         if not signal.conid:
             signal.conid = conId
 
-        # Persist signal to event store
+        self._record_signal(strategy, signal, conId, frame)
         event = TradingEvent(
             event_type=EventType.SIGNAL,
             timestamp=dt.datetime.now(),

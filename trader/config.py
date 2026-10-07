@@ -87,6 +87,7 @@ class TwelveDataConfig:
 class StrategyRuntimeConfig:
     strategies_directory: str = 'strategies'
     config_file: str = '~/.config/mmr/strategy_runtime.yaml'
+    signal_record_retention_days: int = 7
 
 
 @dataclass
@@ -206,6 +207,7 @@ class MMRConfig:
             # Strategy
             'strategies_directory': ('strategy', 'strategies_directory'),
             'strategy_config_file': ('strategy', 'config_file'),
+            'strategy_signal_record_retention_days': ('strategy', 'signal_record_retention_days'),
             # Massive
             'massive_api_key': ('massive', 'api_key'),
             'massive_feed': ('massive', 'feed'),

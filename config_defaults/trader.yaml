@@ -13,6 +13,7 @@ pycron_config_file: ~/.config/mmr/pycron.yaml
 strategy_config_file: ~/.config/mmr/strategy_runtime.yaml
 logfile: ~/.local/share/mmr/logs/trader.log
 strategies_directory: strategies
+strategy_signal_record_retention_days: 7  # durable signal record for the ai controller (SP2)
 
 # Trading mode: 'paper' or 'live'
 # This selects which account and port are used.

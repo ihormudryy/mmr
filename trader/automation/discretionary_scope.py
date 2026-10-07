@@ -13,6 +13,8 @@ import math
 from dataclasses import dataclass
 from typing import Any, Callable, Mapping, Optional
 
+from trader.automation.ai_deployments import DISCRETIONARY_KIND
+from trader.automation.ai_paper_evidence import AI_ENTRY_POLICY, AI_PAPER_ACTION, planned_entry_limit
 from trader.automation.liquidity_policy import MIN_MEDIAN_DOLLAR_VOLUME
 from trader.automation.production_evidence import TwentySessionVolume
 from trader.automation.scope_evidence import ContractEvidence, ScopeEvidenceUnavailable
@@ -25,6 +27,7 @@ SCOPE_PARTS = ("exchange", "instrument_type", "price", "dollar_volume", "liquidi
                "evidence_stale")
 SCOPE_CHECK_MIGRATION_VERSION = 100
 PHASES = ("admission", "sizing", "dispatch")
+DISPATCH_EVIDENCE_MAX_AGE = dt.timedelta(seconds=60)
 
 FilterRefusal = Callable[[ContractEvidence, float], Optional[str]]
 
@@ -276,3 +279,64 @@ class DiscretionaryScopeService:
         except Exception as ex:
             missing.append(f"evidence read failed: {type(ex).__name__}")
         return None
+
+
+# ---------------------------------------------------------------------------
+# Dispatch (rulings 8-10): inside the saga's entry lock, no IB call and no history read
+# ---------------------------------------------------------------------------
+
+EntryGate = Callable[[Any, Any, Any, dt.datetime], Optional[str]]
+
+
+def compose_entry_gates(*gates: EntryGate) -> EntryGate:
+    """The first refusal code wins; every gate runs only while the earlier ones pass."""
+
+    def gate(request: Any, approval: Any, quote: Any, now: dt.datetime) -> Optional[str]:
+        for each in gates:
+            code = each(request, approval, quote, now)
+            if code:
+                return code
+        return None
+    return gate
+
+
+def discretionary_scope_gate(*, kind_of: Callable[[str], str], checks: ScopeCheckStore,
+                             filter_refusal: FilterRefusal, accepted_feeds: frozenset[str]) -> EntryGate:
+    """Ruling 8 at dispatch: price, liquidity and the filter on the guard's fresh quote; the rest from
+    the admission evidence on the approval. The verdict is recorded before the code is returned (ruling 9)."""
+    accepted = frozenset(accepted_feeds)
+
+    def gate(request: Any, approval: Any, quote: Any, now: dt.datetime) -> Optional[str]:
+        if getattr(request, "action", None) != AI_PAPER_ACTION:
+            return None
+        digest = (getattr(request, "body", None) or {}).get("deployment_digest")
+        evidence = getattr(approval, "discretionary_scope", None)
+        if evidence is None:
+            # Ruling 10: a discretionary approval that lost its evidence fails closed.
+            if digest is None or kind_of(digest) != DISCRETIONARY_KIND:
+                return None
+            verdict = ScopeVerdict("evidence_stale", "the approval carries no scope evidence", {})
+        elif evidence.deployment_digest != digest:
+            verdict = ScopeVerdict("evidence_stale", "the scope evidence names another deployment", {})
+        else:
+            verdict = evaluate_scope(evidence.rule, _dispatch_inputs(evidence, approval, quote, now,
+                                                                     filter_refusal, accepted), now)
+        checks.record(command_id=request.command_id, phase="dispatch", deployment_digest=str(digest),
+                      conid=int(approval.conid), verdict=verdict)
+        return None if verdict.passed else OUT_OF_DISCRETIONARY_SCOPE
+
+    return gate
+
+
+def _dispatch_inputs(evidence: DiscretionaryScopeEvidence, approval: Any, quote: Any, now: dt.datetime,
+                     filter_refusal: FilterRefusal, accepted_feeds: frozenset[str]) -> ScopeInputs:
+    age = now - evidence.contract.fetched_at
+    fresh = dt.timedelta(seconds=-MAX_SOURCE_CLOCK_SKEW_SECONDS) <= age <= DISPATCH_EVIDENCE_MAX_AGE
+    notional = None
+    if quote_problem(quote, now, accepted_feeds) is None:
+        # The limit the saga will send on this quote: the order's real notional.
+        limit = planned_entry_limit(float(quote.ask), float(quote.bid), AI_ENTRY_POLICY.limit_offset_bps)
+        notional = abs(float(approval.quantity)) * limit
+    return ScopeInputs(contract=evidence.contract if fresh else None, quote=quote, volume=evidence.volume,
+                       order_notional=notional, filter_refusal=filter_refusal, accepted_feeds=accepted_feeds,
+                       missing=() if fresh else (f"admission evidence is {age.total_seconds():.0f} s old",))

@@ -551,12 +551,16 @@ def _build_ai_paper_parts(trader: Any, config: Any, now: Callable[[], dt.datetim
                          filter_refusal=trading_filter_refusal(load_filter))
 
 
-def _ai_paper_guard_options(parts: Optional[_AiPaperParts]) -> dict:
-    """R25: the AI gate, strict margin and the limits router for submit_ai_paper_decision only."""
+def _ai_paper_guard_options(parts: Optional[_AiPaperParts], accepted_feeds: frozenset[str]) -> dict:
+    """R25: the AI gate, strict margin and the limits router for submit_ai_paper_decision only.
+
+    SP2 Plan 3: the discretionary scope gate runs first, on the command stack's accepted feeds (PR #76).
+    """
     if parts is None:
         return {}
     from trader.automation.ai_paper_decision import AI_PAPER_ACTION
     from trader.automation.ai_paper_evidence import ai_entry_gate
+    from trader.automation.discretionary_scope import compose_entry_gates, discretionary_scope_gate
     from trader.automation.risk_limits import PAPER_LIMITS
 
     def current_limits(request: Any):
@@ -566,7 +570,10 @@ def _ai_paper_guard_options(parts: Optional[_AiPaperParts]) -> dict:
 
     return {
         "current_limits": current_limits,
-        "ai_entry_gate": ai_entry_gate(entry_filter=parts.entry_filter),
+        "ai_entry_gate": compose_entry_gates(
+            discretionary_scope_gate(kind_of=parts.deployments.kind_of, checks=parts.scope_checks,
+                                     filter_refusal=parts.filter_refusal, accepted_feeds=accepted_feeds),
+            ai_entry_gate(entry_filter=parts.entry_filter)),
         "strict_margin_actions": frozenset({AI_PAPER_ACTION}),
     }
 
@@ -1230,7 +1237,7 @@ def build_command_stack(
         allocation_authority_lookup=lambda account_id, artifact_digest: (
             allocation_authority_store.authority_for_dispatch(account_id, artifact_digest)
         ),
-        **_ai_paper_guard_options(ai_paper_parts),
+        **_ai_paper_guard_options(ai_paper_parts, accepted_feeds),
         experiment_gate=lambda request: experiment_gate_slot["gate"](request),
         accepted_feeds=accepted_feeds,
     )

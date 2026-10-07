@@ -28,6 +28,8 @@ from trader.automation.ai_paper_experiment import ExperimentView
 from trader.automation.ai_paper_filter import AiEntryFilter, MtimeCachedFilterLoader
 from trader.automation.ai_risk_policy import AiRiskPolicyService, apply_ai_risk_policy_migration
 from trader.automation.calendar_policy import XNYSCalendarPolicy
+from trader.automation.discretionary_scope import compose_entry_gates
+from trader.automation.liquidity_policy import LiquidityPolicy
 from trader.automation.controller_epoch import ControllerEpochs, apply_controller_epoch_migration
 from trader.automation.protective_order_saga import ProtectiveOrderSaga, apply_protective_order_saga_migration
 from trader.automation.risk_limits import PAPER_LIMITS
@@ -209,6 +211,7 @@ class World:
                  accepted_feeds: frozenset[str] = LIVE_ONLY_FEEDS):
         self.clock = Clock()
         self.accepted_feeds = accepted_feeds
+        self.scope_gate = None          # discretionary_world sets the discretionary scope gate
         self.db = DuckDBConnection.get_instance(str(tmp_path / "journal.duckdb"))
         migrator = SchemaMigrator(self.db)
         self.journal = DomainJournal(self.db)
@@ -255,13 +258,14 @@ class World:
             account_id=ACCOUNT, account_mode="paper", allocation_policy=AllocationPolicy(now=self.clock),
             current_limits=lambda request: (self.policy.effective_limits() if request.action == AI_PAPER_ACTION
                                             else PAPER_LIMITS),
-            ai_entry_gate=ai_entry_gate(entry_filter=self.entry_filter),
+            ai_entry_gate=compose_entry_gates(self._scope_gate, ai_entry_gate(entry_filter=self.entry_filter)),
             strict_margin_actions=frozenset({AI_PAPER_ACTION}), accepted_feeds=accepted_feeds)
         self.liquidation = (self._real_liquidation() if real_liquidation
                             else SimpleNamespace(start=lambda *a, **k: None))
         self.saga = ProtectiveOrderSaga(
             journal=self.journal, ledger=self.ledger, dispatch=self.dispatch, dispatch_guard=self.guard,
-            session_risk=SessionRiskController(calendar=XNYSCalendarPolicy(), now=self.clock),
+            session_risk=SessionRiskController(calendar=XNYSCalendarPolicy(), now=self.clock,
+                                               liquidity_policy=LiquidityPolicy(accepted_feeds=accepted_feeds)),
             breaker=SimpleNamespace(record=lambda signal: None), liquidation=self.liquidation,
             account_id=ACCOUNT, account_mode="paper", now=self.clock, db=self.db)
         self.scheduled: list[str] = []
@@ -290,6 +294,9 @@ class World:
         return LiquidationService(
             self.broker, self.liquidation_dispatch, store=LiquidationRunStore(self.db), registry=self.exit_owners,
             now=self.clock, breaker=_Breaker(), schedule_reconcile=self.liquidation_scheduled.append)
+
+    def _scope_gate(self, request, approval, quote, now):
+        return None if self.scope_gate is None else self.scope_gate(request, approval, quote, now)
 
     def liquidation_runs(self) -> set[str]:
         return {row[0] for row in self.db.execute("SELECT cause_command_id FROM liquidation_runs", fetch="all")}

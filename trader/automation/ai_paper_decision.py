@@ -294,6 +294,7 @@ class DecisionLink:
     effective_revision: Optional[int]
     style: Optional[str]
     digest: Optional[str]
+    deployment_kind: Optional[str] = None
 
 
 class AiPaperDecisionStore:
@@ -377,8 +378,10 @@ class AiPaperDecisionStore:
                 return ()
             where, value = "d.close_root_id = ?", root
         rows = self._journal.connect().execute(
-            "SELECT d.decision_id, d.action, d.decider, d.strategy_digest, p.strategy_digest_provenance, "
-            "d.policy_revision, d.effective_revision, d.style, d.deployment_digest "
+            "SELECT d.decision_id, d.action, d.decider, "
+            "CASE WHEN p.kind = 'discretionary' THEN 'discretionary' ELSE d.strategy_digest END, "
+            "p.strategy_digest_provenance, d.policy_revision, d.effective_revision, d.style, d.deployment_digest, "
+            "p.kind "
             "FROM ai_paper_decisions d LEFT JOIN ai_deployments p ON p.digest = d.deployment_digest "
             f"WHERE {where} AND d.decision_id IS NOT NULL ORDER BY d.received_at", [value]).fetchall()
         return tuple(DecisionLink(*row) for row in rows)
@@ -637,7 +640,7 @@ class AiPaperDecisionService:
         if saga_state.state == "CLOSED" and saga_state.error_code:
             if saga_state.error_code in LATCH_CODES:
                 self._latch(saga_state.error_code, decision)
-            raise _Refusal(saga_state.error_code)
+            raise _Refusal(saga_state.error_code, detail=self._dispatch_detail(cmd, saga_state.error_code))
         if saga_state.state == "OUTCOME_UNKNOWN":
             return self._outcome_unknown(cmd, admission, "DISPATCH_AMBIGUOUS")
         outcome = {
@@ -655,6 +658,14 @@ class AiPaperDecisionService:
             # The reconciler resolves the entry once the broker shows its orders (Plan 6 finding).
             self._schedule_reconcile(cmd.command_id)
         return CommandSteps.receipt(cmd.command_id, "SUBMITTED", None, False, outcome=outcome)
+
+    def _dispatch_detail(self, cmd: CommandRequest, code: str) -> Optional[dict]:
+        """Ruling 9: the saga keeps only the code; the dispatch gate's recorded verdict names the part."""
+        if code != OUT_OF_DISCRETIONARY_SCOPE:
+            return None
+        found = None if self._scope is None else self._scope.checks.detail(cmd.command_id, "dispatch")
+        return found or {"part": "evidence_stale", "reason": "the dispatch check left no record",
+                         "phase": "dispatch", "check_id": None}
 
     def _latch(self, code: str, decision: AiPaperDecision) -> None:
         """R10. A failed latch does not unsafely admit anything: session_risk refuses each entry again."""

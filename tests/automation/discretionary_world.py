@@ -13,7 +13,8 @@ from tests.automation.ai_paper_world import World
 from trader.automation.ai_paper_filter import MtimeCachedFilterLoader
 from trader.automation.discretionary_deployment import DEFAULT_SCOPE_RULE, DiscretionaryDeployment
 from trader.automation.discretionary_scope import (
-    DiscretionaryScopeService, ScopeCheckStore, apply_scope_check_migration, trading_filter_refusal,
+    DiscretionaryScopeService, ScopeCheckStore, apply_scope_check_migration, discretionary_scope_gate,
+    trading_filter_refusal,
 )
 from trader.automation.production_evidence import TwentySessionVolume, latest_closed_sessions
 from trader.automation.scope_evidence import ContractEvidence, ScopeEvidenceUnavailable
@@ -92,5 +93,8 @@ def discretionary_world(tmp_path: Path, *, rule: Optional[dict] = None, **world_
         accepted_feeds=world.accepted_feeds, filter_refusal=world.scope_filter,
         checks=ScopeCheckStore(world.db, now=world.clock), now=world.clock)
     world.service.attach_scope(world.scope)
+    world.scope_gate = discretionary_scope_gate(kind_of=world.deployments.kind_of, checks=world.scope.checks,
+                                                filter_refusal=world.scope_filter,
+                                                accepted_feeds=world.accepted_feeds)
     return world
 

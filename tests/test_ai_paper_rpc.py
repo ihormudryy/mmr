@@ -179,7 +179,7 @@ def test_wrong_principal_is_denied_by_the_allow_list(served, principal, method):
 
 def test_wrong_principal_is_refused_by_the_service_too(served):
     def request(action, body, target, principal):
-        return CommandRequest(command_id=f"bypass-{action}", action=action, account_id=ACCOUNT,
+        return CommandRequest(command_id=f"bypass-{action}-{principal}", action=action, account_id=ACCOUNT,
                               target_type=target[0], target_id=target[1], expected_version=None,
                               body=body, source=principal, principal=principal)
     receipt = served.coordinator.execute(
@@ -191,6 +191,10 @@ def test_wrong_principal_is_refused_by_the_service_too(served):
     receipt = served.coordinator.execute(request(
         "publish_ai_risk_policy", {"limits": PAPER_LIMITS.to_json(), "reason": "r"}, ("ai_policy", ACCOUNT),
         "ai_research"))
+    assert receipt.error_code == "PRINCIPAL_FORBIDDEN"
+    receipt = served.coordinator.execute(request(
+        "publish_ai_risk_policy", {"limits": PAPER_LIMITS.to_json(), "reason": "r"}, ("ai_policy", ACCOUNT),
+        "dashboard"))
     assert receipt.error_code == "PRINCIPAL_FORBIDDEN"
 
 

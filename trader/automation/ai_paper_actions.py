@@ -1,6 +1,6 @@
 """Coordinator actions and reads of the ai_paper family besides the decision (Plan 3 Task 9).
 
-``publish_ai_risk_policy`` (ai_supervisor) and ``register_ai_deployment``
+``publish_ai_risk_policy`` (ai_supervisor, cli) and ``register_ai_deployment``
 (ai_research), plus the two reads. Each action checks its principal itself,
 so a caller that bypasses the RPC allow-list is still refused.
 """
@@ -18,6 +18,8 @@ from trader.trading.command_coordinator import CommandRequest, CommandValidation
 
 AI_SUPERVISOR = "ai_supervisor"
 AI_RESEARCH = "ai_research"
+# SP2 spec 6.7: the operator publishes the initial policy; ai_supervisor keeps the right for SP2d.
+POLICY_PUBLISHERS = frozenset({AI_SUPERVISOR, "cli"})
 PUBLISH_ACTION = "publish_ai_risk_policy"
 REGISTER_ACTION = "register_ai_deployment"
 DEPLOYMENT_COMMAND_PREFIX = "aidep-"
@@ -57,8 +59,8 @@ class AiPaperActions:
         return CommandSteps.receipt(cmd.command_id, "RESOLVED", None, False, outcome=outcome)
 
     def _publish(self, cmd: CommandRequest) -> dict:
-        if cmd.principal != AI_SUPERVISOR:
-            raise _Refused("PRINCIPAL_FORBIDDEN", "only ai_supervisor publishes risk policies")
+        if cmd.principal not in POLICY_PUBLISHERS:
+            raise _Refused("PRINCIPAL_FORBIDDEN", "only ai_supervisor or the cli operator publishes risk policies")
         if cmd.account_id != self._account_id:
             raise _Refused("ACCOUNT_MISMATCH", "command account is not the pinned account")
         try:

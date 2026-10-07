@@ -111,7 +111,8 @@ TRADER_ACL: Mapping[tuple[str, str], frozenset[str]] = {
     **{("command", m): HUMAN for m in _TRADER_HUMAN_COMMANDS},
     # SP1 ai_paper (Plan 3 R23, owner answer 6): explicit sets per method, never a
     # group alias; reads and mutations are separate entries.
-    ("command", "publish_ai_risk_policy"): frozenset({"ai_supervisor"}),
+    # SP2 Plan 1 (spec 6.7): the operator publishes the initial policy; SP2a/b code never calls it as ai_supervisor.
+    ("command", "publish_ai_risk_policy"): frozenset({"ai_supervisor", "cli"}),
     ("command", "submit_ai_paper_decision"): frozenset({"ai_supervisor"}),
     ("command", "register_ai_deployment"): frozenset({"ai_research"}),
     ("query", "get_ai_risk_policy"): frozenset({"cli", "dashboard", "ai_supervisor"}),

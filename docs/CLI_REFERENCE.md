@@ -195,6 +195,8 @@ experiment start --reason "first run"        # operator; flat paper account, ai_
 experiment pause --reason "news risk"        # cli, dashboard or ai_supervisor
 experiment resume --reason "ok"              # operator; never after a kill
 experiment stop --reason "done"              # operator; once the account is flat (final)
+ai-policy show                               # PAPER AI risk policy: published, effective, queued limits
+ai-policy publish policy.yaml --reason "x"   # operator only; file = {limits: {...}}; --command-id to retry
 scoreboard                                   # PAPER scoreboard of the latest experiment ('-' = unknown)
 --json scoreboard --experiment exp-<20 hex>  # the report as JSON: {"data": ..., "title": "Scoreboard (paper)"}
 scoreboard verify                            # rebuild every number from stored inputs; exit 1 on any mismatch

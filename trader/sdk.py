@@ -1990,6 +1990,35 @@ class MMR:
         detail = f'{receipt.error_code or receipt.state}' + (f': {message}' if message else '')
         return SuccessFail.fail(error=f'{method} rejected: {detail}')
 
+    def ai_policy_publish(self, limits: dict, reason: str, command_id: Optional[str] = None) -> SuccessFail:
+        """Publish the PAPER AI risk policy as the operator (SP2 spec 6.7).
+
+        An identical retry with the same ``command_id`` replays from the ledger
+        instead of publishing a second revision.
+        """
+        import uuid
+        from trader.domain.commands import CommandReceipt
+        from trader.messaging.typed_rpc import TypedRpcRemoteError
+
+        command_id = command_id or f'cli-pol-{uuid.uuid4().hex}'
+        body = {'command_id': command_id, 'limits': limits, 'reason': reason}
+        try:
+            receipt = self._typed_command.call('publish_ai_risk_policy', body, CommandReceipt)
+        except TypedRpcRemoteError as ex:
+            return SuccessFail.fail(error=f'{ex.code}: {ex.message}', exception=ex)
+        except (TimeoutError, ConnectionError) as ex:
+            return SuccessFail.fail(
+                error=f'{ex}. Retry with --command-id {command_id} to replay the same publish.', exception=ex)
+        if receipt.state == 'RESOLVED':
+            return SuccessFail.success(obj=receipt.outcome)
+        message = (receipt.outcome or {}).get('message') if isinstance(receipt.outcome, dict) else None
+        detail = f'{receipt.error_code or receipt.state}' + (f': {message}' if message else '')
+        return SuccessFail.fail(error=f'publish_ai_risk_policy rejected: {detail}')
+
+    def ai_policy_view(self) -> dict:
+        """The PAPER AI risk policy: published, effective and queued limits."""
+        return self._typed_query.call('get_ai_risk_policy', {}, dict)
+
     def experiment_start(self, reason: str) -> SuccessFail:
         """Arm a new paper experiment (operators only; the account must be flat)."""
         return self._experiment_command('start_experiment', reason, None)

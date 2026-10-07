@@ -31,6 +31,7 @@ from trader.ai.runtime_schema import ALL_MIGRATIONS
 from trader.ai.schedule import SessionSlots
 from trader.ai.signal_intake import SignalIntake
 from trader.ai.store import AiStore
+from trader.ai.tools import code_version
 from trader.ai.submitter import Submitter
 
 logger = logging.getLogger("trader.ai_service")
@@ -50,11 +51,14 @@ class EngineDeps:
     reads: ReadOnlySupervisor
     clock: Clock
     recorder: ReplayRecorder
+    store: AiStore
 
 
 def build_engine(deps: EngineDeps) -> DecisionEngine:
-    """Plan 6 installs the real engine here (Ruling 16). Until then the service refuses to start."""
-    raise EngineNotInstalled("no decision engine is installed (SP2 Plan 6); the ai service will not start")
+    """SP2 Plan 6: the paper decision engine (Ruling 16 of Plan 5 is now fulfilled)."""
+    from trader.ai.decision_engine import PaperDecisionEngine
+    return PaperDecisionEngine(config=deps.config, reads=deps.reads, recorder=deps.recorder, store=deps.store,
+                               clock=deps.clock)
 
 
 @dataclass(frozen=True)
@@ -71,6 +75,7 @@ async def serve(settings: ServiceSettings, *, engine_factory: Callable[[EngineDe
     environ = os.environ if environ is None else environ
     config = load_ai_config(settings.config_path)
     check_credentials(config, environ)                    # names missing variables only, never values
+    code_version()                                        # the judgment code identity, read once at start
     cfg = config.controller
     Path(config.database_path).expanduser().parent.mkdir(parents=True, exist_ok=True)
     store = AiStore(config.database_path, clock=clock)
@@ -85,7 +90,7 @@ async def serve(settings: ServiceSettings, *, engine_factory: Callable[[EngineDe
         cap_sync = BudgetCapSync(supervisor=clients.supervisor, budget=raw_gateway.budget, clock=clock)
         gateway = CapGatedGateway(raw_gateway, cap_sync)  # no model call without a current owner cap
         engine = engine_factory(EngineDeps(config, gateway, ReadOnlySupervisor(clients.supervisor), clock,
-                                           ReplayRecorder(store)))
+                                           ReplayRecorder(store), store))
         leadership = Leadership(supervisor=clients.supervisor, store=store, clock=clock, holder_id=new_holder_id(),
                                 lease_seconds=cfg.lease_seconds, renew_seconds=cfg.renew_seconds,
                                 held_retry_seconds=cfg.held_retry_seconds)

@@ -29,6 +29,11 @@ from trader.ai.store import to_utc
 logger = logging.getLogger(__name__)
 
 WAIT = "WAIT"
+EXIT_WAIT_OVERRUN = dt.timedelta(minutes=10)      # backstop past an exit's own wait_until (PR #86 4211394337)
+EXIT_WAIT_STUCK = "EXIT_WAIT_STUCK"
+EXIT_WAIT_ALERT_EVERY = dt.timedelta(hours=1)
+NOTHING_TO_CLOSE_YET = frozenset({"POSITION_NOT_OWNED", "NOT_A_REDUCTION"})
+EXIT_REOPEN_WAIT = dt.timedelta(hours=1)          # the engine sets the real backstop on its next judgment
 SLOT_POLL_SECONDS = 1.0
 CYCLE_SOURCE = {ENTRY: "entry_cycle", POSITION: "position_cycle"}
 TRADER_AWAY = (RpcNotSent, RpcOutcomeUnknown, RpcRefused)
@@ -75,7 +80,14 @@ def validate_result(source_kind: str, result: Any) -> Optional[str]:
         return "ACTION_NOT_ALLOWED_HERE"
     if any(b.linked_action_key is not None and b.linked_action_key not in keys for b in result.baselines):
         return "BASELINE_LINK_UNKNOWN"
+    if result.wait_until is not None and (source_kind != "exit_signal" or result.decisions or result.baselines):
+        return "WAIT_NOT_ALLOWED_HERE"
     return None
+
+
+def _close_attempt(action_key: str) -> int:
+    suffix = action_key.split(":")[2] if action_key.count(":") == 2 else "r1"
+    return int(suffix[1:]) if suffix.startswith("r") and suffix[1:].isdigit() else 1
 
 
 def _stop_when_renewals_die(task: asyncio.Task, stop: asyncio.Event) -> None:
@@ -141,10 +153,21 @@ class AiController:
             await self._store.atransaction(lambda conn: register_context_in_tx(
                 conn, context_key=context_key, experiment_id=experiment.experiment_id, served_kind=kind,
                 served_id=served_id, now=now))
+        async def record_baselines(baselines: tuple) -> None:
+            if any(b.linked_action_key is not None or b.baseline_id == MATCHED_ENTRY_BASELINE for b in baselines):
+                raise ValueError("only unlinked baselines are recorded ahead of their result")
+            now = self._clock.now()
+
+            def work(conn: Any) -> None:
+                for baseline in baselines:
+                    self._outbox.enqueue_simulated_in_tx(conn, experiment_id=experiment.experiment_id,
+                                                         baseline=baseline, wait_for_decision_id=None, now=now)
+            await self._store.atransaction(work)
         await register(source_id, served_kind, source_id)
         return ModelWork(context_key=source_id, served_kind=served_kind, served_id=source_id, source_id=source_id,
                          experiment_id=experiment.experiment_id, gateway=self._gateway,
-                         deadline=self._gateway.new_deadline(source_id), register=register)
+                         deadline=self._gateway.new_deadline(source_id), register=register,
+                         record_baselines=record_baselines)
 
     async def _commit(self, source_kind: str, source_id: str, experiment: ExperimentView, result: Any,
                       finish: Callable[[Any, bool, Optional[str]], None],
@@ -185,14 +208,48 @@ class AiController:
             return
         await self._intake.poll()
         await self._intake.expire_stale()
+        await self._reopen_refused_exits()
         await self.dispatch_opportunities()
+
+    async def _reopen_refused_exits(self) -> None:
+        """A strategy CLOSE refused because nothing of ours was held (yet) puts its exit back on the wait path:
+        the engine closes only once shares are proven held, else it ends unheld (PR #86 4212667433).
+
+        Only the exit's latest attempt can reopen it, and only once (PR #86 4212958297): a refusal that a
+        later attempt superseded, pending, accepted or final, never reopens anything. The attempts are the
+        durable ai_submissions rows; ``reopened_for`` marks the latest refusal already handled."""
+        codes = sorted(NOTHING_TO_CLOSE_YET)
+        rows = await self._store.aquery(
+            "SELECT s.source_id, s.decision_id, s.error_code FROM ai_submissions s "
+            "JOIN ai_opportunities o ON o.opportunity_id = s.source_id "
+            "WHERE s.source_kind = 'exit_signal' AND s.action = 'CLOSE' AND s.receipt_state = 'REJECTED' "
+            f"AND s.error_code IN ({', '.join('?' for _ in codes)}) AND o.state = 'DECIDED' "
+            "AND NOT EXISTS (SELECT 1 FROM ai_exit_waits w WHERE w.opportunity_id = s.source_id "
+            "AND w.reopened_for = s.decision_id)", codes)
+        for opportunity_id, decision_id, code in rows:
+            if decision_id != await self._latest_close_attempt(opportunity_id):
+                continue                                   # superseded by a later attempt of the same exit
+            logger.warning("exit %s: close %s refused %s; it waits for held shares again", opportunity_id,
+                           decision_id, code)
+            await self._intake.reopen(opportunity_id, decision_id, self._clock.now() + EXIT_REOPEN_WAIT,
+                                      f"EXIT_CLOSE_REFUSED_{code}")
+
+    async def _latest_close_attempt(self, opportunity_id: str) -> str:
+        """The decision id of the exit's highest attempt: ``close:<conid>`` is 1, ``close:<conid>:r<n>`` is n."""
+        rows = await self._store.aquery("SELECT decision_id, action_key FROM ai_submissions "
+                                        "WHERE source_id = ? AND action = 'CLOSE'", [opportunity_id])
+        return max(rows, key=lambda row: _close_attempt(row[1]))[0]
 
     async def dispatch_opportunities(self) -> None:
         now = self._clock.now()
+        waits = await self._intake.waits()
         for opportunity, _state in await self._intake.open_opportunities():
             if opportunity.opportunity_id in self._opportunity_tasks:
                 continue
-            verdict = self._signal_verdict(opportunity, now)
+            wait = waits.get(opportunity.opportunity_id)
+            if wait is not None:
+                await self._escalate_if_stuck(opportunity.opportunity_id, *wait, now)
+            verdict = self._signal_verdict(opportunity, now, None if wait is None else wait[0])
             if verdict == WAIT:
                 continue
             if verdict is not None:
@@ -203,8 +260,22 @@ class AiController:
             self._opportunity_tasks[opportunity.opportunity_id] = task
             task.add_done_callback(lambda _t, key=opportunity.opportunity_id: self._opportunity_tasks.pop(key, None))
 
-    def _signal_verdict(self, opportunity: SignalOpportunity, now: dt.datetime) -> Optional[str]:
-        if not self._intake.is_fresh(opportunity, now):
+    async def _escalate_if_stuck(self, opportunity_id: str, wait_until: dt.datetime,
+                                 last_alert: Optional[dt.datetime], now: dt.datetime) -> None:
+        """Past its backstop a waiting exit is an incident: one ERROR per hour, counted in the heartbeat. It
+        stays pending until the broker proves its entry ended or filled (PR #86 4212341131)."""
+        if now <= wait_until + EXIT_WAIT_OVERRUN:
+            return
+        if last_alert is not None and now - last_alert < EXIT_WAIT_ALERT_EVERY:
+            return
+        logger.error("%s: exit signal %s still waits for its entry (backstop %s passed); it stays pending until "
+                     "the broker proves the entry ended or filled. Check the broker and the trader.",
+                     EXIT_WAIT_STUCK, opportunity_id, wait_until.isoformat())
+        await self._intake.record_wait_alert(opportunity_id)
+
+    def _signal_verdict(self, opportunity: SignalOpportunity, now: dt.datetime,
+                        waiting_until: Optional[dt.datetime] = None) -> Optional[str]:
+        if waiting_until is None and not self._intake.is_fresh(opportunity, now):
             return "STALE"
         if self._leadership.current_epoch() is None or not self._watch.known:
             return WAIT
@@ -231,6 +302,10 @@ class AiController:
         try:
             work = await self._open_work(opportunity.opportunity_id, "signal", experiment)
             result = await hook(SignalContext(self._clock.now(), experiment, opportunity, work))
+            if not buy and isinstance(result, EngineResult) and result.wait_until is not None \
+                    and validate_result("exit_signal", result) is None:
+                await self._intake.wait(opportunity.opportunity_id, result.wait_until, result.note or "EXIT_WAITING")
+                return                                     # judged again on the next tick, never lost
             await self._commit("entry_signal" if buy else "exit_signal", opportunity.opportunity_id, experiment,
                                result, finish)
         except asyncio.CancelledError:
@@ -362,7 +437,9 @@ class AiController:
                   "unsettled_submissions": await self._submitter.unsettled_count(),
                   "outbox": await self._outbox.counts(),
                   "running_cycles": sorted(kind for kind, task in self._cycle_tasks.items() if not task.done()),
-                  "budget_cap_ready": None if self._cap_sync is None else self._cap_sync.ready()}
+                  "budget_cap_ready": None if self._cap_sync is None else self._cap_sync.ready(),
+                  "exit_waits_stuck": sum(1 for until, _alert in (await self._intake.waits()).values()
+                                          if self._clock.now() > until + EXIT_WAIT_OVERRUN)}
         if self._config.heartbeat_path:
             await asyncio.to_thread(_write_atomically, self._config.heartbeat_path, json.dumps(status))
         return status

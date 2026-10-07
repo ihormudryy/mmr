@@ -20,9 +20,27 @@ def settings(tmp_path, **controller):
     return ServiceSettings(config_path=str(path), keys_dir=str(keys), trader_address="tcp://127.0.0.1")
 
 
-def test_without_an_engine_the_service_refuses_to_start(tmp_path, caplog):
+def test_build_engine_installs_the_paper_decision_engine(tmp_path):              # SP2 Plan 6 Task 6
+    import datetime as dt
+
+    from tests.ai.fakes import FakeClock, load_test_config
+    from trader.ai.decision_engine import PaperDecisionEngine
+    from trader.ai.replay import ReplayRecorder
+    from trader.ai.store import AiStore
+    from trader.ai_service import EngineDeps
+    clock = FakeClock(dt.datetime(2026, 7, 17, 15, tzinfo=dt.timezone.utc))
+    store = AiStore(tmp_path / "ai.duckdb", clock=clock)
+    engine = build_engine(EngineDeps(load_test_config(tmp_path), None, None, clock, ReplayRecorder(store), store))
+    assert isinstance(engine, PaperDecisionEngine)
+
+
+def test_an_engine_factory_that_refuses_stops_the_service(tmp_path, caplog):
+    from trader.ai_service import EngineNotInstalled
+
+    def refuse(_deps):
+        raise EngineNotInstalled("no decision engine is installed")
     caplog.set_level(logging.ERROR)
-    code = run_service(settings(tmp_path), engine_factory=build_engine, environ={"OPENROUTER_API_KEY": "test-only"})
+    code = run_service(settings(tmp_path), engine_factory=refuse, environ={"OPENROUTER_API_KEY": "test-only"})
     assert code == EXIT_REFUSED and "no decision engine is installed" in caplog.text
     assert "test-only" not in caplog.text
 

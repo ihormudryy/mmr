@@ -151,6 +151,7 @@ account never calls Alpaca, even with the setting on.
 | **momentum** | Single auto slot | Armed with the old fixture bundle, which no longer passes the provenance or binding check (see the 2026-10 note). `auto_execute` off. Enable it before a soak (`INSTALLED` ≠ dispatchable). |
 | orb_* / ensemble | Optional propose | Human review on `/cc` if `auto_execute: propose`. |
 | global | Always present | Enable/Disable/Undeploy hidden by design. |
+| `ai` service (SP2) | AI paper decision loop | Not started. Needs model ids and prices in `ai.yaml`, the discretionary digest and the `decisions.strategies` map (see "Starting the AI paper decision loop"). |
 
 Kill switches: Scaling **Deactivate**; `pause_trading`; `automation.enabled: false` + restart strategy.
 
@@ -430,7 +431,18 @@ harness holds its own controller epoch (lease 60 s). Stop the `ai` service
 before an acceptance run, or the harness waits on `CONTROLLER_EPOCH_HELD` and
 then fails.
 
-- AI paper controller (SP2): `./docker.sh -u` copies `ai.yaml` to `~/.config/mmr/` once; fill in the model ids and prices, then `docker compose --profile ai up -d ai`. Stop it with `docker compose --profile ai stop ai` (always before the SP1 acceptance run). Its health is the heartbeat file `/tmp/mmr_ai_heartbeat.json` inside the container. Its data volume `mmr_ai_data` is kept by `./docker.sh -d`; only `./docker.sh -c` removes volumes. It does not start until SP2 Plan 6 installs the decision engine (it exits with code 2 before that). Schema rule (no legacy data): `ai.duckdb` tables are edited in place, never upgraded; if a pre-release build ever created `ai.duckdb`, delete the `mmr_ai_data` volume (`docker volume rm mmr_ai_data`) before starting a newer one.
+- AI paper controller (SP2): `./docker.sh -u` copies `ai.yaml` to `~/.config/mmr/` once; fill in the model ids and prices, then `docker compose --profile ai up -d ai`. Stop it with `docker compose --profile ai stop ai` (always before the SP1 acceptance run). Its health is the heartbeat file `/tmp/mmr_ai_heartbeat.json` inside the container. Its data volume `mmr_ai_data` is kept by `./docker.sh -d`; only `./docker.sh -c` removes volumes. Schema rule (no legacy data): `ai.duckdb` tables are edited in place, never upgraded; if a pre-release build ever created `ai.duckdb`, delete the `mmr_ai_data` volume (`docker volume rm mmr_ai_data`) before starting a newer one.
+
+**Starting the AI paper decision loop (SP2):**
+
+1. Publish the initial risk policy (operator, once): `mmr ai-policy publish policy.yaml --reason "initial paper policy"`.
+2. Register the discretionary deployment (operator, once): `mmr ai-deployment register-discretionary --operator <name> --statement "<why>"`; note the printed digest.
+3. Edit `~/.config/mmr/ai.yaml`: model ids and prices (`roles:`, `pricing:`); `decisions.discretionary_deployment_digest`; one `decisions.strategies.<strategy_name>` entry per strategy whose BUYs the bot may follow (its sealed deployment digest, stop and target fractions).
+4. Start it: `docker compose --profile ai up -d ai`. Stop it before the SP1 acceptance run.
+5. Check: the heartbeat file, `mmr scoreboard` (books per baseline, AI cost with status), and `ai_rulings` / `ai_discovery_reads` in `ai.duckdb` for refusals and discovery coverage.
+
+The service never publishes or loosens policy. A role whose provider rejects its model is paused for 5 minutes at a time: Jev down blocks every ENTER, orchestrator down stops discovery and model closes; SP1's stops, targets and the 15:45 flatten are unaffected.
+Known gap (#85): the trader cannot size `fixed_rule.v1` yet (the baseline sizer reads strategy deployments only), so that book stays `sizing_unavailable` until fixed.
 
 The automation soak below is blocked until the exit fix
 and the split-Docker evidence gap are resolved (see Known blockers). Until then, run strategies with `auto_execute: propose`

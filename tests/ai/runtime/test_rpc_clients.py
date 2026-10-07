@@ -106,6 +106,12 @@ def test_client_sets_match_the_trader_allow_list():
     assert "publish_ai_risk_policy" not in every                   # spec 6.7: SP2a/b never publishes policy
 
 
+def test_the_engine_reads_its_entry_evidence_as_ai_supervisor():          # SP2 Plan 6 Ruling 4
+    assert {"get_account_values", "get_ai_entry_quote"} <= SUPERVISOR_QUERIES
+    for method in ("get_account_values", "get_ai_entry_quote"):
+        assert "ai_supervisor" in TRADER_ACL[("query", method)]
+
+
 def test_cross_principal_calls_are_refused_through_signed_rpc():
     ids = make_identities()
     registry = TypedRpcRegistry(acl=TRADER_ACL)

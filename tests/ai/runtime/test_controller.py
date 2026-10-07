@@ -13,7 +13,7 @@ from tests.ai.runtime.scripted_engine import ScriptedEngine
 from tests.ai.world import World, request
 from trader.ai.budget_cap import BudgetCapSync, CapGatedGateway
 from trader.ai.config import ControllerConfig
-from trader.ai.controller import AiController, ExperimentWatch
+from trader.ai.controller import EXIT_WAIT_ALERT_EVERY, EXIT_WAIT_OVERRUN, AiController, ExperimentWatch
 from trader.ai.engine import EngineResult, ProposedDecision, SimulatedBaseline
 from trader.ai.gateway import CallRefused
 from trader.ai.ids import derive_decision_id
@@ -425,6 +425,124 @@ async def test_the_deadline_is_checked_again_right_before_the_persist(rig, monke
     await rig.slots_then_drain()
     assert ("cyc-entry-20260717-1100", "TIMED_OUT", "SLOT_DEADLINE") in rig.cycles()
     assert rig.sent() == [] and submissions(rig) == 0
+
+
+@pytest.mark.asyncio
+async def test_an_exit_that_waits_for_its_entry_is_kept_past_the_signal_age(rig):   # PR #86 thread 4211394337
+    sell = rig.trader.signals.add(action="SELL")
+    until = rig.clock.now() + dt.timedelta(hours=1)
+    answers = [EngineResult(note="EXIT_WAITING_FOR_ENTRY", wait_until=until)] * 2 + [EngineResult(decisions=(close(),))]
+    rig.engine.results["exit_signal"] = lambda ctx: answers.pop(0)
+    await rig.signals_then_drain()
+    assert rig.opportunity(sell) == ("IN_PROGRESS", "EXIT_WAITING_FOR_ENTRY") and rig.sent() == []
+    rig.clock.advance(400)                                          # older than signal_max_age_seconds (300)
+    await rig.signals_then_drain()
+    assert rig.opportunity(sell) == ("IN_PROGRESS", "EXIT_WAITING_FOR_ENTRY") and rig.sent() == []
+    await rig.signals_then_drain()                                  # the entry filled: the engine closes now
+    assert rig.opportunity(sell)[0] == "DECIDED" and [b["action"] for b in rig.sent()] == ["CLOSE"]
+    await rig.signals_then_drain()
+    assert rig.engine.hooks_called() == ["exit_signal"] * 3 and len(rig.sent()) == 1
+
+
+@pytest.mark.asyncio
+async def test_a_stuck_exit_wait_is_a_loud_incident_and_stays_pending(rig, caplog):  # PR #86 4212341131
+    sell = rig.trader.signals.add(action="SELL")
+    rig.engine.results["exit_signal"] = EngineResult(note="EXIT_WAITING_FOR_ENTRY",
+                                                     wait_until=rig.clock.now() + dt.timedelta(minutes=5))
+    await rig.signals_then_drain()
+    rig.clock.advance(5 * 60 + EXIT_WAIT_OVERRUN.total_seconds() + 1)
+    caplog.set_level(logging.ERROR, logger="trader.ai.controller")
+    await rig.signals_then_drain()
+    await rig.signals_then_drain()
+    # PR #86 4212341131: the backstop only escalates; the exit stays pending and is judged again.
+    assert rig.opportunity(sell) == ("IN_PROGRESS", "EXIT_WAITING_FOR_ENTRY") and rig.sent() == []
+    assert caplog.text.count("EXIT_WAIT_STUCK") == 1 and sell["source_event_id"] in caplog.text
+    assert (await rig.controller.heartbeat())["exit_waits_stuck"] == 1
+    rig.clock.advance(EXIT_WAIT_ALERT_EVERY.total_seconds())
+    await rig.signals_then_drain()
+    assert caplog.text.count("EXIT_WAIT_STUCK") == 2                 # at most once per hour
+    assert rig.store.db.execute("SELECT alerts FROM ai_exit_waits", fetch="one") == (2,)
+    rig.engine.results["exit_signal"] = EngineResult(decisions=(close(),))      # the entry filled after all
+    await rig.signals_then_drain()
+    assert rig.opportunity(sell)[0] == "DECIDED" and [b["action"] for b in rig.sent()] == ["CLOSE"]
+    assert (await rig.controller.heartbeat())["exit_waits_stuck"] == 0
+
+
+def close_retry(conid=AAPL, attempt=2):
+    return ProposedDecision(action_key=f"close:{conid}:r{attempt}", action="CLOSE", conid=conid, side="SELL",
+                            decider="strategy", evidence_digest="sha256:" + "d" * 64)
+
+
+@pytest.mark.asyncio
+async def test_a_close_refused_for_nothing_held_reopens_the_exit(rig):                     # PR #86 4212667433
+    sell = rig.trader.signals.add(action="SELL")
+    waiting = EngineResult(note="EXIT_WAITING_FOR_ENTRY", wait_until=rig.clock.now() + dt.timedelta(hours=1))
+    answers = [EngineResult(decisions=(close(),), note="EXIT_SIGNAL"), waiting,
+               EngineResult(decisions=(close_retry(),), note="EXIT_SIGNAL")]
+    rig.engine.results["exit_signal"] = lambda ctx: answers.pop(0)
+    rig.trader.decisions.script.append(("receipt", "REJECTED", "POSITION_NOT_OWNED"))
+    await rig.signals_then_drain()                                  # the speculative CLOSE is refused
+    first = derive_decision_id(sell["source_event_id"], f"close:{AAPL}")
+    assert (await rig.submitter.get(first)).error_code == "POSITION_NOT_OWNED"
+    await rig.signals_then_drain()                                  # reopened: the engine waits for shares
+    assert rig.opportunity(sell) == ("IN_PROGRESS", "EXIT_WAITING_FOR_ENTRY")
+    await rig.signals_then_drain()                                  # held now: one retry with a new action key
+    assert rig.opportunity(sell) == ("DECIDED", "EXIT_SIGNAL")
+    assert [b["decision_id"] for b in rig.sent()] == [first, derive_decision_id(sell["source_event_id"],
+                                                                                f"close:{AAPL}:r2")]
+    await rig.signals_then_drain()
+    assert len(rig.sent()) == 2 and rig.engine.hooks_called() == ["exit_signal"] * 3
+
+
+@pytest.mark.asyncio
+async def test_two_refusals_then_an_accepted_close_send_exactly_three_closes(rig):        # PR #86 4212958297
+    sell = rig.trader.signals.add(action="SELL")
+    answers = [EngineResult(decisions=(close(),)), EngineResult(decisions=(close_retry(attempt=2),)),
+               EngineResult(decisions=(close_retry(attempt=3),))]
+    rig.engine.results["exit_signal"] = lambda ctx: answers.pop(0)
+    rig.trader.decisions.script.extend([("receipt", "REJECTED", "POSITION_NOT_OWNED"),
+                                        ("receipt", "REJECTED", "NOT_A_REDUCTION")])
+    await rig.signals_then_drain()                                  # close 1: refused
+    await rig.signals_then_drain()                                  # reopened, close r2: refused
+    rig.build()                                                     # a restart in between (same engine script)
+    await rig.controller.start()
+    for _ in range(4):                                              # reopened once more, r3 accepted, then quiet
+        await rig.signals_then_drain()
+    source = sell["source_event_id"]
+    assert [b["decision_id"] for b in rig.sent()] == [
+        derive_decision_id(source, key) for key in (f"close:{AAPL}", f"close:{AAPL}:r2", f"close:{AAPL}:r3")]
+    assert rig.opportunity(sell)[0] == "DECIDED" and answers == []
+
+
+@pytest.mark.asyncio
+async def test_a_reopened_exit_that_ends_unheld_is_not_reopened_again(rig):
+    sell = rig.trader.signals.add(action="SELL")
+    answers = [EngineResult(decisions=(close(),)), EngineResult(note="ENTRY_UNFILLED")]
+    rig.engine.results["exit_signal"] = lambda ctx: answers.pop(0)
+    rig.trader.decisions.script.append(("receipt", "REJECTED", "NOT_A_REDUCTION"))
+    for _ in range(4):
+        await rig.signals_then_drain()
+    assert rig.opportunity(sell) == ("DECIDED", "ENTRY_UNFILLED") and rig.engine.hooks_called() == ["exit_signal"] * 2
+
+
+@pytest.mark.asyncio
+async def test_a_close_refused_for_another_reason_stays_decided(rig):
+    sell = rig.trader.signals.add(action="SELL")
+    rig.engine.results["exit_signal"] = EngineResult(decisions=(close(),))
+    rig.trader.decisions.script.append(("receipt", "REJECTED", "EXPERIMENT_STOPPED"))
+    await rig.signals_then_drain()
+    await rig.signals_then_drain()
+    assert rig.opportunity(sell)[0] == "DECIDED" and rig.engine.hooks_called() == ["exit_signal"]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("source", ["entry_signal", "entry_cycle"])
+async def test_only_an_exit_signal_may_wait(source):
+    from trader.ai.controller import validate_result
+    waiting = EngineResult(wait_until=et(12, 0))
+    assert validate_result(source, waiting) == "WAIT_NOT_ALLOWED_HERE"
+    assert validate_result("exit_signal", EngineResult(decisions=(close(),), wait_until=et(12, 0))) == \
+        "WAIT_NOT_ALLOWED_HERE"
 
 
 def cycle_states(rig):

@@ -204,7 +204,8 @@ scoreboard                                   # PAPER scoreboard of the latest ex
 --json scoreboard --experiment exp-<20 hex>  # the report as JSON: {"data": ..., "title": "Scoreboard (paper)"}
 scoreboard verify                            # rebuild every number from stored inputs; exit 1 on any mismatch
 # The table lists one "simulated baselines" line per book (baseline / cohort, status COMPLETE, INCOMPLETE or
-# PENDING, records, P&L or "known so far ... from N of M records", and the incomplete reasons). Books are never
+# PENDING, records, P&L or "known so far ... from N of M records", and the incomplete reasons). One book per
+# baseline (follow_signal.v1, fixed_rule.v1, no_trade.v1, matched_entry_bracket_exit.v1); books are never
 # summed; P&L is gross (no commissions or slippage). "AI cost" shows the total with its status label
 # (confirmed, estimated, incomplete), the confirmed and estimated parts and the unknown calls; unavailable when none.
 experiment acceptance preflight              # SP1 clean-account gate: PASS, or STOP + reasons (exit 1)

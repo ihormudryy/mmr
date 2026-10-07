@@ -15,7 +15,9 @@ SUPERVISOR_COMMANDS = frozenset({
     "grant_ai_controller_epoch", "submit_ai_paper_decision", "record_ai_cost", "record_simulated_decision"})
 SUPERVISOR_QUERIES = frozenset({
     "read_ai_signals", "get_ai_paper_decision", "get_experiment", "get_experiment_trips", "get_ai_risk_policy",
-    "get_ai_deployment", "get_snapshot", "get_positions", "get_ai_model_budget"})
+    "get_ai_deployment", "get_snapshot", "get_positions", "get_ai_model_budget",
+    "get_account_values", "get_ai_entry_quote",                           # SP2 Plan 6 Ruling 4
+    "get_broker_order_evidence"})                                          # a waiting exit's proof (PR #86)
 SUPERVISOR_SLOW_QUERIES: Mapping[str, float] = {"discover_ai_candidates": 90.0}
 RESEARCH_COMMANDS = frozenset({"register_ai_deployment"})
 RESEARCH_QUERIES = frozenset({"get_ai_deployment"})

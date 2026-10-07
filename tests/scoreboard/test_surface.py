@@ -51,9 +51,10 @@ def test_get_experiment_trips_returns_identity_and_quantity_per_trip(served, wor
         (265598, 3.0, 3.0, "CLOSED"), (4815747, 2.0, 0.0, "OPEN")]
     assert trips[0]["exec_ids"] == ["e1", "e2"] and trips[0]["net_pnl_usd"] == 1.0
     assert trips[1]["net_pnl_usd"] is None and trips[1]["closed_at"] is None
+    assert [t["entry_avg_price"] for t in trips] == [100.0, 50.0]          # SP2 Plan 6 Ruling 17
     assert body["experiment_id"] == EXP_ID and set(trips[0]) == {
         "round_trip_id", "conid", "symbol", "direction", "opened_at", "closed_at", "opened_quantity",
-        "closed_quantity", "exec_ids", "net_pnl_usd", "decision_id", "strategy_ref", "state"}
+        "closed_quantity", "entry_avg_price", "exec_ids", "net_pnl_usd", "decision_id", "strategy_ref", "state"}
 
 
 def test_get_experiment_trips_acl_and_unknown_experiment(served):

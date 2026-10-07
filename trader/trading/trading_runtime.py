@@ -40,6 +40,8 @@ from typing import cast, Dict, List, NamedTuple, Optional, Tuple, Union
 import asyncio
 import backoff
 import datetime as dt
+import math
+import numbers
 import os
 import reactivex as rx
 import reactivex.operators as ops
@@ -63,6 +65,14 @@ class AccountNotPinnedError(Exception):
     mode — any of which could let orders route to the wrong account on a
     multi-account login. A hard, fatal refusal (not retried).
     """
+
+
+# Prefix of a reduce-only refusal: nothing was sent.
+REDUCE_ONLY_REFUSED = 'reduce-only refused'
+# A refusal because the live IB cache no longer matches the order's size: nothing was sent.
+LIVE_SIZE_REFUSED = 'live size mismatch'
+# A live size refusal because the leg already in the OCA group no longer works (#22 round 9).
+OCA_SIBLING_NOT_WORKING = 'OCA_SIBLING_NOT_WORKING'
 
 
 class Trader():
@@ -1698,8 +1708,19 @@ class Trader():
         *,
         broker_quantity: float,
         order_ref: str,
+        order_type: str = 'MKT',
+        price: Optional[float] = None,
+        oca_group: Optional[str] = None,
+        oca_sibling_ref: Optional[str] = None,
     ) -> SuccessFail:
-        """Send a MARKET order that can only shrink an existing position.
+        """Send an order that can only shrink an existing position.
+
+        ``order_type`` is ``MKT`` (full or partial reduce), or ``STP`` / ``LMT``
+        with a positive ``price`` for the exit legs of a re-protect pair. An
+        ``oca_group`` links the legs with ``ocaType=2``: a fill of one leg
+        reduces the other to what is left. ``oca_sibling_ref`` names the leg
+        already in that group: it must be in ib_async's trade cache, working,
+        with exactly ``quantity`` outstanding.
 
         The emergency-exit path (liquidation, session flatten). It keeps the
         boundary checks — account and mode pin, contract, reduce-only side and
@@ -1713,19 +1734,24 @@ class Trader():
         - ``fail(error=...)``: refused, nothing was sent (or IB rejected it
           with nothing filled).
         - ``fail(exception=...)``: the order may have been sent.
+
+        The size check (#22 round 8) reads ib_async's position and open-trade
+        caches. ib_async updates them on this loop, and nothing between the
+        check and ``placeOrder`` suspends this coroutine, so no position or
+        order status update can land in between. Keep it that way: an
+        ``await`` that yields before ``placeOrder`` would reopen the race.
         """
         try:
-            refusal = self._reduce_only_refusal(contract, side, quantity, broker_quantity)
+            refusal = self._reduce_only_refusal(contract, side, quantity, broker_quantity,
+                                                order_type=order_type, price=price, oca_group=oca_group,
+                                                oca_sibling_ref=oca_sibling_ref)
         except Exception as ex:
             refusal = f'pre-send check failed: {ex}'
         if refusal:
             logging.error('reduce-only order refused before send: %s', refusal)
-            return SuccessFail.fail(error=f'reduce-only refused: {refusal}')
+            return SuccessFail.fail(error=f'{REDUCE_ONLY_REFUSED}: {refusal}')
 
-        order = MarketOrder(
-            action=side, totalQuantity=quantity, account=self.ib_account,
-            orderRef=order_ref, tif='DAY', outsideRth=False,
-        )
+        order = self._reduce_only_order(side, quantity, order_ref, order_type, price, oca_group)
         try:
             trade = await self._send_reduce_only(contract, order)
             return await self._confirm_reduce_only(trade)
@@ -1733,17 +1759,40 @@ class Trader():
             logging.error('reduce-only order may have been sent: %s', ex)
             return SuccessFail.fail(exception=ex)
 
-    def _reduce_only_refusal(
-        self, contract: Contract, side: str, quantity: float, broker_quantity: float,
-    ) -> Optional[str]:
-        import math
+    _REDUCE_ONLY_TYPES = ('MKT', 'STP', 'LMT')
 
+    def _reduce_only_order(self, side: str, quantity: float, order_ref: str, order_type: str,
+                           price: Optional[float], oca_group: Optional[str]) -> Order:
+        common = dict(action=side, totalQuantity=quantity, account=self.ib_account,
+                      orderRef=order_ref, tif='DAY', outsideRth=False)
+        if order_type == 'STP':
+            order: Order = StopOrder(stopPrice=float(price), **common)
+        elif order_type == 'LMT':
+            order = LimitOrder(lmtPrice=float(price), **common)
+        else:
+            order = MarketOrder(**common)
+        if oca_group:
+            order.ocaGroup = oca_group
+            order.ocaType = 2  # a fill reduces the sibling to what is left
+        return order
+
+    def _reduce_only_refusal(
+        self, contract: Contract, side: str, quantity: float, broker_quantity: float, *,
+        order_type: str = 'MKT', price: Optional[float] = None, oca_group: Optional[str] = None,
+        oca_sibling_ref: Optional[str] = None,
+    ) -> Optional[str]:
+        if order_type not in self._REDUCE_ONLY_TYPES:
+            return f'order type {order_type!r} is not a reduce-only type'
+        if order_type != 'MKT' and (price is None or not math.isfinite(float(price)) or not float(price) > 0):
+            return f'{order_type} needs a positive price'
         account = self.ib_account
         if not account:
             return 'no ib_account is configured on the trader'
         if self.paper_trading != account.startswith('D'):
             mode = 'paper' if self.paper_trading else 'live'
             return f'ib_account {account!r} does not match trading mode {mode}'
+        if not self.is_ib_connected():
+            return 'IB is not connected'
         if int(contract.conId or 0) <= 0 or not contract.symbol:
             return f'invalid contract (conId={contract.conId!r}, symbol={contract.symbol!r})'
         try:
@@ -1759,11 +1808,99 @@ class Trader():
         if not math.isfinite(quantity) or not 0 < quantity <= abs(broker_quantity):
             return f'quantity {quantity} must be > 0 and <= |{broker_quantity}|'
 
-        live = self._live_position_quantity(int(contract.conId))
-        if live == 0 or (live > 0) != (broker_quantity > 0) or abs(live) < quantity:
-            return (f'live position cache shows {live} for conId {contract.conId}; '
-                    f'cannot {side} {quantity} against broker position {broker_quantity}')
+        mismatch = (self._live_size_mismatch(int(contract.conId), side, quantity, broker_quantity, oca_group)
+                    or self._oca_sibling_problem(int(contract.conId), side, quantity, oca_group, oca_sibling_ref))
+        return None if mismatch is None else f'{LIVE_SIZE_REFUSED}: {mismatch}'
+
+    def _oca_sibling_problem(self, conid: int, side: str, quantity: float, oca_group: Optional[str],
+                             sibling_ref: Optional[str]) -> Optional[str]:
+        """#22 round 9: why the named OCA sibling does not protect next to this leg; None when it does.
+
+        ``ib.openTrades()`` drops a trade once it is Filled, so a missing open
+        sibling proves nothing. ``ib.trades()`` keeps every trade of this
+        session, terminal ones included (ib_async 2.1 ``IB.trades``; the cache
+        is reset only on disconnect). A sibling that is missing (for example it
+        filled during a disconnect) or not working fails closed: a leg joining
+        an OCA group after its sibling filled is never shrunk by OCA.
+        """
+        if sibling_ref is None:
+            return None
+        if not oca_group:
+            return f'{OCA_SIBLING_NOT_WORKING}: sibling {sibling_ref} named without an OCA group'
+        matches = [
+            t for t in self.client.ib.trades()
+            if getattr(t.order, 'orderRef', None) == sibling_ref
+            and getattr(t.order, 'ocaGroup', '') == oca_group
+            and int(getattr(t.contract, 'conId', 0) or 0) == conid
+            and (getattr(t.order, 'account', '') or self.ib_account) == self.ib_account
+            and t.order.action == side
+        ]
+        if len(matches) != 1:
+            return f'{OCA_SIBLING_NOT_WORKING}: {len(matches)} trades of {sibling_ref} in OCA group {oca_group}'
+        status = getattr(matches[0].orderStatus, 'status', None)
+        if status not in ('PreSubmitted', 'Submitted'):
+            return f'{OCA_SIBLING_NOT_WORKING}: {sibling_ref} is {status}'
+        outstanding = self._outstanding(matches[0])
+        if outstanding != quantity:
+            return f'{OCA_SIBLING_NOT_WORKING}: {sibling_ref} outstanding {outstanding:g} != leg quantity {quantity:g}'
         return None
+
+    @staticmethod
+    def _outstanding(trade) -> float:
+        return max(float(trade.order.totalQuantity) - float(getattr(trade.orderStatus, 'filled', 0.0) or 0.0), 0.0)
+
+    def _live_size_mismatch(self, conid: int, side: str, quantity: float, broker_quantity: float,
+                            oca_group: Optional[str]) -> Optional[str]:
+        """Why the live IB caches do not allow this size; None when they do.
+
+        The OCA pair counts once: a working sibling of ``oca_group`` must have
+        exactly ``quantity`` outstanding, so a leg is never sized against a
+        fill of its sibling (#22 round 8).
+        """
+        live = self._live_position_quantity(conid)
+        if live == 0 or (live > 0) != (broker_quantity > 0) or abs(live) < quantity:
+            return (f'live position cache shows {live} for conId {conid}; '
+                    f'cannot {side} {quantity} against broker position {broker_quantity}')
+        working = self._working_reduce_quantity(conid, side, oca_group)
+        if quantity > abs(live) - working:
+            return (f'quantity {quantity:g} is above {abs(live) - working:g}: live position {live:g}, '
+                    f'{working:g} already working to reduce it')
+        siblings = [outstanding for outstanding in self._oca_sibling_outstanding(conid, side, oca_group)
+                    if outstanding != quantity]
+        if siblings:
+            return f'OCA sibling outstanding {siblings[0]:g} != leg quantity {quantity:g}'
+        return None
+
+    def _oca_sibling_outstanding(self, conid: int, reducing_side: str, oca_group: Optional[str]) -> list[float]:
+        """Outstanding quantity of each working order of ``oca_group`` on this position (pinned account)."""
+        if not oca_group:
+            return []
+        return [
+            self._outstanding(t)
+            for t in self.client.ib.openTrades()
+            if int(getattr(t.contract, 'conId', 0) or 0) == conid
+            and (getattr(t.order, 'account', '') or self.ib_account) == self.ib_account
+            and t.order.action == reducing_side
+            and getattr(t.order, 'ocaGroup', '') == oca_group
+        ]
+
+    def _working_reduce_quantity(self, conid: int, reducing_side: str, oca_group: Optional[str]) -> float:
+        """Outstanding quantity of open orders that already reduce this position (R35).
+
+        A stop whose cancel has not landed still sells, so a second reduce of
+        the full position could reverse it. The sibling of ``oca_group`` does
+        not count: one OCA pair protects the same shares once. Only orders of
+        the pinned account count; an order with no account is counted, so an
+        unknown owner fails closed (#38).
+        """
+        return sum(
+            self._outstanding(t)
+            for t in self.client.ib.openTrades()
+            if int(getattr(t.contract, 'conId', 0) or 0) == conid
+            and (getattr(t.order, 'account', '') or self.ib_account) == self.ib_account
+            and t.order.action == reducing_side
+            and not (oca_group and getattr(t.order, 'ocaGroup', '') == oca_group)
+        )
 
     def _live_position_quantity(self, conid: int) -> float:
         """Signed quantity from ib_async's position cache (no IB request)."""
@@ -2345,6 +2482,16 @@ class Trader():
         return SimpleNamespace(ib=_FakeIB())
 
 
+def _finite_number(value, label: str) -> float:
+    """A finite real number; ``None``, a bool or a string is refused, never coerced."""
+    if value is None or isinstance(value, (bool, str, bytes)):
+        raise ValueError(f'{label} {value!r} is not a number')
+    number = float(value)
+    if not math.isfinite(number):
+        raise ValueError(f'{label} {value!r} is not finite')
+    return number
+
+
 class TradingRuntimeOrderDispatch:
     """[M1-F3] Task 5: ``OrderDispatchPort`` over the trader's async
     ``place_expressive_order``.
@@ -2471,7 +2618,7 @@ class TradingRuntimeOrderDispatch:
         return CancelAck(order_entity_id=order_entity_id, cancelled=True)
 
     def reduce_position(self, position, side: str, quantity: float, order_ref: str):
-        """Submit an emergency reduce-only market order.
+        """Reduce-only MARKET order for the whole broker position (account flatten, full close).
 
         This intentionally bypasses proposal semantics and the entry gates
         (``Trader.place_reduce_only_order``), but not the trader's one
@@ -2481,57 +2628,162 @@ class TradingRuntimeOrderDispatch:
 
         Must be called off the trader loop (the liquidation worker or an RPC
         thread). Errors:
-        - ``ValueError`` / ``RuntimeError`` before scheduling: nothing sent.
-        - ``BrokerRejectedError``: refused before send, or rejected by IB with
-          nothing filled.
+        - ``DispatchRefused``: refused before send (size, side, account, no
+          running trader loop, a call on the loop, the trader's reduce-only
+          checks). Nothing was sent (R34).
+        - ``BrokerRejectedError``: rejected by IB with nothing filled.
         - any other exception, including ``TimeoutError``: the order may have
           been sent.
         """
+        contract, held, size = self._close_inputs(position, quantity)
+        if side != self._side_for(held) or size != abs(held):
+            self._refuse('liquidation order must exactly reduce the broker position')
+        return self._reduce_only(position, contract, held, side, size, order_ref)
+
+    def reduce_partial(self, position, side: str, quantity: float, order_ref: str):
+        """Reduce-only MARKET order for a whole-share part strictly inside the position."""
+        contract, held, size = self._close_inputs(position, quantity)
+        if side != self._side_for(held):
+            self._refuse('a partial reduce must be on the reducing side of a position')
+        if not size.is_integer() or not 0 < size < abs(held):
+            self._refuse('a partial reduce needs a whole quantity strictly between 0 and the position')
+        return self._reduce_only(position, contract, held, side, size, order_ref)
+
+    def place_exit_leg(self, position, *, leg: str, quantity: float, price: float,
+                       oca_group: str, order_ref: str, oca_sibling_ref: Optional[str] = None):
+        """One exit-only leg (stop or target) of a re-protect OCA pair.
+
+        ``oca_sibling_ref``: order ref of the leg already in ``oca_group``
+        (the stop, for a target); the boundary refuses unless it still works.
+        """
+        if leg not in ('stop', 'target'):
+            self._refuse(f'unknown exit leg {leg!r}')
+        contract, held, size = self._close_inputs(position, quantity)
+        try:
+            limit = _finite_number(price, 'price')
+        except (TypeError, ValueError) as ex:
+            self._refuse(f'malformed exit leg price: {ex}')
+        side = self._side_for(held)
+        if side is None:
+            self._refuse('no position to protect')
+        return self._reduce_only(position, contract, held, side, size, order_ref,
+                                 order_type='STP' if leg == 'stop' else 'LMT',
+                                 price=limit, oca_group=oca_group, oca_sibling_ref=oca_sibling_ref)
+
+    def cancel_on_loop(self, order_entity_id: str, order_ref: str):
+        """``cancel`` for the liquidation worker (R34, ruling 7).
+
+        The perm id is read from the journal here, on the calling thread; the
+        open-trade match and ``cancelOrder`` run on the trader loop, so no
+        DuckDB read blocks the IB loop. No live order means nothing was sent:
+        a proven refusal before the boundary.
+        """
+        from trader.trading.command_coordinator import CancelAck
+        from trader.trading.command_ports import CancelUnresolved, resolve_cancel_target
+        from trader.trading.liquidation_service import DispatchRefused
+        perm_id = self._perm_id_for_order(order_entity_id)
+        loop = self._dispatch_loop('cancel')
+
+        async def _cancel():
+            order = resolve_cancel_target(perm_id, self._open_trades())
+            if order is None:
+                raise CancelUnresolved(
+                    f'no live order to cancel for {order_entity_id!r} (perm_id={perm_id})')
+            self._trader.client.ib.cancelOrder(order)
+            return CancelAck(order_entity_id=order_entity_id, cancelled=True)
+        try:
+            return self._wait_on_loop(
+                asyncio.run_coroutine_threadsafe(_cancel(), loop), 'cancel', sent='the cancel')
+        except CancelUnresolved as ex:
+            raise DispatchRefused('CANCEL_UNRESOLVED', str(ex)) from ex
+
+    @staticmethod
+    def _side_for(held: float) -> Optional[str]:
+        return None if held == 0 else ('SELL' if held > 0 else 'BUY')
+
+    @classmethod
+    def _close_inputs(cls, position, quantity) -> tuple:
+        """Contract, broker quantity and order size, built before anything is scheduled (#38, ruling 52).
+
+        A missing field, a conId that is not an exact positive integer or a
+        size that is not a finite number is a refusal: nothing was sent.
+        """
+        try:
+            return (cls._contract_for(position), _finite_number(position.quantity, 'position quantity'),
+                    _finite_number(quantity, 'quantity'))
+        except (AttributeError, TypeError, ValueError) as ex:
+            cls._refuse(f'malformed close input: {ex}')
+
+    @staticmethod
+    def _refuse(detail: str, code: str = 'REDUCE_ONLY_REFUSED'):
+        from trader.trading.liquidation_service import DispatchRefused
+        raise DispatchRefused(code, detail)
+
+    @staticmethod
+    def _contract_for(position) -> Contract:
+        conid, symbol = position.conid, position.symbol
+        if isinstance(conid, bool) or not isinstance(conid, numbers.Integral) or conid <= 0:
+            raise ValueError(f'conId {conid!r} is not a positive integer')
+        if not isinstance(symbol, str) or not symbol:
+            raise ValueError(f'symbol {symbol!r} is missing')
+        return Contract(
+            conId=int(conid), symbol=symbol,
+            secType=getattr(position, 'sec_type', None) or 'STK',
+            exchange=getattr(position, 'exchange', None) or 'SMART',
+            currency=getattr(position, 'currency', None) or 'USD',
+        )
+
+    def _reduce_only(self, position, contract: Contract, held: float, side: str, quantity: float,
+                     order_ref: str, **order):
+        """One reduce-only order on the trader loop; maps the result to the errors above.
+
+        Every argument is already built (``_close_inputs``): only the
+        scheduled coroutine can cross the boundary, so only what follows
+        ``run_coroutine_threadsafe`` may be "maybe sent".
+        """
         from trader.trading.command_coordinator import BrokerRejectedError
 
-        broker_quantity = float(position.quantity)
-        expected_side = 'SELL' if broker_quantity > 0 else 'BUY'
-        if broker_quantity == 0 or side != expected_side or float(quantity) != abs(broker_quantity):
-            raise ValueError('liquidation order must exactly reduce the broker position')
         position_account = getattr(position, 'account_id', None)
         if position_account and position_account != getattr(self._trader, 'ib_account', None):
-            raise ValueError('liquidation position account does not match trader account')
+            self._refuse('liquidation position account does not match trader account')
         loop = self._dispatch_loop('liquidation')
-        contract = Contract(
-            conId=int(position.conid), symbol=position.symbol,
-            secType=position.sec_type or 'STK', exchange=position.exchange or 'SMART',
-            currency=position.currency or 'USD',
-        )
         future = asyncio.run_coroutine_threadsafe(
             self._trader.place_reduce_only_order(
-                contract, side, abs(broker_quantity),
-                broker_quantity=broker_quantity, order_ref=order_ref,
+                contract, side, quantity, broker_quantity=held, order_ref=order_ref, **order,
             ), loop,
         )
         result = self._wait_on_loop(future, 'liquidation dispatch')
         if result.is_success():
             return result.obj or []
         if result.error is not None:
+            if str(result.error).startswith(f'{REDUCE_ONLY_REFUSED}: {LIVE_SIZE_REFUSED}'):
+                from trader.trading.liquidation_service import LIVE_SIZE_MISMATCH
+                self._refuse(str(result.error), code=LIVE_SIZE_MISMATCH)
+            if str(result.error).startswith(REDUCE_ONLY_REFUSED):
+                self._refuse(str(result.error))
             raise BrokerRejectedError(str(result.error))
         if result.exception is not None:
             raise result.exception
         raise RuntimeError('liquidation dispatch failed with no detail; the order may have been sent')
 
     def _dispatch_loop(self, purpose: str) -> asyncio.AbstractEventLoop:
-        """The trader loop, or RuntimeError before anything is scheduled.
+        """The trader loop, or ``DispatchRefused`` before anything is scheduled.
 
         A stopped loop would run the order late, after the caller gave up; a
         call from the loop thread would block the loop it waits on.
         """
+        from trader.trading.liquidation_service import DispatchRefused
         loop = getattr(self._trader, '_main_loop', None)
         if loop is None or not loop.is_running():
-            raise RuntimeError(f'trader event loop is not running; {purpose} refused, nothing sent')
+            raise DispatchRefused(
+                'TRADER_LOOP_UNAVAILABLE', f'trader event loop is not running; {purpose} refused, nothing sent')
         try:
             running = asyncio.get_running_loop()
         except RuntimeError:
             running = None
         if running is loop:
-            raise RuntimeError(
+            raise DispatchRefused(
+                'ON_TRADER_LOOP',
                 f'{purpose} called on the trader loop thread; refused to avoid a deadlock, nothing sent')
         return loop
 
@@ -2566,6 +2818,27 @@ class TradingRuntimeOrderDispatch:
             return []
         return orders_matching_group(self._active_order_rows(), account_id, group)
 
+    def find_legacy_reduces(self, account_id: str, prefix: str) -> list:
+        from trader.trading.command_ports import orders_matching_legacy_reduces
+        return orders_matching_legacy_reduces(self._active_order_rows(), account_id, prefix)
+
+    def executed_quantities(self, account_id: str, order_entity_ids: tuple) -> dict:
+        """Executions bound to each order (SP1 #20). Raises when the store is not wired: no answer is not zero."""
+        store, journal = self._broker_store()
+        return store.executed_quantity_by_order_in_tx(journal.connect(), account_id, tuple(order_entity_ids))
+
+    def unbound_execution_since(self, account_id: str, conid, generation_id: int) -> bool:
+        """An execution no order claims, recorded since ``generation_id`` started (SP1 #20, fail closed)."""
+        store, journal = self._broker_store()
+        return store.unbound_fill_since_generation_in_tx(journal.connect(), account_id, conid, int(generation_id))
+
+    def _broker_store(self):
+        store = getattr(self._trader, 'broker_state_store', None)
+        journal = getattr(self._trader, 'domain_journal', None)
+        if store is None or journal is None:
+            raise RuntimeError('broker state store unavailable for execution evidence')
+        return store, journal
+
     def _open_trades(self) -> list:
         ib = getattr(getattr(self._trader, 'client', None), 'ib', None)
         return list(ib.openTrades()) if ib is not None else []
@@ -2581,5 +2854,30 @@ class TradingRuntimeOrderDispatch:
         return store.select_active_orders_in_tx(journal.connect())
 
     def enumeration_complete(self) -> bool:
+        """A promoted broker generation exists and no newer one is staging."""
+        from trader.trading.command_ports import ingest_ready
         ingest = getattr(self._trader, 'broker_ingest', None)
-        return bool(ingest is not None and ingest.is_ready())
+        return ingest is not None and ingest_ready(ingest)
+
+    def hold_broker_changes(self):
+        """``BrokerIngest.hold_changes`` for the close's terminal write (SP1 ruling 48)."""
+        from trader.trading.liquidation_service import BrokerChangesBusy
+        ingest = getattr(self._trader, 'broker_ingest', None)
+        if ingest is None:
+            raise BrokerChangesBusy('no broker ingest to hold')
+        return ingest.hold_changes()
+
+    def newest_generation(self) -> int:
+        """The highest broker generation id, staging included (fence for a child order).
+
+        Raises when the broker store is not wired: a fence that cannot be read
+        must stop the close, never look like an old generation.
+        """
+        store = getattr(self._trader, 'broker_state_store', None)
+        journal = getattr(self._trader, 'domain_journal', None)
+        if store is None or journal is None:
+            raise RuntimeError('broker state store unavailable for a generation fence')
+        newest = store.newest_generation_in_tx(journal.connect())
+        if newest is None:
+            raise RuntimeError('no broker generation has been opened yet')
+        return newest

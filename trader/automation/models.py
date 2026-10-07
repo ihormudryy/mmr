@@ -1,9 +1,17 @@
+import numbers
 from dataclasses import dataclass, asdict
 from datetime import datetime
 from decimal import Decimal
 from typing import Literal, Optional
 
 from trader.automation.intent_ids import derive_intent_id, derive_command_id
+
+
+def is_exact_conid(value) -> bool:
+    """A positive integer conId as given. ``265598.9``, ``1.0``, ``True`` and ``"1"`` are not:
+    coercing them can name another instrument (#21)."""
+    return not isinstance(value, bool) and isinstance(value, numbers.Integral) and value > 0
+
 
 @dataclass(frozen=True)
 class EntryPolicy:
@@ -61,8 +69,8 @@ class ExecutionIntent:
             raise ValueError("completed_bar_timestamp must be timezone-aware")
         if self.completed_bar_timestamp > self.signal_timestamp:
             raise ValueError("completed_bar_timestamp must be <= signal_timestamp")
-        if self.conid <= 0:
-            raise ValueError("conid must be positive")
+        if not is_exact_conid(self.conid):
+            raise ValueError(f"conid must be positive and an exact integer, got {self.conid!r}")
         if self.side not in ("BUY", "SELL"):
             raise ValueError("side must be BUY or SELL")
         if not (Decimal("0") < self.risk_fraction <= Decimal("1")):

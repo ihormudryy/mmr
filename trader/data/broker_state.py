@@ -17,6 +17,7 @@ from typing import Any, Callable, Optional
 
 
 BROKER_STATE_MIGRATION_VERSION = 10
+BROKER_ORDER_OCA_MIGRATION_VERSION = 38
 
 _STATEMENTS = [
     """CREATE TABLE IF NOT EXISTS broker_account_state (
@@ -127,6 +128,11 @@ _STATEMENTS = [
 ]
 
 _EXCLUDED_FROM_COMPARISON = ("revision", "source_timestamp")
+_ORDER_COLUMNS = (
+    "order_entity_id, account_id, conid, symbol, order_group_id, leg, is_external, action, order_type, "
+    "total_quantity, filled_quantity, avg_fill_price, limit_price, stop_price, tif, status, deleted, "
+    "revision, source_timestamp, oca_group, oca_type"
+)
 _WORKING_ORDER_STATUSES = (
     "PendingSubmit",
     "ApiPending",
@@ -235,6 +241,8 @@ class BrokerOrderRow:
     deleted: bool
     revision: int
     source_timestamp: dt.datetime
+    oca_group: Optional[str] = None
+    oca_type: Optional[int] = None
 
     def same_fields(self, other: "BrokerOrderRow") -> bool:
         return _same_fields(self, other)
@@ -328,6 +336,10 @@ class BrokerStateStore:
 
     def migrate(self, migrator: Any) -> None:
         migrator.apply(BROKER_STATE_MIGRATION_VERSION, "broker_state_tables", _STATEMENTS)
+        migrator.apply(BROKER_ORDER_OCA_MIGRATION_VERSION, "sp1_broker_order_oca", (
+            "ALTER TABLE broker_orders ADD COLUMN IF NOT EXISTS oca_group VARCHAR",
+            "ALTER TABLE broker_orders ADD COLUMN IF NOT EXISTS oca_type INTEGER",
+        ))
 
     @staticmethod
     def _upsert(conn: Any, table: str, key: dict[str, Any], values: dict[str, Any]) -> None:
@@ -431,13 +443,13 @@ class BrokerStateStore:
             "stop_price": row.stop_price, "tif": row.tif, "status": row.status,
             "deleted": row.deleted, "revision": row.revision,
             "source_timestamp": row.source_timestamp, "updated_at": _now(),
+            "oca_group": row.oca_group, "oca_type": row.oca_type,
         })
 
     def get_order_in_tx(self, conn: Any, order_entity_id: str) -> Optional[BrokerOrderRow]:
         row = conn.execute(
-            "SELECT order_entity_id, account_id, conid, symbol, order_group_id, leg, is_external, action, "
-            "order_type, total_quantity, filled_quantity, avg_fill_price, limit_price, stop_price, tif, "
-            "status, deleted, revision, source_timestamp FROM broker_orders WHERE order_entity_id = ?",
+            f"SELECT {_ORDER_COLUMNS} "
+            "FROM broker_orders WHERE order_entity_id = ?",
             [order_entity_id],
         ).fetchone()
         return None if row is None else self._order_from_row(row)
@@ -453,9 +465,8 @@ class BrokerStateStore:
 
     def select_active_orders_in_tx(self, conn: Any) -> list[BrokerOrderRow]:
         rows = conn.execute(
-            "SELECT order_entity_id, account_id, conid, symbol, order_group_id, leg, is_external, action, "
-            "order_type, total_quantity, filled_quantity, avg_fill_price, limit_price, stop_price, tif, "
-            "status, deleted, revision, source_timestamp FROM broker_orders WHERE NOT deleted "
+            f"SELECT {_ORDER_COLUMNS} "
+            "FROM broker_orders WHERE NOT deleted "
             "ORDER BY order_entity_id"
         ).fetchall()
         return [self._order_from_row(row) for row in rows]
@@ -463,9 +474,8 @@ class BrokerStateStore:
     def select_working_orders_in_tx(self, conn: Any) -> list[BrokerOrderRow]:
         markers = ", ".join("?" for _ in _WORKING_ORDER_STATUSES)
         rows = conn.execute(
-            "SELECT order_entity_id, account_id, conid, symbol, order_group_id, leg, is_external, action, "
-            "order_type, total_quantity, filled_quantity, avg_fill_price, limit_price, stop_price, tif, "
-            f"status, deleted, revision, source_timestamp FROM broker_orders WHERE NOT deleted AND status IN ({markers}) "
+            f"SELECT {_ORDER_COLUMNS} "
+            f"FROM broker_orders WHERE NOT deleted AND status IN ({markers}) "
             "ORDER BY order_entity_id",
             list(_WORKING_ORDER_STATUSES),
         ).fetchall()
@@ -546,6 +556,41 @@ class BrokerStateStore:
         ).fetchall()
         return [self._fill_from_row(row) for row in rows]
 
+    def executed_quantity_by_order_in_tx(
+        self, conn: Any, account_id: str, order_entity_ids: tuple[str, ...]
+    ) -> dict[str, float]:
+        """Executions bound to each order, summed (SP1 #20: a fill can arrive without an order status)."""
+        if not order_entity_ids:
+            return {}
+        markers = ", ".join("?" for _ in order_entity_ids)
+        rows = conn.execute(
+            "SELECT order_entity_id, SUM(quantity) FROM broker_fills "
+            f"WHERE account_id = ? AND order_entity_id IN ({markers}) GROUP BY order_entity_id",
+            [account_id, *order_entity_ids],
+        ).fetchall()
+        return {row[0]: float(row[1]) for row in rows}
+
+    def unbound_fill_since_generation_in_tx(
+        self, conn: Any, account_id: str, conid: Optional[int], generation_id: int
+    ) -> bool:
+        """An execution with no bound order, recorded at or after ``generation_id`` started.
+
+        An unknown generation counts as True: the caller must not size against it.
+        """
+        started = conn.execute(
+            "SELECT started_at FROM broker_sync_generations WHERE generation_id = ?", [generation_id]
+        ).fetchone()
+        if started is None:
+            return True
+        conid_filter = "" if conid is None else " AND conid = ?"
+        params: list = [account_id, started[0]] + ([] if conid is None else [int(conid)])
+        row = conn.execute(
+            "SELECT COUNT(*) FROM broker_fills WHERE account_id = ? AND order_entity_id IS NULL "
+            "AND source_timestamp >= ?" + conid_filter,
+            params,
+        ).fetchone()
+        return int(row[0]) > 0
+
     def open_generation_in_tx(
         self, conn: Any, sources: tuple[str, ...], started_at: dt.datetime
     ) -> int:
@@ -614,6 +659,15 @@ class BrokerStateStore:
 
     def purge_staging_in_tx(self, conn: Any, generation_id: int) -> None:
         conn.execute("DELETE FROM broker_sync_staging WHERE generation_id = ?", [generation_id])
+
+    def newest_generation_in_tx(self, conn: Any) -> Optional[int]:
+        """The highest broker generation id in any state, staging included.
+
+        A generation with a higher id was opened after this read, so its
+        enumeration started after anything this process sent before the read.
+        """
+        row = conn.execute("SELECT MAX(generation_id) FROM broker_sync_generations").fetchone()
+        return None if row is None or row[0] is None else int(row[0])
 
     def latest_promoted_generation_in_tx(self, conn: Any) -> Optional[int]:
         row = conn.execute(

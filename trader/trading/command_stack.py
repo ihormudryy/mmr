@@ -4,6 +4,7 @@ from __future__ import annotations
 import asyncio
 import datetime as dt
 import os
+import time
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Callable, Optional
@@ -34,6 +35,7 @@ from trader.trading.command_ports import (
     TraderBrokerRiskSnapshotAuthority,
     TraderPositionAuthority,
     TraderQuoteAuthority,
+    ingest_ready,
 )
 from trader.trading.preflight_nonce import (
     PreflightNonceGate,
@@ -44,7 +46,9 @@ from trader.trading.risk_producer import RiskProducer
 from trader.trading.dispatch_guard import DispatchGuard
 from trader.trading.circuit_breaker import CircuitBreaker
 from trader.trading.circuit_breaker import BreakerSignal
+from trader.trading.exit_owner import ExitOwnerRegistry
 from trader.trading.liquidation_service import LiquidationService, LiquidationRunStore, apply_liquidation_migration
+from trader.trading.liquidation_worker import LiquidationWorker, SerializedLiquidation
 from trader.trading.order_correlation import encode_order_ref
 from trader.trading.semantic_readiness import (
     SemanticReadiness,
@@ -204,15 +208,83 @@ class _UniverseAuthority:
 
 
 class _LiquidationDispatch:
-    """Adapter which keeps emergency flattening on the existing IB boundary."""
-    def __init__(self, dispatch):
+    """Keeps every exit on the one IB boundary; child ids become order refs."""
+    def __init__(self, dispatch, orders_view):
         self._dispatch = dispatch
+        self._orders_view = orders_view
 
-    def cancel(self, order, command_id: str) -> None:
-        self._dispatch.cancel(order.order_entity_id, encode_order_ref(command_id))
+    def cancel(self, order, child_id: str) -> None:
+        self._dispatch.cancel_on_loop(order.order_entity_id, encode_order_ref(child_id))
 
-    def reduce(self, position, side: str, quantity: float, command_id: str) -> None:
-        self._dispatch.reduce_position(position, side, quantity, encode_order_ref(command_id))
+    def reduce(self, position, side: str, quantity: float, child_id: str) -> None:
+        self._dispatch.reduce_position(position, side, quantity, encode_order_ref(child_id))
+
+    def reduce_partial(self, position, side: str, quantity: float, child_id: str) -> None:
+        self._dispatch.reduce_partial(position, side, quantity, encode_order_ref(child_id))
+
+    def place_exit_leg(self, position, *, leg: str, quantity: float, price: float,
+                       oca_group: str, child_id: str, sibling_child_id: Optional[str] = None) -> None:
+        sibling_ref = None if sibling_child_id is None else encode_order_ref(sibling_child_id)
+        self._dispatch.place_exit_leg(position, leg=leg, quantity=quantity, price=price,
+                                      oca_group=oca_group, order_ref=encode_order_ref(child_id),
+                                      oca_sibling_ref=sibling_ref)
+
+    def find_orders(self, account_id: str, child_id: str) -> list:
+        return self._dispatch.find_by_order_ref(account_id, encode_order_ref(child_id))
+
+    def find_orders_with_prefix(self, account_id: str, prefix: str) -> list:
+        return self._dispatch.find_legacy_reduces(account_id, prefix)
+
+    def get_order(self, order_entity_id: str):
+        return self._orders_view.get_order(order_entity_id)
+
+    def executed_quantities(self, account_id: str, order_entity_ids: tuple) -> dict:
+        return self._dispatch.executed_quantities(account_id, order_entity_ids)
+
+    def unbound_execution_since(self, account_id: str, conid, generation_id: int) -> bool:
+        return self._dispatch.unbound_execution_since(account_id, conid, generation_id)
+
+    def enumeration_complete(self) -> bool:
+        return self._dispatch.enumeration_complete()
+
+    def newest_generation(self) -> int:
+        return self._dispatch.newest_generation()
+
+    def hold_broker_changes(self):
+        return self._dispatch.hold_broker_changes()
+
+
+class _BrokerGenerationRefresh:
+    """Ask for a newer complete broker generation without waiting for it.
+
+    A promoted generation only changes when ``run_broker_sync`` runs, which
+    today is only at (re)connect. The close needs newer generations to see
+    absence and fresh positions (R4, R5), so it asks for one while it waits.
+    """
+    def __init__(self, trader, *, min_interval_seconds: float = 5.0,
+                 clock: Optional[Callable[[], float]] = None):
+        self._trader = trader
+        self._min_interval = min_interval_seconds
+        self._clock = clock or time.monotonic
+        self._last: Optional[float] = None
+
+    def request_refresh(self, account_id: str) -> None:
+        now = self._clock()
+        if self._last is not None and now - self._last < self._min_interval:
+            return
+        loop = getattr(self._trader, "_main_loop", None)
+        sync = getattr(getattr(self._trader, "broker_ingest", None), "run_broker_sync", None)
+        if loop is None or not loop.is_running() or sync is None:
+            return
+        self._last = now
+        future = asyncio.run_coroutine_threadsafe(sync(self._trader.client), loop)
+        future.add_done_callback(_log_refresh_failure)
+
+
+def _log_refresh_failure(future) -> None:
+    import logging
+    if not future.cancelled() and future.exception() is not None:
+        logging.getLogger(__name__).warning("broker generation refresh failed: %s", future.exception())
 
 
 class _LiquidationBreaker:
@@ -400,8 +472,10 @@ class CommandStack:
     reconciliation_complete: Callable[[str], bool]
     circuit_breaker: CircuitBreaker
     semantic_readiness: SemanticReadiness
-    liquidation_service: LiquidationService
+    liquidation_service: Any  # SerializedLiquidation: every entry point on one worker (R12)
     session_risk: Any = None  # SessionRiskController when automation stack is active
+    liquidation_worker: Any = None  # LiquidationWorker behind liquidation_service (R12)
+    exit_owner_registry: Any = None  # ExitOwnerRegistry (SP1 safe close)
     protective_order_saga: Any = None  # ProtectiveOrderSaga (P3 Task 5)
     session_controller: Any = None  # SessionController (P3 Task 6)
     attribution_ledger: Any = None  # AttributionLedger (P3 Task 7)
@@ -466,8 +540,7 @@ def _resolve_contract(trader: Any, conid: int):
 def _broker_ready(trader: Any) -> bool:
     if not trader.is_ib_connected():
         return False
-    readiness = trader.broker_ingest.is_ready
-    return bool(readiness() if callable(readiness) else readiness)
+    return ingest_ready(trader.broker_ingest)
 
 
 def _bundle_root_for(bundle_path: str) -> Path:
@@ -493,6 +566,7 @@ def _build_automated_intent_service(
     quotes: Any,
     margin: Any,
     policy: CommandAuthorityPolicy,
+    liquidation: Any = None,
 ) -> Optional[Any]:
     """Build ``AutomatedIntentCommandService`` for paper automation only.
 
@@ -560,6 +634,8 @@ def _build_automated_intent_service(
         approval_factory=evidence.approval_factory,
         session_state_factory=evidence.session_state_factory,
         allocation_factory=evidence.allocation_factory,
+        liquidation=liquidation,
+        broker=broker,
     )
 
 
@@ -596,7 +672,9 @@ def build_command_stack(
     apply_trading_control_migration(migrator)
     apply_preflight_nonce_migration(migrator)
     apply_circuit_breaker_migration(migrator)
-    apply_liquidation_migration(migrator)
+    apply_liquidation_migration(migrator)          # also applies 35 (exit owners) before 36
+    exit_owner_registry = ExitOwnerRegistry(trader.journal_db)
+    liquidation_store = LiquidationRunStore(trader.journal_db)
     from trader.promotion.evidence_store import apply_evidence_migrations
     from trader.promotion.stage import apply_stage_migration
     from trader.promotion.controller import apply_live_activation_authority_migration
@@ -740,6 +818,7 @@ def build_command_stack(
         repo=repository,
         orders_view=orders_view,
         now=now,
+        closes=liquidation_store,
     )
     strategy_control_service = None
     if strategy_port is not None:
@@ -805,11 +884,17 @@ def build_command_stack(
             now=now(),
         ),
     )
-    liquidation_service = LiquidationService(
-        broker_snapshot, _LiquidationDispatch(dispatch),
-        breaker=_LiquidationBreaker(circuit_breaker, now), now=now,
-        store=LiquidationRunStore(trader.journal_db),
-        journal=journal, ledger=ledger,
+    liquidation_worker = LiquidationWorker()
+    liquidation_service = SerializedLiquidation(
+        LiquidationService(
+            broker_snapshot, _LiquidationDispatch(dispatch, orders_view),
+            store=liquidation_store, registry=exit_owner_registry, now=now,
+            breaker=_LiquidationBreaker(circuit_breaker, now),
+            journal=journal, ledger=ledger,
+            schedule_reconcile=lambda command_id: reconciler.schedule(command_id, now()),
+            refresh=_BrokerGenerationRefresh(trader),
+        ),
+        liquidation_worker, account_id=trader.ib_account, now=now,
     )
     proposal_service = ProposalCommandService(
         repository=repository,
@@ -877,12 +962,15 @@ def build_command_stack(
         dispatch_guard=dispatch_guard,
         session_risk=session_risk,
         breaker=circuit_breaker,
-        liquidation=liquidation_service,
+        # The ingest thread reports protection failures; it must queue the flatten, not wait (R12).
+        liquidation=liquidation_service.nonblocking(),
         account_id=trader.ib_account,
         account_mode=account_mode,
         now=now,
         db=trader.journal_db,
     )
+    # The saga is the protection port of every close and the source of unhandled failures.
+    liquidation_service.attach_protection(protective_order_saga)
     # P3 Task 6 — exchange-aware session deadlines / flatten scheduler.
     from trader.automation.session_controller import (
         SessionCancelAdapter,
@@ -896,10 +984,10 @@ def build_command_stack(
         db=trader.journal_db,
         calendar=XNYSCalendarPolicy(),
         broker=broker_snapshot,
-        cancel=SessionCancelAdapter(_LiquidationDispatch(dispatch)),
+        cancel=SessionCancelAdapter(_LiquidationDispatch(dispatch, orders_view)),
         liquidation=liquidation_service,
         breaker=circuit_breaker,
-        time_exit=SessionTimeExitAdapter(_LiquidationDispatch(dispatch)),
+        time_exit=SessionTimeExitAdapter(liquidation_service, account_id=trader.ib_account, now=now),
         account_id=trader.ib_account,
         now=now,
     )
@@ -980,6 +1068,7 @@ def build_command_stack(
         schedule_reconcile=lambda command_id: reconciler.schedule(
             command_id, now(),
         ),
+        liquidation=liquidation_service,
     )
     from trader.automation.paper_activation import PaperAutomationActivationService
     from trader.automation.paper_hot_arm import ProductionPaperHotArmPorts
@@ -1020,6 +1109,8 @@ def build_command_stack(
         circuit_breaker=circuit_breaker,
         semantic_readiness=semantic_readiness,
         liquidation_service=liquidation_service,
+        liquidation_worker=liquidation_worker,
+        exit_owner_registry=exit_owner_registry,
         session_risk=session_risk,
         protective_order_saga=protective_order_saga,
         session_controller=session_controller,
@@ -1051,6 +1142,7 @@ def build_command_stack(
             schedule_reconcile=lambda command_id: reconciler.schedule(
                 command_id, now(),
             ),
+            liquidation=liquidation_service,
         )
 
     if account_mode == "paper":
@@ -1088,6 +1180,8 @@ def build_command_stack(
     trader.automation_circuit_breaker = circuit_breaker
     trader.semantic_readiness = semantic_readiness
     trader.liquidation_service = liquidation_service
+    trader.liquidation_worker = liquidation_worker
+    trader.exit_owner_registry = exit_owner_registry
     trader.session_risk = session_risk
     trader.protective_order_saga = protective_order_saga
     trader.session_controller = session_controller

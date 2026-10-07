@@ -13,6 +13,7 @@ Contract (plan §Task 6):
 from __future__ import annotations
 
 import datetime as dt
+from contextlib import contextmanager
 from decimal import Decimal
 from pathlib import Path
 from types import SimpleNamespace
@@ -67,10 +68,12 @@ def _order(
     filled: float = 0.0,
     total: float = 10.0,
     is_external: bool = False,
+    group: str = "og-1",
+    action: str = "BUY",
 ) -> BrokerOrderRow:
     return BrokerOrderRow(
         order_entity_id=entity, account_id=ACCOUNT, conid=CONID, symbol="AAPL",
-        order_group_id="og-1", leg=leg, is_external=is_external, action="BUY",
+        order_group_id=group, leg=leg, is_external=is_external, action=action,
         order_type="LMT", total_quantity=total, filled_quantity=filled,
         avg_fill_price=None, limit_price=160.0, stop_price=None, tif="DAY",
         status="Submitted", deleted=False, revision=1,
@@ -124,37 +127,40 @@ class FakeCancel:
 
 
 class FakeLiquidation:
+    """Records starts; ``joined_root`` makes the next account start join that root."""
     def __init__(self):
         self.starts: list[tuple] = []
-        self._receipt: Any = None
+        self.kwargs: list[dict] = []
+        self.receipts: dict[str, Any] = {}
         self.rescans = 0
+        self.joined_root: Optional[str] = None
+        self.other_flat: Any = None
 
-    def start(self, account_id, cause_command_id, deadline):
+    def start(self, account_id, cause_command_id, deadline, **kwargs):
         self.starts.append((account_id, cause_command_id, deadline))
-        self._receipt = SimpleNamespace(
-            account_id=account_id,
-            cause_command_id=cause_command_id,
-            state="REQUESTED",
-            deadline=deadline,
-            generation_id=None,
-            detail="started",
-        )
-        return self._receipt
+        self.kwargs.append(kwargs)
+        root = self.joined_root or cause_command_id
+        self.receipts.setdefault(root, SimpleNamespace(
+            account_id=account_id, cause_command_id=root, state="REQUESTED",
+            deadline=deadline, generation_id=None, detail="started",
+        ))
+        return self.receipts[root]
 
     def rescan(self):
         self.rescans += 1
-        return self._receipt
+        return self.other_flat or next(iter(self.receipts.values()), None)
 
-    def mark_flat(self, generation_id: int = 2):
-        if self._receipt is None:
+    def receipt_for(self, root_id):
+        return self.receipts.get(root_id)
+
+    def mark_flat(self, generation_id: int = 2, root_id: Optional[str] = None):
+        if not self.receipts:
             return
-        self._receipt = SimpleNamespace(
-            account_id=self._receipt.account_id,
-            cause_command_id=self._receipt.cause_command_id,
-            state="FLAT",
-            deadline=self._receipt.deadline,
-            generation_id=generation_id,
-            detail="flat",
+        root = root_id or next(iter(self.receipts))
+        current = self.receipts[root]
+        self.receipts[root] = SimpleNamespace(
+            account_id=current.account_id, cause_command_id=root, state="FLAT",
+            deadline=current.deadline, generation_id=generation_id, detail="flat",
         )
 
 
@@ -347,6 +353,64 @@ def test_partial_fill_during_cancel_still_cancels_remainder(tmp_path):
     assert cancel.calls[0][1] == "ord-partial"
 
 
+def test_session_cancel_entries_keeps_protective_children(tmp_path):
+    """R16 / #27: stops, targets, a close's reduce and external orders are not cancelled."""
+    working = (
+        _order("og-1:entry", leg="entry"),
+        _order("og-2:stop", leg="stop", group="og-2", action="SELL"),
+        _order("og-2:take_profit", leg="take_profit", group="og-2", action="SELL"),
+        _order("ext-1", leg="entry", is_external=True, group=None),
+        _order("flat-1-liquidation-reduce-265598:entry", leg="entry",
+               group="flat-1-liquidation-reduce-265598", action="SELL"),
+    )
+    broker = FakeBroker([_snapshot(1, positions=[_position()], working=working)])
+    controller, _b, cancel, _l, breaker, _t, _j, _db, clock = _build_controller(tmp_path, broker=broker)
+    clock[0] = _utc(15, 35)
+    controller.recover(clock[0])
+    controller.run_due(clock[0])
+    assert [c[1] for c in cancel.calls] == ["og-1:entry"]
+    assert breaker.signals == []
+
+
+def test_protection_bigger_than_the_position_after_the_cancel_closes_the_conid(tmp_path):
+    """D16: the entry filled 4 of 10 and its rest was cancelled; a stop for 10 would reverse the position."""
+    working = (_order("og-1:stop", leg="stop", total=10.0, action="SELL"),)
+    broker = FakeBroker([_snapshot(1, positions=[_position(4.0)], working=working)])
+    controller, _b, _c, _l, _br, time_exit, _j, _db, clock = _build_controller(tmp_path, broker=broker)
+    clock[0] = _utc(15, 36)
+    controller.recover(clock[0])
+    controller.run_due(clock[0])
+    from trader.automation.session_controller import SessionController
+    root = SessionController.cancel_command_id(ACCOUNT, SESSION_DATE)
+    expected = {"command_id": f"{root}-protect-{CONID}", "conid": CONID, "quantity": Decimal("4.0"), "side": "BUY"}
+    assert time_exit.exits and all(e == expected for e in time_exit.exits)   # one root id: the close joins itself
+
+
+def test_protection_that_matches_the_position_is_left_to_the_flatten(tmp_path):
+    working = (_order("og-1:stop", leg="stop", total=4.0, action="SELL"),)
+    broker = FakeBroker([_snapshot(1, positions=[_position(4.0)], working=working)])
+    controller, _b, _c, _l, _br, time_exit, _j, _db, clock = _build_controller(tmp_path, broker=broker)
+    clock[0] = _utc(15, 36)
+    controller.recover(clock[0])
+    controller.run_due(clock[0])
+    assert time_exit.exits == []
+
+
+def test_an_entry_that_cannot_be_cancelled_does_not_stop_the_others():
+    from trader.automation.session_controller import SessionCancelAdapter
+    from trader.trading.liquidation_service import DispatchRefused
+
+    sent = []
+
+    def cancel(order, child):
+        if order.order_entity_id == "gone":
+            raise DispatchRefused("CANCEL_UNRESOLVED", "no live order")
+        sent.append(order.order_entity_id)
+    SessionCancelAdapter(SimpleNamespace(cancel=cancel)).cancel_working_entries(
+        root_command_id="session-cancel-x", orders=(_order("gone"), _order("og-2:entry")))
+    assert sent == ["og-2:entry"]
+
+
 def test_flatten_at_flatten_deadline_uses_liquidation(tmp_path):
     broker = FakeBroker([_snapshot(1, positions=[_position()])])
     controller, _b, _c, liquidation, _br, _t, _j, _db, clock = _build_controller(
@@ -441,7 +505,7 @@ def test_missed_flat_deadline_records_incident_when_rescan_finds_no_advanceable_
     controller.recover(clock[0])
     state = controller.run_due(clock[0])
     assert liquidation.starts
-    assert state.state == "FLATTENING"
+    assert state.state in ("FLATTENING", "VERIFYING_FLAT")   # Task 11 polls the root it got back
 
     clock[0] = _utc(15, 55)
     state = controller.run_due(clock[0])
@@ -728,3 +792,230 @@ def test_trader_service_starts_session_recovery_before_readiness():
     run_marker = "logging.debug('starting trader run() loop')\n        trader.run()"
     assert run_marker in text
     assert text.index(marker) < text.index(run_marker)
+# ---------------------------------------------------------------------------
+# SP1 plan 1: time exits close through the scoped liquidation (Tasks 1, 11)
+# ---------------------------------------------------------------------------
+
+class _SimBroker:
+    """A broker with one long position and its working protective stop.
+
+    It is the snapshot port and the dispatch port at once; every capture is a
+    newer, complete broker generation, except while broker changes are held.
+    """
+    def __init__(self, quantity: float = 10.0):
+        self.generation = 0
+        self.quantity = quantity
+        self.stop_working = True
+        self.rows: dict[str, list] = {}
+        self.calls: list[tuple] = []
+        self.held = False
+
+    def _stop_row(self, status: str = "Submitted") -> BrokerOrderRow:
+        return BrokerOrderRow(
+            order_entity_id="og-1:stop", account_id=ACCOUNT, conid=CONID, symbol="AAPL",
+            order_group_id="og-1", leg="stop", is_external=False, action="SELL", order_type="STP",
+            total_quantity=10.0, filled_quantity=0.0, avg_fill_price=None, limit_price=None,
+            stop_price=150.0, tif="DAY", status=status, deleted=False, revision=1,
+            source_timestamp=_utc(11, 0),
+        )
+
+    def capture(self, account_id):
+        if not self.held:
+            self.generation += 1
+        positions = [_position(self.quantity)] if self.quantity else []
+        working = [self._stop_row()] if self.stop_working else []
+        return _snapshot(self.generation, positions, working)
+
+    def cancel(self, order, child_id):
+        self.calls.append(("cancel", order.order_entity_id))
+        self.stop_working = False
+
+    def reduce(self, position, side, quantity, child_id):
+        self.calls.append(("reduce", side, float(quantity)))
+        self.quantity -= float(quantity) if side == "SELL" else -float(quantity)
+        self.rows[child_id] = [SimpleNamespace(status="Filled", filled_quantity=float(quantity),
+                                               total_quantity=float(quantity))]
+
+    def find_orders(self, account_id, child_id):
+        return self.rows.get(child_id, [])
+
+    def get_order(self, order_entity_id):
+        return None if self.stop_working else self._stop_row("Cancelled")
+
+    def executed_quantities(self, account_id, order_entity_ids):
+        return {}
+
+    def unbound_execution_since(self, account_id, conid, generation_id):
+        return False
+
+    def enumeration_complete(self):
+        return True
+
+    def newest_generation(self):
+        return self.generation
+
+    @contextmanager
+    def hold_broker_changes(self):
+        self.held = True
+        try:
+            yield
+        finally:
+            self.held = False
+
+
+class _SimProtection:
+    """Saga stand-in that writes its hand-over into the broker's call log, so the order is visible."""
+    def __init__(self, calls):
+        self.calls = calls
+
+    def handover(self, *, account_id, conid, close_root_id, cancels, generation, now):
+        from trader.trading.liquidation_service import HandoverInfo
+        self.calls.append(("handover", tuple(c.order_entity_id for c in cancels)))
+        return HandoverInfo(150.0, None)
+
+    def handover_account(self, **_kwargs):
+        raise AssertionError("a time exit is a conid-scoped close")
+
+    def expect_reprotect(self, **_kwargs):
+        raise AssertionError("a time exit never re-protects")
+
+    def release_after_partial(self, **_kwargs):
+        raise AssertionError("a time exit never re-protects")
+
+    def close_after_full(self, *, close_root_id, now):
+        self.calls.append(("close_after_full", close_root_id))
+
+
+def _real_liquidation(tmp_path, broker, protection=None):
+    from trader.trading.exit_owner import ExitOwnerRegistry
+    from trader.trading.liquidation_service import (
+        LiquidationRunStore, LiquidationService, apply_liquidation_migration,
+    )
+    db = DuckDBConnection.get_instance(str(tmp_path / "liquidation.duckdb"))
+    apply_liquidation_migration(SchemaMigrator(db))
+    return LiquidationService(broker, broker, store=LiquidationRunStore(db), registry=ExitOwnerRegistry(db),
+                              now=lambda: _utc(15, 0), protection=protection)
+
+
+def test_time_exit_leaves_no_live_stop_after_the_position_is_closed(tmp_path):
+    """Spec 5.1: a time exit hands protection over, cancels the stop, then closes from broker truth."""
+    from trader.automation.session_controller import SessionTimeExitAdapter
+
+    broker = _SimBroker()
+    service = _real_liquidation(tmp_path, broker, protection=_SimProtection(broker.calls))
+    adapter = SessionTimeExitAdapter(service, account_id=ACCOUNT, now=lambda: _utc(15, 0))
+    adapter.request_exit(command_id="exit-1", conid=CONID, quantity=Decimal("10"), side="BUY")
+    for _ in range(4):
+        service.rescan()
+    assert broker.calls == [("handover", ("og-1:stop",)), ("cancel", "og-1:stop"), ("reduce", "SELL", 10.0),
+                            ("close_after_full", "exit-1")]
+    assert broker.quantity == 0.0
+    assert broker.stop_working is False, "a live stop on a closed position can open a short"
+    assert service.receipt_for("exit-1").state == "CLOSED"
+
+
+@pytest.mark.parametrize("bad", [1.5, True, "265598", 0])
+def test_time_exit_with_an_inexact_conid_claims_reads_and_sends_nothing(tmp_path, bad):
+    """#21 round 5: the adapter passes the conid as it came; admission refuses it before any claim."""
+    from trader.automation.session_controller import SessionTimeExitAdapter
+    from trader.trading.liquidation_service import LiquidationRefused
+
+    broker = _SimBroker()
+    service = _real_liquidation(tmp_path, broker, protection=_SimProtection(broker.calls))
+    adapter = SessionTimeExitAdapter(service, account_id=ACCOUNT, now=lambda: _utc(15, 0))
+    with pytest.raises(LiquidationRefused, match="CONID_INVALID|conid must be"):
+        adapter.request_exit(command_id="exit-1", conid=bad, quantity=Decimal("10"), side="BUY")
+    assert (broker.generation, broker.calls) == (0, [])
+    assert service.root_for("exit-1") is None
+
+
+def test_time_exit_adapter_starts_a_full_conid_close_without_a_quantity():
+    """#27: a quantity would make a join refusable; the adapter never passes one."""
+    from trader.automation.session_controller import SessionTimeExitAdapter
+
+    liquidation = FakeLiquidation()
+    SessionTimeExitAdapter(liquidation, account_id=ACCOUNT, now=lambda: _utc(15, 0), deadline_seconds=120.0) \
+        .request_exit(command_id="exit-1", conid=CONID, quantity=Decimal("10"), side="BUY")
+    assert liquidation.starts == [(ACCOUNT, "exit-1", _utc(15, 2))]
+    assert liquidation.kwargs == [{"scope": "conid", "conid": CONID}]
+
+
+def test_time_exit_adapter_tolerates_exit_in_progress():
+    from trader.automation.session_controller import SessionTimeExitAdapter
+    from trader.trading.exit_owner import ExitInProgress
+
+    class _Refusing:
+        def start(self, *a, **k):
+            raise ExitInProgress("other-root")
+
+    SessionTimeExitAdapter(_Refusing(), account_id=ACCOUNT, now=lambda: _utc(15, 0)).request_exit(
+        command_id="exit-1", conid=CONID, quantity=Decimal("10"), side="BUY")
+
+
+def test_poll_flat_ignores_another_roots_flat_receipt(tmp_path):
+    controller, broker, _c, liquidation, _br, _t, _j, _db, clock = _build_controller(tmp_path)
+    clock[0] = _utc(15, 46)
+    controller.recover(clock[0])
+    liquidation.other_flat = SimpleNamespace(cause_command_id="someone-else", state="FLAT", generation_id=9)
+    state = controller.run_due(_utc(15, 47))
+    assert state.state in ("FLATTENING", "VERIFYING_FLAT")
+    liquidation.mark_flat(generation_id=3, root_id=state.flatten_command_id)
+    state = controller.run_due(_utc(15, 48))
+    assert (state.state, state.flat_generation) == ("FLAT", 3)
+
+
+def test_session_flatten_joining_an_existing_account_flatten_polls_the_returned_root(tmp_path):
+    """R10 / #27: the session persists the root it got back, also across a restart."""
+    liquidation = FakeLiquidation()
+    liquidation.joined_root = "kill-1"
+    controller, _b, _c, _l, _br, _t, _j, db, clock = _build_controller(tmp_path, liquidation=liquidation)
+    clock[0] = _utc(15, 46)
+    controller.recover(clock[0])
+    state = controller.run_due(clock[0])
+    assert state.flatten_command_id == "kill-1"
+    from trader.automation.session_controller import SessionController
+    restarted = SessionController(
+        journal=DomainJournal(db), db=db, calendar=XNYSCalendarPolicy(), broker=FakeBroker(),
+        cancel=FakeCancel(), liquidation=liquidation, breaker=FakeBreaker(),
+        time_exit=FakeTimeExitDispatch(), account_id=ACCOUNT, now=lambda: _utc(15, 47))
+    restarted.recover(_utc(15, 47))
+    liquidation.mark_flat(generation_id=4, root_id="kill-1")
+    state = restarted.run_due(_utc(15, 48))
+    assert (state.state, state.flatten_command_id, state.flat_generation) == ("FLAT", "kill-1", 4)
+
+
+def test_time_exit_adapter_lets_a_refusal_reach_the_caller():
+    """Fail loudly: only ExitInProgress (never possible without a quantity) is swallowed."""
+    from trader.automation.session_controller import SessionTimeExitAdapter
+    from trader.trading.liquidation_service import LiquidationRefused
+
+    class _Refusing:
+        def start(self, *a, **k):
+            raise LiquidationRefused("NO_POSITION")
+
+    with pytest.raises(LiquidationRefused):
+        SessionTimeExitAdapter(_Refusing(), account_id=ACCOUNT, now=lambda: _utc(15, 0)).request_exit(
+            command_id="exit-1", conid=CONID, quantity=Decimal("10"), side="BUY")
+
+
+def test_session_flatten_without_a_root_to_poll_fails_loudly(tmp_path):
+    """R10: no silent fallback to the session's own cause; the flatten is retried on the next tick."""
+    liquidation = FakeLiquidation()
+    liquidation.start = lambda *a, **k: None
+    controller, _b, _c, _l, _br, _t, _j, _db, clock = _build_controller(tmp_path, liquidation=liquidation)
+    clock[0] = _utc(15, 46)
+    with pytest.raises(RuntimeError, match="no root to poll"):
+        controller.recover(clock[0])
+
+
+def test_session_flatten_whose_root_ends_failed_safe_is_an_incident_at_once(tmp_path):
+    """Ruling: a FAILED_SAFE root (joined or own) is not polled until the flat deadline."""
+    controller, _b, _c, liquidation, breaker, _t, _j, _db, clock = _build_controller(tmp_path)
+    clock[0] = _utc(15, 46)
+    state = controller.recover(clock[0])
+    root = state.flatten_command_id
+    liquidation.receipts[root] = SimpleNamespace(cause_command_id=root, state="FAILED_SAFE", generation_id=5,
+                                                 detail="deadline elapsed")
+    state = controller.run_due(_utc(15, 47))
+    assert state.state == "INCIDENT" and "FAILED_SAFE" in state.incident
+    assert [s.kind for s in breaker.signals] == ["LIQUIDATION_FAILED"]

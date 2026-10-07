@@ -21,6 +21,7 @@ from trader.automation.models import (
     StopPolicy,
     TargetPolicy,
     TimeExitPolicy,
+    is_exact_conid,
 )
 from trader.domain.commands import CommandReceipt
 from trader.objects import Action
@@ -132,11 +133,11 @@ class IntentEmitter:
         side = {Action.BUY: "BUY", Action.SELL: "SELL"}.get(signal.action)
         if side is None:
             return None
-        conid = int(signal.conid or 0)
-        if conid <= 0:
-            logging.error(
-                "signal from %s has no conid — cannot emit intent", strategy_name)
+        if not is_exact_conid(signal.conid):
+            logging.error("signal from %s has conid %r, not a positive integer — cannot emit intent",
+                          strategy_name, signal.conid)
             return None
+        conid = int(signal.conid)
 
         bar_ts = _as_utc(completed_bar_timestamp)
         signal_ts = _as_utc(signal.date_time) if signal.date_time else self._now()

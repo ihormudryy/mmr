@@ -5,9 +5,10 @@ loop, and ``reduce_position`` then waited on that same loop: a timeout, then a
 late order. The ticks now run on the single liquidation worker thread while
 the loop stays free to place the order.
 
-Wiring: a real ``LiquidationService`` -> ``command_stack._LiquidationDispatch``
--> ``TradingRuntimeOrderDispatch`` -> a fake trader whose
-``place_reduce_only_order`` records which thread ran it and when.
+Wiring: a real ``LiquidationService`` on a DuckDB journal ->
+``command_stack._LiquidationDispatch`` -> ``TradingRuntimeOrderDispatch`` ->
+a fake trader whose ``place_reduce_only_order`` records which thread ran it
+and when. Broker evidence (order rows, generations) is answered by the test.
 """
 from __future__ import annotations
 
@@ -25,8 +26,13 @@ import pytest
 from trader import trader_service
 from trader.common.reactivex import SuccessFail
 from trader.data.broker_state import BrokerPositionRow, BrokerRiskSnapshot
+from trader.data.duckdb_store import DuckDBConnection
+from trader.data.schema_migrations import SchemaMigrator
 from trader.trading.command_stack import _LiquidationDispatch
-from trader.trading.liquidation_service import LiquidationReceipt, LiquidationService
+from trader.trading.exit_owner import ExitOwnerRegistry
+from trader.trading.liquidation_service import (
+    LiquidationRunStore, LiquidationService, apply_liquidation_migration,
+)
 from trader.trading.trading_runtime import TradingRuntimeOrderDispatch
 
 UTC = dt.timezone.utc
@@ -68,23 +74,38 @@ class _FakeTrader:
         return SuccessFail.success(obj=[])
 
 
-class _ResumeStore:
-    """A durable run left REQUESTED by a previous process."""
-    def __init__(self, deadline):
-        self._deadline = deadline
+class _EvidenceDispatch(TradingRuntimeOrderDispatch):
+    """The real order dispatch; the fake trader has no broker store, so the test answers the evidence."""
+    def find_by_order_ref(self, account_id, order_ref):
+        return []
 
-    def load_unresolved(self):
-        return [LiquidationReceipt(ACCOUNT, "root-1", "REQUESTED", self._deadline)]
+    def enumeration_complete(self):
+        return True
 
-    def save(self, receipt, now):
-        pass
+    def newest_generation(self):
+        return 1
+
+    def executed_quantities(self, account_id, order_entity_ids):
+        return {}
+
+    def unbound_execution_since(self, account_id, conid, generation_id):
+        return False
 
 
-def _liquidation(trader, *, resume=True, clock=None):
+def _liquidation(trader, tmp_path, *, resume=True, clock=None):
+    """``resume``: a run a previous process claimed and left REQUESTED."""
     clock = clock or [FLATTEN_TIME]
-    dispatch = _LiquidationDispatch(TradingRuntimeOrderDispatch(trader, dispatch_timeout=0.5))
-    store = _ResumeStore(clock[0] + dt.timedelta(minutes=5)) if resume else None
-    return LiquidationService(_Broker(), dispatch, now=lambda: clock[0], store=store)
+    db = DuckDBConnection.get_instance(str(tmp_path / "liquidation.duckdb"))
+    apply_liquidation_migration(SchemaMigrator(db))
+    dispatch = _LiquidationDispatch(_EvidenceDispatch(trader, dispatch_timeout=0.5),
+                                    SimpleNamespace(get_order=lambda entity: None))
+    service = LiquidationService(_Broker(), dispatch, store=LiquidationRunStore(db),
+                                 registry=ExitOwnerRegistry(db), now=lambda: clock[0])
+    if resume:
+        deadline = clock[0] + dt.timedelta(minutes=5)
+        LiquidationRunStore(db).transaction(
+            lambda conn: service._claim_account_in_tx(conn, ACCOUNT, "root-1", deadline))
+    return service
 
 
 @pytest.fixture
@@ -108,9 +129,9 @@ def _close_loop(loop):
 # ---------------------------------------------------------------------------
 
 @pytest.mark.asyncio
-async def test_liquidation_recovery_tick_on_real_loop_places_exactly_one_order(worker):
+async def test_liquidation_recovery_tick_on_real_loop_places_exactly_one_order(tmp_path, worker):
     trader = _FakeTrader(asyncio.get_running_loop())
-    service = _liquidation(trader)
+    service = _liquidation(trader, tmp_path)
 
     started = time.monotonic()
     receipt = await trader_service._liquidation_recovery_tick(service, worker)
@@ -161,7 +182,7 @@ def _session_controller(tmp_path: Path, liquidation, clock):
 async def test_session_controller_tick_flatten_on_real_loop_does_not_block_loop(tmp_path, worker):
     clock = [FLATTEN_TIME]
     trader = _FakeTrader(asyncio.get_running_loop(), send_seconds=0.1)
-    liquidation = _liquidation(trader, resume=False, clock=clock)
+    liquidation = _liquidation(trader, tmp_path, resume=False, clock=clock)
     controller = _session_controller(tmp_path, liquidation, clock)
     controller.recover(dt.datetime(2026, 7, 17, 11, 0, tzinfo=ET))
 
@@ -222,11 +243,11 @@ async def test_watched_loop_logs_critical_and_never_stacks_worker_calls(monkeypa
 # Startup recovery (before trader.run())
 # ---------------------------------------------------------------------------
 
-def test_startup_liquidation_recovery_dispatches_while_loop_runs(worker):
+def test_startup_liquidation_recovery_dispatches_while_loop_runs(tmp_path, worker):
     loop = asyncio.new_event_loop()
     try:
         trader = _FakeTrader(loop)
-        service = _liquidation(trader)
+        service = _liquidation(trader, tmp_path)
         holder = SimpleNamespace(liquidation_service=service)
 
         started = time.monotonic()
@@ -236,28 +257,30 @@ def test_startup_liquidation_recovery_dispatches_while_loop_runs(worker):
         assert len(trader.orders) == 1
         assert trader.orders[0][1] < returned
         assert returned - started < 0.5
-        assert service._runs["root-1"].state == "VERIFYING"
+        assert service.receipt_for("root-1").state == "VERIFYING"
     finally:
         _close_loop(loop)
 
 
-def test_startup_liquidation_recovery_without_trader_loop_sends_nothing_late(worker):
+def test_startup_liquidation_recovery_without_trader_loop_sends_nothing_late(tmp_path, worker):
     loop = asyncio.new_event_loop()
     try:
         trader = _FakeTrader(None)  # e.g. the fake-broker path: _main_loop not set yet
-        service = _liquidation(trader)
+        service = _liquidation(trader, tmp_path)
         holder = SimpleNamespace(liquidation_service=service)
 
         started = time.monotonic()
         trader_service._maybe_start_liquidation_recovery(holder, loop, worker)
         assert time.monotonic() - started < 0.5
 
-        receipt = service._runs["root-1"]
-        assert receipt.state == "OUTCOME_UNKNOWN"
-        assert "not running" in receipt.detail
+        [child] = service.receipt_for("root-1").children
+        assert (child.kind, child.state) == ("reduce", "NOT_SENT")    # a proven refusal (R34)
         trader._main_loop = loop
         loop.run_until_complete(asyncio.sleep(0.05))
-        assert trader.orders == []
+        loop.run_until_complete(loop.run_in_executor(worker, lambda: None))   # a tick in flight has ended
+        # The refused attempt never leaves late; the recovery loop may send a new attempt (R3).
+        sent = [c for c in service.receipt_for("root-1").children if c.state != "NOT_SENT"]
+        assert len(trader.orders) == len(sent) and all(c.attempt > 1 for c in sent)
     finally:
         _close_loop(loop)
 
@@ -267,7 +290,7 @@ def test_startup_session_recovery_flattens_while_loop_runs(tmp_path, worker, mon
     loop = asyncio.new_event_loop()
     try:
         trader = _FakeTrader(loop)
-        liquidation = _liquidation(trader, resume=False, clock=clock)
+        liquidation = _liquidation(trader, tmp_path, resume=False, clock=clock)
         controller = _session_controller(tmp_path, liquidation, clock)
         monkeypatch.setattr(trader_service, "dt", SimpleNamespace(
             datetime=_FrozenDatetime, timezone=dt.timezone, timedelta=dt.timedelta))
@@ -276,7 +299,7 @@ def test_startup_session_recovery_flattens_while_loop_runs(tmp_path, worker, mon
         trader_service._maybe_start_session_recovery(holder, loop, worker)
 
         assert len(trader.orders) == 1
-        assert liquidation._runs[controller.flatten_command_id(ACCOUNT, SESSION_DATE)].state == "VERIFYING"
+        assert liquidation.receipt_for(controller.flatten_command_id(ACCOUNT, SESSION_DATE)).state == "VERIFYING"
     finally:
         _close_loop(loop)
 

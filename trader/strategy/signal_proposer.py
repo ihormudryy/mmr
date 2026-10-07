@@ -55,6 +55,7 @@ from typing import Optional
 
 import pandas as pd
 
+from trader.automation.models import is_exact_conid
 from trader.domain.commands import CommandReceipt
 from trader.objects import Action
 from trader.trading.strategy import Signal
@@ -110,11 +111,11 @@ class SignalProposer:
         server-side refusals surfaced via ``receipt.error_code``)."""
         if not self._gate(strategy_name):
             return None
-        conid = int(signal.conid or 0)
-        if conid <= 0:
-            logging.error(
-                'signal from %s has no conid stamped — cannot propose', strategy_name)
+        if not is_exact_conid(signal.conid):
+            logging.error('signal from %s has conid %r, not a positive integer — cannot propose',
+                          strategy_name, signal.conid)
             return None
+        conid = int(signal.conid)
         action = {Action.BUY: 'BUY', Action.SELL: 'SELL'}.get(signal.action)
         if action is None:
             return None

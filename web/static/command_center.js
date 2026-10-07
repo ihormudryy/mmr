@@ -547,6 +547,7 @@ function renderOrders() {
   const kindOf = (leg) => {
     const l = String(leg || '').toLowerCase();
     if (l === 'entry') return ['ENTRY', 'entry'];
+    if (l === 'exit') return ['EXIT', 'prot'];
     if (l === 'stop' || l === 'take_profit' || l.startsWith('child')) {
       return ['PROTECTIVE', 'prot'];
     }

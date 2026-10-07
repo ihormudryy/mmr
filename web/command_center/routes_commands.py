@@ -81,7 +81,7 @@ anticipated when it was written:
    raises for a nonce it was never going to accept anyway. Note also that
    the real order-classification field the coordinator's
    ``order_correlation.classify_leg`` produces is ``leg`` (values
-   ``"entry" | "stop" | "take_profit" | f"child-{id}" | None``), not the
+   ``"entry" | "stop" | "take_profit" | "exit" | f"child-{id}" | None``), not the
    brief's hypothetical ``leg_role``; that only matters to
    ``command_center.js``'s ``ccClassifyOrder`` (this router forwards
    ``order_entity_id`` opaquely and never inspects the leg itself -- the

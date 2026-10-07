@@ -24,6 +24,8 @@ from trader.trading.order_correlation import encode_order_ref
 
 PROTECTIVE_ORDER_SAGA_MIGRATION_VERSION = 30
 PROTECTIVE_ORDER_SAGA_MIGRATION_NAME = "p3_automated_order_sagas"
+PROTECTIVE_SAGA_OWNERSHIP_MIGRATION_VERSION = 37
+_SAVE_ATTEMPTS = 5
 
 SAGA_STATES = frozenset({
     "VALIDATED",
@@ -35,8 +37,11 @@ SAGA_STATES = frozenset({
     "CLOSED",
     "OUTCOME_UNKNOWN",
     "SAFETY_FAILED",
+    "CLOSE_OWNED",
 })
 
+# A stop that protects a released remainder: accepted and working, or already filled as the exit.
+_RELEASE_STOP_STATUSES = frozenset({"PreSubmitted", "Submitted", "Filled"})
 _WORKING_STATUSES = frozenset({
     "PendingSubmit", "PreSubmitted", "Submitted", "ApiPending", "PendingCancel",
 })
@@ -49,8 +54,15 @@ _PRICE_QUANT = Decimal("0.01")
 
 
 def apply_protective_order_saga_migration(migrator: SchemaMigrator) -> bool:
-    """Journal migration 30: durable automated order saga rows."""
-    return migrator.apply(
+    """Journal migrations 30 (saga rows) and 37 (close ownership, protection groups).
+
+    Migration 37 backfills ``account_id`` / ``conid`` from the payload. Sagas
+    that were already SAFETY_FAILED before the upgrade get
+    ``flatten_requested = FALSE``: the worker starts a flatten only for a
+    failure seen by this version (R29). Returns whether migration 30 was
+    newly applied, as before.
+    """
+    applied = migrator.apply(
         PROTECTIVE_ORDER_SAGA_MIGRATION_VERSION,
         PROTECTIVE_ORDER_SAGA_MIGRATION_NAME,
         (
@@ -70,6 +82,23 @@ def apply_protective_order_saga_migration(migrator: SchemaMigrator) -> bool:
             )""",
         ),
     )
+    migrator.apply(PROTECTIVE_SAGA_OWNERSHIP_MIGRATION_VERSION, "sp1_saga_close_ownership", (
+        "ALTER TABLE automated_order_sagas ADD COLUMN IF NOT EXISTS account_id VARCHAR",
+        "ALTER TABLE automated_order_sagas ADD COLUMN IF NOT EXISTS conid INTEGER",
+        "ALTER TABLE automated_order_sagas ADD COLUMN IF NOT EXISTS close_root_id VARCHAR",
+        "ALTER TABLE automated_order_sagas ADD COLUMN IF NOT EXISTS flatten_requested BOOLEAN DEFAULT FALSE",
+        """UPDATE automated_order_sagas
+           SET account_id = json_extract_string(payload, '$.account_id'),
+               conid = CAST(json_extract(payload, '$.conid') AS INTEGER),
+               flatten_requested = FALSE
+           WHERE account_id IS NULL""",
+        """CREATE TABLE IF NOT EXISTS automated_order_saga_groups (
+            order_group_id VARCHAR PRIMARY KEY,
+            command_id VARCHAR NOT NULL,
+            protection_generation INTEGER NOT NULL
+        )""",
+    ))
+    return applied
 
 
 def _as_utc(value: dt.datetime) -> dt.datetime:
@@ -250,6 +279,11 @@ class BrokerOrderEvent:
     order_id: int
     event_id: str
     source_timestamp: dt.datetime
+    order_entity_id: Optional[str] = None
+
+
+class SagaRevisionConflict(RuntimeError):
+    """Another writer saved this saga since it was read (R28). Re-read and apply again."""
 
 
 @dataclass(frozen=True)
@@ -279,6 +313,19 @@ class SagaState:
     revision: int = 0
     error_code: Optional[str] = None
     plan_json: Optional[dict[str, Any]] = None
+    close_root_id: Optional[str] = None
+    expected_cancel_ids: tuple[str, ...] = ()
+    handover_generation: Optional[int] = None
+    protection_generation: int = 0
+    active_groups: tuple[str, ...] = ()
+    pending_groups: tuple[str, ...] = ()      # re-protect legs of the owning close, not yet released
+    pending_protection_lost: bool = False      # a pending leg was rejected or cancelled unasked
+    flatten_requested: bool = False            # SAFETY_FAILED seen by this version: the worker flattens
+
+    @property
+    def current_groups(self) -> tuple[str, ...]:
+        """Order groups of the protection that is live now (older groups are retired)."""
+        return self.active_groups or (self.order_group_id,)
 
     def to_payload(self) -> dict[str, Any]:
         return {
@@ -307,6 +354,14 @@ class SagaState:
             "revision": self.revision,
             "error_code": self.error_code,
             "plan_json": self.plan_json,
+            "close_root_id": self.close_root_id,
+            "expected_cancel_ids": list(self.expected_cancel_ids),
+            "handover_generation": self.handover_generation,
+            "protection_generation": self.protection_generation,
+            "active_groups": list(self.active_groups),
+            "pending_groups": list(self.pending_groups),
+            "pending_protection_lost": self.pending_protection_lost,
+            "flatten_requested": self.flatten_requested,
         }
 
     @classmethod
@@ -337,6 +392,14 @@ class SagaState:
             revision=int(payload.get("revision", 0)),
             error_code=payload.get("error_code"),
             plan_json=payload.get("plan_json"),
+            close_root_id=payload.get("close_root_id"),
+            expected_cancel_ids=tuple(payload.get("expected_cancel_ids") or ()),
+            handover_generation=payload.get("handover_generation"),
+            protection_generation=int(payload.get("protection_generation", 0)),
+            active_groups=tuple(payload.get("active_groups") or ()),
+            pending_groups=tuple(payload.get("pending_groups") or ()),
+            pending_protection_lost=bool(payload.get("pending_protection_lost", False)),
+            flatten_requested=bool(payload.get("flatten_requested", False)),
         )
 
 
@@ -357,23 +420,86 @@ class ProtectiveOrderSagaStore:
             return None
         return SagaState.from_payload(json.loads(row[0]))
 
-    def load_by_group(self, order_group_id: str) -> Optional[SagaState]:
+    def load_by_group(self, order_group_id: str) -> Optional[tuple[SagaState, int]]:
+        """The saga that owns ``order_group_id`` and the protection generation of that group.
+
+        Re-protect groups are in ``automated_order_saga_groups`` (a pending
+        group has the generation after the current one); the entry bracket
+        group is the saga row itself (generation 0).
+        """
         row = self._db.execute(
-            "SELECT payload FROM automated_order_sagas WHERE order_group_id = ?",
+            "SELECT s.payload, g.protection_generation FROM automated_order_saga_groups g "
+            "JOIN automated_order_sagas s ON s.command_id = g.command_id WHERE g.order_group_id = ?",
             [order_group_id], fetch="one",
         )
         if row is None:
+            row = self._db.execute(
+                "SELECT payload, 0 FROM automated_order_sagas WHERE order_group_id = ?",
+                [order_group_id], fetch="one",
+            )
+        if row is None:
             return None
-        return SagaState.from_payload(json.loads(row[0]))
+        return SagaState.from_payload(json.loads(row[0])), int(row[1])
+
+    def _load_many(self, where: str, params: list) -> list[SagaState]:
+        rows = self._db.execute(
+            f"SELECT payload FROM automated_order_sagas WHERE {where} ORDER BY command_id",
+            params, fetch="all",
+        )
+        return [SagaState.from_payload(json.loads(r[0])) for r in rows]
+
+    def load_live(self, account_id: str, conid: Optional[int] = None) -> list[SagaState]:
+        """Every saga that is not terminal: open ones and ones a close owns."""
+        where = "account_id = ? AND state NOT IN ('CLOSED', 'SAFETY_FAILED')"
+        params: list = [account_id]
+        if conid is not None:
+            where += " AND conid = ?"
+            params.append(int(conid))
+        return self._load_many(where, params)
+
+    def load_by_close_root(self, close_root_id: str) -> list[SagaState]:
+        return self._load_many("state = 'CLOSE_OWNED' AND close_root_id = ?", [close_root_id])
+
+    def load_flatten_requested(self, account_id: str) -> list[SagaState]:
+        return self._load_many("account_id = ? AND state = 'SAFETY_FAILED' AND flatten_requested", [account_id])
 
     def save_in_tx(self, conn, state: SagaState, now: dt.datetime) -> None:
+        """Insert a new saga, or update one with a revision check (R28).
+
+        An update must be built from the stored revision (``state.revision``
+        is that plus one); otherwise another writer won and this one raises
+        ``SagaRevisionConflict``. ``order_group_id`` never changes, so the
+        update never touches the indexed column.
+        """
         payload = json.dumps(state.to_payload(), sort_keys=True, default=str)
-        conn.execute("DELETE FROM automated_order_sagas WHERE command_id = ?", [state.command_id])
-        conn.execute(
-            "INSERT INTO automated_order_sagas "
-            "(command_id, order_group_id, state, payload, updated_at) VALUES (?, ?, ?, ?, ?)",
-            [state.command_id, state.order_group_id, state.state, payload, now],
-        )
+        stored = conn.execute(
+            "SELECT CAST(json_extract(payload, '$.revision') AS INTEGER) FROM automated_order_sagas "
+            "WHERE command_id = ?", [state.command_id]).fetchone()
+        if stored is None:
+            conn.execute(
+                "INSERT INTO automated_order_sagas (command_id, order_group_id, state, payload, updated_at, "
+                "account_id, conid, close_root_id, flatten_requested) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                [state.command_id, state.order_group_id, state.state, payload, now,
+                 state.account_id, int(state.conid), state.close_root_id, state.flatten_requested],
+            )
+        elif int(stored[0]) != state.revision - 1:
+            raise SagaRevisionConflict(
+                f"saga {state.command_id} is at revision {stored[0]}; this write was built on {state.revision - 1}")
+        else:
+            conn.execute(
+                "UPDATE automated_order_sagas SET state = ?, payload = ?, updated_at = ?, account_id = ?, "
+                "conid = ?, close_root_id = ?, flatten_requested = ? WHERE command_id = ?",
+                [state.state, payload, now, state.account_id, int(state.conid), state.close_root_id,
+                 state.flatten_requested, state.command_id],
+            )
+        groups = [(g, state.protection_generation) for g in state.active_groups] + \
+                 [(g, state.protection_generation + 1) for g in state.pending_groups]
+        for group, generation in groups:
+            conn.execute(
+                "INSERT INTO automated_order_saga_groups VALUES (?, ?, ?) ON CONFLICT (order_group_id) "
+                "DO UPDATE SET command_id = excluded.command_id, protection_generation = excluded.protection_generation",
+                [group, state.command_id, generation],
+            )
 
     def seen_event_in_tx(self, conn, event_id: str) -> bool:
         row = conn.execute(
@@ -594,54 +720,73 @@ class ProtectiveOrderSaga:
                 plan=plan, intent=intent, account_id=self._account_id,
             )
         except BrokerRejectedError:
-            closed = replace(
-                submitting, state="CLOSED", error_code="BROKER_REJECTED",
-                revision=submitting.revision + 1,
-            )
-            self._persist(closed, now, from_state="SUBMITTING")
-            return closed
+            return self._after_dispatch(intent.command_id, now, lambda s: replace(
+                s, state="CLOSED", error_code="BROKER_REJECTED"))
         except Exception:
-            unknown = replace(
-                submitting, state="OUTCOME_UNKNOWN", error_code="DISPATCH_AMBIGUOUS",
-                revision=submitting.revision + 1,
-            )
-            self._persist(unknown, now, from_state="SUBMITTING")
-            return unknown
+            return self._after_dispatch(intent.command_id, now, lambda s: replace(
+                s, state="OUTCOME_UNKNOWN", error_code="DISPATCH_AMBIGUOUS"))
 
         order_ids = tuple(int(x) for x in (getattr(submitted, "order_ids", None) or ()))
         # Submit returns correlation ids only — broker events advance working.
-        recorded = replace(
-            submitting,
-            submitted_order_ids=order_ids,
-            revision=submitting.revision + 1,
-        )
-        self._persist(recorded, now, from_state="SUBMITTING")
-        return recorded
+        return self._after_dispatch(
+            intent.command_id, now, lambda s: replace(s, submitted_order_ids=order_ids), always=True)
+
+    def _after_dispatch(self, command_id: str, now: dt.datetime,
+                        change: Callable[[SagaState], SagaState], *, always: bool = False) -> SagaState:
+        """The write after ``submit_bracket``, from a fresh read under the revision check (N1).
+
+        The ingest thread may have saved an event of this bracket while the
+        call waited. A state change is made only while the saga is still
+        SUBMITTING (an event already moved it on, so the broker has the
+        order); ``always`` changes apply on top of whatever the ingest wrote.
+        """
+        def attempt() -> SagaState:
+            current = self._store.load(command_id)
+            if current.state != "SUBMITTING" and not always:
+                return current
+            updated = replace(change(current), revision=current.revision + 1)
+            self._persist(updated, now, from_state=current.state)
+            return updated
+        return self._retrying(attempt)
 
     def resume(self, command_id: str) -> Optional[SagaState]:
         return self._store.load(command_id)
 
     def on_broker_event(self, event: BrokerOrderEvent) -> SagaState:
-        state = self._store.load_by_group(event.order_group_id)
-        if state is None:
+        """Apply one broker event. A lost race with another writer re-reads and applies again (R28)."""
+        return self._retrying(lambda: self._apply_broker_event(event))
+
+    def _retrying(self, attempt: Callable[[], Any]) -> Any:
+        """Read, change and save under the revision check; on a conflict start from a fresh read."""
+        for _ in range(_SAVE_ATTEMPTS - 1):
+            try:
+                return attempt()
+            except SagaRevisionConflict:
+                continue
+        return attempt()
+
+    def _apply_broker_event(self, event: BrokerOrderEvent) -> SagaState:
+        found = self._store.load_by_group(event.order_group_id)
+        if found is None:
             raise KeyError(f"no saga for order_group_id={event.order_group_id!r}")
+        state, group_generation = found
         if event.event_id in state.seen_event_ids:
             return state
         if state.state in _TERMINAL_SAGA:
             return state
 
         now = self._now_utc()
+        if group_generation > state.protection_generation:
+            # A re-protect leg of the close that owns this saga, before its release.
+            return self._on_pending_event(state, event, now)
+        if group_generation < state.protection_generation:
+            # A retired leg: record the event, never let it change today's protection.
+            return self._record_only(state, event, now)
+        if state.state == "CLOSE_OWNED":
+            return self._on_owned_event(state, event, now)
         updated = self._apply_event(state, event)
-        if updated is state:
-            # Still record the event id for idempotency even if no transition.
-            updated = replace(
-                state,
-                seen_event_ids=state.seen_event_ids + (event.event_id,),
-                revision=state.revision + 1,
-            )
-            self._persist(updated, now, from_state=state.state, event_id=event.event_id)
-            return updated
-
+        if updated.state == "SAFETY_FAILED" and state.state != "SAFETY_FAILED":
+            updated = replace(updated, flatten_requested=True)
         updated = replace(
             updated,
             seen_event_ids=state.seen_event_ids + (event.event_id,),
@@ -652,6 +797,174 @@ class ProtectiveOrderSaga:
         if updated.state == "SAFETY_FAILED" and state.state != "SAFETY_FAILED":
             self._trip_and_liquidate(updated, now)
         return updated
+
+    def _record_only(self, state: SagaState, event: BrokerOrderEvent, now: dt.datetime) -> SagaState:
+        recorded = replace(state, seen_event_ids=state.seen_event_ids + (event.event_id,),
+                           revision=state.revision + 1)
+        self._persist(recorded, now, from_state=state.state, event_id=event.event_id)
+        return recorded
+
+    def _lost(self, state: SagaState, event: BrokerOrderEvent) -> bool:
+        """R14: only a cancel of a ref the close asked to cancel is expected."""
+        expected = event.order_entity_id is not None and event.order_entity_id in state.expected_cancel_ids
+        return event.status in _REJECTED_STATUSES or (event.status in _CANCELLED_STATUSES and not expected)
+
+    def _on_owned_event(self, state: SagaState, event: BrokerOrderEvent, now: dt.datetime) -> SagaState:
+        if self._lost(state, event):
+            failed = replace(
+                state, state="SAFETY_FAILED", error_code="PROTECTION_LOST_DURING_CLOSE", flatten_requested=True,
+                seen_event_ids=state.seen_event_ids + (event.event_id,), revision=state.revision + 1,
+            )
+            self._persist(failed, now, from_state=state.state, event_id=event.event_id)
+            self._trip_and_liquidate(failed, now)
+            return failed
+        owned = replace(
+            self._owned_bookkeeping(state, event),
+            seen_event_ids=state.seen_event_ids + (event.event_id,), revision=state.revision + 1,
+        )
+        self._persist(owned, now, from_state=state.state, event_id=event.event_id)
+        return owned
+
+    def _on_pending_event(self, state: SagaState, event: BrokerOrderEvent, now: dt.datetime) -> SagaState:
+        """A replacement leg before release. The close judges its own legs (and escalates); the saga
+        only remembers a loss, so the release cannot report protection that is gone (R2-4)."""
+        lost = state.state == "CLOSE_OWNED" and self._lost(state, event)
+        recorded = replace(state, pending_protection_lost=state.pending_protection_lost or lost,
+                           seen_event_ids=state.seen_event_ids + (event.event_id,), revision=state.revision + 1)
+        self._persist(recorded, now, from_state=state.state, event_id=event.event_id)
+        return recorded
+
+    @staticmethod
+    def _owned_bookkeeping(state: SagaState, event: BrokerOrderEvent) -> SagaState:
+        working = event.status in _WORKING_STATUSES
+        filled = event.status in _FILLED_STATUSES
+        if event.leg == "entry":
+            return replace(state, entry_working=working)
+        if event.leg == "stop":
+            return replace(state, stop_working=working, stop_filled=state.stop_filled or filled)
+        if event.leg == "take_profit":
+            return replace(state, target_working=working, target_filled=state.target_filled or filled)
+        return state
+
+    # -- close ownership (ProtectionOwnershipPort) --------------------------
+
+    @staticmethod
+    def _prices_from_plan(state: SagaState):
+        from trader.trading.liquidation_service import HandoverInfo
+        legs = (state.plan_json or {}).get("legs", [])
+        stop = next((leg for leg in legs if leg.get("role") == "stop"), None)
+        target = next((leg for leg in legs if leg.get("role") == "take_profit"), None)
+        return HandoverInfo(
+            stop_price=None if stop is None or stop.get("stop_price") is None else float(stop["stop_price"]),
+            target_price=None if target is None or target.get("limit_price") is None else float(target["limit_price"]),
+        )
+
+    @staticmethod
+    def _own(states: list[SagaState], close_root_id: str, cancels, generation: int) -> list[SagaState]:
+        """CLOSE_OWNED with the expected cancels merged in; a pending leg's cancel is expected too."""
+        owned = []
+        for state in states:
+            groups = set(state.current_groups) | set(state.pending_groups)
+            mine = {c.order_entity_id for c in cancels if c.order_group_id in groups}
+            expected = tuple(sorted(set(state.expected_cancel_ids) | mine))
+            if (state.state, state.close_root_id, state.expected_cancel_ids) == ("CLOSE_OWNED", close_root_id, expected):
+                continue  # idempotent: already handed over with these refs
+            owned.append(replace(state, state="CLOSE_OWNED", close_root_id=close_root_id,
+                                 expected_cancel_ids=expected, handover_generation=generation,
+                                 revision=state.revision + 1))
+        return owned
+
+    def handover(self, *, account_id: str, conid: int, close_root_id: str, cancels, generation: int,
+                 now: dt.datetime):
+        from trader.trading.liquidation_service import HandoverInfo
+
+        def attempt():
+            states = self._store.load_live(account_id, conid)
+            self._persist_all([(s, None) for s in self._own(states, close_root_id, cancels, generation)],
+                              _as_utc(now))
+            return self._prices_from_plan(states[0]) if states else HandoverInfo(None, None)
+        return self._retrying(attempt)
+
+    def handover_account(self, *, account_id: str, close_root_id: str, cancels, generation: int,
+                         now: dt.datetime) -> None:
+        def attempt():
+            states = self._store.load_live(account_id)
+            self._persist_all([(s, None) for s in self._own(states, close_root_id, cancels, generation)],
+                              _as_utc(now))
+        self._retrying(attempt)
+
+    def expect_reprotect(self, *, close_root_id: str, groups: tuple[str, ...], now: dt.datetime) -> None:
+        """Bind the replacement legs to the saga before they are sent, as pending groups."""
+        def attempt():
+            changed = [replace(s, pending_groups=tuple(groups), revision=s.revision + 1)
+                       for s in self._store.load_by_close_root(close_root_id)[:1]
+                       if s.pending_groups != tuple(groups)]
+            self._persist_all([(s, None) for s in changed], _as_utc(now))
+        self._retrying(attempt)
+
+    def release_after_partial(self, *, close_root_id: str, remaining_quantity: float, stop_group: str,
+                              stop_status: str, target_group: Optional[str], target_status: Optional[str],
+                              now: dt.datetime, protection_problem: Optional[str] = None) -> None:
+        """Back to protection of the remainder, judged from the legs' broker status at release.
+
+        The new legs become the only live protection (a new protection
+        generation). A leg that is not working, a pending leg lost while the
+        close owned the saga, or a ``protection_problem`` the close found
+        under its release hold (#22/#25 round 7) is today's incident path.
+        """
+        def attempt():
+            states = self._store.load_by_close_root(close_root_id)
+            if not states:
+                return None
+            keeper, merged = states[0], states[1:]
+            remaining = _dec(remaining_quantity)
+            groups = (stop_group,) + ((target_group,) if target_group else ())
+            base = replace(
+                keeper, state="PROTECTED", close_root_id=None, expected_cancel_ids=(), handover_generation=None,
+                protection_generation=keeper.protection_generation + 1, active_groups=groups, pending_groups=(),
+                pending_protection_lost=False, requested_quantity=remaining, filled_quantity=remaining,
+                protection_quantity=remaining, protection_working=False, stop_working=False,
+                target_working=False, stop_filled=False, target_filled=False, stop_rejected=False,
+                target_rejected=False, entry_working=False, entry_cancelled=False, error_code=None,
+                revision=keeper.revision + 1,
+            )
+            released = self._apply_event(base, BrokerOrderEvent(
+                stop_group, "stop", stop_status, 0.0, float(remaining), 0, f"release:{close_root_id}:stop", now))
+            if target_group:
+                released = self._apply_event(released, BrokerOrderEvent(
+                    target_group, "take_profit", target_status or "Unknown", 0.0, float(remaining), 0,
+                    f"release:{close_root_id}:target", now))
+            # #22 round 5: the stop row can change after DONE committed and before this read. Live
+            # event handling counts PendingCancel (and not-yet-accepted statuses) as working; at
+            # release they are not protection.
+            stop_accepted = stop_status in _RELEASE_STOP_STATUSES
+            if protection_problem or keeper.pending_protection_lost or not stop_accepted \
+                    or released.state not in ("PROTECTED", "EXITING", "CLOSED"):
+                released = replace(released, state="SAFETY_FAILED", flatten_requested=True,
+                                   error_code=released.error_code or "PROTECTION_LOST_DURING_CLOSE")
+            closed = [replace(s, state="CLOSED", close_root_id=None, error_code="PROTECTION_MERGED",
+                              revision=s.revision + 1) for s in merged]
+            self._persist_all([(released, "CLOSE_OWNED")] + [(s, "CLOSE_OWNED") for s in closed], _as_utc(now))
+            return released
+        released = self._retrying(attempt)
+        if released is not None and released.state == "SAFETY_FAILED":
+            self._trip_and_liquidate(released, _as_utc(now))
+
+    def close_after_full(self, *, close_root_id: str, now: dt.datetime) -> None:
+        def attempt():
+            closed = [replace(s, state="CLOSED", error_code=None, close_root_id=None, stop_working=False,
+                              target_working=False, revision=s.revision + 1)
+                      for s in self._store.load_by_close_root(close_root_id)]
+            self._persist_all([(s, "CLOSE_OWNED") for s in closed], _as_utc(now))
+        self._retrying(attempt)
+
+    def unhandled_failures(self, account_id: str) -> list[str]:
+        """SAFETY_FAILED sagas this version asked to flatten; the worker makes sure each one has a root.
+
+        A saga that was already SAFETY_FAILED before the upgrade is not here (R29):
+        no flatten starts on the first deploy without a fresh trigger.
+        """
+        return [s.command_id for s in self._store.load_flatten_requested(account_id)]
 
     # -- event application -------------------------------------------------
 
@@ -786,6 +1099,21 @@ class ProtectiveOrderSaga:
         from_state: Optional[str],
         event_id: Optional[str] = None,
     ) -> None:
+        mutation, write, event_key = self._mutation(state, now, from_state=from_state, event_id=event_id)
+        self._journal.mutate(self._journal.connect(), mutation, write, event_id=event_key)
+
+    def _persist_all(self, items: list[tuple[SagaState, Optional[str]]], now: dt.datetime) -> None:
+        """Several saga rows in one journal transaction (all or none, revision-checked)."""
+        if not items:
+            return
+        prepared = [self._mutation(state, now, from_state=from_state, event_id=None) for state, from_state in items]
+        self._journal.mutate_batch_work(
+            self._journal.connect(),
+            lambda _conn, append: [append(mutation, write, key) for mutation, write, key in prepared],
+        )
+
+    def _mutation(self, state: SagaState, now: dt.datetime, *, from_state: Optional[str],
+                  event_id: Optional[str]):
         if state.state not in SAGA_STATES:
             raise ValueError(f"invalid saga state {state.state!r}")
 
@@ -806,6 +1134,7 @@ class ProtectiveOrderSaga:
                 "error_code": state.error_code,
                 "filled_quantity": str(state.filled_quantity),
                 "protection_working": state.protection_working,
+                "close_root_id": state.close_root_id,
                 "revision": state.revision,
             },
         )
@@ -816,12 +1145,7 @@ class ProtectiveOrderSaga:
                 self._store.record_event_in_tx(conn, event_id, state.command_id, now)
 
         event_key = event_id or f"saga:{state.command_id}:{state.state}:{state.revision}"
-        self._journal.mutate(
-            self._journal.connect(),
-            mutation,
-            write,
-            event_id=event_key,
-        )
+        return mutation, write, event_key
 
     def _now_utc(self) -> dt.datetime:
         return _as_utc(self._now())

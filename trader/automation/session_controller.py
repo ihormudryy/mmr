@@ -9,9 +9,9 @@ from __future__ import annotations
 
 import datetime as dt
 import json
+import logging
 from dataclasses import dataclass
 from decimal import Decimal
-from types import SimpleNamespace
 from typing import Any, Callable, Optional, Protocol, Sequence
 from zoneinfo import ZoneInfo
 
@@ -165,8 +165,9 @@ class CancelPort(Protocol):
 
 
 class LiquidationPort(Protocol):
-    def start(self, account_id: str, cause_command_id: str, deadline: dt.datetime) -> Any: ...
+    def start(self, account_id: str, cause_command_id: str, deadline: dt.datetime, **kwargs: Any) -> Any: ...
     def rescan(self) -> Any: ...
+    def receipt_for(self, root_id: str) -> Any: ...
 
 
 class BreakerPort(Protocol):
@@ -264,6 +265,12 @@ class SessionStateStore:
 # Adapters
 # ---------------------------------------------------------------------------
 
+def _is_own_entry(order: Any) -> bool:
+    """A working entry order of ours: not external, not a protective child, not a close's child."""
+    from trader.trading.order_correlation import liquidation_child_kind
+    return (getattr(order, "leg", None) == "entry" and not getattr(order, "is_external", False)
+            and liquidation_child_kind(getattr(order, "order_group_id", None)) is None)
+
 class SessionCancelAdapter:
     """Cancel working orders with deterministic child command ids."""
 
@@ -273,31 +280,55 @@ class SessionCancelAdapter:
     def cancel_working_entries(
         self, *, root_command_id: str, orders: Sequence[Any],
     ) -> list[str]:
+        """Cancel each entry; one that cannot be cancelled is logged and the others still go.
+
+        An entry cancel is idempotent at the broker, so it is not a journaled
+        child: a crash before ``cancel_issued`` is stored sends it again.
+        """
+        from trader.trading.liquidation_service import DispatchRefused
         child_ids: list[str] = []
         for index, order in enumerate(orders):
             child = f"{root_command_id}-{index}"
             child_ids.append(child)
-            if self._dispatch is not None:
-                cancel = getattr(self._dispatch, "cancel", None)
-                if cancel is not None:
-                    cancel(order, child)
+            cancel = getattr(self._dispatch, "cancel", None) if self._dispatch is not None else None
+            if cancel is None:
+                continue
+            try:
+                cancel(order, child)
+            except DispatchRefused as ex:
+                logging.getLogger(__name__).info("entry %s needs no cancel: %s", order.order_entity_id, ex)
+            except Exception:
+                logging.getLogger(__name__).exception("entry cancel %s failed", order.order_entity_id)
         return child_ids
 
 
 class SessionTimeExitAdapter:
-    """Reduce-only time exit via liquidation dispatch when available."""
+    """A time exit is a conid-scoped full close.
 
-    def __init__(self, dispatch: Any | None = None):
-        self._dispatch = dispatch
+    The close hands protection over, cancels the stop first, sizes the reduce
+    from the broker and owns the position until it is closed. ``quantity``
+    and ``side`` are part of the port; the broker decides the size.
+    """
+
+    def __init__(self, liquidation: Any, *, account_id: str, now: Callable[[], dt.datetime],
+                 deadline_seconds: float = 300.0):
+        self._liquidation = liquidation
+        self._account_id = account_id
+        self._now = now
+        self._deadline_seconds = deadline_seconds
 
     def request_exit(
         self, *, command_id: str, conid: int, quantity: Decimal, side: str,
     ) -> None:
-        if self._dispatch is None:
+        from trader.trading.exit_owner import ExitInProgress
+
+        deadline = _as_utc(self._now()) + dt.timedelta(seconds=self._deadline_seconds)
+        try:
+            # Never pass a quantity: only a partial request can be refused with ExitInProgress.
+            # The conid goes as it came: admission refuses 1.5, True or "1" (#21); int() would close another one.
+            self._liquidation.start(self._account_id, command_id, deadline, scope="conid", conid=conid)
+        except ExitInProgress:
             return
-        exit_side = "SELL" if side == "BUY" else "BUY"
-        position = SimpleNamespace(conid=conid, quantity=float(quantity))
-        self._dispatch.reduce(position, exit_side, float(quantity), command_id)
 
 
 # ---------------------------------------------------------------------------
@@ -495,6 +526,10 @@ class SessionController:
         ):
             state = self._issue_cancel(state, now_utc)
 
+        # 2b) A cancelled partly filled entry must not leave bigger protection than the position
+        if state.cancel_issued and not state.flatten_issued and state.state not in _TERMINAL:
+            self._close_oversized_protection(state)
+
         # 3) Flatten via P1 liquidation
         if (
             state.flatten_start_utc is not None
@@ -644,11 +679,13 @@ class SessionController:
         root = self.cancel_command_id(self._account_id, state.session_date)
         try:
             snapshot = self._broker.capture(self._account_id)
-            working = tuple(getattr(snapshot, "working_orders", ()) or ())
-            if working:
-                self._cancel.cancel_working_entries(
-                    root_command_id=root, orders=working,
-                )
+            entries = tuple(order for order in getattr(snapshot, "working_orders", ()) or ()
+                            if _is_own_entry(order))
+            # R16 / D16: only our working entries, a partly filled one included, so
+            # nothing fills after the cutoff. Protective children, exits and external
+            # orders are left to the flatten, which owns their protection.
+            if entries:
+                self._cancel.cancel_working_entries(root_command_id=root, orders=entries)
         except Exception:
             # Ambiguous cancel still marks issued; flatten reconciles remainder.
             pass
@@ -661,21 +698,43 @@ class SessionController:
         self._persist(state, now_utc)
         return state
 
+    def _close_oversized_protection(self, state: SessionControllerState) -> None:
+        """D16: after an entry's remainder is cancelled, its children may still be sized for the
+        whole entry. A working stop or target for more than the position would reverse it, so the
+        conid is closed now through the scoped close (hand-over, cancel, reduce)."""
+        try:
+            snapshot = self._broker.capture(self._account_id)
+        except Exception:
+            return
+        held = {p.conid: float(p.quantity) for p in getattr(snapshot, "positions", ()) or ()
+                if float(p.quantity) != 0.0}
+        for conid, quantity in sorted(held.items()):
+            protective = [o for o in getattr(snapshot, "working_orders", ()) or ()
+                          if o.conid == conid and not o.is_external and o.leg in ("stop", "take_profit")]
+            if any(float(o.total_quantity) - float(o.filled_quantity) > abs(quantity) for o in protective):
+                self._time_exit.request_exit(
+                    command_id=f"{self.cancel_command_id(self._account_id, state.session_date)}-protect-{conid}",
+                    conid=conid, quantity=Decimal(str(abs(quantity))), side="BUY" if quantity > 0 else "SELL")
+
     def _issue_flatten(
         self, state: SessionControllerState, now_utc: dt.datetime,
     ) -> SessionControllerState:
         cause = self.flatten_command_id(self._account_id, state.session_date)
         deadline = state.flat_deadline_utc or (now_utc + dt.timedelta(minutes=10))
         try:
-            self._liquidation.start(self._account_id, cause, deadline)
+            receipt = self._liquidation.start(self._account_id, cause, deadline)
+            # R10: persist and poll the root we got back; it is another root after a join.
+            root = getattr(receipt, "cause_command_id", None)
         except LiquidationBusy:
-            # start() persisted the root before waiting for the lock, so
-            # _poll_flat's rescan() advances it once the lock frees up.
-            pass
+            # start() committed its own claim before it waited for the lock (only an own
+            # root waits), so the root is this cause; a later rescan advances it.
+            root = cause
+        if not root:
+            raise RuntimeError(f"liquidation start for {cause} returned no root to poll")
         state = self._evolve(
             state,
             state="FLATTENING",
-            flatten_command_id=cause,
+            flatten_command_id=root,
             flatten_issued=True,
             cancel_issued=True,
             entry_cutoff_reached=True,
@@ -688,9 +747,21 @@ class SessionController:
     ) -> SessionControllerState:
         receipt = None
         try:
-            receipt = self._liquidation.rescan()
+            self._liquidation.rescan()
+            if state.flatten_command_id:
+                receipt = self._liquidation.receipt_for(state.flatten_command_id)
         except Exception:
             receipt = None
+
+        if receipt is not None and getattr(receipt, "state", None) == "FAILED_SAFE":
+            # Ruling: the root this session follows failed safe (its breaker is tripped);
+            # say so now instead of polling a dead root until the flat deadline.
+            detail = f"flatten root {state.flatten_command_id} ended FAILED_SAFE: {getattr(receipt, 'detail', '')}"
+            self._breaker.record(BreakerSignal(kind="LIQUIDATION_FAILED", occurred_at=now_utc, detail=detail,
+                                               key=state.flatten_command_id))
+            state = self._evolve(state, state="INCIDENT", incident=detail)
+            self._persist(state, now_utc)
+            return state
 
         if receipt is not None and getattr(receipt, "state", None) == "FLAT":
             generation = getattr(receipt, "generation_id", None)

@@ -5,6 +5,11 @@
 **Status:** Do not implement the executing path from this spec as written. Rechecked 2026-10-05; verdict unchanged. See the note at the end.
 **Method:** Spec read against `master` at the time of writing. Tests were not re-run. The live paper account was not read. No orders were submitted.
 
+> **Follow-up (2026-10-05):** the owner chose AI-set risk limits, AI self-qualification
+> and sandboxed AI-written code. The security and plumbing findings here are kept;
+> the policy findings are overruled and recorded as accepted risks in
+> [`2026-10-05-ai-paper-sp1-foundation-design.md`](../superpowers/specs/2026-10-05-ai-paper-sp1-foundation-design.md).
+
 ## Verdict
 
 Keep the control sketch. Do not arm it. Do not let phase-1 schemas freeze the risk hole.

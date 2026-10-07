@@ -164,6 +164,14 @@ class TestOnSignalCreatesViaTypedApi:
         assert pid is None
         assert typed.commands == [] and typed.queries == []
 
+    @pytest.mark.parametrize('conid', [265598.9, 4391.0, True, '4391', -1])
+    def test_an_inexact_conid_creates_no_proposal_without_any_rpc(self, proposer, typed, conid):
+        """#21 round 7: int(265598.9) is 265598, another instrument; never coerce a signal conid."""
+        typed.queue_command('create_proposal', CommandReceipt(
+            's1', 's1', 'RESOLVED', {'proposal_id': 41, 'revision': 1}, None, False))
+        assert proposer.on_signal('orb', _signal(conid=conid, action=Action.SELL), _frame()) is None
+        assert typed.commands == [] and typed.queries == []
+
     def test_unknown_action_returns_none(self, proposer, typed):
         sig = _signal()
         sig.action = None

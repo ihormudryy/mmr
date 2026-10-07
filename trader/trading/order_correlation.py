@@ -7,6 +7,7 @@ stream for it.
 from __future__ import annotations
 
 import datetime as dt
+import re
 from dataclasses import dataclass
 from typing import Any, Optional
 
@@ -29,7 +30,63 @@ def decode_order_ref(order_ref: Optional[str]) -> Optional[str]:
     return None
 
 
-def classify_leg(order_type: str, parent_id: int, client_order_id: int) -> str:
+LIQUIDATION_CHILD_KINDS = ("cancel", "reduce", "reprotect-stop", "reprotect-target")
+_LIQUIDATION_CHILD = re.compile(r"-(cancel|reduce|reprotect-stop|reprotect-target)-(\d+)-(\d+)$")
+# Order refs of the liquidation service before SP1: {root}-liquidation-reduce-{conid}.
+_LEGACY_REDUCE = re.compile(r"-liquidation-reduce-(\d+)$")
+
+
+def legacy_reduce_prefix(run_id: str) -> str:
+    """Prefix of every reduce ref a pre-SP1 run may have sent, whatever the conid."""
+    return f"{run_id}-liquidation-reduce-"
+
+
+def matches_legacy_reduce(order_group_id: Optional[str], prefix: str) -> bool:
+    """True for ``{prefix}{conid}``: the prefix followed by digits only."""
+    group = order_group_id or ""
+    return group.startswith(prefix) and group[len(prefix):].isdigit()
+
+
+def liquidation_child_id(root_id: str, kind: str, conid: int, attempt: int) -> str:
+    """Deterministic, colon-free id of one liquidation child order.
+
+    It is also the decoded order ref (``mmr:<child id>``) of a reduce or
+    re-protect order, so the broker rows of that order can be found by it.
+    """
+    if kind not in LIQUIDATION_CHILD_KINDS:
+        raise ValueError(f"unknown liquidation child kind {kind!r}")
+    if not root_id or ":" in root_id:
+        raise ValueError("root id must be non-empty and may not contain ':'")
+    if int(attempt) < 1:
+        raise ValueError("attempt starts at 1")
+    return f"{root_id}-{kind}-{int(conid)}-{int(attempt)}"
+
+
+def reprotect_oca_group(root_id: str, conid: int, attempt: int) -> str:
+    """OCA group shared by the stop and target of one re-protect pair."""
+    return f"{root_id}-reprotect-{int(conid)}-{int(attempt)}"
+
+
+def liquidation_child_kind(order_group_id: Optional[str]) -> Optional[str]:
+    group = order_group_id or ""
+    match = _LIQUIDATION_CHILD.search(group)
+    if match:
+        return match.group(1)
+    return "reduce" if _LEGACY_REDUCE.search(group) else None
+
+
+def classify_leg(
+    order_type: str, parent_id: int, client_order_id: int,
+    order_group_id: Optional[str] = None,
+) -> str:
+    # Liquidation children have no parent; their order group names the leg.
+    kind = liquidation_child_kind(order_group_id)
+    if kind == "reprotect-stop":
+        return "stop"
+    if kind == "reprotect-target":
+        return "take_profit"
+    if kind == "reduce":
+        return "exit"
     if not parent_id:
         return "entry"
     if order_type in _STOP_TYPES:
@@ -65,6 +122,9 @@ class OrderObservation:
     filled_quantity: float
     avg_fill_price: Optional[float]
     source_timestamp: dt.datetime
+    oca_group: Optional[str] = None
+    oca_type: Optional[int] = None
+    oca_reported: bool = False   # True when the source carries OCA fields; '' / 0 then mean "no OCA" (#45)
 
 
 def normalize_open_order(trade: Any, now: dt.datetime) -> OrderObservation:
@@ -87,6 +147,9 @@ def normalize_open_order(trade: Any, now: dt.datetime) -> OrderObservation:
         filled_quantity=float(status.filled or 0.0),
         avg_fill_price=_price_or_none(status.avgFillPrice),
         source_timestamp=now,
+        oca_group=getattr(order, "ocaGroup", None) or None,
+        oca_type=int(getattr(order, "ocaType", 0) or 0) or None,
+        oca_reported=hasattr(order, "ocaGroup") and hasattr(order, "ocaType"),
     )
 
 
@@ -120,7 +183,7 @@ class OrderCorrelator:
         group_id = decode_order_ref(obs.order_ref)
         if group_id is not None:
             return order_group_leg_entity_id(
-                group_id, classify_leg(obs.order_type, obs.parent_id, obs.client_order_id)
+                group_id, classify_leg(obs.order_type, obs.parent_id, obs.client_order_id, group_id)
             )
         return external_order_entity_id()
 

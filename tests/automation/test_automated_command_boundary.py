@@ -189,6 +189,7 @@ class FakeArtifactVerifier:
     def __init__(self):
         self.calls: list[dict] = []
         self._error = None
+        self.allowlist = ("265598",)
 
     def fail_with(self, exc):
         self._error = exc
@@ -208,7 +209,7 @@ class FakeArtifactVerifier:
             manifest_digest="manifest-ok",
             dataset_manifest_digest="dataset-ok",
             parameters={},
-            allowlist=("265598",),
+            allowlist=self.allowlist,
             max_gross_allocation=0.06,
             expires_at=now + dt.timedelta(days=30),
             public_key_id="ed25519-test",
@@ -225,7 +226,8 @@ class FakeSchedule:
         self.calls += 1
 
 
-def _build_stack(tmp_path: Path, *, dispatch=None, verifier=None, now=None):
+def _build_stack(tmp_path: Path, *, dispatch=None, verifier=None, now=None, liquidation=None, broker=None,
+                 protective_saga=None, approval_factory=None):
     from trader.automation.automated_intent_command import AutomatedIntentCommandService
 
     db = DuckDBConnection.get_instance(str(tmp_path / "automation.duckdb"))
@@ -256,6 +258,10 @@ def _build_stack(tmp_path: Path, *, dispatch=None, verifier=None, now=None):
         bundle_root=tmp_path / "bundles",
         expected_artifact_id=ARMED_ARTIFACT_ID,
         schedule_reconcile=schedule.schedule,
+        liquidation=liquidation,
+        broker=broker,
+        protective_saga=protective_saga,
+        approval_factory=approval_factory,
     )
 
     class _NonceGate:
@@ -794,3 +800,225 @@ def test_the_service_refuses_to_start_without_an_armed_artifact(tmp_path):
             dispatch=FakeIntentDispatch(), artifact_verifier=FakeArtifactVerifier(),
             account_id=ACCOUNT, account_mode="paper", now=lambda: NOW,
             bundle_root=tmp_path / "bundles", expected_artifact_id="")
+
+
+# ---------------------------------------------------------------------------
+# SP1 plan 1 Task 12: SELL intents become a proven-reduction close
+# ---------------------------------------------------------------------------
+
+class _FakeCloseLiquidation:
+    def __init__(self, *, raise_exc=None, root=None):
+        self.starts = []
+        self.raise_exc = raise_exc
+        self.root = root
+
+    def start(self, account_id, cause_command_id, deadline, **kwargs):
+        if self.raise_exc is not None:
+            raise self.raise_exc
+        self.starts.append((account_id, cause_command_id, deadline, kwargs))
+        return SimpleNamespace(cause_command_id=self.root or cause_command_id, state="VERIFYING",
+                               generation_id=1, detail="close submitted")
+
+
+class _FakeBrokerSnapshot:
+    def __init__(self, held):
+        self.held = held
+
+    def capture(self, account_id):
+        return SimpleNamespace(account_id=ACCOUNT, generation_id=1,
+                               reducible_quantity=lambda conid: self.held if conid == 265598 else 0.0)
+
+
+def _execute_sell(stack, tmp_path, requested):
+    (tmp_path / "bundles" / ARTIFACT_DIGEST.replace(":", "_")).mkdir(parents=True, exist_ok=True)
+    intent = make_intent(side="SELL", requested_quantity=None if requested is None else Decimal(str(requested)))
+    return stack.coordinator.execute(CommandRequest(
+        command_id=intent.command_id, action="execute_automated_intent", account_id=ACCOUNT,
+        target_type="intent", target_id=intent.intent_id, expected_version=None,
+        body=intent_to_request_body(intent), source="strategy_service",
+    )), intent
+
+
+def test_sell_intent_becomes_a_scoped_close_and_never_a_bracket(tmp_path):
+    liquidation = _FakeCloseLiquidation()
+    stack = _build_stack(tmp_path, liquidation=liquidation, broker=_FakeBrokerSnapshot(10.0))
+    receipt, intent = _execute_sell(stack, tmp_path, None)
+    assert (receipt.state, receipt.error_code) == ("OUTCOME_UNKNOWN", "CLOSE_PENDING")
+    assert receipt.outcome["close_root_id"] == intent.command_id
+    _account, root, _deadline, kwargs = liquidation.starts[0]
+    assert (root, kwargs) == (intent.command_id, {"scope": "conid", "conid": 265598, "quantity": None})
+    assert stack.dispatch.calls == []
+    assert stack.schedule.calls == 1          # R17: reconciled from its exact root
+
+
+@pytest.mark.parametrize("requested,expected", [(4, 4.0), (10, None)])
+def test_sell_intent_quantity_is_a_partial_or_a_full_close(tmp_path, requested, expected):
+    liquidation = _FakeCloseLiquidation()
+    stack = _build_stack(tmp_path, liquidation=liquidation, broker=_FakeBrokerSnapshot(10.0))
+    _execute_sell(stack, tmp_path, requested)
+    assert liquidation.starts[0][3]["quantity"] == expected
+
+
+@pytest.mark.parametrize("held,requested", [(0.0, None), (10.0, 11), (-5.0, None)])
+def test_sell_that_is_not_a_reduction_is_refused(tmp_path, held, requested):
+    liquidation = _FakeCloseLiquidation()
+    stack = _build_stack(tmp_path, liquidation=liquidation, broker=_FakeBrokerSnapshot(held))
+    receipt, _intent = _execute_sell(stack, tmp_path, requested)
+    assert (receipt.state, receipt.error_code) == ("REJECTED", "NOT_A_REDUCTION")
+    assert liquidation.starts == [] and stack.dispatch.calls == []
+
+
+@pytest.mark.parametrize("bad", [1.5, True, "1", 0])
+def test_sell_intent_with_an_inexact_conid_is_invalid_before_any_broker_read(tmp_path, bad):
+    """#21 round 5: the body's conid is never coerced. The intent ids are derived for conid 1,
+    so ``int(bad)`` would have passed every id check and closed conid 1."""
+    liquidation = _FakeCloseLiquidation()
+    captures = []
+    broker = SimpleNamespace(capture=lambda account_id: captures.append(account_id) or _FakeBrokerSnapshot(
+        10.0).capture(account_id))
+    stack = _build_stack(tmp_path, liquidation=liquidation, broker=broker)
+    (tmp_path / "bundles" / ARTIFACT_DIGEST.replace(":", "_")).mkdir(parents=True, exist_ok=True)
+    intent = make_intent(side="SELL", conid=1)
+    body = dict(intent_to_request_body(intent), conid=bad)
+    receipt = stack.coordinator.execute(CommandRequest(
+        command_id=intent.command_id, action="execute_automated_intent", account_id=ACCOUNT,
+        target_type="intent", target_id=intent.intent_id, expected_version=None,
+        body=body, source="strategy_service"))
+    assert (receipt.state, receipt.error_code) == ("REJECTED", "INTENT_INVALID")
+    assert (captures, liquidation.starts, stack.dispatch.calls) == ([], [], [])
+
+
+def _recording_broker(captures, held=10.0):
+    return SimpleNamespace(capture=lambda account_id: captures.append(account_id) or SimpleNamespace(
+        account_id=ACCOUNT, generation_id=1, reducible_quantity=lambda conid: held))
+
+
+def test_sell_intent_for_a_conid_outside_the_artifact_allowlist_is_refused_before_any_broker_read(tmp_path):
+    """#29/#22 round 6: the armed artifact allowlists only 999999; a SELL of the held 265598 must not
+    start a close. Refused before any snapshot, claim or order."""
+    liquidation, captures = _FakeCloseLiquidation(), []
+    verifier = FakeArtifactVerifier()
+    verifier.allowlist = ("999999",)
+    stack = _build_stack(tmp_path, liquidation=liquidation, broker=_recording_broker(captures), verifier=verifier)
+    receipt, intent = _execute_sell(stack, tmp_path, None)
+    assert (receipt.state, receipt.error_code) == ("REJECTED", "CONID_NOT_PERMITTED")
+    assert (captures, liquidation.starts, stack.dispatch.calls) == ([], [], [])
+    assert stack.ledger.get(intent.command_id).state == "REJECTED"
+
+
+@pytest.mark.parametrize("bad", [True, "1", 1.0, 0, -1])
+def test_typed_intent_request_refuses_an_inexact_conid_before_the_handler(tmp_path, bad):
+    """#21 round 6: the typed RPC model is the first parser. It must not turn true, "1" or 1.0 into
+    conid 1 (the intent ids are derived for conid 1, and the artifact allowlists 1 here)."""
+    from trader.messaging.production_api import _execute_automated_intent_rpc_handler
+    from trader.messaging.typed_rpc import _coerce_request_body
+
+    liquidation, captures = _FakeCloseLiquidation(), []
+    verifier = FakeArtifactVerifier()
+    verifier.allowlist = ("1", "265598")
+    stack = _build_stack(tmp_path, liquidation=liquidation, broker=_recording_broker(captures), verifier=verifier)
+    (tmp_path / "bundles" / ARTIFACT_DIGEST.replace(":", "_")).mkdir(parents=True, exist_ok=True)
+    intent = make_intent(side="SELL", conid=1, requested_quantity=None)
+    handler = _execute_automated_intent_rpc_handler(stack.coordinator, ACCOUNT)
+    with pytest.raises(ValidationError):
+        handler(_coerce_request_body(dict(intent_to_wire(intent), conid=bad), ExecuteAutomatedIntentRequest))
+    assert (captures, liquidation.starts) == ([], [])
+
+
+def test_typed_intent_request_accepts_an_exact_conid(tmp_path):
+    liquidation, captures = _FakeCloseLiquidation(), []
+    from trader.messaging.production_api import _execute_automated_intent_rpc_handler
+    from trader.messaging.typed_rpc import _coerce_request_body
+
+    stack = _build_stack(tmp_path, liquidation=liquidation, broker=_recording_broker(captures))
+    (tmp_path / "bundles" / ARTIFACT_DIGEST.replace(":", "_")).mkdir(parents=True, exist_ok=True)
+    intent = make_intent(side="SELL", requested_quantity=None)
+    handler = _execute_automated_intent_rpc_handler(stack.coordinator, ACCOUNT)
+    receipt = handler(_coerce_request_body(intent_to_wire(intent), ExecuteAutomatedIntentRequest))
+    assert receipt["error_code"] == "CLOSE_PENDING" and liquidation.starts[0][3]["conid"] == 265598
+
+
+def test_sell_intent_refused_while_another_close_owns_the_conid(tmp_path):
+    from trader.trading.exit_owner import ExitInProgress
+    stack = _build_stack(tmp_path, liquidation=_FakeCloseLiquidation(raise_exc=ExitInProgress("other-root")),
+                         broker=_FakeBrokerSnapshot(10.0))
+    receipt, _intent = _execute_sell(stack, tmp_path, 3)
+    assert (receipt.state, receipt.error_code) == ("REJECTED", "EXIT_IN_PROGRESS")
+
+
+def test_sell_intent_refused_by_the_partial_quantity_rule(tmp_path):
+    from trader.trading.liquidation_service import LiquidationRefused
+    stack = _build_stack(tmp_path, liquidation=_FakeCloseLiquidation(
+        raise_exc=LiquidationRefused("PARTIAL_QUANTITY_INVALID")), broker=_FakeBrokerSnapshot(10.0))
+    receipt, _intent = _execute_sell(stack, tmp_path, 0.4)
+    assert (receipt.state, receipt.error_code) == ("REJECTED", "PARTIAL_QUANTITY_INVALID")
+
+
+def test_joined_sell_records_the_root_it_must_follow(tmp_path):
+    stack = _build_stack(tmp_path, liquidation=_FakeCloseLiquidation(root="time-exit-1"),
+                         broker=_FakeBrokerSnapshot(10.0))
+    receipt, _intent = _execute_sell(stack, tmp_path, None)
+    assert receipt.outcome["close_root_id"] == "time-exit-1"
+
+
+def test_buy_intent_path_is_unchanged_with_close_configured(tmp_path):
+    liquidation = _FakeCloseLiquidation()
+    stack = _build_stack(tmp_path, liquidation=liquidation, broker=_FakeBrokerSnapshot(0.0))
+    (tmp_path / "bundles" / ARTIFACT_DIGEST.replace(":", "_")).mkdir(parents=True)
+    intent = make_intent()
+    receipt = stack.coordinator.execute(CommandRequest(
+        command_id=intent.command_id, action="execute_automated_intent", account_id=ACCOUNT,
+        target_type="intent", target_id=intent.intent_id, expected_version=None,
+        body=intent_to_request_body(intent), source="strategy_service",
+    ))
+    assert receipt.state in ("SUBMITTED", "RESOLVED")
+    assert len(stack.dispatch.calls) == 1 and liquidation.starts == []
+
+
+def _execute_buy(stack, tmp_path):
+    (tmp_path / "bundles" / ARTIFACT_DIGEST.replace(":", "_")).mkdir(parents=True, exist_ok=True)
+    intent = make_intent()
+    return stack.coordinator.execute(CommandRequest(
+        command_id=intent.command_id, action="execute_automated_intent", account_id=ACCOUNT,
+        target_type="intent", target_id=intent.intent_id, expected_version=None,
+        body=intent_to_request_body(intent), source="strategy_service",
+    ))
+
+
+def test_sell_closes_while_new_exposure_is_paused_and_a_buy_is_refused(tmp_path):
+    """R32 / D11: the pause stops new exposure, never an exit."""
+    liquidation = _FakeCloseLiquidation()
+    stack = _build_stack(tmp_path, liquidation=liquidation, broker=_FakeBrokerSnapshot(10.0))
+    stack.controls.set(ACCOUNT, True, None, "pause-1", "test", NOW)
+    receipt, _intent = _execute_sell(stack, tmp_path, None)
+    assert (receipt.state, receipt.error_code) == ("OUTCOME_UNKNOWN", "CLOSE_PENDING")
+    assert len(liquidation.starts) == 1
+    buy = _execute_buy(stack, tmp_path)
+    assert (buy.state, buy.error_code) == ("REJECTED", "TRADING_PAUSED")
+
+
+def test_sell_without_the_close_path_is_refused_never_bracketed(tmp_path):
+    """R32 / #31: an unwired close path fails loudly; the bracket path would add a reverse stop."""
+    stack = _build_stack(tmp_path)
+    receipt, _intent = _execute_sell(stack, tmp_path, None)
+    assert (receipt.state, receipt.error_code) == ("REJECTED", "CLOSE_PATH_UNAVAILABLE")
+    assert stack.dispatch.calls == []
+
+
+def test_after_a_session_loss_breach_a_sell_closes_and_a_buy_is_refused(tmp_path):
+    """#31: session_risk (inside the saga) refuses a BUY after a daily-loss breach; a SELL never reaches it."""
+    saga_calls = []
+
+    class _BreachedSaga:
+        def start(self, *, intent, **_kwargs):
+            saga_calls.append(intent.side)
+            return SimpleNamespace(state="CLOSED", error_code="DAILY_LOSS", submitted_order_ids=())
+
+    liquidation = _FakeCloseLiquidation()
+    stack = _build_stack(tmp_path, liquidation=liquidation, broker=_FakeBrokerSnapshot(10.0),
+                         protective_saga=_BreachedSaga(), approval_factory=lambda **_k: SimpleNamespace())
+    buy = _execute_buy(stack, tmp_path)
+    assert (buy.state, buy.error_code) == ("REJECTED", "DAILY_LOSS")
+    receipt, _intent = _execute_sell(stack, tmp_path, None)
+    assert (receipt.state, receipt.error_code) == ("OUTCOME_UNKNOWN", "CLOSE_PENDING")
+    assert saga_calls == ["BUY"] and len(liquidation.starts) == 1

@@ -86,10 +86,10 @@ import logging
 import os
 from dataclasses import asdict
 from decimal import Decimal
-from typing import TYPE_CHECKING, Any, Dict, Literal, Optional
+from typing import TYPE_CHECKING, Annotated, Any, Dict, Literal, Optional
 
 from ib_async import Contract
-from pydantic import BaseModel, ConfigDict, Field, field_validator
+from pydantic import BaseModel, ConfigDict, Field, Strict, field_validator
 
 from trader.data.proposal_repository import ProposalRepository
 from trader.domain.commands import CommandReceipt
@@ -469,6 +469,11 @@ def _snapshot_with_cursor_handler(snapshot_service: DomainSnapshotService):
 # at all, on either role.
 # ---------------------------------------------------------------------------
 
+# A conId on a command that can send an order: a JSON integer above zero, never a bool,
+# string or float coerced into one (a coerced id can close another instrument).
+ExactConid = Annotated[int, Strict(), Field(gt=0)]
+
+
 def _reject_colon_in_command_id(value: str) -> str:
     """Shared ``command_id`` field-validator body for the two mutating
     request models below.
@@ -696,7 +701,8 @@ class ExecuteAutomatedIntentRequest(BaseModel):
     signal_id: str
     intent_id: str
     account_mode: Literal["paper", "live"]
-    conid: int
+    # #21 round 6: strict, so true, "1" and 1.0 are refused here instead of becoming conid 1.
+    conid: ExactConid
     side: Literal["BUY", "SELL"]
     requested_quantity: Optional[Decimal] = None
     risk_fraction: Decimal

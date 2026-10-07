@@ -309,6 +309,11 @@ def test_classify_cancel_of_missing_order_is_increasing():
     assert classify_cancel(None) is RiskDirection.INCREASING
 
 
+def test_cancelling_a_liquidation_exit_needs_the_ceremony():
+    """SP1 plan 1 Task 2: a reduce of a close is an ``exit``; cancelling it keeps exposure."""
+    assert classify_cancel(_order("ord-x", leg="exit", status="Submitted")) is RiskDirection.INCREASING
+
+
 def test_cancel_orders_rejects_empty_list(cancel):
     receipt = cancel.execute("cancel_orders", {"order_entity_ids": []}, command_id="root-empty")
     assert receipt.state == "REJECTED"

@@ -13,6 +13,7 @@ import logging
 import queue
 import threading
 import uuid
+from contextlib import contextmanager
 from dataclasses import dataclass, replace
 from typing import Any, Callable, Optional
 
@@ -30,6 +31,7 @@ from trader.trading.order_correlation import (
     OrderObservation,
     classify_leg,
     decode_order_ref,
+    liquidation_child_kind,
     normalize_open_order,
 )
 
@@ -122,6 +124,19 @@ def _none_if_unset(value: Any) -> Optional[float]:
     if numeric == 0.0 or numeric >= _UNSET_DOUBLE:
         return None
     return numeric
+
+
+def _order_leg(obs: Any, group_id: Optional[str], current: Any) -> Optional[str]:
+    """The leg of an order row. The first classification sticks, except for
+    liquidation children: their group names the leg, so an older row (for
+    example a pre-SP1 reduce stored as ``entry``) is classified again."""
+    if group_id and liquidation_child_kind(group_id) is not None:
+        return classify_leg(obs.order_type, obs.parent_id, obs.client_order_id, group_id)
+    if current is not None and current.leg:
+        return current.leg
+    if group_id:
+        return classify_leg(obs.order_type, obs.parent_id, obs.client_order_id, group_id)
+    return None
 
 
 @dataclass(frozen=True)
@@ -370,7 +385,9 @@ class BrokerIngest:
         ] = queue.Queue()
         self._ingest_seq = 0
         self._generation: Optional[_Generation] = None
-        self._apply_lock = threading.Lock()
+        # Reentrant: a close that holds broker changes (``hold_changes``) reads
+        # the snapshot, whose readiness check takes this lock again.
+        self._apply_lock = threading.RLock()
         self._stop = threading.Event()
         self._writer: Optional[threading.Thread] = None
         self.correlator = OrderCorrelator(store, self.session_epoch)
@@ -446,6 +463,26 @@ class BrokerIngest:
             )
             self._generation = _Generation(generation_id=generation_id, required=required)
             return generation_id
+
+    @contextmanager
+    def hold_changes(self, timeout_seconds: float = 2.0):
+        """No broker row or position changes while held (SP1 ruling 48).
+
+        Live batches apply under ``_apply_lock``; a promote runs only while a
+        generation is staging, and staging begins under the same lock. So
+        holding the lock with no generation staging stops every broker write.
+        Raises ``BrokerChangesBusy`` when the lock is not free in time or a
+        generation is staging. Keep the held section short: ingest waits.
+        """
+        from trader.trading.liquidation_service import BrokerChangesBusy
+        if not self._apply_lock.acquire(timeout=timeout_seconds):
+            raise BrokerChangesBusy(f"broker ingest busy for more than {timeout_seconds}s")
+        try:
+            if self._generation is not None:
+                raise BrokerChangesBusy(f"broker generation {self._generation.generation_id} is staging")
+            yield
+        finally:
+            self._apply_lock.release()
 
     @property
     def is_ready(self) -> bool:
@@ -744,15 +781,7 @@ class BrokerIngest:
             conid=obs.conid,
             symbol=obs.symbol,
             order_group_id=group_id or (current.order_group_id if current else None),
-            leg=(
-                current.leg
-                if current and current.leg
-                else (
-                    classify_leg(obs.order_type, obs.parent_id, obs.client_order_id)
-                    if group_id
-                    else None
-                )
-            ),
+            leg=_order_leg(obs, group_id, current),
             is_external=(group_id is None) if current is None else current.is_external,
             action=obs.action,
             order_type=obs.order_type,
@@ -774,6 +803,8 @@ class BrokerIngest:
             deleted=False,
             revision=current.revision if current else 0,
             source_timestamp=obs.source_timestamp,
+            oca_group=obs.oca_group if obs.oca_reported else (current.oca_group if current else None),
+            oca_type=obs.oca_type if obs.oca_reported else (current.oca_type if current else None),
         )
         if current is not None and not current.deleted and merged.same_fields(current):
             self.correlator.bind_aliases_in_tx(conn, entity_id, obs)
@@ -1278,7 +1309,9 @@ class BrokerIngest:
             return
         from trader.automation.protective_order_saga import BrokerOrderEvent
 
-        leg = order.leg or classify_leg(obs.order_type, obs.parent_id, obs.client_order_id)
+        leg = order.leg or classify_leg(
+            obs.order_type, obs.parent_id, obs.client_order_id, order.order_group_id,
+        )
         event = BrokerOrderEvent(
             order_group_id=order.order_group_id,
             leg=leg or "entry",
@@ -1291,6 +1324,7 @@ class BrokerIngest:
                 f"{obs.filled_quantity}:{obs.source_timestamp.isoformat()}"
             ),
             source_timestamp=obs.source_timestamp,
+            order_entity_id=order.order_entity_id,
         )
         try:
             self.protective_order_saga.on_broker_event(event)

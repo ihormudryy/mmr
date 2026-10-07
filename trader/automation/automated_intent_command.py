@@ -90,7 +90,7 @@ def intent_from_body(body: Mapping[str, Any]) -> ExecutionIntent:
         intent_id=body["intent_id"],
         command_id=body["command_id"],
         account_mode=body["account_mode"],
-        conid=int(body["conid"]),
+        conid=body["conid"],  # never coerced: ExecutionIntent refuses 1.5, True or "1" (#21)
         side=body["side"],
         requested_quantity=(
             None if body.get("requested_quantity") is None
@@ -147,6 +147,9 @@ class AutomatedIntentCommandService:
         allocation_factory: Optional[Callable[..., Any]] = None,
         configured_bundle_path: Optional[Path] = None,
         bundle_evidence_validator: Optional[Callable[[Path], None]] = None,
+        liquidation: Optional[Any] = None,
+        broker: Optional[Any] = None,
+        close_deadline_seconds: float = 300.0,
     ):
         self._ledger = ledger
         self._audit = audit
@@ -157,6 +160,9 @@ class AutomatedIntentCommandService:
         self._account_id = account_id
         self._account_mode = account_mode
         self._now = now
+        self._liquidation = liquidation
+        self._broker = broker
+        self._close_deadline_seconds = close_deadline_seconds
         self._bundle_root = Path(bundle_root)
         if not expected_artifact_id:
             raise ValueError("expected_artifact_id is required: the service verifies only the armed artifact")
@@ -248,22 +254,16 @@ class AutomatedIntentCommandService:
 
         self._transition(cmd, "RECEIVED", "VALIDATED")
 
+        # A SELL on the long-only path is an exit, never a bracket (spec 5.1). It adds no
+        # exposure, so the pause on new exposure does not stop it (R32).
+        if intent.side == "SELL":
+            return self._execute_close(cmd, intent, artifact)
+
         order_group_id = f"og-{cmd.command_id}"
         order_ref = encode_order_ref(order_group_id)
 
-        def claim(conn, append):
-            from trader.trading.command_coordinator import _command_updated_mutation, _noop_write
-
-            self._controls.require_unpaused_in_tx(conn, self._account_id)
-            self._ledger.transition_in_tx(conn, cmd.command_id, "VALIDATED", "SUBMITTING")
-            append(
-                _command_updated_mutation(cmd, "SUBMITTING", self._now_utc()),
-                _noop_write,
-                f"command:{cmd.command_id}:submitting",
-            )
-
         try:
-            self._journal.mutate_batch_work(self._journal.connect(), claim)
+            self._claim(cmd, require_unpaused=True)
         except Exception as ex:
             code = "TRADING_PAUSED"
             if getattr(ex, "code", None):
@@ -360,6 +360,85 @@ class AutomatedIntentCommandService:
         return self._finish_submitted(
             cmd, intent, order_group_id, order_ids, bundle_digest,
         )
+
+    def _claim(self, cmd, *, require_unpaused: bool) -> None:
+        """VALIDATED -> SUBMITTING in one journal transaction; an entry also checks the pause."""
+        from trader.trading.command_coordinator import _command_updated_mutation, _noop_write
+
+        def claim(conn, append):
+            if require_unpaused:
+                self._controls.require_unpaused_in_tx(conn, self._account_id)
+            self._ledger.transition_in_tx(conn, cmd.command_id, "VALIDATED", "SUBMITTING")
+            append(
+                _command_updated_mutation(cmd, "SUBMITTING", self._now_utc()),
+                _noop_write,
+                f"command:{cmd.command_id}:submitting",
+            )
+        self._journal.mutate_batch_work(self._journal.connect(), claim)
+
+    def _execute_close(self, cmd, intent, artifact) -> CommandReceipt:
+        """Prove the SELL reduces the held long on the account's broker snapshot, then close.
+
+        The conid must be in the verified artifact's allowlist first (#29 round 6):
+        a strategy may only close what its artifact may trade. The proof is a
+        reduction check, not a sizing: the close sizes every reduce from its
+        own fenced generations, and the reduce-only boundary checks IB's live
+        position again (Task 14).
+        """
+        from trader.trading.exit_owner import ExitInProgress
+        from trader.trading.liquidation_service import LiquidationRefused
+
+        if self._liquidation is None or self._broker is None:
+            # Fail loudly: never fall back to the bracket path, which would add a reverse stop.
+            self._transition(cmd, "VALIDATED", "REJECTED", error_code="CLOSE_PATH_UNAVAILABLE")
+            return self._receipt(cmd.command_id, "REJECTED", "CLOSE_PATH_UNAVAILABLE", False)
+        if cmd.account_id != self._account_id:
+            self._transition(cmd, "VALIDATED", "REJECTED", error_code="ACCOUNT_MISMATCH")
+            return self._receipt(cmd.command_id, "REJECTED", "ACCOUNT_MISMATCH", False)
+        if str(intent.conid) not in {str(item) for item in artifact.allowlist}:
+            self._transition(cmd, "VALIDATED", "REJECTED", error_code="CONID_NOT_PERMITTED")
+            return self._receipt(cmd.command_id, "REJECTED", "CONID_NOT_PERMITTED", False,
+                                 outcome={"detail": f"conid {intent.conid} is not in the artifact allowlist"})
+        self._claim(cmd, require_unpaused=False)
+        try:
+            snapshot = self._broker.capture(self._account_id)
+            if getattr(snapshot, "account_id", None) != self._account_id:
+                raise RuntimeError("broker snapshot is for another account")
+        except Exception as ex:
+            return self._reject_close(cmd, "BROKER_SNAPSHOT_UNAVAILABLE", {"detail": str(ex)})
+        held = float(snapshot.reducible_quantity(intent.conid))
+        requested = None if intent.requested_quantity is None else float(intent.requested_quantity)
+        if held <= 0 or (requested is not None and requested > held):
+            return self._reject_close(cmd, "NOT_A_REDUCTION", {"held": held, "requested": requested})
+        # A close of the whole position takes the broker quantity at reduce time (ruling 10).
+        quantity = None if requested is None or requested >= held else requested
+        deadline = self._now_utc() + dt.timedelta(seconds=self._close_deadline_seconds)
+        try:
+            receipt = self._liquidation.start(
+                self._account_id, cmd.command_id, deadline, scope="conid", conid=intent.conid, quantity=quantity,
+            )
+        except ExitInProgress as ex:
+            return self._reject_close(cmd, "EXIT_IN_PROGRESS", {"close_root_id": ex.root_id})
+        except LiquidationRefused as ex:
+            return self._reject_close(cmd, ex.code, {"detail": str(ex)})
+        except Exception as ex:
+            self._transition(cmd, "SUBMITTING", "OUTCOME_UNKNOWN", error_code="DISPATCH_AMBIGUOUS")
+            if self._schedule_reconcile is not None:
+                self._schedule_reconcile(cmd.command_id)
+            return self._receipt(cmd.command_id, "OUTCOME_UNKNOWN", "DISPATCH_AMBIGUOUS", False,
+                                 outcome={"detail": str(ex)})
+
+        outcome = {"close_root_id": receipt.cause_command_id, "liquidation_state": receipt.state,
+                   "generation_id": receipt.generation_id, "detail": receipt.detail}
+        self._transition(cmd, "SUBMITTING", "OUTCOME_UNKNOWN", error_code="CLOSE_PENDING", outcome=outcome)
+        if self._schedule_reconcile is not None:
+            # R17: the reconciler resolves this command from the exact root it started or joined.
+            self._schedule_reconcile(cmd.command_id)
+        return self._receipt(cmd.command_id, "OUTCOME_UNKNOWN", "CLOSE_PENDING", False, outcome=outcome)
+
+    def _reject_close(self, cmd, code: str, outcome: dict) -> CommandReceipt:
+        self._transition(cmd, "SUBMITTING", "REJECTED", error_code=code)
+        return self._receipt(cmd.command_id, "REJECTED", code, False, outcome=outcome)
 
     def _finish_submitted(
         self, cmd, intent, order_group_id, order_ids, bundle_digest,

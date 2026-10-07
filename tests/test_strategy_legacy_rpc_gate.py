@@ -69,24 +69,30 @@ class _ServingLoop:
         return self
 
     def __exit__(self, *exc):
-        def _close():
+        async def _shutdown():
             for server in (self.runtime.typed_command_server, self.runtime.typed_query_server,
                            self.runtime.zmq_strategy_rpc_server):
                 if server is not None:
                     server.close()
-            self.loop.stop()
-        self.loop.call_soon_threadsafe(_close)
+            cancelled = [task for task in asyncio.all_tasks() if task is not asyncio.current_task()]
+            await asyncio.gather(*cancelled, return_exceptions=True)
+
+        asyncio.run_coroutine_threadsafe(_shutdown(), self.loop).result(5)
+        self.loop.call_soon_threadsafe(self.loop.stop)
         self.thread.join(5)
+        self.loop.close()
 
 
 def _legacy_call(port, method, *args):
     client = RPCClient[StrategyServiceApi](
         zmq_server_address="tcp://127.0.0.1", zmq_server_port=port, timeout=1)
-    asyncio.new_event_loop().run_until_complete(client.connect())
+    client_loop = asyncio.new_event_loop()
+    client_loop.run_until_complete(client.connect())
     try:
         return getattr(client.rpc(), method)(*args)
     finally:
         client.close()
+        client_loop.close()
 
 
 def test_production_posture_never_builds_the_legacy_strategy_server(tmp_path):

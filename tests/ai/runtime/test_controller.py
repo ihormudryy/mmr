@@ -2,6 +2,7 @@
 import asyncio
 import datetime as dt
 import json
+import logging
 
 import pytest
 import pytest_asyncio
@@ -17,8 +18,9 @@ from trader.ai.engine import EngineResult, ProposedDecision, SimulatedBaseline
 from trader.ai.gateway import CallRefused
 from trader.ai.ids import derive_decision_id
 from trader.ai.journal import AttemptJournal
+from trader.ai.leadership import Leadership, new_holder_id
 from trader.ai.outbox import ReportingOutbox
-from trader.ai.rpc_clients import RpcNotSent
+from trader.ai.rpc_clients import RpcNotSent, RpcRefused
 from trader.ai.runtime_schema import ALL_MIGRATIONS, set_cursor_in_tx
 from trader.ai.schedule import Slot, SessionSlots
 from trader.ai.signal_intake import SignalIntake
@@ -361,3 +363,35 @@ async def test_a_closed_cap_gate_keeps_reconciliation_and_the_outbox_running(tmp
     (baseline,) = rig.trader.ingest.rows.values()
     assert (baseline["opportunity_id"], baseline["incomplete_reason"]) == (buy["source_event_id"], "budget_refused")
     RecordSimulatedDecisionRequest.model_validate(baseline)
+
+
+class GrantThenRefuse:
+    """The first grant succeeds; every later one is refused as a broken key would be (not a lost lease)."""
+
+    def __init__(self, clock):
+        self.clock, self.grants = clock, 0
+
+    async def call(self, method, body, *, epoch=None):
+        assert method == "grant_ai_controller_epoch"
+        self.grants += 1
+        if self.grants > 1:
+            raise RpcRefused("PERMISSION_DENIED", "the trader no longer accepts this key")
+        expires = self.clock.now() + dt.timedelta(seconds=60)
+        return {"epoch": 1, "lease_expires_at": expires.isoformat()}
+
+
+@pytest.mark.asyncio
+async def test_a_dead_renewal_loop_stops_the_service_loudly(rig, tmp_path, caplog):
+    caplog.set_level(logging.ERROR, logger="trader.ai.controller")
+    leadership = Leadership(supervisor=GrantThenRefuse(rig.clock), store=rig.store, clock=rig.clock,
+                            holder_id=new_holder_id())
+    assert await leadership.grant_once() == 1
+    controller = AiController(
+        config=ControllerConfig(heartbeat_path=str(tmp_path / "hb.json")), store=rig.store, clock=rig.clock,
+        supervisor=rig.trader, leadership=leadership, watch=rig.watch, submitter=rig.submitter,
+        outbox=ReportingOutbox(store=rig.store, journal=AttemptJournal(rig.store), supervisor=rig.trader,
+                               clock=rig.clock),
+        intake=rig.intake, slots=SessionSlots(), engine=rig.engine, gateway=FakeGateway(rig.clock))
+    stop = asyncio.Event()
+    await asyncio.wait_for(controller.run(stop), timeout=10)        # without the fix it never returns
+    assert stop.is_set() and "PERMISSION_DENIED" in caplog.text

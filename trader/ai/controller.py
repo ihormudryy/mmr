@@ -73,6 +73,17 @@ def validate_result(source_kind: str, result: Any) -> Optional[str]:
     return None
 
 
+def _stop_when_renewals_die(task: asyncio.Task, stop: asyncio.Event) -> None:
+    """Without renewals the epoch lapses and nothing is sent, while the heartbeat stays fresh.
+    Stop the service loudly instead, so it restarts as a new holder."""
+    if task.cancelled() or stop.is_set():
+        return
+    error = task.exception()
+    logger.error("controller epoch renewal stopped (%s); the ai service stops so it can restart",
+                 getattr(error, "code", None) or repr(error))
+    stop.set()
+
+
 def _write_atomically(path: str, text: str) -> None:
     temporary = Path(path).with_suffix(".tmp")
     temporary.write_text(text)
@@ -343,7 +354,9 @@ class AiController:
     async def run(self, stop: asyncio.Event) -> None:
         await self.start()
         cfg = self._config
-        loops = [asyncio.create_task(self._leadership.run_renewals(stop))]
+        renewals = asyncio.create_task(self._leadership.run_renewals(stop))
+        renewals.add_done_callback(lambda task: _stop_when_renewals_die(task, stop))
+        loops = [renewals]
         for seconds, step, name in ((cfg.experiment_poll_seconds, self.refresh_experiment, "experiment"),
                                     (cfg.signal_poll_seconds, self.tick_signals, "signals"),
                                     (SLOT_POLL_SECONDS, self.run_due_slots, "slots"),

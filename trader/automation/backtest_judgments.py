@@ -262,6 +262,10 @@ class BacktestJudgments:
             raise JudgmentRefused("CASE_CLAIM_UNKNOWN", "the trader holds no claim for this evaluation")
         if claim.state not in ("DONE", "FAILED"):
             raise JudgmentRefused("CASE_CLAIM_NOT_FINISHED", f"the evaluation is {claim.state}", retryable=True)
+        finished_as = "FAILED" if case.stage == "FAILED" else "DONE"
+        if claim.state != finished_as:
+            raise JudgmentRefused("CASE_CLAIM_MISMATCH", f"a {case.stage} case needs a {finished_as} claim, "
+                                                         f"the claim is {claim.state}")
         claimed = claim.body()
         same = (claim.strategy_key == case.strategy_key and claim.ny_day.isoformat() == case.claim_day
                 and _text([claimed.cohort, claimed.conids, claimed.bar_size])

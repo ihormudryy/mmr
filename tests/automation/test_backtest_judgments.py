@@ -187,6 +187,24 @@ def test_a_failed_evaluation_still_gets_a_verdict(tmp_path):                    
     assert (reply["status"], reply["verdict"], reply["cooldown_until_session"]) == ("RECORDED", "REJECT", "2026-10-22")
 
 
+def test_failed_claim_cannot_deploy_from_a_complete_signed_case(tmp_path):             # PR #93 round 1
+    w = world(tmp_path)
+    digest = finished(w, state="FAILED")                  # a passing COMPLETE case on a FAILED claim
+    reply = w.judgments.record(judgment(digest, "DEPLOY"))
+    assert (reply["status"], reply["code"]) == ("REFUSED", "CASE_CLAIM_MISMATCH")
+    assert count_judgments(w.db) == 0
+    assert claim_status(w, request_body(cohort=[{"RANGE_MINUTES": 45}])) == "ACCEPTED"     # no cooldown started
+
+
+def test_a_done_claim_cannot_carry_a_failed_stage_case(tmp_path):
+    w = world(tmp_path)
+    digest = finished(w, state="DONE", stage="FAILED")
+    reply = w.judgments.record(judgment(digest, "REJECT", menu=NO_DEPLOY_MENU))
+    assert (reply["status"], reply["code"], reply["cooldown_until_session"]) \
+        == ("REFUSED", "CASE_CLAIM_MISMATCH", None)
+    assert count_judgments(w.db) == 0
+
+
 def test_a_decision_time_ahead_of_the_trader_is_refused(tmp_path):
     w = world(tmp_path)
     reply = w.judgments.record(judgment(finished(w), "SHADOW", decided_at="2026-10-08T21:40:00+00:00"))

@@ -49,6 +49,8 @@
 20. **Replay.** The unit key is the judgment id. The case is recorded as `given:case`; the manifest holds code and config versions. A `NO_VERDICT` from a refusal before any send has no attempt and replays `INCOMPLETE` (as SP2's entry judge does).
 21. **Separate cycle table.** Research cycles live in `ai_research_cycles`, not `ai_cycles`: the entry and position slot code stays untouched.
 22. **The `ai` pass-through of a signal's deployment binding is Plan 2's** (its Task 10, Ruling 19: `decisions.ai_deployments` bracket, signal keys to ENTER fields). This plan only depends on it in the acceptance test.
+23. **A cap refusal closes only INITIAL candidates** (PR #91 thread 4218219455). `EVALUATION_LIMIT_REACHED` means the day's evaluation slots are used, so the cycle's other `NEW` INITIAL candidates are closed `NOT_SUBMITTED_EVALUATION_LIMIT_REACHED` without a call. A RENEWAL candidate (Plan 5) takes no slot (Plan 5 ruling 2), so the bulk close never touches it (`AND kind = 'INITIAL'`); only its own refusal or verdict ends a renewal.
+24. **A finished evaluation appears only after the trader closed its claim** (Plan 3 ruling 24). `get_evaluation` keeps saying `RUNNING` until the research service has the trader's confirmation of `DONE` / `FAILED`, so the pump judges nothing whose claim is still open. Plan 1's `CASE_CLAIM_NOT_FINISHED` (retryable, Ruling 10) stays as the safety net: `_record_decided` leaves the judgment `DECIDED` and sends the same body on the next pump.
 
 ## Cross-plan additions
 
@@ -76,7 +78,7 @@ Shapes this plan uses, as Plans 1–3 define them (the owner plan's shape wins).
 
 1. **A non-deployable case never offers DEPLOY, and a DEPLOY answer to it is `NO_VERDICT`, recorded, never attested.** → Task 5 `test_a_case_that_is_not_deployable_offers_no_deploy`, `test_deploy_off_the_menu_is_no_verdict`; Task 8 `test_rule_failure_reaches_jev_and_leaves_no_bundle`.
 2. **A DEPLOY missing any narrative field is `NO_VERDICT`; no attest, no register follows.** → Task 5 `test_deploy_missing_a_narrative_field_is_no_verdict`; Task 7 `test_no_verdict_is_recorded_and_never_attested`.
-3. **A lost reply never costs a second claim, judgment or version:** submit, record, attest and register resend the unchanged body (the research service answers `DUPLICATE` with the same request id on the same New York day). → Task 7 `test_lost_replies_resend_the_same_body`; Task 8 `test_a_lost_submit_reply_uses_one_claim`.
+3. **A lost reply never costs a second claim, judgment or version:** submit, record, attest and register resend the unchanged body (the research service answers `DUPLICATE` with the same request id on the same New York day). → Task 7 `test_lost_replies_resend_the_same_body`; Task 8 `test_a_lost_submit_reply_uses_one_claim`, `test_a_lost_terminal_claim_update_is_sent_again_and_the_judgment_records` (a lost `DONE` report to the trader does not strand the judgment).
 4. **Model text chooses no id, conid, file, limit or cooldown:** off-menu, undeclared or wrongly typed parts are dropped, and the thesis never reaches Jev. → Task 4 `test_screen_drops_what_is_not_on_the_menu`; Task 7 `test_jev_prompt_has_code_facts_only`.
 5. **Research never runs in session hours, and a restart never asks Jev twice for one case.** → Task 1 `test_research_window_is_closed_during_the_session`; Task 7 `test_pump_does_nothing_inside_the_session`, `test_restart_mid_judgment_records_no_verdict`.
 
@@ -2137,7 +2139,8 @@ def registration_body(binding: Binding, *, judgment_id: str, bundle_digest: str)
                 self._cool_in_tx(conn, strategy_key, f"{session:%Y-%m-%d}", "CLAIM_REFUSED")
             if code == "EVALUATION_LIMIT_REACHED":                       # the day is full: the rest would be refused
                 conn.execute("UPDATE ai_research_candidates SET state = 'CLOSED', end_code = ?, updated_at = ? "
-                             "WHERE cycle_id = ? AND state = 'NEW'", [f"NOT_SUBMITTED_{code}", now, cycle_id])
+                             "WHERE cycle_id = ? AND state = 'NEW' AND kind = 'INITIAL'",   # Ruling 23
+                             [f"NOT_SUBMITTED_{code}", now, cycle_id])
         await self._store.atransaction(work)
 
     # poll -------------------------------------------------------------------------------------------
@@ -2380,7 +2383,7 @@ and pass `research=research` to `AiController`. In `tests/ai/runtime/test_contro
 
 **Interfaces:**
 - Consumes: SP1's `served_stack` and SP2's `TraderWorld` / `DecisionNode` (real coordinator, risk gates, ownership, BrokerSim); Plan 3's research parts; Plan 2's `StrategyNode` and `ai` pass-through; `tests/research/evaluation_fixtures.py` (`TIME_OF_DAY_STRATEGY`, `write_trend_bars`, `write_costs_config`, `holdout_ruleset`, `judge_qualified_evidence_by_holdout_ruleset`); Tasks 1–7.
-- Produces: `ResearchWorld.build(tmp_path, loop_thread, monkeypatch, *, holdout_drift=None, flaky_lab=False)` (async) with `.world`, `.node`, `.cycle`, `.strategy`, `night()`, `next_morning(hour, minute)`, `morning_bar(conid)`, `node_rows(sql)`, `trader_rows(sql)`, `trader_call(principal, method, body)`, `research_client(principal, role)`, `lab_socket(role)`, `reviews()`, `bundles()`, `strategy_trials()`, `close()`.
+- Produces: `ResearchWorld.build(tmp_path, loop_thread, monkeypatch, *, holdout_drift=None, flaky_lab=False)` (async) with `.world`, `.node`, `.cycle`, `.strategy`, `.evaluations` (Plan 3's `EvaluationService`), `.trader_port` (the research service's `TraderPort`, so a test can lose one of its calls), `night()`, `next_morning(hour, minute)`, `morning_bar(conid)`, `node_rows(sql)`, `trader_rows(sql)`, `trader_call(principal, method, body)`, `research_client(principal, role)`, `lab_socket(role)`, `reviews()`, `bundles()`, `strategy_trials()`, `close()`.
 
 **The world, in words.** One served SP1 trader whose test `trader.yaml` holds `ai_paper.backtest_judge.strategy_allowlist: ["strategies/time_of_day.py:TimeOfDay"]` and the research signer's public key in `keys/verify/`. A research server built from Plan 3's parts on its own `Sockets({("research", "command"): registry, ("research", "query"): registry}, served.identities)` with `registry = build_research_registry(evaluations=..., attest=...)` (Plan 3: one registry for both roles): `ResearchStore`, `TraderPort` over `served.sockets.client("research", "trader", ...)`, `EvaluationService(..., build_spec=build_cohort_spec(..., config=ResearchServiceConfig(period_sessions=40, folds=2, embargo_sessions=1, holdout_sessions=5), judge=BacktestJudgeConfig(strategy_allowlist=(KEY,))), evaluate=evaluate_cohort(..., ruleset=holdout_ruleset()))`, `JudgmentAttest(..., ruleset=holdout_ruleset(), is_paper=lambda: True)`. `judge_qualified_evidence_by_holdout_ruleset(monkeypatch)` makes the trader's bundle gate demand the same rule subset; every other check runs for real. One `DecisionNode` whose `ai.yaml` adds the research block below and Plan 2's `decisions.ai_deployments` bracket, with a `ResearchCycle` whose `lab` is `PrincipalClient("ai_research", command=lab_socket("command"), query=lab_socket("query"), commands=LAB_COMMANDS, queries=LAB_QUERIES, timeout=30.0, unreachable_code="RESEARCH_UNREACHABLE")` and whose `registry` is `node.node.clients.research`. Plan 2's `StrategyNode(served, strategies_dir=repo / "strategies")`. The universe is `RESEARCH_CONIDS = (CONID, MSFT, 1003, 1004, 1005, 1006, 1007, 1008)`: eight conids for the evaluator, two of them quoted by BrokerSim and admitted by the trader, so the later ENTER on `CONID` is real. Bars: `write_trend_bars(history, drift=0.0006, start="2026-05-01", end="2026-07-16", conids=RESEARCH_CONIDS, holdout_drift=holdout_drift)` (15-minute bars plus SPY). Time: the stack is built with `served_stack(..., start=et(16, 31))`, Friday 2026-07-17 after the close (the research service sets `research_day` = 2026-07-17), so `night()` needs no jump. `next_morning(10, 1)` moves to Monday 2026-07-20 10:01 with `served.run_session(at)` (SP1's session step), and `morning_bar(conid)` is the accumulated 15-minute frame whose last bar is labelled 10:00 New York: `TimeOfDay` reads that label, and the signal (`signal_time` = the label) is 60 s old, fresh within `signal_max_age_seconds` (300).
 
@@ -2396,7 +2399,7 @@ DEPLOY_PROPOSAL = json.dumps({"candidates": [{"strategy": "S1", "universe": "U1"
                                               "points": [{}], "thesis": "morning drift"}]})
 ```
 
-`night()`: `await cycle.run_due_slot()`, then up to 20 rounds of `await cycle.pump(); evaluations.run_next(); world.served.advance(31)` until a round changes no row in the four research tables. The other helpers are one-liners over `node.node.store.db`, `world.served.trader.journal_db`, `world.served.call`, the research `Sockets` and the research DB (`operator_reviews`, `<artifacts>/sha256_*`, `strategy_trials(...)` of `KEY`).
+`night()`: `await cycle.run_due_slot()`, then up to 20 rounds of `await cycle.pump(); moved = evaluations.run_next(); world.served.advance(31)` until a round changes no row in the four research tables and `moved` is false (`run_next` is the research service's tick: it also sends owed claim reports, Plan 3 ruling 24). The other helpers are one-liners over `node.node.store.db`, `world.served.trader.journal_db`, `world.served.call`, the research `Sockets` and the research DB (`operator_reviews`, `<artifacts>/sha256_*`, `strategy_trials(...)` of `KEY`).
 
 - [ ] **Step 1: Write the failing tests**
 
@@ -2416,6 +2419,7 @@ from trader.ai.replay import COMPLETE, ExternalAdapterCounter
 from trader.ai.research_roles import BACKTEST_MARKER, RESEARCH_MARKER
 from trader.ai.roles import JEV_MARKER
 from trader.messaging.typed_rpc import TypedRpcRemoteError
+from trader.research.trader_port import TraderUnavailable
 
 pytestmark = pytest.mark.timeout(300)
 
@@ -2488,6 +2492,29 @@ async def test_a_lost_submit_reply_uses_one_claim(tmp_path, loop_thread, monkeyp
         rw.lab_socket("command").script("submit_evaluation", "lose_reply")
         await rw.night()
         assert rw.trader_rows("SELECT COUNT(*) FROM evaluation_claims") == [(1,)]
+        assert rw.node_rows("SELECT verdict, state FROM ai_backtest_judgments") == [("SHADOW", "RECORDED")]
+    finally:
+        rw.close()
+
+
+@pytest.mark.asyncio
+async def test_a_lost_terminal_claim_update_is_sent_again_and_the_judgment_records(tmp_path, loop_thread,
+                                                                                    monkeypatch):  # PR #91 4218218688
+    rw = await ResearchWorld.build(tmp_path, loop_thread, monkeypatch)
+    try:
+        rw.node.orchestrator.script(RESEARCH_MARKER, DEPLOY_PROPOSAL)
+        rw.node.jev.script(BACKTEST_MARKER, ruling("SHADOW"))
+        send, lost = rw.trader_port.update_claim, []
+
+        def lose_the_first_end(request_id, state):
+            if state in ("DONE", "FAILED") and not lost:
+                lost.append(state)
+                raise TraderUnavailable("update_claim: request lost")       # never reaches the trader
+            return send(request_id, state)
+        monkeypatch.setattr(rw.trader_port, "update_claim", lose_the_first_end)
+        await rw.night()                                                   # both services up, no restart
+        assert lost == ["DONE"]
+        assert rw.trader_rows("SELECT state FROM evaluation_claims") == [("DONE",)]
         assert rw.node_rows("SELECT verdict, state FROM ai_backtest_judgments") == [("SHADOW", "RECORDED")]
     finally:
         rw.close()

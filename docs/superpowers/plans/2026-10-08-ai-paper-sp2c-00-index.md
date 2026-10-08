@@ -26,7 +26,7 @@ Plans 1 and 3's service skeleton can start in parallel; each plan is one PR.
 |----------|--------|--------|--------|--------|-------------------|
 | Trader journal (SP1/SP2 use ≤ 100) | 110 `evaluation_claims`, 111 `backtest_judgments` (112–114 free) | 115 `ai_deployment_versions`, 116 `ai_deployment_withdrawals` (117–119 free; edits SP1's 56 in place) | 120 `shadow_results` (121–124 free) | — | 125 `renewal_judgments` (126–129 free) |
 | `ai.duckdb` (SP2 uses 1–22) | — | — (edits SP2's migration 14 in place) | — | 30–34 (35–39 free) | — (40–49 stay free; Plan 4's tables already hold RENEWAL rows) |
-| Research DB (today ≤ 11) | — | — | 20 `research_requests`, 21 `research_cases`, 22 `shadow_members`, `shadow_sent` | — | — (a renewal request is a `research_requests` row) |
+| Research DB (today ≤ 11) | — | — | 20 `research_requests`, 21 `research_cases`, 22 `shadow_members`, `shadow_sent`, `shadow_failures` (and `research_requests.pending_report` in 20) | — | — (a renewal request is a `research_requests` row) |
 
 No number is used twice. No legacy data (owner rule): edit CREATEs in place, no ALTER/backfill.
 

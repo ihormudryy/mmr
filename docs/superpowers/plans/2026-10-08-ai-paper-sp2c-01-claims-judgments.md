@@ -37,12 +37,13 @@
 6. **Forward-only states.** Rank `QUEUED (0) < RUNNING (1) < DONE = FAILED (2)`. A move to a higher rank is `UPDATED`; the same state is `UNCHANGED`; anything else (back, or `DONE`↔`FAILED`) is `CLAIM_STATE_BACKWARD`. `QUEUED → DONE` is allowed (a lost `RUNNING` update must not block the end). *Cost if wrong:* a stricter chain would strand a claim whose `RUNNING` reply was lost.
 7. **Cooldown on the judgment row.** A REJECT (INITIAL or RENEWAL) stores `cooldown_until_session` = the N-th XNYS session strictly after the trader's New York day at recording, N = `family_cooldown_sessions` at that moment. A strategy key cools down while today's New York day ≤ the latest such session. One query, no second table, and a later config edit never shortens a running cooldown. *Cost if wrong:* the caller's `decided_at` cannot backdate a cooldown; a judgment recorded just after midnight starts one day later.
 8. **Judgment checks.** The trader loads and verifies the case from `artifacts/cases/`, then requires: judgment kind = case kind; `decided_at` not more than 5 minutes ahead of the trader clock; `menu` exactly equal to the menu the case offers (`["DEPLOY","SHADOW","REJECT"]` only for a qualifying case, else `["SHADOW","REJECT"]`); for INITIAL a claim that is `DONE` or `FAILED`, has the same strategy key, cohort, conids, bar size and day, and was claimed before `decided_at`. One judgment per case and one per evaluation (request id): same id and same body → `EXISTING`; same id with another body, or another id for the same case or evaluation → `JUDGMENT_CONFLICT`. The body digest normalises `decided_at` to UTC, so a respelled retry is `EXISTING`. *Cost if wrong:* without the claim match a stray signed case could be judged outside any counted evaluation.
-9. **Rules first is structural.** "Qualifying" for INITIAL means: stage `COMPLETE`, `decision_state == "PAPER_ELIGIBLE"`, `ruleset_digest == PAPER_V1.digest`, and exactly the paper-v1 rule codes, all passed (the check `paper_materials.py` already uses). A DEPLOY on anything else fails the menu check; `DEPLOY_NOT_ALLOWED` stays as a second guard. *Cost if wrong:* a looser check would let a controller bug offer DEPLOY to a failing case.
+9. **Rules first is structural.** "Qualifying" for INITIAL means: stage `COMPLETE`, `holdout_passed is True`, `decision_state == "PAPER_ELIGIBLE"`, `ruleset_digest == PAPER_V1.digest`, and exactly the paper-v1 rule codes, all passed (the check `paper_materials.py` already uses). A DEPLOY on anything else fails the menu check; `DEPLOY_NOT_ALLOWED` stays as a second guard. *Cost if wrong:* a looser check would let a controller bug offer DEPLOY to a failing case.
 10. **Judgments carry `jev_model`.** Spec 5.1 `attest_from_judgment` writes `reviewer = <Jev model id>#<judgment id>` from the trader's record, so the body needs the model id. Added to the spec's body list. *Cost if wrong:* Plan 3 would have to trust the caller for the reviewer name.
 11. **Renewal and forward evidence wait for Plan 5 (Renewal).** `record_backtest_judgment` asks a `RenewalChecks` port about a RENEWAL case; the Plan 1 default refuses every RENEWAL with `RENEWAL_NOT_SUPPORTED`. `get_deployment_forward_evidence` is registered with its ACL row, wire model and handler over a `ForwardEvidenceSource` port; the Plan 1 default refuses with `DEPLOYMENT_VERSION_UNKNOWN`. Plan 5 supplies both real ports (over Plan 2's versions, paper trips and bundle expiry, and Plan 3's `shadow_results` rows). *Cost if wrong:* if the owner wants these inside Plan 5 entirely, delete the two ports and one handler here.
 12. **Minimal `research` principal.** Plan 1 adds `research` only as a caller of the trader (see Cross-plan additions). The trader container must then bind `research.pub`, so **the operator runs `./docker.sh -k` before deploying this plan** (`docker.sh` refuses to start while a bound key file is missing). *Cost if wrong:* none in code; the deploy fails loudly until the key exists.
 13. **Judgments are sealed.** Each row stores a record digest over all its fields (domain `mmr.backtest-judgment.v1`); every read recomputes it. An edited row reads as `JUDGMENT_TAMPERED`, never as missing. *Cost if wrong:* an edited verdict could feed Plan 2's registration unnoticed.
 14. **Case keys.** Any `*.pem` in `~/.config/mmr/keys/verify/` is trusted (spec 5.2 item 2), loaded through `load_verify_key`, which refuses an RPC identity key. Keys load on every `record` call (rotation needs no restart). One unreadable `.pem` refuses the call (`CASE_VERIFY_KEYS_UNREADABLE`); no keys → `CASE_VERIFY_KEYS_MISSING`. A symlinked case file is `CASE_NOT_FOUND`. *Cost if wrong:* one broken `.pem` stops all judgments until the operator fixes it (the loud, safe side).
+15. **The holdout result is a typed header field** (PR #91 thread 4218218927). `holdout_passed: bool | None` is set by the code that ran the holdout and is bound to the stage by the model: INITIAL `COMPLETE` needs `True`, `HOLDOUT_FAILED` needs `False`, `PRE_HOLDOUT_FAILED` and `FAILED` need `None`; every RENEWAL needs `None`. So a signed case that says `COMPLETE`, `PAPER_ELIGIBLE` and all rules passed but whose holdout failed cannot load (`CASE_MALFORMED`), and `initial_deploy_allowed` checks the field again. The trader no longer has to trust that the stage string and the holdout agree. *Cost if wrong:* none; Plan 3 already knows the holdout result when it builds the case.
 
 ## Cross-plan additions
 
@@ -62,7 +63,7 @@ Plans 2, 3 and 4 use these exact names.
 **Evaluation request (`trader/research/evaluation_request.py`):** `EvaluationRequestBody` = `{strategy_key: str, cohort: list[dict[str, bool|int|float|str]] (1-10 points, distinct, UPPER_CASE names), conids: list[int] (1-20, strictly increasing), bar_size: str (≤ 15 mins), research_day: str (YYYY-MM-DD)}`; `evaluation_request_id(body) -> "sha256:<hex>"`; `canonical_request_json(body) -> str`; `EVALUATION_REQUEST_DOMAIN = "mmr.research.evaluation-request.v1"`, `REQUEST_ID`, `MAX_COHORT_POINTS_LIMIT = 10`, `check_params`, `check_conids`, `check_bar_size`. Plan 3's `submit_evaluation` takes this body.
 
 **Evaluation case (`trader/research/evaluation_case.py`):**
-- `EvaluationCase` fields: `schema_version: "mmr.research.evaluation-case.v1"`, `kind: "INITIAL"|"RENEWAL"`, `request_id: str|None` (INITIAL only), `claim_day: str|None` (INITIAL only), `strategy_key`, `strategy_file_hash: "sha256:<hex>"`, `cohort` (RENEWAL: exactly `[selected_params]`), `conids`, `bar_size`, `stage: "PRE_HOLDOUT_FAILED"|"HOLDOUT_FAILED"|"COMPLETE"|"FAILED"` (INITIAL) or `"FORWARD_COMPLETE"|"FORWARD_INCOMPLETE"` (RENEWAL), `selected_params`, `family_id`, `selected_trial_id`, `artifact_id`, `eligibility_decision_digest`, `decision_state`, `ruleset_digest` (all `str|None`; required for `COMPLETE` and `HOLDOUT_FAILED`; `artifact_id` null for `PRE_HOLDOUT_FAILED`), `final_rule_results: list[{code: str, passed: bool}]` (the selected point's full paper-v1 decision; empty without a holdout), `renewal: {prior_deployment_version: "sha256:<hex>", forward_sessions: int, incomplete_sessions: int}|None`, `created_at: str` (aware), `evidence: dict` (Plan 3's detail; signed, not read by the trader).
+- `EvaluationCase` fields: `schema_version: "mmr.research.evaluation-case.v1"`, `kind: "INITIAL"|"RENEWAL"`, `request_id: str|None` (INITIAL only), `claim_day: str|None` (INITIAL only), `strategy_key`, `strategy_file_hash: "sha256:<hex>"`, `cohort` (RENEWAL: exactly `[selected_params]`), `conids`, `bar_size`, `stage: "PRE_HOLDOUT_FAILED"|"HOLDOUT_FAILED"|"COMPLETE"|"FAILED"` (INITIAL) or `"FORWARD_COMPLETE"|"FORWARD_INCOMPLETE"` (RENEWAL), `holdout_passed: bool|None` (ruling 15: `True` exactly for `COMPLETE`, `False` exactly for `HOLDOUT_FAILED`, `null` for `PRE_HOLDOUT_FAILED`, `FAILED` and every RENEWAL; Plan 3 sets it from its holdout outcome, Plan 5's renewal case sets `null`), `selected_params`, `family_id`, `selected_trial_id`, `artifact_id`, `eligibility_decision_digest`, `decision_state`, `ruleset_digest` (all `str|None`; required for `COMPLETE` and `HOLDOUT_FAILED`; `artifact_id` null for `PRE_HOLDOUT_FAILED`), `final_rule_results: list[{code: str, passed: bool}]` (the selected point's full paper-v1 decision; empty without a holdout), `renewal: {prior_deployment_version: "sha256:<hex>", forward_sessions: int, incomplete_sessions: int}|None`, `created_at: str` (aware), `evidence: dict` (Plan 3's detail; signed, not read by the trader).
 - File `artifacts/cases/sha256_<hex>.json` holds the canonical JSON of `{"case": <body>, "case_digest": "sha256:<hex>", "public_key_id": "ed25519-...", "signature": "<urlsafe b64>"}`. Digest and signature cover the same bytes: `b"mmr.research.evaluation-case.v1\n" + canonical_json_bytes(body)`.
 - Functions: `case_digest(body) -> str`, `case_path(cases_dir, digest) -> Path`, `write_evaluation_case(cases_dir, case, signer: AttestationSigner) -> str`, `load_case_verify_keys(verify_dir) -> dict[str, Ed25519PublicKey]`, `load_verified_case(cases_dir, digest, keys) -> EvaluationCase`, `initial_deploy_allowed(case)`, `renewal_forward_complete(case)`, `offered_menu(case) -> tuple[str, ...]`, `FULL_MENU = ("DEPLOY","SHADOW","REJECT")`, `NO_DEPLOY_MENU = ("SHADOW","REJECT")`, `default_cases_dir()`, `default_verify_dir()`. `CaseRefused(code, detail)` codes: `CASE_DIGEST_INVALID`, `CASE_NOT_FOUND`, `CASE_MALFORMED`, `CASE_DIGEST_MISMATCH`, `CASE_KEY_UNKNOWN`, `CASE_SIGNATURE_INVALID`, `CASE_VERIFY_KEYS_MISSING`, `CASE_VERIFY_KEYS_UNREADABLE`, `CASE_EXISTS_DIFFERENT`.
 
@@ -81,7 +82,7 @@ Plans 2, 3 and 4 use these exact names.
 1. **Two concurrent claims for the last slot of a New York day** must give exactly one `ACCEPTED` and one `EVALUATION_LIMIT_REACHED`, and the row count must equal the cap. → Task 3 `test_two_concurrent_claims_for_the_last_slot_accept_exactly_one`; Task 6 `test_two_concurrent_claims_for_the_last_slot_over_rpc_accept_exactly_one`.
 2. **A claim reply lost after the trader committed** must read back as the same `QUEUED` claim, and the retry must return `EXISTING` without a second slot, even when the cap is full. → Task 6 `test_a_lost_reply_after_acceptance_is_read_back_and_never_takes_a_second_slot`; Task 3 `test_a_retry_with_the_same_body_returns_the_claim_and_takes_no_slot`.
 3. **A judgment retry that only respells `decided_at`** (`Z`, `+00:00`, `-04:00`) must be `EXISTING`; another body under the same id, or another id for the same case or evaluation, must be `JUDGMENT_CONFLICT`. → Task 4 `test_a_retry_that_only_respells_the_decided_time_is_the_same_judgment`, `test_one_judgment_per_case_and_per_evaluation`.
-4. **A DEPLOY on a rule-failing, tampered, foreign-signed or missing case** must be refused with nothing written and no cooldown. → Task 4 `test_rules_first_a_rule_failing_case_is_never_deployed`, `test_a_tampered_foreign_or_missing_case_records_nothing`.
+4. **A DEPLOY on a rule-failing, holdout-failed, tampered, foreign-signed or missing case** must be refused with nothing written and no cooldown. A signed case that claims `COMPLETE` while its holdout failed must not load. → Task 4 `test_rules_first_a_rule_failing_case_is_never_deployed`, `test_a_tampered_foreign_or_missing_case_records_nothing`, `test_a_signed_complete_case_whose_holdout_failed_is_never_deployed`.
 5. **A caller outside a method's row** must get `PERMISSION_DENIED` at the real signed server, and also from the handler behind an open allow-list; `research` holds no other trader right. → Task 6 `test_every_method_is_refused_for_every_caller_outside_its_row`, `test_each_handler_refuses_a_wrong_caller_even_behind_an_open_allow_list`; Task 5 `test_research_has_no_trading_policy_or_decision_right`.
 
 ## File map
@@ -410,11 +411,15 @@ def failed_results() -> list[dict]:
     return results
 
 
+HOLDOUT_BY_STAGE = {"COMPLETE": True, "HOLDOUT_FAILED": False}     # ruling 15; every other stage: None
+
+
 def case_body(body: EvaluationRequestBody, *, stage: str = "COMPLETE", **changes) -> dict:
     raw = {"schema_version": CASE_DOMAIN, "kind": "INITIAL", "request_id": evaluation_request_id(body),
            "claim_day": "2026-10-08", "strategy_key": body.strategy_key, "strategy_file_hash": FILE_HASH,
            "cohort": [dict(point) for point in body.cohort], "conids": list(body.conids),
-           "bar_size": body.bar_size, "stage": stage, "selected_params": dict(body.cohort[0]),
+           "bar_size": body.bar_size, "stage": stage, "holdout_passed": HOLDOUT_BY_STAGE.get(stage),
+           "selected_params": dict(body.cohort[0]),
            "family_id": "fam-1", "selected_trial_id": "trial-1", "artifact_id": "art-1",
            "eligibility_decision_digest": "d" * 64, "decision_state": "PAPER_ELIGIBLE",
            "ruleset_digest": PAPER_V1.digest, "final_rule_results": passing_results(), "renewal": None,
@@ -469,8 +474,8 @@ from tests.automation.backtest_judge_fixtures import (
     ZERO, case_body, case_keys, failed_results, make_case, renewal_case_body, request_body,
 )
 from trader.research.evaluation_case import (
-    FULL_MENU, NO_DEPLOY_MENU, CaseRefused, EvaluationCase, case_path, load_case_verify_keys,
-    load_verified_case, offered_menu, write_evaluation_case,
+    FULL_MENU, NO_DEPLOY_MENU, CaseRefused, EvaluationCase, case_path, initial_deploy_allowed,
+    load_case_verify_keys, load_verified_case, offered_menu, write_evaluation_case,
 )
 from trader.research.evaluation_request import evaluation_request_id
 from trader.research.signing import AttestationSigner
@@ -577,7 +582,22 @@ def test_only_a_complete_case_with_every_paper_v1_rule_passed_offers_deploy():
     assert offered_menu(EvaluationCase.model_validate(incomplete)) == NO_DEPLOY_MENU
 
 
+def test_deploy_needs_the_typed_holdout_result_too():                                 # ruling 15
+    unchecked = make_case().model_copy(update={"holdout_passed": False})            # skips validation on purpose
+    assert initial_deploy_allowed(unchecked) is False and offered_menu(unchecked) == NO_DEPLOY_MENU
+    assert make_case().holdout_passed is True
+    assert make_case(stage="HOLDOUT_FAILED", decision_state="CANDIDATE").holdout_passed is False
+    assert make_case(stage="PRE_HOLDOUT_FAILED").holdout_passed is None
+    assert EvaluationCase.model_validate(renewal_case_body()).holdout_passed is None
+    with pytest.raises(ValidationError):
+        EvaluationCase.model_validate(renewal_case_body(holdout_passed=True))       # a renewal opens no holdout
+
+
 @pytest.mark.parametrize("changes", [
+    {"holdout_passed": False},                                 # COMPLETE needs a passed holdout
+    {"holdout_passed": None},
+    {"stage": "HOLDOUT_FAILED", "holdout_passed": True},       # HOLDOUT_FAILED needs a failed holdout
+    {"stage": "PRE_HOLDOUT_FAILED", "holdout_passed": False},  # no holdout ran: no result
     {"stage": "PRE_HOLDOUT_FAILED", "artifact_id": "art-1"},  # a pre-holdout failure seals no artifact
     {"artifact_id": None},                                     # a sealed case names its artifact
     {"request_id": None},                                      # an INITIAL case names its claim
@@ -750,6 +770,7 @@ from trader.research.strategy_key import is_strategy_key
 
 CASE_DOMAIN = "mmr.research.evaluation-case.v1"
 INITIAL_STAGES = ("PRE_HOLDOUT_FAILED", "HOLDOUT_FAILED", "COMPLETE", "FAILED")
+HOLDOUT_RESULT_BY_STAGE = {"COMPLETE": True, "HOLDOUT_FAILED": False, "PRE_HOLDOUT_FAILED": None, "FAILED": None}
 RENEWAL_STAGES = ("FORWARD_COMPLETE", "FORWARD_INCOMPLETE")
 FULL_MENU = ("DEPLOY", "SHADOW", "REJECT")
 NO_DEPLOY_MENU = ("SHADOW", "REJECT")
@@ -801,6 +822,7 @@ class EvaluationCase(_Strict):
     bar_size: str
     stage: Literal["PRE_HOLDOUT_FAILED", "HOLDOUT_FAILED", "COMPLETE", "FAILED",
                    "FORWARD_COMPLETE", "FORWARD_INCOMPLETE"]
+    holdout_passed: Optional[bool]
     selected_params: Optional[dict[str, ParamValue]]
     family_id: Optional[str]
     selected_trial_id: Optional[str]
@@ -852,12 +874,16 @@ class EvaluationCase(_Strict):
             raise ValueError("a case that opened its holdout names its artifact, decision and rule results")
         if self.stage == "PRE_HOLDOUT_FAILED" and (self.artifact_id is not None or self.final_rule_results):
             raise ValueError("a pre-holdout failure seals no artifact")
+        if self.holdout_passed is not HOLDOUT_RESULT_BY_STAGE[self.stage]:
+            raise ValueError(f"stage {self.stage} needs holdout_passed {HOLDOUT_RESULT_BY_STAGE[self.stage]}")
 
     def _renewal_shape(self) -> None:
         if self.stage not in RENEWAL_STAGES or self.renewal is None:
             raise ValueError("a RENEWAL case has a forward stage and renewal facts")
         if self.request_id is not None or self.claim_day is not None:
             raise ValueError("a RENEWAL case has no evaluation claim")
+        if self.holdout_passed is not None:
+            raise ValueError("a RENEWAL case opens no holdout")
         if self.selected_params is None or self.cohort != [self.selected_params]:
             raise ValueError("a RENEWAL case names exactly its deployed parameters")
 
@@ -865,7 +891,7 @@ class EvaluationCase(_Strict):
 def initial_deploy_allowed(case: EvaluationCase) -> bool:
     """Rules first: complete, a passed holdout and every paper-v1 rule passed."""
     results = case.final_rule_results
-    return (case.kind == "INITIAL" and case.stage == "COMPLETE"
+    return (case.kind == "INITIAL" and case.stage == "COMPLETE" and case.holdout_passed is True
             and case.decision_state == STATE_PAPER_ELIGIBLE and case.ruleset_digest == PAPER_V1.digest
             and len(results) == len(PAPER_V1.rules) and {r.code for r in results} == PAPER_V1_CODES
             and all(r.passed for r in results))
@@ -1465,7 +1491,8 @@ from trader.automation.backtest_judge_wire import NARRATIVE_FIELDS, RecordBackte
 from trader.automation.backtest_judgments import BacktestJudgments
 from trader.automation.calendar_policy import XNYSCalendarPolicy
 from trader.automation.evaluation_claims import EvaluationClaims
-from trader.research.evaluation_case import FULL_MENU, write_evaluation_case
+from trader.research.canonical import canonical_json_bytes
+from trader.research.evaluation_case import FULL_MENU, case_digest, case_path, write_evaluation_case
 
 NARRATIVE = {name: f"{name} written by Jev" for name in NARRATIVE_FIELDS}
 
@@ -1505,6 +1532,18 @@ def judgment(case_digest: str, verdict: str = "REJECT", menu=FULL_MENU, **change
 
 def count_judgments(db: DuckDBConnection) -> int:
     return db.execute("SELECT COUNT(*) FROM backtest_judgments", fetch="one")[0]
+
+
+def write_unchecked_case(cases_dir: Path, body: dict, signer: AttestationSigner) -> str:
+    """Sign a raw case body without the model (a buggy or hostile signer); return its digest."""
+    digest = case_digest(body)
+    message = CASE_DOMAIN.encode("utf-8") + b"\n" + canonical_json_bytes(body)
+    envelope = {"case": body, "case_digest": digest, "public_key_id": signer.public_key_id,
+                "signature": signer.sign_message(message)}
+    path = case_path(cases_dir, digest)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_bytes(canonical_json_bytes(envelope))
+    return digest
 ```
 
 - [ ] **Step 2: Write the failing tests** (`tests/automation/test_backtest_judgments.py`)
@@ -1520,8 +1559,8 @@ import pytest
 from pydantic import ValidationError
 
 from tests.automation.backtest_judge_fixtures import (
-    FILE_HASH, NARRATIVE, VERSION, World, count_judgments, failed_results, finished, judge_config, judgment,
-    make_case, renewal_case_body, request_body, world,
+    FILE_HASH, NARRATIVE, VERSION, World, case_body, count_judgments, failed_results, finished, judge_config,
+    judgment, make_case, renewal_case_body, request_body, world, write_unchecked_case,
 )
 from trader.automation.backtest_judgments import (
     BacktestJudgments, JudgmentRefused, RenewalStatus, nth_session_after,
@@ -1558,6 +1597,22 @@ def test_rules_first_a_rule_failing_case_is_never_deployed(tmp_path):           
         assert w.judgments.record(request)["code"] == "JUDGMENT_MENU_MISMATCH"
     assert count_judgments(w.db) == 0
     assert w.judgments.record(judgment(digest, "SHADOW", menu=NO_DEPLOY_MENU))["status"] == "RECORDED"
+
+
+def test_a_signed_complete_case_whose_holdout_failed_is_never_deployed(tmp_path):  # review focus 4, ruling 15
+    w = world(tmp_path)
+    body = request_body()
+    w.claims.claim(evaluation_request_id(body), body, principal="research")
+    w.claims.update(evaluation_request_id(body), "DONE")
+    lying = case_body(body, holdout_passed=False)        # COMPLETE, PAPER_ELIGIBLE, every paper-v1 rule passed
+    with pytest.raises(ValidationError):
+        EvaluationCase.model_validate(lying)
+    digest = write_unchecked_case(w.keys.cases_dir, lying, w.keys.signer)
+    for verdict in ("DEPLOY", "SHADOW"):
+        reply = w.judgments.record(judgment(digest, verdict))
+        assert (reply["status"], reply["code"]) == ("REFUSED", "CASE_MALFORMED")
+    assert count_judgments(w.db) == 0 and w.judgments.get_by_case(digest) is None    # no DEPLOY row, ever
+    assert claim_status(w, request_body(cohort=[{"RANGE_MINUTES": 45}])) == "ACCEPTED"     # no cooldown started
 
 
 def test_a_pre_holdout_failure_reaches_jev_for_shadow_or_reject(tmp_path):

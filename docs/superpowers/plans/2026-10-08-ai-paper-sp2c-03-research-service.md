@@ -13,7 +13,7 @@
 ## Global Constraints
 
 - **Base:** master after SP2c Plan 1 (claims, judgments, config, the request and case modules) and Plan 2 (deployment versions). Task 9 touches no Plan 1 name and can start first; every other task needs Plan 1's modules or its `research` principal entries; Task 10 also needs Plan 2's `version_for_judgment`. Task 11's shadow discovery reads Plan 1's `get_backtest_judgment` by `case_digest`.
-- **Migrations.** Trader journal: **120** (`shadow_results`) in `trader/scoreboard/schema.py`; 121–124 stay unused. Research DB: **20** (`research_requests`), **21** (`research_cases`), **22** (`shadow_members`, `shadow_sent`) in the research schema's own style (`migrator.apply(version=..., name=..., statements=...)`), called from `apply_research_migrations`. No ALTER, no backfill (owner: no legacy data).
+- **Migrations.** Trader journal: **120** (`shadow_results`) in `trader/scoreboard/schema.py`; 121–124 stay unused. Research DB: **20** (`research_requests`), **21** (`research_cases`), **22** (`shadow_members`, `shadow_sent`, `shadow_failures`) in the research schema's own style (`migrator.apply(version=..., name=..., statements=...)`), called from `apply_research_migrations`. No ALTER, no backfill (owner: no legacy data).
 - **Principals.** Plan 1 adds a minimal `research` entry for its trader methods. This plan extends it to the full spec 5.1 identity. Keep one copy of every entry; never re-add what Plan 1 already wrote.
 - **Wire models:** `ConfigDict(extra="forbid", strict=True)`. Ids are regex-checked. Refusals are reply bodies (`status: "REFUSED"`, `code`, `detail`), never raised errors (a raised error becomes a scrubbed `INTERNAL_ERROR`).
 - **Every handler re-checks its principal** (`with_caller=True`), as `ai_paper_actions.py` does. The allow-list is not the authority; the handler is.
@@ -48,7 +48,10 @@
 19. **A runtime failure** after an accepted claim (bars unreadable, backtest error, changed file, the holdout re-check) signs a case with stage `FAILED` and a class-name summary in `evidence.error`, and moves the claim to `FAILED`. Terminal trials stay counted.
 20. **One evaluation at a time**, queue bounded by `queue_max`; a full queue refuses `QUEUE_FULL` **before** the claim.
 21. **Executing file hash** = `"sha256:" + sha256(exact file bytes)` at submit (`strategy_file_hash`); a different hash when the run starts → stage `FAILED`, `STRATEGY_SOURCE_CHANGED`.
-22. **A HOLDOUT_FAILED case names the decision without recording it.** The evaluator records no eligibility decision for a failed holdout (a retired artifact is never attested), but Plan 1's case shape needs `eligibility_decision_digest` for that stage. The case carries `decision.digest` (computed, not stored). It can never be deployed (`initial_deploy_allowed` needs `COMPLETE`).
+22. **A HOLDOUT_FAILED case names the decision without recording it.** The evaluator records no eligibility decision for a failed holdout (a retired artifact is never attested), but Plan 1's case shape needs `eligibility_decision_digest` for that stage. The case carries `decision.digest` (computed, not stored). It can never be deployed (`initial_deploy_allowed` needs `COMPLETE` and `holdout_passed is True`).
+23. **The holdout result goes into the case header** (Plan 1 ruling 15, PR #91 thread 4218218927). `build_initial_case` sets `holdout_passed` from the `HoldoutOutcome` it ran (`True` / `False`), `None` when no holdout was opened; `build_failed_case` sets `None`. `evaluation_summary` reports this header field, not the evidence copy, and `attest_from_judgment` requires it too.
+24. **A finished evaluation is shown only after the trader confirmed its end** (PR #91 thread 4218218688). After the case is signed, the request row keeps `state = 'RUNNING'` and records the owed end in `pending_report` (`DONE` or `FAILED`). The report is sent at once and again on **every service tick** (`run_next`, also `recover`) until the trader answers `UPDATED` or `UNCHANGED`; after a lost reply the claim is read back with `get_evaluation_claim`, and a claim already in that state counts as confirmed. Only then does the row move to `DONE` / `FAILED` and `get_evaluation` show the case. Plan 4's pump treats Plan 1's `CASE_CLAIM_NOT_FINISHED` as retryable, which stays as the safety net. *Cost if wrong:* while the trader is unreachable a finished case waits (Plan 4's `evaluation_stale_hours` still bounds it).
+25. **A shadow row is sent only when the trader stored it** (PR #91 thread 4218219293). `mark_sent` runs only after `record_shadow_result` answers `INSERTED` (the trader's word for accepted) or `DUPLICATE` (the trader answers `DUPLICATE` only when the stored body digest equals ours; another body is the refusal `CONFLICTING_DUPLICATE`). A retryable refusal (`JUDGMENT_UNKNOWN`) leaves the row pending for the next tick. Any other refusal is final for that session: the row goes to `shadow_failures` with the code and detail, is logged at ERROR, is counted by `ShadowReplay.status()["failed_rows"]` (logged at ERROR after each tick while not zero), and is never sent again or shown as sent; later sessions of the same judgment still go out (each row is its own change of one continuous run). The operator clears a failure by deleting its `shadow_failures` row after fixing the cause; the next tick sends it again. *Cost if wrong:* none to safety; a missing shadow session is visible, never a silent gap.
 
 ## Cross-plan additions
 
@@ -60,7 +63,7 @@ Plan 1 is the base: this plan uses its names exactly (`trader/research/evaluatio
 - **Produced by Plan 3 (Plans 1, 2, 4 use these):**
   - Research server: query **42106**, command **42107**; host `research`; `ai` binds `research.pub` (Task 2). `trader.research.research_surface.build_research_registry(*, evaluations, attest) -> TypedRpcRegistry` (one registry for both roles, as the trader does).
   - `submit_evaluation` request (strict): `{"kind": "INITIAL", "strategy_key", "cohort", "conids" (sorted), "bar_size"}` or `{"kind": "RENEWAL", "prior_version_digest"}` (refused `RENEWAL_NOT_SUPPORTED` until Plan 5, ruling 17). The caller sends no day: the service sets `research_day` (ruling 1). Reply: `{"status": "ACCEPTED"|"DUPLICATE"|"REFUSED", "request_id", "state", "code", "detail", "retryable"}`; `CLAIM_UNKNOWN` is retryable, a trader refusal keeps the trader's `retryable`; a same-day resend of an accepted body is `DUPLICATE` with the same `request_id`. Refusal codes include `FAMILY_COOLING_DOWN`, `EVALUATION_LIMIT_REACHED`, `EVALUATION_REQUEST_CONFLICT` (from the trader), `HOLDOUT_NOT_AVAILABLE`, `STRATEGY_NOT_ALLOWED`, `COHORT_TOO_LARGE`, `COHORT_POINT_INVALID`, `CONIDS_OUT_OF_SCOPE`, `REQUEST_INVALID`, `SPEC_INVALID`, `QUEUE_FULL`, `CLAIM_UNKNOWN`, `PRINCIPAL_FORBIDDEN`.
-  - `get_evaluation` `{"request_id"}` → `{"found", "request_id", "state", "case_digest", "summary"}`; `summary` = `evaluation_summary(case)` (Plan 4's `CaseSummary` models every key): `kind, strategy_key, strategy_path, class_name, file_hash, params, conids, bar_size, stage, rules_passed, holdout_passed, eligibility, renewal_checks_passed, prior_version_digest, order_notional, strategy_trials, prior_holdouts, previously_revealed_sessions, selected_index, error, metrics, points [{index, params, pre_holdout_passed, failed_rules, missing_rules, metrics {expectancy_bps_1x, expectancy_bps_1_5x, expectancy_bps_2x, selection_statistic}}], rule_results [{point, rule, passed}], forward`. `rules_passed` is `offered_menu(case) == FULL_MENU`, the same rule the trader's menu check uses. Every value is code-computed; never a bundle digest.
+  - `get_evaluation` `{"request_id"}` → `{"found", "request_id", "state", "case_digest", "summary"}`. Until the trader has confirmed the claim's `DONE` or `FAILED` (ruling 24), the reply says `state: "RUNNING"` with `case_digest` and `summary` null, so a caller never judges a case whose claim the trader still holds open. `summary` = `evaluation_summary(case)` (Plan 4's `CaseSummary` models every key): `kind, strategy_key, strategy_path, class_name, file_hash, params, conids, bar_size, stage, rules_passed, holdout_passed, eligibility, renewal_checks_passed, prior_version_digest, order_notional, strategy_trials, prior_holdouts, previously_revealed_sessions, selected_index, error, metrics, points [{index, params, pre_holdout_passed, failed_rules, missing_rules, metrics {expectancy_bps_1x, expectancy_bps_1_5x, expectancy_bps_2x, selection_statistic}}], rule_results [{point, rule, passed}], forward`. `rules_passed` is `offered_menu(case) == FULL_MENU`, the same rule the trader's menu check uses. Every value is code-computed; never a bundle digest.
   - `attest_from_judgment` `{"judgment_id"}` → `{"status": "ATTESTED"|"DUPLICATE"|"REFUSED", "bundle_digest", "code", "detail", "retryable", "binding"}`. ATTESTED and DUPLICATE carry `binding` = `{strategy_path, class_name, file_hash, params, conids, bar_size, order_notional}` read from the bundle just signed (Plan 2's `binding_differences` facts); a refusal has `binding: null`. `TRADER_UNAVAILABLE` is retryable.
   - The case `evidence` dict (signed, read only by Plan 3 and humans): `points [{index, params, trial_id, neighbour_trial_ids, pre_holdout_passed, failed_rules, missing_rules, rules [{code, passed, observed}], expectancy_bps {1x, 1.5x, 2x}, selection_statistic}]`, `strategy_trials`, `selected_index`, `replay_index`, `holdout {start, end, passed, detail}|null`, `previously_revealed [ISO dates]`, `holdouts_opened_before`, `warmup_sessions`, `error`.
   - `trader/research/shadow_window.py`: `shadow_window(decided_at, verdict, *, deploy_expiry_sessions, family_cooldown_sessions) -> (first_session, last_session)`.
@@ -70,11 +73,11 @@ Plan 1 is the base: this plan uses its names exactly (`trader/research/evaluatio
 
 ## Review Focus
 
-1. A refused claim runs nothing and writes no trial; a lost reply is read back and takes one slot; a restart resumes `QUEUED`/`RUNNING` under the same claim — `tests/research/test_evaluation_service.py`.
+1. A refused claim runs nothing and writes no trial; a lost reply is read back and takes one slot; a restart resumes `QUEUED`/`RUNNING` under the same claim; a lost `DONE` report withholds the case and is sent again on the next tick without a restart — `tests/research/test_evaluation_service.py` (`test_a_lost_terminal_report_withholds_the_case_until_the_next_tick_confirms_it`, `test_a_lost_terminal_reply_is_confirmed_by_reading_the_claim_back`); end to end in Plan 4 Task 8 `test_a_lost_terminal_claim_update_is_sent_again_and_the_judgment_records`.
 2. Cohort selection and holdout: the best 1x point that fails 2x is not selected, a neighbour is never selected, no pass → no artifact and no holdout, a shifted window → `HOLDOUT_NOT_AVAILABLE` before any claim — `tests/research/test_cohort_evaluation.py`, `tests/research/test_cohort_request.py`.
 3. A case never authorizes: the bundle verifier and `require_qualified_research_evidence` refuse a case the service wrote; a rule failure and a holdout failure are cases that offer only SHADOW / REJECT — `tests/research/test_case_builder.py`.
 4. Review handoff: no durable DEPLOY, live, or another review → refused with no review row; a DEPLOY writes one `llm` review with code-set holdout confirmation; a repeat returns the same digest — `tests/research/test_judgment_attest.py`.
-5. Access and shadow: every research method refused outside its row at the server, `research` calls no trading method, warm-up books no fill, a repeat row is a no-op and a changed one is refused, books per verdict with INCOMPLETE — `tests/research/test_research_surface.py`, `tests/test_research_principal.py`, `tests/test_backtester_trading_start.py`, `tests/scoreboard/test_shadow_results.py`, `tests/research/test_shadow_replay.py`.
+5. Access and shadow: every research method refused outside its row at the server, `research` calls no trading method, warm-up books no fill, a repeat row is a no-op and a changed one is refused, a refused row is never marked sent (`test_a_final_refusal_is_a_visible_failure_and_never_marked_sent`, `test_a_retryable_refusal_leaves_the_row_pending`), books per verdict with INCOMPLETE — `tests/research/test_research_surface.py`, `tests/test_research_principal.py`, `tests/test_backtester_trading_start.py`, `tests/scoreboard/test_shadow_results.py`, `tests/research/test_shadow_replay.py`.
 
 ## File map
 
@@ -1266,6 +1269,7 @@ def build(result):
 def test_a_rule_failure_is_a_case_without_an_artifact_that_offers_shadow_or_reject():
     case = build(pre_holdout_result())
     assert case.stage == "PRE_HOLDOUT_FAILED" and case.artifact_id is None and case.final_rule_results == []
+    assert case.holdout_passed is None
     assert offered_menu(case) == NO_DEPLOY_MENU
     assert case.evidence["points"][0]["rules"][0]["observed"] is None         # NaN never reaches the bytes
 
@@ -1273,12 +1277,13 @@ def test_a_rule_failure_is_a_case_without_an_artifact_that_offers_shadow_or_reje
 def test_a_holdout_failure_names_the_decision_and_offers_no_deploy():
     case = build(complete_result(holdout_passed=False))
     assert case.stage == "HOLDOUT_FAILED" and case.eligibility_decision_digest == "d" * 64
+    assert case.holdout_passed is False and evaluation_summary(case, order_notional=1900.0)["holdout_passed"] is False
     assert offered_menu(case) == NO_DEPLOY_MENU
 
 
 def test_a_complete_passing_case_offers_deploy_and_its_summary_matches_the_menu():
     case = build(complete_result())
-    assert case.stage == "COMPLETE" and offered_menu(case) == FULL_MENU
+    assert case.stage == "COMPLETE" and case.holdout_passed is True and offered_menu(case) == FULL_MENU
     summary = evaluation_summary(case, order_notional=1900.0)
     assert summary["rules_passed"] is True and summary["holdout_passed"] is True
     assert summary["params"] == {"ENTRY_MINUTE": 600} and summary["prior_holdouts"] == 1
@@ -1291,7 +1296,7 @@ def test_a_complete_passing_case_offers_deploy_and_its_summary_matches_the_menu(
 def test_a_failure_after_the_claim_is_a_failed_case():
     case = build_failed_case(BODY, request_id=SPEC.request_id, claim_day="2024-03-29", file_hash=SPEC.file_hash,
                              error="EvaluationError: no bars", created_at=NOW, warmup_sessions=5)
-    assert case.stage == "FAILED" and case.evidence["error"] == "EvaluationError: no bars"
+    assert case.stage == "FAILED" and case.holdout_passed is None and case.evidence["error"] == "EvaluationError: no bars"
     summary = evaluation_summary(case, order_notional=1900.0)
     assert summary["rules_passed"] is False and summary["error"] == "EvaluationError: no bars"
     assert (summary["points"], summary["selected_index"]) == ([], None)
@@ -1385,7 +1390,7 @@ def build_initial_case(spec: Any, claim_day: str, result: Any, *, created_at: dt
         schema_version=CASE_DOMAIN, kind="INITIAL", request_id=spec.request_id, claim_day=claim_day,
         strategy_key=spec.strategy_key, strategy_file_hash=spec.file_hash,
         cohort=[dict(p) for p in spec.cohort], conids=list(spec.body.conids), bar_size=spec.body.bar_size,
-        stage=STAGE_NAMES[result.stage],
+        stage=STAGE_NAMES[result.stage], holdout_passed=None if outcome is None else bool(outcome.passed),
         selected_params=None if selected is None else dict(selected.point.params),
         family_id=result.family_id, selected_trial_id=None if selected is None else selected.point.trial_id,
         artifact_id=None if outcome is None else outcome.artifact_id,
@@ -1403,7 +1408,8 @@ def build_failed_case(body: Any, *, request_id: str, claim_day: str, file_hash: 
     return EvaluationCase(
         schema_version=CASE_DOMAIN, kind="INITIAL", request_id=request_id, claim_day=claim_day,
         strategy_key=body.strategy_key, strategy_file_hash=file_hash, cohort=[dict(p) for p in body.cohort],
-        conids=list(body.conids), bar_size=body.bar_size, stage="FAILED", selected_params=None, family_id=None,
+        conids=list(body.conids), bar_size=body.bar_size, stage="FAILED", holdout_passed=None,
+        selected_params=None, family_id=None,
         selected_trial_id=None, artifact_id=None, eligibility_decision_digest=None, decision_state=None,
         ruleset_digest=None, final_rule_results=[], renewal=None, created_at=created_at.isoformat(),
         evidence={"points": [], "strategy_trials": None, "selected_index": None, "replay_index": 0,
@@ -1429,12 +1435,11 @@ def evaluation_summary(case: EvaluationCase, *, order_notional: float) -> dict:
     path, class_name = split_strategy_key(case.strategy_key)
     points = evidence.get("points") or []
     shown: Optional[dict] = points[evidence["replay_index"]] if points else None
-    holdout = evidence.get("holdout")
     return {
         "kind": case.kind, "strategy_key": case.strategy_key, "strategy_path": path, "class_name": class_name,
         "file_hash": case.strategy_file_hash, "params": case.selected_params, "conids": list(case.conids),
         "bar_size": case.bar_size, "stage": case.stage, "rules_passed": offered_menu(case) == FULL_MENU,
-        "holdout_passed": None if holdout is None else bool(holdout["passed"]),
+        "holdout_passed": case.holdout_passed,                      # the typed header (ruling 23)
         "eligibility": case.decision_state, "renewal_checks_passed": None, "prior_version_digest": None,
         "order_notional": float(order_notional), "strategy_trials": evidence.get("strategy_trials") or 0,
         "prior_holdouts": evidence.get("holdouts_opened_before") or 0,
@@ -1464,7 +1469,7 @@ Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
 **Interfaces.**
 - Consumes Plan 1's `claim_evaluation`, `get_evaluation_claim`, `update_evaluation_claim`, `EvaluationRequestBody`, `write_evaluation_case`, `load_verified_case`; Task 3 `request_body`, `RequestRefused`; Task 5 `build_initial_case`, `build_failed_case`, `evaluation_summary`.
 - Produces `TraderUnavailable`, `TraderPort(query_client, command_client)` with `claim(request_id, body) -> dict`, `claim_readback(request_id) -> Optional[dict]`, `update_claim(request_id, state) -> dict`, `judgment(*, judgment_id=None, case_digest=None) -> Optional[dict]`, `record_shadow(body) -> dict`.
-- Produces `ResearchStore(db)` and `EvaluationService(*, store, trader, build_spec, evaluate, signer, artifacts_root, warmup_sessions, order_notional, queue_max, now)` with `submit(raw, caller) -> dict`, `get(request_id, caller) -> dict`, `recover() -> None`, `run_next() -> bool`, `serve_forever(stop)`. `build_spec(body: EvaluationRequestBody) -> CohortSpec`.
+- Produces `ResearchStore(db)` and `EvaluationService(*, store, trader, build_spec, evaluate, signer, artifacts_root, warmup_sessions, order_notional, queue_max, now)` with `submit(raw, caller) -> dict`, `get(request_id, caller) -> dict`, `recover() -> None`, `report_pending() -> bool`, `run_next() -> bool` (one tick: owed reports first, then one queued evaluation; true when anything moved), `serve_forever(stop)`. `ResearchStore` rows carry `pending_report`; `hold_report(...)`, `confirm_report(...)`, `pending_reports()` (ruling 24). `build_spec(body: EvaluationRequestBody) -> CohortSpec`.
 
 - [ ] **Step 1: Fakes** `tests/research/service_fakes.py`
 
@@ -1479,7 +1484,9 @@ class FakeTrader:
     def __init__(self, *, limit=10, cooling=()):
         self.claims, self.updates, self.limit, self.cooling = {}, [], limit, set(cooling)
         self.lose_next_reply = False
+        self.lose_update = {}                 # state -> "request" (never arrives) or "reply" (applied, answer lost)
         self.judgments, self.shadow_rows = {}, {}
+        self.shadow_calls, self.refuse_shadow = [], {}    # (judgment_id, session_date) -> (code, retryable)
 
     def claim(self, request_id, body):
         existing = self.claims.get(request_id)
@@ -1507,8 +1514,15 @@ class FakeTrader:
 
     def update_claim(self, request_id, state):
         self.updates.append((request_id, state))
-        self.claims[request_id]["state"] = state
-        return {"status": "UPDATED", "code": None, "detail": None, "retryable": False}
+        lost = self.lose_update.pop(state, None)
+        if lost == "request":
+            raise TraderUnavailable("update_claim: request lost")
+        claim = self.claims[request_id]
+        status = "UNCHANGED" if claim["state"] == state else "UPDATED"
+        claim["state"] = state
+        if lost == "reply":
+            raise TraderUnavailable("update_claim: reply lost")
+        return {"status": status, "code": None, "detail": None, "retryable": False}
 
     def judgment(self, *, judgment_id=None, case_digest=None):
         found = [j for j in self.judgments.values()
@@ -1517,6 +1531,10 @@ class FakeTrader:
 
     def record_shadow(self, body):
         key = (body["judgment_id"], body["session_date"])
+        self.shadow_calls.append(key)
+        if key in self.refuse_shadow:
+            code, retryable = self.refuse_shadow[key]
+            return {"status": "REFUSED", "code": code, "detail": "refused by the fake", "retryable": retryable}
         if key in self.shadow_rows and self.shadow_rows[key] != body:
             return {"status": "REFUSED", "code": "CONFLICTING_DUPLICATE", "retryable": False}
         status = "DUPLICATE" if key in self.shadow_rows else "INSERTED"
@@ -1710,6 +1728,31 @@ def test_a_changed_strategy_file_is_a_failed_case(world):
     path.write_text(path.read_text() + "\n# changed\n")
     service.run_next()
     assert case_of(world, service.get(request_id, AI)).evidence["error"].startswith("STRATEGY_SOURCE_CHANGED")
+
+
+def test_a_lost_terminal_report_withholds_the_case_until_the_next_tick_confirms_it(world):  # PR #91 4218218688
+    service = world.service()
+    request_id = service.submit(request(), AI)["request_id"]
+    world.trader.lose_update["DONE"] = "request"                       # the DONE never reaches the trader
+    assert service.run_next() is True
+    assert world.trader.claims[request_id]["state"] == "RUNNING"
+    held = service.get(request_id, AI)
+    assert (held["state"], held["case_digest"], held["summary"]) == ("RUNNING", None, None)
+    assert service.run_next() is True                                   # the next tick, both services up
+    assert world.trader.claims[request_id]["state"] == "DONE"
+    view = service.get(request_id, AI)
+    assert view["state"] == "DONE" and view["case_digest"] is not None and view["summary"] is not None
+    assert world.trader.updates == [(request_id, "RUNNING"), (request_id, "DONE"), (request_id, "DONE")]
+    assert service.run_next() is False                                  # nothing is owed any more
+
+
+def test_a_lost_terminal_reply_is_confirmed_by_reading_the_claim_back(world):
+    service = world.service()
+    request_id = service.submit(request(), AI)["request_id"]
+    world.trader.lose_update["DONE"] = "reply"                          # applied at the trader, the answer lost
+    service.run_next()
+    assert service.get(request_id, AI)["state"] == "DONE"
+    assert world.trader.updates == [(request_id, "RUNNING"), (request_id, "DONE")]   # read back, not sent again
 ```
 
 - [ ] **Step 3: Run** `.venv/bin/python -m pytest tests/research/test_evaluation_service.py -q` — expected: FAIL (`ModuleNotFoundError: trader.research.trader_port`).
@@ -1735,6 +1778,7 @@ _REQUESTS = ("""CREATE TABLE IF NOT EXISTS research_requests (
     file_hash VARCHAR NOT NULL, state VARCHAR NOT NULL
         CHECK (state IN ('CLAIMING','REFUSED','QUEUED','RUNNING','DONE','FAILED')),
     ny_day DATE, code VARCHAR, detail VARCHAR, case_digest VARCHAR, summary_json VARCHAR,
+    pending_report VARCHAR CHECK (pending_report IS NULL OR pending_report IN ('DONE','FAILED')),
     created_at TIMESTAMPTZ NOT NULL, updated_at TIMESTAMPTZ NOT NULL)""",)
 _CASES = ("""CREATE TABLE IF NOT EXISTS research_cases (
     case_digest VARCHAR PRIMARY KEY, request_id VARCHAR NOT NULL UNIQUE, stage VARCHAR NOT NULL,
@@ -1747,7 +1791,11 @@ _SHADOW = (
         joined_at TIMESTAMPTZ NOT NULL)""",
     """CREATE TABLE IF NOT EXISTS shadow_sent (
         judgment_id VARCHAR NOT NULL, session_date DATE NOT NULL, status VARCHAR NOT NULL,
-        reply_status VARCHAR NOT NULL, sent_at TIMESTAMPTZ NOT NULL, PRIMARY KEY (judgment_id, session_date))""",
+        reply_status VARCHAR NOT NULL CHECK (reply_status IN ('INSERTED','DUPLICATE')),
+        sent_at TIMESTAMPTZ NOT NULL, PRIMARY KEY (judgment_id, session_date))""",
+    """CREATE TABLE IF NOT EXISTS shadow_failures (
+        judgment_id VARCHAR NOT NULL, session_date DATE NOT NULL, code VARCHAR NOT NULL, detail VARCHAR,
+        failed_at TIMESTAMPTZ NOT NULL, PRIMARY KEY (judgment_id, session_date))""",
 )
 
 
@@ -1758,7 +1806,7 @@ def apply_service_migrations(migrator: Any) -> None:
 
 
 _COLUMNS = ("request_id", "body_json", "strategy_key", "file_hash", "state", "ny_day", "code", "detail",
-            "case_digest", "summary_json", "created_at", "updated_at")
+            "case_digest", "summary_json", "pending_report", "created_at", "updated_at")
 
 
 class ResearchStore:
@@ -1817,6 +1865,21 @@ class ResearchStore:
 
     def finished(self) -> list[dict]:
         return self._select("state IN ('DONE','FAILED')")
+
+    def hold_report(self, request_id: str, final: str, *, now: dt.datetime, case_digest: str, summary: dict) -> None:
+        """Ruling 24: the case is signed, but the row stays RUNNING until the trader confirms ``final``."""
+        if final not in ("DONE", "FAILED"):
+            raise ValueError(f"a report owes DONE or FAILED, not {final!r}")
+        self._db.execute("UPDATE research_requests SET pending_report = ?, case_digest = ?, summary_json = ?, "
+                         "updated_at = ? WHERE request_id = ? AND state = 'RUNNING'",
+                         [final, case_digest, json.dumps(summary), now, request_id])
+
+    def confirm_report(self, request_id: str, *, now: dt.datetime) -> None:
+        self._db.execute("UPDATE research_requests SET state = pending_report, pending_report = NULL, updated_at = ? "
+                         "WHERE request_id = ? AND pending_report IS NOT NULL", [now, request_id])
+
+    def pending_reports(self) -> list[dict]:
+        return self._select("pending_report IS NOT NULL")
 
     def record_case(self, case_digest: str, request_id: str, stage: str, signed_at: dt.datetime) -> None:
         def tx(conn):
@@ -1995,6 +2058,8 @@ class EvaluationService:
         row = self._store.get(request_id) if caller.principal in READERS else None
         if row is None:
             return {"found": False, "request_id": request_id, "state": None, "case_digest": None, "summary": None}
+        if row["pending_report"] is not None:                 # ruling 24: the trader's claim is not closed yet
+            return {"found": True, "request_id": request_id, "state": "RUNNING", "case_digest": None, "summary": None}
         return {"found": True, "request_id": request_id, "state": row["state"], "case_digest": row["case_digest"],
                 "summary": row["summary"]}
 
@@ -2003,6 +2068,8 @@ class EvaluationService:
     def recover(self) -> None:
         """Spec 5.1 step 6: resume our QUEUED and RUNNING work under the same claim; report finished states."""
         for row in self._store.pending():
+            if row["pending_report"] is not None:
+                continue                                      # signed already: only its report is owed (below)
             claim = self._trader.claim_readback(row["request_id"])
             if claim is None:
                 if row["state"] == "CLAIMING":
@@ -2012,16 +2079,22 @@ class EvaluationService:
                 self._accept(row["request_id"], {"status": "EXISTING", "claim": claim})
             else:
                 self._queue.put(row["request_id"])
-        for row in self._store.finished():
-            claim = self._trader.claim_readback(row["request_id"])
-            if claim is not None and claim["state"] not in FINISHED_CLAIM_STATES:
-                self._report(row["request_id"], row["state"])   # a lost DONE/FAILED report
+        self.report_pending()
+
+    def report_pending(self) -> bool:
+        """Ruling 24: send every owed DONE/FAILED again; true when the trader confirmed at least one."""
+        confirmed = False
+        for row in self._store.pending_reports():
+            confirmed |= self._report_end(row["request_id"], row["pending_report"])
+        return confirmed
 
     def run_next(self) -> bool:
+        """One service tick: owed reports first (no restart needed), then one queued evaluation."""
+        reported = self.report_pending()
         try:
             request_id = self._queue.get_nowait()
         except queue.Empty:
-            return False
+            return reported
         self._run(request_id)
         return True
 
@@ -2032,20 +2105,22 @@ class EvaluationService:
 
     def _run(self, request_id: str) -> None:
         row = self._store.get(request_id)
-        if row["state"] not in OPEN_STATES:
+        if row["state"] not in OPEN_STATES or row["pending_report"] is not None:
             return
         signed = self._store.case(request_id=request_id)
         if signed is None:
             self._store.set_state(request_id, "RUNNING", now=self._now())
-            self._report(request_id, "RUNNING")
+            self._report_running(request_id)
             digest, case = self._evaluate_and_sign(row)
         else:                                                   # signed before a crash: never run twice
             digest = signed["case_digest"]
             case = load_verified_case(self._cases_dir, digest, {self._signer.public_key_id: self._signer.public_key})
         final = "FAILED" if case.stage == "FAILED" else "DONE"
-        self._store.set_state(request_id, final, now=self._now(), case_digest=digest,
-                              summary=evaluation_summary(case, order_notional=self._order_notional))
-        self._report(request_id, final)
+        if row["state"] == "QUEUED":
+            self._store.set_state(request_id, "RUNNING", now=self._now())
+        self._store.hold_report(request_id, final, now=self._now(), case_digest=digest,
+                                summary=evaluation_summary(case, order_notional=self._order_notional))
+        self._report_end(request_id, final)
 
     def _evaluate_and_sign(self, row: dict) -> tuple[str, Any]:
         created_at = self._now()
@@ -2071,11 +2146,35 @@ class EvaluationService:
         self._store.record_case(digest, row["request_id"], case.stage, created_at)
         return digest, case
 
-    def _report(self, request_id: str, state: str) -> None:
+    def _report_running(self, request_id: str) -> None:
+        """Best effort: a lost RUNNING blocks nothing (Plan 1 allows QUEUED -> DONE)."""
         try:
-            self._trader.update_claim(request_id, state)
+            self._trader.update_claim(request_id, "RUNNING")
         except TraderUnavailable:
-            logger.warning("claim %s: state %s not reported yet; the next recover() reports it", request_id, state)
+            logger.warning("claim %s: RUNNING not reported; the end report follows anyway", request_id)
+
+    def _report_end(self, request_id: str, final: str) -> bool:
+        """Ruling 24: confirmed by UPDATED or UNCHANGED, or after a lost reply by reading the claim back."""
+        try:
+            reply = self._trader.update_claim(request_id, final)
+            confirmed = reply["status"] in ("UPDATED", "UNCHANGED")
+            if not confirmed:
+                logger.error("claim %s: the trader refused %s (%s); the case stays withheld", request_id, final,
+                             reply.get("code"))
+        except TraderUnavailable:
+            confirmed = self._claim_reads(request_id, final)
+        if confirmed:
+            self._store.confirm_report(request_id, now=self._now())
+        else:
+            logger.warning("claim %s: %s not confirmed by the trader yet; sent again next tick", request_id, final)
+        return confirmed
+
+    def _claim_reads(self, request_id: str, state: str) -> bool:
+        try:
+            claim = self._trader.claim_readback(request_id)
+        except TraderUnavailable:
+            return False
+        return claim is not None and claim["state"] == state
 ```
 
 `schema.py` `apply_research_migrations` gains, last:
@@ -2143,7 +2242,8 @@ def make_case(result, spec, db, file_hash, **changes) -> EvaluationCase:
     raw = {"schema_version": CASE_DOMAIN, "kind": "INITIAL", "request_id": "sha256:" + "1" * 64,
            "claim_day": "2026-10-08", "strategy_key": KEY, "strategy_file_hash": file_hash,
            "cohort": [dict(spec.params)], "conids": sorted(CONIDS), "bar_size": "15 mins", "stage": "COMPLETE",
-           "selected_params": dict(spec.params), "family_id": result.family_id, "selected_trial_id": "t1",
+           "holdout_passed": True, "selected_params": dict(spec.params), "family_id": result.family_id,
+           "selected_trial_id": "t1",
            "artifact_id": result.artifact_id, "eligibility_decision_digest": result.decision_digest,
            "decision_state": decision.state, "ruleset_digest": decision.ruleset_digest,
            "final_rule_results": [{"code": r.code, "passed": r.passed} for r in decision.results],
@@ -2410,7 +2510,8 @@ class JudgmentAttest:
             raise _Refused(refused.code, refused.detail) from None
         holdout = case.evidence.get("holdout") or {}
         qualifies = (case.kind == "INITIAL" and case.stage == "COMPLETE" and case.decision_state == "PAPER_ELIGIBLE"
-                     and case.ruleset_digest == self._ruleset.digest and holdout.get("passed") is True
+                     and case.ruleset_digest == self._ruleset.digest and case.holdout_passed is True
+                     and holdout.get("passed") is True
                      and case.final_rule_results and all(r.passed for r in case.final_rule_results))
         if not qualifies:
             raise _Refused("CASE_NOT_DEPLOYABLE", f"case stage {case.stage} cannot lead to a bundle")
@@ -3253,7 +3354,7 @@ Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
 
 **Interfaces.**
 - Consumes `TraderPort.judgment(case_digest=...)` (Plan 1's lookup by case digest), `TraderPort.record_shadow(body)` (Task 10 wire), Plan 1's `load_verified_case`, `shadow_window`, `run_window_job` with `WindowJob.trading_start`.
-- Produces `ResearchStore.cases_without_member(since) -> list[dict]`, `add_member(...)`, `shadow_members() -> list[dict]`, `sent_sessions(judgment_id) -> set[date]`, `mark_sent(judgment_id, session, status, reply_status, now)`; `ShadowReplay(*, store, trader, signer, artifacts_root, paths, registry, config, judge, now, run_job=run_window_job)` with `tick() -> None` and `serve_forever(stop)`.
+- Produces `ResearchStore.cases_without_member(since) -> list[dict]`, `add_member(...)`, `shadow_members() -> list[dict]`, `sent_sessions(judgment_id) -> set[date]`, `mark_sent(judgment_id, session, status, reply_status, now)` (`INSERTED` or `DUPLICATE` only), `mark_failed(judgment_id, session, code, detail, now)`, `failed_sessions(judgment_id) -> set[date]`, `shadow_failures() -> list[dict]`; `ShadowReplay(*, store, trader, signer, artifacts_root, paths, registry, config, judge, now, run_job=run_window_job)` with `tick() -> None`, `status() -> dict` and `serve_forever(stop)`.
 
 - [ ] **Step 1: Failing test** `tests/research/test_shadow_replay.py`
 
@@ -3384,6 +3485,33 @@ def test_no_verdict_never_joins(world):
     w = world.make("c.duckdb", verdict="NO_VERDICT")
     w.replay.tick()
     assert w.trader.shadow_rows == {} and w.store.shadow_members() == []
+
+
+@pytest.mark.timeout(120)
+def test_a_final_refusal_is_a_visible_failure_and_never_marked_sent(world):      # ruling 25, PR #91 4218219293
+    w = world.make("d.duckdb")
+    first = ("jdg-00000001", "2024-03-18")
+    w.trader.refuse_shadow[first] = ("SHADOW_SESSION_OUTSIDE_WINDOW", False)
+    w.replay.tick()
+    w.replay.tick()
+    assert w.trader.shadow_calls.count(first) == 1                          # final: never sent again
+    assert dt.date(2024, 3, 18) not in w.store.sent_sessions("jdg-00000001")
+    (failure,) = w.store.shadow_failures()
+    assert (str(failure["session_date"]), failure["code"]) == ("2024-03-18", "SHADOW_SESSION_OUTSIDE_WINDOW")
+    assert w.replay.status()["failed_rows"] == 1
+    assert sorted(rows(w.trader)) == ["2024-03-19", "2024-03-20", "2024-03-21", "2024-03-22"]
+
+
+@pytest.mark.timeout(120)
+def test_a_retryable_refusal_leaves_the_row_pending(world):
+    w = world.make("e.duckdb")
+    first = ("jdg-00000001", "2024-03-18")
+    w.trader.refuse_shadow[first] = ("JUDGMENT_UNKNOWN", True)
+    w.replay.tick()
+    assert w.store.sent_sessions("jdg-00000001") == set() and w.store.shadow_failures() == []
+    del w.trader.refuse_shadow[first]
+    w.replay.tick()
+    assert len(w.store.sent_sessions("jdg-00000001")) == 5 and w.replay.status()["failed_rows"] == 0
 ```
 
 - [ ] **Step 2: Run** `.venv/bin/python -m pytest tests/research/test_shadow_replay.py -q` — expected: FAIL (`ModuleNotFoundError: trader.research.shadow_replay`).
@@ -3419,8 +3547,27 @@ def test_no_verdict_never_joins(world):
         return {r[0] for r in rows}
 
     def mark_sent(self, judgment_id: str, session: dt.date, status: str, reply_status: str, now: dt.datetime) -> None:
+        """Ruling 25: only a row the trader stored (INSERTED, or DUPLICATE of the same body) is sent."""
+        if reply_status not in ("INSERTED", "DUPLICATE"):
+            raise ValueError(f"a {reply_status} reply is not a sent row")
         self._db.execute("INSERT INTO shadow_sent VALUES (?, ?, ?, ?, ?) ON CONFLICT DO NOTHING",
                          [judgment_id, session, status, reply_status, now])
+
+    def mark_failed(self, judgment_id: str, session: dt.date, code: str, detail: Optional[str],
+                    now: dt.datetime) -> None:
+        self._db.execute("INSERT INTO shadow_failures VALUES (?, ?, ?, ?, ?) ON CONFLICT DO NOTHING",
+                         [judgment_id, session, code, None if detail is None else str(detail)[:300], now])
+
+    def failed_sessions(self, judgment_id: str) -> set:
+        rows = self._db.execute("SELECT session_date FROM shadow_failures WHERE judgment_id = ?", [judgment_id],
+                                fetch="all")
+        return {r[0] for r in rows}
+
+    def shadow_failures(self) -> list[dict]:
+        names = ("judgment_id", "session_date", "code", "detail", "failed_at")
+        rows = self._db.execute(f"SELECT {', '.join(names)} FROM shadow_failures ORDER BY failed_at, judgment_id",
+                                fetch="all")
+        return [dict(zip(names, r)) for r in rows]
 ```
 
 `trader/research/shadow_replay.py`:
@@ -3495,7 +3642,15 @@ class ShadowReplay:
                 logger.warning("shadow replay waits for the trader: %s", exc)
             except Exception:
                 logger.exception("shadow replay tick failed")
+            status = self.status()
+            if status["failed_rows"]:
+                logger.error("shadow replay: %d refused rows need the operator (shadow_failures)",
+                             status["failed_rows"])
             stop.wait(TICK_SECONDS)
+
+    def status(self) -> dict:
+        """Ruling 25: refused rows are counted, never hidden among the sent ones."""
+        return {"members": len(self._store.shadow_members()), "failed_rows": len(self._store.shadow_failures())}
 
     def tick(self) -> None:
         self._join_new_members()
@@ -3519,9 +3674,9 @@ class ShadowReplay:
         end = min(member["last_session"], last_closed)
         if end < member["first_session"]:
             return []
-        sent = self._store.sent_sessions(member["judgment_id"])
+        done = self._store.sent_sessions(member["judgment_id"]) | self._store.failed_sessions(member["judgment_id"])
         return [s.date() for s in CALENDAR.sessions_in_range(str(member["first_session"]), str(end))
-                if s.date() not in sent]
+                if s.date() not in done]
 
     def _replay(self, member: dict) -> None:
         case = load_verified_case(self._cases_dir, member["case_digest"],
@@ -3532,11 +3687,14 @@ class ShadowReplay:
             except _Wait:
                 return                                               # later sessions wait too: rows stay ordered
             reply = self._trader.record_shadow(row)
-            if reply["status"] == "REFUSED":
-                logger.error("shadow row %s %s refused: %s", member["judgment_id"], session, reply.get("code"))
-                if reply.get("retryable"):
-                    return
-            self._store.mark_sent(member["judgment_id"], session, row["status"], reply["status"], self._now())
+            if reply["status"] in ("INSERTED", "DUPLICATE"):
+                self._store.mark_sent(member["judgment_id"], session, row["status"], reply["status"], self._now())
+                continue
+            logger.error("shadow row %s %s refused: %s", member["judgment_id"], session, reply.get("code"))
+            if reply.get("retryable"):
+                return                                               # pending: the next tick sends it again
+            self._store.mark_failed(member["judgment_id"], session, reply.get("code") or "REFUSED_WITHOUT_CODE",
+                                    reply.get("detail"), self._now())
 
     def _incomplete(self, member: dict, case: Any, session: dt.date, reason: str) -> dict:
         deadline = CALENDAR.session_close(pd.Timestamp(session)) + pd.Timedelta(
@@ -3641,6 +3799,7 @@ Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
   - `AGENTS.md` Architecture: add a **research** bullet ("`trader.research_service`: claims evaluation slots at the trader, runs cohort evaluations, signs evaluation cases, turns a DEPLOY judgment into the paper `llm` review and a bundle, replays judged strategies nightly; holds the only research signing key"). Plan 1 already added `research` to the principal list; add two port rows: `| 42106 | Typed query (Ed25519) | research: get_evaluation |` and `| 42107 | Typed command (Ed25519) | research: submit_evaluation, attest_from_judgment |`.
   - `docs/ARCHITECTURE.md`: the same two port rows in the port table; a short "Research service (SP2c)" section: claim first, cohort → selection → one holdout, cases are signed with `mmr.research.evaluation-case.v1` and never authorize, `attest_from_judgment` is paper only, shadow books per verdict on the scoreboard; the `research_service:` config block.
   - `docs/OPERATIONAL_STATE.md` under "RPC keys": the `research` container is **not armed**. First start: `./docker.sh -k` (creates `research.key`), `~/.config/mmr/keys/private/signing.pem` must exist (mode 0600), `./docker.sh -K` must pass for `research` and every other service, then `docker compose --profile ai up -d research`. Open items: ruling 13 (DB volume exposure, owner to confirm), ruling 17 (renewal cases and the trader's forward evidence come with SP2c Plan 5), the signing-key file owner inside the container (the `0600` check in `load_signing_key` needs the container user to own the bind; check on the first start).
+  - `docs/OPERATIONAL_STATE.md`, two watch items (rulings 24, 25): a finished evaluation shows as `RUNNING` until the trader confirmed its end (`research_requests.pending_report` is set meanwhile; the log says "not confirmed by the trader yet"); a shadow row the trader refused for good is in `shadow_failures` with its code, counted by the ERROR log "refused rows need the operator"; delete that row after fixing the cause and the next tick sends it again.
 
 - [ ] **Step 2: Full suite** (once, under the shared lock):
 

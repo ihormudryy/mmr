@@ -37,11 +37,12 @@
 9. **Forward evidence shape (Plan 5 owns it).** Plan 1 left `evidence: dict|null`. Plan 5 defines it as `ForwardEvidenceView` (Cross-plan additions). Every shadow row is checked against its scoreboard seal on read (`FORWARD_EVIDENCE_TAMPERED`). Paper trips are the `round_trips` whose `decision_id` is an `ENTER` in `ai_paper_decisions` with this `deployment_version`; they are information for Jev, not a gate.
 10. **No forward-performance threshold** (spec 11, third open question, default kept): complete forward data is the only code check; Jev judges the numbers. *Owner to confirm.*
 11. **No attestation for a renewal.** The bundle's review names the line's INITIAL judgment (Plan 2 ruling 4); Plan 3's `attest_from_judgment` already refuses a RENEWAL judgment (`JUDGMENT_NOT_DEPLOY`). The controller registers the renewal with the line's stored registration body, only `judgment_id` replaced.
-12. **The renewal case header.** `cohort = [selected_params]` = the deployed params; `artifact_id`, `family_id`, `selected_trial_id`, `eligibility_decision_digest` are copied from the line's INITIAL judgment (Plan 2's `binding_differences` then compares them with the bundle); `decision_state`, `ruleset_digest` are null; `final_rule_results` is empty; `stage` is `FORWARD_COMPLETE` only when every session is `COMPLETE`. The `evidence` carries the forward facts and the replay keys (`points: []`, `replay_index: 0`, `warmup_sessions`), so the renewal judgment joins the shadow cohort like any judgment (spec 7) and its own forward rows exist for the next renewal.
+12. **The renewal case header.** `cohort = [selected_params]` = the deployed params; `artifact_id`, `family_id`, `selected_trial_id`, `eligibility_decision_digest` are copied from the line's INITIAL judgment (Plan 2's `binding_differences` then compares them with the bundle); `decision_state`, `ruleset_digest` and `holdout_passed` are null (Plan 1 ruling 15: a renewal opens no holdout); `final_rule_results` is empty; `stage` is `FORWARD_COMPLETE` only when every session is `COMPLETE`. The `evidence` carries the forward facts and the replay keys (`points: []`, `replay_index: 0`, `warmup_sessions`), so the renewal judgment joins the shadow cohort like any judgment (spec 7) and its own forward rows exist for the next renewal.
 13. **"The old version stays expired."** Plan 2 ruling 6 shows a renewed version as `SUPERSEDED` (wire `ENDED`) on purpose. The tests assert what matters: the old version is never active again and is never renewed again.
 14. **Late binding in the trader wiring.** `BacktestJudgments` needs the renewal checks, and the checks need `DeploymentActivity`, which needs the judgments. `_build_ai_paper_parts` builds them in one function with two lambdas (`activity.status`, `backtest_judgments.get` / `.renewals_of`) that are only called after both objects exist.
 15. **Controller line states.** `LIVE` → `RENEWING` (EXPIRED seen at a slot; one RENEWAL candidate per version, id `"rr-" + sha256("RENEWAL|" + V)[:32]`) → `ENDED` with `RENEWED`, `RENEWAL_<verdict>`, `RENEWAL_REFUSED_<code>`, `RENEWAL_JUDGMENT_<code>`, `RENEWAL_REGISTER_<code>`, or the version's own state (`WITHDRAWN`, `ENDED`). The renewal judgment id is `"jdg-" + sha256("RENEWAL|" + case_digest)[:32]`; INITIAL ids do not change.
 16. **Jev's prompt** gains one sentence on RENEWAL cases. The facts are Plan 3's summary (`kind`, `stage`, `renewal_checks_passed`, `prior_version_digest`, `forward`); the menu is `FULL_MENU` only when `rules_passed` (= the forward window is complete).
+17. **An INITIAL cap refusal never ends a renewal** (PR #91 thread 4218219455). A RENEWAL candidate takes no evaluation slot (ruling 2), so Plan 4's bulk close on `EVALUATION_LIMIT_REACHED` closes only INITIAL candidates (Plan 4 ruling 23). Only the renewal's own refusal or verdict ends its line. As a second guard, each slot reopens a `RENEWING` line's candidate that is `CLOSED` without any judgment row (state back to `NEW`, ERROR log naming the old end code); it reads no version for that (a `RENEWING` line is not read again).
 
 ## Cross-plan additions
 
@@ -63,6 +64,7 @@ Names Plan 5 adds or changes; other plans and later work use them exactly.
 3. **After the bundle expires a renewal is refused: the research service asks no Jev, and the trader blocks a direct DEPLOY.** → Task 3 `test_a_renewal_after_the_bundle_expired_cannot_deploy`; Task 6 `test_a_renewal_that_cannot_be_renewed_is_refused_before_any_case`; Task 8 `test_a_renewal_after_the_bundle_expired_is_refused`.
 4. **A missing, INCOMPLETE or not-replayed forward session never allows DEPLOY**, by the case's menu and by the trader's own rows. → Task 2 `test_a_session_outside_the_judgments_shadow_window_is_not_replayed`; Task 3 `test_a_missing_or_incomplete_forward_session_blocks_deploy_not_shadow`; Task 5 `test_any_session_not_complete_makes_a_forward_incomplete_case`; Task 8 `test_a_renewal_reject_cools_the_key_down_and_ends_the_line`.
 5. **A non-DEPLOY renewal verdict ends the line at the trader and in the controller; a REJECT starts the cooldown; only an EXPIRED version can be renewed.** → Task 3 `test_a_renewal_reject_ends_the_line_and_cools_the_key_down`, `test_a_renewal_deploy_needs_an_expired_version_with_complete_forward_rows`; Task 7 `test_a_non_deploy_renewal_ends_the_line`; Task 8 `test_a_renewal_reject_cools_the_key_down_and_ends_the_line`.
+6. **An INITIAL refused with the daily cap in the same cycle never closes the renewal; a renewal closed without a judgment is asked again at the next slot.** → Task 7 `test_an_initial_cap_refusal_leaves_the_renewal_eligible`, `test_a_renewing_line_closed_without_a_judgment_is_asked_again_at_the_next_slot`.
 
 ## File map
 
@@ -1404,7 +1406,7 @@ def build_renewal_case(view: ForwardEvidenceView, *, created_at: dt.datetime, wa
         strategy_key=binding.strategy_key, strategy_file_hash=binding.strategy_file_hash, cohort=[params],
         conids=list(binding.conids), bar_size=binding.bar_size,
         stage="FORWARD_COMPLETE" if view.sessions and incomplete == 0 else "FORWARD_INCOMPLETE",
-        selected_params=params, family_id=line.family_id, selected_trial_id=line.selected_trial_id,
+        holdout_passed=None, selected_params=params, family_id=line.family_id, selected_trial_id=line.selected_trial_id,
         artifact_id=line.artifact_id, eligibility_decision_digest=line.eligibility_decision_digest,
         decision_state=None, ruleset_digest=None, final_rule_results=[],
         renewal={"prior_deployment_version": view.version_digest, "forward_sessions": len(view.sessions),
@@ -1456,7 +1458,7 @@ EOF
 
 **Files:**
 - Create: `trader/research/renewal_service.py`
-- Modify: `trader/research/trader_port.py` (`forward_evidence`), `trader/research/service_store.py` (`record_renewal`), `trader/research/evaluation_service.py` (delegation, recover), `trader/research_service.py` (wiring), `tests/research/service_fakes.py` (`FakeTrader.forward_evidence`)
+- Modify: `trader/research/trader_port.py` (`forward_evidence`), `trader/research/service_store.py` (`record_renewal`), `trader/research/evaluation_service.py` (delegation), `trader/research_service.py` (wiring), `tests/research/service_fakes.py` (`FakeTrader.forward_evidence`)
 - Test: `tests/research/test_renewal_service.py`
 
 **Interfaces:**
@@ -1747,12 +1749,7 @@ class RenewalRequests:
             return _submit_reply("REFUSED", code="REQUEST_INVALID", detail="kind must be INITIAL or RENEWAL")
 ```
 
-- In `recover`, the loop over `self._store.finished()` starts with:
-
-```python
-            if row["body"].get("kind") == "RENEWAL":
-                continue                                      # a renewal has no claim (Plan 5 ruling 2)
-```
+- `recover` and `run_next` need no change: they report only rows whose `pending_report` is set (Plan 3 ruling 24), and `record_renewal` writes a `DONE` row with `pending_report` null, so a renewal is never reported to the trader and `get_evaluation` shows its case at once (a renewal has no claim, ruling 2).
 
 `trader/research_service.py`, in `build_runtime` after `attest = JudgmentAttest(...)`: build
 
@@ -1793,7 +1790,7 @@ EOF
 
 **Interfaces:**
 - Consumes: Plan 4's `ResearchCycle`, `Rig`, `ScriptedClient`, `registration_body`, `Binding`, `parse_reply`, `canonical_json`; Task 6's RENEWAL replies.
-- Produces: `judgment_id_for(case_digest, kind="INITIAL")`; `renewal_candidate_id(prior_version_digest)`; `ResearchCycle._end_finished_lines(slot)`, `_request_renewal_in_tx`, `_end_line_in_tx`, `_renewal_registration_in_tx`, `_close_candidate`.
+- Produces: `judgment_id_for(case_digest, kind="INITIAL")`; `renewal_candidate_id(prior_version_digest)`; `ResearchCycle._end_finished_lines(slot)`, `_reopen_stranded_renewals_in_tx`, `_request_renewal_in_tx`, `_end_line_in_tx`, `_renewal_registration_in_tx`, `_close_candidate`.
 
 - [ ] **Step 1: Add the renewal replies** (append to `tests/ai/research/cases.py`)
 
@@ -1871,9 +1868,10 @@ def seed_live_line(rig):
     return json.loads(body)
 
 
-async def renewal_night(rig, *, verdict="DEPLOY", submit=None, version_state="EXPIRED", pumps=6, **summary_fields):
+async def renewal_night(rig, *, verdict="DEPLOY", submit=None, version_state="EXPIRED", pumps=6,
+                        proposal=NO_CANDIDATES, **summary_fields):
     rig.registry.script("get_ai_deployment_version", version_reply(version_state))
-    rig.orchestrator.script(RESEARCH_MARKER, NO_CANDIDATES)
+    rig.orchestrator.script(RESEARCH_MARKER, proposal)
     rig.lab.script("submit_evaluation", *(submit or [submitted(request_id=RENEWAL_REQUEST, state="DONE")]))
     rig.lab.script("get_evaluation", renewal_done(**summary_fields))
     rig.jev.script(BACKTEST_MARKER, ruling(verdict))
@@ -1974,6 +1972,48 @@ async def test_a_case_for_another_version_is_a_wire_error(rig):
     await renewal_night(rig, prior=V2)                                  # the summary names another version
     assert rig.rows("SELECT state FROM ai_research_candidates") == [("SUBMITTED",)]
     assert rig.jev.requests == []
+
+
+INITIAL_PICK = json.dumps({"candidates": [{"strategy": "S1", "universe": "U1", "bar_size": "B3",
+                                           "points": [{"ENTRY_MINUTE": 615}], "thesis": "same evening"}]})
+
+
+@pytest.mark.asyncio
+async def test_an_initial_cap_refusal_leaves_the_renewal_eligible(rig):                  # PR #91 4218219455
+    seed_live_line(rig)
+    renewal_replies = [refused("FORWARD_EVIDENCE_PENDING", request_id=RENEWAL_REQUEST, retryable=True),
+                       submitted(request_id=RENEWAL_REQUEST, state="DONE")]
+
+    def submit(body):                       # either order: the renewal is still NEW when the INITIAL is refused
+        if body["kind"] == "INITIAL":
+            return refused("EVALUATION_LIMIT_REACHED")
+        return renewal_replies.pop(0) if len(renewal_replies) > 1 else renewal_replies[0]
+    await renewal_night(rig, submit=[submit], pumps=8, proposal=INITIAL_PICK)
+    assert rig.rows("SELECT kind, end_code FROM ai_research_candidates ORDER BY kind") == [
+        ("INITIAL", "REFUSED_EVALUATION_LIMIT_REACHED"), ("RENEWAL", "JUDGED_DEPLOY")]
+    (record,) = rig.registry.sent("record_backtest_judgment")
+    assert (record["kind"], record["renewal_of_version"]) == ("RENEWAL", V1)
+    assert line(rig) == [("ENDED", "RENEWED")]
+    assert rig.rows("SELECT state, version_digest, line_state FROM ai_research_registrations "
+                    "WHERE kind = 'RENEWAL'") == [("REGISTERED", V2, "LIVE")]
+
+
+@pytest.mark.asyncio
+async def test_a_renewing_line_closed_without_a_judgment_is_asked_again_at_the_next_slot(rig):
+    seed_live_line(rig)
+    await renewal_night(rig, pumps=0)                                   # RENEWING, candidate NEW
+    rig.store.db.execute("UPDATE ai_research_candidates SET state = 'CLOSED', "     # what the old cap close did
+                         "end_code = 'NOT_SUBMITTED_EVALUATION_LIMIT_REACHED'")
+    rig.clock.advance(24 * 3600)                                        # the next evening's slot
+    rig.orchestrator.script(RESEARCH_MARKER, NO_CANDIDATES)
+    cycle = rig.cycle()
+    await cycle.run_due_slot()
+    assert rig.rows("SELECT state, end_code FROM ai_research_candidates") == [("NEW", None)]
+    for _ in range(6):
+        await cycle.pump()
+        rig.clock.advance(31)
+    assert line(rig) == [("ENDED", "RENEWED")]
+    assert len(rig.registry.sent("get_ai_deployment_version")) == 1     # reopening reads no version
 ```
 
 In `tests/ai/research/test_research_slot_cycle.py`, delete Plan 4's `test_an_expired_or_withdrawn_version_ends_its_line_without_a_renewal`; this file's `test_a_withdrawn_or_ended_version_ends_its_line_without_a_renewal` replaces it, and EXPIRED now renews.
@@ -2024,6 +2064,7 @@ In `_run_slot`, call `await self._end_finished_lines(slot)`. Replace `_end_finis
 ```python
     async def _end_finished_lines(self, slot: ResearchSlot) -> None:
         """An EXPIRED version asks for a renewal (the line becomes RENEWING); WITHDRAWN or ENDED ends the line."""
+        await self._store.atransaction(self._reopen_stranded_renewals_in_tx)
         rows = await self._store.aquery("SELECT version_digest, strategy_key FROM ai_research_registrations "
                                         "WHERE state = 'REGISTERED' AND line_state = 'LIVE'")
         for version, strategy_key in rows:
@@ -2042,7 +2083,22 @@ In `_run_slot`, call `await self._end_finished_lines(slot)`. Replace `_end_finis
                 await self._store.atransaction(lambda conn, v=version, s=reply.version.state:
                                                self._end_line_in_tx(conn, v, s))
 
+    def _reopen_stranded_renewals_in_tx(self, conn: Any) -> None:
+        """Ruling 17: a RENEWING line whose candidate was closed without a judgment asks again (never silently ends)."""
+        rows = conn.execute(
+            "SELECT c.candidate_id, c.end_code FROM ai_research_registrations r "
+            "JOIN ai_research_candidates c ON c.kind = 'RENEWAL' AND c.prior_version_digest = r.version_digest "
+            "LEFT JOIN ai_backtest_judgments j ON j.candidate_id = c.candidate_id "
+            "WHERE r.line_state = 'RENEWING' AND c.state = 'CLOSED' AND j.judgment_id IS NULL").fetchall()
+        now = self._clock.now()
+        for candidate_id, end_code in rows:
+            logger.error("renewal candidate %s was closed (%s) without a judgment; asked again", candidate_id, end_code)
+            conn.execute("UPDATE ai_research_candidates SET state = 'NEW', end_code = NULL, request_id = NULL, "
+                         "accepted_at = NULL, next_try_at = ?, updated_at = ? WHERE candidate_id = ?",
+                         [now, now, candidate_id])
+
     def _request_renewal_in_tx(self, conn: Any, slot: ResearchSlot, version: str, strategy_key: str) -> None:
+        """The candidate shares the cycle with INITIAL ones, but Plan 4's cap close skips it (kind = 'RENEWAL')."""
         body = canonical_json({"kind": RENEWAL, "prior_version_digest": version})
         now = self._clock.now()
         conn.execute(

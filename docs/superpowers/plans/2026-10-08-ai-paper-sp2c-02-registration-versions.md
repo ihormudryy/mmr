@@ -45,8 +45,9 @@
 16. **Trader unreachable** during reconcile → keep the loaded set and log a warning (the trader still refuses entries). `METHOD_NOT_ALLOWED` (ai_paper off) → treated as no active deployment.
 17. **Test seam, not a back door.** Harness tests that are not about registration seed a judged deployment straight into the stores with `tests/automation/judged_deployment.py`, and answer the judgment from a seeded reader installed by monkeypatching `judgment_reader_for`. Registration itself is tested through the real chain (Task 4 and Task 5 real-bundle tests).
 18. **SP1 acceptance harness** (`trader/acceptance`) no longer registers a fixture deployment (the trader now refuses that). It takes an operator-given judged `deployment_version`, reads it, and sends ENTERs bound to it. *Owner to confirm.* *Cost if wrong:* a new SP1 acceptance run needs an SP2c-judged deployment first.
-19. **`ai` controller pass-through only.** The controller copies `deployment_digest`, `deployment_version` and `source_digest` from the signal to the ENTER and uses a new bracket section `decisions.ai_deployments` for `aidv-` strategies. No other controller logic changes (Plan 4 owns the research cycle).
+19. **`ai` controller pass-through, plus exit ownership by version.** The controller copies `deployment_digest`, `deployment_version` and `source_digest` from the signal to the ENTER and uses a new bracket section `decisions.ai_deployments` for `aidv-` strategies. The one other controller change is ruling 21 (exit ownership). Plan 4 owns the research cycle.
 20. **Trader paths.** `Trader.research_artifacts_root` (default `~/.local/share/mmr/artifacts`) and `Trader.research_verify_dir` (default `~/.config/mmr/keys/verify`). Plan 1 added no trader attributes (its `default_cases_dir()` is `<artifacts_root>/cases`); Plan 2 builds Plan 1's `BacktestJudgments` with `cases_dir = <artifacts_root>/cases` and this verify dir, so both plans read the same files. The trader's compose service gets `keys/verify` read-only here (Plan 1 does not bind it; Plan 3 Task 2 keeps the one line).
+21. **A SELL closes only trips its own version opened** (PR #91 thread 4218219168). Today `on_exit_signal` matches trips by conid only, so an A-bound SELL still queued when B supersedes A could close B's trip on the same conid. A trip belongs to the version of the ENTER that opened it: the controller reads that ENTER's `deployment_version` from its own `ai_submissions.body_json` by the trip's `decision_id` (a trip without a known ENTER counts as unbound, `None`). A SELL bound to version A (or unbound) owns exactly the open trips whose ENTER has the same version (or none). It closes only when every open trip of the experiment on that conid is its own; when another version also holds the conid it sends nothing and notes `EXIT_CONID_SHARED` (a CLOSE is conid-wide, and a PARTIAL_CLOSE would leave both brackets over a smaller position), so its own trip ends by its own bracket or the session flatten. The "may still fill" wait (`_fillable_entries`) counts only ENTERs of the SELL's own version. An exit never asks whether A is still active: the CLOSE carries no binding (ruling 9) and the trader's reduction path never reaches the version gate (ruling 12). *Cost if wrong:* an A trip that shares its conid with a B trip waits for its bracket or the 15:45 flatten instead of the strategy's SELL.
 
 ## Cross-plan additions
 
@@ -75,7 +76,7 @@
 
 1. **Registration is bound to a DEPLOY judgment and a verified bundle.** REJECT → `JUDGMENT_NOT_DEPLOY`, none → `JUDGMENT_MISSING`, other params/conids/bar size/evaluation → `JUDGMENT_MISMATCH`, exact retry → same digests, other body → `JUDGMENT_ALREADY_BOUND`; a tampered, expired or unknown-key bundle is refused. → Task 5 `test_registration_refusals_bind_the_judgment`, `test_exact_retry_returns_the_same_versions`, `test_another_body_for_a_bound_judgment_is_refused`; Task 4 `test_tampered_expired_or_unknown_key_bundles_are_refused`; Task 5 `test_registration_through_a_real_signed_bundle`.
 2. **Renewal gets a fresh version on the same base, refused after the bundle expires.** → Task 5 `test_renewal_gets_a_fresh_version_and_supersedes`, `test_renewal_is_refused_after_the_bundle_expires`, `test_the_same_renewal_twice_returns_the_same_version`.
-3. **Entry recheck at admission and at dispatch, exits never blocked.** → Task 8 `test_expired_version_is_refused_at_admission`, `test_withdrawal_between_jev_and_send_is_refused_at_dispatch`, `test_expiry_between_jev_and_send_is_refused_at_dispatch`, `test_an_exit_on_the_same_conid_still_goes_out`.
+3. **Entry recheck at admission and at dispatch, exits never blocked; a SELL closes only its own version's trips.** → Task 8 `test_expired_version_is_refused_at_admission`, `test_withdrawal_between_jev_and_send_is_refused_at_dispatch`, `test_expiry_between_jev_and_send_is_refused_at_dispatch`, `test_an_exit_on_the_same_conid_still_goes_out`; Task 10 `test_an_old_version_sell_never_closes_a_successor_trip`, `test_an_old_version_sell_still_closes_its_own_trip_after_supersession`.
 4. **Strategy binding.** A changed file is refused at load; a file replaced after load drops signals and unloads; nothing loads on live; every signal of an AI instance carries the version. → Task 9 `test_a_changed_file_is_refused_at_load`, `test_a_file_replaced_after_load_drops_signals_and_unloads`, `test_nothing_loads_on_live`, `test_signals_carry_the_binding`.
 5. **Cap and session boundaries.** Two concurrent registrations for the last slot → exactly one; expiry is inclusive and capped by the bundle. → Task 5 `test_two_concurrent_registrations_for_the_last_slot`; Task 3 `test_sessions_start_after_registration_and_end_inclusive`, `test_expiry_is_capped_by_the_bundle`.
 
@@ -92,7 +93,7 @@
 | `trader/automation/ai_paper_decision.py` | decision fields, row columns, admission recheck | 7 |
 | `trader/trading/command_stack.py`, `tests/automation/ai_paper_world.py` | dispatch gate wiring; recheck tests | 8 |
 | `trader/data/strategy_signal_record.py`, `trader/strategy/ai_deployment_source.py`, `trader/strategy/strategy_runtime.py`, `tests/strategy/ai_deployment_fixtures.py` | signal binding, second source | 9 |
-| `trader/ai/engine.py`, `trader/ai/signal_intake.py`, `trader/ai/runtime_schema.py`, `trader/ai/decision_engine.py`, `trader/ai/submitter.py`, `trader/ai/config.py` | controller pass-through | 10 |
+| `trader/ai/engine.py`, `trader/ai/signal_intake.py`, `trader/ai/runtime_schema.py`, `trader/ai/decision_engine.py`, `trader/ai/submitter.py`, `trader/ai/config.py` | controller pass-through, exit ownership by version | 10 |
 | `trader/acceptance/scenario.py`, `trader/acceptance/runner.py`, `trader/mmr_cli.py`, tests | harness migration, full suite | 11 |
 
 ---
@@ -2162,12 +2163,12 @@ class AiDeploymentSource:
 ### Task 10: `ai` controller pass-through
 
 **Files:**
-- Modify: `trader/ai/engine.py` (`SignalOpportunity`, `ProposedDecision`, `enter_decision`), `trader/ai/signal_intake.py`, `trader/ai/runtime_schema.py` (migration 14 CREATE in place), `trader/ai/decision_engine.py`, `trader/ai/submitter.py`, `trader/ai/config.py`
-- Test: `tests/ai/test_signal_binding_pass_through.py`
+- Modify: `trader/ai/engine.py` (`SignalOpportunity`, `ProposedDecision`, `enter_decision`), `trader/ai/signal_intake.py`, `trader/ai/runtime_schema.py` (migration 14 CREATE in place), `trader/ai/decision_engine.py` (pass-through; exit ownership by version, ruling 21), `trader/ai/submitter.py`, `trader/ai/config.py`
+- Test: `tests/ai/test_signal_binding_pass_through.py`, `tests/ai/decisions/test_decision_engine.py` (append)
 
 **Interfaces:**
 - Consumes: `read_ai_signals` keys from Task 9.
-- Produces: `SignalOpportunity.deployment_digest / deployment_version / source_digest` (defaults None); `ProposedDecision.deployment_version / source_digest`; `DecisionsConfig.ai_deployments: Bracketing`; `build_body` sends both keys.
+- Produces: `SignalOpportunity.deployment_digest / deployment_version / source_digest` (defaults None); `ProposedDecision.deployment_version / source_digest`; `DecisionsConfig.ai_deployments: Bracketing`; `build_body` sends both keys; `PaperDecisionEngine._entry_versions(decision_ids) -> dict`, `_fillable_entries(conid, now, version)`; engine note `EXIT_CONID_SHARED`.
 
 - [ ] **Step 1: Write the failing tests**
 
@@ -2210,6 +2211,74 @@ def test_the_enter_body_carries_the_binding():
     assert (body["deployment_version"], body["source_digest"]) == (D["deployment_version"], D["source_digest"])
 ```
 
+Append to `tests/ai/decisions/test_decision_engine.py` (ruling 21; it reuses that file's `started`, `FakeReads`, `Submitter`, `broker`, `EXPERIMENT`, `AAPL`, `NOW`):
+
+```python
+# -- SP2c Plan 2 ruling 21 (PR #91 thread 4218219168): a SELL closes only its own version's trips ------------------
+
+AI_DEPLOYMENT, SOURCE = "sha256:" + "c" * 64, "sha256:" + "5" * 64
+V_A, V_B = "sha256:" + "a" * 64, "sha256:" + "b" * 64
+
+
+def bound(opportunity_id, cursor, action, version):
+    return SignalOpportunity(opportunity_id, cursor, "aidv-" + version[7:23], AAPL, action, 0.7, NOW, NOW,
+                             deployment_digest=AI_DEPLOYMENT, deployment_version=version, source_digest=SOURCE)
+
+
+def bound_enter(rig, opportunity):
+    """The ENTER the controller sent for a version-bound BUY; its stored body carries the version."""
+    enter = ProposedDecision(action_key=f"enter:{opportunity.conid}", action="ENTER", conid=opportunity.conid,
+                             side="BUY", decider="jev", evidence_digest="sha256:" + "f" * 64,
+                             deployment_digest=AI_DEPLOYMENT, policy_revision=1, stop_price=225.4,
+                             target_price=239.2, deployment_version=opportunity.deployment_version,
+                             source_digest=SOURCE)
+    submitter = Submitter(store=rig.store, supervisor=None, leadership=None, clock=rig.clock, slots=None,
+                          experiment_state=lambda: None)
+    decision_id = rig.store.transaction(lambda conn: submitter.insert_in_tx(
+        conn, source_kind="entry_signal", source_id=opportunity.opportunity_id, decision=enter,
+        expires_at=NOW + dt.timedelta(minutes=5), epoch=1, now=NOW))
+    rig.store.db.execute("UPDATE ai_submissions SET state = 'FINAL', receipt_state = 'RESOLVED' "
+                         "WHERE decision_id = ?", [decision_id])
+    return decision_id
+
+
+def trip(trip_id, decision_id, state="OPEN"):
+    return {"round_trip_id": trip_id, "conid": AAPL, "symbol": "AAPL", "opened_at": NOW.isoformat(),
+            "opened_quantity": 5.0, "closed_quantity": 5.0 if state == "CLOSED" else 0.0,
+            "decision_id": decision_id, "state": state, "entry_avg_price": 230.0}
+
+
+SELL_A = bound("sig-" + "a" * 32, 20, "SELL", V_A)                      # queued while A was still active
+
+
+@pytest.mark.asyncio
+async def test_an_old_version_sell_never_closes_a_successor_trip(tmp_path):
+    trips = {"experiment_id": EXPERIMENT.experiment_id, "trips": []}
+    rig = await started(tmp_path, FakeReads(get_experiment_trips=lambda body: trips,
+                                            get_broker_order_evidence=lambda body: broker()))
+    enter_b = bound_enter(rig, bound("sig-" + "c" * 32, 22, "BUY", V_B))       # B superseded A and bought AAPL
+    trips["trips"] = [trip("rt-b", enter_b)]
+    result = await rig.engine.on_exit_signal(rig.signal(SELL_A))
+    assert (result.decisions, result.note) == ((), "NOT_HELD")                   # B's trip and entry are not A's
+    enter_a = bound_enter(rig, bound("sig-" + "b" * 32, 21, "BUY", V_A))
+    trips["trips"] = [trip("rt-a", enter_a), trip("rt-b", enter_b)]
+    result = await rig.engine.on_exit_signal(rig.signal(SELL_A))
+    assert (result.decisions, result.note) == ((), "EXIT_CONID_SHARED")          # a conid-wide CLOSE would hit B
+
+
+@pytest.mark.asyncio
+async def test_an_old_version_sell_still_closes_its_own_trip_after_supersession(tmp_path):
+    trips = {"experiment_id": EXPERIMENT.experiment_id, "trips": []}
+    rig = await started(tmp_path, FakeReads(get_experiment_trips=lambda body: trips))
+    enter_a = bound_enter(rig, bound("sig-" + "b" * 32, 21, "BUY", V_A))
+    enter_b = bound_enter(rig, bound("sig-" + "c" * 32, 22, "BUY", V_B))       # B is the active version now
+    trips["trips"] = [trip("rt-a", enter_a), trip("rt-b", enter_b, state="CLOSED")]
+    (close,) = (await rig.engine.on_exit_signal(rig.signal(SELL_A))).decisions
+    assert (close.action, close.conid, close.decider, close.side) == ("CLOSE", AAPL, "strategy", "SELL")
+    assert (close.deployment_version, close.source_digest) == (None, None)       # a reduction carries no binding
+    assert rig.calls("get_ai_deployment_version") == []                          # no active-version check on exits
+```
+
 - [ ] **Step 2: Run** → fails.
 - [ ] **Step 3: Implement.**
   - `SignalOpportunity` and `ProposedDecision`: three / two `Optional[str] = None` fields at the end; `ProposedDecision.__post_init__` checks each is null or a digest and that version and source come together.
@@ -2231,6 +2300,34 @@ def test_the_enter_body_carries_the_binding():
 
     and `enter_decision(action_key, judgment, binding=opportunity)` sets `deployment_version=binding.deployment_version, source_digest=binding.source_digest` (`binding` defaults to None for self-found entries).
   - `submitter.build_body`: adds `"deployment_version": decision.deployment_version, "source_digest": decision.source_digest`.
+  - `decision_engine.on_exit_signal` (ruling 21): after the trips are read, replace the conid-only `held` check with:
+
+```python
+        here = [p for p in owned_positions_from_trips(trips) if p.conid == opportunity.conid]
+        versions = await self._entry_versions(tuple(p.decision_id for p in here if p.decision_id))
+        mine = [p for p in here if versions.get(p.decision_id) == opportunity.deployment_version]
+        if not mine:
+            return await self._exit_before_any_fill(ctx, trips)
+        if len(mine) < len(here):
+            logger.warning("exit %s: conid %s is also held by another deployment version; no CLOSE",
+                           opportunity.opportunity_id, opportunity.conid)
+            return EngineResult(note="EXIT_CONID_SHARED")
+```
+
+    The CLOSE that follows is unchanged (no binding, ruling 9). Add:
+
+```python
+    async def _entry_versions(self, decision_ids: tuple[str, ...]) -> dict[str, Optional[str]]:
+        """Ruling 21: the version each trip's ENTER was bound to, from the bodies this controller sent."""
+        if not decision_ids:
+            return {}
+        marks = ", ".join("?" for _ in decision_ids)
+        rows = await self._store.aquery(f"SELECT decision_id, body_json FROM ai_submissions "
+                                        f"WHERE action = 'ENTER' AND decision_id IN ({marks})", list(decision_ids))
+        return {decision_id: json.loads(body_json).get("deployment_version") for decision_id, body_json in rows}
+```
+
+    `_exit_before_any_fill` calls `self._fillable_entries(conid, ctx.now, ctx.opportunity.deployment_version)`; `_fillable_entries(conid, now, version)` also skips an ENTER whose `json.loads(body_json).get("deployment_version") != version`, so an A SELL never waits on a B entry. A trip whose ENTER is unknown here, or an unbound ENTER, has version `None`: an unbound SELL keeps today's behaviour for unbound trips and never closes a bound one.
 - [ ] **Step 4: Run** `tests/ai/test_signal_binding_pass_through.py tests/ai/` (directory, `-x`) → pass.
 - [ ] **Step 5: Commit** `feat: carry the signal's deployment binding into the ai enter`.
 

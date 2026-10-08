@@ -327,13 +327,18 @@ message with no traceback.
 
 Keys live in `~/.config/mmr/keys/rpc/`: `<principal>.key` (mode 0600) and
 `<principal>.pub` (0644) for `trader`, `strategy`, `cli`, `dashboard`,
-`ai_supervisor`, `ai_research`. Each container mounts only its own key pair
+`ai_supervisor`, `ai_research`, `research`. Each container mounts only its own key pair
 and the public keys it needs (tmpfs overlay + per-file read-only binds). A
 service refuses to start when its own `.pub` is missing or does not match its
 `.key`.
 `./docker.sh -u` refuses to start while any key file the compose file names
 is missing. RPC keys and bundle-signing keys (`keys/verify`, `keys/private`)
 are separate; each loader refuses the other kind.
+
+**Upgrade (SP2c Plan 1):** every trader now needs
+`~/.config/mmr/keys/rpc/research.pub` (the trader container mounts it). Run
+`./docker.sh -k` (or `mmr keys init` on a host install) before you redeploy;
+`./docker.sh -u` refuses to start while it is missing.
 
 0. **First setup / cutover (owner-run, in this order):**
    1. `./docker.sh -b` (image with `age` and the keygen entry point).

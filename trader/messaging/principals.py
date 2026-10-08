@@ -11,7 +11,7 @@ import re
 from typing import Mapping
 
 KNOWN_PRINCIPALS: frozenset[str] = frozenset({
-    "trader", "strategy", "cli", "dashboard", "ai_supervisor", "ai_research",
+    "trader", "strategy", "cli", "dashboard", "ai_supervisor", "ai_research", "research",
 })
 SERVER_PRINCIPALS: frozenset[str] = frozenset({"trader", "strategy"})
 # Principals the SDK may sign as (``MMR_RPC_PRINCIPAL``).
@@ -23,7 +23,7 @@ RESERVED_PRINCIPALS: frozenset[str] = frozenset({"telegram_bridge", "scheduler"}
 CONTROLLER_PRINCIPAL = "ai_supervisor"
 
 SERVER_ACCEPTS: Mapping[str, frozenset[str]] = {
-    "trader": frozenset({"cli", "dashboard", "strategy", "ai_supervisor", "ai_research"}),
+    "trader": frozenset({"cli", "dashboard", "strategy", "ai_supervisor", "ai_research", "research"}),
     "strategy": frozenset({"cli", "dashboard", "trader"}),
 }
 
@@ -34,6 +34,9 @@ CALLS: Mapping[str, frozenset[str]] = {
     "dashboard": frozenset({"trader", "strategy"}),
     "ai_supervisor": frozenset({"trader"}),
     "ai_research": frozenset({"trader"}),
+    # SP2c Plan 1: research only calls the trader. Plan 3 makes it a server (SERVER_PRINCIPALS,
+    # SERVER_ACCEPTS["research"], SERVICE_PRINCIPAL) and lets ai_research and cli call it.
+    "research": frozenset({"trader"}),
 }
 
 _PRINCIPAL_NAME = re.compile(r"[a-z][a-z_]{1,31}")
@@ -126,6 +129,13 @@ TRADER_ACL: Mapping[tuple[str, str], frozenset[str]] = {
     # SP2 Plan 3: the trader-owned discovery read and entry quote (read only; spec 6.5, ruling 18).
     ("query", "discover_ai_candidates"): frozenset({"ai_supervisor"}),
     ("query", "get_ai_entry_quote"): frozenset({"ai_supervisor"}),
+    # SP2c Plan 1 (spec 5.1 table): evaluation claims and judgments. Explicit sets per method.
+    ("command", "claim_evaluation"): frozenset({"research"}),
+    ("query", "get_evaluation_claim"): frozenset({"research"}),
+    ("command", "update_evaluation_claim"): frozenset({"research"}),
+    ("query", "get_deployment_forward_evidence"): frozenset({"research"}),
+    ("command", "record_backtest_judgment"): frozenset({"ai_research"}),
+    ("query", "get_backtest_judgment"): frozenset({"research", "ai_research", "cli", "dashboard"}),
     # SP1 experiments (Plan 4 K14): explicit sets per method. ai_supervisor may pause (risk-reducing)
     # and read; only operators start, resume and stop.
     ("command", "start_experiment"): frozenset({"cli", "dashboard"}),

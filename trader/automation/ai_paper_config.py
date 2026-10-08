@@ -13,6 +13,11 @@ from dataclasses import dataclass, field, replace
 from types import MappingProxyType
 from typing import Any, Literal, Mapping, Optional
 
+from trader.automation.backtest_judge_config import (
+    BacktestJudgeConfig,
+    BacktestJudgeConfigError,
+    load_backtest_judge_config,
+)
 from trader.automation.risk_limits import PAPER_LIMITS, STEADY_LIMITS, RiskLimits, RiskLimitsError
 
 logger = logging.getLogger(__name__)
@@ -26,6 +31,7 @@ _REFUSED_ENV_PREFIXES = ("AI_PAPER", "MMR_AI_PAPER")
 _PARSED_KEYS = (
     "enabled", "styles", "limits_ceiling", "experiment_kill_drawdown_pct", "experiment_kill_basis",
     "broker_outage_pause_seconds", "acceptance_probe", "model_budget_usd_per_day",
+    "backtest_judge",
 )
 _RAW_ONLY_KEYS = ("telegram",)  # parsed by Plan 5
 
@@ -45,6 +51,8 @@ class AiPaperConfig:
     acceptance_probe: bool = False
     # SP2 Plan 2 Ruling 20: the owner's cap on model spend per New York day; served read-only to the ai service.
     model_budget_usd_per_day: float = DEFAULT_MODEL_BUDGET_USD_PER_DAY
+    # SP2c Plan 1 (spec 6.1): evaluation and deployment limits; operator only.
+    backtest_judge: BacktestJudgeConfig = field(default_factory=BacktestJudgeConfig)
     raw_section: Mapping[str, Any] = field(default_factory=lambda: MappingProxyType({}))
 
     def style_enabled(self, style: str) -> bool:
@@ -81,6 +89,7 @@ def load_ai_paper_config(
         broker_outage_pause_seconds=_parse_outage_pause(raw),
         acceptance_probe=acceptance_probe,
         model_budget_usd_per_day=_parse_budget(raw.get("model_budget_usd_per_day", DEFAULT_MODEL_BUDGET_USD_PER_DAY)),
+        backtest_judge=_parse_backtest_judge(raw.get("backtest_judge")),
         raw_section=MappingProxyType(copy.deepcopy(dict(raw))),
     )
 
@@ -172,6 +181,13 @@ def _parse_budget(value: object) -> float:
     if type(value) not in (int, float) or not math.isfinite(value) or value < 0:
         raise AiPaperConfigError("ai_paper.model_budget_usd_per_day: must be a finite number >= 0")
     return float(value)
+
+
+def _parse_backtest_judge(value: object) -> BacktestJudgeConfig:
+    try:
+        return load_backtest_judge_config(value)
+    except BacktestJudgeConfigError as exc:
+        raise AiPaperConfigError(str(exc)) from None
 
 
 def _check_drawdown_guard(ceiling: RiskLimits, kill_pct: Optional[float]) -> None:

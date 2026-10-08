@@ -5,7 +5,9 @@ authority: it verifies the signed case itself, offers DEPLOY only when the case
 qualifies (rules first), keeps one judgment per case and per evaluation, and
 starts the strategy key's cooldown on REJECT. Rows are sealed: every read
 recomputes the record digest. File reads, signature checks and the renewal
-port run before the write transaction.
+port run before the write transaction. The clock that sets ``recorded_at`` and
+the REJECT cooldown is read inside it, so a write that waited for the lock across
+New York midnight counts from the day it committed.
 """
 from __future__ import annotations
 
@@ -165,15 +167,9 @@ class BacktestJudgments:
             prior = self._existing_reply(request.judgment_id, body_digest)
             if prior is not None:
                 return prior
-            now = utc(self._now())
             case = self._verified_case(request.case_digest)
-            self._check_against_case(request, case, now)
-            cooldown = self._cooldown_until(request.verdict, now)
-            judgment = BacktestJudgment(request.judgment_id, request.case_digest, case.request_id, case.kind,
-                                        request.verdict, case.strategy_key, body,
-                                        _binding(case, request.case_digest), cooldown, now)
-            return self._db.transaction(
-                lambda conn: self._insert_in_tx(conn, judgment, case, body_digest, request.decided_at_utc()))
+            self._check_against_case(request, case, utc(self._now()))
+            return self._db.transaction(lambda conn: self._insert_in_tx(conn, request, case, body, body_digest))
         except JudgmentRefused as refused:
             if refused.code == JUDGMENT_TAMPERED:
                 raise                       # a broken seal is an error, never a reply
@@ -232,22 +228,26 @@ class BacktestJudgments:
             return None
         return nth_session_after(self._calendar, ny_day(now), self._config.family_cooldown_sessions)
 
-    def _insert_in_tx(self, conn: Any, judgment: BacktestJudgment, case: EvaluationCase, body_digest: str,
-                      decided_at: dt.datetime) -> dict:
+    def _insert_in_tx(self, conn: Any, request: RecordBacktestJudgmentRequest, case: EvaluationCase, body: dict,
+                      body_digest: str) -> dict:
+        recorded_at = utc(self._now())
         row = conn.execute(f"SELECT {_COLUMNS} FROM backtest_judgments WHERE judgment_id = ?",
-                           [judgment.judgment_id]).fetchone()
+                           [request.judgment_id]).fetchone()
         if row is not None:                         # a concurrent retry won the race
             return _existing_receipt(row, body_digest)
         other = conn.execute("SELECT judgment_id FROM backtest_judgments WHERE case_digest = ?",
-                             [judgment.case_digest]).fetchone()
+                             [request.case_digest]).fetchone()
         if other is not None:
             raise JudgmentRefused(JUDGMENT_CONFLICT, f"the case is already judged by {other[0]}")
-        if judgment.kind == "INITIAL":
+        if case.kind == "INITIAL":
             other = conn.execute("SELECT judgment_id FROM backtest_judgments WHERE request_id = ?",
-                                 [judgment.request_id]).fetchone()
+                                 [case.request_id]).fetchone()
             if other is not None:
                 raise JudgmentRefused(JUDGMENT_CONFLICT, f"the evaluation is already judged by {other[0]}")
-            self._check_claim_in_tx(conn, case, decided_at)
+            self._check_claim_in_tx(conn, case, request.decided_at_utc())
+        judgment = BacktestJudgment(request.judgment_id, request.case_digest, case.request_id, case.kind,
+                                    request.verdict, case.strategy_key, body, _binding(case, request.case_digest),
+                                    self._cooldown_until(request.verdict, recorded_at), recorded_at)
         conn.execute(f"INSERT INTO backtest_judgments ({_COLUMNS}) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
                      [judgment.judgment_id, judgment.case_digest, judgment.request_id, judgment.kind,
                       judgment.verdict, judgment.strategy_key, _text(judgment.body), body_digest,

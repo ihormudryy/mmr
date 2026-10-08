@@ -9,8 +9,9 @@ import pytest
 from pydantic import ValidationError
 
 from tests.automation.backtest_judge_fixtures import (
-    FILE_HASH, NARRATIVE, VERSION, World, case_body, count_judgments, failed_results, finished, judge_config,
-    judgment, make_case, renewal_case_body, request_body, world, write_signed_body,
+    FILE_HASH, NARRATIVE, VERSION, ClockMovesWhileWaitingForTheLock, World, case_body, count_judgments,
+    failed_results, finished, judge_config, judgment, make_case, renewal_case_body, request_body, world,
+    write_signed_body,
 )
 from trader.automation.backtest_judgments import (
     BacktestJudgments, JudgmentRefused, RenewalStatus, nth_session_after,
@@ -138,6 +139,19 @@ def test_reject_cools_down_the_strategy_key_for_ten_sessions(tmp_path):
     assert claim_status(w, another) == "FAMILY_COOLING_DOWN"
     w.clock.now = dt.datetime(2026, 10, 23, 14, 0, tzinfo=dt.timezone.utc)
     assert claim_status(w, another) == "ACCEPTED"
+
+
+def test_reject_cooldown_starts_from_commit_day(tmp_path):                            # PR #93 round 1
+    w = world(tmp_path)
+    digest = finished(w)                                  # claimed Thursday 2026-10-08 17:30 ET
+    w.clock.now = dt.datetime(2026, 10, 9, 3, 59, 59, tzinfo=dt.timezone.utc)      # 23:59:59 ET Thursday
+    committed = dt.datetime(2026, 10, 9, 4, 0, 1, tzinfo=dt.timezone.utc)          # 00:00:01 ET Friday
+    waiting = BacktestJudgments(ClockMovesWhileWaitingForTheLock(w.db, w.clock, committed),
+                                config=judge_config(family_cooldown_sessions=1), calendar=XNYSCalendarPolicy(),
+                                cases_dir=w.keys.cases_dir, verify_dir=w.keys.verify_dir, now=w.clock)
+    reply = waiting.record(judgment(digest, "REJECT"))
+    assert (reply["status"], reply["cooldown_until_session"]) == ("RECORDED", "2026-10-12")    # Monday, not Friday
+    assert w.judgments.get("jdg-00000001").recorded_at == committed
 
 
 def test_shadow_and_no_verdict_start_no_cooldown(tmp_path):

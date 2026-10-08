@@ -41,8 +41,10 @@ def request_digest(body: Mapping[str, Any]) -> str:
 
 
 def binding_differences(deployment: AiDeployment, bundle: BundleFacts, cases: Sequence[JudgmentFacts], *,
-                        bundle_digest: str, initial_judgment_id: str) -> list[str]:
-    """Rulings 3-4: every field the bundle, each judgment's case and the body must agree on."""
+                        bundle_digest: str) -> list[str]:
+    """Rulings 3-4: every field the bundle, each judgment's case and the body must agree on.
+
+    ``cases[0]`` is the INITIAL judgment of the line: the bundle was reviewed for it."""
     problems: list[str] = []
 
     def same(name: str, *values: Any) -> None:
@@ -63,9 +65,10 @@ def binding_differences(deployment: AiDeployment, bundle: BundleFacts, cases: Se
         if case.artifact_id is not None:
             same("artifact_id", case.artifact_id, bundle.artifact_id)
             same("family_id", case.family_id, bundle.family_id)
-    model, _, reviewed_id = bundle.reviewer.rpartition("#")
-    if bundle.reviewer_kind != "llm" or not model or reviewed_id != initial_judgment_id:
-        problems.append(f"the bundle review {bundle.reviewer!r} does not name judgment {initial_judgment_id}")
+    initial = cases[0]
+    if bundle.reviewer_kind != "llm":
+        problems.append(f"the bundle review is by a {bundle.reviewer_kind!r}, not by Jev")
+    same("reviewer", bundle.reviewer, f"{initial.model_id}#{initial.judgment_id}")
     if deployment.decider_verdict != "DEPLOY":
         problems.append("decider_verdict must be DEPLOY")
     return problems
@@ -91,8 +94,7 @@ class AiDeploymentRegistrar:
             raise DeploymentRefused("JUDGMENT_MISMATCH", "the bundle names another evaluation's artifact")
         bundle = self._bundles.check(bundle_digest, artifact_id=initial.artifact_id, now=now)
         cases = (initial,) if prior is None else (initial, judgment)
-        problems = binding_differences(deployment, bundle, cases, bundle_digest=bundle_digest,
-                                       initial_judgment_id=initial.judgment_id)
+        problems = binding_differences(deployment, bundle, cases, bundle_digest=bundle_digest)
         if problems:
             raise DeploymentRefused("JUDGMENT_MISMATCH", "; ".join(problems))
         if self._cooldowns.cooling_down(strategy_key(deployment.strategy_path, deployment.class_name), now):

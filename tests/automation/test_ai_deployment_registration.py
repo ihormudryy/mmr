@@ -106,6 +106,17 @@ def test_registration_refusals_bind_the_judgment(env):
     assert env.refused("jdg-2", record()) == "JUDGMENT_MISMATCH"
 
 
+def test_a_bundle_reviewed_by_another_model_is_refused(env):
+    """Ruling 4: the review is exactly <the judgment's Jev model>#<initial judgment id>, not any model."""
+    env.judge("jdg-1", record(), model_id="other-model")         # the bundle review says jev-model#jdg-1
+    with pytest.raises(DeploymentRefused) as refused:
+        env.register("jdg-1", record())
+    assert refused.value.code == "JUDGMENT_MISMATCH"
+    assert "'jev-model#jdg-1'" in refused.value.message and "'other-model#jdg-1'" in refused.value.message
+    assert env.versions.sealed() == ()
+    assert env.db.execute("SELECT COUNT(*) FROM ai_deployments", fetch="one") == (0,)
+
+
 def test_exact_retry_returns_the_same_versions(env):
     env.judge("jdg-1", record())
     first = env.register("jdg-1", record())

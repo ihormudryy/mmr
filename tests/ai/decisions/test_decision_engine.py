@@ -679,6 +679,7 @@ async def test_an_old_version_sell_still_closes_its_own_trip_after_supersession(
     enter_a = bound_enter(rig, bound("sig-" + "b" * 32, 21, "BUY", V_A))
     enter_b = bound_enter(rig, bound("sig-" + "c" * 32, 22, "BUY", V_B))       # B is the active version now
     trips["trips"] = [trip("rt-a", enter_a), trip("rt-b", enter_b, state="CLOSED")]
+    rig.reads.replies["get_broker_order_evidence"] = lambda body: broker(entry_row(enter_b, "Filled", 5.0))
     (close,) = (await rig.engine.on_exit_signal(rig.signal(SELL_A))).decisions
     assert (close.action, close.conid, close.decider, close.side) == ("CLOSE", AAPL, "strategy", "SELL")
     assert (close.deployment_version, close.source_digest) == (None, None)       # a reduction carries no binding
@@ -754,3 +755,20 @@ async def test_a_sell_closes_when_the_other_version_entry_ended_unfilled(tmp_pat
     trips["trips"] = [trip("rt-a", enter_a)]
     (close,) = (await rig.engine.on_exit_signal(rig.signal(SELL_A))).decisions
     assert (close.action, close.conid) == ("CLOSE", AAPL)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("row,note", [(dict(status="Submitted", filled=2.0), "EXIT_CONID_SHARED"),
+                                      (dict(status="Submitted", filled=0.0), "EXIT_WAITING_FOR_ENTRY")])
+async def test_a_closed_rival_trip_does_not_hide_its_live_entry(tmp_path, row, note):
+    """B's bracket closed the shares B got so far; the rest of B's entry still works: a CLOSE would reach it."""
+    trips = {"experiment_id": EXPERIMENT.experiment_id, "trips": []}
+    rig = await started(tmp_path, FakeReads(get_experiment_trips=lambda body: trips))
+    enter_a = bound_enter(rig, bound("sig-" + "b" * 32, 21, "BUY", V_A))
+    enter_b = bound_enter(rig, bound("sig-" + "c" * 32, 22, "BUY", V_B))
+    rig.store.db.execute("UPDATE ai_submissions SET state = 'ACCEPTED', receipt_state = 'SUBMITTED' "
+                         "WHERE decision_id = ?", [enter_b])
+    rig.reads.replies["get_broker_order_evidence"] = lambda body: broker(entry_row(enter_b, **row))
+    trips["trips"] = [trip("rt-a", enter_a), trip("rt-b", enter_b, state="CLOSED")]
+    result = await rig.engine.on_exit_signal(rig.signal(SELL_A))
+    assert (result.decisions, result.note) == ((), note)

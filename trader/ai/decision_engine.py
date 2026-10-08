@@ -274,17 +274,20 @@ class PaperDecisionEngine:
     async def _other_version_entry_state(self, ctx: SignalContext, trips: dict) -> Optional[EngineResult]:
         """An entry of another version on this conid that is working, or filled without a trip yet, shares the
         conid: the CLOSE would reach it (ruling 21). A rival that is only working may still end unfilled, so the exit
-        waits; one with fills is final. None when no such entry exists."""
+        waits; one with fills is final. A rival's trip says nothing about the rest of its entry: its bracket may
+        have closed the shares filled so far while the entry still works, so only a terminal entry with a trip is
+        done. None when no such entry exists."""
         conid = ctx.opportunity.conid
-        projected = {trip.get("decision_id") for trip in trips["trips"]}
-        rivals = tuple(decision_id for decision_id in await self._fillable_entries(
-            conid, ctx.now, ctx.opportunity.deployment_version, other_versions=True) if decision_id not in projected)
+        rivals = await self._fillable_entries(conid, ctx.now, ctx.opportunity.deployment_version, other_versions=True)
         if not rivals:
             return None
         states = await self._entry_states(conid, rivals, separate_partial_fills=True)
         if states is None or WORKING in states.values():      # unreadable or still working: that may end unfilled
             return EngineResult(note="EXIT_WAITING_FOR_ENTRY", wait_until=self._wait_backstop(ctx.now))
-        if not any(state in (FILLED, PARTLY_FILLED) for state in states.values()):
+        projected = {trip.get("decision_id") for trip in trips["trips"]}
+        sharing = [decision_id for decision_id, state in states.items()
+                   if state == PARTLY_FILLED or (state == FILLED and decision_id not in projected)]
+        if not sharing:
             return None
         logger.warning("exit %s: conid %s has another deployment version's fills in flight; no CLOSE",
                        ctx.opportunity.opportunity_id, conid)

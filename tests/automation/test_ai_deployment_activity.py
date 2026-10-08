@@ -17,6 +17,7 @@ from trader.automation.ai_deployments import (
     AiDeployment, AiDeploymentStore, DeploymentRefused, apply_ai_deployment_migration,
 )
 from trader.automation.calendar_policy import XNYSCalendarPolicy
+from trader.data.domain_journal import DomainJournal
 from trader.data.duckdb_store import DuckDBConnection
 from trader.data.schema_migrations import SchemaMigrator
 
@@ -51,9 +52,11 @@ class World:
         migrator = SchemaMigrator(db)
         apply_ai_deployment_migration(migrator)
         apply_ai_deployment_version_migrations(migrator)
+        journal = DomainJournal(db)
+        journal.migrate(migrator)
         self.db, self.judgments, self.cooldowns = db, SeededJudgments(), Cooldowns()
         self.deployments = AiDeploymentStore(db, now=lambda: self.now)
-        self.versions = AiDeploymentVersionStore(db, now=lambda: self.now)
+        self.versions = AiDeploymentVersionStore(journal, now=lambda: self.now)
         self.activity = DeploymentActivity(versions=self.versions, deployments=self.deployments,
                                            judgments=self.judgments, cooldowns=self.cooldowns,
                                            max_active=max_active, now=lambda: self.now)

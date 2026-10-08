@@ -255,7 +255,8 @@ version is an error (`DEPLOYMENT_VERSION_TAMPERED`).
 
 `withdraw VERSION_DIGEST --reason TEXT` (operator, signs as `cli`; typed `withdraw_ai_deployment`) ends the
 version for good: the strategy service unloads its `aidv-` instance and the trader refuses its new entries;
-exits and open brackets are not touched. It returns `{"version_digest", "withdrawn": true,
+exits and open brackets are not touched. An entry whose send had already started (its saga row was
+`SUBMITTING` before the withdrawal committed) still goes out; cancel or flatten it if needed. It returns `{"version_digest", "withdrawn": true,
 "already_withdrawn"}`; a repeat is safe. A refusal (`DEPLOYMENT_VERSION_UNKNOWN`, `PERMISSION_DENIED`) prints
 the code and exits 1. A withdrawn version cannot be renewed; trading the strategy again needs a new DEPLOY judgment and registration.
 

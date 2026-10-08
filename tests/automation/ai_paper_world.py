@@ -19,7 +19,9 @@ from tests.automation.ai_paper_fixtures import (
     ACCOUNT, CONID, NOW, OTHER, FakeUniverse, make_history, order, pos, quote, secdef, snapshot,
 )
 from tests.automation.judged_deployment import Cooldowns, SeededJudgments, deploy_facts
-from trader.automation.ai_deployment_activity import DeploymentActivity, deployment_version_gate
+from trader.automation.ai_deployment_activity import (
+    DeploymentActivity, deployment_version_gate, deployment_withdrawal_gate_in_tx,
+)
 from trader.automation.ai_deployment_versions import (
     INITIAL, AiDeploymentVersionStore, DeploymentVersion, apply_ai_deployment_version_migrations,
 )
@@ -219,6 +221,7 @@ class World:
         self.clock = Clock()
         self.accepted_feeds = accepted_feeds
         self.scope_gate = None          # discretionary_world sets the discretionary scope gate
+        self._intent_hook = None
         self.db = DuckDBConnection.get_instance(str(tmp_path / "journal.duckdb"))
         migrator = SchemaMigrator(self.db)
         self.journal = DomainJournal(self.db)
@@ -254,11 +257,12 @@ class World:
                                                    command_id="dep-1")
         self.activity_clock = Clock()
         self.judgments, self.cooldowns = SeededJudgments(), Cooldowns()
-        self.versions = AiDeploymentVersionStore(self.db, now=self.clock)
+        self.versions = AiDeploymentVersionStore(self.journal, now=self.clock)
         self.activity = DeploymentActivity(versions=self.versions, deployments=self.deployments,
                                            judgments=self.judgments, cooldowns=self.cooldowns, max_active=3,
                                            now=self.activity_clock)
         self.version_digest = self.seal_version("jdg-world-1")
+        self._withdrawal_gate = deployment_withdrawal_gate_in_tx(versions=self.versions)
         self.policy_publish(PAPER_LIMITS)
         self.evidence = FailingEvidence(AiPaperEvidence(
             broker=self.broker, quotes=self.quotes, margin=self.margin,
@@ -285,7 +289,8 @@ class World:
             session_risk=SessionRiskController(calendar=XNYSCalendarPolicy(), now=self.clock,
                                                liquidity_policy=LiquidityPolicy(accepted_feeds=accepted_feeds)),
             breaker=SimpleNamespace(record=lambda signal: None), liquidation=self.liquidation,
-            account_id=ACCOUNT, account_mode="paper", now=self.clock, db=self.db)
+            account_id=ACCOUNT, account_mode="paper", now=self.clock, db=self.db,
+            send_gate_in_tx=self._send_gate_in_tx)
         self.scheduled: list[str] = []
         self.decisions = AiPaperDecisionStore(self.journal)
         self.service = AiPaperDecisionService(
@@ -313,6 +318,15 @@ class World:
         return LiquidationService(
             self.broker, self.liquidation_dispatch, store=LiquidationRunStore(self.db), registry=self.exit_owners,
             now=self.clock, breaker=_Breaker(), schedule_reconcile=self.liquidation_scheduled.append)
+
+    def _send_gate_in_tx(self, conn, request):
+        if self._intent_hook is not None:
+            self._intent_hook(conn, request)
+        return self._withdrawal_gate(conn, request)
+
+    def on_intent_check(self, callback):
+        """``callback(conn, request)`` runs on the saga's SUBMITTING transaction, before the withdrawal read."""
+        self._intent_hook = callback
 
     def _scope_gate(self, request, approval, quote, now):
         return None if self.scope_gate is None else self.scope_gate(request, approval, quote, now)

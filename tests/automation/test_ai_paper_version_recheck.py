@@ -5,7 +5,9 @@ Exits never depend on it. A state that cannot be read refuses an entry as retrya
 from __future__ import annotations
 
 import datetime as dt
+import json
 import logging
+import threading
 
 import pytest
 
@@ -252,3 +254,102 @@ def test_the_command_stack_composes_the_version_gate_into_the_guard_options(worl
     request = SimpleNamespace(action=AI_PAPER_ACTION, body=world.body())
     world.versions.withdraw(world.version_digest, reason="operator", principal="cli", command_id="w1")
     assert gate(request, None, None, world.clock()) == "DEPLOYMENT_NOT_ACTIVE"
+
+
+# PR #95 round 1: the withdrawal and the point of no return (the SUBMITTING row) are ordered by the journal.
+
+def _withdraw(world, command_id="w-race"):
+    return world.versions.withdraw(world.version_digest, reason="operator", principal="cli", command_id=command_id)
+
+
+def _saga_row(world):
+    (raw,) = world.db.execute("SELECT payload FROM automated_order_sagas", fetch="one")
+    payload = json.loads(raw)
+    return payload["state"], payload["error_code"]
+
+
+def test_a_withdrawal_after_the_final_gate_and_before_the_send_stops_the_entry(world):
+    real = world.guard.revalidate
+
+    def gate_then_withdraw(*args, **kwargs):
+        permit = real(*args, **kwargs)                   # the final gate passed: the version was active
+        _withdraw(world)
+        return permit
+    world.guard.revalidate = gate_then_withdraw
+    receipt = world.submit()
+    assert (receipt.state, receipt.error_code) == ("REJECTED", "DEPLOYMENT_NOT_ACTIVE")
+    assert world.dispatch.plans == []
+    assert _saga_row(world) == ("CLOSED", "DEPLOYMENT_NOT_ACTIVE")
+
+
+def test_a_withdrawal_after_the_intent_lets_that_entry_go_and_is_recorded(world):
+    real, withdrawn = world.dispatch.submit_bracket, []
+
+    def withdraw_then_send(**kwargs):
+        withdrawn.append(_withdraw(world))               # the SUBMITTING row committed first
+        return real(**kwargs)
+    world.dispatch.submit_bracket = withdraw_then_send
+    receipt = world.submit()
+    assert receipt.state == "SUBMITTED" and len(world.dispatch.plans) == 1
+    assert withdrawn == [True] and world.versions.withdrawn() == {world.version_digest}
+    assert _saga_row(world) == ("SUBMITTING", None)
+
+
+def test_a_withdrawal_cannot_commit_while_the_intent_transaction_is_open(world):
+    """Linearizable, not only serializable: a withdrawal that starts while the SUBMITTING transaction reads the
+    withdrawals waits for its commit, so it can never land between that read and that commit."""
+    seen = {}
+
+    def withdraw_meanwhile(conn, request):
+        racer = threading.Thread(target=lambda: seen.setdefault("withdrawn", _withdraw(world)))
+        racer.start()
+        racer.join(timeout=0.3)
+        seen["waited"] = racer.is_alive()                # blocked on the journal write lock
+        seen["racer"] = racer
+    world.on_intent_check(withdraw_meanwhile)
+    receipt = world.submit()
+    seen["racer"].join(timeout=10)
+    assert seen["withdrawn"] is True and seen["waited"] is True
+    assert receipt.state == "SUBMITTED" and len(world.dispatch.plans) == 1
+    assert world.versions.withdrawn() == {world.version_digest}
+    # The journal itself orders them, with no clock: the intent's event precedes the withdrawal's.
+    (intent,) = world.db.execute("SELECT source_cursor FROM domain_event_journal "
+                                 "WHERE event_id LIKE 'saga:%:SUBMITTING:%'", fetch="one")
+    (withdrawal,) = world.db.execute("SELECT source_cursor FROM domain_event_journal WHERE event_id = ?",
+                                     [f"ai-deployment-withdrawal:{world.version_digest}"], fetch="one")
+    assert intent < withdrawal
+
+
+def test_the_withdrawal_is_a_journal_event(world):
+    assert _withdraw(world) is True and _withdraw(world, command_id="w-again") is False
+    rows = world.db.execute("SELECT event_type, entity_id, correlation_id FROM domain_event_journal "
+                            "WHERE entity_type = 'ai_deployment_version'", fetch="all")
+    assert rows == [("ai_deployment_version.withdrawn", world.version_digest, "w-race")]
+
+
+def test_the_command_stack_hands_the_saga_the_withdrawal_check(world):
+    from types import SimpleNamespace
+
+    from trader.automation.ai_paper_decision import AI_PAPER_ACTION
+    from trader.trading.command_stack import _AiPaperParts, _ai_paper_send_gate_in_tx
+
+    parts = _AiPaperParts(config=None, policy=world.policy, entry_filter=world.entry_filter,
+                          deployments=world.deployments, scope_checks=None, filter_refusal=None,
+                          versions=world.versions, activity=world.activity)
+    gate = _ai_paper_send_gate_in_tx(parts)
+    request = SimpleNamespace(action=AI_PAPER_ACTION, body=world.body())
+    assert world.db.transaction(lambda conn: gate(conn, request)) is None
+    _withdraw(world)
+    assert world.db.transaction(lambda conn: gate(conn, request)) == "DEPLOYMENT_NOT_ACTIVE"
+    assert _ai_paper_send_gate_in_tx(None) is None
+
+
+def test_a_send_gate_that_fails_refuses_the_entry_and_sends_nothing(world, caplog):
+    def broken(conn, request):
+        raise RuntimeError("journal unreadable")
+    world.on_intent_check(broken)
+    with caplog.at_level(logging.ERROR):
+        receipt = world.submit()
+    assert (receipt.state, receipt.error_code) == ("REJECTED", "AI_ENTRY_GATE_UNAVAILABLE")
+    assert world.dispatch.plans == [] and _saga_row(world) == ("CLOSED", "AI_ENTRY_GATE_UNAVAILABLE")
+    assert any("send gate failed" in r.getMessage() and "RuntimeError" in r.getMessage() for r in caplog.records)

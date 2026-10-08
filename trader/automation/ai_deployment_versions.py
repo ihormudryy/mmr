@@ -16,6 +16,7 @@ from typing import Any, Callable, Optional
 
 from trader.automation.ai_deployments import DeploymentRefused
 from trader.data.schema_migrations import SchemaMigrator
+from trader.domain.events import DomainMutation
 from trader.research.canonical import canonical_json_bytes
 
 AI_DEPLOYMENT_VERSION_MIGRATION_VERSION = 115
@@ -104,8 +105,11 @@ class SealedVersion:
 
 
 class AiDeploymentVersionStore:
-    def __init__(self, db: Any, now: Callable[[], dt.datetime]):
-        self._db = db
+    def __init__(self, journal: Any, now: Callable[[], dt.datetime]):
+        """``journal`` is the trader's DomainJournal: a withdrawal shares its write lock with the saga's
+        SUBMITTING row, so the two are ordered (PR #95). Reads use its DuckDB file directly."""
+        self._journal = journal
+        self._db = journal.db
         self._now = now
 
     def seal_in_tx(self, conn, version: DeploymentVersion, *, request_digest: str, principal: str,
@@ -180,16 +184,33 @@ class AiDeploymentVersionStore:
     def withdrawn(self) -> frozenset[str]:
         return self._db.transaction(self.withdrawn_in_tx)
 
+    def is_withdrawn_in_tx(self, conn, digest: str) -> bool:
+        return conn.execute("SELECT 1 FROM ai_deployment_withdrawals WHERE version_digest = ?",
+                            [digest]).fetchone() is not None
+
     def withdraw(self, digest: str, *, reason: str, principal: str, command_id: str) -> bool:
-        """True when this call withdrew the version, False when it was withdrawn before."""
-        def write(conn) -> bool:
+        """True when this call withdrew the version, False when it was withdrawn before.
+
+        A journal mutation: it commits either before an entry's SUBMITTING row (that entry is refused) or
+        after it (that entry counts as sent before the withdrawal), never in between."""
+        now = self._now()
+
+        def write(conn, append) -> bool:
             if not isinstance(digest, str) or not conn.execute(
                     "SELECT 1 FROM ai_deployment_versions WHERE digest = ?", [digest]).fetchone():
                 raise DeploymentRefused("DEPLOYMENT_VERSION_UNKNOWN", "no sealed version has this digest")
-            if conn.execute("SELECT 1 FROM ai_deployment_withdrawals WHERE version_digest = ?",
-                            [digest]).fetchone():
+            if self.is_withdrawn_in_tx(conn, digest):
                 return False
-            conn.execute("INSERT INTO ai_deployment_withdrawals (version_digest, reason, principal, command_id, "
-                         "withdrawn_at) VALUES (?, ?, ?, ?, ?)", [digest, reason, principal, command_id, self._now()])
+            mutation = DomainMutation(
+                event_type="ai_deployment_version.withdrawn", entity_type="ai_deployment_version",
+                entity_id=digest, operation="upsert", account_id=None, source="trader_service",
+                source_timestamp=now, correlation_id=command_id,
+                payload={"state": "WITHDRAWN", "reason": reason, "principal": principal})
+
+            def insert(conn, _revision: int) -> None:
+                conn.execute("INSERT INTO ai_deployment_withdrawals (version_digest, reason, principal, "
+                             "command_id, withdrawn_at) VALUES (?, ?, ?, ?, ?)",
+                             [digest, reason, principal, command_id, now])
+            append(mutation, insert, f"ai-deployment-withdrawal:{digest}")
             return True
-        return self._db.transaction(write)
+        return self._journal.mutate_batch_work(self._journal.connect(), write)

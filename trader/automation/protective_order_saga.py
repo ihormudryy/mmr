@@ -805,6 +805,7 @@ class ProtectiveOrderSaga:
         liquidation_deadline_seconds: float = 300.0,
         orphan_evidence: Optional[OrphanEvidencePort] = None,
         orphan_settle_seconds: float = DEFAULT_ORPHAN_SETTLE_SECONDS,
+        send_gate_in_tx: Optional[Callable[[Any, Any], Optional[str]]] = None,
     ):
         self._journal = journal
         self._ledger = ledger
@@ -820,6 +821,8 @@ class ProtectiveOrderSaga:
         self._liquidation_deadline_seconds = liquidation_deadline_seconds
         self._orphan_evidence = orphan_evidence
         self._orphan_settle = dt.timedelta(seconds=orphan_settle_seconds)
+        # Read on the SUBMITTING transaction: a refusal code, or None (PR #95).
+        self._send_gate_in_tx = send_gate_in_tx
 
     # -- public API --------------------------------------------------------
 
@@ -999,7 +1002,15 @@ class ProtectiveOrderSaga:
             send_generation_id=send_generation_id, send_attempted_at=now.isoformat(),
             baseline_position=_dec(approval.broker.reducible_quantity(validated.conid)),
         )
-        self._persist(submitting, now, from_state="VALIDATED")
+        try:
+            self._persist(submitting, now, from_state="VALIDATED",
+                          check_in_tx=lambda conn: self._run_send_gate_in_tx(conn, request))
+        except DispatchGuardError as ex:              # rolled back: the saga is still VALIDATED
+            closed = replace(
+                validated, state="CLOSED", error_code=ex.code, revision=validated.revision + 1,
+            )
+            self._persist(closed, now, from_state="VALIDATED")
+            return closed
 
         # 3) Irreversible boundary — submit via existing bracket path.
         try:
@@ -1023,6 +1034,20 @@ class ProtectiveOrderSaga:
             intent.command_id, now,
             lambda s: replace(s, submitted_order_ids=order_ids, send_returned_at=returned_at),
             always=True)
+
+    def _run_send_gate_in_tx(self, conn, request) -> None:
+        """The SUBMITTING row is the point of no return; a state written in the same journal (a withdrawal) is
+        ordered against it by the journal's write lock."""
+        if self._send_gate_in_tx is None:
+            return
+        try:
+            code = self._send_gate_in_tx(conn, request)
+        except Exception as exc:
+            logging.error("send gate failed for %s: %s", getattr(request, "command_id", None),
+                          type(exc).__name__, exc_info=True)
+            raise DispatchGuardError("AI_ENTRY_GATE_UNAVAILABLE", "the send gate failed") from exc
+        if code:
+            raise DispatchGuardError(code, "entry refused on the send transaction")
 
     def _after_dispatch(self, command_id: str, now: dt.datetime,
                         change: Callable[[SagaState], SagaState], *, always: bool = False) -> SagaState:

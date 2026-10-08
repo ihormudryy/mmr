@@ -595,7 +595,7 @@ def _build_ai_paper_parts(trader: Any, config: Any, now: Callable[[], dt.datetim
     judgments = judgment_reader_for(backtest_judgments, cases_dir=cases_dir, verify_dir=verify_dir)
     cooldowns = cooldown_reader_for(trader.journal_db)
     aware_now = _aware_clock(now)
-    versions = AiDeploymentVersionStore(trader.journal_db, now=aware_now)
+    versions = AiDeploymentVersionStore(trader.domain_journal, now=aware_now)   # withdrawals share the saga's lock
     activity = DeploymentActivity(versions=versions, deployments=deployments, judgments=judgments,
                                   cooldowns=cooldowns, max_active=judge.max_active_deploys, now=aware_now)
     registrar = AiDeploymentRegistrar(
@@ -609,6 +609,14 @@ def _build_ai_paper_parts(trader: Any, config: Any, now: Callable[[], dt.datetim
                          scope_checks=ScopeCheckStore(trader.journal_db, now=now),
                          filter_refusal=trading_filter_refusal(load_filter),
                          versions=versions, activity=activity, registrar=registrar, judgments=backtest_judgments)
+
+
+def _ai_paper_send_gate_in_tx(parts: Optional[_AiPaperParts]) -> Optional[Callable[[Any, Any], Optional[str]]]:
+    """PR #95: the saga rereads the withdrawals on its SUBMITTING transaction, after the final gate."""
+    if parts is None:
+        return None
+    from trader.automation.ai_deployment_activity import deployment_withdrawal_gate_in_tx
+    return deployment_withdrawal_gate_in_tx(versions=parts.versions)
 
 
 def _ai_paper_guard_options(parts: Optional[_AiPaperParts], accepted_feeds: frozenset[str]) -> dict:
@@ -1541,6 +1549,7 @@ def build_command_stack(
         orphan_evidence=BrokerStateOrphanEvidence(
             db=trader.journal_db, store=trader.broker_state_store, snapshots=broker_snapshot,
         ),
+        send_gate_in_tx=_ai_paper_send_gate_in_tx(ai_paper_parts),
     )
     # The saga is the protection port of every close and the source of unhandled failures.
     liquidation_service.attach_protection(protective_order_saga)

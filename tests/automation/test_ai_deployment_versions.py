@@ -10,6 +10,7 @@ from trader.automation.ai_deployment_versions import (
     version_digest,
 )
 from trader.automation.ai_deployments import DeploymentRefused
+from trader.data.domain_journal import DomainJournal
 from trader.data.duckdb_store import DuckDBConnection
 from trader.data.schema_migrations import SchemaMigrator
 
@@ -25,8 +26,10 @@ def version(judgment_id="jdg-1", kind=INITIAL, prior=None, first=dt.date(2026, 1
 @pytest.fixture
 def store(tmp_path):
     db = DuckDBConnection.get_instance(str(tmp_path / "journal.duckdb"))
+    journal = DomainJournal(db)
+    journal.migrate(SchemaMigrator(db))
     apply_ai_deployment_version_migrations(SchemaMigrator(db))
-    return AiDeploymentVersionStore(db, now=lambda: NOW)
+    return AiDeploymentVersionStore(journal, now=lambda: NOW)
 
 
 def seal(store, v, request="sha256:" + "1" * 64):

@@ -18,6 +18,7 @@ from trader.automation.ai_deployments import (
 )
 from trader.automation.ai_paper_actions import AiPaperActions
 from trader.automation.calendar_policy import XNYSCalendarPolicy
+from trader.data.domain_journal import DomainJournal
 from trader.data.duckdb_store import DuckDBConnection
 from trader.data.schema_migrations import SchemaMigrator
 from trader.trading.command_coordinator import CommandRequest, CommandValidationError
@@ -56,9 +57,11 @@ class Env:
         migrator = SchemaMigrator(self.db)
         apply_ai_deployment_migration(migrator)
         apply_ai_deployment_version_migrations(migrator)
+        journal = DomainJournal(self.db)
+        journal.migrate(migrator)
         clock = lambda: self.now
         self.deployments = AiDeploymentStore(self.db, now=clock)
-        self.versions = AiDeploymentVersionStore(self.db, now=clock)
+        self.versions = AiDeploymentVersionStore(journal, now=clock)
         self.judgments, self.cooldowns, self.bundles = SeededJudgments(), Cooldowns(), FakeBundles()
         self.activity = DeploymentActivity(versions=self.versions, deployments=self.deployments,
                                            judgments=self.judgments, cooldowns=self.cooldowns,

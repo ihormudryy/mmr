@@ -162,6 +162,25 @@ class DeploymentActivity:
         return None
 
 
+def deployment_withdrawal_gate_in_tx(*, versions: Any):
+    """The last check of a version-bound ENTER, on the saga's SUBMITTING transaction (PR #95).
+
+    The final gate above reads outside that transaction; a withdrawal could commit after it and before the send.
+    Withdrawals are journal mutations too, so either one commits first: this read sees it, or it follows the
+    intent. An unbound ENTER was refused by the final gate already."""
+    from trader.automation.ai_paper_evidence import AI_PAPER_ACTION
+
+    def gate(conn: Any, request: Any) -> Optional[str]:
+        body = getattr(request, "body", None) or {}
+        if getattr(request, "action", None) != AI_PAPER_ACTION or body.get("action") != "ENTER":
+            return None
+        version = body.get("deployment_version")
+        if version is None:
+            return None
+        return "DEPLOYMENT_NOT_ACTIVE" if versions.is_withdrawn_in_tx(conn, version) else None
+    return gate
+
+
 def deployment_version_gate(*, kind_of: Callable[[str], str], activity: DeploymentActivity):
     """Spec 5.2 item 8 at final dispatch, inside the saga's entry lock: journal reads only, no IB."""
     from trader.automation.ai_paper_evidence import AI_PAPER_ACTION

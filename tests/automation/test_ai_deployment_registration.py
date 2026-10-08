@@ -147,6 +147,31 @@ def test_cooldown_and_cap(env):
     assert env.refused("jdg-c3", record(3)) == "DEPLOY_CAP_REACHED"
 
 
+class RejectLandsWhileWaitingForTheLock:
+    """A journal whose ``transaction`` first records a REJECT: it committed after the early cooldown read."""
+
+    def __init__(self, db, strategy_key, until):
+        self._db, self._strategy_key, self._until = db, strategy_key, until
+
+    def transaction(self, fn):
+        from tests.automation.backtest_judge_fixtures import insert_reject
+        insert_reject(self._db, self._strategy_key, self._until)
+        return self._db.transaction(fn)
+
+
+def test_a_reject_recorded_before_the_registration_transaction_refuses_it(env):
+    from trader.automation.ai_judgment_port import Plan1Cooldowns
+    from trader.automation.backtest_judge_schema import apply_backtest_judge_migrations
+    apply_backtest_judge_migrations(SchemaMigrator(env.db))
+    key = "strategies/opening_range_breakout.py:OpeningRangeBreakout"
+    env.registrar._cooldowns = Plan1Cooldowns(env.db)
+    env.registrar._db = RejectLandsWhileWaitingForTheLock(env.db, key, dt.date(2026, 10, 22))
+    env.judge("jdg-1", record())
+    assert env.refused("jdg-1", record()) == "FAMILY_COOLING_DOWN"
+    assert env.versions.sealed() == ()
+    assert env.db.execute("SELECT COUNT(*) FROM ai_deployments", fetch="one") == (0,)
+
+
 def test_two_concurrent_registrations_for_the_last_slot(tmp_path):
     env = Env(tmp_path, max_active=1)
     for n in (0, 1):

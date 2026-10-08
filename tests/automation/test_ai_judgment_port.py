@@ -91,3 +91,14 @@ def test_real_cooldown_covers_the_rejected_strategy_until_its_last_session(tmp_p
     assert cooldowns.cooling_down("strategies/other.py:Other", NOW) is False
     after_last_session = dt.datetime(2026, 10, 23, 14, 0, tzinfo=dt.timezone.utc)
     assert cooldowns.cooling_down(KEY, after_last_session) is False
+
+
+def test_the_cooldown_is_also_read_on_the_caller_s_transaction(tmp_path):
+    w = world(tmp_path)
+    insert_reject(w.db, KEY, dt.date(2026, 10, 22))
+    cooldowns = cooldown_reader_for(w.db)
+    late_evening = dt.datetime(2026, 10, 23, 1, 30, tzinfo=dt.timezone.utc)      # still 22 Oct in New York
+    assert w.db.transaction(lambda conn: cooldowns.cooling_down_in_tx(conn, KEY, late_evening)) is True
+    assert w.db.transaction(lambda conn: cooldowns.cooling_down_in_tx(conn, "strategies/o.py:O", NOW)) is False
+    after_last_session = dt.datetime(2026, 10, 23, 14, 0, tzinfo=dt.timezone.utc)
+    assert w.db.transaction(lambda conn: cooldowns.cooling_down_in_tx(conn, KEY, after_last_session)) is False

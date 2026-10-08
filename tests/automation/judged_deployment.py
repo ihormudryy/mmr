@@ -30,6 +30,9 @@ class Cooldowns:
     def cooling_down(self, key, now):
         return key in self.keys
 
+    def cooling_down_in_tx(self, conn, key, now):
+        return key in self.keys
+
 
 def deploy_facts(record: dict, judgment_id: str, *, verdict="DEPLOY", kind="INITIAL", renews=None,
                  model_id="jev-model", artifact_id="art-1", family_id="fam-1") -> JudgmentFacts:

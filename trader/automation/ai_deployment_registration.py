@@ -97,7 +97,8 @@ class AiDeploymentRegistrar:
         problems = binding_differences(deployment, bundle, cases, bundle_digest=bundle_digest)
         if problems:
             raise DeploymentRefused("JUDGMENT_MISMATCH", "; ".join(problems))
-        if self._cooldowns.cooling_down(strategy_key(deployment.strategy_path, deployment.class_name), now):
+        key = strategy_key(deployment.strategy_path, deployment.class_name)
+        if self._cooldowns.cooling_down(key, now):
             raise DeploymentRefused("FAMILY_COOLING_DOWN", "the strategy key is cooling down")
         first, expiry = self._sessions(now, bundle.expires_at)
         version = DeploymentVersion(base_digest=deployment_digest(deployment), judgment_id=judgment_id,
@@ -114,6 +115,9 @@ class AiDeploymentRegistrar:
                 return self._existing_outcome(raced, digest_of_request)
             if prior is not None and prior in self._versions.withdrawn_in_tx(conn):
                 raise DeploymentRefused("RENEWAL_PRIOR_INVALID", "the prior version was withdrawn")
+            # A REJECT may have committed since the read above; the clock is read after waiting for the lock.
+            if self._cooldowns.cooling_down_in_tx(conn, key, self._now()):
+                raise DeploymentRefused("FAMILY_COOLING_DOWN", "the strategy key is cooling down")
             self._require_room_in_tx(conn, stands, today=ny_date(now), excluding=prior)
             self._deployments.register_in_tx(conn, deployment, principal=principal, command_id=command_id)
             digest, created = self._versions.seal_in_tx(conn, version, request_digest=digest_of_request,

@@ -38,6 +38,7 @@ class JudgmentReader(Protocol):
 
 class CooldownReader(Protocol):
     def cooling_down(self, strategy_key: str, now: dt.datetime) -> bool: ...
+    def cooling_down_in_tx(self, conn: Any, strategy_key: str, now: dt.datetime) -> bool: ...
 
 
 def strategy_key(strategy_path: str, class_name: str) -> str:
@@ -78,8 +79,11 @@ class Plan1Cooldowns:
         self._db = db
 
     def cooling_down(self, strategy_key: str, now: dt.datetime) -> bool:
-        today = ny_day(now)
-        return self._db.transaction(lambda conn: cooling_until_in_tx(conn, strategy_key, today)) is not None
+        return self._db.transaction(lambda conn: self.cooling_down_in_tx(conn, strategy_key, now))
+
+    def cooling_down_in_tx(self, conn: Any, strategy_key: str, now: dt.datetime) -> bool:
+        """On the caller's journal transaction: a REJECT committed before it is seen."""
+        return cooling_until_in_tx(conn, strategy_key, ny_day(now)) is not None
 
 
 def judgment_reader_for(judgments: Any, *, cases_dir: Path, verify_dir: Path) -> JudgmentReader:

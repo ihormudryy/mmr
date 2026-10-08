@@ -86,7 +86,8 @@ def apply_research_migrations(migrator: SchemaMigrator) -> None:
     (migrations 1-2), the experiment registry (migrations 3-6), the eligibility
     decision store (migration 7), operator reviews (migration 8), eligibility
     attestations + revocations (migration 9), the operator-review kind
-    (migration 10), and the evaluation log (migration 11). The research DB is a
+    (migration 10), the evaluation log (migration 11) and the research
+    service's requests, cases and shadow cohort (migrations 20-22). The research DB is a
     single file, so one call bootstraps every research table. The downstream
     migrations are imported lazily to keep this module free of a hard
     dependency on the registry/eligibility/attestation modules at import time."""
@@ -108,6 +109,8 @@ def apply_research_migrations(migrator: SchemaMigrator) -> None:
     apply_reviewer_kind_migration(migrator)
     from trader.research.evaluation_store import apply_evaluation_migrations
     apply_evaluation_migrations(migrator)
+    from trader.research.service_store import apply_service_migrations
+    apply_service_migrations(migrator)
 
 
 class DigestConflict(Exception):

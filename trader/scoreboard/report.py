@@ -11,7 +11,7 @@ from collections import defaultdict
 from dataclasses import dataclass
 from typing import Any, Mapping, Optional, Sequence
 
-from trader.scoreboard.books import build_books, summarize_costs
+from trader.scoreboard.books import build_books, build_shadow_books, summarize_costs
 from trader.scoreboard.metrics import (EOD_DRAWDOWN_LABEL, SPLIT_KEYS, SPY_LABEL, daily_sharpe, eod_drawdown_pct,
                                        group_trip_metrics, session_returns, trip_metrics)
 from trader.scoreboard.ports import session_date_et
@@ -36,6 +36,7 @@ class ReportInputs:
     warnings: Sequence[Mapping[str, Any]]
     outbox: Optional[Mapping[str, Any]]
     calendar: Any                 # previous_session(day) for the SPY base (ruling 14)
+    shadow_rows: Sequence[Mapping[str, Any]] = ()   # SP2c Plan 3: forward replay rows, global (not per experiment)
 
 
 def _round(value: Any) -> Any:
@@ -148,6 +149,7 @@ def build_report(inputs: ReportInputs) -> dict:
         "experiment": _experiment_view(inputs.experiment),
         "account": account,
         "benchmarks": _benchmarks(inputs, account),
+        "shadow_books": build_shadow_books(inputs.shadow_rows),
         "trips": trip_metrics(inputs.trips, start_nlv_usd=start),
         "splits": {key: group_trip_metrics(inputs.trips, key, start_nlv_usd=start) for key in SPLIT_KEYS},
         "sessions": [_session_view(row, inputs.adjustments) for row in rows],

@@ -1080,6 +1080,18 @@ def _scoreboard_terminal(slot: dict, state: Any) -> None:
     ledger.on_controller_terminal(state)
 
 
+def _build_shadow_ingest(trader: Any, scoreboard: Any, ai_paper: Any) -> Any:
+    """SP2c Plan 3: only on an enabled ai_paper stack, which is paper only; None otherwise."""
+    from trader.scoreboard.shadow_ingest import ShadowIngest
+
+    ai_paper_config = getattr(trader, "ai_paper_config", None)
+    if ai_paper is None or ai_paper.judgments is None or ai_paper_config is None:
+        return None
+    return ShadowIngest(store=scoreboard.store, judgments=ai_paper.judgments,
+                        versions=getattr(trader, "ai_deployment_versions", None),
+                        config=ai_paper_config.backtest_judge, now=scoreboard.now)
+
+
 def _build_scoreboard(trader: Any, migrator: Any, broker: Any, experiments: Optional[ExperimentServices],
                       ai_paper: Any, now: Callable[[], dt.datetime], command_ledger: Any = None) -> Any:
     """SP1 Plan 5. An enabled but invalid ai_paper.telegram section raises here: startup stops (ruling 17)."""
@@ -1818,6 +1830,7 @@ def build_command_stack(
     trader.scoreboard = scoreboard
     trader.scoreboard_service = scoreboard.service              # get_scoreboard / verify_scoreboard
     trader.ai_ingest = scoreboard.ingest                          # record_ai_cost / record_simulated_decision
+    trader.shadow_ingest = _build_shadow_ingest(trader, scoreboard, ai_paper)   # record_shadow_result
     trader.session_ledger = scoreboard.ledger
     trader.telegram_outbox = scoreboard.outbox
     if experiments is not None:

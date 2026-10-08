@@ -173,7 +173,7 @@ def load_identity_material(
 # as a peer; all of them must restart together (owner answer 7).
 _LONG_LIVED_SERVICE_PRINCIPALS: Mapping[str, tuple[str, ...]] = {
     "trader": ("trader",), "strategy": ("strategy",), "dashboard": ("dashboard",),
-    "ai": ("ai_supervisor", "ai_research"),
+    "ai": ("ai_supervisor", "ai_research"), "research": ("research",),
 }
 
 

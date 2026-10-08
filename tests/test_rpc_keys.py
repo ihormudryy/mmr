@@ -16,9 +16,9 @@ def test_default_rpc_keys_dir_is_isolated_in_tests():
 def test_peers_follow_the_trust_matrix():
     assert principals.peers_for("trader") == {"cli", "dashboard", "strategy", "ai_supervisor", "ai_research",
                                               "research"}
-    assert principals.peers_for("research") == {"trader"}
+    assert principals.peers_for("research") == {"trader", "ai_research", "cli"}
     assert principals.peers_for("strategy") == {"cli", "dashboard", "trader"}
-    assert principals.peers_for("ai_research") == {"trader"}
+    assert principals.peers_for("ai_research") == {"trader", "research"}
     for reserved in ("telegram_bridge", "scheduler"):
         with pytest.raises(ValueError):
             principals.peers_for(reserved)

@@ -80,6 +80,11 @@ if [ \"$1\" = \"compose\" ]; then
         printf '%s\\n' scheduler-container
       fi
       ;;
+    *\" config --services\"*)
+      if [ -n \"${MMR_FAKE_CONFIG_FAIL:-}\" ]; then exit 1; fi
+      printf '%s\\n' ib-gateway trader strategy
+      if [ \"${MMR_FAKE_RESEARCH_ACTIVE:-}\" = \"1\" ]; then printf '%s\\n' research; fi
+      ;;
     *\" config --format json \"*)
       # Match docker-compose.yml ``name: mmr`` so db_data_volume() resolves
       # the project-prefixed live volume in helper tests.
@@ -106,7 +111,7 @@ exit 0
         calls = []
         for line in (self.log_path.read_text() if self.log_path.exists() else '').splitlines():
             words = shlex.split(line)
-            if words[:2] == ["compose", "-f"]:
+            if words[:2] == ["compose", "-f"] and words[-2:] != ["config", "--services"]:
                 calls.append(words[3:])
         return calls
 
@@ -116,6 +121,9 @@ exit 0
 
     def write_keys(self) -> None:
         write_keyset(self.rpc_dir)
+        private = self.home / ".config" / "mmr" / "keys" / "private"
+        private.mkdir(parents=True, exist_ok=True)
+        (private / "signing.pem").write_text("test signing key placeholder\n")
 
     def run(self, *args: str, env: dict[str, str] | None = None,
             stdin: str = "") -> DockerHelperResult:
@@ -231,6 +239,44 @@ def test_up_refuses_when_an_rpc_key_is_missing(fake_docker: FakeDocker):
 
     assert result.returncode != 0
     assert "mmr keys init" in result.stdout and "strategy.pub" in result.stdout
+    assert not fake_docker.compose_calls
+
+
+def test_up_without_research_in_the_compose_services_does_not_need_the_signing_key(fake_docker: FakeDocker):
+    fake_docker.write_keys()
+    (fake_docker.home / ".config/mmr/keys/private/signing.pem").unlink()
+    result = fake_docker.run("-u")
+
+    assert result.returncode == 0, result.stdout
+    assert "up -d" in result.log
+
+
+@pytest.mark.parametrize("env", [{"MMR_FAKE_RESEARCH_ACTIVE": "1"}, {"MMR_FAKE_CONFIG_FAIL": "1"}],
+                         ids=["research-listed", "compose-config-fails"])
+def test_up_refuses_a_missing_signing_key_when_research_runs_or_compose_cannot_say(
+        fake_docker: FakeDocker, env):
+    fake_docker.write_keys()
+    (fake_docker.home / ".config/mmr/keys/private/signing.pem").unlink()
+    result = fake_docker.run("-u", env=env)
+
+    assert result.returncode != 0
+    assert "mmr keys init-signing" in result.stdout and "signing.pem" in result.stdout
+    assert not fake_docker.compose_calls
+
+
+def test_up_with_research_listed_and_the_key_present_starts(fake_docker: FakeDocker):
+    fake_docker.write_keys()
+    result = fake_docker.run("-u", env={"MMR_FAKE_RESEARCH_ACTIVE": "1"})
+
+    assert result.returncode == 0, result.stdout
+
+
+def test_K_refuses_a_missing_signing_key_whatever_the_profile(fake_docker: FakeDocker):
+    fake_docker.write_keys()
+    (fake_docker.home / ".config/mmr/keys/private/signing.pem").unlink()
+    result = fake_docker.run("-K")
+
+    assert result.returncode != 0 and "mmr keys init-signing" in result.stdout
     assert not fake_docker.compose_calls
 
 
@@ -391,7 +437,7 @@ def test_backup_fallback_uses_compose_project_volume(fake_docker: FakeDocker):
 
 # --- PR #50 round 1, finding 4: isolated, mount-only cutover gate ---
 
-KEYCHECK_SERVICES = {"trader", "strategy", "dashboard", "cli", "scheduler", "data", "ai"}
+KEYCHECK_SERVICES = {"trader", "strategy", "dashboard", "cli", "scheduler", "data", "ai", "research"}
 
 
 def _compose_lines(fake_docker: FakeDocker) -> list[list[str]]:

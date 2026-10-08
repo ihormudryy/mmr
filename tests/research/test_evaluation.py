@@ -306,7 +306,7 @@ def test_same_strategy_overlapping_holdout_is_refused_before_any_trial(workspace
 
 
 @pytest.mark.timeout(240)
-def test_a_benchmark_failure_does_not_spend_the_holdout(workspace, monkeypatch):
+def test_a_benchmark_failure_after_the_holdout_ran_still_spends_it(workspace, monkeypatch):
     _, db_path, db, paths = workspace
     write_trend_bars(db_path, drift=0.0006)
     spec = _spec(workspace)
@@ -320,16 +320,14 @@ def test_a_benchmark_failure_does_not_spend_the_holdout(workspace, monkeypatch):
             evaluate(spec, research_db=db, paths=paths, now=_now, ruleset=_holdout_ruleset())
 
     registry = ExperimentRegistry(db)
-    family_id = EvaluationRepository(db).list()
-    assert family_id == []  # nothing recorded for the failed run
-    families = db.transaction(lambda c: c.execute(
-        'SELECT family_id FROM experiment_families').fetchall())
-    for (fid,) in families:
-        assert all(not a.holdout_opened for a in registry.family_artifacts(fid))
+    assert EvaluationRepository(db).list() == []  # nothing recorded for the failed run
+    windows = registry.opened_holdout_windows(spec.strategy_path, spec.class_name)
+    assert len(windows) == 1                     # the backtests ran: the window is revealed
+    artifact = registry.get_artifact(windows[0]['artifact_id'])
+    assert artifact.holdout_opened and artifact.holdout_passed is False and artifact.state == 'RETIRED'
 
-    result = evaluate(spec, research_db=db, paths=paths, now=_now, ruleset=_holdout_ruleset())
-    assert result.stage == STAGE_COMPLETE
-    assert ExperimentRegistry(db).get_artifact(result.artifact_id).holdout_opened
+    with pytest.raises(EvaluationError, match='holdout already opened'):   # fail closed: no second look
+        evaluate(spec, research_db=db, paths=paths, now=_now, ruleset=_holdout_ruleset())
 
 
 def test_holdout_session_one_keeps_its_spy_return(monkeypatch):

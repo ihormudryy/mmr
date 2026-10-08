@@ -23,6 +23,7 @@ SEALED_TABLES: dict[str, tuple[str, ...]] = {
     "ai_costs": ("record_id",),
     "simulated_decisions": ("record_id",),
     "simulated_outcomes": ("record_id",),
+    "shadow_results": ("record_id",),
 }
 WORKING_TABLES: dict[str, tuple[str, ...]] = {
     "round_trips": ("opened_at", "round_trip_id"),
@@ -267,6 +268,11 @@ class ScoreboardStore:
             for key in sorted(set(live) - {k for t, k in sealed if t == table}):
                 mismatches.append({"check": "ROW_UNSEALED", "table": table, "key": key})
         return mismatches
+
+    def sealed_digests(self, table: str) -> dict[str, str]:
+        """Row key to the digest sealed at insert, for one table."""
+        return {seal["row_key"]: seal["row_digest"] for seal in self.fetch("scoreboard_seals", {})
+                if seal["table_name"] == table}
 
     def seal_count(self) -> int:
         row = self._db.execute("SELECT COUNT(*) FROM scoreboard_seals", fetch="one")

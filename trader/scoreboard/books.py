@@ -9,6 +9,9 @@ from typing import Any, Mapping, Sequence
 
 PNL_BASIS = "gross, no commissions or slippage"
 LABEL = "simulated"
+SHADOW_LABEL = "SHADOW"
+SHADOW_BASIS = "forward replay: same backtester, cost model and live rules; never summed across verdicts"
+SHADOW_VERDICTS = ("DEPLOY", "SHADOW", "REJECT")
 
 
 def build_books(decisions: Sequence[Mapping[str, Any]], outcomes: Sequence[Mapping[str, Any]]) -> list[dict]:
@@ -32,6 +35,31 @@ def build_books(decisions: Sequence[Mapping[str, Any]], outcomes: Sequence[Mappi
             "known_pnl_usd": known if complete else None,
             "incomplete_reasons": dict(Counter(o["reason"] for o in incomplete)),
         })
+    return books
+
+
+def build_shadow_books(rows: Sequence[Mapping[str, Any]]) -> list[dict]:
+    """SP2c spec 7: one book per verdict, so DEPLOY and REJECT forward results sit side by side."""
+    by_verdict: dict[str, list[Mapping]] = defaultdict(list)
+    for row in rows:
+        by_verdict[row["verdict"]].append(row)
+    books = []
+    for verdict in SHADOW_VERDICTS:
+        members = by_verdict.get(verdict)
+        if not members:
+            continue
+        complete = [r for r in members if r["status"] == "COMPLETE"]
+        incomplete = [r for r in members if r["status"] == "INCOMPLETE"]
+        known = float(sum(r["pnl_usd"] for r in complete))
+        books.append({
+            "verdict": verdict, "label": SHADOW_LABEL, "basis": SHADOW_BASIS,
+            "judgments": len({r["judgment_id"] for r in members}), "sessions": len(members),
+            "complete": len(complete), "incomplete": len(incomplete),
+            "status": "INCOMPLETE" if incomplete else "COMPLETE",
+            "pnl_usd": None if incomplete else known, "known_pnl_usd": known if complete else None,
+            "fees_usd": float(sum(r["fees_usd"] for r in complete)) if complete else None,
+            "trades": sum(r["trades"] for r in complete) if complete else None,
+            "incomplete_reasons": dict(Counter(r["reason"] for r in incomplete))})
     return books
 
 

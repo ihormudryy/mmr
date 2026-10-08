@@ -500,34 +500,54 @@ class AttestationRepository:
                     "SELECT 1 FROM eligibility_attestations WHERE payload_digest = ?",
                     [digest]).fetchone() is not None:
                 return digest  # idempotent: content-addressed, already recorded
-            conn.execute(
-                "INSERT INTO eligibility_attestations (payload_digest, artifact_digest, "
-                "source_digest, config_digest, dataset_manifest_digest, allowlist_digest, "
-                "training_boundary, validation_boundary, holdout_boundary, evidence_boundary, "
-                "cost_assumptions, capacity_assumptions, ruleset_name, ruleset_version, "
-                "ruleset_digest, eligibility_state, permitted_account_mode, max_gross_allocation, "
-                "permitted_instruments, created_at, expires_at, operator_approved_at, promoted_at, "
-                "reason_codes, evidence_refs, eligibility_decision_digest, review_digest, "
-                "public_key_id, signature) VALUES "
-                "(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
-                [digest, attestation.artifact_digest, attestation.source_digest,
-                 attestation.config_digest, attestation.dataset_manifest_digest,
-                 attestation.allowlist_digest, attestation.training_boundary,
-                 attestation.validation_boundary, attestation.holdout_boundary,
-                 attestation.evidence_boundary, json.dumps(dict(attestation.cost_assumptions)),
-                 json.dumps(dict(attestation.capacity_assumptions)), attestation.ruleset_name,
-                 attestation.ruleset_version, attestation.ruleset_digest,
-                 attestation.eligibility_state, attestation.permitted_account_mode,
-                 float(attestation.max_gross_allocation),
-                 json.dumps(list(attestation.permitted_instruments)), attestation.created_at,
-                 attestation.expires_at, attestation.operator_approved_at,
-                 attestation.promoted_at, json.dumps(list(attestation.reason_codes)),
-                 json.dumps(list(attestation.evidence_refs)),
-                 attestation.eligibility_decision_digest, attestation.review_digest,
-                 attestation.public_key_id, attestation.signature])
+            self._insert_in_tx(conn, attestation)
             return digest
 
         return self._db.transaction(_tx)
+
+    def record_unless_attested(self, attestation: EligibilityAttestation) -> str:
+        """Record the attestation unless its decision and review already have one; return the stored digest.
+
+        The check and the insert share one transaction, so two writers cannot both attest one decision."""
+        def _tx(conn):
+            found = conn.execute(
+                "SELECT payload_digest FROM eligibility_attestations "
+                "WHERE eligibility_decision_digest = ? AND review_digest = ?",
+                [attestation.eligibility_decision_digest, attestation.review_digest]).fetchall()
+            if found:
+                return found[0][0]
+            self._insert_in_tx(conn, attestation)
+            return attestation.payload_digest
+
+        return self._db.transaction(_tx)
+
+    @staticmethod
+    def _insert_in_tx(conn, attestation: EligibilityAttestation) -> None:
+        conn.execute(
+            "INSERT INTO eligibility_attestations (payload_digest, artifact_digest, "
+            "source_digest, config_digest, dataset_manifest_digest, allowlist_digest, "
+            "training_boundary, validation_boundary, holdout_boundary, evidence_boundary, "
+            "cost_assumptions, capacity_assumptions, ruleset_name, ruleset_version, "
+            "ruleset_digest, eligibility_state, permitted_account_mode, max_gross_allocation, "
+            "permitted_instruments, created_at, expires_at, operator_approved_at, promoted_at, "
+            "reason_codes, evidence_refs, eligibility_decision_digest, review_digest, "
+            "public_key_id, signature) VALUES "
+            "(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            [attestation.payload_digest, attestation.artifact_digest, attestation.source_digest,
+             attestation.config_digest, attestation.dataset_manifest_digest,
+             attestation.allowlist_digest, attestation.training_boundary,
+             attestation.validation_boundary, attestation.holdout_boundary,
+             attestation.evidence_boundary, json.dumps(dict(attestation.cost_assumptions)),
+             json.dumps(dict(attestation.capacity_assumptions)), attestation.ruleset_name,
+             attestation.ruleset_version, attestation.ruleset_digest,
+             attestation.eligibility_state, attestation.permitted_account_mode,
+             float(attestation.max_gross_allocation),
+             json.dumps(list(attestation.permitted_instruments)), attestation.created_at,
+             attestation.expires_at, attestation.operator_approved_at,
+             attestation.promoted_at, json.dumps(list(attestation.reason_codes)),
+             json.dumps(list(attestation.evidence_refs)),
+             attestation.eligibility_decision_digest, attestation.review_digest,
+             attestation.public_key_id, attestation.signature])
 
     def get(self, payload_digest_value: str) -> Optional[EligibilityAttestation]:
         def _tx(conn):

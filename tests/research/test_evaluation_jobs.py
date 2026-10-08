@@ -108,3 +108,14 @@ def test_spawned_workers_apply_the_parents_logging_switch():
             assert pool.submit(_worker_logging_threshold).result(timeout=60) == logging.CRITICAL
     finally:
         logging.disable(previous)
+
+
+@pytest.mark.timeout(240)
+def test_window_job_passes_trading_start_to_the_backtest(market):
+    trading_start = dt.datetime(2024, 2, 5, tzinfo=UTC)
+    job = WindowJob(point_key='p', params={'ENTRY_MINUTE': 600, 'EXIT_MINUTE': 660},
+                    window_kind='fold', window_index=0, start=FEB[0], end=FEB[1],
+                    cost_multiplier=1.0, trading_start=trading_start)
+    outcome = run_window_job(_env(market), job)
+    assert outcome.trades and all(t['timestamp'] >= trading_start for t in outcome.trades)
+    assert outcome.equity[0][0] >= trading_start

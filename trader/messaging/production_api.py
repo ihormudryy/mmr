@@ -2817,6 +2817,8 @@ def build_production_registry(
     register_ai_ingest_surface(registry, getattr(trader, 'ai_ingest', None),
                                model_budget=None if ai_paper_config is None
                                else ai_paper_config.model_budget_usd_per_day)
+    from trader.messaging.shadow_surface import register_shadow_surface
+    register_shadow_surface(registry, getattr(trader, 'shadow_ingest', None))
 
     if command_stack is not None:
         register_command_authority(

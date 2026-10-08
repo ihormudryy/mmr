@@ -194,6 +194,12 @@ services:
         tmpfs:
           size: 65536
           mode: 0755
+      # The research signing key lives only in the research container (SP2c ruling 14).
+      - type: tmpfs
+        target: /home/trader/.config/mmr/keys/private
+        tmpfs:
+          size: 4096
+          mode: 0700
       # Retired shared HMAC key: unreadable in every container (ruling 14).
       - /dev/null:/home/trader/.config/mmr/service_hmac.key:ro
       # Telegram secrets: hidden here; only the trader mounts them (SP1 Plan 5).
@@ -263,6 +269,12 @@ services:
         tmpfs:
           size: 65536
           mode: 0755
+      # The research signing key lives only in the research container (SP2c ruling 14).
+      - type: tmpfs
+        target: /home/trader/.config/mmr/keys/private
+        tmpfs:
+          size: 4096
+          mode: 0700
       - ${HOME}/.config/mmr/keys/rpc/trader.key:/home/trader/.config/mmr/keys/rpc/trader.key:ro
       - ${HOME}/.config/mmr/keys/rpc/trader.pub:/home/trader/.config/mmr/keys/rpc/trader.pub:ro
       - ${HOME}/.config/mmr/keys/rpc/ai_research.pub:/home/trader/.config/mmr/keys/rpc/ai_research.pub:ro
@@ -362,6 +374,12 @@ services:
         tmpfs:
           size: 65536
           mode: 0755
+      # The research signing key lives only in the research container (SP2c ruling 14).
+      - type: tmpfs
+        target: /home/trader/.config/mmr/keys/private
+        tmpfs:
+          size: 4096
+          mode: 0700
       - ${HOME}/.config/mmr/keys/rpc/strategy.key:/home/trader/.config/mmr/keys/rpc/strategy.key:ro
       - ${HOME}/.config/mmr/keys/rpc/strategy.pub:/home/trader/.config/mmr/keys/rpc/strategy.pub:ro
       - ${HOME}/.config/mmr/keys/rpc/cli.pub:/home/trader/.config/mmr/keys/rpc/cli.pub:ro
@@ -487,6 +505,12 @@ services:
         tmpfs:
           size: 65536
           mode: 0755
+      # The research signing key lives only in the research container (SP2c ruling 14).
+      - type: tmpfs
+        target: /home/trader/.config/mmr/keys/private
+        tmpfs:
+          size: 4096
+          mode: 0700
       - ${HOME}/.config/mmr/keys/rpc/dashboard.key:/home/trader/.config/mmr/keys/rpc/dashboard.key:ro
       - ${HOME}/.config/mmr/keys/rpc/dashboard.pub:/home/trader/.config/mmr/keys/rpc/dashboard.pub:ro
       - ${HOME}/.config/mmr/keys/rpc/strategy.pub:/home/trader/.config/mmr/keys/rpc/strategy.pub:ro
@@ -545,6 +569,12 @@ services:
         tmpfs:
           size: 65536
           mode: 0755
+      # The research signing key lives only in the research container (SP2c ruling 14).
+      - type: tmpfs
+        target: /home/trader/.config/mmr/keys/private
+        tmpfs:
+          size: 4096
+          mode: 0700
       # Retired shared HMAC key: unreadable in every container (ruling 14).
       - /dev/null:/home/trader/.config/mmr/service_hmac.key:ro
       # Telegram secrets: hidden here; only the trader mounts them (SP1 Plan 5).
@@ -613,6 +643,7 @@ services:
       - ${HOME}/.config/mmr/keys/rpc/ai_research.key:/home/trader/.config/mmr/keys/rpc/ai_research.key:ro
       - ${HOME}/.config/mmr/keys/rpc/ai_research.pub:/home/trader/.config/mmr/keys/rpc/ai_research.pub:ro
       - ${HOME}/.config/mmr/keys/rpc/trader.pub:/home/trader/.config/mmr/keys/rpc/trader.pub:ro
+      - ${HOME}/.config/mmr/keys/rpc/research.pub:/home/trader/.config/mmr/keys/rpc/research.pub:ro
       - ${HOME}/.config/mmr/ai.yaml:/home/trader/.config/mmr/ai.yaml:ro
       # The key-mount gate (./docker.sh -K) expects the retired HMAC file as /dev/null.
       - /dev/null:/home/trader/.config/mmr/service_hmac.key:ro
@@ -624,6 +655,62 @@ services:
       timeout: 5s
       retries: 3
       start_period: 120s
+
+  # ── research: evaluations, cases, attestation, shadow replay (SP2c Plan 3) ──
+  # Typed RPC server 42106 (query) / 42107 (command) on the private network only.
+  # Holds the research signing key (read-only) and no other private key, no IB or
+  # model credentials, no Telegram secrets. mmr_db_data like strategy (ruling 13);
+  # its own research DB on mmr_research_data.
+  research:
+    <<: *mmr-hardening
+    build: *mmr-build
+    profiles: ["ai"]
+    working_dir: /home/trader/mmr
+    command: ["python", "-m", "trader.research_service"]
+    depends_on:
+      - trader
+    mem_limit: 2g
+    cpus: 1.0
+    environment:
+      TZ: ${TIME_ZONE:-America/New_York}
+      PYTHONDONTWRITEBYTECODE: "1"
+      MMR_CONFIG_DEFAULTS: "off"
+      TRADER_CONFIG: /home/trader/.config/mmr/trader.yaml
+      TRADING_MODE: ${TRADING_MODE:-paper}
+      IB_ACCOUNT: ${IB_ACCOUNT:-}
+      TRADER_TYPED_ADDRESS: tcp://trader
+      RESEARCH_TYPED_BIND_ADDRESS: tcp://0.0.0.0
+      MMR_RESEARCH_DUCKDB: /home/trader/.local/share/mmr/research/mmr_research.duckdb
+    volumes:
+      - type: tmpfs
+        target: /home/trader/.config/mmr
+        tmpfs:
+          size: 65536
+          mode: 0755
+      - type: tmpfs
+        target: /home/trader/.config/mmr/keys/rpc
+        tmpfs:
+          size: 65536
+          mode: 0755
+      - ${HOME}/.config/mmr/keys/rpc/research.key:/home/trader/.config/mmr/keys/rpc/research.key:ro
+      - ${HOME}/.config/mmr/keys/rpc/research.pub:/home/trader/.config/mmr/keys/rpc/research.pub:ro
+      - ${HOME}/.config/mmr/keys/rpc/trader.pub:/home/trader/.config/mmr/keys/rpc/trader.pub:ro
+      - ${HOME}/.config/mmr/keys/rpc/ai_research.pub:/home/trader/.config/mmr/keys/rpc/ai_research.pub:ro
+      - ${HOME}/.config/mmr/keys/rpc/cli.pub:/home/trader/.config/mmr/keys/rpc/cli.pub:ro
+      - ${HOME}/.config/mmr/keys/private/signing.pem:/home/trader/.config/mmr/keys/private/signing.pem:ro
+      - ${HOME}/.config/mmr/trader.yaml:/home/trader/.config/mmr/trader.yaml:ro
+      - ${HOME}/.config/mmr/execution_costs.yaml:/home/trader/.config/mmr/execution_costs.yaml:ro
+      - /dev/null:/home/trader/.config/mmr/service_hmac.key:ro
+      - mmr_db_data:/home/trader/.local/share/mmr/data
+      - mmr_research_data:/home/trader/.local/share/mmr/research
+      - ${HOME}/.local/share/mmr/artifacts:/home/trader/.local/share/mmr/artifacts
+      - ${HOME}/.local/share/mmr/logs:/home/trader/.local/share/mmr/logs
+    healthcheck:
+      test: ["CMD", "python3", "-c", "import socket; socket.create_connection((socket.gethostname(), 42106), timeout=3).close()"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 30s
 
   # ── cli: one-shot `mmr` CLI client (owner answer 1) ──────────────────────
   # `docker compose run --rm cli strategies` -- for commands that need the
@@ -651,10 +738,17 @@ services:
         tmpfs:
           size: 65536
           mode: 0755
+      # The research signing key lives only in the research container (SP2c ruling 14).
+      - type: tmpfs
+        target: /home/trader/.config/mmr/keys/private
+        tmpfs:
+          size: 4096
+          mode: 0700
       - ${HOME}/.config/mmr/keys/rpc/cli.key:/home/trader/.config/mmr/keys/rpc/cli.key:ro
       - ${HOME}/.config/mmr/keys/rpc/cli.pub:/home/trader/.config/mmr/keys/rpc/cli.pub:ro
       - ${HOME}/.config/mmr/keys/rpc/strategy.pub:/home/trader/.config/mmr/keys/rpc/strategy.pub:ro
       - ${HOME}/.config/mmr/keys/rpc/trader.pub:/home/trader/.config/mmr/keys/rpc/trader.pub:ro
+      - ${HOME}/.config/mmr/keys/rpc/research.pub:/home/trader/.config/mmr/keys/rpc/research.pub:ro
       - /dev/null:/home/trader/.config/mmr/service_hmac.key:ro
       # Telegram secrets: hidden here; only the trader mounts them (SP1 Plan 5).
       - type: tmpfs
@@ -763,3 +857,4 @@ networks:
 volumes:
   mmr_db_data:
   mmr_ai_data:
+  mmr_research_data:

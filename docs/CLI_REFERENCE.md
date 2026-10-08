@@ -33,6 +33,7 @@ JSON output always follows the structure `{"data": ..., "title": ...}` for data 
 status                       # Service connectivity check
 keys init                    # Create missing RPC keypairs (never overwrites); Docker: ./docker.sh -k
 keys init --rotate dashboard # Replace one principal's keypair; prints the services to restart together
+keys init-signing            # Create keys/private/signing.pem (0600) + keys/verify/paper-automation.pem; never overwrites; host only
 keys backup --recipient FILE # age-encrypted tar of keys/rpc (Docker: ./docker.sh -k --backup)
 keys restore FILE --identity-stdin  # Restore into an empty keys/rpc
 resolve AMD                  # Resolve symbol to conId/universe

@@ -52,6 +52,10 @@ _NARRATIVE_FIELDS = (
 )
 
 
+class ReviewConflict(Exception):
+    """A different review is already recorded for the decision."""
+
+
 @dataclass(frozen=True)
 class OperatorReview:
     """The complete §8.5 qualitative review an operator signs off on.
@@ -189,23 +193,45 @@ class OperatorReviewRepository:
                     "SELECT 1 FROM operator_reviews WHERE review_digest = ?",
                     [digest]).fetchone() is not None:
                 return digest  # idempotent: content-addressed, already recorded
-            conn.execute(
-                "INSERT INTO operator_reviews (review_digest, artifact_id, "
-                "eligibility_decision_digest, reviewer, reviewed_at, economic_rationale, "
-                "edge_survives_costs, known_failure_regimes, data_and_survivorship_limits, "
-                "parameter_sensitivity, operational_dependencies, capacity_and_decay, "
-                "episode_dominance, holdout_opened_once_confirmed, reviewer_kind) "
-                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
-                [digest, review.artifact_id, review.eligibility_decision_digest,
-                 review.reviewer, review.reviewed_at, review.economic_rationale,
-                 review.edge_survives_costs, review.known_failure_regimes,
-                 review.data_and_survivorship_limits, review.parameter_sensitivity,
-                 review.operational_dependencies, review.capacity_and_decay,
-                 review.episode_dominance, review.holdout_opened_once_confirmed,
-                 review.reviewer_kind])
+            self._insert_in_tx(conn, review)
             return digest
 
         return self._db.transaction(_tx)
+
+    def record_as_only_review(self, review: OperatorReview) -> bool:
+        """Record the review unless another one exists for its decision; True when this call inserted it.
+
+        The check and the insert share one transaction. Raises ``ReviewConflict`` for a different review."""
+        def _tx(conn):
+            found = {row[0] for row in conn.execute(
+                "SELECT review_digest FROM operator_reviews WHERE artifact_id = ? "
+                "AND eligibility_decision_digest = ?",
+                [review.artifact_id, review.eligibility_decision_digest]).fetchall()}
+            if found - {review.digest}:
+                raise ReviewConflict("another review already exists for this decision")
+            if found:
+                return False
+            self._insert_in_tx(conn, review)
+            return True
+
+        return self._db.transaction(_tx)
+
+    @staticmethod
+    def _insert_in_tx(conn, review: OperatorReview) -> None:
+        conn.execute(
+            "INSERT INTO operator_reviews (review_digest, artifact_id, "
+            "eligibility_decision_digest, reviewer, reviewed_at, economic_rationale, "
+            "edge_survives_costs, known_failure_regimes, data_and_survivorship_limits, "
+            "parameter_sensitivity, operational_dependencies, capacity_and_decay, "
+            "episode_dominance, holdout_opened_once_confirmed, reviewer_kind) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            [review.digest, review.artifact_id, review.eligibility_decision_digest,
+             review.reviewer, review.reviewed_at, review.economic_rationale,
+             review.edge_survives_costs, review.known_failure_regimes,
+             review.data_and_survivorship_limits, review.parameter_sensitivity,
+             review.operational_dependencies, review.capacity_and_decay,
+             review.episode_dominance, review.holdout_opened_once_confirmed,
+             review.reviewer_kind])
 
     def get(self, review_digest: str) -> Optional[OperatorReview]:
         def _tx(conn):
@@ -242,4 +268,6 @@ def review_allowed_for(review: OperatorReview, account_mode: str) -> None:
 
 # A convenience for callers/tests that want the mandatory field names.
 NARRATIVE_FIELDS = _NARRATIVE_FIELDS
+# The eight §8.5 narrative fields a reviewer (human or Jev) writes; the first three are linkage.
+REVIEW_NARRATIVE_FIELDS = _NARRATIVE_FIELDS[3:]
 ALL_REVIEW_FIELDS = tuple(f.name for f in fields(OperatorReview))

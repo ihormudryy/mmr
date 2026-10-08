@@ -2,7 +2,7 @@
 import pytest
 
 from tests.rpc_identity_fixtures import ALLOW_ALL, ServedStack
-from trader.messaging.principals import KNOWN_PRINCIPALS, SERVER_ACCEPTS, SERVER_PRINCIPALS
+from trader.messaging.principals import CALLS, KNOWN_PRINCIPALS, SERVER_ACCEPTS, SERVER_PRINCIPALS
 from trader.messaging.rpc_keys import init_keys
 from trader.messaging.typed_rpc import AuthenticationError, ServiceIdentity, TypedRpcRegistry
 
@@ -32,7 +32,9 @@ def test_rotating_one_principal_flips_trust_on_every_server_that_trusts_it(tmp_p
                 assert _code(stack, old_signer, server) == "AUTHENTICATION_ERROR"
                 assert _code(stack, new_signer, server) == "OK"
             else:
-                assert rotated not in stack.servers[(server, "query")].identity.trusted_principals()
+                # The keyring holds a non-caller only as a server this one calls (research calls the trader).
+                held = stack.servers[(server, "query")].identity.trusted_principals()
+                assert (rotated in held) == (rotated in CALLS[server])
         finally:
             stack.close()
 

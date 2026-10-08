@@ -105,22 +105,58 @@ def evaluate(spec: EvaluationSpec, *, research_db: Any, paths: EvaluationPaths,
     _refuse_if_holdout_opened(registry, family_id)
     _refuse_if_strategy_holdout_overlaps(registry, spec, plan)
 
-    env = RunEnvironment(
+    env = run_environment(spec, paths)
+    main = _run_point(registry, family_id, env, plan, dict(spec.params), COST_MULTIPLIERS,
+                      now, max_workers, rerun_existing=True)
+    neighbours = [_run_point(registry, family_id, env, plan, point, (1.0,), now, max_workers,
+                             rerun_existing=False) for point in neighbour_points(spec)]
+    context = point_market_context(spec, plan, main, benchmark_closes, bars)
+    evidence = _walk_forward_evidence(
+        spec, main, neighbours, registry.strategy_trials(spec.strategy_path, spec.class_name),
+        context.regimes, context.liquidity)
+    gate = ev.pre_holdout_outcome(evaluate_eligibility(ruleset, evidence))
+    finish = dict(family_id=family_id, main=main, neighbours=neighbours,
+                  market_context=context.market_context, missing_causes=context.missing_causes)
+    if not gate.passed:
+        return _finish(research_db, spec, paths, now, stage=STAGE_PRE_HOLDOUT, state='CANDIDATE',
+                       artifact_id=None, decision_digest=None, gate=gate, evidence=evidence, **finish)
+    outcome = run_holdout(research_db, registry, spec, env, plan, family_id, main, evidence,
+                          benchmark_closes, context, now, max_workers, ruleset)
+    if not outcome.passed:
+        # paper-v1 has no holdout-expectancy rule, so the decision alone could still
+        # read PAPER_ELIGIBLE. Record none: a retired artifact must never be attested.
+        return _finish(research_db, spec, paths, now, stage=STAGE_HOLDOUT_FAILED,
+                       state=ARTIFACT_STATE_RETIRED, artifact_id=outcome.artifact_id, decision_digest=None,
+                       gate=ev.final_outcome(outcome.decision), evidence=outcome.evidence, **finish)
+    return _finish(research_db, spec, paths, now, stage=STAGE_COMPLETE, state=outcome.decision.state,
+                   artifact_id=outcome.artifact_id, decision_digest=outcome.decision_digest,
+                   gate=ev.final_outcome(outcome.decision), evidence=outcome.evidence, **finish)
+
+
+def run_environment(spec: EvaluationSpec, paths: EvaluationPaths) -> RunEnvironment:
+    return RunEnvironment(
         history_db=paths.history_db, universe_db=paths.universe_db,
         universe_library=paths.universe_library, execution_costs_path=paths.execution_costs,
         strategy_file=str(spec.strategy_file), class_name=spec.class_name,
         conids=tuple(spec.conids), bar_size=spec.bar_size, order_notional=spec.order_notional,
         account_equity=spec.account_equity, max_gross_allocation=spec.max_gross_allocation)
-    main = _run_point(registry, family_id, env, plan, dict(spec.params), COST_MULTIPLIERS,
-                      now, max_workers, rerun_existing=True)
-    neighbours = [_run_point(registry, family_id, env, plan, point, (1.0,), now, max_workers,
-                             rerun_existing=False) for point in neighbour_points(spec)]
+
+
+@dataclass(frozen=True)
+class PointContext:
+    sessions: list
+    regimes: Any
+    liquidity: Any
+    missing_causes: dict
+    market_context: dict
+
+
+def point_market_context(spec, plan, point: PointResult, benchmark_closes, bars) -> PointContext:
     holdout_start = pd.Timestamp(plan.holdout.start).date()
-    holdout_end = pd.Timestamp(plan.holdout.end).date()
     try:
         sessions = _period_session_dates(spec)
         labels = mcx.regime_labels(benchmark_closes, sessions)
-        walk_trips = mcx.annotate_regimes(_round_trips(main.outcomes[1.0]), labels)
+        walk_trips = mcx.annotate_regimes(_round_trips(point.outcomes[1.0]), labels)
         regimes = mcx.regime_evidence(
             walk_trips, labels.loc[[d for d in sessions if d < holdout_start]])
         liquidity = mcx.liquidity_envelope(bars, order_notional=spec.order_notional,
@@ -132,31 +168,45 @@ def evaluate(spec: EvaluationSpec, *, research_db: Any, paths: EvaluationPaths,
         'regime_positive_expectancy_fraction': regimes.positive_fraction,
         'regime_loss_tolerance': regimes.worst_loss,
         'regime_transition_stability': regimes.transitions_stable})
-    market_context = {'regimes': _regime_context(regimes),
-                      'liquidity': _liquidity_context(liquidity)}
-    evidence = _walk_forward_evidence(
-        spec, main, neighbours, registry.strategy_trials(spec.strategy_path, spec.class_name),
-        regimes, liquidity)
-    gate = ev.pre_holdout_outcome(evaluate_eligibility(ruleset, evidence))
-    if not gate.passed:
-        return _finish(research_db, spec, paths, now, family_id=family_id,
-                       stage=STAGE_PRE_HOLDOUT, state='CANDIDATE', artifact_id=None,
-                       decision_digest=None, gate=gate, evidence=evidence, main=main,
-                       neighbours=neighbours, market_context=market_context,
-                       missing_causes=missing_causes)
+    return PointContext(sessions, regimes, liquidity, missing_causes,
+                        {'regimes': _regime_context(regimes),
+                         'liquidity': _liquidity_context(liquidity)})
 
-    artifact_id = registry.seal_artifact(family_id, selected_trial_id=main.trial_id,
-                                         selected_parameters=dict(spec.params), sealed_at=now())
-    start, end = _day_start(plan.holdout.start), _day_end(plan.holdout.end)
-    first, second = run_jobs(env, [
-        WindowJob(_point_key(spec.params), dict(spec.params), 'holdout', 0, start, end, 1.0,
-                  replay=replay) for replay in (0, 1)], max_workers)
-    # Evidence first: a failure here must not spend the one-shot holdout.
-    benchmark, time_in_market = _holdout_market_evidence(
-        spec, benchmark_closes, first, holdout_start, holdout_end, sessions)
-    passed = ev.holdout_passes(build_round_trips(first.trades), first.max_drawdown)
-    registry.open_holdout(artifact_id, opened_at=now(), passed=passed,
-                          detail=f'net_pnl={first.net_pnl:.2f} max_drawdown={first.max_drawdown:.4f}')
+
+@dataclass(frozen=True)
+class HoldoutOutcome:
+    artifact_id: str
+    passed: bool
+    evidence: EligibilityEvidence
+    decision: Any
+    decision_digest: Optional[str]
+    window: dict
+
+
+def run_holdout(research_db, registry: ExperimentRegistry, spec: EvaluationSpec, env: RunEnvironment,
+                plan: ValidationPlan, family_id: str, point: PointResult, evidence: EligibilityEvidence,
+                benchmark_closes: pd.Series, context: PointContext, now, max_workers: int,
+                ruleset: Ruleset) -> HoldoutOutcome:
+    holdout_start = pd.Timestamp(plan.holdout.start).date()
+    holdout_end = pd.Timestamp(plan.holdout.end).date()
+    artifact_id = registry.seal_artifact(family_id, selected_trial_id=point.trial_id,
+                                         selected_parameters=dict(point.params), sealed_at=now())
+    # The window counts as revealed from here on: a run that dies below must not leave it fresh.
+    registry.begin_holdout(artifact_id, opened_at=now())
+    try:
+        start, end = _day_start(plan.holdout.start), _day_end(plan.holdout.end)
+        first, second = run_jobs(env, [
+            WindowJob(_point_key(point.params), dict(point.params), 'holdout', 0, start, end, 1.0,
+                      replay=replay) for replay in (0, 1)], max_workers)
+        benchmark, time_in_market = _holdout_market_evidence(
+            spec, benchmark_closes, first, holdout_start, holdout_end, context.sessions)
+        passed = ev.holdout_passes(build_round_trips(first.trades), first.max_drawdown)
+    except Exception as exc:
+        registry.finish_holdout(artifact_id, passed=False,
+                                detail=f'interrupted before a result: {type(exc).__name__}')
+        raise
+    detail = f'net_pnl={first.net_pnl:.2f} max_drawdown={first.max_drawdown:.4f}'
+    registry.finish_holdout(artifact_id, passed=passed, detail=detail)
     evidence = replace(
         evidence, scaled_holdout_drawdown=first.max_drawdown,
         deterministic_replay_ok=first.trace_signature == second.trace_signature,
@@ -167,25 +217,16 @@ def evaluate(spec: EvaluationSpec, *, research_db: Any, paths: EvaluationPaths,
         benchmark_downside_deviation=benchmark.benchmark_downside_deviation,
         benchmark_recovery_time=benchmark.benchmark_recovery_time,
         strategy_time_in_market=time_in_market)
-    missing_causes.update(_missing_causes({'benchmark_relative_drawdown': benchmark.ratio}))
-    market_context['benchmark'] = _benchmark_context(benchmark, time_in_market)
+    context.missing_causes.update(_missing_causes({'benchmark_relative_drawdown': benchmark.ratio}))
+    context.market_context['benchmark'] = _benchmark_context(benchmark, time_in_market)
     decision = evaluate_eligibility(ruleset, evidence)
-    if not passed:
-        # paper-v1 has no holdout-expectancy rule, so the decision alone could still
-        # read PAPER_ELIGIBLE. Record none: a retired artifact must never be attested.
-        return _finish(research_db, spec, paths, now, family_id=family_id,
-                       stage=STAGE_HOLDOUT_FAILED, state=ARTIFACT_STATE_RETIRED,
-                       artifact_id=artifact_id, decision_digest=None,
-                       gate=ev.final_outcome(decision), evidence=evidence, main=main,
-                       neighbours=neighbours, market_context=market_context,
-                       missing_causes=missing_causes)
-    decision_digest = EligibilityDecisionRepository(research_db).record(
-        decision, artifact_id=artifact_id, recorded_at=now())
-    return _finish(research_db, spec, paths, now, family_id=family_id, stage=STAGE_COMPLETE,
-                   state=decision.state, artifact_id=artifact_id,
-                   decision_digest=decision_digest, gate=ev.final_outcome(decision),
-                   evidence=evidence, main=main, neighbours=neighbours,
-                   market_context=market_context, missing_causes=missing_causes)
+    decision_digest = None
+    if passed:
+        decision_digest = EligibilityDecisionRepository(research_db).record(
+            decision, artifact_id=artifact_id, recorded_at=now())
+    return HoldoutOutcome(artifact_id, passed, evidence, decision, decision_digest,
+                          {'start': holdout_start.isoformat(), 'end': holdout_end.isoformat(),
+                           'passed': passed, 'detail': detail})
 
 
 def _period_session_dates(spec: EvaluationSpec) -> list[dt.date]:

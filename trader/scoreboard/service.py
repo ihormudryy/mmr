@@ -10,6 +10,7 @@ from trader.scoreboard.ports import session_date_et
 from trader.scoreboard.report import ReportInputs, build_report
 from trader.scoreboard.round_trips import project_round_trips
 from trader.scoreboard.session_ledger import SessionFacts, experiment_fills
+from trader.scoreboard.shadow_ingest import verified_shadow_rows
 from trader.scoreboard.store import ScoreboardStore
 
 logger = logging.getLogger(__name__)
@@ -77,7 +78,9 @@ class ScoreboardService:
         if experiment is None and experiment_id is not None:
             return {"label": "PAPER", "error_code": EXPERIMENT_NOT_FOUND, "experiment_id": experiment_id}
         if experiment is None:
-            return build_report(self._inputs(None, [], [], [], [], [], [], [], []))
+            shadow_rows, shadow_warnings = self._shadow_rows()
+            return build_report(self._inputs(None, [], [], [], [], [], [], [], shadow_warnings,
+                                             shadow_rows=shadow_rows))
         exp_id = experiment.experiment_id
         warnings = [{"code": "FILL_OUTSIDE_SESSION",
                      "detail": f"fill {piece.exec_id} on {piece.session_date} (not an XNYS session) is in the "
@@ -86,6 +89,7 @@ class ScoreboardService:
                     if not self.calendar.is_session(piece.session_date)]
         incidents = [i for i in self.store.incidents()
                      if exp_id in i["key"] or i["kind"].startswith("BENCHMARK")]
+        shadow_rows, shadow_warnings = self._shadow_rows()
         return build_report(self._inputs(
             experiment,
             self.store.fetch("equity_daily", {"experiment_id": exp_id}),
@@ -94,7 +98,17 @@ class ScoreboardService:
             self.store.fetch("ai_costs", {"experiment_id": exp_id}),
             self.store.fetch("simulated_decisions", {"experiment_id": exp_id}),
             self.store.fetch("simulated_outcomes", {"experiment_id": exp_id}),
-            incidents, warnings))
+            incidents, warnings + shadow_warnings, shadow_rows=shadow_rows))
+
+    def _shadow_rows(self) -> tuple[list[dict], list[dict]]:
+        """Every shadow row, digest re-checked; an edited row reads as INCOMPLETE and raises a warning."""
+        rows, tampered = verified_shadow_rows(self.store)
+        warnings = [{"code": "SHADOW_ROW_TAMPERED",
+                     "detail": f"shadow row {t['record_id']} of judgment {t['judgment_id']} differs from its "
+                               "sealed body; its result is not counted"} for t in tampered]
+        for warning in warnings:
+            logger.error("scoreboard: %s", warning["detail"])
+        return rows, warnings
 
     def trips(self, experiment_id: str) -> dict:
         """Ruling 19: per-trip identity and quantities from the stored projection, ordered by opened_at."""
@@ -121,14 +135,14 @@ class ScoreboardService:
         return _verify(self, experiment_id)
 
     def _inputs(self, experiment, rows, adjustments, trips, ai_costs, sim_decisions, sim_outcomes, incidents,
-                warnings):
+                warnings, shadow_rows=()):
         return ReportInputs(
             experiment=experiment, rows=rows, adjustments=adjustments, trips=trips,
             spy_closes=self.book.closes(), spy_version=self.book.current_version(),
             spy_provider=self.book.provider(), ai_costs=ai_costs, sim_decisions=sim_decisions,
             sim_outcomes=sim_outcomes, incidents=incidents,
             warnings=warnings, outbox=None if self.outbox is None else self.outbox.counts(),
-            calendar=self.calendar)
+            calendar=self.calendar, shadow_rows=shadow_rows)
 
 
 def _trip_view(row: dict) -> dict:

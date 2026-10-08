@@ -13,7 +13,7 @@ from typing import Mapping
 KNOWN_PRINCIPALS: frozenset[str] = frozenset({
     "trader", "strategy", "cli", "dashboard", "ai_supervisor", "ai_research", "research",
 })
-SERVER_PRINCIPALS: frozenset[str] = frozenset({"trader", "strategy"})
+SERVER_PRINCIPALS: frozenset[str] = frozenset({"trader", "strategy", "research"})
 # Principals the SDK may sign as (``MMR_RPC_PRINCIPAL``).
 CLIENT_PRINCIPALS: frozenset[str] = frozenset({"cli", "ai_supervisor", "ai_research"})
 # Reserved names: no key, no allow-list entry. telegram_bridge arrives in SP2;
@@ -25,17 +25,17 @@ CONTROLLER_PRINCIPAL = "ai_supervisor"
 SERVER_ACCEPTS: Mapping[str, frozenset[str]] = {
     "trader": frozenset({"cli", "dashboard", "strategy", "ai_supervisor", "ai_research", "research"}),
     "strategy": frozenset({"cli", "dashboard", "trader"}),
+    # SP2c spec 5.1: like strategy, research is a server that also calls the trader.
+    "research": frozenset({"ai_research", "cli"}),
 }
 
 CALLS: Mapping[str, frozenset[str]] = {
     "trader": frozenset({"strategy"}),
     "strategy": frozenset({"trader"}),
-    "cli": frozenset({"trader", "strategy"}),
+    "cli": frozenset({"trader", "strategy", "research"}),
     "dashboard": frozenset({"trader", "strategy"}),
     "ai_supervisor": frozenset({"trader"}),
-    "ai_research": frozenset({"trader"}),
-    # SP2c Plan 1: research only calls the trader. Plan 3 makes it a server (SERVER_PRINCIPALS,
-    # SERVER_ACCEPTS["research"], SERVICE_PRINCIPAL) and lets ai_research and cli call it.
+    "ai_research": frozenset({"trader", "research"}),
     "research": frozenset({"trader"}),
 }
 
@@ -140,6 +140,8 @@ TRADER_ACL: Mapping[tuple[str, str], frozenset[str]] = {
     ("query", "get_deployment_forward_evidence"): frozenset({"research"}),
     ("command", "record_backtest_judgment"): frozenset({"ai_research"}),
     ("query", "get_backtest_judgment"): frozenset({"research", "ai_research", "cli", "dashboard"}),
+    # SP2c Plan 3 (spec 7): only the research service records shadow rows.
+    ("command", "record_shadow_result"): frozenset({"research"}),
     # SP1 experiments (Plan 4 K14): explicit sets per method. ai_supervisor may pause (risk-reducing)
     # and read; only operators start, resume and stop.
     ("command", "start_experiment"): frozenset({"cli", "dashboard"}),
@@ -175,11 +177,18 @@ STRATEGY_ACL: Mapping[tuple[str, str], frozenset[str]] = {
     ("command", "disable_strategy_by_name"): HUMAN,
 }
 
+# SP2c spec 5.1: the research server's methods. Each handler re-checks its caller.
+RESEARCH_ACL: Mapping[tuple[str, str], frozenset[str]] = {
+    ("command", "submit_evaluation"): frozenset({"ai_research"}),
+    ("query", "get_evaluation"): frozenset({"ai_research", "cli"}),
+    ("command", "attest_from_judgment"): frozenset({"ai_research"}),
+}
+
 
 # Compose service -> the principal it signs as (None: no key, tmpfs only).
 SERVICE_PRINCIPAL: Mapping[str, str | None] = {
     "trader": "trader", "strategy": "strategy", "dashboard": "dashboard", "cli": "cli",
-    "scheduler": None, "data": None, "ai": "ai_supervisor",
+    "scheduler": None, "data": None, "ai": "ai_supervisor", "research": "research",
 }
 
 # A service that signs as more than one principal. SP2 spec 4: the ai service holds the

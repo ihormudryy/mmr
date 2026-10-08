@@ -262,7 +262,9 @@ bundle digest before a DEPLOY judgment exists.
      bar size, and that the bundle's review names this judgment (for a
      `RENEWAL`: the initial judgment of the prior deployment version the renewal
      names); any difference → `JUDGMENT_MISMATCH`;
-   - refuses a second deployment for the same judgment (`JUDGMENT_ALREADY_BOUND`);
+   - an exact retry of the same registration body for the same judgment returns
+     the same deployment and version (idempotent); a different body for a judgment
+     that is already bound is refused (`JUDGMENT_ALREADY_BOUND`);
    - checks the active-DEPLOY cap (`DEPLOY_CAP_REACHED`), the cooldown and the
      bundle's expiry;
    - seals the base deployment (unchanged `AiDeployment` record) and then seals
@@ -279,7 +281,8 @@ bundle digest before a DEPLOY judgment exists.
      and `binding_verified_by_bundle = true`.
    - Digest: `sha256` over a new domain tag `mmr.ai-deployment-version.v1` plus
      the canonical body. Every read recomputes it, like `get_sealed`.
-   - One version per judgment (`JUDGMENT_ALREADY_BOUND`). A renewal always has a
+   - One version per judgment: an exact retry returns that version; a different
+     body is refused (`JUDGMENT_ALREADY_BOUND`). A renewal always has a
      new judgment id and new sessions, so it always gets a fresh version digest;
      it never reuses the old one.
    - The base row keeps its SP1 meaning and its `CLAIMED_NOT_VERIFIED`
@@ -479,7 +482,8 @@ One regression per review blocker:
 - **Registration bound to the judgment:** a direct signed registration after
   REJECT → `JUDGMENT_NOT_DEPLOY`; with no judgment → `JUDGMENT_MISSING`; a DEPLOY
   judgment of another evaluation, or other params, conids or bar size →
-  `JUDGMENT_MISMATCH`; a second registration for one judgment →
+  `JUDGMENT_MISMATCH`; an exact retry of a registration returns the same
+  deployment and version; a different body for an already-bound judgment →
   `JUDGMENT_ALREADY_BOUND`.
 - **Daily cap at the trader:** two concurrent claims for the last slot → exactly
   one accepted; a lost reply after acceptance → readback returns the same claim

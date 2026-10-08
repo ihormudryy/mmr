@@ -83,6 +83,21 @@ def test_a_complete_case_whose_signed_holdout_evidence_failed_is_never_deployed(
     assert claim_status(w, request_body(cohort=[{"RANGE_MINUTES": 45}])) == "ACCEPTED"     # no cooldown started
 
 
+def test_a_complete_case_whose_signed_selected_point_failed_its_gate_is_never_deployed(tmp_path):  # PR #93 r1
+    w = world(tmp_path)
+    body = request_body()
+    w.claims.claim(evaluation_request_id(body), body, principal="research")
+    w.claims.update(evaluation_request_id(body), "DONE")
+    contradictory = case_body(body)                  # header: COMPLETE, PAPER_ELIGIBLE, every rule passed
+    point = contradictory["evidence"]["points"][contradictory["evidence"]["selected_index"]]
+    point["pre_holdout_passed"] = False
+    point["rules"][0]["passed"] = False
+    digest = write_signed_body(w.keys, contradictory)
+    reply = w.judgments.record(judgment(digest, "DEPLOY"))
+    assert (reply["status"], reply["code"]) == ("REFUSED", "CASE_MALFORMED")
+    assert count_judgments(w.db) == 0
+
+
 def test_a_pre_holdout_failure_reaches_jev_for_shadow_or_reject(tmp_path):
     w = world(tmp_path)
     digest = finished(w, stage="PRE_HOLDOUT_FAILED")

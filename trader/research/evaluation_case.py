@@ -121,6 +121,8 @@ class EvaluationCase(_Strict):
         else:
             self._renewal_shape()
         self._holdout_evidence_shape()
+        if self.kind == "INITIAL":
+            self._selected_point_shape()
         return self
 
     def _holdout_evidence_shape(self) -> None:
@@ -140,6 +142,35 @@ class EvaluationCase(_Strict):
             raise ValueError("evidence.holdout.passed must be true or false")
         if holdout["passed"] is not self.holdout_passed:
             raise ValueError("evidence.holdout.passed contradicts holdout_passed")
+
+    def _selected_point_shape(self) -> None:
+        """The signed selected point is the header's point (Plan 3 ``evidence.points[selected_index]``).
+
+        Once the holdout opened, the point passed its pre-holdout gate and carries the final rule
+        results, so its ``rules`` repeat ``final_rule_results`` code for code. A FAILED case binds nothing.
+        """
+        if self.stage == "FAILED":
+            return
+        index = self.evidence.get("selected_index")
+        if self.selected_params is None:
+            if index is not None:
+                raise ValueError("a case without selected_params has no selected point")
+            return
+        points = self.evidence.get("points")
+        if type(index) is not int or not isinstance(points, list) or not 0 <= index < len(points):
+            raise ValueError("evidence.selected_index must name one of evidence.points")
+        point = points[index]
+        if not isinstance(point, dict) or type(point.get("index")) is not int or point["index"] != index:
+            raise ValueError("the selected point must carry its own index")
+        same_point = _same_json(point.get("params"), self.selected_params)
+        if not same_point or point.get("trial_id") != self.selected_trial_id:
+            raise ValueError("the selected point's params and trial must be the header's")
+        holdout_opened = self.stage != "PRE_HOLDOUT_FAILED"
+        if point.get("pre_holdout_passed") is not holdout_opened:
+            raise ValueError("the selected point passed its pre-holdout gate exactly when the holdout opened")
+        final_rules = [(rule.code, rule.passed) for rule in self.final_rule_results]
+        if holdout_opened and _rule_pairs(point.get("rules")) != final_rules:
+            raise ValueError("the selected point's rules must be the final rule results")
 
     def _initial_shape(self) -> None:
         if self.stage not in INITIAL_STAGES or self.renewal is not None:
@@ -170,6 +201,27 @@ class EvaluationCase(_Strict):
             raise ValueError("a RENEWAL case has no holdout")
         if self.selected_params is None or self.cohort != [self.selected_params]:
             raise ValueError("a RENEWAL case names exactly its deployed parameters")
+
+
+def _same_json(left: Any, right: Any) -> bool:
+    try:
+        return canonical_json_bytes(left) == canonical_json_bytes(right)
+    except (TypeError, ValueError):
+        return False
+
+
+def _rule_pairs(rules: Any) -> Optional[list[tuple[str, bool]]]:
+    """``[(code, passed)]`` of an evidence rule list; None when an entry is not ``{code: str, passed: bool}``."""
+    if not isinstance(rules, list):
+        return None
+    pairs = []
+    for rule in rules:
+        if not isinstance(rule, dict):
+            return None
+        if not isinstance(rule.get("code"), str) or type(rule.get("passed")) is not bool:
+            return None
+        pairs.append((rule["code"], rule["passed"]))
+    return pairs
 
 
 def initial_deploy_allowed(case: EvaluationCase) -> bool:

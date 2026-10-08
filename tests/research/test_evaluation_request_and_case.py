@@ -109,6 +109,7 @@ def test_only_a_complete_case_with_every_paper_v1_rule_passed_offers_deploy():
     assert offered_menu(make_case(final_rule_results=failed_results())) == NO_DEPLOY_MENU
     short = case_body(request_body())
     short["final_rule_results"].pop()
+    selected_point(short)["rules"].pop()
     assert offered_menu(EvaluationCase.model_validate(short)) == NO_DEPLOY_MENU
     assert offered_menu(make_case(decision_state="CANDIDATE")) == NO_DEPLOY_MENU
     assert offered_menu(make_case(stage="HOLDOUT_FAILED", decision_state="CANDIDATE")) == NO_DEPLOY_MENU
@@ -206,9 +207,15 @@ def test_the_holdout_evidence_must_agree_with_the_header(stage, evidence):
         make_case(stage=stage, evidence=evidence)
 
 
+def with_holdout(stage: str, value) -> EvaluationCase:
+    body = case_body(request_body(), stage=stage)
+    body["evidence"]["holdout"] = value
+    return EvaluationCase.model_validate(body)
+
+
 def test_matching_holdout_evidence_is_accepted():
-    assert make_case(evidence={"holdout": holdout(True)}).holdout_passed is True
-    assert make_case(stage="HOLDOUT_FAILED", evidence={"holdout": holdout(False)}).holdout_passed is False
+    assert with_holdout("COMPLETE", holdout(True)).holdout_passed is True
+    assert with_holdout("HOLDOUT_FAILED", holdout(False)).holdout_passed is False
     assert make_case(stage="FAILED", evidence={"holdout": None}).holdout_passed is None
 
 
@@ -216,3 +223,86 @@ def test_a_renewal_case_carries_no_holdout_evidence():
     assert EvaluationCase.model_validate(renewal_case_body(evidence={})).kind == "RENEWAL"
     with pytest.raises(ValidationError, match="holdout"):
         EvaluationCase.model_validate(renewal_case_body(evidence={"holdout": holdout(True)}))
+
+
+def selected_point(body: dict) -> dict:
+    return body["evidence"]["points"][body["evidence"]["selected_index"]]
+
+
+def complete_body(**changes) -> dict:
+    return case_body(request_body(), **changes)
+
+
+def point_failed_its_gate(body: dict) -> None:
+    point = selected_point(body)
+    point["pre_holdout_passed"] = False
+    point["rules"][0]["passed"] = False
+
+
+@pytest.mark.parametrize("damage", [
+    pytest.param(lambda b: b["evidence"].update(selected_index=1), id="another-point"),
+    pytest.param(lambda b: b["evidence"].update(selected_index=True), id="bool-index"),
+    pytest.param(lambda b: b["evidence"].update(selected_index=-1), id="negative-index"),
+    pytest.param(lambda b: b["evidence"].update(selected_index=7), id="index-out-of-range"),
+    pytest.param(lambda b: b["evidence"].pop("selected_index"), id="no-index"),
+    pytest.param(lambda b: b["evidence"].update(points={"0": selected_point(b)}), id="points-not-a-list"),
+    pytest.param(lambda b: b["evidence"].update(points=[]), id="no-points"),
+    pytest.param(lambda b: b["evidence"]["points"].__setitem__(0, "point"), id="point-not-a-dict"),
+    pytest.param(lambda b: selected_point(b).update(index=1), id="point-index-mismatch"),
+    pytest.param(lambda b: selected_point(b).update(index="0"), id="point-index-text"),
+    pytest.param(lambda b: selected_point(b).update(params={"RANGE_MINUTES": 30}), id="params-mismatch"),
+    pytest.param(lambda b: selected_point(b).update(params={"RANGE_MINUTES": 15.0}), id="params-respelled"),
+    pytest.param(lambda b: selected_point(b).update(trial_id="trial-9"), id="trial-mismatch"),
+    pytest.param(lambda b: selected_point(b).update(pre_holdout_passed=False), id="gate-failed"),
+    pytest.param(lambda b: selected_point(b).update(pre_holdout_passed=1), id="gate-not-a-bool"),
+    pytest.param(lambda b: selected_point(b)["rules"][0].update(passed=False), id="rule-failed"),
+    pytest.param(lambda b: selected_point(b)["rules"][0].update(passed=1), id="rule-passed-not-a-bool"),
+    pytest.param(lambda b: selected_point(b)["rules"][0].update(code="other"), id="rule-code-mismatch"),
+    pytest.param(lambda b: selected_point(b)["rules"].pop(), id="rule-missing"),
+    pytest.param(lambda b: selected_point(b)["rules"].append({"code": "extra", "passed": True}), id="rule-extra"),
+    pytest.param(lambda b: selected_point(b).update(rules=["passed"]), id="rule-not-a-dict"),
+    pytest.param(lambda b: selected_point(b).pop("rules"), id="no-rules"),
+    pytest.param(point_failed_its_gate, id="gate-and-rule-failed"),
+])
+@pytest.mark.parametrize("stage", ["COMPLETE", "HOLDOUT_FAILED"])
+def test_the_selected_point_evidence_must_agree_with_the_header(stage, damage):      # PR #93 round 1
+    body = complete_body(stage=stage)
+    damage(body)
+    with pytest.raises(ValidationError, match="selected"):
+        EvaluationCase.model_validate(body)
+
+
+def test_a_signed_complete_case_whose_selected_point_failed_its_gate_is_malformed_on_load(tmp_path):
+    keys = case_keys(tmp_path)
+    body = complete_body()                       # header: COMPLETE, PAPER_ELIGIBLE, every rule passed
+    point_failed_its_gate(body)
+    digest = write_signed_body(keys, body)
+    assert refusal(lambda: load_verified_case(keys.cases_dir, digest, load_case_verify_keys(keys.verify_dir))) \
+        == "CASE_MALFORMED"
+
+
+def test_a_selected_point_carries_the_final_rules_even_when_one_failed():
+    """Plan 3 gives the selected point the final decision: a failed holdout-stage rule is no contradiction."""
+    for stage in ("COMPLETE", "HOLDOUT_FAILED"):
+        case = make_case(stage=stage, decision_state="CANDIDATE", final_rule_results=failed_results())
+        assert offered_menu(case) == NO_DEPLOY_MENU
+
+
+def test_a_pre_holdout_failure_binds_its_selected_point_when_it_names_one():
+    named = complete_body(stage="PRE_HOLDOUT_FAILED", selected_params={"RANGE_MINUTES": 30},
+                          selected_trial_id="trial-2")
+    assert EvaluationCase.model_validate(named).selected_params == {"RANGE_MINUTES": 30}
+    selected_point(named)["pre_holdout_passed"] = True                       # it never reached the holdout
+    with pytest.raises(ValidationError, match="selected"):
+        EvaluationCase.model_validate(named)
+    unnamed = complete_body(stage="PRE_HOLDOUT_FAILED")
+    assert EvaluationCase.model_validate(unnamed).selected_params is None
+    unnamed["evidence"]["selected_index"] = 0
+    with pytest.raises(ValidationError, match="selected"):
+        EvaluationCase.model_validate(unnamed)
+
+
+def test_a_failed_evaluation_binds_no_selected_point():
+    body = complete_body(stage="FAILED")
+    body["evidence"].update(points=[], selected_index=None)
+    assert EvaluationCase.model_validate(body).stage == "FAILED"

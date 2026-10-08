@@ -78,6 +78,26 @@ def holdout_evidence(stage: str) -> dict | None:
     return {"start": "2025-01-02", "end": "2025-12-31", "passed": passed, "detail": "fixture holdout"}
 
 
+def cohort_evidence(raw: dict) -> dict:
+    """Plan 3's evidence.points and selected_index, agreeing with the header.
+
+    The selected point carries the header's trial and, once the holdout opened, the final rule results.
+    """
+    points = [{"index": i, "params": dict(point), "trial_id": f"trial-point-{i}", "pre_holdout_passed": False,
+               "rules": failed_results()} for i, point in enumerate(raw["cohort"])]
+    selected = raw["selected_params"]
+    if selected is None:
+        return {"points": points, "selected_index": None}
+    spelled = canonical_json_bytes(selected)
+    index = next((i for i, point in enumerate(raw["cohort"]) if canonical_json_bytes(point) == spelled), 0)
+    holdout_opened = raw["stage"] in HOLDOUT_BY_STAGE
+    points[index].update(params=dict(selected), trial_id=raw["selected_trial_id"],
+                         pre_holdout_passed=holdout_opened,
+                         rules=[dict(rule) for rule in raw["final_rule_results"]] if holdout_opened
+                         else failed_results())
+    return {"points": points, "selected_index": index}
+
+
 def case_body(body: EvaluationRequestBody, *, stage: str = "COMPLETE", **changes) -> dict:
     raw = {"schema_version": CASE_DOMAIN, "kind": "INITIAL", "request_id": evaluation_request_id(body),
            "claim_day": "2026-10-08", "strategy_key": body.strategy_key, "strategy_file_hash": FILE_HASH,
@@ -87,11 +107,13 @@ def case_body(body: EvaluationRequestBody, *, stage: str = "COMPLETE", **changes
            "eligibility_decision_digest": "d" * 64, "decision_state": "PAPER_ELIGIBLE",
            "ruleset_digest": PAPER_V1.digest, "holdout_passed": HOLDOUT_BY_STAGE.get(stage),
            "final_rule_results": passing_results(), "renewal": None,
-           "created_at": NOW.isoformat(), "evidence": {"note": "fixture", "holdout": holdout_evidence(stage)}}
+           "created_at": NOW.isoformat()}
     if stage == "PRE_HOLDOUT_FAILED":
         raw.update(selected_params=None, selected_trial_id=None, artifact_id=None, eligibility_decision_digest=None,
                    decision_state=None, ruleset_digest=None, final_rule_results=[])
     raw.update(changes)
+    if "evidence" not in changes:
+        raw["evidence"] = {"note": "fixture", "holdout": holdout_evidence(stage), **cohort_evidence(raw)}
     return raw
 
 

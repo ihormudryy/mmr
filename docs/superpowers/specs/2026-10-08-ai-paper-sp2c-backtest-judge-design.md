@@ -83,11 +83,23 @@ measures whether Jev's judgment adds value.
   (`./docker.sh -K`).
 - It is a typed RPC server: **42106** typed query, **42107** typed command.
   Private Docker network only; not published on the host.
-- `principals.py`: `research` joins `KNOWN_PRINCIPALS` and `SERVER_PRINCIPALS`.
-  `SERVER_ACCEPTS["research"] = {ai_research, cli}`.
+- `principals.py`: `research` joins `KNOWN_PRINCIPALS` and `SERVER_PRINCIPALS`
+  (not `CLIENT_PRINCIPALS`: like `strategy`, it is a server that also calls the
+  trader, not an SDK signer). `SERVER_ACCEPTS["research"] = {ai_research, cli}`.
   `CALLS["research"] = {trader}`; `CALLS["ai_research"]` and `CALLS["cli"]` gain
-  `research`;
-  `SERVER_ACCEPTS["trader"]` gains `research`.
+  `research`; `SERVER_ACCEPTS["trader"]` gains `research`.
+- Service identity: `SERVICE_PRINCIPAL["research"] = "research"` in
+  `principals.py`, so `service_rpc_files("research")` and `mmr keys check-mount
+  research` know the service and its exact key files.
+- Rotation: `_LONG_LIVED_SERVICE_PRINCIPALS["research"] = ("research",)` in
+  `rpc_keys.py`. `RESTART_ON_ROTATE` is derived from it and from the peer maps,
+  so rotating `research` restarts `research`, `trader` and `ai`, and rotating
+  `trader`, `ai_research` or `cli` now also restarts `research`.
+- Key generation needs no new list: `mmr keys init` and the key backup walk
+  `KNOWN_PRINCIPALS`. `docker.sh` derives the required key files from the
+  compose file (`_compose_rpc_key_files`), so the new service's binds are
+  checked before any start. `KEYCHECK_SERVICES` in `docker.sh` (the `-K` gate)
+  gains `research`.
 - Every method has an allow-list entry, and each handler checks the principal
   again itself (as `ai_paper_actions.py` does). A method-limited client is not
   the authority; the server-side check is.
@@ -105,6 +117,7 @@ measures whether Jev's judgment adds value.
 | trader | query | `get_backtest_judgment` | `research`, `ai_research`, `cli`, `dashboard` |
 | trader | command | `record_shadow_result` | `research` |
 | trader | query | `get_active_ai_deployments` | `strategy` |
+| trader | query | `get_ai_deployment_version` | `cli`, `dashboard`, `ai_supervisor`, `ai_research` |
 | trader | command | `withdraw_ai_deployment` | `cli`, `dashboard` |
 | trader | command | `register_ai_deployment` (existing) | `ai_research` |
 
@@ -155,11 +168,25 @@ policy method.
 
 **Running an evaluation (cohort, then one holdout).** The service builds the
 evaluation spec itself (period, folds, embargo, holdout, cost model and notional
-from operator config). For each cohort point it runs the existing walk-forward
-stage (main point plus neighbours). It then picks one point by a fixed code rule
-on walk-forward evidence only (section 6.2). Only that point may open the final
-holdout, once, through the existing evaluator path. Evaluations run one at a
-time (CPU-bound; a bounded queue).
+from operator config). Today `evaluation.evaluate` runs the full cost stress
+(1x, 1.5x, 2x) and the pre-holdout gate only for the one main point; its
+neighbours run at 1x as sensitivity evidence; then it opens the main point's
+holdout. SP2c splits this into three phases (an evaluator change):
+
+1. **Pre-holdout, per cohort point.** Every cohort point is a selectable point.
+   Each one runs exactly what the main point runs today: all walk-forward folds
+   at 1x, 1.5x and 2x, its own neighbours at 1x, and the full pre-holdout
+   paper-v1 gate (cost stress, deflated Sharpe with the strategy-key trial count,
+   neighbour sensitivity, regimes, liquidity). Neighbours are never selectable.
+2. **Select.** Among the points that pass the full pre-holdout gate, code picks
+   one by a fixed rule on walk-forward evidence only (section 6.2). If none
+   passes, the evaluation ends at the pre-holdout stage and seals no artifact.
+3. **Holdout.** The registry seals the artifact with the selected point's trial
+   as `selected_trial_id` and opens that point's holdout, once. No other point
+   opens a holdout.
+
+The whole cohort is one experiment family (its search space is the cohort plus
+the neighbourhood). Evaluations run one at a time (CPU-bound; a bounded queue).
 
 **Evaluation case (new, signed, never authorizing).** Every finished or failed
 evaluation produces one evaluation case:
@@ -167,9 +194,10 @@ evaluation produces one evaluation case:
 - Content: request id, claim day, strategy key, executing file hash, class,
   cohort, selected params, conids, bar size, each `family_id` and trial id, the
   stage reached (pre-holdout failure, holdout failure, complete), every paper-v1
-  rule result, cost stress 1x/1.5x/2x, deflated Sharpe, `strategy_trials` count,
-  holdout result if opened, artifact id and eligibility decision digest if
-  sealed, warm-up length.
+  rule result for every cohort point, cost stress 1x/1.5x/2x, deflated Sharpe,
+  `strategy_trials` count, the selected point, holdout result if opened, artifact
+  id and eligibility decision digest if sealed, the `previously_revealed`
+  sessions used, warm-up length.
 - Signed with the research signing key under its own domain tag
   (`mmr.research.evaluation-case.v1`). It has no attestation, no review and no
   manifest, so the bundle verifier and `require_qualified_research_evidence`
@@ -237,16 +265,39 @@ bundle digest before a DEPLOY judgment exists.
    - refuses a second deployment for the same judgment (`JUDGMENT_ALREADY_BOUND`);
    - checks the active-DEPLOY cap (`DEPLOY_CAP_REACHED`), the cooldown and the
      bundle's expiry;
-   - seals the deployment with `strategy_digest_provenance = VERIFIED_BY_BUNDLE`
-     and an expiry of `deploy_expiry_sessions` sessions.
+   - seals the base deployment (unchanged `AiDeployment` record) and then seals
+     a new **deployment version** record (item 5).
    A signed caller cannot register after REJECT or without a judgment.
-5. **Deployment version.** The sealed deployment digest is the version. A
-   deployment is **active** while its DEPLOY judgment stands, it is not
-   withdrawn, it is not expired, and it is within the cap. `withdraw_ai_deployment`
-   (operator) and expiry end it. A later non-DEPLOY renewal judgment also ends it.
-6. **`get_active_ai_deployments`** (query, `strategy`): each active deployment
-   with its version, strategy file path, file hash, class, params, conids, bar
-   size and expiry.
+5. **Deployment version (new sealed record).** The `AiDeployment` digest
+   (`ai_deployments.py`) covers only the strategy binding, verdict and bundle,
+   and registering the same content returns the existing row. A renewal on the
+   same bundle has the same content, so that digest cannot be the version.
+   SP2c adds a separate insert-only table `ai_deployment_versions` (a new trader
+   migration):
+   - Body: base deployment digest, judgment id, kind (`INITIAL` or `RENEWAL`),
+     prior version digest (null for `INITIAL`), first session, expiry session,
+     and `binding_verified_by_bundle = true`.
+   - Digest: `sha256` over a new domain tag `mmr.ai-deployment-version.v1` plus
+     the canonical body. Every read recomputes it, like `get_sealed`.
+   - One version per judgment (`JUDGMENT_ALREADY_BOUND`). A renewal always has a
+     new judgment id and new sessions, so it always gets a fresh version digest;
+     it never reuses the old one.
+   - The base row keeps its SP1 meaning and its `CLAIMED_NOT_VERIFIED`
+     provenance column. The bundle check is recorded on the version, which is
+     the only thing SP2c treats as authority.
+   - `register_ai_deployment` returns both digests. `get_ai_deployment` is
+     unchanged; a new query `get_ai_deployment_version` (`cli`, `dashboard`,
+     `ai_supervisor`, `ai_research`) reads a version. `SignalEntry`,
+     `AiPaperDecision` (new field `deployment_version`, next to the existing
+     `deployment_digest`), strategy instances and shadow rows carry the version
+     digest.
+   A version is **active** while its judgment stands, it is not withdrawn, the
+   current session is not after its expiry session, and it is within the cap.
+   `withdraw_ai_deployment` (operator) and expiry end it. A later non-DEPLOY
+   renewal judgment also ends the line.
+6. **`get_active_ai_deployments`** (query, `strategy`): each active version with
+   its version digest, base deployment digest, strategy file path, file hash,
+   class, params, conids, bar size and expiry session.
 7. **`get_deployment_forward_evidence`** (query, `research`): the paper trips
    and the shadow rows of one deployment version, for a renewal case.
 8. **Recheck at admission and at final dispatch.** For an AI-deployment ENTER,
@@ -290,14 +341,15 @@ no hash check today (`ai_deployments.py` records `strategy_digest` as
 - **Load.** On reconcile it reads `get_active_ai_deployments`. For each one it
   reads the file once, hashes the exact bytes it will execute, and loads the
   class from those bytes. It loads only if the hash, class, params, conids and
-  bar size all equal the deployment. The instance is keyed by the deployment
-  version; the name is derived from it, so two versions never share an instance.
+  bar size all equal the deployment. The instance is keyed by the version
+  digest; the name is derived from it, so two versions never share an instance.
+  A renewal therefore loads a fresh instance.
 - **Unload.** A deployment that is no longer active (withdrawn, expired, cap,
   new version) is unloaded on the next reconcile.
 - **File replaced after load.** At each reconcile and before each signal the
   service re-hashes the file. On a mismatch it stops new entries from that
   instance and unloads it. Exits for positions already open still go through.
-- **Signals.** `SignalEntry` gains `deployment_digest` and `source_digest`.
+- **Signals.** `SignalEntry` gains `deployment_version` and `source_digest`.
   Every BUY from an AI-deployment instance carries both, so the trader can do the
   rechecks in 5.2 item 8. A signal from an instance with no verified binding is
   never emitted.
@@ -317,6 +369,7 @@ overrides; no AI principal can change it):
 | `max_active_deploys` | 3 |
 | `deploy_expiry_sessions` | 20 |
 | `max_cohort_points` | 3 |
+| `shadow_warmup_sessions` | 5 |
 | `strategy_allowlist` | explicit list of `strategies/<file>.py:<Class>` |
 
 - Cooldown and the trial count use the strategy key. A REJECT of
@@ -336,11 +389,19 @@ overrides; no AI principal can change it):
   holdout, once. Its window must start after every holdout window already opened
   for the strategy key (the existing `opened_holdout_windows` guard). Those
   sessions are **revealed** for that strategy key forever.
-- **No reuse of revealed sessions.** A later evaluation of the same strategy key
-  is refused before claiming (`HOLDOUT_NOT_AVAILABLE`) until enough new sessions
-  exist after the last revealed window for a full disjoint holdout. Shifting the
-  period by a day does not help: the new holdout must still lie after every
-  revealed session.
+- **Revealed sessions are never a future holdout.** A later evaluation of the
+  same strategy key is refused before claiming (`HOLDOUT_NOT_AVAILABLE`) until
+  enough new sessions exist after the last revealed window for a full disjoint
+  holdout. Shifting the period by a day does not help: the new holdout must still
+  lie after every revealed session.
+- **Revealed sessions may be selection data.** A later evaluation may use
+  previously revealed sessions in its walk-forward folds, so they can shape the
+  next cohort and its selection. The case labels them `previously_revealed` and
+  states how many holdouts the strategy key has opened before. The spec claims
+  only that the new holdout is data no earlier holdout or fold has touched. It
+  does **not** claim the new test is independent of earlier adaptive choices;
+  the cross-family trial count (below) is the correction for that, and Jev sees
+  both numbers.
 - **Renewal after expiry.** A DEPLOY that expires may be renewed by a `RENEWAL`
   judgment. The `research` service builds its case by code: it reads the paper
   trips and shadow rows of that deployment version with
@@ -348,8 +409,8 @@ overrides; no AI principal can change it):
   case like any other case. The renewal case's code checks pass only if every
   forward session since the deployment started is complete (no INCOMPLETE row).
   It opens no holdout and creates no parameter trial. A renewal
-  DEPLOY creates a new deployment version on the same bundle while that bundle's
-  attestation is still valid. When the bundle has expired, renewal is refused;
+  DEPLOY creates a new sealed deployment version (section 5.2 item 5) on the same
+  base deployment and bundle while that bundle's attestation is still valid. When the bundle has expired, renewal is refused;
   only a new evaluation with a new disjoint holdout can deploy again.
 - **Cross-family count.** Every terminal trial of every cohort counts in
   `strategy_trials(file, class)`, whatever its `family_id`.
@@ -362,10 +423,17 @@ overrides; no AI principal can change it):
   judgments never change an earlier member.
 - **Replay.** After each session close (after bars are complete) the `research`
   service replays every member on **its own bound bar size**, with the same
-  backtester, cost model and `PaperAutomationRules`. Each nightly run starts from
-  the first session after the verdict, with the case's warm-up bars before it,
-  and runs to the new session. So the strategy state equals a continuous run;
-  the new session's row is the change since the previous row.
+  backtester, cost model and `PaperAutomationRules`. Each nightly run covers the
+  first session after the verdict up to the new session, so the strategy state
+  equals a continuous run; the new session's row is the change since the
+  previous row.
+- **Warm-up without trading.** Today `run_window_job` sets the starting capital
+  and trades from `job.start`, so bars placed before the window would trade and
+  book P&L. SP2c adds a backtester option `trading_start`: bars before it (the
+  warm-up, `shadow_warmup_sessions` sessions, recorded in the case) only feed the
+  strategy's state. Signals before `trading_start` are dropped, no order is
+  simulated, no cost is charged, and equity starts at the initial capital at
+  `trading_start` (the first post-verdict session).
 - **Identity.** One row per (judgment id, deployment version or none, session
   date). `record_shadow_result` is idempotent by that identity; another body for
   the same identity is refused.
@@ -424,26 +492,40 @@ One regression per review blocker:
   final dispatch; an exit for the same conid in the same window still goes out.
 - **Strategy binding:** a file replaced after load stops entries and unloads the
   instance while its exit still goes out; a changed file is refused at load; a
-  signal without `deployment_digest` is refused; nothing loads on live.
+  signal without `deployment_version` is refused; nothing loads on live.
 - **Holdout discipline:** a failed revealed holdout followed by a shifted-window
   evaluation of the same strategy key → `HOLDOUT_NOT_AVAILABLE`, no claim; the
   cohort's holdout is opened only for the walk-forward choice; a renewal opens
   no holdout and adds no trial; a renewal DEPLOY registers against the initial
   judgment's bundle while it is valid and is refused after it expires; trial
-  counts carry across `family_id`s.
+  counts carry across `family_id`s; a later evaluation whose folds include a
+  revealed window marks those sessions `previously_revealed` in its case.
+- **Cohort selection:** in a cohort where the point with the best 1x Sharpe
+  fails the 2x cost stress, that point is not selected and a point that passes
+  the full gate is; a neighbour with a better Sharpe than every cohort point is
+  never selected; if no point passes, no artifact is sealed and no holdout opens.
+- **Renewal version:** after expiry, a renewal DEPLOY on the same bundle returns
+  a new version digest (not the old one); the old version stays expired; the
+  strategy service loads a fresh instance for the new version; registering the
+  same renewal judgment twice returns the same version.
 
 Majors and other checks:
 
 - **Counting:** one evaluation with one point and two neighbours adds three
   trials to `strategy_trials`; a judgment adds none; a REJECT of one parameter
   set cools down another parameter set of the same file and class.
-- **Shadow:** a daily-bar candidate replays daily bars; a wrong-size bar →
-  INCOMPLETE; the nightly row equals the same session in one continuous run;
+- **Shadow:** a 15-minute candidate (the longest bar size the evaluator
+  accepts) replays 15-minute bars, never 1-minute bars; a wrong-size bar →
+  INCOMPLETE; with warm-up bars before the first post-verdict session, the
+  forward row has no fill, no cost and no P&L before that session and starts at
+  the initial capital; the nightly row equals the same session in one continuous
+  run;
   books per verdict, including INCOMPLETE; a repeat row is a no-op, a changed one
   is refused.
 - **Access:** every new method refused for every caller outside its table row,
   at the server; `research` cannot call any trading method; `check-mount research`
-  fails if any other private key is mounted.
+  fails if any other private key is mounted; `RESTART_ON_ROTATE["research"]`
+  is `("ai", "research", "trader")`; `KEYCHECK_SERVICES` includes `research`.
 - Bundle tampering: changed parameters, conids, bar size or file; expired
   bundle; unknown signing key → refused.
 - Replay of a judgment: zero external calls; config or code mismatch → INCOMPLETE.

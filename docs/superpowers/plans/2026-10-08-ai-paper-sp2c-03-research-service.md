@@ -49,7 +49,7 @@
 20. **One evaluation at a time**, queue bounded by `queue_max`; a full queue refuses `QUEUE_FULL` **before** the claim.
 21. **Executing file hash** = `"sha256:" + sha256(exact file bytes)` at submit (`strategy_file_hash`); a different hash when the run starts → stage `FAILED`, `STRATEGY_SOURCE_CHANGED`.
 22. **A HOLDOUT_FAILED case names the decision without recording it.** The evaluator records no eligibility decision for a failed holdout (a retired artifact is never attested), but Plan 1's case shape needs `eligibility_decision_digest` for that stage. The case carries `decision.digest` (computed, not stored). It can never be deployed (`initial_deploy_allowed` needs `COMPLETE` and `holdout_passed is True`).
-23. **The holdout result goes into the case header** (Plan 1 ruling 15, PR #91 thread 4218218927). `build_initial_case` sets `holdout_passed` from the `HoldoutOutcome` it ran (`True` / `False`), `None` when no holdout was opened; `build_failed_case` sets `None`. `evaluation_summary` reports this header field, not the evidence copy, and `attest_from_judgment` requires it too.
+23. **The holdout result goes into the case header** (Plan 1 ruling 15, PR #91 thread 4218218927). `build_initial_case` sets `holdout_passed` from the `HoldoutOutcome` it ran (`True` / `False`), `None` when no holdout was opened; `build_failed_case` sets `None`. Both write `evidence["holdout"]` from the same result (PR #91 OpenAI round 2): `holdout_evidence(outcome)` is `null` when no holdout was opened, else the window with `passed = bool(outcome.passed)`, the very value put in `holdout_passed`; `build_failed_case` writes `evidence["holdout"] = None`. Plan 1's model refuses a case whose evidence and header disagree (`CASE_MALFORMED`). `evaluation_summary` reports this header field, not the evidence copy, and `attest_from_judgment` requires it too.
 24. **A finished evaluation is shown only after the trader confirmed its end** (PR #91 thread 4218218688). After the case is signed, the request row keeps `state = 'RUNNING'` and records the owed end in `pending_report` (`DONE` or `FAILED`). The report is sent at once and again on **every service tick** (`run_next`, also `recover`) until the trader answers `UPDATED` or `UNCHANGED`; after a lost reply the claim is read back with `get_evaluation_claim`, and a claim already in that state counts as confirmed. Only then does the row move to `DONE` / `FAILED` and `get_evaluation` show the case. Plan 4's pump treats Plan 1's `CASE_CLAIM_NOT_FINISHED` as retryable, which stays as the safety net. *Cost if wrong:* while the trader is unreachable a finished case waits (Plan 4's `evaluation_stale_hours` still bounds it).
 25. **A shadow row is sent only when the trader stored it** (PR #91 thread 4218219293). `mark_sent` runs only after `record_shadow_result` answers `INSERTED` (the trader's word for accepted) or `DUPLICATE` (the trader answers `DUPLICATE` only when the stored body digest equals ours; another body is the refusal `CONFLICTING_DUPLICATE`). A retryable refusal (`JUDGMENT_UNKNOWN`) leaves the row pending for the next tick. Any other refusal is final for that session: the row goes to `shadow_failures` with the code and detail, is logged at ERROR, is counted by `ShadowReplay.status()["failed_rows"]` (logged at ERROR after each tick while not zero), and is never sent again or shown as sent; later sessions of the same judgment still go out (each row is its own change of one continuous run). The operator clears a failure by deleting its `shadow_failures` row after fixing the cause; the next tick sends it again. *Cost if wrong:* none to safety; a missing shadow session is visible, never a silent gap.
 
@@ -65,7 +65,7 @@ Plan 1 is the base: this plan uses its names exactly (`trader/research/evaluatio
   - `submit_evaluation` request (strict): `{"kind": "INITIAL", "strategy_key", "cohort", "conids" (sorted), "bar_size"}` or `{"kind": "RENEWAL", "prior_version_digest"}` (refused `RENEWAL_NOT_SUPPORTED` until Plan 5, ruling 17). The caller sends no day: the service sets `research_day` (ruling 1). Reply: `{"status": "ACCEPTED"|"DUPLICATE"|"REFUSED", "request_id", "state", "code", "detail", "retryable"}`; `CLAIM_UNKNOWN` is retryable, a trader refusal keeps the trader's `retryable`; a same-day resend of an accepted body is `DUPLICATE` with the same `request_id`. Refusal codes include `FAMILY_COOLING_DOWN`, `EVALUATION_LIMIT_REACHED`, `EVALUATION_REQUEST_CONFLICT` (from the trader), `HOLDOUT_NOT_AVAILABLE`, `STRATEGY_NOT_ALLOWED`, `COHORT_TOO_LARGE`, `COHORT_POINT_INVALID`, `CONIDS_OUT_OF_SCOPE`, `REQUEST_INVALID`, `SPEC_INVALID`, `QUEUE_FULL`, `CLAIM_UNKNOWN`, `PRINCIPAL_FORBIDDEN`.
   - `get_evaluation` `{"request_id"}` → `{"found", "request_id", "state", "case_digest", "summary"}`. Until the trader has confirmed the claim's `DONE` or `FAILED` (ruling 24), the reply says `state: "RUNNING"` with `case_digest` and `summary` null, so a caller never judges a case whose claim the trader still holds open. `summary` = `evaluation_summary(case)` (Plan 4's `CaseSummary` models every key): `kind, strategy_key, strategy_path, class_name, file_hash, params, conids, bar_size, stage, rules_passed, holdout_passed, eligibility, renewal_checks_passed, prior_version_digest, order_notional, strategy_trials, prior_holdouts, previously_revealed_sessions, selected_index, error, metrics, points [{index, params, pre_holdout_passed, failed_rules, missing_rules, metrics {expectancy_bps_1x, expectancy_bps_1_5x, expectancy_bps_2x, selection_statistic}}], rule_results [{point, rule, passed}], forward`. `rules_passed` is `offered_menu(case) == FULL_MENU`, the same rule the trader's menu check uses. Every value is code-computed; never a bundle digest.
   - `attest_from_judgment` `{"judgment_id"}` → `{"status": "ATTESTED"|"DUPLICATE"|"REFUSED", "bundle_digest", "code", "detail", "retryable", "binding"}`. ATTESTED and DUPLICATE carry `binding` = `{strategy_path, class_name, file_hash, params, conids, bar_size, order_notional}` read from the bundle just signed (Plan 2's `binding_differences` facts); a refusal has `binding: null`. `TRADER_UNAVAILABLE` is retryable.
-  - The case `evidence` dict (signed, read only by Plan 3 and humans): `points [{index, params, trial_id, neighbour_trial_ids, pre_holdout_passed, failed_rules, missing_rules, rules [{code, passed, observed}], expectancy_bps {1x, 1.5x, 2x}, selection_statistic}]`, `strategy_trials`, `selected_index`, `replay_index`, `holdout {start, end, passed, detail}|null`, `previously_revealed [ISO dates]`, `holdouts_opened_before`, `warmup_sessions`, `error`.
+  - The case `evidence` dict (signed, read only by Plan 3 and humans): `points [{index, params, trial_id, neighbour_trial_ids, pre_holdout_passed, failed_rules, missing_rules, rules [{code, passed, observed}], expectancy_bps {1x, 1.5x, 2x}, selection_statistic}]`, `strategy_trials`, `selected_index`, `replay_index`, `holdout {start, end, passed, detail}|null` (always present; `passed` equals the header `holdout_passed`, ruling 23), `previously_revealed [ISO dates]`, `holdouts_opened_before`, `warmup_sessions`, `error`.
   - `trader/research/shadow_window.py`: `shadow_window(decided_at, verdict, *, deploy_expiry_sessions, family_cooldown_sessions) -> (first_session, last_session)`.
   - Trader command `record_shadow_result` (`research` only) and table `shadow_results` (journal migration 120): `record_id, judgment_id, deployment_version, session_date, verdict, case_digest, status, reason, pnl_usd, fees_usd, trades, end_equity_usd, bar_size, body_digest, recorded_at`; Plan 5's `ForwardEvidenceSource` reads it by `deployment_version`.
   - Plan 4's acceptance fixture `tests/research/research_service_fixtures.py::research_stack` depends on Plan 4's served harness, so Plan 4 writes it from Plan 3's public constructors (`EvaluationService`, `JudgmentAttest`, `build_research_registry`, `ResearchStore`, `TraderPort`).
@@ -1190,7 +1190,7 @@ Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
 
 **Interfaces.**
 - Consumes Plan 1's `EvaluationCase`, `CASE_DOMAIN`, `write_evaluation_case`, `load_verified_case`, `initial_deploy_allowed`, `offered_menu`, `FULL_MENU`, `NO_DEPLOY_MENU`; `split_strategy_key`.
-- Produces `STAGE_NAMES`, `json_safe(value)`, `initial_evidence(result, *, warmup_sessions) -> dict`, `build_initial_case(spec, claim_day, result, *, created_at, warmup_sessions) -> EvaluationCase`, `build_failed_case(body, *, request_id, claim_day, file_hash, error, created_at, warmup_sessions) -> EvaluationCase`, `evaluation_summary(case, *, order_notional) -> dict` (Plan 4's `EvaluationSummary` keys).
+- Produces `STAGE_NAMES`, `json_safe(value)`, `holdout_evidence(outcome) -> dict | None`, `initial_evidence(result, *, warmup_sessions) -> dict`, `build_initial_case(spec, claim_day, result, *, created_at, warmup_sessions) -> EvaluationCase`, `build_failed_case(body, *, request_id, claim_day, file_hash, error, created_at, warmup_sessions) -> EvaluationCase`, `evaluation_summary(case, *, order_notional) -> dict` (Plan 4's `EvaluationSummary` keys).
 
 - [ ] **Step 1: Fixture** `tests/research/case_fixtures.py` (Tasks 5, 6, 7, 11):
 
@@ -1269,7 +1269,7 @@ def build(result):
 def test_a_rule_failure_is_a_case_without_an_artifact_that_offers_shadow_or_reject():
     case = build(pre_holdout_result())
     assert case.stage == "PRE_HOLDOUT_FAILED" and case.artifact_id is None and case.final_rule_results == []
-    assert case.holdout_passed is None
+    assert case.holdout_passed is None and case.evidence["holdout"] is None
     assert offered_menu(case) == NO_DEPLOY_MENU
     assert case.evidence["points"][0]["rules"][0]["observed"] is None         # NaN never reaches the bytes
 
@@ -1278,12 +1278,14 @@ def test_a_holdout_failure_names_the_decision_and_offers_no_deploy():
     case = build(complete_result(holdout_passed=False))
     assert case.stage == "HOLDOUT_FAILED" and case.eligibility_decision_digest == "d" * 64
     assert case.holdout_passed is False and evaluation_summary(case, order_notional=1900.0)["holdout_passed"] is False
+    assert case.evidence["holdout"]["passed"] is False                          # one result, header and evidence
     assert offered_menu(case) == NO_DEPLOY_MENU
 
 
 def test_a_complete_passing_case_offers_deploy_and_its_summary_matches_the_menu():
     case = build(complete_result())
     assert case.stage == "COMPLETE" and case.holdout_passed is True and offered_menu(case) == FULL_MENU
+    assert case.evidence["holdout"]["passed"] is True
     summary = evaluation_summary(case, order_notional=1900.0)
     assert summary["rules_passed"] is True and summary["holdout_passed"] is True
     assert summary["params"] == {"ENTRY_MINUTE": 600} and summary["prior_holdouts"] == 1
@@ -1297,6 +1299,7 @@ def test_a_failure_after_the_claim_is_a_failed_case():
     case = build_failed_case(BODY, request_id=SPEC.request_id, claim_day="2024-03-29", file_hash=SPEC.file_hash,
                              error="EvaluationError: no bars", created_at=NOW, warmup_sessions=5)
     assert case.stage == "FAILED" and case.holdout_passed is None and case.evidence["error"] == "EvaluationError: no bars"
+    assert "holdout" in case.evidence and case.evidence["holdout"] is None
     summary = evaluation_summary(case, order_notional=1900.0)
     assert summary["rules_passed"] is False and summary["error"] == "EvaluationError: no bars"
     assert (summary["points"], summary["selected_index"]) == ([], None)
@@ -1366,6 +1369,13 @@ def _point(verdict: Any, decision: Any) -> dict:
             "selection_statistic": json_safe(evidence.selection_adjusted_confidence)}
 
 
+def holdout_evidence(outcome: Any) -> dict | None:
+    """Ruling 23: the evidence and the header come from the same holdout result."""
+    if outcome is None:
+        return None
+    return {**json_safe(dict(outcome.window)), "passed": bool(outcome.passed)}
+
+
 def initial_evidence(result: Any, *, warmup_sessions: int) -> dict:
     outcome, selected = result.holdout, result.selected
 
@@ -1376,7 +1386,7 @@ def initial_evidence(result: Any, *, warmup_sessions: int) -> dict:
     return {"points": [_point(v, decision_of(v)) for v in result.verdicts],
             "strategy_trials": result.strategy_trials,
             "selected_index": None if selected is None else selected.index, "replay_index": result.replay_index,
-            "holdout": None if outcome is None else json_safe(dict(outcome.window)),
+            "holdout": holdout_evidence(outcome),
             "previously_revealed": list(result.previously_revealed),
             "holdouts_opened_before": result.holdouts_opened_before, "warmup_sessions": warmup_sessions,
             "error": None}

@@ -200,6 +200,8 @@ ai-policy publish policy.yaml --reason "x"   # operator only; file = {limits: {.
 ai-deployment register-discretionary --operator owner --statement "paper only"   # operator; the SP2 discretionary deployment
 ai-deployment register-discretionary --operator owner --statement "x" --stock-types ETF --min-price 10   # narrow the rule
 ai-deployment show sha256:...                # a sealed deployment, its kind and provenance
+ai-deployment version sha256:...             # a judged deployment version and its state; exit 1 if unknown
+ai-deployment withdraw sha256:... --reason "x"   # operator; ends that version for good; exit 1 on a refusal
 scoreboard                                   # PAPER scoreboard of the latest experiment ('-' = unknown)
 --json scoreboard --experiment exp-<20 hex>  # the report as JSON: {"data": ..., "title": "Scoreboard (paper)"}
 scoreboard verify                            # rebuild every number from stored inputs; exit 1 on any mismatch
@@ -210,13 +212,16 @@ scoreboard verify                            # rebuild every number from stored 
 # (confirmed, estimated, incomplete), the confirmed and estimated parts and the unknown calls; unavailable when none.
 experiment acceptance preflight              # SP1 clean-account gate: PASS, or STOP + reasons (exit 1)
 experiment acceptance run                    # dry run: reads the gate, prints the planned calls, sends nothing
-experiment acceptance run --place-orders --confirm-account DU123 --signing-key KEY   # the owner's paper session only
+experiment acceptance run --place-orders --deployment-version sha256:... --confirm-account DU123 --signing-key KEY
+                                             # the owner's paper session only; the ACTIVE SP2c-judged version
+                                             # (covering both conids) the ENTERs are bound to; the harness
+                                             # registers nothing (DEPLOYMENT_VERSION_REQUIRED without it)
 experiment acceptance finish --run-id acc-... --signing-key KEY   # after 15:55 ET: end checks + signed report
 experiment acceptance status --run-id acc-...  # the local run journal only
 experiment acceptance verify-report REPORT --public-key PUB   # signature + fields; exit 1 if bad or ephemeral
 ```
 
-### `ai-deployment` (SP2 discretionary deployment)
+### `ai-deployment` (SP2 discretionary deployment, SP2c judged versions)
 
 Self-found ideas of the AI paper bot trade only under a `discretionary` deployment that the
 operator registers. Its scope is a rule, not a conid list; the trader checks it at admission and
@@ -240,6 +245,20 @@ Registering the same content again replays one command. `show DIGEST` (`--json` 
 `{"digest", "kind": "strategy"|"discretionary"|null, "deployment", "strategy_digest_provenance", "error_code"}`;
 a discretionary deployment has provenance `OPERATOR_ATTESTED`.
 
+Judged versions (SP2c). `version VERSION_DIGEST` (typed `get_ai_deployment_version`) prints
+`{"version_digest", "base_digest", "judgment_id", "kind": "INITIAL"|"RENEWAL", "prior_version_digest",
+"first_session", "expiry_session", "state"}`; `state` is `ACTIVE`, `EXPIRED`, `WITHDRAWN` or `ENDED`
+(superseded by a renewal, or its judgment no longer stands). `ACTIVE` also covers a version whose first
+session is still ahead or that is over the active cap; the trader refuses its entries
+(`DEPLOYMENT_NOT_ACTIVE`) until it really is active. An unknown digest exits 1; a tampered stored
+version is an error (`DEPLOYMENT_VERSION_TAMPERED`).
+
+`withdraw VERSION_DIGEST --reason TEXT` (operator, signs as `cli`; typed `withdraw_ai_deployment`) ends the
+version for good: the strategy service unloads its `aidv-` instance and the trader refuses its new entries;
+exits and open brackets are not touched. It returns `{"version_digest", "withdrawn": true,
+"already_withdrawn"}`; a repeat is safe. A refusal (`DEPLOYMENT_VERSION_UNKNOWN`, `PERMISSION_DENIED`) prints
+the code and exits 1. A withdrawn version cannot be renewed; trading the strategy again needs a new DEPLOY judgment and registration.
+
 ## Command Service Requirements
 
 **No service needed** (fully local / REST keys only):
@@ -260,8 +279,8 @@ a discretionary deployment has provenance `OPERATOR_ATTESTED`.
 - `forex snapshot`, `forex quote` (default IB source; IDEALPRO CASH contract)
 - `experiment status|start|pause|resume|stop` (SP1 experiments; paper only)
 - `ai-policy show|publish` (SP2 operator AI risk policy; paper only; `publish` signs as `cli`)
-- `ai-deployment register-discretionary|show` (SP2 discretionary deployment; paper only; `register-discretionary` signs as `cli`)
-- `experiment acceptance preflight|run|finish` (SP1 acceptance, host only; `run` and `finish` sign with the `ai_supervisor`/`ai_research` keys, plus `cli` with `--place-orders`); `experiment acceptance status|verify-report` are local
+- `ai-deployment register-discretionary|show|version|withdraw` (SP2 discretionary deployment and SP2c judged versions; paper only; `register-discretionary` and `withdraw` sign as `cli`)
+- `experiment acceptance preflight|run|finish` (SP1 acceptance, host only; `run` and `finish` sign with the `ai_supervisor` key, plus `cli` with `--place-orders`; a real `run` needs `--deployment-version`); `experiment acceptance status|verify-report` are local
 - `flatten --reason TEXT [--wait] [--yes]` (paper only; typed `liquidate_account`, prints `FLAT` only on broker evidence)
 - `scoreboard`, `scoreboard verify` (SP1 scoreboard; reads the journal, not IB, so no IB-upstream check)
 

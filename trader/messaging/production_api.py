@@ -80,8 +80,10 @@ would otherwise scrub to an opaque ``INTERNAL_ERROR``.
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import dataclasses
 import datetime as dt
+import hashlib
 import logging
 import os
 import re
@@ -799,8 +801,11 @@ class PublishAiRiskPolicyRequest(BaseModel):
 
 
 class RegisterAiDeploymentRequest(BaseModel):
+    """SP2c: a registration names its DEPLOY judgment and its research bundle (spec 5.2 item 4)."""
     model_config = ConfigDict(extra="forbid", strict=True)
 
+    judgment_id: Annotated[str, Field(pattern=r"^[A-Za-z0-9_.:-]{1,128}$")]
+    bundle_digest: Annotated[str, Field(pattern=r"^sha256:[0-9a-f]{64}$")]
     deployment: dict
 
     @field_validator("deployment")
@@ -890,6 +895,8 @@ class SubmitAiPaperDecisionRequest(BaseModel):
     policy_revision: Optional[_AiCount]
     evidence_digest: str
     expires_at: str
+    deployment_version: Optional[str] = None
+    source_digest: Optional[str] = None
 
     @field_validator("decision_id")
     @classmethod
@@ -1382,20 +1389,81 @@ def _publish_ai_risk_policy_rpc_handler(coordinator: TradingCommandCoordinator, 
     return _handler
 
 
-def _register_ai_deployment_rpc_handler(coordinator: TradingCommandCoordinator, account_id: Optional[str]):
+def _register_ai_deployment_rpc_handler(coordinator: TradingCommandCoordinator, account_id: Optional[str],
+                                        actions):
     from trader.automation.ai_deployments import AiDeployment, deployment_digest
-    from trader.automation.ai_paper_actions import REGISTER_ACTION, deployment_command_id
+    from trader.automation.ai_paper_actions import REGISTER_ACTION
 
     def _handler(parsed: RegisterAiDeploymentRequest, caller: RpcCaller) -> Dict[str, Any]:
         # The canonical record (conids sorted) is the body, so a re-registration replays.
         deployment = AiDeployment.from_json(parsed.deployment)
-        digest = deployment_digest(deployment)
+        body = {"judgment_id": parsed.judgment_id, "bundle_digest": parsed.bundle_digest,
+                "deployment": deployment.to_json()}
         request = CommandRequest(
-            command_id=deployment_command_id(digest), action=REGISTER_ACTION, account_id=account_id,
-            target_type="ai_deployment", target_id=digest, expected_version=None,
-            body=deployment.to_json(), source=caller.principal, principal=caller.principal,
+            command_id=actions.registration_command_id(body), action=REGISTER_ACTION, account_id=account_id,
+            target_type="ai_deployment", target_id=deployment_digest(deployment), expected_version=None,
+            body=body, source=caller.principal, principal=caller.principal,
         )
-        return _receipt_to_dict(coordinator.execute(request))
+        return _loud_refusal_as_rpc_error(coordinator.execute(request))
+    return _handler
+
+
+def _loud_refusal_as_rpc_error(receipt: CommandReceipt) -> Dict[str, Any]:
+    """A tampered record or an unservable calendar is an RPC error, never a reply body (SP2c spec 5.1).
+
+    The action returns it as a REJECTED receipt, so the ledger keeps the real code and a same-day retry
+    replays it; this is where the receipt becomes the error."""
+    from trader.automation.ai_paper_actions import is_loud_refusal
+    if is_loud_refusal(receipt.error_code):
+        raise _DispatchProblem(receipt.error_code, (receipt.outcome or {}).get("message", receipt.error_code))
+    return _receipt_to_dict(receipt)
+
+
+@contextlib.contextmanager
+def _stored_record_errors_as_rpc_errors():
+    """A direct read has no ledger: a tampered version or judgment raises straight out of the read."""
+    from trader.automation.ai_deployments import DeploymentRefused
+    from trader.automation.ai_paper_actions import is_loud_refusal
+    from trader.automation.backtest_judgments import JudgmentRefused
+    from trader.research.evaluation_case import CaseRefused
+    try:
+        yield
+    except (JudgmentRefused, CaseRefused) as refused:
+        raise _DispatchProblem(refused.code, refused.detail) from None
+    except DeploymentRefused as refused:
+        if not is_loud_refusal(refused.code):
+            raise
+        raise _DispatchProblem(refused.code, refused.message) from None
+
+
+def _require_caller(caller: RpcCaller, allowed: frozenset[str]) -> None:
+    if caller.principal not in allowed:
+        raise _DispatchProblem("PERMISSION_DENIED", f"principal {caller.principal!r} may not call this method")
+
+
+def _withdraw_ai_deployment_rpc_handler(coordinator: TradingCommandCoordinator, account_id: Optional[str]):
+    from trader.automation.ai_paper_actions import WITHDRAW_ACTION
+    from trader.research.canonical import canonical_json_bytes
+
+    def _handler(parsed: WithdrawAiDeploymentRequest, caller: RpcCaller) -> Dict[str, Any]:
+        _require_caller(caller, TRADER_ACL[("command", "withdraw_ai_deployment")])
+        body = {"version_digest": parsed.version_digest, "reason": parsed.reason}
+        request = CommandRequest(
+            command_id="aidw-" + hashlib.sha256(canonical_json_bytes(body)).hexdigest()[:48],
+            action=WITHDRAW_ACTION, account_id=account_id, target_type="ai_deployment_version",
+            target_id=parsed.version_digest, expected_version=None, body=body,
+            source=caller.principal, principal=caller.principal,
+        )
+        return _loud_refusal_as_rpc_error(coordinator.execute(request))
+    return _handler
+
+
+def _ai_deployment_read_handler(read, allowed: frozenset[str]):
+    """Spec 5.1: the allow-list is not the authority; each read checks its caller again."""
+    def _handler(parsed, caller: RpcCaller):
+        _require_caller(caller, allowed)
+        with _stored_record_errors_as_rpc_errors():
+            return read(parsed)
     return _handler
 
 
@@ -1528,11 +1596,14 @@ def _ai_entry_quote_handler(source, now):
 def register_ai_paper_authority(registry: TypedRpcRegistry, coordinator: TradingCommandCoordinator,
                                 ai_paper, *, account_id: Optional[str]) -> None:
     """SP1 ai_paper (Plan 3 Task 9): only when ``ai_paper.enabled`` built the services."""
-    from trader.automation.ai_paper_actions import PUBLISH_ACTION, REGISTER_ACTION, REGISTER_DISCRETIONARY_ACTION
+    from trader.automation.ai_paper_actions import (
+        PUBLISH_ACTION, REGISTER_ACTION, REGISTER_DISCRETIONARY_ACTION, WITHDRAW_ACTION,
+    )
     from trader.automation.ai_paper_decision import AI_PAPER_ACTION
 
     coordinator.register_action(PUBLISH_ACTION, ai_paper.actions.publish, requires_preflight=False, saga=True)
     coordinator.register_action(REGISTER_ACTION, ai_paper.actions.register, requires_preflight=False)
+    coordinator.register_action(WITHDRAW_ACTION, ai_paper.actions.withdraw, requires_preflight=False)
     coordinator.register_action(REGISTER_DISCRETIONARY_ACTION, ai_paper.actions.register_discretionary,
                                 requires_preflight=False)
     coordinator.register_action(AI_PAPER_ACTION, ai_paper.decisions.execute, requires_preflight=False, saga=True)
@@ -1542,7 +1613,7 @@ def register_ai_paper_authority(registry: TypedRpcRegistry, coordinator: Trading
     )
     registry.register(
         "command", "register_ai_deployment", RegisterAiDeploymentRequest, dict,
-        _register_ai_deployment_rpc_handler(coordinator, account_id), with_caller=True,
+        _register_ai_deployment_rpc_handler(coordinator, account_id, ai_paper.actions), with_caller=True,
     )
     registry.register(
         "command", "register_discretionary_deployment", RegisterDiscretionaryDeploymentRequest, dict,
@@ -1567,8 +1638,35 @@ def register_ai_paper_authority(registry: TypedRpcRegistry, coordinator: Trading
     registry.register(
         "query", "get_ai_deployment", GetAiDeploymentRequest, dict, _get_ai_deployment_handler(ai_paper.actions),
     )
+    _register_ai_deployment_versions(registry, coordinator, ai_paper, account_id=account_id)
     _register_ai_discovery(registry, ai_paper)
     _register_backtest_judge(registry, ai_paper)
+
+
+def _register_ai_deployment_versions(registry: TypedRpcRegistry, coordinator: TradingCommandCoordinator,
+                                     ai_paper, *, account_id: Optional[str]) -> None:
+    """SP2c Plan 2: withdrawal and the two version reads. The reads open case files, so they run on a thread."""
+    from trader.messaging.ai_deployment_wire import (
+        GetActiveAiDeploymentsRequest, GetActiveAiDeploymentsResponse, GetAiDeploymentVersionRequest,
+        WithdrawAiDeploymentRequest,
+    )
+    registry.register(
+        "command", "withdraw_ai_deployment", WithdrawAiDeploymentRequest, dict,
+        _withdraw_ai_deployment_rpc_handler(coordinator, account_id), with_caller=True,
+    )
+    registry.register(
+        "query", "get_ai_deployment_version", GetAiDeploymentVersionRequest, dict,
+        _ai_deployment_read_handler(lambda parsed: ai_paper.actions.version_view(parsed.version_digest),
+                                    TRADER_ACL[("query", "get_ai_deployment_version")]),
+        execution="thread", with_caller=True,
+    )
+    registry.register(
+        "query", "get_active_ai_deployments", GetActiveAiDeploymentsRequest, GetActiveAiDeploymentsResponse,
+        _ai_deployment_read_handler(
+            lambda parsed: GetActiveAiDeploymentsResponse.model_validate(ai_paper.actions.active_view()),
+            TRADER_ACL[("query", "get_active_ai_deployments")]),
+        execution="thread", with_caller=True,
+    )
 
 
 def _register_backtest_judge(registry: TypedRpcRegistry, ai_paper) -> None:

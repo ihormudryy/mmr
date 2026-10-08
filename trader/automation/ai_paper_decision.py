@@ -53,7 +53,8 @@ _DECISION_ID = re.compile(r"^[A-Za-z0-9_-]{8,64}$")
 _DECIDER = re.compile(r"^[a-z][a-z0-9_.-]{0,63}$")
 _SHA256 = re.compile(r"^sha256:[0-9a-f]{64}$")
 _KEYS = ("decision_id", "deployment_digest", "decider", "action", "conid", "side", "stop_price",
-         "target_price", "quantity", "policy_revision", "evidence_digest", "expires_at")
+         "target_price", "quantity", "policy_revision", "evidence_digest", "expires_at",
+         "deployment_version", "source_digest")
 
 
 def apply_ai_paper_decision_migration(migrator: SchemaMigrator) -> bool:
@@ -65,7 +66,8 @@ def apply_ai_paper_decision_migration(migrator: SchemaMigrator) -> bool:
             policy_revision INTEGER, effective_revision INTEGER, principal VARCHAR,
             controller_epoch BIGINT, body_json VARCHAR NOT NULL, state VARCHAR NOT NULL, error_code VARCHAR,
             close_root_id VARCHAR, received_at TIMESTAMPTZ NOT NULL, updated_at TIMESTAMPTZ NOT NULL,
-            experiment_id VARCHAR, deployment_kind VARCHAR)""",
+            experiment_id VARCHAR, deployment_kind VARCHAR, deployment_version VARCHAR,
+            source_digest VARCHAR)""",
         "CREATE INDEX IF NOT EXISTS idx_ai_paper_decisions_root ON ai_paper_decisions(close_root_id)",
     ))
 
@@ -118,6 +120,8 @@ class AiPaperDecision:
     policy_revision: Optional[int]
     evidence_digest: str
     expires_at: dt.datetime
+    deployment_version: Optional[str] = None
+    source_digest: Optional[str] = None
 
     def __post_init__(self):
         self._check_fields()
@@ -145,6 +149,12 @@ class AiPaperDecision:
             raise DecisionInvalid("policy_revision must be null or a JSON integer >= 1")
         if not isinstance(self.evidence_digest, str) or not _SHA256.match(self.evidence_digest):
             raise DecisionInvalid("evidence_digest must be sha256:<64 hex>")
+        for name in ("deployment_version", "source_digest"):
+            value = getattr(self, name)
+            if value is not None and (not isinstance(value, str) or not _SHA256.match(value)):
+                raise DecisionInvalid(f"{name} must be null or sha256:<64 hex>")
+        if (self.deployment_version is None) != (self.source_digest is None):
+            raise DecisionInvalid("deployment_version and source_digest come together")
         if not isinstance(self.expires_at, dt.datetime) or self.expires_at.utcoffset() is None:
             raise DecisionInvalid("expires_at must be an aware datetime")
 
@@ -158,6 +168,8 @@ class AiPaperDecision:
             return
         if self.deployment_digest is not None or self.policy_revision is not None:
             raise DecisionInvalid(f"{self.action} must not carry deployment_digest or policy_revision")
+        if self.deployment_version is not None or self.source_digest is not None:
+            raise DecisionInvalid(f"{self.action} carries no deployment binding")
         if self.action == "CLOSE" and (self.stop_price is not None or self.target_price is not None
                                        or self.quantity is not None):
             raise DecisionInvalid("CLOSE takes no quantity, stop_price or target_price")
@@ -240,7 +252,7 @@ def deployment_binding(*, digest: str, allowlist: tuple[str, ...], notional: flo
 _ROW_COLUMNS = ("command_id", "decision_id", "account_id", "conid", "action", "decider", "evidence_digest",
                 "deployment_digest", "strategy_digest", "style", "policy_revision", "effective_revision",
                 "principal", "controller_epoch", "body_json", "state", "error_code", "close_root_id", "received_at", "updated_at",
-                "experiment_id", "deployment_kind")
+                "experiment_id", "deployment_kind", "deployment_version", "source_digest")
 
 
 @dataclass(frozen=True)
@@ -267,6 +279,8 @@ class DecisionRow:
     close_root_id: Optional[str] = None
     experiment_id: Optional[str] = None
     deployment_kind: Optional[str] = None
+    deployment_version: Optional[str] = None
+    source_digest: Optional[str] = None
 
     @classmethod
     def received(cls, cmd: CommandRequest, now: dt.datetime) -> "DecisionRow":
@@ -281,7 +295,8 @@ class DecisionRow:
     def with_decision(self, decision: AiPaperDecision) -> "DecisionRow":
         return replace(self, decision_id=decision.decision_id, conid=decision.conid, action=decision.action,
                        decider=decision.decider, evidence_digest=decision.evidence_digest,
-                       deployment_digest=decision.deployment_digest, policy_revision=decision.policy_revision)
+                       deployment_digest=decision.deployment_digest, policy_revision=decision.policy_revision,
+                       deployment_version=decision.deployment_version, source_digest=decision.source_digest)
 
 
 @dataclass(frozen=True)
@@ -413,7 +428,7 @@ class AiPaperDecisionService:
                  config: Any, account_id: str, now: Callable[[], dt.datetime], epochs: Any,
                  schedule_reconcile: Optional[Callable[[str], None]] = None,
                  decisions: Optional[AiPaperDecisionStore] = None, close_deadline_seconds: float = 300.0,
-                 scope: Any = None):
+                 scope: Any = None, activity: Any = None):
         self._ledger = ledger
         self._journal = journal
         self._policy = policy
@@ -431,6 +446,7 @@ class AiPaperDecisionService:
         self._close_deadline_seconds = close_deadline_seconds
         self._epochs = epochs
         self._scope = scope
+        self._activity = activity
         self._steps = CommandSteps(ledger=ledger, journal=journal, controls=controls,
                                    account_id=account_id, now=now)
 
@@ -618,6 +634,8 @@ class AiPaperDecisionService:
         if isinstance(deployment, DiscretionaryDeployment):
             # SP2 spec 6.6: no conid list; the scope rule is checked in _admit_scope.
             admission.row = replace(admission.row, style=deployment.style, deployment_kind=DISCRETIONARY_KIND)
+            if decision.deployment_version is not None:
+                raise _Refusal("DEPLOYMENT_VERSION_UNEXPECTED")
         else:
             admission.row = replace(admission.row, strategy_digest=deployment.strategy_digest,
                                     style=deployment.style, deployment_kind=STRATEGY_KIND)
@@ -625,9 +643,28 @@ class AiPaperDecisionService:
                 raise _Refusal("DEPLOYMENT_NOT_DEPLOYABLE")
             if decision.conid not in deployment.conids:
                 raise _Refusal("CONID_NOT_IN_DEPLOYMENT")
+            self._require_active_version(decision)
         if not self._config.style_enabled(deployment.style):
             raise _Refusal(STYLE_NOT_ENABLED)
         return deployment
+
+    def _require_active_version(self, decision: AiPaperDecision) -> None:
+        """SP2c spec 5.2 item 8 at admission; the dispatch gate checks again right before the send.
+
+        Any failure to read the version state refuses the entry as retryable: it never admits one.
+        """
+        if self._activity is None:
+            raise _Refusal("DEPLOYMENT_STATE_UNAVAILABLE", retryable=True)
+        try:
+            code = self._activity.entry_refusal(deployment_digest=decision.deployment_digest,
+                                                version_digest=decision.deployment_version,
+                                                source_digest=decision.source_digest)
+        except Exception as ex:
+            logger.error("deployment version state unavailable for %s: %s code=%s", decision.decision_id,
+                         type(ex).__name__, getattr(ex, "code", None), exc_info=True)
+            raise _Refusal("DEPLOYMENT_STATE_UNAVAILABLE", retryable=True) from None
+        if code:
+            raise _Refusal(code)
 
     def _start_saga(self, cmd, admission, decision, order, binding, prepared) -> CommandReceipt:
         try:

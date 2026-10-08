@@ -1,0 +1,283 @@
+"""SP2c Plan 2 Task 9: the strategy service loads active AI deployments from the exact judged bytes."""
+from __future__ import annotations
+
+import os
+from types import SimpleNamespace
+
+import pandas as pd
+import pytest
+
+from tests.automation.judged_deployment import install_seeded_judgments, seed_judged_deployment
+from tests.sp1_acceptance.conftest import loop_thread  # noqa: F401
+from tests.sp1_fixtures import served_stack
+from tests.strategy.ai_deployment_fixtures import StrategyNode
+from tests.test_strategy_artifact_soft_load import _make_runtime, _write_strategy
+from trader.acceptance.scenario import AcceptanceSettings, deployment_record
+from trader.data.backtest_store import compute_strategy_hash
+from trader.data.duckdb_store import DuckDBConnection
+from trader.data.strategy_signal_record import StrategySignalRecord
+from trader.messaging.ai_deployment_wire import ActiveAiDeployment
+from trader.messaging.typed_rpc import TypedRpcRemoteError
+from trader.objects import Action
+from trader.strategy.ai_deployment_source import AiDeploymentSource, ai_instance_name
+from trader.strategy.trader_gateway import StrategyInstrument
+from trader.trading.strategy import Signal, StrategyState
+
+VERSION = "sha256:" + "d" * 64
+BASE = "sha256:" + "b" * 64
+CONID = 265598
+
+
+def _frame():
+    index = pd.date_range("2026-11-02 14:31", periods=1, freq="1min", tz="UTC", name="date")
+    return pd.DataFrame({"open": 100.0, "high": 101.0, "low": 99.0, "close": 100.5, "volume": 1000}, index=index)
+
+
+def active(path, *, digest=None, version=VERSION):
+    return ActiveAiDeployment(
+        version_digest=version, base_digest=BASE,
+        strategy_path="strategies/" + os.path.basename(path),
+        strategy_digest=digest or "sha256:" + compute_strategy_hash(path), class_name="VwapReclaimCat",
+        params={}, conids=[CONID], bar_size="1 min", expiry_session="2026-11-06")
+
+
+def source(rt, deployments, *, paper=True):
+    return AiDeploymentSource(runtime=rt, read_active=lambda: deployments, paper=paper)
+
+
+def failing(error):
+    def read_active():
+        raise error
+    return read_active
+
+
+def signal_of(instance, action=Action.BUY):
+    return Signal(source_name=instance.name, action=action, probability=0.5, risk=0.0)
+
+
+def replace_file(path):
+    with open(path, "a") as f:
+        f.write("# replaced\n")
+
+
+@pytest.fixture
+def rt(tmp_path, tmp_duckdb_path):
+    runtime = _make_runtime(tmp_path, tmp_duckdb_path, automation_enabled=False)
+    runtime._load_enabled = lambda name: None
+    runtime._last_dispatched_bar = {}
+    runtime.signal_record = StrategySignalRecord(DuckDBConnection.get_instance(tmp_duckdb_path))
+    runtime.event_store = SimpleNamespace(append=lambda event: None)
+    runtime.zmq_messagebus_client = SimpleNamespace(write=lambda *args: None)
+    return runtime
+
+
+@pytest.fixture
+def path(rt):
+    return _write_strategy(rt.strategies_directory)
+
+
+def instance_of(rt, version=VERSION):
+    return rt.get_strategy(ai_instance_name(version))
+
+
+def test_an_active_deployment_loads_under_its_version_name(rt, path):
+    source(rt, [active(path)]).reconcile()
+    instance = instance_of(rt)
+    assert instance is not None and instance.ai_deployment_version == VERSION
+    assert instance.state == StrategyState.RUNNING
+    assert instance.paper_only is True
+
+
+def test_a_changed_file_is_refused_at_load(rt, path):
+    source(rt, [active(path, digest="sha256:" + "0" * 64)]).reconcile()
+    assert rt.ai_instances() == {}
+
+
+def test_a_file_replaced_after_load_drops_signals_and_unloads(rt, path):
+    src = source(rt, [active(path)])
+    src.reconcile()
+    instance = instance_of(rt)
+    replace_file(path)
+    rt._dispatch_signal(instance, signal_of(instance), conId=CONID, frame=_frame())
+    assert rt.signal_record.read(0, 10).signals == ()
+    assert instance.state == StrategyState.DISABLED
+    src.reconcile()
+    assert rt.ai_instances() == {}
+
+
+def test_a_sell_from_a_replaced_file_is_dropped_too(rt, path):
+    source(rt, [active(path)]).reconcile()
+    instance = instance_of(rt)
+    replace_file(path)
+    rt._dispatch_signal(instance, signal_of(instance, Action.SELL), conId=CONID, frame=_frame())
+    assert rt.signal_record.read(0, 10).signals == ()
+
+
+def test_a_replaced_file_is_not_reloaded_by_later_reconciles(rt, path):
+    src = source(rt, [active(path)])
+    src.reconcile()
+    replace_file(path)
+    src.reconcile()
+    src.reconcile()
+    assert rt.ai_instances() == {}
+
+
+def test_a_deleted_file_unloads_the_instance(rt, path):
+    src = source(rt, [active(path)])
+    src.reconcile()
+    os.remove(path)
+    src.reconcile()
+    assert rt.ai_instances() == {}
+
+
+def test_withdrawn_or_expired_deployments_unload(rt, path):
+    src = source(rt, [active(path)])
+    src.reconcile()
+    src._read_active = lambda: []
+    src.reconcile()
+    assert rt.ai_instances() == {}
+
+
+def test_nothing_loads_on_live(rt, path):
+    source(rt, [active(path)], paper=False).reconcile()
+    assert rt.ai_instances() == {}
+
+
+def test_the_runtime_itself_refuses_an_ai_load_on_live(rt, path):
+    rt.paper_trading = False
+    assert rt.load_ai_deployment(active(path)) is False
+
+
+def test_a_live_reconcile_unloads_what_is_loaded(rt, path):
+    src = source(rt, [active(path)])
+    src.reconcile()
+    src._paper = False
+    src.reconcile()
+    assert rt.ai_instances() == {}
+
+
+def test_signals_carry_the_binding(rt, path):
+    deployment = active(path)
+    source(rt, [deployment]).reconcile()
+    instance = instance_of(rt)
+    rt._dispatch_signal(instance, signal_of(instance), conId=CONID, frame=_frame())
+    (recorded,) = rt.signal_record.read(0, 10).signals
+    assert (recorded.entry.deployment_version, recorded.entry.source_digest, recorded.entry.deployment_digest) == (
+        deployment.version_digest, deployment.strategy_digest, deployment.base_digest)
+
+
+def test_a_config_strategy_signal_carries_no_binding(rt, path):
+    rt.load_strategy(name="plain", bar_size_str="1 min", conids=[CONID], universe=None, historical_days_prior=1,
+                     module=path, class_name="VwapReclaimCat", description="x")
+    instance = rt.get_strategy("plain")
+    rt._dispatch_signal(instance, signal_of(instance), conId=CONID, frame=_frame())
+    (recorded,) = rt.signal_record.read(0, 10).signals
+    assert (recorded.entry.deployment_version, recorded.entry.source_digest, recorded.entry.deployment_digest) == (
+        None, None, None)
+
+
+def test_a_config_strategy_cannot_take_an_ai_name(rt, path):
+    rt.load_strategy(name="aidv-0123456789abcdef", bar_size_str="1 min", conids=[CONID], universe=None,
+                     historical_days_prior=1, module=path, class_name="VwapReclaimCat", description="x")
+    assert rt.get_strategy("aidv-0123456789abcdef") is None
+
+
+@pytest.mark.parametrize("error", [ConnectionError("trader down"), TimeoutError("no reply")])
+def test_an_unreachable_trader_keeps_the_loaded_set(rt, path, caplog, error):
+    src = source(rt, [active(path)])
+    src.reconcile()
+    src._read_active = failing(error)
+    src.reconcile()
+    assert list(rt.ai_instances()) == [ai_instance_name(VERSION)]
+    assert "keeping the loaded set" in caplog.text
+
+
+def test_method_not_allowed_means_no_active_deployment(rt, path):
+    src = source(rt, [active(path)])
+    src.reconcile()
+    src._read_active = failing(TypedRpcRemoteError("METHOD_NOT_ALLOWED", "ai_paper is off"))
+    src.reconcile()
+    assert rt.ai_instances() == {}
+
+
+def test_any_other_remote_refusal_is_not_hidden(rt):
+    src = AiDeploymentSource(runtime=rt, read_active=failing(TypedRpcRemoteError("VALIDATION_ERROR", "bad")),
+                             paper=True)
+    with pytest.raises(TypedRpcRemoteError):
+        src.reconcile()
+
+
+def test_unload_strategy_removes_every_trace(rt, path):
+    source(rt, [active(path)]).reconcile()
+    instance = instance_of(rt)
+    rt.strategies[CONID] = [instance]
+    assert rt.unload_strategy(instance.name) is True
+    assert rt.strategies[CONID] == [] and rt.get_strategy(instance.name) is None
+    assert rt.unload_strategy(instance.name) is False
+
+
+def test_a_failing_ai_reconcile_does_not_stop_the_runtime_reconcile(rt, path, caplog):
+    rt._ai_deployment_source = AiDeploymentSource(runtime=rt, read_active=failing(RuntimeError("boom")), paper=True)
+    rt._config_mtime = 0.0
+    rt.strategy_config_file = os.path.join(os.path.dirname(path), "missing.yaml")
+    rt._trader_gateway = SimpleNamespace(resolve_instrument=lambda conid: None)
+    rt._revisions = None
+    rt._drain_ack_outbox = lambda: None
+    rt._reconcile_sync()
+    assert "AI deployment reconcile failed" in caplog.text
+
+
+def test_a_runtime_reconcile_subscribes_the_ai_instance_to_its_conid(rt, path):
+    """The real path: the runtime reconcile loads the instance, resolves its conid and routes that conid's bars."""
+    published = []
+    rt._ai_deployment_source = source(rt, [active(path)])
+    rt._config_mtime = 0.0
+    rt.strategy_config_file = os.path.join(os.path.dirname(path), "missing.yaml")
+    rt._trader_gateway = SimpleNamespace(
+        resolve_instrument=lambda conid: StrategyInstrument(conid, "AAPL", "SMART", "NASDAQ", "USD", "STK",
+                                                            "America/New_York") if conid == CONID else None,
+        publish_instrument=lambda conid, delayed: published.append(conid))
+    rt._revisions = None
+    rt._drain_ack_outbox = lambda: None
+    rt._reconcile_sync()
+    assert rt.strategies[CONID] == [instance_of(rt)] and published == [CONID]
+
+
+class BuyingStrategyFile:
+    """Source of a strategy that buys on every bar, so a fed bar always yields a signal."""
+    BYTES = (b"from trader.objects import Action\n"
+             b"from trader.trading.strategy import Signal, Strategy\n\n"
+             b"class VwapReclaimCat(Strategy):\n"
+             b"    def on_prices(self, prices):\n"
+             b"        return Signal(source_name=self.name, action=Action.BUY, probability=0.5, risk=0.0)\n")
+
+
+@pytest.fixture
+def served(tmp_path, loop_thread, monkeypatch):
+    seeded = install_seeded_judgments(monkeypatch)
+    stack = served_stack(tmp_path, loop_thread, monkeypatch)
+    stack.seeded = seeded
+    yield stack
+    stack.close()
+
+
+def test_a_node_follows_the_trader_active_set_over_signed_rpc(served, tmp_path):
+    strategies_dir = tmp_path / "node" / "strategies"
+    strategies_dir.mkdir(parents=True)
+    (strategies_dir / "vwap_reclaim_cat.py").write_bytes(BuyingStrategyFile.BYTES)
+    settings = AcceptanceSettings(run_id="r", account_id="DU1", strategy_path="strategies/vwap_reclaim_cat.py",
+                                  strategy_class="VwapReclaimCat", strategy_bytes=BuyingStrategyFile.BYTES)
+    base, version = seed_judged_deployment(served.composed.stack.ai_paper, served.seeded,
+                                           deployment_record(settings), today=served.now().date())
+    node = StrategyNode(served, strategies_dir=strategies_dir)
+    node.reconcile()
+    assert list(node.instances()) == [version]
+
+    node.feed_bar(settings.conid_a, _frame())
+    (recorded,) = node.runtime.signal_record.read(0, 10).signals
+    assert (recorded.entry.deployment_version, recorded.entry.deployment_digest) == (version, base)
+    assert recorded.entry.source_digest == settings.strategy_digest
+
+    served.call("cli", "withdraw_ai_deployment", {"version_digest": version, "reason": "operator"})
+    node.reconcile()
+    assert node.instances() == {}

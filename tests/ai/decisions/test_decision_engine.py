@@ -29,7 +29,10 @@ from trader.ai_service import EngineDeps, build_engine
 BLOCK = (f"decisions:\n  discretionary_deployment_digest: \"{DISCRETIONARY_DIGEST}\"\n  strategies:\n"
          f"    orb: {{deployment_digest: \"{STRATEGY_DIGEST}\", stop_fraction: 0.02, target_fraction: 0.04}}\n")
 EXPERIMENT = ExperimentView("exp-" + "b" * 20, "ARMED", NOW, None)
-SIGNAL = SignalOpportunity("sig-" + "1" * 32, 7, "orb", AAPL, "BUY", 0.7, NOW, NOW)
+# A BUY enters only from a judged version (SP2c Plan 2); the base digest keeps the follow baseline's digest.
+BINDING = {"deployment_digest": STRATEGY_DIGEST, "deployment_version": "sha256:" + "9" * 64,
+           "source_digest": "sha256:" + "8" * 64}
+SIGNAL = SignalOpportunity("sig-" + "1" * 32, 7, "orb", AAPL, "BUY", 0.7, NOW, NOW, **BINDING)
 ENTER_ID = derive_decision_id(SIGNAL.opportunity_id, f"enter:{AAPL}")
 
 
@@ -145,7 +148,7 @@ async def test_jev_down_blocks_every_enter_but_not_baselines(rig):              
     rig.jev.script(JEV_MARKER, 404)
     first = await rig.engine.on_entry_signal(rig.signal())
     second = await rig.engine.on_entry_signal(rig.signal(SignalOpportunity("sig-" + "2" * 32, 8, "orb", AAPL, "BUY",
-                                                                          0.7, NOW, NOW)))
+                                                                          0.7, NOW, NOW, **BINDING)))
     assert (first.decisions, first.note, second.decisions, second.note) == ((), "MODEL_FAILED_REJECTED", (),
                                                                             "JEV_UNHEALTHY")
     assert len(rig.jev.requests) == 1 and [b.baseline_id for b in second.baselines] == ["follow_signal.v1"]
@@ -267,11 +270,13 @@ def test_role_health_recovers_after_the_recheck_window():
 
 
 @pytest.mark.asyncio
-async def test_an_unconfigured_strategy_is_noted_without_reads(rig):
-    other = SignalOpportunity("sig-" + "4" * 32, 10, "unknown_strategy", AAPL, "BUY", 0.7, NOW, NOW)
-    result = await rig.engine.on_entry_signal(rig.signal(other))
-    assert (result.decisions, result.baselines, result.note) == ((), (), "STRATEGY_NOT_CONFIGURED")
-    assert rig.reads.calls == []
+@pytest.mark.parametrize("strategy_name", ["orb", "unknown_strategy"])
+async def test_an_unbound_strategy_buy_costs_nothing(rig, strategy_name):
+    """The trader refuses an unbound ENTER (DEPLOYMENT_VERSION_REQUIRED): no model call, no read, no baseline."""
+    unbound = SignalOpportunity("sig-" + "4" * 32, 10, strategy_name, AAPL, "BUY", 0.7, NOW, NOW)
+    result = await rig.engine.on_entry_signal(rig.signal(unbound))
+    assert (result.decisions, result.baselines, result.note) == ((), (), "STRATEGY_NOT_BOUND")
+    assert rig.reads.calls == [] and rig.jev.requests == [] and rig.rulings() == []
 
 
 @pytest.mark.asyncio
@@ -613,3 +618,139 @@ async def test_a_finished_cycle_does_not_queue_its_baselines_twice(rig, tmp_path
     await controller.run_cycle(slot)
     assert rig.store.db.execute("SELECT state FROM ai_cycles", fetch="one") == ("DONE",)
     assert rig.store.db.execute("SELECT COUNT(*) FROM ai_outbox WHERE kind = 'simulated'", fetch="one") == (2,)
+
+
+# -- SP2c Plan 2 ruling 21 (PR #91 thread 4218219168): a SELL closes only its own version's trips ------------------
+
+AI_DEPLOYMENT, SOURCE = "sha256:" + "c" * 64, "sha256:" + "5" * 64
+V_A, V_B = "sha256:" + "a" * 64, "sha256:" + "b" * 64
+
+
+def bound(opportunity_id, cursor, action, version):
+    return SignalOpportunity(opportunity_id, cursor, "aidv-" + version[7:23], AAPL, action, 0.7, NOW, NOW,
+                             deployment_digest=AI_DEPLOYMENT, deployment_version=version, source_digest=SOURCE)
+
+
+def bound_enter(rig, opportunity):
+    """The ENTER the controller sent for a version-bound BUY; its stored body carries the version."""
+    enter = ProposedDecision(action_key=f"enter:{opportunity.conid}", action="ENTER", conid=opportunity.conid,
+                             side="BUY", decider="jev", evidence_digest="sha256:" + "f" * 64,
+                             deployment_digest=AI_DEPLOYMENT, policy_revision=1, stop_price=225.4,
+                             target_price=239.2, deployment_version=opportunity.deployment_version,
+                             source_digest=SOURCE)
+    submitter = Submitter(store=rig.store, supervisor=None, leadership=None, clock=rig.clock, slots=None,
+                          experiment_state=lambda: None)
+    decision_id = rig.store.transaction(lambda conn: submitter.insert_in_tx(
+        conn, source_kind="entry_signal", source_id=opportunity.opportunity_id, decision=enter,
+        expires_at=NOW + dt.timedelta(minutes=5), epoch=1, now=NOW))
+    rig.store.db.execute("UPDATE ai_submissions SET state = 'FINAL', receipt_state = 'RESOLVED' "
+                         "WHERE decision_id = ?", [decision_id])
+    return decision_id
+
+
+def trip(trip_id, decision_id, state="OPEN"):
+    return {"round_trip_id": trip_id, "conid": AAPL, "symbol": "AAPL", "opened_at": NOW.isoformat(),
+            "opened_quantity": 5.0, "closed_quantity": 5.0 if state == "CLOSED" else 0.0,
+            "decision_id": decision_id, "state": state, "entry_avg_price": 230.0}
+
+
+SELL_A = bound("sig-" + "a" * 32, 20, "SELL", V_A)                      # queued while A was still active
+
+
+@pytest.mark.asyncio
+async def test_an_old_version_sell_never_closes_a_successor_trip(tmp_path):
+    trips = {"experiment_id": EXPERIMENT.experiment_id, "trips": []}
+    rig = await started(tmp_path, FakeReads(get_experiment_trips=lambda body: trips,
+                                            get_broker_order_evidence=lambda body: broker()))
+    enter_b = bound_enter(rig, bound("sig-" + "c" * 32, 22, "BUY", V_B))       # B superseded A and bought AAPL
+    trips["trips"] = [trip("rt-b", enter_b)]
+    result = await rig.engine.on_exit_signal(rig.signal(SELL_A))
+    assert (result.decisions, result.note) == ((), "NOT_HELD")                   # B's trip and entry are not A's
+    enter_a = bound_enter(rig, bound("sig-" + "b" * 32, 21, "BUY", V_A))
+    trips["trips"] = [trip("rt-a", enter_a), trip("rt-b", enter_b)]
+    result = await rig.engine.on_exit_signal(rig.signal(SELL_A))
+    assert (result.decisions, result.note) == ((), "EXIT_CONID_SHARED")          # a conid-wide CLOSE would hit B
+
+
+@pytest.mark.asyncio
+async def test_an_old_version_sell_still_closes_its_own_trip_after_supersession(tmp_path):
+    trips = {"experiment_id": EXPERIMENT.experiment_id, "trips": []}
+    rig = await started(tmp_path, FakeReads(get_experiment_trips=lambda body: trips))
+    enter_a = bound_enter(rig, bound("sig-" + "b" * 32, 21, "BUY", V_A))
+    enter_b = bound_enter(rig, bound("sig-" + "c" * 32, 22, "BUY", V_B))       # B is the active version now
+    trips["trips"] = [trip("rt-a", enter_a), trip("rt-b", enter_b, state="CLOSED")]
+    (close,) = (await rig.engine.on_exit_signal(rig.signal(SELL_A))).decisions
+    assert (close.action, close.conid, close.decider, close.side) == ("CLOSE", AAPL, "strategy", "SELL")
+    assert (close.deployment_version, close.source_digest) == (None, None)       # a reduction carries no binding
+    assert rig.calls("get_ai_deployment_version") == []                          # no active-version check on exits
+
+
+@pytest.mark.asyncio
+async def test_an_unbound_sell_never_closes_a_bound_trip(tmp_path):
+    trips = {"experiment_id": EXPERIMENT.experiment_id, "trips": []}
+    rig = await started(tmp_path, FakeReads(get_experiment_trips=lambda body: trips,
+                                            get_broker_order_evidence=lambda body: broker()))
+    enter_b = bound_enter(rig, bound("sig-" + "c" * 32, 22, "BUY", V_B))
+    trips["trips"] = [trip("rt-b", enter_b)]
+    result = await rig.engine.on_exit_signal(rig.signal(SELL))
+    assert (result.decisions, result.note) == ((), "NOT_HELD")
+
+
+@pytest.mark.asyncio
+async def test_a_sell_with_a_working_other_version_entry_on_the_conid(tmp_path):
+    trips = {"experiment_id": EXPERIMENT.experiment_id, "trips": []}
+    rig = await started(tmp_path, FakeReads(get_experiment_trips=lambda body: trips,
+                                            get_broker_order_evidence=lambda body: broker()))
+    enter_a = bound_enter(rig, bound("sig-" + "b" * 32, 21, "BUY", V_A))
+    enter_b = bound_enter(rig, bound("sig-" + "c" * 32, 22, "BUY", V_B))
+    rig.store.db.execute("UPDATE ai_submissions SET state = 'ACCEPTED', receipt_state = 'SUBMITTED' "
+                         "WHERE decision_id = ?", [enter_b])
+    trips["trips"] = [trip("rt-a", enter_a)]
+    result = await rig.engine.on_exit_signal(rig.signal(SELL_A))
+    assert (result.decisions, result.note) == ((), "EXIT_WAITING_FOR_ENTRY")
+    assert result.wait_until is not None                                         # re-judged next tick
+
+
+async def rival_rig(tmp_path, evidence):
+    """A's open trip, plus B's accepted ENTER on the same conid whose broker evidence is ``evidence(enter_b)``."""
+    trips = {"experiment_id": EXPERIMENT.experiment_id, "trips": []}
+    rig = await started(tmp_path, FakeReads(get_experiment_trips=lambda body: trips))
+    enter_a = bound_enter(rig, bound("sig-" + "b" * 32, 21, "BUY", V_A))
+    enter_b = bound_enter(rig, bound("sig-" + "c" * 32, 22, "BUY", V_B))
+    rig.store.db.execute("UPDATE ai_submissions SET state = 'ACCEPTED', receipt_state = 'SUBMITTED' "
+                         "WHERE decision_id = ?", [enter_b])
+    rig.reads.replies["get_broker_order_evidence"] = evidence(enter_b)
+    trips["trips"] = [trip("rt-a", enter_a)]
+    return rig
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("row", [dict(status="Filled", filled=5.0), dict(status="Submitted", filled=2.0)])
+async def test_a_sell_with_a_filled_other_version_entry_is_shared(tmp_path, row):
+    rig = await rival_rig(tmp_path, lambda enter_b: broker(entry_row(enter_b, **row)))
+    result = await rig.engine.on_exit_signal(rig.signal(SELL_A))
+    assert (result.decisions, result.note) == ((), "EXIT_CONID_SHARED")
+
+
+@pytest.mark.asyncio
+async def test_unreadable_evidence_with_a_working_other_version_entry_keeps_the_exit_waiting(tmp_path):
+    rig = await rival_rig(tmp_path, lambda enter_b: {"capture_error": "x"})
+    result = await rig.engine.on_exit_signal(rig.signal(SELL_A))
+    assert (result.decisions, result.note) == ((), "EXIT_WAITING_FOR_ENTRY")
+    assert result.wait_until is not None
+
+
+@pytest.mark.asyncio
+async def test_a_sell_closes_when_the_other_version_entry_ended_unfilled(tmp_path):
+    trips = {"experiment_id": EXPERIMENT.experiment_id, "trips": []}
+    rig = await started(tmp_path, FakeReads(get_experiment_trips=lambda body: trips,
+                                            get_broker_order_evidence=lambda body: broker()))
+    enter_a = bound_enter(rig, bound("sig-" + "b" * 32, 21, "BUY", V_A))
+    enter_b = bound_enter(rig, bound("sig-" + "c" * 32, 22, "BUY", V_B))
+    rig.store.db.execute("UPDATE ai_submissions SET state = 'ACCEPTED', receipt_state = 'SUBMITTED' "
+                         "WHERE decision_id = ?", [enter_b])
+    rig.reads.replies["get_broker_order_evidence"] = lambda body: broker(
+        entry_row(enter_b, status="Cancelled", deleted=True))
+    trips["trips"] = [trip("rt-a", enter_a)]
+    (close,) = (await rig.engine.on_exit_signal(rig.signal(SELL_A))).decisions
+    assert (close.action, close.conid) == ("CLOSE", AAPL)

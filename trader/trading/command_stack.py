@@ -514,6 +514,9 @@ class AiPaperServices:
     claims: Any = None            # EvaluationClaims (SP2c Plan 1)
     judgments: Any = None         # BacktestJudgments (SP2c Plan 1)
     forward_evidence: Any = None  # ForwardEvidenceSource (SP2c Plan 1 default; Plan 5 replaces it)
+    versions: Any = None          # AiDeploymentVersionStore (SP2c Plan 2)
+    activity: Any = None          # DeploymentActivity (SP2c Plan 2)
+    registrar: Any = None         # AiDeploymentRegistrar (SP2c Plan 2)
 
 
 @dataclass(frozen=True)
@@ -533,6 +536,10 @@ class _AiPaperParts:
     deployments: Any = None        # AiDeploymentStore (SP2 Plan 3: the dispatch gate reads kind_of)
     scope_checks: Any = None       # ScopeCheckStore
     filter_refusal: Any = None     # trading_filters.yaml on the IB identity, shared with entry_filter
+    versions: Any = None           # AiDeploymentVersionStore (SP2c Plan 2)
+    activity: Any = None           # DeploymentActivity: the dispatch gate needs it before the saga exists
+    registrar: Any = None          # AiDeploymentRegistrar
+    judgments: Any = None          # BacktestJudgments (SP2c Plan 1): built here, the gate and the surface share it
 
 
 def _ai_paper_config(trader: Any, account_mode: str) -> Optional[Any]:
@@ -547,10 +554,28 @@ def _ai_paper_config(trader: Any, account_mode: str) -> Optional[Any]:
     return config
 
 
+def _aware_clock(now: Callable[[], dt.datetime]) -> Callable[[], dt.datetime]:
+    """Deployment sessions are New York dates: a naive clock must fail loudly, not guess a zone."""
+    def aware_now() -> dt.datetime:
+        moment = now()
+        if moment.utcoffset() is None:
+            raise ValueError("the ai_paper clock must be timezone-aware")
+        return moment
+    return aware_now
+
+
 def _build_ai_paper_parts(trader: Any, config: Any, now: Callable[[], dt.datetime]) -> _AiPaperParts:
+    from pathlib import Path
+
+    from trader.automation.ai_bundle_check import DEFAULT_ARTIFACTS_ROOT, DEFAULT_VERIFY_DIR, ResearchBundleCheck
+    from trader.automation.ai_deployment_activity import DeploymentActivity
+    from trader.automation.ai_deployment_registration import AiDeploymentRegistrar
+    from trader.automation.ai_deployment_versions import AiDeploymentVersionStore
     from trader.automation.ai_deployments import AiDeploymentStore
+    from trader.automation.ai_judgment_port import cooldown_reader_for, judgment_reader_for
     from trader.automation.ai_paper_filter import AiEntryFilter, MtimeCachedFilterLoader
     from trader.automation.ai_risk_policy import AiRiskPolicyService
+    from trader.automation.backtest_judgments import BacktestJudgments
     from trader.automation.calendar_policy import XNYSCalendarPolicy
     from trader.automation.discretionary_scope import ScopeCheckStore, trading_filter_refusal
 
@@ -559,20 +584,42 @@ def _build_ai_paper_parts(trader: Any, config: Any, now: Callable[[], dt.datetim
         calendar=XNYSCalendarPolicy(), now=now,
     )
     load_filter = MtimeCachedFilterLoader()
+    # Every ai_paper store shares the trader's one journal connection (its per-instance lock is the race safety).
+    deployments = AiDeploymentStore(trader.journal_db, now=now)
+    artifacts_root = Path(getattr(trader, "research_artifacts_root", "") or DEFAULT_ARTIFACTS_ROOT).expanduser()
+    verify_dir = Path(getattr(trader, "research_verify_dir", "") or DEFAULT_VERIFY_DIR).expanduser()
+    cases_dir = artifacts_root / "cases"                          # Plan 1's default_cases_dir() layout
+    judge = config.backtest_judge
+    backtest_judgments = BacktestJudgments(trader.journal_db, config=judge, calendar=XNYSCalendarPolicy(),
+                                           cases_dir=cases_dir, verify_dir=verify_dir, now=now)
+    judgments = judgment_reader_for(backtest_judgments, cases_dir=cases_dir, verify_dir=verify_dir)
+    cooldowns = cooldown_reader_for(trader.journal_db)
+    aware_now = _aware_clock(now)
+    versions = AiDeploymentVersionStore(trader.journal_db, now=aware_now)
+    activity = DeploymentActivity(versions=versions, deployments=deployments, judgments=judgments,
+                                  cooldowns=cooldowns, max_active=judge.max_active_deploys, now=aware_now)
+    registrar = AiDeploymentRegistrar(
+        db=trader.journal_db, deployments=deployments, versions=versions, activity=activity, judgments=judgments,
+        cooldowns=cooldowns, bundles=ResearchBundleCheck(artifacts_root=artifacts_root, verify_dir=verify_dir),
+        calendar=XNYSCalendarPolicy(), expiry_sessions=judge.deploy_expiry_sessions, now=aware_now)
+    trader.ai_deployment_versions, trader.ai_deployment_activity = versions, activity   # Plans 1 and 3 read these
     return _AiPaperParts(config=config, policy=policy,
                          entry_filter=AiEntryFilter(universe=trader.universe_accessor, load_filter=load_filter),
-                         deployments=AiDeploymentStore(trader.journal_db, now=now),
+                         deployments=deployments,
                          scope_checks=ScopeCheckStore(trader.journal_db, now=now),
-                         filter_refusal=trading_filter_refusal(load_filter))
+                         filter_refusal=trading_filter_refusal(load_filter),
+                         versions=versions, activity=activity, registrar=registrar, judgments=backtest_judgments)
 
 
 def _ai_paper_guard_options(parts: Optional[_AiPaperParts], accepted_feeds: frozenset[str]) -> dict:
     """R25: the AI gate, strict margin and the limits router for submit_ai_paper_decision only.
 
     SP2 Plan 3: the discretionary scope gate runs first, on the command stack's accepted feeds (PR #76).
+    SP2c Plan 2: the deployment version gate runs next and rechecks a strategy entry right before the send.
     """
     if parts is None:
         return {}
+    from trader.automation.ai_deployment_activity import deployment_version_gate
     from trader.automation.ai_paper_decision import AI_PAPER_ACTION
     from trader.automation.ai_paper_evidence import ai_entry_gate
     from trader.automation.discretionary_scope import compose_entry_gates, discretionary_scope_gate
@@ -588,6 +635,7 @@ def _ai_paper_guard_options(parts: Optional[_AiPaperParts], accepted_feeds: froz
         "ai_entry_gate": compose_entry_gates(
             discretionary_scope_gate(kind_of=parts.deployments.kind_of, checks=parts.scope_checks,
                                      filter_refusal=parts.filter_refusal, accepted_feeds=accepted_feeds),
+            deployment_version_gate(kind_of=parts.deployments.kind_of, activity=parts.activity),
             ai_entry_gate(entry_filter=parts.entry_filter)),
         "strict_margin_actions": frozenset({AI_PAPER_ACTION}),
     }
@@ -644,6 +692,7 @@ def _build_ai_paper_services(
         exit_owners=exit_owners,
         liquidation=liquidation, broker=broker, config=parts.config, account_id=trader.ib_account,
         now=now, schedule_reconcile=schedule_reconcile, decisions=decision_store, epochs=epochs,
+        activity=parts.activity,
     )
     contracts = IbContractEvidenceSource(
         request_details=_contract_details_port(trader),
@@ -661,24 +710,18 @@ def _build_ai_paper_services(
     actions = AiPaperActions(
         policy=parts.policy, deployments=deployments, broker=broker, config=parts.config,
         account_id=trader.ib_account, account_mode=account_mode, ledger=ledger, journal=journal,
-        controls=controls, now=now,
+        controls=controls, now=now, registrar=parts.registrar, versions=parts.versions, activity=parts.activity,
     )
     # The same quote authority, feed set and scope service as a real ENTER: a baseline is sized like one.
     baseline_sizer = AiPaperBaselineSizer(
         broker=broker, quotes=quotes, history=getattr(trader, "data", None), policy=parts.policy,
         deployments=deployments, accepted_feeds=accepted_feeds, entry_filter=parts.entry_filter, now=now,
         config=parts.config, scope=scope)
-    from trader.automation.backtest_judgments import BacktestJudgments
-    from trader.automation.calendar_policy import XNYSCalendarPolicy
     from trader.automation.evaluation_claims import EvaluationClaims
     from trader.automation.forward_evidence import NoDeploymentVersions
-    from trader.research.evaluation_case import default_cases_dir, default_verify_dir
 
     # The trader's one journal connection: the daily cap's race safety rests on its per-instance lock.
-    judge_config = parts.config.backtest_judge
-    claims = EvaluationClaims(trader.journal_db, config=judge_config, now=now)
-    judgments = BacktestJudgments(trader.journal_db, config=judge_config, calendar=XNYSCalendarPolicy(),
-                                  cases_dir=default_cases_dir(), verify_dir=default_verify_dir(), now=now)
+    claims = EvaluationClaims(trader.journal_db, config=parts.config.backtest_judge, now=now)
     return AiPaperServices(config=parts.config, policy=parts.policy, deployments=deployments,
                            decisions=decisions, decision_store=decision_store, actions=actions,
                            entry_filter=parts.entry_filter, epochs=epochs, signals=signals,
@@ -689,8 +732,9 @@ def _build_ai_paper_services(
                                deployments=deployments, filter_refusal=parts.filter_refusal, now=now),
                            entry_quotes=EntryQuoteSource(quotes=quotes, accepted_feeds=frozenset(accepted_feeds),
                                                          account_mode=account_mode),
-                           baseline_sizer=baseline_sizer, claims=claims, judgments=judgments,
-                           forward_evidence=NoDeploymentVersions())
+                           baseline_sizer=baseline_sizer, claims=claims, judgments=parts.judgments,
+                           forward_evidence=NoDeploymentVersions(), versions=parts.versions,
+                           activity=parts.activity, registrar=parts.registrar)
 
 
 def _contract_details_port(trader: Any) -> Callable[[Any], list]:
@@ -1214,6 +1258,9 @@ def build_command_stack(
     from trader.automation.backtest_judge_schema import apply_backtest_judge_migrations
 
     apply_backtest_judge_migrations(migrator)         # 110, 111 (SP2c Plan 1)
+    from trader.automation.ai_deployment_versions import apply_ai_deployment_version_migrations
+
+    apply_ai_deployment_version_migrations(migrator)  # 115, 116 (SP2c Plan 2)
     from trader.automation.experiments import apply_experiment_migration
 
     apply_experiment_migration(migrator)              # 70 (SP1 Plan 4)

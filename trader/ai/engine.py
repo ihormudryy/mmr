@@ -65,6 +65,15 @@ def _conid(value: Any) -> int:
     return value
 
 
+def _check_binding(**fields: Any) -> None:
+    """A deployment binding is all of its digests or none of them (SP2c Plan 2 ruling 9)."""
+    for name, value in fields.items():
+        if value is not None and (not isinstance(value, str) or not _DIGEST.fullmatch(value)):
+            raise ValueError(f"{name} must be sha256:<64 hex> or None")
+    if len({value is None for value in fields.values()}) == 2:
+        raise ValueError(f"{', '.join(fields)} come together or not at all")
+
+
 @dataclass(frozen=True)
 class ExperimentView:
     experiment_id: str
@@ -100,6 +109,13 @@ class SignalOpportunity:
     probability: Optional[float]
     signal_time: dt.datetime
     recorded_at: dt.datetime
+    deployment_digest: Optional[str] = None      # an AI-deployment instance's binding (SP2c Plan 2): all three or none
+    deployment_version: Optional[str] = None
+    source_digest: Optional[str] = None
+
+    def __post_init__(self) -> None:
+        _check_binding(deployment_digest=self.deployment_digest, deployment_version=self.deployment_version,
+                       source_digest=self.source_digest)
 
 
 @dataclass(frozen=True)
@@ -210,6 +226,8 @@ class ProposedDecision:
     stop_price: Optional[float] = None
     target_price: Optional[float] = None
     quantity: Optional[int] = None
+    deployment_version: Optional[str] = None
+    source_digest: Optional[str] = None
 
     def __post_init__(self) -> None:
         if not isinstance(self.action_key, str) or not ACTION_KEY.fullmatch(self.action_key):
@@ -226,6 +244,7 @@ class ProposedDecision:
             if (value is not None or name == "evidence_digest") and (
                     not isinstance(value, str) or not _DIGEST.fullmatch(value)):
                 raise ValueError(f"{name} must be sha256:<64 hex>")
+        _check_binding(deployment_version=self.deployment_version, source_digest=self.source_digest)
         _positive_int(self.policy_revision, "policy_revision")
         _positive_int(self.quantity, "quantity")
         _price(self.stop_price, "stop_price")

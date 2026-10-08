@@ -23,7 +23,7 @@ from trader.acceptance.order_status import may_still_fill
 from trader.acceptance.ports import OperatorChannelUnavailable, RemoteRefusal
 from trader.acceptance.preflight import READINGS_APART_SECONDS, evaluate_preflight
 
-RUN_STEPS = ("preflight", "register", "publish", "enter_a", "enter_b", "partial_close_a", "close_a",
+RUN_STEPS = ("preflight", "deployment", "publish", "enter_a", "enter_b", "partial_close_a", "close_a",
              "enter_s", "shrink_proof", "settle_s")
 END_CHECKS = ("session_flat", "equity_row_flat", "no_positions_or_orders", "round_trips", "oca_shrink",
               "no_incidents")
@@ -73,6 +73,7 @@ class AcceptanceSettings:
     strategy_path: str = "strategies/opening_range_breakout.py"
     strategy_class: str = "OpeningRangeBreakout"
     strategy_bytes: bytes = b""
+    deployment_version: str = ""             # ruling 18: an operator-given SP2c-judged version digest
     step_timeout: float = 120.0
     poll_seconds: float = 2.0
 
@@ -119,6 +120,7 @@ def working_orders(evidence: dict, conid: int) -> list[dict]:
 def build_entry(settings: AcceptanceSettings, ctx: dict, step: str, conid: int, quantity: int, ask: float,
                 now: dt.datetime, *, target: bool = False) -> dict:
     return {"decision_id": decision_id(settings.run_id, step), "deployment_digest": ctx["deployment_digest"],
+            "deployment_version": ctx["deployment_version"], "source_digest": ctx["source_digest"],
             "decider": DECIDER, "action": "ENTER", "conid": conid, "side": "BUY",
             "stop_price": round(ask * 0.98, 2), "target_price": round(ask * 1.02, 2) if target else None,
             "quantity": quantity, "policy_revision": ctx["policy_revision"],
@@ -129,7 +131,8 @@ def build_entry(settings: AcceptanceSettings, ctx: dict, step: str, conid: int, 
 def build_entry_s(settings: AcceptanceSettings, ask: float, *, ctx: Optional[dict] = None,
                   now: Optional[dt.datetime] = None) -> dict:
     """S's own ENTER (Task 7): stop below and target above the ask, the same notional rule."""
-    ctx = ctx or {"deployment_digest": None, "policy_revision": None}
+    ctx = ctx or {"deployment_digest": None, "deployment_version": None, "source_digest": None,
+                  "policy_revision": None}
     return build_entry(settings, ctx, "e-s", settings.conid_s, settings.quantity_s, ask,
                        now or dt.datetime.now(dt.timezone.utc), target=True)
 
@@ -137,15 +140,17 @@ def build_entry_s(settings: AcceptanceSettings, ask: float, *, ctx: Optional[dic
 def build_reduction(settings: AcceptanceSettings, step: str, action: str, conid: int, now: dt.datetime, *,
                     quantity: Optional[int] = None) -> dict:
     """Plan 3 R16: a reduction names no deployment, no policy revision and no prices."""
-    return {"decision_id": decision_id(settings.run_id, step), "deployment_digest": None, "decider": DECIDER,
-            "action": action, "conid": conid, "side": "SELL", "stop_price": None,
-            "target_price": None, "quantity": quantity, "policy_revision": None,
+    return {"decision_id": decision_id(settings.run_id, step), "deployment_digest": None,
+            "deployment_version": None, "source_digest": None, "decider": DECIDER, "action": action,
+            "conid": conid, "side": "SELL", "stop_price": None, "target_price": None, "quantity": quantity,
+            "policy_revision": None,
             "evidence_digest": evidence_digest(settings.run_id, step),
             "expires_at": (now + DECISION_TTL).isoformat()}
 
 
 def deployment_record(settings: AcceptanceSettings) -> dict:
-    """Ruling 6: a catalogue strategy, honestly labelled as a harness fixture."""
+    """A catalogue strategy record. Since SP2c ruling 18 the harness registers nothing; tests seed this record
+    as a judged deployment version."""
     return {"strategy_path": settings.strategy_path, "strategy_digest": settings.strategy_digest,
             "class_name": settings.strategy_class, "params": {}, "conids": sorted([settings.conid_a, settings.conid_b]),
             "bar_size": "1 min", "style": "intraday_long", "decider": DECIDER, "decider_verdict": "DEPLOY",
@@ -229,7 +234,8 @@ class AcceptanceScenario:
     def planned_calls(self) -> list[tuple[str, str]]:
         """What ``run`` would send, for the dry run (reads used for waiting are left out)."""
         return [("supervisor", "get_acceptance_preflight"), ("supervisor", "get_acceptance_preflight"),
-                ("supervisor", "get_experiment"), ("research", "register_ai_deployment"),
+                ("supervisor", "get_experiment"),
+                ("supervisor", "get_ai_deployment_version"), ("supervisor", "get_ai_deployment"),
                 ("supervisor", "publish_ai_risk_policy"),
                 ("supervisor", "get_snapshot"), ("supervisor", "submit_ai_paper_decision"),
                 ("supervisor", "get_snapshot"), ("supervisor", "submit_ai_paper_decision"),
@@ -280,11 +286,14 @@ class AcceptanceScenario:
         return {"name": result.name, "passed": result.passed, "code": result.code, "evidence": result.evidence,
                 "phase": kind}
 
+    _SHARED_CONTEXT = ("experiment_id", "deployment_digest", "deployment_version", "source_digest",
+                       "policy_revision")
+
     def _absorb(self, result: StepResult) -> None:
-        for key in ("experiment_id", "deployment_digest", "policy_revision", "ask", "stop_price", "legs"):
+        for key in (*self._SHARED_CONTEXT, "ask", "stop_price", "legs"):
             if key in result.evidence:
                 self.ctx[f"{result.name}.{key}"] = result.evidence[key]
-                if key in ("experiment_id", "deployment_digest", "policy_revision"):
+                if key in self._SHARED_CONTEXT:
                     self.ctx[key] = result.evidence[key]
 
     def _load_context(self) -> None:
@@ -375,12 +384,29 @@ class AcceptanceScenario:
             raise StepFailure("EXPERIMENT_NOT_ARMED", {**evidence, "experiment": experiment})
         return StepResult("preflight", True, None, {**evidence, "experiment_id": experiment["experiment_id"]})
 
-    def _step_register(self) -> StepResult:
-        reply = self._send("register", "research", "register_ai_deployment",
-                           lambda: {"deployment": deployment_record(self.settings)}, None)
-        self._accepted(reply, allowed=("RESOLVED",))
-        return StepResult("register", True, None, {"deployment_digest": reply["outcome"]["digest"],
-                                                   "deployment_record": "harness_fixture"})
+    def _step_deployment(self) -> StepResult:
+        """Ruling 18: the run trades under an operator-given SP2c deployment version; it registers nothing."""
+        digest = self.settings.deployment_version
+        reply = self.port.supervisor("get_ai_deployment_version", {"version_digest": digest})
+        version = reply.get("version") if reply.get("found") else None
+        if version is None or version.get("state") != "ACTIVE" or not self._in_session_window(version):
+            raise StepFailure("DEPLOYMENT_NOT_USABLE", {"version_digest": digest, "version": version,
+                                                        "today": self._today()})
+        record = self.port.supervisor("get_ai_deployment", {"digest": version["base_digest"]}).get("deployment") or {}
+        if not {self.settings.conid_a, self.settings.conid_b} <= set(record.get("conids") or ()):
+            raise StepFailure("DEPLOYMENT_NOT_USABLE", {"version_digest": digest, "conids": record.get("conids")})
+        return StepResult("deployment", True, None, {
+            "deployment_digest": version["base_digest"], "deployment_version": digest,
+            "source_digest": record["strategy_digest"]})
+
+    def _in_session_window(self, version: dict) -> bool:
+        """The wire's ACTIVE also covers NOT_STARTED and OVER_CAP; only today inside the window can trade."""
+        try:
+            first = dt.date.fromisoformat(version["first_session"])
+            expiry = dt.date.fromisoformat(version["expiry_session"])
+        except (KeyError, TypeError, ValueError):
+            return False
+        return first <= dt.date.fromisoformat(self._today()) <= expiry
 
     def _step_publish(self) -> StepResult:
         from trader.automation.risk_limits import PAPER_LIMITS

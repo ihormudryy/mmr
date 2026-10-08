@@ -3,7 +3,6 @@ from __future__ import annotations
 
 import ast
 import datetime as dt
-import hashlib
 import os
 import re
 import stat
@@ -32,7 +31,8 @@ def test_run_sends_the_spec_sequence_with_the_right_principals(fake_port, settin
     assert fake_port.calls == [
         ("supervisor", "get_acceptance_preflight"), ("supervisor", "get_acceptance_preflight"),
         ("supervisor", "get_experiment"),
-        ("research", "register_ai_deployment"), ("supervisor", "publish_ai_risk_policy"),
+        ("supervisor", "get_ai_deployment_version"), ("supervisor", "get_ai_deployment"),
+        ("supervisor", "publish_ai_risk_policy"),
         ("supervisor", "get_snapshot"), ("supervisor", "submit_ai_paper_decision"),     # ENTER A
         ("supervisor", "get_snapshot"), ("supervisor", "submit_ai_paper_decision"),     # ENTER B
         ("supervisor", "submit_ai_paper_decision"),                                     # PARTIAL_CLOSE A
@@ -41,7 +41,7 @@ def test_run_sends_the_spec_sequence_with_the_right_principals(fake_port, settin
         ("operator", "acceptance_mark_start"),
         ("operator", "acceptance_shrink_probe"),
         ("supervisor", "submit_ai_paper_decision")]                                     # settle_s: CLOSE S
-    assert [r.name for r in results] == ["preflight", "register", "publish", "enter_a", "enter_b",
+    assert [r.name for r in results] == ["preflight", "deployment", "publish", "enter_a", "enter_b",
                                          "partial_close_a", "close_a", "enter_s", "shrink_proof", "settle_s"]
     assert results[-2].evidence["oca_shrink"] == "PROVEN" and results[-1].evidence["settled_by"] == "close"
     assert AcceptanceScenario(fake_port, settings, journal).planned_calls() == fake_port.calls
@@ -62,14 +62,36 @@ def test_decision_ids_are_deterministic_and_valid(settings):
     assert ids == [decision_id(settings.run_id, s) for s in ("e-a", "e-b", "pc-a", "c-a", "e-s", "c-s")]
 
 
-def test_deployment_record_is_honest(fake_port, settings, journal):
-    AcceptanceScenario(fake_port, settings, journal).run()
-    dep = fake_port.body_of("register_ai_deployment")["deployment"]
-    assert dep["strategy_digest"] == "sha256:" + hashlib.sha256(settings.strategy_bytes).hexdigest()
-    assert (dep["decider"], dep["decider_verdict"], dep["evidence_ref"]) == (
-        "acceptance_harness", "DEPLOY", f"acceptance:{settings.run_id}")
-    assert sorted(dep["conids"]) == sorted([settings.conid_a, settings.conid_b])
-    assert dep["evidence_order_notional"] == settings.notional and dep["style"] == "intraday_long"
+def test_entries_are_bound_to_the_operator_given_version_and_reductions_are_not(fake_port, settings, journal):
+    from tests.sp1_acceptance.fakes import BASE_DIGEST
+    AcceptanceScenario(fake_port, settings, journal).run()                # SP2c Plan 2 rulings 9 and 18
+    bodies = [b for _, m, b in fake_port.all_calls if m == "submit_ai_paper_decision"]
+    entries = [b for b in bodies if b["action"] == "ENTER"]
+    assert len(entries) == 3 and all(
+        (b["deployment_digest"], b["deployment_version"], b["source_digest"])
+        == (BASE_DIGEST, settings.deployment_version, fake_port.strategy_digest) for b in entries)
+    reductions = [b for b in bodies if b["action"] != "ENTER"]
+    assert reductions and all(
+        (b["deployment_digest"], b["deployment_version"], b["source_digest"]) == (None, None, None)
+        for b in reductions)
+    assert "register_ai_deployment" not in fake_port.methods()
+
+
+WINDOW = ("2026-07-17", "2026-08-14")
+
+
+@pytest.mark.parametrize("state,conids,sessions", [
+    (None, [AAPL, MSFT], WINDOW), ("EXPIRED", [AAPL, MSFT], WINDOW), ("WITHDRAWN", [AAPL, MSFT], WINDOW),
+    ("ENDED", [AAPL, MSFT], WINDOW), ("ACTIVE", [AAPL], WINDOW),
+    ("ACTIVE", [AAPL, MSFT], ("2026-07-20", "2026-08-14")),     # wire ACTIVE, but NOT_STARTED today
+    ("ACTIVE", [AAPL, MSFT], ("2026-06-15", "2026-07-16")),     # wire ACTIVE, past its expiry session
+    ("ACTIVE", [AAPL, MSFT], ("2026-07-17", None))])           # a malformed window is not usable
+def test_an_unusable_version_stops_before_any_write(fake_port, settings, journal, state, conids, sessions):
+    fake_port.version_state, fake_port.deployment_conids = state, conids
+    fake_port.version_sessions = sessions
+    results = AcceptanceScenario(fake_port, settings, journal).run()
+    assert (results[-1].name, results[-1].code) == ("deployment", "DEPLOYMENT_NOT_USABLE")
+    assert not fake_port.writes()
 
 
 @pytest.mark.parametrize("state", [None, "PAUSED", "KILLED", "STOPPED"])
@@ -140,7 +162,7 @@ def test_the_intent_record_holds_the_exact_body_and_resume_replays_those_bytes(f
     fake_port.orders.clear()
     resumed = AcceptanceScenario(fake_port, settings, journal, now=lambda: later(5)).resume()
     assert fake_port.sent_bodies("submit_ai_paper_decision")[:2] == [stored, stored]   # same bytes, same expires_at
-    assert [r.name for r in resumed][:5] == ["preflight", "register", "publish", "enter_a", "enter_b"]
+    assert [r.name for r in resumed][:5] == ["preflight", "deployment", "publish", "enter_a", "enter_b"]
 
 
 def test_resume_takes_a_found_command_as_the_receipt_and_sends_nothing(fake_port, settings, journal):
@@ -251,13 +273,22 @@ def test_report_signature_round_trip_and_tamper(tmp_path):
     assert stat.S_IMODE(os.stat(path).st_mode) == 0o600
 
 
-def test_the_report_flags_a_fixture_untested_restart_and_the_signing_key_kind():   # rulings 18-22
+def test_the_report_flags_a_judged_version_untested_restart_and_the_signing_key_kind():   # rulings 18-22
     from trader.research.signing import AttestationSigner
     report = _passing_report()
     assert (report.deployment_record, report.live_restart_recovery, report.telegram_live_delivery) == (
-        "harness_fixture", "NOT_PROVEN", "UNTESTED")
+        "judged_version", "NOT_PROVEN", "UNTESTED")
+    assert "operator-given SP2c-judged deployment version" in report.harness_note
     report.sign(AttestationSigner.generate(), key_source="ephemeral")
     assert report.signing_key == "ephemeral" and report.passed is False          # a real report needs the operator key
+
+
+def test_a_report_with_the_old_fixture_label_never_passes():                     # SP2c Plan 2 ruling 18
+    from dataclasses import replace
+    from trader.research.signing import AttestationSigner
+    report = replace(_passing_report(), deployment_record="harness_fixture")
+    report.sign(AttestationSigner.generate(), key_source="operator")
+    assert report.passed is False
 
 
 @pytest.mark.parametrize("change", [{"oca_shrink": "UNPROVEN"}, {"evidence_source": "synthetic"},

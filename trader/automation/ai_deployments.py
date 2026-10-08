@@ -2,8 +2,8 @@
 
 ``ai_research`` registers a deployment; registration validates and seals it in
 one insert, so there is never an unsealed row. Every read recomputes the
-digest. ``strategy_digest`` is recorded as a claim of ``ai_research``: nothing
-in SP1 hashes the strategy file (SP2 follow-up).
+digest. ``strategy_digest`` is a claim of ``ai_research`` on this row; SP2c
+records the verified binding on the deployment version.
 """
 from __future__ import annotations
 
@@ -173,31 +173,36 @@ class AiDeploymentStore:
         self._now = now
 
     def register(self, deployment: AiDeployment, *, principal: str, command_id: str) -> tuple[str, bool]:
+        return self._db.transaction(
+            lambda conn: self.register_in_tx(conn, deployment, principal=principal, command_id=command_id))
+
+    def register_in_tx(self, conn, deployment: AiDeployment, *, principal: str,
+                       command_id: str) -> tuple[str, bool]:
+        """The base row inside the caller's transaction, so a version is never sealed without it."""
         if not isinstance(deployment, AiDeployment):
             raise DeploymentRefused("DEPLOYMENT_INVALID", "deployment must be AiDeployment")
-        return self._seal(deployment_digest(deployment), deployment.to_json(), STRATEGY_KIND,
-                          STRATEGY_DIGEST_PROVENANCE, principal, command_id)
+        digest = deployment_digest(deployment)
+        return digest, self._seal_in_tx(conn, digest, deployment.to_json(), STRATEGY_KIND,
+                                        STRATEGY_DIGEST_PROVENANCE, principal, command_id)
 
     def register_discretionary(self, deployment: Any, *, principal: str, command_id: str) -> tuple[str, bool]:
         from trader.automation.discretionary_deployment import DiscretionaryDeployment, discretionary_digest
         if not isinstance(deployment, DiscretionaryDeployment):
             raise DeploymentRefused("DEPLOYMENT_INVALID", "deployment must be DiscretionaryDeployment")
-        return self._seal(discretionary_digest(deployment), deployment.to_json(), DISCRETIONARY_KIND,
-                          OPERATOR_ATTESTED, principal, command_id)
+        digest = discretionary_digest(deployment)
+        sealed = self._db.transaction(lambda conn: self._seal_in_tx(
+            conn, digest, deployment.to_json(), DISCRETIONARY_KIND, OPERATOR_ATTESTED, principal, command_id))
+        return digest, sealed
 
-    def _seal(self, digest: str, record: dict, kind: str, provenance: str, principal: str,
-              command_id: str) -> tuple[str, bool]:
-        record_json = canonical_json_bytes(record).decode("utf-8")
-        now = self._now()
-
-        def write(conn) -> bool:
-            if conn.execute("SELECT 1 FROM ai_deployments WHERE digest = ?", [digest]).fetchone():
-                return False
-            conn.execute("INSERT INTO ai_deployments (digest, record_json, principal, command_id, sealed_at, "
-                         "strategy_digest_provenance, kind) VALUES (?, ?, ?, ?, ?, ?, ?)",
-                         [digest, record_json, principal, command_id, now, provenance, kind])
-            return True
-        return digest, self._db.transaction(write)
+    def _seal_in_tx(self, conn, digest: str, record: dict, kind: str, provenance: str, principal: str,
+                    command_id: str) -> bool:
+        if conn.execute("SELECT 1 FROM ai_deployments WHERE digest = ?", [digest]).fetchone():
+            return False
+        conn.execute("INSERT INTO ai_deployments (digest, record_json, principal, command_id, sealed_at, "
+                     "strategy_digest_provenance, kind) VALUES (?, ?, ?, ?, ?, ?, ?)",
+                     [digest, canonical_json_bytes(record).decode("utf-8"), principal, command_id, self._now(),
+                      provenance, kind])
+        return True
 
     def get_sealed_any(self, digest: str) -> Any:
         """A strategy ``AiDeployment`` or a ``DiscretionaryDeployment``; the digest is re-checked on every read."""

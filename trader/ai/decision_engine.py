@@ -16,6 +16,7 @@ from typing import Any, Optional, Union
 from trader.ai.baselines import (RANKING_UNAVAILABLE, fixed_rule, follow_signal, incomplete, incomplete_reason_for,
                                  matched_entry, no_trade, pick_fixed_rule)
 from trader.ai.discovery_client import DiscoveryClient, DiscoveryRead
+from trader.ai.config import StrategyBracket
 from trader.ai.engine import (
     EngineResult, EntryCycleContext, ModelWork, OwnedPosition, PositionCycleContext, ProposedDecision, SignalContext,
     owned_positions_from_trips,
@@ -41,6 +42,7 @@ FLATTEN_ET = dt.time(15, 45)
 NEVER_SENT_STATES = frozenset({"ABANDONED", "NOT_ADMITTED", "FAILED"})
 ENTRY_DONE_STATUSES = frozenset({"Filled", "Cancelled", "ApiCancelled", "Inactive"})   # ib_async DoneStates
 WORKING, FILLED, ENDED_UNFILLED = "WORKING", "FILLED", "ENDED_UNFILLED"
+PARTLY_FILLED = "PARTLY_FILLED"        # a live entry with some shares already bought
 
 
 class RoleHealth:
@@ -146,12 +148,15 @@ async def judge_entry(tools: Any, source_json: Optional[dict], settings: JudgeSe
                     priced=priced)
 
 
-def enter_decision(action_key: str, judgment: Judgment) -> ProposedDecision:
+def enter_decision(action_key: str, judgment: Judgment, binding: Optional[Any] = None) -> ProposedDecision:
+    """``binding`` is the strategy signal of an AI-deployment instance; self-found entries pass none."""
     evidence = judgment.evidence
     return ProposedDecision(action_key=action_key, action="ENTER", conid=evidence.conid, side="BUY", decider="jev",
                             evidence_digest=evidence.digest, deployment_digest=evidence.deployment_digest,
                             policy_revision=evidence.policy_revision, stop_price=evidence.stop_price,
-                            target_price=evidence.target_price, quantity=judgment.quantity)   # TAKE: trader sizes
+                            target_price=evidence.target_price, quantity=judgment.quantity,      # TAKE: trader sizes
+                            deployment_version=None if binding is None else binding.deployment_version,
+                            source_digest=None if binding is None else binding.source_digest)
 
 
 def close_decision(chosen: ChosenClose) -> ProposedDecision:
@@ -219,9 +224,9 @@ class PaperDecisionEngine:
     # -- strategy signals --------------------------------------------------------------------------
     async def on_entry_signal(self, ctx: SignalContext) -> EngineResult:
         opportunity = ctx.opportunity
-        strategy = self._cfg.strategies.get(opportunity.strategy_name)
-        if strategy is None:
-            return EngineResult(note="STRATEGY_NOT_CONFIGURED")
+        if opportunity.deployment_version is None:          # the trader refuses it: DEPLOYMENT_VERSION_REQUIRED
+            return EngineResult(note="STRATEGY_NOT_BOUND")
+        strategy = self._bound_bracket(opportunity)
         action_key = f"enter:{opportunity.conid}"
         judgment = await self._judge(ctx.work, action_key, EntrySource.for_signal(opportunity, strategy))
         if judgment.priced is None:                                 # no usable quote: sent incomplete, never invented
@@ -232,17 +237,32 @@ class PaperDecisionEngine:
         follow = follow_signal(opportunity, judgment.priced, strategy.deployment_digest)
         if not judgment.enters:
             return EngineResult(baselines=(follow,), note=judgment.code)
-        return EngineResult(decisions=(enter_decision(action_key, judgment),),
+        return EngineResult(decisions=(enter_decision(action_key, judgment, binding=opportunity),),
                             baselines=(dataclasses.replace(follow, linked_action_key=action_key),), note=judgment.code)
+
+    def _bound_bracket(self, opportunity: Any) -> StrategyBracket:
+        """An AI-deployment instance: its own base digest; the trader checks version, cap and source."""
+        return StrategyBracket(deployment_digest=opportunity.deployment_digest,
+                               stop_fraction=self._cfg.ai_deployments.stop_fraction,
+                               target_fraction=self._cfg.ai_deployments.target_fraction)
 
     async def on_exit_signal(self, ctx: SignalContext) -> EngineResult:
         opportunity = ctx.opportunity
         trips = await self._trips(ctx.experiment.experiment_id)
         if trips is None:                                  # unknown ownership proves nothing held (PR #86 4212667433)
             return EngineResult(note="EXIT_WAITING_FOR_TRIPS", wait_until=self._wait_backstop(ctx.now))
-        held = frozenset(p.conid for p in owned_positions_from_trips(trips))
-        if opportunity.conid not in held:
+        here = [p for p in owned_positions_from_trips(trips) if p.conid == opportunity.conid]
+        versions = await self._entry_versions(tuple(p.decision_id for p in here if p.decision_id))
+        mine = [p for p in here if versions.get(p.decision_id) == opportunity.deployment_version]
+        if not mine:
             return await self._exit_before_any_fill(ctx, trips)
+        if len(mine) < len(here):
+            logger.warning("exit %s: conid %s is also held by another deployment version; no CLOSE",
+                           opportunity.opportunity_id, opportunity.conid)
+            return EngineResult(note="EXIT_CONID_SHARED")
+        rival = await self._other_version_entry_state(ctx, trips)
+        if rival is not None:                              # a conid-wide CLOSE would cancel or flatten that entry
+            return rival
         action_key = await self._close_action_key(opportunity)
         digest = evidence_digest({"v": "exit_signal.v1", "opportunity_id": opportunity.opportunity_id,
                                   "conid": opportunity.conid, "signal_time": opportunity.signal_time.isoformat(),
@@ -250,6 +270,34 @@ class PaperDecisionEngine:
         close = ProposedDecision(action_key=action_key, action="CLOSE", conid=opportunity.conid,
                                  side="SELL", decider="strategy", evidence_digest=digest)
         return EngineResult(decisions=(close,), note="EXIT_SIGNAL")
+
+    async def _other_version_entry_state(self, ctx: SignalContext, trips: dict) -> Optional[EngineResult]:
+        """An entry of another version on this conid that is working, or filled without a trip yet, shares the
+        conid: the CLOSE would reach it (ruling 21). A rival that is only working may still end unfilled, so the exit
+        waits; one with fills is final. None when no such entry exists."""
+        conid = ctx.opportunity.conid
+        projected = {trip.get("decision_id") for trip in trips["trips"]}
+        rivals = tuple(decision_id for decision_id in await self._fillable_entries(
+            conid, ctx.now, ctx.opportunity.deployment_version, other_versions=True) if decision_id not in projected)
+        if not rivals:
+            return None
+        states = await self._entry_states(conid, rivals, separate_partial_fills=True)
+        if states is None or WORKING in states.values():      # unreadable or still working: that may end unfilled
+            return EngineResult(note="EXIT_WAITING_FOR_ENTRY", wait_until=self._wait_backstop(ctx.now))
+        if not any(state in (FILLED, PARTLY_FILLED) for state in states.values()):
+            return None
+        logger.warning("exit %s: conid %s has another deployment version's fills in flight; no CLOSE",
+                       ctx.opportunity.opportunity_id, conid)
+        return EngineResult(note="EXIT_CONID_SHARED")
+
+    async def _entry_versions(self, decision_ids: tuple[str, ...]) -> dict[str, Optional[str]]:
+        """Ruling 21: the version each trip's ENTER was bound to, from the bodies this controller sent."""
+        if not decision_ids:
+            return {}
+        marks = ", ".join("?" for _ in decision_ids)
+        rows = await self._store.aquery(f"SELECT decision_id, body_json FROM ai_submissions "
+                                        f"WHERE action = 'ENTER' AND decision_id IN ({marks})", list(decision_ids))
+        return {decision_id: json.loads(body_json).get("deployment_version") for decision_id, body_json in rows}
 
     async def _close_action_key(self, opportunity: Any) -> str:
         """``close:<conid>``, then ``close:<conid>:r<n>`` for the n-th attempt after a refused one: every
@@ -265,7 +313,7 @@ class PaperDecisionEngine:
         reached a trip (held: closed above; already closed: nothing to do). No clock deadline ends it here; the
         controller's backstop after ``wait_until`` is a loud incident, never NOT_HELD (PR #86 4211898491)."""
         conid = ctx.opportunity.conid
-        entries = await self._fillable_entries(conid, ctx.now)
+        entries = await self._fillable_entries(conid, ctx.now, ctx.opportunity.deployment_version)
         if not entries:
             return EngineResult(note="NOT_HELD")
         states = await self._entry_states(conid, entries)
@@ -277,9 +325,11 @@ class PaperDecisionEngine:
             return EngineResult(note="EXIT_WAITING_FOR_FILL", wait_until=self._wait_backstop(ctx.now))
         return EngineResult(note="ENTRY_FILLED_AND_CLOSED" if filled else "ENTRY_UNFILLED")
 
-    async def _fillable_entries(self, conid: int, now: dt.datetime) -> tuple[str, ...]:
+    async def _fillable_entries(self, conid: int, now: dt.datetime, version: Optional[str], *,
+                                other_versions: bool = False) -> tuple[str, ...]:
         """Every ENTER of ours in this conid this session that may have become an order (PR #86 4211895474):
-        a newer refused entry never hides an older working one."""
+        a newer refused entry never hides an older working one. Only ENTERs of ``version`` count, or only those
+        of every other version when ``other_versions`` is set (ruling 21)."""
         schedule = self._calendar.resolve(now)
         since = now - dt.timedelta(days=1) if schedule is None else schedule.open_utc - dt.timedelta(hours=1)
         rows = await self._store.aquery(
@@ -287,16 +337,20 @@ class PaperDecisionEngine:
             "WHERE action = 'ENTER' AND created_at >= ? ORDER BY created_at", [since])
         fillable = []
         for decision_id, state, receipt_state, error_code, body_json in rows:
-            if json.loads(body_json).get("conid") != conid or state in NEVER_SENT_STATES:
+            body = json.loads(body_json)
+            same_version = body.get("deployment_version") == version
+            if body.get("conid") != conid or same_version == other_versions or state in NEVER_SENT_STATES:
                 continue
             if state in ("ACCEPTED", "FINAL") and (receipt_state == "REJECTED" or error_code is not None):
                 continue                                   # the trader refused it: no order exists
             fillable.append(decision_id)                   # PENDING, SENDING, UNKNOWN or an admitted order
         return tuple(fillable)
 
-    async def _entry_states(self, conid: int, entries: tuple[str, ...]) -> Optional[dict[str, str]]:
+    async def _entry_states(self, conid: int, entries: tuple[str, ...], *,
+                            separate_partial_fills: bool = False) -> Optional[dict[str, str]]:
         """Each entry's leg from the trader's fenced broker evidence: WORKING (live, partly filled, or not shown
-        yet), FILLED (terminal with a fill) or ENDED_UNFILLED (terminal with zero fill). None if unreadable."""
+        yet), FILLED (terminal with a fill) or ENDED_UNFILLED (terminal with zero fill). None if unreadable.
+        With ``separate_partial_fills`` a live entry that already filled some shares is PARTLY_FILLED."""
         try:
             evidence = await self._reads.call("get_broker_order_evidence", {"conid": conid})
         except (RpcNotSent, RpcOutcomeUnknown, RpcRefused) as exc:
@@ -310,7 +364,10 @@ class PaperDecisionEngine:
             legs = [o for o in evidence["orders"] if o.get("order_group_id") == group and o.get("leg") == "entry"]
             ended = bool(legs) and all(o.get("deleted") or o.get("status") in ENTRY_DONE_STATUSES for o in legs)
             filled = any(float(o.get("filled_quantity") or 0.0) > 0 for o in legs)
-            states[decision_id] = (FILLED if filled else ENDED_UNFILLED) if ended else WORKING
+            if ended:
+                states[decision_id] = FILLED if filled else ENDED_UNFILLED
+            else:
+                states[decision_id] = PARTLY_FILLED if filled and separate_partial_fills else WORKING
         return states
 
     def _wait_backstop(self, now: dt.datetime) -> dt.datetime:

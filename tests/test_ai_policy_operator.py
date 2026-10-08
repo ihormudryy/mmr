@@ -35,7 +35,8 @@ def test_ai_research_rights_are_exactly_the_sp1_set():
     expected = {("query", m) for m in _TRADER_MARKET_READS} | {
         ("query", "resolve_instrument"), ("query", "discover_instrument"),
         ("command", "register_ai_deployment"), ("query", "get_ai_deployment"),
-        ("command", "record_backtest_judgment"), ("query", "get_backtest_judgment")}     # SP2c Plan 1
+        ("command", "record_backtest_judgment"), ("query", "get_backtest_judgment"),     # SP2c Plan 1
+        ("query", "get_ai_deployment_version")}                                          # SP2c Plan 2
     assert rights("ai_research") == expected
 
 

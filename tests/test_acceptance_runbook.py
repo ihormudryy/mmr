@@ -11,7 +11,8 @@ from trader.mmr_cli import build_parser
 
 ROOT = Path(__file__).resolve().parents[1]
 RUNBOOK = ROOT / "docs" / "PAPER_ACCEPTANCE_SP1.md"
-PLACEHOLDERS = {"<DU account>": "DU1234567", "<run_id>": "acc-20261007-abcdef"}
+PLACEHOLDERS = {"<DU account>": "DU1234567", "<run_id>": "acc-20261007-abcdef",
+                "<version digest>": "sha256:" + "a" * 64, "<base digest>": "sha256:" + "b" * 64}
 
 
 def _spans(text):

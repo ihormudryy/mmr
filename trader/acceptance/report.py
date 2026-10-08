@@ -21,9 +21,11 @@ from trader.acceptance.scenario import END_CHECKS, RUN_STEPS
 
 REPORT_KIND = "sp1_acceptance"
 REPORT_VERSION = 1
-HARNESS_NOTE = ("The deployment is a harness fixture (deployment_record: harness_fixture): its strategy_digest is a "
-                "claim, not research evidence. Live restart recovery was not proven in this session; the synthetic "
+HARNESS_NOTE = ("The run trades under an operator-given SP2c-judged deployment version (deployment_record: "
+                "judged_version), not a fixture; the trader binds every ENTER to that version and its strategy "
+                "digest. Live restart recovery was not proven in this session; the synthetic "
                 "restart tests are the gate. oca_shrink counts only when PROVEN on ib_paper evidence.")
+JUDGED_VERSION = "judged_version"
 OCA_RESULTS = ("PROVEN", "UNPROVEN", "FAILED", "NOT_RUN")
 _PROJECT_ROOT = Path(__file__).resolve().parents[2]
 
@@ -69,7 +71,7 @@ class AcceptanceReport:
     evidence_source: str = "synthetic"           # "ib_paper" only from a real IB generation
     live_restart_recovery: str = "NOT_PROVEN"     # ruling 19: never claimed by this report
     telegram_live_delivery: str = "UNTESTED"     # ruling 18
-    deployment_record: str = "harness_fixture"   # ruling 22
+    deployment_record: str = JUDGED_VERSION       # SP2c Plan 2 ruling 18 (was ruling 22's fixture)
     signing_key: str = "ephemeral"               # "operator" | "ephemeral" (ruling 20)
     order_evidence: list[dict] = field(default_factory=list)
     harness_note: str = HARNESS_NOTE
@@ -93,7 +95,7 @@ class AcceptanceReport:
                 and _complete_and_passed(self.end_checks, required[1])
                 and self.oca_shrink == "PROVEN" and self.evidence_source == "ib_paper"
                 and self.signing_key == "operator" and self.live_restart_recovery == "NOT_PROVEN"
-                and self.deployment_record == "harness_fixture")
+                and self.deployment_record == JUDGED_VERSION)
 
     def _signable_payload(self) -> dict[str, Any]:
         payload = asdict(self)

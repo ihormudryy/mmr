@@ -74,10 +74,10 @@ decisions:
   # The discretionary deployment the operator registered (mmr ai-deployment register-discretionary).
   # null: no entry cycles (self-found ideas) run.
   discretionary_deployment_digest: null
-  # One entry per strategy whose BUY signals the bot may follow: its sealed deployment digest
-  # and the bracket around the fresh ask. A BUY of a strategy missing here is not judged.
+  # Unused since SP2c Plan 2: only aidv- instances of ACTIVE judged versions are judged (bracket
+  # ai_deployments below). A BUY of any other strategy is noted STRATEGY_NOT_BOUND, with no model call.
   strategies: {}
-  #   orb: {deployment_digest: "sha256:...", stop_fraction: 0.02, target_fraction: 0.04}
+  ai_deployments: {stop_fraction: 0.02, target_fraction: 0.04}
   self_found_bracket: {stop_fraction: 0.02, target_fraction: 0.04}
   fixed_rule: {version: fixed_rule.v1, stop_fraction: 0.02, target_fraction: 0.04}   # v1 is pinned to these values
   discovery:

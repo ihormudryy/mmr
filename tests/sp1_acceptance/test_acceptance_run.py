@@ -27,14 +27,14 @@ def settings(**changes):
 
 
 def port(served, *, operator=True):
-    return RpcAcceptancePort(served.client("ai_research"), served.client("ai_supervisor"),
-                             served.client("ai_supervisor", "query"),
+    return RpcAcceptancePort(served.client("ai_supervisor"), served.client("ai_supervisor", "query"),
                              operator_client=served.client("cli", "command") if operator else None,
                              now=served.now, sleep=served.advance_and_promote)
 
 
 def scenario(served, tmp_path, **changes):
-    chosen = settings(**changes)
+    """The harness under the stack's judged version (``judged_served_stack``), as an operator would pass it."""
+    chosen = settings(**{"deployment_version": served.deployment_version, **changes})
     return AcceptanceScenario(port(served), chosen, RunJournal(tmp_path / "acceptance" / chosen.run_id))
 
 
@@ -68,7 +68,7 @@ def test_the_spec_scenario_runs_to_s_protected(served, tmp_path):
     market(served)
     run = scenario(served, tmp_path).run_until("enter_s")
     assert all(r.passed for r in run), run
-    assert [r.name for r in run] == ["preflight", "register", "publish", "enter_a", "enter_b", "partial_close_a",
+    assert [r.name for r in run] == ["preflight", "deployment", "publish", "enter_a", "enter_b", "partial_close_a",
                                      "close_a", "enter_s"]
     partial = next(r for r in run if r.name == "partial_close_a").evidence
     assert {leg["oca_type"] for leg in partial["legs"]} == {2}
@@ -77,16 +77,20 @@ def test_the_spec_scenario_runs_to_s_protected(served, tmp_path):
     assert served.sim.held == {AAPL: 3.0, MSFT: 1.0}
 
 
-def test_the_harness_seeds_nothing(served, tmp_path):
+def test_the_harness_seeds_and_registers_nothing(served, tmp_path):
+    """Every harness write goes over signed RPC; the one deployment is the fixture's judged seed (ruling 18)."""
     market(served)
     scenario(served, tmp_path).run_until("enter_a")
     actions = {row[0]: row[1] for row in served.trader.journal_db.execute(
         "SELECT action, source FROM command_ledger", fetch="all")}       # source is the signing principal
-    assert actions["register_ai_deployment"] == "ai_research"
+    assert "register_ai_deployment" not in actions
     assert actions["publish_ai_risk_policy"] == "ai_supervisor"
     assert actions["submit_ai_paper_decision"] == "ai_supervisor"
-    (principal,), = served.trader.journal_db.execute("SELECT principal FROM ai_deployments", fetch="all")
-    assert principal == "ai_research"
+    (digest,), = served.trader.journal_db.execute("SELECT digest FROM ai_deployments", fetch="all")
+    assert digest == served.deployment_digest
+    (version,), = served.trader.journal_db.execute("SELECT digest FROM ai_deployment_versions",
+                                                   fetch="all")
+    assert version == served.deployment_version
 
 
 def test_resume_after_a_crash_replays_and_sends_no_second_order(served, tmp_path):     # Review Focus 1

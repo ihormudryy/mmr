@@ -49,6 +49,7 @@ RUNTIME_MIGRATIONS: tuple[Migration, ...] = (
             opportunity_id VARCHAR PRIMARY KEY, signal_cursor BIGINT NOT NULL, strategy_name VARCHAR NOT NULL,
             conid BIGINT NOT NULL, action VARCHAR NOT NULL CHECK (action IN ('BUY', 'SELL')),
             probability DOUBLE, signal_time TIMESTAMPTZ NOT NULL, recorded_at TIMESTAMPTZ NOT NULL,
+            deployment_digest VARCHAR, deployment_version VARCHAR, source_digest VARCHAR,
             state VARCHAR NOT NULL CHECK (state IN ('NEW', 'IN_PROGRESS', 'DECIDED', 'MISSED', 'FAILED')),
             reason VARCHAR, created_at TIMESTAMPTZ NOT NULL, updated_at TIMESTAMPTZ NOT NULL)""",)),
     Migration(15, "ai_coverage_gaps", ("""

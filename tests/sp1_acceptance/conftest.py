@@ -3,7 +3,8 @@ from __future__ import annotations
 
 import pytest
 
-from tests.sp1_fixtures import Composed, LoopThread, et, served_stack
+from tests.sp1_acceptance.judged import judged_served_stack
+from tests.sp1_fixtures import Composed, LoopThread, et
 
 
 @pytest.fixture
@@ -23,8 +24,8 @@ def composed_sim(tmp_path, loop_thread):
 
 @pytest.fixture
 def served(tmp_path, loop_thread, monkeypatch):
-    """Paper, ai_paper enabled, an ARMED experiment started by cli over RPC, Telegram off."""
-    stack = served_stack(tmp_path, loop_thread, monkeypatch, acceptance_probe=True)
+    """Paper, ai_paper enabled, an ARMED experiment started by cli over RPC, Telegram off, a judged version."""
+    stack = judged_served_stack(tmp_path, loop_thread, monkeypatch, acceptance_probe=True)
     yield stack
     stack.close()
 
@@ -39,7 +40,8 @@ def fake_port():
 def settings():
     from trader.acceptance.scenario import AcceptanceSettings
     return AcceptanceSettings(run_id="acc-20260717-abcdef", account_id="DU111111",
-                              strategy_bytes=b"class OpeningRangeBreakout: pass\n")
+                              strategy_bytes=b"class OpeningRangeBreakout: pass\n",
+                              deployment_version="sha256:" + "f" * 64)
 
 
 @pytest.fixture

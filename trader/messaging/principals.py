@@ -122,6 +122,10 @@ TRADER_ACL: Mapping[tuple[str, str], frozenset[str]] = {
     ("command", "register_discretionary_deployment"): frozenset({"cli"}),
     ("query", "get_ai_risk_policy"): frozenset({"cli", "dashboard", "ai_supervisor"}),
     ("query", "get_ai_deployment"): frozenset({"cli", "dashboard", "ai_supervisor", "ai_research"}),
+    # SP2c Plan 2 (spec 5.1 table): explicit sets per method. The strategy service reads the active set.
+    ("query", "get_ai_deployment_version"): frozenset({"cli", "dashboard", "ai_supervisor", "ai_research"}),
+    ("command", "withdraw_ai_deployment"): frozenset({"cli", "dashboard"}),
+    ("query", "get_active_ai_deployments"): frozenset({"strategy"}),
     # SP2 Plan 1: the controller epoch (spec 6.2). Explicit sets per method.
     ("command", "grant_ai_controller_epoch"): frozenset({"ai_supervisor"}),
     ("query", "get_ai_paper_decision"): frozenset({"ai_supervisor"}),

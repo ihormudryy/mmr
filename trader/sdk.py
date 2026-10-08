@@ -2046,6 +2046,30 @@ class MMR:
         """``get_ai_deployment``: the sealed record, its ``kind`` and its provenance."""
         return self._typed_query.call('get_ai_deployment', {'digest': digest}, dict)
 
+    def withdraw_ai_deployment(self, version_digest: str, reason: str) -> SuccessFail:
+        """End a PAPER deployment version for good (operator). A repeat is safe: it reports `already_withdrawn`."""
+        from trader.domain.commands import CommandReceipt
+        from trader.messaging.typed_rpc import TypedRpcRemoteError
+
+        method = 'withdraw_ai_deployment'
+        try:
+            receipt = self._typed_command.call(method, {'version_digest': version_digest, 'reason': reason},
+                                               CommandReceipt)
+        except TypedRpcRemoteError as ex:
+            return SuccessFail.fail(error=f'{method} rejected: {ex.code}: {ex.message}', exception=ex)
+        except (TimeoutError, ConnectionError) as ex:
+            return SuccessFail.fail(error=f'{method} did not complete: {ex}. Run it again: a repeat replays.',
+                                    exception=ex)
+        if receipt.state == 'RESOLVED':
+            return SuccessFail.success(obj=receipt.outcome)
+        message = (receipt.outcome or {}).get('message') if isinstance(receipt.outcome, dict) else None
+        detail = f'{receipt.error_code or receipt.state}' + (f': {message}' if message else '')
+        return SuccessFail.fail(error=f'{method} rejected: {detail}')
+
+    def ai_deployment_version(self, version_digest: str) -> dict:
+        """``get_ai_deployment_version``: ``{found, version}`` with the version's state."""
+        return self._typed_query.call('get_ai_deployment_version', {'version_digest': version_digest}, dict)
+
     def ai_policy_view(self) -> dict:
         """The PAPER AI risk policy: published, effective and queued limits."""
         return self._typed_query.call('get_ai_risk_policy', {}, dict)

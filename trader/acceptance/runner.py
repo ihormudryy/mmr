@@ -1,8 +1,9 @@
 """The real driver: ``mmr experiment acceptance preflight|run|finish|status|verify-report`` (Plan 6 Task 5).
 
-Host only. It signs with the ``ai_research`` and ``ai_supervisor`` keys from
-``MMR_RPC_KEYS_DIR`` (default ``~/.config/mmr/keys/rpc``) and, only with
-``--place-orders``, with the operator ``cli`` key for the mark and the probe.
+Host only. It signs with the ``ai_supervisor`` key from ``MMR_RPC_KEYS_DIR``
+(default ``~/.config/mmr/keys/rpc``) and, only with ``--place-orders``, with the
+operator ``cli`` key for the mark and the probe. A real run trades under an
+operator-given SP2c-judged ``--deployment-version`` (SP2c Plan 2 ruling 18).
 Order of checks for ``run``: host -> signing key -> identities -> the
 scenario's preflight (two reads 30 s apart, ARMED, the confirmed account) ->
 the scenario. A dry run (no ``--place-orders``) reads the preflight and prints
@@ -98,13 +99,12 @@ class Clients:
                 pass
 
 
-def build_port(endpoints: Endpoints, *, research: bool, operator: bool,
+def build_port(endpoints: Endpoints, *, operator: bool,
                now: Callable[[], dt.datetime], sleep: Callable[[float], None]) -> tuple[RpcAcceptancePort, Clients]:
-    principals = ("ai_supervisor",) + (("ai_research",) if research else ()) + (("cli",) if operator else ())
+    principals = ("ai_supervisor",) + (("cli",) if operator else ())
     identities = load_identities(endpoints, principals)
     clients = Clients(endpoints, identities)
     port = RpcAcceptancePort(
-        clients.client("ai_research", "command") if research else None,
         clients.client("ai_supervisor", "command"), clients.client("ai_supervisor", "query"),
         operator_client=clients.client("cli", "command") if operator else None, now=now, sleep=sleep)
     return port, clients
@@ -189,14 +189,17 @@ class RunOutcome:
 
 def run(endpoints: Endpoints, *, run_id: Optional[str], conids: tuple[int, int], quantity_a: int, quantity_b: int,
         notional: float, place_orders: bool, confirm_account: Optional[str], report_path: Optional[str],
-        signing_key: Optional[str], now: Callable[[], dt.datetime] = _utc_now,
-        sleep: Callable[[float], None] = time.sleep) -> RunOutcome:
+        signing_key: Optional[str], deployment_version: Optional[str] = None,
+        now: Callable[[], dt.datetime] = _utc_now, sleep: Callable[[float], None] = time.sleep) -> RunOutcome:
     if running_in_container():
         raise AcceptanceRefused("HOST_ONLY", "mmr experiment acceptance runs on the host only, not in a container")
     if place_orders and not signing_key:
         raise AcceptanceRefused("SIGNING_KEY_REQUIRED", "--place-orders needs --signing-key (an operator key)")
     if place_orders and not confirm_account:
         raise AcceptanceRefused("CONFIRM_ACCOUNT_REQUIRED", "--place-orders needs --confirm-account DU...")
+    if place_orders and not deployment_version:
+        raise AcceptanceRefused("DEPLOYMENT_VERSION_REQUIRED",
+                                "--place-orders needs --deployment-version sha256:... (an ACTIVE judged version)")
     signer = _signer(signing_key)
     resuming = False
     if run_id is not None:
@@ -205,13 +208,13 @@ def run(endpoints: Endpoints, *, run_id: Optional[str], conids: tuple[int, int],
         resuming = True
     if resuming and not place_orders:
         raise AcceptanceRefused("PLACE_ORDERS_REQUIRED", "a resume sends orders; it needs --place-orders")
-    port, clients = build_port(endpoints, research=place_orders, operator=place_orders, now=now, sleep=sleep)
+    port, clients = build_port(endpoints, operator=place_orders, now=now, sleep=sleep)
     try:
         chosen = run_id or new_run_id(now())
         settings = AcceptanceSettings(
             run_id=chosen, account_id=confirm_account or "", conid_a=int(conids[0]), conid_b=int(conids[1]),
             quantity_a=quantity_a, quantity_b=quantity_b, notional=float(notional),
-            strategy_bytes=_strategy_bytes())
+            strategy_bytes=_strategy_bytes(), deployment_version=deployment_version or "")
         if not place_orders:
             scenario = AcceptanceScenario(port, settings, _DryJournal())
             results = scenario.run()
@@ -221,6 +224,9 @@ def run(endpoints: Endpoints, *, run_id: Optional[str], conids: tuple[int, int],
             stored = (journal.settings() or {}).get("settings") or {}
             if stored.get("account_id") and stored.get("account_id") != confirm_account:
                 raise AcceptanceRefused("ACCOUNT_MISMATCH", "the run journal names another account")
+            if stored.get("deployment_version") != deployment_version:
+                raise AcceptanceRefused("DEPLOYMENT_VERSION_MISMATCH",
+                                        "the run journal names another deployment version")
         scenario = AcceptanceScenario(port, settings, journal)
         results = scenario.run()
         outcome = AcceptanceScenario.outcome(results)
@@ -260,7 +266,7 @@ def finish(endpoints: Endpoints, *, run_id: str, report_path: Optional[str], sig
     stored = dict((journal.settings() or {}).get("settings") or {})
     stored.pop("strategy_digest", None)
     settings = AcceptanceSettings(**stored) if stored else AcceptanceSettings(run_id=run_id, account_id="")
-    port, clients = build_port(endpoints, research=False, operator=False, now=now, sleep=sleep)
+    port, clients = build_port(endpoints, operator=False, now=now, sleep=sleep)
     try:
         end = AcceptanceScenario(port, settings, journal).finish()
         steps = _latest_run_steps(journal)

@@ -76,6 +76,7 @@ def build_body(decision: ProposedDecision, *, decision_id: str, expires_at: dt.d
             "side": decision.side, "stop_price": decision.stop_price, "target_price": decision.target_price,
             "quantity": decision.quantity, "policy_revision": decision.policy_revision,
             "evidence_digest": decision.evidence_digest,
+            "deployment_version": decision.deployment_version, "source_digest": decision.source_digest,
             "expires_at": expires_at.astimezone(dt.timezone.utc).isoformat()}
 
 

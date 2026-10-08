@@ -1416,11 +1416,14 @@ def build_parser() -> argparse.ArgumentParser:
 
     # ai-deployment (SP2 Plan 3, spec 6.6): the operator registers the discretionary deployment
     ai_deployment_p = sub.add_parser(
-        'ai-deployment', help='PAPER AI deployments: register-discretionary (operator), show',
+        'ai-deployment',
+        help='PAPER AI deployments: register-discretionary, withdraw (operator), show, version',
         epilog='Examples:\n'
                '  ai-deployment register-discretionary --operator owner --statement "paper only"\n'
                '  ai-deployment register-discretionary --operator owner --statement "x" --stock-types ETF\n'
-               '  ai-deployment show sha256:...',
+               '  ai-deployment show sha256:...\n'
+               '  ai-deployment version sha256:...\n'
+               '  ai-deployment withdraw sha256:... --reason "fills drift from the backtest"',
         formatter_class=fmt)
     ai_deployment_sub = ai_deployment_p.add_subparsers(dest='ai_deployment_action')
     register_p = ai_deployment_sub.add_parser(
@@ -1434,6 +1437,12 @@ def build_parser() -> argparse.ArgumentParser:
     register_p.add_argument('--max-order-share', dest='max_order_share', type=float, default=None)
     show_p = ai_deployment_sub.add_parser('show', help='A sealed deployment and its kind')
     show_p.add_argument('digest')
+    version_p = ai_deployment_sub.add_parser('version', help='A judged deployment version and its state')
+    version_p.add_argument('version_digest')
+    withdraw_p = ai_deployment_sub.add_parser(
+        'withdraw', help='End a judged deployment version for good (operator; it is never active again)')
+    withdraw_p.add_argument('version_digest')
+    withdraw_p.add_argument('--reason', required=True)
 
     # scoreboard (SP1 Plan 5)
     scoreboard_p = sub.add_parser(
@@ -3210,8 +3219,8 @@ def _add_acceptance_parser(experiment_sub, fmt) -> None:
         epilog='Examples:\n'
                '  experiment acceptance preflight\n'
                '  experiment acceptance run                       # dry run: prints the plan, sends nothing\n'
-               '  experiment acceptance run --place-orders --confirm-account DU1234567 '
-               '--signing-key ~/.config/mmr/keys/acceptance/operator.key\n'
+               '  experiment acceptance run --place-orders --deployment-version sha256:... '
+               '--confirm-account DU1234567 --signing-key ~/.config/mmr/keys/acceptance/operator.key\n'
                '  experiment acceptance finish --run-id acc-20261007-abcdef --signing-key KEY\n'
                '  experiment acceptance status --run-id acc-20261007-abcdef\n'
                '  experiment acceptance verify-report REPORT.json --public-key PUB.pem',
@@ -3227,6 +3236,9 @@ def _add_acceptance_parser(experiment_sub, fmt) -> None:
     run_p.add_argument('--notional', type=float, default=2000.0, help='USD per entry; never raised')
     run_p.add_argument('--place-orders', dest='place_orders', action='store_true', default=False)
     run_p.add_argument('--confirm-account', dest='confirm_account', default=None)
+    run_p.add_argument('--deployment-version', dest='deployment_version', default=None,
+                       help='The ACTIVE SP2c-judged deployment version (sha256:...) to trade under; '
+                            'required with --place-orders')
     run_p.add_argument('--report', default=None, help='Where to write the signed report')
     run_p.add_argument('--signing-key', dest='signing_key', default=None, help='Operator Ed25519 key (PEM)')
     finish_p = acc_sub.add_parser('finish', help='After 15:55 ET: end checks on broker evidence')
@@ -3304,7 +3316,7 @@ def _acceptance_run(mmr: MMR, args, runner, clock, pause) -> bool:
         mmr.acceptance_endpoints(), run_id=args.run_id, conids=tuple(args.conids), quantity_a=args.quantity_a,
         quantity_b=args.quantity_b, notional=args.notional, place_orders=args.place_orders,
         confirm_account=args.confirm_account, report_path=args.report, signing_key=args.signing_key,
-        now=clock, sleep=pause)
+        deployment_version=args.deployment_version, now=clock, sleep=pause)
     if outcome.dry_run:
         preflight = outcome.results[0]
         if _json_mode:
@@ -3378,8 +3390,14 @@ def _handle_ai_deployment(mmr: MMR, args: argparse.Namespace):
         title = DISCRETIONARY_LABEL if view.get('kind') == 'discretionary' else 'AI deployment'
         print_json_result(view, title=title)
         return
+    if action == 'version':
+        _show_ai_deployment_version(mmr, args.version_digest)
+        return
+    if action == 'withdraw':
+        _withdraw_ai_deployment(mmr, args.version_digest, args.reason)
+        return
     if action != 'register-discretionary':
-        print_status('ai-deployment: choose register-discretionary or show', success=False)
+        print_status('ai-deployment: choose register-discretionary, show, version or withdraw', success=False)
         sys.exit(1)
     result = mmr.register_discretionary_deployment(operator=args.operator, statement=args.statement,
                                                    rule=_discretionary_rule_flags(args) or None)
@@ -3388,6 +3406,22 @@ def _handle_ai_deployment(mmr: MMR, args: argparse.Namespace):
                      success=False)
         sys.exit(1)
     print_json_result(result.obj or {}, title=f'Registered: {DISCRETIONARY_LABEL}')
+
+
+def _show_ai_deployment_version(mmr: MMR, version_digest: str):
+    view = mmr.ai_deployment_version(version_digest)
+    if not view.get('found'):
+        print_status(f'ai-deployment version: no sealed deployment version {version_digest}', success=False)
+        sys.exit(1)
+    print_json_result(view['version'], title='AI deployment version (paper)')
+
+
+def _withdraw_ai_deployment(mmr: MMR, version_digest: str, reason: str):
+    result = mmr.withdraw_ai_deployment(version_digest, reason)
+    if not result.is_success():
+        print_status(f'ai-deployment withdraw failed: {result.error or result.exception}', success=False)
+        sys.exit(1)
+    print_json_result(result.obj or {}, title='AI deployment version withdrawn (paper)')
 
 
 def _handle_experiment(mmr: MMR, args: argparse.Namespace):

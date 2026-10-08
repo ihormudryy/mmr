@@ -1,8 +1,9 @@
 """The acceptance port: the typed RPC calls the scenario needs (Plan 6 rulings 1, 2 and 23).
 
-Three signers. ``research`` signs as ``ai_research`` (register), ``supervisor`` as
-``ai_supervisor`` (publish, decide and every read), ``operator`` as ``cli`` and
-only for ``acceptance_mark_start`` and ``acceptance_shrink_probe``. A port built
+Two signers. ``supervisor`` signs as ``ai_supervisor`` (publish, decide and
+every read), ``operator`` as ``cli`` and only for ``acceptance_mark_start`` and
+``acceptance_shrink_probe``. Nothing registers a deployment: the run trades
+under an operator-given judged version (SP2c Plan 2 ruling 18). A port built
 without the operator client (a run without ``--place-orders``) refuses operator
 calls with ``OperatorChannelUnavailable``.
 """
@@ -30,8 +31,6 @@ class RemoteRefusal(RuntimeError):
 
 
 class AcceptancePort(Protocol):
-    def research(self, method: str, body: dict) -> dict: ...
-
     def supervisor(self, method: str, body: dict) -> dict: ...
 
     def operator(self, method: str, body: dict) -> dict: ...
@@ -56,10 +55,9 @@ def _utc_now() -> dt.datetime:
 class RpcAcceptancePort:
     """``AcceptancePort`` over ``TypedRpcClient``s; nothing here knows which stack answers."""
 
-    def __init__(self, research_client: Any, supervisor_command: Any, supervisor_query: Any,
+    def __init__(self, supervisor_command: Any, supervisor_query: Any,
                  operator_client: Any = None, *, now: Callable[[], dt.datetime] = _utc_now,
                  sleep: Callable[[float], None] = time.sleep):
-        self._research = research_client
         self._supervisor_command = supervisor_command
         self._supervisor_query = supervisor_query
         self._operator = operator_client
@@ -71,9 +69,6 @@ class RpcAcceptancePort:
     @property
     def has_operator(self) -> bool:
         return self._operator is not None
-
-    def research(self, method: str, body: dict) -> dict:
-        return self._call(self._research, method, body)
 
     def supervisor(self, method: str, body: dict) -> dict:
         client = self._supervisor_command if method in SUPERVISOR_COMMANDS else self._supervisor_query

@@ -12,9 +12,10 @@ NOW = dt.datetime(2026, 7, 17, 15, 0, tzinfo=dt.timezone.utc)
 FUTURE = (NOW + dt.timedelta(minutes=5)).isoformat()
 ENTER = {"decision_id": "dec-00000001", "deployment_digest": "sha256:" + "a" * 64, "decider": "jev",
          "action": "ENTER", "conid": 265598, "side": "BUY", "stop_price": 98.0, "target_price": None,
-         "quantity": None, "policy_revision": 1, "evidence_digest": "sha256:" + "c" * 64, "expires_at": FUTURE}
+         "quantity": None, "policy_revision": 1, "evidence_digest": "sha256:" + "c" * 64, "expires_at": FUTURE,
+         "deployment_version": "sha256:" + "d" * 64, "source_digest": "sha256:" + "a" * 64}
 CLOSE = {**ENTER, "action": "CLOSE", "side": "SELL", "deployment_digest": None, "policy_revision": None,
-         "stop_price": None}
+         "stop_price": None, "deployment_version": None, "source_digest": None}
 
 
 def test_a_valid_enter_round_trips():
@@ -76,3 +77,27 @@ def test_the_constructor_checks_types_too():
 
 def test_command_id_is_derived_and_colon_free():
     assert command_id_for("dec-00000001") == "aip-dec-00000001"
+
+
+@pytest.mark.parametrize("change", [{"deployment_version": "abc"}, {"source_digest": "sha256:ABC"},
+                                    {"deployment_version": None}, {"source_digest": None}])
+def test_enter_binding_fields_are_strict_and_paired(change):
+    with pytest.raises(DecisionInvalid):
+        AiPaperDecision.from_body({**ENTER, **change})
+
+
+def test_a_discretionary_enter_carries_no_binding():
+    decision = AiPaperDecision.from_body({**ENTER, "deployment_version": None, "source_digest": None})
+    assert (decision.deployment_version, decision.source_digest) == (None, None)
+
+
+def test_the_binding_fields_are_required_keys():
+    with pytest.raises(DecisionInvalid):
+        AiPaperDecision.from_body({k: v for k, v in ENTER.items() if k != "source_digest"})
+
+
+@pytest.mark.parametrize("action,extra", [("CLOSE", {}), ("PARTIAL_CLOSE", {"quantity": 100})])
+def test_a_reduction_carries_no_binding(action, extra):
+    with pytest.raises(DecisionInvalid):
+        AiPaperDecision.from_body({**CLOSE, "action": action, **extra, "deployment_version": "sha256:" + "d" * 64,
+                                   "source_digest": "sha256:" + "a" * 64})

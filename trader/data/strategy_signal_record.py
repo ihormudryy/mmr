@@ -27,12 +27,14 @@ MAX_READ_LIMIT = 500
 SIGNAL_ACTIONS = ("BUY", "SELL")
 SOURCE_EVENT_ID = re.compile(r"^sig-[0-9a-f]{32}$")
 RECORD_GENERATION = re.compile(r"^gen-[0-9a-f]{32}$")
+DIGEST = re.compile(r"^sha256:[0-9a-f]{64}$")
 
 _CREATE = (
     """CREATE TABLE IF NOT EXISTS strategy_signal_record (
         cursor BIGINT PRIMARY KEY, source_event_id VARCHAR NOT NULL UNIQUE, strategy_name VARCHAR NOT NULL,
         conid BIGINT NOT NULL, action VARCHAR NOT NULL, probability DOUBLE,
-        signal_time TIMESTAMPTZ NOT NULL, recorded_at TIMESTAMPTZ NOT NULL)""",
+        signal_time TIMESTAMPTZ NOT NULL, recorded_at TIMESTAMPTZ NOT NULL,
+        deployment_digest VARCHAR, deployment_version VARCHAR, source_digest VARCHAR)""",
     """CREATE TABLE IF NOT EXISTS strategy_signal_record_state (
         last_cursor BIGINT NOT NULL, retention_watermark BIGINT NOT NULL)""",
     """INSERT INTO strategy_signal_record_state SELECT 0, 0
@@ -40,7 +42,8 @@ _CREATE = (
     # Its own table, so a record created before it existed gains one without an ALTER.
     """CREATE TABLE IF NOT EXISTS strategy_signal_record_generation (record_generation VARCHAR NOT NULL)""",
 )
-_COLUMNS = "cursor, source_event_id, strategy_name, conid, action, probability, signal_time, recorded_at"
+_COLUMNS = ("cursor, source_event_id, strategy_name, conid, action, probability, signal_time, recorded_at, "
+            "deployment_digest, deployment_version, source_digest")
 
 
 class SignalCursorAhead(ValueError):
@@ -85,22 +88,32 @@ class SignalEntry:
     action: str
     probability: Optional[float]
     signal_time: dt.datetime
+    deployment_digest: Optional[str] = None
+    deployment_version: Optional[str] = None
+    source_digest: Optional[str] = None
 
     @classmethod
     def create(cls, *, strategy_name: str, conid: object, action: str, probability: object,
-               signal_time: dt.datetime) -> "SignalEntry":
+               signal_time: dt.datetime, deployment_digest: Optional[str] = None,
+               deployment_version: Optional[str] = None, source_digest: Optional[str] = None) -> "SignalEntry":
         if not isinstance(strategy_name, str) or not strategy_name:
             raise ValueError("strategy_name must be a non-empty string")
         if isinstance(conid, bool) or not isinstance(conid, numbers.Integral) or conid <= 0:
             raise ValueError("conid must be an integer > 0")
         if action not in SIGNAL_ACTIONS:
             raise ValueError(f"action must be one of {SIGNAL_ACTIONS}")
+        binding = (deployment_digest, deployment_version, source_digest)
+        if any(value is not None for value in binding):
+            if not all(isinstance(value, str) and DIGEST.fullmatch(value) for value in binding):
+                raise ValueError("deployment_digest, deployment_version and source_digest are all set "
+                                 "(each sha256:<64 hex>) or all null")
         exact_conid = int(conid)                     # numpy integers are exact; strings were refused above
         when = _as_utc(signal_time)
         finite = (isinstance(probability, (int, float)) and not isinstance(probability, bool)
                   and math.isfinite(probability))
         return cls(source_event_id_for(strategy_name, exact_conid, action, when), strategy_name, exact_conid,
-                   action, float(probability) if finite else None, when)
+                   action, float(probability) if finite else None, when, deployment_digest, deployment_version,
+                   source_digest)
 
 
 @dataclass(frozen=True)
@@ -113,7 +126,9 @@ class RecordedSignal:
         return {"cursor": self.cursor, "source_event_id": self.entry.source_event_id,
                 "strategy_name": self.entry.strategy_name, "conid": self.entry.conid,
                 "action": self.entry.action, "probability": self.entry.probability,
-                "signal_time": self.entry.signal_time.isoformat(), "recorded_at": self.recorded_at.isoformat()}
+                "signal_time": self.entry.signal_time.isoformat(), "recorded_at": self.recorded_at.isoformat(),
+                "deployment_digest": self.entry.deployment_digest,
+                "deployment_version": self.entry.deployment_version, "source_digest": self.entry.source_digest}
 
 
 @dataclass(frozen=True)
@@ -154,9 +169,10 @@ class StrategySignalRecord:
             "SELECT last_cursor, retention_watermark FROM strategy_signal_record_state").fetchone()
         now = _as_utc(self._now())
         cursor = int(last_cursor) + 1
-        conn.execute(f"INSERT INTO strategy_signal_record ({_COLUMNS}) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+        conn.execute(f"INSERT INTO strategy_signal_record ({_COLUMNS}) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
                      [cursor, entry.source_event_id, entry.strategy_name, entry.conid, entry.action,
-                      entry.probability, entry.signal_time, now])
+                      entry.probability, entry.signal_time, now, entry.deployment_digest,
+                      entry.deployment_version, entry.source_digest])
         watermark = self._prune_in_tx(conn, int(watermark), now)
         conn.execute("UPDATE strategy_signal_record_state SET last_cursor = ?, retention_watermark = ?",
                      [cursor, watermark])
@@ -188,7 +204,8 @@ class StrategySignalRecord:
                             "ORDER BY cursor LIMIT ?", [after_cursor, limit]).fetchall()
         (oldest,) = conn.execute("SELECT MIN(cursor) FROM strategy_signal_record").fetchone()
         signals = tuple(
-            RecordedSignal(int(row[0]), SignalEntry(row[1], row[2], int(row[3]), row[4], row[5], _as_utc(row[6])),
+            RecordedSignal(int(row[0]), SignalEntry(row[1], row[2], int(row[3]), row[4], row[5], _as_utc(row[6]),
+                                                    row[8], row[9], row[10]),
                            _as_utc(row[7]))
             for row in rows)
         next_cursor = signals[-1].cursor if signals else max(after_cursor, watermark)

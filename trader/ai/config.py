@@ -117,6 +117,7 @@ class DecisionsConfig(_Section):
     """The decision engine (SP2 Plan 6). No model ids here: those live in roles."""
     discretionary_deployment_digest: Optional[DigestText] = None
     strategies: dict[StrategyName, StrategyBracket] = Field(default_factory=dict)
+    ai_deployments: Bracketing = Field(default_factory=Bracketing)        # the bracket of every aidv- instance
     self_found_bracket: Bracketing = Field(default_factory=Bracketing)
     fixed_rule: FixedRuleConfig = Field(default_factory=FixedRuleConfig)
     discovery: DiscoverySettings = Field(default_factory=DiscoverySettings)

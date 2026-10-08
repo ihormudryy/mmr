@@ -3,10 +3,12 @@
 One durable row per request id. A claim is written in one transaction that
 checks, in order: the same id (retry or conflict), the id is the body's digest,
 the allowlist and cohort size, the strategy key's cooldown, and the New York
-day's cap. The per-instance lock of the shared ``DuckDBConnection.get_instance``
-(one instance per journal file) serialises claims, so the last slot goes to
-exactly one caller; DuckDB's file lock only keeps other processes out. States
-only move forward.
+day's cap. The clock is read inside that transaction, so the cap, the cooldown
+check and the stored row use the New York day on which the lock was taken. The
+per-instance lock of the shared ``DuckDBConnection.get_instance`` (one instance
+per journal file) serialises claims, so the last slot goes to exactly one
+caller; DuckDB's file lock only keeps other processes out. States only move
+forward.
 """
 from __future__ import annotations
 
@@ -100,10 +102,10 @@ class EvaluationClaims:
     def claim(self, request_id: str, body: EvaluationRequestBody, *, principal: str) -> ClaimResult:
         canonical = canonical_request_json(body)
         expected_id = evaluation_request_id(body)
-        now = utc(self._now())
-        day = ny_day(now)
 
         def write(conn: Any) -> ClaimResult:
+            now = utc(self._now())
+            day = ny_day(now)
             existing = claim_row_in_tx(conn, request_id)
             if existing is not None:
                 if existing.body_json != canonical:
@@ -140,9 +142,9 @@ class EvaluationClaims:
     def update(self, request_id: str, state: str) -> ClaimResult:
         if state not in ("RUNNING", "DONE", "FAILED"):
             raise ValueError(f"unknown claim state {state!r}")
-        now = utc(self._now())
 
         def write(conn: Any) -> ClaimResult:
+            now = utc(self._now())
             claim = claim_row_in_tx(conn, request_id)
             if claim is None:
                 raise ClaimRefused(CLAIM_UNKNOWN, "the trader holds no claim with this request id")

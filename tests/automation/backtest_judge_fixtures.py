@@ -37,6 +37,22 @@ class Clock:
         return self.now
 
 
+class ClockMovesWhileWaitingForTheLock:
+    """A journal whose ``transaction`` first moves the clock: the caller waited for the lock until ``then``."""
+
+    def __init__(self, db: DuckDBConnection, clock: Clock, then: dt.datetime):
+        self._db = db
+        self._clock = clock
+        self._then = then
+
+    def execute(self, *args, **kwargs):
+        return self._db.execute(*args, **kwargs)
+
+    def transaction(self, fn):
+        self._clock.now = self._then
+        return self._db.transaction(fn)
+
+
 def request_body(**changes) -> EvaluationRequestBody:
     raw = {"strategy_key": KEY, "cohort": [{"RANGE_MINUTES": 15}, {"RANGE_MINUTES": 30}],
            "conids": [265598, 272093], "bar_size": "5 mins", "research_day": "2026-10-08"}

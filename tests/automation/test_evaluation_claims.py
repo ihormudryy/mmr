@@ -7,7 +7,8 @@ import threading
 import pytest
 
 from tests.automation.backtest_judge_fixtures import (
-    KEY, NOW, ZERO, Clock, count_claims, insert_reject, journal, judge_config, request_body,
+    KEY, NOW, ZERO, Clock, ClockMovesWhileWaitingForTheLock, count_claims, insert_reject, journal, judge_config,
+    request_body,
 )
 from trader.automation.evaluation_claims import ClaimRefused, EvaluationClaims
 from trader.data.duckdb_store import DuckDBConnection
@@ -96,6 +97,20 @@ def test_the_cap_resets_at_new_york_midnight_not_at_utc_midnight(db, clock):
     assert claim(claims, request_body(research_day="2026-10-01")).claim.ny_day == dt.date(2026, 10, 8)
     clock.now = dt.datetime(2026, 10, 9, 4, 1, tzinfo=dt.timezone.utc)           # 00:01 ET on Oct 9
     assert claim(claims, request_body(research_day="2026-10-02")).claim.ny_day == dt.date(2026, 10, 9)
+
+
+def test_claim_cap_uses_transaction_day_not_stale_prelock_day(db, clock):        # PR #93 round 1
+    config = judge_config(evaluations_per_day=1)
+    EvaluationClaims(db, config=config, now=clock).claim(
+        evaluation_request_id(request_body(research_day="2026-10-01")), request_body(research_day="2026-10-01"),
+        principal="research")                                                    # Oct 8's only slot
+    clock.now = dt.datetime(2026, 10, 9, 3, 59, 59, tzinfo=dt.timezone.utc)     # 23:59:59 ET on Oct 8
+    after_midnight = dt.datetime(2026, 10, 9, 4, 0, 1, tzinfo=dt.timezone.utc)  # 00:00:01 ET on Oct 9
+    waiting = EvaluationClaims(ClockMovesWhileWaitingForTheLock(db, clock, after_midnight), config=config,
+                               now=clock)
+    stored = claim(waiting, request_body(research_day="2026-10-02")).claim
+    assert (stored.ny_day, stored.claimed_at) == (dt.date(2026, 10, 9), after_midnight)
+    assert refusal(lambda: claim(waiting, request_body(research_day="2026-10-03"))) == "EVALUATION_LIMIT_REACHED"
 
 
 def test_two_concurrent_claims_for_the_last_slot_accept_exactly_one(db, clock):     # review focus 1

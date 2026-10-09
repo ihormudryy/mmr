@@ -1441,6 +1441,7 @@ def build_command_stack(
         orders_view=orders_view,
         now=now,
         closes=liquidation_store,
+        registrations=None if ai_paper_parts is None else ai_paper_parts.registrar,
     )
     strategy_control_service = None
     if strategy_port is not None:

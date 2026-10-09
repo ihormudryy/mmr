@@ -2529,6 +2529,16 @@ class _ReconcilePlan:
 # name is spelled out: importing it from trader.automation would be a cycle.
 CLOSE_RESOLVED_ACTIONS = frozenset({"execute_automated_intent", "liquidate_account", "submit_ai_paper_decision"})
 AI_PAPER_ENTRY_ACTION = "submit_ai_paper_decision"   # spelled out: importing it would be a cycle
+AI_DEPLOYMENT_REGISTER_ACTION = "register_ai_deployment"   # spelled out: importing it would be a cycle
+# The reconciler's proof that a registration's transaction never committed. Terminal, so it no longer holds
+# reconciliation_safe(); the register RPC handler sends the next attempt under a new command id.
+REGISTRATION_NOT_COMMITTED = "REGISTRATION_NOT_COMMITTED"
+
+
+class RegistrationEvidencePort(Protocol):
+    """The trader's own journal: the outcome of the version a registration command sealed, or None."""
+
+    def committed_outcome(self, command_id: str) -> Optional[dict[str, Any]]: ...
 
 
 class OutcomeReconciler:
@@ -2550,6 +2560,9 @@ class OutcomeReconciler:
       approve path uses is always empty for it and must NEVER resolve a cancel.
       Optional: when unwired (dormant) the cancel branch stays OUTCOME_UNKNOWN
       rather than rubber-stamping RESOLVED (fail-safe).
+    - ``registrations``: ``RegistrationEvidencePort`` -- resolves an
+      ``OUTCOME_UNKNOWN`` ``register_ai_deployment`` from the version its
+      transaction sealed. Optional: unwired (ai_paper off) it stays unknown.
 
     Command-type awareness ([M1-F3] Task 9 HIGH-1, verbatim): ``reconcile_once``
     discriminates by the command's ACTION, not by ``target_type`` alone --
@@ -2574,6 +2587,7 @@ class OutcomeReconciler:
         orders_view: Optional[OrderStateView] = None,
         now: Callable[[], dt.datetime] = _utcnow,
         closes: Optional[Any] = None,
+        registrations: Optional[RegistrationEvidencePort] = None,
     ):
         self._journal = journal
         self._ledger = ledger
@@ -2584,6 +2598,8 @@ class OutcomeReconciler:
         self._orders_view = orders_view
         self._now = now
         self._closes = closes
+        self._registrations = registrations
+        self._unreadable_registrations: set[str] = set()   # logged once; the 15-minute alert follows
         self._plans: dict[str, _ReconcilePlan] = {}
 
     # -- scheduling --------------------------------------------------------
@@ -2716,6 +2732,8 @@ class OutcomeReconciler:
             return self._reconcile_ai_entry(row, now)
         if action in CLOSE_RESOLVED_ACTIONS:
             return self._reconcile_close(row, now)
+        if action == AI_DEPLOYMENT_REGISTER_ACTION:
+            return self._reconcile_registration(row, now)
         # Unmapped action: cannot positively determine an outcome -> stay
         # OUTCOME_UNKNOWN (fail-safe), never rubber-stamp RESOLVED.
         return False
@@ -2735,6 +2753,30 @@ class OutcomeReconciler:
             self._resolve_never_submitted(row, now)
             return True
         return False
+
+    def _reconcile_registration(self, row: LedgerRow, now: dt.datetime) -> bool:
+        """A registration is one journal transaction that writes the command id with the version it seals.
+
+        Its row is OUTCOME_UNKNOWN only after the handler raised, so that transaction has committed or rolled
+        back. A sealed version resolves the command with the receipt a success gives; no version proves the
+        transaction never committed. A version that cannot be read keeps the command unknown (15-minute alert).
+        """
+        if self._registrations is None or row.state != "OUTCOME_UNKNOWN":
+            return False
+        try:
+            outcome = self._registrations.committed_outcome(row.command_id)
+        except Exception:
+            if row.command_id not in self._unreadable_registrations:
+                self._unreadable_registrations.add(row.command_id)
+                logger.exception("registration %s: its sealed version cannot be read; it stays OUTCOME_UNKNOWN",
+                                 row.command_id)
+            return False
+        if outcome is not None:
+            self._resolve_command_only(row, dict(outcome), now)
+            return True
+        self._reject_command_only(row, error_code=REGISTRATION_NOT_COMMITTED,
+                                  outcome={"created": False, "reconciled": "never_committed"}, now=now)
+        return True
 
     def _reconcile_ai_entry(self, row: LedgerRow, now: dt.datetime) -> bool:
         """An ai_paper ENTER (the only decision that ends SUBMITTED) is done once the broker shows its

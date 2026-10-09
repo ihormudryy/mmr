@@ -744,14 +744,23 @@ class CommandLedger:
         ).fetchall()
         return [_row_to_ledger_row(row) for row in rows]
 
-    def received_before(self, cutoff: dt.datetime) -> list[LedgerRow]:
-        """``RECEIVED`` rows created before ``cutoff`` (issue #114): before this process started, so no handler
-        of this process runs them. Their handler died, or the write that ends them failed."""
+    def received(self) -> list[LedgerRow]:
+        """Every ``RECEIVED`` row. Read once before a process serves commands (issue #114), these are rows
+        whose handler died with an earlier process or whose final write failed there."""
         rows = self._journal.connect().execute(
-            f"{self._SELECT} WHERE state = 'RECEIVED' AND created_at < ? ORDER BY created_at",
-            [_as_utc(cutoff)],
+            f"{self._SELECT} WHERE state = 'RECEIVED' ORDER BY created_at",
         ).fetchall()
         return [_row_to_ledger_row(row) for row in rows]
+
+    def audited_body(self, command_id: str) -> Optional[dict[str, Any]]:
+        """The request body the mandatory audit record kept for this command, or None without a record."""
+        row = self._journal.connect().execute(
+            "SELECT redacted_inputs FROM command_audit WHERE command_id = ? ORDER BY audit_id LIMIT 1",
+            [command_id],
+        ).fetchone()
+        if row is None:
+            return None
+        return json.loads(row[0]) if isinstance(row[0], str) else row[0]
 
     def pre_dispatch_orphans(self) -> list[LedgerRow]:
         """Every ``VALIDATED`` row a coordinator restart must recover
@@ -2557,6 +2566,8 @@ SAGA_ACTIONS = frozenset({
 })
 # A single-step command still RECEIVED at a restart: its handler died or its final write failed (issue #114).
 RECEIVED_AT_RESTART = "RECEIVED_AT_RESTART"
+# A cancel_orders root that left no child cancel_order: no cancel was sent, so it is no success (PR #122).
+CANCEL_FANOUT_NOT_STARTED = "CANCEL_FANOUT_NOT_STARTED"
 
 # Commands that start or join a close root and resolve from it (R17). The ai_paper action
 # name is spelled out: importing it from trader.automation would be a cycle.
@@ -2652,7 +2663,7 @@ class OutcomeReconciler:
         self._unreadable_evidence: set[str] = set()   # command ids logged once; the 15-minute alert follows
         self._unreadable_sagas: set[str] = set()      # logged once; the 15-minute alert follows
         self._plans: dict[str, _ReconcilePlan] = {}
-        self._started_at = _as_utc(now())   # rows created before it belong to an earlier process
+        self._received_at_start = self._snapshot_received()
 
     # -- scheduling --------------------------------------------------------
 
@@ -2715,7 +2726,7 @@ class OutcomeReconciler:
         Issue #114: first parks single-step rows left ``RECEIVED`` by an earlier
         process at ``OUTCOME_UNKNOWN`` (``RECEIVED_AT_RESTART``), so the loop
         below schedules them and their action's evidence settles them."""
-        self._park_received_before_start()
+        self._park_received_at_start()
         requeued: list[str] = []
         for row in self._ledger.reconcilable():
             self.schedule(row.command_id, self._now_utc())
@@ -2725,13 +2736,23 @@ class OutcomeReconciler:
                 requeued.append(row.command_id)
         return requeued
 
-    def _park_received_before_start(self) -> None:
-        """RECEIVED -> OUTCOME_UNKNOWN for single-step rows created before this reconciler.
+    def _snapshot_received(self) -> list[LedgerRow]:
+        """The RECEIVED rows at construction. The command stack builds this reconciler before it serves any
+        command, so none of them belongs to a handler of this process (PR #122: a fence, not a clock)."""
+        try:
+            return self._ledger.received()
+        except Exception:
+            logger.exception("the RECEIVED commands at start cannot be read; a crash-left one stays RECEIVED")
+            return []
+
+    def _park_received_at_start(self) -> None:
+        """RECEIVED -> OUTCOME_UNKNOWN for the single-step rows of the start snapshot, once.
 
         Never terminal: only the action's own evidence settles a row, and an action without a resolver stays
         OUTCOME_UNKNOWN (and alerts after 15 minutes). Sagas are left alone. One failed row never stops the
-        others; it stays RECEIVED until the next start."""
-        for row in self._ledger.received_before(self._started_at):
+        others; it stays RECEIVED until the next start. A later rescan parks nothing."""
+        snapshot, self._received_at_start = self._received_at_start, []
+        for row in snapshot:
             if row.action in SAGA_ACTIONS:
                 continue
             try:
@@ -2866,10 +2887,7 @@ class OutcomeReconciler:
         try:
             outcome = committed_outcome(row.command_id)
         except Exception:
-            if row.command_id not in self._unreadable_evidence:
-                self._unreadable_evidence.add(row.command_id)
-                logger.exception("%s %s: its journal evidence cannot be read; it stays OUTCOME_UNKNOWN",
-                                 row.action, row.command_id)
+            self._evidence_unreadable(row)
             return False
         if outcome is not None:
             self._resolve_command_only(row, dict(outcome), now)
@@ -2877,6 +2895,14 @@ class OutcomeReconciler:
         self._reject_command_only(row, error_code=not_committed_code,
                                   outcome={**not_committed_outcome, "reconciled": "never_committed"}, now=now)
         return True
+
+    def _evidence_unreadable(self, row: LedgerRow) -> None:
+        """A failed evidence read never proves anything: the command stays OUTCOME_UNKNOWN and is asked again
+        on its schedule. Logged once per command; the 15-minute alert follows if it never reads."""
+        if row.command_id not in self._unreadable_evidence:
+            self._unreadable_evidence.add(row.command_id)
+            logger.exception("%s %s: its evidence cannot be read; it stays OUTCOME_UNKNOWN",
+                             row.action, row.command_id)
 
     def _reconcile_close(self, row: LedgerRow, now: dt.datetime) -> bool:
         """R17 / R33: a command that started or joined a close root resolves from that exact root.
@@ -3033,7 +3059,11 @@ class OutcomeReconciler:
         transaction rolled back. Reject
         those so they cannot wedge ``reconciliation_safe`` / resume forever.
         """
-        proposal_id = self._created_proposal_id(row.command_id)
+        try:
+            proposal_id = self._created_proposal_id(row.command_id)
+        except Exception:
+            self._evidence_unreadable(row)
+            return False
         if proposal_id is not None:
             self._resolve_command_only(
                 row, {"proposal_id": proposal_id, "created": True}, now
@@ -3092,13 +3122,39 @@ class OutcomeReconciler:
         return False
 
     def _reconcile_cancel_orders(self, row: LedgerRow, now: dt.datetime) -> bool:
-        """MEDIUM-3: the ``cancel_orders`` ROOT is a non-saga fan-out that
-        dispatches NOTHING itself -- each child ``cancel_order`` is an
-        independently-reconciled ledger row carrying its own authoritative
-        outcome. A wedged root therefore has no ambiguous real-money action of
-        its own; resolve it to a defined terminal so it never becomes an
-        eternal critical alert (fail-safe: no order state is hidden)."""
-        self._resolve_command_only(row, {"reconciled": "cancel_orders_root"}, now)
+        """MEDIUM-3 / PR #122: the ``cancel_orders`` ROOT dispatches nothing itself; it fans out one child
+        ``cancel_order`` per distinct order, ``{root}-{index}``, each reconciled on its own.
+
+        Settled only on child evidence read from the ledger: every child settled -> RESOLVED with their
+        outcomes; no child at all -> REJECTED ``CANCEL_FANOUT_NOT_STARTED`` (no cancel was sent; the operator
+        sends the cancel again); a partial fan-out or a child still in flight -> stays unknown. The request
+        comes from the root's audit record; without it nothing is concluded."""
+        try:
+            body = self._ledger.audited_body(row.command_id)
+            order_ids = list(dict.fromkeys((body or {}).get("order_entity_ids") or []))
+            child_ids = [f"{row.command_id}-{index}" for index in range(len(order_ids))]
+            children = [self._ledger.get(child_id) for child_id in child_ids]
+        except Exception:
+            self._evidence_unreadable(row)
+            return False
+        if not order_ids:
+            return False
+        if all(child is None for child in children):
+            self._reject_command_only(row, error_code=CANCEL_FANOUT_NOT_STARTED,
+                                      outcome={"child_command_ids": [], "reconciled": "fan_out_not_started"},
+                                      now=now)
+            return True
+        if any(child is None or child.state not in _TERMINAL_STATES for child in children):
+            return False
+        outcome = {
+            "child_command_ids": child_ids,
+            "children": {order_id: {"command_id": child.command_id, "state": child.state,
+                                    "error_code": child.error_code}
+                         for order_id, child in zip(order_ids, children)},
+            "partial_failure": any(child.state != "RESOLVED" for child in children),
+            "reconciled": "children_settled",
+        }
+        self._resolve_command_only(row, outcome, now)
         return True
 
     def _reconcile_pause(self, row: LedgerRow, now: dt.datetime) -> bool:
@@ -3134,22 +3190,15 @@ class OutcomeReconciler:
         event correlated to the creating command_id (see
         ``ProposalCommandService.create_proposal``); its ABSENCE means the
         create never durably committed, so the command stays OUTCOME_UNKNOWN --
-        fail-safe, NEVER marked FAILED."""
-        try:
-            found = self._journal.connect().execute(
-                "SELECT entity_id FROM domain_event_journal "
-                "WHERE entity_type = 'proposal' AND correlation_id = ? "
-                "ORDER BY source_cursor LIMIT 1",
-                [command_id],
-            ).fetchone()
-        except Exception:
-            return None
-        if found is None:
-            return None
-        try:
-            return int(found[0])
-        except (TypeError, ValueError):
-            return None
+        fail-safe, NEVER marked FAILED. A read that fails raises: only a read
+        that succeeds may show the absence (PR #122)."""
+        found = self._journal.connect().execute(
+            "SELECT entity_id FROM domain_event_journal "
+            "WHERE entity_type = 'proposal' AND correlation_id = ? "
+            "ORDER BY source_cursor LIMIT 1",
+            [command_id],
+        ).fetchone()
+        return None if found is None else int(found[0])
 
     def _pause_state_for(self, account_id: str) -> Optional[tuple[bool, Optional[str]]]:
         """``(new_exposure_paused, updated_by_command_id)`` for the account's

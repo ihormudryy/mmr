@@ -42,6 +42,7 @@ THESIS_LABEL = "orchestrator_thesis"
 THESIS_MAX_CHARS = 1000                   # the proposal schema's own limit
 TERMINAL = frozenset({"DONE", "FAILED"})
 RETRY_REGISTRATION = frozenset({"DEPLOY_CAP_REACHED"})
+INTERNAL_ERROR = "INTERNAL_ERROR"                # the typed RPC server's catch-all: the handler may have committed
 UNSETTLED_ERROR_SECONDS = 900                    # the trader reconciler's critical-alert boundary
 ATTEST_WAITS_FOR_TRADER = "TRADER_UNAVAILABLE"   # infrastructure behind the research service: no try is spent
 ATTEST_MAX_TRIES = 3                             # a "retryable" bundle error may be deterministic (Plan 3 as built)
@@ -712,11 +713,15 @@ class ResearchCycle:
             outcome = parse_registration(await self._registry.call("register_ai_deployment", json.loads(body_json)))
         except AWAY:
             return                                                        # an exact retry returns the same version
-        except RpcRefused as exc:                                         # a loud code (Plan 2 is_loud_refusal)
+        except RpcRefused as exc:
+            if exc.code == INTERNAL_ERROR:                                # the handler may have committed first
+                return self._wait_for_settlement(judgment_id, INTERNAL_ERROR, "the trader failed while handling it "
+                                                 "and the outcome is unknown; the same body is sent again")
             return await self._refuse_registration(judgment_id, f"RPC_{exc.code}", "register_ai_deployment", exc,
                                                    prior=prior)
         if outcome is None:
-            return self._wait_for_settlement(judgment_id)
+            return self._wait_for_settlement(judgment_id, "NOT_SETTLED", "the trader's ledger has not settled it; "
+                                                                         "asked again each pump")
         now = self._clock.now()
         if isinstance(outcome, RegisterRefused) and outcome.retryable:
             return self._warn_registration_once(judgment_id, outcome.code, "the trader refused it for now and kept "
@@ -743,10 +748,9 @@ class ResearchCycle:
         if prior is not None:
             self._end_line_in_tx(conn, prior, "RENEWED")
 
-    def _wait_for_settlement(self, judgment_id: str) -> None:
+    def _wait_for_settlement(self, judgment_id: str, code: str, why: str) -> None:
         """One WARNING, then one ERROR once the trader's reconciler would raise its own critical alert."""
-        self._warn_registration_once(judgment_id, "NOT_SETTLED", "the trader's ledger has not settled it; asked "
-                                                                 "again each pump")
+        self._warn_registration_once(judgment_id, code, why)
         since = self._unsettled_since.setdefault(judgment_id, self._clock.now())
         waited = (self._clock.now() - since).total_seconds()
         reported = (judgment_id, "NOT_SETTLED_ERROR")

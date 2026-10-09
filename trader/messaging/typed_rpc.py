@@ -845,7 +845,9 @@ class TypedRpcServer:
                 f"socket_role must be one of {sorted(VALID_SOCKET_ROLES)}, got {socket_role!r}"
             )
         if not isinstance(identity, ServiceIdentity) or identity.principal not in SERVER_PRINCIPALS:
-            raise ValueError("a typed RPC server needs a server identity (trader or strategy)")
+            raise ValueError(
+                f"a typed RPC server needs a server identity (one of {sorted(SERVER_PRINCIPALS)})"
+            )
         self.socket_role = socket_role
         self.registry = registry
         self.identity = identity

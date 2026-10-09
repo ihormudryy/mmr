@@ -92,6 +92,11 @@ typed_query_port: 42101
 typed_command_port: 42102
 typed_feed_port: 42103
 
+# The research service's own typed query/command sockets (SP2c). The bind address comes from
+# RESEARCH_TYPED_BIND_ADDRESS (default tcp://127.0.0.1; compose sets tcp://0.0.0.0).
+research_typed_query_port: 42106
+research_typed_command_port: 42107
+
 # [M1-F3] Task 7: strategy_service's own typed query/command sockets --
 # the receiving end of the coordinator's one-way strategy-control forwarding
 # (enable_strategy/disable_strategy/update_strategy_params). The bind address
@@ -179,8 +184,20 @@ ai_paper:
     max_active_deploys: 3            # active AI-judged DEPLOYs
     deploy_expiry_sessions: 20       # a DEPLOY expires after this many sessions (1-120)
     max_cohort_points: 3             # parameter points per evaluation (1-10)
-    shadow_warmup_sessions: 5        # bars that only warm up a shadow replay
+    shadow_warmup_sessions: 5        # sessions of bars that only warm up a shadow replay
     strategy_allowlist: []           # strategies/<file>.py:<Class>; empty = nothing may be evaluated
+
+# research service (SP2c): evaluation defaults for AI-proposed candidates. Operator only.
+research_service:
+  period_sessions: 690        # sessions before the research day (at most 2520); the last holdout_sessions are the holdout
+  folds: 6
+  embargo_sessions: 5
+  holdout_sessions: 90
+  order_notional: 1900
+  account_equity: 100000
+  max_gross_allocation: 0.05
+  queue_max: 20               # a full queue refuses before any claim (at most 1000)
+  shadow_incomplete_after_hours: 16   # hours after the close before a row without data goes INCOMPLETE (at most 720)
 
 # Massive.com (formerly Polygon.io)
 massive_api_key: ''

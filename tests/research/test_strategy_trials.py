@@ -48,6 +48,23 @@ def test_trials_of_all_families_of_one_strategy_are_counted(tmp_path):
     assert sorted(t.trial_key for t in trials) == ['a', 'b']
 
 
+def test_interrupted_trials_of_every_family_of_one_strategy_are_closed_and_then_counted(tmp_path):
+    registry = _registry(tmp_path)
+    older = registry.create_family(_family('strategies/rsi.py', 15), created_at=T0)
+    newer = registry.create_family(_family(str(repo_root() / 'strategies' / 'rsi.py'), 30), created_at=T0)
+    other = registry.create_family(_family('strategies/other.py', 15), created_at=T0)
+    stranded = [_trial(registry, older, 'crashed', finish=False), _trial(registry, newer, 'running', finish=False)]
+    untouched = _trial(registry, other, 'elsewhere', finish=False)
+
+    assert registry.close_interrupted_strategy_trials('./strategies/rsi.py', 'RSIStrategy', finished_at=T0) == 2
+
+    assert [registry.get_trial(t).status for t in stranded] == ['FAILED', 'FAILED']
+    assert registry.get_trial(untouched).status == 'RUNNING'
+    assert sorted(t.trial_key for t in registry.strategy_trials('strategies/rsi.py', 'RSIStrategy')) == [
+        'crashed', 'running']
+    assert registry.close_interrupted_strategy_trials('strategies/rsi.py', 'RSIStrategy', finished_at=T0) == 0
+
+
 def test_legacy_imported_backtests_count(tmp_path):
     registry = _registry(tmp_path)
     record = _make_record()

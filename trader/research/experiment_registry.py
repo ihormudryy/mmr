@@ -35,6 +35,7 @@ from trader.research.artifact import (
     ARTIFACT_STATE_RETIRED,
     PROVENANCE_LEGACY_UNQUALIFIED,
     TERMINAL_TRIAL_STATUSES,
+    TRIAL_FAILED,
     TRIAL_RUNNING,
     TRIAL_SUCCEEDED,
     ArtifactRecord,
@@ -145,6 +146,10 @@ def apply_experiment_migrations(migrator: SchemaMigrator) -> None:
     migrator.apply(version=RESEARCH_MIGRATION_HOLDOUT,
                    name="research_holdout_access",
                    statements=list(_HOLDOUT_STATEMENTS))
+
+
+HOLDOUT_IN_PROGRESS = "in progress"
+INTERRUPTED_SUMMARY = "interrupted before it finished"
 
 
 class RegistryError(Exception):
@@ -375,16 +380,9 @@ class ExperimentRegistry:
         """Terminal trials of EVERY family of one strategy file + class: the
         multiple-testing denominator across families. A new family per param
         tweak must not reset it, so paths compare repo-relative."""
-        target = normalize_strategy_path(strategy_path)
-
         def _tx(conn):
-            families = conn.execute(
-                "SELECT family_id, strategy_path FROM experiment_families WHERE class_name = ?",
-                [class_name]).fetchall()
-            family_ids = [fid for fid, path in families
-                          if normalize_strategy_path(path) == target]
             trials: list[TrialRecord] = []
-            for fid in family_ids:
+            for fid in self._strategy_family_ids(conn, strategy_path, class_name):
                 rows = conn.execute(
                     "SELECT trial_id, family_id, trial_key, parameters, status, started_at, "
                     "finished_at, traceback_digest, safe_summary, archived "
@@ -394,6 +392,30 @@ class ExperimentRegistry:
             return trials
 
         return self._db.transaction(_tx)
+
+    def close_interrupted_strategy_trials(self, strategy_path: str, class_name: str, *, finished_at) -> int:
+        """Fail every still-RUNNING trial of one strategy file + class, in any family. Run before counting
+        ``strategy_trials``: a trial stranded by a crash in an older family (the data or code changed since)
+        is a selection attempt and must stay in the denominator. One evaluation runs at a time."""
+        def _tx(conn):
+            closed = 0
+            for fid in self._strategy_family_ids(conn, strategy_path, class_name):
+                closed += len(conn.execute(
+                    "UPDATE experiment_trials SET status = ?, finished_at = ?, safe_summary = ? "
+                    "WHERE family_id = ? AND status = ? RETURNING trial_id",
+                    [TRIAL_FAILED, finished_at, INTERRUPTED_SUMMARY, fid, TRIAL_RUNNING]).fetchall())
+            return closed
+
+        return self._db.transaction(_tx)
+
+    @staticmethod
+    def _strategy_family_ids(conn, strategy_path: str, class_name: str) -> list[str]:
+        """Paths compare repo-relative, so ./strategies/x.py and /repo/strategies/x.py are one strategy."""
+        target = normalize_strategy_path(strategy_path)
+        families = conn.execute(
+            "SELECT family_id, strategy_path FROM experiment_families WHERE class_name = ?",
+            [class_name]).fetchall()
+        return [fid for fid, path in families if normalize_strategy_path(path) == target]
 
     def set_trial_archived(self, trial_id: str, archived: bool) -> None:
         tid = trial_id
@@ -471,28 +493,53 @@ class ExperimentRegistry:
 
     def open_holdout(self, artifact_id: str, *, opened_at, passed: bool,
                      detail: str = "") -> None:
-        aid = artifact_id
-
         def _tx(conn):
-            arow = conn.execute(
-                "SELECT state FROM strategy_artifacts WHERE artifact_id = ?", [aid]).fetchone()
-            if arow is None:
-                raise UnknownArtifact(aid)
-            if conn.execute("SELECT 1 FROM holdout_access_log WHERE artifact_id = ?",
-                            [aid]).fetchone() is not None:
-                raise HoldoutAlreadyOpened(
-                    f"artifact {aid} holdout is write-once and was already opened")
-            self._refuse_overlapping_strategy_holdout(conn, aid)
-            conn.execute(
-                "INSERT INTO holdout_access_log (artifact_id, opened_at, passed, detail) "
-                "VALUES (?, ?, ?, ?)", [aid, opened_at, bool(passed), detail])
+            self._insert_holdout_access(conn, artifact_id, opened_at, passed, detail)
             if not passed:
-                # a failed holdout is a one-way trip -- retire the version so it can
-                # never be re-tuned and re-tested under a different name.
-                conn.execute("UPDATE strategy_artifacts SET state = ? WHERE artifact_id = ?",
-                             [ARTIFACT_STATE_RETIRED, aid])
+                self._retire_artifact(conn, artifact_id)
 
         return self._db.transaction(_tx)
+
+    def begin_holdout(self, artifact_id: str, *, opened_at) -> None:
+        """Record the access before any holdout backtest runs, so the window counts as revealed
+        even if the run fails. The row reads as not passed until `finish_holdout` settles it."""
+        self._db.transaction(lambda conn: self._insert_holdout_access(
+            conn, artifact_id, opened_at, False, HOLDOUT_IN_PROGRESS))
+
+    def finish_holdout(self, artifact_id: str, *, passed: bool, detail: str = "") -> None:
+        """Settle a holdout begun with `begin_holdout`, once."""
+        def _tx(conn):
+            row = conn.execute("SELECT detail FROM holdout_access_log WHERE artifact_id = ?",
+                               [artifact_id]).fetchone()
+            if row is None:
+                raise UnknownArtifact(artifact_id)
+            if row[0] != HOLDOUT_IN_PROGRESS:
+                raise HoldoutAlreadyOpened(f"artifact {artifact_id} holdout was already settled")
+            conn.execute("UPDATE holdout_access_log SET passed = ?, detail = ? WHERE artifact_id = ?",
+                         [bool(passed), detail, artifact_id])
+            if not passed:
+                self._retire_artifact(conn, artifact_id)
+
+        return self._db.transaction(_tx)
+
+    def _insert_holdout_access(self, conn, artifact_id: str, opened_at, passed: bool, detail: str) -> None:
+        if conn.execute("SELECT state FROM strategy_artifacts WHERE artifact_id = ?",
+                        [artifact_id]).fetchone() is None:
+            raise UnknownArtifact(artifact_id)
+        if conn.execute("SELECT 1 FROM holdout_access_log WHERE artifact_id = ?",
+                        [artifact_id]).fetchone() is not None:
+            raise HoldoutAlreadyOpened(
+                f"artifact {artifact_id} holdout is write-once and was already opened")
+        self._refuse_overlapping_strategy_holdout(conn, artifact_id)
+        conn.execute("INSERT INTO holdout_access_log (artifact_id, opened_at, passed, detail) "
+                     "VALUES (?, ?, ?, ?)", [artifact_id, opened_at, bool(passed), detail])
+
+    @staticmethod
+    def _retire_artifact(conn, artifact_id: str) -> None:
+        # a failed holdout is a one-way trip -- retire the version so it can
+        # never be re-tuned and re-tested under a different name.
+        conn.execute("UPDATE strategy_artifacts SET state = ? WHERE artifact_id = ?",
+                     [ARTIFACT_STATE_RETIRED, artifact_id])
 
     def opened_holdout_windows(self, strategy_path: str, class_name: str) -> list[dict]:
         return self._db.transaction(

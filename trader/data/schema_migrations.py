@@ -31,6 +31,7 @@ SP2 Plan 1 owns 90–94 and uses **90** (``ai_controller_epochs``).
 SP2 Plan 2 uses 95 (simulated decisions) and 96 (simulated outcomes).
 SP2 Plan 3 owns 100–104 and uses **100** (``discretionary_scope_checks``).
 SP2c Plan 1 owns 110–114 and uses **110** (``evaluation_claims``) and **111** (``backtest_judgments``).
+SP2c Plan 3 uses **120** (``shadow_results``); 121–124 stay unused.
 
 ``SchemaMigrator`` is deliberately storage-agnostic about *which* file it
 targets — it operates on whatever ``DuckDBConnection`` it is constructed

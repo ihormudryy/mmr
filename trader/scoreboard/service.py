@@ -4,12 +4,13 @@ from __future__ import annotations
 import datetime as dt
 import json
 import logging
-from typing import Any, Callable, Optional
+from typing import Any, Callable, Mapping, Optional
 
 from trader.scoreboard.ports import session_date_et
 from trader.scoreboard.report import ReportInputs, build_report
 from trader.scoreboard.round_trips import project_round_trips
 from trader.scoreboard.session_ledger import SessionFacts, experiment_fills
+from trader.scoreboard.shadow_ingest import verified_shadow_rows
 from trader.scoreboard.store import ScoreboardStore
 
 logger = logging.getLogger(__name__)
@@ -19,7 +20,8 @@ EXPERIMENT_NOT_FOUND = "EXPERIMENT_NOT_FOUND"
 
 class ScoreboardService:
     def __init__(self, *, store: ScoreboardStore, db: Any, experiments: Any, ledger: Any, book: Any, links: Any,
-                 calendar: Any, now: Callable[[], dt.datetime], outbox: Any = None):
+                 calendar: Any, now: Callable[[], dt.datetime], outbox: Any = None,
+                 shadow_owed: Optional[Callable[[], Mapping[str, Mapping[str, Any]]]] = None):
         self.store = store
         self.db = db
         self.experiments = experiments
@@ -29,6 +31,7 @@ class ScoreboardService:
         self.calendar = calendar
         self.outbox = outbox
         self._now = now
+        self._shadow_owed = shadow_owed              # None: no ai_paper stack, so no shadow book can be COMPLETE
 
     # -- derived tables --------------------------------------------------------
 
@@ -77,7 +80,8 @@ class ScoreboardService:
         if experiment is None and experiment_id is not None:
             return {"label": "PAPER", "error_code": EXPERIMENT_NOT_FOUND, "experiment_id": experiment_id}
         if experiment is None:
-            return build_report(self._inputs(None, [], [], [], [], [], [], [], []))
+            shadow, shadow_warnings = self._shadow_inputs()
+            return build_report(self._inputs(None, [], [], [], [], [], [], [], shadow_warnings, **shadow))
         exp_id = experiment.experiment_id
         warnings = [{"code": "FILL_OUTSIDE_SESSION",
                      "detail": f"fill {piece.exec_id} on {piece.session_date} (not an XNYS session) is in the "
@@ -86,6 +90,7 @@ class ScoreboardService:
                     if not self.calendar.is_session(piece.session_date)]
         incidents = [i for i in self.store.incidents()
                      if exp_id in i["key"] or i["kind"].startswith("BENCHMARK")]
+        shadow, shadow_warnings = self._shadow_inputs()
         return build_report(self._inputs(
             experiment,
             self.store.fetch("equity_daily", {"experiment_id": exp_id}),
@@ -94,7 +99,26 @@ class ScoreboardService:
             self.store.fetch("ai_costs", {"experiment_id": exp_id}),
             self.store.fetch("simulated_decisions", {"experiment_id": exp_id}),
             self.store.fetch("simulated_outcomes", {"experiment_id": exp_id}),
-            incidents, warnings))
+            incidents, warnings + shadow_warnings, **shadow))
+
+    def _shadow_inputs(self) -> tuple[dict, list[dict]]:
+        """Every shadow row, digest re-checked (an edited row reads as INCOMPLETE and raises a warning), and the
+        sessions each judgment owes. Owed sessions that cannot be read leave every shadow book unproven."""
+        rows, tampered = verified_shadow_rows(self.store)
+        warnings = [{"code": "SHADOW_ROW_TAMPERED",
+                     "detail": f"shadow row {t['record_id']} of judgment {t['judgment_id']} differs from its "
+                               "sealed body; its result is not counted"} for t in tampered]
+        owed = None
+        if self._shadow_owed is not None:
+            try:
+                owed = self._shadow_owed()
+            except Exception as exc:                     # a tampered judgment or a bad window: no book is COMPLETE
+                warnings.append({"code": "SHADOW_WINDOWS_UNKNOWN",
+                                 "detail": f"the shadow windows could not be read ({type(exc).__name__}: {exc}); "
+                                           "no shadow book can be COMPLETE"})
+        for warning in warnings:
+            logger.error("scoreboard: %s", warning["detail"])
+        return {"shadow_rows": rows, "shadow_owed": owed}, warnings
 
     def trips(self, experiment_id: str) -> dict:
         """Ruling 19: per-trip identity and quantities from the stored projection, ordered by opened_at."""
@@ -121,14 +145,14 @@ class ScoreboardService:
         return _verify(self, experiment_id)
 
     def _inputs(self, experiment, rows, adjustments, trips, ai_costs, sim_decisions, sim_outcomes, incidents,
-                warnings):
+                warnings, shadow_rows=(), shadow_owed=None):
         return ReportInputs(
             experiment=experiment, rows=rows, adjustments=adjustments, trips=trips,
             spy_closes=self.book.closes(), spy_version=self.book.current_version(),
             spy_provider=self.book.provider(), ai_costs=ai_costs, sim_decisions=sim_decisions,
             sim_outcomes=sim_outcomes, incidents=incidents,
             warnings=warnings, outbox=None if self.outbox is None else self.outbox.counts(),
-            calendar=self.calendar)
+            calendar=self.calendar, shadow_rows=shadow_rows, shadow_owed=shadow_owed)
 
 
 def _trip_view(row: dict) -> dict:

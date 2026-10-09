@@ -23,7 +23,7 @@ def _three_days(store):
 def test_migrations_are_idempotent_and_in_range(migrator):
     assert apply_scoreboard_migrations(migrator) is True
     assert apply_scoreboard_migrations(migrator) is False
-    assert {v for v in migrator.applied_versions() if v >= 60} == {60, 61, 62, 63, 64, 95, 96}
+    assert {v for v in migrator.applied_versions() if v >= 60} == {60, 61, 62, 63, 64, 95, 96, 120}
 
 
 def test_sealed_insert_roundtrips_nulls_as_null(store):

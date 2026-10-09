@@ -33,7 +33,8 @@ def test_ai_service_does_not_merge_the_common_env():
 
 def test_ai_sees_its_two_key_pairs_and_the_trader_public_key_only(ai):
     assert visible_rpc_files(ai) == service_rpc_files("ai") == {
-        "ai_supervisor.key", "ai_supervisor.pub", "ai_research.key", "ai_research.pub", "trader.pub"}
+        "ai_supervisor.key", "ai_supervisor.pub", "ai_research.key", "ai_research.pub", "trader.pub",
+        "research.pub"}
 
 
 def visible_config_files(service) -> set[str]:

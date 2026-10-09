@@ -556,6 +556,12 @@ _compose_rpc_key_files() {
         | sed -E 's|^.*/||' | sort -u
 }
 
+# Single-file binds under keys/private (the research signing key). Same trap as the RPC keys.
+_compose_private_key_files() {
+    grep -oE '\$\{HOME\}/\.config/mmr/keys/private/[a-z_.]+' "$BUILDDIR/docker-compose.yml" \
+        | sed -E 's|^.*/||' | sort -u
+}
+
 _require_rpc_keys() {
     local keys_dir="$HOME/.config/mmr/keys/rpc"
     local missing="" name
@@ -569,6 +575,26 @@ _require_rpc_keys() {
         echo "Run ./docker.sh -k (mmr keys init in the keygen container) first."
         exit 1
     fi
+}
+
+# True when compose would start the research service (the opt-in ai profile). Compose itself decides, so
+# environment, .env, quoting and "*" are honoured. If compose cannot say, assume it runs (fail closed).
+_research_service_active() {
+    local services
+    services=$($COMPOSE -f "$BUILDDIR/docker-compose.yml" config --services 2>/dev/null) || return 0
+    grep -qx research <<<"$services"
+}
+
+# The research service binds the host signing key file; a missing file makes Docker create a directory.
+_require_signing_key() {
+    local name
+    for name in $(_compose_private_key_files); do
+        if [[ ! -f "$HOME/.config/mmr/keys/private/$name" || -L "$HOME/.config/mmr/keys/private/$name" ]]; then
+            echo "Error: $HOME/.config/mmr/keys/private/$name is missing or not a regular file."
+            echo "Create it once on the host: mmr keys init-signing (or restore it from backup)."
+            exit 1
+        fi
+    done
 }
 
 ensure_split_config() {
@@ -616,6 +642,9 @@ reclaim_build_cache() {
 
 up() {
     _require_rpc_keys
+    if _research_service_active; then
+        _require_signing_key
+    fi
     ensure_split_config
     check_env
     print_api_keys
@@ -1009,10 +1038,11 @@ keys() {
 # touched. Each container decides pass/fail itself from the shared
 # principals.rpc_files_for formula.
 KEYCHECK_PROJECT="mmr-keycheck"
-KEYCHECK_SERVICES="trader strategy dashboard cli scheduler data ai"
+KEYCHECK_SERVICES="trader strategy dashboard cli scheduler data ai research"
 
 key_check() {
     _require_rpc_keys
+    _require_signing_key
     local compose_args=(-p "$KEYCHECK_PROJECT" -f "$BUILDDIR/docker-compose.yml"
                         -f "$BUILDDIR/docker-compose.test.override.yml")
     local failed="" svc
@@ -1027,6 +1057,7 @@ key_check() {
     $COMPOSE "${compose_args[@]}" down --remove-orphans || true
     $RUNTIME volume rm "${KEYCHECK_PROJECT}_mmr_db_data" >/dev/null 2>&1 || true
     $RUNTIME volume rm "${KEYCHECK_PROJECT}_mmr_ai_data" >/dev/null 2>&1 || true
+    $RUNTIME volume rm "${KEYCHECK_PROJECT}_mmr_research_data" >/dev/null 2>&1 || true
     if [[ -n "$failed" ]]; then
         echo "Key check FAILED for:$failed. Do not cut over."
         exit 1

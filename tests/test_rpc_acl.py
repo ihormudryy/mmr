@@ -9,7 +9,7 @@ from tests.rpc_identity_fixtures import (
     ServedStack, build_full_production_registry, make_identities,
 )
 from trader.messaging import principals
-from trader.messaging.principals import HUMAN, STRATEGY_ACL, TRADER_ACL
+from trader.messaging.principals import HUMAN, RESEARCH_ACL, STRATEGY_ACL, TRADER_ACL
 from trader.messaging.production_api import TypedStrategyControlPort
 from trader.messaging.typed_rpc import RpcCaller, TypedRpcRegistry, TypedRpcRemoteError
 from trader.trading.command_coordinator import CommandRequest
@@ -169,12 +169,15 @@ def test_every_strategy_method_has_an_entry():
 
 def test_every_registration_in_the_source_has_an_entry():
     pattern = re.compile(r"\.register\(\s*['\"](query|command|feed)['\"],\s*['\"]([a-z_]+)['\"]")
-    found = set()
+    research_surface = ROOT / "trader" / "research" / "research_surface.py"
+    found, found_research = set(), set()
     for path in [*ROOT.joinpath("trader").rglob("*.py"), *ROOT.joinpath("web").rglob("*.py")]:
-        found |= set(pattern.findall(path.read_text()))
-    assert found, "registration scan found nothing"
+        (found_research if path == research_surface else found).update(pattern.findall(path.read_text()))
+    assert found and found_research, "registration scan found nothing"
     missing = found - set(TRADER_ACL) - set(STRATEGY_ACL)
     assert not missing, missing
+    # The research server's own methods are checked against its own table, just as strictly.
+    assert not found_research - set(RESEARCH_ACL), found_research - set(RESEARCH_ACL)
 
 
 def test_forwarded_call_is_authorized_as_trader_not_on_behalf_of():

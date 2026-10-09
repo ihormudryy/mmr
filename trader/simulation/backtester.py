@@ -54,6 +54,15 @@ class BacktestConfig:
     # executes at bar t+1's open. ``same_close`` reproduces the (lookahead-
     # biased) legacy behavior and is only intended for regression tests.
     fill_policy: str = 'next_open'
+    # Warm-up (SP2c spec 7): bars before trading_start only feed the strategy's state. Their signals
+    # are dropped, nothing fills, no cost is charged, and equity starts at initial_capital here.
+    # Known limit: a stateful strategy is not told; it still believes a dropped warm-up BUY happened.
+    trading_start: Optional[dt.datetime] = None
+
+    def __post_init__(self) -> None:
+        if self.trading_start is not None and (self.trading_start.tzinfo is None
+                                               or self.trading_start.utcoffset() is None):
+            raise ValueError("BacktestConfig.trading_start must be timezone-aware")
 
 
 @dataclass
@@ -346,11 +355,13 @@ class Backtester:
         if not all_data:
             raise ValueError('no historical data available for any conids')
 
-        # Merge all data into a single timeline sorted by timestamp
-        combined = pd.concat(
-            [df.assign(conid=conid) for conid, df in all_data.items()],
-            axis=0
-        ).sort_index()
+        # One timeline ordered by (timestamp, conid). Bars of several conids share a timestamp, and when the gross
+        # cap admits only some of a bar's signals, their order decides which fill. Both sorts are stable: the
+        # default quicksort orders ties differently for frames of different lengths, so a longer run would not
+        # repeat a shorter one (issue #96).
+        combined = (pd.concat([df.assign(conid=conid) for conid, df in all_data.items()], axis=0)
+                    .sort_values('conid', kind='stable')
+                    .sort_index(kind='stable'))
 
         # Walk forward bar-by-bar, building an expanding window for each conid.
         # To avoid lookahead bias: when a strategy emits a signal while
@@ -481,14 +492,21 @@ class Backtester:
                 signal_risk=signal.risk,
             ))
 
+        trading_start = None if self.config.trading_start is None else pd.Timestamp(self.config.trading_start)
+        warmup_signals_dropped = 0
+
         for timestamp, group in combined.groupby(combined.index):
+            stamp = pd.Timestamp(timestamp)
+            warming = trading_start is not None and (
+                stamp.tz_localize('UTC') if stamp.tzinfo is None else stamp) < trading_start
+
             # Snapshot per-conid bars at this timestamp
             bars_this_ts: Dict[int, pd.DataFrame] = {}
             for conid in group['conid'].unique():
                 bars_this_ts[conid] = group[group['conid'] == conid].drop(columns=['conid'])
 
             # 0. Live paper automation: track session equity, flatten before the close.
-            if live_rules is not None:
+            if live_rules is not None and not warming:
                 live_rules.mark(timestamp, last_equity)
                 if positions and live_rules.flatten_due(timestamp):
                     for conid in list(positions):
@@ -502,7 +520,7 @@ class Backtester:
                     pending_signals = [p for p in pending_signals if p[0].action != Action.BUY]
 
             # 1. Execute any signals queued from the previous bar at THIS bar's open
-            if self.config.fill_policy == 'next_open' and pending_signals:
+            if not warming and self.config.fill_policy == 'next_open' and pending_signals:
                 still_pending = []
                 for signal, conid, signal_ts in pending_signals:
                     bar = bars_this_ts.get(conid)
@@ -601,6 +619,9 @@ class Backtester:
                 signal = strategy.on_bar(full_prices, state, idx)
                 if not signal:
                     continue
+                if warming:
+                    warmup_signals_dropped += 1     # a warm-up signal never fills, not even at the first open
+                    continue
 
                 if self.config.fill_policy == 'same_close':
                     # Legacy lookahead-biased path: fill at this bar's close
@@ -612,6 +633,9 @@ class Backtester:
                 else:
                     # Realistic path: queue for next bar's open
                     pending_signals.append((signal, conid, timestamp))
+
+            if warming:
+                continue
 
             # 4. Track equity (cash + mark-to-market positions)
             portfolio_value = cash
@@ -627,6 +651,9 @@ class Backtester:
             # Time-in-market: count bars where at least one position is open.
             if positions:
                 bars_in_market += 1
+
+        if trading_start is not None:
+            logging.info(f'warm-up before {trading_start}: dropped {warmup_signals_dropped} signals')
 
         # Build equity curve
         equity_curve = pd.Series(equity_values, index=equity_timestamps)

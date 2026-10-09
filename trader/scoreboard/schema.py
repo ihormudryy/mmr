@@ -1,4 +1,4 @@
-"""Journal migrations 60-64: the scoreboard tables (Plan 5 owns 60-69); SP2 Plan 2 adds 95-96."""
+"""Journal migrations 60-64: the scoreboard tables (Plan 5 owns 60-69); SP2 Plan 2 adds 95-96; SP2c Plan 3 adds 120."""
 from __future__ import annotations
 
 from typing import Any
@@ -108,6 +108,18 @@ _OUTBOX = (
         last_error VARCHAR, sent_at TIMESTAMPTZ, telegram_message_id BIGINT)""",
 )
 
+_SHADOW = (
+    """CREATE TABLE IF NOT EXISTS shadow_results (
+        record_id VARCHAR PRIMARY KEY, judgment_id VARCHAR NOT NULL, deployment_version VARCHAR,
+        session_date DATE NOT NULL, verdict VARCHAR NOT NULL CHECK (verdict IN ('DEPLOY','SHADOW','REJECT')),
+        case_digest VARCHAR NOT NULL, status VARCHAR NOT NULL CHECK (status IN ('COMPLETE','INCOMPLETE')),
+        reason VARCHAR, pnl_usd DOUBLE, fees_usd DOUBLE, trades INTEGER, end_equity_usd DOUBLE,
+        bar_size VARCHAR NOT NULL, body_digest VARCHAR NOT NULL, recorded_at TIMESTAMPTZ NOT NULL,
+        UNIQUE (judgment_id, session_date),
+        CHECK ((status = 'COMPLETE') = (pnl_usd IS NOT NULL)))""",
+    "CREATE INDEX IF NOT EXISTS idx_shadow_results_version ON shadow_results(deployment_version)",
+)
+
 MIGRATIONS = (
     (60, "scoreboard_core", _CORE),
     (61, "scoreboard_round_trips", _ROUND_TRIPS),
@@ -116,6 +128,7 @@ MIGRATIONS = (
     (64, "scoreboard_outbox", _OUTBOX),
     (95, "sp2_simulated_decisions", _SIMULATED),
     (96, "sp2_simulated_outcomes", _OUTCOMES),
+    (120, "sp2c_shadow_results", _SHADOW),
 )
 
 

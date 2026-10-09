@@ -354,6 +354,34 @@ class TestArtifactAndHoldout:
         with pytest.raises(HoldoutAlreadyOpened):
             registry.open_holdout(aid, opened_at=T0, passed=True)
 
+    def test_a_begun_holdout_counts_as_opened_before_it_is_settled(self, registry):
+        fid, tid = self._succeeded_trial(registry)
+        aid = registry.seal_artifact(fid, selected_trial_id=tid,
+                                     selected_parameters={"RANGE_MINUTES": 30}, sealed_at=T0)
+        registry.begin_holdout(aid, opened_at=T0)
+        assert registry.get_artifact(aid).holdout_opened is True
+        with pytest.raises(HoldoutAlreadyOpened):
+            registry.begin_holdout(aid, opened_at=T0)
+        with pytest.raises(HoldoutAlreadyOpened):
+            registry.open_holdout(aid, opened_at=T0, passed=True)
+        registry.finish_holdout(aid, passed=True, detail="dd 2.1%")
+        assert registry.get_artifact(aid).holdout_passed is True
+        assert registry.get_artifact(aid).state == ARTIFACT_STATE_CANDIDATE
+        with pytest.raises(HoldoutAlreadyOpened):
+            registry.finish_holdout(aid, passed=False)
+
+    def test_a_failed_finish_retires_the_artifact_and_finish_needs_a_begin(self, registry):
+        fid, tid = self._succeeded_trial(registry)
+        aid = registry.seal_artifact(fid, selected_trial_id=tid,
+                                     selected_parameters={"RANGE_MINUTES": 30}, sealed_at=T0)
+        with pytest.raises(UnknownArtifact):
+            registry.finish_holdout(aid, passed=True)
+        registry.begin_holdout(aid, opened_at=T0)
+        registry.finish_holdout(aid, passed=False, detail="interrupted")
+        assert registry.get_artifact(aid).state == ARTIFACT_STATE_RETIRED
+        with pytest.raises(HoldoutAlreadyOpened):
+            registry.finish_holdout(aid, passed=True)
+
     def test_open_holdout_unknown_artifact_raises(self, registry):
         with pytest.raises(UnknownArtifact):
             registry.open_holdout("nope", opened_at=T0, passed=True)

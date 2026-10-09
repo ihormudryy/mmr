@@ -13,7 +13,7 @@ from typing import Any
 
 from trader.research.artifact import ARTIFACT_STATE_RETIRED
 from trader.research.attestation import AttestationRepository, build_attestation
-from trader.research.bundle import ResearchBundle
+from trader.research.bundle import BundleError, ResearchBundle
 from trader.research.canonical import sha256_digest
 from trader.research.eligibility import STATE_PAPER_ELIGIBLE, EligibilityDecisionRepository, Ruleset
 from trader.research.experiment_registry import ExperimentRegistry
@@ -24,7 +24,13 @@ ATTESTATION_LIFETIME = dt.timedelta(days=90)
 
 
 class AttestExportError(Exception):
-    """The artifact cannot be attested; the message says what is missing."""
+    """The artifact cannot be attested; the message says what is missing.
+
+    ``code`` names the refusal for a caller that answers with codes; ``ATTEST_EXPORT_FAILED`` alone is worth a retry."""
+
+    def __init__(self, message: str, code: str = 'ATTEST_FAILED'):
+        super().__init__(message)
+        self.code = code
 
 
 def bundle_dir_name(manifest_digest: str) -> str:
@@ -35,41 +41,63 @@ def _rows(db: Any, sql: str, params: list) -> list:
     return db.transaction(lambda conn: conn.execute(sql, params).fetchall())
 
 
-def _single(db: Any, sql: str, params: list, error: str) -> str:
+def _single(db: Any, sql: str, params: list, error: str, code: str = 'ATTEST_FAILED') -> str:
     rows = _rows(db, sql, params)
     if len(rows) != 1:
-        raise AttestExportError(error)
+        raise AttestExportError(error, code)
     return rows[0][0]
+
+
+def check_attestable(research_db: Any, artifact_id: str, ruleset: Ruleset = PAPER_V1) -> tuple:
+    """The review-independent preconditions of an attestation, as (registry, family, decision)."""
+    registry = ExperimentRegistry(research_db)
+    artifact = registry.get_artifact(artifact_id)
+    if artifact is None:
+        raise AttestExportError(f'unknown artifact {artifact_id}', 'ARTIFACT_UNKNOWN')
+    short_id = artifact_id[:12]
+    if artifact.state == ARTIFACT_STATE_RETIRED or artifact.holdout_passed is not True:
+        raise AttestExportError(
+            f'artifact {short_id} has no passed holdout (state {artifact.state}, holdout passed '
+            f'{artifact.holdout_passed}); only an artifact whose holdout passed can be attested',
+            'ARTIFACT_NOT_ATTESTABLE')
+    family = registry.get_family(artifact.family_id)
+    if family is None:
+        raise AttestExportError(f'artifact {short_id} names an unknown family', 'ARTIFACT_NOT_ATTESTABLE')
+    decision_digest = _single(
+        research_db, 'SELECT decision_digest FROM eligibility_decisions WHERE artifact_id = ?',
+        [artifact_id], f'artifact {short_id} must have exactly one eligibility decision', 'DECISION_MISSING')
+    decision = EligibilityDecisionRepository(research_db).get(decision_digest)
+    if decision is None:
+        raise AttestExportError(f'eligibility decision {decision_digest[:12]} cannot be read back',
+                                'DECISION_MISSING')
+    if decision.state != STATE_PAPER_ELIGIBLE:
+        raise AttestExportError(
+            f'artifact {short_id} is {decision.state}, not {STATE_PAPER_ELIGIBLE}; nothing to attest',
+            'DECISION_NOT_ELIGIBLE')
+    if decision.ruleset_digest != ruleset.digest:
+        raise AttestExportError(
+            f'decision was made under ruleset {decision.ruleset_name} {decision.ruleset_digest[:12]}, '
+            f'attestation requires {ruleset.name} {ruleset.digest[:12]}', 'RULESET_MISMATCH')
+    return registry, family, decision
+
+
+def check_stored_attestation(research_db: Any, artifact_id: str, decision_digest: str, review_digest: str,
+                             signer: Any, now: dt.datetime) -> None:
+    """Refuse when the attestation already stored for this decision and review is expired or by another key."""
+    existing = _rows(research_db,
+                     'SELECT payload_digest FROM eligibility_attestations '
+                     'WHERE eligibility_decision_digest = ? AND review_digest = ?',
+                     [decision_digest, review_digest])
+    if existing:
+        _refuse_stale_attestation(research_db, existing[0][0], artifact_id[:12], signer, now)
 
 
 def attest_and_export(research_db: Any, *, artifact_id: str, signer: Any,
                       artifacts_root: Path, now: dt.datetime,
                       ruleset: Ruleset = PAPER_V1) -> Path:
-    registry = ExperimentRegistry(research_db)
-    artifact = registry.get_artifact(artifact_id)
-    if artifact is None:
-        raise AttestExportError(f'unknown artifact {artifact_id}')
+    registry, family, decision = check_attestable(research_db, artifact_id, ruleset)
+    decision_digest = decision.digest
     short_id = artifact_id[:12]
-    if artifact.state == ARTIFACT_STATE_RETIRED or artifact.holdout_passed is not True:
-        raise AttestExportError(
-            f'artifact {short_id} has no passed holdout (state {artifact.state}, holdout passed '
-            f'{artifact.holdout_passed}); only an artifact whose holdout passed can be attested')
-    family = registry.get_family(artifact.family_id)
-    if family is None:
-        raise AttestExportError(f'artifact {short_id} names an unknown family')
-    decision_digest = _single(
-        research_db, 'SELECT decision_digest FROM eligibility_decisions WHERE artifact_id = ?',
-        [artifact_id], f'artifact {short_id} must have exactly one eligibility decision')
-    decision = EligibilityDecisionRepository(research_db).get(decision_digest)
-    if decision is None:
-        raise AttestExportError(f'eligibility decision {decision_digest[:12]} cannot be read back')
-    if decision.state != STATE_PAPER_ELIGIBLE:
-        raise AttestExportError(
-            f'artifact {short_id} is {decision.state}, not {STATE_PAPER_ELIGIBLE}; nothing to attest')
-    if decision.ruleset_digest != ruleset.digest:
-        raise AttestExportError(
-            f'decision was made under ruleset {decision.ruleset_name} {decision.ruleset_digest[:12]}, '
-            f'attestation requires {ruleset.name} {ruleset.digest[:12]}')
     review_digest = _single(
         research_db,
         'SELECT review_digest FROM operator_reviews WHERE artifact_id = ? '
@@ -92,7 +120,10 @@ def attest_and_export(research_db: Any, *, artifact_id: str, signer: Any,
         _refuse_stale_attestation(research_db, existing[0][0], short_id, signer, now)
     else:
         unsigned = _attestation(registry, family, artifact_id, decision, review, signer, now)
-        AttestationRepository(research_db).record(signer.sign(unsigned))
+        signed = signer.sign(unsigned)
+        stored_digest = AttestationRepository(research_db).record_unless_attested(signed)
+        if stored_digest != signed.payload_digest:     # another writer attested this decision first
+            _refuse_stale_attestation(research_db, stored_digest, short_id, signer, now)
     return _export(research_db, artifact_id, artifacts_root)
 
 
@@ -108,11 +139,12 @@ def _refuse_stale_attestation(research_db: Any, payload_digest: str, short_id: s
     if stored.expires_at <= now:
         raise AttestExportError(
             f'the attestation for artifact {short_id} expired at {stored.expires_at.isoformat()}; '
-            f'{_RENEWAL}')
+            f'{_RENEWAL}', 'ATTESTATION_EXPIRED')
     if stored.public_key_id != signer.public_key_id:
         raise AttestExportError(
             f'the attestation for artifact {short_id} was signed by key {stored.public_key_id}, '
-            f'not the current signing key {signer.public_key_id}; {_RENEWAL}')
+            f'not the current signing key {signer.public_key_id}; {_RENEWAL}',
+            'ATTESTATION_KEY_CHANGED')
 
 
 def _attestation(registry: ExperimentRegistry, family, artifact_id: str, decision, review,
@@ -165,12 +197,18 @@ def _remove_read_only_tree(path: Path) -> None:
 
 
 def _export(research_db: Any, artifact_id: str, artifacts_root: Path) -> Path:
-    artifacts_root.mkdir(parents=True, exist_ok=True)
     staging = artifacts_root / f'.export-{uuid.uuid4().hex}'
-    digest = ResearchBundle(research_db).export(artifact_id, staging).manifest_digest
-    final = artifacts_root / bundle_dir_name(digest)
-    if final.exists():
-        _remove_read_only_tree(staging)
+    try:
+        artifacts_root.mkdir(parents=True, exist_ok=True)
+        digest = ResearchBundle(research_db).export(artifact_id, staging).manifest_digest
+        final = artifacts_root / bundle_dir_name(digest)
+        if final.exists():
+            _remove_read_only_tree(staging)
+            return final
+        staging.rename(final)
         return final
-    staging.rename(final)
-    return final
+    except (OSError, BundleError) as exc:
+        if staging.exists():
+            _remove_read_only_tree(staging)
+        raise AttestExportError(f'the bundle could not be exported: {type(exc).__name__}',
+                                'ATTEST_EXPORT_FAILED') from exc

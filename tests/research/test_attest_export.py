@@ -1,10 +1,12 @@
 import datetime as dt
 import json
+import threading
 
 import pytest
 
 from tests.research.evaluation_fixtures import FIXED_NOW, export_eligible_bundle, holdout_ruleset
 from trader.automation.artifact_verifier import ArtifactVerifier
+from trader.research import attest_export
 from trader.research.attest_export import (
     ATTESTATION_LIFETIME, AttestExportError, attest_and_export, bundle_dir_name,
 )
@@ -89,3 +91,34 @@ def test_an_attestation_signed_by_another_key_is_not_exported_again(exported, tm
     assert other.public_key_id in str(refusal.value)
     assert 'evaluating again over a newer period' in str(refusal.value)
     assert not (tmp_path / 'x').exists()
+
+
+@pytest.mark.timeout(240)
+def test_two_instances_attesting_one_decision_store_one_attestation(exported, tmp_path):
+    barrier = threading.Barrier(2, timeout=30)
+    real = attest_export._attestation
+
+    def meet_before_recording(*args, **kwargs):
+        signed = real(*args, **kwargs)
+        barrier.wait()                          # both have seen "no attestation yet"
+        return signed
+    db = exported.research_db
+    db.execute("DELETE FROM eligibility_attestations")
+    results, errors = [], []
+
+    def attest(offset):
+        try:
+            results.append(attest_and_export(db, artifact_id=exported.artifact_id, signer=exported.signer,
+                                             artifacts_root=tmp_path / 'x',
+                                             now=FIXED_NOW + dt.timedelta(seconds=offset),
+                                             ruleset=holdout_ruleset()))
+        except Exception as exc:                # surfaced below
+            errors.append(exc)
+    with pytest.MonkeyPatch.context() as patch:
+        patch.setattr(attest_export, '_attestation', meet_before_recording)
+        threads = [threading.Thread(target=attest, args=(offset,)) for offset in (0, 1)]
+        [t.start() for t in threads]
+        [t.join() for t in threads]
+    assert errors == []
+    assert db.execute('SELECT count(*) FROM eligibility_attestations', fetch='one')[0] == 1
+    assert len(set(results)) == 1

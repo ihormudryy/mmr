@@ -340,17 +340,96 @@ are separate; each loader refuses the other kind.
 `./docker.sh -k` (or `mmr keys init` on a host install) before you redeploy;
 `./docker.sh -u` refuses to start while it is missing.
 
+**Research service (SP2c Plan 3): not armed.** The `research` container is in the
+opt-in `ai` profile and nothing starts it yet. It holds the research signing key,
+so it needs one more file than the other services. First start:
+1. `mmr keys init-signing` once on the host. It creates
+   `~/.config/mmr/keys/private/signing.pem` (mode 0600) and
+   `keys/verify/paper-automation.pem`, and never overwrites a private key.
+2. `./docker.sh -k` creates `research.key` and `research.pub`.
+3. `./docker.sh -K` must pass for `research` and every other service.
+4. Deploy the trader before or with research: `./docker.sh -b -u`, then
+   `docker compose --profile ai up -d research`. Two different failures:
+   - A trader build older than research (the row body shape differs): each
+     row is refused for good, kept in `shadow_failures` and never resent.
+   - A trader without `ai_paper` enabled serves none of the research
+     methods (`METHOD_NOT_ALLOWED`). Only the shadow worker waits: it logs
+     ERROR "does not serve this call" every tick and retries. With a pending
+     evaluation (a claim to recover or an end report owed), recovery and the
+     report fail loudly, the service exits and compose restarts research in
+     a loop until `ai_paper` is on. Nothing is lost. Enable `ai_paper` on the
+     trader before you start research.
+   `./docker.sh -u` refuses to start while the ai profile is active and
+   `signing.pem` is missing. A direct `docker compose` start skips that check.
+5. The research DB is fresh: `mmr_research_data` (`mmr_research.duckdb`). Its
+   ports 42106/42107 are not published to the host.
+
+Upgrade notes:
+- The backtester now orders bars with the same timestamp by conid (fix for a
+  day's trades that depended on later bars). The trace signature of such runs
+  changes, so re-running an old succeeded trial of an existing research family
+  fails loudly ("data or code changed"). An existing family needs a new
+  family (a new `mmr research evaluate`).
+- If the trader is down at start, research waits and retries (2 s, doubling to
+  30 s). It accepts no submit until it has recovered its open work.
+
+Open items:
+- Ruling 13: research mounts `mmr_db_data` (bars, like strategy). The owner
+  still has to confirm that this volume exposure is acceptable.
+- Ruling 17: renewal cases and the trader's forward evidence come with SP2c
+  Plan 5. A RENEWAL request is refused until then.
+- The signing key file owner inside the container: `load_signing_key` checks
+  mode `0600`, so the container user must own the bind. Check this on the
+  first start.
+- Known limit: a deterministic trader `INTERNAL_ERROR` on one stored shadow row
+  still ends the research worker, and compose restarts it in a loop. Fix the
+  cause at the trader. A per-row `VALIDATION_ERROR` does not loop; it goes to
+  `shadow_failures`. A busy trader (`SERVER_BUSY`) is retried like an
+  unreachable one.
+- Known limit: a crash, `docker compose stop` or any stop signal during an
+  evaluation spends its holdout window if the holdout was already opened (the
+  service waits only 5 s on a stop). An orphan case file may stay in
+  `artifacts/cases` (follow-up). When another research job dies, the service
+  closes its ports and waits up to 30 min for the running evaluation before it
+  exits. On a host run, a stop signal during that wait does not shorten it; in
+  Docker, `docker compose stop` ends it after about 10 s.
+- Known limit: the holdout ledger is per research DB. A host
+  `mmr research evaluate` and the research service (`mmr_research_data`) do
+  not see each other's holdouts, so they can reveal the same window twice.
+- Known limit: a shadow row sent before its DEPLOY judgment was registered as
+  a deployment version keeps a NULL `deployment_version`; a later registration
+  does not change it.
+
+Watch items (container log: `docker compose logs research`; the research
+tables are in `mmr_research.duckdb`; there is no `mmr` command for these yet):
+- A finished evaluation shows as `RUNNING` until the trader confirmed its end.
+  `research_requests.pending_report` is set meanwhile, and the log says
+  "not confirmed by the trader yet". It is sent again every tick. If the
+  trader refuses the end report, the log says "the case stays withheld".
+- A request that can never finish is `PARKED` with a reason. The log says
+  "evaluation ... parked ... needs the operator". It reads as `FAILED` without
+  a case, and the worker goes on. The trader's claim stays open and still counts
+  for the day.
+- A shadow case that can never be replayed is skipped; the log says
+  "shadow replay parked case". A shadow row the trader refused for good is in
+  `shadow_failures` with its code. The log says "refused for good" at ERROR.
+  Fix the cause, delete that row from `shadow_failures`, and the next tick
+  sends it again.
+
 0. **First setup / cutover (owner-run, in this order):**
    1. `./docker.sh -b` (image with `age` and the keygen entry point).
    2. `./docker.sh -k` (creates every missing keypair, as your host user).
    3. Cutover gate: `./docker.sh -K` (key check). It runs one short-lived
       container per service (`trader`, `strategy`, `dashboard`, `cli`,
-      `scheduler`, `data`) in a separate compose project `mmr-keycheck`, with
+      `scheduler`, `data`, `ai`, `research`) in a separate compose project `mmr-keycheck`, with
       `docker-compose.test.override.yml` (fake broker, `--simulation True`).
       Each container only runs `mmr keys check-mount <service>`: it must see
       exactly its own `.key`, its own `.pub` and its peers' `.pub`, those
       keys must load the way the service loads them at startup (own pair
-      matches, modes, Ed25519), and `service_hmac.key` must read empty. No service process starts, no port
+      matches, modes, Ed25519), and `service_hmac.key` must read empty.
+      `-K` needs `~/.config/mmr/keys/private/signing.pem` (run
+      `mmr keys init-signing` first); `research` must load it as at startup
+      (mode 0600, Ed25519, not an RPC key). No service process starts, no port
       is published and the running `mmr` stack is not touched. `-K` runs
       alone: combined with any other option (e.g. `-K -d`) it refuses before
       any Docker call. Abort the
@@ -436,7 +515,7 @@ harness holds its own controller epoch (lease 60 s). Stop the `ai` service
 before an acceptance run, or the harness waits on `CONTROLLER_EPOCH_HELD` and
 then fails.
 
-- AI paper controller (SP2): `./docker.sh -u` copies `ai.yaml` to `~/.config/mmr/` once; fill in the model ids and prices, then `docker compose --profile ai up -d ai`. Stop it with `docker compose --profile ai stop ai` (always before the SP1 acceptance run). Its health is the heartbeat file `/tmp/mmr_ai_heartbeat.json` inside the container. Its data volume `mmr_ai_data` is kept by `./docker.sh -d`; only `./docker.sh -c` removes volumes. Schema rule (no legacy data): `ai.duckdb` tables are edited in place, never upgraded; if a pre-release build ever created `ai.duckdb`, delete the `mmr_ai_data` volume (`docker volume rm mmr_mmr_ai_data`; Compose prefixes the project name `mmr`) before starting a newer one.
+- AI paper controller (SP2): `./docker.sh -u` copies `ai.yaml` to `~/.config/mmr/` once; fill in the model ids and prices, then `docker compose --profile ai up -d ai`. The signing key matters only when the research service runs (it is in the same `ai` profile): before `./docker.sh -u` with the `ai` profile active, or any start of `research`, run `mmr keys init-signing` once (a direct `docker compose` start skips the `./docker.sh` check). Stop it with `docker compose --profile ai stop ai` (always before the SP1 acceptance run). Its health is the heartbeat file `/tmp/mmr_ai_heartbeat.json` inside the container. Its data volume `mmr_ai_data` is kept by `./docker.sh -d`; only `./docker.sh -c` removes volumes. Schema rule (no legacy data): `ai.duckdb` tables are edited in place, never upgraded; if a pre-release build ever created `ai.duckdb`, delete the `mmr_ai_data` volume (`docker volume rm mmr_mmr_ai_data`; Compose prefixes the project name `mmr`) before starting a newer one.
 
 **Upgrade (SP2c Plan 2: judged deployments and versions).** Before the
 first deploy of this build:
@@ -503,7 +582,7 @@ first deploy of this build:
 1. Publish the initial risk policy (operator, once): `mmr ai-policy publish policy.yaml --reason "initial paper policy"`.
 2. Register the discretionary deployment (operator, once): `mmr ai-deployment register-discretionary --operator <name> --statement "<why>"`; note the printed digest.
 3. Edit `~/.config/mmr/ai.yaml`: model ids and prices (`roles:`, `pricing:`); `decisions.discretionary_deployment_digest`; the bracket of judged strategies (`decisions.ai_deployments`: stop and target fractions). Since SP2c Plan 2 only `aidv-` instances of ACTIVE judged versions are followed; `decisions.strategies` entries no longer trade and cost nothing (see the upgrade note above).
-4. Start it: `docker compose --profile ai up -d ai`. Stop it before the SP1 acceptance run.
+4. Start it: `docker compose --profile ai up -d ai`. If the research service runs too (same `ai` profile, e.g. `./docker.sh -u` with the profile active), run `mmr keys init-signing` once first; a direct `docker compose` start skips the `./docker.sh` check. Stop it before the SP1 acceptance run.
 5. Check: the heartbeat file, `mmr scoreboard` (books per baseline, AI cost with status), and `ai_rulings` / `ai_discovery_reads` in `ai.duckdb` for refusals and discovery coverage.
 
 The service never publishes or loosens policy. A role whose provider rejects its model is paused for 5 minutes at a time: Jev down blocks every ENTER, orchestrator down stops discovery and model closes; SP1's stops, targets and the 15:45 flatten are unaffected.

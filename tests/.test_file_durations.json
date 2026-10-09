@@ -344,7 +344,7 @@
   "tests/integration/test_automation_faults.py::TestSubsetRunsDoNotFabricateFullCoverage::test_a_partial_run_is_never_marked_passed": 5.09,
   "tests/integration/test_automation_faults.py::TestSubsetRunsDoNotFabricateFullCoverage::test_a_single_scenario_subset_still_reports_only_its_own_coverage": 5.09,
   "tests/integration/test_automation_faults.py::TestSubsetRunsDoNotFabricateFullCoverage::test_an_unknown_scenario_name_is_reported_not_silently_dropped": 5.09,
-  "tests/research/test_evaluation.py::test_a_benchmark_failure_does_not_spend_the_holdout": 29.05,
+  "tests/research/test_evaluation.py::test_a_benchmark_failure_after_the_holdout_ran_still_spends_it": 29.05,
   "tests/research/test_evaluation.py::test_a_comment_in_the_costs_config_keeps_the_family": 0.41,
   "tests/research/test_evaluation.py::test_a_real_cost_change_is_a_new_family": 0.43,
   "tests/research/test_evaluation.py::test_an_oversized_order_fails_the_liquidity_rule": 19.71,

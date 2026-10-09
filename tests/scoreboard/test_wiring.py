@@ -191,12 +191,29 @@ def test_ingest_reads_enter_sizes_from_the_command_ledger_and_sizes_with_sp1(pro
     assert stack.scoreboard.simulator._close_fills is close_fills
 
 
+def test_shadow_ingest_shares_the_scoreboard_store_the_judgments_and_the_versions(prod_stack):   # SP2c Plan 3
+    from trader.scoreboard.shadow_ingest import ShadowIngest
+    trader, stack = prod_stack
+    ingest = trader.shadow_ingest
+    assert isinstance(ingest, ShadowIngest) and ingest._store is stack.scoreboard.store
+    assert ingest._judgments is stack.ai_paper.judgments and ingest._versions is trader.ai_deployment_versions
+    assert ingest._config is trader.ai_paper_config.backtest_judge
+    assert stack.scoreboard.service._shadow_owed() == {}                   # the same judgments: none recorded yet
+
+
+def test_no_shadow_ingest_without_an_ai_paper_stack():
+    from types import SimpleNamespace
+    from trader.trading.command_stack import _build_shadow_ingest, _shadow_owed
+    assert _build_shadow_ingest(SimpleNamespace(ai_paper_config=object()), SimpleNamespace(), None) is None
+    assert _shadow_owed(SimpleNamespace(ai_paper_config=object()), None, lambda: None) is None
+
+
 def test_scoreboard_tables_live_in_the_journal_db_not_the_research_db(prod_stack):
     trader, _stack = prod_stack
     tables = {r[0] for r in trader.journal_db.execute(
         "SELECT table_name FROM information_schema.tables", fetch="all")}
     assert {"equity_daily", "round_trips", "benchmark_prices", "ai_costs", "simulated_decisions", "simulated_outcomes",
-            "telegram_outbox",
+            "telegram_outbox", "shadow_results",
             "scoreboard_seals", "scoreboard_incidents"} <= tables
     assert {60, 61, 62, 63, 64, 95, 96} <= {r[0] for r in trader.journal_db.execute(
         "SELECT version FROM schema_migrations", fetch="all")}

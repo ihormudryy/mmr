@@ -5,6 +5,13 @@ import pytest
 
 from trader.messaging.keys_cli import main
 from trader.messaging.principals import SERVICE_PRINCIPAL, rpc_files_for, service_rpc_files
+from trader.research.signing import generate_private_key_pem
+
+
+@pytest.fixture(autouse=True)
+def rpc_keys_dir(tmp_path, monkeypatch):
+    """The signing-key load refuses an RPC identity key; it must look at the test's keys, not the owner's."""
+    monkeypatch.setenv("MMR_RPC_KEYS_DIR", str(tmp_path / "rpc"))
 
 
 def _container_view(tmp_path, service, *, extra=(), missing=(), hmac=b""):
@@ -18,6 +25,11 @@ def _container_view(tmp_path, service, *, extra=(), missing=(), hmac=b""):
     rpc.mkdir()
     for name in (service_rpc_files(service) - set(missing)) | set(extra):
         shutil.copy2(host / name, rpc / name)
+    if service == "research":
+        (tmp_path / "private").mkdir(exist_ok=True)
+        signing = tmp_path / "private" / "signing.pem"
+        signing.write_bytes(generate_private_key_pem())
+        signing.chmod(0o600)
     hmac_file = tmp_path / "service_hmac.key"
     if hmac is not None:
         hmac_file.write_bytes(hmac)
@@ -40,6 +52,37 @@ def test_check_runs_in_a_service_container_without_the_keygen_marker(tmp_path, m
     monkeypatch.delenv("MMR_KEYGEN_CONTAINER", raising=False)
     code, out = _run(_container_view(tmp_path, "trader"))
     assert code == 0, out
+
+
+def test_a_signing_key_outside_research_fails_the_gate(tmp_path):
+    argv = _container_view(tmp_path, "trader")
+    (tmp_path / "private").mkdir()
+    (tmp_path / "private" / "signing.pem").write_text("x")
+    code, out = _run(argv)
+    assert code == 1 and "unexpected" in out and "signing.pem" in out
+
+
+@pytest.mark.parametrize("mode,content,error", [
+    (0o644, None, "InsecureKeyFile"),                  # a real key, readable by others
+    (0o600, b"not a key", "MalformedKey"),
+])
+def test_research_with_a_signing_key_that_does_not_load_fails_the_gate(tmp_path, mode, content, error):
+    argv = _container_view(tmp_path, "research")
+    signing = tmp_path / "private" / "signing.pem"
+    if content is not None:
+        signing.write_bytes(content)
+    key_bytes = signing.read_bytes()
+    signing.chmod(mode)
+    code, out = _run(argv)
+    assert code == 1 and "signing.pem" in out and error in out
+    assert key_bytes.decode(errors="replace").strip() not in out
+
+
+def test_research_without_its_signing_key_fails_the_gate(tmp_path):
+    argv = _container_view(tmp_path, "research")
+    (tmp_path / "private" / "signing.pem").unlink()
+    code, out = _run(argv)
+    assert code == 1 and "missing" in out and "signing.pem" in out
 
 
 @pytest.mark.parametrize("case", [

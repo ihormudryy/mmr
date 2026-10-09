@@ -141,7 +141,7 @@ def _neighbourhood(raw_neighbourhood: Any, params: Mapping[str, Any]) -> dict[st
     return neighbourhood
 
 
-def _tunables(strategy_file: Path, class_name: str) -> set[str]:
+def declared_tunables(strategy_file: Path, class_name: str) -> set[str]:
     module_spec = importlib.util.spec_from_file_location(f'_mmr_eval_{strategy_file.stem}', strategy_file)
     module = importlib.util.module_from_spec(module_spec)
     try:
@@ -205,11 +205,16 @@ def load_evaluation_spec(path: str | Path, *, universe_accessor: Any,
         loaded = yaml.safe_load(Path(path).read_text())
     except yaml.YAMLError as exc:
         raise EvaluationSpecError(f'spec: not valid YAML: {exc}') from exc
-    raw = _mapping(loaded or {}, 'spec')
+    return build_evaluation_spec(_mapping(loaded or {}, 'spec'), universe_accessor=universe_accessor,
+                                 costs_config=costs_config, repo_root=repo_root)
+
+
+def build_evaluation_spec(raw: Mapping[str, Any], *, universe_accessor: Any,
+                          costs_config: ExecutionCostsConfig, repo_root: Path) -> EvaluationSpec:
     name = str(_require(raw, 'name'))
     strategy_path, strategy_file = _strategy_file(str(_require(raw, 'strategy')), repo_root)
     class_name = str(_require(raw, 'class'))
-    tunables = _tunables(strategy_file, class_name)
+    tunables = declared_tunables(strategy_file, class_name)
 
     params = dict(_mapping(_require(raw, 'params'), 'params'))
     unknown = sorted((k for k in params if k not in tunables), key=str)

@@ -10,7 +10,7 @@ import logging
 import os
 from concurrent.futures import ProcessPoolExecutor
 from dataclasses import dataclass
-from typing import Any, Mapping, Sequence
+from typing import Any, Mapping, Optional, Sequence
 
 import pandas as pd
 
@@ -48,6 +48,7 @@ class WindowJob:
     end: dt.datetime
     cost_multiplier: float
     replay: int = 0
+    trading_start: Optional[dt.datetime] = None
 
 
 @dataclass(frozen=True)
@@ -89,7 +90,7 @@ def run_window_job(env: RunEnvironment, job: WindowJob) -> WindowOutcome:
     config = BacktestConfig(
         start_date=job.start, end_date=job.end, initial_capital=env.account_equity,
         bar_size=BarSize.parse_str(env.bar_size), cost_model=costs,
-        order_notional=env.order_notional,
+        order_notional=env.order_notional, trading_start=job.trading_start,
         live_rules=PaperAutomationRules(max_gross_allocation=env.max_gross_allocation))
     result = Backtester(storage, config).run_from_module(
         env.strategy_file, env.class_name, list(env.conids),

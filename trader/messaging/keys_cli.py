@@ -24,6 +24,7 @@ from trader.messaging.rpc_keys import (
     restore_keys,
 )
 from trader.research.key_purpose import default_rpc_keys_dir
+from trader.research.signing import AttestationSigner, InsecureKeyFile, InvalidKeyType, MalformedKey
 
 KEYGEN_CONTAINER_ENV = "MMR_KEYGEN_CONTAINER"
 DEFAULT_BACKUP_DIR = Path("~/.local/share/mmr/backups/rpc_keys")
@@ -56,6 +57,9 @@ def add_keys_parser(sub) -> argparse.ArgumentParser:
     source.add_argument('--identity-stdin', action='store_true', help='Read the age identity from stdin')
     source.add_argument('--identity-file', help='Read the age identity from this file')
     restore_p.add_argument('--keys-dir', help='Override the RPC keys directory')
+    signing_p = keys_sub.add_parser(
+        'init-signing', help='Create the research signing key and its public half (never overwrites)')
+    signing_p.add_argument('--config-dir', help='Override ~/.config/mmr')
     check_p = keys_sub.add_parser(
         'check-mount', help='Inside a service container: check it sees exactly its own keys '
                             '(run by ./docker.sh -K)')
@@ -81,6 +85,51 @@ def _print_init(rows, rotate: Optional[str], out: TextIO) -> None:
             "during the switch, and clients retry.\n")
 
 
+def _default_config_dir() -> Path:
+    return Path.home() / ".config" / "mmr"
+
+
+def init_signing_keys(config_dir: Path, out: TextIO) -> None:
+    """Create keys/private/signing.pem (0600) and keys/verify/paper-automation.pem; never overwrite a private key.
+
+    A private key without its public half (a restore) gets the public half derived from it.
+    """
+    from trader.automation.paper_materials import default_key_paths, ensure_signing_keypair
+    from trader.research.signing import AttestationSigner
+
+    private_pem, _verify_dir, public_pem = default_key_paths(config_dir)
+    if public_pem.exists() and not private_pem.exists():
+        raise RpcKeyError(f"{public_pem} exists but {private_pem} does not; restore the private key "
+                          "from backup or remove the public key by hand")
+    if private_pem.exists() and not public_pem.exists():
+        signer = AttestationSigner.from_key_file(str(private_pem))
+        public_pem.parent.mkdir(parents=True, exist_ok=True)
+        public_pem.write_bytes(signer.public_key_pem())
+        os.chmod(public_pem, 0o644)
+        status = "public half derived"
+    else:
+        _signer, reused = ensure_signing_keypair(private_key_path=private_pem, public_key_path=public_pem)
+        status = "unchanged" if reused else "created"
+    out.write(f"Research signing key ({status}):\n  private {private_pem}\n  public  {public_pem}\n")
+
+
+def _run_init_signing(args, in_container: bool, out: TextIO) -> int:
+    from trader.automation.paper_materials import PaperMaterialsError
+    from trader.research.signing import InsecureKeyFile, InvalidKeyType, MalformedKey
+
+    if in_container:
+        out.write("Refusing to create the signing key inside a container: run it on the host.\n")
+        return 2
+    config_dir = Path(args.config_dir).expanduser() if args.config_dir else _default_config_dir()
+    try:
+        init_signing_keys(config_dir, out)
+    except (RpcKeyError, PaperMaterialsError, InsecureKeyFile, InvalidKeyType, MalformedKey,
+            OSError) as exc:
+        out.write(f"Error: {exc}\n")
+        return 1
+    return 0
+
+
 def _read_identity(args, stdin) -> bytes:
     if args.identity_stdin:
         return stdin.buffer.read() if hasattr(stdin, 'buffer') else stdin.read().encode()
@@ -98,6 +147,24 @@ def _identity_problem(principal: str | None, keys_dir: Path) -> list[str]:
     return []
 
 
+SIGNING_KEY_HOLDERS = frozenset({"research"})
+SIGNING_KEY_NAME = "signing.pem"
+
+
+def signing_key_problems(service: str, private_dir: Path) -> list[str]:
+    """The research signing key is visible in its holder only (SP2c spec 5.1), and loads there as at startup."""
+    key = Path(private_dir) / SIGNING_KEY_NAME
+    if service not in SIGNING_KEY_HOLDERS:
+        return [f"unexpected {key}"] if key.exists() else []
+    if not key.is_file():
+        return [f"missing {key}"]
+    try:
+        AttestationSigner.from_key_file(str(key))
+    except (InsecureKeyFile, InvalidKeyType, MalformedKey, OSError) as exc:
+        return [f"{key} does not load ({type(exc).__name__})"]      # the class only: never key material
+    return []
+
+
 def _mount_problems(service: str, keys_dir: Path, hmac_file: Path) -> list[str]:
     expected = service_rpc_files(service)
     seen = frozenset(os.listdir(keys_dir)) if keys_dir.is_dir() else frozenset()
@@ -106,6 +173,7 @@ def _mount_problems(service: str, keys_dir: Path, hmac_file: Path) -> list[str]:
     if not problems:
         for principal in service_principals(service):
             problems += _identity_problem(principal, keys_dir)
+    problems += signing_key_problems(service, keys_dir.parent / "private")
     if not hmac_file.exists():
         problems.append(f"{hmac_file} is not mounted (expected /dev/null)")
     elif hmac_file.read_bytes():
@@ -136,6 +204,8 @@ def run_keys_command(args, *, in_container: bool, stdin=None, out: TextIO = None
     stdin = stdin or sys.stdin
     if getattr(args, 'keys_action', None) == 'check-mount':
         return check_mount(args, out)
+    if getattr(args, 'keys_action', None) == 'init-signing':
+        return _run_init_signing(args, in_container, out)
     if in_container and os.environ.get(KEYGEN_CONTAINER_ENV) != "1":
         out.write(
             "Refusing to manage RPC keys inside a service container: keys/rpc is a tmpfs "
@@ -156,7 +226,7 @@ def run_keys_command(args, *, in_container: bool, stdin=None, out: TextIO = None
             restored = restore_keys(Path(args.archive), _keys_dir(args), _read_identity(args, stdin))
             out.write(f"Restored RPC keys for: {', '.join(restored)}\n")
         else:
-            out.write("usage: mmr keys {init,backup,restore,check-mount} ...\n")
+            out.write("usage: mmr keys {init,init-signing,backup,restore,check-mount} ...\n")
             return 2
     except RpcKeyError as exc:
         out.write(f"Error: {exc}\n")

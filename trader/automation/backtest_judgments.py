@@ -28,6 +28,7 @@ from trader.research.evaluation_case import (
     CaseRefused, EvaluationCase, initial_deploy_allowed, load_case_verify_keys, load_verified_case, offered_menu,
     renewal_forward_complete,
 )
+from trader.research.shadow_window import TRACKED_VERDICTS
 from trader.research.strategy_key import split_strategy_key
 
 JUDGMENT_DOMAIN = "mmr.backtest-judgment.v1"
@@ -185,6 +186,13 @@ class BacktestJudgments:
         row = self._db.execute("SELECT judgment_id FROM backtest_judgments WHERE case_digest = ?",
                                [case_digest], fetch="one")
         return None if row is None else self.get(row[0])
+
+    def tracked(self) -> list[BacktestJudgment]:
+        """Every judgment with a shadow window (DEPLOY, SHADOW, REJECT); a broken seal raises JudgmentRefused."""
+        marks = ", ".join("?" for _ in TRACKED_VERDICTS)
+        rows = self._db.execute(f"SELECT {_COLUMNS} FROM backtest_judgments WHERE verdict IN ({marks}) "
+                                "ORDER BY recorded_at, judgment_id", list(TRACKED_VERDICTS), fetch="all")
+        return [_sealed_judgment(row) for row in rows or []]
 
     def _existing_reply(self, judgment_id: str, body_digest: str) -> Optional[dict]:
         """A retry returns the first receipt without re-reading the case file."""

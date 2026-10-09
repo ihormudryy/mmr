@@ -1771,6 +1771,21 @@ _ACTIVE_ORDER_STATUSES = frozenset({
 
 _KNOWN_TERMINAL_ORDER_STATUSES = frozenset({"Filled", "Cancelled", "ApiCancelled", "Inactive"})
 
+# The broker accepted the order. PendingSubmit and ApiPending are local echoes and
+# PendingCancel may hide either outcome, so none of them proves acceptance (same
+# split as ``liquidation_service._BROKER_HEALTHY``).
+_BROKER_ACCEPTED_ORDER_STATUSES = frozenset({"Submitted", "PreSubmitted"})
+
+
+def _entry_accepted(entries: list) -> bool:
+    """Broker proof that an entry order was accepted: an accepted status or any fill."""
+    return any(
+        getattr(order, "status", None) in _BROKER_ACCEPTED_ORDER_STATUSES
+        or getattr(order, "status", None) == "Filled"
+        or (getattr(order, "filled_quantity", 0) or 0) > 0
+        for order in entries
+    )
+
 
 def _is_terminal_order(order: BrokerOrderRow) -> bool:
     return order.deleted or order.status not in _ACTIVE_ORDER_STATUSES
@@ -2825,10 +2840,12 @@ class OutcomeReconciler:
         that ends SUBMITTED), dispatches its bracket under ``og-{command_id}``.
         Resolve from that group's broker rows, judged by the ENTRY order:
 
-        - entry working or filled -> RESOLVED (exit legs alone never resolve it);
+        - entry accepted (Submitted, PreSubmitted) or filled -> RESOLVED (exit
+          legs alone never resolve it);
         - entry and every other order in a known terminal status, nothing
           filled, on a COMPLETE enumeration -> REJECTED ``BROKER_REJECTED``;
-        - no entry row, an unknown or unreadable status, or an incomplete
+        - no entry row, an entry only pending (PendingSubmit, ApiPending,
+          PendingCancel), an unknown or unreadable status, or an incomplete
           enumeration -> unresolved. Absence alone never fails the command."""
         found = self._orders.find_by_order_ref(
             row.account_id, encode_order_ref(f"og-{row.command_id}"),
@@ -2845,12 +2862,7 @@ class OutcomeReconciler:
             "order_group_id": f"og-{row.command_id}",
             "broker_statuses": statuses,
         }
-        entry_accepted = any(
-            order.status in _ACTIVE_ORDER_STATUSES or order.status == "Filled"
-            or (getattr(order, "filled_quantity", 0) or 0) > 0
-            for order in entries
-        )
-        if entry_accepted:
+        if _entry_accepted(entries):
             self._resolve_command_only(row, {**outcome, "broker_acknowledged": True}, now)
             return True
         any_active_or_fill = any(

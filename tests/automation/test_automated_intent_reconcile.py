@@ -63,7 +63,7 @@ def test_a_submitted_buy_is_scheduled_for_reconciliation(submitted_buy):
     assert submitted_buy.schedule.calls >= 1
 
 
-@pytest.mark.parametrize("status", ["Submitted", "PreSubmitted", "PendingSubmit"])
+@pytest.mark.parametrize("status", ["Submitted", "PreSubmitted"])
 def test_a_buy_the_broker_shows_working_is_resolved(submitted_buy, status):
     orders = BrokerOrders([order(status), order("PreSubmitted", leg="stop")])
     assert reconcile(submitted_buy, orders).resolved
@@ -127,3 +127,11 @@ def test_a_resolved_buy_no_longer_blocks_later_checks(submitted_buy):
     assert [r.command_id for r in submitted_buy.ledger.unresolved_for_account(ACCOUNT)] == [submitted_buy.command_id]
     reconcile(submitted_buy, BrokerOrders([order("Submitted")]))
     assert submitted_buy.ledger.unresolved_for_account(ACCOUNT) == []
+
+
+@pytest.mark.parametrize("status", ["PendingSubmit", "ApiPending", "PendingCancel"])
+def test_an_ambiguous_entry_status_with_a_stop_row_stays_submitted(submitted_buy, status):
+    """PR #126 review: a local echo (or a pending cancel) does not prove the broker accepted the entry."""
+    orders = BrokerOrders([order(status), order("PreSubmitted", leg="stop")])
+    assert not reconcile(submitted_buy, orders).resolved
+    assert submitted_buy.ledger.get(submitted_buy.command_id).state == "SUBMITTED"

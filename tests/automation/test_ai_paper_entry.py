@@ -274,7 +274,7 @@ def test_no_links_for_foreign_order_refs(world):
 # A SUBMITTED command keeps reconciliation_safe() false, so experiment stop refused
 # RECONCILIATION_INCOMPLETE and the kill flatten was never proven FLAT after any AI entry.
 
-def _entry_reconciler(world, found, *, complete=True):
+def _entry_reconciler(world, found, *, complete=True, closes=None):
     from types import SimpleNamespace
     from trader.trading.command_coordinator import OutcomeReconciler
     refs, alerts = [], []
@@ -285,7 +285,7 @@ def _entry_reconciler(world, found, *, complete=True):
     orders = SimpleNamespace(find_by_order_ref=find_by_order_ref, enumeration_complete=lambda: complete)
     reconciler = OutcomeReconciler(
         journal=world.journal, ledger=world.ledger, orders=orders, strategy=SimpleNamespace(),
-        alerts=SimpleNamespace(raise_alert=lambda *a: alerts.append(a)), now=world.clock, closes=None)
+        alerts=SimpleNamespace(raise_alert=lambda *a: alerts.append(a)), now=world.clock, closes=closes)
     return reconciler, refs
 
 
@@ -361,3 +361,15 @@ def test_an_entry_the_broker_has_not_shown_stays_submitted(world):
     reconciler, _ = _entry_reconciler(world, [])
     assert not reconciler.reconcile_once(receipt.command_id, NOW).resolved
     assert world.ledger.get(receipt.command_id).state == "SUBMITTED"         # never rejected by absence alone
+
+
+# PR #126 review: a local echo is not acceptance (liquidation_service treats it as UNKNOWN).
+
+@pytest.mark.parametrize("status", ["PendingSubmit", "ApiPending", "PendingCancel"])
+def test_an_ambiguous_entry_status_with_a_stop_row_stays_submitted(world, status):
+    receipt = world.submit()
+    found = [_bracket_row("entry", status), _bracket_row("stop", "PreSubmitted")]
+    reconciler, _ = _entry_reconciler(world, found)
+    assert not reconciler.reconcile_once(receipt.command_id, NOW).resolved
+    assert world.ledger.get(receipt.command_id).state == "SUBMITTED"
+

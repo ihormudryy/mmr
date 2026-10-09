@@ -151,7 +151,7 @@ account never calls Alpaca, even with the setting on.
 | **momentum** | Single auto slot | Armed with the old fixture bundle, which no longer passes the provenance or binding check (see the 2026-10 note). `auto_execute` off. Enable it before a soak (`INSTALLED` ≠ dispatchable). |
 | orb_* / ensemble | Optional propose | Human review on `/cc` if `auto_execute: propose`. |
 | global | Always present | Enable/Disable/Undeploy hidden by design. |
-| `ai` service (SP2) | AI paper decision loop | Not started. Needs model ids and prices in `ai.yaml`, the discretionary digest and the `decisions.strategies` map (see "Starting the AI paper decision loop"). |
+| `ai` service (SP2) | AI paper decision loop | Not started. Needs model ids and prices in `ai.yaml` and the discretionary digest (see "Starting the AI paper decision loop"); strategy BUYs come only from ACTIVE judged versions. |
 
 Kill switches: Scaling **Deactivate**; `pause_trading`; `automation.enabled: false` + restart strategy.
 
@@ -436,13 +436,73 @@ harness holds its own controller epoch (lease 60 s). Stop the `ai` service
 before an acceptance run, or the harness waits on `CONTROLLER_EPOCH_HELD` and
 then fails.
 
-- AI paper controller (SP2): `./docker.sh -u` copies `ai.yaml` to `~/.config/mmr/` once; fill in the model ids and prices, then `docker compose --profile ai up -d ai`. Stop it with `docker compose --profile ai stop ai` (always before the SP1 acceptance run). Its health is the heartbeat file `/tmp/mmr_ai_heartbeat.json` inside the container. Its data volume `mmr_ai_data` is kept by `./docker.sh -d`; only `./docker.sh -c` removes volumes. Schema rule (no legacy data): `ai.duckdb` tables are edited in place, never upgraded; if a pre-release build ever created `ai.duckdb`, delete the `mmr_ai_data` volume (`docker volume rm mmr_ai_data`) before starting a newer one.
+- AI paper controller (SP2): `./docker.sh -u` copies `ai.yaml` to `~/.config/mmr/` once; fill in the model ids and prices, then `docker compose --profile ai up -d ai`. Stop it with `docker compose --profile ai stop ai` (always before the SP1 acceptance run). Its health is the heartbeat file `/tmp/mmr_ai_heartbeat.json` inside the container. Its data volume `mmr_ai_data` is kept by `./docker.sh -d`; only `./docker.sh -c` removes volumes. Schema rule (no legacy data): `ai.duckdb` tables are edited in place, never upgraded; if a pre-release build ever created `ai.duckdb`, delete the `mmr_ai_data` volume (`docker volume rm mmr_mmr_ai_data`; Compose prefixes the project name `mmr`) before starting a newer one.
+
+**Upgrade (SP2c Plan 2: judged deployments and versions).** Before the
+first deploy of this build:
+
+- Back up, stop, then start the changed tables fresh. They were edited in
+  place (owner rule: no legacy data, no upgrade), and neither
+  `CREATE TABLE IF NOT EXISTS` nor the migration ledger changes a table that
+  already exists. In this order:
+  1. `./docker.sh -B before_sp2c_plan2` (DuckDB files only; `ai.duckdb` is
+     not in it and is deleted on purpose below).
+  2. `docker compose --profile ai stop ai`, then
+     `docker compose --profile ai rm -f ai` (a stopped container still holds
+     the volume, so step 4 would fail), then `./docker.sh -d`.
+  3. Drop the tables. Run this from the repo root (Compose reads
+     `docker-compose.yml` there). Paths are the `trader.yaml` defaults; use
+     yours if you changed `duckdb_path` or `journal_duckdb_path`:
+     ```bash
+     docker compose run --rm --no-deps --entrypoint python scheduler -c "
+     import duckdb
+     d = '/home/trader/.local/share/mmr/data/'
+     j = duckdb.connect(d + 'mmr_journal.duckdb')
+     j.execute('DROP TABLE IF EXISTS ai_paper_decisions')
+     j.execute('DELETE FROM schema_migrations WHERE version = 56')
+     j.close()
+     t = duckdb.connect(d + 'mmr.duckdb')
+     for name in ('strategy_signal_record', 'strategy_signal_record_state', 'strategy_signal_record_generation'):
+         t.execute('DROP TABLE IF EXISTS ' + name)
+     t.close()"
+     ```
+     The `schema_migrations` row matters: without deleting it, migration 56
+     never creates `ai_paper_decisions` again (all its statements are
+     `IF NOT EXISTS`, so the replay is safe). The strategy service creates
+     the three `strategy_signal_record*` tables on start.
+  4. Delete the ai volume: `docker volume ls | grep mmr_ai_data` shows its
+     full name (Compose prefixes the project name `mmr`), then
+     `docker volume rm mmr_mmr_ai_data`.
+  5. `./docker.sh -b -u`. Journal migrations 115 (`ai_deployment_versions`)
+     and 116 (`ai_deployment_withdrawals`) apply on start.
+- Strategy entries need a judged version. A strategy-kind `ENTER` without
+  `deployment_version` and `source_digest` is refused
+  `DEPLOYMENT_VERSION_REQUIRED`, so BUYs of a plain config strategy listed in
+  `decisions.strategies` no longer enter; only `aidv-` instances, which the
+  strategy service loads from ACTIVE versions, do. Such an unbound BUY also
+  costs nothing: the `ai` service notes it `STRATEGY_NOT_BOUND` and makes no
+  model call and records no baseline.
+- Stop a judged version (operator, final): `mmr ai-deployment withdraw sha256:<version> --reason "<why>"`.
+  Its `aidv-` instance unloads and new entries are refused; exits and open
+  brackets are untouched. While an entry of that version is being sent the
+  withdrawal is refused (`WITHDRAWAL_ENTRY_IN_FLIGHT`): retry after the
+  entry's send returns. `mmr ai-deployment version sha256:<version>` shows
+  its state.
+- SP1 acceptance now needs an SP2c-judged deployment version:
+  `mmr experiment acceptance run --place-orders --deployment-version sha256:...`.
+  The harness registers nothing and no longer uses the `ai_research` key
+  (runbook P0.5a).
+- Verify keys (`~/.config/mmr/keys/verify/*.pem`): when you rotate one, keep
+  the old `.pem` while any version judged under it can still be renewed,
+  that is, while it is `EXPIRED` and not yet `SUPERSEDED` (or withdrawn or
+  ended). The trader re-reads a version's judgment and signed case with
+  these keys.
 
 **Starting the AI paper decision loop (SP2):**
 
 1. Publish the initial risk policy (operator, once): `mmr ai-policy publish policy.yaml --reason "initial paper policy"`.
 2. Register the discretionary deployment (operator, once): `mmr ai-deployment register-discretionary --operator <name> --statement "<why>"`; note the printed digest.
-3. Edit `~/.config/mmr/ai.yaml`: model ids and prices (`roles:`, `pricing:`); `decisions.discretionary_deployment_digest`; one `decisions.strategies.<strategy_name>` entry per strategy whose BUYs the bot may follow (its sealed deployment digest, stop and target fractions).
+3. Edit `~/.config/mmr/ai.yaml`: model ids and prices (`roles:`, `pricing:`); `decisions.discretionary_deployment_digest`; the bracket of judged strategies (`decisions.ai_deployments`: stop and target fractions). Since SP2c Plan 2 only `aidv-` instances of ACTIVE judged versions are followed; `decisions.strategies` entries no longer trade and cost nothing (see the upgrade note above).
 4. Start it: `docker compose --profile ai up -d ai`. Stop it before the SP1 acceptance run.
 5. Check: the heartbeat file, `mmr scoreboard` (books per baseline, AI cost with status), and `ai_rulings` / `ai_discovery_reads` in `ai.duckdb` for refusals and discovery coverage.
 

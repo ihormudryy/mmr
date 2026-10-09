@@ -24,7 +24,7 @@ SIGNAL_CURSOR = "signals"
 SOURCE_EVENT_ID = re.compile(r"^sig-[0-9a-f]{32}$")
 RECORD_GENERATION = re.compile(r"^gen-[0-9a-f]{32}$")
 _COLUMNS = ("opportunity_id, signal_cursor, strategy_name, conid, action, probability, signal_time, recorded_at, "
-            "state")
+            "deployment_digest, deployment_version, source_digest, state")
 
 
 class SignalIntakeError(Exception):
@@ -59,14 +59,18 @@ def _parse_signal(raw: Any) -> SignalOpportunity:
         recorded_at = parse_aware(raw.get("recorded_at"), "recorded_at")
     except ValueError as exc:
         raise SignalIntakeError("SIGNAL_MALFORMED", f"{source}: {exc}") from None
-    return SignalOpportunity(source, _nonnegative_int(raw.get("cursor"), "cursor"), raw["strategy_name"], conid,
-                             raw["action"], probability, signal_time, recorded_at)
+    binding = {name: raw.get(name) for name in ("deployment_digest", "deployment_version", "source_digest")}
+    try:
+        return SignalOpportunity(source, _nonnegative_int(raw.get("cursor"), "cursor"), raw["strategy_name"], conid,
+                                 raw["action"], probability, signal_time, recorded_at, **binding)
+    except ValueError as exc:
+        raise SignalIntakeError("SIGNAL_MALFORMED", f"{source}: {exc}") from None
 
 
 def _opportunity(row: tuple) -> tuple[SignalOpportunity, str]:
     values = list(row)
     return SignalOpportunity(values[0], int(values[1]), values[2], int(values[3]), values[4], values[5],
-                             to_utc(values[6]), to_utc(values[7])), values[8]
+                             to_utc(values[6]), to_utc(values[7]), values[8], values[9], values[10]), values[11]
 
 
 class SignalIntake:
@@ -110,9 +114,10 @@ class SignalIntake:
                 if conn.execute("SELECT 1 FROM ai_opportunities WHERE opportunity_id = ?",
                                 [s.opportunity_id]).fetchone():
                     continue                                              # redelivered: not a new opportunity
-                conn.execute("INSERT INTO ai_opportunities VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'NEW', NULL, ?, ?)",
+                conn.execute("INSERT INTO ai_opportunities VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'NEW', NULL, ?, ?)",
                              [s.opportunity_id, s.signal_cursor, s.strategy_name, s.conid, s.action, s.probability,
-                              s.signal_time, s.recorded_at, now, now])
+                              s.signal_time, s.recorded_at, s.deployment_digest, s.deployment_version,
+                              s.source_digest, now, now])
                 new.append(s.opportunity_id)
             set_cursor_in_tx(conn, SIGNAL_CURSOR, next_cursor, now, generation)
             return new

@@ -41,7 +41,9 @@ def test_cursors_are_monotonic_and_reads_page(record):
     assert (page.next_cursor, page.oldest_retained_cursor, page.gap) == (3, 1, False)
     view = page.signals[0].to_json()
     assert set(view) == {"cursor", "source_event_id", "strategy_name", "conid", "action", "probability",
-                         "signal_time", "recorded_at"}
+                         "signal_time", "recorded_at", "deployment_digest", "deployment_version",
+                         "source_digest"}
+    assert (view["deployment_digest"], view["deployment_version"], view["source_digest"]) == (None, None, None)
     assert SOURCE_EVENT_ID.fullmatch(view["source_event_id"]) and view["conid"] == 265598
     assert view["signal_time"] == (T0 + dt.timedelta(minutes=1)).isoformat()
 
@@ -229,3 +231,32 @@ def test_a_replaced_record_with_the_same_high_water_has_a_new_generation(tmp_pat
     old_page, new_page = old.read(after_cursor=5, limit=10), new.read(after_cursor=5, limit=10)
     assert (old_page.next_cursor, new_page.next_cursor) == (5, 5)              # equal high water
     assert old_page.record_generation != new_page.record_generation
+
+
+BASE, VERSION, SOURCE = ("sha256:" + c * 64 for c in "bde")
+
+
+def bound_entry(**overrides):
+    fields = dict(strategy_name="aidv-0123456789abcdef", conid=265598, action="BUY", probability=0.5,
+                  signal_time=T0, deployment_digest=BASE, deployment_version=VERSION, source_digest=SOURCE)
+    return SignalEntry.create(**{**fields, **overrides})
+
+
+def test_the_deployment_binding_round_trips(record):
+    record.append(bound_entry())
+    (signal,) = record.read(0, 10).signals
+    assert (signal.entry.deployment_digest, signal.entry.deployment_version, signal.entry.source_digest) == (
+        BASE, VERSION, SOURCE)
+    assert signal.to_json()["deployment_version"] == VERSION
+
+
+@pytest.mark.parametrize("missing", ["deployment_digest", "deployment_version", "source_digest"])
+def test_a_partial_binding_is_refused(missing):
+    with pytest.raises(ValueError, match="all set"):
+        bound_entry(**{missing: None})
+
+
+@pytest.mark.parametrize("field", ["deployment_digest", "deployment_version", "source_digest"])
+def test_a_binding_that_is_not_a_digest_is_refused(field):
+    with pytest.raises(ValueError, match="all set"):
+        bound_entry(**{field: "sha256:abc"})

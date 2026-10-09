@@ -12,12 +12,17 @@ import pytest
 
 from tests.rpc_identity_fixtures import make_identities, write_keyset
 from tests.sp1_acceptance.test_acceptance_run import drive_session_to_flat, market
-from tests.sp1_fixtures import served_stack
+from tests.sp1_acceptance.judged import judged_served_stack
 from trader import mmr_cli
 from trader.mmr_cli import build_parser
 from trader.sdk import MMR
 
 ACCOUNT = "DU111111"
+
+
+def place_orders(served, account=ACCOUNT):
+    """A real run's flags: orders, the stack's judged version (SP2c ruling 18) and the confirmed account."""
+    return f"--place-orders --deployment-version {served.deployment_version} --confirm-account {account}"
 
 
 def _json(out):
@@ -35,7 +40,7 @@ def served_with_keys(tmp_path, loop_thread, monkeypatch, rpc_keys_dir):
     keys = write_keyset(rpc_keys_dir)
     monkeypatch.setenv("MMR_RPC_KEYS_DIR", str(rpc_keys_dir))
     monkeypatch.setenv("MMR_ACCEPTANCE_DIR", str(tmp_path / "acceptance"))
-    stack = served_stack(tmp_path, loop_thread, monkeypatch, identities=make_identities(keys=keys),
+    stack = judged_served_stack(tmp_path, loop_thread, monkeypatch, identities=make_identities(keys=keys),
                          acceptance_probe=True)
 
     def command_count():
@@ -108,30 +113,44 @@ def test_preflight_prints_stop_and_exits_one_when_not_clean(served_with_keys, cl
 
 
 def test_run_refuses_wrong_account_and_container(served_with_keys, cli, signing_key, monkeypatch):     # Focus 4
-    out = cli(f"experiment acceptance run --place-orders --confirm-account DU999999 --signing-key {signing_key}")
+    out = cli(f"experiment acceptance run {place_orders(served_with_keys, 'DU999999')} --signing-key {signing_key}")
     assert "ACCOUNT_MISMATCH" in out and cli.code == 1
     monkeypatch.setattr("trader.messaging.keys_cli.running_in_container", lambda: True)
-    out = cli(f"experiment acceptance run --place-orders --confirm-account {ACCOUNT} --signing-key {signing_key}")
+    out = cli(f"experiment acceptance run {place_orders(served_with_keys)} --signing-key {signing_key}")
     assert "HOST_ONLY" in out and "host only" in out
     assert served_with_keys.command_count() == 0
 
 
 def test_missing_supervisor_key_refuses_before_any_call(served_with_keys, cli, rpc_keys_dir, signing_key):
     (rpc_keys_dir / "ai_supervisor.key").unlink()
-    out = cli(f"experiment acceptance run --place-orders --confirm-account {ACCOUNT} --signing-key {signing_key}")
+    out = cli(f"experiment acceptance run {place_orders(served_with_keys)} --signing-key {signing_key}")
     assert "ai_supervisor.key" in out and served_with_keys.command_count() == 0
 
 
 def test_missing_cli_key_refuses_a_real_run_but_not_the_dry_run(served_with_keys, cli, rpc_keys_dir, signing_key):
     (rpc_keys_dir / "cli.key").unlink()
-    out = cli(f"experiment acceptance run --place-orders --confirm-account {ACCOUNT} --signing-key {signing_key}")
+    out = cli(f"experiment acceptance run {place_orders(served_with_keys)} --signing-key {signing_key}")
     assert "cli.key" in out and served_with_keys.command_count() == 0
     assert "dry run" in cli("experiment acceptance run")
 
 
 def test_place_orders_without_a_signing_key_is_refused_before_any_call(served_with_keys, cli):   # ruling 20
-    out = cli(f"experiment acceptance run --place-orders --confirm-account {ACCOUNT}")
+    out = cli(f"experiment acceptance run {place_orders(served_with_keys)}")
     assert "SIGNING_KEY_REQUIRED" in out and served_with_keys.command_count() == 0
+
+
+def test_place_orders_without_a_deployment_version_is_refused_before_any_call(served_with_keys, cli, signing_key):
+    out = cli(f"experiment acceptance run --place-orders --confirm-account {ACCOUNT} --signing-key {signing_key}")
+    assert "DEPLOYMENT_VERSION_REQUIRED" in out and cli.code == 1 and served_with_keys.command_count() == 0
+
+
+def test_a_resume_under_another_deployment_version_is_refused(served_with_keys, cli, signing_key, tmp_path):
+    from trader.acceptance.journal import RunJournal
+    journal = RunJournal(tmp_path / "acceptance" / "acc-20260717-abcdef")
+    journal.append("settings", {"settings": {"account_id": ACCOUNT, "deployment_version": "sha256:" + "0" * 64}})
+    out = cli(f"experiment acceptance run --run-id acc-20260717-abcdef {place_orders(served_with_keys)} "
+              f"--signing-key {signing_key}")
+    assert "DEPLOYMENT_VERSION_MISMATCH" in out and cli.code == 1 and served_with_keys.command_count() == 0
 
 
 def test_finish_without_a_signing_key_is_refused(served_with_keys, cli):
@@ -139,7 +158,7 @@ def test_finish_without_a_signing_key_is_refused(served_with_keys, cli):
 
 
 def test_a_resume_of_an_unknown_run_is_refused(served_with_keys, cli, signing_key):
-    out = cli(f"experiment acceptance run --run-id acc-20260717-ffffff --place-orders --confirm-account {ACCOUNT} "
+    out = cli(f"experiment acceptance run --run-id acc-20260717-ffffff {place_orders(served_with_keys)} "
               f"--signing-key {signing_key}")
     assert "RUN_NOT_FOUND" in out and served_with_keys.command_count() == 0
 
@@ -147,7 +166,7 @@ def test_a_resume_of_an_unknown_run_is_refused(served_with_keys, cli, signing_ke
 def test_run_and_finish_end_to_end_over_the_cli(served_with_keys, cli, signing_key, tmp_path):
     market(served_with_keys)
     served_with_keys.sim.script_target_fills([1])
-    out = cli(f"experiment acceptance run --place-orders --confirm-account {ACCOUNT} --signing-key {signing_key}",
+    out = cli(f"experiment acceptance run {place_orders(served_with_keys)} --signing-key {signing_key}",
               json_mode=True)
     data = _json(out)
     run_id = data["run_id"]
@@ -221,7 +240,7 @@ def test_finish_exit_status_follows_the_signed_report(monkeypatch, capsys, repor
 def test_a_passing_scenario_with_a_failing_signed_run_report_exits_nonzero(served_with_keys, cli, signing_key):
     market(served_with_keys)                                                     # review #35 r2
     served_with_keys.sim.script_target_fills([1])
-    out = cli(f"experiment acceptance run --place-orders --confirm-account {ACCOUNT} --signing-key {signing_key}")
+    out = cli(f"experiment acceptance run {place_orders(served_with_keys)} --signing-key {signing_key}")
     from trader.acceptance.scenario import RUN_STEPS
     assert all(f"[PASS] {name}\n" in out for name in RUN_STEPS) and "report passed: False" in out
     assert "B open, protected" not in out and cli.code == 1

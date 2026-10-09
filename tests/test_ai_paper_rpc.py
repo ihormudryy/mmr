@@ -9,11 +9,13 @@ import copy
 import datetime as dt
 from dataclasses import replace
 from types import SimpleNamespace
+from zoneinfo import ZoneInfo
 
 import pytest
 
 from tests.automation.ai_paper_fixtures import CONID, NOW, make_history, quote, snapshot
 from tests.automation.ai_paper_world import GOOD
+from tests.automation.judged_deployment import install_seeded_judgments, seed_judged_deployment
 from tests.rpc_identity_fixtures import ServedStack, make_identities
 from tests.test_command_stack import _trader
 from trader.automation.ai_paper_config import AiPaperConfig
@@ -29,6 +31,7 @@ from trader.trading.command_policy import CommandAuthorityPolicy
 
 ACCOUNT = "DU111111"
 GOOD_SORTED = {**GOOD, "conids": sorted(GOOD["conids"])}
+BUNDLE = "sha256:" + "b" * 64
 
 
 class FakeBroker:
@@ -88,6 +91,7 @@ def _served(tmp_path, monkeypatch, config, now=lambda: NOW, prepare=lambda trade
     import trader.trading.command_stack as command_stack
     import trader.trading.trading_runtime as trading_runtime
 
+    seeded = install_seeded_judgments(monkeypatch)
     broker, orders = FakeBroker(), FakeOrders()
     monkeypatch.setattr(command_stack, "TraderBrokerRiskSnapshotAuthority", lambda **kw: broker)
     monkeypatch.setattr(command_stack, "TraderQuoteAuthority", FakeQuotes)
@@ -109,7 +113,7 @@ def _served(tmp_path, monkeypatch, config, now=lambda: NOW, prepare=lambda trade
     attach_production_identity(stack.experiments, ids["trader"], registry)
     served = ServedStack({("trader", "command"): registry, ("trader", "query"): registry}, ids)
     served.stack, served.broker, served.orders, served.coordinator = stack, broker, orders, stack.coordinator
-    served.trader = trader
+    served.trader, served.seeded = trader, seeded
     return served
 
 
@@ -145,8 +149,24 @@ def publish(served, command_id="pol-1", limits=PAPER_LIMITS):
         "publish_ai_risk_policy", {"command_id": command_id, "limits": limits.to_json(), "reason": "start"}, dict)
 
 
+def register_version(served):
+    """A sealed, ACTIVE judged deployment (the bundle path has its own tests): its base and version digests."""
+    today = NOW.astimezone(ZoneInfo("America/New_York")).date()
+    return seed_judged_deployment(served.stack.ai_paper, served.seeded, GOOD, today=today)
+
+
 def register(served):
-    return command(served, "ai_research").call("register_ai_deployment", {"deployment": GOOD}, dict)["outcome"]["digest"]
+    return register_version(served)[0]
+
+
+def bound_enter_body(served, **changes):
+    """A strategy ENTER bound to a fresh judged version, as the ai controller builds it (SP2c ruling 9)."""
+    digest, version = register_version(served)
+    return enter_body(digest, deployment_version=version, source_digest=GOOD["strategy_digest"], **changes)
+
+
+def registration_body(deployment=GOOD, judgment_id="jdg-none"):
+    return {"judgment_id": judgment_id, "bundle_digest": BUNDLE, "deployment": deployment}
 
 
 def enter_body(digest="sha256:" + "a" * 64, **changes):
@@ -159,16 +179,15 @@ def enter_body(digest="sha256:" + "a" * 64, **changes):
 
 
 def valid_body(method):
-    return {"register_ai_deployment": {"deployment": GOOD},
+    return {"register_ai_deployment": registration_body(),
             "submit_ai_paper_decision": enter_body(),
             "publish_ai_risk_policy": {"command_id": "pol-x", "limits": PAPER_LIMITS.to_json(), "reason": "r"}}[method]
 
 
-def test_supervisor_publishes_and_research_registers(served):
+def test_supervisor_publishes_and_research_registration_needs_a_judgment(served):
     assert publish(served)["outcome"]["revision"] == 1
-    dep = command(served, "ai_research").call("register_ai_deployment", {"deployment": GOOD}, dict)
-    assert dep["state"] == "RESOLVED" and dep["outcome"]["digest"].startswith("sha256:")
-    assert dep["outcome"]["strategy_digest_provenance"] == "CLAIMED_NOT_VERIFIED"
+    dep = command(served, "ai_research").call("register_ai_deployment", registration_body(), dict)
+    assert (dep["state"], dep["error_code"]) == ("REJECTED", "JUDGMENT_MISSING")
 
 
 @pytest.mark.parametrize("principal,method", [
@@ -225,14 +244,15 @@ def test_policy_limits_on_the_wire_are_strict(served, bad):
 def test_an_invalid_deployment_is_refused_on_the_wire(served):
     with pytest.raises(TypedRpcRemoteError) as exc:
         command(served, "ai_research").call("register_ai_deployment",
-                                            {"deployment": {**GOOD, "conids": [True]}}, dict)
+                                            registration_body({**GOOD, "conids": [True]}), dict)
     assert exc.value.code == "VALIDATION_ERROR"
 
 
 def test_reregistering_with_reordered_conids_replays(served):
-    first = command(served, "ai_research").call("register_ai_deployment", {"deployment": GOOD}, dict)
+    first = command(served, "ai_research").call("register_ai_deployment", registration_body(), dict)
     again = command(served, "ai_research").call(
-        "register_ai_deployment", {"deployment": {**GOOD, "conids": list(reversed(GOOD["conids"]))}}, dict)
+        "register_ai_deployment",
+        registration_body({**GOOD, "conids": list(reversed(GOOD["conids"]))}), dict)
     assert again["command_id"] == first["command_id"] and again["outcome"] == first["outcome"]
 
 
@@ -258,16 +278,17 @@ def test_every_decision_is_refused_without_an_experiment(served):
 
 def test_end_to_end_enter_through_the_stack(served):
     publish(served)
-    digest = register(served)
+    body = bound_enter_body(served)
     started = command(served, "cli").call("start_experiment", {"command_id": "start-1", "reason": "go"}, dict)
     assert started["outcome"]["state"] == "ARMED", started
     served.stack.experiments.monitor.recover()                       # trader_service does this before readiness
-    out = command(served, "ai_supervisor").call("submit_ai_paper_decision", enter_body(digest), dict,
+    out = command(served, "ai_supervisor").call("submit_ai_paper_decision", body, dict,
                                                 controller_epoch=granted_epoch(served))
     assert out["state"] == "SUBMITTED", out
     ((group, proposal),) = served.orders.plans
     assert group == "og-aip-dec-00000001" and proposal.quantity == 499.0
-    assert served.stack.ai_paper.decision_store.links_for_order_ref("mmr:og-aip-dec-00000001")[0].digest == digest
+    link = served.stack.ai_paper.decision_store.links_for_order_ref("mmr:og-aip-dec-00000001")[0]
+    assert link.digest == body["deployment_digest"]
 
 
 def test_reads(served):
@@ -353,8 +374,9 @@ def test_the_service_refuses_a_bypass_of_the_allow_list(served):
                                               ("register_ai_deployment", "ai_research")])
 def test_a_wider_or_foreign_body_is_refused_on_the_wire(served, method, principal):
     body = discretionary_body(stock_types=["COMMON", "WARRANT"])
+    request = {"deployment": body} if method == "register_discretionary_deployment" else registration_body(body)
     with pytest.raises(TypedRpcRemoteError) as exc:
-        command(served, principal).call(method, {"deployment": body}, dict)
+        command(served, principal).call(method, request, dict)
     assert exc.value.code == "VALIDATION_ERROR"
 
 

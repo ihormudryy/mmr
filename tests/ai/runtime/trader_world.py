@@ -9,9 +9,9 @@ from pathlib import Path
 from typing import Any, Callable
 
 from tests.ai.fakes import config_text
+from tests.sp1_acceptance.judged import judged_served_stack
 from tests.sp1_acceptance.test_acceptance_run import entries_placed, market, settings as acceptance_settings
-from tests.sp1_fixtures import MSFT, OTHER, served_stack
-from trader.acceptance.scenario import deployment_record
+from tests.sp1_fixtures import MSFT, OTHER
 from trader.ai.controller import ExperimentWatch
 from trader.ai.engine import ProposedDecision
 from trader.ai.journal import AttemptJournal
@@ -75,7 +75,7 @@ class FlakyClient:
 
 
 class TraderWorld:
-    """Served SP1 trader, ARMED experiment, operator policy (cli) and a registered deployment."""
+    """Served SP1 trader, ARMED experiment, operator policy (cli) and an ACTIVE judged deployment version."""
 
     def __init__(self, tmp_path, loop_thread, monkeypatch, *, identities=None, model_budget_usd_per_day=None,
                  prepare=None, policy_file=None):
@@ -84,7 +84,9 @@ class TraderWorld:
             options["identities"] = identities
         if model_budget_usd_per_day is not None:            # the trader.yaml ai_paper value the trader starts with
             options["model_budget_usd_per_day"] = model_budget_usd_per_day
-        self.served = served_stack(tmp_path, loop_thread, monkeypatch, **options)
+        self.served = judged_served_stack(tmp_path, loop_thread, monkeypatch, **options)
+        self.digest, self.version = self.served.deployment_digest, self.served.deployment_version
+        self.source_digest = self.served.source_digest
         market(self.served)
         chosen = acceptance_settings()
         self.conid, self.quantity = chosen.conid_s, chosen.quantity_s
@@ -94,9 +96,6 @@ class TraderWorld:
             "reason": "operator initial policy"})
         assert published["state"] == "RESOLVED", published
         self.policy_revision = published["outcome"]["revision"]
-        registered = self.served.call("ai_research", "register_ai_deployment",
-                                      {"deployment": deployment_record(chosen)})
-        self.digest = registered["outcome"]["digest"]
         (tmp_path / "ai").mkdir(exist_ok=True)
         self.ai_db = tmp_path / "ai" / "ai.duckdb"
 
@@ -104,7 +103,8 @@ class TraderWorld:
         ask = self.served.sim.quotes[self.conid][1]
         return ProposedDecision(action_key=action_key or f"enter:{self.conid}", action="ENTER", conid=self.conid,
                                 side="BUY", decider="jev", evidence_digest="sha256:" + "e" * 64,
-                                deployment_digest=self.digest, policy_revision=self.policy_revision,
+                                deployment_digest=self.digest, deployment_version=self.version,
+                                source_digest=self.source_digest, policy_revision=self.policy_revision,
                                 stop_price=round(ask * 0.98, 2), target_price=round(ask * 1.02, 2),
                                 quantity=self.quantity)
 
@@ -136,11 +136,12 @@ class TraderWorld:
         return self.served.stack.ai_paper.decision_store.row(decision_id)
 
     def strategy_signal(self, action="BUY", conid=None) -> str:
-        """The strategy service's side: a signal into the durable signal record (Plan 1 Task 6)."""
+        """The strategy service's side: a bound signal of the judged instance into the durable record."""
         from trader.data.duckdb_store import DuckDBConnection
         from trader.data.strategy_signal_record import SignalEntry, StrategySignalRecord
         entry = SignalEntry.create(strategy_name="orb", conid=conid or self.conid, action=action, probability=0.7,
-                                   signal_time=self.served.now())
+                                   signal_time=self.served.now(), deployment_digest=self.digest,
+                                   deployment_version=self.version, source_digest=self.source_digest)
         StrategySignalRecord(DuckDBConnection.get_instance(self.served.stack.ai_paper.signals_path),
                              now=self.served.now).append(entry)
         return entry.source_event_id

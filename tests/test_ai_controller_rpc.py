@@ -7,7 +7,7 @@ import pytest
 
 from tests.automation.ai_paper_fixtures import NOW
 from tests.automation.test_controller_epoch import Clock
-from tests.test_ai_paper_rpc import _served, command, enter_body, publish, query, register
+from tests.test_ai_paper_rpc import _served, bound_enter_body, command, enter_body, publish, query
 from trader.automation.ai_paper_config import AiPaperConfig
 from trader.data.duckdb_store import DuckDBConnection
 from trader.data.strategy_signal_record import RECORD_GENERATION, SignalEntry, StrategySignalRecord
@@ -63,13 +63,14 @@ def test_grant_wire_is_strict(served, body):
         "VALIDATION_ERROR"
 
 
-def armed(served):
+def armed_enter_body(served):
+    """An ARMED experiment, a policy and a judged version; returns a strategy ENTER bound to that version."""
     publish(served)
-    digest = register(served)
+    body = bound_enter_body(served)
     started = command(served, "cli").call("start_experiment", {"command_id": "start-1", "reason": "go"}, dict)
     assert started["outcome"]["state"] == "ARMED", started
     served.stack.experiments.monitor.recover()
-    return digest
+    return body
 
 
 def submit(served, body, epoch):
@@ -77,13 +78,13 @@ def submit(served, body, epoch):
 
 
 def test_missing_epoch_is_refused_without_a_ledger_row(served):
-    body = enter_body(armed(served))
+    body = armed_enter_body(served)
     assert code_of(submit, served, body, None) == "CONTROLLER_EPOCH_MISSING"
     assert served.coordinator.get_command("aip-dec-00000001") is None
 
 
 def test_stale_holder_resend_is_refused_and_successor_replays(served, clock):       # Review Focus 1
-    body = enter_body(armed(served))
+    body = armed_enter_body(served)
     first = submit(served, body, grant(served)["epoch"])
     assert first["state"] == "SUBMITTED", first
     clock.advance(61)
@@ -105,7 +106,7 @@ def read_decision(served, decision_id, epoch, principal="ai_supervisor"):
 
 
 def test_reconcile_read_returns_receipt_and_decision_row(served):
-    body = enter_body(armed(served))
+    body = armed_enter_body(served)
     epoch = grant(served)["epoch"]
     first = submit(served, body, epoch)
     view = read_decision(served, "dec-00000001", epoch)

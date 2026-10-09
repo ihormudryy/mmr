@@ -228,6 +228,8 @@ AI_PAPER_FAMILY = {                                                    # R23, ow
     ("command", "register_discretionary_deployment"): {"cli"},          # SP2 Plan 3: the operator only
     ("query", "get_ai_risk_policy"): {"cli", "dashboard", "ai_supervisor"},
     ("query", "get_ai_deployment"): {"cli", "dashboard", "ai_supervisor", "ai_research"},
+    ("query", "get_ai_deployment_version"): {"cli", "dashboard", "ai_supervisor", "ai_research"},   # SP2c Plan 2
+    ("command", "withdraw_ai_deployment"): {"cli", "dashboard"},
     ("query", "discover_ai_candidates"): {"ai_supervisor"},             # SP2 Plan 3: read only
     ("query", "get_ai_entry_quote"): {"ai_supervisor"},
 }
@@ -236,8 +238,9 @@ AI_PAPER_FAMILY = {                                                    # R23, ow
 def test_ai_paper_family_rights_are_exact():
     assert {key: set(TRADER_ACL[key]) for key in AI_PAPER_FAMILY} == AI_PAPER_FAMILY
     assert {key for key, allowed in TRADER_ACL.items() if "ai_research" in allowed and key in AI_PAPER_FAMILY} == {
-        ("command", "register_ai_deployment"), ("query", "get_ai_deployment")}
+        ("command", "register_ai_deployment"), ("query", "get_ai_deployment"), ("query", "get_ai_deployment_version")}
     assert not [key for key in AI_PAPER_FAMILY if {"strategy", "scheduler", "trader"} & set(TRADER_ACL[key])]
+    assert set(TRADER_ACL[("query", "get_active_ai_deployments")]) == {"strategy"}   # only the strategy service
 
 
 def test_the_full_registry_registers_the_ai_paper_family():

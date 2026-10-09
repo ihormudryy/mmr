@@ -5,6 +5,7 @@ DispatchGuard. Only the broker, quotes, margin, history and the order dispatch a
 from __future__ import annotations
 
 import datetime as dt
+import hashlib
 import json
 import os
 import threading
@@ -16,6 +17,13 @@ from typing import Optional
 
 from tests.automation.ai_paper_fixtures import (
     ACCOUNT, CONID, NOW, OTHER, FakeUniverse, make_history, order, pos, quote, secdef, snapshot,
+)
+from tests.automation.judged_deployment import Cooldowns, SeededJudgments, deploy_facts
+from trader.automation.ai_deployment_activity import (
+    DeploymentActivity, deployment_version_gate, deployment_withdrawal_gate_in_tx,
+)
+from trader.automation.ai_deployment_versions import (
+    INITIAL, AiDeploymentVersionStore, DeploymentVersion, apply_ai_deployment_version_migrations,
 )
 from trader.automation.ai_deployments import AiDeployment, AiDeploymentStore, apply_ai_deployment_migration
 from trader.automation.ai_paper_config import AiPaperConfig
@@ -60,7 +68,8 @@ def enter_body(digest: str, now: dt.datetime, **changes) -> dict:
     body = {"decision_id": "dec-00000001", "deployment_digest": digest, "decider": "jev",
             "action": "ENTER", "conid": CONID, "side": "BUY", "stop_price": 98.0, "target_price": None,
             "quantity": None, "policy_revision": 1, "evidence_digest": "sha256:" + "c" * 64,
-            "expires_at": (now + dt.timedelta(minutes=5)).isoformat()}
+            "expires_at": (now + dt.timedelta(minutes=5)).isoformat(),
+            "deployment_version": None, "source_digest": None}
     body.update(changes)
     return body
 
@@ -212,6 +221,7 @@ class World:
         self.clock = Clock()
         self.accepted_feeds = accepted_feeds
         self.scope_gate = None          # discretionary_world sets the discretionary scope gate
+        self._intent_hook = None
         self.db = DuckDBConnection.get_instance(str(tmp_path / "journal.duckdb"))
         migrator = SchemaMigrator(self.db)
         self.journal = DomainJournal(self.db)
@@ -222,6 +232,7 @@ class World:
                       apply_canary_risk_migration, apply_exit_owner_migration, apply_liquidation_migration,
                       apply_controller_epoch_migration):
             apply(migrator)
+        apply_ai_deployment_version_migrations(migrator)
         self.epochs = ControllerEpochs(journal=self.journal, now=self.clock)
         self.epoch = self.epochs.grant(holder_id="world", current_epoch=None, lease_seconds=60).epoch
         self.controls = TradingControlStore(self.journal)
@@ -244,6 +255,14 @@ class World:
         self.deployments = AiDeploymentStore(self.db, now=self.clock)
         self.digest, _ = self.deployments.register(AiDeployment.from_json(GOOD), principal="ai_research",
                                                    command_id="dep-1")
+        self.activity_clock = Clock()
+        self.judgments, self.cooldowns = SeededJudgments(), Cooldowns()
+        self.versions = AiDeploymentVersionStore(self.journal, now=self.clock)
+        self.activity = DeploymentActivity(versions=self.versions, deployments=self.deployments,
+                                           judgments=self.judgments, cooldowns=self.cooldowns, max_active=3,
+                                           now=self.activity_clock)
+        self.version_digest = self.seal_version("jdg-world-1")
+        self._withdrawal_gate = deployment_withdrawal_gate_in_tx(versions=self.versions)
         self.policy_publish(PAPER_LIMITS)
         self.evidence = FailingEvidence(AiPaperEvidence(
             broker=self.broker, quotes=self.quotes, margin=self.margin,
@@ -258,7 +277,10 @@ class World:
             account_id=ACCOUNT, account_mode="paper", allocation_policy=AllocationPolicy(now=self.clock),
             current_limits=lambda request: (self.policy.effective_limits() if request.action == AI_PAPER_ACTION
                                             else PAPER_LIMITS),
-            ai_entry_gate=compose_entry_gates(self._scope_gate, ai_entry_gate(entry_filter=self.entry_filter)),
+            ai_entry_gate=compose_entry_gates(
+                self._scope_gate,
+                deployment_version_gate(kind_of=self.deployments.kind_of, activity=self.activity),
+                ai_entry_gate(entry_filter=self.entry_filter)),
             strict_margin_actions=frozenset({AI_PAPER_ACTION}), accepted_feeds=accepted_feeds)
         self.liquidation = (self._real_liquidation() if real_liquidation
                             else SimpleNamespace(start=lambda *a, **k: None))
@@ -267,7 +289,8 @@ class World:
             session_risk=SessionRiskController(calendar=XNYSCalendarPolicy(), now=self.clock,
                                                liquidity_policy=LiquidityPolicy(accepted_feeds=accepted_feeds)),
             breaker=SimpleNamespace(record=lambda signal: None), liquidation=self.liquidation,
-            account_id=ACCOUNT, account_mode="paper", now=self.clock, db=self.db)
+            account_id=ACCOUNT, account_mode="paper", now=self.clock, db=self.db,
+            send_gate_in_tx=self._send_gate_in_tx)
         self.scheduled: list[str] = []
         self.decisions = AiPaperDecisionStore(self.journal)
         self.service = AiPaperDecisionService(
@@ -275,7 +298,8 @@ class World:
             deployments=self.deployments, evidence=self.evidence, saga=self.saga,
             experiments=self.experiments, exit_owners=self.exit_owners, liquidation=self.liquidation,
             broker=self.broker, config=AiPaperConfig(enabled=True), account_id=ACCOUNT, now=self.clock,
-            schedule_reconcile=self.scheduled.append, decisions=self.decisions, epochs=self.epochs)
+            schedule_reconcile=self.scheduled.append, decisions=self.decisions, epochs=self.epochs,
+            activity=self.activity)
 
         class _Nonces:
             def consume_in_tx(self, *args, **kwargs):
@@ -294,6 +318,15 @@ class World:
         return LiquidationService(
             self.broker, self.liquidation_dispatch, store=LiquidationRunStore(self.db), registry=self.exit_owners,
             now=self.clock, breaker=_Breaker(), schedule_reconcile=self.liquidation_scheduled.append)
+
+    def _send_gate_in_tx(self, conn, request):
+        if self._intent_hook is not None:
+            self._intent_hook(conn, request)
+        return self._withdrawal_gate(conn, request)
+
+    def on_intent_check(self, callback):
+        """``callback(conn, request)`` runs on the saga's SUBMITTING transaction, before the withdrawal read."""
+        self._intent_hook = callback
 
     def _scope_gate(self, request, approval, quote, now):
         return None if self.scope_gate is None else self.scope_gate(request, approval, quote, now)
@@ -331,7 +364,17 @@ class World:
             expected_version=None, body=body, source=principal, principal=principal,
             controller_epoch=self.epoch)
 
+    def seal_version(self, judgment_id, *, first=dt.date(2026, 7, 17), expiry=dt.date(2026, 8, 14)):
+        self.judgments.seed(deploy_facts(GOOD, judgment_id))
+        version = DeploymentVersion(self.digest, judgment_id, INITIAL, None, first, expiry)
+        return self.db.transaction(lambda conn: self.versions.seal_in_tx(
+            conn, version, request_digest="sha256:" + hashlib.sha256(judgment_id.encode()).hexdigest(),
+            principal="ai_research", command_id=f"seed-{judgment_id}"))[0]
+
     def body(self, **changes):
+        if changes.get("deployment_digest", self.digest) == self.digest:
+            changes = {"deployment_version": self.version_digest, "source_digest": GOOD["strategy_digest"],
+                       **changes}
         return enter_body(self.digest, self.clock(), **changes)
 
     def submit(self, body=None, *, principal="ai_supervisor", **changes):

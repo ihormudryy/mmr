@@ -54,7 +54,7 @@ def _behaviour_params(params: Optional[Mapping[str, Any]]) -> dict:
     return {k: v for k, v in (params or {}).items() if k not in _TRANSPORT_PARAMS}
 
 
-def _same_values(actual: dict, attested: dict) -> bool:
+def same_values(actual: dict, attested: dict) -> bool:
     """Exact comparison: 600 and 600.0 differ, unlike Python ``==``."""
     try:
         return canonical_json_bytes(actual) == canonical_json_bytes(attested)
@@ -62,7 +62,7 @@ def _same_values(actual: dict, attested: dict) -> bool:
         return False
 
 
-def _bar_size_key(value: Any) -> str:
+def bar_size_key(value: Any) -> str:
     return ' '.join(str(value).lower().split())
 
 
@@ -91,12 +91,12 @@ def check_strategy_binding(attested: Optional[AttestedStrategy], *, module_file:
             problems.append(f'strategy file {Path(module_file).name} changed since attestation')
     actual_params = _behaviour_params(params)
     attested_params = _behaviour_params(attested.parameters)
-    if not _same_values(actual_params, attested_params):
+    if not same_values(actual_params, attested_params):
         problems.append(f'params {actual_params} differ from attested {attested_params}')
     actual_conids = {str(c) for c in (conids or ())}
     if actual_conids != set(attested.instruments):
         problems.append(f'conids {sorted(actual_conids)} differ from attested {sorted(attested.instruments)}')
-    if attested.bar_size is None or _bar_size_key(bar_size) != _bar_size_key(attested.bar_size):
+    if attested.bar_size is None or bar_size_key(bar_size) != bar_size_key(attested.bar_size):
         problems.append(f'bar size {bar_size!r} differs from attested {attested.bar_size!r}')
     if problems:
         raise StrategyBindingError('; '.join(problems))

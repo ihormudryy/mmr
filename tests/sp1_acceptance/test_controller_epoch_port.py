@@ -21,7 +21,7 @@ class FakeClient:
 
 def test_submit_carries_a_granted_epoch_and_waits_while_held():
     command, sleeps = FakeClient(held_times=2), []
-    port = RpcAcceptancePort(FakeClient(), command, FakeClient(), sleep=sleeps.append)
+    port = RpcAcceptancePort(command, FakeClient(), sleep=sleeps.append)
     assert port.supervisor("submit_ai_paper_decision", {"decision_id": "d"}) == {"state": "SUBMITTED"}
     grants = [c for c in command.calls if c[0] == "grant_ai_controller_epoch"]
     assert len(grants) == 3 and sleeps == [5.0, 5.0]
@@ -33,6 +33,6 @@ def test_submit_carries_a_granted_epoch_and_waits_while_held():
 
 def test_other_supervisor_calls_carry_no_epoch():
     command = FakeClient()
-    port = RpcAcceptancePort(FakeClient(), command, FakeClient())
+    port = RpcAcceptancePort(command, FakeClient())
     port.supervisor("pause_experiment", {"x": 1})
     assert command.calls == [("pause_experiment", {"x": 1}, {})]

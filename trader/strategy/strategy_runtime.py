@@ -41,6 +41,15 @@ from trader.data.strategy_signal_record import (
     StrategySignalRecord,
     completed_bar_time,
 )
+from trader.messaging.ai_deployment_wire import GetActiveAiDeploymentsResponse
+from trader.strategy.ai_deployment_source import (
+    AI_HISTORY_DAYS,
+    AI_INSTANCE_PREFIX,
+    AiDeploymentSource,
+    AiInstanceBinding,
+    ai_instance_name,
+    source_unchanged,
+)
 from trader.strategy.signal_proposer import SignalProposer
 from trader.strategy.strategy_revisions import StrategyCommandReceipt, StrategyRevisionStore
 from trader.strategy.trader_gateway import StrategyTraderGateway
@@ -53,6 +62,7 @@ import backoff
 import datetime as dt
 import exchange_calendars
 import hashlib
+import hmac
 import importlib
 import importlib.util
 import inspect
@@ -671,6 +681,8 @@ class StrategyRuntime():
             # "resolve_symbol ... no route to server" startup warnings.
             self._trader_gateway = StrategyTraderGateway(
                 query_client=self._trader_query_client)
+            self._ai_deployment_source = AiDeploymentSource(
+                runtime=self, read_active=self._read_active_ai_deployments, paper=bool(self.paper_trading))
 
         # [M1-F3] Task 8: signal → PENDING proposal bridge for
             # auto_execute: 'propose' strategies. Live requires
@@ -693,6 +705,10 @@ class StrategyRuntime():
                 TraderConnectionException,
                 message='strategy_runtime.connect() exception', inner=ex
             )
+
+    def _read_active_ai_deployments(self):
+        return self._trader_query_client.call(
+            'get_active_ai_deployments', {}, GetActiveAiDeploymentsResponse).deployments
 
     @log_method
     def _persist_enabled(self, name: str, enabled: bool) -> None:
@@ -823,6 +839,35 @@ class StrategyRuntime():
                 return strategy
         return None
 
+    def unload_strategy(self, name: str) -> bool:
+        """Remove a loaded strategy from every dispatch list; False when none has this name."""
+        instance = self.get_strategy(name)
+        if instance is None:
+            return False
+        self.strategy_implementations.remove(instance)
+        for bucket in self.strategies.values():
+            if instance in bucket:
+                bucket.remove(instance)
+        self._last_dispatched_bar = {
+            key: value for key, value in self._last_dispatched_bar.items() if key[1] != name}
+        sys.modules.pop(f'_mmr_strategy_{name}', None)
+        return True
+
+    def ai_instances(self) -> Dict[str, Strategy]:
+        return {s.name: s for s in self.strategy_implementations if getattr(s, 'ai_deployment_version', None)}
+
+    def load_ai_deployment(self, deployment) -> bool:
+        """Load one active deployment from the exact bytes the trader judged; False when it does not load."""
+        name = ai_instance_name(deployment.version_digest)
+        self.load_strategy(
+            name=name, bar_size_str=deployment.bar_size, conids=list(deployment.conids), universe=None,
+            historical_days_prior=AI_HISTORY_DAYS, module=deployment.strategy_path.removeprefix('strategies/'),
+            class_name=deployment.class_name, description=f'AI deployment {deployment.version_digest}',
+            paper_only=True, auto_execute=False, params=dict(deployment.params),
+            ai_binding=AiInstanceBinding(deployment.version_digest, deployment.base_digest,
+                                         deployment.strategy_digest))
+        return self.get_strategy(name) is not None
+
     @staticmethod
     def _coerce_param_value(value):
         """Form values arrive as strings — coerce to bool/int/float where the
@@ -908,15 +953,7 @@ class StrategyRuntime():
         # Hot-swap: unload the live instance, re-load from the updated entry.
         # Primed history survives (keyed by (conId, bar_size)) and
         # load_strategy restores the persisted enabled/disabled state (D2).
-        old = self.get_strategy(name)
-        if old is not None:
-            self.strategy_implementations.remove(old)
-            for lst in self.strategies.values():
-                if old in lst:
-                    lst.remove(old)
-            self._last_dispatched_bar = {
-                k: v for k, v in self._last_dispatched_bar.items() if k[1] != name}
-            sys.modules.pop(f'_mmr_strategy_{name}', None)
+        self.unload_strategy(name)
 
         self.load_strategy(
             name=name,
@@ -1126,15 +1163,7 @@ class StrategyRuntime():
         never appends the new instance -- this is what turns that silent
         failure into a loud one the caller can catch and roll back)."""
         merged = config_entry.get('params') or {}
-        old = self.get_strategy(strategy_name)
-        if old is not None:
-            self.strategy_implementations.remove(old)
-            for lst in self.strategies.values():
-                if old in lst:
-                    lst.remove(old)
-            self._last_dispatched_bar = {
-                k: v for k, v in self._last_dispatched_bar.items() if k[1] != strategy_name}
-            sys.modules.pop(f'_mmr_strategy_{strategy_name}', None)
+        self.unload_strategy(strategy_name)
 
         self.load_strategy(
             name=strategy_name,
@@ -1664,7 +1693,10 @@ class StrategyRuntime():
             return
         entry = SignalEntry.create(
             strategy_name=strategy.name, conid=conId, action=str(signal.action),
-            probability=signal.probability, signal_time=completed_bar_time(frame))
+            probability=signal.probability, signal_time=completed_bar_time(frame),
+            deployment_digest=getattr(strategy, 'ai_deployment_digest', None),
+            deployment_version=getattr(strategy, 'ai_deployment_version', None),
+            source_digest=getattr(strategy, 'ai_source_digest', None))
         try:
             self.signal_record.append(entry)
         except Exception as ex:
@@ -1673,6 +1705,11 @@ class StrategyRuntime():
     def _dispatch_signal(self, strategy: Strategy, signal, conId: int,
                          frame: pd.DataFrame) -> None:
         """Record, publish, and (in propose mode) bridge one signal."""
+        if getattr(strategy, 'ai_deployment_version', None) and not source_unchanged(strategy):
+            logging.error('AI deployment %s: %s changed after load; signal dropped, unloading at the next '
+                          'reconcile', strategy.name, strategy.ai_source_path)
+            strategy.disable()
+            return
         if signal.action == Action.BUY:
             logging.info('BUY signal from %s', strategy.name)
         elif signal.action == Action.SELL:
@@ -1967,6 +2004,7 @@ class StrategyRuntime():
         paper_only: bool = False,
         auto_execute: 'bool | str' = False,
         params: Optional[Dict] = None,
+        ai_binding: Optional[AiInstanceBinding] = None,
     ) -> None:
 
         # Skip if strategy with this name already loaded
@@ -1976,6 +2014,11 @@ class StrategyRuntime():
 
         if not name or not class_name or not module or not bar_size_str:
             raise ValueError('invalid config. need name, bar_size, class_name and module specified')
+
+        if name.startswith(AI_INSTANCE_PREFIX) and ai_binding is None:
+            logging.error('refusing to load strategy %s: the %s prefix is reserved for AI deployments',
+                          name, AI_INSTANCE_PREFIX)
+            return
 
         # auto_execute is a safety-relevant knob: accepting a value we don't
         # implement (and silently doing nothing) violates fail-loudly. Only
@@ -2012,6 +2055,10 @@ class StrategyRuntime():
             logging.error('failed to load strategy %s (%s): %s', name, class_name, ex)
             return
         loaded_source_digest = hashlib.sha256(source).hexdigest()
+        if ai_binding is not None and not hmac.compare_digest('sha256:' + loaded_source_digest,
+                                                              ai_binding.strategy_digest):
+            logging.error('refusing to load AI deployment %s: %s is not the judged file', name, module)
+            return
 
         # [P3 Task 2] Artifact verification gate — checked BEFORE the class module
         # is executed. When automation is enabled and the strategy carries
@@ -2114,6 +2161,11 @@ class StrategyRuntime():
                 # Give the strategy a reference to the runtime for subscriptions
                 instance.strategy_runtime = self
                 instance.loaded_source_digest = loaded_source_digest
+                if ai_binding is not None:
+                    instance.ai_deployment_version = ai_binding.version_digest
+                    instance.ai_deployment_digest = ai_binding.base_digest
+                    instance.ai_source_digest = ai_binding.strategy_digest
+                    instance.ai_source_path = filepath
 
                 # Restore the persisted enabled/disabled state so a runtime
                 # enable/disable survives a service restart. Unset (None) leaves
@@ -2123,6 +2175,8 @@ class StrategyRuntime():
                     instance.enable()
                 elif persisted is False:
                     instance.disable()
+                elif ai_binding is not None:
+                    instance.enable()
 
                 self.strategy_implementations.append(cast(Strategy, instance))
 
@@ -2209,6 +2263,13 @@ class StrategyRuntime():
                 # Don't advance _config_mtime — re-try on next reconcile
                 return
             self._config_mtime = current_mtime
+
+        source = getattr(self, '_ai_deployment_source', None)
+        if source is not None:
+            try:
+                source.reconcile()
+            except Exception as ex:
+                logging.warning('AI deployment reconcile failed (will retry next cycle): %s', ex)
 
         # 2. Re-subscribe all strategies (idempotent — only new conIds trigger publish_contract).
         # Only swallow the well-known transient failures (trader_service bouncing,

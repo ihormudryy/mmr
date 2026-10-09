@@ -16,9 +16,10 @@ from trader.acceptance.ports import OperatorChannelUnavailable, RemoteRefusal
 UTC = dt.timezone.utc
 NOW = dt.datetime(2026, 7, 17, 15, 0, tzinfo=UTC)          # 11:00 ET, a Friday session
 AAPL, MSFT = 265598, 272093
+BASE_DIGEST = "sha256:" + "d" * 64
 WAIT_READS = frozenset({"get_positions", "get_open_orders", "get_command", "get_broker_order_evidence",
                         "get_experiment_trips", "get_scoreboard"})
-WRITES = frozenset({"register_ai_deployment", "publish_ai_risk_policy", "submit_ai_paper_decision",
+WRITES = frozenset({"publish_ai_risk_policy", "submit_ai_paper_decision",
                     "acceptance_mark_start", "acceptance_shrink_probe"})
 
 
@@ -62,6 +63,10 @@ class FakePort:
         self._probed = False
         self._enter_s_legs = (True, True)
         self.run_id = "acc-20260717-abcdef"
+        self.version_state: Optional[str] = "ACTIVE"         # None: the trader knows no such version
+        self.deployment_conids = [AAPL, MSFT]
+        self.version_sessions = ("2026-07-17", "2026-08-14")   # first_session, expiry_session
+        self.strategy_digest = "sha256:" + "5" * 64
 
     # -- scripting ----------------------------------------------------------------------------
     def never_fill(self, step):
@@ -104,9 +109,6 @@ class FakePort:
 
     def sleep(self, seconds):
         self.clock += dt.timedelta(seconds=seconds)
-
-    def research(self, method, body):
-        return self._record("research", method, body)
 
     def supervisor(self, method, body):
         return self._record("supervisor", method, body)
@@ -167,8 +169,17 @@ class FakePort:
             return {"experiment": None}
         return {"experiment": {"experiment_id": "exp-" + "a" * 20, "state": self.experiment_state}}
 
-    def _register_ai_deployment(self, body):
-        return {"state": "RESOLVED", "outcome": {"digest": "sha256:" + "d" * 64}, "error_code": None}
+    def _get_ai_deployment_version(self, body):
+        if self.version_state is None:
+            return {"found": False, "version": None}
+        return {"found": True, "version": {
+            "version_digest": body["version_digest"], "base_digest": BASE_DIGEST, "judgment_id": "jdg-fake-0001",
+            "kind": "INITIAL", "prior_version_digest": None, "first_session": self.version_sessions[0],
+            "expiry_session": self.version_sessions[1], "state": self.version_state}}
+
+    def _get_ai_deployment(self, body):
+        assert body["digest"] == BASE_DIGEST
+        return {"deployment": {"conids": list(self.deployment_conids), "strategy_digest": self.strategy_digest}}
 
     def _publish_ai_risk_policy(self, body):
         return {"state": "RESOLVED", "outcome": {"revision": 1}, "error_code": None}

@@ -14,6 +14,7 @@ owner runs it. Every order in it comes from `mmr experiment acceptance run
 | P0.3 cutover gate (Plan 2) | `docker compose -f docker-compose.yml -f docker-compose.test.override.yml --profile test up --build --abort-on-container-exit fullstack-tests` | all pass | stop; do not `-u` |
 | P0.4 config | in `~/.config/mmr/trader.yaml`: `trading_mode: paper`, `ai_paper.enabled: true`, `ai_paper.telegram.enabled: false` (unless you supplied a bot and chat id; the report then says `telegram_live_delivery: UNTESTED`), `ai_paper.acceptance_probe: true` (needed by P4S; set it back to `false` after P6.4; Plan 3 parses it, default `false`, so the key is legal), `experiment_kill_drawdown_pct` as you choose | after P1.2: `mmr status` shows the trader up, and `mmr --json experiment acceptance preflight` shows `"acceptance_probe": true` in both readings (an unknown-key config error at start means the key is misspelled) | fix the file |
 | P0.5 history | after P1.2, inside the scheduler container (the trader reads the `mmr_db_data` volume, not a host file): `docker compose run --rm scheduler mmr data download SPY --bar-size "1 day" --days 30` | rows written | scoreboard SPY shows unknown; not a blocker |
+| P0.5a judged deployment (SP2c Plan 2) | take the `version_digest` from the SP2c registration outcome; `mmr ai-deployment show <base digest>` shows the base deployment. No CLI shows a version's state yet. | you hold a version digest (`sha256:...`) whose base deployment lists AAPL (265598) and MSFT (272093); check again on the session day that it was not withdrawn or renewed | stop: the harness registers nothing. P4.2 refuses `DEPLOYMENT_VERSION_REQUIRED` without a version, and its `deployment` step stops at `DEPLOYMENT_NOT_USABLE`, before any write, when the version is not `ACTIVE`, today is outside its first and expiry session, or a conid is missing. Until SP2c research registers a version, SP1 acceptance cannot run. |
 | P0.6 operator key | `mkdir -p ~/.config/mmr/keys/acceptance && openssl genpkey -algorithm ed25519 -out ~/.config/mmr/keys/acceptance/operator.key && openssl pkey -in ~/.config/mmr/keys/acceptance/operator.key -pubout -out ~/.config/mmr/keys/acceptance/operator.pub && chmod 600 ~/.config/mmr/keys/acceptance/operator.key` (once; keep both files, back them up; never use an RPC key) | both files exist | stop: the real report cannot be signed |
 
 ## Session day
@@ -51,13 +52,16 @@ liquidation finite, above zero, at most 5 minutes old, stable within 0.1 % over
 | Step | Command | Pass | Fail → |
 |---|---|---|---|
 | P4.1 dry run | `mmr experiment acceptance run` | prints the planned calls, "dry run", sends nothing | stop |
-| P4.2 run | `mmr experiment acceptance run --place-orders --confirm-account <DU account> --signing-key ~/.config/mmr/keys/acceptance/operator.key --report ~/.local/share/mmr/acceptance/run-report.json` | every step `PASS` including `shrink_proof` (`oca_shrink: PROVEN`) and `settle_s`; prints `report passed: True` and ends with "B open, protected; waiting for the session flatten" (exit 0 only when the signed report passed); note the printed `run_id`. `OCA_SHRINK_UNPROVEN`: the session is **not** acceptance; flatten (A2), stop, try another day; do not retry today. `OCA_SIBLING_NOT_SHRUNK` or `PROBE_OCA_LOST`: abort A4 at once | abort A2 |
+| P4.2 run | `mmr experiment acceptance run --place-orders --deployment-version <version digest> --confirm-account <DU account> --signing-key ~/.config/mmr/keys/acceptance/operator.key --report ~/.local/share/mmr/acceptance/run-report.json` | every step `PASS` including `shrink_proof` (`oca_shrink: PROVEN`) and `settle_s`; prints `report passed: True` and ends with "B open, protected; waiting for the session flatten" (exit 0 only when the signed report passed); note the printed `run_id`. `OCA_SHRINK_UNPROVEN`: the session is **not** acceptance; flatten (A2), stop, try another day; do not retry today. `OCA_SIBLING_NOT_SHRUNK` or `PROBE_OCA_LOST`: abort A4 at once | abort A2 |
 | P4.3 orders | `mmr --json orders` | only B's protective stop is working | abort A2 |
 
 What P4.2 does, in order: two preflight reads 30 s apart (it refuses
 `PROBE_NOT_ENABLED` here, before any order, if `ai_paper.acceptance_probe` is
-off); register the catalogue deployment (`ai_research`); publish the paper
-limits (`ai_supervisor`); `ENTER` A (3 shares, with a stop and a target) and B (1 share) with explicit
+off); read the `--deployment-version` and its base deployment
+(`ai_supervisor`; it must be `ACTIVE` and cover A and B, else
+`DEPLOYMENT_NOT_USABLE`; the harness registers nothing); publish the paper
+limits (`ai_supervisor`); every `ENTER` names that version and the base
+deployment's `strategy_digest`; `ENTER` A (3 shares, with a stop and a target) and B (1 share) with explicit
 sizes; `PARTIAL_CLOSE` 1 share of A (the existing stop and target re-placed for
 2 shares in one OCA group; a partial close carries no prices); `CLOSE` the rest of A; then P4S below. B stays open. Before each
 entry the harness reads the live ask and refuses `HARNESS_NOTIONAL_TOO_SMALL`
@@ -107,7 +111,7 @@ Do not trade in this window. If 15:55 passes with a position or order: abort A3.
 | P6.1 finish | `mmr experiment acceptance finish --run-id <run_id> --signing-key ~/.config/mmr/keys/acceptance/operator.key --report ~/.local/share/mmr/acceptance/finish-report.json` | every end check `PASS`: `equity_daily` row `FLAT` with `open_positions` 0, no position and no working order, trips through `get_experiment_trips` (A one closed trip of 3 shares, S one closed trip of 3 shares — the partial fills plus the settle close — and B one closed trip of 1 share), `oca_shrink` `PROVEN`, no incidents; exit 0 only when the signed report says `passed: True` | record; the run failed |
 | P6.2 verify | `mmr scoreboard verify` | exit 0, no mismatch | record; the run failed |
 | P6.3 scoreboard | `mmr --json scoreboard > ~/.local/share/mmr/acceptance/scoreboard.json` | label `PAPER`, today `FLAT` | record |
-| P6.4a verify the report | `mmr experiment acceptance verify-report ~/.local/share/mmr/acceptance/finish-report.json --public-key ~/.config/mmr/keys/acceptance/operator.pub` | `signature OK`, `signing_key: operator`, `evidence_source: ib_paper`, `deployment_record: harness_fixture`, `live_restart_recovery: NOT_PROVEN`, `oca_shrink: PROVEN`, `passed: True` | the run failed |
+| P6.4a verify the report | `mmr experiment acceptance verify-report ~/.local/share/mmr/acceptance/finish-report.json --public-key ~/.config/mmr/keys/acceptance/operator.pub` | `signature OK`, `signing_key: operator`, `evidence_source: ib_paper`, `deployment_record: judged_version`, `live_restart_recovery: NOT_PROVEN`, `oca_shrink: PROVEN`, `passed: True` | the run failed |
 | P6.4 stop | `mmr experiment stop --reason "sp1 acceptance done"` | `STOPPED` | `NOT_FLAT`: abort A3 |
 | P6.5 backup | `./docker.sh -B after_acceptance` | backup file named | — |
 
@@ -127,8 +131,10 @@ Copy into `~/.local/share/mmr/acceptance/<run_id>/` (the harness already wrote
 
 The session passes only if P4.2 (with `oca_shrink` `PROVEN`), P6.1, P6.2 and
 P6.4a all pass. One such session is enough; a session with `UNPROVEN` or
-`FAILED` is not a pass. The report states that the deployment is a harness
-fixture and that live restart recovery was not proven (the synthetic restart
+`FAILED` is not a pass. The report states that the run traded under an
+operator-given SP2c-judged deployment version (`deployment_record:
+judged_version`; the trader bound every `ENTER` to it and its strategy digest)
+and that live restart recovery was not proven (the synthetic restart
 tests are the gate). Telegram delivery stays `UNTESTED` unless you supplied a
 bot and chat id and saw the messages yourself.
 
@@ -143,7 +149,7 @@ bot and chat id and saw the messages yourself.
 
 Never re-run `mmr experiment acceptance run` with a new run id after a failure
 on the same day; resume with `--run-id` only if the failure was the host
-process (`mmr experiment acceptance run --run-id <run_id> --place-orders --confirm-account <DU account> --signing-key ~/.config/mmr/keys/acceptance/operator.key`).
+process (`mmr experiment acceptance run --run-id <run_id> --place-orders --deployment-version <version digest> --confirm-account <DU account> --signing-key ~/.config/mmr/keys/acceptance/operator.key`, with the same version digest; another one is refused `DEPLOYMENT_VERSION_MISMATCH`).
 A resume validates the account against the journal and replays the stored
 request bodies unchanged; it sends no new order and never re-sends the mark or
 the probe.

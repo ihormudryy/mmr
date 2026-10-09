@@ -1771,6 +1771,21 @@ _ACTIVE_ORDER_STATUSES = frozenset({
 
 _KNOWN_TERMINAL_ORDER_STATUSES = frozenset({"Filled", "Cancelled", "ApiCancelled", "Inactive"})
 
+# The broker accepted the order. PendingSubmit and ApiPending are local echoes and
+# PendingCancel may hide either outcome, so none of them proves acceptance (same
+# split as ``liquidation_service._BROKER_HEALTHY``).
+_BROKER_ACCEPTED_ORDER_STATUSES = frozenset({"Submitted", "PreSubmitted"})
+
+
+def _entry_accepted(entries: list) -> bool:
+    """Broker proof that an entry order was accepted: an accepted status or any fill."""
+    return any(
+        getattr(order, "status", None) in _BROKER_ACCEPTED_ORDER_STATUSES
+        or getattr(order, "status", None) == "Filled"
+        or (getattr(order, "filled_quantity", 0) or 0) > 0
+        for order in entries
+    )
+
 
 def _is_terminal_order(order: BrokerOrderRow) -> bool:
     return order.deleted or order.status not in _ACTIVE_ORDER_STATUSES
@@ -2529,6 +2544,9 @@ class _ReconcilePlan:
 # name is spelled out: importing it from trader.automation would be a cycle.
 CLOSE_RESOLVED_ACTIONS = frozenset({"execute_automated_intent", "liquidate_account", "submit_ai_paper_decision"})
 AI_PAPER_ENTRY_ACTION = "submit_ai_paper_decision"   # spelled out: importing it would be a cycle
+# A bracket entry whose saga failed into a flatten: the flatten met its goal, but
+# the broker never proved the entry accepted. Terminal, never an entry success.
+ENTRY_UNPROVEN_FLATTENED = "ENTRY_UNPROVEN_FLATTENED"
 AI_DEPLOYMENT_REGISTER_ACTION = "register_ai_deployment"   # spelled out: importing it would be a cycle
 # The reconciler's proof that a registration's transaction never committed. Terminal, so it no longer holds
 # reconciliation_safe(); the register RPC handler sends the next attempt under a new command id.
@@ -2600,6 +2618,7 @@ class OutcomeReconciler:
         self._closes = closes
         self._registrations = registrations
         self._unreadable_registrations: set[str] = set()   # logged once; the 15-minute alert follows
+        self._unreadable_sagas: set[str] = set()           # logged once; the 15-minute alert follows
         self._plans: dict[str, _ReconcilePlan] = {}
 
     # -- scheduling --------------------------------------------------------
@@ -2728,8 +2747,9 @@ class OutcomeReconciler:
             return self._reconcile_strategy(row, now)
         if action == "execute_automated_intent":
             return self._reconcile_automated_intent(row, now)
-        if action == AI_PAPER_ENTRY_ACTION and row.state == "SUBMITTED":
-            return self._reconcile_ai_entry(row, now)
+        if action == AI_PAPER_ENTRY_ACTION:
+            # An ENTER is judged by its entry order; a CLOSE (no bracket) by its close root.
+            return self._reconcile_automated_intent(row, now)
         if action in CLOSE_RESOLVED_ACTIONS:
             return self._reconcile_close(row, now)
         if action == AI_DEPLOYMENT_REGISTER_ACTION:
@@ -2778,18 +2798,6 @@ class OutcomeReconciler:
                                   outcome={"created": False, "reconciled": "never_committed"}, now=now)
         return True
 
-    def _reconcile_ai_entry(self, row: LedgerRow, now: dt.datetime) -> bool:
-        """An ai_paper ENTER (the only decision that ends SUBMITTED) is done once the broker shows its
-        bracket: an order of its group ``og-{command_id}`` is enumerated. Absence alone never rejects it;
-        the 15-minute alert covers an entry the broker never shows. The protective saga owns what happens
-        to the position after that (SP1 Plan 6: a SUBMITTED entry kept reconciliation_safe() false)."""
-        found = self._orders.find_by_order_ref(row.account_id, encode_order_ref(f"og-{row.command_id}"))
-        if not found:
-            return False
-        outcome = {**(row.outcome or {}), "broker_acknowledged": True}
-        self._resolve_command_only(row, outcome, now)
-        return True
-
     def _reconcile_close(self, row: LedgerRow, now: dt.datetime) -> bool:
         """R17 / R33: a command that started or joined a close root resolves from that exact root.
 
@@ -2823,23 +2831,86 @@ class OutcomeReconciler:
 
     def _reconcile_automated_intent(self, row: LedgerRow, now: dt.datetime) -> bool:
         """A command that started or joined a close root (a SELL exit, or a BUY
-        whose protective saga failed into a flatten) resolves only from that
-        root. Any other automated command is a bracket entry."""
-        if self._has_close_root(row.command_id):
+        whose protective saga failed into a flatten) resolves only once that
+        root is decided, so a failed flatten still rejects it with an alert.
+        Any other automated command is a bracket entry."""
+        if not self._has_close_root(row.command_id):
+            return self._reconcile_automated_entry(row, now)
+        bracket_entry = self._is_bracket_entry(row)
+        if bracket_entry is None:
+            return False
+        if bracket_entry:
+            return self._reconcile_flattened_entry(row, now)
+        return self._reconcile_close(row, now)
+
+    def _is_bracket_entry(self, row: LedgerRow) -> Optional[bool]:
+        """Whether the command sent its own bracket ``og-{command_id}``, or None
+        when that cannot be read. A bracket entry reached SUBMITTED, recorded its
+        group, or owns a protective saga row: the saga writes that row before any
+        send and never deletes it, so an ambiguous send has one too. A SELL exit
+        or an ai_paper CLOSE never does."""
+        if row.state == "SUBMITTED" or (row.outcome or {}).get("order_group_id") == f"og-{row.command_id}":
+            return True
+        try:
+            found = self._journal.connect().execute(
+                "SELECT 1 FROM automated_order_sagas WHERE command_id = ?", [row.command_id],
+            ).fetchone()
+        except duckdb.CatalogException:
+            return False      # no saga table: this trader never sent a bracket
+        except Exception:
+            if row.command_id not in self._unreadable_sagas:
+                self._unreadable_sagas.add(row.command_id)
+                logger.exception("command %s: its saga row cannot be read; it stays unresolved", row.command_id)
+            return None
+        return found is not None
+
+    def _reconcile_flattened_entry(self, row: LedgerRow, now: dt.datetime) -> bool:
+        """A bracket entry whose saga failed into a flatten. The root proves the
+        account flat, not that the broker accepted the entry:
+
+        - root open or failed -> as ``_reconcile_close`` (unknown, or REJECTED
+          with an operator alert);
+        - root met its goal and the entry is broker-proven -> RESOLVED with the
+          root's outcome (an entry that traded, then closed);
+        - root met its goal, no entry proven, no order of the group still live,
+          on a COMPLETE enumeration -> REJECTED ``ENTRY_UNPROVEN_FLATTENED``;
+        - otherwise unresolved."""
+        resolution = self._closes.close_resolution(row.command_id)
+        if resolution is None or not resolution.success:
             return self._reconcile_close(row, now)
-        return self._reconcile_automated_entry(row, now)
+        found = self._orders.find_by_order_ref(
+            row.account_id, encode_order_ref(f"og-{row.command_id}"),
+        )
+        if _entry_accepted([order for order in found if getattr(order, "leg", None) == "entry"]):
+            self._resolve_command_only(row, dict(resolution.outcome), now)
+            return True
+        statuses = [getattr(order, "status", None) for order in found]
+        if not all(status in _KNOWN_TERMINAL_ORDER_STATUSES for status in statuses):
+            return False
+        if not self._orders.enumeration_complete():
+            return False
+        self._reject_command_only(
+            row, error_code=ENTRY_UNPROVEN_FLATTENED,
+            outcome={**dict(resolution.outcome), "order_group_id": f"og-{row.command_id}",
+                     "broker_statuses": statuses, "broker_acknowledged": False},
+            now=now,
+        )
+        return True
 
     def _has_close_root(self, command_id: str) -> bool:
         return self._closes is not None and self._closes.root_for(command_id) is not None
 
     def _reconcile_automated_entry(self, row: LedgerRow, now: dt.datetime) -> bool:
-        """An automated entry dispatches its bracket under ``og-{command_id}``.
+        """An automated entry, or an ai_paper ENTER (the only ai_paper decision
+        that ends SUBMITTED), dispatches its bracket under ``og-{command_id}``.
         Resolve from that group's broker rows, judged by the ENTRY order:
 
-        - entry working or filled -> RESOLVED (exit legs alone never resolve it);
+        - entry accepted (Submitted, PreSubmitted) or filled -> RESOLVED (exit
+          legs alone never resolve it);
         - entry and every other order in a known terminal status, nothing
           filled, on a COMPLETE enumeration -> REJECTED ``BROKER_REJECTED``;
-        - no entry row, an unknown or unreadable status, or an incomplete
+        - no entry row, an entry only pending (PendingSubmit, ApiPending,
+          PendingCancel), an unknown or unreadable status, or an incomplete
           enumeration -> unresolved. Absence alone never fails the command."""
         found = self._orders.find_by_order_ref(
             row.account_id, encode_order_ref(f"og-{row.command_id}"),
@@ -2856,12 +2927,7 @@ class OutcomeReconciler:
             "order_group_id": f"og-{row.command_id}",
             "broker_statuses": statuses,
         }
-        entry_accepted = any(
-            order.status in _ACTIVE_ORDER_STATUSES or order.status == "Filled"
-            or (getattr(order, "filled_quantity", 0) or 0) > 0
-            for order in entries
-        )
-        if entry_accepted:
+        if _entry_accepted(entries):
             self._resolve_command_only(row, {**outcome, "broker_acknowledged": True}, now)
             return True
         any_active_or_fill = any(

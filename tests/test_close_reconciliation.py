@@ -261,3 +261,56 @@ def test_a_joined_sell_on_a_reduce_failed_root_is_rejected_after_a_restart(env):
     assert set(restarted.rescan_on_startup()) >= {"p-1", "sell-2"}
     restarted.run_due(NOW)
     assert [env.ledger.get(c).error_code for c in ("p-1", "sell-2")] == ["REDUCE_FAILED", "REDUCE_FAILED"]
+
+def _submitted_buy(env, command_id):
+    request = CommandRequest(command_id=command_id, action="execute_automated_intent", account_id=ACCOUNT,
+                             target_type="intent", target_id=command_id, expected_version=None, body={},
+                             source="strategy_service")
+
+    def work(conn, _append):
+        env.ledger.insert_received_in_tx(conn, request, f"hash-{command_id}", NOW)
+        env.ledger.transition_in_tx(conn, command_id, "RECEIVED", "SUBMITTING", now=NOW)
+        env.ledger.transition_in_tx(conn, command_id, "SUBMITTING", "SUBMITTED",
+                                    outcome={"order_group_id": f"og-{command_id}"}, now=NOW)
+    env.journal.mutate_batch_work(env.journal.connect(), work)
+
+
+def _flattened_buy(env, command_id, entry_rows):
+    env.reconciler._orders = SimpleNamespace(find_by_order_ref=lambda *a: list(entry_rows),
+                                             enumeration_complete=lambda: True)
+    _root(env, command_id, "FLAT", scope="account", goal="account")
+    _join(env, command_id, command_id, "account", outcome="CLAIMED")
+    _submitted_buy(env, command_id)
+
+
+def test_a_flat_root_with_no_entry_leg_is_not_an_entry_success(env):
+    """PR #126 review: a close root proves flat, not that the BUY's entry was accepted."""
+    _flattened_buy(env, "buy-3", [])
+    assert env.reconciler.reconcile_once("buy-3", NOW).resolved is True
+    row = env.ledger.get("buy-3")
+    assert (row.state, row.error_code) == ("REJECTED", "ENTRY_UNPROVEN_FLATTENED")
+    assert row.outcome["broker_acknowledged"] is False and row.outcome["close_root_id"] == "buy-3"
+
+
+def test_a_filled_buy_whose_saga_failed_into_a_flat_root_resolves_from_the_root(env):
+    filled_entry = SimpleNamespace(status="Filled", filled_quantity=10.0, leg="entry")
+    _flattened_buy(env, "buy-4", [filled_entry])
+    assert env.reconciler.reconcile_once("buy-4", NOW).resolved is True
+    row = env.ledger.get("buy-4")
+    assert row.state == "RESOLVED" and row.outcome["liquidation_state"] == "FLAT"
+
+
+def test_an_unknown_buy_with_a_saga_row_and_a_flat_root_is_not_an_entry_success(env):
+    """PR #126 review round 2: an ambiguous send leaves OUTCOME_UNKNOWN with no outcome, like a SELL;
+    the saga row it wrote before the send marks it a bracket entry."""
+    from trader.automation.protective_order_saga import apply_protective_order_saga_migration
+    apply_protective_order_saga_migration(SchemaMigrator(env.db))
+    env.db.execute("INSERT INTO automated_order_sagas (command_id, order_group_id, state, payload, updated_at) "
+                   "VALUES (?, ?, ?, ?, ?)", ["buy-5", "og-buy-5", "OUTCOME_UNKNOWN", "{}", NOW])
+    env.reconciler._orders = SimpleNamespace(find_by_order_ref=lambda *a: [], enumeration_complete=lambda: True)
+    _root(env, "buy-5", "FLAT", scope="account", goal="account")
+    _join(env, "buy-5", "buy-5", "account", outcome="CLAIMED")
+    _command(env, "buy-5")
+    assert env.reconciler.reconcile_once("buy-5", NOW).resolved is True
+    row = env.ledger.get("buy-5")
+    assert (row.state, row.error_code) == ("REJECTED", "ENTRY_UNPROVEN_FLATTENED")

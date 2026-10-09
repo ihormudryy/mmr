@@ -10,8 +10,8 @@ import pytest
 import yaml
 
 from tests.research.case_fixtures import pre_holdout_result
-from tests.research.evaluation_fixtures import (CONIDS, TIME_OF_DAY_STRATEGY, write_costs_config, write_trend_bars,
-                                                write_universe)
+from tests.research.evaluation_fixtures import (CONIDS, TIME_OF_DAY_STRATEGY, write_alpaca_extended_hours_bar,
+                                                write_costs_config, write_trend_bars, write_universe)
 from tests.research.service_fakes import FakeTrader, judgment_view
 from trader.data.duckdb_store import DuckDBConnection, DuckDBDataStore
 from trader.data.schema_migrations import SchemaMigrator
@@ -54,12 +54,12 @@ def world(tmp_path, tmp_duckdb_path):
     file_hash = "sha256:" + hashlib.sha256((tmp_path / "strategies" / "time_of_day.py").read_bytes()).hexdigest()
 
     def make(db_name, verdict="DEPLOY", decided_at="2024-03-15T21:00:00+00:00", bar_size="15 mins",
-             bound_bar_size=None, run_job=None, family_cost_digest="current"):
+             bound_bar_size=None, run_job=None, family_cost_digest="current", params=None):
         """``family_cost_digest=None`` leaves the case's family out of the registry."""
         db = DuckDBConnection.get_instance(str(tmp_path / db_name))
         apply_research_migrations(SchemaMigrator(db))
         store, trader = ResearchStore(db), FakeTrader()
-        params = {"ENTRY_MINUTE": 600, "EXIT_MINUTE": 660}
+        params = params or {"ENTRY_MINUTE": 600, "EXIT_MINUTE": 660}
         body = EvaluationRequestBody.model_validate({"strategy_key": "strategies/time_of_day.py:TimeOfDay",
                                                      "cohort": [params], "conids": CONIDS, "bar_size": bar_size,
                                                      "research_day": "2024-03-15"})
@@ -669,3 +669,25 @@ def test_an_after_hours_bar_in_an_earlier_session_does_not_hide_its_missing_clos
     for session in ("2024-03-20", "2024-03-21"):
         assert got[session]["status"] == "INCOMPLETE"
         assert got[session]["reason"] == f"BARS_MISSING: conid {CONIDS[1]} has no 15 mins bar up to the close on 2024-03-20"
+
+
+# -- PR #117: shadow replay reads the evaluation's regular-session bars ---------------------------------------
+
+
+@pytest.mark.timeout(120)
+def test_pre_market_bars_never_reach_the_shadow_strategy(world):
+    """A strategy that would buy on an 08:00 ET bar: with the stored pre-market bars filtered out of both the
+    replay and its bar check, every row equals the row from regular-session bars only."""
+    pre_market_buyer = {"ENTRY_MINUTE": 480, "EXIT_MINUTE": 660}
+    regular_only = world.make("regular-only.duckdb", params=pre_market_buyer)
+    regular_only.replay.tick()
+    for session in ("2024-03-18", "2024-03-19", "2024-03-20", "2024-03-21", "2024-03-22"):
+        write_alpaca_extended_hours_bar(world.db_path, session)
+    # A pre-market bar one minute later: the bar check must ignore it as the replay does (no BAR_SIZE_MISMATCH).
+    write_alpaca_extended_hours_bar(world.db_path, "2024-03-20", ny_time=dt.time(8, 1))
+    with_pre_market = world.make("with-pre-market.duckdb", params=pre_market_buyer)
+    with_pre_market.replay.tick()
+    got = rows(with_pre_market.trader)
+    assert got == rows(regular_only.trader)
+    assert {row["status"] for row in got.values()} == {"COMPLETE"} and sum(row["trades"] for row in got.values()) == 0
+    assert all(env.regular_session_calendar == "XNYS" for env, _ in with_pre_market.jobs)

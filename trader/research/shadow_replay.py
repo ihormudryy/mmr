@@ -29,6 +29,7 @@ from trader.research.evaluation import EvaluationError, _costs_config_digest, _p
 from trader.research.evaluation_case import CaseRefused, load_verified_case
 from trader.research.evaluation_jobs import RunEnvironment, WindowJob, run_window_job
 from trader.research.judgment_attest import is_loud_trader_code
+from trader.research.regular_sessions import regular_session_bars
 from trader.research.shadow_window import (TRACKED_VERDICTS, session_close_utc, session_open_utc, sessions_before,
                                            shadow_window, xnys_sessions)
 from trader.research.strategy_key import split_strategy_key
@@ -49,6 +50,7 @@ REASON_MAX = 200
 MAX_GAP_BARS = 2
 _BAR = re.compile(r"^(\d+) (sec|secs|min|mins|hour|hours)$")
 _UNIT_SECONDS = {"sec": 1, "secs": 1, "min": 60, "mins": 60, "hour": 3600, "hours": 3600}
+SHADOW_CALENDAR = "XNYS"                   # shadow sessions are XNYS sessions (shadow_window)
 
 
 def bar_seconds(bar_size: str) -> int:
@@ -97,13 +99,13 @@ def _session_bar_problem(stamps: pd.DatetimeIndex, conid, bar_size: str, spacing
                          session: dt.date) -> Optional[str]:
     session_open = pd.Timestamp(session_open_utc(session))
     session_close = pd.Timestamp(session_close_utc(session))
-    # From New York midnight to the close; a bar stamped at the close is the first after-hours bar.
+    # The stamps are regular-session only (the replay's own filter); the close-stamped bar is after hours.
     day = stamps[(stamps >= pd.Timestamp(ny_day_start(session))) & (stamps < session_close)]
     if len(day) == 0:
         return f"BARS_MISSING: no {bar_size} bars for conid {conid} on {session}"
     if (day.to_series().diff().dropna() < spacing).any():
         return f"BAR_SIZE_MISMATCH: conid {conid} has bars closer than {bar_size} on {session}"
-    regular = day[day >= session_open]                    # pre-market bars neither open a gap nor fill one
+    regular = day[day >= session_open]
     if len(regular) == 0 or regular.min() > session_open + spacing:
         first = "none" if len(regular) == 0 else regular.min()
         return f"BARS_MISSING: conid {conid} has its first {bar_size} bar at {first} on {session}"
@@ -348,8 +350,9 @@ class ShadowReplay:
         tickdata = TickStorage(self._paths.history_db).get_tickdata(BarSize.parse_str(bar_size))
         spacing = pd.Timedelta(seconds=bar_seconds(bar_size))
         earlier = xnys_sessions(inputs_from, session)[:-1] if inputs_from is not None else []
-        stamps_of = {conid: _utc_stamps(tickdata.read(conid, date_range=DateRange(
-            start=ny_day_start(earlier[0] if earlier else session), end=before_close(session)))) for conid in conids}
+        stamps_of = {conid: _utc_stamps(regular_session_bars(tickdata.read(conid, date_range=DateRange(
+            start=ny_day_start(earlier[0] if earlier else session), end=before_close(session))), SHADOW_CALENDAR))
+            for conid in conids}
         for day in [session, *earlier]:
             for conid in conids:
                 problem = _session_bar_problem(stamps_of[conid], conid, bar_size, spacing, day)
@@ -369,4 +372,5 @@ class ShadowReplay:
             strategy_file=str(Path(self._paths.repo_root) / path), class_name=class_name,
             conids=tuple(case.conids), bar_size=case.bar_size, order_notional=float(cost["order_notional"]),
             account_equity=float(cost["account_equity"]),
-            max_gross_allocation=float(cost["max_gross_allocation"]))
+            max_gross_allocation=float(cost["max_gross_allocation"]),
+            regular_session_calendar=SHADOW_CALENDAR)          # the bars the evaluation backtested

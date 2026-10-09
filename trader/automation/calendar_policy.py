@@ -72,7 +72,7 @@ class XNYSCalendarPolicy:
         return xcals.__version__
 
     def is_session(self, day: dt.date) -> bool:
-        return bool(self._calendar.is_session(pd.Timestamp(day)))
+        return bool(self._calendar_through(day).is_session(pd.Timestamp(day)))
 
     def sessions_in_range(self, start: dt.date, end: dt.date) -> list[dt.date]:
         """XNYS session dates in ``[start, end]``; empty when ``end`` is before ``start``."""
@@ -82,7 +82,7 @@ class XNYSCalendarPolicy:
         return [ts.date() for ts in calendar.sessions_in_range(pd.Timestamp(start), pd.Timestamp(end))]
 
     def _calendar_through(self, day: dt.date) -> Any:
-        """Our own calendar, rebuilt further out once ``day`` passes its end (a long-running process).
+        """Our own calendar, rebuilt further out once ``day`` passes its end (a long-running process; #92).
 
         An injected calendar is kept as given; past its end it raises ``DateOutOfBounds``.
         """
@@ -98,7 +98,7 @@ class XNYSCalendarPolicy:
 
     def previous_session(self, day: dt.date) -> dt.date:
         """The last XNYS session strictly before ``day`` (also across weekends and holidays)."""
-        return self._calendar.date_to_session(pd.Timestamp(day - dt.timedelta(days=1)),
+        return self._calendar_through(day).date_to_session(pd.Timestamp(day - dt.timedelta(days=1)),
                                               direction="previous").date()
 
     def resolve(
@@ -110,11 +110,12 @@ class XNYSCalendarPolicy:
         """Return the XNYS schedule for ``now``'s session date, or None if closed."""
         now_utc = _as_utc(now)
         session_ts = pd.Timestamp(now_utc.astimezone(ET).date())
-        if not bool(self._calendar.is_session(session_ts)):
+        calendar = self._calendar_through(session_ts.date())
+        if not bool(calendar.is_session(session_ts)):
             return None
 
-        open_utc = _to_pydatetime(self._calendar.session_open(session_ts))
-        close_utc = _to_pydatetime(self._calendar.session_close(session_ts))
+        open_utc = _to_pydatetime(calendar.session_open(session_ts))
+        close_utc = _to_pydatetime(calendar.session_close(session_ts))
         # Regular XNYS close is 16:00 ET; anything earlier is an early close.
         close_et = close_utc.astimezone(ET)
         is_early = not (close_et.hour == 16 and close_et.minute == 0)

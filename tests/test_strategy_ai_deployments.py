@@ -19,7 +19,7 @@ from tests.test_strategy_artifact_soft_load import _make_runtime, _write_strateg
 from tests.test_strategy_runtime import _make_ticker
 from trader.acceptance.scenario import AcceptanceSettings, deployment_record
 from trader.data.backtest_store import compute_strategy_hash
-from trader.data.duckdb_store import DuckDBConnection
+from trader.data.duckdb_store import DuckDBConnection, DuckDBDataStore
 from trader.data.strategy_signal_record import StrategySignalRecord
 from trader.listeners.ib_history_worker import IBNoDataError
 from trader.messaging.ai_deployment_wire import ActiveAiDeployment
@@ -463,3 +463,36 @@ def test_an_overlapping_reconcile_neither_feeds_nor_backfills_an_instance_still_
         reconcile_a.join(10)
     assert history_rt.strategies[CONID] == [instance_of(history_rt)]
 
+
+class FailedReadBack:
+    """Fails every DuckDB read made after a write, i.e. the read-back of freshly backfilled bars."""
+    def __init__(self, monkeypatch):
+        self.armed, self.written = True, False
+        real_read, real_write = DuckDBDataStore.read, DuckDBDataStore.write
+
+        def write(store, *args, **kwargs):
+            self.written = True
+            return real_write(store, *args, **kwargs)
+
+        def read(store, *args, **kwargs):
+            if self.armed and self.written:
+                raise RuntimeError("IO Error: database is locked")
+            return real_read(store, *args, **kwargs)
+
+        monkeypatch.setattr(DuckDBDataStore, "write", write)
+        monkeypatch.setattr(DuckDBDataStore, "read", read)
+
+
+def test_a_failed_history_read_back_fails_the_load_and_the_next_reconcile_retries(
+        history_rt, path, caplog, monkeypatch):
+    history_rt.historical_data_client = FakeHistoryClient()
+    read_back = FailedReadBack(monkeypatch)
+    wire_runtime_reconcile(history_rt, path, [active(path)])
+    with caplog.at_level(logging.ERROR):
+        history_rt._reconcile_sync()
+    assert history_rt.ai_instances() == {} and history_rt.strategies.get(CONID, []) == []
+    assert any(r.levelno == logging.ERROR and "AI_HISTORY_BACKFILL_FAILED" in r.getMessage()
+               and "database is locked" in r.getMessage() for r in caplog.records)
+    read_back.armed = False
+    history_rt._reconcile_sync()
+    assert history_rt.strategies[CONID] == [instance_of(history_rt)]

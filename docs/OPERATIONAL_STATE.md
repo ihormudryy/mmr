@@ -562,9 +562,10 @@ first deploy of this build:
   costs nothing: the `ai` service notes it `STRATEGY_NOT_BOUND` and makes no
   model call and records no baseline.
 - When the strategy service loads an `aidv-` instance, it first backfills its
-  conids from IB (5 days, the startup history step). If that fails, it logs
-  `AI_HISTORY_BACKFILL_FAILED`, unloads the instance and retries at the next
-  reconcile (every 30 s); the instance gets no bar until its history is in.
+  conids from IB (5 days, the startup history step) and reads them back. If
+  either fails, it logs `AI_HISTORY_BACKFILL_FAILED`, does not load the
+  instance and retries at the next reconcile (every 30 s); the instance joins
+  the runtime and gets bars only once its history is in.
 - Stop a judged version (operator, final): `mmr ai-deployment withdraw sha256:<version> --reason "<why>"`.
   Its `aidv-` instance unloads and new entries are refused; exits and open
   brackets are untouched. While an entry of that version is being sent the

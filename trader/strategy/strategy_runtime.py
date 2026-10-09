@@ -928,7 +928,13 @@ class StrategyRuntime():
         if not await self._fetch_strategy_history(instance):
             raise AiHistoryBackfillError('IB returned no data or a conid did not resolve (see the log above)')
         for conId in instance.conids:
-            self._prime_hist_bars(conId, instance.bar_size)   # replace a frame primed before the backfill
+            try:
+                bars = self._read_hist_bars(conId, instance.bar_size)
+            except Exception as ex:
+                raise AiHistoryBackfillError(f'reading back the history of conId {conId} failed: {ex}') from ex
+            if bars.empty:
+                raise AiHistoryBackfillError(f'no history bars for conId {conId} after the backfill')
+            self._hist_bars[(conId, instance.bar_size)] = bars   # replaces a frame primed before the backfill
 
     @staticmethod
     def _coerce_param_value(value):

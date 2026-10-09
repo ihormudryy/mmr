@@ -2597,6 +2597,12 @@ class WithdrawalEvidencePort(Protocol):
     def committed_withdrawal(self, command_id: str) -> Optional[dict[str, Any]]: ...
 
 
+def _is_cancel_child_of(child: LedgerRow, root: LedgerRow, order_id: str) -> bool:
+    """Whether ``child`` is the cancel_order a cancel_orders root fanned out for ``order_id``."""
+    return (child.action == "cancel_order" and child.target_type == "order" and child.target_id == order_id
+            and child.account_id == root.account_id)
+
+
 def read_received_at_start(ledger: CommandLedger) -> list[LedgerRow]:
     """The RECEIVED rows before a process serves any command, so none belongs to a handler of it (issue #114,
     PR #122: a fence, not a clock). Read once per process. A failed read parks nothing: crash-left rows stay
@@ -2675,6 +2681,7 @@ class OutcomeReconciler:
         self._withdrawals = withdrawals
         self._unreadable_evidence: set[str] = set()   # command ids logged once; the 15-minute alert follows
         self._unreadable_sagas: set[str] = set()      # logged once; the 15-minute alert follows
+        self._child_collisions: set[str] = set()      # cancel_orders roots whose child-id clash was logged
         self._plans: dict[str, _ReconcilePlan] = {}
         # The process's own start snapshot when given (the command stack keeps one per process); else read now.
         self._received_at_start = (received_at_start if received_at_start is not None
@@ -2902,6 +2909,13 @@ class OutcomeReconciler:
         self._reject_command_only(row, error_code=not_committed_code,
                                   outcome={**not_committed_outcome, "reconciled": "never_committed"}, now=now)
         return True
+
+    def _child_id_collision(self, row: LedgerRow, foreign: list[str]) -> None:
+        if row.command_id not in self._child_collisions:
+            self._child_collisions.add(row.command_id)
+            logger.error("cancel_orders %s stays OUTCOME_UNKNOWN: its child id(s) %s hold other commands, not its "
+                         "cancel_order children; an operator must check the ledger", row.command_id,
+                         ", ".join(foreign))
 
     def _evidence_unreadable(self, row: LedgerRow) -> None:
         """A failed evidence read never proves anything: the command stays OUTCOME_UNKNOWN and is asked again
@@ -3135,7 +3149,11 @@ class OutcomeReconciler:
         Settled only on child evidence read from the ledger: every child settled -> RESOLVED with their
         outcomes; no child at all -> REJECTED ``CANCEL_FANOUT_NOT_STARTED`` (no cancel was sent; the operator
         sends the cancel again); a partial fan-out or a child still in flight -> stays unknown. The request
-        comes from the root's audit record; without it nothing is concluded."""
+        comes from the root's audit record; without it nothing is concluded.
+
+        The ledger keeps no parent link, so a row counts as the child only when it is the ``cancel_order`` of
+        this root's account for the order its index stands for. Any other row on a child id is foreign: the
+        root stays unknown with one ERROR naming it (PR #122), never a success."""
         try:
             body = self._ledger.audited_body(row.command_id)
             order_ids = list(dict.fromkeys((body or {}).get("order_entity_ids") or []))
@@ -3145,6 +3163,11 @@ class OutcomeReconciler:
             self._evidence_unreadable(row)
             return False
         if not order_ids:
+            return False
+        foreign = [child.command_id for order_id, child in zip(order_ids, children)
+                   if child is not None and not _is_cancel_child_of(child, row, order_id)]
+        if foreign:
+            self._child_id_collision(row, foreign)
             return False
         if all(child is None for child in children):
             self._reject_command_only(row, error_code=CANCEL_FANOUT_NOT_STARTED,

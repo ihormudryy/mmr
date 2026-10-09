@@ -1619,3 +1619,20 @@ def test_a_handler_started_after_the_start_is_never_parked_even_after_a_clock_ro
                                            account_id="DU111111", target_type="ai_deployment", target_id="d",
                                            expected_version=None, body={}, source="ai_research"))
     assert seen == ["RECEIVED"] and receipt.state == "RESOLVED"
+
+
+def test_a_foreign_row_on_a_child_id_is_no_cancel_evidence(recon, caplog):
+    """PR #122: a terminal command that only shares the predictable child id never settles the root."""
+    recon.ledger.insert_for_test("batch-0", state="RESOLVED", updated_at=NOW, account_id="DU111111",
+                                 action="create_proposal", target_type="proposal", target_id="")
+    coord = _recon_coordinator(recon)
+    coord.register_action("cancel_orders", lambda cmd: (_ for _ in ()).throw(ProcessKilled()),
+                          requires_preflight=False)
+    _killed(coord, "batch", "cancel_orders", {"order_entity_ids": ["ord-1"]})
+    reconciler = _restarted(recon)
+    reconciler.rescan_on_startup()
+    reconciler.run_due(LATER)
+    reconciler.run_due(LATER + dt.timedelta(seconds=5))
+    assert recon.ledger.get("batch").state == "OUTCOME_UNKNOWN"
+    errors = [r.getMessage() for r in caplog.records if r.levelname == "ERROR" and "batch-0" in r.getMessage()]
+    assert len(errors) == 1

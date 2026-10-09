@@ -318,7 +318,8 @@ message with no traceback.
 
 ## Infrastructure
 
-- Split compose: ib-gateway, trader, strategy, data, dashboard, scheduler.
+- Split compose: ib-gateway, trader, strategy, data, dashboard, scheduler. The opt-in `ai` profile adds `ai` and `research`
+  (start them with `docker compose --profile ai up -d ai research`; `./docker.sh -u` does not).
 - Restart policy: `unless-stopped`.
 - Paper mode; typed Ed25519 RPC (one key per principal, allow-list in
   `trader/messaging/principals.py`). Dashboard on host loopback (default 7424).
@@ -340,9 +341,9 @@ are separate; each loader refuses the other kind.
 `./docker.sh -k` (or `mmr keys init` on a host install) before you redeploy;
 `./docker.sh -u` refuses to start while it is missing.
 
-**Research service (SP2c Plan 3): not armed.** The `research` container is in the
-opt-in `ai` profile and nothing starts it yet. It holds the research signing key,
-so it needs one more file than the other services. First start:
+**Research service (SP2c Plan 3).** The `research` container is in the opt-in `ai` profile.
+`./docker.sh -u` does not start it; the `ai` service and the research cycle (SP2c Plans 4-5) use it.
+It holds the research signing key, so it needs one more file than the other services. First start:
 1. `mmr keys init-signing` once on the host. It creates
    `~/.config/mmr/keys/private/signing.pem` (mode 0600) and
    `keys/verify/paper-automation.pem`, and never overwrites a private key.
@@ -504,6 +505,8 @@ tables are in `mmr_research.duckdb`; there is no `mmr` command for these yet):
 
 ## Next operator session (paper soak)
 
+Ordered deploy checklist for the first SP2 paper deployment: [`docs/SP2_PAPER_DEPLOY.md`](SP2_PAPER_DEPLOY.md).
+
 **SP1 paper acceptance (Plan 6):** before SP2 trades, run one real IB paper
 session by [`docs/PAPER_ACCEPTANCE_SP1.md`](PAPER_ACCEPTANCE_SP1.md): the
 clean-account gate (`mmr experiment acceptance preflight`), arming, the
@@ -515,7 +518,7 @@ harness holds its own controller epoch (lease 60 s). Stop the `ai` service
 before an acceptance run, or the harness waits on `CONTROLLER_EPOCH_HELD` and
 then fails.
 
-- AI paper controller (SP2): `./docker.sh -u` copies `ai.yaml` to `~/.config/mmr/` once; fill in the model ids and prices, then `docker compose --profile ai up -d ai`. The signing key matters only when the research service runs (it is in the same `ai` profile): before `./docker.sh -u` with the `ai` profile active, or any start of `research`, run `mmr keys init-signing` once (a direct `docker compose` start skips the `./docker.sh` check). Stop it with `docker compose --profile ai stop ai` (always before the SP1 acceptance run). Its health is the heartbeat file `/tmp/mmr_ai_heartbeat.json` inside the container. Its data volume `mmr_ai_data` is kept by `./docker.sh -d`; only `./docker.sh -c` removes volumes. Schema rule (no legacy data): `ai.duckdb` tables are edited in place, never upgraded; if a pre-release build ever created `ai.duckdb`, delete the `mmr_ai_data` volume (`docker volume rm mmr_mmr_ai_data`; Compose prefixes the project name `mmr`) before starting a newer one.
+- AI paper controller (SP2): `./docker.sh -u` copies `ai.yaml` to `~/.config/mmr/` once; fill in the model ids and prices, then `docker compose --profile ai up -d ai research`. `./docker.sh -u` runs `docker compose up -d` without `--profile`, so it neither starts nor recreates `ai` and `research` (only `COMPOSE_PROFILES=ai` in your environment changes that). After every rebuild (`./docker.sh -b -u`) and every `ai.yaml` edit, recreate them: `docker compose --profile ai up -d --force-recreate ai research` (the config files are single-file bind mounts, and a plain `up -d` sees no change). The signing key matters when the research service runs: before `./docker.sh -u` with `COMPOSE_PROFILES=ai`, or any start of `research`, run `mmr keys init-signing` once (a direct `docker compose` start skips the `./docker.sh` check; `./docker.sh -K` needs the key too). Stop it with `docker compose --profile ai stop ai` (always before the SP1 acceptance run). Its health is the heartbeat file `/tmp/mmr_ai_heartbeat.json` inside the container. Its data volume `mmr_ai_data` is kept by `./docker.sh -d`; only `./docker.sh -c` removes volumes. Schema rule (no legacy data): `ai.duckdb` tables are edited in place, never upgraded; if a pre-release build ever created `ai.duckdb`, delete the `mmr_ai_data` volume (`docker volume rm mmr_mmr_ai_data`; Compose prefixes the project name `mmr`) before starting a newer one.
 
 **Upgrade (SP2c Plan 2: judged deployments and versions).** Before the
 first deploy of this build:
@@ -531,24 +534,31 @@ first deploy of this build:
      the volume, so step 4 would fail), then `./docker.sh -d`.
   3. Drop the tables. Run this from the repo root (Compose reads
      `docker-compose.yml` there). Paths are the `trader.yaml` defaults; use
-     yours if you changed `duckdb_path` or `journal_duckdb_path`:
+     yours if you changed `duckdb_path` or `journal_duckdb_path`. Journal tables
+     edited in place since SP1 are `ai_paper_decisions` (migration 56),
+     `ai_deployments` (55, gained `kind`) and `ai_costs` (63, reshaped;
+     `simulated_books` left that migration):
      ```bash
      docker compose run --rm --no-deps --entrypoint python scheduler -c "
-     import duckdb
+     import duckdb, os
      d = '/home/trader/.local/share/mmr/data/'
-     j = duckdb.connect(d + 'mmr_journal.duckdb')
-     j.execute('DROP TABLE IF EXISTS ai_paper_decisions')
-     j.execute('DELETE FROM schema_migrations WHERE version = 56')
-     j.close()
-     t = duckdb.connect(d + 'mmr.duckdb')
-     for name in ('strategy_signal_record', 'strategy_signal_record_state', 'strategy_signal_record_generation'):
-         t.execute('DROP TABLE IF EXISTS ' + name)
-     t.close()"
+     if os.path.exists(d + 'mmr_journal.duckdb'):
+         j = duckdb.connect(d + 'mmr_journal.duckdb')
+         for name in ('ai_paper_decisions', 'ai_deployments', 'ai_costs', 'simulated_books'):  # simulated_books: a v0.2.0 table SP2 no longer creates; its replacements simulated_decisions/outcomes (95, 96) are new and never edited
+             j.execute('DROP TABLE IF EXISTS ' + name)
+         j.execute('DELETE FROM schema_migrations WHERE version IN (55, 56, 63)')
+         j.close()
+     if os.path.exists(d + 'mmr.duckdb'):
+         t = duckdb.connect(d + 'mmr.duckdb')
+         for name in ('strategy_signal_record', 'strategy_signal_record_state', 'strategy_signal_record_generation'):
+             t.execute('DROP TABLE IF EXISTS ' + name)
+         t.close()"
      ```
-     The `schema_migrations` row matters: without deleting it, migration 56
-     never creates `ai_paper_decisions` again (all its statements are
+     The `schema_migrations` rows matter: without deleting them, migrations
+     55, 56 and 63 never create their tables again (all statements are
      `IF NOT EXISTS`, so the replay is safe). The strategy service creates
      the three `strategy_signal_record*` tables on start.
+     Full ordered steps: [`SP2_PAPER_DEPLOY.md`](SP2_PAPER_DEPLOY.md).
   4. Delete the ai volume: `docker volume ls | grep mmr_ai_data` shows its
      full name (Compose prefixes the project name `mmr`), then
      `docker volume rm mmr_mmr_ai_data`.
@@ -582,13 +592,14 @@ first deploy of this build:
   ended). The trader re-reads a version's judgment and signed case with
   these keys.
 
-**Starting the AI paper decision loop (SP2):**
+**Starting the AI paper decision loop (SP2).** Order: deploy with research on and the experiment PAUSED (nothing enters) → wait for the first judged DEPLOY version → run the SP1 acceptance with that version → only then publish the policy, register the discretionary deployment and arm the experiment (below). The ordered checklist is [`SP2_PAPER_DEPLOY.md`](SP2_PAPER_DEPLOY.md).
 
 1. Publish the initial risk policy (operator, once): `mmr ai-policy publish policy.yaml --reason "initial paper policy"`.
 2. Register the discretionary deployment (operator, once): `mmr ai-deployment register-discretionary --operator <name> --statement "<why>"`; note the printed digest.
 3. Edit `~/.config/mmr/ai.yaml`: model ids and prices (`roles:`, `pricing:`); `decisions.discretionary_deployment_digest`; the bracket of judged strategies (`decisions.ai_deployments`: stop and target fractions). Since SP2c Plan 2 only `aidv-` instances of ACTIVE judged versions are followed; `decisions.strategies` entries no longer trade and cost nothing (see the upgrade note above).
-4. Start it: `docker compose --profile ai up -d ai`. If the research service runs too (same `ai` profile, e.g. `./docker.sh -u` with the profile active), run `mmr keys init-signing` once first; a direct `docker compose` start skips the `./docker.sh` check. Stop it before the SP1 acceptance run.
-5. Check: the heartbeat file, `mmr scoreboard` (books per baseline, AI cost with status), and `ai_rulings` / `ai_discovery_reads` in `ai.duckdb` for refusals and discovery coverage.
+4. Start it: `docker compose --profile ai up -d --force-recreate ai research`. Run `mmr keys init-signing` once first (research needs the signing key; a direct `docker compose` start skips the `./docker.sh` check). Stop `ai` before the SP1 acceptance run.
+5. Arm the experiment: `mmr experiment start --reason "sp2 paper"`. The `ai` service enters only while the experiment is ARMED (a PAUSED one holds every entry off, and a research slot is `SKIPPED` when no experiment exists at all).
+6. Check: the heartbeat file, `mmr scoreboard` (books per baseline, AI cost with status), and `ai_rulings` / `ai_discovery_reads` in `ai.duckdb` for refusals and discovery coverage.
 
 The service never publishes or loosens policy. A role whose provider rejects its model is paused for 5 minutes at a time: Jev down blocks every ENTER, orchestrator down stops discovery and model closes; SP1's stops, targets and the 15:45 flatten are unaffected.
 
@@ -628,14 +639,23 @@ Do not arm a second automatic strategy. Do not set `automation.live_enabled`.
 
 ### Turn it on
 
-1. In `trader.yaml` put the strategy keys into `ai_paper.backtest_judge.strategy_allowlist` (`strategies/<file>.py:<Class>`). This is the authority. An empty list means nothing may be evaluated. Restart the trader (`./docker.sh -b -u`).
+1. In `trader.yaml` put the strategy keys into `ai_paper.backtest_judge.strategy_allowlist` (`strategies/<file>.py:<Class>`). This is the authority. An empty list means nothing may be evaluated. Restart the trader (`docker compose restart trader`; `./docker.sh -b -u` also works after a rebuild).
 2. In `ai.yaml` `research:` put the same keys in `strategy_keys`. Add at least one universe of 8 to 20 conids. Check each conid with `mmr resolve SYMBOL`. Set `enabled: true`.
    - Keep `research.max_cohort_points` at or below `ai_paper.backtest_judge.max_cohort_points`. The `ai` service cannot read `trader.yaml`.
-   - The strategy files are baked into the image. After you edit a strategy, rebuild (`./docker.sh -b -u`) so `ai` and `research` read the same bytes.
-3. Make sure the `research` service runs (see "Research service (SP2c Plan 3)" above) and an experiment was started (`mmr experiment start`). Without an experiment a slot is `SKIPPED` (`NO_EXPERIMENT`).
-4. Restart `ai` (`./docker.sh -b -u`, or `docker compose --profile ai up -d ai`). A bad `research:` block stops `ai` at start. The error names the field (`RESEARCH_MENU_EMPTY`, `RESEARCH_UNIVERSE_INVALID`, `RESEARCH_BAR_SIZE_INVALID`, `RESEARCH_BAR_SIZE_TOO_LONG`, `RESEARCH_DUPLICATE_STRATEGY`).
+   - The strategy files are baked into the image. After you edit a strategy, rebuild (`./docker.sh -b`) and recreate (`./docker.sh -u`, then `docker compose --profile ai up -d --force-recreate ai research`) so `trader`, `ai` and `research` read the same bytes.
+3. Make sure the `research` service runs (see "Research service (SP2c Plan 3)" above) and an experiment exists (`mmr experiment start`; `mmr experiment pause` keeps entries off). Without an experiment a slot is `SKIPPED` (`NO_EXPERIMENT`).
+4. Recreate `ai` and `research`: `docker compose --profile ai up -d --force-recreate ai research` (`./docker.sh -b -u` does not touch them). A bad `research:` block stops `ai` at start. The error names the field (`RESEARCH_MENU_EMPTY`, `RESEARCH_UNIVERSE_INVALID`, `RESEARCH_BAR_SIZE_INVALID`, `RESEARCH_BAR_SIZE_TOO_LONG`, `RESEARCH_DUPLICATE_STRATEGY`).
 
-**Daily bars for every conid (important).** The trader checks the liquidity of an ENTER from its local daily bars only (`production_evidence.py`, `liquidity_from_history`). There is no Alpaca fallback. So every conid in a research universe must also be in a universe that the scheduler refreshes with a daily job. The jobs are in `data_refresh.yaml` (`bar_size: "1 day"`) and the cron entries in `pycron.yaml` (`data_refresh_us`, `data_refresh_asx`). A conid with no daily history gets its ENTER refused with `HISTORY_INVALID`, after a good backtest. Check with `mmr data status`.
+**Daily bars for every conid (important).** The trader checks the liquidity of an ENTER from its local daily bars only (`production_evidence.py`, `liquidity_from_history`). There is no Alpaca fallback. So every conid in a research universe must also be in a universe that the scheduler refreshes with a daily job. The jobs are in `data_refresh.yaml` (`bar_size: "1 day"`) and the cron entries in `pycron.yaml` (`data_refresh_us`, `data_refresh_asx`). A conid with no daily history gets its ENTER refused with `HISTORY_INVALID`, after a good backtest. Check with `mmr data status` (in the scheduler container, see below).
+
+**History an evaluation needs (more than daily bars).** An evaluation reads `research_service.period_sessions` sessions (default 690, the last 90 are the holdout) of the candidate's own bar size for every conid, and SPY daily bars from 220 sessions before the period start (`trader/research/evaluation_data.py`). If a conid has no bars of that size in the period, the evaluation stops with "download them before evaluating". The scheduler jobs shipped in `data_refresh.yaml` cover only `"1 day"` (365 days) and `"1 min"` (90 days), so a research bar size such as `"15 mins"` is not downloaded or kept fresh by default (ticket #111: scheduler coverage for research bar sizes). Download the history first, inside the scheduler container (the bars live in the `mmr_db_data` volume, not on the host):
+
+```bash
+docker compose run --rm scheduler mmr data download SPY --bar-size "1 day" --days 1400
+docker compose run --rm scheduler mmr data download AAPL MSFT --bar-size "15 mins" --days 1050
+```
+
+The day counts are an estimate (690 + 220 sessions, about 252 sessions a year); the SPY error message prints the exact command. Until #111 is done, add a job for each research bar size to `data_refresh.yaml` and its name to `data_refresh_us` in `pycron.yaml` yourself.
 
 ### Watch it
 

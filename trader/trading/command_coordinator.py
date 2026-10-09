@@ -2597,6 +2597,18 @@ class WithdrawalEvidencePort(Protocol):
     def committed_withdrawal(self, command_id: str) -> Optional[dict[str, Any]]: ...
 
 
+def read_received_at_start(ledger: CommandLedger) -> list[LedgerRow]:
+    """The RECEIVED rows before a process serves any command, so none belongs to a handler of it (issue #114,
+    PR #122: a fence, not a clock). Read once per process. A failed read parks nothing: crash-left rows stay
+    RECEIVED until the next process start."""
+    try:
+        return ledger.received()
+    except Exception:
+        logger.exception("the RECEIVED commands at start cannot be read; a crash-left one stays RECEIVED "
+                         "until the next start")
+        return []
+
+
 class OutcomeReconciler:
     """Resolves ``SUBMITTING``/``OUTCOME_UNKNOWN`` commands against authority.
 
@@ -2648,6 +2660,7 @@ class OutcomeReconciler:
         closes: Optional[Any] = None,
         registrations: Optional[RegistrationEvidencePort] = None,
         withdrawals: Optional[WithdrawalEvidencePort] = None,
+        received_at_start: Optional[list[LedgerRow]] = None,
     ):
         self._journal = journal
         self._ledger = ledger
@@ -2663,7 +2676,9 @@ class OutcomeReconciler:
         self._unreadable_evidence: set[str] = set()   # command ids logged once; the 15-minute alert follows
         self._unreadable_sagas: set[str] = set()      # logged once; the 15-minute alert follows
         self._plans: dict[str, _ReconcilePlan] = {}
-        self._received_at_start = self._snapshot_received()
+        # The process's own start snapshot when given (the command stack keeps one per process); else read now.
+        self._received_at_start = (received_at_start if received_at_start is not None
+                                   else read_received_at_start(ledger))
 
     # -- scheduling --------------------------------------------------------
 
@@ -2736,22 +2751,14 @@ class OutcomeReconciler:
                 requeued.append(row.command_id)
         return requeued
 
-    def _snapshot_received(self) -> list[LedgerRow]:
-        """The RECEIVED rows at construction. The command stack builds this reconciler before it serves any
-        command, so none of them belongs to a handler of this process (PR #122: a fence, not a clock)."""
-        try:
-            return self._ledger.received()
-        except Exception:
-            logger.exception("the RECEIVED commands at start cannot be read; a crash-left one stays RECEIVED")
-            return []
-
     def _park_received_at_start(self) -> None:
         """RECEIVED -> OUTCOME_UNKNOWN for the single-step rows of the start snapshot, once.
 
         Never terminal: only the action's own evidence settles a row, and an action without a resolver stays
         OUTCOME_UNKNOWN (and alerts after 15 minutes). Sagas are left alone. One failed row never stops the
         others; it stays RECEIVED until the next start. A later rescan parks nothing."""
-        snapshot, self._received_at_start = self._received_at_start, []
+        snapshot = list(self._received_at_start)
+        self._received_at_start.clear()          # shared with any later stack of this process: parked once
         for row in snapshot:
             if row.action in SAGA_ACTIONS:
                 continue

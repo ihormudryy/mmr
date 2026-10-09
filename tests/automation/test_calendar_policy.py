@@ -166,3 +166,20 @@ def test_previous_session_is_strictly_before_also_across_a_holiday_and_a_weekend
     assert policy.previous_session(dt.date(2026, 10, 12)) == dt.date(2026, 10, 9)    # Monday -> Friday
     assert policy.previous_session(dt.date(2026, 10, 11)) == dt.date(2026, 10, 9)    # a Sunday
     assert policy.is_session(dt.date(2026, 11, 26)) is False and policy.is_session(dt.date(2026, 11, 27)) is True
+
+
+def test_every_method_works_for_a_day_years_after_the_policy_was_built():
+    policy = XNYSCalendarPolicy()                       # its own calendar ends about a year from today
+    year = dt.date.today().year + 3
+    reference = xcals.get_calendar("XNYS", start=f"{year}-01-01", end=f"{year}-12-31")
+    session = reference.sessions_in_range(f"{year}-07-07", f"{year}-07-14")[2].date()
+    closed_day = next(day for day in (dt.date(year, 7, d) for d in range(1, 31)) if not reference.is_session(day))
+
+    assert policy.is_session(session) is True and policy.is_session(closed_day) is False
+    expected_previous = reference.date_to_session(pd.Timestamp(session - dt.timedelta(days=1)), direction="previous")
+    assert policy.previous_session(session) == expected_previous.date()
+    noon_et = dt.datetime.combine(session, dt.time(12, 0), tzinfo=ZoneInfo("America/New_York"))
+    schedule = policy.resolve(noon_et)
+    assert schedule is not None and schedule.session_date == session
+    assert schedule.close_utc == reference.session_close(pd.Timestamp(session)).to_pydatetime()
+    assert policy.resolve(dt.datetime.combine(closed_day, dt.time(12, 0), tzinfo=ZoneInfo("America/New_York"))) is None

@@ -1340,3 +1340,56 @@ def test_unknown_command_blocks_other_commands_for_the_same_proposal(gate):
     assert unknown.state == "OUTCOME_UNKNOWN"
     blocked = gate.execute_reject(record, command_id="cmd-2")
     assert blocked.error_code == "COMMAND_IN_FLIGHT"              # §9.5
+
+
+# -- register_ai_deployment: resolved from the sealed version only (issue #101) ----------------------
+
+class FakeRegistrations:
+    def __init__(self, outcomes=None, error=None):
+        self.outcomes, self.error, self.asked = dict(outcomes or {}), error, []
+
+    def committed_outcome(self, command_id):
+        self.asked.append(command_id)
+        if self.error is not None:
+            raise self.error
+        return self.outcomes.get(command_id)
+
+
+def _registration_reconciler(recon, registrations):
+    return OutcomeReconciler(journal=recon.journal, ledger=recon.ledger, orders=recon.orders,
+                             strategy=recon.strategy, alerts=recon.alerts, repo=recon.repo, now=recon.now,
+                             registrations=registrations)
+
+
+def _unknown_registration(recon, command_id, state="OUTCOME_UNKNOWN"):
+    recon.ledger.insert_for_test(command_id, state=state, updated_at=NOW, account_id="DU111111",
+                                 action="register_ai_deployment", target_type="ai_deployment",
+                                 target_id="sha256:" + "a" * 64)
+
+
+def test_an_unknown_registration_stays_unknown_without_the_evidence_port(recon):
+    _unknown_registration(recon, "aidep-1")
+    assert recon.reconciler.reconcile_once("aidep-1", recon.now()).resolved is False
+    assert recon.ledger.get("aidep-1").state == "OUTCOME_UNKNOWN"
+
+
+def test_an_unreadable_sealed_version_keeps_the_registration_unknown_and_other_commands_reconcile(recon, caplog):
+    reconciler = _registration_reconciler(recon, FakeRegistrations(error=RuntimeError("tampered")))
+    _unknown_registration(recon, "aidep-1")
+    recon.ledger.insert_for_test("co-1", state="OUTCOME_UNKNOWN", updated_at=NOW, account_id="DU111111",
+                                 action="cancel_orders", target_type="order_group", target_id="")
+    reconciler.schedule("aidep-1", NOW)
+    reconciler.schedule("co-1", NOW)
+    reconciler.run_due(NOW)
+    assert (recon.ledger.get("aidep-1").state, recon.ledger.get("co-1").state) == ("OUTCOME_UNKNOWN", "RESOLVED")
+    reconciler.run_due(NOW + dt.timedelta(seconds=CRITICAL_AFTER_SECONDS))
+    assert recon.alerts.raised == ["aidep-1"]
+    assert len([r for r in caplog.records if r.levelname == "ERROR" and "aidep-1" in r.getMessage()]) == 1
+
+
+def test_a_registration_whose_handler_may_still_run_is_never_resolved(recon):
+    registrations = FakeRegistrations()
+    reconciler = _registration_reconciler(recon, registrations)
+    _unknown_registration(recon, "aidep-1", state="SUBMITTING")      # a registration never reaches it
+    assert reconciler.reconcile_once("aidep-1", recon.now()).resolved is False
+    assert (recon.ledger.get("aidep-1").state, registrations.asked) == ("SUBMITTING", [])

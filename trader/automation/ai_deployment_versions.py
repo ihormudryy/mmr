@@ -160,6 +160,12 @@ class AiDeploymentVersionStore:
                            [judgment_id]).fetchone()
         return None if row is None else self._parse(row)
 
+    def sealed_by_command(self, command_id: str) -> Optional[SealedVersion]:
+        """The version this command's registration transaction committed, if it committed one."""
+        row = self._db.execute(f"SELECT {_COLUMNS} FROM ai_deployment_versions WHERE command_id = ?",
+                               [command_id], fetch="one")
+        return None if row is None else self._parse(row)
+
     def version_for_judgment(self, judgment_id: str) -> Optional[str]:
         sealed = self.bound_to_judgment(judgment_id)
         return None if sealed is None else sealed.digest

@@ -89,7 +89,7 @@ import os
 import re
 from dataclasses import asdict, dataclass
 from decimal import Decimal
-from typing import TYPE_CHECKING, Annotated, Any, Dict, Literal, Optional
+from typing import TYPE_CHECKING, Annotated, Any, Callable, Dict, Literal, Optional
 
 from ib_async import Contract
 from pydantic import BaseModel, ConfigDict, Field, Strict, field_validator
@@ -126,6 +126,7 @@ from trader.messaging.typed_rpc import (
 )
 from trader.strategy.strategy_revisions import StrategyCommandReceipt
 from trader.trading.command_coordinator import (
+    REGISTRATION_NOT_COMMITTED,
     ApprovalCommandService,
     CancelCommandService,
     CommandRequest,
@@ -1399,13 +1400,28 @@ def _register_ai_deployment_rpc_handler(coordinator: TradingCommandCoordinator, 
         deployment = AiDeployment.from_json(parsed.deployment)
         body = {"judgment_id": parsed.judgment_id, "bundle_digest": parsed.bundle_digest,
                 "deployment": deployment.to_json()}
-        request = CommandRequest(
-            command_id=actions.registration_command_id(body), action=REGISTER_ACTION, account_id=account_id,
-            target_type="ai_deployment", target_id=deployment_digest(deployment), expected_version=None,
-            body=body, source=caller.principal, principal=caller.principal,
-        )
-        return _loud_refusal_as_rpc_error(coordinator.execute(request))
+
+        def execute(command_id: str) -> CommandReceipt:
+            return coordinator.execute(CommandRequest(
+                command_id=command_id, action=REGISTER_ACTION, account_id=account_id,
+                target_type="ai_deployment", target_id=deployment_digest(deployment), expected_version=None,
+                body=body, source=caller.principal, principal=caller.principal,
+            ))
+        receipt = _past_uncommitted_registrations(execute, actions.registration_command_id(body))
+        return _loud_refusal_as_rpc_error(receipt)
     return _handler
+
+
+def _past_uncommitted_registrations(execute: Callable[[str], CommandReceipt], base_id: str) -> CommandReceipt:
+    """A registration the reconciler proved never committed replays that refusal forever, so the body is sent
+    again under the next command id (issue #101). Judged on the receipt, so a row rejected between two calls
+    is passed too; a row still OUTCOME_UNKNOWN replays as it is and never runs the handler twice."""
+    attempt = 1
+    while True:
+        receipt = execute(base_id if attempt == 1 else f"{base_id}-{attempt}")
+        if (receipt.state, receipt.error_code) != ("REJECTED", REGISTRATION_NOT_COMMITTED):
+            return receipt
+        attempt += 1
 
 
 def _loud_refusal_as_rpc_error(receipt: CommandReceipt) -> Dict[str, Any]:

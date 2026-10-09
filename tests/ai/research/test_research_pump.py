@@ -761,6 +761,22 @@ async def test_a_registration_the_ledger_has_not_settled_is_asked_again_with_one
     assert rig.rows("SELECT state FROM ai_research_registrations") == [("REGISTERED",)]
     (judgment_id,), = rig.rows("SELECT judgment_id FROM ai_research_registrations")
     assert len([r for r in records(caplog, logging.WARNING) if judgment_id in r.getMessage()]) == 1
+    assert records(caplog, logging.ERROR) == []
+
+
+@pytest.mark.asyncio
+async def test_a_registration_unsettled_past_the_reconcilers_alert_boundary_logs_one_error(rig, caplog):
+    """The trader's reconciler raises its critical alert after 15 minutes; the ai says so once too."""
+    caplog.set_level(logging.WARNING, logger=LOGGER)
+    script(rig)
+    unsettled = {**resolved(), "state": "OUTCOME_UNKNOWN", "outcome": None, "error_code": "INTERNAL_ERROR"}
+    rig.registry.queues["register_ai_deployment"] = [unsettled] * 40 + [resolved()]   # 31 s per pump
+    await night(rig, pumps=46)
+    assert rig.rows("SELECT state FROM ai_research_registrations") == [("REGISTERED",)]
+    (judgment_id,), = rig.rows("SELECT judgment_id FROM ai_research_registrations")
+    (error,) = records(caplog, logging.ERROR)
+    assert judgment_id in error.getMessage() and "NOT_SETTLED" in error.getMessage()
+    assert len([r for r in records(caplog, logging.WARNING) if judgment_id in r.getMessage()]) == 1
 
 
 @pytest.mark.asyncio

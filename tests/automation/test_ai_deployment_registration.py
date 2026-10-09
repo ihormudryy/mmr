@@ -134,6 +134,17 @@ def test_exact_retry_returns_the_same_versions(env):
                                                                              False)
 
 
+def test_only_the_command_that_sealed_a_version_has_a_committed_outcome(env):
+    env.judge("jdg-1", record())
+    first = env.register("jdg-1", record())
+    body = registration_body(env, "jdg-1", record())
+    assert env.registrar.committed_outcome(registration_command_id(body, NOW.date())) == first
+    env.now = NOW + dt.timedelta(days=3)
+    env.register("jdg-1", record())                                                  # replays; seals nothing
+    assert env.registrar.committed_outcome(registration_command_id(body, env.now.date())) is None
+    assert env.registrar.committed_outcome("aidep-never-sent") is None
+
+
 def test_another_body_for_a_bound_judgment_is_refused(env):
     env.judge("jdg-1", record())
     env.register("jdg-1", record())

@@ -129,6 +129,14 @@ class AiDeploymentRegistrar:
             return self._outcome(digest, version, created=created)
         return self._journal.mutate_batch_work(self._journal.connect(), lambda conn, _append: write(conn))
 
+    def committed_outcome(self, command_id: str) -> Optional[dict]:
+        """The outcome of the command whose own transaction sealed a version, or None when it sealed none.
+
+        The seal writes the command id in the same transaction as the version, so a row is proof of the commit.
+        A command that only replayed an existing version committed nothing and gets None."""
+        sealed = self._versions.sealed_by_command(command_id)
+        return None if sealed is None else self._outcome(sealed.digest, sealed.version, created=True)
+
     def _existing_outcome(self, bound: Any, digest_of_request: str) -> dict:
         if bound.request_digest != digest_of_request:
             raise DeploymentRefused("JUDGMENT_ALREADY_BOUND", f"judgment {bound.version.judgment_id} has a version")

@@ -42,6 +42,7 @@ THESIS_LABEL = "orchestrator_thesis"
 THESIS_MAX_CHARS = 1000                   # the proposal schema's own limit
 TERMINAL = frozenset({"DONE", "FAILED"})
 RETRY_REGISTRATION = frozenset({"DEPLOY_CAP_REACHED"})
+UNSETTLED_ERROR_SECONDS = 900                    # the trader reconciler's critical-alert boundary
 ATTEST_WAITS_FOR_TRADER = "TRADER_UNAVAILABLE"   # infrastructure behind the research service: no try is spent
 ATTEST_MAX_TRIES = 3                             # a "retryable" bundle error may be deterministic (Plan 3 as built)
 STALE_NOT_SUBMITTED = "STALE_NOT_SUBMITTED"
@@ -102,6 +103,7 @@ class ResearchCycle:
         self._root = strategies_root
         self._stuck_reported: set[str] = set()            # JUDGING rows already logged as stuck
         self._registration_waits: set[tuple[str, str]] = set()   # (judgment_id, code) already logged
+        self._unsettled_since: dict[str, dt.datetime] = {}      # judgment_id -> first NOT_SETTLED receipt
         self._slot_hold: Optional[tuple[str, dt.datetime]] = None    # (cycle_id, no orchestrator try before)
         self._slot_waits: set[tuple[str, str]] = set()           # (cycle_id, code) already logged
         self._lines_checked_for: Optional[str] = None            # the cycle whose finished lines were ended
@@ -714,8 +716,7 @@ class ResearchCycle:
             return await self._refuse_registration(judgment_id, f"RPC_{exc.code}", "register_ai_deployment", exc,
                                                    prior=prior)
         if outcome is None:
-            return self._warn_registration_once(judgment_id, "NOT_SETTLED", "the trader's ledger has not settled "
-                                                                            "it; asked again each pump")
+            return self._wait_for_settlement(judgment_id)
         now = self._clock.now()
         if isinstance(outcome, RegisterRefused) and outcome.retryable:
             return self._warn_registration_once(judgment_id, outcome.code, "the trader refused it for now and kept "
@@ -741,6 +742,19 @@ class ResearchCycle:
                      [outcome.base_digest, outcome.version_digest, outcome.expiry_session, now, judgment_id])
         if prior is not None:
             self._end_line_in_tx(conn, prior, "RENEWED")
+
+    def _wait_for_settlement(self, judgment_id: str) -> None:
+        """One WARNING, then one ERROR once the trader's reconciler would raise its own critical alert."""
+        self._warn_registration_once(judgment_id, "NOT_SETTLED", "the trader's ledger has not settled it; asked "
+                                                                 "again each pump")
+        since = self._unsettled_since.setdefault(judgment_id, self._clock.now())
+        waited = (self._clock.now() - since).total_seconds()
+        reported = (judgment_id, "NOT_SETTLED_ERROR")
+        if waited >= UNSETTLED_ERROR_SECONDS and reported not in self._registration_waits:
+            self._registration_waits.add(reported)
+            logger.error("registration of %s is still NOT_SETTLED after %d s (since %s): the trader's reconciler "
+                         "has not resolved it; an operator must check its command ledger", judgment_id, waited,
+                         since.isoformat())
 
     def _warn_registration_once(self, judgment_id: str, code: str, why: str) -> None:
         if (judgment_id, code) not in self._registration_waits:

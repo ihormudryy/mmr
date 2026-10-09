@@ -254,3 +254,101 @@ def test_each_handlers_own_set_is_its_acl_row(served, open_registry, method, rol
         except _DispatchProblem as problem:
             denied = problem.code == "PERMISSION_DENIED"
         assert denied == (principal not in TRADER_ACL[(role, method)]), (method, principal)
+
+
+# -- an OUTCOME_UNKNOWN registration resolves from the trader's journal (issue #101) ------------------
+
+REGISTRATION = {"judgment_id": "jdg-unknown-1", "bundle_digest": "sha256:" + "b" * 64, "deployment": record()}
+
+
+def seal_registration(served, body, *, principal, command_id):
+    """What the registrar's transaction commits, without the bundle path."""
+    import datetime as dt
+    from trader.automation.ai_deployment_registration import AiDeploymentRegistrar, request_digest
+    from trader.automation.ai_deployment_versions import INITIAL, DeploymentVersion
+    from trader.automation.ai_deployments import AiDeployment, deployment_digest
+    services = served.composed.stack.ai_paper
+    deployment = AiDeployment.from_json(body["deployment"])
+    today = served.now().date()
+    version = DeploymentVersion(deployment_digest(deployment), body["judgment_id"], INITIAL, None, today,
+                                today + dt.timedelta(days=40))
+
+    def write(conn):
+        services.deployments.register_in_tx(conn, deployment, principal=principal, command_id=command_id)
+        return services.versions.seal_in_tx(conn, version, request_digest=request_digest(body),
+                                            principal=principal, command_id=command_id)[0]
+    return AiDeploymentRegistrar._outcome(services.versions._db.transaction(write), version, created=True)
+
+
+def registration_rows(served):
+    return [tuple(row) for row in served.trader.journal_db.execute(
+        "SELECT command_id, state, error_code FROM command_ledger WHERE action = 'register_ai_deployment' "
+        "ORDER BY created_at, command_id", fetch="all")]
+
+
+def park_registration(served):
+    """The first send: the handler raises a plain error, the ledger parks OUTCOME_UNKNOWN."""
+    with pytest.raises(TypedRpcRemoteError) as exc:
+        served.call("ai_research", "register_ai_deployment", REGISTRATION)
+    assert exc.value.code == "INTERNAL_ERROR"
+    (row,) = registration_rows(served)
+    assert row[1:] == ("OUTCOME_UNKNOWN", "INTERNAL_ERROR")
+    return row[0]
+
+
+def commits_then_raises(served):
+    def register(body, *, principal, command_id):
+        seal_registration(served, body, principal=principal, command_id=command_id)
+        raise RuntimeError("the journal failed after the registration committed")
+    return register
+
+
+def test_a_registration_that_committed_then_raised_resolves_from_its_sealed_version(served, monkeypatch):
+    from trader.ai.research_wire import Registered, parse_registration
+    monkeypatch.setattr(served.composed.stack.ai_paper.registrar, "register", commits_then_raises(served))
+    command_id = park_registration(served)
+    assert served.call("ai_research", "register_ai_deployment", REGISTRATION)["state"] == "OUTCOME_UNKNOWN"
+    served.stack.reconciler.run_due(served.now())
+    receipt = served.call("ai_research", "register_ai_deployment", REGISTRATION)     # the ai's next resend
+    (sealed,) = served.composed.stack.ai_paper.versions.sealed()
+    assert (receipt["command_id"], receipt["state"], receipt["outcome"]["created"]) == (command_id, "RESOLVED", True)
+    assert parse_registration(receipt) == Registered(sealed.version.base_digest, sealed.digest,
+                                                     sealed.version.expiry_session.isoformat())
+    assert registration_rows(served) == [(command_id, "RESOLVED", None)]
+
+
+def test_a_registration_that_raised_before_its_commit_is_sent_again_under_a_new_command(served, monkeypatch):
+    from trader.trading.command_coordinator import REGISTRATION_NOT_COMMITTED
+    sent = []
+
+    def register(body, *, principal, command_id):
+        sent.append(command_id)
+        if len(sent) == 1:
+            raise RuntimeError("the bundle store failed before the transaction")
+        return seal_registration(served, body, principal=principal, command_id=command_id)
+    monkeypatch.setattr(served.composed.stack.ai_paper.registrar, "register", register)
+    command_id = park_registration(served)
+    assert served.call("ai_research", "register_ai_deployment", REGISTRATION)["state"] == "OUTCOME_UNKNOWN"
+    assert sent == [command_id]                                         # an unsettled row never runs it twice
+    served.stack.reconciler.run_due(served.now())
+    assert registration_rows(served) == [(command_id, "REJECTED", REGISTRATION_NOT_COMMITTED)]
+    receipt = served.call("ai_research", "register_ai_deployment", REGISTRATION)
+    assert (receipt["command_id"], receipt["state"]) == (f"{command_id}-2", "RESOLVED")
+    assert sent == [command_id, f"{command_id}-2"]
+    assert len(served.composed.stack.ai_paper.versions.sealed()) == 1
+    assert served.call("ai_research", "register_ai_deployment", REGISTRATION)["command_id"] == f"{command_id}-2"
+    assert served.stack.coordinator.reconciliation_complete_for_account(served.trader.ib_account)
+
+
+def test_an_unknown_registration_resolves_after_a_trader_restart(served, monkeypatch):
+    monkeypatch.setattr(served.composed.stack.ai_paper.registrar, "register", commits_then_raises(served))
+    command_id = park_registration(served)
+    again = served.restart()
+    try:
+        assert command_id in again.stack.reconciler.rescan_on_startup()     # trader_service does this at start
+        again.stack.reconciler.run_due(again.now())
+        receipt = again.call("ai_research", "register_ai_deployment", REGISTRATION)
+        assert (receipt["command_id"], receipt["state"]) == (command_id, "RESOLVED")
+        assert receipt["outcome"]["version_digest"] == again.composed.stack.ai_paper.versions.sealed()[0].digest
+    finally:
+        again.close()

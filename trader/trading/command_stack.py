@@ -29,6 +29,7 @@ from trader.trading.command_coordinator import (
     OutcomeReconciler,
     TradingCommandCoordinator,
     apply_command_ledger_migration,
+    read_received_at_start,
 )
 from trader.trading.command_alerts import LoggingCriticalAlertPort
 from trader.trading.command_policy import CommandAuthorityPolicy
@@ -1235,6 +1236,16 @@ def _detect_mode_conflict(parts: Optional[_ExperimentParts], paper_automation_se
     return "BOTH_MODES_ARMED"
 
 
+def _received_at_process_start(trader: Any, ledger: CommandLedger) -> list:
+    """The crash-left RECEIVED commands, read at this process's first stack build, before it serves.
+
+    A connect() retry rebuilds the stack in the same process, possibly after the command server bound: it
+    reuses this list and never reads again, so a row of a handler of this process is never in it (PR #122)."""
+    if getattr(trader, "command_received_at_start", None) is None:
+        trader.command_received_at_start = read_received_at_start(ledger)
+    return trader.command_received_at_start
+
+
 def build_command_stack(
     trader: Any,
     policy: CommandAuthorityPolicy,
@@ -1442,6 +1453,8 @@ def build_command_stack(
         now=now,
         closes=liquidation_store,
         registrations=None if ai_paper_parts is None else ai_paper_parts.registrar,
+        withdrawals=None if ai_paper_parts is None else ai_paper_parts.versions,
+        received_at_start=_received_at_process_start(trader, ledger),
     )
     strategy_control_service = None
     if strategy_port is not None:

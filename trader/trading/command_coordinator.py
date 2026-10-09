@@ -744,6 +744,32 @@ class CommandLedger:
         ).fetchall()
         return [_row_to_ledger_row(row) for row in rows]
 
+    def received(self) -> list[LedgerRow]:
+        """Every ``RECEIVED`` row. Read once before a process serves commands (issue #114), these are rows
+        whose handler died with an earlier process or whose final write failed there."""
+        rows = self._journal.connect().execute(
+            f"{self._SELECT} WHERE state = 'RECEIVED' ORDER BY created_at",
+        ).fetchall()
+        return [_row_to_ledger_row(row) for row in rows]
+
+    def audited_correlation_id(self, command_id: str) -> Optional[str]:
+        """The correlation id the audit record kept for this command (a fan-out child: its root), or None."""
+        row = self._journal.connect().execute(
+            "SELECT correlation_id FROM command_audit WHERE command_id = ? ORDER BY audit_id LIMIT 1",
+            [command_id],
+        ).fetchone()
+        return None if row is None else row[0]
+
+    def audited_body(self, command_id: str) -> Optional[dict[str, Any]]:
+        """The request body the mandatory audit record kept for this command, or None without a record."""
+        row = self._journal.connect().execute(
+            "SELECT redacted_inputs FROM command_audit WHERE command_id = ? ORDER BY audit_id LIMIT 1",
+            [command_id],
+        ).fetchone()
+        if row is None:
+            return None
+        return json.loads(row[0]) if isinstance(row[0], str) else row[0]
+
     def pre_dispatch_orphans(self) -> list[LedgerRow]:
         """Every ``VALIDATED`` row a coordinator restart must recover
         ([M1-F3] Task 9 MEDIUM-4 crash recovery).
@@ -2540,6 +2566,17 @@ class _ReconcilePlan:
     alerted: bool = False
 
 
+# Actions whose handler drives its own ledger transitions (``register_action(..., saga=True)``). Spelled out
+# because the reconciler never sees the coordinator's registrations; a test keeps it equal to them.
+SAGA_ACTIONS = frozenset({
+    "approve_proposal", "cancel_order", "liquidate_account", "enable_strategy", "disable_strategy",
+    "update_strategy_params", "execute_automated_intent", "publish_ai_risk_policy", "submit_ai_paper_decision",
+})
+# A single-step command still RECEIVED at a restart: its handler died or its final write failed (issue #114).
+RECEIVED_AT_RESTART = "RECEIVED_AT_RESTART"
+# A cancel_orders root that left no child cancel_order: no cancel was sent, so it is no success (PR #122).
+CANCEL_FANOUT_NOT_STARTED = "CANCEL_FANOUT_NOT_STARTED"
+
 # Commands that start or join a close root and resolve from it (R17). The ai_paper action
 # name is spelled out: importing it from trader.automation would be a cycle.
 CLOSE_RESOLVED_ACTIONS = frozenset({"execute_automated_intent", "liquidate_account", "submit_ai_paper_decision"})
@@ -2551,12 +2588,43 @@ AI_DEPLOYMENT_REGISTER_ACTION = "register_ai_deployment"   # spelled out: import
 # The reconciler's proof that a registration's transaction never committed. Terminal, so it no longer holds
 # reconciliation_safe(); the register RPC handler sends the next attempt under a new command id.
 REGISTRATION_NOT_COMMITTED = "REGISTRATION_NOT_COMMITTED"
+AI_DEPLOYMENT_WITHDRAW_ACTION = "withdraw_ai_deployment"   # spelled out: importing it would be a cycle
+# The same proof for a withdrawal; the withdraw RPC handler then sends it again under a new command id.
+WITHDRAWAL_NOT_COMMITTED = "WITHDRAWAL_NOT_COMMITTED"
 
 
 class RegistrationEvidencePort(Protocol):
     """The trader's own journal: the outcome of the version a registration command sealed, or None."""
 
     def committed_outcome(self, command_id: str) -> Optional[dict[str, Any]]: ...
+
+
+class WithdrawalEvidencePort(Protocol):
+    """The trader's own journal: the outcome of the withdrawal row a command wrote, or None."""
+
+    def committed_withdrawal(self, command_id: str) -> Optional[dict[str, Any]]: ...
+
+
+def _is_cancel_child_of(child: LedgerRow, link: Optional[str], root: LedgerRow, order_id: str) -> bool:
+    """Whether ``child`` is the cancel_order a cancel_orders root fanned out for ``order_id``.
+
+    The proof of parentage is ``link``: the fan-out sends each child with ``parent_command_id`` = the root,
+    so its audit record (and its journal events) carry the root as correlation id. Action, order and account
+    alone are no proof: a standalone cancel_order may share all three and the child's id (PR #122)."""
+    return (link == root.command_id and child.action == "cancel_order" and child.target_type == "order"
+            and child.target_id == order_id and child.account_id == root.account_id)
+
+
+def read_received_at_start(ledger: CommandLedger) -> list[LedgerRow]:
+    """The RECEIVED rows before a process serves any command, so none belongs to a handler of it (issue #114,
+    PR #122: a fence, not a clock). Read once per process. A failed read parks nothing: crash-left rows stay
+    RECEIVED until the next process start."""
+    try:
+        return ledger.received()
+    except Exception:
+        logger.exception("the RECEIVED commands at start cannot be read; a crash-left one stays RECEIVED "
+                         "until the next start")
+        return []
 
 
 class OutcomeReconciler:
@@ -2581,6 +2649,9 @@ class OutcomeReconciler:
     - ``registrations``: ``RegistrationEvidencePort`` -- resolves an
       ``OUTCOME_UNKNOWN`` ``register_ai_deployment`` from the version its
       transaction sealed. Optional: unwired (ai_paper off) it stays unknown.
+    - ``withdrawals``: ``WithdrawalEvidencePort`` -- the same for an
+      ``OUTCOME_UNKNOWN`` ``withdraw_ai_deployment``, from the withdrawal row
+      its transaction wrote. Optional: unwired it stays unknown.
 
     Command-type awareness ([M1-F3] Task 9 HIGH-1, verbatim): ``reconcile_once``
     discriminates by the command's ACTION, not by ``target_type`` alone --
@@ -2606,6 +2677,8 @@ class OutcomeReconciler:
         now: Callable[[], dt.datetime] = _utcnow,
         closes: Optional[Any] = None,
         registrations: Optional[RegistrationEvidencePort] = None,
+        withdrawals: Optional[WithdrawalEvidencePort] = None,
+        received_at_start: Optional[list[LedgerRow]] = None,
     ):
         self._journal = journal
         self._ledger = ledger
@@ -2617,9 +2690,14 @@ class OutcomeReconciler:
         self._now = now
         self._closes = closes
         self._registrations = registrations
-        self._unreadable_registrations: set[str] = set()   # logged once; the 15-minute alert follows
-        self._unreadable_sagas: set[str] = set()           # logged once; the 15-minute alert follows
+        self._withdrawals = withdrawals
+        self._unreadable_evidence: set[str] = set()   # command ids logged once; the 15-minute alert follows
+        self._unreadable_sagas: set[str] = set()      # logged once; the 15-minute alert follows
+        self._child_collisions: set[str] = set()      # cancel_orders roots whose child-id clash was logged
         self._plans: dict[str, _ReconcilePlan] = {}
+        # The process's own start snapshot when given (the command stack keeps one per process); else read now.
+        self._received_at_start = (received_at_start if received_at_start is not None
+                                   else read_received_at_start(ledger))
 
     # -- scheduling --------------------------------------------------------
 
@@ -2677,7 +2755,12 @@ class OutcomeReconciler:
         dispatched no order and claimed no proposal, so it is safe to
         terminalize it (``REJECTED``/``CRASH_ORPHANED``) up front, unblocking
         the target. Each terminalization is isolated so one racing/failed row
-        never aborts the whole rescan."""
+        never aborts the whole rescan.
+
+        Issue #114: first parks single-step rows left ``RECEIVED`` by an earlier
+        process at ``OUTCOME_UNKNOWN`` (``RECEIVED_AT_RESTART``), so the loop
+        below schedules them and their action's evidence settles them."""
+        self._park_received_at_start()
         requeued: list[str] = []
         for row in self._ledger.reconcilable():
             self.schedule(row.command_id, self._now_utc())
@@ -2686,6 +2769,36 @@ class OutcomeReconciler:
             if self._terminalize_pre_dispatch_orphan(row):
                 requeued.append(row.command_id)
         return requeued
+
+    def _park_received_at_start(self) -> None:
+        """RECEIVED -> OUTCOME_UNKNOWN for the single-step rows of the start snapshot, once.
+
+        Never terminal: only the action's own evidence settles a row, and an action without a resolver stays
+        OUTCOME_UNKNOWN (and alerts after 15 minutes). Sagas are left alone. One failed row never stops the
+        others; it stays RECEIVED until the next start. A later rescan parks nothing."""
+        snapshot = list(self._received_at_start)
+        self._received_at_start.clear()          # shared with any later stack of this process: parked once
+        for row in snapshot:
+            if row.action in SAGA_ACTIONS:
+                continue
+            try:
+                self._park_received(row)
+            except Exception:
+                logger.exception("command %s (%s) stays RECEIVED: it could not be parked at OUTCOME_UNKNOWN",
+                                 row.command_id, row.action)
+
+    def _park_received(self, row: LedgerRow) -> None:
+        now = self._now_utc()
+
+        def work(conn: duckdb.DuckDBPyConnection, append) -> None:
+            self._ledger.transition_in_tx(conn, row.command_id, "RECEIVED", "OUTCOME_UNKNOWN",
+                                          error_code=RECEIVED_AT_RESTART, now=now)
+            append(self._command_mutation(row, "OUTCOME_UNKNOWN", now, error_code=RECEIVED_AT_RESTART),
+                   _noop_write, f"command:{row.command_id}:outcome_unknown")
+
+        self._journal.mutate_batch_work(self._journal.connect(), work)
+        logger.warning("command %s (%s) was still RECEIVED at start; parked OUTCOME_UNKNOWN for reconciliation",
+                       row.command_id, row.action)
 
     # -- one reconciliation attempt ----------------------------------------
 
@@ -2754,6 +2867,8 @@ class OutcomeReconciler:
             return self._reconcile_close(row, now)
         if action == AI_DEPLOYMENT_REGISTER_ACTION:
             return self._reconcile_registration(row, now)
+        if action == AI_DEPLOYMENT_WITHDRAW_ACTION:
+            return self._reconcile_withdrawal(row, now)
         # Unmapped action: cannot positively determine an outcome -> stay
         # OUTCOME_UNKNOWN (fail-safe), never rubber-stamp RESOLVED.
         return False
@@ -2775,28 +2890,52 @@ class OutcomeReconciler:
         return False
 
     def _reconcile_registration(self, row: LedgerRow, now: dt.datetime) -> bool:
-        """A registration is one journal transaction that writes the command id with the version it seals.
+        """A registration is one journal transaction that writes the command id with the version it seals."""
+        evidence = None if self._registrations is None else self._registrations.committed_outcome
+        return self._settle_from_own_commit(row, now, evidence, REGISTRATION_NOT_COMMITTED, {"created": False})
 
-        Its row is OUTCOME_UNKNOWN only after the handler raised, so that transaction has committed or rolled
-        back. A sealed version resolves the command with the receipt a success gives; no version proves the
-        transaction never committed. A version that cannot be read keeps the command unknown (15-minute alert).
+    def _reconcile_withdrawal(self, row: LedgerRow, now: dt.datetime) -> bool:
+        """A withdrawal is one journal transaction that writes the command id with the withdrawal row."""
+        evidence = None if self._withdrawals is None else self._withdrawals.committed_withdrawal
+        return self._settle_from_own_commit(row, now, evidence, WITHDRAWAL_NOT_COMMITTED, {"withdrawn": False})
+
+    def _settle_from_own_commit(self, row: LedgerRow, now: dt.datetime,
+                                committed_outcome: Optional[Callable[[str], Optional[dict[str, Any]]]],
+                                not_committed_code: str, not_committed_outcome: dict[str, Any]) -> bool:
+        """Settle a single-step command whose one transaction writes its command id with its work.
+
+        Its row is OUTCOME_UNKNOWN only once no handler runs it any more, so that transaction has committed or
+        rolled back. Evidence written by this command resolves it with the receipt a success gives; no evidence
+        proves the transaction never committed. Unreadable evidence keeps the command unknown (15-minute alert).
         """
-        if self._registrations is None or row.state != "OUTCOME_UNKNOWN":
+        if committed_outcome is None or row.state != "OUTCOME_UNKNOWN":
             return False
         try:
-            outcome = self._registrations.committed_outcome(row.command_id)
+            outcome = committed_outcome(row.command_id)
         except Exception:
-            if row.command_id not in self._unreadable_registrations:
-                self._unreadable_registrations.add(row.command_id)
-                logger.exception("registration %s: its sealed version cannot be read; it stays OUTCOME_UNKNOWN",
-                                 row.command_id)
+            self._evidence_unreadable(row)
             return False
         if outcome is not None:
             self._resolve_command_only(row, dict(outcome), now)
             return True
-        self._reject_command_only(row, error_code=REGISTRATION_NOT_COMMITTED,
-                                  outcome={"created": False, "reconciled": "never_committed"}, now=now)
+        self._reject_command_only(row, error_code=not_committed_code,
+                                  outcome={**not_committed_outcome, "reconciled": "never_committed"}, now=now)
         return True
+
+    def _child_id_collision(self, row: LedgerRow, foreign: list[str]) -> None:
+        if row.command_id not in self._child_collisions:
+            self._child_collisions.add(row.command_id)
+            logger.error("cancel_orders %s stays OUTCOME_UNKNOWN: its child id(s) %s hold other commands, not its "
+                         "cancel_order children; an operator must check the ledger", row.command_id,
+                         ", ".join(foreign))
+
+    def _evidence_unreadable(self, row: LedgerRow) -> None:
+        """A failed evidence read never proves anything: the command stays OUTCOME_UNKNOWN and is asked again
+        on its schedule. Logged once per command; the 15-minute alert follows if it never reads."""
+        if row.command_id not in self._unreadable_evidence:
+            self._unreadable_evidence.add(row.command_id)
+            logger.exception("%s %s: its evidence cannot be read; it stays OUTCOME_UNKNOWN",
+                             row.action, row.command_id)
 
     def _reconcile_close(self, row: LedgerRow, now: dt.datetime) -> bool:
         """R17 / R33: a command that started or joined a close root resolves from that exact root.
@@ -2948,17 +3087,22 @@ class OutcomeReconciler:
         command exists); otherwise stay unknown -- NEVER mark anything
         FAILED.
 
-        Exception: ``INTERNAL_ERROR`` / ``PROPOSAL_IDENTITY_CONFLICT`` with no
-        correlated proposal means the create transaction rolled back. Reject
+        Exception: ``INTERNAL_ERROR`` / ``PROPOSAL_IDENTITY_CONFLICT`` /
+        ``RECEIVED_AT_RESTART`` with no correlated proposal means the create
+        transaction rolled back. Reject
         those so they cannot wedge ``reconciliation_safe`` / resume forever.
         """
-        proposal_id = self._created_proposal_id(row.command_id)
+        try:
+            proposal_id = self._created_proposal_id(row.command_id)
+        except Exception:
+            self._evidence_unreadable(row)
+            return False
         if proposal_id is not None:
             self._resolve_command_only(
                 row, {"proposal_id": proposal_id, "created": True}, now
             )
             return True
-        if row.error_code in {"INTERNAL_ERROR", "PROPOSAL_IDENTITY_CONFLICT"}:
+        if row.error_code in {"INTERNAL_ERROR", "PROPOSAL_IDENTITY_CONFLICT", RECEIVED_AT_RESTART}:
             self._reject_command_only(
                 row,
                 error_code=row.error_code or "INTERNAL_ERROR",
@@ -3011,13 +3155,51 @@ class OutcomeReconciler:
         return False
 
     def _reconcile_cancel_orders(self, row: LedgerRow, now: dt.datetime) -> bool:
-        """MEDIUM-3: the ``cancel_orders`` ROOT is a non-saga fan-out that
-        dispatches NOTHING itself -- each child ``cancel_order`` is an
-        independently-reconciled ledger row carrying its own authoritative
-        outcome. A wedged root therefore has no ambiguous real-money action of
-        its own; resolve it to a defined terminal so it never becomes an
-        eternal critical alert (fail-safe: no order state is hidden)."""
-        self._resolve_command_only(row, {"reconciled": "cancel_orders_root"}, now)
+        """MEDIUM-3 / PR #122: the ``cancel_orders`` ROOT dispatches nothing itself; it fans out one child
+        ``cancel_order`` per distinct order, ``{root}-{index}``, each reconciled on its own.
+
+        Settled only on child evidence read from the ledger: every child settled -> RESOLVED with their
+        outcomes; no child at all -> REJECTED ``CANCEL_FANOUT_NOT_STARTED`` (no cancel was sent; the operator
+        sends the cancel again); a partial fan-out or a child still in flight -> stays unknown. The request
+        comes from the root's audit record; without it nothing is concluded.
+
+        A row counts as the child only when its audit record carries this root as correlation id (the link
+        the fan-out writes) and it is the ``cancel_order`` of this root's account for the order its index
+        stands for. Any other row on a child id is foreign: the root stays unknown with one ERROR naming it
+        (PR #122), never a success."""
+        try:
+            body = self._ledger.audited_body(row.command_id)
+            order_ids = list(dict.fromkeys((body or {}).get("order_entity_ids") or []))
+            child_ids = [f"{row.command_id}-{index}" for index in range(len(order_ids))]
+            children = [self._ledger.get(child_id) for child_id in child_ids]
+            links = [None if child is None else self._ledger.audited_correlation_id(child.command_id)
+                     for child in children]
+        except Exception:
+            self._evidence_unreadable(row)
+            return False
+        if not order_ids:
+            return False
+        foreign = [child.command_id for order_id, child, link in zip(order_ids, children, links)
+                   if child is not None and not _is_cancel_child_of(child, link, row, order_id)]
+        if foreign:
+            self._child_id_collision(row, foreign)
+            return False
+        if all(child is None for child in children):
+            self._reject_command_only(row, error_code=CANCEL_FANOUT_NOT_STARTED,
+                                      outcome={"child_command_ids": [], "reconciled": "fan_out_not_started"},
+                                      now=now)
+            return True
+        if any(child is None or child.state not in _TERMINAL_STATES for child in children):
+            return False
+        outcome = {
+            "child_command_ids": child_ids,
+            "children": {order_id: {"command_id": child.command_id, "state": child.state,
+                                    "error_code": child.error_code}
+                         for order_id, child in zip(order_ids, children)},
+            "partial_failure": any(child.state != "RESOLVED" for child in children),
+            "reconciled": "children_settled",
+        }
+        self._resolve_command_only(row, outcome, now)
         return True
 
     def _reconcile_pause(self, row: LedgerRow, now: dt.datetime) -> bool:
@@ -3053,22 +3235,15 @@ class OutcomeReconciler:
         event correlated to the creating command_id (see
         ``ProposalCommandService.create_proposal``); its ABSENCE means the
         create never durably committed, so the command stays OUTCOME_UNKNOWN --
-        fail-safe, NEVER marked FAILED."""
-        try:
-            found = self._journal.connect().execute(
-                "SELECT entity_id FROM domain_event_journal "
-                "WHERE entity_type = 'proposal' AND correlation_id = ? "
-                "ORDER BY source_cursor LIMIT 1",
-                [command_id],
-            ).fetchone()
-        except Exception:
-            return None
-        if found is None:
-            return None
-        try:
-            return int(found[0])
-        except (TypeError, ValueError):
-            return None
+        fail-safe, NEVER marked FAILED. A read that fails raises: only a read
+        that succeeds may show the absence (PR #122)."""
+        found = self._journal.connect().execute(
+            "SELECT entity_id FROM domain_event_journal "
+            "WHERE entity_type = 'proposal' AND correlation_id = ? "
+            "ORDER BY source_cursor LIMIT 1",
+            [command_id],
+        ).fetchone()
+        return None if found is None else int(found[0])
 
     def _pause_state_for(self, account_id: str) -> Optional[tuple[bool, Optional[str]]]:
         """``(new_exposure_paused, updated_by_command_id)`` for the account's

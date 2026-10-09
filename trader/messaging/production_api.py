@@ -127,6 +127,7 @@ from trader.messaging.typed_rpc import (
 from trader.strategy.strategy_revisions import StrategyCommandReceipt
 from trader.trading.command_coordinator import (
     REGISTRATION_NOT_COMMITTED,
+    WITHDRAWAL_NOT_COMMITTED,
     ApprovalCommandService,
     CancelCommandService,
     CommandRequest,
@@ -1458,15 +1459,17 @@ def _require_caller(caller: RpcCaller, allowed: frozenset[str]) -> None:
 
 
 def _withdraw_command_id(coordinator: TradingCommandCoordinator, base_id: str) -> str:
-    """A repeat of a withdrawal replays its receipt, except one refused because an entry was still being sent:
-    a ledger row replays forever, so that retry needs a new command."""
+    """A repeat of a withdrawal replays its receipt, except one refused because an entry was still being sent
+    or one the reconciler proved never committed (issue #115): a ledger row replays forever, so that retry
+    needs a new command."""
     from trader.automation.ai_deployment_versions import WITHDRAWAL_ENTRY_IN_FLIGHT
 
+    sent_again = {WITHDRAWAL_ENTRY_IN_FLIGHT, WITHDRAWAL_NOT_COMMITTED}
     attempt = 1
     command_id = base_id
     while True:
         receipt = coordinator.get_command(command_id)
-        if receipt is None or receipt.error_code != WITHDRAWAL_ENTRY_IN_FLIGHT:
+        if receipt is None or receipt.error_code not in sent_again:
             return command_id
         attempt += 1
         command_id = f"{base_id}-{attempt}"

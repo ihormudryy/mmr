@@ -14,6 +14,7 @@ from typing import Any, Callable, Optional
 from trader.automation.ai_bundle_check import BundleRefused
 from trader.automation.ai_deployment_activity import WIRE_STATE, ny_date
 from trader.automation.ai_deployment_registration import registration_command_id
+from trader.automation.ai_deployment_versions import withdrawal_outcome
 from trader.automation.ai_deployments import DISCRETIONARY_KIND, AiDeployment, DeploymentRefused
 from trader.automation.ai_paper_config import STYLE_NOT_ENABLED
 from trader.automation.ai_risk_policy import PolicyRefused
@@ -138,7 +139,7 @@ class AiPaperActions:
                                             principal=cmd.principal, command_id=cmd.command_id)
         except DeploymentRefused as ex:
             raise CommandValidationError(ex.code, ex.message) from None
-        return {"version_digest": cmd.body["version_digest"], "withdrawn": True, "already_withdrawn": not newly}
+        return withdrawal_outcome(cmd.body["version_digest"], newly=newly)
 
     # -- register_discretionary_deployment (single step; SP2 spec 6.6) ----------
 

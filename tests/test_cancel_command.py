@@ -503,3 +503,39 @@ def test_fanout_child_decision_carries_root_correlation(cancel):
     assert risk_id == "root-corr-0"          # per-child risk_id (its own command_id) is retained
     assert correlation_id == "root-corr"     # decision correlates to the root, not the child
     assert payload["decision"] == "cancel"
+
+
+# ---------------------------------------------------------------------------
+# PR #122: a root that died after its real fan-out resolves from children that carry its link.
+# ---------------------------------------------------------------------------
+
+class _ProcessKilled(BaseException):
+    pass
+
+
+def test_a_root_killed_after_its_real_fan_out_resolves_from_its_linked_children(cancel):
+    from trader.trading.command_coordinator import OutcomeReconciler
+    for order_id in ("ord-1", "ord-2"):
+        cancel.orders_view.add(_order(order_id, leg="entry", status="Submitted"))
+
+    def fan_out_then_die(cmd):
+        cancel.service.cancel_orders(cmd)
+        raise _ProcessKilled()
+    cancel.coordinator.register_action("cancel_orders", fan_out_then_die, requires_preflight=False)
+    with pytest.raises(_ProcessKilled):
+        cancel.execute("cancel_orders", {"order_entity_ids": ["ord-1", "ord-2"]}, command_id="root-1")
+    assert [cancel.ledger.get(f"root-1-{i}").state for i in (0, 1)] == ["SUBMITTED", "SUBMITTED"]
+    for order_id in ("ord-1", "ord-2"):                               # the broker confirms both cancels
+        cancel.orders_view.add(_order(order_id, leg="entry", status="Cancelled", is_terminal=True))
+    later = NOW + dt.timedelta(seconds=1)
+    reconciler = OutcomeReconciler(
+        journal=cancel.journal, ledger=cancel.ledger, orders=cancel.dispatch,
+        strategy=SimpleNamespace(get_receipt=lambda command_id: None),
+        alerts=SimpleNamespace(raise_alert=lambda command_id, detail: None),
+        orders_view=cancel.orders_view, now=lambda: later)
+    reconciler.rescan_on_startup()
+    reconciler.run_due(later)
+    reconciler.run_due(later + dt.timedelta(seconds=5))
+    root = cancel.ledger.get("root-1")
+    assert root.state == "RESOLVED" and root.outcome["partial_failure"] is False
+    assert root.outcome["children"]["ord-2"]["command_id"] == "root-1-1"

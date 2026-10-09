@@ -95,6 +95,18 @@ Armed paper automation cannot exit safely yet, and the evidence step has a gap i
   history DB (bars) and the main DB (universes); it also writes the research DB
   (`research_duckdb_path`, or `MMR_RESEARCH_DUCKDB`), so point that at a host
   path. Or fix the mounts in a follow-up.
+- **A single-step command left `RECEIVED` by a crash** (only the rows found
+  when the trader starts, before it serves) is parked `OUTCOME_UNKNOWN`
+  (`RECEIVED_AT_RESTART`) and settled from evidence it can read (registration,
+  withdrawal, create; a `cancel_orders` root resolves once all its child
+  cancels settled and is `CANCEL_FANOUT_NOT_STARTED` with none, so send the
+  cancel again; reject and pause/resume only if they committed; a failed read
+  is retried, never taken as "not committed"); any other one (a partial
+  `cancel_orders` fan-out, a reject or pause/resume that did not commit, the
+  four experiment commands, discretionary registration, canary, allocation,
+  paper automation) stays `OUTCOME_UNKNOWN`, alerts after 15 minutes and keeps
+  `reconciliation_safe()` false until an operator settles its ledger row by
+  hand (no tool for it yet).
 
 Resolved: the production approval no longer builds an empty broker snapshot.
 `production_evidence.py` (2026-10-04) captures the fenced broker snapshot, a live
@@ -581,7 +593,10 @@ first deploy of this build:
   brackets are untouched. While an entry of that version is being sent the
   withdrawal is refused (`WITHDRAWAL_ENTRY_IN_FLIGHT`): retry after the
   entry's send returns. `mmr ai-deployment version sha256:<version>` shows
-  its state.
+  its state. A withdrawal left `OUTCOME_UNKNOWN` is settled by the trader's
+  reconciler from its withdrawal row: a row written by that command resolves
+  it, and no row (`WITHDRAWAL_NOT_COMMITTED`) makes the next same withdraw
+  run again under a new command id.
 - SP1 acceptance now needs an SP2c-judged deployment version:
   `mmr experiment acceptance run --place-orders --deployment-version sha256:...`.
   The harness registers nothing and no longer uses the `ai_research` key

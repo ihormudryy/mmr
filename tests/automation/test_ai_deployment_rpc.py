@@ -352,3 +352,148 @@ def test_an_unknown_registration_resolves_after_a_trader_restart(served, monkeyp
         assert receipt["outcome"]["version_digest"] == again.composed.stack.ai_paper.versions.sealed()[0].digest
     finally:
         again.close()
+
+
+# -- an OUTCOME_UNKNOWN withdrawal resolves from its withdrawal row (issue #115) ----------------------
+
+def withdrawal_rows(served):
+    return [tuple(row) for row in served.trader.journal_db.execute(
+        "SELECT command_id, state, error_code FROM command_ledger WHERE action = 'withdraw_ai_deployment' "
+        "ORDER BY created_at, command_id", fetch="all")]
+
+
+def park_withdrawal(served, body):
+    """The first send: the store raises a plain error, the ledger parks OUTCOME_UNKNOWN."""
+    with pytest.raises(TypedRpcRemoteError) as exc:
+        served.call("cli", "withdraw_ai_deployment", body)
+    assert exc.value.code == "INTERNAL_ERROR"
+    (row,) = withdrawal_rows(served)
+    assert row[1:] == ("OUTCOME_UNKNOWN", "INTERNAL_ERROR")
+    return row[0]
+
+
+def withdraw_commits_then_raises(served, monkeypatch):
+    versions = served.composed.stack.ai_paper.versions
+    real = versions.withdraw
+
+    def withdraw(digest, **kwargs):
+        real(digest, **kwargs)
+        raise RuntimeError("the journal failed after the withdrawal committed")
+    monkeypatch.setattr(versions, "withdraw", withdraw)
+
+
+def test_a_withdrawal_that_committed_then_raised_resolves_from_its_row(served, monkeypatch):
+    _base, version = seed(served)
+    body = {"version_digest": version, "reason": "operator"}
+    withdraw_commits_then_raises(served, monkeypatch)
+    command_id = park_withdrawal(served, body)
+    assert served.call("cli", "withdraw_ai_deployment", body)["state"] == "OUTCOME_UNKNOWN"
+    served.stack.reconciler.run_due(served.now())
+    receipt = served.call("cli", "withdraw_ai_deployment", body)
+    assert (receipt["command_id"], receipt["state"]) == (command_id, "RESOLVED")
+    assert receipt["outcome"] == {"version_digest": version, "withdrawn": True, "already_withdrawn": False}
+    assert served.stack.coordinator.reconciliation_complete_for_account(served.trader.ib_account)
+
+
+def test_a_withdrawal_that_raised_before_its_commit_is_sent_again_under_a_new_command(served, monkeypatch):
+    from trader.trading.command_coordinator import WITHDRAWAL_NOT_COMMITTED
+    _base, version = seed(served)
+    body = {"version_digest": version, "reason": "operator"}
+    versions = served.composed.stack.ai_paper.versions
+    real, sent = versions.withdraw, []
+
+    def withdraw(digest, **kwargs):
+        sent.append(kwargs["command_id"])
+        if len(sent) == 1:
+            raise RuntimeError("the journal failed before the transaction")
+        return real(digest, **kwargs)
+    monkeypatch.setattr(versions, "withdraw", withdraw)
+    command_id = park_withdrawal(served, body)
+    assert served.call("cli", "withdraw_ai_deployment", body)["state"] == "OUTCOME_UNKNOWN"
+    assert sent == [command_id]                                         # an unsettled row never runs it twice
+    served.stack.reconciler.run_due(served.now())
+    assert withdrawal_rows(served) == [(command_id, "REJECTED", WITHDRAWAL_NOT_COMMITTED)]
+    receipt = served.call("cli", "withdraw_ai_deployment", body)
+    assert (receipt["command_id"], receipt["state"]) == (f"{command_id}-2", "RESOLVED")
+    assert receipt["outcome"]["already_withdrawn"] is False and versions.withdrawn() == {version}
+    assert served.call("cli", "withdraw_ai_deployment", body)["command_id"] == f"{command_id}-2"
+    assert served.stack.coordinator.reconciliation_complete_for_account(served.trader.ib_account)
+
+
+def test_an_unknown_withdrawal_resolves_after_a_trader_restart(served, monkeypatch):
+    _base, version = seed(served)
+    body = {"version_digest": version, "reason": "operator"}
+    withdraw_commits_then_raises(served, monkeypatch)
+    command_id = park_withdrawal(served, body)
+    again = served.restart()
+    try:
+        assert command_id in again.stack.reconciler.rescan_on_startup()     # trader_service does this at start
+        again.stack.reconciler.run_due(again.now())
+        receipt = again.call("cli", "withdraw_ai_deployment", body)
+        assert (receipt["command_id"], receipt["state"]) == (command_id, "RESOLVED")
+        assert again.stack.coordinator.reconciliation_complete_for_account(again.trader.ib_account)
+    finally:
+        again.close()
+
+
+# -- a RECEIVED registration or withdrawal left by a crash settles after a restart (issue #114) ------
+
+class ProcessKilled(BaseException):
+    """The process dies inside the handler: no except clause of the coordinator runs."""
+
+
+def killed_inside(served, principal, method, body):
+    """Send the command in-process the way the RPC server does; the handler dies and leaves RECEIVED."""
+    from trader.messaging.typed_rpc import RpcCaller
+    registration = served.registry._by_role_method[("command", method)]
+    with pytest.raises(ProcessKilled):
+        registration.handler(registration.request_model.model_validate(body), RpcCaller(principal, None))
+
+
+def reconciliation_safe(served):
+    return dict(served.stack.semantic_readiness._checks)["reconciliation_safe"]()
+
+
+def test_received_registration_and_withdrawal_left_by_a_crash_settle_after_restart(served, monkeypatch):
+    from trader.trading.command_coordinator import WITHDRAWAL_NOT_COMMITTED
+    _base, version = seed(served)
+    withdrawal = {"version_digest": version, "reason": "operator"}
+    services = served.composed.stack.ai_paper
+
+    def register(body, *, principal, command_id):
+        seal_registration(served, body, principal=principal, command_id=command_id)
+        raise ProcessKilled()                                      # committed; RESOLVED is never written
+
+    def withdraw(digest, **kwargs):
+        raise ProcessKilled()                                      # killed before its transaction
+    monkeypatch.setattr(services.registrar, "register", register)
+    monkeypatch.setattr(services.versions, "withdraw", withdraw)
+    killed_inside(served, "ai_research", "register_ai_deployment", REGISTRATION)
+    killed_inside(served, "cli", "withdraw_ai_deployment", withdrawal)
+    ((registration_id, *_),) = registration_rows(served)
+    ((withdrawal_id, *_),) = withdrawal_rows(served)
+    assert {registration_rows(served)[0][1], withdrawal_rows(served)[0][1]} == {"RECEIVED"}
+    assert served.stack.reconciler.rescan_on_startup() == []      # the live process never parks its own rows
+    assert not reconciliation_safe(served)
+    served.advance(seconds=1)
+    again = served.restart()
+    try:
+        assert {registration_id, withdrawal_id} <= set(again.stack.reconciler.rescan_on_startup())
+        again.stack.reconciler.run_due(again.now())
+        assert registration_rows(again) == [(registration_id, "RESOLVED", None)]
+        assert withdrawal_rows(again) == [(withdrawal_id, "REJECTED", WITHDRAWAL_NOT_COMMITTED)]
+        assert reconciliation_safe(again)
+        assert again.call("ai_research", "register_ai_deployment", REGISTRATION)["command_id"] == registration_id
+        receipt = again.call("cli", "withdraw_ai_deployment", withdrawal)              # runs again, really
+        assert (receipt["command_id"], receipt["state"]) == (f"{withdrawal_id}-2", "RESOLVED")
+        assert again.composed.stack.ai_paper.versions.withdrawn() == {version}
+    finally:
+        again.close()
+
+
+def test_every_saga_action_the_trader_registers_is_left_to_its_own_recovery(served):
+    from trader.trading.command_coordinator import SAGA_ACTIONS
+    sagas = {action for action, registration in served.stack.coordinator._actions.items() if registration.saga}
+    assert sagas and sagas <= SAGA_ACTIONS
+    single_steps = set(served.stack.coordinator._actions) - sagas
+    assert not single_steps & SAGA_ACTIONS

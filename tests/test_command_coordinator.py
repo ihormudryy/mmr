@@ -1085,19 +1085,15 @@ def test_pause_wedge_stays_unknown_when_control_row_is_from_another_command(reco
     assert recon.ledger.get("pz-2").state == "OUTCOME_UNKNOWN"
 
 
-def test_cancel_orders_root_wedge_reaches_a_defined_terminal(recon):
-    # The root fan-out dispatches nothing itself; children are independently
-    # reconciled. A wedged root must resolve, not alert forever.
+def test_cancel_orders_root_without_its_request_is_never_resolved(recon):
+    # PR #122: the root is settled only from its children, found through the request its audit record
+    # kept. Without that record nothing can be concluded: it stays unknown and alerts, never a success.
     recon.ledger.insert_for_test(
         "co-1", state="OUTCOME_UNKNOWN", updated_at=NOW, account_id="DU111111",
         action="cancel_orders", target_type="order_group", target_id="")
     recon.reconciler.schedule("co-1", NOW)
-    result = recon.reconciler.reconcile_once("co-1", recon.now())
-    assert result.resolved is True
-    assert recon.ledger.get("co-1").state == "RESOLVED"
-    # And it never escalates to a perpetual critical alert.
-    assert recon.reconciler.run_due(recon.now() + dt.timedelta(seconds=901)) == []
-    assert recon.alerts.raised == []
+    assert recon.reconciler.reconcile_once("co-1", recon.now()).resolved is False
+    assert recon.ledger.get("co-1").state == "OUTCOME_UNKNOWN"
 
 
 # ---------------------------------------------------------------------------
@@ -1376,12 +1372,12 @@ def test_an_unknown_registration_stays_unknown_without_the_evidence_port(recon):
 def test_an_unreadable_sealed_version_keeps_the_registration_unknown_and_other_commands_reconcile(recon, caplog):
     reconciler = _registration_reconciler(recon, FakeRegistrations(error=RuntimeError("tampered")))
     _unknown_registration(recon, "aidep-1")
-    recon.ledger.insert_for_test("co-1", state="OUTCOME_UNKNOWN", updated_at=NOW, account_id="DU111111",
-                                 action="cancel_orders", target_type="order_group", target_id="")
+    recon.mark_unknown("cmd-1", target_type="proposal", order_group_id="og-cmd-1", proposal_id=7)
+    recon.orders.add_broker_order(order_ref=encode_order_ref("og-cmd-1"), status="Submitted", order_ids=[17])
     reconciler.schedule("aidep-1", NOW)
-    reconciler.schedule("co-1", NOW)
+    reconciler.schedule("cmd-1", NOW)
     reconciler.run_due(NOW)
-    assert (recon.ledger.get("aidep-1").state, recon.ledger.get("co-1").state) == ("OUTCOME_UNKNOWN", "RESOLVED")
+    assert (recon.ledger.get("aidep-1").state, recon.ledger.get("cmd-1").state) == ("OUTCOME_UNKNOWN", "RESOLVED")
     reconciler.run_due(NOW + dt.timedelta(seconds=CRITICAL_AFTER_SECONDS))
     assert recon.alerts.raised == ["aidep-1"]
     assert len([r for r in caplog.records if r.levelname == "ERROR" and "aidep-1" in r.getMessage()]) == 1
@@ -1393,3 +1389,271 @@ def test_a_registration_whose_handler_may_still_run_is_never_resolved(recon):
     _unknown_registration(recon, "aidep-1", state="SUBMITTING")      # a registration never reaches it
     assert reconciler.reconcile_once("aidep-1", recon.now()).resolved is False
     assert (recon.ledger.get("aidep-1").state, registrations.asked) == ("SUBMITTING", [])
+
+
+# -- withdraw_ai_deployment: resolved from its withdrawal row only (issue #115) ----------------------
+
+class FakeWithdrawals:
+    def __init__(self, outcomes=None, error=None):
+        self.outcomes, self.error = dict(outcomes or {}), error
+
+    def committed_withdrawal(self, command_id):
+        if self.error is not None:
+            raise self.error
+        return self.outcomes.get(command_id)
+
+
+def _withdrawal_reconciler(recon, withdrawals):
+    return OutcomeReconciler(journal=recon.journal, ledger=recon.ledger, orders=recon.orders,
+                             strategy=recon.strategy, alerts=recon.alerts, repo=recon.repo, now=recon.now,
+                             withdrawals=withdrawals)
+
+
+def _unknown_withdrawal(recon, command_id):
+    recon.ledger.insert_for_test(command_id, state="OUTCOME_UNKNOWN", updated_at=NOW, account_id="DU111111",
+                                 action="withdraw_ai_deployment", target_type="ai_deployment_version",
+                                 target_id="sha256:" + "a" * 64)
+
+
+def test_a_withdrawal_with_its_row_resolves_with_the_success_receipt(recon):
+    outcome = {"version_digest": "sha256:" + "a" * 64, "withdrawn": True, "already_withdrawn": False}
+    reconciler = _withdrawal_reconciler(recon, FakeWithdrawals({"aidw-1": outcome}))
+    _unknown_withdrawal(recon, "aidw-1")
+    assert reconciler.reconcile_once("aidw-1", recon.now()).resolved is True
+    row = recon.ledger.get("aidw-1")
+    assert (row.state, row.outcome, row.error_code) == ("RESOLVED", outcome, None)
+
+
+def test_a_withdrawal_without_its_row_is_rejected_as_not_committed(recon):
+    from trader.trading.command_coordinator import WITHDRAWAL_NOT_COMMITTED
+    reconciler = _withdrawal_reconciler(recon, FakeWithdrawals())
+    _unknown_withdrawal(recon, "aidw-1")
+    assert reconciler.reconcile_once("aidw-1", recon.now()).resolved is True
+    row = recon.ledger.get("aidw-1")
+    assert (row.state, row.error_code) == ("REJECTED", WITHDRAWAL_NOT_COMMITTED)
+
+
+def test_an_unreadable_withdrawal_row_or_no_port_keeps_the_withdrawal_unknown(recon):
+    _unknown_withdrawal(recon, "aidw-1")
+    assert recon.reconciler.reconcile_once("aidw-1", recon.now()).resolved is False
+    reconciler = _withdrawal_reconciler(recon, FakeWithdrawals(error=RuntimeError("db down")))
+    assert reconciler.reconcile_once("aidw-1", recon.now()).resolved is False
+    assert recon.ledger.get("aidw-1").state == "OUTCOME_UNKNOWN"
+
+
+# -- RECEIVED rows left by a crash are parked and settled at the next start (issue #114) --------------
+
+def _received(recon, command_id, action, *, created_at, target_type="ai_deployment"):
+    recon.ledger.insert_for_test(command_id, state="RECEIVED", updated_at=created_at, created_at=created_at,
+                                 account_id="DU111111", action=action, target_type=target_type,
+                                 target_id="sha256:" + "a" * 64)
+
+
+def test_received_single_step_rows_from_before_the_start_are_parked_then_settled(recon):
+    from trader.trading.command_coordinator import RECEIVED_AT_RESTART
+    outcome = {"version_digest": "sha256:" + "a" * 64, "created": True}
+    before = NOW - dt.timedelta(minutes=1)
+    _received(recon, "aidep-old", "register_ai_deployment", created_at=before)
+    _received(recon, "start-old", "start_experiment", created_at=before, target_type="experiment")
+    _received(recon, "approve-old", "approve_proposal", created_at=before, target_type="proposal")
+    reconciler = _registration_reconciler(recon, FakeRegistrations({"aidep-old": outcome}))   # the start
+    _received(recon, "aidep-live", "register_ai_deployment", created_at=before)  # served by this process
+    requeued = reconciler.rescan_on_startup()
+    assert set(requeued) == {"aidep-old", "start-old"}
+    parked = recon.ledger.get("start-old")
+    assert (parked.state, parked.error_code) == ("OUTCOME_UNKNOWN", RECEIVED_AT_RESTART)
+    assert recon.ledger.get("approve-old").state == "RECEIVED"                   # a saga recovers on its own
+    assert recon.ledger.get("aidep-live").state == "RECEIVED"
+    reconciler.run_due(NOW)
+    assert (recon.ledger.get("aidep-old").state, recon.ledger.get("aidep-old").outcome) == ("RESOLVED", outcome)
+    reconciler.run_due(NOW + dt.timedelta(seconds=CRITICAL_AFTER_SECONDS))
+    assert recon.ledger.get("start-old").state == "OUTCOME_UNKNOWN"              # no evidence: it never settles
+    assert recon.alerts.raised == ["start-old"]
+
+
+def test_a_create_left_received_by_a_crash_without_its_proposal_is_rejected(recon):
+    _received(recon, "create-old", "create_proposal", created_at=NOW - dt.timedelta(minutes=1),
+              target_type="proposal")
+    reconciler = _restarted(recon)
+    reconciler.rescan_on_startup()
+    reconciler.run_due(LATER)
+    row = recon.ledger.get("create-old")
+    assert (row.state, row.outcome["reconciled"]) == ("REJECTED", "never_committed")
+
+
+# -- PR #122 review: crash-left rows settle only on evidence that was read (mmr-openai) ---------------
+
+class ProcessKilled(BaseException):
+    """The process dies inside the handler: no except clause of the coordinator runs."""
+
+
+def _killed(coord, command_id, action, body, *, target_type="order_group"):
+    with pytest.raises(ProcessKilled):
+        coord.execute(CommandRequest(command_id=command_id, action=action, account_id="DU111111",
+                                     target_type=target_type, target_id="", expected_version=None,
+                                     body=body, source="dashboard"))
+
+
+LATER = NOW + dt.timedelta(seconds=1)
+
+
+def _restarted(recon, journal=None):
+    """A new trader process on the same journal, a second later: its reconciler is built before it serves."""
+    journal = journal or recon.journal
+    return OutcomeReconciler(journal=journal, ledger=CommandLedger(journal), orders=recon.orders,
+                             strategy=recon.strategy, alerts=recon.alerts, repo=recon.repo, now=lambda: LATER)
+
+
+class _FlakyConn:
+    def __init__(self, conn, owner):
+        self._conn, self._owner = conn, owner
+
+    def execute(self, sql, *args, **kwargs):
+        if self._owner.failures and self._owner.marker in sql:
+            self._owner.failures -= 1
+            raise RuntimeError("transient evidence read failure")
+        return self._conn.execute(sql, *args, **kwargs)
+
+    def __getattr__(self, name):
+        return getattr(self._conn, name)
+
+
+class FlakyEvidenceJournal:
+    """The real journal, except the next ``failures`` statements containing ``marker`` raise."""
+
+    def __init__(self, journal, marker, failures=1):
+        self._journal, self.marker, self.failures = journal, marker, failures
+
+    def connect(self):
+        return _FlakyConn(self._journal.connect(), self)
+
+    def __getattr__(self, name):
+        return getattr(self._journal, name)
+
+
+def _cancel_orders_root(recon, children_before_kill, order_ids=("ord-1", "ord-2")):
+    coord = _recon_coordinator(recon)
+    coord.register_action("cancel_order", lambda cmd: {"order_entity_id": cmd.target_id},
+                          requires_preflight=False)
+
+    def fan_out_then_die(cmd):
+        for index, order_id in enumerate(cmd.body["order_entity_ids"][:children_before_kill]):
+            coord.execute(CommandRequest(command_id=f"{cmd.command_id}-{index}", action="cancel_order",
+                                         account_id=cmd.account_id, target_type="order", target_id=order_id,
+                                         expected_version=None, body={"order_entity_id": order_id},
+                                         source=cmd.source, parent_command_id=cmd.command_id))
+        raise ProcessKilled()
+    coord.register_action("cancel_orders", fan_out_then_die, requires_preflight=False)
+    _killed(coord, "co-1", "cancel_orders", {"order_entity_ids": list(order_ids)})
+    reconciler = _restarted(recon)
+    reconciler.rescan_on_startup()
+    reconciler.run_due(LATER)
+    return recon.ledger.get("co-1")
+
+
+def test_a_cancel_orders_root_that_died_before_its_fan_out_is_not_a_success(recon):
+    from trader.trading.command_coordinator import CANCEL_FANOUT_NOT_STARTED
+    root = _cancel_orders_root(recon, children_before_kill=0)
+    assert (root.state, root.error_code) == ("REJECTED", CANCEL_FANOUT_NOT_STARTED)
+
+
+def test_a_cancel_orders_root_with_a_partial_fan_out_stays_unknown(recon):
+    assert _cancel_orders_root(recon, children_before_kill=1).state == "OUTCOME_UNKNOWN"
+
+
+def test_a_cancel_orders_root_resolves_once_every_child_settled(recon):
+    root = _cancel_orders_root(recon, children_before_kill=2)
+    assert root.state == "RESOLVED"
+    assert root.outcome["child_command_ids"] == ["co-1-0", "co-1-1"] and root.outcome["partial_failure"] is False
+
+
+def test_a_committed_create_whose_evidence_read_fails_once_stays_unknown_then_resolves(recon):
+    svc = _recon_proposal_service(recon)
+    coord = _recon_coordinator(recon)
+
+    def create_then_die(cmd):
+        svc.create_proposal(ProposalCreateRequest(conid=cmd.body["conid"], action=cmd.body["action"],
+                                                  quantity=cmd.body.get("quantity")),
+                            source=cmd.source, correlation_id=cmd.command_id)
+        raise ProcessKilled()
+    coord.register_action("create_proposal", create_then_die, requires_preflight=False)
+    _killed(coord, "cc-crash", "create_proposal", {"conid": 265598, "action": "BUY", "quantity": 10},
+            target_type="proposal")
+    flaky = FlakyEvidenceJournal(recon.journal, "entity_type = 'proposal' AND correlation_id")
+    reconciler = _restarted(recon, journal=flaky)
+    reconciler.rescan_on_startup()
+    reconciler.run_due(LATER)
+    assert (flaky.failures, recon.ledger.get("cc-crash").state) == (0, "OUTCOME_UNKNOWN")
+    reconciler.run_due(LATER + dt.timedelta(seconds=5))
+    row = recon.ledger.get("cc-crash")
+    assert (row.state, row.outcome["created"]) == ("RESOLVED", True)
+
+
+def test_an_unreadable_cancel_orders_request_keeps_the_root_unknown(recon):
+    coord = _recon_coordinator(recon)
+    coord.register_action("cancel_orders", lambda cmd: (_ for _ in ()).throw(ProcessKilled()),
+                          requires_preflight=False)
+    _killed(coord, "co-1", "cancel_orders", {"order_entity_ids": ["ord-1"]})
+    flaky = FlakyEvidenceJournal(recon.journal, "FROM command_audit")
+    reconciler = _restarted(recon, journal=flaky)
+    reconciler.rescan_on_startup()
+    reconciler.run_due(LATER)
+    assert (flaky.failures, recon.ledger.get("co-1").state) == (0, "OUTCOME_UNKNOWN")
+    reconciler.run_due(LATER + dt.timedelta(seconds=5))
+    assert recon.ledger.get("co-1").state == "REJECTED"
+
+
+def test_a_handler_started_after_the_start_is_never_parked_even_after_a_clock_rollback(recon):
+    reconciler = _restarted(recon)                                  # built at NOW, before serving
+    coord = TradingCommandCoordinator(journal=recon.journal, ledger=recon.ledger, audit=CommandAudit(recon.journal),
+                                      nonces=FakeNonceGate(), now=lambda: NOW - dt.timedelta(hours=1))
+    seen = []
+
+    def register_while_rescanned(cmd):
+        reconciler.rescan_on_startup()                              # a rescan while this handler runs
+        reconciler.run_due(LATER)
+        seen.append(recon.ledger.get(cmd.command_id).state)
+        return {"created": True}
+    coord.register_action("register_ai_deployment", register_while_rescanned, requires_preflight=False)
+    receipt = coord.execute(CommandRequest(command_id="aidep-live", action="register_ai_deployment",
+                                           account_id="DU111111", target_type="ai_deployment", target_id="d",
+                                           expected_version=None, body={}, source="ai_research"))
+    assert seen == ["RECEIVED"] and receipt.state == "RESOLVED"
+
+
+def test_a_foreign_row_on_a_child_id_is_no_cancel_evidence(recon, caplog):
+    """PR #122: a terminal command that only shares the predictable child id never settles the root."""
+    recon.ledger.insert_for_test("batch-0", state="RESOLVED", updated_at=NOW, account_id="DU111111",
+                                 action="create_proposal", target_type="proposal", target_id="")
+    coord = _recon_coordinator(recon)
+    coord.register_action("cancel_orders", lambda cmd: (_ for _ in ()).throw(ProcessKilled()),
+                          requires_preflight=False)
+    _killed(coord, "batch", "cancel_orders", {"order_entity_ids": ["ord-1"]})
+    reconciler = _restarted(recon)
+    reconciler.rescan_on_startup()
+    reconciler.run_due(LATER)
+    reconciler.run_due(LATER + dt.timedelta(seconds=5))
+    assert recon.ledger.get("batch").state == "OUTCOME_UNKNOWN"
+    errors = [r.getMessage() for r in caplog.records if r.levelname == "ERROR" and "batch-0" in r.getMessage()]
+    assert len(errors) == 1
+
+
+@pytest.mark.parametrize("parent", [None, "unrelated-root"])
+def test_a_cancel_child_without_the_roots_link_is_no_cancel_evidence(recon, parent):
+    """PR #122: same id, action, order and account as a child, but correlated elsewhere: not this root's."""
+    coord = _recon_coordinator(recon)
+    coord.register_action("cancel_order", lambda cmd: {"order_entity_id": cmd.target_id},
+                          requires_preflight=False)
+    coord.register_action("cancel_orders", lambda cmd: (_ for _ in ()).throw(ProcessKilled()),
+                          requires_preflight=False)
+    prior = coord.execute(CommandRequest(command_id="batch-0", action="cancel_order", account_id="DU111111",
+                                         target_type="order", target_id="ord-1", expected_version=None,
+                                         body={"order_entity_id": "ord-1"}, source="dashboard",
+                                         parent_command_id=parent))
+    assert prior.state == "RESOLVED"
+    _killed(coord, "batch", "cancel_orders", {"order_entity_ids": ["ord-1"]})
+    reconciler = _restarted(recon)
+    reconciler.rescan_on_startup()
+    reconciler.run_due(LATER)
+    reconciler.run_due(LATER + dt.timedelta(seconds=5))
+    assert recon.ledger.get("batch").state == "OUTCOME_UNKNOWN"

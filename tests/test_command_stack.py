@@ -794,3 +794,25 @@ def test_the_iex_fallback_takes_its_symbol_from_fresh_ib_details_only(tmp_path, 
     trader.contract_details_port = lambda contract: []                   # IB cannot prove the identity
     stack.dispatch_guard._quotes.executable_quote(265598, side="BUY")
     assert len(alpaca.requests) == 1                                      # no request on a stored row's word
+
+
+def test_a_stack_rebuilt_in_the_same_process_never_parks_a_live_received_row(tmp_path):
+    """PR #122: the crash-left RECEIVED snapshot is taken once per process, not per stack build."""
+    from trader.trading.command_coordinator import CommandRequest
+    from trader.trading.command_stack import build_command_stack
+    trader = _trader(tmp_path)
+    first = build_command_stack(trader, _policy(), now=lambda: NOW)
+    seen = []
+
+    def runs_through_a_connect_retry(cmd):
+        rebuilt = build_command_stack(trader, _policy(), now=lambda: NOW)     # connect() retried meanwhile
+        rebuilt.reconciler.rescan_on_startup()
+        rebuilt.reconciler.run_due(NOW)
+        seen.append(first.ledger.get(cmd.command_id).state)
+        return {"done": True}
+    first.coordinator.register_action("register_ai_deployment", runs_through_a_connect_retry,
+                                      requires_preflight=False)
+    receipt = first.coordinator.execute(CommandRequest(
+        command_id="aidep-live", action="register_ai_deployment", account_id="DU111111",
+        target_type="ai_deployment", target_id="d", expected_version=None, body={}, source="ai_research"))
+    assert seen == ["RECEIVED"] and receipt.state == "RESOLVED"

@@ -373,3 +373,47 @@ def test_an_ambiguous_entry_status_with_a_stop_row_stays_submitted(world, status
     assert not reconciler.reconcile_once(receipt.command_id, NOW).resolved
     assert world.ledger.get(receipt.command_id).state == "SUBMITTED"
 
+# PR #126 review: a close root proves flat, not that the entry was accepted.
+
+def _flat_root(command_id):
+    from types import SimpleNamespace
+    from trader.trading.liquidation_service import CloseResolution
+    resolution = CloseResolution(
+        command_id=command_id, root_id=command_id, state="FLAT", success=True,
+        outcome={"close_root_id": command_id, "liquidation_state": "FLAT", "filled_quantity": 0.0})
+    return SimpleNamespace(root_for=lambda cid: command_id if cid == command_id else None,
+                           close_resolution=lambda cid: resolution if cid == command_id else None)
+
+
+def test_a_flat_close_root_with_no_entry_leg_is_not_an_entry_success(world):
+    receipt = world.submit()
+    reconciler, _ = _entry_reconciler(world, [], closes=_flat_root(receipt.command_id))
+    assert reconciler.reconcile_once(receipt.command_id, NOW).resolved
+    row = world.ledger.get(receipt.command_id)
+    assert (row.state, row.error_code) == ("REJECTED", "ENTRY_UNPROVEN_FLATTENED")
+    assert row.outcome["broker_acknowledged"] is False
+    assert row.outcome["close_root_id"] == receipt.command_id
+
+
+def test_a_flat_close_root_with_an_ambiguous_entry_stays_submitted(world):
+    receipt = world.submit()
+    found = [_bracket_row("entry", "PendingSubmit")]
+    reconciler, _ = _entry_reconciler(world, found, closes=_flat_root(receipt.command_id))
+    assert not reconciler.reconcile_once(receipt.command_id, NOW).resolved
+    assert world.ledger.get(receipt.command_id).state == "SUBMITTED"
+
+
+def test_a_flat_close_root_with_no_entry_leg_needs_a_complete_enumeration(world):
+    receipt = world.submit()
+    reconciler, _ = _entry_reconciler(world, [], complete=False, closes=_flat_root(receipt.command_id))
+    assert not reconciler.reconcile_once(receipt.command_id, NOW).resolved
+    assert world.ledger.get(receipt.command_id).state == "SUBMITTED"
+
+
+def test_a_filled_entry_closed_flat_resolves_from_its_root(world):
+    receipt = world.submit()
+    found = [_bracket_row("entry", "Filled", filled=499.0), _bracket_row("stop", "Cancelled")]
+    reconciler, _ = _entry_reconciler(world, found, closes=_flat_root(receipt.command_id))
+    assert reconciler.reconcile_once(receipt.command_id, NOW).resolved
+    row = world.ledger.get(receipt.command_id)
+    assert row.state == "RESOLVED" and row.outcome["liquidation_state"] == "FLAT"

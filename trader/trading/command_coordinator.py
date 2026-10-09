@@ -1787,6 +1787,13 @@ def _entry_accepted(entries: list) -> bool:
     )
 
 
+def _is_bracket_entry(row: LedgerRow) -> bool:
+    """The command dispatched its own bracket ``og-{command_id}``: it reached
+    SUBMITTED, or recorded that group before its outcome became unknown. A SELL
+    exit never does (it ends OUTCOME_UNKNOWN with a close outcome)."""
+    return row.state == "SUBMITTED" or (row.outcome or {}).get("order_group_id") == f"og-{row.command_id}"
+
+
 def _is_terminal_order(order: BrokerOrderRow) -> bool:
     return order.deleted or order.status not in _ACTIVE_ORDER_STATUSES
 
@@ -2544,6 +2551,9 @@ class _ReconcilePlan:
 # name is spelled out: importing it from trader.automation would be a cycle.
 CLOSE_RESOLVED_ACTIONS = frozenset({"execute_automated_intent", "liquidate_account", "submit_ai_paper_decision"})
 AI_PAPER_ENTRY_ACTION = "submit_ai_paper_decision"   # spelled out: importing it would be a cycle
+# A bracket entry whose saga failed into a flatten: the flatten met its goal, but
+# the broker never proved the entry accepted. Terminal, never an entry success.
+ENTRY_UNPROVEN_FLATTENED = "ENTRY_UNPROVEN_FLATTENED"
 AI_DEPLOYMENT_REGISTER_ACTION = "register_ai_deployment"   # spelled out: importing it would be a cycle
 # The reconciler's proof that a registration's transaction never committed. Terminal, so it no longer holds
 # reconciliation_safe(); the register RPC handler sends the next attempt under a new command id.
@@ -2826,11 +2836,47 @@ class OutcomeReconciler:
 
     def _reconcile_automated_intent(self, row: LedgerRow, now: dt.datetime) -> bool:
         """A command that started or joined a close root (a SELL exit, or a BUY
-        whose protective saga failed into a flatten) resolves only from that
-        root. Any other automated command is a bracket entry."""
-        if self._has_close_root(row.command_id):
+        whose protective saga failed into a flatten) resolves only once that
+        root is decided, so a failed flatten still rejects it with an alert.
+        Any other automated command is a bracket entry."""
+        if not self._has_close_root(row.command_id):
+            return self._reconcile_automated_entry(row, now)
+        if _is_bracket_entry(row):
+            return self._reconcile_flattened_entry(row, now)
+        return self._reconcile_close(row, now)
+
+    def _reconcile_flattened_entry(self, row: LedgerRow, now: dt.datetime) -> bool:
+        """A bracket entry whose saga failed into a flatten. The root proves the
+        account flat, not that the broker accepted the entry:
+
+        - root open or failed -> as ``_reconcile_close`` (unknown, or REJECTED
+          with an operator alert);
+        - root met its goal and the entry is broker-proven -> RESOLVED with the
+          root's outcome (an entry that traded, then closed);
+        - root met its goal, no entry proven, no order of the group still live,
+          on a COMPLETE enumeration -> REJECTED ``ENTRY_UNPROVEN_FLATTENED``;
+        - otherwise unresolved."""
+        resolution = self._closes.close_resolution(row.command_id)
+        if resolution is None or not resolution.success:
             return self._reconcile_close(row, now)
-        return self._reconcile_automated_entry(row, now)
+        found = self._orders.find_by_order_ref(
+            row.account_id, encode_order_ref(f"og-{row.command_id}"),
+        )
+        if _entry_accepted([order for order in found if getattr(order, "leg", None) == "entry"]):
+            self._resolve_command_only(row, dict(resolution.outcome), now)
+            return True
+        statuses = [getattr(order, "status", None) for order in found]
+        if not all(status in _KNOWN_TERMINAL_ORDER_STATUSES for status in statuses):
+            return False
+        if not self._orders.enumeration_complete():
+            return False
+        self._reject_command_only(
+            row, error_code=ENTRY_UNPROVEN_FLATTENED,
+            outcome={**dict(resolution.outcome), "order_group_id": f"og-{row.command_id}",
+                     "broker_statuses": statuses, "broker_acknowledged": False},
+            now=now,
+        )
+        return True
 
     def _has_close_root(self, command_id: str) -> bool:
         return self._closes is not None and self._closes.root_for(command_id) is not None

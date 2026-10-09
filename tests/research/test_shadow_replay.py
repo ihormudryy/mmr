@@ -170,7 +170,10 @@ def test_wrong_size_or_missing_bars_make_an_incomplete_row_after_the_deadline(wo
     w.replay.tick()
     got = rows(w.trader)
     assert got["2024-03-21"]["status"] == "INCOMPLETE" and got["2024-03-21"]["reason"].startswith("BAR_SIZE_MISMATCH")
-    assert got["2024-03-28"]["status"] == "COMPLETE" and "2024-04-01" not in got
+    later = got["2024-03-28"]                                                # one run: 03-21 is still its input
+    assert later["status"] == "INCOMPLETE" and later["reason"] == (
+        f"BAR_SIZE_MISMATCH: conid {CONIDS[0]} has bars closer than 15 mins on 2024-03-21")
+    assert "2024-04-01" not in got
     w.clock["now"] = dt.datetime(2024, 4, 2, 13, tzinfo=UTC)
     w.replay.tick()
     assert rows(w.trader)["2024-04-01"]["reason"].startswith("BARS_MISSING")
@@ -629,3 +632,40 @@ def test_the_bar_check_ignores_a_close_stamped_bar_even_when_the_read_returns_it
     monkeypatch.setattr(shadow_replay, "before_close", shadow_replay.session_close_utc)    # read includes 20:00
     assert w.replay._bar_problem(CONIDS, "15 mins", dt.date(2024, 3, 20)).startswith(
         f"BARS_MISSING: conid {CONIDS[1]} has no 15 mins bar up to the close")
+
+
+@pytest.mark.timeout(120)
+def test_a_hole_in_an_earlier_session_keeps_every_later_row_incomplete(world):
+    _drop_bars(world.db_path, CONIDS[2], "2024-03-18 00:00+00:00", "2024-03-19 00:00+00:00")   # first session
+    w = world.make("earlier-hole.duckdb")
+    w.replay.tick()                                                       # 03-23 12:00: every deadline passed
+    got = rows(w.trader)
+    assert got["2024-03-18"]["reason"] == f"BARS_MISSING: no 15 mins bars for conid {CONIDS[2]} on 2024-03-18"
+    for session in ("2024-03-19", "2024-03-20", "2024-03-21", "2024-03-22"):
+        assert got[session]["status"] == "INCOMPLETE" and got[session]["reason"] == got["2024-03-18"]["reason"]
+    assert w.jobs == []                                                   # no row was built on the hole
+
+
+@pytest.mark.timeout(120)
+def test_a_hole_in_a_warm_up_session_keeps_the_rows_incomplete(world):
+    _drop_bars(world.db_path, CONIDS[0], "2024-03-13 15:00+00:00", "2024-03-13 17:00+00:00")   # warm-up
+    w = world.make("warm-up-hole.duckdb")
+    w.clock["now"] = dt.datetime(2024, 3, 19, 13, tzinfo=UTC)
+    w.replay.tick()
+    row = rows(w.trader)["2024-03-18"]
+    assert row["status"] == "INCOMPLETE" and row["reason"].startswith(f"BARS_MISSING: conid {CONIDS[0]} has a gap")
+    assert row["reason"].endswith("on 2024-03-13")
+
+
+@pytest.mark.timeout(120)
+def test_an_after_hours_bar_in_an_earlier_session_does_not_hide_its_missing_closing_bar(world):
+    _drop_bars(world.db_path, CONIDS[1], "2024-03-20 19:45+00:00", "2024-03-20 20:00+00:00")
+    _pre_market_bar(world.db_path, CONIDS[1], "2024-03-20 20:00+00:00")
+    w = world.make("earlier-after-hours.duckdb")
+    w.clock["now"] = dt.datetime(2024, 3, 22, 13, tzinfo=UTC)
+    w.replay.tick()
+    got = rows(w.trader)
+    assert got["2024-03-19"]["status"] == "COMPLETE"
+    for session in ("2024-03-20", "2024-03-21"):
+        assert got[session]["status"] == "INCOMPLETE"
+        assert got[session]["reason"] == f"BARS_MISSING: conid {CONIDS[1]} has no 15 mins bar up to the close on 2024-03-20"

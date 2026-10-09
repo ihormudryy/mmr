@@ -86,6 +86,35 @@ def _aware(raw: str) -> dt.datetime:
     return value
 
 
+def _utc_stamps(frame: Optional[pd.DataFrame]) -> pd.DatetimeIndex:
+    if frame is None or len(frame) == 0:
+        return pd.DatetimeIndex([], tz="UTC")
+    stamps = pd.DatetimeIndex(frame.index)
+    return stamps.tz_localize("UTC") if stamps.tz is None else stamps.tz_convert("UTC")
+
+
+def _session_bar_problem(stamps: pd.DatetimeIndex, conid, bar_size: str, spacing: pd.Timedelta,
+                         session: dt.date) -> Optional[str]:
+    session_open = pd.Timestamp(session_open_utc(session))
+    session_close = pd.Timestamp(session_close_utc(session))
+    # From New York midnight to the close; a bar stamped at the close is the first after-hours bar.
+    day = stamps[(stamps >= pd.Timestamp(ny_day_start(session))) & (stamps < session_close)]
+    if len(day) == 0:
+        return f"BARS_MISSING: no {bar_size} bars for conid {conid} on {session}"
+    if (day.to_series().diff().dropna() < spacing).any():
+        return f"BAR_SIZE_MISMATCH: conid {conid} has bars closer than {bar_size} on {session}"
+    regular = day[day >= session_open]                    # pre-market bars neither open a gap nor fill one
+    if len(regular) == 0 or regular.min() > session_open + spacing:
+        first = "none" if len(regular) == 0 else regular.min()
+        return f"BARS_MISSING: conid {conid} has its first {bar_size} bar at {first} on {session}"
+    steps = regular.to_series().diff().dropna()
+    if (steps > MAX_GAP_BARS * spacing).any():
+        return f"BARS_MISSING: conid {conid} has a gap of {steps.max()} in its {bar_size} bars on {session}"
+    if regular.max() < session_close - spacing:
+        return f"BARS_MISSING: conid {conid} has no {bar_size} bar up to the close on {session}"
+    return None
+
+
 class _Wait(Exception):
     """The row is not final yet (an INCOMPLETE row waits for its deadline, ruling 11)."""
 
@@ -232,16 +261,16 @@ class ShadowReplay:
 
     def _row(self, member: dict, case: Any, session: dt.date) -> dict:
         family = self._family(case)
-        problem = (self._source_problem(case) or self._family_problem(case, family)
-                   or self._costs_problem(family) or self._bar_problem(case.conids, case.bar_size, session))
+        evidence = case.evidence
+        first = member["first_session"]
+        warm_start = sessions_before(first, int(evidence["warmup_sessions"]))
+        problem = (self._source_problem(case) or self._family_problem(case, family) or self._costs_problem(family)
+                   or self._bar_problem(case.conids, case.bar_size, session, inputs_from=warm_start))
         if problem is not None:
             return self._incomplete(member, case, session, problem)
-        evidence = case.evidence
         replay_index = evidence["replay_index"]
         points = evidence.get("points") or []
         params = points[replay_index]["params"] if points else case.cohort[replay_index]
-        first = member["first_session"]
-        warm_start = sessions_before(first, int(evidence["warmup_sessions"]))
         env = self._environment(case, family)
         job = WindowJob(_point_key(params), dict(params), "shadow", 0, ny_day_start(warm_start),
                         before_close(session), 1.0, trading_start=ny_day_start(first))
@@ -312,30 +341,20 @@ class ShadowReplay:
             return "COSTS_CHANGED: execution_costs.yaml differs from the judged one"
         return None
 
-    def _bar_problem(self, conids, bar_size: str, session: dt.date) -> Optional[str]:
+    def _bar_problem(self, conids, bar_size: str, session: dt.date, *,
+                     inputs_from: Optional[dt.date] = None) -> Optional[str]:
+        """Every session the replay reads, ``inputs_from`` (the warm-up start) through ``session``: one continuous
+        run carries a hole in an earlier session into every later row. ``session`` itself is checked first."""
         tickdata = TickStorage(self._paths.history_db).get_tickdata(BarSize.parse_str(bar_size))
         spacing = pd.Timedelta(seconds=bar_seconds(bar_size))
-        session_open = pd.Timestamp(session_open_utc(session))
-        session_close = pd.Timestamp(session_close_utc(session))
-        last_bar_due = session_close - spacing
-        for conid in conids:
-            frame = tickdata.read(conid, date_range=DateRange(start=ny_day_start(session), end=before_close(session)))
-            if frame is None or len(frame) == 0:
-                return f"BARS_MISSING: no {bar_size} bars for conid {conid} on {session}"
-            stamps = pd.DatetimeIndex(frame.index)
-            stamps = stamps.tz_localize("UTC") if stamps.tz is None else stamps
-            stamps = stamps[stamps < session_close]           # a bar stamped at the close is after hours
-            if (stamps.to_series().diff().dropna() < spacing).any():
-                return f"BAR_SIZE_MISMATCH: conid {conid} has bars closer than {bar_size} on {session}"
-            regular = stamps[stamps >= session_open]          # pre-market bars neither open a gap nor fill one
-            if len(regular) == 0 or regular.min() > session_open + spacing:
-                first = "none" if len(regular) == 0 else regular.min()
-                return f"BARS_MISSING: conid {conid} has its first {bar_size} bar at {first} on {session}"
-            steps = regular.to_series().diff().dropna()
-            if (steps > MAX_GAP_BARS * spacing).any():
-                return f"BARS_MISSING: conid {conid} has a gap of {steps.max()} in its {bar_size} bars on {session}"
-            if regular.max() < last_bar_due:
-                return f"BARS_MISSING: conid {conid} has no {bar_size} bar up to the close on {session}"
+        earlier = xnys_sessions(inputs_from, session)[:-1] if inputs_from is not None else []
+        stamps_of = {conid: _utc_stamps(tickdata.read(conid, date_range=DateRange(
+            start=ny_day_start(earlier[0] if earlier else session), end=before_close(session)))) for conid in conids}
+        for day in [session, *earlier]:
+            for conid in conids:
+                problem = _session_bar_problem(stamps_of[conid], conid, bar_size, spacing, day)
+                if problem is not None:
+                    return problem
         return None
 
     def _family(self, case: Any) -> Any:

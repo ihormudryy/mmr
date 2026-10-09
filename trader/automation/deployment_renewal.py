@@ -20,7 +20,7 @@ from trader.automation.forward_evidence import ForwardEvidenceRefused
 from trader.automation.strategy_binding import bar_size_key, same_values
 from trader.research.evaluation_case import EvaluationCase
 from trader.research.forward_evidence_view import (
-    ForwardEvidenceView, ForwardSession, LineFacts, PaperTrip, Renewability, VersionBinding,
+    ForwardEvidenceView, ForwardSession, LineFacts, PaperTrip, Renewability, VersionBinding, forward_evidence_digest,
 )
 from trader.research.shadow_window import session_close_utc, shadow_window
 from trader.research.strategy_key import split_strategy_key
@@ -32,6 +32,7 @@ from trader.scoreboard.shadow_ingest import _is_intact, shadow_record_id
 from trader.scoreboard.store import row_key
 
 FORWARD_EVIDENCE_TAMPERED = "FORWARD_EVIDENCE_TAMPERED"
+FORWARD_EVIDENCE_CHANGED = "FORWARD_EVIDENCE_CHANGED"
 DEPLOYMENT_VERSION_TAMPERED = "DEPLOYMENT_VERSION_TAMPERED"
 SESSION_NOT_CLOSED = "SESSION_NOT_CLOSED"
 NOT_DUE = frozenset({"ACTIVE", "NOT_STARTED", "OVER_CAP"})
@@ -300,6 +301,7 @@ class TraderRenewalChecks:
         try:
             facts = self._forward.facts(prior)
             sessions = self._forward.sessions(facts)
+            trips = self._forward.trips(prior)
         except ForwardEvidenceRefused as refused:
             if refused.code.endswith("TAMPERED"):
                 raise JudgmentRefused(refused.code, refused.detail) from None
@@ -315,6 +317,9 @@ class TraderRenewalChecks:
         block = self._gate.deploy_block(facts.base, facts.line, now)
         if block is not None:
             return RenewalStatus(deploy_block_code=block[0], detail=block[1])
+        if case.evidence.get("forward_evidence_digest") != forward_evidence_digest(sessions, trips):
+            return RenewalStatus(deploy_block_code=FORWARD_EVIDENCE_CHANGED,
+                                 detail="the forward sessions or paper trips are not the ones the case was signed on")
         open_sessions = [s.session_date for s in sessions if s.state != "COMPLETE"]
         if open_sessions:
             return RenewalStatus(deploy_block_code="FORWARD_INCOMPLETE",

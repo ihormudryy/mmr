@@ -10,7 +10,7 @@ from collections import Counter
 
 from trader.research.canonical import sha256_digest
 from trader.research.evaluation_case import CASE_DOMAIN, EvaluationCase
-from trader.research.forward_evidence_view import ForwardEvidenceView
+from trader.research.forward_evidence_view import ForwardEvidenceView, forward_evidence_digest
 from trader.research.shadow_window import session_close_utc
 
 RENEWAL_REQUEST_DOMAIN = "mmr.research.renewal-request.v1"
@@ -92,5 +92,6 @@ def build_renewal_case(view: ForwardEvidenceView, *, created_at: dt.datetime, wa
                   "warmup_sessions": warmup_sessions, "error": None, "forward": summary,
                   "forward_sessions": [session.model_dump(mode="json") for session in view.sessions],
                   "paper_trips": [trip.model_dump(mode="json") for trip in view.trips],
+                  "forward_evidence_digest": forward_evidence_digest(view.sessions, view.trips),
                   "order_notional": binding.order_notional, "bundle_digest": binding.bundle_digest,
                   "initial_judgment_id": line.initial_judgment_id})

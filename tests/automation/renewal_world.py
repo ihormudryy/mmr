@@ -4,7 +4,7 @@ from __future__ import annotations
 import datetime as dt
 from dataclasses import dataclass
 from types import SimpleNamespace
-from typing import Any
+from typing import Any, Optional
 
 from tests.automation.backtest_judge_fixtures import (
     FILE_HASH, NOW, World, finished, judge_config, judgment, renewal_case_body, world,
@@ -26,9 +26,11 @@ from trader.automation.ai_paper_decision import (
 from trader.automation.backtest_judgments import BacktestJudgments
 from trader.automation.calendar_policy import XNYSCalendarPolicy
 from trader.automation.deployment_renewal import RenewalGate, TraderRenewalChecks, VersionForwardEvidence
+from trader.automation.forward_evidence import ForwardEvidenceRefused
 from trader.data.domain_journal import DomainJournal
 from trader.data.schema_migrations import SchemaMigrator
 from trader.research.evaluation_case import EvaluationCase, write_evaluation_case
+from trader.research.forward_evidence_view import forward_evidence_digest
 from trader.scoreboard.ports import DecisionStoreAttribution
 from trader.scoreboard.round_trips import project_round_trips
 from trader.scoreboard.schema import apply_scoreboard_migrations
@@ -154,11 +156,21 @@ class RenewalWorld:
 
     def renewal_case(self, prior: str, *, forward_sessions: int = 3, incomplete_sessions: int = 0,
                      **changes) -> str:
+        """A signed renewal case bound, like the research service's, to the trader's forward evidence now."""
         raw = renewal_case_body(**changes)
         raw["renewal"] = {"prior_deployment_version": prior, "forward_sessions": forward_sessions,
                           "incomplete_sessions": incomplete_sessions}
+        if "evidence" not in changes:
+            raw["evidence"] = {**raw["evidence"], "forward_evidence_digest": self.forward_digest(prior)}
         return write_evaluation_case(self.base.keys.cases_dir, EvaluationCase.model_validate(raw),
                                      self.base.keys.signer)
+
+    def forward_digest(self, prior: str) -> Optional[str]:
+        try:
+            facts = self.forward.facts(prior)
+            return forward_evidence_digest(self.forward.sessions(facts), self.forward.trips(prior))
+        except ForwardEvidenceRefused:          # an unknown prior: the trader refuses that case before the digest
+            return None
 
     def renew(self, case_digest: str, prior: str, verdict: str = "DEPLOY", *,
               judgment_id: str = "jdg-renewal-1", **changes) -> dict:

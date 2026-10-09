@@ -696,7 +696,7 @@ Refused before Jev (the candidate closes as `REFUSED_<code>` and the line ends a
 - `RENEWED`: a new version was registered.
 - `RENEWAL_<verdict>`: Jev judged SHADOW, REJECT or NO_VERDICT.
 - `RENEWAL_REFUSED_<code>`: refused before Jev (list above).
-- `RENEWAL_JUDGMENT_<code>`: the trader refused to record the judgment (for example `RENEWAL_ALREADY_JUDGED`, or `FORWARD_INCOMPLETE` on a DEPLOY). A loud error shows as `RENEWAL_JUDGMENT_RPC_<code>`.
+- `RENEWAL_JUDGMENT_<code>`: the trader refused to record the judgment (for example `RENEWAL_ALREADY_JUDGED`, or `FORWARD_INCOMPLETE` or `FORWARD_EVIDENCE_CHANGED` on a DEPLOY; CHANGED means a session row or a paper trip changed after the case was signed). A loud error shows as `RENEWAL_JUDGMENT_RPC_<code>`.
 - `RENEWAL_REGISTER_<code>`: the trader refused the registration (for example `BUNDLE_EXPIRED`, `RENEWAL_PRIOR_INVALID`). A loud error shows as `RENEWAL_REGISTER_RPC_<code>`.
 - `RENEWAL_RPC_<code>`: the research service refused a typed call. ERROR log.
 - `RENEWAL_EVALUATION_FAILED_NO_CASE`, `RENEWAL_EVALUATION_STALE`, `RENEWAL_DUPLICATE_REQUEST`, `RENEWAL_RESEARCH_REPLY_MISMATCH`: the candidate ended with that `end_code` and no judgment.

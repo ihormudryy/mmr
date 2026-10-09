@@ -4,14 +4,17 @@ The trader builds it for get_deployment_forward_evidence; the research service p
 strict model and signs a renewal case from it. Every value is code-computed."""
 from __future__ import annotations
 
-from typing import Annotated, Literal, Optional, Union
+from typing import Annotated, Literal, Optional, Sequence, Union
 
 from pydantic import BaseModel, ConfigDict, Field, StrictBool, StrictInt, StrictStr
+
+from trader.research.canonical import sha256_digest
 
 DIGEST = r"^sha256:[0-9a-f]{64}$"
 DAY = r"^\d{4}-\d{2}-\d{2}$"
 Money = Annotated[float, Field(strict=True, allow_inf_nan=False)]
 Scalar = Union[StrictBool, StrictInt, Money, StrictStr]
+FORWARD_EVIDENCE_DOMAIN = "mmr.research.forward-evidence.v1"
 VERSION_STATUSES = ("ACTIVE", "NOT_STARTED", "EXPIRED", "WITHDRAWN", "SUPERSEDED", "JUDGMENT_ENDED", "OVER_CAP")
 
 
@@ -84,3 +87,11 @@ class ForwardEvidenceView(_View):
 
     def to_wire(self) -> dict:
         return self.model_dump(mode="json")
+
+
+def forward_evidence_digest(sessions: Sequence[ForwardSession], trips: Sequence[PaperTrip]) -> str:
+    """Binds a renewal case to the forward evidence it was built from: every session (state, reason, numbers) and
+    every paper trip. The trader recomputes it from its own read when the judgment is recorded."""
+    return "sha256:" + sha256_digest(FORWARD_EVIDENCE_DOMAIN, {
+        "sessions": [session.model_dump(mode="json") for session in sessions],
+        "trips": [trip.model_dump(mode="json") for trip in trips]})

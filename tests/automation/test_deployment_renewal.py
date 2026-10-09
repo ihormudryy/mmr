@@ -293,3 +293,42 @@ def test_a_deleted_initial_judgment_is_tampered_for_the_registration(tmp_path):
         register_renewal(rw)
     assert exc.value.code == "JUDGMENT_TAMPERED"
     assert rw.base.db.execute("SELECT COUNT(*) FROM ai_deployment_versions", fetch="one")[0] == 1
+
+
+# Fix round 2 (PR #100 blocker 2): the judgment is recorded on the forward evidence the case was signed on
+
+def test_a_deploy_on_forward_evidence_that_changed_after_signing_is_refused(tmp_path):
+    """Signed with a CLOSED trip of +12.50; a broker correction makes it -12000 before Jev's DEPLOY."""
+    rw, v1 = expired_line(tmp_path)
+    rw.paper_trip(v1, "rt-1", net_pnl=12.5)
+    case = rw.renewal_case(v1)
+    rw.base.db.execute("UPDATE broker_fills SET quantity = 200 WHERE exec_id IN ('x-rt-1-in', 'x-rt-1-out')")
+    rw.base.db.execute("UPDATE broker_fills SET price = 40.005 WHERE exec_id = 'x-rt-1-out'")
+    rw.refresh_trips()
+    assert [t["net_pnl_usd"] for t in rw.forward.read(v1)["trips"]] == [-12000.0]
+    refused = rw.renew(case, v1)
+    assert (refused["status"], refused["code"]) == ("REFUSED", "FORWARD_EVIDENCE_CHANGED")
+    assert rw.judgments.renewals_of(v1) == ()
+    with pytest.raises(DeploymentRefused):
+        register_renewal(rw)
+    assert rw.base.db.execute("SELECT COUNT(*) FROM ai_deployment_versions", fetch="one")[0] == 1
+    assert rw.renew(case, v1, "SHADOW")["status"] == "RECORDED"                 # Jev may still end the line
+    assert rw.activity.status(v1) == "JUDGMENT_ENDED"
+
+
+def test_a_deploy_on_an_edited_trip_projection_fails_loudly(tmp_path):
+    """The reviewer's exact trace: only the stored projection changes. That is tampering (blocker 1), loud."""
+    rw, v1 = expired_line(tmp_path)
+    rw.paper_trip(v1, "rt-1", net_pnl=12.5)
+    case = rw.renewal_case(v1)
+    rw.base.db.execute("UPDATE round_trips SET net_pnl_usd = -12000.0")
+    with pytest.raises(JudgmentRefused) as exc:
+        rw.renew(case, v1)
+    assert exc.value.code == "FORWARD_EVIDENCE_TAMPERED"
+    assert rw.base.db.execute("SELECT COUNT(*) FROM ai_deployment_versions", fetch="one")[0] == 1
+
+
+def test_a_case_without_a_forward_evidence_digest_cannot_deploy(tmp_path):
+    rw, v1 = expired_line(tmp_path)
+    case = rw.renewal_case(v1, evidence={"note": "unbound"})
+    assert rw.renew(case, v1)["code"] == "FORWARD_EVIDENCE_CHANGED"

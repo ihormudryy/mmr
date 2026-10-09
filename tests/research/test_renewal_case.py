@@ -13,7 +13,7 @@ from trader.research.case_builder import evaluation_summary
 from trader.research.evaluation_case import (
     FULL_MENU, NO_DEPLOY_MENU, case_path, load_verified_case, offered_menu, write_evaluation_case,
 )
-from trader.research.forward_evidence_view import ForwardEvidenceView
+from trader.research.forward_evidence_view import ForwardEvidenceView, forward_evidence_digest
 from trader.research.renewal_case import build_renewal_case, pending_sessions, renewal_request_id
 from trader.research.signing import AttestationSigner
 
@@ -41,6 +41,15 @@ def test_a_complete_window_is_a_forward_complete_case_that_offers_deploy():
     assert (parsed.order_notional, parsed.holdout_passed, parsed.strategy_trials) == (1900.0, None, 0)
     assert parsed.forward["pnl_usd"] == 15.0 and parsed.forward["paper_trips"] == 1
     assert parsed.forward["paper_net_pnl_usd"] == 7.5
+
+
+def test_the_case_carries_the_digest_of_the_sessions_and_trips_it_was_built_from():     # PR #100 blocker 2
+    view = ForwardEvidenceView.model_validate(forward_view(trips=(trip(),)))
+    signed = build(trips=(trip(),)).evidence["forward_evidence_digest"]
+    assert signed == forward_evidence_digest(view.sessions, view.trips)
+    assert build(trips=(trip(net_pnl=-12000.0),)).evidence["forward_evidence_digest"] != signed
+    assert build(trips=(trip(),), states=("COMPLETE", "INCOMPLETE", "COMPLETE")).evidence[
+        "forward_evidence_digest"] != signed
 
 
 @pytest.mark.parametrize("state", ["INCOMPLETE", "MISSING", "NOT_REPLAYED"])

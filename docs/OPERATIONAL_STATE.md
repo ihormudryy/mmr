@@ -424,7 +424,7 @@ tables are in `mmr_research.duckdb`; there is no `mmr` command for these yet):
       container per service (`trader`, `strategy`, `dashboard`, `cli`,
       `scheduler`, `data`, `ai`, `research`) in a separate compose project `mmr-keycheck`, with
       `docker-compose.test.override.yml` (fake broker, `--simulation True`).
-      Each container only runs `mmr keys check-mount <service>`: it must see
+      Each container only runs `python -m trader.messaging.keys_cli check-mount <service>`: it must see
       exactly its own `.key`, its own `.pub` and its peers' `.pub`, those
       keys must load the way the service loads them at startup (own pair
       matches, modes, Ed25519), and `service_hmac.key` must read empty.

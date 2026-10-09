@@ -1636,3 +1636,24 @@ def test_a_foreign_row_on_a_child_id_is_no_cancel_evidence(recon, caplog):
     assert recon.ledger.get("batch").state == "OUTCOME_UNKNOWN"
     errors = [r.getMessage() for r in caplog.records if r.levelname == "ERROR" and "batch-0" in r.getMessage()]
     assert len(errors) == 1
+
+
+@pytest.mark.parametrize("parent", [None, "unrelated-root"])
+def test_a_cancel_child_without_the_roots_link_is_no_cancel_evidence(recon, parent):
+    """PR #122: same id, action, order and account as a child, but correlated elsewhere: not this root's."""
+    coord = _recon_coordinator(recon)
+    coord.register_action("cancel_order", lambda cmd: {"order_entity_id": cmd.target_id},
+                          requires_preflight=False)
+    coord.register_action("cancel_orders", lambda cmd: (_ for _ in ()).throw(ProcessKilled()),
+                          requires_preflight=False)
+    prior = coord.execute(CommandRequest(command_id="batch-0", action="cancel_order", account_id="DU111111",
+                                         target_type="order", target_id="ord-1", expected_version=None,
+                                         body={"order_entity_id": "ord-1"}, source="dashboard",
+                                         parent_command_id=parent))
+    assert prior.state == "RESOLVED"
+    _killed(coord, "batch", "cancel_orders", {"order_entity_ids": ["ord-1"]})
+    reconciler = _restarted(recon)
+    reconciler.rescan_on_startup()
+    reconciler.run_due(LATER)
+    reconciler.run_due(LATER + dt.timedelta(seconds=5))
+    assert recon.ledger.get("batch").state == "OUTCOME_UNKNOWN"

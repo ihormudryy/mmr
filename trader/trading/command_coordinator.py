@@ -752,6 +752,14 @@ class CommandLedger:
         ).fetchall()
         return [_row_to_ledger_row(row) for row in rows]
 
+    def audited_correlation_id(self, command_id: str) -> Optional[str]:
+        """The correlation id the audit record kept for this command (a fan-out child: its root), or None."""
+        row = self._journal.connect().execute(
+            "SELECT correlation_id FROM command_audit WHERE command_id = ? ORDER BY audit_id LIMIT 1",
+            [command_id],
+        ).fetchone()
+        return None if row is None else row[0]
+
     def audited_body(self, command_id: str) -> Optional[dict[str, Any]]:
         """The request body the mandatory audit record kept for this command, or None without a record."""
         row = self._journal.connect().execute(
@@ -2597,10 +2605,14 @@ class WithdrawalEvidencePort(Protocol):
     def committed_withdrawal(self, command_id: str) -> Optional[dict[str, Any]]: ...
 
 
-def _is_cancel_child_of(child: LedgerRow, root: LedgerRow, order_id: str) -> bool:
-    """Whether ``child`` is the cancel_order a cancel_orders root fanned out for ``order_id``."""
-    return (child.action == "cancel_order" and child.target_type == "order" and child.target_id == order_id
-            and child.account_id == root.account_id)
+def _is_cancel_child_of(child: LedgerRow, link: Optional[str], root: LedgerRow, order_id: str) -> bool:
+    """Whether ``child`` is the cancel_order a cancel_orders root fanned out for ``order_id``.
+
+    The proof of parentage is ``link``: the fan-out sends each child with ``parent_command_id`` = the root,
+    so its audit record (and its journal events) carry the root as correlation id. Action, order and account
+    alone are no proof: a standalone cancel_order may share all three and the child's id (PR #122)."""
+    return (link == root.command_id and child.action == "cancel_order" and child.target_type == "order"
+            and child.target_id == order_id and child.account_id == root.account_id)
 
 
 def read_received_at_start(ledger: CommandLedger) -> list[LedgerRow]:
@@ -3151,21 +3163,24 @@ class OutcomeReconciler:
         sends the cancel again); a partial fan-out or a child still in flight -> stays unknown. The request
         comes from the root's audit record; without it nothing is concluded.
 
-        The ledger keeps no parent link, so a row counts as the child only when it is the ``cancel_order`` of
-        this root's account for the order its index stands for. Any other row on a child id is foreign: the
-        root stays unknown with one ERROR naming it (PR #122), never a success."""
+        A row counts as the child only when its audit record carries this root as correlation id (the link
+        the fan-out writes) and it is the ``cancel_order`` of this root's account for the order its index
+        stands for. Any other row on a child id is foreign: the root stays unknown with one ERROR naming it
+        (PR #122), never a success."""
         try:
             body = self._ledger.audited_body(row.command_id)
             order_ids = list(dict.fromkeys((body or {}).get("order_entity_ids") or []))
             child_ids = [f"{row.command_id}-{index}" for index in range(len(order_ids))]
             children = [self._ledger.get(child_id) for child_id in child_ids]
+            links = [None if child is None else self._ledger.audited_correlation_id(child.command_id)
+                     for child in children]
         except Exception:
             self._evidence_unreadable(row)
             return False
         if not order_ids:
             return False
-        foreign = [child.command_id for order_id, child in zip(order_ids, children)
-                   if child is not None and not _is_cancel_child_of(child, row, order_id)]
+        foreign = [child.command_id for order_id, child, link in zip(order_ids, children, links)
+                   if child is not None and not _is_cancel_child_of(child, link, row, order_id)]
         if foreign:
             self._child_id_collision(row, foreign)
             return False

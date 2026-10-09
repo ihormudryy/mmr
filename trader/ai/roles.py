@@ -6,7 +6,7 @@ Models pick from code-built menus; conids, ids, prices and ceilings come from co
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Any, Literal, Mapping, Optional, Protocol, Sequence, Union
+from typing import Any, Literal, Mapping, Optional, Sequence, Union
 
 from pydantic import Field
 
@@ -197,22 +197,3 @@ def close_messages(menu: Mapping[str, PositionChoice], *,
                             "bid": c.bid, "ask": c.ask, "stop": body_price(c, "stop_price"),
                             "target": body_price(c, "target_price")} for ref, c in menu.items()]}
     return ChatMessage("system", CLOSE_SYSTEM), _user(facts, (), 0)
-
-
-# -- Jev as backtest judge (SP2c owns the workflow) ----------------------------------------------------
-
-class BacktestVerdict(StrictModelOutput):
-    """Jev as backtest judge (spec 3). The type only: SP2c owns the workflow."""
-    verdict: Literal["DEPLOY", "SHADOW", "REJECT"]
-    reason: str = Field(min_length=1, max_length=2000)
-
-
-@dataclass(frozen=True)
-class BacktestCase:
-    strategy_digest: str
-    evidence_ref: str
-    metrics: Mapping[str, float]
-
-
-class BacktestJudge(Protocol):
-    async def judge_backtest(self, case: BacktestCase) -> Union[BacktestVerdict, OutputRefusal]: ...

@@ -6,7 +6,8 @@ from decimal import ROUND_CEILING, ROUND_FLOOR, Decimal
 from pathlib import Path
 from typing import Annotated, Callable, Literal, Mapping, Optional
 import yaml
-from pydantic import BaseModel, BeforeValidator, ConfigDict, Field, StrictStr, StringConstraints, ValidationError
+from pydantic import (BaseModel, BeforeValidator, ConfigDict, Field, StrictBool, StrictStr, StringConstraints,
+                      ValidationError)
 
 
 SUPPORTED_BACKENDS = ("openrouter", "bedrock", "azure")
@@ -81,6 +82,8 @@ class ControllerConfig(_Section):
     experiment_poll_seconds: Number = Field(10.0, gt=0, le=300, allow_inf_nan=False)
     heartbeat_seconds: Number = Field(10.0, gt=0, le=60, allow_inf_nan=False)
     budget_cap_poll_seconds: Number = Field(60.0, gt=0, le=300, allow_inf_nan=False)
+    research_query_port: Whole = Field(42106, gt=0, lt=65536)
+    research_command_port: Whole = Field(42107, gt=0, lt=65536)
     heartbeat_path: StrictStr = "/tmp/mmr_ai_heartbeat.json"
 
 
@@ -127,6 +130,26 @@ class DecisionsConfig(_Section):
     role_recheck_seconds: Whole = Field(300, ge=30, le=3600)
 
 
+StrategyKey = Annotated[StrictStr, StringConstraints(
+    pattern=r"^strategies/[A-Za-z0-9_]+\.py:[A-Za-z_][A-Za-z0-9_]{0,63}$")]
+UniverseName = Annotated[StrictStr, StringConstraints(pattern=r"^[a-z][a-z0-9_]{0,31}$")]
+MIN_RESEARCH_CONIDS, MAX_RESEARCH_CONIDS = 8, 20     # evaluation_spec.MIN_INSTRUMENTS, ai_deployments.MAX_CONIDS
+
+
+class ResearchCycleConfig(_Section):
+    """The research cycle's menu (SP2c Plan 4). trader.yaml and the research service hold the authority."""
+    enabled: StrictBool = False
+    strategy_keys: tuple[StrategyKey, ...] = Field((), max_length=20)
+    universes: dict[UniverseName, tuple[Whole, ...]] = Field(default_factory=dict, max_length=10)
+    bar_sizes: tuple[StrictStr, ...] = Field(("1 min", "5 mins", "15 mins"), min_length=1, max_length=9)
+    max_candidates_per_cycle: Whole = Field(3, ge=1, le=10)
+    max_cohort_points: Whole = Field(3, ge=1, le=5)
+    after_close_minutes: Whole = Field(30, ge=0, le=240)
+    poll_seconds: Number = Field(30.0, gt=0, le=600, allow_inf_nan=False)
+    evaluation_stale_hours: Whole = Field(24, ge=1, le=168)
+    judge_attempts: Whole = Field(2, ge=1, le=3)
+
+
 class _PriceRow(_Section):
     input_usd_per_million: Number = Field(ge=0, allow_inf_nan=False)
     output_usd_per_million: Number = Field(ge=0, allow_inf_nan=False)
@@ -139,6 +162,7 @@ class _RawConfig(_Section):
     database_path: StrictStr = "~/.local/share/mmr_ai/ai.duckdb"
     controller: ControllerConfig = Field(default_factory=ControllerConfig)
     decisions: DecisionsConfig = Field(default_factory=DecisionsConfig)
+    research: ResearchCycleConfig = Field(default_factory=ResearchCycleConfig)
 
 
 @dataclass(frozen=True)
@@ -169,6 +193,7 @@ class AiConfig:
     database_path: str
     controller: ControllerConfig = ControllerConfig()
     decisions: DecisionsConfig = DecisionsConfig()
+    research: ResearchCycleConfig = ResearchCycleConfig()
 
     def role(self, name: str) -> RoleConfig:
         try:
@@ -187,6 +212,7 @@ class AiConfig:
             "budget": self.budget.model_dump(),
             "controller": self.controller.model_dump(),
             "decisions": self.decisions.model_dump(mode="json"),
+            "research": self.research.model_dump(mode="json"),
         }
         return hashlib.sha256(json.dumps(body, sort_keys=True).encode()).hexdigest()
 
@@ -247,8 +273,28 @@ def _check(parsed: _RawConfig) -> AiConfig:
     if (fixed.stop_fraction, fixed.target_fraction) != FIXED_RULE_V1:
         raise AiConfigError("FIXED_RULE_VERSION_MISMATCH",
                             "fixed_rule.v1 is 0.02 / 0.04; other values need a new baseline version")
+    _check_research(parsed.research)
     return AiConfig(dict(parsed.roles), PriceBook(rows), parsed.budget, parsed.database_path, controller,
-                    parsed.decisions)
+                    parsed.decisions, parsed.research)
+
+
+def _check_research(research: ResearchCycleConfig) -> None:
+    from trader.objects import BarSize
+    for size in research.bar_sizes:
+        try:
+            parsed = BarSize.parse_str(size)
+        except ValueError:
+            raise AiConfigError("RESEARCH_BAR_SIZE_INVALID", f"{size!r} is not a bar size") from None
+        if parsed > BarSize.Mins15:
+            raise AiConfigError("RESEARCH_BAR_SIZE_TOO_LONG", f"{size!r} is longer than 15 minutes")
+    for name, conids in research.universes.items():
+        if not (MIN_RESEARCH_CONIDS <= len(set(conids)) == len(conids) <= MAX_RESEARCH_CONIDS) \
+                or any(conid <= 0 for conid in conids):
+            raise AiConfigError("RESEARCH_UNIVERSE_INVALID", f"universe {name!r} needs 8-20 distinct positive conids")
+    if len(set(research.strategy_keys)) != len(research.strategy_keys):
+        raise AiConfigError("RESEARCH_DUPLICATE_STRATEGY", "a strategy key is listed twice")
+    if research.enabled and not (research.strategy_keys and research.universes):
+        raise AiConfigError("RESEARCH_MENU_EMPTY", "an enabled research cycle needs strategy_keys and universes")
 
 
 def usd_to_micros_floor(usd: float | Decimal) -> int:

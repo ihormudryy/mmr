@@ -19,15 +19,17 @@ SUPERVISOR_QUERIES = frozenset({
     "get_account_values", "get_ai_entry_quote",                           # SP2 Plan 6 Ruling 4
     "get_broker_order_evidence"})                                          # a waiting exit's proof (PR #86)
 SUPERVISOR_SLOW_QUERIES: Mapping[str, float] = {"discover_ai_candidates": 90.0}
-RESEARCH_COMMANDS = frozenset({"register_ai_deployment"})
-RESEARCH_QUERIES = frozenset({"get_ai_deployment"})
+RESEARCH_COMMANDS = frozenset({"register_ai_deployment", "record_backtest_judgment"})    # ai_research -> trader
+RESEARCH_QUERIES = frozenset({"get_ai_deployment", "get_backtest_judgment", "get_ai_deployment_version"})
+LAB_COMMANDS = frozenset({"submit_evaluation", "attest_from_judgment"})                   # ai_research -> research
+LAB_QUERIES = frozenset({"get_evaluation"})
 EPOCH_METHODS = frozenset({"submit_ai_paper_decision", "read_ai_signals", "get_ai_paper_decision"})
 EPOCH_REFUSALS = frozenset({"CONTROLLER_EPOCH_MISSING", "CONTROLLER_EPOCH_STALE"})
 ENGINE_QUERIES = (SUPERVISOR_QUERIES | frozenset(SUPERVISOR_SLOW_QUERIES)) - EPOCH_METHODS
 
 
 class RpcNotSent(Exception):
-    """Proven: the trader never received this request (local refusal, or no route before the send)."""
+    """Proven: the server never received this request (local refusal, or no route before the send)."""
 
     def __init__(self, code: str, detail: str = ""):
         super().__init__(f"{code}: {detail}" if detail else code)
@@ -54,7 +56,8 @@ class RpcRefused(Exception):
         self.code, self.message, self.details = code, message, details
 
 
-def _call_blocking(client: Any, method: str, body: dict, timeout: float, options: dict) -> dict:
+def _call_blocking(client: Any, method: str, body: dict, timeout: float, options: dict,
+                   unreachable_code: str) -> dict:
     from trader.messaging.typed_rpc import TypedRpcRemoteError
     try:
         return client.call(method, body, dict, timeout, **options)
@@ -62,7 +65,7 @@ def _call_blocking(client: Any, method: str, body: dict, timeout: float, options
         raise RpcRefused(exc.code, exc.message, exc.details) from None
     except ConnectionError as exc:
         # TypedRpcClient.call raises ConnectionError only before the send: no socket, or IMMEDIATE=1 refused.
-        raise RpcNotSent("TRADER_UNREACHABLE", str(exc)) from None
+        raise RpcNotSent(unreachable_code, str(exc)) from None
     except TimeoutError as exc:
         raise RpcOutcomeUnknown("REPLY_TIMEOUT", str(exc)) from None
     except Exception as exc:                       # a reply that failed verification, or anything after the send
@@ -72,8 +75,9 @@ def _call_blocking(client: Any, method: str, body: dict, timeout: float, options
 class PrincipalClient:
     def __init__(self, principal: str, *, command: Any, query: Any, commands: frozenset[str],
                  queries: frozenset[str], timeout: float, slow_query: Any = None,
-                 slow_queries: Optional[Mapping[str, float]] = None):
+                 slow_queries: Optional[Mapping[str, float]] = None, unreachable_code: str = "TRADER_UNREACHABLE"):
         self.principal = principal
+        self._unreachable_code = unreachable_code
         slow = dict(slow_queries or {})
         if slow and slow_query is None:
             raise ValueError("slow queries need their own socket")
@@ -102,7 +106,7 @@ class PrincipalClient:
                 raise RpcNotSent("NOT_LEADER", f"{method} needs a held controller epoch")
             options["controller_epoch"] = held
         timeout = self._timeouts.get(method, self._timeout)
-        return await asyncio.to_thread(_call_blocking, client, method, body, timeout, options)
+        return await asyncio.to_thread(_call_blocking, client, method, body, timeout, options, self._unreachable_code)
 
     def close(self) -> None:
         for socket in self._sockets:
@@ -124,39 +128,53 @@ class ReadOnlySupervisor:
 @dataclass
 class AiRpcClients:
     supervisor: PrincipalClient
-    research: PrincipalClient
+    research: PrincipalClient                         # ai_research at the trader
+    lab: PrincipalClient                              # ai_research at the research server
 
     @classmethod
     def from_sockets(cls, *, supervisor_command: Any, supervisor_query: Any, supervisor_discovery: Any,
-                     research_command: Any, research_query: Any, timeout: float) -> "AiRpcClients":
+                     research_command: Any, research_query: Any, lab_command: Any, lab_query: Any,
+                     timeout: float) -> "AiRpcClients":
         supervisor = PrincipalClient("ai_supervisor", command=supervisor_command, query=supervisor_query,
                                      slow_query=supervisor_discovery, commands=SUPERVISOR_COMMANDS,
                                      queries=SUPERVISOR_QUERIES, slow_queries=SUPERVISOR_SLOW_QUERIES,
                                      timeout=timeout)
         research = PrincipalClient("ai_research", command=research_command, query=research_query,
                                    commands=RESEARCH_COMMANDS, queries=RESEARCH_QUERIES, timeout=timeout)
-        return cls(supervisor, research)
+        lab = PrincipalClient("ai_research", command=lab_command, query=lab_query, commands=LAB_COMMANDS,
+                              queries=LAB_QUERIES, timeout=timeout, unreachable_code="RESEARCH_UNREACHABLE")
+        return cls(supervisor, research, lab)
 
     @classmethod
     def connect(cls, *, keys_dir: Optional[str], address: str, query_port: int, command_port: int,
+                research_address: str, research_query_port: int, research_command_port: int,
                 timeout: float) -> "AiRpcClients":
-        """Load both key pairs (startup only) and open five sockets. ZMQ connects lazily: no trader needed yet."""
+        """Load both key pairs (startup only) and open seven sockets. ZMQ connects lazily: no server needed yet."""
         from trader.messaging.typed_rpc import ServiceIdentity, TypedRpcClient
 
         identities = {p: ServiceIdentity.load(p, keys_dir) for p in ("ai_supervisor", "ai_research")}
 
-        def socket(principal: str, role: str) -> Any:
-            port = command_port if role == "command" else query_port
-            client = TypedRpcClient(role, identities[principal], server="trader", address=address, port=port,
+        def trader_socket(principal: str, role: str) -> Any:
+            return open_socket(principal, role, "trader", address, command_port if role == "command" else query_port)
+
+        def research_socket(role: str) -> Any:
+            port = research_command_port if role == "command" else research_query_port
+            return open_socket("ai_research", role, "research", research_address, port)
+
+        def open_socket(principal: str, role: str, server: str, at: str, port: int) -> Any:
+            client = TypedRpcClient(role, identities[principal], server=server, address=at, port=port,
                                     timeout=timeout)
             client.connect()
             return client
         return cls.from_sockets(
-            supervisor_command=socket("ai_supervisor", "command"), supervisor_query=socket("ai_supervisor", "query"),
-            supervisor_discovery=socket("ai_supervisor", "query"),
-            research_command=socket("ai_research", "command"), research_query=socket("ai_research", "query"),
-            timeout=timeout)
+            supervisor_command=trader_socket("ai_supervisor", "command"),
+            supervisor_query=trader_socket("ai_supervisor", "query"),
+            supervisor_discovery=trader_socket("ai_supervisor", "query"),
+            research_command=trader_socket("ai_research", "command"),
+            research_query=trader_socket("ai_research", "query"),
+            lab_command=research_socket("command"), lab_query=research_socket("query"), timeout=timeout)
 
     def close(self) -> None:
         self.supervisor.close()
         self.research.close()
+        self.lab.close()

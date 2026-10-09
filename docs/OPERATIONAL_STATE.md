@@ -602,6 +602,107 @@ Do not arm a second automatic strategy. Do not set `automation.live_enabled`.
 
 ---
 
+## AI research cycle (SP2c)
+
+**Status: built, off by default** (`research.enabled: false` in `ai.yaml`). It runs only on paper.
+
+### What runs
+
+- After each session close, plus `after_close_minutes` (30), the `ai` service starts one research slot. The slot ends 30 minutes before the next open. Nothing of this runs during the session.
+- In the slot the `ai` service:
+  1. builds a menu from `ai.yaml` `research:` (strategy keys, universes, bar sizes, the tunables of each strategy file),
+  2. asks the orchestrator for at most `max_candidates_per_cycle` candidates,
+  3. screens the answer in code. One bad pick is dropped with a code and never stops the others,
+  4. sends each candidate to the `research` service (`submit_evaluation`),
+  5. polls the result (`get_evaluation`). When the case is ready, Jev judges it (DEPLOY, SHADOW, REJECT or NO_VERDICT),
+  6. records every judgment at the trader (`record_backtest_judgment`),
+  7. for a DEPLOY: the research service attests it (`attest_from_judgment`) and the trader registers the deployment (`register_ai_deployment`).
+- Each step is stored in `ai.duckdb` before its call. After a lost reply the same stored body is sent again.
+- Jev sees only the code-built summary of the case. The orchestrator's thesis is stored but never reaches Jev. DEPLOY is on Jev's menu only when every rule passed.
+- Model calls use the same budget, cap and journal as the rest of the `ai` service.
+
+### Turn it on
+
+1. In `trader.yaml` put the strategy keys into `ai_paper.backtest_judge.strategy_allowlist` (`strategies/<file>.py:<Class>`). This is the authority. An empty list means nothing may be evaluated. Restart the trader (`./docker.sh -b -u`).
+2. In `ai.yaml` `research:` put the same keys in `strategy_keys`. Add at least one universe of 8 to 20 conids. Check each conid with `mmr resolve SYMBOL`. Set `enabled: true`.
+   - Keep `research.max_cohort_points` at or below `ai_paper.backtest_judge.max_cohort_points`. The `ai` service cannot read `trader.yaml`.
+   - The strategy files are baked into the image. After you edit a strategy, rebuild (`./docker.sh -b -u`) so `ai` and `research` read the same bytes.
+3. Make sure the `research` service runs (see "Research service (SP2c Plan 3)" above) and an experiment was started (`mmr experiment start`). Without an experiment a slot is `SKIPPED` (`NO_EXPERIMENT`).
+4. Restart `ai` (`./docker.sh -b -u`, or `docker compose --profile ai up -d ai`). A bad `research:` block stops `ai` at start. The error names the field (`RESEARCH_MENU_EMPTY`, `RESEARCH_UNIVERSE_INVALID`, `RESEARCH_BAR_SIZE_INVALID`, `RESEARCH_BAR_SIZE_TOO_LONG`, `RESEARCH_DUPLICATE_STRATEGY`).
+
+**Daily bars for every conid (important).** The trader checks the liquidity of an ENTER from its local daily bars only (`production_evidence.py`, `liquidity_from_history`). There is no Alpaca fallback. So every conid in a research universe must also be in a universe that the scheduler refreshes with a daily job. The jobs are in `data_refresh.yaml` (`bar_size: "1 day"`) and the cron entries in `pycron.yaml` (`data_refresh_us`, `data_refresh_asx`). A conid with no daily history gets its ENTER refused with `HISTORY_INVALID`, after a good backtest. Check with `mmr data status`.
+
+### Watch it
+
+- The heartbeat file `/tmp/mmr_ai_heartbeat.json` in the `ai` container has a `research` object: `open_candidates`, `unrecorded_judgments`, `pending_registrations`. It is `null` when research is off. `open_candidates` and `unrecorded_judgments` should go to 0 within a night. A candidate still open the next evening waits on purpose: a slow evaluation (closed as `EVALUATION_STALE` after `evaluation_stale_hours`), a closed budget cap gate, or a judgment row left in `JUDGING` (see "Waiting on purpose"). `pending_registrations` can stay above 0 while a DEPLOY waits for the cap (`WAITING_CAP`) or for the trader (a retryable refusal).
+- Typed read calls (no CLI command yet): `get_backtest_judgment` (trader, as `cli` or `dashboard`) and `get_evaluation` (research service, as `cli`).
+- `ai.duckdb` tables:
+  - `ai_research_cycles`: one row per evening. `state` is RUNNING, DONE, SKIPPED, MISSED or FAILED. `reason` says why. `menu_json` is the menu. `dropped_json` lists every dropped menu entry and pick with its code.
+  - `ai_research_candidates`: one row per candidate. `state` is NEW, SUBMITTED, EVALUATED or CLOSED. `end_code` says how it ended.
+  - `ai_backtest_judgments`: one row per case. `state` is JUDGING, DECIDED, RECORDED or REFUSED. `verdict` and `code` hold the result.
+  - `ai_research_registrations`: one row per DEPLOY. `state` is ATTESTING, REGISTERING, WAITING_CAP, REGISTERED or REFUSED. `line_state` is LIVE or ENDED.
+  - `ai_research_cooldowns`: strategy keys that cool down, and until which session.
+- Logs: a lost slot, a refused judgment or registration and a judgment that cannot be taken (stuck in `JUDGING`, or the case already judged) are ERROR. A lost submit reply is one WARNING when it happens. If that candidate then closes as `STALE_NOT_SUBMITTED`, that is an ERROR. A wait is WARNING: once per row (or slot) and code, except the closed budget cap gate, which logs one per pump.
+
+### Codes you will see
+
+Cycle `reason` (`ai_research_cycles`):
+- `CANDIDATES_n`: done, n candidates stored.
+- `NO_STRATEGY_ON_MENU`, `MENU_INCOMPLETE`: the menu was empty. Check `dropped_json` (`STRATEGY_NOT_FOUND`, `COOLING_DOWN`, `NO_NUMERIC_TUNABLES`, `TOO_MANY_TUNABLES`, `UNIVERSE_INVALID`, `BAR_SIZE_NOT_ELIGIBLE`, `STRATEGY_SCAN_FAILED`).
+- `PROPOSAL_*`: the orchestrator's answer was refused (`PROPOSAL_OUTPUT_*`, or `PROPOSAL_MODEL_FAILED_*` after the call was sent). No candidate that night.
+- `NO_EXPERIMENT` (SKIPPED), `LATE_START` (MISSED), `ENGINE_ERROR`, `PROCESS_RESTARTED` (FAILED).
+- A refused or never-sent orchestrator call leaves the slot open. It is tried again while the slot is due: not before the refusal's retry time (for a spent budget, the next New York midnight), or 60 seconds later when the refusal has none. This hold-off lives in memory; a restart tries at once.
+
+Dropped picks (`dropped_json`): `OFF_MENU_STRATEGY`, `OFF_MENU_UNIVERSE`, `OFF_MENU_BAR_SIZE`, `CANDIDATE_LIMIT`, `COHORT_CONFLICT`, `UNDECLARED_TUNABLE`, `TUNABLE_TYPE`, `POINT_INVALID`, `DUPLICATE_POINT`, `COHORT_POINT_LIMIT`, `NO_VALID_POINTS`.
+
+Candidate `end_code`:
+- `JUDGED_DEPLOY`, `JUDGED_SHADOW`, `JUDGED_REJECT`, `JUDGED_NO_VERDICT`: judged.
+- `REFUSED_<code>`: the research service refused the submit. For example `REFUSED_FAMILY_COOLING_DOWN` (this also starts a cooldown here), `REFUSED_HOLDOUT_NOT_AVAILABLE`, `REFUSED_COHORT_TOO_LARGE`.
+- `NOT_SUBMITTED_EVALUATION_LIMIT_REACHED`: the day's evaluation limit was hit. The other new candidates of that slot close with this code. The one that was refused has `REFUSED_EVALUATION_LIMIT_REACHED`.
+- `STALE_NOT_SUBMITTED`: the candidate was still NEW after its slot window closed. It is never carried to another night. If the submit reply was lost, this is logged as ERROR, because the research service may hold an accepted evaluation.
+- `EVALUATION_STALE`: no result after `evaluation_stale_hours`.
+- `EVALUATION_FAILED_NO_CASE`: the evaluation failed or was parked and has no case.
+- `DUPLICATE_REQUEST`: the research service mapped this candidate to a request that another candidate already holds (a submit retried past New York midnight, then the same cohort the next evening). One WARNING names both candidates. The other candidate carries the case and its judgment.
+- `RPC_<code>`: the typed call was refused by the service.
+
+Judgment `code` when the verdict is `NO_VERDICT`: `JEV_OFF_MENU`, `JEV_NARRATIVE_MISSING`, `OUTPUT_*` (bad JSON or schema), `MODEL_REFUSED_<code>` (for example the budget is spent), `MODEL_FAILED_<outcome>`, `ENGINE_ERROR`, `PROCESS_RESTARTED`. Judgment `error_code` (state REFUSED): the trader refused the record (`JUDGMENT_MENU_MISMATCH`, `DEPLOY_NOT_ALLOWED`, `RPC_*`, ...). The line ends.
+
+Registration `state` and `error_code`:
+- `WAITING_CAP` (`DEPLOY_CAP_REACHED`): the cap of active DEPLOYs is full. It is tried again at the first research slot on a later New York date (the trader keys the registration by that date, so a retry on the same date would replay the refusal). It ends when the bundle expires (`BUNDLE_EXPIRED`).
+- `REGISTERING` with a retryable refusal (for example `AUDIT_UNAVAILABLE`): the trader refused for now and kept no ledger record. The same body is sent again on the next pump, with one WARNING per code. A receipt the ledger has not settled yet (`OUTCOME_UNKNOWN`) is also asked again, with one WARNING. Both end when the trader answers, at the latest with `BUNDLE_EXPIRED`.
+- `ATTEST_<code>`: the research service refused the attestation for good. The line ends with ERROR.
+- `ATTEST_<code>_RETRIES_EXHAUSTED`: the attestation failed `ATTEST_MAX_TRIES` (3) times. `TRADER_UNAVAILABLE` does not count as a try.
+- `RPC_<code>` or the trader's own code (`JUDGMENT_*`, `BUNDLE_*`, `FAMILY_COOLING_DOWN`, `RENEWAL_PRIOR_INVALID`, ...): registration refused. The line ends.
+- `line_state ENDED` with `error_code` EXPIRED, WITHDRAWN or ENDED: the deployed version is over. No renewal yet.
+
+### Waiting on purpose
+
+- While the budget cap gate is closed (the owner's cap is not read from the trader yet), an evaluated case waits and is not judged. You see one WARNING per pump. Jev would be refused and the case would be lost. When the gate opens, the case is judged. A budget that is really spent still gives `NO_VERDICT`.
+- A judgment row left in `JUDGING` (for example a database error right after the Jev call) is logged as ERROR once per process. Only the next start of `ai` with research on settles it: `recover()` records it as `NO_VERDICT` (`PROCESS_RESTARTED`) and the pump sends that record. Jev is never asked twice. Until that restart the candidate stays `EVALUATED`.
+- A case that already has a judgment for another candidate is also ERROR once per process. That candidate stays `EVALUATED`; a restart does not change it. Since `DUPLICATE_REQUEST` this should not happen. If it does, check both candidates' `request_id` and `case_digest`.
+
+### Stop it
+
+- Set `research.enabled: false` and restart `ai`. Nothing new starts. Recorded judgments and registered versions stay.
+- Withdraw one deployment with `mmr ai-deployment withdraw VERSION_DIGEST --reason "..."` (typed `withdraw_ai_deployment`, `cli` or dashboard).
+- The trader refuses the ENTER of an expired, withdrawn or cooling-down deployment on its own.
+
+### Replay a judgment
+
+`replay_backtest_judgment(store, judgment_id, config=...)` (`trader/ai/backtest_judge.py`) repeats the verdict from the stored evidence with zero model calls. If the config or the code changed, the result is `INCOMPLETE`. A case judged twice is also `INCOMPLETE`.
+
+### Known limits
+
+- No renewal before SP2c Plan 5. An expired DEPLOY ends. Only a new evaluation with a new, disjoint holdout can deploy that strategy again.
+- The research service runs one evaluation at a time.
+- A crash during a Jev call loses that case (`PROCESS_RESTARTED`). A crash during the orchestrator call loses that night's slot.
+- A submit reply lost just before New York midnight and sent again after it is a new request and uses a second evaluation slot (Plan 3, Ruling 1).
+- Calls to the research service and the trader are not fenced by the controller epoch. When a new leader runs `recover()`, a stale leader could race it for a short time (two orchestrator calls, a narrow window).
+- Jev judges on the code-computed summary: stage, rule results, per-point expectancy at 1x, 1.5x and 2x cost, the selection statistic and trial counts. It has no Sharpe or drawdown figures.
+- Research universes need local daily bars. See "Daily bars for every conid" above.
+
+---
+
 ## Open items / follow-ups (offline)
 
 - Cluster G (AUDIT_ROADMAP): G1 mass-enable RPC timeout, G2 IB farm-status log noise.

@@ -67,6 +67,8 @@ controller:
   experiment_poll_seconds: 10.0
   heartbeat_seconds: 10.0
   budget_cap_poll_seconds: 60.0   # how often the owner's cap is read from the trader (trader.yaml)
+  research_query_port: 42106
+  research_command_port: 42107
   heartbeat_path: /tmp/mmr_ai_heartbeat.json
 
 # The decision engine (SP2 Plan 6). Every key is optional; these are the defaults.
@@ -91,3 +93,18 @@ decisions:
   quote_max_age_seconds: 15
   news_chars_per_item: 400
   role_recheck_seconds: 300        # a role whose provider rejects its model is paused this long
+
+# SP2c research cycle (a menu only; trader.yaml ai_paper.backtest_judge is the authority).
+# This container cannot read trader.yaml. It cuts every cohort at max_cohort_points here, so the operator must keep
+# max_cohort_points at or below ai_paper.backtest_judge.max_cohort_points in trader.yaml.
+research:
+  enabled: false
+  strategy_keys: []          # e.g. ["strategies/opening_range_breakout.py:OpeningRangeBreakout"]
+  universes: {}              # e.g. {us_large: [265598, 272093, ...]}  (8-20 conids, check with mmr resolve)
+  bar_sizes: ["1 min", "5 mins", "15 mins"]   # nothing longer than 15 mins
+  max_candidates_per_cycle: 3
+  max_cohort_points: 3
+  after_close_minutes: 30
+  poll_seconds: 30
+  evaluation_stale_hours: 24
+  judge_attempts: 2

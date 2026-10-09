@@ -58,6 +58,10 @@ class CapGatedGateway:
     def new_deadline(self, label: str = ""):
         return self._gateway.new_deadline(label)
 
+    def ready(self) -> bool:
+        """False while the owner cap is unread or from another window: every call would be refused."""
+        return self._cap.ready()
+
     async def call(self, role, request, deadline):
         if not self._cap.ready():
             raise CallRefused("BUDGET_CAP_UNKNOWN", self._cap.last_error or "the cap is from another window")

@@ -13,10 +13,11 @@ from trader.messaging.typed_rpc import AuthenticationError, TypedRpcRegistry, Ty
 
 
 def fake_clients(epoch=None, error=None):
-    sockets = {name: FakeSocket(error=error) for name in ("sc", "sq", "sd", "rc", "rq")}
+    sockets = {name: FakeSocket(error=error) for name in ("sc", "sq", "sd", "rc", "rq", "lc", "lq")}
     clients = AiRpcClients.from_sockets(
         supervisor_command=sockets["sc"], supervisor_query=sockets["sq"], supervisor_discovery=sockets["sd"],
-        research_command=sockets["rc"], research_query=sockets["rq"], timeout=10.0)
+        research_command=sockets["rc"], research_query=sockets["rq"], lab_command=sockets["lc"],
+        lab_query=sockets["lq"], timeout=10.0)
     clients.supervisor.bind_epoch(lambda: epoch)
     return clients, sockets
 
@@ -126,7 +127,8 @@ def test_cross_principal_calls_are_refused_through_signed_rpc():
             supervisor_command=served.client("ai_supervisor", role="command"),
             supervisor_query=served.client("ai_supervisor"), supervisor_discovery=served.client("ai_supervisor"),
             research_command=served.client("ai_research", role="command"),
-            research_query=served.client("ai_research"), timeout=5.0)
+            research_query=served.client("ai_research"), lab_command=FakeSocket(), lab_query=FakeSocket(),
+            timeout=5.0)
         clients.supervisor.bind_epoch(lambda: 3)
         assert asyncio.run(clients.supervisor.call("submit_ai_paper_decision", {})) == \
             {"principal": "ai_supervisor", "epoch": 3}

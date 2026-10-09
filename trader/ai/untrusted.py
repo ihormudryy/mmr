@@ -115,7 +115,7 @@ def parse_model_output(text: str, schema: type[T]) -> Union[ParsedOutput[T], Out
         candidate = extract_json_text(text)
         try:
             loaded = json.loads(candidate, object_pairs_hook=_no_duplicate_keys, parse_constant=_reject_constant)
-        except (json.JSONDecodeError, RecursionError):
+        except (ValueError, RecursionError):        # JSONDecodeError, or an integer literal over 4300 digits
             raise _Refuse(OUTPUT_BAD_JSON) from None
         if not isinstance(loaded, dict):
             raise _Refuse(OUTPUT_NOT_OBJECT)

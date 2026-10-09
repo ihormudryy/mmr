@@ -270,4 +270,5 @@ def review_allowed_for(review: OperatorReview, account_mode: str) -> None:
 NARRATIVE_FIELDS = _NARRATIVE_FIELDS
 # The eight §8.5 narrative fields a reviewer (human or Jev) writes; the first three are linkage.
 REVIEW_NARRATIVE_FIELDS = _NARRATIVE_FIELDS[3:]
+MAX_NARRATIVE_CHARS = 4000                    # one narrative field of a Jev judgment (record_backtest_judgment)
 ALL_REVIEW_FIELDS = tuple(f.name for f in fields(OperatorReview))

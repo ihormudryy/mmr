@@ -44,7 +44,7 @@ def _extends_strategy(cls: ast.ClassDef) -> bool:
     )
 
 
-def _scan_class(cls: ast.ClassDef, filename: str) -> Dict[str, Any]:
+def _scan_class(cls: ast.ClassDef, filename: str, include_params: bool = True) -> Dict[str, Any]:
     tunables: Dict[str, Any] = {}
     methods: set = set()
     for item in cls.body:
@@ -66,7 +66,7 @@ def _scan_class(cls: ast.ClassDef, filename: str) -> Dict[str, Any]:
             methods.add(item.name)
             # Older strategies keep tunables in ``self.params`` and read them
             # via ``self.params.get('key', default)`` — surface those too.
-            for node in ast.walk(item):
+            for node in ast.walk(item) if include_params else ():
                 if not isinstance(node, ast.Call):
                     continue
                 func = node.func
@@ -107,8 +107,10 @@ def _scan_class(cls: ast.ClassDef, filename: str) -> Dict[str, Any]:
     }
 
 
-def scan_strategies(directory: Union[str, Path]) -> List[Dict[str, Any]]:
-    """Scan ``directory`` for Strategy subclasses. Missing directory → []."""
+def scan_strategies(directory: Union[str, Path], *, include_params: bool = True) -> List[Dict[str, Any]]:
+    """Scan ``directory`` for Strategy subclasses. Missing directory → [].
+
+    ``include_params=False`` reports only class-attribute tunables (what the research service declares)."""
     directory = Path(directory).expanduser()
     if not directory.is_dir():
         return []
@@ -129,5 +131,5 @@ def scan_strategies(directory: Union[str, Path]) -> List[Dict[str, Any]]:
             continue
         for cls in [n for n in tree.body if isinstance(n, ast.ClassDef)]:
             if _extends_strategy(cls):
-                rows.append(_scan_class(cls, py.name))
+                rows.append(_scan_class(cls, py.name, include_params))
     return rows

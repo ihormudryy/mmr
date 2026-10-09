@@ -16,6 +16,7 @@ from typing import Any, Mapping, Sequence
 import yaml
 
 from trader.objects import BarSize
+from trader.research.request_rules import LONGEST_BAR_SIZE, MIN_INSTRUMENTS  # noqa: F401  re-exported
 from trader.research.strategy_paths import normalize_strategy_path
 from trader.simulation.execution_costs import (
     ExecutionCostError,
@@ -23,12 +24,8 @@ from trader.simulation.execution_costs import (
     build_realistic_costs,
 )
 
-MIN_INSTRUMENTS = 8
 # Calendars with a live paper-automation calendar policy (calendar_policy.py).
 LIVE_CALENDARS = ('XNYS',)
-# Live paper automation flattens every position at 15:45 ET, so coarser bars
-# would hold positions overnight or block every entry.
-LONGEST_BAR_SIZE = BarSize.Mins15
 
 
 class EvaluationSpecError(ValueError):

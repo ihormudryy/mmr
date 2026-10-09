@@ -17,6 +17,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Callable, Mapping, Optional
 
+from trader.ai.backtest_judge import BacktestJudgeRunner
 from trader.ai.budget_cap import BudgetCapSync, CapGatedGateway
 from trader.ai.clock import Clock, SystemClock
 from trader.ai.config import DEFAULT_CONFIG_PATH, AiConfig, AiConfigError, check_credentials, load_ai_config
@@ -26,12 +27,13 @@ from trader.ai.gateway import ModelCaller, build_gateway
 from trader.ai.leadership import Leadership, new_holder_id
 from trader.ai.outbox import ReportingOutbox
 from trader.ai.replay import ReplayRecorder
+from trader.ai.research_cycle import ResearchCycle
 from trader.ai.rpc_clients import AiRpcClients, ReadOnlySupervisor
 from trader.ai.runtime_schema import ALL_MIGRATIONS
 from trader.ai.schedule import SessionSlots
 from trader.ai.signal_intake import SignalIntake
 from trader.ai.store import AiStore
-from trader.ai.tools import code_version
+from trader.ai.tools import TRADER_ROOT, code_version
 from trader.ai.submitter import Submitter
 
 logger = logging.getLogger("trader.ai_service")
@@ -61,11 +63,32 @@ def build_engine(deps: EngineDeps) -> DecisionEngine:
                                clock=deps.clock)
 
 
+def build_session_slots(config: AiConfig) -> SessionSlots:
+    cfg = config.controller
+    return SessionSlots(entry_minutes=cfg.entry_slot_minutes, position_minutes=cfg.position_slot_minutes,
+                        grace_seconds=cfg.slot_start_grace_seconds,
+                        research_after_close_minutes=config.research.after_close_minutes)
+
+
+def build_research_cycle(config: AiConfig, *, store: AiStore, clock: Clock, slots: SessionSlots, leadership: Any,
+                         watch: ExperimentWatch, clients: AiRpcClients, gateway: CapGatedGateway,
+                         strategies_root: Path = TRADER_ROOT.parent) -> Optional[ResearchCycle]:
+    """``gateway`` is the cap-gated one: research calls book the same budget and journal as SP2a."""
+    if not config.research.enabled:
+        return None
+    judge = BacktestJudgeRunner(config=config, gateway=gateway, store=store, clock=clock,
+                                recorder=ReplayRecorder(store))
+    return ResearchCycle(config=config, store=store, clock=clock, slots=slots, leadership=leadership, watch=watch,
+                         lab=clients.lab, registry=clients.research, gateway=gateway, judge=judge,
+                         strategies_root=strategies_root)
+
+
 @dataclass(frozen=True)
 class ServiceSettings:
     config_path: str = DEFAULT_CONFIG_PATH
     keys_dir: Optional[str] = None
     trader_address: str = DEFAULT_TRADER_ADDRESS
+    research_address: str = DEFAULT_TRADER_ADDRESS
 
 
 async def serve(settings: ServiceSettings, *, engine_factory: Callable[[EngineDeps], Any], stop: asyncio.Event,
@@ -82,7 +105,9 @@ async def serve(settings: ServiceSettings, *, engine_factory: Callable[[EngineDe
     await asyncio.to_thread(store.migrate, ALL_MIGRATIONS)
     clients = await asyncio.to_thread(lambda: AiRpcClients.connect(
         keys_dir=settings.keys_dir, address=settings.trader_address, query_port=cfg.trader_query_port,
-        command_port=cfg.trader_command_port, timeout=cfg.rpc_timeout_seconds))
+        command_port=cfg.trader_command_port, research_address=settings.research_address,
+        research_query_port=cfg.research_query_port, research_command_port=cfg.research_command_port,
+        timeout=cfg.rpc_timeout_seconds))
     if wrap_clients is not None:
         clients = wrap_clients(clients)
     try:
@@ -100,8 +125,7 @@ async def serve(settings: ServiceSettings, *, engine_factory: Callable[[EngineDe
         if await leadership.acquire(stop) is None:
             return
         await raw_gateway.start()                         # only the leader turns half-finished calls into UNKNOWN
-        slots = SessionSlots(entry_minutes=cfg.entry_slot_minutes, position_minutes=cfg.position_slot_minutes,
-                             grace_seconds=cfg.slot_start_grace_seconds)
+        slots = build_session_slots(config)
         watch = ExperimentWatch(clients.supervisor)
         submitter = Submitter(store=store, supervisor=clients.supervisor, leadership=leadership, clock=clock,
                               slots=slots, experiment_state=watch.state,
@@ -112,7 +136,9 @@ async def serve(settings: ServiceSettings, *, engine_factory: Callable[[EngineDe
             outbox=ReportingOutbox(store=store, journal=gateway.journal, supervisor=clients.supervisor, clock=clock),
             intake=SignalIntake(store=store, supervisor=clients.supervisor, clock=clock,
                                 page_limit=cfg.signal_page_limit, max_age_seconds=cfg.signal_max_age_seconds),
-            slots=slots, engine=engine, gateway=gateway, cap_sync=cap_sync)
+            slots=slots, engine=engine, gateway=gateway, cap_sync=cap_sync,
+            research=build_research_cycle(config, store=store, clock=clock, slots=slots, leadership=leadership,
+                                          watch=watch, clients=clients, gateway=gateway))
         await controller.run(stop)
     finally:
         clients.close()
@@ -146,7 +172,8 @@ def main(argv: Optional[list[str]] = None) -> int:
     args = parser.parse_args(argv)
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s %(message)s")
     settings = ServiceSettings(config_path=args.config, keys_dir=args.keys_dir,
-                               trader_address=os.environ.get("TRADER_TYPED_ADDRESS", DEFAULT_TRADER_ADDRESS))
+                               trader_address=os.environ.get("TRADER_TYPED_ADDRESS", DEFAULT_TRADER_ADDRESS),
+                               research_address=os.environ.get("RESEARCH_TYPED_ADDRESS", DEFAULT_TRADER_ADDRESS))
     return run_service(settings)
 
 

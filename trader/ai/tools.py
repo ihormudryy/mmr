@@ -5,7 +5,7 @@ import functools
 import hashlib
 import os
 from pathlib import Path
-from typing import Any, Iterable, Mapping
+from typing import Any, Iterable, Mapping, Optional
 
 from trader.ai.replay import RecordingClock
 from trader.ai.rpc_clients import RpcNotSent, RpcOutcomeUnknown, RpcRefused
@@ -77,6 +77,15 @@ class LiveTools:
         await self._recorder.record_tool_result(self.unit_key, f"given:{name}", {}, value)
         return value
 
+    async def recorded_refusal(self, try_no: int) -> Optional[str]:
+        """Live there is nothing to read ahead: the call itself decides."""
+        return None
+
+    async def record_try(self, try_no: int, refusal_code: Optional[str]) -> None:
+        """What try N of a retrying unit came to: the refusal code, or None when the call went out. A refusal
+        creates no journal attempt, so replay needs this to take the same branch on every try."""
+        await self.given(f"try:{try_no}", refusal_code)
+
     async def finish(self, config_digest: str) -> None:
         await self._recorder.record_clock_values(self.unit_key, self.clock.values)
         await self._recorder.record_manifest(self.unit_key, code_version=code_version(), config_digest=config_digest)
@@ -101,6 +110,12 @@ class ReplayTools:
 
     async def given(self, name: str, value: Any) -> Any:
         return self._session.tool_result(f"given:{name}", {})
+
+    async def recorded_refusal(self, try_no: int) -> Optional[str]:
+        return await self.given(f"try:{try_no}", None)
+
+    async def record_try(self, try_no: int, refusal_code: Optional[str]) -> None:
+        return None
 
     async def finish(self, config_digest: str) -> None:
         return None

@@ -9,6 +9,7 @@ from pydantic import BaseModel, ConfigDict, field_validator, model_validator
 
 from trader.research.evaluation_case import FULL_MENU, NO_DEPLOY_MENU
 from trader.research.evaluation_request import REQUEST_ID, EvaluationRequestBody
+from trader.research.review import MAX_NARRATIVE_CHARS
 
 DIGEST = re.compile(r"^sha256:[0-9a-f]{64}$")
 JUDGMENT_ID = re.compile(r"^[A-Za-z0-9_-]{8,96}$")
@@ -18,7 +19,6 @@ ATTEMPT_REF = re.compile(r"^[A-Za-z0-9_.:-]{1,128}$")
 NARRATIVE_FIELDS = ("economic_rationale", "edge_survives_costs", "known_failure_regimes",
                     "data_and_survivorship_limits", "parameter_sensitivity", "operational_dependencies",
                     "capacity_and_decay", "episode_dominance")
-MAX_NARRATIVE_CHARS = 4000
 
 
 class _Strict(BaseModel):

@@ -459,3 +459,19 @@ def test_a_tampered_bundle_registers_nothing(tmp_path, signed_bundle, monkeypatc
     assert env.refused("jdg-chain", rec) == "BUNDLE_INVALID"
     assert env.versions.sealed() == ()
     assert env.db.execute("SELECT COUNT(*) FROM ai_deployments", fetch="one") == (0,)
+
+
+@pytest.mark.timeout(240)
+def test_a_deploy_registration_whose_bundle_digest_names_no_bundle_is_refused(tmp_path, signed_bundle, monkeypatch):
+    """A DEPLOY judgment is real, but a digest that is not a signed bundle (here: a case digest) registers nothing."""
+    import hashlib
+    env, rec = real_bundle_env(tmp_path, signed_bundle, monkeypatch)
+    case_digest = "sha256:" + hashlib.sha256(b"the evaluation case, not a bundle").hexdigest()
+    body = {"judgment_id": "jdg-chain", "bundle_digest": case_digest,
+            "deployment": AiDeployment.from_json({**rec, "evidence_ref": case_digest}).to_json()}
+    with pytest.raises(BundleRefused) as refused:
+        env.registrar.register(body, principal="ai_research",
+                               command_id=registration_command_id(body, env.now.date()))
+    assert refused.value.code == "BUNDLE_MISSING"
+    assert env.versions.sealed() == ()
+    assert env.db.execute("SELECT COUNT(*) FROM ai_deployments", fetch="one") == (0,)

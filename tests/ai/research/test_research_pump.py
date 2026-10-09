@@ -765,6 +765,52 @@ async def test_a_registration_the_ledger_has_not_settled_is_asked_again_with_one
 
 
 @pytest.mark.asyncio
+async def test_an_internal_error_on_register_is_an_unknown_outcome_and_the_same_body_is_sent_again(rig, caplog):
+    caplog.set_level(logging.WARNING, logger=LOGGER)
+    script(rig)
+    rig.registry.queues["register_ai_deployment"] = [RpcRefused("INTERNAL_ERROR", "boom"), resolved()]
+    await night(rig, pumps=8)
+    assert rig.rows("SELECT state, error_code, line_state FROM ai_research_registrations") == [
+        ("REGISTERED", None, "LIVE")]
+    first, again = rig.registry.sent("register_ai_deployment")
+    assert again == first
+    (judgment_id,), = rig.rows("SELECT judgment_id FROM ai_research_registrations")
+    (warning,) = [r for r in records(caplog, logging.WARNING) if judgment_id in r.getMessage()]
+    assert "INTERNAL_ERROR" in warning.getMessage()
+    assert records(caplog, logging.ERROR) == []
+
+
+@pytest.mark.asyncio
+async def test_repeated_internal_errors_and_an_unsettled_receipt_still_end_in_the_resolved_version(rig, caplog):
+    """The trader re-runs a registration its reconciler proved uncommitted (REGISTRATION_NOT_COMMITTED) under the
+    next command id, so the ai only ever sees the next answer: an error, an unsettled receipt or the version."""
+    caplog.set_level(logging.WARNING, logger=LOGGER)
+    script(rig)
+    unsettled = {**resolved(), "state": "OUTCOME_UNKNOWN", "outcome": None, "error_code": "INTERNAL_ERROR"}
+    rig.registry.queues["register_ai_deployment"] = [RpcRefused("INTERNAL_ERROR", "boom"), unsettled,
+                                                     RpcRefused("INTERNAL_ERROR", "boom"), resolved()]
+    await night(rig, pumps=10)
+    assert rig.rows("SELECT state, line_state FROM ai_research_registrations") == [("REGISTERED", "LIVE")]
+    first, *again = rig.registry.sent("register_ai_deployment")
+    assert len(again) == 3 and all(body == first for body in again)
+    (judgment_id,), = rig.rows("SELECT judgment_id FROM ai_research_registrations")
+    assert len([r for r in records(caplog, logging.WARNING) if judgment_id in r.getMessage()]) == 2
+    assert records(caplog, logging.ERROR) == []
+
+
+@pytest.mark.asyncio
+async def test_an_internal_error_on_register_that_never_resolves_logs_one_error(rig, caplog):
+    caplog.set_level(logging.WARNING, logger=LOGGER)
+    script(rig)
+    rig.registry.queues["register_ai_deployment"] = [RpcRefused("INTERNAL_ERROR", "boom")] * 40 + [resolved()]
+    await night(rig, pumps=46)
+    (judgment_id,), = rig.rows("SELECT judgment_id FROM ai_research_registrations")
+    (error,) = records(caplog, logging.ERROR)
+    assert judgment_id in error.getMessage()
+    assert len([r for r in records(caplog, logging.WARNING) if judgment_id in r.getMessage()]) == 1
+
+
+@pytest.mark.asyncio
 async def test_a_registration_unsettled_past_the_reconcilers_alert_boundary_logs_one_error(rig, caplog):
     """The trader's reconciler raises its critical alert after 15 minutes; the ai says so once too."""
     caplog.set_level(logging.WARNING, logger=LOGGER)

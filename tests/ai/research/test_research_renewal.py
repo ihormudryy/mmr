@@ -325,6 +325,21 @@ async def test_a_registration_that_waits_keeps_the_line_renewing(rig, reply, sta
 
 
 @pytest.mark.asyncio
+async def test_an_internal_error_on_a_renewal_registration_keeps_the_line_renewing_and_resends(rig):
+    seed_live_line(rig)
+    await renewal_night(rig, register=[RpcRefused("INTERNAL_ERROR", "boom")] * 3, pumps=3)
+    assert line(rig) == [("RENEWING", None)]
+    assert len(rig.registry.sent("register_ai_deployment")) == 3
+
+
+@pytest.mark.asyncio
+async def test_a_renewal_registration_resent_after_an_internal_error_renews_the_line(rig):
+    seed_live_line(rig)
+    await renewal_night(rig, register=[RpcRefused("INTERNAL_ERROR", "boom"), renewed()])
+    assert line(rig) == [("ENDED", "RENEWED")]
+
+
+@pytest.mark.asyncio
 async def test_a_full_cap_renews_the_line_on_the_next_evening(rig):
     seed_live_line(rig)
     await renewal_night(rig, register=[rejected("DEPLOY_CAP_REACHED"), renewed()])

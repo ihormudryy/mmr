@@ -26,6 +26,7 @@ class StrategyNode:
         self.runtime.signal_record = StrategySignalRecord(DuckDBConnection.get_instance(duckdb_path))
         self.runtime.event_store = SimpleNamespace(append=lambda event: None)
         self.runtime.zmq_messagebus_client = SimpleNamespace(write=lambda *args: None)
+        self.runtime._load_ai_history = lambda instance: None     # no IB in a node test
         strategy_query = served.client("strategy", "query")
         self._source = AiDeploymentSource(
             runtime=self.runtime, paper=True,

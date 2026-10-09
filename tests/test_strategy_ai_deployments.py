@@ -1,6 +1,8 @@
 """SP2c Plan 2 Task 9: the strategy service loads active AI deployments from the exact judged bytes."""
 from __future__ import annotations
 
+import datetime as dt
+import logging
 import os
 from types import SimpleNamespace
 
@@ -16,9 +18,10 @@ from trader.acceptance.scenario import AcceptanceSettings, deployment_record
 from trader.data.backtest_store import compute_strategy_hash
 from trader.data.duckdb_store import DuckDBConnection
 from trader.data.strategy_signal_record import StrategySignalRecord
+from trader.listeners.ib_history_worker import IBNoDataError
 from trader.messaging.ai_deployment_wire import ActiveAiDeployment
 from trader.messaging.typed_rpc import TypedRpcRemoteError
-from trader.objects import Action
+from trader.objects import Action, BarSize
 from trader.strategy.ai_deployment_source import AiDeploymentSource, ai_instance_name
 from trader.strategy.trader_gateway import StrategyInstrument
 from trader.trading.strategy import Signal, StrategyState
@@ -68,6 +71,7 @@ def rt(tmp_path, tmp_duckdb_path):
     runtime.signal_record = StrategySignalRecord(DuckDBConnection.get_instance(tmp_duckdb_path))
     runtime.event_store = SimpleNamespace(append=lambda event: None)
     runtime.zmq_messagebus_client = SimpleNamespace(write=lambda *args: None)
+    runtime._load_ai_history = lambda instance: None      # no IB here; the history tests below use the real step
     return runtime
 
 
@@ -281,3 +285,98 @@ def test_a_node_follows_the_trader_active_set_over_signed_rpc(served, tmp_path):
     served.call("cli", "withdraw_ai_deployment", {"version_digest": version, "reason": "operator"})
     node.reconcile()
     assert node.instances() == {}
+
+
+APPLE = StrategyInstrument(CONID, "AAPL", "SMART", "NASDAQ", "USD", "STK", "America/New_York")
+ONE_MIN = BarSize.parse_str("1 min")
+
+
+def backfilled_bars():
+    """Three 1-min IB bars two days back: older than any live tick, inside the priming window."""
+    start = (dt.datetime.now(dt.timezone.utc) - dt.timedelta(days=2)).replace(second=0, microsecond=0)
+    index = pd.date_range(start, periods=3, freq="1min", name="date").tz_convert("America/New_York")
+    return pd.DataFrame({"open": 100.0, "high": 101.0, "low": 99.0, "close": [100.1, 100.2, 100.3],
+                         "volume": 1000.0, "average": 100.0, "bar_count": 10, "bar_size": "1 min",
+                         "what_to_show": 1}, index=index)
+
+
+class FakeHistoryClient:
+    """Stands in for the IB history worker; records each request and fails while ``error`` is set."""
+    def __init__(self, error=None):
+        self.error, self.requests, self.bars = error, [], backfilled_bars()
+
+    async def get_contract_history(self, *, security, what_to_show, bar_size, start_date, end_date):
+        self.requests.append((security.conId, str(bar_size)))
+        if self.error is not None:
+            raise self.error
+        return self.bars
+
+
+@pytest.fixture
+def history_rt(rt, loop_thread, tmp_duckdb_path):
+    del rt._load_ai_history
+    rt._loop = loop_thread.loop
+    rt.history_duckdb_path = tmp_duckdb_path
+    rt._hist_bars = {}
+    rt._tick_retention_days = 2
+    rt._trader_gateway = SimpleNamespace(resolve_instrument=lambda conid: APPLE if conid == CONID else None)
+    return rt
+
+
+def test_a_reconciled_instance_gets_its_history_before_its_first_bar(history_rt, path):
+    history_rt.historical_data_client = FakeHistoryClient()
+    history_rt._hist_bars[(CONID, ONE_MIN)] = pd.DataFrame()   # primed empty earlier, e.g. by a config strategy
+    source(history_rt, [active(path)]).reconcile()
+    assert instance_of(history_rt) is not None
+    assert set(history_rt.historical_data_client.requests) == {(CONID, "1 min")}
+    frame = history_rt._strategy_frame(CONID, ONE_MIN)
+    backfilled = history_rt.historical_data_client.bars.index.tz_convert("UTC")
+    assert frame is not None and set(backfilled) <= set(frame.index)
+
+
+def test_a_history_failure_keeps_the_instance_out_and_the_next_reconcile_retries(history_rt, path, caplog):
+    history = FakeHistoryClient(error=IBNoDataError("error_code: 162, error_string: No market data permissions"))
+    history_rt.historical_data_client = history
+    src = source(history_rt, [active(path)])
+    with caplog.at_level(logging.ERROR):
+        src.reconcile()
+    assert history_rt.ai_instances() == {} and history_rt.strategies == {}
+    assert any(r.levelno == logging.ERROR and "AI_HISTORY_BACKFILL_FAILED" in r.getMessage() for r in caplog.records)
+    history.error = None
+    src.reconcile()
+    assert instance_of(history_rt) is not None and len(history.requests) == 2
+
+
+def test_an_unresolved_conid_fails_the_backfill(history_rt, path, caplog):
+    history_rt.historical_data_client = FakeHistoryClient()
+    history_rt._trader_gateway = SimpleNamespace(resolve_instrument=lambda conid: None)
+    source(history_rt, [active(path)]).reconcile()
+    assert history_rt.ai_instances() == {}
+    assert "AI_HISTORY_BACKFILL_FAILED" in caplog.text
+
+
+def test_no_history_client_yet_fails_the_backfill(history_rt, path, caplog):
+    source(history_rt, [active(path)]).reconcile()
+    assert history_rt.ai_instances() == {}
+    assert "AI_HISTORY_BACKFILL_FAILED" in caplog.text
+
+
+def test_config_strategies_keep_the_lenient_startup_history_step(history_rt, path, loop_thread):
+    history = FakeHistoryClient(error=IBNoDataError("error_code: 162, error_string: HMDS query returned no data"))
+    history_rt.historical_data_client = history
+    history_rt.load_strategy(name="plain", bar_size_str="1 min", conids=[CONID], universe=None,
+                             historical_days_prior=1, module=path, class_name="VwapReclaimCat", description="x")
+    assert history.requests == []
+    loop_thread.run(history_rt.get_historical_data())
+    assert history.requests and history_rt.get_strategy("plain") is not None
+
+
+def test_the_startup_history_step_stores_a_config_strategy_bars(history_rt, path, loop_thread):
+    """resolve_instrument returns a StrategyInstrument, which the tick store used to refuse on write."""
+    history_rt.historical_data_client = FakeHistoryClient()
+    history_rt.load_strategy(name="plain", bar_size_str="1 min", conids=[CONID], universe=None,
+                             historical_days_prior=1, module=path, class_name="VwapReclaimCat", description="x")
+    loop_thread.run(history_rt.get_historical_data())
+    frame = history_rt._strategy_frame(CONID, ONE_MIN)
+    backfilled = history_rt.historical_data_client.bars.index.tz_convert("UTC")
+    assert frame is not None and set(backfilled) <= set(frame.index)

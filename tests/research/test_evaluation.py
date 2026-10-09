@@ -269,7 +269,8 @@ def test_new_spy_data_is_a_new_family(workspace):
     spec = _spec(workspace)
     bars = load_bars(db_path, spec.conids, spec.bar_size,
                      dt.datetime.combine(spec.period_start, dt.time.min, tzinfo=dt.timezone.utc),
-                     dt.datetime.combine(spec.period_end, dt.time.max, tzinfo=dt.timezone.utc))
+                     dt.datetime.combine(spec.period_end, dt.time.max, tzinfo=dt.timezone.utc),
+                     calendar_name=spec.calendar)
     closes = load_benchmark_closes(db_path, spec)
 
     sealed = qualify_dataset(bars, spec, benchmark_closes=closes)

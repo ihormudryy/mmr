@@ -120,7 +120,7 @@ def evaluate_cohort(spec: CohortSpec, *, research_db: Any, paths: EvaluationPath
     require_fresh_holdout(windows, holdout_start)
     repository_commit = _repository_commit(paths.repo_root, base.strategy_file)
     bars = load_bars(paths.history_db, base.conids, base.bar_size, _day_start(base.period_start),
-                     _day_end(base.period_end))
+                     _day_end(base.period_end), calendar_name=base.calendar)
     benchmark_closes = load_benchmark_closes(paths.history_db, base)
     manifest_digest = DatasetManifestRepository(research_db).seal(
         qualify_dataset(bars, base, benchmark_closes=benchmark_closes), sealed_at=now())

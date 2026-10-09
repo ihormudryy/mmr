@@ -216,3 +216,18 @@ def export_eligible_bundle(repo: Path, duckdb_path: str) -> EligibleBundleFixtur
                                     artifacts_root=repo / 'artifacts', now=FIXED_NOW,
                                     ruleset=holdout_ruleset())
     return EligibleBundleFixture(bundle_path, signer, result.artifact_id, spec, research_db)
+
+
+def write_alpaca_extended_hours_bar(duckdb_path: str, day: str, *, conids=CONIDS, ny_time=dt.time(8, 0)) -> None:
+    """One SIP extended-hours 15-minute bar per conid, stored the way the Alpaca refresh stores it."""
+    from trader.data.data_access import TickStorage
+    from trader.data_providers.alpaca.history import _to_frame
+    from trader.objects import BarSize
+
+    stamp = pd.Timestamp(dt.datetime.combine(dt.date.fromisoformat(day), ny_time), tz='America/New_York')
+    bar_size = BarSize.parse_str('15 mins')
+    tickdata = TickStorage(duckdb_path).get_tickdata(bar_size)
+    for conid in conids:
+        frame = _to_frame([{'t': stamp.tz_convert('UTC').isoformat(), 'o': 100.0, 'h': 100.0, 'l': 100.0,
+                            'c': 100.0, 'v': 10, 'vw': 100.0, 'n': 1}], bar_size, 'US/Eastern')
+        tickdata.write_resolve_overlap(conid, frame)

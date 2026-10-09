@@ -92,7 +92,7 @@ def test_a_request_without_its_bars_is_refused_retryable(build, tmp_path):
     with pytest.raises(RequestRefused) as refused:
         build(raw(), history_db=str(tmp_path / "empty.duckdb"))
     assert (refused.value.code, refused.value.retryable) == ("BARS_MISSING", True)
-    assert "no 15 mins bars" in refused.value.detail and "SPY" in refused.value.detail
+    assert "no regular-session 15 mins bars" in refused.value.detail and "SPY" in refused.value.detail
 
 
 def test_other_refusals_are_not_retryable(build):

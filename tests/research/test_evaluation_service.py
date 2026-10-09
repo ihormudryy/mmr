@@ -5,8 +5,8 @@ from types import SimpleNamespace
 import pytest
 
 from tests.research.case_fixtures import complete_result, pre_holdout_result
-from tests.research.evaluation_fixtures import (CONIDS, build_spec_file, write_costs_config, write_trend_bars,
-                                               write_universe)
+from tests.research.evaluation_fixtures import (CONIDS, build_spec_file, write_alpaca_extended_hours_bar,
+                                               write_costs_config, write_trend_bars, write_universe)
 from tests.research.service_fakes import AI, CLI, FakeTrader
 from trader.automation.backtest_judge_config import BacktestJudgeConfig
 from trader.data.duckdb_store import DuckDBConnection, DuckDBDataStore
@@ -150,6 +150,11 @@ def test_missing_bars_are_a_retryable_refusal_before_any_claim(world):
     assert (reply["status"], reply["code"], reply["retryable"]) == ("REFUSED", "BARS_MISSING", True)
     assert str(CONIDS[0]) in reply["detail"]
     assert world.trader.claims == {} and service.run_next() is False and trials(world) == []
+
+
+def test_extended_hours_bars_around_complete_sessions_are_accepted(world):
+    write_alpaca_extended_hours_bar(world.history_db, "2024-03-28")
+    assert world.service().submit(request(), AI)["status"] == "ACCEPTED"
 
 
 def test_callers_queue_and_renewal(world):

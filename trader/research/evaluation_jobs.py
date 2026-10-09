@@ -18,6 +18,7 @@ from trader.data.data_access import TickStorage
 from trader.data.universe import UniverseAccessor
 from trader.objects import BarSize
 from trader.research.evaluation_data import EvaluationDataError
+from trader.research.regular_sessions import RegularSessionStorage
 from trader.simulation.backtester import Backtester, BacktestConfig, trace_signature
 from trader.simulation.execution_costs import build_realistic_costs, load_execution_costs_config
 from trader.simulation.live_rules import PaperAutomationRules
@@ -36,6 +37,8 @@ class RunEnvironment:
     order_notional: float
     account_equity: float
     max_gross_allocation: float
+    # An evaluation backtests regular-session bars only, the bars its dataset sealed; None reads every stored bar.
+    regular_session_calendar: Optional[str] = None
 
 
 @dataclass(frozen=True)
@@ -83,6 +86,8 @@ def _require_every_conid_loaded(env: RunEnvironment, job: WindowJob,
 
 def run_window_job(env: RunEnvironment, job: WindowJob) -> WindowOutcome:
     storage = TickStorage(env.history_db)
+    if env.regular_session_calendar is not None:
+        storage = RegularSessionStorage(storage, env.regular_session_calendar)
     accessor = UniverseAccessor(env.universe_db, env.universe_library)
     costs = build_realistic_costs(
         env.conids, accessor, load_execution_costs_config(env.execution_costs_path)

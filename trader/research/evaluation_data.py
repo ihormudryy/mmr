@@ -19,6 +19,7 @@ from trader.objects import BarSize
 from trader.research.data_quality import DatasetQualificationRequest, DatasetQualifier
 from trader.research.dataset_manifest import DatasetFile, DatasetManifest
 from trader.research.market_context import BENCHMARK_CONID, SPY_LOOKBACK_SESSIONS
+from trader.research.regular_sessions import regular_session_bars
 
 OHLCV = ['open', 'high', 'low', 'close', 'volume']
 
@@ -36,7 +37,8 @@ class BarsMissing(EvaluationDataError):
 
 
 def load_bars(history_db: str, conids: Sequence[int], bar_size: str,
-              start: dt.datetime, end: dt.datetime) -> dict[int, pd.DataFrame]:
+              start: dt.datetime, end: dt.datetime, *, calendar_name: str) -> dict[int, pd.DataFrame]:
+    """Regular-session bars only: stored pre- and post-market bars never reach qualification."""
     tickdata = TickStorage(history_db).get_tickdata(BarSize.parse_str(bar_size))
     bars: dict[int, pd.DataFrame] = {}
     missing: list[int] = []
@@ -44,7 +46,7 @@ def load_bars(history_db: str, conids: Sequence[int], bar_size: str,
         raw = tickdata.read(conid, date_range=DateRange(start=start, end=end))
         frame = None
         if raw is not None and len(raw) > 0:
-            frame = normalize_historical(raw).dropna(subset=['close'])
+            frame = regular_session_bars(normalize_historical(raw).dropna(subset=['close']), calendar_name)
         if frame is None or frame.empty:
             missing.append(int(conid))
             continue
@@ -76,50 +78,58 @@ def benchmark_lookback_start(spec) -> dt.date:
     return sessions_before[-(SPY_LOOKBACK_SESSIONS + 1)].date()
 
 
-def _stored_days(tickdata, conid: int, intraday_tz: Optional[str]) -> Optional[tuple[dt.date, dt.date]]:
-    """First and last stored day of this conid at this bar size only (TickData.date_summary mixes bar sizes).
-
-    Intraday stamps count on their exchange day; daily stamps on their UTC day, as load_benchmark_closes reads them.
-    """
+def _stored_utc_days(tickdata, conid: int) -> Optional[tuple[dt.date, dt.date]]:
+    """First and last stored UTC day of this conid at this bar size only (TickData.date_summary mixes bar sizes).
+    Used for daily bars, which load_benchmark_closes also reads by UTC day."""
     try:
         first = tickdata.library.min_date(symbol=str(conid), bar_size=tickdata.library_name)
         last = tickdata.library.max_date(symbol=str(conid), bar_size=tickdata.library_name)
     except ValueError:
         return None
 
-    def day(stamp) -> dt.date:
+    def utc_day(stamp) -> dt.date:
         ts = pd.Timestamp(stamp)
-        ts = ts.tz_localize('UTC') if ts.tz is None else ts.tz_convert('UTC')
-        return (ts.tz_convert(intraday_tz) if intraday_tz else ts).date()
-    return day(first), day(last)
+        return (ts.tz_localize('UTC') if ts.tz is None else ts.tz_convert('UTC')).date()
+    return utc_day(first), utc_day(last)
 
 
-def _coverage_gap(label: str, bar_size: str, days: Optional[tuple[dt.date, dt.date]],
-                  start: dt.date, end: dt.date) -> Optional[str]:
+def _benchmark_gap(daily, spec) -> Optional[str]:
+    label, start, end = f'SPY (conid {BENCHMARK_CONID})', benchmark_lookback_start(spec), spec.period_end
+    days = _stored_utc_days(daily, BENCHMARK_CONID)
     if days is None:
-        return f'{label}: no {bar_size} bars'
+        return f'{label}: no 1 day bars'
     first, last = days
     if first > start:
-        return f'{label}: {bar_size} bars start {first}, need {start}'
+        return f'{label}: 1 day bars start {first}, need {start}'
     if last < end:
-        return f'{label}: {bar_size} bars end {last}, need {end}'
+        return f'{label}: 1 day bars end {last}, need {end}'
     return None
 
 
-def require_bars_available(history_db: str, spec) -> None:
-    """Before any claim: every conid has ``spec.bar_size`` bars from the period start through the period end,
-    and SPY has daily bars from its lookback start through the period end.
+def _session_gap(intraday, conid: int, spec, calendar, session: dt.date, role: str) -> Optional[str]:
+    """None when ``conid`` has a regular-session bar on ``session``, through the same filter as load_bars."""
+    window = DateRange(start=calendar.session_open(session).to_pydatetime(),
+                       end=calendar.session_close(session).to_pydatetime())
+    raw = intraday.read(conid, date_range=window)
+    if raw is not None and len(raw) > 0:
+        if not regular_session_bars(normalize_historical(raw).dropna(subset=['close']), spec.calendar).empty:
+            return None
+    return f'conid {conid}: no regular-session {spec.bar_size} bars on {session} ({role})'
 
-    Only the first and last stored day are checked here; the qualifier still checks every session in the run.
+
+def require_bars_available(history_db: str, spec) -> None:
+    """Before any claim: every conid has regular-session ``spec.bar_size`` bars on the first and the last session
+    of the period, and SPY has daily bars from its lookback start through the period end.
+
+    Interior sessions are not read here; the qualifier still checks every session in the run.
     """
     storage = TickStorage(history_db)
-    daily = storage.get_tickdata(BarSize.parse_str('1 day'))
     intraday = storage.get_tickdata(BarSize.parse_str(spec.bar_size))
-    exchange_tz = str(xcals.get_calendar(spec.calendar).tz)
-    gaps = [_coverage_gap(f'SPY (conid {BENCHMARK_CONID})', '1 day', _stored_days(daily, BENCHMARK_CONID, None),
-                          benchmark_lookback_start(spec), spec.period_end)]
-    gaps += [_coverage_gap(f'conid {conid}', spec.bar_size, _stored_days(intraday, conid, exchange_tz),
-                           spec.period_start, spec.period_end) for conid in spec.conids]
+    calendar = xcals.get_calendar(spec.calendar)
+    gaps = [_benchmark_gap(storage.get_tickdata(BarSize.parse_str('1 day')), spec)]
+    for conid in spec.conids:
+        gaps.append(_session_gap(intraday, conid, spec, calendar, spec.period_start, 'period start')
+                    or _session_gap(intraday, conid, spec, calendar, spec.period_end, 'period end'))
     gaps = [gap for gap in gaps if gap is not None]
     if gaps:
         listed = '; '.join(gaps[:MISSING_LISTED_MAX])

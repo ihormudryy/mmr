@@ -47,6 +47,7 @@ jobs:
   # its bar size for every conid, plus 220 earlier daily SPY sessions (conid
   # 756733). The research service refuses a submit with BARS_MISSING (retryable)
   # until these bars are stored; it never evaluates on partial data.
+  # Extended-hours bars stay stored; the evaluation reads regular sessions only.
   # `research` is a universe you create: the same conids as every
   # ai.yaml `research.universes` list, PLUS SPY. ai.yaml is not read here, so
   # keep both lists in step by hand (docs/OPERATIONAL_STATE.md, "Daily bars").

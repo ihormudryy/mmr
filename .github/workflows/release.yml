@@ -33,8 +33,28 @@ env:
   IMAGE: ghcr.io/${{ github.repository }}
 
 jobs:
-  test:
-    name: Test suite (Python 3.12.13)
+  test-shard:
+    # The same split as CI (scripts/ci_test_shard.py): every test file runs in exactly one shard.
+    name: Test shard ${{ matrix.shard }}/8 (Python 3.12.13)
+    if: github.event_name != 'pull_request'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    strategy:
+      fail-fast: false
+      matrix:
+        shard: [0, 1, 2, 3, 4, 5, 6, 7]
+    steps:
+      - uses: actions/checkout@v7
+      - uses: astral-sh/setup-uv@v7
+        with:
+          enable-cache: true
+      - run: uv python install 3.12.13
+      - run: uv sync --python 3.12.13 --frozen --extra test
+      - run: uv run --frozen pytest $(uv run --frozen python scripts/ci_test_shard.py ${{ matrix.shard }} 8) --timeout=30 --timeout-method=thread -q
+
+  async-ibrx:
+    name: Async IB reactive (quarantined)
     if: github.event_name != 'pull_request'
     runs-on: ubuntu-latest
     permissions:
@@ -42,9 +62,20 @@ jobs:
     steps:
       - uses: actions/checkout@v7
       - uses: astral-sh/setup-uv@v7
+        with:
+          enable-cache: true
       - run: uv python install 3.12.13
       - run: uv sync --python 3.12.13 --frozen --extra test
-      - run: uv run --frozen pytest tests/ --timeout=30 --timeout-method=thread -q --ignore=tests/test_ibrx_async.py
+      - run: uv run --frozen pytest tests/test_ibrx_async.py --timeout=30 -q
+
+  test:
+    # Keeps the old job name, so `needs: test` below still waits for every shard.
+    name: Test suite (Python 3.12.13)
+    needs: [test-shard, async-ibrx]
+    if: ${{ always() && github.event_name != 'pull_request' }}
+    runs-on: ubuntu-latest
+    steps:
+      - run: test "${{ needs.test-shard.result }}" = success && test "${{ needs.async-ibrx.result }}" = success
 
   release:
     name: Create GitHub release

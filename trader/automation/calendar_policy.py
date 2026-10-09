@@ -17,6 +17,8 @@ _ENTRY_CUTOFF_BEFORE_CLOSE = dt.timedelta(minutes=30)   # 15:30 on a 16:00 close
 _CANCEL_ENTRIES_BEFORE_CLOSE = dt.timedelta(minutes=25)  # 15:35
 _FLATTEN_START_BEFORE_CLOSE = dt.timedelta(minutes=15)   # 15:45
 _FLAT_DEADLINE_BEFORE_CLOSE = dt.timedelta(minutes=5)    # 15:55
+# A default exchange_calendars calendar ends about one year after it is built.
+_EXTENSION_YEARS = 5
 
 
 @dataclass(frozen=True)
@@ -62,6 +64,7 @@ class XNYSCalendarPolicy:
         calendar_name: str = "XNYS",
     ):
         self._calendar_name = calendar_name
+        self._owns_calendar = calendar is None
         self._calendar = calendar if calendar is not None else xcals.get_calendar(calendar_name)
         self._opening_stabilization = opening_stabilization
 
@@ -75,7 +78,19 @@ class XNYSCalendarPolicy:
         """XNYS session dates in ``[start, end]``; empty when ``end`` is before ``start``."""
         if end < start:
             return []
-        return [ts.date() for ts in self._calendar.sessions_in_range(pd.Timestamp(start), pd.Timestamp(end))]
+        calendar = self._calendar_through(end)
+        return [ts.date() for ts in calendar.sessions_in_range(pd.Timestamp(start), pd.Timestamp(end))]
+
+    def _calendar_through(self, day: dt.date) -> Any:
+        """Our own calendar, rebuilt further out once ``day`` passes its end (a long-running process).
+
+        An injected calendar is kept as given; past its end it raises ``DateOutOfBounds``.
+        """
+        if not self._owns_calendar or day <= self._calendar.last_session.date():
+            return self._calendar
+        self._calendar = xcals.get_calendar(self._calendar_name, start=self._calendar.first_session,
+                                            end=dt.date(day.year + _EXTENSION_YEARS, 12, 31))
+        return self._calendar
 
     def sessions_between(self, start: dt.date, end: dt.date) -> int:
         """How many sessions lie strictly between ``start`` and ``end``."""

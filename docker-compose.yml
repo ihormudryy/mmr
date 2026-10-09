@@ -270,6 +270,7 @@ services:
       - ${HOME}/.config/mmr/keys/rpc/cli.pub:/home/trader/.config/mmr/keys/rpc/cli.pub:ro
       - ${HOME}/.config/mmr/keys/rpc/dashboard.pub:/home/trader/.config/mmr/keys/rpc/dashboard.pub:ro
       - ${HOME}/.config/mmr/keys/rpc/strategy.pub:/home/trader/.config/mmr/keys/rpc/strategy.pub:ro
+      - ${HOME}/.config/mmr/keys/rpc/research.pub:/home/trader/.config/mmr/keys/rpc/research.pub:ro
       # Retired shared HMAC key: unreadable in every container (ruling 14).
       - /dev/null:/home/trader/.config/mmr/service_hmac.key:ro
       # Telegram bot token (SP1 Plan 5): only the trader sees ~/.config/mmr/secrets, read-only.

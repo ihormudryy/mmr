@@ -34,7 +34,8 @@ def test_ai_research_rights_are_exactly_the_sp1_set():
     from trader.messaging.principals import _TRADER_MARKET_READS
     expected = {("query", m) for m in _TRADER_MARKET_READS} | {
         ("query", "resolve_instrument"), ("query", "discover_instrument"),
-        ("command", "register_ai_deployment"), ("query", "get_ai_deployment")}
+        ("command", "register_ai_deployment"), ("query", "get_ai_deployment"),
+        ("command", "record_backtest_judgment"), ("query", "get_backtest_judgment")}     # SP2c Plan 1
     assert rights("ai_research") == expected
 
 

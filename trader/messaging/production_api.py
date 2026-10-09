@@ -1568,6 +1568,17 @@ def register_ai_paper_authority(registry: TypedRpcRegistry, coordinator: Trading
         "query", "get_ai_deployment", GetAiDeploymentRequest, dict, _get_ai_deployment_handler(ai_paper.actions),
     )
     _register_ai_discovery(registry, ai_paper)
+    _register_backtest_judge(registry, ai_paper)
+
+
+def _register_backtest_judge(registry: TypedRpcRegistry, ai_paper) -> None:
+    """SP2c Plan 1: only on an enabled ai_paper stack, which is paper only."""
+    from trader.messaging.backtest_judge_surface import register_backtest_judge_surface
+    missing = [name for name in ("claims", "judgments", "forward_evidence") if getattr(ai_paper, name, None) is None]
+    if missing:
+        raise RuntimeError(f"the ai_paper stack is missing its backtest-judge services: {', '.join(missing)}")
+    register_backtest_judge_surface(registry, claims=ai_paper.claims, judgments=ai_paper.judgments,
+                                    forward_evidence=ai_paper.forward_evidence)
 
 
 def _register_ai_discovery(registry: TypedRpcRegistry, ai_paper) -> None:

@@ -173,6 +173,14 @@ ai_paper:
   broker_outage_pause_seconds: 300   # pause the experiment after this long without broker data
   acceptance_probe: false            # paper only; true only on the SP1 acceptance day (Plan 6), then back to false
   model_budget_usd_per_day: 2000   # owner cap for model spend per New York day; only this file changes it (restart the trader)
+  backtest_judge:                    # SP2c: operator only, no env override; restart the trader after an edit
+    evaluations_per_day: 10          # evaluation claims per New York day
+    family_cooldown_sessions: 10     # XNYS sessions a REJECTed strategy key cools down (1-120)
+    max_active_deploys: 3            # active AI-judged DEPLOYs
+    deploy_expiry_sessions: 20       # a DEPLOY expires after this many sessions (1-120)
+    max_cohort_points: 3             # parameter points per evaluation (1-10)
+    shadow_warmup_sessions: 5        # bars that only warm up a shadow replay
+    strategy_allowlist: []           # strategies/<file>.py:<Class>; empty = nothing may be evaluated
 
 # Massive.com (formerly Polygon.io)
 massive_api_key: ''

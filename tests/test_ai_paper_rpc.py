@@ -366,3 +366,24 @@ def test_a_live_account_never_registers(served):
     with pytest.raises(CommandValidationError) as exc:
         actions.register_discretionary(request)
     assert exc.value.code == "ACCOUNT_NOT_PAPER"
+
+
+def test_backtest_judge_methods_serve_on_the_real_paper_stack(served):               # SP2c Plan 1
+    from trader.data.schema_migrations import SchemaMigrator
+    from trader.research.evaluation_request import EvaluationRequestBody, evaluation_request_id
+
+    zero = "sha256:" + "0" * 64
+    assert query(served, "research").call("get_evaluation_claim", {"request_id": zero}, dict) == \
+        {"found": False, "claim": None}
+    body = {"strategy_key": "strategies/opening_range_breakout.py:OpeningRangeBreakout",
+            "cohort": [{"RANGE_MINUTES": 15}], "conids": [265598], "bar_size": "5 mins", "research_day": "2026-10-08"}
+    request_id = evaluation_request_id(EvaluationRequestBody.model_validate(body))
+    reply = command(served, "research").call("claim_evaluation", {"request_id": request_id, "body": body}, dict)
+    assert (reply["status"], reply["code"]) == ("REFUSED", "STRATEGY_NOT_ALLOWED")   # the default allowlist is empty
+    assert {110, 111} <= SchemaMigrator(served.trader.journal_db).applied_versions()
+
+
+def test_backtest_judge_methods_are_absent_when_ai_paper_is_off(served_disabled):    # SP2c Plan 1
+    with pytest.raises(TypedRpcRemoteError) as exc:
+        query(served_disabled, "research").call("get_evaluation_claim", {"request_id": "sha256:" + "0" * 64}, dict)
+    assert exc.value.code == "METHOD_NOT_ALLOWED"

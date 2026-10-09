@@ -74,6 +74,7 @@ def test_restart_list_follows_the_peers():
     assert RESTART_ON_ROTATE["cli"] == ("strategy", "trader")
     assert RESTART_ON_ROTATE["ai_research"] == ("ai", "trader")
     assert RESTART_ON_ROTATE["ai_supervisor"] == ("ai", "trader")
+    assert RESTART_ON_ROTATE["research"] == ("trader",)        # SP2c Plan 1; Plan 3 adds ai and research
 
 
 def test_cli_refuses_inside_an_ordinary_container(monkeypatch, tmp_path, capsys):

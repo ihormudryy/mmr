@@ -511,6 +511,9 @@ class AiPaperServices:
     discovery: Any = None         # AiDiscoveryReader (SP2 Plan 3): discover_ai_candidates
     entry_quotes: Any = None      # EntryQuoteSource (SP2 Plan 3): get_ai_entry_quote
     baseline_sizer: Any = None   # AiPaperBaselineSizer (SP2 Plan 2 Ruling 19)
+    claims: Any = None            # EvaluationClaims (SP2c Plan 1)
+    judgments: Any = None         # BacktestJudgments (SP2c Plan 1)
+    forward_evidence: Any = None  # ForwardEvidenceSource (SP2c Plan 1 default; Plan 5 replaces it)
 
 
 @dataclass(frozen=True)
@@ -665,6 +668,17 @@ def _build_ai_paper_services(
         broker=broker, quotes=quotes, history=getattr(trader, "data", None), policy=parts.policy,
         deployments=deployments, accepted_feeds=accepted_feeds, entry_filter=parts.entry_filter, now=now,
         config=parts.config, scope=scope)
+    from trader.automation.backtest_judgments import BacktestJudgments
+    from trader.automation.calendar_policy import XNYSCalendarPolicy
+    from trader.automation.evaluation_claims import EvaluationClaims
+    from trader.automation.forward_evidence import NoDeploymentVersions
+    from trader.research.evaluation_case import default_cases_dir, default_verify_dir
+
+    # The trader's one journal connection: the daily cap's race safety rests on its per-instance lock.
+    judge_config = parts.config.backtest_judge
+    claims = EvaluationClaims(trader.journal_db, config=judge_config, now=now)
+    judgments = BacktestJudgments(trader.journal_db, config=judge_config, calendar=XNYSCalendarPolicy(),
+                                  cases_dir=default_cases_dir(), verify_dir=default_verify_dir(), now=now)
     return AiPaperServices(config=parts.config, policy=parts.policy, deployments=deployments,
                            decisions=decisions, decision_store=decision_store, actions=actions,
                            entry_filter=parts.entry_filter, epochs=epochs, signals=signals,
@@ -675,7 +689,8 @@ def _build_ai_paper_services(
                                deployments=deployments, filter_refusal=parts.filter_refusal, now=now),
                            entry_quotes=EntryQuoteSource(quotes=quotes, accepted_feeds=frozenset(accepted_feeds),
                                                          account_mode=account_mode),
-                           baseline_sizer=baseline_sizer)
+                           baseline_sizer=baseline_sizer, claims=claims, judgments=judgments,
+                           forward_evidence=NoDeploymentVersions())
 
 
 def _contract_details_port(trader: Any) -> Callable[[Any], list]:
@@ -1196,6 +1211,9 @@ def build_command_stack(
     from trader.automation.discretionary_scope import apply_scope_check_migration
 
     apply_scope_check_migration(migrator)             # 100 (SP2 Plan 3)
+    from trader.automation.backtest_judge_schema import apply_backtest_judge_migrations
+
+    apply_backtest_judge_migrations(migrator)         # 110, 111 (SP2c Plan 1)
     from trader.automation.experiments import apply_experiment_migration
 
     apply_experiment_migration(migrator)              # 70 (SP1 Plan 4)

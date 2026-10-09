@@ -606,3 +606,26 @@ def test_a_case_whose_family_is_not_in_the_registry_waits_then_is_incomplete(wor
     w.replay.tick()
     (row,) = rows(w.trader).values()
     assert row["status"] == "INCOMPLETE" and row["reason"].startswith("FAMILY_UNKNOWN")
+
+
+@pytest.mark.timeout(120)
+def test_an_after_hours_bar_never_stands_in_for_a_missing_closing_bar(world):
+    _drop_bars(world.db_path, CONIDS[1], "2024-03-20 19:45+00:00", "2024-03-20 20:00+00:00")   # last bar due
+    _pre_market_bar(world.db_path, CONIDS[1], "2024-03-20 20:00+00:00")                       # 16:00 New York
+    w = world.make("after-hours-close.duckdb")
+    assert w.replay._bar_problem(CONIDS, "15 mins", dt.date(2024, 3, 20)).startswith(
+        f"BARS_MISSING: conid {CONIDS[1]} has no 15 mins bar up to the close")
+    w.clock["now"] = dt.datetime(2024, 3, 21, 13, tzinfo=UTC)
+    w.replay.tick()
+    row = rows(w.trader)["2024-03-20"]
+    assert row["status"] == "INCOMPLETE" and row["reason"].startswith(f"BARS_MISSING: conid {CONIDS[1]}")
+
+
+def test_the_bar_check_ignores_a_close_stamped_bar_even_when_the_read_returns_it(world, monkeypatch):
+    """An interval read (every earlier input session) returns after-hours bars; only [open, close) counts."""
+    _drop_bars(world.db_path, CONIDS[1], "2024-03-20 19:45+00:00", "2024-03-20 20:00+00:00")
+    _pre_market_bar(world.db_path, CONIDS[1], "2024-03-20 20:00+00:00")
+    w = world.make("after-hours-read.duckdb")
+    monkeypatch.setattr(shadow_replay, "before_close", shadow_replay.session_close_utc)    # read includes 20:00
+    assert w.replay._bar_problem(CONIDS, "15 mins", dt.date(2024, 3, 20)).startswith(
+        f"BARS_MISSING: conid {CONIDS[1]} has no 15 mins bar up to the close")

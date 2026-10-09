@@ -316,13 +316,15 @@ class ShadowReplay:
         tickdata = TickStorage(self._paths.history_db).get_tickdata(BarSize.parse_str(bar_size))
         spacing = pd.Timedelta(seconds=bar_seconds(bar_size))
         session_open = pd.Timestamp(session_open_utc(session))
-        last_bar_due = pd.Timestamp(session_close_utc(session)) - spacing
+        session_close = pd.Timestamp(session_close_utc(session))
+        last_bar_due = session_close - spacing
         for conid in conids:
             frame = tickdata.read(conid, date_range=DateRange(start=ny_day_start(session), end=before_close(session)))
             if frame is None or len(frame) == 0:
                 return f"BARS_MISSING: no {bar_size} bars for conid {conid} on {session}"
             stamps = pd.DatetimeIndex(frame.index)
             stamps = stamps.tz_localize("UTC") if stamps.tz is None else stamps
+            stamps = stamps[stamps < session_close]           # a bar stamped at the close is after hours
             if (stamps.to_series().diff().dropna() < spacing).any():
                 return f"BAR_SIZE_MISMATCH: conid {conid} has bars closer than {bar_size} on {session}"
             regular = stamps[stamps >= session_open]          # pre-market bars neither open a gap nor fill one

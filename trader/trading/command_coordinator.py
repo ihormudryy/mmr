@@ -744,6 +744,15 @@ class CommandLedger:
         ).fetchall()
         return [_row_to_ledger_row(row) for row in rows]
 
+    def received_before(self, cutoff: dt.datetime) -> list[LedgerRow]:
+        """``RECEIVED`` rows created before ``cutoff`` (issue #114): before this process started, so no handler
+        of this process runs them. Their handler died, or the write that ends them failed."""
+        rows = self._journal.connect().execute(
+            f"{self._SELECT} WHERE state = 'RECEIVED' AND created_at < ? ORDER BY created_at",
+            [_as_utc(cutoff)],
+        ).fetchall()
+        return [_row_to_ledger_row(row) for row in rows]
+
     def pre_dispatch_orphans(self) -> list[LedgerRow]:
         """Every ``VALIDATED`` row a coordinator restart must recover
         ([M1-F3] Task 9 MEDIUM-4 crash recovery).
@@ -2540,6 +2549,15 @@ class _ReconcilePlan:
     alerted: bool = False
 
 
+# Actions whose handler drives its own ledger transitions (``register_action(..., saga=True)``). Spelled out
+# because the reconciler never sees the coordinator's registrations; a test keeps it equal to them.
+SAGA_ACTIONS = frozenset({
+    "approve_proposal", "cancel_order", "liquidate_account", "enable_strategy", "disable_strategy",
+    "update_strategy_params", "execute_automated_intent", "publish_ai_risk_policy", "submit_ai_paper_decision",
+})
+# A single-step command still RECEIVED at a restart: its handler died or its final write failed (issue #114).
+RECEIVED_AT_RESTART = "RECEIVED_AT_RESTART"
+
 # Commands that start or join a close root and resolve from it (R17). The ai_paper action
 # name is spelled out: importing it from trader.automation would be a cycle.
 CLOSE_RESOLVED_ACTIONS = frozenset({"execute_automated_intent", "liquidate_account", "submit_ai_paper_decision"})
@@ -2634,6 +2652,7 @@ class OutcomeReconciler:
         self._unreadable_evidence: set[str] = set()   # command ids logged once; the 15-minute alert follows
         self._unreadable_sagas: set[str] = set()      # logged once; the 15-minute alert follows
         self._plans: dict[str, _ReconcilePlan] = {}
+        self._started_at = _as_utc(now())   # rows created before it belong to an earlier process
 
     # -- scheduling --------------------------------------------------------
 
@@ -2691,7 +2710,12 @@ class OutcomeReconciler:
         dispatched no order and claimed no proposal, so it is safe to
         terminalize it (``REJECTED``/``CRASH_ORPHANED``) up front, unblocking
         the target. Each terminalization is isolated so one racing/failed row
-        never aborts the whole rescan."""
+        never aborts the whole rescan.
+
+        Issue #114: first parks single-step rows left ``RECEIVED`` by an earlier
+        process at ``OUTCOME_UNKNOWN`` (``RECEIVED_AT_RESTART``), so the loop
+        below schedules them and their action's evidence settles them."""
+        self._park_received_before_start()
         requeued: list[str] = []
         for row in self._ledger.reconcilable():
             self.schedule(row.command_id, self._now_utc())
@@ -2700,6 +2724,34 @@ class OutcomeReconciler:
             if self._terminalize_pre_dispatch_orphan(row):
                 requeued.append(row.command_id)
         return requeued
+
+    def _park_received_before_start(self) -> None:
+        """RECEIVED -> OUTCOME_UNKNOWN for single-step rows created before this reconciler.
+
+        Never terminal: only the action's own evidence settles a row, and an action without a resolver stays
+        OUTCOME_UNKNOWN (and alerts after 15 minutes). Sagas are left alone. One failed row never stops the
+        others; it stays RECEIVED until the next start."""
+        for row in self._ledger.received_before(self._started_at):
+            if row.action in SAGA_ACTIONS:
+                continue
+            try:
+                self._park_received(row)
+            except Exception:
+                logger.exception("command %s (%s) stays RECEIVED: it could not be parked at OUTCOME_UNKNOWN",
+                                 row.command_id, row.action)
+
+    def _park_received(self, row: LedgerRow) -> None:
+        now = self._now_utc()
+
+        def work(conn: duckdb.DuckDBPyConnection, append) -> None:
+            self._ledger.transition_in_tx(conn, row.command_id, "RECEIVED", "OUTCOME_UNKNOWN",
+                                          error_code=RECEIVED_AT_RESTART, now=now)
+            append(self._command_mutation(row, "OUTCOME_UNKNOWN", now, error_code=RECEIVED_AT_RESTART),
+                   _noop_write, f"command:{row.command_id}:outcome_unknown")
+
+        self._journal.mutate_batch_work(self._journal.connect(), work)
+        logger.warning("command %s (%s) was still RECEIVED at start; parked OUTCOME_UNKNOWN for reconciliation",
+                       row.command_id, row.action)
 
     # -- one reconciliation attempt ----------------------------------------
 
@@ -2976,8 +3028,9 @@ class OutcomeReconciler:
         command exists); otherwise stay unknown -- NEVER mark anything
         FAILED.
 
-        Exception: ``INTERNAL_ERROR`` / ``PROPOSAL_IDENTITY_CONFLICT`` with no
-        correlated proposal means the create transaction rolled back. Reject
+        Exception: ``INTERNAL_ERROR`` / ``PROPOSAL_IDENTITY_CONFLICT`` /
+        ``RECEIVED_AT_RESTART`` with no correlated proposal means the create
+        transaction rolled back. Reject
         those so they cannot wedge ``reconciliation_safe`` / resume forever.
         """
         proposal_id = self._created_proposal_id(row.command_id)
@@ -2986,7 +3039,7 @@ class OutcomeReconciler:
                 row, {"proposal_id": proposal_id, "created": True}, now
             )
             return True
-        if row.error_code in {"INTERNAL_ERROR", "PROPOSAL_IDENTITY_CONFLICT"}:
+        if row.error_code in {"INTERNAL_ERROR", "PROPOSAL_IDENTITY_CONFLICT", RECEIVED_AT_RESTART}:
             self._reject_command_only(
                 row,
                 error_code=row.error_code or "INTERNAL_ERROR",

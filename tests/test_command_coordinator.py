@@ -1443,3 +1443,42 @@ def test_an_unreadable_withdrawal_row_or_no_port_keeps_the_withdrawal_unknown(re
     reconciler = _withdrawal_reconciler(recon, FakeWithdrawals(error=RuntimeError("db down")))
     assert reconciler.reconcile_once("aidw-1", recon.now()).resolved is False
     assert recon.ledger.get("aidw-1").state == "OUTCOME_UNKNOWN"
+
+
+# -- RECEIVED rows left by a crash are parked and settled at the next start (issue #114) --------------
+
+def _received(recon, command_id, action, *, created_at, target_type="ai_deployment"):
+    recon.ledger.insert_for_test(command_id, state="RECEIVED", updated_at=created_at, created_at=created_at,
+                                 account_id="DU111111", action=action, target_type=target_type,
+                                 target_id="sha256:" + "a" * 64)
+
+
+def test_received_single_step_rows_from_before_the_start_are_parked_then_settled(recon):
+    from trader.trading.command_coordinator import RECEIVED_AT_RESTART
+    outcome = {"version_digest": "sha256:" + "a" * 64, "created": True}
+    reconciler = _registration_reconciler(recon, FakeRegistrations({"aidep-old": outcome}))
+    before = NOW - dt.timedelta(minutes=1)
+    _received(recon, "aidep-old", "register_ai_deployment", created_at=before)
+    _received(recon, "start-old", "start_experiment", created_at=before, target_type="experiment")
+    _received(recon, "approve-old", "approve_proposal", created_at=before, target_type="proposal")
+    _received(recon, "aidep-live", "register_ai_deployment", created_at=NOW)     # this process may run it
+    requeued = reconciler.rescan_on_startup()
+    assert set(requeued) == {"aidep-old", "start-old"}
+    parked = recon.ledger.get("start-old")
+    assert (parked.state, parked.error_code) == ("OUTCOME_UNKNOWN", RECEIVED_AT_RESTART)
+    assert recon.ledger.get("approve-old").state == "RECEIVED"                   # a saga recovers on its own
+    assert recon.ledger.get("aidep-live").state == "RECEIVED"
+    reconciler.run_due(NOW)
+    assert (recon.ledger.get("aidep-old").state, recon.ledger.get("aidep-old").outcome) == ("RESOLVED", outcome)
+    reconciler.run_due(NOW + dt.timedelta(seconds=CRITICAL_AFTER_SECONDS))
+    assert recon.ledger.get("start-old").state == "OUTCOME_UNKNOWN"              # no evidence: it never settles
+    assert recon.alerts.raised == ["start-old"]
+
+
+def test_a_create_left_received_by_a_crash_without_its_proposal_is_rejected(recon):
+    _received(recon, "create-old", "create_proposal", created_at=NOW - dt.timedelta(minutes=1),
+              target_type="proposal")
+    recon.reconciler.rescan_on_startup()
+    recon.reconciler.run_due(NOW)
+    row = recon.ledger.get("create-old")
+    assert (row.state, row.outcome["reconciled"]) == ("REJECTED", "never_committed")

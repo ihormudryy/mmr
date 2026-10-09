@@ -277,7 +277,7 @@ class ResearchCycle:
         if slot is None or not self._slots.research_due(slot, now) or experiment_id is None:
             return                                                        # Rulings 2 and 3
         await self._close_unsent_of_closed_windows(slot.cycle_id)
-        await self._start_new(now)
+        await self._start_new(slot, now)
         await self._poll_submitted(now)
         await self._judge_evaluated(experiment_id)
         await self._record_decided()
@@ -311,12 +311,14 @@ class ResearchCycle:
                                candidate_id, cycle_id, STALE_NOT_SUBMITTED)
 
     # submit, and resend the unchanged body after a lost reply (Ruling 9) ------------------------------
-    async def _start_new(self, now: dt.datetime) -> None:
+    async def _start_new(self, slot: ResearchSlot, now: dt.datetime) -> None:
         rows = await self._store.aquery(
             "SELECT candidate_id, cycle_id, strategy_key, body_json FROM ai_research_candidates "
             "WHERE state = 'NEW' AND next_try_at <= ? ORDER BY created_at, candidate_id", [now])
 
         async def start(candidate_id, cycle_id, strategy_key, body_json):
+            if not self._slots.research_due(slot, self._clock.now()):
+                return                                                    # an earlier submit ran past closes_at
             if await self._store.aquery("SELECT state FROM ai_research_candidates WHERE candidate_id = ?",
                                         [candidate_id], fetch="one") != ("NEW",):
                 return                                                    # closed by a sibling's limit refusal

@@ -797,3 +797,26 @@ async def test_a_full_cap_seen_after_midnight_waits_for_a_slot_on_a_later_new_yo
     rig.clock.advance(72 * 3600)                                                    # Monday 17:00
     await night(rig, cycle, pumps=1)
     assert rig.rows("SELECT state FROM ai_research_registrations") == [("REGISTERED",)]
+
+
+@pytest.mark.asyncio
+async def test_no_submit_starts_after_the_window_closes_inside_the_pump(rig):
+    """Candidate A's submit begins at 08:59 ET and ends at 09:01, past closes_at 09:00. B must not claim anything."""
+    from trader.ai.schedule import ET
+    script(rig)
+    cycle = rig.cycle()
+    await cycle.run_due_slot()
+    rig.store.db.execute(
+        "INSERT INTO ai_research_candidates (candidate_id, cycle_id, kind, strategy_key, thesis, body_json, "
+        "body_sha256, state, next_try_at, created_at, updated_at) SELECT candidate_id || '-b', cycle_id, kind, "
+        "strategy_key || '-b', thesis, body_json, body_sha256, state, next_try_at, created_at + INTERVAL 1 SECOND, "
+        "updated_at FROM ai_research_candidates")
+    rig.clock.advance((dt.datetime(2026, 10, 9, 8, 59, tzinfo=ET) - rig.clock.now()).total_seconds())
+
+    def submit_that_crosses_closes_at(body):
+        rig.clock.advance(120)
+        return submitted()
+    rig.lab.queues["submit_evaluation"] = [submit_that_crosses_closes_at]
+    await cycle.pump()
+    assert len(rig.lab.sent("submit_evaluation")) == 1
+    assert rig.rows("SELECT state FROM ai_research_candidates ORDER BY created_at") == [("SUBMITTED",), ("NEW",)]

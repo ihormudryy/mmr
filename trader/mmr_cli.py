@@ -9268,6 +9268,80 @@ def _download_setup_failure(message: str, symbol_count: int) -> Dict[str, Any]:
     return {**summary, 'error': message}
 
 
+class DownloadTargetError(ValueError):
+    """One download target cannot be bound to exactly one conId; nothing is fetched for it."""
+
+
+def _trader_for_symbol_resolution(cfg):
+    """The trader, when it answers within 1 s, so tickers missing from every local universe still end up
+    conId-keyed. None when it is down: those tickers are then stored under their string."""
+    candidate = None
+    try:
+        from trader.sdk import MMR  # local import — avoids SDK cost when unused
+        candidate = MMR(
+            rpc_address=cfg.get('zmq_rpc_server_address'),
+            rpc_port=cfg.get('zmq_rpc_server_port'),
+            timeout=1,
+        )
+        candidate.connect()
+        candidate._typed_query.call('get_status', {}, dict)   # soft probe
+        return candidate
+    except Exception:
+        # connect() may have opened a socket before the probe failed.
+        if candidate is not None:
+            try: candidate.close()
+            except Exception: pass
+        return None
+
+
+def _resolve_download_symbol(accessor, rpc_mmr, symbol: str):
+    """The one SecurityDefinition of ``symbol``: local universes first, then the trader.
+
+    A ticker held under several conIds in the local universes is refused rather than guessed.
+    """
+    local = accessor.resolve_symbol(symbol)
+    conids = sorted({definition.conId for definition in local})
+    if len(conids) > 1:
+        raise DownloadTargetError(
+            f'{symbol} is ambiguous: local universes hold conIds {conids}; '
+            f'refresh it through a universe job (mmr data refresh) instead')
+    if local:
+        return local[0]
+    if rpc_mmr is None:
+        return None
+    try:
+        resolved = rpc_mmr.resolve(symbol)  # List[SecurityDefinition]
+    except Exception as ex:
+        if not _json_mode:
+            console.print(f'[dim]  resolve via trader_service failed for {symbol}: {ex}[/dim]')
+        return None
+    if not resolved:
+        return None
+    sec_def = resolved[0]
+    try:
+        _register_in_downloads_universe(accessor, sec_def)
+        if not _json_mode:
+            console.print(f'[dim]  registered {symbol} → conId {sec_def.conId} in universe "downloads"[/dim]')
+    except Exception as ex:
+        if not _json_mode:
+            console.print(f'[dim]  could not register {symbol} in universe "downloads": {ex}[/dim]')
+    return sec_def
+
+
+def _register_in_downloads_universe(accessor, sec_def) -> None:
+    """Persist a trader resolution so later runs resolve locally (as `propose --group` does)."""
+    from trader.data.universe import Universe
+    try:
+        universe = accessor.get('downloads')
+    except Exception:
+        universe = None
+    if universe is None:
+        universe = Universe(name='downloads', security_definitions=[sec_def])
+    elif not any(sd.conId == sec_def.conId for sd in universe.security_definitions):
+        universe.security_definitions.append(sec_def)
+    accessor.update(universe)
+
+
 def _handle_data_download(args: argparse.Namespace):
     """Download data from the selected source directly to local DuckDB.
 
@@ -9349,33 +9423,9 @@ def _handle_data_download(args: argparse.Namespace):
         # single loop instead.
         _ib_loop = asyncio.new_event_loop()
 
-    # If trader_service is reachable, fall back to it for symbols that aren't
-    # in the local universe so rows end up conId-keyed (instead of strings
-    # like "JPM"). Without this, tickers the user hasn't explicitly added to
-    # a universe get persisted under their symbol string and show up with
-    # a blank conId in `data summary`. Timeout is kept tight (1s) so a
-    # misconfigured or down trader_service doesn't make the CLI look hung.
-    rpc_mmr = None
-    candidate = None
-    try:
-        from trader.sdk import MMR  # local import — avoids SDK cost when unused
-        candidate = MMR(
-            rpc_address=cfg.get('zmq_rpc_server_address'),
-            rpc_port=cfg.get('zmq_rpc_server_port'),
-            timeout=1,
-        )
-        candidate.connect()
-        # Soft probe — if trader_service isn't up, skip silently
-        candidate._typed_query.call('get_status', {}, dict)
-        rpc_mmr = candidate
-    except Exception:
-        # connect() may have opened a socket before the probe failed — close the
-        # CANDIDATE (the old code closed rpc_mmr, which is still None on the
-        # failure path, so the connected candidate leaked its socket).
-        if candidate is not None:
-            try: candidate.close()
-            except Exception: pass
-        rpc_mmr = None
+    bound_definitions = getattr(args, 'security_definitions', None)
+    # A refresh job passes its universe's definitions: no ticker lookup, so no trader needed.
+    rpc_mmr = _trader_for_symbol_resolution(cfg) if bound_definitions is None else None
 
     end_date = dt.datetime.now()
     start_date = end_date - dt.timedelta(days=args.days)
@@ -9385,43 +9435,20 @@ def _handle_data_download(args: argparse.Namespace):
     total_rows_written = 0
     tickdata = storage.get_tickdata(bar_size)
 
-    for symbol in args.symbols:
-        # Resolve to conId for storage key: local universe first, then
-        # trader_service RPC if available. Registering a new resolution in
-        # the universe means subsequent downloads (and anything else that
-        # calls resolve_symbol locally) won't need to hit IB again.
-        conid = None
-        sec_def = None
-        results = accessor.resolve_symbol(symbol, first_only=True)
-        if results:
-            sec_def = results[0]
-            conid = sec_def.conId
-        elif rpc_mmr is not None:
-            try:
-                resolved = rpc_mmr.resolve(symbol)  # List[SecurityDefinition]
-                if resolved:
-                    sec_def = resolved[0]
-                    conid = sec_def.conId
-                    # Persist into a "downloads" universe so the resolution
-                    # sticks for future runs — matches the auto-register
-                    # behaviour of `propose --group`.
-                    universe_name = 'downloads'
-                    try:
-                        u = accessor.get(universe_name)
-                    except Exception:
-                        u = None
-                    if u is None:
-                        from trader.data.universe import Universe
-                        u = Universe(name=universe_name, security_definitions=[sec_def])
-                    else:
-                        if not any(sd.conId == sec_def.conId for sd in u.security_definitions):
-                            u.security_definitions.append(sec_def)
-                    accessor.update(u)
-                    if not _json_mode:
-                        console.print(f'[dim]  registered {symbol} → conId {conid} in universe "downloads"[/dim]')
-            except Exception as ex:
-                if not _json_mode:
-                    console.print(f'[dim]  resolve via trader_service failed for {symbol}: {ex}[/dim]')
+    targets = ([(definition.symbol, definition) for definition in bound_definitions]
+               if bound_definitions is not None else [(symbol, None) for symbol in args.symbols])
+    for symbol, sec_def in targets:
+        try:
+            if sec_def is None:
+                sec_def = _resolve_download_symbol(accessor, rpc_mmr, symbol)
+            elif not sec_def.conId:
+                raise DownloadTargetError(f'{symbol}: the universe entry has no conId')
+        except DownloadTargetError as ex:
+            failed += 1
+            if not _json_mode:
+                console.print(f'[red]  {ex}[/red]')
+            continue
+        conid = sec_def.conId if sec_def is not None else None
 
         # Freshness guard: use tick_data.missing() to skip date ranges already
         # stored, so repeat runs are cheap (no API calls when fully covered).
@@ -10028,6 +10055,7 @@ def _handle_data_refresh(args: argparse.Namespace):
         # is incremental by default (skips already-current ranges).
         dl_args = _ap.Namespace(
             symbols=symbols,
+            security_definitions=list(uni.security_definitions),   # the universe's conIds, never re-resolved
             bar_size=bar_size,
             days=days,
             source=source,

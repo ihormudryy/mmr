@@ -544,7 +544,7 @@ first deploy of this build:
      d = '/home/trader/.local/share/mmr/data/'
      if os.path.exists(d + 'mmr_journal.duckdb'):
          j = duckdb.connect(d + 'mmr_journal.duckdb')
-         for name in ('ai_paper_decisions', 'ai_deployments', 'ai_costs', 'simulated_books'):
+         for name in ('ai_paper_decisions', 'ai_deployments', 'ai_costs', 'simulated_books'):  # simulated_books: a v0.2.0 table SP2 no longer creates; its replacements simulated_decisions/outcomes (95, 96) are new and never edited
              j.execute('DROP TABLE IF EXISTS ' + name)
          j.execute('DELETE FROM schema_migrations WHERE version IN (55, 56, 63)')
          j.close()

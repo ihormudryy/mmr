@@ -52,7 +52,7 @@ Owner rule: no legacy data, no upgrade. Drop them and let the migrations create 
    d = '/home/trader/.local/share/mmr/data/'
    if os.path.exists(d + 'mmr_journal.duckdb'):
        j = duckdb.connect(d + 'mmr_journal.duckdb')
-       for t in ('ai_paper_decisions', 'ai_deployments', 'ai_costs', 'simulated_books'):
+       for t in ('ai_paper_decisions', 'ai_deployments', 'ai_costs', 'simulated_books'):  # simulated_books: a v0.2.0 table SP2 no longer creates; its replacements simulated_decisions/outcomes (95, 96) are new and never edited
            j.execute('DROP TABLE IF EXISTS ' + t)
        j.execute('DELETE FROM schema_migrations WHERE version IN (55, 56, 63)')
        j.close()

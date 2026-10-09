@@ -274,7 +274,7 @@ def test_no_links_for_foreign_order_refs(world):
 # A SUBMITTED command keeps reconciliation_safe() false, so experiment stop refused
 # RECONCILIATION_INCOMPLETE and the kill flatten was never proven FLAT after any AI entry.
 
-def _entry_reconciler(world, found):
+def _entry_reconciler(world, found, *, complete=True):
     from types import SimpleNamespace
     from trader.trading.command_coordinator import OutcomeReconciler
     refs, alerts = [], []
@@ -282,24 +282,78 @@ def _entry_reconciler(world, found):
     def find_by_order_ref(account_id, order_ref):
         refs.append((account_id, order_ref))
         return list(found)
-    orders = SimpleNamespace(find_by_order_ref=find_by_order_ref, enumeration_complete=lambda: True)
+    orders = SimpleNamespace(find_by_order_ref=find_by_order_ref, enumeration_complete=lambda: complete)
     reconciler = OutcomeReconciler(
         journal=world.journal, ledger=world.ledger, orders=orders, strategy=SimpleNamespace(),
         alerts=SimpleNamespace(raise_alert=lambda *a: alerts.append(a)), now=world.clock, closes=None)
     return reconciler, refs
 
 
-def test_a_submitted_entry_is_scheduled_and_resolved_once_the_broker_shows_its_orders(world):
-    from types import SimpleNamespace
+ENTRY_GROUP = "og-aip-dec-00000001"
+
+
+def _bracket_row(leg, status, *, filled=0.0):
+    return order(leg=leg, status=status, filled=filled, group=ENTRY_GROUP)
+
+
+def test_a_submitted_entry_is_scheduled_and_resolved_once_the_broker_shows_its_entry_order(world):
     receipt = world.submit()
     assert receipt.state == "SUBMITTED" and world.scheduled == [receipt.command_id]
-    reconciler, refs = _entry_reconciler(world, [SimpleNamespace(order_ids=[11, 12])])
+    found = [_bracket_row("entry", "Submitted"), _bracket_row("stop", "PreSubmitted")]
+    reconciler, refs = _entry_reconciler(world, found)
     assert reconciler.reconcile_once(receipt.command_id, NOW).resolved
     row = world.ledger.get(receipt.command_id)
-    assert row.state == "RESOLVED" and row.outcome["order_group_id"] == "og-aip-dec-00000001"
+    assert row.state == "RESOLVED" and row.outcome["order_group_id"] == ENTRY_GROUP
     assert row.outcome["broker_acknowledged"] is True and row.outcome["quantity"] == 499
-    assert refs == [(ACCOUNT, "mmr:og-aip-dec-00000001")]
+    assert row.outcome["broker_statuses"] == ["Submitted", "PreSubmitted"]     # same fields as the automated path
+    assert refs == [(ACCOUNT, f"mmr:{ENTRY_GROUP}")]
     assert world.ledger.unresolved_for_account(ACCOUNT) == []
+
+
+def test_a_filled_entry_is_resolved(world):
+    receipt = world.submit()
+    found = [_bracket_row("entry", "Filled", filled=499.0), _bracket_row("stop", "Submitted")]
+    reconciler, _ = _entry_reconciler(world, found)
+    assert reconciler.reconcile_once(receipt.command_id, NOW).resolved
+    assert world.ledger.get(receipt.command_id).state == "RESOLVED"
+
+
+# Issue #70: the broker shows the group, but not an accepted entry order.
+
+def test_a_rejected_entry_with_a_working_stop_leg_is_not_resolved(world):
+    receipt = world.submit()
+    found = [_bracket_row("entry", "Inactive"), _bracket_row("stop", "Submitted")]
+    reconciler, _ = _entry_reconciler(world, found)
+    assert not reconciler.reconcile_once(receipt.command_id, NOW).resolved
+    assert world.ledger.get(receipt.command_id).state == "SUBMITTED"
+
+
+def test_protective_legs_alone_never_resolve_the_entry(world):
+    receipt = world.submit()
+    found = [_bracket_row("stop", "Submitted"), _bracket_row("take_profit", "PreSubmitted")]
+    reconciler, _ = _entry_reconciler(world, found)
+    assert not reconciler.reconcile_once(receipt.command_id, NOW).resolved
+    assert world.ledger.get(receipt.command_id).state == "SUBMITTED"
+
+
+@pytest.mark.parametrize("status", ["Inactive", "Cancelled", "ApiCancelled"])
+def test_an_entry_the_broker_rejected_or_cancelled_with_no_fill_is_rejected(world, status):
+    receipt = world.submit()
+    found = [_bracket_row("entry", status), _bracket_row("stop", "Cancelled")]
+    reconciler, _ = _entry_reconciler(world, found)
+    assert reconciler.reconcile_once(receipt.command_id, NOW).resolved
+    row = world.ledger.get(receipt.command_id)
+    assert (row.state, row.error_code) == ("REJECTED", "BROKER_REJECTED")
+    assert row.outcome["broker_acknowledged"] is False and row.outcome["quantity"] == 499
+    assert world.ledger.unresolved_for_account(ACCOUNT) == []
+
+
+def test_a_rejected_entry_needs_a_complete_enumeration(world):
+    receipt = world.submit()
+    found = [_bracket_row("entry", "Inactive"), _bracket_row("stop", "Cancelled")]
+    reconciler, _ = _entry_reconciler(world, found, complete=False)
+    assert not reconciler.reconcile_once(receipt.command_id, NOW).resolved
+    assert world.ledger.get(receipt.command_id).state == "SUBMITTED"
 
 
 def test_an_entry_the_broker_has_not_shown_stays_submitted(world):

@@ -2729,7 +2729,7 @@ class OutcomeReconciler:
         if action == "execute_automated_intent":
             return self._reconcile_automated_intent(row, now)
         if action == AI_PAPER_ENTRY_ACTION and row.state == "SUBMITTED":
-            return self._reconcile_ai_entry(row, now)
+            return self._reconcile_automated_intent(row, now)
         if action in CLOSE_RESOLVED_ACTIONS:
             return self._reconcile_close(row, now)
         if action == AI_DEPLOYMENT_REGISTER_ACTION:
@@ -2778,18 +2778,6 @@ class OutcomeReconciler:
                                   outcome={"created": False, "reconciled": "never_committed"}, now=now)
         return True
 
-    def _reconcile_ai_entry(self, row: LedgerRow, now: dt.datetime) -> bool:
-        """An ai_paper ENTER (the only decision that ends SUBMITTED) is done once the broker shows its
-        bracket: an order of its group ``og-{command_id}`` is enumerated. Absence alone never rejects it;
-        the 15-minute alert covers an entry the broker never shows. The protective saga owns what happens
-        to the position after that (SP1 Plan 6: a SUBMITTED entry kept reconciliation_safe() false)."""
-        found = self._orders.find_by_order_ref(row.account_id, encode_order_ref(f"og-{row.command_id}"))
-        if not found:
-            return False
-        outcome = {**(row.outcome or {}), "broker_acknowledged": True}
-        self._resolve_command_only(row, outcome, now)
-        return True
-
     def _reconcile_close(self, row: LedgerRow, now: dt.datetime) -> bool:
         """R17 / R33: a command that started or joined a close root resolves from that exact root.
 
@@ -2833,7 +2821,8 @@ class OutcomeReconciler:
         return self._closes is not None and self._closes.root_for(command_id) is not None
 
     def _reconcile_automated_entry(self, row: LedgerRow, now: dt.datetime) -> bool:
-        """An automated entry dispatches its bracket under ``og-{command_id}``.
+        """An automated entry, or an ai_paper ENTER (the only ai_paper decision
+        that ends SUBMITTED), dispatches its bracket under ``og-{command_id}``.
         Resolve from that group's broker rows, judged by the ENTRY order:
 
         - entry working or filled -> RESOLVED (exit legs alone never resolve it);

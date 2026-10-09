@@ -1787,13 +1787,6 @@ def _entry_accepted(entries: list) -> bool:
     )
 
 
-def _is_bracket_entry(row: LedgerRow) -> bool:
-    """The command dispatched its own bracket ``og-{command_id}``: it reached
-    SUBMITTED, or recorded that group before its outcome became unknown. A SELL
-    exit never does (it ends OUTCOME_UNKNOWN with a close outcome)."""
-    return row.state == "SUBMITTED" or (row.outcome or {}).get("order_group_id") == f"og-{row.command_id}"
-
-
 def _is_terminal_order(order: BrokerOrderRow) -> bool:
     return order.deleted or order.status not in _ACTIVE_ORDER_STATUSES
 
@@ -2625,6 +2618,7 @@ class OutcomeReconciler:
         self._closes = closes
         self._registrations = registrations
         self._unreadable_registrations: set[str] = set()   # logged once; the 15-minute alert follows
+        self._unreadable_sagas: set[str] = set()           # logged once; the 15-minute alert follows
         self._plans: dict[str, _ReconcilePlan] = {}
 
     # -- scheduling --------------------------------------------------------
@@ -2753,7 +2747,8 @@ class OutcomeReconciler:
             return self._reconcile_strategy(row, now)
         if action == "execute_automated_intent":
             return self._reconcile_automated_intent(row, now)
-        if action == AI_PAPER_ENTRY_ACTION and row.state == "SUBMITTED":
+        if action == AI_PAPER_ENTRY_ACTION:
+            # An ENTER is judged by its entry order; a CLOSE (no bracket) by its close root.
             return self._reconcile_automated_intent(row, now)
         if action in CLOSE_RESOLVED_ACTIONS:
             return self._reconcile_close(row, now)
@@ -2841,9 +2836,33 @@ class OutcomeReconciler:
         Any other automated command is a bracket entry."""
         if not self._has_close_root(row.command_id):
             return self._reconcile_automated_entry(row, now)
-        if _is_bracket_entry(row):
+        bracket_entry = self._is_bracket_entry(row)
+        if bracket_entry is None:
+            return False
+        if bracket_entry:
             return self._reconcile_flattened_entry(row, now)
         return self._reconcile_close(row, now)
+
+    def _is_bracket_entry(self, row: LedgerRow) -> Optional[bool]:
+        """Whether the command sent its own bracket ``og-{command_id}``, or None
+        when that cannot be read. A bracket entry reached SUBMITTED, recorded its
+        group, or owns a protective saga row: the saga writes that row before any
+        send and never deletes it, so an ambiguous send has one too. A SELL exit
+        or an ai_paper CLOSE never does."""
+        if row.state == "SUBMITTED" or (row.outcome or {}).get("order_group_id") == f"og-{row.command_id}":
+            return True
+        try:
+            found = self._journal.connect().execute(
+                "SELECT 1 FROM automated_order_sagas WHERE command_id = ?", [row.command_id],
+            ).fetchone()
+        except duckdb.CatalogException:
+            return False      # no saga table: this trader never sent a bracket
+        except Exception:
+            if row.command_id not in self._unreadable_sagas:
+                self._unreadable_sagas.add(row.command_id)
+                logger.exception("command %s: its saga row cannot be read; it stays unresolved", row.command_id)
+            return None
+        return found is not None
 
     def _reconcile_flattened_entry(self, row: LedgerRow, now: dt.datetime) -> bool:
         """A bracket entry whose saga failed into a flatten. The root proves the

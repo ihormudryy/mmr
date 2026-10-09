@@ -96,7 +96,7 @@ def evaluate(spec: EvaluationSpec, *, research_db: Any, paths: EvaluationPaths,
                                  embargo=spec.embargo_sessions, holdout=spec.holdout_sessions,
                                  calendar_name=spec.calendar)
     bars = load_bars(paths.history_db, spec.conids, spec.bar_size,
-                     _day_start(spec.period_start), _day_end(spec.period_end))
+                     _day_start(spec.period_start), _day_end(spec.period_end), calendar_name=spec.calendar)
     benchmark_closes = load_benchmark_closes(paths.history_db, spec)
     manifest_digest = DatasetManifestRepository(research_db).seal(
         qualify_dataset(bars, spec, benchmark_closes=benchmark_closes), sealed_at=now())
@@ -140,7 +140,8 @@ def run_environment(spec: EvaluationSpec, paths: EvaluationPaths) -> RunEnvironm
         universe_library=paths.universe_library, execution_costs_path=paths.execution_costs,
         strategy_file=str(spec.strategy_file), class_name=spec.class_name,
         conids=tuple(spec.conids), bar_size=spec.bar_size, order_notional=spec.order_notional,
-        account_equity=spec.account_equity, max_gross_allocation=spec.max_gross_allocation)
+        account_equity=spec.account_equity, max_gross_allocation=spec.max_gross_allocation,
+        regular_session_calendar=spec.calendar)
 
 
 @dataclass(frozen=True)

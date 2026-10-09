@@ -42,6 +42,45 @@ jobs:
     bar_size: "1 min"
     days: 90
 
+  # ---- AI research (Alpaca) — runs at 21:15 ET, after the US jobs ----
+  # An SP2c evaluation reads `research_service.period_sessions` (690) sessions of
+  # its bar size for every conid, plus 220 earlier daily SPY sessions (conid
+  # 756733). The research service refuses a submit with BARS_MISSING (retryable)
+  # until these bars are stored; it never evaluates on partial data.
+  # Extended-hours bars stay stored; the evaluation reads regular sessions only.
+  # `research` is a universe you create: the same conids as every
+  # ai.yaml `research.universes` list, PLUS SPY. ai.yaml is not read here, so
+  # keep both lists in step by hand (docs/OPERATIONAL_STATE.md, "Daily bars").
+  # Keep one intraday job per entry of ai.yaml `research.bar_sizes`.
+  # days: 690 sessions span up to ~1008 calendar days, 910 sessions (with SPY's
+  # lookback) up to ~1330; raise both if you raise period_sessions.
+  # tests/research/test_research_refresh_config.py checks these numbers.
+  # The first run of research_1min fetches ~2.8 years of 1-min bars (with
+  # extended hours) for every conid; run it once by hand before research.enabled.
+  research_daily:
+    universe: research
+    source: alpaca
+    bar_size: "1 day"
+    days: 1360
+
+  research_1min:
+    universe: research
+    source: alpaca
+    bar_size: "1 min"
+    days: 1030
+
+  research_5mins:
+    universe: research
+    source: alpaca
+    bar_size: "5 mins"
+    days: 1030
+
+  research_15mins:
+    universe: research
+    source: alpaca
+    bar_size: "15 mins"
+    days: 1030
+
   # ---- ASX (IB) — runs after ASX close (16:30 AEST / 16:30 ET prev day) ----
   # ASX has no after-hours session — once the 16:00 closing auction
   # settles, the day's bars are final. Run 30 min after to be safe.

@@ -3,7 +3,6 @@
 The scheduler ACL may not grow beyond what the listed pycron jobs need.
 Adding a job without a row here fails the first test.
 """
-import inspect
 from pathlib import Path
 
 import pytest
@@ -23,6 +22,7 @@ SCHEDULED_JOB_RPC_NEEDS = {
     # local universe DB first).
     "data_refresh_us": frozenset(),
     "data_refresh_asx": frozenset(),
+    "data_refresh_research": frozenset(),
     "db_backup": frozenset(),          # data backup: local files only
 }
 SCHEDULER_ACL_ALLOWED = frozenset().union(*SCHEDULED_JOB_RPC_NEEDS.values())
@@ -65,9 +65,16 @@ def test_a_keyless_sdk_cannot_sign_and_the_data_refresh_probe_is_soft(monkeypatc
     sdk._rpc_identity = None
     with pytest.raises(RpcKeyError):
         sdk._load_rpc_identity()
-    # ... and the data-download trader probe treats any failure as "no
-    # trader" (rpc_mmr = None) instead of aborting the refresh.
+    # ... and the data-download trader probe treats that failure as "no
+    # trader" instead of aborting the refresh.
     from trader import mmr_cli
-    source = inspect.getsource(mmr_cli._handle_data_download)
-    probe = source.split("candidate._typed_query.call('get_status'")[1].split("rpc_mmr = None")[0]
-    assert "except Exception:" in probe
+
+    class KeylessSdk:
+        def __init__(self, **kwargs):
+            pass
+
+        def connect(self):
+            raise RpcKeyError("no RPC key in the scheduler")
+
+    monkeypatch.setattr("trader.sdk.MMR", KeylessSdk)
+    assert mmr_cli._trader_for_symbol_resolution({}) is None

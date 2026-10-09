@@ -4,7 +4,8 @@ from types import SimpleNamespace
 
 import pytest
 
-from tests.research.evaluation_fixtures import (CONIDS, build_spec_file, holdout_ruleset, write_costs_config,
+from tests.research.evaluation_fixtures import (CONIDS, build_spec_file, holdout_ruleset,
+                                                write_alpaca_extended_hours_bar, write_costs_config,
                                                 write_trend_bars, write_universe)
 from trader.data.duckdb_store import DuckDBConnection
 from trader.data.schema_migrations import SchemaMigrator
@@ -45,7 +46,7 @@ def workspace(tmp_path, tmp_duckdb_path):
             request_body({"strategy_key": KEY, "cohort": cohort, "conids": CONIDS, "bar_size": "15 mins"}, TODAY),
             config=config, judge=judge, universe_accessor=UniverseAccessor(tmp_duckdb_path, "Universes"),
             costs_config=load_execution_costs_config(str(costs)), repo_root=tmp_path,
-            registry=ExperimentRegistry(db))
+            registry=ExperimentRegistry(db), history_db=tmp_duckdb_path)
     return SimpleNamespace(db=db, paths=paths, spec_for=spec_for, registry=ExperimentRegistry(db))
 
 
@@ -81,6 +82,13 @@ def world(workspace, monkeypatch):
         return spec, ce.evaluate_cohort(spec, research_db=workspace.db, paths=workspace.paths, now=lambda: NOW)
     return SimpleNamespace(run=run, jobs=jobs, opened=opened, registry=workspace.registry, db=workspace.db,
                            paths=workspace.paths)
+
+
+def test_alpaca_extended_hours_bars_are_accepted_and_the_dataset_qualifies(world):
+    for day in ("2024-02-01", "2024-03-28"):
+        write_alpaca_extended_hours_bar(world.paths.history_db, day)        # SIP pre-market, 08:00 ET
+    spec, result = world.run([{"ENTRY_MINUTE": 600}], {0: (False, 0.1)})   # build_cohort_spec ran the pre-claim check
+    assert result.stage == "pre_holdout" and result.family_id
 
 
 def test_the_best_point_that_fails_the_gate_is_not_selected(world):

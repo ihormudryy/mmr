@@ -19,16 +19,26 @@ from trader.objects import BarSize
 from trader.research.data_quality import DatasetQualificationRequest, DatasetQualifier
 from trader.research.dataset_manifest import DatasetFile, DatasetManifest
 from trader.research.market_context import BENCHMARK_CONID, SPY_LOOKBACK_SESSIONS
+from trader.research.regular_sessions import regular_session_bars
 
 OHLCV = ['open', 'high', 'low', 'close', 'volume']
+
+
+MISSING_LISTED_MAX = 5
+REFRESH_HINT = 'run the research refresh (data_refresh.yaml research_* jobs) or mmr data download'
 
 
 class EvaluationDataError(Exception):
     """The evaluation's bars are missing or failed qualification."""
 
 
+class BarsMissing(EvaluationDataError):
+    """Bars the evaluation needs are not stored yet; a later refresh may add them."""
+
+
 def load_bars(history_db: str, conids: Sequence[int], bar_size: str,
-              start: dt.datetime, end: dt.datetime) -> dict[int, pd.DataFrame]:
+              start: dt.datetime, end: dt.datetime, *, calendar_name: str) -> dict[int, pd.DataFrame]:
+    """Regular-session bars only: stored pre- and post-market bars never reach qualification."""
     tickdata = TickStorage(history_db).get_tickdata(BarSize.parse_str(bar_size))
     bars: dict[int, pd.DataFrame] = {}
     missing: list[int] = []
@@ -36,7 +46,7 @@ def load_bars(history_db: str, conids: Sequence[int], bar_size: str,
         raw = tickdata.read(conid, date_range=DateRange(start=start, end=end))
         frame = None
         if raw is not None and len(raw) > 0:
-            frame = normalize_historical(raw).dropna(subset=['close'])
+            frame = regular_session_bars(normalize_historical(raw).dropna(subset=['close']), calendar_name)
         if frame is None or frame.empty:
             missing.append(int(conid))
             continue
@@ -59,15 +69,79 @@ def _day_end_utc(day: dt.date) -> dt.datetime:
     return _utc_midnight(day) + dt.timedelta(days=1)
 
 
-def load_benchmark_closes(history_db: str, spec) -> pd.Series:
-    """SPY daily closes from SPY_LOOKBACK_SESSIONS sessions before the period
-    start through the period end, indexed by session date. Missing or short
-    history stops the run with the exact download command."""
+def benchmark_lookback_start(spec) -> dt.date:
+    """The first SPY session the evaluation reads: SPY_LOOKBACK_SESSIONS sessions before the period start."""
     calendar = xcals.get_calendar(spec.calendar)
     sessions_before = calendar.sessions_in_range(calendar.first_session, str(spec.period_start))
     if len(sessions_before) <= SPY_LOOKBACK_SESSIONS:
         raise EvaluationDataError(f'period start {spec.period_start} is too early for the calendar')
-    required_start = sessions_before[-(SPY_LOOKBACK_SESSIONS + 1)].date()
+    return sessions_before[-(SPY_LOOKBACK_SESSIONS + 1)].date()
+
+
+def _stored_utc_days(tickdata, conid: int) -> Optional[tuple[dt.date, dt.date]]:
+    """First and last stored UTC day of this conid at this bar size only (TickData.date_summary mixes bar sizes).
+    Used for daily bars, which load_benchmark_closes also reads by UTC day."""
+    try:
+        first = tickdata.library.min_date(symbol=str(conid), bar_size=tickdata.library_name)
+        last = tickdata.library.max_date(symbol=str(conid), bar_size=tickdata.library_name)
+    except ValueError:
+        return None
+
+    def utc_day(stamp) -> dt.date:
+        ts = pd.Timestamp(stamp)
+        return (ts.tz_localize('UTC') if ts.tz is None else ts.tz_convert('UTC')).date()
+    return utc_day(first), utc_day(last)
+
+
+def _benchmark_gap(daily, spec) -> Optional[str]:
+    label, start, end = f'SPY (conid {BENCHMARK_CONID})', benchmark_lookback_start(spec), spec.period_end
+    days = _stored_utc_days(daily, BENCHMARK_CONID)
+    if days is None:
+        return f'{label}: no 1 day bars'
+    first, last = days
+    if first > start:
+        return f'{label}: 1 day bars start {first}, need {start}'
+    if last < end:
+        return f'{label}: 1 day bars end {last}, need {end}'
+    return None
+
+
+def _session_gap(intraday, conid: int, spec, calendar, session: dt.date, role: str) -> Optional[str]:
+    """None when ``conid`` has a regular-session bar on ``session``, through the same filter as load_bars."""
+    window = DateRange(start=calendar.session_open(session).to_pydatetime(),
+                       end=calendar.session_close(session).to_pydatetime())
+    raw = intraday.read(conid, date_range=window)
+    if raw is not None and len(raw) > 0:
+        if not regular_session_bars(normalize_historical(raw).dropna(subset=['close']), spec.calendar).empty:
+            return None
+    return f'conid {conid}: no regular-session {spec.bar_size} bars on {session} ({role})'
+
+
+def require_bars_available(history_db: str, spec) -> None:
+    """Before any claim: every conid has regular-session ``spec.bar_size`` bars on the first and the last session
+    of the period, and SPY has daily bars from its lookback start through the period end.
+
+    Interior sessions are not read here; the qualifier still checks every session in the run.
+    """
+    storage = TickStorage(history_db)
+    intraday = storage.get_tickdata(BarSize.parse_str(spec.bar_size))
+    calendar = xcals.get_calendar(spec.calendar)
+    gaps = [_benchmark_gap(storage.get_tickdata(BarSize.parse_str('1 day')), spec)]
+    for conid in spec.conids:
+        gaps.append(_session_gap(intraday, conid, spec, calendar, spec.period_start, 'period start')
+                    or _session_gap(intraday, conid, spec, calendar, spec.period_end, 'period end'))
+    gaps = [gap for gap in gaps if gap is not None]
+    if gaps:
+        listed = '; '.join(gaps[:MISSING_LISTED_MAX])
+        more = f' (+{len(gaps) - MISSING_LISTED_MAX} more)' if len(gaps) > MISSING_LISTED_MAX else ''
+        raise BarsMissing(f'{listed}{more}; {REFRESH_HINT}')
+
+
+def load_benchmark_closes(history_db: str, spec) -> pd.Series:
+    """SPY daily closes from SPY_LOOKBACK_SESSIONS sessions before the period
+    start through the period end, indexed by session date. Missing or short
+    history stops the run with the exact download command."""
+    required_start = benchmark_lookback_start(spec)
     days_needed = (dt.date.today() - required_start).days + 5
     download = f'mmr data download SPY --bar-size "1 day" --days {days_needed}'
     tickdata = TickStorage(history_db).get_tickdata(BarSize.parse_str('1 day'))

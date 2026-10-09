@@ -27,6 +27,7 @@ from trader.automation.backtest_judgments import BacktestJudgments
 from trader.automation.calendar_policy import XNYSCalendarPolicy
 from trader.automation.deployment_renewal import RenewalGate, TraderRenewalChecks, VersionForwardEvidence
 from trader.automation.forward_evidence import ForwardEvidenceRefused
+from trader.automation.protective_order_saga import apply_protective_order_saga_migration
 from trader.data.domain_journal import DomainJournal
 from trader.data.schema_migrations import SchemaMigrator
 from trader.research.evaluation_case import EvaluationCase, write_evaluation_case
@@ -194,6 +195,7 @@ def renewal_world(tmp_path, *, bundles: FakeBundles | None = None) -> RenewalWor
     apply_ai_deployment_migration(migrator)
     apply_ai_deployment_version_migrations(migrator)
     apply_ai_paper_decision_migration(migrator)
+    apply_protective_order_saga_migration(migrator)     # withdraw reads the entries being sent
     apply_scoreboard_migrations(migrator)
     config, calendar, bundles = judge_config(deploy_expiry_sessions=3), XNYSCalendarPolicy(), bundles or FakeBundles()
     scoreboard = ScoreboardStore(base.db, now=base.clock)

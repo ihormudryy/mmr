@@ -1092,6 +1092,18 @@ def _build_shadow_ingest(trader: Any, scoreboard: Any, ai_paper: Any) -> Any:
                         config=ai_paper_config.backtest_judge, now=scoreboard.now)
 
 
+def _shadow_owed(trader: Any, ai_paper: Any, now: Callable[[], dt.datetime]) -> Optional[Callable[[], dict]]:
+    """The closed sessions each shadow judgment owes, on the same stack as ``_build_shadow_ingest``."""
+    from trader.scoreboard.shadow_ingest import owed_shadow_sessions
+
+    ai_paper_config = getattr(trader, "ai_paper_config", None)
+    if ai_paper is None or ai_paper.judgments is None or ai_paper_config is None:
+        return None
+    judge = ai_paper_config.backtest_judge
+    return lambda: owed_shadow_sessions(ai_paper.judgments, deploy_expiry_sessions=judge.deploy_expiry_sessions,
+                                        now=now())
+
+
 def _build_scoreboard(trader: Any, migrator: Any, broker: Any, experiments: Optional[ExperimentServices],
                       ai_paper: Any, now: Callable[[], dt.datetime], command_ledger: Any = None) -> Any:
     """SP1 Plan 5. An enabled but invalid ai_paper.telegram section raises here: startup stops (ruling 17)."""
@@ -1105,7 +1117,8 @@ def _build_scoreboard(trader: Any, migrator: Any, broker: Any, experiments: Opti
         decision_store=None if ai_paper is None else ai_paper.decision_store,
         calendar=XNYSCalendarPolicy(),
         cash=lambda: TraderServiceApi(trader).get_account_cash_by_currency(), now=now,
-        sizer=None if ai_paper is None else ai_paper.baseline_sizer, command_ledger=command_ledger)
+        sizer=None if ai_paper is None else ai_paper.baseline_sizer, command_ledger=command_ledger,
+        shadow_owed=_shadow_owed(trader, ai_paper, now))
     if experiments is not None:
         # Plan 4 K18: kill_started alerts go to the outbox (None while Telegram is off: logged NO_OUTBOX),
         # the KILLED session end to the ledger.

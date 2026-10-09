@@ -303,6 +303,18 @@ def test_a_judgment_is_found_by_its_case(tmp_path):
     assert w.judgments.get_by_case("sha256:" + "e" * 64) is None
 
 
+def test_tracked_lists_the_judgments_with_a_shadow_window_and_refuses_an_edited_one(tmp_path):
+    w = world(tmp_path)
+    w.judgments.record(judgment(finished(w, request_body(research_day="2026-10-01")), "SHADOW"))
+    w.judgments.record(judgment(finished(w, request_body(research_day="2026-10-02")), "NO_VERDICT",
+                                judgment_id="jdg-00000002"))
+    assert [j.judgment_id for j in w.judgments.tracked()] == ["jdg-00000001"]
+    w.db.execute("UPDATE backtest_judgments SET verdict = 'DEPLOY' WHERE judgment_id = 'jdg-00000001'")
+    with pytest.raises(JudgmentRefused) as exc:
+        w.judgments.tracked()
+    assert exc.value.code == "JUDGMENT_TAMPERED"
+
+
 def test_judgments_survive_a_restart(tmp_path):
     w = world(tmp_path)
     w.judgments.record(judgment(finished(w), "REJECT"))

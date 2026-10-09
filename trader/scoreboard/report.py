@@ -37,6 +37,7 @@ class ReportInputs:
     outbox: Optional[Mapping[str, Any]]
     calendar: Any                 # previous_session(day) for the SPY base (ruling 14)
     shadow_rows: Sequence[Mapping[str, Any]] = ()   # SP2c Plan 3: forward replay rows, global (not per experiment)
+    shadow_owed: Optional[Mapping[str, Mapping[str, Any]]] = None   # judgment -> closed window sessions; None: unknown
 
 
 def _round(value: Any) -> Any:
@@ -149,7 +150,7 @@ def build_report(inputs: ReportInputs) -> dict:
         "experiment": _experiment_view(inputs.experiment),
         "account": account,
         "benchmarks": _benchmarks(inputs, account),
-        "shadow_books": build_shadow_books(inputs.shadow_rows),
+        "shadow_books": build_shadow_books(inputs.shadow_rows, inputs.shadow_owed),
         "trips": trip_metrics(inputs.trips, start_nlv_usd=start),
         "splits": {key: group_trip_metrics(inputs.trips, key, start_nlv_usd=start) for key in SPLIT_KEYS},
         "sessions": [_session_view(row, inputs.adjustments) for row in rows],

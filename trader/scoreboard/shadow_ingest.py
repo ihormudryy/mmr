@@ -11,7 +11,7 @@ from typing import Any, Callable, Literal, Mapping, Optional
 from pydantic import BaseModel, ConfigDict, Field, StrictFloat, StrictInt, ValidationError, model_validator
 
 from trader.research.canonical import sha256_digest
-from trader.research.shadow_window import is_xnys_session, session_close_utc, shadow_window
+from trader.research.shadow_window import is_xnys_session, session_close_utc, shadow_window, xnys_sessions
 from trader.scoreboard.seal import row_digest
 from trader.scoreboard.store import ScoreboardConflict, ScoreboardStore, row_key
 
@@ -106,6 +106,20 @@ class ShadowIngest:
         if request.verdict != "DEPLOY" or self._versions is None:
             return None
         return self._versions.version_for_judgment(request.judgment_id)
+
+
+def owed_shadow_sessions(judgments: Any, *, deploy_expiry_sessions: int, now: dt.datetime) -> dict[str, dict]:
+    """judgment_id -> its verdict and every session of its window that has closed: the rows a shadow book needs
+    before it may read COMPLETE. Same window and close rule as ``ShadowIngest.record``."""
+    owed: dict[str, dict] = {}
+    for judgment in judgments.tracked():
+        first, last = shadow_window(judgment.recorded_at, judgment.verdict,
+                                    deploy_expiry_sessions=deploy_expiry_sessions,
+                                    cooldown_until_session=judgment.cooldown_until_session)
+        owed[judgment.judgment_id] = {
+            "verdict": judgment.verdict,
+            "sessions": tuple(day for day in xnys_sessions(first, last) if session_close_utc(day) <= now)}
+    return owed
 
 
 def _body_of(row: Mapping[str, Any]) -> RecordShadowResultRequest:

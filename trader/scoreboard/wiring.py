@@ -9,7 +9,7 @@ from __future__ import annotations
 import datetime as dt
 import logging
 from dataclasses import dataclass
-from typing import Any, Callable, Optional, Sequence
+from typing import Any, Callable, Mapping, Optional, Sequence
 
 from trader.scoreboard.bar_sources import default_bar_sources
 from trader.scoreboard.benchmark import BenchmarkBook, BenchmarkSourceError, read_spy_closes
@@ -104,10 +104,13 @@ def _telegram_section(trader: Any) -> Optional[dict]:
 def build_scoreboard(trader: Any, *, migrator: Any, broker: Any, experiments: Any, decision_store: Any,
                      calendar: Any, cash: Callable[[], dict], now: Callable[[], dt.datetime],
                      sizer: Any = None, command_ledger: Any = None,
-                     bar_sources: Optional[Sequence[Any]] = None) -> ScoreboardServices:
+                     bar_sources: Optional[Sequence[Any]] = None,
+                     shadow_owed: Optional[Callable[[], Mapping[str, Mapping[str, Any]]]] = None
+                     ) -> ScoreboardServices:
     """Raises TelegramConfigError when ai_paper.telegram is enabled but invalid (startup stops, ruling 17).
 
     ``command_ledger`` is the SP1 ``CommandLedger``: a placed ENTER's size is read from its receipt.
+    ``shadow_owed`` returns the closed sessions each shadow judgment owes (None without an ai_paper stack).
     """
     apply_scoreboard_migrations(migrator)
     db = trader.journal_db
@@ -119,7 +122,7 @@ def build_scoreboard(trader: Any, *, migrator: Any, broker: Any, experiments: An
     book = BenchmarkBook(store, _history_source(getattr(trader, "history_duckdb_path", "") or ""), calendar, now)
     outbox, sender = build_telegram(_telegram_section(trader), db, now)
     service = ScoreboardService(store=store, db=db, experiments=reader, ledger=ledger, book=book, links=links,
-                                calendar=calendar, now=now, outbox=outbox)
+                                calendar=calendar, now=now, outbox=outbox, shadow_owed=shadow_owed)
     decisions = NullDecisionFacts() if decision_store is None else DecisionStoreFacts(decision_store, command_ledger)
     ingest = AiIngest(store=store, experiments=reader, decisions=decisions, calendar=calendar, now=now, sizer=sizer)
     close_fills = NullCloseFills() if decision_store is None else JournalCloseFills(

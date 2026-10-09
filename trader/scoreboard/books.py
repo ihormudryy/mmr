@@ -4,8 +4,9 @@ A book is the group of simulated decisions with one (baseline_id, cohort). Books
 """
 from __future__ import annotations
 
+import datetime as dt
 from collections import Counter, defaultdict
-from typing import Any, Mapping, Sequence
+from typing import Any, Mapping, Optional, Sequence
 
 PNL_BASIS = "gross, no commissions or slippage"
 LABEL = "simulated"
@@ -38,25 +39,44 @@ def build_books(decisions: Sequence[Mapping[str, Any]], outcomes: Sequence[Mappi
     return books
 
 
-def build_shadow_books(rows: Sequence[Mapping[str, Any]]) -> list[dict]:
-    """SP2c spec 7: one book per verdict, so DEPLOY and REJECT forward results sit side by side."""
+def _day(value: Any) -> dt.date:
+    return value if isinstance(value, dt.date) else dt.date.fromisoformat(str(value))
+
+
+def build_shadow_books(rows: Sequence[Mapping[str, Any]],
+                       owed: Optional[Mapping[str, Mapping[str, Any]]] = None) -> list[dict]:
+    """SP2c spec 7: one book per verdict, so DEPLOY and REJECT forward results sit side by side.
+
+    ``owed`` maps each judgment to its verdict and the closed sessions of its window (``owed_shadow_sessions``).
+    A book is COMPLETE, with a final ``pnl_usd``, only when every owed session has a COMPLETE row; a stored
+    row alone proves nothing. Without ``owed`` no book can be COMPLETE."""
     by_verdict: dict[str, list[Mapping]] = defaultdict(list)
     for row in rows:
         by_verdict[row["verdict"]].append(row)
+    owed_by_verdict: dict[str, dict[str, Mapping]] = defaultdict(dict)
+    for judgment_id, judgment in (owed or {}).items():
+        owed_by_verdict[judgment["verdict"]][judgment_id] = judgment
     books = []
     for verdict in SHADOW_VERDICTS:
-        members = by_verdict.get(verdict)
-        if not members:
+        members = by_verdict.get(verdict, [])
+        judgments = owed_by_verdict.get(verdict, {})
+        if not members and not judgments:
             continue
         complete = [r for r in members if r["status"] == "COMPLETE"]
         incomplete = [r for r in members if r["status"] == "INCOMPLETE"]
+        due = {(judgment_id, day) for judgment_id, judgment in judgments.items() for day in judgment["sessions"]}
+        missing = due - {(r["judgment_id"], _day(r["session_date"])) for r in members}
+        proven = owed is not None and bool(due) and not missing and all(r["judgment_id"] in judgments for r in members)
+        status = "INCOMPLETE" if incomplete else ("COMPLETE" if proven else "PENDING")
         known = float(sum(r["pnl_usd"] for r in complete))
         books.append({
             "verdict": verdict, "label": SHADOW_LABEL, "basis": SHADOW_BASIS,
-            "judgments": len({r["judgment_id"] for r in members}), "sessions": len(members),
+            "judgments": len({r["judgment_id"] for r in members} | set(judgments)), "sessions": len(members),
             "complete": len(complete), "incomplete": len(incomplete),
-            "status": "INCOMPLETE" if incomplete else "COMPLETE",
-            "pnl_usd": None if incomplete else known, "known_pnl_usd": known if complete else None,
+            "owed_sessions": None if owed is None else len(due),
+            "missing_sessions": None if owed is None else len(missing),
+            "status": status,
+            "pnl_usd": known if status == "COMPLETE" else None, "known_pnl_usd": known if complete else None,
             "fees_usd": float(sum(r["fees_usd"] for r in complete)) if complete else None,
             "trades": sum(r["trades"] for r in complete) if complete else None,
             "incomplete_reasons": dict(Counter(r["reason"] for r in incomplete))})

@@ -14,7 +14,8 @@ from trader.messaging.typed_rpc import TypedRpcRegistry, TypedRpcRemoteError
 from trader.research.shadow_window import shadow_window
 from trader.scoreboard.books import build_shadow_books
 from trader.scoreboard.report import build_report
-from trader.scoreboard.shadow_ingest import RecordShadowResultRequest, ShadowIngest, verified_shadow_rows
+from trader.scoreboard.shadow_ingest import (RecordShadowResultRequest, ShadowIngest, owed_shadow_sessions,
+                                             verified_shadow_rows)
 
 RESEARCH, CLI = SimpleNamespace(principal="research"), SimpleNamespace(principal="cli")
 CASE = "sha256:" + "c" * 64
@@ -36,7 +37,8 @@ def ingest(store):
                                        recorded_at=RECORDED, cooldown_until_session=None,
                                        binding={"bar_size": "15 mins"})}
     versions = {"j1": None}
-    service = ShadowIngest(store=store, judgments=SimpleNamespace(get=judgments.get),
+    service = ShadowIngest(store=store, judgments=SimpleNamespace(get=judgments.get,
+                                                                  tracked=lambda: list(judgments.values())),
                            versions=SimpleNamespace(version_for_judgment=versions.get), config=CONFIG,
                            now=lambda: dt.datetime(2024, 4, 1, 22, tzinfo=dt.timezone.utc))
     service.versions_map = versions
@@ -169,27 +171,55 @@ def test_an_edit_outside_the_body_also_reads_as_tampered(ingest, store, db, colu
 
 
 def test_one_book_per_verdict_never_summed_and_incomplete_shown():
-    rows = [{"verdict": "DEPLOY", "judgment_id": "a", "status": "COMPLETE", "pnl_usd": 10.0, "fees_usd": 1.0,
-             "trades": 2, "reason": None},
-            {"verdict": "REJECT", "judgment_id": "b", "status": "COMPLETE", "pnl_usd": -5.0, "fees_usd": 1.0,
-             "trades": 1, "reason": None},
-            {"verdict": "REJECT", "judgment_id": "b", "status": "INCOMPLETE", "pnl_usd": None, "fees_usd": None,
-             "trades": None, "reason": "BARS_MISSING"}]
-    books = {b["verdict"]: b for b in build_shadow_books(rows)}
+    rows = [{"verdict": "DEPLOY", "judgment_id": "a", "session_date": dt.date(2024, 4, 1), "status": "COMPLETE",
+             "pnl_usd": 10.0, "fees_usd": 1.0, "trades": 2, "reason": None},
+            {"verdict": "REJECT", "judgment_id": "b", "session_date": dt.date(2024, 4, 1), "status": "COMPLETE",
+             "pnl_usd": -5.0, "fees_usd": 1.0, "trades": 1, "reason": None},
+            {"verdict": "REJECT", "judgment_id": "b", "session_date": dt.date(2024, 4, 2), "status": "INCOMPLETE",
+             "pnl_usd": None, "fees_usd": None, "trades": None, "reason": "BARS_MISSING"}]
+    owed = {"a": {"verdict": "DEPLOY", "sessions": (dt.date(2024, 4, 1),)},
+            "b": {"verdict": "REJECT", "sessions": (dt.date(2024, 4, 1), dt.date(2024, 4, 2))}}
+    books = {b["verdict"]: b for b in build_shadow_books(rows, owed)}
     assert set(books) == {"DEPLOY", "REJECT"}
     assert books["DEPLOY"]["pnl_usd"] == 10.0 and books["DEPLOY"]["status"] == "COMPLETE"
     assert books["REJECT"]["status"] == "INCOMPLETE" and books["REJECT"]["pnl_usd"] is None
-    only_incomplete = build_shadow_books([rows[2]])[0]
+    only_incomplete = build_shadow_books([rows[2]], owed)[1]
     assert (only_incomplete["pnl_usd"], only_incomplete["known_pnl_usd"], only_incomplete["fees_usd"],
             only_incomplete["trades"]) == (None, None, None, None)
     assert books["REJECT"]["known_pnl_usd"] == -5.0 and books["REJECT"]["incomplete_reasons"] == {"BARS_MISSING": 1}
     assert all(book["label"] == "SHADOW" for book in books.values())
-    assert build_report(empty_inputs(shadow_rows=rows))["shadow_books"] == build_shadow_books(rows)
+    assert build_report(empty_inputs(shadow_rows=rows, shadow_owed=owed))["shadow_books"] == build_shadow_books(
+        rows, owed)
+
+
+def test_stored_rows_alone_never_make_a_book_complete():
+    rows = [{"verdict": "DEPLOY", "judgment_id": "a", "session_date": dt.date(2024, 4, 1), "status": "COMPLETE",
+             "pnl_usd": 10.0, "fees_usd": 1.0, "trades": 2, "reason": None}]
+    [unknown] = build_shadow_books(rows)                                    # no window known: unproven
+    assert (unknown["status"], unknown["pnl_usd"], unknown["known_pnl_usd"]) == ("PENDING", None, 10.0)
+    assert build_report(empty_inputs(shadow_rows=rows))["shadow_books"] == [unknown]
+    stranger = build_shadow_books(rows, {"z": {"verdict": "DEPLOY", "sessions": (dt.date(2024, 4, 1),)}})[0]
+    assert (stranger["status"], stranger["pnl_usd"]) == ("PENDING", None)   # a row of a judgment owed nothing
+
+
+def test_a_book_owed_two_closed_sessions_with_only_the_first_stored_is_pending(ingest, store):
+    ingest._now = lambda: dt.datetime(2024, 4, 2, 22, tzinfo=dt.timezone.utc)          # 04-01 and 04-02 closed
+    owed = owed_shadow_sessions(ingest._judgments, deploy_expiry_sessions=20, now=ingest._now())
+    assert owed == {"j1": {"verdict": "DEPLOY", "sessions": (dt.date(2024, 4, 1), dt.date(2024, 4, 2))}}
+    [empty] = build_shadow_books([], owed)                                 # owed but nothing sent: not absent
+    assert (empty["status"], empty["sessions"], empty["missing_sessions"], empty["pnl_usd"]) == ("PENDING", 0, 2, None)
+    ingest.record(body(), RESEARCH)
+    [book] = build_shadow_books(verified_shadow_rows(store)[0], owed)
+    assert (book["status"], book["pnl_usd"], book["known_pnl_usd"]) == ("PENDING", None, 12.5)
+    assert (book["owed_sessions"], book["missing_sessions"]) == (2, 1)
+    ingest.record(body(session_date="2024-04-02", pnl_usd=7.5, end_equity_usd=100_020.0), RESEARCH)
+    [book] = build_shadow_books(verified_shadow_rows(store)[0], owed)
+    assert (book["status"], book["pnl_usd"], book["missing_sessions"]) == ("COMPLETE", 20.0, 0)
 
 
 def test_shadow_rows_never_move_the_real_account_or_the_baseline_books():
-    rows = [{"verdict": "DEPLOY", "judgment_id": "a", "status": "COMPLETE", "pnl_usd": 10.0, "fees_usd": 1.0,
-             "trades": 2, "reason": None}]
+    rows = [{"verdict": "DEPLOY", "judgment_id": "a", "session_date": dt.date(2024, 4, 1), "status": "COMPLETE",
+             "pnl_usd": 10.0, "fees_usd": 1.0, "trades": 2, "reason": None}]
     without, with_rows = build_report(empty_inputs()), build_report(empty_inputs(shadow_rows=rows))
     assert without["shadow_books"] == [] and with_rows["label"] == "PAPER"
     assert {k: v for k, v in with_rows.items() if k != "shadow_books"} == {
@@ -199,8 +229,13 @@ def test_shadow_rows_never_move_the_real_account_or_the_baseline_books():
 def test_the_service_report_carries_the_verified_shadow_books(ingest, scoreboard):
     ingest._store = scoreboard.store
     ingest._now = lambda: dt.datetime(2024, 4, 3, 22, tzinfo=dt.timezone.utc)
+    scoreboard._shadow_owed = lambda: owed_shadow_sessions(ingest._judgments, deploy_expiry_sessions=20,
+                                                           now=ingest._now())
     ingest.record(body(), RESEARCH)
     ingest.record(body(session_date="2024-04-02", pnl_usd=7.5, end_equity_usd=100_020.0), RESEARCH)
+    report = scoreboard.report()
+    assert (report["shadow_books"][0]["status"], report["shadow_books"][0]["pnl_usd"]) == ("PENDING", None)   # 04-03
+    ingest.record(body(session_date="2024-04-03", pnl_usd=0.0, end_equity_usd=100_020.0), RESEARCH)
     report = scoreboard.report()
     assert report["shadow_books"][0]["verdict"] == "DEPLOY" and report["shadow_books"][0]["pnl_usd"] == 20.0
     assert report["label"] == "PAPER" and report["warnings"] == []
@@ -209,6 +244,18 @@ def test_the_service_report_carries_the_verified_shadow_books(ingest, scoreboard
     assert report["shadow_books"][0]["status"] == "INCOMPLETE" and report["shadow_books"][0]["pnl_usd"] is None
     assert [w["code"] for w in report["warnings"]] == ["SHADOW_ROW_TAMPERED"]
     assert scoreboard.verify()["ok"] is False
+
+
+def test_unreadable_shadow_windows_are_a_warning_and_no_book_is_complete(ingest, scoreboard):
+    ingest._store = scoreboard.store
+    ingest.record(body(), RESEARCH)
+
+    def tampered():
+        raise JudgmentRefused("JUDGMENT_TAMPERED", "j1")
+    scoreboard._shadow_owed = tampered
+    report = scoreboard.report()
+    assert (report["shadow_books"][0]["status"], report["shadow_books"][0]["pnl_usd"]) == ("PENDING", None)
+    assert [w["code"] for w in report["warnings"]] == ["SHADOW_WINDOWS_UNKNOWN"]
 
 
 # -- the typed RPC surface ---------------------------------------------------------------------------------

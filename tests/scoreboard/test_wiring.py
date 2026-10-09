@@ -198,12 +198,14 @@ def test_shadow_ingest_shares_the_scoreboard_store_the_judgments_and_the_version
     assert isinstance(ingest, ShadowIngest) and ingest._store is stack.scoreboard.store
     assert ingest._judgments is stack.ai_paper.judgments and ingest._versions is trader.ai_deployment_versions
     assert ingest._config is trader.ai_paper_config.backtest_judge
+    assert stack.scoreboard.service._shadow_owed() == {}                   # the same judgments: none recorded yet
 
 
 def test_no_shadow_ingest_without_an_ai_paper_stack():
     from types import SimpleNamespace
-    from trader.trading.command_stack import _build_shadow_ingest
+    from trader.trading.command_stack import _build_shadow_ingest, _shadow_owed
     assert _build_shadow_ingest(SimpleNamespace(ai_paper_config=object()), SimpleNamespace(), None) is None
+    assert _shadow_owed(SimpleNamespace(ai_paper_config=object()), None, lambda: None) is None
 
 
 def test_scoreboard_tables_live_in_the_journal_db_not_the_research_db(prod_stack):

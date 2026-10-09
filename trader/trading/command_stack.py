@@ -579,7 +579,10 @@ def _build_ai_paper_parts(trader: Any, config: Any, now: Callable[[], dt.datetim
     from trader.automation.backtest_judgments import BacktestJudgments
     from trader.automation.calendar_policy import XNYSCalendarPolicy
     from trader.automation.deployment_renewal import RenewalGate, TraderRenewalChecks, VersionForwardEvidence
+    from trader.automation.ai_paper_decision import AiPaperDecisionStore
     from trader.automation.discretionary_scope import ScopeCheckStore, trading_filter_refusal
+    from trader.automation.experiments import ExperimentStore
+    from trader.scoreboard.ports import DecisionStoreAttribution
     from trader.scoreboard.store import ScoreboardStore
 
     policy = AiRiskPolicyService(
@@ -603,7 +606,9 @@ def _build_ai_paper_parts(trader: Any, config: Any, now: Callable[[], dt.datetim
     gate = RenewalGate(renewals_of=lambda digest: backtest_judgments.renewals_of(digest), bundles=bundles,
                        cooldowns=cooldowns, calendar=calendar, expiry_sessions=judge.deploy_expiry_sessions)
     forward_evidence = VersionForwardEvidence(
-        db=trader.journal_db, scoreboard=ScoreboardStore(trader.journal_db, now=now), versions=versions,
+        db=trader.journal_db, scoreboard=ScoreboardStore(trader.journal_db, now=now),
+        experiments=ExperimentStore(trader.journal_db, trader.ib_account, now),
+        links=DecisionStoreAttribution(AiPaperDecisionStore(trader.domain_journal)), versions=versions,
         deployments=deployments, status_of=lambda digest: activity.status(digest),
         judgment_of=lambda judgment_id: backtest_judgments.get(judgment_id), gate=gate, calendar=calendar,
         config=judge, now=aware_now)

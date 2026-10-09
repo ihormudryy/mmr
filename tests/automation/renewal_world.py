@@ -9,6 +9,7 @@ from typing import Any
 from tests.automation.backtest_judge_fixtures import (
     FILE_HASH, NOW, World, finished, judge_config, judgment, renewal_case_body, world,
 )
+from tests.scoreboard.fills import broker_store, put_fill
 from trader.automation.ai_bundle_check import BundleFacts, BundleRefused
 from trader.automation.ai_deployment_activity import DeploymentActivity
 from trader.automation.ai_deployment_registration import AiDeploymentRegistrar
@@ -19,16 +20,22 @@ from trader.automation.ai_deployments import (
     AiDeployment, AiDeploymentStore, apply_ai_deployment_migration, deployment_digest,
 )
 from trader.automation.ai_judgment_port import cooldown_reader_for, judgment_reader_for
-from trader.automation.ai_paper_decision import apply_ai_paper_decision_migration
+from trader.automation.ai_paper_decision import (
+    AiPaperDecisionStore, apply_ai_paper_decision_migration, command_id_for,
+)
 from trader.automation.backtest_judgments import BacktestJudgments
 from trader.automation.calendar_policy import XNYSCalendarPolicy
 from trader.automation.deployment_renewal import RenewalGate, TraderRenewalChecks, VersionForwardEvidence
 from trader.data.domain_journal import DomainJournal
 from trader.data.schema_migrations import SchemaMigrator
 from trader.research.evaluation_case import EvaluationCase, write_evaluation_case
+from trader.scoreboard.ports import DecisionStoreAttribution
+from trader.scoreboard.round_trips import project_round_trips
 from trader.scoreboard.schema import apply_scoreboard_migrations
+from trader.scoreboard.session_ledger import experiment_fills
 from trader.scoreboard.shadow_ingest import RecordShadowResultRequest, ShadowIngest
 from trader.scoreboard.store import ScoreboardStore
+from trader.trading.order_correlation import encode_order_ref
 
 UTC = dt.timezone.utc
 BUNDLE = "sha256:" + "e" * 64
@@ -36,6 +43,9 @@ FIRST, EXPIRY = dt.date(2026, 10, 9), dt.date(2026, 10, 13)       # three sessio
 SESSIONS = ("2026-10-09", "2026-10-12", "2026-10-13")
 AFTER_EXPIRY = dt.datetime(2026, 10, 14, 22, 0, tzinfo=UTC)          # Wednesday 18:00 New York
 RESEARCH = SimpleNamespace(principal="research")
+EXPERIMENT = SimpleNamespace(experiment_id="exp-1", account_id="DU1",
+                             started_at=dt.datetime(2026, 10, 1, tzinfo=UTC), stopped_at=None)
+FIRST_FILL = dt.datetime(2026, 10, 9, 14, 0, tzinfo=UTC)            # the version's first session, 10:00 New York
 RECORD = {"strategy_path": "strategies/opening_range_breakout.py", "strategy_digest": FILE_HASH,
           "class_name": "OpeningRangeBreakout", "params": {"RANGE_MINUTES": 15}, "conids": [265598, 272093],
           "bar_size": "5 mins", "style": "intraday_long", "decider": "jev", "decider_verdict": "DEPLOY",
@@ -61,6 +71,13 @@ class FakeBundles:
                            "openrouter/jev-1#jdg-00000001", "llm", self.expires_at)
 
 
+class FakeExperiments:
+    """ExperimentStore's read: the one experiment the fixture's paper trips run in."""
+
+    def get(self, experiment_id: str):
+        return EXPERIMENT if experiment_id == EXPERIMENT.experiment_id else None
+
+
 @dataclass
 class RenewalWorld:
     base: World
@@ -74,6 +91,8 @@ class RenewalWorld:
     bundles: FakeBundles
     shadow: ShadowIngest
     scoreboard: ScoreboardStore
+    broker: Any
+    links: DecisionStoreAttribution
 
     @property
     def clock(self):
@@ -103,20 +122,35 @@ class RenewalWorld:
                                             bar_size="5 mins", **numbers)
         return self.shadow.record(request, RESEARCH)["status"]
 
-    def paper_trip(self, version_digest: str, round_trip_id: str, *, net_pnl: float) -> None:
-        """An ENTER decision bound to ``version_digest`` and the round trip it opened."""
+    def paper_trip(self, version_digest: str, label: str, *, net_pnl: float) -> str:
+        """An ENTER decision bound to ``version_digest`` and the closed trip its order filled: real broker fills
+        (10 shares, $0.50 commission each way), then the scoreboard's refresh. Returns the round trip id."""
+        decision_id = f"dec-{label}"
         self.base.db.execute(
-            "INSERT INTO ai_paper_decisions (command_id, decision_id, account_id, conid, action, body_json, state, "
-            "received_at, updated_at, deployment_version) VALUES (?, ?, 'DU1', 265598, 'ENTER', '{}', 'FINAL', ?, ?, ?)",
-            [f"cmd-{round_trip_id}", f"dec-{round_trip_id}", NOW, NOW, version_digest])
-        self.scoreboard.replace_round_trips(f"exp-{round_trip_id}", [{
-            "round_trip_id": round_trip_id, "experiment_id": f"exp-{round_trip_id}", "account_id": "DU1",
-            "conid": 265598, "symbol": "AAPL", "direction": "LONG", "status": "CLOSED", "opened_at": NOW,
-            "closed_at": NOW, "opened_session": FIRST, "closed_session": FIRST, "entry_qty": 10.0, "exit_qty": 10.0,
-            "entry_avg": 100.0, "exit_avg": 101.0, "gross_pnl_usd": net_pnl + 1.0, "fees_usd": 1.0,
-            "net_pnl_usd": net_pnl, "fees_complete": True, "notional_traded_usd": 2010.0, "strategy_version": None,
-            "decider": "jev", "policy_revision": None, "style": "intraday_long",
-            "decision_id": f"dec-{round_trip_id}", "links_digest": None, "exec_ids": "[]", "fills_digest": "f"}])
+            "INSERT INTO ai_paper_decisions (command_id, decision_id, account_id, conid, action, decider, body_json, "
+            "state, received_at, updated_at, experiment_id, deployment_version) "
+            "VALUES (?, ?, 'DU1', 265598, 'ENTER', 'jev', '{}', 'FINAL', ?, ?, ?, ?)",
+            [command_id_for(decision_id), decision_id, NOW, NOW, EXPERIMENT.experiment_id, version_digest])
+        opened = FIRST_FILL + dt.timedelta(minutes=10 * self._fills_placed())
+        ref = encode_order_ref(f"og-{command_id_for(decision_id)}")
+        exit_price = 100.0 + (net_pnl + 1.0) / 10
+        put_fill(self.base.db, self.broker, "DU1", f"x-{label}-in", "BUY", 10, 100.0, 0.5, opened, ref=ref)
+        put_fill(self.base.db, self.broker, "DU1", f"x-{label}-out", "SELL", 10, exit_price, 0.5,
+                 opened + dt.timedelta(minutes=5), ref=ref)
+        trips = self.refresh_trips()
+        (trip,) = [t for t in trips if t.decision_id == decision_id]
+        return trip.round_trip_id
+
+    def _fills_placed(self) -> int:
+        return self.base.db.execute("SELECT COUNT(*) FROM broker_fills", fetch="one")[0]
+
+    def refresh_trips(self) -> tuple:
+        """ScoreboardService.refresh: the stored round_trips projection of the experiment, rebuilt from its fills."""
+        projection = project_round_trips(experiment_fills(self.base.db, EXPERIMENT),
+                                         links_for=self.links.links_for_order_ref, account_id="DU1")
+        self.scoreboard.replace_round_trips(EXPERIMENT.experiment_id, [
+            t.as_row(EXPERIMENT.experiment_id, "DU1") for t in projection.trips])
+        return projection.trips
 
     def renewal_case(self, prior: str, *, forward_sessions: int = 3, incomplete_sessions: int = 0,
                      **changes) -> str:
@@ -142,6 +176,7 @@ class RenewalWorld:
 def renewal_world(tmp_path, *, bundles: FakeBundles | None = None) -> RenewalWorld:
     base = world(tmp_path, deploy_expiry_sessions=3)
     migrator = SchemaMigrator(base.db)
+    broker = broker_store(base.db, migrator)
     journal = DomainJournal(base.db)
     journal.migrate(migrator)
     apply_ai_deployment_migration(migrator)
@@ -156,7 +191,9 @@ def renewal_world(tmp_path, *, bundles: FakeBundles | None = None) -> RenewalWor
     # Plan 5 ruling 14: the lambdas run only after `judgments` and `activity` exist.
     gate = RenewalGate(renewals_of=lambda digest: judgments.renewals_of(digest), bundles=bundles,
                        cooldowns=cooldowns, calendar=calendar, expiry_sessions=3)
-    forward = VersionForwardEvidence(db=base.db, scoreboard=scoreboard, versions=versions, deployments=deployments,
+    links = DecisionStoreAttribution(AiPaperDecisionStore(journal))
+    forward = VersionForwardEvidence(db=base.db, scoreboard=scoreboard, experiments=FakeExperiments(), links=links,
+                                     versions=versions, deployments=deployments,
                                      status_of=lambda digest: activity.status(digest),
                                      judgment_of=lambda judgment_id: judgments.get(judgment_id), gate=gate,
                                      calendar=calendar, config=config, now=base.clock)
@@ -169,4 +206,4 @@ def renewal_world(tmp_path, *, bundles: FakeBundles | None = None) -> RenewalWor
                                   cooldowns=cooldowns, max_active=3, now=base.clock)
     shadow = ShadowIngest(store=scoreboard, judgments=judgments, versions=versions, config=config, now=base.clock)
     return RenewalWorld(base, journal, judgments, reader, versions, deployments, activity, forward, bundles, shadow,
-                        scoreboard)
+                        scoreboard, broker, links)

@@ -9,6 +9,7 @@ from tests.automation.backtest_judge_fixtures import KEY, insert_reject
 from tests.automation.renewal_world import (
     AFTER_EXPIRY, BUNDLE, SESSIONS, UTC, FakeBundles, renewal_world,
 )
+from tests.scoreboard.fills import set_commission
 from trader.automation.forward_evidence import ForwardEvidenceRefused
 from trader.research.forward_evidence_view import ForwardEvidenceView
 from trader.scoreboard.seal import row_digest
@@ -42,11 +43,44 @@ def test_a_session_outside_the_judgments_shadow_window_is_not_replayed(tmp_path)
 def test_paper_trips_of_the_version_and_only_of_it(tmp_path):
     rw = renewal_world(tmp_path)
     v1 = rw.deploy_initial()
-    rw.paper_trip(v1, "rt-1", net_pnl=12.5)
+    own = rw.paper_trip(v1, "rt-1", net_pnl=12.5)
     rw.paper_trip("sha256:" + "9" * 64, "rt-2", net_pnl=-3.0)
     trips = rw.forward.read(v1)["trips"]
     assert [(t["round_trip_id"], t["net_pnl_usd"], t["status"], t["fees_complete"]) for t in trips] == [
-        ("rt-1", 12.5, "CLOSED", True)]
+        (own, 12.5, "CLOSED", True)]
+
+
+# Fix round 2 (PR #100 blocker 1): trip numbers come from the broker fills, never from the projection alone
+
+@pytest.mark.parametrize("edit", [
+    "UPDATE round_trips SET net_pnl_usd = 999999.0",
+    "UPDATE round_trips SET net_pnl_usd = 999999.0, gross_pnl_usd = 1000000.0, exit_avg = 100100.0",
+    "UPDATE round_trips SET status = 'OPEN', closed_session = NULL, net_pnl_usd = NULL",
+    "UPDATE round_trips SET round_trip_id = 'rt-forged'",
+])
+def test_an_edited_paper_trip_is_tampered_not_evidence(tmp_path, edit):
+    rw = renewal_world(tmp_path)
+    v1 = rw.deploy_initial()
+    rw.paper_trip(v1, "rt-1", net_pnl=12.5)
+    rw.base.db.execute(edit)
+    with pytest.raises(ForwardEvidenceRefused) as exc:
+        rw.forward.read(v1)
+    assert exc.value.code == "FORWARD_EVIDENCE_TAMPERED"
+
+
+def test_a_projection_that_lags_its_fills_reads_the_fills(tmp_path):
+    """The scoreboard rebuilds round_trips every 30 s: a late commission or a new fill is lag, not tampering."""
+    rw = renewal_world(tmp_path)
+    v1 = rw.deploy_initial()
+    trip = rw.paper_trip(v1, "rt-1", net_pnl=12.5)
+    rw.base.db.execute("UPDATE broker_fills SET commission = NULL, commission_currency = NULL "
+                       "WHERE exec_id = 'x-rt-1-out'")
+    rw.refresh_trips()                                   # stored: fees incomplete, no net P&L
+    set_commission(rw.base.db, "DU1", "x-rt-1-out", 0.5)  # the commission lands before the next refresh
+    assert [(t["round_trip_id"], t["net_pnl_usd"], t["fees_complete"]) for t in rw.forward.read(v1)["trips"]] == [
+        (trip, 12.5, True)]
+    rw.base.db.execute("DELETE FROM round_trips")         # not refreshed yet at all
+    assert [t["net_pnl_usd"] for t in rw.forward.read(v1)["trips"]] == [12.5]
 
 
 @pytest.mark.parametrize("setup,code", [
@@ -126,3 +160,12 @@ def test_a_tampered_judgment_of_the_version_is_refused_by_name(tmp_path):
     with pytest.raises(ForwardEvidenceRefused) as exc:
         rw.forward.read(v1)
     assert exc.value.code == "JUDGMENT_TAMPERED"
+
+
+def test_a_trip_edited_with_its_fills_digest_still_reports_the_fills(tmp_path):
+    """An edit that also rewrites fills_digest reads as lag; the view still carries the fills' numbers."""
+    rw = renewal_world(tmp_path)
+    v1 = rw.deploy_initial()
+    rw.paper_trip(v1, "rt-1", net_pnl=12.5)
+    rw.base.db.execute("UPDATE round_trips SET net_pnl_usd = 999999.0, fills_digest = 'forged'")
+    assert [t["net_pnl_usd"] for t in rw.forward.read(v1)["trips"]] == [12.5]

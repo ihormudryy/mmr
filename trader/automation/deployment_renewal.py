@@ -1,8 +1,8 @@
 """Renewal of an expired AI deployment version (SP2c spec 5.2 items 2 and 7, 6.2 "Renewal after expiry").
 
 VersionForwardEvidence answers get_deployment_forward_evidence: the version's sessions, its sealed shadow rows
-and its paper trips. RenewalGate says whether a version may be renewed now. TraderRenewalChecks is Plan 1's
-RenewalChecks port. Every read happens before any write transaction. A tampered record is raised by name, never
+and its paper trips (recomputed from the broker fills; the stored round_trips projection is only checked).
+RenewalGate says whether a version may be renewed now. TraderRenewalChecks is Plan 1's RenewalChecks port. Every read happens before any write transaction. A tampered record is raised by name, never
 answered as a business refusal.
 """
 from __future__ import annotations
@@ -25,6 +25,9 @@ from trader.research.forward_evidence_view import (
 from trader.research.shadow_window import session_close_utc, shadow_window
 from trader.research.strategy_key import split_strategy_key
 from trader.research.strategy_paths import normalize_strategy_path
+from trader.scoreboard.round_trips import RoundTrip, project_round_trips
+from trader.scoreboard.service import _differences
+from trader.scoreboard.session_ledger import experiment_fills
 from trader.scoreboard.shadow_ingest import _is_intact, shadow_record_id
 from trader.scoreboard.store import row_key
 
@@ -32,6 +35,8 @@ FORWARD_EVIDENCE_TAMPERED = "FORWARD_EVIDENCE_TAMPERED"
 DEPLOYMENT_VERSION_TAMPERED = "DEPLOYMENT_VERSION_TAMPERED"
 SESSION_NOT_CLOSED = "SESSION_NOT_CLOSED"
 NOT_DUE = frozenset({"ACTIVE", "NOT_STARTED", "OVER_CAP"})
+FEE_COLUMNS = ("fees_usd", "net_pnl_usd", "fees_complete")
+NOT_FILL_DERIVED = frozenset({"experiment_id", "account_id", *FEE_COLUMNS})
 Refusal = tuple[str, str]
 
 
@@ -89,10 +94,11 @@ class RenewalGate:
 class VersionForwardEvidence:
     """Plan 1's ForwardEvidenceSource over Plan 2's versions and Plan 3's sealed shadow rows (ruling 4)."""
 
-    def __init__(self, *, db: Any, scoreboard: Any, versions: Any, deployments: Any,
+    def __init__(self, *, db: Any, scoreboard: Any, experiments: Any, links: Any, versions: Any, deployments: Any,
                  status_of: Callable[[str], str], judgment_of: Callable[[str], Any], gate: RenewalGate,
                  calendar: Any, config: Any, now: Callable[[], dt.datetime]):
         self._db, self._scoreboard, self._versions, self._deployments = db, scoreboard, versions, deployments
+        self._experiments, self._links = experiments, links
         self._status_of, self._judgment_of, self._gate = status_of, judgment_of, gate
         self._calendar, self._config, self._now = calendar, config, now
 
@@ -109,7 +115,7 @@ class VersionForwardEvidence:
             binding=self._binding(facts.base), line=facts.line,
             renewable=Renewability(ok=refusal is None, code=None if refusal is None else refusal[0],
                                    detail="" if refusal is None else refusal[1]),
-            sessions=self.sessions(facts), trips=self._trips(version_digest), as_of=now.isoformat()).to_wire()
+            sessions=self.sessions(facts), trips=self.trips(version_digest), as_of=now.isoformat()).to_wire()
 
     def facts(self, version_digest: str) -> VersionFacts:
         """Only ``version_digest`` itself may be unknown. Every record behind a sealed version (its base, its
@@ -183,15 +189,54 @@ class VersionForwardEvidence:
                                              f"the sealed shadow row of {judgment_id} on {day} is gone")
         return found
 
-    def _trips(self, version_digest: str) -> list[PaperTrip]:
-        rows = self._db.execute(
-            "SELECT DISTINCT rt.round_trip_id, rt.conid, rt.status, rt.opened_session, rt.closed_session, "
-            "rt.net_pnl_usd, rt.fees_complete FROM round_trips rt JOIN ai_paper_decisions d "
-            "ON d.decision_id = rt.decision_id WHERE d.action = 'ENTER' AND d.deployment_version = ? "
-            "ORDER BY rt.opened_session, rt.round_trip_id", [version_digest], fetch="all")
-        return [PaperTrip(round_trip_id=r[0], conid=int(r[1]), status=r[2], opened_session=r[3].isoformat(),
-                          closed_session=None if r[4] is None else r[4].isoformat(), net_pnl_usd=_money(r[5]),
-                          fees_complete=bool(r[6])) for r in rows]
+    def trips(self, version_digest: str) -> list[PaperTrip]:
+        """The version's trips recomputed from the broker fills and the decision links, as scoreboard verify does.
+        The stored projection is never the evidence: a stored trip that its own fills contradict is tampering."""
+        decisions = self._db.execute(
+            "SELECT DISTINCT decision_id, experiment_id FROM ai_paper_decisions "
+            "WHERE action = 'ENTER' AND deployment_version = ? AND decision_id IS NOT NULL",
+            [version_digest], fetch="all")
+        decision_ids = {decision_id for decision_id, _ in decisions}
+        if not decision_ids:
+            return []
+        experiment_ids = {experiment_id for _, experiment_id in decisions if experiment_id is not None}
+        experiment_ids |= self._stored_trip_experiments(decision_ids)
+        trips = [trip for experiment_id in sorted(experiment_ids)
+                 for trip in self._verified_trips(experiment_id, decision_ids)]
+        trips.sort(key=lambda trip: (trip.opened_session, trip.round_trip_id))
+        return [PaperTrip(round_trip_id=t.round_trip_id, conid=t.conid, status=t.status,
+                          opened_session=t.opened_session.isoformat(),
+                          closed_session=None if t.closed_session is None else t.closed_session.isoformat(),
+                          net_pnl_usd=t.net_pnl_usd, fees_complete=t.fees_complete) for t in trips]
+
+    def _stored_trip_experiments(self, decision_ids: set[str]) -> set[str]:
+        markers = ", ".join("?" for _ in decision_ids)
+        rows = self._db.execute(f"SELECT DISTINCT experiment_id FROM round_trips WHERE decision_id IN ({markers})",
+                                sorted(decision_ids), fetch="all")
+        return {row[0] for row in rows}
+
+    def _verified_trips(self, experiment_id: str, decision_ids: set[str]) -> list[RoundTrip]:
+        experiment = self._experiments.get(experiment_id)
+        if experiment is None:
+            raise ForwardEvidenceRefused(FORWARD_EVIDENCE_TAMPERED,
+                                         f"the experiment {experiment_id} behind the version's trips is gone")
+        projection = project_round_trips(experiment_fills(self._db, experiment),
+                                         links_for=self._links.links_for_order_ref, account_id=experiment.account_id)
+        recomputed = {trip.round_trip_id: trip for trip in projection.trips}
+        for row in self._scoreboard.fetch("round_trips", {"experiment_id": experiment_id}):
+            if row["decision_id"] not in decision_ids:
+                continue
+            trip = recomputed.get(row["round_trip_id"])
+            if trip is None:
+                raise ForwardEvidenceRefused(FORWARD_EVIDENCE_TAMPERED,
+                                             f"round trip {row['round_trip_id']} has no broker fills behind it")
+            edited = _projection_edits(row, self._scoreboard.prepare(
+                "round_trips", trip.as_row(experiment_id, experiment.account_id)))
+            if edited:
+                raise ForwardEvidenceRefused(FORWARD_EVIDENCE_TAMPERED,
+                                             f"round trip {row['round_trip_id']} differs from its broker fills: "
+                                             f"{', '.join(edited)}")
+        return [trip for trip in projection.trips if trip.decision_id in decision_ids]
 
     @staticmethod
     def _binding(base: AiDeployment) -> VersionBinding:
@@ -200,6 +245,19 @@ class VersionForwardEvidence:
             class_name=base.class_name, strategy_file_hash=base.strategy_digest, params=dict(base.params),
             conids=sorted(int(c) for c in base.conids), bar_size=base.bar_size,
             order_notional=float(base.evidence_order_notional), bundle_digest=base.evidence_ref)
+
+
+def _projection_edits(stored: dict, recomputed: dict) -> list[str]:
+    """Columns of a stored trip that its own fills contradict. Other fills than the stored ones, or a commission
+    that arrived after the stored fees were incomplete, are the 30 s refresh lagging, not an edit."""
+    if stored["fills_digest"] != recomputed["fills_digest"]:
+        return []
+    edited = _differences(stored, recomputed, [name for name in recomputed if name not in NOT_FILL_DERIVED])
+    if stored["fees_complete"]:
+        edited.update(_differences(stored, recomputed, FEE_COLUMNS))
+    elif stored["fees_usd"] is not None or stored["net_pnl_usd"] is not None:
+        edited["fees_usd"] = "incomplete fees carry an amount"
+    return sorted(edited)
 
 
 def _session(day: dt.date, state: str, reason: Optional[str]) -> ForwardSession:

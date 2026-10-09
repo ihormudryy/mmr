@@ -44,6 +44,7 @@ from trader.data.strategy_signal_record import (
 from trader.messaging.ai_deployment_wire import GetActiveAiDeploymentsResponse
 from trader.strategy.ai_deployment_source import (
     AI_HISTORY_DAYS,
+    AI_HISTORY_TIMEOUT_S,
     AI_INSTANCE_PREFIX,
     AiDeploymentSource,
     AiInstanceBinding,
@@ -55,7 +56,7 @@ from trader.strategy.strategy_revisions import StrategyCommandReceipt, StrategyR
 from trader.strategy.trader_gateway import StrategyTraderGateway
 from trader.trading.strategy import Signal, Strategy, StrategyConfig, StrategyContext, StrategyState
 from decimal import Decimal
-from typing import Any, cast, Dict, List, Optional
+from typing import Any, cast, Dict, List, Optional, Set
 
 import asyncio
 import backoff
@@ -166,6 +167,17 @@ class SignalRecordWriteFailed(Exception):
     The signal is kept and retried with the same ``source_event_id``, which the
     record treats as the same row (SP2 Plan 1, PR #78 review).
     """
+
+
+class AiHistoryBackfillError(Exception):
+    """An AI instance's history did not load; it must not trade on partial data."""
+
+
+def _running_loop() -> Optional[asyncio.AbstractEventLoop]:
+    try:
+        return asyncio.get_running_loop()
+    except RuntimeError:
+        return None
 
 
 class StartupConfigRecoveryError(Exception):
@@ -570,6 +582,11 @@ class StrategyRuntime():
         self._tick_retention_days: int = 2
 
         self.historical_data_client: IBHistoryWorker
+        # The service loop, set in run(): the reconcile thread runs AI history backfills on it.
+        self._loop: Optional[asyncio.AbstractEventLoop] = None
+        # AI instance names whose history backfill is running; two reconciles may overlap.
+        self._ai_backfills: Set[str] = set()
+        self._ai_backfill_lock = threading.Lock()
 
     def create_strategy_exception(self, exception_type: type, message: str, inner: Optional[Exception]):
         # todo use reflection here to automatically populate trader runtime vars that we care about
@@ -857,16 +874,67 @@ class StrategyRuntime():
         return {s.name: s for s in self.strategy_implementations if getattr(s, 'ai_deployment_version', None)}
 
     def load_ai_deployment(self, deployment) -> bool:
-        """Load one active deployment from the exact bytes the trader judged; False when it does not load."""
+        """Load one active deployment from the exact bytes the trader judged; False when it does not load.
+
+        The instance joins the runtime only once its history is in, so no reconcile subscribes it and
+        no bar reaches it before. A deployment whose backfill is already running counts as loading.
+        """
         name = ai_instance_name(deployment.version_digest)
-        self.load_strategy(
+        with self._ai_backfill_lock:
+            if name in self._ai_backfills or self.get_strategy(name) is not None:
+                return True
+            self._ai_backfills.add(name)
+        try:
+            return self._load_ai_instance(name, deployment)
+        finally:
+            with self._ai_backfill_lock:
+                self._ai_backfills.discard(name)
+
+    def _load_ai_instance(self, name: str, deployment) -> bool:
+        instance = self.load_strategy(
             name=name, bar_size_str=deployment.bar_size, conids=list(deployment.conids), universe=None,
             historical_days_prior=AI_HISTORY_DAYS, module=deployment.strategy_path.removeprefix('strategies/'),
             class_name=deployment.class_name, description=f'AI deployment {deployment.version_digest}',
             paper_only=True, auto_execute=False, params=dict(deployment.params),
             ai_binding=AiInstanceBinding(deployment.version_digest, deployment.base_digest,
                                          deployment.strategy_digest))
-        return self.get_strategy(name) is not None
+        if instance is None:
+            return False
+        try:
+            self._load_ai_history(instance)
+        except Exception as ex:
+            logging.error('AI_HISTORY_BACKFILL_FAILED: %s (conids %s, %s): %s; not loaded, the next reconcile '
+                          'retries', name, instance.conids, instance.bar_size, ex)
+            sys.modules.pop(f'_mmr_strategy_{name}', None)
+            return False
+        self.strategy_implementations.append(instance)
+        return True
+
+    def _load_ai_history(self, instance: Strategy) -> None:
+        """Run the startup history step for one AI instance from the reconcile thread; raise when it fails."""
+        loop = getattr(self, '_loop', None)
+        if loop is None or getattr(self, 'historical_data_client', None) is None:
+            raise AiHistoryBackfillError('the IB history client has not started yet')
+        if _running_loop() is loop:
+            raise AiHistoryBackfillError('called on the service loop, which would wait on itself')
+        future = asyncio.run_coroutine_threadsafe(self._backfill_ai_history(instance), loop)
+        try:
+            future.result(timeout=AI_HISTORY_TIMEOUT_S)
+        except TimeoutError as ex:
+            future.cancel()
+            raise AiHistoryBackfillError(f'no result within {AI_HISTORY_TIMEOUT_S}s') from ex
+
+    async def _backfill_ai_history(self, instance: Strategy) -> None:
+        if not await self._fetch_strategy_history(instance):
+            raise AiHistoryBackfillError('IB returned no data or a conid did not resolve (see the log above)')
+        for conId in instance.conids:
+            try:
+                bars = self._read_hist_bars(conId, instance.bar_size)
+            except Exception as ex:
+                raise AiHistoryBackfillError(f'reading back the history of conId {conId} failed: {ex}') from ex
+            if bars.empty:
+                raise AiHistoryBackfillError(f'no history bars for conId {conId} after the backfill')
+            self._hist_bars[(conId, instance.bar_size)] = bars   # replaces a frame primed before the backfill
 
     @staticmethod
     def _coerce_param_value(value):
@@ -1529,22 +1597,25 @@ class StrategyRuntime():
         from the DB into the priming cache, normalized to the live schema so it
         concatenates cleanly with resampled ticks. Marks the key as primed even
         on no-data so we don't re-read the DB on every tick."""
-        from trader.data.duckdb_store import DuckDBDataStore
-        from trader.data.market_data import normalize_historical
         key = (conId, bar_size)
         self._hist_bars[key] = pd.DataFrame()   # mark primed (default empty)
         try:
-            ds = DuckDBDataStore(self.history_duckdb_path)
-            end = dt.datetime.now(dt.timezone.utc)
-            start = end - dt.timedelta(days=max(self._tick_retention_days, 5) + 5)
-            df = ds.read(str(conId), start=start, end=end, bar_size=str(bar_size))
-            if df is not None and not df.empty:
-                norm = normalize_historical(df)
-                idx = norm.index
-                norm.index = idx.tz_localize('UTC') if idx.tz is None else idx.tz_convert('UTC')
-                self._hist_bars[key] = norm
+            self._hist_bars[key] = self._read_hist_bars(conId, bar_size)
         except Exception as ex:
             logging.warning('could not prime hist bars for conId %s %s: %s', conId, bar_size, ex)
+
+    def _read_hist_bars(self, conId: int, bar_size: BarSize) -> pd.DataFrame:
+        """Recent historical bars for (conId, bar_size) from the DB in the live UTC schema; raises on a read error."""
+        from trader.data.duckdb_store import DuckDBDataStore
+        from trader.data.market_data import normalize_historical
+        end = dt.datetime.now(dt.timezone.utc)
+        start = end - dt.timedelta(days=max(self._tick_retention_days, 5) + 5)
+        df = DuckDBDataStore(self.history_duckdb_path).read(str(conId), start=start, end=end, bar_size=str(bar_size))
+        if df is None or df.empty:
+            return pd.DataFrame()
+        bars = normalize_historical(df)
+        bars.index = bars.index.tz_localize('UTC') if bars.index.tz is None else bars.index.tz_convert('UTC')
+        return bars
 
     def _strategy_frame(self, conId: int, bar_size: BarSize) -> Optional[pd.DataFrame]:
         """The OHLCV frame a bar-based strategy should see: historical priming
@@ -2005,7 +2076,12 @@ class StrategyRuntime():
         auto_execute: 'bool | str' = False,
         params: Optional[Dict] = None,
         ai_binding: Optional[AiInstanceBinding] = None,
-    ) -> None:
+    ) -> Optional[Strategy]:
+        """Load and return one strategy; None when it is refused or fails.
+
+        A config strategy joins the runtime here; an AI instance joins only after its history
+        (``load_ai_deployment``).
+        """
 
         # Skip if strategy with this name already loaded
         if any(s.name == name for s in self.strategy_implementations):
@@ -2178,7 +2254,9 @@ class StrategyRuntime():
                 elif ai_binding is not None:
                     instance.enable()
 
-                self.strategy_implementations.append(cast(Strategy, instance))
+                if ai_binding is None:
+                    self.strategy_implementations.append(cast(Strategy, instance))
+                return cast(Strategy, instance)
 
         except Exception as ex:
             # Load failures used to be swallowed at DEBUG; a config typo could
@@ -2513,7 +2591,7 @@ class StrategyRuntime():
         bar_size: BarSize,
         historical_days: int,
         strategy_name: str,
-    ):
+    ) -> bool:
         """Fetch historical bars only for the date ranges not already in DuckDB.
 
         Mirrors the cache-aware pattern in data_service: ask TickStorage
@@ -2522,15 +2600,18 @@ class StrategyRuntime():
         90-day backfill on every strategy_service restart into a no-op
         once the local store is warm.
 
+        Returns False when a range had no IB data or its write failed, True otherwise.
+
         Errors:
-          * IBNoDataError    -> swallowed (logged at warning); some IB
-                                contracts genuinely have no history.
+          * IBNoDataError    -> logged at warning and reported in the result;
+                                some IB contracts genuinely have no history.
           * IBConnectivityError -> propagated; caller decides whether to
                                 reconnect and retry.
         """
         contract = SecurityDefinition.to_contract(security)
         what_to_show = _whattoshow_for_contract(contract)
 
+        # Keyed by conId below: the store refuses the StrategyInstrument that resolve_instrument returns.
         tick_data = self.storage.get_tickdata(bar_size=bar_size)
         tz = security.timeZoneId or 'US/Eastern'
         # dateify() with timezone= returns a tz-aware dt.datetime even
@@ -2545,7 +2626,7 @@ class StrategyRuntime():
         if cal is not None:
             try:
                 date_ranges = tick_data.missing(
-                    security, cal,
+                    security.conId, cal,
                     date_range=DateRange(start=window_start, end=window_end),
                 )
             except Exception as ex:
@@ -2565,8 +2646,9 @@ class StrategyRuntime():
                 'history cache hit for %s (%s, %sd) — skipping IB fetch',
                 security.symbol, strategy_name, historical_days,
             )
-            return
+            return True
 
+        complete = True
         for dr in date_ranges:
             # tick_data.missing() returns DateRanges whose start/end are
             # bare dt.date objects (from exchange_calendars sessions.date)
@@ -2589,11 +2671,12 @@ class StrategyRuntime():
                     security.symbol, security.conId,
                     dr.start, dr.end, strategy_name, ex,
                 )
+                complete = False
                 continue
 
             if df is not None and len(df) > 0:
                 try:
-                    tick_data.write(security, df)
+                    tick_data.write(security.conId, df)
                     logging.debug(
                         'wrote %d bars for %s (%s) strategy %s',
                         len(df), security.symbol, security.conId, strategy_name,
@@ -2603,42 +2686,39 @@ class StrategyRuntime():
                         'tick_data.write() failed for %s strategy %s: %s',
                         security.symbol, strategy_name, ex,
                     )
+                    complete = False
+        return complete
+
+    async def _fetch_strategy_history(self, strategy: Strategy) -> bool:
+        """Backfill one strategy's conids and universe; False when any part could not be loaded."""
+        historical_days = strategy.historical_days_prior if strategy.historical_days_prior else 1
+        complete = True
+        for conId in strategy.conids or []:
+            instrument = self._trader_gateway.resolve_instrument(conId)
+            if not instrument:
+                logging.error('could not find security definition for conId %s for strategy %s', conId, strategy)
+                complete = False
+                continue
+            if not await self._fetch_history_with_resume(
+                    security=instrument, bar_size=strategy.bar_size,
+                    historical_days=historical_days, strategy_name=strategy.name):
+                complete = False
+
+        if strategy.universe:
+            # Iterate SecurityDefinitions directly so we can pass them to
+            # _fetch_history_with_resume (which needs primaryExchange,
+            # timeZoneId, etc. for calendar lookup and missing-range
+            # computation; a bare Contract(conId=...) wouldn't suffice).
+            for sd in self.universe_accessor.get(strategy.universe).security_definitions:
+                if not await self._fetch_history_with_resume(
+                        security=sd, bar_size=strategy.bar_size,
+                        historical_days=historical_days, strategy_name=strategy.name):
+                    complete = False
+        return complete
 
     async def get_historical_data(self):
         for strategy in self.strategy_implementations:
-            historical_days = strategy.historical_days_prior if strategy.historical_days_prior else 1
-
-            if strategy.conids:
-                for conId in strategy.conids:
-                    instrument = self._trader_gateway.resolve_instrument(conId)
-                    if instrument:
-                        try:
-                            await self._fetch_history_with_resume(
-                                security=instrument,
-                                bar_size=strategy.bar_size,
-                                historical_days=historical_days,
-                                strategy_name=strategy.name,
-                            )
-                        except IBConnectivityError:
-                            raise
-                    else:
-                        logging.error('could not find security definition for conId {} for strategy {}'.format(conId, strategy))
-
-            if strategy.universe:
-                # Iterate SecurityDefinitions directly so we can pass them to
-                # _fetch_history_with_resume (which needs primaryExchange,
-                # timeZoneId, etc. for calendar lookup and missing-range
-                # computation; a bare Contract(conId=...) wouldn't suffice).
-                for sd in self.universe_accessor.get(strategy.universe).security_definitions:
-                    try:
-                        await self._fetch_history_with_resume(
-                            security=sd,
-                            bar_size=strategy.bar_size,
-                            historical_days=historical_days,
-                            strategy_name=strategy.name,
-                        )
-                    except IBConnectivityError:
-                        raise
+            await self._fetch_strategy_history(strategy)
         logging.debug('finished get_historical_data()')
 
     async def _serve_control_sockets(self):
@@ -2650,6 +2730,7 @@ class StrategyRuntime():
     async def run(self):
         logging.info('starting strategy_runtime')
         logging.debug('StrategyRuntime.run()')
+        self._loop = asyncio.get_running_loop()
 
         # Async setup that used to happen inside connect() via asyncio.run():
         # we now do it here so the tasks land on the real service loop and

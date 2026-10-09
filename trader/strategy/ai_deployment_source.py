@@ -15,6 +15,8 @@ from trader.messaging.typed_rpc import TypedRpcRemoteError
 
 AI_INSTANCE_PREFIX = "aidv-"
 AI_HISTORY_DAYS = 5
+# Bounds one instance's backfill: a few IB history requests at ib_async's 60 s default each.
+AI_HISTORY_TIMEOUT_S = 180
 
 
 @dataclass(frozen=True)

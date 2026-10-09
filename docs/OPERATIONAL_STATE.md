@@ -648,14 +648,16 @@ Do not arm a second automatic strategy. Do not set `automation.live_enabled`.
 
 **Daily bars for every conid (important).** The trader checks the liquidity of an ENTER from its local daily bars only (`production_evidence.py`, `liquidity_from_history`). There is no Alpaca fallback. So every conid in a research universe must also be in a universe that the scheduler refreshes with a daily job. The jobs are in `data_refresh.yaml` (`bar_size: "1 day"`) and the cron entries in `pycron.yaml` (`data_refresh_us`, `data_refresh_asx`). A conid with no daily history gets its ENTER refused with `HISTORY_INVALID`, after a good backtest. Check with `mmr data status` (in the scheduler container, see below).
 
-**History an evaluation needs (more than daily bars).** An evaluation reads `research_service.period_sessions` sessions (default 690, the last 90 are the holdout) of the candidate's own bar size for every conid, and SPY daily bars from 220 sessions before the period start (`trader/research/evaluation_data.py`). If a conid has no bars of that size in the period, the evaluation stops with "download them before evaluating". The scheduler jobs shipped in `data_refresh.yaml` cover only `"1 day"` (365 days) and `"1 min"` (90 days), so a research bar size such as `"15 mins"` is not downloaded or kept fresh by default (ticket #111: scheduler coverage for research bar sizes). Download the history first, inside the scheduler container (the bars live in the `mmr_db_data` volume, not on the host):
+**History an evaluation needs (more than daily bars).** An evaluation reads `research_service.period_sessions` sessions (default 690, the last 90 are the holdout) of the candidate's own bar size for every conid, about 1,000 calendar days, and SPY daily bars from 220 sessions before the period start, about 1,330 days (`trader/research/evaluation_data.py`). It reads regular-session bars only. The `data_refresh_research` cron entry (21:15 ET weekdays) runs the `research_*` jobs (`research_daily`, `research_1min`, `research_5mins`, `research_15mins`) over a `research` universe. Set it up once, inside the scheduler container (the bars live in the `mmr_db_data` volume, not on the host):
 
 ```bash
-docker compose run --rm scheduler mmr data download SPY --bar-size "1 day" --days 1400
-docker compose run --rm scheduler mmr data download AAPL MSFT --bar-size "15 mins" --days 1050
+docker compose run --rm scheduler mmr universe create research
+docker compose run --rm scheduler mmr universe add research <the symbols of every ai.yaml research.universes conid> SPY
+docker compose run --rm scheduler mmr universe show research   # each conid must equal the ai.yaml one
+docker compose run --rm scheduler mmr data refresh research_daily research_1min research_5mins research_15mins
 ```
 
-The day counts are an estimate (690 + 220 sessions, about 252 sessions a year); the SPY error message prints the exact command. Until #111 is done, add a job for each research bar size to `data_refresh.yaml` and its name to `data_refresh_us` in `pycron.yaml` yourself.
+Keep the `research` universe in step with `ai.yaml` by hand: the scheduler does not read `ai.yaml`. Run the refresh once by hand before `research.enabled: true`; the first 1-min run is large. Until the bars are there, the research service refuses the submit with `BARS_MISSING` (retryable, nothing is claimed). The `ai` service sends it again every poll and logs a WARNING each time; a candidate that never gets its bars closes `STALE_NOT_SUBMITTED`.
 
 ### Watch it
 

@@ -23,8 +23,16 @@ from trader.research.market_context import BENCHMARK_CONID, SPY_LOOKBACK_SESSION
 OHLCV = ['open', 'high', 'low', 'close', 'volume']
 
 
+MISSING_LISTED_MAX = 5
+REFRESH_HINT = 'run the research refresh (data_refresh.yaml research_* jobs) or mmr data download'
+
+
 class EvaluationDataError(Exception):
     """The evaluation's bars are missing or failed qualification."""
+
+
+class BarsMissing(EvaluationDataError):
+    """Bars the evaluation needs are not stored yet; a later refresh may add them."""
 
 
 def load_bars(history_db: str, conids: Sequence[int], bar_size: str,
@@ -59,15 +67,71 @@ def _day_end_utc(day: dt.date) -> dt.datetime:
     return _utc_midnight(day) + dt.timedelta(days=1)
 
 
-def load_benchmark_closes(history_db: str, spec) -> pd.Series:
-    """SPY daily closes from SPY_LOOKBACK_SESSIONS sessions before the period
-    start through the period end, indexed by session date. Missing or short
-    history stops the run with the exact download command."""
+def benchmark_lookback_start(spec) -> dt.date:
+    """The first SPY session the evaluation reads: SPY_LOOKBACK_SESSIONS sessions before the period start."""
     calendar = xcals.get_calendar(spec.calendar)
     sessions_before = calendar.sessions_in_range(calendar.first_session, str(spec.period_start))
     if len(sessions_before) <= SPY_LOOKBACK_SESSIONS:
         raise EvaluationDataError(f'period start {spec.period_start} is too early for the calendar')
-    required_start = sessions_before[-(SPY_LOOKBACK_SESSIONS + 1)].date()
+    return sessions_before[-(SPY_LOOKBACK_SESSIONS + 1)].date()
+
+
+def _stored_days(tickdata, conid: int, intraday_tz: Optional[str]) -> Optional[tuple[dt.date, dt.date]]:
+    """First and last stored day of this conid at this bar size only (TickData.date_summary mixes bar sizes).
+
+    Intraday stamps count on their exchange day; daily stamps on their UTC day, as load_benchmark_closes reads them.
+    """
+    try:
+        first = tickdata.library.min_date(symbol=str(conid), bar_size=tickdata.library_name)
+        last = tickdata.library.max_date(symbol=str(conid), bar_size=tickdata.library_name)
+    except ValueError:
+        return None
+
+    def day(stamp) -> dt.date:
+        ts = pd.Timestamp(stamp)
+        ts = ts.tz_localize('UTC') if ts.tz is None else ts.tz_convert('UTC')
+        return (ts.tz_convert(intraday_tz) if intraday_tz else ts).date()
+    return day(first), day(last)
+
+
+def _coverage_gap(label: str, bar_size: str, days: Optional[tuple[dt.date, dt.date]],
+                  start: dt.date, end: dt.date) -> Optional[str]:
+    if days is None:
+        return f'{label}: no {bar_size} bars'
+    first, last = days
+    if first > start:
+        return f'{label}: {bar_size} bars start {first}, need {start}'
+    if last < end:
+        return f'{label}: {bar_size} bars end {last}, need {end}'
+    return None
+
+
+def require_bars_available(history_db: str, spec) -> None:
+    """Before any claim: every conid has ``spec.bar_size`` bars from the period start through the period end,
+    and SPY has daily bars from its lookback start through the period end.
+
+    Only the first and last stored day are checked here; the qualifier still checks every session in the run.
+    """
+    storage = TickStorage(history_db)
+    daily = storage.get_tickdata(BarSize.parse_str('1 day'))
+    intraday = storage.get_tickdata(BarSize.parse_str(spec.bar_size))
+    exchange_tz = str(xcals.get_calendar(spec.calendar).tz)
+    gaps = [_coverage_gap(f'SPY (conid {BENCHMARK_CONID})', '1 day', _stored_days(daily, BENCHMARK_CONID, None),
+                          benchmark_lookback_start(spec), spec.period_end)]
+    gaps += [_coverage_gap(f'conid {conid}', spec.bar_size, _stored_days(intraday, conid, exchange_tz),
+                           spec.period_start, spec.period_end) for conid in spec.conids]
+    gaps = [gap for gap in gaps if gap is not None]
+    if gaps:
+        listed = '; '.join(gaps[:MISSING_LISTED_MAX])
+        more = f' (+{len(gaps) - MISSING_LISTED_MAX} more)' if len(gaps) > MISSING_LISTED_MAX else ''
+        raise BarsMissing(f'{listed}{more}; {REFRESH_HINT}')
+
+
+def load_benchmark_closes(history_db: str, spec) -> pd.Series:
+    """SPY daily closes from SPY_LOOKBACK_SESSIONS sessions before the period
+    start through the period end, indexed by session date. Missing or short
+    history stops the run with the exact download command."""
+    required_start = benchmark_lookback_start(spec)
     days_needed = (dt.date.today() - required_start).days + 5
     download = f'mmr data download SPY --bar-size "1 day" --days {days_needed}'
     tickdata = TickStorage(history_db).get_tickdata(BarSize.parse_str('1 day'))

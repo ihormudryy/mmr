@@ -109,7 +109,7 @@ def build_runtime(*, config_path: str, environ: Mapping[str, str], now: Callable
 
     def build_spec(body):
         return build_cohort_spec(body, config=config, judge=judge, universe_accessor=universe, costs_config=costs,
-                                 repo_root=root, registry=registry)
+                                 repo_root=root, registry=registry, history_db=history_path)
 
     attest = JudgmentAttest(research_db=db, store=store, trader=trader, signer=signer, artifacts_root=ARTIFACTS_ROOT,
                             repo_root=root, is_paper=lambda: is_paper_posture(environ, raw), now=now)

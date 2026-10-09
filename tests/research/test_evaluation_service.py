@@ -5,10 +5,11 @@ from types import SimpleNamespace
 import pytest
 
 from tests.research.case_fixtures import complete_result, pre_holdout_result
-from tests.research.evaluation_fixtures import CONIDS, build_spec_file, write_costs_config, write_universe
+from tests.research.evaluation_fixtures import (CONIDS, build_spec_file, write_costs_config, write_trend_bars,
+                                               write_universe)
 from tests.research.service_fakes import AI, CLI, FakeTrader
 from trader.automation.backtest_judge_config import BacktestJudgeConfig
-from trader.data.duckdb_store import DuckDBConnection
+from trader.data.duckdb_store import DuckDBConnection, DuckDBDataStore
 from trader.data.schema_migrations import SchemaMigrator
 from trader.data.universe import UniverseAccessor
 from trader.messaging.typed_rpc import TypedRpcRemoteError
@@ -51,6 +52,7 @@ def fake_evaluate(registry):
 @pytest.fixture
 def world(tmp_path, tmp_duckdb_path):
     write_universe(tmp_duckdb_path)
+    write_trend_bars(tmp_duckdb_path, drift=0.0)
     build_spec_file(tmp_path)
     costs = load_execution_costs_config(str(write_costs_config(tmp_path / "execution_costs.yaml")))
     db = DuckDBConnection.get_instance(str(tmp_path / "research.duckdb"))
@@ -63,14 +65,16 @@ def world(tmp_path, tmp_duckdb_path):
     def build_spec(body):
         return build_cohort_spec(body, config=config, judge=judge,
                                  universe_accessor=UniverseAccessor(tmp_duckdb_path, "Universes"),
-                                 costs_config=costs, repo_root=tmp_path, registry=registry)
+                                 costs_config=costs, repo_root=tmp_path, registry=registry,
+                                 history_db=tmp_duckdb_path)
 
     def service(evaluate=None, store=None):
         return EvaluationService(store=store or ResearchStore(db), trader=trader, build_spec=build_spec,
                                  evaluate=evaluate or fake_evaluate(registry), signer=signer,
                                  artifacts_root=tmp_path / "artifacts", warmup_sessions=5, order_notional=1900.0,
                                  queue_max=2, now=lambda: NOW)
-    return SimpleNamespace(service=service, trader=trader, registry=registry, signer=signer, root=tmp_path, db=db)
+    return SimpleNamespace(service=service, trader=trader, registry=registry, signer=signer, root=tmp_path, db=db,
+                           history_db=tmp_duckdb_path)
 
 
 def trials(world):
@@ -137,6 +141,15 @@ def test_holdout_not_available_is_refused_before_any_claim(world, monkeypatch):
         {"artifact_id": "a", "family_id": "x", "start": dt.date(2024, 3, 20), "end": dt.date(2024, 3, 27)}])
     reply = world.service().submit(request(), AI)
     assert reply["code"] == "HOLDOUT_NOT_AVAILABLE" and world.trader.claims == {}
+
+
+def test_missing_bars_are_a_retryable_refusal_before_any_claim(world):
+    DuckDBDataStore(world.history_db).delete(str(CONIDS[0]))
+    service = world.service()
+    reply = service.submit(request(), AI)
+    assert (reply["status"], reply["code"], reply["retryable"]) == ("REFUSED", "BARS_MISSING", True)
+    assert str(CONIDS[0]) in reply["detail"]
+    assert world.trader.claims == {} and service.run_next() is False and trials(world) == []
 
 
 def test_callers_queue_and_renewal(world):

@@ -11,6 +11,7 @@ import exchange_calendars as xcals
 import pandas as pd
 from pydantic import ValidationError
 
+from trader.research.evaluation_data import BarsMissing, EvaluationDataError, require_bars_available
 from trader.research.evaluation_request import EvaluationRequestBody, evaluation_request_id
 from trader.research.evaluation_spec import (MIN_INSTRUMENTS, EvaluationSpec, EvaluationSpecError,
                                              build_evaluation_spec, declared_tunables)
@@ -20,9 +21,11 @@ from trader.research.validation import generate_walk_forward
 
 
 class RequestRefused(Exception):
-    def __init__(self, code: str, detail: str):
+    """``retryable``: nothing was decided; the same body may succeed later (BARS_MISSING after a refresh)."""
+
+    def __init__(self, code: str, detail: str, *, retryable: bool = False):
         super().__init__(f"{code}: {detail}")
-        self.code, self.detail = code, detail
+        self.code, self.detail, self.retryable = code, detail, retryable
 
 
 def request_body(raw: Mapping[str, Any], research_day: dt.date) -> EvaluationRequestBody:
@@ -74,8 +77,17 @@ def _file_hash(path: Path) -> str:
     return "sha256:" + hashlib.sha256(path.read_bytes()).hexdigest()
 
 
+def _require_bars(history_db: str, base: EvaluationSpec) -> None:
+    try:
+        require_bars_available(history_db, base)
+    except BarsMissing as missing:
+        raise RequestRefused("BARS_MISSING", str(missing), retryable=True) from None
+    except EvaluationDataError as exc:              # the SPY lookback reaches before the calendar
+        raise RequestRefused("SPEC_INVALID", str(exc)) from None
+
+
 def build_cohort_spec(body: EvaluationRequestBody, *, config: Any, judge: Any, universe_accessor: Any,
-                      costs_config: Any, repo_root: Path, registry: Any) -> CohortSpec:
+                      costs_config: Any, repo_root: Path, registry: Any, history_db: str) -> CohortSpec:
     if not judge.allows(body.strategy_key):
         raise RequestRefused("STRATEGY_NOT_ALLOWED", f"{body.strategy_key} is not on the allowlist")
     cohort = [dict(point) for point in body.cohort]
@@ -118,5 +130,6 @@ def build_cohort_spec(body: EvaluationRequestBody, *, config: Any, judge: Any, u
         raise RequestRefused("SPEC_INVALID", f"walk_forward: {exc}") from None
     require_fresh_holdout(registry.opened_holdout_windows(base.strategy_path, base.class_name),
                           pd.Timestamp(plan.holdout.start).date())
+    _require_bars(history_db, base)
     return CohortSpec(request_id=evaluation_request_id(body), body=body, strategy_key=body.strategy_key,
                       base=base, cohort=tuple(cohort), neighbours=neighbours, file_hash=_file_hash(base.strategy_file))

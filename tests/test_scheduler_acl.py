@@ -23,6 +23,7 @@ SCHEDULED_JOB_RPC_NEEDS = {
     # local universe DB first).
     "data_refresh_us": frozenset(),
     "data_refresh_asx": frozenset(),
+    "data_refresh_research": frozenset(),
     "db_backup": frozenset(),          # data backup: local files only
 }
 SCHEDULER_ACL_ALLOWED = frozenset().union(*SCHEDULED_JOB_RPC_NEEDS.values())

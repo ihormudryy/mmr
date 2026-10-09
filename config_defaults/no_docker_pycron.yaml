@@ -26,6 +26,14 @@ jobs:
       start_on_pycron_start: False
       restart_if_found: False
       restart_if_finished: False
+    - name: data_refresh_research
+      description: refresh the AI research universe (Alpaca) — after the US refresh
+      command: python3
+      arguments: -m trader.mmr_cli data refresh research_daily research_1min research_5mins research_15mins
+      start: "15 21 * * 1-5"     # 9:15 PM ET, after data_refresh_us (see pycron.yaml)
+      start_on_pycron_start: False
+      restart_if_found: False
+      restart_if_finished: False
     - name: data_refresh_asx
       description: refresh ASX universes (IB) — after ASX close (no AH session)
       command: python3

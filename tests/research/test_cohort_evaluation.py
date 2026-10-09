@@ -45,7 +45,7 @@ def workspace(tmp_path, tmp_duckdb_path):
             request_body({"strategy_key": KEY, "cohort": cohort, "conids": CONIDS, "bar_size": "15 mins"}, TODAY),
             config=config, judge=judge, universe_accessor=UniverseAccessor(tmp_duckdb_path, "Universes"),
             costs_config=load_execution_costs_config(str(costs)), repo_root=tmp_path,
-            registry=ExperimentRegistry(db))
+            registry=ExperimentRegistry(db), history_db=tmp_duckdb_path)
     return SimpleNamespace(db=db, paths=paths, spec_for=spec_for, registry=ExperimentRegistry(db))
 
 

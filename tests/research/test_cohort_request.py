@@ -2,7 +2,8 @@ import datetime as dt
 
 import pytest
 
-from tests.research.evaluation_fixtures import CONIDS, build_spec_file, write_costs_config, write_universe
+from tests.research.evaluation_fixtures import (CONIDS, build_spec_file, write_costs_config, write_trend_bars,
+                                               write_universe)
 from trader.automation.backtest_judge_config import BacktestJudgeConfig
 from trader.research.cohort import (RequestRefused, build_cohort_spec, neighbours_of, request_body,
                                     previously_revealed, require_fresh_holdout)
@@ -34,13 +35,15 @@ def raw(**overrides):
 def build(tmp_path, tmp_duckdb_path):
     from trader.data.universe import UniverseAccessor
     write_universe(tmp_duckdb_path)
+    write_trend_bars(tmp_duckdb_path, drift=0.0)
     build_spec_file(tmp_path)
     costs = load_execution_costs_config(str(write_costs_config(tmp_path / "execution_costs.yaml")))
 
-    def _build(request, windows=(), judge=JUDGE):
+    def _build(request, windows=(), judge=JUDGE, history_db=tmp_duckdb_path):
         return build_cohort_spec(request_body(request, TODAY), config=CONFIG, judge=judge,
                                  universe_accessor=UniverseAccessor(tmp_duckdb_path, "Universes"),
-                                 costs_config=costs, repo_root=tmp_path, registry=Windows(windows))
+                                 costs_config=costs, repo_root=tmp_path, registry=Windows(windows),
+                                 history_db=history_db)
     return _build
 
 
@@ -83,6 +86,19 @@ def test_bad_requests_are_refused_by_code(build, request_raw, code):
     with pytest.raises(RequestRefused) as refused:
         build(request_raw)
     assert refused.value.code == code
+
+
+def test_a_request_without_its_bars_is_refused_retryable(build, tmp_path):
+    with pytest.raises(RequestRefused) as refused:
+        build(raw(), history_db=str(tmp_path / "empty.duckdb"))
+    assert (refused.value.code, refused.value.retryable) == ("BARS_MISSING", True)
+    assert "no 15 mins bars" in refused.value.detail and "SPY" in refused.value.detail
+
+
+def test_other_refusals_are_not_retryable(build):
+    with pytest.raises(RequestRefused) as refused:
+        build(raw(strategy_key="strategies/other.py:Other"))
+    assert refused.value.retryable is False
 
 
 def test_a_revealed_window_blocks_any_holdout_that_does_not_start_after_it(build):
@@ -137,7 +153,8 @@ def test_a_walk_forward_the_calendar_cannot_build_is_refused_as_spec_invalid(tmp
     with pytest.raises(RequestRefused) as refused:
         build_cohort_spec(request_body(raw(), TODAY), config=too_many_folds, judge=JUDGE,
                           universe_accessor=UniverseAccessor(tmp_duckdb_path, "Universes"),
-                          costs_config=costs, repo_root=tmp_path, registry=Windows())
+                          costs_config=costs, repo_root=tmp_path, registry=Windows(),
+                          history_db=tmp_duckdb_path)
     assert refused.value.code == "SPEC_INVALID" and "walk_forward" in refused.value.detail
 
 
@@ -167,7 +184,8 @@ def test_a_period_the_calendar_does_not_cover_is_refused_as_spec_invalid(tmp_pat
     with pytest.raises(RequestRefused) as refused:
         build_cohort_spec(request_body(raw(), TODAY), config=before_the_calendar, judge=JUDGE,
                           universe_accessor=UniverseAccessor(tmp_duckdb_path, "Universes"),
-                          costs_config=costs, repo_root=tmp_path, registry=Windows())
+                          costs_config=costs, repo_root=tmp_path, registry=Windows(),
+                          history_db=tmp_duckdb_path)
     assert refused.value.code == "SPEC_INVALID" and "period" in refused.value.detail
 
 

@@ -93,8 +93,8 @@ class EvaluationService:
             return _submit_reply("REFUSED", code="REQUEST_INVALID", detail="kind must be INITIAL or RENEWAL")
         try:
             body = request_body({k: v for k, v in raw.items() if k != "kind"}, self._today())
-        except RequestRefused as refusal:
-            return _submit_reply("REFUSED", code=refusal.code, detail=refusal.detail)   # nothing is claimed
+        except RequestRefused as refusal:                       # nothing is claimed
+            return _submit_reply("REFUSED", code=refusal.code, detail=refusal.detail, retryable=refusal.retryable)
         request_id = evaluation_request_id(body)
         with self._submit_lock:
             row = self._store.get(request_id)
@@ -116,8 +116,8 @@ class EvaluationService:
                 return self._accept(request_id, {"status": "EXISTING", "claim": held})
         try:
             spec = self._build_spec(body)
-        except RequestRefused as refusal:
-            return _submit_reply("REFUSED", code=refusal.code, detail=refusal.detail)   # nothing is claimed
+        except RequestRefused as refusal:                       # nothing is claimed
+            return _submit_reply("REFUSED", code=refusal.code, detail=refusal.detail, retryable=refusal.retryable)
         if self._store.count(OPEN_STATES) >= self._queue_max:
             return _submit_reply("REFUSED", request_id, code="QUEUE_FULL",
                                  detail=f"{self._queue_max} evaluations are already waiting", retryable=True)

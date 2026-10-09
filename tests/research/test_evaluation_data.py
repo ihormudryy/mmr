@@ -4,11 +4,13 @@ import pandas as pd
 import pytest
 
 from tests.research.evaluation_fixtures import (
-    build_spec_file, write_benchmark_bars, write_costs_config, write_universe,
+    CONIDS, build_spec_file, write_benchmark_bars, write_costs_config, write_trend_bars, write_universe,
 )
 from trader.data.duckdb_store import DuckDBDataStore
 from trader.data.universe import UniverseAccessor
-from trader.research.evaluation_data import EvaluationDataError, load_benchmark_closes
+from trader.research.evaluation_data import (
+    BarsMissing, EvaluationDataError, load_benchmark_closes, require_bars_available,
+)
 from trader.research.market_context import BENCHMARK_CONID
 from trader.research.evaluation_spec import load_evaluation_spec
 from trader.simulation.execution_costs import load_execution_costs_config
@@ -58,3 +60,51 @@ def test_duplicate_spy_sessions_are_refused(tmp_path, tmp_duckdb_path):
                                name='date')))
     with pytest.raises(EvaluationDataError, match=rf'756733.*{duplicate_day.isoformat()}.*re-download'):
         load_benchmark_closes(tmp_duckdb_path, spec)
+
+
+def test_full_history_passes_the_bars_check(tmp_path, tmp_duckdb_path):
+    write_universe(tmp_duckdb_path)
+    write_trend_bars(tmp_duckdb_path, drift=0.0)
+    require_bars_available(tmp_duckdb_path, _spec(tmp_path, tmp_duckdb_path))
+
+
+def test_a_conid_without_bars_is_named(tmp_path, tmp_duckdb_path):
+    write_universe(tmp_duckdb_path)
+    write_trend_bars(tmp_duckdb_path, drift=0.0, conids=CONIDS[:-1])
+    with pytest.raises(BarsMissing, match=rf'conid {CONIDS[-1]}: no 15 mins bars'):
+        require_bars_available(tmp_duckdb_path, _spec(tmp_path, tmp_duckdb_path))
+
+
+def test_bars_that_stop_before_the_period_end_are_stale(tmp_path, tmp_duckdb_path):
+    write_universe(tmp_duckdb_path)
+    write_trend_bars(tmp_duckdb_path, drift=0.0, end='2024-03-27')
+    with pytest.raises(BarsMissing, match=r'15 mins bars end 2024-03-27, need 2024-03-28'):
+        require_bars_available(tmp_duckdb_path, _spec(tmp_path, tmp_duckdb_path))
+
+
+def test_bars_that_start_after_the_period_start_are_missing(tmp_path, tmp_duckdb_path):
+    write_universe(tmp_duckdb_path)
+    write_trend_bars(tmp_duckdb_path, drift=0.0, start='2024-02-05')
+    with pytest.raises(BarsMissing, match=r'15 mins bars start 2024-02-05, need 2024-02-01'):
+        require_bars_available(tmp_duckdb_path, _spec(tmp_path, tmp_duckdb_path))
+
+
+def test_daily_bars_never_count_as_intraday_bars(tmp_path, tmp_duckdb_path):
+    write_universe(tmp_duckdb_path)
+    write_benchmark_bars(tmp_duckdb_path)
+    days = pd.DatetimeIndex(pd.bdate_range('2024-01-02', '2024-03-28', tz='UTC'), name='date')
+    for conid in CONIDS:
+        DuckDBDataStore(tmp_duckdb_path).write(str(conid), pd.DataFrame(
+            {'open': 1.0, 'high': 1.0, 'low': 1.0, 'close': 1.0, 'volume': 1.0, 'bar_size': '1 day'}, index=days))
+    with pytest.raises(BarsMissing, match=r'no 15 mins bars'):
+        require_bars_available(tmp_duckdb_path, _spec(tmp_path, tmp_duckdb_path))
+
+
+def test_short_spy_daily_history_is_missing(tmp_path, tmp_duckdb_path):
+    write_universe(tmp_duckdb_path)
+    write_trend_bars(tmp_duckdb_path, drift=0.0)
+    store = DuckDBDataStore(tmp_duckdb_path)
+    store.delete(str(BENCHMARK_CONID))
+    write_benchmark_bars(tmp_duckdb_path, start='2024-01-02')
+    with pytest.raises(BarsMissing, match=r'SPY \(conid 756733\): 1 day bars start 2024-01-02'):
+        require_bars_available(tmp_duckdb_path, _spec(tmp_path, tmp_duckdb_path))

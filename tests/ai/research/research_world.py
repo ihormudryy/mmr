@@ -258,7 +258,8 @@ class ResearchWorld:
 
         def build_spec(body):
             return build_cohort_spec(body, config=config, judge=judge, universe_accessor=universe,
-                                     costs_config=costs, repo_root=self.repo, registry=self.registry)
+                                     costs_config=costs, repo_root=self.repo, registry=self.registry,
+                                     history_db=bars)
 
         self.evaluations = EvaluationService(
             store=store, trader=self.trader_port, build_spec=build_spec,

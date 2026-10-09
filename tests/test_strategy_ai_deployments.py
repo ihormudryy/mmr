@@ -1,9 +1,11 @@
 """SP2c Plan 2 Task 9: the strategy service loads active AI deployments from the exact judged bytes."""
 from __future__ import annotations
 
+import asyncio
 import datetime as dt
 import logging
 import os
+import threading
 from types import SimpleNamespace
 
 import pandas as pd
@@ -14,6 +16,7 @@ from tests.sp1_acceptance.conftest import loop_thread  # noqa: F401
 from tests.sp1_fixtures import served_stack
 from tests.strategy.ai_deployment_fixtures import StrategyNode
 from tests.test_strategy_artifact_soft_load import _make_runtime, _write_strategy
+from tests.test_strategy_runtime import _make_ticker
 from trader.acceptance.scenario import AcceptanceSettings, deployment_record
 from trader.data.backtest_store import compute_strategy_hash
 from trader.data.duckdb_store import DuckDBConnection
@@ -401,3 +404,62 @@ def test_the_runtime_reconcile_feeds_the_instance_only_after_its_history(history
     history_rt._reconcile_sync()
     assert dispatchable_during_history and not any(dispatchable_during_history)
     assert history_rt.strategies[CONID] == [instance_of(history_rt)]
+
+
+def wire_runtime_reconcile(rt, path, deployments):
+    rt._ai_deployment_source = source(rt, deployments)
+    rt._trader_gateway.publish_instrument = lambda conid, delayed: None
+    rt._config_mtime = 0.0
+    rt.strategy_config_file = os.path.join(os.path.dirname(path), "missing.yaml")
+    rt._revisions = None
+    rt._drain_ack_outbox = lambda: None
+
+
+def bar_recording_strategy(rt, record):
+    """A strategy file whose on_prices appends to ``record``, so a bar reaching it leaves a trace."""
+    path = os.path.join(rt.strategies_directory, "vwap_reclaim_cat.py")
+    with open(path, "w") as f:
+        f.write("from trader.trading.strategy import Strategy\n\n"
+                "class VwapReclaimCat(Strategy):\n"
+                "    def on_prices(self, prices):\n"
+                f"        open({str(record)!r}, 'a').write('bar\\n')\n"
+                "        return None\n")
+    return path
+
+
+class HeldHistoryClient(FakeHistoryClient):
+    """Holds every request until ``release`` is set, so a second reconcile can run meanwhile."""
+    def __init__(self):
+        super().__init__()
+        self.entered, self.requested, self.release = 0, threading.Event(), threading.Event()
+
+    async def get_contract_history(self, **request):
+        self.entered += 1
+        self.requested.set()
+        while not self.release.is_set():
+            await asyncio.sleep(0.01)
+        return await super().get_contract_history(**request)
+
+
+def test_an_overlapping_reconcile_neither_feeds_nor_backfills_an_instance_still_loading(history_rt, tmp_path):
+    record = tmp_path / "on_prices.log"
+    path = bar_recording_strategy(history_rt, record)
+    history = HeldHistoryClient()
+    history_rt.historical_data_client = history
+    history_rt._pending_signals = {}
+    history_rt._hist_bars[(CONID, ONE_MIN)] = backfilled_bars().tz_convert("UTC")   # a bar would reach on_prices
+    wire_runtime_reconcile(history_rt, path, [active(path)])
+    reconcile_a = threading.Thread(target=history_rt._reconcile_sync)
+    reconcile_a.start()
+    try:
+        assert history.requested.wait(5)
+        history_rt._reconcile_sync()                                   # reconcile B, while A waits on IB
+        history_rt.on_ticker_next(_make_ticker(conid=CONID, symbol="AAPL"))
+        assert not record.exists()
+        assert history_rt.strategies.get(CONID, []) == [] and history_rt.ai_instances() == {}
+        assert history.entered == 1
+    finally:
+        history.release.set()
+        reconcile_a.join(10)
+    assert history_rt.strategies[CONID] == [instance_of(history_rt)]
+

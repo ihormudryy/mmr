@@ -56,7 +56,7 @@ from trader.strategy.strategy_revisions import StrategyCommandReceipt, StrategyR
 from trader.strategy.trader_gateway import StrategyTraderGateway
 from trader.trading.strategy import Signal, Strategy, StrategyConfig, StrategyContext, StrategyState
 from decimal import Decimal
-from typing import Any, cast, Dict, List, Optional
+from typing import Any, cast, Dict, List, Optional, Set
 
 import asyncio
 import backoff
@@ -584,6 +584,9 @@ class StrategyRuntime():
         self.historical_data_client: IBHistoryWorker
         # The service loop, set in run(): the reconcile thread runs AI history backfills on it.
         self._loop: Optional[asyncio.AbstractEventLoop] = None
+        # AI instance names whose history backfill is running; two reconciles may overlap.
+        self._ai_backfills: Set[str] = set()
+        self._ai_backfill_lock = threading.Lock()
 
     def create_strategy_exception(self, exception_type: type, message: str, inner: Optional[Exception]):
         # todo use reflection here to automatically populate trader runtime vars that we care about
@@ -871,26 +874,40 @@ class StrategyRuntime():
         return {s.name: s for s in self.strategy_implementations if getattr(s, 'ai_deployment_version', None)}
 
     def load_ai_deployment(self, deployment) -> bool:
-        """Load one active deployment from the exact bytes the trader judged; False when it does not load."""
+        """Load one active deployment from the exact bytes the trader judged; False when it does not load.
+
+        The instance joins the runtime only once its history is in, so no reconcile subscribes it and
+        no bar reaches it before. A deployment whose backfill is already running counts as loading.
+        """
         name = ai_instance_name(deployment.version_digest)
-        self.load_strategy(
+        with self._ai_backfill_lock:
+            if name in self._ai_backfills or self.get_strategy(name) is not None:
+                return True
+            self._ai_backfills.add(name)
+        try:
+            return self._load_ai_instance(name, deployment)
+        finally:
+            with self._ai_backfill_lock:
+                self._ai_backfills.discard(name)
+
+    def _load_ai_instance(self, name: str, deployment) -> bool:
+        instance = self.load_strategy(
             name=name, bar_size_str=deployment.bar_size, conids=list(deployment.conids), universe=None,
             historical_days_prior=AI_HISTORY_DAYS, module=deployment.strategy_path.removeprefix('strategies/'),
             class_name=deployment.class_name, description=f'AI deployment {deployment.version_digest}',
             paper_only=True, auto_execute=False, params=dict(deployment.params),
             ai_binding=AiInstanceBinding(deployment.version_digest, deployment.base_digest,
                                          deployment.strategy_digest))
-        instance = self.get_strategy(name)
         if instance is None:
             return False
-        # Not yet in any dispatch bucket (reconcile subscribes after this returns), so no bar reaches it first.
         try:
             self._load_ai_history(instance)
         except Exception as ex:
-            logging.error('AI_HISTORY_BACKFILL_FAILED: %s (conids %s, %s): %s; unloaded, the next reconcile retries',
-                          name, instance.conids, instance.bar_size, ex)
-            self.unload_strategy(name)
+            logging.error('AI_HISTORY_BACKFILL_FAILED: %s (conids %s, %s): %s; not loaded, the next reconcile '
+                          'retries', name, instance.conids, instance.bar_size, ex)
+            sys.modules.pop(f'_mmr_strategy_{name}', None)
             return False
+        self.strategy_implementations.append(instance)
         return True
 
     def _load_ai_history(self, instance: Strategy) -> None:
@@ -1574,22 +1591,25 @@ class StrategyRuntime():
         from the DB into the priming cache, normalized to the live schema so it
         concatenates cleanly with resampled ticks. Marks the key as primed even
         on no-data so we don't re-read the DB on every tick."""
-        from trader.data.duckdb_store import DuckDBDataStore
-        from trader.data.market_data import normalize_historical
         key = (conId, bar_size)
         self._hist_bars[key] = pd.DataFrame()   # mark primed (default empty)
         try:
-            ds = DuckDBDataStore(self.history_duckdb_path)
-            end = dt.datetime.now(dt.timezone.utc)
-            start = end - dt.timedelta(days=max(self._tick_retention_days, 5) + 5)
-            df = ds.read(str(conId), start=start, end=end, bar_size=str(bar_size))
-            if df is not None and not df.empty:
-                norm = normalize_historical(df)
-                idx = norm.index
-                norm.index = idx.tz_localize('UTC') if idx.tz is None else idx.tz_convert('UTC')
-                self._hist_bars[key] = norm
+            self._hist_bars[key] = self._read_hist_bars(conId, bar_size)
         except Exception as ex:
             logging.warning('could not prime hist bars for conId %s %s: %s', conId, bar_size, ex)
+
+    def _read_hist_bars(self, conId: int, bar_size: BarSize) -> pd.DataFrame:
+        """Recent historical bars for (conId, bar_size) from the DB in the live UTC schema; raises on a read error."""
+        from trader.data.duckdb_store import DuckDBDataStore
+        from trader.data.market_data import normalize_historical
+        end = dt.datetime.now(dt.timezone.utc)
+        start = end - dt.timedelta(days=max(self._tick_retention_days, 5) + 5)
+        df = DuckDBDataStore(self.history_duckdb_path).read(str(conId), start=start, end=end, bar_size=str(bar_size))
+        if df is None or df.empty:
+            return pd.DataFrame()
+        bars = normalize_historical(df)
+        bars.index = bars.index.tz_localize('UTC') if bars.index.tz is None else bars.index.tz_convert('UTC')
+        return bars
 
     def _strategy_frame(self, conId: int, bar_size: BarSize) -> Optional[pd.DataFrame]:
         """The OHLCV frame a bar-based strategy should see: historical priming
@@ -2050,7 +2070,12 @@ class StrategyRuntime():
         auto_execute: 'bool | str' = False,
         params: Optional[Dict] = None,
         ai_binding: Optional[AiInstanceBinding] = None,
-    ) -> None:
+    ) -> Optional[Strategy]:
+        """Load and return one strategy; None when it is refused or fails.
+
+        A config strategy joins the runtime here; an AI instance joins only after its history
+        (``load_ai_deployment``).
+        """
 
         # Skip if strategy with this name already loaded
         if any(s.name == name for s in self.strategy_implementations):
@@ -2223,7 +2248,9 @@ class StrategyRuntime():
                 elif ai_binding is not None:
                     instance.enable()
 
-                self.strategy_implementations.append(cast(Strategy, instance))
+                if ai_binding is None:
+                    self.strategy_implementations.append(cast(Strategy, instance))
+                return cast(Strategy, instance)
 
         except Exception as ex:
             # Load failures used to be swallowed at DEBUG; a config typo could

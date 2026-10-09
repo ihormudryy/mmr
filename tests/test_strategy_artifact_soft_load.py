@@ -10,6 +10,7 @@ from __future__ import annotations
 import datetime as dt
 import logging
 import os
+import threading
 from types import SimpleNamespace
 from unittest.mock import MagicMock
 
@@ -43,6 +44,8 @@ def _make_runtime(tmp_path, tmp_duckdb_path, *, automation_enabled: bool):
     rt.automation_expected_artifact_id = ""
     rt.automation_public_key_ring_path = ""
     rt._artifact_verifier = None
+    rt._ai_backfills = set()
+    rt._ai_backfill_lock = threading.Lock()
     os.makedirs(rt.strategies_directory, exist_ok=True)
     return rt
 

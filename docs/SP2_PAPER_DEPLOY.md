@@ -27,7 +27,7 @@ Tickets: checklist #104, deploy #105, paper soak #106, SP1 acceptance #35.
 3. Add your model key to `.env`, for example `OPENROUTER_API_KEY=...`. Compose passes it to the `ai` container.
 4. Alpaca keys are set (`./docker.sh -u` prints "set" for Alpaca). Research and discovery need them.
 5. One-strategy automation is off: `automation.enabled: false` in `~/.config/mmr/trader.yaml`. Both on refuses every entry.
-6. AGENTS.md says no `ai_paper` entry before #49 (gross reservations) is merged and verified. You confirm that.
+6. Gross reservations for in-flight entries (issue #49) are fixed by merged PR #52. Nothing to do.
 7. The paper account is flat: `mmr --json portfolio` shows no position, `mmr --json orders` shows no working order.
 8. Back up: `./docker.sh -B before_sp2`
    - check: it prints "Backup complete". It copies the `*.duckdb` files of the data volume only (not `ai.duckdb`, not the research DB).
@@ -123,7 +123,7 @@ Config templates are copied only when a file is missing, so your old files lack 
    ```
    - The evaluation reads about 690 sessions of each `bar_size`; SPY needs 220 more daily sessions. Both day counts are my estimate.
    - `mmr data download` puts the symbols in the `downloads` universe. The scheduler refreshes it daily at 20:30 ET (`us_top20_daily`).
-   - Only `1 day` and `1 min` have refresh jobs. For another bar size, add a job to `~/.config/mmr/data_refresh.yaml` and its name to
+   - Only `1 day` (365 days) and `1 min` (90 days) have refresh jobs (ticket #111 tracks research bar sizes). For another bar size, add a job to `~/.config/mmr/data_refresh.yaml` and its name to
      `data_refresh_us` in `~/.config/mmr/pycron.yaml`.
    - check: `docker compose run --rm scheduler mmr data status` shows a recent last bar date for every universe.
 

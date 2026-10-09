@@ -112,6 +112,8 @@ class AiDeploymentVersionStore:
         self._journal = journal
         self._db = journal.db
         self._now = now
+        # Built once when the trader starts: a send of an earlier process can never return or be re-sent.
+        self._process_started_at = now()
 
     def seal_in_tx(self, conn, version: DeploymentVersion, *, request_digest: str, principal: str,
                    command_id: str) -> tuple[str, bool]:
@@ -193,13 +195,15 @@ class AiDeploymentVersionStore:
         """Command ids of entries bound to this version whose broker send has not returned.
 
         The saga row is SUBMITTING from its send gate until ``send_returned_at`` is written; the decision row
-        carries the version the entry was admitted under."""
+        carries the version the entry was admitted under. ``submit_bracket`` is called once, right after that
+        commit in the same process, and no restart sends again: a row older than this process is not in flight."""
         rows = conn.execute(
             "SELECT s.command_id FROM automated_order_sagas s "
             "JOIN ai_paper_decisions d ON d.command_id = s.command_id "
             "WHERE d.deployment_version = ? AND s.state = 'SUBMITTING' "
-            "AND json_extract_string(s.payload, '$.send_returned_at') IS NULL ORDER BY s.command_id",
-            [digest]).fetchall()
+            "AND json_extract_string(s.payload, '$.send_returned_at') IS NULL AND s.updated_at >= ? "
+            "ORDER BY s.command_id",
+            [digest, self._process_started_at]).fetchall()
         return tuple(row[0] for row in rows)
 
     def withdraw(self, digest: str, *, reason: str, principal: str, command_id: str) -> bool:

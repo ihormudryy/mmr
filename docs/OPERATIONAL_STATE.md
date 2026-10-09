@@ -646,6 +646,18 @@ Do not arm a second automatic strategy. Do not set `automation.live_enabled`.
 3. Make sure the `research` service runs (see "Research service (SP2c Plan 3)" above) and an experiment exists (`mmr experiment start`; `mmr experiment pause` keeps entries off). Without an experiment a slot is `SKIPPED` (`NO_EXPERIMENT`).
 4. Recreate `ai` and `research`: `docker compose --profile ai up -d --force-recreate ai research` (`./docker.sh -b -u` does not touch them). A bad `research:` block stops `ai` at start. The error names the field (`RESEARCH_MENU_EMPTY`, `RESEARCH_UNIVERSE_INVALID`, `RESEARCH_BAR_SIZE_INVALID`, `RESEARCH_BAR_SIZE_TOO_LONG`, `RESEARCH_DUPLICATE_STRATEGY`).
 
+**Daily bars for every conid (important).** The trader checks the liquidity of an ENTER from its local daily bars only (`production_evidence.py`, `liquidity_from_history`). There is no Alpaca fallback. So every conid in a research universe must also be in a universe that the scheduler refreshes with a daily job. The jobs are in `data_refresh.yaml` (`bar_size: "1 day"`) and the cron entries in `pycron.yaml` (`data_refresh_us`, `data_refresh_asx`). A conid with no daily history gets its ENTER refused with `HISTORY_INVALID`, after a good backtest. Check with `mmr data status` (in the scheduler container, see below).
+
+**History an evaluation needs (more than daily bars).** An evaluation reads `research_service.period_sessions` sessions (default 690, the last 90 are the holdout) of the candidate's own bar size for every conid, about 1,000 calendar days, and SPY daily bars from 220 sessions before the period start, about 1,330 days (`trader/research/evaluation_data.py`). It reads regular-session bars only; the pre- and post-market bars that Alpaca stores are kept but ignored. The `data_refresh_research` cron entry (21:15 ET weekdays) runs the `research_*` jobs (`research_daily`, `research_1min`, `research_5mins`, `research_15mins`) over a `research` universe. Set it up once, inside the scheduler container (the bars live in the `mmr_db_data` volume, not on the host):
+
+```bash
+docker compose run --rm scheduler mmr universe create research
+docker compose run --rm scheduler mmr universe add research <the symbols of every ai.yaml research.universes conid> SPY
+docker compose run --rm scheduler mmr universe show research   # each conid must equal the ai.yaml one
+docker compose run --rm scheduler mmr data refresh research_daily research_1min research_5mins research_15mins
+```
+
+Keep the `research` universe in step with `ai.yaml` by hand: the scheduler does not read `ai.yaml`. Run the refresh once by hand before `research.enabled: true`; the first 1-min run is large. Until the bars are there (a regular-session bar on the period's first and last session for each conid), the research service refuses the submit with `BARS_MISSING` (retryable, nothing is claimed). The `ai` service sends it again every poll and logs a WARNING each time; a candidate that never gets its bars closes `STALE_NOT_SUBMITTED`.
 
 ### Watch it
 

@@ -36,6 +36,7 @@ from trader.research.evaluation_service import EvaluationService
 from trader.research.experiment_registry import ExperimentRegistry
 from trader.research.judgment_attest import JudgmentAttest, is_paper_posture
 from trader.research.key_purpose import default_rpc_keys_dir
+from trader.research.renewal_service import RenewalRequests
 from trader.research.research_surface import build_research_registry
 from trader.research.schema import apply_research_migrations
 from trader.research.service_config import load_research_service_config
@@ -110,13 +111,16 @@ def build_runtime(*, config_path: str, environ: Mapping[str, str], now: Callable
         return build_cohort_spec(body, config=config, judge=judge, universe_accessor=universe, costs_config=costs,
                                  repo_root=root, registry=registry)
 
+    attest = JudgmentAttest(research_db=db, store=store, trader=trader, signer=signer, artifacts_root=ARTIFACTS_ROOT,
+                            repo_root=root, is_paper=lambda: is_paper_posture(environ, raw), now=now)
+    renewals = RenewalRequests(store=store, trader=trader, signer=signer, artifacts_root=ARTIFACTS_ROOT,
+                               repo_root=root, judge=judge, warmup_sessions=judge.shadow_warmup_sessions,
+                               incomplete_after_hours=config.shadow_incomplete_after_hours, now=now)
     evaluations = EvaluationService(
         store=store, trader=trader, build_spec=build_spec,
         evaluate=lambda spec: evaluate_cohort(spec, research_db=db, paths=paths, now=now), signer=signer,
         artifacts_root=ARTIFACTS_ROOT, warmup_sessions=judge.shadow_warmup_sessions,
-        order_notional=config.order_notional, queue_max=config.queue_max, now=now)
-    attest = JudgmentAttest(research_db=db, store=store, trader=trader, signer=signer, artifacts_root=ARTIFACTS_ROOT,
-                            repo_root=root, is_paper=lambda: is_paper_posture(environ, raw), now=now)
+        order_notional=config.order_notional, queue_max=config.queue_max, now=now, renewals=renewals)
     shadow = ShadowReplay(store=store, trader=trader, signer=signer, artifacts_root=ARTIFACTS_ROOT, paths=paths,
                           registry=registry, config=config, judge=judge, now=now)
     rpc = build_research_registry(evaluations=evaluations, attest=attest)

@@ -29,11 +29,16 @@ NOT_JUDGED_REFUSALS = frozenset({"BUDGET_CAP_UNKNOWN"})     # the cap gate close
 _DIGEST = re.compile(DIGEST)
 
 
-def judgment_id_for(case_digest: str) -> str:
-    """One judgment per case (spec 5.2 item 2): the id follows from the case, so a retry reuses it."""
+JUDGMENT_KINDS = ("INITIAL", "RENEWAL")
+
+
+def judgment_id_for(case_digest: str, kind: str = "INITIAL") -> str:
+    """One judgment per case (spec 5.2 item 2): the id follows from the kind and the case, so a retry reuses it."""
+    if kind not in JUDGMENT_KINDS:
+        raise ValueError(f"unknown judgment kind {kind!r}")
     if not _DIGEST.fullmatch(case_digest):
         raise ValueError("a case digest is sha256: and 64 lower-case hex characters")
-    return "jdg-" + hashlib.sha256(f"INITIAL|{case_digest}".encode("utf-8")).hexdigest()[:32]
+    return "jdg-" + hashlib.sha256(f"{kind}|{case_digest}".encode("utf-8")).hexdigest()[:32]
 
 
 @dataclass(frozen=True)
@@ -44,8 +49,6 @@ class BacktestCase:
     def __post_init__(self) -> None:
         if not isinstance(self.case_digest, str) or not _DIGEST.fullmatch(self.case_digest):
             raise WireError("case: the digest is not sha256: and 64 lower-case hex characters")
-        if self.summary.kind != "INITIAL":
-            raise WireError(f"case: a {self.summary.kind} case is not judged here (renewals are Plan 5)")
 
     def to_json(self) -> dict:
         return {"case_digest": self.case_digest, "summary": self.summary.model_dump(mode="json")}
@@ -151,8 +154,11 @@ def judgment_body(judgment_id: str, case: BacktestCase, decision: JudgmentDecisi
     deploy = decision.verdict == "DEPLOY"
     if deploy and (decision.review is None or decision.menu != FULL_MENU):
         raise ValueError("a DEPLOY needs the full review and a menu that offered DEPLOY")
-    return {"judgment_id": judgment_id, "case_digest": case.case_digest, "kind": "INITIAL",
-            "renewal_of_version": None, "verdict": decision.verdict, "menu": list(decision.menu),
+    kind, prior = case.summary.kind, case.summary.prior_version_digest
+    if (kind == "RENEWAL") != (prior is not None):
+        raise ValueError("a RENEWAL judgment names its prior version; an INITIAL one names none")
+    return {"judgment_id": judgment_id, "case_digest": case.case_digest, "kind": kind,
+            "renewal_of_version": prior, "verdict": decision.verdict, "menu": list(decision.menu),
             "jev_model": jev_model,
             "jev_attempt_ref": None if decision.attempt_key is None else attempt_ref(decision.attempt_key),
             "decided_at": decided_at.astimezone(dt.timezone.utc).isoformat(),

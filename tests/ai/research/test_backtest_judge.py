@@ -5,7 +5,7 @@ import json
 import pytest
 import pytest_asyncio
 
-from tests.ai.research.cases import CASE, summary
+from tests.ai.research.cases import CASE, RENEWAL_CASE, V1, renewal_summary, summary
 from tests.ai.research.rig import EXPERIMENT, NARRATIVE, Rig, ruling
 from trader.ai.backtest_judge import (NO_DEPLOY_MENU, BacktestCase, JudgmentDecision, NotJudged, jev_menu,
                                       judgment_body, judgment_id_for, replay_backtest_judgment)
@@ -74,16 +74,42 @@ def test_the_judgment_id_needs_a_real_digest():
             judgment_id_for(wrong)
 
 
+def renewal_case(complete=True):
+    return BacktestCase(RENEWAL_CASE, parse_reply(CaseSummary, "case", renewal_summary(complete=complete)))
+
+
+def test_the_judgment_id_follows_from_the_kind_and_the_case():
+    renewal = judgment_id_for(CASE, "RENEWAL")
+    assert renewal.startswith("jdg-") and len(renewal) == 36 and renewal != JUDGMENT == judgment_id_for(CASE, "INITIAL")
+    with pytest.raises(ValueError):
+        judgment_id_for(CASE, "SHADOW")
+    with pytest.raises(ValueError):
+        judgment_id_for("abc", "RENEWAL")
+
+
 @pytest.mark.asyncio
-async def test_a_renewal_summary_is_never_judged_as_an_initial_case(rig):
-    renewal = summary()
-    renewal["kind"] = "RENEWAL"
-    parsed = parse_reply(CaseSummary, "case", renewal)
-    with pytest.raises(WireError):
-        BacktestCase(CASE, parsed)
-    with pytest.raises(WireError):
-        BacktestCase.from_json({"case_digest": CASE, "summary": renewal})
-    assert rig.jev.requests == []
+async def test_a_renewal_case_is_judged_and_replayed(rig):                    # Plan 5 preflight ruling (D13)
+    judged = renewal_case()
+    assert BacktestCase.from_json(judged.to_json()) == judged and jev_menu(judged) == ("DEPLOY", "SHADOW", "REJECT")
+    assert jev_menu(renewal_case(complete=False)) == NO_DEPLOY_MENU
+    renewal_judgment = judgment_id_for(RENEWAL_CASE, "RENEWAL")
+    rig.jev.script(BACKTEST_MARKER, ruling("DEPLOY"))
+    live = await rig.judge.judge(renewal_judgment, judged, experiment_id=EXPERIMENT)
+    body = judgment_body(renewal_judgment, judged, live, jev_model="m", decided_at=NOW)
+    assert (body["kind"], body["renewal_of_version"], body["verdict"]) == ("RENEWAL", V1, "DEPLOY")
+    RecordBacktestJudgmentRequest.model_validate(body)
+    counter = ExternalAdapterCounter()
+    replayed = await replay_backtest_judgment(rig.store, renewal_judgment, config=rig.config, counter=counter)
+    assert (replayed.status, replayed.value, counter.total) == (COMPLETE, live.summary(), 0)
+
+
+@pytest.mark.parametrize("kind, prior", [("RENEWAL", None), ("INITIAL", V1)])
+def test_a_judgment_body_needs_a_prior_version_exactly_for_a_renewal(kind, prior):
+    fields = {**summary(), "kind": kind, "prior_version_digest": prior}
+    wrong = BacktestCase(CASE, parse_reply(CaseSummary, "case", fields))
+    with pytest.raises(ValueError):
+        judgment_body(JUDGMENT, wrong, JudgmentDecision("SHADOW", "JEV_SHADOW", ("DEPLOY", "SHADOW", "REJECT")),
+                      jev_model="m", decided_at=NOW)
 
 
 @pytest.mark.asyncio

@@ -11,7 +11,8 @@ from tests.automation.backtest_judge_fixtures import (
 )
 from tests.rpc_identity_fixtures import ALLOW_ALL, ServedStack, build_full_production_registry, make_identities
 from trader.automation.evaluation_claims import EvaluationClaims
-from trader.automation.forward_evidence import NoDeploymentVersions
+from trader.automation.backtest_judgments import JudgmentRefused
+from trader.automation.forward_evidence import ForwardEvidenceRefused, NoDeploymentVersions
 from trader.data.duckdb_store import DuckDBConnection
 from trader.messaging.backtest_judge_surface import register_backtest_judge_surface
 from trader.messaging.principals import SERVER_ACCEPTS, TRADER_ACL
@@ -63,10 +64,10 @@ class HeldFirstReply:
         return getattr(self._claims, name)
 
 
-def serve(w, *, claims=None, acl=TRADER_ACL) -> ServedStack:
+def serve(w, *, claims=None, acl=TRADER_ACL, judgments=None, forward_evidence=None) -> ServedStack:
     registry = TypedRpcRegistry(acl=acl, default_execution="thread")
-    register_backtest_judge_surface(registry, claims=claims or w.claims, judgments=w.judgments,
-                                    forward_evidence=NoDeploymentVersions())
+    register_backtest_judge_surface(registry, claims=claims or w.claims, judgments=judgments or w.judgments,
+                                    forward_evidence=forward_evidence or NoDeploymentVersions())
     return ServedStack({("trader", "command"): registry, ("trader", "query"): registry}, make_identities())
 
 
@@ -255,6 +256,56 @@ def test_forward_evidence_is_refused_until_versions_exist(served):
     reply = served.client("research", role="query").call(
         "get_deployment_forward_evidence", {"deployment_version": ZERO}, dict)
     assert (reply["status"], reply["code"], reply["evidence"]) == ("REFUSED", "DEPLOYMENT_VERSION_UNKNOWN", None)
+
+
+class RefusingForwardEvidence:
+    def __init__(self, code):
+        self._code = code
+
+    def read(self, deployment_version):
+        raise ForwardEvidenceRefused(self._code, "a sealed record is damaged")
+
+
+class RefusingJudgments:
+    def __init__(self, code):
+        self._code = code
+
+    def record(self, parsed):
+        raise JudgmentRefused(self._code, "a sealed record is damaged")
+
+
+@pytest.mark.parametrize("code", ["FORWARD_EVIDENCE_TAMPERED", "DEPLOYMENT_VERSION_TAMPERED", "JUDGMENT_TAMPERED"])
+def test_a_tampered_forward_evidence_read_is_a_named_rpc_error_not_a_refused_body(w, code):
+    stack = serve(w, forward_evidence=RefusingForwardEvidence(code))
+    try:
+        with pytest.raises(TypedRpcRemoteError) as exc:
+            stack.client("research", role="query").call(
+                "get_deployment_forward_evidence", {"deployment_version": ZERO}, dict)
+        assert exc.value.code == code
+    finally:
+        stack.close()
+
+
+def test_a_business_refusal_of_forward_evidence_stays_a_refused_body(w):
+    stack = serve(w, forward_evidence=RefusingForwardEvidence("RENEWAL_NOT_DUE"))
+    try:
+        reply = stack.client("research", role="query").call(
+            "get_deployment_forward_evidence", {"deployment_version": ZERO}, dict)
+        assert (reply["status"], reply["code"], reply["evidence"]) == ("REFUSED", "RENEWAL_NOT_DUE", None)
+    finally:
+        stack.close()
+
+
+@pytest.mark.parametrize("code", ["FORWARD_EVIDENCE_TAMPERED", "DEPLOYMENT_VERSION_TAMPERED"])
+def test_a_tampered_record_behind_a_judgment_is_a_named_rpc_error(w, code):
+    stack = serve(w, judgments=RefusingJudgments(code))
+    try:
+        with pytest.raises(TypedRpcRemoteError) as exc:
+            stack.client("ai_research", role="command").call(
+                "record_backtest_judgment", judgment(ZERO, "SHADOW").model_dump(), dict)
+        assert exc.value.code == code
+    finally:
+        stack.close()
 
 
 def test_the_full_production_registry_registers_the_six_methods():

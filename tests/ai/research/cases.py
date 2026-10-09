@@ -106,3 +106,44 @@ def version(state="ACTIVE"):
         "version_digest": V1, "base_digest": BASE, "judgment_id": "jdg-00000001", "kind": "INITIAL",
         "prior_version_digest": None, "first_session": "2026-10-09", "expiry_session": "2026-11-05",
         "state": state}}
+
+
+RENEWAL_CASE, RENEWAL_REQUEST, V2 = "sha256:" + "9" * 64, "sha256:" + "8" * 64, "sha256:" + "2" * 64
+
+
+def renewal_forward(complete=True):
+    """renewal_case.forward_summary for three sessions, the last one INCOMPLETE unless ``complete``."""
+    return {"first_session": "2026-09-10", "expiry_session": "2026-10-07", "sessions": 3,
+            "complete": 3 if complete else 2, "incomplete": 0 if complete else 1,
+            "incomplete_reasons": {} if complete else {"BARS_MISSING": 1},
+            "pnl_usd": 15.0 if complete else None, "known_pnl_usd": 15.0 if complete else 10.0,
+            "fees_usd": 3.0 if complete else None, "trades": 6 if complete else None,
+            "worst_session_pnl_usd": 5.0 if complete else None, "end_equity_usd": 100_015.0 if complete else None,
+            "paper_trips": 1, "paper_trips_closed": 1, "paper_trips_unpriced": 0, "paper_net_pnl_usd": 7.5,
+            "paper_fees_complete": True}
+
+
+def renewal_summary(complete=True, prior=V1):
+    """Plan 3's evaluation_summary of a RENEWAL case (Plan 5 Task 5)."""
+    return {**summary(), "kind": "RENEWAL", "stage": "FORWARD_COMPLETE" if complete else "FORWARD_INCOMPLETE",
+            "rules_passed": complete, "holdout_passed": None, "eligibility": None, "renewal_checks_passed": complete,
+            "prior_version_digest": prior, "strategy_trials": 0, "prior_holdouts": 0,
+            "previously_revealed_sessions": 0, "selected_index": None, "error": None, "metrics": {}, "points": [],
+            "rule_results": [], "forward": renewal_forward(complete)}
+
+
+def renewal_done(**fields):
+    return view("DONE", request_id=RENEWAL_REQUEST, case=RENEWAL_CASE, summary_=renewal_summary(**fields))
+
+
+def version_reply(state, version=V1):
+    return {"found": True, "version": {"version_digest": version, "base_digest": BASE, "judgment_id": "jdg-old",
+                                       "kind": "INITIAL", "prior_version_digest": None,
+                                       "first_session": "2026-09-10", "expiry_session": "2026-10-07",
+                                       "state": state}}
+
+
+def renewed():
+    outcome = {**resolved(V2)["outcome"], "kind": "RENEWAL", "first_session": "2026-10-12",
+               "expiry_session": "2026-11-06"}
+    return {**resolved(V2), "outcome": outcome}

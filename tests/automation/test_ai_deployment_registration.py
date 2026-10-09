@@ -71,7 +71,7 @@ class Env:
                                            judgments=self.judgments, cooldowns=self.cooldowns,
                                            max_active=max_active, now=clock)
         self.registrar = AiDeploymentRegistrar(
-            db=self.db, deployments=self.deployments, versions=self.versions, activity=self.activity,
+            journal=journal, deployments=self.deployments, versions=self.versions, activity=self.activity,
             judgments=self.judgments, cooldowns=self.cooldowns, bundles=self.bundles,
             calendar=XNYSCalendarPolicy(), expiry_sessions=20, now=clock)
 
@@ -155,15 +155,19 @@ def test_cooldown_and_cap(env):
 
 
 class RejectLandsWhileWaitingForTheLock:
-    """A journal whose ``transaction`` first records a REJECT: it committed after the early cooldown read."""
+    """A journal whose ``mutate_batch_work`` first records a REJECT: it committed after the registration's early
+    cooldown read and before the seal took the journal write lock."""
 
-    def __init__(self, db, strategy_key, until):
-        self._db, self._strategy_key, self._until = db, strategy_key, until
+    def __init__(self, journal, strategy_key, until):
+        self._journal, self._strategy_key, self._until = journal, strategy_key, until
 
-    def transaction(self, fn):
+    def connect(self):
+        return self._journal.connect()
+
+    def mutate_batch_work(self, conn, work):
         from tests.automation.backtest_judge_fixtures import insert_reject
-        insert_reject(self._db, self._strategy_key, self._until)
-        return self._db.transaction(fn)
+        insert_reject(self._journal.db, self._strategy_key, self._until)
+        return self._journal.mutate_batch_work(conn, work)
 
 
 def test_a_reject_recorded_before_the_registration_transaction_refuses_it(env):
@@ -172,7 +176,7 @@ def test_a_reject_recorded_before_the_registration_transaction_refuses_it(env):
     apply_backtest_judge_migrations(SchemaMigrator(env.db))
     key = "strategies/opening_range_breakout.py:OpeningRangeBreakout"
     env.registrar._cooldowns = Plan1Cooldowns(env.db)
-    env.registrar._db = RejectLandsWhileWaitingForTheLock(env.db, key, dt.date(2026, 10, 22))
+    env.registrar._journal = RejectLandsWhileWaitingForTheLock(env.registrar._journal, key, dt.date(2026, 10, 22))
     env.judge("jdg-1", record())
     assert env.refused("jdg-1", record()) == "FAMILY_COOLING_DOWN"
     assert env.versions.sealed() == ()

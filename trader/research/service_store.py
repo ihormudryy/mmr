@@ -10,6 +10,7 @@ RESEARCH_MIGRATION_CASES = 21
 RESEARCH_MIGRATION_SHADOW = 22
 REQUEST_STATES = ("CLAIMING", "REFUSED", "QUEUED", "RUNNING", "DONE", "FAILED", "PARKED")
 OPEN_STATES = ("QUEUED", "RUNNING")                  # PARKED is terminal and takes no queue slot
+UNREAD = ""                                          # a NOT NULL column whose value was never read
 
 _REQUESTS = ("""CREATE TABLE IF NOT EXISTS research_requests (
     request_id VARCHAR PRIMARY KEY, body_json VARCHAR NOT NULL, strategy_key VARCHAR NOT NULL,
@@ -132,6 +133,31 @@ class ResearchStore:
             if conn.execute("SELECT 1 FROM research_cases WHERE case_digest = ?", [case_digest]).fetchone() is None:
                 conn.execute("INSERT INTO research_cases VALUES (?, ?, ?, ?)",
                              [case_digest, request_id, stage, signed_at])
+        self._db.transaction(tx)
+
+    def record_renewal(self, request_id: str, body: dict, *, strategy_key: str, file_hash: str, case_digest: str,
+                       stage: str, summary: dict, now: dt.datetime) -> None:
+        """A renewal request is DONE at once (Plan 5 rulings 2-3): the request and its case in one transaction."""
+        def tx(conn):
+            if conn.execute("SELECT 1 FROM research_requests WHERE request_id = ?", [request_id]).fetchone():
+                return
+            conn.execute("INSERT INTO research_requests (request_id, body_json, strategy_key, file_hash, state, "
+                         "case_digest, summary_json, created_at, updated_at) VALUES (?, ?, ?, ?, 'DONE', ?, ?, ?, ?)",
+                         [request_id, json.dumps(body, sort_keys=True), strategy_key, file_hash, case_digest,
+                          json.dumps(summary), now, now])
+            conn.execute("INSERT INTO research_cases VALUES (?, ?, ?, ?)", [case_digest, request_id, stage, now])
+        self._db.transaction(tx)
+
+    def record_parked_renewal(self, request_id: str, body: dict, reason: str, *, now: dt.datetime) -> None:
+        """A renewal whose forward evidence the trader called tampered: parked at once, with no case.
+
+        No binding was read, so the strategy key and file hash are stored as UNREAD."""
+        def tx(conn):
+            if conn.execute("SELECT 1 FROM research_requests WHERE request_id = ?", [request_id]).fetchone():
+                return
+            conn.execute("INSERT INTO research_requests (request_id, body_json, strategy_key, file_hash, state, "
+                         "parked_reason, created_at, updated_at) VALUES (?, ?, ?, ?, 'PARKED', ?, ?, ?)",
+                         [request_id, json.dumps(body, sort_keys=True), UNREAD, UNREAD, reason, now, now])
         self._db.transaction(tx)
 
     def case(self, *, case_digest: Optional[str] = None, request_id: Optional[str] = None) -> Optional[dict]:

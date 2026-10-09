@@ -11,6 +11,7 @@ class FakeTrader:
         self.lose_update = {}                 # state -> "request" (never arrives) or "reply" (applied, answer lost)
         self.judgments, self.shadow_rows = {}, {}
         self.shadow_calls, self.refuse_shadow = [], {}    # (judgment_id, session_date) -> (code, retryable)
+        self.forward, self.forward_reads = {}, []
 
     def claim(self, request_id, body):
         existing = self.claims.get(request_id)
@@ -52,6 +53,15 @@ class FakeTrader:
         found = [j for j in self.judgments.values()
                  if j["judgment_id"] == judgment_id or j["case_digest"] == case_digest]
         return dict(found[0]) if found else None
+
+    def forward_evidence(self, version_digest):
+        """Plan 1's get_deployment_forward_evidence reply; Plan 5 owns the evidence shape."""
+        self.forward_reads.append(version_digest)
+        evidence = self.forward.get(version_digest)
+        if evidence is None:
+            return {"status": "REFUSED", "code": "DEPLOYMENT_VERSION_UNKNOWN", "detail": version_digest,
+                    "evidence": None}
+        return {"status": "FOUND", "code": None, "detail": None, "evidence": evidence}
 
     def record_shadow(self, body):
         key = (body["judgment_id"], body["session_date"])

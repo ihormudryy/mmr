@@ -2,12 +2,13 @@
 
 Direct handlers: no command ledger, no controller epoch. The allow-list is not the
 authority; each handler checks its caller again. A business refusal is a reply
-body; a tampered judgment is an RPC error.
+body; a tampered judgment or forward-evidence record is an RPC error.
 """
 from __future__ import annotations
 
 from typing import Any
 
+from trader.automation.ai_paper_actions import is_loud_refusal
 from trader.automation.backtest_judge_wire import (
     ClaimEvaluationRequest, GetBacktestJudgmentRequest, GetDeploymentForwardEvidenceRequest,
     GetEvaluationClaimRequest, RecordBacktestJudgmentRequest, UpdateEvaluationClaimRequest,
@@ -68,6 +69,8 @@ def register_backtest_judge_surface(registry: Any, *, claims: Any, judgments: An
         try:
             evidence = forward_evidence.read(parsed.deployment_version)
         except ForwardEvidenceRefused as refused:
+            if is_loud_refusal(refused.code):       # a tampered record fails loudly, never a reply body
+                raise _DispatchProblem(refused.code, refused.detail) from None
             return {"status": "REFUSED", "code": refused.code, "detail": refused.detail, "evidence": None}
         return {"status": "FOUND", "code": None, "detail": None, "evidence": evidence}
 

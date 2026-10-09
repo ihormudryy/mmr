@@ -261,8 +261,9 @@ exits and open brackets are not touched. While an entry of the version is being 
 `WITHDRAWAL_ENTRY_IN_FLIGHT`, naming the entry's command ids: retry after the entry's send returns (a retry is
 a new command, not a replay). A send left by an earlier trader process (a crash inside the send) does not block it. That entry still goes out; cancel or flatten it if needed. A successful receipt is never followed
 by a new broker plan. It returns `{"version_digest", "withdrawn": true,
-"already_withdrawn"}`; a repeat is safe. A refusal (`WITHDRAWAL_ENTRY_IN_FLIGHT`, `DEPLOYMENT_VERSION_UNKNOWN`,
-`PERMISSION_DENIED`) prints the code and exits 1. A withdrawn version cannot be renewed; trading the strategy again needs a new DEPLOY judgment and registration.
+"already_withdrawn"}`; a repeat is safe. A refusal (`WITHDRAWAL_ENTRY_IN_FLIGHT`, `VERSION_SUPERSEDED`,
+`DEPLOYMENT_VERSION_UNKNOWN`, `PERMISSION_DENIED`) prints the code and exits 1. A version that was already renewed
+is refused with `VERSION_SUPERSEDED`, which names its successor: withdraw that version instead. A withdrawn version cannot be renewed; trading the strategy again needs a new DEPLOY judgment and registration.
 
 ## Command Service Requirements
 

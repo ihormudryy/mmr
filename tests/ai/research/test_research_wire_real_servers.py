@@ -12,6 +12,7 @@ import pytest
 from tests.ai.research import cases
 from tests.ai.runtime.fakes import FakeSocket
 from tests.research.case_fixtures import complete_result
+from tests.research.renewal_fixtures import forward_view, trip
 from tests.rpc_identity_fixtures import ServedStack, make_identities
 from tests.research.service_fakes import AI, CLI
 from tests.research.test_case_builder import STAGE_CASES
@@ -20,8 +21,10 @@ from tests.research.test_evaluation_service import request as submit_body
 from trader.ai.rpc_clients import AiRpcClients
 from trader.ai.research_wire import AttestReply, CaseSummary, EvaluationView, SubmitReply, parse_reply
 from trader.research.case_builder import evaluation_summary
+from trader.research.forward_evidence_view import ForwardEvidenceView
 from trader.research.evaluation_service import _submit_reply
 from trader.research.judgment_attest import JudgmentAttest
+from trader.research.renewal_case import build_renewal_case
 from trader.research.research_surface import build_research_registry
 
 
@@ -81,6 +84,31 @@ def test_cases_py_has_exactly_the_keys_of_the_real_builder(stage):
     assert set(handwritten["metrics"]) == set(real["metrics"])
     assert (handwritten["error"] is None) == (real["error"] is None)
     CaseSummary.model_validate(handwritten)
+
+
+@pytest.mark.parametrize("complete", [True, False])
+def test_cases_py_renewal_summary_has_exactly_the_keys_of_the_real_builder(complete):           # Plan 5 Task 7
+    view = ForwardEvidenceView.model_validate(forward_view(states=("COMPLETE",) * 2 + (
+        "COMPLETE" if complete else "INCOMPLETE",), trips=(trip(),)))
+    real = evaluation_summary(build_renewal_case(view, created_at=NOW, warmup_sessions=5), order_notional=1900.0)
+    handwritten = cases.renewal_summary(complete=complete)
+    assert set(handwritten) == set(real) and set(handwritten["forward"]) == set(real["forward"])
+    assert (handwritten["points"], handwritten["rule_results"], handwritten["metrics"]) == ([], [], {}) == (
+        real["points"], real["rule_results"], real["metrics"])
+    for key in ("kind", "stage", "rules_passed", "holdout_passed", "eligibility", "renewal_checks_passed",
+                "selected_index", "error", "strategy_trials", "prior_holdouts", "previously_revealed_sessions"):
+        assert handwritten[key] == real[key], key
+    assert ((handwritten["forward"]["pnl_usd"] is None), handwritten["forward"]["incomplete"]) == (
+        (real["forward"]["pnl_usd"] is None), real["forward"]["incomplete"])
+    CaseSummary.model_validate(handwritten)
+
+
+def test_cases_py_renewal_trader_replies_have_the_keys_of_the_proven_ones():
+    """version() and resolved() are proven against the real trader in test_research_wire_trader_replies.py."""
+    assert set(cases.version_reply("EXPIRED")) == set(cases.version())
+    assert set(cases.version_reply("EXPIRED")["version"]) == set(cases.version()["version"])
+    assert set(cases.renewed()) == set(cases.resolved())
+    assert set(cases.renewed()["outcome"]) == set(cases.resolved()["outcome"])
 
 
 def test_cases_py_submit_replies_have_the_keys_of_the_real_builder():

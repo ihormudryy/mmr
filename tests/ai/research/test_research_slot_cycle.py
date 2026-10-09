@@ -7,7 +7,6 @@ import pytest
 import pytest_asyncio
 
 from tests.ai.fakes import load_test_config
-from tests.ai.research.cases import BASE, V1
 from tests.ai.research.rig import Rig
 from trader.ai.config import ResearchCycleConfig
 from trader.ai.research_cycle import SLOT_HOLD_SECONDS, candidate_id_for, stored_thesis
@@ -71,22 +70,6 @@ async def test_a_slot_seen_only_in_the_session_is_missed_not_run(rig):
     assert rig.rows("SELECT cycle_id, state, reason FROM ai_research_cycles") == [
         ("rcy-20261008", "MISSED", "LATE_START")]
     assert rig.orchestrator.requests == []
-
-
-@pytest.mark.asyncio
-@pytest.mark.parametrize("state", ["EXPIRED", "WITHDRAWN", "ENDED"])
-async def test_an_expired_or_withdrawn_version_ends_its_line_without_a_renewal(rig, state):     # Ruling 17
-    rig.store.db.execute(
-        "INSERT INTO ai_research_registrations (judgment_id, kind, strategy_key, state, base_digest, version_digest, "
-        "expiry_session, line_state, next_try_at, created_at, updated_at) VALUES ('jdg-old', 'INITIAL', ?, "
-        "'REGISTERED', ?, ?, '2026-10-07', 'LIVE', now(), now(), now())", [KEY, BASE, V1])
-    rig.registry.script("get_ai_deployment_version", {"found": True, "version": {
-        "version_digest": V1, "base_digest": BASE, "judgment_id": "jdg-old", "kind": "INITIAL",
-        "prior_version_digest": None, "first_session": "2026-09-10", "expiry_session": "2026-10-07", "state": state}})
-    rig.orchestrator.script(RESEARCH_MARKER, json.dumps({"candidates": []}))
-    await rig.cycle().run_due_slot()
-    assert rig.rows("SELECT line_state, error_code FROM ai_research_registrations") == [("ENDED", state)]
-    assert rig.lab.calls == []                                    # no renewal request exists in SP2c
 
 
 # -- carried decisions of the Plan 4 controller ------------------------------------------------------------------

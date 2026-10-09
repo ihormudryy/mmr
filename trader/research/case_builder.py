@@ -9,7 +9,9 @@ import datetime as dt
 import math
 from typing import Any, Mapping, Optional
 
-from trader.research.evaluation_case import CASE_DOMAIN, FULL_MENU, EvaluationCase, offered_menu
+from trader.research.evaluation_case import (
+    CASE_DOMAIN, FULL_MENU, EvaluationCase, offered_menu, renewal_forward_complete,
+)
 from trader.research.strategy_key import split_strategy_key
 
 STAGE_NAMES = {"pre_holdout": "PRE_HOLDOUT_FAILED", "holdout_failed": "HOLDOUT_FAILED", "complete": "COMPLETE"}
@@ -125,6 +127,16 @@ def _replayed_point(evidence: Mapping[str, Any]) -> Optional[Mapping[str, Any]]:
     return points[index] if type(index) is int and 0 <= index < len(points) else None
 
 
+def _renewal_order_notional(case: EvaluationCase) -> float:
+    """A RENEWAL case carries the deployed line's own notional."""
+    notional = case.evidence.get("order_notional")
+    if notional is None:
+        prior = None if case.renewal is None else case.renewal.prior_deployment_version
+        raise ValueError(f"the RENEWAL case of {case.strategy_key} (renewing {prior}) has no evidence "
+                         f"order_notional")
+    return notional
+
+
 def evaluation_summary(case: EvaluationCase, *, order_notional: float) -> dict:
     """Plan 4's EvaluationSummary: the code-computed view Jev's BacktestCase is built from."""
     evidence = case.evidence
@@ -136,8 +148,11 @@ def evaluation_summary(case: EvaluationCase, *, order_notional: float) -> dict:
         "file_hash": case.strategy_file_hash, "params": case.selected_params, "conids": list(case.conids),
         "bar_size": case.bar_size, "stage": case.stage, "rules_passed": offered_menu(case) == FULL_MENU,
         "holdout_passed": case.holdout_passed,                      # the typed header
-        "eligibility": case.decision_state, "renewal_checks_passed": None, "prior_version_digest": None,
-        "order_notional": float(order_notional), "strategy_trials": evidence.get("strategy_trials") or 0,
+        "eligibility": case.decision_state,
+        "renewal_checks_passed": renewal_forward_complete(case) if case.kind == "RENEWAL" else None,
+        "prior_version_digest": None if case.renewal is None else case.renewal.prior_deployment_version,
+        "order_notional": float(_renewal_order_notional(case) if case.kind == "RENEWAL" else order_notional),
+        "strategy_trials": evidence.get("strategy_trials") or 0,
         "prior_holdouts": evidence.get("holdouts_opened_before") or 0,
         "previously_revealed_sessions": len(evidence.get("previously_revealed") or []),
         "metrics": {} if shown is None else _point_metrics(shown),
@@ -145,4 +160,4 @@ def evaluation_summary(case: EvaluationCase, *, order_notional: float) -> dict:
                          for p in points for r in p["rules"]],
         "selected_index": evidence.get("selected_index"), "error": evidence.get("error"),
         "points": [_point_summary(p) for p in points],
-        "forward": None}
+        "forward": evidence.get("forward")}

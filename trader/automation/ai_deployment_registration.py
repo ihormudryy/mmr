@@ -75,9 +75,11 @@ def binding_differences(deployment: AiDeployment, bundle: BundleFacts, cases: Se
 
 
 class AiDeploymentRegistrar:
-    def __init__(self, *, db: Any, deployments: Any, versions: Any, activity: Any, judgments: Any, cooldowns: Any,
-                 bundles: Any, calendar: Any, expiry_sessions: int, now: Callable[[], dt.datetime]):
-        self._db, self._deployments, self._versions, self._activity = db, deployments, versions, activity
+    def __init__(self, *, journal: Any, deployments: Any, versions: Any, activity: Any, judgments: Any,
+                 cooldowns: Any, bundles: Any, calendar: Any, expiry_sessions: int, now: Callable[[], dt.datetime]):
+        """``journal`` is the trader's DomainJournal. A seal takes its write lock, as a withdrawal does, so a
+        renewal and a withdrawal of its prior version commit one after the other (Plan 5)."""
+        self._journal, self._deployments, self._versions, self._activity = journal, deployments, versions, activity
         self._judgments, self._cooldowns, self._bundles = judgments, cooldowns, bundles
         self._calendar, self._expiry_sessions, self._now = calendar, expiry_sessions, now
 
@@ -115,7 +117,9 @@ class AiDeploymentRegistrar:
                 return self._existing_outcome(raced, digest_of_request)
             if prior is not None and prior in self._versions.withdrawn_in_tx(conn):
                 raise DeploymentRefused("RENEWAL_PRIOR_INVALID", "the prior version was withdrawn")
-            # A REJECT may have committed since the read above; the clock is read after waiting for the lock.
+            # Read again on the seal's transaction: a REJECT committed before its BEGIN is seen. The REJECT writer
+            # holds another lock, so one that commits during the seal is not; the dispatch gate re-checks the
+            # cooldown before every entry is sent.
             if self._cooldowns.cooling_down_in_tx(conn, key, self._now()):
                 raise DeploymentRefused("FAMILY_COOLING_DOWN", "the strategy key is cooling down")
             self._require_room_in_tx(conn, stands, today=ny_date(now), excluding=prior)
@@ -123,7 +127,7 @@ class AiDeploymentRegistrar:
             digest, created = self._versions.seal_in_tx(conn, version, request_digest=digest_of_request,
                                                         principal=principal, command_id=command_id)
             return self._outcome(digest, version, created=created)
-        return self._db.transaction(write)
+        return self._journal.mutate_batch_work(self._journal.connect(), lambda conn, _append: write(conn))
 
     def _existing_outcome(self, bound: Any, digest_of_request: str) -> dict:
         if bound.request_digest != digest_of_request:
@@ -160,10 +164,25 @@ class AiDeploymentRegistrar:
             raise DeploymentRefused("RENEWAL_PRIOR_INVALID", "the prior version was withdrawn")
         if any(s.version.prior_version == prior for s in self._versions.sealed()):
             raise DeploymentRefused("RENEWAL_PRIOR_INVALID", "the prior version was already renewed")
-        first = prior_version
+        return prior, self._initial_judgment(prior_version)
+
+    def _initial_judgment(self, sealed: DeploymentVersion) -> JudgmentFacts:
+        """Walk back to the line's INITIAL version. Behind a sealed version every record must be there."""
+        first = sealed
         while first.prior_version is not None:
-            first = self._sealed_version(first.prior_version)
-        return prior, self._deploy_judgment(first.judgment_id)
+            try:
+                first = self._versions.get(first.prior_version)
+            except DeploymentRefused as refused:
+                if refused.code != "DEPLOYMENT_VERSION_UNKNOWN":
+                    raise
+                raise DeploymentRefused("DEPLOYMENT_VERSION_TAMPERED",
+                                        f"the chain names {first.prior_version}, which is gone") from None
+        try:
+            return self._deploy_judgment(first.judgment_id)
+        except DeploymentRefused as refused:
+            if refused.code != "JUDGMENT_MISSING":
+                raise
+            raise DeploymentRefused("JUDGMENT_TAMPERED", f"the INITIAL judgment {first.judgment_id} is gone") from None
 
     def _sealed_version(self, digest: Optional[str]) -> DeploymentVersion:
         try:

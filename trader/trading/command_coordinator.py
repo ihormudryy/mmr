@@ -2551,12 +2551,21 @@ AI_DEPLOYMENT_REGISTER_ACTION = "register_ai_deployment"   # spelled out: import
 # The reconciler's proof that a registration's transaction never committed. Terminal, so it no longer holds
 # reconciliation_safe(); the register RPC handler sends the next attempt under a new command id.
 REGISTRATION_NOT_COMMITTED = "REGISTRATION_NOT_COMMITTED"
+AI_DEPLOYMENT_WITHDRAW_ACTION = "withdraw_ai_deployment"   # spelled out: importing it would be a cycle
+# The same proof for a withdrawal; the withdraw RPC handler then sends it again under a new command id.
+WITHDRAWAL_NOT_COMMITTED = "WITHDRAWAL_NOT_COMMITTED"
 
 
 class RegistrationEvidencePort(Protocol):
     """The trader's own journal: the outcome of the version a registration command sealed, or None."""
 
     def committed_outcome(self, command_id: str) -> Optional[dict[str, Any]]: ...
+
+
+class WithdrawalEvidencePort(Protocol):
+    """The trader's own journal: the outcome of the withdrawal row a command wrote, or None."""
+
+    def committed_withdrawal(self, command_id: str) -> Optional[dict[str, Any]]: ...
 
 
 class OutcomeReconciler:
@@ -2581,6 +2590,9 @@ class OutcomeReconciler:
     - ``registrations``: ``RegistrationEvidencePort`` -- resolves an
       ``OUTCOME_UNKNOWN`` ``register_ai_deployment`` from the version its
       transaction sealed. Optional: unwired (ai_paper off) it stays unknown.
+    - ``withdrawals``: ``WithdrawalEvidencePort`` -- the same for an
+      ``OUTCOME_UNKNOWN`` ``withdraw_ai_deployment``, from the withdrawal row
+      its transaction wrote. Optional: unwired it stays unknown.
 
     Command-type awareness ([M1-F3] Task 9 HIGH-1, verbatim): ``reconcile_once``
     discriminates by the command's ACTION, not by ``target_type`` alone --
@@ -2606,6 +2618,7 @@ class OutcomeReconciler:
         now: Callable[[], dt.datetime] = _utcnow,
         closes: Optional[Any] = None,
         registrations: Optional[RegistrationEvidencePort] = None,
+        withdrawals: Optional[WithdrawalEvidencePort] = None,
     ):
         self._journal = journal
         self._ledger = ledger
@@ -2617,8 +2630,9 @@ class OutcomeReconciler:
         self._now = now
         self._closes = closes
         self._registrations = registrations
-        self._unreadable_registrations: set[str] = set()   # logged once; the 15-minute alert follows
-        self._unreadable_sagas: set[str] = set()           # logged once; the 15-minute alert follows
+        self._withdrawals = withdrawals
+        self._unreadable_evidence: set[str] = set()   # command ids logged once; the 15-minute alert follows
+        self._unreadable_sagas: set[str] = set()      # logged once; the 15-minute alert follows
         self._plans: dict[str, _ReconcilePlan] = {}
 
     # -- scheduling --------------------------------------------------------
@@ -2754,6 +2768,8 @@ class OutcomeReconciler:
             return self._reconcile_close(row, now)
         if action == AI_DEPLOYMENT_REGISTER_ACTION:
             return self._reconcile_registration(row, now)
+        if action == AI_DEPLOYMENT_WITHDRAW_ACTION:
+            return self._reconcile_withdrawal(row, now)
         # Unmapped action: cannot positively determine an outcome -> stay
         # OUTCOME_UNKNOWN (fail-safe), never rubber-stamp RESOLVED.
         return False
@@ -2775,27 +2791,39 @@ class OutcomeReconciler:
         return False
 
     def _reconcile_registration(self, row: LedgerRow, now: dt.datetime) -> bool:
-        """A registration is one journal transaction that writes the command id with the version it seals.
+        """A registration is one journal transaction that writes the command id with the version it seals."""
+        evidence = None if self._registrations is None else self._registrations.committed_outcome
+        return self._settle_from_own_commit(row, now, evidence, REGISTRATION_NOT_COMMITTED, {"created": False})
 
-        Its row is OUTCOME_UNKNOWN only after the handler raised, so that transaction has committed or rolled
-        back. A sealed version resolves the command with the receipt a success gives; no version proves the
-        transaction never committed. A version that cannot be read keeps the command unknown (15-minute alert).
+    def _reconcile_withdrawal(self, row: LedgerRow, now: dt.datetime) -> bool:
+        """A withdrawal is one journal transaction that writes the command id with the withdrawal row."""
+        evidence = None if self._withdrawals is None else self._withdrawals.committed_withdrawal
+        return self._settle_from_own_commit(row, now, evidence, WITHDRAWAL_NOT_COMMITTED, {"withdrawn": False})
+
+    def _settle_from_own_commit(self, row: LedgerRow, now: dt.datetime,
+                                committed_outcome: Optional[Callable[[str], Optional[dict[str, Any]]]],
+                                not_committed_code: str, not_committed_outcome: dict[str, Any]) -> bool:
+        """Settle a single-step command whose one transaction writes its command id with its work.
+
+        Its row is OUTCOME_UNKNOWN only once no handler runs it any more, so that transaction has committed or
+        rolled back. Evidence written by this command resolves it with the receipt a success gives; no evidence
+        proves the transaction never committed. Unreadable evidence keeps the command unknown (15-minute alert).
         """
-        if self._registrations is None or row.state != "OUTCOME_UNKNOWN":
+        if committed_outcome is None or row.state != "OUTCOME_UNKNOWN":
             return False
         try:
-            outcome = self._registrations.committed_outcome(row.command_id)
+            outcome = committed_outcome(row.command_id)
         except Exception:
-            if row.command_id not in self._unreadable_registrations:
-                self._unreadable_registrations.add(row.command_id)
-                logger.exception("registration %s: its sealed version cannot be read; it stays OUTCOME_UNKNOWN",
-                                 row.command_id)
+            if row.command_id not in self._unreadable_evidence:
+                self._unreadable_evidence.add(row.command_id)
+                logger.exception("%s %s: its journal evidence cannot be read; it stays OUTCOME_UNKNOWN",
+                                 row.action, row.command_id)
             return False
         if outcome is not None:
             self._resolve_command_only(row, dict(outcome), now)
             return True
-        self._reject_command_only(row, error_code=REGISTRATION_NOT_COMMITTED,
-                                  outcome={"created": False, "reconciled": "never_committed"}, now=now)
+        self._reject_command_only(row, error_code=not_committed_code,
+                                  outcome={**not_committed_outcome, "reconciled": "never_committed"}, now=now)
         return True
 
     def _reconcile_close(self, row: LedgerRow, now: dt.datetime) -> bool:

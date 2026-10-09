@@ -1442,6 +1442,7 @@ def build_command_stack(
         now=now,
         closes=liquidation_store,
         registrations=None if ai_paper_parts is None else ai_paper_parts.registrar,
+        withdrawals=None if ai_paper_parts is None else ai_paper_parts.versions,
     )
     strategy_control_service = None
     if strategy_port is not None:

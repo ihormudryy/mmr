@@ -104,3 +104,12 @@ def test_withdraw_is_idempotent_and_needs_a_known_version(store):
     with pytest.raises(DeploymentRefused) as refused:
         store.withdraw("sha256:" + "f" * 64, reason="x", principal="cli", command_id="w3")
     assert refused.value.code == "DEPLOYMENT_VERSION_UNKNOWN"
+
+
+def test_only_the_command_that_wrote_the_withdrawal_has_a_committed_outcome(store):
+    digest, _ = seal(store, version())
+    store.withdraw(digest, reason="operator", principal="cli", command_id="w1")
+    store.withdraw(digest, reason="again", principal="cli", command_id="w2")          # wrote nothing
+    assert store.committed_withdrawal("w1") == {"version_digest": digest, "withdrawn": True,
+                                                "already_withdrawn": False}
+    assert store.committed_withdrawal("w2") is None and store.committed_withdrawal("w-never") is None

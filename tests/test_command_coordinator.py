@@ -1393,3 +1393,53 @@ def test_a_registration_whose_handler_may_still_run_is_never_resolved(recon):
     _unknown_registration(recon, "aidep-1", state="SUBMITTING")      # a registration never reaches it
     assert reconciler.reconcile_once("aidep-1", recon.now()).resolved is False
     assert (recon.ledger.get("aidep-1").state, registrations.asked) == ("SUBMITTING", [])
+
+
+# -- withdraw_ai_deployment: resolved from its withdrawal row only (issue #115) ----------------------
+
+class FakeWithdrawals:
+    def __init__(self, outcomes=None, error=None):
+        self.outcomes, self.error = dict(outcomes or {}), error
+
+    def committed_withdrawal(self, command_id):
+        if self.error is not None:
+            raise self.error
+        return self.outcomes.get(command_id)
+
+
+def _withdrawal_reconciler(recon, withdrawals):
+    return OutcomeReconciler(journal=recon.journal, ledger=recon.ledger, orders=recon.orders,
+                             strategy=recon.strategy, alerts=recon.alerts, repo=recon.repo, now=recon.now,
+                             withdrawals=withdrawals)
+
+
+def _unknown_withdrawal(recon, command_id):
+    recon.ledger.insert_for_test(command_id, state="OUTCOME_UNKNOWN", updated_at=NOW, account_id="DU111111",
+                                 action="withdraw_ai_deployment", target_type="ai_deployment_version",
+                                 target_id="sha256:" + "a" * 64)
+
+
+def test_a_withdrawal_with_its_row_resolves_with_the_success_receipt(recon):
+    outcome = {"version_digest": "sha256:" + "a" * 64, "withdrawn": True, "already_withdrawn": False}
+    reconciler = _withdrawal_reconciler(recon, FakeWithdrawals({"aidw-1": outcome}))
+    _unknown_withdrawal(recon, "aidw-1")
+    assert reconciler.reconcile_once("aidw-1", recon.now()).resolved is True
+    row = recon.ledger.get("aidw-1")
+    assert (row.state, row.outcome, row.error_code) == ("RESOLVED", outcome, None)
+
+
+def test_a_withdrawal_without_its_row_is_rejected_as_not_committed(recon):
+    from trader.trading.command_coordinator import WITHDRAWAL_NOT_COMMITTED
+    reconciler = _withdrawal_reconciler(recon, FakeWithdrawals())
+    _unknown_withdrawal(recon, "aidw-1")
+    assert reconciler.reconcile_once("aidw-1", recon.now()).resolved is True
+    row = recon.ledger.get("aidw-1")
+    assert (row.state, row.error_code) == ("REJECTED", WITHDRAWAL_NOT_COMMITTED)
+
+
+def test_an_unreadable_withdrawal_row_or_no_port_keeps_the_withdrawal_unknown(recon):
+    _unknown_withdrawal(recon, "aidw-1")
+    assert recon.reconciler.reconcile_once("aidw-1", recon.now()).resolved is False
+    reconciler = _withdrawal_reconciler(recon, FakeWithdrawals(error=RuntimeError("db down")))
+    assert reconciler.reconcile_once("aidw-1", recon.now()).resolved is False
+    assert recon.ledger.get("aidw-1").state == "OUTCOME_UNKNOWN"

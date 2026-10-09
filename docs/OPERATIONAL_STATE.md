@@ -581,7 +581,10 @@ first deploy of this build:
   brackets are untouched. While an entry of that version is being sent the
   withdrawal is refused (`WITHDRAWAL_ENTRY_IN_FLIGHT`): retry after the
   entry's send returns. `mmr ai-deployment version sha256:<version>` shows
-  its state.
+  its state. A withdrawal left `OUTCOME_UNKNOWN` is settled by the trader's
+  reconciler from its withdrawal row: a row written by that command resolves
+  it, and no row (`WITHDRAWAL_NOT_COMMITTED`) makes the next same withdraw
+  run again under a new command id.
 - SP1 acceptance now needs an SP2c-judged deployment version:
   `mmr experiment acceptance run --place-orders --deployment-version sha256:...`.
   The harness registers nothing and no longer uses the `ai_research` key

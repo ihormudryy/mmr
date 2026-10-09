@@ -30,6 +30,11 @@ _JUDGMENT_ID = re.compile(r"^[A-Za-z0-9_.:-]{1,128}$")
 _COLUMNS = "digest, record_json, request_digest, sealed_at, judgment_id, base_digest, prior_version"
 
 
+def withdrawal_outcome(digest: str, *, newly: bool) -> dict:
+    """The receipt outcome of a withdraw_ai_deployment command."""
+    return {"version_digest": digest, "withdrawn": True, "already_withdrawn": not newly}
+
+
 def apply_ai_deployment_version_migrations(migrator: SchemaMigrator) -> None:
     migrator.apply(AI_DEPLOYMENT_VERSION_MIGRATION_VERSION, "sp2c_ai_deployment_versions", (
         """CREATE TABLE IF NOT EXISTS ai_deployment_versions (
@@ -196,6 +201,15 @@ class AiDeploymentVersionStore:
     def is_withdrawn_in_tx(self, conn, digest: str) -> bool:
         return conn.execute("SELECT 1 FROM ai_deployment_withdrawals WHERE version_digest = ?",
                             [digest]).fetchone() is not None
+
+    def committed_withdrawal(self, command_id: str) -> Optional[dict]:
+        """The success outcome of the command whose own transaction wrote a withdrawal row, or None.
+
+        The row carries the command id in the same transaction, so it is proof of the commit. A command that
+        found the version already withdrawn wrote nothing and gets None."""
+        row = self._db.execute("SELECT version_digest FROM ai_deployment_withdrawals WHERE command_id = ?",
+                               [command_id], fetch="one")
+        return None if row is None else withdrawal_outcome(row[0], newly=True)
 
     def entries_being_sent_in_tx(self, conn, digest: str) -> tuple[str, ...]:
         """Command ids of entries bound to this version whose broker send has not returned.

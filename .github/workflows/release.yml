@@ -74,6 +74,7 @@ jobs:
     needs: [test-shard, async-ibrx]
     if: ${{ always() && github.event_name != 'pull_request' }}
     runs-on: ubuntu-latest
+    permissions: {}
     steps:
       - run: test "${{ needs.test-shard.result }}" = success && test "${{ needs.async-ibrx.result }}" = success
 

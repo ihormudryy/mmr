@@ -380,3 +380,24 @@ def test_the_startup_history_step_stores_a_config_strategy_bars(history_rt, path
     frame = history_rt._strategy_frame(CONID, ONE_MIN)
     backfilled = history_rt.historical_data_client.bars.index.tz_convert("UTC")
     assert frame is not None and set(backfilled) <= set(frame.index)
+
+
+def test_the_runtime_reconcile_feeds_the_instance_only_after_its_history(history_rt, path):
+    """While its history loads, the instance is in no dispatch bucket, so no bar can reach it."""
+    dispatchable_during_history = []
+
+    class OrderCheckingHistory(FakeHistoryClient):
+        async def get_contract_history(self, **request):
+            dispatchable_during_history.append(any(history_rt.strategies.values()))
+            return await super().get_contract_history(**request)
+
+    history_rt.historical_data_client = OrderCheckingHistory()
+    history_rt._ai_deployment_source = source(history_rt, [active(path)])
+    history_rt._trader_gateway.publish_instrument = lambda conid, delayed: None
+    history_rt._config_mtime = 0.0
+    history_rt.strategy_config_file = os.path.join(os.path.dirname(path), "missing.yaml")
+    history_rt._revisions = None
+    history_rt._drain_ack_outbox = lambda: None
+    history_rt._reconcile_sync()
+    assert dispatchable_during_history and not any(dispatchable_during_history)
+    assert history_rt.strategies[CONID] == [instance_of(history_rt)]

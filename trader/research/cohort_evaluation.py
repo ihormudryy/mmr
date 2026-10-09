@@ -128,6 +128,7 @@ def evaluate_cohort(spec: CohortSpec, *, research_db: Any, paths: EvaluationPath
                      search_space=_cohort_search_space(spec))
     family_id = registry.create_family(family, created_at=now(), validation_folds=_fold_specs(plan))
     _refuse_if_holdout_opened(registry, family_id)
+    registry.close_interrupted_strategy_trials(base.strategy_path, base.class_name, finished_at=now())
     env = run_environment(base, paths)
     # Cohort points first, so a neighbour equal to a cohort point reuses that trial.
     points = [_run_point(registry, family_id, env, plan, dict(p), COST_MULTIPLIERS, now, max_workers,

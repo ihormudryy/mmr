@@ -119,6 +119,18 @@ def test_a_neighbour_equal_to_another_cohort_point_is_one_trial(world):
     assert len(world.registry.strategy_trials("strategies/time_of_day.py", "TimeOfDay")) == 5   # not 6
 
 
+def test_a_trial_stranded_by_a_crash_before_the_bars_changed_is_closed_and_counted(world):
+    _, first = world.run([{"ENTRY_MINUTE": 600}], {0: (False, 0.1)})
+    stranded = world.registry.start_trial(first.family_id, trial_key="point:crashed#1",
+                                          parameters={"ENTRY_MINUTE": 630}, started_at=NOW)
+    write_trend_bars(world.paths.history_db, drift=0.0007)              # new dataset manifest: a new family
+    _, second = world.run([{"ENTRY_MINUTE": 600}], {0: (False, 0.1)})
+    assert second.family_id != first.family_id
+    trial = world.registry.get_trial(stranded)
+    assert (trial.status, trial.safe_summary) == ("FAILED", "interrupted before it finished")
+    assert second.strategy_trials == 3 + 1 + 3
+
+
 def test_previously_revealed_sessions_are_labelled(world):
     registry = world.registry
     spec, first = world.run([{"ENTRY_MINUTE": 600}], {0: (False, 0.1)})

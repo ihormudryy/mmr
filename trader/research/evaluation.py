@@ -38,7 +38,7 @@ from trader.research.evaluation_store import (
     STAGE_COMPLETE, STAGE_HOLDOUT_FAILED, STAGE_PRE_HOLDOUT,
     EvaluationRecord, EvaluationRepository, write_evaluation_summary,
 )
-from trader.research.experiment_registry import ExperimentRegistry
+from trader.research.experiment_registry import INTERRUPTED_SUMMARY, ExperimentRegistry
 from trader.research.rulesets.paper_v1 import PAPER_V1
 from trader.research.schema import DatasetManifestRepository
 from trader.research.statistics import annualized_sharpe_ci, profit_factor
@@ -105,6 +105,7 @@ def evaluate(spec: EvaluationSpec, *, research_db: Any, paths: EvaluationPaths,
     _refuse_if_holdout_opened(registry, family_id)
     _refuse_if_strategy_holdout_overlaps(registry, spec, plan)
 
+    registry.close_interrupted_strategy_trials(spec.strategy_path, spec.class_name, finished_at=now())
     env = run_environment(spec, paths)
     main = _run_point(registry, family_id, env, plan, dict(spec.params), COST_MULTIPLIERS,
                       now, max_workers, rerun_existing=True)
@@ -436,7 +437,7 @@ def _run_point(registry: ExperimentRegistry, family_id: str, env: RunEnvironment
                 if t.trial_key.split('#')[0] == key]
     for stale in (t for t in attempts if t.status == TRIAL_RUNNING):
         registry.finish_trial(stale.trial_id, status=TRIAL_FAILED, finished_at=now(),
-                              safe_summary='interrupted before it finished')
+                              safe_summary=INTERRUPTED_SUMMARY)
     succeeded = next((t for t in attempts if t.status == TRIAL_SUCCEEDED), None)
     if succeeded is not None and not rerun_existing:
         return PointResult(params, succeeded.trial_id, dict(succeeded.metrics))

@@ -110,12 +110,13 @@ def _write_atomically(path: str, text: str) -> None:
 class AiController:
     def __init__(self, *, config: Any, store: Any, clock: Any, supervisor: Any, leadership: Any,
                  watch: ExperimentWatch, submitter: Any, outbox: Any, intake: Any, slots: Any, engine: Any,
-                 gateway: Any, cap_sync: Any = None):
+                 gateway: Any, cap_sync: Any = None, research: Any = None):
         self._config, self._store, self._clock = config, store, clock
         self._supervisor, self._leadership, self._watch = supervisor, leadership, watch
         self._submitter, self._outbox, self._intake = submitter, outbox, intake
         self._slots, self._engine, self._gateway = slots, engine, gateway
         self._cap_sync = cap_sync                      # BudgetCapSync (Ruling 19); None in unit tests
+        self._research = research                      # ResearchCycle (SP2c Plan 4); None when research is off
         self._ttl = dt.timedelta(seconds=config.decision_ttl_seconds)
         self._tasks: set[asyncio.Task] = set()
         self._opportunity_tasks: dict[str, asyncio.Task] = {}
@@ -142,6 +143,8 @@ class AiController:
         await self._watch.refresh()
         if self._cap_sync is not None:
             await self._cap_sync.sync()                # a failure is logged; the gateway stays closed (Ruling 19)
+        if self._research is not None:
+            await self._research.recover()             # the gateway already turned STARTED attempts into UNKNOWN
 
     async def refresh_experiment(self) -> None:
         await self._watch.refresh()
@@ -439,7 +442,8 @@ class AiController:
                   "running_cycles": sorted(kind for kind, task in self._cycle_tasks.items() if not task.done()),
                   "budget_cap_ready": None if self._cap_sync is None else self._cap_sync.ready(),
                   "exit_waits_stuck": sum(1 for until, _alert in (await self._intake.waits()).values()
-                                          if self._clock.now() > until + EXIT_WAIT_OVERRUN)}
+                                          if self._clock.now() > until + EXIT_WAIT_OVERRUN),
+                  "research": None if self._research is None else await self._research.counts()}
         if self._config.heartbeat_path:
             await asyncio.to_thread(_write_atomically, self._config.heartbeat_path, json.dumps(status))
         return status
@@ -471,6 +475,10 @@ class AiController:
         if self._cap_sync is not None:
             loops.append(asyncio.create_task(self._every(stop, cfg.budget_cap_poll_seconds, self._cap_sync.sync,
                                                          "budget_cap")))
+        if self._research is not None:
+            for seconds, step, name in ((SLOT_POLL_SECONDS, self._research.run_due_slot, "research_slot"),
+                                        (self._research.poll_seconds, self._research.pump, "research_pump")):
+                loops.append(asyncio.create_task(self._every(stop, seconds, step, name)))
         try:
             await stop.wait()
         finally:

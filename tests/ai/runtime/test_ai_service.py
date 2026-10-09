@@ -57,3 +57,27 @@ def test_a_missing_config_file_exits_loudly(tmp_path, monkeypatch, caplog):
     monkeypatch.setenv("TRADER_TYPED_ADDRESS", "tcp://127.0.0.1")
     assert main(["--config", str(tmp_path / "missing.yaml")]) == EXIT_REFUSED
     assert "AI_CONFIG_NOT_FOUND" in caplog.text
+
+
+def test_the_research_cycle_uses_the_cap_gated_gateway_and_is_built_only_when_enabled(tmp_path):  # SP2c Plan 4
+    import datetime as dt
+    from types import SimpleNamespace
+
+    from tests.ai.fakes import FakeClock, load_test_config
+    from tests.ai.research.rig import BLOCK
+    from trader.ai.store import AiStore
+    from trader.ai_service import build_research_cycle, build_session_slots
+
+    clock = FakeClock(dt.datetime(2026, 10, 8, 21, tzinfo=dt.timezone.utc))
+    store = AiStore(tmp_path / "ai.duckdb", clock=clock)
+    clients, gateway = SimpleNamespace(lab=object(), research=object()), object()
+
+    def build(config):
+        return build_research_cycle(config, store=store, clock=clock, slots=build_session_slots(config),
+                                    leadership=None, watch=None, clients=clients, gateway=gateway)
+    (tmp_path / "off").mkdir()
+    (tmp_path / "on").mkdir()
+    assert build(load_test_config(tmp_path / "off")) is None
+    cycle = build(load_test_config(tmp_path / "on", extra_top_level=BLOCK))
+    assert cycle._gateway is gateway and cycle._judge._gateway is gateway
+    assert (cycle._lab, cycle._registry) == (clients.lab, clients.research)

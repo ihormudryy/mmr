@@ -3,7 +3,6 @@ from __future__ import annotations
 
 import datetime as dt
 import hashlib
-import math
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Mapping, Sequence
@@ -15,10 +14,9 @@ from pydantic import ValidationError
 from trader.research.evaluation_request import EvaluationRequestBody, evaluation_request_id
 from trader.research.evaluation_spec import (MIN_INSTRUMENTS, EvaluationSpec, EvaluationSpecError,
                                              build_evaluation_spec, declared_tunables)
+from trader.research.neighbours import NEIGHBOUR_SHARE, neighbours_of  # noqa: F401  re-exported
 from trader.research.strategy_key import split_strategy_key
 from trader.research.validation import generate_walk_forward
-
-NEIGHBOUR_SHARE = 0.1
 
 
 class RequestRefused(Exception):
@@ -35,22 +33,6 @@ def request_body(raw: Mapping[str, Any], research_day: dt.date) -> EvaluationReq
         return EvaluationRequestBody.model_validate({**raw, "research_day": research_day.isoformat()})
     except ValidationError as exc:
         raise RequestRefused("REQUEST_INVALID", exc.errors()[0]["msg"]) from None
-
-
-def _neighbour_values(value: Any) -> tuple:
-    if isinstance(value, bool) or not isinstance(value, (int, float)):
-        return ()
-    if isinstance(value, int):
-        step = max(1, round(abs(value) * NEIGHBOUR_SHARE))
-        return (value - step, value + step)
-    if not math.isfinite(value) or value == 0:
-        return ()
-    return tuple(float(f"{v:.6g}") for v in (value * (1 - NEIGHBOUR_SHARE), value * (1 + NEIGHBOUR_SHARE)))
-
-
-def neighbours_of(point: Mapping[str, Any]) -> tuple[dict, ...]:
-    """Ruling 2: one key changes at a time, +/- 10 %."""
-    return tuple({**point, key: v} for key, value in point.items() for v in _neighbour_values(value) if v != value)
 
 
 def evaluation_period(research_day: dt.date, config: Any) -> tuple[dt.date, dt.date]:

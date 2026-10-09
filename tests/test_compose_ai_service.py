@@ -7,7 +7,8 @@ import yaml
 from tests.compose_rpc_helpers import CONTAINER_CONFIG, ROOT, load_compose, visible_rpc_files, volumes
 from trader.messaging.principals import service_rpc_files
 
-ALLOWED_ENV = {"TZ", "PYTHONDONTWRITEBYTECODE", "TRADER_TYPED_ADDRESS", "MMR_CONFIG_DEFAULTS",
+ALLOWED_ENV = {"TZ", "PYTHONDONTWRITEBYTECODE", "TRADER_TYPED_ADDRESS", "RESEARCH_TYPED_ADDRESS",
+               "MMR_CONFIG_DEFAULTS",
                "OPENROUTER_API_KEY", "AWS_REGION",
                "AWS_ACCESS_KEY_ID", "AWS_SECRET_ACCESS_KEY", "AWS_SESSION_TOKEN", "AZURE_OPENAI_ENDPOINT",
                "AZURE_OPENAI_API_KEY", "AZURE_OPENAI_API_VERSION"}
@@ -29,6 +30,11 @@ def test_ai_service_does_not_merge_the_common_env():
     text = (ROOT / "docker-compose.yml").read_text()
     block = text.split("\n  ai:\n", 1)[1].split("\n  # ──", 1)[0]
     assert "*mmr-common-env" not in block                    # that anchor carries the Alpaca keys
+
+
+def test_ai_reaches_the_research_server_by_its_compose_name(ai):
+    assert ai["environment"]["RESEARCH_TYPED_ADDRESS"] == "tcp://research"
+    assert "research" in load_compose()["services"]
 
 
 def test_ai_sees_its_two_key_pairs_and_the_trader_public_key_only(ai):
@@ -102,3 +108,14 @@ def test_ai_is_opt_in_publishes_nothing_and_runs_the_service(ai):
     assert ai["profiles"] == ["ai"] and not ai.get("ports")
     assert ai["command"] == ["python", "-m", "trader.ai_service"]
     assert "healthcheck" in ai and "trader" in ai["depends_on"]
+
+
+def test_ai_sees_the_same_baked_strategy_files_as_the_research_service(ai):
+    """The research menu scans <working_dir>/strategies. The image bakes that tree (Dockerfile COPY ./), as it does
+    for the research service, so both read one copy. A host bind on ai alone would let the two disagree, so there is none."""
+    compose = load_compose()["services"]
+    assert ai["working_dir"] == compose["research"]["working_dir"] == "/home/trader/mmr"
+    assert "COPY --chown=trader:trader ./ /home/trader/mmr/" in (ROOT / "Dockerfile").read_text()
+    ignored = {line.strip().rstrip("/") for line in (ROOT / ".dockerignore").read_text().splitlines()}
+    assert "strategies" not in ignored and (ROOT / "strategies").is_dir()
+    assert not [v for v in volumes(ai) if "strategies" in v["target"] or "strategies" in v["source"]]

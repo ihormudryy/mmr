@@ -50,6 +50,16 @@ class TraderClock:
             await asyncio.sleep(0)
 
 
+class NoResearchServer:
+    """The SP2 runtime tests never call the research server: any call is refused before the send."""
+
+    def call(self, method, body, response_model, timeout=None, **options):
+        raise ConnectionError(f"typed RPC call to {method!r} could not be sent: no research server in this world")
+
+    def close(self):
+        pass
+
+
 class FlakyClient:
     """Wraps a real TypedRpcClient. "down": refused before the send (ConnectionError, like IMMEDIATE=1);
     "lose_reply": the trader handles the request, then the reply is lost (TimeoutError)."""
@@ -181,6 +191,7 @@ class AiNode:
                "supervisor_discovery": sockets.client("ai_supervisor", "trader", "query", timeout=30.0),
                "research_command": sockets.client("ai_research", "trader", "command", timeout=30.0),
                "research_query": sockets.client("ai_research", "trader", "query", timeout=30.0)}
+        raw.update(lab_command=NoResearchServer(), lab_query=NoResearchServer())   # Task 8 binds a real one
         self.sockets = {name: FlakyClient(client) for name, client in raw.items()} if flaky else raw
         self.clients = AiRpcClients.from_sockets(**self.sockets, timeout=30.0)
         self.leadership = Leadership(supervisor=self.clients.supervisor, store=self.store, clock=clock,

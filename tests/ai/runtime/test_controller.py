@@ -595,3 +595,55 @@ async def test_a_restart_on_the_next_day_journals_yesterdays_last_slots(tmp_path
 async def test_the_first_start_does_not_invent_slots_from_before_the_service_ran(rig):
     await rig.slots_then_drain()
     assert sorted(cycle_states(rig)) == ["cyc-entry-20260717-1100", "cyc-position-20260717-1100"]
+
+
+# -- SP2c Plan 4 Task 7: the research cycle's loops --------------------------------------------------------------
+class StubResearch:
+    """Counts what the controller calls; stops the run once both research loops ran."""
+    poll_seconds = 30.0
+
+    def __init__(self, stop):
+        self.calls, self.stop = [], stop
+
+    async def recover(self):
+        self.calls.append("recover")
+
+    async def run_due_slot(self):
+        self.calls.append("run_due_slot")
+        self._stop_after_both_loops()
+
+    async def pump(self):
+        self.calls.append("pump")
+        self._stop_after_both_loops()
+
+    async def counts(self):
+        return {"open_candidates": 2, "unrecorded_judgments": 0, "pending_registrations": 1}
+
+    def _stop_after_both_loops(self):
+        if {"run_due_slot", "pump"} <= set(self.calls):
+            self.stop.set()
+
+
+class RenewingLeadership(FakeLeadership):
+    async def run_renewals(self, stop):
+        await stop.wait()
+
+
+@pytest.mark.asyncio
+async def test_research_loops_run_only_when_enabled(rig, tmp_path):
+    stop = asyncio.Event()
+    research = StubResearch(stop)
+    controller = AiController(
+        config=ControllerConfig(heartbeat_path=str(tmp_path / "hb.json")), store=rig.store, clock=rig.clock,
+        supervisor=rig.trader, leadership=RenewingLeadership(1), watch=rig.watch, submitter=rig.submitter,
+        outbox=ReportingOutbox(store=rig.store, journal=AttemptJournal(rig.store), supervisor=rig.trader,
+                               clock=rig.clock),
+        intake=rig.intake, slots=SessionSlots(), engine=rig.engine, gateway=FakeGateway(rig.clock),
+        research=research)
+    await controller.start()
+    assert research.calls == ["recover"]
+    research.calls.clear()
+    await asyncio.wait_for(controller.run(stop), timeout=10)
+    assert research.calls[0] == "recover" and {"run_due_slot", "pump"} <= set(research.calls)
+    assert (await controller.heartbeat())["research"] == await research.counts()
+    assert (await rig.controller.heartbeat())["research"] is None

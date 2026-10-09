@@ -6,9 +6,10 @@ import pytest
 from tests.ai.decisions.fakes import AAPL, MSFT, NOW
 from trader.ai.discovery_client import DiscoveryRead, EligibleCandidate, NewsLine
 from trader.ai.engine import OwnedPosition
+from trader.ai.research_roles import BacktestVerdict
 from trader.ai.roles import (
-    CLOSE_MARKER, ENTRY_MARKER, JEV_MARKER, BacktestVerdict, PositionChoice, close_messages, entry_messages,
-    jev_messages, parse_close_picks, parse_entry_picks, parse_jev,
+    CLOSE_MARKER, ENTRY_MARKER, JEV_MARKER, PositionChoice, close_messages, entry_messages, jev_messages,
+    parse_close_picks, parse_entry_picks, parse_jev,
 )
 from trader.ai.untrusted import OutputRefusal, parse_model_output
 

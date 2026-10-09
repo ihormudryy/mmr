@@ -127,3 +127,11 @@ def test_untrusted_text_is_capped_and_labels_are_checked():
         with pytest.raises(ValueError):
             fence_untrusted(bad, "text", max_chars=10)
     fence_untrusted("alpaca_news_2", "text", max_chars=10)
+
+
+def test_an_integer_literal_over_the_python_digit_limit_is_a_refusal_not_an_exception():
+    class Shape(StrictModelOutput):
+        n: int
+
+    refusal = parse_model_output('{"n": 1' + "0" * 5000 + "}", Shape)
+    assert isinstance(refusal, OutputRefusal) and refusal.code == "OUTPUT_BAD_JSON"

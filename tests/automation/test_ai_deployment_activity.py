@@ -101,8 +101,9 @@ def test_status_order_when_several_reasons_apply(world):
     renewed_and_expired, _ = world.seal(1, **past)
     world.seal(2, kind=RENEWAL, prior=renewed_and_expired, first=dt.date(2026, 10, 14))
     withdrawn_and_renewed, _ = world.seal(3)
-    world.seal(4, kind=RENEWAL, prior=withdrawn_and_renewed, first=dt.date(2026, 10, 14))
+    # Withdraw before the renewal is sealed: withdrawing a superseded version is refused (VERSION_SUPERSEDED).
     world.versions.withdraw(withdrawn_and_renewed, reason="x", principal="cli", command_id="w")
+    world.seal(4, kind=RENEWAL, prior=withdrawn_and_renewed, first=dt.date(2026, 10, 14))
     ended_and_expired, _ = world.seal(5, **past)
     world.judgments.end_line(ended_and_expired, "NO_VERDICT")
     statuses = world.activity.statuses()

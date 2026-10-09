@@ -207,7 +207,8 @@ class AiDeploymentVersionStore:
         return tuple(row[0] for row in rows)
 
     def withdraw(self, digest: str, *, reason: str, principal: str, command_id: str) -> bool:
-        """True when this call withdrew the version, False when it was withdrawn before.
+        """True when this call withdrew the version, False when it was withdrawn before. A renewed (superseded)
+        version is refused with VERSION_SUPERSEDED: it trades no more, and its successor is the one to withdraw.
 
         A journal mutation: it commits either before an entry's SUBMITTING row (that entry is refused) or
         after it. In the second case the entry is still being sent, so the withdrawal is refused until the
@@ -220,6 +221,11 @@ class AiDeploymentVersionStore:
                 raise DeploymentRefused("DEPLOYMENT_VERSION_UNKNOWN", "no sealed version has this digest")
             if self.is_withdrawn_in_tx(conn, digest):
                 return False
+            successor = conn.execute("SELECT digest FROM ai_deployment_versions WHERE prior_version = ?",
+                                     [digest]).fetchone()
+            if successor is not None:
+                raise DeploymentRefused("VERSION_SUPERSEDED",
+                                        f"{digest} is superseded by {successor[0]}; withdraw that version")
             in_flight = self.entries_being_sent_in_tx(conn, digest)
             if in_flight:
                 raise DeploymentRefused(

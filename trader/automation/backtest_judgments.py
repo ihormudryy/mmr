@@ -3,7 +3,8 @@
 ``ai_research`` records one judgment per evaluation case. The trader is the
 authority: it verifies the signed case itself, offers DEPLOY only when the case
 qualifies (rules first), keeps one judgment per case and per evaluation, and
-starts the strategy key's cooldown on REJECT. Rows are sealed: every read
+starts the strategy key's cooldown on REJECT. A deployment version gets at most
+one RENEWAL judgment, whatever its case (refusal ``RENEWAL_ALREADY_JUDGED``). Rows are sealed: every read
 recomputes the record digest. File reads, signature checks and the renewal
 port run before the write transaction. The clock that sets ``recorded_at`` and
 the REJECT cooldown is read inside it, so a write that waited for the lock across
@@ -36,6 +37,7 @@ JUDGMENT_BODY_DOMAIN = "mmr.backtest-judgment-body.v1"
 MAX_DECIDED_AHEAD = dt.timedelta(minutes=5)
 JUDGMENT_CONFLICT = "JUDGMENT_CONFLICT"
 JUDGMENT_TAMPERED = "JUDGMENT_TAMPERED"
+RENEWAL_ALREADY_JUDGED = "RENEWAL_ALREADY_JUDGED"
 COOLDOWN_CALENDAR_UNAVAILABLE = "COOLDOWN_CALENDAR_UNAVAILABLE"
 _COLUMNS = ("judgment_id, case_digest, request_id, kind, verdict, strategy_key, body_json, body_digest, "
             "binding_json, cooldown_until_session, recorded_at, record_digest")
@@ -172,14 +174,37 @@ class BacktestJudgments:
             self._check_against_case(request, case, utc(self._now()))
             return self._db.transaction(lambda conn: self._insert_in_tx(conn, request, case, body, body_digest))
         except JudgmentRefused as refused:
-            if refused.code == JUDGMENT_TAMPERED:
-                raise                       # a broken seal is an error, never a reply
+            if refused.code.endswith("TAMPERED"):
+                raise                       # a broken seal (judgment, version, shadow row) is an error, never a reply
             return refused.reply(request.judgment_id)
 
     def get(self, judgment_id: str) -> Optional[BacktestJudgment]:
         row = self._db.execute(f"SELECT {_COLUMNS} FROM backtest_judgments WHERE judgment_id = ?",
                                [judgment_id], fetch="one")
         return None if row is None else _sealed_judgment(row)
+
+    def renewals_of(self, version_digest: str) -> tuple[BacktestJudgment, ...]:
+        """The RENEWAL judgment naming ``version_digest``: at most one (migration 125). Every row read is sealed,
+        and the index must agree with the sealed RENEWAL judgments both ways."""
+        rows = self._db.execute("SELECT judgment_id FROM renewal_judgments WHERE prior_version = ?",
+                                [version_digest], fetch="all")
+        found = []
+        for (judgment_id,) in rows:
+            judgment = self.get(judgment_id)
+            if (judgment is None or judgment.kind != "RENEWAL"
+                    or judgment.binding["prior_deployment_version"] != version_digest):
+                raise JudgmentRefused(JUDGMENT_TAMPERED, f"the renewal index names {judgment_id} for {version_digest}")
+            found.append(judgment)
+        indexed = {judgment.judgment_id for judgment in found}
+        for judgment in self._sealed_renewals():
+            if judgment.binding["prior_deployment_version"] == version_digest and judgment.judgment_id not in indexed:
+                raise JudgmentRefused(JUDGMENT_TAMPERED,
+                                      f"renewal judgment {judgment.judgment_id} of {version_digest} is not indexed")
+        return tuple(found)
+
+    def _sealed_renewals(self) -> tuple[BacktestJudgment, ...]:
+        rows = self._db.execute(f"SELECT {_COLUMNS} FROM backtest_judgments WHERE kind = 'RENEWAL'", fetch="all")
+        return tuple(_sealed_judgment(row) for row in rows)
 
     def get_by_case(self, case_digest: str) -> Optional[BacktestJudgment]:
         """One judgment per case (UNIQUE case_digest), so the case names at most one row."""
@@ -253,6 +278,8 @@ class BacktestJudgments:
             if other is not None:
                 raise JudgmentRefused(JUDGMENT_CONFLICT, f"the evaluation is already judged by {other[0]}")
             self._check_claim_in_tx(conn, case, request.decided_at_utc())
+        else:
+            self._claim_renewal_in_tx(conn, case.renewal.prior_deployment_version, request.judgment_id, recorded_at)
         judgment = BacktestJudgment(request.judgment_id, request.case_digest, case.request_id, case.kind,
                                     request.verdict, case.strategy_key, body, _binding(case, request.case_digest),
                                     self._cooldown_until(request.verdict, recorded_at), recorded_at)
@@ -262,6 +289,16 @@ class BacktestJudgments:
                       _text(judgment.binding), judgment.cooldown_until_session, judgment.recorded_at,
                       record_digest(judgment, body_digest)])
         return _receipt("RECORDED", judgment.judgment_id, judgment.verdict, judgment.cooldown_until_session)
+
+    @staticmethod
+    def _claim_renewal_in_tx(conn: Any, prior: str, judgment_id: str, recorded_at: dt.datetime) -> None:
+        """One renewal judgment per version, whatever its case. Runs before the judgment INSERT, in its transaction."""
+        other = conn.execute("SELECT judgment_id FROM renewal_judgments WHERE prior_version = ?",
+                             [prior]).fetchone()
+        if other is not None:
+            raise JudgmentRefused(RENEWAL_ALREADY_JUDGED, f"version {prior} is already judged by {other[0]}")
+        conn.execute("INSERT INTO renewal_judgments (prior_version, judgment_id, recorded_at) VALUES (?, ?, ?)",
+                     [prior, judgment_id, recorded_at])
 
     @staticmethod
     def _check_claim_in_tx(conn: Any, case: EvaluationCase, decided_at: dt.datetime) -> None:

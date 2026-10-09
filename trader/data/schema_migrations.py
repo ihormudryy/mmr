@@ -32,6 +32,7 @@ SP2 Plan 2 uses 95 (simulated decisions) and 96 (simulated outcomes).
 SP2 Plan 3 owns 100–104 and uses **100** (``discretionary_scope_checks``).
 SP2c Plan 1 owns 110–114 and uses **110** (``evaluation_claims``) and **111** (``backtest_judgments``).
 SP2c Plan 3 uses **120** (``shadow_results``); 121–124 stay unused.
+SP2c Plan 5 uses **125** (``renewal_judgments``, one renewal judgment per deployment version); 126–129 stay free.
 
 ``SchemaMigrator`` is deliberately storage-agnostic about *which* file it
 targets — it operates on whatever ``DuckDBConnection`` it is constructed

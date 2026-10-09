@@ -18,7 +18,7 @@ INITIAL_FIELDS = ("strategy_key", "cohort", "conids", "bar_size")
 
 
 class SubmitEvaluationRequest(BaseModel):
-    """An INITIAL candidate, or a RENEWAL (answered with a refusal until SP2c Plan 5, ruling 17)."""
+    """An INITIAL candidate, or a RENEWAL of one deployment version (SP2c Plan 5)."""
     model_config = ConfigDict(extra="forbid", strict=True)
     kind: Literal["INITIAL", "RENEWAL"]
     strategy_key: Optional[str] = Field(default=None, max_length=200)

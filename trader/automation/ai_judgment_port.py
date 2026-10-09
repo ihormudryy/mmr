@@ -86,13 +86,14 @@ class Plan1Cooldowns:
         return cooling_until_in_tx(conn, strategy_key, ny_day(now)) is not None
 
 
-def judgment_reader_for(judgments: Any, *, cases_dir: Path, verify_dir: Path) -> JudgmentReader:
+def judgment_reader_for(judgments: Any, *, cases_dir: Path, verify_dir: Path,
+                        renewals_of: Callable[[str], Iterable[Any]] = _no_renewals) -> JudgmentReader:
     from trader.research.evaluation_case import load_case_verify_keys, load_verified_case
 
     def read_case(digest: str) -> Any:
         # Keys are loaded per read: nothing touches the disk at trader start, and a rotated key is seen.
         return load_verified_case(cases_dir, digest, load_case_verify_keys(verify_dir))
-    return Plan1Judgments(judgments, read_case=read_case)
+    return Plan1Judgments(judgments, read_case=read_case, renewals_of=renewals_of)
 
 
 def cooldown_reader_for(db: Any) -> CooldownReader:

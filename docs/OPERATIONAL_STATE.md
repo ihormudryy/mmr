@@ -376,8 +376,8 @@ Upgrade notes:
 Open items:
 - Ruling 13: research mounts `mmr_db_data` (bars, like strategy). The owner
   still has to confirm that this volume exposure is acceptable.
-- Ruling 17: renewal cases and the trader's forward evidence come with SP2c
-  Plan 5. A RENEWAL request is refused until then.
+- Ruling 17 is done in SP2c Plan 5: the research service builds RENEWAL cases from
+  the trader's forward evidence. See "Renewal" under "AI research cycle (SP2c)" below.
 - The signing key file owner inside the container: `load_signing_key` checks
   mode `0600`, so the container user must own the bind. Check this on the
   first start.
@@ -638,9 +638,9 @@ Do not arm a second automatic strategy. Do not set `automation.live_enabled`.
 - Typed read calls (no CLI command yet): `get_backtest_judgment` (trader, as `cli` or `dashboard`) and `get_evaluation` (research service, as `cli`).
 - `ai.duckdb` tables:
   - `ai_research_cycles`: one row per evening. `state` is RUNNING, DONE, SKIPPED, MISSED or FAILED. `reason` says why. `menu_json` is the menu. `dropped_json` lists every dropped menu entry and pick with its code.
-  - `ai_research_candidates`: one row per candidate. `state` is NEW, SUBMITTED, EVALUATED or CLOSED. `end_code` says how it ended.
+  - `ai_research_candidates`: one row per candidate. `kind` is INITIAL or RENEWAL (a renewal also has `prior_version_digest`). `state` is NEW, SUBMITTED, EVALUATED or CLOSED. `end_code` says how it ended.
   - `ai_backtest_judgments`: one row per case. `state` is JUDGING, DECIDED, RECORDED or REFUSED. `verdict` and `code` hold the result.
-  - `ai_research_registrations`: one row per DEPLOY. `state` is ATTESTING, REGISTERING, WAITING_CAP, REGISTERED or REFUSED. `line_state` is LIVE or ENDED.
+  - `ai_research_registrations`: one row per DEPLOY. `state` is ATTESTING, REGISTERING, WAITING_CAP, REGISTERED or REFUSED. `line_state` is LIVE, RENEWING or ENDED. `error_code` of an ended line says why (see "Renewal").
   - `ai_research_cooldowns`: strategy keys that cool down, and until which session.
 - Logs: a lost slot, a refused judgment or registration and a judgment that cannot be taken (stuck in `JUDGING`, or the case already judged) are ERROR. A lost submit reply is one WARNING when it happens. If that candidate then closes as `STALE_NOT_SUBMITTED`, that is an ERROR. A wait is WARNING: once per row (or slot) and code, except the closed budget cap gate, which logs one per pump.
 
@@ -659,11 +659,12 @@ Candidate `end_code`:
 - `JUDGED_DEPLOY`, `JUDGED_SHADOW`, `JUDGED_REJECT`, `JUDGED_NO_VERDICT`: judged.
 - `REFUSED_<code>`: the research service refused the submit. For example `REFUSED_FAMILY_COOLING_DOWN` (this also starts a cooldown here), `REFUSED_HOLDOUT_NOT_AVAILABLE`, `REFUSED_COHORT_TOO_LARGE`.
 - `NOT_SUBMITTED_EVALUATION_LIMIT_REACHED`: the day's evaluation limit was hit. The other new candidates of that slot close with this code. The one that was refused has `REFUSED_EVALUATION_LIMIT_REACHED`.
-- `STALE_NOT_SUBMITTED`: the candidate was still NEW after its slot window closed. It is never carried to another night. If the submit reply was lost, this is logged as ERROR, because the research service may hold an accepted evaluation.
+- `STALE_NOT_SUBMITTED`: an INITIAL candidate was still NEW after its slot window closed (a waiting renewal is never closed so; see "Renewal"). It is never carried to another night. If the submit reply was lost, this is logged as ERROR, because the research service may hold an accepted evaluation.
 - `EVALUATION_STALE`: no result after `evaluation_stale_hours`.
 - `EVALUATION_FAILED_NO_CASE`: the evaluation failed or was parked and has no case.
 - `DUPLICATE_REQUEST`: the research service mapped this candidate to a request that another candidate already holds (a submit retried past New York midnight, then the same cohort the next evening). One WARNING names both candidates. The other candidate carries the case and its judgment.
 - `RPC_<code>`: the typed call was refused by the service.
+- `RESEARCH_REPLY_MISMATCH`: `get_evaluation` answered with a case of another kind or another version than the candidate asked for. ERROR log. The candidate closes and, for a renewal, the line ends. See "Renewal".
 
 Judgment `code` when the verdict is `NO_VERDICT`: `JEV_OFF_MENU`, `JEV_NARRATIVE_MISSING`, `OUTPUT_*` (bad JSON or schema), `MODEL_REFUSED_<code>` (for example the budget is spent), `MODEL_FAILED_<outcome>`, `ENGINE_ERROR`, `PROCESS_RESTARTED`. Judgment `error_code` (state REFUSED): the trader refused the record (`JUDGMENT_MENU_MISMATCH`, `DEPLOY_NOT_ALLOWED`, `RPC_*`, ...). The line ends.
 
@@ -673,7 +674,53 @@ Registration `state` and `error_code`:
 - `ATTEST_<code>`: the research service refused the attestation for good. The line ends with ERROR.
 - `ATTEST_<code>_RETRIES_EXHAUSTED`: the attestation failed `ATTEST_MAX_TRIES` (3) times. `TRADER_UNAVAILABLE` does not count as a try.
 - `RPC_<code>` or the trader's own code (`JUDGMENT_*`, `BUNDLE_*`, `FAMILY_COOLING_DOWN`, `RENEWAL_PRIOR_INVALID`, ...): registration refused. The line ends.
-- `line_state ENDED` with `error_code` EXPIRED, WITHDRAWN or ENDED: the deployed version is over. No renewal yet.
+- `line_state ENDED` with `error_code` WITHDRAWN or ENDED: the deployed version was withdrawn, or a judgment ended it. The line is over. An EXPIRED version is not an end: it asks for a renewal (see "Renewal").
+
+### Renewal
+
+A DEPLOY runs for `deploy_expiry_sessions` sessions. It is `EXPIRED` from the New York day after its `expiry_session`. On the evening of its last session it is still `ACTIVE`, so the renewal is asked at the next session's slot.
+
+- **Ask.** In the first evening slot after the expiry (the next session's evening), the `ai` service asks the `research` service for a renewal (`submit_evaluation`, kind RENEWAL, naming only the version). The line goes from LIVE to RENEWING. There is one renewal candidate per version (`kind = 'RENEWAL'` in `ai_research_candidates`).
+- **Case.** The research service reads the version's forward evidence from the trader (`get_deployment_forward_evidence`: each session's shadow row, and the paper trips) and signs a RENEWAL case. It opens no holdout, writes no trial and uses no daily evaluation slot. The case is ready at once.
+- **Jev.** Jev may choose DEPLOY only when every forward session is `COMPLETE`. SHADOW, REJECT or `NO_VERDICT` ends the line. REJECT also cools the strategy key down.
+- **DEPLOY.** The `ai` service registers it (`register_ai_deployment`) on the same bundle, with no new attestation. The trader seals a new deployment version that starts at the next session. The old version shows `ENDED` and never trades again. The old line ends as `RENEWED`; the new version has its own LIVE line and can be renewed in turn.
+- **Retries.** A renewal waiting on `FORWARD_EVIDENCE_PENDING` (shadow rows not final yet) keeps waiting. It is asked again on every pump and moves to the next slot's cycle when its own window closes. It is not closed as `STALE_NOT_SUBMITTED`. A lost submit or registration reply is sent again with the same body.
+- **Trader error.** If the trader's forward-evidence read fails with any error that is not `*_TAMPERED` (for example `DEPLOYMENT_CALENDAR_UNAVAILABLE`, or a bug), the research service refuses the renewal for now: `TRADER_ERROR`, retryable, with an ERROR log naming the trader's code. It stores no row. The line stays RENEWING and the next pump asks again. A lasting `TRADER_ERROR` in the research log needs you.
+
+Refused before Jev (the candidate closes as `REFUSED_<code>` and the line ends as `RENEWAL_REFUSED_<code>`). The code is one of:
+- `BUNDLE_EXPIRED`: the bundle attestation ran out, or has no session left. Only a new evaluation with a new, disjoint holdout can deploy this strategy again.
+- `FAMILY_COOLING_DOWN`, `STRATEGY_NOT_ALLOWED` (the key left `strategy_allowlist`), `STRATEGY_SOURCE_CHANGED` (the strategy file is not the deployed bytes).
+- `RENEWAL_LINE_ENDED`, `RENEWAL_PRIOR_INVALID` (withdrawn or already renewed), `RENEWAL_NOT_DUE`, `RENEWAL_ALREADY_JUDGED`, `DEPLOYMENT_VERSION_UNKNOWN`.
+
+`error_code` of the old line in `ai_research_registrations`:
+- `RENEWED`: a new version was registered.
+- `RENEWAL_<verdict>`: Jev judged SHADOW, REJECT or NO_VERDICT.
+- `RENEWAL_REFUSED_<code>`: refused before Jev (list above).
+- `RENEWAL_JUDGMENT_<code>`: the trader refused to record the judgment (for example `RENEWAL_ALREADY_JUDGED`, or `FORWARD_INCOMPLETE` on a DEPLOY). A loud error shows as `RENEWAL_JUDGMENT_RPC_<code>`.
+- `RENEWAL_REGISTER_<code>`: the trader refused the registration (for example `BUNDLE_EXPIRED`, `RENEWAL_PRIOR_INVALID`). A loud error shows as `RENEWAL_REGISTER_RPC_<code>`.
+- `RENEWAL_RPC_<code>`: the research service refused a typed call. ERROR log.
+- `RENEWAL_EVALUATION_FAILED_NO_CASE`, `RENEWAL_EVALUATION_STALE`, `RENEWAL_DUPLICATE_REQUEST`, `RENEWAL_RESEARCH_REPLY_MISMATCH`: the candidate ended with that `end_code` and no judgment.
+- `RENEWAL_REGISTRATION_BODY_MISSING`: Jev judged DEPLOY and the trader recorded it, but the old line's own `ai_research_registrations` row has no `body_json` or `bundle_digest` to register again. ERROR log. Nothing is registered. Look for a damaged `ai.duckdb`.
+- The line stays RENEWING while a step waits: the research service or the trader is away, a retryable refusal, `FORWARD_EVIDENCE_PENDING`, or `WAITING_CAP`. A RENEWING line whose candidate was closed without a judgment is asked again at the next slot (ERROR log).
+
+Failures that need you:
+- **Tampered record.** If the trader finds a stored record changed (a code ending in `TAMPERED`, for example `FORWARD_EVIDENCE_TAMPERED`, `DEPLOYMENT_VERSION_TAMPERED`, `JUDGMENT_TAMPERED`), it answers with a loud RPC error, never a REFUSED body. Unreadable evaluation cases (`CASE_*`) and an unservable calendar are loud too; on the forward-evidence read the research service turns those into a retryable `TRADER_ERROR` (see "Trader error" above).
+  - Research service: a `*_TAMPERED` forward-evidence read parks the renewal (ERROR log). The request reads `FAILED` with no case.
+  - `ai` service: the candidate ends as `EVALUATION_FAILED_NO_CASE` and the line as `RENEWAL_EVALUATION_FAILED_NO_CASE`. The tamper code itself is only in the research service log (and in `parked_reason`).
+  - A parked renewal is final. After you repair the record at the trader:
+    1. Stop the research service (one writer). In `mmr_research.duckdb` (volume `mmr_research_data`), table `research_requests`, delete the row with `state = 'PARKED'` whose `body_json` names the version.
+    2. Stop `ai`. In `ai.duckdb` (volume `mmr_ai_data`), set that version's `ai_research_registrations` row back to `line_state = 'LIVE'` (`error_code` NULL) and delete its `rr-` candidate row in `ai_research_candidates`.
+    3. Start both. The next slot reads the version as `EXPIRED` again and asks for the renewal. `tests/ai/research/test_renewal_parked_repair.py` runs these steps.
+  - These steps are only for a PARKED renewal (the line ended `RENEWAL_EVALUATION_FAILED_NO_CASE` and the research row is `PARKED`). Do not use them after a line ended `RENEWAL_JUDGMENT_RPC_<code>_TAMPERED`: there the research request is DONE with a case, and `ai` already holds the refused judgment of that case, so a new ask finds the same case and the candidate stays EVALUATED, never judged. (This follows from the code; it was not run.)
+  - At the trader, one tampered RENEWAL judgment row fails every AI entry closed (`DEPLOYMENT_STATE_UNAVAILABLE`, retryable, with an ERROR log) until it is repaired. Do not leave it.
+- **Mismatched reply.** A `get_evaluation` reply that never matches its candidate closes loudly (`RESEARCH_REPLY_MISMATCH`, ERROR log) and ends the line. Look for a research service and `ai` build that differ.
+- **Withdraw.** Withdrawing a superseded (renewed) version is refused with `VERSION_SUPERSEDED`, naming its successor. Withdraw the successor.
+
+Known limits of renewal:
+- One session passes without an active version between the expiry and the renewed version (ruling 1).
+- A version whose registration lands after its judgment's New York day (a lost reply sent again, or a `WAITING_CAP` wait) can never renew with DEPLOY. Its first forward session falls outside the judgment's shadow window, so that session is never COMPLETE (owner ruling 4, an extra cost accepted). Only a new evaluation can deploy it again.
+- A Jev outage during a renewal ends the line (the judgment is `NO_VERDICT`).
+- The forward window needs the shadow rows of the research service. If shadow replay is behind, the renewal waits (`FORWARD_EVIDENCE_PENDING`), then the sessions count as incomplete after `shadow_incomplete_after_hours`.
 
 ### Waiting on purpose
 
@@ -693,7 +740,7 @@ Registration `state` and `error_code`:
 
 ### Known limits
 
-- No renewal before SP2c Plan 5. An expired DEPLOY ends. Only a new evaluation with a new, disjoint holdout can deploy that strategy again.
+- Renewal has its own limits: see "Renewal" above. After a `BUNDLE_EXPIRED` refusal only a new evaluation with a new, disjoint holdout can deploy that strategy again.
 - The research service runs one evaluation at a time.
 - A crash during a Jev call loses that case (`PROCESS_RESTARTED`). A crash during the orchestrator call loses that night's slot.
 - A submit reply lost just before New York midnight and sent again after it is a new request and uses a second evaluation slot (Plan 3, Ruling 1).

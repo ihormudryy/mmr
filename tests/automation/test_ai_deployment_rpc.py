@@ -109,7 +109,8 @@ def test_the_version_migrations_are_applied_to_the_trader_journal(served):
 def test_every_ai_paper_store_shares_the_one_journal_connection(served):
     services = served.composed.stack.ai_paper
     journal = served.trader.journal_db
-    assert services.versions._db is journal and services.registrar._db is journal
+    assert services.versions._db is journal and services.registrar._journal is served.trader.domain_journal
+    assert served.trader.domain_journal.db is journal                       # a seal shares the withdrawal's lock
     assert services.deployments._db is journal and services.judgments._db is journal
     assert served.trader.ai_deployment_versions is services.versions
     assert served.trader.ai_deployment_activity is services.activity

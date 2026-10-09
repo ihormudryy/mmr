@@ -25,6 +25,14 @@ Mappings from the plan text to the helpers as built (adapted here only):
 - Monday: ``next_morning`` first refreshes the trader's daily bars (twenty closed sessions as of Monday), as the
   data service does each night; the trader's history fixture otherwise ends on Thursday.
 - ``strategy_trials()`` is the count of the registry's trials of ``KEY``.
+
+SP2c Plan 5 Task 8 (renewal) mappings:
+- ``deploy_expiry_sessions`` goes to both judges: the trader's (set by the ``prepare`` seam, not ``trader.yaml``) and
+  the research side's own ``BacktestJudgeConfig``.
+- The seeded reader's Plan 1 fallback gets ``renewals_of`` from the stack's ``BacktestJudgments``, as the production
+  reader does, so a SHADOW/REJECT renewal ends the old version.
+- ``RenewalRequests`` takes ``incomplete_after_hours`` from this world's ``ResearchServiceConfig`` (the default 16 h).
+- ``research_signer`` is the world's ``signer``; ``node_rows`` takes ``params``.
 """
 from __future__ import annotations
 
@@ -66,7 +74,9 @@ from trader.research.cohort_evaluation import evaluate_cohort
 from trader.research.evaluation import EvaluationPaths
 from trader.research.evaluation_service import EvaluationService
 from trader.research.experiment_registry import ExperimentRegistry
+from trader.research.forward_evidence_view import ForwardEvidenceView
 from trader.research.judgment_attest import JudgmentAttest
+from trader.research.renewal_service import RenewalRequests
 from trader.research.research_surface import build_research_registry
 from trader.research.schema import apply_research_migrations
 from trader.research.service_config import ResearchServiceConfig
@@ -124,7 +134,8 @@ class ResearchStrategyNode(StrategyNode):
 class _TraderResearchFiles:
     """What the trader reads from the research service: the artifacts root and the research signer's key."""
 
-    def __init__(self, root: Path, signer: AttestationSigner):
+    def __init__(self, root: Path, signer: AttestationSigner, deploy_expiry_sessions: int):
+        self.deploy_expiry_sessions = deploy_expiry_sessions
         self.artifacts = root / "artifacts"
         self.verify = root / "keys" / "verify"
         self.artifacts.mkdir(parents=True, exist_ok=True)
@@ -132,7 +143,7 @@ class _TraderResearchFiles:
         (self.verify / "research.pem").write_bytes(signer.public_key_pem())
 
     def prepare(self, trader: Any) -> None:
-        judge = BacktestJudgeConfig(strategy_allowlist=(KEY,))
+        judge = BacktestJudgeConfig(strategy_allowlist=(KEY,), deploy_expiry_sessions=self.deploy_expiry_sessions)
         trader.ai_paper_config = dataclasses.replace(trader.ai_paper_config, backtest_judge=judge)
         trader.research_artifacts_root = str(self.artifacts)
         trader.research_verify_dir = str(self.verify)
@@ -164,16 +175,21 @@ class ResearchWorld:
 
     @classmethod
     async def build(cls, tmp_path: Path, loop_thread: Any, monkeypatch: Any, *, holdout_drift: Optional[float] = None,
-                    flaky_lab: bool = False) -> "ResearchWorld":
+                    flaky_lab: bool = False, deploy_expiry_sessions: int = 20,
+                    renewals: bool = False) -> "ResearchWorld":
+        """``renewals`` serves submit_evaluation kind RENEWAL (SP2c Plan 5); without it the research service
+        refuses RENEWAL_NOT_SUPPORTED, as before Plan 5."""
         self = cls()
         try:
-            await self._build(tmp_path, loop_thread, monkeypatch, holdout_drift, flaky_lab)
+            await self._build(tmp_path, loop_thread, monkeypatch, holdout_drift, flaky_lab, deploy_expiry_sessions,
+                              renewals)
         except BaseException:
             self.close()
             raise
         return self
 
-    async def _build(self, tmp_path, loop_thread, monkeypatch, holdout_drift, flaky_lab) -> None:
+    async def _build(self, tmp_path, loop_thread, monkeypatch, holdout_drift, flaky_lab, deploy_expiry_sessions,
+                     renewals) -> None:
         # The trader reads trading_filters.yaml from here, never from the developer's ~/.config/mmr.
         monkeypatch.setattr("trader.trading.trading_filter._default_path", lambda: tmp_path / "trading_filters.yaml")
         monkeypatch.setenv("MMR_STRATEGIES_EXTRA_ROOT", str(tmp_path))
@@ -183,7 +199,7 @@ class ResearchWorld:
         (self.repo / "strategies").mkdir(parents=True)
         (self.repo / STRATEGY_PATH).write_text(TIME_OF_DAY_STRATEGY)
         self.signer = AttestationSigner.generate()
-        trader_side = _TraderResearchFiles(tmp_path, self.signer)
+        trader_side = _TraderResearchFiles(tmp_path, self.signer, deploy_expiry_sessions)
         self.artifacts = trader_side.artifacts
 
         market = TraderMarket()
@@ -192,12 +208,13 @@ class ResearchWorld:
         self._closers.append(self.world.close)
         market.now = self.world.served.now
         served = self.world.served
-        served.seeded._inner = plan1_judgment_reader_for(served.stack.ai_paper.judgments,
-                                                         cases_dir=self.artifacts / "cases",
-                                                         verify_dir=trader_side.verify)
+        judgments = served.stack.ai_paper.judgments
+        served.seeded._inner = plan1_judgment_reader_for(judgments, cases_dir=self.cases_dir,
+                                                         verify_dir=trader_side.verify,
+                                                         renewals_of=judgments.renewals_of)
         served.clock[0] = FRIDAY_AFTER_CLOSE
 
-        self._start_research_service(tmp_path / "research", holdout_drift)
+        self._start_research_service(tmp_path / "research", holdout_drift, deploy_expiry_sessions, renewals)
         self._flaky_lab = flaky_lab
 
         digest = register_discretionary(self.world)
@@ -215,7 +232,8 @@ class ResearchWorld:
                                           strategies_root=self.repo)
         self.strategy = ResearchStrategyNode(served, strategies_dir=self.repo / "strategies")
 
-    def _start_research_service(self, root: Path, holdout_drift: Optional[float]) -> None:
+    def _start_research_service(self, root: Path, holdout_drift: Optional[float], deploy_expiry_sessions: int,
+                                renewals: bool) -> None:
         served = self.world.served
         root.mkdir()
         bars = str(root / "bars.duckdb")
@@ -232,7 +250,7 @@ class ResearchWorld:
         self.trader_port = TraderPort(served.sockets.client("research", "trader", "query", timeout=30.0),
                                       served.sockets.client("research", "trader", "command", timeout=30.0))
         config = ResearchServiceConfig(period_sessions=40, folds=2, embargo_sessions=1, holdout_sessions=5)
-        judge = BacktestJudgeConfig(strategy_allowlist=(KEY,))
+        judge = BacktestJudgeConfig(strategy_allowlist=(KEY,), deploy_expiry_sessions=deploy_expiry_sessions)
         paths = EvaluationPaths(bars, bars, "Universes", str(costs_path), self.repo, root / "reports",
                                 self.artifacts / "evaluations")
         universe = UniverseAccessor(bars, "Universes")
@@ -247,7 +265,12 @@ class ResearchWorld:
             evaluate=lambda spec: evaluate_cohort(spec, research_db=self.research_db, paths=paths, now=now,
                                                   ruleset=holdout_ruleset()),
             signer=self.signer, artifacts_root=self.artifacts, warmup_sessions=judge.shadow_warmup_sessions,
-            order_notional=config.order_notional, queue_max=config.queue_max, now=now)
+            order_notional=config.order_notional, queue_max=config.queue_max, now=now,
+            renewals=RenewalRequests(store=store, trader=self.trader_port, signer=self.signer,
+                                     artifacts_root=self.artifacts, repo_root=self.repo, judge=judge,
+                                     warmup_sessions=judge.shadow_warmup_sessions,
+                                     incomplete_after_hours=config.shadow_incomplete_after_hours,
+                                     now=now) if renewals else None)
         attest = JudgmentAttest(research_db=self.research_db, store=store, trader=self.trader_port,
                                 signer=self.signer, artifacts_root=self.artifacts, repo_root=self.repo,
                                 is_paper=lambda: True, now=now, ruleset=holdout_ruleset())
@@ -315,9 +338,54 @@ class ResearchWorld:
         frame.index.name = "date"
         return frame
 
+    # -- renewal evenings and mornings (SP2c Plan 5) ----------------------------------------------------------------
+    def evening(self, day: dt.date) -> None:
+        """17:00 New York on ``day``: inside that evening's research window (slot due from 16:30).
+
+        It is one ``run_session`` jump, so it skips the sessions in between on purpose: they get no session-end
+        ledger rows."""
+        self.world.served.run_session(dt.datetime.combine(day, dt.time(17, 0), NEW_YORK).astimezone(dt.timezone.utc))
+
+    def morning(self, day: dt.date, hour: int, minute: int) -> None:
+        self.world.served.run_session(dt.datetime.combine(day, dt.time(hour, minute), NEW_YORK)
+                                      .astimezone(dt.timezone.utc))
+
+    def version(self, digest: str) -> dict:
+        return self.trader_call("cli", "get_ai_deployment_version", {"version_digest": digest})["version"]
+
+    def record_forward_rows(self, judgment_id: str, sessions, *, status: str = "COMPLETE") -> None:
+        """Rows as the research replay sends them: signed as research through the real record_shadow_result."""
+        judgment = self.trader_call("research", "get_backtest_judgment",
+                                    {"judgment_id": judgment_id, "case_digest": None})["judgment"]
+        for day in sessions:
+            numbers = ({"reason": None, "pnl_usd": 6.0, "fees_usd": 1.0, "trades": 1, "end_equity_usd": 100_006.0}
+                       if status == "COMPLETE" else
+                       {"reason": "BARS_MISSING: fixture", "pnl_usd": None, "fees_usd": None, "trades": None,
+                        "end_equity_usd": None})
+            reply = self.trader_call("research", "record_shadow_result", {
+                "judgment_id": judgment_id, "case_digest": judgment["case_digest"], "verdict": judgment["verdict"],
+                "session_date": day.isoformat(), "status": status, "bar_size": "15 mins", **numbers})
+            assert reply["status"] == "INSERTED", reply
+
+    def opened_holdouts(self) -> int:
+        return len(self.registry.opened_holdout_windows(STRATEGY_PATH, STRATEGY_CLASS))
+
+    def forward_view(self, version: str) -> ForwardEvidenceView:
+        reply = self.trader_call("research", "get_deployment_forward_evidence", {"deployment_version": version})
+        assert reply["status"] == "FOUND", reply
+        return ForwardEvidenceView.model_validate(reply["evidence"])
+
+    @property
+    def cases_dir(self) -> Path:
+        return self.artifacts / "cases"                    # the directory the trader reads cases from
+
+    @property
+    def research_signer(self) -> AttestationSigner:
+        return self.signer
+
     # -- reads and calls ------------------------------------------------------------------------------------------
-    def node_rows(self, sql: str) -> list:
-        return self.node.node.store.db.execute(sql, fetch="all")
+    def node_rows(self, sql: str, params: Optional[list] = None) -> list:
+        return self.node.node.store.db.execute(sql, params, fetch="all")
 
     def trader_rows(self, sql: str) -> list:
         return self.world.served.trader.journal_db.execute(sql, fetch="all")

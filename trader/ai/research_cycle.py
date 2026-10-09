@@ -1,9 +1,11 @@
 """The ai controller's research cycle (SP2c spec 5.3, 8; Plan 4 Rulings 1-21).
 
-run_due_slot(): once per session after the close: end expired lines, one orchestrator call, screening, candidates.
+run_due_slot(): once per session after the close: ask renewals of expired lines, end withdrawn or ended ones, one
+orchestrator call, screening, candidates.
 pump(): inside the research window, moves each durable row one step. Every step is stored before its RPC and is
 safe to repeat: a lost reply resends the stored body unchanged. A candidate is submitted only inside its own
-slot's window; one that window never sent is closed as STALE_NOT_SUBMITTED, never carried into another night.
+slot's window; an INITIAL one that window never sent is closed as STALE_NOT_SUBMITTED, never carried into another
+night (a waiting renewal is never closed so; it is asked again in the next window).
 recover(): at controller start, settles what a dead process left RUNNING or JUDGING; the pump resumes the rest."""
 from __future__ import annotations
 
@@ -24,8 +26,8 @@ from trader.ai.outbox import register_context_in_tx
 from trader.ai.research_menu import Dropped, ResearchMenu, build_menu, screen_picks
 from trader.ai.research_roles import parse_research_proposal, research_messages
 from trader.ai.research_wire import (AttestReply, Binding, CaseSummary, EvaluationView, JudgmentReceipt,
-                                     RegisterRefused, SubmitReply, VersionReply, WireError, parse_registration,
-                                     parse_reply)
+                                     Registered, RegisterRefused, SubmitReply, VersionReply, WireError,
+                                     parse_registration, parse_reply)
 from trader.ai.rpc_clients import RpcNotSent, RpcOutcomeUnknown, RpcRefused
 from trader.ai.schedule import ResearchSlot
 from trader.ai.store import to_utc
@@ -33,7 +35,9 @@ from trader.ai.untrusted import OutputRefusal, fence_untrusted
 
 logger = logging.getLogger(__name__)
 AWAY = (RpcNotSent, RpcOutcomeUnknown)        # RESEARCH_UNREACHABLE, TRADER_UNREACHABLE, a lost reply: next tick
-LINE_ENDING_STATES = frozenset({"EXPIRED", "WITHDRAWN", "ENDED"})
+RENEWAL = "RENEWAL"
+RENEWABLE_STATE = "EXPIRED"                   # Plan 5 ruling 1: a version is renewed only after it expired
+LINE_ENDING_STATES = frozenset({"WITHDRAWN", "ENDED"})
 THESIS_LABEL = "orchestrator_thesis"
 THESIS_MAX_CHARS = 1000                   # the proposal schema's own limit
 TERMINAL = frozenset({"DONE", "FAILED"})
@@ -42,6 +46,8 @@ ATTEST_WAITS_FOR_TRADER = "TRADER_UNAVAILABLE"   # infrastructure behind the res
 ATTEST_MAX_TRIES = 3                             # a "retryable" bundle error may be deterministic (Plan 3 as built)
 STALE_NOT_SUBMITTED = "STALE_NOT_SUBMITTED"
 DUPLICATE_REQUEST = "DUPLICATE_REQUEST"
+RESEARCH_REPLY_MISMATCH = "RESEARCH_REPLY_MISMATCH"     # a case of another kind or version than the candidate asked
+RENEWAL_REGISTRATION_BODY_MISSING = "RENEWAL_REGISTRATION_BODY_MISSING"   # the renewed line's own row is damaged
 SLOT_HOLD_SECONDS = 60                           # a slot refused with no retry time waits this long between tries
 
 
@@ -60,6 +66,11 @@ def _sha(text: str) -> str:
 def candidate_id_for(cycle_id: str, strategy_key: str) -> str:
     """The only candidate identity. The table has no UNIQUE(cycle_id, strategy_key): every insert uses this id."""
     return "rc-" + _sha(f"{cycle_id}|{strategy_key}")[:32]
+
+
+def renewal_candidate_id(prior_version_digest: str) -> str:
+    """Ruling 15: one renewal candidate per version, whatever the cycle."""
+    return "rr-" + _sha(f"{RENEWAL}|{prior_version_digest}")[:32]
 
 
 def proposal_request_key(cycle_id: str) -> str:
@@ -169,7 +180,7 @@ class ResearchCycle:
 
     async def _run_slot(self, slot: ResearchSlot, experiment_id: str) -> None:
         if self._lines_checked_for != slot.cycle_id:
-            await self._end_finished_lines()
+            await self._end_finished_lines(slot)
             self._lines_checked_for = slot.cycle_id
         rows = await self._store.aquery("SELECT strategy_key FROM ai_research_cooldowns WHERE until_session >= ?",
                                         [f"{slot.session_date:%Y-%m-%d}"])
@@ -247,11 +258,12 @@ class ResearchCycle:
             return OutputRefusal(f"MODEL_FAILED_{exc.outcome}", exc.code)
         return parse_research_proposal(result.response.text)
 
-    async def _end_finished_lines(self) -> None:
-        """Ruling 17: no renewal in SP2c. An expired, withdrawn or ended version ends its line here."""
-        rows = await self._store.aquery("SELECT version_digest FROM ai_research_registrations "
+    async def _end_finished_lines(self, slot: ResearchSlot) -> None:
+        """An EXPIRED version asks for a renewal (the line becomes RENEWING); WITHDRAWN or ENDED ends the line."""
+        await self._store.atransaction(lambda conn: self._reopen_stranded_renewals_in_tx(conn, slot))
+        rows = await self._store.aquery("SELECT version_digest, strategy_key FROM ai_research_registrations "
                                         "WHERE state = 'REGISTERED' AND line_state = 'LIVE'")
-        for (version,) in rows:
+        for version, strategy_key in rows:
             try:
                 reply = parse_reply(VersionReply, "get_ai_deployment_version", await self._registry.call(
                     "get_ai_deployment_version", {"version_digest": version}))
@@ -260,12 +272,60 @@ class ResearchCycle:
                 continue
             if not reply.found:
                 logger.error("deployment version %s is unknown to the trader", version)
+            elif reply.version.state == RENEWABLE_STATE:
+                await self._store.atransaction(lambda conn, v=version, k=strategy_key:
+                                               self._request_renewal_in_tx(conn, slot, v, k))
             elif reply.version.state in LINE_ENDING_STATES:
-                logger.info("deployment line of %s ended: %s (renewal is not available in SP2c)", version,
-                            reply.version.state)
-                await self._update("UPDATE ai_research_registrations SET line_state = 'ENDED', error_code = ?, "
-                                   "updated_at = ? WHERE version_digest = ?",
-                                   [reply.version.state, self._clock.now(), version])
+                await self._store.atransaction(lambda conn, v=version, s=reply.version.state:
+                                               self._end_line_in_tx(conn, v, s))
+
+    def _reopen_stranded_renewals_in_tx(self, conn: Any, slot: ResearchSlot) -> None:
+        """Ruling 17: a RENEWING line whose candidate was closed without a judgment asks again (never silently
+        ends). A renewal still NEW from an earlier window (say, waiting on FORWARD_EVIDENCE_PENDING) moves on.
+        Both join this slot's cycle, so the pump does not close them as STALE_NOT_SUBMITTED."""
+        now = self._clock.now()
+        moved = conn.execute(
+            "UPDATE ai_research_candidates SET cycle_id = ?, updated_at = ? WHERE kind = 'RENEWAL' AND state = 'NEW' "
+            "AND cycle_id <> ? AND prior_version_digest IN (SELECT version_digest FROM ai_research_registrations "
+            "WHERE line_state = 'RENEWING') RETURNING candidate_id", [slot.cycle_id, now, slot.cycle_id]).fetchall()
+        for (candidate_id,) in moved:
+            logger.info("renewal candidate %s still waits; it moves to %s", candidate_id, slot.cycle_id)
+        rows = conn.execute(
+            "SELECT c.candidate_id, c.end_code FROM ai_research_registrations r "
+            "JOIN ai_research_candidates c ON c.kind = 'RENEWAL' AND c.prior_version_digest = r.version_digest "
+            "LEFT JOIN ai_backtest_judgments j ON j.candidate_id = c.candidate_id "
+            "WHERE r.line_state = 'RENEWING' AND c.state = 'CLOSED' AND j.judgment_id IS NULL").fetchall()
+        for candidate_id, end_code in rows:
+            logger.error("renewal candidate %s was closed (%s) without a judgment; asked again", candidate_id, end_code)
+            conn.execute("UPDATE ai_research_candidates SET state = 'NEW', cycle_id = ?, end_code = NULL, "
+                         "request_id = NULL, submit_reply_lost = FALSE, accepted_at = NULL, next_try_at = ?, "
+                         "updated_at = ? WHERE candidate_id = ?", [slot.cycle_id, now, now, candidate_id])
+
+    def _request_renewal_in_tx(self, conn: Any, slot: ResearchSlot, version: str, strategy_key: str) -> None:
+        """The candidate shares the cycle with INITIAL ones, but the cap close skips it (kind = 'RENEWAL').
+        The body names only the version: the research service builds the case (Plan 5 ruling 2: no claim)."""
+        body = canonical_json({"kind": RENEWAL, "prior_version_digest": version})
+        now = self._clock.now()
+        conn.execute(                                         # only while the line is LIVE: no orphan renewal
+            "INSERT INTO ai_research_candidates (candidate_id, cycle_id, kind, strategy_key, prior_version_digest, "
+            "body_json, body_sha256, state, next_try_at, created_at, updated_at) "
+            "SELECT ?, ?, 'RENEWAL', ?, ?, ?, ?, 'NEW', ?, ?, ? FROM ai_research_registrations "
+            "WHERE version_digest = ? AND line_state = 'LIVE' ON CONFLICT (candidate_id) DO NOTHING",
+            [renewal_candidate_id(version), slot.cycle_id, strategy_key, version, body, _sha(body), now, now, now,
+             version])
+        renewing = conn.execute("UPDATE ai_research_registrations SET line_state = 'RENEWING', updated_at = ? "
+                                "WHERE version_digest = ? AND line_state = 'LIVE' RETURNING version_digest",
+                                [now, version]).fetchone()
+        if renewing is not None:
+            logger.info("deployment version %s expired; renewal requested", version)
+
+    def _end_line_in_tx(self, conn: Any, version: str, code: str) -> None:
+        ended = conn.execute(
+            "UPDATE ai_research_registrations SET line_state = 'ENDED', error_code = ?, updated_at = ? "
+            "WHERE version_digest = ? AND line_state IN ('LIVE', 'RENEWING') RETURNING version_digest",
+            [code, self._clock.now(), version]).fetchone()
+        if ended is not None:
+            logger.info("deployment line of %s ended: %s", version, code)
 
     # -- the pump ------------------------------------------------------------------------------------
     async def pump(self) -> None:
@@ -294,12 +354,14 @@ class ResearchCycle:
                 logger.exception("research %s failed for %s", what, row[0])
 
     async def _close_unsent_of_closed_windows(self, open_cycle_id: str) -> None:
-        """A candidate of an earlier slot that was never accepted, because it was written after its window
-        closed or every try was lost, is closed: tomorrow's research day would claim a new evaluation for it."""
+        """An INITIAL candidate of an earlier slot that was never accepted, because it was written after its
+        window closed or every try was lost, is closed: tomorrow's research day would claim a new evaluation for
+        it. A waiting renewal is never closed here; the next slot moves it into its own cycle."""
         now = self._clock.now()
         rows = await self._store.atransaction(lambda conn: conn.execute(
             "UPDATE ai_research_candidates SET state = 'CLOSED', end_code = ?, updated_at = ? "
-            "WHERE state = 'NEW' AND cycle_id <> ? RETURNING candidate_id, cycle_id, submit_reply_lost",
+            "WHERE state = 'NEW' AND kind = 'INITIAL' AND cycle_id <> ? "
+            "RETURNING candidate_id, cycle_id, submit_reply_lost",
             [STALE_NOT_SUBMITTED, now, open_cycle_id]).fetchall())
         for candidate_id, cycle_id, reply_lost in rows:
             if reply_lost:
@@ -313,10 +375,10 @@ class ResearchCycle:
     # submit, and resend the unchanged body after a lost reply (Ruling 9) ------------------------------
     async def _start_new(self, slot: ResearchSlot, now: dt.datetime) -> None:
         rows = await self._store.aquery(
-            "SELECT candidate_id, cycle_id, strategy_key, body_json FROM ai_research_candidates "
+            "SELECT candidate_id, cycle_id, strategy_key, body_json, prior_version_digest FROM ai_research_candidates "
             "WHERE state = 'NEW' AND next_try_at <= ? ORDER BY created_at, candidate_id", [now])
 
-        async def start(candidate_id, cycle_id, strategy_key, body_json):
+        async def start(candidate_id, cycle_id, strategy_key, body_json, prior):
             if not self._slots.research_due(slot, self._clock.now()):
                 return                                                    # an earlier submit ran past closes_at
             if await self._store.aquery("SELECT state FROM ai_research_candidates WHERE candidate_id = ?",
@@ -330,17 +392,17 @@ class ResearchCycle:
             except RpcOutcomeUnknown:                                     # it may have claimed an evaluation
                 return await self._mark_submit_reply_lost(candidate_id)
             except RpcRefused as exc:
-                return await self._close_loudly(candidate_id, f"RPC_{exc.code}", "submit_evaluation", exc)
+                return await self._close_loudly(candidate_id, f"RPC_{exc.code}", "submit_evaluation", exc, prior)
             if reply.status in ("ACCEPTED", "DUPLICATE"):
                 if reply.request_id is None:
                     raise WireError(f"submit_evaluation: {reply.status} without a request id")
-                return await self._mark_submitted(candidate_id, reply.request_id)
+                return await self._mark_submitted(candidate_id, reply.request_id, prior)
             if reply.retryable:
                 logger.warning("research candidate %s: submit refused for now (%s); sent again next tick",
                                candidate_id, reply.code)
                 return
             logger.warning("research candidate %s: submit refused: %s", candidate_id, reply.code)
-            await self._submit_refused(candidate_id, cycle_id, strategy_key, reply.code)
+            await self._submit_refused(candidate_id, cycle_id, strategy_key, reply.code, prior)
         await self._each(rows, start, "submit")
 
     async def _mark_submit_reply_lost(self, candidate_id: str) -> None:
@@ -359,7 +421,7 @@ class ResearchCycle:
             raise WireError(f"get_evaluation: request id {view.request_id} is not the local {request_id}")
         return view
 
-    async def _mark_submitted(self, candidate_id: str, request_id: str) -> None:
+    async def _mark_submitted(self, candidate_id: str, request_id: str, prior: Optional[str] = None) -> None:
         """One request has one case and one judgment. A second candidate the service maps to a request another
         candidate holds (a submit retried past New York midnight, then the same cohort the next evening) ends."""
         now = self._clock.now()
@@ -369,7 +431,7 @@ class ResearchCycle:
                                   "AND candidate_id <> ? ORDER BY created_at LIMIT 1",
                                   [request_id, candidate_id]).fetchone()
             if holder is not None:
-                self._close_in_tx(conn, candidate_id, DUPLICATE_REQUEST)
+                self._close_in_tx(conn, candidate_id, DUPLICATE_REQUEST, prior)
                 return holder[0]
             conn.execute("UPDATE ai_research_candidates SET state = 'SUBMITTED', request_id = ?, accepted_at = ?, "
                          "next_try_at = ?, updated_at = ? WHERE candidate_id = ?",
@@ -380,12 +442,13 @@ class ResearchCycle:
             logger.warning("research candidate %s ends: %s, request %s already belongs to candidate %s",
                            candidate_id, DUPLICATE_REQUEST, request_id, holder)
 
-    async def _submit_refused(self, candidate_id: str, cycle_id: str, strategy_key: str, code: Optional[str]) -> None:
+    async def _submit_refused(self, candidate_id: str, cycle_id: str, strategy_key: str, code: Optional[str],
+                              prior: Optional[str] = None) -> None:
         code = code or "REFUSED_WITHOUT_CODE"
         now = self._clock.now()
 
         def work(conn: Any) -> None:
-            self._close_in_tx(conn, candidate_id, f"REFUSED_{code}")
+            self._close_in_tx(conn, candidate_id, f"REFUSED_{code}", prior)
             if code == "FAMILY_COOLING_DOWN":
                 session = dt.datetime.strptime(cycle_id[len("rcy-"):], "%Y%m%d").date()
                 self._cool_in_tx(conn, strategy_key, f"{session:%Y-%m-%d}", "CLAIM_REFUSED")
@@ -397,25 +460,31 @@ class ResearchCycle:
 
     # poll -------------------------------------------------------------------------------------------
     async def _poll_submitted(self, now: dt.datetime) -> None:
-        rows = await self._store.aquery("SELECT candidate_id, request_id, accepted_at FROM ai_research_candidates "
-                                        "WHERE state = 'SUBMITTED' AND next_try_at <= ?", [now])
+        rows = await self._store.aquery("SELECT candidate_id, request_id, accepted_at, kind, prior_version_digest "
+                                        "FROM ai_research_candidates WHERE state = 'SUBMITTED' AND next_try_at <= ?",
+                                        [now])
         stale_after = dt.timedelta(hours=self._cfg.evaluation_stale_hours)
 
-        async def poll(candidate_id, request_id, accepted_at):
+        async def poll(candidate_id, request_id, accepted_at, kind, prior):
             try:
                 view = self._view(request_id, await self._lab.call("get_evaluation", {"request_id": request_id}))
             except AWAY:
                 return
             except RpcRefused as exc:
-                return await self._close_loudly(candidate_id, f"RPC_{exc.code}", "get_evaluation", exc)
+                return await self._close_loudly(candidate_id, f"RPC_{exc.code}", "get_evaluation", exc, prior)
             if view.found and view.state in TERMINAL and view.case_digest and view.summary is not None:
+                if (view.summary.kind, view.summary.prior_version_digest) != (kind, prior):
+                    return await self._close_loudly(
+                        candidate_id, RESEARCH_REPLY_MISMATCH, "get_evaluation",
+                        f"{request_id} answers a {view.summary.kind} case of {view.summary.prior_version_digest}, "
+                        f"not this {kind} candidate of {prior}", prior)
                 return await self._update(
                     "UPDATE ai_research_candidates SET state = 'EVALUATED', case_digest = ?, summary_json = ?, "
                     "updated_at = ? WHERE candidate_id = ?",
                     [view.case_digest, canonical_json(view.summary.model_dump(mode="json")), now, candidate_id])
             if view.found and view.state == "FAILED":                     # parked, or failed before any case
                 return await self._close_loudly(candidate_id, "EVALUATION_FAILED_NO_CASE", "get_evaluation",
-                                                f"request {request_id} ended without a case to judge")
+                                                f"request {request_id} ended without a case to judge", prior)
             if view.found and view.state == "DONE":
                 raise WireError(f"get_evaluation: {request_id} is DONE without a case")
             if not view.found:
@@ -423,7 +492,7 @@ class ResearchCycle:
             if now - to_utc(accepted_at) > stale_after:
                 logger.error("evaluation %s is still %s after %s; closed without a judgment", request_id,
                              view.state or "NOT_FOUND", stale_after)
-                return await self._close(candidate_id, "EVALUATION_STALE")
+                return await self._close(candidate_id, "EVALUATION_STALE", prior)
             await self._update("UPDATE ai_research_candidates SET next_try_at = ?, updated_at = ? "
                                "WHERE candidate_id = ?",
                                [now + dt.timedelta(seconds=self.poll_seconds), now, candidate_id])
@@ -440,7 +509,7 @@ class ResearchCycle:
 
         async def judge(candidate_id, case_digest, summary_json):
             case = BacktestCase(case_digest, parse_reply(CaseSummary, "case", json.loads(summary_json)))
-            judgment_id = judgment_id_for(case_digest)
+            judgment_id = judgment_id_for(case_digest, case.summary.kind)
             existing = await self._store.atransaction(lambda conn: self._open_judgment_in_tx(
                 conn, judgment_id, candidate_id, case, self._clock.now()))
             if existing is not None:
@@ -489,9 +558,11 @@ class ResearchCycle:
                                 [judgment_id]).fetchone()
         if existing is not None:
             return existing[0], existing[1]
-        conn.execute("INSERT INTO ai_backtest_judgments (judgment_id, candidate_id, case_digest, kind, menu_json, "
-                     "state, created_at, updated_at) VALUES (?, ?, ?, 'INITIAL', ?, 'JUDGING', ?, ?)",
-                     [judgment_id, candidate_id, case.case_digest, json.dumps(list(jev_menu(case))), now, now])
+        conn.execute("INSERT INTO ai_backtest_judgments (judgment_id, candidate_id, case_digest, kind, "
+                     "prior_version_digest, menu_json, state, created_at, updated_at) "
+                     "VALUES (?, ?, ?, ?, ?, ?, 'JUDGING', ?, ?)",
+                     [judgment_id, candidate_id, case.case_digest, case.summary.kind,
+                      case.summary.prior_version_digest, json.dumps(list(jev_menu(case))), now, now])
         return None
 
     async def _decide(self, judgment_id: str, candidate_id: str, case: BacktestCase,
@@ -513,18 +584,18 @@ class ResearchCycle:
     # record: EXISTING is success (Ruling 10) ---------------------------------------------------------
     async def _record_decided(self) -> None:
         rows = await self._store.aquery(
-            "SELECT j.judgment_id, j.verdict, j.body_json, c.strategy_key FROM ai_backtest_judgments j "
-            "JOIN ai_research_candidates c ON c.candidate_id = j.candidate_id "
+            "SELECT j.judgment_id, j.verdict, j.body_json, c.strategy_key, j.kind, j.prior_version_digest "
+            "FROM ai_backtest_judgments j JOIN ai_research_candidates c ON c.candidate_id = j.candidate_id "
             "WHERE j.state = 'DECIDED' ORDER BY j.decided_at")
 
-        async def record(judgment_id, verdict, body_json, strategy_key):
+        async def record(judgment_id, verdict, body_json, strategy_key, kind, prior):
             try:
                 receipt = parse_reply(JudgmentReceipt, "record_backtest_judgment", await self._registry.call(
                     "record_backtest_judgment", json.loads(body_json)))
             except AWAY:
                 return                                                    # resend the unchanged body
             except RpcRefused as exc:                                     # every trader refusal arrives here
-                return await self._refuse_judgment(judgment_id, f"RPC_{exc.code}", exc)
+                return await self._refuse_judgment(judgment_id, f"RPC_{exc.code}", exc, prior)
             if receipt.judgment_id != judgment_id:
                 raise WireError(f"record_backtest_judgment: receipt for {receipt.judgment_id}, not {judgment_id}")
             if receipt.status == "REFUSED":
@@ -532,7 +603,7 @@ class ResearchCycle:
                     logger.warning("judgment %s refused for now (%s); sent again next tick", judgment_id, receipt.code)
                     return
                 return await self._refuse_judgment(judgment_id, receipt.code or "REFUSED_WITHOUT_CODE",
-                                                   receipt.detail)
+                                                   receipt.detail, prior)
             if receipt.verdict != verdict:
                 raise WireError(f"record_backtest_judgment: the trader holds {receipt.verdict} for {judgment_id}, "
                                 f"this controller decided {verdict}")
@@ -543,31 +614,56 @@ class ResearchCycle:
                              "WHERE judgment_id = ?", [canonical_json(receipt.model_dump()), now, judgment_id])
                 if verdict == "REJECT" and receipt.cooldown_until_session is not None:
                     self._cool_in_tx(conn, strategy_key, receipt.cooldown_until_session, "REJECT")
-                if verdict == "DEPLOY":
+                if kind == RENEWAL and verdict == "DEPLOY":
+                    self._renewal_registration_in_tx(conn, judgment_id, prior, strategy_key, now)
+                elif kind == RENEWAL:
+                    self._end_line_in_tx(conn, prior, f"RENEWAL_{verdict}")
+                elif verdict == "DEPLOY":
                     conn.execute("INSERT INTO ai_research_registrations (judgment_id, kind, strategy_key, state, "
                                  "next_try_at, created_at, updated_at) VALUES (?, 'INITIAL', ?, 'ATTESTING', ?, ?, ?) "
                                  "ON CONFLICT (judgment_id) DO NOTHING", [judgment_id, strategy_key, now, now, now])
             await self._store.atransaction(work)
         await self._each(rows, record, "record")
 
-    async def _refuse_judgment(self, judgment_id: str, code: str, detail: Any) -> None:
+    async def _refuse_judgment(self, judgment_id: str, code: str, detail: Any, prior: Optional[str]) -> None:
         logger.error("the trader refused judgment %s: %s (%s); its line ends here", judgment_id, code, detail)
-        await self._update("UPDATE ai_backtest_judgments SET state = 'REFUSED', error_code = ?, updated_at = ? "
-                           "WHERE judgment_id = ?", [code, self._clock.now(), judgment_id])
+
+        def work(conn: Any) -> None:
+            conn.execute("UPDATE ai_backtest_judgments SET state = 'REFUSED', error_code = ?, updated_at = ? "
+                         "WHERE judgment_id = ?", [code, self._clock.now(), judgment_id])
+            if prior is not None:
+                self._end_line_in_tx(conn, prior, f"RENEWAL_JUDGMENT_{code}")
+        await self._store.atransaction(work)
+
+    def _renewal_registration_in_tx(self, conn: Any, judgment_id: str, prior: str, strategy_key: str,
+                                    now: dt.datetime) -> None:
+        """Ruling 11: no attestation; the line's registration body with the renewal judgment id."""
+        found = conn.execute("SELECT bundle_digest, body_json FROM ai_research_registrations WHERE version_digest = ?",
+                             [prior]).fetchone()
+        if found is None or found[0] is None or found[1] is None:
+            logger.error("renewal judgment %s: no registration body of %s to renew; its line ends (%s)", judgment_id,
+                         prior, RENEWAL_REGISTRATION_BODY_MISSING)
+            return self._end_line_in_tx(conn, prior, RENEWAL_REGISTRATION_BODY_MISSING)
+        body = canonical_json({**json.loads(found[1]), "judgment_id": judgment_id})
+        conn.execute(
+            "INSERT INTO ai_research_registrations (judgment_id, kind, prior_version_digest, strategy_key, "
+            "bundle_digest, body_json, body_sha256, state, next_try_at, created_at, updated_at) "
+            "VALUES (?, 'RENEWAL', ?, ?, ?, ?, ?, 'REGISTERING', ?, ?, ?) ON CONFLICT (judgment_id) DO NOTHING",
+            [judgment_id, prior, strategy_key, found[0], body, _sha(body), now, now, now])
 
     # attest and register ----------------------------------------------------------------------------
     async def _advance_registrations(self, now: dt.datetime) -> None:
         rows = await self._store.aquery(
-            "SELECT judgment_id, state, body_json, attest_tries FROM ai_research_registrations "
+            "SELECT judgment_id, state, body_json, attest_tries, prior_version_digest FROM ai_research_registrations "
             "WHERE state IN ('ATTESTING', 'REGISTERING', 'WAITING_CAP') AND next_try_at <= ? ORDER BY created_at",
             [now])
 
-        async def advance(judgment_id, state, body_json, attest_tries):
-            if state == "ATTESTING":
+        async def advance(judgment_id, state, body_json, attest_tries, prior):
+            if state == "ATTESTING":                                      # an INITIAL row; a renewal is never attested
                 body_json = await self._attest(judgment_id, attest_tries)
                 if body_json is None:
                     return
-            await self._register(judgment_id, body_json)
+            await self._register(judgment_id, body_json, prior)
         await self._each(rows, advance, "registration")
 
     async def _attest(self, judgment_id: str, tries: int) -> Optional[str]:
@@ -609,13 +705,14 @@ class ResearchCycle:
         await self._update("UPDATE ai_research_registrations SET attest_tries = ?, updated_at = ? "
                            "WHERE judgment_id = ?", [tries, self._clock.now(), judgment_id])
 
-    async def _register(self, judgment_id: str, body_json: str) -> None:
+    async def _register(self, judgment_id: str, body_json: str, prior: Optional[str]) -> None:
         try:
             outcome = parse_registration(await self._registry.call("register_ai_deployment", json.loads(body_json)))
         except AWAY:
             return                                                        # an exact retry returns the same version
         except RpcRefused as exc:                                         # a loud code (Plan 2 is_loud_refusal)
-            return await self._refuse_registration(judgment_id, f"RPC_{exc.code}", "register_ai_deployment", exc)
+            return await self._refuse_registration(judgment_id, f"RPC_{exc.code}", "register_ai_deployment", exc,
+                                                   prior=prior)
         if outcome is None:
             return self._warn_registration_once(judgment_id, "NOT_SETTLED", "the trader's ledger has not settled "
                                                                             "it; asked again each pump")
@@ -631,13 +728,19 @@ class ResearchCycle:
                                "next_try_at = ?, updated_at = ? WHERE judgment_id = ?",
                                [outcome.code, retry_at, now, judgment_id])
         elif isinstance(outcome, RegisterRefused):
-            await self._refuse_registration(judgment_id, outcome.code, "register_ai_deployment", "REJECTED")
+            await self._refuse_registration(judgment_id, outcome.code, "register_ai_deployment", "REJECTED",
+                                            prior=prior)
         else:
-            await self._update("UPDATE ai_research_registrations SET state = 'REGISTERED', base_digest = ?, "
-                               "version_digest = ?, expiry_session = ?, line_state = 'LIVE', error_code = NULL, "
-                               "updated_at = ? WHERE judgment_id = ?",
-                               [outcome.base_digest, outcome.version_digest, outcome.expiry_session, now,
-                                judgment_id])
+            await self._store.atransaction(lambda conn: self._registered_in_tx(conn, judgment_id, outcome, prior, now))
+
+    def _registered_in_tx(self, conn: Any, judgment_id: str, outcome: Registered, prior: Optional[str],
+                          now: dt.datetime) -> None:
+        """The new version's line is LIVE; a renewal ends the line it renewed in the same transaction."""
+        conn.execute("UPDATE ai_research_registrations SET state = 'REGISTERED', base_digest = ?, version_digest = ?, "
+                     "expiry_session = ?, line_state = 'LIVE', error_code = NULL, updated_at = ? WHERE judgment_id = ?",
+                     [outcome.base_digest, outcome.version_digest, outcome.expiry_session, now, judgment_id])
+        if prior is not None:
+            self._end_line_in_tx(conn, prior, "RENEWED")
 
     def _warn_registration_once(self, judgment_id: str, code: str, why: str) -> None:
         if (judgment_id, code) not in self._registration_waits:
@@ -645,23 +748,32 @@ class ResearchCycle:
             logger.warning("registration of %s waits (%s): %s", judgment_id, code, why)
 
     async def _refuse_registration(self, judgment_id: str, code: str, method: str, detail: Any, *,
-                                   attest_tries: Optional[int] = None) -> None:
+                                   attest_tries: Optional[int] = None, prior: Optional[str] = None) -> None:
         logger.error("%s refused judgment %s: %s (%s); its line ends here", method, judgment_id, code, detail)
-        await self._update("UPDATE ai_research_registrations SET state = 'REFUSED', error_code = ?, "
-                           "attest_tries = COALESCE(?, attest_tries), updated_at = ? WHERE judgment_id = ?",
-                           [code, attest_tries, self._clock.now(), judgment_id])
+
+        def work(conn: Any) -> None:
+            conn.execute("UPDATE ai_research_registrations SET state = 'REFUSED', error_code = ?, "
+                         "attest_tries = COALESCE(?, attest_tries), updated_at = ? WHERE judgment_id = ?",
+                         [code, attest_tries, self._clock.now(), judgment_id])
+            if prior is not None:
+                self._end_line_in_tx(conn, prior, f"RENEWAL_REGISTER_{code}")
+        await self._store.atransaction(work)
 
     # row helpers ------------------------------------------------------------------------------------
-    def _close_in_tx(self, conn: Any, candidate_id: str, code: str) -> None:
+    def _close_in_tx(self, conn: Any, candidate_id: str, code: str, prior: Optional[str] = None) -> None:
+        """Close a candidate; a renewal candidate (``prior`` set) ends its line with the same reason."""
         conn.execute("UPDATE ai_research_candidates SET state = 'CLOSED', end_code = ?, updated_at = ? "
                      "WHERE candidate_id = ?", [code, self._clock.now(), candidate_id])
+        if prior is not None:
+            self._end_line_in_tx(conn, prior, f"RENEWAL_{code}")
 
-    async def _close(self, candidate_id: str, code: str) -> None:
-        await self._store.atransaction(lambda conn: self._close_in_tx(conn, candidate_id, code))
+    async def _close(self, candidate_id: str, code: str, prior: Optional[str] = None) -> None:
+        await self._store.atransaction(lambda conn: self._close_in_tx(conn, candidate_id, code, prior))
 
-    async def _close_loudly(self, candidate_id: str, code: str, method: str, detail: Any) -> None:
+    async def _close_loudly(self, candidate_id: str, code: str, method: str, detail: Any,
+                            prior: Optional[str] = None) -> None:
         logger.error("%s: research candidate %s ends: %s (%s)", method, candidate_id, code, detail)
-        await self._close(candidate_id, code)
+        await self._close(candidate_id, code, prior)
 
     def _cool_in_tx(self, conn: Any, strategy_key: str, until: str, source: str) -> None:
         conn.execute("INSERT INTO ai_research_cooldowns VALUES (?, ?, ?, ?) ON CONFLICT (strategy_key) DO UPDATE "

@@ -45,5 +45,9 @@ class TraderPort:
         body = {"judgment_id": judgment_id, "case_digest": case_digest}
         return self._call(self._query, "get_backtest_judgment", body)["judgment"]
 
+    def forward_evidence(self, version_digest: str) -> dict:
+        """Plan 1's get_deployment_forward_evidence; the evidence is Plan 5's ForwardEvidenceView."""
+        return self._call(self._query, "get_deployment_forward_evidence", {"deployment_version": version_digest})
+
     def record_shadow(self, body: dict) -> dict:
         return self._call(self._command, "record_shadow_result", body)

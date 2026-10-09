@@ -67,8 +67,9 @@ def _submit_reply(status: str, request_id: Optional[str] = None, state: Optional
 class EvaluationService:
     def __init__(self, *, store: Any, trader: Any, build_spec: Callable[[EvaluationRequestBody], Any],
                  evaluate: Callable[[Any], Any], signer: Any, artifacts_root: Path, warmup_sessions: int,
-                 order_notional: float, queue_max: int, now: Callable[[], dt.datetime]):
+                 order_notional: float, queue_max: int, now: Callable[[], dt.datetime], renewals: Any = None):
         self._store, self._trader, self._build_spec, self._evaluate = store, trader, build_spec, evaluate
+        self._renewals = renewals                               # kind RENEWAL (SP2c Plan 5); None: refused
         self._signer, self._cases_dir = signer, Path(artifacts_root) / "cases"
         self._warmup_sessions, self._order_notional = warmup_sessions, order_notional
         self._queue_max, self._now = queue_max, now
@@ -84,8 +85,12 @@ class EvaluationService:
     def submit(self, raw: Mapping[str, Any], caller: Any) -> dict:
         if caller.principal != AI_RESEARCH:
             return _submit_reply("REFUSED", code="PRINCIPAL_FORBIDDEN", detail="only ai_research submits")
+        if raw.get("kind") == "RENEWAL":
+            if self._renewals is None:
+                return _submit_reply("REFUSED", code="RENEWAL_NOT_SUPPORTED", detail="this service builds no renewals")
+            return self._renewals.submit(raw["prior_version_digest"])
         if raw.get("kind") != "INITIAL":
-            return _submit_reply("REFUSED", code="RENEWAL_NOT_SUPPORTED", detail="renewal cases: SP2c Plan 5")
+            return _submit_reply("REFUSED", code="REQUEST_INVALID", detail="kind must be INITIAL or RENEWAL")
         try:
             body = request_body({k: v for k, v in raw.items() if k != "kind"}, self._today())
         except RequestRefused as refusal:

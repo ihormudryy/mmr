@@ -10,6 +10,8 @@ from trader.automation.ai_deployment_activity import (
     ACTIVE, EXPIRED, JUDGMENT_ENDED, NOT_STARTED, OVER_CAP, SUPERSEDED, WITHDRAWN, DeploymentActivity,
     deployment_sessions, deployment_version_gate,
 )
+from trader.automation.ai_paper_decision import apply_ai_paper_decision_migration
+from trader.automation.protective_order_saga import apply_protective_order_saga_migration
 from trader.automation.ai_deployment_versions import (
     INITIAL, RENEWAL, AiDeploymentVersionStore, DeploymentVersion, apply_ai_deployment_version_migrations,
 )
@@ -51,6 +53,8 @@ class World:
         db = DuckDBConnection.get_instance(str(tmp_path / "journal.duckdb"))
         migrator = SchemaMigrator(db)
         apply_ai_deployment_migration(migrator)
+        apply_protective_order_saga_migration(migrator)
+        apply_ai_paper_decision_migration(migrator)
         apply_ai_deployment_version_migrations(migrator)
         journal = DomainJournal(db)
         journal.migrate(migrator)

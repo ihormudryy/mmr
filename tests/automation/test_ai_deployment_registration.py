@@ -12,6 +12,8 @@ from tests.automation.judged_deployment import Cooldowns, SeededJudgments, deplo
 from trader.automation.ai_bundle_check import BundleFacts, BundleRefused
 from trader.automation.ai_deployment_activity import SUPERSEDED, DeploymentActivity
 from trader.automation.ai_deployment_registration import AiDeploymentRegistrar, registration_command_id
+from trader.automation.ai_paper_decision import apply_ai_paper_decision_migration
+from trader.automation.protective_order_saga import apply_protective_order_saga_migration
 from trader.automation.ai_deployment_versions import AiDeploymentVersionStore, apply_ai_deployment_version_migrations
 from trader.automation.ai_deployments import (
     AiDeployment, AiDeploymentStore, DeploymentRefused, apply_ai_deployment_migration,
@@ -56,6 +58,8 @@ class Env:
         self.db = DuckDBConnection.get_instance(str(tmp_path / "journal.duckdb"))
         migrator = SchemaMigrator(self.db)
         apply_ai_deployment_migration(migrator)
+        apply_protective_order_saga_migration(migrator)
+        apply_ai_paper_decision_migration(migrator)
         apply_ai_deployment_version_migrations(migrator)
         journal = DomainJournal(self.db)
         journal.migrate(migrator)

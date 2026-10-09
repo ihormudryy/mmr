@@ -1441,6 +1441,21 @@ def _require_caller(caller: RpcCaller, allowed: frozenset[str]) -> None:
         raise _DispatchProblem("PERMISSION_DENIED", f"principal {caller.principal!r} may not call this method")
 
 
+def _withdraw_command_id(coordinator: TradingCommandCoordinator, base_id: str) -> str:
+    """A repeat of a withdrawal replays its receipt, except one refused because an entry was still being sent:
+    a ledger row replays forever, so that retry needs a new command."""
+    from trader.automation.ai_deployment_versions import WITHDRAWAL_ENTRY_IN_FLIGHT
+
+    attempt = 1
+    command_id = base_id
+    while True:
+        receipt = coordinator.get_command(command_id)
+        if receipt is None or receipt.error_code != WITHDRAWAL_ENTRY_IN_FLIGHT:
+            return command_id
+        attempt += 1
+        command_id = f"{base_id}-{attempt}"
+
+
 def _withdraw_ai_deployment_rpc_handler(coordinator: TradingCommandCoordinator, account_id: Optional[str]):
     from trader.automation.ai_paper_actions import WITHDRAW_ACTION
     from trader.research.canonical import canonical_json_bytes
@@ -1449,7 +1464,8 @@ def _withdraw_ai_deployment_rpc_handler(coordinator: TradingCommandCoordinator, 
         _require_caller(caller, TRADER_ACL[("command", "withdraw_ai_deployment")])
         body = {"version_digest": parsed.version_digest, "reason": parsed.reason}
         request = CommandRequest(
-            command_id="aidw-" + hashlib.sha256(canonical_json_bytes(body)).hexdigest()[:48],
+            command_id=_withdraw_command_id(coordinator, "aidw-" + hashlib.sha256(
+                canonical_json_bytes(body)).hexdigest()[:48]),
             action=WITHDRAW_ACTION, account_id=account_id, target_type="ai_deployment_version",
             target_id=parsed.version_digest, expected_version=None, body=body,
             source=caller.principal, principal=caller.principal,

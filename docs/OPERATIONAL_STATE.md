@@ -484,7 +484,9 @@ first deploy of this build:
   model call and records no baseline.
 - Stop a judged version (operator, final): `mmr ai-deployment withdraw sha256:<version> --reason "<why>"`.
   Its `aidv-` instance unloads and new entries are refused; exits and open
-  brackets are untouched. `mmr ai-deployment version sha256:<version>` shows
+  brackets are untouched. While an entry of that version is being sent the
+  withdrawal is refused (`WITHDRAWAL_ENTRY_IN_FLIGHT`): retry after the
+  entry's send returns. `mmr ai-deployment version sha256:<version>` shows
   its state.
 - SP1 acceptance now needs an SP2c-judged deployment version:
   `mmr experiment acceptance run --place-orders --deployment-version sha256:...`.

@@ -10,6 +10,8 @@ from trader.automation.ai_deployment_versions import (
     version_digest,
 )
 from trader.automation.ai_deployments import DeploymentRefused
+from trader.automation.ai_paper_decision import apply_ai_paper_decision_migration
+from trader.automation.protective_order_saga import apply_protective_order_saga_migration
 from trader.data.domain_journal import DomainJournal
 from trader.data.duckdb_store import DuckDBConnection
 from trader.data.schema_migrations import SchemaMigrator
@@ -28,7 +30,10 @@ def store(tmp_path):
     db = DuckDBConnection.get_instance(str(tmp_path / "journal.duckdb"))
     journal = DomainJournal(db)
     journal.migrate(SchemaMigrator(db))
-    apply_ai_deployment_version_migrations(SchemaMigrator(db))
+    migrator = SchemaMigrator(db)
+    apply_protective_order_saga_migration(migrator)     # withdraw reads the entries being sent
+    apply_ai_paper_decision_migration(migrator)
+    apply_ai_deployment_version_migrations(migrator)
     return AiDeploymentVersionStore(journal, now=lambda: NOW)
 
 

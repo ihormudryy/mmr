@@ -255,10 +255,13 @@ version is an error (`DEPLOYMENT_VERSION_TAMPERED`).
 
 `withdraw VERSION_DIGEST --reason TEXT` (operator, signs as `cli`; typed `withdraw_ai_deployment`) ends the
 version for good: the strategy service unloads its `aidv-` instance and the trader refuses its new entries;
-exits and open brackets are not touched. An entry whose send had already started (its saga row was
-`SUBMITTING` before the withdrawal committed) still goes out; cancel or flatten it if needed. It returns `{"version_digest", "withdrawn": true,
-"already_withdrawn"}`; a repeat is safe. A refusal (`DEPLOYMENT_VERSION_UNKNOWN`, `PERMISSION_DENIED`) prints
-the code and exits 1. A withdrawn version cannot be renewed; trading the strategy again needs a new DEPLOY judgment and registration.
+exits and open brackets are not touched. While an entry of the version is being sent (its saga row is
+`SUBMITTING` and the broker send has not returned) the withdrawal is refused with
+`WITHDRAWAL_ENTRY_IN_FLIGHT`, naming the entry's command ids: retry after the entry's send returns (a retry is
+a new command, not a replay). That entry still goes out; cancel or flatten it if needed. A successful receipt is never followed
+by a new broker plan. It returns `{"version_digest", "withdrawn": true,
+"already_withdrawn"}`; a repeat is safe. A refusal (`WITHDRAWAL_ENTRY_IN_FLIGHT`, `DEPLOYMENT_VERSION_UNKNOWN`,
+`PERMISSION_DENIED`) prints the code and exits 1. A withdrawn version cannot be renewed; trading the strategy again needs a new DEPLOY judgment and registration.
 
 ## Command Service Requirements
 

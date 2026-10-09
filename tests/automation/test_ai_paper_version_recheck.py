@@ -16,6 +16,7 @@ from tests.automation.ai_paper_world import GOOD, World
 from tests.automation.discretionary_world import discretionary_world
 from tests.automation.test_ai_paper_reductions import close_body, partial_body
 from trader.automation.ai_deployments import DeploymentRefused
+from trader.automation.ai_paper_actions import is_loud_refusal
 from trader.automation.backtest_judgments import JudgmentRefused
 from trader.research.evaluation_case import CaseRefused
 
@@ -282,26 +283,19 @@ def test_a_withdrawal_after_the_final_gate_and_before_the_send_stops_the_entry(w
     assert _saga_row(world) == ("CLOSED", "DEPLOYMENT_NOT_ACTIVE")
 
 
-def test_a_withdrawal_after_the_intent_lets_that_entry_go_and_is_recorded(world):
-    real, withdrawn = world.dispatch.submit_bracket, []
-
-    def withdraw_then_send(**kwargs):
-        withdrawn.append(_withdraw(world))               # the SUBMITTING row committed first
-        return real(**kwargs)
-    world.dispatch.submit_bracket = withdraw_then_send
-    receipt = world.submit()
-    assert receipt.state == "SUBMITTED" and len(world.dispatch.plans) == 1
-    assert withdrawn == [True] and world.versions.withdrawn() == {world.version_digest}
-    assert _saga_row(world) == ("SUBMITTING", None)
-
-
 def test_a_withdrawal_cannot_commit_while_the_intent_transaction_is_open(world):
     """Linearizable, not only serializable: a withdrawal that starts while the SUBMITTING transaction reads the
-    withdrawals waits for its commit, so it can never land between that read and that commit."""
+    withdrawals waits for its commit. It then sees that row and is refused until the send returns."""
     seen = {}
 
+    def try_withdraw():
+        try:
+            seen["withdrawn"] = _withdraw(world)
+        except DeploymentRefused as refused:
+            seen["refused"] = refused.code
+
     def withdraw_meanwhile(conn, request):
-        racer = threading.Thread(target=lambda: seen.setdefault("withdrawn", _withdraw(world)))
+        racer = threading.Thread(target=try_withdraw)
         racer.start()
         racer.join(timeout=0.3)
         seen["waited"] = racer.is_alive()                # blocked on the journal write lock
@@ -309,10 +303,11 @@ def test_a_withdrawal_cannot_commit_while_the_intent_transaction_is_open(world):
     world.on_intent_check(withdraw_meanwhile)
     receipt = world.submit()
     seen["racer"].join(timeout=10)
-    assert seen["withdrawn"] is True and seen["waited"] is True
+    assert seen["waited"] is True and seen["refused"] == "WITHDRAWAL_ENTRY_IN_FLIGHT" and "withdrawn" not in seen
     assert receipt.state == "SUBMITTED" and len(world.dispatch.plans) == 1
-    assert world.versions.withdrawn() == {world.version_digest}
-    # The journal itself orders them, with no clock: the intent's event precedes the withdrawal's.
+    assert world.versions.withdrawn() == frozenset()
+    # The journal itself orders the two with no clock: the intent's event precedes the withdrawal's.
+    assert _withdraw(world, "w-after-send") is True
     (intent,) = world.db.execute("SELECT source_cursor FROM domain_event_journal "
                                  "WHERE event_id LIKE 'saga:%:SUBMITTING:%'", fetch="one")
     (withdrawal,) = world.db.execute("SELECT source_cursor FROM domain_event_journal WHERE event_id = ?",
@@ -353,3 +348,51 @@ def test_a_send_gate_that_fails_refuses_the_entry_and_sends_nothing(world, caplo
     assert (receipt.state, receipt.error_code) == ("REJECTED", "AI_ENTRY_GATE_UNAVAILABLE")
     assert world.dispatch.plans == [] and _saga_row(world) == ("CLOSED", "AI_ENTRY_GATE_UNAVAILABLE")
     assert any("send gate failed" in r.getMessage() and "RuntimeError" in r.getMessage() for r in caplog.records)
+
+
+# PR #95 round 2: a withdrawal receipt is never followed by a new broker plan.
+
+def _withdraw_during_send(world, seen, *, version=None):
+    """Replace the broker send with one that first tries to withdraw ``version``, then sends as before."""
+    real = world.dispatch.submit_bracket
+
+    def withdraw_then_send(**kwargs):
+        try:
+            seen["withdrawn"] = world.versions.withdraw(version or world.version_digest, reason="operator",
+                                                        principal="cli", command_id="w-during")
+        except DeploymentRefused as refused:
+            seen["refused"] = refused
+        return real(**kwargs)
+    world.dispatch.submit_bracket = withdraw_then_send
+
+
+def test_a_withdrawal_while_the_entry_is_being_sent_is_refused_until_the_send_returns(world):
+    seen = {}
+    _withdraw_during_send(world, seen)
+    receipt = world.submit()
+    assert receipt.state == "SUBMITTED" and len(world.dispatch.plans) == 1
+    assert "withdrawn" not in seen and world.versions.withdrawn() == frozenset()
+    refused = seen["refused"]
+    assert refused.code == "WITHDRAWAL_ENTRY_IN_FLIGHT"
+    assert "aip-dec-00000001" in refused.message and "retry" in refused.message
+    assert not is_loud_refusal(refused.code)
+
+    plans_at_receipt = len(world.dispatch.plans)
+    assert _withdraw(world, "w-after") is True           # the send returned: now the receipt is true
+    assert len(world.dispatch.plans) == plans_at_receipt
+    assert len(world.dispatch.plans) == plans_at_receipt
+
+
+def test_a_withdrawal_of_another_version_is_not_blocked_by_an_entry_being_sent(world):
+    other = world.seal_version("jdg-other")
+    seen = {}
+    _withdraw_during_send(world, seen, version=other)
+    assert world.submit().state == "SUBMITTED" and len(world.dispatch.plans) == 1
+    assert seen == {"withdrawn": True}
+    assert world.versions.withdrawn() == {other}
+
+
+def test_an_entry_that_never_reached_the_send_does_not_block_a_withdrawal(world):
+    world.on_before_guard(lambda: _withdraw(world))      # the final gate refuses: the row stays VALIDATED/CLOSED
+    assert world.submit().error_code == "DEPLOYMENT_NOT_ACTIVE"
+    assert world.versions.withdrawn() == {world.version_digest}

@@ -23,6 +23,7 @@ AI_DEPLOYMENT_VERSION_MIGRATION_VERSION = 115
 AI_DEPLOYMENT_WITHDRAWAL_MIGRATION_VERSION = 116
 INITIAL = "INITIAL"
 RENEWAL = "RENEWAL"
+WITHDRAWAL_ENTRY_IN_FLIGHT = "WITHDRAWAL_ENTRY_IN_FLIGHT"
 _VERSION_DOMAIN = b"mmr.ai-deployment-version.v1\x00"
 _SHA256 = re.compile(r"^sha256:[0-9a-f]{64}$")
 _JUDGMENT_ID = re.compile(r"^[A-Za-z0-9_.:-]{1,128}$")
@@ -188,11 +189,25 @@ class AiDeploymentVersionStore:
         return conn.execute("SELECT 1 FROM ai_deployment_withdrawals WHERE version_digest = ?",
                             [digest]).fetchone() is not None
 
+    def entries_being_sent_in_tx(self, conn, digest: str) -> tuple[str, ...]:
+        """Command ids of entries bound to this version whose broker send has not returned.
+
+        The saga row is SUBMITTING from its send gate until ``send_returned_at`` is written; the decision row
+        carries the version the entry was admitted under."""
+        rows = conn.execute(
+            "SELECT s.command_id FROM automated_order_sagas s "
+            "JOIN ai_paper_decisions d ON d.command_id = s.command_id "
+            "WHERE d.deployment_version = ? AND s.state = 'SUBMITTING' "
+            "AND json_extract_string(s.payload, '$.send_returned_at') IS NULL ORDER BY s.command_id",
+            [digest]).fetchall()
+        return tuple(row[0] for row in rows)
+
     def withdraw(self, digest: str, *, reason: str, principal: str, command_id: str) -> bool:
         """True when this call withdrew the version, False when it was withdrawn before.
 
         A journal mutation: it commits either before an entry's SUBMITTING row (that entry is refused) or
-        after it (that entry counts as sent before the withdrawal), never in between."""
+        after it. In the second case the entry is still being sent, so the withdrawal is refused until the
+        send returns: a successful receipt is never followed by a new broker plan (PR #95 round 2)."""
         now = self._now()
 
         def write(conn, append) -> bool:
@@ -201,6 +216,12 @@ class AiDeploymentVersionStore:
                 raise DeploymentRefused("DEPLOYMENT_VERSION_UNKNOWN", "no sealed version has this digest")
             if self.is_withdrawn_in_tx(conn, digest):
                 return False
+            in_flight = self.entries_being_sent_in_tx(conn, digest)
+            if in_flight:
+                raise DeploymentRefused(
+                    WITHDRAWAL_ENTRY_IN_FLIGHT,
+                    f"an entry of this version is being sent ({', '.join(in_flight)}); "
+                    "retry after the entry's send returns")
             mutation = DomainMutation(
                 event_type="ai_deployment_version.withdrawn", entity_type="ai_deployment_version",
                 entity_id=digest, operation="upsert", account_id=None, source="trader_service",

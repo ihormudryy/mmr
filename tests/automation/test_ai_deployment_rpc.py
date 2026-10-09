@@ -64,6 +64,23 @@ def test_strategy_reads_the_active_set_and_an_operator_withdraws(served):
     assert served.call("strategy", "get_active_ai_deployments", {})["deployments"] == []
 
 
+def test_a_withdrawal_refused_for_an_entry_in_flight_can_be_retried_after_the_send(served, monkeypatch):
+    _base, version = seed(served)
+    versions = served.composed.stack.ai_paper.versions
+    real = versions.entries_being_sent_in_tx
+    monkeypatch.setattr(versions, "entries_being_sent_in_tx", lambda conn, digest: ("aip-dec-00000001",))
+    body = {"version_digest": version, "reason": "operator"}
+    refused = served.call("cli", "withdraw_ai_deployment", body)         # a refusal receipt, not an RPC error
+    assert (refused["state"], refused["error_code"]) == ("REJECTED", "WITHDRAWAL_ENTRY_IN_FLIGHT")
+    assert "aip-dec-00000001" in refused["outcome"]["message"] and "retry" in refused["outcome"]["message"]
+    again = served.call("cli", "withdraw_ai_deployment", body)           # the entry is still being sent
+    assert again["error_code"] == "WITHDRAWAL_ENTRY_IN_FLIGHT" and again["command_id"] != refused["command_id"]
+    monkeypatch.setattr(versions, "entries_being_sent_in_tx", real)      # the send returned
+    receipt = served.call("cli", "withdraw_ai_deployment", body)
+    assert receipt["state"] == "RESOLVED" and receipt["outcome"]["already_withdrawn"] is False
+    assert served.call("cli", "withdraw_ai_deployment", body)["command_id"] == receipt["command_id"]   # now it replays
+
+
 def test_registration_without_a_judgment_is_refused_on_the_wire(served):
     receipt = served.call("ai_research", "register_ai_deployment", {
         "judgment_id": "jdg-none", "bundle_digest": "sha256:" + "b" * 64, "deployment": record()})

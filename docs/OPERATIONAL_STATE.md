@@ -504,6 +504,8 @@ tables are in `mmr_research.duckdb`; there is no `mmr` command for these yet):
 
 ## Next operator session (paper soak)
 
+Ordered deploy checklist for the first SP2 paper deployment: [`docs/SP2_PAPER_DEPLOY.md`](SP2_PAPER_DEPLOY.md).
+
 **SP1 paper acceptance (Plan 6):** before SP2 trades, run one real IB paper
 session by [`docs/PAPER_ACCEPTANCE_SP1.md`](PAPER_ACCEPTANCE_SP1.md): the
 clean-account gate (`mmr experiment acceptance preflight`), arming, the

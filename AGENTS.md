@@ -197,6 +197,7 @@ Use `mmr --json ...` for machine-readable output from any command.
 - [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md): key patterns (DI container, messaging, storage, risk, sizing, research evaluation, bundle binding, backtester, sweeps, statistics), data-provider rules, configuration, logging.
 - [docs/IDEAS_SCANNER.md](docs/IDEAS_SCANNER.md): the ideas scanner and its sources.
 - [docs/AGENT_WORKFLOW.md](docs/AGENT_WORKFLOW.md): explore → backtest → deploy, the LLM trading loop, strategy details, command latency.
+- [docs/SP2_PAPER_DEPLOY.md](docs/SP2_PAPER_DEPLOY.md): ordered checklist for the first SP2 paper deployment (keys, fresh tables, config, acceptance, start, stop).
 - [docs/OPERATIONAL_STATE.md](docs/OPERATIONAL_STATE.md): what is deployed and armed now, known blockers.
 - [docs/PAPER_AUTOMATION_SETUP.md](docs/PAPER_AUTOMATION_SETUP.md): unattended paper automation.
 - [docs/AUDIT_ROADMAP.md](docs/AUDIT_ROADMAP.md): code backlog.

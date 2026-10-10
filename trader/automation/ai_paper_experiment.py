@@ -66,3 +66,24 @@ def experiment_entry_refusal(reader: ExperimentStatePort, account_id: str) -> Op
     if view.state != "ARMED":
         return "EXPERIMENT_NOT_ARMED"
     return view.entry_block
+
+
+def experiment_send_gate_in_tx(*, store: Any):
+    """The ARMED check of an ai_paper ENTER, on the saga's SUBMITTING transaction (issue #124).
+
+    The dispatch gate reads the experiment outside that transaction; a pause could commit after it and before the
+    send. Both the SUBMITTING write and every ExperimentStore write take the domain journal's write lock, so they
+    cannot overlap: either the pause commits first and this read refuses, or it follows the SUBMITTING row and
+    names that entry in its receipt. Reductions are never gated. Only the state is read here:
+    the kill monitor's entry block stays on the dispatch gate."""
+    from trader.automation.ai_paper_decision import AI_PAPER_ACTION
+
+    def gate(conn: Any, request: Any) -> Optional[str]:
+        body = getattr(request, "body", None) or {}
+        if getattr(request, "action", None) != AI_PAPER_ACTION or body.get("action") != "ENTER":
+            return None
+        record = store.latest_in_tx(conn)
+        if record is None:
+            return "NO_EXPERIMENT"
+        return None if record.state == "ARMED" else "EXPERIMENT_NOT_ARMED"
+    return gate

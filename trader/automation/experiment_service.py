@@ -222,11 +222,12 @@ class ExperimentService:
         record = self._target(body["experiment_id"])
         if record.state == "KILLED":
             raise ExperimentRefused("EXPERIMENT_KILLED", "a killed experiment is flattening; stop it once flat")
-        if record.state == "PAUSED":
-            return self._view(record)
-        paused = self.store.transition(record.experiment_id, expected=frozenset({"ARMED"}), to="PAUSED",
-                                       principal=cmd.principal, command_id=cmd.command_id, reason=body["reason"])
-        return self._view(paused)
+        if record.state != "PAUSED":
+            record = self.store.transition(record.experiment_id, expected=frozenset({"ARMED"}), to="PAUSED",
+                                           principal=cmd.principal, command_id=cmd.command_id,
+                                           reason=body["reason"])
+        return {**self._view(record),
+                "entries_in_flight": self.store.entries_in_flight_at_pause(record.experiment_id, record.revision)}
 
     @_refusals
     def resume(self, cmd) -> dict:

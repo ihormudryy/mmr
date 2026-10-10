@@ -763,6 +763,19 @@ def _entry_limit_price(state: SagaState) -> float:
     return price
 
 
+def unreturned_send_sql(alias: str) -> str:
+    """SQL condition (one ``?``: the process start) for a saga row whose broker send started in this process
+    and has not returned, in whatever state the saga is now.
+
+    ``submit_bracket`` is called once, right after the SUBMITTING commit in the same process, and no restart sends
+    again. Broker events can move the row on (ENTRY_WORKING, ...) before the call returns, so the state says
+    nothing. The bound is the send's own ``send_attempted_at``, not ``updated_at``, which later events bump: the
+    unreturned send of an earlier process must never count again."""
+    attempted = f"json_extract_string({alias}.payload, '$.send_attempted_at')"
+    returned = f"json_extract_string({alias}.payload, '$.send_returned_at')"
+    return f"({attempted} IS NOT NULL AND {returned} IS NULL AND CAST({attempted} AS TIMESTAMPTZ) >= ?)"
+
+
 def _is_reduction(approval) -> bool:
     direction = getattr(approval, "risk_direction", None)
     return str(getattr(direction, "value", direction)) == "REDUCING"

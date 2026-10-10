@@ -3457,9 +3457,21 @@ def _handle_experiment(mmr: MMR, args: argparse.Namespace):
         result = getattr(mmr, f'experiment_{action}')(args.reason, experiment_id=args.experiment_id)
     if result.is_success():
         print_json_result(result.obj or {}, title=f'Experiment {action}')
+        if action == 'pause' and not _json_mode:
+            _print_entries_in_flight_warning((result.obj or {}).get('entries_in_flight') or [])
     else:
         error = str(result.error or result.exception or 'Unknown error')
         print_status(f'experiment {action} failed: {error}', success=False)
+
+
+def _print_entries_in_flight_warning(command_ids: list) -> None:
+    """A pause stops entries not yet being sent; one already being sent may still reach the broker."""
+    if not command_ids:
+        return
+    count = len(command_ids)
+    noun, verb = ('entry', 'was') if count == 1 else ('entries', 'were')
+    console.print(f"[red]{count} {noun} {verb} already being sent and may still reach the broker: "
+                  f"{', '.join(command_ids)}. Check mmr orders / mmr portfolio.[/red]", soft_wrap=True)
 
 
 def _dash(value, fmt='{:,.2f}', suffix=''):

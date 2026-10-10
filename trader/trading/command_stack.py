@@ -634,12 +634,28 @@ def _build_ai_paper_parts(trader: Any, config: Any, now: Callable[[], dt.datetim
                          forward_evidence=forward_evidence)
 
 
-def _ai_paper_send_gate_in_tx(parts: Optional[_AiPaperParts]) -> Optional[Callable[[Any, Any], Optional[str]]]:
-    """PR #95: the saga rereads the withdrawals on its SUBMITTING transaction, after the final gate."""
+def _ai_paper_send_gate_in_tx(
+    parts: Optional[_AiPaperParts], experiment_store: Any = None,
+) -> Optional[Callable[[Any, Any], Optional[str]]]:
+    """PR #95 and issue #124: the saga rereads the withdrawals and the experiment state on its SUBMITTING
+    transaction, after the final gate. Both run; the first refusal wins. A stack without experiments has no
+    experiment gate, as for the dispatch gate."""
     if parts is None:
         return None
     from trader.automation.ai_deployment_activity import deployment_withdrawal_gate_in_tx
-    return deployment_withdrawal_gate_in_tx(versions=parts.versions)
+    from trader.automation.ai_paper_experiment import experiment_send_gate_in_tx
+
+    gates = [deployment_withdrawal_gate_in_tx(versions=parts.versions)]
+    if experiment_store is not None:
+        gates.append(experiment_send_gate_in_tx(store=experiment_store))
+
+    def gate(conn: Any, request: Any) -> Optional[str]:
+        for check in gates:
+            code = check(conn, request)
+            if code:
+                return code
+        return None
+    return gate
 
 
 def _ai_paper_guard_options(parts: Optional[_AiPaperParts], accepted_feeds: frozenset[str]) -> dict:
@@ -1038,7 +1054,7 @@ def _build_experiment_parts(trader: Any, account_mode: str,
     from trader.automation.experiment_service import ArmingLock, ExperimentLock
     from trader.automation.experiments import ExperimentStore
 
-    store = ExperimentStore(trader.journal_db, trader.ib_account, now)
+    store = ExperimentStore(trader.journal_db, trader.ib_account, now, journal=trader.domain_journal)
     lock = ArmingLock()
     return _ExperimentParts(store=store, arming_lock=lock, experiment_lock=ExperimentLock(store, lock))
 
@@ -1623,7 +1639,8 @@ def build_command_stack(
         orphan_evidence=BrokerStateOrphanEvidence(
             db=trader.journal_db, store=trader.broker_state_store, snapshots=broker_snapshot,
         ),
-        send_gate_in_tx=_ai_paper_send_gate_in_tx(ai_paper_parts),
+        send_gate_in_tx=_ai_paper_send_gate_in_tx(
+            ai_paper_parts, None if experiment_parts is None else experiment_parts.store),
     )
     # The saga is the protection port of every close and the source of unhandled failures.
     liquidation_service.attach_protection(protective_order_saga)

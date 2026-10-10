@@ -402,8 +402,10 @@ def test_a_send_left_by_an_earlier_process_does_not_block_a_withdrawal(world):
     """The one send call follows the SUBMITTING commit in the same process, so a row written before this
     process started (a crash inside the send) can never be sent."""
     def leave_the_row_from_before_the_start():
-        world.db.execute("UPDATE automated_order_sagas SET updated_at = ?",
-                         [world.clock() - dt.timedelta(seconds=1)])
+        (raw,) = world.db.execute("SELECT payload FROM automated_order_sagas", fetch="one")
+        before_the_start = (world.clock() - dt.timedelta(seconds=1)).isoformat()
+        world.db.execute("UPDATE automated_order_sagas SET payload = ?",
+                         [json.dumps({**json.loads(raw), "send_attempted_at": before_the_start})])
         seen["withdrawn"] = _withdraw(world)
     seen = {}
     real = world.dispatch.submit_bracket

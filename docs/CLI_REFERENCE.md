@@ -196,7 +196,7 @@ forex movers --losers --source massive       # Massive forex movers (paid)
 forex convert EUR USD 1000                   # ECB daily rate (Frankfurter); --source massive|twelvedata
 experiment status                            # PAPER ai_paper experiment: state, active + pending kill line, entry block
 experiment start --reason "first run"        # operator; flat paper account, ai_paper.enabled
-experiment pause --reason "news risk"        # cli, dashboard or ai_supervisor
+experiment pause --reason "news risk"        # cli, dashboard or ai_supervisor; lists entries already being sent
 experiment resume --reason "ok"              # operator; never after a kill
 experiment stop --reason "done"              # operator; once the account is flat (final)
 ai-policy show                               # PAPER AI risk policy: published, effective, queued limits

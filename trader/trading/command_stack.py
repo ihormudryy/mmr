@@ -1483,6 +1483,7 @@ def build_command_stack(
         closes=liquidation_store,
         registrations=None if ai_paper_parts is None else ai_paper_parts.registrar,
         withdrawals=None if ai_paper_parts is None else ai_paper_parts.versions,
+        policies=None if ai_paper_parts is None else ai_paper_parts.policy,
         experiments=_experiment_evidence(trader, experiment_parts),
         received_at_start=_received_at_process_start(trader, ledger),
     )

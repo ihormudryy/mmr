@@ -157,6 +157,8 @@ strategies:
     auto_execute: propose   # optional — see below
 ```
 
+`historical_days_prior` is the least history loaded. A strategy that declares `MIN_BARS` gets enough days for that many bars on its bar size, and the runtime does not call `on_prices` until its frame has them (`HISTORY_BELOW_WARMUP` in `mmr strategies list`). See [ARCHITECTURE.md](ARCHITECTURE.md) (history depth).
+
 **Important**: ConIds can change. Always verify with `mmr resolve SYMBOL` before hardcoding. If a conId is stale, the strategy will log an error and be disabled — it will NOT silently subscribe to a different instrument.
 
 **Signal → proposal bridge (`auto_execute: propose`)**: by default signals are only recorded to the event store and published on the MessageBus. With `auto_execute: propose`, each signal becomes a **PENDING trade proposal** (auto-sized via the PositionSizer, `source=strategy:<name>`, 30-min TTL after which it self-expires) that a human approves in the web dashboard or via `mmr approve N`. Paper mode only. Semantics mirror the backtester's long-only model: BUY proposes a new entry (deduped while one is pending), SELL proposes closing the currently-held long and is ignored when flat. Time-based exits on a BUY signal (`max_hold_bars`, `close_by_time`) are recorded on the proposal; once the entry executes, `SignalProposer.check_exits` (called every new completed bar) proposes the close when the condition triggers. `auto_execute: true` (full auto) is NOT implemented and is refused at load time — fail loudly, not silently inert. Implementation: `trader/strategy/signal_proposer.py`; spec: `docs/superpowers/specs/2026-07-15-signal-propose-bridge-design.md`.

@@ -7,6 +7,7 @@ from trader.common.logging_helper import setup_logging
 from trader.data.data_access import SecurityDefinition
 from trader.data.universe import Universe
 from trader.objects import BarSize, WhatToShow
+from trader.strategy.history_depth import ib_request_span
 from typing import List, Optional, Union
 
 import asyncio
@@ -201,29 +202,8 @@ class IBHistoryWorker():
         if not self.ib_client.isConnected():
             raise ConnectionError()
 
-        # 16 hours, 4am to 8pm
-        # duration_step_size = '57600 S'
-
-        # IB historical-data chunk sizes per bar size. Bigger chunks =
-        # fewer round-trips before hitting IB's pacing limit.
-        # Limits per IB docs:
-        #   1 sec  -> 1800 S, 5 sec -> 7200 S
-        #   1 min  -> 1 W, 5 min -> 1 M
-        #   1 hour -> 1 Y, 1 day -> no practical cap
-        duration_step_size = '86400 S'
-
-        if str(bar_size) == '1 day':
-            duration_step_size = '10 Y'
-        if str(bar_size) == '1 hour':
-            duration_step_size = '4 Y'
-        if str(bar_size) == '2 hours':
-            duration_step_size = '1 Y'
-        if str(bar_size) == '1 min':
-            duration_step_size = '1 W'
-        if str(bar_size) == '5 mins' or str(bar_size) == '5 min':
-            duration_step_size = '1 M'
-        if str(bar_size) == '15 mins' or str(bar_size) == '15 min':
-            duration_step_size = '1 M'
+        # One request spans this much; bigger spans mean fewer round-trips before IB's pacing limit.
+        duration_step_size, _ = ib_request_span(bar_size)
 
         # we say that the 'end date' is the start of the day after
         # start_date = dateify(start_date, timezone=tz_info)

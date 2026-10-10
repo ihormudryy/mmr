@@ -44,12 +44,20 @@ from trader.data.strategy_signal_record import (
 from trader.messaging.ai_deployment_wire import GetActiveAiDeploymentsResponse
 from trader.strategy.ai_deployment_source import (
     AI_HISTORY_DAYS,
-    AI_HISTORY_TIMEOUT_S,
     AI_INSTANCE_PREFIX,
     AiDeploymentSource,
     AiInstanceBinding,
+    ai_history_timeout_s,
     ai_instance_name,
     source_unchanged,
+)
+from trader.strategy.history_depth import (
+    HISTORY_BELOW_WARMUP,
+    HISTORY_DEPTH_CAPPED,
+    HistoryDepth,
+    InvalidWarmupDeclaration,
+    declared_warmup_bars,
+    history_depth,
 )
 from trader.strategy.signal_proposer import SignalProposer
 from trader.strategy.signal_hold import (
@@ -275,20 +283,27 @@ def _strategy_row(config: StrategyConfig) -> Dict[str, Any]:
     }
 
 
+def _live_strategy_rows(runtime: 'StrategyRuntime') -> List[Dict[str, Any]]:
+    rows = []
+    for strategy in runtime.get_strategies():
+        row = _strategy_row(StrategyConfig.from_strategy(strategy))
+        row['historical_days_prior'] = strategy.historical_days_prior
+        row['history_days'] = runtime.history_days(strategy)
+        row['history_code'] = runtime.history_code(strategy)
+        rows.append(row)
+    return rows
+
+
 def _list_strategies_handler(runtime: 'StrategyRuntime'):
     def _handler(_parsed: ListStrategiesRequest) -> Dict[str, Any]:
-        rows = [_strategy_row(StrategyConfig.from_strategy(s))
-                for s in runtime.get_strategies()]
-        return {'strategies': rows}
+        return {'strategies': _live_strategy_rows(runtime)}
     return _handler
 
 
 def _reload_strategies_handler(runtime: 'StrategyRuntime'):
     async def _handler(_parsed: ReloadStrategiesRequest) -> Dict[str, Any]:
         await runtime._reconcile()
-        rows = [_strategy_row(StrategyConfig.from_strategy(s))
-                for s in runtime.get_strategies()]
-        return {'ok': True, 'strategies': rows}
+        return {'ok': True, 'strategies': _live_strategy_rows(runtime)}
     return _handler
 
 
@@ -565,6 +580,10 @@ class StrategyRuntime():
         # warmup + today's opening bars — the live tick stream alone only holds
         # ticks since subscription.
         self._hist_bars: Dict[tuple, pd.DataFrame] = {}
+        # Calendar days each _hist_bars entry was read with; a deeper strategy on the key re-reads it.
+        self._hist_bar_days: Dict[tuple, int] = {}
+        # (conId, strategy name) -> (bars, MIN_BARS) while a strategy is held back below its warm-up.
+        self._warmup_shortfalls: Dict[tuple, tuple[int, int]] = {}
         # Last completed bar timestamp dispatched per (conId, strategy name), so
         # a strategy sees each bar once (not on every tick).
         self._last_dispatched_bar: Dict[tuple, pd.Timestamp] = {}
@@ -868,6 +887,8 @@ class StrategyRuntime():
                     bucket.remove(instance)
         self._last_dispatched_bar = {
             key: value for key, value in self._last_dispatched_bar.items() if key[1] != name}
+        self._warmup_shortfalls = {
+            key: value for key, value in self._warmup_shortfalls.items() if key[1] != name}
         sys.modules.pop(f'_mmr_strategy_{name}', None)
         return True
 
@@ -918,24 +939,28 @@ class StrategyRuntime():
             raise AiHistoryBackfillError('the IB history client has not started yet')
         if _running_loop() is loop:
             raise AiHistoryBackfillError('called on the service loop, which would wait on itself')
+        timeout_s = ai_history_timeout_s(instance.bar_size, self._warmup_days(instance), len(instance.conids or []))
         future = asyncio.run_coroutine_threadsafe(self._backfill_ai_history(instance), loop)
         try:
-            future.result(timeout=AI_HISTORY_TIMEOUT_S)
+            future.result(timeout=timeout_s)
         except TimeoutError as ex:
             future.cancel()
-            raise AiHistoryBackfillError(f'no result within {AI_HISTORY_TIMEOUT_S}s') from ex
+            raise AiHistoryBackfillError(f'no result within {timeout_s}s') from ex
 
     async def _backfill_ai_history(self, instance: Strategy) -> None:
         if not await self._fetch_strategy_history(instance):
             raise AiHistoryBackfillError('IB returned no data or a conid did not resolve (see the log above)')
         for conId in instance.conids:
+            key = (conId, instance.bar_size)
+            days = max(self._warmup_days(instance), self._hist_days_needed(conId, instance.bar_size))
             try:
-                bars = self._read_hist_bars(conId, instance.bar_size)
+                bars = self._read_hist_bars(conId, instance.bar_size, days)
             except Exception as ex:
                 raise AiHistoryBackfillError(f'reading back the history of conId {conId} failed: {ex}') from ex
             if bars.empty:
                 raise AiHistoryBackfillError(f'no history bars for conId {conId} after the backfill')
-            self._hist_bars[(conId, instance.bar_size)] = bars   # replaces a frame primed before the backfill
+            self._hist_bars[key] = bars   # replaces a frame primed before the backfill
+            self._hist_bar_days[key] = days
 
     @staticmethod
     def _coerce_param_value(value):
@@ -1590,24 +1615,81 @@ class StrategyRuntime():
         except Exception:
             pass
 
-    def _prime_hist_bars(self, conId: int, bar_size: BarSize) -> None:
-        """One-time load of recent historical OHLCV bars for (conId, bar_size)
+    @staticmethod
+    def _history_depth_for(strategy: Strategy, configured_days: int) -> HistoryDepth:
+        """The days to load for this strategy: its configured depth, raised to cover its MIN_BARS."""
+        depth = history_depth(strategy.bar_size, declared_warmup_bars(strategy), configured_days or 0)
+        if depth.capped:
+            logging.warning(
+                '%s: strategy %s needs %d %s bars of warm-up, more than the %d-day history limit for '
+                'that bar size; loading %d days, and it waits for live bars if that is not enough',
+                HISTORY_DEPTH_CAPPED, strategy.name, depth.warmup_bars, strategy.bar_size,
+                depth.cap_days, depth.days)
+        return depth
+
+    @staticmethod
+    def history_days(strategy: Strategy) -> int:
+        """Calendar days of history loaded for the strategy (at least 1, as before)."""
+        depth: Optional[HistoryDepth] = getattr(strategy, 'history_depth', None)
+        days = depth.days if depth is not None else strategy.historical_days_prior
+        return days or 1
+
+    def history_code(self, strategy: Strategy) -> Optional[str]:
+        """HISTORY_BELOW_WARMUP while any of the strategy's instruments has fewer bars than its MIN_BARS."""
+        if any(name == strategy.name for _, name in self._warmup_shortfalls):
+            return HISTORY_BELOW_WARMUP
+        return None
+
+    def _below_warmup(self, strategy: Strategy, conId: int, bars: int) -> bool:
+        """True while the frame is shorter than the strategy's MIN_BARS; logs once when it starts and ends."""
+        depth: Optional[HistoryDepth] = getattr(strategy, 'history_depth', None)
+        needed = depth.warmup_bars if depth is not None else 0
+        key = (conId, strategy.name)
+        if bars >= needed:
+            if self._warmup_shortfalls.pop(key, None) is not None:
+                logging.info('strategy %s conId %s: warm-up met (%d bars, MIN_BARS %d); dispatching bars',
+                             strategy.name, conId, bars, needed)
+            return False
+        if key not in self._warmup_shortfalls:
+            logging.warning(
+                '%s: strategy %s conId %s has %d %s bars, MIN_BARS is %d; on_prices is not called '
+                'until enough bars are in', HISTORY_BELOW_WARMUP, strategy.name, conId, bars,
+                strategy.bar_size, needed)
+        self._warmup_shortfalls[key] = (bars, needed)
+        return True
+
+    @staticmethod
+    def _warmup_days(strategy: Strategy) -> int:
+        depth: Optional[HistoryDepth] = getattr(strategy, 'history_depth', None)
+        return depth.warmup_days if depth is not None else 0
+
+    def _hist_days_needed(self, conId: int, bar_size: BarSize) -> int:
+        """The days of stored bars the frame on (conId, bar_size) must hold for its strategies' warm-up."""
+        return max((self._warmup_days(s) for s in self.strategies.get(conId, []) if s.bar_size == bar_size),
+                   default=0)
+
+    def _prime_hist_bars(self, conId: int, bar_size: BarSize, days: int = 0) -> None:
+        """Load recent historical OHLCV bars for (conId, bar_size)
         from the DB into the priming cache, normalized to the live schema so it
         concatenates cleanly with resampled ticks. Marks the key as primed even
         on no-data so we don't re-read the DB on every tick."""
         key = (conId, bar_size)
         self._hist_bars[key] = pd.DataFrame()   # mark primed (default empty)
+        self._hist_bar_days[key] = days
         try:
-            self._hist_bars[key] = self._read_hist_bars(conId, bar_size)
+            self._hist_bars[key] = self._read_hist_bars(conId, bar_size, days)
         except Exception as ex:
             logging.warning('could not prime hist bars for conId %s %s: %s', conId, bar_size, ex)
 
-    def _read_hist_bars(self, conId: int, bar_size: BarSize) -> pd.DataFrame:
-        """Recent historical bars for (conId, bar_size) from the DB in the live UTC schema; raises on a read error."""
+    def _read_hist_bars(self, conId: int, bar_size: BarSize, days: int = 0) -> pd.DataFrame:
+        """Historical bars for (conId, bar_size) from the DB in the live UTC schema; raises on a read error.
+
+        Reads at least the last ``days`` calendar days, so a strategy's warm-up history reaches its frame.
+        """
         from trader.data.duckdb_store import DuckDBDataStore
         from trader.data.market_data import normalize_historical
         end = dt.datetime.now(dt.timezone.utc)
-        start = end - dt.timedelta(days=max(self._tick_retention_days, 5) + 5)
+        start = end - dt.timedelta(days=max(self._tick_retention_days + 5, 10, days))
         df = DuckDBDataStore(self.history_duckdb_path).read(str(conId), start=start, end=end, bar_size=str(bar_size))
         if df is None or df.empty:
             return pd.DataFrame()
@@ -1622,8 +1704,9 @@ class StrategyRuntime():
         the raw per-tick, cumulative-volume stream and couldn't compute bars."""
         from trader.data.market_data import resample_ticks_to_bars
         key = (conId, bar_size)
-        if key not in self._hist_bars:
-            self._prime_hist_bars(conId, bar_size)
+        days_needed = self._hist_days_needed(conId, bar_size)
+        if key not in self._hist_bars or days_needed > self._hist_bar_days.get(key, 0):
+            self._prime_hist_bars(conId, bar_size, days_needed)
         try:
             freq = BarSize.to_pandas_freq(bar_size)
         except Exception:
@@ -1696,12 +1779,15 @@ class StrategyRuntime():
             if self._last_dispatched_bar.get(dkey) == last_bar:
                 return
             self._last_dispatched_bar[dkey] = last_bar
-            # Stamp which instrument this dispatch is for BEFORE calling
-            # on_prices — multi-instrument strategies (pairs) read
-            # ``self.dispatch_conid`` instead of guessing identity from
-            # the shape of the data.
-            strategy._dispatch_conid = conId
-            signal = strategy.on_prices(frame)
+            if self._below_warmup(strategy, conId, len(frame)):
+                signal = None   # exits below still run: a held position must not wait for warm-up
+            else:
+                # Stamp which instrument this dispatch is for BEFORE calling
+                # on_prices — multi-instrument strategies (pairs) read
+                # ``self.dispatch_conid`` instead of guessing identity from
+                # the shape of the data.
+                strategy._dispatch_conid = conId
+                signal = strategy.on_prices(frame)
         except Exception:
             logging.exception(
                 'strategy %s raised on_prices for conId %s; disabling it and '
@@ -2241,6 +2327,12 @@ class StrategyRuntime():
                     logging.error('refusing to load strategy %s: %s', name, exc)
                     return
 
+                try:
+                    instance.history_depth = self._history_depth_for(instance, historical_days_prior)
+                except InvalidWarmupDeclaration as exc:
+                    logging.error('refusing to load strategy %s: %s', name, exc)
+                    return
+
                 # Give the strategy a reference to the runtime for subscriptions
                 instance.strategy_runtime = self
                 instance.loaded_source_digest = loaded_source_digest
@@ -2703,7 +2795,7 @@ class StrategyRuntime():
 
     async def _fetch_strategy_history(self, strategy: Strategy) -> bool:
         """Backfill one strategy's conids and universe; False when any part could not be loaded."""
-        historical_days = strategy.historical_days_prior if strategy.historical_days_prior else 1
+        historical_days = self.history_days(strategy)
         complete = True
         for conId in strategy.conids or []:
             instrument = self._trader_gateway.resolve_instrument(conId)

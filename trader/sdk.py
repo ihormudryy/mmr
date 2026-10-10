@@ -2688,6 +2688,8 @@ class MMR:
                 'bar_size': str(s.get('bar_size') or ''),
                 'conids': s.get('conids') or [],
                 'hist_days_prior': s.get('historical_days_prior'),
+                'history_days': s.get('history_days'),
+                'history_code': s.get('history_code') or '',
                 'auto_execute': s.get('auto_execute', False),
                 'class_name': s.get('class_name') or '',
                 'description': s.get('description') or '',

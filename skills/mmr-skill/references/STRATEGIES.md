@@ -79,6 +79,8 @@ class OpeningRangeBreakout(Strategy):
         ...
 ```
 
+`MIN_BARS` is also the strategy's **warm-up declaration** for live runs: the strategy service loads enough history for that many bars on the strategy's bar size, and does not call `on_prices` until the frame has them (`HISTORY_BELOW_WARMUP`, shown in `mmr strategies list`). Declare it when the strategy needs a long lookback; a strategy without it keeps the configured `historical_days_prior` and is never held back. It must be a positive int.
+
 Overrides via:
 - **CLI**: `mmr backtest --param RANGE_MINUTES=15 --param VOLUME_MULT=1.5`
 - **JSON**: `mmr backtest --params '{"RANGE_MINUTES":15,"VOLUME_MULT":1.5}'`
@@ -225,7 +227,7 @@ After `install()`, access via `self.ctx`:
 | `self.bar_size` | BarSize | Bar size enum |
 | `self.conids` | List[int] | Contract IDs assigned |
 | `self.universe` | str | Universe name (if used instead of conids) |
-| `self.historical_days_prior` | int | Days of history to preload |
+| `self.historical_days_prior` | int | Days of history to preload, as configured (the runtime loads more when `MIN_BARS` needs it) |
 | `self.paper_only` | bool | If True, strategy refuses to load on a live trader_service (safety gate for untested strategies). Routing itself is always determined by the trader_service's account. |
 | `self.storage` | TickStorage | Access to DuckDB historical data |
 | `self.logging` | Logger | Per-strategy logger |

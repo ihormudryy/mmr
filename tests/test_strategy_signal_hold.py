@@ -121,27 +121,29 @@ def test_a_record_that_keeps_failing_holds_at_most_the_cap_and_raises_one_incide
     assert nothing_acted_on(rt)
 
 
-def test_recovery_writes_the_superseded_held_signals_as_stale_gaps_then_one_gap_for_the_dropped(held, caplog):
+def test_recovery_dispatches_the_newest_held_signal_after_one_gap_for_the_evicted_and_stale_gaps(held, caplog):
     rt, strategy = held
     events = rt.event_store.append
-    rt.event_store.append = _raise_disk_full
-    tick_bars(rt, strategy, range(31, 31 + MAX_HELD_SIGNALS + 3))         # 14:30..14:37 held, 14:38..14:41 dropped
+    rt.event_store.append = _raise_disk_full                              # both stores are down
+    tick_bars(rt, strategy, range(31, 31 + MAX_HELD_SIGNALS + 3))         # 14:30..14:33 evicted, 14:34..14:41 held
+    assert rt._signal_hold.held_count((CONID, strategy.name)) == MAX_HELD_SIGNALS
     rt.event_store.append = events
     rt.signal_record.failures_left = 0
     caplog.clear()
-    rt._on_tick_for_strategy(strategy, CONID)                             # the latest bar is 14:41
-    assert nothing_acted_on(rt)                                           # every held signal was superseded
-    *stale, dropped = gaps(rt)
-    assert [g.metadata['signal_time'] for g in stale] == [
-        f'2026-10-07T14:{m:02d}:00+00:00' for m in range(30, 30 + MAX_HELD_SIGNALS)]
-    assert {g.metadata['reason'] for g in stale} == {'STALE'}
-    assert dropped.metadata == {'reason': 'HOLD_FULL', 'count': 4, 'first_signal_time': '2026-10-07T14:38:00+00:00',
-                                'last_signal_time': '2026-10-07T14:41:00+00:00'}
+    seen = watch_side_effects(rt, strategy)
+    rt._on_tick_for_strategy(strategy, CONID)                             # the latest bar is still 14:41
+    evicted, *stale = gaps(rt)
+    assert evicted.metadata == {'reason': 'HOLD_FULL', 'count': 4, 'first_signal_time': '2026-10-07T14:30:00+00:00',
+                                'last_signal_time': '2026-10-07T14:33:00+00:00'}
+    assert [(g.metadata['reason'], g.metadata['signal_time']) for g in stale] == [
+        ('STALE', f'2026-10-07T14:{m:02d}:00+00:00') for m in range(34, 41)]
+    assert [t for _, t in recorded(rt)] == ['2026-10-07T14:41:00+00:00']   # the newest signal is on the latest bar
+    assert [kind for kind, _ in seen] == ['record', 'publish', 'proposal']
     assert rt._signal_hold.held_count((CONID, strategy.name)) == 0
     assert errors(caplog) == []
     rt.current_frame = _frame(last_time='2026-10-07 14:42')                # the next signal is dispatched at once
     rt._on_tick_for_strategy(strategy, CONID)
-    assert [t for _, t in recorded(rt)] == ['2026-10-07T14:42:00+00:00']
+    assert [t for _, t in recorded(rt)][-1] == '2026-10-07T14:42:00+00:00'
 
 
 def test_a_record_that_keeps_failing_never_fills_the_hold_while_events_can_be_written(held):

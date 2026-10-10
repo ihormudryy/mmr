@@ -13,10 +13,12 @@ superseded the signal (issue #140). The check reads the strategy's current frame
 not the wall clock: a bar is the strategy's own clock. When the latest bar cannot
 be read, the signal stays held and is neither dispatched nor written down.
 
-The hold is bounded per (conId, strategy). Once full, each newer signal is dropped
-and counted; the count is written as one ``SIGNAL_GAP`` event as soon as any event
-can be written. A failing record logs one ERROR when the hold starts and one
-``SIGNAL_HOLD_FULL`` ERROR when it first drops a signal, not one per tick.
+The hold is bounded per (conId, strategy). Once full, the oldest held signal is
+evicted and counted, so the newest one (the only one that can still be current)
+is kept. The count is written as one ``SIGNAL_GAP`` event by the next retry that
+can write an event, before the held signals are settled. A failing record logs one
+ERROR when the hold starts and one ``SIGNAL_HOLD_FULL`` ERROR when it first evicts
+a signal, not one per tick.
 
 Every dispatch, fresh or held, checks that its strategy may still act and then
 writes the record and runs its side effects under one lock. A disable or unload
@@ -149,8 +151,8 @@ class SignalHold:
         hold = self._holds.get(key)
         if hold is None:
             return
+        self._flush_dropped(key, hold)              # the evicted signals are older than every held one
         self._settle_in_order(key, hold)
-        self._flush_dropped(key, hold)
         if not hold.signals and hold.dropped is None:
             del self._holds[key]
             logging.warning('signal hold for %s conId %s is clear', key[1], key[0])
@@ -160,17 +162,20 @@ class SignalHold:
             self.retry(key)
 
     def _enqueue(self, key: tuple, hold: _Hold, held: HeldSignal) -> None:
-        if len(hold.signals) < self._capacity:
-            hold.signals.append(held)
-            return
-        # Full: keep the oldest held signals, so the dropped ones are one contiguous run after them.
-        hold.dropped = _add_dropped(hold.dropped, held.signal_time)
-        if not hold.full_alarm_raised:
-            hold.full_alarm_raised = True
-            logging.error('SIGNAL_HOLD_FULL: %d signals of %s conId %s wait for the signal record; newer signals '
-                          'are dropped and written as one SIGNAL_GAP event once any event can be written',
-                          len(hold.signals), key[1], key[0])
-        self._flush_dropped(key, hold)
+        """Queue behind the held signals; when full, evict the oldest, which a newer bar has already superseded.
+
+        The evicted signals form one contiguous run before the held ones. They are not written here: the
+        retry that ran just before on this tick could not write an event, or the hold would be empty.
+        """
+        if len(hold.signals) >= self._capacity:
+            evicted = hold.signals.pop(0)
+            hold.dropped = _add_dropped(hold.dropped, evicted.signal_time)
+            if not hold.full_alarm_raised:
+                hold.full_alarm_raised = True
+                logging.error('SIGNAL_HOLD_FULL: %d signals of %s conId %s wait for the signal record; the oldest '
+                              'are evicted and written as one SIGNAL_GAP event once any event can be written',
+                              len(hold.signals) + 1, key[1], key[0])
+        hold.signals.append(held)
 
     def _settle_in_order(self, key: tuple, hold: _Hold) -> None:
         while hold.signals:
@@ -228,7 +233,7 @@ class SignalHold:
             logging.debug('SIGNAL_GAP for %s conId %s not written yet: %s', key[1], key[0], ex)
             return
         hold.dropped = None
-        logging.warning('%d signals of %s conId %s from %s to %s were dropped by a full hold; written as SIGNAL_GAP',
+        logging.warning('%d signals of %s conId %s from %s to %s were evicted by a full hold; written as SIGNAL_GAP',
                         dropped.count, key[1], key[0], dropped.first_signal_time.isoformat(),
                         dropped.last_signal_time.isoformat())
 

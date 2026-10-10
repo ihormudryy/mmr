@@ -1,0 +1,244 @@
+"""Issue #80: held strategy signals of a disabled strategy, and a bounded hold when the record keeps failing."""
+from __future__ import annotations
+
+import asyncio
+import logging
+import threading
+
+import pytest
+
+from tests.test_signal_proposer import _frame
+from tests.test_strategy_signal_record import T0, ticking_runtime, recorded
+from tests.automation.test_controller_epoch import Clock
+from trader.data.event_store import EventType
+from trader.data.strategy_signal_record import source_event_id_for
+from trader.strategy.signal_hold import MAX_HELD_SIGNALS
+from trader.trading.strategy import StrategyState
+
+CONID = 4391
+ALWAYS = 10 ** 6
+WAIT = 10          # seconds; only a guard against a hang, never part of an assertion's timing
+
+
+@pytest.fixture
+def clock():
+    return Clock(T0)
+
+
+@pytest.fixture
+def held(tmp_path, installed_strategy, clock):
+    """A runtime whose record failed the 14:30 BUY of a propose-mode strategy, so that signal is held."""
+    installed_strategy.ctx.auto_execute = 'propose'
+    rt, _ = ticking_runtime(tmp_path, clock, installed_strategy, fail_after_write=False)
+    rt._schedule_persist_enabled = lambda name, enabled: None
+    rt._announce_and_drain = lambda name: None
+    rt._reconcile_sync = lambda: None
+    rt.signal_proposer.expire_stale = lambda: None
+    rt.signal_record.failures_left = ALWAYS
+    rt._on_tick_for_strategy(installed_strategy, CONID)
+    assert rt._signal_hold.held_count((CONID, installed_strategy.name)) == 1
+    return rt, installed_strategy
+
+
+def gaps(rt):
+    return [e for e in rt.event_store.events if e.event_type == EventType.SIGNAL_GAP]
+
+
+def nothing_acted_on(rt):
+    return recorded(rt) == [] and rt.zmq_messagebus_client.written == [] and rt.signal_proposer.signals == []
+
+
+def errors(caplog):
+    return [r for r in caplog.records if r.levelno >= logging.ERROR]
+
+
+def test_a_held_signal_of_a_disabled_strategy_is_settled_on_reconcile_as_a_gap(held):
+    rt, strategy = held
+    rt.disable_strategy(strategy.name)
+    rt.signal_record.failures_left = 0                                    # the record is writable again
+    asyncio.run(rt._reconcile())                                          # no tick reaches a disabled strategy
+    assert nothing_acted_on(rt)
+    [gap] = gaps(rt)
+    assert gap.strategy_name == strategy.name and gap.conid == CONID and gap.action == ''
+    assert gap.metadata == {
+        'reason': 'STRATEGY_DISABLED', 'action': 'BUY', 'signal_time': '2026-10-07T14:30:00+00:00',
+        'source_event_id': source_event_id_for(strategy.name, CONID, 'BUY', T0.replace(minute=30))}
+    assert rt._signal_hold.held_count((CONID, strategy.name)) == 0
+
+
+def test_a_disable_and_re_enable_between_retries_still_never_dispatches_the_held_signal(held):
+    rt, strategy = held
+    rt.disable_strategy(strategy.name)
+    rt.enable_strategy(strategy.name)
+    rt.signal_record.failures_left = 0
+    rt._on_tick_for_strategy(strategy, CONID)                             # same bar: only the retry runs
+    assert nothing_acted_on(rt)
+    assert [g.metadata['reason'] for g in gaps(rt)] == ['STRATEGY_DISABLED']
+
+
+def test_a_held_signal_of_an_unloaded_strategy_is_settled_as_a_gap(held):
+    rt, strategy = held
+    rt.unload_strategy(strategy.name)
+    rt.signal_record.failures_left = 0
+    rt._retry_held_signals()
+    assert nothing_acted_on(rt)
+    assert [g.metadata['reason'] for g in gaps(rt)] == ['STRATEGY_UNLOADED']
+
+
+def test_a_disabled_strategy_keeps_its_signal_held_until_the_gap_can_be_written(held):
+    rt, strategy = held
+    rt.disable_strategy(strategy.name)
+    events, rt.event_store.append = rt.event_store.append, _raise_disk_full
+    rt._retry_held_signals()
+    assert rt._signal_hold.held_count((CONID, strategy.name)) == 1
+    rt.event_store.append = events
+    rt._retry_held_signals()
+    assert nothing_acted_on(rt) and [g.metadata['reason'] for g in gaps(rt)] == ['STRATEGY_DISABLED']
+
+
+def _raise_disk_full(event):
+    raise OSError('No space left on device')
+
+
+def tick_bars(rt, strategy, minutes, ticks_per_bar=3):
+    for minute in minutes:
+        rt.current_frame = _frame(last_time=f'2026-10-07 14:{minute:02d}')
+        for _ in range(ticks_per_bar):
+            rt._on_tick_for_strategy(strategy, CONID)
+
+
+def test_a_record_that_keeps_failing_holds_at_most_the_cap_and_raises_one_incident(held, caplog):
+    rt, strategy = held
+    rt.event_store.append = _raise_disk_full                              # nothing can be written at all
+    caplog.clear()
+    with caplog.at_level(logging.DEBUG):
+        tick_bars(rt, strategy, range(31, 31 + MAX_HELD_SIGNALS + 3))
+        for _ in range(5):
+            rt._retry_held_signals()
+    assert rt._signal_hold.held_count((CONID, strategy.name)) == MAX_HELD_SIGNALS
+    [incident] = errors(caplog)                                           # the hold-start ERROR came before
+    assert incident.getMessage().startswith('SIGNAL_HOLD_FULL')
+    assert nothing_acted_on(rt)
+
+
+def test_recovery_writes_the_held_signals_in_order_and_one_gap_for_the_dropped(held, caplog):
+    rt, strategy = held
+    events = rt.event_store.append
+    rt.event_store.append = _raise_disk_full
+    tick_bars(rt, strategy, range(31, 31 + MAX_HELD_SIGNALS + 3))         # 14:30..14:37 held, 14:38..14:41 dropped
+    rt.event_store.append = events
+    rt.signal_record.failures_left = 0
+    caplog.clear()
+    rt._on_tick_for_strategy(strategy, CONID)
+    assert [t for _, t in recorded(rt)] == [f'2026-10-07T14:{m:02d}:00+00:00' for m in range(30, 30 + MAX_HELD_SIGNALS)]
+    [gap] = gaps(rt)
+    assert gap.metadata == {'reason': 'HOLD_FULL', 'count': 4, 'first_signal_time': '2026-10-07T14:38:00+00:00',
+                            'last_signal_time': '2026-10-07T14:41:00+00:00'}
+    assert rt._signal_hold.held_count((CONID, strategy.name)) == 0
+    assert errors(caplog) == []
+    assert len(rt.signal_proposer.signals) == MAX_HELD_SIGNALS            # an enabled strategy's held signals act
+    rt.current_frame = _frame(last_time='2026-10-07 14:42')                # the next signal is dispatched at once
+    rt._on_tick_for_strategy(strategy, CONID)
+    assert recorded(rt)[-1][1] == '2026-10-07T14:42:00+00:00'
+
+
+def test_a_full_hold_writes_each_dropped_signal_as_a_gap_while_events_can_be_written(held):
+    rt, strategy = held
+    tick_bars(rt, strategy, range(31, 31 + MAX_HELD_SIGNALS + 1))
+    assert [g.metadata['count'] for g in gaps(rt)] == [1, 1]
+    assert rt._signal_hold.held_count((CONID, strategy.name)) == MAX_HELD_SIGNALS
+
+
+# -- a disable from the RPC thread against a dispatch on the loop (mmr-openai review of 0818eaf5, PR #139) --
+
+class ObservedLock:
+    """The hold's dispatch lock, reporting when another thread has to wait for it and pausing the loop before it."""
+
+    def __init__(self, *, contended, pause_thread=None, paused=None, resume=None):
+        self._lock = threading.RLock()
+        self.contended, self.pause_thread, self.paused, self.resume = contended, pause_thread, paused, resume
+
+    def __enter__(self):
+        if self.pause_thread is not None and threading.current_thread() is self.pause_thread:
+            self.pause_thread = None
+            self.paused.set()
+            assert self.resume.wait(WAIT)
+        if not self._lock.acquire(blocking=False):
+            self.contended.set()
+            self._lock.acquire()
+        return self
+
+    def __exit__(self, *exc):
+        self._lock.release()
+
+
+def watch_side_effects(rt, strategy):
+    """Each record, publish and proposal of the dispatch, with the strategy state at that moment."""
+    seen = []
+    record, publish, propose = rt._record_signal, rt.zmq_messagebus_client.write, rt.signal_proposer.on_signal
+    rt._record_signal = lambda *a: (record(*a), seen.append(('record', strategy.state)))
+    rt.zmq_messagebus_client.write = lambda *a: (publish(*a), seen.append(('publish', strategy.state)))
+    rt.signal_proposer.on_signal = lambda *a: (propose(*a), seen.append(('proposal', strategy.state)))
+    return seen
+
+
+def disable_on_rpc_thread(rt, strategy, done):
+    thread = threading.Thread(target=lambda: (rt.disable_strategy(strategy.name), done.set()), name='rpc')
+    thread.start()
+    return thread
+
+
+def test_a_disable_during_the_held_record_write_waits_until_the_dispatch_is_done(held):
+    """OpenAI's probe: pause in _record_signal on a retry, disable from the RPC thread, resume."""
+    rt, strategy = held
+    rt.signal_record.failures_left = 0
+    seen = watch_side_effects(rt, strategy)
+    in_write, resume, disable_progressed = threading.Event(), threading.Event(), threading.Event()
+    rt._signal_hold._dispatch_lock = ObservedLock(contended=disable_progressed)
+    record = rt._record_signal
+    rt._record_signal = lambda *a: (in_write.set(), resume.wait(WAIT), record(*a))
+    loop = threading.Thread(target=rt._retry_held_signals, name='loop')
+    loop.start()
+    assert in_write.wait(WAIT)
+    rpc = disable_on_rpc_thread(rt, strategy, disable_progressed)
+    assert disable_progressed.wait(WAIT)                    # the disable finished, or it waits for the dispatch
+    resume.set()
+    loop.join(WAIT)
+    rpc.join(WAIT)
+    running = StrategyState.RUNNING
+    assert seen == [('record', running), ('publish', running), ('proposal', running)]   # all before the disable
+    assert strategy.state == StrategyState.DISABLED and gaps(rt) == []
+
+
+def test_a_disable_before_the_held_dispatch_takes_the_lock_makes_a_gap_and_no_dispatch(held):
+    rt, strategy = held
+    rt.signal_record.failures_left = 0
+    paused, resume, disabled = threading.Event(), threading.Event(), threading.Event()
+    loop = threading.Thread(target=rt._retry_held_signals, name='loop')
+    rt._signal_hold._dispatch_lock = ObservedLock(contended=threading.Event(), pause_thread=loop,
+                                                  paused=paused, resume=resume)
+    loop.start()
+    assert paused.wait(WAIT)                                # the retry is about to check the strategy
+    disable_on_rpc_thread(rt, strategy, disabled).join(WAIT)
+    assert disabled.is_set()
+    resume.set()
+    loop.join(WAIT)
+    assert nothing_acted_on(rt)
+    assert [g.metadata['reason'] for g in gaps(rt)] == ['STRATEGY_DISABLED']
+
+
+def test_a_disable_while_a_fresh_signal_is_computed_makes_a_gap_and_no_dispatch(tmp_path, installed_strategy, clock):
+    installed_strategy.ctx.auto_execute = 'propose'
+    rt, _ = ticking_runtime(tmp_path, clock, installed_strategy, fail_after_write=False)
+    rt.signal_record.failures_left = 0
+    rt._schedule_persist_enabled = lambda name, enabled: None
+    rt._announce_and_drain = lambda name: None
+    on_prices = installed_strategy.on_prices
+
+    def disabled_mid_bar(frame):
+        disable_on_rpc_thread(rt, installed_strategy, threading.Event()).join(WAIT)
+        return on_prices(frame)
+    installed_strategy.on_prices = disabled_mid_bar
+    rt._on_tick_for_strategy(installed_strategy, CONID)
+    assert nothing_acted_on(rt)
+    assert [g.metadata['reason'] for g in gaps(rt)] == ['STRATEGY_DISABLED']

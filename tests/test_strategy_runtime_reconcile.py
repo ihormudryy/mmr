@@ -38,6 +38,7 @@ def _make_runtime(tmp_path, strategies_dir, config_file=None, paper_trading=True
     # _reconcile() sweeps proposal expiry unconditionally on every call — a
     # bare stub (not exercised by these tests) keeps that a no-op.
     rt.signal_proposer = Mock()
+    rt._signal_hold = rt._new_signal_hold()
     return rt
 
 

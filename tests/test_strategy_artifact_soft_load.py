@@ -46,6 +46,7 @@ def _make_runtime(tmp_path, tmp_duckdb_path, *, automation_enabled: bool):
     rt._artifact_verifier = None
     rt._ai_backfills = set()
     rt._ai_backfill_lock = threading.Lock()
+    rt._signal_hold = rt._new_signal_hold()
     os.makedirs(rt.strategies_directory, exist_ok=True)
     return rt
 

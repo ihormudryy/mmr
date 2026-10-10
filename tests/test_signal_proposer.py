@@ -335,7 +335,7 @@ def _make_runtime(tmp_path, paper_trading=True) -> StrategyRuntime:
     rt.signal_proposer = _RecordingProposer()  # type: ignore
     rt.signal_record = _RecordingSignalRecord()  # type: ignore
     rt._last_dispatched_bar = {}
-    rt._pending_signals = {}
+    rt._signal_hold = rt._new_signal_hold()
     return rt
 
 

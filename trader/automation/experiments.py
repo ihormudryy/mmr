@@ -360,9 +360,11 @@ class ExperimentStore:
 
         Runs inside the pause's write transaction, which holds the journal's write lock like the saga's SUBMITTING
         write: the pause sees every SUBMITTING row committed before it, and any entry after it finds PAUSED. The
-        saga row is SUBMITTING from its send gate until ``send_returned_at`` is written. ``submit_bracket`` is
-        called once, right after that commit in the same process, and no restart sends again: a row older than this
-        process is not in flight. A pause committing after that row cannot stop the send; it can only name it."""
+        send is in flight from the SUBMITTING row until ``send_returned_at`` is written, whatever state broker
+        events moved the saga to meanwhile (``unreturned_send_sql``). A pause committing after that row cannot stop
+        the send; it can only name it."""
+        from trader.automation.protective_order_saga import unreturned_send_sql
+
         tables = {row[0] for row in conn.execute(
             "SELECT table_name FROM information_schema.tables "
             "WHERE table_name IN ('automated_order_sagas', 'ai_paper_decisions')").fetchall()}
@@ -371,8 +373,7 @@ class ExperimentStore:
         rows = conn.execute(
             "SELECT s.command_id FROM automated_order_sagas s "
             "JOIN ai_paper_decisions d ON d.command_id = s.command_id "
-            "WHERE s.account_id = ? AND d.action = 'ENTER' AND s.state = 'SUBMITTING' "
-            "AND json_extract_string(s.payload, '$.send_returned_at') IS NULL AND s.updated_at >= ? "
+            f"WHERE s.account_id = ? AND d.action = 'ENTER' AND {unreturned_send_sql('s')} "
             "ORDER BY s.command_id",
             [self._account_id, self._process_started_at]).fetchall()
         return [row[0] for row in rows]

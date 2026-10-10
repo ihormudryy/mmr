@@ -214,14 +214,15 @@ class AiDeploymentVersionStore:
     def entries_being_sent_in_tx(self, conn, digest: str) -> tuple[str, ...]:
         """Command ids of entries bound to this version whose broker send has not returned.
 
-        The saga row is SUBMITTING from its send gate until ``send_returned_at`` is written; the decision row
-        carries the version the entry was admitted under. ``submit_bracket`` is called once, right after that
-        commit in the same process, and no restart sends again: a row older than this process is not in flight."""
+        A send is in flight from the saga's SUBMITTING row until ``send_returned_at`` is written, whatever state
+        broker events moved the saga to meanwhile (``unreturned_send_sql``); the decision row carries the version
+        the entry was admitted under."""
+        from trader.automation.protective_order_saga import unreturned_send_sql
+
         rows = conn.execute(
             "SELECT s.command_id FROM automated_order_sagas s "
             "JOIN ai_paper_decisions d ON d.command_id = s.command_id "
-            "WHERE d.deployment_version = ? AND s.state = 'SUBMITTING' "
-            "AND json_extract_string(s.payload, '$.send_returned_at') IS NULL AND s.updated_at >= ? "
+            f"WHERE d.deployment_version = ? AND {unreturned_send_sql('s')} "
             "ORDER BY s.command_id",
             [digest, self._process_started_at]).fetchall()
         return tuple(row[0] for row in rows)

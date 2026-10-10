@@ -296,3 +296,74 @@ def test_the_stack_builds_its_experiment_store_on_the_domain_journal(world):
     parts = _build_experiment_parts(trader, "paper", world.clock)
     assert parts.store._journal is world.journal
     assert _build_experiment_parts(trader, "live", world.clock) is None
+
+
+# Issue #124 round 2: a send is in flight until it returns, in whatever state broker events moved the saga to.
+
+def _entry_submitted_event(world):
+    from trader.automation.protective_order_saga import BrokerOrderEvent
+    return world.saga.on_broker_event(BrokerOrderEvent(
+        order_group_id="og-" + ENTRY_COMMAND_ID, leg="entry", status="Submitted", filled_quantity=0.0,
+        total_quantity=499.0, order_id=1, event_id="evt-submitted", source_timestamp=world.clock()))
+
+
+def _after_the_broker_work_before_the_return(world, then):
+    """The fake send finishes its broker work, the broker's Submitted event is ingested, then ``then`` runs."""
+    real = world.dispatch.submit_bracket
+
+    def send(**kwargs):
+        submitted = real(**kwargs)
+        assert _entry_submitted_event(world).state == "ENTRY_WORKING"
+        world.clock.advance(seconds=10)
+        then()
+        return submitted
+    world.dispatch.submit_bracket = send
+
+
+def test_a_pause_names_an_entry_the_broker_acknowledged_before_the_send_returned(world):
+    _after_the_broker_work_before_the_return(world, world.pause_experiment)
+    assert world.submit().state == "SUBMITTED"
+    assert _pause_transition(world)["detail"]["entries_in_flight"] == [ENTRY_COMMAND_ID]
+
+
+def test_a_withdrawal_is_refused_while_an_acknowledged_entry_has_not_returned_from_its_send(world):
+    from trader.automation.ai_deployments import DeploymentRefused
+    seen = {}
+
+    def try_withdraw():
+        try:
+            world.versions.withdraw(world.version_digest, reason="operator", principal="cli", command_id="w-ack")
+        except DeploymentRefused as refused:
+            seen["code"] = refused.code
+    _after_the_broker_work_before_the_return(world, try_withdraw)
+    assert world.submit().state == "SUBMITTED"
+    assert seen["code"] == "WITHDRAWAL_ENTRY_IN_FLIGHT"
+    assert world.versions.withdraw(world.version_digest, reason="operator", principal="cli", command_id="w-after")
+
+
+def test_an_acknowledged_entry_whose_send_returned_is_not_in_flight(world):
+    assert world.submit().state == "SUBMITTED"
+    assert _entry_submitted_event(world).state == "ENTRY_WORKING"
+    assert _service(world).pause(_pause_command(world))["entries_in_flight"] == []
+
+
+def test_an_unreturned_send_of_an_earlier_process_is_not_listed_even_after_a_later_event(world):
+    restarted = ExperimentStore(world.db, ACCOUNT, world.clock, process_started_at=NOW + dt.timedelta(seconds=5))
+
+    def pause_through_restarted_store():
+        record = restarted.latest()
+        restarted.transition(record.experiment_id, expected=frozenset({"ARMED"}), to="PAUSED",
+                             principal="cli", command_id="pause-1", reason="x")
+    _after_the_broker_work_before_the_return(world, pause_through_restarted_store)   # updated_at is now NOW+10 s
+    world.submit()
+    assert _pause_transition(world)["detail"]["entries_in_flight"] == []
+
+
+def test_a_withdrawal_ignores_an_unreturned_send_of_an_earlier_process(world):
+    world.versions._process_started_at = NOW + dt.timedelta(seconds=5)
+    seen = {}
+    _after_the_broker_work_before_the_return(
+        world, lambda: seen.update(withdrawn=world.versions.withdraw(
+            world.version_digest, reason="operator", principal="cli", command_id="w-old")))
+    world.submit()
+    assert seen == {"withdrawn": True}

@@ -50,6 +50,35 @@ class IBAIORxError():
         )
 
 
+# IB errors that mean "this account has no (or only partial) API market-data
+# permission for the request". 10167 is deliberately absent: it only announces
+# that delayed data is being shown, and ``__handle_error`` drops it.
+MARKET_DATA_NOT_SUBSCRIBED = 'MARKET_DATA_NOT_SUBSCRIBED'
+MARKET_DATA_PERMISSION_ERROR_CODES = frozenset({354, 10089, 10090})
+
+
+class MarketDataNotSubscribedError(Exception):
+    """IB refused a market-data request for lack of a subscription.
+
+    Carries IB's own code and text so callers can report them. The text is
+    IB's message about the request, never a credential.
+    """
+
+    def __init__(self, error_code: int, error_string: str, contract: Contract):
+        symbol = getattr(contract, 'symbol', '') or '?'
+        con_id = getattr(contract, 'conId', 0) or 0
+        super().__init__(f'IB error {error_code} for {symbol} (conId={con_id}): {error_string}')
+        self.error_code = error_code
+        self.error_string = error_string
+        self.contract = contract
+
+
+def _market_data_failure(error: IBAIORxError) -> Exception:
+    if error.errorCode in MARKET_DATA_PERMISSION_ERROR_CODES:
+        return MarketDataNotSubscribedError(error.errorCode, error.errorString, error.contract)
+    return Exception(error)
+
+
 # Every eventkit Event name on ib_async.IB that trader_runtime may have
 # registered handlers for before reconnect. We snapshot+restore across
 # ``IB()`` replacement in connect() so a reconnect doesn't silently drop
@@ -647,7 +676,7 @@ class IBAIORx():
         # (10167) are filtered in ``__handle_error`` and never reach here.
         def handle_error(error: IBAIORxError):
             logging.error('__subscribe_snapshot() had error: {}'.format(error))
-            xs.on_error(Exception(error))
+            xs.on_error(_market_data_failure(error))
 
         def handle_exception(exception: Exception):
             logging.error('__subscribe_snapshot() threw {}'.format(exception))

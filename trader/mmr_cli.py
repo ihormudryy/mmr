@@ -20,6 +20,7 @@ from rich.text import Text
 from rich.markup import escape
 from trader.sdk import MMR
 from trader.messaging.keys_cli import add_keys_parser, run_keys_command
+from trader.messaging.typed_rpc import TypedRpcRemoteError
 from trader.messaging.keys_cli import running_in_container as _container_probe
 from typing import Any, Dict, List, Optional
 
@@ -10275,6 +10276,26 @@ def _handle_snapshot(mmr: MMR, args: argparse.Namespace, cmd: str):
             print_dict(result, title=f'Snapshot: {args.symbol}{suffix}')
     except (ProviderError, ValueError) as ex:
         print_status(str(ex), success=False)
+    except TypedRpcRemoteError as ex:
+        if ex.code not in _SNAPSHOT_PROBLEM_HINTS:
+            raise
+        _print_problem_with_hint(ex, _SNAPSHOT_PROBLEM_HINTS[ex.code])
+
+
+_SNAPSHOT_PROBLEM_HINTS = {
+    'MARKET_DATA_NOT_SUBSCRIBED': (
+        'The IB account has no market-data subscription for this instrument. '
+        'Enable the subscription (or market-data sharing for a paper account) in IB '
+        'Account Management, or pass --delayed for 15-minute delayed data.'),
+}
+
+
+def _print_problem_with_hint(ex: TypedRpcRemoteError, hint: str):
+    if _json_mode:
+        print(json.dumps({'success': False, 'code': ex.code, 'message': ex.message, 'hint': hint}))
+        return
+    console.print(f'[red]{escape(ex.code)}: {escape(ex.message)}[/red]')
+    console.print(f'[yellow]Hint: {escape(hint)}[/yellow]')
 
 
 def _handle_depth(mmr: MMR, args: argparse.Namespace):

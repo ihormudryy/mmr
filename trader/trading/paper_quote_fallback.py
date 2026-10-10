@@ -17,7 +17,7 @@ from typing import Any, Callable, Optional
 import pandas as pd
 
 from trader.automation.calendar_policy import XNYSCalendarPolicy
-from trader.data_providers.alpaca.us_listing import US_PRIMARY_EXCHANGES
+from trader.data_providers.us_listing import US_PRIMARY_EXCHANGES
 from trader.trading.command_ports import _side_wants_ask, _usable_depth, _usable_price
 from trader.trading.proposal_command_service import ExecutableQuote, QuoteAuthority
 from trader.trading.quote_feeds import IEX_REALTIME_FEED, LIVE_FEED

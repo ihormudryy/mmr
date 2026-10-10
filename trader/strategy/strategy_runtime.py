@@ -1809,7 +1809,7 @@ class StrategyRuntime():
 
     def _new_signal_hold(self) -> SignalHold:
         return SignalHold(dispatch=self._dispatch_held, block_reason=self._held_signal_block_reason,
-                          write_gap=self._write_signal_gap)
+                          latest_bar_time=self._latest_bar_time, write_gap=self._write_signal_gap)
 
     def _dispatch_held(self, held: HeldSignal) -> None:
         self._dispatch_once(held.strategy, held.signal, held.conid, held.frame)
@@ -1820,6 +1820,16 @@ class StrategyRuntime():
         if not _is_dispatchable(strategy):
             return STRATEGY_DISABLED
         return None
+
+    def _latest_bar_time(self, held: HeldSignal) -> Optional[dt.datetime]:
+        """The newest completed bar the strategy would now be evaluated on; None when it cannot be read."""
+        try:
+            frame = self._strategy_frame(held.conid, held.strategy.bar_size)
+            return None if frame is None or frame.empty else completed_bar_time(frame)
+        except Exception as ex:
+            # Raising here would reach the ticker subscriber and detach the feed; the hold keeps the signal instead.
+            logging.warning('latest bar of %s conId %s could not be read: %s', held.strategy.name, held.conid, ex)
+            return None
 
     def _write_signal_gap(self, strategy_name: str, conid: int, metadata: dict) -> None:
         # The action stays in metadata only, so no reader can count a gap row as a BUY or SELL.

@@ -121,7 +121,7 @@ def test_a_record_that_keeps_failing_holds_at_most_the_cap_and_raises_one_incide
     assert nothing_acted_on(rt)
 
 
-def test_recovery_writes_the_held_signals_in_order_and_one_gap_for_the_dropped(held, caplog):
+def test_recovery_writes_the_superseded_held_signals_as_stale_gaps_then_one_gap_for_the_dropped(held, caplog):
     rt, strategy = held
     events = rt.event_store.append
     rt.event_store.append = _raise_disk_full
@@ -129,24 +129,115 @@ def test_recovery_writes_the_held_signals_in_order_and_one_gap_for_the_dropped(h
     rt.event_store.append = events
     rt.signal_record.failures_left = 0
     caplog.clear()
-    rt._on_tick_for_strategy(strategy, CONID)
-    assert [t for _, t in recorded(rt)] == [f'2026-10-07T14:{m:02d}:00+00:00' for m in range(30, 30 + MAX_HELD_SIGNALS)]
-    [gap] = gaps(rt)
-    assert gap.metadata == {'reason': 'HOLD_FULL', 'count': 4, 'first_signal_time': '2026-10-07T14:38:00+00:00',
-                            'last_signal_time': '2026-10-07T14:41:00+00:00'}
+    rt._on_tick_for_strategy(strategy, CONID)                             # the latest bar is 14:41
+    assert nothing_acted_on(rt)                                           # every held signal was superseded
+    *stale, dropped = gaps(rt)
+    assert [g.metadata['signal_time'] for g in stale] == [
+        f'2026-10-07T14:{m:02d}:00+00:00' for m in range(30, 30 + MAX_HELD_SIGNALS)]
+    assert {g.metadata['reason'] for g in stale} == {'STALE'}
+    assert dropped.metadata == {'reason': 'HOLD_FULL', 'count': 4, 'first_signal_time': '2026-10-07T14:38:00+00:00',
+                                'last_signal_time': '2026-10-07T14:41:00+00:00'}
     assert rt._signal_hold.held_count((CONID, strategy.name)) == 0
     assert errors(caplog) == []
-    assert len(rt.signal_proposer.signals) == MAX_HELD_SIGNALS            # an enabled strategy's held signals act
     rt.current_frame = _frame(last_time='2026-10-07 14:42')                # the next signal is dispatched at once
     rt._on_tick_for_strategy(strategy, CONID)
-    assert recorded(rt)[-1][1] == '2026-10-07T14:42:00+00:00'
+    assert [t for _, t in recorded(rt)] == ['2026-10-07T14:42:00+00:00']
 
 
-def test_a_full_hold_writes_each_dropped_signal_as_a_gap_while_events_can_be_written(held):
+def test_a_record_that_keeps_failing_never_fills_the_hold_while_events_can_be_written(held):
     rt, strategy = held
     tick_bars(rt, strategy, range(31, 31 + MAX_HELD_SIGNALS + 1))
-    assert [g.metadata['count'] for g in gaps(rt)] == [1, 1]
-    assert rt._signal_hold.held_count((CONID, strategy.name)) == MAX_HELD_SIGNALS
+    assert [g.metadata['reason'] for g in gaps(rt)] == ['STALE'] * (MAX_HELD_SIGNALS + 1)
+    assert rt._signal_hold.held_count((CONID, strategy.name)) == 1        # only the latest bar's signal waits
+    assert nothing_acted_on(rt)
+
+
+# -- a held signal superseded by a newer completed bar (issue #140) --
+
+def test_a_held_signal_retried_after_a_newer_bar_completed_is_a_stale_gap(held):
+    rt, strategy = held
+    rt.signal_record.failures_left = 0
+    rt.current_frame = _frame(last_time='2026-10-07 14:31')
+    rt._retry_held_signals()                                              # the reconcile retry
+    assert nothing_acted_on(rt)
+    [gap] = gaps(rt)
+    assert gap.strategy_name == strategy.name and gap.conid == CONID and gap.action == ''
+    assert gap.metadata == {
+        'reason': 'STALE', 'action': 'BUY', 'signal_time': '2026-10-07T14:30:00+00:00',
+        'source_event_id': source_event_id_for(strategy.name, CONID, 'BUY', T0.replace(minute=30)),
+        'latest_bar_time': '2026-10-07T14:31:00+00:00'}
+    assert rt._signal_hold.held_count((CONID, strategy.name)) == 0
+
+
+def test_the_first_tick_of_a_newer_bar_writes_the_held_signal_as_stale_and_dispatches_the_new_one(held):
+    rt, strategy = held
+    rt.signal_record.failures_left = 0
+    rt.current_frame = _frame(last_time='2026-10-07 14:31')
+    rt._on_tick_for_strategy(strategy, CONID)                             # the retry runs before the new bar
+    assert [g.metadata['signal_time'] for g in gaps(rt)] == ['2026-10-07T14:30:00+00:00']
+    assert [t for _, t in recorded(rt)] == ['2026-10-07T14:31:00+00:00']
+    assert len(rt.zmq_messagebus_client.written) == 1 and len(rt.signal_proposer.signals) == 1
+
+
+def test_a_held_signal_retried_within_its_own_bar_is_dispatched(held):
+    rt, strategy = held
+    rt.signal_record.failures_left = 0
+    rt._retry_held_signals()
+    assert [t for _, t in recorded(rt)] == ['2026-10-07T14:30:00+00:00']
+    assert len(rt.zmq_messagebus_client.written) == 1 and len(rt.signal_proposer.signals) == 1
+    assert gaps(rt) == []
+
+
+def test_of_several_held_signals_only_the_latest_bar_is_dispatched_after_the_stale_gaps_in_order(held):
+    rt, strategy = held
+    events = rt.event_store.append
+    rt.event_store.append = _raise_disk_full                              # the STALE gaps cannot be written yet
+    tick_bars(rt, strategy, [31, 32])
+    assert rt._signal_hold.held_count((CONID, strategy.name)) == 3
+    rt.event_store.append = events
+    rt.signal_record.failures_left = 0
+    seen = watch_side_effects(rt, strategy)
+    rt._retry_held_signals()
+    assert [(g.metadata['reason'], g.metadata['signal_time']) for g in gaps(rt)] == [
+        ('STALE', '2026-10-07T14:30:00+00:00'), ('STALE', '2026-10-07T14:31:00+00:00')]
+    assert [t for _, t in recorded(rt)] == ['2026-10-07T14:32:00+00:00']
+    assert [kind for kind, _ in seen] == ['record', 'publish', 'proposal']
+
+
+def test_a_stale_signal_stays_held_until_its_gap_can_be_written(held):
+    rt, strategy = held
+    rt.signal_record.failures_left = 0
+    rt.current_frame = _frame(last_time='2026-10-07 14:31')
+    events, rt.event_store.append = rt.event_store.append, _raise_disk_full
+    rt._retry_held_signals()
+    assert rt._signal_hold.held_count((CONID, strategy.name)) == 1 and nothing_acted_on(rt)
+    rt.event_store.append = events
+    rt._retry_held_signals()
+    assert nothing_acted_on(rt) and [g.metadata['reason'] for g in gaps(rt)] == ['STALE']
+    assert rt._signal_hold.held_count((CONID, strategy.name)) == 0
+
+
+def _no_frame(conid, bar_size):
+    return None
+
+
+def _unreadable_frame(conid, bar_size):
+    raise OSError('history store unreadable')
+
+
+@pytest.mark.parametrize('latest_frame', [_no_frame, _unreadable_frame])
+def test_a_held_signal_whose_latest_bar_cannot_be_read_stays_held(held, latest_frame):
+    rt, strategy = held
+    rt.signal_record.failures_left = 0
+    frame = rt._strategy_frame
+    rt._strategy_frame = latest_frame
+    rt._signal_hold.retry((CONID, strategy.name))                         # the tick path's retry: must not raise
+    rt._retry_held_signals()
+    assert rt._signal_hold.held_count((CONID, strategy.name)) == 1
+    assert nothing_acted_on(rt) and gaps(rt) == []
+    rt._strategy_frame = frame                                            # still the 14:30 bar
+    rt._retry_held_signals()
+    assert [t for _, t in recorded(rt)] == ['2026-10-07T14:30:00+00:00']
 
 
 # -- a disable from the RPC thread against a dispatch on the loop (mmr-openai review of 0818eaf5, PR #139) --

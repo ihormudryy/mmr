@@ -6,6 +6,13 @@ signal whose strategy was disabled or unloaded after it fired is never dispatche
 the signal record feeds the AI controller, which may enter on it. It is written
 down as a ``SIGNAL_GAP`` event instead.
 
+A held signal is also never dispatched once it is ``STALE``: a newer bar of its
+(conId, bar size) has completed since the bar it was computed on. The runtime
+evaluates a strategy once per completed bar, so that newer bar has already
+superseded the signal (issue #140). The check reads the strategy's current frame,
+not the wall clock: a bar is the strategy's own clock. When the latest bar cannot
+be read, the signal stays held and is neither dispatched nor written down.
+
 The hold is bounded per (conId, strategy). Once full, each newer signal is dropped
 and counted; the count is written as one ``SIGNAL_GAP`` event as soon as any event
 can be written. A failing record logs one ERROR when the hold starts and one
@@ -34,6 +41,7 @@ MAX_HELD_SIGNALS = 8
 
 STRATEGY_DISABLED = 'STRATEGY_DISABLED'
 STRATEGY_UNLOADED = 'STRATEGY_UNLOADED'
+STALE = 'STALE'
 HOLD_FULL = 'HOLD_FULL'
 
 
@@ -49,6 +57,13 @@ class SignalGapWriteFailed(Exception):
     """A ``SIGNAL_GAP`` event could not be written; it is tried again on the next retry."""
 
 
+class LatestBarUnknown(Exception):
+    """The strategy's latest completed bar could not be read, so a held signal stays held."""
+
+
+_NOT_SETTLED = (SignalRecordWriteFailed, SignalGapWriteFailed, LatestBarUnknown)
+
+
 @dataclass
 class HeldSignal:
     strategy: Any
@@ -58,6 +73,8 @@ class HeldSignal:
     disables_when_held: int
     # Once set the signal is never dispatched, only written down as a gap.
     block_reason: Optional[str] = None
+    # The newer completed bar that made the signal STALE.
+    superseded_by: Optional[dt.datetime] = None
 
     @property
     def signal_time(self) -> dt.datetime:
@@ -86,10 +103,12 @@ class SignalHold:
 
     def __init__(self, *, dispatch: Callable[[HeldSignal], None],
                  block_reason: Callable[[Any], Optional[str]],
+                 latest_bar_time: Callable[[HeldSignal], Optional[dt.datetime]],
                  write_gap: Callable[[str, int, dict], None],
                  capacity: int = MAX_HELD_SIGNALS):
         self._dispatch = dispatch            # raises SignalRecordWriteFailed when the record write failed
         self._block_reason = block_reason    # why a strategy may no longer act, or None
+        self._latest_bar_time = latest_bar_time   # newest completed bar of the signal's (conId, bar size), or None
         self._write_gap = write_gap
         self._capacity = capacity
         self._holds: Dict[tuple, _Hold] = {}
@@ -121,8 +140,8 @@ class SignalHold:
             return
         try:
             self._settle(held)
-        except (SignalRecordWriteFailed, SignalGapWriteFailed) as ex:
-            logging.error('signal of %s conId %s could not be written; holding its signals (at most %d) and '
+        except _NOT_SETTLED as ex:
+            logging.error('signal of %s conId %s could not be settled; holding its signals (at most %d) and '
                           'retrying on each tick and reconcile: %s', key[1], key[0], self._capacity, ex)
             self._holds.setdefault(key, _Hold()).signals.append(held)
 
@@ -157,7 +176,7 @@ class SignalHold:
         while hold.signals:
             try:
                 self._settle(hold.signals[0])
-            except (SignalRecordWriteFailed, SignalGapWriteFailed) as ex:
+            except _NOT_SETTLED as ex:
                 logging.debug('held signal of %s conId %s still not settled: %s', key[1], key[0], ex)
                 return
             hold.signals.pop(0)
@@ -174,16 +193,27 @@ class SignalHold:
     def _write_blocked_gap(self, held: HeldSignal) -> None:
         signal_time = held.signal_time
         action = str(held.signal.action)
-        self._write(held.strategy.name, held.conid, {
-            'reason': held.block_reason, 'action': action, 'signal_time': signal_time.isoformat(),
-            'source_event_id': source_event_id_for(held.strategy.name, held.conid, action, signal_time)})
+        metadata = {'reason': held.block_reason, 'action': action, 'signal_time': signal_time.isoformat(),
+                    'source_event_id': source_event_id_for(held.strategy.name, held.conid, action, signal_time)}
+        if held.superseded_by is not None:
+            metadata['latest_bar_time'] = held.superseded_by.isoformat()
+        self._write(held.strategy.name, held.conid, metadata)
         logging.warning('%s signal of %s conId %s at %s was not dispatched (%s); written as SIGNAL_GAP',
                         action, held.strategy.name, held.conid, signal_time.isoformat(), held.block_reason)
 
     def _why_blocked(self, held: HeldSignal) -> Optional[str]:
         if self._disables.get(held.strategy.name, 0) != held.disables_when_held:
             return STRATEGY_DISABLED
-        return self._block_reason(held.strategy)
+        return self._block_reason(held.strategy) or self._staleness(held)
+
+    def _staleness(self, held: HeldSignal) -> Optional[str]:
+        latest = self._latest_bar_time(held)
+        if latest is None:
+            raise LatestBarUnknown(f'no completed bar for conId {held.conid} {held.strategy.bar_size}')
+        if latest <= held.signal_time:
+            return None
+        held.superseded_by = latest
+        return STALE
 
     def _flush_dropped(self, key: tuple, hold: _Hold) -> None:
         dropped = hold.dropped

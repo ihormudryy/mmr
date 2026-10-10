@@ -11,14 +11,14 @@ TABLES = {"ai_held_epochs", "ai_submissions", "ai_outbox", "ai_cursors", "ai_opp
           "ai_coverage_gaps", "ai_call_contexts", "ai_cycles"}
 
 
-def test_plan_5_owns_10_to_17():
-    assert [m.version for m in RUNTIME_MIGRATIONS] == list(range(10, 18))
+def test_plan_5_owns_10_to_18():
+    assert [m.version for m in RUNTIME_MIGRATIONS] == list(range(10, 19))
 
 
 def test_migrations_apply_once_and_survive_reopen(tmp_path):
     clock = FakeClock(dt.datetime(2026, 7, 17, 15, 0, tzinfo=dt.timezone.utc))
     store = AiStore(tmp_path / "ai.duckdb", clock=clock)
-    assert [v for v in store.migrate(ALL_MIGRATIONS) if 10 <= v < 20] == list(range(10, 18))
+    assert [v for v in store.migrate(ALL_MIGRATIONS) if 10 <= v < 20] == list(range(10, 19))
     assert AiStore(tmp_path / "ai.duckdb", clock=clock).migrate(ALL_MIGRATIONS) == []
     names = {row[0] for row in store.db.execute(
         "SELECT table_name FROM information_schema.tables", fetch="all")}

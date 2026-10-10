@@ -59,3 +59,14 @@ async def test_a_bound_signal_keeps_its_binding_through_intake(tmp_path):
     assert state == "NEW"
     assert (opportunity.deployment_digest, opportunity.deployment_version, opportunity.source_digest) == (
         D["deployment_digest"], D["deployment_version"], D["source_digest"])
+
+
+@pytest.mark.parametrize("bar_size", ["15 min", 15, ""])
+def test_an_unknown_bar_size_is_malformed(bar_size):                          # issue #146
+    with pytest.raises(SignalIntakeError, match="bar_size"):
+        _parse_signal({**RAW, "bar_size": bar_size})
+
+
+def test_the_bar_size_reaches_the_opportunity_and_its_absence_is_kept():
+    assert _parse_signal({**RAW, "bar_size": "5 mins"}).bar_size == "5 mins"
+    assert _parse_signal(RAW).bar_size is None

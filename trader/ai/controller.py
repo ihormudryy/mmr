@@ -278,8 +278,9 @@ class AiController:
 
     def _signal_verdict(self, opportunity: SignalOpportunity, now: dt.datetime,
                         waiting_until: Optional[dt.datetime] = None) -> Optional[str]:
-        if waiting_until is None and not self._intake.is_fresh(opportunity, now):
-            return "STALE"
+        stale = None if waiting_until is not None else self._intake.stale_reason(opportunity, now)
+        if stale is not None:
+            return stale
         if self._leadership.current_epoch() is None or not self._watch.known:
             return WAIT
         experiment = self._watch.view

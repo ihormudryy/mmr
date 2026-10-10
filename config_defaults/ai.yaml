@@ -59,7 +59,7 @@ controller:
   slot_start_grace_seconds: 120
   signal_poll_seconds: 5.0
   signal_page_limit: 100
-  signal_max_age_seconds: 300
+  signal_max_age_seconds: 300           # counted from the signal's bar close (signal_time + bar size)
   decision_ttl_seconds: 300
   not_found_settle_seconds: 120
   reconcile_seconds: 10.0

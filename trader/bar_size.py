@@ -1,6 +1,9 @@
 """BarSize: the IB bar sizes. Standard library only, so research and ai code can use it without ib_async."""
+import datetime as dt
 from enum import IntEnum
 from typing import Tuple
+
+_SECONDS_PER_UNIT = {'secs': 1, 'min': 60, 'mins': 60, 'hour': 3600, 'hours': 3600}
 
 
 class BarSize(IntEnum):
@@ -40,6 +43,20 @@ class BarSize(IntEnum):
 
     def __str__(self):
         return BarSize.bar_sizes()[int(self.value)]
+
+    @staticmethod
+    def intraday_length(bar_size_str: str) -> dt.timedelta:
+        """The fixed length of an intraday bar ('15 mins' -> 15 minutes).
+
+        Raises ValueError for an unknown string and for '1 day' and longer: their bars end at a session close
+        or a calendar boundary, not a fixed time after their label.
+        """
+        if bar_size_str not in BarSize.bar_sizes():
+            raise ValueError(f'unknown bar size {bar_size_str!r}')
+        count, unit = bar_size_str.split()
+        if unit not in _SECONDS_PER_UNIT:
+            raise ValueError(f'bar size {bar_size_str!r} has no fixed intraday length')
+        return dt.timedelta(seconds=int(count) * _SECONDS_PER_UNIT[unit])
 
     @staticmethod
     def to_massive_timespan(bar_size: 'BarSize') -> Tuple[int, str]:

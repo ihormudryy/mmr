@@ -151,7 +151,7 @@ class TraderWorld:
         from trader.data.strategy_signal_record import SignalEntry, StrategySignalRecord
         entry = SignalEntry.create(strategy_name="orb", conid=conid or self.conid, action=action, probability=0.7,
                                    signal_time=self.served.now(), deployment_digest=self.digest,
-                                   deployment_version=self.version, source_digest=self.source_digest)
+                                   deployment_version=self.version, source_digest=self.source_digest, bar_size="1 min")
         StrategySignalRecord(DuckDBConnection.get_instance(self.served.stack.ai_paper.signals_path),
                              now=self.served.now).append(entry)
         return entry.source_event_id

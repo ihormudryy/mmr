@@ -1860,7 +1860,7 @@ class StrategyRuntime():
             probability=signal.probability, signal_time=completed_bar_time(frame),
             deployment_digest=getattr(strategy, 'ai_deployment_digest', None),
             deployment_version=getattr(strategy, 'ai_deployment_version', None),
-            source_digest=getattr(strategy, 'ai_source_digest', None))
+            source_digest=getattr(strategy, 'ai_source_digest', None), bar_size=str(strategy.bar_size))
         try:
             self.signal_record.append(entry)
         except Exception as ex:

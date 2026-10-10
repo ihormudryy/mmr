@@ -121,10 +121,9 @@ def _runtime() -> StrategyRuntime:
     rt = StrategyRuntime.__new__(StrategyRuntime)  # skip __init__
     rt.strategy_implementations, rt.strategies, rt.streams = [], {}, {}
     rt._hist_bars, rt._hist_bar_days = {}, {}
-    rt._last_dispatched_bar, rt._warmup_shortfalls, rt._pending_signals = {}, {}, {}
+    rt._last_dispatched_bar, rt._warmup_shortfalls = {}, {}
     rt.signal_proposer = _ExitRecorder()
-    if hasattr(StrategyRuntime, '_new_signal_hold'):       # the held-signal hold of PR #139
-        rt._signal_hold = rt._new_signal_hold()
+    rt._signal_hold = rt._new_signal_hold()
     rt.dispatched = []
     rt._dispatch_once = lambda strategy, signal, conId, frame: rt.dispatched.append(signal) or True
     return rt
@@ -344,7 +343,6 @@ class _GapEvents:
         self.events.append(event)
 
 
-@pytest.mark.xfail(reason='settled by #139 held-signal hold', strict=True)
 def test_a_signal_held_before_a_hot_swap_is_not_sent_by_the_replacement_below_its_warm_up(tmp_path):
     import yaml
     (tmp_path / 'always_buys.py').write_text(_SWAPPED)

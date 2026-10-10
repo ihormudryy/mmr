@@ -71,6 +71,8 @@ def rt(tmp_path, tmp_duckdb_path):
     runtime = _make_runtime(tmp_path, tmp_duckdb_path, automation_enabled=False)
     runtime._load_enabled = lambda name: None
     runtime._last_dispatched_bar = {}
+    runtime._warmup_shortfalls = {}
+    runtime._hist_bar_days = {}
     runtime.signal_record = StrategySignalRecord(DuckDBConnection.get_instance(tmp_duckdb_path))
     runtime.event_store = SimpleNamespace(append=lambda event: None)
     runtime.zmq_messagebus_client = SimpleNamespace(write=lambda *args: None)
@@ -335,6 +337,30 @@ def test_a_reconciled_instance_gets_its_history_before_its_first_bar(history_rt,
     frame = history_rt._strategy_frame(CONID, ONE_MIN)
     backfilled = history_rt.historical_data_client.bars.index.tz_convert("UTC")
     assert frame is not None and set(backfilled) <= set(frame.index)
+
+
+def test_an_ai_instance_loads_the_history_its_min_bars_needs(history_rt):
+    path = os.path.join(history_rt.strategies_directory, "vwap_reclaim_cat.py")
+    with open(path, "w") as f:
+        f.write("from trader.trading.strategy import Strategy\n\n"
+                "class VwapReclaimCat(Strategy):\n"
+                "    MIN_BARS = 1000\n"
+                "    def on_prices(self, prices):\n"
+                "        return None\n")
+    history_rt.historical_data_client = FakeHistoryClient()
+    asked = []
+    fetch = history_rt._fetch_history_with_resume
+
+    async def recording_fetch(**kwargs):
+        asked.append(kwargs["historical_days"])
+        return await fetch(**kwargs)
+
+    history_rt._fetch_history_with_resume = recording_fetch
+    source(history_rt, [active(path)]).reconcile()
+    instance = instance_of(history_rt)
+    assert instance is not None and instance.history_depth.warmup_bars == 1000
+    assert asked == [10]                                  # 4 sessions of 1 min bars, not AI_HISTORY_DAYS (5)
+    assert history_rt._hist_bar_days[(CONID, ONE_MIN)] == 10
 
 
 def test_a_history_failure_keeps_the_instance_out_and_the_next_reconcile_retries(history_rt, path, caplog):

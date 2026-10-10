@@ -23,6 +23,8 @@ class StrategyNode:
         self.runtime.strategies_directory = str(strategies_dir)
         self.runtime._load_enabled = lambda name: None
         self.runtime._last_dispatched_bar = {}
+        self.runtime._warmup_shortfalls = {}
+        self.runtime._hist_bar_days = {}
         self.runtime.signal_record = StrategySignalRecord(DuckDBConnection.get_instance(duckdb_path))
         self.runtime.event_store = SimpleNamespace(append=lambda event: None)
         self.runtime.zmq_messagebus_client = SimpleNamespace(write=lambda *args: None)

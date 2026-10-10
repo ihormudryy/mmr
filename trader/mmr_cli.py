@@ -4558,6 +4558,9 @@ def _handle_strategies_list(mmr: MMR):
             state_disp = f'[yellow]{state_raw}[/yellow]'
         else:
             state_disp = state_raw
+        history_code = row.get('history_code')
+        if history_code:
+            state_disp += f' [yellow]{history_code}[/yellow]'
 
         conids = row.get('conids') or []
         if not conids:
@@ -4590,7 +4593,7 @@ def _handle_strategies_list(mmr: MMR):
             state_disp,
             auto_disp,
             str(row.get('bar_size', '?')),
-            str(row.get('hist_days_prior', '?')),
+            str(row.get('history_days') or row.get('hist_days_prior', '?')),
             symbols_disp,
             params_disp,
         )

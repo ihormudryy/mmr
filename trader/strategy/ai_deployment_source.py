@@ -12,11 +12,14 @@ from typing import Any, Callable, Sequence
 
 from trader.data.backtest_store import compute_strategy_hash
 from trader.messaging.typed_rpc import TypedRpcRemoteError
+from trader.strategy.history_depth import ib_requests_for
 
 AI_INSTANCE_PREFIX = "aidv-"
+# The least history an AI instance loads; a strategy's MIN_BARS can raise it (history_depth).
 AI_HISTORY_DAYS = 5
 # Bounds one instance's backfill: a few IB history requests at ib_async's 60 s default each.
 AI_HISTORY_TIMEOUT_S = 180
+AI_HISTORY_REQUEST_TIMEOUT_S = 60
 
 
 @dataclass(frozen=True)
@@ -24,6 +27,15 @@ class AiInstanceBinding:
     version_digest: str
     base_digest: str
     strategy_digest: str
+
+
+def ai_history_timeout_s(bar_size: Any, warmup_days: int, conid_count: int) -> int:
+    """The backfill budget: AI_HISTORY_TIMEOUT_S, more only when a declared warm-up needs many IB requests
+    (a strategy without MIN_BARS has warmup_days 0 and keeps the old budget)."""
+    if warmup_days <= 0:
+        return AI_HISTORY_TIMEOUT_S
+    requests = ib_requests_for(bar_size, warmup_days) * max(1, conid_count)
+    return max(AI_HISTORY_TIMEOUT_S, requests * AI_HISTORY_REQUEST_TIMEOUT_S)
 
 
 def ai_instance_name(version_digest: str) -> str:

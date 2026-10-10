@@ -336,6 +336,8 @@ def _make_runtime(tmp_path, paper_trading=True) -> StrategyRuntime:
     rt.signal_record = _RecordingSignalRecord()  # type: ignore
     rt._last_dispatched_bar = {}
     rt._signal_hold = rt._new_signal_hold()
+    rt._warmup_shortfalls = {}
+    rt._hist_bar_days = {}
     return rt
 
 

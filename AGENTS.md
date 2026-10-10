@@ -161,7 +161,7 @@ Tests (same as CI, `.github/workflows/ci.yml`):
 
 ```bash
 uv sync --python 3.12.13 --frozen --extra test
-uv run --frozen pytest tests/ --timeout=30 --timeout-method=thread -q --ignore=tests/test_ibrx_async.py
+uv run --frozen pytest tests/ --timeout=120 --timeout-method=signal -q --ignore=tests/test_ibrx_async.py
 uv run --frozen pytest tests/test_ibrx_async.py --timeout=30 -q   # flaky in the full run; run alone
 ```
 

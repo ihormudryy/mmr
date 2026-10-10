@@ -1246,6 +1246,36 @@ class MMR:
         """
         return self._typed_query.call('reconcile_with_broker', {}, dict) or {}
 
+    def unresolved_commands(self) -> dict:
+        """The ledger commands of the account that are not RESOLVED or REJECTED: they hold
+        ``reconciliation_safe()`` false. ``operator_settleable`` marks the ones ``settle_unknown_command`` takes."""
+        return self._typed_query.call('list_unresolved_commands', {}, dict)
+
+    def settle_unknown_command(self, target_command_id: str, outcome: str, reason: str) -> SuccessFail:
+        """Settle an OUTCOME_UNKNOWN command by the operator's word (``cli`` only, audited).
+
+        ``outcome`` is ``resolved`` or ``rejected``. Only actions without a broker side effect are taken; the
+        trader refuses any other with its code. Check the real state first: this changes only the ledger row."""
+        import uuid
+        from trader.domain.commands import CommandReceipt
+        from trader.messaging.typed_rpc import TypedRpcRemoteError
+
+        method = 'settle_unknown_command'
+        body = {'command_id': f'sdk-{uuid.uuid4()}', 'target_command_id': target_command_id,
+                'outcome': outcome, 'reason': reason}
+        try:
+            receipt = self._typed_command.call(method, body, CommandReceipt)
+        except TypedRpcRemoteError as ex:
+            return SuccessFail.fail(error=f'{method} rejected: {ex.code}: {ex.message}', exception=ex)
+        except (TimeoutError, ConnectionError) as ex:
+            return SuccessFail.fail(error=f'{method} did not complete: {ex}. Check `mmr reconcile unknown` '
+                                          'before retrying.', exception=ex)
+        if receipt.state == 'RESOLVED':
+            return SuccessFail.success(obj=receipt.outcome)
+        message = (receipt.outcome or {}).get('message') if isinstance(receipt.outcome, dict) else None
+        detail = f'{receipt.error_code or receipt.state}' + (f': {message}' if message else '')
+        return SuccessFail.fail(error=f'{method} rejected: {detail}')
+
     def risk_report(self) -> dict:
         """Generate a portfolio risk report. Requires trader_service for portfolio data."""
         from trader.trading.portfolio_risk import PortfolioRiskAnalyzer

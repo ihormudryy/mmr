@@ -1550,11 +1550,22 @@ def build_parser() -> argparse.ArgumentParser:
                                      '  portfolio-risk --json           # JSON for LLM consumption',
                               formatter_class=fmt)
 
-    sub.add_parser('reconcile', help='Reconcile proposals + positions against live IB (report-only)',
-                   epilog='Examples:\n'
-                          '  reconcile           # divergence report vs broker truth\n'
-                          '  reconcile --json    # JSON for LLM consumption',
-                   formatter_class=fmt)
+    reconcile_p = sub.add_parser(
+        'reconcile', help='Reconcile proposals + positions against live IB (report-only); list or settle '
+                          'commands that block reconciliation',
+        epilog='Examples:\n'
+               '  reconcile           # divergence report vs broker truth\n'
+               '  reconcile --json    # JSON for LLM consumption\n'
+               '  reconcile unknown   # ledger commands that keep reconciliation_safe() false\n'
+               '  reconcile settle CMD_ID --outcome rejected --reason "pause never applied, checked control"',
+        formatter_class=fmt)
+    reconcile_sub = reconcile_p.add_subparsers(dest='reconcile_action')
+    reconcile_sub.add_parser('unknown', help='List the unresolved ledger commands of the account')
+    settle_p = reconcile_sub.add_parser(
+        'settle', help='Settle an OUTCOME_UNKNOWN command by hand (operator, audited; check the real state first)')
+    settle_p.add_argument('command_id', help='The OUTCOME_UNKNOWN command to settle (see: reconcile unknown)')
+    settle_p.add_argument('--outcome', required=True, choices=('resolved', 'rejected'))
+    settle_p.add_argument('--reason', required=True, help='Why, and what you checked (1-200 characters)')
 
     # portfolio-snapshot (compact JSON for LLM loop)
     sub.add_parser('portfolio-snapshot', aliases=['psnap'], help='Compact portfolio snapshot (JSON)')
@@ -2188,6 +2199,9 @@ def dispatch(mmr: MMR, args: argparse.Namespace) -> bool:
     _bypass_ib_check = False
     if cmd in ('snapshot', 'snap', 'snapshot-batch') and getattr(args, 'source', 'ib') != 'ib':
         _bypass_ib_check = True
+
+    if cmd == 'reconcile' and getattr(args, 'reconcile_action', None) is not None:
+        _bypass_ib_check = True          # the trader's own ledger: settling must work while IB is down
 
     if cmd in _ib_commands and not _bypass_ib_check:
         upstream_err = mmr.check_ib_upstream()
@@ -3698,6 +3712,13 @@ def _handle_group(mmr: MMR, args: argparse.Namespace):
 
 
 def _handle_reconcile(mmr: MMR, args: argparse.Namespace):
+    action = getattr(args, 'reconcile_action', None)
+    if action == 'unknown':
+        _handle_unresolved_commands(mmr)
+        return
+    if action == 'settle':
+        _handle_settle_command(mmr, args)
+        return
     try:
         report = mmr.reconcile()
     except Exception as e:
@@ -3723,6 +3744,37 @@ def _handle_reconcile(mmr: MMR, args: argparse.Namespace):
         tag = f'#{pid} ' if pid else ''
         console.print(f'  [{color}]{f.get("severity", "").upper()}[/{color}] '
                       f'{tag}{f.get("symbol", "")}: {f.get("detail", "")}')
+
+
+def _handle_unresolved_commands(mmr: MMR):
+    try:
+        listing = mmr.unresolved_commands()
+    except Exception as e:
+        print_status(f'Listing unresolved commands failed: {e}', success=False)
+        return
+    if _json_mode:
+        print_json_result(listing, title='Unresolved Commands')
+        return
+    commands = listing.get('commands', [])
+    if not commands:
+        console.print('[green]No unresolved command: reconciliation is not blocked by the ledger.[/green]')
+        return
+    console.print(f'[bold]Unresolved commands[/bold] ({listing.get("account_id")})\n')
+    for row in commands:
+        settle = 'settleable' if row.get('operator_settleable') else 'evidence only'
+        console.print(f'  {row["command_id"]}  {row["action"]}  {row["state"]}  '
+                      f'{row.get("error_code") or "-"}  since {row["created_at"]}  [{settle}]')
+    console.print('\n  Settle one by hand, after checking the real state: '
+                  'mmr reconcile settle CMD_ID --outcome resolved|rejected --reason "..."')
+
+
+def _handle_settle_command(mmr: MMR, args: argparse.Namespace):
+    result = mmr.settle_unknown_command(args.command_id, args.outcome, args.reason)
+    if result.is_success():
+        print_json_result(result.obj or {}, title='Command settled')
+    else:
+        error = str(result.error or result.exception or 'Unknown error')
+        print_status(f'reconcile settle failed: {error}', success=False)
 
 
 def _handle_portfolio_risk(mmr: MMR, args: argparse.Namespace):

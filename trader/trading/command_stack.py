@@ -1043,6 +1043,21 @@ def _build_experiment_parts(trader: Any, account_mode: str,
     return _ExperimentParts(store=store, arming_lock=lock, experiment_lock=ExperimentLock(store, lock))
 
 
+def _experiment_config(trader: Any) -> Any:
+    from trader.automation.ai_paper_config import AiPaperConfig
+
+    return getattr(trader, "ai_paper_config", None) or AiPaperConfig()
+
+
+def _experiment_evidence(trader: Any, parts: Optional[_ExperimentParts]) -> Any:
+    """Issue #121: the reconciler settles a crashed experiment command from its transition row."""
+    if parts is None:
+        return None
+    from trader.automation.experiment_evidence import ExperimentCommandEvidence
+
+    return ExperimentCommandEvidence(parts.store, _experiment_config(trader))
+
+
 @dataclass(frozen=True)
 class ExperimentServices:
     store: Any       # ExperimentStore
@@ -1063,13 +1078,12 @@ def _build_experiment_services(
     """K15: built on every paper stack, also with ``ai_paper.enabled: false``."""
     if parts is None:
         return None
-    from trader.automation.ai_paper_config import AiPaperConfig
     from trader.automation.ai_paper_experiment import ExperimentStateReader
     from trader.automation.experiment_service import ArmingPorts, ExperimentService
     from trader.automation.kill_monitor import KillLineMonitor
     from trader.messaging.trader_service_api import TraderServiceApi
 
-    config = getattr(trader, "ai_paper_config", None) or AiPaperConfig()
+    config = _experiment_config(trader)
     monitor = KillLineMonitor(
         store=parts.store, broker=broker, session=session_controller, liquidation=liquidation, config=config,
         account_id=trader.ib_account, now=now, journal=journal, reconciliation_safe=reconciliation_safe)
@@ -1153,13 +1167,12 @@ def _build_acceptance_probe(trader: Any, experiments: Optional[ExperimentService
     """SP1 Plan 6: the operator's OCA shrink probe. Built with the experiments; refused unless configured."""
     if experiments is None:
         return None
-    from trader.automation.ai_paper_config import AiPaperConfig
     from trader.trading.acceptance_probe import (
         AcceptanceMarkStore, AcceptanceProbeService, read_broker_order_evidence,
     )
     return AcceptanceProbeService(
         trader=trader, marks=AcceptanceMarkStore(trader.journal_db), experiments=experiments.store,
-        config=getattr(trader, "ai_paper_config", None) or AiPaperConfig(), account_id=trader.ib_account,
+        config=_experiment_config(trader), account_id=trader.ib_account,
         account_mode=account_mode, broker=broker, quotes=quotes, saga=saga,
         evidence=lambda conid: read_broker_order_evidence(trader, conid), now=now)
 
@@ -1454,6 +1467,7 @@ def build_command_stack(
         closes=liquidation_store,
         registrations=None if ai_paper_parts is None else ai_paper_parts.registrar,
         withdrawals=None if ai_paper_parts is None else ai_paper_parts.versions,
+        experiments=_experiment_evidence(trader, experiment_parts),
         received_at_start=_received_at_process_start(trader, ledger),
     )
     strategy_control_service = None

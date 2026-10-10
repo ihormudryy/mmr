@@ -245,7 +245,7 @@ def full_command_stack_stub(coordinator=None):
     names = ("coordinator", "proposal_service", "repository", "controls", "nonces",
              "approval_service", "cancel_service", "liquidation_service", "canary_service",
              "allocation_service", "paper_automation_service", "automated_intent_service",
-             "strategy_control_service", "journal", "ai_paper")
+             "strategy_control_service", "journal", "ai_paper", "reconciler", "ledger")
     stack = SimpleNamespace(**{name: MagicMock(name=name) for name in names})
     if coordinator is not None:
         stack.coordinator = coordinator

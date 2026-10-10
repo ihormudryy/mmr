@@ -126,12 +126,15 @@ from trader.messaging.typed_rpc import (
 )
 from trader.strategy.strategy_revisions import StrategyCommandReceipt
 from trader.trading.command_coordinator import (
+    OPERATOR_SETTLEABLE_ACTIONS,
     REGISTRATION_NOT_COMMITTED,
+    SETTLE_ACTION,
     WITHDRAWAL_NOT_COMMITTED,
     ApprovalCommandService,
     CancelCommandService,
     CommandRequest,
     CommandValidationError,
+    OperatorSettleRefused,
     StrategyControlCommandService,
     TradingCommandCoordinator,
     acknowledge_strategy_state,
@@ -837,6 +840,27 @@ class RegisterDiscretionaryDeploymentRequest(BaseModel):
         except DeploymentRefused as ex:
             raise ValueError(str(ex)) from None
         return value
+
+
+# --- Issue #121: the operator settles an OUTCOME_UNKNOWN command no evidence can settle. ---
+
+class SettleUnknownCommandRequest(BaseModel):
+    """``command_id`` is this settle command's own id; ``target_command_id`` is the row it settles."""
+    model_config = ConfigDict(extra="forbid", strict=True)
+
+    command_id: str
+    target_command_id: Annotated[str, Field(min_length=1, max_length=200)]
+    outcome: Literal["resolved", "rejected"]
+    reason: Annotated[str, Field(min_length=1, max_length=200)]
+
+    @field_validator("command_id")
+    @classmethod
+    def _command_id_has_no_colon(cls, value: str) -> str:
+        return _reject_colon_in_command_id(value)
+
+
+class ListUnresolvedCommandsRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid", strict=True)
 
 
 # --- SP1 experiments (Plan 4 Task 7): strict wire models. The service checks the body again. ---
@@ -1774,6 +1798,73 @@ def register_experiment_authority(registry: TypedRpcRegistry, command_stack: Any
                                  mode_conflict=getattr(command_stack, "mode_conflict", None),
                                  config_path=experiments.config_path)
     registry.register("query", "get_experiment", GetExperimentRequest, dict, _status)
+
+
+_SETTLE_PRINCIPAL = "cli"
+_SETTLE_BODY_KEYS = frozenset({"target_command_id", "outcome", "reason"})
+
+
+def _is_settle_body(body: Any) -> bool:
+    def _text(value: Any) -> bool:
+        return isinstance(value, str) and 1 <= len(value) <= 200
+    return (isinstance(body, dict) and set(body) == _SETTLE_BODY_KEYS and _text(body["target_command_id"])
+            and body["outcome"] in ("resolved", "rejected") and _text(body["reason"]))
+
+
+def _settle_unknown_command_action(reconciler: Any, account_id: Optional[str]):
+    """Issue #121: the coordinator action. The handler checks principal and body again behind the RPC layer."""
+    def _action(command: CommandRequest) -> Dict[str, Any]:
+        if command.principal != _SETTLE_PRINCIPAL:
+            raise CommandValidationError("PRINCIPAL_FORBIDDEN", "only the cli operator settles a command")
+        body = command.body
+        if not _is_settle_body(body):
+            raise CommandValidationError("SETTLE_REQUEST_INVALID",
+                                         f"body must have exactly {sorted(_SETTLE_BODY_KEYS)}")
+        try:
+            return reconciler.settle_by_operator(
+                body["target_command_id"], resolved=body["outcome"] == "resolved", reason=body["reason"],
+                principal=command.principal, settle_command_id=command.command_id, account_id=account_id)
+        except OperatorSettleRefused as refused:
+            raise CommandValidationError(refused.code, refused.message) from None
+    return _action
+
+
+def _settle_unknown_command_rpc_handler(coordinator: TradingCommandCoordinator, account_id: Optional[str]):
+    def _handler(parsed: SettleUnknownCommandRequest, caller: RpcCaller) -> Dict[str, Any]:
+        request = CommandRequest(
+            command_id=parsed.command_id, action=SETTLE_ACTION, account_id=account_id, target_type="command",
+            target_id=parsed.target_command_id, expected_version=None,
+            body={"target_command_id": parsed.target_command_id, "outcome": parsed.outcome,
+                  "reason": parsed.reason},
+            source=caller.principal, principal=caller.principal,
+        )
+        return _receipt_to_dict(coordinator.execute(request))
+    return _handler
+
+
+def _list_unresolved_commands_handler(ledger: Any, account_id: Optional[str]):
+    def _handler(_parsed: ListUnresolvedCommandsRequest) -> Dict[str, Any]:
+        return {"account_id": account_id, "commands": [
+            {"command_id": row.command_id, "action": row.action, "state": row.state,
+             "error_code": row.error_code, "target_type": row.target_type, "target_id": row.target_id,
+             "created_at": row.created_at.isoformat(), "updated_at": row.updated_at.isoformat(),
+             "operator_settleable": row.state == "OUTCOME_UNKNOWN" and row.action in OPERATOR_SETTLEABLE_ACTIONS}
+            for row in ledger.unresolved_for_account(account_id)]}
+    return _handler
+
+
+def register_settle_authority(registry: TypedRpcRegistry, command_stack: Any, *,
+                              account_id: Optional[str]) -> None:
+    """Issue #121: list the commands that hold reconciliation_safe(), and let the operator settle one.
+
+    Neither checks reconciliation_safe(): settling is how an operator clears it."""
+    command_stack.coordinator.register_action(
+        SETTLE_ACTION, _settle_unknown_command_action(command_stack.reconciler, account_id),
+        requires_preflight=False)
+    registry.register("command", SETTLE_ACTION, SettleUnknownCommandRequest, dict,
+                      _settle_unknown_command_rpc_handler(command_stack.coordinator, account_id), with_caller=True)
+    registry.register("query", "list_unresolved_commands", ListUnresolvedCommandsRequest, dict,
+                      _list_unresolved_commands_handler(command_stack.ledger, account_id))
 
 
 def _cancel_order_rpc_handler(coordinator: TradingCommandCoordinator, account_id: Optional[str]):
@@ -2860,6 +2951,7 @@ def build_production_registry(
             automated_intent_service=command_stack.automated_intent_service,
             strategy_control_service=command_stack.strategy_control_service,
         )
+        register_settle_authority(registry, command_stack, account_id=getattr(trader, 'ib_account', None))
         # record_state_acknowledged is registered by register_command_authority
         # when strategy_control_service is wired; otherwise keep the minimal
         # ingest-only handler so strategy announce/drain still works.

@@ -288,20 +288,25 @@ class TestFastPathEquivalence:
 # sensible so a future regression can't silently put us back to O(N²).
 # ---------------------------------------------------------------------------
 
+def _best_cpu_ms(run, attempts=3):
+    timings = []
+    for _ in range(attempts):
+        start = time.process_time()
+        run()
+        timings.append((time.process_time() - start) * 1000)
+    return min(timings)
+
+
 class TestPerfSanity:
     def test_fast_path_not_slower_than_legacy(self, tmp_duckdb_path):
         _write_bars(tmp_duckdb_path, n=500)
         bt = _backtester(tmp_duckdb_path)
 
         fast_strat = _install(DualMa(use_fast_path=True), tmp_duckdb_path)
-        t0 = time.perf_counter()
-        bt.run(fast_strat, [4391])
-        fast_ms = (time.perf_counter() - t0) * 1000
-
         legacy_strat = _install(DualMa(use_fast_path=False), tmp_duckdb_path)
-        t0 = time.perf_counter()
-        bt.run(legacy_strat, [4391])
-        legacy_ms = (time.perf_counter() - t0) * 1000
+        # Best of three CPU times: wall clock under parallel workers is noise (issue #99).
+        fast_ms = _best_cpu_ms(lambda: bt.run(fast_strat, [4391]))
+        legacy_ms = _best_cpu_ms(lambda: bt.run(legacy_strat, [4391]))
 
         # For pandas .rolling this is expected to be close to a wash (both
         # are fast); we just guard against a catastrophic regression that

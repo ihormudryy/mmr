@@ -123,6 +123,8 @@ def _runtime() -> StrategyRuntime:
     rt._hist_bars, rt._hist_bar_days = {}, {}
     rt._last_dispatched_bar, rt._warmup_shortfalls, rt._pending_signals = {}, {}, {}
     rt.signal_proposer = _ExitRecorder()
+    if hasattr(StrategyRuntime, '_new_signal_hold'):       # the held-signal hold of PR #139
+        rt._signal_hold = rt._new_signal_hold()
     rt.dispatched = []
     rt._dispatch_once = lambda strategy, signal, conId, frame: rt.dispatched.append(signal) or True
     return rt
@@ -356,8 +358,6 @@ def test_a_signal_held_before_a_hot_swap_is_not_sent_by_the_replacement_below_it
     rt.storage = rt.universe_accessor = rt._trader_gateway = None
     rt.paper_trading, rt._config_mtime = True, 0.0
     rt.event_store = _GapEvents()
-    if hasattr(StrategyRuntime, '_new_signal_hold'):       # the held-signal hold of PR #139
-        rt._signal_hold = rt._new_signal_hold()
     sends, failures = [], [SignalRecordWriteFailed('record down')]
 
     def dispatch_signal(strategy, signal, conId, frame):

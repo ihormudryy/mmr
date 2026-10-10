@@ -1809,7 +1809,11 @@ class StrategyRuntime():
 
     def _new_signal_hold(self) -> SignalHold:
         return SignalHold(dispatch=self._dispatch_held, block_reason=self._held_signal_block_reason,
-                          latest_bar_time=self._latest_bar_time, write_gap=self._write_signal_gap)
+                          latest_bar_time=self._latest_bar_time, recorded_ids=self._recorded_signal_ids,
+                          write_gap=self._write_signal_gap)
+
+    def _recorded_signal_ids(self, source_event_ids: List[str]) -> frozenset:
+        return self.signal_record.recorded_source_event_ids(source_event_ids)
 
     def _dispatch_held(self, held: HeldSignal) -> None:
         self._dispatch_once(held.strategy, held.signal, held.conid, held.frame)

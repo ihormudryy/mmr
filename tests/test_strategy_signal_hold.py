@@ -25,19 +25,29 @@ def clock():
     return Clock(T0)
 
 
-@pytest.fixture
-def held(tmp_path, installed_strategy, clock):
+def holding_runtime(tmp_path, strategy, clock, *, fail_after_write):
     """A runtime whose record failed the 14:30 BUY of a propose-mode strategy, so that signal is held."""
-    installed_strategy.ctx.auto_execute = 'propose'
-    rt, _ = ticking_runtime(tmp_path, clock, installed_strategy, fail_after_write=False)
+    strategy.ctx.auto_execute = 'propose'
+    rt, _ = ticking_runtime(tmp_path, clock, strategy, fail_after_write=fail_after_write)
     rt._schedule_persist_enabled = lambda name, enabled: None
     rt._announce_and_drain = lambda name: None
     rt._reconcile_sync = lambda: None
     rt.signal_proposer.expire_stale = lambda: None
     rt.signal_record.failures_left = ALWAYS
-    rt._on_tick_for_strategy(installed_strategy, CONID)
-    assert rt._signal_hold.held_count((CONID, installed_strategy.name)) == 1
-    return rt, installed_strategy
+    rt._on_tick_for_strategy(strategy, CONID)
+    assert rt._signal_hold.held_count((CONID, strategy.name)) == 1
+    return rt, strategy
+
+
+@pytest.fixture
+def held(tmp_path, installed_strategy, clock):
+    return holding_runtime(tmp_path, installed_strategy, clock, fail_after_write=False)
+
+
+@pytest.fixture
+def held_after_commit(tmp_path, installed_strategy, clock):
+    """The append committed the 14:30 row and then raised, so the runtime holds a signal the record has."""
+    return holding_runtime(tmp_path, installed_strategy, clock, fail_after_write=True)
 
 
 def gaps(rt):
@@ -62,7 +72,8 @@ def test_a_held_signal_of_a_disabled_strategy_is_settled_on_reconcile_as_a_gap(h
     assert gap.strategy_name == strategy.name and gap.conid == CONID and gap.action == ''
     assert gap.metadata == {
         'reason': 'STRATEGY_DISABLED', 'action': 'BUY', 'signal_time': '2026-10-07T14:30:00+00:00',
-        'source_event_id': source_event_id_for(strategy.name, CONID, 'BUY', T0.replace(minute=30))}
+        'source_event_id': source_event_id_for(strategy.name, CONID, 'BUY', T0.replace(minute=30)),
+        'recorded': False}
     assert rt._signal_hold.held_count((CONID, strategy.name)) == 0
 
 
@@ -134,7 +145,7 @@ def test_recovery_dispatches_the_newest_held_signal_after_one_gap_for_the_evicte
     rt._on_tick_for_strategy(strategy, CONID)                             # the latest bar is still 14:41
     evicted, *stale = gaps(rt)
     assert evicted.metadata == {'reason': 'HOLD_FULL', 'count': 4, 'first_signal_time': '2026-10-07T14:30:00+00:00',
-                                'last_signal_time': '2026-10-07T14:33:00+00:00'}
+                                'last_signal_time': '2026-10-07T14:33:00+00:00', 'recorded_count': 0}
     assert [(g.metadata['reason'], g.metadata['signal_time']) for g in stale] == [
         ('STALE', f'2026-10-07T14:{m:02d}:00+00:00') for m in range(34, 41)]
     assert [t for _, t in recorded(rt)] == ['2026-10-07T14:41:00+00:00']   # the newest signal is on the latest bar
@@ -167,7 +178,7 @@ def test_a_held_signal_retried_after_a_newer_bar_completed_is_a_stale_gap(held):
     assert gap.metadata == {
         'reason': 'STALE', 'action': 'BUY', 'signal_time': '2026-10-07T14:30:00+00:00',
         'source_event_id': source_event_id_for(strategy.name, CONID, 'BUY', T0.replace(minute=30)),
-        'latest_bar_time': '2026-10-07T14:31:00+00:00'}
+        'recorded': False, 'latest_bar_time': '2026-10-07T14:31:00+00:00'}
     assert rt._signal_hold.held_count((CONID, strategy.name)) == 0
 
 
@@ -335,3 +346,90 @@ def test_a_disable_while_a_fresh_signal_is_computed_makes_a_gap_and_no_dispatch(
     rt._on_tick_for_strategy(installed_strategy, CONID)
     assert nothing_acted_on(rt)
     assert [g.metadata['reason'] for g in gaps(rt)] == ['STRATEGY_DISABLED']
+
+
+# -- the gap says whether the record already has the signal (mmr-openai review of 53255a17, PR #145) --
+
+def published_or_proposed(rt):
+    return rt.zmq_messagebus_client.written != [] or rt.signal_proposer.signals != []
+
+
+def _supersede_with_a_newer_bar(rt, strategy):
+    rt.current_frame = _frame(last_time='2026-10-07 14:31')
+
+
+def _disable(rt, strategy):
+    rt.disable_strategy(strategy.name)
+
+
+@pytest.mark.parametrize('block, reason', [(_supersede_with_a_newer_bar, 'STALE'), (_disable, 'STRATEGY_DISABLED')])
+def test_a_gap_for_a_signal_whose_append_committed_says_it_was_recorded(held_after_commit, block, reason):
+    rt, strategy = held_after_commit
+    rt.signal_record.failures_left = 0
+    block(rt, strategy)
+    rt._retry_held_signals()
+    assert not published_or_proposed(rt)
+    [gap] = gaps(rt)
+    assert (gap.metadata['reason'], gap.metadata['recorded']) == (reason, True)
+    assert recorded(rt) == [(1, '2026-10-07T14:30:00+00:00')]           # the AI intake judges this row by its age
+
+
+def test_a_held_signal_stays_held_while_the_record_cannot_say_whether_it_has_it(held):
+    rt, strategy = held
+    rt.signal_record.failures_left = 0
+    rt.current_frame = _frame(last_time='2026-10-07 14:31')
+    lookup = rt.signal_record.recorded_source_event_ids
+    rt.signal_record.recorded_source_event_ids = _raise_disk_full
+    rt._signal_hold.retry((CONID, strategy.name))                         # the tick path's retry: must not raise
+    rt._retry_held_signals()
+    assert rt._signal_hold.held_count((CONID, strategy.name)) == 1
+    assert nothing_acted_on(rt) and gaps(rt) == []
+    rt.signal_record.recorded_source_event_ids = lookup
+    rt._retry_held_signals()
+    assert [(g.metadata['reason'], g.metadata['recorded']) for g in gaps(rt)] == [('STALE', False)]
+
+
+def test_the_evicted_gap_counts_an_evicted_signal_whose_append_committed(held_after_commit):
+    rt, strategy = held_after_commit
+    events = rt.event_store.append
+    rt.event_store.append = _raise_disk_full
+    tick_bars(rt, strategy, range(31, 31 + MAX_HELD_SIGNALS))             # 14:30 (committed) is evicted
+    rt.event_store.append = events
+    rt.signal_record.failures_left = 0
+    rt._retry_held_signals()
+    evicted, *_ = gaps(rt)
+    assert (evicted.metadata['reason'], evicted.metadata['count'], evicted.metadata['recorded_count']) == (
+        'HOLD_FULL', 1, 1)
+
+
+def _fail_hold_full_gaps(append):
+    def append_unless_hold_full(event):
+        if event.event_type == EventType.SIGNAL_GAP and event.metadata.get('reason') == 'HOLD_FULL':
+            raise OSError('No space left on device')
+        return append(event)
+    return append_unless_hold_full
+
+
+def test_nothing_held_or_newer_acts_until_the_evicted_gap_is_written(held):
+    rt, strategy = held
+    events = rt.event_store.append
+    rt.event_store.append = _raise_disk_full                              # both stores are down
+    tick_bars(rt, strategy, range(31, 31 + MAX_HELD_SIGNALS + 3))         # 14:30..14:33 evicted, 14:34..14:41 held
+    rt.event_store.append = _fail_hold_full_gaps(events)                  # only the evicted gap still fails
+    rt.signal_record.failures_left = 0
+    seen = watch_side_effects(rt, strategy)
+    rt._on_tick_for_strategy(strategy, CONID)
+    rt._retry_held_signals()
+    assert nothing_acted_on(rt) and gaps(rt) == [] and seen == []
+    rt.current_frame = _frame(last_time='2026-10-07 14:42')                # a newer signal waits too, evicting 14:34
+    rt._on_tick_for_strategy(strategy, CONID)
+    assert nothing_acted_on(rt) and gaps(rt) == [] and seen == []
+    rt.event_store.append = events
+    rt._retry_held_signals()
+    evicted, *stale = gaps(rt)
+    assert evicted.metadata == {'reason': 'HOLD_FULL', 'count': 5, 'first_signal_time': '2026-10-07T14:30:00+00:00',
+                                'last_signal_time': '2026-10-07T14:34:00+00:00', 'recorded_count': 0}
+    assert [(g.metadata['reason'], g.metadata['signal_time']) for g in stale] == [
+        ('STALE', f'2026-10-07T14:{m:02d}:00+00:00') for m in range(35, 42)]
+    assert [t for _, t in recorded(rt)] == ['2026-10-07T14:42:00+00:00']
+    assert [kind for kind, _ in seen] == ['record', 'publish', 'proposal']

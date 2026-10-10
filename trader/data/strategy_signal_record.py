@@ -178,6 +178,15 @@ class StrategySignalRecord:
                      [cursor, watermark])
         return cursor
 
+    def recorded_source_event_ids(self, source_event_ids: list[str]) -> frozenset[str]:
+        """Which of these signals already have a row; an append that raised may still have committed one."""
+        if not source_event_ids:
+            return frozenset()
+        rows = self._db.transaction(lambda conn: conn.execute(
+            "SELECT source_event_id FROM strategy_signal_record WHERE list_contains(?, source_event_id)",
+            [list(source_event_ids)]).fetchall())
+        return frozenset(row[0] for row in rows)
+
     def _prune_in_tx(self, conn: Any, watermark: int, now: dt.datetime) -> int:
         """Delete a prefix of cursors older than the retention; return the new watermark."""
         (newest_expired,) = conn.execute("SELECT MAX(cursor) FROM strategy_signal_record WHERE recorded_at < ?",

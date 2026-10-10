@@ -110,6 +110,13 @@ def test_non_finite_probability_is_stored_as_null(record):
     assert record.read(0, 1).signals[0].to_json()["probability"] is None
 
 
+def test_the_record_says_which_signals_it_already_has(record):
+    held, absent = entry(1), entry(2)
+    record.append(held)
+    assert record.recorded_source_event_ids([held.source_event_id, absent.source_event_id]) == {held.source_event_id}
+    assert record.recorded_source_event_ids([]) == frozenset()
+
+
 @pytest.mark.parametrize("days", [0, 366, True, 7.0])
 def test_retention_days_are_checked(tmp_path, days):
     with pytest.raises(ValueError):
@@ -148,6 +155,9 @@ class FlakyRecord:
 
     def read(self, after_cursor, limit):
         return self.inner.read(after_cursor, limit)
+
+    def recorded_source_event_ids(self, source_event_ids):
+        return self.inner.recorded_source_event_ids(source_event_ids)
 
 
 def ticking_runtime(tmp_path, clock, strategy, *, fail_after_write):
